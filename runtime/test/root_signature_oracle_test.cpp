@@ -120,6 +120,48 @@ int main() {
     const PackResult packed = pack(model);
     check(packed.ok && packed.dword_count == 6, "oracle model packs to 6 dwords");
 
+    // The descriptor count and range offset are independent. The final SRV range is unbounded
+    // and begins immediately after the fixed range, but the whole table still occupies one GPU address.
+    {
+        D3D12_DESCRIPTOR_RANGE1 ranges[] = {
+            {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 2, 3, 0, D3D12_DESCRIPTOR_RANGE_FLAG_DATA_STATIC, 0},
+            {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, UINT32_MAX, 7, 1,
+             D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE, D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND},
+        };
+        D3D12_ROOT_PARAMETER1 table_and_constants[2] = {{}, params[0]};
+        auto& table = table_and_constants[0];
+        table.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        table.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+        table.DescriptorTable = {2, ranges};
+        const auto unbounded_desc = make_desc(table_and_constants, 2);
+        Blobs unbounded;
+        const HRESULT result =
+            D3D12SerializeVersionedRootSignature(&unbounded_desc, &unbounded.blob, &unbounded.error);
+        check(result == S_OK, "Microsoft serializer accepts an unbounded SRV range");
+        RootSignature table_model;
+        if (SUCCEEDED(result) && unbounded.blob &&
+            parse_blob(unbounded.blob, table_model) && table_model.params.size() == 2 &&
+            table_model.params[0].ranges.size() == 2) {
+            const auto& fixed = table_model.params[0].ranges[0];
+            const auto& tail = table_model.params[0].ranges[1];
+            check(table_model.params[0].type == ParamType::Table &&
+                      table_model.params[0].visibility == Visibility::Pixel &&
+                      fixed.num_descriptors == 2 && fixed.offset_in_table == 0 &&
+                      tail.range_type == D3D12_DESCRIPTOR_RANGE_TYPE_SRV &&
+                      tail.num_descriptors == UINT32_MAX && tail.base_shader_register == 7 &&
+                      tail.register_space == 1 && tail.flags == D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE &&
+                      tail.offset_in_table == kRangeOffsetAppend,
+                  "fixed and unbounded SRV ranges survive native serialization");
+            const auto table_pack = pack(table_model);
+            check(table_pack.ok && table_pack.d3d12_cost == 5 && table_pack.dword_count == 6 &&
+                      table_pack.provenance.size() == 6 &&
+                      table_pack.provenance[1].param_index == 0 && table_pack.provenance[2].param_index == 1,
+                  "unbounded SRV table occupies two SGPRs before the following constants");
+        } else {
+            check(false, "native unbounded table parses with two ranges and two parameters");
+        }
+    }
+
     // Static samplers, one signature per version: every field round-trips through the real serializer, and 1.2
     // adds D3D12_STATIC_SAMPLER_DESC1::Flags (a 14th dword) to each sampler record. Each also carries a table and a
     // root descriptor, so the 1.1/1.2 descriptor and range flags sit between the samplers and the header.
@@ -150,15 +192,16 @@ int main() {
                         s.ComparisonFunc, s.BorderColor, s.MinLOD, s.MaxLOD, s.ShaderRegister, s.RegisterSpace,
                         s.ShaderVisibility};
     }
-    // Two ranges, so the range stride (20 bytes in 1.0, 24 with flags) is under test too.
+    // Two ranges, so the range stride (20 bytes in 1.0, 24 with flags) is under test too. Every field differs from
+    // its neighbours (an explicit table offset, nonzero registers and spaces, distinct flags), so a swapped or
+    // shifted field read shows up instead of matching by accident.
     D3D12_DESCRIPTOR_RANGE range0[2] = {
         {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 3, 1, 0, D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND},
-        {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 2, 0, 0, D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND}};
+        {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 2, 4, 2, 7}};
     D3D12_DESCRIPTOR_RANGE1 range1[2] = {
         {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 3, 1, 0, D3D12_DESCRIPTOR_RANGE_FLAG_DATA_STATIC,
          D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND},
-        {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 2, 0, 0, D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE,
-         D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND}};
+        {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 2, 4, 2, D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE, 7}};
     D3D12_ROOT_PARAMETER params0[2]{};
     params0[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
     params0[0].DescriptorTable = {2, range0};
@@ -181,8 +224,23 @@ int main() {
                got.visibility == static_cast<Visibility>(want.ShaderVisibility) &&
                got.flags == (flags ? uint32_t(want.Flags) : 0u);
     };
+    // Ranges as the model should hold them: 1.0 has no range flags (0 in the model); 1.1 and 1.2 use range1.
+    const auto same_ranges = [&](const std::vector<DescriptorRange>& got, bool range_flags) {
+        if (got.size() != 2) return false;
+        for (int i = 0; i < 2; ++i) {
+            const D3D12_DESCRIPTOR_RANGE1& want = range1[i];
+            if (got[i].range_type != uint32_t(want.RangeType) || got[i].num_descriptors != want.NumDescriptors ||
+                got[i].base_shader_register != want.BaseShaderRegister ||
+                got[i].register_space != want.RegisterSpace ||
+                got[i].flags != (range_flags ? uint32_t(want.Flags) : 0u) ||
+                got[i].offset_in_table != want.OffsetInDescriptorsFromTableStart)
+                return false;
+        }
+        return true;
+    };
     const auto serialize = [&](const D3D12_VERSIONED_ROOT_SIGNATURE_DESC& d, Version version, const char* name,
                                bool sampler_flags) {
+        const bool range_flags = version != Version::V1_0;
         Blobs out;
         char what[160];
         const HRESULT result = D3D12SerializeVersionedRootSignature(&d, &out.blob, &out.error);
@@ -206,6 +264,8 @@ int main() {
                   got.params[1].descriptor_space == 1 && got.static_samplers.size() == 2,
               what);
         if (got.static_samplers.size() != 2) return;
+        std::snprintf(what, sizeof(what), "%s: every range field round-trips (flags before the table offset)", name);
+        check(same_ranges(got.params[0].ranges, range_flags), what);
         std::snprintf(what, sizeof(what), "%s: every sampler field round-trips", name);
         check(same_sampler(got.static_samplers[0], samplers[0], sampler_flags) &&
                   same_sampler(got.static_samplers[1], samplers[1], sampler_flags),
@@ -215,6 +275,7 @@ int main() {
         const DecodeResult again = decode_canonical(bytes.data(), bytes.size());
         std::snprintf(what, sizeof(what), "%s: canonical codec round-trips the parsed model", name);
         check(again.ok && again.sig.version == version && again.sig.static_samplers.size() == 2 &&
+                  again.sig.params.size() == 2 && same_ranges(again.sig.params[0].ranges, range_flags) &&
                   same_sampler(again.sig.static_samplers[0], samplers[0], sampler_flags) &&
                   same_sampler(again.sig.static_samplers[1], samplers[1], sampler_flags),
               what);

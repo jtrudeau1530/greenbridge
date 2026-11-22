@@ -34,7 +34,8 @@ Usage:
     --out     JSON summary (default: <input name>.navmesh-decode.json in the current directory)
     --csv     optional CSV, one row of numeric header fields per resource
     --start   first byte to scan in an archive (default: the archive's data start, u32 at offset 4)
-    --limit   bytes to scan from --start; a resource that starts inside the window is read to its end
+    --limit   bytes to scan from --start; a resource that starts inside the window is read to its end, but a
+              stream past the window's end is reported under past_window, not in the carver counts
     --deep    also walk every navmesh polygon, quadtree node and grid hash-table slot (slower)
     --quiet   do not print the summary
 """
@@ -48,6 +49,7 @@ import re
 import struct
 import sys
 import time
+import unicodedata
 import zlib
 from collections import Counter
 
@@ -239,7 +241,8 @@ def _psin_state(b):
         at += size
         count += 1
     if at == len(b):
-        return True, count, False
+        # Ends exactly here: complete with at least one section; a bare header is incomplete, not continued.
+        return count > 0, count, False
     return False, count, True
 
 
@@ -792,7 +795,15 @@ def _scan_rpf(path, start, limit, deep, rows):
 
 
 def _account(m, carver, last, s, used, inflated, end):
-    """Carver-compatible accounting of one stream of 64 bytes or more, plus the gap before it."""
+    """Carver-compatible accounting of one stream of 64 bytes or more, plus the gap before it.
+
+    A stream that runs past the --limit window is still decoded (a resource is read to its end) but, as in
+    navmesh_index.py (#766), it is not counted as carved: its bytes inside the window fall into the tail, so
+    streams + zero_padding + unread add up to the span. It is reported under past_window instead."""
+    if s + used > end:
+        carver["past_window"] += 1
+        carver["past_window_stored"] += used
+        return last
     if s > last and last < end:
         gap = m[last:min(s, end)]
         carver["zero_padding" if gap.count(0) == len(gap) else "unread"] += len(gap)
@@ -852,7 +863,8 @@ def _summary(path, mode, start, end, carver, classes, checks, stats, elapsed):
         "end": end,
         "span": (end - start) if (start is not None and end is not None) else None,
         "carver_streams": {k: carver.get(k, 0) for k in ("streams", "stored", "inflated", "zero_padding",
-                                                         "unread", "tiny_continuations", "tiny_orphans")},
+                                                         "unread", "tiny_continuations", "tiny_orphans",
+                                                         "past_window", "past_window_stored")},
         "resources": {cls: dict(v, streams={str(k): c for k, c in sorted(v["streams"].items())})
                       for cls, v in sorted(classes.items())},
         "checks": {cls: {name: {"pass": p, "fail": f} for name, (p, f) in sorted(t.items())}
@@ -904,9 +916,18 @@ def _summary(path, mode, start, end, carver, classes, checks, stats, elapsed):
     }
 
 
+def _make_parent(path):
+    """Create the folder an output path lives in: the scan is over by the time we write, so a missing
+    folder used to end the run in a FileNotFoundError and lose the result."""
+    parent = os.path.dirname(os.path.abspath(path))
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
+
 def write_csv(path, rows):
+    _make_parent(path)
     with open(path, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=COLUMNS, extrasaction="ignore")
+        w = csv.DictWriter(f, fieldnames=COLUMNS, extrasaction="ignore", lineterminator="\n")
         w.writeheader()
         for r in rows:
             w.writerow({k: ("" if r.get(k) is None else r.get(k)) for k in COLUMNS})
@@ -926,6 +947,42 @@ def _offset(text):
     return value
 
 
+_PC_CASE_SENSITIVE = 11  # <sys/unistd.h> on macOS; os.pathconf_names doesn't list it
+
+
+def _case_insensitive_volume(path):
+    """True when the volume that will hold `path` ignores letter case, as macOS's default APFS volume does.
+    os.path.normcase folds case only on Windows, so on macOS `R.json` and `r.json` would pass as two reports."""
+    if sys.platform != "darwin":
+        return False
+    while not os.path.exists(path):
+        parent = os.path.dirname(path)
+        if parent == path:
+            break
+        path = parent
+    try:
+        return os.pathconf(path, _PC_CASE_SENSITIVE) == 0
+    except (OSError, ValueError):
+        return True  # the macOS default; folding can only refuse a pair, never overwrite one
+
+
+def _path_key(path):
+    path = os.path.normcase(os.path.realpath(path))
+    if _case_insensitive_volume(path):
+        # APFS and HFS+ also treat composed and decomposed accents as one name.
+        path = unicodedata.normalize("NFD", path.casefold())
+    return path
+
+
+def same_report_path(first, second):
+    if _path_key(first) == _path_key(second):
+        return True
+    try:
+        return os.path.samefile(first, second)
+    except OSError:
+        return False
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("input", help="RPF9 archive (navmeshes.rpf) or directory of carved streams")
@@ -940,15 +997,21 @@ def main(argv=None):
         ap.error("%s does not exist" % a.input)
     if os.path.isdir(a.input) and (a.start is not None or a.limit is not None):
         ap.error("--start and --limit apply to archive inputs only")
+    base = os.path.basename(os.path.abspath(a.input)) or "navmesh"
+    out = a.out or os.path.splitext(base)[0] + ".navmesh-decode.json"
+    if a.csv and same_report_path(out, a.csv):
+        ap.error("--out and --csv must use different paths")
+    for flag, path in (("--out", out), ("--csv", a.csv)):
+        if path and same_report_path(path, a.input):
+            ap.error(f"{flag} would overwrite the input {a.input}")
     rows = [] if a.csv else None
     try:
         summary = scan(a.input, a.start, a.limit, a.deep, rows)
     except ValueError as exc:
         print("error: %s" % exc, file=sys.stderr)
         return 2
-    base = os.path.basename(os.path.abspath(a.input)) or "navmesh"
-    out = a.out or os.path.splitext(base)[0] + ".navmesh-decode.json"
-    with open(out, "w", encoding="utf-8") as f:
+    _make_parent(out)
+    with open(out, "w", encoding="utf-8", newline="\n") as f:
         json.dump(summary, f, indent=1, allow_nan=False)
     if a.csv:
         write_csv(a.csv, rows)
@@ -959,4 +1022,8 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
+    try:  # a redirected stdout is strict ANSI code page under -I; write '?' for what it cannot encode
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
     sys.exit(main())

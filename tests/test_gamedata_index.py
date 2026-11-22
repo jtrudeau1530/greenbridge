@@ -15,6 +15,7 @@ import sys
 import tempfile
 import unittest
 import zlib
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOL = os.path.join(ROOT, "tools", "gamedata_index.py")
@@ -66,6 +67,20 @@ class GamedataIndexTest(unittest.TestCase):
     def run_tool(self, target, *args):
         return subprocess.run([sys.executable, "-I", TOOL, target, *args], cwd=self.root,
                               capture_output=True, text=True, encoding="utf-8", errors="replace")
+
+    def test_rejects_a_shared_csv_and_json_destination(self):
+        self.finish()
+        out = os.path.join(self.root, "index.json")
+        with open(out, "w", encoding="utf-8") as f:
+            f.write("existing report")
+        alias = os.path.join(self.root, ".", "index.json")
+
+        result = self.run_tool(self.carve, "--csv", out, "--json", alias)
+
+        with open(out, encoding="utf-8") as f:
+            self.assertEqual(f.read(), "existing report")
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("--csv and --json must use different paths", result.stderr)
 
     def test_bad_targets_are_one_line(self):
         empty = os.path.join(self.root, "empty.rpf")
@@ -134,6 +149,25 @@ class GamedataIndexTest(unittest.TestCase):
         self.assertEqual(len(rows), 9)
         self.assertEqual(rows[0]["root"], "RootA")
         self.assertEqual(rows[0]["type"], "xml")
+
+    def test_printable_page_directory_stream_is_not_xml(self):
+        # A resource stream with the "0DRP" page marker at +16 whose first 4 KiB are over 95% printable and hold a
+        # "<": data.rpf's 337 such streams were reported as incomplete XML with no root.
+        head = bytes(8) + bytes.fromhex("80ca005000000000") + b"0DRP" + bytes(12)
+        page = head + (b"<abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ>" * 80)[:4096 - len(head)]
+        page += bytes(512)
+        tool = load_tool()
+        self.assertGreater(tool.printable(page), 0.95)      # the heuristic alone would call it text
+        self.add(page)
+        self.finish()
+        out = os.path.join(self.root, "index.json")
+        p = self.run_tool(self.carve, "--json", out)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        with open(out, encoding="utf-8") as f:
+            data = json.load(f)
+        self.assertNotIn("xml", data["summary"]["types"])
+        self.assertEqual(data["summary"]["xml_incomplete"], 0)
+        self.assertEqual([(r["type"], r["detail"]) for r in data["rows"]], [("other", "0DRP")])
 
     def test_archive_runs_the_carver_and_reads_roots(self):
         xml = b'<?xml version="1.0"?>\n<RootA><!-- synthetic fixture, longer than 64 bytes --><Item value="1"/></RootA>'
@@ -249,6 +283,37 @@ class XmlGroupingRegressionTest(GamedataIndexTest):
         self.assertEqual(row["chunks"], 2)
         self.assertTrue(row["header"])
         self.assertFalse(row["complete"])
+
+
+class BuildRowsReadCountTest(unittest.TestCase):
+    """The XML-shaped text branch must join the chunks it already read, not reinflate the group twice."""
+
+    def test_text_group_with_late_close_reads_each_member_once(self):
+        tool = load_tool()
+        head = b"<SyntheticRoot>" + b" " * (65536 - len(b"<SyntheticRoot>"))
+        tail = b"</SyntheticRoot>"
+        rows = [
+            {"off": 0x1000, "stored": len(head), "size": 65536, "head": head[:16].hex(), "type": ""},
+            {"off": 0x2000, "stored": len(tail), "size": len(tail), "head": tail[:16].hex(), "type": ""},
+        ]
+        chunks_by_offset = {0x1000: head, 0x2000: tail}
+        source = mock.Mock()
+        source.read.side_effect = lambda row: chunks_by_offset[row["off"]]
+
+        out = tool.build_rows(rows, source)
+
+        self.assertEqual(len(out), 1)
+        row = out[0]
+        self.assertEqual(row["type"], "xml")
+        self.assertEqual(row["root"], "SyntheticRoot")
+        self.assertTrue(row["complete"])
+        self.assertFalse(row["header"])
+        self.assertEqual(row["chunks"], 2)
+        self.assertEqual(row["size"], 65536 + len(tail))
+        self.assertEqual(row["stored"], len(head) + len(tail))
+        self.assertEqual(source.read.call_count, 2)
+        self.assertEqual([call.args[0]["off"] for call in source.read.call_args_list],
+                         [0x1000, 0x2000])
 
 
 if __name__ == "__main__":

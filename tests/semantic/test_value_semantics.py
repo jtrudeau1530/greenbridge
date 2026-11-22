@@ -33,6 +33,13 @@ ISA semantics used (AMD RDNA2 ISA reference, VALU/VOP3/VOP3P chapters):
   v_fmaak_f32/madak_f32 D = S0 * S1 + K (printed vdst, src0, vsrc1, K).
   s_ff1_i32_b32 /       index of the lowest set / clear bit of S0, -1 (0xffffffff) when there is none. An inline
   s_ff0_i32_b32           constant or literal source is a 32-bit value, not a lane mask (SHADER-46).
+  v_mad_u32_u16 /       D = S0.lo * S1.lo + S2 mod 2^32, the halves zero- (u16) or sign-extended (i16); op_sel bit
+  v_mad_i32_i16           0/1 reads the high half of S0/S1. D is a whole dword (nothing of the old value is kept).
+  v_subrev_f16          D.lo = S1.lo - S0.lo; the high half of D is kept in the VOP2 and the VOP3 form.
+  s_*_saveexec_b32/b64, a constant used as a lane mask gives lane L its bit L: of the 32-bit value for a b32 op,
+  s_andn2_wrexec_*,       of the 64-bit value for a b64 op (inline constants sign-extended, literals with a zero
+  s_mov/s_not/s_and_b64   high word). cs_w32_mask_imm / cs_w64_mask_imm run every lane of a wave (LaneMaskConstants).
+    into EXEC or VCC
 
 The appended cases for ps_ops5/ps_ops6 also pin the op_sel source-half selection for packed shifts, which the
 GPU-checked ps_ops4 does not exercise. cs_bounds (compute) pins the buffer num_records bounds checks: an
@@ -41,10 +48,13 @@ the channel order of the 10:10:10:2 typed-buffer formats: the names list the cha
 2_10_10_10 (50) is R10G10B10A2 and 10_10_10_2 (44) has a 2-bit x (Mesa gfx10_format_table.py, ac_formats.c).
 """
 import math
+import os
 import struct
+import sys
 import unittest
 
 import support
+import spirv_mini_interp as si
 
 # Independent constants, written down by hand (derivations are in the reference functions).
 EXPECTED_LEGACY_MUL = [0x00000000, 0x00000000, 0x00000000, 0x40C00000]
@@ -52,7 +62,7 @@ EXPECTED_OPS4 = [0x34000010, 0x00120800, 0xBEEF0000, 0x12343C00]
 EXPECTED_OPS5 = [0x12340010, 0xBEEF0800, 0xAAAAFFFF, 0xDEADBC00]
 EXPECTED_OPS6 = [0xF800FFFF, 0x01000010, 0x00800800, 0x8000FFF0]
 EXPECTED_OPS7 = [0x00FF8077, 0xFF0000FF, 0x89ABCDEF, 0x00070003]
-EXPECTED_OPS8 = [0x80000000, 0xFFFFFFFF, 0x000F100E, 0x0F0F0F1F]
+EXPECTED_OPS8 = [0x80000000, 0xBFFFFFFF, 0x000F100E, 0x0F0F0F1F]
 EXPECTED_VCC_X2 = [0x11223344, 0x55667788, 0x00000000, 0x00000000]
 EXPECTED_F16_VOP2 = [0xAAAA4000, 0xAAAAC000, 0xAAAA3A00, 0x42003F00]        # hardware-measured
 EXPECTED_FLAT = [0x00000101, 0x00000102, 0x3F000000, 0x3E800000]
@@ -64,6 +74,8 @@ EXPECTED_FMT_1010102 = {0x00: 0x00000000, 0x04: 0x3F800000, 0x08: 0x00000000, 0x
                         0x20: 0x00000000, 0x24: 0x3F800000, 0x28: 0x00000000, 0x2C: 0x3F800000,
                         0x30: 0xC00FFC00, 0x34: 0x003FF003, 0x38: 0xE00003FF, 0x3C: 0xFFE00003}
 EXPECTED_SFF_IMM = [0x00000002, 0x00000001, 0x00000014, 0x00000010]
+EXPECTED_VALU16_MAD = [0x00000002, 0x00030002, 0x00008000, 0x00000004]
+EXPECTED_VALU16_SUBREV = [0xAAAABC00, 0xAAAAC000, 0xAAAA3C00, 0x42003800]
 
 
 def _f32_bits(x):
@@ -169,8 +181,9 @@ def reference_ops8():
     ffbl = (0x00010000 & -0x00010000).bit_length() - 1
     ffbh = 32 - 0x00010000.bit_length()
     xad = ((0xF0F0F0F0 ^ m) + 1) & m
+    signed_high = ((_s(0xFFFFFFFE) * 0x40000000) >> 32) & m
     return [(0x80000001 * 0xFFFFFFFF) >> 32,
-            ((_s(0xFFFFFFFE) * 0x40000000) >> 32) & m,
+            signed_high ^ 0x40000000,
             ((ffbh << 16) + (ffbl << 8) + bcnt) & m,
             (xad + 16 + m) & m]                                  # v_ffbh_u32(0) = 0xffffffff
 
@@ -260,6 +273,26 @@ def reference_sff_imm():
     return [_ff1(4), _ff1(~61), _ff1(0x00100000), _ff1(~0x0000FFFF)]
 
 
+def _mad_32_16(signed, s0, s1, s2, sel=(0, 0)):
+    """v_mad_u32_u16 / v_mad_i32_i16: the selected 16-bit halves, extended, multiplied, plus S2, mod 2^32."""
+    a, b = (s0 >> (16 * sel[0])) & 0xFFFF, (s1 >> (16 * sel[1])) & 0xFFFF
+    if signed:
+        a, b = _s16(a), _s16(b)
+    return (a * b + s2) & 0xFFFFFFFF
+
+
+def reference_valu16_mad():
+    v0, v1, v3, v5, v6, v7 = 0x1234FFFF, 0x5678FFFE, 0x00030000, 0x00018000, 0xFFFF7FFF, 0x40000000
+    return [_mad_32_16(False, v0, v1, v3), _mad_32_16(True, v0, v1, v3), _mad_32_16(True, v5, v6, v7),
+            _mad_32_16(True, v5, v6, 5, sel=(1, 1))]
+
+
+def reference_valu16_subrev():
+    a, b, d = _unhalf(0x3E00), _unhalf(0x3800), _unhalf(0x3C00)        # low halves: v0 1.5, v1 0.5, v5 1.0
+    return [0xAAAA0000 | _half(b - a), 0xAAAA0000 | _half(-b - a), 0xAAAA0000 | _half(min(1.0, b + a)),
+            0x42000000 | _half(a - d)]
+
+
 def _isg1_dxbc(elements):
     """A DXBC container with one ISG1 input signature. elements: (register, mask, system value, component type)."""
     payload = bytearray(struct.pack("<II", len(elements), 8))
@@ -307,6 +340,8 @@ class OracleTests(unittest.TestCase):
         self.assertEqual(reference_bounds(), EXPECTED_BOUNDS)
         self.assertEqual(reference_fmt_1010102(), EXPECTED_FMT_1010102)
         self.assertEqual(reference_sff_imm(), EXPECTED_SFF_IMM)
+        self.assertEqual(reference_valu16_mad(), EXPECTED_VALU16_MAD)
+        self.assertEqual(reference_valu16_subrev(), EXPECTED_VALU16_SUBREV)
 
 
 class TranslatorValueSemantics(unittest.TestCase):
@@ -359,6 +394,16 @@ class TranslatorValueSemantics(unittest.TestCase):
         # v_fmac_f16 accumulates into the low half of its destination.
         self.check("ps_f16_vop2", EXPECTED_F16_VOP2)
 
+    def test_mad_u32_u16_i32_i16_wrap_and_sign_extend(self):
+        # The u16 product plus S2 wraps at 32 bits; i16 sign-extends both halves (also the op_sel-selected high
+        # halves); the destination dword is replaced, its 0xaaaa5555 is not kept.
+        self.check("ps_valu16_mad", EXPECTED_VALU16_MAD)
+
+    def test_subrev_f16_reversed_and_keeps_high_half(self):
+        # S1 - S0 in the _e32 and _e64 forms (neg, clamp), low half out, the destination's high half kept, also
+        # when the destination is a source.
+        self.check("ps_valu16_subrev", EXPECTED_VALU16_SUBREV)
+
     def test_s_buffer_load_dwordx2_into_vcc(self):
         # The V# in s[0:3] points at 0x1000; the two dwords must come back in vcc_lo and vcc_hi, not be lost.
         push = [0x1000, 0, 16, 0] + [0] * 28
@@ -384,7 +429,7 @@ class TranslatorValueSemantics(unittest.TestCase):
         memory = {0x0C: 0xEEEEEEEE}
         outputs = support.run_fragment(
             spv, inputs={"%wg_id": (0, 0, 0), "%local_id": (0, 0, 0)},
-            push_constants=[0, 0, 16, 0] + [0] * 28, memory=memory)
+            push_constants=[0, 0, 16, 0x31016FAC] + [0] * 28, memory=memory)
         self.assertEqual(outputs, {})
         for address, want in EXPECTED_BOUNDS.items():
             with self.subTest(address=address):
@@ -398,16 +443,228 @@ class TranslatorValueSemantics(unittest.TestCase):
         memory = {}
         outputs = support.run_fragment(
             spv, inputs={"%wg_id": (0, 0, 0), "%local_id": (0, 0, 0)},
-            push_constants=[0, 0, 0x100, 0] + [0] * 28, memory=memory)
+            push_constants=[0, 0, 0x100, 0x31016FAC] + [0] * 28, memory=memory)
         self.assertEqual(outputs, {})
         for address, want in EXPECTED_FMT_1010102.items():
             with self.subTest(address=address):
                 self.assertEqual(f"{memory.get(address, 0):#010x}", f"{want:#010x}")
 
+    def test_signed_typed_buffers(self):
+        spv = support.translate_fixture("cs_fmt_sint32", fssm=CS_BOUNDS_FSSM)
+        memory = {}
+        support.run_fragment(
+            spv, inputs={"%wg_id": (0, 0, 0), "%local_id": (0, 0, 0)},
+            push_constants=[0, 0, 0x100, 0x31016FAC] + [0] * 28, memory=memory)
+        expected = {
+            0x0C: 1,                         # MUBUF integer DST_SEL=1
+            0x18: 0xFFFFFFFD,                # MUBUF 96-bit format, third component
+            0x34: 0x7FFFFFFF, 0x38: 0,       # MTBUF 64-bit format with absent third component
+            0x48: 0xFFFFFFFD, 0x4C: 0,       # MTBUF 96-bit format with absent fourth component
+            0x58: 0xFFFFFFFD, 0x5C: 17,      # MTBUF 128-bit format
+            0x60: 0x7FFF8000, 0x64: 0x0011FFFD,
+            0x68: 0x7FFF8000, 0x6C: 0x0011FFFD,
+            0x70: 0xFFFFFFFD, 0x74: 0xFFFFFFFD,
+            0x90: 0x80000000, 0xA8: 0xFFFFFFFD, 0xBC: 17,
+            0xC0: 0xFFFFFFFD, 0xC4: 0xFFFF8000, 0xC8: 0xFFFFFFFD,
+        }
+        for address, word in expected.items():
+            with self.subTest(address=hex(address)):
+                self.assertEqual(memory.get(address), word)
+        for address in (0x98, 0xAC, 0xCC):
+            self.assertNotIn(address, memory)
+
     def test_s_ff0_s_ff1_read_an_immediate_as_a_value(self):
         # SHADER-46: an inline constant or literal is a 32-bit value. Read as a lane mask (all ones or zero from
         # bit 0), s_ff0 of 61 and of 0x0000ffff gave -1; the s_ff1 words guard the path it already got right.
         self.check("ps_sff_imm", EXPECTED_SFF_IMM)
+
+
+class ReadLog(dict):
+    """A {byte_address: word} memory for run_fragment that records the address of every load."""
+
+    def __init__(self, *args):
+        super().__init__(*args)
+        self.reads = []
+
+    def get(self, key, default=None):
+        self.reads.append(key)
+        return super().get(key, default)
+
+
+VEC_REGION = 0x1000
+
+
+def _pattern_word(offset):
+    # byte n of the region holds 0x40 + n (as in the measurement), so an unaligned dword is its four exact bytes
+    return int.from_bytes(bytes((0x40 + offset + k) & 0xFF for k in range(4)), "little")
+
+
+class RawBufferTailBounds(unittest.TestCase):
+    """Raw MUBUF loads (V# stride 0) are bounded per dword, measured on an AMD Radeon RX 6800 (gfx1030), raw
+    compute kernel, wave32 and wave64, V# word3 0x31016fac (OOB_SELECT 3):
+
+        O = inst_offset + soffset + (offen ? vaddr : 0)        one byte offset, nothing truncated
+        dword i = data at base + O + 4*i (byte exact) if O + 4*i + 4 <= NUM_RECORDS, else 0 (and not read)
+
+    Each case is a one-thread compute program written by hand around one buffer_load (row names of the oracle's
+    model in the comments; rule in docs/design.md, Buffer bounds checking). It runs in spirv_mini_interp with a
+    memory whose every byte address holds the dword starting there; the test asserts the words stored and the
+    exact addresses loaded. Since 2e8101b the interpreter raises on a PhysicalStorageBuffer access that is not
+    4-byte aligned (undefined under the translator's Aligned 4), so a row that loads at an unaligned O sets
+    base_low to make base + O aligned: the bound sees only O, so the measured O / NUM_RECORDS pairs are kept, but
+    byte-exact data at an unaligned address is no longer checked here. The last tests pin paths the measurement did not cover and that keep their old check
+    of the first byte: structured buffers and idxen (OOB_SELECT 1).
+    """
+
+    def run_program(self, load_lines, n, *, nr, base_low=0, word1=0, word3=0x31016FAC, offset=0, extra=()):
+        lines = ["v_cmpx_eq_u32_e32 0, v0",
+                 f"s_mov_b32 s4, {VEC_REGION + base_low:#x}", f"s_mov_b32 s5, {word1:#x}",
+                 f"s_mov_b32 s6, {nr:#x}", f"s_mov_b32 s7, {word3:#x}",
+                 f"v_mov_b32 v1, {offset:#x}", *extra, *load_lines, "s_waitcnt vmcnt(0)"]
+        lines += [f"buffer_store_dword v{2 + i}, off, s[0:3], 0 offset:{4 * i}" for i in range(n)]
+        lines.append("s_endpgm")
+        spv = support.translate_lines("cs_vec_tail", lines, fssm=CS_BOUNDS_FSSM)
+        memory = ReadLog({VEC_REGION + k: _pattern_word(k - base_low) for k in range(-4, 0x40)})
+        support.run_fragment(spv, inputs={"%wg_id": (0, 0, 0), "%local_id": (0, 0, 0)},
+                             push_constants=[0, 0, 0x100, 0x31016FAC] + [0] * 28, memory=memory)
+        words = [dict.get(memory, 4 * i) for i in range(n)]
+        return words, [a - VEC_REGION - base_low for a in memory.reads]
+
+    def check(self, line, n, want, **kw):
+        """want: per dword, the byte offset O + 4*i whose data it holds, or None for 0 (and no load)."""
+        words, reads = self.run_program([line], n, **kw)
+        self.assertEqual([f"{w:#010x}" for w in words],
+                         [f"{0 if o is None else _pattern_word(o):#010x}" for o in want], line)
+        self.assertEqual([hex(r) for r in reads], [hex(o) for o in want if o is not None], line)
+
+    def test_single_dword_needs_all_four_bytes(self):
+        # vx1-k0[1], lane 15: offset 0xf, NR 18 -> 0 (a start-only check, 0xf < 18, would read)
+        self.check("buffer_load_dword v2, v1, s[4:7], 0 offen", 1, [None], nr=18, offset=0xF)
+        # offset 0xe, NR 18: bytes 0xe..0x11 fit -> data (base_low 2: base + O aligned, see the class docstring)
+        self.check("buffer_load_dword v2, v1, s[4:7], 0 offen", 1, [0xE], nr=18, offset=0xE, base_low=2)
+
+    def test_multi_dword_load_is_bounded_per_dword(self):
+        # vx4a-k0[4..7], lane 3: x4 at offset 3, NR 18 -> d0..d2 data, d3 (bytes 15..18) 0
+        # (base_low here and below makes base + O aligned for the interpreter, see the class docstring)
+        self.check("buffer_load_dwordx4 v[2:5], v1, s[4:7], 0 offen", 4, [3, 7, 0xB, None], nr=18, offset=3,
+                   base_low=1)
+        # lane 2: d3 = bytes 14..17 fits -> all four data
+        self.check("buffer_load_dwordx4 v[2:5], v1, s[4:7], 0 offen", 4, [2, 6, 0xA, 0xE], nr=18, offset=2,
+                   base_low=2)
+        # vmix2-k0[4..7]: x4 off offset:13, NR 20 -> data, 0, 0, 0
+        self.check("buffer_load_dwordx4 v[2:5], off, s[4:7], 0 offset:13", 4, [13, None, None, None], nr=20,
+                   base_low=3)
+        # x2 at 8, NR 0xe: d0 data, d1 0
+        self.check("buffer_load_dwordx2 v[2:3], v1, s[4:7], 0 offen", 2, [8, None], nr=0xE, offset=8)
+
+    def test_offsets_are_summed_before_the_check(self):
+        # vx1-k*[7..13] style: soffset 3 + inst_offset 2 + vaddr 0xb = 0x10; NR 0x16 -> x2: data, 0
+        self.check("buffer_load_dwordx2 v[2:3], v1, s[4:7], s8 offen offset:2", 2, [0x10, None],
+                   nr=0x16, offset=0xB, extra=("s_mov_b32 s8, 3",))
+
+    def test_base_low_bits_kept_in_the_address_not_in_the_bound(self):
+        # vx4a-k3[4], [7] measured base & 3 = 3 with x4 at offset 3, NR 18 -> d0..d2 data at base + 3.., d3 0.
+        # Stand-in at offset 5 so that base + O is aligned for the interpreter (class docstring): d0..d2 data,
+        # d3 (bytes 0x11..0x14) 0; a bound that added base & 3 would also zero d2 (3 + 5 + 8 + 4 = 0x14 > 18).
+        self.check("buffer_load_dwordx4 v[2:5], v1, s[4:7], 0 offen", 4, [5, 9, 0xD, None],
+                   nr=18, offset=5, base_low=3)
+
+    def test_num_records_zero_reads_nothing(self):
+        self.check("buffer_load_dwordx4 v[2:5], v1, s[4:7], 0 offen", 4, [None] * 4, nr=0, offset=0)
+
+    # Modes 1 and 2 (OOB_SELECT) check the index or NUM_RECORDS once for the whole load; modes 0 and 3 are per dword
+    # (docs/buffer_bounds.md; tests/semantic/test_buffer_oob_select.py has the full table).
+    def test_structured_buffer_keeps_its_first_byte_check(self):
+        # OOB_SELECT 1, stride 4, NR 2 records (8 bytes): no idxen, so index 0 < 2 and every dword is loaded
+        self.check("buffer_load_dwordx4 v[2:5], v1, s[4:7], 0 offen", 4, [4, 8, 0xC, 0x10],
+                   nr=2, offset=4, word1=4 << 16, word3=0x11016FAC)
+
+    def test_idxen_keeps_its_first_byte_check(self):
+        # OOB_SELECT 1, idxen with index 0 and offset:0xc, NR 0xe: index 0 < 0xe, so both dwords are loaded
+        self.check("buffer_load_dwordx2 v[2:3], v1, s[4:7], 0 idxen offset:12", 2, [0xC, 0x10], nr=0xE, offset=0,
+                   word3=0x11016FAC)
+
+    def test_store_is_per_dword(self):
+        # x2 at 0xc with NR 0x10: the first dword ends at 0x10 and lands, the second (ends at 0x14) is dropped
+        lines = ["v_cmpx_eq_u32_e32 0, v0", f"s_mov_b32 s4, {VEC_REGION:#x}", "s_mov_b32 s5, 0",
+                 "s_mov_b32 s6, 0x10", "s_mov_b32 s7, 0x31016fac", "v_mov_b32 v1, 0xc",
+                 "v_mov_b32 v2, 0x11111111", "v_mov_b32 v3, 0x22222222",
+                 "buffer_store_dwordx2 v[2:3], v1, s[4:7], 0 offen", "s_endpgm"]
+        spv = support.translate_lines("cs_vec_store", lines, fssm=CS_BOUNDS_FSSM)
+        memory = {}
+        support.run_fragment(spv, inputs={"%wg_id": (0, 0, 0), "%local_id": (0, 0, 0)},
+                             push_constants=[0, 0, 0x100, 0x31016FAC] + [0] * 28, memory=memory)
+        self.assertEqual(memory, {VEC_REGION + 0xC: 0x11111111})
+
+
+class MeasuredBoundsShaders(unittest.TestCase):
+    """The four GPU tests of the measured SMEM / raw MUBUF rules (runtime/test/shaders/cs_smem_bounds.asm,
+    cs_smem_stride_align.asm, cs_smem_sload_neg.asm, cs_buf_tail.asm), run here in the interpreter on a 256-byte
+    heap filled with 0xee like vk_compute_test's. The words are the ones derived in each .asm header."""
+
+    WANT = {
+        "cs_smem_bounds": [0, 0x5EED0010, 0x5EED000C, 0, 0x5EED000C, 0x5EED0010, 0, 0],
+        "cs_smem_stride_align": [0x5EED0010, 0, 0, 0x5EED0000, 0x5EED0000, 0x5EED0000, 0x5EED0000, 0x5EED0004],
+        "cs_smem_sload_neg": [0x5EED0004, 0x5EED0000, 0x5EED0004, 0x5EED0004, 0x5EED0008, 0x5EED000C,
+                              0xEEEEEEEE, 0xEEEEEEEE],
+        "cs_buf_tail": [0, 0x5EED000C, 0x5EED0008, 0x5EED000C, 0, 0, 0x5EED0010, 0],
+        "cs_oob_select": [0x5EED000C, 0, 0x5EED0014, 0, 0x5EED0018, 0xEEEEEEEE, 0, 0],
+        "cs_oob_tail": [0, 0, 0x5EED0010, 0, 0xBEEF0000, 0xEEEEEEEE, 0, 0x5EED0010],
+    }
+
+    def test_words(self):
+        for name, want in self.WANT.items():
+            with self.subTest(shader=name):
+                spv = support.translate_fixture(name, fssm=CS_BOUNDS_FSSM)
+                memory = {a: 0xEEEEEEEE for a in range(0, 0x100, 4)}
+                support.run_fragment(spv, inputs={"%wg_id": (0, 0, 0), "%local_id": (0, 0, 0)},
+                                     push_constants=[0, 0, 0xFFFFFFFF, 0x31016FAC] + [0] * 28, memory=memory)
+                self.assertEqual([f"{memory[4 * i]:#010x}" for i in range(8)], [f"{w:#010x}" for w in want])
+                self.assertEqual(set(memory), set(range(0, 0x100, 4)), "nothing written outside the heap")
+
+
+class LaneMaskConstants(unittest.TestCase):
+    """runtime/test/shaders/cs_w32_mask_imm.asm and cs_w64_mask_imm.asm: a constant read as a lane mask (saveexec,
+    wrexec, s_and_b64 / s_not_b64 / s_mov_b64 into EXEC or VCC) gives lane L its bit L, not bit 0 for every lane.
+    Run on all lanes of one wave (32 on a 32-wide subgroup, 64 on a 64-wide one, no --wave64-emulate) with a heap
+    of 0xee bytes; the words are the GPU check's (check.py CS_DUMPS), derived by hand in each .asm header."""
+
+    WANT = {"cs_w32_mask_imm": (32, [2056, 20, 2, 6152, 2050, 4112, 258, 32]),
+            "cs_w64_mask_imm": (64, [2056, 1084, 828, 2052, 319, 2104, 516, 2064])}
+    # Bit 0 of the constant for every lane, the translation before the fix (in the .asm headers).
+    OLD = {"cs_w32_mask_imm": [0xFFFFFF00, 32, 32, 0xFFFFFF00, 2072, 0xFFFFFF00, 0xFFFFFF00, 32],
+           "cs_w64_mask_imm": [0xFFFFFF00] * 7 + [2080]}
+
+    def run_words(self, name, lanes):
+        sys.path.insert(0, os.path.join(support.ROOT, "runtime", "test", "shaders"))
+        from compute_fixture import compute_header
+        header = compute_header(os.path.join(support.ROOT, "runtime", "test", "shaders", name + ".asm"))
+        spv = support.translate_fixture(name, fssm=bytes(header))
+        memory = {a: 0xEEEEEEEE for a in range(0, 0x100, 4)}
+        si.run_workgroup(spv, lanes, lanes,
+                         inputs_for=lambda i: {"%wg_id": (0, 0, 0), "%local_id": (i, 0, 0), "%sg_lane": i},
+                         push_constants=[0, 0, 0xFFFFFFFF, 0x31016FAC] + [0] * 28, memory=memory)
+        self.assertEqual(set(memory), set(range(0, 0x100, 4)), "nothing written outside the heap")
+        return [memory[4 * i] for i in range(8)]
+
+    def test_words(self):
+        for name, (lanes, want) in self.WANT.items():
+            with self.subTest(shader=name):
+                got = self.run_words(name, lanes)
+                self.assertEqual([f"{w:#010x}" for w in got], [f"{w:#010x}" for w in want])
+                self.assertNotEqual(got, self.OLD[name])
+
+    def test_words_follow_from_the_masks(self):
+        # Plain-Python reference: word = set lanes | lowest lane << 8 of each case's resulting mask.
+        def word(m):
+            return 0xFFFFFF00 if m == 0 else bin(m).count("1") | ((m & -m).bit_length() - 1) << 8
+        m32, m64 = 0xFFFFFFFF, (1 << 64) - 1
+        w32 = [word(0xFF00 & m32), word(0x55555555 | 0xFF), word(5 & m32), word(0xFF00FF00 & ~0xFFFF & m32),
+               word(0x3FF & ~0xFF), word(-16 & m32 & ~0xFFFF), word(0x80000002 | 0), word(-1 & m32)]
+        w64 = [word(0xFF00 & m64), word(-16 & m64), word(-8 & m64 & ~0x10), word(0xFF00 & ~0xF0F0 & m64),
+               word(-2 & m64), word(~0xFF & m64), word(0x3C), bin(0xFF00FF).count("1") | 8 << 8]
+        self.assertEqual(w32, self.WANT["cs_w32_mask_imm"][1])
+        self.assertEqual(w64, self.WANT["cs_w64_mask_imm"][1])
 
 
 if __name__ == "__main__":

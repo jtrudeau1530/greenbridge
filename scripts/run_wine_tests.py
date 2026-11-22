@@ -2,24 +2,39 @@
 
 Usage:
     python -I scripts/run_wine_tests.py --tests ctest.json --windows-root D:/a/Leonida/Leonida
-        [--root DIR] [--wine CMD] [--require NAME ...] [--timeout SECONDS] [--summary FILE]
+        [--root DIR] [--wine CMD] [--require NAME ...] [--timeout SECONDS] [--summary FILE] [--label TEXT]
 
 --tests is the output of `ctest --show-only=json-v1` from the Windows build, and --windows-root the checkout it was
 made in (forward slashes, as `cygpath -m` prints it). Paths under it are mapped to --root, the Linux checkout (default:
 this repository), which must hold the Windows build's runtime/build folder at the same place.
+
+Some tests open files through absolute paths compiled into them (the GLSL test shaders, LEONIDA_TEST_*_SPV under
+runtime/build/generated). For those, the drive of --windows-root is pointed at --root in the Wine prefix for the run
+($WINEPREFIX, else ~/.wine), unless that drive is already in use there.
 
 Every test is run and reported. The exit code is 1 if a test named by --require fails or is missing, else 0: the
 others show what does and doesn't work under Wine yet without failing the job.
 """
 import argparse
 import json
+import math
 import os
+import re
 import shlex
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def _make_parent(path: str) -> None:
+    """Create the folder a report lives in: the run is over by the time the summary is written."""
+    parent = os.path.dirname(os.path.abspath(path))
+    if parent:
+        os.makedirs(parent, exist_ok=True)
 
 
 def norm(path: str) -> str:
@@ -37,6 +52,51 @@ def map_path(arg: str, windows_root: str, root: str) -> str | None:
     return None
 
 
+class DriveMap:
+    """Points the drive of the Windows checkout at the Linux one inside the Wine prefix, for the run.
+
+    A test that opens D:/a/Leonida/Leonida/runtime/build/generated/x.spv (a path compiled into it) then reads
+    <root>/runtime/build/generated/x.spv. The drive is a dosdevices link to a scratch folder holding a/Leonida/Leonida
+    as a link to the root; both are removed afterwards. A drive the prefix already has (c:, z:, or one set up by
+    hand) is left alone, and so is a root without a drive letter.
+    """
+
+    def __init__(self, windows_root: str, root: str, prefix: str):
+        self.windows_root, self.root, self.prefix = norm(windows_root), os.path.abspath(root), prefix
+        self.link = self.scratch = None
+        self.note = ""
+
+    def __enter__(self):
+        m = re.fullmatch(r"([A-Za-z]):/(.+)", self.windows_root)
+        if not m:
+            self.note = f"{self.windows_root} has no drive letter: no drive mapped"
+            return self
+        drive, rest = m.group(1).lower(), [p for p in m.group(2).split("/") if p]
+        dosdevices = os.path.join(self.prefix, "dosdevices")
+        link = os.path.join(dosdevices, drive + ":")
+        if not os.path.isdir(dosdevices):
+            self.note = f"no Wine prefix at {self.prefix}: drive {drive}: not mapped"
+            return self
+        if os.path.lexists(link):
+            self.note = f"drive {drive}: is already set in {dosdevices}: left as it is"
+            return self
+        self.scratch = tempfile.mkdtemp(prefix="wine-drive-")
+        parent = os.path.join(self.scratch, *rest[:-1])
+        os.makedirs(parent, exist_ok=True)
+        os.symlink(self.root, os.path.join(parent, rest[-1]))
+        os.symlink(self.scratch, link)
+        self.link = link
+        self.note = f"drive {drive}: maps {self.windows_root} to {self.root} for this run"
+        return self
+
+    def __exit__(self, *exc):
+        if self.link and os.path.islink(self.link):
+            os.unlink(self.link)
+        if self.scratch:
+            shutil.rmtree(self.scratch, ignore_errors=True)   # removes the links, never what they point to
+        return False
+
+
 def wine_path(path: str) -> str:
     """Wine's Z: drive is the Unix root, so a Windows program reads /x/y as Z:\\x\\y."""
     return "Z:" + os.path.abspath(path).replace("/", "\\")
@@ -46,13 +106,26 @@ def properties(test: dict) -> dict:
     return {p["name"]: p["value"] for p in test.get("properties", [])}
 
 
+def truthy(value) -> bool:
+    """A ctest boolean property. The JSON carries it as a string, so "0" must stay false."""
+    return str(value).strip().lower() in ("1", "on", "true", "yes")
+
+
+def regex_list(value: str | list[str]) -> list[str]:
+    """Treat a single string as one output expression, like a one-element CTest list."""
+    return [value] if isinstance(value, str) else value
+
+
 def run_test(test: dict, args, wine: list[str]) -> tuple[str, str]:
     """Returns (status, detail): status is pass, fail or skip."""
     command = test.get("command")
     if not command:
         return "fail", "no command (target not built?)"
     exe = map_path(command[0], args.windows_root, args.root)
-    if exe is None or not os.path.isfile(exe):
+    if exe is None:
+        # A test that runs a tool of the Windows runner (cmake -P, python) rather than one this build made.
+        return "skip", f"runs {command[0]}, not a program from the build"
+    if not os.path.isfile(exe):
         return "fail", f"executable not in the artifact: {command[0]}"
     argv = list(wine) + [exe]
     for a in command[1:]:
@@ -70,14 +143,69 @@ def run_test(test: dict, args, wine: list[str]) -> tuple[str, str]:
     except subprocess.TimeoutExpired as e:
         out = (e.stdout or b"").decode("utf-8", "replace")
         return "fail", f"timed out after {args.timeout} s\n{out}"
+    except OSError as e:                  # a mistyped --wine, or a missing one: report the test, do not abort the run
+        return "fail", f"could not start {argv[0]}: {e.strerror or e}"
     elapsed = time.monotonic() - start
     out = proc.stdout.decode("utf-8", "replace")
     code = proc.returncode
+    if code < 0:
+        # A negative return code is a host-signal termination (e.g. SIGSEGV), not a process exit code:
+        # report it as a failure before SKIP_RETURN_CODE or WILL_FAIL can reinterpret it.
+        return "fail", f"killed by signal {-code} in {elapsed:.1f} s\n{out}"
     skip_code = props.get("SKIP_RETURN_CODE")
     if skip_code is not None and code == int(skip_code):
         return "skip", f"exit {code} (skip) in {elapsed:.1f} s\n{out}"
-    passed = (code != 0) if props.get("WILL_FAIL") else (code == 0)
-    return ("pass" if passed else "fail"), f"exit {code} in {elapsed:.1f} s\n{out}"
+    detail = f"exit {code} in {elapsed:.1f} s\n{out}"
+    required = regex_list(props.get("PASS_REGULAR_EXPRESSION", []))
+    forbidden = regex_list(props.get("FAIL_REGULAR_EXPRESSION", []))
+    # A required match takes the place of the exit code. A forbidden match overrides either kind of success.
+    try:
+        passed = any(re.search(pattern, out, re.DOTALL) for pattern in required) if required else code == 0
+        if any(re.search(pattern, out, re.DOTALL) for pattern in forbidden):
+            passed = False
+    except re.error as e:
+        return "fail", f"invalid output regular expression: {e}\n{detail}"
+    if truthy(props.get("WILL_FAIL")):
+        passed = not passed
+    return ("pass" if passed else "fail"), detail
+
+
+def positive_seconds(text: str) -> float:
+    """--timeout: a finite value greater than 0, so subprocess.run never gets a bad timeout to raise on."""
+    try:
+        value = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"invalid float value: {text!r}") from None
+    if not math.isfinite(value):
+        raise argparse.ArgumentTypeError("must be a finite number")
+    if value <= 0:
+        raise argparse.ArgumentTypeError("must be greater than 0")
+    return value
+
+
+def wine_command(text: str) -> list[str]:
+    """--wine: split into a command the way a shell would, refusing blank or malformed values up front."""
+    try:
+        parts = shlex.split(text)
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(f"malformed --wine: {e}") from None
+    if not parts:
+        raise argparse.ArgumentTypeError("must be a nonempty command")
+    return parts
+
+
+def read_tests(path: str) -> list[dict] | None:
+    """The tests in a `ctest --show-only=json-v1` file, or None when it is not one."""
+    try:
+        with open(path, encoding="utf-8-sig") as f:
+            doc = json.load(f)
+    except (OSError, ValueError) as e:
+        print(f"ERROR: cannot read {path}: {e}", file=sys.stderr)
+        return None
+    if not isinstance(doc, dict) or not isinstance(doc.get("tests", []), list):
+        print(f"ERROR: {path} is not the output of ctest --show-only=json-v1", file=sys.stderr)
+        return None
+    return doc.get("tests", [])
 
 
 def main() -> int:
@@ -85,24 +213,30 @@ def main() -> int:
     ap.add_argument("--tests", required=True, help="ctest --show-only=json-v1 output from the Windows build")
     ap.add_argument("--windows-root", required=True, help="the Windows checkout the tests were listed in")
     ap.add_argument("--root", default=ROOT, help="the Linux checkout (default: this repository)")
-    ap.add_argument("--wine", default=os.environ.get("WINE", "wine"), help="Wine command (default: $WINE or wine)")
+    ap.add_argument("--wine", type=wine_command, default=os.environ.get("WINE", "wine"),
+                    help="Wine command (default: $WINE or wine)")
     ap.add_argument("--require", action="append", default=[], help="a test that must pass (repeatable)")
-    ap.add_argument("--timeout", type=float, default=120.0, help="seconds per test (default 120)")
+    ap.add_argument("--timeout", type=positive_seconds, default=120.0, help="seconds per test (default 120)")
     ap.add_argument("--summary", help="append a Markdown table to this file (e.g. $GITHUB_STEP_SUMMARY)")
+    ap.add_argument("--label", help="named in the summary's heading, e.g. the Wine version")
     args = ap.parse_args()
 
-    with open(args.tests, encoding="utf-8-sig") as f:
-        tests = json.load(f).get("tests", [])
-    wine = shlex.split(args.wine)
+    tests = read_tests(args.tests)
+    if tests is None:
+        return 2
+    wine = args.wine
     results = {}
-    for test in tests:
-        name = test.get("name", "?")
-        status, detail = run_test(test, args, wine)
-        results[name] = status
-        print(f"[{status.upper()}] {name}", flush=True)
-        if status != "pass":
-            for line in detail.rstrip().splitlines()[-40:]:
-                print(f"    {line}")
+    prefix = os.environ.get("WINEPREFIX") or os.path.join(os.path.expanduser("~"), ".wine")
+    with DriveMap(args.windows_root, args.root, prefix) as drive:
+        print(drive.note, flush=True)
+        for test in tests:
+            name = test.get("name", "?")
+            status, detail = run_test(test, args, wine)
+            results[name] = status
+            print(f"[{status.upper()}] {name}", flush=True)
+            if status != "pass":
+                for line in detail.rstrip().splitlines()[-40:]:
+                    print(f"    {line}")
 
     missing = [n for n in args.require if n not in results]
     failed_required = [n for n in args.require if results.get(n) != "pass"]
@@ -115,13 +249,18 @@ def main() -> int:
         print("required tests that did not pass: " + ", ".join(failed_required))
 
     if args.summary:
-        with open(args.summary, "a", encoding="utf-8") as f:
-            f.write("### Windows tests under Wine\n\n")
-            f.write(f"{counts['pass']} passed, {counts['fail']} failed, {counts['skip']} skipped.\n\n")
-            f.write("| Test | Result | Required |\n|---|---|---|\n")
-            for name, status in results.items():
-                f.write(f"| `{name}` | {status} | {'yes' if name in args.require else ''} |\n")
-            f.write("\n")
+        try:
+            _make_parent(args.summary)
+            with open(args.summary, "a", encoding="utf-8", newline="\n") as f:
+                f.write(f"### Windows tests under {args.label or 'Wine'}\n\n")
+                f.write(f"{counts['pass']} passed, {counts['fail']} failed, {counts['skip']} skipped.\n\n")
+                f.write("| Test | Result | Required |\n|---|---|---|\n")
+                for name, status in results.items():
+                    f.write(f"| `{name}` | {status} | {'yes' if name in args.require else ''} |\n")
+                f.write("\n")
+        except OSError as e:
+            print(f"ERROR: cannot write the summary {args.summary}: {e.strerror or e}", file=sys.stderr)
+            return 1
     return 1 if failed_required else 0
 
 

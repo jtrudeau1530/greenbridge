@@ -181,6 +181,45 @@ class GlbAtomicTests(unittest.TestCase):
             self.assertIn(target.read_bytes(), allowed)
             self.assertEqual(os.listdir(directory), [target.name])
 
+    @unittest.skipUnless(os.name == "posix", "POSIX permission bits")
+    def test_published_glb_keeps_permission_bits(self):
+        # The staging file is created 0600; the published GLB must not lose group/other read.
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "mesh.glb"
+            old = os.umask(0o022)
+            try:
+                glb_writer.write_glb(target, self.primitives())
+                self.assertEqual(target.stat().st_mode & 0o777, 0o644)
+                os.chmod(target, 0o640)
+                glb_writer.write_glb(target, self.primitives(2))
+                self.assertEqual(target.stat().st_mode & 0o777, 0o640)
+            finally:
+                os.umask(old)
+
+    def test_concurrent_new_files_leave_the_umask_alone(self):
+        # A new file's mode comes from a probe file (file_mode.published_mode), never from setting the umask to 0
+        # and back, which could leave a threaded process at umask 0.
+        import file_mode
+        modes = []
+        with tempfile.TemporaryDirectory() as directory,                 mock.patch.object(file_mode.os, "umask", side_effect=AssertionError("umask touched")) as umask:
+            threads = [threading.Thread(target=lambda i=i: modes.append(
+                file_mode.published_mode(os.path.join(directory, f"new{i}.glb")))) for i in range(2)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+        umask.assert_not_called()
+        self.assertEqual(len(modes), 2)
+        self.assertEqual(modes[0], modes[1])
+
+    def test_published_glb_is_writable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "mesh.glb"
+            glb_writer.write_glb(target, self.primitives())
+            self.assertTrue(os.access(target, os.W_OK))
+            glb_writer.write_glb(target, self.primitives(2))
+            self.assertEqual(target.read_bytes(), glb_writer.build_glb(self.primitives(2)))
+
     def test_creates_missing_parent_directory(self):
         with tempfile.TemporaryDirectory() as directory:
             target = Path(directory) / "nested" / "mesh.glb"

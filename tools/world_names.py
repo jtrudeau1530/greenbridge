@@ -22,7 +22,7 @@ pull requests. Tests use synthetic names only.
 
 Usage:
     python -I tools/world_names.py build --manifest <models> --scan <scan.json> \
-        --names <names.txt> --xml <common-concat.txt> --out <names.json>
+        --names <names.txt> --rpf9-names <rpf9_names.json> --xml <common-concat.txt> --out <names.json>
     python -I tools/world_names.py resolve --dict <names.json> \
         --maps <maps.json> --archetypes <archetypes.json> --out <report.json>
 """
@@ -34,6 +34,7 @@ import json
 import os
 import re
 import sys
+import tempfile
 
 MASK32 = 0xFFFFFFFF
 MASK64 = 0xFFFFFFFFFFFFFFFF
@@ -181,6 +182,20 @@ def _collisions(table: dict[int, set[str]]) -> int:
     return sum(1 for names in table.values() if len(names) > 1)
 
 
+_XML_ENTITY = re.compile(r"&(?:(amp|lt|gt|quot|apos)|#([0-9]+)|#x([0-9A-Fa-f]+));")
+_XML_NAMED = {"amp": "&", "lt": "<", "gt": ">", "quot": '"', "apos": "'"}
+
+
+def _xml_unescape(text: str) -> str:
+    """Decode XML's five named entities and numeric character references; leave anything else as written."""
+    def one(m: re.Match) -> str:
+        if m[1]:
+            return _XML_NAMED[m[1]]
+        code = int(m[2]) if m[2] else int(m[3], 16)
+        return chr(code) if 0 < code <= 0x10FFFF else m[0]
+    return _XML_ENTITY.sub(one, text)
+
+
 class NameDictionary:
     """Hash -> names, with exact and derived (LOD spelling) tables kept apart."""
 
@@ -242,6 +257,20 @@ class NameDictionary:
             added += int(self.add(stem, source=source))
         return added
 
+    def add_rpf9_names(self, path: str, *, source: str = "rpf9_names") -> int:
+        """Names from an ``rpf9_names.py`` index (``files[].names``, spelled ``name.#dr``, ``name.#ft`` ...)."""
+        with open(path, encoding="utf-8-sig") as handle:
+            data = json.load(handle)
+        files = data.get("files") if isinstance(data, dict) else None
+        if not isinstance(files, list):
+            return 0
+        added = 0
+        for entry in files:
+            names = entry.get("names") if isinstance(entry, dict) else None
+            for name in names if isinstance(names, list) else ():
+                added += self.add_model_name(name, source=source)
+        return added
+
     def add_names_file(self, path: str, *, source: str = "names") -> int:
         added = 0
         with open(path, encoding="utf-8-sig", errors="replace") as handle:
@@ -254,16 +283,25 @@ class NameDictionary:
     def add_xml(self, path: str, *, source: str = "xml") -> int:
         with open(path, encoding="utf-8-sig", errors="replace") as handle:
             text = handle.read()
+
+        # Comments are dropped, CDATA and processing instructions are kept. The input may be many files joined
+        # together, so an unterminated comment ends at the next XML declaration, not at the end of the input.
+        text = re.sub(r"(<!\[CDATA\[.*?\]\]>|<\?.*?\?>)|<!--.*?(?:-->|(?=<\?xml)|\Z)",
+                      lambda m: m[1] or "", text, flags=re.S)
+
         added = 0
         for match in re.finditer(r"<filename>(.*?)</filename>", text, re.S):
-            raw = match.group(1).strip().replace("\\", "/")
+            raw = _xml_unescape(match.group(1)).strip().replace("\\", "/")
             base = raw.rsplit("/", 1)[-1]
             added += int(self.add(base, source=source + "_filename"))
             if "." in base:
                 added += int(self.add(base.rsplit(".", 1)[0], source=source + "_filename"))
         for match in re.finditer(r"<(?:[A-Za-z0-9_]+:)?(?:name|Name|locationName)>(.*?)</", text, re.S):
-            value = match.group(1).strip()
-            if value and len(value) <= 120 and "<" not in value:
+            raw = match.group(1)
+            if "<" in raw:
+                continue
+            value = _xml_unescape(raw).strip()
+            if value and len(value) <= 120:
                 added += int(self.add(value, source=source + "_name"))
         return added
 
@@ -334,17 +372,22 @@ class NameDictionary:
         out = cls()
         if not isinstance(data, dict) or data.get("format") != 1:
             raise ValueError("not a world_names dictionary (format 1)")
-        for key, names in (data.get("names") or {}).items():
-            for name in (names if isinstance(names, list) else ()):
-                out.add(name, source="dictionary")
-        for key, names in (data.get("derived") or {}).items():
-            for name in (names if isinstance(names, list) else ()):
-                out.add(name, derived=True, source="dictionary_derived")
+        for field, derived, source in (("names", False, "dictionary"),
+                                       ("derived", True, "dictionary_derived")):
+            table = data.get(field, {})
+            if not isinstance(table, dict):
+                raise ValueError(f"dictionary {field!r} must be a hash-to-names object")
+            for names in table.values():
+                if not isinstance(names, list):
+                    raise ValueError(f"dictionary {field!r} entries must be lists of names")
+                for name in names:
+                    if not out.add(name, derived=derived, source=source):
+                        raise ValueError(f"dictionary {field!r} has an invalid name")
         return out
 
 
 def build_dictionary(manifests=(), scans=(), names_files=(), xml_files=(), *,
-                     derive_lod: bool = False) -> NameDictionary:
+                     derive_lod: bool = False, rpf9_names=()) -> NameDictionary:
     dictionary = NameDictionary()
     for path in manifests:
         if os.path.isdir(path):
@@ -360,6 +403,8 @@ def build_dictionary(manifests=(), scans=(), names_files=(), xml_files=(), *,
         dictionary.add_scan(path)
     for path in names_files:
         dictionary.add_names_file(path)
+    for path in rpf9_names:
+        dictionary.add_rpf9_names(path)
     for path in xml_files:
         dictionary.add_xml(path)
     if derive_lod:
@@ -498,12 +543,22 @@ def _load_json(path: str) -> dict:
         return json.load(handle)
 
 
+def _same_report_path(first: str, second: str) -> bool:
+    if os.path.normcase(os.path.realpath(first)) == os.path.normcase(os.path.realpath(second)):
+        return True
+    try:
+        return os.path.samefile(first, second)
+    except OSError:
+        return False
+
+
 def _build(args) -> int:
-    if not (args.manifest or args.scan or args.names or args.xml):
-        print("build: at least one --manifest/--scan/--names/--xml source is required", file=sys.stderr)
+    if not (args.manifest or args.scan or args.names or args.xml or args.rpf9_names):
+        print("build: at least one --manifest/--scan/--names/--rpf9-names/--xml source is required",
+              file=sys.stderr)
         return 2
     dictionary = build_dictionary(args.manifest, args.scan, args.names, args.xml,
-                                  derive_lod=args.derive_lod)
+                                  derive_lod=args.derive_lod, rpf9_names=args.rpf9_names)
     counts = dictionary.counts()
     if counts["exact_names"] == 0:
         print("build: no names recovered from the given sources", file=sys.stderr)
@@ -514,7 +569,15 @@ def _build(args) -> int:
 
 
 def _resolve(args) -> int:
-    dictionary = NameDictionary.from_json(_load_json(args.dict))
+    if args.out:
+        for path in (args.dict, *args.maps, *args.archetypes):
+            if _same_report_path(args.out, path):
+                raise ValueError(
+                    f"resolve: --out {args.out} would overwrite input {path}")
+    try:
+        dictionary = NameDictionary.from_json(_load_json(args.dict))
+    except ValueError as exc:
+        raise ValueError(f"{args.dict}: {exc}") from None
     report = {"dictionary": dictionary.counts(), "maps": {}, "archetypes": {}}
     maps = collections.Counter()
     for path in args.maps:
@@ -540,13 +603,13 @@ def _resolve(args) -> int:
 
 def _write_json(path: str, data: dict) -> None:
     directory = os.path.dirname(os.path.abspath(path))
-    if directory:
-        os.makedirs(directory, exist_ok=True)
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as handle:
-        json.dump(data, handle, indent=1, sort_keys=True)
-        handle.write("\n")
-    os.replace(tmp, path)
+    os.makedirs(directory, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=directory, prefix=".world-names-") as staging:
+        tmp = os.path.join(staging, "report.json")
+        with open(tmp, "w", encoding="utf-8", newline="\n") as handle:
+            json.dump(data, handle, indent=1, sort_keys=True)
+            handle.write("\n")
+        os.replace(tmp, path)
 
 
 def main(argv=None) -> int:
@@ -560,6 +623,8 @@ def main(argv=None) -> int:
                        help="rpf9dump levels scan JSON with entries[].Path")
     build.add_argument("--names", action="append", default=[],
                        help="text file with one recovered name per line")
+    build.add_argument("--rpf9-names", action="append", default=[],
+                       help="rpf9_names.py index JSON (files[].names)")
     build.add_argument("--xml", action="append", default=[],
                        help="common.rpf XML or a concatenated XML text")
     build.add_argument("--derive-lod", action="store_true",
@@ -587,4 +652,8 @@ def main(argv=None) -> int:
 
 
 if __name__ == "__main__":
+    try:  # a redirected stdout is strict ANSI code page under -I; write '?' for what it cannot encode
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
     sys.exit(main())

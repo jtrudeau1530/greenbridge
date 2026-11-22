@@ -399,6 +399,78 @@ class TestGlbMaterialsAndTextures(unittest.TestCase):
         self.assertTrue(mat.get("doubleSided"))
         self.assertEqual(mat["pbrMetallicRoughness"]["baseColorFactor"], [0.2, 0.4, 0.6, 1.0])
 
+    def _alpha_materials(self, materials: dict, *, has_uvs: bool = False) -> list[dict]:
+        prims = [
+            dict(_simple_triangle_primitive(has_uvs=has_uvs, offset=5.0 * i), material=key)
+            for i, key in enumerate(materials)
+        ]
+        return glb_writer.read_glb_summary(glb_writer.build_glb(prims, materials=materials))["json"]["materials"]
+
+    def test_alpha_mode_inferred_and_explicit(self):
+        red = (1.0, 0.0, 0.0)
+        mats = self._alpha_materials({
+            "plain": {"base_color_factor": red},
+            "half": {"base_color_factor": red + (0.5,)},
+            "opaque": {"base_color_factor": red + (0.5,), "alpha_mode": "OPAQUE"},
+            "blend": {"base_color_factor": red, "alpha_mode": "BLEND"},
+            "mask_default": {"alpha_mode": "MASK"},
+            "mask_low": {"base_color_factor": red + (0.4,), "alpha_mode": "MASK", "alpha_cutoff": 0.5},
+        })
+        modes = {m["name"]: (m.get("alphaMode"), m.get("alphaCutoff")) for m in mats}
+        self.assertEqual(modes, {
+            "plain": (None, None),
+            "half": ("BLEND", None),
+            "opaque": (None, None),
+            "blend": ("BLEND", None),
+            "mask_default": ("MASK", None),
+            "mask_low": ("MASK", 0.5),
+        })
+        alphas = [m["pbrMetallicRoughness"]["baseColorFactor"][3] for m in mats]
+        self.assertEqual(alphas, [1.0, 0.5, 0.5, 1.0, 1.0, 0.4])
+
+    def test_opaque_materials_stay_byte_identical(self):
+        prim = dict(_simple_triangle_primitive(), material="m1")
+        plain = glb_writer.build_glb([prim], {"m1": {"base_color_factor": (1.0, 0.0, 0.0)}})
+        explicit = glb_writer.build_glb(
+            [prim], {"m1": {"base_color_factor": (1.0, 0.0, 0.0, 1.0), "alpha_mode": "OPAQUE"}},
+        )
+        self.assertEqual(plain, explicit)
+        self.assertNotIn(b"alphaMode", plain)
+        self.assertNotIn(b"alphaMode", glb_writer.build_glb([prim]))
+
+    def test_alpha_mode_on_deduplicated_textured_material(self):
+        png = _make_synthetic_png(1, 1, bytes([0, 255, 0, 0]))
+        materials = {
+            "leaf": {"png_bytes": png, "alpha_mode": "MASK", "alpha_cutoff": 0.25},
+            "no_mode": {"png_bytes": png},  # transparent texel alone never selects a mode
+        }
+        prims = [
+            dict(_simple_triangle_primitive(offset=o), material=key)
+            for o, key in ((0.0, "leaf"), (5.0, "leaf"), (10.0, "no_mode"))
+        ]
+        gltf = glb_writer.read_glb_summary(glb_writer.build_glb(prims, materials=materials))["json"]
+        leaf, no_mode = gltf["materials"]
+        self.assertEqual((leaf["alphaMode"], leaf["alphaCutoff"]), ("MASK", 0.25))
+        self.assertNotIn("alphaMode", no_mode)
+        self.assertEqual([p["material"] for p in gltf["meshes"][0]["primitives"]], [0, 0, 1])
+        self.assertEqual(len(gltf["textures"]), 1)
+
+    def test_invalid_alpha_specs_raise_error(self):
+        prim = dict(_simple_triangle_primitive(has_uvs=False), material="m1")
+        for spec in (
+            {"alpha_mode": "blend"},
+            {"alpha_mode": "TRANSPARENT"},
+            {"alpha_mode": 1},
+            {"alpha_cutoff": 0.5},
+            {"alpha_mode": "BLEND", "alpha_cutoff": 0.5},
+            {"alpha_mode": "MASK", "alpha_cutoff": float("nan")},
+            {"alpha_mode": "MASK", "alpha_cutoff": -0.1},
+            {"alpha_mode": "MASK", "alpha_cutoff": True},
+            {"alpha_mode": "MASK", "alpha_cutoff": "0.5"},
+        ):
+            with self.subTest(spec=spec), self.assertRaises(glb_writer.GlbError):
+                glb_writer.build_glb([prim], {"m1": spec})
+
 
 class TestGlbWriterValidationAndErrors(unittest.TestCase):
     """Tests error cases and validation in build_glb and helper functions."""
@@ -646,6 +718,55 @@ class TestObjParserAndBounds(unittest.TestCase):
         self.assertAlmostEqual(uvs[2][0], 0.0)
         self.assertAlmostEqual(uvs[2][1], 0.0)   # 1.0 - 1.0
 
+    def test_parse_obj_generated_normals_cross_uv_seams(self):
+        # The second triangle has twice the area of the first and a different UV
+        # on each shared corner. They contribute +2Y and +Z to the shared normals.
+        expected = (0.0, 2 / math.sqrt(5), 1 / math.sqrt(5))
+        for suffix in ("", "/1"):
+            with self.subTest(explicit_normal=bool(suffix)):
+                obj_text = "\n".join([
+                    "v 0 0 0", "v 1 0 0", "v 0 1 0", "v 0 0 2",
+                    "vt 0 0", "vt 1 0", "vt 0 1", "vt .75 0", "vt .25 0", "vt .25 1",
+                    "vn 1 0 0",
+                    "s 1",
+                    "f 1/1 2/2 3/3",
+                    f"f 2/4 1/5{suffix} 4/6",
+                ])
+                prim, = glb_writer.parse_obj(obj_text, is_path=False, up_axis="y")
+                self.assertEqual(len(prim["positions"]), 6)
+                normals = {
+                    (position, uv): normal
+                    for position, uv, normal in zip(prim["positions"], prim["uvs"], prim["normals"])
+                }
+                shared_edge = [
+                    ((0.0, 0.0, 0.0), (0.0, 1.0), expected),
+                    ((0.0, 0.0, 0.0), (0.25, 1.0), (1.0, 0.0, 0.0) if suffix else expected),
+                    ((1.0, 0.0, 0.0), (1.0, 1.0), expected),
+                    ((1.0, 0.0, 0.0), (0.75, 1.0), expected),
+                ]
+                for position, uv, expected_normal in shared_edge:
+                    for actual, target in zip(normals[position, uv], expected_normal):
+                        self.assertAlmostEqual(actual, target)
+
+    def test_parse_obj_explicit_faces_preserve_generated_hard_edge(self):
+        # A top face without normals shares two positions with a fully normaled side.
+        vertices = ["v 0 1 0", "v 1 1 0", "v 1 1 1", "v 0 1 1", "v 0 0 1", "v 1 0 1"]
+        top = "f 1 4 3 2"
+        side = "f 5//1 6//1 3//1 4//1"
+        for faces in ((top, side), (side, top)):
+            with self.subTest(first_face=faces[0]):
+                obj_text = "\n".join([*vertices, "vn 0 0 1", *faces])
+                prim, = glb_writer.parse_obj(obj_text, is_path=False, up_axis="y")
+                normals_by_face = [
+                    {(0.0, 1.0, 0.0)} if face == top else {(0.0, 0.0, 1.0)}
+                    for face in faces
+                ]
+                self.assertEqual(len(prim["positions"]), 8)
+                self.assertEqual(len(prim["indices"]), 12)
+                for start, expected in zip((0, 6), normals_by_face):
+                    actual = {prim["normals"][i] for i in prim["indices"][start:start + 6]}
+                    self.assertEqual(actual, expected)
+
     def test_parse_obj_quad_fan_triangulation(self):
         obj_text = "\n".join([
             "v 0 0 0",
@@ -691,6 +812,50 @@ class TestObjParserAndBounds(unittest.TestCase):
 
         with self.assertRaises(glb_writer.GlbError):
             glb_writer.parse_obj("", is_path=False, scale=float("nan"))
+
+
+class TestConcaveObjFaces(unittest.TestCase):
+    def test_notched_face_preserves_its_surface_and_corner_attributes(self):
+        # A square with a 2 x 3 notch, including a collinear point on its base.
+        # Embed the outline in YZ so the down-axis projection matters.
+        outline = [(0, 0), (2, 0), (4, 0), (4, 4), (3, 4), (3, 1), (1, 1), (1, 4), (0, 4)]
+        vertices = [f"v 10 {20 + u} {30 + v}" for u, v in outline]
+        uvs = [f"vt {i / 16} 0.25" for i in range(len(outline))]
+        for reverse in (False, True):
+            for scale in (1, -1):
+                with self.subTest(reverse=reverse, scale=scale):
+                    order = list(range(len(outline)))
+                    if reverse:
+                        order.reverse()
+                    text = "\n".join(vertices + uvs + ["f " + " ".join(f"{i + 1}/{i + 1}" for i in order)])
+                    prim, = glb_writer.parse_obj(text, is_path=False, up_axis="y", scale=scale)
+                    positions = prim["positions"]
+                    expected_uvs = {
+                        (10 * scale, (20 + u) * scale, (30 + v) * scale): (i / 16, 0.75)
+                        for i, (u, v) in enumerate(outline)
+                    }
+                    self.assertEqual(dict(zip(positions, prim["uvs"])), expected_uvs)
+                    sign = (-1 if reverse else 1) * scale
+                    self.assertEqual(set(prim["normals"]), {(sign, 0, 0)})
+                    idx = prim["indices"]
+                    self.assertEqual(len(idx), (len(outline) - 2) * 3)
+                    total = 0
+                    for i in range(0, len(idx), 3):
+                        a, b, c = (positions[j] for j in idx[i:i + 3])
+                        area2 = (b[1] - a[1]) * (c[2] - a[2]) - (b[2] - a[2]) * (c[1] - a[1])
+                        self.assertGreater(area2 * sign, 0)
+                        total += abs(area2)
+                    self.assertEqual(total, 2 * (4 * 4 - 2 * 3))
+
+    def test_valid_first_corner_fan_keeps_its_index_order(self):
+        for shape in ([(0, 0), (2, 0), (3, 2), (1, 3), (-1, 2)],
+                      [(2, 1), (4, 0), (2, 4), (0, 0)]):
+            with self.subTest(shape=shape):
+                lines = [f"v {x} {y} 0" for x, y in shape]
+                lines.append("f " + " ".join(str(i + 1) for i in range(len(shape))))
+                prim, = glb_writer.parse_obj("\n".join(lines), is_path=False, up_axis="y")
+                self.assertEqual(prim["positions"], [(x, y, 0) for x, y in shape])
+                self.assertEqual(prim["indices"], [j for i in range(1, len(shape) - 1) for j in (0, i, i + 1)])
 
 
 class TestGlbWriterMainCli(unittest.TestCase):

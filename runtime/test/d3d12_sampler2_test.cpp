@@ -137,24 +137,28 @@ std::vector<D3D12_SAMPLER_DESC> plain_cases() {
 struct Edge {
     const char* name;
     bool written, want;  // `want`: whether the PC runtime writes the slot (RTX 4090, driver 621.14, and WARP)
+    // The description asks for non-normalized coordinates: a host runtime without D3D12_OPTIONS17's
+    // NonNormalizedCoordinateSamplersSupported answers it differently, so it is not compared with such a host.
+    bool non_normalized;
 };
 
 // Which descriptions are written and which leave the slot as it was, on any ID3D12Device11: ours, or the host's PC
 // runtime to compare with.
 std::vector<Edge> edge_answers(ID3D12Device11* device, Slots& slots) {
-    const auto written = [&](const D3D12_SAMPLER_DESC2* d) {
+    const auto edge = [&](const char* name, const D3D12_SAMPLER_DESC2* d, bool want) {
         const D3D12_CPU_DESCRIPTOR_HANDLE h = slots.take();
         device->CreateSampler2(d, h);
-        return !slots.unwritten(h);
+        const bool non_normalized = d && (d->Flags & D3D12_SAMPLER_FLAG_NON_NORMALIZED_COORDINATES);
+        return Edge{name, !slots.unwritten(h), want, non_normalized};
     };
     const D3D12_SAMPLER_DESC2 point = desc2(sampler(D3D12_FILTER_MIN_MAG_MIP_POINT, D3D12_TEXTURE_ADDRESS_MODE_CLAMP, 0),
                                             D3D12_SAMPLER_FLAG_NON_NORMALIZED_COORDINATES);
-    const auto nn = [&](auto change) {
-        D3D12_SAMPLER_DESC2 d = point;
-        change(d);
-        return written(&d);
-    };
     using D = D3D12_SAMPLER_DESC2;
+    const auto nn = [&](const char* name, auto change, bool want) {
+        D d = point;
+        change(d);
+        return edge(name, &d, want);
+    };
     D unknown = point;
     unknown.Flags = D3D12_SAMPLER_FLAGS(0x4);
     D both = with_uint_border(point, 0, 0, 0, 1);
@@ -162,35 +166,34 @@ std::vector<Edge> edge_answers(ID3D12Device11* device, Slots& slots) {
     D uint_custom = with_uint_border(desc2(sampler(D3D12_FILTER_MIN_MAG_MIP_LINEAR, D3D12_TEXTURE_ADDRESS_MODE_BORDER)),
                                      7, 0x40000000, 1, 1);
     return {
-        {"null description", written(nullptr), false},
-        {"unknown flag 0x4", written(&unknown), false},
-        {"UINT border, custom colour", written(&uint_custom), true},
-        {"UINT border and non-normalized", written(&both), true},
-        {"non-normalized, point, clamp, LOD 0", written(&point), true},
-        {"non-normalized, linear, mip point",
-         nn([](D& d) { d.Filter = D3D12_FILTER_MIN_MAG_LINEAR_MIP_POINT; }), true},
-        {"non-normalized, mip linear", nn([](D& d) { d.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR; }), false},
-        {"non-normalized, min point mag linear",
-         nn([](D& d) { d.Filter = D3D12_FILTER_MIN_POINT_MAG_LINEAR_MIP_POINT; }), false},
-        {"non-normalized, anisotropic", nn([](D& d) { d.Filter = D3D12_FILTER_ANISOTROPIC; d.MaxAnisotropy = 8; }),
-         false},
-        {"non-normalized, comparison",
-         nn([](D& d) { d.Filter = D3D12_FILTER_COMPARISON_MIN_MAG_MIP_POINT; d.ComparisonFunc = D3D12_COMPARISON_FUNC_LESS; }),
-         false},
-        {"non-normalized, minimum", nn([](D& d) { d.Filter = D3D12_FILTER_MINIMUM_MIN_MAG_MIP_POINT; }), true},
-        {"non-normalized, maximum linear",
-         nn([](D& d) { d.Filter = D3D12_FILTER_MAXIMUM_MIN_MAG_LINEAR_MIP_POINT; }), true},
-        {"non-normalized, MaxAnisotropy 16 on a point filter", nn([](D& d) { d.MaxAnisotropy = 16; }), true},
-        {"non-normalized, ComparisonFunc on a point filter",
-         nn([](D& d) { d.ComparisonFunc = D3D12_COMPARISON_FUNC_LESS; }), true},
-        {"non-normalized, AddressU wrap", nn([](D& d) { d.AddressU = D3D12_TEXTURE_ADDRESS_MODE_WRAP; }), false},
-        {"non-normalized, AddressV mirror", nn([](D& d) { d.AddressV = D3D12_TEXTURE_ADDRESS_MODE_MIRROR; }), false},
-        {"non-normalized, AddressW wrap", nn([](D& d) { d.AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP; }), true},
-        {"non-normalized, border", nn([](D& d) { d.AddressU = D3D12_TEXTURE_ADDRESS_MODE_BORDER; }), true},
-        {"non-normalized, MaxLOD 5", nn([](D& d) { d.MaxLOD = 5; }), false},
-        {"non-normalized, MaxLOD -0", nn([](D& d) { d.MaxLOD = -0.0f; }), true},
-        {"non-normalized, MinLOD and MaxLOD 1", nn([](D& d) { d.MinLOD = d.MaxLOD = 1; }), false},
-        {"non-normalized, MipLODBias 1", nn([](D& d) { d.MipLODBias = 1; }), false},
+        edge("null description", nullptr, false),
+        edge("unknown flag 0x4", &unknown, false),
+        edge("UINT border, custom colour", &uint_custom, true),
+        edge("UINT border and non-normalized", &both, true),
+        edge("non-normalized, point, clamp, LOD 0", &point, true),
+        nn("non-normalized, linear, mip point", [](D& d) { d.Filter = D3D12_FILTER_MIN_MAG_LINEAR_MIP_POINT; }, true),
+        nn("non-normalized, mip linear", [](D& d) { d.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR; }, false),
+        nn("non-normalized, min point mag linear",
+           [](D& d) { d.Filter = D3D12_FILTER_MIN_POINT_MAG_LINEAR_MIP_POINT; }, false),
+        nn("non-normalized, anisotropic", [](D& d) { d.Filter = D3D12_FILTER_ANISOTROPIC; d.MaxAnisotropy = 8; },
+           false),
+        nn("non-normalized, comparison",
+           [](D& d) { d.Filter = D3D12_FILTER_COMPARISON_MIN_MAG_MIP_POINT; d.ComparisonFunc = D3D12_COMPARISON_FUNC_LESS; },
+           false),
+        nn("non-normalized, minimum", [](D& d) { d.Filter = D3D12_FILTER_MINIMUM_MIN_MAG_MIP_POINT; }, true),
+        nn("non-normalized, maximum linear", [](D& d) { d.Filter = D3D12_FILTER_MAXIMUM_MIN_MAG_LINEAR_MIP_POINT; },
+           true),
+        nn("non-normalized, MaxAnisotropy 16 on a point filter", [](D& d) { d.MaxAnisotropy = 16; }, true),
+        nn("non-normalized, ComparisonFunc on a point filter",
+           [](D& d) { d.ComparisonFunc = D3D12_COMPARISON_FUNC_LESS; }, true),
+        nn("non-normalized, AddressU wrap", [](D& d) { d.AddressU = D3D12_TEXTURE_ADDRESS_MODE_WRAP; }, false),
+        nn("non-normalized, AddressV mirror", [](D& d) { d.AddressV = D3D12_TEXTURE_ADDRESS_MODE_MIRROR; }, false),
+        nn("non-normalized, AddressW wrap", [](D& d) { d.AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP; }, true),
+        nn("non-normalized, border", [](D& d) { d.AddressU = D3D12_TEXTURE_ADDRESS_MODE_BORDER; }, true),
+        nn("non-normalized, MaxLOD 5", [](D& d) { d.MaxLOD = 5; }, false),
+        nn("non-normalized, MaxLOD -0", [](D& d) { d.MaxLOD = -0.0f; }, true),
+        nn("non-normalized, MinLOD and MaxLOD 1", [](D& d) { d.MinLOD = d.MaxLOD = 1; }, false),
+        nn("non-normalized, MipLODBias 1", [](D& d) { d.MipLODBias = 1; }, false),
     };
 }
 
@@ -204,7 +207,9 @@ leonida::gfx10::SamplerWords words_of(const std::vector<unsigned char>& bytes) {
 
 int main() {
     vktest::Device d;
-    EXPECT(d.create());
+    const auto device_status = d.initialize();
+    if (device_status == vktest::DeviceStatus::unavailable) return 77;   // no Vulkan GPU: ctest skips
+    if (device_status != vktest::DeviceStatus::ready) return 1;
     {
         rt::d3d12::VulkanDeviceInfo info{};
         info.get_instance_proc = d.instance_proc;
@@ -235,6 +240,20 @@ int main() {
             EXPECT(via2(desc2(desc)) == via1(desc));
             ++plain;
         }
+
+        // A comparison that always returns zero still needs a comparison-enabled Vulkan sampler,
+        // alongside an ordinary sampler with otherwise identical settings in the same set.
+        const auto regular = sampler(D3D12_FILTER_MIN_MAG_MIP_POINT, D3D12_TEXTURE_ADDRESS_MODE_CLAMP);
+        auto comparison = regular;
+        comparison.Filter = D3D12_FILTER_COMPARISON_MIN_MAG_MIP_POINT;
+        const auto regular_words = words_of(via1(regular));
+        const auto never_words = words_of(via1(comparison));
+        EXPECT(never_words != regular_words);
+        EXPECT(words_of(via2(desc2(comparison))) == never_words);
+        const auto regular_info = leonida::gfx10::vulkan_sampler(leonida::gfx10::decode(regular_words));
+        const auto never_info = leonida::gfx10::vulkan_sampler(leonida::gfx10::decode(never_words));
+        EXPECT(!regular_info.compareEnable);
+        EXPECT(never_info.compareEnable && never_info.compareOp == VK_COMPARE_OP_NEVER);
 
         // UINT border colours take the S#'s border types as the float ones do, marked as integers in
         // BORDER_COLOR_PTR (kIntegerBorderPtr), so that they are their own key and VK_BORDER_COLOR_INT_* in Vulkan.
@@ -309,16 +328,24 @@ int main() {
                 D3D12_FEATURE_DATA_D3D12_OPTIONS17 theirs17{};
                 EXPECT(SUCCEEDED(host->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS17, &theirs17,
                                                            sizeof(theirs17))));
-                if (!theirs17.NonNormalizedCoordinateSamplersSupported)
-                    std::printf("host reports no non-normalized samplers: its answers may differ from the layer's\n");
-                EXPECT(!theirs17.NonNormalizedCoordinateSamplersSupported || ours17.NonNormalizedCoordinateSamplersSupported);
+                // Without non-normalized samplers the host leaves those descriptions unwritten, so only the other
+                // edge cases are compared with it; the layer's answers to all of them were checked above.
+                const bool host_nn = theirs17.NonNormalizedCoordinateSamplersSupported;
+                EXPECT(!host_nn || ours17.NonNormalizedCoordinateSamplersSupported);
                 const std::vector<Edge> theirs = edge_answers(host.p, host_slots);
+                std::size_t compared = 0;
                 for (std::size_t i = 0; i < ours.size(); ++i) {
+                    if (ours[i].non_normalized && !host_nn) continue;
+                    ++compared;
                     if (ours[i].written == theirs[i].written) continue;
                     std::fprintf(stderr, "%s: ours written %d, host runtime %d\n", ours[i].name, ours[i].written,
                                  theirs[i].written);
                     return 1;
                 }
+                if (!host_nn)
+                    std::printf("host reports no non-normalized samplers: %zu of %zu edge cases compared with it, "
+                                "the non-normalized ones against their recorded answers only\n",
+                                compared, ours.size());
                 // The host also tells the UINT and float border colours apart, and normalized from not.
                 const auto host2 = [&](const D3D12_SAMPLER_DESC2& desc) {
                     const D3D12_CPU_DESCRIPTOR_HANDLE h = host_slots.take();
@@ -326,7 +353,8 @@ int main() {
                     return host_slots.bytes(h);
                 };
                 const D3D12_SAMPLER_DESC point = sampler(D3D12_FILTER_MIN_MAG_MIP_POINT, D3D12_TEXTURE_ADDRESS_MODE_CLAMP, 0);
-                EXPECT(host2(desc2(point)) != host2(desc2(point, D3D12_SAMPLER_FLAG_NON_NORMALIZED_COORDINATES)));
+                if (host_nn)
+                    EXPECT(host2(desc2(point)) != host2(desc2(point, D3D12_SAMPLER_FLAG_NON_NORMALIZED_COORDINATES)));
             } else {
                 std::printf("no host D3D12 device: edge cases checked against their recorded answers only\n");
             }

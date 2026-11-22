@@ -40,6 +40,8 @@ def left_shifts(spv):
 OPS = [
     ("v_fma_f16", "v_fma_f16 v3, v1, v1, v1", 3),
     ("v_med3_f16", "v_med3_f16 v3, v1, v1, v1", 3),
+    ("v_min3_f16", "v_min3_f16 v3, v1, v1, v1", 3),
+    ("v_max3_f16", "v_max3_f16 v3, v1, v1, v1", 3),
     ("v_add_f16", "v_add_f16_e64 v3, v1, v1", 2),
     ("v_sub_f16", "v_sub_f16_e64 v3, v1, v1", 2),
     ("v_subrev_f16", "v_subrev_f16_e64 v3, v1, v1", 2),
@@ -96,4 +98,4 @@ def test_translation_is_deterministic(tmp_path):
 
 def test_other_unsupported_instructions_are_still_rejected(tmp_path):
     with pytest.raises(rdna2spirv.Unsupported):
-        translate(tmp_path, "v_mqsad_u32_u8 v[8:11], v[2:3], v1, v[4:7]")
+        translate(tmp_path, "v_sat_pk_u8_i16 v3, v1")

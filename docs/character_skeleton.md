@@ -8,6 +8,11 @@ drawables do not use this 597-name table.
 No game data is reproduced here. Offsets, counts, field layouts and a few short name/hash
 examples are enough to reproduce the measurements against a reader's own package.
 
+The fragment carries the skeleton and a **25-vertex / 32-triangle bounds grid**, not a skin mesh. A
+SixNG fragment-child walk finds no embedded drawables in any of the 2,865 `packs.rpf` character
+fragments, while world fragments do have them; see
+[character_models.md](character_models.md#what-is-not-decoded).
+
 ## The skeleton name table
 
 Source resource: `ambient_femalebody_upper_nohead.#ft` in `packs.rpf`, stream offset
@@ -119,16 +124,66 @@ The array is `local bone count × u32`, sorted ascending. Each hash is matched a
 Unresolved hashes are genuinely absent from the ambient table; they should be emitted as
 `bone_0x...` fallbacks, never given invented names.
 
-The vertex skin streams are in the FVF semantic table:
+## Vertex skin streams (ASSET-12)
 
-- Head/legacy head: semantic 20 is four packed `(u16 bone, u16 weight)` pairs; semantic 21 is
-  a second index stream.
-- Body/hands/feet/eyes/undies/jacket/tee: semantic 20 is four `u8` bone indices, semantic 21
-  is four `u8` weights. A zero-weight row falls back to the first valid index.
-- Brabikini: semantic 20 is 16 bytes that do not form `(bone, weight)` pairs and semantic 21
-  has four `u32` indices with no weight bytes. Exported static; a rigid binding would be an
-  invention.
-- Eyecap: no semantic-20 weight stream and no valid palette. Exported static.
+Measured with `tools/skin_streams.py` over every drawable resource that carves out of `packs.rpf`,
+`data.rpf` and `levels.rpf` of the 1.0.2.1 package: the tool walks the same drawable → LOD →
+`grmModel` → geometry chain as the readers above, joins each resource's pages (system pages first,
+then graphics pages, one zlib stream per page) and reads the FVF semantic table, whose per-semantic
+entries are a `u32` stream offset at `fvf + 4*i`, a `u8` element size at `fvf + 0xD0 + i` and a
+`u8` format at `fvf + 0x104 + i` (vertex count = `u32` at `fvf + 0x138` >> 10). A size-0 slot is
+a placeholder with no stream. The candidate scan only starts a resource at a 4096-aligned offset
+with 16 preceding zero bytes — rpf9-explorer's recovery convention — and does not recurse into
+nested archives, so the counts are a floor for the package.
+
+| Layout | Weights (semantic 16/17) | Indices (semantic 20/21) | Meshes | Vertices |
+|---|---|---|---:|---:|
+| 4 influences, 8-bit | 16: `R8G8B8A8_UNORM` | 20: `R8G8B8A8_UINT` | 38,721 | 40,631,019 |
+| 8 influences, 8-bit | 16, 17: `R8G8B8A8_UNORM` | 20, 21: `R8G8B8A8_UINT` | 23,860 | 47,611,935 |
+| 4 influences, packed | 16: `R8G8B8A8_UNORM` | 20: `R32G32B32A32_UINT` | 18,247 | 39,468,907 |
+| 8 influences, packed | 16, 17: `R8G8B8A8_UNORM` | 20, 21: `R32G32B32A32_UINT` | 16,111 | 9,512,230 |
+| rigid, 8-bit | none | 20: `R8_UINT` | 5,364 | 3,606,677 |
+| rigid, 16-bit | none | 20: `R16_UINT` | — | — |
+
+Total: 102,303 skin meshes / 140,830,768 vertices. The meshes split by archive: `packs.rpf`
+45,854 meshes / 60,142,591 vertices, `data.rpf` 3,222 / 3,854,484 (all 4-influence 8-bit),
+`levels.rpf` 53,227 / 76,833,693. No 16-bit index form appears in the top-level streams of these
+three archives; the 16-bit forms were measured (over nested-archive recovery) in the independent
+measurement linked below. The format names are the DXGI equivalents of the measured format bytes —
+28 for the weight slots, 30 for the 8-bit index slots, 3 for the packed index slots, 62 for the
+rigid 8-bit index slot — anchored on the decoded bytes, not on a name table: the 1.0.2.1 FVF
+format byte is not desktop DXGI numbering (desktop `R32G32B32A32_UINT` is 3 but desktop
+`R8G8B8A8_UNORM` is 24, and here it is 28; `R16_UINT` is 56 in desktop DXGI and 57 here, as
+breadbbbb/rpf9-explorer#10 reads it).
+
+Rules the bytes support, validated per mesh against the model's own bone count (`grmModel + 0x14`)
+on a deterministic sample (96 meshes per layout per archive; the census itself covers every mesh):
+
+- **The index is into the model's own bone list.** Every component with a non-zero weight has an
+  index below the local bone count — zero violations in every sampled mesh; a zero-weight
+  component may carry any index, so the check masks by weight.
+- **The weights are the UNORM bytes and sum to 255** over all present weight slots. Every sampled
+  vertex of every layout in `data.rpf` and `levels.rpf`, and of the 8-influence and 8-bit
+  4-influence layouts in `packs.rpf`, sums to exactly 255. The packed 4-influence meshes in
+  `packs.rpf` round: of 50,648 sampled vertices, 31,884 sum to exactly 255, 11,604 to 247–254,
+  and 7,160 fall below 247 (as low as 164).
+- **Packed `R32G32B32A32_UINT`: the bone index is bits 0–11 of each u32.** Bits 9–11 were never
+  set in the sampled meshes; bit 8 appears only where the model has more than 256 bones. Bits
+  12–31 hold a separate, dense, unidentified field (smooth per-vertex values in the high bits —
+  not a weight: the weights are already complete in 16/17).
+- **Rigid meshes carry one index per vertex and no weight slot.**
+- The vertex buffer head carries one native buffer descriptor word per used semantic; every skin
+  slot's stream offset (bits 7–28 of the word) matched its descriptor. The word's size code
+  (bits 3–6) equals the element bytes for the 4- and 8-byte slots, reads 1 for the 16-byte packed
+  index slot and 0 for the 1-byte rigid slot, so only the offset is checked.
+
+This corrects the earlier reading of this section (semantic 20 as packed `(u16 bone, u16 weight)`
+pairs, semantic 21 as weights): semantic 21 is always index-typed, and the weights are the UNORM
+bytes of semantics 16/17. The earlier "16 bytes that do not form `(bone, weight)` pairs" note was
+the packed index layout above. [An independent measurement of the same layouts, over rpf9-explorer
+recovery with the bone-palette pull requests applied, was posted in
+#634](https://github.com/ItsNotRexed/Leonida/issues/634#issuecomment-7074504326); the counts there
+are higher because that recovery also walks nested archives.
 
 ## Texture parameter split
 
@@ -148,10 +203,84 @@ The practical rule for exporters: use `0xC8E8C282` as albedo, and **do not fall 
 first texture** when it is absent. A normal map painted as a base colour is the usual symptom
 of that fallback.
 
+To apply this rule, pass `--base-color-param C8E8C282` to `tools/world_build.py` (or
+`base_color_param="C8E8C282"` to `build_world`): only references with that parameter hash are
+used as base colour, and materials without a resolvable match stay untextured clay. Without the
+option the exporter keeps its existing first-resolvable-reference behaviour, because these hash
+roles are measured only on the character corpus.
+
+## The Mandy search
+
+Mandy is a KeyLento persistent/cutscene character schedule, not a unique drawable. `common.rpf`
+contains the schedule entry `KeyLento/Perschars/Peds/Unique/Mandy` (pack
+`PSP_KeyLento_perschars_peds`) in the `CPedScheduleInfoManager` XML. A read-only search of the
+1.0.2.1 package found no `mandy`/`cs_mandy`/`ig_mandy`/`mp_mandy` drawable or fragment:
+
+| Container | Search | Mandy drawable |
+|---|---|---|
+| `packs.rpf` | 144,364 streams / 9.74 GB; 26,585 decoded models at `e293917` (24,034 at `917e9b9`); 12,338 name records | none |
+| `data.rpf` | 28,509 streams / 1.41 GB | none (localization/UI text only) |
+| `common.rpf` | 954 streams / 50 MB | none (schedule and ped-appearance XML) |
+| `levels.rpf` | 2,051 page-aligned nested archives, every zlib stream's first 4 MiB | none (an iFruit billboard and a house photo prop are the only name hits) |
+| `story000.rpf` | 0-4 GiB and the 14 GiB region | none (animation clips `*_mandy.clip`, no drawable) |
+| `story000_script.rpf`, `script.rpf`, `shared_minigame000.rpf`, rest-of-world, `audio.rpf`, `anim.rpf`, `movies.rpf`, `textures.rpf`/peds TTPF | full raw scans | none |
+
+The name controls resolve `cs_kenton`, `u_f_o_rhonda`, `cs_monalisa` and `cs_lucia`; Mandy does
+not. The delivered `mandy/` preview export is therefore a clearly labelled `cs_monalisa` proxy,
+not a verified Mandy model.
+
+Two further checks refine that negative. A missing `mandy` name is the common case, not an
+anomaly: of the 13 `KeyLento/Perschars/Peds/Unique` entries, two resolve cleanly by name
+(`kenton` -> `cs_kenton`, `rhonda` -> `u_f_o_rhonda`), one plausibly maps (`Bert` ->
+`hc_cs_herbert_watson`), and the other ten, including `Mandy`, have no name hit. Also, the
+package manifest lists 108 files and its `pack/` directory contains only `story000`,
+`core_restofworld`, `core_restofworld001`, `shared_minigame000` and their `_bvh4`/`_licenses`
+companions; there is no `psp_*` archive, so the `PSP_KeyLento_perschars_peds` pack named by the
+schedule is not present in this build. Mandy is therefore not disproven: her appearance is either
+a generic ped assembled at runtime or in a pack this package does not include.
+
+Caveats: `levels.rpf` was prefix-bounded at 4 MiB per inflated stream, raw RSC8 bodies and
+Bink/opaque regions were not decoded, and the encrypted RPF9 table of contents prevents a full
+path enumeration (27 top-level entries remain). The evidence supports a shared ped-appearance
+actor assembled from existing components, not a unique `mandy` resource.
+The mission binding is now measured. `COM_KBOS_NEIGHB` is the internal id of the "Pipework"
+mission: the replay table carries that `<MissionId>`, and the mission text names "Mandy's
+house", "Follow Mandy" and "Bert died". Five PSIN state tables in
+`pack/story000/story000_script.rpf` (`03fe4000`, `03fe8000`, `03feb000`, `03fee000`,
+`03ff0000`) contain both characters as entity link hashes: `0x03A885E6` (`Mandy`) and
+`0xE34ACBC8` (`Bert`); the schedule pack hash is `0x865F0DA9`
+(`PSP_KeyLento_perschars_peds`).
+
+The model binding is also decoded. `PERSCHARS_INFO` (`data.rpf@0x1AA5F000`, record 3499) maps
+`Name = 0x03A885E6` (`mandy`) to `ModelSetName = 0x03A885E6`; `CPedModelInfo__InitData`
+(`packs.rpf@0x11D1FF000`, record 1219) maps that link to `cs_mandy` (`0xD7C0CDFF`). `cs_mandy`
+is a live model id — a `story000.rpf` cutscene actor/voice table uses it — but there is **no
+named `cs_mandy` drawable**. Its 64-bit `ModelName` is `0x009B33B7D7C0CDFF`, and its `FragName`
+`0xC9888B65009B33B7` is byte-identical to `cs_lucia` and `cs_monalisa`: the shared female
+cutscene-ped fragment set. The realistic full-body in that family is `cs_lucia_legacypedcs`
+(874 v), so Mandy uses the same body as Lucia. Her nine-entry variation table has 18 u32 hashes;
+16 are unique to her, but none resolves to a shipped drawable or texture name.
+
+The entities linked to Mandy carry three different per-state archetype hashes
+(`0x18BB2550`, `0x73E83886`, `0x57DDFFC2`), which fits her outfit changing between states, not
+three models. None of those hashes resolves through the package name dictionary, any drawable
+or prop name pool, the `packs.rpf` PSOs, or a `0x7a` meta hash scan, so they are state/archetype
+ids, not model names. The archetype-to-component-set table is not in the readable archives;
+whether it is in the missing executable or an undecoded store is not established.
+
+`Mandy_FirstTingle`, `Mandy_ComingUp` and `Drug_Mandy_*` in `common.rpf` are MDMA drug effects,
+not the character. They are a red herring in any `mandy` name search.
+
+Caveats: the RPF9 table of contents is still not decoded; names come from carving and recovery
+(318,266 unique `levels.rpf` names, 24,034 `packs.rpf` names), and raw RSC8 bodies and
+Bink/opaque regions were not decoded. The evidence supports a shared ped-appearance actor: a
+`cs_mandy` model id, a body fragment shared with `cs_lucia` and `cs_monalisa`, and a variation
+table, not a unique `mandy` drawable.
+
 ## Reproduction
 
-The measurement tools were local and are not part of this repository. A reader can reproduce
-the numbers with a standard zlib/RPF9 reader:
+Steps 1-4 were measured with local tools that are not part of this repository; a reader can
+reproduce them with a standard zlib/RPF9 reader:
 
 1. Inflate the `.#ft` stream at `0x45449F70`; parse the 4,095-slot hash table and the
    NUL-separated names; verify `joaat32` lowercased.
@@ -159,5 +288,8 @@ the numbers with a standard zlib/RPF9 reader:
    `0x150 + 0x50*i`; read `u16 parent` at +0x06.
 3. For a character `#dr` system page, read `grmModel+0x20`, then the `u32` bone hashes.
 4. Map each hash through step 1; unresolved hashes are hash-only fallbacks.
+5. Run `python -I tools/skin_streams.py <your copy's packs.rpf> [...] --json out.json` for the
+   skin-stream census and validation; `python -I tests/test_skin_streams.py` runs the same walk
+   and the same checks on synthetic resources built by the test.
 
 No archive, model, texture or audio file is stored in the repository or in any test fixture.

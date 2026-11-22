@@ -23,7 +23,7 @@ sys.path.insert(0, HERE)
 
 import rdna2spirv  # noqa: E402
 import spirv_mini_interp as si  # noqa: E402
-from test_buffer_load_format import BASE, load_format  # noqa: E402
+from test_buffer_load_format import BASE, FMT_U32, load_format  # noqa: E402
 
 
 def f32_rne(x: Fraction) -> int:
@@ -110,6 +110,13 @@ class DecodeThroughBufferLoad(unittest.TestCase):
                          tuple(f32_rne(Fraction(b, 255)) for b in (0x03, 0x7F, 0xFF, 0x80)))
         self.assertEqual(load_format(57, 0, memory=mem),
                          (f32_rne(Fraction(3, 127)), 0x3F800000, f32_rne(Fraction(-1, 127)), 0xBF800000))
+
+    def test_fixed_snorm8x4_uses_the_instruction_format(self):
+        # A U32 descriptor cannot supply the expected fractional values or the signed minimum.
+        words = load_format(FMT_U32, 0, memory={BASE: 0x80FF7F03}, op="tbuffer_load_format",
+                            mods=" format:[BUF_FMT_8_8_8_8_SNORM]")
+        self.assertEqual(words, (f32_rne(Fraction(3, 127)), 0x3F800000,
+                                 f32_rne(Fraction(-1, 127)), 0xBF800000))
 
     def test_added_snorm_formats(self):
         mem = {BASE: 0x8001FF81}

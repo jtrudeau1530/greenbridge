@@ -3,10 +3,13 @@
 
     python -I tests/test_save_keys.py
 """
+import collections
 import contextlib
 import io
 import json
 import os
+import struct
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -83,6 +86,18 @@ class Resolve(unittest.TestCase):
             saves.extract(self.jsav, out)
         self.assertEqual(set(sk.collect_keys([out])), set(sk.collect_keys([self.jsav])))
 
+    def test_directory_scan_reads_jsav_files(self):
+        # #844: a folder of .jsav saves counts the same as naming each file
+        with open(self.jsav, "rb") as f:
+            data = f.read()
+        folder = os.path.join(self.dir, "saves")
+        os.makedirs(folder)
+        for name in ("a.jsav", "b.ASAV", "c.bin", "d"):
+            with open(os.path.join(folder, name), "wb") as f:
+                f.write(data)
+        one = sk.collect_keys([self.jsav])
+        self.assertEqual(sk.collect_keys([folder]), collections.Counter({k: 4 * n for k, n in one.items()}))
+
     def test_resolve_counts_per_family(self):
         res = os.path.join(self.dir, "res.json")
         text = run(["resolve", self.jsav, "--dict", self.dict, "--out", res])
@@ -96,10 +111,185 @@ class Resolve(unittest.TestCase):
         self.assertEqual(got["%08x" % sk.joaat(b"GadgetBlock")], ["GadgetBlock"])
         self.assertNotIn("%08x" % sk.joaat(b"MysteryField"), got)
 
+    def resolve_cli(self, *args):
+        tool = os.path.join(ROOT, "tools", "save_keys.py")
+        return subprocess.run([sys.executable, "-I", tool, "resolve", *args], cwd=ROOT, capture_output=True, text=True)
+
+    def test_out_naming_an_input_is_refused(self):
+        # --out must not replace the user's dictionary, a save, a file found in an input folder, or a hard link to one
+        folder = os.path.join(self.dir, "saves")
+        os.makedirs(folder)
+        inside = os.path.join(folder, "more.json")
+        with open(inside, "w", encoding="utf-8") as f:
+            f.write("{}")
+        link = os.path.join(self.dir, "link.bin")
+        os.link(self.dict, link)
+        for out, inputs in ((self.dict, [self.jsav]), (self.jsav, [self.jsav]), (inside, [folder]),
+                            (link, [self.jsav])):
+            with self.subTest(out=os.path.basename(out)):
+                with open(out, "rb") as f:
+                    before = f.read()
+                r = self.resolve_cli(*inputs, "--dict", self.dict, "--out", out)
+                self.assertEqual(r.returncode, 1, r.stderr)
+                self.assertIn("refusing to overwrite", r.stderr)
+                self.assertNotIn("Traceback", r.stderr)
+                with open(out, "rb") as f:
+                    self.assertEqual(f.read(), before)
+
+    def test_out_in_a_missing_folder_is_one_error_line(self):
+        r = self.resolve_cli(self.jsav, "--dict", self.dict, "--out", os.path.join(self.dir, "nope", "res.json"))
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("error: the folder for --out", r.stderr)
+        self.assertNotIn("Traceback", r.stderr)
+        self.assertEqual(r.stdout, "")      # refused before the resolve ran
+
+    def test_rejects_negative_compose_count(self):
+        result = self.resolve_cli(self.dir, "--dict", self.dict, "--compose", "-1")
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("--compose must be 0 or more", result.stderr)
+
     def test_compose_finds_two_word_names(self):
         text = run(["resolve", self.jsav, "--dict", self.dict, "--compose", "50"])
         self.assertIn("joaat, composed       1 more keys", text)       # SprocketCount from Sprocket + Count
         self.assertIn("total (joaat)         6 of 7 keys", text)
+
+
+class MalformedJsavTest(unittest.TestCase):
+    """A lying JSAV entry count must warn and skip the table, not abort a whole batch."""
+
+    def collect(self, data, name="save.jsav"):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = os.path.join(tmp.name, name)
+        with open(path, "wb") as f:
+            f.write(data)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            keys = sk.collect_keys([path])
+        return keys, err.getvalue(), path
+
+    def jsav(self, n_code, n_script=0, entries=(), tail=b""):
+        data = bytearray(b"JSAV" + struct.pack("<III", 0, n_code, n_script))
+        for key in entries:
+            data += struct.pack("<I", key) + bytes(16)
+        return bytes(data) + tail
+
+    def test_header_declaring_more_entries_than_present_is_skipped(self):
+        keys, err, _ = self.collect(self.jsav(4))
+        self.assertEqual(keys, {})
+        self.assertIn("JSAV header declares 4 entries", err)
+        self.assertIn("skipping its entry table", err)
+
+    def test_partial_entry_table_is_skipped(self):
+        keys, err, _ = self.collect(self.jsav(1) + bytes(10))
+        self.assertEqual(keys, {})
+        self.assertIn("declares 1 entries", err)
+
+    def test_header_shorter_than_16_bytes_is_skipped(self):
+        keys, err, _ = self.collect(b"JSAV" + bytes(4))
+        self.assertEqual(keys, {})
+        self.assertIn("JSAV header is only 8 bytes", err)
+
+    def test_declared_zero_entries_is_not_a_warning(self):
+        keys, err, _ = self.collect(self.jsav(0))
+        self.assertEqual(keys, {})
+        self.assertEqual(err, "")
+
+    def test_complete_table_is_still_collected(self):
+        keys, err, _ = self.collect(self.jsav(2, entries=(0x12345678, 0xABCDEF01)))
+        self.assertEqual(set(keys), {0x12345678, 0xABCDEF01})
+        self.assertEqual(err, "")
+
+    def test_text_keys_from_a_truncated_file_are_kept(self):
+        keys, err, _ = self.collect(self.jsav(4) + b'\n"$0x0000abcd"\n')
+        self.assertEqual(set(keys), {0xABCD})
+        self.assertIn("skipping its entry table", err)
+
+    def test_cli_reports_a_warning_and_exits_zero(self):
+        _keys, _err, path = self.collect(self.jsav(4))
+        tool = os.path.join(ROOT, "tools", "save_keys.py")
+        r = subprocess.run([sys.executable, "-I", tool, "collect", path],
+                           cwd=ROOT, capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("JSAV header declares 4 entries", r.stderr)
+        self.assertNotIn("Traceback", r.stderr)
+        self.assertIn("0 distinct keys", r.stdout)
+
+
+class DirectoryScanTest(unittest.TestCase):
+    """A directory of saves must include .jsav files, not just .bin/.json/extensionless names."""
+
+    def jsav(self, key):
+        data = bytearray(b"JSAV" + struct.pack("<III", 0, 1, 0))
+        data += struct.pack("<I", key) + bytes(16)
+        return bytes(data)
+
+    def test_jsav_files_in_a_directory_are_collected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for name in ("a.jsav", "b.JSAV", "c.bin", "plain"):
+                with open(os.path.join(tmp, name), "wb") as f:
+                    f.write(self.jsav(0x12345678))
+            keys = sk.collect_keys([tmp])
+            self.assertEqual(keys[0x12345678], 4)
+
+    def test_warning_names_the_offending_file_in_a_batch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "broken.bin")
+            with open(path, "wb") as f:
+                f.write(b"JSAV" + struct.pack("<III", 0, 4, 0))  # claims 4 entries, has no table
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                keys = sk.collect_keys([tmp])
+            self.assertEqual(keys, {})
+            self.assertIn("broken.bin", err.getvalue())
+            self.assertIn("JSAV header declares 4 entries", err.getvalue())
+            self.assertEqual(err.getvalue().count("warning:"), 1)
+
+    def test_direct_jsav_file_still_matches_directory_scan(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "save.jsav")
+            with open(path, "wb") as f:
+                f.write(self.jsav(0xABCDEF01))
+            self.assertEqual(sk.collect_keys([path]), sk.collect_keys([tmp]))
+
+
+
+class LongIdentifiers(unittest.TestCase):
+    """harvest() takes a run of identifier characters whole: it used to cut after 81 and go on in the rest."""
+
+    def harvest(self, *chunks):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "strings.bin")
+            with open(path, "wb") as f:
+                for chunk in chunks:
+                    f.write(b"\0" + chunk + b"\0")
+            return sk.harvest([path])
+
+    def test_a_name_longer_than_81_characters_is_one_name(self):
+        name = b"A" * 81 + b"TailPart"
+        got = self.harvest(name, b"Short")
+        self.assertIn(name, got)
+        self.assertIn(b"Short", got)
+        self.assertNotIn(b"A" * 81, got)       # the old cut
+        self.assertNotIn(b"TailPart", got)     # and the name it invented from the rest
+
+    def test_the_same_inside_a_zlib_stream(self):
+        name = b"Group_" + b"x" * 120
+        got = self.harvest(zlib.compress(b"<Item>" + name + b"</Item>"))
+        self.assertIn(name, got)
+        self.assertNotIn(name[81:], got)
+
+    def test_a_run_past_the_limit_is_left_out_whole(self):
+        blob = b"Q" * (sk.IDENT_MAX + 1)
+        got = self.harvest(blob, b"Q" * sk.IDENT_MAX)
+        self.assertIn(b"Q" * sk.IDENT_MAX, got)
+        self.assertFalse([name for name in got if len(name) > sk.IDENT_MAX])
+        self.assertNotIn(b"Q", got)
+        self.assertEqual({name for name in got if set(name) == {ord("Q")}}, {b"Q" * sk.IDENT_MAX})
+
+    def test_a_127_character_name_is_harvested(self):
+        name = b"Vehicle" + b"Part" * 30
+        self.assertEqual(self.harvest(name), {name})
 
 
 if __name__ == "__main__":

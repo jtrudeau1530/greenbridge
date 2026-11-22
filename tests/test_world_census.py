@@ -9,6 +9,7 @@ import importlib.util
 import io
 import json
 import os
+import shutil
 import struct
 import subprocess
 import sys
@@ -70,10 +71,10 @@ class WorldCensusTest(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def run_census(self, shard_size=1 << 30, jobs=1):
+    def run_census(self, shard_size=1 << 30, jobs=1, out_name="out"):
         arc = os.path.join(self.dir, "sample.rpf")
         make_archive(arc)
-        out = os.path.join(self.dir, "out")
+        out = os.path.join(self.dir, out_name)
         code = WC.main([arc, "--out", out, "--shard-size", str(shard_size), "--jobs", str(jobs)])
         with open(os.path.join(out, "summary.json"), encoding="utf-8") as f:
             return code, json.load(f)
@@ -103,6 +104,87 @@ class WorldCensusTest(unittest.TestCase):
         self.assertEqual(s["entities"], 4)
         self.assertEqual(s["duplicate_offsets"], 0)
         self.assertEqual(s["coverage"]["accounted"], s["coverage"]["span"])
+
+    def test_tiny_shards_give_the_same_stream_totals(self):
+        """Each shard starts scanning WARMUP bytes early to find its first stream boundary. Streams that start in
+        that window belong to the previous shard, so the stream and byte totals must not depend on the shard size."""
+        _, whole = self.run_census(out_name="whole")
+        _, tiny = self.run_census(shard_size=400, out_name="tiny")
+        self.assertGreater(tiny["shards_expected"], 1)
+        for key, value in whole["totals"].items():
+            with self.subTest(total=key):
+                self.assertEqual(tiny["totals"].get(key), value)
+        self.assertGreater(whole["totals"]["streams"], 0)
+
+    def test_version_4_warmup_shard_requires_a_rescan(self):
+        archive = Path(self.dir) / "sample.rpf"
+        out = Path(self.dir) / "out"
+        start, shard_size = 0x40, 0x200
+        boundary = start + shard_size
+        map_data, meta_data = TWI.make_resource(True), TWI.make_resource(False)
+        first, second = zlib.compress(map_data), zlib.compress(meta_data)
+        data = bytearray(boundary)
+        struct.pack_into("<4sI", data, 0, b"9FPR", start)
+        data[start:start + len(first)] = first
+        data.extend(second)
+        archive.write_bytes(data)
+
+        def run(*flags):
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                code = WC.main([str(archive), "--out", str(out), "--shard-size", str(shard_size),
+                                "--jobs", "1", *flags])
+            summary = json.loads((out / "summary.json").read_text(encoding="utf-8"))
+            return code, stdout.getvalue(), summary
+
+        code, _, fresh = run()
+        self.assertEqual(code, 0)
+        expected = {"streams": 2, "stored": len(first) + len(second),
+                    "inflated": len(map_data) + len(meta_data), "rejected": 0}
+        self.assertEqual({k: fresh["totals"][k] for k in expected}, expected)
+        self.assertTrue(fresh["census_exact"])
+        self.assertEqual(fresh["shards_complete"], 2)
+        maps = (out / "maps.json").read_bytes()
+
+        compatible_path, legacy_path = [Path(WC._shard_path(out, s)) for s in fresh["shards"]]
+        compatible = compatible_path.read_bytes()
+        legacy = json.loads(legacy_path.read_text(encoding="utf-8"))
+        # Format 4 counted the first shard's stream again during the second shard's warm-up.
+        legacy["format"] = 4
+        legacy["intervals"].insert(0, [start, start + len(first)])
+        legacy["stats"]["streams"] += 1
+        legacy["stats"]["stored"] += len(first)
+        legacy["stats"]["inflated"] += len(map_data)
+        legacy["stats"]["adopted"] = 1
+        legacy_path.write_text(json.dumps(legacy), encoding="utf-8")
+        stale = legacy_path.read_bytes()
+
+        code, _, partial = run("--merge-only")
+        self.assertEqual(code, 1)
+        self.assertEqual(partial["missing_ranges"], [[boundary, len(data)]])
+        self.assertEqual(partial["shards_complete"], 1)
+        self.assertFalse(partial["census_exact"])
+        self.assertEqual(partial["totals"]["streams"], 1)
+        self.assertEqual(legacy_path.read_bytes(), stale)
+
+        code, stdout, rebuilt = run("--resume")
+        self.assertEqual(code, 0)
+        self.assertIn("2 shards, 1 to scan", stdout)
+        self.assertEqual(rebuilt["totals"], fresh["totals"])
+        self.assertEqual(rebuilt["missing_ranges"], [])
+        self.assertTrue(rebuilt["census_exact"])
+        self.assertEqual((out / "maps.json").read_bytes(), maps)
+        self.assertEqual(compatible_path.read_bytes(), compatible)
+        self.assertEqual(json.loads(legacy_path.read_bytes())["format"], WC.FORMAT)
+
+        code, stdout, resumed = run("--resume")
+        self.assertEqual(code, 0)
+        self.assertIn("2 shards, 0 to scan", stdout)
+        code, _, merged = run("--merge-only")
+        self.assertEqual(code, 0)
+        for summary in (resumed, merged):
+            self.assertEqual(summary["totals"], fresh["totals"])
+            self.assertTrue(summary["census_exact"])
 
     def test_required_len_detects_split_page(self):
         blob = TWI.make_resource(True)
@@ -593,6 +675,32 @@ class MainTest(unittest.TestCase):
                 self.assertEqual(out, "")
         self.assertFalse(os.path.exists(self.out))
 
+    def test_same_output_path_identity(self):
+        a = os.path.join(self.dir, "test.rpf")
+        self.assertTrue(WC.same_output_path(a, a))
+        b = os.path.join(self.dir, "other.rpf")
+        self.assertFalse(WC.same_output_path(a, b))
+
+    def test_out_matching_archive_or_reports_is_rejected(self):
+        code, _, err = self.run_main(self.arc, "--out", self.arc)
+        self.assertEqual(code, 2)
+        self.assertIn("error: --out must not overwrite the input archive", err)
+
+        # Archive named summary.json would be overwritten if output directory is its parent
+        arc_summary = os.path.join(self.dir, "summary.json")
+        shutil.copyfile(self.arc, arc_summary)
+        code, _, err = self.run_main(arc_summary, "--out", self.dir)
+        self.assertEqual(code, 2)
+        self.assertIn("error: --out reports would overwrite input archive", err)
+
+    def test_out_as_existing_file_is_rejected(self):
+        file_out = os.path.join(self.dir, "existing_file.txt")
+        with open(file_out, "w") as f:
+            f.write("data")
+        code, _, err = self.run_main(self.arc, "--out", file_out)
+        self.assertEqual(code, 2)
+        self.assertIn("is a file, not a directory", err)
+
     def test_bad_scan_range(self):
         size = os.path.getsize(self.arc)
         for args in (("--start", "16"), ("--start", str(size)), ("--start", str(size + 100)), ("--limit", "-1"),
@@ -828,6 +936,13 @@ class CensusSourceTest(unittest.TestCase):
         rebuilt, new_rows = self.scan(self.arc, "--resume", to_scan=2)
         self.assertTrue(rebuilt["census_exact"])
         self.assertEqual(new_rows, rows)
+
+
+def setUpModule():
+    # The tools' main() prints its summary JSON; keep it out of the test log (tests that check it redirect again).
+    quiet = contextlib.redirect_stdout(io.StringIO())
+    quiet.__enter__()
+    unittest.addModuleCleanup(quiet.__exit__, None, None, None)
 
 
 if __name__ == "__main__":

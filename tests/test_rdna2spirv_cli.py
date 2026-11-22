@@ -1,16 +1,20 @@
-"""rdna2spirv.py command line: --limit and --shard are checked before anything is translated or written.
+"""rdna2spirv.py command-line validation and SPIR-V output tests.
 
     python -I tests/test_rdna2spirv_cli.py
 
-Standard library only: every case is refused by argparse, so no llvm-mc, spirv-as or shader input is needed. No
-game data.
+Standard library only: the output tests substitute the SPIR-V tools and use synthetic input.
 """
 import argparse
+import io
+import json
 import os
 import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stdout
+from pathlib import Path
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
@@ -36,6 +40,104 @@ class ArgumentTypes(unittest.TestCase):
                 rdna2spirv._shard_arg(text)
 
 
+class SourceDiscovery(unittest.TestCase):
+    """The src argument is a .s file or a folder of .s files; other names are not inputs."""
+
+    def run_main(self, src, out):
+        def spirv_tool(cmd, **kwargs):
+            tool = cmd[0]
+            if tool == "spirv-as":
+                Path(cmd[3]).write_bytes(b"new module")
+            elif tool == "spirv-val":
+                self.assertEqual(Path(cmd[-1]).read_bytes(), b"new module")
+            else:
+                self.fail(f"unexpected tool: {tool}")
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        output = io.StringIO()
+        with mock.patch.object(sys, "argv", [TOOL, str(src), "--out", str(out)]), \
+                mock.patch.object(rdna2spirv.subprocess, "run", side_effect=spirv_tool), \
+                redirect_stdout(output):
+            rdna2spirv.main()
+        return output.getvalue()
+
+    def test_missing_src_is_refused_with_usage_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "spirv")
+            # The .s suffix matters: without isfile() a missing shader path would be trusted as a file.
+            p = subprocess.run([sys.executable, "-I", TOOL, os.path.join(tmp, "absent.s"), "--out", out],
+                               capture_output=True, text=True)
+            self.assertEqual(p.returncode, 2, p.stderr)
+            self.assertIn("not a .s file or a folder of .s files", p.stderr)
+            self.assertNotIn("Traceback", p.stderr)
+            self.assertFalse(os.path.exists(out))
+
+    def test_directory_ending_in_s_as_src_is_a_directory(self):
+        # A .s suffix alone is not a shader: an existing directory is still scanned as a folder.
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "shader.s")
+            os.mkdir(src)
+            p = subprocess.run([sys.executable, "-I", TOOL, src, "--out", os.path.join(tmp, "spirv")],
+                               capture_output=True, text=True)
+            self.assertEqual(p.returncode, 0, p.stderr)
+            self.assertNotIn("Traceback", p.stderr)
+            self.assertIn("0 shaders:", p.stdout)
+
+    def test_non_file_non_dir_entry_is_skipped(self):
+        # Covers entries that are neither files nor directories (broken symlinks, FIFOs, devices).
+        # is_file() rejects them; `not is_dir()` would feed one to translate() and crash.
+        class OddEntry:
+            name = "foo.s"
+            path = os.path.join("not-a-file", "foo.s")
+
+            def is_file(self):
+                return False
+
+            def is_dir(self):
+                return False
+
+        class FakeScandir:
+            def __enter__(self):
+                return iter([OddEntry()])
+
+            def __exit__(self, *exc):
+                return False
+
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "disasm")
+            os.mkdir(src)
+            output = io.StringIO()
+            with mock.patch.object(sys, "argv", [TOOL, src, "--out", os.path.join(tmp, "spirv")]), \
+                    mock.patch.object(rdna2spirv.os, "scandir", lambda path: FakeScandir()), \
+                    redirect_stdout(output):
+                rdna2spirv.main()
+            self.assertIn("0 shaders:", output.getvalue())
+
+    def test_directory_ending_in_s_is_skipped(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            src = root / "disasm"
+            src.mkdir()
+            (src / "ps_ok.s").write_text("\ts_endpgm\n", encoding="utf-8")
+            (root / "ps_ok.dxbc").write_bytes(b"DXBC" + bytes(28))
+            (src / "nested.s").mkdir()  # a directory that looks like a shader
+            out = root / "spirv"
+            out.mkdir()
+            stdout = self.run_main(src, out)
+            self.assertIn("1 pass spirv-val", stdout)
+            self.assertTrue((out / "ps_ok.spv").is_file())
+            self.assertFalse((out / "nested.spv").exists())
+
+    def test_non_s_file_as_src_is_refused_with_usage_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "notes.txt")
+            Path(src).write_text("not a shader", encoding="utf-8")
+            p = subprocess.run([sys.executable, "-I", TOOL, src, "--out", os.path.join(tmp, "spirv")],
+                               capture_output=True, text=True)
+            self.assertEqual(p.returncode, 2, p.stderr)
+            self.assertNotIn("Traceback", p.stderr)
+
+
 class CommandLine(unittest.TestCase):
     def test_bad_limit_or_shard_is_refused_before_out_is_made(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -58,5 +160,117 @@ class CommandLine(unittest.TestCase):
                     self.assertFalse(os.path.exists(out))     # 9/8 used to write an empty index.part9.json
 
 
+class ValidatedOutput(unittest.TestCase):
+    def setUp(self):
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.src = root / "disasm" / "ps_fixture.s"
+        self.src.parent.mkdir()
+        self.src.write_text("\ts_endpgm\n", encoding="utf-8")
+        (root / "ps_fixture.dxbc").write_bytes(b"DXBC" + bytes(28))
+        self.out = root / "spirv"
+        self.out.mkdir()
+        self.module = self.out / "ps_fixture.spv"
+        self.index = self.out / "index.json"
+
+    def translate(self, *, reject_at=None):
+        def spirv_tool(cmd, **kwargs):
+            tool = cmd[0]
+            if tool == "spirv-as":
+                Path(cmd[3]).write_bytes(b"new module")
+            elif tool == "spirv-val":
+                self.assertEqual(Path(cmd[-1]).read_bytes(), b"new module")
+                if reject_at is None:
+                    self.assertFalse(self.module.exists(), "the binary was published before validation")
+            else:
+                self.fail(f"unexpected tool: {tool}")
+            rejected = tool == reject_at
+            return subprocess.CompletedProcess(cmd, int(rejected), "", "synthetic rejection" if rejected else "")
+
+        output = io.StringIO()
+        with mock.patch.object(sys, "argv", [TOOL, str(self.src), "--out", str(self.out)]), \
+                mock.patch.object(rdna2spirv.subprocess, "run", side_effect=spirv_tool), redirect_stdout(output):
+            rdna2spirv.main()
+        return output.getvalue()
+
+    def test_existing_single_s_file_still_translates(self):
+        self.assertIn("1 pass spirv-val", self.translate())
+
+    def test_validator_rejection_does_not_publish_binary(self):
+        self.assertIn("INVALID: synthetic rejection", self.translate(reject_at="spirv-val"))
+        self.assertFalse(self.module.exists())
+        self.assertEqual(json.loads(self.index.read_text(encoding="utf-8")), {})
+        self.assertTrue((self.out / "ps_fixture.spvasm").is_file())
+        self.assertEqual(list(self.out.glob("*.tmp")), [])
+
+    def test_rejection_clears_retried_shader_but_preserves_unrelated_output(self):
+        other = self.out / "cs_other.spv"
+        other.write_bytes(b"unrelated module")
+        previous = {"cs_other": {"stage": "cs"}}
+        for tool in ("spirv-as", "spirv-val"):
+            with self.subTest(tool=tool):
+                self.module.write_bytes(b"old module")
+                self.index.write_text(json.dumps({**previous, "ps_fixture": {"stage": "ps"}}), encoding="utf-8")
+                self.assertIn("INVALID: synthetic rejection", self.translate(reject_at=tool))
+                self.assertFalse(self.module.exists())
+                self.assertEqual(json.loads(self.index.read_text(encoding="utf-8")), previous)
+                self.assertEqual(other.read_bytes(), b"unrelated module")
+
+    def test_unsupported_clears_retried_shader_but_preserves_unrelated_output(self):
+        # s_barrier is compute-only, so this PS is Unsupported before any SPIR-V tool runs. A module an
+        # earlier run published for it must not survive: the index is make_game.py's proof of completion.
+        self.src.write_text("\ts_barrier\n\ts_endpgm\n", encoding="utf-8")
+        other = self.out / "cs_other.spv"
+        other.write_bytes(b"unrelated module")
+        previous = {"cs_other": {"stage": "cs"}}
+        self.module.write_bytes(b"old module")
+        self.index.write_text(json.dumps({**previous, "ps_fixture": {"stage": "ps"}}), encoding="utf-8")
+        output = self.translate()
+        self.assertIn("s_barrier outside compute", output)
+        self.assertFalse(self.module.exists())
+        self.assertEqual(json.loads(self.index.read_text(encoding="utf-8")), previous)
+        self.assertEqual(other.read_bytes(), b"unrelated module")
+        self.assertEqual(list(self.out.glob("*.tmp")), [])
+
+    def test_translator_error_clears_retried_shader(self):
+        self.module.write_bytes(b"old module")
+        self.index.write_text(json.dumps({"ps_fixture": {"stage": "ps"}}), encoding="utf-8")
+        output = io.StringIO()
+        with mock.patch.object(rdna2spirv, "translate", side_effect=ValueError("synthetic translator error")), \
+                mock.patch.object(sys, "argv", [TOOL, str(self.src), "--out", str(self.out)]), \
+                redirect_stdout(output):
+            rdna2spirv.main()
+        self.assertIn("translator error ValueError", output.getvalue())
+        self.assertFalse(self.module.exists())
+        self.assertEqual(json.loads(self.index.read_text(encoding="utf-8")), {})
+
+    def test_validation_success_publishes_binary_and_metadata(self):
+        self.assertIn("1 pass spirv-val", self.translate())
+        self.assertEqual(self.module.read_bytes(), b"new module")
+        self.assertIn("ps_fixture", json.loads(self.index.read_text(encoding="utf-8")))
+
+
 if __name__ == "__main__":
     unittest.main()
+
+
+class EmptyShader(unittest.TestCase):
+    """A .s with no tab-indented instruction parses to an empty shader.
+
+    It used to translate to a module that passes spirv-val, lands in index.json and does no work at all, which is
+    what a hand-written or re-indented .s looks like: found while writing a fixture with spaces instead of tabs.
+    """
+
+    def test_no_instructions_is_reported_and_no_module_is_published(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "disasm")
+            os.mkdir(src)
+            with open(os.path.join(src, "ps_empty.s"), "w", encoding="utf-8") as f:
+                f.write("; ps_empty  code 0x0..0x0 (synthetic), gfx1013, 0 invalid words\n    s_endpgm\n")
+            with open(os.path.join(tmp, "ps_empty.dxbc"), "wb") as f:
+                f.write(b"DXBC" + bytes(28))
+            out = os.path.join(tmp, "spirv")
+            p = subprocess.run([sys.executable, "-I", TOOL, src, "--out", out], capture_output=True, text=True)
+            self.assertEqual(p.returncode, 0, p.stderr)
+            self.assertIn("0 translated", p.stdout, p.stdout)
+            self.assertIn("no instructions (nothing tab-indented?)", p.stdout, p.stdout)
+            self.assertFalse(os.path.exists(os.path.join(out, "ps_empty.spv")))

@@ -10,29 +10,59 @@
 //   [cache.bin]   loaded first if it exists (a stopped run resumes: cached pipelines are instant), saved every
 //                 10 minutes and at the end
 //   --jobs N      compile on N threads (default: half the hardware threads)
+//   --large-module-bytes N  compile modules larger than N bytes alone (default: 4194304; 0 disables isolation)
 //   --start I --count N   check only index entries [I, I+N) (sorted by name)
 //   --slow SEC    print pipelines slower than SEC (default 30); compiles past 60 s are named while running
 //   --max-bytes N skip modules whose .spv is larger than N bytes (0 = no limit; names every skip)
 //   --stage S     which stages to check: all (default), cs, or graphics (aliases: --compute-only, --graphics-only)
+//   --stats FILE  write the driver's statistics for each translated shader (VK_KHR_pipeline_executable_properties:
+//                 instructions, registers, spills, scratch, waves...) as CSV rows name,stage,statistic,value. Only
+//                 the executable that runs the translated shader is written, not the partner stub's. Use without
+//                 cache.bin: a pipeline loaded from the cache may come without statistics.
+//   --cache-feedback  count each stage's successful pipelines by VkPipelineCreationFeedback: hits (VALID and
+//                 APPLICATION_PIPELINE_CACHE_HIT), no hit reported (VALID only) and unavailable (no VALID bit, or a
+//                 pre-1.3 device without VK_EXT_pipeline_creation_feedback). The three add up to the ok count.
+//   --isolate     (POSIX only) check in child processes, --isolate-batch modules at a time (default 256), so a module
+//                 that kills the driver (SIGFPE, SIGSEGV, ...) is recorded as failed ("MODULE CRASH") and the pass
+//                 goes on. A crashed batch is bisected to the module. Children run one after the other and share
+//                 cache.bin. Not compatible with --stats.
+//   test hook     VK_PIPELINE_CHECK_SIMULATE_CRASH=<module name substring>[:SIGNAL] raises SIGNAL (default SIGFPE)
+//                 just before the pipeline of a matching module is created. Only for testing --isolate.
 #include "vulkan_loader.h"
+#include "vk_device_pick.h"
 #include "pipeline_cache_file.h"
 #include "pipeline_cache_snapshot.h"
 
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <charconv>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
+#include <csignal>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <iterator>
+#include <limits>
 #include <map>
 #include <mutex>
 #include <set>
+#include <shared_mutex>
 #include <string>
+#include <string_view>
 #include <thread>
+#include <utility>
 #include <vector>
+
+#ifndef _WIN32
+#include <sys/wait.h>
+#include <unistd.h>
+#include <cerrno>
+#include <filesystem>
+#endif
 
 static PFN_vkGetInstanceProcAddr gipa;
 
@@ -261,11 +291,13 @@ struct JsonParser {
 
 std::map<std::string, ShaderMeta> read_index(const std::string& path, std::string& err) {
     std::ifstream f(path, std::ios::binary);
-    std::string s((std::istreambuf_iterator<char>(f)), {});
     std::map<std::string, ShaderMeta> out;
+    if (!f) { err = "cannot open the file"; return out; }   // a missing index must not read as an empty corpus
+    std::string s((std::istreambuf_iterator<char>(f)), {});
+    if (f.bad()) { err = "read error"; return out; }
     JsonParser p{s, 0};
     p.ws();
-    if (p.i >= s.size()) return out;
+    if (p.i >= s.size()) { err = "the file is empty (an intentionally empty index is {})"; return out; }
     if (!p.consume('{')) { err = "expected '{' at byte " + std::to_string(p.i); return out; }
     while (!p.error && p.i < s.size()) {
         if (p.consume('}')) return out;
@@ -329,11 +361,147 @@ struct StageStats {
     uint32_t w64_ok = 0;
     uint32_t w64_bad = 0;
     uint32_t w64_unforced = 0;
+    uint32_t feedback[3] = {};  // --cache-feedback, successful pipelines only, indexed by feedback_outcome
     double seconds = 0.0;
     double max_sec = 0.0;
     std::string max_name;
     std::map<std::string, uint32_t> skip_reasons;
 };
+
+constexpr std::pair<size_t, size_t> shader_slice(size_t size, size_t start, size_t count) {
+    const size_t lo = std::min(start, size);
+    const size_t remaining = size - lo;
+    const size_t hi = count ? lo + std::min(count, remaining) : size;
+    return {lo, hi};
+}
+
+static_assert(shader_slice(7, 2, 3) == std::pair<size_t, size_t>{2, 5});
+static_assert(shader_slice(7, 2, 0) == std::pair<size_t, size_t>{2, 7});
+static_assert(shader_slice(7, 8, 3) == std::pair<size_t, size_t>{7, 7});
+static_assert(shader_slice(7, 2, std::numeric_limits<size_t>::max()) == std::pair<size_t, size_t>{2, 7});
+
+// --cache-feedback class of a successful pipeline: 0 hit, 1 no hit reported, 2 unavailable. A hit counts only with
+// VALID; the duration and base-pipeline bits are not classified.
+constexpr int feedback_outcome(VkPipelineCreationFeedbackFlags f) {
+    if (!(f & VK_PIPELINE_CREATION_FEEDBACK_VALID_BIT)) return 2;
+    return (f & VK_PIPELINE_CREATION_FEEDBACK_APPLICATION_PIPELINE_CACHE_HIT_BIT) ? 0 : 1;
+}
+
+static_assert(feedback_outcome(0) == 2);
+static_assert(feedback_outcome(VK_PIPELINE_CREATION_FEEDBACK_APPLICATION_PIPELINE_CACHE_HIT_BIT) == 2);
+static_assert(feedback_outcome(VK_PIPELINE_CREATION_FEEDBACK_VALID_BIT) == 1);
+static_assert(feedback_outcome(VK_PIPELINE_CREATION_FEEDBACK_VALID_BIT |
+                               VK_PIPELINE_CREATION_FEEDBACK_APPLICATION_PIPELINE_CACHE_HIT_BIT) == 0);
+
+// Test hook (see the header): VK_PIPELINE_CHECK_SIMULATE_CRASH=<module name substring>[:SIGNAL].
+struct SimulatedCrash {
+    bool enabled = false;
+    std::string pattern;
+    int sig = SIGFPE;
+};
+
+int signal_from_name(std::string n) {
+    for (char& c : n) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+    if (n.rfind("SIG", 0) == 0) n = n.substr(3);
+    if (n == "FPE") return SIGFPE;
+    if (n == "SEGV") return SIGSEGV;
+    if (n == "ABRT") return SIGABRT;
+    if (n == "ILL") return SIGILL;
+    if (n == "TERM") return SIGTERM;
+#ifndef _WIN32
+    if (n == "BUS") return SIGBUS;
+    if (n == "KILL") return SIGKILL;
+#endif
+    return 0;
+}
+
+SimulatedCrash read_simulated_crash() {
+    SimulatedCrash c;
+    const char* env = std::getenv("VK_PIPELINE_CHECK_SIMULATE_CRASH");
+    if (!env || !*env) return c;
+    std::string v = env;
+    const size_t colon = v.rfind(':');
+    if (colon != std::string::npos) {
+        if (const int sig = signal_from_name(v.substr(colon + 1))) {
+            c.sig = sig;
+            v.resize(colon);
+        }
+    }
+    c.enabled = true;
+    c.pattern = v;
+    return c;
+}
+
+#ifndef _WIN32
+std::string signal_label(int sig) {
+    switch (sig) {
+    case SIGFPE: return "SIGFPE";
+    case SIGSEGV: return "SIGSEGV";
+    case SIGABRT: return "SIGABRT";
+    case SIGILL: return "SIGILL";
+    case SIGBUS: return "SIGBUS";
+    case SIGKILL: return "SIGKILL";
+    case SIGTERM: return "SIGTERM";
+    default: return "signal " + std::to_string(sig);
+    }
+}
+
+// --isolate: one child run of this executable over [start, start + count) of the stage-filtered list.
+struct ChildRun {
+    bool ready = false;     // reached the work loop (ISO-READY): Vulkan and the cache were set up
+    bool done = false;      // finished the pass and saved the cache (ISO-DONE)
+    bool cache_ok = true;
+    int sig = 0;            // killed by this signal
+    int status = 0;         // exit status when it exited
+    std::string out;        // its stdout
+};
+
+ChildRun run_child(const std::string& exe, const std::string& dir, const std::vector<std::string>& pass,
+                   const std::string& cache_path, size_t start, size_t count) {
+    ChildRun r;
+    std::vector<std::string> args = {exe, dir};
+    if (!cache_path.empty()) args.push_back(cache_path);
+    for (const auto& a : pass) args.push_back(a);
+    args.insert(args.end(), {"--isolate-child", "--start", std::to_string(start), "--count", std::to_string(count)});
+    std::vector<char*> argv;
+    for (auto& a : args) argv.push_back(a.data());
+    argv.push_back(nullptr);
+    int fds[2];
+    if (pipe(fds) != 0) { r.status = 127; return r; }
+    std::fflush(nullptr);
+    const pid_t pid = fork();
+    if (pid < 0) { close(fds[0]); close(fds[1]); r.status = 127; return r; }
+    if (pid == 0) {
+        dup2(fds[1], 1);
+        close(fds[0]); close(fds[1]);
+        execv(exe.c_str(), argv.data());
+        _exit(127);
+    }
+    close(fds[1]);
+    char buf[4096];
+    for (;;) {
+        const ssize_t n = read(fds[0], buf, sizeof buf);
+        if (n > 0) r.out.append(buf, size_t(n));
+        else if (n < 0 && errno == EINTR) continue;
+        else break;
+    }
+    close(fds[0]);
+    int st = 0;
+    while (waitpid(pid, &st, 0) < 0 && errno == EINTR) {}
+    if (WIFSIGNALED(st)) r.sig = WTERMSIG(st);
+    else r.status = WIFEXITED(st) ? WEXITSTATUS(st) : 1;
+    size_t pos = 0;
+    while (pos < r.out.size()) {
+        size_t e = r.out.find('\n', pos);
+        if (e == std::string::npos) e = r.out.size();
+        const std::string_view line(r.out.data() + pos, e - pos);
+        if (line == "ISO-READY") r.ready = true;
+        else if (line.rfind("ISO-DONE", 0) == 0) { r.done = true; r.cache_ok = line.find("cache_ok=0") == std::string_view::npos; }
+        pos = e + 1;
+    }
+    return r;
+}
+#endif
 
 }  // namespace
 
@@ -341,37 +509,78 @@ int main(int argc, char** argv) {
     if (argc < 2) {
         std::fprintf(stderr,
             "usage: vk_pipeline_check <spirv dir> [cache.bin] [--jobs N] [--start I] [--count N] [--slow SEC] "
-            "[--max-bytes N] [--stage all|cs|graphics | --compute-only | --graphics-only]\n");
+            "[--max-bytes N] [--large-module-bytes N] [--stage all|cs|graphics | --compute-only | --graphics-only] "
+            "[--stats FILE] [--cache-feedback] [--isolate [--isolate-batch N]]\n");
         return 2;
     }
     std::setvbuf(stdout, nullptr, _IOLBF, 1 << 16);   // failures reach a redirected log as they happen
-    std::string dir = argv[1], cache_path;
+    std::string dir = argv[1], cache_path, stats_path;
     uint32_t jobs = std::max(1u, std::thread::hardware_concurrency() / 2);
     size_t start = 0, count = 0, max_bytes = 0;
+    size_t large_module_bytes = 4 * 1024 * 1024;
     double slow = 30.0;
     std::string stage_filter = "all";
+    bool cache_feedback = false, isolate = false, iso_child = false;
+    size_t isolate_batch = 256;
     for (int i = 2; i < argc; i++) {
         std::string a = argv[i];
-        auto val = [&] { return i + 1 < argc ? std::string(argv[++i]) : std::string("0"); };
-        if (a == "--jobs") jobs = std::max(1u, uint32_t(std::stoul(val())));
-        else if (a == "--start") start = std::stoull(val());
-        else if (a == "--count") count = std::stoull(val());
-        else if (a == "--slow") slow = std::stod(val());
-        else if (a == "--stage") stage_filter = val();
+        auto value = [&]() -> std::string_view {
+            if (i + 1 == argc || std::string_view(argv[i + 1]).starts_with("--")) return {};
+            return argv[++i];
+        };
+        auto number = [&](auto& dest) {
+            const auto text = value();
+            if (text.empty()) return false;
+            const auto end = text.data() + text.size();
+            const auto [ptr, ec] = std::from_chars(text.data(), end, dest);
+            return ec == std::errc{} && ptr == end;
+        };
+        bool valid = true;
+        if (a == "--jobs") {
+            valid = number(jobs);
+            jobs = std::max(1u, jobs);
+        } else if (a == "--start") valid = number(start);
+        else if (a == "--count") valid = number(count);
+        else if (a == "--slow") valid = number(slow) && std::isfinite(slow) && slow >= 0.0;
+        else if (a == "--stage") valid = !(stage_filter = value()).empty();
         else if (a == "--compute-only") stage_filter = "cs";
         else if (a == "--graphics-only") stage_filter = "graphics";
-        else if (a == "--max-bytes") max_bytes = std::stoull(val());
+        else if (a == "--max-bytes") valid = number(max_bytes);
+        else if (a == "--large-module-bytes") valid = number(large_module_bytes);
+        else if (a == "--stats") valid = !(stats_path = value()).empty();
+        else if (a == "--cache-feedback") cache_feedback = true;
+        else if (a == "--isolate") isolate = true;
+        else if (a == "--isolate-child") iso_child = true;   // internal: the parent's child runs
+        else if (a == "--isolate-batch") {   // parsed like the other numbers (#1735); at least one per batch
+            valid = number(isolate_batch);
+            isolate_batch = std::max<size_t>(1, isolate_batch);
+        }
         else cache_path = a;
+        if (!valid) {
+            std::fprintf(stderr, "%s requires a valid value\n", a.c_str());
+            return 2;
+        }
     }
     if (stage_filter != "all" && stage_filter != "cs" && stage_filter != "graphics") {
         std::fprintf(stderr, "unknown --stage '%s' (expected: all, cs, graphics)\n", stage_filter.c_str());
         return 2;
     }
 
+    if (isolate && !stats_path.empty()) {
+        std::fprintf(stderr, "--isolate cannot be combined with --stats\n");
+        return 2;
+    }
+#ifdef _WIN32
+    if (isolate) {
+        std::fprintf(stderr, "--isolate is not supported on Windows (it needs fork/waitpid); run without it\n");
+        return 2;
+    }
+#endif
+
     std::string index_err;
     auto index = read_index(dir + "/index.json", index_err);
     if (!index_err.empty()) {
-        std::fprintf(stderr, "error: malformed JSON in %s/index.json: %s\n", dir.c_str(), index_err.c_str());
+        std::fprintf(stderr, "error: cannot use %s/index.json: %s\n", dir.c_str(), index_err.c_str());
         return 2;
     }
     std::fprintf(stderr, "%zu shaders in index\n", index.size());
@@ -384,11 +593,120 @@ int main(int argc, char** argv) {
         if (stage_filter == "graphics" && !is_graphics_stage(meta.stage)) continue;
         all.push_back({&name, &meta});
     }
-    const size_t lo = std::min(start, all.size()), hi = std::min(all.size(), count ? lo + count : all.size());
+    const auto [lo, hi] = shader_slice(all.size(), start, count);
     const std::vector<Item> work(all.begin() + lo, all.begin() + hi);
 
+#ifndef _WIN32
+    if (isolate) {
+        // Parent: no Vulkan here. Run the check in child processes, one at a time, in batches of --isolate-batch
+        // modules. A child that dies mid-batch has its output discarded and the batch is bisected until the one
+        // module that kills the driver is found; the clean sub-runs partition the rest, so nothing is counted twice.
+        std::string exe = argv[0];
+        std::error_code ec;
+        if (auto self = std::filesystem::read_symlink("/proc/self/exe", ec); !ec) exe = self.string();
+        std::vector<std::string> pass = {"--jobs", std::to_string(jobs), "--slow", std::to_string(slow), "--stage", stage_filter,
+                                         "--max-bytes", std::to_string(max_bytes),
+                                         "--large-module-bytes", std::to_string(large_module_bytes)};
+        if (cache_feedback) pass.push_back("--cache-feedback");
+        struct Agg { uint32_t mod_ok = 0, mod_bad = 0, pipe_ok = 0, pipe_bad = 0, pipe_skip = 0, big = 0, crashed = 0, fb[3] = {}; };
+        std::map<std::string, Agg> agg;
+        std::vector<std::string> crashes;
+        bool cache_ok = true, setup_failed = false;
+        size_t unreproduced = 0;
+        const auto t_iso = std::chrono::steady_clock::now();
+        std::fprintf(stderr, "isolating %zu shaders [%zu, %zu) (stage=%s) in child processes, %zu per batch\n",
+                     work.size(), lo, hi, stage_filter.c_str(), isolate_batch);
+        auto commit = [&](const ChildRun& r) {
+            size_t pos = 0;
+            while (pos < r.out.size()) {
+                size_t e = r.out.find('\n', pos);
+                if (e == std::string::npos) e = r.out.size();
+                const std::string line = r.out.substr(pos, e - pos);
+                pos = e + 1;
+                // The parent prints one cache line at the end instead of one per child.
+                if (line == "ISO-READY" || line.rfind("ISO-DONE", 0) == 0 || line.rfind("pipeline cache: ", 0) == 0) continue;
+                if (line.rfind("ISO-RESULT ", 0) == 0) {
+                    char st[16];
+                    unsigned v[9] = {};
+                    if (std::sscanf(line.c_str(), "ISO-RESULT %15s %u %u %u %u %u %u %u %u %u", st, v, v + 1, v + 2, v + 3,
+                                    v + 4, v + 5, v + 6, v + 7, v + 8) == 10) {
+                        Agg& a = agg[st];
+                        a.mod_ok += v[0]; a.mod_bad += v[1]; a.pipe_ok += v[2]; a.pipe_bad += v[3]; a.pipe_skip += v[4];
+                        a.big += v[5]; a.fb[0] += v[6]; a.fb[1] += v[7]; a.fb[2] += v[8];
+                    }
+                    continue;
+                }
+                std::printf("%s\n", line.c_str());
+            }
+            std::fflush(stdout);
+            if (!r.cache_ok) cache_ok = false;
+        };
+        // Returns the number of failures recorded for [s, s + n): crashed modules, or 1 for a crash that vanished.
+        auto bisect = [&](auto&& self, size_t s, size_t n) -> size_t {
+            if (setup_failed) return 0;
+            const ChildRun r = run_child(exe, dir, pass, cache_path, s, n);
+            if (r.done) { commit(r); return 0; }
+            if (!r.ready) {   // died or exited before the work loop: not a module's fault
+                std::fputs(r.out.c_str(), stdout);
+                if (r.sig) std::fprintf(stderr, "error: a child process died during setup (%s)\n", signal_label(r.sig).c_str());
+                else std::fprintf(stderr, "error: a child process failed during setup (exit status %d)\n", r.status);
+                setup_failed = true;
+                return 0;
+            }
+            const std::string why = r.sig ? "driver crashed: " + signal_label(r.sig)
+                                          : "driver exited with status " + std::to_string(r.status);
+            if (n == 1) {
+                const std::string& name = *all[s].first;
+                const std::string& st = all[s].second->stage;
+                std::printf("MODULE CRASH %s (%s, %s)\n", name.c_str(), st.c_str(), why.c_str());
+                std::fflush(stdout);
+                crashes.push_back(name + " (" + st + ", " + why + ")");
+                agg[st].pipe_bad++;
+                agg[st].crashed++;
+                return 1;
+            }
+            std::fprintf(stderr, "child over [%zu, %zu) died (%s); bisecting\n", s, s + n, why.c_str());
+            const size_t half = n / 2;
+            size_t found = self(self, s, half);
+            found += self(self, s + half, n - half);
+            if (found == 0 && !setup_failed) {
+                std::printf("MODULE CRASH [%zu, %zu) not reproduced when split (%s); counted as failed\n", s, s + n, why.c_str());
+                ++unreproduced;
+                return 1;
+            }
+            return found;
+        };
+        for (size_t s = lo; s < hi && !setup_failed; s += isolate_batch) bisect(bisect, s, std::min(isolate_batch, hi - s));
+        if (setup_failed) return 1;
+        bool failed = !crashes.empty() || unreproduced || !cache_ok;
+        for (const auto& [st, a] : agg) {
+            std::printf("%s: %u modules ok, %u failed\n", st.c_str(), a.mod_ok, a.mod_bad);
+            std::printf("%s pipelines: %u ok, %u failed, %u skipped\n", st.c_str(), a.pipe_ok, a.pipe_bad, a.pipe_skip);
+            if (a.crashed) std::printf("  %s crashed the driver: %u (counted as failed)\n", st.c_str(), a.crashed);
+            if (cache_feedback)
+                std::printf("  %s cache feedback: %u hits, %u no hit reported, %u unavailable\n", st.c_str(), a.fb[0], a.fb[1], a.fb[2]);
+            if (a.mod_bad || a.pipe_bad) failed = true;
+        }
+        uint32_t big_total = 0;
+        for (const auto& [st, a] : agg) big_total += a.big;
+        if (big_total) std::printf("big modules skipped: %u (limit %zu bytes)\n", big_total, max_bytes);
+        if (!crashes.empty()) {
+            std::printf("modules that crashed the driver: %zu\n", crashes.size());
+            for (const auto& c : crashes) std::printf("  %s\n", c.c_str());
+        }
+        if (unreproduced) std::printf("crashes not reproduced after splitting: %zu\n", unreproduced);
+        if (!cache_path.empty()) {
+            const auto sz = std::filesystem::file_size(cache_path, ec);
+            if (!ec) std::printf("pipeline cache: %ju bytes -> %s\n", static_cast<uintmax_t>(sz), cache_path.c_str());
+        }
+        std::printf("wall time: %.1fs (isolated)\n",
+                    std::chrono::duration<double>(std::chrono::steady_clock::now() - t_iso).count());
+        return failed ? 1 : 0;
+    }
+#endif
+
     // Scan selected shaders to request only the optional extensions they actually use.
-    bool want_mesh = false, want_bary = false, want_lock = false, want_m8 = false;
+    bool want_mesh = false, want_bary = false, want_lock = false, want_m8 = false, want_fma = false;
     for (auto& [_, meta] : work) {
         if (meta->stage == "ms") want_mesh = true;
         if (meta->needs_maintenance8) want_m8 = true;
@@ -396,6 +714,7 @@ int main(int argc, char** argv) {
             if (feat == "meshShader") want_mesh = true;
             else if (feat == "fragmentShaderBarycentric") want_bary = true;
             else if (feat == "fragmentShaderPixelInterlock") want_lock = true;
+            else if (feat == "shaderFmaFloat32") want_fma = true;   // OpFmaKHR (rdna2spirv.py --fma khr)
         }
     }
 
@@ -417,10 +736,13 @@ int main(int argc, char** argv) {
     if (n == 0) { std::fprintf(stderr, "no Vulkan physical devices found\n"); return 1; }
     std::vector<VkPhysicalDevice> pds(n);
     vkEnumeratePhysicalDevices(inst, &n, pds.data());
-    VkPhysicalDevice pd = VK_NULL_HANDLE;
-    for (auto d : pds) {
-        VkPhysicalDeviceProperties p; vkGetPhysicalDeviceProperties(d, &p);
-        if (p.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU || !pd) pd = d;
+    std::vector<VkPhysicalDeviceProperties> candidates(pds.size());
+    for (std::size_t i = 0; i < pds.size(); ++i) vkGetPhysicalDeviceProperties(pds[i], &candidates[i]);
+    const std::size_t chosen = leonida::vk_test::pick_device(candidates);
+    VkPhysicalDevice pd = chosen < pds.size() ? pds[chosen] : VK_NULL_HANDLE;
+    if (!pd) {
+        leonida::vk_test::report_no_device();
+        return 1;
     }
     VkPhysicalDeviceProperties props; vkGetPhysicalDeviceProperties(pd, &props);
     VkPhysicalDeviceSubgroupSizeControlProperties sgProps{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES};
@@ -443,6 +765,8 @@ int main(int argc, char** argv) {
 #ifdef VK_KHR_MAINTENANCE_8_EXTENSION_NAME
     VkPhysicalDeviceMaintenance8FeaturesKHR m8{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_8_FEATURES_KHR};
 #endif
+    VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR exe{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR};
     VkPhysicalDeviceVulkan12Features f12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
     VkPhysicalDeviceVulkan13Features f13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
     void* chain = nullptr;
@@ -463,6 +787,28 @@ int main(int argc, char** argv) {
 #else
     (void)want_m8;
 #endif
+#ifdef VK_KHR_SHADER_FMA_EXTENSION_NAME
+    VkPhysicalDeviceShaderFmaFeaturesKHR fma{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FMA_FEATURES_KHR};
+    const bool ext_fma = link(&fma, reinterpret_cast<VkBaseOutStructure*>(&fma), VK_KHR_SHADER_FMA_EXTENSION_NAME, want_fma);
+#else
+    const bool ext_fma = false;
+    (void)want_fma;
+#endif
+    const bool ext_exe = link(&exe, reinterpret_cast<VkBaseOutStructure*>(&exe),
+                              VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME, !stats_path.empty());
+    if (!stats_path.empty() && !ext_exe) {
+        std::fprintf(stderr, "--stats: the device has no %s\n", VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME);
+        return 1;
+    }
+    // --cache-feedback: core in Vulkan 1.3 (no feature bit). A pre-1.3 device needs VK_EXT_pipeline_creation_feedback;
+    // without it nothing is chained and every successful pipeline counts as unavailable.
+    const bool fb_ext = cache_feedback && props.apiVersion < VK_API_VERSION_1_3 &&
+                        has(VK_EXT_PIPELINE_CREATION_FEEDBACK_EXTENSION_NAME);
+    if (fb_ext) enable.push_back(VK_EXT_PIPELINE_CREATION_FEEDBACK_EXTENSION_NAME);
+    const bool feedback = cache_feedback && (props.apiVersion >= VK_API_VERSION_1_3 || fb_ext);
+    if (cache_feedback && !feedback)
+        std::fprintf(stderr, "note: --cache-feedback: no Vulkan 1.3 or %s; every pipeline is counted unavailable\n",
+                     VK_EXT_PIPELINE_CREATION_FEEDBACK_EXTENSION_NAME);
     VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
     f2.pNext = chain;
     vkGetPhysicalDeviceFeatures2(pd, &f2);            // fills every linked struct with what's supported
@@ -507,6 +853,8 @@ int main(int argc, char** argv) {
     LOADD(vkCreateShaderModule); LOADD(vkDestroyShaderModule); LOADD(vkCreateDescriptorSetLayout);
     LOADD(vkCreatePipelineLayout); LOADD(vkCreateComputePipelines); LOADD(vkCreateGraphicsPipelines);
     LOADD(vkDestroyPipeline); LOADD(vkCreatePipelineCache); LOADD(vkGetPipelineCacheData);
+    LOADD(vkGetPipelineExecutablePropertiesKHR); LOADD(vkGetPipelineExecutableStatisticsKHR);
+    const VkPipelineCreateFlags capture = stats_path.empty() ? 0 : VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR;
 
     // Map enabled device features for per-shader compatibility checks.
     auto check_missing_feature = [&](const ShaderMeta& meta) -> std::string {
@@ -525,6 +873,13 @@ int main(int argc, char** argv) {
             if (feat == "geometryShader" && !f2.features.geometryShader) return "no geometryShader";
             if (feat == "fragmentShaderBarycentric" && !(ext_bary && bary.fragmentShaderBarycentric)) return "no fragmentShaderBarycentric";
             if (feat == "fragmentShaderPixelInterlock" && !(ext_lock && lock.fragmentShaderPixelInterlock)) return "no fragmentShaderPixelInterlock";
+            if (feat == "shaderFmaFloat32") {
+#ifdef VK_KHR_SHADER_FMA_EXTENSION_NAME
+                if (!(ext_fma && fma.shaderFmaFloat32)) return "no VK_KHR_shader_fma (shaderFmaFloat32)";
+#else
+                return "no VK_KHR_shader_fma (shaderFmaFloat32)";
+#endif
+            }
             if (feat == "shaderFloat64" && !f2.features.shaderFloat64) return "no shaderFloat64";
             if (feat == "shaderInt64" && !f2.features.shaderInt64) return "no shaderInt64";
             if (feat == "bufferDeviceAddress" && !f12.bufferDeviceAddress) return "no bufferDeviceAddress";
@@ -595,6 +950,8 @@ int main(int argc, char** argv) {
                  work.size(), lo, hi, stage_filter.c_str(), jobs);
 
     std::mutex mu;  // guards counters, stdout, stub cache and in-flight table
+    std::shared_mutex compile_gate;  // large modules exclude other shader and pipeline work
+    size_t isolated_modules = 0;
     std::map<std::string, uint32_t> modules_ok, modules_bad, big_skipped;
     std::map<std::string, StageStats> stats;
     std::map<std::string, VkShaderModule> stub_cache;
@@ -633,8 +990,41 @@ int main(int argc, char** argv) {
         std::printf("SKIPPED %s (%s)\n", name.c_str(), reason.c_str());
     };
 
+    std::FILE* stats_out = stats_path.empty() ? nullptr : std::fopen(stats_path.c_str(), "w");
+    if (!stats_path.empty() && !stats_out) { std::fprintf(stderr, "cannot write %s\n", stats_path.c_str()); return 1; }
+    if (stats_out) std::fprintf(stats_out, "name,stage,statistic,value\n");
+    // --stats: one CSV row per statistic of the executable that runs the translated shader (stage bit `bit`).
+    auto write_stats = [&](const std::string& name, const std::string& stage, VkShaderStageFlagBits bit, VkPipeline p) {
+        if (!stats_out) return;
+        VkPipelineInfoKHR pi{VK_STRUCTURE_TYPE_PIPELINE_INFO_KHR};
+        pi.pipeline = p;
+        uint32_t n = 0;
+        vkGetPipelineExecutablePropertiesKHR(dev, &pi, &n, nullptr);
+        std::vector<VkPipelineExecutablePropertiesKHR> exes(n, {VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_PROPERTIES_KHR});
+        vkGetPipelineExecutablePropertiesKHR(dev, &pi, &n, exes.data());
+        for (uint32_t e = 0; e < n; e++) {
+            if (!(exes[e].stages & bit)) continue;
+            VkPipelineExecutableInfoKHR ei{VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_INFO_KHR};
+            ei.pipeline = p; ei.executableIndex = e;
+            uint32_t m = 0;
+            vkGetPipelineExecutableStatisticsKHR(dev, &ei, &m, nullptr);
+            std::vector<VkPipelineExecutableStatisticKHR> st(m, {VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_STATISTIC_KHR});
+            vkGetPipelineExecutableStatisticsKHR(dev, &ei, &m, st.data());
+            std::lock_guard<std::mutex> g(mu);
+            for (auto& x : st) {
+                std::fprintf(stats_out, "%s,%s,%s,", name.c_str(), stage.c_str(), x.name);
+                switch (x.format) {
+                case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_BOOL32_KHR: std::fprintf(stats_out, "%u\n", x.value.b32); break;
+                case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_INT64_KHR: std::fprintf(stats_out, "%lld\n", (long long)x.value.i64); break;
+                case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_UINT64_KHR: std::fprintf(stats_out, "%llu\n", (unsigned long long)x.value.u64); break;
+                default: std::fprintf(stats_out, "%g\n", x.value.f64); break;
+                }
+            }
+        }
+    };
+
     auto record_pipe = [&](const std::string& name, const std::string& stage, uint32_t sg, bool sg_forced,
-                           VkResult r, double sec) {
+                           VkResult r, double sec, VkPipelineCreationFeedbackFlags fb_flags) {
         std::lock_guard<std::mutex> g(mu);
         inflight.erase(std::this_thread::get_id());
         auto& st = stats[stage];
@@ -650,10 +1040,20 @@ int main(int argc, char** argv) {
             std::printf("PIPELINE FAIL %s (%s w%u, %d)\n", name.c_str(), stage.c_str(), sg, r);
         } else {
             st.pipes_ok++;
+            if (cache_feedback) st.feedback[feedback_outcome(fb_flags)]++;
             if (sg == 64) st.w64_ok++; else st.w32_ok++;
         }
         uint32_t n_done = ++total_pipes_done;
         if (n_done % 250 == 0) std::fprintf(stderr, "  pipelines %u (%.0fs elapsed)\n", n_done, elapsed());
+    };
+
+    const SimulatedCrash sim_crash = read_simulated_crash();
+    auto maybe_simulate_crash = [&](const std::string& name) {   // test hook, see the header
+        if (sim_crash.enabled && name.find(sim_crash.pattern) != std::string::npos) {
+            std::fprintf(stderr, "simulating signal %d before the pipeline of %s\n", sim_crash.sig, name.c_str());
+            std::fflush(nullptr);
+            std::raise(sim_crash.sig);
+        }
     };
 
     auto worker = [&] {
@@ -663,7 +1063,7 @@ int main(int argc, char** argv) {
             const std::string& stage = meta.stage;
             std::ifstream f(dir + "/" + name + ".spv", std::ios::binary | std::ios::ate);
             const std::streamoff file_size = f.tellg();
-            if (max_bytes && file_size > std::streamoff(max_bytes)) {   // multi-MB ray-tracing shaders (#108)
+            if (max_bytes && std::cmp_greater(file_size, max_bytes)) {   // multi-MB ray-tracing shaders (#108)
                 {
                     std::lock_guard<std::mutex> g(mu);
                     big_skipped[stage]++;
@@ -673,6 +1073,14 @@ int main(int argc, char** argv) {
                 ++done;
                 continue;
             }
+            // Enter before reading the module: creation can also enter the driver. Hold until its pipeline and
+            // module have been destroyed, including on failure. The watchdog and cache writer don't take this lock.
+            const bool isolated = large_module_bytes && std::cmp_greater(file_size, large_module_bytes);
+            std::unique_lock exclusive(compile_gate, std::defer_lock);
+            std::shared_lock parallel(compile_gate, std::defer_lock);
+            if (isolated) exclusive.lock();
+            else if (large_module_bytes) parallel.lock();
+
             f.seekg(0);
             std::vector<char> code((std::istreambuf_iterator<char>(f)), {});
             VkShaderModule sm = VK_NULL_HANDLE;
@@ -684,6 +1092,7 @@ int main(int argc, char** argv) {
             }
             {
                 std::lock_guard<std::mutex> g(mu);
+                if (isolated) ++isolated_modules;
                 if (mod_ok) modules_ok[stage]++;
                 else { modules_bad[stage]++; std::printf("MODULE FAIL %s\n", name.c_str()); }
             }
@@ -701,13 +1110,21 @@ int main(int argc, char** argv) {
                     const bool sg_forced = can_require_sg(meta.subgroup_size, VK_SHADER_STAGE_COMPUTE_BIT);
                     if (sg_forced) cpi.stage.pNext = &reqSg;
                     cpi.layout = pl;
+                    cpi.flags = capture;
+                    // Only whole-pipeline feedback is reported.
+                    VkPipelineCreationFeedback fb{};
+                    VkPipelineCreationFeedbackCreateInfo fci{
+                        VK_STRUCTURE_TYPE_PIPELINE_CREATION_FEEDBACK_CREATE_INFO, nullptr, &fb, 0, nullptr};
+                    if (feedback) cpi.pNext = &fci;
                     const auto t0 = std::chrono::steady_clock::now();
                     { std::lock_guard<std::mutex> g(mu); inflight[std::this_thread::get_id()] = {name, t0}; }
                     VkPipeline p = VK_NULL_HANDLE;
+                    maybe_simulate_crash(name);
                     VkResult r = vkCreateComputePipelines(dev, cache, 1, &cpi, nullptr, &p);
                     const double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+                    if (r == VK_SUCCESS) write_stats(name, stage, VK_SHADER_STAGE_COMPUTE_BIT, p);
                     if (r == VK_SUCCESS) vkDestroyPipeline(dev, p, nullptr);
-                    record_pipe(name, stage, meta.subgroup_size, sg_forced, r, sec);
+                    record_pipe(name, stage, meta.subgroup_size, sg_forced, r, sec, fb.flags);
                 }
             } else if (mod_ok && is_graphics_stage(stage)) {
                 const std::string miss = check_missing_feature(meta);
@@ -862,14 +1279,22 @@ int main(int argc, char** argv) {
                         gpci.pDynamicState = &dyn_state;
                         gpci.layout = pl;
                         gpci.renderPass = VK_NULL_HANDLE;
+                        gpci.flags = capture;
+                        // Zeroed per call and read after it returns; per-stage entries are required but not reported.
+                        VkPipelineCreationFeedback fb{};
+                        VkPipelineCreationFeedbackCreateInfo fci{
+                            VK_STRUCTURE_TYPE_PIPELINE_CREATION_FEEDBACK_CREATE_INFO, &rend, &fb, 0, nullptr};
+                        if (feedback) gpci.pNext = &fci;  // keeps rend chained behind it
 
                         const auto t0 = std::chrono::steady_clock::now();
                         { std::lock_guard<std::mutex> g(mu); inflight[std::this_thread::get_id()] = {name, t0}; }
                         VkPipeline p = VK_NULL_HANDLE;
+                        maybe_simulate_crash(name);
                         VkResult r = vkCreateGraphicsPipelines(dev, cache, 1, &gpci, nullptr, &p);
                         const double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+                        if (r == VK_SUCCESS) write_stats(name, stage, stage_bit(stage), p);
                         if (r == VK_SUCCESS) vkDestroyPipeline(dev, p, nullptr);
-                        record_pipe(name, stage, meta.subgroup_size, sg_forced, r, sec);
+                        record_pipe(name, stage, meta.subgroup_size, sg_forced, r, sec, fb.flags);
                     }
                 }
             } else if (mod_ok) {
@@ -882,6 +1307,8 @@ int main(int argc, char** argv) {
             }
         }
     };
+    if (iso_child) std::printf("ISO-READY\n");
+    std::fflush(stdout);
     std::vector<std::thread> pool;
     for (uint32_t t = 0; t < jobs; t++) pool.emplace_back(worker);
     // Watchdog: names every compile running past 60 s (about once a minute) and saves the cache every 10 minutes.
@@ -920,6 +1347,20 @@ int main(int argc, char** argv) {
     for (auto& [st, _] : modules_bad) all_stages.insert(st);
     for (auto& [st, _] : stats) all_stages.insert(st);
 
+    if (iso_child) {   // --isolate child: machine-readable counts; the parent prints the summary
+        for (const auto& st : all_stages) {
+            const StageStats* s = stats.count(st) ? &stats[st] : nullptr;
+            uint32_t big = big_skipped.count(st) ? big_skipped[st] : 0;
+            std::printf("ISO-RESULT %s %u %u %u %u %u %u %u %u %u\n", st.c_str(), modules_ok[st], modules_bad[st],
+                        s ? s->pipes_ok : 0u, s ? s->pipes_bad : 0u, s ? s->pipes_skipped : 0u, big,
+                        s ? s->feedback[0] : 0u, s ? s->feedback[1] : 0u, s ? s->feedback[2] : 0u);
+        }
+        const bool saved = save_cache(true);
+        std::printf("ISO-DONE cache_ok=%d\n", saved ? 1 : 0);
+        std::fflush(stdout);
+        return saved ? 0 : 1;
+    }
+
     bool check_failed = false;
     for (const auto& st : all_stages) {
         std::printf("%s: %u modules ok, %u failed\n", st.c_str(), modules_ok[st], modules_bad[st]);
@@ -931,6 +1372,9 @@ int main(int argc, char** argv) {
             const uint32_t compiled = s.pipes_ok + s.pipes_bad;
             std::printf("%s pipelines: %u ok, %u failed, %u skipped\n",
                         st.c_str(), s.pipes_ok, s.pipes_bad, s.pipes_skipped);
+            if (cache_feedback)
+                std::printf("  %s cache feedback: %u hits, %u no hit reported, %u unavailable\n",
+                            st.c_str(), s.feedback[0], s.feedback[1], s.feedback[2]);
             if (!s.skip_reasons.empty()) {
                 for (const auto& [reason, cnt] : s.skip_reasons)
                     std::printf("  %s skipped (%s): %u\n", st.c_str(), reason.c_str(), cnt);
@@ -955,7 +1399,11 @@ int main(int argc, char** argv) {
         for (auto& [st, c] : big_skipped) std::printf(" %s=%u", st.c_str(), c);
         std::printf("; checked %zu of %zu\n", work.size() - big_total, work.size());
     }
+    if (isolated_modules)
+        std::printf("large modules checked exclusively: %zu (over %zu bytes)\n", isolated_modules,
+                    large_module_bytes);
     std::printf("wall time: %.1fs on %u threads\n", elapsed(), jobs);
     const bool cache_saved = save_cache(true);  // keep successful pipelines even if another entry failed
+    if (stats_out) std::fclose(stats_out);
     return (check_failed || !cache_saved) ? 1 : 0;
 }

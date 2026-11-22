@@ -29,8 +29,11 @@ other machine.
 ## Dry run
 
 ```powershell
-gta6rt --dry-run <image.exe|image.dll> [--game-dir <package>]
+gta6rt --dry-run <image.exe|image.dll> [--game-dir <package>] [--overlay <dir>]
 ```
+
+`--overlay` is where a mapped title's writes go (default `<game-dir>\overlay`); `GAME:` paths read from
+`--game-dir`. See [Console paths and the write overlay](../docs/runtime_imports.md#console-paths-and-the-write-overlay).
 
 The dry run maps the image and the bundled modules it imports, applies base relocations, binds every
 import through the shim registry, a host DLL, or another bundled module, parses exports, installs static
@@ -41,7 +44,13 @@ code from the mapped images runs. TLS reserves its module index through the runt
 
 `gta6rt --init <image>` runs the same mapping and then `Loader::initialise()`: each module's TLS
 callbacks and each DLL's `DllMain(DLL_PROCESS_ATTACH)`, dependencies first. An EXE's entry point is not
-run.
+run. When the loader is destroyed, initialised modules receive TLS callbacks and DLL entry-point calls with
+`DLL_PROCESS_DETACH`, in reverse initialisation order. All mapped images, unwind tables and static TLS stay
+available until these notifications finish, so DLLs can release resources such as FLS callbacks safely. The reserved
+argument is null (explicit unload). A map-only load receives no detach notifications.
+
+`--dry-run`, `--init` and `--run` are separate modes: give exactly one. Two together (`--dry-run --run`)
+print the usage and exit 2 before anything is mapped.
 
 The report line is:
 
@@ -97,6 +106,14 @@ through a mapped image are dispatched and stack walks can step over its frames. 
 first (entries in bounds, sorted and non-overlapping) and removed when the loader is destroyed. Modules
 are deduped by lower-case file name, so an import graph that reaches the same DLL twice maps it once.
 
+MSVC C++ exceptions need one more piece. `_CxxThrowException` stores the throwing image's base in the
+exception record, from `RtlPcToFileHeader`, and the catch side adds the throw's RVAs to it; Windows' own
+`RtlPcToFileHeader` only knows images its loader mapped, so for a mapped image the base is 0 and no
+`catch` matches. When the loader binds a host copy of the MSVC runtime (`vcruntime140.dll`,
+`msvcp140.dll` and the rest of that list), it points that DLL's import of `RtlPcToFileHeader` at a
+version that asks Windows first and then the modules a live `Loader` maps. The redirect stays for the
+process lifetime and answers as Windows does when no `Loader` is alive.
+
 `load()` also installs static TLS for the calling thread. `__declspec(thread)` reads `TEB->ThreadLocalStoragePointer[_tls_index]`, which is a
 different index space from the `TlsAlloc` slots, and only the OS loader can allocate a module index.
 The runtime therefore ships a minimal `gta6rt_tls_host.dll`; the loader reuses the index the OS assigns
@@ -110,11 +127,16 @@ Current limits, by design:
 - `load()` runs no image code. Static TLS is data, not code. The TLS index helper is the runtime's own
   `gta6rt_tls_host.dll`; host imports still load system DLLs as before.
 - `--dry-run` never runs image code. `initialise()` runs TLS callbacks and a DLL's `DllMain`;
-  `run_tls_callbacks()` is the opt-in seam for `DLL_THREAD_ATTACH`/`DETACH` and for callers that do not
-  use `initialise()`. An EXE's entry point is the caller's to run.
-- The loader does not deliver thread attach/detach events. Call `install_tls_for_thread()` before mapped
-  code runs on a thread the runtime created and `uninstall_tls_for_thread()` before it exits; destroy the
-  `Loader` on the thread that called `load()`.
+  `run_tls_callbacks()` is the seam for callers that do not use `initialise()`. An EXE's entry point is
+  the caller's to run.
+- Every thread started after `load()` gets its own copy of the TLS template, from
+  `gta6rt_tls_host.dll`'s `DLL_THREAD_ATTACH`, and gives it back at `DLL_THREAD_DETACH`, also when the
+  thread outlives its `Loader`. From `initialise()` until `~Loader` starts the process detach, those
+  events also run the module's TLS callbacks, with the thread's copy already in place. A thread that
+  existed before `load()` gets nothing:
+  call `install_tls_for_thread()` before mapped code runs on it and `uninstall_tls_for_thread()` before it
+  exits. Mapped DLLs' `DllMain` is not called with thread events. Destroy the `Loader` on the thread that
+  called `load()`.
 - The TOC of the game's RPF archives is encrypted and is not read here. The loader works on the PE
   files and on any images the caller passes it.
 
@@ -122,10 +144,16 @@ Current limits, by design:
 
 `shims/registry.cpp` holds the static tables. The current shims are:
 
-- `xmem.dll` — `XMemAlloc`, `XMemFree`, `XMemGetWorkingSetStatistics`, and the measured three-argument
+- `xmem.dll` — `XMemAlloc`, `XMemFree`, the measured two-argument `XMemGetWorkingSetStatistics(kind, out)`, and the
+  measured three-argument
   `XMemVirtualQuery(process, address, out)`. Allocations are 64-byte aligned; the working-set and
   virtual-query outputs fill the observed 64-byte structures and return `FALSE`/`0` on a null or bad
   address.
+- The `kernel32.dll` file API — `CreateFileA/W`, `FindFirstFileA/W`/`FindNextFileA/W`/`FindClose`,
+  `GetFileAttributesA/W`, `GetFileAttributesExA/W` and `DeleteFileA/W`: a `GAME:` path maps under `--game-dir`, an
+  open that can write and a delete go to `--overlay DIR` (default `<game-dir>\overlay`), which reads prefer, and a path
+  that climbs above `GAME:` is refused. The package is never modified. See
+  [docs/runtime_imports.md](../docs/runtime_imports.md#console-paths-and-the-write-overlay).
 - `d3d12_xs.dll` — `D3D12SerializeVersionedRootSignature` and
   `D3D12CreateRootSignatureDeserializer`, with the console root-signature high byte (`0x03000000`)
   cleared on a copy before forwarding to the PC `d3d12.dll`. `D3D12XboxCreateDevice` wraps a device in
@@ -134,6 +162,13 @@ Current limits, by design:
   Vulkan SDK and Python 3. The Vulkan device covers command submission, descriptor heaps, render-target and
   depth views, committed resources and copies (uploads, readbacks, BC textures); see `docs/d3d12_vulkan.md`
   section 3.2 for what is missing.
+
+- `gameinput.dll` / `xgameruntime.dll` — `GameInputCreate`: the v0 GameInput API for gamepads on SDL3
+  (`shims/gameinput.cpp`), so any controller SDL supports works, with rumble, Xbox trigger rumble, and on a
+  DualSense adaptive-trigger effects and the lightbar. Optional and CMake-only: built when an installed SDL3 is found,
+  or with `-DLEONIDA_SDL3_FETCH=ON` to download the pinned release; nothing is downloaded otherwise, and the
+  `scripts/build_runtime.ps1` cl.exe fallback never builds it. See [docs/gameinput.md](../docs/gameinput.md) for the mapping, the `LEONIDA_DS_*` settings and what is
+  unverified.
 
 The two serializer functions and `D3D12XboxCreateDevice` are the only `d3d12_xs` imports used by the
 shipped DLLs (measured; see `docs/design.md` and `docs/d3d12_vulkan.md`). The game executable's own
@@ -148,13 +183,34 @@ ctest --test-dir runtime/build -C RelWithDebInfo --output-on-failure
 ```
 
 On Windows the build configures the CPU tests that do not need a GPU or game files, including the
-root-signature forwarding test (`root_sig_test`) and the clear-command test. The Vulkan tools are built
-when the Vulkan SDK is found:
+root-signature forwarding test (`root_sig_test`) and the clear-command test. The Vulkan tools and
+D3D12-over-Vulkan COM targets are built when Vulkan headers are found (via `VULKAN_SDK`, an installed
+SDK, or `-DLEONIDA_VULKAN_HEADERS_FETCH=ON` to download the pinned Khronos Vulkan-Headers release):
 
 - `vk_harness` — hand-written RDNA2 shader programs on a real Vulkan device.
 - `vk_texture_test`, `vk_compute_test`, `vk_store_test` — texture, LDS/compute, and buffer-store paths.
 - `vk_command_replay_test`, `d3d12_com_test`, `d3d12_vulkan_device_test` — the D3D12 command path on
-  Vulkan: replay, the COM command objects, and the Vulkan device behind the Xbox-ABI proxy. Set
+  Vulkan: replay, the COM command objects, and the Vulkan device behind the Xbox-ABI proxy.
+- GPU tests count only validation-type errors. Loader and layer messages, such as a third-party implicit layer
+  that fails to load, are printed but don't fail the run; to silence one, set
+  `VK_LOADER_LAYERS_DISABLE=<layer name pattern>`.
+- `d3d12_draw_test` — milestone M1: a VS+PS pipeline found by FSSM hash, the input layout matched by semantic,
+  and five draws plus a culled triangle, compared pixel by pixel. They also cover an unbound render target and
+  DSV, a rebound root signature, instance step rate 0, an unbound vertex slot, and PSOs, buffers and heaps that
+  must be refused. A second pass draws a full-screen triangle with no vertex input and an XOR logic op.
+- `d3d12_translated_draw_test` — milestone M1.5: the same with translator output. `test/shaders/vs_m15.asm` (vertex
+  fetch through a V#) and `ps_m15.asm` (constants read through the code base) are built by `test/shaders/build.py`
+  and found by FSSM hash; three draws into a float target, compared bit for bit. Needs `llvm-mc` (`LLVM_MC`) and the
+  Vulkan SDK's `spirv-as` and `spirv-val` at build time.
+- `d3d12_compute_test` — the compute path: root signature, a compute PSO found by its FSSM hash in a
+  translator-style index, root arguments through the GPU address arena, and two dispatches.
+- `d3d12_set0_compute_test` — set 0 from the compute bind point: a compute PSO whose index entry lists set-0
+  bindings, and four dispatches that sample two SRVs, bytes no view was made for and a clamping sampler through
+  the bindless set the layer binds.
+- `d3d12_present_test` — milestone M0: opens a window and presents 60 cleared frames through the proxy on
+  Vulkan, resizes it and presents 10 more, and checks the colour on screen. A driver double then injects an
+  out-of-date and a suboptimal present, a failed semaphore during a swapchain recreation and a failed blit
+  submission, which the presenter must survive. Set
   `LEONIDA_VK_VALIDATION=1` to run them under the Khronos validation layer.
 - `vk_pipeline_check <spirv dir> [cache.bin] [--jobs N] [--start I] [--count N] [--max-bytes N]` -
   creates a shader module and, for compute shaders, a pipeline for every entry in the translator's
@@ -162,6 +218,11 @@ when the Vulkan SDK is found:
   names and skips modules larger than the limit, which is how the corpus run works around the
   driver's compile time on multi-megabyte ray-tracing shaders. The measured partial pass is in
   [docs/pipeline_check.md](../docs/pipeline_check.md).
+
+`gameinput_test` (only with SDL3; otherwise CTest lists `gameinput` as not run) drives the GameInput shim on SDL virtual joysticks (no controller needed): enumeration, readings
+and the button/axis mapping, rumble and trigger rumble, DualSense effect bytes, a dispatcher, and hot-plug.
+`gameinput_probe [--seconds N] [--rumble]` is the manual check on a real pad: it prints live readings and plays each
+motor and trigger.
 
 `unimplemented_policy_test` builds a small image whose two imports bind to nothing and checks `log`, `fail` and
 `stop` on it: return values, untouched out parameter, xmm0 = 0, environment parsing, and (in a child process) the
@@ -173,6 +234,14 @@ back to the caller.
 The PE-loader and Bink-decode tests that need the retail package are optional: when
 `LEONIDA_GAME_DIR` (and, for Bink, `LEONIDA_MOVIE`) is unset they print `SKIP` and exit 0. They read
 the files in place and never copy or commit game data.
+
+`shader_library_corpus_test` runs the D3D12 layer's shader lookup (`src/shader_library.h`) over a work folder
+that `make_game.py --stages shaders` built from your copy. With `LEONIDA_SHADERS=<work>/shaders/spirv` it takes
+every container in `<work>/shaders/dxbc` (or `LEONIDA_SHADER_DXBC`), inflates its FSSM program and looks it up
+under the stage its DXIL program header names. Each container has to find its own `index.json` entry and a
+readable `.spv`, every entry has to be reached, and in containers with more than one 0x0D payload no earlier
+payload may be the indexed program. Without `LEONIDA_SHADERS` it prints `SKIP` (CTest reports it as skipped).
+It prints counts only; on the 1.0.2.1 corpus all 26,503 containers resolve.
 
 ## Current limits
 
@@ -232,4 +301,47 @@ $env:VK_VALIDATION_VALIDATE_SYNC = '1'
 .\runtime\build\RelWithDebInfo\d3d12_typeless_rtv_test.exe
 ```
 
+### 96-bit R32G32B32 textures (D3D-62)
+
+`d3d12_rgb96_test` compares footprints, uploads, readbacks, boxes, texture-to-texture copies and CPU copies of
+`R32G32B32_FLOAT/UINT/SINT/TYPELESS` textures (2D arrays with mips, and volumes) with Windows WARP, bit for bit,
+and prints how long an upload and a readback take. `d3d12_descriptor_test` samples them (alpha reads as one). It
+is registered in CTest (`d3d12_rgb96`).
+
+```powershell
+$env:LEONIDA_VK_VALIDATION = '1'
+$env:VK_VALIDATION_VALIDATE_SYNC = '1'
+.\runtime\build\RelWithDebInfo\d3d12_rgb96_test.exe
+```
+
 RGBA8 typeless RTV clears support explicit UNORM/SRGB/UINT views of 2D mip slices and contiguous array-layer ranges, with sample count 1. Other format families, typed-resource casts, MSAA and 3D views are not expanded.
+
+### Resource descriptions
+
+`d3d12_resource_desc_test` creates the same committed and reserved resources on the Vulkan-backed device and on
+Windows D3D12 (the default adapter and WARP, whichever exist) and compares every field of `ID3D12Resource::GetDesc`:
+the `Alignment` and `MipLevels` a description left at 0 must read back as the host fills them in. A description the
+host refuses is skipped, and one only the layer refuses (1D textures today) is listed and not compared. It needs a
+Vulkan GPU and runs explicitly.
+
+```powershell
+$env:LEONIDA_VK_VALIDATION = '1'
+.\runtime\build\RelWithDebInfo\d3d12_resource_desc_test.exe
+```
+
+### Depth and stencil resolves
+
+`d3d12_depth_resolve_test` resolves one plane of a 4x D32 or D24S8 target into a 1x one with
+`ResolveSubresourceRegion` (MIN and MAX of depth or stencil, AVERAGE of depth by its own format; whole and by
+rectangle) on the Vulkan-backed device and on Windows D3D12 (the default adapter and WARP), and compares the
+destinations read back. Calls the layer refuses must fail `Close` and leave the destination as cleared. Clears give
+every sample of a pixel one value, so the modes over differing samples are not checked. It needs a Vulkan GPU.
+
+```powershell
+$env:LEONIDA_VK_VALIDATION = '1'
+.\runtime\build\RelWithDebInfo\d3d12_depth_resolve_test.exe
+```
+
+### Predicate capture lifetime
+
+`vk_predicate_capture_test` checks full-width predicate snapshots, offset rebinding and reset with 32 gated submissions, then reuses completed command-buffer slots. Run explicitly on a Vulkan GPU with conditional rendering; it uses only synthetic data.

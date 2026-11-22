@@ -323,6 +323,28 @@ class ToolchainDetectionTest(PreflightTestBase):
         self.assertFalse(make_game.tool_available("   "))
         self.assertFalse(make_game.tool_available('""'))
 
+    APPDATA_ENV = {"LOCALAPPDATA": r"C:\Users\u\AppData\Local", "APPDATA": r"C:\Users\u\AppData\Roaming"}
+
+    def test_appdata_hint_names_the_folder_llvm_mc_is_in(self):
+        with mock.patch("os.name", "nt"), mock.patch.dict(os.environ, self.APPDATA_ENV):
+            for cmd, var in ((r"C:\Users\u\AppData\Local\Leonida\llvm-mc\llvm-mc.exe", "LOCALAPPDATA"),
+                             (r'"c:\users\U\appdata\roaming\llvm\llvm-mc.exe"', "APPDATA")):
+                with self.subTest(cmd=cmd):
+                    hint = make_game.appdata_hint(cmd)
+                    self.assertIn(f"LLVM_MC points into %{var}%", hint)
+                    self.assertIn(r"%USERPROFILE%\.leonida\llvm-mc", hint)
+
+    def test_appdata_hint_is_empty_outside_appdata(self):
+        with mock.patch("os.name", "nt"), mock.patch.dict(os.environ, self.APPDATA_ENV):
+            for cmd in ("llvm-mc", r"D:\Tools\llvm-mc\llvm-mc.exe", r"C:\Users\u\.leonida\llvm-mc\llvm-mc.exe",
+                        r"C:\Users\u\AppData\LocalLow\llvm-mc.exe", "wsl -d Ubuntu -e /usr/lib/llvm-21/bin/llvm-mc"):
+                with self.subTest(cmd=cmd):
+                    self.assertEqual(make_game.appdata_hint(cmd), "")
+
+    def test_appdata_hint_is_empty_off_windows(self):
+        with mock.patch("os.name", "posix"), mock.patch.dict(os.environ, self.APPDATA_ENV):
+            self.assertEqual(make_game.appdata_hint(r"C:\Users\u\AppData\Local\llvm-mc.exe"), "")
+
     def test_need_success_returns_tool(self):
         self.assertEqual(make_game.need(sys.executable, "Install python"), sys.executable)
 
@@ -348,7 +370,7 @@ class PreflightPrerequisiteTest(PreflightTestBase):
                  mock.patch("make_game.ensure_submodule", return_value=None), \
                  mock.patch("make_game.visual_cpp_tools_ok", return_value=True), \
                  mock.patch("shutil.disk_usage", return_value=Usage(1000 * 2**30, 200 * 2**30, 800 * 2**30)):
-                # runtime is refused before any check off Windows (tests/test_make_game_platform.py)
+                # off Windows runtime checks the cross-build instead (tests/test_make_game_platform.py)
                 stages = ["shaders", "assets"] + (["runtime"] if os.name == "nt" else [])
                 make_game.preflight(stages, tmp_work, wav=True)
 
@@ -368,6 +390,19 @@ class PreflightPrerequisiteTest(PreflightTestBase):
                 self.assertIn("spirv-val:", err)
                 self.assertIn(".NET 8 SDK", err)
                 self.assertIn("Visual Studio 2022", err)
+
+    def test_preflight_explains_llvm_mc_hidden_in_appdata(self):
+        env = {"LOCALAPPDATA": r"C:\Users\u\AppData\Local",
+               "LLVM_MC": r"C:\Users\u\AppData\Local\Leonida\llvm-mc\llvm-mc.exe"}
+        with tempfile.TemporaryDirectory() as tmp_work, \
+             mock.patch.dict(os.environ, env), \
+             mock.patch("os.name", "nt"), \
+             mock.patch("sys.version_info", (3, 12, 0)), \
+             mock.patch("shutil.which", return_value="/usr/bin/tool"), \
+             mock.patch("make_game.tool_available", return_value=False):
+            err = self.assert_fails(make_game.preflight, ["shaders"], tmp_work,
+                                    match="llvm-mc (LLVM 21+ with the AMDGPU target)")
+        self.assertIn("LLVM_MC points into %LOCALAPPDATA%", err)
 
     def test_preflight_rejects_visual_studio_installer_without_cpp_tools(self):
         with tempfile.TemporaryDirectory() as tmp_work, \
@@ -431,6 +466,57 @@ class PreflightPrerequisiteTest(PreflightTestBase):
                 self.assert_fails(make_game.preflight, ["shaders"], tmp_work, wav=False,
                                   match="15 GB free on the drive of")
 
+    def test_preflight_charges_space_only_when_shaders_need_to_be_rebuilt(self):
+        cases = (
+            ("current translation", {}, {}, False, True),
+            ("matching emulation", {"spirv/wave64_emulate.txt": "on"}, {"emulate": True}, False, True),
+            ("auto keeps emulation", {"spirv/wave64_emulate.txt": "on"}, {"keep_emulated": True}, False, True),
+            ("missing disassembly marker", {"dxbc/disasm.done": None}, {}, False, False),
+            ("old disassembly marker", {"dxbc/disasm.done": "shader_disasm.py finished"}, {}, False, False),
+            ("changed LLVM", {"dxbc/disasm.done": "old llvm-mc"}, {}, False, False),
+            ("stale translator", {"spirv/translation_sources.sha256": "stale"}, {}, False, False),
+            ("old translation without fingerprint", {"spirv/translation_sources.sha256": None}, {}, False, False),
+            ("needs emulation", {}, {"emulate": True}, False, False),
+            ("explicit native mode", {"spirv/wave64_emulate.txt": "on"}, {}, False, False),
+            ("interrupted unpack", {"dxbc/fssm_index.json": None}, {}, False, False),
+            ("interrupted translation", {"spirv/index.json": None}, {}, False, False),
+            ("old disassembly layout", {}, {}, True, False),
+        )
+        fingerprint = make_game.translation_sources_digest()
+        usage = Usage(500 * 2**30, 485 * 2**30, 15 * 2**30)
+        for name, changed, settings, legacy_layout, reusable in cases:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as work:
+                files = {
+                    "dxbc/index.json": "{}",
+                    "dxbc/fssm_index.json": "{}",
+                    "dxbc/disasm.done": "test llvm-mc 21",
+                    "spirv/index.json": "{}",
+                    "spirv/translation_sources.sha256": fingerprint,
+                    "spirv/wave64_emulate.txt": "off",
+                    **changed,
+                }
+                shader_root = os.path.join(work, "shaders")
+                for name, content in files.items():
+                    if content is not None:
+                        path = os.path.join(shader_root, name)
+                        os.makedirs(os.path.dirname(path), exist_ok=True)
+                        with open(path, "w", encoding="utf-8") as handle:
+                            handle.write(content + "\n")
+                disasm_parts = ("disasm",) if legacy_layout else ("dxbc", "disasm")
+                os.makedirs(os.path.join(shader_root, *disasm_parts))
+                with mock.patch("sys.version_info", (3, 12, 0)), \
+                     mock.patch("make_game.llvm_mc_signature", return_value="test llvm-mc 21"), \
+                     mock.patch("make_game.tool_available", return_value=True), \
+                     mock.patch("shutil.which", return_value="/usr/bin/tool"), \
+                     mock.patch("shutil.disk_usage", return_value=usage), \
+                     mock.patch("sys.stdout", io.StringIO()):
+                    if reusable:
+                        make_game.preflight(["shaders"], work, **settings)
+                    else:
+                        self.assert_fails(make_game.preflight, ["shaders"], work,
+                                          match="about 30 GB is needed", **settings)
+
+
     def test_preflight_disk_space_stage_accumulation(self):
         with tempfile.TemporaryDirectory() as tmp_work:
             with mock.patch("sys.version_info", (3, 12, 0)), \
@@ -479,13 +565,45 @@ class GameDiscoveryTest(unittest.TestCase):
             with open(os.path.join(folder, name), "wb") as file:
                 file.truncate(info["size"])
 
-    def discover(self):
-        roots = (self.home, self.desktop, self.downloads)
+    def discover(self, known=()):
+        """find_dumps() over the synthetic home folder only; `known` is what the shell reports for Downloads,
+        Desktop and Documents."""
+        roots = (self.home, self.desktop, self.downloads, *known)
         isdir = os.path.isdir
         with mock.patch("os.path.expanduser", return_value=self.home), \
              mock.patch("os.path.isdir", side_effect=lambda path: path in roots and isdir(path)), \
+             mock.patch.object(make_game, "known_folders", return_value=list(known)), \
              mock.patch.object(make_game, "versions", return_value=[self.version]):
             return make_game.find_dumps()
+
+    def test_find_searches_known_folders_moved_into_onedrive(self):
+        # OneDrive's Known Folder Move: Explorer's Desktop and Documents are ~\OneDrive\Desktop and
+        # ~\OneDrive\Documents, two levels below the home folder, so the home root alone never reaches inside them.
+        desktop = os.path.join(self.home, "OneDrive", "Desktop")
+        documents = os.path.join(self.home, "OneDrive", "Documents")
+        on_desktop = os.path.join(desktop, "GTA VI")
+        in_documents = os.path.join(documents, "Games", "GTA VI")
+        self.write_probes(on_desktop)
+        self.write_probes(in_documents)
+
+        self.assertEqual(self.discover(), [])
+        self.assertEqual(self.discover(known=(desktop, documents)),
+                         [(on_desktop, self.version), (in_documents, self.version)])
+
+    def test_find_reports_a_copy_once_when_known_folders_are_not_moved(self):
+        package = os.path.join(self.desktop, "Package")
+        self.write_probes(package)
+        self.assertEqual(self.discover(known=(self.downloads, self.desktop)), [(package, self.version)])
+
+    def test_known_folders_from_the_shell(self):
+        folders = make_game.known_folders()
+        if os.name != "nt":
+            self.assertEqual(folders, [])
+            return
+        self.assertEqual(len(folders), len(make_game.KNOWN_FOLDERS))
+        for folder in folders:
+            self.assertTrue(os.path.isabs(folder), folder)
+        self.assertEqual(make_game.known_folders(), folders)   # the shell's buffers are freed, calls repeat cleanly
 
     def test_find_searches_below_rejected_folder_with_config(self):
         outer = os.path.join(self.desktop, "Backup")
@@ -536,9 +654,41 @@ class PathAndGameSelectionTest(PreflightTestBase):
             self.assert_fails(make_game.choose_game,
                               match="More than one copy found: choose one with --game.")
 
+    def default_out_in(self, platform, icloud_documents, earlier_build=False, call=None):
+        """default_out() (or `call`) with a temporary home folder; icloud_documents makes the folder macOS keeps in
+        iCloud Drive when Desktop & Documents sync is on (~/Library/Mobile Documents/com~apple~CloudDocs/Documents),
+        earlier_build a ~/Documents/Leonida from before the change."""
+        with tempfile.TemporaryDirectory() as home:
+            if icloud_documents:
+                os.makedirs(os.path.join(home, "Library", "Mobile Documents", "com~apple~CloudDocs", "Documents"))
+            if earlier_build:
+                os.makedirs(os.path.join(home, "Documents", "Leonida", "work"))
+            with mock.patch.object(make_game.os.path, "expanduser", lambda p: home + p[1:] if p.startswith("~") else p), \
+                    mock.patch.object(make_game.sys, "platform", platform):
+                if call:
+                    return [note.replace(home, "~") for note in call()]
+                return os.path.relpath(make_game.default_out(), home)
+
+    def test_icloud_note_names_an_earlier_build_in_documents(self):
+        # A Mac that built into ~/Documents/Leonida before the default moved: say where that resumable build is.
+        notes = self.default_out_in("darwin", True, earlier_build=True, call=make_game.icloud_default_notes)
+        self.assertEqual(len(notes), 2, notes)
+        self.assertIn("off iCloud", notes[0])
+        self.assertIn(os.path.join("~", "Documents", "Leonida"), notes[1])
+        self.assertIn(os.path.join("~", "Leonida") + " to resume", notes[1])
+        self.assertIn("--out", notes[1])
+        self.assertEqual(len(self.default_out_in("darwin", True, call=make_game.icloud_default_notes)), 1)
+
     def test_default_out_matches_documents_folder(self):
-        expected = os.path.join(os.path.expanduser("~"), "Documents", "Leonida")
-        self.assertEqual(make_game.default_out(), expected)
+        for platform in ("win32", "linux", "darwin"):
+            self.assertEqual(self.default_out_in(platform, False), os.path.join("Documents", "Leonida"), platform)
+
+    def test_default_out_leaves_icloud_synced_documents_on_a_mac(self):
+        # Before: with iCloud Desktop & Documents sync on, ~/Documents/Leonida (and its work folder, hundreds of GB
+        # made from the game) went into iCloud Drive, which uploads it and can evict the work files from the disk.
+        self.assertEqual(self.default_out_in("darwin", True), "Leonida")
+        # Only macOS keeps Documents in iCloud Drive this way; elsewhere the folder means nothing.
+        self.assertEqual(self.default_out_in("linux", True), os.path.join("Documents", "Leonida"))
 
     def test_constants_definitions(self):
         self.assertEqual(make_game.STAGES, ["check", "shaders", "assets", "runtime", "pipelines"])
@@ -547,6 +697,119 @@ class PathAndGameSelectionTest(PreflightTestBase):
 
     def test_below_normal_priority_does_not_crash(self):
         make_game.below_normal()
+
+
+class PreflightExportedAssetsSpaceTest(PreflightTestBase):
+    """A rerun over finished asset exports doesn't need room for a second copy of them."""
+
+    OGG = "awc_opus.py finished\n"
+    XMA = "rpf9dump xma finished\n"
+
+    def run_preflight(self, work, free_gb, wav=False, ffmpeg=True):
+        usage = Usage(1000 * 2**30, (1000 - free_gb) * 2**30, free_gb * 2**30)
+
+        def which(cmd):
+            return None if cmd == "ffmpeg" and not ffmpeg else "/usr/bin/tool"
+
+        # The other prerequisites are faked, so the result doesn't depend on what this machine has installed (a .NET
+        # SDK, ffmpeg) and preflight always reaches the space check.
+        with mock.patch("sys.version_info", (3, 12, 0)), \
+             mock.patch("shutil.which", side_effect=which), \
+             mock.patch("make_game.tool_available", return_value=True), \
+             mock.patch("make_game.dotnet_sdk_ok", return_value=True), \
+             mock.patch("make_game.ensure_submodule", return_value=None), \
+             mock.patch("sys.stdout", io.StringIO()), \
+             mock.patch("shutil.disk_usage", return_value=usage):
+            make_game.preflight(["shaders", "assets"], work, wav=wav)
+
+    def write_xma(self, work, decoded):
+        """One XMA2 stream as the assets stage leaves it, with or without the .wav that ffmpeg decodes it to."""
+        bank = os.path.join(work, "assets", "audio", "xma", "bank0")
+        os.makedirs(bank, exist_ok=True)
+        for name in ("123.xma.wav",) + (("123.wav",) if decoded else ()):
+            with open(os.path.join(bank, name), "wb") as f:
+                f.write(b"RIFF")
+
+    def write_markers(self, work, ogg=OGG, xma=XMA):
+        audio = os.path.join(work, "assets", "audio")
+        os.makedirs(audio, exist_ok=True)
+        for name, text in (("ogg.done", ogg), ("xma.done", xma)):
+            if text is not None:
+                with open(os.path.join(audio, name), "w", encoding="utf-8") as f:
+                    f.write(text)
+
+    def test_markers_written_by_assets_are_read_back(self):
+        with tempfile.TemporaryDirectory() as work:
+            audio = os.path.join(work, "assets", "audio")
+            os.makedirs(audio)
+            make_game.mark(os.path.join(audio, "ogg.done"), "awc_opus.py")
+            make_game.mark(os.path.join(audio, "xma.done"), "rpf9dump xma")
+            self.assertTrue(make_game.assets_exported(work))
+
+    def test_exported_assets_need_only_the_shader_space(self):
+        with tempfile.TemporaryDirectory() as work:
+            self.write_markers(work)
+            self.run_preflight(work, free_gb=220)  # 30 GB for the shaders, not 330
+            err = self.assert_fails(self.run_preflight, work, free_gb=20, match="about 30 GB is needed")
+            self.assertIn("20 GB free", err)
+
+    def test_fresh_work_folder_still_needs_the_asset_space(self):
+        with tempfile.TemporaryDirectory() as work:
+            self.assertFalse(make_game.assets_exported(work))
+            self.assert_fails(self.run_preflight, work, free_gb=220, match="about 330 GB is needed")
+
+    def test_stopped_export_still_needs_the_asset_space(self):
+        with tempfile.TemporaryDirectory() as work:
+            self.write_markers(work, xma=None)  # stopped before the XMA2 step
+            self.assertFalse(make_game.assets_exported(work))
+            self.assert_fails(self.run_preflight, work, free_gb=220, match="about 330 GB is needed")
+
+    def test_marker_with_other_contents_does_not_count(self):
+        for ogg, xma in (("", self.XMA), (self.OGG, "something else\n"), (self.XMA, self.OGG)):
+            with self.subTest(ogg=ogg, xma=xma), tempfile.TemporaryDirectory() as work:
+                self.write_markers(work, ogg=ogg, xma=xma)
+                self.assertFalse(make_game.assets_exported(work))
+
+    def test_marker_that_is_a_folder_does_not_count(self):
+        with tempfile.TemporaryDirectory() as work:
+            self.write_markers(work, xma=None)
+            os.makedirs(os.path.join(work, "assets", "audio", "xma.done"))
+            self.assertFalse(make_game.assets_exported(work))
+
+    def test_xma_streams_ffmpeg_will_decode_still_need_the_asset_space(self):
+        # xma.done is written without ffmpeg too; once ffmpeg is on PATH every run decodes the streams with no .wav.
+        with tempfile.TemporaryDirectory() as work:
+            self.write_markers(work)
+            self.write_xma(work, decoded=False)
+            self.assert_fails(self.run_preflight, work, free_gb=220, match="about 330 GB is needed")
+
+    def test_xma_streams_left_undecoded_without_ffmpeg_are_not_counted(self):
+        # Without ffmpeg nothing decodes them, so the assets stage writes nothing more.
+        with tempfile.TemporaryDirectory() as work:
+            self.write_markers(work)
+            self.write_xma(work, decoded=False)
+            self.run_preflight(work, free_gb=220, ffmpeg=False)
+
+    def test_decoded_xma_streams_need_only_the_shader_space(self):
+        with tempfile.TemporaryDirectory() as work:
+            self.write_markers(work)
+            self.write_xma(work, decoded=True)
+            self.run_preflight(work, free_gb=220)
+
+    def test_pending_xma_lists_only_streams_without_a_wav(self):
+        with tempfile.TemporaryDirectory() as work:
+            xma = os.path.join(work, "assets", "audio", "xma")
+            self.assertEqual(make_game.pending_xma(xma), [])  # no folder yet
+            self.write_xma(work, decoded=True)
+            self.assertEqual(make_game.pending_xma(xma), [])
+            os.remove(os.path.join(xma, "bank0", "123.wav"))
+            self.assertEqual(make_game.pending_xma(xma), [os.path.join(xma, "bank0", "123.xma.wav")])
+
+    def test_wav_still_counts_the_asset_space(self):
+        # The WAV decode writes several times the Ogg Opus size and has no marker of its own.
+        with tempfile.TemporaryDirectory() as work:
+            self.write_markers(work)
+            self.assert_fails(self.run_preflight, work, free_gb=220, wav=True, match="about 330 GB is needed")
 
 
 if __name__ == "__main__":

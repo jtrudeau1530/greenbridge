@@ -1,0 +1,175 @@
+// library_loader: LoadLibrary / GetModuleHandle / GetProcAddress for modules the shims own.
+//
+// GDK code does not always import the console runtime. The package's libHttpClient.GDK.dll and XCurl.dll have no
+// import entry for xgameruntime.dll at all: their statically linked xgameruntime.lib thunks hold the wide string
+// "xgameruntime.dll" and the names InitializeApiImpl, InitializeApiImplEx, InitializeApiImplEx2, QueryApiImpl and
+// UninitializeApiImpl, and look them up at run time (docs/runtime_imports.md, "Run-time loaded modules"). Bound to the
+// host, that LoadLibraryW would load the PC's Gaming Services runtime or fail, and never reach the offline shims.
+//
+// So for a module the shim registry owns (rt::shims::owns_dll: xgameruntime.dll, d3d12_xs.dll, xmem.dll, ...), these
+// return a pseudo-handle, and GetProcAddress on it resolves names (and "#ordinal") through rt::shims::find. A name the
+// registry doesn't serve returns NULL with ERROR_PROC_NOT_FOUND, as a real module would, and is logged once. Every
+// other module goes to the host unchanged. Only images mapped by the loader see these: they are bound through the
+// registry, the runtime's own code calls the host directly.
+#include <windows.h>
+
+#include <cstdio>
+#include <deque>
+#include <mutex>
+#include <set>
+#include <string>
+
+#include "shims.h"
+
+namespace rt::shims::library_loader {
+
+// A module the shims own, identified by a pointer to one of these. Host modules are image bases (64 KiB aligned);
+// these live in the runtime's heap, and GetProcAddress tells them apart by lookup, not by address range.
+struct Pseudo {
+    char tag[8] = {'L', 'E', 'O', 'S', 'H', 'I', 'M', 0};
+    std::string dll;  // lower case, with .dll
+};
+
+namespace {
+
+// Intentionally immortal: mapped-DLL DLL_PROCESS_DETACH and earlier atexit handlers can call GetProcAddress or
+// FreeLibrary on pseudo-handles during process teardown, after normal statics would have been destroyed.
+std::mutex& loader_mutex() {
+    static auto* m = new std::mutex;
+    return *m;
+}
+
+std::deque<Pseudo>& pseudos() {   // a deque never moves its elements, so handed-out handles stay valid
+    static auto* d = new std::deque<Pseudo>;
+    return *d;
+}
+
+std::string lower_ascii(std::string s) {
+    for (auto& c : s)
+        if (c >= 'A' && c <= 'Z') c = static_cast<char>(c + 32);
+    return s;
+}
+
+std::string narrow(const wchar_t* w) {
+    std::string s;
+    for (; w && *w; ++w) s += (*w < 0x80) ? static_cast<char>(*w) : '?';
+    return s;
+}
+
+// LoadLibrary's file-name rules for the module a path names: the last path component, lower case, and ".dll" added
+// when there is no extension (a trailing '.' means "no extension, add nothing").
+std::string module_name(std::string path) {
+    const size_t slash = path.find_last_of("\\/");
+    if (slash != std::string::npos) path.erase(0, slash + 1);
+    path = lower_ascii(path);
+    if (!path.empty() && path.back() == '.') path.pop_back();
+    else if (path.find('.') == std::string::npos) path += ".dll";
+    return path;
+}
+
+}  // namespace
+
+// The pseudo-handle for an owned module, or nullptr when the shims don't own `path`'s module.
+HMODULE owned_handle(const std::string& path) {
+    const std::string dll = module_name(path);
+    if (dll.empty() || !owns_dll(dll)) return nullptr;
+    std::lock_guard lock(loader_mutex());
+    for (auto& p : pseudos())
+        if (p.dll == dll) return reinterpret_cast<HMODULE>(&p);
+    pseudos().push_back(Pseudo{});
+    pseudos().back().dll = dll;
+    std::fprintf(stderr, "[rt] loader: %s is served by the shims (run-time load)\n", dll.c_str());
+    return reinterpret_cast<HMODULE>(&pseudos().back());
+}
+
+// The owned module a handle names, or nullptr for a host module.
+const Pseudo* pseudo(HMODULE h) {
+    std::lock_guard lock(loader_mutex());
+    for (auto& p : pseudos())
+        if (reinterpret_cast<HMODULE>(&p) == h) return &p;
+    return nullptr;
+}
+
+namespace {
+
+HMODULE WINAPI load_library_a(LPCSTR name) {
+    if (HMODULE h = name ? owned_handle(name) : nullptr) return h;
+    return LoadLibraryA(name);
+}
+
+HMODULE WINAPI load_library_w(LPCWSTR name) {
+    if (HMODULE h = name ? owned_handle(narrow(name)) : nullptr) return h;
+    return LoadLibraryW(name);
+}
+
+HMODULE WINAPI load_library_ex_a(LPCSTR name, HANDLE file, DWORD flags) {
+    if (HMODULE h = name ? owned_handle(name) : nullptr) return h;
+    return LoadLibraryExA(name, file, flags);
+}
+
+HMODULE WINAPI load_library_ex_w(LPCWSTR name, HANDLE file, DWORD flags) {
+    if (HMODULE h = name ? owned_handle(narrow(name)) : nullptr) return h;
+    return LoadLibraryExW(name, file, flags);
+}
+
+// GetModuleHandle answers for an owned module as if it were loaded: the GDK may probe before it loads.
+HMODULE WINAPI get_module_handle_a(LPCSTR name) {
+    if (HMODULE h = name ? owned_handle(name) : nullptr) return h;
+    return GetModuleHandleA(name);
+}
+
+HMODULE WINAPI get_module_handle_w(LPCWSTR name) {
+    if (HMODULE h = name ? owned_handle(narrow(name)) : nullptr) return h;
+    return GetModuleHandleW(name);
+}
+
+FARPROC WINAPI get_proc_address(HMODULE module, LPCSTR name) {
+    const Pseudo* p = pseudo(module);
+    if (!p) return GetProcAddress(module, name);
+    if (!name) {
+        SetLastError(ERROR_PROC_NOT_FOUND);
+        return nullptr;
+    }
+    // A value below 0x10000 is an ordinal (IS_INTRESOURCE), as in the real GetProcAddress.
+    const std::string what = IS_INTRESOURCE(name) ? "#" + std::to_string(reinterpret_cast<uintptr_t>(name)) : name;
+    if (void* fn = find(p->dll, what)) return reinterpret_cast<FARPROC>(fn);
+    {
+        static auto* m = new std::mutex;
+        static auto* seen = new std::set<std::string>;
+        std::lock_guard lock(*m);
+        if (seen->insert(p->dll + "!" + what).second)
+            std::fprintf(stderr, "[rt] loader: GetProcAddress(%s, %s): not served\n", p->dll.c_str(), what.c_str());
+    }
+    SetLastError(ERROR_PROC_NOT_FOUND);
+    return nullptr;
+}
+
+BOOL WINAPI free_library(HMODULE module) {
+    if (pseudo(module)) return TRUE;   // owned modules are never unloaded
+    return FreeLibrary(module);
+}
+
+#define LOADER(dll)                                                                         \
+    {dll, "LoadLibraryA", reinterpret_cast<void*>(&rt::shims::library_loader::load_library_a)},                        \
+    {dll, "LoadLibraryW", reinterpret_cast<void*>(&rt::shims::library_loader::load_library_w)},                        \
+    {dll, "LoadLibraryExA", reinterpret_cast<void*>(&rt::shims::library_loader::load_library_ex_a)},                   \
+    {dll, "LoadLibraryExW", reinterpret_cast<void*>(&rt::shims::library_loader::load_library_ex_w)},                   \
+    {dll, "GetModuleHandleA", reinterpret_cast<void*>(&rt::shims::library_loader::get_module_handle_a)},               \
+    {dll, "GetModuleHandleW", reinterpret_cast<void*>(&rt::shims::library_loader::get_module_handle_w)},               \
+    {dll, "GetProcAddress", reinterpret_cast<void*>(&rt::shims::library_loader::get_proc_address)},                    \
+    {dll, "FreeLibrary", reinterpret_cast<void*>(&rt::shims::library_loader::free_library)}
+
+}  // namespace
+}  // namespace rt::shims::library_loader
+
+// The package's DLLs import the loader functions through these api sets (XCurl.dll: libraryloader-l1-2-0 and
+// -l1-2-1); kernel32 and kernelbase cover code linked against the classic libraries.
+SHIM_TABLE(library_loader,
+    LOADER("kernel32.dll"),
+    LOADER("kernelbase.dll"),
+    LOADER("api-ms-win-core-libraryloader-l1-1-0.dll"),
+    LOADER("api-ms-win-core-libraryloader-l1-1-1.dll"),
+    LOADER("api-ms-win-core-libraryloader-l1-2-0.dll"),
+    LOADER("api-ms-win-core-libraryloader-l1-2-1.dll"),
+    LOADER("api-ms-win-core-libraryloader-l1-2-2.dll"),
+);

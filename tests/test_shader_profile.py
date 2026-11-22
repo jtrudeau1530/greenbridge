@@ -382,6 +382,20 @@ class TestCommandLineEndToEnd(unittest.TestCase):
         self.assertEqual(data["undecoded"], {"warnings": 0, "unresolved": 0, "by_word": []})
         self.assertIn("  undecoded: 0 LLVM warnings, 0 distinct words, 0 unresolved", stdout)
 
+    def test_cli_takes_the_stage_from_the_carve_index(self):
+        """Most corpus names carry no stage prefix; shader_carve.py's index.json (next to the disasm folder) has
+        the stage from each container's program header, so it wins over the name. Names it doesn't list keep
+        the name-prefix fallback."""
+        with open(os.path.join(self.tmp.name, "index.json"), "w", encoding="utf-8") as f:
+            json.dump([{"name": "Foo", "file": "Foo_1.dxbc", "stage": "cs"},
+                       {"name": "CS_Bar", "file": "CS_Bar.dxbc", "stage": "ms"}], f)
+        for name in ("Foo_1", "CS_Bar", "vs_unlisted"):
+            self.write(name, "\tv_mov_b32 v0, 1\n\ts_endpgm\n")
+        _, data = self.run_profile(["--per-shader"])
+        self.assertEqual({row["name"]: row["stage"] for row in data["per_shader"]},
+                         {"Foo_1": "cs", "CS_Bar": "ms", "vs_unlisted": "vs"})
+        self.assertEqual(sorted(data["registers"]), ["cs", "ms", "vs"])
+
     def test_cli_counts_only_instructions(self):
         with open(os.path.join(self.disasm_dir, "ps_001.s"), "w", encoding="utf-8") as f:
             f.write("\t.text\n\t.long 0\n\t; comment with v7\n\t\t\n\tv_mov_b32 v0, 1\n\ts_endpgm\n")
@@ -453,6 +467,15 @@ class TestCommandLineEndToEnd(unittest.TestCase):
             {"name": "vs_002", "stage": "vs", "instructions": 3, "vgpr_count": 4, "sgpr_count": 0},
         ])
 
+    def test_cli_ignores_directories_with_shader_suffix(self):
+        self.write("cs_main", "\ts_endpgm\n")
+        os.mkdir(os.path.join(self.disasm_dir, "cs_cache.s"))
+
+        _, data = self.run_profile(["--per-shader"])
+
+        self.assertEqual(data["shaders"], 1)
+        self.assertEqual([shader["name"] for shader in data["per_shader"]], ["cs_main"])
+
     def test_cli_warning_words_from_llvm_messages(self):
         a = echo("070080bf feffffff ffffffd7 050080bf feffffff 000081bf")
         b = echo("090080bf ffffffd7 000081bf")
@@ -504,6 +527,29 @@ class TestCommandLineEndToEnd(unittest.TestCase):
         self.assertEqual(summary["cs"]["vgpr_max"], 300)
         self.assertEqual(summary["cs"]["sgpr_mean"], 8.5)
         self.assertEqual(P.register_summary({}), {})
+
+    def test_same_output_path_identity(self):
+        a = os.path.join(self.disasm_dir, "a.json")
+        self.assertTrue(P.same_output_path(a, a))
+        b = os.path.join(self.disasm_dir, "b.json")
+        self.assertFalse(P.same_output_path(a, b))
+
+    def test_cli_refuses_output_overwriting_input_shader(self):
+        tool = os.path.join(ROOT, "tools", "shader_profile.py")
+        shader_file = os.path.join(self.disasm_dir, "ps_001.s")
+        original_content = "\tv_mov_b32 v0, 1.0\n\ts_endpgm\n"
+        with open(shader_file, "w", encoding="utf-8") as f:
+            f.write(original_content)
+
+        res = subprocess.run(
+            [sys.executable, "-I", tool, self.disasm_dir, "--out", shader_file],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(res.returncode, 2)
+        self.assertIn("ERROR: output would overwrite input shader", res.stderr)
+        with open(shader_file, "r", encoding="utf-8") as f:
+            self.assertEqual(f.read(), original_content)
 
 
 if __name__ == "__main__":

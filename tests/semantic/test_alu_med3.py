@@ -23,6 +23,7 @@ The test matrix covers:
 from __future__ import annotations
 
 import itertools
+import math
 import os
 import struct
 import sys
@@ -103,9 +104,10 @@ def ref_f32(x_bits: int, y_bits: int, z_bits: int) -> int:
     xf = f32_from_bits(x_bits)
     yf = f32_from_bits(y_bits)
     zf = f32_from_bits(z_bits)
-    lo = min(xf, yf)
-    hi = max(xf, yf)
-    r = min(max(zf, lo), hi)
+    # The median with -0 ordered below +0, as measured on RDNA2 hardware (AMD Radeon RX 6800, gfx1030):
+    # med3(-0, +0, 1.0) = +0 and med3(+0, -0, -1.0) = -0, in every operand order (docs/design.md, float
+    # min/max/med3 with NaN). Python's min/max return their first argument for equal zeros, which is not that.
+    r = sorted((xf, yf, zf), key=lambda v: (v, math.copysign(1.0, v)))[1]
     return bits_from_f32(r)
 
 

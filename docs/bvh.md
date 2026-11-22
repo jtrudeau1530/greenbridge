@@ -280,8 +280,8 @@ and fill counts. It reads only headers and emits no payload bytes. The row's `ve
 `flags` as an integer; `flags` keeps the full 32-bit word.
 
 ```powershell
-python -I tools/bvh_index.py <archive.rpf> --out index.json --csv index.csv
-python -I tools/bvh_index.py <carve-dir> --out index.json
+python -I tools/bvh_index.py <archive.rpf> --out <temp>/index.json --csv <temp>/index.csv
+python -I tools/bvh_index.py <carve-dir> --out <temp>/index.json
 python -I tests/test_bvh_index.py
 ```
 
@@ -298,6 +298,93 @@ template, XML and XML fragments, the two-stream advance bug and CSV/JSON output.
 
 Measured with the tool on `shared_minigame000_bvh4.rpf`: 2,560 streams, 59,142,787 stored, 970,044,012 inflated,
 1,237 complete `bvh4`, 1,233 `instance208`, 85 descriptors, 5 XML. That matches the carver summary exactly.
+
+## 7a. Building runtime BVHs: `tools/xdxr_bvh.py`
+
+The Vulkan layer has to write acceleration structures in this runtime layout, because the game's traversal shaders
+read the nodes themselves (`docs/d3d12_vulkan.md` §4.8). `tools/xdxr_bvh.py` (standard library only) is the CPU
+reference for that builder. It encodes a BLAS from triangles or a TLAS from instances, runs one traversal step
+with the semantics of the hardware instruction, walks a whole BVH to the closest hit, and checks a buffer's
+structure. Its fixtures are synthetic.
+
+What it writes, and where each part comes from (line numbers in the public `.hlsli` quoted in §3.1):
+
+| Part | Layout | Source |
+|---|---|---|
+| Header | §3.1 table; `flags = 0x80000006` (BLAS) or `0x00000006` (TLAS); `crc32` and `compressionParams` 0 | `XboxBvh4Header` L2531, flag masks L2551, `XDXR_VERSION_2403 = 6` |
+| BOX32 / BOX16 | four children, unused slots `0xffffffff` with an empty box (min > max); BOX16 rounds min down and max up to half | `Node32` L2302, `Node16` L2285, `XdxrDecompressBox16` |
+| Leaf | vertex slots 0–3, then `GeometryIndexAndFlags` (index << 8 \| flags), `BasePrimitiveIndex` (TRI0), `PrimitiveIndex2` (TRI1), one remap byte per triangle node type | `Leaf` L2342, `XDXR_Runtime_Callback_GetPrimitiveIndex` |
+| TRI0 / TRI1 | TRI0 reads slots (0, 1, 2), TRI1 reads (1, 3, 2); TRI2/TRI3 read slot 4, which overlaps the metadata, and are not emitted | `Read3Verts`, `XdxrGetVertexIndicesForNodeType` |
+| Barycentric remap | byte `8 * type` of leaf `+60`: bits [1:0] pick which edge function is the first barycentric (0 U, 1 V, 2 W), [3:2] the second; U weighs the first vertex read | `TestXboxBvh4Leaf` |
+| INSTANCE | 128 bytes: object-to-world 3×4, ID \| mask << 24, contribution \| flags << 24, BLAS root pointer with bit 31 = identity rotation, BLAS address >> 8, world-to-object 3×4, instance index, parent | `Instance` L2436, `XDXR_INSTANCE_INTERNAL_FLAGS_*` |
+| Parent table | one dword per 64-byte unit from `offsetToElements` on; the entry for unit `u` is at dword `u - offsetToElements/64 + offsetToParents/4` | `XboxBvh4Node_GetParentTableOffset` |
+
+**ASSUMPTION:** the region order (header, parent table, elements, nodes), the median-split build and the greedy
+pairing of triangles that share an edge into TRI0/TRI1 are this tool's choices. The console builder's own choices
+are not public. A shader reaches every region through the header, so these choices don't change what it reads.
+
+The traversal step (`intersect_node`) follows `TestXboxBvh4Node` and `TestXboxBvh4Leaf`. A box child is kept when
+its entry distance is at most the ray extent, and the children are sorted with the network (0,2) (1,3) (0,1) (2,3)
+(1,2). A triangle returns `(t_num, t_denom, i_num, j_num)`, or `(inf, 1, 0, 0)` on a miss. A box miss stays a miss
+for an unbounded ray: the public code's `<=` against an infinite extent would keep it.
+
+**Translator.** `image_bvh_intersect_ray` in `tools/rdna2spirv.py` used to follow RADV's software path on triangle
+nodes: slots (0, 1, 2) for every type and (V, W) as the barycentrics, because RADV builds only one triangle per
+node. It now reads the slots of the node type and applies the remap byte. AMD GPURT
+(`CalcTriangleCompressionVertexIndices`, `SwizzleBarycentrics`) and the XDXR path agree on both. TRI1 nodes
+therefore traverse to the right triangle (docs/design.md, Ray tracing row; `tests/semantic/test_image_bvh_tri.py`).
+
+**GPU builder.** `runtime/src/xdxr_build.comp` with `xdxr_build.h` writes the same layout on the GPU, straight into
+the destination buffer:
+
+1. one thread per triangle (TRI0 leaves, remap `0x09`) or per instance (128-byte records, the world-to-object
+   inverse, the BLAS root and identity-rotation flag);
+2. a 30-bit Morton key of each box centre, then a stable sort: up to 1,024 keys in one workgroup's shared memory
+   (one dispatch), more with a radix sort of 8 passes of 4-bit digits over 256-element tiles (24 dispatches
+   whatever the count, no padding to a power of two);
+3. BOX32 nodes, built level by level from four consecutive sorted children, with the parent table and each
+   instance's `ParentNode`;
+4. the header.
+
+The tree's shape depends only on the element count. `XdxrLayout` therefore computes the result and scratch sizes
+exactly when the build is recorded, and the same numbers can answer `GetRaytracingAccelerationStructurePrebuildInfo`.
+A triangle with a NaN vertex gets an empty box (D3D12 treats it as inactive). So do an instance with mask 0, one with
+no BLAS and one with a singular transform. An instance record holds its BLAS address in 256-byte units in 32 bits,
+so BLAS addresses must be below 2^40, as console GPU addresses are. Where device addresses are wider (llvmpipe's are
+host pointers), the builder takes a bias that is added to the addresses read from instance descs.
+
+The Vulkan layer uses it for `BuildRaytracingAccelerationStructure` unless `LEONIDA_RT_AS=khr`
+(`docs/d3d12_vulkan.md` §4.8); `d3d12_xdxr_rt_test <dir>` builds a BLAS and a TLAS through the D3D12 API and writes
+them the same way.
+
+`vk_xdxr_build_test <dir>` builds nine synthetic cases on the GPU and writes each structure with a description of its
+scene. `xdxr_bvh.py check-build <dir>` validates them and traces rays against brute force. `ctest` runs both as
+`xdxr_build` and `xdxr_build_check`.
+
+**Updates** (D3D12 `PERFORM_UPDATE`) refit: the source structure is copied to the destination unless it is the
+destination, the elements are rewritten at their slots, and each node's boxes are recomputed bottom-up from the
+children it already points to. The tree is kept, so a refit is valid for any motion and skips the Morton pass and
+the sort. It takes 0.07 ms for 1,000 triangles and 9.8 ms for 1,000,000 on an RTX 2050, against 0.19 ms and 22 ms for
+a build, but the tree traverses more slowly as the geometry moves away from where it was built.
+
+**Copies and postbuild info.** `CopyRaytracingAccelerationStructure` with `CLONE` or `COMPACT` copies the
+structure's bytes. The records are position-independent: node pointers count from the structure's start, and a TLAS
+names its BLASes by address, which a clone keeps. The size comes from the source header (`totalSizeIn64BNodes`), so
+a copy can follow a build in the same command list, and it is bounded by the destination resource. A build is
+already exactly its layout's size, so `COMPACTED_SIZE` and `CURRENT_SIZE` (from
+`EmitRaytracingAccelerationStructurePostbuildInfo` or the postbuild descs of a build) are both
+`totalSizeIn64BNodes * 64`, and compaction saves nothing. Serialization, deserialization and the tools-visualization
+mode are refused at replay as unsupported, not faked. In `LEONIDA_RT_AS=khr` mode the postbuild descs stay ignored,
+as before.
+
+Not done yet: pairing triangles into TRI1 leaves, BOX16 nodes, serialization. A higher-quality build (SAH) would also
+come later.
+
+```powershell
+python -I tools/xdxr_bvh.py selftest --seed 1 --rays 400   # build BLASes, compare closest hits with brute force
+python -I tools/xdxr_bvh.py validate <dumped BVH buffer>    # structural check of a runtime buffer
+python -I tests/test_xdxr_bvh.py
+```
 
 ## 8. No-sharing rule
 

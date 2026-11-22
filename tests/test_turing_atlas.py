@@ -5,6 +5,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -100,9 +101,9 @@ class ValidationGateTests(unittest.TestCase):
                 patch.object(turing_atlas, "run", self.fake_run(accept_control, fail_assembly)):
             return turing_atlas.validate_cases()
 
-    def main_with(self, accept_control=False, fail_assembly=False, tools=True):
+    def main_with(self, accept_control=False, fail_assembly=False, tools=True, argv=None):
         err = io.StringIO()
-        with patch.object(sys, "argv", ["turing_atlas.py"]), \
+        with patch.object(sys, "argv", argv or ["turing_atlas.py"]), \
                 patch.object(turing_atlas.shutil, "which", return_value="tool" if tools else None), \
                 patch.object(turing_atlas, "run", self.fake_run(accept_control, fail_assembly)), \
                 contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
@@ -143,6 +144,20 @@ class ValidationGateTests(unittest.TestCase):
                 code, err = self.main_with(**kwargs)
                 self.assertEqual(code, 0)
                 self.assertEqual(err, "")
+
+    def test_out_in_a_missing_folder_creates_it(self):
+        # #934's class: a --out whose parent does not exist used to lose the whole run to a traceback.
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "nested", "dir", "atlas.json")
+            code, err = self.main_with(argv=["turing_atlas.py", "--out", out])
+            self.assertEqual((code, err), (0, ""))
+            self.assertTrue(os.path.isfile(out))
+
+    def test_out_cannot_be_a_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            code, err = self.main_with(argv=["turing_atlas.py", "--out", tmp])
+            self.assertEqual(code, 2)
+            self.assertIn("--out is a folder", err)
 
     def test_missing_tools_skip_without_treating_it_as_a_control_failure(self):
         with patch.object(turing_atlas.shutil, "which", return_value=None):

@@ -47,7 +47,7 @@ WARMUP = 8 << 20
 JOIN_MAX = 64
 BAND_GAP = 64 << 20
 GAP_CHUNK = 4 << 20
-FORMAT = 4
+FORMAT = 5  # Format 4 shards may count warm-up streams again.
 SOURCE_SAMPLE = 4096
 
 
@@ -101,7 +101,7 @@ def _mapped_source(archive, expected_id):
 def _staged_json(path, doc, **options):
     with tempfile.TemporaryDirectory(dir=os.path.dirname(path)) as directory:
         tmp = os.path.join(directory, os.path.basename(path))
-        with open(tmp, "w", encoding="utf-8") as f:
+        with open(tmp, "w", encoding="utf-8", newline="\n") as f:
             json.dump(doc, f, **options)
         try:
             mode = os.lstat(path).st_mode
@@ -372,7 +372,7 @@ def scan_shard(job, source_id=None):
     stats = {"streams": 0, "stored": 0, "raw_system": 0, "inflated": 0, "rejected": 0, "meta": 0,
              "map_meta": 0, "meta_other": 0, "map_meta_bytes": 0,
              "invalid": 0, "incomplete": 0, "join_max": 0, "entity_gfx": 0,
-             "entity_unresolved": 0, "adopted": 0}
+             "entity_unresolved": 0}
     rows, intervals, raw_pages, raw_system = [], [], [], []
     with _mapped_source(archive, source_id) as (m, scanned_id):
         size = len(m)
@@ -388,15 +388,21 @@ def scan_shard(job, source_id=None):
             if s % 16:
                 pos = s + 1
                 continue
+            # A stream that starts in the warm-up window belongs to the previous shard, which counts it: here it
+            # only moves the scan past its bytes, so the next stream is found on a real boundary.
+            warm_up = s < start
             try:
                 res = assemble(m, s, size)
             except (zlib.error, struct.error, IndexError):
-                stats["rejected"] += 1
+                stats["rejected"] += not warm_up
                 pos = s + 1
                 continue
             if res is None:
-                stats["rejected"] += 1
+                stats["rejected"] += not warm_up
                 pos = s + 1
+                continue
+            if warm_up:
+                pos = max(res["end"], s + 1)
                 continue
             for a, used in res["spans"]:
                 intervals.append([a, a + used])
@@ -409,9 +415,6 @@ def scan_shard(job, source_id=None):
             if not res["is_meta"]:
                 continue
             res["offset"] = s
-            if s < start:
-                stats["adopted"] += 1
-                continue
             raw_system.extend([a, a + used] for a, used in res["raw_spans"])
             stats["raw_system"] += res["raw_system"]
             if not res["complete"]:
@@ -689,7 +692,7 @@ def _summarize(archive, start, end, data_start, size, source_id, expected, docs)
     totals = {"streams": 0, "stored": 0, "raw_system": 0, "inflated": 0, "rejected": 0, "meta": 0,
               "map_meta": 0, "meta_other": 0, "map_meta_bytes": 0,
               "invalid": 0, "incomplete": 0, "join_max": 0, "entity_gfx": 0,
-              "entity_unresolved": 0, "adopted": 0}
+              "entity_unresolved": 0}
     shards = []
     for want in expected:
         doc = docs.get(want["index"])
@@ -769,6 +772,16 @@ def job_count(text):
     return value
 
 
+def same_output_path(first, second):
+    """True when writing ``second`` would truncate ``first`` (same file, path or hard link)."""
+    if os.path.normcase(os.path.realpath(first)) == os.path.normcase(os.path.realpath(second)):
+        return True
+    try:
+        return os.path.samefile(first, second)
+    except OSError:
+        return False
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("archive")
@@ -799,7 +812,21 @@ def main(argv=None):
     if start < data_start or start >= end:
         print("bad scan range", file=sys.stderr)
         return 2
-    os.makedirs(a.out, exist_ok=True)
+    if same_output_path(a.archive, a.out):
+        print("error: --out must not overwrite the input archive", file=sys.stderr)
+        return 2
+    if os.path.isfile(a.out):
+        print(f"error: --out {a.out} is a file, not a directory", file=sys.stderr)
+        return 2
+    for report in ("summary.json", "maps.json"):
+        if same_output_path(a.archive, os.path.join(a.out, report)):
+            print(f"error: --out reports would overwrite input archive: {a.archive}", file=sys.stderr)
+            return 2
+    try:
+        os.makedirs(a.out, exist_ok=True)
+    except OSError as e:
+        print(f"error: cannot create output directory {a.out}: {e.strerror or e}", file=sys.stderr)
+        return 2
     expected = _expected_shards(start, end, a.shard_size)
     t0 = time.time()
     docs = _load_shards(a.out, expected, source_id) if a.resume or a.merge_only else {}
@@ -859,4 +886,8 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
+    try:  # a redirected stdout is strict ANSI code page under -I; write '?' for what it cannot encode
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
     sys.exit(main())

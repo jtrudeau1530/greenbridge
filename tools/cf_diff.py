@@ -567,7 +567,7 @@ def self_test():
     e.items = [it for it in e.items if not (it[0] == "ins" and it[1].startswith("s_or_b32 exec_lo"))]
     with tempfile.TemporaryDirectory(prefix="cf-diff-") as tmp:
         p = os.path.join(tmp, "c.s")
-        with open(p, "w", encoding="utf-8") as f:
+        with open(p, "w", encoding="utf-8", newline="\n") as f:
             f.write(listing_text(e.assemble(), "ps_canary_bad"))
         if len(cf_ref.run(p, wave=32)["exports"]) != 4:     # 4 > lane: lanes 0-3 stay on
             print("canary FAILED: the reference did not drop lanes whose EXEC was never restored")
@@ -642,4 +642,8 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
+    try:  # a redirected stdout is strict ANSI code page under -I; write '?' for what it cannot encode
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
     sys.exit(main())

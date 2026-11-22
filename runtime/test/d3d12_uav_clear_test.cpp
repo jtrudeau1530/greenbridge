@@ -73,13 +73,35 @@ int conversion_checks() {
     // Half floats round to nearest even; too large is infinity; tiny values become subnormals.
     EXPECT((element(VK_FORMAT_R16_SFLOAT, true, floats(1.0f, 0, 0, 0)) == V{0x00, 0x3c}));
     EXPECT((element(VK_FORMAT_R16_SFLOAT, true, floats(-2.0f, 0, 0, 0)) == V{0x00, 0xc0}));
-    EXPECT((element(VK_FORMAT_R16_SFLOAT, true, floats(65520.0f, 0, 0, 0)) == V{0x00, 0x7c}));
-    EXPECT((element(VK_FORMAT_R16_SFLOAT, true, floats(1e-7f, 0, 0, 0)) == V{0x02, 0x00}));
-    EXPECT((element(VK_FORMAT_R16_SFLOAT, true, floats(1.0f + 1.0f / 2048, 0, 0, 0)) == V{0x00, 0x3c}));  // a tie, to even
+    // Round toward zero, a finite overflow saturating to the largest finite (D3D11.3 3.2.2), as
+    // ClearUnorderedAccessViewFloat gives on WARP and on NVIDIA: 65520 and 70000 are 65504, not infinity.
+    EXPECT((element(VK_FORMAT_R16_SFLOAT, true, floats(65520.0f, 0, 0, 0)) == V{0xff, 0x7b}));
+    EXPECT((element(VK_FORMAT_R16_SFLOAT, true, floats(70000.0f, 0, 0, 0)) == V{0xff, 0x7b}));
+    EXPECT((element(VK_FORMAT_R16_SFLOAT, true, floats(-1e10f, 0, 0, 0)) == V{0xff, 0xfb}));
+    EXPECT((element(VK_FORMAT_R16_SFLOAT, true, floats(INFINITY, 0, 0, 0)) == V{0x00, 0x7c}));  // stays infinity
+    EXPECT((element(VK_FORMAT_R16_SFLOAT, true, floats(1e-7f, 0, 0, 0)) == V{0x01, 0x00}));
+    EXPECT((element(VK_FORMAT_R16_SFLOAT, true, floats(1.0f + 1.0f / 2048, 0, 0, 0)) == V{0x00, 0x3c}));  // truncated
     // The packed 11/11/10 floats: 1.0, 2.0 and 0.5; no sign, so negative is 0.
     EXPECT(word(element(VK_FORMAT_B10G11R11_UFLOAT_PACK32, true, floats(1.0f, 2.0f, 0.5f, 0))) ==
            (0x3c0u | 0x400u << 11 | 0x1c0u << 22));
     EXPECT(word(element(VK_FORMAT_B10G11R11_UFLOAT_PACK32, true, floats(-1.0f, 0, 0, 0))) == 0);
+    // Too large is the largest finite on every channel (host: 0xf7fdffbf), and 1/3 truncates (host: 0x1aa).
+    EXPECT(word(element(VK_FORMAT_B10G11R11_UFLOAT_PACK32, true, floats(1e6f, 1e6f, 1e6f, 0))) == 0xf7fdffbfu);
+    EXPECT(word(element(VK_FORMAT_B10G11R11_UFLOAT_PACK32, true, floats(0, 0, 1.0f / 3, 0))) >> 22 == 0x1aau);
+    // Shared-exponent 9:9:9:5 float (pinned against WARP): round half-up, bump on 512, clamp negatives/NaN to 0
+    // and +Inf/overflow to 65408; Uint clears to zero.
+    EXPECT(word(element(VK_FORMAT_E5B9G9R9_UFLOAT_PACK32, true, floats(0, 0, 0, 1))) == 0x00000000u);
+    EXPECT(word(element(VK_FORMAT_E5B9G9R9_UFLOAT_PACK32, true, floats(1.0f, 2.0f, 4.0f, 0))) == 0x94010040u);
+    EXPECT(word(element(VK_FORMAT_E5B9G9R9_UFLOAT_PACK32, true, floats(0.5f, 0.25f, 0.125f, 0))) == 0x79010100u);
+    EXPECT(word(element(VK_FORMAT_E5B9G9R9_UFLOAT_PACK32, true, floats(1.0f / 3, 1.0f / 3, 1.0f / 3, 0))) == 0x7556ab55u);
+    EXPECT(word(element(VK_FORMAT_E5B9G9R9_UFLOAT_PACK32, true,
+                        floats(1.0f + 0.5f / 256, 1.0f + 1.5f / 256, 1.0f + 2.5f / 256, 0))) == 0x840e0501u);
+    EXPECT(word(element(VK_FORMAT_E5B9G9R9_UFLOAT_PACK32, true, floats(1.0f - 0.25f / 256, 0, 0, 0))) == 0x80000100u);
+    EXPECT(word(element(VK_FORMAT_E5B9G9R9_UFLOAT_PACK32, true, floats(65408.0f, 65472.0f, INFINITY, 0))) == 0xffffffffu);
+    EXPECT(word(element(VK_FORMAT_E5B9G9R9_UFLOAT_PACK32, true, floats(std::ldexp(1.0f, -25), 0, 0, 0))) == 0x00000001u);
+    EXPECT(word(element(VK_FORMAT_E5B9G9R9_UFLOAT_PACK32, true, floats(std::ldexp(511.5f, -24), 0, 0, 0))) == 0x08000100u);
+    EXPECT(word(element(VK_FORMAT_E5B9G9R9_UFLOAT_PACK32, true, floats(-1.0f, 1.0f, NAN, 0))) == 0x80020000u);
+    EXPECT(word(element(VK_FORMAT_E5B9G9R9_UFLOAT_PACK32, false, {0x3f800000u, 0xffffffffu, 1u, 2u})) == 0u);
     // Float into an integer channel: toward zero, clamped.
     EXPECT(word(element(VK_FORMAT_R32_SINT, true, floats(-3.7f, 0, 0, 0))) == std::uint32_t(-3));
     EXPECT((element(VK_FORMAT_R8G8_UINT, true, floats(300.0f, -5.0f, 0, 0)) == V{0xff, 0x00}));
@@ -93,6 +115,11 @@ int conversion_checks() {
     EXPECT(value.uint32[0] == 0xff && value.uint32[1] == 0x80 && value.uint32[2] == 0 && value.uint32[3] == 0xff);
     EXPECT(uc::encode(VK_FORMAT_R8_UINT, false, {0x80, 0, 0, 0}, e) && uc::decode(VK_FORMAT_R8_SINT, e, value) &&
            value.int32[0] == -128);
+    // R9G9B9E5 decodes both to R32_UINT (emulated backing) and to float RGB (native backing).
+    EXPECT(uc::encode(VK_FORMAT_E5B9G9R9_UFLOAT_PACK32, true, floats(1.0f, 2.0f, 4.0f, 0), e) &&
+           uc::decode(VK_FORMAT_R32_UINT, e, value) && value.uint32[0] == 0x94010040u);
+    EXPECT(uc::decode(VK_FORMAT_E5B9G9R9_UFLOAT_PACK32, e, value) && value.float32[0] == 1.0f &&
+           value.float32[1] == 2.0f && value.float32[2] == 4.0f);
     EXPECT(!uc::encode(VK_FORMAT_BC1_RGBA_UNORM_BLOCK, false, {}, e));  // not a typed-UAV format
     EXPECT(!uc::decode(VK_FORMAT_R16_UINT, e, value));                  // e is one byte, R16 is two
     return 0;
@@ -409,7 +436,9 @@ int main() {
     if (conversion_checks()) return 1;
 
     vktest::Device d;
-    EXPECT(d.create());
+    const auto device_status = d.initialize();
+    if (device_status == vktest::DeviceStatus::unavailable) return 77;   // no Vulkan GPU: ctest skips
+    if (device_status != vktest::DeviceStatus::ready) return 1;
     {
         rt::d3d12::VulkanDeviceInfo info{};
         info.get_instance_proc = d.instance_proc;
@@ -560,7 +589,36 @@ int main() {
             {"RGBA8_UNORM volume, one mip", DXGI_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R8G8B8A8_UNORM, 4, 4, 2, 4, true,
              {texture_clear(VK_FORMAT_R8G8B8A8_UNORM, false, {1, 2, 3, 4}, 1, 0, 1)}},
         };
-        for (const auto& test : textures)
+        std::vector<TextureCase> all_textures = textures;
+        {
+            D3D12_FEATURE_DATA_FORMAT_SUPPORT e5_support{DXGI_FORMAT_R9G9B9E5_SHAREDEXP};
+            if (SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &e5_support, sizeof(e5_support))) &&
+                (e5_support.Support1 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW)) {
+                // Full-view Float and Uint clears work whether R9G9B9E5 UAV is native or backed by mutable R32_UINT.
+                TextureCase e5{"R9G9B9E5_SHAREDEXP array, Float and Uint", DXGI_FORMAT_R9G9B9E5_SHAREDEXP,
+                               VK_FORMAT_E5B9G9R9_UFLOAT_PACK32, 8, 8, 2, 2, false,
+                               {texture_clear(VK_FORMAT_E5B9G9R9_UFLOAT_PACK32, true, floats(1.0f, 2.0f, 4.0f, 0.0f),
+                                              0, 0, 2),
+                                texture_clear(VK_FORMAT_E5B9G9R9_UFLOAT_PACK32, true,
+                                              floats(0.5f, 0.25f, 0.125f, 0.0f), 1, 1, 1),
+                                texture_clear(VK_FORMAT_E5B9G9R9_UFLOAT_PACK32, false,
+                                              {0x3f800000u, 0xffffffffu, 1u, 2u}, 0, 1, 1)}};
+                VkFormatProperties e5_props{};
+                d.instance_fn<PFN_vkGetPhysicalDeviceFormatProperties>("vkGetPhysicalDeviceFormatProperties")(
+                    d.physical, VK_FORMAT_E5B9G9R9_UFLOAT_PACK32, &e5_props);
+                const bool native_storage = (e5_props.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) != 0;
+                const bool native_attach = (e5_props.optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT) != 0;
+                if (!native_storage || native_attach) {
+                    // Emulated R32_UINT images (or native ones with COLOR_ATTACHMENT) also clear partial rectangles.
+                    e5.clears.push_back(texture_clear(VK_FORMAT_E5B9G9R9_UFLOAT_PACK32, true,
+                                                      floats(100.0f, 0.001f, 0.5f, 0.0f), 0, 0, 1, {{1, 2, 5, 6}}));
+                    e5.clears.push_back(texture_clear(VK_FORMAT_E5B9G9R9_UFLOAT_PACK32, false,
+                                                      {0x12345678u, 0x9abcdef0u, 0u, 0u}, 0, 0, 1, {{2, 3, 4, 5}}));
+                }
+                all_textures.push_back(std::move(e5));
+            }
+        }
+        for (const auto& test : all_textures)
             if (run_texture(h, test)) return 1;
 
         // Refused while recording (Close says E_INVALIDARG): no values, an empty slot, no resource.

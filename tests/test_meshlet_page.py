@@ -25,12 +25,14 @@ def pad16(buf):
     return buf
 
 
-def block(n, colour=True, uv1=True, flags=0x200):
+def block(n, colour=True, uv1=True, normal=True, flags=0x200):
     """A vertex block with n vertices: slots 0 (pos), 1 (rgba), 2 (normal), 3 (uv0), 4 (uv1).
 
     The streams are stored in slot order 0, 2, 1, 3, 4, as measured.
     """
     order = [(0, 0x63, 12), (2, 0x63, 12), (1, 0x26, 4), (3, 0x42, 8), (4, 0x42, 8)]
+    if not normal:
+        order = [o for o in order if o[0] != 2]
     if not colour:
         order = [o for o in order if o[0] != 1]
     if not uv1:
@@ -80,6 +82,73 @@ def page(*chunks):
     return bytes(pad16(buf))
 
 
+class DrawBindingTests(unittest.TestCase):
+    def setUp(self):
+        self.system = bytearray(704)
+        self.graphics = bytearray(640)
+        # Two same-sized blocks. The group near the first binds the second.
+        for at in (0, 384):
+            struct.pack_into("<I", self.graphics, at, 0x4042)
+        data = bytes(pad16(bytearray(group([(8, 4)]))))
+        self.graphics[256:256 + len(data)] = data
+        for at, target in ((8, 160), (64, 240), (224, 320), (240, 256)):
+            struct.pack_into("<Q", self.system, at, 0x50000000 + target)
+        struct.pack_into("<IH", self.system, 168, 192, 1)
+        struct.pack_into("<Q", self.system, 184, 0x60000000 + 384)
+        struct.pack_into("<HHI", self.system, 248, 1, 4, 8 << 8)
+        struct.pack_into("<IH", self.system, 264, len(data) // 4, 4)
+        struct.pack_into("<Q", self.system, 280, 0x60000000 + 256)
+        struct.pack_into("<I", self.system, 320, 128)
+        self.system[320 + 208] = 8
+        self.system[320 + 260] = 16
+        struct.pack_into("<I", self.system, 320 + 312, (8 << 10) | 1)
+
+    def test_binding_uses_resource_relative_pointers(self):
+        result = mp.draw_binding(self.system, self.graphics, 0)
+        self.assertEqual(result, {"vertex_block": 384, "meshlet_group": 256, "vertices": 8})
+
+    def test_binding_to_group_in_later_page(self):
+        graphics = self.graphics + self.graphics[256:336]
+        struct.pack_into("<Q", self.system, 280, 0x60000000 + 640)
+        self.assertEqual(mp.draw_binding(self.system, graphics, 0)["meshlet_group"], 640)
+
+    def test_primary_lod_traversal(self):
+        self.system.extend(bytes(304))
+        for at, target in ((784, 880), (880, 896), (896, 912), (920, 976), (976, 0)):
+            struct.pack_into("<Q", self.system, at, 0x50000000 + target)
+        for at in (888, 928):
+            struct.pack_into("<HH", self.system, at, 1, 1)
+        struct.pack_into("<H", self.system, 966, 1)
+        self.assertEqual(list(mp.drawable_geometries(self.system, 704)), [0])
+        self.system[966] = 2
+        with self.assertRaises(mp.PageError):
+            list(mp.drawable_geometries(self.system, 704))
+
+    def test_inconsistent_bindings(self):
+        for offset, fmt, value in ((64, "Q", 0x50010000), (248, "H", 2),
+                                   (280, "Q", 0x60010000), (632, "I", (7 << 10) | 1)):
+            with self.subTest(offset=offset):
+                damaged = self.system.copy()
+                struct.pack_into("<" + fmt, damaged, offset, value)
+                with self.assertRaises(mp.PageError):
+                    mp.draw_binding(damaged, self.graphics, 0)
+
+    def test_cli_preserves_unresolved_rows(self):
+        with tempfile.TemporaryDirectory() as folder:
+            system = os.path.join(folder, "system")
+            graphics = os.path.join(folder, "graphics")
+            for path, data in ((system, self.system), (graphics, self.graphics)):
+                with open(path, "wb") as out:
+                    out.write(data)
+            run = subprocess.run([sys.executable, "-I", TOOL, graphics, "--draw-system", system,
+                                  "--geometry-offset", "0", "--geometry-offset", "0xffff"],
+                                 capture_output=True, text=True)
+            self.assertEqual(run.returncode, 1)
+            rows = json.loads(run.stdout)["bindings"]
+            self.assertEqual(rows[0]["vertex_block"], 384)
+            self.assertIn("unresolved", rows[1])
+
+
 class ParseTests(unittest.TestCase):
     def test_block_then_group(self):
         data = page(block(200), group([(128, 120), (72, 70)]))
@@ -98,6 +167,20 @@ class ParseTests(unittest.TestCase):
         chunks = mp.parse_page(data)
         self.assertEqual([c["kind"] for c in chunks], ["block", "group", "block"])
         self.assertEqual([s[0] for s in chunks[0]["slots"]], [0, 2, 3])
+
+    def test_block_without_normals(self):
+        # slots 0, 3, 4 only: the vertex count comes from slot 0's span up to the next stream (slot 3)
+        data = page(block(7, colour=False, normal=False), group([(7, 5)]))
+        chunks = mp.parse_page(data)
+        self.assertEqual([c["kind"] for c in chunks], ["block", "group"])
+        self.assertEqual(chunks[0]["vertices"], 7)
+        self.assertEqual([s[0] for s in chunks[0]["slots"]], [0, 3, 4])
+        self.assertTrue(chunks[0]["tags_expected"])
+        summary = mp.summarise_page(data, "x")
+        self.assertNotIn("error", summary)
+        c = summary["checks"]
+        self.assertEqual((c["vertices"], c["positions_finite"], c["normals_unit"]), (7, 7, 0))
+        self.assertEqual((c["uv_vertices"], c["uv_finite"]), (14, 14))
 
     def test_group_led_page(self):
         data = page(group([(10, 8)]), block(10))
@@ -170,6 +253,12 @@ class RejectTests(unittest.TestCase):
         with self.assertRaises(mp.PageError):
             mp.parse_block(bytes(b), 0)
 
+    def test_block_with_only_slot_0(self):
+        b = bytearray(0x60 + 12 * 4)
+        struct.pack_into("<I", b, 0, 0x63 | ((0x60 // 2) << 8))
+        with self.assertRaises(mp.PageError):
+            mp.parse_block(bytes(b), 0)
+
     def test_unknown_chunk(self):
         data = page(block(4)) + struct.pack("<I", 0x1234) + b"\0" * 12
         summary = mp.summarise_page(data, "x")
@@ -210,6 +299,19 @@ class CliTests(unittest.TestCase):
             with open(out2, encoding="utf-8") as fh:
                 self.assertEqual(json.load(fh)["totals"]["pages"], 2)
 
+    def test_page_report_write_failure_is_reported(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = os.path.join(tmp, "page.bin")
+            with open(source, "wb") as fh:
+                fh.write(page(block(4)))
+            out = os.path.join(tmp, "missing", "report.json")
+
+            result = self.run_tool(source, "--json", out, "--quiet")
+
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn(f"cannot write {out}", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+
     def test_missing_input(self):
         r = self.run_tool(os.path.join(tempfile.gettempdir(), "no-such-meshlet-page.bin"))
         self.assertEqual(r.returncode, 2)
@@ -221,6 +323,106 @@ class CliTests(unittest.TestCase):
                 fh.write(page(block(4)) + struct.pack("<I", 0x1234) + b"\0" * 12)
             r = self.run_tool(path, "--quiet")
             self.assertEqual(r.returncode, 1)
+
+    def test_json_that_is_a_directory_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = os.path.join(tmp, "page.bin")
+            with open(source, "wb") as fh:
+                fh.write(page(block(4)))
+            r = self.run_tool(source, "--json", tmp, "--quiet")
+            self.assertEqual(r.returncode, 2, r.stderr)
+            self.assertIn("is a directory", r.stderr)
+            self.assertNotIn("Traceback", r.stderr)
+
+    def test_json_over_input_archive_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            rpf = os.path.join(tmp, "test.rpf")
+            data = b"9FPR" + struct.pack("<I", 16) + b"\0" * 8 + zlib.compress(page(block(4)))
+            with open(rpf, "wb") as fh:
+                fh.write(data)
+            alias = os.path.join(tmp, ".", "test.rpf")
+            r = self.run_tool(rpf, "--json", alias, "--quiet")
+            self.assertEqual(r.returncode, 2, r.stderr)
+            self.assertIn("would overwrite the input", r.stderr)
+            self.assertNotIn("Traceback", r.stderr)
+            with open(rpf, "rb") as fh:
+                self.assertEqual(fh.read(), data)
+
+    def test_json_over_input_file_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = os.path.join(tmp, "page.bin")
+            data = page(block(4))
+            with open(source, "wb") as fh:
+                fh.write(data)
+            r = self.run_tool(source, "--json", source, "--quiet")
+            self.assertEqual(r.returncode, 2, r.stderr)
+            self.assertIn("would overwrite the input", r.stderr)
+            self.assertNotIn("Traceback", r.stderr)
+            with open(source, "rb") as fh:
+                self.assertEqual(fh.read(), data)
+
+    def test_json_over_carve_dir_manifest_or_payload_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            carve = os.path.join(tmp, "carve")
+            os.mkdir(carve)
+            manifest = os.path.join(carve, "index.json")
+            with open(manifest, "w", encoding="utf-8") as fh:
+                fh.write('{"files": []}')
+            bin_path = os.path.join(carve, "0000.bin")
+            bin_data = page(block(4))
+            with open(bin_path, "wb") as fh:
+                fh.write(bin_data)
+
+            # Refuse overwrite of index.json
+            r = self.run_tool(carve, "--json", manifest, "--quiet")
+            self.assertEqual(r.returncode, 2, r.stderr)
+            self.assertIn("would overwrite the input", r.stderr)
+            self.assertNotIn("Traceback", r.stderr)
+            with open(manifest, "r", encoding="utf-8") as fh:
+                self.assertEqual(fh.read(), '{"files": []}')
+
+            # Refuse overwrite of carved .bin payload
+            r = self.run_tool(carve, "--json", bin_path, "--quiet")
+            self.assertEqual(r.returncode, 2, r.stderr)
+            self.assertIn("would overwrite the input", r.stderr)
+            self.assertNotIn("Traceback", r.stderr)
+            with open(bin_path, "rb") as fh:
+                self.assertEqual(fh.read(), bin_data)
+
+    def test_fresh_json_inside_carve_dir_is_allowed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            carve = os.path.join(tmp, "carve")
+            os.mkdir(carve)
+            bin_path = os.path.join(carve, "0000.bin")
+            with open(bin_path, "wb") as fh:
+                fh.write(page(block(4)))
+            out = os.path.join(carve, "report.json")
+            r = self.run_tool(carve, "--json", out, "--quiet")
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertTrue(os.path.isfile(out))
+            with open(out, "r", encoding="utf-8") as fh:
+                self.assertEqual(json.load(fh)["totals"]["pages"], 1)
+
+    def test_json_over_draw_system_inputs_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sys_path = os.path.join(tmp, "system.bin")
+            gfx_path = os.path.join(tmp, "graphics.bin")
+            with open(sys_path, "wb") as fh:
+                fh.write(b"\0" * 256)
+            with open(gfx_path, "wb") as fh:
+                fh.write(b"\0" * 256)
+
+            # Refuse overwrite of graphics segment
+            r = self.run_tool(gfx_path, "--draw-system", sys_path, "--geometry-offset", "0", "--json", gfx_path, "--quiet")
+            self.assertEqual(r.returncode, 2, r.stderr)
+            self.assertIn("would overwrite the input", r.stderr)
+            self.assertNotIn("Traceback", r.stderr)
+
+            # Refuse overwrite of system segment
+            r = self.run_tool(gfx_path, "--draw-system", sys_path, "--geometry-offset", "0", "--json", sys_path, "--quiet")
+            self.assertEqual(r.returncode, 2, r.stderr)
+            self.assertIn("would overwrite the input", r.stderr)
+            self.assertNotIn("Traceback", r.stderr)
 
 
 if __name__ == "__main__":

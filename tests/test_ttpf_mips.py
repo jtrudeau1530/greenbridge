@@ -4,13 +4,18 @@ synthetic RDS5/ETPF pool round trip. No game data is used.
     python -I tests/test_ttpf_mips.py
 """
 import importlib.util
+import io
 import json
 import os
+import random
 import struct
+import subprocess
 import sys
 import tempfile
 import unittest
 import zlib
+from contextlib import redirect_stdout
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOL = os.path.join(ROOT, "tools", "ttpf_mips.py")
@@ -34,6 +39,124 @@ def solid_bc4(v):
 
 def solid_bc5(r, g):
     return solid_bc4(r) + solid_bc4(g)
+
+
+def pack_bc7_block(mode, *, part=0, rot=0, isel=0, r=(), g=(), b=(), a=(),
+                   pbits=(), idx1=None, idx2=None):
+    """Assemble one 16-byte BC7 block for any valid mode (0..7)."""
+    ns, pb, rb, isb, cb, ab, epb, spb, ib, ib2 = ttpf._BC7_MODES[mode]
+    blk = 1 << mode
+    pos = mode + 1
+    if pb:
+        blk |= (part & ((1 << pb) - 1)) << pos
+        pos += pb
+    if rb:
+        blk |= (rot & ((1 << rb) - 1)) << pos
+        pos += rb
+    if isb:
+        blk |= (isel & 1) << pos
+        pos += isb
+    n_ep = 2 * ns
+    for vals, bits in ((r, cb), (g, cb), (b, cb)):
+        assert len(vals) == n_ep
+        mask = (1 << bits) - 1
+        for v in vals:
+            blk |= (v & mask) << pos
+            pos += bits
+    if ab:
+        assert len(a) == n_ep
+        mask = (1 << ab) - 1
+        for v in a:
+            blk |= (v & mask) << pos
+            pos += ab
+    if epb:
+        assert len(pbits) == n_ep
+        for p in pbits:
+            blk |= (p & 1) << pos
+            pos += 1
+    elif spb:
+        assert len(pbits) == ns
+        for p in pbits:
+            blk |= (p & 1) << pos
+            pos += 1
+    tab = ttpf._bptc.load_bc7()
+    if ns == 1:
+        sm = None
+        anchors = (0,)
+    elif ns == 2:
+        sm = tab["partition2"][part]
+        anchors = (0, tab["anchor2"][part])
+    else:
+        sm = tab["partition3"][part]
+        anchors = (0, tab["anchor3a"][part], tab["anchor3b"][part])
+    idx1 = [0] * 16 if idx1 is None else idx1
+    for p in range(16):
+        sub = 0 if sm is None else sm[p]
+        nb = (ib - 1) if p == anchors[sub] else ib
+        blk |= (idx1[p] & ((1 << nb) - 1)) << pos
+        pos += nb
+    if ib2:
+        idx2 = [0] * 16 if idx2 is None else idx2
+        for p in range(16):
+            nb = (ib2 - 1) if p == 0 else ib2
+            blk |= (idx2[p] & ((1 << nb) - 1)) << pos
+            pos += nb
+    assert pos == 128, f"mode {mode} ended at bit {pos}"
+    return blk.to_bytes(16, "little")
+
+
+def solid_bc7(r, g, b):
+    """Mode 6 solid BC7 block for an 8-bit RGB colour (exact to +-1 LSB)."""
+    return pack_bc7_block(
+        6,
+        r=(r >> 1, r >> 1),
+        g=(g >> 1, g >> 1),
+        b=(b >> 1, b >> 1),
+        a=(127, 127),
+        pbits=(r & 1, r & 1),
+    )
+
+
+def pack_bc6h_block(code, *, part=0, fields=None, indices=None):
+    """Assemble one 16-byte BC6H block for any of the 14 valid mode codes."""
+    _, _, _, reg = ttpf.bcpack._BC6H_INFO[code]
+    plan, hdr = ttpf.bcpack._bc6h_plan(code)
+    blk = code
+    fields = fields or [[0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0]]
+    for c, q, bit_idx, pos in plan:
+        bit = ((part >> bit_idx) & 1) if c < 0 else ((fields[c][q] >> bit_idx) & 1)
+        if bit:
+            blk |= 1 << pos
+    pos = hdr
+    indices = [0] * 16 if indices is None else indices
+    if reg == 1:
+        for p in range(16):
+            nb = 3 if p == 0 else 4
+            blk |= (indices[p] & ((1 << nb) - 1)) << pos
+            pos += nb
+    else:
+        anchor1 = ttpf._bptc.load_bc7()["anchor2"][part]
+        for p in range(16):
+            nb = 2 if (p == 0 or p == anchor1) else 3
+            blk |= (indices[p] & ((1 << nb) - 1)) << pos
+            pos += nb
+    assert pos == 128, f"BC6H mode {code:#x} ended at bit {pos}"
+    return blk.to_bytes(16, "little")
+
+
+def solid_bc6h(r, g, b, *, signed=False):
+    """Mode 0x0F (16-bit base, zero delta) solid BC6H block for float16 RGB."""
+    fields = [[0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0]]
+    for c, v in enumerate((r, g, b)):
+        neg = signed and v < 0
+        hv = struct.unpack("<H", struct.pack("<e", abs(v) if signed else max(0.0, v)))[0]
+        hv = min(hv, 0x7BFF)
+        if signed:
+            mag = min(0x7FFF, (hv * 32 + 30) // 31)
+            fields[c][0] = (-mag if neg else mag) & 0xFFFF
+        else:
+            fields[c][0] = min(0xFFFF, (hv * 64 + 30) // 31)
+    return pack_bc6h_block(0x0F, fields=fields)
 
 
 def retile_to(layout, mip, linear, out, base_offset=0):
@@ -85,9 +208,10 @@ def retile_volume(layout, linear):
 
 
 def solid_chain(layout, fmt=71, color_fn=None):
-    """Build block-linear bytes for every mip; each block is one solid BC1/BC4/BC5 colour."""
+    """Build block-linear bytes for every mip; each block is one solid BC colour."""
     eb = layout["element_bytes"]
     out = {}
+    is_hdr = fmt in (95, 96)
     # Smooth gradient at the top level; every lower mip is the 2x2 block mean.
     top = layout["mips"][0]
     colours = {}
@@ -95,6 +219,12 @@ def solid_chain(layout, fmt=71, color_fn=None):
         for x in range(top["blocks_w"]):
             if color_fn is not None:
                 colours[(0, x, y)] = color_fn(x, y, top["blocks_w"], top["blocks_h"])
+            elif fmt == 95:
+                colours[(0, x, y)] = (x * 16.0 / max(1, top["blocks_w"] - 1),
+                                      y * 8.0 / max(1, top["blocks_h"] - 1), 1.5)
+            elif fmt == 96:
+                colours[(0, x, y)] = (-4.0 + x * 8.0 / max(1, top["blocks_w"] - 1),
+                                      -2.0 + y * 4.0 / max(1, top["blocks_h"] - 1), 0.5)
             else:
                 colours[(0, x, y)] = (min(255, x * 255 // max(1, top["blocks_w"] - 1)),
                                       min(255, y * 255 // max(1, top["blocks_h"] - 1)), 128)
@@ -103,7 +233,7 @@ def solid_chain(layout, fmt=71, color_fn=None):
         cm = layout["mips"][m]
         for y in range(cm["blocks_h"]):
             for x in range(cm["blocks_w"]):
-                acc = [0, 0, 0]
+                acc = [0.0, 0.0, 0.0] if is_hdr else [0, 0, 0]
                 n = 0
                 for dy in range(2):
                     for dx in range(2):
@@ -112,7 +242,7 @@ def solid_chain(layout, fmt=71, color_fn=None):
                         for k in range(3):
                             acc[k] += q[k]
                         n += 1
-                colours[(m, x, y)] = tuple(a // n for a in acc)
+                colours[(m, x, y)] = tuple((a / n) if is_hdr else (a // n) for a in acc)
     for mip in layout["mips"]:
         buf = bytearray(mip["blocks_w"] * mip["blocks_h"] * eb)
         for y in range(mip["blocks_h"]):
@@ -123,6 +253,10 @@ def solid_chain(layout, fmt=71, color_fn=None):
                     blk = solid_bc4(c[0])
                 elif fmt == 83:
                     blk = solid_bc5(c[0], c[1])
+                elif fmt in (95, 96):
+                    blk = solid_bc6h(c[0], c[1], c[2], signed=(fmt == 96))
+                elif fmt in (98, 99):
+                    blk = solid_bc7(c[0], c[1], c[2])
                 else:
                     blk = solid_bc1(c)[:eb].ljust(eb, b"\0")
                 buf[at:at + eb] = blk
@@ -339,6 +473,191 @@ class BcDecodeTest(unittest.TestCase):
         unclamped = ttpf.block_means(pixels, 1, 1)
         self.assertEqual(unclamped, [(50.0, 25.0, 12.5)])
 
+    def test_bc7_all_eight_modes_and_reserved(self):
+        tab = ttpf._bptc.load_bc7()
+        # Reserved mode (b0 == 0): decodes to all-zero black.
+        self.assertEqual(ttpf.decode_pixels(98, b"\x00" * 16, 1, 1), [(0.0, 0.0, 0.0)] * 16)
+        self.assertEqual(ttpf.decode_pixels(99, b"\x00" * 16, 1, 1), [(0.0, 0.0, 0.0)] * 16)
+
+        # Mode 0: 3 subsets, 4-bit endpoints + per-endpoint p-bit -> 5-bit expanded via MSB rep.
+        # Subset 0: (15,0,0) p=1 -> (255,8,8); Subset 1: (0,15,0) p=0 -> (0,247,0); Subset 2: (0,0,15) p=1 -> (8,8,255).
+        blk0 = pack_bc7_block(
+            0, part=0,
+            r=(15, 15, 0, 0, 0, 0), g=(0, 0, 15, 15, 0, 0), b=(0, 0, 0, 0, 15, 15),
+            pbits=(1, 1, 0, 0, 1, 1),
+        )
+        px0 = ttpf.decode_pixels(98, blk0, 1, 1)
+        exp0 = [(255.0, 8.0, 8.0), (0.0, 247.0, 0.0), (8.0, 8.0, 255.0)]
+        for p, sub in enumerate(tab["partition3"][0]):
+            self.assertEqual(px0[p], exp0[sub], f"mode 0 pixel {p}")
+
+        # Mode 1: 2 subsets, 6-bit endpoints + shared per-subset p-bit -> 7-bit expanded.
+        # Subset 0: r=0..63, p=1 -> 2..255; Subset 1: g=32..32, p=0 -> 129..129.
+        # Index 3 on 3-bit table has weight 27 -> ((37*2 + 27*255 + 32) >> 6) = 109.
+        idx1 = [3 if p == 1 else 0 for p in range(16)]
+        blk1 = pack_bc7_block(
+            1, part=0,
+            r=(0, 63, 0, 0), g=(0, 0, 32, 32), b=(0, 0, 0, 0),
+            pbits=(1, 0), idx1=idx1,
+        )
+        px1 = ttpf.decode_pixels(98, blk1, 1, 1)
+        self.assertEqual(px1[0], (2.0, 2.0, 2.0))
+        self.assertEqual(px1[1], (109.0, 2.0, 2.0))
+        self.assertEqual(px1[2], (0.0, 129.0, 0.0))  # partition2[0][2] == 1
+
+        # Mode 2: 3 subsets, 5-bit endpoints (no p-bits), 2-bit indices.
+        blk2 = pack_bc7_block(
+            2, part=1,
+            r=(31, 0, 16, 16, 0, 0), g=(0, 0, 0, 0, 31, 31), b=(0, 31, 0, 0, 0, 0),
+            idx1=[3 if p == 1 else 0 for p in range(16)],
+        )
+        px2 = ttpf.decode_pixels(98, blk2, 1, 1)
+        self.assertEqual(px2[0], (255.0, 0.0, 0.0))
+        # pixel 1 is subset 0 in partition3[1]; idx=3 -> weight 64 -> (0, 0, 255)
+        self.assertEqual(tab["partition3"][1][1], 0)
+        self.assertEqual(px2[1], (0.0, 0.0, 255.0))
+
+        # Mode 3: 2 subsets, 7-bit + per-endpoint p-bit (exact 8-bit), 2-bit indices.
+        # Subset 0: R=0..255, idx=1 (w=21) -> (21*255 + 32)>>6 = 84.
+        blk3 = pack_bc7_block(
+            3, part=0,
+            r=(0, 127, 50, 50), g=(0, 0, 100, 100), b=(0, 0, 0, 0),
+            pbits=(0, 1, 0, 0), idx1=[1 if p == 1 else 0 for p in range(16)],
+        )
+        px3 = ttpf.decode_pixels(98, blk3, 1, 1)
+        self.assertEqual(px3[0], (0.0, 0.0, 0.0))
+        self.assertEqual(px3[1], (84.0, 0.0, 0.0))
+        self.assertEqual(px3[2], (100.0, 200.0, 0.0))
+
+        # Mode 4: 1 subset, 5-bit color, 6-bit alpha, rotation + index selection (isel=0 and isel=1).
+        # Color endpoints: R=0..255, G=0..0, B=0..0. Alpha endpoints: A=0..255.
+        # idx1[1]=1 (2-bit, w=21 -> 84), idx2[1]=4 (3-bit, w=37 -> 147).
+        for rot, isel, expected in (
+            (0, 0, (84.0, 0.0, 0.0)),    # color uses idx1 (84), no swap
+            (0, 1, (147.0, 0.0, 0.0)),   # color uses idx2 (147), no swap
+            (1, 0, (147.0, 0.0, 0.0)),   # rot=1 swaps R and A -> R gets alpha(idx2=147)
+            (2, 0, (84.0, 147.0, 0.0)),  # rot=2 swaps G and A -> G gets alpha(147)
+            (3, 1, (147.0, 0.0, 84.0)),  # isel=1: color=idx2(147), alpha=idx1(84), rot=3 puts A into B
+        ):
+            blk4 = pack_bc7_block(
+                4, rot=rot, isel=isel,
+                r=(0, 31), g=(0, 0), b=(0, 0), a=(0, 63),
+                idx1=[1 if p == 1 else 0 for p in range(16)],
+                idx2=[4 if p == 1 else 0 for p in range(16)],
+            )
+            px4 = ttpf.decode_pixels(98, blk4, 1, 1)
+            self.assertEqual(px4[1], expected, f"mode 4 rot={rot} isel={isel}")
+
+        # Mode 5: 1 subset, 7-bit color, 8-bit alpha, rotation, 2-bit color & alpha indices.
+        blk5 = pack_bc7_block(
+            5, rot=2,
+            r=(64, 64), g=(0, 0), b=(16, 16), a=(0, 200),
+            idx1=[0] * 16, idx2=[3 if p == 5 else 0 for p in range(16)],
+        )
+        px5 = ttpf.decode_pixels(98, blk5, 1, 1)
+        self.assertEqual(px5[0], (129.0, 0.0, 32.0))
+        self.assertEqual(px5[5], (129.0, 200.0, 32.0))  # rot=2 swaps A into G
+
+        # Mode 6: 1 subset, 7-bit RGBA + per-endpoint p-bit (exact 8-bit), 4-bit indices.
+        # idx=5 has weight 21 -> ((43*20 + 21*220 + 32) >> 6) = 86.
+        blk6 = pack_bc7_block(
+            6, r=(10, 110), g=(0, 0), b=(127, 127), a=(127, 127),
+            pbits=(0, 0), idx1=[5 if p == 3 else 0 for p in range(16)],
+        )
+        px6 = ttpf.decode_pixels(99, blk6, 1, 1)
+        self.assertEqual(px6[0], (20.0, 0.0, 254.0))
+        self.assertEqual(px6[3], (86.0, 0.0, 254.0))
+
+        # Mode 7: 2 subsets, 5-bit RGBA + per-endpoint p-bit -> 6-bit expanded, 2-bit indices.
+        blk7 = pack_bc7_block(
+            7, part=0,
+            r=(31, 31, 0, 0), g=(0, 0, 31, 31), b=(0, 0, 0, 0), a=(31, 31, 31, 31),
+            pbits=(1, 1, 1, 1),
+        )
+        px7 = ttpf.decode_pixels(98, blk7, 1, 1)
+        self.assertEqual(px7[0], (255.0, 4.0, 4.0))
+        self.assertEqual(px7[2], (4.0, 255.0, 4.0))
+
+    def test_bc6h_modes_uf16_sf16_and_reserved(self):
+        lut = ttpf._f16_lut()
+        # Reserved modes (0x13, 0x17, 0x1B, 0x1F) decode to zero.
+        for bad_mode in (0x13, 0x17, 0x1B, 0x1F):
+            blk_bad = bytes([bad_mode]) + b"\x00" * 15
+            self.assertEqual(ttpf.decode_pixels(95, blk_bad, 1, 1), [(0.0, 0.0, 0.0)] * 16)
+            self.assertEqual(ttpf.decode_pixels(96, blk_bad, 1, 1), [(0.0, 0.0, 0.0)] * 16)
+
+        # Mode 0x03 (1-region untransformed 10-bit): UF16 max endpoint 1023 -> 0xFFFF -> 0x7BF7 -> ~65024.0
+        blk03 = pack_bc6h_block(0x03, fields=[[0, 1023, 0, 0], [512, 512, 0, 0], [0, 0, 0, 0]],
+                                indices=[0, 15] + [0] * 14)
+        px03_u = ttpf.decode_pixels(95, blk03, 1, 1)
+        self.assertEqual(px03_u[0][0], 0.0)
+        self.assertAlmostEqual(px03_u[1][0], lut[(0xFFFF * 31) >> 6], places=5)
+        self.assertGreater(px03_u[0][1], 1.0)
+        # Same bit pattern as SF16: 1023 -> -1 (negative!), 512 -> -512 (max negative magnitude -> -65504.0).
+        px03_s = ttpf.decode_pixels(96, blk03, 1, 1)
+        self.assertEqual(px03_s[0][0], 0.0)
+        self.assertLess(px03_s[1][0], 0.0)
+        self.assertEqual(px03_s[0][1], -65504.0)
+
+        # Mode 0x0B (1-region transformed 12-bit base + 8-bit delta, reversed rw[11:10]).
+        # e0 = 0x900 (2304, uses both bits 11 and 8), delta = -16 -> e1 = 2288.
+        blk0b = pack_bc6h_block(0x0B, fields=[[0x900, (-16) & 0xFF, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0]],
+                                indices=[0, 15] + [0] * 14)
+        px0b = ttpf.decode_pixels(95, blk0b, 1, 1)
+        exp_e0 = ttpf._bc6h_finish(ttpf._bc6h_unquantize(0x900, 12, False), False, lut)
+        exp_e1 = ttpf._bc6h_finish(ttpf._bc6h_unquantize(0x8F0, 12, False), False, lut)
+        self.assertEqual(px0b[0][0], exp_e0)
+        self.assertEqual(px0b[1][0], exp_e1)
+
+        # Mode 0x0F (1-region transformed 16-bit base + 4-bit delta, reversed rw[15:10]).
+        # Test exact round-trip of large positive UF16 and negative SF16 via solid_bc6h,
+        # plus -32768 clamp in SF16 -> finite -65504.0 (never -inf/NaN).
+        px_hi = ttpf.decode_pixels(95, solid_bc6h(128.0, 0.5, 0.0, signed=False), 1, 1)
+        self.assertAlmostEqual(px_hi[0][0], 128.0, places=2)
+        self.assertAlmostEqual(px_hi[0][1], 0.5, places=3)
+        px_neg = ttpf.decode_pixels(96, solid_bc6h(-12.5, 3.25, -0.25, signed=True), 1, 1)
+        self.assertAlmostEqual(px_neg[0][0], -12.5, places=2)
+        self.assertAlmostEqual(px_neg[0][1], 3.25, places=2)
+        self.assertAlmostEqual(px_neg[0][2], -0.25, places=3)
+        blk_min16 = pack_bc6h_block(0x0F, fields=[[0x8000, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0]])
+        px_min16 = ttpf.decode_pixels(96, blk_min16, 1, 1)
+        self.assertEqual(px_min16[0][0], -65504.0)
+
+        # Mode 0x02 (2-region transformed 11-bit base, deltas (5,4,4)) with partition 1.
+        # Subset 0: R=1000, Subset 1: R=1000+10=1010..1000-6=994.
+        blk02 = pack_bc6h_block(
+            0x02, part=1,
+            fields=[[1000, 0, 10, (-6) & 0x1F], [0, 0, 0, 0], [0, 0, 0, 0]],
+            indices=[0] * 16,
+        )
+        px02 = ttpf.decode_pixels(95, blk02, 1, 1)
+        sm1 = ttpf._bptc.load_bc7()["partition2"][1]
+        exp_s0 = ttpf._bc6h_finish(ttpf._bc6h_unquantize(1000, 11, False), False, lut)
+        exp_s1 = ttpf._bc6h_finish(ttpf._bc6h_unquantize(1010, 11, False), False, lut)
+        for p, sub in enumerate(sm1):
+            self.assertEqual(px02[p][0], exp_s0 if sub == 0 else exp_s1, f"mode 0x02 pixel {p}")
+
+        # Mode 0x1E (2-region untransformed 6-bit) in SF16: negative subset 1 endpoint.
+        blk1e = pack_bc6h_block(
+            0x1E, part=0,
+            fields=[[16, 16, (-16) & 0x3F, (-16) & 0x3F], [0, 0, 0, 0], [0, 0, 0, 0]],
+            indices=[0] * 16,
+        )
+        px1e = ttpf.decode_pixels(96, blk1e, 1, 1)
+        self.assertGreater(px1e[0][0], 0.0)
+        self.assertEqual(px1e[2][0], -px1e[0][0])
+
+    def test_hdr_tonemap_metric(self):
+        same = [(0.0, 1.0, 500.0), (1000.0, 0.25, 65504.0)]
+        self.assertEqual(ttpf.mean_abs_error(same, same, hdr=True), 0.0)
+        # Bounded even on extreme HDR highlights.
+        hi_err = ttpf.mean_abs_error([(0.0, 0.0, 0.0)], [(65504.0, 65504.0, 65504.0)], hdr=True)
+        self.assertGreater(hi_err, 250.0)
+        self.assertLess(hi_err, 255.0)
+        # Signed sensitivity for SF16: -1.0 -> -127.5, +1.0 -> +127.5 -> diff = 255.0.
+        sign_err = ttpf.mean_abs_error([(-1.0, -1.0, -1.0)], [(1.0, 1.0, 1.0)], hdr=True)
+        self.assertAlmostEqual(sign_err, 255.0, places=5)
+
 
 class Bc3CheckTest(unittest.TestCase):
     def run_check(self, fmt, lower_colour):
@@ -381,6 +700,337 @@ class Bc3CheckTest(unittest.TestCase):
                 code, result = self.run_check(fmt, black)
                 self.assertEqual(code, 1, result)
                 self.assertEqual(result["chain_error"], [170.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+
+
+BC1_BLACK = bytes(8)
+BC1_WHITE = struct.pack("<HHI", 0xFFFF, 0xFFFF, 0)
+# Four-colour mode (white > black): selector 1 = black, selector 0 = white.
+BC1_LEFT_BLACK = struct.pack("<HHI", 0xFFFF, 0, 0x05050505)  # columns 0-1 black, 2-3 white
+BC1_LEFT_WHITE = struct.pack("<HHI", 0xFFFF, 0, 0x50505050)  # columns 0-1 white, 2-3 black
+
+
+def bc1_black(x, y):
+    return BC1_BLACK
+
+
+def bc1_column(cx, block=BC1_WHITE):
+    return lambda x, y: block if x == cx else BC1_BLACK
+
+
+def bc1_single(cx, cy):
+    return lambda x, y: BC1_WHITE if (x, y) == (cx, cy) else BC1_BLACK
+
+
+def bc1_blocks(mip, block_fn):
+    return b"".join(block_fn(x, y) for y in range(mip["blocks_h"]) for x in range(mip["blocks_w"]))
+
+
+def odd_mip(index, pw, ph):
+    return dict(index=index, pixels_w=pw, pixels_h=ph, blocks_w=(pw + 3) // 4, blocks_h=(ph + 3) // 4)
+
+
+def pair_error(parent, parent_fn, child, child_fn):
+    ppx = ttpf.decode_pixels(71, bc1_blocks(parent, parent_fn), parent["blocks_w"], parent["blocks_h"])
+    cpx = ttpf.decode_pixels(71, bc1_blocks(child, child_fn), child["blocks_w"], child["blocks_h"])
+    means = ttpf.block_means(cpx, child["blocks_w"], child["blocks_h"],
+                             child["pixels_w"], child["pixels_h"])
+    return ttpf.mean_abs_error(ttpf.predict_child_means(ppx, parent, child),
+                               ttpf.visible_block_means(means, child))
+
+
+class PredictChildMeansTest(unittest.TestCase):
+    def test_odd_block_counts_match_box_filter_oracles(self):
+        cases = (
+            ((12, 8), bc1_black, bc1_single(1, 0), 127.5),
+            ((8, 12), bc1_black, bc1_single(0, 1), 127.5),
+            ((12, 12), bc1_black, bc1_single(1, 1), 63.75),
+            ((12, 8), bc1_column(2), bc1_single(1, 0), 0.0),
+            ((12, 8), bc1_column(2), bc1_black, 127.5),
+            # 5x3 -> 3x2 blocks: a flat zip of 2x1 predictions would misalign rows.
+            ((20, 12), bc1_column(4), bc1_column(2), 0.0),
+            ((20, 12), bc1_column(4), bc1_black, 85.0),
+            # Child texels 6-7 are padding: only the visible half of the edge block counts.
+            ((12, 8), bc1_black, bc1_column(1, BC1_LEFT_BLACK), 0.0),
+            ((12, 8), bc1_black, bc1_column(1, BC1_LEFT_WHITE), 127.5),
+            # Parent texels 10-11 are padding and must not leak into child texel 4.
+            ((10, 8), bc1_column(2, BC1_LEFT_BLACK), bc1_black, 0.0),
+            ((10, 8), bc1_column(2, BC1_LEFT_WHITE), bc1_black, 127.5),
+        )
+        for (w, h), parent_fn, child_fn, expected in cases:
+            with self.subTest(size=(w, h), expected=expected):
+                self.assertAlmostEqual(pair_error(odd_mip(0, w, h), parent_fn,
+                                                  odd_mip(1, w // 2, h // 2), child_fn),
+                                       expected, places=9)
+
+    def test_matches_block_downsample_on_power_of_two_chains(self):
+        rng = random.Random(1)
+        for w, h in ((16, 8), (8, 8), (4, 4), (2, 2), (1, 1)):
+            with self.subTest(size=(w, h)):
+                parent = odd_mip(0, w, h)
+                child = odd_mip(1, max(1, w // 2), max(1, h // 2))
+                bw, bh = parent["blocks_w"], parent["blocks_h"]
+                data = bytes(rng.randrange(256) for _ in range(8 * bw * bh))
+                px = ttpf.decode_pixels(71, data, bw, bh)
+                old = ttpf.downsample2(ttpf.block_means(px, bw, bh, w, h), bw, bh)
+                new = ttpf.predict_child_means(px, parent, child)
+                self.assertEqual(len(new), len(old))
+                for a, b in zip(new, old):
+                    for x, y in zip(a, b):
+                        self.assertAlmostEqual(x, y, places=9)
+
+    def test_matches_nested_list_box_filter_on_odd_sizes(self):
+        rng = random.Random(2)
+        for w, h in ((28, 20), (22, 14), (6, 1), (1, 6)):
+            with self.subTest(size=(w, h)):
+                parent = odd_mip(0, w, h)
+                child = odd_mip(1, max(1, w // 2), max(1, h // 2))
+                bw, bh = parent["blocks_w"], parent["blocks_h"]
+                px = ttpf.decode_pixels(71, bytes(rng.randrange(256) for _ in range(8 * bw * bh)), bw, bh)
+                grid = [[px[y * bw * 4 + x] for x in range(w)] for y in range(h)]
+                cw, ch = child["pixels_w"], child["pixels_h"]
+                texels = [[tuple(sum(grid[min(h - 1, 2 * y + dy)][min(w - 1, 2 * x + dx)][k]
+                                     for dy in (0, 1) for dx in (0, 1)) / 4 for k in range(3))
+                           for x in range(cw)] for y in range(ch)]
+                expected = []
+                for by in range(0, ch, 4):
+                    for bx in range(0, cw, 4):
+                        cell = [t for row in texels[by:by + 4] for t in row[bx:bx + 4]]
+                        expected.append(tuple(sum(t[k] for t in cell) / len(cell) for k in range(3)))
+                got = ttpf.predict_child_means(px, parent, child)
+                self.assertEqual(len(got), child["blocks_w"] * child["blocks_h"])
+                for a, b in zip(got, expected):
+                    for x, y in zip(a, b):
+                        self.assertAlmostEqual(x, y, places=9)
+
+    def test_mismatched_geometry_is_rejected(self):
+        parent = odd_mip(0, 12, 8)
+        px = ttpf.decode_pixels(71, BC1_BLACK * 6, 3, 2)
+        for child in (odd_mip(1, 5, 4), odd_mip(1, 6, 3), dict(odd_mip(1, 6, 4), blocks_w=1)):
+            with self.subTest(child=child), self.assertRaises(ttpf.MipGeometryError):
+                ttpf.predict_child_means(px, parent, child)
+        with self.assertRaises(ttpf.MipGeometryError):
+            ttpf.predict_child_means(px[:-1], parent, odd_mip(1, 6, 4))
+        with self.assertRaises(ttpf.MipGeometryError):
+            ttpf.visible_block_means([(0.0, 0.0, 0.0)], odd_mip(1, 6, 4))
+        with self.assertRaises(ValueError):
+            ttpf.mean_abs_error([(0.0, 0.0, 0.0)], [(0.0, 0.0, 0.0)] * 2)
+
+
+def linear_layout(sizes, first_tail=0, depth=1):
+    """Fake layout storing each mip block-linear, mip-major across `depth` slices."""
+    mips, off = [], 0
+    for i, (w, h) in enumerate(sizes):
+        m = odd_mip(i, w, h)
+        m.update(offset=off, region=8 * m["blocks_w"] * m["blocks_h"], tile_x=0, tile_y=0)
+        m["slice_stride"] = m["region"]
+        mips.append(m)
+        off += m["region"] * depth
+    return dict(mips=mips, size=off, slice_size=off // depth, face_size=off, tile=4096,
+                first_tail=first_tail, element_bytes=8)
+
+
+def run_shape_check(shape, sizes, chunks, first_tail=0, depth=1):
+    layout = linear_layout(sizes, first_tail, depth)
+    if shape == "cubemap":
+        layout.update(data_offset=0, full_bytes=6 * layout["size"], snapshots=1)
+    w, h = sizes[0]
+    d = dict(base=0, format=71, width=w, height=h, depth=depth, mips=len(sizes), non_tail=0)
+    a = dict(layout=layout, descriptor=d, available=True, full_chain=True)
+    if shape != "2d":
+        a["shape"] = shape
+    tiled = b"".join(chunks) + bytes(1 << 17)
+    buf = io.StringIO()
+    with mock.patch.object(ttpf, "analyze", lambda pool, index: a), \
+            mock.patch.object(ttpf, "_read_range_or_block", lambda *args, **kw: tiled), \
+            mock.patch.object(ttpf, "detile", lambda lay, mip, data: bytes(
+                data[:8 * mip["blocks_w"] * mip["blocks_h"]])), \
+            redirect_stdout(buf):
+        code = ttpf.check(None, 0)
+    return code, json.loads(buf.getvalue())
+
+
+class OddBlockShapeCheckTest(unittest.TestCase):
+    """check() on 12x8 -> 6x4 BC1 (3x2 parent blocks) for each 2D-family shape. The container
+    and tiling are faked (block-linear mips); OddBlockPoolTest covers the real path."""
+    SIZES = ((12, 8), (6, 4))
+
+    def chunk(self, level, block_fn):
+        return bc1_blocks(odd_mip(level, *self.SIZES[level]), block_fn)
+
+    def test_2d_edge_column_and_tail_origin(self):
+        parent = self.chunk(0, bc1_column(2))
+        code, result = run_shape_check("2d", self.SIZES, [parent, self.chunk(1, bc1_column(1))],
+                                       first_tail=1)
+        self.assertEqual(code, 0, result)
+        self.assertEqual(result["chain_error"], [0.0])
+        # The fake tile-origin read sees parent blocks 0-1 (black) where the white edge belongs.
+        self.assertEqual(result["tail_origin_control"], 127.5)
+        code, result = run_shape_check("2d", self.SIZES, [parent, self.chunk(1, bc1_black)],
+                                       first_tail=1)
+        self.assertEqual(code, 1, result)
+        self.assertEqual(result["chain_error"], [127.5])
+
+    def test_array_reports_the_slice_with_a_dropped_edge(self):
+        parents = [self.chunk(0, bc1_column(2))] * 3
+        children = [self.chunk(1, bc1_column(1)), self.chunk(1, bc1_black),
+                    self.chunk(1, bc1_column(1))]
+        code, result = run_shape_check("2d_array", self.SIZES, parents + children, depth=3)
+        self.assertEqual(code, 1, result)
+        self.assertEqual(result["per_slice_max_error"], [0.0, 127.5, 0.0])
+        self.assertEqual(result["max_error"], 127.5)
+
+    def test_cube_reports_the_face_with_a_dropped_edge_and_tail_origin(self):
+        chunks = []
+        for face in range(6):
+            chunks += [self.chunk(0, bc1_column(2)),
+                       self.chunk(1, bc1_black if face == 4 else bc1_column(1))]
+        code, result = run_shape_check("cubemap", self.SIZES, chunks, first_tail=1)
+        self.assertEqual(code, 1, result)
+        self.assertEqual(result["per_face_max_error"], [0.0, 0.0, 0.0, 0.0, 127.5, 0.0])
+        self.assertEqual(result["tail_origin_control"], 127.5)
+
+    def test_mismatched_mip_geometry_is_blocked(self):
+        sizes = ((12, 8), (5, 4))
+        chunks = [bc1_blocks(odd_mip(0, 12, 8), bc1_black), bc1_blocks(odd_mip(1, 5, 4), bc1_black)]
+        code, result = run_shape_check("2d", sizes, chunks)
+        self.assertEqual(code, 2, result)
+        self.assertIn("geometry", result["blocked"])
+
+
+def odd_bc1_pool(path, width, height, parent_fn, child_fn):
+    """Write a two-mip BC1 pool through the real layout and tiling."""
+    layout = ttpf.surface_layout(width, height, 71, 2, 4096)
+    payload = bytearray(layout["size"])
+    for mip, block_fn in zip(layout["mips"], (parent_fn, child_fn)):
+        retile_to(layout, mip, bc1_blocks(mip, block_fn), payload)
+    non_tail = layout["first_tail"]
+    record = pack_etpf_record(width, height, 2 - non_tail, non_tail, 71, 1, 1, 2, 4096)
+    write_rds5_pool(path, [record], [payload])
+
+
+class OddBlockPoolTest(unittest.TestCase):
+    """Before the fix the changed 12x8, 8x12 and 12x12 children passed with error 0."""
+    CASES = (
+        # (width, height, parent, child, rc, chain_error)
+        (12, 8, bc1_black, bc1_black, 0, [0.0]),
+        (12, 8, bc1_black, bc1_single(1, 0), 1, [127.5]),
+        (8, 12, bc1_black, bc1_black, 0, [0.0]),
+        (8, 12, bc1_black, bc1_single(0, 1), 1, [127.5]),
+        (12, 12, bc1_black, bc1_black, 0, [0.0]),
+        (12, 12, bc1_black, bc1_single(1, 1), 1, [63.75]),
+        (12, 8, bc1_column(2), bc1_column(1), 0, [0.0]),
+        (16, 8, bc1_black, bc1_black, 0, [0.0]),
+        (16, 8, bc1_black, bc1_single(1, 0), 1, [127.5]),
+        (256, 256, bc1_black, bc1_black, 0, [0.0]),
+        (256, 256, bc1_black, bc1_single(31, 31), 0, [0.25]),
+    )
+
+    def run_check(self, *case):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "odd.ttpf")
+            odd_bc1_pool(path, *case)
+            pool = ttpf.Pool(path)
+            buf = io.StringIO()
+            try:
+                with redirect_stdout(buf):
+                    code = ttpf.check(pool, 0)
+            finally:
+                pool.close()
+        return code, json.loads(buf.getvalue())
+
+    def test_odd_block_counts_cover_every_child_block(self):
+        for w, h, parent_fn, child_fn, rc, errs in self.CASES:
+            with self.subTest(size=(w, h), rc=rc, chain_error=errs):
+                code, result = self.run_check(w, h, parent_fn, child_fn)
+                self.assertEqual(code, rc, result)
+                self.assertEqual(result["chain_error"], errs)
+
+    def test_cli_rejects_a_dropped_edge_block(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "odd.ttpf")
+            odd_bc1_pool(path, 12, 8, bc1_black, bc1_single(1, 0))
+            proc = subprocess.run([sys.executable, "-I", TOOL, "check", path, "0"],
+                                  capture_output=True, text=True, check=False)
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        result = json.loads(proc.stdout)
+        self.assertEqual(result["max_error"], 127.5)
+        self.assertTrue(result["full_chain"])
+
+
+class VisibleExportTest(unittest.TestCase):
+    """Before the fix 17x13 BC1 exported its 2x2-block child as 3x2 storage blocks (208 bytes)."""
+    RED = (255, 0, 0)
+
+    def test_export_packs_visible_blocks_only(self):
+        def child(x, y):
+            return solid_bc1(self.RED) if y == 1 else bc1_black(x, y)
+        for w, h in ((17, 13), (17, 16), (16, 13), (16, 16)):
+            with self.subTest(size=(w, h)), tempfile.TemporaryDirectory() as tmp:
+                path, out = os.path.join(tmp, "edge.ttpf"), os.path.join(tmp, "edge.dds")
+                odd_bc1_pool(path, w, h, bc1_black, child)
+                pool = ttpf.Pool(path)
+                try:
+                    with redirect_stdout(io.StringIO()):
+                        self.assertEqual(ttpf.export(pool, 0, out), 0)
+                finally:
+                    pool.close()
+                with open(out, "rb") as f:
+                    blob = f.read()
+                pw, ph, cw, ch = (w + 3) // 4, (h + 3) // 4, (w // 2 + 3) // 4, (h // 2 + 3) // 4
+                self.assertEqual(len(blob) - 148, 8 * (pw * ph + cw * ch))
+                self.assertEqual(struct.unpack_from("<I", blob, 20)[0], 8 * pw * ph)
+                at = 148 + 8 * (pw * ph + cw)
+                px = ttpf.decode_pixels(71, blob[at:at + 8], 1, 1)
+                self.assertEqual(tuple(px[0][:3]), self.RED)
+
+
+class BptcCheckTest(unittest.TestCase):
+    def _run_pool_check(self, fmt, *, corrupt_mip1=False):
+        layout = ttpf.surface_layout(256, 256, fmt, 7, 4096)
+        linear = solid_chain(layout, fmt=fmt)
+        if corrupt_mip1:
+            m1 = layout["mips"][1]
+            bad = solid_bc6h(0.0, 0.0, 0.0, signed=(fmt == 96)) if fmt in (95, 96) else solid_bc7(0, 0, 0)
+            linear[1] = bad * (m1["blocks_w"] * m1["blocks_h"])
+        payload = bytearray(layout["size"])
+        for mip in layout["mips"]:
+            retile_to(layout, mip, linear[mip["index"]], payload)
+        record = pack_etpf_record(256, 256, 6, 1, fmt, 1, 1, 4, 4096, 0x103)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, f"bptc_{fmt}.ttpf")
+            write_rds5_pool(path, [record], [payload])
+            pool = ttpf.Pool(path)
+            buf = io.StringIO()
+            try:
+                with redirect_stdout(buf):
+                    code = ttpf.check(pool, 0)
+            finally:
+                pool.close()
+        return code, json.loads(buf.getvalue())
+
+    def test_bc7_unorm_and_srgb_chain_check(self):
+        for fmt in (98, 99):
+            with self.subTest(fmt=fmt):
+                code, res = self._run_pool_check(fmt)
+                self.assertEqual(code, 0, res)
+                self.assertLess(res["max_error"], 2.0)
+                self.assertGreater(res["tail_origin_control"], 5 * max(res["max_error"], 1.0))
+
+                bad_code, bad_res = self._run_pool_check(fmt, corrupt_mip1=True)
+                self.assertEqual(bad_code, 1, bad_res)
+                self.assertGreater(bad_res["chain_error"][0], 50.0)
+
+    def test_bc6h_uf16_and_sf16_chain_check(self):
+        for fmt in (95, 96):
+            with self.subTest(fmt=fmt):
+                code, res = self._run_pool_check(fmt)
+                self.assertEqual(code, 0, res)
+                self.assertLess(res["max_error"], 2.0)
+                self.assertGreater(res["tail_origin_control"], 5 * max(res["max_error"], 1.0))
+
+                bad_code, bad_res = self._run_pool_check(fmt, corrupt_mip1=True)
+                self.assertEqual(bad_code, 1, bad_res)
+                self.assertGreater(bad_res["chain_error"][0], 50.0)
 
 
 class SyntheticPoolTest(unittest.TestCase):
@@ -462,6 +1112,30 @@ class SyntheticPoolTest(unittest.TestCase):
         self.assertEqual((result["after_full"], result["after_partial"],
                           result["after_skip"]), (1, 0, 0))
 
+    def test_scan_finds_pools_below_any_folder_and_rejects_paths_without_one(self):
+        """A pool folder other than the game root (data/ttdb itself, one pack) is searched recursively; a
+        path with no pool is an error, not an all-zero scan with exit code 0."""
+        import io
+        from contextlib import redirect_stderr, redirect_stdout
+        ttdb = os.path.join(self.tmp.name, "game [v1]", "data", "ttdb", "props")   # [..] is not a glob here
+        os.makedirs(ttdb)
+        build_pool(os.path.join(ttdb, "a.ttpf"))
+        out = os.path.join(self.tmp.name, "scan.json")
+        for folder in (os.path.join(self.tmp.name, "game [v1]"), os.path.dirname(ttdb), ttdb):
+            with redirect_stdout(io.StringIO()):
+                self.assertEqual(ttpf.main(["scan", folder, "--json", out]), 0, folder)
+            with open(out, encoding="utf-8") as f:
+                self.assertEqual(json.load(f)["total"]["pools"], 1, folder)
+        empty = os.path.join(self.tmp.name, "empty")
+        os.mkdir(empty)
+        for bad, why in ((os.path.join(self.tmp.name, "missing"), "no such file or folder"),
+                         (empty, "no .ttpf pool in it")):
+            err = io.StringIO()
+            with redirect_stdout(io.StringIO()), redirect_stderr(err):
+                self.assertEqual(ttpf.main(["scan", self.path, bad]), 2, bad)
+            self.assertIn(why, err.getvalue())
+            self.assertIn(bad, err.getvalue())
+
     def test_scan_counts_an_unlisted_tuple_as_gated(self):
         path = os.path.join(self.tmp.name, "unlisted.ttpf")
         build_pool(path, meta=0x599)
@@ -504,15 +1178,15 @@ class SyntheticPoolTest(unittest.TestCase):
     def test_scan_buckets_an_unknown_element_size(self):
         path = os.path.join(self.tmp.name, "unknown-format.ttpf")
         build_pool(path, meta=0x599)
-        # Rewrite the 7-bit format field to DXGI 11 (R16G16B16A16_UNORM, intentionally
-        # unmapped in ELEMENT_BYTES). The scan rejects the record before reading texture data.
+        # Rewrite the 7-bit format field to DXGI 120 (unmapped in ELEMENT_BYTES).
+        # The scan rejects the record before reading texture data.
         etpf = ttpf.align(24 + 2 * 8, 256)
         at = etpf + 16 + 4
         with open(path, "r+b") as f:
             f.seek(at)
             b = struct.unpack("<I", f.read(4))[0]
             f.seek(at)
-            f.write(struct.pack("<I", (b & ~(0x7F << 3)) | (11 << 3)))
+            f.write(struct.pack("<I", (b & ~(0x7F << 3)) | (120 << 3)))
         out = os.path.join(self.tmp.name, "scan4.json")
         import io
         from contextlib import redirect_stdout
@@ -520,7 +1194,8 @@ class SyntheticPoolTest(unittest.TestCase):
             ttpf.scan_pools([path], out)
         with open(out, encoding="utf-8") as f:
             total = json.load(f)["total"]
-        self.assertEqual(total["format11"], 1)
+        self.assertEqual(total["unsupported_format"], 1)
+        self.assertEqual(total["format11"], 0)
         self.assertEqual(total["whitelist_gated"], 1)
         self.assertEqual(total["gated_layout_ok"], 0)
         self.assertEqual(total["gated_no_layout"], 1)
@@ -736,6 +1411,13 @@ class SyntheticBcpackPoolTest(unittest.TestCase):
         self.assertTrue(a_info["full_chain"])
         self.assertEqual(a_info["mip_codecs"][0], [7])
 
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(ttpf.check(pool, 0), 0)
+        chk = json.loads(buf.getvalue())
+        self.assertEqual(chk["format"], 98)
+        self.assertEqual(chk["chain_error"], [])
+
         out_dds = os.path.join(self.tmp.name, "bc7_bcpack.dds")
         with redirect_stdout(io.StringIO()):
             self.assertEqual(ttpf.export(pool, 0, out_dds), 0)
@@ -887,6 +1569,54 @@ class BadPoolTest(unittest.TestCase):
         code, err = self.run_main("scan", self.good, self.bad)
         self.assertEqual(code, 2)
         self.assertIn(self.bad, err)
+
+    def test_scan_json_over_an_input_pool_is_refused(self):
+        with open(self.good, "rb") as f:
+            before = f.read()
+        alias = os.path.join(self.tmp.name, ".", "good.ttpf")
+        code, err = self.run_main("scan", self.good, "--json", alias)
+        self.assertEqual(code, 2)
+        self.assertIn("would overwrite the input", err)
+        with open(self.good, "rb") as f:
+            self.assertEqual(f.read(), before)
+
+    def test_scan_json_over_a_pool_found_in_a_game_folder_is_refused(self):
+        game = os.path.join(self.tmp.name, "game")
+        os.makedirs(os.path.join(game, "data", "ttdb"))
+        pool = os.path.join(game, "data", "ttdb", "found.ttpf")
+        build_pool(pool)
+        with open(pool, "rb") as f:
+            before = f.read()
+        code, err = self.run_main("scan", game, "--json", pool)
+        self.assertEqual(code, 2)
+        self.assertIn("would overwrite the input", err)
+        with open(pool, "rb") as f:
+            self.assertEqual(f.read(), before)
+
+    def test_scan_json_that_is_a_directory_is_refused(self):
+        code, err = self.run_main("scan", self.good, "--json", self.tmp.name)
+        self.assertEqual(code, 2)
+        self.assertIn("is a directory", err)
+
+    def test_scan_json_in_a_missing_folder_is_created(self):
+        out = os.path.join(self.tmp.name, "reports", "ttpf", "scan.json")
+        code, err = self.run_main("scan", self.good, "--json", out)
+        self.assertEqual(code, 0, err)
+        with open(out, encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["total"]["entries"], 1)
+
+    def test_scan_json_that_cannot_be_written_keeps_the_printed_report(self):
+        import io
+        from contextlib import redirect_stderr, redirect_stdout
+        blocker = os.path.join(self.tmp.name, "blocker")
+        with open(blocker, "w", encoding="utf-8") as f:
+            f.write("a file, not a folder")
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = ttpf.main(["scan", self.good, "--json", os.path.join(blocker, "scan.json")])
+        self.assertEqual(code, 2)
+        self.assertIn("cannot write", err.getvalue())
+        self.assertEqual(json.loads(out.getvalue())["total"]["entries"], 1)
 
     def test_index_past_the_pool(self):
         for index in ("1", "-1"):
@@ -1354,6 +2084,225 @@ class SyntheticVolumePoolTest(unittest.TestCase):
         self.assertIn("unsupported 3D volume", abc["blocked"])
         with redirect_stderr(io.StringIO()):
             self.assertEqual(ttpf.export(pool_bc, 0, os.path.join(self.tmp.name, "bad_vol.dds")), 2)
+
+
+class Uncompressed2DTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    @staticmethod
+    def _encode_pixel(fmt, r, g, b, a=255):
+        if fmt in (61, 65):
+            return bytes((r,))
+        if fmt in (28, 29):
+            return bytes((r, g, b, a))
+        if fmt in (87, 91):
+            return bytes((b, g, r, a))
+        if fmt == 49:
+            return bytes((r, g))
+        if fmt == 56:
+            return struct.pack("<H", r * 257)
+        if fmt == 54:
+            return struct.pack("<e", r / 64.0)
+        if fmt == 11:
+            return struct.pack("<HHHH", r * 257, g * 257, b * 257, a * 257)
+        if fmt == 10:
+            return struct.pack("<eeee", r / 64.0, g / 64.0, b / 64.0, 1.0)
+        if fmt == 2:
+            return struct.pack("<ffff", r / 255.0, g / 255.0, b / 255.0, 1.0)
+        raise AssertionError(f"unsupported test format {fmt}")
+
+    def _build_uncompressed_pool(self, path, width, height, fmt, mips, mode=2,
+                                 corrupt_mip=None):
+        tile = ttpf.tile_bytes(mode)
+        layout = ttpf.surface_layout(width, height, fmt, mips, tile)
+        eb = layout["element_bytes"]
+        # Build top mip gradient, then exact 2x2 box-downsample each child mip.
+        grids = {}
+        top = layout["mips"][0]
+        grids[0] = [
+            (min(255, x * 255 // max(1, top["pixels_w"] - 1)),
+             min(255, y * 255 // max(1, top["pixels_h"] - 1)),
+             (x * 7 + y * 13) & 0xFF)
+            for y in range(top["pixels_h"])
+            for x in range(top["pixels_w"])
+        ]
+        for k in range(1, mips):
+            pm, cm = layout["mips"][k - 1], layout["mips"][k]
+            pw, ph = pm["pixels_w"], pm["pixels_h"]
+            cw, ch = cm["pixels_w"], cm["pixels_h"]
+            parent = grids[k - 1]
+            cur = []
+            for y in range(ch):
+                y0, y1 = min(ph - 1, 2 * y), min(ph - 1, 2 * y + 1)
+                for x in range(cw):
+                    x0, x1 = min(pw - 1, 2 * x), min(pw - 1, 2 * x + 1)
+                    p00 = parent[y0 * pw + x0]
+                    p10 = parent[y0 * pw + x1]
+                    p01 = parent[y1 * pw + x0]
+                    p11 = parent[y1 * pw + x1]
+                    cur.append(tuple((p00[c] + p10[c] + p01[c] + p11[c] + 2) // 4 for c in range(3)))
+            grids[k] = cur
+
+        tiled = bytearray(layout["size"])
+        expected_payload = bytearray()
+        for k, mip in enumerate(layout["mips"]):
+            bw, bh = mip["blocks_w"], mip["blocks_h"]
+            pw, ph = mip["pixels_w"], mip["pixels_h"]
+            lin = bytearray(bw * bh * eb)
+            vis = bytearray()
+            g = grids[k]
+            for y in range(bh):
+                for x in range(bw):
+                    if x < pw and y < ph:
+                        r, gr, b = g[y * pw + x]
+                        if corrupt_mip == k:
+                            r, gr, b = 255 - r, 255 - gr, 255 - b
+                        px = self._encode_pixel(fmt, r, gr, b)
+                        vis += px
+                    else:
+                        # Non-zero sentinel in padding cells to verify cropping and masking.
+                        px = self._encode_pixel(fmt, 255, 0, 255)
+                    at = (y * bw + x) * eb
+                    lin[at:at + eb] = px
+            retile_to(layout, mip, lin, tiled)
+            expected_payload += vis
+
+        base = ttpf.align(16 + 24 + 32, 4096)
+        non_tail = min(7, layout["first_tail"])
+        rec = pack_etpf_record(width, height, mips - non_tail, non_tail, fmt, 1, 1, mode, base)
+        write_rds5_pool(path, [rec], [bytes(tiled)])
+        return layout, bytes(expected_payload)
+
+    def test_rdna2_sw_64k_d_4bpp_pattern_and_round_trip(self):
+        # Mesa addrlib GFX10_SW_64K_D_RBPLUS_PATINFO (RDNA2/Xbox Series): 4 BPP swaps
+        # bits 6..7 vs Navi 1x to (3, -3).
+        self.assertEqual(
+            ttpf.PATTERNS_64K[2],
+            (0, 0, 1, 2, -1, -2, 3, -3, -4, 4, -5, 5, -6, 6, -7, 7),
+        )
+        # Pixel (x=4, y=0) sets X2 (bit 6 -> +64 bytes); pixel (x=0, y=4) sets Y2 (bit 7 -> +128 bytes).
+        layout = ttpf.surface_layout(128, 128, 28, 1, tile=65536)
+        mip = layout["mips"][0]
+        tiled = bytearray(65536)
+        tiled[64:68] = b"\x11\x22\x33\x44"
+        tiled[128:132] = b"\x55\x66\x77\x88"
+        det = ttpf.detile(layout, mip, bytes(tiled))
+        self.assertEqual(det[4 * 4:4 * 4 + 4], b"\x11\x22\x33\x44")
+        self.assertEqual(det[(4 * 128) * 4:(4 * 128) * 4 + 4], b"\x55\x66\x77\x88")
+
+    def test_decode_pixels_all_validated_uncompressed_formats(self):
+        self.assertEqual(ttpf.ELEMENT_BYTES[11], 8)
+        for fmt in sorted(ttpf.UNCOMPRESSED_2D_FORMATS):
+            with self.subTest(fmt=fmt):
+                raw = self._encode_pixel(fmt, 64, 128, 192, 255)
+                px = ttpf.decode_pixels(fmt, raw, 1, 1)
+                self.assertEqual(len(px), 1)
+                r, g, b = px[0]
+                if fmt in (61, 65, 56):
+                    self.assertAlmostEqual(r, 64.0, places=3)
+                    self.assertAlmostEqual(g, 64.0, places=3)
+                    self.assertAlmostEqual(b, 64.0, places=3)
+                elif fmt == 49:
+                    self.assertEqual((r, g, b), (64.0, 128.0, 0.0))
+                elif fmt == 54:
+                    self.assertAlmostEqual(r, 1.0, places=3)
+                    self.assertAlmostEqual(g, 1.0, places=3)
+                    self.assertAlmostEqual(b, 1.0, places=3)
+                elif fmt == 10:
+                    self.assertAlmostEqual(r, 1.0, places=3)
+                    self.assertAlmostEqual(g, 2.0, places=3)
+                    self.assertAlmostEqual(b, 3.0, places=3)
+                else:  # 11, 28, 29, 87, 91
+                    self.assertAlmostEqual(r, 64.0, places=3)
+                    self.assertAlmostEqual(g, 128.0, places=3)
+                    self.assertAlmostEqual(b, 192.0, places=3)
+        # Non-finite float16 values clamp cleanly in _hdr_tonemap.
+        self.assertEqual(ttpf._hdr_tonemap(float("nan")), 0.0)
+        self.assertEqual(ttpf._hdr_tonemap(float("inf")), 255.0)
+        self.assertEqual(ttpf._hdr_tonemap(float("-inf")), -255.0)
+
+    def test_uncompressed_2d_check_export_and_scan(self):
+        import io
+        from contextlib import redirect_stdout, redirect_stderr
+
+        cases = [
+            # (name, w, h, fmt, mips, mode, expect_tail_control)
+            ("dxgi11_1mip_4k", 8, 4, 11, 1, 2, False),
+            ("dxgi11_multi_4k", 32, 32, 11, 4, 2, True),
+            ("dxgi28_multi_64k", 256, 256, 28, 5, 0, True),
+            ("dxgi28_odd_4k", 17, 13, 28, 4, 2, True),
+            ("dxgi49_multi_4k", 64, 64, 49, 4, 2, True),
+            ("dxgi56_multi_4k", 64, 64, 56, 4, 2, True),
+            ("dxgi54_multi_64k", 128, 128, 54, 3, 0, False),
+            ("dxgi61_multi_64k", 256, 256, 61, 4, 0, True),
+            ("dxgi65_multi_4k", 64, 64, 65, 5, 2, True),
+            ("dxgi87_multi_4k", 64, 64, 87, 5, 2, True),
+            ("dxgi10_multi_4k", 32, 32, 10, 4, 2, True),
+        ]
+        for name, w, h, fmt, mips, mode, expect_ctrl in cases:
+            with self.subTest(case=name):
+                path = os.path.join(self.tmp.name, f"{name}.ttpf")
+                _, expected_payload = self._build_uncompressed_pool(path, w, h, fmt, mips, mode)
+                pool = ttpf.Pool(path)
+                self.addCleanup(pool.close)
+
+                buf = io.StringIO()
+                with redirect_stdout(buf):
+                    rc = ttpf.check(pool, 0)
+                res = json.loads(buf.getvalue())
+                self.assertEqual(rc, 0, res)
+                if mips > 1:
+                    self.assertLessEqual(res["max_error"], 1.0, res)
+                if expect_ctrl and res["tail_origin_control"] is not None:
+                    self.assertGreater(res["tail_origin_control"], 6.0, res)
+
+                out_dds = os.path.join(self.tmp.name, f"{name}.dds")
+                with redirect_stdout(io.StringIO()):
+                    erc = ttpf.export(pool, 0, out_dds)
+                self.assertEqual(erc, 0)
+                with open(out_dds, "rb") as f:
+                    dds = f.read()
+                self.assertEqual(dds[:4], b"DDS ")
+                flags, dh, dw, pitch = struct.unpack_from("<IIII", dds, 8)
+                self.assertEqual(flags & 0x8, 0x8)  # DDSD_PITCH for uncompressed
+                self.assertEqual((dw, dh, pitch), (w, h, w * ttpf.ELEMENT_BYTES[fmt]))
+                dxgi_fmt, dim, misc, arr, _ = struct.unpack_from("<IIIII", dds, 128)
+                self.assertEqual((dxgi_fmt, dim, misc, arr), (fmt, 3, 0, 1))
+                self.assertEqual(dds[148:], expected_payload)
+
+                if fmt == 11:
+                    scan_out = os.path.join(self.tmp.name, f"scan_{name}.json")
+                    with redirect_stdout(io.StringIO()):
+                        ttpf.scan_pools([path], scan_out)
+                    with open(scan_out, encoding="utf-8") as f:
+                        total = json.load(f)["total"]
+                    self.assertEqual((total["unsupported_format"], total["format11"]), (0, 0))
+                    self.assertEqual((total["after_full"], total["after_skip"]), (1, 0))
+
+        # Negative control 1: corrupted child mip fails check (rc == 1).
+        bad = os.path.join(self.tmp.name, "dxgi28_bad.ttpf")
+        self._build_uncompressed_pool(bad, 256, 256, 28, 4, mode=0, corrupt_mip=2)
+        pool_bad = ttpf.Pool(bad)
+        self.addCleanup(pool_bad.close)
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rc = ttpf.check(pool_bad, 0)
+        res = json.loads(buf.getvalue())
+        self.assertEqual(rc, 1, res)
+        self.assertGreater(res["max_error"], 50.0)
+
+        # Negative control 2: unvalidated uncompressed format (DXGI 2, R32G32B32A32_FLOAT)
+        # is still blocked in check (rc == 2) and refused by export (rc == 2).
+        unval = os.path.join(self.tmp.name, "dxgi2_unval.ttpf")
+        self._build_uncompressed_pool(unval, 16, 16, 2, 2, mode=2)
+        pool_u = ttpf.Pool(unval)
+        self.addCleanup(pool_u.close)
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(ttpf.check(pool_u, 0), 2)
+        with redirect_stderr(io.StringIO()):
+            self.assertEqual(ttpf.export(pool_u, 0, os.path.join(self.tmp.name, "dxgi2.dds")), 2)
 
 
 if __name__ == "__main__":

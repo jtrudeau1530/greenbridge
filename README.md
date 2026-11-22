@@ -13,6 +13,7 @@
 </h4>
 
 <p align="center">
+  <a href="docs/i18n/README.md">Other languages</a> |
   <a href="#project-status">Status</a> |
   <a href="#how-to-build">How to build</a> |
   <a href="#how-it-works">How it works</a> |
@@ -43,17 +44,18 @@ work on booting can start as soon as one is available to a developer.
 
 | What | Status |
 |---|---|
+| Booting, story mode, anything playable | ❌ No |
 | Finding and checking your copy (Xbox Series 1.0.2.1) | ✅ Works |
 | Shaders: carve, unpack native RDNA2 code, disassemble | ✅ All 26,503 |
-| Shaders: RDNA2 → SPIR-V translation | ✅ **All 26,503** (disassembled with LLVM 21; LLVM 23 leaves 1,471 rejected for now, #644): 2,236 VS, 12,101 PS, 2,689 CS, 9,282 mesh, 195 geometry. All pass `spirv-val`, with a per-shader metadata index for pipeline creation. ⚠️ 21,545 are wave64: exact on 64-wide subgroups (AMD). On 32-wide subgroups (NVIDIA, Intel), compute and mesh shaders are exact with wave64 emulation (`--wave64-emulate`, on by default there); cross-half wave ops in vertex, pixel and geometry shaders are still approximate |
+| Shaders: RDNA2 → SPIR-V translation | ✅ **All 26,503 translated**: 2,236 VS, 12,101 PS, 2,689 CS, 9,282 mesh, 195 geometry, with a per-shader metadata index for pipeline creation. All 26,503 passed `spirv-val` in the [LLVM 23.1.5 Linux run at `c432cdc`](https://github.com/ItsNotRexed/Leonida/issues/644#issuecomment-7072972586). A [full-corpus run at `43d4703`](https://github.com/ItsNotRexed/Leonida/issues/881#issuecomment-7075507328) also validated all 26,503 after `dcd8ecf` fixed the SPIR-V ID bound; the intervening `dedd75c` run was 26,501. ⚠️ 21,545 are wave64: exact on 64-wide subgroups (AMD). On 32-wide subgroups (NVIDIA, Intel), compute and mesh shaders are exact with wave64 emulation (`--wave64-emulate`, on by default there); cross-half wave ops in vertex, pixel and geometry shaders are still approximate |
 | Shader translator checked on a real GPU | ⚠️ The hand-written GPU tests (vertex fetch, texture sampling, exports, ALU ops, partial-register ops, barycentrics, wave-uniform branches, compute LDS/barriers/buffer stores, wave64 masks) have been run on more than 30 GPU and driver combinations, with results in [#166](https://github.com/ItsNotRexed/Leonida/issues/166): NVIDIA Turing, Ampere, Ada and Blackwell (Windows and Linux); AMD GCN3, RDNA1, RDNA2, RDNA3 and RDNA4 (Windows driver and RADV); Intel Gen9 (ANV); Apple M1 (MoltenVK, no geometry or mesh stages); and Mesa llvmpipe. Wave64 tests need 64-wide subgroups (AMD) or `LEONIDA_W64_EMULATE=1`. These are small test shaders: the game's own shaders are checked by `spirv-val` and by driver pipeline creation (`vk_pipeline_check`), not by their output |
 | Models (OBJ with real names, UVs, material references) | ✅ Exported. Not all layouts are decoded yet |
-| Texture dictionaries and world texture pools (DDS) | ✅ Exported. Pool entries stored as BCPack are still skipped by the export; a clean-room decoder (`tools/bcpack.py`) rebuilds BC1, BC3, BC4 and BC5, and is not wired into `rpf9dump` yet ([notes](docs/textures.md)) |
+| Texture dictionaries and world texture pools (DDS) | ✅ Exported. Pool entries stored as BCPack are still skipped by the export; a clean-room decoder (`tools/bcpack.py`) rebuilds BC1, BC3, BC4, BC5, BC6H and BC7 (most BC6H/BC7 chunks need a local history table, which the repo does not ship), and is not wired into `rpf9dump` yet ([notes](docs/textures.md)) |
 | Audio banks (AWC: Opus, XMA2) | ✅ Exported whole. Opus repackaged **losslessly** as Ogg Opus; PCM (codec 0/2) as WAV; XMA2 decoded with ffmpeg. `--wav` adds 16-bit PCM WAV ([notes](docs/audio.md)) |
 | Music/radio config | ? Measured. **1,589** audio-config records with exact durations and AWC stream ids; station grouping and content-id lists; no per-track start offsets ([notes](docs/audio_config.md)) |
-| PE loader and import shims | ⚠️ Runs a stand-in executable end to end (`gta6rt --run`: CRT startup, statics, heap, files, threads, GDK imports through the shims, exit code back). Untested against the real executable |
-| Xbox D3D12 → Vulkan | ⚠️ In progress. A Vulkan-backed device behind the Xbox-ABI proxy creates queues, command lists, fences, descriptor heaps, committed and reserved resources, render-target and depth views, and texture views and samplers (which go into the bindless set). Barriers, clears, uploads, copies (BC included) and colour resolves run on Vulkan, checked on one GPU. No buffer views, root signatures, pipelines, draws or swapchain yet ([plan](docs/d3d12_vulkan.md)) |
-| Booting, story mode, anything playable | ❌ No |
+| PE loader and import shims | ⚠️ Runs a stand-in executable end to end (`gta6rt --run`: CRT startup, statics, heap, files, threads, GDK imports through the shims, exit code back). Controllers through a GameInput shim on SDL3 (any controller SDL supports, rumble, DualSense trigger effects and lightbar; built when SDL3 is installed or with `-DLEONIDA_SDL3_FETCH=ON`, [notes](docs/gameinput.md)). `--trace-d3d12` logs every D3D12 call and its outcome for the first boot. Untested against the real executable |
+| Xbox D3D12 → Vulkan | ⚠️ In progress. A Vulkan-backed device behind the Xbox-ABI proxy creates queues, command lists, fences, descriptor heaps, committed and reserved resources, render-target and depth views (3D targets included), texture views and samplers (2D, cube and 3D views, the depth and stencil planes of depth-stencil textures, packed formats such as B5G6R5, B4G4R4A4 and R9G9B9E5; they go into the bindless set), and query heaps. Barriers, clears, uploads, copies (BC included), colour resolves, predication, CPU-side texture reads and writes, and occlusion, timestamp and pipeline-statistics queries run on Vulkan, checked on one GPU. No buffer views, root signatures, pipelines, draws, placed resources, 1D textures or swapchain yet ([plan](docs/d3d12_vulkan.md)) |
+
 
 ## How to build
 
@@ -67,9 +69,9 @@ The port isn't downloaded ready-made. It's built on your PC from your own copy.
    and otherwise tells you what to do.
 3. Double-click **`Build.bat`**.
 
-It finds your copy of the game by itself: it looks in Downloads, Desktop, Documents, Games, your home folder and
-the top of every drive, two folders deep. It recognises the version from a few file sizes, without reading
-anything large. If you have more than one copy it asks which one, and if it finds none it asks you to paste the
+It finds your copy of the game by itself: it looks in Downloads, Desktop, Documents (also where Windows keeps them,
+such as in OneDrive), Games, your home folder and the top of every drive, two folders deep. It recognises the
+version from a few file sizes, without reading anything large. If you have more than one copy it asks which one, and if it finds none it asks you to paste the
 folder. Before starting it checks that everything below is installed and that there is enough free space, and it
 lists anything missing in one go. The result goes to `Documents\Leonida`. A stopped build continues where it left
 off.
@@ -96,7 +98,9 @@ Your game folder is the one that holds `MicrosoftGame.Config` and the `.rpf` arc
 
 ```powershell
 python -I make_game.py --find                          # list the copies found on this PC
+python -I make_game.py --pick                          # choose the game folder in a folder dialog
 python -I make_game.py --check                         # check your copy, build nothing
+python -I make_game.py --check --full-check            # also compare SHA-256 of every file (slow)
 python -I make_game.py --game "D:\path\to\your\package" --out "D:\Games\Leonida" --work "E:\leonida-work"
 python -I make_game.py --stages shaders,assets         # only some stages
 python -I make_game.py --game "D:\path\to\your\package" --wav   # also decode Opus to PCM WAV (large)
@@ -107,9 +111,23 @@ python -I make_game.py --wave64-emulate off            # auto (default), on or o
 (see "Wave64 emulation" in [docs/design.md](docs/design.md)). NVIDIA and Intel GPUs have 32-wide subgroups and need
 it. The default, `auto`, asks `vulkaninfo` (part of the Vulkan SDK) and turns it on unless every GPU reports 64-wide
 subgroups, or when it can't tell; it also turns it on when the GPU the runtime would use can't be made to run
-compute and mesh shaders 64-wide. The mode is saved next to the translated shaders, and changing it translates them
+compute and mesh shaders 64-wide. One exception keeps it off: when the runtime's GPU is an RDNA2 card or iGPU
+(RX 6000, Ryzen 6000/7000/9000 graphics) on AMD's Windows driver and runs wave64 natively, because that driver's
+shader compiler crashes on emulated LDS code (#857); an Intel iGPU next to an RX 6000 card would otherwise turn it on.
+The mode is saved next to the translated shaders, and changing it translates them
 again. With `auto`, a work folder that previously used emulation keeps it for later translations and retries, even if
 the current GPU supports native wave64. Use `--wave64-emulate off` to translate it natively.
+
+Four fallback flags are forwarded to the translator the same way, saved next to the translated shaders, and changing
+them translates them again: `--no-float-controls` (drop `SignedZeroInfNanPreserve`, for devices whose pipeline check
+skips a shader without `shaderSignedZeroInfNanPreserveFloat32`; needs PR #664's translator flag), `--bary-fallback`
+(read raw barycentrics from an interpolated input, for devices without `VK_KHR_fragment_shader_barycentric`),
+`--texel-offset-fallback` (fold `image_sample*_o` offsets into the coordinate, for devices without
+`VK_KHR_maintenance8`) and `--mesh-compute` (mesh shaders as compute, for devices without `VK_EXT_mesh_shader`).
+Each is documented in [docs/design.md](docs/design.md).
+
+The build records which llvm-mc command and version produced the disassembly. Changing either, or reusing a work
+folder that predates this record, reruns disassembly and translation while keeping the extracted shader inputs.
 
 The build records which translator sources produced the shaders. A change to those files reruns translation using the
 saved disassembly. Older work folders need one translation after upgrading to record this information.
@@ -133,9 +151,28 @@ cmake --build runtime/build/linux --parallel
 
 Pass the directory containing `index.json` and the translated SPIR-V files to `vk_pipeline_check`.
 
-`make_game.py` runs on Linux too, without the `runtime` stage, which builds on Windows only for now: without
-`--stages` it is left out, and asking for it fails before any work starts. The `pipelines` stage uses the
-`vk_pipeline_check` built above (`runtime/build/linux`, or `runtime/build`).
+`make_game.py` runs on Linux too. The `pipelines` stage uses the `vk_pipeline_check` built above
+(`runtime/build/linux`, or `runtime/build`), and builds it there itself before any other work if it is missing.
+
+### Running the loader on Linux
+
+The loader is a Windows program and runs under Wine or Proton; CI runs its tests under Wine on every change to
+`runtime/` (the `wine` job of the Runtime workflow). On Linux the `runtime` stage cross-builds it into
+`runtime/build/windows` with clang-cl and lld-link (LLVM 19+, but not 22.1.7 or 22.1.8, see [docs/testing.md](docs/testing.md#known-problems); plain names, or all five LLVM tools with one version
+suffix such as `clang-cl-21`) against the MSVC CRT and Windows SDK that
+[xwin](https://github.com/Jake-Shadle/xwin) lays out, in `XWIN_DIR` or `~/.local/share/xwin-sdk`
+([docs/testing.md](docs/testing.md#the-windows-runtime-on-linux-under-wine-or-proton) has the one-time `xwin`
+command). Without them the stage is left out of the default stages, and asking for it lists what is missing before
+any work starts. A Windows build made elsewhere works too, such as the `runtime-windows` artifact of that workflow's
+`windows` job, unzipped:
+
+```sh
+python3 -I make_game.py --runtime-build ~/Downloads/runtime-windows
+```
+
+Either way it copies `gta6rt.exe` and `gta6rt_tls_host.dll` into `--out` and writes `gta6rt.sh` next to them, which
+starts `gta6rt.exe` with `wine`, or with the Wine named by `WINE` (for Proton, its `files/bin/wine`). The same option
+skips the build on Windows.
 
 ## How it works
 

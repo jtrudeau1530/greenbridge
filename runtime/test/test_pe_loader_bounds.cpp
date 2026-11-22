@@ -628,6 +628,267 @@ void test_boundary_exact_fits() {
     }
 }
 
+// HIGHLOW (type 3) relocations: a 32-bit absolute address, which the x64 Windows loader applies too. The image
+// prefers base 0x10000, the lowest address VirtualAlloc hands out; the test holds that address so the loader has to
+// map the image higher, which makes the delta positive. The relocation table sits at the start of .text (RVA 0x1000)
+// and fixes up the dword at RVA 0x1100.
+std::vector<uint8_t> make_highlow_image(uint32_t stored, uint16_t type = IMAGE_REL_BASED_HIGHLOW,
+                                        uint64_t image_base = 0x10000) {
+    auto img = make_base_image(0x2000, 0x400);
+    std::fill(img.begin() + 0x200, img.end(), uint8_t{0});
+    auto* nt = nt_header_of(img);
+    nt->OptionalHeader.ImageBase = image_base;
+    auto& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC];
+    dir.VirtualAddress = 0x1000;
+    dir.Size = sizeof(IMAGE_BASE_RELOCATION) + 2 * sizeof(uint16_t);
+    auto* block = reinterpret_cast<IMAGE_BASE_RELOCATION*>(img.data() + 0x200);
+    block->VirtualAddress = 0x1000;
+    block->SizeOfBlock = dir.Size;
+    auto* entries = reinterpret_cast<uint16_t*>(block + 1);
+    entries[0] = static_cast<uint16_t>((type << 12) | 0x100);
+    entries[1] = static_cast<uint16_t>(IMAGE_REL_BASED_ABSOLUTE << 12);  // padding, as linkers write it
+    std::memcpy(img.data() + 0x300, &stored, sizeof(stored));           // RVA 0x1100
+    return img;
+}
+
+void test_highlow_relocations() {
+    std::printf("\n--- HIGHLOW (32-bit) base relocations ---\n");
+    // Hold the preferred base. If something else already holds it, the image is relocated all the same.
+    void* hold = VirtualAlloc(reinterpret_cast<void*>(0x10000), 0x2000, MEM_RESERVE, PAGE_NOACCESS);
+
+    // Case 1: the dword names RVA 0x1100 of an image at 0x10000. After the move it must name RVA 0x1100 of the new
+    // base when that fits in 32 bits; otherwise the load must be refused rather than truncated.
+    {
+        auto file_path = write_temp_image(make_highlow_image(0x10000 + 0x1100));
+        try {
+            rt::Loader loader(g_temp_dir);
+            rt::Module& m = loader.load(file_path);
+            const uint64_t want = reinterpret_cast<uint64_t>(m.base) + 0x1100;
+            check_condition(m.relocated, "HIGHLOW image was relocated away from its held base");
+            check_condition(want <= 0xFFFFFFFFull, "HIGHLOW image mapped low enough for a 32-bit address",
+                            "mapped at " + std::to_string(reinterpret_cast<uint64_t>(m.base)) + " yet accepted");
+            uint32_t got = 0;
+            std::memcpy(&got, m.base + 0x1100, sizeof(got));
+            check_condition(got == static_cast<uint32_t>(want), "HIGHLOW dword now names RVA 0x1100 of the new base",
+                            "got " + std::to_string(got) + ", want " + std::to_string(want));
+        } catch (const std::exception& e) {
+            const std::string msg = e.what();
+            // Only acceptable when the new base is too high for the 32-bit address.
+            check_condition(msg.find("does not fit at this base") != std::string::npos,
+                            "HIGHLOW image mapped above 4 GiB is refused with the 32-bit message", "threw: " + msg);
+        }
+    }
+
+    // Case 2: a dword near the top of the 32-bit range overflows for any base above 0x10000: refused, not wrapped.
+    expect_loader_rejection("HIGHLOW relocation past 4 GiB is refused, not truncated", make_highlow_image(0xFFFFFFF0u),
+                            "does not fit at this base");
+
+    // Case 3: other 32-bit forms (HIGH, type 1) are still refused by name.
+    expect_loader_rejection("HIGH (type 1) relocation is still unsupported",
+                            make_highlow_image(0, IMAGE_REL_BASED_HIGH), "unsupported relocation type 1");
+
+    // Case 4: the fix-up itself, whatever the address space looks like. The preferred base is a region this test
+    // holds, so the image lands elsewhere but usually near it; the delta is then small, and a dword in the middle of
+    // the 32-bit range must move by exactly that delta. (A delta too large for it must be refused, as in case 2.)
+    if (void* near_hold = VirtualAlloc(nullptr, 0x2000, MEM_RESERVE, PAGE_NOACCESS)) {
+        const uint64_t preferred = reinterpret_cast<uint64_t>(near_hold);
+        constexpr uint32_t stored = 0x80000000u;
+        auto file_path = write_temp_image(make_highlow_image(stored, IMAGE_REL_BASED_HIGHLOW, preferred));
+        try {
+            rt::Loader loader(g_temp_dir);
+            rt::Module& m = loader.load(file_path);
+            const int64_t delta = static_cast<int64_t>(reinterpret_cast<uint64_t>(m.base) - preferred);
+            const int64_t want = static_cast<int64_t>(stored) + delta;
+            uint32_t got = 0;
+            std::memcpy(&got, m.base + 0x1100, sizeof(got));
+            check_condition(m.relocated && want >= 0 && want <= 0xFFFFFFFFll,
+                            "HIGHLOW fix-up: relocated by a delta that fits", "delta " + std::to_string(delta));
+            check_condition(got == static_cast<uint32_t>(want), "HIGHLOW fix-up: the dword moved by exactly the delta",
+                            "got " + std::to_string(got) + ", want " + std::to_string(want) + ", delta " +
+                                std::to_string(delta));
+        } catch (const std::exception& e) {
+            const std::string msg = e.what();
+            check_condition(msg.find("does not fit at this base") != std::string::npos,
+                            "HIGHLOW fix-up: only a too-large delta is refused", "threw: " + msg);
+        }
+        VirtualFree(near_hold, 0, MEM_RELEASE);
+    }
+
+    if (hold) VirtualFree(hold, 0, MEM_RELEASE);
+}
+
+// PE/COFF spec, optional header: NumberOfRvaAndSizes is "the number of data-directory entries in the remainder of
+// the optional header". Entries past it are not directories, whatever bytes they hold.
+void test_directory_count() {
+    std::printf("\n--- NumberOfRvaAndSizes bounds the data directories ---\n");
+    auto img = make_base_image(0x2000, 0x400);
+    auto* nt = nt_header_of(img);
+    nt->OptionalHeader.NumberOfRvaAndSizes = IMAGE_DIRECTORY_ENTRY_IMPORT;  // only the export entry is a directory
+    nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT] = {0xFFFFF000u, sizeof(IMAGE_IMPORT_DESCRIPTOR)};
+    nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT] = {0xFFFFF000u, 0x20};
+    expect_loader_success("Stale entries past NumberOfRvaAndSizes are not read as directories", img);
+}
+
+// A forwarder "kernel32.#65537" names an ordinal no export table can hold (ordinals are 16 bits). It must not be
+// truncated to ordinal 1 and bound to whatever kernel32 exports there.
+void test_forwarder_ordinal_range() {
+    std::printf("\n--- Forwarder ordinal range ---\n");
+    auto dll = make_base_image(0x2000, 0x400);
+    std::fill(dll.begin() + 0x200, dll.end(), uint8_t{0});
+    auto* dnt = nt_header_of(dll);
+    dnt->OptionalHeader.ImageBase = 0x150000000ull;
+    dnt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT] = {0x1000, 0x100};
+    auto* ed = reinterpret_cast<IMAGE_EXPORT_DIRECTORY*>(dll.data() + 0x200);  // RVA 0x1000
+    ed->Base = 1;
+    ed->NumberOfFunctions = 1;
+    ed->NumberOfNames = 1;
+    ed->AddressOfFunctions = 0x1040;
+    ed->AddressOfNames = 0x1050;
+    ed->AddressOfNameOrdinals = 0x1060;
+    const uint32_t forwarder_rva = 0x1080, name_rva = 0x10C0;
+    std::memcpy(dll.data() + 0x240, &forwarder_rva, 4);
+    std::memcpy(dll.data() + 0x250, &name_rva, 4);
+    std::memcpy(dll.data() + 0x280, "kernel32.#65537", 16);
+    std::memcpy(dll.data() + 0x2C0, "F", 2);
+    {
+        std::ofstream out(g_temp_dir / "fwd_ord.dll", std::ios::binary);
+        out.write(reinterpret_cast<const char*>(dll.data()), static_cast<std::streamsize>(dll.size()));
+    }
+
+    auto exe = make_base_image(0x2000, 0x400);
+    std::fill(exe.begin() + 0x200, exe.end(), uint8_t{0});
+    auto* ent = nt_header_of(exe);
+    ent->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT] = {0x1000, 2 * sizeof(IMAGE_IMPORT_DESCRIPTOR)};
+    auto* d = reinterpret_cast<IMAGE_IMPORT_DESCRIPTOR*>(exe.data() + 0x200);
+    d->OriginalFirstThunk = 0x1040;
+    d->Name = 0x1080;
+    d->FirstThunk = 0x1060;
+    const uint64_t hint_name = 0x1090;
+    std::memcpy(exe.data() + 0x240, &hint_name, 8);
+    std::memcpy(exe.data() + 0x260, &hint_name, 8);
+    std::memcpy(exe.data() + 0x280, "fwd_ord.dll", 12);
+    std::memcpy(exe.data() + 0x292, "F", 2);  // after the 2-byte hint
+
+    auto path = write_temp_image(exe);
+    try {
+        rt::Loader loader(g_temp_dir);
+        rt::Module& m = loader.load(path);
+        const bool one = m.imports.size() == 1;
+        check_condition(one && m.imports[0].binding == rt::Binding::Unimplemented,
+                        "Forwarder to ordinal 65537 is not truncated to a host ordinal",
+                        one ? "bound as " + std::to_string(static_cast<int>(m.imports[0].binding))
+                            : std::to_string(m.imports.size()) + " imports");
+    } catch (const std::exception& e) {
+        fail("Forwarder to ordinal 65537 is not truncated to a host ordinal", e.what());
+    }
+}
+
+void test_headers_and_reloc_tail_bounds() {
+    std::printf("\n--- Headers vs SizeOfHeaders and Truncated Relocation Block Header ---\n");
+
+    // 1. e_lfanew + sizeof(IMAGE_NT_HEADERS64) > SizeOfImage with SizeOfHeaders < e_lfanew.
+    //    Previously passed map_image() checks and crashed dereferencing m->base + e_lfanew.
+    {
+        std::vector<uint8_t> bytes(0x2000, 0);
+        auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(bytes.data());
+        dos->e_magic = IMAGE_DOS_SIGNATURE;
+        dos->e_lfanew = 0x1000;
+        auto* nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(bytes.data() + dos->e_lfanew);
+        nt->Signature = IMAGE_NT_SIGNATURE;
+        nt->FileHeader.Machine = IMAGE_FILE_MACHINE_AMD64;
+        nt->FileHeader.NumberOfSections = 0;
+        nt->FileHeader.SizeOfOptionalHeader = sizeof(IMAGE_OPTIONAL_HEADER64);
+        nt->OptionalHeader.Magic = IMAGE_NT_OPTIONAL_HDR64_MAGIC;
+        nt->OptionalHeader.ImageBase = 0x140000000ull;
+        nt->OptionalHeader.SectionAlignment = 0x1000;
+        nt->OptionalHeader.FileAlignment = 0x200;
+        nt->OptionalHeader.SizeOfImage = 0x1000;
+        nt->OptionalHeader.SizeOfHeaders = 0x200;
+        nt->OptionalHeader.NumberOfRvaAndSizes = IMAGE_NUMBEROF_DIRECTORY_ENTRIES;
+
+        auto path = write_temp_image(bytes);
+        bool threw = false;
+        try {
+            rt::Loader loader(g_temp_dir);
+            loader.load(path);
+        } catch (const std::runtime_error&) {
+            threw = true;
+        }
+        check_condition(threw, "NT headers past SizeOfHeaders/SizeOfImage are rejected cleanly");
+    }
+
+    // 2. SizeOfHeaders covers NT headers but truncates the section table.
+    {
+        auto bytes = make_base_image(0x2000, 0x400);
+        auto* nt = nt_header_of(bytes);
+        // e_lfanew(0x80) + sizeof(IMAGE_NT_HEADERS64)(0x108) = 0x188; section header ends at 0x1B0.
+        nt->OptionalHeader.SizeOfHeaders = 0x190;
+        auto path = write_temp_image(bytes);
+        bool threw = false;
+        try {
+            rt::Loader loader(g_temp_dir);
+            loader.load(path);
+        } catch (const std::runtime_error&) {
+            threw = true;
+        }
+        check_condition(threw, "Section table extending past SizeOfHeaders is rejected cleanly");
+    }
+
+    // 3. Relocation directory with < 8 bytes remaining at the exact end of SizeOfImage (forced relocation).
+    {
+        void* occupied = VirtualAlloc(nullptr, 0x2000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        check_condition(occupied != nullptr, "Reserved preferred base for truncated reloc test");
+        if (occupied) {
+            auto bytes = make_base_image(0x2000, 0x400);
+            auto* nt = nt_header_of(bytes);
+            nt->OptionalHeader.ImageBase = reinterpret_cast<uint64_t>(occupied);
+            nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC] = {0x1FFC, 4};
+            auto path = write_temp_image(bytes);
+            bool threw = false;
+            try {
+                rt::Loader loader(g_temp_dir);
+                loader.load(path);
+            } catch (const std::runtime_error&) {
+                threw = true;
+            }
+            VirtualFree(occupied, 0, MEM_RELEASE);
+            check_condition(threw, "Truncated 4-byte relocation block at end of image is rejected cleanly");
+        }
+    }
+
+    // 4. Valid 8-byte relocation block followed by 4 trailing bytes (remaining < sizeof(IMAGE_BASE_RELOCATION)).
+    {
+        void* occupied = VirtualAlloc(nullptr, 0x2000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        check_condition(occupied != nullptr, "Reserved preferred base for trailing reloc bytes test");
+        if (occupied) {
+            auto bytes = make_base_image(0x2000, 0x1400);
+            auto* nt = nt_header_of(bytes);
+            nt->OptionalHeader.ImageBase = reinterpret_cast<uint64_t>(occupied);
+            auto* sec = IMAGE_FIRST_SECTION(nt);
+            sec->VirtualAddress = 0x1000;
+            sec->Misc.VirtualSize = 0x1000;
+            sec->PointerToRawData = 0x400;
+            sec->SizeOfRawData = 0x1000;
+            // Place a 12-byte reloc dir at RVA 0x1FF4 (raw offset 0x13F4): 8-byte block + 4 trailing bytes.
+            nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC] = {0x1FF4, 12};
+            IMAGE_BASE_RELOCATION hdr{};
+            hdr.VirtualAddress = 0x1000;
+            hdr.SizeOfBlock = sizeof(IMAGE_BASE_RELOCATION);
+            std::memcpy(bytes.data() + 0x13F4, &hdr, sizeof(hdr));
+            auto path = write_temp_image(bytes);
+            bool threw = false;
+            try {
+                rt::Loader loader(g_temp_dir);
+                loader.load(path);
+            } catch (const std::runtime_error&) {
+                threw = true;
+            }
+            VirtualFree(occupied, 0, MEM_RELEASE);
+            check_condition(threw, "Trailing 4 bytes after valid relocation block are rejected cleanly");
+        }
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -635,7 +896,8 @@ int main() {
 
     const char* env_dir = std::getenv("LEONIDA_TEST_DIR");
     g_temp_dir = env_dir ? std::filesystem::path(env_dir)
-                         : std::filesystem::temp_directory_path() / "leonida_pe_bounds_test";
+                         : std::filesystem::temp_directory_path() /
+                               ("leonida_pe_bounds_test_" + std::to_string(GetCurrentProcessId()));
     std::filesystem::create_directories(g_temp_dir);
 
     try {
@@ -644,6 +906,10 @@ int main() {
         test_import_table_null_termination();
         test_virtual_address_range_wrapping();
         test_boundary_exact_fits();
+        test_highlow_relocations();
+        test_directory_count();
+        test_forwarder_ordinal_range();
+        test_headers_and_reloc_tail_bounds();
     } catch (const std::exception& e) {
         std::printf("FATAL: Unhandled exception during test execution: %s\n", e.what());
         ++g_failures;

@@ -271,17 +271,6 @@ def check_supported(ins):
     return None
 
 
-def _inline_float_bits(value):
-    """Bits for an LLVM integer token used as a float source.
-
-    llvm-mc prints AMD inline constants 0..64 and -16..-1 as bare integers; those are floats in a
-    float-operand position. Other integers are 32-bit literals.
-    """
-    if 0 <= value <= 64 or -16 <= value <= -1:
-        return float_to_bits(float(value))
-    return value & MASK32
-
-
 # ---- machine ---------------------------------------------------------------------------------
 
 class Machine:
@@ -418,7 +407,7 @@ class Machine:
                                   "multi-dword SGPR source is not modelled")
             bits = self.sgpr.get(arg["r"], 0)
         elif kind == "imm":
-            bits = _inline_float_bits(arg["v"])
+            bits = arg["v"] & MASK32  # integer inline constants are bit patterns; float ones parse as "fimm"
         elif kind == "fimm":
             bits = float_to_bits(arg["v"])
         elif kind == "special":
@@ -787,24 +776,30 @@ def main(argv=None):
     ap.add_argument("--json", action="store_true", help="print the result as JSON")
     args = ap.parse_args(argv)
 
+    inputs = {"lanes": args.lanes, "vcc": args.vcc}
+    if args.lanes == 1:
+        inputs["lane"] = args.lane
+    if args.exec is not None:
+        inputs["exec"] = args.exec
+    for kind, assignments, syntax in (
+        ("sgpr", args.sgpr, "N=VALUE"),
+        ("vgpr", args.vgpr, "N=VALUE[,VALUE...]"),
+    ):
+        for item in assignments:
+            try:
+                register, text = item.split("=", 1)
+                index = _value(register)
+                value = _value(text) if kind == "sgpr" else _vgpr_value(text, args.lanes)
+            except (ValueError, argparse.ArgumentTypeError):
+                ap.exit(2, f"error: --{kind} expects {syntax}, got {item!r}\n")
+            inputs.setdefault(kind, {})[index] = value
+
     if args.parse_only:
         try:
             return _print_parse_report(args.listing)
         except (CpuRefError, OSError) as e:
             print(f"error: {e}", file=sys.stderr)
             return 1
-
-    inputs = {"lanes": args.lanes, "vcc": args.vcc}
-    if args.lanes == 1:
-        inputs["lane"] = args.lane
-    if args.exec is not None:
-        inputs["exec"] = args.exec
-    for item in args.sgpr:
-        n, value = item.split("=", 1)
-        inputs.setdefault("sgpr", {})[int(n, 0)] = int(value, 0)
-    for item in args.vgpr:
-        n, value = item.split("=", 1)
-        inputs.setdefault("vgpr", {})[int(n, 0)] = _vgpr_value(value, args.lanes)
 
     try:
         result = run(args.listing, inputs)
@@ -831,4 +826,8 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
+    try:  # a redirected stdout is strict ANSI code page under -I; write '?' for what it cannot encode
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
     sys.exit(main())

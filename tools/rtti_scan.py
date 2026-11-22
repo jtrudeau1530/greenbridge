@@ -22,6 +22,9 @@ import struct
 import sys
 import tempfile
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from file_mode import published_mode  # noqa: E402
+
 
 
 IMAGE_SCN_MEM_EXECUTE = 0x20000000
@@ -173,7 +176,7 @@ def scan_pe64_rtti(data: bytes) -> dict:
             if q in col_vas:
                 vt = p + 8
                 n = 0
-                while vt + 8 * (n + 1) <= len(img):
+                while vt + 8 * (n + 1) <= hi:
                     f = struct.unpack_from("<Q", img, vt + 8 * n)[0] - base
                     if not (0 <= f < len(img) and is_exec(f)):
                         break
@@ -191,7 +194,8 @@ def scan_pe64_rtti(data: bytes) -> dict:
 
 def write_report(path, text):
     """Write the report next to its destination and swap it in, so a write that fails part-way (a full disk, a
-    locked range) leaves the previous report as it was instead of an empty or truncated file."""
+    locked range) leaves the previous report as it was instead of an empty or truncated file. The result keeps
+    the previous report's permission bits, or gets the usual ones for a new file."""
     parent = os.path.dirname(os.path.abspath(path))
     tmp = None
     try:
@@ -199,6 +203,7 @@ def write_report(path, text):
                                          delete=False) as f:
             tmp = f.name
             f.write(text)
+        os.chmod(tmp, published_mode(path))
         os.replace(tmp, path)
     except BaseException:
         if tmp is not None:
@@ -214,6 +219,14 @@ def main():
     ap.add_argument("image")
     ap.add_argument("--out")
     a = ap.parse_args()
+    path = a.out or re.sub(r"\.(exe|dll)$", "", a.image, flags=re.I) + ".rtti.json"
+    same_path = os.path.normcase(os.path.realpath(a.image)) == os.path.normcase(os.path.realpath(path))
+    try:
+        same_path = same_path or os.path.samefile(a.image, path)
+    except OSError:
+        pass  # A missing or inaccessible path is handled by the normal read/write error path.
+    if same_path:
+        ap.error("output must not overwrite the source image")
     try:
         with open(a.image, "rb") as f:
             data = f.read()
@@ -223,7 +236,6 @@ def main():
         return 1
 
     out = {"image": a.image, **scanned}
-    path = a.out or re.sub(r"\.(exe|dll)$", "", a.image, flags=re.I) + ".rtti.json"
     try:
         write_report(path, json.dumps(out, indent=1))
     except OSError as exc:
@@ -236,4 +248,8 @@ def main():
 
 
 if __name__ == "__main__":
+    try:  # a redirected stdout is strict ANSI code page under -I; write '?' for what it cannot encode
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
     sys.exit(main())

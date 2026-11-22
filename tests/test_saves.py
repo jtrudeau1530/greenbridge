@@ -13,6 +13,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOL = os.path.join(ROOT, "tools", "saves.py")
@@ -159,6 +160,51 @@ class JsavTest(unittest.TestCase):
         self.assertIn("changed: code 10000002", out)
         self.assertIn("4 blocks identical", out)
 
+    def test_diff_keeps_duplicate_group_hash_blocks(self):
+        # Two blocks can share a (group, hash) pair; the second must not overwrite the first in diff's table.
+        hashes = [0x11111111, 0x11111111]
+        blocks = [b'{"$0x11111111":1}', b'{"$0x11111111":2}']
+        a = saves.build_jsav(3, 2, hashes, [1, 1], blocks)
+        b = saves.build_jsav(3, 2, hashes, [1, 1], [blocks[0], b'{"$0x11111111":3}'])
+        with tempfile.TemporaryDirectory() as tmp:
+            pa, pb = os.path.join(tmp, "a"), os.path.join(tmp, "b")
+            write(pa, a)
+            write(pb, b)
+            out = quiet(saves.diff, pa, pb)
+        self.assertIn("changed: code 11111111", out)
+        self.assertIn('"$0x11111111":2', out)
+        self.assertIn('"$0x11111111":3', out)
+        self.assertIn("1 blocks identical", out)
+        self.assertNotIn("only in", out)
+
+    def test_diff_reports_one_sided_duplicate_with_the_same_label_format(self):
+        hashes = [0x11111111, 0x11111111]
+        blocks = [b'{"$0x11111111":1}', b'{"$0x11111111":2}']
+        a = saves.build_jsav(3, 1, hashes[:1], [1], blocks[:1])
+        b = saves.build_jsav(3, 2, hashes, [1, 1], blocks)
+        with tempfile.TemporaryDirectory() as tmp:
+            pa, pb = os.path.join(tmp, "a"), os.path.join(tmp, "b")
+            write(pa, a)
+            write(pb, b)
+            out = quiet(saves.diff, pa, pb)
+        self.assertIn("only in B: code 11111111 17", out)
+        self.assertIn("1 blocks identical", out)
+        self.assertNotIn("changed:", out)
+
+    def test_diff_matches_identical_duplicate_blocks_by_content(self):
+        hashes = [0x11111111, 0x11111111]
+        blocks = [b'{"$0x11111111":1}', b'{"$0x11111111":2}']
+        a = saves.build_jsav(3, 2, hashes, [1, 1], blocks)
+        b = saves.build_jsav(3, 1, hashes[1:], [1], blocks[1:])
+        with tempfile.TemporaryDirectory() as tmp:
+            pa, pb = os.path.join(tmp, "a"), os.path.join(tmp, "b")
+            write(pa, a)
+            write(pb, b)
+            out = quiet(saves.diff, pa, pb)
+        self.assertIn("only in A: code 11111111 17", out)
+        self.assertIn("1 blocks identical", out)
+        self.assertNotIn("changed:", out)
+
 
 class AsavTest(unittest.TestCase):
     def test_header_fields(self):
@@ -183,6 +229,41 @@ class AsavTest(unittest.TestCase):
             saves.parse_asav(b"JSAV" + bytes(0x200))
 
 
+class MalformedAsavTest(unittest.TestCase):
+    """A truncated or lying ASAV is a ValueError with a readable message, not a struct.error (#980)."""
+
+    def test_file_shorter_than_the_fixed_header_is_rejected(self):
+        for blob in (b"ASAV", b"ASAV" + bytes(0x20)):
+            with self.subTest(size=len(blob)), self.assertRaises(ValueError) as ctx:
+                saves.parse_asav(blob)
+            self.assertIn(f"header is only {len(blob)} bytes", str(ctx.exception))
+
+    def test_a_short_non_asav_blob_keeps_the_not_asav_message(self):
+        with self.assertRaises(ValueError) as ctx:
+            saves.parse_asav(b"NOPE")
+        self.assertEqual(str(ctx.exception), "not ASAV")
+
+    def test_payload_offset_past_the_end_is_rejected(self):
+        d = bytearray(make_asav(kind=2))
+        struct.pack_into("<I", d, 0x14, 0xFFFF)  # payload_offset
+        with self.assertRaises(ValueError) as ctx:
+            saves.parse_asav(bytes(d))
+        self.assertIn("payload offset 0xffff is past the end", str(ctx.exception))
+
+    def test_cli_reports_an_error_without_a_traceback(self):
+        # End to end: #923's dispatch guard plus this parser message give one line and exit 2.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "truncated.asav")
+            with open(path, "wb") as f:
+                f.write(b"ASAV")
+            p = subprocess.run([sys.executable, "-I", TOOL, "info", path],
+                               capture_output=True, text=True, check=False)
+        self.assertEqual(p.returncode, 2, p.stderr)
+        self.assertIn("ERROR:", p.stderr)
+        self.assertIn("header is only 4 bytes, an ASAV header is 368", p.stderr)
+        self.assertNotIn("Traceback", p.stderr)
+
+
 class SlayerTest(unittest.TestCase):
     def test_wrapper_and_unaligned_name(self):
         inner = make_asav(kind=1, title="Packed", slot="SLOT7") + os.urandom(64)
@@ -203,6 +284,42 @@ class SlayerTest(unittest.TestCase):
         self.assertIn("not decoded", out)
 
 
+class MalformedSlayerTest(unittest.TestCase):
+    """A truncated or lying SLAYER1 header is a SLAYER1-specific ValueError, not a struct.error."""
+
+    def test_a_short_non_slayer_blob_keeps_the_not_slayer_message(self):
+        with self.assertRaises(ValueError) as ctx:
+            saves.parse_slayer(b"NOPE")
+        self.assertEqual(str(ctx.exception), "not SLAYER1")
+
+    def test_bounds(self):
+        # Boundary cases around the name length: a short fixed preamble, an oversized declared name, and a
+        # name that fits but truncates the 8-byte payload-size field that follows it.
+        name = b"ABCD0000"
+        cases = [
+            (b"SLAYER1\0", "header is only 8 bytes"),
+            (b"SLAYER1\0" + struct.pack("<II", 1, 0x1000), "declares a 4096-byte name"),
+            (b"SLAYER1\0" + struct.pack("<II", 1, len(name)) + name + b"\x05", "needs 32 bytes"),
+        ]
+        for blob, needle in cases:
+            with self.subTest(size=len(blob)), self.assertRaises(ValueError) as ctx:
+                saves.parse_slayer(blob)
+            self.assertIn(needle, str(ctx.exception))
+
+    def test_cli_reports_an_error_with_a_path_and_no_traceback(self):
+        # End to end: the dispatch guard plus the parser message give one line, the path, and exit 2.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "truncated.dat")
+            write(path, b"SLAYER1\0" + struct.pack("<II", 1, 0x1000))
+            p = subprocess.run([sys.executable, "-I", TOOL, "info", path],
+                               capture_output=True, text=True, check=False)
+        self.assertEqual(p.returncode, 2, p.stderr)
+        self.assertIn("ERROR:", p.stderr)
+        self.assertIn(path, p.stderr)
+        self.assertIn("declares a 4096-byte name", p.stderr)
+        self.assertNotIn("Traceback", p.stderr)
+
+
 class ImportTest(unittest.TestCase):
     def test_encoding_matches_the_shim(self):
         # Same rule as encode_name() in runtime/shims/xgameruntime_services.cpp.
@@ -220,6 +337,18 @@ class ImportTest(unittest.TestCase):
         prof = os.path.join(tmp, "in", "profile")
         write(os.path.join(prof, "Player"), make_asav(kind=3, title="Player", slot="Player"))
         return story, prof, jsav
+
+    def test_import_rejects_flag_as_value(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            story, _, _ = self._folders(tmp)
+            tool = os.path.join(ROOT, "tools", "saves.py")
+            result = subprocess.run(
+                [sys.executable, "-I", tool, "import", story, "--out", "--dry-run"],
+                cwd=tmp, capture_output=True, text=True,
+            )
+            self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+            self.assertIn("--out needs a value", result.stderr)
+            self.assertFalse(os.path.exists(os.path.join(tmp, "--dry-run")))
 
     def test_import_layout_and_manifest(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -269,6 +398,60 @@ class ImportTest(unittest.TestCase):
             write(os.path.join(empty, "readme.txt"), b"nothing here")
             with self.assertRaises(SystemExit):
                 quiet(saves.import_saves, [empty, "--out", os.path.join(tmp, "o")])
+
+    def test_discovery_reads_at_most_eight_bytes_per_candidate(self):
+        # save_slot probes each candidate with eight bytes, then reads only the chosen payload in full.
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = os.path.join(tmp, "story")
+            jsav, _, _ = make_jsav()
+            write(os.path.join(folder, "SLOT0"), jsav)
+            write(os.path.join(folder, "notes.txt"), b"just text" * 1000)
+            with mock.patch.object(saves, "read", wraps=saves.read) as reader:
+                quiet(saves.save_slot, folder)
+        payload = os.path.join(folder, "SLOT0")
+        other = os.path.join(folder, "notes.txt")
+        self.assertEqual(reader.call_args_list,
+                         [mock.call(payload, 8), mock.call(other, 8), mock.call(payload)])
+
+
+class MalformedJsavTest(unittest.TestCase):
+    """A truncated or lying JSAV is one error line, not a struct.error traceback."""
+
+    def test_header_shorter_than_16_bytes_is_rejected(self):
+        with self.assertRaises(ValueError) as ctx:
+            saves.parse_jsav(b"JSAV")
+        self.assertIn("header is only 4 bytes", str(ctx.exception))
+
+    def test_a_short_non_jsav_blob_keeps_the_not_jsav_message(self):
+        with self.assertRaises(ValueError) as ctx:
+            saves.parse_jsav(b"NOPE")
+        self.assertEqual(str(ctx.exception), "not JSAV")
+
+    def test_entry_table_past_end_is_rejected(self):
+        data = b"JSAV" + struct.pack("<III", 1, 4, 0)
+        with self.assertRaises(ValueError) as ctx:
+            saves.parse_jsav(data)
+        self.assertIn("declares 4 entries but the file has 16 bytes", str(ctx.exception))
+
+    def test_missing_body_marker_is_rejected(self):
+        # A complete entry table with no JSON body marker after it.
+        data = bytearray(b"JSAV" + struct.pack("<III", 3, 1, 0))
+        data += struct.pack("<IIIII", 0x11111111, 1, 0, 36, 0)
+        with self.assertRaises(ValueError) as ctx:
+            saves.parse_jsav(bytes(data))
+        self.assertIn("body marker not found", str(ctx.exception))
+
+    def test_cli_reports_an_error_without_a_traceback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "truncated.jsav")
+            with open(path, "wb") as f:
+                f.write(b"JSAV" + struct.pack("<III", 1, 4, 0))
+            p = subprocess.run([sys.executable, "-I", TOOL, "info", path],
+                               capture_output=True, text=True)
+        self.assertEqual(p.returncode, 2, p.stderr)
+        self.assertIn("ERROR:", p.stderr)
+        self.assertIn("declares 4 entries", p.stderr)
+        self.assertNotIn("Traceback", p.stderr)
 
 
 if __name__ == "__main__":

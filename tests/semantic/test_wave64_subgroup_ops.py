@@ -8,8 +8,7 @@ with base 0 and num_records 0xFFFFFFFF.
 * One 64-wide subgroup: every word equals the GPU check's value (check.py CS_DUMPS, W64X_DUMPS, W64X_PARTIAL; for
   cs_wavemask the per-lane formula of vk_compute_test's "wavemask" mode). This covers ballots and s_bcnt1 /
   s_ff1 of 64-bit masks, readfirstlane with only upper lanes on, the votes behind wave-uniform branches, and the
-  missing lanes of a partial wave (21cef25's ds_bpermute guard: a shuffle from them is undefined and must be
-  selected away).
+  missing lanes of a partial wave (ds_bpermute uses the ballot to avoid shuffling from a missing lane).
 * Two 32-wide subgroups (NVIDIA without emulation): the words differ, and WAVE32_EXPECTED pins them. Measured:
   NVIDIA GeForce RTX 4070 SUPER (subgroup 32), driver 610.88, `vk_compute_test <name>.spv 1 dump` on
   run_gpu_tests.py's non-emulated build, three runs each: every word equals WAVE32_EXPECTED, and cs_wavemask
@@ -40,7 +39,7 @@ GPU_DUMPS = dict(check.CS_DUMPS + check.W64X_DUMPS + check.W64X_PARTIAL)
 DUMPS = ("cs_w64x_ballot", "cs_w64x_readfirstlane", "cs_w64x_load_ballot_load", "cs_w64x_partial",
          "cs_wave64_ballot", "cs_wm_bfm64", "cs_wm_half_cmp")
 HEAP_FILL = 0xEEEEEEEE
-VSHARP = [0, 0, 0xFFFFFFFF, 0]
+VSHARP = [0, 0, 0xFFFFFFFF, 0x31016FAC]
 
 # Two 32-wide subgroups: each half votes, counts and picks its first lane on its own.
 WAVE32_EXPECTED = {
@@ -111,15 +110,17 @@ class OnTwoSubgroups32(unittest.TestCase):
 
 
 class NegativeControl(unittest.TestCase):
-    def test_partial_wave_bpermute_without_its_ballot_guard(self):
-        # 21cef25: the shuffle result is kept only where a ballot has the source lane. Without the select, lanes
-        # whose source is one of the 24 missing lanes of the 40-thread wave pass an undefined value on.
+    def test_partial_wave_bpermute_without_its_source_lane_fallback(self):
+        # Bypass the safe shuffle index. Reading a missing lane is undefined even if its result is masked.
         header = compute_header(os.path.join(ASM_DIR, "cs_w64x_partial.asm"))
         spv = support.translate_fixture("cs_w64x_partial", fssm=bytes(header))
-        bad, n = re.subn(r"(%\w+) = OpSelect %uint (%\w+) (%\w+) %c0(?=\n)",
-                         lambda m: f"{m.group(1)} = OpCopyObject %uint {m.group(3)}"
-                         if f"{m.group(2)} = OpGroupNonUniformBallotBitExtract" in spv else m.group(0), spv)
-        self.assertNotEqual(bad, spv)
+        bad, replaced = re.subn(
+            r"(?P<ballot>(?P<present>%\w+) = OpGroupNonUniformBallotBitExtract[^\n]*\n\s*)"
+            r"(?P<index>%\w+) = OpSelect %uint (?P=present) (?P<source>%\w+) %\w+(?=\n)",
+            r"\g<ballot>\g<index> = OpCopyObject %uint \g<source>",
+            spv,
+        )
+        self.assertEqual(replaced, 2)
         with self.assertRaisesRegex(si.UnsupportedConstruct, "undefined value"):
             si.run_workgroup(bad, 40, 64,
                              inputs_for=lambda i: {"%wg_id": (0, 0, 0), "%local_id": (i, 0, 0), "%sg_lane": i},

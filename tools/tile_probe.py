@@ -8,6 +8,7 @@ Usage:
     python -I tile_probe.py <blob> [--out preview.png] [--offset N]
 """
 import argparse
+import os
 import sys
 
 import numpy as np
@@ -104,7 +105,12 @@ def render(data, offset, bpe, wpx, mode, out):
     """Full BC decode of the reordered top mip through Pillow (BC1 for 8-byte blocks, BC7 for 16-byte)."""
     import io
     import struct
-    from PIL import Image
+    try:
+        from PIL import Image
+    except ModuleNotFoundError:
+        # only the preview needs Pillow; -I does not see a --user install of it
+        raise SystemExit("--out needs Pillow: the scan runs without it, but the preview cannot be written "
+                         "(run without -I, or install Pillow where this interpreter can see it)")
     wb = wpx // 4
     raw = np.frombuffer(data[offset:offset + (len(data) - offset) // bpe * bpe], np.uint8).reshape(-1, bpe)
     hb = min(len(raw) // wb, wb)
@@ -131,12 +137,37 @@ def render(data, offset, bpe, wpx, mode, out):
     return im.size
 
 
+def same_report_path(first, second):
+    if os.path.normcase(os.path.realpath(first)) == os.path.normcase(os.path.realpath(second)):
+        return True
+    try:
+        return os.path.samefile(first, second)
+    except OSError:
+        return False
+
+
+def check_preview_path(out, blob):
+    """Refuse a preview that would destroy the sample, and create its folder.
+
+    Before: `--out <blob>` opened the blob for the probe and then wrote the preview over it, truncating the
+    sample the run had just read; a missing folder raised a PIL traceback after the whole probe had run.
+    """
+    if os.path.isdir(out):
+        raise SystemExit(f"{out} is a directory, not an image file")
+    if same_report_path(out, blob):
+        raise SystemExit(f"--out would overwrite the input {blob}")
+    out_dir = os.path.dirname(os.path.abspath(out))
+    os.makedirs(out_dir, exist_ok=True)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("blob")
     ap.add_argument("--offset", type=int, default=0)
     ap.add_argument("--out")
     a = ap.parse_args()
+    if a.out:
+        check_preview_path(a.out, a.blob)
     try:
         with open(a.blob, "rb") as f:
             data = f.read()
@@ -145,6 +176,12 @@ def main():
     if not 0 <= a.offset < len(data):  # a negative offset used to probe the file's tail, one past the end nothing
         raise SystemExit(f"--offset {a.offset} is outside {a.blob} ({len(data)} bytes)")
     res = probe(data, a.offset)
+    if not res:
+        # Every candidate needs at least 16 rows of blocks at one of the widths; a short sample used to print
+        # nothing, write no preview and exit 0, which reads as a successful run with no result.
+        print(f"ERROR: no layout fits {a.blob} at offset {a.offset}: the sample is too short for every candidate "
+              "width (use a larger blob, or an --offset nearer its start)", file=sys.stderr)
+        return 1
     for s, bpe, wpx, mode in res[:6]:
         print(f"score {s:8.2f}  {bpe}-byte blocks  width {wpx:5}  {mode}")
     if a.out and res:
@@ -153,4 +190,8 @@ def main():
 
 
 if __name__ == "__main__":
+    try:  # a redirected stdout is strict ANSI code page under -I; write '?' for what it cannot encode
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
     sys.exit(main())

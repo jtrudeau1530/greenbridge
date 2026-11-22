@@ -534,6 +534,42 @@ class NavmeshDecodeTest(unittest.TestCase):
         self.assertEqual(doc["resources"]["psin"]["incomplete"], 1)
         self.assertEqual(doc["psin"]["complete"], 0)
 
+    def test_psin_first_section_at_eof_is_incomplete(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            carve = os.path.join(tmp, "carve")
+            os.mkdir(carve)
+            with open(os.path.join(carve, "000000000000.bin"), "wb") as f:
+                f.write(struct.pack(">4sI", b"PSIN", 64) + bytes(56))
+            out = os.path.join(tmp, "out.json")
+            proc = subprocess.run([sys.executable, "-I", TOOL, carve, "--quiet", "--out", out],
+                                  capture_output=True, text=True)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            with open(out, encoding="utf-8") as f:
+                doc = json.load(f)
+
+        self.assertEqual(doc["resources"]["psin"]["resources"], 1)
+        self.assertEqual(doc["resources"]["psin"]["incomplete"], 1)
+        self.assertEqual(doc["psin"]["complete"], 0)
+
+    def test_header_only_psin_does_not_swallow_the_next_resource(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            carve = os.path.join(tmp, "carve")
+            os.mkdir(carve)
+            with open(os.path.join(carve, "000000000000.bin"), "wb") as f:
+                f.write(struct.pack(">4sI", b"PSIN", 64) + bytes(56))
+            with open(os.path.join(carve, "000000000040.bin"), "wb") as f:
+                f.write(struct.pack(">4sI", b"PSIN", 64) + bytes(56) + struct.pack(">4sI", b"SECT", 64) + bytes(56))
+            out = os.path.join(tmp, "out.json")
+            proc = subprocess.run([sys.executable, "-I", TOOL, carve, "--quiet", "--out", out],
+                                  capture_output=True, text=True)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            with open(out, encoding="utf-8") as f:
+                doc = json.load(f)
+
+        self.assertEqual(doc["resources"]["psin"]["resources"], 2)
+        self.assertEqual(doc["resources"]["psin"]["incomplete"], 1)
+        self.assertEqual(doc["psin"]["complete"], 1)
+
     def test_carved_directory_mode_and_window_limit(self):
         sector = (260 << 9) | 250
         p0, p1 = build_0drp(total_size=0x1000, split_at=0x1000, node_count=2, override_n4e=0)
@@ -566,7 +602,73 @@ class NavmeshDecodeTest(unittest.TestCase):
             win = nd.scan(arc, start=offs[0], limit=offs[1] - offs[0], deep=True)
             self.assertEqual(win["resources"]["grid"]["resources"], 1)
             self.assertNotIn("navmesh", win["resources"])
-            self.assertEqual(win["carver_streams"]["streams"], 2)
+            # The continuation starts at the window's end: decoded as part of the grid, but carved past the
+            # window, so the carver counts match navmesh_index.py on the same window (#766).
+            self.assertEqual(win["carver_streams"]["streams"], 1)
+            self.assertEqual(win["carver_streams"]["past_window"], 1)
+            c = win["carver_streams"]
+            self.assertEqual(c["stored"] + c["zero_padding"] + c["unread"], win["span"])
+
+    def test_limit_inside_a_stream_counts_nothing_past_the_window(self):
+        """--limit ending inside the first of two streams: nothing is carved, and the byte classes add up to
+        the span, as navmesh_index.py reports for the same window."""
+        import hashlib
+        noisy = lambda seed: b"".join(hashlib.sha256(bytes([seed, i])).digest() for i in range(128))
+        with tempfile.TemporaryDirectory() as tmp:
+            arc = os.path.join(tmp, "w.rpf")
+            offs = make_rpf(arc, [noisy(1), noisy(2)])
+            doc = nd.scan(arc, start=offs[0], limit=0x100)
+            c = doc["carver_streams"]
+            self.assertEqual((c["streams"], c["stored"]), (0, 0))
+            self.assertEqual(c["stored"] + c["zero_padding"] + c["unread"], doc["span"])
+            self.assertEqual(c["past_window"], 1)
+
+    def test_cli_rejects_shared_report_destination(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            archive = os.path.join(tmp, "nav.rpf")
+            make_rpf(archive, build_0drp())
+            output = os.path.join(tmp, "nav.navmesh-decode.json")
+            result = subprocess.run(
+                [sys.executable, "-I", TOOL, archive, "--csv", output, "--quiet"],
+                cwd=tmp, capture_output=True, text=True,
+            )
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertIn("--out and --csv must use different paths", result.stderr)
+            self.assertFalse(os.path.exists(output))
+
+    def test_cli_creates_missing_output_folders(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            archive = os.path.join(tmp, "nav.rpf")
+            make_rpf(archive, build_0drp())
+            out_json = os.path.join(tmp, "reports", "deep", "nav.json")
+            out_csv = os.path.join(tmp, "tables", "nav.csv")
+            result = subprocess.run(
+                [sys.executable, "-I", TOOL, archive, "--out", out_json, "--csv", out_csv, "--quiet"],
+                capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertNotIn("Traceback", result.stderr)
+            with open(out_json, encoding="utf-8") as f:
+                self.assertEqual(json.load(f)["resources"]["0drp"]["resources"], 1)
+            with open(out_csv, newline="", encoding="utf-8") as f:
+                self.assertEqual(len(list(csv.DictReader(f))), 1)
+
+    def test_cli_refuses_to_overwrite_its_input(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            archive = os.path.join(tmp, "nav.rpf")
+            make_rpf(archive, build_0drp())
+            with open(archive, "rb") as f:
+                original = f.read()
+            for flag in ("--out", "--csv"):
+                result = subprocess.run(
+                    [sys.executable, "-I", TOOL, archive, flag, archive, "--quiet"],
+                    capture_output=True, text=True, check=False,
+                )
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn("would overwrite the input", result.stderr)
+                self.assertNotIn("Traceback", result.stderr)
+                with open(archive, "rb") as f:
+                    self.assertEqual(f.read(), original, f"{flag} touched the input")
 
     def test_cli_rejects_bad_arguments_and_files(self):
         with tempfile.TemporaryDirectory() as tmp:

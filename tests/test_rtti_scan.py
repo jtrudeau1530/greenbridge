@@ -260,6 +260,23 @@ class RttiScanCoreTest(unittest.TestCase):
         self.assertEqual(v1["offset_in_object"], 8)
         self.assertEqual(v1["slots"], 1)
 
+    def test_vtable_slots_stop_at_the_end_of_their_section(self):
+        rdata = bytearray(0x1000)
+        rdata[0x10:0x1D] = b".?AVProbe@@\x00\x00"
+        # The vtable's first slot ends at .rdata's declared VirtualSize (0x200).
+        struct.pack_into("<6I", rdata, 0x40, 1, 0, 0, 0x2000, 0, 0x2040)
+        struct.pack_into("<3Q", rdata, 0x1F0,
+                         self.image_base + 0x2040, self.image_base + 0x1000, self.image_base + 0x1008)
+        pe = bytearray(make_synthetic_pe(rdata_bytes=rdata))
+        section_virtual_size = 0x80 + 24 + 240 + 40 + 8
+        struct.pack_into("<I", pe, section_virtual_size, 0x200)
+        vtables = rtti_scan.scan_pe64_rtti(pe)["vtables"]
+        self.assertEqual(vtables, [{"rva": 0x21F8, "class": "Probe", "offset_in_object": 0, "slots": 1}])
+
+        # The same second code pointer is a real slot when the section extends to include it.
+        struct.pack_into("<I", pe, section_virtual_size, 0x208)
+        self.assertEqual(rtti_scan.scan_pe64_rtti(pe)["vtables"][0]["slots"], 2)
+
     def test_col_validation_rejects_corrupted_locators(self):
         rdata = bytearray(0x1000)
 
@@ -346,6 +363,36 @@ class RttiScanCoreTest(unittest.TestCase):
             data = json.load(f)
         self.assertEqual(data["type_descriptors"], 1)
 
+    def test_report_must_not_overwrite_the_input_image(self):
+        image = os.path.join(self.tmp.name, "source.exe")
+        original = make_synthetic_pe(text_bytes=b"\xc3", rdata_bytes=b".?AVSample@@\x00")
+        hardlink = os.path.join(self.tmp.name, "source-link.exe")
+
+        for label, output in [
+            ("identical", image),
+            ("alternate spelling", os.path.join(self.tmp.name, ".", "source.exe")),
+            ("hard link", hardlink),
+        ]:
+            with self.subTest(label):
+                with open(image, "wb") as f:
+                    f.write(original)
+                if os.path.exists(hardlink):
+                    os.remove(hardlink)
+                os.link(image, hardlink)
+                p = self.run_tool(image, "--out", output)
+                self.assertNotEqual(p.returncode, 0)
+                self.assertIn("output must not overwrite the source image", p.stderr)
+                with open(image, "rb") as f:
+                    self.assertEqual(f.read(), original)
+
+        distinct = os.path.join(self.tmp.name, "report.json")
+        p = self.run_tool(image, "--out", distinct)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        with open(image, "rb") as f:
+            self.assertEqual(f.read(), original)
+        with open(distinct, encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["image"], image)
+
     def test_output_it_cannot_write_is_one_line(self):
         img_path = os.path.join(self.tmp.name, "unwritable.exe")
         with open(img_path, "wb") as f:
@@ -395,6 +442,33 @@ class RttiScanCoreTest(unittest.TestCase):
         with open(out, encoding="utf-8") as f:
             self.assertEqual(f.read(), '{"new": true}')
         self.assertEqual(sorted(os.listdir(self.tmp.name)), ["kept.rtti.json"])
+
+    @unittest.skipUnless(os.name == "posix", "POSIX permission bits")
+    def test_report_keeps_permission_bits(self):
+        # NamedTemporaryFile creates 0600; the swapped-in report must not lose group/other read (#750 review).
+        out = os.path.join(self.tmp.name, "perm.rtti.json")
+        old = os.umask(0o022)
+        try:
+            rtti_scan.write_report(out, "{}")
+            self.assertEqual(os.stat(out).st_mode & 0o777, 0o644)
+            os.chmod(out, 0o640)
+            rtti_scan.write_report(out, "{}")
+            self.assertEqual(os.stat(out).st_mode & 0o777, 0o640)
+            os.umask(0o027)
+            os.remove(out)
+            rtti_scan.write_report(out, "{}")
+            self.assertEqual(os.stat(out).st_mode & 0o777, 0o640)
+        finally:
+            os.umask(old)
+
+    def test_new_report_is_writable(self):
+        # On Windows os.chmod only sets the read-only flag: a new report must not come out read-only.
+        out = os.path.join(self.tmp.name, "w.rtti.json")
+        rtti_scan.write_report(out, "{}")
+        self.assertTrue(os.access(out, os.W_OK))
+        rtti_scan.write_report(out, '{"again": 1}')
+        with open(out, encoding="utf-8") as f:
+            self.assertEqual(f.read(), '{"again": 1}')
 
     def test_invalid_pe_images_rejected_cleanly(self):
         good = bytearray(make_synthetic_pe(text_bytes=b"\xc3" * 16, rdata_bytes=b"\x00" * 16))

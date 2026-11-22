@@ -20,9 +20,11 @@ tests/semantic/spirv_mini_interp.py runs one invocation of forward-only code. Th
     composited. Float arithmetic raises, so a NaN payload can never be rewritten by the host.
 
 Inputs: Input variables decorated BuiltIn SubgroupLocalInvocationId read the lane number, SubgroupSize reads the
-wave size; other Input variables read zero. PushConstant words can be seeded (default zero).
+wave size; other Input variables read zero, except the built-ins named in `builtins` (name -> function of the
+lane number giving that lane's integer value, e.g. {"VertexIndex": lambda lane: first + lane}). PushConstant words
+can be seeded (default zero).
 
-    run_wave(text, wave=32, push_constants=None, max_steps=2_000_000) ->
+    run_wave(text, wave=32, push_constants=None, max_steps=2_000_000, builtins=None) ->
         {"outputs": [ {output_name: tuple_of_words} or None (lane killed) for each lane ],
          "steps": instructions executed (summed over invocations)}
 """
@@ -34,6 +36,15 @@ SUBGROUP = 3        # Scope Subgroup
 
 class UnsupportedConstruct(NotImplementedError):
     """The module uses something this interpreter deliberately does not model."""
+
+
+class InvalidModule(AssertionError):
+    """The module breaks spirv-val's merge rule (see spirv_mini_interp.check_structure): a merge instruction must
+    directly precede its block's branch. Raised instead of running a shader no driver would accept."""
+
+
+_MERGE_FOLLOW = {"OpSelectionMerge": ("OpBranchConditional", "OpSwitch"),
+                 "OpLoopMerge": ("OpBranch", "OpBranchConditional")}
 
 
 class F:
@@ -118,6 +129,7 @@ class _Module:
         self.id_type = {}
         cur = None
         in_body = False
+        merge_line = None           # (opcode, line) of a merge whose branch has not been seen yet
         for raw in text.splitlines():
             line = raw.strip()
             if not line:
@@ -128,6 +140,11 @@ class _Module:
             res, op, rest = m.groups()
             a = rest.split()
             if in_body:
+                if merge_line is not None:
+                    if op not in _MERGE_FOLLOW[merge_line[0]]:
+                        raise InvalidModule(f"{merge_line[1]!r} is followed by {line!r}, not by "
+                                            f"{' or '.join(_MERGE_FOLLOW[merge_line[0]])}")
+                    merge_line = None
                 if op == "OpFunctionEnd":
                     in_body = False
                     continue
@@ -143,10 +160,16 @@ class _Module:
                     raise UnsupportedConstruct(f"{op} before the first label")
                 if res and a and op != "OpStore":
                     self.id_type[res] = a[0]
+                if op == "OpVariable" and a[1:2] == ["Function"] and len(self.blocks) > 1:
+                    raise InvalidModule(f"{line!r} is a Function variable outside the function's first block")
                 if op == "OpPhi":
+                    if cur.body:
+                        raise InvalidModule(f"{line!r} follows a non-phi instruction of its block (spirv-val: "
+                                            "OpPhi must come first)")
                     cur.phis.append((res, a))
                 elif op in ("OpSelectionMerge", "OpLoopMerge"):
                     cur.merge = (op, a[0], a[1] if op == "OpLoopMerge" else None)
+                    merge_line = (op, line)
                 elif op in _TERMINATORS:
                     cur.term = (op, a)
                     cur = None
@@ -268,7 +291,7 @@ def _copy(v):
 
 
 class _Wave:
-    def __init__(self, mod, wave, push_constants, max_steps):
+    def __init__(self, mod, wave, push_constants, max_steps, builtins=None):
         self.m = mod
         self.wave = wave
         self.pcw = list(push_constants or [])
@@ -288,6 +311,8 @@ class _Wave:
                         value = lane.index
                     elif b == "SubgroupSize":
                         value = wave
+                    elif builtins and b in builtins:
+                        value = builtins[b](lane.index) & MASK
                     elif b is None:
                         value = mod.zero(pointee)
                     else:
@@ -825,9 +850,9 @@ class _BuiltinNotModelled:
         self.name = name
 
 
-def run_wave(text, wave=32, push_constants=None, max_steps=2_000_000):
+def run_wave(text, wave=32, push_constants=None, max_steps=2_000_000, builtins=None):
     if wave not in (32, 64):
         raise ValueError("wave must be 32 or 64")
-    w = _Wave(_Module(text), wave, push_constants, max_steps)
+    w = _Wave(_Module(text), wave, push_constants, max_steps, builtins)
     outputs = w.run()
     return {"outputs": outputs, "steps": w.steps}

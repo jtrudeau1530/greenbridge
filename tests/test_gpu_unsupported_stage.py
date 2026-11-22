@@ -61,7 +61,7 @@ class PixelTestOnDeviceWithoutAFeature(unittest.TestCase):
     """run_gpu_tests.py's pixel branch with a fake vk_harness that exits 77 (no assembler or GPU needed)."""
 
     def test_the_skip_is_reported_once(self):
-        def fake_run_cmd(cmd, env=None):
+        def fake_run_cmd(cmd, env=None, gpu=True):
             if cmd[0] == sys.executable:                    # the translator: leave the .spv it would write
                 Path(cmd[cmd.index("--out") + 1], "ps_bary.spv").touch()
                 return 0, ""
@@ -70,7 +70,10 @@ class PixelTestOnDeviceWithoutAFeature(unittest.TestCase):
         out = io.StringIO()
         with tempfile.TemporaryDirectory() as tmp:
             args = SimpleNamespace(filter="ps_bary", llvm_mc="llvm-mc", build=tmp)
-            with (patch.object(run_gpu_tests, "assemble_to_s"), patch.object(run_gpu_tests, "spirv_as"),
+            # the fake assembler still writes its .s: the runner copies this run's inputs before translating
+            fake_assemble = lambda _mc, _src, dst, _name: Path(dst).touch()
+            with (patch.object(run_gpu_tests, "assemble_to_s", side_effect=fake_assemble),
+                  patch.object(run_gpu_tests, "spirv_as"),
                   patch.object(run_gpu_tests, "run_cmd", side_effect=fake_run_cmd), contextlib.redirect_stdout(out)):
                 self.assertEqual(run_gpu_tests.run_suite(args, tmp), 0)
         rows = [line for line in out.getvalue().splitlines() if "ps_bary" in line]

@@ -119,6 +119,14 @@ int main() {
         check(!r.ok && r.error.find("64-dword") != std::string::npos,
               "65 constants refused by cost limit");
     }
+    // A count that wraps a 32-bit sum (1 + 0xFFFFFFFF) is still refused, not packed past dwords[32].
+    {
+        rt::rootsig::RootSignature sig;
+        sig.params = {consts(1), consts(0xFFFFFFFFu)};
+        const auto r = rt::rootsig::pack(sig);
+        check(!r.ok && r.error.find("64-dword") != std::string::npos,
+              "a constant count that wraps 32 bits is refused by the cost limit");
+    }
 
     // Canonical codec round-trips byte-exactly, sampler included.
     {
@@ -234,8 +242,9 @@ int main() {
         put_u32(p, 52);  // at 52
         put_u32(p, 0xdeadbeefu);  // gap
         put_u32(p, 0xdeadbeefu);
-        for (const uint32_t v : {0u, 4u, 0u, 0u, 0xffffffffu, 0u,      // SRV x4
-                                 2u, 1u, 3u, 1u, 0xffffffffu, 0u})     // CBV x1
+        // {type, count, base register, space, flags, offset}: 1.1 puts the flags before the table offset.
+        for (const uint32_t v : {0u, 4u, 0u, 0u, 8u, 0xffffffffu,      // SRV x4, DATA_STATIC, appended
+                                 2u, 1u, 3u, 1u, 1u, 6u})              // CBV x1 at b3 space1, DESCRIPTORS_VOLATILE, offset 6
             put_u32(p, v);
         const DecodeResult d = parse_rts0(p.data(), p.size());
         check(d.ok && d.sig.params.size() == 1 && d.sig.params[0].type == ParamType::Table &&
@@ -243,9 +252,65 @@ int main() {
                   d.sig.params[0].ranges[0].range_type == 0 && d.sig.params[0].ranges[0].num_descriptors == 4 &&
                   d.sig.params[0].ranges[1].range_type == 2 && d.sig.params[0].ranges[1].num_descriptors == 1,
               "RTS0 table ranges read from their offset");
+        check(d.ok && d.sig.params[0].ranges.size() == 2 && d.sig.params[0].ranges[0].flags == 8 &&
+                  d.sig.params[0].ranges[0].offset_in_table == kRangeOffsetAppend &&
+                  d.sig.params[0].ranges[1].base_shader_register == 3 &&
+                  d.sig.params[0].ranges[1].register_space == 1 && d.sig.params[0].ranges[1].flags == 1 &&
+                  d.sig.params[0].ranges[1].offset_in_table == 6,
+              "RTS0 1.1 ranges: register, space, flags, then table offset");
         std::vector<uint8_t> wild = p;
         wild[40] = 0xF0;  // ranges offset far past the payload
         check(!parse_rts0(wild.data(), wild.size()).ok, "RTS0 ranges offset past the payload rejected");
+    }
+
+    // RTS0 1.0 ranges have no flags dword: 20 bytes, the table offset right after the space.
+    {
+        std::vector<uint8_t> p;
+        put_u32(p, 1);   // version 1.0
+        put_u32(p, 1);   // 1 param
+        put_u32(p, 24);  // params table offset
+        put_u32(p, 0);   // 0 samplers
+        put_u32(p, 0);
+        put_u32(p, 0);   // flags
+        put_u32(p, 0);   // entry 0: descriptor table
+        put_u32(p, 0);   // all stages
+        put_u32(p, 36);  // table payload
+        put_u32(p, 2);   // 2 ranges
+        put_u32(p, 44);  // right after the payload
+        for (const uint32_t v : {1u, 2u, 5u, 0u, 0xffffffffu,    // UAV x2 at u5, appended
+                                 3u, 1u, 2u, 4u, 9u})            // sampler x1 at s2 space4, offset 9
+            put_u32(p, v);
+        const DecodeResult d = parse_rts0(p.data(), p.size());
+        check(d.ok && d.sig.params.size() == 1 && d.sig.params[0].ranges.size() == 2 &&
+                  d.sig.params[0].ranges[0].range_type == 1 && d.sig.params[0].ranges[0].num_descriptors == 2 &&
+                  d.sig.params[0].ranges[0].base_shader_register == 5 &&
+                  d.sig.params[0].ranges[0].offset_in_table == kRangeOffsetAppend &&
+                  d.sig.params[0].ranges[0].flags == 0 && d.sig.params[0].ranges[1].range_type == 3 &&
+                  d.sig.params[0].ranges[1].base_shader_register == 2 &&
+                  d.sig.params[0].ranges[1].register_space == 4 &&
+                  d.sig.params[0].ranges[1].offset_in_table == 9 && d.sig.params[0].ranges[1].flags == 0,
+              "RTS0 1.0 ranges: no flags, table offset at +16");
+        std::vector<uint8_t> cut = p;
+        cut.resize(cut.size() - 4);
+        check(!parse_rts0(cut.data(), cut.size()).ok, "RTS0 1.0 range without its offset rejected");
+    }
+
+    // The canonical codec keeps every range field, and refuses the old codec version that dropped them.
+    {
+        RootSignature sig;
+        sig.params = {table()};
+        sig.params[0].ranges.push_back({2, 1, 7, 3, 4, 12});
+        const std::vector<uint8_t> bytes = encode_canonical(sig);
+        const DecodeResult d = decode_canonical(bytes.data(), bytes.size());
+        check(d.ok && d.sig.params.size() == 1 && d.sig.params[0].ranges.size() == 2 &&
+                  d.sig.params[0].ranges[1].range_type == 2 && d.sig.params[0].ranges[1].num_descriptors == 1 &&
+                  d.sig.params[0].ranges[1].base_shader_register == 7 &&
+                  d.sig.params[0].ranges[1].register_space == 3 && d.sig.params[0].ranges[1].flags == 4 &&
+                  d.sig.params[0].ranges[1].offset_in_table == 12,
+              "canonical codec round-trips every range field");
+        std::vector<uint8_t> v1 = bytes;
+        v1[4] = 1;  // codec version 1 stored ranges as {type, count} only
+        check(!decode_canonical(v1.data(), v1.size()).ok, "canonical codec version 1 refused");
     }
 
     // Version 1.2: the canonical codec carries the static-sampler flags, and only for 1.2, so 1.0/1.1 encodings are

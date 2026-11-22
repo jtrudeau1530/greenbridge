@@ -1030,6 +1030,41 @@ class BlockRebuildTest(unittest.TestCase):
             bcpack.decode(raw_pbit, 7, 16)
 
 
+class DocumentedExampleTest(unittest.TestCase):
+    """The table and the BC7 example in docs/textures.md ("From a chunk entry to bcpack.decode")."""
+
+    BC7_BLOCK = bytes.fromhex("40 31 72 04 a5 68 19 be 02 34 56 78 9a bc de f0")
+    BC7_PACKED = bytes.fromhex(
+        "101010101010101004040303030304040101010101010140"
+        "000000000000024002027546281800000101df5f4b7c0341"
+        "020202411010101004040403101010104004100103030304"
+        "4001080001010104000000080000000041020994e4db27a4"
+        "410511fe6b020005"
+    )
+
+    def test_bc7_fixed_stream_strict(self):
+        out, prov = bcpack.decode_with_info(self.BC7_PACKED, 7, 16)
+        self.assertEqual(out, self.BC7_BLOCK)
+        self.assertFalse(prov)
+        # The hex in the doc is what the test encoder writes for that block.
+        self.assertEqual(encode_bc7_mode6_blocks(self.BC7_BLOCK), self.BC7_PACKED)
+
+    def test_lane_widths_and_symbols_per_block(self):
+        widths = {
+            1: (8, 8, 5, 6, 5, 5, 6, 5, 8, 8, 8, 8),
+            3: (4, 4, 8, 6, 6, 6, 6, 5, 6, 5, 8, 8),
+            4: (8, 8, 8, 8, 6, 6, 6, 6, 6, 6, 6, 6),
+            5: (4, 4, 8, 8, 6, 6, 6, 6, 6, 6, 6, 6),
+            6: (4, 4, 8, 8, 8, 5, 5, 5, 6, 6, 6, 8, 8, 8, 8, 5),
+            7: (4, 4, 8, 8, 8, 8, 8, 7, 7, 5, 6, 8, 8, 8, 8, 5),
+        }
+        self.assertEqual(bcpack.LANE_WIDTHS, widths)
+        for codec in widths:
+            # Chunk-entry tag = codec << 2: 0x04, 0x0c, 0x10, 0x14, 0x18, 0x1c.
+            self.assertEqual(codec << 2, (0x04, 0x0C, 0x10, 0x14, 0x18, 0x1C)[sorted(widths).index(codec)])
+            self.assertEqual(bcpack.BLOCK_BYTES[codec] // bcpack.ELEMENT_BYTES, 1 if codec in (1, 4) else 2)
+
+
 def encode_bc7_mode6_blocks(blocks, *, first_ep_history=None):
     """Encode raw BC7 mode-6 blocks (16 bytes each) into a codec-7 BCPack chunk.
 
@@ -1090,6 +1125,29 @@ def encode_bc7_mode6_blocks(blocks, *, first_ep_history=None):
                 ds.append(_zig(d))
             lanes[11 + y].extend([_pack_ix_pair(ds[0], ds[1], y), _pack_ix_pair(ds[2], ds[3], y)])
     return encode_lanes(lanes, 7)
+
+
+class UnknownBlockCountTest(unittest.TestCase):
+    """The provisional gate counts undetermined blocks. A BC6H or BC7 block whose endpoint and index both come
+    from unknown history entries is one block, not two."""
+
+    def test_a_block_with_both_roots_unknown_counts_once(self):
+        self.assertEqual(bcpack._unknown_blocks([255, 255, 7, -1], [255, 3, 255, -1], {255}, {255}), 3)
+        self.assertEqual(bcpack._unknown_blocks([-1, -1], [-1, -1], {255}, {255}), 0)
+
+    def test_bc7_gate_reports_distinct_blocks(self):
+        n = 4
+        lanes = [[] for _ in range(16)]
+        for i in range(n):
+            di = i + 1   # both lanes reach back past block 0: endpoint and index history entry 256 + i - di = 255
+            lanes[0].extend(_deint4(_zig(0)))
+            lanes[1].extend(_deint4(di))
+            for ln in range(2, 16):
+                lanes[ln].extend([0, 0])
+        from unittest import mock
+        with mock.patch.object(bcpack, "_bc7_check", return_value=[("endpoint", 255), ("index", 255)]):
+            with self.assertRaisesRegex(bcpack.BcpackProvisionalError, f" {n}/{n} blocks"):
+                bcpack._bc7_blocks(lanes, n, set())
 
 
 if __name__ == "__main__":

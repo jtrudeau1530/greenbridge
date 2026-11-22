@@ -118,6 +118,152 @@ class NavmeshIndexTest(unittest.TestCase):
         self.assertIsNone(row["stored"])
         self.assertEqual(row["size"], 0x80)
 
+    def test_out_and_csv_in_missing_folders_are_created(self):
+        # Before: write_outputs opened both paths directly, so a missing folder ended a finished scan in a
+        # FileNotFoundError traceback and lost the index.
+        folder = os.path.join(self.root, "carve")
+        os.makedirs(folder)
+        with open(os.path.join(folder, "page.bin"), "wb") as f:
+            f.write(page(pages=5))
+        out = os.path.join(self.root, "no", "such", "index.json")
+        csv_path = os.path.join(self.root, "also", "missing", "index.csv")
+        self.run_tool(folder, "--out", out, "--csv", csv_path, "--pattern", "*.bin")
+        with open(out, encoding="utf-8") as f:
+            doc = json.load(f)
+        self.assertEqual(doc["summary"]["page_counts"], {"5": 1})
+        with open(csv_path, encoding="utf-8") as f:
+            lines = f.read().splitlines()
+        self.assertEqual(len(lines), 2)
+        self.assertIn("0DRP@16", lines[1])
+
+    def assert_output_collision(self, *args):
+        r = subprocess.run([sys.executable, "-I", TOOL, *args], cwd=self.root, capture_output=True, text=True)
+        self.assertEqual(r.returncode, 2, r.stderr)
+        self.assertIn("--out and --csv must refer to different files", r.stderr)
+
+    def test_explicit_output_collision_before_scan(self):
+        # A missing input would give a different error if the scan started.
+        self.assert_output_collision("missing.rpf", "--out", "new.json", "--csv", "./new.json")
+        self.assertFalse(os.path.exists(os.path.join(self.root, "new.json")))
+
+    def test_default_output_collision_preserves_report(self):
+        make_rpf(os.path.join(self.root, "nav.rpf"))
+        report = os.path.join(self.root, "nav.navmesh-index.json")
+        with open(report, "wb") as f:
+            f.write(b"previous report")
+        self.assert_output_collision("nav.rpf", "--csv", report)
+        with open(report, "rb") as f:
+            self.assertEqual(f.read(), b"previous report")
+
+    def test_hard_link_output_collision(self):
+        report = os.path.join(self.root, "out.json")
+        with open(report, "wb") as f:
+            f.write(b"previous report")
+        try:
+            os.link(report, os.path.join(self.root, "out.csv"))
+        except OSError as exc:
+            self.skipTest(f"cannot create a hard link: {exc}")
+        self.assert_output_collision(self.root, "--out", "out.json", "--csv", "out.csv")
+        with open(report, "rb") as f:
+            self.assertEqual(f.read(), b"previous report")
+
+    def test_report_path_cannot_be_scanned_input(self):
+        # Before: --out/--csv naming a file the scan reads replaced that file with the report, exit 0.
+        folder = os.path.join(self.root, "carve")
+        os.makedirs(folder)
+        carved = os.path.join(folder, "page.bin")
+        with open(carved, "wb") as f:
+            f.write(page(pages=4))
+        rpf = os.path.join(self.root, "nav.rpf")
+        make_rpf(rpf)
+        originals = {}
+        for path in (carved, rpf):
+            with open(path, "rb") as f:
+                originals[path] = f.read()
+        cases = [((folder, "--out", carved), carved), ((folder, "--csv", carved), carved),
+                 ((rpf, "--out", rpf), rpf), ((rpf, "--csv", rpf), rpf)]
+        for args, path in cases:
+            r = subprocess.run([sys.executable, "-I", TOOL, *args], cwd=ROOT, capture_output=True, text=True,
+                               check=False)
+            self.assertEqual(r.returncode, 2, r.stderr)
+            self.assertIn("would overwrite the input", r.stderr)
+            self.assertNotIn("Traceback", r.stderr)
+            with open(path, "rb") as f:
+                self.assertEqual(f.read(), originals[path], f"{args} touched the input")
+
+    def test_differently_cased_report_path_cannot_be_scanned_input(self):
+        # Before: on a case-insensitive filesystem, --out/--csv spelling the input folder in another case
+        # passed the containment check and replaced the carved file with the report, exit 0.
+        folder = os.path.join(self.root, "carve")
+        os.makedirs(os.path.join(folder, "sub"))
+        carved = os.path.join(folder, "page.bin")
+        nested = os.path.join(folder, "sub", "deep.bin")
+        for path in (carved, nested):
+            with open(path, "wb") as f:
+                f.write(page(pages=4))
+        cased = os.path.join(self.root, "CARVE")
+        if not os.path.isdir(cased):
+            self.skipTest("the temporary folder is on a case-sensitive filesystem")
+        module = load_tool_module()
+        for spelled in (os.path.join(cased, "page.bin"), os.path.join(cased, "PAGE.BIN"),
+                        os.path.join(cased, "sub", "deep.bin")):
+            self.assertTrue(module.is_scanned_input(spelled, folder, None), spelled)
+            self.assertTrue(module.is_scanned_input(spelled, cased, None), spelled)
+        for flag in ("--out", "--csv"):
+            r = subprocess.run([sys.executable, "-I", TOOL, folder, flag, os.path.join(cased, "page.bin")],
+                               cwd=ROOT, capture_output=True, text=True, check=False)
+            self.assertEqual(r.returncode, 2, r.stderr)
+            self.assertIn("would overwrite the input", r.stderr)
+            with open(carved, "rb") as f:
+                self.assertEqual(f.read(), page(pages=4), f"{flag} touched the input")
+
+    def test_report_path_linked_to_a_scanned_file_is_scanned_input(self):
+        # Before: a report path the pattern doesn't match was let through even when it is the same file as one the
+        # scan reads. A hard link does that on any filesystem, and so does PAGE.BIN for page.bin on a
+        # case-insensitive macOS or Linux volume, where fnmatch doesn't fold case: the report truncated the input.
+        folder = os.path.join(self.root, "carve")
+        os.makedirs(folder)
+        carved = os.path.join(folder, "page.bin")
+        with open(carved, "wb") as f:
+            f.write(page(pages=4))
+        linked = os.path.join(folder, "report.json")
+        try:
+            os.link(carved, linked)
+        except (OSError, NotImplementedError) as e:
+            self.skipTest(f"no hard links here: {e}")
+        module = load_tool_module()
+        self.assertTrue(module.is_scanned_input(linked, folder, None))
+        for flag in ("--out", "--csv"):
+            r = subprocess.run([sys.executable, "-I", TOOL, folder, flag, linked],
+                               cwd=ROOT, capture_output=True, text=True, check=False)
+            self.assertEqual(r.returncode, 2, r.stderr)
+            self.assertIn("would overwrite the input", r.stderr)
+            with open(carved, "rb") as f:
+                self.assertEqual(f.read(), page(pages=4), f"{flag} touched the input")
+
+    def test_unscanned_file_in_input_folder_is_not_scanned_input(self):
+        folder = os.path.join(self.root, "carve")
+        os.makedirs(folder)
+        with open(os.path.join(folder, "page.bin"), "wb") as f:
+            f.write(page(pages=4))
+        report = os.path.join(folder, "report.json")
+        with open(report, "wb") as f:
+            f.write(b"previous report")
+        module = load_tool_module()
+        self.assertFalse(module.is_scanned_input(report, folder, None))
+
+    def test_sibling_folder_with_shared_prefix_is_not_scanned_input(self):
+        folder = os.path.join(self.root, "carve")
+        sibling = os.path.join(self.root, "carve2")
+        os.makedirs(folder)
+        os.makedirs(sibling)
+        report = os.path.join(sibling, "page.bin")
+        with open(report, "wb") as f:
+            f.write(b"previous report")
+        module = load_tool_module()
+        self.assertFalse(module.is_scanned_input(report, folder, None))
+        self.assertFalse(module.is_scanned_input(os.path.join(folder, "missing.bin"), folder, None))
+
     def test_not_an_rpf(self):
         path = os.path.join(self.root, "not.rpf")
         with open(path, "wb") as f:
@@ -224,6 +370,45 @@ class MissingInputTest(unittest.TestCase):
             self.assertIn("missing.rpf", p.stderr)
             self.assertNotIn("Traceback", p.stderr)
             self.assertFalse(os.path.exists(out))
+
+
+class LimitWindowTest(unittest.TestCase):
+    """--limit must bound the bytes read, not just where signatures are searched."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.rpf = os.path.join(self.tmp.name, "window.rpf")
+        self.streams = make_rpf(self.rpf)
+        self.mod = load_tool_module()
+
+    def summary(self, limit):
+        _rows, summary = self.mod.scan_archive(self.rpf, limit=limit)
+        self.assertLessEqual(summary["compressed_bytes"], summary["span"])
+        self.assertLessEqual(summary["readable_fraction"], 1.0)
+        self.assertEqual(summary["compressed_bytes"] + summary["zero_padding"] + summary["unread_bytes"],
+                         summary["span"])
+        return summary
+
+    def test_stream_crossing_the_limit_is_not_counted(self):
+        # The zlib header is inside the window but its body is not: counting it would make the
+        # compressed bytes exceed the span and readable_fraction greater than 1.
+        summary = self.summary(10)
+        self.assertEqual(summary["span"], 10)
+        self.assertEqual(summary["streams"], 0)
+        self.assertEqual(summary["compressed_bytes"], 0)
+
+    def test_stream_ending_at_the_limit_is_counted(self):
+        summary = self.summary(len(self.streams[0]))
+        self.assertEqual(summary["span"], len(self.streams[0]))
+        self.assertEqual(summary["streams"], 1)
+        self.assertEqual(summary["compressed_bytes"], len(self.streams[0]))
+        self.assertEqual(summary["readable_fraction"], 1.0)
+
+    def test_window_too_short_for_a_signature_has_no_streams(self):
+        summary = self.summary(1)
+        self.assertEqual(summary["streams"], 0)
+        self.assertEqual(summary["span"], 1)
 
 
 if __name__ == "__main__":

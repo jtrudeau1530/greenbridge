@@ -5,7 +5,7 @@
 // registers that T# -> image index 1 and the shader's literal S# -> sampler index 1, binds an 8x8 gradient at
 // index 1 and a magenta fallback at index 0, draws a full-screen triangle and dumps the RGBA32F result.
 //
-//   vk_texture_test <vs.spv> <fs.spv> <out.raw> <ptr_sgpr> <s0> <s1> <s2> <s3> [--two-mip]   (S# words as hex)
+//   vk_texture_test <vs.spv> <fs.spv> <out.raw> <ptr_sgpr> <s0> <s1> <s2> <s3> [--two-mip|--two-mip-sint]   (S# words as hex)
 //   --two-mip: expose a 128x128 quadrant texture and its solid cyan mip 1 to the 64x64 draw.
 //   vk_texture_test cube [out.raw]: ps_cube_sample against two 8x8 cubes, a 12-layer 2D array at binding 3 (the
 //   translator's view of a cube array); every pixel must be the texel a cube sample of its direction reads.
@@ -21,6 +21,8 @@
 // capability on a device without shaderResourceMinLod prints "unsupported: ..." and exits 77.
 #define VK_NO_PROTOTYPES
 #include "vulkan_loader.h"
+#include "vk_device_pick.h"
+#include "vk_shader_fma.h"
 
 #include <algorithm>
 #include <cmath>
@@ -57,10 +59,12 @@ static bool declares_capability(const std::vector<uint32_t>& spv, uint32_t cap) 
 }
 
 #include "../src/descriptor_table.h"
+#include "../src/gfx10_descriptors.h"
 
 int main(int argc, char** argv) {
     const uint32_t W = 64, H = 64, TW = 8;
-    const bool two_mip = argc == 10 && std::strcmp(argv[9], "--two-mip") == 0;
+    const bool signed_mips = argc == 10 && std::strcmp(argv[9], "--two-mip-sint") == 0;
+    const bool two_mip = signed_mips || (argc == 10 && std::strcmp(argv[9], "--two-mip") == 0);
     // With vs_ids spanning UV [0,1] over the viewport, adjacent fragments differ by two base texels.
     const uint32_t texture_side = two_mip ? 2 * W : TW;
     const uint32_t levels = two_mip ? 2 : 1;
@@ -105,21 +109,29 @@ int main(int argc, char** argv) {
         if (dref)
             ssharp[0] |= 3u << 12;              // the shader's S#: DEPTH_COMPARE_FUNC = LESSEQUAL
     } else {
-        std::fprintf(stderr, "usage: vk_texture_test [cube|dref|dref_a16] [out] | vs fs out ptr_sgpr s0 s1 s2 s3 [--two-mip]\n");
+        std::fprintf(stderr, "usage: vk_texture_test [cube|dref|dref_a16] [out] | vs fs out ptr_sgpr s0 s1 s2 s3 [--two-mip|--two-mip-sint]\n");
         return 2;
     }
-    uint32_t tsharp[8] = {0x11111111, 0x22222222, 0x33333333, 0x44444444,
-                          0x55555555, 0x66666666, 0x77777777, 0x88888888};   // any 8 dwords; only the key matters
+    // Word 1 also selects the numeric type when the shader fetches through this key.
+    const VkFormat sampled_format = dref ? VK_FORMAT_D32_SFLOAT :
+        signed_mips ? VK_FORMAT_R8G8B8A8_SINT : VK_FORMAT_R8G8B8A8_UNORM;
+    uint32_t tsharp[8] = {0x11111111, leonida::gfx10::format_from_vulkan(sampled_format) << 20, 0x33333333, 0x44444444,
+                          0x55555555, 0x66666666, 0x77777777, 0x88888888};
     const uint32_t tsharp_va = 256;
 
     gipa = load_vulkan();
-    if (!gipa) { std::fprintf(stderr, "the Vulkan loader was not found\n"); return 1; }
+    if (!gipa) { std::fprintf(stderr, "the Vulkan loader was not found\n"); return 77; }
     VkInstance inst = VK_NULL_HANDLE;
 #define LI(n) auto n = reinterpret_cast<PFN_##n>(gipa(inst, #n))
     LI(vkCreateInstance);
     VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO}; app.apiVersion = VK_API_VERSION_1_2;
     VkInstanceCreateInfo ici{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO}; ici.pApplicationInfo = &app;
-    CHECK(vkCreateInstance(&ici, nullptr, &inst));
+    const VkResult instance_result = vkCreateInstance(&ici, nullptr, &inst);
+    if (instance_result == VK_ERROR_INCOMPATIBLE_DRIVER) return 77;  // no ICD, as on a GPU-less runner
+    if (instance_result != VK_SUCCESS) {
+        std::fprintf(stderr, "FAILED vkCreateInstance -> %d (line %d)\n", instance_result, __LINE__);
+        return 1;
+    }
     LI(vkEnumeratePhysicalDevices); LI(vkGetPhysicalDeviceProperties); LI(vkGetPhysicalDeviceQueueFamilyProperties);
     LI(vkGetPhysicalDeviceMemoryProperties); LI(vkCreateDevice); LI(vkGetDeviceProcAddr);
     uint32_t n = 0;
@@ -128,16 +140,18 @@ int main(int argc, char** argv) {
     if (n) CHECK(vkEnumeratePhysicalDevices(inst, &n, pds.data()));
     if (!n) {
         std::fprintf(stderr, "unsupported: no Vulkan physical device\n");
-        return two_mip ? 77 : 1;
+        return 77;  // a missing device is a skip in every texture-test mode
     }
     VkPhysicalDevice pd = VK_NULL_HANDLE;
     VkPhysicalDeviceProperties properties{};
+    int best_rank = -1;
     for (uint32_t i = 0; i < n; ++i) {
         VkPhysicalDeviceProperties p;
         vkGetPhysicalDeviceProperties(pds[i], &p);
-        if (!pd || p.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) {
+        if (const int rank = leonida::vk_test::device_rank(p.deviceType, p.vendorID); rank > best_rank) {
             pd = pds[i];
             properties = p;
+            best_rank = rank;
         }
     }
     constexpr uint32_t push_words = 36;
@@ -145,7 +159,7 @@ int main(int argc, char** argv) {
     if (properties.limits.maxPushConstantsSize < push_bytes) {
         std::fprintf(stderr, "unsupported: need %u push constant bytes, device has %u\n",
                      push_bytes, properties.limits.maxPushConstantsSize);
-        return two_mip ? 77 : 1;
+        return 77;   // a device limit, not a wrong result: every texture test skips (128-byte devices, D3D-14)
     }
     uint32_t qn = 0; vkGetPhysicalDeviceQueueFamilyProperties(pd, &qn, nullptr);
     std::vector<VkQueueFamilyProperties> qf(qn); vkGetPhysicalDeviceQueueFamilyProperties(pd, &qn, qf.data());
@@ -153,7 +167,7 @@ int main(int argc, char** argv) {
     while (qi < qn && !(qf[qi].queueFlags & VK_QUEUE_GRAPHICS_BIT)) ++qi;
     if (qi == qn) {
         std::fprintf(stderr, "unsupported: no graphics queue family\n");
-        return two_mip ? 77 : 1;
+        return 77;  // a missing queue is a skip in every texture-test mode
     }
     float prio = 1;
     VkDeviceQueueCreateInfo qci{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
@@ -176,6 +190,9 @@ int main(int argc, char** argv) {
         return 77;
     }
     std::vector<const char*> enable;
+    leonida::vk_test::ShaderFma fma;      // OpFmaKHR (rdna2spirv.py --fma khr), when the device has it
+    fma.query(gipa, inst, pd);
+    if (fma.supported()) { enable.push_back(fma.extension()); fma.link_after(&f2); }
     bool m8_on = false;
 #ifdef VK_KHR_MAINTENANCE_8_EXTENSION_NAME   // the structure type is an enumerator: defined() never sees it
     // Older Vulkan headers (as on some CI images) do not declare maintenance8; the test is then unsupported.
@@ -242,6 +259,8 @@ int main(int argc, char** argv) {
     CHECK(make_buffer(heap_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT, &heap, &heapm, &heapp));
     std::memset(heapp, 0, size_t(heap_bytes));
     std::memcpy(static_cast<char*>(heapp) + tsharp_va, tsharp, 32);
+    if (two_mip)  // The gather test loads its S# from the four words just after the T#.
+        std::memcpy(static_cast<char*>(heapp) + tsharp_va + 32, ssharp, 16);
     VkBufferDeviceAddressInfo bdai{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO}; bdai.buffer = heap;
     VkDeviceAddress heap_base = vkGetBufferDeviceAddress(dev, &bdai);
     // Descriptor hash table: 16 slots.
@@ -286,6 +305,9 @@ int main(int argc, char** argv) {
                                          : (x * 32u) | ((y * 32u) << 8) | (128u << 16) | (255u << 24);
         }
     }
+    // The signed two-mip fixture uses 0 or -128 in each channel, including the alpha channel.
+    if (signed_mips)
+        for (auto& texel : texels) texel &= 0x80808080u;
     if (dref) {   // same size as the 8x8 gradient: one 32-bit word a texel
         for (uint32_t y = 0; y < TW; y++)
             for (uint32_t x = 0; x < TW; x++) {
@@ -300,7 +322,7 @@ int main(int argc, char** argv) {
             for (uint32_t l = 0; l < CUBE_LAYERS; l++)
                 cubes[(l * TW + y) * TW + x] = (x * 32u) | ((y * 32u) << 8) | ((l * 20u) << 16) | (255u << 24);
         }
-    const VkFormat tfmt[4] = {VK_FORMAT_R8G8B8A8_UNORM, dref ? VK_FORMAT_D32_SFLOAT : VK_FORMAT_R8G8B8A8_UNORM,
+    const VkFormat tfmt[4] = {VK_FORMAT_R8G8B8A8_UNORM, sampled_format,
                               VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R8G8B8A8_UNORM};
     VkImage timg[4]; VkImageView tview[4];
     CHECK(make_tex(1, 1, 1, 1, VK_IMAGE_VIEW_TYPE_2D, tfmt[0], &timg[0], &tview[0]));
@@ -321,6 +343,12 @@ int main(int argc, char** argv) {
     sci.maxLod = float(levels - 1);
     sci.addressModeU = sci.addressModeV = sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
     VkSamplerCreateInfo sci1 = sci;            // index 1: the S# the shader names
+    if (two_mip) {
+        const leonida::gfx10::SamplerWords words{ssharp[0], ssharp[1], ssharp[2], ssharp[3]};
+        const auto sampler = leonida::gfx10::decode(words);
+        sci1.minLod = sampler.min_lod;
+        sci1.maxLod = sampler.max_lod;
+    }
     if (dref) {
         sci1.compareEnable = VK_TRUE;
         sci1.compareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
@@ -351,6 +379,9 @@ int main(int argc, char** argv) {
     VkSubpassDescription sd{}; sd.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS; sd.colorAttachmentCount = 1; sd.pColorAttachments = &ar;
     VkRenderPassCreateInfo rpi{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
     rpi.attachmentCount = 1; rpi.pAttachments = &ad; rpi.subpassCount = 1; rpi.pSubpasses = &sd;
+    VkSubpassDependency copy_dep{0, VK_SUBPASS_EXTERNAL, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                                 VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT};
+    rpi.dependencyCount = 1; rpi.pDependencies = &copy_dep;
     VkRenderPass rp; CHECK(vkCreateRenderPass(dev, &rpi, nullptr, &rp));
     VkFramebufferCreateInfo fbi{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
     fbi.renderPass = rp; fbi.attachmentCount = 1; fbi.pAttachments = &rtv; fbi.width = W; fbi.height = H; fbi.layers = 1;
@@ -458,7 +489,10 @@ int main(int argc, char** argv) {
     CHECK(vkEndCommandBuffer(cmd));
     VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO}; si.commandBufferCount = 1; si.pCommandBuffers = &cmd;
     CHECK(vkQueueSubmit(q, 1, &si, VK_NULL_HANDLE)); CHECK(vkQueueWaitIdle(q));
-    std::ofstream(out_path, std::ios::binary).write(static_cast<const char*>(rbp), std::streamsize(W) * H * 16);
+    std::ofstream output(out_path, std::ios::binary);
+    output.write(static_cast<const char*>(rbp), std::streamsize(W) * H * 16);
+    output.close();
+    if (!output) { std::fprintf(stderr, "failed to write %s\n", out_path.c_str()); return 1; }
     std::fprintf(stderr, "ok -> %s (heap base 0x%llx)\n", out_path.c_str(), (unsigned long long)heap_base);
     if (autonomous && cube) {
         // Expected: the texel a cube sample of the pixel centre's direction reads from the second cube (layer 6 + face).

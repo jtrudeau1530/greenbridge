@@ -58,9 +58,42 @@ Every exact resolution above is confirmed by the +0x20 key: 5,107/5,107 hashes, 
 candidate had a valid lower-cased joaat but the wrong 64-bit key, which is exactly the same-hash case the
 confirmation exists for. Derived `_lod`/`_slod` names are confirmed the same way; they add 2,741 entities.
 
-This is a **dictionary-coverage lower bound**, not a claim that the other archetypes have no names. The
+This is a **dictionary-coverage lower bound**, not a claim that the other archetypes have no names (see
+[Whole-archive coverage](#whole-archive-coverage)). The
 unresolved majority is dominated by models whose names are not in the local exports, and the same 32-bit
 formula is proven by every resolved entry.
+
+## Whole-archive coverage
+
+The windows above use only names that were already exported locally. The names of almost all the other
+archetypes are in `levels.rpf` itself: `tools/rpf9_names.py` lists the `name.#dr` and `name.#ft` strings of every
+stream. A full pass over the data area (76.15 GB, 5,255 s) inflates 1,116,073 zlib streams (98.32% of
+compressed bytes) and finds 235,814 named streams / 318,266 unique names (267,463 `.#dr`, 50,803 `.#ft`);
+with that list as the dictionary nearly every placement resolves. Whole `levels.rpf`, one
+`world_index.py --archetypes-out` run (23,532 placement maps and 1,670,435 entities: 3 maps and 7 entities fewer
+than the census in [world.md](world.md#how-many-are-there), which also joins the raw continuation page that 3
+placement maps use and `world_index.py` does not; 228,681 distinct `archetypeName` hashes, one 64-bit key per hash, no conflicting keys,
+no incomplete entity records):
+
+| Dictionary (`world_names.py build --rpf9-names`) | Archetype hashes resolved | Entities resolved |
+|---|---:|---:|
+| `rpf9_names.py --types dr,ft` (default `--max-inflate`, 1 MiB) | 227,422 (99.45%) | 1,667,978 (99.85%) |
+| `rpf9_names.py --types dr,ft --max-inflate 268435456` | 228,430 (99.89%) | 1,669,373 (99.94%) |
+| `rpf9_names.py --types dr` only (default) | 217,491 (95.11%) | 508,600 (30.45%) |
+
+Every resolved hash is **verified** by the entity's 64-bit key (Murmur3-64, see Result): 0 unverified, 0
+unconfirmed, 0 ambiguous. Two observations explain the earlier lower bound:
+
+- **Fragments carry most placed objects.** Fragment (`.#ft`) names resolve only ~10,000 more hashes than
+  drawable names alone, but those archetypes account for about 70% of the entities.
+- **Map LOD models are drawable-dictionary members.** A drawable dictionary is one resource with several member
+  drawables, each with its own `name.#dr` string; a model export that takes one name per resource misses the
+  others, but `rpf9_names.py` lists every name string. In a local structural check (member = named drawable
+  root with a valid LOD table), dictionary member names account for 99,987 of the 228,681 hashes (43.7%) but
+  only 110,650 entities (6.6%): many distinct LOD models, each placed a few times. Some member names lie deep
+  in large resources: raising `--max-inflate` from 1 MiB to 256 MiB adds 1,008 hashes, 992 of them members.
+
+The 251 hashes (1,062 entities) left have no match in the 256 MiB name list.
 
 ## Map-name coverage
 
@@ -114,7 +147,22 @@ python -I tests\test_world_names.py
 ```
 
 `build` accepts model manifests (a file or a tree containing `models/manifest.json`), rpf9dump scan JSON,
-one-name-per-line text and `common.rpf` XML. `--derive-lod` adds the separate `_lod`/`_slod` table.
+one-name-per-line text, `rpf9_names.py` index JSON (`--rpf9-names`) and `common.rpf` XML. `--derive-lod` adds the
+separate `_lod`/`_slod` table.
+
+The whole-archive numbers above come from these four commands (no other inputs):
+
+```powershell
+python -I tools\rpf9_names.py <game>\levels.rpf <work>\world\rpf9_names.json --types dr,ft --max-inflate 268435456
+python -I tools\world_index.py <game>\levels.rpf --out <work>\world\world_index.json `
+    --archetypes-out <work>\world\archetypes.json
+python -I tools\world_names.py build --rpf9-names <work>\world\rpf9_names.json --out <work>\world\names.json
+python -I tools\world_names.py resolve --dict <work>\world\names.json `
+    --archetypes <work>\world\archetypes.json --out <work>\world\names-report.json
+```
+
+`resolve` adds the counts of several `--archetypes` files, so make one whole-archive file rather than one per
+window; `--rpf9-names` may be given once per window.
 
 `resolve` accepts `world_index`/`world_census` map JSON (or a row list) and an aggregate archetype file:
 

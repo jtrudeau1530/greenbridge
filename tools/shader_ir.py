@@ -20,57 +20,116 @@ SPECIAL = {"vcc", "vcc_lo", "vcc_hi", "exec", "exec_lo", "exec_hi", "m0", "scc",
            "src_private_base", "src_private_limit", "src_pops_exiting_wave_id", "lds", "flat_scratch",
            "flat_scratch_lo", "flat_scratch_hi", "ttmp", "tba", "tma"}
 
+# operand() runs once per operand of every instruction of every shader, so its patterns are compiled once here
+# rather than looked up in re's cache on each call.
+_NEG = re.compile(r"neg\((.+)\)")
+_ABS = re.compile(r"abs\((.+)\)")
+_SEXT = re.compile(r"sext\((.+)\)")
+_REG = re.compile(r"([sv])(\d+)")
+_REG_RANGE = re.compile(r"([sv])\[(\d+):(\d+)\]")
+_TTMP = re.compile(r"ttmp(\d+)|ttmp\[(\d+):(\d+)\]")
+_VLIST = re.compile(r"\[(v\d+(?:,\s*v\d+)+)\]")
+_ATTR = re.compile(r"attr(\d+)\.([xyzw])")
+_TARGET = re.compile(r"(pos|param|mrt|mrtz|null|prim)(\d*)")
+_INT = re.compile(r"-?(0x[0-9a-fA-F]+|\d+)")
+_FLOAT = re.compile(r"-?\d+\.\d+(e[+-]?\d+)?")
+
 
 def operand(tok):
     t = tok.strip()
     neg = t.startswith("-")
     core = t[1:] if neg else t
-    absm = core.startswith("|") and core.endswith("|")
+    absm = len(core) > 2 and core.startswith("|") and core.endswith("|")
     if absm:
         core = core[1:-1]
-    m = re.fullmatch(r"neg\((.+)\)", core)
-    if m:  # VOP3 negation of an inline constant, printed as neg(0) / neg(1.0)
+    # Fast path for the commonest operand, a single register (v3, s12): the same dict _REG builds below, and
+    # such a token can't match any of the neg/abs/sext forms tried before it.
+    if len(core) > 1 and core[0] in "sv" and core[1:].isdigit():
+        return {"k": core[0] + "gpr", "r": int(core[1:]), "n": 1, "neg": neg, "abs": absm}
+    m = _NEG.fullmatch(core)
+    if m:  # VOP3 FP negation: neg(0), neg(1.0), neg(0x3f800000), neg(|1.0|), neg(v1)
         inner = operand(m.group(1))
-        if inner.get("k") == "imm":
-            return {"k": "fimm", "v": -float(inner["v"]), "abs": False} if inner["v"] == 0 else {"k": "imm", "v": -inner["v"]}
-        if inner.get("k") == "fimm":
-            return {**inner, "v": -inner["v"]}
-        inner["neg"] = not inner.get("neg", False)
+        if absm:
+            # Outer |...| absorbs the inner neg; outer '-' (if any) negates the result.
+            inner["abs"] = True
+            if neg:
+                inner["neg"] = True
+            elif inner.get("k") in ("imm", "fimm"):
+                inner.pop("neg", None)
+            else:
+                inner["neg"] = False
+        elif not neg:
+            # Keep neg as a VOP3 sign-bit modifier on constants instead of integer negation:
+            # in LLVM AMDGPU, neg(1) flips bit 31 (0x80000001) while -1 is 0xffffffff.
+            new_neg = not inner.get("neg", False)
+            if not new_neg and inner.get("k") in ("imm", "fimm"):
+                inner.pop("neg", None)
+            else:
+                inner["neg"] = new_neg
         return inner
-    m = re.fullmatch(r"sext\((.+)\)", core)
+    m = _ABS.fullmatch(core)
+    if m:  # VOP3 FP absolute value: abs(v0), abs(0xbf800000), neg(abs(1.0))
+        inner = operand(m.group(1))
+        inner["abs"] = True
+        if neg:
+            inner["neg"] = True
+        elif inner.get("k") in ("imm", "fimm"):
+            inner.pop("neg", None)
+        else:
+            inner["neg"] = False
+        return inner
+    m = _SEXT.fullmatch(core)
     if m:  # SDWA integer sign-extension of the selected source bits
         inner = operand(m.group(1))
         inner["sext"] = True
+        if absm:
+            inner["abs"] = True
         inner["neg"] = inner.get("neg", False) or neg
         return inner
-    m = re.fullmatch(r"([sv])(\d+)", core)
+    m = _REG.fullmatch(core)
     if m:
         return {"k": m.group(1) + "gpr", "r": int(m.group(2)), "n": 1, "neg": neg, "abs": absm}
-    m = re.fullmatch(r"([sv])\[(\d+):(\d+)\]", core)
+    m = _REG_RANGE.fullmatch(core)
     if m:
         lo, hi = int(m.group(2)), int(m.group(3))
         return {"k": m.group(1) + "gpr", "r": lo, "n": hi - lo + 1, "neg": neg, "abs": absm}
-    m = re.fullmatch(r"ttmp(\d+)|ttmp\[(\d+):(\d+)\]", core)
+    m = _TTMP.fullmatch(core)
     if m:
         return {"k": "ttmp", "t": core}
-    m = re.fullmatch(r"\[(v\d+(?:,\s*v\d+)+)\]", core)
+    m = _VLIST.fullmatch(core)
     if m:  # NSA image address: non-contiguous VGPR list
         return {"k": "vlist", "r": [int(x.strip()[1:]) for x in m.group(1).split(",")]}
-    m = re.fullmatch(r"attr(\d+)\.([xyzw])", core)
+    m = _ATTR.fullmatch(core)
     if m:
         return {"k": "attr", "a": int(m.group(1)), "c": "xyzw".index(m.group(2))}
     if core in ("p0", "p10", "p20"):
         return {"k": "interp", "t": core}
-    m = re.fullmatch(r"(pos|param|mrt|mrtz|null|prim)(\d*)", core)
+    m = _TARGET.fullmatch(core)
     if m and core not in ("null",):
         return {"k": "target", "t": core}
     if core in SPECIAL:
         return {"k": "special", "t": core, "neg": neg, "abs": absm}
-    if re.fullmatch(r"-?(0x[0-9a-fA-F]+|\d+)", core):
-        v = int(core, 0)
+    if _INT.fullmatch(core):
+        # int(core, 0) rejects the leading-zero decimals this regex accepts ('010', '08', '0001'),
+        # which aborts a whole parse_file() run on one disassembly line.
+        neg_core = core.startswith("-")
+        digits = core[1:] if neg_core else core
+        v = int(digits, 16) if digits.lower().startswith("0x") else int(digits, 10)
+        if neg_core:
+            v = -v
+        if absm:
+            out = {"k": "imm", "v": v, "abs": True}
+            if neg:
+                out["neg"] = True
+            return out
         return {"k": "imm", "v": -v if neg else v}
-    if re.fullmatch(r"-?\d+\.\d+(e[+-]?\d+)?", core):
-        return {"k": "fimm", "v": float(core) * (-1 if neg else 1), "abs": absm}
+    if _FLOAT.fullmatch(core):
+        if absm:
+            out = {"k": "fimm", "v": float(core), "abs": True}
+            if neg:
+                out["neg"] = True
+            return out
+        return {"k": "fimm", "v": float(core) * (-1 if neg else 1), "abs": False}
     if core.startswith("hwreg(") or core.startswith("sendmsg(") or core.startswith("vmcnt(") or \
             core.startswith("expcnt(") or core.startswith("lgkmcnt(") or core.startswith("vscnt(") or \
             core.startswith("depctr") or core.startswith("instid") or core.startswith("quad_perm") or \
@@ -116,7 +175,9 @@ def parse_line(line):
     code = code.strip()
     if not code:
         return None
-    op, _, rest = code.partition(" ")
+    fields = code.split(maxsplit=1)
+    op = fields[0]
+    rest = fields[1] if len(fields) > 1 else ""
     # sendmsg(MSG_GS, GS_OP_NOP) contains a comma: keep it as one operand.
     rest = SENDMSG.sub(lambda m: m.group(0).replace(", ", "|").replace(",", "|"), rest)
     mods = MODWORDS.findall(rest)
@@ -171,10 +232,12 @@ def main(argv=None):
     a = ap.parse_args(argv)
     if not os.path.isdir(a.src):
         ap.error(f"{a.src} is not a folder")
-    files = sorted(f for f in os.listdir(a.src) if f.endswith(".s"))[:a.limit]
+    with os.scandir(a.src) as entries:
+        files = sorted(entry.path for entry in entries
+                       if entry.name.endswith(".s") and entry.is_file())[:a.limit]
     kinds, raw, n_ins, no_enc = Counter(), Counter(), 0, 0
-    for f in files:
-        info = parse_file(os.path.join(a.src, f))
+    for path in files:
+        info = parse_file(path)
         for ins in info["insns"]:
             n_ins += 1
             no_enc += ins["enc"] is None
@@ -188,4 +251,8 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
+    try:  # a redirected stdout is strict ANSI code page under -I; write '?' for what it cannot encode
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
     sys.exit(main())

@@ -20,8 +20,11 @@
 // LEONIDA_VK_VALIDATION=1 runs under VK_LAYER_KHRONOS_validation; a validation error fails the test.
 #define VK_NO_PROTOTYPES
 #include "vulkan_loader.h"
+#include "vk_device_pick.h"
+#include "vk_shader_fma.h"
 #include "../src/vulkan_bindless.h"
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstdio>
@@ -29,6 +32,7 @@
 #include <cstring>
 #include <fstream>
 #include <iterator>
+#include <limits>
 #include <vector>
 
 #define CHECK(x)                                                                     \
@@ -72,6 +76,16 @@ std::vector<std::uint32_t> read_spv(const char* path) {
     return words;
 }
 
+// Expected RGBA values in this test are finite. Report the worst channel error per pixel.
+float pixel_error(const float* pixel, const float* want) {
+    float error = 0;
+    for (int c = 0; c < 4; ++c) {
+        if (!std::isfinite(pixel[c])) return std::numeric_limits<float>::infinity();
+        error = std::max(error, std::fabs(pixel[c] - want[c]));
+    }
+    return error;
+}
+
 DescriptorKey numbered(std::uint32_t n) {
     return {n, 0x9e3779b9u * n, n ^ 0x55555555u, n >> 3, 7, n * n, 0x80000000u, ~n};
 }
@@ -92,8 +106,15 @@ std::uint32_t probe_depth(std::span<const std::uint32_t> table, const Descriptor
 
 int main(int argc, char** argv) {
     if (argc < 3) {
-        std::fprintf(stderr, "usage: vk_bindless_test <vs_ids.spv> <ps_tex.spv>\n");
+        std::fprintf(stderr, "usage: vk_bindless_test <vs_ids.spv> <ps_tex.spv | ps_imgatomic.spv>\n");
         return 2;
+    }
+    // A bad readback in a single channel must still fail when all three others match.
+    const float black[4]{};
+    for (int c = 0; c < 4; ++c) {
+        float pixel[4]{};
+        pixel[c] = std::numeric_limits<float>::quiet_NaN();
+        EXPECT(std::isinf(pixel_error(pixel, black)));
     }
     constexpr std::uint32_t W = 64, H = 64, TW = 8;
     constexpr std::uint32_t table_va = 256;  // console VA of the descriptor table: T# at +0, S# at +32
@@ -150,20 +171,33 @@ int main(int argc, char** argv) {
     std::vector<VkPhysicalDevice> pds(n);
     vkEnumeratePhysicalDevices(inst, &n, pds.data());
     VkPhysicalDevice pd = VK_NULL_HANDLE;
+    int best_rank = -1;
     for (auto d : pds) {
         VkPhysicalDeviceProperties p;
         vkGetPhysicalDeviceProperties(d, &p);
         if (p.apiVersion < VK_API_VERSION_1_2) continue;
-        if (!pd || p.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) pd = d;
+        if (const int rank = leonida::vk_test::device_rank(p.deviceType, p.vendorID); rank > best_rank) {
+            pd = d;
+            best_rank = rank;
+        }
     }
     if (!pd) {
         std::printf("unsupported: no Vulkan 1.2 device\n");
         return unsupported;
     }
     VkPhysicalDeviceVulkan12Properties props12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_PROPERTIES};
-    VkPhysicalDeviceProperties2 props{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &props12};
+    VkPhysicalDeviceVulkan11Properties props11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_PROPERTIES, &props12};
+    VkPhysicalDeviceProperties2 props{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &props11};
     vkGetPhysicalDeviceProperties2(pd, &props);
     std::printf("device: %s%s\n", props.properties.deviceName, validation ? " (validation on)" : "");
+    // The pipeline layout pushes the 144-byte translated user-data block. A device with fewer push constant bytes
+    // (128 on Intel Arc and some AMD drivers) can't create it: a device limit, not a wrong result (TEST-149).
+    constexpr std::uint32_t push_bytes = 144;
+    if (props.properties.limits.maxPushConstantsSize < push_bytes) {
+        std::printf("unsupported: need %u push constant bytes, device has %u\n", push_bytes,
+                    props.properties.limits.maxPushConstantsSize);
+        return unsupported;
+    }
 
     // The features ps_tex's metadata names (bufferDeviceAddress, runtimeDescriptorArray, shaderInt64), dynamic
     // indexing of the image array, and whichever descriptor-indexing flags the set can use.
@@ -192,6 +226,15 @@ int main(int argc, char** argv) {
     VkPhysicalDeviceFeatures2 enable{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &enable12};
     enable.features.shaderInt64 = VK_TRUE;
     enable.features.shaderSampledImageArrayDynamicIndexing = VK_TRUE;
+    // ps_imgatomic: image atomics in a pixel shader need fragment stores and atomics.
+    const bool atomic_mode = std::strstr(argv[2], "imgatomic") != nullptr;
+    if (atomic_mode) {
+        if (!have.features.fragmentStoresAndAtomics) {
+            std::printf("unsupported: fragmentStoresAndAtomics (image atomics in a pixel shader)\n");
+            return unsupported;
+        }
+        enable.features.fragmentStoresAndAtomics = VK_TRUE;
+    }
 
     std::uint32_t qn = 0;
     vkGetPhysicalDeviceQueueFamilyProperties(pd, &qn, nullptr);
@@ -205,9 +248,14 @@ int main(int argc, char** argv) {
     qci.queueFamilyIndex = qi;
     qci.queueCount = 1;
     qci.pQueuePriorities = &priority;
+    leonida::vk_test::ShaderFma fma;      // OpFmaKHR (rdna2spirv.py --fma khr), when the device has it
+    fma.query(gipa, inst, pd);
+    fma.link_after(&enable);
+    const char* fma_extension = fma.extension();
     VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &enable};
     dci.queueCreateInfoCount = 1;
     dci.pQueueCreateInfos = &qci;
+    if (fma.supported()) { dci.enabledExtensionCount = 1; dci.ppEnabledExtensionNames = &fma_extension; }
     VkDevice dev = VK_NULL_HANDLE;
     CHECK(vkCreateDevice(pd, &dci, nullptr, &dev));
 #define LD(n) const auto n = reinterpret_cast<PFN_##n>(vkGetDeviceProcAddr(dev, #n))
@@ -222,7 +270,7 @@ int main(int argc, char** argv) {
     LD(vkDeviceWaitIdle); LD(vkDestroyPipeline); LD(vkDestroyPipelineLayout);
     LD(vkDestroyCommandPool); LD(vkDestroyShaderModule); LD(vkDestroyFramebuffer); LD(vkDestroyRenderPass);
     LD(vkDestroySampler); LD(vkDestroyImageView); LD(vkDestroyImage); LD(vkDestroyBuffer);
-    LD(vkFreeMemory); LD(vkDestroyDevice);
+    LD(vkFreeMemory); LD(vkDestroyDevice); LD(vkCmdClearColorImage);
     VkQueue queue = VK_NULL_HANDLE;
     vkGetDeviceQueue(dev, qi, 0, &queue);
     VkPhysicalDeviceMemoryProperties mp;
@@ -408,7 +456,7 @@ int main(int argc, char** argv) {
     const struct { VkImage image; std::uint32_t size; VkDeviceSize offset; VkImageLayout layout; } uploads[] = {
         {gradient, TW, 0, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
         {decoy, 1, 1024, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
-        {stored, 1, 1024, VK_IMAGE_LAYOUT_GENERAL}};
+        {stored, 1, 0, VK_IMAGE_LAYOUT_GENERAL}};
     for (const auto& u : uploads) {
         VkImageMemoryBarrier ib{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
         ib.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
@@ -431,37 +479,61 @@ int main(int argc, char** argv) {
     }
     CHECK(submit());
 
+    // An adapter at the original 5632 sampled-image limit must keep the original set. The per-stage
+    // resource budget can also leave room for just one class (9985 original resources + 512).
+    constexpr auto ms_classes = [](std::uint32_t sampled, std::uint32_t total) {
+        BindlessFeatures f{};
+        f.ms_samples.fill(VK_SAMPLE_COUNT_4_BIT);
+        bindless::limit_ms_bindings(f, sampled, total);
+        return f.ms_samples;
+    };
+    static_assert(ms_classes(5632, 20000) ==
+                  std::array{VK_SAMPLE_COUNT_1_BIT, VK_SAMPLE_COUNT_1_BIT, VK_SAMPLE_COUNT_1_BIT});
+    static_assert(ms_classes(7168, 10497) ==
+                  std::array{VK_SAMPLE_COUNT_4_BIT, VK_SAMPLE_COUNT_1_BIT, VK_SAMPLE_COUNT_1_BIT});
+
     // Does a set with these flags fit the device? Every binding is visible to every stage.
-    constexpr std::uint32_t sampled_total = 4096 + 1024 + 256 + 256, sampler_total = 1024, storage_total = 1024 + 13 * 256;
+    const auto descriptors = [](VkDescriptorType type, const BindlessFeatures& f) {
+        std::uint32_t count = 0;
+        for (std::uint32_t b = 0; b < bindless::bindings.size(); ++b)
+            if (bindless::bindings[b].type == type && bindless::binding_enabled(b, f))
+                count += f.counts[b];
+        return count;
+    };
     const auto fits = [&](const BindlessFeatures& f) {
+        const auto sampled_total = descriptors(VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, f);
+        const auto sampler_total = descriptors(VK_DESCRIPTOR_TYPE_SAMPLER, f);
+        const auto storage_total = descriptors(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, f);
+        const auto stage_resources = sampled_total + storage_total + 2;  // table buffer and fragment output
         const VkPhysicalDeviceLimits& l = props.properties.limits;
         if (f.update_after_bind)
             return props12.maxPerStageDescriptorUpdateAfterBindSampledImages >= sampled_total &&
                    props12.maxPerStageDescriptorUpdateAfterBindSamplers >= sampler_total &&
                    props12.maxPerStageDescriptorUpdateAfterBindStorageImages >= storage_total &&
-                   props12.maxPerStageUpdateAfterBindResources >= sampled_total + sampler_total + storage_total + 1 &&
+                   props12.maxPerStageUpdateAfterBindResources >= stage_resources &&
+                   props12.maxUpdateAfterBindDescriptorsInAllPools >= sampled_total + sampler_total + storage_total + 1 &&
                    props12.maxDescriptorSetUpdateAfterBindSampledImages >= sampled_total &&
                    props12.maxDescriptorSetUpdateAfterBindSamplers >= sampler_total &&
                    props12.maxDescriptorSetUpdateAfterBindStorageImages >= storage_total;
         return l.maxPerStageDescriptorSampledImages >= sampled_total && l.maxPerStageDescriptorSamplers >= sampler_total &&
                l.maxPerStageDescriptorStorageImages >= storage_total &&
-               l.maxPerStageResources >= sampled_total + sampler_total + storage_total + 1 &&
+               l.maxPerStageResources >= stage_resources &&
                l.maxDescriptorSetSampledImages >= sampled_total && l.maxDescriptorSetSamplers >= sampler_total &&
                l.maxDescriptorSetStorageImages >= storage_total;
     };
 
-    unsigned mismatches = 0, runs = 0;
+    unsigned mismatches = 0, runs = 0, readbacks = 0;
     float worst = 0;
     // What the 64x64 target must hold: the texel under each pixel, or one colour everywhere.
     const auto compare = [&](const char* what, const float* colour) {
+        ++readbacks;
         const float* got = static_cast<const float*>(readback_map);
         for (std::uint32_t y = 0; y < H; ++y) {
             for (std::uint32_t x = 0; x < W; ++x) {
                 const float gradient_texel[4] = {float(x * TW / W * 32) / 255.0f, float(y * TW / H * 32) / 255.0f, 128.0f / 255.0f, 1.0f};
                 const float* want = colour ? colour : gradient_texel;
                 const float* pixel = got + (std::size_t(y) * W + x) * 4;
-                float error = 0;
-                for (int c = 0; c < 4; ++c) error = std::max(error, std::fabs(pixel[c] - want[c]));
+                const float error = pixel_error(pixel, want);
                 worst = std::max(worst, error);
                 if (error <= 1e-6f) continue;
                 if (mismatches++ < 6)
@@ -474,17 +546,20 @@ int main(int argc, char** argv) {
     BindlessFeatures configurations[2] = {device_flags, {}};
     const int configuration_count = (device_flags.update_after_bind || device_flags.partially_bound) ? 2 : 1;
     for (int configuration = 0; configuration < configuration_count; ++configuration) {
-        const BindlessFeatures flags = configurations[configuration];
+        BindlessFeatures flags = configurations[configuration];
+        flags.ms_samples[0] = VK_SAMPLE_COUNT_4_BIT;
+        // A device below the default counts gets a smaller set; this test needs at least those.
+        const bool full = bindless::size_bindings(flags, props.properties.limits, props11, props12);
         const char* name = flags.update_after_bind && flags.partially_bound ? "update after bind, partially bound"
                            : flags.update_after_bind ? "update after bind" : flags.partially_bound ? "partially bound" : "no flags";
-        if (!fits(flags)) {
+        if (!full || !fits(flags)) {
             std::printf("%s: skipped, the set does not fit this device's descriptor limits\n", name);
             continue;
         }
         BindlessSet set(vkGetDeviceProcAddr, dev, mp, flags);
         EXPECT(set.ok() && set.layout() && set.set());
 
-        const VkPushConstantRange push{VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, 144};
+        const VkPushConstantRange push{VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, push_bytes};
         const VkDescriptorSetLayout set_layout = set.layout();
         VkPipelineLayoutCreateInfo pli{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
         pli.setLayoutCount = 1;
@@ -583,13 +658,13 @@ int main(int argc, char** argv) {
         const std::uint32_t stored_index = set.add_image(ImageDimension::dim_2d, stored_view, VK_IMAGE_LAYOUT_GENERAL, as_storage);
         const std::uint32_t decoy_index = set.add_image(ImageDimension::dim_2d, decoy_view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
         const std::uint32_t gradient_index = set.add_image(ImageDimension::dim_2d, gradient_view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-        EXPECT(stored_index >= 1 && stored_index < bindless::storage_indices);
-        EXPECT(decoy_index >= bindless::storage_indices && gradient_index > decoy_index);
-        EXPECT(gradient_index < bindless::image_capacity(ImageDimension::dim_2d));
+        EXPECT(stored_index >= 1 && stored_index < set.storage_capacity(ImageDimension::dim_2d));
+        EXPECT(decoy_index >= set.storage_capacity(ImageDimension::dim_2d) && gradient_index > decoy_index);
+        EXPECT(gradient_index < set.image_capacity(ImageDimension::dim_2d));
         std::vector<std::uint32_t> filled;
-        for (std::uint32_t i = 1; i < bindless::image_capacity(ImageDimension::dim_1d); ++i)
+        for (std::uint32_t i = 1; i < set.image_capacity(ImageDimension::dim_1d); ++i)
             filled.push_back(set.add_image(ImageDimension::dim_1d, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_GENERAL));
-        EXPECT(filled.front() == 1 && filled.back() == bindless::image_capacity(ImageDimension::dim_1d) - 1);
+        EXPECT(filled.front() == 1 && filled.back() == set.image_capacity(ImageDimension::dim_1d) - 1);
         EXPECT(set.add_image(ImageDimension::dim_1d, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_GENERAL) == 0);
         set.remove_image(ImageDimension::dim_1d, 7);
         EXPECT(set.add_image(ImageDimension::dim_1d, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_GENERAL) == 7);
@@ -597,6 +672,171 @@ int main(int argc, char** argv) {
         const std::uint32_t decoy_sampler = set.add_sampler(nearest);
         const std::uint32_t sampler_index = set.add_sampler(nearest);
         EXPECT(decoy_sampler == 1 && sampler_index == 2);
+
+        if (atomic_mode) {
+            // ps_imgatomic.asm: image_atomic_umax/umin/or on three 8x8 r32ui images and umax on a 4x4x4 one, from
+            // every pixel of the 64x64 draw (64 pixels per 2D texel), each found through its own T# key. Odd
+            // pixels are discarded after their atomics, which still count.
+            constexpr std::uint32_t atomic_va = 1024, AW = 8, A3 = 4;
+            const std::array<DescriptorKey, 4> keys{{{0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7, 0xa8},
+                                                     {0xb1, 0xb2, 0xb3, 0xb4, 0xb5, 0xb6, 0xb7, 0xb8},
+                                                     {0xc1, 0xc2, 0xc3, 0xc4, 0xc5, 0xc6, 0xc7, 0xc8},
+                                                     {0xd1, 0xd2, 0xd3, 0xd4, 0xd5, 0xd6, 0xd7, 0xd8}}};
+            for (std::uint32_t k = 0; k < 4; ++k)
+                std::memcpy(static_cast<char*>(heap_map) + atomic_va + 32 * k, keys[k].data(), 32);
+            const VkImageUsageFlags atomic_usage =
+                VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+            VkImage images[4];
+            VkImageView views[4];
+            for (int k = 0; k < 3; ++k) CHECK(make_image(VK_FORMAT_R32_UINT, AW, AW, atomic_usage, &images[k], &views[k]));
+            {   // the 3D image
+                VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+                ii.imageType = VK_IMAGE_TYPE_3D;
+                ii.format = VK_FORMAT_R32_UINT;
+                ii.extent = {A3, A3, A3};
+                ii.mipLevels = 1;
+                ii.arrayLayers = 1;
+                ii.samples = VK_SAMPLE_COUNT_1_BIT;
+                ii.usage = atomic_usage;
+                CHECK(vkCreateImage(dev, &ii, nullptr, &images[3]));
+                VkMemoryRequirements mr;
+                vkGetImageMemoryRequirements(dev, images[3], &mr);
+                VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+                ai.allocationSize = mr.size;
+                ai.memoryTypeIndex = memtype(mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+                VkDeviceMemory m;
+                CHECK(vkAllocateMemory(dev, &ai, nullptr, &m));
+                allocations.push_back(m);
+                CHECK(vkBindImageMemory(dev, images[3], m, 0));
+                VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+                vi.image = images[3];
+                vi.viewType = VK_IMAGE_VIEW_TYPE_3D;
+                vi.format = VK_FORMAT_R32_UINT;
+                vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+                CHECK(vkCreateImageView(dev, &vi, nullptr, &views[3]));
+            }
+            std::uint32_t indices[4];
+            for (int k = 0; k < 4; ++k) {
+                StorageViews storage;
+                storage.as_uint = views[k];
+                storage.r32ui = views[k];
+                indices[k] = set.add_image(k == 3 ? ImageDimension::dim_3d : ImageDimension::dim_2d, views[k],
+                                           VK_IMAGE_LAYOUT_GENERAL, storage);
+                EXPECT(indices[k] != 0);
+                EXPECT(set.insert_key(keys[k], indices[k]));
+            }
+            EXPECT(flush());
+
+            // Clear: umax and or start at 0, umin at all ones; then GENERAL for the shader's atomics.
+            CHECK(vkResetCommandBuffer(cmd, 0));
+            CHECK(vkBeginCommandBuffer(cmd, &begin));
+            if (!set.fallbacks_ready()) set.record_fallback_init(cmd);
+            for (int k = 0; k < 4; ++k) {
+                VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+                b.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+                b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+                b.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+                b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                b.image = images[k];
+                b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+                vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0,
+                                     nullptr, 0, nullptr, 1, &b);
+                VkClearColorValue value{};
+                for (auto& c : value.uint32) c = k == 1 ? 0xFFFFFFFFu : 0u;
+                vkCmdClearColorImage(cmd, images[k], VK_IMAGE_LAYOUT_GENERAL, &value, 1, &b.subresourceRange);
+                b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+                b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+                b.oldLayout = b.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+                vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0,
+                                     nullptr, 0, nullptr, 1, &b);
+            }
+            CHECK(submit());
+
+            // The draw, then the images and the render target read back.
+            const VkDeviceSize image_bytes = 3 * AW * AW * 4 + A3 * A3 * A3 * 4;
+            VkBuffer atomic_readback;
+            void* atomic_map;
+            CHECK(make_buffer(image_bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT, &atomic_readback, &atomic_map));
+            CHECK(vkResetCommandBuffer(cmd, 0));
+            CHECK(vkBeginCommandBuffer(cmd, &begin));
+            VkClearValue clear{};
+            for (float& channel : clear.color.float32) channel = 0.25f;
+            VkRenderPassBeginInfo rbi{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+            rbi.renderPass = pass;
+            rbi.framebuffer = framebuffer;
+            rbi.renderArea = scissor;
+            rbi.clearValueCount = 1;
+            rbi.pClearValues = &clear;
+            vkCmdBeginRenderPass(cmd, &rbi, VK_SUBPASS_CONTENTS_INLINE);
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+            const VkDescriptorSet bound = set.set();
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout, 0, 1, &bound, 0, nullptr);
+            std::uint32_t block[36] = {};
+            block[2] = atomic_va;
+            block[32] = std::uint32_t(heap_base);
+            block[33] = std::uint32_t(heap_base >> 32);
+            vkCmdPushConstants(cmd, pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
+                               sizeof(block), block);
+            vkCmdDraw(cmd, 3, 1, 0, 0);
+            vkCmdEndRenderPass(cmd);
+            VkMemoryBarrier after{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+            after.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+            after.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &after,
+                                 0, nullptr, 0, nullptr);
+            VkDeviceSize offset = 0;
+            for (int k = 0; k < 4; ++k) {
+                VkBufferImageCopy rc{};
+                rc.bufferOffset = offset;
+                rc.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+                rc.imageExtent = k == 3 ? VkExtent3D{A3, A3, A3} : VkExtent3D{AW, AW, 1};
+                vkCmdCopyImageToBuffer(cmd, images[k], VK_IMAGE_LAYOUT_GENERAL, atomic_readback, 1, &rc);
+                offset += k == 3 ? A3 * A3 * A3 * 4 : AW * AW * 4;
+            }
+            VkBufferImageCopy tc{};
+            tc.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+            tc.imageExtent = {W, H, 1};
+            vkCmdCopyImageToBuffer(cmd, target, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback, 1, &tc);
+            CHECK(submit());
+
+            // The model: every pixel's atomics, discarded or not.
+            std::vector<std::uint32_t> want(3 * AW * AW + A3 * A3 * A3, 0);
+            for (std::uint32_t t = 0; t < AW * AW; ++t) want[AW * AW + t] = 0xFFFFFFFFu;
+            for (std::uint32_t py = 0; py < H; ++py)
+                for (std::uint32_t px = 0; px < W; ++px) {
+                    const std::uint32_t id = px + 64 * py, t = (py >> 3) * AW + (px >> 3);
+                    want[t] = std::max(want[t], id);
+                    want[AW * AW + t] = std::min(want[AW * AW + t], id);
+                    want[2 * AW * AW + t] |= 1u << (id & 31);
+                    const std::uint32_t v = ((px & 3) * A3 + (py >> 4)) * A3 + (px >> 4);
+                    want[3 * AW * AW + v] = std::max(want[3 * AW * AW + v], id);
+                }
+            const auto* got = static_cast<const std::uint32_t*>(atomic_map);
+            const char* names[] = {"2D umax", "2D umin", "2D or", "3D umax"};
+            unsigned wrong = 0;
+            for (std::size_t i = 0; i < want.size(); ++i) {
+                if (got[i] == want[i]) continue;
+                const int k = i < 3 * AW * AW ? int(i / (AW * AW)) : 3;
+                if (wrong++ < 8)
+                    std::printf("  %s texel %zu: got 0x%08x, want 0x%08x\n", names[k],
+                                k == 3 ? i - 3 * AW * AW : i % (AW * AW), got[i], want[i]);
+            }
+            const float* rt = static_cast<const float*>(readback_map);
+            unsigned bad_rt = 0;
+            for (std::uint32_t py = 0; py < H; ++py)
+                for (std::uint32_t px = 0; px < W; ++px)
+                    bad_rt += rt[(py * W + px) * 4] != ((px & 1) ? 0.25f : 1.0f);
+            std::printf("ps_imgatomic: %u of %zu texels wrong (2D umax/umin/or 8x8 each, 3D umax 4x4x4); "
+                        "%u of %u render-target pixels wrong (odd columns discarded)\n",
+                        wrong, want.size(), bad_rt, W * H);
+            vkDeviceWaitIdle(dev);
+            if (g_validation_errors) {
+                std::printf("ps_imgatomic: %u validation errors\n", g_validation_errors);
+                return 1;
+            }
+            return wrong || bad_rt ? 1 : 0;
+        }
 
         // A view that comes and goes before the set is flushed is never written: a texture created and destroyed
         // between two submissions. Its slots are written once, with the fallback; a write of the destroyed view
@@ -612,7 +852,8 @@ int main(int argc, char** argv) {
             StorageViews brief_storage;
             brief_storage.as_float = brief;
             const std::uint32_t brief_index = set.add_image(ImageDimension::dim_2d, brief, VK_IMAGE_LAYOUT_GENERAL, brief_storage);
-            EXPECT(brief_index >= 1 && brief_index < bindless::storage_indices && brief_index != stored_index);
+            EXPECT(brief_index >= 1 && brief_index < set.storage_capacity(ImageDimension::dim_2d) &&
+                   brief_index != stored_index);
             set.remove_image(ImageDimension::dim_2d, brief_index);
             vkDestroyImageView(dev, brief, nullptr);
         }
@@ -661,7 +902,7 @@ int main(int argc, char** argv) {
         // 2. Without its key the T# is a miss: index 0, the fallback image of zeros.
         const float zeros[4] = {0, 0, 0, 0};
         EXPECT(set.erase_key(tsharp) && !set.erase_key(tsharp));
-        EXPECT(set.flush_needs_idle());  // erasing may move the keys behind it; nothing is running here
+        EXPECT(!set.flush_needs_idle());  // erasing empties its slot only: the three keys ahead stay where they are
         EXPECT(flush() && !set.flush_needs_idle());
         CHECK(draw());
         compare("2 miss", zeros);
@@ -716,10 +957,50 @@ int main(int argc, char** argv) {
         compare("8 removed", zeros);
         EXPECT(set.add_image(ImageDimension::dim_2d, gradient_view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) == gradient_index);
 
+        // 9. More than 4096 2D images and more than a full D3D12 sampler heap (2048): the gradient and the S#
+        // through the last indices of both arrays, where the device's limits gave the set room for them.
+        std::uint32_t far_image = 0, far_sampler = 0;
+        if (set.image_capacity(ImageDimension::dim_2d) > 5000 + 8 && set.sampler_capacity() > 2100 + 8) {
+            for (std::uint32_t i = 0; i < 5000; ++i)
+                EXPECT(set.add_image(ImageDimension::dim_2d, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_GENERAL) != 0);
+            far_image = set.add_image(ImageDimension::dim_2d, gradient_view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+            for (std::uint32_t i = 0; i < 2100; ++i) far_sampler = set.add_sampler(nearest);
+            EXPECT(far_image > 5000 && far_sampler > 2100);
+            set.insert_key(tsharp, far_image);
+            set.insert_key(make_ssharp_key(ssharp.data()), far_sampler);
+            EXPECT(flush());
+            CHECK(draw());
+            compare("9 past 4096 images and 2048 samplers", nullptr);
+
+            // Keep another high slot live while the sampled slot is removed and then reused.
+            const auto neighbour = set.add_image(ImageDimension::dim_2d, decoy_view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+            EXPECT(neighbour > 5000 && neighbour != far_image);
+            set.remove_image(ImageDimension::dim_2d, far_image);
+            EXPECT(flush());
+            CHECK(draw());
+            compare("10 freed high slot", zeros);
+
+            const auto replacement = set.add_image(ImageDimension::dim_2d, stored_view, VK_IMAGE_LAYOUT_GENERAL);
+            EXPECT(replacement == far_image);
+            EXPECT(flush());
+            CHECK(draw());
+            const float blue[4] = {0, 0, 128.0f / 255.0f, 1};  // stored image uses the first gradient texel
+            compare("11 reused high slot", blue);
+
+            EXPECT(set.insert_key(tsharp, neighbour));
+            EXPECT(flush());
+            CHECK(draw());
+            compare("12 live neighbour", orange_colour);
+        } else {
+            std::printf("%s: no room past 5000 2D images and 2100 samplers on this device; step 9 skipped\n", name);
+        }
+
         std::printf("%s: descriptor table in %s memory\n", name,
                     set.table_in_device_local_memory() ? "device-local" : "host-visible");
-        std::printf("%s: gradient at the %uth slot probed, miss, table grown %u -> %u slots, rebound, restored, other view, removed\n", name,
-                    depth + 1, slots, slot_count());
+        std::printf("%s: gradient at the %uth slot probed, miss, table grown %u -> %u slots, rebound, restored, "
+                    "other view, removed, index %u of %u 2D images and %u of %u samplers\n", name, depth + 1, slots,
+                    slot_count(), far_image, set.image_capacity(ImageDimension::dim_2d), far_sampler,
+                    set.sampler_capacity());
         ++runs;
         vkDeviceWaitIdle(dev);
         vkDestroyPipeline(dev, pipeline, nullptr);
@@ -750,7 +1031,7 @@ int main(int argc, char** argv) {
         std::printf("unsupported: the bindless set does not fit this device's descriptor limits\n");
         return unsupported;
     }
-    std::printf("bindless: %u draws read back, %u bad pixels, largest error %g\n", runs * 7, mismatches, double(worst));
+    std::printf("bindless: %u draws read back, %u bad pixels, largest error %g\n", readbacks, mismatches, double(worst));
     if (g_validation_errors) {
         std::fprintf(stderr, "%u validation errors\n", g_validation_errors);
         return 1;

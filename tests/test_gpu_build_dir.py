@@ -162,5 +162,25 @@ class MainUsesTheResolvedFolder(unittest.TestCase):
         self.assertIn("test programs:", out.getvalue())
 
 
+class MissingTestProgram(unittest.TestCase):
+    def test_missing_texture_executable_is_a_test_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            build = Path(tmp)
+            touch(build)
+            program = "vk_texture_test" + check.EXE
+            code, message = check.run(str(build / program))
+        self.assertNotEqual(code, 0)
+        self.assertIn(program, message)
+
+    def test_missing_core_executable_preserves_build_diagnostic(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            build = Path(tmp)
+            touch(build, names=PROGRAMS[:-1])
+            with self.assertRaises(SystemExit) as caught:
+                check.run(str(build / PROGRAMS[-1]))
+        self.assertIn(PROGRAMS[-1], str(caught.exception))
+        self.assertIn("subfolders were searched", str(caught.exception))
+
+
 if __name__ == "__main__":
     unittest.main()

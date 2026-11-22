@@ -33,7 +33,9 @@ int main(int argc, char** argv) {
     else if (argc != 1) return 2;
     using namespace leonida;
     vktest::Device d;
-    EXPECT(d.create());
+    const auto device_status = d.initialize();
+    if (device_status == vktest::DeviceStatus::unavailable) return 77;   // no Vulkan GPU: ctest skips
+    if (device_status != vktest::DeviceStatus::ready) return 1;
     VulkanContext context(d.device_proc, d.device, true);
     EXPECT(context.loaded());
 
@@ -268,9 +270,22 @@ int main(int argc, char** argv) {
         EXPECT(invalid_bundle_call([&](auto* b) { b->ClearDepthStencilView(dsv_handle, D3D12_CLEAR_FLAG_DEPTH,
                                                                             0.5f, 0, 0, nullptr); }));
         EXPECT(invalid_bundle_call([&](auto* b) { b->SetPredication(nullptr, 0, D3D12_PREDICATION_OP_EQUAL_ZERO); }));
+        // D3D-26: DiscardResource and the atomic copies are not allowed in a bundle; WriteBufferImmediate is
+        // ("Recording command lists and bundles", the bundle restrictions and the API restrictions table).
+        EXPECT(invalid_bundle_call([&](auto* b) { b->DiscardResource(rt_resource, nullptr); }));
+        ID3D12Resource* const bundle_dependents[] = {ds_resource};
+        const D3D12_SUBRESOURCE_RANGE_UINT64 bundle_ranges[] = {{0, {0, 8}}};
+        EXPECT(invalid_bundle_call([&](auto* b) {
+            b->AtomicCopyBufferUINT(rt_resource, 0, ds_resource, 0, 1, bundle_dependents, bundle_ranges); }));
+        EXPECT(invalid_bundle_call([&](auto* b) {
+            b->AtomicCopyBufferUINT64(rt_resource, 0, ds_resource, 0, 1, bundle_dependents, bundle_ranges); }));
+        EXPECT(!invalid_bundle_call([&](auto* b) {
+            const D3D12_WRITEBUFFERIMMEDIATE_PARAMETER write{0x1000, 1};
+            b->WriteBufferImmediate(1, &write, nullptr); }));
 
         list->Barrier(1, &group);
-        list->SetMarker(0, nullptr, 0);  // not implemented: reported once by its generated stub, recording continues
+        // Not implemented: reported once by its generated stub, recording continues.
+        list->SetProtectedResourceSession(nullptr);
         EXPECT(list->Close() == S_OK);
         EXPECT(list->Close() == E_FAIL);  // already closed
 

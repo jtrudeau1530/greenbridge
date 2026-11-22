@@ -302,6 +302,18 @@ void add_module_lookup(void* ctx, ModuleLookup fn) {
     g_lookups.push_back({ctx, fn});
 }
 
+bool mapped_image_base(uint64_t address, uint64_t& base) {
+    std::string module;
+    uint32_t rva = 0;
+    std::lock_guard lock(g_lookup_mutex);
+    for (auto& l : g_lookups)
+        if (l.fn(l.ctx, address, module, rva)) {
+            base = address - rva;
+            return true;
+        }
+    return false;
+}
+
 void remove_module_lookup(void* ctx) {
     std::lock_guard lock(g_lookup_mutex);
     for (auto it = g_lookups.begin(); it != g_lookups.end(); ++it)
@@ -312,7 +324,7 @@ void remove_module_lookup(void* ctx) {
 }
 
 Table::Table(const Entry* entries, size_t count) {
-    for (size_t i = 0; i < count; ++i) table()[std::string(entries[i].dll) + "!" + entries[i].name] = entries[i].fn;
+    for (size_t i = 0; i < count; ++i) table()[lower_ascii(entries[i].dll) + "!" + entries[i].name] = entries[i].fn;
 }
 
 void* find(const std::string& dll_lower, const std::string& name) {
@@ -320,8 +332,24 @@ void* find(const std::string& dll_lower, const std::string& name) {
     return it == table().end() ? nullptr : it->second;
 }
 
+bool owns_dll(const std::string& dll_lower) {
+    static const char* const host[] = {"kernel32.dll", "kernelbase.dll", "msvcrt.dll", "ucrtbase.dll", "ucrtbased.dll",
+                                       "vulkan-1.dll", "ntdll.dll", "user32.dll"};
+    if (starts_with(dll_lower, "api-ms-") || starts_with(dll_lower, "ext-ms-")) return false;
+    for (const char* h : host)
+        if (dll_lower == h) return false;
+    const std::string prefix = dll_lower + "!";
+    auto it = table().lower_bound(prefix);
+    return it != table().end() && it->first.compare(0, prefix.size(), prefix) == 0;
+}
+
 void* make_unimplemented_thunk(const std::string& dll, const std::string& name) {
     std::lock_guard lock(g_pool_mutex);
+    static std::map<std::string, void*> s_thunks;
+    const std::string key = lower_ascii(dll) + "!" + name;
+    auto it = s_thunks.find(key);
+    if (it != s_thunks.end()) return it->second;
+
     if (!g_stub) g_stub = make_common_stub();
     if (!g_stub) return nullptr;
     if (!g_pool || g_pool_used + kThunkSize > g_pool_size) {
@@ -330,7 +358,7 @@ void* make_unimplemented_thunk(const std::string& dll, const std::string& name) 
         g_pool_used = 0;
         if (!g_pool) return nullptr;
     }
-    const char* what = _strdup((dll + "!" + name).c_str());  // lives for the process
+    const char* what = _strdup(key.c_str());  // lives for the process
     uint8_t* t = g_pool + g_pool_used;
     g_pool_used += kThunkSize;
     const uint64_t a = reinterpret_cast<uint64_t>(what), f = reinterpret_cast<uint64_t>(g_stub);
@@ -344,6 +372,7 @@ void* make_unimplemented_thunk(const std::string& dll, const std::string& name) 
     std::memset(code + 22, 0xCC, kThunkSize - 22);
     std::memcpy(t, code, kThunkSize);
     FlushInstructionCache(GetCurrentProcess(), t, kThunkSize);
+    s_thunks.emplace(key, t);
     return t;
 }
 

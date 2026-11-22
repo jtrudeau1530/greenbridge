@@ -254,21 +254,33 @@ batched paths.
 Disassembling the exported bodies and the functions they call directly gives these calls through
 the object received in the command-list parameter:
 
-| RVA | Vtable offset | Public slot if PC order | Observed arguments | Confidence |
-|---:|---:|---:|---|---|
-| `0x2171e` | `+0xd0` | 26 `ResourceBarrier` | `NumBarriers=1`, `&{Type=2 (UAV), Flags=0, pResource=null}` | **Measured**: the shape is a global UAV barrier; slot 26 is the SDK `ResourceBarrier` |
-| `0x1d9cb` | `+0x70` | 14 `Dispatch` | `(1, 1, 1)` | **Measured**: exact `Dispatch` shape |
-| `0x1d85e` | `+0xc8` | 25 `SetPipelineState` | `RCX=list`; RDX is not re-set at the call site | Inferred: offset and object match; the pipeline argument is not proven |
-| `0x1d7f4` | `+0x108` | 33 `SetComputeRoot32BitConstant` | root index, value and offset registers | Inferred |
-| `0x1d8b9`, `0x1d956` | `+0x138` | 39 `SetComputeRootShaderResourceView` | `(root=3, value, …)` | Inferred |
-| `0x1d8f9` | `+0x168` | 45 `SOSetTargets` | `NumBuffers=0` (a no-op), resource in R8 | Inferred; `NumBuffers=0` means the view pointer is not read |
-| `0x1da02` | `+0x490` | **none** | `(1, &{0, 1, pointer, …})` | **Measured offset**; method identity **Open** |
+The console list is not in PC order past slot 26 (section 3.5a), so the method column reads each call in the
+console order, from the arguments at the call and from the inline write it falls back from (section 3.5a, last
+paragraph). Every call below except the two barriers is the fallback branch of an inline write of the same values.
+
+| RVA | Vtable offset | Console slot → PC method | Observed arguments | Confidence |
+|---:|---:|---|---|---|
+| `0x2171e` | `+0xd0` | 26 → 26 `ResourceBarrier` | `NumBarriers=1`, `&{Type=2 (UAV), Flags=0, pResource=null}` | **Measured**: the shape is a global UAV barrier; slot 26 is the SDK `ResourceBarrier` |
+| `0x1d9cb` | `+0x70` | 14 → 14 `Dispatch` | `(1, 1, 1)` | **Measured**: exact `Dispatch` shape |
+| `0x1d85e` | `+0xc8` | 25 → 25 `SetPipelineState` | `RCX=list`, `RDX=[rdi+8]`: loaded at `0x1d7fa` and not changed before the call; the inline branch (`0x1d822`–`0x1d850`) copies 28 bytes from that object's `+0x10` | **Measured**: RDX is the pipeline the inline branch reads |
+| `0x1d7f4` | `+0x108` | 33 → 29 `SetComputeRootSignature` | one argument, `RDX=[rcx]`: the pointer stored next to the pipeline (`[rdi]`; the pipeline is `[rdi+8]`) | **Measured** shape; agrees with slot 33 in section 3.5a |
+| `0x1d8b9` | `+0x138` | 39 → 35 `SetComputeRoot32BitConstants` | `(3, 1, &value, offset)`: `EDX=3`, `R8D=EDX-2=1`, `R9=rsp+0x30`, fifth argument `EDI` | **Measured**: four arguments with a count and a source pointer; a root SRV takes two |
+| `0x1d956` | `+0x138` | 39 → 35 `SetComputeRoot32BitConstants` | `(3, count, source, offset)`: `R8D=EDI` (the count of the inline copy loop above it), `R9=RSI` | **Measured** |
+| `0x1d8f9` | `+0x168` | 45 → 41 `SetComputeRootUnorderedAccessView` | `(0, VA)`: `EDX=0`, `R8=RBP`; the inline branch writes a header word and the same 64-bit `RBP` (12 bytes) | **Measured**: a root index and a 64-bit address |
+| `0x1da02` | `+0x490` | 146 → GCL7 80 `Barrier` | `(1, &group)`, group `{Type=0, NumBarriers=1, pGlobalBarriers}`; the barrier is the 16 bytes at RVA `0xcdf60`: `{0x80, 0x80, 0x10, 0x10}` | **Measured**: the public `Barrier(UINT32, const D3D12_BARRIER_GROUP*)` shape with public enum values |
 
 The `+0x490` call is after the `Dispatch(1,1,1)` at `0x1d9cb`, in the per-descriptor path. It is
-**beyond the last public GCL8 slot**: slot 81 is `0x288`, so `0x490` is 65 slots past the end of
-the public chain. It is either an appended console command-list method or a method of an internal
-class that the helper receives through the command-list parameter; the evidence below favours the
-second reading. Its arguments are not a public D3D12 method shape.
+**beyond the last public GCL8 slot** (slot 81 is `0x288`), but its arguments are the public enhanced-barrier
+call: one `D3D12_BARRIER_GROUP` of type `D3D12_BARRIER_TYPE_GLOBAL` (0) holding one `D3D12_GLOBAL_BARRIER` with
+`SyncBefore = SyncAfter = D3D12_BARRIER_SYNC_COMPUTE_SHADING` (`0x80`) and
+`AccessBefore = AccessAfter = D3D12_BARRIER_ACCESS_UNORDERED_ACCESS` (`0x10`), values as in SDK 10.0.26100
+`d3d12.h`. The public PC equivalent is GCL7 slot 80.
+
+@MoonYueya's static enumeration of the Xbox Series 1.0.2.1 builder found 29 calls through console slot 146
+across seven functions. It counted 11 direct calls through the vtable entry and 18 calls through a register
+loaded from that entry. All 29 passed one global barrier group containing one `D3D12_GLOBAL_BARRIER` with
+the same compute-shading and unordered-access arguments described above. The counts cover the two
+enumerated dispatch forms in the builder's `.text`. [Static corroboration and coverage details](https://github.com/ItsNotRexed/Leonida/issues/1626)
 
 The same two inner functions (`0x1d540` and `0x1d7c0`) contain the `+0x70`, `+0xc8`, `+0x108`,
 `+0x138`, `+0x168` and `+0x490` calls; the outer batched function contains the `+0xd0` barrier.
@@ -277,12 +289,46 @@ The exported `CopyRaytracingAccelerationStructure` (ordinal 5) and the rehydrate
 internal functions using objects cached in the builder (`[this+0x10]` and `[this+8]`). Their
 signatures still require GCL4/GCL8 objects, but those bodies do not measure command-list slots.
 
+### 3.3a Other builder call sites past the PC order
+
+The rest of `.text` has further calls through the list pointer. The table shows examples, including one of the
+slot-146 sites counted in section 3.3. Each name rests on the call shape. “Inline” means the call is the fallback
+of an inline write of the same values.
+
+| RVA | Vtable offset | Console slot → PC method | Observed arguments | Confidence |
+|---:|---:|---|---|---|
+| `0x1a1e9` | `+0x128` | 37 → 33 `SetComputeRoot32BitConstant` | `(2, value, 0)`: `EDX=R9D+2`, `R9D=0` (inline: header + one dword) | **Measured** shape |
+| `0x14e81` | `+0x138` | 39 → 35 `SetComputeRoot32BitConstants` | `(0, 19, rsp+0xc0, 0)` (inline: header + 19 dwords) | **Measured** shape |
+| `0x14e11` | `+0x158` | 43 → 39 `SetComputeRootShaderResourceView` | `(3, VA)`: `EDX=3`, `R8=R13` (inline: header + the 64-bit `R13`) | **Measured** shape |
+| `0x1a3b0` | `+0x168` | 45 → 41 `SetComputeRootUnorderedAccessView` | `(0, VA)` (inline: header + a 64-bit value) | **Measured** shape |
+| `0x20ed6` | `+0x4a0` | 148 → none | `(list, count * 40, 16)` returns a pointer; on null the DLL prints `D3D12 XDXR Error: Failed to allocate upload buffer` and throws `E_FAIL` | **Measured**: an upload allocator `(size, alignment)` |
+| `0x20f99` | `+0x158` | 43 → 39 `SetComputeRootShaderResourceView` | `(0, p)`, `p` the pointer slot 148 returned at `0x20ed6`, unchanged | **Measured**: the CPU pointer is used as the GPU address |
+| `0x149ba` | `+0x280` | 80 → none | `(x, 1, 1, 0x8020)`: `EDX=EDI`, `R8D=R9D=1`, fifth argument `0x8020` (inline: a five-dword packet) | Inferred: a `Dispatch` with one extra word |
+| `0xd6de` | `+0x238` | 71 → none | `(&label, counter, 0 or 0x1000, 0)`: the counter at `[rbx+0x9c]` is incremented first; `0x1000` on the last item of a batch | Inferred: a GPU write of a 32-bit value to memory |
+| `0xd679` | `+0x248` | 73 → none | `(&label, 3, reference, 0xffffffff, 0)` | Inferred: a GPU wait until the masked value compares (function 3) with the reference |
+| `0xd7b4` | `+0x490` | 146 → GCL7 80 `Barrier` | the same global UAV barrier as `0x1da02` | **Measured** |
+
+So the compute root-binding group keeps its PC order four slots later (33, 37, 39, 43 and 45 here; 35 and 41 in
+section 3.5a), and the console list has methods well past the PC tail: 71, 73, 80, 146 and 148 here, 141 in the
+FSR DLL.
+
+Slot 148 matters beyond the builder: the address it returns is written by the CPU and passed unchanged to the GPU
+as a root SRV address, so console upload memory has the same address for the CPU and the GPU. A replacement must
+return memory whose CPU pointer is also a valid GPU address (for this layer: inside the arena of
+[d3d12_vulkan.md §3.3](d3d12_vulkan.md)).
+
+The function at `0xd580` uses the 71/73 pair instead of the slot-146 barrier when the byte at RVA `0xd773c` is set.
+That byte is one of seven bools at `0xd7738`–`0xd773e` in zero-initialised `.bss`. The only accesses to them in
+`.text` are about 50 RIP-relative reads (`cmp`, `movzx`); there is no write and no export that points there. So in
+the shipping DLL the label path is unreachable unless something writes that byte through a computed pointer, and
+the barrier path is the one that runs.
+
 ### 3.4 The object is wider than the public vtable
 
 The inner function at `0x1d7c0` receives the command-list pointer in RDX, copies it to RBX
 (`0x1d7da`–`0x1d7dd`), and then does more than call public methods:
 
-- writes 16 bytes at `[rbx+0x544]` (`0x1d803`);
+- writes 32 bytes at `[rbx+0x544]` (`0x1d803`, `0x1d810`: the pipeline object's `+0x10`..`+0x2f`);
 - writes a byte at `[rbx+0x140]` (`0x1d841`, `0x1d884`);
 - reads `[rbx+0x350]` (`0x1d877`) and `[rbx+0x344]` (`0x1d8c9`);
 - maintains a pointer at `[rbx+0x18]` against limits at `[rbx+0x30]` (`0x1d818`, `0x1d871`);
@@ -291,13 +337,103 @@ The inner function at `0x1d7c0` receives the command-list pointer in RDX, copies
 A client that knows only the public COM interface cannot legally read or write those fields.
 The helper is therefore compiled against a **wider contract** than the public vtable: either the
 Xbox command-list object is an internal class whose layout first-party code may use, or the game
-passes a builder-specific object that also implements the interface. The byte offsets are facts;
-the field meanings and the method at `+0x490` are **Open**.
+passes a builder-specific object that also implements the interface. Section 3.5a explains most of the fields
+(the inline command buffer), and section 3.3 identifies `+0x490` as `Barrier` at console slot 146.
 
 This is the most important compatibility finding on this page. A replacement command list that
-implements only the public GCL7/GCL8 vtable is safe for the game's own public calls, but it is
-**not** safe to hand to `XboxBvhBuilder`'s build path. The helper will touch fields the public
-object does not define and call `+0x490`, which a public-only vtable does not have.
+implements only the public GCL7/GCL8 vtable is **not** safe to hand to `XboxBvhBuilder`'s build path. (Section 3.5a
+shows it is not safe for console-compiled callers' public calls either: the console list order differs from the PC
+order past slot 26.) The helper will touch fields the public
+object does not define and call `+0x490` (console slot 146, `Barrier`), which a public-only vtable does not have.
+
+### 3.5a The FSR DLL as a second device client
+
+`amd_fidelityfx_upscaler_xbox.dll` is a second shipped module compiled against the console device, the second
+measured client of the console **command list** after the BVH builder (section 3.3), and the first one run. It is run
+by `fsr_dispatch_test` with its measured Xbox backend
+descriptor ([d3d12_vulkan.md Appendix A.3](d3d12_vulkan.md)), on a PC device behind the Xbox-ABI proxy, and its
+command recorder (RVA `0x59a0`) was read with Ghidra 12.2 through REA. RVAs are from image base `0x180000000`. The
+run's command-list calls are the same 13, in the same order, on an RTX 2000 Ada (driver 597.06) and on WARP.
+
+**Device.** At context creation it calls slots 14, 15, 18, 19, 27, 38 and 76 and heap slot 9, all with the shapes the
+PC order and the measured overrides predict; slot 76 takes the seven `CreateCommittedResource` arguments. During
+`ffxDispatch` it adds 16 `CreateRootSignature` and heap slot 10 (the recorder also has a path that calls 24
+`CopyDescriptorsSimple`, not taken in this run), plus its two compute-pipeline paths below.
+
+Which descriptor-copy path runs is decided by a **byte at `+0x18` of the device object**, read before each copy at
+`0x5bb8`, `0x5dd1`, `0x5f8c` and `0x617e`. When it is 0 (the run), the DLL copies the 32 bytes at the source CPU
+handle to the destination CPU handle itself (two 16-byte moves, e.g. `0x5bc0`–`0x5bce`), so CPU descriptor handles
+must be pointers to at least 32 writable bytes. When it is set, the same copy is device slot 24,
+`CopyDescriptorsSimple(1, dst, src, 0)` (calls at `0x5bed`, `0x5e06`, `0x5fc2`, `0x61b3`). A device proxy that sets
+that byte therefore sees this DLL's descriptor copies as calls. Like the list's fields (below), the byte is past the
+vtable pointer of a public object.
+
+- **Slot 67** (call at `0x56d9`) is **not** the PC `CreateProtectedResourceSession1`: it takes `(desc, riid, out)`
+  with `IID_ID3D12PipelineState`. The DLL's own messages name it `DeserializeComputePipelineStateX`. Its desc is the
+  root signature at `+0x00`, then pointer and size pairs for the shader's `FSPX` entries: kind 0 at `+0x08`, kind 1
+  at `+0x18`, a copy of the kind-6 program at `+0x28`, and kind 7 at `+0x38` ([fspx.md](fspx.md)). The proxy maps the
+  console desc to `D3D12_COMPUTE_PIPELINE_STATE_DESC` and routes it to `CreateComputePipelineState` (PC slot 11). On a
+  PC device that call fails (`E_FAIL`) because the code is not a PC shader, so the DLL falls back to slot 62; its message
+  for that failure calls the fallback "NewBE".
+- **Slot 62** (call at `0x5825`) takes the measured `(D3D12_COMPUTE_PIPELINE_STATE_DESC*, 0, 0, riid, out)`. The PC
+  runtime refuses the DLL's code (`E_FAIL`): it is not a PC shader. The DLL's pipeline function then returns
+  `0x8000000d` (`0x4b85`), but the dispatch goes on, records the null pipeline and faults (`0x65ff`), which is where a
+  PC device stops.
+- **Pipeline slot 11 sizes the compute scratch.** After either path succeeds (slot 67 jumps to `0x5833`), the DLL
+  calls the new pipeline's slot 11 as `(0, 0, &obj)` (`0x586d`); the public `ID3D12PipelineState` ends at slot 8, so
+  this is a console-only method. On success it reads a dword through `obj`'s slot 3 (`0x5881`), multiplies it by
+  1024 (`shl ecx, 0xa`), stores it in the pipeline's record at `+0x44` and releases `obj` (slot 2). The context keeps
+  the largest value (`+0x10f8`). Before a dispatch whose pipeline has a non-zero value (`0x64d3`; zero skips the
+  binding), the DLL creates the scratch buffer once, `largest * 0xd0` bytes rounded up to 64 KiB, through device
+  slot 27 in state `UNORDERED_ACCESS` (`0x65ab`), names it `FFX_XBox_ComputeScratch`, and binds it with list slot
+  141 `(2, GPU VA, buffer size, this pipeline's value)` (`0x65f8`). Measured: the calls and the arithmetic. Open:
+  what the slot-11 object is, the unit of its dword (the factor 1024 suggests KiB), the meaning of `0xd0`, and
+  of the leading `2`.
+- The DLL's 29 shaders are `DXBC` containers with `SFI0`, `ISG1`, `OSG1`, `PSV0`, `RTS0`, `HASH` and `ACCC` parts
+  and no `DXIL`. The `ACCC` payload starts with the tag `FSPX` in all 29; the game's own native shaders are `FSSM`
+  inside `XBCH` ([design.md](design.md)). `FSPX` is a directory around an uncompressed RDNA2 program and its
+  dispatch state; `tools/fspx_unpack.py` unpacks it for the translator, which takes 13 of the 29 today. The 13 that
+  use `v_dot4` instructions are not translated yet ([fspx.md](fspx.md)).
+
+**Command list.** The console list is **not** the PC order past `ResourceBarrier`. Each row is backed by the
+argument shape at the call and, where marked "run", by the call seen in the run. Rows marked "inferred" fit the
+shape and the shift around them, but the shape alone does not single the method out:
+
+| Console slot (offset) | PC slot | Method | Evidence |
+|---|---|---|---|
+| 14 (`+0x70`) | 14 | `Dispatch` | the vtable path of the inline dispatch at `0x59a0`; the BVH builder's `Dispatch(1,1,1)` at `+0x70` |
+| 15 (`+0x78`) | 15 | `CopyBufferRegion` | run: `(resource, 0, resource, …)` |
+| 25 (`+0xc8`) | 25 | `SetPipelineState` | `(pipeline)` at `0x59a0` |
+| 26 (`+0xd0`) | 26 | `ResourceBarrier` | run: `(1, barriers)`; the BVH builder's `+0xd0` |
+| 32 (`+0x100`) | **28** | `SetDescriptorHeaps` | run: `(1, &heap)`, the heap a device-proxy descriptor heap |
+| 33 (`+0x108`) | **29** | `SetComputeRootSignature` | one pointer argument, the first call at `0x59a0` (null in the run, where pipeline creation had failed); in the BVH builder the pointer stored next to the pipeline (section 3.3) |
+| 35 (`+0x118`) | **31** | `SetComputeRootDescriptorTable` | `(index, heap GPU start + offset)` at `0x59a0` |
+| 41 (`+0x148`) | **37** | `SetComputeRootConstantBufferView` (inferred) | `(index, 64-bit GPU VA from the constant allocator)` at `0x6738`; the root SRV/UAV setters take the same shape |
+| 53 (`+0x1a8`) | **49** | `ClearUnorderedAccessViewUint` | run: `(GPU handle, CPU handle, resource, …)` |
+| 54 (`+0x1b0`) | **50** | `ClearUnorderedAccessViewFloat` | `(GPU handle, CPU handle, resource, values, 0, null)` at `0x7296`; chosen over the slot-53 call at `0x72ee` by a compare of a local with `0x12` (`0x7266`), with the four values passed in place where the 53 path copies them to the stack |
+| 55 (`+0x1b8`) | **51** | `DiscardResource` | `(resource, null)` at `0x6dcb`, after the pending barriers are flushed through slot 26 |
+| 59 (`+0x1d8`) | — | console only (shape) | four calls, two shapes: `(1, blob, size)` at `0x6b5a` and `0x6d53`, the blob a run of qwords whose first is `0xf3080 \| (qword count & 0x7f)`; and `(0, &qword, 8)` with the qword 1 at `0x6e52` and `0x6eb8`, only when a profiling bit of the context is set (`0x6e2a`). The first argument is set as a byte (`mov dl, 1` / `xor edx, edx`). It looks like one slot for both ends of a GPU event; no public method takes a bool first. With 55 at +4 and 61 at +2, the two slots the console lacks are among 56–60 |
+| 61 (`+0x1e8`) | **59** | `ExecuteIndirect` | `(signature, 1, argument buffer, offset, null, 0)` at `0x59a0` |
+| 85 (`+0x2a8`) | — | `CopyTextureRegion` shape (inferred) | run: `(stack pointer, 0, 0)`, twice per dispatch. Statically six arguments, `(&dst, 0, 0, 0, &src, null)`: the public `CopyTextureRegion` (PC 16) with two `D3D12_TEXTURE_COPY_LOCATION`s, not one pointer. At `0x7147` dst is `{texture, SUBRESOURCE_INDEX, 0}` and src `{buffer, PLACED_FOOTPRINT, footprint}`, the footprint from device slot 38 (`GetCopyableFootprints`, `0x708b`); at `0x7191` both are subresource 0 (texture to texture). The caller also clears the next stack argument (`0x70e7`); whether the method takes a seventh is open, as is what console slot 16 is |
+| 141 (`+0x468`) | — | console only | `(2, GPU VA, size, n)` at `0x65f8`: binds a buffer the DLL names `FFX_XBox_ComputeScratch`; `n` is the bound pipeline's scratch value from pipeline slot 11 (see above) |
+
+So the console list has four more methods than the PC list between `ResourceBarrier` (26) and `SetDescriptorHeaps`
+(console 32), and two fewer between `ClearUnorderedAccessViewUint` (console 53) and `ExecuteIndirect` (console 61).
+Mapping the console list as "PC plus a constant" is wrong. The BVH builder adds 37, 39, 43 and 45 (the rest of the
++4 root group) and the console-only 71, 73, 80, 146 (`Barrier`) and 148 (sections 3.3 and 3.3a).
+
+**The list object is wider than its vtable, and this is what that width is for.** Before a root-argument or dispatch
+call the DLL checks a write cursor at `+0x18` against a limit (`+0x30` for root arguments, `+0x28` for a dispatch). While there is room,
+it writes the command into that buffer itself instead of calling: a root argument is a header word from the
+per-root-parameter table at `+0x344` and then the value (32 bits for a descriptor table, 64 for the slot-41 GPU VA),
+a dispatch four words (`0x4002c400`, or `(flag | 0x1000ba00) << 2`, then x, y, z).
+It sets a flag byte at `+0x140`, stores a flag at `+0x141` from the
+pipeline, and copies 32 bytes of the pipeline object (from its `+0x10`) to `+0x544`. These are the fields
+section 3.4 measured in the BVH builder's helper without a meaning (`+0x18`, `+0x30`, `+0x140`, `+0x344`, `+0x544`).
+**With the cursor at the limit, every command goes through the vtable**: that is how `fsr_dispatch_test` records
+them, and it is the simplest contract for a layer that does not want to decode these packets. Whether the game's
+executable makes the same check before writing is unknown until it is available; it is compiled against the same
+console headers.
 
 ### 3.5 What the package does not measure
 
@@ -368,7 +504,7 @@ Even taking both projects at face value, the following remain **Open**:
   `CreateFence`;
 - the Xbox queue vtable beyond the public chain (`PresentX`, `SuspendX`, `ResumeX`);
 - the `PresentX` signature, plane struct, resource/view arrays and swapchain parameters;
-- the command-list extension slots (only `0x490` is measured here, without a name);
+- the command-list extension slots other than the ones sections 3.3a and 3.5a measured (71, 73, 80, 85, 141, 146, 148);
 - the DMA list type's real numeric value and the compute/copy console list IIDs;
 - any Xbox-specific return convention on these interfaces.
 
@@ -404,6 +540,66 @@ Xbox slots differ, a generic forward-to-PC thunk calls the wrong method. The cur
 (`runtime/shims/d3d12_xs_device.h:1-18`) forwards every unshadowed slot in PC order and logs
 first calls; a wrong slot would therefore be visible as a misnamed call, not a silent success.
 
+Queues and fences are wrapped the same way.
+
+- **What is wrapped.** Device slots 8 (`CreateCommandQueue`), 75 (`CreateCommandQueue1`), 36
+  (`CreateFence`) and 32 (`OpenSharedHandle`, when it opens a fence) return queue and fence proxies. Each
+  proxy forwards the public chain in PC order: 19 queue slots, and 11 or 12 fence slots, in SDK 10.0.26100.
+- **Logging.** Each slot logs its first call. `--trace-d3d12` records every call except `AddRef`/`Release`,
+  as `XboxID3D12CommandQueue::Signal called` or `XboxID3D12Fence::Slot40 unsupported` (the README's trace
+  grammar); on the Vulkan device the layer's own record of the same call follows it. An interface the real
+  object implements but the proxy does not model is logged once and refused.
+- **The refused tail.** A slot past the public chain, up to the end of the proxy's own table (128 queue and
+  64 fence slots, every one a thunk), logs its first four argument words once and returns `E_NOTIMPL`.
+- **The guard region.** Each table sits at the end of the first page of a 64 KiB reservation, and the rest
+  of that reservation is never committed. A slot past the table therefore faults on the vtable read itself,
+  inside the reservation, and a vectored handler logs the slot before the fault goes on. A vtable read that
+  lands beyond the reservation is not caught.
+- **Unwrapping.** Wherever a device or queue method hands a heap, queue or fence object to the real
+  runtime, the proxy passes the real object instead: queue `Signal`/`Wait` (14/15), and device `CreateSharedHandle` (31), `MakeResident`
+  and `Evict` (34/35), `SetEventOnMultipleFenceCompletion` (45), `SetResidencyPriority` (46) and
+  `EnqueueMakeResident` (50).
+- **QueryInterface.** It answers only the modelled interfaces, so no real object reaches the title.
+- **What is not covered.** Command lists are not wrapped yet: `ExecuteCommandLists` passes the lists through,
+  and a heap proxy given to a list's `SetDescriptorHeaps` reaches the real list unchanged. The command-list
+  proxy of §3.5a adds the unwrap at both places.
+
+Command allocators get the same kind of proxy: device slot 9 (`CreateCommandAllocator`) returns one.
+
+- **What is forwarded.** The public chain, 9 slots: the base chain and `Reset` at 8. A slot past it, up to the
+  end of a 64-slot table, is logged and refused, and a read past the table faults in its own guard region.
+  The console allocator's extra methods are not measured.
+- **Where a list takes it.** A list takes an allocator from the title in `CreateCommandList` and `Reset`, so
+  the proxy is safe only where the list side resolves it. Slot 9 therefore wraps an allocator only when it
+  answers `kLeonidaCommandAllocatorTag` (`d3d12_xs_device.h`). That is the Vulkan layer's own allocator, whose
+  `CommandAllocator::from()` resolves the proxy for both list calls.
+- **On the host runtime.** A PC runtime allocator comes back unwrapped, logged once, because the PC runtime's
+  lists would take a proxy for their own allocator. A command-list proxy that unwraps at `Reset` (§3.5a) is
+  what lets the host backend wrap allocators too.
+- **Residency.** An allocator is a pageable, so `MakeResident`/`Evict`/`SetResidencyPriority`/
+  `EnqueueMakeResident` unwrap allocator proxies like heap, queue and fence proxies.
+
+`allocator_proxy_test` checks this on the Vulkan device and on the host runtime, and the mock test checks it
+over allocators with and without the tag. On the Vulkan device it checks forwarding, the refused tail, the guard
+region, identity, and D3D12's allocator rules through the proxy, and runs a list created and `Reset` on the
+proxy whose copies go through the queue and fence proxies and are read back.
+
+Which of this is measured: the slot numbers and signatures are the SDK's (public). That the console
+keeps the public queue and fence slots, and device slots 8/32/36/75, is an assumption the package cannot
+test, as above. The proxies make a wrong assumption visible in the log; they do not prove it right.
+`queue_proxy_test` checks all of this with no game files, on the host runtime (WARP and a hardware
+adapter) and on the Vulkan device; `OpenSharedHandle` of a shared fence only on the host runtime, since the
+Vulkan device does not share fences (the test prints "not checked" there). Each error case runs in its own
+process and is compared with the real object's HRESULT. The test also includes a console-style client: it makes a heap through slot 14 (handle in
+RAX) and buffers through slot 76 (layout word 0x1). It then copies through the queue proxy, finishes through
+the fence proxy, reads the data back, and makes residency calls that carry the heap, queue and fence proxies.
+`device_proxy_test` gets its queue and fence through the registered `D3D12XboxCreateDevice` shim.
+
+The package-gated `bvh_builder_test` and `fsr_dispatch_test` stay at `SKIP (no package)` without
+`LEONIDA_GAME_DIR`, and they would not cover these paths if they ran. Neither creates a queue or a fence:
+the BVH builder's constructor calls device slots only, and `fsr_dispatch_test` records into a logging list it
+never executes. Neither DLL calls the device slots the proxies change (§3.5, §3.5a).
+
 The same caveat applies to **return conventions**: the public AMD64 COM convention (HRESULT in
 EAX, `void` methods, out-parameters through pointers, `GetDesc` returning a 16-byte struct by
 value) is what the runtime implements. No Xbox-specific convention on a queue, list, fence or
@@ -419,8 +615,7 @@ command object.
 | `CreateCommandQueueX` | No slot or parameter layout; only the UMD message and an inferred shape. |
 | `SuspendX` / `ResumeX` | No slot or signature. |
 | Xbox queue/list/fence/allocator slot deviations | No runtime binary and no game executable; the package has no queue, fence or allocator client, and its only command-list client is the BVH builder. |
-| Command-list method at `+0x490` | Offset measured; identity, signature and whether it is an appended COM method or an internal class method are unknown. |
-| Builder's internal field layout (`+0x18`, `+0x30`, `+0x140`, `+0x344`, `+0x350`, `+0x544`) | No header or symbol; the helper's writes prove the contract is wider than the public vtable, but not what the fields mean. |
+| Builder's list field `+0x350` | Read once (`0x1d877`) and not explained by the inline buffer of section 3.5a, which covers `+0x18`, `+0x28`, `+0x30`, `+0x140`, `+0x141`, `+0x344` and `+0x544`. |
 | DMA list use/value | The IID is prior art; type 6 is derived; no shipped module uses it. |
 
 ### 5.4 GCL8 (resolved in PR #164)
@@ -429,8 +624,8 @@ The shipped builder's rehydrate exports name `ID3D12GraphicsCommandList8`, and
 `OMSetFrontAndBackStencilRef` is public GCL8 at slot 81. **PR #164 adds the public GCL8 interface**
 to `runtime/shims/d3d12_com.cpp`: it records the front/back values, resets them in `Reset`, answers
 `IID_ID3D12GraphicsCommandList8`, and registers the `d3d12_gcl8` CTest (9/9). The values are recorded
-but not applied because this layer still has no pipeline/draw path. It does **not** close the
-builder's `+0x490` gap, but a GCL8 pointer is now served instead of refused.
+but not applied because this layer still has no pipeline/draw path. The builder's `+0x490` call is the
+enhanced-barrier `Barrier` at console slot 146 (section 3.3), which a console-order list routes to GCL7 slot 80.
 
 ## 6. Return conventions
 
@@ -450,23 +645,25 @@ return has been measured.
 The executable is absent, so the next step should use the one shipped client that exists rather
 than invent slots.
 
-1. **Trace the builder's command-list calls with a logging proxy.** Create a test-only command
+1. **Confirm sections 3.3 and 3.3a with a logging proxy.** Create a test-only command
    list whose public GCL6/GCL8 vtable logs `(slot, raw arguments)` and whose tail is a page of
    logged unknown slots. Pass it to
    `XboxBvhBuilder::BuildRaytracingAccelerationStructureBatched2X` with a minimal non-empty
    descriptor. The `+0xd0` barrier and `+0x70` dispatch should be observed first; the `+0x490`
-   call will be recorded with its raw arguments. This turns `0x490` from an offset into a
-   call shape and tests the "wider than the public vtable" hypothesis without a GPU. If the
+   call should arrive with one global UAV barrier group (section 3.3), and slot 148 should be
+   asked for `count * 40` bytes. Keep the cursor at its limit so every call reaches the vtable. If the
    builder validates its inputs before reaching the dispatch, use a descriptor shaped like the
    one its own `GetRaytracingAccelerationStructurePrebuildInfo` accepts (prior art measured a
    3,000-vertex triangle geometry; the prebuild answer is 204,800 bytes / 128,704 scratch).
 2. **GCL8 is now implemented** in PR #164 (public slot 81, recorded/reset, CTest 9/9); the
-   remaining builder gap is the `+0x490` method.
+   builder's `+0x490` is `Barrier` (section 3.3), and its slot 148 needs an upload allocator (section 3.3a).
 3. **When the executable appears, trace the four creation calls first.** Per-slot counters on
    device slots 8/9/12/36, then queue slots 10/14/15, fence slots 8/9/10, and every slot beyond
    the public chain. The first `PresentX` call and the queue vtable tail are the only way to
    recover the present surface; a DXGI import would make the DXGI path the first
-   implementation instead ([d3d12_vulkan.md §8.2 Q6](d3d12_vulkan.md)).
+   implementation instead ([d3d12_vulkan.md §8.2 Q6](d3d12_vulkan.md)). The counters exist: device,
+   queue and fence proxies count every slot, and the queue and fence tails are logged with their
+   first argument words (§5.2).
 
 Do not fill the unknown slots with guesses. A wrong slot is worse than a clean refusal; the
 existing device proxy already follows that rule (`runtime/shims/d3d12_xs_device.h:16-18`).
@@ -501,7 +698,10 @@ the SDK; the console GUIDs are attributed to SCARAB in
 - Builder call sites: Capstone 5.0.7 x86-64 disassembly of the 12 exported functions and the
   functions they call directly; RVAs are PE relative virtual addresses. The
   `0xd0` call is in the batched entry (`0x216a0`, site `0x2171e`); the `0x490` call is in the
-  per-descriptor function reached from it (`0x1d7c0`, site `0x1da02`).
+  per-descriptor function reached from it (`0x1d7c0`, site `0x1da02`). Section 3.3a: the
+  `call [reg+disp]` sites in the rest of `.text` whose object register holds the list pointer,
+  each read with the argument registers set before it and the inline write it falls back from;
+  the barrier constant is the 16 bytes at RVA `0xcdf60` (file offset from the section table).
 - Public slots: parse the `MIDL_INTERFACE`/`virtual` declarations in `d3d12.h`; the counts in
   section 2 include the seven `IUnknown`+`ID3D12Object` slots. Cross-check selected values with
   `python tools/d3d12_xs_surface.py --check --sdk` (116 slots, 83 standard GUIDs) and

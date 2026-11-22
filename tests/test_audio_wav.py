@@ -4,6 +4,8 @@
 
 The decode tests use synthetic audio and skip when ffmpeg is not on PATH.
 """
+import contextlib
+import io
 import os
 from pathlib import Path
 import shutil
@@ -32,7 +34,7 @@ class AudioWavTest(unittest.TestCase):
         os.makedirs(os.path.dirname(self.src))
         subprocess.run([FFMPEG, "-v", "error", "-y", "-f", "lavfi", "-i",
                         "sine=frequency=440:sample_rate=48000:duration=1",
-                        "-ac", "1", "-c:a", "libopus", self.src], check=True)
+                        "-ac", "1", "-c:a", "libopus", self.src], stdin=subprocess.DEVNULL, check=True)
         self.out = os.path.join(self.dir, "wav")
         self.dst = os.path.join(self.out, "one.wav")
 
@@ -73,14 +75,14 @@ class AudioWavTest(unittest.TestCase):
                     tone = f"sine=frequency={hz}:sample_rate=48000:duration={ms / 1000}"
                     link = subprocess.check_output([FFMPEG, "-v", "error", "-f", "lavfi", "-i", tone,
                                                     "-c:a", "libopus", "-fflags", "+bitexact", "-serial_offset",
-                                                    str(serial), "-f", "ogg", "pipe:1"])
+                                                    str(serial), "-f", "ogg", "pipe:1"], stdin=subprocess.DEVNULL)
                     self.assertEqual(int.from_bytes(link[14:18], "little"), serial)
                     links.append(link)
                 src = Path(self.dir, name + ".ogg")
                 src.write_bytes(b"".join(links))
                 reference = os.path.join(self.dir, "reference.wav")
                 subprocess.run([FFMPEG, "-v", "error", "-y", "-i", src, "-c:a", "pcm_s16le", reference],
-                               check=True, capture_output=True)
+                               stdin=subprocess.DEVNULL, check=True, capture_output=True)
                 with wave.open(reference, "rb") as w:
                     self.assertEqual(w.getnframes(), sum(ms for _, ms in tones) * 48)
                     pcm = w.readframes(w.getnframes())
@@ -111,11 +113,155 @@ class AudioWavTest(unittest.TestCase):
             self.assertEqual(f.read(), b"previous output")
         self.assertEqual(sorted(os.listdir(self.out)), ["one.wav", "one.wav.part.wav"])
 
+    def test_repair_audio_matches_pcm_with_different_tags_and_rejects_other_audio(self):
+        self.assertEqual(self.run_tool(self.src, "--out", self.out).returncode, 0)
+        tagged = os.path.join(self.dir, "tagged.wav")
+        silent = os.path.join(self.dir, "silent.wav")
+        subprocess.run([FFMPEG, "-v", "error", "-i", self.dst, "-c:a", "copy", "-metadata", "comment=other", tagged],
+                       stdin=subprocess.DEVNULL, check=True)
+        subprocess.run([FFMPEG, "-v", "error", "-i", self.dst, "-af", "volume=0", silent],
+                       stdin=subprocess.DEVNULL, check=True)
+        expected = audio_wav.audio_digest(FFMPEG, self.src, source=True)
+        self.assertIsNotNone(expected)
+        self.assertEqual(audio_wav.audio_digest(FFMPEG, tagged, source=False), expected)
+        self.assertNotEqual(audio_wav.audio_digest(FFMPEG, silent, source=False), expected)
+
+    def test_readonly_shared_and_foreign_repair_wavs_survive_resume(self):
+        src_dir = os.path.dirname(self.src)
+        first, second = (os.path.join(src_dir, n) for n in ("Track.ogg", "track.opus"))
+        os.rename(self.src, first)
+        os.makedirs(self.out)
+        with open(os.path.join(self.out, "CaseProbe"), "wb"):
+            pass
+        if not os.path.exists(os.path.join(self.out, "caseprobe")):
+            second = os.path.join(src_dir, "Track.opus")  # a lexical collision on a case-sensitive test volume
+        subprocess.run([FFMPEG, "-v", "error", "-f", "lavfi", "-i", "sine=frequency=880:sample_rate=48000:duration=1",
+                        "-c:a", "libopus", second], stdin=subprocess.DEVNULL, check=True)
+        shared = os.path.join(self.out, "Track.wav")
+        occupied = os.path.join(self.out, os.path.basename(second) + ".wav")
+        for name in (shared, occupied):
+            with wave.open(name, "wb") as w:
+                w.setparams((1, 2, 48000, 48000, "NONE", "not compressed"))
+                w.writeframes(bytes(96000))
+        with open(shared, "rb") as f:
+            previous = f.read()
+        try:
+            for name in (shared, occupied):
+                os.chmod(name, 0o444)
+            p = self.run_tool(src_dir, "--out", self.out, "--jobs", "2")
+            self.assertEqual(p.returncode, 0, p.stderr)
+            self.assertIn("2 WAV written", p.stdout)
+            for src, name in ((first, "Track.ogg.wav"), (second, os.path.basename(second) + "~2.wav")):
+                self.assertEqual(audio_wav.audio_digest(FFMPEG, os.path.join(self.out, name), source=False),
+                                 audio_wav.audio_digest(FFMPEG, src, source=True))
+            p = self.run_tool(src_dir, "--out", self.out, "--jobs", "1")
+            self.assertEqual(p.returncode, 0, p.stderr)
+            self.assertIn("0 WAV written, 2 already present", p.stdout)
+            for name in (shared, occupied):
+                with open(name, "rb") as f:
+                    self.assertEqual(f.read(), previous)
+        finally:
+            for name in (shared, occupied):
+                os.chmod(name, 0o644)
+
+    def test_new_source_cannot_resume_from_a_previous_inputs_repair_name(self):
+        src = os.path.join(os.path.dirname(self.src), "Track.ogg.ogg")
+        os.rename(self.src, src)
+        os.makedirs(self.out)
+        old = os.path.join(self.out, "Track.ogg.wav")
+        with wave.open(old, "wb") as w:
+            w.setparams((1, 2, 48000, 48000, "NONE", "not compressed"))
+            w.writeframes(bytes(96000))                  # right frame count, wrong recording
+        with open(old, "rb") as f:
+            previous = f.read()
+        p = self.run_tool(src, "--out", self.out)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("1 WAV written", p.stdout)
+        fixed = os.path.join(self.out, "Track.ogg~2.wav")
+        self.assertEqual(audio_wav.audio_digest(FFMPEG, fixed, source=False),
+                         audio_wav.audio_digest(FFMPEG, src, source=True))
+        p = self.run_tool(os.path.dirname(src), "--out", self.out)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("0 WAV written, 1 already present", p.stdout)
+        with open(old, "rb") as f:
+            self.assertEqual(f.read(), previous)
+
+    def test_clean_case_pair_has_two_outputs_and_a_stable_second_run(self):
+        folder = os.path.dirname(self.src)
+        shutil.copyfile(self.src, os.path.join(folder, "One.opus"))
+        first = self.run_tool(folder, "--out", self.out, "--jobs", "2")
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertIn("2 WAV written", first.stdout)
+        files = [os.path.join(self.out, name) for name in os.listdir(self.out)]
+        self.assertEqual(len(files), 2)
+        times = [os.stat(path).st_mtime_ns for path in files]
+        second = self.run_tool(folder, "--out", self.out, "--jobs", "1")
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertIn("0 WAV written, 2 already present", second.stdout)
+        self.assertEqual([os.stat(path).st_mtime_ns for path in files], times)
+
+    def test_unlabelled_quad_pcm_matches_without_guessing_a_speaker_layout(self):
+        src, dst = (os.path.join(self.dir, name) for name in ("quad.ogg", "quad.wav"))
+        subprocess.run([FFMPEG, "-v", "error", "-f", "lavfi", "-i", "anullsrc=r=48000:cl=quad", "-t", "0.12",
+                        "-c:a", "libopus", "-mapping_family", "255", src], stdin=subprocess.DEVNULL, check=True)
+        with open(src, "rb") as f:
+            header = f.read(512)
+        self.assertEqual(header[header.index(b"OpusHead") + 18], 255)
+        self.assertTrue(audio_wav.decode(FFMPEG, src, dst)[0])
+        expected = audio_wav.audio_digest(FFMPEG, src, source=True)
+        self.assertIsNotNone(expected)
+        self.assertEqual(audio_wav.audio_digest(FFMPEG, dst, source=False), expected)
+
+    def test_explicit_speaker_layouts_still_distinguish_the_same_pcm(self):
+        signatures = []
+        for layout in ("5.1", "5.1(side)"):
+            path = os.path.join(self.dir, layout + ".wav")
+            subprocess.run([FFMPEG, "-v", "error", "-f", "lavfi", "-i", "anullsrc=r=48000:cl=" + layout, "-t", "0.1",
+                            "-c:a", "pcm_s16le", path], stdin=subprocess.DEVNULL, check=True)
+            signatures.append(audio_wav.audio_digest(FFMPEG, path, source=False))
+        self.assertNotIn(None, signatures)
+        self.assertNotEqual(*signatures)
+
+    def test_long_repaired_names_resume_from_a_readonly_directory(self):
+        if os.name == "nt":
+            self.skipTest("uses the POSIX lexical naming path")
+        with open(os.path.join(self.dir, "CaseProbe"), "wb"):
+            pass
+        if not os.path.exists(os.path.join(self.dir, "caseprobe")):
+            self.skipTest("requires a case-insensitive output volume")
+        folder = os.path.dirname(self.src)
+        first = os.path.join(folder, "A" * 249 + ".ogg")
+        os.rename(self.src, first)
+        shutil.copyfile(first, os.path.join(folder, "a" * 249 + ".opus"))
+        result = self.run_tool(folder, "--out", self.out)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("2 WAV written", result.stdout)
+        os.chmod(self.out, 0o555)
+        try:
+            result = self.run_tool(folder, "--out", self.out)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("0 WAV written, 2 already present", result.stdout)
+        finally:
+            os.chmod(self.out, 0o755)
+
     def test_missing_ffmpeg_is_an_explanation_not_a_traceback(self):
         p = self.run_tool(self.src, "--out", self.out, "--ffmpeg", os.path.join(self.dir, "no-ffmpeg"))
         self.assertNotEqual(p.returncode, 0)
         self.assertIn("ffmpeg", p.stderr.lower())
         self.assertNotIn("Traceback", p.stderr)
+
+
+class CliArgumentTest(unittest.TestCase):
+    def test_rejects_nonpositive_jobs(self):
+        with tempfile.TemporaryDirectory() as source:
+            for jobs in ("0", "-1"):
+                with self.subTest(jobs=jobs):
+                    result = subprocess.run(
+                        [sys.executable, "-I", TOOL, source, "--jobs", jobs],
+                        capture_output=True, text=True,
+                    )
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertIn("--jobs must be at least 1", result.stderr)
 
 
 class GranuleTest(unittest.TestCase):
@@ -140,14 +286,96 @@ class GranuleTest(unittest.TestCase):
                     path.write_bytes(first + last)
                     self.assertEqual(audio_wav.ogg_output_samples(path), expected)
 
+    def test_walk_rejects_same_serial_chaining_multiplexing_and_trailing_data(self):
+        head = b"OpusHead" + struct.pack("<BBHIhB", 1, 1, 312, 48000, 0, 0)
+        bos = awc_opus.ogg_page(10, 0, 0, [head], 2)
+        tags = awc_opus.ogg_page(10, 1, 0, [b"OpusTags\x00\x00\x00\x00\x00\x00\x00\x00"], 0)
+        mid = awc_opus.ogg_page(10, 2, 1272, [b"\xf8\xff\xfe"], 0)
+        eos = awc_opus.ogg_page(10, 3, 2232, [b"\xf8\xff\xfe"], 4)
+        # Second link reusing the same serial number (valid per RFC 3533 section 4).
+        link2 = (
+            awc_opus.ogg_page(10, 0, 0, [head], 2)
+            + awc_opus.ogg_page(10, 1, 0, [b"OpusTags\x00\x00\x00\x00\x00\x00\x00\x00"], 0)
+            + awc_opus.ogg_page(10, 2, 1272, [b"\xf8\xff\xfe"], 4)
+        )
+        cases = [
+            ("same-serial chained", bos + tags + mid + eos + link2, 0),
+            ("same-serial chained without first EOS", bos + tags + mid + link2, 0),
+            ("trailing garbage after EOS", bos + tags + eos + b"trailing", 0),
+            (
+                "embedded OggS in intermediate payload",
+                bos + tags + awc_opus.ogg_page(10, 2, 1272, [b"xxOggS\x00\x04yy"], 0) + eos,
+                1920,
+            ),
+            (
+                "continuation flags on intermediate and EOS",
+                bos
+                + tags
+                + awc_opus.ogg_page(10, 2, 1272, [b"\xf8\xff\xfe"], 1)
+                + awc_opus.ogg_page(10, 3, 2232, [b"\xf8\xff\xfe"], 5),
+                1920,
+            ),
+            (
+                "multiplexed different serial mid-stream",
+                bos + tags + awc_opus.ogg_page(11, 0, 0, [b"other"], 0) + eos,
+                0,
+            ),
+            ("truncated page at EOF", bos + tags + eos[:-1], 0),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp, "sample.ogg")
+            for name, data, expected in cases:
+                with self.subTest(name=name):
+                    path.write_bytes(data)
+                    self.assertEqual(audio_wav.ogg_output_samples(path), expected)
+
 
 # Stands in for ffmpeg: writes the input's file name into the output, so each WAV shows which file it came from.
 FAKE_FFMPEG = """import os, sys
 args = sys.argv[1:]
 src = args[args.index("-i") + 1]
-with open(args[-1], "wb") as f:
-    f.write(b"FAKE:" + os.path.basename(src).encode())
+if "copy" in args:
+    with open(src, "rb") as f:
+        data = f.read()
+else:
+    data = b"FAKE:" + os.path.basename(src).encode()
+if args[-1] == "-":
+    sys.stdout.buffer.write(b"RIFF" + bytes(4) + b"WAVE" + data)
+else:
+    with open(args[-1], "wb") as f:
+        f.write(data)
 """
+
+# FAKE_FFMPEG that also logs what it could read from its stdin, one line per run, to $FAKE_FFMPEG_STDIN_LOG.
+STDIN_LOGGING_FFMPEG = FAKE_FFMPEG + """
+with open(os.environ["FAKE_FFMPEG_STDIN_LOG"], "a", encoding="utf-8") as log:
+    log.write(repr(sys.stdin.buffer.read() if sys.stdin else b"") + "\\n")
+"""
+
+
+def write_fake_ffmpeg(directory, source=FAKE_FFMPEG):
+    """Write source as a Python script and return an ffmpeg command for --ffmpeg that runs it."""
+    script = os.path.join(directory, "fake_ffmpeg.py")
+    with open(script, "w", encoding="utf-8") as f:
+        f.write(source)
+    if os.name == "nt":
+        ffmpeg = os.path.join(directory, "ffmpeg.cmd")
+        with open(ffmpeg, "w", encoding="utf-8") as f:
+            f.write(f'@"{sys.executable}" "{script}" %*\n')
+    else:
+        ffmpeg = os.path.join(directory, "ffmpeg")
+        with open(ffmpeg, "w", encoding="utf-8") as f:
+            f.write(f'#!/bin/sh\nexec "{sys.executable}" "{script}" "$@"\n')
+        os.chmod(ffmpeg, 0o755)
+    return ffmpeg
+
+
+def write_fake_opus_inputs(directory, names=("x.ogg", "x.opus", "y.ogg")):
+    """Ogg Opus look-alikes: enough for the tool to accept them; the fake ffmpeg never parses them."""
+    os.makedirs(directory)
+    for name in names:
+        with open(os.path.join(directory, name), "wb") as f:
+            f.write(b"OggS" + b"\0" * 24 + b"OpusHead" + bytes(64))
 
 
 class SameStemTest(unittest.TestCase):
@@ -196,26 +424,107 @@ class SameStemTest(unittest.TestCase):
             os.mkdir(os.path.join(first, "child"))
             self.assertEqual(audio_wav.output_names(items, out), (expected, 2))
 
+    def test_case_collisions_in_leaves_and_missing_parents_follow_the_output_volume(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "in")
+            os.mkdir(os.path.join(tmp, "Probe"))
+            insensitive = os.path.isdir(os.path.join(tmp, "probe"))
+            for a, b in (("Track", "track"), (os.path.join("A", "x"), os.path.join("a", "x"))):
+                with self.subTest(a=a, b=b):
+                    out = os.path.join(tmp, "out")
+                    items = [(os.path.join(src, a + ".ogg"), a), (os.path.join(src, b + ".opus"), b)]
+                    names, lexical, native = audio_wav.plan_outputs(items, src, out, None)
+                    self.assertEqual([stem for _, stem in names], [a + ".ogg", b + ".opus"] if insensitive else [a, b])
+                    self.assertEqual(lexical + native, 2 if insensitive else 0)
+                    self.assertFalse(os.path.exists(out))
+
+    def test_unicode_spellings_follow_native_equivalence(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            a, b = "caf\u00e9", "cafe\u0301"
+            with open(os.path.join(tmp, a), "wb"):
+                pass
+            equivalent = os.path.exists(os.path.join(tmp, b))
+            src, out = os.path.join(tmp, "in"), os.path.join(tmp, "out")
+            items = [(os.path.join(src, a + ".ogg"), a), (os.path.join(src, b + ".opus"), b)]
+            names, lexical, native = audio_wav.plan_outputs(items, src, out, None)
+            self.assertEqual([stem for _, stem in names], [a + ".ogg", b + ".opus"] if equivalent else [a, b])
+            self.assertEqual(lexical + native, 2 if equivalent else 0)
+            self.assertFalse(os.path.exists(out))
+
+    def test_distinct_readonly_hard_links_keep_their_own_names(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src, out = os.path.join(tmp, "in"), os.path.join(tmp, "out")
+            os.mkdir(out)
+            a, b = os.path.join(out, "Track.wav"), os.path.join(out, "track.wav")
+            with open(a, "wb"):
+                pass
+            if os.path.exists(b):
+                self.skipTest("requires two case-distinct directory entries")
+            try:
+                os.link(a, b)
+            except OSError as e:
+                self.skipTest(f"hard links unavailable: {e}")
+            items = [(os.path.join(src, "Track.ogg"), "Track"), (os.path.join(src, "track.opus"), "track")]
+            os.chmod(out, 0o555)
+            try:
+                self.assertEqual(audio_wav.plan_outputs(items, src, out, None), (items, 0, 0))
+            finally:
+                os.chmod(out, 0o755)
+
+    def test_canonical_alias_with_a_case_distinct_hard_link(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src, out = os.path.join(tmp, "in"), os.path.join(tmp, "out")
+            os.mkdir(out)
+            a, b = "\u00c9", "E\u0301"
+            old = os.path.join(out, a + ".wav")
+            with open(old, "wb") as f:
+                f.write(b"older WAV")
+            lower = os.path.join(out, a.lower() + ".wav")
+            if not os.path.exists(os.path.join(out, b + ".wav")) or os.path.exists(lower):
+                self.skipTest("requires canonical equivalence with distinct letter case")
+            try:
+                os.link(old, lower)
+            except OSError as e:
+                self.skipTest(f"hard links unavailable: {e}")
+            items = [(os.path.join(src, a + ".ogg"), a), (os.path.join(src, b + ".opus"), b)]
+            named, _, repaired = audio_wav.plan_outputs(items, src, out, None)
+            self.assertEqual(repaired, 2)
+            self.assertEqual([stem for _, stem in named], [a + ".ogg", b + ".opus"])
+            with open(old, "rb") as f:
+                self.assertEqual(f.read(), b"older WAV")
+
+    def test_readonly_repaired_pair_and_distinct_plain_wav_in_one_fold_group(self):
+        with tempfile.TemporaryDirectory() as out:
+            a, b, c = "\u00c9", "E\u0301", "\u00e9"
+            for name in (a + ".ogg.wav", a + ".opus.wav", c + ".wav"):
+                with open(os.path.join(out, name), "wb"):
+                    pass
+            if os.path.exists(os.path.join(out, a + ".wav")) or not os.path.exists(os.path.join(out, b + ".ogg.wav")):
+                self.skipTest("requires canonical equivalence with distinct letter case")
+            items = [(a + ".ogg", a), (b + ".opus", b), (c + ".ogg", c)]
+            uncertain = set()
+            os.chmod(out, 0o555)
+            try:
+                repaired = audio_wav.native_collisions([0, 1, 2], items, lambda stem: os.path.join(out, stem), uncertain)
+                self.assertEqual(repaired, {0, 1})
+                self.assertFalse(uncertain)
+            finally:
+                os.chmod(out, 0o755)
+
+    @unittest.skipUnless(os.name == "nt", "checks the Windows normcase mapping")
+    def test_broad_unicode_filter_includes_windows_lexical_matches(self):
+        for n in range(0x10000):
+            c = chr(n)
+            self.assertEqual(audio_wav.fold_name(c), audio_wav.fold_name(os.path.normcase(c)), hex(n))
+
+
+class FakeFfmpegDecodeTest(unittest.TestCase):
     def test_every_input_gets_its_own_wav(self):
         with tempfile.TemporaryDirectory() as tmp:
             src = os.path.join(tmp, "in")
             out = os.path.join(tmp, "out")
-            os.makedirs(src)
-            for name in ("x.ogg", "x.opus", "y.ogg"):
-                with open(os.path.join(src, name), "wb") as f:
-                    f.write(b"OggS" + b"\0" * 24 + b"OpusHead" + bytes(64))
-            script = os.path.join(tmp, "fake_ffmpeg.py")
-            with open(script, "w", encoding="utf-8") as f:
-                f.write(FAKE_FFMPEG)
-            if os.name == "nt":
-                ffmpeg = os.path.join(tmp, "ffmpeg.cmd")
-                with open(ffmpeg, "w", encoding="utf-8") as f:
-                    f.write(f'@"{sys.executable}" "{script}" %*\n')
-            else:
-                ffmpeg = os.path.join(tmp, "ffmpeg")
-                with open(ffmpeg, "w", encoding="utf-8") as f:
-                    f.write(f'#!/bin/sh\nexec "{sys.executable}" "{script}" "$@"\n')
-                os.chmod(ffmpeg, 0o755)
+            write_fake_opus_inputs(src)
+            ffmpeg = write_fake_ffmpeg(tmp)
 
             run = [sys.executable, "-I", TOOL, src, "--out", out, "--jobs", "3", "--ffmpeg", ffmpeg]
             p = subprocess.run(run, capture_output=True, text=True)
@@ -231,6 +540,102 @@ class SameStemTest(unittest.TestCase):
             p = subprocess.run(run, capture_output=True, text=True)
             self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
             self.assertIn("0 WAV written, 3 already present", p.stdout)
+
+    def test_ffmpeg_gets_no_stdin(self):
+        # ffmpeg reads stdin for key commands. Given the caller's stdin, it stops a run in the background of a
+        # terminal ("Stopped (tty output)") and swallows input piped to the caller, such as a shell loop's file list.
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "in")
+            write_fake_opus_inputs(src)
+            log = os.path.join(tmp, "stdin.log")
+            env = dict(os.environ, FAKE_FFMPEG_STDIN_LOG=log)
+            run = [sys.executable, "-I", TOOL, src, "--out", os.path.join(tmp, "out"), "--jobs", "1",
+                   "--ffmpeg", write_fake_ffmpeg(tmp, STDIN_LOGGING_FFMPEG)]
+            # The first run decodes; the second checks the WAVs of the inputs that share a name (audio_digest).
+            for step, summary in (("decode", "3 WAV written"), ("resume check", "0 WAV written, 3 already present")):
+                with self.subTest(step):
+                    if os.path.exists(log):
+                        os.remove(log)
+                    p = subprocess.run(run, input="tests/test_next.py\n", capture_output=True, text=True, env=env)
+                    self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+                    self.assertIn(summary, p.stdout)
+                    with open(log, encoding="utf-8") as f:
+                        reads = f.read().splitlines()
+                    self.assertTrue(reads, "the fake ffmpeg never ran")
+                    self.assertEqual(reads, ["b''"] * len(reads))
+
+
+class AudioWavCliTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = self.tmp.name
+        self.src_dir = os.path.join(self.dir, "in")
+        os.makedirs(self.src_dir)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_cli_rejects_jobs_below_one(self):
+        for val in ("0", "-1", "-5"):
+            with self.subTest(val=val):
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err), self.assertRaises(SystemExit) as cm:
+                    audio_wav.main([self.src_dir, "--jobs", val])
+                self.assertEqual(cm.exception.code, 2)
+                self.assertIn("--jobs must be at least 1", err.getvalue())
+
+    def test_cli_subprocess_rejects_jobs_below_one(self):
+        p = subprocess.run([sys.executable, "-I", TOOL, self.src_dir, "--jobs", "0"],
+                           capture_output=True, text=True)
+        self.assertEqual(p.returncode, 2)
+        self.assertIn("--jobs must be at least 1", p.stderr)
+
+    def test_cli_rejects_out_file(self):
+        out_file = os.path.join(self.dir, "out_file")
+        with open(out_file, "wb") as f:
+            f.write(b"content")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), self.assertRaises(SystemExit) as cm:
+            audio_wav.main([self.src_dir, "--out", out_file])
+        self.assertEqual(cm.exception.code, 2)
+        self.assertIn("is a file, not a folder", err.getvalue())
+
+    def test_cli_subprocess_rejects_out_file(self):
+        out_file = os.path.join(self.dir, "out_file")
+        with open(out_file, "wb") as f:
+            f.write(b"content")
+        p = subprocess.run([sys.executable, "-I", TOOL, self.src_dir, "--out", out_file],
+                           capture_output=True, text=True)
+        self.assertEqual(p.returncode, 2)
+        self.assertIn("is a file, not a folder", p.stderr)
+
+    def test_cli_rejects_missing_source(self):
+        missing = os.path.join(self.dir, "nonexistent")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            code = audio_wav.main([missing])
+        self.assertEqual(code, 2)
+        self.assertIn(f"source not found: {missing}", err.getvalue())
+
+    def test_cli_rejects_non_opus_file_extension(self):
+        txt_file = os.path.join(self.dir, "test.txt")
+        with open(txt_file, "wb") as f:
+            f.write(b"hello")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            code = audio_wav.main([txt_file])
+        self.assertEqual(code, 2)
+        self.assertIn("is not an .ogg/.opus file", err.getvalue())
+
+    def test_cli_rejects_file_not_opus(self):
+        bogus_ogg = os.path.join(self.dir, "test.ogg")
+        with open(bogus_ogg, "wb") as f:
+            f.write(b"NotOpusData" * 10)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            code = audio_wav.main([bogus_ogg])
+        self.assertEqual(code, 2)
+        self.assertIn("is not Ogg Opus", err.getvalue())
 
 
 if __name__ == "__main__":

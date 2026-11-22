@@ -14,6 +14,9 @@ import unittest
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOL = os.path.join(ROOT, "tools", "tile_probe.py")
 HAVE_NUMPY = importlib.util.find_spec("numpy") is not None
+# the tool is documented as `python -I`, which does not see a --user install of Pillow
+HAVE_PIL_ISOLATED = subprocess.run([sys.executable, "-I", "-c", "import PIL"],
+                                   capture_output=True, check=False).returncode == 0
 
 
 @unittest.skipUnless(HAVE_NUMPY, "tile_probe.py needs numpy")
@@ -51,6 +54,54 @@ class TileProbeInputTest(unittest.TestCase):
         p = self.run_tool(empty)
         self.assertEqual(p.returncode, 1, p.stderr)
         self.assertIn("0 bytes", p.stderr)
+
+    def test_a_sample_with_no_candidate_layout_is_an_error(self):
+        # Before: an 8-byte or 4 KiB blob printed nothing, wrote no preview and exited 0.
+        tiny = os.path.join(self.tmp.name, "tiny.bin")
+        with open(tiny, "wb") as f:
+            f.write(bytes(4096))
+        preview = os.path.join(self.tmp.name, "preview.png")
+        for extra in ((), ("--out", preview)):
+            with self.subTest(extra=extra):
+                p = self.run_tool(tiny, *extra)
+                self.assertEqual(p.returncode, 1, p.stderr)
+                self.assertIn("no layout fits", p.stderr)
+                self.assertIn("tiny.bin", p.stderr)
+                self.assertNotIn("Traceback", p.stderr)
+                self.assertEqual(p.stdout, "")
+                self.assertFalse(os.path.exists(preview), "a run with no layout writes no preview")
+
+    def test_out_cannot_overwrite_the_input(self):
+        # Before: --out naming the blob saved the preview over it after the probe, destroying the sample.
+        with open(self.blob, "rb") as f:
+            before = f.read()
+        p = self.run_tool(self.blob, "--out", self.blob)
+        self.assertEqual(p.returncode, 1, p.stderr)
+        self.assertIn("overwrite the input", p.stderr)
+        self.assertNotIn("Traceback", p.stderr)
+        with open(self.blob, "rb") as f:
+            self.assertEqual(f.read(), before, "the sample is left as it was")
+
+    def test_out_directory_is_a_message_not_a_traceback(self):
+        p = self.run_tool(self.blob, "--out", self.tmp.name)
+        self.assertEqual(p.returncode, 1, p.stderr)
+        self.assertIn("is a directory", p.stderr)
+        self.assertNotIn("Traceback", p.stderr)
+
+    def test_out_creates_a_missing_folder(self):
+        sys.path.insert(0, os.path.join(ROOT, "tools"))
+        import tile_probe
+        preview = os.path.join(self.tmp.name, "previews", "deep", "best.png")
+        tile_probe.check_preview_path(preview, self.blob)
+        self.assertTrue(os.path.isdir(os.path.dirname(preview)), "the preview's folder is created")
+
+    @unittest.skipIf(HAVE_PIL_ISOLATED, "this interpreter's -I can import Pillow")
+    def test_preview_without_pillow_is_a_message_not_a_traceback(self):
+        # Before: the probe ran, then render()'s lazy PIL import raised after all the work was done.
+        p = self.run_tool(self.blob, "--out", os.path.join(self.tmp.name, "preview.png"))
+        self.assertEqual(p.returncode, 1, p.stderr)
+        self.assertIn("Pillow", p.stderr)
+        self.assertNotIn("Traceback", p.stderr)
 
     def test_offset_inside_the_file_still_probes(self):
         p = self.run_tool(self.blob, "--offset", "0")

@@ -9,6 +9,51 @@ the Vulkan implementation, not that the shader results are correct. Value-level 
 The checker exits nonzero if a module fails to load, a pipeline fails to compile, or the requested final
 cache save fails. It still finishes checking the other entries and attempts the final save so the next run
 can reuse successful pipelines. Entries reported as skipped do not count as failures.
+It also exits 2, before loading Vulkan, if `index.json` is missing, unreadable, empty or malformed, so a wrong
+directory can't pass as an empty corpus. A valid `{}` is an intentionally empty index.
+
+## Check user-defined interfaces between stages
+
+`tools/shader_link_check.py` compares the binary SPIR-V declarations of the shaders you plan to put in the
+same pipeline. Use it before driver compilation to locate missing varyings, overlapping components, type
+mismatches and per-primitive mesh declarations. It reads local modules and needs only Python.
+
+```powershell
+python -I tools/shader_link_check.py check --vs <vertex.spv> --ps <pixel.spv>
+python -I tools/shader_link_check.py check --vs <vertex.spv> --gs <geometry.spv> --ps <pixel.spv>
+python -I tools/shader_link_check.py check --ms <mesh.spv> --ps <pixel.spv>
+python -I tools/shader_link_check.py inspect <shader.spv>
+```
+
+To audit a batch, give it the shader names from your local translation directory in a JSON file. A stage can
+use a string or a `shader` and `entry` object. Names refer to `<name>.spv` in `--shader-dir`.
+
+```json
+{
+  "version": 1,
+  "pipelines": [
+    {"name": "two-stage", "vs": "vs_example", "ps": "ps_example"},
+    {"name": "with-geometry", "vs": "vs_example", "gs": "gs_example",
+     "ps": {"shader": "ps_other", "entry": "main"}}
+  ]
+}
+```
+
+```powershell
+python -I tools/shader_link_check.py batch pairs.json --shader-dir <spirv> --quiet --report link-report.json
+```
+
+The report records per-pipeline results. It uses the Vulkan Location and Component model, including one
+outer array level for geometry inputs, mesh outputs and fragment `PerVertexKHR` inputs. Add `--maintenance4`
+when the actual device enables that feature and the pipeline relies on matching a wider output vector to a
+narrower input vector. See [Vulkan interface matching][interfaces].
+
+Exit codes are `0` for compatible interfaces, `1` for a mismatch and `2` for a bad input or an interface
+the reader cannot interpret. Continue with the driver checker for shader instruction validation, resource
+bindings, device limits and pipeline state. Shader pairs must come from the caller. Share aggregate counts
+and error classes, keeping the local shader files and reports that identify them on your PC.
+
+[interfaces]: https://docs.vulkan.org/spec/latest/chapters/interfaces.html#interfaces-iointerfaces-matching
 
 ## Corpus
 
@@ -68,6 +113,16 @@ overlay layers (a missing Epic JSON, three non-conforming layer names, one dupli
 22,092 full-shard modules were not re-run through the validation layer; their result is driver
 acceptance only.
 
+## Limiting concurrent compilation of large modules
+
+By default, a SPIR-V module larger than 4 MiB compiles alone. Smaller modules continue to use
+`--jobs`. The gate covers module creation and both compute and graphics pipelines. The size
+cutoff is a heuristic for [#884](https://github.com/ItsNotRexed/Leonida/issues/884), where several
+compiles that each needed gigabytes of host RAM ran at the same time. The pipeline cache still
+checkpoints during the run, and isolated modules count towards the regular results.
+
+`--large-module-bytes N` changes the cutoff in bytes. Set it to `0` to disable isolation.
+
 ## Skipping huge modules
 
 `vk_pipeline_check` now accepts `--max-bytes N`:
@@ -84,6 +139,98 @@ modules passed.
 The report above therefore states the limit and the skip count; a later run on an RTX 4060 Ti / 595
 completed the full 26,503-entry set without them (`docs/design.md`). `--max-bytes` remains a visibility
 tool, not a pass: a skipped module has not been validated.
+
+## Crash isolation (`--isolate`)
+
+A driver that dies while compiling one module (for example the RADV `SIGFPE` in
+[#1721](https://github.com/ItsNotRexed/Leonida/issues/1721)) ends the whole process, so the rest of the corpus
+used to need that module excluded by hand with `--start/--count`. With `--isolate` (POSIX only; on Windows it
+prints an error and exits with 2) the tool runs the check in child processes instead:
+
+```sh
+vk_pipeline_check <spirv dir> cache.bin --isolate [--isolate-batch 256] [--jobs N ...]
+```
+
+- The parent opens no Vulkan device. It runs this executable, one child at a time, over `--isolate-batch`
+  modules (default 256) of the same sorted, stage-filtered list, with the other options passed on (`--jobs` is
+  the thread count inside each child). `--stats` is refused: children would overwrite one file.
+- A child that is killed by a signal, or exits without finishing the pass after it started work, has its output
+  discarded and its batch is bisected (re-run in halves) down to the module that kills it. That module is printed as
+  `MODULE CRASH <name> (<stage>, driver crashed: SIGFPE)`, counted as a failed pipeline and listed at the end;
+  the other modules are checked as usual and counted once. If both halves of a crashed batch run clean (a crash
+  that needs several threads at once), the batch is reported as `MODULE CRASH [a, b) not reproduced ...` and
+  counts as a failure. A child that fails before it starts work (no device, bad arguments) stops the run
+  with exit status 1.
+- The pipeline cache: children run one after another and each seeds from and saves to the same `cache.bin`,
+  like the chunked runs above; the save is atomic, a crashed child saves nothing, so the file stays valid and
+  holds everything the finished children compiled. The parent prints its size at the end.
+- Exit status: 0 only if no module failed or crashed and the cache saved; 1 otherwise. The summary is
+  aggregated by the parent (modules, pipelines, skips, `--cache-feedback`); the per-stage wave and compile-time lines
+  of a normal run are not repeated. Output of a batch appears when its child finishes.
+- Each child loads the cache again, so a very large cache makes small batches slow; raise `--isolate-batch`.
+  There is no timeout: a hung compile still hangs.
+
+Test hook, not for normal use: `VK_PIPELINE_CHECK_SIMULATE_CRASH=<module name substring>[:SIGNAL]` makes the
+process raise `SIGNAL` (default `SIGFPE`; `SEGV`, `ABRT`, `KILL`, ... also accepted) just before the pipeline of a
+matching module is created. `tests/test_vk_pipeline_check_isolate.py` uses it with five hand-assembled compute
+shaders to check `--isolate` without a crashing driver; it skips when the tool isn't built or there is no
+Vulkan device.
+
+## Application pipeline-cache feedback
+
+With `--cache-feedback`, the checker groups successful pipeline creations by translated shader stage
+and reports three counts. A **hit** means the driver set both the valid-feedback bit and the
+application-cache-hit bit. **No hit reported** means feedback was valid and the hit bit was clear.
+**Unavailable** means the driver returned no valid feedback, or feedback was unsupported.
+The three counts sum to the successful pipelines for the stage. Skips and failures are counted separately.
+
+A driver can also use its own caches. A clear hit bit does not establish a fresh compile, and a
+reported hit may reuse data populated earlier in the same process. The seed-file byte count alone
+cannot identify which pipelines benefited.
+
+To compare runs, start with a new cache path and keep the device, index and flags identical, including
+`--stats` if used. For example, from a scratch directory that contains no `sample.cache`, run the same
+command twice, replacing `path/to/spirv` with the local translated-shader directory.
+
+```sh
+vk_pipeline_check path/to/spirv sample.cache --cache-feedback
+vk_pipeline_check path/to/spirv sample.cache --cache-feedback
+```
+
+On Windows with an RTX 5090 (driver 621.14), a synthetic three-compute, one-vertex and one-pixel
+sample reported zero application-cache hits on its first run and five on the seeded run. On Mesa
+llvmpipe the same five pipelines succeeded both times and neither run reported a hit.
+
+## Wave64-emulated corpus (`--wave64-emulate`)
+
+A GPU that only runs 32-wide subgroups (NVIDIA, Intel) needs the corpus translated with
+`--wave64-emulate`. Its cross-lane operations go through workgroup memory instead of subgroup operations.
+Its modules are larger, and they behave differently under the driver. All runs below are on an
+RTX 4060 Ti (NVIDIA 595 driver, 32 GB RAM).
+
+**Translation.** All 26,503 shaders translate and pass `spirv-val` at 43d4703. The run used eight
+`--shard` processes and took 80 minutes. The modules total 13.68 GB: median 3.3% larger than the
+previous emulated translation (spirv4), 90th percentile 16% larger, with exact-semantics rules added
+in between.
+
+**One process per chunk.** A single `vk_pipeline_check --jobs 4` run over the emulated corpus reached
+21,000 of 26,503 pipelines with no failures. Then the driver's compiler ran out of memory
+(`LLVM ERROR: out of memory`). With 2 jobs, one process later grew past 100 GB of committed memory.
+Driver compiler memory isn't returned between pipelines, so the build now runs as one checker
+process per 300–500 entries. Each process seeds from and saves to the same cache file, so the chunks
+resume. Since #903 the checker also compiles modules over 4 MiB alone.
+
+**The ScreenProbes shaders.** `indirect_diffuse_lighting`'s ScreenProbes_ActivateProbes,
+ActivateProbesTarget and ActivateRays compute shaders were 60, 60 and 32 MB of SPIR-V. Their 3,281
+typed-buffer loads each decoded every supported format inline. The exact UNORM/SNORM conversion added in
+#755 made that about 900 instructions per load, which pushed the two largest past SPIR-V's id bound of
+4,194,303 (#881). They were also the modules compiling when the driver ran out of memory. Since
+dcd8ecf the run-time format decode is one function per module (`%fmt_decode_fn`):
+ActivateProbes went from 6.16 M to 2.20 M instructions (41.7 MB), and all three now validate.
+
+**Results.** With the pre-dcd8ecf translation (spirv4), entries 0–24,200 compiled with 0 module and
+0 pipeline failures; two modules over 16 MiB were skipped in the chunked part. The spirv5 cache (all
+26,503 entries, nothing skipped by size) is being built.
 
 ## Device
 

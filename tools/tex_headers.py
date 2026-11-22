@@ -71,9 +71,9 @@ GFX10_TO_DXGI = {
     27: 36,
     28: 38,
     29: 34,
-    43: 26,
-    44: 24,
-    48: 25,
+    36: 26,
+    50: 24,
+    54: 25,
     56: 28,
     57: 31,
     60: 30,
@@ -705,6 +705,16 @@ def scan_archive(carve, arch):
     return out
 
 
+def same_output_path(first, second):
+    """True when writing ``second`` would truncate ``first`` (same file, path or hard link)."""
+    if os.path.normcase(os.path.realpath(first)) == os.path.normcase(os.path.realpath(second)):
+        return True
+    try:
+        return os.path.samefile(first, second)
+    except OSError:
+        return False
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("carve")
@@ -720,14 +730,32 @@ def main():
         ap.error(f"no index.json for {', '.join(missing)} in {a.carve}")
     if not archs:
         ap.error(f"no carved archive (a folder with index.json) in {a.carve}")
+    path = a.out or os.path.join(a.carve, "textures_index.json")
+    if os.path.isdir(path):
+        ap.error(f"{path} is a directory, not a .json file")
+    for arch in archs:
+        manifest = os.path.join(a.carve, arch, "index.json")
+        if same_output_path(manifest, path):
+            ap.error(f"output would overwrite an input manifest: {path}")
     allt = []
     for arch in archs:
-        t = scan_archive(a.carve, arch)
+        try:
+            t = scan_archive(a.carve, arch)
+        except (OSError, ValueError, KeyError, TypeError) as e:   # a malformed index.json: one line, as gamedata_index
+            where = getattr(e, "filename", None) or os.path.join(a.carve, arch, "index.json")
+            print(f"ERROR: cannot read {where}: {getattr(e, 'strerror', None) or e!r}", file=sys.stderr)
+            return 2
         print(f"{arch}: {len(t)} texture headers", flush=True)
         allt += t
-    path = a.out or os.path.join(a.carve, "textures_index.json")
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(allt, f)
+    parent = os.path.dirname(os.path.abspath(path))
+    if parent:      # the scan is already done; a missing folder used to lose it in a FileNotFoundError
+        os.makedirs(parent, exist_ok=True)
+    try:
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            json.dump(allt, f)
+    except OSError as e:
+        print(f"ERROR: cannot write {path}: {e.strerror or e}", file=sys.stderr)
+        return 2
     print(f"{len(allt)} textures -> {path}")
     print("formats:", Counter(t["fmt_name"] for t in allt).most_common(12))
     print("flags (low 16 bits):", Counter(hex(t["flags"] & 0xFFFF) for t in allt).most_common(10))
@@ -735,4 +763,8 @@ def main():
 
 
 if __name__ == "__main__":
+    try:  # a redirected stdout is strict ANSI code page under -I; write '?' for what it cannot encode
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
     sys.exit(main())

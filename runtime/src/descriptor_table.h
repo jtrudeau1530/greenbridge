@@ -129,7 +129,10 @@ public:
     }
 
     // Erases a key from the table. Returns true if the key was found and erased, false otherwise.
-    // Backward-shifts downstream entries in the probe cluster so probe chains remain intact and compact.
+    // Only the key's own slot changes (it becomes empty): no other entry moves. Every lookup, here and in the
+    // shaders (rdna2spirv.py desc_probe), compares all kDescriptorProbes slots and never stops at an empty one, so
+    // a hole breaks no probe chain and inserts reuse it. Keeping the other entries in place is what lets the GPU
+    // copy of the table take an erase while shaders still probe it (BindlessSet::flush_needs_idle).
     bool erase(const std::uint32_t key[8]) {
         std::lock_guard lock(mutex_);
         return erase_locked(key);
@@ -207,8 +210,9 @@ public:
 
     // `count` consecutive slots' 10 dwords each to `dest`, under one lock; false when any is out of range.
     bool read_slots(std::uint32_t first, std::uint32_t count, std::uint32_t* dest) const {
+        if (count > 0 && !dest) return false;
         std::lock_guard lock(mutex_);
-        if (first + count > entries_.size()) return false;
+        if (first > entries_.size() || count > entries_.size() - first) return false;
         for (std::uint32_t i = 0; i < count; ++i) {
             const DescriptorEntry& entry = entries_[first + i];
             std::memcpy(dest + i * 10, entry.key, sizeof(entry.key));
@@ -218,10 +222,21 @@ public:
         return true;
     }
 
+    // Serializes directly into `dest` (must hold at least size_bytes()) without allocating a temporary vector.
     void write_to_buffer(void* dest, bool clear_pad = false) const {
         if (!dest) return;
-        const auto buf = build_gpu_buffer(clear_pad);
-        std::memcpy(dest, buf.data(), buf.size() * sizeof(std::uint32_t));
+        std::lock_guard lock(mutex_);
+        auto* out = static_cast<std::uint8_t*>(dest);
+        std::memcpy(out, &mask_, sizeof(mask_));
+        out += sizeof(mask_);
+        for (const auto& entry : entries_) {
+            std::uint32_t slot[10];
+            std::memcpy(slot, entry.key, sizeof(entry.key));
+            slot[8] = entry.index;
+            slot[9] = clear_pad ? 0 : entry.pad;
+            std::memcpy(out, slot, sizeof(slot));
+            out += sizeof(slot);
+        }
     }
 
 private:
@@ -309,24 +324,9 @@ private:
         }
         if (!found) return false;
 
-        // Backward-shift entries in the probe cluster to maintain probe chains
-        std::uint32_t i = found_slot;
-        std::uint32_t j = i;
+        // No backward shift: see erase().
+        entries_[found_slot] = DescriptorEntry{};
         mark(found_slot);
-        while (true) {
-            j = (j + 1) & mask_;
-            if (entries_[j].pad != kSlotOccupiedMarker) break;
-            const std::uint32_t r = hash_descriptor_key(entries_[j].key);
-            const std::uint32_t dist_r_to_i = (i - r) & mask_;
-            const std::uint32_t dist_r_to_j = (j - r) & mask_;
-            if (dist_r_to_i < dist_r_to_j && dist_r_to_i < kDescriptorProbes) {
-                entries_[i] = entries_[j];
-                mark(i);
-                i = j;
-            }
-        }
-        entries_[i] = DescriptorEntry{};
-        mark(i);
         --occupied_count_;
         return true;
     }

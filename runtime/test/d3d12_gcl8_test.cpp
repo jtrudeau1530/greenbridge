@@ -36,6 +36,10 @@ int main(int argc, char** argv) {
     EXPECT(SUCCEEDED(create_command_allocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator.p))));
     EXPECT(SUCCEEDED(create_command_list(D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.p, IID_PPV_ARGS(&list7.p))));
 
+    // Null bindings exercise the public entry points without creating a pipeline or loading Vulkan.
+    list7.p->SetPipelineState(nullptr);
+    list7.p->SetGraphicsRootSignature(nullptr);
+
     // AddRef through the GCL7 pointer gives the count this test expects while the QueryInterface reference is held.
     const ULONG held = list7.p->AddRef();
     list7.p->Release();
@@ -67,10 +71,12 @@ int main(int argc, char** argv) {
         EXPECT(front_back_stencil_ref(list8.p, front, back));
         EXPECT(front == 3 && back == 4);
 
-        // The generated stub is still invoked for each call, even when the legacy diagnostic is deduplicated.
+        // A marker is traced by name, never by its label. A method still unsupported (protected sessions) goes
+        // through its generated stub on each call, even when the legacy diagnostic is deduplicated.
         constexpr char marker[] = "synthetic-marker-argument";
-        list8.p->SetMarker(0, marker, static_cast<UINT>(sizeof(marker)));
-        list8.p->SetMarker(0, marker, static_cast<UINT>(sizeof(marker)));
+        list8.p->SetMarker(1, marker, static_cast<UINT>(sizeof(marker)));
+        list8.p->SetProtectedResourceSession(nullptr);
+        list8.p->SetProtectedResourceSession(nullptr);
         EXPECT(list8.p->Close() == S_OK);
         EXPECT(list8.p->Close() == E_FAIL);
         EXPECT(SUCCEEDED(list7.p->Reset(allocator.p, nullptr)));
@@ -79,6 +85,11 @@ int main(int argc, char** argv) {
     }
     EXPECT(list7.p->AddRef() == held);  // QueryInterface released its reference
     list7.p->Release();
+
+    // Calls made before pipeline setup still belong in the trace. They invalidate this list without needing a GPU.
+    list7.p->DrawInstanced(3, 1, 0, 0);
+    list7.p->DrawIndexedInstanced(3, 1, 0, 0, 0);
+    EXPECT(list7.p->Close() == E_INVALIDARG);
 
     UINT ignored_front = 0, ignored_back = 0;
     EXPECT(!front_back_stencil_ref(nullptr, ignored_front, ignored_back));

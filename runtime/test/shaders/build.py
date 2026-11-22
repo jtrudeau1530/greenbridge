@@ -8,9 +8,20 @@ staged in a temporary directory. After validation, the build writes <out>/spirv/
 metadata.
 
 Compute shaders can override the default header with leading "; group: X,Y,Z" and "; rsrc2: 0x..." comments.
+A shader whose header has "; fssm-at: 0xOFFSET" and "; fssm-data: 0xWORD ..." comments also gets a synthetic
+FSSM program (the magic, zeros up to OFFSET, then the words): it is published as <out>/fssm/<name>.fssm and its
+SHA-256 goes into the index as fssm_sha256, which is what the layer looks a PSO's shader up by (the translator
+hashes <work>/fssm/<name>.fssm for the game's programs, and compute shaders here already). A test builds the shader container from that file. The words
+are also what a shader reads through s_getpc_b64 (the code base) at that offset.
 The stage comes from the name's prefix. Mesh and geometry shaders (ms_, gs_) also need a DXBC container with
 their signatures, which this doesn't make.
 The comment at the top of each .asm says which test program to run on the result and what it should print.
+With LEONIDA_FMA=khr (or glsl), the fused multiply-adds are translated with --fma khr (OpFmaKHR, which needs
+VK_KHR_shader_fma; the test programs enable it when the device has it, else they exit 77) or --fma glsl.
+With LEONIDA_BARY_FALLBACK=1, pixel shaders that read raw barycentrics are translated with --bary-fallback, and
+each gets a pass-through geometry shader, <name>.bary_gs.spv, that check.py draws it with (tools/bary_fallback_gs.py).
+Under that or LEONIDA_F16_INTERP_FALLBACK=1, ps_ij_computed isn't built: its computed I/J pair needs PerVertexKHR
+inputs, and check.py reports it as SKIP.
 """
 import json
 import os
@@ -29,6 +40,8 @@ import mc_command  # noqa: E402
 
 MC = mc_command.mc_command()
 RSRC2, GROUP = 0x8088, (64, 1, 1)
+# Not built under LEONIDA_BARY_FALLBACK=1 or LEONIDA_F16_INTERP_FALLBACK=1 (see main).
+NEEDS_PER_VERTEX_INPUTS = ("ps_ij_computed",)
 sys.path.insert(0, HERE)  # this script is also run with python -I
 from compute_fixture import compute_header  # noqa: E402
 
@@ -47,6 +60,40 @@ def asm_mattr(path):
 
 
 CLIP_CASES = {"vs_clip": 1, "vs_clip_param4": 4, "vs_clip_undeclared": 1}
+
+
+def asm_fssm_fields(path):
+    """(offset, words) of the "fssm-at" and "fssm-data" header comments, (None, []) without them."""
+    at, words = None, []
+    for ln in Path(path).read_text(encoding="utf-8").splitlines():
+        s = ln.strip()
+        if s and not s.startswith(";"):
+            break
+        m = re.match(r";\s*fssm-at:\s*(0x[0-9a-fA-F]+|\d+)", s)
+        if m:
+            at = int(m.group(1), 0)
+        m = re.match(r";\s*fssm-data:\s*(.*)", s)
+        if m:
+            words += [int(w, 0) for w in m.group(1).split()]
+    return at, words
+
+
+def asm_fssm(path):
+    """The synthetic FSSM program a vs_/ps_ shader's header asks for, or None."""
+    at, words = asm_fssm_fields(path)
+    if at is None or not words or at < 4 or at % 4:
+        return None
+    return b"FSSM" + bytes(at - 4) + b"".join(struct.pack("<I", w) for w in words)
+
+
+def cs_fssm_extra(path):
+    """A compute shader's "fssm-at"/"fssm-data" words (at 0x148 or later, after compute_header's header), or None.
+    Two compute shaders with the same group size and RSRC2 would otherwise share one FSSM hash, which is what the
+    layer finds a PSO's shader by."""
+    at, words = asm_fssm_fields(path)
+    if at is None or not words or at < 0x148 or at % 4:
+        return None
+    return at, b"".join(struct.pack("<I", w) for w in words)
 
 
 def shader_source(name):
@@ -76,14 +123,21 @@ def translate_tests(work, names):
             cmd.append(f"-mattr={mattr}")
         cmd.append("-show-encoding")
         # Feed the text on stdin: an LLVM_MC command that runs in WSL cannot open a Windows path argument.
-        r = subprocess.run(cmd, input=raw, capture_output=True, text=True)
+        r = mc_command.run(cmd, input=raw, capture_output=True, text=True)
         if r.returncode or "error:" in r.stderr:
             sys.exit(f"{n}.asm did not assemble:\n{r.stderr}")
         # rdna2spirv.py rejects assembler directives such as the "\t.text" llvm-mc prints first.
         code = "".join(ln for ln in r.stdout.splitlines(keepends=True) if not ln.lstrip().startswith("."))
-        (disasm / (n + ".s")).write_text(f"; {n}  hand-written test\n{code}", encoding="utf-8")
+        (disasm / (n + ".s")).write_text(f"; {n}  hand-written test\n{code}", encoding="utf-8", newline="\n")
+        program = None if n.startswith("cs_") else asm_fssm(asm_path)
+        if program:   # where the translator looks for a program to hash, as in the game's work folder
+            (fssm / (n + ".fssm")).write_bytes(program)
         if n.startswith("cs_"):
-            (fssm / (n + ".fssm")).write_bytes(compute_header(asm_path))
+            program = bytes(compute_header(asm_path))
+            extra = cs_fssm_extra(asm_path)
+            if extra:
+                program += bytes(extra[0] - len(program)) + extra[1]
+            (fssm / (n + ".fssm")).write_bytes(program)
         elif n in CLIP_CASES and n != "vs_clip_undeclared":
             (work / (n + ".dxbc")).write_bytes(clip_container())
         else:
@@ -91,12 +145,24 @@ def translate_tests(work, names):
     cmd = [sys.executable, "-I", TRANSLATOR, disasm, "--out", spirv]
     if os.environ.get("LEONIDA_W64_EMULATE") == "1":   # wave64 on 32-wide subgroups (compute shaders only)
         cmd.append("--wave64-emulate")
+    if os.environ.get("LEONIDA_BARY_FALLBACK") == "1":   # raw barycentrics without VK_KHR_fragment_shader_barycentric
+        cmd.append("--bary-fallback")
+    if os.environ.get("LEONIDA_FMA") in ("glsl", "khr"):   # fused multiply-add as GLSL Fma (default) or OpFmaKHR
+        cmd += ["--fma", os.environ["LEONIDA_FMA"]]
+    if os.environ.get("LEONIDA_F16_INTERP_FALLBACK") == "1":   # f16 interpolation without PerVertexKHR (MoltenVK)
+        cmd.append("--f16-interp-fallback")
+    if os.environ.get("LEONIDA_TEXOFF_FALLBACK") == "1":   # texel offsets without VK_KHR_maintenance8
+        cmd.append("--texel-offset-fallback")
     return subprocess.run(cmd).returncode
 
 
 def main():
     if len(sys.argv) < 2:
         sys.exit(__doc__)
+    # The CMake test targets name the spirv-as/spirv-val folder here instead of passing a whole PATH, which the Visual
+    # Studio generator's command line can't carry intact (a PATH entry ending in a backslash escapes the next quote).
+    if os.environ.get("LEONIDA_SPIRV_TOOLS"):
+        os.environ["PATH"] = os.environ["LEONIDA_SPIRV_TOOLS"] + os.pathsep + os.environ.get("PATH", "")
     out = Path(sys.argv[1])
     available = sorted({p.stem for p in Path(HERE).glob("*.asm")} | CLIP_CASES.keys())
     names = sys.argv[2:] or available
@@ -107,6 +173,14 @@ def main():
     if skipped:
         print("not built (need a DXBC container with signatures):", ", ".join(skipped))
     names = [n for n in names if n not in skipped]
+    # A computed I/J pair needs PerVertexKHR inputs, which both fallbacks take away: the translator refuses it there,
+    # and check.py and run_gpu_tests.py report it as SKIP. Leave it out instead of losing the whole batch.
+    if os.environ.get("LEONIDA_BARY_FALLBACK") == "1" or os.environ.get("LEONIDA_F16_INTERP_FALLBACK") == "1":
+        per_vertex = [n for n in names if n in NEEDS_PER_VERTEX_INPUTS]
+        if per_vertex:
+            print("not built (computed I/J pairs need PerVertexKHR inputs, off under the fallback):",
+                  ", ".join(per_vertex))
+        names = [n for n in names if n not in per_vertex]
     if not names:
         return 0
     out.mkdir(parents=True, exist_ok=True)
@@ -126,15 +200,24 @@ def main():
         published_index = spirv / index.name
         combined = json.loads(published_index.read_text(encoding="utf-8")) if published_index.exists() else {}
         combined.update(validated)
-        index.write_text(json.dumps(combined, indent=2) + "\n", encoding="utf-8")
+        index.write_text(json.dumps(combined, indent=2) + "\n", encoding="utf-8", newline="\n")
         for n in validated:
             for suffix in (".spv", ".spvasm"):
                 artifact = built / (n + suffix)
                 artifact.replace(spirv / artifact.name)
+            sidecar = work / "fssm" / (n + ".fssm")
+            published = not n.startswith("cs_") or cs_fssm_extra(os.path.join(HERE, n + ".asm"))
+            if published and sidecar.is_file():
+                (out / "fssm").mkdir(exist_ok=True)
+                sidecar.replace(out / "fssm" / sidecar.name)
         index.replace(published_index)
         sys.path.insert(0, os.path.join(HERE, "..", "..", "..", "tools"))
         import spirv_stubs
         spirv_stubs.generate_for_index(str(spirv), combined)
+        if os.environ.get("LEONIDA_BARY_FALLBACK") == "1":
+            # The pass-through geometry shader each --bary-fallback PS is drawn with (<name>.bary_gs.spv).
+            import bary_fallback_gs
+            bary_fallback_gs.build_for_index(str(spirv))
     return 0
 
 

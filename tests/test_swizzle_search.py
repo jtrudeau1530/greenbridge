@@ -366,6 +366,44 @@ class TestSwizzleSearchPermutationMatching(unittest.TestCase):
 
 class TestSwizzleSearchCliAndRender(unittest.TestCase):
     @unittest.skipUnless(HAVE_NUMPY, "numpy required")   # the tool imports numpy before it parses arguments
+    def test_cli_bad_numeric_arguments_are_usage_errors(self):
+        """Bad --bpe/--tile/--widths/--tiles must be usage errors, not arithmetic tracebacks."""
+        cases = [
+            (["--bpe", "0"], "--bpe must be at least 1"),
+            (["--tile", "0"], "--tile must be a multiple"),
+            (["--tile", "1"], "--tile must be a multiple"),
+            (["--tile", "3"], "--tile must be a multiple"),
+            (["--tile", "24"], "--tile / --bpe must be a power of two"),
+            (["--widths", "0"], "--widths must be positive multiples of 4"),
+            (["--widths", "abc"], "--widths must be a comma-separated list"),
+            (["--tiles", "0"], "--tiles must be at least 1"),
+        ]
+        with tempfile.TemporaryDirectory() as td:
+            blob = Path(td) / "valid.bin"
+            blob.write_bytes(bytes(8 * 16 * 8))
+            for args, expected in cases:
+                with self.subTest(args=args):
+                    result = subprocess.run(
+                        [sys.executable, "-I", str(TOOL), str(blob)] + args,
+                        capture_output=True, text=True,
+                    )
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertIn(expected, result.stderr)
+                    self.assertNotIn("Traceback", result.stderr)
+
+    @unittest.skipUnless(HAVE_NUMPY, "numpy required")
+    def test_cli_missing_input_is_an_error_not_a_traceback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            missing = os.path.join(tmp, "definitely_missing_path")
+            result = subprocess.run(
+                [sys.executable, "-I", str(TOOL), missing], capture_output=True, text=True
+            )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("ERROR: cannot read", result.stderr)
+        self.assertIn("definitely_missing_path", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+
+    @unittest.skipUnless(HAVE_NUMPY, "numpy required")   # the tool imports numpy before it parses arguments
     def test_preview_with_no_fitting_layout_reports_the_problem(self):
         """CLI with tiny blob and --out must exit 1, report 'no layout', and not create file."""
         with tempfile.TemporaryDirectory() as td:

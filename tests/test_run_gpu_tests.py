@@ -1,7 +1,12 @@
 """scripts/run_gpu_tests.py: how it judges the output of a compute "dump" test (no device needed)."""
+import contextlib
+import io
 from pathlib import Path
 import sys
+import tempfile
+from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 import run_gpu_tests as rgt
@@ -31,6 +36,146 @@ class DumpWords(unittest.TestCase):
                      "out[0..7] = 55 48 0 0 0 0 0 0 x\n", "out[0..7] = \n", "no dump here\n"):
             with self.subTest(line=line):
                 self.assertIsNone(rgt.dump_words(line))
+
+
+class PackedFormatFixture(unittest.TestCase):
+    def test_filtered_suite_counts_a_packed_store_mismatch(self):
+        name = "cs_fmt_1010102"
+        with tempfile.TemporaryDirectory() as tmp:
+            args = SimpleNamespace(filter=name, build=tmp, llvm_mc="unused")
+
+            def translate(_cmd, env=None, gpu=True):
+                (Path(tmp) / "spirv" / f"{name}.spv").touch()
+                return 0, ""
+
+            output = io.StringIO()
+            problem = "word 15: expected 0xffe00003, got 0xe00003ff"
+            with (patch.object(rgt, "assemble_to_s", side_effect=lambda _mc, _src, dst, _name: Path(dst).touch()),
+                  patch.object(rgt, "spirv_as"),
+                  patch.object(rgt, "run_cmd", side_effect=translate),
+                  patch.object(rgt, "fmt_1010102_test", return_value=problem) as check_fmt,
+                  contextlib.redirect_stdout(output)):
+                self.assertEqual(rgt.run_suite(args, tmp), 1)
+            check_fmt.assert_called_once()
+            self.assertIn(problem, output.getvalue())
+            self.assertIn("0/1 passed", output.getvalue())
+
+
+class TextureTestOnASmallPushConstantDevice(unittest.TestCase):
+    """vk_texture_test exits 77 on a device with 128 push constant bytes: a SKIP, not a FAIL."""
+    UNSUPPORTED_MSG = "unsupported: need 144 push constant bytes, device has 128\n"
+
+    def run_one(self, name):
+        with tempfile.TemporaryDirectory() as tmp:
+            args = SimpleNamespace(filter=name, build=tmp, llvm_mc="unused")
+
+            def translate(_cmd, env=None, gpu=True):
+                (Path(tmp) / "spirv" / f"{name}.spv").touch()
+                return 0, ""
+
+            output = io.StringIO()
+            texture = SimpleNamespace(returncode=77, stdout="", stderr=self.UNSUPPORTED_MSG)
+            with (patch.object(rgt, "assemble_to_s", side_effect=lambda _mc, _src, dst, _name: Path(dst).touch()),
+                  patch.object(rgt, "spirv_as"),
+                  patch.object(rgt, "run_cmd", side_effect=translate),
+                  patch.object(rgt.subprocess, "run", return_value=texture),
+                  contextlib.redirect_stdout(output), contextlib.redirect_stderr(output)):
+                rc = rgt.run_suite(args, tmp)
+            return rc, output.getvalue()
+
+    def test_bindless_texture_and_gather_tests_skip(self):
+        for name in ("ps_cube_sample", "ps_texture_sample_d16", "ps_gather_wrap", "ps_array_resinfo"):
+            with self.subTest(name=name):
+                rc, out = self.run_one(name)
+                self.assertEqual(rc, 0, out)
+                self.assertIn("SKIP (unsupported: need 144 push constant bytes, device has 128)", out)
+                self.assertIn("0/1 passed, 1 skipped", out)
+                self.assertNotIn("no runnable", out)
+
+
+class BindlessTestOnASmallPushConstantDevice(unittest.TestCase):
+    """vk_bindless_test (ps_tex) exits 77 below its 144 push constant bytes (TEST-149): a SKIP with that reason."""
+
+    def run_ps_tex(self, rc, msg):
+        with tempfile.TemporaryDirectory() as tmp:
+            args = SimpleNamespace(filter="ps_tex.asm", build=tmp, llvm_mc="unused")   # not ps_texoff etc.
+
+            def run(cmd, env=None, gpu=True):
+                if Path(cmd[0]).stem == "vk_bindless_test":
+                    return rc, msg
+                (Path(tmp) / "spirv" / "ps_tex.spv").touch()   # rdna2spirv.py "translating" the shader
+                return 0, ""
+
+            output = io.StringIO()
+            with (patch.object(rgt, "assemble_to_s", side_effect=lambda _mc, _src, dst, _name: Path(dst).touch()),
+                  patch.object(rgt, "spirv_as"),
+                  patch.object(rgt, "run_cmd", side_effect=run),
+                  contextlib.redirect_stdout(output), contextlib.redirect_stderr(output)):
+                suite_rc = rgt.run_suite(args, tmp)
+            return suite_rc, output.getvalue()
+
+    def test_too_few_push_constant_bytes_skip(self):
+        rc, out = self.run_ps_tex(77, "device: X\nunsupported: need 144 push constant bytes, device has 128")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("SKIP (unsupported: need 144 push constant bytes, device has 128)", out)
+        self.assertIn("0/1 passed, 1 skipped", out)
+
+    def test_other_failures_still_fail(self):
+        rc, out = self.run_ps_tex(1, "device: X\nps_tex: 12 pixels differ")
+        self.assertEqual(rc, 1, out)
+        self.assertIn("0/1 passed", out)
+        self.assertNotIn("skipped", out)
+
+
+class FilterWithoutRunnableCases(unittest.TestCase):
+    """A filter selecting only an input shader (cs_bench_mix) must not report 0/0 passed with exit 0."""
+
+    def run_filter(self, name, translate_rc=0, spv=True):
+        with tempfile.TemporaryDirectory() as tmp:
+            args = SimpleNamespace(filter=name, build=tmp, llvm_mc="unused")
+
+            def translate(_cmd, env=None, gpu=True):
+                if spv:
+                    (Path(tmp) / "spirv" / f"{name}.spv").touch()
+                return translate_rc, ""
+
+            out, err = io.StringIO(), io.StringIO()
+            with (patch.object(rgt, "assemble_to_s", side_effect=lambda _mc, _src, dst, _name: Path(dst).touch()) as asm,
+                  patch.object(rgt, "spirv_as"),
+                  patch.object(rgt, "run_cmd", side_effect=translate) as run,
+                  patch.object(rgt, "fmt_1010102_test", return_value=None),
+                  contextlib.redirect_stdout(out), contextlib.redirect_stderr(err)):
+                rc = rgt.run_suite(args, tmp)
+            return rc, out.getvalue(), err.getvalue(), asm, run
+
+    def test_benchmark_input_reports_no_runnable_cases(self):
+        rc, out, err, _, _ = self.run_filter("cs_bench_mix")
+        self.assertEqual(rc, 2, out + err)
+        self.assertIn("--filter 'cs_bench_mix' selected cs_bench_mix but no runnable GPU test cases", err)
+        self.assertIn("inputs without a GPU test row", err)
+        self.assertIn("benchmark tool", err)
+        self.assertIn("=== rdna2spirv.py ===", out)
+        self.assertNotIn("0/0 passed", out)
+
+    def test_translation_failure_stays_a_failure(self):
+        rc, out, err, _, _ = self.run_filter("cs_bench_mix", translate_rc=1)
+        self.assertEqual((rc, err), (1, ""))
+        rc, out, err, _, _ = self.run_filter("cs_bench_mix", spv=False)
+        self.assertEqual((rc, err), (1, ""))
+        self.assertIn("missing .spv (translation failed)", out)
+        self.assertIn("0/1 passed", out)
+
+    def test_supported_case_still_passes(self):
+        rc, out, err, _, _ = self.run_filter("cs_fmt_1010102")
+        self.assertEqual((rc, err), (0, ""))
+        self.assertIn("1/1 passed", out)
+
+    def test_unmatched_filter_fails_before_the_tools_run(self):
+        rc, out, err, asm, run = self.run_filter("unmatched_nicofilter")
+        self.assertEqual(rc, 2)
+        self.assertEqual(err, "error: --filter 'unmatched_nicofilter' matched no GPU test cases\n")
+        asm.assert_not_called()
+        run.assert_not_called()
 
 
 class WholeWaveDump(unittest.TestCase):
@@ -114,8 +259,9 @@ class UniformBranchCheck(unittest.TestCase):
         import tempfile
         fd, path = tempfile.mkstemp(suffix=".raw")
         try:
-            with os.fdopen(fd, "wb") as f:
-                for s5, bit, bary in rows:
+            with os.fdopen(fd, "wb") as f:   # the rows repeated over a full 64x64 frame (a short one fails, TEST-29)
+                for k in range(64 * 64):
+                    s5, bit, bary = rows[k % len(rows)]
                     f.write(struct.pack("<2I2f", s5, bit, bary, 0.0))
             return rgt.check_uniform_branch(path)
         finally:
@@ -139,7 +285,14 @@ class Wave32LaneDumps(unittest.TestCase):
     def test_uses_check_py_rule(self):
         import check
         self.assertIs(rgt.narrow_subgroup_skip, check.narrow_subgroup_skip)
+        self.assertIs(rgt.wave32_lane_skip, check.wave32_lane_skip)
         self.assertIs(rgt.WAVE32_LANE_DUMPS, check.WAVE32_LANE_DUMPS)
+        self.assertIs(rgt.WAVE32_LANE_ENV, check.WAVE32_LANE_ENV)
+
+    def test_unpinned_rule(self):
+        self.assertEqual(rgt.wave32_lane_skip("device: X (subgroup 8..32)\ncompute subgroup size: 32 not available\n"),
+                         "SKIP (the device can't run this shader at 32 lanes on request)")
+        self.assertIsNone(rgt.wave32_lane_skip("device: X (subgroup 8..32)\ncompute subgroup size: 32\n"))
 
     def test_rule(self):
         self.assertEqual(rgt.narrow_subgroup_skip("device: llvmpipe (subgroup 8..8)\n"),
@@ -148,6 +301,50 @@ class Wave32LaneDumps(unittest.TestCase):
                     "no device line\n"):
             with self.subTest(out=out):
                 self.assertIsNone(rgt.narrow_subgroup_skip(out))
+
+
+class ComputedIJWithoutPerVertexInputs(unittest.TestCase):
+    """ps_ij_computed (SHADER-177): without PerVertexKHR inputs (--bary-fallback, --f16-interp-fallback, the latter on
+    by default on MoltenVK) the translator refuses the computed I/J pair, so there is no .spv. Both runners SKIP it
+    there, before their missing-.spv check; a missing .spv without a fallback stays a translation failure."""
+    NAME = "ps_ij_computed"
+
+    def run_suite(self, bary, f16):
+        with tempfile.TemporaryDirectory() as tmp:
+            args = SimpleNamespace(filter=self.NAME, build=tmp, llvm_mc="unused")
+            env = {"LEONIDA_BARY_FALLBACK": "1" if bary else "0", "LEONIDA_F16_INTERP_FALLBACK": "1" if f16 else "0"}
+            out = io.StringIO()
+            with (patch.dict(rgt.os.environ, env),
+                  patch.object(rgt, "assemble_to_s", side_effect=lambda _mc, _src, dst, _name: Path(dst).touch()),
+                  patch.object(rgt, "spirv_as"),
+                  patch.object(rgt, "run_cmd", return_value=(0, "1 shaders: 0 translated, 0 pass spirv-val")),   # refused
+                  contextlib.redirect_stdout(out), contextlib.redirect_stderr(out)):
+                rc = rgt.run_suite(args, tmp)
+            return rc, out.getvalue()
+
+    def test_run_gpu_tests_skips_under_either_fallback(self):
+        for bary, f16 in ((True, False), (False, True)):
+            with self.subTest(bary=bary, f16=f16):
+                rc, out = self.run_suite(bary, f16)
+                self.assertIn("SKIP (computed I/J pairs need PerVertexKHR inputs", out)
+                self.assertIn("0/1 passed, 1 skipped", out)
+                self.assertNotIn("missing .spv", out)
+                self.assertEqual(rc, 0, out)
+
+    def test_run_gpu_tests_missing_spv_without_fallback_still_fails(self):
+        rc, out = self.run_suite(False, False)
+        self.assertIn("missing .spv (translation failed)", out)
+        self.assertEqual(rc, 1, out)
+
+    def test_check_py_skips_before_its_spv_check(self):
+        import check
+        with tempfile.TemporaryDirectory() as tmp:
+            for bary, f16 in ((True, False), (False, True)):
+                with self.subTest(bary=bary, f16=f16), \
+                        patch.object(check, "BARY_FALLBACK", bary), patch.object(check, "F16_HALVES", f16):
+                    self.assertIsInstance(check.pixel_test("unused", tmp, self.NAME), check.Skip)
+            with patch.object(check, "BARY_FALLBACK", False), patch.object(check, "F16_HALVES", False):
+                self.assertEqual(check.pixel_test("unused", tmp, self.NAME), f"missing {self.NAME}.spv")
 
 
 if __name__ == "__main__":

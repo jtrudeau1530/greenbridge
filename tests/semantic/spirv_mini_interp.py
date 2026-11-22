@@ -14,8 +14,10 @@ Design rules (see tests/semantic/README.md):
     Backward branches, loops, calls and switches are rejected. Function/Output/Input variables live in Python
     boxes; PushConstant reads can be seeded with a word list; physical-storage-buffer loads/stores (and 32-bit
     atomics, which with one invocation are read-combine-write) use a flat address -> word dictionary, so they
-    must be 32-bit integers at 4-byte-aligned addresses (anything else raises). Workgroup
-    storage and images are rejected.
+    must be 32-bit integers at 4-byte-aligned addresses (anything else raises). Workgroup variables (LDS) are
+    zero-initialised per invocation like Function ones, so they are only meaningful with one invocation
+    (run_workgroup does not share them between invocations); 32-bit atomics on them (and on Function variables)
+    are read-combine-write like the physical-storage-buffer ones. Images are rejected.
   * A default run sees zero push constants, no inputs and empty memory, so tests that do not care about them
     keep the old behaviour.
 
@@ -33,6 +35,43 @@ MASK = 0xFFFFFFFF
 
 class UnsupportedConstruct(NotImplementedError):
     """The module uses something this interpreter deliberately does not model."""
+
+
+class InvalidModule(AssertionError):
+    """The module breaks a SPIR-V structural rule spirv-val enforces, so no driver would accept it, even though
+    this interpreter could run it. Raised instead of returning results for a shader that never reaches a GPU."""
+
+
+def check_structure(body):
+    """spirv-val's merge, phi and Function-variable rules (SPIR-V 2.16.1-2): OpSelectionMerge must be the second-to-last instruction of its block,
+    directly before OpBranchConditional or OpSwitch, and OpLoopMerge directly before OpBranch or
+    OpBranchConditional. Until 2026-11-22 the interpreter skipped merges, so a translator change that put an
+    instruction between a merge and its branch (#1633: OpLoad %active) passed every semantic test while every
+    driver rejected the module. `body` is the list of (result, opcode, operands, line) of a function."""
+    follow = {"OpSelectionMerge": ("OpBranchConditional", "OpSwitch"),
+              "OpLoopMerge": ("OpBranch", "OpBranchConditional")}
+    # OpPhi must come first in its block: only OpLabel or other OpPhi before it (SPIR-V 2.16.2, "OpPhi ... must be
+    # the first instructions of a block"). A phi emitted after an instruction of the merge block is rejected by
+    # spirv-val, and every translator path that merges a guarded load (OpPhi of the loaded and the kept value)
+    # depends on the order.
+    # Function-storage OpVariable belongs in the function's first block (SPIR-V 2.16.1).
+    prev, blocks = None, 0
+    for _, op, a, line in body:
+        if op == "OpPhi" and prev not in ("OpLabel", "OpPhi"):
+            raise InvalidModule(f"{line!r} follows {prev or 'the start of the function'}, not OpLabel or OpPhi")
+        if op == "OpFunction":
+            blocks = 0
+        elif op == "OpLabel":
+            blocks += 1
+        elif op == "OpVariable" and a[1:2] == ["Function"] and blocks > 1:
+            raise InvalidModule(f"{line!r} is a Function variable outside the function's first block")
+        prev = op
+    for k, (_, op, _, line) in enumerate(body):
+        if op in follow:
+            nxt = body[k + 1][1] if k + 1 < len(body) else None
+            if nxt not in follow[op]:
+                raise InvalidModule(f"{line!r} is followed by {body[k + 1][3] if nxt else 'the end of the function'!r}"
+                                    f", not by {' or '.join(follow[op])}")
 
 
 # Instructions that carry no runtime semantics for a single-entry-point, straight-line module.
@@ -150,6 +189,44 @@ def float_to_half(x):
 def _s32(x):
     x &= MASK
     return x - (1 << 32) if x >> 31 else x
+
+
+def _fraction_to_f32(q):
+    """Round an exact non-negative Fraction below 2**128 to binary32: nearest, ties to even (subnormals too)."""
+    if q == 0:
+        return 0.0
+    e = q.numerator.bit_length() - q.denominator.bit_length()     # 2**e <= q < 2**(e+1) after the fix-up
+    if Fraction(2) ** e > q:
+        e -= 1
+    e = max(e, -126)                                              # below 2**-126 the step stays 2**-149
+    m = q * Fraction(2) ** (23 - e)                               # significand in units of the last place
+    n = m.numerator // m.denominator
+    rem = m - n
+    if rem > Fraction(1, 2) or (rem == Fraction(1, 2) and n & 1):
+        n += 1
+    return f32(n * 2.0 ** (e - 23))                               # exact: n <= 2**24
+
+
+def _fract(x):
+    """GLSL.std.450 Fract: x - floor(x), here computed exactly and rounded once to binary32, so a tiny negative x
+    gives 1.0 (the nearest float to 1 - |x|). NaN stays NaN; +-inf gives NaN (inf - inf)."""
+    if math.isnan(x) or math.isinf(x):
+        return math.nan
+    q = Fraction(x)
+    return _fraction_to_f32(q - math.floor(q))
+
+
+def _nmin_nmax(name, x, y):
+    """GLSL.std.450 NMin / NMax: a NaN operand gives the other operand; both NaN give a NaN. Zeros are ordered
+    -0 < +0, the order RDNA2 v_min_f32/v_max_f32 use (measured on an RX 6800, see docs/design.md)."""
+    if math.isnan(x):
+        return y if not math.isnan(y) else math.nan
+    if math.isnan(y):
+        return x
+    kx, ky = (x, math.copysign(1.0, x)), (y, math.copysign(1.0, y))
+    if name == "NMin":
+        return y if ky < kx else x
+    return y if ky > kx else x
 
 
 class _Types:
@@ -318,6 +395,7 @@ def _invocation(text, inputs, push_constants, memory, step=False):
     id_type = {}                # constant / result id -> its type id (the width of a signed comparison)
     pc_type = {}                # id -> pointee type id of a PushConstant pointer
     in_body = False
+    first_fn = None
     body = []
     outputs = []
 
@@ -356,6 +434,7 @@ def _invocation(text, inputs, push_constants, memory, step=False):
             continue
         if op == "OpFunction":
             in_body = True
+            first_fn = res
             continue
         if op in _IGNORED:
             continue
@@ -406,7 +485,7 @@ def _invocation(text, inputs, push_constants, memory, step=False):
             elif cls == "Input":
                 init = inputs.get(res, types.zero(pointee))
                 var_box[res] = [list(init) if isinstance(init, (list, tuple)) else init]
-            elif cls in ("Function", "Output"):
+            elif cls in ("Function", "Output", "Workgroup"):
                 if len(a) > 2:
                     init = values[a[2]]
                     var_box[res] = [list(init) if isinstance(init, list) else init]
@@ -421,6 +500,7 @@ def _invocation(text, inputs, push_constants, memory, step=False):
             raise UnsupportedConstruct(f"{op} in module header")
     if not in_body:
         raise UnsupportedConstruct("no function body")
+    check_structure(body)
 
     def deref(p):
         box, i = p
@@ -448,7 +528,20 @@ def _invocation(text, inputs, push_constants, memory, step=False):
         return signed(val(x), t[1] if t else 32)
 
     labels = {res: idx for idx, (res, op, _, _) in enumerate(body) if op == "OpLabel" and res}
-    pc = 0
+    # Every function's first body index and parameter ids. The first OpFunction was consumed by the header parse;
+    # later ones are in the body. Execution starts at %main (the entry point the translator names).
+    fn_start, fn_params = {first_fn: 0}, {}
+    for idx, (res, op, _, _) in enumerate(body):
+        if op == "OpFunction":
+            fn_start[res] = idx + 1
+    for fid, start in list(fn_start.items()):           # parameters come right after OpFunction
+        params, i = [], start
+        while i < len(body) and body[i][1] == "OpFunctionParameter":
+            params.append(body[i][0])
+            i += 1
+        fn_params[fid], fn_start[fid] = params, i
+    calls = []                                          # (return pc, result id, cur_label, prev_label)
+    pc = fn_start.get("%main", 0)
     killed = False
     cur_label = prev_label = None
     while pc < len(body):
@@ -461,6 +554,28 @@ def _invocation(text, inputs, push_constants, memory, step=False):
         if op == "OpLabel":
             prev_label, cur_label = cur_label, res
             continue
+        if op == "OpFunctionCall":
+            fid, args = a[1], a[2:]
+            if fid not in fn_start or len(args) != len(fn_params[fid]) or len(calls) > 16:
+                raise UnsupportedConstruct(f"OpFunctionCall {fid}")
+            for prm, arg in zip(fn_params[fid], args):
+                values[prm] = val(arg)
+                if arg in id_type:
+                    id_type[prm] = id_type[arg]
+            calls.append((pc, res, cur_label, prev_label))
+            pc = fn_start[fid]
+            continue
+        if op == "OpReturnValue":
+            if not calls:
+                raise UnsupportedConstruct("OpReturnValue outside a called function")
+            ret = val(a[0])
+            pc, res_id, cur_label, prev_label = calls.pop()
+            values[res_id] = ret
+            continue
+        if op == "OpReturn" and not calls:
+            break
+        if op in ("OpFunction", "OpFunctionParameter"):
+            raise UnsupportedConstruct(f"{op} reached by falling through")
         if op in _IGNORED:
             continue
         if op == "OpKill":
@@ -556,12 +671,19 @@ def _invocation(text, inputs, push_constants, memory, step=False):
         elif op in _ATOMICS:
             # One invocation, so an atomic is read, combine, write; the result is the original value (SPIR-V spec,
             # 3.42.18). Operands: result type, pointer, scope, semantics(, unequal semantics), value(, comparator).
+            # The pointer is a physical-storage-buffer word or an element of a variable (a Workgroup array is LDS):
+            # the same pointers OpLoad / OpStore take. Push constants are read-only.
             p = pointers[a[1]]
-            if p[0] != "psb":
-                raise UnsupportedConstruct(f"{op} outside PhysicalStorageBuffer")
+            if p[0] == "pc":
+                raise UnsupportedConstruct(f"{op} on a PushConstant")
             if types.bits(a[0]) != 32:
                 raise UnsupportedConstruct(f"{op} on a non-32-bit integer")
-            old = memory.get(psb_word(p[1]), 0)
+            if p[0] == "psb":
+                old = memory.get(psb_word(p[1]), 0)
+            else:
+                old = deref(p)
+                if isinstance(old, bool) or not isinstance(old, int) or old > MASK:
+                    raise UnsupportedConstruct(f"{op} on a variable element that is not a 32-bit integer")
             if op == "OpAtomicCompareExchange":
                 new = val(a[5]) if old == val(a[6]) & MASK else old
             else:
@@ -570,7 +692,10 @@ def _invocation(text, inputs, push_constants, memory, step=False):
                        "OpAtomicUMax": max(old, v), "OpAtomicSMin": old if _s32(old) <= _s32(v) else v,
                        "OpAtomicSMax": old if _s32(old) >= _s32(v) else v, "OpAtomicAnd": old & v,
                        "OpAtomicOr": old | v, "OpAtomicXor": old ^ v, "OpAtomicExchange": v}[op]
-            memory[p[1]] = new & MASK
+            if p[0] == "psb":
+                memory[p[1]] = new & MASK
+            else:
+                p[0][p[1]] = new & MASK
             values[res] = old
         elif op == "OpSelect":
             if not isinstance(val(a[1]), bool):
@@ -593,6 +718,12 @@ def _invocation(text, inputs, push_constants, memory, step=False):
             for i in a[2:]:
                 v = v[int(i)]
             values[res] = v
+        elif op == "OpVectorExtractDynamic":
+            # SPIR-V: an Index outside the vector's component count gives an undefined value
+            v, i = val(a[1]), val(a[2])
+            if not isinstance(i, int) or not 0 <= i < len(v):
+                raise UnsupportedConstruct(f"OpVectorExtractDynamic index {i!r} outside the vector")
+            values[res] = v[i]
         elif op == "OpCompositeConstruct":
             values[res] = tuple(val(x) for x in a[1:])
         elif op == "OpBitwiseAnd":
@@ -743,20 +874,15 @@ def _invocation(text, inputs, push_constants, memory, step=False):
                 values[res] = fn(x, y)
             else:
                 raise UnsupportedConstruct(f"{op} on non-float")
+        elif op == "OpFmaKHR":
+            # SPV_KHR_fma: x * y + z correctly rounded, the same exact single rounding as GLSL Fma above (fma_f32)
+            x, y, z = (val(t) for t in a[1:4])
+            if isinstance(x, tuple):
+                values[res] = tuple(fma_f32(p, q, s) for p, q, s in zip(x, y, z))
+            else:
+                values[res] = fma_f32(x, y, z)
         elif op == "OpFNegate":
             values[res] = f32(-val(a[1]))
-        elif op == "OpFDiv":
-            x, y = val(a[1]), val(a[2])
-            if not (isinstance(x, float) and isinstance(y, float)):
-                raise UnsupportedConstruct("OpFDiv on non-float")
-            if y == 0.0:
-                raise UnsupportedConstruct("OpFDiv by zero (undefined in SPIR-V)")
-            if math.isinf(x) and math.isinf(y):
-                values[res] = math.nan
-            elif math.isnan(x) or math.isnan(y):
-                values[res] = math.nan
-            else:
-                values[res] = f32(x / y)        # x/inf is a signed zero, as in Python
         elif op == "OpQuantizeToF16":
             # Single-instruction f32 -> f16 -> f32 round to nearest, with the
             # SPIR-V subnormal rule: a magnitude too small for a normal f16
@@ -836,14 +962,26 @@ def _invocation(text, inputs, push_constants, memory, step=False):
                 values[res] = f32(math.sin(args[0]) if name == "Sin" else math.cos(args[0]))
             elif name == "FAbs":
                 values[res] = f32(abs(args[0]))
+            elif name == "FSign":
+                # GLSL.std.450: 1.0 if x > 0, 0.0 if x = 0 (keeping the zero's sign), -1.0 if x < 0
+                x = args[0]
+                if math.isnan(x):
+                    raise UnsupportedConstruct("GLSL.std.450 FSign of a NaN (result not specified)")
+                values[res] = 1.0 if x > 0 else -1.0 if x < 0 else x
             elif name == "SAbs":
                 # Two's complement: the most negative value is its own absolute value (as on the hardware).
                 values[res] = abs(_s32(args[0])) & MASK
             elif name in ("FMax", "FClamp"):
-                if any(math.isnan(v) for v in args) or (name == "FClamp" and args[1] > args[2]):
-                    raise UnsupportedConstruct(f"GLSL.std.450 {name} with these operands (undefined)")
-                v = max(args[0], args[1])
-                values[res] = f32(v if name == "FMax" else min(v, args[2]))
+                def fmax_clamp(*xs):
+                    if any(math.isnan(v) for v in xs) or (name == "FClamp" and xs[1] > xs[2]):
+                        raise UnsupportedConstruct(f"GLSL.std.450 {name} with these operands (undefined)")
+                    # Equal zeros: -0 is ordered below +0, as in NMin/NMax above (the order RDNA2 hardware uses,
+                    # so a med3 built from these ops is the hardware's median for signed zeros too).
+                    v = _nmin_nmax("NMax", xs[0], xs[1])
+                    return f32(v if name == "FMax" else _nmin_nmax("NMin", v, xs[2]))
+                # Vector operands (v_pk_* clamp) are component-wise.
+                values[res] = (tuple(fmax_clamp(*c) for c in zip(*args)) if isinstance(args[0], tuple)
+                               else fmax_clamp(*args))
             elif name in ("RoundEven", "Floor", "Ceil", "Trunc"):
                 # round() breaks ties to even. An integral result keeps the operand's sign (IEEE 754
                 # roundToIntegral), so RoundEven(-0.4), Ceil(-0.5) and Trunc(-0.5) are -0.0, not +0.0.
@@ -878,7 +1016,17 @@ def _invocation(text, inputs, push_constants, memory, step=False):
             elif name == "FMin":
                 if any(math.isnan(x) for x in args):
                     raise UnsupportedConstruct(f"GLSL.std.450 {name} of NaN (undefined)")
-                values[res] = f32(min(args))
+                values[res] = f32(_nmin_nmax("NMin", *args))
+            elif name in ("NMin", "NMax"):
+                x, y = args
+                if isinstance(x, tuple):
+                    values[res] = tuple(_nmin_nmax(name, p, q) for p, q in zip(x, y))
+                else:
+                    values[res] = _nmin_nmax(name, x, y)
+            elif name == "Fract":
+                if not isinstance(args[0], float):
+                    raise UnsupportedConstruct("Fract on non-float")
+                values[res] = _fract(args[0])
             elif name == "UMin":
                 values[res] = min(args)
             elif name == "UMax":

@@ -217,8 +217,8 @@ With 2D compact layouts plus 2D arrays, cubemaps, and 3D volumes enabled in
 
 `tools/ttpf_mips.py` exports DX10 DDS for 2D arrays (`Texture2DArray`), cubemaps
 (`TextureCube`), and validated float16 3D volumes (`Texture3D`). Upstream C# `TtpfReader` parity
-has landed in `breadbbbb/rpf9-explorer` PRs #5 and #6 and is carried by the `917e9b9` submodule
-pin.
+has landed in `breadbbbb/rpf9-explorer` PRs #5, #6, and #7 (compact layouts, multi-slice shapes,
+and BCPack BC1/BC3/BC4/BC5) and is carried by the `e293917` submodule pin.
 
 ## Reproduce
 

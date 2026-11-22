@@ -150,7 +150,11 @@ def run(spvasm):
         "OpIEqual": lambda a, b: a == b, "OpINotEqual": lambda a, b: a != b,
     }
 
+    F64 = {"OpFAdd": lambda a, b: a + b, "OpFSub": lambda a, b: a - b, "OpFMul": lambda a, b: a * b}
+
     def glsl(fn, a):
+        if fn in ("Fma", "FMin", "FMax", "FClamp") and isinstance(a[0], tuple):      # vector: per component
+            return tuple(glsl(fn, list(c)) for c in zip(*a))
         if fn == "UnpackHalf2x16":
             return (f32(half_to_float(a[0])), f32(half_to_float(a[0] >> 16)))
         if fn == "PackHalf2x16":
@@ -166,6 +170,16 @@ def run(spvasm):
         simple = {"FMin": min, "FMax": max, "FAbs": abs, "Sin": math.sin, "Cos": math.cos,
                   "Sqrt": math.sqrt, "InverseSqrt": lambda x: 1 / math.sqrt(x), "Exp2": lambda x: 2.0 ** x,
                   "Log2": math.log2}
+        if fn in ("NMin", "NMax"):
+            # A NaN operand gives the other operand (both NaN: a NaN); zeros ordered -0 < +0 as on RDNA2.
+            def pick(x, y):
+                if math.isnan(x) or math.isnan(y):
+                    return y if math.isnan(x) else x
+                kx, ky = (x, math.copysign(1.0, x)), (y, math.copysign(1.0, y))
+                return y if (ky < kx if fn == "NMin" else ky > kx) else x
+            if isinstance(a[0], tuple):
+                return tuple(pick(x, y) for x, y in zip(a[0], a[1]))
+            return pick(a[0], a[1])
         if fn in simple:
             return f32(float(simple[fn](*a)))
         if fn == "Fract":
@@ -198,7 +212,11 @@ def run(spvasm):
             val[res] = get(args[1])
         elif op == "OpBitcast":
             t, v = types[args[0]][0], get(args[1])
-            if t == "Float":
+            if types[args[0]] == ("Float", "64"):          # v2uint (lo, hi) -> double
+                val[res] = struct.unpack("<d", struct.pack("<II", v[0] & M32, v[1] & M32))[0]
+            elif t == "Vector" and isinstance(v, float):  # double -> v2uint (lo, hi)
+                val[res] = struct.unpack("<II", struct.pack("<d", v))
+            elif t == "Float":
                 val[res] = u2f(v) if isinstance(v, int) else v
             else:
                 bits = f2u(v) if isinstance(v, float) else v & M32
@@ -206,8 +224,10 @@ def run(spvasm):
         elif op == "OpSelect":
             val[res] = get(args[2]) if get(args[1]) else get(args[3])
         elif op in ARITH:
-            x, y = get(args[1]), get(args[2])
-            if isinstance(x, tuple) and isinstance(y, tuple):     # vector operands: component by component
+            t, x, y = types.get(args[0], ("",)), get(args[1]), get(args[2])
+            if t == ("Float", "64") and op in F64:
+                val[res] = F64[op](x, y)                   # binary64: Python floats, no f32 rounding
+            elif isinstance(x, tuple) and isinstance(y, tuple):     # vector operands: component by component
                 val[res] = tuple(ARITH[op](p, q) for p, q in zip(x, y))
             else:
                 val[res] = ARITH[op](x, y)

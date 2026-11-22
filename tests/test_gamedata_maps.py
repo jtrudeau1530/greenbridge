@@ -47,15 +47,16 @@ def mhiu_payload(width: int, height: int, rows, pixels: bytes,
 
 
 def pamh_payload(width: int, height: int, maximum, minimum,
-                 flag: int = 0x1BBC8CED) -> bytes:
+                 padding: int = 0x1BBC8CED,
+                 version: tuple = (1, 2)) -> bytes:
     rows = b"".join(struct.pack("<HHi", 0, width, i * width)
                     for i in range(height))
     data = rows + bytes(maximum) + bytes(minimum)
     head = bytearray(44)
     head[:4] = b"PAMH"
-    head[0x04] = 1
-    head[0x05] = 2
-    struct.pack_into("<I", head, 0x08, flag)
+    head[0x04] = version[0]
+    head[0x05] = version[1]
+    struct.pack_into("<I", head, 0x08, padding)
     struct.pack_into("<HH", head, 0x0C, width, height)
     struct.pack_into("<6f", head, 0x10, -10.0, -20.0, -30.0, 40.0, 50.0, 60.0)
     struct.pack_into("<I", head, 0x28, len(data))
@@ -151,11 +152,62 @@ class GamedataMapsTest(unittest.TestCase):
         p = gamedata_maps.parse_pamh(payload)
         self.assertEqual(p["header"]["version_major"], 1)
         self.assertEqual(p["header"]["version_minor"], 2)
-        self.assertEqual(p["header"]["flag"], 0x1BBC8CED)
+        self.assertEqual(p["header"]["padding08"], 0x1BBC8CED)
         self.assertEqual(p["header"]["bounds"]["max"], [40.0, 50.0, 60.0])
         self.assertEqual(list(p["_max"]), [1, 2, 3, 4, 5, 6])
         self.assertEqual(list(p["_min"]), [0, 1, 2, 3, 4, 7])
         self.assertEqual(p["grid"]["min_above_max"], 1)
+
+    def test_pamh_padding_word_does_not_change_the_arrays(self):
+        args = (3, 2, [1, 2, 3, 4, 5, 6], [0, 1, 2, 3, 4, 7])
+        zero = gamedata_maps.parse_pamh(pamh_payload(*args, padding=0))
+        measured = gamedata_maps.parse_pamh(pamh_payload(*args, padding=0x1BBC8CED))
+        ascii_tail = gamedata_maps.parse_pamh(pamh_payload(*args, padding=0x74680001))
+        self.assertEqual((zero["header"]["padding08"], measured["header"]["padding08"],
+                          ascii_tail["header"]["padding08"]),
+                         (0, 0x1BBC8CED, 0x74680001))
+        self.assertEqual(zero["_max"], measured["_max"])
+        self.assertEqual(zero["_min"], ascii_tail["_min"])
+        self.assertEqual(measured["grid"], ascii_tail["grid"])
+
+    def test_pamh_census_groups_tiles_by_grid(self):
+        self.add(pamh_payload(4, 3, [1] * 12, [0] * 12, padding=0, version=(1, 1)))
+        self.add(pamh_payload(4, 3, [2] * 12, [0] * 12,
+                              padding=0x74680001, version=(1, 2)))
+        self.add(pamh_payload(2, 2, [3] * 4, [0] * 4, version=(1, 2)))
+        self.finish()
+
+        p, data = self.run_tool()
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        census = data["pamh_census"]
+        self.assertEqual([(g["width"], g["height"], g["tiles"]) for g in census],
+                         [(4, 3, 2), (2, 2, 1)])
+        first = census[0]
+        self.assertEqual((first["full_width_row_tiles"], first["padding08_zero"],
+                          first["padding08_distinct"]), (2, 1, 2))
+        self.assertEqual(first["version_minor"], {"1": 1, "2": 1})
+        self.assertEqual(first["bounds_min"], [-10.0, -20.0, -30.0])
+        self.assertIn("PAMH census 4x3: 2 tiles", p.stdout)
+
+    def test_pamh_row_table_full_width_count(self):
+        payload = pamh_payload(3, 2, [1] * 6, [0] * 6)
+        head = bytearray(payload)
+        struct.pack_into("<HH", head, 44, 0, 2)
+        p = gamedata_maps.parse_pamh(bytes(head))
+        self.assertEqual(p["grid"]["full_width_rows"], 1)
+
+    def test_bounds_reject_nan_and_infinity(self):
+        for off, args, field in (
+                (0x0C, (3, 1, [(0, 3, [1, 2, 3])], b""), "mhiu"),
+                (0x10, (3, 1, [1, 2, 3], [0, 0, 0]), "pamh")):
+            for bad in (float("nan"), float("inf"), float("-inf")):
+                payload = (mhiu_payload if field == "mhiu" else pamh_payload)(*args)
+                head = bytearray(payload)
+                struct.pack_into("<f", head, off, bad)
+                parser = gamedata_maps.parse_mhiu if field == "mhiu" \
+                    else gamedata_maps.parse_pamh
+                with self.assertRaisesRegex(ValueError, "non-finite bound"):
+                    parser(bytes(head))
 
     def test_pamh_rejects_a_short_row_body(self):
         payload = pamh_payload(2, 2, [1, 2, 3, 4], [0, 1, 2, 3])
@@ -194,6 +246,18 @@ class GamedataMapsTest(unittest.TestCase):
         self.assertEqual(mhiu["chunks"], 2)
         self.assertEqual(mhiu["grid"]["width"], 300)
         self.assertEqual(mhiu["grid"]["height"], 1)
+
+    def test_reports_an_unwritable_json_destination(self):
+        self.finish()
+        out = os.path.join(self.root, "missing", "maps.json")
+        result = subprocess.run(
+            [sys.executable, "-I", TOOL, self.carve, "--json", out],
+            capture_output=True, text=True,
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(f"cannot write {out}", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertNotIn("wrote", result.stdout)
 
     def test_complete_64k_map_leaves_the_next_stream_alone(self):
         payload = mhiu_payload(255, 1, [(0, 255, [7] * 255)], pixels=b"\x00" * 65229)

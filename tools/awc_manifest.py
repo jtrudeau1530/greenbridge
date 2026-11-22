@@ -5,14 +5,18 @@
 The AWC layout is read by tools/awc_opus.py (parse_awc + music_channels), so this manifest and the
 exporter agree on stream ids, codecs, sample rates and streamed-music descriptors. A directory is
 scanned recursively for *.awc. CSV is the default on stdout; --out writes a file and a .json
-extension selects JSON unless --format says otherwise. Unreadable banks are reported on stderr and
-skipped. The bank column gives the path relative to the scanned directory or the basename for a single file.
+extension selects JSON unless --format says otherwise. A report cannot replace an input bank, including one
+found during a directory scan. Unreadable banks are reported on stderr, skipped,
+and excluded from bank_count. The bank column gives the path relative to the scanned directory or the basename
+for a single file.
 
 CSV columns: bank, stream, codec, codec_name, channels, sample_rate, declared_samples, duration_s,
 streamed_music, data_offset, data_size, bank_size, notes. JSON is an object with bank_count,
 stream_count, streamed_music_channel_count and a streams list of the same fields (booleans and
-numbers keep their types). duration_s is the AWC header's declared samples / sample rate; notes
-flags values that look inconsistent (zero/odd rate, data-size mismatch, implausible duration).
+numbers keep their types). duration_s is the decoded duration: a plain Opus stream counts 48 kHz
+frames interleaved across channels, so it is `declared_samples / channels / 48000` regardless of
+the tag's rate field; PCM and XMA use `declared_samples / sample_rate`. notes flags values that
+look inconsistent (zero/odd rate, data-size mismatch, implausible duration).
 A streamed-music descriptor contributes one row per channel group; `channels` is the packet channel count read
 from the Opus TOC stereo bit, and `declared_samples`/`duration_s` are per channel (the descriptor stores the
 interleaved count). `data_offset`/`size` is the shared data tag.
@@ -28,13 +32,28 @@ import tempfile
 # -I keeps the script directory off sys.path, so add it explicitly before importing the parser.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import awc_opus  # noqa: E402
+from file_mode import published_mode  # noqa: E402
 
 FIELDS = ("bank", "stream", "codec", "codec_name", "channels", "sample_rate", "declared_samples",
           "duration_s", "streamed_music", "data_offset", "data_size", "bank_size", "notes")
 CODEC_NAMES = {0x00: "PCM16", 0x02: "PCM float32", 0x05: "XMA2", 0x0B: "Opus"}
 
 
-def _notes(codec: int, channels: int, rate: int, samples: int, data, bank_size: int) -> str:
+def _seconds(codec: int, channels: int, rate: int, samples: int, streamed: bool):
+    """Decoded duration of one stream, or None when the header has no usable timing.
+
+    A plain Opus format tag counts 48 kHz frames interleaved across the packet channels: over
+    1,598,151 measured streams, packet samples - declared is 1920..2879 for every rate, which is
+    only possible if the count is already 48 kHz frames (and halved for stereo). PCM and XMA
+    count per-channel samples at the tag's rate. Streamed-music descriptors are already divided
+    to a per-channel count by awc_opus.music_channels()."""
+    if codec == 0x0B and not streamed:
+        return samples / channels / 48000 if channels > 0 else None
+    return samples / rate if rate > 0 else None
+
+
+def _notes(codec: int, channels: int, rate: int, samples: int, data, bank_size: int,
+           streamed: bool = False) -> str:
     """Human-readable warnings for metadata that does not look self-consistent."""
     offset, size = data
     out = []
@@ -48,8 +67,8 @@ def _notes(codec: int, channels: int, rate: int, samples: int, data, bank_size: 
         out.append("data size is zero")
     if offset < 0 or size < 0 or offset + size > bank_size:
         out.append("data range is outside the bank")
-    if rate > 0:
-        seconds = samples / rate
+    seconds = _seconds(codec, channels, rate, samples, streamed)
+    if seconds is not None:
         if samples and seconds < 0.001:
             out.append(f"duration {seconds:.6f} s is under 1 ms")
         if seconds > 24 * 3600:
@@ -69,7 +88,7 @@ def _notes(codec: int, channels: int, rate: int, samples: int, data, bank_size: 
 
 def _row(bank: str, sid: int, codec: int, channels: int, rate: int, samples: int, data,
          bank_size: int, streamed: bool) -> dict:
-    duration = samples / rate if rate > 0 else None
+    duration = _seconds(codec, channels, rate, samples, streamed)
     return {
         "bank": bank,
         "stream": f"{sid:08X}",
@@ -83,7 +102,7 @@ def _row(bank: str, sid: int, codec: int, channels: int, rate: int, samples: int
         "data_offset": data[0],
         "data_size": data[1],
         "bank_size": bank_size,
-        "notes": _notes(codec, channels, rate, samples, data, bank_size),
+        "notes": _notes(codec, channels, rate, samples, data, bank_size, streamed),
     }
 
 
@@ -96,10 +115,16 @@ def _bank_rows(path: str, bank: str) -> list:
     else:                                                    # older parser: streams + attribute
         streams = parsed
         music = getattr(awc_opus.parse_awc, "music", [])
-    bank_size, rows = len(d), {}
-    for s in streams:
-        rows[s["id"]] = _row(bank, s["id"], s["codec"], s["channels"], s["rate"], s["samples"],
-                             s["data"], bank_size, False)
+    bank_size, rows = len(d), []
+    # A bank can hold two streams with the same id: list both, and note the name awc_opus exports the later
+    # one under, instead of letting it replace the first row.
+    for s, stem in zip(streams, awc_opus.export_stems([s["id"] for s in streams])):
+        row = _row(bank, s["id"], s["codec"], s["channels"], s["rate"], s["samples"], s["data"], bank_size,
+                   False)
+        if stem != row["stream"]:
+            note = f"same id as an earlier stream in this bank; awc_opus exports it as {stem}"
+            row["notes"] = "; ".join(x for x in (row["notes"], note) if x)
+        rows.append(row)
     for mus, data in music or []:
         try:
             channels = awc_opus.music_channels(d, mus, data, collect_packets=False)
@@ -111,12 +136,31 @@ def _bank_rows(path: str, bank: str) -> list:
                   file=sys.stderr)
             continue
         for cid, samples, rate, codec, _packets, packet_channels in channels:
-            rows[cid] = _row(bank, cid, codec, packet_channels, rate, samples, data, bank_size, True)
-    return list(rows.values())
+            row = _row(bank, cid, codec, packet_channels, rate, samples, data, bank_size, True)
+            same = next((i for i, r in enumerate(rows) if r["stream"] == row["stream"]), None)
+            if same is None:
+                rows.append(row)
+            else:   # as before: a streamed-music channel replaces a row with its id
+                rows[same] = row
+    return rows
 
 
-def collect(src: str):
-    """(bank count, rows, streamed-music row count); one warning per skipped bank."""
+def _same_report_path(first: str, second: str) -> bool:
+    if os.path.normcase(os.path.realpath(first)) == os.path.normcase(os.path.realpath(second)):
+        return True
+    try:
+        return os.path.samefile(first, second)
+    except OSError:
+        return False
+
+
+def collect(src: str, *, out: str | None = None):
+    """(parsed bank count, rows, streamed-music row count); one warning per skipped bank.
+
+    Invalid banks are reported on stderr and excluded from the bank count, so the summary cannot claim
+    that a directory was inventoried when none of its files could be read. If out is given, refuse a report
+    that would replace any input bank before reading even the first bank (including invalid ones).
+    """
     recursive = os.path.isdir(src)
     if recursive:
         banks = []
@@ -126,15 +170,21 @@ def collect(src: str):
         banks.sort(key=lambda p: (os.path.basename(p).lower(), p.lower()))
     else:
         banks = [src]
+    if out:
+        for path in banks:
+            if _same_report_path(out, path):
+                raise ValueError(f"--out would overwrite the input {path}")
     rows = []
+    parsed = 0
     for path in banks:
         try:
             bank = os.path.relpath(path, src).replace(os.sep, "/") if recursive else os.path.basename(path)
             rows += _bank_rows(path, bank)
+            parsed += 1
         except (ValueError, struct.error, IndexError, OSError) as e:
             print(f"awc_manifest: warning: skipping {path}: {e}", file=sys.stderr)
     rows.sort(key=lambda r: (r["bank"].lower(), int(r["stream"], 16)))
-    return len(banks), rows, sum(1 for r in rows if r["streamed_music"])
+    return parsed, rows, sum(1 for r in rows if r["streamed_music"])
 
 
 def write_manifest(rows: list, banks: int, streamed: int, fmt: str, out: str) -> None:
@@ -164,6 +214,7 @@ def write_manifest(rows: list, banks: int, streamed: int, fmt: str, out: str) ->
                 w.writerow(row)
         if tmp:
             f.close()
+            os.chmod(tmp, published_mode(out))   # mkstemp creates 0600
             os.replace(tmp, out)
             tmp = None
     finally:
@@ -188,7 +239,11 @@ def main(argv=None) -> int:
         print(f"awc_manifest: error: {a.src}: no such file or directory", file=sys.stderr)
         return 2
     fmt = a.format or ("json" if a.out and a.out.lower().endswith(".json") else "csv")
-    banks, rows, streamed = collect(a.src)
+    try:
+        banks, rows, streamed = collect(a.src, out=a.out)
+    except ValueError as e:
+        print(f"awc_manifest: error: {e}", file=sys.stderr)
+        return 2
     try:
         write_manifest(rows, banks, streamed, fmt, a.out)
     except OSError as e:
@@ -199,4 +254,8 @@ def main(argv=None) -> int:
 
 
 if __name__ == "__main__":
+    try:  # a redirected stdout is strict ANSI code page under -I; write '?' for what it cannot encode
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
     sys.exit(main())

@@ -249,6 +249,78 @@ class TestXbchContainerCarvingAndUnpack(unittest.TestCase):
             fssm_unpack.unpack(dxbc)
         self.assertIn("size mismatch", str(ctx.exception))
 
+    def test_unpack_rejects_declared_size_over_fixed_limit_before_inflating(self):
+        fssm_payload = make_fssm(pad_to=64)
+        xbch_blob = make_xbch(fssm_payload, unpacked_override=65)
+        dxil = make_xdat({0x0D: xbch_blob})
+        dxbc = make_dxbc([(b"DXIL", dxil)])
+        real_decompressobj = zlib.decompressobj
+
+        with mock.patch.object(fssm_unpack, "MAX_FSSM_BYTES", 64, create=True), \
+                mock.patch.object(fssm_unpack.zlib, "decompressobj", wraps=real_decompressobj) as decompressobj:
+            with self.assertRaisesRegex(ValueError, "exceeds limit"):
+                fssm_unpack.unpack(dxbc)
+            decompressobj.assert_not_called()
+
+    def test_unpack_caps_expansion_at_declared_size_plus_one(self):
+        fssm_payload = make_fssm(pad_to=4096)
+        xbch_blob = make_xbch(fssm_payload, unpacked_override=32)
+        dxil = make_xdat({0x0D: xbch_blob})
+        dxbc = make_dxbc([(b"DXIL", dxil)])
+        real_decompressobj = zlib.decompressobj
+        observed = []
+
+        class RecordingDecompressor:
+            def __init__(self, *args, **kwargs):
+                self.inner = real_decompressobj(*args, **kwargs)
+
+            def decompress(self, data, max_length=0):
+                output = self.inner.decompress(data, max_length)
+                observed.append((max_length, len(output)))
+                return output
+
+            @property
+            def eof(self):
+                return self.inner.eof
+
+        with mock.patch.object(fssm_unpack, "MAX_FSSM_BYTES", 64, create=True), \
+                mock.patch.object(fssm_unpack.zlib, "decompressobj", side_effect=RecordingDecompressor):
+            with self.assertRaisesRegex(ValueError, "exceeds declared size"):
+                fssm_unpack.unpack(dxbc)
+
+        self.assertEqual(observed, [(33, 33)])
+
+    def test_unpack_rejects_truncated_zlib_stream(self):
+        fssm_payload = make_fssm()
+        compressed = zlib.compress(fssm_payload)[:-4]
+        header = struct.pack("<4sIIIII", b"XBCH", 0, len(compressed), 0, len(fssm_payload), 0)
+        xbch_blob = header + compressed
+        dxil = make_xdat({0x0D: xbch_blob})
+        dxbc = make_dxbc([(b"DXIL", dxil)])
+
+        with self.assertRaisesRegex(ValueError, "truncated XBCH zlib stream"):
+            fssm_unpack.unpack(dxbc)
+
+    def test_unpack_rejects_trailing_data_after_zlib_stream(self):
+        fssm_payload = make_fssm()
+        compressed = zlib.compress(fssm_payload) + b"trailing"
+        header = struct.pack("<4sIIIII", b"XBCH", 0, len(compressed), 0, len(fssm_payload), 0)
+        xbch_blob = header + compressed
+        dxil = make_xdat({0x0D: xbch_blob})
+        dxbc = make_dxbc([(b"DXIL", dxil)])
+
+        with self.assertRaisesRegex(ValueError, "trailing data after XBCH zlib stream"):
+            fssm_unpack.unpack(dxbc)
+
+    def test_unpack_rejects_mismatched_stored_size(self):
+        fssm_payload = make_fssm()
+        xbch_blob = make_xbch(fssm_payload, stored_override=1)
+        dxil = make_xdat({0x0D: xbch_blob})
+        dxbc = make_dxbc([(b"DXIL", dxil)])
+
+        with self.assertRaisesRegex(ValueError, "stored size"):
+            fssm_unpack.unpack(dxbc)
+
     def test_unpack_corrupt_zlib_raises_error(self):
         fssm_payload = make_fssm()
         xbch_blob = make_xbch(fssm_payload, corrupt_zlib=True)
@@ -375,7 +447,7 @@ class TestMainBadSource(unittest.TestCase):
     def test_unlistable_source(self):
         with tempfile.TemporaryDirectory() as tmp:
             out = io.StringIO()
-            with mock.patch.object(fssm_unpack.os, "listdir", side_effect=PermissionError(13, "Permission denied")), \
+            with mock.patch.object(fssm_unpack.os, "scandir", side_effect=PermissionError(13, "Permission denied")), \
                     mock.patch.object(sys, "stderr", out):
                 self.assertEqual(fssm_unpack.main([tmp]), 2)
             self.assertIn("cannot list", out.getvalue())
@@ -390,6 +462,33 @@ class TestMainDirectoryProcessing(unittest.TestCase):
 
     def tearDown(self):
         self.tmp.cleanup()
+
+    def test_main_rejects_invalid_fssm_magic(self):
+        bad_payload = b"JUNK\x01\x01" + bytes(58)
+        bad_dxbc = make_dxbc([(b"DXIL", make_xdat({0x0D: make_xbch(bad_payload)}))])
+        bad_path = os.path.join(self.src, "bad.dxbc")
+        with open(bad_path, "wb") as f:
+            f.write(bad_dxbc)
+
+        cmd = [sys.executable, "-I", TOOL, self.src]
+        res = subprocess.run(cmd, capture_output=True, text=True)
+        self.assertEqual(res.returncode, 1, res.stdout)
+        self.assertIn("'ValueError': 1", res.stdout)
+        self.assertIn("no shader in", res.stderr)
+        fssm_dir = os.path.join(self.src, "fssm")
+        self.assertEqual(os.listdir(fssm_dir) if os.path.isdir(fssm_dir) else [], [])
+        self.assertFalse(os.path.exists(os.path.join(self.src, "fssm_index.json")))
+
+        good_dxbc = make_dxbc([(b"DXIL", make_xdat({0x0D: make_xbch(make_fssm())}))])
+        with open(os.path.join(self.src, "good.dxbc"), "wb") as f:
+            f.write(good_dxbc)
+
+        res = subprocess.run(cmd, capture_output=True, text=True)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn("'ValueError': 1", res.stdout)
+        self.assertEqual(os.listdir(fssm_dir), ["good.fssm"])
+        with open(os.path.join(self.src, "fssm_index.json"), encoding="utf-8") as f:
+            self.assertEqual([row["name"] for row in json.load(f)], ["good"])
 
     def test_main_cli_processing_and_index_generation(self):
         fssm_1 = make_fssm(version=0x0101, instructions=[(0x40, S_ENDPGM)])
@@ -416,6 +515,7 @@ class TestMainDirectoryProcessing(unittest.TestCase):
             f.write(dxbc_short_fssm)
         with open(os.path.join(self.src, "ignored.txt"), "w") as f:
             f.write("not a dxbc container")
+        os.mkdir(os.path.join(self.src, "cache.dxbc"))
 
         res = subprocess.run([sys.executable, "-I", TOOL, self.src], capture_output=True, text=True)
         self.assertEqual(res.returncode, 0, res.stderr)

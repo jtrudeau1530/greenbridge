@@ -63,13 +63,17 @@ def sha256_file(path: str, chunk_size: int = CHUNK) -> str:
 
 def walk(target_dir: str, *, exclude: str | None = None):
     """Yields (relative_path, absolute_path) using forward slashes, excluding the selected manifest."""
+    def scan_failed(error: OSError) -> None:
+        raise error
+
     excluded_dir = excluded_name = None
     if exclude is not None:
         directory, name = os.path.split(os.path.abspath(exclude))
         excluded_dir = os.path.normcase(os.path.realpath(directory))
         excluded_name = os.path.normcase(name)
 
-    for root, _, files in os.walk(target_dir):
+    # os.walk otherwise treats missing or unreadable directories as empty.
+    for root, _, files in os.walk(target_dir, onerror=scan_failed):
         contains_manifest = excluded_dir is not None and os.path.normcase(os.path.realpath(root)) == excluded_dir
         for name in sorted(files):
             if contains_manifest and os.path.normcase(name) == excluded_name:
@@ -102,21 +106,27 @@ def load_manifest(path: str) -> dict[str, dict]:
     if not isinstance(doc, dict):
         raise ManifestError(f"{path}: root must be a JSON object")
 
-    raw_files = doc.get("files") if "files" in doc and isinstance(doc["files"], dict) else doc
-    if not isinstance(raw_files, dict):
-        raise ManifestError(f"{path} has no valid files table")
+    nested = "files" in doc
+    if nested:
+        raw_files = doc["files"]
+        if not isinstance(raw_files, dict):
+            raise ManifestError(f"{path}: 'files' must be a JSON object")
+    else:
+        raw_files = doc
 
     entries: dict[str, dict] = {}
     for raw_rel, info in raw_files.items():
-        if raw_rel in ("created", "title", "version", "note"):
+        if not nested and raw_rel in ("created", "title", "version", "note"):
             continue
         rel = str(raw_rel).replace("\\", "/")
+        if rel in entries:
+            raise ManifestError(f"{path}: duplicate normalized path {rel!r}")
         if isinstance(info, dict):
             size = info.get("size")
             digest = info.get("sha256")
             if not isinstance(digest, str):
                 raise ManifestError(f"{path}: entry {rel!r} missing 'sha256' string")
-            if size is not None and not (isinstance(size, int) and size >= 0):
+            if size is not None and not (isinstance(size, int) and not isinstance(size, bool) and size >= 0):
                 raise ManifestError(f"{path}: entry {rel!r} has invalid integer 'size'")
             entries[rel] = {"size": size, "sha256": digest.lower()}
         elif isinstance(info, str):
@@ -151,10 +161,19 @@ class ManifestReport:
     problems: dict[str, str] = field(default_factory=dict)
     bytes_verified: int = 0
     elapsed_seconds: float = 0.0
+    strict: bool = False
+
+    def count_problems(self, *, strict: Optional[bool] = None) -> int:
+        count = len(self.missing) + len(self.size_mismatch) + len(self.hash_mismatch) + len(self.unreadable)
+        if strict is None:
+            strict = self.strict
+        if strict:
+            count += len(self.untracked)
+        return count
 
     @property
     def problem_count(self) -> int:
-        return len(self.missing) + len(self.size_mismatch) + len(self.hash_mismatch) + len(self.unreadable)
+        return self.count_problems()
 
     def to_dict(self) -> dict:
         return {
@@ -309,6 +328,7 @@ def verify_manifest(
         problems={rel: problems[rel] for rel in sorted(problems.keys())},
         bytes_verified=completed_bytes,
         elapsed_seconds=elapsed_total,
+        strict=strict,
     )
 
 
@@ -316,7 +336,7 @@ def print_report(
     report: ManifestReport,
     out: TextIO = sys.stdout,
     verbose: bool = False,
-    strict: bool = False,
+    strict: Optional[bool] = None,
 ) -> None:
     for rel in sorted(report.problems.keys()):
         kind = report.problems[rel]
@@ -324,9 +344,7 @@ def print_report(
     for rel in report.untracked:
         out.write(f"{'NEW':<10}{rel}\n")
 
-    bad = report.problem_count
-    if strict and report.untracked:
-        bad += len(report.untracked)
+    bad = report.count_problems(strict=strict)
 
     if bad == 0:
         if verbose:
@@ -370,6 +388,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         if not game_dir:
             parser.error("target directory required when using 'verify'")
     else:
+        if args.target_dir is not None:
+            parser.error(f"unrecognized arguments: {args.target_dir}")
         game_dir = args.cmd_or_dir
 
     below_normal()
@@ -396,10 +416,14 @@ def main(argv: Optional[list[str]] = None) -> int:
     if args.json:
         print(json.dumps(report.to_dict(), indent=2))
     else:
-        print_report(report, out=sys.stdout, verbose=args.verbose, strict=args.strict)
+        print_report(report, out=sys.stdout, verbose=args.verbose)
 
     return 0 if report.passed else 1
 
 
 if __name__ == "__main__":
+    try:  # a redirected stdout is strict ANSI code page under -I; write '?' for what it cannot encode
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
     sys.exit(main())

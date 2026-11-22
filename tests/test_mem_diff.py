@@ -32,6 +32,13 @@ class Harness(unittest.TestCase):
         self.assertEqual(a.lines, b.lines)
         self.assertEqual(a.memory, b.memory)
 
+    def test_tbuffer_case_uses_a_bound_descriptor(self):
+        rng = random.Random(20261122)
+        prog = md.generate_program(rng, rng.randrange(1, 3), families=["buffer_format"])
+        self.assertTrue(any(line.startswith("tbuffer_load_format_") for line in prog.lines))
+        descriptor = next(line for line in prog.lines if line.startswith("s_mov_b32 s3,"))
+        self.assertNotEqual(int(descriptor.split(",")[1], 0) >> 12 & 0x7f, 0)
+
     def test_every_family_runs_clean(self):
         for family in sorted(md.GENERATORS):
             with self.subTest(family=family):
@@ -101,15 +108,30 @@ class FormatDecode(unittest.TestCase):
         # 32_UINT: missing Y/Z/W repeat X (SHADER-86).
         self.assertEqual(md.decode_element(7, [32], "UINT"), [7, 7, 7, 7])
 
+    def test_mtbuf_bound_unbound_and_identity(self):
+        # Seed 20261122's first format load: gfx1036 returned zero for INVALID, 2/3 for a bound descriptor.
+        for fmt, want in ((0, 0), (20, 0x3f2aaaab)):
+            with self.subTest(fmt=fmt):
+                ref = md.RefMachine({0x728c: 0xaededaaa})
+                ref.run(["s_mov_b32 s0, 0x7000", "s_mov_b32 s1, 0", "s_mov_b32 s2, 0x1000",
+                         f"s_mov_b32 s3, {md.OOB_RAW | md.XYZW | fmt << 12:#x}", "v_mov_b32 v2, 0x28c",
+                         "tbuffer_load_format_x v8, v2, s[0:3], 0 format:[BUF_FMT_2_10_10_10_UNORM] offen"])
+                self.assertEqual(ref.v[8], want)
+        ref = md.RefMachine({0x7000: 42})
+        ref.run(["s_mov_b32 s0, 0x7000", "s_mov_b32 s1, 0", "s_mov_b32 s2, 0x1000",
+                 f"s_mov_b32 s3, {md.OOB_RAW | 20 << 12:#x}",
+                 "tbuffer_load_format_xyzw v[8:11], off, s[0:3], 0 format:[BUF_FMT_32_UINT]"])
+        self.assertEqual([ref.v[i] for i in range(8, 12)], [42, 0, 0, 0])
+
     def test_shader86_closed_open_questions(self):
         """Missing W repeats X; UNORM raw 3 matches correctly rounded 0x3c40c0c1 (no 1-ULP split)."""
         base = ["s_mov_b32 s0, 0x7000", "s_mov_b32 s1, 0", "s_mov_b32 s2, 0x100"]
-        w32 = program(base + [f"s_mov_b32 s3, {22 << 12 | md.XYZW:#x}", "v_mov_b32 v2, 0",
+        w32 = program(base + [f"s_mov_b32 s3, {22 << 12 | md.XYZW | md.OOB_RAW:#x}", "v_mov_b32 v2, 0",
                               "buffer_load_format_xyzw v[4:7], v2, s[0:3], 0 offen", "s_waitcnt vmcnt(0)",
                               "v_mov_b32 v8, v4", "v_mov_b32 v9, v5", "v_mov_b32 v10, v6", "v_mov_b32 v11, v7"],
                       {0x7000: 0x40000000})
         self.assertEqual(md.run_one("ps_mem_w32", w32)[0], "match")
-        unorm = program(base + [f"s_mov_b32 s3, {56 << 12 | md.XYZW:#x}", "v_mov_b32 v2, 0",
+        unorm = program(base + [f"s_mov_b32 s3, {56 << 12 | md.XYZW | md.OOB_RAW:#x}", "v_mov_b32 v2, 0",
                                 "buffer_load_format_x v4, v2, s[0:3], 0 offen", "s_waitcnt vmcnt(0)",
                                 "v_mov_b32 v8, v4", "v_mov_b32 v9, v4", "v_mov_b32 v10, v4", "v_mov_b32 v11, v4"],
                         {0x7000: 3})

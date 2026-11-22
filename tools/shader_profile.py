@@ -263,6 +263,30 @@ def register_summary(reg_stage) -> dict:
     return out
 
 
+def stage_map(disasm_dir) -> dict:
+    """{shader file stem: stage} from shader_carve.py's index.json next to the disasm folder (the stage comes from
+    each container's program header), as rdna2spirv.stage_of reads it. Most corpus names carry no stage prefix,
+    so the name is only a fallback for shaders the index doesn't list. Empty when there is no readable index."""
+    path = os.path.join(os.path.dirname(os.path.realpath(disasm_dir)), "index.json")
+    try:
+        with open(path, encoding="utf-8") as f:
+            entries = json.load(f)
+        return {os.path.splitext(e["file"])[0]: e["stage"] for e in entries
+                if isinstance(e, dict) and isinstance(e.get("file"), str) and isinstance(e.get("stage"), str)}
+    except (OSError, ValueError, TypeError):
+        return {}
+
+
+def same_output_path(first, second):
+    """True when writing ``second`` would truncate ``first`` (same file, path or hard link)."""
+    if os.path.normcase(os.path.realpath(first)) == os.path.normcase(os.path.realpath(second)):
+        return True
+    try:
+        return os.path.samefile(first, second)
+    except OSError:
+        return False
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("src")
@@ -275,28 +299,36 @@ def main():
         print(f"ERROR: {a.src} {what}. Give the folder of .s files shader_disasm.py writes.", file=sys.stderr)
         return 2
     path = a.out or os.path.join(a.src, "..", "profile.json")
+    if os.path.isdir(path):
+        print(f"ERROR: cannot write {path}: destination is a directory, not a file", file=sys.stderr)
+        return 2
     out_dir = os.path.dirname(os.path.abspath(path))
     if not os.path.isdir(out_dir):        # checked before the scan, which takes minutes on the whole corpus
         print(f"ERROR: the folder for {path} does not exist", file=sys.stderr)
         return 2
     try:
-        names = os.listdir(a.src)
+        with os.scandir(a.src) as entries:
+            shader_files = [entry for entry in entries if entry.name.endswith(".s") and entry.is_file()]
     except OSError as e:
         print(f"ERROR: cannot list {a.src}: {e.strerror or e}", file=sys.stderr)
         return 2
+    for entry in shader_files:
+        if same_output_path(entry.path, path):
+            print(f"ERROR: output would overwrite input shader {entry.path}", file=sys.stderr)
+            return 2
     occ, users = Counter(), Counter()
     word_occ, word_users = Counter(), Counter()    # warned-at word -> warnings, shaders
     unresolved = 0
     per_stage = defaultdict(Counter)
     reg_stage = defaultdict(list)    # stage -> [(vgpr_count, sgpr_count)]
     shaders = []
+    stages = stage_map(a.src)
     n = 0
-    for name in names:
-        if not name.endswith(".s"):
-            continue
+    for entry in shader_files:
+        name = entry.name
         n += 1
-        stage = name[:2].lower() if name[2:3] == "_" else "?"
-        with open(os.path.join(a.src, name), encoding="utf-8", errors="replace") as f:
+        stage = stages.get(name[:-2]) or (name[:2].lower() if name[2:3] == "_" else "?")
+        with open(entry.path, encoding="utf-8", errors="replace") as f:
             text = f.read()
         prof = profile_shader(text)
         regs = prof["registers"]
@@ -331,7 +363,7 @@ def main():
     if a.per_shader:
         out["per_shader"] = sorted(shaders, key=lambda e: e["name"])
     try:
-        with open(path, "w", encoding="utf-8") as f:
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
             json.dump(out, f, indent=1, allow_nan=False)
     except OSError as e:
         print(f"ERROR: cannot write {path}: {e.strerror or e}", file=sys.stderr)
@@ -355,4 +387,8 @@ def main():
 
 
 if __name__ == "__main__":
+    try:  # a redirected stdout is strict ANSI code page under -I; write '?' for what it cannot encode
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
     sys.exit(main())

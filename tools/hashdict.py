@@ -6,6 +6,7 @@ When multiple names share a hash, the dictionary keeps the lexicographically fir
 
 Usage:
     python -I hashdict.py <carve dir> --out hashes.json [--archives a,b] [--extra f1 f2 ...] [--min 3]
+      <carve dir> holds one folder per archive (<work>/carve), or is one archive's folder (<work>/carve/common).
     python -I hashdict.py --lookup <hashes.json> 0x28cca8df ...
 """
 import argparse
@@ -14,7 +15,18 @@ import os
 import re
 import sys
 
-STR = re.compile(rb"[A-Za-z_][A-Za-z0-9_./:\\-]{2,200}")
+# A whole printable run, however long (one linear scan: a single character class, no nested quantifiers).
+STR = re.compile(rb"[A-Za-z_][A-Za-z0-9_./:\\-]{2,}")
+# For --min below 3 the run matcher must also accept one- and two-character identifiers, so the same
+# identifier syntax (first byte [A-Za-z_], the rest of the run [A-Za-z0-9_./:\\-]) is used with no minimum tail.
+SHORT_STR = re.compile(rb"[A-Za-z_][A-Za-z0-9_./:\\-]*")
+# A name (a whole run or one piece of it) longer than this is not added: it is a blob of text, not a name.
+# The old pattern cut every run at 201 characters, so no entry was ever longer than this.
+MAX_NAME_LEN = 201
+# The pieces of a path or dotted name, found one at a time (a run can be megabytes: no list of all its parts).
+PART = re.compile(r"[^./:\\]+")
+# Where re.split would yield an empty piece; only matters for --min 0 or less, which keeps "" as a name.
+EMPTY_PART = re.compile(r"[./:\\]{2}|[./:\\]$")
 
 
 def joaat(s: str) -> int:
@@ -29,14 +41,18 @@ def joaat(s: str) -> int:
 
 
 def harvest(data: bytes, out: set, minlen: int):
-    for m in STR.finditer(data):
+    run = STR if minlen >= 3 else SHORT_STR
+    for m in run.finditer(data):
         s = m.group(0).decode("latin-1")
         if len(s) >= minlen:
-            out.add(s)
+            if len(s) <= MAX_NAME_LEN:
+                out.add(s)
             # also the pieces of paths and dotted names, which are hashed on their own
-            for part in re.split(r"[./:\\]", s):
-                if len(part) >= minlen:
-                    out.add(part)
+            for pm in PART.finditer(s):
+                if minlen <= pm.end() - pm.start() <= MAX_NAME_LEN:
+                    out.add(pm.group(0))
+            if minlen <= 0 and EMPTY_PART.search(s):
+                out.add("")
 
 
 def main():
@@ -64,6 +80,9 @@ def main():
             print(f"ERROR: cannot read the dictionary {a.lookup[0]}: {getattr(e, 'strerror', None) or e}",
                   file=sys.stderr)
             return 2
+        if not isinstance(d, dict):
+            print(f"ERROR: the dictionary {a.lookup[0]} is not a JSON object of hash -> name", file=sys.stderr)
+            return 2
         for h, v in values:
             print(h, d.get(f"{v:08x}", "?"))
         return 0
@@ -73,21 +92,48 @@ def main():
         what = "is not a folder" if os.path.exists(a.carve) else "does not exist"
         print(f"ERROR: the carve folder {a.carve} {what}", file=sys.stderr)
         return 2
+    # A folder with its own index.json is one archive's carve (<work>\carve\common, the folder the gamedata_*
+    # tools take): harvest it as that archive. Otherwise each subfolder with an index.json is one archive.
+    if os.path.isfile(os.path.join(a.carve, "index.json")):
+        archives = [(os.path.basename(os.path.normpath(os.path.abspath(a.carve))), a.carve)]
+    else:
+        archives = [(d, os.path.join(a.carve, d)) for d in sorted(os.listdir(a.carve))]
+    # The dictionary is written after the harvest: an --out naming one of the inputs would replace it.
+    # samefile also catches a case-only difference on Windows and macOS's default volume.
+    if os.path.exists(a.out):
+        inputs = [x for x in a.extra if os.path.isfile(x)]
+        inputs += [os.path.join(d, "index.json") for _, d in archives]
+        for x in inputs:
+            try:
+                same = os.path.isfile(x) and os.path.samefile(a.out, x)
+            except OSError:
+                same = False
+            if same:
+                print(f"ERROR: --out {a.out} is one of the inputs ({x}); choose another output file",
+                      file=sys.stderr)
+                return 2
     strings = set()
     full = set(a.archives.split(","))
     missing = []                    # carved blobs an index.json lists that can't be read: skipped, reported
-    for arch in sorted(os.listdir(a.carve)):
-        p = os.path.join(a.carve, arch, "index.json")
+    for arch, arch_dir in archives:
+        p = os.path.join(arch_dir, "index.json")
         if not os.path.isfile(p):
             continue
-        with open(p, encoding="utf-8") as f:
-            rows = json.load(f)["files"]
+        try:
+            with open(p, encoding="utf-8") as f:
+                rows = json.load(f)["files"]
+            if not isinstance(rows, list) or not all(isinstance(r, dict) for r in rows):
+                raise ValueError('"files" is not a list of entries')
+        except (OSError, ValueError, KeyError, TypeError) as e:
+            reason = getattr(e, "strerror", None) or (f"no {e} key" if isinstance(e, KeyError) else e)
+            print(f"ERROR: cannot read {p}: {reason}", file=sys.stderr)
+            return 2
         for r in rows:
             if r.get("type") == "bink2":
                 continue
             meta = r["head"].startswith("5053494e") or r["head"].startswith("52424630")
             if arch in full or meta:
-                blob = os.path.join(a.carve, arch, f"{r['off']:012x}.bin")
+                blob = os.path.join(arch_dir, f"{r['off']:012x}.bin")
                 try:
                     with open(blob, "rb") as f:
                         data = f.read()
@@ -105,15 +151,26 @@ def main():
                 for fn in files:
                     strings.add(os.path.splitext(fn)[0])
         elif os.path.isfile(x):
-            harvest(open(x, "rb").read(), strings, a.min)
+            with open(x, "rb") as f:
+                harvest(f.read(), strings, a.min)
     d = {}
     for s in sorted(strings):
         d.setdefault(f"{joaat(s):08x}", s)
-    with open(a.out, "w", encoding="utf-8") as f:
-        json.dump(d, f)
+    # Other tools create the output parent too: a long harvest must not be lost to a missing folder.
+    try:
+        os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
+        with open(a.out, "w", encoding="utf-8", newline="\n") as f:
+            json.dump(d, f)
+    except OSError as e:
+        print(f"ERROR: cannot write {a.out}: {e}", file=sys.stderr)
+        return 2
     print(f"{len(strings)} strings -> {len(d)} hashes -> {a.out}")
     return 0
 
 
 if __name__ == "__main__":
+    try:  # a redirected stdout is strict ANSI code page under -I; write '?' for what it cannot encode
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
     sys.exit(main())

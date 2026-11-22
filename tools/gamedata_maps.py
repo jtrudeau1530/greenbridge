@@ -24,9 +24,11 @@ match the published GTA V `heightmap.dat` (`HMAP`) layout:
 
 `PAMH` (`HMAP` read little-endian)
     0x00  "PAMH"             (the `HMAP` magic stored little-endian)
-    0x04  u8 version major, u8 version minor
+    0x04  u8 version major, u8 version minor  (1.2 in `common.rpf`)
+    0x05  in the `levels.rpf` tiles 0x05..0x0B also hold leftover text of the
+          tile name; 0x04 stays 1 and the real fields start at 0x0C (see below)
     0x06  u16 pad
-    0x08  u32 compressed/flag word (GTA V writes 1; measured 0x1BBC8CED here)
+    0x08  u32: GTA V's `compressed` word in `common.rpf`, padding in the tiles
     0x0C  u16 width
     0x0E  u16 height
     0x10  six f32 bounds     (min xyz, max xyz)
@@ -35,6 +37,14 @@ match the published GTA V `heightmap.dat` (`HMAP`) layout:
           then `width * height` u8 max rows and `width * height` u8 min rows.
     On the measured file the first array is a flat 110 (2.5 m) sea-surface
     layer and the second is the ground; min <= max in all 23,616 cells.
+
+In the 1,476 64 x 64 tiles of `levels.rpf`, bytes 0x05..0x0B hold leftover text,
+not a version minor and a flag: 0x04 stays 1, 0x05.. hold the tile name `n_m`
+(n = column + 1, m = row + 1), and the remaining bytes keep the right-aligned
+tail of the string `height` (`ght`, `ht`, or a zero byte when the name is
+longer). The 28 distinct 0x08..0x0B words are all text and none of them changes
+the arrays, so 0x08 is padding there. The `common.rpf` payload happens to hold
+0x1BBC8CED, which is why it was once reported as a `compressed` flag.
 
 Both formats scale a u8 value into the header's Z box:
 
@@ -48,6 +58,7 @@ printed or written; the height bytes are not. Standard library only.
 """
 import argparse
 import json
+import math
 import os
 import struct
 import sys
@@ -67,6 +78,9 @@ def _u32(blob: bytes, offset: int) -> int:
 def _bounds(blob: bytes, offset: int) -> dict:
     lo = list(struct.unpack_from("<3f", blob, offset))
     hi = list(struct.unpack_from("<3f", blob, offset + 12))
+    for value in lo + hi:
+        if not math.isfinite(value):
+            raise ValueError(f"non-finite bound {value!r} at offset {offset:#x}")
     return {"min": lo, "max": hi}
 
 
@@ -178,11 +192,14 @@ def parse_pamh(blob: bytes) -> dict:
     half = width * height
     maximum = bytearray(half)
     minimum = bytearray(half)
+    full_width = 0
     for y in range(height):
         start, count = struct.unpack_from("<HH", rows, y * 8)
         offset = struct.unpack_from("<i", rows, y * 8 + 4)[0]
         if start + count > width:
             raise ValueError(f"PAMH row {y} leaves the {width}-cell width")
+        if start == 0 and count == width:
+            full_width += 1
         for i in range(count):
             x = start + i
             at = offset + x
@@ -197,7 +214,7 @@ def parse_pamh(blob: bytes) -> dict:
         "header": {
             "version_major": blob[0x04],
             "version_minor": blob[0x05],
-            "flag": _u32(blob, 0x08),
+            "padding08": _u32(blob, 0x08),
             "width": width,
             "height": height,
             "bounds": bounds,
@@ -210,6 +227,7 @@ def parse_pamh(blob: bytes) -> dict:
             "height": height,
             "cells": width * height,
             "row_records": height,
+            "full_width_rows": full_width,
             "max_min": min(maximum),
             "max_max": max(maximum),
             "min_min": min(minimum),
@@ -219,6 +237,52 @@ def parse_pamh(blob: bytes) -> dict:
         "_max": bytes(maximum),
         "_min": bytes(minimum),
     }
+
+
+def pamh_census(payloads: list[dict]) -> list[dict]:
+    """Group decoded PAMH payloads by grid size and count what varies inside a group.
+
+    The 0x08 word is padding, so it is counted, not used as a key. Byte 0x05 is the HMAP
+    version-minor byte in the common.rpf payload but holds text in the levels.rpf tiles, so it is
+    reported as a distribution instead of a group key."""
+    groups = {}
+    for p in payloads:
+        if p["type"] != "PAMH":
+            continue
+        h, g = p["header"], p["grid"]
+        grp = groups.get((g["width"], g["height"]))
+        if grp is None:
+            grp = groups[(g["width"], g["height"])] = {
+                "width": g["width"],
+                "height": g["height"],
+                "tiles": 0,
+                "cells": 0,
+                "bounds_min": list(h["bounds"]["min"]),
+                "bounds_max": list(h["bounds"]["max"]),
+                "full_width_row_tiles": 0,
+                "min_above_max": 0,
+                "version_minor": {},
+                "padding08_zero": 0,
+                "_padding": set(),
+            }
+        grp["tiles"] += 1
+        grp["cells"] += g["cells"]
+        for i in range(3):
+            grp["bounds_min"][i] = min(grp["bounds_min"][i], h["bounds"]["min"][i])
+            grp["bounds_max"][i] = max(grp["bounds_max"][i], h["bounds"]["max"][i])
+        if g["full_width_rows"] == g["height"]:
+            grp["full_width_row_tiles"] += 1
+        grp["min_above_max"] += g["min_above_max"]
+        minor = str(h["version_minor"])
+        grp["version_minor"][minor] = grp["version_minor"].get(minor, 0) + 1
+        if h["padding08"] == 0:
+            grp["padding08_zero"] += 1
+        grp["_padding"].add(h["padding08"])
+    out = list(groups.values())
+    for grp in out:
+        grp["padding08_distinct"] = len(grp.pop("_padding"))
+    out.sort(key=lambda x: (-x["tiles"], x["width"], x["height"]))
+    return out
 
 
 def parse_payload(blob: bytes) -> dict:
@@ -294,7 +358,7 @@ def main() -> int:
 
     try:
         payloads = read_payloads(a.carve_dir)
-    except (OSError, ValueError, KeyError, struct.error) as e:
+    except (OSError, ValueError, KeyError, TypeError, struct.error) as e:
         print("error:", e, file=sys.stderr)
         return 1
 
@@ -310,12 +374,29 @@ def main() -> int:
                   f'{g["min_above_max"]} cells min>max')
     if not payloads:
         print("no MHIU or PAMH payloads")
+    census = pamh_census(payloads)
+    for grp in census:
+        print(f'PAMH census {grp["width"]}x{grp["height"]}: {grp["tiles"]} tiles, '
+              f'{grp["full_width_row_tiles"]} with full-width rows, '
+              f'{grp["min_above_max"]} cells min>max, padding 08 zero {grp["padding08_zero"]}, '
+              f'{grp["padding08_distinct"]} distinct')
     if a.json:
-        with open(a.json, "w", encoding="utf-8") as f:
-            json.dump({"payloads": [_public(p) for p in payloads]}, f, indent=1)
+        out = {"payloads": [_public(p) for p in payloads]}
+        if census:
+            out["pamh_census"] = census
+        try:
+            with open(a.json, "w", encoding="utf-8", newline="\n") as f:
+                json.dump(out, f, indent=1)
+        except OSError as e:
+            print(f"error: cannot write {a.json}: {e.strerror or e}", file=sys.stderr)
+            return 1
         print("wrote", a.json)
     return 0
 
 
 if __name__ == "__main__":
+    try:  # a redirected stdout is strict ANSI code page under -I; write '?' for what it cannot encode
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
     sys.exit(main())

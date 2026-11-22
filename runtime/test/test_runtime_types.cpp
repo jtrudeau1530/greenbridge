@@ -293,7 +293,7 @@ constexpr uint32_t kObservedXboxRootSigFlag = 0x03000000u;
 using XMemAllocFn = void*(__stdcall*)(size_t, uint64_t);
 using XMemFreeFn = void(__stdcall*)(void*, uint64_t);
 using XMemVirtualQueryFn = SIZE_T(__stdcall*)(HANDLE, const void*, void*);
-using XMemGetWorkingSetStatisticsFn = BOOL(__stdcall*)(void*);
+using XMemGetWorkingSetStatisticsFn = BOOL(__stdcall*)(uint32_t, void*);
 
 // Function pointer signatures for D3D12 exports
 using D3D12SerializeVersionedRootSignatureFn =

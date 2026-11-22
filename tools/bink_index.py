@@ -46,10 +46,10 @@ BASE_FIELDS = [
 PROBE_FIELDS = ["decodes", "codec", "probe_duration_s"]
 
 
-def _audio_layout(data, base, count):
+def _audio_layout(data, base, count, end):
     """Decode one candidate audio layout, or return None if it is not plausible."""
     need = base + 12 * count
-    if need > len(data):
+    if need > end:
         return None
     rates, flags = [], []
     for i in range(count):
@@ -93,7 +93,7 @@ def parse_header(data, offset):
         # layout first, then the other, and accept only plausible descriptors.
         bases = [offset + 0x30, offset + 0x2C] if revision in "ijkn" else [offset + 0x2C]
         for base in bases:
-            got = _audio_layout(data, base, audio)
+            got = _audio_layout(data, base, audio, offset + stored)
             if got:
                 rates, flags = got
                 break
@@ -135,7 +135,7 @@ def scan_file(path, source):
     """Index every Bink 2 stream in one file. Returns (rows, stats)."""
     rows = []
     size = os.path.getsize(path)
-    if size < HDR:
+    if size == 0:
         return rows, {"files_scanned": 1, "streams": 0, "bytes": 0, "zero_padding": 0,
                       "unread_bytes": 0, "span": 0}
     with open(path, "rb") as fh:
@@ -174,8 +174,13 @@ def scan_file(path, source):
     return rows, stats
 
 
-def scan_target(target):
-    """Index a single container or every file below a directory."""
+def scan_target(target, skip_report=None):
+    """Index a single container or every file below a directory.
+
+    ``skip_report``, when given, is one existing file path (the report the
+    caller is about to overwrite) that must be left out of the scan so that a
+    repeat invocation does not count the previous report's bytes.
+    """
     rows, total = [], {"files_scanned": 0, "streams": 0, "bytes": 0,
                        "zero_padding": 0, "unread_bytes": 0, "span": 0}
     if os.path.isdir(target):
@@ -183,7 +188,10 @@ def scan_target(target):
         paths = []
         for root, _dirs, files in os.walk(target):
             for name in files:
-                paths.append(os.path.join(root, name))
+                path = os.path.join(root, name)
+                if skip_report is not None and same_output_path(path, skip_report):
+                    continue
+                paths.append(path)
         for path in sorted(paths):
             got, stats = scan_file(path, os.path.relpath(path, base))
             rows.extend(got)
@@ -268,7 +276,7 @@ def _flat(row, fields):
 def write_csv(path, rows, probe):
     fields = BASE_FIELDS + (PROBE_FIELDS if probe else [])
     with open(path, "w", encoding="utf-8", newline="") as fh:
-        writer = csv.DictWriter(fh, fieldnames=fields)
+        writer = csv.DictWriter(fh, fieldnames=fields, lineterminator="\n")
         writer.writeheader()
         for row in rows:
             writer.writerow(_flat(row, fields))
@@ -277,9 +285,19 @@ def write_csv(path, rows, probe):
 def write_json(path, target, rows, summary, probe):
     fields = BASE_FIELDS + (PROBE_FIELDS if probe else [])
     streams = [_flat(row, fields) for row in rows]
-    with open(path, "w", encoding="utf-8") as fh:
+    with open(path, "w", encoding="utf-8", newline="\n") as fh:
         json.dump({"target": target, "summary": summary, "streams": streams},
                   fh, indent=1)
+
+
+def same_output_path(first, second):
+    """True when writing ``second`` would truncate ``first`` (same file, path or hard link)."""
+    if os.path.normcase(os.path.realpath(first)) == os.path.normcase(os.path.realpath(second)):
+        return True
+    try:
+        return os.path.samefile(first, second)
+    except OSError:
+        return False
 
 
 def main(argv=None):
@@ -289,11 +307,29 @@ def main(argv=None):
     ap.add_argument("--format", choices=["csv", "json"], help="inferred from --out if omitted")
     ap.add_argument("--probe", action="store_true", help="run ffprobe on each stream")
     a = ap.parse_args(argv)
+    if a.out and same_output_path(a.target, a.out):
+        ap.error("--out must not overwrite the source")
+    if a.out and os.path.isdir(a.out):
+        ap.error(f"--out is a folder, not a report file: {a.out}")
+    if a.out and os.path.isdir(a.target):
+        manifest = os.path.join(a.target, "index.json")
+        if os.path.isfile(manifest) and same_output_path(a.out, manifest):
+            ap.error(f"--out would overwrite the carve manifest: {a.out}")
+        if os.path.isfile(a.out):
+            for root, _dirs, names in os.walk(a.target):
+                for name in names:
+                    if name.lower().endswith((".json", ".csv")):
+                        continue
+                    if same_output_path(os.path.join(root, name), a.out):
+                        ap.error(f"--out would overwrite an input file: {a.out}")
     if not os.path.exists(a.target):
         print(f"bink_index: error: {a.target}: no such file or directory", file=sys.stderr)
         return 2
 
-    rows, summary = scan_target(a.target)
+    skip_report = None
+    if a.out and os.path.isfile(a.out):
+        skip_report = a.out
+    rows, summary = scan_target(a.target, skip_report)
     probe = False
     if a.probe:
         ffprobe = shutil.which("ffprobe")
@@ -306,10 +342,14 @@ def main(argv=None):
 
     fmt = a.format or ("json" if a.out and a.out.lower().endswith(".json") else "csv")
     if a.out:
-        if fmt == "json":
-            write_json(a.out, a.target, rows, summary, probe)
-        else:
-            write_csv(a.out, rows, probe)
+        try:
+            if fmt == "json":
+                write_json(a.out, a.target, rows, summary, probe)
+            else:
+                write_csv(a.out, rows, probe)
+        except OSError as error:
+            print(f"bink_index: error: cannot write {a.out}: {error}", file=sys.stderr)
+            return 2
         print(f"{len(rows)} Bink 2 streams, {summary['bytes']} bytes, "
               f"{summary['unread_bytes']} unread, {summary['zero_padding']} zero padding")
     else:
@@ -332,4 +372,8 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
+    try:  # a redirected stdout is strict ANSI code page under -I; write '?' for what it cannot encode
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
     sys.exit(main())

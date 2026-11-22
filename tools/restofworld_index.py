@@ -211,7 +211,7 @@ def scan_rpf(path, start=None, limit=None, max_inflate=MAX_INFLATE):
                 if m[s:s + 3] == b"KB2":
                     blen = (_u32(m, s + 4) or 0) + 8
                     w, h = _u32(m, s + 0x14), _u32(m, s + 0x18)
-                    if not (64 <= blen <= size - s and w and h and 16 <= w <= 8192 and 16 <= h <= 8192):
+                    if not (64 <= blen <= end - s and w and h and 16 <= w <= 8192 and 16 <= h <= 8192):
                         pos = s + 1
                         continue
                     z, u = _gap(m[last:s])
@@ -221,11 +221,11 @@ def scan_rpf(path, start=None, limit=None, max_inflate=MAX_INFLATE):
                     last = pos = s + blen
                     continue
                 d = zlib.decompressobj()
-                p, total, head = s, 0, b""
+                p, total, head, psin = s, 0, b"", bytearray()
                 too_big = False
                 try:
-                    while not d.eof and p < size:
-                        block = m[p:p + (1 << 20)]
+                    while not d.eof and p < end:   # inside the --limit window, as in story_index (#712)
+                        block = m[p:min(p + (1 << 20), end)]
                         if not block:
                             break
                         p += len(block)
@@ -239,6 +239,8 @@ def scan_rpf(path, start=None, limit=None, max_inflate=MAX_INFLATE):
                                     break
                                 if len(head) < 256:
                                     head += chunk[:256 - len(head)]
+                                if len(head) < 4 or head[:4] == b"PSIN":   # classify walks the whole PSIN chain
+                                    psin += chunk
                             if not block:
                                 break
                         if too_big:
@@ -254,7 +256,7 @@ def scan_rpf(path, start=None, limit=None, max_inflate=MAX_INFLATE):
                 z, u = _gap(m[last:s])
                 zero += z
                 unread += u
-                row = classify(head, s, used)
+                row = classify(bytes(psin) if head[:4] == b"PSIN" else head, s, used)
                 row["size"] = total
                 rows.append(row)
                 last = pos = s + used
@@ -320,11 +322,11 @@ def summarise(rows, span, zero, unread):
 def write_output(path, rows, summary):
     """Write CSV or JSON from the file extension."""
     if os.path.splitext(path)[1].lower() == ".json":
-        with open(path, "w", encoding="utf-8") as f:
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
             json.dump({"summary": summary, "files": rows}, f, indent=1)
         return
     with open(path, "w", encoding="utf-8", newline="") as f:
-        writer = csv.writer(f)
+        writer = csv.writer(f, lineterminator="\n")
         writer.writerow(COLUMNS)
         for row in rows:
             writer.writerow([f"0x{row['offset']:x}" if i == 0 else ("" if row[c] is None else row[c])
@@ -371,6 +373,14 @@ def main():
     if not os.path.isdir(folder):
         ap.error(f"{folder} is not a folder, so {args.out} cannot be written")
     try:
+        overwrites_source = os.path.samefile(args.source, args.out)
+    except FileNotFoundError:
+        overwrites_source = False
+    except OSError as e:
+        ap.error(f"cannot compare source and output paths: {e}")
+    if overwrites_source:
+        ap.error("output must not overwrite the source archive")
+    try:
         if os.path.isdir(args.source):
             rows, summary = scan_dir(args.source, args.max_inflate)
         else:
@@ -392,4 +402,8 @@ def main():
 
 
 if __name__ == "__main__":
+    try:  # a redirected stdout is strict ANSI code page under -I; write '?' for what it cannot encode
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
     sys.exit(main())

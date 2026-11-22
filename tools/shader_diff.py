@@ -177,7 +177,7 @@ def generate_program(rng, n_ops):
 
 
 def _write_listing(path, lines, with_export):
-    with open(path, "w", encoding="utf-8") as f:
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
         f.write("; shader_diff case  code 0x0..0x1000\n")
         for line in lines:
             f.write("\t" + line + "\n")
@@ -202,7 +202,7 @@ def compare_pair(cpu_words, spv_words, *, writers=None):
             continue
         writer = writers.get(EXPORT_REGS[i])
         mismatch = f"lane word {i}: expected 0x{c:08x} ({c}), actual 0x{s:08x} ({s})"
-        if writer and writer[0] in _FLOAT_OPS:
+        if writer and cpu_ref.base_op(writer[0]) in _FLOAT_OPS:
             c_nan, s_nan = _is_nan_bits(c), _is_nan_bits(s)
             if c_nan and s_nan:
                 continue
@@ -309,12 +309,29 @@ def self_test():
     return True
 
 
+def _at_least_one(value):
+    """An integer option that must be at least 1.
+
+    0 and negative values used to run nothing (--programs, --limit) or raise
+    `empty range in randrange(1, 1)` (--max-ops) instead of being refused.
+    """
+    try:
+        n = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected an integer, got {value!r}") from None
+    if n < 1:
+        raise argparse.ArgumentTypeError(f"must be at least 1 (got {n})")
+    return n
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Differential oracle: cpu_ref vs translated SPIR-V.")
-    ap.add_argument("--programs", type=int, default=200)
+    ap.add_argument("--programs", type=_at_least_one, default=200, help="number of programs to run (default: 200)")
     ap.add_argument("--seed", type=int, default=1)
-    ap.add_argument("--max-ops", type=int, default=8)
-    ap.add_argument("--limit", type=int, default=None, help="run only the first N programs")
+    ap.add_argument("--max-ops", type=_at_least_one, default=8,
+                    help="maximum ops per generated program (default: 8)")
+    ap.add_argument("--limit", type=_at_least_one, default=None,
+                    help="run only the first N programs (N >= 1)")
     ap.add_argument("--list-ops", action="store_true", help="print the op table and exit")
     ap.add_argument("--self-test", action="store_true", help="run harness canaries and exit")
     a = ap.parse_args(argv)
@@ -326,18 +343,22 @@ def main(argv=None):
         return 0 if self_test() else 1
     counts, first_failure = run_suite(a.programs, a.seed, a.max_ops, a.limit)
     total_skips = sum(counts["skip"].values())
-    print(f"{a.programs} programs (seed {a.seed}): "
+    total_run = counts["pass"] + counts["mismatch"] + total_skips + counts["harness-error"]
+    print(f"{total_run} programs (seed {a.seed}): "
           f"{counts['pass']} pass, {counts['mismatch']} mismatch, "
           f"{total_skips} skipped, {counts['harness-error']} harness errors")
     for reason, n in sorted(counts["skip"].items()):
         print(f"  skip x{n}: {reason}")
     if first_failure is not None:
-        print("FIRST MISMATCH:\n" + first_failure)
-        return 1
+        print("FIRST FAILURE:\n" + first_failure)
     if counts["harness-error"]:
         return 2
-    return 0
+    return 1 if counts["mismatch"] else 0
 
 
 if __name__ == "__main__":
+    try:  # a redirected stdout is strict ANSI code page under -I; write '?' for what it cannot encode
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
     sys.exit(main())

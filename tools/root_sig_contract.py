@@ -74,10 +74,14 @@ def reconcile(shader_reads, dwords):
     issues = []
     by_sgpr = {}
     for read in shader_reads:
-        by_sgpr.setdefault(read["sgpr"], []).append(read["kind"])
+        sgpr = read["sgpr"]
+        if type(sgpr) is not int:  # bool is an int subclass, but not a valid SGPR index.
+            issues.append(f"invalid SGPR index {sgpr!r}: expected an integer")
+            continue
+        by_sgpr.setdefault(sgpr, []).append(read["kind"])
     for sgpr in sorted(by_sgpr):
         kinds = by_sgpr[sgpr]
-        if sgpr >= len(dwords):
+        if sgpr < 0 or sgpr >= len(dwords):
             issues.append(f"s{sgpr} read but layout has {len(dwords)} dwords")
             continue
         slot = dwords[sgpr]
@@ -89,6 +93,8 @@ def reconcile(shader_reads, dwords):
                 issues.append(
                     f"s{sgpr} ({kind}) incompatible with param "
                     f"{slot['param']} ({slot['ptype']})")
+            elif kind == "ptr64_lo" and slot["sub"] != 0:
+                issues.append(f"s{sgpr} (ptr64_lo) reads the high half of the address")
             if kind == "ptr64_hi":
                 lo = dwords[sgpr - 1] if sgpr > 0 else None
                 if slot["sub"] != 1 or lo is None or lo["param"] != slot["param"] \
@@ -102,10 +108,22 @@ def cluster(shaders):
     groups = {}
     for name, entry in shaders.items():
         reads = entry.get("user_sgpr_reads", [])
-        shape = tuple(sorted((r["sgpr"], r["kind"]) for r in reads))
+        shape = tuple(sorted(
+            ((r["sgpr"], r["kind"]) if type(r["sgpr"]) is int
+             else (f"invalid:{r['sgpr']!r}", r["kind"]) for r in reads),
+            key=lambda item: (type(item[0]) is not int, item[0], item[1])))
         groups.setdefault(shape, []).append(name)
     ranked = sorted(groups.items(), key=lambda kv: -len(kv[1]))
     return [(shape, len(names), names) for shape, names in ranked]
+
+
+def _load_json(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError) as e:
+        reason = getattr(e, "strerror", None) or e
+        raise ValueError(f"cannot read {path}: {reason}") from None
 
 
 def main():
@@ -125,10 +143,42 @@ def main():
         return 0
     if not a.index or not a.rootsig:
         ap.error("index.json and --rootsig are required (or --example)")
-    with open(a.index, encoding="utf-8") as f:
-        index = json.load(f)
-    with open(a.rootsig, encoding="utf-8") as f:
-        sig = json.load(f)
+    try:
+        index = _load_json(a.index)
+        sig = _load_json(a.rootsig)
+    except ValueError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 2
+    if not isinstance(index, dict):
+        print(f"ERROR: {a.index}: expected a JSON object of shader -> metadata entries", file=sys.stderr)
+        return 2
+    if any(not isinstance(entry, dict) for entry in index.values()):
+        print(f"ERROR: {a.index}: each shader entry must be a JSON object", file=sys.stderr)
+        return 2
+    if not isinstance(sig, dict):
+        print(f"ERROR: {a.rootsig}: expected a JSON object root signature", file=sys.stderr)
+        return 2
+    params = sig.get("params", [])
+    if not isinstance(params, list):
+        print(f"ERROR: {a.rootsig}: 'params' must be a JSON array", file=sys.stderr)
+        return 2
+    if any(not isinstance(p, dict) for p in params):
+        print(f"ERROR: {a.rootsig}: each param must be a JSON object", file=sys.stderr)
+        return 2
+    for name in sorted(index):
+        reads = index[name].get("user_sgpr_reads", [])
+        if not isinstance(reads, list):
+            print(f"ERROR: {a.index}: {name}: 'user_sgpr_reads' must be a JSON array", file=sys.stderr)
+            return 2
+        for read in reads:
+            if not isinstance(read, dict) or "sgpr" not in read or "kind" not in read:
+                print(f"ERROR: {a.index}: {name}: each read needs 'sgpr' and 'kind' fields",
+                      file=sys.stderr)
+                return 2
+            if not isinstance(read["kind"], str):
+                print(f"ERROR: {a.index}: {name}: each read kind must be a string",
+                      file=sys.stderr)
+                return 2
     dwords, error = pack_layout(sig)
     if error:
         print(f"root signature refused: {error}")
@@ -152,4 +202,8 @@ def main():
 
 
 if __name__ == "__main__":
+    try:  # a redirected stdout is strict ANSI code page under -I; write '?' for what it cannot encode
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
     sys.exit(main())

@@ -1,8 +1,8 @@
 """v_interp_p2_f16 with the VOP3 clamp bit: the f16 result is clamped to [0, 1].
 
 Mesa ACO declares v_interp_p2_f16 dst(F16), which takes output modifiers, and llvm-mc encodes `clamp` on it (but no
-omod). The translator models the p1ll/p2 pair as one read of the interpolated attribute, so the interpreter's input
-value stands for that attribute here. Only the low half of each result is checked: the high half v_interp_p2_f16
+omod). The translator models the p1ll/p2 pair as one read of the interpolated attribute, decoded per vertex from
+the low f16 of the producer's packed word (test_interp_f16_high.py has the high half). Only the low half of each result is checked: the high half v_interp_p2_f16
 leaves is not pinned by this test.
 """
 import gc
@@ -46,8 +46,10 @@ def translate(asm, name="ps_interp_f16"):
 
 class InterpP2F16Clamp(unittest.TestCase):
     def test_clamp_applies_to_the_f16_result(self):
-        words = support.mrt0_words(translate(SHADER), inputs={"%in_attr0": (1.5, -0.25, 0.0, 1.0),
-                                                             "%in_attr1": (0.0,) * 4})
+        # The producer's words hold the f16 in the low half (support.varyings); the same at all three vertices.
+        attr0 = [(0x3E00, 0xB400, 0, 0)] * 3
+        spv = translate(SHADER)
+        words = support.mrt0_words(spv, inputs=support.varyings(spv, {0: attr0}, (0.25, 0.25, 0.5)))
         self.assertEqual([f"{w & 0xFFFF:#06x}" for w in words], [f"{w:#06x}" for w in EXPECTED_LOW_HALVES])
 
 

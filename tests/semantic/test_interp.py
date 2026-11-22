@@ -432,6 +432,22 @@ class InterpreterTests(unittest.TestCase):
                                   "%res = OpSelect %uint %b %c1 %c0\n"), 1)
         self.assertEqual(run_word(nan + "%b = OpIsInf %bool %nan\n%res = OpSelect %uint %b %c1 %c0\n"), 0)
 
+    def test_float_compares_with_equal_operands(self):
+        # 2 vs 2 for every ordered and unordered relation (asked in review on #262): without this an interpreter
+        # that dropped the equality part of an Equal / LessThanEqual / GreaterThanEqual compare, or that turned
+        # NotEqual into "unordered only", would still pass the NaN and 2-vs-3 cases above.
+        for op, want in (("OpFOrdEqual", 1), ("OpFOrdNotEqual", 0), ("OpFOrdLessThan", 0),
+                         ("OpFOrdLessThanEqual", 1), ("OpFOrdGreaterThan", 0), ("OpFOrdGreaterThanEqual", 1),
+                         ("OpFUnordEqual", 1), ("OpFUnordNotEqual", 0), ("OpFUnordLessThan", 0),
+                         ("OpFUnordLessThanEqual", 1), ("OpFUnordGreaterThan", 0), ("OpFUnordGreaterThanEqual", 1)):
+            with self.subTest(op=op):
+                self.assertEqual(run_word(f"%b = {op} %bool %f2 %f2\n%res = OpSelect %uint %b %c1 %c0\n"), want)
+        # -0.0 equals +0.0 in both families.
+        for op, want in (("OpFOrdEqual", 1), ("OpFUnordEqual", 1), ("OpFOrdNotEqual", 0), ("OpFUnordNotEqual", 0)):
+            with self.subTest(op=op, operands="-0.0, +0.0"):
+                self.assertEqual(run_word("%z = OpBitcast %float %c0\n%n = OpFNegate %float %z\n"
+                                          f"%b = {op} %bool %n %z\n%res = OpSelect %uint %b %c1 %c0\n"), want)
+
     def test_phi_selects_the_value_from_the_taken_predecessor(self):
         for cond, want in (("%t", 1), ("%f", 2)):
             text = (HEADER + f"OpSelectionMerge %merge None\nOpBranchConditional {cond} %a %b\n"

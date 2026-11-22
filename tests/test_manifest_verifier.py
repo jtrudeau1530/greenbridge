@@ -7,6 +7,7 @@ Zero game data used.
 """
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import io
 import json
@@ -115,6 +116,135 @@ class TestManifestVerifier(unittest.TestCase):
         entries = mv.load_manifest(flat_path)
         self.assertEqual(len(entries), len(SYNTHETIC_SIZES))
 
+    def test_load_manifest_flat_skips_metadata_keys(self) -> None:
+        flat_path = os.path.join(self.root, "manifest_flat_meta.json")
+        doc = {
+            "created": "2026-11-22 00:00:00",
+            "title": "synthetic",
+            "version": "1.0",
+            "note": "top-level metadata",
+            "alpha.bin": {
+                "size": len(self.payloads["alpha.bin"]),
+                "sha256": hashlib.sha256(self.payloads["alpha.bin"]).hexdigest(),
+            },
+        }
+        with open(flat_path, "w", encoding="utf-8") as f:
+            json.dump(doc, f)
+        entries = mv.load_manifest(flat_path)
+        self.assertEqual(list(entries.keys()), ["alpha.bin"])
+
+    def test_load_manifest_duplicate_normalized_paths_raise(self) -> None:
+        digest = hashlib.sha256(b"x").hexdigest()
+        for wrapper in (True, False):
+            with self.subTest(wrapper=wrapper):
+                entry = {
+                    "nested/a.bin": {"size": 1, "sha256": digest},
+                    "nested\\a.bin": {"size": 1, "sha256": digest},
+                }
+                doc = {"files": entry} if wrapper else entry
+                bad_path = os.path.join(self.root, f"dup_wrapper_{wrapper}.json")
+                with open(bad_path, "w", encoding="utf-8") as f:
+                    json.dump(doc, f)
+                with self.assertRaises(mv.ManifestError) as cm:
+                    mv.load_manifest(bad_path)
+                self.assertIn(bad_path, str(cm.exception))
+                self.assertIn("nested/a.bin", str(cm.exception))
+
+    def test_load_manifest_single_spelling_control(self) -> None:
+        digest = hashlib.sha256(b"x").hexdigest()
+        for wrapper in (True, False):
+            for spelling in ("nested/a.bin", "nested\\a.bin"):
+                with self.subTest(wrapper=wrapper, spelling=spelling):
+                    entry = {spelling: {"size": 1, "sha256": digest}}
+                    doc = {"files": entry} if wrapper else entry
+                    p = os.path.join(self.root, f"one_{wrapper}_{'fwd' if '/' in spelling else 'bwd'}.json")
+                    with open(p, "w", encoding="utf-8") as f:
+                        json.dump(doc, f)
+                    entries = mv.load_manifest(p)
+                    self.assertEqual(list(entries.keys()), ["nested/a.bin"])
+
+    def test_nested_manifest_verifies_files_named_like_metadata_keys(self) -> None:
+        meta_dir = os.path.join(self.root, "meta_game")
+        os.makedirs(meta_dir, exist_ok=True)
+        meta_files = {
+            "created": b"created-payload",
+            "title": b"title-payload!!",
+            "version": b"version-payload",
+            "note": b"note-payload",
+        }
+        for name, data in meta_files.items():
+            with open(os.path.join(meta_dir, name), "wb") as f:
+                f.write(data)
+        manifest_p = self.write_manifest(os.path.join(self.root, "meta_manifest.json"), meta_files, wrapper=True)
+
+        entries = mv.load_manifest(manifest_p)
+        self.assertEqual(sorted(entries.keys()), sorted(meta_files.keys()))
+
+        ok_report = mv.verify_manifest(meta_dir, manifest_p, jobs=2, strict=True)
+        self.assertTrue(ok_report.passed)
+        self.assertEqual(sorted(ok_report.matched), sorted(meta_files.keys()))
+        self.assertEqual(ok_report.untracked, [])
+
+        # Tamper (same size -> CHANGED), truncate (-> SIZE), remove (-> MISSING)
+        with open(os.path.join(meta_dir, "version"), "wb") as f:
+            f.write(b"VERSION-PAYLOAD")
+        with open(os.path.join(meta_dir, "title"), "wb") as f:
+            f.write(b"short")
+        os.remove(os.path.join(meta_dir, "note"))
+
+        bad_report = mv.verify_manifest(meta_dir, manifest_p, jobs=1, strict=True)
+        self.assertFalse(bad_report.passed)
+        self.assertEqual(bad_report.problems, {
+            "note": "MISSING",
+            "title": "SIZE",
+            "version": "CHANGED",
+        })
+        self.assertEqual(bad_report.matched, ["created"])
+        self.assertEqual(bad_report.untracked, [])
+
+    def test_load_manifest_non_dict_files_raises(self) -> None:
+        for bad_value in ("abc", [], 123, None):
+            with self.subTest(files_value=bad_value):
+                bad_path = os.path.join(self.root, f"bad_files_{type(bad_value).__name__}.json")
+                with open(bad_path, "w", encoding="utf-8") as f:
+                    json.dump({"created": "2026-11-22", "files": bad_value}, f)
+                with self.assertRaisesRegex(mv.ManifestError, "'files' must be a JSON object"):
+                    mv.load_manifest(bad_path)
+
+    def test_load_manifest_boolean_size_raises(self) -> None:
+        digest = hashlib.sha256(b"x").hexdigest()
+        for bool_size in (True, False):
+            for wrapper in (True, False):
+                with self.subTest(size=bool_size, wrapper=wrapper):
+                    bad_path = os.path.join(self.root, f"bool_size_{bool_size}_{wrapper}.json")
+                    entry = {"a.bin": {"size": bool_size, "sha256": digest}}
+                    doc = {"files": entry} if wrapper else entry
+                    with open(bad_path, "w", encoding="utf-8") as f:
+                        json.dump(doc, f)
+                    with self.assertRaises(mv.ManifestError):
+                        mv.load_manifest(bad_path)
+
+    def test_walk_unreadable_directory_raises_and_cli_exits_2(self) -> None:
+        def failing_walk(top: str, *args, onerror=None, **kwargs):
+            err = PermissionError(13, "Permission denied", os.path.join(top, "nested"))
+            if onerror is not None:
+                onerror(err)
+            return
+            yield  # pragma: no cover
+
+        with patch("tools.manifest_verifier.os.walk", side_effect=failing_walk):
+            with self.assertRaises(PermissionError):
+                list(mv.walk(self.game_dir))
+            with self.assertRaises(PermissionError):
+                mv.verify_manifest(self.game_dir, self.manifest_path, jobs=1)
+
+            stderr_buf = io.StringIO()
+            with contextlib.redirect_stderr(stderr_buf):
+                rc = mv.main([self.game_dir, "--manifest", self.manifest_path, "--quiet"])
+            self.assertEqual(rc, 2)
+            self.assertIn("ERROR:", stderr_buf.getvalue())
+            self.assertIn("Permission denied", stderr_buf.getvalue())
+
     def test_load_manifest_invalid_json(self) -> None:
         bad_json = os.path.join(self.root, "bad.json")
         with open(bad_json, "w", encoding="utf-8") as f:
@@ -213,6 +343,11 @@ class TestManifestVerifier(unittest.TestCase):
         report_strict = mv.verify_manifest(self.game_dir, self.manifest_path, jobs=2, strict=True)
         self.assertFalse(report_strict.passed)
         self.assertEqual(report_strict.untracked, ["bonus.bin"])
+        self.assertEqual(report_strict.problem_count, 1)
+        self.assertEqual(report_strict.to_dict()["problem_count"], 1)
+        out = io.StringIO()
+        mv.print_report(report_strict, out=out)
+        self.assertIn("1 problem(s)", out.getvalue())
 
     def test_progress_reporting_callback_and_stream(self) -> None:
         progress_events: list[mv.ProgressInfo] = []
@@ -293,6 +428,11 @@ class TestManifestVerifier(unittest.TestCase):
         self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
         self.assertEqual(res.stdout.strip(), "OK")
 
+    def test_cli_direct_syntax_rejects_extra_path(self) -> None:
+        res = self.run_cli(self.game_dir, "extra", "--manifest", self.manifest_path)
+        self.assertEqual(res.returncode, 2, res.stdout + res.stderr)
+        self.assertIn("unrecognized arguments: extra", res.stderr)
+
     def test_cli_verbose_output(self) -> None:
         res = self.run_cli(self.game_dir, "--manifest", self.manifest_path, "--verbose")
         self.assertEqual(res.returncode, 0)
@@ -330,6 +470,10 @@ class TestManifestVerifier(unittest.TestCase):
         self.assertEqual(res_strict.returncode, 1)
         self.assertIn("NEW       new_file.dat", res_strict.stdout)
         self.assertIn("1 problem(s)", res_strict.stdout)
+
+        res_json = self.run_cli(self.game_dir, "--manifest", self.manifest_path, "--strict", "--json")
+        self.assertEqual(res_json.returncode, 1)
+        self.assertEqual(json.loads(res_json.stdout)["problem_count"], 1)
 
     def test_cli_strict_ignores_only_selected_in_tree_manifest(self) -> None:
         in_tree = self.write_manifest(os.path.join(self.game_dir, "nested", "manifest.json"), self.payloads)
