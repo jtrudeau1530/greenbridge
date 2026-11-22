@@ -197,6 +197,23 @@ void check_run_time_load() {
     check(get_proc(rt_mod, nullptr) == nullptr && GetLastError() == ERROR_PROC_NOT_FOUND,
           "a null proc name is NULL with ERROR_PROC_NOT_FOUND");
 
+    // XCurl.dll's other way in: LoadLibraryExW(L"gameplatformservices.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32),
+    // then GetApiVersionImpl(uint64_t*, uint64_t*) and QueryApiImpl. Served by the shims, never the PC's own.
+    using LoadExW = HMODULE(WINAPI*)(LPCWSTR, HANDLE, DWORD);
+    auto load_ex_w = reinterpret_cast<LoadExW>(rt::shims::find(set, "LoadLibraryExW"));
+    HMODULE gps = load_ex_w ? load_ex_w(L"gameplatformservices.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32) : nullptr;
+    check(rt::shims::owns_dll("gameplatformservices.dll") && gps != nullptr && gps != rt_mod,
+          "LoadLibraryExW(gameplatformservices.dll, SEARCH_SYSTEM32) is served by the shims");
+    using ApiVersion = HRESULT(WINAPI*)(uint64_t*, uint64_t*);
+    auto api_version = gps ? reinterpret_cast<ApiVersion>(get_proc(gps, "GetApiVersionImpl")) : nullptr;
+    uint64_t v1 = 0, v2 = 0, w1 = 0, w2 = 0;
+    check(api_version && api_version(&v1, &v2) == S_OK && api_version(&w1, &w2) == S_OK && v1 && v2 && v1 == w1 &&
+              v2 == w2,
+          "GetApiVersionImpl writes the same two non-zero versions on every call");
+    check(gps && reinterpret_cast<void*>(get_proc(gps, "QueryApiImpl")) ==
+                     rt::shims::find("xgameruntime.dll", "QueryApiImpl"),
+          "its QueryApiImpl is the offline runtime's");
+
     struct Options {
         uint32_t unknown;
         BOOL is_inline;
