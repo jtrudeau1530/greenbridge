@@ -5,14 +5,17 @@
 Every byte here is built by the test: a synthetic drawable system page, a synthetic graphics page and a
 synthetic RPF9-style archive made of page-aligned zlib streams. No game file, value or name is used.
 """
+import json
 import os
 import struct
+import subprocess
 import sys
 import tempfile
 import unittest
 import zlib
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+TOOL = os.path.join(ROOT, "tools", "skin_streams.py")
 sys.path.insert(0, os.path.join(ROOT, "tools"))
 
 import skin_streams as ss  # noqa: E402
@@ -329,6 +332,92 @@ class TestFormatTable(unittest.TestCase):
             20: (8, 30, 104, bytes(16))}, 2, 6)            # format 30 with 8 bytes must be refused
         with self.assertRaises(ss.Skip):
             ss.walk_resource(system, "drawable")
+
+
+class TestCli(unittest.TestCase):
+    @staticmethod
+    def _archive(tmp, name="synthetic.rpf"):
+        system, gfx, _mesh = weighted_mesh("weighted-8inf-8bit", vertices=12, bones=7)
+        data = build_archive(system, gfx)
+        path = os.path.join(tmp, name)
+        with open(path, "wb") as fh:
+            fh.write(data)
+        return path, data
+
+    def test_json_over_an_input_archive_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path, data = self._archive(tmp)
+            other = os.path.join(tmp, ".", "synthetic.rpf")
+            r = subprocess.run([sys.executable, "-I", TOOL, path, "--json", other],
+                               capture_output=True, text=True)
+            self.assertEqual(r.returncode, 2, r.stderr)
+            self.assertIn("would overwrite the input", r.stderr)
+            self.assertNotIn("Traceback", r.stderr)
+            self.assertEqual(r.stdout, "")
+            with open(path, "rb") as fh:
+                self.assertEqual(fh.read(), data)
+
+    def test_json_that_is_a_directory_is_refused_before_the_scan(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path, _ = self._archive(tmp)
+            r = subprocess.run([sys.executable, "-I", TOOL, path, "--json", tmp],
+                               capture_output=True, text=True)
+            self.assertEqual(r.returncode, 2, r.stderr)
+            self.assertIn("is a directory", r.stderr)
+            self.assertNotIn("Traceback", r.stderr)
+            self.assertEqual(r.stdout, "")
+
+    def test_json_in_a_missing_folder_is_created(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path, _ = self._archive(tmp)
+            out = os.path.join(tmp, "reports", "sub", "out.json")
+            r = subprocess.run([sys.executable, "-I", TOOL, path, "--json", out],
+                               capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            with open(out, encoding="utf-8") as fh:
+                report = json.load(fh)
+                self.assertIn(path, report)
+                self.assertEqual(report[path]["resources"], 1)
+
+    def test_json_that_cannot_be_written_is_one_error_line(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path, _ = self._archive(tmp)
+            blocker = os.path.join(tmp, "blocker")
+            with open(blocker, "w", encoding="utf-8") as fh:
+                fh.write("a file, not a folder")
+            out = os.path.join(blocker, "out.json")
+            r = subprocess.run([sys.executable, "-I", TOOL, path, "--json", out],
+                               capture_output=True, text=True)
+            self.assertEqual(r.returncode, 2, r.stderr)
+            self.assertIn("cannot write", r.stderr)
+            self.assertNotIn("Traceback", r.stderr)
+            self.assertIn("synthetic.rpf: 1 resources", r.stdout)
+
+    def test_invalid_sample_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path, _ = self._archive(tmp)
+            for sample in ("0", "-1"):
+                with self.subTest(sample=sample):
+                    r = subprocess.run([sys.executable, "-I", TOOL, path, "--sample", sample],
+                                       capture_output=True, text=True)
+                    self.assertEqual(r.returncode, 2, r.stderr)
+                    self.assertIn("--sample must be at least 1", r.stderr)
+                    self.assertNotIn("Traceback", r.stderr)
+
+    def test_missing_or_directory_input_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            missing = os.path.join(tmp, "missing.rpf")
+            r = subprocess.run([sys.executable, "-I", TOOL, missing],
+                               capture_output=True, text=True)
+            self.assertEqual(r.returncode, 2, r.stderr)
+            self.assertIn("not a file", r.stderr)
+            self.assertNotIn("Traceback", r.stderr)
+
+            r2 = subprocess.run([sys.executable, "-I", TOOL, tmp],
+                                capture_output=True, text=True)
+            self.assertEqual(r2.returncode, 2, r2.stderr)
+            self.assertIn("not a file", r2.stderr)
+            self.assertNotIn("Traceback", r2.stderr)
 
 
 if __name__ == "__main__":
