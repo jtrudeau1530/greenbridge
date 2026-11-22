@@ -215,6 +215,9 @@ W64_EMULATED = os.environ.get("LEONIDA_W64_EMULATE") == "1"
 # LEONIDA_BARY_FALLBACK=1 (set for build.py too): a pixel shader that reads raw barycentrics was translated with
 # --bary-fallback and is drawn through its pass-through geometry shader, <name>.bary_gs.spv.
 BARY_FALLBACK = os.environ.get("LEONIDA_BARY_FALLBACK") == "1"
+# LEONIDA_F16_INTERP_FALLBACK=1 (as build.py reads it): *_f16 interps were translated from decoded-half inputs, with no
+# PerVertexKHR inputs at all, so the translator refuses a computed I/J pair (ps_ij_computed) there.
+F16_HALVES = os.environ.get("LEONIDA_F16_INTERP_FALLBACK") == "1"
 W64X_DUMPS = [("cs_dpp_w64", [1, 0, 3, 2, 5, 4, 7, 6]),
               ("cs_w64x_readlane", [121, 121, 16, 97, 16, 100, 100, 121]),
               ("cs_w64x_writelane", [4660, 77, 99, 2748, 0, 0, 4660, 99]),
@@ -1097,11 +1100,14 @@ def wide_pixel_skip(name, out):
 
 def pixel_test(tools, spirv, name):
     path = os.path.join(spirv, name + ".spv")
+    if name == "ps_ij_computed" and (BARY_FALLBACK or F16_HALVES):
+        # Before the .spv check: without PerVertexKHR inputs the translator refuses a computed I/J pair (no .spv).
+        return Skip("SKIP (computed I/J pairs need PerVertexKHR inputs: no --bary-fallback / --f16-interp-fallback)")
     if not os.path.isfile(path):
         return f"missing {name}.spv"
     if name in ("ps_texoff", "ps_texoff_implicit"):
         return texoff_test(tools, spirv, name)
-    if name in ("ps_interp_f16_high", "ps_ij_computed") and BARY_FALLBACK:
+    if name == "ps_interp_f16_high" and BARY_FALLBACK:
         return Skip("SKIP (per-vertex interpolants need VK_KHR_fragment_shader_barycentric)")
     fmt = "<4f" if name == "ps_bary" else "<2I2f" if name in ("ps_flat", "ps_uniform_branch", "ps_scc_mask32") else "<4I"
     px, out = pixels(tools, spirv, name, fmt, PIXEL_VERTEX.get(name, "vs_ids"))
