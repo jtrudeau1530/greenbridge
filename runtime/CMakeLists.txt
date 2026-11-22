@@ -994,6 +994,13 @@ if(TARGET Vulkan::Headers)
     add_executable(replay_uav_clear_offset_test test/replay_uav_clear_offset_test.cpp)
     target_link_libraries(replay_uav_clear_offset_test PRIVATE Vulkan::Headers)
     add_test(NAME replay_uav_clear_offset COMMAND replay_uav_clear_offset_test)
+    # ResolveQueryData suspends conditional rendering around un-ended vkCmdFillBuffer runs as well as dispatches (D3D-148).
+    add_executable(replay_query_predication_test test/replay_query_predication_test.cpp)
+    target_link_libraries(replay_query_predication_test PRIVATE Vulkan::Headers)
+    if(WIN32)
+      target_compile_definitions(replay_query_predication_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    endif()
+    add_test(NAME replay_query_predication COMMAND replay_query_predication_test)
     # GFX10 T#/S#/V# descriptor encoding and its Vulkan mappings (src/gfx10_descriptors.h).
     add_executable(gfx10_descriptors_test test/gfx10_descriptors_test.cpp)
     target_link_libraries(gfx10_descriptors_test PRIVATE Vulkan::Headers)
