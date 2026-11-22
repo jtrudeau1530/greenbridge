@@ -6979,7 +6979,11 @@ class Gen:
             # D = {norm16(S1), norm16(S0)}: each f32 clamped to [-1, 1] (i16) or [0, 1] (u16), scaled by 32767 or
             # 65535 and rounded to nearest even. Mesa ACO emits these for NIR pack_snorm_2x16 / pack_unorm_2x16,
             # which nir_opcodes.py defines as fround_even(fclamp(x) * 32767.0 / 65535.0). NaN gives 0, as
-            # v_cvt_i32_f32 does (not measured on hardware). The whole dword is written.
+            # v_cvt_i32_f32 does (measured on gfx1036, SHADER-339). The whole dword is written.
+            # RDNA2 rounds the exact product once (SHADER-363): the f32 OpFMul can land exactly on k + 0.5 when the
+            # exact product is just below or above it, and RoundEven then picks the even neighbour. The product's
+            # error e = Fma(c, s, -p) is exact, and on such a tie its sign decides: floor(p) + 1 above, floor(p)
+            # below, RoundEven when e is 0. Away from a tie both roundings agree, since k + 0.5 is an f32 here.
             if "clamp" in mods:
                 raise Unsupported(op + " clamp")
             snorm = op == "v_cvt_pknorm_i16_f32"
@@ -6990,8 +6994,22 @@ class Gen:
                 self.emit(f"{nan} = OpIsNan %bool {f}")
                 self.emit(f"{z} = OpSelect %float {nan} %f0 {f}")
                 self.emit(f"{c} = OpExtInst %float %glsl FClamp {z} {self.fconst(-1.0) if snorm else '%f0'} %f1")
-                self.emit(f"{m} = OpFMul %float {c} {self.fconst(32767.0 if snorm else 65535.0)}")
-                self.emit(f"{rr} = OpExtInst %float %glsl RoundEven {m}")
+                scale = self.fconst(32767.0 if snorm else 65535.0)
+                self.emit(f"{m} = OpFMul %float {c} {scale}")
+                re_, nm, e, fl, fr, tie, epos, eneg, up, pick = (self.tmp() for _ in range(10))
+                self.emit(f"{re_} = OpExtInst %float %glsl RoundEven {m}")
+                self.emit(f"{nm} = OpFNegate %float {m}")
+                self.emit_fma(e, c, scale, nm)
+                self.emit(f"{fl} = OpExtInst %float %glsl Floor {m}")
+                self.emit(f"{fr} = OpFSub %float {m} {fl}")
+                self.emit(f"{tie} = OpFOrdEqual %bool {fr} {self.fconst(0.5)}")
+                self.emit(f"{epos} = OpFOrdGreaterThan %bool {e} %f0")
+                self.emit(f"{eneg} = OpFOrdLessThan %bool {e} %f0")
+                self.emit(f"{up} = OpFAdd %float {fl} %f1")
+                self.emit(f"{pick} = OpSelect %float {epos} {up} {re_}")
+                adj = self.tmp()
+                self.emit(f"{adj} = OpSelect %float {eneg} {fl} {pick}")
+                self.emit(f"{rr} = OpSelect %float {tie} {adj} {re_}")
                 if snorm:
                     si_ = self.tmp()
                     self.emit(f"{si_} = OpConvertFToS %int {rr}")
