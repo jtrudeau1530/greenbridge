@@ -818,6 +818,160 @@ class SIMDVALUInterpreter:
         return self.execute(ast)
 
 
+# --- Mutated Oracles for Mutation Testing and Negative Controls ---
+
+def mutant_bias_off_by_one(src0: int, src1: int) -> int:
+    """Mutant A: uses incorrect bias 1022 instead of 1023 on re-bias."""
+    scale = s32(src1)
+    exp = ((src0 >> 52) & 0x7FF) - BIAS_F64
+    rebiased = exp + scale + 1022  # Off by one: 1022 instead of 1023
+    return (src0 & SIGN_MASK_F64) | (rebiased << 52) | (src0 & MANT_MASK_F64)
+
+
+def mutant_flush_subnormal(src0: int, src1: int) -> int:
+    """Mutant B: prematurely flushes all subnormals to zero."""
+    res = ref_ldexp_f64(src0, src1)
+    if is_subnormal_f64(res):
+        return src0 & SIGN_MASK_F64
+    return res
+
+
+def mutant_no_clamp(src0: int, src1: int) -> int:
+    """Mutant C: ignores clamp modifier."""
+    return ref_ldexp_f64(src0, src1, clamp=False)
+
+
+def mutant_truncation_rounding(src0: int, src1: int) -> int:
+    """Mutant D: uses truncation (round toward zero) instead of round-to-nearest-even."""
+    scale = s32(src1)
+    exp_field = (src0 >> 52) & 0x7FF
+    mant_field = src0 & MANT_MASK_F64
+    sign = (src0 >> 63) & 1
+    E = (exp_field - BIAS_F64) if exp_field != 0 else -1022
+    F = (1 << 52) | mant_field if exp_field != 0 else mant_field
+    target_exp = E + scale + BIAS_F64
+    if target_exp < 1:
+        shift_right = 1 - target_exp
+        q = F >> shift_right  # purely truncated without rounding
+        return (sign << 63) | (q & MANT_MASK_F64)
+    return ref_ldexp_f64(src0, src1)
+
+
+def mutant_leak_vcc(interp: ScalarVALUInterpreter, ast: InstructionAST) -> None:
+    """Mutant E: improperly corrupts VCC register during VALU FP execution."""
+    interp.execute(ast)
+    interp.vcc ^= 0x1
+
+
+def mutant_exec_leak(sim: SIMDVALUInterpreter, ast: InstructionAST) -> None:
+    """Mutant F: writes inactive lanes under EXEC mask."""
+    sim.execute(ast)
+    # Overwrite lane 0 regardless of EXEC
+    sim.set_vgpr_u64(ast.dst.reg_index, 0, 0x1234567890ABCDEF)
+
+
+class TestValuLdexpF64NegativeControlsAndMutations(unittest.TestCase):
+    """Negative controls, syntax rejection, and mutation detection for v_ldexp_f64."""
+
+    def test_syntax_rejection_invalid_opcode(self):
+        with self.assertRaises(ValueError):
+            parse_vop3_ldexp_f64("v_add_f64 v[0:1], v[2:3], v4")
+
+    def test_syntax_rejection_insufficient_operands(self):
+        with self.assertRaises(ValueError):
+            parse_vop3_ldexp_f64("v_ldexp_f64 v[0:1], v[2:3]")
+
+    def test_syntax_rejection_non_contiguous_dst(self):
+        with self.assertRaises(ValueError):
+            parse_vop3_ldexp_f64("v_ldexp_f64 v[0:2], v[2:3], v4")
+
+    def test_syntax_rejection_non_contiguous_src0(self):
+        with self.assertRaises(ValueError):
+            parse_vop3_ldexp_f64("v_ldexp_f64 v[0:1], v[2:4], v4")
+
+    def test_syntax_rejection_out_of_range_registers(self):
+        with self.assertRaises(ValueError):
+            parse_vop3_ldexp_f64("v_ldexp_f64 v[255:256], v[2:3], v4")
+        with self.assertRaises(ValueError):
+            parse_vop3_ldexp_f64("v_ldexp_f64 v[0:1], s[105:106], v4")
+
+    def test_syntax_rejection_invalid_modifier(self):
+        # Invalid omod
+        with self.assertRaises(ValueError):
+            ast = parse_vop3_ldexp_f64("v_ldexp_f64 v[0:1], v[2:3], v4")
+            ast.omod = "mul:3"
+            ast.validate()
+
+    def test_syntax_rejection_invalid_types(self):
+        # Single VGPR as destination (must be 64-bit pair)
+        with self.assertRaises(ValueError):
+            parse_vop3_ldexp_f64("v_ldexp_f64 v0, v[2:3], v4")
+        # Single VGPR as src0 (must be 64-bit pair)
+        with self.assertRaises(ValueError):
+            parse_vop3_ldexp_f64("v_ldexp_f64 v[0:1], v2, v4")
+
+    def test_mutation_detection_bias_off_by_one(self):
+        # Correct oracle gives 8.0 for 1.0 * 2^3
+        correct = ref_ldexp_f64(ONE_F64, 3)
+        mutant = mutant_bias_off_by_one(ONE_F64, 3)
+        # Mutant computes with wrong bias, causing discrepancy
+        self.assertEqual(bits_to_f64(correct), 8.0)
+        # In fact, with exp = -1022 + 3 + 1022 = exp, it dropped scale or gave wrong exponent!
+        # Let's ensure discrepancy is caught
+        mutant_scaled = mutant_bias_off_by_one(ONE_F64, 1)
+        self.assertNotEqual(mutant_scaled, ref_ldexp_f64(ONE_F64, 1))
+
+    def test_mutation_detection_flush_subnormal(self):
+        # Subnormal must be preserved in IEEE mode, not flushed to zero
+        correct = ref_ldexp_f64(MIN_NORMAL_F64, -1)
+        self.assertTrue(is_subnormal_f64(correct))
+        mutant = mutant_flush_subnormal(MIN_NORMAL_F64, -1)
+        self.assertEqual(mutant, POS_ZERO_F64)
+        self.assertNotEqual(correct, mutant)
+
+    def test_mutation_detection_no_clamp(self):
+        val = f64_to_bits(4.0)
+        correct_clamped = ref_ldexp_f64(val, 0, clamp=True)
+        mutant = mutant_no_clamp(val, 0)
+        self.assertEqual(bits_to_f64(correct_clamped), 1.0)
+        self.assertEqual(bits_to_f64(mutant), 4.0)
+        self.assertNotEqual(correct_clamped, mutant)
+
+    def test_mutation_detection_truncation_vs_tiesto_even(self):
+        # Odd remainder that rounds up under TiesToEven
+        f_odd = MIN_NORMAL_F64 | 2
+        correct = ref_ldexp_f64(f_odd, -53)
+        mutant = mutant_truncation_rounding(f_odd, -53)
+        self.assertEqual(correct, MIN_SUBNORMAL_F64)
+        self.assertEqual(mutant, POS_ZERO_F64)
+        self.assertNotEqual(correct, mutant)
+
+    def test_mutation_detection_corrupt_vcc(self):
+        interp = ScalarVALUInterpreter()
+        interp.vcc = 0x5555555555555555
+        interp.set_vgpr_u64(2, ONE_F64)
+        interp.set_vgpr_u32(4, 1)
+        ast = parse_vop3_ldexp_f64("v_ldexp_f64 v[0:1], v[2:3], v4")
+        # Under normal execution VCC is preserved
+        interp.execute(ast)
+        self.assertEqual(interp.vcc, 0x5555555555555555)
+        # Mutant corrupts VCC
+        mutant_leak_vcc(interp, ast)
+        self.assertNotEqual(interp.vcc, 0x5555555555555555)
+
+    def test_mutation_detection_exec_mask_leak(self):
+        sim = SIMDVALUInterpreter(wave_size=32)
+        sim.exec = 0x0  # all lanes disabled
+        sim.set_vgpr_u64(0, 0, 0xAAAAAAAAAAAAAAAA)
+        ast = parse_vop3_ldexp_f64("v_ldexp_f64 v[0:1], v[2:3], v4")
+        # Normal execution preserves lane 0
+        sim.execute(ast)
+        self.assertEqual(sim.get_vgpr_u64(0, 0), 0xAAAAAAAAAAAAAAAA)
+        # Mutant writes inactive lane
+        mutant_exec_leak(sim, ast)
+        self.assertNotEqual(sim.get_vgpr_u64(0, 0), 0xAAAAAAAAAAAAAAAA)
+
+
 class TestValuLdexpF64IEEE754Boundaries(unittest.TestCase):
     """Deep verification of IEEE 754 boundary extremes, subnormals, and NaN handling."""
 
