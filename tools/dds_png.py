@@ -1044,6 +1044,12 @@ def main(argv: list[str] | None = None) -> int:
         ap.error("--max-size must be 0 or more")
 
     try:
+        try:
+            overwrites_input = os.path.samefile(args.input, args.output)
+        except FileNotFoundError:
+            overwrites_input = False
+        if overwrites_input:
+            raise DdsError("output must not overwrite the input DDS")
         png = dds_file_to_png_bytes(args.input, max_size=args.max_size)
         parent = os.path.dirname(os.path.abspath(args.output))
         if parent:
