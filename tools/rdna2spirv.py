@@ -15398,6 +15398,10 @@ def assemble_spirv(sa, sv, asm_text=None, assembler="spirv-as"):
     """
     with tempfile.NamedTemporaryFile(prefix=".spirv-", suffix=".tmp", dir=os.path.dirname(sv), delete=False) as f:
         tmp = Path(f.name)
+    # spirv-as reads the .spvasm from stdin, and both tools run in the output folder with the staging file's bare
+    # name. On Windows they read their command line in the ANSI code page, so a folder name outside it (a Cyrillic or
+    # CJK user name, say) reached them as '?' and every shader failed with "file does not exist".
+    folder = os.path.dirname(os.path.abspath(tmp))
     try:
         if assembler == "python":
             import spirv_asm
@@ -15408,12 +15412,20 @@ def assemble_spirv(sa, sv, asm_text=None, assembler="spirv-as"):
             except (OSError, spirv_asm.SpirvAsmError) as exc:
                 result = subprocess.CompletedProcess(["spirv_asm"], 1, "", str(exc))
         else:
-            result = subprocess.run(["spirv-as", sa, "-o", str(tmp), "--target-env", "vulkan1.2"],
-                                    capture_output=True, text=True)
+            try:
+                with open(sa, "rb") as f:
+                    source = f.read()
+            except OSError as exc:
+                result = subprocess.CompletedProcess(["spirv-as"], 1, "", f"error: cannot read {sa}: {exc}")
+            else:
+                result = subprocess.run(["spirv-as", "-", "-o", tmp.name, "--target-env", "vulkan1.2"],
+                                        input=source, capture_output=True, cwd=folder)
+                result.stdout = result.stdout.decode("utf-8", "replace")
+                result.stderr = result.stderr.decode("utf-8", "replace")
         if result.returncode == 0:
             # Offset on non-gather: VK_KHR_maintenance8
             result = subprocess.run(["spirv-val", "--target-env", "vulkan1.2", "--allow-offset-texture-operand",
-                                     str(tmp)], capture_output=True, text=True)
+                                     tmp.name], capture_output=True, text=True, cwd=folder)
         if result.returncode == 0:
             tmp.replace(sv)
         else:
