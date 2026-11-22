@@ -442,6 +442,8 @@ def preflight(stages: list, work: str, wav: bool = False, runtime_build: str | N
                 missing.append(pipeline_check_prerequisite(runtime_building))
     if missing:
         fail("Install these first, then run the build again:\n  - " + "\n  - ".join(dict.fromkeys(missing)))
+    if "pipelines" in stages and "shaders" not in stages:
+        require_translated_shaders(work)
     need = {s: MIN_FREE_GB.get(s, 0) for s in stages}
     # A rerun that only refreshes the shaders shouldn't need room for a second copy of exports already on disk.
     # --wav still counts it: the WAV decode writes several times the Ogg Opus size and has no marker.
@@ -1373,17 +1375,22 @@ def pipeline_check_exe():
     return next((p for p in found if os.path.isfile(p)), None)
 
 
+def require_translated_shaders(work: str) -> str:
+    spirv = os.path.join(work, "shaders", "spirv")
+    if not os.path.isfile(os.path.join(spirv, "index.json")):
+        fail("No translated shaders yet: run the shaders stage first.")
+    return spirv
+
+
 def pipelines(work: str, out: str, jobs: "int | None" = None) -> None:
     exe = pipeline_check_exe()
-    spirv = os.path.join(work, "shaders", "spirv")
     if not exe and os.name == "nt":
         fail("vk_pipeline_check.exe wasn't built: run the runtime stage with the Vulkan SDK installed.")
     if not exe:
         fail("vk_pipeline_check wasn't built. With CMake 3.24+, a C++20 compiler and the Vulkan headers and "
              "loader installed, run: cmake -S runtime -B runtime/build/linux && "
              "cmake --build runtime/build/linux --parallel")
-    if not os.path.isfile(os.path.join(spirv, "index.json")):
-        fail("No translated shaders yet: run the shaders stage first.")
+    spirv = require_translated_shaders(work)
     log("pipelines: creating every shader module and compute pipeline on this GPU")
     os.makedirs(out, exist_ok=True)
     cache = os.path.join(out, "pipeline_cache.bin")
