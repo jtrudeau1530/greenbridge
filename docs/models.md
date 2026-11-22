@@ -208,9 +208,10 @@ reproduced the ten-archive total. The `48557ea` column is the pre-fix control:
 | **Total** | **190,792** | **155,598** | **190,792** |
 
 The `packs.rpf` row is the pre-dictionary-root control: at `917e9b9` that archive recovers
-24,034 models, and the other archives' new-pin counts are in the table above. The rows here are
-the `c3708fb` measurements (190,792 models); the new-pin re-count is 350,248. Triangle totals
-have not been re-run at the new pin.
+24,034 models (26,585 at `e293917`), and the other archives' counts are in the tables above. The
+rows here are the `c3708fb` measurements (190,792 models); the `917e9b9` re-count is 350,248.
+Triangle totals for that pin have not been re-run; the current `e293917` totals are in the
+full-archive table above.
 
 At `c3708fb`, every candidate is recovered, read back and decoded: 0 decode failures, 0 readback
 failures, no duplicate model names, and 2.22 billion triangles (1.95 billion before). The
