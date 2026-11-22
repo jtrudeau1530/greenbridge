@@ -6,7 +6,7 @@
 // calls exit() with 0 (42 with `exit-code`) when everything held. Two checks are opt-in, by argument (CTest's
 // run_tiny_game_tls and run_tiny_game_eh): `tls`, thread_local on the game's own threads, which needs the loader's
 // per-thread TLS (gta6rt starts main on a separate thread); and `eh`, a C++ exception caught inside the image.
-// A third, `game-file` (run_tiny_game_dir), reads GAME:	iny_game_probe.txt after moving the current directory.
+// A third, `game-file` (run_tiny_game_dir), reads GAME:\tiny_game_probe.txt after moving the current directory.
 // On MSVC, `eh` needs more than the unwind tables #176 registers: _CxxThrowException finds the throwing image
 // with RtlPcToFileHeader, which the loader redirects in the host MSVC runtime. Arguments, not environment variables,
 // so scripts/run_wine_tests.py (which passes a test's command line but not its ENVIRONMENT) runs them too. stdout is
