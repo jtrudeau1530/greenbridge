@@ -288,6 +288,8 @@ W64X_PARTIAL = [("cs_w64x_partial", [40, 40, 528, 0, 0, 532, 539, 524820]),
                 ("cs_w64x_partial_scmp", [0, 1, 0, 1, 1, 1, 1, 0])]
 PIXEL_BITS = {"ps_clip_color": (0x3e800000, 0x3f000000, 0x3f400000, 0x3f800000),
               "ps_legacy_mul": (0, 0, 0, 0x40c00000),
+              "ps_mul_legacy_denorm": (0, 0, 0, 0x80000000),
+              "ps_mul_legacy_denorm_mods": (0, 0, 0, 0x40400000),
               "ps_ops": (0x48804300, 5, 7, 0xbffffffc), "ps_ops2": (0xabcd4400, 0x46001234, 0xbffffffa, 7),
               "ps_ops3": (0xbffffffa, 0x44660066, 0x44aabbcc, 16), "ps_ops4": (0x34000010, 0x00120800, 0xbeef0000, 0x12343c00),
               "ps_ops5": (0x12340010, 0xbeef0800, 0xaaaaffff, 0xdeadbc00),

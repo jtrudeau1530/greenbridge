@@ -4400,7 +4400,8 @@ class Gen:
         return v
 
     def flush_f32(self, f):
-        """v_mad_f32, v_mac_f32 and v_mad_legacy_f32 have no f32 denormal support: a subnormal operand or result
+        """v_mad_f32, v_mac_f32, v_mad_legacy_f32 and default-mode v_mul_legacy_f32 flush f32 denormals:
+        a subnormal operand or result
         reads as signed zero, whatever the MODE register says. LLVM's SITargetLowering::isFMADLegal forms
         v_mad_f32/v_mac_f32 only when f32 denormals are flushed (SIISelLowering.cpp, llvm-project 1922c0c);
         v_mad_legacy_f32 is the same VALU. Emulated as |x| < FLT_MIN -> copysign(0, x): inf and NaN compare
@@ -6958,15 +6959,24 @@ class Gen:
                 self.emit(f"{m} = OpSelect %uint {cm} {self.cu(0xFFFFFFFF)} {self.cu(0)}")
                 self.mask_dst(cd, m)
         elif op == "v_mul_legacy_f32":
-            # Legacy multiply treats 0 * anything (inf/NaN included) as 0.
-            x, y = self.src_f(a[1]), self.src_f(a[2])
+            # The inferred game's f32 denorm mode is flush-in/flush-out. Unlike an IEEE multiply, the legacy
+            # zero override gives +0 even when a negative subnormal operand becomes -0 after input flushing.
+            # Flush the product before omod: otherwise FLT_MIN * 0.5 mul:2 becomes FLT_MIN, not zero.
+            x, y = (self.flush_f32(self.src_f(t)) for t in a[1:3])
             m, zx, zy, either, r = (self.tmp() for _ in range(5))
             self.emit(f"{m} = OpFMul %float {x} {y}")
             self.emit(f"{zx} = OpFOrdEqual %bool {x} %f0")
             self.emit(f"{zy} = OpFOrdEqual %bool {y} %f0")
             self.emit(f"{either} = OpLogicalOr %bool {zx} {zy}")
-            self.emit(f"{r} = OpSelect %float {either} %f0 {m}")
-            self.dst(a[0], self.tou(self.clamp_mods(r, mods)))
+            self.emit(f"{r} = OpSelect %float {either} %f0 {self.flush_f32(m)}")
+            r = self.flush_f32(self.clamp_mods(r, mods))
+            if any(mod in ("mul:2", "mul:4", "div:2") for mod in mods):
+                # With IEEE off, omod makes -0 (including a flushed subnormal result) +0.
+                z, pos = self.tmp(), self.tmp()
+                self.emit(f"{z} = OpFOrdEqual %bool {r} %f0")
+                self.emit(f"{pos} = OpSelect %float {z} %f0 {r}")
+                r = pos
+            self.dst(a[0], self.tou(r))
         elif op in ("v_mad_legacy_f32", "v_mac_legacy_f32"):
             # Legacy multiply treats 0 * anything (inf/NaN included) as 0, after the denormal flush.
             # v_mac_legacy_f32 is the GFX10.1 VOP2 form with D as the addend, as v_mac_f32 is to v_mad_f32 (LLVM
