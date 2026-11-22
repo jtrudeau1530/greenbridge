@@ -837,6 +837,135 @@ class PreflightExportedAssetsSpaceTest(PreflightTestBase):
             self.write_markers(work)
             self.assert_fails(self.run_preflight, work, free_gb=220, wav=True, match="about 330 GB is needed")
 
+    # A stopped export: models, textures and most pools on disk, no xma.done yet.
+    def run_partial(self, work, free_gb, on_disk_gb, **kwargs):
+        with mock.patch("make_game.assets_bytes_on_disk", return_value=on_disk_gb * 2**30) as walk:
+            self.run_preflight(work, free_gb, **kwargs)
+        return walk
+
+    def test_stopped_export_counts_what_is_already_on_disk(self):
+        # The case this was found on: 270 GB already exported, 205 GB free, refused for 330 GB.
+        with tempfile.TemporaryDirectory() as work:
+            self.write_markers(work, xma=None)
+            self.run_partial(work, free_gb=205, on_disk_gb=270)  # 30 + 300 - 270 = 60 GB
+
+    def test_stopped_export_still_needs_what_is_left(self):
+        with tempfile.TemporaryDirectory() as work:
+            self.write_markers(work, xma=None)
+            err = self.assert_fails(self.run_partial, work, free_gb=205, on_disk_gb=50,
+                                    match="about 280 GB is needed")
+            self.assertIn("205 GB free", err)
+
+    def test_more_on_disk_than_the_estimate_leaves_the_shader_space(self):
+        with tempfile.TemporaryDirectory() as work:
+            self.write_markers(work, xma=None)
+            self.assert_fails(self.run_partial, work, free_gb=20, on_disk_gb=400, match="about 30 GB is needed")
+
+    def test_assets_folder_is_not_walked_when_there_is_room(self):
+        with tempfile.TemporaryDirectory() as work:
+            walk = self.run_partial(work, free_gb=500, on_disk_gb=270)
+            walk.assert_not_called()
+
+    def test_wav_still_counts_the_whole_asset_space_for_a_stopped_export(self):
+        with tempfile.TemporaryDirectory() as work:
+            self.write_markers(work, xma=None)
+            self.assert_fails(self.run_partial, work, free_gb=205, on_disk_gb=270, wav=True,
+                              match="about 330 GB is needed")
+
+    # The walk itself: only the output of steps assets() would skip on a rerun is counted.
+    def put(self, work, rel, size):
+        path = os.path.join(work, "assets", *rel.split("/"))
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as f:
+            f.write(b"\0" * size)
+
+    def put_pool(self, work, rel, files, promised=None):
+        for name, size in files.items():
+            self.put(work, f"{rel}/{name}", size)
+        rows = [{"File": n} for n in (promised if promised is not None else files)]
+        path = os.path.join(work, "assets", *rel.split("/"), "manifest.json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"Count": len(rows), "Textures": rows}, f)
+        return os.path.getsize(path)
+
+    def test_assets_bytes_on_disk_counts_only_finished_steps(self):
+        with tempfile.TemporaryDirectory() as work:
+            self.assertEqual(make_game.assets_bytes_on_disk(work), 0)  # no assets folder yet
+            self.put(work, "levels/models/a.obj", 100)
+            self.put(work, "levels/models/manifest.json", 7)
+            self.put(work, "levels/textures/b.dds", 50)                 # no manifest: the step reruns
+            self.put(work, "common/models/c.obj", 30)
+            self.put(work, "common/models/manifest.json", 3)
+            pool = self.put_pool(work, "ttpf/pool", {"d.dds": 4096})
+            hashed = self.put_pool(work, "ttpf_pack/core/pool~0123456789ab/pool", {"e.dds": 200})
+            self.put_pool(work, "ttpf/half", {"f.dds": 900}, promised=["f.dds", "g.dds"])  # g.dds missing
+            self.put(work, "ttpf/stray/h.dds", 800)                      # no manifest at all
+            self.put(work, "audio/audio_manifest.json", 9)
+            self.put(work, "audio/awc/i.awc", 60)
+            self.put(work, "audio/ogg/j.ogg", 70)                        # no ogg.done yet
+            self.put(work, "audio/xma/k.xma", 80)
+            self.put(work, "audio/xma.done", 1)
+            self.put(work, "audio/wav/l.wav", 90)                        # --wav output: not in the estimate
+            self.put(work, "unrelated.bin", 5000)
+            with open(os.path.join(work, "outside.bin"), "wb") as f:     # not under assets
+                f.write(b"\0" * 999)
+            expected = (100 + 7) + (30 + 3) + (4096 + pool) + (200 + hashed) + (9 + 60 + 1) + 80
+            self.assertEqual(make_game.assets_bytes_on_disk(work), expected)
+
+    def test_unrelated_files_under_assets_are_not_credited(self):
+        # A large file the exporter didn't write must not let a short drive through.
+        with tempfile.TemporaryDirectory() as work:
+            self.write_markers(work, xma=None)
+            self.put(work, "big.bin", 4096)
+            self.put(work, "levels/textures/abandoned.dds", 4096)    # a step that stopped before its manifest
+            self.assertEqual(make_game.assets_bytes_on_disk(work), 0)
+            self.assert_fails(self.run_preflight, work, free_gb=10, match="about 330 GB is needed")
+
+    def test_assets_bytes_on_disk_does_not_follow_a_linked_folder(self):
+        with tempfile.TemporaryDirectory() as work, tempfile.TemporaryDirectory() as elsewhere:
+            with open(os.path.join(elsewhere, "big.bin"), "wb") as f:
+                f.write(b"\0" * 5000)
+            self.put(work, "levels/models/manifest.json", 7)
+            try:
+                os.symlink(elsewhere, os.path.join(work, "assets", "levels", "models", "link"),
+                           target_is_directory=True)
+            except (OSError, NotImplementedError):
+                self.skipTest("symbolic links are not available here")
+            self.assertEqual(make_game.assets_bytes_on_disk(work), 7)
+
+    def test_assets_bytes_on_disk_does_not_follow_a_junction(self):
+        if os.name != "nt":
+            self.skipTest("NTFS junctions are Windows only")
+        import _winapi
+        with tempfile.TemporaryDirectory() as work, tempfile.TemporaryDirectory() as elsewhere:
+            with open(os.path.join(elsewhere, "big.bin"), "wb") as f:
+                f.write(b"\0" * 5000)
+            self.put(work, "levels/models/manifest.json", 7)
+            junction = os.path.join(work, "assets", "levels", "models", "junction")
+            _winapi.CreateJunction(elsewhere, junction)
+            try:
+                self.assertEqual(make_game.assets_bytes_on_disk(work), 7)
+            finally:
+                os.rmdir(junction)          # removes the junction, not its target
+
+    def test_a_linked_assets_folder_counts_nothing(self):
+        # <work>/assets pointing at another drive: what is there takes no room on the drive preflight measures.
+        with tempfile.TemporaryDirectory() as work, tempfile.TemporaryDirectory() as elsewhere:
+            os.makedirs(os.path.join(elsewhere, "levels", "models"))
+            with open(os.path.join(elsewhere, "levels", "models", "manifest.json"), "wb") as f:
+                f.write(b"\0" * 5000)
+            link = os.path.join(work, "assets")
+            if os.name == "nt":
+                import _winapi
+                _winapi.CreateJunction(elsewhere, link)
+            else:
+                os.symlink(elsewhere, link, target_is_directory=True)
+            try:
+                self.assertEqual(make_game.assets_bytes_on_disk(work), 0)
+            finally:
+                if os.name == "nt":
+                    os.rmdir(link)
+
 
 if __name__ == "__main__":
     unittest.main()

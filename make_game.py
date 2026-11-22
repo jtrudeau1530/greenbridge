@@ -385,6 +385,82 @@ def assets_exported(work: str) -> bool:
     return not (shutil.which("ffmpeg") and pending_xma(os.path.join(audio, "xma")))
 
 
+def _linked(path: str) -> bool:
+    """A symbolic link or an NTFS junction: what it points at may be on another drive, so it is never counted."""
+    return os.path.islink(path) or os.path.isjunction(path)
+
+
+def _tree_bytes(root: str, skip: tuple = ()) -> int:
+    """Bytes of the regular files under root, without following links or junctions (root's own names in skip are
+    left out). One os.scandir walk; on Windows the sizes come with the directory listing, so no file is opened."""
+    if _linked(root):
+        return 0
+    total, stack = 0, [(root, True)]
+    while stack:
+        folder, top = stack.pop()
+        try:
+            with os.scandir(folder) as it:
+                for e in it:
+                    try:
+                        if e.is_symlink() or e.is_junction() or (top and e.name in skip):
+                            continue
+                        if e.is_dir(follow_symlinks=False):
+                            stack.append((e.path, False))
+                        elif e.is_file(follow_symlinks=False):
+                            total += e.stat(follow_symlinks=False).st_size
+                    except OSError:
+                        continue
+        except OSError:   # missing, or can't be listed: count nothing for it
+            continue
+    return total
+
+
+def _finished_pool_dirs(top: str) -> list:
+    """Texture pool folders under assets/ttpf or assets/ttpf_pack whose manifest ttpf_manifest() accepts, the check
+    assets() uses to skip a pool. A folder with a manifest is a pool: its subfolders are not searched."""
+    found, stack = [], [top]
+    while stack:
+        folder = stack.pop()
+        if _linked(folder):
+            continue
+        if os.path.isfile(os.path.join(folder, "manifest.json")):
+            if ttpf_manifest(folder) is not None:
+                found.append(folder)
+            continue
+        try:
+            with os.scandir(folder) as it:
+                stack += [e.path for e in it if e.is_dir(follow_symlinks=False)]
+        except OSError:
+            continue
+    return found
+
+
+def assets_bytes_on_disk(work: str) -> int:
+    """Bytes a stopped assets stage has already written and a rerun will skip: only the output of steps whose
+    manifest or marker assets() checks before redoing them (an archive's models/textures manifest.json, a texture
+    pool's complete manifest, audio_manifest.json, ogg.done, xma.done). Other files under <work>/assets, such as a
+    step that stopped before its marker, are not counted, since the rerun writes that step again."""
+    out = os.path.join(work, "assets")
+    if _linked(out):
+        return 0
+    total = 0
+    for rel in MODEL_ARCHIVES:
+        name = os.path.splitext(os.path.basename(rel))[0]
+        for mode in ("models", "textures"):
+            folder = os.path.join(out, name, mode)
+            if os.path.isfile(os.path.join(folder, "manifest.json")):
+                total += _tree_bytes(folder)
+    for top in ("ttpf", "ttpf_pack"):
+        total += sum(_tree_bytes(d) for d in _finished_pool_dirs(os.path.join(out, top)))
+    audio = os.path.join(out, "audio")
+    if os.path.isfile(os.path.join(audio, "audio_manifest.json")):
+        total += _tree_bytes(audio, skip=("ogg", "xma", "wav"))
+    for step in ("ogg", "xma"):
+        if os.path.isfile(os.path.join(audio, f"{step}.done")):
+            total += _tree_bytes(os.path.join(audio, step))
+    return total
+
+
 def pipeline_check_prerequisite(runtime_selected: bool = False) -> str:
     """Why the pipelines stage can't run yet. Kept here so preflight can fail before a long shader build;
     pipelines() prints its own, more detailed message when the stage is reached. On Windows the runtime stage
@@ -456,6 +532,16 @@ def preflight(stages: list, work: str, wav: bool = False, runtime_build: str | N
     if free_gb < need_gb and need.get("shaders") and shader_outputs_reusable(work, emulate, keep_emulated, fallbacks):
         log(f"preflight: the shaders in {work} can be reused; not counting their {need['shaders']} GB")
         need_gb -= need["shaders"]
+    # An export stopped part-way (no xma.done yet) has already put some of the 300 GB on the drive, and the rerun
+    # skips the steps it finished. Only walked when the space is short, so a build with room to spare reads no
+    # folder.
+    # --wav still counts the whole estimate, as above: the WAV decode writes several times the Ogg Opus size and has
+    # no marker, so what is on disk says nothing about what it will still write.
+    if free_gb < need_gb and need.get("assets") and not wav:
+        done_gb = min(assets_bytes_on_disk(work) // 2**30, need["assets"])
+        if done_gb:
+            log(f"preflight: {done_gb} GB of a stopped asset export is already in {work}; not counting it again")
+            need_gb -= done_gb
     if free_gb < need_gb:
         hint = ""
         if "assets" in stages and need.get("assets"):
