@@ -37,7 +37,12 @@ def program(name):
     return label(name) + b"\x02" + u32(stored) + packed + bytes(152) + u32(2) + b"\xaa\xbb"
 
 
-def effect(name, ordinals=None, techniques=(), pool_tail=b""):
+def post_pass(words=(), blocks=(b"", b""), packed=0, entries=b""):
+    data = u32(len(words)) + b"".join(u32(word) for word in words) + u32(0x80000000)
+    return data + b"".join(u32(len(block)) + block for block in blocks) + u32(packed) + entries
+
+
+def effect(name, ordinals=None, techniques=(), pool_tail=b"", suffix=None):
     data = bytearray(label(name) + u32(0xDEADBEEF))
     for group in range(6):
         entries = (ordinals or {}).get(group, ())
@@ -57,7 +62,7 @@ def effect(name, ordinals=None, techniques=(), pool_tail=b""):
     for row in rows:
         data += bytes(row) + bytes(18)
     pool += pool_tail
-    return data + u32(len(pool)) + pool
+    return data + (post_pass() if suffix is None else suffix) + u32(len(pool)) + pool
 
 
 def database(groups, effects, base=0):
@@ -169,12 +174,50 @@ class EffectsTest(unittest.TestCase):
         for reason, item in [
             ("ordinal outside group", effect("Mock", {0: (1,)})),
             ("selector outside effect list", effect("Mock", {0: (0,)}, [("Hue", [(2, 0, 0, 0, 0, 0)])])),
-            ("two valid pool boundaries", effect("Mock", pool_tail=u32(32) + b"\0" + b"X" * 30 + b"\0")),
+            ("invalid pool text", effect("Mock", pool_tail=b"\xff\0")),
         ]:
             with self.subTest(reason=reason):
                 data, layout = database({0: ("Glow",)}, [item])
                 with self.assertRaises(ValueError):
                     sgd5_effects.read_database(io.BytesIO(data), layout, "Absent", "Absent")
+
+    def test_counted_suffix_skips_header_and_pool_lookalikes(self):
+        decoy = label("Other") + u32(0) + u32(0) * 6
+        tags = u32(0x80000000) + b"ABCD" + u32(24) + bytes(24)
+        suffix = post_pass((0, 17), (decoy, b"test"), 0x14000002, tags)
+        inner_pool = u32(32) + b"\0" + b"X" * 30 + b"\0"
+        first = effect("First", pool_tail=inner_pool, suffix=suffix)
+        second = effect("Next")
+        data, layout = database({}, [first, second])
+        matches = sgd5_effects.read_database(io.BytesIO(data), layout, list_effects=True)["matches"]
+        self.assertEqual([(m["effect"], m["effect_offset"]) for m in matches],
+                         [("First", data.index(first)), ("Next", data.index(second))])
+
+    def test_counted_suffix_refuses_invalid_framing(self):
+        invalid = {
+            "oversize word array": u32(0xffffffff),
+            "marker": u32(0) + u32(7),
+            "first block length": u32(0) + u32(0x80000000) + u32(0xffffffff),
+            "second block length": u32(0) + u32(0x80000000) + u32(0) + u32(0xffffffff),
+            "packed count": post_pass(packed=0x00000100),
+            "missing tag payload": post_pass(packed=1, entries=u32(0x80000000)),
+            "oversize variable payload": post_pass(packed=1, entries=u32(0xffffffff)),
+            "oversize pool": post_pass() + u32(0xffffffff),
+        }
+        for reason, suffix in invalid.items():
+            with self.subTest(reason=reason), self.assertRaises(ValueError):
+                data, layout = database({}, [effect("First", suffix=suffix)])
+                sgd5_effects.read_database(io.BytesIO(data), layout)
+
+    def test_declared_effect_count_must_consume_region(self):
+        item = effect("First")
+        original, layout = database({}, [item])
+        offset = original.index(item) - 4
+        for count in (0, 2):
+            with self.subTest(count=count), self.assertRaises(ValueError):
+                data = bytearray(original)
+                data[offset:offset + 4] = u32(count)
+                sgd5_effects.read_database(io.BytesIO(data), layout)
 
     def test_bad_framing_and_truncation(self):
         data, layout = database({0: ("Glow",)}, [effect("Vacant")])
@@ -184,6 +227,7 @@ class EffectsTest(unittest.TestCase):
             ("magic", 0, b"MOCK"),
             ("stored size", record + len(label("Glow")) + 1, u32(0xffffffff)),
             ("end marker", end, u32(2)),
+            ("extra marker in padding", end + 4, u32(1)),
         ]:
             with self.subTest(reason=reason):
                 damaged = bytearray(data)

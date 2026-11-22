@@ -21,6 +21,7 @@ from pathlib import Path
 import re
 import struct
 import sys
+from typing import NamedTuple
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from hashdict import joaat
@@ -104,70 +105,96 @@ def program_lists(data, pos, groups):
     return lists, pos
 
 
-def effect_headers(data, groups):
-    """Find counted native identifiers and validate all six arrays of database-local ordinals."""
-    for match in IDENTIFIER.finditer(data):
-        end = match.end()
-        # If the prefix itself looks like an identifier character, it is part
-        # of the regex match. The length byte decides where the label starts.
-        for start in range(max(0, match.start() - 1), end - 2):
-            if data[start] != end - start - 1 or not IDENTIFIER.fullmatch(data, start + 1, end):
-                continue
-            arrays = program_lists(data, end + 4, groups)  # the word following the name is opaque
-            if arrays is not None:
-                lists, pos = arrays
-                yield start, data[start + 1:end - 1].decode("ascii"), lists, pos
+def advance(data, pos, size):
+    if pos + size > len(data):
+        raise ValueError("effect field exceeds the database boundary")
+    return pos + size
 
 
-def string_pool(data, pos, end):
-    # The length excludes its own u32, includes the final NUL, and the pool
-    # ends at the next effect boundary (or just before the terminal marker).
-    found = []
-    for prefix in range(pos, end - 4):
-        if (u32(data, prefix) == end - prefix - 4 and data[prefix + 4] == data[end - 1] == 0
-                and POOL.fullmatch(data, prefix + 4, end)):
-            found.append(prefix)
-    if len(found) != 1:
-        raise ValueError(f"expected one string pool at effect boundary {end:#x}, found {len(found)}")
-    return found[0]
+def pool_after_passes(data, pos):
+    # Counted words, a marker and two length-prefixed byte blocks.
+    pos = advance(data, pos + 4, 4 * u32(data, pos))
+    if u32(data, pos) != 0x80000000:
+        raise ValueError("invalid post-pass marker")
+    pos += 4
+    for _ in range(2):
+        pos = advance(data, pos + 4, u32(data, pos))
+    # In 1.0.2.1 the observed entry counts fit in the low byte. Bits 8..23
+    # are zero, and the high byte can be nonzero. Payload meanings are unknown.
+    packed = u32(data, pos)
+    if packed & 0x00ffff00:
+        raise ValueError("unsupported packed post-pass count")
+    pos += 4
+    for _ in range(packed & 0xff):
+        tag = u32(data, pos)
+        pos = advance(data, pos + 4, 4 if tag == 0x80000000 else tag)
+    return pos
 
 
-def techniques(data, lists, pos, boundary):
+class Effect(NamedTuple):
+    start: int
+    name: str
+    lists: list
+    technique_rows: int
+    first_pass: int
+    pass_end: int
+    pool: int
+    end: int
+
+
+def effect_records(data, groups, count):
+    start = 0
+    for _ in range(count):
+        if start >= len(data):
+            raise ValueError("missing effect record")
+        name_end = advance(data, start + 1, data[start])
+        if not IDENTIFIER.fullmatch(data, start + 1, name_end):
+            raise ValueError("invalid counted effect name")
+        name = data[start + 1:name_end - 1].decode("ascii")
+        arrays = program_lists(data, name_end + 4, groups)  # word after the name is opaque
+        if arrays is None:
+            raise ValueError("invalid effect program lists")
+        lists, pos = arrays
+        pos = advance(data, pos, 80)
+        for width in (16, 24, 68, 36):
+            pos = advance(data, pos + 4, width * u32(data, pos))
+        rows = pos + 4
+        pass_count_at = advance(data, rows, 4 * u32(data, pos))
+        first = pass_count_at + 4
+        pass_end = advance(data, first, 24 * u32(data, pass_count_at))
+        pool = pool_after_passes(data, pass_end)
+        end = advance(data, pool + 4, u32(data, pool))
+        if (end == pool + 4 or data[pool + 4] != 0 or data[end - 1] != 0
+                or not POOL.fullmatch(data, pool + 4, end)):
+            raise ValueError("invalid counted string pool")
+        yield Effect(start, name, lists, rows, first, pass_end, pool, end)
+        start = end
+    if not 4 <= len(data) - start <= 4096 or u32(data, start) != 1 or any(data[start + 4:]):
+        raise ValueError("declared effects do not reach the database terminator and zero padding")
+
+
+def techniques(data, effect):
     """Yield the stored name and passes, including zero-program passes."""
-    pool = string_pool(data, pos, boundary)
-    names = {m.start() - pool - 4: m.group()[:-1].decode("ascii")
-             for m in STRING.finditer(data, pool + 4, boundary)}
-    pos += 80
-    for width in (16, 24, 68, 36):
-        if pos + 4 > pool:
-            raise ValueError("state table crosses the string pool")
-        pos += 4 + width * u32(data, pos)
-    if pos + 4 > pool:
-        raise ValueError("missing technique count")
-    count = u32(data, pos)
-    pass_count_at = pos + 4 + 4 * count
-    if pass_count_at + 4 > pool:
-        raise ValueError("technique rows cross the string pool")
-    cursor = pass_count_at + 4
-    pass_end = cursor + 24 * u32(data, pass_count_at)
-    if pass_end > pool:
-        raise ValueError("pass rows cross the string pool")
-    for name_bits, _, length in struct.iter_unpack("<HBB", data[pos + 4:pass_count_at]):
+    names = {m.start() - effect.pool - 4: m.group()[:-1].decode("ascii")
+             for m in STRING.finditer(data, effect.pool + 4, effect.end)}
+    cursor = effect.first_pass
+    rows = memoryview(data)[effect.technique_rows:cursor - 4]
+    for name_bits, _, length in struct.iter_unpack("<HBB", rows):
         name = names.get(name_bits & 0x7fff)
-        if name is None or cursor + 24 * length > pass_end:
+        if name is None or cursor + 24 * length > effect.pass_end:
             raise ValueError("invalid technique name offset or pass count")
         passes = []
         for _ in range(length):
             programs = []
             for group, selector in enumerate(data[cursor:cursor + 6]):
-                if selector > len(lists[group]):
+                if selector > len(effect.lists[group]):
                     raise ValueError("pass selector is outside the effect's program list")
                 if selector:
-                    programs.append((group, lists[group][selector - 1]))
+                    programs.append((group, effect.lists[group][selector - 1]))
             passes.append(programs)
             cursor += 24
         yield name, passes
-    if cursor != pass_end:
+    if cursor != effect.pass_end:
         raise ValueError("technique pass counts do not sum to the table count")
 
 
@@ -182,24 +209,19 @@ def read_database(stream, layout, effect=None, technique=None, *, list_effects=F
     base = stream.tell()
     if base >= end:
         raise ValueError("missing effect region")
-    region = stream.read(end - base)
-    tail = len(region.rstrip(b"\x00")) - 1
-    if len(region) != end - base or tail < 0 or region[tail] != 1 or not 4 <= len(region) - tail <= 4096:
-        raise ValueError("truncated effect region or invalid terminal marker")
-    data = region[:tail]
-    headers = list(effect_headers(data, groups))
-    if len(headers) != count or (headers and headers[0][0] != 0) or (not headers and data):
-        raise ValueError(f"found {len(headers)} effect headers for {count} declared effects")
+    data = stream.read(end - base)
+    if len(data) != end - base:
+        raise ValueError("truncated effect region")
     result = {"database": database, "groups": list(map(len, groups)), "effects": count,
               "named_effects": 0, "techniques": 0, "passes": 0, "matches": []}
-    ends = [header[0] for header in headers[1:]] + [len(data)]
-    for (start, name, lists, pos), boundary in zip(headers, ends):
+    for record in effect_records(data, groups, count):
+        name = record.name
         key = joaat(name)
         selected = name == effect or key == shader_hash
         if list_effects:
-            result["matches"].append({"effect": name, "shader_hash": f"{key:08X}", "effect_offset": base + start})
+            result["matches"].append({"effect": name, "shader_hash": f"{key:08X}", "effect_offset": base + record.start})
         listing = []
-        for index, (stored_name, passes) in enumerate(techniques(data, lists, pos, boundary)):
+        for index, (stored_name, passes) in enumerate(techniques(data, record)):
             result["named_effects"] += index == 0
             result["techniques"] += 1
             result["passes"] += len(passes)
@@ -210,10 +232,10 @@ def read_database(stream, layout, effect=None, technique=None, *, list_effects=F
             elif stored_name == technique:
                 resolved = [[program_identity(stream, g, ordinal, groups[g][ordinal]) for g, ordinal in row]
                             for row in passes]
-                result["matches"].append({"effect": name, "effect_offset": base + start,
+                result["matches"].append({"effect": name, "effect_offset": base + record.start,
                                           "technique_index": index, "passes": resolved})
         if selected and technique is None:
-            result["matches"].append({"effect": name, "effect_offset": base + start, "techniques": listing})
+            result["matches"].append({"effect": name, "effect_offset": base + record.start, "techniques": listing})
     return result
 
 
