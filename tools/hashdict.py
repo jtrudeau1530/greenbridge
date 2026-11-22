@@ -126,7 +126,8 @@ def main():
                 for fn in files:
                     strings.add(os.path.splitext(fn)[0])
         elif os.path.isfile(x):
-            harvest(open(x, "rb").read(), strings, a.min)
+            with open(x, "rb") as f:
+                harvest(f.read(), strings, a.min)
     d = {}
     for s in sorted(strings):
         d.setdefault(f"{joaat(s):08x}", s)

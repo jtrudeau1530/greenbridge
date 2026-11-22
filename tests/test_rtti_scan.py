@@ -260,6 +260,23 @@ class RttiScanCoreTest(unittest.TestCase):
         self.assertEqual(v1["offset_in_object"], 8)
         self.assertEqual(v1["slots"], 1)
 
+    def test_vtable_slots_stop_at_the_end_of_their_section(self):
+        rdata = bytearray(0x1000)
+        rdata[0x10:0x1D] = b".?AVProbe@@\x00\x00"
+        # The vtable's first slot ends at .rdata's declared VirtualSize (0x200).
+        struct.pack_into("<6I", rdata, 0x40, 1, 0, 0, 0x2000, 0, 0x2040)
+        struct.pack_into("<3Q", rdata, 0x1F0,
+                         self.image_base + 0x2040, self.image_base + 0x1000, self.image_base + 0x1008)
+        pe = bytearray(make_synthetic_pe(rdata_bytes=rdata))
+        section_virtual_size = 0x80 + 24 + 240 + 40 + 8
+        struct.pack_into("<I", pe, section_virtual_size, 0x200)
+        vtables = rtti_scan.scan_pe64_rtti(pe)["vtables"]
+        self.assertEqual(vtables, [{"rva": 0x21F8, "class": "Probe", "offset_in_object": 0, "slots": 1}])
+
+        # The same second code pointer is a real slot when the section extends to include it.
+        struct.pack_into("<I", pe, section_virtual_size, 0x208)
+        self.assertEqual(rtti_scan.scan_pe64_rtti(pe)["vtables"][0]["slots"], 2)
+
     def test_col_validation_rejects_corrupted_locators(self):
         rdata = bytearray(0x1000)
 

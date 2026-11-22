@@ -246,6 +246,20 @@ class TbufferDefaultFormat(unittest.TestCase):
                 self.assertEqual(got[0], 0x3F800000)
                 self.assertEqual(got, self.tload(0, ncomp, self.EXPLICIT)[:ncomp])
 
+    def test_packed_load_uses_instruction_format(self):
+        # The V# declares one u32. The instruction specifies four u8s at byte 4: EF BE AD DE.
+        expected = ((0x123400EF,), (0x00BE00EF,), (0x00BE00EF, 0xA9BC00AD), (0x00BE00EF, 0x00DE00AD))
+        for ncomp, want in enumerate(expected, 1):
+            with self.subTest(ncomp=ncomp):
+                got = load_format(FMT_U32, 4, ncomp, d16=True, op="tbuffer_load_format",
+                                  mods=" format:[BUF_FMT_8_8_8_8_UINT]")
+                self.assertEqual(got[:len(want)], want)
+
+    def test_packed_default_8_unorm(self):
+        # The first byte is 0xff: 1.0 in f16 is 0x3c00. Preserve the upper destination half.
+        got = load_format(FMT_U32, 0, 1, memory=self.MEM, d16=True, op="tbuffer_load_format")
+        self.assertEqual(got[0], 0x12343C00)
+
     def test_explicit_invalid_still_rejected(self):
         with self.assertRaises(rdna2spirv.Unsupported):
             self.tload(0, 1, " format:[BUF_FMT_INVALID]")
