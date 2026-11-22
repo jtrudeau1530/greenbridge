@@ -8,7 +8,9 @@ the Vulkan implementation, not that the shader results are correct. Value-level 
 
 The checker exits nonzero if a module fails to load, a pipeline fails to compile, or the requested final
 cache save fails. It still finishes checking the other entries and attempts the final save so the next run
-can reuse successful pipelines. Entries reported as skipped do not count as failures.
+can reuse successful pipelines. Before creating a Vulkan shader module, it checks that the file has a
+complete SPIR-V header, the SPIR-V magic word, and a whole number of 32-bit words. A rejected input
+module counts as a failure. A rejected partner stub is unavailable, so the affected pipeline is skipped.
 It also exits 2, before loading Vulkan, if `index.json` is missing, unreadable, empty or malformed, so a wrong
 directory can't pass as an empty corpus. A valid `{}` is an intentionally empty index.
 

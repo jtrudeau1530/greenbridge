@@ -42,6 +42,7 @@
 #include "vk_device_pick.h"
 #include "pipeline_cache_file.h"
 #include "pipeline_cache_snapshot.h"
+#include "../src/spirv_words.h"
 
 #include <algorithm>
 #include <atomic>
@@ -1144,13 +1145,13 @@ int main(int argc, char** argv) {
             auto it = stub_cache.find(fname);
             if (it != stub_cache.end()) return it->second;
         }
-        std::ifstream f(dir + "/stubs/" + fname, std::ios::binary);
-        std::vector<char> code((std::istreambuf_iterator<char>(f)), {});
+        std::ifstream f(dir + "/stubs/" + fname, std::ios::binary | std::ios::ate);
+        const auto code = leonida::read_spirv_words(f, f.tellg());
         VkShaderModule mod = VK_NULL_HANDLE;
         if (!code.empty()) {
             VkShaderModuleCreateInfo smi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
-            smi.codeSize = code.size();
-            smi.pCode = reinterpret_cast<const uint32_t*>(code.data());
+            smi.codeSize = code.size() * sizeof(code.front());
+            smi.pCode = code.data();
             if (vkCreateShaderModule(dev, &smi, nullptr, &mod) != VK_SUCCESS) mod = VK_NULL_HANDLE;
         }
         std::lock_guard<std::mutex> g(mu);
@@ -1288,13 +1289,13 @@ int main(int argc, char** argv) {
                 if (isolated) write_inflight();   // alone in flight: the file names exactly this module
             }
 
-            f.seekg(0);
-            std::vector<char> code((std::istreambuf_iterator<char>(f)), {});
+            const auto code = leonida::read_spirv_words(f, file_size);
             VkShaderModule sm = VK_NULL_HANDLE;
             bool mod_ok = false;
             if (!code.empty()) {
                 VkShaderModuleCreateInfo smi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
-                smi.codeSize = code.size(); smi.pCode = reinterpret_cast<const uint32_t*>(code.data());
+                smi.codeSize = code.size() * sizeof(code.front());
+                smi.pCode = code.data();
                 mod_ok = vkCreateShaderModule(dev, &smi, nullptr, &sm) == VK_SUCCESS;
             }
             {
