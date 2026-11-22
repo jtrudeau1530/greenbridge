@@ -1,6 +1,7 @@
 ; buffer_load_format_xy/xyz, tbuffer_load_format_xy/xyz and buffer_store_format_xy/xyz (TEST-185). Every expected
-; word was measured by running this body natively on a Radeon 680M (gfx1035, RDNA2) through tools/hw_oracle's kernel
+; word in the original fixture was measured by running its body natively on a Radeon 680M (gfx1035, RDNA2) through tools/hw_oracle's kernel
 ; wrapper, with s[0:3] set to the V# vk_compute_test passes; wave32 and wave64 gave the same 84 words. One thread runs.
+; The updated UINT store at 0x2a0 and all 84 current words were checked on gfx1036 in both wave sizes.
 ; - Loads write only their 2 or 3 VGPRs; the next ones keep 0x5a5a00xx. A missing channel repeats one the format has
 ;   (component c reads c mod n, SHADER-86): 32_32 xyz gives (x, y, x), 32 xy gives (x, x).
 ; - tbuffer loads take the instruction's format, not the V#'s.
@@ -271,9 +272,9 @@ s_mov_b32 s6, 0xffffffff
 s_mov_b32 s7, 0x31038fac
 v_mov_b32_e32 v5, 0x290
 buffer_store_format_xy v[20:21], v5, s[4:7], 0 offen
-; 0x2a0: buffer_store_format_xyz, 8_8_8_8_UINT
+; 0x2a0: buffer_store_format_xyz, 8_8_8_8_UINT; y = 258 saturates to 255
 v_mov_b32_e32 v20, 0x1
-v_mov_b32_e32 v21, 0x2
+v_mov_b32_e32 v21, 0x102
 v_mov_b32_e32 v22, 0x3
 s_mov_b32 s6, 0xffffffff
 s_mov_b32 s7, 0x3103cfac

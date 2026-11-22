@@ -206,6 +206,24 @@ class HandlerTest(unittest.TestCase):
         self.assertIn(b"<title>viewer</title>", body)
 
 
+class WorldArgumentTest(unittest.TestCase):
+    def test_explicit_world_must_be_a_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            missing = Path(tmp) / "missing"
+            file = Path(tmp) / "world.json"
+            file.write_text("{}", encoding="utf-8")
+            for path in (missing, file):
+                with self.subTest(path=path):
+                    result = subprocess.run(
+                        [sys.executable, "-I", str(VIEWER / "serve.py"), "--port", "0",
+                         "--world", str(path)],
+                        capture_output=True, text=True, timeout=5)
+                    self.assertEqual(result.returncode, 2)
+                    self.assertIn("--world", result.stderr)
+                    self.assertIn(str(path), result.stderr)
+                    self.assertNotIn("Traceback", result.stderr)
+
+
 class PortArgumentTest(unittest.TestCase):
     """--port is 0-65535; outside that it used to reach socketserver and raise OverflowError."""
 

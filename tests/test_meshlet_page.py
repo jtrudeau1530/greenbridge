@@ -324,6 +324,106 @@ class CliTests(unittest.TestCase):
             r = self.run_tool(path, "--quiet")
             self.assertEqual(r.returncode, 1)
 
+    def test_json_that_is_a_directory_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = os.path.join(tmp, "page.bin")
+            with open(source, "wb") as fh:
+                fh.write(page(block(4)))
+            r = self.run_tool(source, "--json", tmp, "--quiet")
+            self.assertEqual(r.returncode, 2, r.stderr)
+            self.assertIn("is a directory", r.stderr)
+            self.assertNotIn("Traceback", r.stderr)
+
+    def test_json_over_input_archive_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            rpf = os.path.join(tmp, "test.rpf")
+            data = b"9FPR" + struct.pack("<I", 16) + b"\0" * 8 + zlib.compress(page(block(4)))
+            with open(rpf, "wb") as fh:
+                fh.write(data)
+            alias = os.path.join(tmp, ".", "test.rpf")
+            r = self.run_tool(rpf, "--json", alias, "--quiet")
+            self.assertEqual(r.returncode, 2, r.stderr)
+            self.assertIn("would overwrite the input", r.stderr)
+            self.assertNotIn("Traceback", r.stderr)
+            with open(rpf, "rb") as fh:
+                self.assertEqual(fh.read(), data)
+
+    def test_json_over_input_file_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = os.path.join(tmp, "page.bin")
+            data = page(block(4))
+            with open(source, "wb") as fh:
+                fh.write(data)
+            r = self.run_tool(source, "--json", source, "--quiet")
+            self.assertEqual(r.returncode, 2, r.stderr)
+            self.assertIn("would overwrite the input", r.stderr)
+            self.assertNotIn("Traceback", r.stderr)
+            with open(source, "rb") as fh:
+                self.assertEqual(fh.read(), data)
+
+    def test_json_over_carve_dir_manifest_or_payload_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            carve = os.path.join(tmp, "carve")
+            os.mkdir(carve)
+            manifest = os.path.join(carve, "index.json")
+            with open(manifest, "w", encoding="utf-8") as fh:
+                fh.write('{"files": []}')
+            bin_path = os.path.join(carve, "0000.bin")
+            bin_data = page(block(4))
+            with open(bin_path, "wb") as fh:
+                fh.write(bin_data)
+
+            # Refuse overwrite of index.json
+            r = self.run_tool(carve, "--json", manifest, "--quiet")
+            self.assertEqual(r.returncode, 2, r.stderr)
+            self.assertIn("would overwrite the input", r.stderr)
+            self.assertNotIn("Traceback", r.stderr)
+            with open(manifest, "r", encoding="utf-8") as fh:
+                self.assertEqual(fh.read(), '{"files": []}')
+
+            # Refuse overwrite of carved .bin payload
+            r = self.run_tool(carve, "--json", bin_path, "--quiet")
+            self.assertEqual(r.returncode, 2, r.stderr)
+            self.assertIn("would overwrite the input", r.stderr)
+            self.assertNotIn("Traceback", r.stderr)
+            with open(bin_path, "rb") as fh:
+                self.assertEqual(fh.read(), bin_data)
+
+    def test_fresh_json_inside_carve_dir_is_allowed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            carve = os.path.join(tmp, "carve")
+            os.mkdir(carve)
+            bin_path = os.path.join(carve, "0000.bin")
+            with open(bin_path, "wb") as fh:
+                fh.write(page(block(4)))
+            out = os.path.join(carve, "report.json")
+            r = self.run_tool(carve, "--json", out, "--quiet")
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertTrue(os.path.isfile(out))
+            with open(out, "r", encoding="utf-8") as fh:
+                self.assertEqual(json.load(fh)["totals"]["pages"], 1)
+
+    def test_json_over_draw_system_inputs_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sys_path = os.path.join(tmp, "system.bin")
+            gfx_path = os.path.join(tmp, "graphics.bin")
+            with open(sys_path, "wb") as fh:
+                fh.write(b"\0" * 256)
+            with open(gfx_path, "wb") as fh:
+                fh.write(b"\0" * 256)
+
+            # Refuse overwrite of graphics segment
+            r = self.run_tool(gfx_path, "--draw-system", sys_path, "--geometry-offset", "0", "--json", gfx_path, "--quiet")
+            self.assertEqual(r.returncode, 2, r.stderr)
+            self.assertIn("would overwrite the input", r.stderr)
+            self.assertNotIn("Traceback", r.stderr)
+
+            # Refuse overwrite of system segment
+            r = self.run_tool(gfx_path, "--draw-system", sys_path, "--geometry-offset", "0", "--json", sys_path, "--quiet")
+            self.assertEqual(r.returncode, 2, r.stderr)
+            self.assertIn("would overwrite the input", r.stderr)
+            self.assertNotIn("Traceback", r.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -303,6 +303,14 @@ int main(int argc, char** argv) {
         if (rgb9e5_only) {
             D3D12_FEATURE_DATA_FORMAT_SUPPORT fs{DXGI_FORMAT_R9G9B9E5_SHAREDEXP};
             if (FAILED(ours->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &fs, sizeof(fs)))) return 1;
+            VkFormatProperties properties{};
+            auto query = vk.instance_fn<PFN_vkGetPhysicalDeviceFormatProperties>("vkGetPhysicalDeviceFormatProperties");
+            query(vk.physical, VK_FORMAT_E5B9G9R9_UFLOAT_PACK32, &properties);
+            const bool native_rtv = properties.optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT;
+            if (native_rtv != bool(fs.Support1 & D3D12_FORMAT_SUPPORT1_RENDER_TARGET)) {
+                std::fprintf(stderr, "RGB9E5 render-target support disagrees with the native attachment capability\n");
+                return 1;
+            }
             if (!(fs.Support1 & D3D12_FORMAT_SUPPORT1_RENDER_TARGET)) {
                 std::puts("RGB9E5 render targets unavailable on this adapter");
                 return 77;

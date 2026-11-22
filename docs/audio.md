@@ -76,8 +76,14 @@ The exporters ignore the remaining bytes.
 | `5` | XMA2 | `.xma.wav`, RIFF XMA2; ffmpeg decodes it to PCM WAV |
 
 Opus data is stored in 2048-byte blocks. Each block is a sequence of `[u16 length][packet]`; a zero length pads
-the rest of the block. The last Ogg page's granule is trimmed to the sample count declared in the format tag, so a
-decoder stops at the real end instead of the padded final frame.
+the rest of the block. The first 312 decoded samples are the encoder's lookahead (libopus at 48 kHz); the AWC does
+not store it, so the exporter writes that value as `OpusHead` pre-skip and sets the last page's granule to
+`pre-skip + declared samples`. Decoders then drop the priming and stop at the real end instead of the padded final
+frame. `--pre-skip` overrides the 312 default for a stream encoded with a different lookahead.
+
+The format tag's sample count is already in 48 kHz frames even when its rate field is 32 kHz, and a stereo count is
+interleaved across both channels. The exporter therefore does not scale it by the rate field and halves it for
+stereo; scaling a 32 kHz stream by 48000/32000 leaves up to a frame of padding untrimmed.
 
 Codec `5` is not handled by `tools/awc_opus.py`. `rpf9dump xma` writes it as RIFF XMA2, and ffmpeg does the decode.
 
@@ -115,7 +121,7 @@ count unchanged. Reading `samples` as a frame count produces a file that reports
 |---|---|
 | `rpf9dump audio <audio.rpf> <out>` | `<out>/audio/awc/<path>.awc` (the original banks) and `<out>/audio/audio_manifest.json` |
 | `rpf9dump xma <audio.rpf> <out>` | `<out>/audio/xma/<bank>/<stream id>.xma.wav` for every codec-5 stream |
-| `python -I tools/awc_opus.py <bank or dir> <out> [--jobs N]` | `<out>/<bank>/<stream id>.ogg`, or `.wav` for codec 0/2; `--jobs` processes that many banks at once |
+| `python -I tools/awc_opus.py <bank or dir> <out> [--jobs N] [--pre-skip N]` | `<out>/<bank>/<stream id>.ogg`, or `.wav` for codec 0/2; `--jobs` processes that many banks at once |
 | `python -I tools/audio_wav.py <ogg dir> --out <wav dir> [--jobs N]` | 16-bit PCM WAV mirroring the Ogg tree; `--jobs` ffmpeg processes at once |
 
 When exporting a directory, `awc_opus.py` keeps the path to each bank below the input root. For example,
@@ -215,6 +221,57 @@ resource is the only mission-side container not decoded; the retail track may be
 or patch content not covered by the public references; sub-30 s stings were not exhaustively
 fingerprinted. No game audio is stored in the repository; the searches ran on a local copy and
 `radio-dump-v3` was not modified.
+
+## Stream names
+
+The stream table stores only `joaat(lowercase name) & 0x1FFFFFFF`, so the exporters name files by id.
+`tools/awc_names.py` recovers names by hashing dictionary words against those ids. With about 1.8 million distinct
+ids in a 2^29 space, roughly 0.3% of arbitrary words collide by chance, so a hit is accepted only under one of two
+rules:
+
+| Rule | Accepted when |
+|---|---|
+| `dialogue` | the word is shaped like a dialogue wave, `<root>au_<4 letters>_<NN>`, and is in the dictionary exactly |
+| `family` | one base (a name without its trailing `_<number>`) hits ids in the same bank with several numbered suffixes (`''`, `_00`-`_40`, `_1`-`_9`): at least 3 members, or 2 with adjacent numbers. Every token of the base occurs in at least 5 dictionary words, and at least one member is itself a dictionary word |
+
+Each run repeats the attack with `zq` prepended to every word. Those names can't be right, so what the control
+accepts estimates the false names. Per source, the dialogue rule is kept only when its control is under 2% of its
+real count, and the family rule takes the smallest family size whose control is under 2%.
+
+The dictionary comes from two kinds of input:
+
+- `--words`: plain word lists, or a `hashdict.py` JSON (its values).
+- `--conversations`: conversation data, which pairs a dialogue key with its line labels as
+  `<ROOT>AU_<XXXX>\0<LABEL>\0`. A key with N distinct labels yields the waves `<key>_01` .. `<key>_<N>`. Wave `_01`
+  speaks the first label, `_02` the second, and so on. In 1.0.2.1 the pairs are in 594 carved `story000.rpf`
+  streams, 4 `shared_minigame000.rpf` streams and 2 `data.rpf` streams, and they give 136,788 wave names.
+
+Measured on the 1.0.2.1 package (2026-11-22). The dictionary is about 2.9 million harvested identifiers plus the
+conversation waves:
+
+| Archive | Banks | Distinct ids | Named | Dialogue | Family | Control (expected false) |
+|---|---:|---:|---:|---:|---:|---:|
+| `audio.rpf` | 7,162 | 1,606,237 | 92,043 | 0 | 92,043 | 352 |
+| `story000.rpf` | 63,861 | 234,458 | 172,781 | 119,492 | 53,289 | 62 |
+| `shared_minigame000.rpf` | 638 | 4,334 | 1,957 | 1,957 | 0 | 3 |
+
+`story000.rpf` is 73.7% named: dialogue is named almost entirely, because conversation data lists every key.
+`audio.rpf` is 5.7% named. Its sound effects, ambience and music have no list, so only numbered families are
+found. Adding 1,319 more dialogue words that exist only as harvested strings (not in any conversation pair) brings
+`story000.rpf` to 173,800. When two accepted families claim the same id in one bank (3 rows), the first family in
+sorted base order keeps it.
+
+The output names game files: keep it local, and do not commit it or attach it to an issue.
+
+```sh
+python -I tools/hashdict.py <carve dir> --out <temp>/hashes.json
+python -I tools/awc_names.py <work>/assets/audio/awc --words <temp>/hashes.json \
+    --conversations <carve dir>/story000 --out <temp>/awc_names.csv
+```
+
+Each positional source is reported and thresholded on its own. A source is a directory of `.awc` banks, a single
+bank, or an `audio_manifest.json` from `rpf9dump audio` (read without opening the banks). Pure Python; the run above
+took about 3 minutes on one core.
 
 ## Never commit or share extracted audio
 

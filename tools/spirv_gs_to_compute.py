@@ -174,6 +174,7 @@ def rewrite(text):
         return f"%gsc_t{count}"
 
     out = []
+    entry_label = None
     state = "header"        # header -> body (in main, entry block) -> after the entry check
     for ln in text.splitlines():
         s = ln.strip()
@@ -208,6 +209,7 @@ def rewrite(text):
             state = "other"
         if state == "main_entry" and re.match(r"%\w+ = OpLabel$", s):
             state = "main_vars"
+            entry_label = s.split()[0]
             out.append(ln)
             continue
         if state == "main_vars" and not re.match(r"%\w+ = OpVariable ", s):
@@ -225,6 +227,14 @@ def rewrite(text):
             out.append(ln)
             continue
         # ---- the body of main ----
+        # The primitive-count check splits the entry block: what followed its variables now sits in %gsc_body, so
+        # an OpPhi naming the entry label as a predecessor names %gsc_body instead.
+        m = re.match(r"(%\w+ = OpPhi %\w+) (.*)$", s)
+        if m:
+            ops = m.group(2).split()
+            ops[1::2] = ["%gsc_body" if lbl == entry_label else lbl for lbl in ops[1::2]]
+            s = f"{m.group(1)} {' '.join(ops)}"
+            ln = s
         m = re.match(r"(%\w+) = OpAccessChain (%\w+) (%\w+) (.*)$", s)
         if m and m.group(3) in in_slot:
             idx = m.group(4).split()
@@ -316,4 +326,8 @@ def main(argv):
 
 
 if __name__ == "__main__":
+    try:  # a redirected stdout is strict ANSI code page under -I; write '?' for what it cannot encode
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
     sys.exit(main(sys.argv))

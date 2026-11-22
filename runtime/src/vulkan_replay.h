@@ -75,6 +75,8 @@ struct ResourceBinding {
     bool volume = false;               // one array layer, including at mips with a single slice
     std::uint32_t samples = 1;         // more than one: a multisampled 2D texture
     bool rgba8_typeless = false;       // Original resource was R8G8B8A8_TYPELESS; views may reinterpret it.
+    bool castable_view_formats = false;  // A creation-time castable list made the image mutable (D3D-85/D3D-90),
+                                         // so views may reinterpret it as typeless resources do.
     // D24_UNORM_S8_UINT stored as D32_SFLOAT_S8_UINT (the GPU has no D24): footprint copies of the depth plane convert
     // (depth24.h) and clears quantise to 24 bits.
     bool depth24_as_float = false;
@@ -707,6 +709,8 @@ struct ReplayFunctions {
     PFN_vkCmdEndQuery end_query = nullptr;
     PFN_vkCmdWriteTimestamp write_timestamp = nullptr;
     PFN_vkCmdCopyQueryPoolResults copy_query_pool_results = nullptr;
+    std::function<void(VkCommandBuffer, VkQueryPool, std::uint32_t, std::uint32_t, VkBuffer, VkDeviceSize)>
+        sum_occlusion;
     PFN_vkCmdBindPipeline bind_pipeline = nullptr;              // dispatches
     PFN_vkCmdPushConstants push_constants = nullptr;
     PFN_vkCmdBindDescriptorSets bind_descriptor_sets = nullptr;  // set 0 of pipelines that declare bindings
@@ -731,8 +735,6 @@ struct ReplayFunctions {
     VkDeviceSize zero_offset = 0;
     VkDeviceSize zero_size = 0;
     std::uint64_t heap_base = 0;  // device address of the GPU address arena (push-constant dwords 32-33)
-    std::function<void(VkCommandBuffer, VkQueryPool, std::uint32_t, std::uint32_t, VkBuffer, VkDeviceSize)>
-        sum_occlusion;
     // Resolves available binary-occlusion queries to 64-bit 0/1 values, outside conditional rendering.
     std::function<void(VkCommandBuffer, VkQueryPool, std::uint32_t first, std::uint32_t count,
                        VkBuffer dst, VkDeviceSize offset)> resolve_binary_occlusion;
@@ -903,7 +905,9 @@ inline VkClearColorValue render_target_clear_color(VkFormat format, const ClearC
     return value;
 }
 
-// Only the RGBA8 family is explicitly reinterpreted here. Legacy views retain their resource format.
+// Only the RGBA8 family is explicitly reinterpreted here. Legacy views retain their resource format. A typeless
+// resource or one created with a castable-format list (its image is mutable and lists the view formats) may be
+// reinterpreted; the reinterpretation itself is the UNORM image's.
 inline VkFormat color_view_format(const ResourceBinding& resource, const TargetView& target) {
     if (target.format == ColorViewFormat::resource)
         return resource.rgba8_typeless ? VK_FORMAT_UNDEFINED : resource.format;
@@ -912,9 +916,12 @@ inline VkFormat color_view_format(const ResourceBinding& resource, const TargetV
     case ColorViewFormat::rgba8_unorm: format = VK_FORMAT_R8G8B8A8_UNORM; break;
     case ColorViewFormat::rgba8_srgb: format = VK_FORMAT_R8G8B8A8_SRGB; break;
     case ColorViewFormat::rgba8_uint: format = VK_FORMAT_R8G8B8A8_UINT; break;
+    case ColorViewFormat::rgba8_sint: format = VK_FORMAT_R8G8B8A8_SINT; break;
+    case ColorViewFormat::rgba8_snorm: format = VK_FORMAT_R8G8B8A8_SNORM; break;
     default: return VK_FORMAT_UNDEFINED;
     }
-    if (!resource.rgba8_typeless) return format == resource.format ? format : VK_FORMAT_UNDEFINED;
+    if (!resource.rgba8_typeless && !resource.castable_view_formats)
+        return format == resource.format ? format : VK_FORMAT_UNDEFINED;
     if (resource.format != VK_FORMAT_R8G8B8A8_UNORM || resource.volume || resource.depth != 1 || resource.samples != 1)
         return VK_FORMAT_UNDEFINED;
     return format;
@@ -1922,7 +1929,7 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                     job.to_float = upload;
                     job.app = buffer.buffer;
                     job.app_offset = region.bufferOffset;
-                    job.app_size = buffer.size;
+                    job.app_size = buffer.buffer_offset + buffer.size;
                     job.width = region.imageExtent.width;
                     job.height = region.imageExtent.height;
                     job.slices = region.imageExtent.depth;
@@ -2742,9 +2749,10 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                 }
             }
         } else if (const auto* build = std::get_if<BuildAccelerationStructure>(&command)) {
-            // Build inputs and scratch are named by console VA: heap_base + VA is the device address, in the arena
-            // or not (section 3.3). 0 stays 0 (no index buffer, no transform). With no arena heap_base is 0.
-            const auto address = [&](std::uint64_t va) -> VkDeviceAddress { return va ? vk.heap_base + va : 0; };
+            // The build's addresses are console VAs into the GPU address arena (heap_base is its device address).
+            // A null VA (no index buffer, no transform) stays null: heap_base + 0 would name the arena's zero page.
+            const VkDeviceSize heap_base = vk.heap_base;
+            const auto addr = [&](std::uint64_t va) -> VkDeviceAddress { return va ? heap_base + va : 0; };
             std::vector<VkAccelerationStructureGeometryKHR> geoms;
             std::vector<VkAccelerationStructureBuildRangeInfoKHR> ranges;
             if (build->is_tlas) {
@@ -2752,7 +2760,7 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                 g.geometryType = VK_GEOMETRY_TYPE_INSTANCES_KHR;
                 g.geometry.instances.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_INSTANCES_DATA_KHR;
                 g.geometry.instances.arrayOfPointers = VK_FALSE;
-                g.geometry.instances.data.deviceAddress = address(build->instances_va);
+                g.geometry.instances.data.deviceAddress = addr(build->instances_va);
                 geoms.push_back(g);
                 ranges.push_back({build->instance_count, 0, 0, 0});
             } else {
@@ -2765,14 +2773,14 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                     auto& tr = g.geometry.triangles;
                     tr.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR;
                     tr.vertexFormat = static_cast<VkFormat>(t.vertex_format);
-                    tr.vertexData.deviceAddress = address(t.vertex_va);
+                    tr.vertexData.deviceAddress = addr(t.vertex_va);
                     tr.vertexStride = t.vertex_stride;
                     tr.maxVertex = t.vertex_count ? (t.vertex_count - 1u) : 0u;
                     tr.indexType = (t.index_type == 1)
                                        ? VK_INDEX_TYPE_UINT16
                                        : ((t.index_type == 2) ? VK_INDEX_TYPE_UINT32 : VK_INDEX_TYPE_NONE_KHR);
-                    tr.indexData.deviceAddress = address(t.index_va);
-                    tr.transformData.deviceAddress = address(t.transform_va);
+                    tr.indexData.deviceAddress = addr(t.index_va);
+                    tr.transformData.deviceAddress = addr(t.transform_va);
                     geoms.push_back(g);
                     const std::uint32_t prim_count =
                         (t.index_type != 0 && t.index_count >= 3) ? (t.index_count / 3u) : (t.vertex_count / 3u);
@@ -2790,7 +2798,7 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             info.dstAccelerationStructure = p.accel_dst;
             info.geometryCount = static_cast<std::uint32_t>(geoms.size());
             info.pGeometries = geoms.data();
-            info.scratchData.deviceAddress = address(build->scratch_va);
+            info.scratchData.deviceAddress = addr(build->scratch_va);
             const VkAccelerationStructureBuildRangeInfoKHR* range_ptr = ranges.data();
             vk.build_acceleration_structures(command_buffer, 1, &info, &range_ptr);
         } else if (const auto* dispatch = std::get_if<Dispatch>(&command)) {

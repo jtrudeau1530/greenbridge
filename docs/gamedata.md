@@ -830,6 +830,32 @@ distribution over the listed channels (independent chances or weights would fit)
 Not measured here (hypothesis): which texture channel numbering `Channel` uses, and how `VehSpawnIntensities`
 are chosen at spawn.
 
+## Entity component sets and component LOD
+
+Four documents describe which runtime components an entity gets and how far away each stays alive. Counts only;
+no set or type names.
+
+| Root | Content |
+|---|---|
+| `CEntityComponentLodManagerData` | `EntityComponentCounts/Components/Item` x 33: `Type` (33 distinct) and `DesiredCount` (0 to 250, 2,684 in total; one type is 0), plus optional distance-scale factors for not-visible (5 and 2 items), interior (1) and deep-interior (1) entities and per-frame create/remove limits (4 and 2) |
+| `CVehicleComponentSetManager` | 7 `CVehicleComponentSetInfo` sets with 11 to 14 components each (90 in all): `Type`, `MinDistance`, `MaxDistance` |
+| `CPedComponentSetManager` | 15 `CPedComponentSetInfo` sets with 8 to 17 components each (173 in all), plus feature flags: `HasFacial` (true in 12), `HasRagdollConstraints` (13), `HasLookAt` (10), `HasInventory` (8), `HasPhone` (2), `HasReins` (1), `HasDistraction` (2 of 3 sets that carry it), `IsRidable` (false in all 15) |
+| `CObjectComponentSetManager` | 1 `CObjectComponentSetInfo` set with an empty component list |
+
+Each manager has a `DefaultSet ref`, and all three refs name one of their own sets.
+
+**The component types form one closed list.** Vehicle sets use 14 distinct `Type`s and ped sets 18, with none
+in common, and every one of the 32 is among the 33 types of `CEntityComponentLodManagerData`; only one LOD-manager
+type is used by no set. So a runtime can treat the LOD manager's list as the component registry, with
+`DesiredCount` as the pool size per type.
+
+**Distances.** `MinDistance <= MaxDistance` in all 263 components. Vehicle components reach up to 3,000 units
+and ped components up to 200 (both medians 100); the natural reading is the range within which the component is kept
+alive.
+
+Not measured here (hypothesis): whether the distances are metres from the camera or the player, and what the
+not-visible and interior scale factors multiply.
+
 ## No-sharing rule
 
 The archive, every carved `.bin`, `index.json` (its `head`/`pre` fields contain payload bytes), XML

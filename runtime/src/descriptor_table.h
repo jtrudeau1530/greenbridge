@@ -207,8 +207,9 @@ public:
 
     // `count` consecutive slots' 10 dwords each to `dest`, under one lock; false when any is out of range.
     bool read_slots(std::uint32_t first, std::uint32_t count, std::uint32_t* dest) const {
+        if (count > 0 && !dest) return false;
         std::lock_guard lock(mutex_);
-        if (first + count > entries_.size()) return false;
+        if (first > entries_.size() || count > entries_.size() - first) return false;
         for (std::uint32_t i = 0; i < count; ++i) {
             const DescriptorEntry& entry = entries_[first + i];
             std::memcpy(dest + i * 10, entry.key, sizeof(entry.key));
@@ -218,10 +219,21 @@ public:
         return true;
     }
 
+    // Serializes directly into `dest` (must hold at least size_bytes()) without allocating a temporary vector.
     void write_to_buffer(void* dest, bool clear_pad = false) const {
         if (!dest) return;
-        const auto buf = build_gpu_buffer(clear_pad);
-        std::memcpy(dest, buf.data(), buf.size() * sizeof(std::uint32_t));
+        std::lock_guard lock(mutex_);
+        auto* out = static_cast<std::uint8_t*>(dest);
+        std::memcpy(out, &mask_, sizeof(mask_));
+        out += sizeof(mask_);
+        for (const auto& entry : entries_) {
+            std::uint32_t slot[10];
+            std::memcpy(slot, entry.key, sizeof(entry.key));
+            slot[8] = entry.index;
+            slot[9] = clear_pad ? 0 : entry.pad;
+            std::memcpy(out, slot, sizeof(slot));
+            out += sizeof(slot);
+        }
     }
 
 private:

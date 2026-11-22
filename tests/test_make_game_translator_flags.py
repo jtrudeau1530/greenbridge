@@ -150,13 +150,14 @@ class RecordedFlagsTest(unittest.TestCase):
 class MainWiringTest(unittest.TestCase):
     """main() parses the four flags and hands the same tuple to preflight() and shaders()."""
 
-    def run_main(self, *extra_argv):
+    def run_main(self, *extra_argv, per_vertex=None):
         argv = ["make_game.py", "--stages", "shaders", *extra_argv]
         with mock.patch.object(sys, "argv", argv), \
                 mock.patch("make_game.below_normal"), \
                 mock.patch("make_game.choose_game", return_value=os.path.abspath("C:/dummy_game")), \
                 mock.patch("make_game.check", return_value={"expected_exe": "game.exe"}), \
                 mock.patch("make_game.wave64_emulate", return_value=False), \
+                mock.patch("make_game.runtime_gpu_per_vertex", return_value=per_vertex), \
                 mock.patch("make_game.preflight") as preflight, \
                 mock.patch("make_game.shaders") as shaders, \
                 mock.patch("make_game.log"):
@@ -172,6 +173,13 @@ class MainWiringTest(unittest.TestCase):
         pre, sh = self.run_main()
         self.assertEqual(pre, ())
         self.assertEqual(sh, ())
+
+    def test_f16_interp_fallback_follows_the_device(self):
+        """On by itself where vk_subgroup_info says the GPU can't take PerVertexKHR inputs (MoltenVK), not where
+        it can or can't tell; asked for explicitly, it is on everywhere."""
+        self.assertEqual(self.run_main(per_vertex=False), (("--f16-interp-fallback",),) * 2)
+        self.assertEqual(self.run_main(per_vertex=True), ((), ()))
+        self.assertEqual(self.run_main("--f16-interp-fallback", per_vertex=True), (("--f16-interp-fallback",),) * 2)
 
 
 if __name__ == "__main__":

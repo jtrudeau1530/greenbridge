@@ -419,6 +419,36 @@ class OutputTest(unittest.TestCase):
         finally:
             os.umask(old)
 
+    def _run_cli(self, *argv):
+        tool = os.path.join(ROOT, "tools", "rbf0_tree.py")
+        return subprocess.run([sys.executable, "-I", tool, *argv, "--quiet"], capture_output=True, text=True)
+
+    def test_out_or_csv_over_the_source_file_is_refused(self):
+        source = os.path.join(self.root, "resource.bin")
+        blob = wide_blob()
+        with open(source, "wb") as f:
+            f.write(blob)
+        other = os.path.join(self.root, "tree.json")
+        for argv in ((source, os.path.join(self.root, ".", "resource.bin")),
+                     (source, other, "--csv", source)):
+            with self.subTest(argv=argv):
+                result = self._run_cli(*argv)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn("would overwrite the source", result.stderr)
+                self.assertNotIn("Traceback", result.stderr)
+                with open(source, "rb") as f:
+                    self.assertEqual(f.read(), blob)
+        self.assertFalse(os.path.exists(other))
+
+    def test_out_and_csv_on_the_same_file_are_refused(self):
+        with open(os.path.join(self.root, "00000000.bin"), "wb") as f:
+            f.write(wide_blob())
+        out = os.path.join(self.root, "reports", "tree.json")
+        result = self._run_cli(self.root, out, "--csv", out)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("must be different files", result.stderr)
+        self.assertFalse(os.path.exists(out))
+
     def test_root_filter_and_limit(self):
         with open(os.path.join(self.root, "00000000.bin"), "wb") as f:
             f.write(wide_blob())
