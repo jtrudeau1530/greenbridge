@@ -415,9 +415,27 @@ struct DeviceState {
         std::uint8_t* mapped = nullptr;
         VkDeviceAddress address = 0;
         VkDeviceSize size = 0;
+        std::uint32_t memory_type = 0;
         std::mutex mutex;
         std::map<VkDeviceSize, VkDeviceSize> free;  // offset -> size
     } arena;
+
+    std::uint32_t sparse_buffer_memory_types = 0;
+
+    bool tiles_share_arena() const { return (sparse_buffer_memory_types & (1u << arena.memory_type)) != 0; }
+
+    VkBufferCreateInfo sparse_buffer_info(VkDeviceSize bytes) const {
+        VkBufferCreateInfo result{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+        result.size = bytes;
+        result.flags = VK_BUFFER_CREATE_SPARSE_BINDING_BIT | VK_BUFFER_CREATE_SPARSE_RESIDENCY_BIT |
+                       VK_BUFFER_CREATE_SPARSE_ALIASED_BIT;
+        result.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                       VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
+                       VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                       VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+        if (info.conditional_rendering) result.usage |= VK_BUFFER_USAGE_CONDITIONAL_RENDERING_BIT_EXT;
+        return result;
+    }
 
     // A zero-size range is refused: it would share its offset with the next range, and its release would collide
     // with that range's free entry. The fit test cannot wrap: free blocks lie inside the arena (below 4 GiB).
@@ -929,7 +947,7 @@ struct DeviceState {
     // memory came from.
     VkDeviceMemory allocate(const VkMemoryRequirements& requirements, VkMemoryPropertyFlags required,
                             VkMemoryPropertyFlags preferred, VkMemoryPropertyFlags* chosen = nullptr,
-                            bool device_address = false) const {
+                            bool device_address = false, std::uint32_t* chosen_type = nullptr) const {
         VkMemoryAllocateFlagsInfo flags_info{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO};
         flags_info.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
         for (const std::uint32_t i :
@@ -941,6 +959,7 @@ struct DeviceState {
             VkDeviceMemory out = VK_NULL_HANDLE;
             if (context->vk.vkAllocateMemory(info.device, &allocate, nullptr, &out) == VK_SUCCESS) {
                 if (chosen) *chosen = memory.memoryTypes[i].propertyFlags;
+                if (chosen_type) *chosen_type = i;
                 return out;
             }
         }
@@ -1363,6 +1382,33 @@ public:
                                   heap_.CPUPageProperty == D3D12_CPU_PAGE_PROPERTY_WRITE_BACK));
         binding.va = va_;
         device_.context->add_resource(id(), binding);
+        return S_OK;
+    }
+
+    HRESULT create_sparse_buffer() {
+        constexpr std::uint64_t tile_bytes = leonida::tile_size_in_bytes;
+        if (!desc_.Width || desc_.Width > UINT64_MAX - tile_bytes ||
+            desc_.SampleDesc.Count != 1 || desc_.SampleDesc.Quality != 0) return E_INVALIDARG;
+        auto& vk = device_.context->vk;
+        auto sparse = std::make_shared<leonida::SparseBuffer>(device_.info.device, vk.vkDestroyBuffer);
+        sparse->tile_count = (desc_.Width + tile_bytes - 1) / tile_bytes;
+        const auto info = device_.sparse_buffer_info(sparse->tile_count * tile_bytes);
+        if (vk.vkCreateBuffer(device_.info.device, &info, nullptr, &sparse->buffer) != VK_SUCCESS)
+            return E_OUTOFMEMORY;
+        VkMemoryRequirements requirements{};
+        vk.vkGetBufferMemoryRequirements(device_.info.device, sparse->buffer, &requirements);
+        sparse->memory_types = requirements.memoryTypeBits;
+        if (tile_bytes % requirements.alignment ||
+            !(sparse->memory_types & device_.sparse_buffer_memory_types)) return E_NOTIMPL;
+        VkBufferDeviceAddressInfo address{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
+        address.buffer = sparse->buffer;
+        va_ = vk.vkGetBufferDeviceAddress(device_.info.device, &address) - device_.arena.address;
+        leonida::ResourceBinding binding{};
+        binding.buffer = sparse->buffer;
+        binding.size = desc_.Width;
+        binding.va = va_;
+        binding.sparse_buffer = true;
+        device_.context->add_sparse_buffer(id(), binding, std::move(sparse));
         return S_OK;
     }
 
@@ -1950,28 +1996,67 @@ public:
     static constexpr GUID kTag{0x5d20c7a4, 0x8e13, 0x4b6d, {0x9f, 0x27, 0x3a, 0x1c, 0x94, 0xe0, 0xb7, 0xd8}};
 
     Heap(DeviceState& device, const D3D12_HEAP_DESC& desc) : device_(device), desc_(desc) {
-        reserved_ = device_.arena.mapped &&
-                    device_.arena_allocate(desc_.SizeInBytes, D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT, offset_);
-    }
-
-    ~Heap() override {
-        if (reserved_) device_.arena_release(offset_, desc_.SizeInBytes);
+        VkDeviceSize offset = 0;
+        if (device_.arena.mapped &&
+            device_.arena_allocate(desc_.SizeInBytes, D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT, offset)) {
+            allocation_ = std::shared_ptr<const leonida::TileHeapAllocation>(
+                new leonida::TileHeapAllocation{device_.arena.memory, offset, desc_.SizeInBytes,
+                                                device_.arena.memory_type},
+                [&device](const leonida::TileHeapAllocation* allocation) {
+                    device.arena_release(allocation->offset, allocation->size);
+                    delete allocation;
+                });
+        }
     }
 
     D3D12_HEAP_DESC STDMETHODCALLTYPE GetDesc() override { return desc_; }
 
-    bool reserved() const { return reserved_; }
-    VkDeviceSize offset() const { return offset_; }
+    bool reserved() const { return bool(allocation_); }
+    VkDeviceSize offset() const { return allocation_->offset; }
     UINT64 bytes() const { return desc_.SizeInBytes; }
     UINT64 alignment() const { return desc_.Alignment ? desc_.Alignment : D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT; }
     const D3D12_HEAP_PROPERTIES& properties() const { return desc_.Properties; }
     D3D12_HEAP_FLAGS flags() const { return desc_.Flags; }
+    std::shared_ptr<const leonida::TileHeapAllocation> tiles(const leonida::VulkanContext& context) {
+        if (device_.context.get() != &context || desc_.Properties.Type != D3D12_HEAP_TYPE_DEFAULT ||
+            (desc_.Flags & D3D12_HEAP_FLAG_DENY_BUFFERS) || !device_.sparse_buffer_memory_types) return {};
+        if (device_.tiles_share_arena()) return allocation_;
+        std::lock_guard lock(backing_mutex_);
+        if (placed_buffer_) return {};
+        if (!tile_allocation_) {
+            std::uint32_t memory_type = 0;
+            const VkMemoryRequirements requirements{desc_.SizeInBytes, leonida::tile_size_in_bytes,
+                                                    device_.sparse_buffer_memory_types};
+            const auto memory = device_.allocate(requirements, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0,
+                                                  nullptr, true, &memory_type);
+            if (!memory) return {};
+            tile_allocation_ = std::shared_ptr<const leonida::TileHeapAllocation>(
+                new leonida::TileHeapAllocation{memory, 0, desc_.SizeInBytes, memory_type},
+                [device = device_.info.device, free = device_.context->vk.vkFreeMemory]
+                (const leonida::TileHeapAllocation* allocation) {
+                    free(device, allocation->memory, nullptr);
+                    delete allocation;
+                });
+        }
+        return tile_allocation_;
+    }
+
+    bool use_as_placed_buffer(bool create) {
+        std::lock_guard lock(backing_mutex_);
+        // Some drivers only accept non-host-visible local memory for sparse buffers. A heap that uses this
+        // separate backing cannot also expose the arena's bytes as though they were the same allocation.
+        if (tile_allocation_) return false;
+        placed_buffer_ |= create;
+        return true;
+    }
 
 private:
     DeviceState& device_;
     D3D12_HEAP_DESC desc_;
-    VkDeviceSize offset_ = 0;
-    bool reserved_ = false;
+    std::shared_ptr<const leonida::TileHeapAllocation> allocation_;
+    std::mutex backing_mutex_;
+    std::shared_ptr<const leonida::TileHeapAllocation> tile_allocation_;
+    bool placed_buffer_ = false;
 };
 
 // Among index entries for one program (containers with the same FSSM program; 789 groups in the 26,503-shader
@@ -3178,6 +3263,22 @@ public:
             if (!state_.context->debug_labels())
                 std::fprintf(stderr, "[rt] d3d12: VK_EXT_debug_utils entry points missing; debug markers are off\n");
         }
+
+        if (state_.arena.memory && state_.context->vk.vkQueueBindSparse &&
+            info.features.sparseBinding && info.features.sparseResidencyBuffer && info.features.sparseResidencyAliased &&
+            properties.sparseProperties.residencyNonResidentStrict && info.queue_family < family_count &&
+            (families[info.queue_family].queueFlags & VK_QUEUE_SPARSE_BINDING_BIT)) {
+            auto& vk = state_.context->vk;
+            const auto sparse_info = state_.sparse_buffer_info(leonida::tile_size_in_bytes);
+            VkBuffer sample = VK_NULL_HANDLE;
+            if (vk.vkCreateBuffer(info.device, &sparse_info, nullptr, &sample) == VK_SUCCESS) {
+                VkMemoryRequirements requirements{};
+                vk.vkGetBufferMemoryRequirements(info.device, sample, &requirements);
+                vk.vkDestroyBuffer(info.device, sample, nullptr);
+                if (!(leonida::tile_size_in_bytes % requirements.alignment))
+                    state_.sparse_buffer_memory_types = requirements.memoryTypeBits;
+            }
+        }
     }
 
     // Set 0 of every translated shader that declares bindings: images, samplers and the descriptor hash table
@@ -3284,7 +3385,7 @@ public:
         vk.vkGetBufferMemoryRequirements(state_.info.device, arena.buffer, &requirements);
         arena.memory = state_.allocate(requirements,
                                        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-                                       VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, nullptr, true);
+                                       VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, nullptr, true, &arena.memory_type);
         void* mapped = nullptr;
         if (!arena.memory || vk.vkBindBufferMemory(state_.info.device, arena.buffer, arena.memory, 0) != VK_SUCCESS ||
             vk.vkMapMemory(state_.info.device, arena.memory, 0, VK_WHOLE_SIZE, 0, &mapped) != VK_SUCCESS) {
@@ -4351,11 +4452,8 @@ public:
                                                             out));
     }
 
-    // Reserved (tiled) resources, for the first boot (docs/d3d12_vulkan.md section 4.2): the whole resource is
-    // reserved linearly and backed at creation, as a committed resource on a default heap would be. Tile mappings
-    // are not emulated (queue UpdateTileMappings and CopyTileMappings log and do nothing), so every tile reads and
-    // writes its own memory; unmapped tiles start zeroed, as D3D12 tier 2 reads them. The rules for the description
-    // are D3D12's: buffers are ROW_MAJOR, textures 64KB_UNDEFINED_SWIZZLE in a format with a tile shape
+    // Reserved buffers use sparse binding where available. Textures and fallback buffers are fully backed.
+    // The description rules are D3D12's: buffers are ROW_MAJOR, textures 64KB_UNDEFINED_SWIZZLE with a tile shape
     // (64KB_STANDARD_SWIZZLE needs StandardSwizzle64KBSupported, which CheckFeatureSupport reports as FALSE). The
     // Xbox tiled layout word 0x101 (slot 76, section 4.2) is accepted as 64KB_UNDEFINED_SWIZZLE; that the console
     // uses it for reserved resources too is an assumption.
@@ -4599,6 +4697,10 @@ public:
             } else if (heap_offset >= heap->bytes()) {
                 return E_INVALIDARG;
             }
+        }
+        if (desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER && !heap->use_as_placed_buffer(out != nullptr)) {
+            log_once("placed buffer refused: heap uses a separate allocation for sparse tiles", 1);
+            return E_NOTIMPL;
         }
         // Only buffers are addressable, as in D3D12: a placed texture keeps a null VA and its own Vulkan image.
         const VkDeviceSize placed_va = desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? heap->offset() + heap_offset : 0;
@@ -5578,7 +5680,7 @@ private:
             log_once("calibrated timestamps lack the DEVICE or QueryPerformanceCounter domain; domains:", int(count));
     }
 
-    // D3D12's layout rules for a reserved resource, then a committed resource on a default heap under it.
+    // D3D12's layout rules for reserved resources. Buffers use sparse storage when supported.
     HRESULT create_reserved(const D3D12_RESOURCE_DESC* desc, REFIID riid, void** out) {
         if (out) *out = nullptr;
         if (!desc) return E_INVALIDARG;
@@ -5603,8 +5705,20 @@ private:
         }
         const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
         ID3D12Resource* resource = nullptr;
-        HRESULT hr = CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &backing, D3D12_RESOURCE_STATE_COMMON,
-                                             nullptr, IID_PPV_ARGS(&resource));
+        HRESULT hr;
+        if (desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER && state_.sparse_buffer_memory_types) {
+            auto* sparse = new Resource(state_, backing, heap, D3D12_HEAP_FLAG_NONE);
+            sparse->attach_device(identity());
+            hr = sparse->create_sparse_buffer();
+            if (FAILED(hr)) {
+                sparse->Release();
+                return hr;
+            }
+            resource = sparse;
+        } else {
+            hr = CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &backing, D3D12_RESOURCE_STATE_COMMON,
+                                         nullptr, IID_PPV_ARGS(&resource));
+        }
         if (FAILED(hr)) return hr;
         Resource::from<Resource>(resource)->make_reserved(desc->Layout);
         if (!out) {  // a capability check: D3D12 allows a null output
@@ -5716,6 +5830,11 @@ HRESULT create_vulkan_device(const VulkanDeviceInfo& info, REFIID riid, void** o
         return E_FAIL;
     }
     return hand_out(device, riid, out);
+}
+
+std::shared_ptr<const leonida::TileHeapAllocation> tile_heap(ID3D12Heap* heap, const leonida::VulkanContext& context) {
+    auto* object = Heap::from<Heap>(heap);
+    return object ? object->tiles(context) : nullptr;
 }
 
 void set_device_outer(ID3D12Device* device, IUnknown* outer) {
@@ -5858,6 +5977,11 @@ bool device_upload_in_vram(ID3D12Device* device) {
     if (!real) real = device;
     if (auto* d = Device::from<Device>(real)) return d->upload_in_vram();
     return false;
+}
+
+bool device_sparse_buffer_tiles(ID3D12Device* device) {
+    const Device* d = Device::from<Device>(device);
+    return d && d->state().sparse_buffer_memory_types != 0;
 }
 
 namespace {
@@ -6279,6 +6403,9 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     queue_info.queueCount = command_queue_count;
     queue_info.pQueuePriorities = priorities.data();
     VkPhysicalDeviceFeatures enable{};
+    enable.sparseBinding = chosen_features.sparseBinding;
+    enable.sparseResidencyBuffer = chosen_features.sparseResidencyBuffer;
+    enable.sparseResidencyAliased = chosen_features.sparseResidencyAliased;
     info.texture_compression_bc = chosen_bc;
     enable.textureCompressionBC = chosen_bc ? VK_TRUE : VK_FALSE;  // the game's textures are BC1-7
     enable.shaderSampledImageArrayDynamicIndexing = info.bindless;

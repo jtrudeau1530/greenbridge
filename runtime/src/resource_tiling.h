@@ -15,7 +15,7 @@
 // GPU packs from the first mip smaller than a tile on any axis and WARP packs nothing; the test accepts all of
 // them. The packed size is their tight
 // linear size rounded up to whole tiles (at least one); NVIDIA sometimes reports one more. Applications read the
-// numbers rather than assume them, and this layer backs every reserved resource fully, so any split is consistent.
+// numbers rather than assume them, and this layer backs reserved textures fully, so any split is consistent.
 
 #include <algorithm>
 #include <cstdint>
