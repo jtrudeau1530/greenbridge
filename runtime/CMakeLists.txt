@@ -571,7 +571,7 @@ if(TARGET Vulkan::Headers)
       DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/../tools/gen_d3d12_stubs.py
       COMMENT "Generating D3D12 COM stubs"
       VERBATIM)
-    add_library(gta6rt_d3d12_com STATIC shims/d3d12_com.cpp shims/d3d12_vulkan_device.cpp shims/d3d12_xs_device.cpp
+    add_library(gta6rt_d3d12_com STATIC shims/d3d12_com.cpp shims/d3d12_vulkan_device.cpp shims/d3d12_xs_device.cpp shims/xbox_present.cpp
                 ${LEONIDA_STUBS})   # d3d12_vulkan_device.cpp reads the PC device behind the proxy (#224)
     target_include_directories(gta6rt_d3d12_com PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/generated)
     target_link_libraries(gta6rt_d3d12_com PUBLIC Vulkan::Headers)
@@ -666,6 +666,15 @@ if(TARGET Vulkan::Headers)
     target_link_libraries(d3d12_present_test PRIVATE gta6rt_d3d12_com user32 gdi32)
     target_compile_definitions(d3d12_present_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(d3d12_present_test PRIVATE /W4 /permissive- /utf-8)
+
+    # PresentX and the frame events on the Vulkan device (shims/xbox_present.h), checked on swapchain pixels.
+    add_executable(xbox_present_test test/xbox_present_test.cpp)
+    target_link_libraries(xbox_present_test PRIVATE gta6rt_d3d12_com user32)
+    target_compile_definitions(xbox_present_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(xbox_present_test PRIVATE /W4 /permissive- /utf-8)
+    # Needs a Vulkan GPU and a window; exits 77 (skipped) without a Vulkan device.
+    add_test(NAME xbox_present COMMAND xbox_present_test)
+    set_tests_properties(xbox_present PROPERTIES SKIP_RETURN_CODE 77)
 
     # The loader can create this device instead of the host's (D3D12XboxCreateDevice, LEONIDA_D3D12=vulkan).
     if(TARGET gta6rt)
