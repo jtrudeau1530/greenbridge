@@ -462,5 +462,309 @@ class TestTypedStoreReferenceInterpreter(unittest.TestCase):
         self.assertEqual(interp.read_dword(0x200), 0xDEADBEEF)
 
 
+class WaveTypedBufferInterpreter:
+    """Multi-lane SIMD wave reference interpreter modeling RDNA2 Wave32/Wave64 typed buffer stores."""
+
+    def __init__(self, wave_size: int = 32, memory: dict[int, int] | None = None) -> None:
+        self.wave_size = wave_size
+        self.memory: dict[int, int] = {} if memory is None else dict(memory)
+        self.exec_mask: int = (1 << wave_size) - 1
+
+    def set_exec_mask(self, mask: int) -> None:
+        mask_limit = (1 << self.wave_size) - 1
+        self.exec_mask = mask & mask_limit
+
+    def read_dword(self, byte_addr: int) -> int:
+        aligned = byte_addr & ~3
+        return self.memory.get(aligned & MASK64, 0) & MASK32
+
+    def write_bytes(self, byte_addr: int, data: bytes) -> None:
+        for offset, byte_val in enumerate(data):
+            curr_addr = byte_addr + offset
+            aligned = curr_addr & ~3
+            shift = (curr_addr & 3) * 8
+            old_dword = self.read_dword(aligned)
+            cleared = old_dword & ~(0xFF << shift)
+            new_dword = cleared | ((byte_val & 0xFF) << shift)
+            self.memory[aligned & MASK64] = new_dword & MASK32
+
+    def execute_wave_store(
+        self,
+        vdatas: list[tuple[float | int, ...] | list[float | int]],
+        voffsets: list[int],
+        desc: BufferResourceDescriptor,
+        soffset: int = 0,
+        inst_offset: int = 0,
+        vindices: list[int] | None = None,
+        format_code: int = GFX10_FMT_32_32_32_32_FLOAT,
+    ) -> dict[str, int | list[int]]:
+        """Executes typed buffer store across all wave lanes under the current EXEC mask.
+
+        Inactive lanes (EXEC bit == 0) never store to memory.
+        Active lanes that are out-of-bounds are silently ignored.
+        """
+        elem_size = FORMAT_ELEMENT_SIZES.get(format_code, 4)
+        active_count = 0
+        stored_count = 0
+        written_addrs: list[int] = []
+
+        if desc.format_code == 0:
+            return {"active": 0, "stored": 0, "written_addrs": []}
+
+        for lane_id in range(self.wave_size):
+            is_active = (self.exec_mask & (1 << lane_id)) != 0
+            if not is_active:
+                continue
+            active_count += 1
+
+            voff = voffsets[lane_id] if lane_id < len(voffsets) else 0
+            vidx = vindices[lane_id] if vindices is not None and lane_id < len(vindices) else None
+            vdata = vdatas[lane_id] if lane_id < len(vdatas) else ()
+
+            addr, in_bounds, _ = compute_typed_buffer_address(
+                desc,
+                soffset=soffset,
+                inst_offset=inst_offset,
+                voffset=voff,
+                vindex=vidx,
+                element_size=elem_size,
+            )
+
+            if in_bounds:
+                packed = pack_typed_format_bytes(vdata, format_code)
+                self.write_bytes(addr, packed)
+                stored_count += 1
+                written_addrs.append(addr)
+
+        return {"active": active_count, "stored": stored_count, "written_addrs": written_addrs}
+
+
+class TestWaveBoundsAndSIMDDivergence(unittest.TestCase):
+    def test_wave32_uniform_exec_in_bounds(self) -> None:
+        wave = WaveTypedBufferInterpreter(wave_size=32)
+        desc = BufferResourceDescriptor.from_fields(
+            base_address=0x1000,
+            num_records=32 * 16,
+            format_code=GFX10_FMT_32_32_32_32_FLOAT,
+            oob_select=3,
+        )
+        voffsets = [i * 16 for i in range(32)]
+        vdatas = [(float(i), float(i * 2), float(i * 3), float(i * 4)) for i in range(32)]
+        stats = wave.execute_wave_store(vdatas, voffsets, desc, format_code=GFX10_FMT_32_32_32_32_FLOAT)
+        self.assertEqual(stats["active"], 32)
+        self.assertEqual(stats["stored"], 32)
+        for i in range(32):
+            base_addr = 0x1000 + i * 16
+            self.assertEqual(wave.read_dword(base_addr), pack_float32(float(i)))
+            self.assertEqual(wave.read_dword(base_addr + 4), pack_float32(float(i * 2)))
+            self.assertEqual(wave.read_dword(base_addr + 8), pack_float32(float(i * 3)))
+            self.assertEqual(wave.read_dword(base_addr + 12), pack_float32(float(i * 4)))
+
+    def test_wave64_uniform_exec_in_bounds(self) -> None:
+        wave = WaveTypedBufferInterpreter(wave_size=64)
+        desc = BufferResourceDescriptor.from_fields(
+            base_address=0x2000,
+            num_records=64 * 16,
+            format_code=GFX10_FMT_32_32_32_32_UINT,
+            oob_select=3,
+        )
+        voffsets = [i * 16 for i in range(64)]
+        vdatas = [(0x1000 + i, 0x2000 + i, 0x3000 + i, 0x4000 + i) for i in range(64)]
+        stats = wave.execute_wave_store(vdatas, voffsets, desc, format_code=GFX10_FMT_32_32_32_32_UINT)
+        self.assertEqual(stats["active"], 64)
+        self.assertEqual(stats["stored"], 64)
+        for i in range(64):
+            base_addr = 0x2000 + i * 16
+            self.assertEqual(wave.read_dword(base_addr), 0x1000 + i)
+            self.assertEqual(wave.read_dword(base_addr + 4), 0x2000 + i)
+            self.assertEqual(wave.read_dword(base_addr + 8), 0x3000 + i)
+            self.assertEqual(wave.read_dword(base_addr + 12), 0x4000 + i)
+
+    def test_divergent_exec_mask_inactive_lanes_suppression(self) -> None:
+        memory = {0x1000 + 4 * k: 0xDEADBEEF for k in range(32 * 4)}
+        wave = WaveTypedBufferInterpreter(wave_size=32, memory=memory)
+        wave.set_exec_mask(0x55555555)  # Even lanes active (0, 2, 4...), odd lanes inactive
+        desc = BufferResourceDescriptor.from_fields(
+            base_address=0x1000,
+            num_records=32 * 16,
+            format_code=GFX10_FMT_32_32_32_32_UINT,
+            oob_select=3,
+        )
+        voffsets = [i * 16 for i in range(32)]
+        vdatas = [(0xA000 + i, 0xB000 + i, 0xC000 + i, 0xD000 + i) for i in range(32)]
+        stats = wave.execute_wave_store(vdatas, voffsets, desc, format_code=GFX10_FMT_32_32_32_32_UINT)
+        self.assertEqual(stats["active"], 16)
+        self.assertEqual(stats["stored"], 16)
+
+        for i in range(32):
+            base_addr = 0x1000 + i * 16
+            if i % 2 == 0:
+                self.assertEqual(wave.read_dword(base_addr), 0xA000 + i)
+                self.assertEqual(wave.read_dword(base_addr + 4), 0xB000 + i)
+                self.assertEqual(wave.read_dword(base_addr + 8), 0xC000 + i)
+                self.assertEqual(wave.read_dword(base_addr + 12), 0xD000 + i)
+            else:
+                for dword_idx in range(4):
+                    self.assertEqual(wave.read_dword(base_addr + 4 * dword_idx), 0xDEADBEEF)
+
+    def test_half_wave_divergence(self) -> None:
+        memory = {0x4000 + 4 * k: 0xCAFEBABE for k in range(64 * 4)}
+        wave = WaveTypedBufferInterpreter(wave_size=64, memory=memory)
+        wave.set_exec_mask(0x00000000FFFFFFFF)  # Lower 32 lanes active, upper 32 inactive
+        desc = BufferResourceDescriptor.from_fields(
+            base_address=0x4000,
+            num_records=64 * 16,
+            format_code=GFX10_FMT_32_32_32_32_UINT,
+            oob_select=3,
+        )
+        voffsets = [i * 16 for i in range(64)]
+        vdatas = [(0x1111 * (i + 1), 0x2222 * (i + 1), 0x3333 * (i + 1), 0x4444 * (i + 1)) for i in range(64)]
+        stats = wave.execute_wave_store(vdatas, voffsets, desc, format_code=GFX10_FMT_32_32_32_32_UINT)
+        self.assertEqual(stats["active"], 32)
+        self.assertEqual(stats["stored"], 32)
+
+        for i in range(32):
+            base_addr = 0x4000 + i * 16
+            self.assertEqual(wave.read_dword(base_addr), 0x1111 * (i + 1))
+        for i in range(32, 64):
+            base_addr = 0x4000 + i * 16
+            for dword_idx in range(4):
+                self.assertEqual(wave.read_dword(base_addr + 4 * dword_idx), 0xCAFEBABE)
+
+    def test_single_lane_divergence(self) -> None:
+        memory = {0x3000 + 4 * k: 0x12345678 for k in range(32 * 4)}
+        wave = WaveTypedBufferInterpreter(wave_size=32, memory=memory)
+        target_lane = 13
+        wave.set_exec_mask(1 << target_lane)
+        desc = BufferResourceDescriptor.from_fields(
+            base_address=0x3000,
+            num_records=32 * 16,
+            format_code=GFX10_FMT_32_32_32_32_UINT,
+            oob_select=3,
+        )
+        voffsets = [i * 16 for i in range(32)]
+        vdatas = [(0x7777, 0x8888, 0x9999, 0xAAAA) for _ in range(32)]
+        stats = wave.execute_wave_store(vdatas, voffsets, desc, format_code=GFX10_FMT_32_32_32_32_UINT)
+        self.assertEqual(stats["active"], 1)
+        self.assertEqual(stats["stored"], 1)
+
+        for i in range(32):
+            base_addr = 0x3000 + i * 16
+            if i == target_lane:
+                self.assertEqual(wave.read_dword(base_addr), 0x7777)
+                self.assertEqual(wave.read_dword(base_addr + 4), 0x8888)
+                self.assertEqual(wave.read_dword(base_addr + 8), 0x9999)
+                self.assertEqual(wave.read_dword(base_addr + 12), 0xAAAA)
+            else:
+                for dword_idx in range(4):
+                    self.assertEqual(wave.read_dword(base_addr + 4 * dword_idx), 0x12345678)
+
+    def test_simd_lane_oob_suppression_boundary(self) -> None:
+        memory = {0x1000 + 4 * k: 0xBAADF00D for k in range(32 * 4)}
+        wave = WaveTypedBufferInterpreter(wave_size=32, memory=memory)
+        desc = BufferResourceDescriptor.from_fields(
+            base_address=0x1000,
+            num_records=16 * 16,  # Exactly 16 records of 16 bytes = 256 bytes
+            format_code=GFX10_FMT_32_32_32_32_UINT,
+            oob_select=3,
+        )
+        voffsets = [i * 16 for i in range(32)]
+        vdatas = [(0x5000 + i, 0x6000 + i, 0x7000 + i, 0x8000 + i) for i in range(32)]
+        stats = wave.execute_wave_store(vdatas, voffsets, desc, format_code=GFX10_FMT_32_32_32_32_UINT)
+        self.assertEqual(stats["active"], 32)
+        self.assertEqual(stats["stored"], 16)
+
+        for i in range(16):
+            base_addr = 0x1000 + i * 16
+            self.assertEqual(wave.read_dword(base_addr), 0x5000 + i)
+        for i in range(16, 32):
+            base_addr = 0x1000 + i * 16
+            for dword_idx in range(4):
+                self.assertEqual(wave.read_dword(base_addr + 4 * dword_idx), 0xBAADF00D)
+
+    def test_xyzw_element_size_straddle_boundary(self) -> None:
+        memory = {0x5000 + 4 * k: 0x55555555 for k in range(32)}
+        wave = WaveTypedBufferInterpreter(wave_size=2, memory=memory)
+        # Limit is 100 bytes.
+        # Lane 0: offset 80 -> 80 + 16 = 96 <= 100 (in-bounds)
+        # Lane 1: offset 88 -> 88 + 16 = 104 > 100 (straddles boundary -> out of bounds)
+        desc = BufferResourceDescriptor.from_fields(
+            base_address=0x5000,
+            num_records=100,
+            format_code=GFX10_FMT_32_32_32_32_UINT,
+            oob_select=3,
+        )
+        voffsets = [80, 88]
+        vdatas = [(1, 2, 3, 4), (5, 6, 7, 8)]
+        stats = wave.execute_wave_store(vdatas, voffsets, desc, format_code=GFX10_FMT_32_32_32_32_UINT)
+        self.assertEqual(stats["active"], 2)
+        self.assertEqual(stats["stored"], 1)
+
+        self.assertEqual(wave.read_dword(0x5000 + 80), 1)
+        self.assertEqual(wave.read_dword(0x5000 + 84), 2)
+        self.assertEqual(wave.read_dword(0x5000 + 88), 3)
+        self.assertEqual(wave.read_dword(0x5000 + 92), 4)
+        # Memory past 96 was never modified by lane 1
+        self.assertEqual(wave.read_dword(0x5000 + 96), 0x55555555)
+
+    def test_channel_variants_multi_lane(self) -> None:
+        # Test x (1-comp), xy (2-comp), xyz (3-comp), xyzw (4-comp)
+        wave = WaveTypedBufferInterpreter(wave_size=4)
+        # x variant (4 bytes per element)
+        desc_x = BufferResourceDescriptor.from_fields(0x1000, num_records=64, format_code=GFX10_FMT_32_UINT, oob_select=3)
+        stats_x = wave.execute_wave_store([(10,), (20,), (30,), (40,)], [0, 4, 8, 12], desc_x, format_code=GFX10_FMT_32_UINT)
+        self.assertEqual(stats_x["stored"], 4)
+        for i, val in enumerate([10, 20, 30, 40]):
+            self.assertEqual(wave.read_dword(0x1000 + 4 * i), val)
+
+        # xy variant (8 bytes per element)
+        desc_xy = BufferResourceDescriptor.from_fields(0x2000, num_records=64, format_code=GFX10_FMT_32_32_UINT, oob_select=3)
+        stats_xy = wave.execute_wave_store([(1, 2), (3, 4), (5, 6), (7, 8)], [0, 8, 16, 24], desc_xy, format_code=GFX10_FMT_32_32_UINT)
+        self.assertEqual(stats_xy["stored"], 4)
+        self.assertEqual(wave.read_dword(0x2000 + 16), 5)
+        self.assertEqual(wave.read_dword(0x2000 + 20), 6)
+
+        # xyz variant (12 bytes per element)
+        wave_xyz = WaveTypedBufferInterpreter(wave_size=2)
+        desc_xyz = BufferResourceDescriptor.from_fields(0x3000, num_records=64, format_code=GFX10_FMT_32_32_32_UINT, oob_select=3)
+        stats_xyz = wave_xyz.execute_wave_store([(1, 2, 3), (4, 5, 6)], [0, 12], desc_xyz, format_code=GFX10_FMT_32_32_32_UINT)
+        self.assertEqual(stats_xyz["stored"], 2)
+        self.assertEqual(wave_xyz.read_dword(0x3000 + 12), 4)
+        self.assertEqual(wave_xyz.read_dword(0x3000 + 16), 5)
+        self.assertEqual(wave_xyz.read_dword(0x3000 + 20), 6)
+
+    def test_structured_stride_multi_lane(self) -> None:
+        wave = WaveTypedBufferInterpreter(wave_size=8)
+        desc = BufferResourceDescriptor.from_fields(
+            base_address=0x8000,
+            stride=32,
+            num_records=5,  # Only first 5 records valid
+            format_code=GFX10_FMT_32_32_UINT,
+            oob_select=1,
+        )
+        vindices = list(range(8))
+        voffsets = [0] * 8
+        vdatas = [(100 + i, 200 + i) for i in range(8)]
+        stats = wave.execute_wave_store(vdatas, voffsets, desc, vindices=vindices, format_code=GFX10_FMT_32_32_UINT)
+        self.assertEqual(stats["active"], 8)
+        self.assertEqual(stats["stored"], 5)
+        for i in range(5):
+            self.assertEqual(wave.read_dword(0x8000 + i * 32), 100 + i)
+            self.assertEqual(wave.read_dword(0x8000 + i * 32 + 4), 200 + i)
+
+    def test_soffset_inst_offset_multi_lane(self) -> None:
+        wave = WaveTypedBufferInterpreter(wave_size=4)
+        desc = BufferResourceDescriptor.from_fields(base_address=0x6000, num_records=256, format_code=GFX10_FMT_32_UINT, oob_select=3)
+        soffset = 0x23  # Will be masked to 0x20
+        inst_offset = 0x10
+        voffsets = [0, 4, 8, 12]
+        vdatas = [(100,), (200,), (300,), (400,)]
+        stats = wave.execute_wave_store(vdatas, voffsets, desc, soffset=soffset, inst_offset=inst_offset, format_code=GFX10_FMT_32_UINT)
+        self.assertEqual(stats["stored"], 4)
+        expected_base = 0x6000 + 0x20 + 0x10
+        for i, val in enumerate([100, 200, 300, 400]):
+            self.assertEqual(wave.read_dword(expected_base + 4 * i), val)
+
+
 if __name__ == "__main__":
     unittest.main()
