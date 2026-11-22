@@ -373,5 +373,144 @@ class TestSymbolicASTAndTypedExpressions(unittest.TestCase):
                 self.assertEqual(inst, parsed)
 
 
+class ScalarRegisterFile:
+    """Architectural register file for a single wavefront lane (256 32-bit VGPRs)."""
+
+    def __init__(self) -> None:
+        self.regs: List[int] = [0] * 256
+
+    def get(self, reg: VGPR) -> int:
+        """Read 32-bit VGPR value."""
+        return self.regs[reg.index] & MASK32
+
+    def set(self, reg: VGPR, val: int) -> None:
+        """Write 32-bit VGPR value."""
+        self.regs[reg.index] = val & MASK32
+
+
+class ScalarThreadState:
+    """Execution state of a single scalar thread executing LDS instructions."""
+
+    def __init__(self, lds: Optional[LDSMemory] = None) -> None:
+        self.rf: ScalarRegisterFile = ScalarRegisterFile()
+        self.lds: LDSMemory = lds if lds is not None else LDSMemory()
+
+    def get_vgpr(self, reg: VGPR) -> int:
+        return self.rf.get(reg)
+
+    def set_vgpr(self, reg: VGPR, val: int) -> None:
+        self.rf.set(reg, val)
+
+
+class ScalarDSInterpreter:
+    """Deterministic scalar instruction interpreter for RDNA2 DS bitwise AND opcodes."""
+
+    def execute(self, state: ScalarThreadState, inst: DSAndB32Instruction) -> Optional[int]:
+        """Execute a single DS bitwise AND instruction on the scalar thread state."""
+        addr = state.get_vgpr(inst.vaddr)
+        data = state.get_vgpr(inst.vdata)
+
+        old_val = state.lds.atomic_and_b32(addr, data, offset=inst.offset.value)
+
+        if inst.opcode.is_return:
+            assert inst.vdst is not None
+            state.set_vgpr(inst.vdst, old_val)
+            return old_val
+        return None
+
+
+class TestDeterministicScalarInterpreter(unittest.TestCase):
+    """Unit tests for deterministic scalar instruction execution of DS and / and_rtn b32."""
+
+    def setUp(self) -> None:
+        self.lds = LDSMemory(65536)
+        self.state = ScalarThreadState(lds=self.lds)
+        self.interp = ScalarDSInterpreter()
+
+    def test_scalar_ds_and_b32_non_returning(self) -> None:
+        self.lds.write_dword(5, 0b11110000)
+        self.state.set_vgpr(VGPR(1), 20)  # dword 5
+        self.state.set_vgpr(VGPR(2), 0b11001100)
+
+        inst = DSAndB32Instruction(DSOpcode.DS_AND_B32, vaddr=VGPR(1), vdata=VGPR(2))
+        res = self.interp.execute(self.state, inst)
+
+        self.assertIsNone(res)
+        self.assertEqual(self.lds.read_dword(5), 0b11000000)
+        self.assertEqual(self.state.get_vgpr(VGPR(1)), 20)
+        self.assertEqual(self.state.get_vgpr(VGPR(2)), 0b11001100)
+
+    def test_scalar_ds_and_rtn_b32_returning(self) -> None:
+        self.lds.write_dword(8, 0xFF00FF00)
+        self.state.set_vgpr(VGPR(1), 32)  # dword 8
+        self.state.set_vgpr(VGPR(2), 0x0F0F0F0F)
+        self.state.set_vgpr(VGPR(0), 0)
+
+        inst = DSAndB32Instruction(DSOpcode.DS_AND_RTN_B32, vaddr=VGPR(1), vdata=VGPR(2), vdst=VGPR(0))
+        res = self.interp.execute(self.state, inst)
+
+        self.assertEqual(res, 0xFF00FF00)
+        self.assertEqual(self.state.get_vgpr(VGPR(0)), 0xFF00FF00)
+        self.assertEqual(self.lds.read_dword(8), 0x0F000F00)
+
+    def test_scalar_ds_and_rtn_b32_with_offset(self) -> None:
+        self.lds.write_dword(10, 0x12345678)
+        self.state.set_vgpr(VGPR(1), 36)  # dword 9
+        self.state.set_vgpr(VGPR(2), 0xFFFF0000)
+
+        inst = DSAndB32Instruction(
+            DSOpcode.DS_AND_RTN_B32,
+            vaddr=VGPR(1),
+            vdata=VGPR(2),
+            vdst=VGPR(3),
+            offset=OffsetImmediate(4),  # offset 4 -> dword 10
+        )
+        res = self.interp.execute(self.state, inst)
+
+        self.assertEqual(res, 0x12345678)
+        self.assertEqual(self.state.get_vgpr(VGPR(3)), 0x12345678)
+        self.assertEqual(self.lds.read_dword(10), 0x12340000)
+
+    def test_scalar_ds_and_rtn_identity_mask(self) -> None:
+        self.lds.write_dword(2, 0xDEADBEEF)
+        self.state.set_vgpr(VGPR(1), 8)
+        self.state.set_vgpr(VGPR(2), 0xFFFFFFFF)
+
+        inst = DSAndB32Instruction(DSOpcode.DS_AND_RTN_B32, vaddr=VGPR(1), vdata=VGPR(2), vdst=VGPR(4))
+        res = self.interp.execute(self.state, inst)
+
+        self.assertEqual(res, 0xDEADBEEF)
+        self.assertEqual(self.state.get_vgpr(VGPR(4)), 0xDEADBEEF)
+        self.assertEqual(self.lds.read_dword(2), 0xDEADBEEF)
+
+    def test_scalar_ds_and_rtn_zero_mask(self) -> None:
+        self.lds.write_dword(3, 0xCAFEBABE)
+        self.state.set_vgpr(VGPR(1), 12)
+        self.state.set_vgpr(VGPR(2), 0x00000000)
+
+        inst = DSAndB32Instruction(DSOpcode.DS_AND_RTN_B32, vaddr=VGPR(1), vdata=VGPR(2), vdst=VGPR(5))
+        res = self.interp.execute(self.state, inst)
+
+        self.assertEqual(res, 0xCAFEBABE)
+        self.assertEqual(self.state.get_vgpr(VGPR(5)), 0xCAFEBABE)
+        self.assertEqual(self.lds.read_dword(3), 0x00000000)
+
+    def test_scalar_sequential_bit_clearing(self) -> None:
+        self.lds.write_dword(0, 0xFFFFFFFF)
+        self.state.set_vgpr(VGPR(1), 0)
+
+        # Clear upper 16 bits
+        self.state.set_vgpr(VGPR(2), 0x0000FFFF)
+        r1 = self.interp.execute(self.state, DSAndB32Instruction(DSOpcode.DS_AND_RTN_B32, VGPR(1), VGPR(2), vdst=VGPR(10)))
+        self.assertEqual(r1, 0xFFFFFFFF)
+        self.assertEqual(self.lds.read_dword(0), 0x0000FFFF)
+
+        # Clear lower 8 bits
+        self.state.set_vgpr(VGPR(2), 0x0000FF00)
+        r2 = self.interp.execute(self.state, DSAndB32Instruction(DSOpcode.DS_AND_RTN_B32, VGPR(1), VGPR(2), vdst=VGPR(11)))
+        self.assertEqual(r2, 0x0000FFFF)
+        self.assertEqual(self.lds.read_dword(0), 0x0000FF00)
+
+
 if __name__ == "__main__":
     unittest.main()
