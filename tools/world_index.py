@@ -19,7 +19,8 @@ reads: entity count per ``archetypeName`` hash and the entity's 64-bit archetype
 
 ``--entities-out`` writes one JSON line per complete ``CEntityDef`` (archetype hash and 64-bit key, position,
 stored rotation, scales and LOD fields), the placement input of ``world_build.py --placements``. The rows are
-derived from your own copy of the game: keep the file in your local work folder.
+derived from your own copy of the game: keep the file in your local work folder. The placement report is
+replaced after the scan and other report writes succeed.
 
 For a 76 GB archive, bound the run with --start/--limit. Coverage and the scanned window are written to the
 JSON summary. Place reports outside a directory input if you want to overwrite them on a later run.
@@ -30,9 +31,12 @@ import json
 import mmap
 import os
 import re
+import stat
 import struct
 import sys
+import tempfile
 import zlib
+from contextlib import contextmanager
 
 SIGNATURE = b"0DRP"
 VERSION = 0x7A
@@ -555,6 +559,30 @@ def _check_report_paths(parser, reports, source, directory_files):
                 parser.error(f"{flag} would overwrite the input {path}")
 
 
+@contextmanager
+def _staged_entity_report(path):
+    if not path:
+        yield None
+        return
+
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    destination = os.path.realpath(path)
+    try:
+        mode = os.stat(destination).st_mode
+    except FileNotFoundError:
+        mode = None
+    if mode is not None and not stat.S_ISREG(mode):
+        raise OSError(f"placement report destination is not a regular file: {path}")
+
+    with tempfile.TemporaryDirectory(dir=os.path.dirname(destination), prefix=".world-index-") as directory:
+        staged = os.path.join(directory, "entities.jsonl")
+        with open(staged, "w", encoding="utf-8", newline="\n") as handle:
+            yield EntityRows(handle)
+        if mode is not None:
+            os.chmod(staged, mode & 0o777)
+        os.replace(staged, destination)
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("path", help="RPF9 archive, one carved file, or a directory of carved files")
@@ -573,26 +601,24 @@ def main(argv=None):
     reports = (("--out", a.out), ("--csv", a.csv), ("--archetypes-out", a.archetypes_out),
                ("--entities-out", a.entities_out))
     agg = ArchetypeCounts() if a.archetypes_out else None
-    ent_handle = ent = None
     try:
         # Check the same inputs the directory scan will read, before the streaming report exists.
         directory_files = list(_directory_files(a.path)) if os.path.isdir(a.path) else None
         _check_report_paths(ap, reports, a.path, directory_files)
-        if a.entities_out:
-            os.makedirs(os.path.dirname(os.path.abspath(a.entities_out)), exist_ok=True)
-            ent_handle = open(a.entities_out, "w", encoding="utf-8", newline="\n")
-            ent = EntityRows(ent_handle)
-        sink = _Both(agg, ent) if agg is not None and ent is not None else (agg if agg is not None else ent)
-        rows, stats = scan_path(a.path, a.start, a.limit, a.max_inflate, sink, directory_files=directory_files)
-    except (OSError, ValueError) as e:      # a missing path or --start outside an archive's data area
+        with _staged_entity_report(a.entities_out) as ent:
+            sink = _Both(agg, ent) if agg is not None and ent is not None else (agg if agg is not None else ent)
+            rows, stats = scan_path(a.path, a.start, a.limit, a.max_inflate, sink, directory_files=directory_files)
+            summary = _write_reports(a, rows, stats, agg)
+            if ent is not None:
+                summary["entity_rows"] = {"written": ent.written, "incomplete": ent.incomplete}
+    except (OSError, ValueError) as e:
         print(f"ERROR: {e}", file=sys.stderr)
-        if ent_handle is not None:
-            ent_handle.close()
-            os.remove(a.entities_out)       # no partial placement file
         return 2
-    finally:
-        if ent_handle is not None:
-            ent_handle.close()
+    print(json.dumps(summary, indent=1))
+    return 0
+
+
+def _write_reports(a, rows, stats, agg):
     summary = dict(stats)
     summary["resources"] = len(rows)
     summary["maps"] = sum(1 for r in rows if r["kind"] == "map")
@@ -625,10 +651,7 @@ def main(argv=None):
         with open(a.archetypes_out, "w", encoding="utf-8") as f:
             json.dump(agg.to_json(), f, indent=1, sort_keys=True)
         summary["archetype_file"] = agg.to_json()["summary"]
-    if ent is not None:
-        summary["entity_rows"] = {"written": ent.written, "incomplete": ent.incomplete}
-    print(json.dumps(summary, indent=1))
-    return 0
+    return summary
 
 
 if __name__ == "__main__":

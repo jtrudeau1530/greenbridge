@@ -329,6 +329,77 @@ class WorldIndexTest(unittest.TestCase):
         with open(out, "rb") as f:
             self.assertEqual(f.read(), b"previous report")
 
+    def test_failed_scan_keeps_existing_placement_report(self):
+        archive = os.path.join(self.dir, "archive.rpf")
+        resource = make_resource()
+        with open(archive, "wb") as f:
+            f.write(make_rpf_streams([resource]))
+        carve = os.path.join(self.dir, "carve")
+        os.makedirs(carve)
+        with open(os.path.join(carve, "01-resource.bin"), "wb") as f:
+            f.write(resource)
+        with open(os.path.join(carve, "02-archive.rpf"), "wb") as f:
+            f.write(make_rpf_streams([resource]))
+
+        outputs = os.path.join(self.dir, "outputs")
+        os.makedirs(outputs)
+        summary = os.path.join(outputs, "summary.json")
+        entities = os.path.join(outputs, "entities.jsonl")
+        previous = b'{"previous":true}\n'
+        for source, arguments, diagnostic in (
+            (os.path.join(self.dir, "missing.rpf"), [], "missing.rpf"),
+            (archive, ["--start", "0"], "outside the data area"),
+            # The carved resource emits one row before the archive rejects this window.
+            (carve, ["--start", "0"], "outside the data area"),
+        ):
+            with self.subTest(source=source):
+                with open(entities, "wb") as f:
+                    f.write(previous)
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err):
+                    self.assertEqual(WI.main([source, "--out", summary, "--entities-out", entities, *arguments]), 2)
+                self.assertIn(diagnostic, err.getvalue())
+                self.assertEqual(os.listdir(outputs), ["entities.jsonl"])
+                with open(entities, "rb") as f:
+                    self.assertEqual(f.read(), previous)
+
+    def test_summary_write_failure_keeps_existing_placement_report(self):
+        source = os.path.join(self.dir, "resource.bin")
+        with open(source, "wb") as f:
+            f.write(make_resource())
+        entities = os.path.join(self.dir, "entities.jsonl")
+        with open(entities, "wb") as f:
+            f.write(b"previous report")
+        summary = os.path.join(self.dir, "summary.json")
+        os.makedirs(summary)
+
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertEqual(WI.main([source, "--out", summary, "--entities-out", entities]), 2)
+        self.assertIn("ERROR:", err.getvalue())
+        self.assertCountEqual(os.listdir(self.dir), ["resource.bin", "summary.json", "entities.jsonl"])
+        with open(entities, "rb") as f:
+            self.assertEqual(f.read(), b"previous report")
+
+    def test_success_replaces_existing_placement_report(self):
+        source = os.path.join(self.dir, "resource.bin")
+        with open(source, "wb") as f:
+            f.write(make_resource())
+        entities = os.path.join(self.dir, "entities.jsonl")
+        with open(entities, "wb") as f:
+            f.write(b"previous report")
+        if os.name != "nt":
+            os.chmod(entities, 0o640)
+        previous_mode = os.stat(entities).st_mode
+        summary = os.path.join(self.dir, "summary.json")
+
+        self.assertEqual(WI.main([source, "--out", summary, "--entities-out", entities]), 0)
+        self.assertCountEqual(os.listdir(self.dir), ["resource.bin", "summary.json", "entities.jsonl"])
+        self.assertEqual(os.stat(entities).st_mode, previous_mode)
+        with open(entities, encoding="utf-8") as f:
+            rows = [json.loads(line) for line in f]
+        self.assertEqual([row["archetype"] for row in rows], ["deadbeef"])
+
     def test_directory_scan_and_outputs(self):
         with open(os.path.join(self.dir, "map.bin"), "wb") as f:
             f.write(make_resource())
