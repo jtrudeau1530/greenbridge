@@ -287,7 +287,9 @@ bool sample_through_set(vktest::Device& d, VkDescriptorSet set0, VkDescriptorSet
 
 int main() {
     vktest::Device d;
-    EXPECT(d.create());
+    const auto device_status = d.initialize();
+    if (device_status == vktest::DeviceStatus::unavailable) return 77;   // no Vulkan GPU: ctest skips
+    if (device_status != vktest::DeviceStatus::ready) return 1;
 
     constexpr UINT size = 8, texels = size * size, bytes = texels * 4;
     std::vector<std::uint8_t> results(4 * bytes), after_destruction(bytes), borders(3 * bytes);

@@ -33,7 +33,9 @@ int main(int argc, char** argv) {
     else if (argc != 1) return 2;
     using namespace leonida;
     vktest::Device d;
-    EXPECT(d.create());
+    const auto device_status = d.initialize();
+    if (device_status == vktest::DeviceStatus::unavailable) return 77;   // no Vulkan GPU: ctest skips
+    if (device_status != vktest::DeviceStatus::ready) return 1;
     VulkanContext context(d.device_proc, d.device, true);
     EXPECT(context.loaded());
 
