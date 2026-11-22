@@ -10,13 +10,13 @@ extern "C" __declspec(dllexport) HRESULT __stdcall XGameRuntimeInitialize() { re
 extern "C" __declspec(dllexport) void __stdcall XGameRuntimeUninitialize() {}
 extern "C" __declspec(dllexport) uint32_t __stdcall XSystemGetDeviceType() { return 0; }
 
-extern "C" __declspec(dllexport) HRESULT __stdcall XTaskQueueCreate(
+STDAPI XTaskQueueCreate(
     XTaskQueueDispatchMode, XTaskQueueDispatchMode, XTaskQueueHandle* queue) noexcept {
     *queue = nullptr;
     return E_NOTIMPL;
 }
-extern "C" __declspec(dllexport) bool __stdcall XTaskQueueDispatch(
+STDAPI_(bool) XTaskQueueDispatch(
     XTaskQueueHandle, XTaskQueuePort, uint32_t) noexcept { return false; }
-extern "C" __declspec(dllexport) void __stdcall XTaskQueueCloseHandle(XTaskQueueHandle) noexcept {}
-extern "C" __declspec(dllexport) HRESULT __stdcall XAsyncRun(XAsyncBlock*, XAsyncWork*) noexcept { return E_NOTIMPL; }
-extern "C" __declspec(dllexport) HRESULT __stdcall XAsyncGetStatus(XAsyncBlock*, bool) noexcept { return E_NOTIMPL; }
+STDAPI_(void) XTaskQueueCloseHandle(XTaskQueueHandle) noexcept {}
+STDAPI XAsyncRun(XAsyncBlock*, XAsyncWork*) noexcept { return E_NOTIMPL; }
+STDAPI XAsyncGetStatus(XAsyncBlock*, bool) noexcept { return E_NOTIMPL; }

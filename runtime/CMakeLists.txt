@@ -341,7 +341,7 @@ if(BUILD_TESTING)
 
     # `gta6rt --run` rehearsal: a stand-in game EXE (CRT startup, statics, heap, files, threads) that imports
     # xgameruntime.dll from a link-time stub; under --run the shim registry answers those imports instead.
-    add_library(xgameruntime_stub SHARED test/fixtures/xgameruntime_stub.cpp)
+    add_library(xgameruntime_stub SHARED test/fixtures/xgameruntime_stub.cpp test/fixtures/xgameruntime_stub.def)
     target_include_directories(xgameruntime_stub PUBLIC ${XTASKQUEUE_DIR}/Include)
     target_compile_definitions(xgameruntime_stub PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     set_target_properties(xgameruntime_stub PROPERTIES
