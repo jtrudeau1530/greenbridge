@@ -52,7 +52,10 @@ def run(tools, spv, groups, reps, driver, emulate):
     args = [os.path.join(tools, "vk_compute_test" + (".exe" if os.name == "nt" else "")), spv, str(groups), "dump"]
     if not emulate:
         args.append("--require-wave64")
-    r = subprocess.run(args, env=env, capture_output=True, text=True)
+    try:
+        r = subprocess.run(args, env=env, capture_output=True, text=True)
+    except OSError as e:
+        return None, f"{args[0]}: {e}", None
     out = r.stdout + r.stderr
     m = re.search(r"bench ms: median=([\d.]+) min=([\d.]+) max=([\d.]+)", out)
     h = re.search(r"bench out fnv1a: (\w+)", out)
