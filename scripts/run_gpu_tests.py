@@ -841,7 +841,7 @@ def run_suite(a, work: str) -> int:
                 # base + soffset + imm (cs_smem_soffset_imm.asm); out[4..7] are seeds the shader leaves alone
                 "cs_smem_soffset_imm": [0x5EED0024, 0x5EED0028, 0x5EED002C, 0x5EED0030,
                                         0x5EED0010, 0x5EED0014, 0x5EED0018, 0x5EED001C],
-                # SHADER-52: wave32 lane select & 31 (40 ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢ 8)
+                # SHADER-52: wave32 lane select & 31 (40 → 8)
                 "cs_w32_lane_wrap": [25, 16, 777, 777],
                 # v_movrelsd_2_b32: VGPR[D + M0[25:16]] = VGPR[S0 + M0[9:0]] (cs_movrelsd_2.asm)
                 "cs_movrelsd_2": [11, 33, 33, 55, 1717, 77, 1515, 1717],
