@@ -512,6 +512,22 @@ int main() {
         device->CreateShaderResourceView(volume.p, &volume_view, view_slot(volume_mip));
         EXPECT(image_at(volume_mip, vol) && vol.type == g::ImageType::image_3d);
         EXPECT(vol.first_mip == 1 && vol.mip_count == 1 && vol.depth == 4 && vol.resource_mips == 2);
+        // D3D12 requires DENY_SHADER_RESOURCE to accompany ALLOW_DEPTH_STENCIL. If the layer accepts
+        // this transfer-only volume at creation, requesting an SRV must still clear the destination.
+        D3D12_RESOURCE_DESC denied_desc = volume_desc;
+        denied_desc.Flags = D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE;
+        Ref<ID3D12Resource> denied_volume;
+        const HRESULT denied_hr = device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &denied_desc,
+                D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&denied_volume.p));
+        EXPECT(denied_hr == S_OK || denied_hr == E_INVALIDARG);
+        if (denied_hr == S_OK) {
+            device->CopyDescriptorsSimple(1, view_slot(null_slot), view_slot(volume_mip),
+                                          D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+            EXPECT(!null_at(null_slot));
+            device->CreateShaderResourceView(denied_volume.p, &volume_view, view_slot(null_slot));
+            EXPECT(null_at(null_slot));
+            denied_volume.reset();
+        }
         volume_view.Texture3D.MostDetailedMip = 2;
         device->CreateShaderResourceView(volume.p, &volume_view, view_slot(null_slot));
         EXPECT(null_at(null_slot));
