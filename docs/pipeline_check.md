@@ -147,6 +147,29 @@ The report above therefore states the limit and the skip count; a later run on a
 completed the full 26,503-entry set without them (`docs/design.md`). `--max-bytes` remains a visibility
 tool, not a pass: a skipped module has not been validated.
 
+## Build-stage batches (BUILD-1030)
+
+`make_game.py` runs the pipelines stage in fresh checker processes over at most **500 index entries** each, on
+Windows and POSIX. The ranges partition the same name-sorted index as `--start` / `--count`, including the final
+short range. Each finished process saves to the same `pipeline_cache.bin`, and the next loads that checkpoint.
+This releases allocations that the driver's compiler otherwise retains over a full-corpus process. A work folder
+with at most 500 entries keeps the single invocation. An older checker without the range options keeps the older
+invocation; rebuild the runtime to get batching.
+
+If a batch crashes, its in-flight modules are checked alone in fresh processes. A module that reproducibly crashes
+is recorded as failed, and the rest is checked. If none crashes alone, the entire failed range is retried in
+smaller processes, down to one entry; healthy modules are not added to the crash list. An unrecoverable crash,
+an interrupted check or a setup error stops the stage. A validation failure in one batch remains a failure even
+when subsequent batches succeed; it does not prevent those later batches from being checked.
+
+The batch size limits how much compilation accumulates between process exits, **not total memory usage**. Loading
+a large saved cache or compiling one large shader can still exceed a process's available memory; a range that
+cannot complete even alone fails with a diagnostic rather than being counted as checked.
+
+`tests/test_make_game_pipeline_batches.py` runs the real build-stage orchestration against scripted child processes:
+bounded coverage and cache checkpoints, collective memory-crash recovery, a genuinely crashing module, validation
+failures, interruptions, setup failures and compatibility with older checkers. It needs no game files or GPU.
+
 ## Crash isolation (`--isolate`)
 
 A driver that dies while compiling one module (for example the RADV `SIGFPE` in
@@ -223,9 +246,10 @@ in between.
 **One process per chunk.** A single `vk_pipeline_check --jobs 4` run over the emulated corpus reached
 21,000 of 26,503 pipelines with no failures. Then the driver's compiler ran out of memory
 (`LLVM ERROR: out of memory`). With 2 jobs, one process later grew past 100 GB of committed memory.
-Driver compiler memory isn't returned between pipelines, so the build now runs as one checker
-process per 300–500 entries. Each process seeds from and saves to the same cache file, so the chunks
-resume. Since #903 the checker also compiles modules over 4 MiB alone.
+Driver compiler memory isn't returned between pipelines; the original workaround used one checker process per
+300–500 entries. The build stage now uses at most 500 per process, with smaller retries when needed (above).
+Each process seeds from and saves to the same cache file, so the chunks resume. Since #903 the checker also
+compiles modules over 4 MiB alone.
 
 **The ScreenProbes shaders.** `indirect_diffuse_lighting`'s ScreenProbes_ActivateProbes,
 ActivateProbesTarget and ActivateRays compute shaders were 60, 60 and 32 MB of SPIR-V. Their 3,281
