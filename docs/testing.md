@@ -86,8 +86,11 @@ belongs to the commit that built it; check that commit out as well.
 
 If you cannot build the test programs locally, the Runtime workflow publishes them as the `runtime-windows`
 artifact of its own commit. It holds Windows executables, so use them on Windows or under Wine as in the
-section below; GitHub expires the artifact after 7 days. Open the run for that commit under Actions ->
-Runtime, download and unzip `runtime-windows`, and pass the unzipped folder to `--build`:
+section below; GitHub expires the artifact after 7 days. Not every commit on `main` has one: the workflow runs
+only when a commit touches what it builds or reads (the `paths` list in `.github/workflows/runtime.yml`), so a
+commit that changes only docs, tests or other tools has no Runtime run. Take the most recent run under
+Actions -> Runtime, and check out the commit it built, or start a run of the commit you want on your own fork with
+"Run workflow" (`workflow_dispatch`). Download and unzip `runtime-windows`, and pass the unzipped folder to `--build`:
 
 ```sh
 python -I scripts/run_gpu_tests.py --build <unzipped runtime-windows>
@@ -218,7 +221,8 @@ compute and drawn by a generated vertex shader (`docs/design.md`, "Mesh shaders 
 ## Without a GPU: Mesa llvmpipe
 
 Mesa's llvmpipe is a software Vulkan driver (`mesa-vulkan-drivers` on Debian and Ubuntu). CI runs the suite on it
-for every pull request (`.github/workflows/runtime.yml`), and you can do the same on Linux without a GPU:
+for every pull request that touches the runtime, the scripts or a tool the jobs read (`.github/workflows/runtime.yml`
+lists them), and you can do the same on Linux without a GPU:
 
 ```sh
 sudo apt-get install -y libvulkan-dev mesa-vulkan-drivers vulkan-tools spirv-tools llvm-18
