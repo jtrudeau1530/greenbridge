@@ -8515,6 +8515,49 @@ class Gen:
             self.emit(f"{sh} = OpShiftLeftLogical %uint {halves[1]} {self.cu(16)}")
             self.emit(f"{r} = OpBitwiseOr %uint {halves[0]} {sh}")
             self.dst(a[0], r)
+        elif op in ("v_cvt_pknorm_i16_f16", "v_cvt_pknorm_u16_f16"):
+            # RDNA2 ISA (VOP3): D[15:0] = norm16(S0.f16), D[31:16] = norm16(S1.f16). Each f16 (selected by
+            # op_sel[0..1], with neg/abs source modifiers) is clamped to [-1, 1] (i16) or [0, 1] (u16), scaled by
+            # 32767 or 65535 and rounded once to nearest even (NaN -> 0). For |cl| >= 0.25, cl * (scale + 1) is an
+            # exact even integer in f32, so cl * (scale + 1) - RoundEven(cl) gives the exact single-rounded result
+            # without binary32 double-rounding at near-tie f16 inputs. Output modifiers and dst op_sel are rejected.
+            if any(m == "clamp" or m.startswith(("mul:", "div:", "op_sel_hi:", "neg_lo:", "neg_hi:")) for m in mods):
+                raise Unsupported(op + " modifier")
+            sel, dhi = self.opsel_bits(mods, 2)
+            if dhi:
+                raise Unsupported(op + " op_sel destination")
+            snorm = op == "v_cvt_pknorm_i16_f16"
+            lo_f = self.fconst(-1.0) if snorm else "%f0"
+            scale_f = self.fconst(32767.0 if snorm else 65535.0)
+            pow2_f = self.fconst(32768.0 if snorm else 65536.0)
+            qtr_f = self.fconst(0.25)
+            halves = []
+            for idx, src in enumerate(a[1:3]):
+                f = self.f16_in(src, sel[idx])
+                nan, z, cl, ab, big, p2, rc, r_big, m, r_sm, rr, i, h = (self.tmp() for _ in range(13))
+                self.emit(f"{nan} = OpIsNan %bool {f}")
+                self.emit(f"{z} = OpSelect %float {nan} %f0 {f}")
+                self.emit(f"{cl} = OpExtInst %float %glsl FClamp {z} {lo_f} %f1")
+                self.emit(f"{ab} = OpExtInst %float %glsl FAbs {cl}")
+                self.emit(f"{big} = OpFOrdGreaterThanEqual %bool {ab} {qtr_f}")
+                self.emit(f"{p2} = OpFMul %float {cl} {pow2_f}")
+                self.emit(f"{rc} = OpExtInst %float %glsl RoundEven {cl}")
+                self.emit(f"{r_big} = OpFSub %float {p2} {rc}")
+                self.emit(f"{m} = OpFMul %float {cl} {scale_f}")
+                self.emit(f"{r_sm} = OpExtInst %float %glsl RoundEven {m}")
+                self.emit(f"{rr} = OpSelect %float {big} {r_big} {r_sm}")
+                if snorm:
+                    si_ = self.tmp()
+                    self.emit(f"{si_} = OpConvertFToS %int {rr}")
+                    self.emit(f"{i} = OpBitcast %uint {si_}")
+                else:
+                    self.emit(f"{i} = OpConvertFToU %uint {rr}")
+                self.emit(f"{h} = OpBitwiseAnd %uint {i} {self.cu(0xFFFF)}")
+                halves.append(h)
+            sh, r = self.tmp(), self.tmp()
+            self.emit(f"{sh} = OpShiftLeftLogical %uint {halves[1]} {self.cu(16)}")
+            self.emit(f"{r} = OpBitwiseOr %uint {halves[0]} {sh}")
+            self.dst(a[0], r)
         elif op == "v_cvt_pkrtz_f16_f32":
             # Packs two f32 as f16 into one dword with round-toward-zero (exact, see f16_rtz). The earlier
             # round-to-nearest version produced inf where hardware gives 65504 (found by the GPU smoke test).
