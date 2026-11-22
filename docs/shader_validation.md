@@ -672,7 +672,10 @@ every scalar. `vk_compute_test` reads them back with `VKC_OUT_WORDS` / `VKC_DUMP
   every family, 40 of them `hyp_dpp` (DPP8 with an inactive source and fi = 0 reads 0). This is the first measured
   check of every DPP16 control and mask pair on RDNA2 hardware, and it confirms the rules in the model's docstring
   (and `docs/design.md`): `bound_ctrl` with an invalid source, `fi` on DPP16 and DPP8 inactive sources, an
-  unwritten lane keeping the old vD for non-mov ops, and `row_mask`/`bank_mask` in both wave sizes.
+  unwritten lane keeping the old vD for non-mov ops, and `row_mask`/`bank_mask` in both wave sizes. In the same
+  run (`--oracle translator,hw`), the translator matches all of them as well: 7,206 wave32 native and 7,206 wave64
+  `--wave64-emulate`, with 0 rejected and 0 harness errors. One `vk_compute_test` runs per case, so the translator
+  side takes about 90 minutes there; the hardware side takes about one.
   First results (Radeon 880M, driver 26.11.2): 24,000 programs on the hardware, half wave32 and half native
   wave64, seeds 11 to 16 (4,000 programs each), with and without `--dpp`, 12 to 60 ops, with and without
   `--no-maskdata` and `--no-hw-guard`: match 24,000, mismatch 0, hyp_only 0, rejected 0. 7,652 of them contained
