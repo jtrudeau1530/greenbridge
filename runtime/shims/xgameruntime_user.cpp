@@ -24,6 +24,7 @@
 #include <iterator>
 #include <mutex>
 #include <set>
+#include <unordered_set>
 
 #include <XAsync.h>
 #include <XAsyncProvider.h>
@@ -63,13 +64,14 @@ const char* gamertag() {
     static char tag[16] = "Player";
     static std::once_flag once;
     std::call_once(once, [] {
-        char value[64] = {};
-        size_t length = 0;
-        if (getenv_s(&length, value, "LEONIDA_GAMERTAG") != 0 || length <= 1) return;
+        size_t length = 0;   // with the terminator; 0 when unset
+        if (getenv_s(&length, nullptr, 0, "LEONIDA_GAMERTAG") != 0 || length <= 1) return;
         if (length - 1 > 15) {
             std::fprintf(stderr, "[rt] xgameruntime: LEONIDA_GAMERTAG is longer than 15 characters; using \"Player\"\n");
             return;
         }
+        char value[16] = {};
+        if (getenv_s(&length, value, "LEONIDA_GAMERTAG") != 0) return;
         for (size_t i = 0; i + 1 < length; ++i)
             if (static_cast<unsigned char>(value[i]) < 0x20 || static_cast<unsigned char>(value[i]) > 0x7e) {
                 std::fprintf(stderr, "[rt] xgameruntime: LEONIDA_GAMERTAG is not printable ASCII; using \"Player\"\n");
@@ -81,20 +83,26 @@ const char* gamertag() {
 }
 
 // A title must close every XUserHandle it gets exactly once, so each one is its own allocation; they all name the
-// one local user. The magic tells a live handle from a closed or foreign pointer.
+// one local user. A handle is valid while it is in the live set: it's looked up, never read, so a closed or foreign
+// pointer is refused without touching its memory. The block is freed on close, so the heap may hand its address out
+// again; a stale handle then names a newer live one, which is harmless here since every handle names the same user.
 struct XUserLocal {
-    uint32_t magic;
+    uint32_t unused;
 };
-constexpr uint32_t kHandleMagic = 0x52535558;   // "XUSR"
-constexpr uint32_t kClosedMagic = 0x44534c43;   // "CLSD"
-std::atomic<long> g_open_handles{0};
+std::mutex g_handles_mutex;
+std::unordered_set<const void*> g_handles;
 
 XUserHandle new_handle() {
-    auto* h = new XUserLocal{kHandleMagic};
-    g_open_handles.fetch_add(1);
+    auto* h = new XUserLocal{};
+    std::lock_guard<std::mutex> lock(g_handles_mutex);
+    g_handles.insert(h);
     return h;
 }
-bool valid(XUserHandle h) { return h && h->magic == kHandleMagic; }
+bool valid(XUserHandle h) {
+    if (!h) return false;
+    std::lock_guard<std::mutex> lock(g_handles_mutex);
+    return g_handles.count(h) != 0;
+}
 
 // ---- IXUserImpl (slots 3-36) ----
 
@@ -109,9 +117,10 @@ HRESULT STDMETHODCALLTYPE user_duplicate(void*, XUserHandle handle, XUserHandle*
 
 // 4: void XUserCloseHandle(XUserHandle user)
 void STDMETHODCALLTYPE user_close(void*, XUserHandle user) {
-    if (!valid(user)) return;
-    user->magic = kClosedMagic;
-    g_open_handles.fetch_sub(1);
+    {
+        std::lock_guard<std::mutex> lock(g_handles_mutex);
+        if (!user || g_handles.erase(user) == 0) return;   // closed already, or not ours
+    }
     delete user;
 }
 
@@ -249,8 +258,15 @@ HRESULT STDMETHODCALLTYPE user_get_state(void*, XUserHandle user, XUserState* st
     return S_OK;
 }
 
-// A slot with no public signature (15 is the docs' "unknown"; 47-49 are IXUserImpl6's undocumented sign-out trio):
-// logged once, answers 0 (S_OK / false).
+// A slot with no public signature, logged once. Slot 15 (the docs' "unknown") answers E_NOTIMPL, so a caller fails
+// instead of reading outputs nothing wrote. Slot 47, IXUserImpl6's undocumented XUserIsSignOutPresent, is read as a
+// bool, where E_NOTIMPL's low byte (1) would mean true, so it answers 0 (false: nothing signs out offline).
+template <int Slot> HRESULT STDMETHODCALLTYPE unknown_slot(void*) {
+    static std::atomic<bool> s_logged{false};
+    if (!s_logged.exchange(true))
+        std::fprintf(stderr, "[rt] xgameruntime: XUserImpl slot %d has no public signature; answering E_NOTIMPL\n", Slot);
+    return E_NOTIMPL;
+}
 template <int Slot> uint64_t STDMETHODCALLTYPE private_slot(void*) {
     static std::atomic<bool> s_logged{false};
     if (!s_logged.exchange(true))
@@ -319,9 +335,13 @@ HRESULT STDMETHODCALLTYPE user_register_change(void*, XTaskQueueHandle, void*, X
     return S_OK;
 }
 
+// false means "wait was false and the unregistration is still pending"; nothing is ever pending offline, so it is
+// true for every token, including one already unregistered or never handed out (a title polling with wait = false
+// would otherwise spin).
 bool STDMETHODCALLTYPE user_unregister_change(void*, XTaskQueueRegistrationToken token, bool) {
     std::lock_guard<std::mutex> lock(g_tokens_mutex);
-    return g_tokens.erase(token.token) != 0;
+    g_tokens.erase(token.token);
+    return true;
 }
 
 // 35: HRESULT XUserGetSignOutDeferral(XUserSignOutDeferralHandle* deferral): nothing signs out offline, so there is
@@ -352,8 +372,9 @@ HRESULT STDMETHODCALLTYPE user_add_by_id_result(void*, XAsyncBlock* async, XUser
 
 // ---- IXUserImpl4 (42) ----
 
-// 42: bool XUserIsStoreUser(XUserHandle user): the local user is the one the game was "bought" by.
-bool STDMETHODCALLTYPE user_is_store_user(void*, XUserHandle user) { return valid(user); }
+// 42: bool XUserIsStoreUser(XUserHandle user): the handle is _In_opt_, and the GDK reference says the function
+// always returns true on console.
+bool STDMETHODCALLTYPE user_is_store_user(void*, XUserHandle) { return true; }
 
 // ---- IXUserGamertagImpl (its slot 3) ----
 
@@ -447,7 +468,7 @@ const void* const kUserVtable[] = {
     FN(user_find_by_id),                                                        // 12 XUserFindUserById
     FN(user_get_is_guest),                                                      // 13 XUserGetIsGuest
     FN(user_get_state),                                                         // 14 XUserGetState
-    FN(private_slot<15>),                                                       // 15 (unknown in the docs)
+    FN(unknown_slot<15>),                                                       // 15 (unknown in the docs)
     FN((offline_failure<16, E_FAIL>)),                                          // 16 XUserGetGamerPictureAsync
     FN((offline_failure<17, E_FAIL>)),                                          // 17 XUserGetGamerPictureResultSize
     FN((offline_failure<18, E_FAIL>)),                                          // 18 XUserGetGamerPictureResult
@@ -510,6 +531,9 @@ bool xgameruntime_user_query(const GUID& class_id, REFIID interface_id, void** o
 }
 
 // For tests: the XUserHandles a title holds open.
-long xgameruntime_user_open_handles() { return g_open_handles.load(); }
+long xgameruntime_user_open_handles() {
+    std::lock_guard<std::mutex> lock(g_handles_mutex);
+    return static_cast<long>(g_handles.size());
+}
 
 }  // namespace rt::shims

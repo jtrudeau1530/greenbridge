@@ -162,8 +162,10 @@ int main(int argc, char** argv) {
     XTaskQueueRegistrationToken reg{};
     check(at<Register>(user, 33)(user, nullptr, nullptr, on_change, &reg) == S_OK && reg.token != 0,
           "XUserRegisterForChangeEvent hands out a token");
-    check(at<Unregister>(user, 34)(user, reg, true) && !at<Unregister>(user, 34)(user, reg, true),
-          "XUserUnregisterForChangeEvent: true once, then false for the same token");
+    check(at<Unregister>(user, 34)(user, reg, false) && at<Unregister>(user, 34)(user, reg, false) &&
+              at<Unregister>(user, 34)(user, XTaskQueueRegistrationToken{999}, false),
+          "XUserUnregisterForChangeEvent: true, also with wait = false for a token already gone or never issued "
+          "(false would mean still pending, which never happens offline)");
     void* deferral = reinterpret_cast<void*>(1);
     check(at<Deferral>(user, 35)(user, &deferral) == E_GAMEUSER_DEFERRAL_NOT_AVAILABLE && deferral == nullptr,
           "XUserGetSignOutDeferral: E_GAMEUSER_DEFERRAL_NOT_AVAILABLE (nothing signs out offline)");
@@ -181,7 +183,13 @@ int main(int argc, char** argv) {
 
     // ---- IXUserImpl4: XUserIsStoreUser (42) ----
     using IsStore = bool(STDMETHODCALLTYPE*)(void*, XUserHandle);
-    check(at<IsStore>(user, 42)(user, h), "XUserIsStoreUser: true");
+    check(at<IsStore>(user, 42)(user, h) && at<IsStore>(user, 42)(user, nullptr),
+          "XUserIsStoreUser: true, also for a null handle (_In_opt_; always true on console)");
+    using Unknown = HRESULT(STDMETHODCALLTYPE*)(void*, XUserHandle, size_t, char*, size_t*);
+    char probe[16] = "untouched";
+    size_t probe_used = 42;
+    check(at<Unknown>(user, 15)(user, h, sizeof(probe), probe, &probe_used) == E_NOTIMPL,
+          "slot 15 (no public signature) answers E_NOTIMPL rather than S_OK with nothing written");
 
     // ---- IXUserGamertagImpl: XUserGetGamertag (3) ----
     using GetTag = HRESULT(STDMETHODCALLTYPE*)(void*, XUserHandle, uint32_t, size_t, char*, size_t*);
@@ -210,6 +218,9 @@ int main(int argc, char** argv) {
     check(rt::shims::xgameruntime_user_open_handles() == 6, "six handles are open: two adds, two finds, an add by id and a duplicate");
     for (XUserHandle x : {h, h_picker, by_local, by_id, h_by_id, dup}) at<Close>(user, 4)(user, x);
     check(rt::shims::xgameruntime_user_open_handles() == 0, "XUserCloseHandle closes each of them");
+    at<Close>(user, 4)(user, h);   // a double close: the handle is looked up, not read, so this is a no-op
+    check(rt::shims::xgameruntime_user_open_handles() == 0 && at<GetBool>(user, 13)(user, h, &guest) == E_INVALIDARG,
+          "a closed handle is refused and closing it again does nothing");
 
     std::printf("xgameruntime_user_test: %d of %d checks failed\n", g_failures, g_checks);
     return g_failures ? 1 : 0;

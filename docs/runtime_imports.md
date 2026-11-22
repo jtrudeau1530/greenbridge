@@ -212,8 +212,12 @@ The executable's first boot confirms them, or names the slots that differ.
   starting (`E_GAMEUSER_FAILED_TO_GET_TOKEN`, `E_FAIL`, `E_GAMEUSER_FAILED_TO_RESOLVE`), so no `XAsyncBlock` waits.
   `XUserGetSignOutDeferral` is `E_GAMEUSER_DEFERRAL_NOT_AVAILABLE`, and change callbacks are only tracked as tokens,
   because the user never changes.
-- **Logged on first use:** the docs' unknown slot 15, the PC-only `IXUserImpl5` slots and `IXUserImpl6`'s
-  undocumented sign-out trio.
+- **Logged on first use:** the docs' unknown slot 15 (answers `E_NOTIMPL`, so nothing reads outputs it didn't
+  write), the PC-only `IXUserImpl5` slots and `IXUserImpl6`'s undocumented sign-out trio (`XUserIsSignOutPresent`, a
+  bool, answers false).
+- **Validity:** handles are looked up in a live set, never read, so a closed or foreign pointer is refused without
+  touching its memory, and a double close does nothing. Unregistering a change callback is never pending, so it
+  returns true for any token. `XUserIsStoreUser` is true, as documented for console.
 
 `xgameruntime_user_test` calls every served slot with the documented arguments.
 
