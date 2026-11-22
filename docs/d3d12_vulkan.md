@@ -1567,7 +1567,12 @@ Not implemented yet:
   application-state restoration requirement above applies. A predicated copy inside an active pipeline-statistics
   query is rejected to avoid counting internal compute work.
   Synthetic checks: `predicated_copy_test` covers preparation and rejection paths without a GPU;
-  `d3d12_predicated_copy_test` compares 180 byte-exact cases against WARP and an independent literal oracle;
+  `d3d12_predicated_copy_test` compares 180 byte-exact cases against WARP and an independent literal oracle,
+  plus 16 query-to-copy cases: real empty ordinary/binary occlusion queries resolve zero into a default-heap
+  predicate at offsets 0/16, both predicate operations govern copies, and executing overwrite copies replace zero
+  with a high-word-only value. Four paired controls verify that recapturing the same address changes exactly one
+  13-byte destination region; without recapture, later copies keep using the captured zero. Predicate-buffer guards
+  and all untouched destination bytes are checked too. These query cases do not cover nonzero visible-draw counts;
   `vk_predicated_copy_test` forces small windows and dispatches, arena prefixes, dependent copies, offset rebinding,
   reset, 32 gated plus 32 reused submissions, failed-submit cleanup and host stages on all three queue kinds.
   Binary and overlapping occlusion fixtures also verify that query results resolve under a false predicate while
