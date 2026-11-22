@@ -433,5 +433,162 @@ class TestBufferAtomicSmaxAST(unittest.TestCase):
         self.assertEqual(s32(mem.read_u32(0)), -10)
 
 
+class ScalarRegisterFile:
+    """Scalar processor register file maintaining 256 VGPRs and 106 SGPRs."""
+
+    def __init__(self) -> None:
+        self.vgprs = [0] * 256
+        self.sgprs = [0] * 106
+
+    def read_vgpr(self, idx: int) -> int:
+        return self.vgprs[idx]
+
+    def write_vgpr(self, idx: int, val: int) -> None:
+        self.vgprs[idx] = val & MASK32
+
+    def read_sgpr(self, idx: int) -> int:
+        return self.sgprs[idx]
+
+    def write_sgpr(self, idx: int, val: int) -> None:
+        self.sgprs[idx] = val & MASK32
+
+
+class ScalarBufferInterpreter:
+    """Deterministic scalar interpreter executing buffer_atomic_smax."""
+
+    def __init__(self, mem: BufferMemory, rf: ScalarRegisterFile | None = None) -> None:
+        self.mem = mem
+        self.rf = rf if rf is not None else ScalarRegisterFile()
+
+    def set_buffer_descriptor(self, sgpr_base: int, desc: BufferResourceDescriptor) -> None:
+        d0, d1, d2, d3 = desc.to_dwords()
+        self.rf.write_sgpr(sgpr_base, d0)
+        self.rf.write_sgpr(sgpr_base + 1, d1)
+        self.rf.write_sgpr(sgpr_base + 2, d2)
+        self.rf.write_sgpr(sgpr_base + 3, d3)
+
+    def step(self, inst: Instruction) -> tuple[int, bool]:
+        d0 = self.rf.read_sgpr(inst.srsrc.index)
+        d1 = self.rf.read_sgpr(inst.srsrc.index + 1)
+        d2 = self.rf.read_sgpr(inst.srsrc.index + 2)
+        d3 = self.rf.read_sgpr(inst.srsrc.index + 3)
+        desc = BufferResourceDescriptor.from_dwords(d0, d1, d2, d3)
+
+        soffset = (
+            self.rf.read_sgpr(inst.soffset.index)
+            if isinstance(inst.soffset, Register)
+            else inst.soffset
+        )
+        vaddr = self.rf.read_vgpr(inst.vaddr.index)
+        cmp_val = self.rf.read_vgpr(inst.vdata.index)
+
+        ret, ok = ref_buffer_atomic_smax(
+            self.mem,
+            desc,
+            soffset=soffset,
+            vaddr=vaddr,
+            cmp_val=cmp_val,
+            inst_offset=inst.mods.offset,
+            glc=inst.mods.glc,
+            offen=inst.mods.offen,
+        )
+
+        if inst.mods.glc:
+            self.rf.write_vgpr(inst.vdata.index, ret)
+
+        return ret, ok
+
+
+class TestBufferAtomicSmaxScalarInterpreter(unittest.TestCase):
+    """Unit tests for deterministic scalar instruction interpreter."""
+
+    def setUp(self) -> None:
+        self.mem = BufferMemory(4096)
+        self.rf = ScalarRegisterFile()
+        self.interp = ScalarBufferInterpreter(self.mem, self.rf)
+        self.desc = BufferResourceDescriptor(base_address=0, stride=0, num_records=1024)
+        self.interp.set_buffer_descriptor(4, self.desc)
+
+    def test_scalar_smax_basic(self) -> None:
+        self.mem.write_u32(0, 100)
+        self.rf.write_vgpr(0, 200)  # vdata
+        self.rf.write_vgpr(1, 0)    # vaddr
+
+        inst = Instruction(
+            opcode=Opcode.BUFFER_ATOMIC_SMAX,
+            vdata=Register(RegKind.VGPR, 0),
+            vaddr=Register(RegKind.VGPR, 1),
+            srsrc=Register(RegKind.SGPR, 4, count=4),
+            soffset=0,
+            mods=BufferAtomicModifiers(offen=True, glc=False),
+        )
+        ret, ok = self.interp.step(inst)
+        self.assertTrue(ok)
+        self.assertEqual(self.mem.read_u32(0), 200)
+        # Without glc, vdata in register file is not overwritten
+        self.assertEqual(self.rf.read_vgpr(0), 200)
+
+    def test_scalar_smax_with_glc_return(self) -> None:
+        self.mem.write_u32(8, u32(-50))
+        self.rf.write_vgpr(2, u32(-10))  # vdata
+        self.rf.write_vgpr(3, 8)         # vaddr
+
+        inst = Instruction(
+            opcode=Opcode.BUFFER_ATOMIC_SMAX,
+            vdata=Register(RegKind.VGPR, 2),
+            vaddr=Register(RegKind.VGPR, 3),
+            srsrc=Register(RegKind.SGPR, 4, count=4),
+            soffset=0,
+            mods=BufferAtomicModifiers(offen=True, glc=True),
+        )
+        ret, ok = self.interp.step(inst)
+        self.assertTrue(ok)
+        # Memory is updated to max(-50, -10) = -10
+        self.assertEqual(s32(self.mem.read_u32(8)), -10)
+        # Pre-operation value (-50) returned to vdata
+        self.assertEqual(s32(ret), -50)
+        self.assertEqual(s32(self.rf.read_vgpr(2)), -50)
+
+    def test_scalar_smax_oob_suppression(self) -> None:
+        self.rf.write_vgpr(0, 999)
+        self.rf.write_vgpr(1, 1024)  # OOB
+
+        inst = Instruction(
+            opcode=Opcode.BUFFER_ATOMIC_SMAX,
+            vdata=Register(RegKind.VGPR, 0),
+            vaddr=Register(RegKind.VGPR, 1),
+            srsrc=Register(RegKind.SGPR, 4, count=4),
+            soffset=0,
+            mods=BufferAtomicModifiers(offen=True, glc=True),
+        )
+        ret, ok = self.interp.step(inst)
+        self.assertFalse(ok)
+        self.assertEqual(ret, 0)
+        self.assertEqual(self.rf.read_vgpr(0), 0)
+
+    def test_scalar_smax_repeatability(self) -> None:
+        self.mem.write_u32(16, u32(-100))
+        self.rf.write_vgpr(0, u32(-80))
+        self.rf.write_vgpr(1, 16)
+
+        inst = Instruction(
+            opcode=Opcode.BUFFER_ATOMIC_SMAX,
+            vdata=Register(RegKind.VGPR, 0),
+            vaddr=Register(RegKind.VGPR, 1),
+            srsrc=Register(RegKind.SGPR, 4, count=4),
+            soffset=0,
+            mods=BufferAtomicModifiers(offen=True, glc=True),
+        )
+        ret1, _ = self.interp.step(inst)
+        self.assertEqual(s32(ret1), -100)
+        self.assertEqual(s32(self.mem.read_u32(16)), -80)
+
+        # Step again with smaller value (-90): memory remains -80, returns -80
+        self.rf.write_vgpr(0, u32(-90))
+        ret2, _ = self.interp.step(inst)
+        self.assertEqual(s32(ret2), -80)
+        self.assertEqual(s32(self.mem.read_u32(16)), -80)
+
+
 if __name__ == "__main__":
     unittest.main()
