@@ -492,6 +492,71 @@ class Wavefront:
 
 
 # ---------------------------------------------------------------------------
+# Condition Codes, Status Flags, and Carry/Borrow Model
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class StatusFlags:
+    """IEEE-754 / RDNA2 floating-point exception status flags."""
+    invalid_op: bool = False
+    div_by_zero: bool = False
+    overflow: bool = False
+    underflow: bool = False
+    inexact: bool = False
+
+
+def evaluate_status_flags_rsq_f16(
+    src0_bits: int,
+    abs_mod: bool = False,
+    neg_mod: bool = False,
+    ftz: bool = False,
+) -> StatusFlags:
+    """Evaluate floating-point exception flags according to IEEE-754 / RDNA2 spec."""
+    s0 = apply_f16_input_modifiers(src0_bits, abs_mod=abs_mod, neg_mod=neg_mod)
+
+    # Signaling NaN or Negative input (excluding negative zero) raises Invalid Op
+    if is_snan_f16(s0):
+        return StatusFlags(invalid_op=True)
+    if is_nan_f16(s0):
+        return StatusFlags()
+    if bool(s0 & SIGN_MASK_16) and not is_zero_f16(s0):
+        return StatusFlags(invalid_op=True)
+
+    # Division by Zero raised on +/- 0.0
+    if is_zero_f16(s0):
+        return StatusFlags(div_by_zero=True)
+
+    if s0 == H_POS_INF:
+        return StatusFlags()
+
+    # Exact powers of 2 with even exponent: 1/sqrt(2^(2k)) = 2^(-k) are exact
+    # In binary16, powers of 4 (e.g. 0.0625, 0.25, 1.0, 4.0, 16.0, 64.0) have fraction == 0
+    # and even biased exponent.
+    _, exp, frac = split_f16_bits(s0)
+    is_exact_power = (frac == 0) and ((exp - 15) % 2 == 0)
+    return StatusFlags(inexact=not is_exact_power)
+
+
+def classify_f16(bits: int) -> int:
+    """Compute RDNA2 v_cmp_class_f16 classification bitmask.
+
+    Bits:
+      0: sNaN, 1: qNaN, 2: -inf, 3: -normal, 4: -subnormal,
+      5: -zero, 6: +zero, 7: +subnormal, 8: +normal, 9: +inf
+    """
+    sign, exp, frac = split_f16_bits(bits)
+    if exp == 0x1F:
+        if frac == 0:
+            return 1 << 2 if sign else 1 << 9
+        return 1 << 0 if is_snan_f16(bits) else 1 << 1
+    if exp == 0:
+        if frac == 0:
+            return 1 << 5 if sign else 1 << 6
+        return 1 << 4 if sign else 1 << 7
+    return 1 << 3 if sign else 1 << 8
+
+
+# ---------------------------------------------------------------------------
 # Unit Test Suites
 # ---------------------------------------------------------------------------
 
@@ -804,6 +869,72 @@ class TestRegisterAliasingRSQF16(unittest.TestCase):
         step3 = interp.step(ASTRsqF16(dst=dst, src0=src))
         val3 = bits_to_f16(step3)
         self.assertTrue(math.isclose(val3, 1.0 / math.sqrt(2.0), rel_tol=1e-3))
+
+
+class TestConditionCodesAndStatusFlagsRSQF16(unittest.TestCase):
+    """Unit tests verifying condition codes, IEEE-754 status flags, and classification."""
+
+    def test_division_by_zero_flag(self) -> None:
+        flags_pos_zero = evaluate_status_flags_rsq_f16(H_POS_ZERO)
+        self.assertTrue(flags_pos_zero.div_by_zero)
+        self.assertFalse(flags_pos_zero.invalid_op)
+
+        flags_neg_zero = evaluate_status_flags_rsq_f16(H_NEG_ZERO)
+        self.assertTrue(flags_neg_zero.div_by_zero)
+        self.assertFalse(flags_neg_zero.invalid_op)
+
+    def test_invalid_operation_flag_on_negatives_and_snan(self) -> None:
+        # Negative finite values raise invalid operation
+        flags_neg = evaluate_status_flags_rsq_f16(f16_to_bits(-4.0))
+        self.assertTrue(flags_neg.invalid_op)
+        self.assertFalse(flags_neg.div_by_zero)
+
+        # -inf raises invalid op
+        flags_neg_inf = evaluate_status_flags_rsq_f16(H_NEG_INF)
+        self.assertTrue(flags_neg_inf.invalid_op)
+
+        # Signaling NaN raises invalid op
+        flags_snan = evaluate_status_flags_rsq_f16(H_SNAN)
+        self.assertTrue(flags_snan.invalid_op)
+
+        # Quiet NaN does not raise invalid op
+        flags_qnan = evaluate_status_flags_rsq_f16(H_QNAN)
+        self.assertFalse(flags_qnan.invalid_op)
+
+    def test_inexact_flag_precision(self) -> None:
+        # Exact powers have inexact == False
+        flags_1 = evaluate_status_flags_rsq_f16(H_ONE)
+        self.assertFalse(flags_1.inexact)
+        flags_4 = evaluate_status_flags_rsq_f16(H_FOUR)
+        self.assertFalse(flags_4.inexact)
+        flags_16 = evaluate_status_flags_rsq_f16(H_SIXTEEN)
+        self.assertFalse(flags_16.inexact)
+
+        # Arbitrary floats (e.g. 2.0, 3.0, 5.0) have inexact == True
+        flags_2 = evaluate_status_flags_rsq_f16(H_TWO)
+        self.assertTrue(flags_2.inexact)
+        flags_3 = evaluate_status_flags_rsq_f16(f16_to_bits(3.0))
+        self.assertTrue(flags_3.inexact)
+
+    def test_rdna2_classification_mask(self) -> None:
+        # +0.0 -> bit 6 (0x040)
+        self.assertEqual(classify_f16(H_POS_ZERO), 1 << 6)
+        # -0.0 -> bit 5 (0x020)
+        self.assertEqual(classify_f16(H_NEG_ZERO), 1 << 5)
+        # +inf -> bit 9 (0x200)
+        self.assertEqual(classify_f16(H_POS_INF), 1 << 9)
+        # -inf -> bit 2 (0x004)
+        self.assertEqual(classify_f16(H_NEG_INF), 1 << 2)
+        # qNaN -> bit 1 (0x002)
+        self.assertEqual(classify_f16(H_QNAN), 1 << 1)
+        # sNaN -> bit 0 (0x001)
+        self.assertEqual(classify_f16(H_SNAN), 1 << 0)
+        # +normal 4.0 -> bit 8 (0x100)
+        self.assertEqual(classify_f16(H_FOUR), 1 << 8)
+        # -normal -4.0 -> bit 3 (0x008)
+        self.assertEqual(classify_f16(f16_to_bits(-4.0)), 1 << 3)
+        # +subnormal -> bit 7 (0x080)
+        self.assertEqual(classify_f16(H_MIN_SUBNORMAL), 1 << 7)
 
 
 if __name__ == "__main__":
