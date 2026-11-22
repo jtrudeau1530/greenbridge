@@ -3,6 +3,7 @@
 //      present actually submits its zero-fill).
 //   2. With enable_capture(), every frame's vkCmdCopyImageToBuffer into the shared capture buffer is preceded by a
 //      TRANSFER_WRITE -> TRANSFER_WRITE barrier to prevent WRITE_AFTER_WRITE hazards across the two in-flight frames.
+//      A failed capture fence wait also leaves the caller's outputs untouched.
 //   3. Concurrent present() + VulkanQueue::execute() + add_resource()/remove_resource() follows VulkanContext's
 //      resource_mutex_ -> tracker_mutex_ -> submit_mutex_ lock hierarchy without data races or deadlocks.
 // Skips with exit code 77 when no Vulkan 1.3 device with Win32 presentation is available. No game data.
@@ -54,10 +55,12 @@ PFN_vkGetInstanceProcAddr real_get_instance = nullptr;
 PFN_vkGetDeviceProcAddr real_get_device = nullptr;
 PFN_vkQueueSubmit real_submit = nullptr;
 PFN_vkQueuePresentKHR real_present = nullptr;
+PFN_vkWaitForFences real_wait = nullptr;
 PFN_vkCmdPipelineBarrier real_barrier = nullptr;
 PFN_vkCmdCopyImageToBuffer real_copy_i2b = nullptr;
 
 std::atomic<VkResult> fail_next_submit{VK_SUCCESS};
+std::atomic<VkResult> fail_next_wait{VK_SUCCESS};
 std::function<void()> on_next_present;
 std::atomic<bool> observe_capture{false};
 std::atomic<bool> saw_capture_waw{false};
@@ -78,6 +81,13 @@ VKAPI_ATTR VkResult VKAPI_CALL queue_present(VkQueue queue, const VkPresentInfoK
         cb();
     }
     return real_present(queue, info);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL wait_for_fences(VkDevice device, std::uint32_t count, const VkFence* fences,
+                                               VkBool32 wait_all, std::uint64_t timeout) {
+    const VkResult armed = fail_next_wait.exchange(VK_SUCCESS);
+    if (armed != VK_SUCCESS) return armed;
+    return real_wait(device, count, fences, wait_all, timeout);
 }
 
 VKAPI_ATTR void VKAPI_CALL cmd_pipeline_barrier(VkCommandBuffer cb, VkPipelineStageFlags src_stage,
@@ -116,6 +126,7 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL get_device(VkDevice device, const char*
     const std::string_view n = name;
     if (n == "vkQueueSubmit") return reinterpret_cast<PFN_vkVoidFunction>(queue_submit);
     if (n == "vkQueuePresentKHR") return reinterpret_cast<PFN_vkVoidFunction>(queue_present);
+    if (n == "vkWaitForFences") return reinterpret_cast<PFN_vkVoidFunction>(wait_for_fences);
     if (n == "vkCmdPipelineBarrier") return reinterpret_cast<PFN_vkVoidFunction>(cmd_pipeline_barrier);
     if (n == "vkCmdCopyImageToBuffer") return reinterpret_cast<PFN_vkVoidFunction>(cmd_copy_image_to_buffer);
     return real_get_device(device, name);
@@ -131,6 +142,7 @@ void install(PFN_vkGetInstanceProcAddr instance_proc, VkInstance instance, VkDev
     real_get_device = reinterpret_cast<PFN_vkGetDeviceProcAddr>(instance_proc(instance, "vkGetDeviceProcAddr"));
     real_submit = reinterpret_cast<PFN_vkQueueSubmit>(real_get_device(device, "vkQueueSubmit"));
     real_present = reinterpret_cast<PFN_vkQueuePresentKHR>(real_get_device(device, "vkQueuePresentKHR"));
+    real_wait = reinterpret_cast<PFN_vkWaitForFences>(real_get_device(device, "vkWaitForFences"));
     real_barrier = reinterpret_cast<PFN_vkCmdPipelineBarrier>(real_get_device(device, "vkCmdPipelineBarrier"));
     real_copy_i2b = reinterpret_cast<PFN_vkCmdCopyImageToBuffer>(real_get_device(device, "vkCmdCopyImageToBuffer"));
 }
@@ -256,9 +268,13 @@ int main() {
         EXPECT(seen_during_present == VK_IMAGE_LAYOUT_GENERAL);
         EXPECT(context.layout(1, 0) == VK_IMAGE_LAYOUT_GENERAL);
         for (ResourceId extra = 1000; extra < 1512; ++extra) context.remove_resource(extra);
-        std::vector<std::uint8_t> pixels;
-        VkExtent2D ext{};
-        VkFormat fmt = VK_FORMAT_UNDEFINED;
+        std::vector<std::uint8_t> pixels{0x7f};
+        VkExtent2D ext{1, 2};
+        VkFormat fmt = VK_FORMAT_R8_UNORM;
+        driver::fail_next_wait = VK_ERROR_DEVICE_LOST;
+        EXPECT(!presenter.read_back(pixels, &ext, &fmt));
+        EXPECT(pixels.size() == 1 && pixels[0] == 0x7f);
+        EXPECT(ext.width == 1 && ext.height == 2 && fmt == VK_FORMAT_R8_UNORM);
         EXPECT(presenter.read_back(pixels, &ext, &fmt));
         EXPECT(pixels.size() == std::size_t(ext.width) * ext.height * 4);
         const std::size_t mid = (std::size_t(ext.height / 2) * ext.width + ext.width / 2) * 4;

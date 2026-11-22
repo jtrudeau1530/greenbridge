@@ -663,7 +663,7 @@ class TestTextureDescriptorParsing(unittest.TestCase):
         self.arch_dir = os.path.join(self.carve, self.arch)
         os.makedirs(self.arch_dir, exist_ok=True)
 
-    def _make_synthetic_texture_blobs(self, w=512, h=256, depth=1, fmt=71, data_off=0x1000, mips=9):
+    def _make_synthetic_texture_blobs(self, w=512, h=256, depth=1, fmt=71, data_off=0x1000, mips=9, *, dtype: int = 0x980):
         cpu_off = 0x1000
         gpu_off = 0x2000
 
@@ -681,7 +681,7 @@ class TestTextureDescriptorParsing(unittest.TestCase):
 
         k = 10
         qwords[k - 2] = 0xCAFEBABE00000001
-        qwords[k - 1] = 0x980
+        qwords[k - 1] = dtype
         qwords[k] = 0x60000000 + data_off
         d_bytes = struct.pack("<HHHBB", w, h, depth, 0x42, fmt)
         qwords[k + 4] = struct.unpack("<Q", d_bytes)[0]
@@ -736,9 +736,30 @@ class TestTextureDescriptorParsing(unittest.TestCase):
         results = tex_headers.scan_archive(self.carve, self.arch)
         self.assertEqual(len(results), 0)
 
+    def test_cli_indexes_a_small_texture_with_its_gpu_location(self) -> None:
+        cpu_off, gpu_off, index = self._make_synthetic_texture_blobs(w=2, h=3, fmt=28, mips=2)
+        output = os.path.join(self.carve, "textures.json")
+        with mock.patch.object(sys, "argv", ["tex_headers.py", self.carve, "--out", output]), \
+                contextlib.redirect_stdout(io.StringIO()):
+            tex_headers.main()
+        with open(output, encoding="utf-8") as handle:
+            entries = json.load(handle)
+        self.assertEqual(len(entries), 1)
+        entry = entries[0]
+        self.assertEqual((entry["w"], entry["h"], entry["depth"], entry["mips"]), (2, 3, 1, 2))
+        self.assertEqual(entry["fmt_name"], "R8G8B8A8_UNORM")
+        self.assertEqual((entry["cpu"], entry["gpu"], entry["data_off"], entry["q_index"]),
+                         (cpu_off, gpu_off, 0x1000, index))
+
+    def test_narrow_texture_requires_a_known_type_and_valid_mips(self) -> None:
+        for dtype, mips in ((0x900, 1), (0x980, 0), (0x980, 3)):
+            with self.subTest(dtype=dtype, mips=mips):
+                self._make_synthetic_texture_blobs(w=1, h=2, fmt=28, mips=mips, dtype=dtype)
+                self.assertEqual(tex_headers.scan_archive(self.carve, self.arch), [])
+
     def test_scan_archive_invalid_dimensions_rejected(self):
-        # Width < 4
-        self._make_synthetic_texture_blobs(w=2, h=256)
+        # Zero width
+        self._make_synthetic_texture_blobs(w=0, h=256)
         self.assertEqual(len(tex_headers.scan_archive(self.carve, self.arch)), 0)
 
         # Height > 16384

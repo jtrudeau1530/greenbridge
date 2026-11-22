@@ -433,8 +433,11 @@ u32; u32 count}` with `Entry {u64 key; T *value; Entry *next}`. Hashes are `joaa
 | | `+0x50` array | sequence pointers |
 | | `+0x60` array, 12-byte items | tracks `{u32 bone hash; u32 track type; u32 format}` |
 
-A clip plays its animations at the same time, each over its own `[start, end]` window. In the samples, the
-animations of one clip covered different bones and could have different frame rates.
+A clip plays its animations at the same time, each over its own `[start, end]` window at its rate: animation time
+`t` is clip time `(t − start) / rate`, and `(end − start) / rate` equals the clip's `+0x78` duration (4,471 of 4,471
+entries in 300 sampled dictionaries). In the samples, the animations of one clip covered different bones and could
+have different frame rates. `tools/anim_glb.py` plays clips on a fragment skeleton and writes them as glTF
+animations; see [character_skeleton.md](character_skeleton.md#animated-gltf-export).
 
 **Track types** are `joaat32` of their names. This is the meaning of the recurring `0x98e1750c` noted above:
 

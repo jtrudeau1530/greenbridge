@@ -52,6 +52,7 @@ import time
 import unicodedata
 import zlib
 from collections import Counter
+from collections.abc import Iterator
 
 BASE = 0x50000000
 ZHDR = re.compile(rb"\x78[\x01\x5e\x9c\xda]")
@@ -187,13 +188,18 @@ def walk(m, start, size):
         pos = s + used
 
 
+def carved_files(root: str) -> Iterator[os.DirEntry[str]]:
+    with os.scandir(root) as entries:
+        for entry in entries:
+            if not entry.name.lower().endswith((".json", ".csv")) and entry.is_file():
+                yield entry
+
+
 def walk_dir(root):
     """Yield (offset, None, data) from carved files sorted by leading hex offset, then name."""
     entries = []
-    for name in os.listdir(root):
-        full = os.path.join(root, name)
-        if not os.path.isfile(full) or name.lower().endswith((".json", ".csv")):
-            continue
+    for entry in carved_files(root):
+        name, full = entry.name, entry.path
         if os.path.getsize(full) > MAX_INFLATE:
             raise ValueError("%s exceeds %d-byte limit" % (full, MAX_INFLATE))
         mt = HEX_PREFIX.match(name)
@@ -1002,8 +1008,14 @@ def main(argv=None):
     if a.csv and same_report_path(out, a.csv):
         ap.error("--out and --csv must use different paths")
     for flag, path in (("--out", out), ("--csv", a.csv)):
-        if path and same_report_path(path, a.input):
+        if not path:
+            continue
+        if same_report_path(path, a.input):
             ap.error(f"{flag} would overwrite the input {a.input}")
+        if os.path.isfile(path) and os.path.isdir(a.input):
+            for entry in carved_files(a.input):
+                if same_report_path(path, entry.path):
+                    ap.error(f"{flag} would overwrite the input {entry.path}")
     rows = [] if a.csv else None
     try:
         summary = scan(a.input, a.start, a.limit, a.deep, rows)

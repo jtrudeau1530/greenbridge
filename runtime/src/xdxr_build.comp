@@ -24,11 +24,12 @@
 // grouping is kept, so there is no Morton pass and no sort), and MODE_HEADER rewrites the bounds.
 //   MODE_COPY      one thread per word: count words from src0 to dst
 //   MODE_COPY_AS   CopyRaytracingAccelerationStructure CLONE / COMPACT: the source structure's size comes from its
-//                  header (totalSizeIn64BNodes), so the copy can follow a build in the same list; at most count
+//                  header (totalSizeIn64BNodes, which does not count the 64-byte header: the size is 64 * (field +
+//                  1) bytes), so the copy can follow a build in the same list; at most count
 //                  words. The records are position-independent (node pointers count from the structure's start, and
 //                  a TLAS names its BLASes by address), so the bytes are the copy.
 //   MODE_POSTBUILD one thread: the 8-byte COMPACTED_SIZE or CURRENT_SIZE of the structure at src0, at dst. A build
-//                  is already exactly its layout's size, so both are totalSizeIn64BNodes * 64.
+//                  is already exactly its layout's size, so both are (totalSizeIn64BNodes + 1) * 64.
 // The tree groups four consecutive children per node in Morton order, level by level, so its shape depends only on
 // the element count and the layout (xdxr_build.h XdxrLayout) is known when the command is recorded.
 //
@@ -436,7 +437,7 @@ void build_header() {
     vec3 lo, hi;
     load_box(pc.elements + root, lo, hi);
     store(pc.dst, 0u, (pc.tlas != 0u ? 0u : FLAG_BOTTOM_LEVEL) | VERSION_2403);
-    store(pc.dst, 4u, pc.total_size / 64u);
+    store(pc.dst, 4u, pc.total_size / 64u - 1u);          // totalSizeIn64BNodes does not count the header: 64 * (field + 1) bytes
     store(pc.dst, 8u, 0u);                               // crc32: not computed for runtime builds
     store(pc.dst, 12u, pc.elements);
     storef(pc.dst, 16u, lo.x); storef(pc.dst, 20u, lo.y); storef(pc.dst, 24u, lo.z);
@@ -462,11 +463,11 @@ void main() {
     }
     if (i >= pc.count) return;
     if (pc.mode == MODE_POSTBUILD) {
-        if (i == 0u) { store(pc.dst, 0u, load(pc.src0, 4u) * 64u); store(pc.dst, 4u, 0u); }
+        if (i == 0u) { store(pc.dst, 0u, (load(pc.src0, 4u) + 1u) * 64u); store(pc.dst, 4u, 0u); }
         return;
     }
     if (pc.mode == MODE_COPY_AS) {
-        if (4u * i < load(pc.src0, 4u) * 64u) store(pc.dst, 4u * i, load(pc.src0, 4u * i));
+        if (4u * i < (load(pc.src0, 4u) + 1u) * 64u) store(pc.dst, 4u * i, load(pc.src0, 4u * i));
         return;
     }
     if (pc.mode == MODE_COPY) {

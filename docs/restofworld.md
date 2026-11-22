@@ -480,6 +480,100 @@ Models are present (37 decoded in core, plus 924 name-bearing pages), but the me
 support a claim that these archives hold map placement, compiled scripts, audio banks or UI layout.
 The only UI-adjacent evidence is content-manifest XML and text; there is no UI container signature.
 
+## Content-definition reader (ASSET-149)
+
+`tools/content_definitions.py` reads the three measured XML roots:
+`CDataFileMgr__ContentChangeSetDef`, `CDataFileMgr__ContentDef` and `SSetupData`.
+It accepts local XML files or an existing `rpf9_carve.py` directory and prints only aggregate counts:
+
+```powershell
+python -I tools/content_definitions.py <work>/carve/story000_restofworld
+python -I tools/content_definitions.py <local-content.xml> <local-setup.xml>
+python -I tests/test_content_definitions.py
+```
+
+The Python API `parse_content(byte_chunks)` returns a `ContentDocument` only after the entire document
+parses successfully. Its `kind` is `change_set`, `content` or `setup`; its immutable `root` record preserves
+ordered children, attributes, text and tails, including unknown fields, after normal XML normalization.
+Comments and processing instructions are not configuration fields. The convenience views are:
+
+- `files`: ordered `fileList/Item` entries with `filename`, `file_type` and the original record. `contents`,
+  flags and future fields remain accessible through that record.
+- `included_changesets`: ordered `includedChangesets/Item` records, including `loadPath` and include flags.
+- `included_sets`: ordered `includedSets/Item` records.
+- `change_set_groups`: setup `contentChangeSetGroups/Item` records, preserving `NameHash` and the ordered
+  `ContentChangeSets/Item` children.
+
+`record.select("field", "Item")` selects direct-child paths without collapsing repeated fields;
+`record.scalar("field")` reads a single text or `value`-attribute field. Missing fields return `None`, empty
+fields return `""`, and ambiguous repeated/nested scalars raise `ContentError`. Text scalar access strips
+surrounding whitespace; the underlying record retains it. Values stay strings: hashes, bit flags, phases,
+macros, paths and references are not converted or resolved. No include is opened and no mount is performed.
+The reader does not infer runtime execution order, resource boundaries or a relationship between an XML
+filename and a carved resource. Those still require independent evidence.
+
+`carve_documents(directory)` uses the existing game-data grouper and yields `(offset, stored_bytes, document)`;
+the first two values are the first recovered block offset and sum of compressed block sizes, **not** a named
+RPF entry or a contiguous span including padding. Non-content XML yields `None`. Missing carved blocks raise
+an error instead of substituting the index's header bytes. This path inherits the grouper's recovery limits.
+The parser retains one complete XML document, limited to 64 MiB and 128 nested elements by default (`max_bytes`
+can change the byte limit); the grouping step itself is not subject to that parser limit. DTDs are refused.
+The CLI reports failed input counts and returns nonzero on failure; successful documents earlier in a failed
+carve remain in the counts. It emits no input values, paths or exception text. API records contain game data
+and must stay local, as must the carve and its index.
+
+Full scans of the four archives in this note recovered **30 content XML documents**, all accepted, with
+no record differences against an independent ElementTree parse of each reassembled payload:
+
+| Archive | Change sets | Content definitions | Setup documents | File entries | Included change sets | Setup groups |
+|---|---:|---:|---:|---:|---:|---:|
+| `core_restofworld` | 8 | 1 | 1 | 33 | 8 | 4 |
+| `story000_restofworld` | 11 | 1 | 1 | 28 | 11 | 2 |
+| `core_restofworld001` | 2 | 1 | 1 | 3 | 2 | 1 |
+| `core_licenses_data` | 1 | 1 | 1 | 1 | 1 | 1 |
+| **Total** | **22** | **4** | **4** | **65** | **22** | **8** |
+
+There are zero `includedSets/Item` entries in these documents. Counts cover the four complete archives,
+not a sample of the separate 20 GB `story000.rpf`. The check compares tags, attributes, text, tails and
+child order; it establishes parsing fidelity, not the game's interpretation of flags or references.
+Synthetic tests cover the three schemas, unknown fields, symbolic references, duplicate/ambiguous fields,
+chunk boundaries, UTF-16, malformed/DTD input, limits, split carve payloads, missing blocks and the CLI.
+
+## Textures (`ASSET-148`)
+
+The stream-start scan above found zero `DDS`, `TXTR`, `DXT` or `BC` signatures because rest-of-world textures are
+not raw stream-start images. Measured on the 1.0.2.1 package, they live in two places:
+
+1. **Embedded RAGE9 `0x980` texture descriptors inside `zero-prefix` CPU-segment streams** (the same `grcTexture`
+   layout `tools/tex_headers.py` reads in the main archives: `q[k-1] == 0x980`, 256-byte-aligned GPU pointer
+   `0x60000000 + offset` at `q[k]`, `(width, height, depth, byte6, dxgi_format)` at `q[k+4]`, `flags | (mips << 16)`
+   at `q[k+5]`), paired with the following GPU-segment stream chain. `tools/restofworld_index.py` now detects these
+   descriptors inside `zero-prefix` streams (`tex980=`, `dict=`, and summary fields `texture_streams`,
+   `texture_dictionaries`, `texture_headers`):
+
+   | Archive | Texture streams | Standalone `pgDictionary` | Total `0x980` headers | GPU chain fit | Formats and tiling |
+   |---|---:|---:|---:|---:|---|
+   | `core_restofworld.rpf` | 145 | 144 (72×1, 72×2) | 278 | 278 / 278 | 216 tiled (`flags & 0xffff = 0x5`, 1–10 mips: `BC1_UNORM` 146, `BC1_UNORM_SRGB` 31, `BC7_UNORM` 26, `BC5_UNORM` 9, `BC7_UNORM_SRGB` 4) in the 144 dictionaries; 62 linear (`0x0`, 1 mip, `R16G16B16A16_FLOAT`, e.g. `16x4`–`16x10`) in one 576 KiB resource page |
+   | `story000_restofworld.rpf` | 1 | 0 | 51 | 51 / 51 | 51 linear (`0x0`, 1 mip, `R16G16B16A16_FLOAT`, `16x4`–`16x10`) in one 320 KiB resource page |
+   | `core_restofworld001.rpf` | 0 | 0 | 0 | — | textures are in the companion TTPF pool below |
+   | `story000_script.rpf` | 0 | 0 | 0 | — | none |
+
+   All 329 embedded descriptors across these archives have `dtype = 0x980`, `depth = 1`, `byte6 = 1`, and 100% fit
+   within their following GPU-segment stream chain (`data_off + mip0_bytes <= gpu_chain_bytes`).
+
+2. **Companion RDS5/TTPF texture pools** alongside the archives under `pack/core_restofworld*/data/ttdb/` (6 pools,
+   88,795,904 bytes total, **635** 2D textures, already walked and exported by `make_game.py`'s `assets` stage
+   under `ttpf_pack/core_restofworld/` and `ttpf_pack/core_restofworld001/`):
+
+   | Pool | Bytes | Textures | Formats |
+   |---|---:|---:|---|
+   | `pack/core_restofworld/data/ttdb/props/ttdb_props.ttpf` | 35,286,784 | 211 | `BC1_UNORM` 110, `BC1_UNORM_SRGB` 72, `BC7_UNORM_SRGB` 11, `BC7_UNORM` 9, `BC3_UNORM_SRGB` 8, `BC6H_UF16` 1 |
+   | `pack/core_restofworld/data/ttdb/textures_loose.ttpf` | 21,081,856 | 194 | `BC1_UNORM` 89, `BC4_UNORM` 67, `BC7_UNORM` 17, `BC7_UNORM_SRGB` 13, `BC5_UNORM` 5, `BC6H_UF16` 2, `BC3_UNORM_SRGB` 1 |
+   | `pack/core_restofworld/data/ttdb/peds/ttdb_peds.ttpf` | 24,529,408 | 165 | `BC1_UNORM` 67, `BC1_UNORM_SRGB` 46, `BC7_UNORM` 35, `BC5_UNORM` 9, `BC7_UNORM_SRGB` 5, `BC3_UNORM_SRGB` 1, other 2 |
+   | `pack/core_restofworld/data/ttdb/ui/ttdb_ui.ttpf` | 4,729,600 | 43 | `BC1_UNORM` 37, `BC7_UNORM` 6 |
+   | `pack/core_restofworld/data/ttdb/vfx/ttdb_vfx.ttpf` | 3,129,600 | 17 | `BC7_UNORM_SRGB` 5, `BC1_UNORM` 5, `BC5_UNORM` 5, `BC4_UNORM` 1, `BC3_UNORM_SRGB` 1 |
+   | `pack/core_restofworld001/data/ttdb/ui/ttdb_ui.ttpf` | 38,656 | 5 | `BC7_UNORM` 3, `BC3_UNORM` 2 |
+
 ## What a future decoder needs
 
 1. The RPF9 table-of-contents key/schema for names, paths and exact entry boundaries. This project
@@ -498,10 +592,12 @@ The only UI-adjacent evidence is content-manifest XML and text; there is no UI c
    a page-graph rule.
 7. A vertex decoder for `42 40 00 00` blocks. ASSET-57 measured recurring stream widths;
    decoding vertex values still requires component types, final-stream widths and a way to
-   locate the owning geometry when only a graphics page is available. Texture identification also remains open:
-   the stream-start scan found no DDS, `TXTR`, DXT or BC signature.
-8. An XML content-definition reader. The roots are content change sets, content definitions and
-   `SSetupData`; this is configuration, not UI layout.
+   locate the owning geometry when only a graphics page is available. (Texture identification is
+   resolved above under **Textures (`ASSET-148`)**: embedded `0x980` descriptors in `zero-prefix`
+   CPU-segment streams plus the companion `ttdb/*.ttpf` pools.)
+8. Runtime consumers for the XML content-definition records read by `tools/content_definitions.py`
+   (see above). Their roots describe configuration, not UI layout; reference resolution and mapping
+   to resources remain unimplemented.
 9. A false-positive-aware magic scanner. `ADAT` inside `METADATA`, `AWC` inside names and `ATI2` inside
    a page are measured examples; only validated stream starts and fixed headers count.
 
