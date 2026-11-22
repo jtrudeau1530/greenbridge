@@ -1092,5 +1092,161 @@ class TestIEEE754BoundaryExtremes(unittest.TestCase):
         self.assertEqual(res2, 0x3802)
 
 
+class TestNegativeControlsAndMutations(unittest.TestCase):
+    """Unit tests for negative controls, syntax rejection, and mutation detection."""
+
+    def test_syntax_rejection_invalid_register_indices(self) -> None:
+        with self.assertRaises(ValueError):
+            Reg16(-1, RegType.VGPR)
+        with self.assertRaises(ValueError):
+            Reg16(256, RegType.VGPR)
+
+    def test_syntax_rejection_valu_destination_must_be_vgpr(self) -> None:
+        dst_sgpr = Reg16(0, RegType.SGPR)
+        src = VOP3Operand16(Reg16(2, RegType.VGPR))
+        with self.assertRaises(TypeError):
+            VAddClampF16Instruction(dst=dst_sgpr, src0=src, src1=src)
+
+    def test_syntax_rejection_invalid_lane_count(self) -> None:
+        with self.assertRaises(ValueError):
+            SIMDState(num_lanes=16)
+        with self.assertRaises(ValueError):
+            SIMDState(num_lanes=128)
+
+    def test_negative_control_bit_flip_detection(self) -> None:
+        s0 = f16_to_bits(0.2)
+        s1 = f16_to_bits(0.3)
+        correct = oracle_v_add_clamp_f16(s0, s1)
+        self.assertAlmostEqual(bits_to_f16(correct), 0.5, places=2)
+
+        # Perturb single mantissa bit
+        corrupted_mantissa = correct ^ 0x1
+        self.assertNotEqual(correct, corrupted_mantissa)
+
+        # Perturb single exponent bit
+        corrupted_exp = correct ^ (1 << 10)
+        self.assertNotEqual(correct, corrupted_exp)
+
+        # Perturb sign bit
+        corrupted_sign = correct ^ SIGN_MASK
+        self.assertNotEqual(correct, corrupted_sign)
+
+    def test_mutation_add_to_sub(self) -> None:
+        """Mutant: Replace addition with subtraction (s0 - s1)."""
+        def mutant_v_add_clamp_f16(s0_bits: int, s1_bits: int) -> int:
+            f0 = bits_to_f16(s0_bits)
+            f1 = bits_to_f16(s1_bits)
+            diff = f0 - f1
+            clamped = min(1.0, max(0.0, diff))
+            return f16_to_bits(clamped)
+
+        s0 = f16_to_bits(0.6)
+        s1 = f16_to_bits(0.2)
+        expected = oracle_v_add_clamp_f16(s0, s1)  # 0.8
+        mutant_res = mutant_v_add_clamp_f16(s0, s1)  # 0.4
+        self.assertNotEqual(expected, mutant_res)
+
+    def test_mutation_ignore_abs_modifier(self) -> None:
+        """Mutant: Ignore abs modifier on negative operand."""
+        def mutant_apply_mod(bits: int, abs_mod: bool, neg_mod: bool) -> int:
+            res = bits & 0xFFFF
+            if neg_mod:
+                res ^= SIGN_MASK
+            return res
+
+        val = f16_to_bits(-0.4)
+        correct = apply_f16_modifiers(val, abs_mod=True, neg_mod=False)
+        mutant = mutant_apply_mod(val, abs_mod=True, neg_mod=False)
+        self.assertAlmostEqual(bits_to_f16(correct), 0.4, places=2)
+        self.assertNotEqual(correct, mutant)
+
+    def test_mutation_ignore_neg_modifier(self) -> None:
+        """Mutant: Ignore neg modifier on positive operand."""
+        def mutant_apply_mod(bits: int, abs_mod: bool, neg_mod: bool) -> int:
+            res = bits & 0xFFFF
+            if abs_mod:
+                res &= ~SIGN_MASK
+            return res
+
+        val = f16_to_bits(0.5)
+        correct = apply_f16_modifiers(val, abs_mod=False, neg_mod=True)
+        mutant = mutant_apply_mod(val, abs_mod=False, neg_mod=True)
+        self.assertEqual(bits_to_f16(correct), -0.5)
+        self.assertNotEqual(correct, mutant)
+
+    def test_mutation_unclamped_upper_bound(self) -> None:
+        """Mutant: Fails to clamp values exceeding 1.0."""
+        s0 = f16_to_bits(0.75)
+        s1 = f16_to_bits(0.5)
+        expected = oracle_v_add_clamp_f16(s0, s1)
+        self.assertEqual(expected, ONE_F16)
+
+        # Mutant produces unclamped 1.25
+        unclamped = f16_to_bits(1.25)
+        self.assertNotEqual(expected, unclamped)
+
+    def test_mutation_unclamped_lower_bound(self) -> None:
+        """Mutant: Fails to clamp negative values to +0.0."""
+        s0 = f16_to_bits(-1.0)
+        s1 = f16_to_bits(0.2)
+        expected = oracle_v_add_clamp_f16(s0, s1)
+        self.assertEqual(expected, POS_ZERO)
+
+        # Mutant produces negative float
+        unclamped = f16_to_bits(-0.8)
+        self.assertNotEqual(expected, unclamped)
+
+    def test_mutation_ignore_exec_mask(self) -> None:
+        """Mutant: Inactive SIMD lanes are overwritten despite EXEC mask."""
+        sentinel = 0xDEAD
+        state = SIMDState(num_lanes=32, exec_mask=0x0000_0000)  # all inactive
+        for lane in range(32):
+            state.set_reg16(lane, Reg16(4, RegType.VGPR, SubWord.LO), sentinel)
+
+        # Mutant interpreter that ignores exec_mask
+        class MutantSIMDInterpreter(SIMDInterpreter):
+            def step(self, instr: VAddClampF16Instruction, state: SIMDState) -> List[Optional[int]]:
+                results = []
+                for lane in range(state.num_lanes):
+                    res = oracle_v_add_clamp_f16(f16_to_bits(0.2), f16_to_bits(0.3))
+                    state.set_reg16(lane, instr.dst, res)
+                    results.append(res)
+                return results
+
+        mutant_interp = MutantSIMDInterpreter()
+        instr = VAddClampF16Instruction(
+            dst=Reg16(4, RegType.VGPR, SubWord.LO),
+            src0=VOP3Operand16(Literal16.from_float(0.2)),
+            src1=VOP3Operand16(Literal16.from_float(0.3)),
+        )
+        mutant_interp.step(instr, state)
+        # Mutation detected: inactive lanes corrupted
+        corrupted_lanes = [
+            lane for lane in range(32)
+            if state.get_reg16(lane, Reg16(4, RegType.VGPR, SubWord.LO)) != sentinel
+        ]
+        self.assertEqual(len(corrupted_lanes), 32)
+
+    def test_mutation_subnormal_flush_to_zero(self) -> None:
+        """Mutant: Subnormals flushed to zero (FTZ mode)."""
+        sub = 0x0001
+        correct = oracle_v_add_clamp_f16(sub, sub)
+        self.assertEqual(correct, 0x0002)
+
+        # FTZ mutant flushes to 0.0
+        ftz_mutant = POS_ZERO
+        self.assertNotEqual(correct, ftz_mutant)
+
+    def test_mutation_nan_not_clamped(self) -> None:
+        """Mutant: Clamped NaN propagates NaN instead of clamping to +0.0."""
+        snan = 0x7C05
+        correct = oracle_v_add_clamp_f16(snan, f16_to_bits(0.5))
+        self.assertEqual(correct, POS_ZERO)
+
+        # Propagated NaN mutant
+        nan_mutant = snan | QNAN_BIT
+        self.assertNotEqual(correct, nan_mutant)
+
+
 if __name__ == "__main__":
     unittest.main()
