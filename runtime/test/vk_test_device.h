@@ -216,6 +216,9 @@ public:
             std::vector<VkExtensionProperties> available(count);
             enumerate_instance(nullptr, &count, available.data());
             bool caps2 = false;
+            for (const auto& e : available)  // lists the HDR10 (ST.2084) surface formats, when the display has them
+                if (std::strcmp(e.extensionName, "VK_EXT_swapchain_colorspace") == 0)
+                    instance_extensions.push_back("VK_EXT_swapchain_colorspace");
             for (const auto& e : available) {
                 caps2 = caps2 || std::strcmp(e.extensionName, "VK_KHR_get_surface_capabilities2") == 0;
                 surface_m1_khr = surface_m1_khr || std::strcmp(e.extensionName, "VK_KHR_surface_maintenance1") == 0;

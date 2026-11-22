@@ -87,6 +87,7 @@ struct ResourceBinding {
     // bytes, and copies between it and a buffer are repacked by the depth24 pass (Depth24Job::rgb96).
     bool rgb96 = false;
     bool color_attachment = false;     // has COLOR_ATTACHMENT usage: unordered-access rectangle clears need it
+    bool sampled = false;              // has SAMPLED usage (no DENY_SHADER_RESOURCE): the present compose pass reads it
     bool host_readable = false;        // D3D12_HEAP_TYPE_READBACK (or CUSTOM write-back): needs host-read flush
     bool sparse_buffer = false;
 };
