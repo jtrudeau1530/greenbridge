@@ -113,6 +113,8 @@ struct VulkanDeviceInfo {
     // `rdna2spirv.py --fma khr` (OpFmaKHR, capability FMAKHR in the index) can be created. Without it only the
     // default `--fma glsl` shaders can.
     bool shader_fma = false;
+    bool shader_subgroup_clock = false;
+    bool shader_device_clock = false;
     // The caller enabled textureCompressionBC on this logical device.
     bool texture_compression_bc = false;
     // Optional device features the caller enabled. Without occlusionQueryPrecise, D3D12_QUERY_TYPE_OCCLUSION counts

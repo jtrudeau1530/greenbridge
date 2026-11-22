@@ -252,6 +252,7 @@ class Gen:
         self.uses_fhalf = False        # %fhalf_g (0.5) constant
         self.uses_f64 = False
         self.uses_fma_khr = False      # an OpFmaKHR was emitted: capability FMAKHR + extension SPV_KHR_fma
+        self.uses_clock = set()
         self.uses_bvh = False
         self.lconsts = {}              # 64-bit constants: value -> id
         self.uses_vote = False         # wave-uniform branches (OpGroupNonUniformAny)
@@ -7491,6 +7492,18 @@ class Gen:
                 self.dst({"k": "vgpr", "r": d["r"] + 1, "n": 1}, r_hi)
         elif op.startswith("s_load_dword") or op.startswith("s_buffer_load_dword"):
             self.scalar_load(op, a, ins["mods"])
+        elif op in ("s_memtime", "s_memrealtime"):
+            d = a[0]
+            if d["k"] != "sgpr" or d.get("n") != 2:
+                raise Unsupported(op + " destination")
+            scope = "subgroup" if op == "s_memtime" else "device"
+            self.uses_clock.add(scope)
+            v, lo, hi = self.tmp(), self.tmp(), self.tmp()
+            self.emit(f"{v} = OpReadClockKHR %v2uint_d {self.cu(3 if scope == 'subgroup' else 1)}")
+            self.emit(f"{lo} = OpCompositeExtract %uint {v} 0")
+            self.emit(f"{hi} = OpCompositeExtract %uint {v} 1")
+            self.store_reg("sgpr", d["r"], lo)
+            self.store_reg("sgpr", d["r"] + 1, hi)
         elif op in ("s_lshl_b64", "s_lshr_b64", "s_ashr_i64"):
             # 64-bit shift of an SGPR pair by (src1 & 63); SCC = result != 0.
             d, x = a[0], a[1]
@@ -11440,6 +11453,8 @@ def assemble(gen):
         caps.append("Float64")
     if gen.uses_fma_khr:
         caps.append("FMAKHR")
+    if gen.uses_clock:
+        caps.append("ShaderClockKHR")
     if gen.uses_store_views:
         caps.append("StorageImageWriteWithoutFormat")     # shaderStorageImageWriteWithoutFormat
         if gen.reads_store_views:
@@ -11470,6 +11485,8 @@ def assemble(gen):
     exts = (["SPV_KHR_physical_storage_buffer"] if psb else []) + (["SPV_EXT_descriptor_indexing"] if tex else [])
     if gen.uses_fma_khr:
         exts.append("SPV_KHR_fma")
+    if gen.uses_clock:
+        exts.append("SPV_KHR_shader_clock")
     if bary_builtin:
         exts.append("SPV_KHR_fragment_shader_barycentric")
     if ms and not msc:
@@ -11687,7 +11704,9 @@ def assemble(gen):
     if gen.uses_fhalf:
         types += ["%fhalf_g = OpConstant %float 0.5"]
     if gen.uses_f64:
-        types += ["%double = OpTypeFloat 64", "%v2uint_d = OpTypeVector %uint 2"]
+        types += ["%double = OpTypeFloat 64"]
+    if gen.uses_f64 or gen.uses_clock:
+        types += ["%v2uint_d = OpTypeVector %uint 2"]
     if gen.uses_ballot:
         types += ["%v4uint_bal = OpTypeVector %uint 4"]
     if gen.uses_store_views or gen.uses_int_fetch:
@@ -14009,7 +14028,9 @@ def shader_meta(g, asm, src_path=None, fssm_path=None):
              "FMAKHR": "shaderFmaFloat32"}     # VkPhysicalDeviceShaderFmaFeaturesKHR (VK_KHR_shader_fma)
     m = {"stage": g.stage, "wave64": bool(g.wave64), "control_flow": getattr(g, "control_flow", "straight line"),
          "capabilities": caps, "extensions": exts,
-         "features": sorted({feats[c] for c in caps if c in feats and not feats[c].startswith(("core", "shaderImage1D"))}),
+         "features": sorted({feats[c] for c in caps if c in feats and not feats[c].startswith(("core", "shaderImage1D"))} |
+                            {{"subgroup": "shaderSubgroupClock", "device": "shaderDeviceClock"}[k]
+                             for k in getattr(g, "uses_clock", ())}),
          "bindings": binds, "push_constant_bytes": 4 * USER_SGPRS + 16,
          "subgroup_size": 64 if g.wave64 else 32,
          # Which stages can ask for a 64-wide subgroup is the driver's requiredSubgroupSizeStages, not a fixed rule:
