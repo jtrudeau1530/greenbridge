@@ -1,0 +1,71 @@
+// A mapped program that reaches the GDK runtime the way xgameruntime.lib's thunks do: it has no import of
+// xgameruntime.dll, loads it with LoadLibraryW and looks the five run-time entry points up with GetProcAddress
+// (measured in the package's libHttpClient.GDK.dll and XCurl.dll, docs/runtime_imports.md "Run-time loaded
+// modules"). Run under `gta6rt --run`, its own kernel32 imports are bound by the loader, so LoadLibraryW and
+// GetProcAddress must reach runtime/shims/library_loader.cpp and the offline xgameruntime shim. Run on its own,
+// LoadLibraryW goes to Windows and either fails or loads the PC's Gaming Services runtime, and this never prints
+// PASS. Ordinary test code; no game data.
+#include <windows.h>
+
+#include <cstdio>
+
+namespace {
+
+struct Options {        // InitializeApiImplEx2's fourth argument (xodus-gaming/xgameruntime-docs)
+    UINT32 unknown;     // documented as always 1
+    BOOL is_inline;
+    const char* game_config;
+};
+
+using InitEx2 = HRESULT(WINAPI*)(ULONG, ULONG, char, const Options*);
+using Query = HRESULT(WINAPI*)(const GUID*, REFIID, void**);
+using Uninit = HRESULT(WINAPI*)();
+
+int fail(const char* stage, unsigned long value) {
+    std::printf("tiny_gdk_load: FAIL %s (0x%08lx)\n", stage, value);
+    return 1;
+}
+
+}  // namespace
+
+int main() {
+    HMODULE runtime = LoadLibraryW(L"xgameruntime.dll");
+    if (!runtime) return fail("LoadLibraryW(xgameruntime.dll)", GetLastError());
+    // The loader shim hands out a pseudo-handle for a module it owns: not an image the host loaded.
+    HMODULE host_view = nullptr;
+    if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, L"xgameruntime.dll", &host_view) && host_view == runtime)
+        return fail("xgameruntime.dll came from the host loader, not the shims", 0);
+
+    const char* names[] = {"InitializeApiImpl", "InitializeApiImplEx", "InitializeApiImplEx2", "UninitializeApiImpl",
+                           "QueryApiImpl"};
+    for (const char* name : names)
+        if (!GetProcAddress(runtime, name)) return fail(name, GetLastError());
+    SetLastError(0);
+    if (GetProcAddress(runtime, "NoSuchRuntimeFunction") || GetLastError() != ERROR_PROC_NOT_FOUND)
+        return fail("an unserved name is NULL with ERROR_PROC_NOT_FOUND", GetLastError());
+
+    auto init = reinterpret_cast<InitEx2>(GetProcAddress(runtime, "InitializeApiImplEx2"));
+    auto query = reinterpret_cast<Query>(GetProcAddress(runtime, "QueryApiImpl"));
+    auto uninit = reinterpret_cast<Uninit>(GetProcAddress(runtime, "UninitializeApiImpl"));
+    const Options options{1, FALSE, nullptr};
+    HRESULT hr = init(0, 0, 0x02, &options);
+    if (hr != S_OK) return fail("InitializeApiImplEx2", static_cast<unsigned long>(hr));
+
+    // XThreadingImpl, the first class XCurl.dll references (docs/runtime_imports.md); not provided offline yet.
+    const GUID threading = {0x073b7dcb, 0x1fcf, 0x4030, {0x94, 0xbe, 0xe3, 0xc9, 0xeb, 0x62, 0x34, 0x28}};
+    void* out = reinterpret_cast<void*>(1);
+    hr = query(&threading, threading, &out);
+    if (hr != static_cast<HRESULT>(0x80070032) || out != nullptr)
+        return fail("QueryApiImpl refuses an unprovided class and clears its out pointer", static_cast<unsigned long>(hr));
+    hr = uninit();
+    if (hr != S_OK) return fail("UninitializeApiImpl", static_cast<unsigned long>(hr));
+
+    // Host modules still come from the host.
+    HMODULE k32 = LoadLibraryW(L"kernel32.dll");
+    if (!k32 || GetProcAddress(k32, "GetTickCount") != GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "GetTickCount"))
+        return fail("kernel32.dll from the host", GetLastError());
+    if (!FreeLibrary(runtime)) return fail("FreeLibrary(xgameruntime.dll)", GetLastError());
+
+    std::puts("tiny_gdk_load: PASS");
+    return 0;
+}
