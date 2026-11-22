@@ -327,8 +327,9 @@ class PipelineStageIsolationTest(unittest.TestCase):
         expected_cache = os.path.join(self.out_dir, "pipeline_cache.bin")
         executed_cmds = []
 
-        def fake_run(args: list[str], **kwargs: object) -> None:
+        def fake_run(args: list[str], **kwargs: object) -> int:
             executed_cmds.append(args)
+            return 0
 
         with mock.patch("make_game.pipeline_check_exe", return_value=dummy_exe), \
                 mock.patch("make_game.run", side_effect=fake_run), \
@@ -336,7 +337,8 @@ class PipelineStageIsolationTest(unittest.TestCase):
             make_game.pipelines(self.work_dir, self.out_dir)
 
         self.assertEqual(len(executed_cmds), 1)
-        self.assertEqual(executed_cmds[0], [dummy_exe, spirv_dir, expected_cache])
+        self.assertEqual(executed_cmds[0], [dummy_exe, spirv_dir, expected_cache, "--inflight-file",
+                                            os.path.join(self.out_dir, "pipeline_inflight.txt")])
 
     def test_pipelines_stage_alone_invokes_no_asset_or_shader_compilers(self) -> None:
         game_dir = os.path.join(self.tmp.name, "game")
