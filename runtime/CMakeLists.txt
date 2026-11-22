@@ -929,7 +929,7 @@ if(TARGET Vulkan::Headers)
               ${_stubs_header}
               ID3D12GraphicsCommandList8 ID3D12CommandQueue ID3D12CommandAllocator ID3D12Fence1
               ID3D12Device11 ID3D12DescriptorHeap ID3D12Heap ID3D12Resource ID3D12QueryHeap ID3D12RootSignature
-              ID3D12PipelineState ID3D12CommandSignature ID3D12PipelineLibrary1
+              ID3D12PipelineState ID3D12CommandSignature ID3D12PipelineLibrary1 ID3D12ShaderCacheSession
       DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/../tools/gen_d3d12_stubs.py ${LEONIDA_D3D12_HEADER}
       COMMENT "Generating D3D12 COM stubs"
       VERBATIM)
@@ -1105,6 +1105,13 @@ if(TARGET Vulkan::Headers)
     target_compile_definitions(d3d12_method_variants_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(d3d12_method_variants_test PRIVATE /W4 /permissive- /utf-8)
     add_test(NAME d3d12_method_variants COMMAND d3d12_method_variants_test)
+    # ID3D12Device9::CreateShaderCacheSession, ID3D12ShaderCacheSession and ShaderCacheControl (D3D-34).
+    add_executable(d3d12_shader_cache_test test/d3d12_shader_cache_test.cpp)
+    target_link_libraries(d3d12_shader_cache_test PRIVATE gta6rt_d3d12_com)
+    target_compile_definitions(d3d12_shader_cache_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_shader_cache_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME d3d12_shader_cache COMMAND d3d12_shader_cache_test)
+    set_tests_properties(d3d12_shader_cache PROPERTIES SKIP_RETURN_CODE 77)
     set_tests_properties(d3d12_method_variants PROPERTIES SKIP_RETURN_CODE 77)
 
     # CreateSampler2 (D3D-28) against CreateSampler, and its refusals against the host's PC runtime.

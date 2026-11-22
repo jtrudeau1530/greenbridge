@@ -35,6 +35,8 @@
 #include <cctype>
 #include <climits>
 #include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <iterator>
 #include <map>
 #include <cstring>
@@ -3093,6 +3095,267 @@ private:
     std::unordered_map<std::wstring, ID3D12PipelineState*> entries_;
 };
 
+// Process-wide backing for ID3D12Device9::CreateShaderCacheSession and ID3D12ShaderCacheSession (D3D-34).
+// Sessions in the same process sharing (Identifier, Mode, Version, disk_path) share their entries; MODE_DISK
+// persists entries to a versioned binary file so data survives device/process teardown; SetDeleteOnDestroy
+// removes the backing store (and disk file, if any) once the last live session referencing it is released.
+struct ShaderCacheKey {
+    GUID identifier{};
+    D3D12_SHADER_CACHE_MODE mode = D3D12_SHADER_CACHE_MODE_MEMORY;
+    UINT64 version = 0;
+    std::wstring disk_path;  // empty for MODE_MEMORY
+
+    bool operator<(const ShaderCacheKey& other) const {
+        const int cmp = std::memcmp(&identifier, &other.identifier, sizeof(GUID));
+        if (cmp != 0) return cmp < 0;
+        if (mode != other.mode) return mode < other.mode;
+        if (version != other.version) return version < other.version;
+        return disk_path < other.disk_path;
+    }
+};
+
+struct ShaderCacheStore {
+    static constexpr std::uint32_t kDiskMagic = 0x3143534Cu;  // "LSC1"
+    static constexpr std::uint32_t kDiskVersion = 1;
+
+    std::mutex mutex;
+    std::map<std::string, std::vector<std::uint8_t>> entries;
+    std::size_t total_bytes = 0;
+    std::uint32_t live_sessions = 0;
+    bool delete_on_destroy = false;
+    std::filesystem::path disk_path;
+
+    void load_from_disk_locked() {
+        if (disk_path.empty()) return;
+        std::ifstream in(disk_path, std::ios::binary);
+        if (!in) return;
+        std::uint32_t header[3]{};
+        if (!in.read(reinterpret_cast<char*>(header), sizeof(header))) return;
+        if (header[0] != kDiskMagic || header[1] != kDiskVersion) return;
+        const std::uint32_t count = header[2];
+        std::map<std::string, std::vector<std::uint8_t>> loaded;
+        std::size_t bytes = 0;
+        for (std::uint32_t i = 0; i < count; ++i) {
+            std::uint32_t lens[2]{};
+            if (!in.read(reinterpret_cast<char*>(lens), sizeof(lens))) return;
+            if (!lens[0] || !lens[1]) return;
+            std::string k(lens[0], '\0');
+            std::vector<std::uint8_t> v(lens[1]);
+            if (!in.read(k.data(), lens[0]) || !in.read(reinterpret_cast<char*>(v.data()), lens[1])) return;
+            loaded.emplace(std::move(k), std::move(v));
+            bytes += lens[1];
+        }
+        entries = std::move(loaded);
+        total_bytes = bytes;
+    }
+
+    bool save_to_disk_locked() const {
+        if (disk_path.empty()) return true;
+        std::error_code ec;
+        std::filesystem::create_directories(disk_path.parent_path(), ec);
+        std::filesystem::path tmp = disk_path;
+        tmp += L".tmp";
+        {
+            std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+            if (!out) return false;
+            const std::uint32_t header[3] = {kDiskMagic, kDiskVersion, static_cast<std::uint32_t>(entries.size())};
+            out.write(reinterpret_cast<const char*>(header), sizeof(header));
+            for (const auto& [k, v] : entries) {
+                const std::uint32_t lens[2] = {static_cast<std::uint32_t>(k.size()),
+                                               static_cast<std::uint32_t>(v.size())};
+                out.write(reinterpret_cast<const char*>(lens), sizeof(lens));
+                out.write(k.data(), static_cast<std::streamsize>(k.size()));
+                out.write(reinterpret_cast<const char*>(v.data()), static_cast<std::streamsize>(v.size()));
+            }
+            if (!out.good()) return false;
+        }
+        if (!MoveFileExW(tmp.c_str(), disk_path.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+            std::filesystem::remove(tmp, ec);
+            return false;
+        }
+        return true;
+    }
+
+    void clear() {
+        std::lock_guard lock(mutex);
+        entries.clear();
+        total_bytes = 0;
+        if (!disk_path.empty()) {
+            std::error_code ec;
+            std::filesystem::remove(disk_path, ec);
+        }
+    }
+};
+
+struct ShaderCacheRegistry {
+    std::mutex mutex;
+    std::map<ShaderCacheKey, std::shared_ptr<ShaderCacheStore>> stores;
+    std::atomic<bool> disabled{false};
+
+    std::shared_ptr<ShaderCacheStore> acquire(const ShaderCacheKey& key) {
+        std::lock_guard lock(mutex);
+        auto& slot = stores[key];
+        if (!slot) {
+            slot = std::make_shared<ShaderCacheStore>();
+            if (key.mode == D3D12_SHADER_CACHE_MODE_DISK && !key.disk_path.empty()) {
+                slot->disk_path = key.disk_path;
+                std::lock_guard store_lock(slot->mutex);
+                slot->load_from_disk_locked();
+            }
+        }
+        ++slot->live_sessions;
+        return slot;
+    }
+
+    void mark_delete_on_destroy(const std::shared_ptr<ShaderCacheStore>& store) {
+        std::lock_guard lock(mutex);
+        if (store) store->delete_on_destroy = true;
+    }
+
+    void release(const ShaderCacheKey& key, const std::shared_ptr<ShaderCacheStore>& store) {
+        std::lock_guard lock(mutex);
+        if (!store) return;
+        if (store->live_sessions > 0) --store->live_sessions;
+        if (store->live_sessions == 0) {
+            if (store->delete_on_destroy) {
+                if (!store->disk_path.empty()) {
+                    std::error_code ec;
+                    std::filesystem::remove(store->disk_path, ec);
+                }
+                const auto it = stores.find(key);
+                if (it != stores.end() && it->second == store) stores.erase(it);
+            } else if (key.mode == D3D12_SHADER_CACHE_MODE_DISK) {
+                // Evict idle disk stores from memory so reopening reloads from disk.
+                const auto it = stores.find(key);
+                if (it != stores.end() && it->second == store) stores.erase(it);
+            }
+        }
+    }
+
+    void clear_all() {
+        std::vector<std::shared_ptr<ShaderCacheStore>> snapshot;
+        {
+            std::lock_guard lock(mutex);
+            snapshot.reserve(stores.size());
+            for (const auto& [k, v] : stores) snapshot.push_back(v);
+        }
+        for (const auto& store : snapshot) store->clear();
+    }
+};
+
+ShaderCacheRegistry& process_shader_cache_registry() {
+    static auto* registry = new ShaderCacheRegistry();
+    return *registry;
+}
+
+std::filesystem::path shader_cache_disk_path(const D3D12_SHADER_CACHE_SESSION_DESC& desc,
+                                             const VkPhysicalDeviceProperties& gpu_props) {
+    std::error_code ec;
+    std::filesystem::path dir = (desc.Flags & D3D12_SHADER_CACHE_FLAG_USE_WORKING_DIR)
+                                    ? std::filesystem::current_path(ec)
+                                    : (std::filesystem::temp_directory_path(ec) / L"leonida_shader_cache");
+    if (ec || dir.empty()) return {};
+    wchar_t name[160]{};
+    const auto& g = desc.Identifier;
+    if (desc.Flags & D3D12_SHADER_CACHE_FLAG_DRIVER_VERSIONED) {
+        std::swprintf(name, std::size(name),
+                      L"leonida_sc_%08lx%04x%04x%02x%02x%02x%02x%02x%02x%02x%02x_v%llu_d%04x_%04x_%08x.bin",
+                      static_cast<unsigned long>(g.Data1), g.Data2, g.Data3, g.Data4[0], g.Data4[1], g.Data4[2],
+                      g.Data4[3], g.Data4[4], g.Data4[5], g.Data4[6], g.Data4[7],
+                      static_cast<unsigned long long>(desc.Version), gpu_props.vendorID, gpu_props.deviceID,
+                      gpu_props.driverVersion);
+    } else {
+        std::swprintf(name, std::size(name), L"leonida_sc_%08lx%04x%04x%02x%02x%02x%02x%02x%02x%02x%02x_v%llu.bin",
+                      static_cast<unsigned long>(g.Data1), g.Data2, g.Data3, g.Data4[0], g.Data4[1], g.Data4[2],
+                      g.Data4[3], g.Data4[4], g.Data4[5], g.Data4[6], g.Data4[7],
+                      static_cast<unsigned long long>(desc.Version));
+    }
+    return dir / name;
+}
+
+class ShaderCacheSession final
+    : public Child<ShaderCacheSession, ID3D12ShaderCacheSessionStubs, ID3D12Object, ID3D12DeviceChild,
+                   ID3D12ShaderCacheSession> {
+public:
+    // {9a4f1b2c-8d6e-43a7-b152-7e3c9f0d4a81}
+    static constexpr GUID kTag{0x9a4f1b2c, 0x8d6e, 0x43a7, {0xb1, 0x52, 0x7e, 0x3c, 0x9f, 0x0d, 0x4a, 0x81}};
+
+    ShaderCacheSession(const D3D12_SHADER_CACHE_SESSION_DESC& desc, const ShaderCacheKey& key,
+                       ShaderCacheRegistry& registry, std::shared_ptr<ShaderCacheStore> store)
+        : desc_(desc), key_(key), registry_(&registry), store_(std::move(store)) {}
+
+    ~ShaderCacheSession() override {
+        if (registry_) registry_->release(key_, store_);
+    }
+
+    HRESULT STDMETHODCALLTYPE FindValue(const void* key, UINT key_size, void* value, UINT* value_size) override {
+        if (!key || !key_size || !value_size) return E_INVALIDARG;
+        if (registry_ && registry_->disabled.load(std::memory_order_relaxed)) return DXGI_ERROR_NOT_FOUND;
+        std::lock_guard lock(store_->mutex);
+        const std::string k(static_cast<const char*>(key), key_size);
+        const auto it = store_->entries.find(k);
+        if (it == store_->entries.end()) return DXGI_ERROR_NOT_FOUND;
+        const UINT stored_size = static_cast<UINT>(it->second.size());
+        if (!value) {
+            *value_size = stored_size;
+            return S_OK;
+        }
+        if (*value_size < stored_size) {
+            *value_size = stored_size;
+            return DXGI_ERROR_MORE_DATA;
+        }
+        std::memcpy(value, it->second.data(), stored_size);
+        *value_size = stored_size;
+        return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE StoreValue(const void* key, UINT key_size, const void* value, UINT value_size) override {
+        if (!key || !key_size || !value || !value_size) return E_INVALIDARG;
+        if (registry_ && registry_->disabled.load(std::memory_order_relaxed)) return S_OK;
+        std::lock_guard lock(store_->mutex);
+        const std::string k(static_cast<const char*>(key), key_size);
+        if (store_->entries.find(k) != store_->entries.end()) return DXGI_ERROR_ALREADY_EXISTS;
+        if (desc_.MaximumInMemoryCacheEntries && store_->entries.size() >= desc_.MaximumInMemoryCacheEntries)
+            return E_OUTOFMEMORY;
+        if (desc_.MaximumInMemoryCacheSizeBytes &&
+            (value_size > desc_.MaximumInMemoryCacheSizeBytes ||
+             store_->total_bytes > desc_.MaximumInMemoryCacheSizeBytes - value_size))
+            return E_OUTOFMEMORY;
+        if (desc_.Mode == D3D12_SHADER_CACHE_MODE_DISK && desc_.MaximumValueFileSizeBytes &&
+            (value_size > desc_.MaximumValueFileSizeBytes ||
+             store_->total_bytes > desc_.MaximumValueFileSizeBytes - value_size))
+            return E_OUTOFMEMORY;
+        const auto* bytes = static_cast<const std::uint8_t*>(value);
+        auto [it, inserted] = store_->entries.emplace(k, std::vector<std::uint8_t>(bytes, bytes + value_size));
+        store_->total_bytes += value_size;
+        if (desc_.Mode == D3D12_SHADER_CACHE_MODE_DISK && !store_->save_to_disk_locked()) {
+            store_->total_bytes -= value_size;
+            store_->entries.erase(it);
+            return E_FAIL;
+        }
+        return S_OK;
+    }
+
+    void STDMETHODCALLTYPE SetDeleteOnDestroy() override {
+        if (registry_) registry_->mark_delete_on_destroy(store_);
+    }
+
+#if defined(_MSC_VER) || !defined(_WIN32)
+    D3D12_SHADER_CACHE_SESSION_DESC STDMETHODCALLTYPE GetDesc() override { return desc_; }
+#else
+    D3D12_SHADER_CACHE_SESSION_DESC* STDMETHODCALLTYPE GetDesc(D3D12_SHADER_CACHE_SESSION_DESC* out) override {
+        *out = desc_;
+        return out;
+    }
+#endif
+
+private:
+    D3D12_SHADER_CACHE_SESSION_DESC desc_{};
+    ShaderCacheKey key_{};
+    ShaderCacheRegistry* registry_ = nullptr;
+    std::shared_ptr<ShaderCacheStore> store_;
+};
+
 // The T# of a view: what the shader gets to know about it, in the structure the console's shaders read.
 // False (with a log) for a view set 0 cannot show yet.
 bool image_descriptor(const Resource& resource, const TextureView& view, leonida::gfx10::Image& out) {
@@ -4275,6 +4538,64 @@ public:
         auto* lib = new PipelineLibrary();
         lib->attach_device(identity());
         return d3d12_trace::result(method, hand_out(lib, riid, out));
+    }
+
+    // Device9: process-wide shader cache sessions (in-memory and disk-backed) and control (D3D-34).
+    HRESULT STDMETHODCALLTYPE CreateShaderCacheSession(const D3D12_SHADER_CACHE_SESSION_DESC* desc, REFIID riid,
+                                                       void** out) override {
+        constexpr auto method = "ID3D12Device9::CreateShaderCacheSession";
+        if (out) *out = nullptr;
+        if (!desc) return d3d12_trace::result(method, E_INVALIDARG);
+        const GUID zero_guid{};
+        if (std::memcmp(&desc->Identifier, &zero_guid, sizeof(GUID)) == 0)
+            return d3d12_trace::result(method, E_INVALIDARG);
+        if (desc->Mode != D3D12_SHADER_CACHE_MODE_MEMORY && desc->Mode != D3D12_SHADER_CACHE_MODE_DISK)
+            return d3d12_trace::result(method, E_INVALIDARG);
+        constexpr UINT kKnownFlags = D3D12_SHADER_CACHE_FLAG_DRIVER_VERSIONED | D3D12_SHADER_CACHE_FLAG_USE_WORKING_DIR;
+        if (UINT(desc->Flags) & ~kKnownFlags) return d3d12_trace::result(method, E_INVALIDARG);
+        if (!out) return d3d12_trace::result(method, S_FALSE);
+        std::wstring disk_path;
+        if (desc->Mode == D3D12_SHADER_CACHE_MODE_DISK) {
+            VkPhysicalDeviceProperties props{};
+            if (state_.info.get_instance_proc && state_.info.instance && state_.info.physical) {
+                if (const auto get_props = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(
+                        state_.info.get_instance_proc(state_.info.instance, "vkGetPhysicalDeviceProperties")))
+                    get_props(state_.info.physical, &props);
+            }
+            const auto path = shader_cache_disk_path(*desc, props);
+            if (path.empty()) return d3d12_trace::result(method, E_FAIL);
+            disk_path = path.wstring();
+        }
+        const ShaderCacheKey key{desc->Identifier, desc->Mode, desc->Version, std::move(disk_path)};
+        auto& registry = process_shader_cache_registry();
+        auto store = registry.acquire(key);
+        auto* session = new ShaderCacheSession(*desc, key, registry, std::move(store));
+        session->attach_device(identity());
+        return d3d12_trace::result(method, hand_out(session, riid, out));
+    }
+
+    HRESULT STDMETHODCALLTYPE ShaderCacheControl(D3D12_SHADER_CACHE_KIND_FLAGS kinds,
+                                                 D3D12_SHADER_CACHE_CONTROL_FLAGS control) override {
+        constexpr auto method = "ID3D12Device9::ShaderCacheControl";
+        constexpr UINT kKnownKinds = D3D12_SHADER_CACHE_KIND_FLAG_IMPLICIT_D3D_CACHE_FOR_DRIVER |
+                                     D3D12_SHADER_CACHE_KIND_FLAG_IMPLICIT_D3D_CONVERSIONS |
+                                     D3D12_SHADER_CACHE_KIND_FLAG_IMPLICIT_DRIVER_MANAGED |
+                                     D3D12_SHADER_CACHE_KIND_FLAG_APPLICATION_MANAGED;
+        constexpr UINT kKnownControls = D3D12_SHADER_CACHE_CONTROL_FLAG_DISABLE |
+                                        D3D12_SHADER_CACHE_CONTROL_FLAG_ENABLE | D3D12_SHADER_CACHE_CONTROL_FLAG_CLEAR;
+        if (!kinds || (UINT(kinds) & ~kKnownKinds) || !control || (UINT(control) & ~kKnownControls))
+            return d3d12_trace::result(method, E_INVALIDARG);
+        if ((control & D3D12_SHADER_CACHE_CONTROL_FLAG_ENABLE) && (control & D3D12_SHADER_CACHE_CONTROL_FLAG_DISABLE))
+            return d3d12_trace::result(method, E_INVALIDARG);
+        auto& registry = process_shader_cache_registry();
+        if (kinds & D3D12_SHADER_CACHE_KIND_FLAG_APPLICATION_MANAGED) {
+            if (control & D3D12_SHADER_CACHE_CONTROL_FLAG_CLEAR) registry.clear_all();
+            if (control & D3D12_SHADER_CACHE_CONTROL_FLAG_DISABLE)
+                registry.disabled.store(true, std::memory_order_relaxed);
+            if (control & D3D12_SHADER_CACHE_CONTROL_FLAG_ENABLE)
+                registry.disabled.store(false, std::memory_order_relaxed);
+        }
+        return d3d12_trace::result(method, S_OK);
     }
 
     UINT STDMETHODCALLTYPE GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE) override {
