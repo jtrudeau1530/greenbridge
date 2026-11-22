@@ -45,6 +45,8 @@ DEFAULT_TEXTURED_COLOR = [1.0, 1.0, 1.0, 1.0]
 DEFAULT_METALLIC = 0.0
 DEFAULT_ROUGHNESS = 0.85
 
+ALPHA_MODES = ("OPAQUE", "MASK", "BLEND")
+
 DEFAULT_SAMPLER = {
     "magFilter": 9729,  # LINEAR
     "minFilter": 9987,  # LINEAR_MIPMAP_LINEAR
@@ -564,6 +566,24 @@ def _parse_base_color_factor(value: object, default: list[float]) -> list[float]
     return [_clean_zero(c) for c in out]
 
 
+def _parse_alpha_mode(mode: object, cutoff: object, factor_alpha: float) -> dict:
+    """glTF alphaMode/alphaCutoff fields for a material spec; OPAQUE is the glTF default and is omitted."""
+    if mode is None:
+        mode = "BLEND" if factor_alpha < 1.0 else "OPAQUE"
+    if not isinstance(mode, str) or mode not in ALPHA_MODES:
+        raise GlbError("alpha_mode must be one of 'OPAQUE', 'MASK', 'BLEND'")
+    if cutoff is not None and mode != "MASK":
+        raise GlbError("alpha_cutoff is only valid with alpha_mode 'MASK'")
+    if mode == "OPAQUE":
+        return {}
+    out: dict = {"alphaMode": mode}
+    if cutoff is not None:
+        if isinstance(cutoff, bool) or not isinstance(cutoff, (int, float)) or not math.isfinite(cutoff) or cutoff < 0.0:
+            raise GlbError("alpha_cutoff must be a finite number >= 0.0")
+        out["alphaCutoff"] = _clean_zero(float(cutoff))
+    return out
+
+
 def _build_glb_with_stats(
     primitives: list[dict],
     materials: dict[str, dict] | None = None,
@@ -642,6 +662,7 @@ def _build_glb_with_stats(
                 return existing
             default_color = DEFAULT_TEXTURED_COLOR if has_png else DEFAULT_CLAY_COLOR
             base_color = _parse_base_color_factor(spec.get("base_color_factor"), default_color)
+            alpha_fields = _parse_alpha_mode(spec.get("alpha_mode"), spec.get("alpha_cutoff"), base_color[3])
 
             pbr: dict = {
                 "baseColorFactor": base_color,
@@ -660,6 +681,7 @@ def _build_glb_with_stats(
                 mat_obj["name"] = mat_name
             if spec.get("double_sided"):
                 mat_obj["doubleSided"] = True
+            mat_obj.update(alpha_fields)
 
             mat_idx = len(gltf_materials)
             gltf_materials.append(mat_obj)
@@ -842,7 +864,24 @@ def build_glb(
     *,
     generator: str = "Leonida glb_writer",
 ) -> bytes:
-    """Serialize glTF-ready primitives and optional PNG materials into binary .glb bytes."""
+    """Serialize glTF-ready primitives and optional PNG materials into binary .glb bytes.
+
+    ``materials`` maps a primitive's ``material`` name (or ``material_index``) to a
+    spec dict. Each spec becomes one glTF material shared by every primitive that
+    resolves to it; primitives without a matching spec share an opaque
+    ``default_clay`` material. Recognised spec keys:
+
+    - ``name``: material name (defaults to the string key).
+    - ``png_bytes``: PNG embedded as ``baseColorTexture`` for primitives with UVs.
+    - ``base_color_factor``: 3 or 4 finite floats in [0, 1]; alpha defaults to 1.
+    - ``double_sided``: emit ``doubleSided: true`` when truthy.
+    - ``alpha_mode``: ``"OPAQUE"``, ``"MASK"`` or ``"BLEND"``. When omitted, a
+      ``base_color_factor`` alpha below 1 gives ``BLEND``; otherwise no ``alphaMode``
+      is written (glTF default ``OPAQUE``). Texture alpha is never inspected.
+    - ``alpha_cutoff``: finite number >= 0, only with ``MASK`` (glTF default 0.5).
+
+    Invalid specs raise GlbError.
+    """
     glb_bytes, _ = _build_glb_with_stats(primitives, materials, generator=generator)
     return glb_bytes
 
@@ -876,6 +915,7 @@ def write_glb(
     existing sibling files are never used as staging files. On Windows a replace
     that hits a sharing violation is retried briefly (see ``_replace``); one held
     longer than that still raises PermissionError and leaves the old file in place.
+    ``materials`` takes the spec keys documented on ``build_glb``.
     """
     glb_bytes, stats = _build_glb_with_stats(primitives, materials)
     out_path = os.fspath(path)

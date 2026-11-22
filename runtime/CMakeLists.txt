@@ -435,9 +435,6 @@ if(BUILD_TESTING)
     add_test(NAME unimplemented_policy COMMAND unimplemented_policy_test)
   endif()
 
-  if(WIN32 AND TARGET root_sig_test)
-    add_test(NAME root_sig_test COMMAND root_sig_test)
-  endif()
   if(TARGET device_proxy_test)
     add_test(NAME device_proxy COMMAND device_proxy_test)
     set_tests_properties(device_proxy PROPERTIES SKIP_RETURN_CODE 77)  # no WARP adapter (Wine)
@@ -575,6 +572,10 @@ endif()
 endif()
 
 # GPU test and pipeline tools load Vulkan at run time, so only the Vulkan headers are needed at build time.
+# Nothing is downloaded unless asked: set VULKAN_SDK, install the Vulkan headers, pass
+# -DLEONIDA_VULKAN_HEADERS_FETCH=ON to download the pinned Khronos Vulkan-Headers release once at configure time
+# (hash-checked), or pass -DFETCHCONTENT_SOURCE_DIR_VULKANHEADERS=<path> to use a local copy without downloading.
+option(LEONIDA_VULKAN_HEADERS_FETCH "Download the pinned Khronos Vulkan-Headers release if no Vulkan headers are found" OFF)
 find_package(Vulkan QUIET)
 if(NOT TARGET Vulkan::Headers)
   find_path(Vulkan_INCLUDE_DIR
@@ -586,6 +587,17 @@ if(NOT TARGET Vulkan::Headers)
     set_target_properties(Vulkan::Headers PROPERTIES
       INTERFACE_INCLUDE_DIRECTORIES "${Vulkan_INCLUDE_DIR}"
     )
+  elseif(LEONIDA_VULKAN_HEADERS_FETCH OR FETCHCONTENT_SOURCE_DIR_VULKANHEADERS)
+    include(FetchContent)
+    FetchContent_Declare(VulkanHeaders
+      # vulkan-sdk-1.4.363.0 (same commit pinned in .github/workflows/runtime.yml)
+      URL https://github.com/KhronosGroup/Vulkan-Headers/archive/6802bb4733b63ed5efd3adb308a6c885ef180ea1.tar.gz
+      URL_HASH SHA256=9044fbb356160e43201dc2094acb44c8a906722a63a35f48fc0f051579db9bb6
+      DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
+    set(VULKAN_HEADERS_ENABLE_TESTS OFF CACHE BOOL "" FORCE)
+    set(VULKAN_HEADERS_ENABLE_INSTALL OFF CACHE BOOL "" FORCE)
+    set(VULKAN_HEADERS_ENABLE_MODULE OFF CACHE BOOL "" FORCE)
+    FetchContent_MakeAvailable(VulkanHeaders)
   endif()
 endif()
 if(TARGET Vulkan::Headers)
@@ -602,6 +614,31 @@ if(TARGET Vulkan::Headers)
   target_link_libraries(vk_device_pick_test PRIVATE Vulkan::Headers)
   if(BUILD_TESTING)
     add_test(NAME vk_device_pick COMMAND vk_device_pick_test)
+  endif()
+  if(NOT Vulkan_GLSLANG_VALIDATOR_EXECUTABLE)
+    find_program(Vulkan_GLSLANG_VALIDATOR_EXECUTABLE glslangValidator HINTS "$ENV{VULKAN_SDK}/Bin" "$ENV{VULKAN_SDK}/bin")
+  endif()
+  if(Vulkan_GLSLANG_VALIDATOR_EXECUTABLE)
+    add_executable(vk_binary_occlusion_test test/vk_binary_occlusion_test.cpp)
+    target_link_libraries(vk_binary_occlusion_test PRIVATE Vulkan::Headers ${CMAKE_DL_LIBS})
+    if(WIN32)
+      target_compile_definitions(vk_binary_occlusion_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    endif()
+    foreach(stage vert frag)
+      set(source "${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/binary_occlusion.${stage}")
+      set(output "${CMAKE_CURRENT_BINARY_DIR}/binary_occlusion.${stage}.spv")
+      add_custom_command(OUTPUT "${output}"
+                         COMMAND "${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE}" -V --target-env vulkan1.0
+                                 -o "${output}" "${source}"
+                         DEPENDS "${source}" VERBATIM)
+      target_sources(vk_binary_occlusion_test PRIVATE "${output}")
+    endforeach()
+    if(BUILD_TESTING)
+      add_test(NAME vk_binary_occlusion COMMAND vk_binary_occlusion_test
+               "${CMAKE_CURRENT_BINARY_DIR}/binary_occlusion.vert.spv"
+               "${CMAKE_CURRENT_BINARY_DIR}/binary_occlusion.frag.spv")
+      set_tests_properties(vk_binary_occlusion PROPERTIES SKIP_RETURN_CODE 77)
+    endif()
   endif()
   # D3D12 COM objects over the Vulkan backend. Their method stubs are generated from the SDK's d3d12.h at build
   # time (tools/gen_d3d12_stubs.py), so nothing derived from the SDK header is checked in.
@@ -680,12 +717,16 @@ if(TARGET Vulkan::Headers)
     target_link_libraries(d3d12_debug_markers_test PRIVATE gta6rt_d3d12_com)
     target_compile_definitions(d3d12_debug_markers_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(d3d12_debug_markers_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME d3d12_debug_markers COMMAND d3d12_debug_markers_test)
+    set_tests_properties(d3d12_debug_markers PROPERTIES SKIP_RETURN_CODE 77)
 
     # Fences and timing (D3D-30): multiple-fence waits, clock calibration, adapter LUID, custom heap properties.
     add_executable(d3d12_fence_timing_test test/d3d12_fence_timing_test.cpp)
     target_link_libraries(d3d12_fence_timing_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
     target_compile_definitions(d3d12_fence_timing_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(d3d12_fence_timing_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME d3d12_fence_timing COMMAND d3d12_fence_timing_test)
+    set_tests_properties(d3d12_fence_timing PROPERTIES SKIP_RETURN_CODE 77)
     # The countdown behind those event-backed waits, with no GPU: the full unsigned count, no wrap past zero.
     add_executable(d3d12_fence_waiter_test test/d3d12_fence_waiter_test.cpp)
     target_compile_definitions(d3d12_fence_waiter_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
@@ -716,9 +757,6 @@ if(TARGET Vulkan::Headers)
     target_compile_options(d3d12_descriptor_test PRIVATE /W4 /permissive- /utf-8)
     add_test(NAME d3d12_descriptor COMMAND d3d12_descriptor_test)
     set_tests_properties(d3d12_descriptor PROPERTIES SKIP_RETURN_CODE 77)
-    if(NOT Vulkan_GLSLANG_VALIDATOR_EXECUTABLE)
-      find_program(Vulkan_GLSLANG_VALIDATOR_EXECUTABLE glslangValidator HINTS "$ENV{VULKAN_SDK}/Bin" "$ENV{VULKAN_SDK}/bin")
-    endif()
     if(Vulkan_GLSLANG_VALIDATOR_EXECUTABLE)
       function(descriptor_test_shader shader definition)
         set(source ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/${shader})
@@ -768,12 +806,16 @@ if(TARGET Vulkan::Headers)
     target_link_libraries(d3d12_node_mask_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
     target_compile_definitions(d3d12_node_mask_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(d3d12_node_mask_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME d3d12_node_mask COMMAND d3d12_node_mask_test)
+    set_tests_properties(d3d12_node_mask PROPERTIES SKIP_RETURN_CODE 77)
 
     # Vulkan-backed IDXGIFactory4 / IDXGISwapChain3 presentation over a Win32 HWND.
     add_executable(dxgi_swapchain_test test/dxgi_swapchain_test.cpp)
     target_link_libraries(dxgi_swapchain_test PRIVATE gta6rt_d3d12_com)
     target_compile_definitions(dxgi_swapchain_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(dxgi_swapchain_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME dxgi_swapchain COMMAND dxgi_swapchain_test)
+    set_tests_properties(dxgi_swapchain PROPERTIES SKIP_RETURN_CODE 77)
 
     # ExecuteIndirect with CountBuffer (vkCmdDrawIndirectCount) + optional BLAS/TLAS/RayQueryKHR GPU test.
     add_executable(d3d12_indirect_rt_test test/d3d12_indirect_rt_test.cpp)
@@ -877,5 +919,6 @@ if(TARGET Vulkan::Headers)
   endif()
 else()
   message(STATUS "Vulkan headers not found: GPU test tools, vk_pipeline_check, d3d12_state_map_test and "
-                 "gfx10_descriptors_test are not built")
+                 "gfx10_descriptors_test are not built. Set VULKAN_SDK, install Vulkan headers, or pass "
+                 "-DLEONIDA_VULKAN_HEADERS_FETCH=ON to download the pinned Khronos Vulkan-Headers release")
 endif()

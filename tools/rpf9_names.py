@@ -187,13 +187,20 @@ def scan_archive(archive, start=None, limit=None, max_inflate=1 << 20, types=("d
             return rows, summary
 
 
+def _int_arg(text):
+    try:
+        return int(text, 0)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"invalid int value: {text!r}") from None
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("archive", help="an .rpf archive")
     ap.add_argument("out", help="output JSON path")
-    ap.add_argument("--start", type=lambda s: int(s, 0), help="first byte to scan (default: RPF data start)")
-    ap.add_argument("--limit", type=lambda s: int(s, 0), help="number of bytes to scan")
-    ap.add_argument("--max-inflate", type=lambda s: int(s, 0), default=1 << 20,
+    ap.add_argument("--start", type=_int_arg, help="first byte to scan (default: RPF data start)")
+    ap.add_argument("--limit", type=_int_arg, help="number of bytes to scan")
+    ap.add_argument("--max-inflate", type=_int_arg, default=1 << 20,
                     help="maximum inflated prefix to inspect per stream (default: 1 MiB)")
     ap.add_argument("--types", default="dr,ft,dd", help="comma-separated resource suffixes")
     ap.add_argument("--quiet", action="store_true")
@@ -226,7 +233,8 @@ def main(argv=None):
         json.dump({"summary": summary, "files": rows}, f, indent=1)
         f.write("\n")
     os.replace(tmp, a.out)
-    print(json.dumps(summary, indent=1))
+    if not a.quiet:
+        print(json.dumps(summary, indent=1))
     return 0
 
 

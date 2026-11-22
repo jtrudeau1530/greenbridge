@@ -1919,6 +1919,28 @@ class WorldBuildStagingTest(unittest.TestCase):
             world_build.build_world(assets, output)
             self.assertEqual(sorted(os.listdir(output)), ["chunks", "world.json"])
 
+    def test_stale_cleanup_preserves_staging_with_unrestored_previous_chunks(self):
+        prefix = world_build.CHUNK_STAGING_PREFIX
+        with tempfile.TemporaryDirectory() as tmp:
+            empty = os.path.join(tmp, prefix + "empty")
+            os.makedirs(empty)
+            incomplete = os.path.join(tmp, prefix + "incomplete")
+            os.makedirs(os.path.join(incomplete, "previous"))  # an empty previous/ holds nothing to recover
+            with open(os.path.join(incomplete, "c_1_0.glb"), "wb") as f:
+                f.write(b"partial")
+            recovery = os.path.join(tmp, prefix + "recovery")
+            os.makedirs(os.path.join(recovery, "previous"))
+            with open(os.path.join(recovery, "previous", "c_0_0.glb"), "wb") as f:
+                f.write(b"previous chunk")
+            unrelated = os.path.join(tmp, "notes")
+            os.makedirs(unrelated)
+
+            world_build._remove_stale_staging(tmp)
+
+            self.assertEqual(sorted(os.listdir(tmp)), sorted([prefix + "recovery", "notes"]))
+            with open(os.path.join(recovery, "previous", "c_0_0.glb"), "rb") as f:
+                self.assertEqual(f.read(), b"previous chunk")
+
 
 # ---------------------------------------------------------------------------
 # 4. viewer/serve.py tests

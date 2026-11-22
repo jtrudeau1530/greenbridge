@@ -22,7 +22,8 @@
 // - enhanced barriers need pipeline_barrier2 (synchronization2, Vulkan 1.3);
 // - unordered-access clears need fill_buffer, update_buffer and copy_buffer for buffers; texture views cleared with
 //   rectangles need color_attachment usage on the image (ResourceBinding::color_attachment);
-// - query commands need the query functions, fill_buffer and query_pool; resolve destinations have TRANSFER_DST usage.
+// - query commands need the query functions, fill_buffer and query_pool; resolve destinations have TRANSFER_DST
+//   usage and binary occlusion resolves need resolve_binary_occlusion.
 // A list that needs a missing function fails with ReplayResult::unsupported before anything is written.
 
 #include "command_list.h"
@@ -633,6 +634,9 @@ struct ReplayFunctions {
     PFN_vkCmdEndQuery end_query = nullptr;
     PFN_vkCmdWriteTimestamp write_timestamp = nullptr;
     PFN_vkCmdCopyQueryPoolResults copy_query_pool_results = nullptr;
+    // Resolves available binary-occlusion queries to 64-bit 0/1 values, outside conditional rendering.
+    std::function<void(VkCommandBuffer, VkQueryPool, std::uint32_t first, std::uint32_t count,
+                       VkBuffer dst, VkDeviceSize offset)> resolve_binary_occlusion;
     // VK_EXT_debug_utils, set only when the instance enabled it; debug markers are skipped without them.
     PFN_vkCmdInsertDebugUtilsLabelEXT insert_label = nullptr;
     PFN_vkCmdBeginDebugUtilsLabelEXT begin_label = nullptr;
@@ -1234,6 +1238,7 @@ class PreparedList {
 public:
     const CommandList* list = nullptr;
     std::vector<detail::Prepared> commands;
+    bool binary_occlusion = false;  // the queue needs its internal resolve resources
     // Copies, resolves and UAV clears that run as transfers, recorded while a predicate was set. D3D12 skips them
     // when the predicate says so, but Vulkan's conditional rendering does not cover transfer commands, so they run
     // unconditionally (docs/d3d12_vulkan.md section 4.7). Counted so the caller can report it.
@@ -1297,6 +1302,7 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
     const auto commands = list.commands();
     out.list = &list;
     out.commands.assign(commands.size(), {});
+    out.binary_occlusion = false;
     const bool rendering = vk.begin_rendering && vk.end_rendering && vk.clear_attachments && vk.image_view;
     const bool copies = vk.copy_buffer && vk.copy_buffer_to_image && vk.copy_image_to_buffer && vk.copy_image;
     const bool conditional = vk.begin_conditional_rendering && vk.end_conditional_rendering;
@@ -1541,10 +1547,17 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             if (const auto* resolve_queries = std::get_if<ResolveQueries>(&command)) {
                 // The destination is a buffer, as D3D12 requires, large enough for every result.
                 if (!bind(resolve_queries->dst)) return ReplayResult::unresolved_resource;
-                if (!p.binding.buffer ||
-                    !detail::within(resolve_queries->offset, std::uint64_t(range.count) * query_result_size(range.type),
-                                    p.binding.size))
+                const std::uint64_t bytes = std::uint64_t(range.count) * query_result_size(range.type);
+                if (!p.binding.buffer || p.binding.buffer_offset % 8 ||
+                    !detail::within(resolve_queries->offset, bytes, p.binding.size) ||
+                    !detail::within(p.binding.buffer_offset, resolve_queries->offset + bytes,
+                                    std::numeric_limits<VkDeviceSize>::max()))
                     return ReplayResult::invalid_query;
+                if (range.type == d3d12_query::binary_occlusion) {
+                    // The internal dispatch would otherwise count towards the application's CSInvocations.
+                    if (!vk.resolve_binary_occlusion || statistics_active) return ReplayResult::unsupported;
+                    out.binary_occlusion = true;
+                }
             }
         } else if (const auto* ind = std::get_if<ExecuteIndirect>(&command)) {
             if (!bind(ind->argument_buffer) || !p.binding.buffer) return ReplayResult::unresolved_resource;
@@ -1595,14 +1608,13 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
     const VulkanAccess transfer_dst = vulkan_access(d3d12_state::copy_dest, false);
     // The extension is enabled: barriers into and out of PREDICATION also cover conditional rendering's read.
     const bool predicates = vk.begin_conditional_rendering != nullptr;
-    bool conditional_rendering = false;  // inside vkCmdBeginConditionalRenderingEXT
     VkConditionalRenderingBeginInfoEXT predicate{VK_STRUCTURE_TYPE_CONDITIONAL_RENDERING_BEGIN_INFO_EXT};
     // A dispatch honours conditional rendering and a copy does not (the layer runs copies unpredicated), so the
     // conversion around a copy must run whatever the predicate says: end it for the dispatch and begin it again.
     const auto run_depth24 = [&](const Depth24Job& job) {
-        if (conditional_rendering) vk.end_conditional_rendering(command_buffer);
+        if (predicate.buffer) vk.end_conditional_rendering(command_buffer);
         vk.depth24_run(command_buffer, job);
-        if (conditional_rendering) vk.begin_conditional_rendering(command_buffer, &predicate);
+        if (predicate.buffer) vk.begin_conditional_rendering(command_buffer, &predicate);
     };
 
     for (std::size_t i = 0; i < commands.size(); ++i) {
@@ -1610,10 +1622,9 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
         const auto& p = prepared.commands[i];
         if (const auto* predication = std::get_if<Predication>(&command)) {
             // Conditional rendering cannot nest, so a new predicate ends the previous one first.
-            if (conditional_rendering) vk.end_conditional_rendering(command_buffer);
-            conditional_rendering = predication->buffer != 0;
-            if (conditional_rendering) {
-                predicate.buffer = p.binding.buffer;
+            if (predicate.buffer) vk.end_conditional_rendering(command_buffer);
+            predicate.buffer = p.binding.buffer;
+            if (predicate.buffer) {
                 predicate.offset = predication->offset;
                 // Vulkan discards the commands when the word is 0, which is EQUAL_ZERO; INVERTED gives NOT_EQUAL_ZERO.
                 predicate.flags = predication->op == d3d12_predication::not_equal_zero
@@ -1988,24 +1999,30 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             }
             heap.ended[end->index] = true;
         } else if (const auto* resolve = std::get_if<ResolveQueries>(&command)) {
-            // Runs of ended queries are copied as UINT64s, waiting for their results; D3D12 leaves a query that
-            // was never ended undefined, and it is written as zeros here rather than waited on forever.
+            // D3D12 leaves a query that was never ended undefined. Write zeros instead of waiting forever.
             const QueryPool& heap = *p.queries;
             const std::uint32_t size = query_result_size(resolve->type);
+            const bool binary = resolve->type == d3d12_query::binary_occlusion;
+            // ResolveQueryData is unconditional in D3D12, including our internal dispatch.
+            if (binary && predicate.buffer) vk.end_conditional_rendering(command_buffer);
             std::uint32_t index = resolve->first;
             const std::uint32_t last = resolve->first + resolve->count;
             while (index < last) {
                 const bool ended = heap.ended[index];
                 std::uint32_t run = 1;
                 while (index + run < last && heap.ended[index + run] == ended) ++run;
-                const VkDeviceSize offset = resolve->offset + VkDeviceSize(index - resolve->first) * size;
-                if (ended)
+                const VkDeviceSize offset = p.binding.buffer_offset + resolve->offset +
+                                            VkDeviceSize(index - resolve->first) * size;
+                if (!ended)
+                    vk.fill_buffer(command_buffer, p.binding.buffer, offset, VkDeviceSize(run) * size, 0);
+                else if (binary)
+                    vk.resolve_binary_occlusion(command_buffer, heap.pool, index, run, p.binding.buffer, offset);
+                else
                     vk.copy_query_pool_results(command_buffer, heap.pool, index, run, p.binding.buffer, offset, size,
                                                VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
-                else
-                    vk.fill_buffer(command_buffer, p.binding.buffer, offset, VkDeviceSize(run) * size, 0);
                 index += run;
             }
+            if (binary && predicate.buffer) vk.begin_conditional_rendering(command_buffer, &predicate);
         } else if (const auto* ind = std::get_if<ExecuteIndirect>(&command)) {
             if (ind->count_buffer) {
                 if (ind->kind == IndirectKind::draw) {
@@ -2081,7 +2098,7 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
         }
     }
     // Predication does not carry over to the next command list.
-    if (conditional_rendering) vk.end_conditional_rendering(command_buffer);
+    if (predicate.buffer) vk.end_conditional_rendering(command_buffer);
     if (!open_labels) close_labels(command_buffer, vk, own_labels);
 }
 

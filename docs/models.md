@@ -313,6 +313,31 @@ the model mapping and the texture-parameter split are in
 [character_skeleton.md](character_skeleton.md). No character bind matrices were recovered; that
 page records the reference-pose caveat rather than inventing a bind pose.
 
+## Shader render buckets
+
+`rpf9dump` writes two raw shader fields per material, `RenderBucket` (byte at shader +0x39) and
+`RenderBucketMask` (u32 at +0x3C; `RageModelDecoder.cs:651`). Measured on a random sample of 3,000 `.ydr`/`.yft`
+models (27,435 shaders):
+
+- `RenderBucketMask == 0xFF00 | (1 << (RenderBucket & 0x7F))` in all 27,435. Bit 7 of `RenderBucket` is a
+  separate flag (set in 438) that does not change the mask.
+- `RenderBucket & 0x7F` takes the values 0-6, the GTA V drawable bucket list. Model-name tokens (counted per
+  shader, from the model's name) line up with it:
+
+| Bucket | GTA V meaning | Shaders | Name evidence (share of shaders whose model name matches) |
+|---:|---|---:|---|
+| 0 | opaque | 17,826 | baseline: water 0.6%, vegetation 0.5%, glass/window 0.2%, decal 0.1% |
+| 1 | alpha | 725 | glass/window 7.6% (38x baseline) |
+| 2 | decal | 7,282 | decal/graffiti/dirt 3.1% (31x) |
+| 3 | cutout | 1,311 | vegetation 2.8% (5.6x) |
+| 4 | no splash | 6 | one program (`fc34f08b`) |
+| 5 | no water | 6 | the same program |
+| 6 | water | 343 | water/river/pool/canal 80.2% |
+
+Names are per model and a building holds glass, decal and opaque shaders alike, so the token shares are low
+in absolute terms; the enrichment against bucket 0 is the signal. For export: bucket 1 needs blending, 2 is
+a projected decal, 3 needs alpha testing, 6 is a water surface.
+
 ## What to do next
 
 1. **Done:** [rpf9-explorer PR #1](https://github.com/breadbbbb/rpf9-explorer/pull/1) is merged upstream.

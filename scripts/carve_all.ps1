@@ -3,9 +3,12 @@
 param([Parameter(Mandatory)][string]$Game, [Parameter(Mandatory)][string]$Out)
 $root = Split-Path $PSScriptRoot -Parent
 $tool = Join-Path $root "tools\rpf9_carve.py"
+# -Game may be relative or end in a separator; archive names are cut from the resolved, separator-ended prefix.
+$Game = (Resolve-Path -LiteralPath $Game).ProviderPath
+$prefix = $Game.TrimEnd('\') + '\'
 $rows = @()
 foreach ($f in Get-ChildItem $Game -Recurse -Filter *.rpf | Sort-Object Length) {
-    $rel = $f.FullName.Substring($Game.Length + 1)
+    $rel = $f.FullName.Substring($prefix.Length)
     $dest = Join-Path $Out ([IO.Path]::GetFileNameWithoutExtension(($rel -replace "[\\/]", "_")))
     if (-not (Test-Path (Join-Path $dest "index.json"))) {
         Write-Host ("{0:HH:mm:ss} carving {1} ({2:N1} GiB)" -f (Get-Date), $rel, ($f.Length / 1GB))
