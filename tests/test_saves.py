@@ -417,6 +417,44 @@ class ImportTest(unittest.TestCase):
 class MalformedJsavTest(unittest.TestCase):
     """A truncated or lying JSAV is one error line, not a struct.error traceback."""
 
+    def test_entry_ranges_must_stay_inside_the_json_body(self):
+        original, _, _ = make_jsav()
+        header, entries = saves.parse_jsav(original)
+        cases = {
+            "header": (0, 2),
+            "entry table": (saves.JSAV_HDR, 2),
+            "alignment padding": (header["table_end"], 1),
+            "past EOF": (len(original) + 16, 1),
+            "truncated block": (entries[0]["offset"], len(original)),
+            "trailing padding": (header["body_end"] - 1, 2),
+            "uint32 extent": (0xFFFFFFFF, 0xFFFFFFFF),
+        }
+        for name, (offset, size) in cases.items():
+            with self.subTest(name=name):
+                data = bytearray(original)
+                struct.pack_into("<II", data, saves.JSAV_HDR + 12, offset, size)
+                with self.assertRaisesRegex(ValueError, r"JSAV entry 0.*outside.*body"):
+                    saves.parse_jsav(bytes(data))
+
+    def test_all_read_commands_refuse_a_bad_entry_before_using_blocks(self):
+        data, _, _ = make_jsav()
+        bad = bytearray(data)
+        struct.pack_into("<I", bad, saves.JSAV_HDR + 12, len(data) + 16)
+        with tempfile.TemporaryDirectory() as tmp:
+            source, out = os.path.join(tmp, "bad.jsav"), os.path.join(tmp, "extract")
+            write(source, bad)
+            for args in (("info", source), ("extract", source, out),
+                         ("diff", source, source), ("verify", source)):
+                with self.subTest(command=args[0]):
+                    result = subprocess.run([sys.executable, "-I", TOOL, *args],
+                                            capture_output=True, text=True, timeout=10)
+                    self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                    self.assertIn("ERROR: JSAV entry 0", result.stderr)
+                    self.assertNotIn("Traceback", result.stderr)
+                    self.assertNotIn("blocks identical", result.stdout)
+            self.assertFalse(os.path.exists(os.path.join(out, "blocks")))
+            self.assertEqual(rd(source), bytes(bad))
+
     def test_header_shorter_than_16_bytes_is_rejected(self):
         with self.assertRaises(ValueError) as ctx:
             saves.parse_jsav(b"JSAV")

@@ -101,6 +101,12 @@ def parse_jsav(d):
     except ValueError:
         raise ValueError('JSAV body marker not found after the entry table') from None
     body_end = len(d.rstrip(b'\0'))
+    for entry in entries:
+        start, end = entry['offset'], entry['offset'] + entry['size']
+        if start < body_off or end > body_end:
+            # Python slices silently truncate invalid ranges; never export or compare those as real blocks.
+            raise ValueError(f"JSAV entry {entry['index']} range {start:#x}..{end:#x} is outside "
+                             f"the JSON body {body_off:#x}..{body_end:#x}")
     return {'magic': 'JSAV', 'version': ver, 'code_blocks': n_code, 'script_blocks': n_script,
             'table_end': table_end, 'body_offset': body_off, 'body_end': body_end,
             'file_size': len(d)}, entries
