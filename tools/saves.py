@@ -42,6 +42,10 @@ def ts(v):
 def parse_asav(d):
     if d[:4] != b'ASAV':
         raise ValueError('not ASAV')
+    # The fixed fields below are read at absolute offsets, so a short file must be rejected here instead of
+    # letting struct.unpack_from raise a struct.error that says nothing about the save (the JSAV parser in #923).
+    if len(d) < ASAV_HDR:
+        raise ValueError(f'header is only {len(d)} bytes, an ASAV header is {ASAV_HDR}')
     f = struct.unpack_from('<IIIIIII', d, 4)
     h = {
         'magic': 'ASAV',
@@ -61,6 +65,8 @@ def parse_asav(d):
         'file_size': len(d),
     }
     h['timestamp_utc'] = ts(h['timestamp'])
+    if h['payload_offset'] > len(d):
+        raise ValueError(f"payload offset {h['payload_offset']:#x} is past the end of a {len(d)}-byte file")
     return h
 
 
