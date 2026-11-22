@@ -458,6 +458,89 @@ class LdsSemanticInterpreter:
         self.vgprs[lane][vdst_reg] = old_val
         return dword_idx, old_val
 
+    def set_vgpr_u64(self, reg_idx: int, value: int, lane: int = 0) -> None:
+        lo, hi = split_u64_to_u32(value)
+        self.set_vgpr(reg_idx, lo, lane=lane)
+        self.set_vgpr(reg_idx + 1, hi, lane=lane)
+
+    def get_vgpr_u64(self, reg_idx: int, lane: int = 0) -> int:
+        lo = self.get_vgpr(reg_idx, lane=lane)
+        hi = self.get_vgpr(reg_idx + 1, lane=lane)
+        return combine_u32_to_u64(lo, hi)
+
+    def set_lds_u64(self, dword_idx: int, value: int) -> None:
+        lo, hi = split_u64_to_u32(value)
+        self.set_lds_dword(dword_idx, lo)
+        self.set_lds_dword((dword_idx + 1) & (self.lds_dwords - 1), hi)
+
+    def get_lds_u64(self, dword_idx: int) -> int:
+        lo = self.get_lds_dword(dword_idx)
+        hi = self.get_lds_dword((dword_idx + 1) & (self.lds_dwords - 1))
+        return combine_u32_to_u64(lo, hi)
+
+    def ds_write_b64(self, vaddr_reg: int, vdata_lo_reg: int, offset: int = 0, lane: int = 0) -> tuple[int, int] | None:
+        if not self.active_lanes[lane]:
+            return None
+        vaddr = self.vgprs[lane][vaddr_reg]
+        _, dword_idx0, _ = calc_lds_byte_offset(vaddr, offset, self.lds_dwords)
+        dword_idx1 = (dword_idx0 + 1) & (self.lds_dwords - 1)
+        self.lds[dword_idx0] = self.vgprs[lane][vdata_lo_reg] & MASK32
+        self.lds[dword_idx1] = self.vgprs[lane][vdata_lo_reg + 1] & MASK32
+        return dword_idx0, dword_idx1
+
+    def ds_read_b64(self, vdst_lo_reg: int, vaddr_reg: int, offset: int = 0, lane: int = 0) -> tuple[int, int] | None:
+        if not self.active_lanes[lane]:
+            return None
+        vaddr = self.vgprs[lane][vaddr_reg]
+        _, dword_idx0, _ = calc_lds_byte_offset(vaddr, offset, self.lds_dwords)
+        dword_idx1 = (dword_idx0 + 1) & (self.lds_dwords - 1)
+        val_lo = self.lds[dword_idx0]
+        val_hi = self.lds[dword_idx1]
+        self.vgprs[lane][vdst_lo_reg] = val_lo
+        self.vgprs[lane][vdst_lo_reg + 1] = val_hi
+        return dword_idx0, dword_idx1
+
+    def ds_or_b64(self, vaddr_reg: int, vdata_lo_reg: int, offset: int = 0, lane: int = 0) -> tuple[int, int] | None:
+        """Non-returning 64-bit atomic OR: updates LDS[idx] and LDS[idx+1], returns (idx0, idx1) or None."""
+        if not self.active_lanes[lane]:
+            return None
+        vaddr = self.vgprs[lane][vaddr_reg]
+        vdata_lo = self.vgprs[lane][vdata_lo_reg]
+        vdata_hi = self.vgprs[lane][vdata_lo_reg + 1]
+        _, dword_idx0, _ = calc_lds_byte_offset(vaddr, offset, self.lds_dwords)
+        dword_idx1 = (dword_idx0 + 1) & (self.lds_dwords - 1)
+        self.lds[dword_idx0] = (self.lds[dword_idx0] | vdata_lo) & MASK32
+        self.lds[dword_idx1] = (self.lds[dword_idx1] | vdata_hi) & MASK32
+        return dword_idx0, dword_idx1
+
+    def ds_or_rtn_b64(
+        self,
+        vdst_lo_reg: int,
+        vaddr_reg: int,
+        vdata_lo_reg: int,
+        offset: int = 0,
+        lane: int = 0,
+    ) -> tuple[int, int] | None:
+        """Returning 64-bit atomic OR: stores prior 64-bit value into vdst[0:1] and updates LDS[idx:idx+1].
+
+        Returns (dword_idx0, old_val_u64) if lane active, or None if inactive.
+        Reads all sources before writing vdst to handle aliasing safely.
+        """
+        if not self.active_lanes[lane]:
+            return None
+        vaddr = self.vgprs[lane][vaddr_reg]
+        vdata_lo = self.vgprs[lane][vdata_lo_reg]
+        vdata_hi = self.vgprs[lane][vdata_lo_reg + 1]
+        _, dword_idx0, _ = calc_lds_byte_offset(vaddr, offset, self.lds_dwords)
+        dword_idx1 = (dword_idx0 + 1) & (self.lds_dwords - 1)
+        old_lo = self.lds[dword_idx0]
+        old_hi = self.lds[dword_idx1]
+        self.lds[dword_idx0] = (old_lo | vdata_lo) & MASK32
+        self.lds[dword_idx1] = (old_hi | vdata_hi) & MASK32
+        self.vgprs[lane][vdst_lo_reg] = old_lo
+        self.vgprs[lane][vdst_lo_reg + 1] = old_hi
+        return dword_idx0, combine_u32_to_u64(old_lo, old_hi)
+
     def parse_and_execute(self, instruction_text: str, lane: int = 0) -> int | tuple[int, int] | None:
         line = instruction_text.strip()
         if not line or line.startswith(";"):
@@ -501,6 +584,31 @@ class LdsSemanticInterpreter:
             vdst = reg_num(raw_args[0])
             vaddr = reg_num(raw_args[1])
             return self.ds_read_b32(vdst, vaddr, offset=offset, lane=lane)
+
+        elif op == "ds_or_b64":
+            vaddr = reg_num(raw_args[0])
+            vdata = reg_num(raw_args[1])
+            res_b64 = self.ds_or_b64(vaddr, vdata, offset=offset, lane=lane)
+            return res_b64[0] if res_b64 else None
+
+        elif op == "ds_or_rtn_b64":
+            vdst = reg_num(raw_args[0])
+            vaddr = reg_num(raw_args[1])
+            vdata = reg_num(raw_args[2])
+            res_rtn_b64 = self.ds_or_rtn_b64(vdst, vaddr, vdata, offset=offset, lane=lane)
+            return res_rtn_b64[0] if res_rtn_b64 else None
+
+        elif op == "ds_write_b64":
+            vaddr = reg_num(raw_args[0])
+            vdata = reg_num(raw_args[1])
+            res_w64 = self.ds_write_b64(vaddr, vdata, offset=offset, lane=lane)
+            return res_w64[0] if res_w64 else None
+
+        elif op == "ds_read_b64":
+            vdst = reg_num(raw_args[0])
+            vaddr = reg_num(raw_args[1])
+            res_r64 = self.ds_read_b64(vdst, vaddr, offset=offset, lane=lane)
+            return res_r64[0] if res_r64 else None
 
         else:
             raise UnsupportedConstruct(f"Opcode {op} not supported in interpreter")
@@ -1170,6 +1278,471 @@ class TestTranslatorIntegrationB32(unittest.TestCase):
         spv = translate_cs_listing(body)
         self.assertIn("OpAtomicOr", spv)
         self.assertIn("%lds", spv)
+
+
+class TestLdsSemanticInterpreterB64(unittest.TestCase):
+    """Verifies 64-bit LDS atomic OR execution in multi-lane SIMD interpreter."""
+
+    def setUp(self):
+        self.interp = LdsSemanticInterpreter(lds_dwords=256, num_vgprs=64, num_lanes=32)
+
+    def test_ds_or_b64_non_returning_mutates_both_dwords(self):
+        self.interp.set_lds_dword(10, 0x12340000)
+        self.interp.set_lds_dword(11, 0x9ABC0000)
+        self.interp.set_vgpr(0, 40)           # byte 40 -> dword 10
+        self.interp.set_vgpr(2, 0x00005678)   # data lo
+        self.interp.set_vgpr(3, 0x0000DEF0)   # data hi
+        self.interp.set_vgpr(4, 0xDEADBEEF)   # dummy
+
+        res = self.interp.ds_or_b64(vaddr_reg=0, vdata_lo_reg=2, offset=0, lane=0)
+        self.assertEqual(res, (10, 11))
+        self.assertEqual(self.interp.get_lds_dword(10), 0x12345678)
+        self.assertEqual(self.interp.get_lds_dword(11), 0x9ABCDEF0)
+        self.assertEqual(self.interp.get_vgpr(0), 40)
+        self.assertEqual(self.interp.get_vgpr(2), 0x00005678)
+        self.assertEqual(self.interp.get_vgpr(3), 0x0000DEF0)
+        self.assertEqual(self.interp.get_vgpr(4), 0xDEADBEEF)
+
+    def test_ds_or_rtn_b64_returns_prior_64bit_value(self):
+        init_val = 0xCAFEBABE_DEADBEEF
+        mask_val = 0x00000000_11111111
+        self.interp.set_lds_u64(12, init_val)
+        self.interp.set_vgpr(0, 48)           # byte 48 -> dword 12
+        self.interp.set_vgpr_u64(2, mask_val)
+        self.interp.set_vgpr_u64(4, 0)        # vdst in v[4:5]
+
+        res = self.interp.ds_or_rtn_b64(vdst_lo_reg=4, vaddr_reg=0, vdata_lo_reg=2, offset=0, lane=0)
+        self.assertEqual(res, (12, init_val))
+        self.assertEqual(self.interp.get_vgpr_u64(4), init_val)
+        self.assertEqual(self.interp.get_lds_u64(12), init_val | mask_val)
+
+    def test_ds_or_rtn_b64_with_offset(self):
+        init_val = 0x11112222_33334444
+        mask_val = 0x55555555_AAAAAAAA
+        # vaddr = 32 (dword 8), offset = 24 bytes (6 dwords) -> target is dword 14
+        self.interp.set_lds_u64(14, init_val)
+        self.interp.set_vgpr(0, 32)
+        self.interp.set_vgpr_u64(2, mask_val)
+        self.interp.set_vgpr_u64(6, 0)
+
+        res = self.interp.ds_or_rtn_b64(vdst_lo_reg=6, vaddr_reg=0, vdata_lo_reg=2, offset=24, lane=0)
+        self.assertEqual(res, (14, init_val))
+        self.assertEqual(self.interp.get_vgpr_u64(6), init_val)
+        self.assertEqual(self.interp.get_lds_u64(14), init_val | mask_val)
+
+    def test_ds_or_rtn_b64_saturation_chain(self):
+        # Initial 0; OR with 0x55555555_55555555, then 0xAAAAAAAA_AAAAAAAA -> MASK64
+        self.interp.set_lds_u64(20, 0)
+        self.interp.set_vgpr(0, 80)
+        mask1 = 0x55555555_55555555
+        mask2 = 0xAAAAAAAA_AAAAAAAA
+        self.interp.set_vgpr_u64(2, mask1)
+
+        res1 = self.interp.ds_or_rtn_b64(vdst_lo_reg=4, vaddr_reg=0, vdata_lo_reg=2, offset=0, lane=0)
+        self.assertEqual(res1, (20, 0))
+        self.assertEqual(self.interp.get_vgpr_u64(4), 0)
+        self.assertEqual(self.interp.get_lds_u64(20), mask1)
+
+        self.interp.set_vgpr_u64(2, mask2)
+        res2 = self.interp.ds_or_rtn_b64(vdst_lo_reg=6, vaddr_reg=0, vdata_lo_reg=2, offset=0, lane=0)
+        self.assertEqual(res2, (20, mask1))
+        self.assertEqual(self.interp.get_vgpr_u64(6), mask1)
+        self.assertEqual(self.interp.get_lds_u64(20), MASK64)
+
+    def test_ds_or_rtn_b64_vdst_aliasing_vdata(self):
+        init_val = 0x88880000_66660000
+        data_val = 0x00007777_00005555
+        self.interp.set_lds_u64(16, init_val)
+        self.interp.set_vgpr(0, 64)
+        self.interp.set_vgpr_u64(2, data_val)
+
+        # vdst is v[2:3], which aliases vdata in v[2:3]
+        res = self.interp.ds_or_rtn_b64(vdst_lo_reg=2, vaddr_reg=0, vdata_lo_reg=2, lane=0)
+        self.assertEqual(res, (16, init_val))
+        self.assertEqual(self.interp.get_lds_u64(16), init_val | data_val)
+        self.assertEqual(self.interp.get_vgpr_u64(2), init_val)
+
+    def test_ds_or_rtn_b64_vdst_aliasing_vaddr(self):
+        init_val = 0xAAAA0000_CCCC0000
+        data_val = 0x0000BBBB_0000DDDD
+        self.interp.set_lds_u64(18, init_val)
+        self.interp.set_vgpr(0, 72)
+        self.interp.set_vgpr_u64(2, data_val)
+
+        # vdst is v[0:1], aliasing vaddr in v0
+        res = self.interp.ds_or_rtn_b64(vdst_lo_reg=0, vaddr_reg=0, vdata_lo_reg=2, lane=0)
+        self.assertEqual(res, (18, init_val))
+        self.assertEqual(self.interp.get_lds_u64(18), init_val | data_val)
+        self.assertEqual(self.interp.get_vgpr_u64(0), init_val)
+
+    def test_ds_or_b64_inactive_lane_under_exec_mask(self):
+        self.interp.set_lds_u64(4, 0x12345678_9ABCDEF0)
+        self.interp.set_vgpr(0, 16, lane=2)
+        self.interp.set_vgpr_u64(2, 0xFFFFFFFF_FFFFFFFF, lane=2)
+        self.interp.set_vgpr_u64(4, 0xFEEDFACE_CAFEBABE, lane=2)
+        self.interp.set_lane_active(2, False)
+
+        res = self.interp.ds_or_rtn_b64(vdst_lo_reg=4, vaddr_reg=0, vdata_lo_reg=2, lane=2)
+        self.assertIsNone(res)
+        self.assertEqual(self.interp.get_vgpr_u64(4, lane=2), 0xFEEDFACE_CAFEBABE)
+        self.assertEqual(self.interp.get_lds_u64(4), 0x12345678_9ABCDEF0)
+
+    def test_ds_or_rtn_b64_simd_wave_divergent(self):
+        # 32 lanes, each lane targeting its own 64-bit element (lane * 8 bytes = dword 2 * lane)
+        for lane in range(32):
+            val = (0x1000_0000_0000 + lane * 0x1_0000_0001) & MASK64
+            self.interp.set_lds_u64(lane * 2, val)
+            self.interp.set_vgpr(0, lane * 8, lane=lane)
+            self.interp.set_vgpr_u64(2, 0x00FF00FF_00FF00FF, lane=lane)
+            self.interp.set_vgpr_u64(4, 0, lane=lane)
+
+        for lane in range(32):
+            self.interp.ds_or_rtn_b64(vdst_lo_reg=4, vaddr_reg=0, vdata_lo_reg=2, offset=0, lane=lane)
+
+        for lane in range(32):
+            orig_val = (0x1000_0000_0000 + lane * 0x1_0000_0001) & MASK64
+            self.assertEqual(self.interp.get_vgpr_u64(4, lane=lane), orig_val)
+            self.assertEqual(self.interp.get_lds_u64(lane * 2), orig_val | 0x00FF00FF_00FF00FF)
+
+    def test_ds_or_rtn_b64_simd_wave_convergent_shared_word(self):
+        # 32 lanes all targeting dword 30 (64-bit), each setting bit lane and bit lane + 32
+        self.interp.set_lds_u64(30, 0)
+        for lane in range(32):
+            self.interp.set_vgpr(0, 120, lane=lane)  # byte 120 -> dword 30
+            mask_64 = (1 << lane) | (1 << (lane + 32))
+            self.interp.set_vgpr_u64(2, mask_64, lane=lane)
+            self.interp.set_vgpr_u64(4, 0, lane=lane)
+
+        for lane in range(32):
+            self.interp.ds_or_rtn_b64(vdst_lo_reg=4, vaddr_reg=0, vdata_lo_reg=2, offset=0, lane=lane)
+
+        self.assertEqual(self.interp.get_lds_u64(30), MASK64)
+
+    def test_assembly_parser_dispatch_b64(self):
+        self.interp.set_lds_u64(8, 0xAAAAAAAA_00000000)
+        self.interp.set_vgpr(0, 32)
+        self.interp.set_vgpr_u64(2, 0x00000000_55555555)
+
+        self.interp.parse_and_execute("ds_or_b64 v0, v[2:3] offset:0")
+        self.assertEqual(self.interp.get_lds_u64(8), 0xAAAAAAAA_55555555)
+
+        self.interp.set_vgpr_u64(4, 0)
+        self.interp.set_vgpr_u64(2, 0x55555555_AAAAAAAA)
+        self.interp.parse_and_execute("ds_or_rtn_b64 v[4:5], v0, v[2:3] offset:0")
+        self.assertEqual(self.interp.get_vgpr_u64(4), 0xAAAAAAAA_55555555)
+        self.assertEqual(self.interp.get_lds_u64(8), MASK64)
+
+        # Test ds_write_b64 and ds_read_b64 through parser
+        self.interp.set_vgpr_u64(6, 0xCAFEBABE_12345678)
+        self.interp.parse_and_execute("ds_write_b64 v0, v[6:7] offset:8")
+        self.assertEqual(self.interp.get_lds_u64(10), 0xCAFEBABE_12345678)
+
+        self.interp.set_vgpr_u64(8, 0)
+        self.interp.parse_and_execute("ds_read_b64 v[8:9], v0 offset:8")
+        self.assertEqual(self.interp.get_vgpr_u64(8), 0xCAFEBABE_12345678)
+
+    def test_run_simd_wave_b64_with_exec_mask(self):
+        # Lanes 0..3 active (0x0F), lanes 4..7 inactive
+        self.interp.set_exec_mask(0x0F)
+        for lane in range(8):
+            self.interp.set_vgpr(0, lane * 8, lane=lane)
+            self.interp.set_vgpr_u64(2, 0xFFFFFFFF_00000000, lane=lane)
+            self.interp.set_vgpr_u64(4, 0x55555555_55555555, lane=lane)
+
+        results = self.interp.run_simd_wave("ds_or_rtn_b64 v[4:5], v0, v[2:3]")
+        for lane in range(4):
+            self.assertIsNotNone(results[lane])
+            self.assertEqual(self.interp.get_vgpr_u64(4, lane=lane), 0)
+            self.assertEqual(self.interp.get_lds_u64(lane * 2), 0xFFFFFFFF_00000000)
+        for lane in range(4, 8):
+            self.assertIsNone(results[lane])
+            self.assertEqual(self.interp.get_vgpr_u64(4, lane=lane), 0x55555555_55555555)
+            self.assertEqual(self.interp.get_lds_u64(lane * 2), 0)
+
+
+class TestLdsOffsetWrappingAndStrides(unittest.TestCase):
+    """Verifies edge-case address calculation, 64-bit element wrapping, and st64 dual offsets."""
+
+    def test_64bit_boundary_crossing_wrap(self):
+        interp = LdsSemanticInterpreter(lds_dwords=64, num_vgprs=16, num_lanes=1)
+        # LDS has 64 dwords (indices 0..63).
+        # A 64-bit element at dword 63 spans dword 63 and dword (63+1)%64 = 0.
+        interp.set_lds_dword(63, 0x11110000)
+        interp.set_lds_dword(0, 0x22220000)
+        interp.set_vgpr(0, 63 * 4)  # byte address 252 -> dword 63
+        interp.set_vgpr(2, 0x00003333)
+        interp.set_vgpr(3, 0x00004444)
+        interp.set_vgpr_u64(4, 0)
+
+        res = interp.ds_or_rtn_b64(vdst_lo_reg=4, vaddr_reg=0, vdata_lo_reg=2, offset=0, lane=0)
+        self.assertEqual(res, (63, combine_u32_to_u64(0x11110000, 0x22220000)))
+        self.assertEqual(interp.get_vgpr(4), 0x11110000)
+        self.assertEqual(interp.get_vgpr(5), 0x22220000)
+        self.assertEqual(interp.get_lds_dword(63), 0x11113333)
+        self.assertEqual(interp.get_lds_dword(0), 0x22224444)
+
+    def test_large_offset_overflow_wrap(self):
+        interp = LdsSemanticInterpreter(lds_dwords=128, num_vgprs=16, num_lanes=1)
+        # 32-bit unsigned wrapping: 0xFFFFFFFC + 8 = 0x00000004 -> dword 1
+        interp.set_lds_dword(1, 0x55550000)
+        interp.set_lds_dword(2, 0xAAAA0000)
+        interp.set_vgpr(0, 0xFFFFFFFC)
+        interp.set_vgpr(2, 0x000000FF)
+        interp.set_vgpr(3, 0x00FF0000)
+
+        interp.ds_or_b64(vaddr_reg=0, vdata_lo_reg=2, offset=8, lane=0)
+        self.assertEqual(interp.get_lds_dword(1), 0x555500FF)
+        self.assertEqual(interp.get_lds_dword(2), 0xAAFF0000)
+
+    def test_calc_dual_offsets_st64_math(self):
+        # Non-st64: stride unit is 4 bytes for 32-bit (1 dword per offset unit)
+        (eff0, idx0), (eff1, idx1) = calc_lds_dual_offsets(0x100, 4, 8, lds_dwords=512, st64=False)
+        self.assertEqual(eff0, 0x100 + 16)
+        self.assertEqual(idx0, (0x100 + 16) >> 2)
+        self.assertEqual(eff1, 0x100 + 32)
+        self.assertEqual(idx1, (0x100 + 32) >> 2)
+
+        # st64=True: stride unit is 4 * 64 = 256 bytes per offset unit
+        (eff0_st, idx0_st), (eff1_st, idx1_st) = calc_lds_dual_offsets(0x100, 1, 2, lds_dwords=512, st64=True)
+        self.assertEqual(eff0_st, 0x100 + 256)
+        self.assertEqual(idx0_st, (0x100 + 256) >> 2)
+        self.assertEqual(eff1_st, 0x100 + 512)
+        self.assertEqual(idx1_st, (0x100 + 512) >> 2)
+
+    def test_dual_offset_wrapping_power_of_two(self):
+        lds_dwords = 32  # 128 bytes total
+        (eff0, idx0), (eff1, idx1) = calc_lds_dual_offsets(0, 32, 33, lds_dwords=lds_dwords, st64=False)
+        # offset 32 * 4 = 128 bytes -> wraps to dword 0
+        self.assertEqual(idx0, 0)
+        # offset 33 * 4 = 132 bytes -> wraps to dword 1
+        self.assertEqual(idx1, 1)
+
+
+class TestSpirvAtomicOrB64Emission(unittest.TestCase):
+    """Verifies that 64-bit LDS atomic OR translates to conforming SPIR-V and executes correctly."""
+
+    def test_rdna2spirv_translate_b64_emission(self):
+        spv = translate_cs_listing([
+            "ds_or_b64 v0, v[2:3]",
+            "ds_or_rtn_b64 v[4:5], v0, v[2:3] offset:16",
+        ])
+        lines = [ln.strip() for ln in spv.splitlines() if "OpAtomicOr" in ln]
+        # Must emit 2 OpAtomicOr for ds_or_b64 + 2 OpAtomicOr for ds_or_rtn_b64
+        self.assertEqual(len(lines), 4)
+        for ln in lines:
+            self.assertIn("OpAtomicOr", ln)
+            self.assertIn("%uint", ln)
+            self.assertIn("%c2", ln)  # Workgroup scope
+            self.assertIn("%c0", ln)  # Relaxed semantics
+
+    def test_spirv_sequential_atomics_emulating_b64(self):
+        # Compute shader executing two sequential 32-bit OpAtomicOr operations simulating a 64-bit atomic
+        spvasm = """
+OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main" %out_lo %out_hi
+OpExecutionMode %main LocalSize 1 1 1
+%uint = OpTypeInt 32 0
+%c64 = OpConstant %uint 64
+%c2 = OpConstant %uint 2
+%c0 = OpConstant %uint 0
+%c10 = OpConstant %uint 10
+%c11 = OpConstant %uint 11
+%c_mask_lo = OpConstant %uint 3735928559
+%c_mask_hi = OpConstant %uint 3405691582
+%lds_arr = OpTypeArray %uint %c64
+%_ptr_WG_lds = OpTypePointer Workgroup %lds_arr
+%_ptr_WG_uint = OpTypePointer Workgroup %uint
+%_ptr_Out_uint = OpTypePointer Output %uint
+%lds = OpVariable %_ptr_WG_lds Workgroup
+%out_lo = OpVariable %_ptr_Out_uint Output
+%out_hi = OpVariable %_ptr_Out_uint Output
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%ptr_lo = OpAccessChain %_ptr_WG_uint %lds %c10
+%ptr_hi = OpAccessChain %_ptr_WG_uint %lds %c11
+%old_lo = OpAtomicOr %uint %ptr_lo %c2 %c0 %c_mask_lo
+%old_hi = OpAtomicOr %uint %ptr_hi %c2 %c0 %c_mask_hi
+OpStore %out_lo %old_lo
+OpStore %out_hi %old_hi
+OpReturn
+OpFunctionEnd
+"""
+        interp = LdsAtomicSpirvInterp(spvasm)
+        init_lo = 0x12340000
+        init_hi = 0x9ABC0000
+        final_lds, lane_outputs = interp.run(seed_lds={10: init_lo, 11: init_hi})
+        self.assertEqual(lane_outputs[0]["%out_lo"], init_lo)
+        self.assertEqual(lane_outputs[0]["%out_hi"], init_hi)
+        self.assertEqual(final_lds[10], init_lo | 3735928559)
+        self.assertEqual(final_lds[11], init_hi | 3405691582)
+
+
+class TestNegativeControlsAndBounds(unittest.TestCase):
+    """Verifies that invalid operands, unmodelled opcodes, bad stages, and bound violations fail safely."""
+
+    def test_rdna2spirv_invalid_operand_shape_rejected(self):
+        # ds_or_b64 requires VGPR pair for data: passing scalar v1 must raise Unsupported
+        with self.assertRaises(rdna2spirv.Unsupported):
+            translate_cs_listing(["ds_or_b64 v0, v1"])
+
+    def test_rdna2spirv_invalid_rtn_destination_shape_rejected(self):
+        # ds_or_rtn_b64 requires VGPR pair for destination: passing scalar v4 must raise Unsupported
+        with self.assertRaises(rdna2spirv.Unsupported):
+            translate_cs_listing(["ds_or_rtn_b64 v4, v0, v[2:3]"])
+
+    def test_rdna2spirv_non_compute_stage_rejected(self):
+        class MockPixelGen:
+            def __init__(self):
+                self.stage = "ps"
+                self.uses_lds = False
+
+            lds_op = rdna2spirv.Gen.lds_op
+
+        gen = MockPixelGen()
+        with self.assertRaises(rdna2spirv.Unsupported):
+            gen.lds_op("ds_or_b32", [{"r": 0}, {"r": 1}], [])
+        with self.assertRaises(rdna2spirv.Unsupported):
+            gen.lds_op("ds_or_b64", [{"r": 0}, {"r": 1, "k": "vgpr", "n": 2}], [])
+
+    def test_spirv_unsupported_storage_class(self):
+        spvasm = """
+OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+%uint = OpTypeInt 32 0
+%_ptr_UC = OpTypePointer UniformConstant %uint
+%u = OpVariable %_ptr_UC UniformConstant
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%main = OpFunction %void None %fn
+%entry = OpLabel
+OpReturn
+OpFunctionEnd
+"""
+        with self.assertRaises(UnsupportedConstruct):
+            LdsAtomicSpirvInterp(spvasm)
+
+    def test_spirv_unsupported_opcode_in_body(self):
+        spvasm = """
+OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+%uint = OpTypeInt 32 0
+%c10 = OpConstant %uint 10
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%bad = OpSDiv %uint %c10 %c10
+OpReturn
+OpFunctionEnd
+"""
+        interp = LdsAtomicSpirvInterp(spvasm)
+        with self.assertRaises(UnsupportedConstruct):
+            interp.run()
+
+    def test_spirv_invalid_workgroup_local_sizes(self):
+        for bad_dims in [(0, 1, 1), (1025, 1, 1), (33, 32, 1)]:
+            with self.subTest(dims=bad_dims):
+                spvasm = f"""
+OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize {bad_dims[0]} {bad_dims[1]} {bad_dims[2]}
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%main = OpFunction %void None %fn
+%entry = OpLabel
+OpReturn
+OpFunctionEnd
+"""
+                with self.assertRaises(WorkgroupBoundsError):
+                    LdsAtomicSpirvInterp(spvasm)
+
+    def test_spirv_atomic_on_non_lds_pointer(self):
+        spvasm = """
+OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+%uint = OpTypeInt 32 0
+%_ptr_fn_uint = OpTypePointer Function %uint
+%c2 = OpConstant %uint 2
+%c0 = OpConstant %uint 0
+%c7 = OpConstant %uint 7
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%fn_var = OpVariable %_ptr_fn_uint Function
+%bad = OpAtomicOr %uint %fn_var %c2 %c0 %c7
+OpReturn
+OpFunctionEnd
+"""
+        interp = LdsAtomicSpirvInterp(spvasm)
+        with self.assertRaises(UnsupportedConstruct):
+            interp.run()
+
+    def test_spirv_out_of_bounds_lds_access(self):
+        spvasm = """
+OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+%uint = OpTypeInt 32 0
+%c16 = OpConstant %uint 16
+%c99 = OpConstant %uint 99
+%c2 = OpConstant %uint 2
+%c0 = OpConstant %uint 0
+%lds_arr = OpTypeArray %uint %c16
+%_ptr_WG_lds = OpTypePointer Workgroup %lds_arr
+%_ptr_WG_uint = OpTypePointer Workgroup %uint
+%lds = OpVariable %_ptr_WG_lds Workgroup
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%ptr = OpAccessChain %_ptr_WG_uint %lds %c99
+%bad = OpAtomicOr %uint %ptr %c2 %c0 %c16
+OpReturn
+OpFunctionEnd
+"""
+        interp = LdsAtomicSpirvInterp(spvasm)
+        with self.assertRaises(WorkgroupBoundsError):
+            interp.run()
+
+    def test_simd_interp_unknown_opcode_rejected(self):
+        interp = LdsSemanticInterpreter()
+        with self.assertRaises(UnsupportedConstruct):
+            interp.parse_and_execute("ds_unknown_op v0, v1")
+
+    def test_spirv_shift_bounds_rejected(self):
+        for op in ("OpShiftRightLogical", "OpShiftLeftLogical"):
+            with self.subTest(op=op):
+                spvasm = f"""
+OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+%uint = OpTypeInt 32 0
+%c1 = OpConstant %uint 1
+%c32 = OpConstant %uint 32
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%bad = {op} %uint %c1 %c32
+OpReturn
+OpFunctionEnd
+"""
+                interp = LdsAtomicSpirvInterp(spvasm)
+                with self.assertRaises(UnsupportedConstruct):
+                    interp.run()
 
 
 if __name__ == "__main__":
