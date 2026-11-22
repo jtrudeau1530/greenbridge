@@ -341,7 +341,7 @@ struct State {
     bool config_read = false;
     bool sdl_ready = false, sdl_failed = false;
     bool thread_started = false;
-    DWORD delivering_thread = 0;
+    std::atomic<DWORD> delivering_thread{0};  // written by the delivering thread, read unlocked by UnregisterCallback
 };
 
 // Never destroyed: the poll thread may still run while the process exits.
@@ -722,6 +722,11 @@ bool init_sdl() {
     if (s.sdl_failed) return false;
     // No window: keep reading pads when another application has focus.
     SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
+    // Never read pads through the host's GameInput underneath this GameInput shim (SDL's default is already off
+    // outside the GDK; this keeps it off if that default changes).
+#ifdef SDL_HINT_JOYSTICK_GAMEINPUT
+    SDL_SetHint(SDL_HINT_JOYSTICK_GAMEINPUT, "0");
+#endif
     SDL_SetGamepadEventsEnabled(false);  // the shim reads state directly; nothing drains an event queue
     if (!SDL_InitSubSystem(SDL_INIT_GAMEPAD)) {
         std::fprintf(stderr, "[rt] gameinput: SDL gamepad init failed: %s; no controllers\n", SDL_GetError());

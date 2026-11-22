@@ -13,13 +13,25 @@ module, is unverified (see [VERIFY](#verify)).
 
 ## Building
 
-SDL3 is zlib-licensed. CMake uses an installed SDL3 3.2 or newer if `find_package(SDL3)` finds one (set `SDL3_DIR`
-or `CMAKE_PREFIX_PATH`). Otherwise it downloads the pinned release `SDL3-3.4.20.tar.gz` from SDL's GitHub releases
-once at configure time, checks its SHA-256, and builds it static with only the gamepad parts (no audio, video, GPU or
-render). That takes about a minute on the first build.
+The shim is optional, and the build downloads nothing unless asked. SDL3 is zlib-licensed. CMake builds the shim when
+SDL3 is available in one of these ways:
 
-- Offline: extract the same tarball and pass `-DFETCHCONTENT_SOURCE_DIR_SDL3=<path to SDL3-3.4.20>`.
-- Without the shim: `-DLEONIDA_SDL3=OFF`. `gta6rt` then has no `GameInputCreate`, as before.
+- **Installed SDL3**, 3.2 or newer, found by `find_package(SDL3)`: set `SDL3_DIR` or `CMAKE_PREFIX_PATH`, for example
+  `-DSDL3_DIR=C:/SDL3/cmake`. No flag is needed.
+- **`-DLEONIDA_SDL3_FETCH=ON`**: downloads the pinned release `SDL3-3.4.20.tar.gz` from SDL's GitHub releases once at
+  configure time, checks its SHA-256, and builds it static with only the gamepad parts (no audio, video, GPU or
+  render). That takes about a minute on the first build. `scripts/build_runtime.ps1 -FetchSdl3` passes it.
+- **A local copy of that tarball**: extract it and pass `-DFETCHCONTENT_SOURCE_DIR_SDL3=<path to SDL3-3.4.20>`; it is
+  built the same way, without a download.
+
+Without any of these, or with `-DLEONIDA_SDL3=OFF`, configure prints a message and `gta6rt` is built without the shim:
+it has no `GameInputCreate`, as before, so the loader binds it to the host's `GameInput.dll` or the unimplemented
+thunk. `gameinput_test` and `gameinput_probe` are not built, and CTest lists `gameinput` as not run (disabled) rather
+than failing.
+
+`scripts/build_runtime.ps1` (what `make_game.py` runs) builds the shim only on its CMake path, when Visual Studio's
+C++ CMake tools are installed. Its direct-`cl.exe` fallback compiles a fixed file list without the shim and warns
+about it.
 
 ## Mapping
 
