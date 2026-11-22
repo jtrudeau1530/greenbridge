@@ -381,6 +381,8 @@ int main() {
         std::memcpy(second.data(), static_cast<const std::uint8_t*>(results) + bytes, bytes);
 
         for (auto* r : {&out_a, &out_b, &constants, &readback}) r->reset();
+        pso67.reset();
+        unknown67.reset();
         pso.reset();
         root.reset();
         heap.reset();
