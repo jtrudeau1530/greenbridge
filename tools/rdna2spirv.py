@@ -60,6 +60,7 @@ W64G_COUNTS = Counter()   # tiers of the wave64 VS/PS/GS translated so far, for 
 # barycentrics, so .y/.z are AMD's i/j as with BaryCoordKHR.
 BARY_FALLBACK = False
 FMA_KHR = False          # --fma khr: fused multiply-adds are OpFmaKHR (SPV_KHR_fma, VK_KHR_shader_fma), not GLSL Fma
+FMA_EXACT = False        # --fma exact: fused multiply-adds are emulated from single-rounded f32 ops (Gen.fma_exact)
 # --texel-offset-fallback: image_sample*_o without VK_KHR_maintenance8. The run-time texel offset is folded into the
 # coordinate (coordinate + offset / size of the sampled mip level) instead of the SPIR-V Offset operand, which needs
 # maintenance8 outside gather. Implicit-LOD samples become Grad samples with the derivatives of the original
@@ -826,8 +827,103 @@ class Gen:
         if FMA_KHR:
             self.uses_fma_khr = True
             self.emit(f"{r} = OpFmaKHR %float {x} {y} {z}")
+        elif FMA_EXACT:
+            self.fma_exact(r, x, y, z)
         else:
             self.emit(f"{r} = OpExtInst %float %glsl Fma {x} {y} {z}")
+
+    def fma_exact(self, r, x, y, z):
+        """r = x * y + z rounded once to f32, built from single-rounded NoContraction f32 operations (--fma exact,
+        SHADER-497): for a device whose driver splits GLSL Fma into two roundings and that has no VK_KHR_shader_fma
+        (Intel UHD Graphics, Xe-LP, Windows driver 101.7088: cs_fma_fused words 0, 2, 3 and 5 split).
+
+        Boldo and Melquiond's emulated FMA ("Emulation of a FMA and correctly-rounded sums: proved algorithms using
+        rounding to odd", IEEE Transactions on Computers 57(4), 2008): p + pe = x * y exactly (Dekker's product; the
+        factors are split into 12-bit halves by masking the low 12 mantissa bits, so the split cannot overflow),
+        th + tl = z + p exactly (TwoSum), v = tl + pe rounded to odd (as fma_f16_odd), and r = th + v rounded to
+        nearest, or th when v is zero (th + 0 would turn a -0 sum into +0).
+
+        That needs every intermediate in the f32 normal range, so the operands are first scaled by powers of two,
+        which is exact, and the result scaled back: by 2^-64 when the product or z is at least 2^126 (the product may
+        overflow while z brings the sum back into range), by 2^96 when both are tiny (|x*y| < 2^-76 and
+        |z| < 2^-46), and a factor below 2^-100 is traded 2^64 against one above 2^-20, so the low split halves stay
+        normal on a driver that flushes f32 denormals. Infinite or NaN operands, and finite ones whose product is
+        beyond even the scaled range (the result is +-inf), take the plain Fma. Exact (checked against an exact
+        rational reference in tests/semantic/test_fma_exact.py) for finite operands with a normal or zero result,
+        with f32 denormals kept or flushed; a result in the denormal range is scaled back with a second rounding,
+        and a denormal operand follows the driver's denormal mode, as for every f32 operation here."""
+        t = self.tmp
+        one = "%f1"
+
+        def op(name, *args, ty="%float"):
+            o = t()
+            self.emit(f"{o} = {name} {ty} {' '.join(args)}")
+            return o
+
+        def mag(v):
+            return op("OpBitwiseAnd", op("OpBitcast", v, ty="%uint"), self.cu(0x7FFFFFFF), ty="%uint")
+
+        def below(m, k):
+            return op("OpULessThan", m, self.cu(k), ty="%bool")
+
+        def above(m, k):
+            return op("OpUGreaterThan", m, self.cu(k), ty="%bool")
+
+        def sel(c, a, b):
+            return op("OpSelect", c, a, b)
+
+        up64, dn64, up96, dn96 = (self.fconst(2.0 ** e) for e in (64, -64, 96, -96))
+        mx, my, mz = mag(x), mag(y), mag(z)
+        mp0 = mag(op("OpFMul", x, y))
+        big = op("OpLogicalOr", above(mp0, 0x7E7FFFFF), above(mz, 0x7E7FFFFF), ty="%bool")    # >= 2^126 (or inf)
+        tiny = self.emit_land(below(mp0, 0x19800000), below(mz, 0x28800000))                   # < 2^-76, < 2^-46
+        xsm = op("OpULessThan", mx, my, ty="%bool")
+        # big: the larger factor and z down by 2^64; tiny: the smaller factor and z up by 2^96; the result back.
+        fx = sel(big, sel(xsm, one, dn64), sel(tiny, sel(xsm, up96, one), one))
+        fy = sel(big, sel(xsm, dn64, one), sel(tiny, sel(xsm, one, up96), one))
+        fz = sel(big, dn64, sel(tiny, up96, one))
+        fr = sel(big, up64, sel(tiny, dn96, one))
+        x1, y1, z1 = op("OpFMul", x, fx), op("OpFMul", y, fy), op("OpFMul", z, fz)
+        # A factor below 2^-100 next to one above 2^-20: trade 2^64 between them (the product is unchanged).
+        mx1, my1 = mag(x1), mag(y1)
+        bx = self.emit_land(below(mx1, 0x0D800000), above(my1, 0x35800000))
+        by = self.emit_land(below(my1, 0x0D800000), above(mx1, 0x35800000))
+        xa = op("OpFMul", x1, sel(bx, up64, sel(by, dn64, one)))
+        ya = op("OpFMul", y1, sel(bx, dn64, sel(by, up64, one)))
+        # Dekker's product: p + pe = xa * ya, every partial product exact (12 x 12 bits).
+        p = op("OpFMul", xa, ya)
+        halves = []
+        for v in (xa, ya):
+            hi = op("OpBitcast", op("OpBitwiseAnd", op("OpBitcast", v, ty="%uint"), self.cu(0xFFFFF000), ty="%uint"))
+            halves += [hi, op("OpFSub", v, hi)]
+        xh, xl, yh, yl = halves
+        t1 = op("OpFSub", op("OpFMul", xh, yh), p)
+        t2 = op("OpFAdd", t1, op("OpFMul", xh, yl))
+        t3 = op("OpFAdd", t2, op("OpFMul", xl, yh))
+        pe = op("OpFAdd", t3, op("OpFMul", xl, yl))
+
+        def two_sum(a, b):
+            s = op("OpFAdd", a, b)
+            bb = op("OpFSub", s, a)
+            e = op("OpFAdd", op("OpFSub", a, op("OpFSub", s, bb)), op("OpFSub", b, bb))
+            return s, e
+
+        th, tl = two_sum(p, z1)
+        # v = tl + pe rounded to odd: the nearest sum, moved one ulp towards its error when inexact and even.
+        s, e = two_sum(tl, pe)
+        sbits, ebits = op("OpBitcast", s, ty="%uint"), op("OpBitcast", e, ty="%uint")
+        even = op("OpIEqual", op("OpBitwiseAnd", sbits, self.cu(1), ty="%uint"), self.cu(0), ty="%bool")
+        inexact = self.emit_land(op("OpFUnordNotEqual", e, "%f0", ty="%bool"), op("OpFOrdEqual", e, e, ty="%bool"))
+        same = below(op("OpBitwiseXor", sbits, ebits, ty="%uint"), 0x80000000)     # same sign: away from zero
+        adj = op("OpSelect", same, op("OpIAdd", sbits, self.cu(1), ty="%uint"),
+                 op("OpISub", sbits, self.cu(1), ty="%uint"), ty="%uint")
+        v = op("OpBitcast", op("OpSelect", self.emit_land(even, inexact), adj, sbits, ty="%uint"))
+        rs = sel(op("OpFOrdEqual", v, "%f0", ty="%bool"), th, op("OpFAdd", th, v))
+        rr = op("OpFMul", rs, fr)
+        special = op("OpLogicalOr", op("OpLogicalOr", above(mx, 0x7F7FFFFF), above(my, 0x7F7FFFFF), ty="%bool"),
+                     op("OpLogicalOr", above(mz, 0x7F7FFFFF), op("OpIsNan", rr, ty="%bool"), ty="%bool"), ty="%bool")
+        g = op("OpExtInst", "%glsl Fma", x, y, z)
+        self.emit(f"{r} = OpSelect %float {special} {g} {rr}")
 
     def fma_f16_odd(self, x, y, z):
         """fma(x, y, z) for f16 inputs (widened to f32), rounded to f32 with round-to-odd (SHADER-55).
@@ -13678,11 +13774,13 @@ def main():
                     help="mesh shaders become compute shaders that write their vertices and primitives to a buffer "
                          "(metadata: mesh_compute), drawn by tools/mesh_compute_vs.py, for devices without "
                          "VK_EXT_mesh_shader (e.g. NVIDIA Pascal)")
-    ap.add_argument("--fma", choices=("glsl", "khr"), default="glsl",
+    ap.add_argument("--fma", choices=("glsl", "khr", "exact"), default="glsl",
                     help="how fused multiply-adds (v_fma_f32, v_fmac_f32, v_fmaak/fmamk_f32, v_fma_mix*) are emitted: "
                          "glsl = GLSL.std.450 Fma (default; the Vulkan spec lets a driver round twice), khr = OpFmaKHR "
                          "(guaranteed single rounding; needs VK_KHR_shader_fma + shaderFmaFloat32, listed in the "
-                         "shader's metadata as capability FMAKHR / feature shaderFmaFloat32)")
+                         "shader's metadata as capability FMAKHR / feature shaderFmaFloat32), exact = a single "
+                         "rounding built from NoContraction f32 ops, for a device that splits Fma and has no "
+                         "VK_KHR_shader_fma (about 110 instructions per multiply-add; no extension needed)")
     ap.add_argument("--f16-interp-fallback", action="store_true",
                     help="16-bit interpolation without PerVertexKHR inputs, for devices that can't compile them "
                          "(MoltenVK): VS and mesh params also export their f16 halves decoded to f32, which the PS "
@@ -13716,7 +13814,9 @@ def main():
     global STRUCTURED, WAVE64_EMULATE, WAVE64_GRAPHICS, BARY_FALLBACK, TEXEL_OFFSET_FALLBACK, MESH_COMPUTE, FMA_KHR, F16_HALVES
     global PC_TAIL_UBO
     PC_TAIL_UBO = a.pc_tail_ubo
+    global FMA_EXACT
     FMA_KHR = a.fma == "khr"
+    FMA_EXACT = a.fma == "exact"
     STRUCTURED = not a.dispatch_loop
     global FLOAT_CONTROLS
     FLOAT_CONTROLS = not a.no_float_controls

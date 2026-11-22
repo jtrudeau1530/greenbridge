@@ -298,8 +298,11 @@ operands taken from user SGPRs so the driver cannot fold them. It passes with th
 GLSL.std.450 `Fma`) and with `LEONIDA_FMA=khr` **for `build.py`** (or for `run_gpu_tests.py`), which emits `OpFmaKHR`.
 That needs `VK_KHR_shader_fma` with `shaderFmaFloat32`; the test programs enable it when the device has it and exit
 77 (a SKIP) for a module that needs it on a device without it. The Vulkan specification allows a driver to split GLSL
-`Fma` into two roundings, which is why `khr` exists. Neither the AMD (26.11.2) nor the NVIDIA (617.42) driver we tried
-does, so `cs_fma_fused` passing with `glsl` is not evidence that every driver is safe.
+`Fma` into two roundings, which is why `khr` exists. The AMD (26.11.2) and NVIDIA (617.42) drivers we tried don't,
+but the Intel UHD Graphics driver (Xe-LP, Windows 101.7088) does: `cs_fma_fused` fails there with `glsl`, words 0, 2, 3
+and 5 (`v_fma_f32`, `v_fmaak_f32`, `v_fmac_f32`) getting the split value, and the device has no `VK_KHR_shader_fma`.
+For such a device, `LEONIDA_FMA=exact` (`--fma exact`) builds the single rounding from plain f32 operations and
+needs no extension; with it `cs_fma_fused` passes on that Intel UHD and on an RTX 3050 Laptop (617.42).
 
 ## Hardware oracle (optional, AMD)
 
