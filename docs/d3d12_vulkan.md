@@ -2086,8 +2086,13 @@ Vulkan AS would be invisible to them. Two paths:
    and make `GetRaytracingAccelerationStructurePrebuildInfo` return sizes for that layout.
    The layout is the XDXR BVH4 runtime form ([bvh.md](bvh.md) §3.1). `tools/xdxr_bvh.py` encodes it on the
    CPU, with a reference traversal and a validator ([bvh.md](bvh.md) §7a). `runtime/src/xdxr_build.h` builds it on
-   the GPU and is checked against that reference. It is not yet wired to `BuildRaytracingAccelerationStructure`, which
-   today builds a `VkAccelerationStructureKHR` (#743) that the game's shaders can't read.
+   the GPU and is checked against that reference. The standalone device uses it for `BuildRaytracingAccelerationStructure`
+   and answers `GetRaytracingAccelerationStructurePrebuildInfo` from its layout, exactly. Acceleration-structure
+   buffers then keep their console VAs, the addresses the records name each other by. `LEONIDA_RT_AS=khr` keeps
+   #743's `VkAccelerationStructureKHR` builds (for `RayQueryKHR`), which the game's shaders can't read. Updates rebuild
+   the structure; compaction, copies, serialization and the Xbox batched/streaming builds are not implemented. The
+   reported `RaytracingTier` is unchanged (`NOT_SUPPORTED`). Checked by `runtime/test/d3d12_xdxr_rt_test.cpp` through
+   the D3D12 API.
 
 **Open:** which path the game uses. Resolve by logging the first call to the standard AS methods and by tracing the
 builder's command-list usage. If XDXR batched/streaming builds are used, their structs and compression formats need

@@ -2842,7 +2842,9 @@ public:
 
         state_.context = std::make_unique<leonida::VulkanContext>(get_device, info.device,
                                                                   info.separate_depth_stencil_layouts,
-                                                                  info.conditional_rendering, info.ray_tracing);
+                                                                  info.conditional_rendering, info.ray_tracing,
+                                                                  info.xdxr_acceleration_structures &&
+                                                                      info.buffer_device_address);
         if (info.buffer_device_address && state_.context->loaded() && !create_arena())
             std::fprintf(stderr, "[rt] d3d12: the GPU address arena could not be created\n");
         if (info.conditional_rendering) {
@@ -3354,6 +3356,34 @@ public:
         if (!out) return;
         *out = {};
         auto& vk = state_.context->vk;
+        if (desc && state_.context->xdxr_acceleration_structures()) {
+            // XDXR records: the layout depends only on the triangle or instance count (xdxr_build.h), so the sizes
+            // are exact. An update rebuilds the structure, so it needs the same scratch.
+            leonida::BuildAccelerationStructure build{};
+            build.is_tlas = desc->Type == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL;
+            if (build.is_tlas) {
+                build.instance_count = desc->NumDescs;
+            } else {
+                for (UINT i = 0; i < desc->NumDescs; ++i) {
+                    const D3D12_RAYTRACING_GEOMETRY_DESC* gd =
+                        (desc->DescsLayout == D3D12_ELEMENTS_LAYOUT_ARRAY_OF_POINTERS)
+                            ? (desc->ppGeometryDescs ? desc->ppGeometryDescs[i] : nullptr)
+                            : (desc->pGeometryDescs ? &desc->pGeometryDescs[i] : nullptr);
+                    if (!gd || gd->Type != D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES) continue;
+                    leonida::RtTriangleGeometry t{};
+                    t.vertex_count = gd->Triangles.VertexCount;
+                    t.index_count = gd->Triangles.IndexCount;
+                    t.index_type = gd->Triangles.IndexFormat == DXGI_FORMAT_UNKNOWN ? 0u : 1u;
+                    build.triangles.push_back(t);
+                }
+            }
+            leonida::XdxrLayout layout;
+            if (!layout.compute(leonida::VulkanContext::xdxr_elements(build), build.is_tlas)) return;
+            out->ResultDataMaxSizeInBytes = layout.size;
+            out->ScratchDataSizeInBytes = layout.scratch;
+            out->UpdateScratchDataSizeInBytes = layout.scratch;
+            return;
+        }
         if (!desc || !state_.info.ray_tracing || !vk.vkGetAccelerationStructureBuildSizesKHR) return;
 
         const bool is_tlas = (desc->Type == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL);
@@ -5697,6 +5727,16 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
             VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &as_features};
             vkGetPhysicalDeviceFeatures2(info.physical, &features);
             info.ray_tracing = as_features.accelerationStructure == VK_TRUE && rq_features.rayQuery == VK_TRUE;
+        }
+        // The game's translated RT shaders read XDXR BVH4 records, which a VkAccelerationStructureKHR is not
+        // (docs/d3d12_vulkan.md 4.8): build those, unless LEONIDA_RT_AS=khr asks for #743's KHR builds instead.
+        char rt_as[8] = {};
+        std::size_t rt_as_length = 0;
+        const bool khr = getenv_s(&rt_as_length, rt_as, "LEONIDA_RT_AS") == 0 && rt_as_length > 1 &&
+                         std::strcmp(rt_as, "khr") == 0;
+        if (!khr && chosen12.bufferDeviceAddress) {
+            info.xdxr_acceleration_structures = true;
+            info.ray_tracing = false;  // no KHR extensions: AS resources keep their console VAs
         }
         if (!info.conditional_rendering)
             std::fprintf(stderr, "[rt] d3d12: the GPU has no VK_EXT_conditional_rendering: SetPredication is unsupported\n");

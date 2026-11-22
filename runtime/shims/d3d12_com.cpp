@@ -625,9 +625,17 @@ public:
                 t.vertex_va = gd->Triangles.VertexBuffer.StartAddress;
                 t.vertex_count = gd->Triangles.VertexCount;
                 t.vertex_stride = static_cast<std::uint32_t>(gd->Triangles.VertexBuffer.StrideInBytes);
-                t.vertex_format = (gd->Triangles.VertexFormat == DXGI_FORMAT_R32G32_FLOAT)
-                                      ? VK_FORMAT_R32G32_SFLOAT
-                                      : VK_FORMAT_R32G32B32_SFLOAT;
+                // The vertex formats D3D12 allows for BLAS builds; any other stays VK_FORMAT_UNDEFINED and the
+                // build is refused at replay instead of reading the wrong layout.
+                switch (gd->Triangles.VertexFormat) {
+                case DXGI_FORMAT_R32G32B32_FLOAT: t.vertex_format = VK_FORMAT_R32G32B32_SFLOAT; break;
+                case DXGI_FORMAT_R32G32_FLOAT: t.vertex_format = VK_FORMAT_R32G32_SFLOAT; break;
+                case DXGI_FORMAT_R16G16B16A16_FLOAT: t.vertex_format = VK_FORMAT_R16G16B16A16_SFLOAT; break;
+                case DXGI_FORMAT_R16G16_FLOAT: t.vertex_format = VK_FORMAT_R16G16_SFLOAT; break;
+                case DXGI_FORMAT_R16G16B16A16_SNORM: t.vertex_format = VK_FORMAT_R16G16B16A16_SNORM; break;
+                case DXGI_FORMAT_R16G16_SNORM: t.vertex_format = VK_FORMAT_R16G16_SNORM; break;
+                default: t.vertex_format = VK_FORMAT_UNDEFINED; break;
+                }
                 t.index_va = gd->Triangles.IndexBuffer;
                 t.index_count = gd->Triangles.IndexCount;
                 if (gd->Triangles.IndexFormat == DXGI_FORMAT_R16_UINT)
@@ -636,6 +644,7 @@ public:
                     t.index_type = 2;
                 t.transform_va = gd->Triangles.Transform3x4;
                 t.opaque = (gd->Flags & D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE) != 0;
+                t.flags = static_cast<std::uint32_t>(gd->Flags);
                 cmd.triangles.push_back(t);
             }
         }

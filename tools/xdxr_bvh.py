@@ -753,12 +753,13 @@ def check_build(directory, rays=300, seed=1):
             ids = [(t[3], t[4]) for t in tris]
         else:
             blas = [cases[b][0] for b in desc["blas"]]
-            scene, ids = [], None
+            scene, ids, inst_ids = [], None, []
             for inst in desc["instances"]:
                 m = inst["transform"]
                 rows = [m[0:4], m[4:8], m[8:12]]
-                tris = [t[:3] for t in blas[inst["blas"]]["triangles"]] if inst["blas"] >= 0 else []
-                scene.append((rows, inst["mask"], tris))
+                src = blas[inst["blas"]]["triangles"] if inst["blas"] >= 0 else []
+                scene.append((rows, inst["mask"], [t[:3] for t in src]))
+                inst_ids.append([(t[3], t[4]) for t in src])      # list position -> (geometry, primitive)
         bad = hits = 0
         case_rays = min(rays, desc.get("rays", rays))      # a large case may ask for fewer (brute force is slow)
         for _ in range(case_rays):
@@ -778,7 +779,8 @@ def check_build(directory, rays=300, seed=1):
                 same = same and math.isclose(got["t"], want["t"], rel_tol=1e-6, abs_tol=1e-9)
             else:
                 # the instance's world-to-object matrix is a float32 inverse; allow for its rounding in t
-                same = (got["instance"], got["primitive"]) == (want["instance"], want["primitive"])
+                want_id = inst_ids[want["instance"]][want["primitive"]]
+                same = (got["instance"], (got["geometry"], got["primitive"])) == (want["instance"], want_id)
                 same = same and math.isclose(got["t"], want["t"], rel_tol=1e-4)
             bad += not same
         print(f"{n}: {len(data)} bytes, {len(errs)} validation errors, {bad}/{case_rays} rays differ ({hits} hits)")
@@ -856,6 +858,10 @@ def main(argv=None):
     if a.cmd == "check-build":
         if a.rays < 1:
             ap.error("--rays must be at least 1")
+        import glob
+        if not glob.glob(f"{a.dir}/*.json"):
+            print(f"no cases in {a.dir}: skipped (the build step skipped or did not run)")
+            return 77                                   # ctest SKIP_RETURN_CODE
         problems = check_build(a.dir, a.rays)
         for e in problems:
             print(e)

@@ -784,6 +784,10 @@ struct ReplayFunctions {
     PFN_vkCmdDispatchIndirect dispatch_indirect = nullptr;
     // Optional VK_KHR_acceleration_structure: BuildRaytracingAccelerationStructure.
     PFN_vkCmdBuildAccelerationStructuresKHR build_acceleration_structures = nullptr;
+    // XDXR BVH4 builds (xdxr_build.h), used instead of the KHR ones when set: `xdxr_check` refuses inputs the builder
+    // cannot read while the list is prepared, `xdxr_record` records the build.
+    std::function<bool(const BuildAccelerationStructure&)> xdxr_check;
+    std::function<void(VkCommandBuffer, const BuildAccelerationStructure&)> xdxr_record;
     std::function<VkAccelerationStructureKHR(std::uint64_t)> resolve_acceleration_structure;
     // Preparation only allocates a slot; capture records the GPU snapshot at the SetPredication command.
     std::function<bool(VkBuffer, VkDeviceSize, PredicateCapture&)> prepare_predicate;
@@ -2225,13 +2229,17 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                     return ReplayResult::unsupported;
             }
         } else if (const auto* build = std::get_if<BuildAccelerationStructure>(&command)) {
-            if (!vk.build_acceleration_structures || !vk.resolve_acceleration_structure)
-                return ReplayResult::unsupported;
-            p.accel_dst = vk.resolve_acceleration_structure(build->dst_va);
-            if (!p.accel_dst) return ReplayResult::unresolved_resource;
-            if (build->update && build->src_va) {
-                p.accel_src = vk.resolve_acceleration_structure(build->src_va);
-                if (!p.accel_src) return ReplayResult::unresolved_resource;
+            if (vk.xdxr_check) {
+                if (!vk.xdxr_check(*build)) return ReplayResult::unsupported;
+            } else {
+                if (!vk.build_acceleration_structures || !vk.resolve_acceleration_structure)
+                    return ReplayResult::unsupported;
+                p.accel_dst = vk.resolve_acceleration_structure(build->dst_va);
+                if (!p.accel_dst) return ReplayResult::unresolved_resource;
+                if (build->update && build->src_va) {
+                    p.accel_src = vk.resolve_acceleration_structure(build->src_va);
+                    if (!p.accel_src) return ReplayResult::unresolved_resource;
+                }
             }
         } else if (const auto* dispatch = std::get_if<Dispatch>(&command)) {
             if (!vk.bind_pipeline || !vk.push_constants || !vk.dispatch || !vk.compute_pipeline)
@@ -2947,6 +2955,8 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                     }
                 }
             }
+        } else if (const auto* build = std::get_if<BuildAccelerationStructure>(&command); build && vk.xdxr_record) {
+            vk.xdxr_record(command_buffer, *build);
         } else if (const auto* build = std::get_if<BuildAccelerationStructure>(&command)) {
             // The build's addresses are console VAs into the GPU address arena (heap_base is its device address).
             // A null VA (no index buffer, no transform) stays null: heap_base + 0 would name the arena's zero page.
