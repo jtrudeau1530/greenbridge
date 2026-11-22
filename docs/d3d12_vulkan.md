@@ -2820,7 +2820,7 @@ on a PC device behind the Xbox-ABI proxy). Measured:
     (`+0x18`, `+0x28`, `+0x30`) the DLL writes commands through while there is room. Table and evidence:
     [d3d12_command_objects.md §3.5a](d3d12_command_objects.md).
     Device slot 67 is a console-only compute-pipeline call, `DeserializeComputePipelineStateX` in the DLL's own
-    messages, not the PC method at that index; the proxy now refuses it. The dispatch stops where the PC runtime
+    messages, not the PC method at that index; the proxy routes it to `CreateComputePipelineState`. The dispatch stops where the PC runtime
     refuses the DLL's compute code at slot 62: the DLL's shaders carry an `ACCC` part instead of DXIL, an `FSPX`
     payload with an RDNA2 program ([fspx.md](fspx.md)).
   - Its `throw 1` reaches the caller. Before #965 the throw carried an image base of 0, because `_CxxThrowException`

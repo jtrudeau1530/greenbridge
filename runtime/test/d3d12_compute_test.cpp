@@ -33,6 +33,8 @@ using XboxHeapHandleFn = std::uint64_t(WINAPI*)(void* heap);  // heap slots 9/10
 // Device slot 62 as XboxBvhBuilder.dll calls it on 1.0.2.1: (desc, 0, 0, riid, out) (main's 28cf235).
 using XboxComputePipelineFn = HRESULT(WINAPI*)(void* device, const D3D12_COMPUTE_PIPELINE_STATE_DESC*, std::uint64_t,
                                                std::uint64_t, const IID*, void**);
+// Device slot 67 as amd_fidelityfx_upscaler_xbox.dll calls it: (desc, riid, out).
+using XboxNativeComputePipelineFn = HRESULT(WINAPI*)(void* device, const void*, const IID*, void**);
 using SerializeFn = HRESULT(WINAPI*)(const D3D12_VERSIONED_ROOT_SIGNATURE_DESC*, ID3DBlob**, ID3DBlob**);
 
 template<class T>
@@ -220,6 +222,40 @@ int main() {
         pso_desc.CS = {other_container.data(), other_container.size()};
         EXPECT(device->CreateComputePipelineState(&pso_desc, IID_PPV_ARGS(&unknown.p)) == E_INVALIDARG && !unknown.p);
         pso_desc.CS = {container.data(), container.size()};
+
+        // The PSO through slot 67, compute pipeline from native code; maps to CreateComputePipelineState.
+        struct XboxNativeComputeDesc {
+            ID3D12RootSignature* root_signature;
+            const void* kind0;
+            std::uint64_t kind0_size;
+            const void* kind1;
+            std::uint64_t kind1_size;
+            const void* kind6;
+            std::uint64_t kind6_size;
+            const void* kind7;
+            std::uint64_t kind7_size;
+        } native_desc{};
+        native_desc.root_signature = root.p;
+        native_desc.kind6 = fssm.data();
+        native_desc.kind6_size = fssm.size();
+        Ref<ID3D12PipelineState> pso67, unknown67;
+        EXPECT(SUCCEEDED(reinterpret_cast<XboxNativeComputePipelineFn>(slot(device.p, 67))(
+            device.p, &native_desc, &pso_iid, reinterpret_cast<void**>(&pso67.p))));
+        EXPECT(pso67.p != nullptr);
+        native_desc.kind6 = other.data();
+        native_desc.kind6_size = other.size();
+        EXPECT(reinterpret_cast<XboxNativeComputePipelineFn>(slot(device.p, 67))(
+            device.p, &native_desc, &pso_iid, reinterpret_cast<void**>(&unknown67.p)) == E_INVALIDARG && !unknown67.p);
+        void* out_null = reinterpret_cast<void*>(0x1111);
+        EXPECT(reinterpret_cast<XboxNativeComputePipelineFn>(slot(device.p, 67))(
+            device.p, nullptr, &pso_iid, &out_null) == E_INVALIDARG && !out_null);
+        out_null = reinterpret_cast<void*>(0x1111);
+        native_desc.kind6 = fssm.data();
+        native_desc.kind6_size = fssm.size();
+        EXPECT(reinterpret_cast<XboxNativeComputePipelineFn>(slot(device.p, 67))(
+            device.p, &native_desc, nullptr, &out_null) == E_POINTER && !out_null);
+        EXPECT(reinterpret_cast<XboxNativeComputePipelineFn>(slot(device.p, 67))(
+            device.p, &native_desc, &pso_iid, nullptr) == E_POINTER);
 
         // A device whose maxPushConstantsSize is the Vulkan minimum (128 bytes) cannot hold the 144-byte block, so
         // its PSOs are refused instead of creating a pipeline layout the spec forbids (#224's fallback flag).
