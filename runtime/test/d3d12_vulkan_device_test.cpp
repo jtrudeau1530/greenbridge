@@ -925,7 +925,10 @@ int main() {
         // Push constants limit check (D3D-14): Vulkan spec guarantees >= 128 bytes.
         EXPECT(rt::d3d12::device_max_push_constants_size(device.p) >= 128);
         EXPECT(rt::d3d12::device_max_push_constants_size(inner) == rt::d3d12::device_max_push_constants_size(device.p));
-        EXPECT(!rt::d3d12::device_push_constants_need_fallback(device.p));
+        // The test GPU may have either answer (Intel Arc and a Radeon 680M on driver 22.40.84.06 report 128 bytes);
+        // the device must flag the fallback exactly when the 144-byte block does not fit.
+        EXPECT(rt::d3d12::device_push_constants_need_fallback(device.p) ==
+               (rt::d3d12::device_max_push_constants_size(device.p) < 144));
 
         // Simulated fallback path when maxPushConstantsSize < 144 bytes:
         {
