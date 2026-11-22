@@ -84,6 +84,13 @@ double ms_since(std::chrono::steady_clock::time_point start) {
     return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
 }
 
+// HANDLE_CLOSING arrives on the callback thread, so a count read right after WinHttpCloseHandle can be short, and a
+// notification that comes late lands in the next block's count (TEST-721). Waits up to two seconds for `n`.
+bool wait_for_closing(const Seen& s, int n) {
+    for (int i = 0; i < 200 && s.closing.load() < n; ++i) Sleep(10);
+    return s.closing.load() >= n;
+}
+
 }  // namespace
 
 int main() {
@@ -232,7 +239,7 @@ int main() {
               "and HANDLE_CLOSING follows once, after the error");
         close(connection);
         close(session);
-        check(seen.closing.load() == 3, "every handle reports HANDLE_CLOSING once");
+        check(wait_for_closing(seen, 3) && seen.closing.load() == 3, "every handle reports HANDLE_CLOSING once");
     }
 
     // A callback that closes its request while handling the error, as libHttpClient-style code does.
@@ -253,6 +260,8 @@ int main() {
         seen.close_in_callback = nullptr;
         close(connection);
         close(session);
+        check(wait_for_closing(seen, 3) && seen.closing.load() == 3,
+              "the connection and the session report HANDLE_CLOSING before the next block counts its own");
     }
 
     // A request closed before its queued failure is delivered gets no error callback, only HANDLE_CLOSING.
