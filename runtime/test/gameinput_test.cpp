@@ -608,6 +608,20 @@ void test_aggregate_device(IGameInput* input) {
         IGameInputReading* r = nullptr;
         check(input->GetCurrentReading(GameInputKindGamepad, agg, &r) == GAMEINPUT_E_READING_NOT_FOUND && !r,
               "aggregate device returns READING_NOT_FOUND when no pads are connected");
+        check(input->GetCurrentReading(GameInputKindKeyboard, agg, &r) == GAMEINPUT_E_READING_NOT_FOUND && !r,
+              "aggregate device returns READING_NOT_FOUND for kind mismatch with no pads");
+
+        // Callback registration guards for aggregate device
+        GameInputCallbackToken reading_tok = 0xbeef;
+        check(input->RegisterReadingCallback(agg, GameInputKindGamepad, 0.0f, nullptr, on_reading, &reading_tok) == E_NOTIMPL &&
+                  reading_tok == kInvalidCallbackToken,
+              "RegisterReadingCallback rejects aggregate device with E_NOTIMPL and invalid token");
+
+        GameInputCallbackToken device_tok = 0xbeef;
+        check(input->RegisterDeviceCallback(agg, GameInputKindGamepad, GameInputDeviceConnected,
+                                            GameInputBlockingEnumeration, nullptr, on_device, &device_tok) == E_NOTIMPL &&
+                  device_tok == kInvalidCallbackToken,
+              "RegisterDeviceCallback rejects aggregate device with E_NOTIMPL and invalid token");
 
         // Attach a virtual pad and verify aggregate device yields readings from it
         Pad xbox;
@@ -623,6 +637,10 @@ void test_aggregate_device(IGameInput* input) {
             check(buttons_of(r) == GameInputGamepadA, "aggregate device reading reflects pad input state");
             r->Release();
         }
+
+        IGameInputReading* r_mismatch = nullptr;
+        check(input->GetCurrentReading(GameInputKindKeyboard, agg, &r_mismatch) == GAMEINPUT_E_READING_NOT_FOUND && !r_mismatch,
+              "aggregate device rejects kind mismatch even when pad is connected");
 
         SDL_SetJoystickVirtualButton(xbox.js, SDL_GAMEPAD_BUTTON_SOUTH, false);
         rt::gameinput::poll();
