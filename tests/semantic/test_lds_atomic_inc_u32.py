@@ -380,3 +380,55 @@ class TestReferenceAtomicIncOracle(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestModuloWrapBoundaryAndBankConflicts(unittest.TestCase):
+    """Tests modulo wrap boundaries and SIMD multi-lane bank conflict scenarios."""
+
+    def test_modulo_wrap_boundaries(self):
+        interp = LdsSemanticInterpreter(lds_dwords=256)
+        limits = [0, 1, 2, 3, 15, 16, 255, 65535]
+        for idx, lim in enumerate(limits):
+            interp.set_lds_dword(idx, lim)
+            interp.set_vgpr(1, idx * 4)
+            interp.set_vgpr(2, lim)
+            res = interp.parse_and_execute("ds_inc_rtn_u32 v0, v1, v2", lane=0)
+            self.assertEqual(res, (idx, lim))
+            self.assertEqual(interp.get_lds_dword(idx), 0)
+
+            if lim > 0:
+                interp.set_lds_dword(idx, 0)
+                interp.set_vgpr(2, lim)
+                res2 = interp.parse_and_execute("ds_inc_rtn_u32 v0, v1, v2", lane=0)
+                self.assertEqual(res2, (idx, 0))
+                self.assertEqual(interp.get_lds_dword(idx), 1)
+
+    def test_simd_multilane_bank_conflicts(self):
+        interp = LdsSemanticInterpreter(lds_dwords=1024, num_lanes=64)
+        target_dword = 42
+        interp.set_lds_dword(target_dword, 0)
+        for lane in range(64):
+            interp.set_vgpr(1, target_dword * 4, lane=lane)
+            interp.set_vgpr(2, 100, lane=lane)
+
+        old_vals = []
+        for lane in range(64):
+            _, old_v = interp.parse_and_execute("ds_inc_rtn_u32 v0, v1, v2", lane=lane)
+            old_vals.append(old_v)
+
+        self.assertEqual(old_vals, list(range(64)))
+        self.assertEqual(interp.get_lds_dword(target_dword), 64)
+
+    def test_simd_multilane_staggered_addresses(self):
+        interp = LdsSemanticInterpreter(lds_dwords=1024, num_lanes=16)
+        for lane in range(16):
+            dword = lane * 3
+            interp.set_lds_dword(dword, lane * 2)
+            interp.set_vgpr(1, dword * 4, lane=lane)
+            interp.set_vgpr(2, 50, lane=lane)
+
+        for lane in range(16):
+            res = interp.parse_and_execute("ds_inc_rtn_u32 v0, v1, v2", lane=lane)
+            self.assertEqual(res[1], lane * 2)
+            dword = lane * 3
+            self.assertEqual(interp.get_lds_dword(dword), lane * 2 + 1)
