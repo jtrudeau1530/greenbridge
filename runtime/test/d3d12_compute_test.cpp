@@ -508,6 +508,10 @@ int main() {
         pso67.reset();
         unknown67.reset();
         pso.reset();
+        pso67.reset();  // the slot-67 PSO holds the device like any other; released before the count is checked
+        unknown.reset();
+        unknown67.reset();
+        junk.reset();
         root.reset();
         heap.reset();
         list.reset();
