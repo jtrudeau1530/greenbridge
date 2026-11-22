@@ -300,6 +300,56 @@ class GlbSkinningTests(unittest.TestCase):
         self.assertNotEqual(0, proc.returncode)
         self.assertIn("joint index 2", proc.stderr)
 
+    def test_oversized_declared_max_is_a_one_line_error(self):
+        builder = Builder()
+        positions = ((0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0))
+        position_payload = b"".join(struct.pack("<3f", *point) for point in positions)
+        position = builder.add_accessor(
+            position_payload, 5126, "VEC3", len(positions),
+            minimum=[0.0, 0.0, 0.0], maximum=[10 ** 400, 1.0, 0.0],
+        )
+        joints = builder.add_accessor(bytes((0, 0, 0, 0)) * 3, 5121, "VEC4", 3)
+        weights = builder.add_accessor(
+            struct.pack("<12f", *([1.0, 0.0, 0.0, 0.0] * 3)), 5126, "VEC4", 3,
+        )
+        inverse = builder.add_accessor(struct.pack("<16f", *IDENTITY), 5126, "MAT4", 1)
+        mesh = {"name": "Body", "primitives": [{"attributes": {
+            "POSITION": position, "JOINTS_0": joints, "WEIGHTS_0": weights,
+        }}]}
+        nodes = [{"name": "Bone"}, {"name": "Body", "mesh": 0, "skin": 0}]
+        skins = [{"joints": [0], "inverseBindMatrices": inverse}]
+        data = build_glb(builder.document([mesh], nodes, skins, [0, 1]), builder.data)
+
+        with self.assertRaises(glb_skinning.GlbSkinError) as caught:
+            glb_skinning.analyze_glb(data)
+        self.assertIn("accessors[0].max must be 3 finite number(s)", str(caught.exception))
+
+        path = self.write("huge_max.glb", data)
+        proc = self.run_tool(path)
+        self.assertNotEqual(0, proc.returncode)
+        lines = [line for line in proc.stderr.splitlines() if line.strip()]
+        self.assertEqual(1, len(lines), proc.stderr)
+        self.assertIn("accessors[0].max must be 3 finite number(s)", lines[0])
+        self.assertNotIn("Traceback", proc.stderr)
+
+    def test_skin_joint_must_reference_a_node_even_when_nodes_is_empty(self):
+        builder = Builder()
+        data = build_glb(
+            builder.document([], [], [{"joints": [5]}], []),
+            builder.data,
+        )
+        report = glb_skinning.analyze_glb(data)
+        self.assertFalse(report["ok"])
+        errors = "\n".join(report["errors"])
+        self.assertIn("joint 0 references node 5", errors)
+        self.assertIn("the GLB has 0 nodes", errors)
+
+        path = self.write("missing_joint_node.glb", data)
+        proc = self.run_tool(path)
+        self.assertNotEqual(0, proc.returncode)
+        self.assertIn("references node 5", proc.stderr)
+        self.assertNotIn("Traceback", proc.stderr)
+
     def test_inverse_bind_matrices_count_mismatch(self):
         report = glb_skinning.analyze_glb(make_glb(ibm_count=1))
         self.assertFalse(report["ok"])
