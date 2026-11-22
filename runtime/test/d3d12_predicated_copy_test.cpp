@@ -194,7 +194,12 @@ int main(int argc,char** argv) {
     if(FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory.p))) || FAILED(factory->EnumWarpAdapter(IID_PPV_ARGS(&adapter.p))) ||
        FAILED(D3D12CreateDevice(adapter.p,D3D_FEATURE_LEVEL_11_0,IID_PPV_ARGS(&host.p)))) return 1;
     if(!native_only) {
-        if(!vk.create())return 77;   // no Vulkan GPU: ctest skips (SKIP_RETURN_CODE 77), as the other registered runtime tests do
+        const auto status = vk.initialize();
+        if (status == vktest::DeviceStatus::unavailable) {
+            std::puts("predicated buffer copies: skipped (no Vulkan device)");
+            return 77;
+        }
+        if (status != vktest::DeviceStatus::ready) return 1;
         if(!vk.conditional_rendering || !vk.storage_buffer_8bit) {
             std::puts("predicated buffer copies: skipped (requires conditional rendering and storageBuffer8BitAccess)");
             return 0;
