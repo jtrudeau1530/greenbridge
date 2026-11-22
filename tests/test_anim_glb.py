@@ -426,6 +426,43 @@ class ExportTest(unittest.TestCase):
         for rotation, x in zip(values, clips_fixture.X_INTS):
             self.assertAlmostEqual(rotation[0], 0.002 * x - 0.05, places=5)
 
+    def test_missing_page_leaves_adjacent_dictionary_selectable(self):
+        data = clips_fixture.two_sequence_dictionary("incomplete")
+        first, _ = clips_fixture.split(data, len(data), move_map=False)
+        other = clips_fixture.two_sequence_dictionary("neighbor")
+        selected, neighbor = clips_fixture.write_rpf(self.anim, [first, other])
+        with self.assertRaisesRegex(anim_glb.ExportError, "no clip dictionary"):
+            anim_glb.load_dictionary(self.anim, selected)
+        system, _ = anim_glb.load_dictionary(self.anim, neighbor)
+        self.assertEqual(system.d, other)
+        _, summary = anim_glb.anim_clips.scan(self.anim)
+        self.assertEqual(summary["unresolved"], {"system page not the next stream": 1})
+        self.assertEqual(summary["counts"]["dictionaries"], 1)
+
+    def test_root_like_continuation_with_incidental_name(self):
+        data = clips_fixture.two_sequence_dictionary()
+        first, _ = clips_fixture.split(data, len(data), move_map=False)
+        tail = bytearray(first)
+        tail[0x68] ^= 1  # Root prefix and valid name, but no matching dictionary hash.
+        selected, _ = clips_fixture.write_rpf(self.anim, [first, tail])
+        system, _ = anim_glb.load_dictionary(self.anim, selected)
+        self.assertEqual(system.d, first + tail)
+
+    def test_middle_dictionary_page_count_straddles_fifth_and_sixth_pages(self):
+        neighbor = clips_fixture.two_sequence_dictionary()
+        data = bytearray(clips_fixture.two_sequence_dictionary("middle"))
+        page_map = len(data)
+        data.extend(bytes(96))
+        struct.pack_into("<Q", data, 8, SYSTEM + page_map)
+        data[page_map + 8] = 6
+        cuts = [0, 256, 512, 768, 1024, page_map + 9, len(data)]
+        pages = [data[a:b] for a, b in zip(cuts, cuts[1:])]
+        offsets = clips_fixture.write_rpf(self.anim, [neighbor, *pages, neighbor])
+        with patch.object(anim_glb.anim_index, "classify", wraps=anim_glb.anim_index.classify) as classify:
+            system, _ = anim_glb.load_dictionary(self.anim, offsets[1])
+        self.assertEqual(system.d, data)
+        self.assertEqual([call.args[1] for call in classify.call_args_list], offsets[1:-1])
+
     def test_no_root_motion_leaves_the_mover_node_out(self):
         (gltf, _binary), _report = self.export("--no-root-motion")
         self.assertNotIn("mover", [n.get("name") for n in gltf["nodes"]])
