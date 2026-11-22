@@ -257,6 +257,36 @@ public:
                                         stencil, to_rects(count, rects)));
     }
 
+    // A null region discards the whole resource. Not allowed in a bundle.
+    void STDMETHODCALLTYPE DiscardResource(ID3D12Resource* resource, const D3D12_DISCARD_REGION* region) override {
+        if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);
+        if (!region) return check(list_.discard({resource_id(resource), 0, 0, false, true}));
+        if (region->NumRects && !region->pRects) return check(false);
+        check(list_.discard({resource_id(resource), region->FirstSubresource, region->NumSubresources,
+                             region->NumRects != 0}));
+    }
+
+    // GCL2. A null pModes means DEFAULT for every write. The address is resolved when the list is executed.
+    // Allowed in a bundle (the API restrictions table of "Recording command lists and bundles").
+    void STDMETHODCALLTYPE WriteBufferImmediate(UINT count, const D3D12_WRITEBUFFERIMMEDIATE_PARAMETER* params,
+                                                const D3D12_WRITEBUFFERIMMEDIATE_MODE* modes) override {
+        if (count && !params) return check(false);
+        for (UINT i = 0; i < count; ++i)
+            check(list_.write_immediate({params[i].Dest, params[i].Value, modes ? u(modes[i]) : 0}));
+    }
+
+    // GCL1. Not allowed in a bundle, as no copy is.
+    void STDMETHODCALLTYPE AtomicCopyBufferUINT(ID3D12Resource* dst, UINT64 dst_offset, ID3D12Resource* src,
+                                                UINT64 src_offset, UINT count, ID3D12Resource* const* resources,
+                                                const D3D12_SUBRESOURCE_RANGE_UINT64* ranges) override {
+        atomic_copy(4, dst, dst_offset, src, src_offset, count, resources, ranges);
+    }
+    void STDMETHODCALLTYPE AtomicCopyBufferUINT64(ID3D12Resource* dst, UINT64 dst_offset, ID3D12Resource* src,
+                                                  UINT64 src_offset, UINT count, ID3D12Resource* const* resources,
+                                                  const D3D12_SUBRESOURCE_RANGE_UINT64* ranges) override {
+        atomic_copy(8, dst, dst_offset, src, src_offset, count, resources, ranges);
+    }
+
     // The CPU handle's slot holds the view as the GFX10 descriptor a shader would load (docs/d3d12_vulkan.md
     // section 3.4): a T# for a texture, a V# for a buffer. It is read now, because the slot may be rewritten before
     // the list runs. The GPU handle names the same view in a shader-visible heap and is not needed.
@@ -316,6 +346,17 @@ private:
 
     void check(bool ok) {
         if (!ok) invalid_ = true;
+    }
+
+    void atomic_copy(std::uint32_t bytes, ID3D12Resource* dst, UINT64 dst_offset, ID3D12Resource* src,
+                     UINT64 src_offset, UINT count, ID3D12Resource* const* resources,
+                     const D3D12_SUBRESOURCE_RANGE_UINT64* ranges) {
+        if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE || (count && (!resources || !ranges))) return check(false);
+        leonida::AtomicCopyBuffer copy{resource_id(dst), dst_offset, resource_id(src), src_offset, bytes, {}};
+        for (UINT i = 0; i < count; ++i)
+            copy.dependencies.push_back(
+                {resource_id(resources[i]), ranges[i].Subresource, ranges[i].Range.Begin, ranges[i].Range.End});
+        check(list_.atomic_copy(copy));
     }
 
     void clear_unordered_access(D3D12_CPU_DESCRIPTOR_HANDLE view, ID3D12Resource* resource, bool is_float,

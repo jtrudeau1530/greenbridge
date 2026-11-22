@@ -1624,7 +1624,8 @@ class Gen:
                 addr = self.src_u(a[0])
                 for k, o in enumerate(offs):
                     self.emit(f"OpStore {self.lds_ptr(addr, o)} {self.src_u(a[1 + k])}")
-        elif op in ("ds_read_u16", "ds_read_i16", "ds_read_u8", "ds_read_i8", "ds_read_u16_d16_hi", "ds_read_u16_d16"):
+        elif op in ("ds_read_u16", "ds_read_i16", "ds_read_u8", "ds_read_i8", "ds_read_u16_d16_hi", "ds_read_u16_d16",
+                    "ds_read_u8_d16", "ds_read_u8_d16_hi", "ds_read_i8_d16", "ds_read_i8_d16_hi"):
             bits = 16 if "16" in op.split("_")[2] else 8
             addr = self.src_u(a[1])
             s1, sh, sh2, w, v = (self.tmp() for _ in range(5))
@@ -1636,6 +1637,8 @@ class Gen:
             self.emit(f"{v} = {f} %uint {w} {sh2} {self.cu(bits)}")
             d = a[0]
             if "_d16" in op:
+                # u8/i8: v is the 8-bit field extended to 32 bits; the insert keeps only its low 16 bits, so the
+                # i8 sign extension is 8 -> 16 as the ISA says. The other half of the destination is kept.
                 hi = op.endswith("_hi")
                 r = self.tmp()
                 self.emit(f"{r} = OpBitFieldInsert %uint {self.load_reg('vgpr', d['r'])} {v} "

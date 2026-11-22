@@ -314,6 +314,17 @@ Module& Loader::map_image(const std::filesystem::path& path) {
                     require_range(m->name, static_cast<uint64_t>(block->VirtualAddress) + off, sizeof(uint64_t), m->size,
                                   "a relocation");
                     *at<uint64_t>(m->base, block->VirtualAddress + off) += delta;
+                } else if (type == IMAGE_REL_BASED_HIGHLOW) {
+                    // A 32-bit absolute address (code built /LARGEADDRESSAWARE:NO), which the x64 Windows loader
+                    // also applies. Where the new address no longer fits in 32 bits, Windows would truncate it; the
+                    // image would then jump or read through a wrong pointer, so the load is refused instead.
+                    require_range(m->name, static_cast<uint64_t>(block->VirtualAddress) + off, sizeof(uint32_t),
+                                  m->size, "a relocation");
+                    auto* slot = at<uint32_t>(m->base, block->VirtualAddress + off);
+                    const int64_t moved = static_cast<int64_t>(*slot) + delta;
+                    if (moved < 0 || moved > 0xFFFFFFFFll)
+                        throw std::runtime_error(m->name + ": a 32-bit (HIGHLOW) relocation does not fit at this base");
+                    *slot = static_cast<uint32_t>(moved);
                 } else if (type != IMAGE_REL_BASED_ABSOLUTE) {
                     throw std::runtime_error(m->name + ": unsupported relocation type " + std::to_string(type));
                 }
