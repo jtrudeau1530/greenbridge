@@ -511,7 +511,13 @@ class ScalarVALUInterpreter:
         self.vgprs: list[int] = [0] * 256
         self.sgprs: list[int] = [0] * 106
         self.vcc: int = 0
+        self.scc: int = 0
         self.trace: list[str] = []
+
+    @property
+    def vccz(self) -> bool:
+        """Vector condition code zero flag: True if all bits of VCC are zero."""
+        return (self.vcc & MASK64) == 0
 
     def read_reg_u32(self, kind: RegKind, idx: int) -> int:
         if kind == RegKind.VGPR:
@@ -703,6 +709,13 @@ class SIMDWavefrontInterpreter:
         self.vgprs: list[list[int]] = [[0] * 256 for _ in range(wave_size)]
         self.sgprs: list[int] = [0] * 106
         self.vcc: int = 0
+        self.scc: int = 0
+
+    @property
+    def vccz(self) -> bool:
+        """Vector condition code zero flag: True if all active wave bits of VCC are zero."""
+        valid_mask = (1 << self.wave_size) - 1
+        return (self.vcc & valid_mask) == 0
 
     def set_exec_mask(self, mask: int) -> None:
         valid_mask = (1 << self.wave_size) - 1
@@ -1008,6 +1021,91 @@ class TestValuCmpClassRegisterAliasing(unittest.TestCase):
         res_mask = simd.step(inst)
         self.assertEqual(res_mask, MASK64)
         self.assertEqual(simd.read_lane_reg_u64(0, RegKind.SGPR, 4), MASK64)
+
+
+class TestValuCmpClassConditionCodesAndFlags(unittest.TestCase):
+    """Unit tests for condition codes, status flags, and carry/borrow isolation."""
+
+    def test_scc_immutability_scalar(self) -> None:
+        interp = ScalarVALUInterpreter()
+        interp.scc = 1  # Preset SCC to 1
+
+        inst = Instruction(
+            opcode=Opcode.V_CMP_CLASS_F32,
+            dst=Register(RegKind.SPECIAL, 0, count=2),
+            src0=Immediate(1.0),
+            src1=Immediate(CLASS_MASK_NORMAL),
+        )
+        interp.step(inst)
+        # Vector comparison instructions never modify the scalar condition code (SCC)
+        self.assertEqual(interp.scc, 1)
+
+    def test_scc_immutability_simd(self) -> None:
+        simd = SIMDWavefrontInterpreter(wave_size=64)
+        simd.scc = 1
+
+        inst = Instruction(
+            opcode=Opcode.V_CMP_CLASS_F64,
+            dst=Register(RegKind.SPECIAL, 0, count=2),
+            src0=Immediate(0.0),
+            src1=Immediate(CLASS_MASK_ZERO),
+        )
+        simd.step(inst)
+        self.assertEqual(simd.scc, 1)
+
+    def test_vccz_flag_evaluation_scalar(self) -> None:
+        interp = ScalarVALUInterpreter()
+        # Non-matching check: 1.0 against ZERO mask -> match=False, VCC=0, vccz=True
+        inst_nomatch = Instruction(
+            opcode=Opcode.V_CMP_CLASS_F32,
+            dst=Register(RegKind.SPECIAL, 0, count=2),
+            src0=Immediate(1.0),
+            src1=Immediate(CLASS_MASK_ZERO),
+        )
+        interp.step(inst_nomatch)
+        self.assertEqual(interp.vcc, 0)
+        self.assertTrue(interp.vccz)
+
+        # Matching check: 0.0 against ZERO mask -> match=True, VCC=1, vccz=False
+        inst_match = Instruction(
+            opcode=Opcode.V_CMP_CLASS_F32,
+            dst=Register(RegKind.SPECIAL, 0, count=2),
+            src0=Immediate(0.0),
+            src1=Immediate(CLASS_MASK_ZERO),
+        )
+        interp.step(inst_match)
+        self.assertEqual(interp.vcc, 1)
+        self.assertFalse(interp.vccz)
+
+    def test_vccz_flag_evaluation_simd(self) -> None:
+        simd = SIMDWavefrontInterpreter(wave_size=32)
+        # All lanes hold 1.0; compare against ZERO -> all false -> vcc=0 -> vccz=True
+        for lane in range(32):
+            simd.write_lane_reg_u32(lane, RegKind.VGPR, 0, POS_ONE_F32)
+
+        inst = Instruction(
+            opcode=Opcode.V_CMP_CLASS_F32,
+            dst=Register(RegKind.SPECIAL, 0, count=2),
+            src0=Register(RegKind.VGPR, 0, count=1),
+            src1=Immediate(CLASS_MASK_ZERO),
+        )
+        simd.step(inst)
+        self.assertEqual(simd.vcc, 0)
+        self.assertTrue(simd.vccz)
+
+        # One lane holds 0.0 -> vcc != 0 -> vccz=False
+        simd.write_lane_reg_u32(5, RegKind.VGPR, 0, POS_ZERO_F32)
+        simd.step(inst)
+        self.assertEqual(simd.vcc, (1 << 5))
+        self.assertFalse(simd.vccz)
+
+    def test_snan_quiet_classification_without_exception(self) -> None:
+        # Per IEEE 754-2008 / 2019 clause 5.7.2, classification is a non-arithmetic predicate
+        # that inspects bit patterns quietly without signaling Invalid Operation on sNaN.
+        self.assertTrue(ref_cmp_class_f32(SNAN_F32, CLASS_SNAN))
+        self.assertFalse(ref_cmp_class_f32(SNAN_F32, CLASS_QNAN))
+        self.assertTrue(ref_cmp_class_f64(SNAN_F64, CLASS_SNAN))
+        self.assertFalse(ref_cmp_class_f64(SNAN_F64, CLASS_QNAN))
 
 
 if __name__ == "__main__":
