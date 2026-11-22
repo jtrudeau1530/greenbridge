@@ -6356,7 +6356,10 @@ public:
                 return d3d12_trace::result(method, S_OK);
             }
 
-            if (buffer != 0) s1 |= D3D12_FORMAT_SUPPORT1_BUFFER;
+            // D3D12 disallows typed buffer views for the RGBA8 and BGRA8 sRGB formats (including BGRX8).
+            // Vulkan can still advertise buffer features for their backing formats.
+            if (buffer != 0 && vk_fmt != VK_FORMAT_R8G8B8A8_SRGB && vk_fmt != VK_FORMAT_B8G8R8A8_SRGB)
+                s1 |= D3D12_FORMAT_SUPPORT1_BUFFER;
             // Only what CreateGraphicsPipelineState's input layouts accept (vertex_format): R8/R16 SNORM and SINT
             // have Vulkan vertex support but no input-layout mapping yet.
             VkFormat vertex_vk = VK_FORMAT_UNDEFINED;
