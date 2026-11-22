@@ -94,6 +94,20 @@ def tri_prim():
 
 
 class InstancedGlbTest(unittest.TestCase):
+    def test_gpu_instance_bounds_follow_the_stored_translation_and_scale(self) -> None:
+        meshes = [{
+            "primitives": [tri_prim()],
+            "instances": [((16_777_219, 0, 0), (0, 0, 0, 1), (1, 1.00000003, 1))],
+        }]
+        data, stats = glb_writer.build_instanced_glb(meshes)
+        gltf, binary = twb.parse_and_validate_glb(data)
+        attrs = gltf["nodes"][0]["extensions"][EXT]["attributes"]
+        (translation,) = twb.read_accessor_floats(gltf, binary, attrs["TRANSLATION"])
+        (scale,) = twb.read_accessor_floats(gltf, binary, attrs["SCALE"])
+        self.assertEqual(translation, (16_777_220, 0, 0))
+        self.assertEqual(scale, (1, 1, 1))
+        self.assertEqual(stats["bounds"], [16_777_220, 0, 0, 16_777_221, 1, 0])
+
     def test_gpu_mode(self):
         meshes = [{"name": "a", "primitives": [tri_prim()],
                    "instances": [((0, 0, 0), (0, 0, 0, 1), (1, 1, 1)), ((5, 0, 0), (0, 0, 0, 1), (2, 2, 2))]},
