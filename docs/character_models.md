@@ -38,8 +38,8 @@ The decoded export used by the previews contains 13 parts:
 | legacy head | `cs_lucia_legacyheadcs_fr1_001_regular_ws00_full.#dr` | 592 | 1,028 | `0x707771F769AA3542` |
 | jacket (biker) | `cs_lucia_jacketbiker_fr1_000_regular_c_hl_long_full.#dr` | 9,818 | 10,837 | none — `speculartex` only (`0xF5073AA039BB3CED`) |
 | crop tee | `player_story000_00_tshirtcrop_fr1_001_slim_cc_un_long_full.#dr` | 4,932 | 6,756 | none — `speculartex` only (`0x46E8FA9436E9D43C`) |
-| bikini top | `brabikini_fr1_012_regular_ws00_full.#dr` | 6,547 | 5,697 | none / unverified — likely `speculartex` only (`0xDF3615ADFB1F4787`) |
-| undies | `undiesgstring_fr1_002_slim_hw_full.#dr` | 961 | 913 | none / unverified — likely `speculartex` only (`0xCFD339832A9C724A`) |
+| bikini top | `brabikini_fr1_012_regular_ws00_full.#dr` | 6,547 | 5,697 | `0xDF3615ADFB1F4787` (sRGB + alpha) |
+| undies | `undiesgstring_fr1_002_slim_hw_full.#dr` | 961 | 913 | `0xCFD339832A9C724A` (sRGB + alpha) |
 
 ### Higher-detail variants
 
@@ -110,11 +110,22 @@ The character export requested 215 texture keys and matched **184**. The only sR
 `0xC8E8C282` (`diffusetex`); `0xC6F46E79` is `speculartex` (specular/gloss pack), `0x1E77BF4C` is
 `bumptex` (the tangent-space normal), `0x739E3D0D` is `speculartex2` (packed ORM), and
 `0x8ADB8480` is `materialid` (an ID/palette map, declared but unbound on the jacket). The garment
-shaders (`d5ed50f4`, `ea8d09d0`, `39ddb9ca`) do not declare a `0xC8E8C282` slot at all, so no
-clothing item in this wardrobe has an albedo. A part without one keeps a flat colour; it must not
+shaders (`d5ed50f4`, `ea8d09d0`, `39ddb9ca`) do not declare a `0xC8E8C282` slot at all: none of
+their 7,948 material rows in the export has one. The jacket and the crop tee are on them, so they
+have no albedo. A part without one keeps a flat colour; it must not
 be painted with `speculartex` or an ORM map. The garments' `_COLOR0` vertex data is baked shading
 (alpha 255 on every vertex), not a tint; `materialid` is unbound on all four, and the shader
-declares no tint or palette slot. No authored base colour exists to recover.
+declares no tint or palette slot. No authored base colour exists to recover for those two.
+
+The bikini top and the undies are not on the garment shaders, and they do have an albedo. All
+three records of each drawable bind `0xC8E8C282` to the key in the table: the bikini top on
+shaders `84af5c61` and `81153bcc` (`76c45dd8` and `428b44d6` in its smallest record), the undies
+on `a9dfb1e7` (`428b44d6` in its smallest record). Every material row on those five shaders in
+the export binds the slot (1,372 of 1,372). Both keys are 512x256 `BC3_UNORM_SRGB` textures with
+7 mips in the `ttdb_peds` pools: an sRGB format with an alpha channel, as the eyes' and eyecap's
+`BC7_UNORM_SRGB` keys are. Their `speculartex` keys are
+other textures (`0x93CB433D30220BA6` and `0x5D237CCCD91F8E4D`, 256x128 `BC7_UNORM`), where the
+jacket's and the crop tee's table keys are `BC7_UNORM` `speculartex` sheets themselves.
 
 The hands and feet keys (`0x4D89F2311DBBB7A8`, `0xA54D9F8B51CA6034`) did not resolve in the
 scanned TTPF pools. The head drawable has no material texture reference, but its face is selected by
@@ -246,6 +257,22 @@ print(len(items), len(names))
 print(sum(1 for i in items if i.get("IsFragment")), "fragments")
 print([n for n in names if "lucia" in n.lower()])
 ```
+
+The material rows are in the same manifest, one per shader of a record, each with the texture
+references by slot:
+
+```python
+import json
+
+items = json.load(open(r"<outdir>/packs/models/manifest.json", encoding="utf-8"))["Items"]
+for item in items:
+    if item["Name"] == "brabikini_fr1_012_regular_ws00_full.#dr":
+        for material in item["Materials"]:
+            print(material["Shader"], {t["Param"]: t["Id64"] for t in material["Textures"]})
+```
+
+A key's size and format come from the pool that holds it: the `AssetKey`, `Width`, `Height`,
+`DxgiFormat` and `Mips` fields of the manifest `rpf9dump ttpf <pool.ttpf> <outdir>` writes.
 
 The fragment and skinning fields are in the same manifest; the skeleton measurements are in
 [character_skeleton.md](character_skeleton.md), and the world model export is in
