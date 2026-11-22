@@ -199,6 +199,7 @@ class SkipAssetsAndStageIsolationTest(unittest.TestCase):
                 mock.patch.object(make_game, "dotnet_sdk_ok") as mock_dotnet, \
                 mock.patch.object(make_game, "ensure_submodule") as mock_submodule, \
                 mock.patch.object(make_game, "tool_available", return_value=True), \
+                mock.patch.object(make_game, "pipeline_check_exe", return_value="/bin/vk_pipeline_check"), \
                 mock.patch("shutil.which", return_value="/usr/bin/tool"), \
                 mock.patch("shutil.disk_usage", return_value=mock.Mock(free=100 * (2**30))):
             make_game.preflight(["shaders", "pipelines"], self.work_dir, wav=True)  # no runtime: Windows-only
@@ -360,7 +361,8 @@ class PipelineStageIsolationTest(unittest.TestCase):
             mock_shaders.assert_not_called()
             mock_assets.assert_not_called()
             mock_runtime.assert_not_called()
-            mock_pipelines.assert_called_once_with(os.path.abspath(self.work_dir), os.path.abspath(self.out_dir))
+            mock_pipelines.assert_called_once_with(os.path.abspath(self.work_dir), os.path.abspath(self.out_dir),
+                                                   mock.ANY)
 
 
 class StageResumptionAndStepIsolationTest(unittest.TestCase):

@@ -8,10 +8,13 @@
 //   VKC_OUT_WORDS=N (env): make the output buffer at least N words (default groups * 64), so a single group can
 //   write more than one word per thread. VKC_DUMP=<file> (env): write the whole buffer to <file> after the dispatch.
 //   --require-wave64: require full 64-wide subgroups (local size X must be a multiple of 64), or exit 77.
+//   VKC_SGPRS=w4,w5,... (env): set s4, s5, ... (decimal or 0x hex, up to s31), the user SGPRs after the output V#,
+//   so a test can take input words (cs_user_sgprs.asm). They are zero otherwise. Same syntax as vk_harness's VKH_SGPRS.
 // Contract (docs/design.md): push constants = s0..s31 (128 bytes), heap base lo/hi, code base lo/hi (144 bytes).
 // The output buffer is the "heap": Xbox VA 0 maps to its device address, and s[0:3] hold a V# with base 0.
 #include "vulkan_loader.h"
 
+#include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -32,10 +35,41 @@ static PFN_vkGetInstanceProcAddr gipa;
         }                                                                                \
     } while (0)
 
+// The same word list parser as vk_harness: decimal or 0x hex, no sign or space, and "1,2," is rejected.
+static bool parse_u32(const char*& s, uint32_t& v) {
+    const bool hex = s[0] == '0' && (s[1] == 'x' || s[1] == 'X');
+    const char* digits = hex ? s + 2 : s;
+    if (!(hex ? std::isxdigit(uint8_t(*digits)) : std::isdigit(uint8_t(*digits)))) return false;
+    char* end;
+    unsigned long long x = std::strtoull(digits, &end, hex ? 16 : 10);
+    if (x > 0xFFFFFFFFull) return false;
+    v = uint32_t(x); s = end;
+    return true;
+}
+
+static bool next_item(const char*& s) {
+    if (!*s) return true;
+    return *s++ == ',' && *s;
+}
+
+// VKC_SGPRS: s4, s5, ... in order, at most s31 (s[0:3] stay the output V#).
+static bool parse_user_sgprs(const char* s, uint32_t* pc) {
+    for (uint32_t i = 4; *s; i++) {
+        if (i == 32 || !parse_u32(s, pc[i]) || !next_item(s)) return false;
+    }
+    return true;
+}
+
 int main(int argc, char** argv) {
     const bool require_wave64 = argc == 5 && !std::strcmp(argv[4], "--require-wave64");
     if (argc != 4 && !require_wave64) {
         std::fprintf(stderr, "usage: vk_compute_test cs.spv groups expect [--require-wave64]\n");
+        return 2;
+    }
+    uint32_t pc[36] = {};
+    const char* sgprs_env = std::getenv("VKC_SGPRS");
+    if (sgprs_env && !parse_user_sgprs(sgprs_env, pc)) {
+        std::fprintf(stderr, "VKC_SGPRS: expected up to 28 comma-separated words for s4..s31, got \"%s\"\n", sgprs_env);
         return 2;
     }
     const bool workgroup_yz = !std::strcmp(argv[3], "workgroup_yz");
@@ -203,7 +237,6 @@ int main(int argc, char** argv) {
     VkPipeline pipe; CHECK(vkCreateComputePipelines(dev, VK_NULL_HANDLE, 1, &cpi, nullptr, &pipe));
     if (require_wave64) std::printf("compute subgroup size: 64\n");
 
-    uint32_t pc[36] = {};
     pc[0] = 0; pc[1] = 0; pc[2] = 0xFFFFFFFFu; pc[3] = 0;     // V#: base 0, stride 0, num_records max
     pc[32] = uint32_t(heap); pc[33] = uint32_t(heap >> 32);    // heap base
     VkCommandPoolCreateInfo cpci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};

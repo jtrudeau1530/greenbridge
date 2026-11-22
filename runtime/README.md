@@ -216,3 +216,5 @@ $env:LEONIDA_VK_VALIDATION = '1'
 $env:VK_VALIDATION_VALIDATE_SYNC = '1'
 .\runtime\build\RelWithDebInfo\d3d12_typeless_rtv_test.exe
 ```
+
+RGBA8 typeless RTV clears support explicit UNORM/SRGB/UINT views of 2D mip slices and contiguous array-layer ranges, with sample count 1. Other format families, typed-resource casts, MSAA and 3D views are not expanded.

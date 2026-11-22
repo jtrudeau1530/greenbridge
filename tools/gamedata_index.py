@@ -37,6 +37,8 @@ BOM = b"\xef\xbb\xbf"
 XML_DECL = re.compile(rb"<\?xml[^>]*\?>")
 XML_OPEN = re.compile(rb"<([A-Za-z_][\w.:-]*)")
 XML_CLOSE_TAIL = re.compile(rb"</([A-Za-z_][\w.:-]*)>\s*$")
+# Tag-like text inside these cannot open or close an element.
+XML_NON_TAG = re.compile(rb"<!--.*?-->|<!\[CDATA\[.*?\]\]>|<\?.*?\?>", re.S)
 MAGIC = {b"MHIU": "MHIU", b"PAMH": "PAMH", b"SPS1Z": "SPS1Z", b"RBF0": "RBF0", b"PSIN": "PSIN"}
 
 
@@ -49,9 +51,10 @@ def printable(data: bytes) -> float:
 
 
 def has_xml_decl(data: bytes) -> bool:
-    if data.startswith(BOM) and XML_DECL.match(data[3:]):
-        return True
-    return bool(XML_DECL.match(data) or XML_DECL.match(data.lstrip(b" \t\r\n")))
+    # xml_root() drops the BOM before looking for the declaration; do the same here, or a BOM followed by
+    # whitespace makes the two disagree and the stream is grouped by the 64 KiB binary rule instead.
+    text = data[3:] if data.startswith(BOM) else data
+    return bool(XML_DECL.match(text) or XML_DECL.match(text.lstrip(b" \t\r\n")))
 
 
 def xml_root(data: bytes) -> str:
@@ -82,13 +85,21 @@ def tail_root(data: bytes) -> str:
 
 
 def xml_complete(root: str, data: bytes) -> bool:
+    """True when every <root> in data is closed, not merely when a </root> occurs somewhere in the tail.
+
+    A nested element with the same name as the root used to satisfy the old substring test, so a truncated
+    document was reported complete and its continuation streams were not absorbed into the payload.
+    """
     if not root:
         return False
-    close = b"</" + root.encode("ascii", "replace") + b">"
-    if close in data[-65536:]:
-        return True
-    return bool(re.search(rb"<" + re.escape(root.encode("ascii", "replace")) + rb"\b[^>]*/>\s*$",
-                          data[-4096:]))
+    text = XML_NON_TAG.sub(b"", data)
+    name = re.escape(root.encode("ascii", "replace"))
+    opens = re.findall(rb"<" + name + rb"(?=[\s/>])[^>]*>", text)
+    closes = re.findall(rb"</" + name + rb"\s*>", text)
+    self_closed = sum(1 for tag in opens if tag.rstrip().endswith(b"/>"))
+    if len(opens) - self_closed > len(closes):
+        return False
+    return bool(closes or self_closed)
 
 
 def standalone_xml(data: bytes) -> bool:

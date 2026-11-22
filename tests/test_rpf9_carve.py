@@ -16,7 +16,7 @@ def make_archive(path):
     a = zlib.compress(b"A" * 1000)
     b = zlib.compress(b"B" * 2000)
     data = bytearray(0x40 + len(a) + len(b) + 4096)
-    data[0:4] = b"RPF9"
+    data[0:4] = b"9FPR"
     struct.pack_into("<I", data, 4, 0x40)
     data[0x40:0x40 + len(a)] = a
     data[0x40 + len(a):0x40 + len(a) + len(b)] = b
@@ -61,7 +61,7 @@ class CarveEdgeTest(unittest.TestCase):
         # A truncated copy can end inside what looks like a Bink 2 header: its fields lie past the end of the file.
         a = zlib.compress(b"A" * 1000)
         data = bytearray(0x40) + a + b"KB2a" + bytes(8)
-        data[0:4] = b"RPF9"
+        data[0:4] = b"9FPR"
         struct.pack_into("<I", data, 4, 0x40)
         doc = carve(self, bytes(data))
         self.assertEqual(doc["summary"]["files"], 1, doc["summary"])
@@ -69,7 +69,7 @@ class CarveEdgeTest(unittest.TestCase):
 
     def test_empty_data_area(self):
         data = bytearray(0x40)
-        data[0:4] = b"RPF9"
+        data[0:4] = b"9FPR"
         struct.pack_into("<I", data, 4, 0x40)        # data starts at the end of the file
         doc = carve(self, bytes(data))
         self.assertEqual(doc["summary"]["files"], 0)
@@ -80,7 +80,7 @@ class CarveEdgeTest(unittest.TestCase):
             arc = os.path.join(tmp, "x.rpf")
             out = os.path.join(tmp, "out")
             data = bytearray(0x40)
-            data[0:4] = b"RPF9"
+            data[0:4] = b"9FPR"
             struct.pack_into("<I", data, 4, 0x1000)   # data offset past the end of the file
             with open(arc, "wb") as f:
                 f.write(data)
@@ -106,6 +106,30 @@ class CarveEdgeTest(unittest.TestCase):
                 self.assertIn(message, p.stderr)
                 self.assertNotIn("Traceback", p.stderr)
                 self.assertFalse(os.path.exists(out))
+
+    def test_non_rpf9_file_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            arc = os.path.join(tmp, "x.rpf")
+            out = os.path.join(tmp, "out")
+            with open(arc, "wb") as f:
+                f.write(b"MZ" + bytes(0x3E) + zlib.compress(b"A" * 1000))
+            p = subprocess.run([sys.executable, "-I", TOOL, arc, out, "--index-only"],
+                               capture_output=True, text=True)
+            self.assertNotEqual(p.returncode, 0)
+            self.assertIn("x.rpf: not an RPF9 archive", p.stderr)
+            self.assertNotIn("Traceback", p.stderr)
+            self.assertFalse(os.path.exists(out))
+
+    def test_valid_magic_is_accepted_with_limit(self):
+        # make_archive() writes the real on-disk magic; a plain run and --limit with the magic check both pass.
+        with tempfile.TemporaryDirectory() as tmp:
+            arc = os.path.join(tmp, "x.rpf")
+            make_archive(arc)
+            for extra in ([], ["--limit", "4096"]):
+                out = os.path.join(tmp, "out" + str(len(extra)))
+                p = subprocess.run([sys.executable, "-I", TOOL, arc, out, "--index-only", *extra],
+                                   capture_output=True, text=True)
+                self.assertEqual(p.returncode, 0, p.stderr)
 
     def test_hex_limit_is_still_accepted(self):
         # The new converter keeps the repo's decimal-or-0x convention for byte counts.
