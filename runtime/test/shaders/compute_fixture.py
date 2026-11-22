@@ -1,4 +1,5 @@
 """Synthetic FSSM compute headers shared by both GPU test runners."""
+import os
 import re
 import struct
 from pathlib import Path
@@ -21,3 +22,13 @@ def compute_header(asm_path):
     header = bytearray(0x148)
     struct.pack_into("<4I", header, 0x138, rsrc2, *group)
     return header
+
+
+def find_test_program(build, name):
+    """The folder holding test program `name`: `build` itself (Ninja, Makefiles) or the RelWithDebInfo/Release
+    subfolder a Visual Studio build puts it in, as run_gpu_tests.py's find_test_programs looks. None if not built."""
+    exe = name + (".exe" if os.name == "nt" else "")
+    for folder in (build, os.path.join(build, "RelWithDebInfo"), os.path.join(build, "Release")):
+        if os.path.isfile(os.path.join(folder, exe)):
+            return folder
+    return None
