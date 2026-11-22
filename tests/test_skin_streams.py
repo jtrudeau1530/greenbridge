@@ -308,6 +308,20 @@ class TestScanArchive(unittest.TestCase):
         self.assertEqual(v["components-out-of-range"], 0)
         self.assertEqual(v["descriptor-mismatch"], 0)
 
+    def test_scan_counts_weighted_16_bit_joint_values(self) -> None:
+        slots = {
+            0: (8, 16, 96, bytes(24)),
+            16: (4, 28, 128, bytes((255, 0, 0, 0)) * 3),
+            20: (8, 12, 144, struct.pack("<12H", 300, 700, 0, 0,
+                                        403, 700, 0, 0, 399, 700, 0, 0)),
+        }
+        system, gfx = build_resource(slots, vertices=3, bones=400)
+        stats = self.run_scan(system, gfx)
+        validated = stats["validated"]["weighted-4inf-16bit"]
+        self.assertEqual(validated["descriptor-mismatch"], 0)
+        self.assertEqual(validated["weighted-components"], 3)
+        self.assertEqual(validated["components-out-of-range"], 1)
+
     def test_unaligned_resource_is_not_a_candidate(self):
         system, gfx, _mesh = rigid_mesh()
         stats = self.run_scan(system, gfx, extra=zlib.compress(system, 9))

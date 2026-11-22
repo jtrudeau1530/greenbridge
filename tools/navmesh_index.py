@@ -33,6 +33,10 @@ import sys
 import time
 import zlib
 
+# -I keeps the script directory off sys.path, so add it explicitly before importing the sibling module.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from report_paths import same_report_path  # noqa: E402
+
 CHUNK = 1 << 20
 HEAD = 0x80
 MARKER = b"0DRP"
@@ -231,15 +235,6 @@ def offset(text):
     if value < 0:
         raise argparse.ArgumentTypeError("must be 0 or more")
     return value
-
-
-def same_report_path(first, second):
-    if os.path.normcase(os.path.realpath(first)) == os.path.normcase(os.path.realpath(second)):
-        return True
-    try:
-        return os.path.samefile(first, second)
-    except OSError:
-        return False
 
 
 def is_scanned_input(path, input_path, pattern):

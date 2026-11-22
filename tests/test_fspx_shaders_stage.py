@@ -261,8 +261,12 @@ class ShadersStageWithTheDll(unittest.TestCase):
                 ran.append(tool)
                 if tool == "shader_carve.py":
                     touch(dxbc, "index.json")
+                    with open(os.path.join(dxbc, "index.json"), "w") as f:
+                        f.write('[{"file": "shader.dxbc"}]')
                 elif tool == "fssm_unpack.py":
                     touch(dxbc, "fssm_index.json")
+                    with open(os.path.join(dxbc, "fssm_index.json"), "w") as f:
+                        f.write('[{"name": "shader"}]')
                 elif tool == "shader_disasm.py":
                     os.makedirs(os.path.join(dxbc, "disasm"), exist_ok=True)
                 elif tool == "rdna2spirv.py":
