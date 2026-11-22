@@ -207,7 +207,8 @@ def animation(page, frames, tracks, sequences):
 
 
 def dictionary(name="synthetic@dict", sequences=None, frames=None, tracks=None, external=0, children=(),
-               external_hashes=(), parameters=1, times=None, axis=None, node=None, sample_lists=None):
+               external_hashes=(), parameters=1, times=None, axis=None, node=None, sample_lists=None,
+               node_axis_count=None):
     """One clip dictionary page: one `.clip`, one `.motion`, one `.motionmatcher`, one local pack with one animation."""
     p = Page()
     pm = p.alloc(bytes(16))
@@ -266,7 +267,8 @@ def dictionary(name="synthetic@dict", sequences=None, frames=None, tracks=None, 
             struct.pack_into("<I", p.b, node_at + 0x20, count)
         else:
             p.ptr(node_at + 0x10, p.alloc(b"".join(struct.pack("<IHH", *a) for a in axes)))
-            struct.pack_into("<HH", p.b, node_at + 0x18, len(axes), len(axes))
+            n_axes = len(axes) if node_axis_count is None else node_axis_count   # override: an axis array overrun
+            struct.pack_into("<HH", p.b, node_at + 0x18, n_axes, n_axes)
             struct.pack_into("<I", p.b, node_at + anim_clips.NODE_SAMPLE_COUNT_AT[kind], count)
     if axis is not None or node is not None:
         if parameters == 1:
@@ -443,6 +445,21 @@ class DecodeTest(unittest.TestCase):
         stats = anim_clips.new_stats()
         anim_clips.count_motion_blend(motion, stats)
         self.assertEqual(stats["motion_samples:3:sample_k_is_child_k"], 1)
+
+    def test_several_items_in_a_list_are_not_identity(self):
+        # list 0 holds children 0 and 1: its first child is 0, but that is not sample k -> child k
+        motion = self.motion(children=[(1, 2), (3, 4)], axis=([joaat32("speed")], [(0, 0.0), (1, 1.0)], 0.0, 1.0),
+                             sample_lists=[[(0, 1.0, 1.0), (1, 1.0, 1.0)], [(1, 1.0, 1.0)]])
+        stats = anim_clips.new_stats()
+        anim_clips.count_motion_blend(motion, stats)
+        self.assertEqual((stats["motion_samples:3:sample_k_is_child_k"], stats["motion_samples:3:every_list_one_item"],
+                          stats["motion_samples:3:every_child_sampled"]), (0, 0, 1))
+
+    def test_malformed_node_keeps_the_time_table(self):
+        times = [(1.5, 1.5, [(0.0, 0.0), (1.5, 1.5)])]
+        motion = self.motion(children=[(1, 2)], times=times, node=(8, [(1, 0, 0)], 1), node_axis_count=0xFFFF)
+        self.assertIsNone(motion["node"])                       # the axis array runs past the page
+        self.assertEqual(len(motion["times"]), 1)
 
     def test_child_out_of_range_is_counted(self):
         motion = self.motion(children=[(1, 2)], axis=([joaat32("speed")], [(0, 0.0)], 0.0, 0.0),

@@ -232,11 +232,14 @@ def parse_clip(s, at):
                     motion["parameters"] = s.u32(at + 0x58)
             except (DecodeError, struct.error):
                 pass
-            try:
+            try:  # read apart: a malformed node must not mark a readable time table unreadable
                 motion["times"] = motion_times(s, at)
+            except (DecodeError, struct.error):
+                motion["times"] = None
+            try:
                 motion["node"] = parameter_node(s, at, motion["parameters"])
             except (DecodeError, struct.error):
-                motion["times"], motion["node"] = None, None
+                motion["node"] = None
             try:
                 motion["samples"] = motion_samples(s, at)
             except (DecodeError, struct.error):
@@ -686,7 +689,8 @@ def count_motion_samples(c, kind, axis, stats):
     stats[pre + "every_list_one_item"] += all(len(items) == 1 for items in lists)
     stats[pre + "children_in_range"] += all(ch < children for items in lists for ch, _a, _b in items)
     stats[pre + "every_child_sampled"] += {ch for items in lists for ch, _a, _b in items} == set(range(children))
-    stats[pre + "sample_k_is_child_k"] += mapped == list(range(children)) and len(lists) == children
+    stats[pre + "sample_k_is_child_k"] += (len(lists) == children and all(len(items) == 1 for items in lists) and
+                                           mapped == list(range(children)))
     for items in lists:
         for _ch, a, b in items:
             stats[pre + "items"] += 1
