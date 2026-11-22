@@ -526,6 +526,37 @@ def test_stale_export_entry_is_not_counted(eq, tmp_path, monkeypatch, capsys):
     assert text.splitlines()[0].startswith("1 textures: {'error:FileNotFoundError': 1}")
     assert text.splitlines()[1] == "png: {}"
 
+def test_texture_io_error_fails_the_run_but_preserves_successes(eq, tmp_path, monkeypatch, capsys):
+    carve, _ = build_case(eq, tmp_path, 28, top_first=True)
+    good = texture(28, "R8G8B8A8_UNORM", 64, 64, mips=2)
+    missing = texture(28, "R8G8B8A8_UNORM", 64, 64, mips=2, gpu=0x5000)
+    index = tmp_path / "index.json"
+    index.write_text(json.dumps([good, missing]), encoding="utf-8")
+    out = tmp_path / "out"
+    _argv(monkeypatch, index, carve, out)
+    assert T.main() == 1
+    captured = capsys.readouterr()
+    assert "1 texture(s) could not be read or written" in captured.err
+    assert "000000005000.bin" in captured.err
+    assert "error:FileNotFoundError" in captured.out
+    exported, failed = json.loads((out / "export_log.json").read_text(encoding="utf-8"))
+    assert (out / "x.rpf" / exported["export"]["file"]).is_file()
+    assert "export" not in failed
+
+
+def test_main_reports_export_log_write_failure(tmp_path, monkeypatch, capsys):
+    index = tmp_path / "index.json"
+    index.write_text("[]", encoding="utf-8")
+    out = tmp_path / "out"
+    (out / "export_log.json").mkdir(parents=True)
+    _argv(monkeypatch, index, tmp_path, out)
+    assert T.main() == 1
+    captured = capsys.readouterr()
+    assert "ERROR: cannot write" in captured.err
+    assert "export_log.json" in captured.err
+    assert not captured.out
+
+
 # ---- bad index / --out guards (#1607's class in main) ----
 
 def _argv(monkeypatch, index, carve, out, *extra):
