@@ -12,6 +12,8 @@
 #include <dxgi1_4.h>
 
 #include <algorithm>
+#include <cctype>
+#include <cstdlib>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -37,7 +39,7 @@ struct Ptr {
 };
 
 // The host runtime's device for this comparison and a name for the report; false if there is none.
-inline bool create_host(Ptr<ID3D12Device>& host, std::string& name) {
+inline bool create_host_impl(Ptr<ID3D12Device>& host, std::string& name) {
     const HMODULE d3d12 = LoadLibraryExA("d3d12.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
     const HMODULE dxgi = LoadLibraryExA("dxgi.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
     if (!d3d12 || !dxgi) return false;
@@ -93,6 +95,18 @@ inline bool create_host(Ptr<ID3D12Device>& host, std::string& name) {
     return true;
 }
 
+// A host device, or false when there is none (the comparisons are then skipped). When LEONIDA_HOST_ADAPTER names an
+// adapter that cannot be had, the run fails: a typo must not turn the comparisons into a silent pass.
+inline bool create_host(Ptr<ID3D12Device>& host, std::string& name) {
+    if (create_host_impl(host, name)) return true;
+    char want[128] = {};
+    if (GetEnvironmentVariableA("LEONIDA_HOST_ADAPTER", want, sizeof(want)) && want[0]) {
+        std::fprintf(stderr, "LEONIDA_HOST_ADAPTER=%s: no such adapter, or no D3D12 device on it\n", want);
+        std::exit(1);
+    }
+    return false;
+}
+
 struct Region {
     std::string label;
     size_t offset = 0, pitch = 0, row_bytes = 0, rows = 0, depth = 1;
@@ -114,6 +128,7 @@ struct TexCase {
     bool floaty;  // bytes stay small so floats are finite
     bool ds;      // depth-stencil: whole-subresource copies only
     bool bc;
+    bool emulated = false;  // the layer stores the format as another one (D24 as D32S8): only bit-preserving copies
 };
 
 // One device with a direct queue, an allocator, a list and a fence.
@@ -125,6 +140,7 @@ struct Run {
     Ptr<ID3D12GraphicsCommandList> list;
     Ptr<ID3D12Fence> fence;
     UINT64 value = 0;
+    bool refused = false;  // the last submit failed at Close or in the layer's replay: the list was rejected
 
     bool init(ID3D12Device* d, bool is_ours) {
         device = d;
@@ -137,7 +153,22 @@ struct Run {
                                               IID_PPV_ARGS(&list.p))) &&
                SUCCEEDED(d->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence.p)));
     }
-    bool buffer(D3D12_HEAP_TYPE heap, UINT64 bytes, D3D12_RESOURCE_STATES state, Ptr<ID3D12Resource>& out) {
+    // Starts another scenario on the same queue: the list and allocator are reset (a list that failed at Close can be).
+    bool used = false;
+    void begin() {
+        if (used && refused) {  // a rejected list is dropped with its allocator rather than reset
+            list.reset();
+            allocator.reset();
+            device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator.p));
+            device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.p, nullptr, IID_PPV_ARGS(&list.p));
+        } else if (used) {
+            allocator->Reset();
+            list->Reset(allocator.p, nullptr);
+        }
+        refused = false;
+        used = true;
+    }
+    bool buffer(D3D12_HEAP_TYPE heap,UINT64 bytes, D3D12_RESOURCE_STATES state, Ptr<ID3D12Resource>& out) {
         D3D12_HEAP_PROPERTIES hp{};
         hp.Type = heap;
         D3D12_RESOURCE_DESC desc{};
@@ -166,13 +197,15 @@ struct Run {
     }
     // Close, execute, wait. Returns an error text, or an empty string.
     std::string submit() {
-        if (const HRESULT hr = list->Close(); FAILED(hr)) return "Close failed 0x" + hex(hr);
+        if (const HRESULT hr = list->Close(); FAILED(hr)) { refused = true; return "Close failed 0x" + hex(hr); }
         ID3D12CommandList* lists[] = {list.p};
         queue->ExecuteCommandLists(1, lists);
         if (ours) {
             const auto result = rt::d3d12::last_execute_result(queue.p);
-            if (result != leonida::ReplayResult::success)
+            if (result != leonida::ReplayResult::success) {
+                refused = true;
                 return "the layer refused the list (ReplayResult " + std::to_string(int(result)) + ")";
+            }
         }
         if (FAILED(queue->Signal(fence.p, ++value)) || FAILED(fence->SetEventOnCompletion(value, nullptr)))
             return "fence wait failed";
@@ -319,6 +352,11 @@ inline void run_texture(Run& run, ID3D12Device* host, const TexCase& tc, Outcome
             run.list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
         }
     run.barrier(A.p, copy_dest, copy_source);
+    // The partial copies below write the textures the uploads just wrote: a round trip through COPY_SOURCE orders them.
+    for (auto* t : {&B, &C, &D}) {
+        run.barrier(t->p, copy_dest, copy_source);
+        run.barrier(t->p, copy_source, copy_dest);
+    }
     run.list->CopyResource(R.p, A.p);
     for (UINT i = 0; i < n; ++i) {
         const Inner in = inner(i);
@@ -395,6 +433,8 @@ inline void run_buffers(Run& run, Outcome& out) {
     l.CopyBufferRegion(B.p, 0, up.p, kb, kb);
     l.CopyBufferRegion(E.p, 0, up.p, 2 * kb, 4093);
     run.barrier(A.p, copy_dest, copy_source);
+    run.barrier(B.p, copy_dest, copy_source);  // orders B's upload before the partial copies into it
+    run.barrier(B.p, copy_source, copy_dest);
     l.CopyBufferRegion(B.p, 1, A.p, 3, 1);
     l.CopyBufferRegion(B.p, 7, A.p, 100, 5);
     l.CopyBufferRegion(B.p, 64, A.p, 0, 256);
@@ -419,6 +459,92 @@ inline void run_buffers(Run& run, Outcome& out) {
     for (const auto& [label, size] : parts) {
         out.regions.push_back({label, at, size, size, 1, 1, false});
         at += size;
+    }
+    up->Unmap(0, nullptr);
+    rb->Unmap(0, nullptr);
+}
+
+// Texture to texture between different mips of one 24x24 texture (mips 24, 12, 6, 3, 1): sizes that are not block
+// multiples, boxes that run to a padded edge, and boxes that do not fit the destination (which must be refused).
+struct MixCase {
+    const char* name;
+    UINT src_mip, dst_mip;
+    bool has_box;
+    D3D12_BOX box;
+    UINT dx, dy;
+    bool bc_gap;  // block-compressed: the host copies whole blocks, the layer cannot (known difference)
+};
+
+// Copies one subresource of A into one of D (both prefilled), reads D back. `out.error` is set when the list was
+// rejected (`run.refused`).
+inline void run_mixed(Run& run, ID3D12Device* host, DXGI_FORMAT format, const MixCase& mc, Outcome& out) {
+    D3D12_RESOURCE_DESC desc{};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    desc.Width = desc.Height = 24;
+    desc.DepthOrArraySize = 1;
+    desc.MipLevels = 5;
+    desc.Format = format;
+    desc.SampleDesc.Count = 1;
+    constexpr UINT n = 5;
+    Layout layout[3];
+    UINT64 total_one = 0;
+    host->GetCopyableFootprints(&desc, 0, n, 0, nullptr, nullptr, nullptr, &total_one);
+    const UINT64 stride = (total_one + 511) / 512 * 512;
+    for (int k = 0; k < 3; ++k) {
+        layout[k].placed.resize(n);
+        layout[k].rows.resize(n);
+        layout[k].row_bytes.resize(n);
+        host->GetCopyableFootprints(&desc, 0, n, k == 2 ? 0 : stride * k, layout[k].placed.data(), layout[k].rows.data(),
+                                    layout[k].row_bytes.data(), &layout[k].total);
+    }
+    constexpr auto copy_dest = D3D12_RESOURCE_STATE_COPY_DEST, copy_source = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    Ptr<ID3D12Resource> up, rb, A, D;
+    if (!run.buffer(D3D12_HEAP_TYPE_UPLOAD, stride * 2, D3D12_RESOURCE_STATE_GENERIC_READ, up) ||
+        !run.buffer(D3D12_HEAP_TYPE_READBACK, stride, copy_dest, rb) || !run.texture(desc, copy_dest, A) ||
+        !run.texture(desc, copy_dest, D)) {
+        out.error = "resource creation failed";
+        return;
+    }
+    std::uint8_t *upm = nullptr, *rbm = nullptr;
+    if (FAILED(up->Map(0, nullptr, reinterpret_cast<void**>(&upm))) || FAILED(rb->Map(0, nullptr, reinterpret_cast<void**>(&rbm)))) {
+        out.error = "Map failed";
+        return;
+    }
+    std::memset(upm, 0, size_t(stride) * 2);
+    std::memset(rbm, 0xcd, size_t(stride));
+    for (int k = 0; k < 2; ++k)
+        for (UINT i = 0; i < n; ++i) {
+            const Placed& p = layout[k].placed[i];
+            for (UINT row = 0; row < layout[k].rows[i]; ++row)
+                for (UINT64 col = 0; col < layout[k].row_bytes[i]; ++col)
+                    upm[size_t(p.Offset) + size_t(row) * p.Footprint.RowPitch + size_t(col)] =
+                        fill_byte(unsigned(k + 11) * 104729u + i, size_t(row) * 131 + size_t(col), false);
+            const auto dst = sub_loc(k ? D.p : A.p, i);
+            const auto src = foot_loc(up.p, p);
+            run.list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+        }
+    run.barrier(A.p, copy_dest, copy_source);
+    run.barrier(D.p, copy_dest, copy_source);  // orders the upload before the partial copy
+    run.barrier(D.p, copy_source, copy_dest);
+    {
+        const auto dst = sub_loc(D.p, mc.dst_mip), src = sub_loc(A.p, mc.src_mip);
+        run.list->CopyTextureRegion(&dst, mc.dx, mc.dy, 0, &src, mc.has_box ? &mc.box : nullptr);
+    }
+    run.barrier(D.p, copy_dest, copy_source);
+    for (UINT i = 0; i < n; ++i) {
+        const auto dst = foot_loc(rb.p, layout[2].placed[i]);
+        const auto src = sub_loc(D.p, i);
+        run.list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+    }
+    out.error = run.submit();
+    if (!out.error.empty()) return;
+    out.bytes.assign(rbm, rbm + size_t(stride));
+    for (UINT i = 0; i < n; ++i) {
+        const Placed& p = layout[2].placed[i];
+        char label[64];
+        std::snprintf(label, sizeof(label), "D sub %u (mip %u)", i, i);
+        out.regions.push_back({label, size_t(p.Offset), p.Footprint.RowPitch, size_t(layout[2].row_bytes[i]),
+                               layout[2].rows[i], p.Footprint.Depth, false});
     }
     up->Unmap(0, nullptr);
     rb->Unmap(0, nullptr);
@@ -494,10 +620,11 @@ inline int compare_copies(ID3D12Device* ours, bool bc_supported, bool d24_native
     };
     depth("D16_UNORM", DXGI_FORMAT_D16_UNORM, false);
     depth("D32_FLOAT", DXGI_FORMAT_D32_FLOAT, true);
-    if (d24_native)
-        depth("D24_UNORM_S8_UINT", DXGI_FORMAT_D24_UNORM_S8_UINT, false);
-    else  // the layer stores it as D32_SFLOAT_S8_UINT: the 24-bit texel bits are not converted (docs/d3d12_vulkan.md)
-        std::printf("copy comparison: no native D24_UNORM_S8_UINT on this GPU, that case skipped (known difference)\n");
+    depth("D24_UNORM_S8_UINT", DXGI_FORMAT_D24_UNORM_S8_UINT, false);
+    // Without a native D24 the layer stores D32_SFLOAT_S8_UINT and an upload or readback does not convert the 24-bit
+    // texels (docs/d3d12_vulkan.md, known gaps): only the copies that keep the bits are checked, on the layer alone.
+    cases.back().emulated = !d24_native;
+    cases.back().floaty = !d24_native;  // the layer's D32 holds floats: keep them normal and finite
     depth("D32_FLOAT_S8X24_UINT", DXGI_FORMAT_D32_FLOAT_S8X24_UINT, true);
     if (bc_supported) {
         const auto bc = [&](const char* name, DXGI_FORMAT f) {
@@ -537,9 +664,106 @@ inline int compare_copies(ID3D12Device* ours, bool bc_supported, bool d24_native
         bad += r;
         if (!r) std::printf("copy case %s: matches the host (%zu regions)\n", name, b.regions.size());
     };
-    for (const TexCase& tc : cases)
-        both(tc.name, [&](Run& r, Outcome& o) { run_texture(r, host.p, tc, o); });
+    // An emulated format: the readbacks of a CopyResource, a box copy and a copy into another slice must equal the
+    // readback of the source (bits kept), on the layer alone.
+    const auto bit_preserving = [&](const TexCase& tc) {
+        ++total;
+        Outcome a;
+        Run run;
+        if (!run.init(ours, true)) {
+            std::fprintf(stderr, "copy case %s: could not create the queue and list\n", tc.name);
+            ++bad;
+            return;
+        }
+        run_texture(run, host.p, tc, a);
+        if (!a.error.empty()) {
+            std::fprintf(stderr, "copy case %s: layer run failed: %s\n", tc.name, a.error.c_str());
+            ++bad;
+            return;
+        }
+        const size_t n = a.regions.size() / 6, layers = tc.depth_or_layers;
+        const auto same = [&](const Region& x, const Region& y) {
+            for (size_t row = 0; row < x.rows; ++row)
+                if (std::memcmp(&a.bytes[x.offset + row * x.pitch], &a.bytes[y.offset + row * y.pitch], x.row_bytes))
+                    return false;
+            return true;
+        };
+        int wrong = 0;
+        for (size_t i = 0; i < n; ++i) {
+            const size_t mip = i % tc.mips, slice = (i / tc.mips) % layers, plane = i / (tc.mips * layers);
+            const size_t other = mip + ((slice + 1) % layers) * tc.mips + plane * tc.mips * layers;
+            const Region& source = a.regions[4 * n + i];
+            if (!same(a.regions[i], source) || !same(a.regions[n + i], source) || !same(a.regions[2 * n + other], source)) {
+                if (wrong++ < 3)
+                    std::fprintf(stderr, "copy case %s: sub %zu: a copy did not keep the source's bits\n", tc.name, i);
+            }
+        }
+        bad += wrong ? 1 : 0;
+        if (!wrong)
+            std::printf("copy case %s: emulated format, CopyResource and box copies keep the source's bits "
+                        "(upload and readback are not compared)\n", tc.name);
+    };
+    for (const TexCase& tc : cases) {
+        if (tc.emulated) bit_preserving(tc);
+        else both(tc.name, [&](Run& r, Outcome& o) { run_texture(r, host.p, tc, o); });
+    }
     both("buffers", [&](Run& r, Outcome& o) { run_buffers(r, o); });
+
+    // Different mips of one texture. Both sides must refuse what does not fit; what the host copies the layer must
+    // copy the same, except block-compressed copies of sizes that are no block multiple (known difference).
+    constexpr D3D12_BOX no_box{};
+    const MixCase mixes[] = {
+        {"mip 0 box 12x12 into mip 1", 0, 1, true, {0, 0, 0, 12, 12, 1}, 0, 0, false},
+        {"mip 1 into mip 0 at 8,8", 1, 0, false, no_box, 8, 8, false},
+        {"mip 1 box 4..12 into mip 0", 1, 0, true, {4, 4, 0, 12, 12, 1}, 0, 0, false},
+        {"mip 0 box 8x8 into the 6x6 mip 2", 0, 2, true, {0, 0, 0, 8, 8, 1}, 0, 0, true},
+        {"mip 2 (6x6) into mip 0 at 4,4", 2, 0, false, no_box, 4, 4, true},
+        {"mip 2 (6x6) into mip 1", 2, 1, false, no_box, 0, 0, true},
+        {"mip 0 box 4x4 into the 3x3 mip 3", 0, 3, true, {0, 0, 0, 4, 4, 1}, 0, 0, true},
+        {"mip 0 box 16x16 into the 3x3 mip 3 (does not fit)", 0, 3, true, {0, 0, 0, 16, 16, 1}, 0, 0, false},
+        {"mip 0 box 16x16 into the 6x6 mip 2 (does not fit)", 0, 2, true, {0, 0, 0, 16, 16, 1}, 0, 0, false},
+        {"mip 1 into mip 0 at 16,16 (does not fit)", 1, 0, false, no_box, 16, 16, false},
+    };
+    Run ours_run, host_run;  // one queue each for every mixed-mip case
+    const bool ours_ok = ours_run.init(ours, true), host_ok = host_run.init(host.p, false);
+    if (!ours_ok || !host_ok) {
+        std::fprintf(stderr, "copy cases with mixed mips: could not create the queue and list on %s\n",
+                     ours_ok ? "the host" : "the layer");
+        return bad + 1;
+    }
+    for (const DXGI_FORMAT format : {DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_BC1_UNORM, DXGI_FORMAT_BC7_UNORM}) {
+        const bool bc = format != DXGI_FORMAT_R8G8B8A8_UNORM;
+        if (bc && !bc_supported) continue;
+        for (const MixCase& mc : mixes) {
+            ++total;
+            const std::string name = std::string(bc ? "BC " : "RGBA8 ") + mc.name;
+            Outcome a, b;
+            ours_run.begin();
+            host_run.begin();
+            run_mixed(ours_run, host.p, format, mc, a);
+            run_mixed(host_run, host.p, format, mc, b);
+            if (!host_run.refused && !b.error.empty()) {
+                std::fprintf(stderr, "copy case %s: the HOST run failed (%s); fix the case\n", name.c_str(), b.error.c_str());
+                ++bad;
+            } else if (host_run.refused != ours_run.refused) {
+                if (!host_run.refused && bc && mc.bc_gap) {
+                    std::printf("copy case %s: known difference: the host copies whole blocks, the layer refuses it\n", name.c_str());
+                } else {
+                    std::fprintf(stderr, "copy case %s: the host %s the copy, the layer %s it (%s)\n", name.c_str(),
+                                 host_run.refused ? "refuses" : "does", ours_run.refused ? "refuses" : "does",
+                                 ours_run.refused ? a.error.c_str() : "accepted");
+                    ++bad;
+                }
+            } else if (!host_run.refused) {
+                const int r = compare(name.c_str(), a, b);
+                bad += r;
+                if (!r) std::printf("copy case %s: matches the host\n", name.c_str());
+            } else {
+                std::printf("copy case %s: refused by both (host: %s; layer: %s)\n", name.c_str(), b.error.c_str(),
+                            a.error.c_str());
+            }
+        }
+    }
     std::printf("copy comparison: %d of %d cases differ from the host\n", bad, total);
     return bad;
 }

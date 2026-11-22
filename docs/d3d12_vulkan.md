@@ -161,8 +161,9 @@ What is implemented (all of it testable without the game):
   scope, with rectangles clipped to the mip. Copies become `vkCmdCopyBuffer`, `vkCmdCopyBufferToImage`,
   `vkCmdCopyImageToBuffer` and `vkCmdCopyImage`. A placed footprint's row pitch becomes `bufferRowLength`, and
   block-compressed extents stop at the mip edge (D3D12 pads footprints to whole blocks, Vulkan does not; a
-  texture-to-texture box of a block-compressed format may likewise run to the padded edge, as on the PC runtime, and
-  the Vulkan extent is cut at the mip edge). Each
+  texture-to-texture box of a block-compressed format is rounded up to whole blocks, as on the PC runtime, must fit
+  the destination's padded mip, and the Vulkan extent is cut where it reaches an image's edge; Vulkan wants that per
+  image, so a copy whose cut extent is neither a block multiple nor at the edge of both images is refused). Each
   range and buffer bound is checked before anything is written. A copy runs in `TRANSFER_SRC`/`TRANSFER_DST`, or
   in place in `GENERAL` when the texture is in `COMMON`: that is D3D12's implicit promotion to a copy state.
   A 3D mip is one subresource. Boxed volume transfers preserve the full footprint's row and slice strides.
@@ -353,12 +354,25 @@ and any validation error fails them.
     - A texture-to-texture box on a block-compressed texture that reaches the padded edge of a mip (for example a
       box of whole blocks over a 9x5 mip) was refused as `invalid_copy`; the PC runtime accepts it.
 
-    Known differences, not fixed: `TEXTURE1D` resources are not supported by the layer (creation, footprints and
-    allocation info refuse them), so 1D copies are not compared. On a GPU without `D24_UNORM_S8_UINT` (the Radeon
-    880M) the layer stores it as `D32_SFLOAT_S8_UINT` and copies the bits without converting 24-bit to float, so a
-    D24 round trip changes the value; that case is skipped there. On a GPU with it, a readback leaves the
-    unspecified `X8` byte of the depth plane untouched where the PC runtime writes 0; the comparison ignores it.
-    A PC driver's copy flushes denormal float depth to zero, so the test keeps its values normal.
+    Copies between different mips of one texture are compared too (mips 24, 12, 6, 3, 1; RGBA8, BC1, BC7): sizes that
+    are no block multiple, boxes to a padded edge, and boxes that do not fit the destination, which both sides must
+    refuse (the host at `Close` with `E_INVALIDARG`, the layer at execution with `invalid_copy`). Known gaps shown
+    by it and by the formats, not fixed:
+    - **Block-compressed copies into a mip whose size is no block multiple**, for example a 0..8 box into a 6-wide
+      mip, a 6x6 mip into a larger one, or a 4x4 box into a 3x3 mip: the host copies whole blocks, `vkCmdCopyImage`
+      cannot (its extent must be a block multiple or reach each image's edge), so the layer refuses them with
+      `invalid_copy`. A fix needs a staging copy through a buffer. The test prints these as known differences.
+    - **`TEXTURE1D`** resources are not supported by the layer (creation, footprints and allocation info refuse
+      them), so 1D copies are not compared.
+    - **`D24_UNORM_S8_UINT` on a GPU without it (the Radeon 880M)**: the layer stores `D32_SFLOAT_S8_UINT`, and an
+      upload or readback copies the bits without converting 24-bit unorm to float, so the values a D24 texture
+      holds are not the ones the game wrote. Only the bit-preserving copies (`CopyResource`, box and slice copies
+      between two D24 textures) are checked there, against the layer's own readback of the source; the upload
+      and readback paths are not compared. A fix needs a conversion pass (compute) around such copies.
+    - On a GPU with D24, a readback leaves the unspecified `X8` byte of the depth plane untouched where the PC
+      runtime writes 0; the comparison ignores it.
+    A PC driver's copy flushes denormal float depth to zero, so the test keeps its values normal. A
+    `LEONIDA_HOST_ADAPTER` that matches no adapter fails the run instead of skipping the comparisons.
 - `d3d12_descriptor_test`: descriptors through the proxy.
   - Copies, checked on the slots' bytes: one run, range lists of different shapes on each side, null size
     arrays, and a destination longer than its source.

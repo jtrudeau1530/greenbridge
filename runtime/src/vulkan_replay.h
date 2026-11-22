@@ -761,10 +761,23 @@ inline ReplayResult prepare_texture_copy(const CopyTexture& copy, Prepared& p) {
         std::uint32_t w = box.right - box.left, h = box.bottom - box.top;
         const std::uint32_t d = box.back - box.front;
         if (block > 1) {
-            if (box.left >= from.width || box.top >= from.height || copy.x >= to.width || copy.y >= to.height)
+            // D3D12 copies whole blocks: the box is rounded up to blocks and must fit the destination's padded mip.
+            // Vulkan takes an extent that is a block multiple or reaches the edge of each image separately, so the
+            // extent is cut where it reaches an edge, and a copy that cannot satisfy both images is refused.
+            if ((box.left | box.top | copy.x | copy.y) % block || box.left >= from.width || box.top >= from.height ||
+                copy.x >= padded(to.width) || copy.y >= padded(to.height))
                 return ReplayResult::invalid_copy;
+            w = padded(w);
+            h = padded(h);
+            if (w > padded(to.width) - copy.x || h > padded(to.height) - copy.y) return ReplayResult::invalid_copy;
             w = std::min({w, from.width - box.left, to.width - copy.x});
             h = std::min({h, from.height - box.top, to.height - copy.y});
+            const auto fits = [block](std::uint32_t offset, std::uint32_t extent, std::uint32_t size) {
+                return extent % block == 0 || offset + extent == size;
+            };
+            if (!fits(box.left, w, from.width) || !fits(copy.x, w, to.width) || !fits(box.top, h, from.height) ||
+                !fits(copy.y, h, to.height))
+                return ReplayResult::invalid_copy;
         }
         if (!within(copy.x, w, to.width) || !within(copy.y, h, to.height) || !within(copy.z, d, to_depth))
             return ReplayResult::invalid_copy;
