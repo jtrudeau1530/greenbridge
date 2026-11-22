@@ -27,8 +27,9 @@ Meshlet group (first u32 has bit 31 set):
          u32 w1: low u16 = first vertex reference, high u16 = first triangle (running sums)
          u32 w2, w3: bits 0-11 and 12-23 of w2 and bits 0-11 of w3 are the meshlet's centre in x, y and z as
                      12-bit steps of 1/16 m around 2047, (field - 2047) / 16 (measured on `42 40` geometry; the
-                     default 0x007FF7FF / 0x7FF is the origin). w2 bits 24-31 (0 or 16) and w3 bits 12-31
-                     (non-zero when the meshlet's faces point roughly one way) are not decoded.
+                     default 0x007FF7FF / 0x7FF is the origin). w2 bits 24-31 (0 or 16) and w3 bits 14-30 are the
+                     normal cone: axis octahedral u = bits 14-19, v = bits 20-25 (x / 31.5 - 1), sin(half-angle) =
+                     (31 - bits 26-30) / 31; all zero = no cone. w2 bits 24-31 (0 or 16) are not decoded.
     then T u32 triangles: three 7-bit meshlet-local indices (bits 0-6, 7-13, 14-20), meshlet index in bits 21-31
     then V u16 vertex references into a vertex block
 
@@ -59,7 +60,7 @@ the stream. Only counts and layout checks are written; no vertex, index or float
 
 Usage:
     python -I tools/meshlet_page.py <file|dir|archive.rpf> [...] [--json out.json] [--quiet]
-        [--faces] [--centres] [--normals]
+        [--faces] [--centres] [--normals] [--cones]
     python -I tools/meshlet_page.py <graphics-segment> --draw-system <system-segment> --geometry-offset <offset> [--json out.json]
     python -I tools/meshlet_page.py <graphics-segment> --draw-system <system-segment> --drawable-offset <offset>
 """
@@ -237,6 +238,54 @@ def meshlet_centre(w2, w3):
 def meshlet_radius(w0):
     """The bounding-sphere radius in a meshlet record's word 0 (bits 16-31, an f16), in metres."""
     return struct.unpack("<e", struct.pack("<H", w0 >> 16))[0]
+
+
+def meshlet_cone(w3):
+    """The normal cone in a meshlet record's word +12: ((x, y, z) axis, cos of the half-angle), or None when bits
+    12-31 are all zero (no cone)."""
+    if not w3 >> 12:
+        return None
+    axis = _octahedral(((w3 >> 14) & 63) / 31.5 - 1, ((w3 >> 20) & 63) / 31.5 - 1)
+    s = (31 - ((w3 >> 26) & 31)) / 31
+    return axis, math.sqrt(max(0.0, 1 - s * s))
+
+
+def cone_agreement(data, group, positions):
+    """For each meshlet with a cone: does the axis lie within ~25 degrees of the area-weighted mean face normal, and
+    does every face normal lie inside the cone (dot with the axis at least cos(half-angle)), exactly or within 0.05?"""
+    at, k = group["offset"], group["meshlets"]
+    rec_at, tri_at = at + 12, at + 12 + 16 * k
+    refs = struct.unpack_from(f"<{group['vertex_refs']}H", data, tri_at + 4 * group["triangles"])
+    out = {"meshlets": k, "cones": 0, "axis_within_25_degrees": 0, "faces_inside": 0, "faces_inside_within_0_05": 0}
+    for m in range(k):
+        w0, w1, _, w3 = struct.unpack_from("<4I", data, rec_at + 16 * m)
+        cone = meshlet_cone(w3)
+        if cone is None:
+            continue
+        axis, cos_half = cone
+        vb, tb, tc = w1 & 0xFFFF, w1 >> 16, ((w0 >> 7) & 0x7F) + 1
+        normals, total = [], [0.0, 0.0, 0.0]
+        for t in struct.unpack_from(f"<{tc}I", data, tri_at + 4 * tb):
+            idx = [refs[vb + ((t >> s) & 0x7F)] for s in (0, 7, 14)]
+            if max(idx) >= len(positions):
+                raise PageError("meshlet references a vertex past its block")
+            p, q, r = (positions[i] for i in idx)
+            u = (q[0] - p[0], q[1] - p[1], q[2] - p[2])
+            v = (r[0] - p[0], r[1] - p[1], r[2] - p[2])
+            n = (u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2], u[0] * v[1] - u[1] * v[0])
+            length = math.sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2])
+            if length and math.isfinite(length):
+                normals.append((n[0] / length, n[1] / length, n[2] / length))
+                total = [a + b for a, b in zip(total, n)]
+        length = math.sqrt(sum(c * c for c in total))
+        if not normals or not length:
+            continue
+        out["cones"] += 1
+        out["axis_within_25_degrees"] += sum(a * c / length for a, c in zip(axis, total)) > 0.9
+        smallest = min(sum(a * c for a, c in zip(axis, n)) for n in normals)
+        out["faces_inside"] += smallest >= cos_half
+        out["faces_inside_within_0_05"] += smallest >= cos_half - 0.05
+    return out
 
 
 def centre_agreement(data, group, positions):
@@ -501,9 +550,9 @@ def block_checks(data, block):
     return out
 
 
-def summarise_page(data, name, faces=False, centres=False, normals=False):
-    """Counts for one page. faces=True also runs face_agreement, centres=True centre_agreement and normals=True
-    normal_agreement on every group
+def summarise_page(data, name, faces=False, centres=False, normals=False, cones=False):
+    """Counts for one page. faces=True also runs face_agreement, centres=True centre_agreement, normals=True
+    normal_agreement and cones=True cone_agreement on every group
     whose vertex span matches a `42 40` block in the page (the nearest such block before it, else the first after
     it)."""
     try:
@@ -526,7 +575,7 @@ def summarise_page(data, name, faces=False, centres=False, normals=False):
                 if nrm is not None:
                     for k, v in tangent_agreement(nrm, tangents_4240(data, b)).items():
                         checks["tangents_4240_" + k] = checks.get("tangents_4240_" + k, 0) + v
-        if faces or centres or normals:
+        if faces or centres or normals or cones:
             decoded = {}
             for g in groups:
                 same = [b for b in others if b["vertices"] == g["vertex_span"]]
@@ -542,6 +591,9 @@ def summarise_page(data, name, faces=False, centres=False, normals=False):
                 if centres:
                     for k, v in centre_agreement(data, g, decoded[b["offset"]]).items():
                         checks["centres_4240_" + k] = checks.get("centres_4240_" + k, 0) + v
+                if cones:
+                    for k, v in cone_agreement(data, g, decoded[b["offset"]]).items():
+                        checks["cones_4240_" + k] = checks.get("cones_4240_" + k, 0) + v
                 if normals:
                     nrm = normals_4240(data, b)
                     if nrm is not None:
@@ -777,6 +829,8 @@ def main(argv=None):
     ap.add_argument("--normals", action="store_true",
                     help="also compare 42 40 slot-2 normals with their vertices' face normals, and tangents with "
                          "the normals (slower)")
+    ap.add_argument("--cones", action="store_true",
+                    help="also compare meshlet records' normal cones with their 42 40 face normals (slower)")
     ap.add_argument("--centres", action="store_true",
                     help="also compare meshlet records' stored centres with their 42 40 vertices (slower)")
     ap.add_argument("--draw-system", help="inflated system segment paired with one graphics segment")
@@ -833,7 +887,7 @@ def main(argv=None):
         if not os.path.exists(path):
             print(f"error: {path} does not exist", file=sys.stderr)
             return 2
-    pages = [summarise_page(data, name, args.faces, args.centres, args.normals)
+    pages = [summarise_page(data, name, args.faces, args.centres, args.normals, args.cones)
              for name, data in iter_inputs(args.inputs)]
     total = totals(pages)
     if not args.quiet:
