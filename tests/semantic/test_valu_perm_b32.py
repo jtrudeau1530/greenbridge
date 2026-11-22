@@ -602,5 +602,191 @@ class TestPermB32SymbolicAST(unittest.TestCase):
         self.assertEqual(v.type_kind, TypeKind.INT32)
 
 
+# ==============================================================================
+# Deterministic Scalar Instruction Interpreter
+# ==============================================================================
+
+class ScalarRegisterFile:
+    """Architectural register file for deterministic scalar simulation."""
+
+    def __init__(self) -> None:
+        self.vgprs: dict[int, int] = {i: 0 for i in range(256)}
+        self.sgprs: dict[int, int] = {i: 0 for i in range(106)}
+
+    def get_vgpr(self, idx: int) -> int:
+        if not 0 <= idx < 256:
+            raise IndexError(f"VGPR index out of range [0, 255]: {idx}")
+        return self.vgprs.get(idx, 0) & MASK32
+
+    def set_vgpr(self, idx: int, val: int) -> None:
+        if not 0 <= idx < 256:
+            raise IndexError(f"VGPR index out of range [0, 255]: {idx}")
+        self.vgprs[idx] = val & MASK32
+
+    def get_sgpr(self, idx: int) -> int:
+        if not 0 <= idx < 106:
+            raise IndexError(f"SGPR index out of range [0, 105]: {idx}")
+        return self.sgprs.get(idx, 0) & MASK32
+
+    def set_sgpr(self, idx: int, val: int) -> None:
+        if not 0 <= idx < 106:
+            raise IndexError(f"SGPR index out of range [0, 105]: {idx}")
+        self.sgprs[idx] = val & MASK32
+
+    def read_operand(self, op: ASTOperand) -> int:
+        if op.kind == OperandKind.VGPR:
+            assert op.reg_index is not None
+            return self.get_vgpr(op.reg_index)
+        elif op.kind == OperandKind.SGPR:
+            assert op.reg_index is not None
+            return self.get_sgpr(op.reg_index)
+        elif op.kind in (OperandKind.INLINE_CONST, OperandKind.LITERAL_CONST):
+            assert op.constant_value is not None
+            return op.constant_value & MASK32
+        else:
+            raise ValueError(f"Unknown operand kind: {op.kind}")
+
+    def write_operand(self, op: ASTOperand, val: int) -> None:
+        if op.kind == OperandKind.VGPR:
+            assert op.reg_index is not None
+            self.set_vgpr(op.reg_index, val)
+        else:
+            raise ValueError(f"Cannot write VALU result to non-VGPR operand: {op}")
+
+
+class PermB32ScalarInterpreter:
+    """Deterministic scalar instruction interpreter for v_perm_b32."""
+
+    def __init__(self, rf: Optional[ScalarRegisterFile] = None) -> None:
+        self.rf: ScalarRegisterFile = rf if rf is not None else ScalarRegisterFile()
+
+    def step(self, instr: ASTInstruction) -> None:
+        instr.validate()
+        if instr.opcode != Opcode.V_PERM_B32:
+            raise NotImplementedError(f"Unsupported opcode: {instr.opcode}")
+
+        s0 = self.rf.read_operand(instr.src0)
+        s1 = self.rf.read_operand(instr.src1)
+        s2 = self.rf.read_operand(instr.src2)
+
+        res = oracle_v_perm_b32(s0, s1, s2)
+        self.rf.write_operand(instr.dst, res)
+
+    def run_program(self, instructions: list[ASTInstruction]) -> None:
+        for instr in instructions:
+            self.step(instr)
+
+
+# ==============================================================================
+# Unit Tests: Deterministic Scalar Interpreter
+# ==============================================================================
+
+class TestPermB32ScalarInterpreter(unittest.TestCase):
+    """Test suite for deterministic scalar instruction interpreter."""
+
+    def test_scalar_execution_all_vgpr(self):
+        rf = ScalarRegisterFile()
+        rf.set_vgpr(1, 0x11223344)  # src0
+        rf.set_vgpr(2, 0x55667788)  # src1
+        rf.set_vgpr(3, PermSelectorWord.bswap_src1().raw)  # src2 (selector)
+
+        interp = PermB32ScalarInterpreter(rf)
+        instr = ASTInstruction(
+            opcode=Opcode.V_PERM_B32,
+            dst=ASTOperand.vgpr(0),
+            src0=ASTOperand.vgpr(1),
+            src1=ASTOperand.vgpr(2),
+            src2=ASTOperand.vgpr(3),
+        )
+        interp.step(instr)
+
+        # src1 bytes: [88, 77, 66, 55], reversed: [55, 66, 77, 88] -> 0x88776655
+        self.assertEqual(rf.get_vgpr(0), 0x88776655)
+
+    def test_scalar_execution_mixed_sgpr_vgpr_literal(self):
+        rf = ScalarRegisterFile()
+        rf.set_sgpr(0, 0xAABBCCDD)  # src0 from SGPR
+        rf.set_vgpr(1, 0x11223344)  # src1 from VGPR
+
+        interp = PermB32ScalarInterpreter(rf)
+        # Select identity of src0 using literal constant 0x07060504
+        instr = ASTInstruction(
+            opcode=Opcode.V_PERM_B32,
+            dst=ASTOperand.vgpr(2),
+            src0=ASTOperand.sgpr(0),
+            src1=ASTOperand.vgpr(1),
+            src2=ASTOperand.literal(0x07060504),
+        )
+        interp.step(instr)
+        self.assertEqual(rf.get_vgpr(2), 0xAABBCCDD)
+
+    def test_scalar_execution_inline_constants(self):
+        rf = ScalarRegisterFile()
+        rf.set_vgpr(0, 0x12345678)
+        interp = PermB32ScalarInterpreter(rf)
+
+        # src0=0 (inline), src1=v0, src2=literal 0x0C0C0100 (zero extend low 16 bits of src1)
+        # byte 0 = src1[0] = 0x78, byte 1 = src1[1] = 0x56, byte 2 = 0x00, byte 3 = 0x00
+        # Result: 0x00005678
+        instr = ASTInstruction(
+            opcode=Opcode.V_PERM_B32,
+            dst=ASTOperand.vgpr(1),
+            src0=ASTOperand.inline_const(0),
+            src1=ASTOperand.vgpr(0),
+            src2=ASTOperand.literal(make_selector(0, 1, SEL_ZERO, SEL_ZERO)),
+        )
+        interp.step(instr)
+        self.assertEqual(rf.get_vgpr(1), 0x00005678)
+
+    def test_sequential_pipeline_execution(self):
+        rf = ScalarRegisterFile()
+        rf.set_vgpr(0, 0x12345678)
+        rf.set_vgpr(1, 0x9ABCDEF0)
+
+        interp = PermB32ScalarInterpreter(rf)
+        # Program:
+        # 1. v2 = perm(v0, v1, 0x04040404) -> broadcasts byte 4 (src0[0] = 0x78)
+        # 2. v3 = perm(v2, v1, 0x03020104) -> replace byte 0 with broadcasted 0x78
+        prog = [
+            ASTInstruction(
+                opcode=Opcode.V_PERM_B32,
+                dst=ASTOperand.vgpr(2),
+                src0=ASTOperand.vgpr(0),
+                src1=ASTOperand.vgpr(1),
+                src2=ASTOperand.literal(0x04040404),
+            ),
+            ASTInstruction(
+                opcode=Opcode.V_PERM_B32,
+                dst=ASTOperand.vgpr(3),
+                src0=ASTOperand.vgpr(2),
+                src1=ASTOperand.vgpr(1),
+                src2=ASTOperand.literal(make_selector(4, 1, 2, 3)),
+            ),
+        ]
+        interp.run_program(prog)
+
+        self.assertEqual(rf.get_vgpr(2), 0x78787878)
+        # v3 byte 0 is v2[0] = 0x78; bytes 1..3 are v1[1..3] = 0x9ABCDE
+        self.assertEqual(rf.get_vgpr(3), 0x9ABCDE78)
+
+    def test_state_preservation_unmodified_registers(self):
+        rf = ScalarRegisterFile()
+        rf.set_vgpr(10, 0xCAFEBABE)
+        rf.set_sgpr(5, 0xFEEDFACE)
+
+        interp = PermB32ScalarInterpreter(rf)
+        instr = ASTInstruction(
+            opcode=Opcode.V_PERM_B32,
+            dst=ASTOperand.vgpr(0),
+            src0=ASTOperand.inline_const(0),
+            src1=ASTOperand.inline_const(0),
+            src2=ASTOperand.inline_const(0),
+        )
+        interp.step(instr)
+
+        self.assertEqual(rf.get_vgpr(10), 0xCAFEBABE)
+        self.assertEqual(rf.get_sgpr(5), 0xFEEDFACE)
+
+
 if __name__ == "__main__":
     unittest.main()
