@@ -655,6 +655,32 @@ class ArchiveTest(unittest.TestCase):
         self.assertEqual(animation["decoded"]["2"], [[1.0, 2.0, 3.0]] * 3)
         self.assertEqual(animation["decoded"]["4"], [[0.0], [1.5], [3.0]])
 
+    def test_decode_page_counts_on_or_across_sixth_page(self):
+        data = bytearray(two_sequence_dictionary())
+        pm = len(data)
+        data.extend(bytes(96))
+        struct.pack_into("<Q", data, 8, SYSTEM + pm)
+        data[pm + 8] = 6
+        for last_page in (pm, pm + 9):
+            cuts = [0, 256, 512, 768, 1024, last_page, len(data)]
+            pages = [data[a:b] for a, b in zip(cuts, cuts[1:])]
+            root, *_ = write_rpf(self.rpf, pages)
+            result = subprocess.run([sys.executable, "-I", TOOL, self.rpf, "--decode", str(root)],
+                                    capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(json.loads(result.stdout)["packs"][0]["animations"][0]["decoded_frames"], NF)
+
+    def test_invalid_map_cannot_borrow_counts_from_next_root(self):
+        data = bytearray(two_sequence_dictionary())
+        for pm in (len(data) + 64, 0xfffffff):
+            struct.pack_into("<Q", data, 8, SYSTEM + pm)
+            following = bytearray(two_sequence_dictionary())
+            following[72] = 2
+            write_rpf(self.rpf, [data, following])
+            _, summary = anim_clips.scan(self.rpf)
+            self.assertEqual(summary["unresolved"], {"page map not in the next stream": 1})
+            self.assertEqual(summary["pages"], {"1": 1})
+
     def test_budget_rejects_nan_and_negative(self):
         for value in ("nan", "-1"):
             r = subprocess.run(
