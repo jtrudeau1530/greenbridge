@@ -136,6 +136,35 @@ class RunTestTest(unittest.TestCase):
         self.assertEqual(status, "skip")
         self.assertIn("exit 77", detail)
 
+    def test_ctest_environment_is_applied_only_to_its_child(self) -> None:
+        exe = self.program("show_environment.py",
+                           "import os\n"
+                           "for key in ('LEONIDA_HOST_ADAPTER', 'LEONIDA_WINE_TEST_INHERITED', "
+                           "'LEONIDA_WINE_TEST_VALUE', 'LEONIDA_WINE_TEST_EMPTY'):\n"
+                           "    print(repr(os.environ.get(key)))\n")
+        command = self.command_for(exe)
+        env = {"LEONIDA_HOST_ADAPTER": "inherited", "LEONIDA_WINE_TEST_INHERITED": "keep"}
+        props = {"ENVIRONMENT": ["LEONIDA_HOST_ADAPTER=warp", "LEONIDA_WINE_TEST_VALUE=path=a;b",
+                                 "LEONIDA_WINE_TEST_EMPTY="]}
+        with mock.patch.dict(os.environ, env):
+            os.environ.pop("LEONIDA_WINE_TEST_VALUE", None)
+            os.environ.pop("LEONIDA_WINE_TEST_EMPTY", None)
+            status, detail = self.run_entry(ctest_entry("with_environment", command, props))
+            self.assertEqual(status, "pass", detail)
+            self.assertEqual(detail.splitlines()[1:], ["'warp'", "'keep'", "'path=a;b'", "''"])
+            status, detail = self.run_entry(ctest_entry("without_environment", command))
+            self.assertEqual(status, "pass", detail)
+            self.assertEqual(detail.splitlines()[1:], ["'inherited'", "'keep'", "None", "None"])
+
+    def test_malformed_ctest_environment_fails_before_launch(self) -> None:
+        command = self.command_for(self.exiting(0))
+        props = {"ENVIRONMENT": ["missing_equals"]}
+        with mock.patch.object(rwt.subprocess, "run", wraps=rwt.subprocess.run) as launch:
+            status, detail = self.run_entry(ctest_entry("bad_environment", command, props))
+        launch.assert_not_called()
+        self.assertEqual(status, "fail", detail)
+        self.assertIn("invalid CTest ENVIRONMENT", detail)
+
     def test_ctest_output_expressions_determine_the_result(self):
         usage = {"PASS_REGULAR_EXPRESSION": ["alternative", "usage: gta6rt"]}
         forbidden = {"FAIL_REGULAR_EXPRESSION": ["running ", r"module\(s\) mapped"]}
