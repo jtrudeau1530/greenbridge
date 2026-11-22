@@ -798,5 +798,111 @@ class TestSIMDMultiLaneDivergence(unittest.TestCase):
             self.assertFalse(state.is_lane_active(lane))
 
 
+class TestRegisterAliasing(unittest.TestCase):
+    """Register aliasing and in-place operand preservation tests."""
+
+    def setUp(self) -> None:
+        self.interp = ScalarInterpreter()
+
+    def test_dst_equals_src0_in_place(self) -> None:
+        """Verify atomic read-before-write when destination SGPR equals source SGPR."""
+        state = ScalarMachineState()
+        # Initial: s[4:5] = 0xAAAAAAAAAAAAAAAA, EXEC = 0x5555555555555555
+        state.set_sgpr64(4, 0xAAAAAAAAAAAAAAAA)
+        state.exec_mask = 0x5555555555555555
+
+        # s_xnor_saveexec_b64 s[4:5], s[4:5]
+        instr = parse_salu_instruction("s_xnor_saveexec_b64 s[4:5], s[4:5]")
+        saved, new_exec, scc = self.interp.step(instr, state)
+
+        # Saved EXEC should be old EXEC (0x5555555555555555)
+        self.assertEqual(saved, 0x5555555555555555)
+        self.assertEqual(state.get_sgpr64(4), 0x5555555555555555)
+
+        # New EXEC must be computed from original s[4:5] before it was overwritten
+        # ~(0xAAAAAAAAAAAAAAAA ^ 0x5555555555555555) = ~(0xFFFFFFFFFFFFFFFF) = 0
+        self.assertEqual(new_exec, 0)
+        self.assertEqual(state.exec_mask, 0)
+        self.assertEqual(scc, 0)
+
+    def test_src0_equals_exec_special(self) -> None:
+        """Verify self-XNOR behavior when SSRC0 is the EXEC register itself."""
+        state = ScalarMachineState()
+        state.exec_mask = 0x123456789ABCDEF0
+        state.set_sgpr64(2, 0)
+
+        # s_xnor_saveexec_b64 s[2:3], exec
+        instr = parse_salu_instruction("s_xnor_saveexec_b64 s[2:3], exec")
+        saved, new_exec, scc = self.interp.step(instr, state)
+
+        self.assertEqual(saved, 0x123456789ABCDEF0)
+        self.assertEqual(state.get_sgpr64(2), 0x123456789ABCDEF0)
+        # ~(EXEC ^ EXEC) == ~(0) == MASK64
+        self.assertEqual(new_exec, MASK64)
+        self.assertEqual(state.exec_mask, MASK64)
+        self.assertEqual(scc, 1)
+
+    def test_dst_equals_exec(self) -> None:
+        """Verify behavior when destination operand is explicitly the EXEC register."""
+        state = ScalarMachineState()
+        state.exec_mask = 0x0F0F0F0F0F0F0F0F
+        state.set_sgpr64(2, 0x0000000000000000)
+
+        # s_xnor_saveexec_b64 exec, s[2:3]
+        instr = parse_salu_instruction("s_xnor_saveexec_b64 exec, s[2:3]")
+        saved, new_exec, scc = self.interp.step(instr, state)
+
+        self.assertEqual(saved, 0x0F0F0F0F0F0F0F0F)
+        expected_new = (~(0x0000000000000000 ^ 0x0F0F0F0F0F0F0F0F)) & MASK64
+        self.assertEqual(new_exec, expected_new)
+        self.assertEqual(state.exec_mask, expected_new)
+
+    def test_dst_and_src0_both_exec(self) -> None:
+        """Verify execution when both SDST and SSRC0 are the EXEC register."""
+        state = ScalarMachineState()
+        state.exec_mask = 0xDEADBEEFCAFE0000
+
+        instr = parse_salu_instruction("s_xnor_saveexec_b64 exec, exec")
+        saved, new_exec, scc = self.interp.step(instr, state)
+
+        self.assertEqual(saved, 0xDEADBEEFCAFE0000)
+        self.assertEqual(new_exec, MASK64)
+        self.assertEqual(state.exec_mask, MASK64)
+        self.assertEqual(scc, 1)
+
+    def test_adjacent_register_non_interference(self) -> None:
+        """Verify writing a 64-bit pair leaves immediately adjacent SGPRs unchanged."""
+        state = ScalarMachineState()
+        state.set_sgpr64(2, 0x1111111111111111)
+        state.set_sgpr64(4, 0x2222222222222222)
+        state.set_sgpr64(6, 0x3333333333333333)
+        state.exec_mask = 0xAAAAAAAAAAAAAAAA
+
+        instr = parse_salu_instruction("s_xnor_saveexec_b64 s[4:5], s[2:3]")
+        self.interp.step(instr, state)
+
+        # s[2:3] (src0) and s[6:7] (neighbor) must remain completely untouched
+        self.assertEqual(state.get_sgpr64(2), 0x1111111111111111)
+        self.assertEqual(state.get_sgpr64(6), 0x3333333333333333)
+        # s[4:5] should hold old EXEC
+        self.assertEqual(state.get_sgpr64(4), 0xAAAAAAAAAAAAAAAA)
+
+    def test_unrelated_sgprs_preserved(self) -> None:
+        """Verify full SGPR file preservation across instruction execution."""
+        state = ScalarMachineState()
+        for i in range(128):
+            state.sgprs[i] = 0xA000 + i
+
+        state.exec_mask = 0x1234567887654321
+        instr = parse_salu_instruction("s_xnor_saveexec_b64 s[10:11], s[20:21]")
+        self.interp.step(instr, state)
+
+        # Verify only s10 and s11 changed
+        for i in range(128):
+            if i in (10, 11):
+                continue
+            self.assertEqual(state.sgprs[i], 0xA000 + i, f"SGPR s{i} was unexpectedly corrupted")
+
+
 if __name__ == "__main__":
     unittest.main()
