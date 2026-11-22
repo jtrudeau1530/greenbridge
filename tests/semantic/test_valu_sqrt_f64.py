@@ -949,5 +949,84 @@ class TestConditionCodesAndStatusFlags(unittest.TestCase):
         self.assertEqual(borrow, 0)
 
 
+class TestIEEE754BoundaryExtremes(unittest.TestCase):
+    """Unit tests for IEEE 754 boundary extremes, subnormals, and NaN handling."""
+
+    def test_subnormal_sqrt_transition_to_normal(self) -> None:
+        # Smallest positive subnormal: 2^-1074 (bits: 0x1)
+        # sqrt(2^-1074) = 2^-537, which is a normal double!
+        sub_min = 0x0000_0000_0000_0001
+        res = oracle_v_sqrt_f64(sub_min)
+        self.assertFalse(is_subnormal(res))
+        self.assertFalse(is_zero(res))
+        # Exponent of 2^-537 in IEEE 754 (bias 1023): 1023 - 537 = 486
+        sign, exp, frac = split_f64_bits(res)
+        self.assertEqual(sign, 0)
+        self.assertEqual(exp, 486)
+        self.assertEqual(frac, 0)
+
+    def test_largest_subnormal_sqrt(self) -> None:
+        # Largest subnormal: 0x000F_FFFF_FFFF_FFFF = (1 - 2^-52) * 2^-1022
+        max_sub = 0x000F_FFFF_FFFF_FFFF
+        res = oracle_v_sqrt_f64(max_sub)
+        self.assertFalse(is_subnormal(res))
+        # Exponent is 511 (just below 2^-511)
+        sign, exp, _ = split_f64_bits(res)
+        self.assertEqual(sign, 0)
+        self.assertEqual(exp, 511)
+
+    def test_nan_signaling_to_quiet_conversion(self) -> None:
+        snan = 0x7FF0_0000_0000_0005  # fraction non-zero, quiet bit 51 is 0
+        self.assertTrue(is_snan(snan))
+        res = oracle_v_sqrt_f64(snan)
+        self.assertTrue(is_qnan(res))
+        self.assertEqual(res, snan | QNAN_BIT)
+
+    def test_nan_payload_preservation(self) -> None:
+        payload = 0x0008_DEAD_BEEF_CAFE
+        qnan = EXP_MASK | payload
+        res = oracle_v_sqrt_f64(qnan)
+        self.assertEqual(res, qnan)
+
+    def test_nan_with_modifiers(self) -> None:
+        qnan = 0x7FF8_0000_0000_0001
+        # abs clears sign bit
+        res_abs = oracle_v_sqrt_f64(qnan | SIGN_MASK, abs_mod=True)
+        self.assertEqual(res_abs & SIGN_MASK, 0)
+        self.assertTrue(is_qnan(res_abs))
+
+        # neg toggles sign bit
+        res_neg = oracle_v_sqrt_f64(qnan, neg_mod=True)
+        self.assertEqual(res_neg & SIGN_MASK, SIGN_MASK)
+
+    def test_nan_with_clamp(self) -> None:
+        qnan = CANONICAL_QNAN
+        res = oracle_v_sqrt_f64(qnan, clamp=True)
+        self.assertEqual(res, POS_ZERO)
+
+        snan = 0x7FF0_0000_0000_0001
+        res_snan = oracle_v_sqrt_f64(snan, clamp=True)
+        self.assertEqual(res_snan, POS_ZERO)
+
+    def test_infinity_arithmetic_boundaries(self) -> None:
+        self.assertEqual(oracle_v_sqrt_f64(POS_INF), POS_INF)
+        self.assertEqual(oracle_v_sqrt_f64(NEG_INF), CANONICAL_QNAN)
+        self.assertEqual(oracle_v_sqrt_f64(POS_INF, clamp=True), ONE_F64)
+        self.assertEqual(oracle_v_sqrt_f64(NEG_INF, clamp=True), POS_ZERO)
+
+    def test_maximum_finite_f64(self) -> None:
+        max_f64 = 0x7FEF_FFFF_FFFF_FFFF
+        res = oracle_v_sqrt_f64(max_f64)
+        f_res = bits_to_f64(res)
+        self.assertAlmostEqual(f_res, 1.3407807929942597e+154, delta=1e140)
+
+    def test_smallest_normal_f64(self) -> None:
+        # 2^-1022 (0x0010_0000_0000_0000) -> sqrt is 2^-511 (0x2000_0000_0000_0000)
+        min_norm = 0x0010_0000_0000_0000
+        res = oracle_v_sqrt_f64(min_norm)
+        expected = 0x2000_0000_0000_0000
+        self.assertEqual(res, expected)
+
+
 if __name__ == "__main__":
     unittest.main()
