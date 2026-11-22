@@ -13,13 +13,22 @@ others show what does and doesn't work under Wine yet without failing the job.
 """
 import argparse
 import json
+import math
 import os
+import re
 import shlex
 import subprocess
 import sys
 import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def _make_parent(path: str) -> None:
+    """Create the folder a report lives in: the run is over by the time the summary is written."""
+    parent = os.path.dirname(os.path.abspath(path))
+    if parent:
+        os.makedirs(parent, exist_ok=True)
 
 
 def norm(path: str) -> str:
@@ -90,19 +99,43 @@ def run_test(test: dict, args, wine: list[str]) -> tuple[str, str]:
     skip_code = props.get("SKIP_RETURN_CODE")
     if skip_code is not None and code == int(skip_code):
         return "skip", f"exit {code} (skip) in {elapsed:.1f} s\n{out}"
-    passed = (code != 0) if truthy(props.get("WILL_FAIL")) else (code == 0)
-    return ("pass" if passed else "fail"), f"exit {code} in {elapsed:.1f} s\n{out}"
+    detail = f"exit {code} in {elapsed:.1f} s\n{out}"
+    required = props.get("PASS_REGULAR_EXPRESSION", [])
+    forbidden = props.get("FAIL_REGULAR_EXPRESSION", [])
+    # A required match takes the place of the exit code. A forbidden match overrides either kind of success.
+    try:
+        passed = any(re.search(pattern, out, re.DOTALL) for pattern in required) if required else code == 0
+        if any(re.search(pattern, out, re.DOTALL) for pattern in forbidden):
+            passed = False
+    except re.error as e:
+        return "fail", f"invalid output regular expression: {e}\n{detail}"
+    if truthy(props.get("WILL_FAIL")):
+        passed = not passed
+    return ("pass" if passed else "fail"), detail
 
 
 def positive_seconds(text: str) -> float:
-    """--timeout: a value of 0 or less made subprocess.run raise ValueError before the test could be reported."""
+    """--timeout: a finite value greater than 0, so subprocess.run never gets a bad timeout to raise on."""
     try:
         value = float(text)
     except ValueError:
         raise argparse.ArgumentTypeError(f"invalid float value: {text!r}") from None
+    if not math.isfinite(value):
+        raise argparse.ArgumentTypeError("must be a finite number")
     if value <= 0:
         raise argparse.ArgumentTypeError("must be greater than 0")
     return value
+
+
+def wine_command(text: str) -> list[str]:
+    """--wine: split into a command the way a shell would, refusing blank or malformed values up front."""
+    try:
+        parts = shlex.split(text)
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(f"malformed --wine: {e}") from None
+    if not parts:
+        raise argparse.ArgumentTypeError("must be a nonempty command")
+    return parts
 
 
 def read_tests(path: str) -> list[dict] | None:
@@ -124,7 +157,8 @@ def main() -> int:
     ap.add_argument("--tests", required=True, help="ctest --show-only=json-v1 output from the Windows build")
     ap.add_argument("--windows-root", required=True, help="the Windows checkout the tests were listed in")
     ap.add_argument("--root", default=ROOT, help="the Linux checkout (default: this repository)")
-    ap.add_argument("--wine", default=os.environ.get("WINE", "wine"), help="Wine command (default: $WINE or wine)")
+    ap.add_argument("--wine", type=wine_command, default=os.environ.get("WINE", "wine"),
+                    help="Wine command (default: $WINE or wine)")
     ap.add_argument("--require", action="append", default=[], help="a test that must pass (repeatable)")
     ap.add_argument("--timeout", type=positive_seconds, default=120.0, help="seconds per test (default 120)")
     ap.add_argument("--summary", help="append a Markdown table to this file (e.g. $GITHUB_STEP_SUMMARY)")
@@ -134,7 +168,7 @@ def main() -> int:
     tests = read_tests(args.tests)
     if tests is None:
         return 2
-    wine = shlex.split(args.wine)
+    wine = args.wine
     results = {}
     for test in tests:
         name = test.get("name", "?")
@@ -156,13 +190,18 @@ def main() -> int:
         print("required tests that did not pass: " + ", ".join(failed_required))
 
     if args.summary:
-        with open(args.summary, "a", encoding="utf-8") as f:
-            f.write(f"### Windows tests under {args.label or 'Wine'}\n\n")
-            f.write(f"{counts['pass']} passed, {counts['fail']} failed, {counts['skip']} skipped.\n\n")
-            f.write("| Test | Result | Required |\n|---|---|---|\n")
-            for name, status in results.items():
-                f.write(f"| `{name}` | {status} | {'yes' if name in args.require else ''} |\n")
-            f.write("\n")
+        try:
+            _make_parent(args.summary)
+            with open(args.summary, "a", encoding="utf-8") as f:
+                f.write(f"### Windows tests under {args.label or 'Wine'}\n\n")
+                f.write(f"{counts['pass']} passed, {counts['fail']} failed, {counts['skip']} skipped.\n\n")
+                f.write("| Test | Result | Required |\n|---|---|---|\n")
+                for name, status in results.items():
+                    f.write(f"| `{name}` | {status} | {'yes' if name in args.require else ''} |\n")
+                f.write("\n")
+        except OSError as e:
+            print(f"ERROR: cannot write the summary {args.summary}: {e.strerror or e}", file=sys.stderr)
+            return 1
     return 1 if failed_required else 0
 
 

@@ -248,9 +248,15 @@ def is_scanned_input(path, input_path, pattern):
         return True
     if not os.path.isdir(input_path) or not os.path.isfile(path):
         return False
-    root, target = os.path.abspath(input_path), os.path.abspath(path)
-    if os.path.dirname(target) != root and not target.startswith(root + os.sep):
-        return False
+    # Walk up from the report path and compare each folder like same_report_path does (normcase, realpath,
+    # samefile), so a spelling that differs only in case, or goes through a link, is still inside the input.
+    target = os.path.abspath(path)
+    root = os.path.dirname(target)
+    while not same_report_path(root, input_path):
+        parent = os.path.dirname(root)
+        if parent == root:
+            return False
+        root = parent
     pattern = pattern or "*.bin"
     return (fnmatch.fnmatch(os.path.relpath(target, root), pattern)
             or fnmatch.fnmatch(os.path.basename(target), pattern))

@@ -136,17 +136,33 @@ class RunTestTest(unittest.TestCase):
         self.assertEqual(status, "skip")
         self.assertIn("exit 77", detail)
 
-    def test_a_signal_termination_fails_even_under_will_fail_or_skip(self):
-        # A host signal is reported as a failure, not reinterpreted by WILL_FAIL or SKIP_RETURN_CODE.
+    def test_ctest_output_expressions_determine_the_result(self):
+        usage = {"PASS_REGULAR_EXPRESSION": ["alternative", "usage: gta6rt"]}
+        forbidden = {"FAIL_REGULAR_EXPRESSION": ["running ", r"module\(s\) mapped"]}
+        for code, output, props, expected in (
+            (2, "usage: gta6rt", usage | forbidden, "pass"),
+            (0, "unexpected output", usage, "fail"),
+            (2, "usage: gta6rt\n1 module(s) mapped", usage | forbidden, "fail"),
+            (0, "running tiny_game.exe", forbidden, "fail"),
+            (2, "unexpected output", forbidden, "fail"),
+            (77, "unexpected output", usage | {"SKIP_RETURN_CODE": 77}, "skip"),
+            (0, "running tiny_game.exe", forbidden | {"WILL_FAIL": True}, "pass"),
+        ):
+            with self.subTest(code=code, output=output, props=props):
+                exe = self.program("regex.py", f"import sys\nprint({output!r}, file=sys.stderr)\nsys.exit({code})\n")
+                status, detail = self.run_entry(ctest_entry("regex", self.command_for(exe), props))
+                self.assertEqual(status, expected, detail)
+
+    def test_a_signal_termination_fails_even_with_success_overrides(self):
         # The mocked negative returncode keeps the test portable across Windows and POSIX.
         exe = self.exiting(0)
-        fake = mock.Mock(returncode=-11, stdout=b"")
-        entry = ctest_entry("segv", self.command_for(exe),
-                            {"WILL_FAIL": "1", "SKIP_RETURN_CODE": "77"})
-        with mock.patch.object(rwt.subprocess, "run", return_value=fake):
-            status, detail = self.run_entry(entry)
-        self.assertEqual(status, "fail")
-        self.assertIn("signal 11", detail)
+        fake = mock.Mock(returncode=-11, stdout=b"usage: gta6rt")
+        for props in ({"WILL_FAIL": True}, {"PASS_REGULAR_EXPRESSION": ["usage: gta6rt"]}):
+            with self.subTest(props=props), mock.patch.object(rwt.subprocess, "run", return_value=fake):
+                entry = ctest_entry("segv", self.command_for(exe), props | {"SKIP_RETURN_CODE": 77})
+                status, detail = self.run_entry(entry)
+                self.assertEqual(status, "fail")
+                self.assertIn("signal 11", detail)
 
     def test_a_timeout_is_reported_without_hanging(self):
         slow = self.program("slow.py", "import time\ntime.sleep(5)\n")
@@ -240,6 +256,24 @@ class MainTest(unittest.TestCase):
         self.assertIn("| `ok` | pass | yes |", text)
         self.assertIn("| `bad` | fail |  |", text)
 
+    def test_a_summary_in_a_missing_folder_creates_it(self):
+        summary = self.root / "missing" / "sub" / "summary.md"
+        code, _, err = self.run_main([ctest_entry("ok", self.command("ok.py"))],
+                                     "--summary", str(summary), "--label", "Wine 12")
+        self.assertEqual(code, 0)
+        self.assertEqual(err, "")
+        self.assertIn("### Windows tests under Wine 12", summary.read_text(encoding="utf-8"))
+
+    def test_an_unwritable_summary_is_one_error_line(self):
+        blocker = self.root / "blocker"
+        blocker.write_text("not a folder", encoding="utf-8")
+        summary = blocker / "summary.md"       # its parent is a file, not a folder
+        code, _, err = self.run_main([ctest_entry("ok", self.command("ok.py"))], "--summary", str(summary))
+        self.assertEqual(code, 1)
+        self.assertNotIn("Traceback", err)
+        self.assertIn("ERROR: cannot write the summary", err)
+        self.assertEqual(len(err.strip().splitlines()), 1, err)
+
     def test_a_file_that_is_not_json_is_one_error_line(self):
         listing = self.root / "notes.txt"
         listing.write_text("this is not ctest output\n", encoding="utf-8")
@@ -268,11 +302,33 @@ class MainTest(unittest.TestCase):
         return code, out.getvalue(), err.getvalue()
 
     def test_a_bad_timeout_is_refused_by_argparse(self):
-        for text in ("0", "-1", "abc"):
+        for text in ("0", "-1", "abc", "nan", "inf", "-inf"):
             with self.subTest(text=text):
                 with self.assertRaises(argparse.ArgumentTypeError):
                     rwt.positive_seconds(text)
         self.assertEqual(rwt.positive_seconds("0.5"), 0.5)
+
+    def test_a_nonfinite_timeout_is_a_usage_error(self):
+        for text in ("nan", "inf", "-inf"):
+            with self.subTest(text=text):
+                with self.assertRaises(SystemExit) as ctx:
+                    self.run_main([ctest_entry("ok", self.command("ok.py"))], "--timeout", text)
+                self.assertEqual(ctx.exception.code, 2)
+
+    def test_a_blank_wine_is_a_usage_error(self):
+        with self.assertRaises(SystemExit) as ctx:
+            self.run_main([ctest_entry("ok", self.command("ok.py"))], "--wine", "")
+        self.assertEqual(ctx.exception.code, 2)
+
+    def test_an_unclosed_quote_in_wine_is_a_usage_error(self):
+        with self.assertRaises(SystemExit) as ctx:
+            self.run_main([ctest_entry("ok", self.command("ok.py"))], "--wine", "wine 'unclosed")
+        self.assertEqual(ctx.exception.code, 2)
+
+    def test_wine_quoting_is_still_split(self):
+        self.assertEqual(rwt.wine_command("prog 'two words'"), ["prog", "two words"])
+        with self.assertRaises(argparse.ArgumentTypeError):
+            rwt.wine_command("   ")
 
 
 if __name__ == "__main__":

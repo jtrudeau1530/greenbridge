@@ -30,7 +30,11 @@ What they check (`tools/rdna2spirv.py`, pixel shaders plus one compute shader):
   raw MUBUF rules (`cs_smem_bounds`, `cs_smem_stride_align`, `cs_smem_sload_neg`, `cs_buf_tail`).
 - `test_buffer_oob_select.py` runs 33 hand-tabulated MUBUF cases through the translator and the interpreter, loads
   and stores, each with a literal and a run-time V#: the first-byte bound of every OOB_SELECT mode (the RDNA2 rules of
-  docs/buffer_bounds.md, docs/design.md Buffer bounds checking), and that a literal RAW V# with ADD_TID/INDEX_STRIDE is Unsupported.
+  docs/buffer_bounds.md, docs/design.md Buffer bounds checking).
+- `test_buffer_swizzle.py` runs hand-worked MUBUF cases for swizzled V#s (SWIZZLE_ENABLE) and ADD_TID_ENABLE, the
+  RDNA2 ISA's swizzled buffer_offset and its OOB_SELECT 3 rule (docs/design.md Swizzled buffer addressing): the
+  exact addresses loaded and stored for dword, multi-dword and typed accesses, each with a literal and a run-time
+  V#, and the GPU fixture `cs_buf_swizzle` on 64 threads.
 - `test_scalar_mem_smem.py` runs the code `Gen.scalar_load` emits with its own small evaluator (64-bit
   addresses, forward selection constructs) and asserts the SGPR values and the addresses read, including the
   measured SMEM truncation, `s_buffer_load` `NUM_RECORDS` bound and signed `s_load` immediate.
@@ -64,6 +68,9 @@ What they check (`tools/rdna2spirv.py`, pixel shaders plus one compute shader):
   the pixel must survive exactly when Python's comparison of the operands holds, and on a 16-lane wave with
   one lane switched off beforehand, where the lanes left running and an untouched VCC are checked. It also
   runs the GPU test `ps_vcmpx_forms` and re-derives its four words.
+- `test_image_bvh_tri.py` runs `image_bvh64_intersect_ray` on hand-built triangle nodes. It checks the vertex
+  slots of each node type (TRI0–TRI3) and every selector of the barycentric remap byte at +60, against weights
+  written by hand and a plain-Python solve (docs/design.md, Ray tracing row).
 - `test_interp.py` tests the interpreter against the SPIR-V / GLSL.std.450 definitions. The interpreter raises
   `UnsupportedConstruct` for anything it does not model instead of approximating it. It can seed Input variables,
   PushConstant words and a flat physical-address memory map for the tests above.

@@ -78,6 +78,8 @@ def test_reconcile_compatible():
     (0, "ptr64_lo", "incompatible"),  # s0 is a constant dword, not a VA
     (31, "const32", "8 dwords"),  # layout ends at s7
     (4, "ptr64_hi", "paired lo"),  # s4 is sub 0 of the CBV pair
+    (5, "ptr64_lo", "high half"),  # s5 is the high half of the CBV pair
+    (7, "ptr64_lo", "high half"),  # s7 is the high half of the table pair
     (0, "nope", "unknown read kind"),
 ])
 def test_reconcile_contradictions(sgpr, kind, needle):

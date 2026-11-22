@@ -89,6 +89,8 @@ def reconcile(shader_reads, dwords):
                 issues.append(
                     f"s{sgpr} ({kind}) incompatible with param "
                     f"{slot['param']} ({slot['ptype']})")
+            elif kind == "ptr64_lo" and slot["sub"] != 0:
+                issues.append(f"s{sgpr} (ptr64_lo) reads the high half of the address")
             if kind == "ptr64_hi":
                 lo = dwords[sgpr - 1] if sgpr > 0 else None
                 if slot["sub"] != 1 or lo is None or lo["param"] != slot["param"] \

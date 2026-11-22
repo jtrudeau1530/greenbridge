@@ -441,6 +441,36 @@ class PeInspectTest(unittest.TestCase):
             self.assertEqual(pe_inspect.main([bad, "--out", os.path.join(self.dir, "reports2")]), 1)
         self.assertIn("not a PE image", err.getvalue())
 
+    def test_same_output_path_identity(self):
+        a = os.path.join(self.dir, "test.exe")
+        self.assertTrue(pe_inspect.same_output_path(a, a))
+        b = os.path.join(self.dir, "other.exe")
+        self.assertFalse(pe_inspect.same_output_path(a, b))
+
+    def test_cli_refuses_to_overwrite_input_file_with_report(self):
+        out = os.path.join(self.dir, "reports_collision")
+        os.makedirs(out, exist_ok=True)
+        colliding_file = os.path.join(out, "sample.dll.json")
+        with open(colliding_file, "w", encoding="utf-8") as f:
+            f.write("original preserved text")
+
+        err = io.StringIO()
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+            rc = pe_inspect.main([self.image, colliding_file, "--out", out])
+        self.assertEqual(rc, 1)
+        self.assertIn("would overwrite input file", err.getvalue())
+        with open(colliding_file, "r", encoding="utf-8") as f:
+            self.assertEqual(f.read(), "original preserved text")
+
+    def test_cli_refuses_existing_file_as_out_dir(self):
+        file_out = os.path.join(self.dir, "some_file.txt")
+        with open(file_out, "w", encoding="utf-8") as f:
+            f.write("file not dir")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertEqual(pe_inspect.main([self.image, "--out", file_out]), 1)
+        self.assertIn("path is a file, not a directory", err.getvalue())
+
 
 OPT = 0x58   # where build_image puts the optional header
 

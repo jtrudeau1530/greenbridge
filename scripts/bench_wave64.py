@@ -63,13 +63,20 @@ def run(tools, spv, groups, reps, driver, emulate):
     return (float(m.group(1)), float(m.group(2))), h.group(1), dev.group(1) if dev else "?"
 
 
+def positive_int(text):
+    value = int(text)
+    if value <= 0:
+        raise argparse.ArgumentTypeError(f"must be a positive integer, got {text!r}")
+    return value
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--build", default=os.path.join(ROOT, "runtime", "build"))
     ap.add_argument("--llvm-mc", default=os.environ.get("LLVM_MC", "llvm-mc"))
-    ap.add_argument("--groups", type=int, default=65536)
-    ap.add_argument("--reps", type=int, default=30)
-    ap.add_argument("--procs", type=int, default=5)
+    ap.add_argument("--groups", type=positive_int, default=65536)
+    ap.add_argument("--reps", type=positive_int, default=30)
+    ap.add_argument("--procs", type=positive_int, default=5)
     ap.add_argument("--shader", default="cs_bench_mix")
     a = ap.parse_args()
     with tempfile.TemporaryDirectory(prefix="bench-w64-") as work:

@@ -25,6 +25,7 @@ import argparse
 import os
 import random
 import re
+import signal
 import struct
 import subprocess
 import sys
@@ -54,6 +55,17 @@ FORMATS = {
 }
 SIZES = (8, 16, 32, 64)
 DMASKS = (0xf, *range(1, 0xf))
+STDERR_TAIL = 20  # lines of the harness's output a failure prints
+
+# Windows reports a crash as an NTSTATUS exit code (unsigned); the ones a driver crash tends to end with
+NTSTATUS = {
+    0xC0000005: "access violation",
+    0xC000001D: "illegal instruction",
+    0xC0000094: "integer divide by zero",
+    0xC00000FD: "stack overflow",
+    0xC0000374: "heap corruption",
+    0xC0000409: "stack buffer overrun",
+}
 
 
 def assemble(asm: str, name: str, work: str) -> None:
@@ -217,6 +229,20 @@ def compare(fmt_name, texels, width, height, got, dmask=0xf) -> list:
     return problems
 
 
+def exit_status(returncode: int) -> str:
+    """How the harness ended, for a failure line: "exit 1", "killed by SIGSEGV", "exit 0xc0000005 (access violation)"."""
+    if returncode < 0:  # POSIX: subprocess reports a fatal signal as its negative number
+        try:
+            name = signal.Signals(-returncode).name
+        except ValueError:
+            name = f"signal {-returncode}"
+        return f"killed by {name}"
+    status = returncode & 0xFFFFFFFF
+    if status >= 0xC0000000:
+        return f"exit 0x{status:08x}" + (f" ({NTSTATUS[status]})" if status in NTSTATUS else "")
+    return f"exit {returncode}"
+
+
 def run_case(fmt_name, width, height, rng, work, build, keep, show, dmask=0xf) -> bool:
     vk_format, _, _, model = FORMATS[fmt_name]
     asm = pixel_shader(width, height, dmask, model)
@@ -246,8 +272,18 @@ def run_case(fmt_name, width, height, rng, work, build, keep, show, dmask=0xf) -
         print(f"{fmt_name} {width}x{height} dmask:0x{dmask:x}: SKIP ({why})")
         return None
     if r.returncode != 0:
-        reason = (r.stderr or r.stdout).strip().splitlines()[-1:] or ["harness error"]
-        print(f"{fmt_name} {width}x{height} dmask:0x{dmask:x}: FAIL ({reason[0]})")
+        status = exit_status(r.returncode)
+        stream, lines = "stderr", (r.stderr or "").strip().splitlines()
+        if not lines:
+            stream, lines = "stdout", (r.stdout or "").strip().splitlines()
+        reason = f"{HARNESS} {status}" + (f": {lines[-1]}" if lines else ", no output")
+        print(f"{fmt_name} {width}x{height} dmask:0x{dmask:x}: FAIL ({reason})")
+        if len(lines) > 1:
+            shown = lines[-STDERR_TAIL:]
+            print(f"  {HARNESS} {stream}" + (f" (last {len(shown)} of {len(lines)} lines)"
+                                              if len(shown) < len(lines) else "") + ":")
+            for line in shown:
+                print(f"    {line}")
         return False
     got = read_rgba(out_path)
     problems = compare(fmt_name, texels, width, height, got, dmask)

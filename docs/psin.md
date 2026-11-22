@@ -47,7 +47,7 @@ empty. The measured tag counts over the 670 complete `script.rpf` records are:
 |---|---:|---|
 | `LSCH` | 670 | 464-544 bytes; the type schema (structs and members), decoded below |
 | `LENM` | 670 | the schema's enums and their values, decoded below |
-| `LSNS` | 670 | high-entropy body (8,608 bytes in the sampled record), not zlib/LZ4; not decoded |
+| `LSNS` | 670 | block table and 16-byte records; layout decoded below, record contents opaque |
 | `LGID` | 670 | empty (8-byte section) |
 | `LRSC` | 670 | starts with `0DRP` + version 122; resource page directory link |
 | `CHKS` | 670 | file size and a 32-bit checksum |
@@ -204,7 +204,62 @@ signatures are not joaat of a name. No name or hash from the game is committed h
   `LENM` for 59,945 of 60,354 and in another file for 395 more.
 - The region between the 8-byte header and `LSCH` is the instance data these structs describe: a block table
   and its data blocks, read from the root block that `LRSC` names. See *Instance data*.
-- `LSNS` (high-entropy) is not touched.
+- `LSNS` values occur nowhere else in the container (see *`LSNS`*).
+
+## `LSNS`
+
+`LSNS` is a block table followed by the blocks it lists:
+
+| Offset | Size | Field |
+|---|---|---|
+| +0 | 4 | little-endian block count n |
+| +4 | 8 × n | per block: u32 kind, u32 byte count |
+| +4 + 8n | | the n blocks back to back |
+
+The byte counts fill the section exactly, and every block is a whole number of 16-byte records. A section with
+n = 0 is 12 bytes long (tag, size, count) and is followed directly by `LGID`. The kind's high byte is 1 or 2 and
+reads like the word width (4- or 8-byte words), but the 16-byte rule holds for both. The low byte varies.
+
+Measured with `psin_index.py` over every complete container in five carved archives:
+
+| Archive | `LSNS` sections | Empty | 16-byte records | Errors |
+|---|---:|---:|---:|---:|
+| `data.rpf` | 2,083 | 886 | 164,512 | 0 |
+| `script.rpf` | 1,009 | 0 | 56,382 | 0 |
+| `story000_script.rpf` | 2,118 | 0 | 285,674 | 0 |
+| `core_restofworld.rpf` | 5 | 0 | 605 | 0 |
+| `story000_restofworld.rpf` | 2 | 0 | 1,975 | 0 |
+| **Total** | **5,217** | **886** | **509,148** | **0** |
+
+Blocks by kind across these sections: `0x101` 4,200, `0x11c` 2,118, `0x207` 1,235, `0x10f` 26, `0x204` 14,
+`0x113` 7, and 1-2 each of `0x102`, `0x205`, `0x208`, `0x109`, `0x11e` and `0x211`. Section sizes run from 12 to
+36,756 bytes (median 836).
+
+### The records
+
+The record contents are opaque. A wider pass over 16,169 containers that have an `LSNS` block (the archives
+above plus `levels.rpf`, `story000.rpf`, `packs.rpf` and `anim.rpf`; 22,101 blocks, 1,957,739 records) measured:
+
+- **Uniform bytes.** 8.0 bits/byte over the pooled records, and no record byte position favours any value.
+  (The per-section 5.2-8.0 bits/byte in [restofworld.md](restofworld.md) is the small-sample limit of short
+  sections.) Records are not version-4 GUIDs: no fixed version or variant nibble.
+- **No references.** No 32-bit or 64-bit record word occurs anywhere else in its container, `LSCH` included (a
+  300-container sample, 107,594 words). Instance data stores its own hashes directly (member types `0x4a`-`0x4f`).
+- **No name hash.** Against up to 3.3 million harvested identifiers and model names, each as is, lower-cased and
+  upper-cased, the records match none of these functions. Each search was checked against a planted known value.
+  - 32-bit words: joaat, FNV-1, FNV-1a, CRC-32, MurmurHash3-32 and xxHash32 all stay at the level of a salted
+    control (about 1,350 chance hits each; this test used a third of the dictionary, 1.0 million words,
+    against 5.8 million distinct 32-bit words).
+  - 64-bit words: MurmurHash3 x64 (either half; the function behind the 64-bit map keys in
+    [world_names.md](world_names.md)), xxHash64, XXH3-64, FNV-1 and FNV-1a 64 have 0 matches.
+  - Whole records: MD5, XXH3-128, BLAKE2b-128, truncated SHA-1 and SHA-256, and full MurmurHash3 x64 128 have
+    0 matches.
+- **Repeats.** 18,692 of the 22,101 blocks are distinct. Beyond repeated whole blocks, 99,071 records still repeat
+  across different blocks.
+
+Uniform bytes in exact 16-byte units that repeat record by record fit a deterministic 128-bit block cipher. They
+also fit 128-bit hashes of inputs outside the tested dictionary and functions. Which one it is has not been
+established. Per the project rules, no decryption is attempted.
 
 ## Instance data
 
@@ -317,8 +372,8 @@ the CLI.
 
 ## What it does not give
 
-- No plaintext script code, function names or string table. `LSNS` is high-entropy and is not
-  decoded; the measured body does not decompress with zlib (15/-15/31) or raw LZ4.
+- No plaintext script code, function names or string table. `LSNS` has a decoded block layout, but its
+  16-byte records are uniformly random and match no tested name hash (see *`LSNS`*).
 - No station/track names, no model names, no file paths. The archive TOC is still the only source
   for original names.
 - No names. `LSCH` and `LENM` give the schema as 32-bit name hashes only; resolving them needs a name
@@ -360,7 +415,7 @@ only.
 
 - The 64 KiB split is not joined automatically. A caller that has the archive order can join adjacent
   blocks first; the tool then parses the complete container.
-- `LSNS` and `CHKS` payloads are opaque to this tool. `LSCH` and `LENM` are decoded as above, and the instance
+- `LSNS` record contents and the `CHKS` payload are opaque to this tool; only the `LSNS` block layout is read. `LSCH` and `LENM` are decoded as above, and the instance
   data by `tools/psin_data.py`. Struct, member and enum names stay 32-bit hashes, and most of them have no known
   name.
 - No game data, names, hashes or payloads are committed. The carve directories are local.

@@ -105,6 +105,29 @@ class StringHarvestTest(unittest.TestCase):
         self.assertNotIn("cde", found4)
         self.assertIn("ghij", found4)
 
+    def test_harvest_short_standalone_identifiers(self):
+        # The default run pattern needs three bytes, so --min 1/2 must use a shorter matcher to
+        # keep one- and two-letter identifiers that stand alone (and still keep the longer ones).
+        data = b"\x00a\x00\x00ab\x00\x00abc\x00"
+
+        found1 = set()
+        hashdict.harvest(data, found1, minlen=1)
+        self.assertIn("a", found1)
+        self.assertIn("ab", found1)
+        self.assertIn("abc", found1)
+
+        found2 = set()
+        hashdict.harvest(data, found2, minlen=2)
+        self.assertNotIn("a", found2)
+        self.assertIn("ab", found2)
+        self.assertIn("abc", found2)
+
+        found3 = set()
+        hashdict.harvest(data, found3, minlen=3)
+        self.assertNotIn("a", found3)
+        self.assertNotIn("ab", found3)
+        self.assertIn("abc", found3)
+
 
 class LongRunHarvestTest(unittest.TestCase):
     """A printable run longer than hashdict.MAX_NAME_LEN used to be cut at 201 characters, and the next match
@@ -413,6 +436,27 @@ class OutputPathTest(unittest.TestCase):
             self.assertTrue(os.path.isfile(out))
             with open(out, encoding="utf-8") as f:
                 self.assertEqual(json.load(f), {})
+
+    def test_out_naming_an_input_is_refused_and_left_alone(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            carve = os.path.join(tmp, "carve")
+            os.makedirs(os.path.join(carve, "common"))
+            index = os.path.join(carve, "common", "index.json")
+            with open(index, "w", encoding="utf-8") as f:
+                json.dump({"files": []}, f)
+            extra = os.path.join(tmp, "names.txt")
+            with open(extra, "wb") as f:
+                f.write(b"adder\n")
+            for out in (extra, index):
+                with open(out, "rb") as f:
+                    before = f.read()
+                p = subprocess.run([sys.executable, "-I", TOOL, carve, "--extra", extra, "--out", out],
+                                   capture_output=True, text=True)
+                self.assertEqual(p.returncode, 2, p.stderr)
+                self.assertIn("is one of the inputs", p.stderr)
+                self.assertNotIn("Traceback", p.stderr)
+                with open(out, "rb") as f:
+                    self.assertEqual(f.read(), before)
 
 
 if __name__ == "__main__":

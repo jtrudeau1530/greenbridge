@@ -52,8 +52,14 @@ HRESULT XboxPresentation::PresentX(UINT plane_count, const XboxPresentPlaneParam
     std::lock_guard serialise(present_mutex_);
     if (plane_count > 2 || (plane_count && !planes)) return E_INVALIDARG;
     if (pacer_.suspended()) return from_pacer(hr::invalid_state);
-    if (params && params->ImmediateThresholdPercent != 0.0f)
-        log_once(logged_threshold_, "ImmediateThresholdPercent is not implemented: a late frame waits for the next vblank");
+    // A zero, negative or NaN threshold never tears.
+    const float threshold = params ? params->ImmediateThresholdPercent : 0.0f;
+    const bool wants_tear = threshold > 0.0f;
+    if (wants_tear && !presenter_->tear_supported())
+        log_once(logged_threshold_,
+                 "ImmediateThresholdPercent has no effect on this swapchain (tearing disabled by LEONIDA_PRESENT_NO_TEAR, "
+                 "no VK_KHR/EXT_swapchain_maintenance1, or no IMMEDIATE/FIFO_RELAXED mode the surface can switch to): "
+                 "a late frame waits for the next vblank");
 
     // Unpaced (no interval registered): do not hold the queue for vblanks.
     const UINT sync_interval = pacer_.registered() ? 1 : 0;
@@ -110,9 +116,19 @@ HRESULT XboxPresentation::PresentX(UINT plane_count, const XboxPresentPlaneParam
     if (plane_count == 2)
         log_once(logged_planes_, "PresentX with 2 planes: only plane 0 is shown; HDR/GameDVR plane composition is not implemented");
 
-    const HRESULT result = presenter_->present(resource, sync_interval, rect);
+    // How late the frame is, now that everything that can refuse it has: past the vblank it was due at, by what part of
+    // the interval the scan has moved on. The presenter says whether it really queued it as a tear.
+    FramePacer::PresentTiming timing;
+    bool tear = false;
+    if (wants_tear && sync_interval > 0 && presenter_->tear_supported()) {
+        timing = pacer_.present_timing(token);
+        tear = leonida::decide_present_sync(timing.late_us, timing.period_us, threshold) == leonida::PresentSync::immediate;
+    }
+    const HRESULT result = presenter_->present(resource, sync_interval, rect, tear);
     if (FAILED(result)) return pacer_.suspended() ? from_pacer(hr::invalid_state) : result;
-    pacer_.commit_present_token(token, plane_count);
+    pacer_.commit_present_token(token, plane_count,
+                                tear && presenter_->last_present_tore() ? leonida::PresentSync::immediate
+                                                                        : leonida::PresentSync::vblank);
     ++presents_;
     return S_OK;
 }

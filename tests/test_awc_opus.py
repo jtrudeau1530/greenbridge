@@ -431,6 +431,26 @@ class ExportBankTest(unittest.TestCase):
             pages = parse_ogg_pages(f.read())
         self.assertEqual(pages[-1]["granule"], 312 + 2880)
 
+    def test_format_block_per_channel_frame_count_is_used(self):
+        # +0x0C is the per-channel Opus frame count and wins over dividing the +0 count:
+        # 9999 interleaved samples / 2 would be 4999 frames and would not trim the padding.
+        packet = bytes([0x9C])          # CELT 20 ms, code 0, stereo bit: 960 frames per channel
+        opus = bytearray(3 * 2048)
+        for block in range(3):
+            struct.pack_into("<H", opus, block * 2048, len(packet))
+            opus[block * 2048 + 2:block * 2048 + 2 + len(packet)] = packet
+        fmt = bytearray(format_block(9999, 48000, 0x0B, 2))
+        struct.pack_into("<I", fmt, 12, 1920)
+        bank = build_bank([(11, bytes(fmt), bytes(opus))])
+        path = os.path.join(self.tmp.name, "frames.awc")
+        with open(path, "wb") as f:
+            f.write(bank)
+
+        awc.export_bank(path, self.out)
+        with open(os.path.join(self.out, "frames", "0000000B.ogg"), "rb") as f:
+            pages = parse_ogg_pages(f.read())
+        self.assertEqual(pages[-1]["granule"], 312 + 1920)
+
     def test_cli_pre_skip_override(self):
         bank, _, _ = self.make_bank()
         subprocess.run([sys.executable, "-I", awc.__file__, bank, self.out, "--jobs", "1", "--pre-skip", "0"],
@@ -439,6 +459,24 @@ class ExportBankTest(unittest.TestCase):
             pages = parse_ogg_pages(f.read())
         self.assertEqual(struct.unpack_from("<H", pages[0]["body"], 10)[0], 0)
         self.assertEqual(pages[-1]["granule"], 1920)
+
+
+class DuplicateIdTest(unittest.TestCase):
+    """Two streams in one bank can share a 29-bit id; the second used to overwrite the first's file."""
+
+    def test_streams_with_the_same_id_both_export(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "dup.awc")
+            fmt = format_block(2, 48000, 0x00, 1)
+            with open(path, "wb") as f:
+                f.write(build_bank([(0x123, fmt, struct.pack("<hh", 1, 2)),
+                                    (0x123, fmt, struct.pack("<hh", 3, 4))]))
+            counts = awc.export_bank(path, os.path.join(tmp, "out"))
+            od = os.path.join(tmp, "out", "dup")
+            self.assertEqual(counts["pcm"], 2)
+            self.assertEqual(sorted(os.listdir(od)), ["00000123.wav", "00000123~2.wav"])
+            self.assertNotEqual(read_wav(os.path.join(od, "00000123.wav")),
+                                read_wav(os.path.join(od, "00000123~2.wav")))
 
 
 class StreamedMusicTest(unittest.TestCase):

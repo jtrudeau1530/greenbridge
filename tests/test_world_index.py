@@ -9,6 +9,7 @@ import io
 import json
 import os
 import struct
+import sys
 import tempfile
 import unittest
 import zlib
@@ -333,6 +334,39 @@ class WorldIndexTest(unittest.TestCase):
                 self.assertFalse(os.path.exists(missing))
                 self.assertFalse(os.path.exists(summary))
 
+    def test_new_report_paths_that_differ_only_in_case(self):
+        # On a case-insensitive volume (macOS's default APFS, Windows) out/R.json and out/r.json are one file, so
+        # the CSV used to replace the JSON summary; on a case-sensitive one they are two reports.
+        source = os.path.join(self.dir, "resource.bin")
+        with open(source, "wb") as f:
+            f.write(make_resource())
+        folder = os.path.join(self.dir, "out")
+        upper, lower = os.path.join(folder, "R.json"), os.path.join(folder, "r.json")
+        os.makedirs(folder)
+        with open(upper, "wb"):
+            pass
+        insensitive = os.path.exists(lower)
+        os.unlink(upper)
+        if insensitive:
+            self.assert_report_collision([source, "--out", upper, "--csv", lower],
+                                         "--out and --csv must use different paths")
+            self.assertEqual(os.listdir(folder), [])
+            accent = os.path.join(folder, "café.json")             # composed é
+            self.assert_report_collision([source, "--out", accent, "--csv", os.path.join(folder, "CAFÉ.json")],
+                                         "--out and --csv must use different paths")
+        else:
+            self.assertEqual(WI.main([source, "--out", upper, "--csv", lower]), 0)
+            with open(upper, encoding="utf-8") as f:
+                self.assertEqual(json.load(f)["summary"]["resources"], 1)
+
+    @unittest.skipUnless(sys.platform == "darwin", "macOS volume case query")
+    def test_macos_case_query_follows_the_volume(self):
+        missing = os.path.join(self.dir, "new", "deeper", "report.json")
+        probe = os.path.join(self.dir, "Probe")
+        with open(probe, "wb"):
+            pass
+        self.assertEqual(WI._case_insensitive_volume(missing), os.path.exists(probe.lower()))
+
     @unittest.skipUnless(os.name == "nt", "requires Windows verbatim paths")
     def test_windows_verbatim_path_can_name_a_distinct_report(self):
         source = os.path.join(self.dir, "resource.bin")
@@ -504,6 +538,35 @@ class WorldIndexTest(unittest.TestCase):
         self.assertEqual(len(rows), 2)
         self.assertEqual(rows[0]["signature"], "0DRPz")
         self.assertEqual(rows[0]["version"], "122")
+
+    def carve(self, parts, gap=0):
+        """A carve folder as rpf9_carve.py writes it: <offset>.bin per stream plus index.json (off, stored)."""
+        folder = os.path.join(self.dir, "carve")
+        os.makedirs(folder)
+        files, off = [], 0x1000
+        for part in parts:
+            stored = len(zlib.compress(part))
+            with open(os.path.join(folder, f"{off:012x}.bin"), "wb") as f:
+                f.write(part)
+            files.append({"off": off, "stored": stored, "size": len(part)})
+            off = ((off + stored + 15) & ~15) + gap
+        with open(os.path.join(folder, "index.json"), "w", encoding="utf-8") as f:
+            json.dump({"summary": {}, "files": files}, f)
+        return folder
+
+    def test_carve_folder_joins_a_resource_split_over_two_files(self):
+        """scan_rpf appends the next contiguous stream while a 0DRPz resource needs a continuation; a carve
+        folder holds the same streams as files, and index.json says which ones were contiguous."""
+        blob = make_resource()
+        rows, stats = WI.scan_path(self.carve([blob[:0x150], blob[0x150:], make_resource(map_file=False)]))
+        maps = [r for r in rows if r["kind"] == "map"]
+        self.assertEqual([(r["file"], r["size"]) for r in maps], [("000000001000.bin", len(blob))])
+        self.assertEqual(len(rows), 2)
+
+    def test_carve_folder_does_not_join_streams_that_were_not_contiguous(self):
+        blob = make_resource()
+        rows, _ = WI.scan_path(self.carve([blob[:0x150], blob[0x150:]], gap=0x10))
+        self.assertEqual(rows, [])
 
     def test_directory_inflate_cap_does_not_exclude_large_archives(self):
         resource = make_resource()
