@@ -13261,6 +13261,21 @@ def main():
                          "--mesh-compute output address from a uniform block at set 1, binding 0 (metadata: pc_tail), "
                          "for devices whose maxPushConstantsSize is below 144")
     a = ap.parse_args()
+    # A file at --out (or one above it) can never become a folder. Refuse it here, before
+    # --merge publishes an index or os.makedirs raises a traceback. Same check as #1607's
+    # shader_disasm.py and #1632's tex_export.py.
+    if os.path.lexists(a.out) and not os.path.isdir(a.out):
+        ap.error(f"{a.out} is a file, not a folder")
+    # realpath resolves symlink components before '..' is applied, so a symlinked parent
+    # does not make the walk inspect a different tree than os.makedirs will use.
+    ancestor = os.path.dirname(os.path.realpath(a.out))
+    while ancestor and not os.path.exists(ancestor):
+        parent = os.path.dirname(ancestor)
+        if parent == ancestor:  # a root that doesn't exist, e.g. an unmapped Windows drive
+            ap.error(f"cannot create {a.out}: {ancestor} is not a folder")
+        ancestor = parent
+    if ancestor and not os.path.isdir(ancestor):
+        ap.error(f"cannot create {a.out}: {ancestor} is a file, not a folder")
     MAX_SHARED_BYTES = a.max_shared_memory
     global STRUCTURED, WAVE64_EMULATE, WAVE64_GRAPHICS, BARY_FALLBACK, TEXEL_OFFSET_FALLBACK, MESH_COMPUTE, FMA_KHR, F16_HALVES
     global PC_TAIL_UBO
@@ -13300,7 +13315,10 @@ def main():
         si, sn = a.shard
         files = files[si::sn]
         shard = si
-    os.makedirs(a.out, exist_ok=True)
+    try:
+        os.makedirs(a.out, exist_ok=True)
+    except OSError as e:  # a trailing separator on a file, or a symlink changed since the check above
+        ap.error(f"cannot create {a.out}: {e.strerror or e}")
     why, ok, valid = Counter(), 0, 0
     meta = {}
     invalid = set()
