@@ -29,8 +29,8 @@ who builds what, and which D3D12 methods are still open.
 - A new shader-translator rule goes into the contract table in `docs/design.md`, with how it was confirmed: a GPU
   test, a Mesa/LLVM reference, or a count over the corpus.
 - `python -I tests/test_<name>.py` runs one of the unit tests (standard library only; CI runs them all).
-- Runtime tests: `cmake -S runtime -B runtime/build`, `cmake --build runtime/build`, then
-  `ctest --test-dir runtime/build --output-on-failure`. The CPU tests that need no game data are configured
+- Runtime tests: `cmake -S runtime -B runtime/build`, `cmake --build runtime/build --config RelWithDebInfo`, then
+  `ctest --test-dir runtime/build -C RelWithDebInfo --output-on-failure`. The CPU tests that need no game data are configured
   on Windows. Tests that need the retail package read `LEONIDA_GAME_DIR` (and `LEONIDA_MOVIE` for the Bink
   decode test) in place and print `SKIP` when the variable is unset; never copy or commit those files.
 - Viewer streaming tests: `node --test tests/test_viewer_streaming.cjs` (Node.js 22+, no packages,
