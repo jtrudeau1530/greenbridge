@@ -1771,28 +1771,65 @@ def pipelines(work: str, out: str, jobs: "int | None" = None, *, runtime_build: 
         log("pipelines: done")
         return
     base += ["--inflight-file", inflight]
+    # Bound each checker invocation to a range that recovery can split further when concurrent heavy compiles
+    # exceed available memory, without starting the entire corpus again (BUILD-1030).
+    names = pipeline_names(spirv) if checker_supports(exe, "--start", "--count") else []
     crashed: "list[str]" = []
-    code = 0
-    for _ in range(PIPELINE_CRASH_RETRIES + 1):
-        code = run(base + (["--skip-file", skip] if crashed else []), check=False)
-        if code in (0, 1, 2) or interrupted(code):
-            break
-        # The driver took vk_pipeline_check down. Name the module it was compiling and check the rest without it:
-        # what was already compiled comes back from pipeline_cache.bin, saved every 10 minutes.
-        suspects = [n for n in read_names(inflight) if n not in crashed]
-        if len(suspects) > 1:   # several were compiling: keep the ones that also kill it on their own
-            suspects = [n for n in suspects if crashes_alone(exe, spirv, cache, n)]
-        if not suspects:
-            fail(f"vk_pipeline_check exited with {exit_label(code)} while no module could be named as the cause; "
-                 "run the pipelines stage again, and report it if it keeps happening")
-        for n in suspects:
-            log(f"pipelines: {n} took vk_pipeline_check down ({exit_label(code)}); checking the rest without it")
-        crashed += suspects
-        with open(skip, "w", encoding="utf-8", newline="\n") as f:
-            f.write("".join(n + "\n" for n in crashed))
-    else:
+
+    def check_range(start: int = 0, count: "int | None" = None) -> int:
+        selection = ["--start", str(start), "--count", str(count)] if count is not None else []
+        allowed = set(names[start:start + count]) if count is not None else None
+        for _ in range(PIPELINE_CRASH_RETRIES + 1):
+            drop(inflight)   # a crash during setup must not inherit another process's in-flight module names
+            code = run(base + selection + (["--skip-file", skip] if crashed else []), check=False)
+            # Native setup failures also return 1. A finished pass writes/clears this report even when shaders
+            # fail validation; setup failures return before writing it. Do not repeat setup for every batch.
+            if code == 1 and not os.path.isfile(inflight):
+                fail("vk_pipeline_check exited with 1 before writing its work report; check Vulkan initialization "
+                     "and report-file access in the output above")
+            if code in (0, 1, 2) or interrupted(code):
+                return code
+            suspects = list(dict.fromkeys(n for n in read_names(inflight)
+                                          if n not in crashed and (allowed is None or n in allowed)))
+            # Even the last in-flight module can be innocent after other heavy compiles in the batch.
+            if count is not None or len(suspects) > 1:
+                suspects = [n for n in suspects if crashes_alone(exe, spirv, cache, n, inflight)]
+            if not suspects:
+                if count is not None and count > 1:
+                    # All suspects survived in fresh processes: do not blacklist them. Re-check the entire failed
+                    # range in smaller processes; completed earlier batches retain their cache checkpoints.
+                    log(f"pipelines: shaders {start + 1}-{start + count} exited with {exit_label(code)} without "
+                        "a reproducible module crash; retrying this range in smaller batches")
+                    half = count // 2
+                    first = check_range(start, half)
+                    if first == 2 or interrupted(first):
+                        return first
+                    second = check_range(start + half, count - half)
+                    return second or first
+                fail(f"vk_pipeline_check exited with {exit_label(code)} while no module could be named as the cause; "
+                     "the checker could not finish even this range in a fresh process; check available memory "
+                     "and report it if it keeps happening")
+            for n in suspects:
+                log(f"pipelines: {n} took vk_pipeline_check down ({exit_label(code)}); checking the rest without it")
+            crashed.extend(suspects)
+            with open(skip, "w", encoding="utf-8", newline="\n") as f:
+                f.write("".join(n + "\n" for n in crashed))
         fail(f"vk_pipeline_check still crashed after {PIPELINE_CRASH_RETRIES} retries; modules that took it down: "
              + ", ".join(crashed))
+
+    code = 0
+    ranges = [(s, min(PIPELINE_BATCH_SIZE, len(names) - s))
+              for s in range(0, len(names), PIPELINE_BATCH_SIZE)] if names else [(0, None)]
+    for start, count in ranges:
+        if count is not None:
+            log(f"pipelines: checking shaders {start + 1}-{start + count} of {len(names)} in a fresh process")
+        result = check_range(start, count)
+        if result:
+            code = result   # a later successful batch must not erase an earlier validation failure
+        if result == 2 or interrupted(result):
+            break
+    if crashed and not code:
+        code = 1
     drop(inflight)
     if code != 0:
         why = f"; {len(crashed)} module(s) took the driver down and were counted as failed: " + ", ".join(crashed) \
@@ -1804,6 +1841,7 @@ def pipelines(work: str, out: str, jobs: "int | None" = None, *, runtime_build: 
 # How many times the pipelines stage restarts vk_pipeline_check after a module takes it down (each costs at most the
 # 10 minutes since the last cache checkpoint, plus loading the cache).
 PIPELINE_CRASH_RETRIES = 5
+PIPELINE_BATCH_SIZE = 500   # fresh compiler process and cache checkpoint after at most this many index entries
 
 
 def interrupted(code: int) -> bool:
@@ -1839,14 +1877,34 @@ def read_names(path: str) -> "list[str]":
         return []
 
 
-def crashes_alone(exe: str, spirv: str, cache: str, name: str) -> bool:
-    """Whether one module takes vk_pipeline_check down on its own: --start/--count select it in the checker's
-    name-sorted index (byte order, as its std::map)."""
-    with open(os.path.join(spirv, "index.json"), encoding="utf-8") as f:
-        names = sorted(json.load(f), key=lambda n: n.encode("utf-8"))
+def pipeline_names(spirv: str) -> "list[str]":
+    """The checker's name-sorted index (byte order, as its std::map); ranges and diagnostic probes share it."""
+    path = os.path.join(spirv, "index.json")
+    try:
+        with open(path, encoding="utf-8") as f:
+            index = json.load(f)
+    except (OSError, ValueError) as e:
+        fail(f"pipelines: cannot read {path}: {e}")
+    if not isinstance(index, dict):
+        fail(f"pipelines: {path} must contain a JSON object")
+    return sorted(index, key=lambda n: n.encode("utf-8"))
+
+
+def crashes_alone(exe: str, spirv: str, cache: str, name: str, inflight: str | None = None) -> bool:
+    """Whether one module takes vk_pipeline_check down on its own, using its global index position."""
+    names = pipeline_names(spirv)
     if name not in names:
         return False
-    code = run([exe, spirv, cache, "--jobs", "1", "--start", str(names.index(name)), "--count", "1"], check=False)
+    args = [exe, spirv, cache, "--jobs", "1", "--start", str(names.index(name)), "--count", "1"]
+    if inflight:
+        drop(inflight)
+        args += ["--inflight-file", inflight]
+    code = run(args, check=False)
+    if code == 1 and inflight and not os.path.isfile(inflight):
+        fail(f"pipelines: checking {name} alone exited with 1 before writing its work report; "
+             "check Vulkan initialization and report-file access in the output above")
+    if interrupted(code) or code == 2:
+        fail(f"pipelines: checking {name} alone stopped with {exit_label(code)}")
     return code not in (0, 1, 2) and not interrupted(code)
 
 
