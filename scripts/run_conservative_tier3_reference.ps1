@@ -1,5 +1,5 @@
 param(
-    [ValidateNotNullOrEmpty()][string]$Device = "3080"
+    [string]$Device = ""
 )
 $ErrorActionPreference = "Stop"
 
@@ -15,7 +15,11 @@ if ($LASTEXITCODE -ne 0) { throw "Building the Tier 3 reference test failed ($LA
 
 $previousFilter = $env:LEONIDA_VK_DEVICE
 try {
-    $env:LEONIDA_VK_DEVICE = $Device
+    if ([string]::IsNullOrWhiteSpace($Device)) {
+        if (Test-Path Env:LEONIDA_VK_DEVICE) { Remove-Item Env:LEONIDA_VK_DEVICE }
+    } else {
+        $env:LEONIDA_VK_DEVICE = $Device
+    }
     & ctest --test-dir $build -C RelWithDebInfo -R d3d12_conservative_tier3_reference --output-on-failure -V
     if ($LASTEXITCODE -ne 0) { throw "The Tier 3 reference test failed ($LASTEXITCODE)." }
 } finally {

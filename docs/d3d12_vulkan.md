@@ -715,9 +715,11 @@ The compute path, end to end:
     It reports the selected Vulkan device's `fullyCoveredFragmentShaderInputVariable`, matches that device to its
     native D3D12 adapter by LUID, then checks the adapter's Tier 3 `SV_InnerCoverage` output on four synthetic
     triangles. On Windows with Visual Studio 2022 and Windows SDK 10.0.26100 or newer, run
-    `.\scripts\run_conservative_tier3_reference.ps1 -Device 3080` from the repository root. It builds only this
-    test, needs no glslang, and fetches the pinned Vulkan headers only if none are installed. The verbose CTest output
-    reports the capability and result; it skips if the selected device lacks a matching native D3D12 adapter or Tier 3.
+    `.\scripts\run_conservative_tier3_reference.ps1` from the repository root; by default this uses Vulkan's default
+    adapter. Pass `-Device <name substring>` to select a specific one when multiple GPUs are present. It builds only
+    this test, needs no glslang, and fetches the pinned Vulkan headers only if none are installed. The verbose CTest
+    output reports the capability and result; it skips if the selected device lacks a matching native D3D12 adapter
+    or Tier 3.
   - **Formats:** dynamic rendering takes the RTV and DSV formats. A draw that leaves a slot unbound for which the
     PSO names a format (D3D12 allows it and discards those writes) uses a variant of the pipeline with that format
     undefined, built on first use and kept with the PSO. Bit i of the variant key is colour slot i, and bit 8 is
