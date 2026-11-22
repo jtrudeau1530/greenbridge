@@ -3214,10 +3214,8 @@ class Gen:
             self.buffer_load_format(op, a, mods)
         elif op in ("tbuffer_load_format_x", "tbuffer_load_format_xy", "tbuffer_load_format_xyz",
                     "tbuffer_load_format_xyzw"):
-            # Typed load with the format in the instruction (format:[BUF_FMT_...]) instead of the V#.
-            fm = next((m for m in mods if m.startswith("format:")), None)
-            if fm is None:
-                raise Unsupported(op + " without format")
+            # MTBUF encodes its own format. LLVM omits the modifier for GFX10's default, BUF_FMT_8_UNORM.
+            fm = next((m for m in mods if m.startswith("format:")), "format:[BUF_FMT_8_UNORM]")
             name = "GFX10_FORMAT_" + fm.split("BUF_FMT_")[-1].rstrip("]")
             code = next((c for c, n in GFX10_FORMATS.items() if n == name), None)
             if code is None or code not in self.FORMATS:
