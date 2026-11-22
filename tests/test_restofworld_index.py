@@ -327,6 +327,47 @@ class ArchiveTest(unittest.TestCase):
         self.assertEqual(result.returncode, 2, result.stderr)
         self.assertIn("output must not overwrite the source archive", result.stderr)
 
+    def test_cli_rejects_output_aliasing_directory_payload_or_index(self):
+        folder = os.path.join(self.root, "carved_alias")
+        os.makedirs(folder)
+        payload = page()
+        with open(os.path.join(folder, f"{0x1000:012x}.bin"), "wb") as f:
+            f.write(payload)
+        with open(os.path.join(folder, "index.json"), "w", encoding="utf-8") as f:
+            f.write("{}")
+        original = payload
+
+        # Directly overwriting the carved payload.
+        direct = subprocess.run(
+            [sys.executable, "-I", TOOL, folder, os.path.join(folder, f"{0x1000:012x}.bin")],
+            capture_output=True, text=True, encoding="utf-8", errors="replace")
+        self.assertEqual(direct.returncode, 2, direct.stderr)
+        self.assertIn("output must not overwrite the source archive", direct.stderr)
+
+        # A hard link at a JSON path naming the payload.
+        link = os.path.join(self.root, "payload.json")
+        os.link(os.path.join(folder, f"{0x1000:012x}.bin"), link)
+        linked = subprocess.run(
+            [sys.executable, "-I", TOOL, folder, link],
+            capture_output=True, text=True, encoding="utf-8", errors="replace")
+        self.assertEqual(linked.returncode, 2, linked.stderr)
+        self.assertIn("output must not overwrite the source archive", linked.stderr)
+
+        # Overwriting index.json, part of the carve.
+        idx = subprocess.run(
+            [sys.executable, "-I", TOOL, folder, os.path.join(folder, "index.json")],
+            capture_output=True, text=True, encoding="utf-8", errors="replace")
+        self.assertEqual(idx.returncode, 2, idx.stderr)
+        self.assertIn("output must not overwrite the source archive", idx.stderr)
+
+        # None of the inputs changed, and the bytes are preserved.
+        with open(os.path.join(folder, f"{0x1000:012x}.bin"), "rb") as f:
+            self.assertEqual(f.read(), original, "the carved payload was overwritten")
+        with open(os.path.join(folder, "index.json"), encoding="utf-8") as f:
+            self.assertEqual(f.read(), "{}", "the index was overwritten")
+        with open(link, "rb") as f:
+            self.assertEqual(f.read(), original, "the hard link target changed")
+
     def test_cli(self):
         out = os.path.join(self.root, "cli.json")
         proc = subprocess.run([sys.executable, "-I", TOOL, self.rpf, out, "--quiet"],
