@@ -445,3 +445,22 @@ class Wave32LaneDumps(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PixelTestRegistry(unittest.TestCase):
+    def test_pixel_tests_include_every_pixel_fixture(self):
+        # A repeated PIXEL_TESTS assignment silently dropped ps_texoff once; keep the registry explicit.
+        for name in ("ps_texoff", "ps_wqm", "ps_scc_mask32"):
+            with self.subTest(name=name):
+                self.assertIn(name, check.PIXEL_TESTS)
+        self.assertEqual(len(check.PIXEL_TESTS), len(set(check.PIXEL_TESTS)))
+
+    def test_pixel_test_runs_the_harness_once(self):
+        # A duplicated pixels() line ran the whole shader twice and could hide a first-call failure behind a
+        # second-call success.
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "ps_legacy_mul.spv").touch()
+            want = check.PIXEL_BITS["ps_legacy_mul"]
+            with patch.object(check, "pixels", return_value=([want], "")) as pixels:
+                self.assertEqual(check.pixel_test("tools", tmp, "ps_legacy_mul"), "")
+            self.assertEqual(pixels.call_count, 1)

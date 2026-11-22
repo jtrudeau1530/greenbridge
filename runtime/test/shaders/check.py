@@ -156,12 +156,11 @@ PIXEL_BITS = {"ps_legacy_mul": (0, 0, 0, 0x40c00000),
 # tests/semantic/test_value_semantics.py does for the interpreter.
 PIXEL_ENV = {"ps_vcc_x2": {"VKH_SGPRS": "0x1000,0,16,0", "VKH_HEAP": "0x1000=0x11223344,0x1004=0x55667788"}}
 CLIP_TESTS = ("vs_clip", "vs_clip_param4", "vs_clip_undeclared")
-PIXEL_TESTS = sorted((*PIXEL_BITS, "ps_bary", "ps_flat", "ps_bitmask_perm", "ps_texoff", "ps_uniform_branch"))
-PIXEL_TESTS = sorted((*PIXEL_BITS, "ps_bary", "ps_flat", "ps_bitmask_perm", "ps_texoff", "ps_uniform_branch",
-                      "ps_wqm"))
+# One definition: a later assignment used to drop ps_texoff (and any entry added by an earlier assignment) from
+# the standalone run. Keep every pixel fixture in this tuple.
+PIXEL_TESTS = sorted((*PIXEL_BITS, "ps_bary", "ps_flat", "ps_bitmask_perm", "ps_texoff",
+                      "ps_uniform_branch", "ps_wqm", "ps_scc_mask32"))
 TEXOFF_ARGS = ("2", "92", "0", "0", "0")              # ps_texoff: T# pointer in s2, then the shader's literal S#
-PIXEL_TESTS = sorted((*PIXEL_BITS, "ps_bary", "ps_flat", "ps_bitmask_perm", "ps_uniform_branch"))
-PIXEL_TESTS = sorted((*PIXEL_BITS, "ps_bary", "ps_flat", "ps_bitmask_perm", "ps_uniform_branch", "ps_wqm", "ps_scc_mask32"))
 TEXTURE_MIP_TEST = "ps_texture_mip0"
 TEXTURE_MIP_DEPENDENCIES = ("vs_ids", "ps_texture_sample")
 
@@ -511,7 +510,6 @@ def pixel_test(tools, spirv, name):
         return f"missing {name}.spv"
     if name == "ps_texoff":
         return texoff_test(tools, spirv, name)
-    px, out = pixels(tools, spirv, name, "<4f" if name == "ps_bary" else "<2I2f" if name in ("ps_flat", "ps_uniform_branch") else "<4I")
     px, out = pixels(tools, spirv, name, "<4f" if name == "ps_bary" else "<2I2f" if name in ("ps_flat", "ps_uniform_branch", "ps_scc_mask32") else "<4I")
     if isinstance(px, Skip):   # exit 77: the device cannot run this shader (e.g. no barycentrics)
         m = re.search(r"unsupported: .*", out)
