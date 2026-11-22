@@ -7492,7 +7492,28 @@ std::shared_ptr<const leonida::TileHeapAllocation> tile_heap(ID3D12Heap* heap, c
 }
 
 void set_device_outer(ID3D12Device* device, IUnknown* outer) {
-    if (Device* d = Device::from<Device>(device)) d->set_outer(outer);
+    Device* d = Device::from<Device>(device);
+    if (!d) return;
+    // A caller passes what create_device_proxy returned, which is the proxy's DXGI pointer when the title asked
+    // for IDXGIDevice1: the device's outer identity is the proxy itself either way.
+    if (void* proxy = rt::d3d12_xs::device_proxy_primary(outer)) outer = static_cast<IUnknown*>(proxy);
+    d->set_outer(outer);
+    // Second job, for an outer that is the Xbox-ABI proxy: its IDXGIDevice1::GetAdapter (d3d12_xs_device.h) hands
+    // out this layer's adapter, the one create_dxgi_factory enumerates, so a title on the Vulkan device never gets
+    // a host DXGI object from it.
+    if (!rt::d3d12_xs::is_device_proxy(outer)) return;
+    rt::d3d12_xs::set_device_adapter_provider(outer, [](ID3D12Device* real, REFIID riid, void** out) {
+        IDXGIFactory1* factory = nullptr;
+        HRESULT hr = create_dxgi_factory(real, __uuidof(IDXGIFactory1), reinterpret_cast<void**>(&factory));
+        if (FAILED(hr)) return hr;
+        IDXGIAdapter* adapter = nullptr;
+        hr = factory->EnumAdapters(0, &adapter);
+        factory->Release();
+        if (FAILED(hr)) return hr;
+        hr = adapter->QueryInterface(riid, out);
+        adapter->Release();
+        return hr;
+    });
 }
 
 const RootArgumentLayout* root_signature_layout(ID3D12RootSignature* signature) {
