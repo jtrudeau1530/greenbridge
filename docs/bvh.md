@@ -351,6 +351,25 @@ python -I tools/bvh_match.py <dehydrated.bin> <out>/levels/models/manifest.json 
 python -I tests/test_bvh_match.py
 ```
 
+The sample set §4a was measured on can be rebuilt from any copy of the package, and nothing of it enters this
+repository:
+
+1. `tools/bvh_index.py` on `core_bvh4.rpf` lists each `bvh4` stream and its descriptor row; the 3x4 at `+0x50` is
+   the transform the matching needs, and a carved stream is passed to the next tools with `--header-offset 256`
+   (or `0` when the structure was carved from its own header);
+2. export a window of `levels.rpf` that holds that region's drawables (`rpf9dump models`, `--start`/`--length`);
+3. `tools/bvh_match.py` identifies the drawable's geometries against it, and `--write <dir>` stores exactly those
+   geometries as the float3 and uint32 buffers the next step takes, with the transform recorded in `export.json`;
+4. `tools/bvh_rehydrate.py` on the same stream with those buffers and `--transform` gives the runtime layout,
+   byte-identical to what `XboxBvhBuilder.dll` writes on these samples (§4a).
+
+With the two excluded shader hashes the run answers with one consistent candidate per sample; without them every
+candidate is checked and the checks decide. Measured on the window above: 1,228 models in the export, 1 to 374
+candidates from the signature per sample, and a rehydrated structure of `64 * (totalSizeIn64BNodes + 1)` bytes from
+the header. Its root parent-table entry is `0xFFFFFFFF` in all eight identified samples (the entry at
+`offsetToParents` read signed, plus `4 * ((root - offsetToElements) / 64)`), which is what the GPU builder writes
+for a root and what `tools/xdxr_bvh.py validate` requires since #2625.
+
 ## 7a. Building runtime BVHs: `tools/xdxr_bvh.py`
 
 The Vulkan layer has to write acceleration structures in this runtime layout, because the game's traversal shaders

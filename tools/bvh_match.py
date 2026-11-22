@@ -30,7 +30,10 @@ Usage:
     python -I tools/bvh_match.py <dehydrated.bin> <manifest.json> --descriptor <instance208.bin>
                                 [--models DIR] [--header-offset N] [--descriptor-offset N]
                                 [--transform 12 floats] [--skip-shaders HEX,HEX] [--unordered]
-                                [--embeddings N] [--top N] [--names] [--json FILE]
+                                [--embeddings N] [--top N] [--names] [--write DIR] [--json FILE]
+
+--write DIR writes the matched geometries as float3/uint32 buffers plus an export.json, the shape
+tools/bvh_rehydrate.py takes: the transform is recorded in it rather than applied to the vertices.
 """
 import argparse
 import json
@@ -194,6 +197,32 @@ def score(src, candidate, groups, transform, header_offset=0):
     return C.check(src, geometries, header_offset)
 
 
+def write_export(directory, candidate, groups, transform):
+    """Write the matched geometries as float3/uint32 buffers plus the export.json tools/bvh_rehydrate.py is given.
+
+    The vertices are the OBJ's float32 as they are, so the instance transform is recorded rather than applied: pass
+    it to bvh_rehydrate.py with --transform, exactly as the descriptor gave it here.
+    """
+    os.makedirs(directory, exist_ok=True)
+    rows = []
+    for k in candidate["used"]:
+        mesh = candidate["kept"][k]
+        geometry = build_geometry(groups[mesh[0]])
+        vb, ib = "g%d_f3.bin" % len(rows), "g%d_tri.bin" % len(rows)
+        with open(os.path.join(directory, vb), "wb") as f:
+            f.write(geometry.vertices)
+        with open(os.path.join(directory, ib), "wb") as f:
+            f.write(geometry.indices)
+        rows.append({"index": len(rows), "model": candidate["model"], "drawable_geometry": mesh[2],
+                     "vertices": len(geometry.vertices) // 12, "triangles": len(geometry.indices) // 12,
+                     "vertex_format": 6, "index_format": 42, "stride": 12, "vb": vb, "ib": ib,
+                     "instance_transform": False,
+                     "transform": None if transform is None else [v for row in transform for v in row]})
+    with open(os.path.join(directory, "export.json"), "w", encoding="utf-8", newline="\n") as f:
+        json.dump(rows, f, indent=1)
+    return rows
+
+
 def describe(candidate, names):
     item = candidate["item"]
     used = [candidate["kept"][k][2] for k in candidate["used"]]
@@ -217,6 +246,8 @@ def main(argv=None):
     ap.add_argument("--embeddings", type=int, default=64, help="at most this many index choices per model")
     ap.add_argument("--top", type=int, default=8, help="how many scored candidates to print")
     ap.add_argument("--names", action="store_true", help="print drawable names (game data: local use only)")
+    ap.add_argument("--write", metavar="DIR", help="write the matched geometries here as float3/uint32 buffers "
+                                                  "and an export.json for tools/bvh_rehydrate.py")
     ap.add_argument("--json", help="write the report here")
     a = ap.parse_args(argv)
     try:
@@ -276,6 +307,14 @@ def main(argv=None):
     if len(consistent) > 1:
         print("more than one candidate is consistent: the signature and the checks do not decide between them; "
               "the internal box area (the smallest one) is the tie-break")
+    if a.write:
+        if not consistent:
+            print("nothing written: no candidate is consistent")
+        else:
+            match = consistent[0][3]
+            rows = write_export(a.write, match, groups[os.path.join(models_dir, match["item"]["File"])], transform)
+            print("wrote %d geometries to %s%s" % (len(rows), a.write,
+                  "; pass the transform in export.json to bvh_rehydrate.py with --transform" if transform else ""))
     if a.json:
         match = consistent[0][3] if consistent else None
         with open(a.json, "w", encoding="utf-8", newline="\n") as f:
