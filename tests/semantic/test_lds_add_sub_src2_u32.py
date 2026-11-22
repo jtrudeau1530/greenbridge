@@ -33,6 +33,7 @@ MASK32 = 0xFFFFFFFF
 DEFAULT_LDS_DWORDS = 16384  # 64 KiB default capacity in dwords (16384 * 4 bytes)
 DEFAULT_NUM_LANES = 64     # Wave64 default width
 DEFAULT_NUM_VGPRS = 256    # Standard GFX10 vector register file size
+DEFAULT_NUM_SGPRS = 106    # Standard GFX10 scalar register file size
 
 
 def u32(val: int) -> int:
@@ -153,6 +154,72 @@ class DSSrc2Instruction:
         return " ".join(parts)
 
 
+# ==============================================================================
+# Deterministic Scalar Interpreter & Machine State
+# ==============================================================================
+
+class LDSMemory:
+    """Model of Local Data Share memory storage."""
+
+    def __init__(self, size_dwords: int = DEFAULT_LDS_DWORDS) -> None:
+        if size_dwords <= 0 or (size_dwords & (size_dwords - 1)) != 0:
+            raise ValueError(f"LDS size must be a positive power of two: {size_dwords}")
+        self.size_dwords = size_dwords
+        self.data = [0] * size_dwords
+
+    def read_dword(self, index: int) -> int:
+        return self.data[index & (self.size_dwords - 1)]
+
+    def write_dword(self, index: int, val: int) -> None:
+        self.data[index & (self.size_dwords - 1)] = u32(val)
+
+
+class ScalarMachineState:
+    """Scalar architectural machine state for single-lane emulation."""
+
+    def __init__(self, lds_dwords: int = DEFAULT_LDS_DWORDS) -> None:
+        self.vgprs = [0] * DEFAULT_NUM_VGPRS
+        self.sgprs = [0] * DEFAULT_NUM_SGPRS
+        self.lds = LDSMemory(lds_dwords)
+
+    def get_vgpr(self, index: int) -> int:
+        return self.vgprs[index]
+
+    def set_vgpr(self, index: int, val: int) -> None:
+        self.vgprs[index] = u32(val)
+
+    def get_lds(self, dword_idx: int) -> int:
+        return self.lds.read_dword(dword_idx)
+
+    def set_lds(self, dword_idx: int, val: int) -> None:
+        self.lds.write_dword(dword_idx, val)
+
+
+class ScalarInterpreter:
+    """Deterministic scalar instruction interpreter for DS src2 add/sub."""
+
+    def execute(self, instr: DSSrc2Instruction, state: ScalarMachineState) -> None:
+        base_addr = state.get_vgpr(instr.addr.base_reg.index)
+        _, _, idx_a, idx_b = calc_lds_src2_addresses(
+            vaddr=base_addr,
+            offset0=instr.addr.offset0,
+            offset1=instr.addr.offset1,
+            lds_dwords=state.lds.size_dwords,
+        )
+
+        val_a = state.lds.read_dword(idx_a)
+        val_b = state.lds.read_dword(idx_b)
+
+        if instr.opcode == DSOpcode.DS_ADD_SRC2_U32:
+            new_a = ref_ds_add_src2_u32(val_a, val_b)
+        elif instr.opcode == DSOpcode.DS_SUB_SRC2_U32:
+            new_a = ref_ds_sub_src2_u32(val_a, val_b)
+        else:
+            raise NotImplementedError(f"Unsupported opcode: {instr.opcode}")
+
+        state.lds.write_dword(idx_a, new_a)
+
+
 class TestReferenceModelAndOracle(unittest.TestCase):
     """Unit tests for reference mathematical oracle and architectural model."""
 
@@ -249,6 +316,43 @@ class TestSymbolicAST(unittest.TestCase):
         instr1 = DSSrc2Instruction(DSOpcode.DS_ADD_SRC2_U32, addr1)
         instr2 = DSSrc2Instruction(DSOpcode.DS_ADD_SRC2_U32, addr2)
         self.assertEqual(instr1, instr2)
+
+
+class TestScalarInterpreter(unittest.TestCase):
+    """Unit tests for deterministic scalar instruction interpreter."""
+
+    def setUp(self) -> None:
+        self.interp = ScalarInterpreter()
+        self.state = ScalarMachineState(lds_dwords=1024)
+
+    def test_scalar_add_src2_execution(self) -> None:
+        self.state.set_vgpr(0, 0x10)  # dword 4
+        self.state.set_lds(4, 75)
+        self.state.set_lds(5, 25)
+
+        v0 = RegisterOperand(0, RegType.VGPR)
+        instr = DSSrc2Instruction(
+            DSOpcode.DS_ADD_SRC2_U32,
+            LDSAddressExpression(v0, offset0=0, offset1=1),
+        )
+        self.interp.execute(instr, self.state)
+        self.assertEqual(self.state.get_lds(4), 100)
+        self.assertEqual(self.state.get_lds(5), 25)
+        self.assertEqual(self.state.get_vgpr(0), 0x10)
+
+    def test_scalar_sub_src2_execution(self) -> None:
+        self.state.set_vgpr(1, 0x20)  # dword 8
+        self.state.set_lds(8, 20)
+        self.state.set_lds(9, 30)
+
+        v1 = RegisterOperand(1, RegType.VGPR)
+        instr = DSSrc2Instruction(
+            DSOpcode.DS_SUB_SRC2_U32,
+            LDSAddressExpression(v1, offset0=0, offset1=1),
+        )
+        self.interp.execute(instr, self.state)
+        self.assertEqual(self.state.get_lds(8), u32(-10))
+        self.assertEqual(self.state.get_lds(9), 30)
 
 
 if __name__ == "__main__":
