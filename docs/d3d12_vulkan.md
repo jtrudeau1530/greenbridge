@@ -1027,6 +1027,9 @@ The trace will enumerate them.
   operation group the wave intrinsics map to is present (`BASIC`, `VOTE`, `BALLOT`, `SHUFFLE`, `ARITHMETIC`),
   because D3D12 promises them all behind that one bool. `WaveLaneCountMin`/`Max` are the subgroup size range
   (`VkPhysicalDeviceSubgroupSizeControlProperties`, or the single `subgroupSize` without those 1.3 properties).
+  The exception is an Intel integrated GPU (D3D-121): Vulkan reports 8..32 there, Intel's D3D12 driver a fixed
+  16..16, and the layer answers 16..16 like the host. Measured on Xe-LP: UHD 770 (32.0.101.6129) and Raptor Lake-S
+  Mobile (101.7092). Discrete Arc keeps the Vulkan range until it is measured (TEST-57).
   `TotalLaneCount` has no Vulkan equivalent: D3D12 counts every lane of the device, and the layer answers one full
   wave, so a game that sizes work from it plans for less parallelism than the GPU has, never more. Measured
   against the host PC runtime (616.86) on an RTX 5070: `S_OK` with `WaveOps` 1, lanes 32..32 and a total of 6144,
