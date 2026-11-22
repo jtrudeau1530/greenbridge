@@ -114,7 +114,7 @@ def light_resource(archetype=0xA1B2C3D4):
     return r.build()
 
 
-def map_resource():
+def map_resource(scale_xy: float = 2.0, scale_z: float = 3.0) -> bytes:
     """A map resource with one entity that owns a light effect (one light, offset 1 m up)."""
     r = Resource()
     ent_members = [(M["position"], 0x00, 0x32), (M["rotation"], 0x10, 0x34), (M["scaleXY"], 0x20, 0x21),
@@ -127,7 +127,7 @@ def map_resource():
     s = math.sqrt(0.5)
     struct.pack_into("<3f", ent, 0x00, 100.0, 200.0, 10.0)
     struct.pack_into("<4f", ent, 0x10, 0.0, 0.0, s, s)          # stored +90 degrees about Z: the entity turns -90
-    struct.pack_into("<2f", ent, 0x20, 2.0, 3.0)
+    struct.pack_into("<2f", ent, 0x20, scale_xy, scale_z)
     struct.pack_into("<I", ent, 0x28, 0xCAFEF00D)
     struct.pack_into("<QHH", ent, 0x30, pool(3), 1, 1)
     eff = bytearray(EXT_SIZE)
@@ -396,6 +396,26 @@ class ScanTest(unittest.TestCase):
         self.assertEqual(summary["placement"]["archetype_lights_placed"], 4)
         xs = sorted(r["position"][0] for r in rows if r["owner"] == "archetype")
         self.assertEqual(xs, [0.0, 0.0, 50.0, 50.0])
+
+    def test_light_export_preserves_zero_entity_scale(self) -> None:
+        write_rpf(self.rpf, [light_resource(), map_resource(scale_xy=0.0, scale_z=0.0)])
+        lights = os.path.join(self.tmp.name, "zero-scale.jsonl")
+        with open(self.entities, "w", encoding="utf-8", newline="\n") as f:
+            for x, scales in ((10, {"scale_xy": 0.0, "scale_z": 0.0}), (20, {})):
+                f.write(json.dumps({"archetype": "a1b2c3d4", "position": [x, 0, 0],
+                                    "rotation": [0, 0, 0, 1], **scales}) + "\n")
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(T.main([self.rpf, "--entities", self.entities, "--lights-out", lights]), 0)
+        with open(lights, encoding="utf-8") as f:
+            rows = [json.loads(line) for line in f]
+
+        self.assertEqual([row["owner"] for row in rows], ["entity", "archetype", "archetype",
+                                                         "archetype", "archetype"])
+        for row, position in zip(rows, ([100.0, 200.0, 10.0], [10.0, 0.0, 0.0], [10.0, 0.0, 0.0],
+                                        [20.0, 0.5, 2.5], [20.0, 0.0, 1.0])):
+            with self.subTest(owner=row["owner"], expected=position):
+                self.assertEqual(row["position"], position)
 
     def test_bad_input_is_one_line(self):
         err = io.StringIO()
