@@ -18,7 +18,7 @@ ASM_DIR = os.path.join(ROOT, "runtime", "test", "shaders")
 FIXTURE_DIR = os.path.join(HERE, "fixtures", "disasm")
 SHADERS = ("ps_sdwa", "ps_ops", "ps_ops2", "ps_ops3", "ps_ops4", "ps_ops5", "ps_ops6", "ps_ops7", "ps_ops8",
            "ps_legacy_mul", "ps_vcc_x2", "ps_flat", "cs_bounds", "cs_fmt_1010102", "cs_w64x_readlane",
-           "cs_w64x_writelane", "cs_w64x_bpermute", "cs_w64x_ballot", "cs_w64x_readfirstlane",
+           "cs_w64x_writelane", "cs_w64x_bpermute", "cs_w32_permute", "cs_w64x_permute", "cs_w64x_ballot", "cs_w64x_readfirstlane",
            "cs_w64x_load_ballot_load", "cs_w64x_partial", "cs_wave64_ballot", "cs_wm_bfm64", "cs_wm_half_cmp",
            "cs_wavemask", "cs_cvt_f32_sat", "ps_scc_minmax", "ps_fma_literal", "ps_f16_vop2",
            "ps_f32_mods", "ps_f64_mods")

@@ -75,15 +75,17 @@ COMPUTE = [("cs_lds", "4", "mirror64"), ("cs_exec64", "1", "exec64"), ("cs_bvh",
            ("cs_workgroup_yz", "2x3x4", "workgroup_yz")]
 CS_STORE = [0x400080ff, 0xe00003ff, 0x3c004000, 0xeeeeeeee, 0x40003c00, 0xbc003800]
 CS_SMEM = [0x5eed0024, 0x5eed0028, 0x5eed002c, 0x5eed0030, 0x5eed0010, 0x5eed0014, 0x5eed0018, 0x5eed001c]
-WAVE32_DUMPS = ("cs_store", "cs_smem_soffset_imm", "cs_wqm_w32", "cs_w32_lane_wrap", "cs_movrelsd_2")
+WAVE32_DUMPS = ("cs_store", "cs_smem_soffset_imm", "cs_wqm_w32", "cs_w32_lane_wrap", "cs_movrelsd_2", "cs_w32_permute")
 # Wave32 lane-mask dumps: their EXEC/VCC masks and lane selects cover 32 lanes, so a device whose widest subgroup is
 # narrower (Mesa llvmpipe: 8) can't produce their words. They are skipped there, as ps_bitmask_perm is.
-WAVE32_LANE_DUMPS = ("cs_wqm_w32", "cs_w32_lane_wrap")
+WAVE32_LANE_DUMPS = ("cs_wqm_w32", "cs_w32_lane_wrap", "cs_w32_permute")
 CS_DUMPS = [("cs_store", CS_STORE), ("cs_smem_soffset_imm", CS_SMEM),
             # SHADER-52: wave32 lane select is & 31; lane 40 wraps to 8
             ("cs_w32_lane_wrap", [25, 16, 777, 777]),
             # v_movrelsd_2_b32: VGPR[D + M0[25:16]] = VGPR[S0 + M0[9:0]]
             ("cs_movrelsd_2", [11, 33, 33, 55, 1717, 77, 1515, 1717]),
+            # SHADER-90: ds_permute_b32, the forward (scatter) permute; unwritten lane 0, EXEC gates the destination
+            ("cs_w32_permute", [218, 29, 8, 211, 0, 15, 99, 15]),
             ("cs_wave64_ballot", [32, 16, 24, 40, 8, 48]),
             ("cs_wm_half_ops", [32, 16, 16, 0, 16]), ("cs_wm_half_cmp", [1, 0, 1, 1]),
             ("cs_wm_bfm64", [16, 8, 8, 40]), ("cs_wm_scc_rfl", [55, 48]),
@@ -116,6 +118,8 @@ W64X_DUMPS = [("cs_w64x_readlane", [121, 121, 16, 97, 16, 100, 100, 121]),
               ("cs_w64x_writelane", [4660, 77, 99, 2748, 0, 0, 4660, 99]),
               ("cs_w64x_readfirstlane", [140, 140, 163, 132, 100, 105, 133, 48]),
               ("cs_w64x_bpermute", [36, 316, 253, 218, 435, 225, 0, 442]),
+              # SHADER-90: ds_permute_b32 on each wave32 half; unwritten lane 0, EXEC gates the destination
+              ("cs_w64x_permute", [218, 442, 435, 239, 0, 99, 239, 232]),
               ("cs_w64x_branch", [0, 0, 0, 0, 5, 5, 9, 9]),
               ("cs_w64x_mask_reuse", [8, 40, 8, 40, 2, 20, 10, 64]),
               ("cs_w64x_mask_reuse2", [10, 20, 8, 8, 5, 2, 132, 131]),

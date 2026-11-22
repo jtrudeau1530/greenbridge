@@ -81,6 +81,7 @@ class Gen:
         self.interpolated = set()   # inputs read through v_interp_p1/p2; the rest are flat (v_interp_mov only)
         self.uses_psb = False
         self.uses_active = False
+        self.uses_perm = False     # emulate: ds_permute_b32 parks its winning source lane in %x_perm
         self.uses_tex = False
         self.uses_subgroup = False
         self.uses_tex_array = False
@@ -1707,6 +1708,84 @@ class Gen:
         read = self.x_round(data=v)[0]
         self.emit(f"{r} = OpCopyObject %uint {read(src)}")
 
+    def ds_permute(self, a, mods):
+        """ds_permute_b32 vD, vAddr, vData offset:N, the forward (scatter) permute: every source lane that is on in
+        EXEC sends vData to lane ((vAddr + offset) / 4) mod 32 of its own half (as ds_bpermute_b32, RDNA ISA
+        10.4.4: a wave64 runs it as two wave32s); a destination lane nobody sends to gets 0; EXEC gates only the
+        destination write. Several sources to one lane: the highest-numbered source wins (ISA: "the final value is
+        not predictable but will be the value from one of the writers"). Vulkan has no subgroup scatter, so each
+        destination lane scans the 32 source lanes of its half in order and keeps the last one that targets it.
+        Each source lane publishes its target plus one (0 = off in EXEC, so a lane that doesn't exist in a partial
+        wave reads as "no target" as well)."""
+        d, ad, dat = a[0], self.src_u(a[1]), self.src_u(a[2])
+        off = self.mod_int(mods, "offset", 0)
+        s1, sh, dl, dp, tp = (self.tmp() for _ in range(5))
+        self.emit(f"{s1} = OpIAdd %uint {ad} {self.cu(off)}")
+        self.emit(f"{sh} = OpShiftRightLogical %uint {s1} {self.cu(2)}")
+        self.emit(f"{dl} = OpBitwiseAnd %uint {sh} {self.cu(31)}")
+        self.emit(f"{dp} = OpIAdd %uint {dl} {self.cu(1)}")
+        self.emit(f"{tp} = OpSelect %uint {self.active_b()} {dp} {self.cu(0)}")
+        if self.emulate:
+            # Round 1 publishes the targets; the next segment finds each lane's winning source and parks it in
+            # %x_perm; round 2 publishes the data; the segment after that reads the winner's data.
+            self.uses_perm = True
+            read = self.x_round(data=tp)[0]
+            lane, rl, mine, half, win = (self.tmp() for _ in range(5))
+            self.emit(f"{lane} = OpCopyObject %uint {self.wave_lane()}")
+            self.emit(f"{rl} = OpBitwiseAnd %uint {lane} {self.cu(31)}")
+            self.emit(f"{mine} = OpIAdd %uint {rl} {self.cu(1)}")
+            self.emit(f"{half} = OpBitwiseAnd %uint {lane} {self.cu(32)}")
+            acc = self.cu(32)
+            for j in range(32):
+                src, v, hit, nxt = (self.tmp() for _ in range(4))
+                self.emit(f"{src} = OpBitwiseOr %uint {half} {self.cu(j)}")
+                self.emit(f"{v} = OpCopyObject %uint {read(src)}")
+                self.emit(f"{hit} = OpIEqual %bool {v} {mine}")
+                self.emit(f"{nxt} = OpSelect %uint {hit} {self.cu(j)} {acc}")
+                acc = nxt
+            self.emit(f"OpStore %x_perm {acc}")
+            dat2 = self.src_u(a[2])
+            read2 = self.x_round(data=dat2)[0]
+            w, ok, half2, src, got, r, lane2 = (self.tmp() for _ in range(7))
+            self.emit(f"{w} = OpLoad %uint %x_perm")
+            self.emit(f"{ok} = OpULessThan %bool {w} {self.cu(32)}")
+            self.emit(f"{lane2} = OpCopyObject %uint {self.wave_lane()}")
+            self.emit(f"{half2} = OpBitwiseAnd %uint {lane2} {self.cu(32)}")
+            wc = self.tmp()
+            self.emit(f"{wc} = OpBitwiseAnd %uint {w} {self.cu(31)}")
+            self.emit(f"{src} = OpBitwiseOr %uint {half2} {wc}")
+            self.emit(f"{got} = OpCopyObject %uint {read2(src)}")
+            self.emit(f"{r} = OpSelect %uint {ok} {got} {self.cu(0)}")
+            self.dst(d, r)
+            return
+        self.uses_subgroup = self.uses_ballot = True
+        lane, rl, mine, half = (self.tmp() for _ in range(4))
+        self.emit(f"{lane} = OpCopyObject %uint {self.wave_lane()}")
+        self.emit(f"{rl} = OpBitwiseAnd %uint {lane} {self.cu(31)}")
+        self.emit(f"{mine} = OpIAdd %uint {rl} {self.cu(1)}")
+        if self.wave64:
+            sgl = self.tmp()
+            self.emit(f"{sgl} = OpLoad %uint %sg_lane")
+            self.emit(f"{half} = OpBitwiseAnd %uint {sgl} {self.cu(32)}")
+        bal = self.tmp()
+        self.emit(f"{bal} = OpGroupNonUniformBallot %v4uint_bal %c3 %true")
+        acc = self.cu(0)
+        for j in range(32):
+            src = self.cu(j)
+            if self.wave64:
+                src = self.tmp()
+                self.emit(f"{src} = OpBitwiseOr %uint {half} {self.cu(j)}")
+            ex, shv, v, shd, hit, nxt = (self.tmp() for _ in range(6))
+            # a shuffle from a lane that isn't running (the missing lanes of a partial wave) is undefined
+            self.emit(f"{ex} = OpGroupNonUniformBallotBitExtract %bool %c3 {bal} {src}")
+            self.emit(f"{shv} = OpGroupNonUniformShuffle %uint %c3 {tp} {src}")
+            self.emit(f"{v} = OpSelect %uint {ex} {shv} {self.cu(0)}")
+            self.emit(f"{shd} = OpGroupNonUniformShuffle %uint %c3 {dat} {src}")
+            self.emit(f"{hit} = OpIEqual %bool {v} {mine}")
+            self.emit(f"{nxt} = OpSelect %uint {hit} {shd} {acc}")
+            acc = nxt
+        self.dst(d, acc)
+
     def sub_lane(self, r):
         """r = the lane the subgroup shuffles above index: the subgroup lane, or the wave lane when emulated."""
         if self.emulate:
@@ -2736,6 +2815,8 @@ class Gen:
                 self.emit(f"{r} = OpGroupNonUniformShuffle %uint %c3 {dat} {ln2}")
                 self.uses_subgroup = True
             self.dst(d, r)
+        elif op == "ds_permute_b32":
+            self.ds_permute(a, mods)
         elif op.startswith("ds_") and self.stage == "gs":
             self.gs_ds(op, a, mods)
         elif op.startswith("ds_"):
@@ -5975,6 +6056,8 @@ def assemble(gen):
                "%x_bar = OpVariable %_ptr_Function_bool Function %false",
                "%x_chain = OpVariable %_ptr_Function_bool Function %false"]
         fn += [f"{var} = OpVariable {ptr} Function" for var, ptr in gen.x_spills]
+        if gen.uses_perm:
+            fn.append("%x_perm = OpVariable %_ptr_Function_uint Function %c0")
     # User data: s0..s31 are loaded at entry from a push-constant block (the driver's user-SGPR setup).
     if gen.uses_heap:
         gen.consts.setdefault(1, "%c1")
@@ -6619,7 +6702,7 @@ def translate(path):
         # LDS: the declared group-shared size, grown to cover every constant offset the code uses.
         need = (psv.get("shared", 0) + 3) // 4
         for ins in insns:
-            if not ins["op"].startswith("ds_") or ins["op"].startswith(("ds_swizzle", "ds_bpermute")):
+            if not ins["op"].startswith("ds_") or ins["op"].startswith(("ds_swizzle", "ds_bpermute", "ds_permute")):
                 continue
             for m in ins["mods"]:
                 k, _, v = m.partition(":")
@@ -6657,7 +6740,7 @@ def translate(path):
         # constant offsets, so the array also covers the largest offset in the code).
         need = ((rsrc2 >> 15) & 0x1FF) * 128
         for ins in insns:
-            if not ins["op"].startswith("ds_") or ins["op"].startswith(("ds_swizzle", "ds_bpermute")):
+            if not ins["op"].startswith("ds_") or ins["op"].startswith(("ds_swizzle", "ds_bpermute", "ds_permute")):
                 continue
             for m in ins["mods"]:
                 k, _, v = m.partition(":")
