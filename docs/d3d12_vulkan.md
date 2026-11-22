@@ -1221,8 +1221,22 @@ The game can use D3D12 descriptors in three ways, and the layer must handle all 
 2. **Direct heap indexing.** The root signature has `D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED`
    and/or `..._SAMPLER_HEAP_DIRECTLY_INDEXED`, and the shader indexes `ResourceDescriptorHeap` /
    `SamplerDescriptorHeap` directly. The console driver supplies the bound heap base and stride; the shader loads
-   the descriptor at `base + index * stride`. **Open:** where the heap base/stride arrive (user or system SGPRs; if
-   system, the translator needs a new runtime-supplied constant).
+   the descriptor at `base + index * stride`. **Measured (D3D-329): each heap base arrives as a 32-bit pointer in
+   an input SGPR the shader reads directly, inside the user data for compute; no stride arrives at all.**
+   `tools/heap_index_census.py` over the 1.0.2.1 corpus (26,503 listings; 1,473 with embedded data words skipped)
+   follows every descriptor-width `s_load_dwordx4/x8/x16` back to the SGPRs it starts from. Of 770,412 such loads,
+   769,366 (99.86%) start from an entry SGPR used as a 32-bit pointer (high word a constant 0), 0 from a pointer
+   loaded from memory, and 1,041 could not be followed (0.14%, all but 63 in heap-indexing shaders). That holds for
+   the 18,066 shaders whose `SFI0` sets either heap-indexing bit as much as for the 6,964 that set neither. The
+   heap-indexing shaders add a base read with a run-time offset (the heap index): for example `s10` in CS, `s23` in
+   MS and `s15` in PS for the resource heap, and a separate base for the sampler heap (`s11` in CS, `s24` in MS,
+   `s16` in PS). For compute this is settled: every base lies below the shader's `COMPUTE_PGM_RSRC2` `USER_SGPR`
+   count, so it is user data. For VS, PS, MS and GS no user-SGPR count is measured; every base lies below `s32` and
+   none is the NGG `s3`, so they are user data under the translator's 32-SGPR assumption, and the user count of the
+   graphics stages (question 3 in the table below) is what would confirm it. Which SGPR holds which heap varies
+   with the stage and the root signature, so placing the bases belongs to the root-signature mapping, not to a new
+   translator input. No stride is read at run time: static offsets of T# loads are multiples of 32 and of S# loads
+   multiples of 16, so the stride is compiled into the code.
 3. **Game-built descriptor memory.** The game writes raw T#/S# bytes into a heap itself, without calling
    `CreateShaderResourceView`. The shaders then read those bytes exactly as in case 1.
 
@@ -1458,10 +1472,12 @@ Things that can invalidate this simple model, all **Open**:
   no representation for that. The likely answer is that this game keeps its root signatures small (bindless
   descriptors, a few constants), but it must be measured. If a large root signature appears, the spill layout has
   to be reverse-engineered from the shader's loads.
-- **Direct heap indexing.** The bound heap base and stride are not root parameters. They come from a
-  driver-managed slot, possibly a system SGPR rather than user data. The layer needs to know which register the
-  shader reads for them; if it is a system SGPR, the translator must expose it as a runtime-supplied value. The
-  root signature flag tells us direct indexing is enabled; the shader's address arithmetic identifies the base.
+- **Direct heap indexing.** The bound heap base and stride are not root parameters. Measured (D3D-329, section
+  3.4): each heap's base reaches the shader as a 32-bit pointer in an entry SGPR, inside the user data for compute
+  (and below `s32` for the graphics stages, whose user count is not measured yet), and the stride is compiled into
+  the shader's offsets. So the translator needs no new runtime value; the layer has to write the bound heap bases
+  into the user-data slots the root-signature mapping assigns them. The root signature
+  flag tells us direct indexing is enabled; the shader's address arithmetic identifies the base.
 - **Static samplers.** D3D12 static samplers do not consume root parameters. The console driver may place their
   S# values in a fixed table. The layer registers every static sampler's S# in the hash table, so a shader that
   loads it by value works; a shader that expects a driver table needs that table's location (**Open**).
