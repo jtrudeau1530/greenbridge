@@ -510,17 +510,20 @@ def main() -> int:
 
 
 def run_suite(a, work: str) -> int:
+    asm_files = sorted({f for f in os.listdir(SHADER_DIR) if f.endswith(".asm")} | {n + ".asm" for n in CLIP_CASES})
+    if a.filter:
+        asm_files = [f for f in asm_files if a.filter in f]
+        if not asm_files:
+            print(f"error: --filter {a.filter!r} matched no GPU test cases", file=sys.stderr)
+            return 2
+    build_files = with_draw_shaders(asm_files)
+
     fssm_dir = os.path.join(work, "fssm")
     disasm_dir = os.path.join(work, "disasm")
     spirv_dir = os.path.join(work, "spirv")
     raw_dir = os.path.join(work, "raw")
     for d in (fssm_dir, disasm_dir, spirv_dir, raw_dir):
         os.makedirs(d, exist_ok=True)
-
-    asm_files = sorted({f for f in os.listdir(SHADER_DIR) if f.endswith(".asm")} | {n + ".asm" for n in CLIP_CASES})
-    if a.filter:
-        asm_files = [f for f in asm_files if a.filter in f]
-    build_files = with_draw_shaders(asm_files)
 
     # 1. Create synthetic DXBC / FSSM metadata + assemble .asm -> .s
     for fname in build_files:
