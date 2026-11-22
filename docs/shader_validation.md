@@ -212,6 +212,35 @@ First results on an RX 6700 XT (RADV, Mesa 26.3.1), native wave64/wave32 and wit
 - **Not covered.** The translator rejects `ds_permute_b32` and the 8-bit d16 reads
   (`ds_read_u8_d16[_hi]`, `ds_read_i8_d16[_hi]`), so the fuzzer leaves them out.
 
+### 16-bit, memory and cross-lane ops on the GPU (`tools/valu_fuzz.py`, FUZZ-2, FUZZ-5, FUZZ-7)
+
+`tools/valu_fuzz.py --family f16|mem|wave` uses the same runner shape as `lds_fuzz.py`. It generates seeded
+64-thread compute programs, translates them, runs them with `vk_compute_test`'s `VKC_DUMP`, and compares every
+thread's 16 result VGPRs (plus the scratch memory for `mem`) bit for bit with a model of the instructions written in
+the same file. The model doesn't import the translator. `tests/test_valu_fuzz.py` checks the models on the CPU:
+the f16/f32 rounding against Python's IEEE packers, signed zeros, the partial-write rules, mbcnt/readfirstlane/
+permlane semantics, and out-of-range buffer accesses. If llvm-mc is present, it also checks that every family's
+programs assemble for gfx1013.
+
+- **`f16`**: f16 add/sub/mul/min/max/fma/fmac/med3, `v_cvt_f16_f32`/`v_cvt_f32_f16`/`v_cvt_pkrtz_f16_f32`,
+  `v_pk_*` (f16 and shifts) with `op_sel`/`op_sel_hi`, 16-bit integer ops and `v_pack_b32_f16`. It only uses
+  encodings `llvm-mc -mcpu=gfx1013` accepts: on GFX10 the VOP3 forms of the f16 VOP2 ops take no `op_sel`, and the
+  16-bit integer ops exist only as `op_sel` VOP3. Which form keeps the other half follows the 16-bit row of
+  `docs/design.md`. Results whose exact value is NaN, infinite or denormal, denormal inputs, and min/max of +0
+  against -0 are marked uncertain and not compared.
+- **`wave`**: `v_readlane`/`v_writelane`/`v_readfirstlane`, `v_mbcnt_lo/hi`, `v_cmp` into SGPR masks (inactive lanes
+  write 0) consumed by `s_bcnt1`/`s_ff1`/`v_cndmask`, `v_permlane16`/`x16`, and VALU writes under random EXEC. Also
+  `maskdata`: a lane mask used as an integer, which is SHADER-21 / #210. wave32 runs natively; wave64 needs a
+  64-wide subgroup or `--emulate`.
+- **`mem`**: raw (`offen` + `soffset` + offset) and structured (`idxen`) `buffer_load/store_dword` to `dwordx4`
+  through V#s built in SGPRs, with a random `num_records` so some threads are out of range (loads read 0, stores
+  are dropped). Each thread uses only its own 64-byte slot. Accesses are wholly in or out of range, because
+  multi-dword accesses straddling `num_records` are the known gap in "Buffer bounds checking". Byte/short buffer
+  loads and scalar loads aren't generated: the translator rejects the former, and SHADER-41 covers the latter.
+
+`--skip-op OP` (an op name, or a `wave` kind) sets a known finding aside without changing the rest of the program.
+`--show SEED:INDEX:WAVE` prints a program and its model.
+
 ## Coverage plan and cost
 
 Start with straight-line scalar/vector ALU because it is deterministic, needs no descriptors and
