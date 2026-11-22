@@ -41,6 +41,26 @@ def harness() -> str | None:
     return None
 
 
+class MeshOutputTests(unittest.TestCase):
+    def test_fit_keeps_relative_depth_for_an_offset_mesh(self) -> None:
+        import tempfile
+
+        vertices = [(-2.0, -1.0, 900.0, 0.0, 0.0),
+                    (2.0, -1.0, 901.0, 1.0, 0.0),
+                    (0.0, 1.0, 902.0, 0.5, 1.0)]
+        fitted = fl.fit(vertices, 128, 128, True, False)
+        with tempfile.TemporaryDirectory() as directory:
+            mesh = os.path.join(directory, "mesh.bin")
+            fl.write_mesh(mesh, fitted, [0, 1, 2])
+            with open(mesh, "rb") as handle:
+                encoded = handle.read()
+
+        records = encoded[fl.MESH_HEADER.size:fl.MESH_HEADER.size + 3 * 20]
+        depth = b"".join(records[offset + 8:offset + 12] for offset in (0, 20, 40))
+        self.assertEqual(depth, struct.pack("<3f", 0.05, 0.5, 0.95))
+        self.assertEqual(encoded[-12:], struct.pack("<3I", 0, 1, 2))
+
+
 class FirstLightTests(unittest.TestCase):
     def setUp(self):
         self.out = os.environ.get("LEONIDA_FIRST_LIGHT_DIR")

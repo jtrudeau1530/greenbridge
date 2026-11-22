@@ -175,7 +175,7 @@ def fit(vertices, width: int, height: int, fit_xy: bool, flatten_z: bool):
     cx, cy = (min(xs) + max(xs)) / 2, (min(ys) + max(ys)) / 2
     span = max(max(xs) - min(xs), max(ys) - min(ys)) or 1.0
     scale = 1.8 / span
-    cz = (min(zs) + max(zs)) / 2 if flatten_z else 0.0
+    cz = (min(zs) + max(zs)) / 2 if not flatten_z else 0.0
     aspect = width / height if height else 1.0
     out = []
     for x, y, z, u, v in vertices:
