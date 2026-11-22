@@ -158,6 +158,41 @@ class TestAlign(unittest.TestCase):
         self.assertEqual(names_mod.name_streams(["f/a.bk2"], []), ([], ["f/a.bk2"]))
 
 
+class TestLoadPins(unittest.TestCase):
+    def test_repeated_rows_union_and_sources_stay_separate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            csv_path = os.path.join(tmp, "pins.csv")
+            with open(csv_path, "w", encoding="utf-8", newline="") as fh:
+                w = csv.DictWriter(fh, fieldnames=["offset", "path", "source"])
+                w.writeheader()
+                # same offset across two rows, different sources: each source accumulates independently
+                w.writerow({"offset": 0x10, "path": "f/a.bk2", "source": "a.rpf"})
+                w.writerow({"offset": 0x10, "path": "F/B.BK2", "source": "a.rpf"})
+                w.writerow({"offset": 0x10, "path": "f/c.bk2", "source": "b.rpf"})
+                # empty-source fallback stays separate and accumulates too
+                w.writerow({"offset": 0x20, "path": "g/x.bk2"})
+                w.writerow({"offset": 0x20, "path": "g/y.bk2"})
+            pins = names_mod.load_pins(csv_path)
+        self.assertEqual(pins[("a.rpf", 0x10)], {"f/a.bk2", "f/b.bk2"})
+        self.assertEqual(pins[("b.rpf", 0x10)], {"f/c.bk2"})
+        self.assertEqual(pins[("", 0x20)], {"g/x.bk2", "g/y.bk2"})
+
+    def test_single_pipe_row_and_split_rows_agree(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            split = os.path.join(tmp, "split.csv")
+            pipe = os.path.join(tmp, "pipe.csv")
+            for name, rows in (
+                (split, [{"offset": 0x10, "path": "f/a.bk2"},
+                         {"offset": 0x10, "path": "f/b.bk2"}]),
+                (pipe, [{"offset": 0x10, "path": "f/a.bk2|f/b.bk2"}]),
+            ):
+                with open(name, "w", encoding="utf-8", newline="") as fh:
+                    w = csv.DictWriter(fh, fieldnames=["offset", "path"])
+                    w.writeheader()
+                    w.writerows(rows)
+            self.assertEqual(names_mod.load_pins(split), names_mod.load_pins(pipe))
+
+
 class TestCli(unittest.TestCase):
     def test_archive_end_to_end(self):
         shapes = [(1280, 720, 40), (1920, 1080, 50), (512, 512, 15)]
