@@ -27,8 +27,9 @@ def test_d16_image_load_reads_integer_views(make_shader, mask, dst):
     sh.validate(spv)
 
 
-def test_d16_integer_fetch_saturates_before_packing(make_shader):
-    shader = make_shader("image_load v3, v[1:2], s[8:15] dmask:0x9 dim:SQ_RSRC_IMG_2D d16\n"
+@pytest.mark.parametrize("load,addr,dim", [("image_load", "v[1:2]", "2D"), ("image_load_mip", "v[4:7]", "3D")])
+def test_d16_integer_fetch_saturates_before_packing(make_shader, load, addr, dim):
+    shader = make_shader(f"{load} v3, {addr}, s[8:15] dmask:0x9 dim:SQ_RSRC_IMG_{dim} d16\n"
                          "s_waitcnt vmcnt(0)\nexp mrt0 v3, v3, v3, v3 done vm\ns_endpgm\n", name="ps_d16_sat")
     text = shader.translate()
     # R and A are both narrowed on each integer path. Full-width and float paths have different conversions.
