@@ -248,6 +248,19 @@ class AudioWavTest(unittest.TestCase):
         self.assertNotIn("Traceback", p.stderr)
 
 
+class CliArgumentTest(unittest.TestCase):
+    def test_rejects_nonpositive_jobs(self):
+        with tempfile.TemporaryDirectory() as source:
+            for jobs in ("0", "-1"):
+                with self.subTest(jobs=jobs):
+                    result = subprocess.run(
+                        [sys.executable, "-I", TOOL, source, "--jobs", jobs],
+                        capture_output=True, text=True,
+                    )
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertIn("--jobs must be at least 1", result.stderr)
+
+
 class GranuleTest(unittest.TestCase):
     def test_trim_requires_identifiable_matching_endpoints(self):
         # A 240-channel family-255 header occupies two laces. Every output maps to the same mono stream.
