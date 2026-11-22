@@ -114,8 +114,8 @@ What they check (`tools/rdna2spirv.py`, pixel shaders plus one compute shader):
   `runtime/test/shaders/*.asm` (`python tests/semantic/regen_fixtures.py` rewrites them).
 
 Limits: single lane (or lanes in lockstep, one instruction per lane per round, that exchange values only through
-`OpGroupNonUniformShuffle`, `Ballot`, `Any`, `All` and `BitwiseOr` Reduce), forward-only structured control flow (the fragment-exit discard test and the compute
-dynamic-bounds merge; no backward branches, loops, calls or switches), no texture access. PushConstant words,
+`OpGroupNonUniformShuffle`, `Ballot`, `Any`, `All` and `BitwiseOr` Reduce), control flow followed one branch at a time (the fragment-exit discard test, the compute
+dynamic-bounds merge, loops of up to 10000 backward branches and calls of the module's own functions; no switches), no texture access. PushConstant words,
 Input variables and a flat physical-address `{address: word}` map can be supplied per run. A shift by at least the bit width is an undefined value: arithmetic on it stays
 undefined and any other use (store, branch or select condition, shuffle, output) raises. Values that pass
 through a float op lose NaN payloads (Python floats), so expected output words avoid NaN bit patterns; a

@@ -3,6 +3,7 @@ and GLSL.std.450 specifications (not from the translator)."""
 import unittest
 
 import spirv_mini_interp as si
+import spirv_wave_interp
 
 HEADER = """\
 OpCapability Shader
@@ -457,6 +458,26 @@ class InterpreterTests(unittest.TestCase):
                     "OpStore %out %res\n" + FOOTER)
             with self.subTest(cond=cond):
                 self.assertEqual(si.run_fragment(text)["%out"][0], want)
+
+    def test_phis_of_a_block_take_their_values_together(self):
+        # A loop header that swaps %a and %b on every back edge: each OpPhi reads the other's value from before
+        # the block. Three iterations from (1, 2) leave (2, 1); assigning %a first would give %b the new %a, (2, 2).
+        text = (HEADER.replace('"main" %out', '"main" %out %out2')
+                .replace("%main = OpFunction", "%out2 = OpVariable %_ptr_Output_uint Output\n"
+                         "%c3 = OpConstant %uint 3\n%main = OpFunction") +
+                "OpBranch %head\n"
+                "%head = OpLabel\n"
+                "%a = OpPhi %uint %c1 %entry %b %cont\n"
+                "%b = OpPhi %uint %c2 %entry %a %cont\n"
+                "%i = OpPhi %uint %c0 %entry %inext %cont\n"
+                "%more = OpULessThan %bool %i %c3\n"
+                "OpLoopMerge %done %cont None\nOpBranchConditional %more %cont %done\n"
+                "%cont = OpLabel\n%inext = OpIAdd %uint %i %c1\nOpBranch %head\n"
+                "%done = OpLabel\nOpStore %out %a\nOpStore %out2 %b\n" + FOOTER)
+        out = si.run_fragment(text)
+        self.assertEqual((out["%out"], out["%out2"]), ((2,), (1,)))
+        lane0 = spirv_wave_interp.run_wave(text, wave=32)["outputs"][0]     # the other interpreter agrees
+        self.assertEqual((lane0["%out"], lane0["%out2"]), ((2,), (1,)))
 
     def test_function_array_access(self):
         self.assertEqual(run_word("%arr_v = OpVariable %_ptr_Function_arr Function %null_arr\n"
