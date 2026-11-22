@@ -143,7 +143,7 @@ CMPX_CLASS_WORDS = [0xEEEEEEEE] * 3 + [0x22] + [0x11] * 4
 FMT_1010102_WORDS = [0, 0x3F800000, 0, 0x3F800000, 0x3F800000, 0, 0x3F800000, 0,
                      0, 0x3F800000, 0, 0x3F800000, 0xC00FFC00, 0x003FF003, 0xE00003FF, 0xFFE00003]
 # cs_fmt_xy_xyz.asm (TEST-185): 12 xy/xyz loads, then the 9 store regions read back, as a Radeon 680M (gfx1035) gives
-# them natively. Layout and rules in the .asm header.
+# them natively, with the updated UINT saturation case checked on gfx1036. Layout and rules in the .asm header.
 FMT_XY_XYZ_WORDS = [
     0x3F800000, 0x40000000, 0x5A5A0008, 0x5A5A000C, 0x3F800000, 0x40000000, 0x40400000, 0x5A5A001C,
     0x3F800000, 0x40000000, 0x5A5A0028, 0x5A5A002C, 0x3F800000, 0x40000000, 0x40400000, 0x5A5A003C,
@@ -154,7 +154,7 @@ FMT_XY_XYZ_WORDS = [
     0x3F800000, 0x40000000, 0x00000000, 0x00000000, 0x3F800000, 0x40000000, 0x40400000, 0x00000000,
     0x40003C00, 0x00000000, 0xA5A50268, 0xA5A5026C, 0x40003C00, 0x00004200, 0xA5A50278, 0xA5A5027C,
     0x3F800000, 0xA5A50284, 0xA5A50288, 0xA5A5028C, 0x0000FFFF, 0xA5A50294, 0xA5A50298, 0xA5A5029C,
-    0x00030201, 0xA5A502A4, 0xA5A502A8, 0xA5A502AC, 0xA5A502B0, 0xA5A502B4, 0xA5A502B8, 0xA5A502BC,
+    0x0003FF01, 0xA5A502A4, 0xA5A502A8, 0xA5A502AC, 0xA5A502B0, 0xA5A502B4, 0xA5A502B8, 0xA5A502BC,
     0xA5A502C0, 0xA5A502C4, 0xA5A502C8, 0xA5A502CC]
 # Negative global_load/global_store offsets (cs_global_neg_offset.asm): 40 groups make a 0x2800-byte heap that holds
 # both the right addresses and the 4096-lower ones; only group 0 thread 0 runs, so no wave64 requirement.

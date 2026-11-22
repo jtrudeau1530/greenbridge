@@ -1236,8 +1236,9 @@ class Gen:
                 self.emit(f"{i} = OpConvertFToS %int {rd}")
                 self.emit(f"{u} = OpBitcast %uint {i}")
                 field = u
-            else:   # uint
-                field = icomps[c]
+            else:   # Narrow UINT stores saturate to the field width before insertion.
+                field = self.tmp()
+                self.emit(f"{field} = OpExtInst %uint %glsl UMin {icomps[c]} {self.cu((1 << w) - 1)}")
             wi = bit // 32
             ins = self.tmp()
             self.emit(f"{ins} = OpBitFieldInsert %uint {words[wi]} {field} {self.cu(bit % 32)} {self.cu(w)}")
