@@ -165,6 +165,20 @@ def _transform(matrix, point):
     ]
 
 
+class InterleavedAccessorTest(unittest.TestCase):
+    def test_last_attribute_can_end_at_the_last_bin_byte(self) -> None:
+        gltf = {
+            "bufferViews": [{"buffer": 0, "byteStride": 24, "byteLength": 48}],
+            "accessors": [{"bufferView": 0, "byteOffset": 12, "componentType": 5126,
+                           "count": 2, "type": "VEC3"}],
+        }
+        vertices = struct.pack("<12f", 1, 2, 3, 0, 1, 0, 4, 5, 6, 0, 0, 1)
+        normals, _ = skinned_glb.accessor_bytes(gltf, vertices, 0)
+        self.assertEqual(normals, struct.pack("<6f", 0, 1, 0, 0, 0, 1))
+        with self.assertRaisesRegex(skinned_glb.SkinError, "outside the BIN chunk"):
+            skinned_glb.accessor_bytes(gltf, vertices[:-1], 0)
+
+
 class SkinnedGlbTest(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
