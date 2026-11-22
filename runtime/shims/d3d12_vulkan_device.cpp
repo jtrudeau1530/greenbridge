@@ -2436,6 +2436,20 @@ public:
             blends[i].dstAlphaBlendFactor = blend_factor(b.DestBlendAlpha);
             blends[i].alphaBlendOp = blend_op(b.BlendOpAlpha);
             blends[i].colorWriteMask = b.RenderTargetWriteMask & 0xf;  // R, G, B, A in both APIs
+            // B8G8R8X8 has no alpha, so blending reads destination alpha as 1 there (WARP and AMD's D3D12 driver),
+            // where its BGRA8 Vulkan image would read the X byte. For colour SRC_ALPHA_SAT is min(As, 1 - Ad), so 0;
+            // for alpha it is 1 in both APIs already.
+            if (alpha_unused(desc.RTVFormats[i])) {
+                const auto dest_alpha_one = [](VkBlendFactor& factor, bool colour) {
+                    if (factor == VK_BLEND_FACTOR_DST_ALPHA) factor = VK_BLEND_FACTOR_ONE;
+                    else if (factor == VK_BLEND_FACTOR_ONE_MINUS_DST_ALPHA) factor = VK_BLEND_FACTOR_ZERO;
+                    else if (colour && factor == VK_BLEND_FACTOR_SRC_ALPHA_SATURATE) factor = VK_BLEND_FACTOR_ZERO;
+                };
+                dest_alpha_one(blends[i].srcColorBlendFactor, true);
+                dest_alpha_one(blends[i].dstColorBlendFactor, true);
+                dest_alpha_one(blends[i].srcAlphaBlendFactor, false);
+                dest_alpha_one(blends[i].dstAlphaBlendFactor, false);
+            }
         }
         VkPipelineColorBlendStateCreateInfo blend{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
         blend.attachmentCount = std::uint32_t(blends.size());

@@ -331,7 +331,10 @@ What is implemented (all of it testable without the game):
     keep all four bytes (WARP writes the clear's alpha into the X byte too), and shader views read alpha as 1. Its
     typeless family is its own, so views to or from `B8G8R8A8` are refused (a castable-format list that names the
     other family is not consulted yet). As on the host runtime, the family has no typed UAV, and a typed
-    `B8G8R8X8` texture cannot allow unordered access;
+    `B8G8R8X8` texture cannot allow unordered access. Blending into a `B8G8R8X8` render target reads destination
+    alpha as 1, as WARP and AMD's D3D12 driver do: the PSO turns `DEST_ALPHA` into `ONE`, `INV_DEST_ALPHA` into
+    `ZERO` and the colour `SRC_ALPHA_SAT` into `ZERO`, where the BGRA8 image would read the X byte. What a draw
+    leaves in the X byte is not defined (WARP writes 0, AMD the blended alpha), and no view reads it;
   - `R10G10B10_XR_BIAS_A2_UNORM` maps to `VK_FORMAT_A2B10G10R10_UNORM_PACK32`, the same packed 10:10:10:2
     layout; the bias and scale are the application's shader work. Like the PC runtime, it accepts only a
     single-mip, single-sample 2D texture: extra mips, multisampling and 3D are refused in creation, allocation

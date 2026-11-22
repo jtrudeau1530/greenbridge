@@ -7,7 +7,9 @@
 //   - a render target cleared blue, two indexed draws with different root arguments (top-left red, bottom-right
 //     green), and one back-facing triangle (bottom-left) that culling must remove;
 //   - the image read back through CopyTextureRegion and compared pixel by pixel. Where the quadrants land also
-//     checks the viewport flip (D3D clip space is y-up) and the front-face winding.
+//     checks the viewport flip (D3D clip space is y-up) and the front-face winding;
+//   - full-screen blends that read destination alpha into B8G8R8X8 and B8G8R8A8 targets cleared with alpha 0.25:
+//     B8G8R8X8 has no alpha, so destination alpha reads 1 there, as on WARP and AMD's D3D12 driver.
 // The shaders are GLSL written to the translator's contract (test/glsl/vs_draw.vert, ps_draw.frag). No game data.
 // Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation.
 #include "vk_test_device.h"
@@ -16,8 +18,10 @@
 #include "../shims/d3d12_xs_device.h"
 #include "../src/shader_library.h"
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
+#include <cstdlib>
 #include <cstring>
 
 #if !defined(LEONIDA_TEST_VS_SPV) || !defined(LEONIDA_TEST_PS_SPV) || !defined(LEONIDA_TEST_VS_INT_SPV)
@@ -670,6 +674,103 @@ int main() {
                     return 1;
                 }
             }
+        }
+
+        // B8G8R8X8 targets have no alpha, so the blend factors that read destination alpha read 1 there, as WARP and
+        // AMD's D3D12 driver blend; B8G8R8A8 with the same cleared bytes reads its stored alpha. Only red, green and
+        // blue are compared: what a draw leaves in the X byte differs between them (WARP writes 0, AMD the blended
+        // alpha), and no view reads it.
+        {
+            const float x8_tint[3] = {0.8f, 0.6f, 0.4f};  // with the full-screen VS's yellow: (0.8, 0.6, 0, 1)
+            void* x8_up = nullptr;
+            EXPECT(SUCCEEDED(upload->Map(0, nullptr, &x8_up)));
+            std::memcpy(static_cast<std::uint8_t*>(x8_up) + 2048, x8_tint, sizeof(x8_tint));
+            upload->Unmap(0, nullptr);
+            const FLOAT x8_clear[4] = {0.2f, 0.4f, 0.6f, 0.25f};
+            struct BlendCase {
+                const char* name;
+                D3D12_BLEND src, dst;
+            };
+            constexpr BlendCase x8_cases[] = {
+                {"src*DEST_ALPHA", D3D12_BLEND_DEST_ALPHA, D3D12_BLEND_ZERO},
+                {"src*INV_DEST_ALPHA", D3D12_BLEND_INV_DEST_ALPHA, D3D12_BLEND_ZERO},
+                {"src*SRC_ALPHA_SAT", D3D12_BLEND_SRC_ALPHA_SAT, D3D12_BLEND_ZERO},
+                {"dst*DEST_ALPHA", D3D12_BLEND_ZERO, D3D12_BLEND_DEST_ALPHA},
+                {"dst*INV_DEST_ALPHA", D3D12_BLEND_ZERO, D3D12_BLEND_INV_DEST_ALPHA},
+            };
+            const D3D12_DESCRIPTOR_HEAP_DESC x8_heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1,
+                                                          D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+            Ref<ID3D12DescriptorHeap> x8_heap;
+            EXPECT(SUCCEEDED(device->CreateDescriptorHeap(&x8_heap_desc, IID_PPV_ARGS(&x8_heap.p))));
+            const D3D12_CPU_DESCRIPTOR_HANDLE x8_rtv{
+                SIZE_T(reinterpret_cast<XboxHeapHandleFn>(slot(x8_heap.p, 9))(x8_heap.p))};
+            const D3D12_VIEWPORT x8_viewport{0, 0, 4, 4, 0, 1};
+            const D3D12_RECT x8_scissor{0, 0, 4, 4};
+            UINT64 x8_fence = 40;
+            for (const DXGI_FORMAT format : {DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_B8G8R8X8_UNORM}) {
+                D3D12_RESOURCE_DESC x8_desc = rt_desc;
+                x8_desc.Width = x8_desc.Height = 4;
+                x8_desc.Format = format;
+                Ref<ID3D12Resource> x8_target;
+                EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &x8_desc,
+                                                                 D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr,
+                                                                 IID_PPV_ARGS(&x8_target.p))));
+                device->CreateRenderTargetView(x8_target.p, nullptr, x8_rtv);
+                // The clear stores alpha 64 in both formats.
+                const float dest_alpha = format == DXGI_FORMAT_B8G8R8X8_UNORM ? 1.0f : 64 / 255.0f;
+                for (const BlendCase& c : x8_cases) {
+                    D3D12_GRAPHICS_PIPELINE_STATE_DESC x8_pso_desc = fullscreen_desc;
+                    x8_pso_desc.RTVFormats[0] = format;
+                    x8_pso_desc.BlendState.RenderTarget[0] = {
+                        TRUE, FALSE, c.src, c.dst, D3D12_BLEND_OP_ADD, D3D12_BLEND_ONE, D3D12_BLEND_ZERO,
+                        D3D12_BLEND_OP_ADD, D3D12_LOGIC_OP_NOOP, D3D12_COLOR_WRITE_ENABLE_ALL};
+                    Ref<ID3D12PipelineState> x8_pso;
+                    EXPECT(SUCCEEDED(device->CreateGraphicsPipelineState(&x8_pso_desc, IID_PPV_ARGS(&x8_pso.p))));
+                    EXPECT(SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.p, x8_pso.p)));
+                    list->ClearRenderTargetView(x8_rtv, x8_clear, 0, nullptr);
+                    list->SetGraphicsRootSignature(root.p);
+                    list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                    list->RSSetViewports(1, &x8_viewport);
+                    list->RSSetScissorRects(1, &x8_scissor);
+                    list->OMSetRenderTargets(1, &x8_rtv, FALSE, nullptr);
+                    list->SetGraphicsRootConstantBufferView(1, upload_va + 2048);
+                    list->DrawInstanced(3, 1, 0, 0);
+                    const auto x8_to_copy = transition(x8_target.p, D3D12_RESOURCE_STATE_RENDER_TARGET,
+                                                       D3D12_RESOURCE_STATE_COPY_SOURCE);
+                    list->ResourceBarrier(1, &x8_to_copy);
+                    D3D12_TEXTURE_COPY_LOCATION x8_dst{readback.p, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, {}};
+                    x8_dst.PlacedFootprint = {0, {format, 4, 4, 1, 256}};
+                    D3D12_TEXTURE_COPY_LOCATION x8_src{x8_target.p, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {}};
+                    list->CopyTextureRegion(&x8_dst, 0, 0, 0, &x8_src, nullptr);
+                    const auto x8_to_target = transition(x8_target.p, D3D12_RESOURCE_STATE_COPY_SOURCE,
+                                                         D3D12_RESOURCE_STATE_RENDER_TARGET);
+                    list->ResourceBarrier(1, &x8_to_target);
+                    EXPECT(list->Close() == S_OK);
+                    queue->ExecuteCommandLists(1, lists);
+                    EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
+                    ++x8_fence;
+                    EXPECT(SUCCEEDED(queue->Signal(fence.p, x8_fence)) &&
+                           SUCCEEDED(fence->SetEventOnCompletion(x8_fence, nullptr)));
+                    // Source (0.8, 0.6, 0) with alpha 1, destination the cleared bytes; SRC_ALPHA_SAT is
+                    // min(1, 1 - dest alpha).
+                    const float source[3] = {0.8f, 0.6f, 0.0f}, dest[3] = {51 / 255.0f, 102 / 255.0f, 153 / 255.0f};
+                    const auto factor = [&](D3D12_BLEND b) {
+                        return b == D3D12_BLEND_DEST_ALPHA ? dest_alpha : b == D3D12_BLEND_ZERO ? 0.0f : 1 - dest_alpha;
+                    };
+                    const auto* got = static_cast<const std::uint8_t*>(mapped);
+                    for (UINT ch = 0; ch < 3; ++ch) {  // R, G, B, at bytes 2, 1, 0
+                        const float value = source[ch] * factor(c.src) + dest[ch] * factor(c.dst);
+                        const int want = int(std::min(1.0f, value) * 255 + 0.5f);
+                        if (std::abs(int(got[2 - ch]) - want) <= 1) continue;
+                        std::fprintf(stderr, "%s target, %s: got B,G,R %u,%u,%u, channel %u wants %d\n",
+                                     format == DXGI_FORMAT_B8G8R8X8_UNORM ? "B8G8R8X8" : "B8G8R8A8", c.name, got[0],
+                                     got[1], got[2], ch, want);
+                        return 1;
+                    }
+                }
+            }
+            std::printf("B8G8R8X8: %u blends that read destination alpha read 1, B8G8R8A8 its stored alpha\n",
+                        unsigned(std::size(x8_cases)));
         }
 
         // A draw without a topology is invalid; Close reports it.
