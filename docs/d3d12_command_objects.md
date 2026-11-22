@@ -615,12 +615,12 @@ Command allocators get the same kind of proxy: device slot 9 (`CreateCommandAllo
 
 - **What is forwarded.** The public chain, 9 slots: the base chain and `Reset` at 8. A slot past it, up to the
   end of a 64-slot table, is logged and refused, and a read past the table faults in its own guard region.
-  The console allocator's extra methods cannot be measured from the package (D3D-360). The 16 images in
-  `game/xbox-1.0.2.1.json` don't include `d3d12_xs.dll`, which owns the allocator's vtable. None of them contains
-  `IID_ID3D12CommandAllocator`, and no export takes an allocator: the BVH builder's take an `ID3D12Device11` or
-  an `ID3D12GraphicsCommandList4`/`6`/`8`, and the FSR loader and upscaler export only the five `ffx*` entry points.
-  So no shipped module creates, receives or calls an allocator (§3.5). Only the game executable, which the package
-  doesn't contain, could show a call past slot 8. Until it does, a slot past 8 stays logged and refused.
+  The console allocator's extra methods cannot be measured from the package (D3D-360). No shipped module creates,
+  receives or calls an allocator (§3.5). The package has no `d3d12_xs.dll` either, and no export of the three
+  D3D12 clients takes an allocator. `dumpbin /exports` (MSVC 19.52) lists the BVH builder's 12 exports, which take
+  an `ID3D12Device11` or a command list (`docs/d3d12_xs_surface.md`), and the FSR loader's and upscaler's
+  `ffxConfigure`, `ffxCreateContext`, `ffxDestroyContext`, `ffxDispatch` and `ffxQuery`. A call past slot 8 could
+  only show up in the game executable, which the package doesn't contain, so such a slot stays logged and refused.
 - **Where a list takes it.** A list takes an allocator from the title in `CreateCommandList` and `Reset`, so
   the proxy is safe only where the list side resolves it. Slot 9 therefore wraps an allocator only when it
   answers `kLeonidaCommandAllocatorTag` (`d3d12_xs_device.h`). That is the Vulkan layer's own allocator, whose
