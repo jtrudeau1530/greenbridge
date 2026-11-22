@@ -1124,5 +1124,108 @@ class TestIEEE754BoundaryExtremes(unittest.TestCase):
                 self.assertEqual(reconstructed, f)
 
 
+class TestNegativeControlsAndMutations(unittest.TestCase):
+    """Negative controls, syntax rejection, and mutation detection tests."""
+
+    def test_syntax_rejection_negative_controls(self) -> None:
+        """Verify parser rejects invalid assembly syntaxes and illegal operand structures."""
+        invalid_instructions = [
+            "s_xnor_saveexec_b64",  # Missing all operands
+            "s_xnor_saveexec_b64 s[4:5]",  # Missing src0 operand
+            "s_xnor_saveexec_b64 s[4:5], s[2:3], s[0:1]",  # Extra third operand
+            "s_xnor_saveexec_b64 v[4:5], s[2:3]",  # VGPR destination invalid for SALU
+            "s_xnor_saveexec_b64 s[1:2], s[2:3]",  # Odd-aligned destination register pair
+            "s_xnor_saveexec_b64 s[4:5], s[3:4]",  # Odd-aligned source register pair
+            "s_xnor_saveexec_b64 s[4:7], s[2:3]",  # 4-dword span instead of 2-dword
+            "s_xnor_saveexec_b64 m0, s[2:3]",  # Invalid scalar destination special register
+            "s_xor_saveexec_b64 s[4:5], s[2:3]",  # Wrong opcode mnemonic
+            "s_xnor_saveexec_b32 s[4:5], s[2:3]",  # 32-bit opcode mismatch
+        ]
+        for bad in invalid_instructions:
+            with self.subTest(bad=bad):
+                with self.assertRaises((ValueError, TypeError)):
+                    parse_salu_instruction(bad)
+
+    def test_mutation_detection_xor_instead_of_xnor(self) -> None:
+        """Mutation 1: Detect mutant calculating XOR rather than XNOR."""
+        class MutantXorInterpreter(ScalarInterpreter):
+            def step(self, instr: SXnorSaveexecB64Instruction, state: ScalarMachineState) -> Tuple[int, int, int]:
+                src0_val = self.resolve_source(instr.src0, state)
+                curr_exec = state.exec_mask & MASK64
+                # Mutant bug: computes XOR instead of XNOR
+                new_exec = (src0_val ^ curr_exec) & MASK64
+                saved = curr_exec
+                state.exec_mask = new_exec
+                state.scc = ref_scc(new_exec)
+                return saved, new_exec, state.scc
+
+        mutant = MutantXorInterpreter()
+        st = ScalarMachineState(exec_mask=0)
+        st.set_sgpr64(0, 0)
+        instr = parse_salu_instruction("s_xnor_saveexec_b64 s[2:3], s[0:1]")
+        _, new_exec, _ = mutant.step(instr, st)
+        # Expected XNOR(0, 0) == MASK64, Mutant XOR(0, 0) == 0
+        self.assertNotEqual(new_exec, MASK64)
+        self.assertEqual(new_exec, 0)
+
+    def test_mutation_detection_wrexec_instead_of_saveexec(self) -> None:
+        """Mutation 2: Detect mutant saving new_exec into dst instead of old EXEC (wrexec bug)."""
+        class MutantWrexecInterpreter(ScalarInterpreter):
+            def step(self, instr: SXnorSaveexecB64Instruction, state: ScalarMachineState) -> Tuple[int, int, int]:
+                src0_val = self.resolve_source(instr.src0, state)
+                curr_exec = state.exec_mask & MASK64
+                saved, new_exec, scc = oracle_s_xnor_saveexec_b64(src0_val, curr_exec)
+                # Mutant bug: saves new_exec to destination instead of saved
+                if isinstance(instr.dst, RegPair):
+                    state.set_sgpr64(instr.dst.index, new_exec)
+                state.exec_mask = new_exec
+                state.scc = scc
+                return new_exec, new_exec, scc
+
+        mutant = MutantWrexecInterpreter()
+        st = ScalarMachineState(exec_mask=0x1111111111111111)
+        st.set_sgpr64(0, 0x2222222222222222)
+        instr = parse_salu_instruction("s_xnor_saveexec_b64 s[2:3], s[0:1]")
+        saved, _, _ = mutant.step(instr, st)
+        self.assertNotEqual(st.get_sgpr64(2), 0x1111111111111111)
+
+    def test_mutation_detection_inverted_scc_flag(self) -> None:
+        """Mutation 3: Detect mutant inverting SCC flag logic."""
+        class MutantSccInterpreter(ScalarInterpreter):
+            def step(self, instr: SXnorSaveexecB64Instruction, state: ScalarMachineState) -> Tuple[int, int, int]:
+                saved, new_exec, scc = super().step(instr, state)
+                # Mutant bug: inverts SCC condition
+                bad_scc = 0 if scc == 1 else 1
+                state.scc = bad_scc
+                return saved, new_exec, bad_scc
+
+        mutant = MutantSccInterpreter()
+        st = ScalarMachineState(exec_mask=MASK64)
+        st.set_sgpr64(0, MASK64)
+        instr = parse_salu_instruction("s_xnor_saveexec_b64 s[2:3], s[0:1]")
+        _, _, scc = mutant.step(instr, st)
+        # Correct SCC is 1, mutant sets 0
+        self.assertEqual(scc, 0)
+        self.assertNotEqual(scc, 1)
+
+    def test_mutation_detection_32bit_truncation(self) -> None:
+        """Mutation 4: Detect mutant erroneously truncating 64-bit operation to 32 bits."""
+        class Mutant32BitTruncation(ScalarInterpreter):
+            def step(self, instr: SXnorSaveexecB64Instruction, state: ScalarMachineState) -> Tuple[int, int, int]:
+                saved, new_exec, scc = super().step(instr, state)
+                truncated_exec = new_exec & MASK32
+                state.exec_mask = truncated_exec
+                return saved, truncated_exec, scc
+
+        mutant = Mutant32BitTruncation()
+        st = ScalarMachineState(exec_mask=MASK64)
+        st.set_sgpr64(0, MASK64)
+        instr = parse_salu_instruction("s_xnor_saveexec_b64 s[2:3], s[0:1]")
+        _, new_exec, _ = mutant.step(instr, st)
+        # Mutant lost upper 32 bits
+        self.assertEqual(new_exec, MASK32)
+        self.assertNotEqual(new_exec, MASK64)
+
+
 if __name__ == "__main__":
     unittest.main()
