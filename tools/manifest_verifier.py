@@ -91,13 +91,23 @@ def load_manifest(path: str) -> dict[str, dict]:
       or flat:
       {<rel_path>: {"size": <int>, "sha256": <str>}, ...}
 
-    Normalizes relative paths to forward slashes and hashes to lowercase hex.
+    Rejects repeated JSON keys and normalizes relative paths to forward
+    slashes and hashes to lowercase hex.
     """
     if not os.path.isfile(path):
         raise ManifestError(f"manifest file not found: {path}")
+
+    def unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        result: dict[str, object] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ManifestError(f"{path}: duplicate JSON key {key!r}")
+            result[key] = value
+        return result
+
     try:
         with open(path, encoding="utf-8") as f:
-            doc = json.load(f)
+            doc = json.load(f, object_pairs_hook=unique_object)
     except ValueError as err:
         raise ManifestError(f"{path} is not valid JSON ({err})") from None
     except OSError as err:
