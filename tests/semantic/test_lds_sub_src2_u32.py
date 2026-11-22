@@ -284,6 +284,77 @@ class SIMDInterpreter:
             state.lds.write_dword(idx_a, new_a)
 
 
+class TestRegisterAliasingAndInPlacePreservation(unittest.TestCase):
+    """Unit tests for register preservation and memory location self-aliasing."""
+
+    def test_vaddr_register_unmodified_scalar(self) -> None:
+        interp = ScalarInterpreter()
+        state = ScalarMachineState(lds_dwords=256)
+        initial_vaddr = 0x1234
+        state.set_vgpr(5, initial_vaddr)
+        state.set_lds(10, 100)
+        state.set_lds(11, 40)
+
+        instr = DSSrc2Instruction(
+            opcode=DSOpcode.DS_SUB_SRC2_U32,
+            addr=LDSAddressExpression(base_reg=RegisterOperand(5), offset0=0, offset1=1),
+        )
+        interp.execute(instr, state)
+        # vaddr in v5 must remain strictly untouched
+        self.assertEqual(state.get_vgpr(5), initial_vaddr)
+
+    def test_vaddr_register_unmodified_simd(self) -> None:
+        interp = SIMDInterpreter()
+        state = SIMDState(num_lanes=64, exec_mask=MASK64, lds_dwords=512)
+        for lane in range(64):
+            state.set_lane_vgpr(lane, 3, 0x100 + lane * 4)
+
+        instr = DSSrc2Instruction(
+            opcode=DSOpcode.DS_SUB_SRC2_U32,
+            addr=LDSAddressExpression(base_reg=RegisterOperand(3), offset0=0, offset1=1),
+        )
+        interp.execute(instr, state)
+        for lane in range(64):
+            self.assertEqual(state.get_lane_vgpr(lane, 3), 0x100 + lane * 4)
+
+    def test_same_address_self_subtraction_zeroes_memory(self) -> None:
+        # If offset0 == offset1, location A and location B are identical.
+        # LDS[A] = LDS[A] - LDS[A] = 0
+        interp = ScalarInterpreter()
+        state = ScalarMachineState(lds_dwords=256)
+        state.set_vgpr(0, 0x40)  # dword 16
+        state.set_lds(16, 0x98765432)
+
+        instr = DSSrc2Instruction(
+            opcode=DSOpcode.DS_SUB_SRC2_U32,
+            addr=LDSAddressExpression(base_reg=RegisterOperand(0), offset0=2, offset1=2),
+        )
+        # byte address = 0x40 + 8 = 0x48 -> dword 18
+        state.set_lds(18, 0xDEADBEEF)
+        interp.execute(instr, state)
+        self.assertEqual(state.get_lds(18), 0)
+
+    def test_cross_lane_address_aliasing(self) -> None:
+        # Multiple lanes targeting the same LDS dword
+        interp = SIMDInterpreter()
+        state = SIMDState(num_lanes=32, exec_mask=0xF, lds_dwords=256)  # 4 lanes active
+        # All 4 lanes target A=dword 10, B=dword 20
+        for lane in range(4):
+            state.set_lane_vgpr(lane, 0, 40)  # 40 bytes = dword 10
+        state.lds.write_dword(10, 100)
+        state.lds.write_dword(20, 10)
+
+        # offset0=0 -> dword 10, offset1=10 -> byte 40+40=80 -> dword 20
+        instr = DSSrc2Instruction(
+            opcode=DSOpcode.DS_SUB_SRC2_U32,
+            addr=LDSAddressExpression(base_reg=RegisterOperand(0), offset0=0, offset1=10),
+        )
+        interp.execute(instr, state)
+        # 4 consecutive subtractions of 10 from 100 -> 100 - 40 = 60
+        self.assertEqual(state.lds.read_dword(10), 60)
+        self.assertEqual(state.lds.read_dword(20), 10)
+
+
 class TestSIMDMultiLaneDivergence(unittest.TestCase):
     """Unit tests for SIMD execution, lane divergence, and 32/64-bit EXEC masking."""
 
