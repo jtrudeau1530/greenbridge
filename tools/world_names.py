@@ -36,6 +36,10 @@ import re
 import sys
 import tempfile
 
+# -I keeps the script directory off sys.path, so add it explicitly before importing the sibling module.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from report_paths import same_report_path  # noqa: E402
+
 MASK32 = 0xFFFFFFFF
 MASK64 = 0xFFFFFFFFFFFFFFFF
 
@@ -543,15 +547,6 @@ def _load_json(path: str) -> dict:
         return json.load(handle)
 
 
-def _same_report_path(first: str, second: str) -> bool:
-    if os.path.normcase(os.path.realpath(first)) == os.path.normcase(os.path.realpath(second)):
-        return True
-    try:
-        return os.path.samefile(first, second)
-    except OSError:
-        return False
-
-
 def _build(args) -> int:
     if not (args.manifest or args.scan or args.names or args.xml or args.rpf9_names):
         print("build: at least one --manifest/--scan/--names/--rpf9-names/--xml source is required",
@@ -571,7 +566,7 @@ def _build(args) -> int:
 def _resolve(args) -> int:
     if args.out:
         for path in (args.dict, *args.maps, *args.archetypes):
-            if _same_report_path(args.out, path):
+            if same_report_path(args.out, path):
                 raise ValueError(
                     f"resolve: --out {args.out} would overwrite input {path}")
     try:

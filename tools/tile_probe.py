@@ -13,6 +13,10 @@ import sys
 
 import numpy as np
 
+# -I keeps the script directory off sys.path, so add it explicitly before importing the sibling module.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from report_paths import same_report_path  # noqa: E402
+
 
 def morton_decode(i, bits):
     """Split a Z-order index into (x, y), x taking the even bits."""
@@ -135,15 +139,6 @@ def render(data, offset, bpe, wpx, mode, out):
     im = Image.open(io.BytesIO(body + lin.tobytes())).convert("RGB")
     im.save(out)
     return im.size
-
-
-def same_report_path(first, second):
-    if os.path.normcase(os.path.realpath(first)) == os.path.normcase(os.path.realpath(second)):
-        return True
-    try:
-        return os.path.samefile(first, second)
-    except OSError:
-        return False
 
 
 def check_preview_path(out, blob):
