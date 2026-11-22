@@ -3,6 +3,7 @@ r"""Build the PC port from your own copy of the game.
     Build.bat                                                   # double-click: finds your copy and builds
     python -I make_game.py                                      # same, from a terminal
     python -I make_game.py --find                               # list the copies found on this PC
+    python -I make_game.py --pick                               # choose the game folder in a folder dialog
     python -I make_game.py --game "D:\path\to\your\package" --out "D:\Games\Leonida"
     python -I make_game.py --game "..." --check                 # only check the copy, build nothing
     python -I make_game.py --stages shaders,assets              # only some stages
@@ -229,6 +230,34 @@ def find_dumps() -> list:
         if os.path.isdir(r):
             visit(r, 2)
     return list(found.values())
+
+
+def pick_game() -> str:
+    """--pick: choose the game folder in the system's folder dialog. Asks again until the folder is a supported
+    version; cancelling stops the build."""
+    try:
+        import tkinter
+        from tkinter import filedialog, messagebox
+        root = tkinter.Tk()
+    except Exception as e:      # no tkinter, or no display (SSH, headless Linux)
+        fail(f"The folder dialog couldn't open ({e}). Give the folder with --game.")
+    root.withdraw()
+    root.attributes("-topmost", True)
+    try:
+        while True:
+            d = filedialog.askdirectory(parent=root, mustexist=True,
+                                        title="Choose the folder that holds MicrosoftGame.Config")
+            if not d:
+                fail("No folder chosen: choose one with --pick or --game.")
+            d = os.path.normpath(d)
+            v = match_version(d)
+            if v:
+                log(f"chose {v['title']} {v['version']} in {d}")
+                return d
+            messagebox.showwarning("Leonida", "That folder isn't a supported version of the game. Choose the "
+                                   "folder that holds MicrosoftGame.Config and the .rpf archives.", parent=root)
+    finally:
+        root.destroy()
 
 
 def choose_game() -> str:
@@ -1102,6 +1131,7 @@ def pipelines(work: str, out: str, jobs: "int | None" = None) -> None:
 def main() -> int:
     ap = argparse.ArgumentParser(description="Build the PC port from your own copy of the game.")
     ap.add_argument("--game", help="your package folder (found automatically if left out)")
+    ap.add_argument("--pick", action="store_true", help="choose your package folder in a folder dialog")
     ap.add_argument("--out", help="folder for the finished port (default Documents/Leonida)")
     ap.add_argument("--work", help="folder for intermediate files (hundreds of GB; default <out>/work)")
     ap.add_argument("--stages", help="comma list from: " + ",".join(STAGES))
@@ -1140,6 +1170,8 @@ def main() -> int:
         for s in stages:
             if s not in STAGES:
                 ap.error(f"--stages: unknown stage '{s}' (choose from: {','.join(STAGES)})")
+    if a.pick and a.game:
+        ap.error("--pick and --game both choose the game folder: give one")
     below_normal()
     if a.find:
         found = find_dumps()
@@ -1147,7 +1179,7 @@ def main() -> int:
             print(f"{d}  ({v['title']} {v['version']})")
         print(f"{len(found)} found")
         return 0
-    game = os.path.abspath(a.game or choose_game())
+    game = os.path.abspath(a.game or (pick_game() if a.pick else choose_game()))
     v = check(game, a.full_check)
     if a.check:
         return 0

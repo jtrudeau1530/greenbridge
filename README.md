@@ -97,6 +97,7 @@ Your game folder is the one that holds `MicrosoftGame.Config` and the `.rpf` arc
 
 ```powershell
 python -I make_game.py --find                          # list the copies found on this PC
+python -I make_game.py --pick                          # choose the game folder in a folder dialog
 python -I make_game.py --check                         # check your copy, build nothing
 python -I make_game.py --game "D:\path\to\your\package" --out "D:\Games\Leonida" --work "E:\leonida-work"
 python -I make_game.py --stages shaders,assets         # only some stages
