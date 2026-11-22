@@ -122,12 +122,14 @@ class Reader:
         self.type_handlers = TYPE_HANDLERS if type_handlers is None else type_handlers
         self.stats = Counter()
         self.types = Counter()
+        self._active_type_elements = set()
 
     def convert(self, el, use_type_handler=True):
         """The generic value of element ``el`` (a registered ``type`` handler first, unless told not to). Attributes
         no convention uses (``name``, ``userFlags``, ...) are kept as ``"@name"`` entries."""
+        in_handler = id(el) in self._active_type_elements
         value = self._convert(el, use_type_handler)
-        return self.with_attributes(el.attrib, value, count_stats=use_type_handler)
+        return self.with_attributes(el.attrib, value, count_stats=not in_handler)
 
     def with_attributes(self, attrib, value, count_stats=True):
         consumed = CONVENTION_KEYS if _uses_vector_keys(attrib) else BASE_CONVENTION_KEYS
@@ -147,12 +149,16 @@ class Reader:
             self.stats["null"] += 1
             return None
         if t is not None:
-            if use_type_handler:
+            if id(el) not in self._active_type_elements:
                 self.types[t] += 1
             handler = self.type_handlers.get(t) if use_type_handler else None
             if handler:
                 self.stats["type handler"] += 1
-                return handler(el, self)
+                self._active_type_elements.add(id(el))
+                try:
+                    return handler(el, self)
+                finally:
+                    self._active_type_elements.discard(id(el))
         if "content" in a:
             self.stats["array"] += 1
             return parse_content(a["content"], el.text)

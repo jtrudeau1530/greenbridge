@@ -128,17 +128,40 @@ class Conventions(unittest.TestCase):
     def test_streaming_drops_top_level_children_from_root(self):
         orig_iterparse = ET.iterparse
         roots_seen = []
+        max_children = 0
 
         def spy_iterparse(*args, **kwargs):
+            nonlocal max_children
             for event, el in orig_iterparse(*args, **kwargs):
                 if event == "start" and not roots_seen:
                     roots_seen.append(el)
+                elif roots_seen:
+                    max_children = max(max_children, len(roots_seen[0]))
                 yield event, el
 
         with mock.patch.object(ET, "iterparse", side_effect=spy_iterparse):
             R.Reader(root_handlers={}, type_handlers={}).read(DOC)
         self.assertEqual(len(roots_seen), 1)
         self.assertEqual(len(roots_seen[0]), 0)
+
+        roots_seen.clear()
+        max_children = 0
+        count = 1000
+        large_xml = (
+            b"<CLargeRoot>"
+            + b"".join(f'<Item><idx value="{i}"/><pos x="{i}.0" y="1.0" z="2.0"/></Item>'.encode("ascii")
+                       for i in range(count))
+            + b"</CLargeRoot>"
+        )
+        reader = R.Reader(root_handlers={}, type_handlers={})
+        with mock.patch.object(ET, "iterparse", side_effect=spy_iterparse):
+            tag, _, items = reader.read(large_xml)
+        self.assertEqual(tag, "CLargeRoot")
+        self.assertEqual(len(items), count)
+        self.assertEqual([item["idx"] for item in items], list(range(count)))
+        self.assertEqual(reader.stats["list"], 1)
+        self.assertEqual(len(roots_seen[0]), 0)
+        self.assertLess(max_children, count)
 
 
 class Dispatch(unittest.TestCase):
@@ -168,6 +191,17 @@ class Dispatch(unittest.TestCase):
         self.assertEqual(reader.stats["type handler"], 1)
         self.assertEqual(reader.stats["extra attributes"], 1)
         self.assertEqual(reader.stats["object"], 1)
+
+        direct_reader = R.Reader(root_handlers={}, type_handlers={"CThing": thing})
+        direct_val = direct_reader.convert(
+            ET.fromstring(b'<Item type="CThing" name="direct"><size value="5"/></Item>'),
+            use_type_handler=False,
+        )
+        self.assertEqual(direct_val, {"$type": "CThing", "size": 5, "@name": "direct"})
+        self.assertEqual(direct_reader.types, {"CThing": 1})
+        self.assertEqual(direct_reader.stats["type handler"], 0)
+        self.assertEqual(direct_reader.stats["extra attributes"], 1)
+        self.assertEqual(direct_reader.stats["object"], 1)
 
     def test_streaming_parity_on_typed_null_and_attribute_roots(self):
         def thing(el, reader):
