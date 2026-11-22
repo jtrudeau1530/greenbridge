@@ -607,19 +607,18 @@ def group(m, rows, *, first_row_only: bool = False, continuation_rows=None):
             continue
         pm = struct.unpack_from("<Q", data, 8)[0] - SYSTEM
         parts, k = [i], i
-        # Defer ambiguous named boundaries when the owning root's pack table is on a later page.
-        candidates = set()
-
         def separate_root(page, offset):
             name_hash = _named_root_hash(page)
             if name_hash is None:
                 return None  # Unnamed: use the existing page-map discovery rules.
-            reference = (SYSTEM + offset, name_hash)
+            # Only pages already accepted for this owner may establish membership.
+            # The candidate and its successors could belong to a different dictionary.
             packs = _local_packs(data)
-            if packs is None:
-                candidates.add(reference)
-                return False
-            return reference not in packs
+            if packs is None and len(parts) > 1:
+                prefix = data + b"".join(_inflate(m, rows[j]) for j in parts[1:])
+                packs = _local_packs(prefix)
+            return packs is None or (SYSTEM + offset, name_hash) not in packs
+
         # Only the two count bytes are needed. Locate them by inflated size,
         # including when they straddle a listed stream boundary.
         count_at = pm + 8
@@ -659,25 +658,15 @@ def group(m, rows, *, first_row_only: bool = False, continuation_rows=None):
             end += following["size"]
             k += 1
             parts.append(k)
-        joined = None
         # A listed adjacent root cannot also be an unlisted gap page.
         if len(parts) == pages - 1 and (k + 1 == len(rows) or not _next_to(rows[k], rows[k + 1])):
             joined = b"".join(_inflate(m, rows[j]) for j in parts)
             gap = _gap_page(m, rows[k], joined)
             if gap is not None:
                 parts.append(gap)
-                if candidates:
-                    off, stored, raw = segment(rows, gap)
-                    joined += m[off:off + stored] if raw else _inflate(m, gap)
         if len(parts) != pages:
             unresolved["system page not the next stream"] += 1
             continue
-        if candidates:
-            if joined is None:
-                joined = b"".join(_inflate(m, rows[j]) for j in parts)
-            if not candidates.issubset(_local_packs(joined) or set()):
-                unresolved["system page not the next stream"] += 1
-                continue
         if isinstance(parts[-1], dict):
             gaps[parts[-1]["kind"]] += 1
         taken.update(p for p in parts if not isinstance(p, dict))
