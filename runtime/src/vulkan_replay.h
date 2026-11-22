@@ -2412,7 +2412,12 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             else if (write->mode == write_immediate_mode::marker_in)
                 detail::memory_barrier(vk, command_buffer, 0, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0,
                                        VK_PIPELINE_STAGE_TRANSFER_BIT);
+            // WriteBufferImmediate is unconditional on hardware D3D12 (measured on Intel and NVIDIA D3D12; not in
+            // SetPredication's predicated list). Suspend conditional rendering around vkCmdUpdateBuffer because
+            // Intel's Windows Vulkan driver suppresses it after PredicateReducer::capture's compute dispatch.
+            if (predicate.buffer) vk.end_conditional_rendering(command_buffer);
             vk.update_buffer(command_buffer, p.write_buffer, p.write_offset, 4, &write->value);
+            if (predicate.buffer) vk.begin_conditional_rendering(command_buffer, &predicate);
         } else if (std::holds_alternative<AtomicCopyBuffer>(command)) {
             // Every earlier write, to the dependent resources among others, finishes and is visible before the copy.
             // Vulkan promises no atomicity for a transfer; that a naturally aligned 4- or 8-byte copy is one write
