@@ -403,6 +403,32 @@ python -I tests\test_world_place.py
 ```
 
 The entity rows and the placed chunks come from your own copy of the game; keep them in the local work folder.
+## Trains (`CTrainConfigs`)
+
+Trains are configured by one `CTrainConfigs` XML document in `common.rpf` (see [gamedata.md](gamedata.md)).
+Counts only; no names.
+
+| Path | Count | Content |
+|---|---:|---|
+| `trainConfigs/Item` | 46 | `name` (46 distinct), station stop durations, announce/beep/hang/swing flags, `carriageGap`, `defaultMaxSpeed`, `maxAcceleration`, `maxDeceleration`, `populateTrainDist`, `deathToReviveTime`, `carriages` |
+| `.../carriages/Item` | 314 | `modelName` (304), `modelSetName` (300), `maxPedsPerCarriage`, `flipModelDir`, `doInteriorLights`; 1 to 17 per train (median 8) |
+| `trainGroups/Item` | 5 | `name` and `trainConfigRefs` (24, 4, 5, 1 and 2 refs) |
+| `.../trainConfigRefs/Item` | 36 | `trainConfigsName` and `trainConfigIndex` |
+
+**Group references: resolve by name, not by index.** All 36 `trainConfigsName` values name a config and all 36
+`trainConfigIndex` values are in range, but only 25 indices equal the position of the named config. The other 11
+are exactly one less. The split is clean: every reference to a config at (0-based) position 23 or earlier agrees, and every
+reference to a config at position 26 or later is off by one. That is what one config inserted at position 24 or
+25 after the indices were written would produce, so `trainConfigIndex` looks stale: a loader that trusts it
+would pick a different config for 11 of the 36 references. 12 of the 46 configs are in no group.
+
+Carriage models: the 304 `modelName` values use 13 distinct names; 9 are `.yft` base names in the local archive
+catalog and all 9 are among the vehicle distant-light models, while 4 match no archive entry. The 23 distinct
+`modelSetName` values resolve to an archive entry name in 9 cases. Every carriage has a model name, a model set,
+or both (290 have both).
+
+Ranges: `defaultMaxSpeed` 8 to 15 (median 8), `maxAcceleration` 1 and `maxDeceleration` 2 in all 46,
+`populateTrainDist` 40 in all 46, `carriageGap` -0.5 to 0.1.
 
 ## Instanced props and grass
 
