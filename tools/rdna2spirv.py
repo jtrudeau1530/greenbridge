@@ -7224,6 +7224,14 @@ class Gen:
             fn = {"v_rsq_f16": "InverseSqrt", "v_sqrt_f16": "Sqrt", "v_exp_f16": "Exp2", "v_log_f16": "Log2",
                   "v_floor_f16": "Floor", "v_fract_f16": "Fract", "v_ceil_f16": "Ceil", "v_trunc_f16": "Trunc",
                   "v_rndne_f16": "RoundEven"}.get(op)
+            if fn == "Fract":
+                inf = self.tmp()
+                self.emit(f"{inf} = OpIsInf %bool {f}")
+                if "clamp" in mods:
+                    # DX10_CLAMP maps the infinity result to +0. Give FClamp a defined operand.
+                    clamp_input = self.tmp()
+                    self.emit(f"{clamp_input} = OpSelect %float {inf} %f0 {f}")
+                    f = clamp_input
             if fn:
                 self.emit(f"{r} = OpExtInst %float %glsl {fn} {f}")
             else:
@@ -7231,6 +7239,11 @@ class Gen:
             if fn == "Fract":
                 r = self.fract_below_one(r)
             r = self.clamp_mods(r, mods)
+            if fn == "Fract" and "clamp" not in mods:
+                # gfx1036 returns 0xfe00 for both infinities. Fract and FMul leave the NaN sign unspecified.
+                result = self.tmp()
+                self.emit(f"{result} = OpSelect %float {inf} {self.tof(self.cu(0xFFC00000))} {r}")
+                r = result
             # 0x3c00 -> 0x3bff only when 0x3c00 is Fract's own rounding: after mul:2 fract(0.5) is a true 1.0.
             omod = any(m in ("mul:2", "mul:4", "div:2") for m in mods)
             # rcp/rsq/sqrt (and sin below) ignore MODE rounding on hardware (RX 6800, SHADER-35); exp, log (and cos
