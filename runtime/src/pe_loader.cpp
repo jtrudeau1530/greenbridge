@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "../shims/shims.h"
+#include "../shims/startup_trace.h"
 #include "base_reservation.h"
 
 namespace rt {
@@ -214,7 +215,9 @@ void uninstall_thread_block(Module& m) {
     release_thread_block();
 }
 
-void run_callbacks(Module& m, uint32_t reason) {
+// `trace`: record each callback in the startup trace. Only the Loader's own calls (process attach and detach) pass
+// true; the thread events run under the Windows loader lock and stay out of the trace.
+void run_callbacks(Module& m, uint32_t reason, bool trace = false) {
     auto* tls = tls_directory(m);
     if (!tls || !tls->AddressOfCallBacks) return;
     const uint64_t table_rva = rva_in(m, tls->AddressOfCallBacks, "the TLS callback table");
@@ -226,6 +229,10 @@ void run_callbacks(Module& m, uint32_t reason) {
         if (!fn) break;
         auto callback =
             reinterpret_cast<PIMAGE_TLS_CALLBACK>(m.base + rva_in(m, fn, "a TLS callback"));
+        if (trace && startup_trace::enabled())
+            startup_trace::event("tls_callback", "\"module\":" + startup_trace::quote(m.name) + ",\"at\":" +
+                                                     startup_trace::quote(startup_trace::where(reinterpret_cast<uint64_t>(callback))) +
+                                                     ",\"reason\":" + std::to_string(reason));
         callback(m.base, static_cast<DWORD>(reason), nullptr);
     }
 }
@@ -401,6 +408,11 @@ Module& Loader::load(const std::filesystem::path& image) {
     protect_sections(m);
     register_unwind(m);
     init_order_.push_back(&m);
+    if (startup_trace::enabled())
+        startup_trace::event("map", "\"module\":" + startup_trace::quote(m.name) +
+                                        ",\"base\":" + startup_trace::quote(startup_trace::hex(reinterpret_cast<uint64_t>(m.base))) +
+                                        ",\"size\":" + startup_trace::quote(startup_trace::hex(m.size)) +
+                                        ",\"relocated\":" + (m.relocated ? "true" : "false"));
     return m;
 }
 
@@ -458,7 +470,11 @@ void Loader::initialise(Module& m) {
     if ((nt->FileHeader.Characteristics & IMAGE_FILE_DLL) && m.entry_rva) {
         if (m.entry_rva >= m.size) throw std::runtime_error(m.name + ": the entry point is outside the image");
         auto entry = reinterpret_cast<BOOL(NTAPI*)(void*, DWORD, void*)>(m.base + m.entry_rva);
-        if (!entry(m.base, DLL_PROCESS_ATTACH, nullptr)) {
+        const BOOL ok = entry(m.base, DLL_PROCESS_ATTACH, nullptr);
+        if (startup_trace::enabled())
+            startup_trace::event("dllmain", "\"module\":" + startup_trace::quote(m.name) +
+                                                ",\"result\":" + std::to_string(ok));
+        if (!ok) {
             set_initialised(m, true);  // it ran: a second DLL_PROCESS_ATTACH would be wrong
             throw std::runtime_error(m.name + ": DllMain returned FALSE");
         }
@@ -645,7 +661,7 @@ void Loader::install_tls_for_thread(Module& m) { install_thread_block(m); }
 
 void Loader::uninstall_tls_for_thread(Module& m) { uninstall_thread_block(m); }
 
-void Loader::run_tls_callbacks(Module& m, uint32_t reason) { run_callbacks(m, reason); }
+void Loader::run_tls_callbacks(Module& m, uint32_t reason) { run_callbacks(m, reason, /*trace=*/true); }
 
 void Loader::parse_exports(Module& m) {
     auto* nt = at<IMAGE_NT_HEADERS64>(m.base, reinterpret_cast<IMAGE_DOS_HEADER*>(m.base)->e_lfanew);

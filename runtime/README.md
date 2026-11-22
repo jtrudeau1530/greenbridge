@@ -272,6 +272,37 @@ Each trace line contains a sequence number, a fixed API name and an outcome. `ca
 whose validation may be deferred. `ok`, `failed` and `unsupported` report known results. `ignored` marks a no-op.
 Share only the lines prefixed with `[d3d12-trace]`. Other runtime diagnostics are separate.
 
+### Startup trace: `--trace FILE`
+
+`--trace FILE` (with `--dry-run`, `--init` or `--run`, before the `--` separator) writes one JSON object per line
+to FILE, flushed per event so the file survives a crash ([shims/startup_trace.h](shims/startup_trace.h)). FILE must
+not exist yet: the trace is created before the loader reads anything, so gta6rt refuses an existing path (exit code 2)
+rather than risk truncating an input such as the image. The file is UTF-8; `OutputDebugStringA` text is converted
+from the ANSI code page.
+
+| `kind` | When | Fields |
+|---|---|---|
+| `trace_open` | first line | `pid` |
+| `map` | a module is mapped, bound and protected | `module`, `base`, `size`, `relocated` |
+| `tls_callback` | before each TLS callback the Loader runs (process attach and detach; thread events run under the Windows loader lock and are not traced) | `module`, `at` (module+RVA), `reason` |
+| `dllmain` | after `DllMain(DLL_PROCESS_ATTACH)` returns | `module`, `result` |
+| `unimplemented_call` | first call of each unimplemented import | `import` (`dll!name`), `caller` (module+RVA) |
+| `debug_string` | `OutputDebugStringA/W` with no debugger attached | `text` |
+| `exception` | any exception, before handlers run | `code`, `at`, `access`/`address` for access violations, `cpp` for C++ throws, `stack` (up to 16 frames) |
+| `exit` / `error` | `--run` returns, or the loader throws | `code` / `what` |
+
+Every line also has `seq` and `t` (seconds since the trace opened). Addresses are `module+0xRVA` for mapped images,
+`host:name.dll+0xRVA` for host modules. The exception handler only records: it returns `EXCEPTION_CONTINUE_SEARCH`,
+so the process behaves the same with or without the trace. It works with any `LEONIDA_UNIMPLEMENTED` policy.
+
+The file can quote what the game prints, so it stays on your machine. In issues and pull requests, share counts or
+lines from synthetic fixtures only.
+
+```powershell
+.\runtime\build\gta6rt.exe --run $gameExe --trace startup.jsonl
+Get-Content startup.jsonl | ConvertFrom-Json | Group-Object kind | Select-Object Count, Name
+```
+
 ### Typed clear regression
 
 `clear_color_test` checks numeric UINT conversion and unchanged float clears without a GPU.

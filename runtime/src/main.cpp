@@ -9,7 +9,7 @@
 //   gta6rt --init <image> [--game-dir DIR] [--overlay DIR]
 //       The same mapping, then each loaded DLL's TLS callbacks and DllMain(DLL_PROCESS_ATTACH) are run.
 //
-//   gta6rt --run <exe> [--game-dir DIR] [--overlay DIR] [--trace-d3d12] [-- game arguments...]
+//   gta6rt --run <exe> [--game-dir DIR] [--overlay DIR] [--trace-d3d12] [--trace FILE] [-- game arguments...]
 //       The same, then the EXE's own TLS callbacks and its entry point, on a game thread. The game's argv and
 //       command line are <exe name> plus the arguments after "--"; exit/ExitProcess from the game end the run
 //       (shims/process.cpp). gta6rt prints the binding report first and returns the game's exit code.
@@ -29,6 +29,7 @@
 #include "../shims/file_system.h"
 #include "../shims/process_shim.h"
 #include "../shims/shims.h"
+#include "../shims/startup_trace.h"
 
 namespace {
 
@@ -43,9 +44,9 @@ const char* binding_name(rt::Binding b) {
 
 int usage() {
     std::fprintf(stderr,
-                 "usage: gta6rt --dry-run <image> [--game-dir DIR] [--overlay DIR]\n"
-                 "       gta6rt --init <image> [--game-dir DIR] [--overlay DIR] [--trace-d3d12]\n"
-                 "       gta6rt --run <exe> [--game-dir DIR] [--overlay DIR] [--trace-d3d12] [-- game arguments...]\n");
+                 "usage: gta6rt --dry-run <image> [--game-dir DIR] [--overlay DIR] [--trace FILE]\n"
+                 "       gta6rt --init <image> [--game-dir DIR] [--overlay DIR] [--trace-d3d12] [--trace FILE]\n"
+                 "       gta6rt --run <exe> [--game-dir DIR] [--overlay DIR] [--trace-d3d12] [--trace FILE] [-- game arguments...]\n");
     return 2;
 }
 
@@ -55,6 +56,7 @@ int wmain(int argc, wchar_t** argv) {
     std::filesystem::path image, game_dir, overlay_dir;
     bool dry_run = false, init = false, run = false, trace_d3d12 = false;
     std::vector<std::wstring> game_args;  // wide: path::string() throws on a character the code page lacks (RT-84)
+    std::wstring trace_file;
     for (int i = 1; i < argc; ++i) {
         std::wstring a = argv[i];
         if (a == L"--") {
@@ -65,6 +67,7 @@ int wmain(int argc, wchar_t** argv) {
         else if (a == L"--init") init = true;
         else if (a == L"--run") run = true;
         else if (a == L"--trace-d3d12") trace_d3d12 = true;
+        else if (a == L"--trace" && i + 1 < argc) trace_file = argv[++i];
         else if (a == L"--game-dir" && i + 1 < argc) game_dir = argv[++i];
         else if (a == L"--overlay" && i + 1 < argc) overlay_dir = argv[++i];
         else if (image.empty()) image = a;
@@ -82,6 +85,11 @@ int wmain(int argc, wchar_t** argv) {
     if (overlay_dir.empty()) overlay_dir = game_dir / "overlay";
     rt::fs::configure(game_dir, overlay_dir);
     rt::d3d12_trace::set_enabled(trace_d3d12);
+    if (int trace_error = 0; !trace_file.empty() && !rt::startup_trace::open(trace_file.c_str(), &trace_error)) {
+        std::fprintf(stderr, trace_error == EEXIST ? "error: the trace file already exists; --trace only creates a new file\n"
+                                                   : "error: cannot create the trace file\n");
+        return 2;
+    }
 
     try {
         rt::Loader loader(game_dir);
@@ -112,7 +120,10 @@ int wmain(int argc, wchar_t** argv) {
         std::printf("%zu module(s) mapped, %d unimplemented import(s)\n", loader.modules().size(), unimplemented);
         std::printf("unimplemented by return policy: hresult=%d other=%d\n", unimplemented_hresult,
                     unimplemented - unimplemented_hresult);
-        if (!run) return 0;
+        if (!run) {
+            rt::startup_trace::event("exit", "\"code\":0");
+            return 0;
+        }
         if (!main_module.entry_rva) {
             std::fprintf(stderr, "error: %s has no entry point\n", main_module.name.c_str());
             return 1;
@@ -125,6 +136,7 @@ int wmain(int argc, wchar_t** argv) {
         std::fflush(stdout);
         std::printf("game exited with code %d\n", code);
         rt::shims::report_called_unimplemented();
+        rt::startup_trace::event("exit", "\"code\":" + std::to_string(code));
         std::fflush(stdout);
         std::fflush(stderr);
         // Not `return`: a normal host exit runs the CRT's atexit table, which the game shares with gta6rt (its
@@ -132,6 +144,7 @@ int wmain(int argc, wchar_t** argv) {
         ExitProcess(static_cast<UINT>(code));
     } catch (const std::exception& e) {
         std::fprintf(stderr, "error: %s\n", e.what());
+        rt::startup_trace::event("error", "\"what\":" + rt::startup_trace::quote(e.what()));
         return 1;
     }
 }

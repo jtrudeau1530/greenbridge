@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <cwchar>
 #include <map>
 #include <mutex>
 #include <set>
@@ -12,6 +13,7 @@
 #include <vector>
 
 #include "shims.h"
+#include "startup_trace.h"
 
 namespace rt::shims {
 namespace {
@@ -162,6 +164,9 @@ extern "C" uint64_t rt_unimplemented(const char* what, const CallInfo* info) {
         }
     }
     const uint64_t fail_value = cls == ReturnClass::HResult ? kENotImpl : 0;
+    if (first && startup_trace::enabled())
+        startup_trace::event("unimplemented_call", "\"import\":" + startup_trace::quote(what) +
+                                                       ",\"caller\":" + startup_trace::quote(module_offset(info->ret)));
 
     if (policy == UnimplementedPolicy::Stop) {
         std::fprintf(stderr,
@@ -312,6 +317,37 @@ bool mapped_image_base(uint64_t address, uint64_t& base) {
             return true;
         }
     return false;
+}
+
+std::string module_offset(uint64_t address) {
+    char b[48];
+    std::string module;
+    uint32_t rva = 0;
+    {
+        std::lock_guard lock(g_lookup_mutex);
+        for (auto& l : g_lookups)
+            if (l.fn(l.ctx, address, module, rva)) {
+                std::snprintf(b, sizeof b, "+0x%x", rva);
+                return module + b;
+            }
+    }
+    HMODULE host = nullptr;
+    if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           reinterpret_cast<LPCWSTR>(address), &host) && host) {
+        // Wide, then UTF-8: the ANSI form would put code-page bytes into the trace's JSON lines.
+        wchar_t path[MAX_PATH] = {};
+        const DWORD len = GetModuleFileNameW(host, path, MAX_PATH);
+        const wchar_t* slash = std::wcsrchr(path, L'\\');
+        const wchar_t* file = slash ? slash + 1 : path;
+        const int wlen = len ? static_cast<int>(path + len - file) : 0;
+        const int bytes = wlen > 0 ? WideCharToMultiByte(CP_UTF8, 0, file, wlen, nullptr, 0, nullptr, nullptr) : 0;
+        std::string name(bytes > 0 ? bytes : 0, '\0');
+        if (bytes > 0) WideCharToMultiByte(CP_UTF8, 0, file, wlen, name.data(), bytes, nullptr, nullptr);
+        std::snprintf(b, sizeof b, "+0x%llx", static_cast<unsigned long long>(address - reinterpret_cast<uint64_t>(host)));
+        return "host:" + name + b;
+    }
+    std::snprintf(b, sizeof b, "0x%llx", static_cast<unsigned long long>(address));
+    return b;
 }
 
 void remove_module_lookup(void* ctx) {
