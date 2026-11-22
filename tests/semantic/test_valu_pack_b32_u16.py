@@ -936,6 +936,119 @@ class TestValuPackB32U16ConditionCodes(unittest.TestCase):
         self.assertEqual(simd_state.vcc, canary_vcc)
 
 
+# ==============================================================================
+# IEEE 754 Boundary Extremes, Subnormals, and NaN Handling
+# ==============================================================================
+
+# IEEE 754 binary16 half-precision constants
+POS_ZERO_F16: int = 0x0000
+NEG_ZERO_F16: int = 0x8000
+MIN_SUBNORMAL_F16: int = 0x0001
+MAX_SUBNORMAL_F16: int = 0x03FF
+MIN_SUBNORMAL_NEG_F16: int = 0x8001
+MAX_SUBNORMAL_NEG_F16: int = 0x83FF
+MIN_NORMAL_F16: int = 0x0400
+MAX_FINITE_F16: int = 0x7BFF
+POS_INF_F16: int = 0x7C00
+NEG_INF_F16: int = 0xFC00
+QNAN_F16: int = 0x7E00
+SNAN_F16: int = 0x7C01
+QNAN_PAYLOAD_F16: int = 0x7E55
+SNAN_PAYLOAD_F16: int = 0x7CA5
+
+
+def f16_to_bits(val: float) -> int:
+    """Pack Python float into IEEE 754 binary16 unsigned 16-bit integer."""
+    return struct.unpack("<H", struct.pack("<e", val))[0]
+
+
+def bits_to_f16(bits: int) -> float:
+    """Unpack unsigned 16-bit integer into Python float (IEEE 754 binary16)."""
+    return struct.unpack("<e", struct.pack("<H", bits & MASK16))[0]
+
+
+def is_nan16(bits: int) -> bool:
+    """Return True if 16-bit word represents an IEEE 754 NaN."""
+    return ((bits & 0x7C00) == 0x7C00) and ((bits & 0x03FF) != 0)
+
+
+def is_subnormal16(bits: int) -> bool:
+    """Return True if 16-bit word represents a subnormal (denormal) half float."""
+    return ((bits & 0x7C00) == 0) and ((bits & 0x03FF) != 0)
+
+
+def is_inf16(bits: int) -> bool:
+    """Return True if 16-bit word represents positive or negative infinity."""
+    return ((bits & 0x7C00) == 0x7C00) and ((bits & 0x03FF) == 0)
+
+
+class TestValuPackB32U16IEEE754Boundaries(unittest.TestCase):
+    """Unit tests for IEEE 754 boundary extremes, subnormals, and NaN bit preservation."""
+
+    def test_subnormals_preservation_no_ftz(self) -> None:
+        # Minimum positive subnormal (2^-24) and maximum subnormal
+        res = oracle_v_pack_b32_u16(MIN_SUBNORMAL_F16, MAX_SUBNORMAL_F16)
+        self.assertEqual(ref_extract_half(res, False), MIN_SUBNORMAL_F16)
+        self.assertEqual(ref_extract_half(res, True), MAX_SUBNORMAL_F16)
+        self.assertTrue(is_subnormal16(ref_extract_half(res, False)))
+        self.assertTrue(is_subnormal16(ref_extract_half(res, True)))
+
+        # Negative subnormals
+        res_neg = oracle_v_pack_b32_u16(MIN_SUBNORMAL_NEG_F16, MAX_SUBNORMAL_NEG_F16)
+        self.assertEqual(ref_extract_half(res_neg, False), MIN_SUBNORMAL_NEG_F16)
+        self.assertEqual(ref_extract_half(res_neg, True), MAX_SUBNORMAL_NEG_F16)
+        self.assertTrue(is_subnormal16(ref_extract_half(res_neg, False)))
+        self.assertTrue(is_subnormal16(ref_extract_half(res_neg, True)))
+
+    def test_signaling_nan_preservation_no_quieting(self) -> None:
+        # sNaN must NOT be quieted (bit 9 must remain 0)
+        res = oracle_v_pack_b32_u16(SNAN_F16, SNAN_PAYLOAD_F16)
+        h0 = ref_extract_half(res, False)
+        h1 = ref_extract_half(res, True)
+        self.assertEqual(h0, SNAN_F16)
+        self.assertEqual(h1, SNAN_PAYLOAD_F16)
+        self.assertTrue(is_nan16(h0))
+        self.assertTrue(is_nan16(h1))
+        # Quiet bit (bit 9) must not be set
+        self.assertEqual(h0 & 0x0200, 0)
+        self.assertEqual(h1 & 0x0200, 0)
+
+    def test_quiet_nan_payload_preservation(self) -> None:
+        res = oracle_v_pack_b32_u16(QNAN_F16, QNAN_PAYLOAD_F16)
+        self.assertEqual(ref_extract_half(res, False), QNAN_F16)
+        self.assertEqual(ref_extract_half(res, True), QNAN_PAYLOAD_F16)
+        self.assertTrue(is_nan16(ref_extract_half(res, False)))
+        self.assertTrue(is_nan16(ref_extract_half(res, True)))
+
+    def test_signed_zeros_preservation(self) -> None:
+        # +0.0 (0x0000) and -0.0 (0x8000)
+        res = oracle_v_pack_b32_u16(POS_ZERO_F16, NEG_ZERO_F16)
+        self.assertEqual(ref_extract_half(res, False), POS_ZERO_F16)
+        self.assertEqual(ref_extract_half(res, True), NEG_ZERO_F16)
+        self.assertEqual(ref_extract_half(res, False) & SIGN16, 0)
+        self.assertEqual(ref_extract_half(res, True) & SIGN16, SIGN16)
+
+    def test_infinities_preservation(self) -> None:
+        res = oracle_v_pack_b32_u16(POS_INF_F16, NEG_INF_F16)
+        self.assertEqual(ref_extract_half(res, False), POS_INF_F16)
+        self.assertEqual(ref_extract_half(res, True), NEG_INF_F16)
+        self.assertTrue(is_inf16(ref_extract_half(res, False)))
+        self.assertTrue(is_inf16(ref_extract_half(res, True)))
+
+    def test_float32_halves_roundtrip(self) -> None:
+        # Slicing float32 3.1415927 into 16-bit halves and re-packing
+        f32_val = 3.1415927
+        f32_bits = struct.unpack("<I", struct.pack("<f", f32_val))[0]
+        lo16 = f32_bits & MASK16
+        hi16 = (f32_bits >> 16) & MASK16
+
+        repacked = oracle_v_pack_b32_u16(lo16, hi16)
+        self.assertEqual(repacked, f32_bits)
+        repacked_f32 = struct.unpack("<f", struct.pack("<I", repacked))[0]
+        self.assertAlmostEqual(f32_val, repacked_f32, places=6)
+
+
+
 
 
 
