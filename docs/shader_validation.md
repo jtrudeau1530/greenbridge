@@ -1705,6 +1705,40 @@ is cached).
 - **Constant operands under `op_sel` / `op_sel_hi`:** Integer constants under VOP3P are uniformly treated as 32-bit dwords `C`. When `op_sel[i] == 0`, bits `[15:0]` are selected; when `op_sel[i] == 1`, bits `[31:16]` are selected. Positive inline constants zero-extend (`5` → `0x00000005`: lo=`0x0005`, hi=`0x0000`; `64` → `0x00000040`: lo=`0x0040`, hi=`0x0000`). Negative inline constants sign-extend (`-1` → `0xFFFFFFFF`: lo=`0xFFFF`, hi=`0xFFFF`; `-16` → `0xFFFFFFF0`: lo=`0xFFF0`, hi=`0xFFFF`). 32-bit literals preserve their full dword (`0x12345678`: lo=`0x5678`, hi=`0x1234`; `0x80017fff`: lo=`0x7fff`, hi=`0x8001`). Float inline tokens (`0.5`, `1.0`, `-2.0`, `4.0`) assemble as their 32-bit IEEE 754 bit patterns (`1.0` → `0x3f800000`: lo=`0x0000`, hi=`0x3f80`).
 - **`clamp` saturation:** Unsigned add/mad saturate to `0xFFFF`; unsigned sub saturates underflow to `0x0000`; signed add/sub/mad saturate to `[-32768, 32767]`.
 - **Silicon vs Translator parity:** 380 of 380 kernels match bit-for-bit between native hardware and `tools/rdna2spirv.py` lowered to SPIR-V (0 mismatches, 0 wave32/wave64 differences).
+#### Helper lanes at a triangle edge (`tools/ps_helper_probe.py`, SHADER-681)
+
+What a pixel wave does with the helper lanes of a partly covered 2x2 quad, which the translator's EXEC model and
+`s_wqm` lowering depend on (`docs/design.md` row "Whole-quad mode"). The probe draws one triangle, (-1, -1), (1.3, -1),
+(-1, 0.9), into a 16 x 16 target, so its edge cuts quads; the varying is the vertex position, so each lane's
+interpolated value is its own pixel centre. The template pixel shader takes a derivative, so the driver builds it as
+a shader that needs quads. Seven wave64 programs replace the pixel shader. A helper is never written to the target,
+so a covered lane of the same quad reads the helper's registers through DPP `quad_perm` and exports them.
+
+```sh
+LEONIDA_VK_DEVICE=raphael python -I tools/ps_helper_probe.py --build <runtime build> [--json out.json]
+```
+
+On the Ryzen 7 9800X3D iGPU (`RADV RAPHAEL_MENDOCINO`, gfx1036, Mesa 26.3.1): 137 covered pixels in three waves,
+25 (covered lane, helper neighbour) pairs, and all 10 checks hold in three runs, with identical words except an
+unwritten helper register:
+
+| check | gfx1036 |
+|---|---|
+| entry EXEC | exactly the covered pixels: helpers start off |
+| `s_wqm_b64 exec, exec` | turns on exactly the quads with a covered pixel |
+| wave layout | quads packed from lane 0; a quad with no covered pixel is not in the wave |
+| lane order in a quad | lane % 4 = (x & 1) + 2 (y & 1): top-left, top-right, bottom-left, bottom-right |
+| a helper's `v_interp_p1/p2_f32` after `s_wqm` | its own pixel centre, extrapolated (error 1.64e-4, as covered) |
+| a helper's v0/v1 without `s_wqm` | already its own pixel's I/J (to 7e-5; I + J > 1, outside the triangle) |
+| a helper's VGPR without `s_wqm` | not written (an unwritten register, different in every run) |
+| EXEC without `s_wqm` | stays the entry mask |
+| DPP without `fi` from an inactive lane | leaves the destination unchanged |
+| `exp mrt0 ... done vm` with helpers on in EXEC | writes no pixel outside the triangle |
+
+The last row is what the driver's own code relies on: RADV compiles the template as `s_wqm_b64 exec, exec` at entry,
+then the interpolation and an `exp mrt0 ... done vm` with the helpers still on. The programs are wave64; a wave32
+pixel stage (`RADV_PERFTEST=pswave32`) and GFX11+ exit 77. Not measured: wave32, RDNA1/gfx1013 and the Windows driver.
+
 ### Packed 16-bit integer operations on RDNA2 (SHADER-302)
 
 *Measured on an RDNA2 iGPU (gfx1036), Windows 11, AMD Windows driver 32.0.21045.29003, HIP backend (`amdhip64_6.dll`), AMD clang 23.0.0git (`rocm-sdk-core 10.0.0`).*
