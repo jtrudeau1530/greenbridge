@@ -44,14 +44,27 @@ class F64TranscendentalsTest(unittest.TestCase):
             masked = result(rf"OpSelect %uint %\w+ {word} {old_word}")
             self.assertRegex(spv, rf"(?m)^ *OpStore {dest} {masked}$")
 
+    def _double_const_id(self, spv, value):
+        def result(instruction):
+            match = re.search(rf"^ *(%\w+) = {instruction}$", spv, re.M)
+            self.assertIsNotNone(match, f"Missing SPIR-V instruction: {instruction}")
+            return match.group(1)
+
+        lo, hi = words(value)
+        pair = result(
+            rf"OpCompositeConstruct %v2uint_d {result(f'OpConstant %uint {lo}')} "
+            rf"{result(f'OpConstant %uint {hi}')}"
+        )
+        return result(rf"OpBitcast %double {pair}")
+
     def test_v_rcp_rsq_sqrt_f64_lowering_and_modifiers(self):
         ops = (
             ("v_rcp_f64_e32", "", r"OpFDiv %double %\w+ %\w+", None, False),
             ("v_rsq_f64_e32", "", r"OpExtInst %double %glsl InverseSqrt %\w+", None, False),
             ("v_sqrt_f64_e32", "", r"OpExtInst %double %glsl Sqrt %\w+", None, False),
             ("v_rcp_f64_e64", "mul:2", r"OpFDiv %double %\w+ %\w+", 2.0, False),
-            ("v_rsq_f64_e64", "div:2 clamp", r"OpExtInst %double %glsl InverseSqrt %\w+", 0.5, True),
-            ("v_sqrt_f64_e64", "mul:4 clamp", r"OpExtInst %double %glsl Sqrt %\w+", 4.0, True),
+            ("v_rsq_f64_e64", "clamp div:2", r"OpExtInst %double %glsl InverseSqrt %\w+", 0.5, True),
+            ("v_sqrt_f64_e64", "clamp mul:4", r"OpExtInst %double %glsl Sqrt %\w+", 4.0, True),
         )
         prefix = load_double(0, 1, 4.0)
         with tempfile.TemporaryDirectory() as directory:
@@ -64,13 +77,22 @@ class F64TranscendentalsTest(unittest.TestCase):
                     self.assertIsNotNone(m, f"Missing {pattern} in:\n{spv}")
                     val = m.group(1)
                     if scale is not None:
-                        m_mul = re.search(rf"^ *(%\w+) = OpFMul %double {val} %\w+$", spv, re.M)
-                        self.assertIsNotNone(m_mul)
+                        scale_id = self._double_const_id(spv, scale)
+                        m_mul = re.search(rf"^ *(%\w+) = OpFMul %double {val} {scale_id}$", spv, re.M)
+                        self.assertIsNotNone(m_mul, f"Missing OpFMul by {scale} ({scale_id})")
                         val = m_mul.group(1)
+                    else:
+                        self.assertNotRegex(spv, r"OpFMul %double")
                     if clamp:
-                        m_cl = re.search(rf"^ *(%\w+) = OpExtInst %double %glsl FClamp {val} %\w+ %\w+$", spv, re.M)
+                        zero_id = self._double_const_id(spv, 0.0)
+                        one_id = self._double_const_id(spv, 1.0)
+                        m_cl = re.search(
+                            rf"^ *(%\w+) = OpExtInst %double %glsl FClamp {val} {zero_id} {one_id}$", spv, re.M
+                        )
                         self.assertIsNotNone(m_cl)
                         val = m_cl.group(1)
+                    else:
+                        self.assertNotIn("FClamp", spv)
                     self._check_store_pair(spv, val, 4, 5)
                     if shutil.which("spirv-as") and shutil.which("spirv-val"):
                         spv_bin = Path(directory) / f"{op}.spv"
