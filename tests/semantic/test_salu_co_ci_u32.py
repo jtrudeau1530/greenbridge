@@ -751,5 +751,139 @@ class TestRegisterAliasingAndPreservation(unittest.TestCase):
                 self.assertEqual(self.state.read_sgpr(i), (i * 0x0202_0202) & MASK_U32)
 
 
+# ==============================================================================
+# Condition Codes, Status Flags, and Extended Precision Propagation
+# ==============================================================================
+
+@dataclass(frozen=True)
+class SALUStatusFlags:
+    """Architectural condition codes and algebraic status flags."""
+    carry_or_borrow: int
+    zero: bool
+    sign: bool
+    signed_overflow: bool
+    parity_even: bool
+
+
+def evaluate_salu_co_ci_flags(
+    opcode: SOPOpcode, src0: int, src1: int, cin: int, result: int, cc_out: int
+) -> SALUStatusFlags:
+    """Evaluate condition codes including signed overflow for carry-in operations."""
+    s0 = src0 & MASK_U32
+    s1 = src1 & MASK_U32
+    c = 1 if cin else 0
+    res = result & MASK_U32
+
+    zero = (res == 0)
+    sign = bool(res & SIGN_BIT_U32)
+
+    # Convert to signed 32-bit integer for signed overflow detection
+    def to_signed(val: int) -> int:
+        return val - MODULO_U32 if (val & SIGN_BIT_U32) else val
+
+    s0_signed = to_signed(s0)
+    s1_signed = to_signed(s1)
+
+    is_add = opcode in (SOPOpcode.S_ADDC_U32, SOPOpcode.S_ADD_CO_CI_U32)
+    if is_add:
+        exact_sum = s0_signed + s1_signed + c
+        signed_overflow = not (-(1 << 31) <= exact_sum < (1 << 31))
+    else:
+        exact_diff = s0_signed - s1_signed - c
+        signed_overflow = not (-(1 << 31) <= exact_diff < (1 << 31))
+
+    parity_even = (bin(res).count("1") % 2 == 0)
+
+    return SALUStatusFlags(
+        carry_or_borrow=cc_out,
+        zero=zero,
+        sign=sign,
+        signed_overflow=signed_overflow,
+        parity_even=parity_even,
+    )
+
+
+def simulate_multi_dword_add(words_a: List[int], words_b: List[int]) -> Tuple[List[int], int]:
+    """Chain 32-bit additions across N dwords using s_addc_u32."""
+    assert len(words_a) == len(words_b)
+    res_words: List[int] = []
+    carry = 0
+    for a, b in zip(words_a, words_b):
+        res, carry = oracle_s_addc_u32(a, b, cin=carry)
+        res_words.append(res)
+    return res_words, carry
+
+
+def simulate_multi_dword_sub(words_a: List[int], words_b: List[int]) -> Tuple[List[int], int]:
+    """Chain 32-bit subtractions across N dwords using s_subb_u32."""
+    assert len(words_a) == len(words_b)
+    res_words: List[int] = []
+    borrow = 0
+    for a, b in zip(words_a, words_b):
+        res, borrow = oracle_s_subb_u32(a, b, bin_val=borrow)
+        res_words.append(res)
+    return res_words, borrow
+
+
+class TestConditionCodesAndExtendedPrecisionPropagation(unittest.TestCase):
+    """Verification of condition codes and multi-dword ripple carry/borrow propagation."""
+
+    def test_signed_overflow_evaluation(self) -> None:
+        # 0x7FFF_FFFF + 0 + cin=1 => 0x8000_0000 (signed overflow)
+        res, cc = oracle_s_addc_u32(0x7FFF_FFFF, 0, cin=1)
+        flags = evaluate_salu_co_ci_flags(SOPOpcode.S_ADDC_U32, 0x7FFF_FFFF, 0, 1, res, cc)
+        self.assertEqual(res, 0x8000_0000)
+        self.assertEqual(cc, 0)
+        self.assertTrue(flags.signed_overflow)
+        self.assertTrue(flags.sign)
+
+        # 0x8000_0000 - 0 - bin=1 => 0x7FFF_FFFF (signed overflow)
+        res_s, cc_s = oracle_s_subb_u32(0x8000_0000, 0, bin_val=1)
+        flags_s = evaluate_salu_co_ci_flags(SOPOpcode.S_SUBB_U32, 0x8000_0000, 0, 1, res_s, cc_s)
+        self.assertEqual(res_s, 0x7FFF_FFFF)
+        self.assertEqual(cc_s, 0)
+        self.assertTrue(flags_s.signed_overflow)
+        self.assertFalse(flags_s.sign)
+
+    def test_96bit_ripple_carry_addition(self) -> None:
+        # A = 0x00000000_FFFFFFFF_FFFFFFFF, B = 0x00000000_00000000_00000001
+        words_a = [MAX_U32, MAX_U32, 0]
+        words_b = [1, 0, 0]
+        res_words, carry_out = simulate_multi_dword_add(words_a, words_b)
+        self.assertEqual(res_words, [0, 0, 1])
+        self.assertEqual(carry_out, 0)
+
+    def test_96bit_ripple_borrow_subtraction(self) -> None:
+        # A = 0x00000001_00000000_00000000, B = 0x00000000_00000000_00000001
+        words_a = [0, 0, 1]
+        words_b = [1, 0, 0]
+        res_words, borrow_out = simulate_multi_dword_sub(words_a, words_b)
+        self.assertEqual(res_words, [MAX_U32, MAX_U32, 0])
+        self.assertEqual(borrow_out, 0)
+
+    def test_128bit_ripple_arithmetic_against_bigint(self) -> None:
+        vectors_128 = [
+            (0xFFFF_FFFF_FFFF_FFFF_FFFF_FFFF_FFFF_FFFF, 1),
+            ((1 << 96) - 1, 1),
+            (0x1234_5678_9ABC_DEF0_1357_9BDF_0246_8ACE, 0xEDCB_A987_6543_210F_ECCA_8642_FD75_3190),
+        ]
+        for a128, b128 in vectors_128:
+            with self.subTest(a=hex(a128), b=hex(b128)):
+                words_a = [(a128 >> (i * 32)) & MASK_U32 for i in range(4)]
+                words_b = [(b128 >> (i * 32)) & MASK_U32 for i in range(4)]
+
+                # Addition
+                res_add, c_out = simulate_multi_dword_add(words_a, words_b)
+                sum_int = sum(w << (i * 32) for i, w in enumerate(res_add))
+                self.assertEqual(sum_int, (a128 + b128) & ((1 << 128) - 1))
+                self.assertEqual(c_out, 1 if (a128 + b128) >= (1 << 128) else 0)
+
+                # Subtraction
+                res_sub, b_out = simulate_multi_dword_sub(words_a, words_b)
+                diff_int = sum(w << (i * 32) for i, w in enumerate(res_sub))
+                self.assertEqual(diff_int, (a128 - b128) & ((1 << 128) - 1))
+                self.assertEqual(b_out, 1 if a128 < b128 else 0)
+
+
 if __name__ == "__main__":
     unittest.main()
