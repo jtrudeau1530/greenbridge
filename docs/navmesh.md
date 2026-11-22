@@ -192,10 +192,42 @@ layout, fixed `0xF0`-byte header, `14.36 GiB` / `15,420,757,856` bytes inflated 
 | `+0xC8` | 4 | `u32` | 512 Ã— 512 sector ID (`0` if `flags & 4`) | `0` iff `flags & 4` (`162` pages); exact `136 Ã— 180 = 24,480` static grid |
 | `+0xCC` | 4 | `u32` | Core mesh data byte size | `6*c0 + 14*pool + 44*c4 + 32*d4 == u32@0xCC` with **0 residual** on `27,644 / 27,644` |
 | `+0xD4` / `+0xD8` / `+0xDC` | 12 | `u32[3]` | Special-link, link-index, and `+0xB8` record counts | Sums `26,679,246` / `26,903,247` / `6,246,890` |
-| `+0xE8` | 4 | `u32` | Build stamp (`0` if `flags & 4`) | `7` distinct values (`0` on `162`, `0x09090516` on `24,474`, `0x160e3132` on `3,003`, 4 rare on `5`); encoding **open** |
+| `+0xE8` | 4 | `u8[4]` | Build stamp (`0` if `flags & 4`): second, minute, hour, day of month | `7` distinct values (`0` on `162`, `0x09090516` on `24,474`, `0x160e3132` on `3,003`, 4 rare on `5`); see [Build stamp](#build-stamp-0xe8) |
 
 Reserved slots `+0x18..+0x1f`, `+0x6c..+0x6f`, `+0x78..+0x7f`, `+0x94..+0x97`, `+0xd0..+0xd3`, `+0xe0..+0xe7`, and
 `+0xec..+0xef` are zero on `27,644 / 27,644` pages.
+
+### Build stamp (`+0xE8`)
+
+Read as four bytes from the lowest address, every nonzero value is a second, a minute, an hour and a day of month,
+the first four fields of C's `struct tm` in their order. No month or year is stored. The numbers are for the
+1.0.2.1 package (ASSET-282):
+
+| `u32@0xE8` | Bytes | Reads as | Tiles | Grid positions |
+|---|---|---|---:|---|
+| `0x09090516` | 22, 5, 9, 9 | day 9, 09:05:22 | 24,474 | 24,474 of 24,480: 23,536 alone, 938 shared |
+| `0x160e3132` | 50, 49, 14, 22 | day 22, 14:49:50 | 3,003 | 940, never alone |
+| `0x0f0e1b37` | 55, 27, 14, 15 | day 15, 14:27:55 | 2 | 2 adjacent, alone |
+| `0x1d07151c` | 28, 21, 7, 29 | day 29, 07:21:28 | 1 | alone |
+| `0x18101739` | 57, 23, 16, 24 | day 24, 16:23:57 | 1 | shared with 2 day-22 tiles |
+| `0x0b0a2f1a` | 26, 47, 10, 11 | day 11, 10:47:26 | 1 | alone |
+| `0` | | not a grid tile | 162 | the `flags & 4` meshes |
+
+- **Only the date and time reading fits all six nonzero values.** In each one, the low two bytes are below 60, the
+  third is below 24 and the top byte is 1 to 31. Six independent random words land in those ranges with a
+  probability of about 6 × 10⁻²⁰. The low two bytes could in principle be the other way round (minute first). The
+  `struct tm` order is the natural reading, but the data can't tell them apart.
+- **The day-22 stamp marks tiles added on top of the base grid.** The 27,482 static tiles sit on 24,480 grid
+  positions (the `u32@0xC8` sector, above). The 3,002 extra tiles are all on 940 positions that hold 2 to 40 tiles,
+  and every one of those positions has day-22 tiles. 2,984 of the 3,003 day-22 tiles share their position with a
+  day-9 tile, and on all 938 positions with both, the day-22 tiles come later in the archive. The other 19 are on two
+  positions without a day-9 tile: 17 at sector (255, 248), and 2 with the day-24 tile at (248, 246). On 450 of the 938, the first day-22 tile has the same vertex and polygon
+  counts as the day-9 tile. What the stacked tiles are for is not measured.
+- **Neighbouring tiles share a stamp.** Of the 48,644 pairs of grid neighbours (one tile per position), 98.12% have
+  the same stamp, against 92.58% for stamps placed at random with the same frequencies.
+
+Method: `tools/navmesh_decode.py`'s own scan of `navmeshes.rpf`, with each tile's `u32@0xE8`, `u32@0xC8`, flags,
+counts and archive offset recorded per tile. No geometry was kept.
 
 The `+4` word of a polygon packs `(index start << 4) | count`; the runs tile the index pool in order
 (`tools/navmesh_decode.py --deep` checks it on all `124,768,148` polygons, 0 failures), which caps a polygon at 15
