@@ -3,7 +3,7 @@
 > [!NOTE]
 > A documentação em inglês ([`README.md`](../../../README.md), [`CONTRIBUTING.md`](../../../CONTRIBUTING.md) e
 > [`docs/README.md`](../../README.md)) é a **referência oficial**. Este guia reúne apenas instruções estáveis de
-> configuração e compilação (sincronizado com o commit `d3841c0c`). Para o status diário do projeto, consulte o
+> configuração e compilação (sincronizado com o commit `003e7812`). Para o status diário do projeto, consulte o
 > [`README.md`](../../../README.md).
 
 ## O que é o Leonida
@@ -30,9 +30,14 @@ O projeto está em fase inicial: **o jogo ainda não dá boot**.
 - [Vulkan SDK](https://vulkan.lunarg.com/) (`spirv-as`, `spirv-val` e `vulkaninfo`).
 - [LLVM 21+](https://github.com/llvm/llvm-project/releases) com o **target AMDGPU** (`llvm-mc`):
   - O binário oficial do LLVM para Windows **não** inclui o target AMDGPU.
-  - Para compilar um `llvm-mc.exe` nativo com AMDGPU, execute `.\scripts\build_llvm_mc.ps1` no PowerShell
-    a partir da raiz do repositório. O script requer `git` e as ferramentas C++ do Visual Studio, configura
-    `LLVM_MC` para o seu usuário e pede que você abra um novo terminal para carregar a variável.
+  - Para compilar um `llvm-mc.exe` nativo com AMDGPU, rode este comando a partir da raiz do repositório.
+
+    ```powershell
+    powershell -ExecutionPolicy Bypass -File scripts\build_llvm_mc.ps1
+    ```
+
+    O script requer `git` e as ferramentas C++ do Visual Studio, configura `LLVM_MC` para o seu usuário
+    e pede que você abra um novo terminal para carregar a variável.
   - Se usar o WSL, instale `llvm-21` no Ubuntu e defina a variável na mesma sessão do PowerShell em que vai
     executar `make_game.py`.
 
@@ -80,7 +85,7 @@ Os estágios executam nesta ordem: `check` → `shaders` → `assets` → `runti
 ## Problemas comuns
 
 - **Baixou pelo botão "Download ZIP" do GitHub**: o ZIP não inclui o submódulo `third_party/rpf9-explorer`. Use `git clone --recursive` ou execute `git submodule update --init --recursive` dentro da pasta do repositório.
-- **`llvm-mc` recusa `gfx1013` / AMDGPU**: você provavelmente está com o instalador oficial do LLVM para Windows. Use `scripts\build_llvm_mc.ps1` ou aponte `LLVM_MC` para o `llvm-mc` do WSL (`llvm-21`).
+- **`llvm-mc` recusa `gfx1013` / AMDGPU**: você provavelmente está com o instalador oficial do LLVM para Windows. Siga um dos passos de configuração do LLVM acima.
 - **Erro de `D3D12_ROOT_SIGNATURE_DESC2` ao compilar o runtime**: atualize o Windows SDK para `10.0.26100` ou mais recente pelo Visual Studio Installer ou `winget install Microsoft.WindowsSDK.10.0.26100`, apague a pasta de build e reconfigure.
 - **Falha por falta de espaço no drive `C:`**: passe `--work "D:\leonida-work"` para mover os arquivos temporários para outra partição.
 
@@ -91,7 +96,8 @@ Os estágios executam nesta ordem: `check` → `shaders` → `assets` → `runti
 2. Rode os testes relevantes com entradas sintéticas. Por exemplo, para testar o verificador de manifestos,
    execute `python -I tests/test_manifest_verifier.py` na raiz do repositório.
 3. No PR, inclua o ID da tarefa, descreva o que testou e informe a GPU e o driver se rodou testes de GPU.
-   Indique se usou assistência de IA. Confira as regras em [`CONTRIBUTING.md`](../../../CONTRIBUTING.md).
+   Confira as regras em [`CONTRIBUTING.md`](../../../CONTRIBUTING.md). Se usou assistência de IA, indique
+   isso no PR, conforme [`AGENTS.md`](../../../AGENTS.md).
 
 O [guia de testes em GPU](../../testing.md) mostra como executar os testes sem arquivos do jogo.
 Publique os resultados de GPU na [issue #166](https://github.com/ItsNotRexed/Leonida/issues/166).

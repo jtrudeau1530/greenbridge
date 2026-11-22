@@ -1497,7 +1497,7 @@ def scan_pools(paths, as_json=None, include_tuples=False):
     if as_json:
         try:
             os.makedirs(os.path.dirname(os.path.abspath(as_json)), exist_ok=True)
-            with open(as_json, "w", encoding="utf-8") as f:
+            with open(as_json, "w", encoding="utf-8", newline="\n") as f:
                 json.dump(report, f, indent=1)
         except OSError as exc:
             raise ValueError(f"cannot write {as_json}: {exc.strerror or exc}") from None

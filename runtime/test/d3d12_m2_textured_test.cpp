@@ -20,6 +20,7 @@
 // [1] POINT/WRAP. The left half takes the WRAP sampler (U + 1 wraps back: the gradient again), the right half the
 // CLAMP one (U + 1 clamps to the last column: each row is that row's right-edge texel of the reflected texture). The
 // pixels are predicted on the CPU, error 0, and 1536 of them differ from the plain reflection.
+// The control also keeps one unbounded SRV table bound and selects its two entries by a root constant.
 // Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation (0 errors required).
 #include "vk_test_device.h"
 #include "d3d12_test_shaders.h"
@@ -148,6 +149,22 @@ int main() {
         pso_desc.SampleDesc.Count = 1;
         Ref<ID3D12PipelineState> pso, uoff_pso;
         EXPECT(SUCCEEDED(device->CreateGraphicsPipelineState(&pso_desc, IID_PPV_ARGS(&pso.p))));
+        D3D12_DESCRIPTOR_RANGE indexed_range = srv_range;
+        indexed_range.NumDescriptors = UINT32_MAX;
+        D3D12_ROOT_PARAMETER indexed_params[3] = {params[0], params[1], {}};
+        indexed_params[0].DescriptorTable = {1, &indexed_range};
+        indexed_params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+        indexed_params[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+        indexed_params[2].Constants = {0, 0, 2};  // s4 = SRV index, s5 = SRV stride in bytes
+        D3D12_VERSIONED_ROOT_SIGNATURE_DESC indexed_desc = root_desc;
+        indexed_desc.Desc_1_0.NumParameters = 3;
+        indexed_desc.Desc_1_0.pParameters = indexed_params;
+        const auto indexed_blob = serialize_root_signature(indexed_desc);
+        EXPECT(!indexed_blob.empty());
+        Ref<ID3D12RootSignature> indexed_root;
+        EXPECT(SUCCEEDED(device->CreateRootSignature(0, indexed_blob.data(), indexed_blob.size(),
+                                                    IID_PPV_ARGS(&indexed_root.p))));
+        pso_desc.pRootSignature = indexed_root.p;
         pso_desc.PS = {uoff_container.data(), uoff_container.size()};
         EXPECT(SUCCEEDED(device->CreateGraphicsPipelineState(&pso_desc, IID_PPV_ARGS(&uoff_pso.p))));
 
@@ -350,8 +367,9 @@ int main() {
                                                  D3D12_RESOURCE_STATE_RENDER_TARGET);
         list2->ResourceBarrier(1, &back);
         list2->ClearRenderTargetView(rtv, clear, 0, nullptr);
-        list2->SetGraphicsRootSignature(root.p);
+        list2->SetGraphicsRootSignature(indexed_root.p);
         list2->SetDescriptorHeaps(2, heaps);
+        list2->SetGraphicsRootDescriptorTable(0, D3D12_GPU_DESCRIPTOR_HANDLE{srv_gpu});
         list2->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         list2->IASetIndexBuffer(&ibv);
         list2->RSSetViewports(1, &viewport);
@@ -359,7 +377,8 @@ int main() {
         for (UINT half = 0; half < 2; ++half) {
             const D3D12_RECT scissor{LONG(half * target_size / 2), 0, LONG((half + 1) * target_size / 2), LONG(target_size)};
             list2->RSSetScissorRects(1, &scissor);
-            list2->SetGraphicsRootDescriptorTable(0, D3D12_GPU_DESCRIPTOR_HANDLE{srv_gpu + std::uint64_t(half) * step});
+            const UINT srv_args[] = {half, step};
+            list2->SetGraphicsRoot32BitConstants(2, 2, srv_args, 0);
             list2->SetGraphicsRootDescriptorTable(
                 1, D3D12_GPU_DESCRIPTOR_HANDLE{sampler_gpu + std::uint64_t(half == 0 ? sampler_step : 0)});
             list2->DrawIndexedInstanced(6, 1, 0, 0, 0);
@@ -387,6 +406,7 @@ int main() {
         uoff_pso.reset();
         list2.reset();
         allocator2.reset();
+        indexed_root.reset();
         root.reset();
         srv_heap.reset();
         sampler_heap.reset();

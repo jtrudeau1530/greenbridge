@@ -153,7 +153,7 @@ def main(argv=None) -> int:
               "game version.", file=sys.stderr)
         return 1
     tmp = os.path.join(src, "fssm_index.json.tmp")   # written last and renamed in, so a stopped run leaves none
-    with open(tmp, "w", encoding="utf-8") as f:
+    with open(tmp, "w", encoding="utf-8", newline="\n") as f:
         json.dump(rows, f)
         f.flush()
         os.fsync(f.fileno())

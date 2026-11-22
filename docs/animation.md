@@ -278,7 +278,8 @@ blob to its last byte and confirms the counts above: 9 descriptors, 28,962 eleme
 string values, 6,677 integer values and maximum element depth 6. The 1,126 string values are the `key` attributes
 on the rig-set `Item` elements. Each of the 6,677 entry `Item` elements contains `Dictionary`, `Rig` and `Group`
 text children followed by a `Priority` integer. The record framing is consumed exactly; the numeric field
-semantics and the rig-to-skeleton link remain unresolved.
+semantics remain unresolved. The `Dictionary` text names one of the four rig dictionaries and `Rig` is a key
+there; see [Rig dictionaries](#rig-dictionaries).
 
 Mapping to the name tables:
 
@@ -328,7 +329,8 @@ are in the same stream. It is not a rig → skeleton link for RBF0:
 - The four motionmatcher paths are not in the 2,298 `.clip`/`.anim`/`.motion` name-table paths.
 
 So RBF0 gives rig-set → source → rig, and the motion matcher resources show how a clip can carry its own bone
-table. The link from an RBF0 rig to that table is still missing; it is the main unresolved binding.
+table. The RBF0 rig itself resolves into a rig dictionary ([Rig dictionaries](#rig-dictionaries)); what it does not
+give is a whole skeleton for the clips.
 
 ### Magics not found
 
@@ -380,7 +382,8 @@ as a clip dictionary; all 36 do, so no root is left unresolved. That recovery ru
 has been read from listed streams: a root whose page map is in such an unlisted last page stays unresolved ("page
 map not in the next stream"). No anim.rpf root has that layout. In `story000.rpf` 5 roots do, with the page map in
 a 32- or 48-byte zlib tail, and none of the 5 is a clip dictionary once that tail is joined. Of the joined resources, 61,505 are clip
-dictionaries. 4 have `RIG` plus a version at +0x70 instead of a pack array (rig dictionaries, not decoded here), and
+dictionaries. 4 have `RIG` plus a version at +0x70 instead of a pack array (rig dictionaries, [decoded
+below](#rig-dictionaries) by `tools/anim_rigs.py`), and
 1 has some other value there. Together the dictionaries use 87,234 listed streams plus the 36 unlisted pages
 (3,802,124,713 stored / 7,077,351,104 inflated bytes in the listed streams). By `anim_index.py` class those
 streams are: zero-prefix 66,115, raw 20,845, name-table 273, skeleton-names 1.
@@ -594,6 +597,68 @@ one of the 1,902 hashes anim.rpf refers to without having them.
 ```
 python -I tools/anim_clips.py <package>\pack\story000\story000.rpf <work>\story000-clips.json --jobs 20
 ```
+
+## Rig dictionaries
+
+`tools/anim_rigs.py` reads the four `RIG` roots above (ASSET-20). Run on the 1.0.2.1 copy:
+
+```powershell
+python -I tools/anim_index.py <package>\anim.rpf <work>\anim-index.json --rigs <work>\rigs.json
+python -I tools/anim_rigs.py <package>\anim.rpf <work>\anim-rigs.json --rigs <work>\rigs.json
+```
+
+The output holds counts and one row per rig dictionary (offset, name, hash, entry count), no table items.
+
+**Layout.** The root is the clip dictionary's: `+0x38` atString name, `+0x48` atMap, `+0x68` `joaat32(name)` (4 of
+4), and at `+0x70` the bytes `RIG` and a version byte (2 in all four). Every map key has a zero high half (3,897 of
+3,897). Every map value has a pointer at `+0x20` to a **`RIG` block** (3,897 of 3,897): `RIG`, a version byte (2),
+a u32 length of what follows, then tables `{u32 kind hash; u32 size = 0xC + 8 × count; u32 count; u32 word}`, each
+followed by `count` 8-byte items `{u32 hash; u32 word}`, with other bytes between the tables. The other bytes and
+the item words are not mapped.
+
+**The four dictionaries are the four RBF0 sources.** Their names are the four source strings of the rig-set
+manager:
+
+| Name | Entries | Keys that are `joaat32` of an RBF0 rig |
+|---|---:|---:|
+| `canonical@legacy` | 22 | 16 |
+| `canonical@source` | 543 | 534 |
+| `generated@source` | 1,256 | 1,188 |
+| `pipelined@source` | 2,076 | 1,931 |
+
+These are the distinct-rig counts per source in [the RBF0 table above](#tail-rbf0-rig-set-manager). The other 228
+keys are not named by any RBF0 entry. **All 6,677 RBF0 entries resolve**: the entry's `Dictionary` text is the
+rig dictionary's name, and `joaat32(lowercase Rig path)` is a key in it (6,677 of 6,677; 0 in another dictionary,
+0 missing). So a rig set reaches its rigs' `RIG` blocks through rig-set → `{Dictionary, Rig}` → rig dictionary →
+key → `+0x20`.
+
+**Tables.** 6,606 tables are found in the 3,897 blocks. Four kind hashes hold all but 5 of them; the 5 are single
+hits whose "kind" is an f32 near 1.0 (`0x3f7f....`, `0x3f76....`) or a small integer, so they are float data that
+happens to fit the header rule. The kind names are not resolved:
+
+| Kind | Tables | Items | Items that are a clip track's bone hash |
+|---|---:|---:|---:|
+| `0x74d00508` | 2,642 | 13,210 | 0 |
+| `0x2316833f` | 2,437 | 118,853 | 91,559 |
+| `0xb688b77e` | 1,427 | 72,528 | 39,880 |
+| `0x5e25d3bf` | 95 | 4,416 | 0 |
+
+"A clip track's bone hash" means the hash is the bone of some track in the 191,042 decoded animations.
+
+**Rigs are not the clips' skeletons.** The clip side was measured with a local script over the same
+`anim_clips.py` parse: for each of the 52,752 clip dictionaries with bone tracks, the union of its
+`bonerotation`/`bonetranslation` bone hashes (mover track 0 left out).
+
+- Against the 596 hashed names of the shared humanoid skeleton ([character_skeleton.md](character_skeleton.md)),
+  44,359 dictionaries have at least 90% of their bones in it (16 have all of them).
+- Against the rigs (the items of the two bone-bearing kinds above), no rig set covers the clips of a humanoid
+  dictionary. Even the union over all the rigs of one rig set reaches 80% of a dictionary's bones for 11 of those
+  44,359. Only 4 dictionaries, all of objects, are covered completely by a rig set.
+
+So humanoid clips bind to the fragment skeleton, not to a `RIG` block. The rig tables look like per-rig bone or
+channel subsets (the RBF0 groups are `deformation`, `pose`, `identity`, `facial` and others); that reading is not
+measured. Still open in ASSET-20: the `0DRP` "2/3 packed clip streams" ([above](#packed-clip-streams)) and which
+model or skeleton each non-humanoid clip dictionary drives.
 
 ## Readable, compressed and still opaque
 

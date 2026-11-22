@@ -51,10 +51,27 @@ int main() {
     HRESULT hr = init(0, 0, 0x02, &options);
     if (hr != S_OK) return fail("InitializeApiImplEx2", static_cast<unsigned long>(hr));
 
-    // XThreadingImpl, the first class XCurl.dll references (docs/runtime_imports.md); not provided offline yet.
+    // XThreadingImpl, the first class XCurl.dll references (docs/runtime_imports.md), used as its thunks do: the
+    // class id as both ids, a slot with `this` first, then Release (slot 2). Slot 12 is XTaskQueueCreate, 17
+    // XTaskQueueCloseHandle.
     const GUID threading = {0x073b7dcb, 0x1fcf, 0x4030, {0x94, 0xbe, 0xe3, 0xc9, 0xeb, 0x62, 0x34, 0x28}};
+    void* obj = nullptr;
+    hr = query(&threading, threading, &obj);
+    if (hr != S_OK || !obj) return fail("QueryApiImpl hands out XThreadingImpl", static_cast<unsigned long>(hr));
+    void* const* vtable = *static_cast<void* const* const*>(obj);
+    using Create = HRESULT(STDMETHODCALLTYPE*)(void*, UINT32, UINT32, void**);
+    using Close = void(STDMETHODCALLTYPE*)(void*, void*);
+    using Release = ULONG(STDMETHODCALLTYPE*)(void*);
+    void* queue = nullptr;
+    hr = reinterpret_cast<Create>(vtable[12])(obj, 0, 0, &queue);  // XTaskQueueDispatchMode::Manual twice
+    if (hr != S_OK || !queue) return fail("XThreadingImpl slot 12 (XTaskQueueCreate)", static_cast<unsigned long>(hr));
+    reinterpret_cast<Close>(vtable[17])(obj, queue);
+    reinterpret_cast<Release>(vtable[2])(obj);
+
+    // A class not served yet (XNetworkingImpl) is refused, with the out pointer cleared.
+    const GUID networking = {0x37e56907, 0x2f10, 0x41e8, {0xb7, 0x2f, 0x36, 0xed, 0xb1, 0x85, 0x33, 0x1a}};
     void* out = reinterpret_cast<void*>(1);
-    hr = query(&threading, threading, &out);
+    hr = query(&networking, networking, &out);
     if (hr != static_cast<HRESULT>(0x80070032) || out != nullptr)
         return fail("QueryApiImpl refuses an unprovided class and clears its out pointer", static_cast<unsigned long>(hr));
     hr = uninit();

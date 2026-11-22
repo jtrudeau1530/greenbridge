@@ -95,25 +95,47 @@ OPUS_PRE_SKIP = 312
 
 def write_ogg_opus(path: str, packets: list, channels: int, serial: int, length: int = 0,
                    pre_skip: int = OPUS_PRE_SKIP) -> int:
-    """length: the stream's declared per-channel sample count at 48 kHz; the last page's granule position is
+    """length: the stream's declared per-channel sample count at 48 kHz; the EOS page's granule position is
     trimmed to pre_skip + length (Ogg Opus granules count the pre-skip too), so decoders drop the encoder priming
-    at the start and stop at the exact end instead of the padded last frame."""
+    at the start and stop at the exact end instead of the padded last frame.
+
+    The EOS page is emitted at the packet that first reaches pre_skip + length; any later packets are encoder
+    padding and are dropped. Clamping only the final page would make its granule smaller than the previous page's
+    when the trim point falls before that page starts, which is invalid Ogg and makes decoders keep the excess.
+    """
+    if not 0 <= pre_skip <= 0xFFFF:
+        raise ValueError(f"pre-skip must be 0..65535, got {pre_skip}")
+    if length < 0:
+        raise ValueError(f"length must be non-negative, got {length}")
+    total = sum(opus_samples(p) for p in packets)
+    if pre_skip > total:
+        pre_skip = total          # a granule below the pre-skip makes the stream undecodable
     head = b"OpusHead" + struct.pack("<BBHIhB", 1, channels, pre_skip, 48000, 0, 0)
     tags = b"OpusTags" + struct.pack("<I", 8) + b"leonida " + struct.pack("<I", 0)
     out = [ogg_page(serial, 0, 0, [head], 0x02), ogg_page(serial, 1, 0, [tags], 0x00)]
     seq, granule, pending, size = 2, 0, [], 0
+    target = pre_skip + length if length > 0 else None
+    written = 0
+    if not packets:
+        out.append(ogg_page(serial, 2, pre_skip, [], 0x04))
+        write_file(path, b"".join(out))
+        return pre_skip
     for i, p in enumerate(packets):
         pending.append(p)
         granule += opus_samples(p)
         size += len(p)
+        reach = target is not None and granule >= target
         last = i == len(packets) - 1
-        if size > 4000 or len(pending) >= 50 or last:
-            g = min(granule, pre_skip + length) if (last and 0 < length) else granule
-            out.append(ogg_page(serial, seq, g, pending, 0x04 if last else 0x00))
+        if reach or size > 4000 or len(pending) >= 50 or last:
+            g = target if reach else granule
+            out.append(ogg_page(serial, seq, g, pending, 0x04 if (reach or last) else 0x00))
+            written = g
             seq += 1
             pending, size = [], 0
+            if reach or last:
+                break
     write_file(path, b"".join(out))
-    return granule
+    return written
 
 
 def write_file(path: str, data: bytes) -> None:
@@ -293,9 +315,12 @@ def export_bank(path: str, out_dir: str, pre_skip: int = OPUS_PRE_SKIP):
             pk = opus_packets(d, at, size)
             if pk:
                 # +0x0C is the per-channel Opus frame count: equal to the +0 count for mono and
-                # half of it for stereo in all 7,451 measured streams. Fall back to dividing the
-                # interleaved count when a synthetic or malformed block leaves the field zero.
-                frames = s["frames"] or s["samples"] // max(1, s["channels"])
+                # half of it for stereo in all 7,451 measured streams. Use it only when it agrees
+                # with the interleaved +0 count; a synthetic or malformed block that disagrees
+                # must not silently truncate the real audio.
+                frames = s["frames"]
+                if not frames or frames * s["channels"] != s["samples"]:
+                    frames = s["samples"] // max(1, s["channels"])
                 write_ogg_opus(os.path.join(od, stem + ".ogg"), pk, s["channels"], s["id"], frames,
                                pre_skip=pre_skip)
                 counts["opus"] += 1

@@ -788,6 +788,10 @@ struct ReplayFunctions {
     // cannot read while the list is prepared, `xdxr_record` records the build.
     std::function<bool(const BuildAccelerationStructure&)> xdxr_check;
     std::function<void(VkCommandBuffer, const BuildAccelerationStructure&)> xdxr_record;
+    // CopyRaytracingAccelerationStructure (CLONE, COMPACT) of XDXR structures: `bytes` is the room the destination
+    // resource has; and one postbuild value (COMPACTED_SIZE, CURRENT_SIZE) of the structure at `src` to `dest`.
+    std::function<void(VkCommandBuffer, std::uint64_t src_va, std::uint64_t dst_va, std::uint64_t bytes)> xdxr_copy;
+    std::function<void(VkCommandBuffer, std::uint64_t src_va, std::uint64_t dest_va)> xdxr_postbuild;
     std::function<VkAccelerationStructureKHR(std::uint64_t)> resolve_acceleration_structure;
     // Preparation only allocates a slot; capture records the GPU snapshot at the SetPredication command.
     std::function<bool(VkBuffer, VkDeviceSize, PredicateCapture&)> prepare_predicate;
@@ -903,6 +907,7 @@ struct Prepared {
     VkExtent2D area{};
     std::uint32_t layers = 1;  // the fewest layers any bound attachment view has
     VkAccelerationStructureKHR accel_dst = VK_NULL_HANDLE;
+    std::uint64_t xdxr_bytes = 0;     // CopyAccelerationStructure: the most bytes the copy may write
     VkAccelerationStructureKHR accel_src = VK_NULL_HANDLE;
 };
 
@@ -972,7 +977,7 @@ inline VkFormat color_view_format(const ResourceBinding& resource, const TargetV
     }
     if (!resource.rgba8_typeless && !resource.castable_view_formats)
         return format == resource.format ? format : VK_FORMAT_UNDEFINED;
-    if (resource.format != VK_FORMAT_R8G8B8A8_UNORM || resource.volume || resource.depth != 1 || resource.samples != 1)
+    if (resource.format != VK_FORMAT_R8G8B8A8_UNORM || resource.volume || resource.depth != 1)
         return VK_FORMAT_UNDEFINED;
     return format;
 }
@@ -1058,20 +1063,180 @@ inline std::vector<LayoutPiece> current(const LayoutTracker* tracker, ResourceId
     return out;
 }
 
+// Zero-fills a block-compressed image range via vkCmdCopyBufferToImage from either the device's zero page
+// (`vk.zero_buffer`) or a zeroed transfer-scratch chunk (`vk.copy_scratch` + `vk.fill_buffer`). Vulkan forbids
+// vkCmdClearColorImage on BC formats, yet D3D12 committed resources start zeroed unless CREATE_NOT_ZEROED is set
+// (D3D-220).
+inline bool zero_compressed_image(const ReplayFunctions& vk, VkCommandBuffer command_buffer,
+                                  const ResourceBinding& resource, const VkImageSubresourceRange& range,
+                                  VkImageLayout dst_layout) {
+    const BlockFormat fmt = block_format(resource.format, VK_IMAGE_ASPECT_COLOR_BIT);
+    if (fmt.block <= 1 || !fmt.bytes || !vk.copy_buffer_to_image) return false;
+    const std::uint32_t mip_begin = range.baseMipLevel;
+    const std::uint32_t mip_end =
+        range.levelCount == VK_REMAINING_MIP_LEVELS ? resource.mip_levels
+                                                    : std::min(resource.mip_levels, mip_begin + range.levelCount);
+    const std::uint32_t layer_begin = range.baseArrayLayer;
+    const std::uint32_t layer_end =
+        range.layerCount == VK_REMAINING_ARRAY_LAYERS ? resource.array_layers
+                                                      : std::min(resource.array_layers, layer_begin + range.layerCount);
+    if (mip_begin >= mip_end || layer_begin >= layer_end) return true;
+
+    constexpr VkDeviceSize kMaxChunk = 64u * 1024u;
+    const std::uint32_t layer_count = layer_end - layer_begin;
+    VkDeviceSize needed = 0;
+    for (std::uint32_t mip = mip_begin; mip < mip_end; ++mip) {
+        const VkExtent2D ext = mip_extent(resource, mip);
+        const std::uint64_t bx = (std::uint64_t(ext.width) + fmt.block - 1) / fmt.block;
+        const std::uint64_t by = (std::uint64_t(ext.height) + fmt.block - 1) / fmt.block;
+        const std::uint64_t mip_d = std::max(1u, resource.depth >> mip);
+        const std::uint64_t slice_bytes = bx * by * fmt.bytes;
+        if (slice_bytes >= kMaxChunk || mip_d > kMaxChunk / slice_bytes ||
+            layer_count > kMaxChunk / (slice_bytes * mip_d)) {
+            needed = kMaxChunk;
+            break;
+        }
+        needed = std::max<VkDeviceSize>(needed, slice_bytes * mip_d * layer_count);
+    }
+    if (!needed) return true;
+
+    VkBuffer zero_buf = VK_NULL_HANDLE;
+    VkDeviceSize zero_off = 0;
+    VkDeviceSize zero_cap = 0;
+    if (vk.zero_buffer && vk.zero_size >= fmt.bytes) {
+        const VkDeviceSize align = fmt.bytes;
+        const VkDeviceSize pad = (align - (vk.zero_offset % align)) % align;
+        if (vk.zero_size >= pad + fmt.bytes) {
+            zero_buf = vk.zero_buffer;
+            zero_off = vk.zero_offset + pad;
+            zero_cap = vk.zero_size - pad;
+        }
+    }
+    if (!zero_buf && vk.copy_scratch && vk.fill_buffer) {
+        // Round up to a multiple of fmt.bytes (8 or 16, always a multiple of 4 for vkCmdFillBuffer).
+        const VkDeviceSize fill_bytes = ((needed + fmt.bytes - 1) / fmt.bytes) * fmt.bytes;
+        VkBuffer scratch = VK_NULL_HANDLE;
+        VkDeviceSize offset = 0;
+        if (vk.copy_scratch(fill_bytes, scratch, offset)) {
+            const VkDeviceSize align = fmt.bytes;
+            const VkDeviceSize pad = (align - (offset % align)) % align;
+            if (fill_bytes >= pad + fmt.bytes) {
+                vk.fill_buffer(command_buffer, scratch, offset + pad, fill_bytes - pad, 0);
+                memory_barrier(vk, command_buffer, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                               VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+                zero_buf = scratch;
+                zero_off = offset + pad;
+                zero_cap = fill_bytes - pad;
+            }
+        }
+    }
+    if (!zero_buf || zero_cap < fmt.bytes) return false;
+
+    std::vector<VkBufferImageCopy> regions;
+    for (std::uint32_t mip = mip_begin; mip < mip_end; ++mip) {
+        const VkExtent2D ext = mip_extent(resource, mip);
+        const std::uint32_t mip_d = std::max(1u, resource.depth >> mip);
+        const std::uint64_t bx_total = (std::uint64_t(ext.width) + fmt.block - 1) / fmt.block;
+        const std::uint64_t by_total = (std::uint64_t(ext.height) + fmt.block - 1) / fmt.block;
+        const std::uint64_t slice_bytes = bx_total * by_total * fmt.bytes;
+        if (slice_bytes && slice_bytes <= zero_cap && mip_d <= zero_cap / slice_bytes &&
+            layer_count <= zero_cap / (slice_bytes * mip_d)) {
+            VkBufferImageCopy r{};
+            r.bufferOffset = zero_off;
+            r.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, mip, layer_begin, layer_count};
+            r.imageExtent = {ext.width, ext.height, mip_d};
+            regions.push_back(r);
+            continue;
+        }
+        const std::uint64_t row_bytes = bx_total * fmt.bytes;
+        for (std::uint32_t layer = layer_begin; layer < layer_end; ++layer) {
+            if (slice_bytes <= zero_cap) {
+                const std::uint32_t slices_per_copy =
+                    std::max<std::uint32_t>(1u, std::uint32_t(std::min<std::uint64_t>(mip_d, zero_cap / slice_bytes)));
+                for (std::uint32_t z = 0; z < mip_d; z += slices_per_copy) {
+                    VkBufferImageCopy r{};
+                    r.bufferOffset = zero_off;
+                    r.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, mip, layer, 1};
+                    r.imageOffset = {0, 0, std::int32_t(z)};
+                    r.imageExtent = {ext.width, ext.height, std::min(slices_per_copy, mip_d - z)};
+                    regions.push_back(r);
+                }
+            } else if (row_bytes <= zero_cap) {
+                const std::uint32_t rows_per_copy =
+                    std::max<std::uint32_t>(1u, std::uint32_t(std::min<std::uint64_t>(by_total, zero_cap / row_bytes)));
+                for (std::uint32_t z = 0; z < mip_d; ++z) {
+                    for (std::uint64_t y_blk = 0; y_blk < by_total; y_blk += rows_per_copy) {
+                        const std::uint32_t oy = std::uint32_t(y_blk * fmt.block);
+                        const std::uint32_t eh = std::min<std::uint32_t>(rows_per_copy * fmt.block, ext.height - oy);
+                        VkBufferImageCopy r{};
+                        r.bufferOffset = zero_off;
+                        r.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, mip, layer, 1};
+                        r.imageOffset = {0, std::int32_t(oy), std::int32_t(z)};
+                        r.imageExtent = {ext.width, eh, 1};
+                        regions.push_back(r);
+                    }
+                }
+            } else {
+                const std::uint32_t cols_per_copy =
+                    std::max<std::uint32_t>(1u, std::uint32_t(std::min<std::uint64_t>(bx_total, zero_cap / fmt.bytes)));
+                for (std::uint32_t z = 0; z < mip_d; ++z) {
+                    for (std::uint64_t y_blk = 0; y_blk < by_total; ++y_blk) {
+                        const std::uint32_t oy = std::uint32_t(y_blk * fmt.block);
+                        const std::uint32_t eh = std::min<std::uint32_t>(fmt.block, ext.height - oy);
+                        for (std::uint64_t x_blk = 0; x_blk < bx_total; x_blk += cols_per_copy) {
+                            const std::uint32_t ox = std::uint32_t(x_blk * fmt.block);
+                            const std::uint32_t ew =
+                                std::min<std::uint32_t>(cols_per_copy * fmt.block, ext.width - ox);
+                            VkBufferImageCopy r{};
+                            r.bufferOffset = zero_off;
+                            r.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, mip, layer, 1};
+                            r.imageOffset = {std::int32_t(ox), std::int32_t(oy), std::int32_t(z)};
+                            r.imageExtent = {ew, eh, 1};
+                            regions.push_back(r);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if (!regions.empty())
+        vk.copy_buffer_to_image(command_buffer, zero_buf, resource.image, dst_layout,
+                                std::uint32_t(regions.size()), regions.data());
+    return true;
+}
+
 // Images registered with the tracker in UNDEFINED have never been used. D3D12 committed resources start zeroed,
-// so each such piece is cleared to zero (colour 0, depth 0, stencil 0) and moved to `layout`, the layout the
-// operation about to run expects, before that operation; with not_zeroed, or a block-compressed format (which
-// Vulkan cannot clear), it is only moved. The tracker records it.
+// so each such piece is zero-filled (clear for uncompressed images, zero-buffer copy for block-compressed formats
+// when a zero page or transfer scratch is available) and moved to `layout`, the layout the operation about to run
+// expects; with not_zeroed, it is only moved. The tracker records it.
 inline void initialize(const ReplayFunctions& vk, VkCommandBuffer command_buffer, const ResourceBinding& resource,
                        ResourceId id, std::vector<LayoutPiece>& pieces, VkImageLayout layout, LayoutTracker* tracker) {
     constexpr VkAccessFlags any_memory = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
     for (auto& piece : pieces) {
         if (piece.layout != VK_IMAGE_LAYOUT_UNDEFINED) continue;
-        // Vulkan cannot clear block-compressed images; those start undefined (applications upload them first).
-        const bool compressed = block_format(resource.format, VK_IMAGE_ASPECT_COLOR_BIT).block > 1;
-        if (resource.not_zeroed || compressed) {
+        const BlockFormat fmt = block_format(resource.format, VK_IMAGE_ASPECT_COLOR_BIT);
+        const bool compressed = fmt.block > 1;
+        if (resource.not_zeroed) {
             image_barrier(vk, command_buffer, resource, piece.range, VK_IMAGE_LAYOUT_UNDEFINED, layout, 0,
                           VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, any_memory, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+        } else if (compressed) {
+            const bool can_zero =
+                vk.copy_buffer_to_image &&
+                ((vk.zero_buffer && vk.zero_size >= fmt.bytes) || (vk.copy_scratch && vk.fill_buffer));
+            if (can_zero) {
+                const VkImageLayout dst = image_layout(resource, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+                image_barrier(vk, command_buffer, resource, piece.range, VK_IMAGE_LAYOUT_UNDEFINED, dst, 0,
+                              VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+                              VK_PIPELINE_STAGE_TRANSFER_BIT);
+                const bool zeroed = zero_compressed_image(vk, command_buffer, resource, piece.range, dst);
+                image_barrier(vk, command_buffer, resource, piece.range, dst, layout,
+                              zeroed ? VK_ACCESS_TRANSFER_WRITE_BIT : 0,
+                              zeroed ? VK_PIPELINE_STAGE_TRANSFER_BIT : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, any_memory,
+                              VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+            } else {
+                image_barrier(vk, command_buffer, resource, piece.range, VK_IMAGE_LAYOUT_UNDEFINED, layout, 0,
+                              VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, any_memory, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+            }
         } else {
             const VkImageLayout dst = image_layout(resource, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
             image_barrier(vk, command_buffer, resource, piece.range, VK_IMAGE_LAYOUT_UNDEFINED, dst, 0,
@@ -2232,6 +2397,13 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                     (ind->kind == IndirectKind::dispatch && !vk.dispatch_indirect))
                     return ReplayResult::unsupported;
             }
+            if (ind->kind == IndirectKind::dispatch && ind->pipeline) {  // the pipeline and root arguments it was recorded
+                if (!vk.bind_pipeline || !vk.push_constants || !vk.compute_pipeline) return ReplayResult::unsupported;
+                const ComputePipeline* pipeline = vk.compute_pipeline(ind->pipeline);
+                if (!pipeline || !pipeline->pipeline) return ReplayResult::unresolved_resource;
+                if (pipeline->bindless_set && !vk.bind_descriptor_sets) return ReplayResult::unsupported;
+                p.pipeline = *pipeline;
+            }
         } else if (const auto* build = std::get_if<BuildAccelerationStructure>(&command)) {
             if (vk.xdxr_check) {
                 if (!vk.xdxr_check(*build)) return ReplayResult::unsupported;
@@ -2244,6 +2416,29 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                     p.accel_src = vk.resolve_acceleration_structure(build->src_va);
                     if (!p.accel_src) return ReplayResult::unresolved_resource;
                 }
+            }
+        } else if (const auto* copy = std::get_if<CopyAccelerationStructure>(&command)) {
+            // XDXR only (a KHR copy needs VkAccelerationStructureKHR handles and vkCmdCopyAccelerationStructureKHR);
+            // the destination's room bounds the copy, as the size is only known to the GPU.
+            if (!vk.xdxr_copy || !vk.buffer_at || copy->mode > 1) return ReplayResult::unsupported;
+            std::uint64_t room = ~std::uint64_t(0);
+            VkBuffer buffer = VK_NULL_HANDLE;
+            VkDeviceSize offset = 0;
+            if (!vk.buffer_at(copy->dst_va, room, buffer, offset)) return ReplayResult::unresolved_resource;
+            std::uint64_t source = ~std::uint64_t(0);
+            if (!vk.buffer_at(copy->src_va, source, buffer, offset)) return ReplayResult::unresolved_resource;
+            p.xdxr_bytes = std::min(room, source);
+        } else if (const auto* info = std::get_if<AccelerationStructurePostbuild>(&command)) {
+            // The KHR path never wrote postbuild values; it keeps skipping them rather than failing the list.
+            if (!vk.xdxr_postbuild) {
+                p.skip = true;
+            } else {
+                if (!vk.buffer_at || (info->type != 0 && info->type != 3)) return ReplayResult::unsupported;
+                std::uint64_t room = 8 * info->sources.size();
+                VkBuffer buffer = VK_NULL_HANDLE;
+                VkDeviceSize offset = 0;
+                if (!vk.buffer_at(info->dest_va, room, buffer, offset)) return ReplayResult::unresolved_resource;
+                if (room < 8 * info->sources.size()) return ReplayResult::invalid_copy;
             }
         } else if (const auto* dispatch = std::get_if<Dispatch>(&command)) {
             if (!vk.bind_pipeline || !vk.push_constants || !vk.dispatch || !vk.compute_pipeline)
@@ -2953,14 +3148,32 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                 } else if (ind->kind == IndirectKind::draw_indexed) {
                     vk.draw_indexed_indirect(command_buffer, p.binding.buffer, arguments, ind->max_count, ind->stride);
                 } else if (ind->kind == IndirectKind::dispatch) {
+                    if (ind->pipeline) {
+                        ShaderUserData data{};
+                        std::copy(ind->user_data.begin(), ind->user_data.end(), data.s);
+                        data.heap_base = vk.heap_base;
+                        data.code_base = p.pipeline.code_base;
+                        vk.bind_pipeline(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, p.pipeline.pipeline);
+                        if (p.pipeline.bindless_set)
+                            vk.bind_descriptor_sets(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, p.pipeline.layout, 0,
+                                                    1, &p.pipeline.bindless_set, 0, nullptr);
+                        vk.push_constants(command_buffer, p.pipeline.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(data),
+                                          &data);
+                    }
                     for (std::uint32_t k = 0; k < ind->max_count; ++k) {
                         vk.dispatch_indirect(command_buffer, p.binding.buffer,
                                              arguments + VkDeviceSize(k) * ind->stride);
                     }
                 }
             }
-        } else if (const auto* build = std::get_if<BuildAccelerationStructure>(&command); build && vk.xdxr_record) {
-            vk.xdxr_record(command_buffer, *build);
+        } else if (const auto* xdxr_build = std::get_if<BuildAccelerationStructure>(&command);
+                   xdxr_build && vk.xdxr_record) {
+            vk.xdxr_record(command_buffer, *xdxr_build);
+        } else if (const auto* copy = std::get_if<CopyAccelerationStructure>(&command)) {
+            vk.xdxr_copy(command_buffer, copy->src_va, copy->dst_va, p.xdxr_bytes);
+        } else if (const auto* info = std::get_if<AccelerationStructurePostbuild>(&command); info && !p.skip) {
+            for (std::size_t i = 0; i < info->sources.size(); ++i)
+                vk.xdxr_postbuild(command_buffer, info->sources[i], info->dest_va + 8 * i);
         } else if (const auto* build = std::get_if<BuildAccelerationStructure>(&command)) {
             // The build's addresses are console VAs into the GPU address arena (heap_base is its device address).
             // A null VA (no index buffer, no transform) stays null: heap_base + 0 would name the arena's zero page.

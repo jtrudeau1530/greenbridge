@@ -334,8 +334,31 @@ def choose_game() -> str:
         print("  That folder isn't a supported version of the game. Try again.")
 
 
+def icloud_documents() -> bool:
+    """macOS: whether iCloud Drive holds Desktop & Documents. With that sync on, ~/Documents lives in iCloud Drive,
+    which uploads what goes in it and may evict files from the disk ("Optimize Mac Storage"). The folder can stay in
+    iCloud Drive after the sync is turned off; leaving Documents alone then costs nothing."""
+    return sys.platform == "darwin" and os.path.isdir(
+        os.path.join(os.path.expanduser("~"), "Library", "Mobile Documents", "com~apple~CloudDocs", "Documents"))
+
+
 def default_out() -> str:
+    """Documents/Leonida, except on a Mac whose Documents iCloud syncs: the port and its work folder (hundreds of
+    GB made from the game) must stay on this computer, so they go to ~/Leonida there."""
+    if icloud_documents():
+        return os.path.join(os.path.expanduser("~"), "Leonida")
     return os.path.join(os.path.expanduser("~"), "Documents", "Leonida")
+
+
+def icloud_default_notes() -> list:
+    """The log lines when default_out() left iCloud-synced Documents: why, and where a build made before this change
+    is, so its resumable work folder isn't silently left behind."""
+    notes = ["iCloud syncs Documents on this Mac: building into ~/Leonida instead, so the game's files stay off iCloud"]
+    earlier = os.path.join(os.path.expanduser("~"), "Documents", "Leonida")
+    if os.path.isdir(earlier):
+        notes.append(f"an earlier build is in {earlier}: move it to {default_out()} to resume it there, "
+                     f'or pass --out "{earlier}" to keep using it')
+    return notes
 
 
 # ---------------------------------------------------------------- preflight
@@ -682,7 +705,7 @@ def shaders(game: str, work: str, jobs: int, emulate: bool = False, keep_emulate
         drop(translated, shard_plan, disassembled)
         clear_shader_disassembly(work, disasm)
         py("shader_disasm.py", os.path.join(dxbc, "fssm"), "--out", disasm, "--mcpu", "gfx1013", "--jobs", jobs)
-        with open(disassembled, "w", encoding="utf-8") as f:
+        with open(disassembled, "w", encoding="utf-8", newline="\n") as f:
             f.write(signature + "\n")
     # The translation also depends on the translator's own files, so their digest is kept beside it. A folder without
     # it (from before the file existed), with an unreadable one or with another one is translated again; carving, unpacking and
@@ -726,11 +749,11 @@ def shaders(game: str, work: str, jobs: int, emulate: bool = False, keep_emulate
         # a stop at any point then leaves either no index (translated again) or an index with the right mode and
         # digest, never a guessed one. rdna2spirv.py --merge writes index.json last, after the stubs.
         os.makedirs(spirv, exist_ok=True)
-        with open(mode_file, "w", encoding="utf-8") as f:
+        with open(mode_file, "w", encoding="utf-8", newline="\n") as f:
             f.write(want + "\n")
-        with open(flags_file, "w", encoding="utf-8") as f:
+        with open(flags_file, "w", encoding="utf-8", newline="\n") as f:
             f.write(want_flags + "\n")
-        with open(sources_file, "w", encoding="utf-8") as f:
+        with open(sources_file, "w", encoding="utf-8", newline="\n") as f:
             f.write(sources + "\n")
         translate(disasm, spirv, jobs, emulate=emulate, fallbacks=fallbacks)
     log("shaders: done")
@@ -907,9 +930,9 @@ def translate(disasm: str, spirv: str, jobs: int, emulate: bool = False,
         # Parts from another --jobs would be merged in too, and parts from another mode, flags or translator are
         # wrong. They go before the new plan is written: a stop in between must not leave old parts under a new plan.
         for f in os.listdir(spirv):
-            if f.startswith("index.part") and f.endswith(".json"):
+            if (f.startswith("index.part") and f.endswith(".json")) or re.fullmatch(r"shard\d+\.json", f):
                 os.remove(os.path.join(spirv, f))
-        with open(plan_path, "w", encoding="utf-8") as f:
+        with open(plan_path, "w", encoding="utf-8", newline="\n") as f:
             json.dump(plan, f)
     todo = [i for i in range(jobs) if not os.path.isfile(os.path.join(spirv, f"index.part{i}.json"))]
     if len(todo) < jobs:
@@ -1058,7 +1081,7 @@ def assets(game: str, work: str, wav: bool, jobs: int) -> None:
 
 def mark(path: str, what: str) -> None:
     """Write a step's completion marker; call it only after the step succeeded."""
-    with open(path, "w", encoding="utf-8") as f:
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
         f.write(f"{what} finished\n")
 
 
@@ -1177,7 +1200,7 @@ def runtime(game: str, out: str, v: dict, runtime_build: str | None = None, jobs
         if not os.path.exists(os.path.join(out, os.path.basename(built))) or \
                 not os.path.samefile(built, os.path.join(out, os.path.basename(built))):
             shutil.copy2(built, out)
-    with open(os.path.join(out, "game_path.txt"), "w", encoding="utf-8") as f:
+    with open(os.path.join(out, "game_path.txt"), "w", encoding="utf-8", newline="\n") as f:
         f.write(os.path.abspath(game))
     start = os.path.join(out, "gta6rt.exe")
     if os.name != "nt":
@@ -1235,7 +1258,8 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="Build the PC port from your own copy of the game.")
     ap.add_argument("--game", help="your package folder (found automatically if left out)")
     ap.add_argument("--pick", action="store_true", help="choose your package folder in a folder dialog")
-    ap.add_argument("--out", help="folder for the finished port (default Documents/Leonida)")
+    ap.add_argument("--out", help="folder for the finished port (default Documents/Leonida; ~/Leonida on a Mac "
+                                  "whose Documents iCloud syncs)")
     ap.add_argument("--work", help="folder for intermediate files (hundreds of GB; default <out>/work)")
     ap.add_argument("--stages", help="comma list from: " + ",".join(STAGES))
     ap.add_argument("--check", action="store_true", help="only check the game files")
@@ -1336,6 +1360,9 @@ def main() -> int:
     fallbacks = fallback_flags(a) if "shaders" in stages else ()
     preflight(stages, work, a.wav, runtime_build, emulate=emulate, keep_emulated=keep_emulated,
               fallbacks=fallbacks, jobs=a.jobs)
+    if not a.out and icloud_documents():
+        for note in icloud_default_notes():
+            log(note)
     log(f"building into {out} (work files in {work})")
     t0 = time.time()
     if "shaders" in stages:

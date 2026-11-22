@@ -322,7 +322,7 @@ def summarise(rows, span, zero, unread):
 def write_output(path, rows, summary):
     """Write CSV or JSON from the file extension."""
     if os.path.splitext(path)[1].lower() == ".json":
-        with open(path, "w", encoding="utf-8") as f:
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
             json.dump({"summary": summary, "files": rows}, f, indent=1)
         return
     with open(path, "w", encoding="utf-8", newline="") as f:

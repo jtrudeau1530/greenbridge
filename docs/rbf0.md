@@ -468,7 +468,15 @@ python -I tools/rbf0_tree.py <work>\data-carve <work>\subtitle.json --root CMovi
 # Unit tests: synthetic headers and trees only
 python -I tests/test_rbf0_index.py
 python -I tests/test_rbf0_tree.py
+python -I tests/test_imhex_patterns.py
 ```
+
+To look at one resource in a hex editor, open the inflated and joined resource (not the archive) in
+[ImHex](https://imhex.werwolv.net/) with [tools/imhex/rbf0.hexpat](../tools/imhex/rbf0.hexpat). The pattern follows
+the grammar in section 3, picks the 8- or 4-byte value width from the prologue, and stops where the root element
+closes. `tests/test_imhex_patterns.py` builds wide and narrow streams with every record type, checks them with
+`rbf0_index.parse_rbf0`, and when ImHex is installed (on `PATH`, in its default Windows folder, or named by
+`LEONIDA_IMHEX`) compares the pattern's output with the parser's.
 
 `--start` must be 0 or more and `--limit` at least 1 (decimal or `0x` hex); an out-of-range value stops with a
 one-line error and exit code 2 before an index is written.

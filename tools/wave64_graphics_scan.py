@@ -96,10 +96,10 @@ def scan_directory(disasm):
                          "mask_word_source": {"exec_vcc": Counter(), "other": Counter()}}
                  for stage in GRAPHICS}
     other = {"shaders": 0, "wave64": 0}
-    for name in sorted(os.listdir(disasm)):
-        if not name.endswith(".s"):
-            continue
-        path = os.path.join(disasm, name)
+    with os.scandir(disasm) as entries:
+        paths = sorted(entry.path for entry in entries
+                       if entry.name.endswith(".s") and entry.is_file())
+    for path in paths:
         info = parse_file(path)
         stage = rdna2spirv.stage_of(info["name"], path)
         wave64 = wave64_rule(stage, info["insns"])
@@ -158,7 +158,7 @@ def main(argv=None) -> int:
     o = report["other_stages"]
     print("other stages: %d shaders, %d wave64 (not counted)" % (o["shaders"], o["wave64"]))
     if args.out:
-        with open(args.out, "w", encoding="utf-8") as f:
+        with open(args.out, "w", encoding="utf-8", newline="\n") as f:
             json.dump(report, f, indent=1)
         print("wrote %s" % args.out)
     return 0
