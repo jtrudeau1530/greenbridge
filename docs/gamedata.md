@@ -380,6 +380,44 @@ block as incomplete evidence: `gamedata_xml.py --check` is the reference for tha
 aggregate counts and schema/root/element/attribute names belong in git; the CSV/JSON, the element values, the
 `type`/`content` values and per-file paths stay on the local machine. The tests are synthetic.
 
+## Weather types
+
+One `CContentsOfWeatherXmlFile` document defines the weather system. Element tree (counts per path; no values
+or names):
+
+| Path | Count | Content |
+|---|---:|---|
+| `WeatherTimeCycleFileNames/Item` | 25 | one timecycle file path each, all with the same path prefix |
+| `WeatherTypeDatas/Item` | 25 | `Name`, `TimeCycleName`, 72 numeric `value=` fields (wind, gusts, rain, snow, fog, sandstorm, ripples, ocean and shore waves, foam, puddles, accumulation), one-token `LocalizedDensityMap`, `CloudMapA` and `CloudMapB`, an empty `Variations` on all 25, and `PedDirtDefinition` / `DirtCannedColor` (set on 1 of 25) |
+| `WeatherTypes/Item` | 168 | `Name`, `ShortName`, `DataName`, eight `Mod*` tags, `WeatherAppDataName` (151), `SkipDebugCycling` |
+| `WeatherAppTypeDatas/Item` | 26 | `Name`, `Icon`, `IconNight` (23), `Background`, `Description` |
+| `Mod*List/Item` | 73 | allowed tags: Atmosphere 17, Precipitation 16, Temperature 9, Humidity 5, Wind 11, Fetch 5, Misc 7, Niceness 3 |
+| `WeatherCycles/Item` | 2 | `CycleName`, `TimeMult` |
+| `WeatherTypeIndirectionList/Item` | 15 | `From`, `To` |
+| `WeatherMiscData` | 1 | four `Honor*` thresholds and times |
+
+How the pieces link, checked by name (case-insensitive) over the archive:
+
+- **25 weather datas = 25 timecycles.** Every `WeatherTypeDatas/Item` has `TimeCycleName` equal to its own
+  `Name`, the 25 are distinct, and each matches the `cycle` `name` of one of the 27 `timecycle_keyframe_data`
+  documents. The 25 matched documents are exactly the ones with 1,142 variables per region; the two keyframe
+  documents with 515 and 520 variables are not referenced. All 25 file paths contain one of the 25 names;
+  19 are in the same order as the data list.
+- **168 weather types over 25 datas.** Every `WeatherTypes/Item` has a distinct `Name` and a `DataName` that
+  resolves to one of the 25 datas, and every data is used. A weather type is therefore a named variant of a
+  data entry, not a separate timecycle. 151 types carry all eight `Mod*` tags and a `WeatherAppDataName`; the
+  other 17 carry none, and 16 of those have `Name == DataName` (the plain base weathers).
+- **Mod tags resolve to their lists**, with three exceptions: Atmosphere, Precipitation, Temperature, Humidity,
+  Fetch and Niceness resolve 151/151; Wind 150/151 (the miss is two characters from a list entry); Misc only
+  14/151, because 137 types use one of two values that are not in `ModMiscList`. A loader should not reject a
+  type over an unknown `ModMisc`.
+- `WeatherAppDataName` resolves 151/151 to `WeatherAppTypeDatas`. In the 15 indirection pairs, 14 `From`
+  and 14 `To` values are weather type names, and 13 pairs have both.
+- The two `WeatherCycles` names occur in other `common.rpf` documents (2 and 1 documents), not as weather types.
+
+Not measured here (hypothesis): what the `Mod*` axes do at runtime (they read as weather-app forecast
+attributes), how `TimeMult` scales a cycle, and what the `Honor*` values gate.
+
 ## `OceanSimPresets`
 
 `tools/gamedata_xml.py` lists `OceanSimPresets` among the time/weather/water roots. There is one such document.
