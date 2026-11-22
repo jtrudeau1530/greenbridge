@@ -403,9 +403,12 @@ class SkinnedGlbTest(unittest.TestCase):
             "SKEL_ROOT": {"name": "SKEL_ROOT", "index": 0},
             "SKEL_L_UpperArm01": {"name": "SKEL_L_UpperArm01", "index": 1},
             "SKEL_R_UpperArm01": {"name": "SKEL_R_UpperArm01", "index": 2},
+            "SKEL_SPINE10": {"name": "SKEL_SPINE10", "index": 3},
         }
         self.assertEqual(skinned_glb.infer_ped_parent("GM_TEST_L_UpperArm_O", ped), 1)
         self.assertEqual(skinned_glb.infer_ped_parent("GM_TEST_R_UpperArm_O", ped), 2)
+        # Numbered aliases (e.g. SPINE1) must not prefix-match a different numbered bone (SPINE10).
+        self.assertEqual(skinned_glb.infer_ped_parent("GM_C_SPINE1", ped), 0)
 
     def test_cli_returns_nonzero_for_bad_input(self):
         result = subprocess.run(
