@@ -287,5 +287,132 @@ class TestRefOracle(unittest.TestCase):
         self.assertEqual(got, ref_ashr_i64(16, val))
 
 
+class TestSimdMultiLaneVgprPairs(unittest.TestCase):
+    """Multi-lane SIMD wave simulation and VGPR register pair allocation tests."""
+
+    def test_wave64_divergent_shifts_uniform_data(self) -> None:
+        val = 0x8000000000000000
+        lanes = 64
+        for lane_id in range(lanes):
+            shift_count = lane_id
+            expected = ref_ashr_i64(shift_count, val)
+            lo, hi = decompose_u64(val)
+            elo, ehi = emulate_ashr_i64_dwords(shift_count, lo, hi)
+            got = compose_u64(elo, ehi)
+            self.assertEqual(got, expected, f"Lane {lane_id} shift {shift_count} failed")
+
+    def test_wave64_uniform_shift_divergent_data(self) -> None:
+        rng = random.Random(0x42)
+        lanes = 64
+        shift = 16
+        for lane_id in range(lanes):
+            lane_val = rng.getrandbits(64)
+            if lane_id % 2 == 0:
+                lane_val |= SIGN64
+            else:
+                lane_val &= ~SIGN64
+            expected = ref_ashr_i64(shift, lane_val)
+            lo, hi = decompose_u64(lane_val)
+            elo, ehi = emulate_ashr_i64_dwords(shift, lo, hi)
+            got = compose_u64(elo, ehi)
+            self.assertEqual(got, expected, f"Lane {lane_id} val {hex(lane_val)} failed")
+
+    def test_wave64_fully_divergent_lanes(self) -> None:
+        rng = random.Random(0x1337)
+        lanes = 64
+        for lane_id in range(lanes):
+            lane_shift = rng.getrandbits(32)
+            lane_val = rng.getrandbits(64)
+            expected = ref_ashr_i64(lane_shift, lane_val)
+            lo, hi = decompose_u64(lane_val)
+            elo, ehi = emulate_ashr_i64_dwords(lane_shift, lo, hi)
+            got = compose_u64(elo, ehi)
+            self.assertEqual(got, expected, f"Lane {lane_id} divergent pair failed")
+
+    def test_shader_non_overlapping_vgpr_pairs(self) -> None:
+        val = 0x8000000000000000
+        lo, hi = decompose_u64(val)
+
+        pairs = [
+            ("v[4:5]", "v[6:7]"),
+            ("v[10:11]", "v[12:13]"),
+            ("v[20:21]", "v[22:23]"),
+            ("v[30:31]", "v[14:15]"),
+        ]
+        for src_reg, dst_reg in pairs:
+            s0 = int(src_reg.strip("v[]").split(":")[0])
+            s1 = s0 + 1
+            d0 = int(dst_reg.strip("v[]").split(":")[0])
+            d1 = d0 + 1
+            lines = [
+                f"v_mov_b32 v{s0}, {lo:#x}",
+                f"v_mov_b32 v{s1}, {hi:#x}",
+                f"v_ashrrev_i64 {dst_reg}, 4, {src_reg}",
+                f"v_mov_b32 v0, v{d0}",
+                f"v_mov_b32 v1, v{d1}",
+            ]
+            got = run_lines(lines)
+            self.assertEqual(got, ref_ashr_i64(4, val), f"Failed for pair {src_reg} -> {dst_reg}")
+
+    def test_shader_in_place_destination_aliasing(self) -> None:
+        val = 0x8000000000000000
+        lo, hi = decompose_u64(val)
+        lines = [
+            f"v_mov_b32 v0, {lo:#x}",
+            f"v_mov_b32 v1, {hi:#x}",
+            "v_ashrrev_i64 v[0:1], 8, v[0:1]",
+        ]
+        got = run_lines(lines)
+        self.assertEqual(got, ref_ashr_i64(8, val))
+
+        lines_v2 = [
+            f"v_mov_b32 v2, {lo:#x}",
+            f"v_mov_b32 v3, {hi:#x}",
+            "v_ashrrev_i64 v[2:3], 12, v[2:3]",
+            "v_mov_b32 v0, v2",
+            "v_mov_b32 v1, v3",
+        ]
+        got_v2 = run_lines(lines_v2)
+        self.assertEqual(got_v2, ref_ashr_i64(12, val))
+
+    def test_shader_partially_overlapping_register_pairs(self) -> None:
+        val = 0x8000000000000000
+        lo, hi = decompose_u64(val)
+        lines = [
+            f"v_mov_b32 v2, {lo:#x}",
+            f"v_mov_b32 v3, {hi:#x}",
+            "v_ashrrev_i64 v[1:2], 4, v[2:3]",
+            "v_mov_b32 v0, v1",
+            "v_mov_b32 v1, v2",
+        ]
+        got = run_lines(lines)
+        self.assertEqual(got, ref_ashr_i64(4, val))
+
+    def test_shader_chained_vgpr_pair_shifts(self) -> None:
+        val = 0x8000000000000000
+        lo, hi = decompose_u64(val)
+        lines = [
+            f"v_mov_b32 v2, {lo:#x}",
+            f"v_mov_b32 v3, {hi:#x}",
+            "v_ashrrev_i64 v[4:5], 16, v[2:3]",
+            "v_ashrrev_i64 v[0:1], 16, v[4:5]",
+        ]
+        got = run_lines(lines)
+        self.assertEqual(got, ref_ashr_i64(32, val))
+
+    def test_shader_shift_count_from_different_vgprs(self) -> None:
+        val = 0xFEDCBA9876543210
+        lo, hi = decompose_u64(val)
+        for count_vgpr in ("v4", "v7", "v15", "v25"):
+            lines = [
+                f"v_mov_b32 {count_vgpr}, 24",
+                f"v_mov_b32 v2, {lo:#x}",
+                f"v_mov_b32 v3, {hi:#x}",
+                f"v_ashrrev_i64 v[0:1], {count_vgpr}, v[2:3]",
+            ]
+            got = run_lines(lines)
+            self.assertEqual(got, ref_ashr_i64(24, val), f"Failed with count in {count_vgpr}")
+
+
 if __name__ == "__main__":
     unittest.main()
