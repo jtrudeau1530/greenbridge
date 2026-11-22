@@ -20,15 +20,33 @@ if (mode == "ttpf")
     foreach (var t in info.Textures)
     {
         string name = $"{t.Index:D6}_{Util.Safe(Path.GetFileNameWithoutExtension(t.Name))}.dds";
-        rows.Add(new { t.Index, t.Name, t.Id, AssetKey = t.AssetKey.ToString("X16"), t.Width, t.Height, t.DxgiFormat, t.Mips, t.SourceMips, t.BaseMipLevel, t.Limitation, File = t.CanExtract ? name : null });
-        if (!t.CanExtract) { skip++; continue; }
         string path = Path.Combine(outDir, name);
-        if (File.Exists(path)) { ok++; continue; }
-        try { Util.WriteAllBytes(path, TtpfReader.CreateDds(src, t.Index)); ok++; }
-        catch (Exception e) { fail++; if (fail <= 5) Console.WriteLine($"  fail {t.Index}: {e.GetType().Name} {e.Message}"); }
-        if ((ok + fail) % 5000 == 0) Console.WriteLine($"  {ok + fail}/{info.Textures.Count}");
+        string? file = t.CanExtract ? name : null, limitation = t.Limitation;
+        if (!t.CanExtract) skip++;
+        else if (File.Exists(path)) ok++;
+        else
+        {
+            try
+            {
+                // Content the decoder cannot handle is a skip like !CanExtract. Pool read errors, DDS write errors,
+                // cancellation and anything unexpected stay failures.
+                byte[]? dds = null;
+                try { dds = TtpfReader.CreateDds(src, t.Index); }
+                catch (Exception e) when (e.GetType() == typeof(NotSupportedException) || e.GetType() == typeof(InvalidDataException))
+                { skip++; file = null; limitation = e.Message; }
+                if (dds != null) { Util.WriteAllBytes(path, dds); ok++; }
+            }
+            catch (Exception e) { fail++; if (fail <= 5) Console.WriteLine($"  fail {t.Index}: {e.GetType().Name} {e.Message}"); }
+            if ((ok + fail) % 5000 == 0) Console.WriteLine($"  {ok + fail}/{info.Textures.Count}");
+        }
+        rows.Add(new { t.Index, t.Name, t.Id, AssetKey = t.AssetKey.ToString("X16"), t.Width, t.Height, t.DxgiFormat, t.Mips, t.SourceMips, t.BaseMipLevel, Limitation = limitation, File = file });
     }
-    Util.WriteAllText(Path.Combine(outDir, "manifest.json"), JsonSerializer.Serialize(new { src, info.Version, Count = info.Textures.Count, info.Metadata, Textures = rows }, json));
+    // The manifest is the build's completion marker. Keep successful DDS for retry, but withdraw a stale marker.
+    string manifest = Path.Combine(outDir, "manifest.json");
+    if (fail == 0)
+        Util.WriteAllText(manifest, JsonSerializer.Serialize(new { src, info.Version, Count = info.Textures.Count, info.Metadata, Textures = rows }, json));
+    else
+        File.Delete(manifest);
 }
 else if (mode == "audio")
 {
@@ -199,4 +217,4 @@ else if (mode is "models" or "textures")
     File.Move(partial, manifestPath, true);
 }
 Console.WriteLine($"{mode} {baseName}: ok={ok} fail={fail} skip={skip} in {sw.Elapsed.TotalSeconds:0}s");
-return 0;
+return mode == "ttpf" && fail != 0 ? 1 : 0;
