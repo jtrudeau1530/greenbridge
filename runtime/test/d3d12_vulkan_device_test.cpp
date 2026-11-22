@@ -3838,15 +3838,15 @@ int main() {
                         tiled_3d_desc,
                     };
                     for (int idx = 0; idx < int(std::size(host_cases)); ++idx) {
-                        const D3D12_RESOURCE_DESC& d = host_cases[idx];
-                        if (d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D &&
+                        const D3D12_RESOURCE_DESC& host_desc = host_cases[idx];
+                        if (host_desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D &&
                             host_opts.TiledResourcesTier < D3D12_TILED_RESOURCES_TIER_3)
                             continue;
                         Ref<ID3D12Resource> our_r, host_r;
                         const HRESULT our_hr = standalone->CreatePlacedResource(
-                            tiled_heap.p, 0, &d, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&our_r.p));
+                            tiled_heap.p, 0, &host_desc, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&our_r.p));
                         const HRESULT host_hr = host_dev->CreatePlacedResource(
-                            host_heap.p, 0, &d, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&host_r.p));
+                            host_heap.p, 0, &host_desc, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&host_r.p));
                         if (FAILED(host_hr)) continue;
                         EXPECT(SUCCEEDED(our_hr));
                         EXPECT(our_r->GetDesc().Layout == host_r->GetDesc().Layout);
