@@ -5,6 +5,8 @@ and a u32 size. The scan's job is to accept exactly that shape and to reject the
 strings that occur in ordinary code.
 """
 
+import contextlib
+import io
 import json
 import os
 import random
@@ -165,6 +167,79 @@ class ContainerTests(unittest.TestCase):
                 psc.inspect(bytes(data), "fuzz.dll")
             except Exception as e:  # noqa: BLE001 - any exception is the failure being asserted
                 self.fail(f"inspect raised {type(e).__name__}: {e}")
+
+
+class ReportPathTests(unittest.TestCase):
+    """--json and --extract must not overwrite an input, each other, or a folder."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dir = self.tmp.name
+        self.image = os.path.join(self.dir, "shader.dll")
+        with open(self.image, "wb") as f:
+            f.write(container([(b"SFI0", bytes(8))]))
+
+    def run_main(self, argv):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            try:
+                code = psc.main(argv)
+            except SystemExit as e:
+                return e.code, out.getvalue(), err.getvalue()
+        return code, out.getvalue(), err.getvalue()
+
+    def test_json_must_not_overwrite_an_image(self):
+        with open(self.image, "rb") as f:
+            before = f.read()
+        code, _, err = self.run_main([self.image, "--json", self.image])
+        self.assertEqual(code, 2)
+        self.assertIn("would overwrite the input image", err)
+        with open(self.image, "rb") as f:
+            self.assertEqual(f.read(), before)
+
+    def test_json_creates_a_missing_folder(self):
+        out = os.path.join(self.dir, "reports", "containers.json")
+        code, _, err = self.run_main([self.image, "--json", out])
+        self.assertEqual(code, 0, err)
+        with open(out, encoding="utf-8") as f:
+            self.assertIsInstance(json.load(f), list)
+
+    def test_json_refuses_a_folder(self):
+        folder = os.path.join(self.dir, "folder")
+        os.makedirs(folder)
+        code, _, err = self.run_main([self.image, "--json", folder])
+        self.assertEqual(code, 2)
+        self.assertIn("is a folder, not a file", err)
+
+    def test_extract_refuses_an_existing_file(self):
+        blocker = os.path.join(self.dir, "blocked")
+        with open(blocker, "wb") as f:
+            f.write(b"keep me")
+        code, _, err = self.run_main([self.image, "--extract", blocker])
+        self.assertEqual(code, 2)
+        self.assertIn("is not a folder", err)
+        with open(blocker, "rb") as f:
+            self.assertEqual(f.read(), b"keep me")
+
+    def test_json_must_not_overwrite_the_extract_index(self):
+        extract = os.path.join(self.dir, "out")
+        index = os.path.join(extract, "index.json")
+        code, _, err = self.run_main([self.image, "--extract", extract, "--json", index])
+        self.assertEqual(code, 2)
+        self.assertIn("would overwrite the extract index", err)
+        self.assertFalse(os.path.exists(extract))
+
+    def test_a_failed_json_write_is_one_line(self):
+        blocker = os.path.join(self.dir, "not_a_folder")
+        with open(blocker, "wb") as f:
+            f.write(b"keep me")
+        code, _, err = self.run_main([self.image, "--json", os.path.join(blocker, "containers.json")])
+        self.assertEqual(code, 2)
+        self.assertIn("ERROR: cannot write", err)
+        self.assertNotIn("Traceback", err)
+        with open(blocker, "rb") as f:
+            self.assertEqual(f.read(), b"keep me")
 
 
 if __name__ == "__main__":
