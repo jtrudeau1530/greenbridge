@@ -299,6 +299,7 @@ public:
 
     void STDMETHODCALLTYPE OMSetStencilRef(UINT reference) override {
         front_stencil_ref_ = back_stencil_ref_ = reference;
+        stencil_ref_set_ = true;  // sticky state a bundle hands back to its caller, as the GCL8 setter marks it
     }
 
     void STDMETHODCALLTYPE DrawInstanced(UINT vertices, UINT instances, UINT first_vertex, UINT first_instance) override {
