@@ -118,4 +118,13 @@ def test_generator_covers_every_shape():
                     walk(x)
     for i in range(200):
         walk(cf_diff.generate(random.Random(i), 32))
-    assert {"if", "ifelse", "cmpx", "vccz", "sif", "sloop", "vloop", "irr", "sccmask", "csel", "probe"} <= kinds
+    assert {"if", "ifelse", "cmpx", "saveexec", "vccz", "sif", "sloop", "vloop",
+            "irr", "sccmask", "csel", "probe"} <= kinds
+
+
+@pytest.mark.parametrize("op_name", ("andn2", "orn2", "xor", "nand", "nor", "xnor"))
+@pytest.mark.parametrize("wave", (32, 64))
+def test_saveexec_variants_match(op_name, wave):
+    body = [("saveexec", FEW_LANES, op_name, "s_cbranch_scc0", [("probe", 13), ("op", "v_add_nc_u32 v9, 1, v9")])]
+    status, detail = cf_diff.run_case(f"ps_saveexec_{op_name}", body, wave, structured=True)
+    assert status == "match", detail
