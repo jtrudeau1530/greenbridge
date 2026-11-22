@@ -77,6 +77,9 @@ Format vulkan_format(DXGI_FORMAT format, bool depth) {
     case DXGI_FORMAT_R10G10B10A2_TYPELESS: return {VK_FORMAT_A2B10G10R10_UNORM_PACK32, color, true};
     case DXGI_FORMAT_R10G10B10A2_UNORM: return {VK_FORMAT_A2B10G10R10_UNORM_PACK32, color};
     case DXGI_FORMAT_R10G10B10A2_UINT: return {VK_FORMAT_A2B10G10R10_UINT_PACK32, color};
+    // XR_BIAS is the same packed 10:10:10:2 bit layout as R10G10B10A2_UNORM. Vulkan has no XR_BIAS format:
+    // the application biases and scales the channels in its shader, so the resource itself is an ordinary UNORM.
+    case DXGI_FORMAT_R10G10B10_XR_BIAS_A2_UNORM: return {VK_FORMAT_A2B10G10R10_UNORM_PACK32, color};
     case DXGI_FORMAT_R9G9B9E5_SHAREDEXP: return {VK_FORMAT_E5B9G9R9_UFLOAT_PACK32, color};
     case DXGI_FORMAT_R11G11B10_FLOAT: return {VK_FORMAT_B10G11R11_UFLOAT_PACK32, color};
     case DXGI_FORMAT_R8G8B8A8_TYPELESS: return {VK_FORMAT_R8G8B8A8_UNORM, color, true};
@@ -158,6 +161,15 @@ UINT16 full_mips(UINT64 width, UINT height, UINT depth) {
     return mips;
 }
 
+// XR_BIAS is a display format: the PC runtime accepts it only as a single-mip, single-sample 2D texture, and
+// refuses 3D, extra mips and multisampling in creation, allocation and footprints alike.
+bool xr_bias_compatible(const D3D12_RESOURCE_DESC& desc) {
+    if (desc.Format != DXGI_FORMAT_R10G10B10_XR_BIAS_A2_UNORM) return true;
+    if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.SampleDesc.Count != 1) return false;
+    const UINT mips = desc.MipLevels ? desc.MipLevels : full_mips(desc.Width, desc.Height, 1);
+    return mips == 1;
+}
+
 // A volume RTV covers W slices of one mip. UINT_MAX extends through the last slice of that mip.
 leonida::TargetView volume_rtv(leonida::ResourceId id, const D3D12_RESOURCE_DESC& resource,
                                const D3D12_RENDER_TARGET_VIEW_DESC* view) {
@@ -211,6 +223,15 @@ struct DeviceState {
     // D3D-96: upload-heap buffers prefer DEVICE_LOCAL | HOST_VISIBLE memory, so the GPU reads them from VRAM. Only
     // with Resizable BAR (leonida::resizable_bar); LEONIDA_UPLOAD_SYSMEM=1 keeps them in system memory to compare.
     bool upload_in_vram = false;
+
+    // What D3D12_OPTIONS1 answers with: the physical device's own subgroup facts, read on first use.
+    struct SubgroupFacts {
+        UINT lane_min = 0;
+        UINT lane_max = 0;
+        bool wave_ops = false;
+    };
+    SubgroupFacts subgroups;
+    bool subgroups_read = false;
     PFN_vkGetPhysicalDeviceFormatProperties format_properties = nullptr;
     PFN_vkGetPhysicalDeviceImageFormatProperties image_format_properties = nullptr;
     PFN_vkGetDeviceImageMemoryRequirements image_requirements = nullptr;  // Vulkan 1.3 or VK_KHR_maintenance4
@@ -256,8 +277,36 @@ struct DeviceState {
         return S_OK;
     }
 
+    // D3D12_OPTIONS1's wave facts, from the physical device: which subgroup operations exist and what wave sizes it
+    // can run. Zeros and false when the device cannot be asked, which the query then reports as unsupported.
+    const SubgroupFacts& subgroup_facts() {
+        if (subgroups_read) return subgroups;
+        subgroups_read = true;
+        const auto properties2 = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties2>(
+            info.get_instance_proc
+                ? info.get_instance_proc(info.instance, "vkGetPhysicalDeviceProperties2")
+                : nullptr);
+        if (!properties2 || !info.physical) return subgroups;
+        VkPhysicalDeviceSubgroupSizeControlProperties size_control{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES};
+        VkPhysicalDeviceSubgroupProperties subgroup{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES,
+                                                   &size_control};
+        VkPhysicalDeviceProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &subgroup};
+        properties2(info.physical, &properties);
+        // Every group the wave intrinsics map to, because D3D12 promises them all behind the one bool.
+        constexpr VkSubgroupFeatureFlags kD3D12WaveOps =
+            VK_SUBGROUP_FEATURE_BASIC_BIT | VK_SUBGROUP_FEATURE_VOTE_BIT | VK_SUBGROUP_FEATURE_BALLOT_BIT |
+            VK_SUBGROUP_FEATURE_SHUFFLE_BIT | VK_SUBGROUP_FEATURE_ARITHMETIC_BIT;
+        subgroups.wave_ops = (subgroup.supportedOperations & kD3D12WaveOps) == kD3D12WaveOps;
+        subgroups.lane_min = size_control.minSubgroupSize ? size_control.minSubgroupSize : subgroup.subgroupSize;
+        subgroups.lane_max = size_control.maxSubgroupSize ? size_control.maxSubgroupSize : subgroups.lane_min;
+        if (subgroups.lane_max < subgroups.lane_min) subgroups.lane_max = subgroups.lane_min;
+        return subgroups;
+    }
+
     // The format a texture description is created with, D24S8's fallback included.
     Format texture_format(const D3D12_RESOURCE_DESC& desc) const {
+        if (!xr_bias_compatible(desc)) return {};
         if (desc.Format == DXGI_FORMAT_A8_UNORM &&
             (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.SampleDesc.Count != 1 ||
              (desc.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL |
@@ -380,7 +429,24 @@ struct DeviceState {
         view_info.image = vk_image;
         view_info.viewType = g::vulkan_view_type(image.type);
         view_info.format = view_format;
-        view_info.components = g::vulkan_swizzle(image.swizzle, view_format);
+        auto swizzle = image.swizzle;
+        VkImageViewMinLodCreateInfoEXT clamp{VK_STRUCTURE_TYPE_IMAGE_VIEW_MIN_LOD_CREATE_INFO_EXT};
+        if (!storage && image.type == g::ImageType::image_2d && (aspects & VK_IMAGE_ASPECT_COLOR_BIT)) {
+            // Use the clamp in the T# itself: views with identical keys must sample identically.
+            clamp.minLod = g::image_min_lod(words);
+            if (clamp.minLod > float(image.first_mip + image.mip_count - 1)) {
+                // The accessible mip set is empty. Keep the dimensions and constant/missing channels.
+                for (auto& channel : swizzle)
+                    if (channel != g::select_one) channel = g::select_zero;
+            } else if (clamp.minLod > float(image.first_mip)) {
+                if (!info.image_view_min_lod) {
+                    log_once("2D SRV requires VK_EXT_image_view_min_lod; first mip", int(image.first_mip));
+                    return false;
+                }
+                view_info.pNext = &clamp;
+            }
+        }
+        view_info.components = g::vulkan_swizzle(swizzle, view_format);
         // The cast: MSVC's enums are ints, and it rejects int to VkImageAspectFlags in braces as narrowing.
         view_info.subresourceRange = {
             VkImageAspectFlags(stencil                                   ? VK_IMAGE_ASPECT_STENCIL_BIT
@@ -519,7 +585,12 @@ public:
     explicit DescriptorHeap(const D3D12_DESCRIPTOR_HEAP_DESC& desc)
         : desc_(desc), storage_(new std::byte[std::size_t(desc.NumDescriptors) * kDescriptorSize]()) {}
 
-    D3D12_DESCRIPTOR_HEAP_DESC STDMETHODCALLTYPE GetDesc() override { return desc_; }
+    // A node mask of 0 reads back as the one node of a single adapter, as on the PC runtime (d3d12_node_mask_test).
+    D3D12_DESCRIPTOR_HEAP_DESC STDMETHODCALLTYPE GetDesc() override {
+        D3D12_DESCRIPTOR_HEAP_DESC desc = desc_;
+        if (!desc.NodeMask) desc.NodeMask = 1;
+        return desc;
+    }
     D3D12_CPU_DESCRIPTOR_HANDLE STDMETHODCALLTYPE GetCPUDescriptorHandleForHeapStart() override {
         return {reinterpret_cast<SIZE_T>(storage_.get())};
     }
@@ -681,11 +752,32 @@ public:
 
     // D3D12 answers only for committed and placed resources (E_INVALIDARG for reserved ones, measured on the PC
     // runtime).
+    //
+    // The node masks read back as the one node of a single adapter (0 becomes 1), and the heap flags as the runtime
+    // resolves them: the caller's, without the two creation-only bits (CREATE_NOT_RESIDENT, CREATE_NOT_ZEROED), plus
+    // the DENY bits of the resource classes this resource is not (buffers 0xC0, textures without render-target or
+    // depth use 0x44, the others 0x84). Measured on the PC runtime and WARP (d3d12_node_mask_test).
     HRESULT STDMETHODCALLTYPE GetHeapProperties(D3D12_HEAP_PROPERTIES* properties, D3D12_HEAP_FLAGS* flags) override {
         if (reserved_) return E_INVALIDARG;
-        if (properties) *properties = heap_;
-        if (flags) *flags = heap_flags_;
+        if (properties) {
+            *properties = heap_;
+            if (!properties->CreationNodeMask) properties->CreationNodeMask = 1;
+            if (!properties->VisibleNodeMask) properties->VisibleNodeMask = 1;
+        }
+        if (flags) *flags = resolved_heap_flags();
         return S_OK;
+    }
+
+    D3D12_HEAP_FLAGS resolved_heap_flags() const {
+        const UINT deny_buffers = D3D12_HEAP_FLAG_DENY_BUFFERS, deny_rt_ds = D3D12_HEAP_FLAG_DENY_RT_DS_TEXTURES,
+                   deny_non_rt_ds = D3D12_HEAP_FLAG_DENY_NON_RT_DS_TEXTURES;
+        UINT deny = deny_buffers | deny_rt_ds;  // a texture without render-target or depth use
+        if (desc_.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER)
+            deny = deny_rt_ds | deny_non_rt_ds;
+        else if (desc_.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL))
+            deny = deny_buffers | deny_non_rt_ds;
+        const UINT creation_only = D3D12_HEAP_FLAG_CREATE_NOT_RESIDENT | D3D12_HEAP_FLAG_CREATE_NOT_ZEROED;
+        return D3D12_HEAP_FLAGS((UINT(heap_flags_) & ~creation_only) | deny);
     }
 
     // Buffers on upload and readback heaps are mapped persistently; the ranges are hints, as on D3D12. A texture
@@ -1087,6 +1179,8 @@ leonida::gfx10::Sampler sampler_descriptor(const D3D12_SAMPLER_DESC& desc) {
     // D3D12's comparison functions are 1 (NEVER) to 8 (ALWAYS); the S#'s are 0 to 7 in the same order.
     if (reduction == D3D12_FILTER_REDUCTION_TYPE_COMPARISON && desc.ComparisonFunc >= D3D12_COMPARISON_FUNC_NEVER)
         out.compare = g::CompareFunction(desc.ComparisonFunc - D3D12_COMPARISON_FUNC_NEVER);
+    out.compare_never = reduction == D3D12_FILTER_REDUCTION_TYPE_COMPARISON &&
+                        desc.ComparisonFunc == D3D12_COMPARISON_FUNC_NEVER;
     if (reduction == D3D12_FILTER_REDUCTION_TYPE_MINIMUM) out.filter_mode = g::FilterMode::minimum;
     if (reduction == D3D12_FILTER_REDUCTION_TYPE_MAXIMUM) out.filter_mode = g::FilterMode::maximum;
     out.min_lod = desc.MinLOD;
@@ -1957,7 +2051,7 @@ public:
             }
             if (total) *total = ~0ull;
         };
-        if (!desc) return fail();
+        if (!desc || !xr_bias_compatible(*desc)) return fail();
         const auto align = [](UINT64 value, UINT64 to) { return (value + to - 1) / to * to; };
         if (desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
             if (first != 0 || count != 1) return fail();
@@ -2205,6 +2299,20 @@ public:
             opts->GPUUploadHeapSupported = FALSE;
             return S_OK;
         }
+        case D3D12_FEATURE_D3D12_OPTIONS1: {
+            if (size != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS1)) return E_INVALIDARG;
+            auto* opts = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS1*>(data);
+            const DeviceState::SubgroupFacts& facts = state_.subgroup_facts();
+            *opts = {};
+            opts->WaveOps = facts.wave_ops;
+            opts->WaveLaneCountMin = facts.lane_min;
+            opts->WaveLaneCountMax = facts.lane_max;
+            // D3D12 counts every lane of the device here, and Vulkan has no such number. This is one full wave
+            // (section 4.1): a game that sizes work from it plans for less parallelism than the GPU has, not more.
+            opts->TotalLaneCount = facts.lane_max;
+            opts->ExpandedComputeResourceStates = TRUE;  // Vulkan has no resource states to expand
+            return S_OK;
+        }
         case D3D12_FEATURE_D3D12_OPTIONS17: {
             // Non-normalized samplers are core Vulkan (unnormalizedCoordinates), with the restrictions
             // CreateSampler2 checks. No manual write tracking, as the RTX 4090 answers too.
@@ -2306,6 +2414,13 @@ public:
             if (vk_fmt == VK_FORMAT_UNDEFINED || !state_.format_properties) {
                 return d3d12_trace::result(method, DXGI_ERROR_UNSUPPORTED);
             }
+            if (fs->Format == DXGI_FORMAT_R10G10B10_XR_BIAS_A2_UNORM) {
+                // The host reports this display format as 2D, display, cast-within-bit-layout, back-buffer-cast and
+                // video-processor output, and no shader reads. The layer has the 2D resource and the bit-compatible
+                // view cast; it has no display scan-out or video processor, so it reports only what it provides.
+                fs->Support1 = D3D12_FORMAT_SUPPORT1_TEXTURE2D | D3D12_FORMAT_SUPPORT1_CAST_WITHIN_BIT_LAYOUT;
+                return S_OK;
+            }
             VkFormatProperties props{};
             state_.format_properties(state_.info.physical, vk_fmt, &props);
             const VkFormatFeatureFlags optimal = props.optimalTilingFeatures;
@@ -2393,6 +2508,8 @@ public:
                 return d3d12_trace::result(method, E_INVALIDARG);
             const bool alpha_only = levels->Format == DXGI_FORMAT_A8_UNORM;
             if (alpha_only && levels->SampleCount != 1) return d3d12_trace::result(method, S_OK);
+            if (levels->Format == DXGI_FORMAT_R10G10B10_XR_BIAS_A2_UNORM && levels->SampleCount != 1)
+                return d3d12_trace::result(method, S_OK);  // single-sample 2D only; no quality levels
             Format format = texture_storage_format(levels->Format, false);
             if (format.aspects & VK_IMAGE_ASPECT_DEPTH_BIT) {
                 D3D12_RESOURCE_DESC depth_desc{};
@@ -2938,6 +3055,18 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     const bool has_host_image_copy = std::any_of(extensions.begin(), extensions.end(), [](const auto& e) {
         return std::strcmp(e.extensionName, VK_EXT_HOST_IMAGE_COPY_EXTENSION_NAME) == 0;
     });
+    VkPhysicalDeviceImageViewMinLodFeaturesEXT min_lod{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_VIEW_MIN_LOD_FEATURES_EXT};
+    if (std::any_of(extensions.begin(), extensions.end(), [](const auto& e) {
+            return std::strcmp(e.extensionName, VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME) == 0;
+        })) {
+        VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &min_lod};
+        vkGetPhysicalDeviceFeatures2(info.physical, &query);
+        info.image_view_min_lod = min_lod.minLod == VK_TRUE;
+        if (info.image_view_min_lod) {
+            min_lod.pNext = enable13.pNext;
+            enable13.pNext = &min_lod;
+        }
+    }
     VkPhysicalDeviceHostImageCopyFeaturesEXT host_copy{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_IMAGE_COPY_FEATURES_EXT};
     if (has_host_image_copy) {
         VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &host_copy};
@@ -2957,6 +3086,7 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     device_info.pQueueCreateInfos = &queue_info;
     device_info.pEnabledFeatures = &enable;
     std::vector<const char*> device_extensions;
+    if (info.image_view_min_lod) device_extensions.push_back(VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME);
     if (info.conditional_rendering) device_extensions.push_back(conditional_extension);
     if (info.host_image_copy) device_extensions.push_back(host_image_copy_name);
     device_info.enabledExtensionCount = std::uint32_t(device_extensions.size());

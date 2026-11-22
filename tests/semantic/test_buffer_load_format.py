@@ -59,14 +59,16 @@ def tearDownModule():
 
 
 def load_format(fmt: int, offset: int, ncomp: int = 4, dst_sel: int = DST_SEL_XYZW,
-                memory: dict | None = None, op: str = "buffer_load_format", mods: str = "") -> tuple:
-    """<op>_<x..xyzw> with V# format `fmt` at byte `offset`; returns the four mrt0 words.
-    `mods` is emitted after soffset (e.g. " format:[BUF_FMT_8_UNORM]" for tbuffer_load_format)."""
+                memory: dict | None = None, d16: bool = False, *, op: str = "buffer_load_format",
+                mods: str = "") -> tuple:
+    """Return four MRT words for a formatted load. D16 packs two components per register.
+    For a fixed-format load, pass its instruction name in op and its optional format modifier in mods."""
     if _TMP_DIR is None:
         setUpModule()
-    suffix = "xyzw"[:ncomp]
-    vdata = "v2" if ncomp == 1 else f"v[2:{1 + ncomp}]"
-    regs = [f"v{2 + min(i, ncomp - 1)}" for i in range(4)]
+    suffix = ("d16_" if d16 else "") + "xyzw"[:ncomp]
+    nregs = (ncomp + 1) // 2 if d16 else ncomp
+    vdata = "v2" if nregs == 1 else f"v[2:{1 + nregs}]"
+    regs = [f"v{2 + min(i, nregs - 1)}" for i in range(4)]
     asm = (
         "; test_buffer_load_format\n"
         f"\ts_mov_b32 s0, {BASE:#x}\n"
@@ -118,6 +120,20 @@ class SubDwordElements(unittest.TestCase):
         for off, half in ((4, 0xBEEF), (6, 0xDEAD), (8, 0xF00D), (10, 0xCAFE)):
             with self.subTest(off=off):
                 self.assertEqual(load_format(FMT_F16, off, 1)[0], f16_word(half))
+
+
+class D16NormalizedRounding(unittest.TestCase):
+    """d16 narrows a normalized value to f16 with round to nearest even, like the d16 image results (#489; inferred
+    for the hardware, not measured). These bytes are among the about half of unorm8 values where round toward zero,
+    which PackHalf2x16 becomes on AMD drivers, gives 1 ulp less."""
+
+    def test_unorm8_x(self):
+        # byte 5 is 0xbe: 190/255 is 0x39f6 to nearest even, 0x39f5 toward zero
+        self.assertEqual(load_format(FMT_UNORM8, 5, 1, d16=True)[0] & 0xFFFF, 0x39F6)
+
+    def test_unorm8x4_xyzw(self):
+        # bytes 4..7 are 0xef, 0xbe, 0xad, 0xde: 0x3b7f, 0x39f6, 0x396d, 0x3af7 (0x39f5 and 0x3af6 toward zero)
+        self.assertEqual(load_format(FMT_UNORM8X4, 4, 4, d16=True)[:2], (0x39F63B7F, 0x3AF7396D))
 
 
 class CrossingDwordBoundary(unittest.TestCase):

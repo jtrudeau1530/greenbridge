@@ -15,7 +15,8 @@ Vertex inputs: v0 = VertexIndex (the full-screen-triangle shaders read only that
 
 Usage (needs spirv-as/spirv-val on PATH, from the Vulkan SDK or spirv-tools):
     python3 -I rdna2spirv.py <disasm dir or .s> --out DIR [--limit N]
-Writes <name>.spvasm and <name>.spv for each translated shader and prints coverage + validation results.
+Writes <name>.spvasm for each translated shader and <name>.spv only for validated modules.
+Prints coverage and validation results.
 """
 import argparse
 import hashlib
@@ -24,7 +25,9 @@ import re
 import struct
 import subprocess
 import sys
+import tempfile
 from collections import Counter
+from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(__file__))
 from shader_ir import parse_file  # noqa: E402
@@ -291,82 +294,15 @@ class Gen:
                 raise Unsupported("f16 inline constant out of range") from None
         return self.src_u({**s, "neg": False, "abs": False})
 
-    def f32_to_f16_int(self, f):
-        """Convert f32 to IEEE-754 binary16 (round-to-nearest-even, RTE) using only integer SPIR-V ops.
-
-        Workaround for an amdvlk64 pipeline-creation crash (0xC0000005) when GLSL.std.450 PackHalf2x16 on an
-        OpImageSampleExplicitLod result feeds a structured loop with OpGroupNonUniformAny. Preserves +-0,
-        f16 subnormals, +-Inf, and canonical quiet NaNs (sign | 0x7E00 | (mant >> 13)); all shift counts stay
-        in [14, 24]. Used only for d16 image_sample*/image_gather4* results."""
-        u = self.tou(f)
-        sh_s, sign, sh_e, exp, mant = (self.tmp() for _ in range(5))
-        self.emit(f"{sh_s} = OpShiftRightLogical %uint {u} {self.cu(16)}")
-        self.emit(f"{sign} = OpBitwiseAnd %uint {sh_s} {self.cu(0x8000)}")
-        self.emit(f"{sh_e} = OpShiftRightLogical %uint {u} {self.cu(23)}")
-        self.emit(f"{exp} = OpBitwiseAnd %uint {sh_e} {self.cu(0xFF)}")
-        self.emit(f"{mant} = OpBitwiseAnd %uint {u} {self.cu(0x7FFFFF)}")
-
-        # Special: exp == 255 -> Inf or quiet NaN.
-        is_spec, is_nan, m_hi, nan_p, nan_r, inf_r, spec_r = (self.tmp() for _ in range(7))
-        self.emit(f"{is_spec} = OpIEqual %bool {exp} {self.cu(255)}")
-        self.emit(f"{is_nan} = OpINotEqual %bool {mant} {self.cu(0)}")
-        self.emit(f"{m_hi} = OpShiftRightLogical %uint {mant} {self.cu(13)}")
-        self.emit(f"{nan_p} = OpBitwiseOr %uint {self.cu(0x7E00)} {m_hi}")
-        self.emit(f"{nan_r} = OpBitwiseOr %uint {sign} {nan_p}")
-        self.emit(f"{inf_r} = OpBitwiseOr %uint {sign} {self.cu(0x7C00)}")
-        self.emit(f"{spec_r} = OpSelect %uint {is_nan} {nan_r} {inf_r}")
-
-        # Normal: exp >= 113 -> RTE via +(0xFFF + lsb), overflow >= 0x7C00 clamps to Inf.
-        is_norm, n_exp, lsb, r_add, rounded, r_hi, n_sh, raw_n, e_gt, n_ge, ovf, n_mag, norm_r = (
-            self.tmp() for _ in range(13))
-        self.emit(f"{is_norm} = OpUGreaterThanEqual %bool {exp} {self.cu(113)}")
-        self.emit(f"{n_exp} = OpISub %uint {exp} {self.cu(112)}")
-        self.emit(f"{lsb} = OpBitwiseAnd %uint {m_hi} {self.cu(1)}")
-        self.emit(f"{r_add} = OpIAdd %uint {self.cu(0xFFF)} {lsb}")
-        self.emit(f"{rounded} = OpIAdd %uint {mant} {r_add}")
-        self.emit(f"{r_hi} = OpShiftRightLogical %uint {rounded} {self.cu(13)}")
-        self.emit(f"{n_sh} = OpShiftLeftLogical %uint {n_exp} {self.cu(10)}")
-        self.emit(f"{raw_n} = OpIAdd %uint {n_sh} {r_hi}")
-        self.emit(f"{e_gt} = OpUGreaterThan %bool {exp} {self.cu(142)}")
-        self.emit(f"{n_ge} = OpUGreaterThanEqual %bool {raw_n} {self.cu(0x7C00)}")
-        self.emit(f"{ovf} = OpLogicalOr %bool {e_gt} {n_ge}")
-        self.emit(f"{n_mag} = OpSelect %uint {ovf} {self.cu(0x7C00)} {raw_n}")
-        self.emit(f"{norm_r} = OpBitwiseOr %uint {sign} {n_mag}")
-
-        # Subnormal / underflow: 102 <= exp <= 112 (shift strictly in [14, 24] for all exp).
-        full_m, ge102, le112, in_sub, raw_s, s, q, sm1, hbit, sh1, rmask, rem = (self.tmp() for _ in range(12))
-        gt_h, eq_h, q_odd_u, q_odd, tie, rup, inc, smag, sub_m, sub_r, fin_r, res = (self.tmp() for _ in range(12))
-        self.emit(f"{full_m} = OpBitwiseOr %uint {mant} {self.cu(0x800000)}")
-        self.emit(f"{ge102} = OpUGreaterThanEqual %bool {exp} {self.cu(102)}")
-        self.emit(f"{le112} = OpULessThanEqual %bool {exp} {self.cu(112)}")
-        self.emit(f"{in_sub} = OpLogicalAnd %bool {ge102} {le112}")
-        self.emit(f"{raw_s} = OpISub %uint {self.cu(126)} {exp}")
-        self.emit(f"{s} = OpSelect %uint {in_sub} {raw_s} {self.cu(24)}")
-        self.emit(f"{q} = OpShiftRightLogical %uint {full_m} {s}")
-        self.emit(f"{sm1} = OpISub %uint {s} {self.cu(1)}")
-        self.emit(f"{hbit} = OpShiftLeftLogical %uint {self.cu(1)} {sm1}")
-        self.emit(f"{sh1} = OpShiftLeftLogical %uint {self.cu(1)} {s}")
-        self.emit(f"{rmask} = OpISub %uint {sh1} {self.cu(1)}")
-        self.emit(f"{rem} = OpBitwiseAnd %uint {full_m} {rmask}")
-        self.emit(f"{gt_h} = OpUGreaterThan %bool {rem} {hbit}")
-        self.emit(f"{eq_h} = OpIEqual %bool {rem} {hbit}")
-        self.emit(f"{q_odd_u} = OpBitwiseAnd %uint {q} {self.cu(1)}")
-        self.emit(f"{q_odd} = OpINotEqual %bool {q_odd_u} {self.cu(0)}")
-        self.emit(f"{tie} = OpLogicalAnd %bool {eq_h} {q_odd}")
-        self.emit(f"{rup} = OpLogicalOr %bool {gt_h} {tie}")
-        self.emit(f"{inc} = OpSelect %uint {rup} {self.cu(1)} {self.cu(0)}")
-        self.emit(f"{smag} = OpIAdd %uint {q} {inc}")
-        self.emit(f"{sub_m} = OpSelect %uint {in_sub} {smag} {self.cu(0)}")
-        self.emit(f"{sub_r} = OpBitwiseOr %uint {sign} {sub_m}")
-
-        self.emit(f"{fin_r} = OpSelect %uint {is_norm} {norm_r} {sub_r}")
-        self.emit(f"{res} = OpSelect %uint {is_spec} {spec_r} {fin_r}")
-        return res
-
     def pack_f16_pair_int(self, f0, f1):
-        """Pack two f32 values into one u32 (lo f16 | hi f16 << 16) via pure integer SPIR-V ops."""
-        lo = self.f32_to_f16_int(f0)
-        hi = self.f32_to_f16_int(f1)
+        """Two f32 values -> one u32 (lo f16 | hi f16 << 16), each narrowed by f16_bits: integer ops only, no
+        GLSL.std.450 at all (#489: an amdvlk64 pipeline-creation crash came from PackHalf2x16 on a d16
+        image_sample result feeding a structured loop with OpGroupNonUniformAny). For d16 memory results (image
+        samples and gathers, typed buffer loads): those are converted outside the VALU, so they stay round to
+        nearest even and don't go through f16_pack2. f16_bits replaced #489's own f32_to_f16_int on 2026-11-22; the
+        two gave the same bits on 30,648 inputs (every f32 exponent, ties, the subnormal and overflow edges, NaN)."""
+        lo = self.f16_bits(f0)
+        hi = self.f16_bits(f1)
         hi_s, out = self.tmp(), self.tmp()
         self.emit(f"{hi_s} = OpShiftLeftLogical %uint {hi} {self.cu(16)}")
         self.emit(f"{out} = OpBitwiseOr %uint {lo} {hi_s}")
@@ -416,11 +352,13 @@ class Gen:
             self.emit(f"{mb} = OpIAdd %uint {m} {bias}")
             self.emit(f"{nh} = OpShiftRightLogical %uint {mb} {self.cu(13)}")
         # subnormal range (2^-25 <= |x| < 2^-14): shift the full mantissa right by 126 - e (14..25)
-        e, man, sh, shc, sub = t(), t(), t(), t(), t()
+        e, man, sh, short, shc, sub = t(), t(), t(), t(), t(), t()
         self.emit(f"{e} = OpShiftRightLogical %uint {a} {self.cu(23)}")
         self.emit(f"{man} = OpBitwiseOr %uint {self.cu(0x800000)} {self.emit_and(a, 0x7FFFFF)}")
         self.emit(f"{sh} = OpISub %uint {self.cu(126)} {e}")
-        self.emit(f"{shc} = OpExtInst %uint %glsl UMin {sh} {self.cu(25)}")
+        # min(sh, 25) without GLSL.std.450, so the d16 memory results can use this too (see pack_f16_pair_int)
+        self.emit(f"{short} = OpULessThan %bool {sh} {self.cu(25)}")
+        self.emit(f"{shc} = OpSelect %uint {short} {sh} {self.cu(25)}")
         self.emit(f"{sub} = OpShiftRightLogical %uint {man} {shc}")
         if not rtz:
             one, msk, rem, half, odd, gt, eq, tie, up, upu, sub2 = (t() for _ in range(11))
@@ -1289,7 +1227,7 @@ class Gen:
                     is_int = o
             for i in range(0, len(outs), 2):
                 lo, hi = outs[i], (outs[i + 1] if i + 1 < len(outs) else self.cu(0))
-                ph = self.f16_pack2(self.tof(lo), self.tof(hi))
+                ph = self.pack_f16_pair_int(self.tof(lo), self.tof(hi))   # a memory d16 result, see there
                 il, ih, pi, r = (self.tmp() for _ in range(4))
                 self.emit(f"{il} = OpBitwiseAnd %uint {lo} {self.cu(0xFFFF)}")
                 self.emit(f"{ih} = OpShiftLeftLogical %uint {hi} {self.cu(16)}")
@@ -3084,8 +3022,16 @@ class Gen:
                 self.emit(f"{r} = OpSelect %uint {ex} {sh} {self.cu(0)}")
                 self.uses_subgroup = self.uses_ballot = True
             else:
-                self.emit(f"{r} = OpGroupNonUniformShuffle %uint %c3 {dat} {ln2}")
-                self.uses_subgroup = True
+                # Wave32: a source lane that is off in EXEC reads as 0 here too (RDNA ISA 10.4.4). Until
+                # 2026-11-21 the raw value was shuffled. GPU-checked with cs_bpermute32. A source lane that isn't
+                # running (a partial wave) reads 0 as well, through the same ballot as the wave64 path.
+                z, bal, ex, sh = self.tmp(), self.tmp(), self.tmp(), self.tmp()
+                self.emit(f"{z} = OpSelect %uint {self.active_b()} {dat} {self.cu(0)}")
+                self.emit(f"{bal} = OpGroupNonUniformBallot %v4uint_bal %c3 %true")
+                self.emit(f"{ex} = OpGroupNonUniformBallotBitExtract %bool %c3 {bal} {ln2}")
+                self.emit(f"{sh} = OpGroupNonUniformShuffle %uint %c3 {z} {ln2}")
+                self.emit(f"{r} = OpSelect %uint {ex} {sh} {self.cu(0)}")
+                self.uses_subgroup = self.uses_ballot = True
             self.dst(d, r)
         elif op == "ds_permute_b32":
             self.ds_permute(a, mods)
@@ -7895,6 +7841,26 @@ def write_index(path, index):
     os.replace(tmp, path)   # ponytail: no retry; add one if a scanner on Windows ever holds the new file open
 
 
+def assemble_spirv(sa, sv):
+    """Keep the assembled module out of the final path until validation succeeds."""
+    with tempfile.NamedTemporaryFile(prefix=".spirv-", suffix=".tmp", dir=os.path.dirname(sv), delete=False) as f:
+        tmp = Path(f.name)
+    try:
+        result = subprocess.run(["spirv-as", sa, "-o", str(tmp), "--target-env", "vulkan1.2"],
+                                capture_output=True, text=True)
+        if result.returncode == 0:
+            # Offset on non-gather: VK_KHR_maintenance8
+            result = subprocess.run(["spirv-val", "--target-env", "vulkan1.2", "--allow-offset-texture-operand",
+                                     str(tmp)], capture_output=True, text=True)
+        if result.returncode == 0:
+            tmp.replace(sv)
+        else:
+            Path(sv).unlink(missing_ok=True)
+        return result
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
 def _limit_arg(text):
     """--limit N: at least 1. 0 used to mean "no limit" (the whole corpus) and a negative N dropped the last N."""
     try:
@@ -7960,6 +7926,7 @@ def main():
     os.makedirs(a.out, exist_ok=True)
     why, ok, valid = Counter(), 0, 0
     meta = {}
+    invalid = set()
     for p in files:
         name = os.path.splitext(os.path.basename(p))[0]
         try:
@@ -7975,10 +7942,7 @@ def main():
         sv = os.path.join(a.out, name + ".spv")
         with open(sa, "w") as f:
             f.write(asm)
-        r = subprocess.run(["spirv-as", sa, "-o", sv, "--target-env", "vulkan1.2"], capture_output=True, text=True)
-        if r.returncode == 0:
-            r = subprocess.run(["spirv-val", "--target-env", "vulkan1.2", "--allow-offset-texture-operand", sv],
-                               capture_output=True, text=True)  # Offset on non-gather: VK_KHR_maintenance8
+        r = assemble_spirv(sa, sv)
         if r.returncode == 0:
             valid += 1
             try:
@@ -7987,6 +7951,7 @@ def main():
             except Exception as e:  # noqa: BLE001 - metadata must never cost a translation
                 meta[name] = {"error": f"{type(e).__name__}: {e}"}
         else:
+            invalid.add(name)
             why["INVALID: " + (r.stderr.strip().splitlines() or ["?"])[0][:90]] += 1
         if a.no_asm and os.path.exists(sa):
             os.remove(sa)
@@ -7994,7 +7959,10 @@ def main():
     idx_path = os.path.join(a.out, f"index.part{shard}.json" if shard is not None else "index.json")
     old = {}
     if shard is None and os.path.isfile(idx_path) and a.limit is None and len(files) < 1000:
-        old = _js.load(open(idx_path, encoding="utf-8"))      # partial runs merge into an existing index
+        with open(idx_path, encoding="utf-8") as f:
+            old = _js.load(f)  # partial runs merge into an existing index
+        for name in invalid:
+            old.pop(name, None)
     old.update(meta)
     write_index(idx_path, old)
     if shard is None:
