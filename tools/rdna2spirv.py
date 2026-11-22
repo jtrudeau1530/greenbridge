@@ -3694,9 +3694,10 @@ class Gen:
             x["k"] == "special" and x.get("t", "").startswith(("exec", "vcc"))
         )
 
-    def src64_data(self, s, op):
-        if s["k"] == "sgpr" and s.get("n") == 2:
-            return self.load_reg("sgpr", s["r"]), self.load_reg("sgpr", s["r"] + 1)
+    def src64_data(self, s, op, *, allow_vgpr: bool = False):
+        kind = s["k"]
+        if s.get("n") == 2 and (kind == "sgpr" or (allow_vgpr and kind == "vgpr")):
+            return self.load_reg(kind, s["r"]), self.load_reg(kind, s["r"] + 1)
         if s["k"] == "imm":
             v = s["v"] & 0xFFFFFFFFFFFFFFFF
             return self.cu(v & 0xFFFFFFFF), self.cu(v >> 32)
@@ -5849,14 +5850,9 @@ class Gen:
             if a[0].get("n") != 2 or "clamp" in mods:
                 raise Unsupported(op + " operands")
 
-            def pair(sv):
-                if sv["k"] in ("vgpr", "sgpr") and sv.get("n") == 2:
-                    return self.load_reg(sv["k"], sv["r"]), self.load_reg(sv["k"], sv["r"] + 1)
-                if sv["k"] == "imm":
-                    v = sv["v"] & 0xFFFFFFFFFFFFFFFF          # 64-bit inline/literal constant: sign-extended
-                    return self.cu(v & 0xFFFFFFFF), self.cu(v >> 32)
-                raise Unsupported(op + " operands")
-            (x_lo, x_hi), y, (c_lo, c_hi) = pair(a[1]), self.src_u(a[2]), pair(a[3])
+            x_lo, x_hi = self.src64_data(a[1], op, allow_vgpr=True)
+            y = self.src_u(a[2])
+            c_lo, c_hi = self.src64_data(a[3], op, allow_vgpr=True)
             words = []
             for k in range(4):
                 if k == 0:
@@ -5942,13 +5938,7 @@ class Gen:
             if a[0].get("n") != 4 or "clamp" in mods:
                 raise Unsupported(op + " operands")
             s0, s2 = a[1], a[3]
-            if s0["k"] in ("vgpr", "sgpr") and s0.get("n") == 2:
-                x_lo, x_hi = self.load_reg(s0["k"], s0["r"]), self.load_reg(s0["k"], s0["r"] + 1)
-            elif s0["k"] == "imm":
-                v = s0["v"] & 0xFFFFFFFFFFFFFFFF                  # 64-bit inline/literal constant: sign-extended
-                x_lo, x_hi = self.cu(v & 0xFFFFFFFF), self.cu(v >> 32)
-            else:
-                raise Unsupported(op + " operands")
+            x_lo, x_hi = self.src64_data(s0, op, allow_vgpr=True)
             if s2["k"] == "vgpr" and s2.get("n") == 4:
                 accs = [self.load_reg("vgpr", s2["r"] + k) for k in range(4)]
             else:
