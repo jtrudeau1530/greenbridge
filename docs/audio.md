@@ -76,8 +76,14 @@ The exporters ignore the remaining bytes.
 | `5` | XMA2 | `.xma.wav`, RIFF XMA2; ffmpeg decodes it to PCM WAV |
 
 Opus data is stored in 2048-byte blocks. Each block is a sequence of `[u16 length][packet]`; a zero length pads
-the rest of the block. The last Ogg page's granule is trimmed to the sample count declared in the format tag, so a
-decoder stops at the real end instead of the padded final frame.
+the rest of the block. The first 312 decoded samples are the encoder's lookahead (libopus at 48 kHz); the AWC does
+not store it, so the exporter writes that value as `OpusHead` pre-skip and sets the last page's granule to
+`pre-skip + declared samples`. Decoders then drop the priming and stop at the real end instead of the padded final
+frame. `--pre-skip` overrides the 312 default for a stream encoded with a different lookahead.
+
+The format tag's sample count is already in 48 kHz frames even when its rate field is 32 kHz, and a stereo count is
+interleaved across both channels. The exporter therefore does not scale it by the rate field and halves it for
+stereo; scaling a 32 kHz stream by 48000/32000 leaves up to a frame of padding untrimmed.
 
 Codec `5` is not handled by `tools/awc_opus.py`. `rpf9dump xma` writes it as RIFF XMA2, and ffmpeg does the decode.
 
@@ -115,7 +121,7 @@ count unchanged. Reading `samples` as a frame count produces a file that reports
 |---|---|
 | `rpf9dump audio <audio.rpf> <out>` | `<out>/audio/awc/<path>.awc` (the original banks) and `<out>/audio/audio_manifest.json` |
 | `rpf9dump xma <audio.rpf> <out>` | `<out>/audio/xma/<bank>/<stream id>.xma.wav` for every codec-5 stream |
-| `python -I tools/awc_opus.py <bank or dir> <out> [--jobs N]` | `<out>/<bank>/<stream id>.ogg`, or `.wav` for codec 0/2; `--jobs` processes that many banks at once |
+| `python -I tools/awc_opus.py <bank or dir> <out> [--jobs N] [--pre-skip N]` | `<out>/<bank>/<stream id>.ogg`, or `.wav` for codec 0/2; `--jobs` processes that many banks at once |
 | `python -I tools/audio_wav.py <ogg dir> --out <wav dir> [--jobs N]` | 16-bit PCM WAV mirroring the Ogg tree; `--jobs` ffmpeg processes at once |
 
 When exporting a directory, `awc_opus.py` keeps the path to each bank below the input root. For example,

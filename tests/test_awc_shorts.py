@@ -93,7 +93,7 @@ class ShortsTest(unittest.TestCase):
         with open(os.path.join(self.out, "stereo", "00001234.ogg"), "rb") as f:
             channels, granule = ogg_head_and_last_granule(f.read())
         self.assertEqual(channels, 2)
-        self.assertEqual(granule, 960)   # the synthetic bank has one 20 ms packet
+        self.assertEqual(granule, 960)   # one 20 ms packet; the declared count exceeds the payload
 
     def test_mono_selection_and_filter(self):
         path = self.write("mono.awc", 0x78, 480000)      # 10 s mono
