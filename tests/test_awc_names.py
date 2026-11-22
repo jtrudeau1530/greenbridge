@@ -163,6 +163,24 @@ class TestConversations(unittest.TestCase):
 
 
 class TestCli(unittest.TestCase):
+    def test_sources_with_same_basename_keep_separate_summaries_and_streams(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sources = []
+            for parent, count in (("first", 1), ("second", 2)):
+                folder = os.path.join(tmp, parent, "banks")
+                os.makedirs(folder)
+                sources.append(folder)
+                write(os.path.join(folder, "one.awc"), make_bank(["zz_rootau_abcd_01"], extra_ids=range(count - 1)))
+            words = write(os.path.join(tmp, "words.txt"), "zz_rootau_abcd_01\n")
+            out = os.path.join(tmp, "names.json")
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(A.main([*sources, "--words", words, "--out", out]), 0)
+            with open(out, encoding="utf-8") as fh:
+                doc = json.load(fh)
+            self.assertEqual({k: v["streams"] for k, v in doc["summary"].items()},
+                             {"first/banks": 1, "second/banks": 2})
+            self.assertEqual([row["source"] for row in doc["streams"]], ["first/banks", "second/banks"])
+
     def test_end_to_end(self):
         with tempfile.TemporaryDirectory() as tmp:
             banks = os.path.join(tmp, "banks")
