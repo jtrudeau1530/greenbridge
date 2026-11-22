@@ -604,10 +604,14 @@ def main() -> int:
         print(f"{d['unreadable']} .dxbc files could not be read")
     if a.out:
         folder = os.path.dirname(a.out)  # --out into a folder that does not exist yet, as awc_manifest.py does
-        if folder:
-            os.makedirs(folder, exist_ok=True)
-        with open(a.out, "w", encoding="utf-8", newline="\n") as f:
-            json.dump(result, f, indent=1)
+        try:
+            if folder:
+                os.makedirs(folder, exist_ok=True)
+            with open(a.out, "w", encoding="utf-8", newline="\n") as f:
+                json.dump(result, f, indent=1)
+        except OSError as e:
+            print(f"ERROR: cannot write {a.out}: {e.strerror or e}", file=sys.stderr)
+            return 2
     return 0
 
 
