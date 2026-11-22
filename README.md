@@ -13,6 +13,7 @@
 </h4>
 
 <p align="center">
+  <a href="docs/i18n/README.md">Other languages</a> |
   <a href="#project-status">Status</a> |
   <a href="#how-to-build">How to build</a> |
   <a href="#how-it-works">How it works</a> |
