@@ -1325,6 +1325,29 @@ def test_buffer_store_format_bgra(fmt, shifts, channels, packed, components, bgr
     assert memory[0x1000] == expected
 
 
+@pytest.mark.parametrize("fmt, packed, inputs, expected", [
+    (60, True, (0x01000101, 0x00fe00ff), (0xfeffffff,)),
+    (27, False, (65536, 65537), (0xffffffff,)),
+    (69, False, (65534, 65535, 65536, 0xffffffff), (0xfffffffe, 0xffffffff)),
+    (75, False, (65534, 65535, 65536, 0xffffffff), (65534, 65535, 65536, 0xffffffff)),
+])
+def test_uint_buffer_store_saturation(fmt, packed, inputs, expected, make_shader):
+    # Native gfx1036 clips each channel to the destination's width. The 32-bit control keeps every bit.
+    setup = "".join(f"v_mov_b32 v{4 + i}, {v:#x}\n" for i, v in enumerate(inputs))
+    selectors = 0x22c if fmt == 27 else 0xfac  # XY01 for RG16, XYZW for RGBA
+    components = 4 if packed else len(inputs)
+    op = "buffer_store_format_" + ("d16_" if packed else "") + "xyzw"[:components]
+    src = ("s_mov_b32 s0, 0x1000\ns_mov_b32 s1, 0\ns_mov_b32 s2, 16\n"
+           f"s_mov_b32 s3, {0x31000000 | fmt << 12 | selectors:#x}\n" + setup +
+           f"{op} v[4:{3 + len(inputs)}], off, s[0:3], 0\ns_endpgm\n")
+    shader = make_shader(src, name="ps_store_uint")
+    spv = shader.translate()
+    shader.validate(spv)
+    memory = {0x1000 + 4 * i: 0xdeadbeef for i in range(4)}
+    _load_mini_interp().run_fragment(spv, memory=memory)
+    assert tuple(memory[0x1000 + 4 * i] for i in range(4)) == expected + (0xdeadbeef,) * (4 - len(expected))
+
+
 def test_remaining_d16_paths_avoid_packhalf2x16(make_shader):
     """buffer_format d16 and image_sample_c_lz d16 avoid PackHalf2x16 and validate with spirv-val."""
     tbuf_asm = (

@@ -253,6 +253,22 @@ class LoadOnlyShaders(unittest.TestCase):
 
 
 class TypedGatherShaders(unittest.TestCase):
+    def test_2d_sample_lz_uses_matching_typed_view_at_level_zero(self):
+        for dst, modifier in (("v[0:3]", ""), ("v[0:1]", " d16")):
+            with self.subTest(modifier=modifier):
+                m = Module(translate([f"image_sample_lz {dst}, v[4:5], s[0:7], s[8:11] "
+                                      f"dmask:0xf dim:SQ_RSRC_IMG_2D{modifier}"]))
+                samples = [args for _, op, args in m.order if op == "OpImageSampleExplicitLod"]
+                self.assertEqual({args[0] for args in samples}, {"%v4float", "%v4uint_st", "%v4int_st"})
+                for ty, sampled, _, mask, lod in samples:
+                    self.assertEqual((mask, lod), ("Lod", "%f0"))
+                    op, pair = m.defs[sampled]
+                    self.assertEqual(op, "OpSampledImage")
+                    _, image = m.defs[pair[1]]
+                    _, chain = m.defs[image[1]]
+                    self.assertEqual(m.binding[chain[1]], 0)
+                    self.assertEqual(m.defs[ty][1][0], m.defs[image[0]][1][0])
+
     def test_explicit_lod_gather_fetches_four_taps_from_each_typed_view(self):
         for suffix, coords in (("", "v[4:6]"), ("_o", "v[4:7]")):
             with self.subTest(suffix=suffix):

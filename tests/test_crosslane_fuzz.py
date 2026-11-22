@@ -193,6 +193,39 @@ class Modes(unittest.TestCase):
         self.assertIn("unknown mode 'emulat'", r.stderr)
 
 
+class Counts(unittest.TestCase):
+    """--programs and --ops cannot be below 1: a run of no programs ended in a bare `summary:` with no lines and exit
+    0, which reads as every program passing, and --ops 0 built a program with no ops. The other fuzzers refuse both."""
+
+    def run_tool(self, *args):
+        return subprocess.run([sys.executable, "-I", TOOL, *args], capture_output=True, text=True, timeout=300)
+
+    def test_zero_or_negative_programs_is_a_usage_error(self):
+        for value in ("0", "-1", "-5"):
+            with self.subTest(programs=value):
+                r = self.run_tool("--programs", value, "--self-test")
+                self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+                self.assertIn(f"--programs: must be at least 1 (got {value})", r.stderr)
+                self.assertEqual(r.stdout, "")
+
+    def test_zero_ops_is_a_usage_error(self):
+        r = self.run_tool("--ops", "0", "--self-test")
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("--ops: must be at least 1 (got 0)", r.stderr)
+        self.assertEqual(r.stdout, "")
+
+    def test_the_count_is_checked_before_the_harness_is_looked_for(self):
+        # Both are wrong here: a count below 1 is a usage error whatever the state of the build is.
+        r = self.run_tool("--exe", os.path.join(TOOLS, "no-such-build", "vk_compute_test"), "--programs", "0")
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertNotIn("vk_compute_test not found", r.stderr)
+
+    def test_a_count_of_one_still_runs(self):
+        r = self.run_tool("--programs", "1", "--ops", "1", "--self-test")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("self-test OK", r.stdout)
+
+
 class MissingHarness(unittest.TestCase):
     """Without vk_compute_test the translator oracle stops with one line before any program is generated. It used to
     translate for a while and then end in a FileNotFoundError traceback from the first GPU run."""

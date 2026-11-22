@@ -888,6 +888,15 @@ def analyze(pool, index, *, allow_bcpack=True):
 
 # --- commands --------------------------------------------------------------
 
+def same_output_path(first, second):
+    if os.path.normcase(os.path.realpath(first)) == os.path.normcase(os.path.realpath(second)):
+        return True
+    try:
+        return os.path.samefile(first, second)
+    except OSError:
+        return False
+
+
 def find_pools(arg):
     if os.path.isfile(arg):
         return [arg]
@@ -1129,10 +1138,15 @@ def scan_pools(paths, as_json=None, include_tuples=False):
             for key, count in sorted(gated_tuples.items(), key=lambda kv: (-kv[1], kv[0]))
         ]
     report = dict(total=total)
-    if as_json:
-        with open(as_json, "w", encoding="utf-8") as f:
-            json.dump(report, f, indent=1)
+    # Printed first: a report path that can't be written used to end the scan in a traceback with nothing shown.
     print(json.dumps(report, indent=1))
+    if as_json:
+        try:
+            os.makedirs(os.path.dirname(os.path.abspath(as_json)), exist_ok=True)
+            with open(as_json, "w", encoding="utf-8") as f:
+                json.dump(report, f, indent=1)
+        except OSError as exc:
+            raise ValueError(f"cannot write {as_json}: {exc.strerror or exc}") from None
 
 
 def describe(pool, index):
@@ -1537,6 +1551,15 @@ def main(argv=None):
         pools = []
         for p in a.paths:
             pools += find_pools(p)
+        # The report is written after every pool is read: a pool given as --json used to be replaced by it.
+        if a.json:
+            if os.path.isdir(a.json):
+                print(f"ERROR: --json {a.json} is a directory", file=sys.stderr)
+                return 2
+            for p in pools:
+                if same_output_path(a.json, p):
+                    print(f"ERROR: --json would overwrite the input {p}", file=sys.stderr)
+                    return 2
         try:
             scan_pools(pools, a.json, a.tuples)
         except ValueError as exc:   # a truncated or unsupported pool: name it instead of a traceback
@@ -1575,4 +1598,8 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
+    try:  # a redirected stdout is strict ANSI code page under -I; write '?' for what it cannot encode
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
     sys.exit(main())

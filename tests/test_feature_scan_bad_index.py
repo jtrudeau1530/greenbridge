@@ -65,6 +65,25 @@ class BadFeatureScanIndexTest(unittest.TestCase):
             self.assert_clean(result)
             self.assertIn("could not be read", result.stdout)
 
+    def test_bad_fields_do_not_stop_the_scan(self):
+        with tempfile.TemporaryDirectory() as td:
+            rows = [
+                {"file": ["bad.dxbc"], "stage": "vs"},
+                {"file": "missing.dxbc", "stage": {"invalid": True}},
+                {"file": "missing.dxbc", "stage": 1},
+            ]
+            spirv = [{"stage": ["bad"], "uses_code_base": True}, {"stage": "ps"}]
+            shaders = make_work(td, rows, spirv=spirv)
+            out = Path(td) / "report.json"
+            result = self.run_scan(shaders, out)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            report = json.loads(out.read_text(encoding="utf-8"))
+            self.assertEqual(report["dxbc"]["unreadable"], 3)
+            self.assertEqual(report["dxbc"]["stages"]["vs"], 1)
+            self.assertEqual(report["dxbc"]["stages"]["?"], 2)
+            self.assertEqual(report["spirv"]["translated"], {"?": 1, "ps": 1})
+            self.assertEqual(report["spirv"]["uses_code_base"], {"?": 1})
+
     def test_valid_indexes_are_still_counted(self):
         with tempfile.TemporaryDirectory() as td:
             rows = [{"name": "ps_a", "file": "ps_a.dxbc", "stage": "ps"}]

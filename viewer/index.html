@@ -304,7 +304,12 @@ async function loadChunk(entry) {
 function stream(now = performance.now()) {
   const p = camera.position;
   for (const [id, c] of live) {
-    if ((!c.obj && !c.loading) || range(c.def, p).keep) continue;
+    if (!c.obj && !c.loading) continue;
+    const { load, keep } = range(c.def, p);
+    if (keep) {
+      if (c.obj && c.def.lod !== undefined) c.obj.visible = load;
+      continue;
+    }
     drop(id);
     // A canceled retry does not erase the previous failures or spend another attempt.
     if (c.previous) live.set(id, c.previous);

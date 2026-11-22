@@ -297,6 +297,52 @@ class ScanTest(unittest.TestCase):
             self.assertFalse(os.path.exists(out))
 
 
+    def test_report_cannot_overwrite_carve_manifest(self):
+        manifest = os.path.join(self.dir, "index.json")
+        with open(manifest, "w", encoding="utf-8") as f:
+            f.write('{"carve_manifest": true}')
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(SystemExit) as cm:
+                bvh_index.main([self.dir, "--out", manifest])
+        self.assertEqual(cm.exception.code, 2)
+        self.assertIn("would overwrite the carve manifest", err.getvalue())
+        with open(manifest, "r", encoding="utf-8") as f:
+            self.assertEqual(f.read(), '{"carve_manifest": true}')
+
+    def test_report_cannot_overwrite_a_carved_input(self):
+        payload = os.path.join(self.dir, "a.bin")
+        with open(payload, "wb") as f:
+            f.write(bvh_payload(4))
+        alias = os.path.join(self.dir, "alias.json")
+        try:
+            os.link(payload, alias)
+        except OSError:
+            self.skipTest("hard links are not available")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(SystemExit) as cm:
+                bvh_index.main([self.dir, "--out", alias])
+        self.assertEqual(cm.exception.code, 2)
+        self.assertIn("would overwrite an input file", err.getvalue())
+
+    def test_missing_report_folder_is_created(self):
+        out = os.path.join(self.dir, "missing", "sub", "index.json")
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(bvh_index.main([self.dir, "--out", out]), 0)
+        self.assertTrue(os.path.isfile(out))
+
+    def test_report_folder_is_rejected(self):
+        outdir = os.path.join(self.dir, "outdir")
+        os.makedirs(outdir, exist_ok=True)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(SystemExit) as cm:
+                bvh_index.main([self.dir, "--out", outdir])
+        self.assertEqual(cm.exception.code, 2)
+        self.assertIn("is a folder, not a report file", err.getvalue())
+
+
 def setUpModule():
     # The tools' main() prints its summary JSON; keep it out of the test log (tests that check it redirect again).
     quiet = contextlib.redirect_stdout(io.StringIO())

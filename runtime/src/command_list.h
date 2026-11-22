@@ -3,8 +3,8 @@
 // The command-list IR (docs/d3d12_vulkan.md section 3.2): what a D3D12 command list records, kept until
 // ExecuteCommandLists replays it on Vulkan (vulkan_replay.h). This slice covers legacy and enhanced barriers and
 // render-target, depth-stencil and unordered-access clears (whole views or rectangles), copies, resolves,
-// predication, discards, immediate buffer writes, atomic copies, queries and debug markers. It has no Windows or
-// Vulkan dependency.
+// predication, discards, immediate buffer writes, atomic copies, queries, debug markers and dispatches. It has
+// no Windows or Vulkan dependency.
 
 #include <algorithm>
 #include <array>
@@ -151,7 +151,7 @@ inline constexpr std::uint32_t clear_stencil = 0x2;
 inline constexpr std::uint32_t texture_barrier_discard = 0x1;
 
 // Portable color-view interpretation. Other views inherit their resource format as before.
-enum class ColorViewFormat : std::uint32_t { resource, rgba8_unorm, rgba8_srgb, rgba8_uint };
+enum class ColorViewFormat : std::uint32_t { resource, rgba8_unorm, rgba8_srgb, rgba8_uint, rgba8_sint, rgba8_snorm };
 
 // D3D12_QUERY_HEAP_TYPE and D3D12_QUERY_TYPE.
 namespace d3d12_query_heap {
@@ -354,6 +354,63 @@ struct ResolveSubresource {
     std::optional<ResolveRegion> region = std::nullopt;
 };
 
+// Dispatch, with what it uses captured when it is recorded: the pipeline (an opaque id the replay resolves) and
+// the 32 user-data dwords the root arguments produced (s0..s31 of the translated shader, section 3.5).
+struct Dispatch {
+    std::uintptr_t pipeline;
+    std::array<std::uint32_t, 32> user_data;
+    std::uint32_t x;
+    std::uint32_t y;
+    std::uint32_t z;
+};
+
+// D3D12_VIEWPORT.
+struct Viewport {
+    float x;
+    float y;
+    float width;
+    float height;
+    float min_depth;
+    float max_depth;
+};
+
+// D3D12_VERTEX_BUFFER_VIEW / D3D12_INDEX_BUFFER_VIEW: console VAs, resolved to buffers at replay.
+struct VertexBufferView {
+    std::uint64_t va;
+    std::uint32_t size;
+    std::uint32_t stride;
+};
+
+struct IndexBufferView {
+    std::uint64_t va;
+    std::uint32_t size;
+    std::uint32_t format;  // DXGI_FORMAT_R16_UINT (57) or DXGI_FORMAT_R32_UINT (42)
+};
+
+// DrawInstanced / DrawIndexedInstanced, with everything they use captured when they are recorded: D3D12 reads
+// render-target and depth descriptors at OMSetRenderTargets, and every other piece of state is the list's state at
+// the draw. resource 0 marks an unbound render-target slot or no depth buffer.
+struct Draw {
+    std::uintptr_t pipeline;
+    std::array<std::uint32_t, 32> user_data;
+    std::vector<TargetView> render_targets;
+    TargetView depth;
+    std::vector<VertexBufferView> vertex_buffers;  // by input slot
+    IndexBufferView index;
+    std::uint32_t topology;  // D3D_PRIMITIVE_TOPOLOGY
+    Viewport viewport;       // the first; more viewports are not modelled yet
+    Rect scissor;            // the first; D3D12 always scissors
+    std::array<float, 4> blend_factor;
+    std::uint32_t stencil_front;
+    std::uint32_t stencil_back;
+    bool indexed;
+    std::uint32_t count;  // vertices or indices per instance
+    std::uint32_t instances;
+    std::uint32_t first;  // first vertex or first index
+    std::int32_t base_vertex;
+    std::uint32_t first_instance;
+};
+
 // D3D12_TEXTURE_DATA_PITCH_ALIGNMENT and D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT.
 inline constexpr std::uint32_t texture_data_pitch_alignment = 256;
 inline constexpr std::uint32_t texture_data_placement_alignment = 512;
@@ -540,7 +597,7 @@ using Command = std::variant<TransitionBarrier, UavBarrier, AliasingBarrier, Glo
                              TextureBarrier, ClearRenderTarget, ClearDepthStencil, CopyBuffer, CopyTexture,
                              CopyResource, ResolveSubresource, Predication, ClearUnorderedAccess, DiscardResource,
                              WriteImmediate, AtomicCopyBuffer, BeginQuery, EndQuery, ResolveQueries, DebugMarker,
-                             ExecuteIndirect, BuildAccelerationStructure>;
+                             ExecuteIndirect, BuildAccelerationStructure, Dispatch, Draw>;
 
 class CommandList {
 public:
@@ -614,6 +671,20 @@ public:
                 return false;
         }
         return append(resolve);
+    }
+
+    // A dispatch with no groups does nothing in D3D12, and is not recorded.
+    bool dispatch(const Dispatch& dispatch) {
+        if (!dispatch.pipeline) return false;
+        if (!dispatch.x || !dispatch.y || !dispatch.z) return !closed_;
+        return append(dispatch);
+    }
+
+    // A draw with no vertices or instances does nothing in D3D12, and is not recorded.
+    bool draw(const Draw& draw) {
+        if (!draw.pipeline) return false;
+        if (!draw.count || !draw.instances) return !closed_;
+        return append(draw);
     }
 
     // ClearRenderTargetView; the resource must be in render_target state at execution. No rects: the whole view.
