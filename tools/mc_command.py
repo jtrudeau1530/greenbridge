@@ -5,6 +5,8 @@ form when llvm-mc runs inside WSL, because the official Windows LLVM build has n
 
     set LLVM_MC=wsl -d Ubuntu -e /usr/lib/llvm-21/bin/llvm-mc
 """
+from __future__ import annotations
+
 import os
 import shlex
 

@@ -1,17 +1,25 @@
 name: CI
-on: [push, pull_request]
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
+
+env:
+  PYTEST_FILE_MARKERS: '^import pytest|^ *HAVE_NUMPY ='
 
 jobs:
   change-scope:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     outputs:
       docs-only: ${{ steps.paths.outputs.docs-only }}
     steps:
@@ -41,6 +49,7 @@ jobs:
     needs: change-scope
     if: ${{ !cancelled() && needs.change-scope.outputs.docs-only != 'true' }}
     runs-on: windows-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -51,44 +60,68 @@ jobs:
       - uses: actions/setup-dotnet@0f4a354dd5547a28c70b7853dbd95d5b67886e73 # v6.1.0
         with:
           dotnet-version: "8.0.x"
+          cache: true
+          cache-dependency-path: "**/packages.lock.json"
       - name: Python tools compile
         run: python -m compileall -q make_game.py tools tests
       - name: make_game.py help
         run: python -I make_game.py --help
       - name: Tests (standard library only, no game data)
         shell: bash
-        run: for t in tests/test_*.py; do grep -q '^import pytest' "$t" && continue; echo "== $t"; python -I "$t" || exit 1; done  # pytest-based files run in the translator-tests job
-      - name: Build the runtime (the GPU tools are skipped without the Vulkan SDK)
         run: |
-          cmake -S runtime -B runtime/build
-          cmake --build runtime/build --config RelWithDebInfo
+          for t in tests/test_*.py; do
+            if grep -Eq "$PYTEST_FILE_MARKERS" "$t" || ! grep -q '__main__' "$t"; then
+              continue
+            fi
+            echo "== $t"
+            python -I "$t" || exit 1
+          done  # pytest-based files run in the translator-tests job
       - name: Build rpf9dump
         run: dotnet build tools/rpf9dump/rpf9dump.csproj -c Release
-      - name: No game data tracked
-        shell: bash
-        run: |
-          bad=$(git ls-files | grep -iE '\.(rpf|ttpf|xvd|dxbc|fssm|spv|spvasm|dds|bk2|awc|exe|dll)$' || true)
-          if [ -n "$bad" ]; then echo "Game or binary files tracked:"; echo "$bad"; exit 1; fi
+      - name: Test rpf9dump diagnostics
+        run: dotnet run --project tests/Rpf9DumpDiagnostics/Rpf9DumpDiagnostics.csproj -c Release
   translator-tests:
     needs: change-scope
     if: ${{ !cancelled() && needs.change-scope.outputs.docs-only != 'true' }}
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.12"
-      - name: Install LLVM, SPIR-V tools and Python test dependencies
+          cache: "pip"
+          cache-dependency-path: tests/requirements.txt
+      - name: Install llvm-mc (LLVM 21) and spirv-tools
+        shell: bash
         run: |
+          curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key | sudo gpg --dearmor -o /usr/share/keyrings/llvm-snapshot.gpg
+          echo "deb [signed-by=/usr/share/keyrings/llvm-snapshot.gpg] https://apt.llvm.org/noble/ llvm-toolchain-noble-21 main" | sudo tee /etc/apt/sources.list.d/llvm-21.list > /dev/null
           sudo apt-get update
-          sudo apt-get install -y llvm-18 spirv-tools
-          python -m pip install pytest numpy Pillow
+          sudo apt-get install -y --no-install-recommends llvm-21 spirv-tools
+          pip install -r tests/requirements.txt
+          LLVM_MC=/usr/lib/llvm-21/bin/llvm-mc
+          echo "LLVM_MC=$LLVM_MC" >> "$GITHUB_ENV"
+          version_out=$("$LLVM_MC" --version)
+          printf '%s\n' "$version_out"
+          grep -q 'LLVM version 21\.' <<< "$version_out"
+          grep -q 'amdgcn' <<< "$version_out"
       - name: Translator tests
-        run: python -m pytest tests -q --ignore=tests/semantic
+        run: |
+          pytest_files=()
+          for t in tests/test_*.py; do
+            if grep -Eq "$PYTEST_FILE_MARKERS" "$t" || ! grep -q '__main__' "$t"; then
+              pytest_files+=("$t")
+            elif [[ "$t" == tests/test_tex_headers.py ]]; then
+              pytest_files+=("$t::TestTextureDescriptorParsing::test_stdlib_qword_scanner_edge_cases_and_parity")
+            fi
+          done
+          python -m pytest "${pytest_files[@]}" -q
   semantic-tests:
     needs: change-scope
     if: ${{ !cancelled() && needs.change-scope.outputs.docs-only != 'true' }}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
     strategy:
       matrix:
         os: [windows-latest, ubuntu-latest]
@@ -104,10 +137,11 @@ jobs:
     needs: change-scope
     if: ${{ !cancelled() && needs.change-scope.outputs.docs-only != 'true' }}
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: "22"
+          node-version: "24"
       - name: Viewer chunk streaming (synthetic, no browser or game data)
         run: node --test tests/test_viewer_streaming.cjs

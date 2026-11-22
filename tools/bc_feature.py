@@ -1,4 +1,8 @@
-"""Exact per-block average colour for BC1 (8-byte) and BC3 (16-byte, colour half) blocks, vectorised."""
+"""Vectorised per-block average colour for BC1 and the colour half of BC3.
+
+Endpoints and palette colours are computed in floating point. The averages can differ from GPU readback
+when the hardware quantizes the decoded RGB values.
+"""
 import numpy as np
 
 
