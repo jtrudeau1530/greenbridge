@@ -87,15 +87,25 @@ def hash_values(blob):
 
 
 def load_names(paths):
-    """The set of names in rpf9_names.py JSON files and one-name-per-line text files."""
+    """The set of names in rpf9_names.py JSON files and one-name-per-line text files. A .json file that is not
+    JSON, or not the shape rpf9_names.py writes, raises ValueError naming the file (--names is repeatable)."""
     names = set()
     for path in paths:
         if path.endswith(".json"):
-            with open(path, encoding="utf-8") as f:
-                doc = json.load(f)
-            for row in doc.get("files", []):
-                for n in row.get("names", []):
-                    names.add(SUFFIX.sub("", n))
+            try:
+                with open(path, encoding="utf-8") as f:
+                    doc = json.load(f)
+            except (ValueError, RecursionError) as e:   # ValueError: not JSON, or not UTF-8
+                raise ValueError(f"{path}: not JSON: {e}") from None
+            rows = doc.get("files", []) if isinstance(doc, dict) else None
+            if not isinstance(rows, list):
+                raise ValueError(f"{path}: expected rpf9_names.py JSON, an object with a 'files' array")
+            for row in rows:
+                listed = row.get("names", []) if isinstance(row, dict) else None
+                if not isinstance(listed, list) or not all(isinstance(n, str) for n in listed):
+                    raise ValueError(f"{path}: each 'files' row must be an object whose 'names' is an array of "
+                                     "strings")
+                names.update(SUFFIX.sub("", n) for n in listed)
         else:
             with open(path, encoding="utf-8", errors="replace") as f:
                 names.update(line.strip() for line in f)
