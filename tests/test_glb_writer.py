@@ -784,6 +784,31 @@ class TestObjParserAndBounds(unittest.TestCase):
         self.assertAlmostEqual(uvs[2][0], 0.0)
         self.assertAlmostEqual(uvs[2][1], 0.0)   # 1.0 - 1.0
 
+    def test_glb_preserves_finite_obj_normal_directions(self) -> None:
+        obj = """\
+v 0 0 0
+v 1 0 0
+v 0 1 0
+vn 1e-200 0 0
+vn 1.7e308 0 1.7e308
+vn 5e-324 0 5e-324
+f 1//1 2//2 3//3
+"""
+        primitives = glb_writer.parse_obj(obj, is_path=False, up_axis="y")
+        data = glb_writer.build_glb(primitives)
+        gltf = glb_writer.read_glb_summary(data)["json"]
+        normal_idx = gltf["meshes"][0]["primitives"][0]["attributes"]["NORMAL"]
+        normals = gltf["accessors"][normal_idx]
+        view = gltf["bufferViews"][normals["bufferView"]]
+        json_len, = struct.unpack_from("<I", data, 12)
+        offset = 28 + json_len + view.get("byteOffset", 0) + normals.get("byteOffset", 0)
+        values = struct.unpack_from("<9f", data, offset)
+
+        h = math.sqrt(0.5)
+        for i, expected in enumerate((1.0, 0.0, 0.0, h, 0.0, h, h, 0.0, h)):
+            with self.subTest(component=i):
+                self.assertAlmostEqual(values[i], expected, places=7)
+
     def test_parse_obj_generated_normals_cross_uv_seams(self):
         # The second triangle has twice the area of the first and a different UV
         # on each shared corner. They contribute +2Y and +Z to the shared normals.
