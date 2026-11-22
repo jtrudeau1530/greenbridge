@@ -194,5 +194,17 @@ class PageIndexTest(unittest.TestCase):
                 self.assertEqual(json.load(f)["summary"]["pages"], 0)
 
 
+    def test_directory_rejects_start_or_limit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "out.json")
+            for extra in (("--start", "0"), ("--limit", "100")):
+                proc = subprocess.run([sys.executable, "-I", TOOL, tmp, out, "--quiet", *extra],
+                                      capture_output=True, text=True)
+                self.assertEqual(proc.returncode, 2, proc.stderr)
+                self.assertIn("single archive", proc.stderr)
+                self.assertEqual(proc.stdout, "")
+                self.assertFalse(os.path.exists(out))
+
+
 if __name__ == "__main__":
     unittest.main()
