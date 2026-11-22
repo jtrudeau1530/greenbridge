@@ -171,6 +171,13 @@ transmittance table #1897 names, so it runs second and not side by side with `CS
 (mip 0). Which texture is bound to which table comes from #1897, not from the program. If a sky pass runs before the
 tables are built, it reads whatever is in them, and the black or noisy sky looks like a translator bug.
 
+### Transmittance addresses texel corners
+
+`CS_Transmittance` turns its integer texel index into table coordinates as x × 1/256 and y × 1/64, with no +0.5,
+so each texel holds the value at its corner, not its centre (pointed out by @Silliana in
+[#3217](https://github.com/ItsNotRexed/Leonida/pull/3217#issuecomment-7084678180)). A reference table built at texel
+centres differs from it slightly, most visibly near the ground. That difference is expected and isn't a translator bug.
+
 ### The dword at +0xD0: output format, not an enable
 
 #1897 reports a SkyView dword that skips the stores when it is zero. In `CS_SkyView` and `CS_MultipleScattering`
