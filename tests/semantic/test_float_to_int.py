@@ -70,16 +70,35 @@ class FloatToIntTest(unittest.TestCase):
 
     def test_multi_lane_divergence_and_rounding(self):
         rounding_cases = [
-            (0x3F800000, 1, 1),      # 1.0 -> 1
-            (0x3FA00000, 1, 1),      # 1.25 -> 1 (trunc toward zero)
-            (0x3FE00000, 1, 1),      # 1.75 -> 1 (trunc toward zero)
-            (0xBF800000, 0, 0xFFFFFFFF), # -1.0 -> -1
-            (0xBFA00000, 0, 0xFFFFFFFF), # -1.25 -> -1
-            (0xBFE00000, 0, 0xFFFFFFFF), # -1.75 -> -1
+            (0x3F800000, 1, 1),
+            (0x3FA00000, 1, 1),
+            (0x3FE00000, 1, 1),
+            (0xBF800000, 0, 0xFFFFFFFF),
+            (0xBFA00000, 0, 0xFFFFFFFF),
+            (0xBFE00000, 0, 0xFFFFFFFF),
         ]
         fssm = bytes(0x138) + struct.pack("<4I", 0x808A, 1, 1, 1)
         spv = support.translate_fixture("cs_cvt_f32_sat", fssm=fssm)
         for bits, unsigned, signed in rounding_cases:
+            memory = {}
+            support.run_fragment(
+                spv, inputs={"%wg_id": (0, 0, 0), "%local_id": (0, 0, 0)},
+                push_constants=[0, 0, 8, 0x31016FAC, bits] + [0] * 27, memory=memory)
+            self.assertEqual(memory[0], unsigned)
+            self.assertEqual(memory[4], signed)
+
+    def test_nan_inf_saturation_and_negative_controls(self):
+        special_cases = [
+            (0x7F800000, 0xFFFFFFFF, 0x7FFFFFFF), # +inf
+            (0xFF800000, 0, 0x80000000),          # -inf
+            (0x7F800001, 0, 0),                   # +NaN
+            (0xFFC00000, 0, 0),                   # -NaN
+            (0x80000000, 0, 0),                   # -0 negative control
+            (0x00000001, 0, 0),                   # subnormal negative control
+        ]
+        fssm = bytes(0x138) + struct.pack("<4I", 0x808A, 1, 1, 1)
+        spv = support.translate_fixture("cs_cvt_f32_sat", fssm=fssm)
+        for bits, unsigned, signed in special_cases:
             memory = {}
             support.run_fragment(
                 spv, inputs={"%wg_id": (0, 0, 0), "%local_id": (0, 0, 0)},
