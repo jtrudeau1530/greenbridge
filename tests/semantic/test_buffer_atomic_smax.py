@@ -1098,5 +1098,75 @@ class TestBufferAtomicSmaxStatusFlagsAndConditionCodes(unittest.TestCase):
         self.assertEqual(vcc_lt >> 32, 0)
 
 
+class TestBufferAtomicSmaxIEEE754BitwiseBoundaries(unittest.TestCase):
+    """Unit tests for IEEE 754 bit-pattern behavior under signed integer maximum."""
+
+    def setUp(self) -> None:
+        self.mem = BufferMemory(1024)
+        self.desc = BufferResourceDescriptor(base_address=0, stride=0, num_records=512)
+
+    def test_signed_zeros_float_bitpatterns(self) -> None:
+        # +0.0 float32 is 0x00000000 (signed int 0)
+        # -0.0 float32 is 0x80000000 (signed int INT32_MIN = -2147483648)
+        # Therefore smax(+0.0, -0.0) yields +0.0 (0x00000000)
+        self.mem.write_u32(0, 0x80000000)  # -0.0
+        ret, ok = ref_buffer_atomic_smax(
+            self.mem, self.desc, soffset=0, vaddr=0, cmp_val=0x00000000, glc=True
+        )
+        self.assertTrue(ok)
+        self.assertEqual(ret, 0x80000000)
+        self.assertEqual(self.mem.read_u32(0), 0x00000000)
+
+    def test_positive_vs_negative_float_bitpatterns(self) -> None:
+        # +1.0f is 0x3F800000 (positive int 1065353216)
+        # -1.0f is 0xBF800000 (negative int -1082130432)
+        # smax(+1.0f, -1.0f) = +1.0f
+        self.mem.write_u32(4, 0xBF800000)
+        ret, ok = ref_buffer_atomic_smax(
+            self.mem, self.desc, soffset=0, vaddr=4, cmp_val=0x3F800000, glc=True
+        )
+        self.assertTrue(ok)
+        self.assertEqual(ret, 0xBF800000)
+        self.assertEqual(self.mem.read_u32(4), 0x3F800000)
+
+    def test_infinities_float_bitpatterns(self) -> None:
+        # +inf is 0x7F800000 (positive int 2139095040)
+        # -inf is 0xFF800000 (negative int -8388608)
+        # smax(+inf, -inf) yields +inf
+        self.mem.write_u32(8, 0xFF800000)
+        ret, ok = ref_buffer_atomic_smax(
+            self.mem, self.desc, soffset=0, vaddr=8, cmp_val=0x7F800000, glc=True
+        )
+        self.assertTrue(ok)
+        self.assertEqual(ret, 0xFF800000)
+        self.assertEqual(self.mem.read_u32(8), 0x7F800000)
+
+    def test_subnormal_float_bitpatterns(self) -> None:
+        # Smallest positive subnormal: 0x00000001 (int +1)
+        # Smallest-magnitude negative subnormal: 0x80000001 (int INT32_MIN + 1 = -2147483647)
+        # smax(pos_sub, neg_sub) yields pos_sub (0x00000001)
+        self.mem.write_u32(12, 0x80000001)
+        ret, ok = ref_buffer_atomic_smax(
+            self.mem, self.desc, soffset=0, vaddr=12, cmp_val=0x00000001, glc=True
+        )
+        self.assertTrue(ok)
+        self.assertEqual(ret, 0x80000001)
+        self.assertEqual(self.mem.read_u32(12), 0x00000001)
+
+    def test_extreme_two_complement_limits(self) -> None:
+        # INT32_MAX (0x7FFFFFFF = 2147483647) is the supreme upper bound for smax
+        self.mem.write_u32(16, 0)
+        ref_buffer_atomic_smax(
+            self.mem, self.desc, soffset=0, vaddr=16, cmp_val=U32_INT32_MAX, glc=False
+        )
+        self.assertEqual(self.mem.read_u32(16), U32_INT32_MAX)
+
+        # Comparing INT32_MAX with any value leaves INT32_MAX intact
+        ref_buffer_atomic_smax(
+            self.mem, self.desc, soffset=0, vaddr=16, cmp_val=1000, glc=False
+        )
+        self.assertEqual(self.mem.read_u32(16), U32_INT32_MAX)
+
+
 if __name__ == "__main__":
     unittest.main()
