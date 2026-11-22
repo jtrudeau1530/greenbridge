@@ -11943,9 +11943,17 @@ class Gen:
                        fext("FMax", b0[2], b1[2]))
             notnan = T()
             e(f"{notnan} = OpFOrdEqual %bool {mm[0]} {mm[0]}")
+            # An empty box (min > max on any axis) is inactive, not a box that spans everything: xdxr_bvh._box_test
+            # culls it before the slabs. Ordered > keeps a NaN bound out of this decision, as before (SHADER-650).
+            empty = bop("OpLogicalOr",
+                        bop("OpLogicalOr", bop("OpFOrdGreaterThan", mm[0], mm[3]),
+                            bop("OpFOrdGreaterThan", mm[1], mm[4])),
+                        bop("OpFOrdGreaterThan", mm[2], mm[5]))
+            nonempty = T()
+            e(f"{nonempty} = OpLogicalNot %bool {empty}")
             h1 = bop("OpFOrdGreaterThanEqual", tmx, fext("FMax", "%f0", tmin))
             h2 = bop("OpFOrdLessThan", tmin, tmax)
-            hb = andd(notnan, andd(h1, h2))
+            hb = andd(notnan, andd(nonempty, andd(h1, h2)))
             dist.append(sel(hb, tmin, INF))
             idx.append(sel(hb, child, self.cu(0xFFFFFFFF), "%uint"))
         for p_, q_ in ((0, 1), (2, 3), (0, 2), (1, 3), (1, 2)):
