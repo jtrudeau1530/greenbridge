@@ -13,7 +13,10 @@
 #include <windows.h>
 #include <d3d12.h>
 
+#include "../src/gfx10_descriptors.h"
 #include "../src/vulkan_backend.h"
+
+#include <span>
 
 namespace rt::d3d12 {
 
@@ -36,6 +39,9 @@ HRESULT create_command_list(D3D12_COMMAND_LIST_TYPE type, ID3D12CommandAllocator
                             void** out, IUnknown* device = nullptr);
 HRESULT create_fence(leonida::VulkanContext& context, UINT64 initial_value, D3D12_FENCE_FLAGS flags, REFIID riid,
                      void** out, IUnknown* device = nullptr);
+HRESULT create_command_signature(leonida::IndirectKind kind, UINT byte_stride, REFIID riid, void** out,
+                                 IUnknown* device = nullptr);
+bool command_signature_info(ID3D12CommandSignature* signature, leonida::IndirectKind& kind, UINT& byte_stride);
 
 // ID3D12Device1::SetEventOnMultipleFenceCompletion on fences from create_fence: sets `event` once every fence
 // (D3D12_MULTIPLE_FENCE_WAIT_FLAG_ALL) or any fence (_ANY) has reached its value; a null event blocks until then.
@@ -84,6 +90,12 @@ struct VulkanDeviceInfo {
     // The instance enabled VK_EXT_debug_utils: SetMarker/BeginEvent/EndEvent become debug labels. Otherwise they
     // do nothing.
     bool debug_utils = false;
+    // Vulkan 1.2 bufferDeviceAddress is enabled: buffers carry VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT and
+    // ID3D12Resource::GetGPUVirtualAddress() returns the Vulkan buffer device address.
+    bool buffer_device_address = false;
+    // Optional VK_KHR_acceleration_structure + VK_KHR_deferred_host_operations + VK_KHR_ray_query are enabled:
+    // GetRaytracingAccelerationStructurePrebuildInfo and BuildRaytracingAccelerationStructure (BLAS + TLAS) work.
+    bool ray_tracing = false;
 };
 
 // A Vulkan-backed ID3D12Device (PC ABI, up to ID3D12Device11) on caller-owned Vulkan objects, which must outlive
@@ -100,12 +112,27 @@ void set_device_outer(ID3D12Device* device, IUnknown* outer);
 
 // The VkImage behind a texture created by such a device, or VK_NULL_HANDLE. For tests and the swapchain.
 VkImage vulkan_image(ID3D12Resource* resource);
+// The VkBuffer behind a buffer created by such a device, or VK_NULL_HANDLE. For tests.
+VkBuffer vulkan_buffer(ID3D12Resource* resource);
+// True when `device` has VK_KHR_acceleration_structure + VK_KHR_ray_query enabled.
+bool device_supports_ray_tracing(ID3D12Device* device);
+// The VkAccelerationStructureKHR registered for `va` on `device`, or VK_NULL_HANDLE. For tests.
+VkAccelerationStructureKHR vulkan_acceleration_structure(ID3D12Device* device, D3D12_GPU_VIRTUAL_ADDRESS va);
 
 // The property flags of the Vulkan memory type behind a resource created by such a device, or 0. For tests.
 VkMemoryPropertyFlags vulkan_memory_flags(ID3D12Resource* resource);
 
 // Whether both resources use the requested typed, non-integer colour format for a regional average resolve.
 bool color_resolve_format_matches(DXGI_FORMAT format, ID3D12Resource* dst, ID3D12Resource* src);
+
+// Whether a resolve of one depth or stencil plane can be replayed: both resources are depth-stencil textures of
+// `format` (a depth format, or a plane's shader-resource format such as R24_UNORM_X8_TYPELESS), the source
+// multisampled and the destination not, the same plane on both sides, MIN or MAX (or AVERAGE of the depth plane by
+// its own format), the destination offset the source rectangle's corner (or 0, 0 without one), and the Vulkan device
+// has the mode.
+bool depth_stencil_resolve_supported(DXGI_FORMAT format, ID3D12Resource* dst, UINT dst_subresource, UINT x, UINT y,
+                                     ID3D12Resource* src, UINT src_subresource, const D3D12_RECT* rect,
+                                     D3D12_RESOLVE_MODE mode);
 
 // The maxPushConstantsSize in bytes of the Vulkan physical device behind `device`, or 0 if not a Vulkan device.
 std::uint32_t device_max_push_constants_size(ID3D12Device* device);
@@ -123,6 +150,11 @@ bool device_upload_in_vram(ID3D12Device* device);
 // brought up to date at every ExecuteCommandLists.
 VkDescriptorSet bindless_set(ID3D12Device* device);
 VkDescriptorSetLayout bindless_set_layout(ID3D12Device* device);
+// Gives each S# a sampler in that set and a key in its hash table, as CreateSampler does, without a heap slot: for
+// the literal S#s a shader builds from immediates (`literal_samplers` in the shader index). An S# that has them
+// already is left as it is. E_INVALIDARG when `device` is not such a device; E_FAIL when one of them could not be
+// registered (no bindless set, or its sampler array is full), the others are registered all the same.
+HRESULT register_samplers(ID3D12Device* device, std::span<const leonida::gfx10::SamplerWords> samplers);
 // True when GetClockCalibration on `queue` reads calibrated timestamps, false when it submits a timestamp query
 // (or `queue` is not one of this module's queues). For tests.
 bool queue_uses_calibrated_timestamps(ID3D12CommandQueue* queue);

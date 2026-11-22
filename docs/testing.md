@@ -136,6 +136,22 @@ instruction"), which is why the second run is limited to compute. llvmpipe is no
 real GPU in [#166](https://github.com/ItsNotRexed/Leonida/issues/166): it catches regressions, not hardware
 differences.
 
+## GPUs without fragment barycentrics (NVIDIA Pascal and older)
+
+`ps_bary`, `ps_uniform_branch` and `ps_scc_mask32` read raw barycentrics, which need
+`VK_KHR_fragment_shader_barycentric`. Where the device lacks it they're skipped; that's expected, not a failure. To
+test the fallback that runs them anyway, set `LEONIDA_BARY_FALLBACK=1`, **for both `build.py` and `check.py`** (or
+for `run_gpu_tests.py`). The shaders are then translated with `--bary-fallback` and drawn through a pass-through
+geometry shader that supplies the barycentrics (`docs/design.md`, "Barycentric fallback"), so the device needs
+geometry shaders instead.
+
+## GPUs without VK_KHR_maintenance8 (NVIDIA Pascal and older)
+
+`ps_texoff` and `ps_texoff_implicit` sample with a run-time texel offset, which needs `VK_KHR_maintenance8`;
+without it they're skipped, which is expected, not a failure. To test the fallback, set `LEONIDA_TEXOFF_FALLBACK=1`
+**for both `build.py` and `check.py`** (or for `run_gpu_tests.py`): the offset is then folded into the coordinate
+(`docs/design.md`, "Texel offsets"), and the +16/-32 sample is judged on every device.
+
 ## Choosing the GPU
 
 With more than one GPU, pick one through the Vulkan loader, for example
@@ -147,7 +163,8 @@ say; without a choice the D3D12 tests take the last discrete GPU). `LEONIDA_VK_D
 name, without case: `LEONIDA_VK_DEVICE=5070` or `LEONIDA_VK_DEVICE=radeon`. The D3D12 tests (`vk_test_device.h`)
 and the layer's standalone device read it, and a value that matches no device fails the run instead of testing
 another GPU. For the host side of the comparison tests, `LEONIDA_HOST_ADAPTER` picks the D3D12 adapter the same way.
-The GPU tools of `runtime/test/shaders` (`vk_compute_test`, `vk_harness`, ...) do not read it yet.
+The GPU tools of `runtime/test/shaders` (`vk_compute_test`, `vk_harness`, ...) read it the same way through
+`vk_device_pick.h`, and fail with a message naming the filter when it matches no device.
 
 ## Known problems
 

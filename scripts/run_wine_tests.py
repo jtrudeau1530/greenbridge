@@ -46,6 +46,11 @@ def properties(test: dict) -> dict:
     return {p["name"]: p["value"] for p in test.get("properties", [])}
 
 
+def truthy(value) -> bool:
+    """A ctest boolean property. The JSON carries it as a string, so "0" must stay false."""
+    return str(value).strip().lower() in ("1", "on", "true", "yes")
+
+
 def run_test(test: dict, args, wine: list[str]) -> tuple[str, str]:
     """Returns (status, detail): status is pass, fail or skip."""
     command = test.get("command")
@@ -73,14 +78,41 @@ def run_test(test: dict, args, wine: list[str]) -> tuple[str, str]:
     except subprocess.TimeoutExpired as e:
         out = (e.stdout or b"").decode("utf-8", "replace")
         return "fail", f"timed out after {args.timeout} s\n{out}"
+    except OSError as e:                  # a mistyped --wine, or a missing one: report the test, do not abort the run
+        return "fail", f"could not start {argv[0]}: {e.strerror or e}"
     elapsed = time.monotonic() - start
     out = proc.stdout.decode("utf-8", "replace")
     code = proc.returncode
     skip_code = props.get("SKIP_RETURN_CODE")
     if skip_code is not None and code == int(skip_code):
         return "skip", f"exit {code} (skip) in {elapsed:.1f} s\n{out}"
-    passed = (code != 0) if props.get("WILL_FAIL") else (code == 0)
+    passed = (code != 0) if truthy(props.get("WILL_FAIL")) else (code == 0)
     return ("pass" if passed else "fail"), f"exit {code} in {elapsed:.1f} s\n{out}"
+
+
+def positive_seconds(text: str) -> float:
+    """--timeout: a value of 0 or less made subprocess.run raise ValueError before the test could be reported."""
+    try:
+        value = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"invalid float value: {text!r}") from None
+    if value <= 0:
+        raise argparse.ArgumentTypeError("must be greater than 0")
+    return value
+
+
+def read_tests(path: str) -> list[dict] | None:
+    """The tests in a `ctest --show-only=json-v1` file, or None when it is not one."""
+    try:
+        with open(path, encoding="utf-8-sig") as f:
+            doc = json.load(f)
+    except (OSError, ValueError) as e:
+        print(f"ERROR: cannot read {path}: {e}", file=sys.stderr)
+        return None
+    if not isinstance(doc, dict) or not isinstance(doc.get("tests", []), list):
+        print(f"ERROR: {path} is not the output of ctest --show-only=json-v1", file=sys.stderr)
+        return None
+    return doc.get("tests", [])
 
 
 def main() -> int:
@@ -90,13 +122,14 @@ def main() -> int:
     ap.add_argument("--root", default=ROOT, help="the Linux checkout (default: this repository)")
     ap.add_argument("--wine", default=os.environ.get("WINE", "wine"), help="Wine command (default: $WINE or wine)")
     ap.add_argument("--require", action="append", default=[], help="a test that must pass (repeatable)")
-    ap.add_argument("--timeout", type=float, default=120.0, help="seconds per test (default 120)")
+    ap.add_argument("--timeout", type=positive_seconds, default=120.0, help="seconds per test (default 120)")
     ap.add_argument("--summary", help="append a Markdown table to this file (e.g. $GITHUB_STEP_SUMMARY)")
     ap.add_argument("--label", help="named in the summary's heading, e.g. the Wine version")
     args = ap.parse_args()
 
-    with open(args.tests, encoding="utf-8-sig") as f:
-        tests = json.load(f).get("tests", [])
+    tests = read_tests(args.tests)
+    if tests is None:
+        return 2
     wine = shlex.split(args.wine)
     results = {}
     for test in tests:

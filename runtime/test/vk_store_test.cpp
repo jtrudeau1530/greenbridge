@@ -65,6 +65,10 @@ int main(int argc, char** argv) {
     for (std::size_t i = 0; i < pds.size(); ++i) vkGetPhysicalDeviceProperties(pds[i], &candidates[i]);
     const std::size_t chosen = leonida::vk_test::pick_device(candidates);
     VkPhysicalDevice pd = chosen < pds.size() ? pds[chosen] : VK_NULL_HANDLE;
+    if (!pd) {
+        leonida::vk_test::report_no_device();
+        return 1;
+    }
     VkPhysicalDeviceProperties props; vkGetPhysicalDeviceProperties(pd, &props);
     std::fprintf(stderr, "device: %s\n", props.deviceName);
     uint32_t qn = 0;

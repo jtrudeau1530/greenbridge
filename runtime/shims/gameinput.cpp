@@ -12,7 +12,7 @@
 //     effect (SDL_SendGamepadEffect), as set by LEONIDA_DS_TRIGGERS. That is an approximation of the Xbox impulse
 //     trigger signal, not the PS5 version's authored effects.
 //   - DualSense/DualShock 4 lightbar colour (LEONIDA_DS_LIGHTBAR) and the player LEDs by connection order
-//   - the keyboard pad (LEONIDA_KEYBOARD_PAD): one SDL virtual gamepad whose buttons the keyboard presses, for menus
+//   - the keyboard pad (LEONIDA_KEYBOARD_PAD): one SDL virtual gamepad driven by the keyboard and mouse
 //
 // One thread owns SDL: the background poll thread by default, or the caller of rt::gameinput::poll() when
 // LEONIDA_GAMEINPUT_THREAD=0. Title calls never touch SDL: they read the latest snapshot and leave rumble requests
@@ -288,6 +288,7 @@ public:
     uint64_t seq = 0;
     Rumble wanted;
     GameInputBatteryState battery{0, 0, 0, 0, GameInputBatteryUnknown};
+    AppLocalDeviceId base_id{};  // id_bytes of the identity alone: twins share it, info.deviceId tells them apart
 
     // Poll-thread state.
     SDL_Gamepad* pad = nullptr;
@@ -521,6 +522,12 @@ void id_bytes(const std::string& identity, const SDL_GUID& guid, AppLocalDeviceI
     }
 }
 
+// Twin n of an identity. Twin 0 is the plain id, so a pad without twins keeps the id it always had. Real identities
+// start with "s:", "p:" or are empty, never "t:", so a twin id cannot be another pad's own id.
+void id_bytes(const std::string& identity, const SDL_GUID& guid, uint32_t twin, AppLocalDeviceId* out) {
+    id_bytes(twin ? "t:" + std::to_string(twin) + ":" + identity : identity, guid, out);
+}
+
 void fill_info(Device* d, SDL_Gamepad* p, const AppLocalDeviceId& id) {
     GameInputDeviceInfo& i = d->info;
     i = {};
@@ -595,16 +602,34 @@ void open_pad(SDL_JoystickID jid, uint64_t ts) {
     const char* serial = SDL_GetGamepadSerial(p);
     const char* path = SDL_GetGamepadPath(p);
     const std::string identity = (serial && *serial) ? std::string("s:") + serial : (path && *path) ? std::string("p:") + path : "";
-    AppLocalDeviceId id{};
-    id_bytes(identity, SDL_GetGamepadGUIDForID(jid), &id);
+    const SDL_GUID guid = SDL_GetGamepadGUIDForID(jid);
+    AppLocalDeviceId base{};
+    id_bytes(identity, guid, &base);
 
     const SDL_PropertiesID props = SDL_GetGamepadProperties(p);
     std::lock_guard lock(s.mu);
+    // The same pad coming back gets its old object. Pads with the same GUID and serial or path (identical pads with
+    // neither, mostly) are twins sharing one base id, told apart by order alone: the lowest disconnected twin is
+    // reused, and a new one gets the next free twin id. Which physical pad was which cannot be recovered, so twins
+    // that return in a different order swap objects and ids (docs/gameinput.md).
     Device* d = nullptr;
-    for (Device* old : s.devices)  // the same pad coming back gets its old object
-        if (old->status == GameInputDeviceNoStatus && std::memcmp(&old->info.deviceId, &id, sizeof id) == 0) d = old;
+    uint32_t twins = 0;
+    for (Device* old : s.devices) {  // creation order, so twins in twin order
+        if (std::memcmp(&old->base_id, &base, sizeof base) != 0) continue;
+        ++twins;
+        if (!d && old->status == GameInputDeviceNoStatus) d = old;
+    }
+    AppLocalDeviceId id = d ? d->info.deviceId : base;  // a copy: fill_info clears info before it writes the id
     if (!d) {
+        const auto taken = [&s](const AppLocalDeviceId& v) {
+            for (Device* o : s.devices)
+                if (std::memcmp(&o->info.deviceId, &v, sizeof v) == 0) return true;
+            return false;
+        };
+        id_bytes(identity, guid, twins, &id);
+        for (uint32_t n = twins + 1; taken(id); ++n) id_bytes(identity, guid, n, &id);
         d = new Device;
+        d->base_id = base;
         s.devices.push_back(d);
     }
     d->pad = p;
@@ -754,6 +779,7 @@ void refresh_battery(Device* d, uint64_t now) {
 // code presses buttons on each poll. It then goes through open_pad and read_pad like any controller, so it gets a
 // device object, a player slot, readings, callbacks and UI navigation the same way. It has no motors, so rumble sent
 // to it is dropped. Keys are read with GetAsyncKeyState, which needs no window or message loop and works under Wine.
+// WASD is the left stick, the mouse the right stick, and the right/left mouse buttons the left/right triggers.
 
 constexpr rt::gameinput::KeyBinding kKeyBindings[] = {
     {VK_UP, SDL_GAMEPAD_BUTTON_DPAD_UP, "Up"},
@@ -770,7 +796,29 @@ constexpr rt::gameinput::KeyBinding kKeyBindings[] = {
     {VK_TAB, SDL_GAMEPAD_BUTTON_BACK, "Tab"},
 };
 
+// WASD on the left stick: a full press is the edge of the stick; a diagonal sits on the round gate, as a real stick
+// reports it, so each axis is 1/sqrt(2) of full.
+constexpr int kStickFull = 32767;
+constexpr int kStickDiagonal = 23170;  // 32767 / sqrt(2)
+
+// The mouse on the right stick, in SDL axis units per poll (2 ms with the background thread): each poll the stick
+// keeps kMouseDecayNum/kMouseDecayDen of its value and adds kMouseAxisPerPixel for every pixel the cursor moved, then
+// is clamped to full. Steady movement settles at 8 x 1024 units per pixel per poll, so 4 pixels per poll (2000
+// pixels a second) is full deflection; a stopped mouse falls back from full to exactly 0 in 67 polls (134 ms).
+// Integer math rounds toward zero, so the stick always reaches center.
+constexpr int kMouseAxisPerPixel = 1024;
+constexpr int kMouseDecayNum = 7, kMouseDecayDen = 8;
+
 bool async_key_down(int vk) { return (GetAsyncKeyState(vk) & 0x8000) != 0; }
+
+// shortcut: plain cursor deltas stop at the screen edge; capture or recenter the cursor if that matters in game.
+bool system_cursor_pos(int* x, int* y) {
+    POINT p;
+    if (!GetCursorPos(&p)) return false;
+    *x = p.x;
+    *y = p.y;
+    return true;
+}
 
 bool foreground_is_ours() {
     const HWND w = GetForegroundWindow();
@@ -780,11 +828,15 @@ bool foreground_is_ours() {
 
 std::atomic<rt::gameinput::KeyDownFn> g_key_down{async_key_down};
 std::atomic<rt::gameinput::HasFocusFn> g_has_focus{foreground_is_ours};
+std::atomic<rt::gameinput::CursorPosFn> g_cursor_pos{system_cursor_pos};
 
 struct KeyboardPad {
     SDL_JoystickID id = 0;
     SDL_Joystick* js = nullptr;
     bool failed = false;  // attaching failed once; not retried every 2 ms
+    int right_x = 0, right_y = 0;    // the mouse's right stick, SDL axis units (+Y down)
+    int cursor_x = 0, cursor_y = 0;  // the cursor at the last poll
+    bool have_cursor = false;        // cursor_x/y are valid; false after focus loss, so the first poll moves nothing
 };
 KeyboardPad g_keyboard;
 
@@ -812,11 +864,9 @@ bool attach_keyboard_pad() {
         g_keyboard.failed = true;
         return false;
     }
-    // Triggers at rest: SDL maps a full-range virtual axis to the trigger, so -32768 is released, 0 half pulled.
-    SDL_SetJoystickVirtualAxis(g_keyboard.js, SDL_GAMEPAD_AXIS_LEFT_TRIGGER, -32768);
-    SDL_SetJoystickVirtualAxis(g_keyboard.js, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER, -32768);
     std::fprintf(stderr, "[rt] gameinput: keyboard pad attached (arrows d-pad, Enter A, Backspace B, X X, Y Y, "
-                         "Q/E shoulders, Esc Menu, Tab View)\n");
+                         "Q/E shoulders, Esc Menu, Tab View, WASD left stick, mouse right stick, right/left "
+                         "button LT/RT)\n");
     return true;
 }
 
@@ -835,12 +885,43 @@ void update_keyboard_pad() {
     if (!g_keyboard.js && (g_keyboard.failed || !attach_keyboard_pad())) return;
 
     bool down[SDL_GAMEPAD_BUTTON_COUNT] = {};
-    // Out of focus every button is released, so a key held while switching windows does not stay pressed.
+    int lx = 0, ly = 0;
+    bool aim = false, fire = false;
+    // Out of focus every button, stick and trigger is released, so a key held while switching windows does not stay
+    // pressed, and the cursor is read afresh on return, so moving it in another window does not swing the stick.
     if (mode == rt::gameinput::KeyboardPadMode::Always || g_has_focus.load()()) {
         const rt::gameinput::KeyDownFn key_down = g_key_down.load();
         for (const auto& b : kKeyBindings) down[b.sdl_button] |= key_down(b.virtual_key);
+        lx = key_down('D') - key_down('A');  // opposite keys cancel
+        ly = key_down('S') - key_down('W');  // SDL's +Y is down
+        aim = key_down(VK_RBUTTON);
+        fire = key_down(VK_LBUTTON);
+
+        int x = 0, y = 0;
+        const bool have = g_cursor_pos.load()(&x, &y);
+        const bool moved = have && g_keyboard.have_cursor;
+        auto step = [](int v, int pixels) {
+            const long long n = static_cast<long long>(v) * kMouseDecayNum / kMouseDecayDen +
+                                static_cast<long long>(pixels) * kMouseAxisPerPixel;
+            return static_cast<int>(std::clamp<long long>(n, -kStickFull, kStickFull));
+        };
+        g_keyboard.right_x = step(g_keyboard.right_x, moved ? x - g_keyboard.cursor_x : 0);
+        g_keyboard.right_y = step(g_keyboard.right_y, moved ? y - g_keyboard.cursor_y : 0);
+        if (have) g_keyboard.cursor_x = x, g_keyboard.cursor_y = y;
+        g_keyboard.have_cursor = have;
+    } else {
+        g_keyboard.right_x = g_keyboard.right_y = 0;
+        g_keyboard.have_cursor = false;
     }
     for (const auto& b : kKeyBindings) SDL_SetJoystickVirtualButton(g_keyboard.js, b.sdl_button, down[b.sdl_button]);
+    const int reach = lx && ly ? kStickDiagonal : kStickFull;
+    SDL_SetJoystickVirtualAxis(g_keyboard.js, SDL_GAMEPAD_AXIS_LEFTX, static_cast<Sint16>(lx * reach));
+    SDL_SetJoystickVirtualAxis(g_keyboard.js, SDL_GAMEPAD_AXIS_LEFTY, static_cast<Sint16>(ly * reach));
+    SDL_SetJoystickVirtualAxis(g_keyboard.js, SDL_GAMEPAD_AXIS_RIGHTX, static_cast<Sint16>(g_keyboard.right_x));
+    SDL_SetJoystickVirtualAxis(g_keyboard.js, SDL_GAMEPAD_AXIS_RIGHTY, static_cast<Sint16>(g_keyboard.right_y));
+    // SDL maps a full-range virtual axis to the trigger, so -32768 is released, 0 half pulled, 32767 full.
+    SDL_SetJoystickVirtualAxis(g_keyboard.js, SDL_GAMEPAD_AXIS_LEFT_TRIGGER, aim ? 32767 : -32768);
+    SDL_SetJoystickVirtualAxis(g_keyboard.js, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER, fire ? 32767 : -32768);
 }
 
 bool init_sdl() {
@@ -1283,6 +1364,8 @@ void set_keyboard_source(KeyDownFn key_down, HasFocusFn has_focus) {
     g_key_down = key_down ? key_down : async_key_down;
     g_has_focus = has_focus ? has_focus : foreground_is_ours;
 }
+
+void set_cursor_source(CursorPosFn cursor_pos) { g_cursor_pos = cursor_pos ? cursor_pos : system_cursor_pos; }
 
 const KeyBinding* keyboard_bindings(int* count) {
     if (count) *count = static_cast<int>(std::size(kKeyBindings));

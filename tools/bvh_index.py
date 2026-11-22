@@ -23,6 +23,7 @@ Usage:
 
 --start and --limit apply to a single archive only; with a directory they are an error (exit 2).
 --max-inflate applies to every .rpf in the directory.
+Archive rows include a fill histogram only when the complete node range was kept.
 
 Exit status is 0 even when nothing is found; the summary says how many streams were read.
 """
@@ -268,7 +269,7 @@ def scan_rpf(path, start=None, limit=None, max_inflate=1 << 28):
                     unread += len(gap)
                 row = classify(head, total, kept[-HEAD:] if len(kept) >= HEAD else kept)
                 row.update(source=path, offset=s, stored=used, size=total)
-                if row["kind"] in ("bvh4", "bvh4-chunk") and row["declared_bytes"] <= total:
+                if row["kind"] in ("bvh4", "bvh4-chunk") and row["declared_bytes"] <= len(kept):
                     body = kept[HEAD:HEAD + row["node_count"] * 64]
                     row["fill"] = {("%02x" % b): body.count(bytes([b])) for b in FILL_BYTES if body.count(bytes([b]))}
                     row["fill"]["total"] = len(body)
@@ -383,6 +384,15 @@ def offset(text):
     return value
 
 
+def same_output_path(first, second):
+    if os.path.normcase(os.path.realpath(first)) == os.path.normcase(os.path.realpath(second)):
+        return True
+    try:
+        return os.path.samefile(first, second)
+    except OSError:
+        return False
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("target", help="RPF9 archive or a directory of .rpf/.bin payloads")
@@ -393,6 +403,8 @@ def main(argv=None):
     ap.add_argument("--max-inflate", type=byte_count, default=1 << 28,
                     help="keep at most this many bytes of one stream")
     a = ap.parse_args(argv)
+    if a.out and a.csv and same_output_path(a.out, a.csv):
+        ap.error("--out and --csv must use different paths")
     if os.path.isdir(a.target) and (a.start is not None or a.limit is not None):
         ap.error("--start and --limit apply to a single archive, not a directory")
     below_normal()

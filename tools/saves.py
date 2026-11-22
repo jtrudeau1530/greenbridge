@@ -42,6 +42,10 @@ def ts(v):
 def parse_asav(d):
     if d[:4] != b'ASAV':
         raise ValueError('not ASAV')
+    # The fixed fields below are read at absolute offsets, so a short file must be rejected here instead of
+    # letting struct.unpack_from raise a struct.error that says nothing about the save (the JSAV parser in #923).
+    if len(d) < ASAV_HDR:
+        raise ValueError(f'header is only {len(d)} bytes, an ASAV header is {ASAV_HDR}')
     f = struct.unpack_from('<IIIIIII', d, 4)
     h = {
         'magic': 'ASAV',
@@ -61,6 +65,8 @@ def parse_asav(d):
         'file_size': len(d),
     }
     h['timestamp_utc'] = ts(h['timestamp'])
+    if h['payload_offset'] > len(d):
+        raise ValueError(f"payload offset {h['payload_offset']:#x} is past the end of a {len(d)}-byte file")
     return h
 
 
@@ -286,21 +292,43 @@ def verify(p):
 def diff(pa, pb):
     da, db = read(pa), read(pb)
     (_, ea), (_, eb) = parse_jsav(da), parse_jsav(db)
-    ma = {(e['group'], e['hash']): b for e, b in zip(ea, jsav_blocks(da, ea))}
-    mb = {(e['group'], e['hash']): b for e, b in zip(eb, jsav_blocks(db, eb))}
-    for k in ma.keys() - mb.keys():
-        print('only in A:', *k, len(ma[k]))
-    for k in mb.keys() - ma.keys():
-        print('only in B:', *k, len(mb[k]))
+    # A save can hold several blocks with the same (group, hash): keep them in order instead of letting
+    # later ones overwrite earlier ones in a dict, which silently dropped them from the comparison.
+    ma, mb = {}, {}
+    for entries, data, table in ((ea, da, ma), (eb, db, mb)):
+        for entry, block in zip(entries, jsav_blocks(data, entries)):
+            table.setdefault((entry['group'], entry['hash']), []).append(block)
+    for k in sorted(ma.keys() - mb.keys()):
+        for block in ma[k]:
+            print('only in A:', *k, len(block))
+    for k in sorted(mb.keys() - ma.keys()):
+        for block in mb[k]:
+            print('only in B:', *k, len(block))
     same = 0
-    for k in ma.keys() & mb.keys():
-        if ma[k] == mb[k]:
-            same += 1
-            continue
-        a, b = ma[k], mb[k]
-        n = next((i for i, (x, y) in enumerate(zip(a, b)) if x != y), min(len(a), len(b)))
-        print(f'changed: {k[0]} {k[1]} {len(a)} -> {len(b)} bytes, first difference near: '
-              f'A {a[max(0, n - 40):n + 40]!r}  B {b[max(0, n - 40):n + 40]!r}')
+    for k in sorted(ma.keys() & mb.keys()):
+        left, right = ma[k], mb[k]
+        # Match identical blocks by content first: with duplicate keys, an unchanged block that moved
+        # position should be reported as a removal/addition of the others, not as a false "changed".
+        pending_right, matched_left = list(right), [False] * len(left)
+        for i, block in enumerate(left):
+            if block in pending_right:
+                matched_left[i] = True
+                pending_right.remove(block)
+                same += 1
+        left = [block for i, block in enumerate(left) if not matched_left[i]]
+        for i in range(max(len(left), len(pending_right))):
+            a = left[i] if i < len(left) else None
+            b = pending_right[i] if i < len(pending_right) else None
+            if a is None or b is None:
+                label, block = ('only in B:', b) if a is None else ('only in A:', a)
+                print(label, *k, len(block))
+                continue
+            if a == b:
+                same += 1
+                continue
+            n = next((j for j, (x, y) in enumerate(zip(a, b)) if x != y), min(len(a), len(b)))
+            print(f'changed: {k[0]} {k[1]} {len(a)} -> {len(b)} bytes, first difference near: '
+                  f'A {a[max(0, n - 40):n + 40]!r}  B {b[max(0, n - 40):n + 40]!r}')
     print(f'{same} blocks identical')
 
 
@@ -351,15 +379,26 @@ def save_slot(folder):
 
 
 def import_saves(args):
+    flags = {'--out', '--map', '--with-packed', '--force', '--dry-run'}
+    for option, following in zip(args, args[1:]):
+        if option in ('--out', '--map') and following in flags:
+            raise ValueError(f'import: {option} needs a value before {following}')
+
     import hashlib
     out, maps, with_packed, force, dry = None, {}, False, False, False
     folders = []
     it = iter(args)
+
+    def value(flag):
+        v = next(it, None)
+        if v is None:
+            raise ValueError(f'import: {flag} needs a value')
+        return v
     for a in it:
         if a == '--out':
-            out = next(it)
+            out = value(a)
         elif a == '--map':
-            k, v = next(it).split('=', 1)
+            k, v = value(a).split('=', 1)
             c, _, b = v.partition('/')
             maps[k] = (c, b or None)
         elif a == '--with-packed':

@@ -36,7 +36,7 @@ FSSM = bytearray(0x148)
 struct.pack_into("<4I", FSSM, 0x138, 0x8088, 64, 1, 1)
 FSSM = bytes(FSSM)
 # V# in s[0:3]: base 0, stride 0, num_records 0x1000 bytes. out[k] is the dword at byte 4k.
-VSHARP = [0, 0, 0x1000, 0]
+VSHARP = [0, 0, 0x1000, 0x31016FAC]
 
 # Expected on a 64-wide subgroup: the GPU check's values (check.py W64X_DUMPS).
 GPU_EXPECTED = {

@@ -262,15 +262,14 @@ that was a lower bound, and the full pass settles the extrapolation. See
 coverage.
 
 The full count is lower than SixNG's published 30,785 map files / 2,249,490 entities
-(https://github.com/holdmysocks/SixNG). A census of the other ten non-radio archives found no maps
-outside `levels.rpf`, so the 7,250-map / 579,048-entity difference is not explained by other archives;
-duplicate map payloads and map-name hashes are zero, and the 138,839 `CMapData`-only metadata
-resources cannot account for the 579,048 entities (see
-[world_census.md](world_census.md#other-archives)). The census counts only
-validated `0x7a` resources whose schema includes `CMapData` and whose entity table is self-consistent;
-SixNG may count archive entries, nested maps, or map resources that this scanner rejects. Treat the
-23,535 / 1,670,442 figure as the measured count for this package and this validation rule, not as a
-claim about a different enumeration method.
+(https://github.com/holdmysocks/SixNG), and the whole difference is now accounted for map by map (see
+[world_census.md](world_census.md#the-sixng-difference-map-by-map)). The 23,528 maps both count agree
+on every entity count. SixNG also counts 7,257 `0x7a` resources that have `CEntityDef` objects but no
+`CMapData` struct: 961 interior archetype resources (`CMloArchetypeDef`, 540,665 entities in interior
+space) and 6,296 `35abc248` entity groups (39,622 entities in group-local space). It misses 7 maps
+(1,239 entities) whose entity data is in a continuation page. 7,257 − 7 = 7,250 maps and 580,287 −
+1,239 = 579,048 entities. The 23,535 / 1,670,442 census figure is the count of world placement
+lists; interiors and entity groups need the transform of whatever places them.
 
 ## What is readable, what is hash-only
 
@@ -324,8 +323,10 @@ Hash-only or opaque:
 `tools/world_index.py` scans an RPF9 archive or a directory of carved streams and writes JSON/CSV with
 `offset, size, signature, version, kind, structs, blocks, entities, extents, position bounds, LOD counts`,
 map name/parent hashes and the map root's 64-bit name key. It implements the header/schema validation above
-and the continuation join. It does not decrypt anything, does not extract models/textures, and keeps the
-output aggregate (one row per resource, no entity dump).
+and the continuation join. It does not decrypt anything and does not extract models/textures. Its JSON/CSV
+output is aggregate (one row per resource). `--entities-out` adds a local-only JSON-lines file with one row per
+complete entity (archetype hash and key, position, stored rotation, scales, LOD fields), the input of
+`world_build.py --placements` below.
 
 `tools/world_census.py` scans the whole `levels.rpf` data area in shards and counts every validated
 `0x7a` map resource and placement entity. The measured full pass is 23,535 maps / 1,670,442 entities
@@ -347,6 +348,104 @@ python -I tests\test_world_names.py
 For a 76 GB archive always bound the run with `--start/--limit`; the tool records the window in its summary.
 A 0x7a resource split beyond the first continuation, or a map whose entity block lives in a graphics page, is
 reported with fewer entities or as `meta` rather than guessed.
+
+## Building a placed world
+
+`tools/world_build.py --placements` builds the viewer's chunks from map placements instead of each model's own
+coordinates. It covers points 3 and 4 of *What a runtime needs*; point 5 (HD/LOD switching) is not done.
+
+1. `world_index.py <levels.rpf> --entities-out <work>\world\entities.jsonl` writes one row per complete entity.
+2. rpf9dump exports the models (`models/manifest.json` + OBJ).
+3. `world_build.py <assets> --out <world> --placements <entities.jsonl>`. Each selected entity is matched to an
+   exported model by the lower-cased joaat of the manifest `Name` without its `.#dr`/`.#ft` suffix. When the
+   entity row carries the +0x20 key, the model's Murmur3-64 must equal it, as in `world_names.py`; a 32-bit-only
+   match is a `key_mismatch` and is not placed. The model is scaled by (`scaleXY`, `scaleXY`, `scaleZ`), rotated
+   by the **conjugate** of the stored quaternion, translated to `position`, and converted from RAGE Z-up to
+   glTF Y-up `(x, z, -y)`. Normals use the inverse-transpose; a negative scale product flips the winding.
+
+`--lod-levels` picks the `lodLevel` values to place (default `0,5`: HD and ORPHAN_HD) and `--region
+MINX,MINY,MAXX,MAXY` bounds the RAGE world X/Y. `world.json` then has `"layout": "placements"` and a
+`stats.placements` block: `rows`, `malformed`, `other_lod_level`, `outside_region`, `selected`, `placed`,
+`placed_unverified` (no key in the row), `key_mismatch`, `unresolved_archetype` (no exported model has that name),
+`model_not_loadable` and `distinct_models`.
+
+Measured on the 1.0.2.1 package:
+
+| Step | Result |
+|---|---|
+| `--entities-out` over the whole data area (24 parallel `--start/--limit` windows) | 1,670,435 rows, about 1 min |
+| `lodLevel` split | 0: 1,153,122 · 5: 396,871 · 1: 100,953 · 2: 16,828 · 3: 1,708 · 4: 601 · 6: 352 |
+| one 700 m × 700 m downtown box, HD + ORPHAN_HD | 29,258 entities, 3,995 distinct archetypes |
+| placed with models recovered by the pinned rpf9-explorer (917e9b9) | 10,729 (36.7%); 18,529 `unresolved_archetype`, 0 `key_mismatch` |
+| same box, models recovered with breadbbbb/rpf9-explorer#8 and #10 applied | 29,229 of 29,258 entities have a model (3,992 of 3,995 archetypes) |
+| build of the 10,729 placed instances (`--no-textures --jobs 8`, 256 m chunks) | 16 chunks, 29.3M triangles, 1.17 GB of GLB, median chunk 104 MB, max 164 MB; 5 min, 22 GB peak RSS |
+
+The unresolved share in that box is a model-recovery gap, not a naming gap. All 1,800 archetypes that #8/#10 add
+in that box are `.#ft` fragments (18,500 of the entities). The pinned `LooksLikeFragment` rejects their headers
+(breadbbbb/rpf9-explorer#8).
+
+Checks on the same box:
+- The conjugate of every stored rotation equals SixNG's independently derived world rotation:
+  |dot| ≥ 0.9999 on 29,124 of 29,125 entities matched by position and archetype, and the minimum is 0.99894.
+  Scales are equal on all 29,125.
+- Every placed instance's position lies inside its chunk's bounds (10,620 of 10,620 distinct
+  position/archetype pairs).
+
+**Not verified:** the result has not been looked at in a browser. Instances are baked into the chunk geometry,
+not shared, so a dense box makes 100 MB+ chunks; a smaller `--chunk-size` keeps them small. Building a whole
+city needs glTF instancing and LOD switching, which are next steps.
+
+```powershell
+python -I tools\world_index.py <levels.rpf> --out work\world\index.json --entities-out work\world\entities.jsonl
+python -I tools\world_build.py work\assets --out work\world\placed --no-textures `
+    --placements work\world\entities.jsonl --region=-900,500,-200,1200
+python -I tests\test_world_place.py
+```
+
+The entity rows and the placed chunks come from your own copy of the game; keep them in the local work folder.
+
+## Instanced props and grass
+
+Map resources can carry two instance lists besides `CEntityDef`. All four struct names are the case-sensitive
+joaat of the GTA V class names, and every member below is named by the resource's own member table.
+`tools/instance_lists.py` reads them through that table (by name hash) and writes counts only.
+
+| Hash | Struct | Size | Members (offset) |
+|---|---|---:|---|
+| `0xBA049770` | `rage__fwPropInstanceListDef` | 0x170 | `CEntityDef` members, `InstanceList` 0x90, `BatchAABB` 0xA0, `ScaleRange` 0x160, `InstanceLodDist` 0x168 |
+| `0xEA6B3A96` | `rage__fwPropInstanceListDef__InstanceData` | 0x40 | `InstMat` 0x0 (3x4 floats, translation in the last column), `Tint` 0x34 |
+| `0x7C475B5D` | `rage__fwGrassInstanceListDef` | 0x1A0 | `CEntityDef` members, `BatchAABB` 0x80, `ScaleRange` 0xA0, `LodFadeStartDist` 0xB8, `InstanceLodDist` 0xBC, `OrientToTerrain` 0xC0, `slodID` 0xB0, `IsSLODList` 0x150, `SLODArchetypeList` 0x158 (array), `InstanceList` 0x178 |
+| `0xED86F522` | `rage__fwGrassInstanceListDef__InstanceData` | 0x10 | `Position` 0x0 (3 x u16 in `BatchAABB`), `NormalX` 0x6, `NormalY` 0x7, `Color` 0x8 (3 bytes), `Scale` 0xB, `ScaleZ` 0xC, `RotationIdx` 0xD |
+
+Two more grass-list members are named by joaat from a brute force over common engine words: `slodID` (0xB0, member hash `9fe78fd1`) and `SLODArchetypeList` (0x158, `b451fc98`), so grass lists carry their own link to an SLOD archetype set next to `IsSLODList`. The other unnamed members stay as hashes in the schema.
+
+An `InstanceList` is a u64 (low 12 bits: 1-based block index; bits 20+: offset in that block) and a u16 count.
+Instance blocks are usually in the physical buffer, so the tool joins each resource's virtual and physical
+streams from its block map (+0x08 -> +8 virtual count, +9 physical count).
+
+Full run over `levels.rpf`, `story000.rpf` and `shared_minigame000.rpf` (stream occurrences, duplicates
+included):
+
+| Archive | Map resources | With lists | Prop lists | Prop instances | Grass lists | Grass instances |
+|---|---:|---:|---:|---:|---:|---:|
+| `levels.rpf` | 188,447 | 135,560 | 690,779 | 24,778,818 | 202,143 | 219,453,097 |
+| `story000.rpf` | 48,084 | 2,683 | 4,833 | 1,652,980 | 5,504 | 5,641,657 |
+| `shared_minigame000.rpf` | 787 | 472 | 3,317 | 51,795 | 592 | 437,849 |
+| total | 237,318 | 138,715 | 698,929 | 26,483,593 | 208,239 | 225,532,603 |
+
+Struct sizes and every member offset in the table match the schema in all 98,722 resources with prop lists
+and all 57,650 with grass lists. 29,482 prop lists and 8,015 grass lists point to a block outside the
+streams the tool joined; their instances are not counted.
+
+Props (26,483,593 instances): every matrix is right-handed; 26,046,778 have orthonormal axes (within 0.01),
+25,936,781 are uniformly scaled and 4,692,108 have unit scale; the translation is inside the list's
+`BatchAABB` for 26,386,624. List `lodLevel`: LOD 424,012, HD 116,660, ORPHAN_HD 93,958, SLOD1 64,299. Every
+list has an ordered `ScaleRange` and `0 < InstanceLodDist <= lodDist`.
+
+Grass (225,532,603 instances): 225,379,032 `NormalX`/`NormalY` pairs (byte / 127.5 - 1) are inside the unit
+disc; `RotationIdx` is 0 to 72; `ScaleZ` equals `Scale` in 52,021,564 and `Scale` is 0 in 47,679,734, so
+`ScaleZ` is its own value, not ambient occlusion. `OrientToTerrain` is 1.0 in all 208,239 lists, `IsSLODList`
+is set in 5,802, and `lodLevel` is ORPHAN_HD in 205,181 and SLOD1 in 3,058.
 
 ## No-sharing rule
 

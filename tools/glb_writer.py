@@ -7,6 +7,7 @@ Reads a Wavefront OBJ file (positions, UVs, normals, faces, groups, objects, mat
 converts coordinates from RAGE Z-up to glTF Y-up (or keeps Y-up), computes smooth
 area-weighted vertex normals when explicit normals are absent, and serializes a strict
 glTF 2.0 binary (.glb) container with optional deduplicated embedded PNG textures.
+Simple planar polygon faces may be convex or concave.
 """
 from __future__ import annotations
 
@@ -44,6 +45,8 @@ DEFAULT_CLAY_COLOR = [0.75, 0.75, 0.75, 1.0]
 DEFAULT_TEXTURED_COLOR = [1.0, 1.0, 1.0, 1.0]
 DEFAULT_METALLIC = 0.0
 DEFAULT_ROUGHNESS = 0.85
+
+ALPHA_MODES = ("OPAQUE", "MASK", "BLEND")
 
 DEFAULT_SAMPLER = {
     "magFilter": 9729,  # LINEAR
@@ -136,6 +139,57 @@ def _resolve_obj_index(token: str, count: int) -> int | None:
     if 0 <= resolved < count:
         return resolved
     return None
+
+
+def _concave_triangles(points: list[tuple[float, float, float]]) -> list[tuple[int, int, int]] | None:
+    """Return corner triples for a simple planar face whose first-corner fan folds over.
+
+    None keeps the original fan for convex faces, already valid fans, or
+    degenerate input for which we cannot find a triangulation.
+    """
+    # Project onto the plane with the largest signed area. Work relative to one
+    # corner so translating the mesh far from the origin does not affect the sum.
+    origin = points[0]
+    rel = [(x - origin[0], y - origin[1], z - origin[2]) for x, y, z in points]
+    edges = list(zip(rel, rel[1:] + rel[:1]))
+    planes = ((1, 2), (2, 0), (0, 1))
+    areas = [sum(a[u] * b[v] - a[v] * b[u] for a, b in edges) for u, v in planes]
+    axis = max(range(3), key=lambda i: abs(areas[i]))
+    area = areas[axis]
+    if not area or not math.isfinite(area):
+        return None
+    u, v = planes[axis]
+    winding = 1 if area > 0 else -1
+    xy = [(p[u], p[v]) for p in rel]
+
+    def turn(a, b, c):
+        ax, ay = xy[a]
+        bx, by = xy[b]
+        cx, cy = xy[c]
+        return winding * ((bx - ax) * (cy - ay) - (by - ay) * (cx - ax))
+
+    if all(turn(0, i, i + 1) >= 0 for i in range(1, len(points) - 1)):
+        return None
+
+    # Clip ears in boundary order. A point on the ear's edge blocks it too:
+    # that corner may carry its own UV or normal and still needs a triangle.
+    ring = list(range(len(points)))
+    triangles = []
+    while len(ring) > 3:
+        for i, b in enumerate(ring):
+            a, c = ring[i - 1], ring[(i + 1) % len(ring)]
+            if turn(a, b, c) <= 0:
+                continue
+            if any(turn(a, b, p) >= 0 and turn(b, c, p) >= 0 and turn(c, a, p) >= 0
+                   for p in ring if p not in (a, b, c)):
+                continue
+            triangles.append((a, b, c))
+            del ring[i]
+            break
+        else:
+            return None
+    triangles.append(tuple(ring))
+    return triangles
 
 
 def parse_obj(
@@ -321,15 +375,16 @@ def parse_obj(
             if not valid_face or len(corners) < 3:
                 continue
 
-            # Fan-triangulate polygon (c0, c_i, c_{i+1}), skipping degenerate triangles
-            # that repeat the same vertex position index.
-            c0 = corners[0]
-            tris: list[tuple[tuple[int, int | None, int | None],
-                             tuple[int, int | None, int | None],
-                             tuple[int, int | None, int | None]]] = []
-            for i in range(1, len(corners) - 1):
-                c1 = corners[i]
-                c2 = corners[i + 1]
+            indices = ((0, 1, 2),)
+            if len(corners) > 3:
+                indices = None
+                if len({c[0] for c in corners}) == len(corners):
+                    indices = _concave_triangles([raw_v[c[0]] for c in corners])
+                if indices is None:
+                    indices = ((0, i, i + 1) for i in range(1, len(corners) - 1))
+            tris = []
+            for a, b, c in indices:
+                c0, c1, c2 = corners[a], corners[b], corners[c]
                 if c0[0] == c1[0] or c1[0] == c2[0] or c0[0] == c2[0]:
                     continue
                 tris.append((c0, c2, c1) if mirrored else (c0, c1, c2))
@@ -564,6 +619,24 @@ def _parse_base_color_factor(value: object, default: list[float]) -> list[float]
     return [_clean_zero(c) for c in out]
 
 
+def _parse_alpha_mode(mode: object, cutoff: object, factor_alpha: float) -> dict:
+    """glTF alphaMode/alphaCutoff fields for a material spec; OPAQUE is the glTF default and is omitted."""
+    if mode is None:
+        mode = "BLEND" if factor_alpha < 1.0 else "OPAQUE"
+    if not isinstance(mode, str) or mode not in ALPHA_MODES:
+        raise GlbError("alpha_mode must be one of 'OPAQUE', 'MASK', 'BLEND'")
+    if cutoff is not None and mode != "MASK":
+        raise GlbError("alpha_cutoff is only valid with alpha_mode 'MASK'")
+    if mode == "OPAQUE":
+        return {}
+    out: dict = {"alphaMode": mode}
+    if cutoff is not None:
+        if isinstance(cutoff, bool) or not isinstance(cutoff, (int, float)) or not math.isfinite(cutoff) or cutoff < 0.0:
+            raise GlbError("alpha_cutoff must be a finite number >= 0.0")
+        out["alphaCutoff"] = _clean_zero(float(cutoff))
+    return out
+
+
 def _build_glb_with_stats(
     primitives: list[dict],
     materials: dict[str, dict] | None = None,
@@ -642,6 +715,7 @@ def _build_glb_with_stats(
                 return existing
             default_color = DEFAULT_TEXTURED_COLOR if has_png else DEFAULT_CLAY_COLOR
             base_color = _parse_base_color_factor(spec.get("base_color_factor"), default_color)
+            alpha_fields = _parse_alpha_mode(spec.get("alpha_mode"), spec.get("alpha_cutoff"), base_color[3])
 
             pbr: dict = {
                 "baseColorFactor": base_color,
@@ -660,6 +734,7 @@ def _build_glb_with_stats(
                 mat_obj["name"] = mat_name
             if spec.get("double_sided"):
                 mat_obj["doubleSided"] = True
+            mat_obj.update(alpha_fields)
 
             mat_idx = len(gltf_materials)
             gltf_materials.append(mat_obj)
@@ -842,7 +917,24 @@ def build_glb(
     *,
     generator: str = "Leonida glb_writer",
 ) -> bytes:
-    """Serialize glTF-ready primitives and optional PNG materials into binary .glb bytes."""
+    """Serialize glTF-ready primitives and optional PNG materials into binary .glb bytes.
+
+    ``materials`` maps a primitive's ``material`` name (or ``material_index``) to a
+    spec dict. Each spec becomes one glTF material shared by every primitive that
+    resolves to it; primitives without a matching spec share an opaque
+    ``default_clay`` material. Recognised spec keys:
+
+    - ``name``: material name (defaults to the string key).
+    - ``png_bytes``: PNG embedded as ``baseColorTexture`` for primitives with UVs.
+    - ``base_color_factor``: 3 or 4 finite floats in [0, 1]; alpha defaults to 1.
+    - ``double_sided``: emit ``doubleSided: true`` when truthy.
+    - ``alpha_mode``: ``"OPAQUE"``, ``"MASK"`` or ``"BLEND"``. When omitted, a
+      ``base_color_factor`` alpha below 1 gives ``BLEND``; otherwise no ``alphaMode``
+      is written (glTF default ``OPAQUE``). Texture alpha is never inspected.
+    - ``alpha_cutoff``: finite number >= 0, only with ``MASK`` (glTF default 0.5).
+
+    Invalid specs raise GlbError.
+    """
     glb_bytes, _ = _build_glb_with_stats(primitives, materials, generator=generator)
     return glb_bytes
 
@@ -876,6 +968,7 @@ def write_glb(
     existing sibling files are never used as staging files. On Windows a replace
     that hits a sharing violation is retried briefly (see ``_replace``); one held
     longer than that still raises PermissionError and leaves the old file in place.
+    ``materials`` takes the spec keys documented on ``build_glb``.
     """
     glb_bytes, stats = _build_glb_with_stats(primitives, materials)
     out_path = os.fspath(path)
@@ -967,10 +1060,14 @@ def read_glb_summary(data: bytes) -> dict:
     buffers = gltf.get("buffers")
     if isinstance(buffers, list) and buffers:
         buf0 = buffers[0]
-        if isinstance(buf0, dict) and "uri" not in buf0:
-            declared = buf0.get("byteLength", 0)
-            if isinstance(declared, bool) or not isinstance(declared, int) or declared < 0 or declared > bin_bytes:
+        if isinstance(buf0, dict):
+            embedded = "uri" not in buf0
+            declared = buf0.get("byteLength", 0 if embedded else None)
+            invalid_length = isinstance(declared, bool) or not isinstance(declared, int) or declared < 0
+            if embedded and (invalid_length or declared > bin_bytes):
                 raise GlbError(f"buffers[0].byteLength ({declared}) exceeds BIN chunk ({bin_bytes})")
+            if invalid_length:
+                raise GlbError("invalid buffers[0].byteLength")
             buf0_limit = declared
 
     buffer_views = gltf.get("bufferViews")

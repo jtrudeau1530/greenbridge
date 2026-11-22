@@ -80,15 +80,29 @@ default.
 | Q / E | left / right shoulder |
 | Esc | `Menu` |
 | Tab | `View` |
+| W / A / S / D | left stick up / left / down / right |
+| mouse movement | right stick |
+| right mouse button | left trigger (aim) |
+| left mouse button | right trigger (fire) |
 
-This is enough to drive menus and press prompts. The sticks and triggers stay at rest: moving with WASD and aiming
-with the mouse are for a later change. Letters are Windows virtual-key codes, so `Y` is the key labelled Y on the
-active layout (it sits where Z does on a QWERTY keyboard with a German layout).
+Letters are Windows virtual-key codes, so `Y` is the key labelled Y on the active layout (it sits where Z does on a
+QWERTY keyboard with a German layout). Mouse buttons are the physical ones: `GetAsyncKeyState` ignores the
+swapped-buttons setting.
+
+WASD pushes the left stick to full deflection. Opposite keys cancel (W+S is centered on Y), and a diagonal sits on
+the round gate as a real stick reports it: about 0.707 on each axis, not 1.
+
+The right stick follows the cursor's movement (`GetCursorPos`), not its position. Each poll (2 ms with the
+background thread) the stick keeps 7/8 of its value and adds 1024 axis units (of 32767) per pixel the cursor moved
+since the last poll, clamped to full. Steady movement of 4 pixels a poll (2000 pixels a second) is full deflection;
+when the mouse stops, the stick falls back from full to exactly 0 in 67 polls (134 ms). Moving the mouse down pushes
+the stick down. The cursor is not captured, so movement stops counting when it reaches the edge of the screen.
 
 Keys are read with `GetAsyncKeyState`, which needs no window or message loop (SDL's keyboard is part of its video
 subsystem, which this build leaves out) and works under Wine. With `LEONIDA_KEYBOARD_PAD=1` keys count only while a
-window of this process is in the foreground, so typing in another application presses nothing, and every button is
-released when focus moves away. `LEONIDA_KEYBOARD_PAD=always` reads them whatever has focus; a console tool such as
+window of this process is in the foreground, so typing in another application presses nothing, and every button,
+stick and trigger is released when focus moves away (the cursor is read afresh when focus returns, so the right
+stick does not jump). `LEONIDA_KEYBOARD_PAD=always` reads them whatever has focus; a console tool such as
 `gameinput_probe` needs it, because its console window belongs to the terminal, not to the tool.
 
 To try it by hand: `set LEONIDA_KEYBOARD_PAD=always`, then `gameinput_probe --seconds 20` and press keys.
@@ -185,6 +199,22 @@ After a pad is plugged back in, its last reading before the unplug leads to the 
 `REFERENCE_READING_TOO_OLD`, and sequence numbers carry on. Timestamps are poll times, so a change shorter than one poll
 (2 ms with the thread) is not seen.
 
+### Device identity
+
+`AppLocalDeviceId` is the SDL GUID in bytes 0-15 and an FNV-1a hash of the serial or path in bytes 16-31. Pads that
+SDL cannot tell apart, such as two of the same model with no serial and no path, would share that id, and
+`FindDeviceFromId` would return the first for both. They are twins: the first keeps the id, so a single pad's id is
+unchanged, and each further one gets an id hashed from its twin number (`t:<n>:` before the serial or path). A new id
+is checked against every device seen in the process and moved to the next number if taken, so no two devices share
+one. A pad that comes back takes the lowest-numbered disconnected twin's object and id; a connected device is never
+reused.
+
+That is assignment by order, not identification. With one twin unplugged, the right object comes back if the same pad
+returns, but another identical pad plugged in instead gets it too. With two or more unplugged, nothing tells them
+apart: if they return in a different order, the objects and ids are swapped between the physical pads, and the shim
+cannot detect it. The same sequence of plugs gives the same ids in every run, since the ids depend only on the GUID,
+the serial or path and the order; for pads already connected at start, that order is SDL's (see [VERIFY](#verify)).
+
 ## ABI
 
 `runtime/shims/gameinput_abi.h` declares the v0 GameInput API as Leonida's own code: the interfaces in vtable order,
@@ -203,9 +233,13 @@ shim fills (`GameInputDeviceInfo` 320 bytes with `deviceFamily` at 96 and the in
   the fact, both directions, two pads interleaved and filtered by device, ageing out, held readings, unplug and
   replug), the guide button, motor and trigger
   rumble as SDL receives them, the DualSense effect bytes in each `LEONIDA_DS_TRIGGERS` mode, the lightbar, a
-  dispatcher, async and blocking enumeration, unregistering, and unplugging and replugging. The keyboard pad is
-  driven through `rt::gameinput::set_keyboard_source` with fake keys and focus: every binding, two keys at once, no
-  input out of focus, release on focus loss, the `always` mode, and turning it off and on again.
+  dispatcher, async and blocking enumeration, unregistering, unplugging and replugging, and three identical pads
+  (an id each, `FindDeviceFromId` and device-filtered readings per pad, replugging one, two and all three, and the
+  first twin's id equal to the single-pad id). The keyboard pad is
+  driven through `rt::gameinput::set_keyboard_source` and `set_cursor_source` with fake keys, focus and cursor: every
+  binding, two keys at once, each WASD direction, opposite keys cancelling, diagonals, the mouse moving the right
+  stick, clamping and decaying to 0, the mouse-button triggers, no input out of focus, release of buttons, sticks and
+  triggers on focus loss, the `always` mode, and turning it off and on again.
 - `gameinput_probe [--seconds N] [--rumble]` (by hand, with a pad connected): lists the pads, plays each motor and
   trigger for a second with `--rumble`, then prints the live reading.
 
@@ -226,8 +260,14 @@ These need the game executable or a test on hardware:
 - **`UnregisterCallback` timeout** is not honoured; it waits for a callback that is running.
 - **Device family**: every pad is reported as `GameInputFamilyXboxOne`; a title that filters on family sees only
   that.
+- **Identical pads at start**: twins are numbered in the order the shim opens them. For pads already connected when
+  it starts, that is SDL's enumeration order, not measured on Windows for identical pads; if it varies between runs,
+  so does which pad gets which id.
 - **Keyboard pad as a second pad**: it is one more connected gamepad, so with a controller plugged in the title sees
   two. A title that follows only the first pad it saw, or asks the player to press a button to pick the active pad,
   may ignore one of them; whether the game does either is unknown.
+- **Mouse on the right stick**: the scale (1024 units per pixel per poll) and decay (7/8 per poll) are a starting
+  point, not tuned in game. The title adds its own stick acceleration and deadzone on top, so aiming may feel slow
+  near center or jumpy.
 - **DualSense effect parameters**: the `06` (vibration) and `01` (resistance) byte meanings follow SDL's
   `testcontroller.c`; how strong 255 feels and what frequency suits the Xbox signal needs a session on a real pad.

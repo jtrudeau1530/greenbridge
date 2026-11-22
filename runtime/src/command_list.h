@@ -330,10 +330,18 @@ struct CopyResource {
     ResourceId src;
 };
 
+// D3D12_RESOLVE_MODE values a region resolve replays.
+namespace d3d12_resolve_mode {
+inline constexpr std::uint32_t minimum = 1;
+inline constexpr std::uint32_t maximum = 2;
+inline constexpr std::uint32_t average = 3;
+}
+
 struct ResolveRegion {
     std::uint32_t dst_x;
     std::uint32_t dst_y;
     std::optional<Rect> src_rect;
+    std::uint32_t mode = d3d12_resolve_mode::average;  // colour: average only; stencil: minimum or maximum
 };
 
 // Without a region, both subresources have the same extent. A region with no source rectangle takes the
@@ -485,11 +493,54 @@ struct DebugMarker {
     std::string label;
 };
 
+// ExecuteIndirect argument kind (from ID3D12CommandSignature).
+enum class IndirectKind : std::uint8_t {
+    draw = 0,
+    draw_indexed = 1,
+    dispatch = 2,
+};
+
+struct ExecuteIndirect {
+    IndirectKind kind = IndirectKind::draw;
+    std::uint32_t stride = 0;
+    std::uint32_t max_count = 0;
+    ResourceId argument_buffer = 0;
+    std::uint64_t argument_offset = 0;
+    ResourceId count_buffer = 0;  // 0: fixed max_count; non-zero: vkCmdDraw*IndirectCount
+    std::uint64_t count_offset = 0;
+};
+
+// Triangle geometry descriptor for a BLAS build (ID3D12GraphicsCommandList4::BuildRaytracingAccelerationStructure).
+struct RtTriangleGeometry {
+    std::uint64_t vertex_va = 0;
+    std::uint32_t vertex_count = 0;
+    std::uint32_t vertex_stride = 0;
+    std::uint32_t vertex_format = 0;  // VkFormat (e.g. VK_FORMAT_R32G32B32_SFLOAT)
+    std::uint64_t index_va = 0;
+    std::uint32_t index_count = 0;
+    std::uint32_t index_type = 0;     // 0=NONE, 1=UINT16, 2=UINT32
+    std::uint64_t transform_va = 0;
+    bool opaque = true;
+};
+
+// BLAS or TLAS build command (VK_KHR_acceleration_structure).
+struct BuildAccelerationStructure {
+    bool is_tlas = false;
+    bool update = false;
+    std::uint32_t build_flags = 0;
+    std::uint64_t dst_va = 0;
+    std::uint64_t src_va = 0;
+    std::uint64_t scratch_va = 0;
+    std::uint64_t instances_va = 0;
+    std::uint32_t instance_count = 0;
+    std::vector<RtTriangleGeometry> triangles;
+};
+
 using Command = std::variant<TransitionBarrier, UavBarrier, AliasingBarrier, GlobalBarrier, BufferBarrier,
                              TextureBarrier, ClearRenderTarget, ClearDepthStencil, CopyBuffer, CopyTexture,
                              CopyResource, ResolveSubresource, Predication, ClearUnorderedAccess, DiscardResource,
-                             WriteImmediate, AtomicCopyBuffer, BeginQuery, EndQuery, ResolveQueries,
-                             DebugMarker>;
+                             WriteImmediate, AtomicCopyBuffer, BeginQuery, EndQuery, ResolveQueries, DebugMarker,
+                             ExecuteIndirect, BuildAccelerationStructure>;
 
 class CommandList {
 public:
@@ -556,6 +607,7 @@ public:
         if (!resolve.dst || !resolve.src || resolve.dst == resolve.src) return false;
         if (const auto& region = resolve.region) {
             if (region->dst_x > INT32_MAX || region->dst_y > INT32_MAX) return false;
+            if (region->mode < d3d12_resolve_mode::minimum || region->mode > d3d12_resolve_mode::average) return false;
             if (const auto& r = region->src_rect;
                 r && (r->left < 0 || r->top < 0 || r->right <= r->left || r->bottom <= r->top))
                 return false;
@@ -674,6 +726,15 @@ public:
         return append(DebugMarker{kind, std::move(label)});
     }
 
+    bool execute_indirect(const ExecuteIndirect& indirect) {
+        if (!indirect.argument_buffer || !indirect.stride || !indirect.max_count) return false;
+        return append(indirect);
+    }
+
+    bool build_acceleration_structure(BuildAccelerationStructure build) {
+        if (!build.dst_va || !build.scratch_va) return false;
+        return append(std::move(build));
+    }
     bool close() {
         if (closed_) return false;
         closed_ = true;

@@ -46,6 +46,7 @@ from meshlet_page import PageError, parse_group  # noqa: E402  (same group valid
 MAGIC = 0x4042
 HEADER = 0x80
 SLOTS = 23
+TRI_SAMPLE = 256  # triangles per block for the mapping and face-normal tests
 ZHDR = re.compile(rb"\x78[\x01\x5e\x9c\xda]")
 
 
@@ -104,13 +105,14 @@ def group_edges(data, gat, group):
     ref_at = tri_at + 4 * group["triangles"]
     refs = struct.unpack_from(f"<{group['vertex_refs']}H", data, ref_at)
     tris = []
+    vbase = tbase = 0  # running sums: the record's u16 fields wrap past 65,535 (parse_group checks them mod 2^16)
     for m in range(meshlets):
-        w1 = struct.unpack_from("<I", data, rec_at + 16 * m + 4)[0]
-        vbase, tbase = w1 & 0xFFFF, w1 >> 16
         w0 = struct.unpack_from("<I", data, rec_at + 16 * m)[0]
-        tcount = ((w0 >> 7) & 0x7F) + 1
+        vcount, tcount = (w0 & 0x7F) + 1, ((w0 >> 7) & 0x7F) + 1
         for t in struct.unpack_from(f"<{tcount}I", data, tri_at + 4 * tbase):
             tris.append((refs[vbase + (t & 0x7F)], refs[vbase + ((t >> 7) & 0x7F)], refs[vbase + ((t >> 14) & 0x7F)]))
+        vbase += vcount
+        tbase += tcount
     return tris
 
 
@@ -240,12 +242,15 @@ def measure_block(data, at, T, rng):
     ext = max(max(p[k] for p in pos) - min(p[k] for p in pos) for k in range(3)) if pos else 0
     if ext > 0 and all(math.dist(pos[p], pos[q]) <= ext * 1.0001 for p, q in edges):
         add(T, "pos_edges_within_block")
-    pos_areas = [tri_area(pos[a], pos[b], pos[c]) for a, b, c in tris]
+    # the mapping and face-normal tests run on a fixed sample of triangles per block (seeded rng, so a rerun
+    # gives the same counts); the edge, wrap and per-byte counts above and below stay exhaustive
+    stris = tris if len(tris) <= TRI_SAMPLE else rng.sample(tris, TRI_SAMPLE)
+    pos_areas = [tri_area(pos[a], pos[b], pos[c]) for a, b, c in stris]
     # +0x6C = which model axis the 16-bit slot holds (CodeX GTA6 viewer: k=2 x,y,z; k=1 (y,z,x); k=0 (z,y,x));
     # normals are compared in model space
     k = struct.unpack_from("<I", data, at + 0x6C)[0]
     mpos = [(p[1], p[2], p[0]) if k == 1 else (p[2], p[1], p[0]) if k == 0 else p for p in pos]
-    face_normals = [face_normal(mpos[a], mpos[b], mpos[c]) for a, b, c in tris]
+    face_normals = [face_normal(mpos[a], mpos[b], mpos[c]) for a, b, c in stris]
     if edges:
         e = sum(math.dist(pos[p], pos[q]) for p, q in edges) / len(edges)
         r = sum(math.dist(pos[p], pos[q]) for p, q in pairs) / max(len(pairs), 1)
@@ -289,7 +294,7 @@ def measure_block(data, at, T, rng):
                 if name == "half" and not all(math.isfinite(c) for uv in uvs for c in uv):
                     add(tt, "mapping_half_unusable")
                     continue
-                r = [uv_area(uvs[a], uvs[b], uvs[c]) / pa for (a, b, c), pa in zip(tris, pos_areas) if pa > 1e-9]
+                r = [uv_area(uvs[a], uvs[b], uvs[c]) / pa for (a, b, c), pa in zip(stris, pos_areas) if pa > 1e-9]
                 m = mad_log(r)
                 if m is not None:
                     T.setdefault("mapping_spread", {}).setdefault(name, []).append(m)
@@ -317,7 +322,7 @@ def measure_block(data, at, T, rng):
             add(tt, "unit_snorm10", unit10)
             for name, dec in NORMAL_CANDIDATES.items():
                 good = tot = 0
-                for (a, b, c), fn in zip(tris, face_normals):
+                for (a, b, c), fn in zip(stris, face_normals):
                     if fn is None:
                         continue
                     for v in (a, b, c):
@@ -419,7 +424,8 @@ def main(argv=None):
             print(f"error: {p} does not exist", file=sys.stderr)
             return 2
         if os.path.isdir(p):
-            for root, _, files in os.walk(p):
+            for root, directories, files in os.walk(p):
+                directories.sort()
                 archives += [os.path.join(root, f) for f in sorted(files) if f.lower().endswith(".rpf")]
         else:
             archives.append(p)

@@ -879,6 +879,8 @@ via `bcpack.decode_with_info`).
 
 ## Reproduce
 
+The normal `make_game.py` assets stage now fills missing and partial BCPack DDS entries in the same pool manifests used for model texture lookup. It uses strict decoding by default and discovers an optional local reconstruction profile at `<work>/bcpack-calibration.json`. The single-entry exporter accepts the same profile through `--calibration`. Build instructions, the JSON schema and the game-independent test are in the [calibrated export guide](../tools/bcpack_calibration/README.md).
+
 `tools/ttpf_mips.py` is the read-only measurement and decode tool (with `tools/bcpack.py`
 enabled in strict confirmed-history mode by default):
 

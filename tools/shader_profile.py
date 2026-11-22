@@ -280,7 +280,8 @@ def main():
         print(f"ERROR: the folder for {path} does not exist", file=sys.stderr)
         return 2
     try:
-        names = os.listdir(a.src)
+        with os.scandir(a.src) as entries:
+            shader_files = [entry for entry in entries if entry.name.endswith(".s") and entry.is_file()]
     except OSError as e:
         print(f"ERROR: cannot list {a.src}: {e.strerror or e}", file=sys.stderr)
         return 2
@@ -291,12 +292,11 @@ def main():
     reg_stage = defaultdict(list)    # stage -> [(vgpr_count, sgpr_count)]
     shaders = []
     n = 0
-    for name in names:
-        if not name.endswith(".s"):
-            continue
+    for entry in shader_files:
+        name = entry.name
         n += 1
         stage = name[:2].lower() if name[2:3] == "_" else "?"
-        with open(os.path.join(a.src, name), encoding="utf-8", errors="replace") as f:
+        with open(entry.path, encoding="utf-8", errors="replace") as f:
             text = f.read()
         prof = profile_shader(text)
         regs = prof["registers"]

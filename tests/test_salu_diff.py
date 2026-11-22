@@ -46,6 +46,9 @@ class Reference(unittest.TestCase):
         self.assertEqual(run("s_bfe_u32 s4, 0xf0, 0x40004")[0], 0xF)
         self.assertEqual(run("s_bfe_i32 s4, 0xf0, 0x40004")[0], 0xFFFFFFFF)
         self.assertEqual(run("s_bfm_b32 s4, 4, 8")[0], 0xF00)
+        # a field past bit 31 stops there (gfx1150 hardware, LLVM constantFoldBFE): width 127 at offset 28 is 4 bits
+        self.assertEqual(run("s_bfe_i32 s4, 0xd2f90159, 0x7f001c")[0], 0xFFFFFFFD)
+        self.assertEqual(run("s_bfe_u32 s4, 0xd2f90159, 0x7f001c")[0], 0xD)
         self.assertEqual(run("s_bitset1_b32 s4, 3", seeds={4: 0x10})[0], 0x18)
 
     def test_sopk_extends_its_immediate(self):

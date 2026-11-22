@@ -47,7 +47,7 @@ WARMUP = 8 << 20
 JOIN_MAX = 64
 BAND_GAP = 64 << 20
 GAP_CHUNK = 4 << 20
-FORMAT = 4
+FORMAT = 5  # Format 4 shards may count warm-up streams again.
 SOURCE_SAMPLE = 4096
 
 

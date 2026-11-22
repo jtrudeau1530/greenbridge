@@ -89,6 +89,8 @@ bool parse_spec(const char* path, Spec& s, std::string& error) {
             else if (value == "R16G16B16A16_SFLOAT") s.format = VK_FORMAT_R16G16B16A16_SFLOAT, s.bytes_per_texel = 8;
             else if (value == "R32G32B32A32_SFLOAT") s.format = VK_FORMAT_R32G32B32A32_SFLOAT, s.bytes_per_texel = 16;
             else if (value == "R32_SFLOAT") s.format = VK_FORMAT_R32_SFLOAT, s.bytes_per_texel = 4;
+            else if (value == "R8G8B8A8_UINT") s.format = VK_FORMAT_R8G8B8A8_UINT, s.bytes_per_texel = 4;
+            else if (value == "R8G8B8A8_SINT") s.format = VK_FORMAT_R8G8B8A8_SINT, s.bytes_per_texel = 4;
             else return error = where + "unknown format '" + value + "'", false;
             s.has_format = true;
         } else if (key == "texels") {
@@ -181,7 +183,7 @@ int main(int argc, char** argv) {
     }
     LI(vkEnumeratePhysicalDevices); LI(vkGetPhysicalDeviceProperties); LI(vkGetPhysicalDeviceQueueFamilyProperties);
     LI(vkGetPhysicalDeviceMemoryProperties); LI(vkGetPhysicalDeviceFeatures2); LI(vkGetPhysicalDeviceProperties2);
-    LI(vkCreateDevice); LI(vkGetDeviceProcAddr);
+    LI(vkCreateDevice); LI(vkGetDeviceProcAddr); LI(vkGetPhysicalDeviceFormatProperties);
     std::uint32_t n = 0;
     vkEnumeratePhysicalDevices(inst, &n, nullptr);
     std::vector<VkPhysicalDevice> pds(n);
@@ -201,6 +203,22 @@ int main(int argc, char** argv) {
     VkPhysicalDeviceProperties2 props{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &props12};
     vkGetPhysicalDeviceProperties2(pd, &props);
     std::printf("device: %s%s\n", props.properties.deviceName, validation ? " (validation on)" : "");
+    const bool integer = spec.format == VK_FORMAT_R8G8B8A8_UINT || spec.format == VK_FORMAT_R8G8B8A8_SINT;
+    VkFormatProperties format_props{};
+    vkGetPhysicalDeviceFormatProperties(pd, spec.format, &format_props);
+    const VkFormatFeatureFlags required = integer ? VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT : VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT;
+    if (!(format_props.optimalTilingFeatures & required)) {
+        std::printf("unsupported: %s lacks the required image feature\n", spec.format_name.c_str());
+        return unsupported;
+    }
+    // The pipeline layout pushes the 144-byte translated user-data block. A device with fewer push constant bytes
+    // (128 on Intel Arc and some AMD drivers) can't create it: a device limit, not a wrong result (TEST-149).
+    constexpr std::uint32_t push_bytes = 144;
+    if (props.properties.limits.maxPushConstantsSize < push_bytes) {
+        std::printf("unsupported: need %u push constant bytes, device has %u\n", push_bytes,
+                    props.properties.limits.maxPushConstantsSize);
+        return unsupported;
+    }
     VkPhysicalDeviceVulkan12Features have12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
     VkPhysicalDeviceFeatures2 have{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &have12};
     vkGetPhysicalDeviceFeatures2(pd, &have);
@@ -332,7 +350,9 @@ int main(int argc, char** argv) {
     std::memcpy(staging_map, texels.data(), texels.size());
     VkImage image = VK_NULL_HANDLE;
     VkImageView view = VK_NULL_HANDLE;
-    CHECK(make_image(spec.format, spec.width, spec.height, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+    const VkImageLayout image_layout = integer ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    CHECK(make_image(spec.format, spec.width, spec.height,
+                     (integer ? VK_IMAGE_USAGE_STORAGE_BIT : VK_IMAGE_USAGE_SAMPLED_BIT) | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
                      &image, &view));
     // Render target, pass and framebuffer.
     constexpr VkFormat target_format = VK_FORMAT_R32G32B32A32_SFLOAT;
@@ -404,7 +424,7 @@ int main(int argc, char** argv) {
         if (VkResult r = vkQueueSubmit(queue, 1, &si, VK_NULL_HANDLE)) return r;
         return vkQueueWaitIdle(queue);
     };
-    // Upload the texels in one command buffer: UNDEFINED -> TRANSFER_DST_OPTIMAL, copy, -> SHADER_READ_ONLY_OPTIMAL.
+    // Upload the texels, then transition to the layout used by the shader's descriptor.
     CHECK(vkBeginCommandBuffer(cmd, &begin));
     {
         VkImageMemoryBarrier ib{.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
@@ -419,7 +439,7 @@ int main(int argc, char** argv) {
                              nullptr, 1, &ib);
         VkBufferImageCopy c{.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .imageExtent = {spec.width, spec.height, 1}};
         vkCmdCopyBufferToImage(cmd, staging, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c);
-        ib.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, ib.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        ib.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, ib.newLayout = image_layout;
         ib.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT, ib.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
         vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr,
                              0, nullptr, 1, &ib);
@@ -455,13 +475,16 @@ int main(int argc, char** argv) {
         std::printf("unsupported: cannot create the bindless set\n");
         return unsupported;
     }
-    const std::uint32_t index = set->add_image(ImageDimension::dim_2d, view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    StorageViews storage{};
+    if (spec.format == VK_FORMAT_R8G8B8A8_UINT) storage.as_uint = view;
+    if (spec.format == VK_FORMAT_R8G8B8A8_SINT) storage.as_sint = view;
+    const std::uint32_t index = set->add_image(ImageDimension::dim_2d, integer ? VK_NULL_HANDLE : view, image_layout, storage);
     if (index < 1) {
         std::fprintf(stderr, "FAILED add_image -> 0 (line %d)\n", __LINE__);
         return 1;
     }
     set->insert_key(make_tsharp_key(spec.tsharp), index);
-    const VkPushConstantRange push{.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, .size = 144};
+    const VkPushConstantRange push{.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, .size = push_bytes};
     const VkDescriptorSetLayout set_layout = set->layout();
     VkPipelineLayoutCreateInfo pli{.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
                                    .setLayoutCount = 1,

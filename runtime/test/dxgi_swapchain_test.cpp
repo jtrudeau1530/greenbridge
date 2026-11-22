@@ -83,7 +83,7 @@ int main() {
     const PFN_vkGetInstanceProcAddr gipa = load_vulkan();
     if (!gipa) {
         std::printf("SKIP: vulkan-1.dll not available\n");
-        return 0;
+        return 77;  // ctest skips
     }
     const auto create_inst = reinterpret_cast<PFN_vkCreateInstance>(gipa(nullptr, "vkCreateInstance"));
     const auto enum_layers =
@@ -138,7 +138,12 @@ int main() {
     }
 
     VkInstance instance = VK_NULL_HANDLE;
-    if (create_inst(&ici, nullptr, &instance) != VK_SUCCESS) return fail("vkCreateInstance");
+    const VkResult created = create_inst(&ici, nullptr, &instance);
+    if (created == VK_ERROR_INCOMPATIBLE_DRIVER) {  // no Vulkan driver at all, as on a GPU-less runner
+        std::printf("SKIP: no Vulkan driver\n");
+        return 77;
+    }
+    if (created != VK_SUCCESS) return fail("vkCreateInstance");
 
     const auto destroy_inst = reinterpret_cast<PFN_vkDestroyInstance>(gipa(instance, "vkDestroyInstance"));
     const auto gdpa = reinterpret_cast<PFN_vkGetDeviceProcAddr>(gipa(instance, "vkGetDeviceProcAddr"));
@@ -188,7 +193,7 @@ int main() {
         std::printf("SKIP: no Vulkan 1.3 GPU found\n");
         if (messenger && destroy_dbg) destroy_dbg(instance, messenger, nullptr);
         destroy_inst(instance, nullptr);
-        return 0;
+        return 77;  // ctest skips
     }
 
     VkPhysicalDeviceVulkan13Features f13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
@@ -397,6 +402,188 @@ int main() {
     if (FAILED(sc->ResizeBuffers(2, 37, 19, DXGI_FORMAT_UNKNOWN, 0))) return fail("ResizeBuffers");
     const float green[4] = {0.0f, 1.0f, 0.0f, 1.0f};
     if (run_clear_readback_present(37, 19, green, 0, 255, 0) != 0) return 1;
+
+    // Frame 3: ResizeBuffers to 37x19 DXGI_FORMAT_R10G10B10A2_UNORM on the unchanged 128x128 HWND.
+    // Preserves 10-bit format in GetDesc1, GetBuffer()->GetDesc(), and GPU readback before blitting on Present.
+    if (FAILED(sc->ResizeBuffers(2, 37, 19, DXGI_FORMAT_R10G10B10A2_UNORM, 0)))
+        return fail("ResizeBuffers R10G10B10A2_UNORM");
+    {
+        DXGI_SWAP_CHAIN_DESC1 d10{};
+        if (FAILED(sc->GetDesc1(&d10))) return fail("GetDesc1 (10-bit)");
+        if (d10.Width != 37 || d10.Height != 19 || d10.Format != DXGI_FORMAT_R10G10B10A2_UNORM)
+            return fail("GetDesc1 did not preserve 37x19 R10G10B10A2_UNORM");
+
+        const UINT idx = sc->GetCurrentBackBufferIndex();
+        ID3D12Resource* bb = nullptr;
+        if (FAILED(sc->GetBuffer(idx, IID_PPV_ARGS(&bb))) || !bb) return fail("GetBuffer (10-bit)");
+        const D3D12_RESOURCE_DESC bb_desc = bb->GetDesc();
+        if (bb_desc.Width != 37 || bb_desc.Height != 19 || bb_desc.Format != DXGI_FORMAT_R10G10B10A2_UNORM) {
+            bb->Release();
+            return fail("backbuffer GetDesc did not preserve 37x19 R10G10B10A2_UNORM");
+        }
+
+        const D3D12_CPU_DESCRIPTOR_HANDLE rtv = rtv_heap->GetCPUDescriptorHandleForHeapStart();
+        dev->CreateRenderTargetView(bb, nullptr, rtv);
+
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp{};
+        UINT64 total_bytes = 0;
+        dev->GetCopyableFootprints(&bb_desc, 0, 1, 0, &fp, nullptr, nullptr, &total_bytes);
+
+        D3D12_HEAP_PROPERTIES rb_hp{D3D12_HEAP_TYPE_READBACK};
+        D3D12_RESOURCE_DESC rb_desc{};
+        rb_desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        rb_desc.Width = total_bytes;
+        rb_desc.Height = 1;
+        rb_desc.DepthOrArraySize = 1;
+        rb_desc.MipLevels = 1;
+        rb_desc.SampleDesc.Count = 1;
+        rb_desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        ID3D12Resource* rb = nullptr;
+        if (FAILED(dev->CreateCommittedResource(&rb_hp, D3D12_HEAP_FLAG_NONE, &rb_desc,
+                                                D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&rb))) ||
+            !rb) {
+            bb->Release();
+            return fail("CreateCommittedResource readback (10-bit)");
+        }
+
+        alloc->Reset();
+        cl->Reset(alloc, nullptr);
+        D3D12_RESOURCE_BARRIER b0{};
+        b0.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        b0.Transition = {bb, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_PRESENT,
+                         D3D12_RESOURCE_STATE_RENDER_TARGET};
+        cl->ResourceBarrier(1, &b0);
+
+        const float band0[4] = {0.0f, 0.75f, 0.25f, 1.0f};
+        const float band1[4] = {1.0f / 1024.0f, 0.75f, 0.25f, 1.0f};
+        const float band2[4] = {1.0f / 128.0f, 0.75f, 0.25f, 1.0f};
+        const D3D12_RECT r0{0, 0, 12, 19};
+        const D3D12_RECT r1{12, 0, 24, 19};
+        const D3D12_RECT r2{24, 0, 37, 19};
+        cl->ClearRenderTargetView(rtv, band0, 1, &r0);
+        cl->ClearRenderTargetView(rtv, band1, 1, &r1);
+        cl->ClearRenderTargetView(rtv, band2, 1, &r2);
+
+        D3D12_RESOURCE_BARRIER b1{};
+        b1.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        b1.Transition = {bb, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_RENDER_TARGET,
+                         D3D12_RESOURCE_STATE_COPY_SOURCE};
+        cl->ResourceBarrier(1, &b1);
+
+        D3D12_TEXTURE_COPY_LOCATION src_loc{bb, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {0}};
+        D3D12_TEXTURE_COPY_LOCATION dst_loc{rb, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, {}};
+        dst_loc.PlacedFootprint = fp;
+        cl->CopyTextureRegion(&dst_loc, 0, 0, 0, &src_loc, nullptr);
+
+        D3D12_RESOURCE_BARRIER b2{};
+        b2.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        b2.Transition = {bb, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_COPY_SOURCE,
+                         D3D12_RESOURCE_STATE_PRESENT};
+        cl->ResourceBarrier(1, &b2);
+        cl->Close();
+
+        ID3D12CommandList* lists[1] = {cl};
+        queue->ExecuteCommandLists(1, lists);
+        queue->Signal(fence, ++fence_val);
+        if (!wait_fence(fence, fence_val)) {
+            rb->Release();
+            bb->Release();
+            return fail("wait_fence (10-bit)");
+        }
+
+        void* mapped = nullptr;
+        if (FAILED(rb->Map(0, nullptr, &mapped)) || !mapped) {
+            rb->Release();
+            bb->Release();
+            return fail("readback Map (10-bit)");
+        }
+        const auto* base = static_cast<const std::uint8_t*>(mapped);
+        bool mismatch = false;
+        std::uint32_t bad_word = 0, want_word = 0;
+        for (UINT y = 0; y < 19 && !mismatch; ++y) {
+            const auto* row = reinterpret_cast<const std::uint32_t*>(base + static_cast<std::size_t>(y) * fp.Footprint.RowPitch);
+            for (UINT x = 0; x < 37; ++x) {
+                const std::uint32_t want = (x < 12) ? 0xd00bfc00u : ((x < 24) ? 0xd00bfc01u : 0xd00bfc08u);
+                if (row[x] != want) {
+                    mismatch = true;
+                    bad_word = row[x];
+                    want_word = want;
+                    break;
+                }
+            }
+        }
+        rb->Unmap(0, nullptr);
+        rb->Release();
+        bb->Release();
+        if (mismatch) {
+            std::fprintf(stderr, "FAIL: 10-bit backbuffer word 0x%08x != expected 0x%08x\n", bad_word, want_word);
+            return 1;
+        }
+        if (FAILED(sc->Present(0, 0))) return fail("Present (10-bit)");
+    }
+
+    // Unsupported swapchain format must fail explicitly instead of silently downgrading to BGRA8.
+    if (sc->ResizeBuffers(2, 37, 19, DXGI_FORMAT_R32_UINT, 0) != DXGI_ERROR_UNSUPPORTED)
+        return fail("ResizeBuffers should reject unsupported format DXGI_FORMAT_R32_UINT");
+
+    // Measured on host DXGI (RTX 5070 and WARP): DXGI_PRESENT_TEST returns S_OK without presenting, so the back
+    // buffer index stays; a sync interval above 4 is DXGI_ERROR_INVALID_CALL and presents nothing either.
+    {
+        const UINT before = sc->GetCurrentBackBufferIndex();
+        if (sc->Present(0, DXGI_PRESENT_TEST) != S_OK || sc->GetCurrentBackBufferIndex() != before)
+            return fail("Present(0, DXGI_PRESENT_TEST) presented a frame");
+        if (sc->Present(5, 0) != DXGI_ERROR_INVALID_CALL || sc->GetCurrentBackBufferIndex() != before)
+            return fail("Present(5, 0) should be DXGI_ERROR_INVALID_CALL and present nothing");
+    }
+
+    // Host DXGI refuses ResizeBuffers with DXGI_ERROR_INVALID_CALL while the app still holds a back buffer,
+    // and keeps the old buffers.
+    {
+        ID3D12Resource* held = nullptr;
+        if (FAILED(sc->GetBuffer(0, IID_PPV_ARGS(&held))) || !held) return fail("GetBuffer (held)");
+        const HRESULT hr = sc->ResizeBuffers(2, 64, 64, DXGI_FORMAT_UNKNOWN, 0);
+        DXGI_SWAP_CHAIN_DESC1 d{};
+        sc->GetDesc1(&d);
+        held->Release();
+        if (hr != DXGI_ERROR_INVALID_CALL || d.Width != 37 || d.Height != 19)
+            return fail("ResizeBuffers with a held back buffer should be DXGI_ERROR_INVALID_CALL and keep 37x19");
+    }
+
+    // Zero width or height means the window's client area, in ResizeBuffers (the usual WM_SIZE call) and at
+    // creation; host DXGI: ResizeBuffers(0, 0, 0) after resizing the window gives the new client size.
+    {
+        RECT wr{0, 0, 300, 200};
+        AdjustWindowRect(&wr, WS_OVERLAPPEDWINDOW, FALSE);
+        SetWindowPos(hwnd, nullptr, 0, 0, wr.right - wr.left, wr.bottom - wr.top, SWP_NOMOVE | SWP_NOZORDER);
+        RECT cr{};
+        GetClientRect(hwnd, &cr);
+        if (FAILED(sc->ResizeBuffers(0, 0, 0, DXGI_FORMAT_UNKNOWN, 0))) return fail("ResizeBuffers(0, 0, 0)");
+        DXGI_SWAP_CHAIN_DESC1 d{};
+        sc->GetDesc1(&d);
+        if (d.Width != UINT(cr.right) || d.Height != UINT(cr.bottom)) {
+            std::fprintf(stderr, "FAIL: ResizeBuffers(0, 0, 0) gave %ux%u, client area is %ldx%ld\n", d.Width, d.Height,
+                         cr.right, cr.bottom);
+            return 1;
+        }
+
+        HWND hwnd2 = create_test_window(200, 150);
+        if (!hwnd2) return fail("CreateWindowExW (second)");
+        GetClientRect(hwnd2, &cr);
+        DXGI_SWAP_CHAIN_DESC1 zd = scd;
+        zd.Width = 0;
+        zd.Height = 0;
+        IDXGISwapChain1* zsc = nullptr;
+        if (FAILED(factory->CreateSwapChainForHwnd(queue, hwnd2, &zd, nullptr, nullptr, &zsc)) || !zsc)
+            return fail("CreateSwapChainForHwnd 0x0");
+        zsc->GetDesc1(&d);
+        zsc->Release();
+        DestroyWindow(hwnd2);
+        if (d.Width != UINT(cr.right) || d.Height != UINT(cr.bottom)) {
+            std::fprintf(stderr, "FAIL: 0x0 swapchain is %ux%u, client area is %ldx%ld\n", d.Width, d.Height, cr.right,
+                         cr.bottom);
+            return 1;
+        }
+    }
 
     rtv_heap->Release();
     sc->Release();

@@ -578,6 +578,23 @@ class AwcAndArchiveScanTest(unittest.TestCase):
             self.assertEqual(rows[0]["version"], "8001")
             self.assertEqual(rows[0]["valid"], "True")
 
+    def test_cli_rejects_output_aliasing_source(self):
+        clip = build_synthetic_rsc8(stream_hash=0x20112233, frames=90)
+        original = build_synthetic_awc([{"id": 0x00112233, "rsc8": clip, "samples": 48000}])
+        with tempfile.TemporaryDirectory() as tmp:
+            source = os.path.join(tmp, "bank.awc")
+            with open(source, "wb") as f:
+                f.write(original)
+            alias = os.path.join(tmp, ".", "bank.awc")
+            result = subprocess.run(
+                [sys.executable, "-I", TOOL, source, alias, "--quiet"],
+                capture_output=True, text=True,
+            )
+            with open(source, "rb") as f:
+                self.assertEqual(f.read(), original)
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertIn("output must not overwrite the source file", result.stderr)
+
     def test_cli_validation_errors(self):
         with tempfile.TemporaryDirectory() as tmp:
             missing = os.path.join(tmp, "missing.rpf")

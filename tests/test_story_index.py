@@ -4,7 +4,9 @@
 
 Every byte here is built by the test. No game file or game asset name is used.
 """
+import contextlib
 import csv
+import io
 import json
 import os
 import struct
@@ -13,6 +15,7 @@ import sys
 import tempfile
 import unittest
 import zlib
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOL = os.path.join(ROOT, "tools", "story_index.py")
@@ -227,11 +230,34 @@ class ArchiveTest(unittest.TestCase):
         p = subprocess.run([sys.executable, "-I", TOOL, self.rpf, out, "--quiet"],
                            capture_output=True, text=True, encoding="utf-8", errors="replace")
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertEqual(p.stdout, "")
         with open(out, encoding="utf-8") as f:
             doc = json.load(f)
         self.assertEqual(doc["summary"]["signatures"]["psin"]["files"], 1)
         self.assertEqual(doc["summary"]["signatures"]["page-directory"]["files"], 1)
         self.assertEqual(doc["summary"]["signatures"]["rsc8"]["files"], 1)
+
+    def test_cli_reports_a_report_write_error(self):
+        out = os.path.join(self.root, "index.json")
+        err = io.StringIO()
+        with (mock.patch.object(sys, "argv", [TOOL, self.rpf, out, "--quiet"]),
+              mock.patch.object(story_index, "write_output", side_effect=OSError("disk full")),
+              contextlib.redirect_stderr(err)):
+            self.assertEqual(story_index.main(), 2)
+        self.assertIn(f"{out}: disk full", err.getvalue())
+
+    def test_unwritable_or_bad_output_path_fails_before_the_scan(self):
+        for out in (os.path.join(self.root, "no_such_folder", "x.json"),
+                    os.path.join(self.root, "out.txt"),
+                    self.root):
+            with self.subTest(out=out):
+                p = subprocess.run([sys.executable, "-I", TOOL, self.rpf, out, "--quiet"],
+                                   capture_output=True, text=True, encoding="utf-8", errors="replace")
+                self.assertEqual(p.returncode, 2, p.stderr)
+                self.assertNotIn("Traceback", p.stderr)
+                self.assertEqual(p.stdout, "")
+        self.assertFalse(os.path.exists(os.path.join(self.root, "no_such_folder")))
+        self.assertFalse(os.path.exists(os.path.join(self.root, "out.txt")))
 
     def test_directory(self):
         folder = os.path.join(self.root, "carved")

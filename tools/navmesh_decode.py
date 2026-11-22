@@ -238,8 +238,9 @@ def _psin_state(b):
             return False, count, False
         at += size
         count += 1
-    if count and at == len(b):
-        return True, count, False
+    if at == len(b):
+        # Ends exactly here: complete with at least one section; a bare header is incomplete, not continued.
+        return count > 0, count, False
     return False, count, True
 
 
@@ -926,6 +927,15 @@ def _offset(text):
     return value
 
 
+def same_report_path(first, second):
+    if os.path.normcase(os.path.realpath(first)) == os.path.normcase(os.path.realpath(second)):
+        return True
+    try:
+        return os.path.samefile(first, second)
+    except OSError:
+        return False
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("input", help="RPF9 archive (navmeshes.rpf) or directory of carved streams")
@@ -940,14 +950,16 @@ def main(argv=None):
         ap.error("%s does not exist" % a.input)
     if os.path.isdir(a.input) and (a.start is not None or a.limit is not None):
         ap.error("--start and --limit apply to archive inputs only")
+    base = os.path.basename(os.path.abspath(a.input)) or "navmesh"
+    out = a.out or os.path.splitext(base)[0] + ".navmesh-decode.json"
+    if a.csv and same_report_path(out, a.csv):
+        ap.error("--out and --csv must use different paths")
     rows = [] if a.csv else None
     try:
         summary = scan(a.input, a.start, a.limit, a.deep, rows)
     except ValueError as exc:
         print("error: %s" % exc, file=sys.stderr)
         return 2
-    base = os.path.basename(os.path.abspath(a.input)) or "navmesh"
-    out = a.out or os.path.splitext(base)[0] + ".navmesh-decode.json"
     with open(out, "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=1, allow_nan=False)
     if a.csv:

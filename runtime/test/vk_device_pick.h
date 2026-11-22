@@ -9,8 +9,12 @@
 
 #include <vulkan/vulkan.h>
 
+#include "../src/vulkan_device_filter.h"
+
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <string>
 #include <vector>
 
 namespace leonida::vk_test {
@@ -36,6 +40,7 @@ inline std::size_t pick_device(const std::vector<VkPhysicalDeviceProperties>& ca
     std::size_t best = candidates.size();
     int best_rank = -1;
     for (std::size_t i = 0; i < candidates.size(); ++i) {
+        if (!leonida::vulkan_device_wanted(candidates[i].deviceName)) continue;
         const int rank = device_rank(candidates[i].deviceType, candidates[i].vendorID);
         if (rank > best_rank) {
             best = i;
@@ -43,6 +48,17 @@ inline std::size_t pick_device(const std::vector<VkPhysicalDeviceProperties>& ca
         }
     }
     return best;
+}
+
+// Why no device was chosen, naming LEONIDA_VK_DEVICE when its filter excluded every device (otherwise the list was
+// empty). The tools call this instead of dereferencing a null device.
+inline void report_no_device() {
+    const std::string filter = leonida::vulkan_device_filter();
+    if (!filter.empty()) {
+        std::fprintf(stderr, "LEONIDA_VK_DEVICE=%s: no Vulkan physical device matches\n", filter.c_str());
+    } else {
+        std::fprintf(stderr, "no Vulkan physical device found\n");
+    }
 }
 
 }  // namespace leonida::vk_test

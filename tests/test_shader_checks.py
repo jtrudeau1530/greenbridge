@@ -25,10 +25,10 @@ PARTIAL = {n for n, _ in check.W64X_PARTIAL}
 WAVE32_WORDS = {n: w for n, w in check.CS_DUMPS if n in check.WAVE32_DUMPS and n not in ("cs_store", "cs_smem_soffset_imm")}
 
 
-# every test check.py runs: compute, cs_wavemask, cs_fmt_1010102, the dumps (#73, #152 cross-half, partial), the two store
-# tests, pixel tests, the two-mip draws, the gradient samples and three mesh fixtures (skipped here: build.py
+# every test check.py runs: compute, cs_wavemask, cs_fmt_1010102, the dumps (#73, #152 cross-half, partial), the three
+# vk_store_test checks (cs_imgstore, cs_imgload, cs_imgload_d16), pixel tests, the two-mip draws, the gradient samples and three mesh fixtures (skipped here: build.py
 # does not build mesh shaders)
-TOTAL = (len(check.COMPUTE) + 2 + len(check.CS_DUMPS) + len(check.W64X_DUMPS) + len(check.W64X_PARTIAL) + 2
+TOTAL = (len(check.COMPUTE) + 2 + len(check.CS_DUMPS) + len(check.W64X_DUMPS) + len(check.W64X_PARTIAL) + 3
          + len(check.PIXEL_TESTS) + len(check.CLIP_TESTS) + len(check.BOUNDS) + len(check.GLOBAL_OFFSET)
          + len(check.MIP_TEST_PASSES) + len(check.GRADIENT_TESTS)
          + 8)  # three mesh fixtures, ps_tex, cs_cmpx_class_f32, cs_user_sgprs, cs_cvt_f32_sat and ps_gather_wrap
@@ -96,6 +96,9 @@ class Wave64Checks(unittest.TestCase):
             if name == "cs_global_neg_offset":
                 self.assertEqual(args[0], "40")
                 return 0, "out[0..7] = " + " ".join(map(str, check.GLOBAL_OFFSET[0][2])) + "\n"
+            if name in dict(check.BOUNDS):    # the SMEM / raw MUBUF rule tests: their words, then the 0xee fill
+                words = (dict(check.BOUNDS)[name] + [0xEEEEEEEE] * 8)[:8]
+                return 0, "out[0..7] = " + " ".join(map(str, words)) + "\n"
             if name == "cs_store":
                 return 0, "out[0..7] = 1073774847 3758097407 1006649344 4008636142 1073757184 3154130944 0 0\n"
             if name == "cs_smem_soffset_imm":
@@ -104,7 +107,7 @@ class Wave64Checks(unittest.TestCase):
                 return 0, "out[0..7] = " + " ".join(map(str, (WAVE32_WORDS[name] + [0] * 8)[:8])) + "\n"
             if name == "cs_workgroup_yz":     # #186: vk_compute_test's 2x3x4 Y/Z histogram line
                 return 0, "2x3x4 workgroup Y/Z: 0 mismatches\n"
-            if name in ("cs_imgstore", "cs_imgload"):
+            if name in ("cs_imgstore", "cs_imgload", "cs_imgload_d16"):   # vk_store_test checks
                 return 0, "0 bad\n0 bad\n0 bad\n"
             return 0, "0 mismatches\n"
 
@@ -456,6 +459,36 @@ class Wave32LaneDumps(unittest.TestCase):
             problem = check.compute_test("tools", "spirv", "cs_store", "1", "dump", expected_words=check.CS_STORE)
         self.assertTrue(problem)
         self.assertNotIsInstance(problem, check.Skip)
+
+    def test_lane_dumps_request_32_lanes(self):
+        # #774: like run_gpu_tests.py, so an 8..32 device (Intel ANV) doesn't judge the dump at a narrower size.
+        for name in check.WAVE32_LANE_DUMPS:
+            with self.subTest(name=name), patch.object(check, "run", return_value=(0, self.words(name))) as run:
+                check.compute_test("tools", "spirv", name, "1", "dump", expected_words=dict(check.CS_DUMPS)[name],
+                                   needs_32_lanes=True)
+                self.assertEqual(run.call_args.kwargs["env"]["VKC_SUBGROUP_SIZE"], "32")
+
+    def test_other_dumps_keep_the_default_size(self):
+        with patch.object(check, "run", return_value=(0, self.words("cs_store"))) as run:
+            check.compute_test("tools", "spirv", "cs_store", "1", "dump", expected_words=check.CS_STORE)
+        self.assertNotIn("env", run.call_args.kwargs)
+
+    def test_skipped_when_32_lanes_cannot_be_pinned(self):
+        for name in check.WAVE32_LANE_DUMPS:
+            for flip in (False, True):
+                with self.subTest(name=name, flip=flip):
+                    out = ("device: gpu (subgroup 8..32)\ncompute subgroup size: 32 not available\n"
+                           + self.words(name, flip))
+                    problem = self.run_dump(name, 0, out)
+                    self.assertIsInstance(problem, check.Skip)
+                    self.assertIn("at 32 lanes on request", problem)
+
+    def test_judged_when_32_lanes_are_pinned(self):
+        for name in check.WAVE32_LANE_DUMPS:
+            with self.subTest(name=name):
+                out = "device: gpu (subgroup 8..32)\ncompute subgroup size: 32\n"
+                self.assertEqual(self.run_dump(name, 0, out + self.words(name)), "")
+                self.assertNotIsInstance(self.run_dump(name, 0, out + self.words(name, flip=True)), check.Skip)
 
 
 if __name__ == "__main__":

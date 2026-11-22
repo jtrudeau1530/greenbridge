@@ -224,6 +224,37 @@ python -I tools/gamedata_maps.py <work>\carve\common --json maps.json
   sum of the grid. They are most likely uninitialised struct padding after the
   `u8` and are reported as `pad_29`; with N = 2 this is a hypothesis.
 
+## Grid atlases
+
+Four `GridAtlasInfo` documents describe world-space texture grids streamed by position. All four have the
+same numeric fields; the rest are names (`type`, `clientSystemName`, tile prefix/suffix, fallback texture).
+
+| Field | Measured (identical in all 4) |
+|---|---|
+| `width`, `height` | 16,384 x 33,792 world units |
+| `tileSize` | 512, so **32 x 66 = 2,112 tiles** |
+| `origin` | the grid **centre** (see below) |
+| `streamRadius` | 512 (one tile) |
+| `zInflation` | 1,000 |
+| `hasOwnGlobalFallback`, `useGlobalFallback` | true, true |
+| `sectorOverrides/Item` | 1, with one sector at start (0, 0) and span (32, 66): the whole grid |
+
+The tile count is the only reading under which the sector override's span matches: 16,384 / 512 = 32 and
+33,792 / 512 = 66, so `width`/`height` are world units, not tile or texel counts.
+
+Which corner `origin` names was tested against the 2,036,542 map placements of the local catalog (x 0.1th to
+99.9th percentile -9,955 to 4,577, y -8,096 to 9,440): with `origin` as the grid centre, 99.83% fall inside
+the grid; as the minimum corner, 1.0%; as the top-left corner with y growing downwards, 82.5%. The centre
+reading also gives a minimum x of exactly -13,312, the `PAMH` heightmap's minimum x above.
+
+Tile names: none of the four `tileTextureNamePrefix` values occurs at the start of a name in the local
+texture catalog, no fallback texture name's joaat hash is a catalog id, and seven obvious `prefix + x + y + suffix` spellings hash
+to 0-2 catalog ids out of 2,112 per atlas, which is chance level. The tile textures are therefore either outside
+the scanned archives or named another way; this is unresolved.
+
+Not measured here (hypothesis): what the four grids hold (their names suggest per-tile map data for separate
+client systems), and how `zInflation` widens a tile's streaming box vertically.
+
 ## XML documents
 
 257 documents start with an XML declaration and all 257 parse as well-formed XML with a standard parser.
@@ -284,6 +315,41 @@ loadouts, combat references and animation configuration. Vehicle handling-style 
 vehicle/tyre roots, and the remaining gameplay tables are not XML. Do not infer a full gameplay schema from
 `common.rpf` alone.
 
+## Fog volumes
+
+Volumetric fog comes in two documents: `FogVolumeProfileList` (the media) and
+`CScatteringTransmittance__FogVolumeListData` (placed volumes). Counts; no values or names.
+
+**Profiles** (`ProfileList/Item`, 43): `Name`, `UUID`, `Anisotropy`, `WaterDropletDensity`,
+`DiffusionIntensity`, `ScatteringColorBlend`, `AbsorptionColorBlend`, `Scattering` and `Absorption` (`x y z`),
+`IntExtMode`, plus optional `WaterDropletVariance` (8) and `WindDensityInfluence` (15). Names and UUIDs are
+unique. `Scattering` and `Absorption` are within 0..1 per channel in 41 of 43. `IntExtMode` is 0 in 31 and 1 in 12.
+
+**Volumes** (`FogVolumeList/Item`, 14), 37 fields each: shape (`IsBox`, `Position`, `PositionOffset`, `Scale`,
+`Rotation`, `Shear`, `Wedge`), falloff (`Falloff`, `FalloffCurve` and per-axis versions), two 3x3 matrices
+(`RotationMtx`, `TransformMtx`, 9 numbers each), ambient/emissive intensity, noise and wind, `Scattering`, `Density`,
+`Anisotropy`, `WaterDropletDensity`, `Color`, `BlendMode`, `IntExtMode`, `SortKey`, `ProfileIndex`,
+`SecondaryProfileIndex`, `ProfileInterpolation`, `uuid` and `Name`.
+
+| Check | Result |
+|---|---|
+| `ProfileIndex` and `SecondaryProfileIndex` in `0..42` | 14 of 14 each: profiles are referenced by **list position**, not by UUID |
+| Volume `uuid` equal to a profile `UUID` | 0 of 14 (separate id spaces) |
+| Distinct profiles referenced | 2 of 43; primary equals secondary in 12; `ProfileInterpolation` is 0 in all 14 |
+| `RotationMtx` and `TransformMtx` | identity in all 14, while `Rotation` is zero and `Scale` ranges 0.6 to 28 |
+| `Shear` | zero in all 14 |
+| `IsBox` | true in 13, false in 1 |
+| `BlendMode` / `IntExtMode` | 0 or 1, seven each / 0 in all 14 |
+| Positions | 7 at exactly (0, 0, 0); 8 distinct; all within x -2,093..30, y 0..803, z 0..109 |
+
+Two consequences for a loader. The stored matrices do not include `Scale`, so the volume transform has to be
+built from `Position`, `Rotation` and `Scale` rather than read from `TransformMtx`. Profile indices are
+positions in `ProfileList`, so its order must be kept.
+
+Not measured here (hypothesis): with half the volumes at the origin, two profiles in use and no interpolation,
+this list looks like a sample or default set; the placed fog of the map is probably elsewhere (map resources
+or another archive). What `IntExtMode` (interior/exterior) and `BlendMode` select is also untested.
+
 ## Schema style
 
 Four patterns cover almost everything:
@@ -323,6 +389,36 @@ A runtime consumer needs:
 - streaming rather than whole-file parsing for the 14 MB table;
 - strict handling of the 9 tail-only and 1 unattributed blocks: they are incomplete evidence, not documents
   to guess at.
+
+## Custom clouds
+
+One `CustomClouds` document places individual weather clouds over the world. Counts and ranges; no values or
+names:
+
+| Path | Count | Content |
+|---|---:|---|
+| `CustomCloudGroupList/Item` | 26 | `Name` (26 distinct), `Position` (`x`, `y`), `CustomCloudList` |
+| `.../CustomCloudList/Item` | 630 | `Name` (429 distinct), `Position` (`x`, `y`), `Density`, `Rain`, `Fog`, `FogHeight`, `StrikeChance`, `BurstChance`, `CoverageMinMax` (`x`, `y`), and five booleans `Nimbus0`, `Nimbus1`, `Cumulus`, `Stratus`, `CirroStratus` |
+
+Measured over the 630 clouds:
+
+- **Positions are absolute world x/y.** Every group `Position` is (0, 0), so the group offset cannot be
+  distinguished from none, and cloud positions span x -33,515 to 28,596 and y -31,920 to 37,612. 386 of the 630
+  fall inside the 2D box of the world grid atlases (x -13,312..3,072, y -9,216..24,576; #1180); 136 lie more than
+  20,000 units from the origin, far outside the map placements. There is no z component.
+- **Groups** hold 1 to 74 clouds (median 18).
+- **Cloud types are flags, not weights.** Per cloud the number of `true` flags is 0 (91 clouds), 1 (418), 2 (55),
+  3 (26), 4 (3) or 5 (37). Clouds per type: `Cumulus` 357, `Nimbus0` 158, `Nimbus1` 131, `CirroStratus` 84,
+  `Stratus` 73.
+- **`CoverageMinMax` is a distance range, not a fraction**: min <= max in all 630, values 0 to 30,000, medians 200
+  (min) and 2,000 (max), so it reads as an inner/outer radius in world units.
+- `StrikeChance` and `BurstChance` are within 0..1 in all 630. `Rain` and `Fog` are within -1..1 (median 0),
+  `Density` within -100..100 (median 0.5) and `FogHeight` within -100..300: signed values, so these act as
+  offsets or overrides with a sign, not plain amounts.
+
+Not measured here (hypothesis): how a cloud's radius range blends with the weather's `CloudType` and cloud maps,
+what a negative `Rain`/`Fog`/`Density` means (subtracting from the weather, or "unset"), and what the two
+`Nimbus` flags distinguish.
 
 ## XML catalog
 
@@ -380,6 +476,123 @@ block as incomplete evidence: `gamedata_xml.py --check` is the reference for tha
 aggregate counts and schema/root/element/attribute names belong in git; the CSV/JSON, the element values, the
 `type`/`content` values and per-file paths stay on the local machine. The tests are synthetic.
 
+## Weather types
+
+One `CContentsOfWeatherXmlFile` document defines the weather system. Element tree (counts per path; no values
+or names):
+
+| Path | Count | Content |
+|---|---:|---|
+| `WeatherTimeCycleFileNames/Item` | 25 | one timecycle file path each, all with the same path prefix |
+| `WeatherTypeDatas/Item` | 25 | `Name`, `TimeCycleName`, 72 numeric `value=` fields (wind, gusts, rain, snow, fog, sandstorm, ripples, ocean and shore waves, foam, puddles, accumulation), one-token `LocalizedDensityMap`, `CloudMapA` and `CloudMapB`, an empty `Variations` on all 25, and `PedDirtDefinition` / `DirtCannedColor` (set on 1 of 25) |
+| `WeatherTypes/Item` | 168 | `Name`, `ShortName`, `DataName`, eight `Mod*` tags, `WeatherAppDataName` (151), `SkipDebugCycling` |
+| `WeatherAppTypeDatas/Item` | 26 | `Name`, `Icon`, `IconNight` (23), `Background`, `Description` |
+| `Mod*List/Item` | 73 | allowed tags: Atmosphere 17, Precipitation 16, Temperature 9, Humidity 5, Wind 11, Fetch 5, Misc 7, Niceness 3 |
+| `WeatherCycles/Item` | 2 | `CycleName`, `TimeMult` |
+| `WeatherTypeIndirectionList/Item` | 15 | `From`, `To` |
+| `WeatherMiscData` | 1 | four `Honor*` thresholds and times |
+
+How the pieces link, checked by name (case-insensitive) over the archive:
+
+- **25 weather datas = 25 timecycles.** Every `WeatherTypeDatas/Item` has `TimeCycleName` equal to its own
+  `Name`, the 25 are distinct, and each matches the `cycle` `name` of one of the 27 `timecycle_keyframe_data`
+  documents. The 25 matched documents are exactly the ones with 1,142 variables per region; the two keyframe
+  documents with 515 and 520 variables are not referenced. All 25 file paths contain one of the 25 names;
+  19 are in the same order as the data list.
+- **168 weather types over 25 datas.** Every `WeatherTypes/Item` has a distinct `Name` and a `DataName` that
+  resolves to one of the 25 datas, and every data is used. A weather type is therefore a named variant of a
+  data entry, not a separate timecycle. 151 types carry all eight `Mod*` tags and a `WeatherAppDataName`; the
+  other 17 carry none, and 16 of those have `Name == DataName` (the plain base weathers).
+- **Mod tags resolve to their lists**, with three exceptions: Atmosphere, Precipitation, Temperature, Humidity,
+  Fetch and Niceness resolve 151/151; Wind 150/151 (the miss is two characters from a list entry); Misc only
+  14/151, because 137 types use one of two values that are not in `ModMiscList`. A loader should not reject a
+  type over an unknown `ModMisc`.
+- `WeatherAppDataName` resolves 151/151 to `WeatherAppTypeDatas`. In the 15 indirection pairs, 14 `From`
+  and 14 `To` values are weather type names, and 13 pairs have both.
+- The two `WeatherCycles` names occur in other `common.rpf` documents (2 and 1 documents), not as weather types.
+
+Not measured here (hypothesis): what the `Mod*` axes do at runtime (they read as weather-app forecast
+attributes), how `TimeMult` scales a cycle, and what the `Honor*` values gate.
+
+## `OceanSimPresets`
+
+`tools/gamedata_xml.py` lists `OceanSimPresets` among the time/weather/water roots. There is one such document.
+Its element tree (counts per path; no values or names):
+
+| Path | Count | Content |
+|---|---:|---|
+| `Presets/Item` | 10 | one preset per sea region |
+| `Presets/Item/Name`, `Id` | 10 each | region label and id |
+| `Presets/Item/Location` | 10 | `x`, `y` attributes in world units: x -7,995 to 3,183, y -4,572 to 8,645 |
+| `Presets/Item/Direction` | 10 | wave direction |
+| `Presets/Item/Octaves/Item` | 30 | exactly 3 per preset |
+| `Presets/Item/Octaves/Item/ControlPoints` | 30 | 4 `(x, y)` pairs each, both in 0..1 |
+| `WavefrontShapeA`, `B`, `G`, `R` `/Item/ControlPoints` | 1 each | one curve each |
+
+So the ocean is a small set of regional presets placed by world position, each with three wave octaves whose
+amplitude is a 4-point curve over a 0..1 input. The input is the sea state: the timecycle keyframe documents
+carry a `water_ocean_beaufort_scale` variable (26 documents, 676 values, 0 to 10), the Beaufort number per
+weather and time of day.
+
+Not measured here (hypothesis): which preset applies at a position (nearest `Location` is the obvious reading),
+how the Beaufort number maps onto the 0..1 curve input (Beaufort / 12 is one choice), and what the four
+`WavefrontShape` curves drive.
+
+## Timecycle documents
+
+Two of the three most repeated roots are the timecycle tables: 27 `timecycle_keyframe_data` and 49
+`timecycle_modifier_data` documents. All 76 parse. Counts below; no values, modifier names or region names.
+
+**Keyframe documents** (root attribute `version`, the same value in all 27):
+
+| Path | Count | Content |
+|---|---:|---|
+| `cycle` | 27 | exactly one per document; attributes `name`, `description`, `regions` |
+| `cycle/region` | 54 | exactly two per cycle; attribute `name` |
+| `cycle/region/<variable>` | 59,170 | one element per variable, text = **13** space-separated numbers |
+
+Every one of the 59,170 variables has 13 values, the same as GTA V's 13 time-of-day samples, so a keyframe
+document reads as one weather's day curve per variable and region. In 25 documents each region has
+**1,142 variables**; the other two have 515 and 520. Within every document the two regions list the same
+variables in the same order. The 1,142-variable set and the two short documents together use 1,301 distinct
+names: 362 of the 521 short-document names are in the 1,142 set and 159 are not, so the short documents
+follow an older or separate variable list rather than a prefix of the current one. A loader should therefore
+bind variables by element name, not by position.
+
+**Modifier documents** (root attribute `version`, the same value in all 49):
+
+| Path | Count | Content |
+|---|---:|---|
+| `modifier` | 4,593 | attributes `name`, `description`, `groupApplyTag`, `localApplyIndex`, `userFlags` on all; 4,592 distinct names |
+| `modifier/<variable>` | 29,738 | 29,727 hold 2 numbers, 11 are empty |
+| `modifier/submodifiers/item` | 8,043 | in 1,928 modifiers (4 items is the usual count: 1,252); attributes `flags` (29), `alpha` (14), `blendSpeed` (3) |
+| `modifier/axis` | 405 | in the 302 modifiers that carry `numAxes` and `numKeyframes`; attribute `controlValue` on all |
+| `modifier/axis/keyframe_t_value` | 302 | exactly one per axis modifier (on one of its axes), `numKeyframes` numbers |
+| `modifier/axis/<variable>` | 2,713 | `numKeyframes` numbers each |
+
+Modifiers come in two shapes:
+
+- **Plain** (4,291): variables are direct children with two numbers each, as in GTA V's modifier files.
+  Per modifier: 0 to 407 variables. 1,025 have none: 759 of those only list submodifiers and 266 are empty. The 1,054 modifier variable
+  names include 947 keyframe variables and 107 that occur only in modifiers.
+- **Axis-driven** (302): every variable sits inside an `axis` and has exactly `numKeyframes` values; the axis's
+  `keyframe_t_value` lists the input positions (one list per modifier, even with several axes). All 2,713 axis variables match their modifier's
+  `numKeyframes`, and all 302 `keyframe_t_value` lists have that length and are sorted ascending.
+  `numAxes` is 1 (235), 2 (49) or 4 (18) and always equals the number of `axis` children
+  (`(numAxes, numKeyframes)` most often `(1, 6)`: 93), and `numKeyframes` ranges from
+  2 to 25 (2 to 7 in 271 of the 302; 6 alone in 107). `controlValue` takes 43 distinct symbolic names, so the input is a named game
+  quantity rather than time of day. 61 axes add `input_min`/`input_max`, and 7 add `blendType`; 23 of the
+  302 position lists fall outside `[input_min, input_max]` or, without those attributes, outside 0..1, so
+  the range is not a clamp on the stored positions.
+
+`submodifiers/item` text is one token. 8,042 of the 8,043 items equal the `name` of a modifier in the same
+49 documents, so a submodifier is a by-name reference to another modifier, with its own blend attributes.
+The one unresolved item points outside this archive or at a document lost to the unread region.
+
+Not measured here (hypothesis): the hour of each of the 13 samples (GTA V's are fixed in code), how the two
+regions are chosen at runtime, what the two plain-modifier numbers are (GTA V reads them as a value pair
+blended by strength), and how `controlValue` maps onto game state.
+
 ## Relationship to `data.rpf` and `script.rpf`
 
 | Archive | Size | Streams | Inflated | Dominant payloads | XML | `RBF0` | `PSIN` |
@@ -413,6 +626,38 @@ in `.bk2`), not XML. Of the 57 `.xml` path entries, 50 are under `$(common)/` an
 are under `data/` or `script/`. A further 40 `parentPath` attributes are relative references that cannot be
 resolved without the table of contents. No XInclude (`xi:include`) elements occur.
 
+## Shore wave placement
+
+The shore-break waves are placed by one `ShoreWavePlacementData` document, the coastline counterpart of
+`OceanSimPresets`. Element tree (counts per path; no values):
+
+| Path | Count | Content |
+|---|---:|---|
+| `Context` | 1 | empty |
+| `Patches/item` | 434 | `loop` and `waveType` (`value=`), then `ControlPoints` |
+| `Patches/item/ControlPoints/item` | 7,839 | `position` and `direction` (`x`, `y`), `lateralCoord`, `maxDistance`, `amplitude` (`value=`) |
+
+Measured over the 434 patches and 7,839 points:
+
+- **Patches are open 2D polylines.** 2 to 124 points per patch (median 14), median spacing 9.5 world units.
+  `loop` is false on all 434; 11 patches still repeat their first point at the end. Positions span x -9,602 to
+  2,335 and y -7,955 to 9,474, a larger box than the ten ocean preset locations. Positions have no z
+  component.
+- **`waveType`** takes 5 values, used by 181, 147, 69, 31 and 6 patches.
+- **`direction` is a unit vector** at every point (length 1.000 to three decimals). It runs across the polyline
+  rather than along it: the median |cos| between it and the local polyline tangent is 0.24 (quartiles 0.11 and
+  0.44), consistent with a wave travelling across the line towards the shore.
+- **`amplitude` is 1.0 at all 7,839 points**, so it carries no per-point variation in this build. The height
+  presumably comes from elsewhere, for example the per-weather `ShoreWaveAmplitude`, `ShoreWaveMinAmplitude`,
+  `ShoreWaveMaxAmplitude` and `ShoreWaveWindScale` fields of the `CContentsOfWeatherXmlFile` weather data
+  (its layout is documented in #1175).
+- **`maxDistance`** ranges 3.0 to 120.4 (median 74.9): how far the wave runs from the line.
+- **`lateralCoord`** is a float in -2.94..3.50 with 7,820 distinct values. It is not arc length and not monotonic
+  along 433 of the 434 patches, so it is not a running texture coordinate along the line.
+
+Not measured here (hypothesis): what the five `waveType` values select, and what `lateralCoord` encodes (an
+offset across the line is one reading).
+
 ## Readable vs binary
 
 Readable: the 266 XML documents, 3 text/INI-like files, and the two `MHIU` 2048 x 2048
@@ -425,6 +670,49 @@ implemented.
 Not fully readable: the 8.6% unread span, the two opaque binary blobs, and the missing first blocks of the 9
 tail-only documents (their retained tails are readable but incomplete). The encrypted table of contents is
 outside this work by rule; names and exact file boundaries stay unknown until a documented table reader exists.
+
+## Dirt and canned colours (`CGraphicsDefinitionsData`)
+
+One `CGraphicsDefinitionsData` document holds the dirt/grime presets for peds, vehicles and props and the
+colour table they draw from. Seven sections, each a list of `Item key="..."` records (counts; no values or
+names):
+
+| Section | Items | Fields per item | `key` |
+|---|---:|---:|---|
+| `CannedColors` | 44 | none: `x`, `y`, `z`, `w` attributes | text |
+| `AlphaChannels` | 7 | `Name`, `Channels` (1 or 2 `Probability`/`Channel` pairs; 10 in total) | equals `Name` in 6 of 7 |
+| `DirtDefinitions` | 24 | 25 (alpha curves and thresholds, vertex multipliers, normal/roughness/material contribution, spawn range, 6 `ClothHideDirtModifiers`) | equals `Name` in 22 of 24 |
+| `VehDirtDefinitions` | 1 | 12, including a `DirtTunings` block of tile, detail-map, mud and modulate start/end values | equals `Name` |
+| `VehDirtControls` | 5 | 13 | equals `Name` |
+| `VehSpawnIntensities` | 31 | 5 | equals `Name` |
+| `PropDirtDefinitions` | 9 | 4 | equals `Name` |
+
+The keys are plain text, not joaat hashes, and a loader can index each section by `key`.
+
+**Canned colours are 8-bit RGB.** In all 44, `x`, `y` and `z` are integers from 0 to 255 and `w` is -1, so
+`w` is not alpha; read it as an unused component or "no alpha".
+
+**References** (case-insensitive equality with another section's `key` or `Name`):
+
+| Field | Resolves to | Count |
+|---|---|---:|
+| `DirtDefinitions/Item/ColorLookup` | `CannedColors` | 24 of 24 |
+| `DirtDefinitions/Item/AlphaMasksLookup` | `AlphaChannels` | 18 of 24 (the other 6 are empty) |
+| `VehDirtDefinitions/Item/ColorLookup` | `CannedColors` | 1 of 1 |
+| `PropDirtDefinitions/Item/Color0Lookup`, `Color1Lookup`, `Color2Lookup` | `CannedColors` | 9 of 9 each |
+| weather data `PedDirtDefinition` (see the weather document) | `DirtDefinitions` | 1 of 1 |
+| weather data `DirtCannedColor` | none | 0 of 1 |
+
+So every dirt preset gets its colour from the canned table, and one weather selects a ped dirt preset. The
+weather's `DirtCannedColor` is a single non-numeric token that matches no canned-colour key, even as a
+substring; where it resolves is unknown. Other `common.rpf` documents share only a few short generic words
+with the `VehSpawnIntensities` keys, which is not evidence of a reference.
+
+`AlphaChannels` probabilities do not sum to 1 in any of the 7 entries, so they are not a probability
+distribution over the listed channels (independent chances or weights would fit). The `Channel` values are 0, 1 or 2.
+
+Not measured here (hypothesis): which texture channel numbering `Channel` uses, and how `VehSpawnIntensities`
+are chosen at spawn.
 
 ## No-sharing rule
 

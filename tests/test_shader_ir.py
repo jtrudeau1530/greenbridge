@@ -263,6 +263,18 @@ class ParseFileTests(unittest.TestCase):
         self.assertEqual([i["pc"] for i in info["insns"]], [0x100, 0x102, 0x104])
         self.assertEqual(info["invalid"], 1)
 
+    def test_tab_between_mnemonic_and_operands(self):
+        path = self.write(
+            "; sample code 0x0..0x4 (header)\n"
+            "\ts_mov_b32\ts3, 1 ; encoding: [0x81,0x00,0x83,0xbe]\n"
+        )
+        ins = shader_ir.parse_file(path)["insns"][0]
+        self.assertEqual(ins["op"], "s_mov_b32")
+        self.assertEqual(ins["args"], [
+            {"k": "sgpr", "r": 3, "n": 1, "neg": False, "abs": False},
+            {"k": "imm", "v": 1},
+        ])
+
     def test_file_without_a_header_starts_at_zero(self):
         path = self.write("\tv_mov_b32 v0, v1 ; encoding: [0xaa,0xbb]\n")
         info = shader_ir.parse_file(path)
@@ -298,6 +310,15 @@ class CliInputTest(unittest.TestCase):
                     self.assertEqual(p.returncode, 2, p.stderr)
                     self.assertIn("usage:", p.stderr)
                     self.assertNotIn("Traceback", p.stderr)
+
+    def test_s_directory_does_not_count_toward_limit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            os.mkdir(os.path.join(tmp, "a_cache.s"))
+            with open(os.path.join(tmp, "b_shader.s"), "w", encoding="utf-8") as f:
+                f.write("\ts_endpgm ; encoding: [0x00,0x00,0x81,0xbf]\n")
+            result = self.run_tool(tmp, "--limit", "1")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("1 shaders, 1 instructions", result.stdout)
 
     def test_folder_with_limit_still_works(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -117,7 +117,7 @@ int main(int argc, char** argv) {
     const std::size_t chosen = leonida::vk_test::pick_device(candidates);
     VkPhysicalDevice pd = chosen < pds.size() ? pds[chosen] : VK_NULL_HANDLE;
     if (!pd) {
-        std::fprintf(stderr, "no Vulkan physical device found\n");
+        leonida::vk_test::report_no_device();
         return 1;
     }
     VkPhysicalDeviceProperties props; vkGetPhysicalDeviceProperties(pd, &props);
@@ -236,8 +236,15 @@ int main(int argc, char** argv) {
     cpi.layout = pl;
     VkPipeline pipe; CHECK(vkCreateComputePipelines(dev, VK_NULL_HANDLE, 1, &cpi, nullptr, &pipe));
     if (require_wave64) std::printf("compute subgroup size: 64\n");
+    else if (req_sg) {
+        // VKC_SUBGROUP_SIZE: say whether the pipeline really runs at that size, so a runner can skip a test the device
+        // can't pin instead of judging words from whatever size the driver picked (#774).
+        const bool fixed = sgProps.minSubgroupSize == sgProps.maxSubgroupSize && subgroup.subgroupSize == req_sg;
+        if (can_request_size || fixed) std::printf("compute subgroup size: %u\n", req_sg);
+        else std::printf("compute subgroup size: %u not available\n", req_sg);
+    }
 
-    pc[0] = 0; pc[1] = 0; pc[2] = 0xFFFFFFFFu; pc[3] = 0;     // V#: base 0, stride 0, num_records max
+    pc[0] = 0; pc[1] = 0; pc[2] = 0xFFFFFFFFu; pc[3] = 0x31016FACu;     // V#: base 0, stride 0, num_records max, OOB_SELECT 3 (raw)
     pc[32] = uint32_t(heap); pc[33] = uint32_t(heap >> 32);    // heap base
     VkCommandPoolCreateInfo cpci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
     cpci.queueFamilyIndex = qi;

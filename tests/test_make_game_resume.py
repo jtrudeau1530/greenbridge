@@ -133,6 +133,7 @@ class EarlierStepDropsThePlanTest(unittest.TestCase):
             def fake_translate(disasm, out, jobs, emulate=False):
                 seen["plan"] = os.path.exists(plan)
             with mock.patch.object(make_game, "py"), mock.patch.object(make_game, "need"), \
+                    mock.patch.object(make_game, "llvm_mc_signature", return_value="test llvm-mc 21"), \
                     mock.patch.object(make_game, "translate", side_effect=fake_translate), \
                     mock.patch.object(make_game, "log", lambda *a: None):
                 make_game.shaders("game", work, 2)

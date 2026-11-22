@@ -56,12 +56,18 @@ int check_calibration(ID3D12CommandQueue* queue, double gpu_frequency, const cha
     const UINT64 after = qpc();
     EXPECT(before <= cpu0 && cpu0 <= after);
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    const UINT64 before1 = qpc();
     EXPECT(SUCCEEDED(queue->GetClockCalibration(&gpu1, &cpu1)));
+    const UINT64 after1 = qpc();
     EXPECT(gpu1 > gpu0 && cpu1 > cpu0);
     const double gpu_s = double(gpu1 - gpu0) / gpu_frequency, cpu_s = double(cpu1 - cpu0) / double(qpf.QuadPart);
     std::printf("%s: GPU %.6f s, CPU %.6f s between two calibrations (%.1f us apart)\n", path, gpu_s, cpu_s,
                 std::fabs(gpu_s - cpu_s) * 1e6);
-    EXPECT(std::fabs(gpu_s - cpu_s) < 0.002);  // 2 ms: the fallback's error is half a submission round trip
+    // Each calibration pairs a GPU stamp with a CPU stamp taken during the call, so neither is off by more than
+    // that call's own duration: microseconds with calibrated timestamps, a submission round trip for the fallback,
+    // which a busy GPU can stretch past a few ms. Allow the two calls' durations, and at least 2 ms.
+    const double calls_s = double((after - before) + (after1 - before1)) / double(qpf.QuadPart);
+    EXPECT(std::fabs(gpu_s - cpu_s) < (calls_s > 0.002 ? calls_s : 0.002));
     EXPECT(queue->GetClockCalibration(nullptr, &cpu0) == E_INVALIDARG);
     EXPECT(queue->GetClockCalibration(&gpu0, nullptr) == E_INVALIDARG);
     return 0;
@@ -229,7 +235,9 @@ HRESULT wrap(ID3D12Device* inner, Ref<ID3D12Device>& device) {
 
 int main() {
     vktest::Device d;
-    EXPECT(d.create());
+    const auto device_status = d.initialize();
+    if (device_status == vktest::DeviceStatus::unavailable) return 77;   // no Vulkan GPU: ctest skips
+    if (device_status != vktest::DeviceStatus::ready) return 1;
     VkPhysicalDeviceProperties properties{};
     d.instance_fn<PFN_vkGetPhysicalDeviceProperties>("vkGetPhysicalDeviceProperties")(d.physical, &properties);
     const double gpu_frequency = 1e9 / double(properties.limits.timestampPeriod);  // GetTimestampFrequency's answer

@@ -157,7 +157,9 @@ def parse_line(line):
     code = code.strip()
     if not code:
         return None
-    op, _, rest = code.partition(" ")
+    fields = code.split(maxsplit=1)
+    op = fields[0]
+    rest = fields[1] if len(fields) > 1 else ""
     # sendmsg(MSG_GS, GS_OP_NOP) contains a comma: keep it as one operand.
     rest = SENDMSG.sub(lambda m: m.group(0).replace(", ", "|").replace(",", "|"), rest)
     mods = MODWORDS.findall(rest)
@@ -212,10 +214,12 @@ def main(argv=None):
     a = ap.parse_args(argv)
     if not os.path.isdir(a.src):
         ap.error(f"{a.src} is not a folder")
-    files = sorted(f for f in os.listdir(a.src) if f.endswith(".s"))[:a.limit]
+    with os.scandir(a.src) as entries:
+        files = sorted(entry.path for entry in entries
+                       if entry.name.endswith(".s") and entry.is_file())[:a.limit]
     kinds, raw, n_ins, no_enc = Counter(), Counter(), 0, 0
-    for f in files:
-        info = parse_file(os.path.join(a.src, f))
+    for path in files:
+        info = parse_file(path)
         for ins in info["insns"]:
             n_ins += 1
             no_enc += ins["enc"] is None

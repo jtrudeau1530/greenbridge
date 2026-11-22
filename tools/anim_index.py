@@ -249,20 +249,26 @@ def _inflate_row(archive, row):
         return zlib.decompress(f.read(row["stored"]))
 
 
+MAX_CHUNK = 65536   # a resource is split into 64 KiB streams; only a full one is followed by a continuation
+
+
 def collect_rbf0(archive, rows):
-    """Join the RBF0 stream with its 64 KiB continuation blocks. Stops at a known signature or a gap."""
+    """Join the RBF0 stream with its 64 KiB continuation blocks. Stops at a known signature, a gap, or after
+    a stream shorter than 64 KiB: that one ends the resource, so the next stream belongs to something else."""
     start = next((i for i, r in enumerate(rows) if r["signature"] == "rbf0"), None)
     if start is None:
         return None
     blob = bytearray(_inflate_row(archive, rows[start]))
     previous_end = rows[start]["offset"] + rows[start]["stored"]
+    previous_size = rows[start]["size"]
     for row in rows[start + 1:]:
-        if len(blob) >= 8 * 1024 * 1024 or row["offset"] > previous_end + 16:
+        if len(blob) >= 8 * 1024 * 1024 or row["offset"] > previous_end + 16 or previous_size != MAX_CHUNK:
             break
-        if row["signature"] in STOP_SIGNATURES or row["size"] > 65536:
+        if row["signature"] in STOP_SIGNATURES or row["size"] > MAX_CHUNK:
             break
         blob += _inflate_row(archive, row)
         previous_end = row["offset"] + row["stored"]
+        previous_size = row["size"]
     return bytes(blob)
 
 
@@ -315,12 +321,16 @@ def collect_rbf0_dir(path):
         return None
     blob = bytearray(entries[first][2])
     previous_end = entries[first][0] + len(entries[first][2])
+    previous_size = len(entries[first][2])
     for offset, _, data in entries[first + 1:]:
+        if previous_size != MAX_CHUNK:
+            break
         sign = classify(data, offset, len(data))["signature"]
-        if len(blob) >= 8 * 1024 * 1024 or offset > previous_end + 16 or sign in STOP_SIGNATURES or len(data) > 65536:
+        if len(blob) >= 8 * 1024 * 1024 or offset > previous_end + 16 or sign in STOP_SIGNATURES or len(data) > MAX_CHUNK:
             break
         blob += data
         previous_end = offset + len(data)
+        previous_size = len(data)
     return bytes(blob)
 
 
@@ -476,6 +486,15 @@ def byte_count(text):
     return value
 
 
+def same_report_path(first, second):
+    if os.path.normcase(os.path.realpath(first)) == os.path.normcase(os.path.realpath(second)):
+        return True
+    try:
+        return os.path.samefile(first, second)
+    except OSError:
+        return False
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("source", help="an .rpf archive or a directory of carved .bin files")
@@ -485,8 +504,13 @@ def main():
     ap.add_argument("--rigs", metavar="PATH", help="write parsed RBF0 rig-set/rig and SKEL_ JSON here")
     ap.add_argument("--quiet", action="store_true")
     a = ap.parse_args()
+    if a.rigs and same_report_path(a.out, a.rigs):
+        ap.error("index and --rigs must use different paths")
     try:
         if os.path.isdir(a.source):
+            if a.start is not None or a.limit is not None:
+                print("--start and --limit are only supported for archive files", file=sys.stderr)
+                return 2
             rows, summary = scan_dir(a.source)
         else:
             def progress(n, pos, end):
@@ -517,8 +541,11 @@ def main():
             # Parse before opening --rigs, so a failed parse leaves an existing file as it was.
             print(f"{a.source}: RBF0 stream: {e}", file=sys.stderr)
             return 2
-        with open(a.rigs, "w", encoding="utf-8") as f:
-            json.dump({"rbf0": rbf0, "skeletons": skeletons}, f, indent=1)
+        try:
+            with open(a.rigs, "w", encoding="utf-8") as f:
+                json.dump({"rbf0": rbf0, "skeletons": skeletons}, f, indent=1)
+        except OSError as e:
+            sys.exit(f"{a.rigs}: cannot write: {e.strerror or e}")
     top = dict(sorted(summary["signatures"].items(), key=lambda kv: -kv[1]["files"])[:15])
     print(json.dumps({k: summary[k] for k in
                       ("files", "compressed_bytes", "inflated_bytes", "zero_padding", "unread_bytes",

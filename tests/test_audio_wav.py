@@ -248,6 +248,19 @@ class AudioWavTest(unittest.TestCase):
         self.assertNotIn("Traceback", p.stderr)
 
 
+class CliArgumentTest(unittest.TestCase):
+    def test_rejects_nonpositive_jobs(self):
+        with tempfile.TemporaryDirectory() as source:
+            for jobs in ("0", "-1"):
+                with self.subTest(jobs=jobs):
+                    result = subprocess.run(
+                        [sys.executable, "-I", TOOL, source, "--jobs", jobs],
+                        capture_output=True, text=True,
+                    )
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertIn("--jobs must be at least 1", result.stderr)
+
+
 class GranuleTest(unittest.TestCase):
     def test_trim_requires_identifiable_matching_endpoints(self):
         # A 240-channel family-255 header occupies two laces. Every output maps to the same mono stream.
@@ -268,6 +281,49 @@ class GranuleTest(unittest.TestCase):
             for name, first, last, expected in cases:
                 with self.subTest(name=name):
                     path.write_bytes(first + last)
+                    self.assertEqual(audio_wav.ogg_output_samples(path), expected)
+
+    def test_walk_rejects_same_serial_chaining_multiplexing_and_trailing_data(self):
+        head = b"OpusHead" + struct.pack("<BBHIhB", 1, 1, 312, 48000, 0, 0)
+        bos = awc_opus.ogg_page(10, 0, 0, [head], 2)
+        tags = awc_opus.ogg_page(10, 1, 0, [b"OpusTags\x00\x00\x00\x00\x00\x00\x00\x00"], 0)
+        mid = awc_opus.ogg_page(10, 2, 1272, [b"\xf8\xff\xfe"], 0)
+        eos = awc_opus.ogg_page(10, 3, 2232, [b"\xf8\xff\xfe"], 4)
+        # Second link reusing the same serial number (valid per RFC 3533 section 4).
+        link2 = (
+            awc_opus.ogg_page(10, 0, 0, [head], 2)
+            + awc_opus.ogg_page(10, 1, 0, [b"OpusTags\x00\x00\x00\x00\x00\x00\x00\x00"], 0)
+            + awc_opus.ogg_page(10, 2, 1272, [b"\xf8\xff\xfe"], 4)
+        )
+        cases = [
+            ("same-serial chained", bos + tags + mid + eos + link2, 0),
+            ("same-serial chained without first EOS", bos + tags + mid + link2, 0),
+            ("trailing garbage after EOS", bos + tags + eos + b"trailing", 0),
+            (
+                "embedded OggS in intermediate payload",
+                bos + tags + awc_opus.ogg_page(10, 2, 1272, [b"xxOggS\x00\x04yy"], 0) + eos,
+                1920,
+            ),
+            (
+                "continuation flags on intermediate and EOS",
+                bos
+                + tags
+                + awc_opus.ogg_page(10, 2, 1272, [b"\xf8\xff\xfe"], 1)
+                + awc_opus.ogg_page(10, 3, 2232, [b"\xf8\xff\xfe"], 5),
+                1920,
+            ),
+            (
+                "multiplexed different serial mid-stream",
+                bos + tags + awc_opus.ogg_page(11, 0, 0, [b"other"], 0) + eos,
+                0,
+            ),
+            ("truncated page at EOF", bos + tags + eos[:-1], 0),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp, "sample.ogg")
+            for name, data, expected in cases:
+                with self.subTest(name=name):
+                    path.write_bytes(data)
                     self.assertEqual(audio_wav.ogg_output_samples(path), expected)
 
 

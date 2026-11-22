@@ -89,6 +89,24 @@ std::string event_label(UINT metadata, const void* data, UINT size) {
     return out;
 }
 
+class CommandSignature final
+    : public Child<CommandSignature, ID3D12CommandSignatureStubs, ID3D12Object, ID3D12DeviceChild, ID3D12Pageable,
+                   ID3D12CommandSignature> {
+public:
+    // {9a4e1c2b-55d8-4f7a-b012-3c8e7a1f6d90}
+    static constexpr GUID kTag{0x9a4e1c2b, 0x55d8, 0x4f7a, {0xb0, 0x12, 0x3c, 0x8e, 0x7a, 0x1f, 0x6d, 0x90}};
+
+    CommandSignature(leonida::IndirectKind kind, UINT byte_stride) : kind_(kind), stride_(byte_stride) {}
+
+    leonida::IndirectKind kind() const { return kind_; }
+    UINT stride() const { return stride_; }
+    static CommandSignature* from(IUnknown* object) { return Child::from<CommandSignature>(object); }
+
+private:
+    leonida::IndirectKind kind_;
+    UINT stride_;
+};
+
 class CommandAllocator final
     : public Child<CommandAllocator, ID3D12CommandAllocatorStubs, ID3D12Object, ID3D12DeviceChild, ID3D12Pageable,
                     ID3D12CommandAllocator> {
@@ -262,10 +280,19 @@ public:
                                                      ID3D12Resource* src, UINT src_subresource, D3D12_RECT* rect,
                                                      DXGI_FORMAT format, D3D12_RESOLVE_MODE mode) override {
         d3d12_trace::record("ID3D12GraphicsCommandList1::ResolveSubresourceRegion");
-        if (type_ != D3D12_COMMAND_LIST_TYPE_DIRECT || mode != D3D12_RESOLVE_MODE_AVERAGE ||
-            !color_resolve_format_matches(format, dst, src))
-            return check(false);
+        if (type_ != D3D12_COMMAND_LIST_TYPE_DIRECT) return check(false);
         leonida::ResolveRegion region{x, y, std::nullopt};
+        if (mode != D3D12_RESOLVE_MODE_AVERAGE || !color_resolve_format_matches(format, dst, src)) {
+            if (!depth_stencil_resolve_supported(format, dst, dst_subresource, x, y, src, src_subresource, rect,
+                                                 mode)) {
+                note_once("ResolveSubresourceRegion refused: neither an average colour resolve nor a depth or "
+                          "stencil one the device can replay");
+                return check(false);
+            }
+            region.mode = mode == D3D12_RESOLVE_MODE_MIN   ? leonida::d3d12_resolve_mode::minimum
+                        : mode == D3D12_RESOLVE_MODE_MAX   ? leonida::d3d12_resolve_mode::maximum
+                                                           : leonida::d3d12_resolve_mode::average;
+        }
         if (rect) region.src_rect = leonida::Rect{rect->left, rect->top, rect->right, rect->bottom};
         check(list_.resolve_subresource({resource_id(dst), dst_subresource, resource_id(src), src_subresource, region}));
     }
@@ -389,6 +416,75 @@ public:
         check(list_.marker(leonida::DebugMarker::Kind::end));
     }
 
+    void STDMETHODCALLTYPE ExecuteIndirect(ID3D12CommandSignature* signature, UINT max_command_count,
+                                           ID3D12Resource* argument_buffer, UINT64 argument_buffer_offset,
+                                           ID3D12Resource* count_buffer, UINT64 count_buffer_offset) override {
+        if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);
+        leonida::IndirectKind kind = leonida::IndirectKind::draw;
+        UINT stride = 0;
+        if (!command_signature_info(signature, kind, stride) || !argument_buffer || !max_command_count)
+            return check(false);
+        leonida::ExecuteIndirect cmd{};
+        cmd.kind = kind;
+        cmd.stride = stride;
+        cmd.max_count = max_command_count;
+        cmd.argument_buffer = resource_id(argument_buffer);
+        cmd.argument_offset = argument_buffer_offset;
+        cmd.count_buffer = count_buffer ? resource_id(count_buffer) : 0;
+        cmd.count_offset = count_buffer ? count_buffer_offset : 0;
+        check(list_.execute_indirect(cmd));
+    }
+
+    void STDMETHODCALLTYPE BuildRaytracingAccelerationStructure(
+        const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC* desc, UINT,
+        const D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC*) override {
+        if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE || !desc) return check(false);
+        const auto& in = desc->Inputs;
+        leonida::BuildAccelerationStructure cmd{};
+        cmd.is_tlas = (in.Type == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL);
+        cmd.update = (in.Flags & D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PERFORM_UPDATE) != 0;
+        if (in.Flags & D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_UPDATE)
+            cmd.build_flags |= VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR;
+        if (in.Flags & D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_COMPACTION)
+            cmd.build_flags |= VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_COMPACTION_BIT_KHR;
+        if (in.Flags & D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE)
+            cmd.build_flags |= VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR;
+        if (in.Flags & D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_BUILD)
+            cmd.build_flags |= VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_BUILD_BIT_KHR;
+        cmd.dst_va = desc->DestAccelerationStructureData;
+        cmd.src_va = desc->SourceAccelerationStructureData;
+        cmd.scratch_va = desc->ScratchAccelerationStructureData;
+        if (cmd.is_tlas) {
+            cmd.instances_va = in.InstanceDescs;
+            cmd.instance_count = in.NumDescs;
+        } else {
+            for (UINT i = 0; i < in.NumDescs; ++i) {
+                const D3D12_RAYTRACING_GEOMETRY_DESC* gd =
+                    (in.DescsLayout == D3D12_ELEMENTS_LAYOUT_ARRAY_OF_POINTERS)
+                        ? (in.ppGeometryDescs ? in.ppGeometryDescs[i] : nullptr)
+                        : (in.pGeometryDescs ? &in.pGeometryDescs[i] : nullptr);
+                if (!gd || gd->Type != D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES) return check(false);
+                leonida::RtTriangleGeometry t{};
+                t.vertex_va = gd->Triangles.VertexBuffer.StartAddress;
+                t.vertex_count = gd->Triangles.VertexCount;
+                t.vertex_stride = static_cast<std::uint32_t>(gd->Triangles.VertexBuffer.StrideInBytes);
+                t.vertex_format = (gd->Triangles.VertexFormat == DXGI_FORMAT_R32G32_FLOAT)
+                                      ? VK_FORMAT_R32G32_SFLOAT
+                                      : VK_FORMAT_R32G32B32_SFLOAT;
+                t.index_va = gd->Triangles.IndexBuffer;
+                t.index_count = gd->Triangles.IndexCount;
+                if (gd->Triangles.IndexFormat == DXGI_FORMAT_R16_UINT)
+                    t.index_type = 1;
+                else if (gd->Triangles.IndexFormat == DXGI_FORMAT_R32_UINT)
+                    t.index_type = 2;
+                t.transform_va = gd->Triangles.Transform3x4;
+                t.opaque = (gd->Flags & D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE) != 0;
+                cmd.triangles.push_back(t);
+            }
+        }
+        check(list_.build_acceleration_structure(cmd));
+    }
+
     static GraphicsCommandList* from(IUnknown* object) { return Child::from<GraphicsCommandList>(object); }
 
 private:
@@ -505,16 +601,9 @@ public:
     static constexpr GUID kTag{0xb4c39e02, 0x6f71, 0x4d8a, {0xb2, 0x5e, 0x3e, 0x9d, 0x0f, 0x6c, 0x1a, 0x88}};
 
     Fence(leonida::VulkanContext& context, UINT64 initial, D3D12_FENCE_FLAGS flags)
-        : fence_(context, initial), flags_(flags), highest_(initial) {}
+        : context_(context), fence_(context, initial), flags_(flags), highest_(initial) {}
 
-    ~Fence() override {
-        {
-            std::lock_guard lock(mutex_);
-            stop_ = true;
-        }
-        changed_.notify_all();
-        if (waiter_.joinable()) waiter_.join();
-    }
+    ~Fence() override { context_.cancel_fence_waits(fence_.semaphore()); }
 
     bool ok() const { return fence_.semaphore() != VK_NULL_HANDLE; }
     VkSemaphore semaphore() const { return fence_.semaphore(); }
@@ -529,7 +618,9 @@ public:
         return false;
     }
 
-    UINT64 STDMETHODCALLTYPE GetCompletedValue() override { return fence_.completed(); }
+    UINT64 STDMETHODCALLTYPE GetCompletedValue() override {
+        return context_.is_device_lost() ? UINT64_MAX : fence_.completed();
+    }
     D3D12_FENCE_FLAGS STDMETHODCALLTYPE GetCreationFlags() override { return flags_; }
 
     HRESULT STDMETHODCALLTYPE Signal(UINT64 value) override {
@@ -539,57 +630,31 @@ public:
 
     // A null event blocks until the value is reached, as D3D12 does.
     HRESULT STDMETHODCALLTYPE SetEventOnCompletion(UINT64 value, HANDLE event) override {
-        if (!event) return fence_.completed() >= value || fence_.wait(value, UINT64_MAX) ? S_OK : E_FAIL;
-        notify(value, std::make_shared<FenceWaiter>(event, 1));
+        if (context_.is_device_lost() || fence_.completed() >= value) {
+            if (event) SetEvent(event);
+            return S_OK;
+        }
+        if (!event) return fence_.wait(value, UINT64_MAX) ? S_OK : E_FAIL;
+        context_.enqueue_fence_wait(fence_.semaphore(), value, event);
         return S_OK;
     }
 
-    // Counts `waiter` down once this fence reaches `value`: now if it has, else from the waiter thread.
+    // Counts `waiter` down once this fence reaches `value`: now if it has, else via the centralized dispatcher.
     void notify(UINT64 value, std::shared_ptr<FenceWaiter> waiter) {
-        if (fence_.completed() >= value) {
+        if (context_.is_device_lost() || fence_.completed() >= value) {
             waiter->hit();
             return;
         }
-        {
-            std::lock_guard lock(mutex_);
-            pending_.emplace_back(value, std::move(waiter));
-            if (!waiter_.joinable()) waiter_ = std::thread([this] { wait_loop(); });
-        }
-        changed_.notify_all();
+        context_.enqueue_fence_callback(fence_.semaphore(), value, [w = std::move(waiter)] { w->hit(); });
     }
 
     static Fence* from(IUnknown* object) { return Child::from<Fence>(object); }
 
 private:
-    void wait_loop() {
-        std::unique_lock lock(mutex_);
-        while (true) {
-            changed_.wait(lock, [this] { return stop_ || !pending_.empty(); });
-            if (stop_) return;
-            UINT64 lowest = UINT64_MAX;
-            for (const auto& entry : pending_) lowest = std::min(lowest, entry.first);
-            lock.unlock();
-            fence_.wait(lowest, 10'000'000);  // 10 ms, so destruction is never held up for long
-            const UINT64 done = fence_.completed();
-            lock.lock();
-            // An ANY wait that another fence already satisfied is dropped without waiting for this one.
-            std::erase_if(pending_, [done](const auto& entry) {
-                if (entry.second->done()) return true;
-                if (entry.first > done) return false;
-                entry.second->hit();
-                return true;
-            });
-        }
-    }
-
+    leonida::VulkanContext& context_;
     leonida::VulkanFence fence_;
     D3D12_FENCE_FLAGS flags_;
     std::atomic<UINT64> highest_;
-    std::mutex mutex_;
-    std::condition_variable changed_;
-    std::vector<std::pair<UINT64, std::shared_ptr<FenceWaiter>>> pending_;
-    std::thread waiter_;
-    bool stop_ = false;
 };
 
 class CommandQueue final
@@ -599,10 +664,16 @@ public:
     // {e1a85d76-0b3f-4c29-a7d4-58f2c6e0b913}
     static constexpr GUID kTag{0xe1a85d76, 0x0b3f, 0x4c29, {0xa7, 0xd4, 0x58, 0xf2, 0xc6, 0xe0, 0xb9, 0x13}};
 
+    static leonida::VulkanQueue::QueueKind queue_kind_for(D3D12_COMMAND_LIST_TYPE type) {
+        if (type == D3D12_COMMAND_LIST_TYPE_COPY) return leonida::VulkanQueue::QueueKind::copy;
+        if (type == D3D12_COMMAND_LIST_TYPE_COMPUTE) return leonida::VulkanQueue::QueueKind::compute;
+        return leonida::VulkanQueue::QueueKind::direct;
+    }
+
     CommandQueue(leonida::VulkanContext& context, VkQueue queue, std::uint32_t family,
                  const D3D12_COMMAND_QUEUE_DESC& desc, const QueueClock& clock)
-        : desc_(desc), context_(context), queue_(context, queue, family), vk_queue_(queue), family_(family),
-          clock_(clock) {}
+        : desc_(desc), context_(context), queue_(context, queue, family, queue_kind_for(desc.Type)),
+          vk_queue_(queue), family_(family), clock_(clock) {}
 
     ~CommandQueue() override {
         if (!stamp_.pool) return;
@@ -616,7 +687,9 @@ public:
 
     D3D12_COMMAND_QUEUE_DESC STDMETHODCALLTYPE GetDesc() override {
         d3d12_trace::record("ID3D12CommandQueue::GetDesc");
-        return desc_;
+        D3D12_COMMAND_QUEUE_DESC desc = desc_;
+        if (!desc.NodeMask) desc.NodeMask = 1;  // node mask 0 reads back as the one node, as on the host
+        return desc;
     }
 
     void STDMETHODCALLTYPE ExecuteCommandLists(UINT count, ID3D12CommandList* const* lists) override {
@@ -865,6 +938,7 @@ HRESULT create_fence(leonida::VulkanContext& context, UINT64 initial_value, D3D1
                      void** out, IUnknown* device) {
     if (!out) return E_POINTER;
     *out = nullptr;
+    context.set_signal_event_fn([](void* h) { SetEvent(static_cast<HANDLE>(h)); });
     auto* object = new Fence(context, initial_value, flags);
     if (!object->ok()) {
         object->Release();
@@ -908,6 +982,23 @@ HRESULT set_event_on_multiple_fence_completion(leonida::VulkanContext& context, 
 bool queue_uses_calibrated_timestamps(ID3D12CommandQueue* queue) {
     const CommandQueue* q = CommandQueue::from(queue);
     return q && q->uses_calibrated_timestamps();
+}
+
+HRESULT create_command_signature(leonida::IndirectKind kind, UINT byte_stride, REFIID riid, void** out,
+                                 IUnknown* device) {
+    if (!out) return E_POINTER;
+    *out = nullptr;
+    auto* sig = new CommandSignature(kind, byte_stride);
+    sig->attach_device(device);
+    return hand_out(sig, riid, out);
+}
+
+bool command_signature_info(ID3D12CommandSignature* signature, leonida::IndirectKind& kind, UINT& byte_stride) {
+    const CommandSignature* s = CommandSignature::from(signature);
+    if (!s) return false;
+    kind = s->kind();
+    byte_stride = s->stride();
+    return true;
 }
 
 leonida::ReplayResult last_execute_result(ID3D12CommandQueue* queue) {

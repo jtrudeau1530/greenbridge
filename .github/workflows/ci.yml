@@ -83,6 +83,16 @@ jobs:
         env:
           RPF9DUMP_DLL: tools/rpf9dump/bin/Release/net8.0/rpf9dump.dll
         run: python -I tests/test_ttpf_export_resume.py
+      - name: Build the calibrated BCPack reader and test the texture pipeline
+        env:
+          RPF9DUMP_DLL: tools/rpf9dump/bin/Release/net8.0/rpf9dump.dll
+        shell: bash
+        run: |
+          python -m pip install -c tests/requirements.txt numpy
+          cargo build --release --locked --manifest-path tools/bcpack_calibration/Cargo.toml
+          python -I -c "import sys; sys.path.insert(0, 'tools'); import calibrated_texture; calibrated_texture.native()"
+          python -I tests/test_calibrated_texture.py
+          python -I tests/test_ttpf_assets.py
       - name: Test rpf9dump diagnostics
         run: dotnet run --project tests/Rpf9DumpDiagnostics/Rpf9DumpDiagnostics.csproj -c Release
   translator-tests:

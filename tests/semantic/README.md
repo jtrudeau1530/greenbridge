@@ -24,10 +24,20 @@ What they check (`tools/rdna2spirv.py`, pixel shaders plus one compute shader):
   as compute too and asserts 16 dwords: 10:10:10:2 words read through formats 50 and 44 (from the V# and from
   tbuffer's own format) and stored in both. `ps_scc_minmax` asserts SCC after `s_min`/`s_max` `_i32`/`_u32`:
   0 on a tie, and 1 on a pair (-1 against 1) that only the right signedness orders that way.
+  `RawBufferTailBounds` runs one-thread compute programs written in the test around one `buffer_load` and
+  asserts the words and the exact addresses loaded for the raw-buffer rule measured on an RX 6800 (per-dword
+  `num_records` check on the exact byte offset); `MeasuredBoundsShaders` runs the four GPU tests of the SMEM and
+  raw MUBUF rules (`cs_smem_bounds`, `cs_smem_stride_align`, `cs_smem_sload_neg`, `cs_buf_tail`).
+- `test_buffer_oob_select.py` runs 33 hand-tabulated MUBUF cases through the translator and the interpreter, loads
+  and stores, each with a literal and a run-time V#: the first-byte bound of every OOB_SELECT mode (the RDNA2 rules of
+  docs/buffer_bounds.md, docs/design.md Buffer bounds checking), and that a literal RAW V# with ADD_TID/INDEX_STRIDE is Unsupported.
+- `test_scalar_mem_smem.py` runs the code `Gen.scalar_load` emits with its own small evaluator (64-bit
+  addresses, forward selection constructs) and asserts the SGPR values and the addresses read, including the
+  measured SMEM truncation, `s_buffer_load` `NUM_RECORDS` bound and signed `s_load` immediate.
 - `test_alu_movrel.py` runs hand-written listings for `v_movrels_b32`, `v_movreld_b32` and `v_movrelsd_b32`
   (10 cases): sentinels in v1..v8, M0 set by `s_mov_b32`, then the indexed register and its neighbours are
   exported, so a write must land only in `VGPR[D.addr + M0]`. A plain-Python register-file model checks the
-  hand-written constants. `v_movrelsd_2_b32` is not handled by the translator yet.
+  hand-written constants. `v_movrelsd_2_b32` is covered by `test_alu_movrelsd_2.py`.
 - `spirv_wave_interp.py` runs every invocation of one subgroup at once through structured control flow
   (split at a selection, rejoin at its merge, loops until no invocation is left) with the subgroup
   operations the translator emits. It is the SPIR-V side of `tools/cf_diff.py` (FUZZ-8);

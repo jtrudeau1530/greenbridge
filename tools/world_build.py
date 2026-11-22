@@ -4,9 +4,18 @@ Consumes rpf9dump model manifests (models/manifest.json + .obj + <stem>_tex/*.dd
 optional TTPF texture manifests (manifest.json + *.dds), groups geometry into spatial
 or grid-laid-out XZ chunks, embeds decoded PNG textures into binary glTF 2.0 (.glb)
 chunks, and writes world.json atomically for viewer/serve.py + viewer/index.html.
+Chunks are built and verified in a staging directory first, so a build that fails or is
+interrupted leaves the previous world.json and the chunks it references as they were.
+
+With --placements, models are instanced at their map placements instead: each entity row written by
+``world_index.py --entities-out`` is matched to an exported model by the joaat of its name (and, when the row
+carries it, the 64-bit Murmur3 archetype key, as in world_names.py), then scaled, rotated by the conjugate of
+the stored quaternion and translated into world space.
 
 Usage:
     python -I tools/world_build.py <assets_dir> --out <world_dir> [options]
+    python -I tools/world_build.py <assets_dir> --out <world_dir> --placements <entities.jsonl>
+        [--lod-levels 0,5] [--region MINX,MINY,MAXX,MAXY]
 """
 from __future__ import annotations
 
@@ -17,13 +26,17 @@ import json
 import math
 import os
 import re
+import shutil
 import statistics
 import sys
+import tempfile
 import threading
 
 _TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
 if _TOOLS_DIR not in sys.path:
     sys.path.insert(0, _TOOLS_DIR)
+
+from file_mode import published_mode  # noqa: E402
 
 try:
     import dds_png
@@ -37,6 +50,147 @@ except ImportError:  # pragma: no cover - sibling module may not be present duri
 
 
 GRID_GAP = 4.0
+# lodLevel values (docs/world.md): 0 HD, 1 LOD, 2 SLOD1, 3 SLOD2, 4 SLOD3, 5 ORPHAN_HD, 6 SLOD4.
+DEFAULT_LOD_LEVELS = (0, 5)
+
+
+def _get_world_names():
+    import world_names  # sibling tool; only needed for --placements
+    return world_names
+
+
+def load_placements(path: str, lod_levels=DEFAULT_LOD_LEVELS, region=None) -> tuple[list[dict], dict]:
+    """Read ``world_index.py --entities-out`` rows. Returns (selected rows, counts).
+
+    A row is kept when its lod_level is in lod_levels and, with region = (minx, miny, maxx, maxy) in RAGE
+    world metres, its position lies inside it. Rows without a finite position, rotation or archetype are
+    counted as malformed and skipped.
+    """
+    levels = set(lod_levels)
+    counts = {"rows": 0, "malformed": 0, "other_lod_level": 0, "outside_region": 0, "selected": 0}
+    rows: list[dict] = []
+    with open(path, encoding="utf-8-sig") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            counts["rows"] += 1
+            try:
+                row = json.loads(line)
+                arch = int(str(row["archetype"]), 16)
+                pos = [float(v) for v in row["position"]]
+                rot = [float(v) for v in row["rotation"]]
+            except (ValueError, KeyError, TypeError):
+                counts["malformed"] += 1
+                continue
+            if len(pos) != 3 or len(rot) != 4 or not all(math.isfinite(v) for v in pos + rot):
+                counts["malformed"] += 1
+                continue
+            if row.get("lod_level") not in levels:
+                counts["other_lod_level"] += 1
+                continue
+            if region is not None and not (region[0] <= pos[0] <= region[2] and region[1] <= pos[1] <= region[3]):
+                counts["outside_region"] += 1
+                continue
+            sxy, sz = row.get("scale_xy"), row.get("scale_z")
+            row["_arch"] = arch & 0xFFFFFFFF
+            row["_pos"], row["_rot"] = pos, rot
+            row["_sxy"] = float(sxy) if isinstance(sxy, (int, float)) and math.isfinite(sxy) else 1.0
+            row["_sz"] = float(sz) if isinstance(sz, (int, float)) and math.isfinite(sz) else 1.0
+            rows.append(row)
+            counts["selected"] += 1
+    return rows, counts
+
+
+def entity_transform(rotation, scale_xy: float, scale_z: float) -> tuple[list[list[float]], list[list[float]], bool]:
+    """3x3 position and normal matrices (RAGE Z-up) for one entity, and whether it mirrors.
+
+    The stored quaternion (x, y, z, w) is the inverse of the entity's world rotation, so the world rotation is
+    its conjugate (-x, -y, -z, w). Positions use R * diag(sxy, sxy, sz); normals use R * diag(1/sxy, 1/sxy, 1/sz).
+    """
+    x, y, z, w = (float(v) for v in rotation)
+    n = math.sqrt(x * x + y * y + z * z + w * w)
+    if n == 0 or not math.isfinite(n):
+        x, y, z, w = 0.0, 0.0, 0.0, 1.0
+    else:
+        x, y, z, w = -x / n, -y / n, -z / n, w / n
+    r = [
+        [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+        [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+        [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+    ]
+    sc = (scale_xy, scale_xy, scale_z)
+    pos_m = [[r[i][j] * sc[j] for j in range(3)] for i in range(3)]
+    inv = tuple((1.0 / v) if v else 0.0 for v in sc)
+    nrm_m = [[r[i][j] * inv[j] for j in range(3)] for i in range(3)]
+    return pos_m, nrm_m, scale_xy * scale_xy * scale_z < 0
+
+
+def place_primitives(prims: list[dict], rotation, scale_xy: float, scale_z: float, position) -> list[dict]:
+    """New primitives for one placed instance: model-space RAGE (Z-up) -> world -> glTF Y-up (x, z, -y).
+
+    ``prims`` must come from ``glb_writer.parse_obj(..., up_axis="y")``, i.e. unconverted RAGE coordinates.
+    """
+    m, nm, mirror = entity_transform(rotation, scale_xy, scale_z)
+    tx, ty, tz = (float(v) for v in position)
+    out = []
+    for p in prims:
+        positions = []
+        for vx, vy, vz in p.get("positions") or ():
+            wx = m[0][0] * vx + m[0][1] * vy + m[0][2] * vz + tx
+            wy = m[1][0] * vx + m[1][1] * vy + m[1][2] * vz + ty
+            wz = m[2][0] * vx + m[2][1] * vy + m[2][2] * vz + tz
+            positions.append((wx, wz, -wy))
+        normals = []
+        for nx, ny, nz in p.get("normals") or ():
+            ax = nm[0][0] * nx + nm[0][1] * ny + nm[0][2] * nz
+            ay = nm[1][0] * nx + nm[1][1] * ny + nm[1][2] * nz
+            az = nm[2][0] * nx + nm[2][1] * ny + nm[2][2] * nz
+            ln = math.sqrt(ax * ax + ay * ay + az * az) or 1.0
+            normals.append((ax / ln, az / ln, -ay / ln))
+        indices = list(p.get("indices") or ())
+        if mirror:
+            for i in range(0, len(indices) - 2, 3):
+                indices[i + 1], indices[i + 2] = indices[i + 2], indices[i + 1]
+        q = dict(p)
+        q.update(positions=positions, normals=normals, indices=indices, uvs=list(p.get("uvs") or ()))
+        out.append(q)
+    return out
+
+
+def model_name_index(entries: list[tuple[str, dict]], world_names) -> dict[int, list[tuple[str, dict, int]]]:
+    """32-bit joaat of each manifest item's model name -> [(models_dir, item, Murmur3-64 of the name)]."""
+    index: dict[int, list[tuple[str, dict, int]]] = {}
+    for models_dir, item in entries:
+        name = item.get("Name")
+        if not isinstance(name, str) or not name.strip():
+            continue
+        stem = name.split(".#", 1)[0].strip()
+        if not stem:
+            continue
+        index.setdefault(world_names.joaat(stem), []).append((models_dir, item, world_names.hash64(stem)))
+    return index
+
+
+def resolve_placement(index, arch: int, key_hex) -> tuple[tuple[str, dict] | None, str]:
+    """Pick the exported model for one entity. Returns (model or None, outcome)."""
+    cands = index.get(arch)
+    if not cands:
+        return None, "unresolved_archetype"
+    key = None
+    if isinstance(key_hex, str):
+        try:
+            key = int(key_hex, 16)
+        except ValueError:
+            key = None
+    if key is not None:
+        good = [c for c in cands if c[2] == key]
+        if not good:
+            return None, "key_mismatch"
+        return (good[0][0], good[0][1]), "placed"
+    return (cands[0][0], cands[0][1]), "placed_unverified"
+
+
 SPAWN_SPAN_CAP = 1200.0
 
 
@@ -525,6 +679,105 @@ def _prune_stale_chunks(chunks_dir: str, keep_filenames: set[str]) -> None:
                 pass
 
 
+# A build stages its chunks in <out>/<prefix><random>/ (the same volume as <out>/chunks, so
+# publishing is a rename) and keeps the chunks it replaces in <staging>/previous/ until
+# world.json is committed.
+CHUNK_STAGING_PREFIX = ".chunks-staging-"
+_STAGING_BACKUP = "previous"
+
+
+def _holds_unrestored_chunks(staging_dir: str) -> bool:
+    backup_dir = os.path.join(staging_dir, _STAGING_BACKUP)
+    try:
+        return os.path.isdir(backup_dir) and bool(os.listdir(backup_dir))
+    except OSError:
+        return True  # cannot tell: keep it rather than risk deleting a recovery copy
+
+
+def _remove_stale_staging(out_dir: str) -> None:
+    """Remove staging directories left behind by builds that were killed.
+
+    A staging directory whose previous/ still holds chunks is a recovery copy from a publish
+    that could not be rolled back; it is kept until someone restores or deletes it.
+    """
+    try:
+        entries = os.listdir(out_dir)
+    except OSError:
+        return
+    for name in entries:
+        path = os.path.join(out_dir, name)
+        if (
+            name.startswith(CHUNK_STAGING_PREFIX)
+            and os.path.isdir(path)
+            and not os.path.islink(path)
+            and not _holds_unrestored_chunks(path)
+        ):
+            shutil.rmtree(path, ignore_errors=True)
+
+
+def _verify_staged_chunk(path: str, expected_size: int, glb_mod) -> None:
+    """Raise GlbError unless the staged file is the complete GLB that write_glb reported."""
+    with open(path, "rb") as f:
+        data = f.read()
+    if len(data) != expected_size:
+        raise glb_mod.GlbError(f"staged chunk {path} is {len(data)} bytes, expected {expected_size}")
+    glb_mod.read_glb_summary(data)
+
+
+def _publish_world(
+    staging_dir: str,
+    chunks_dir: str,
+    chunk_names: list[str],
+    world_path: str,
+    world_doc: dict,
+    glb_mod,
+) -> None:
+    """Move the verified staged chunks into chunks_dir, then commit world.json.
+
+    Every live chunk that gets replaced is first moved into <staging>/previous/. If a move or
+    the world.json write fails, the new chunks are taken out again and the previous ones put
+    back, so the old world.json keeps matching its chunks. A previous chunk that cannot be put
+    back stays in <staging>/previous/ and is named in the raised error.
+    """
+    backup_dir = os.path.join(staging_dir, _STAGING_BACKUP)
+    os.makedirs(backup_dir, exist_ok=True)
+    os.makedirs(chunks_dir, exist_ok=True)
+    backed_up: list[str] = []
+    placed: list[str] = []
+    try:
+        for name in chunk_names:
+            live = os.path.join(chunks_dir, name)
+            staged = os.path.join(staging_dir, name)
+            os.chmod(staged, published_mode(live))
+            if os.path.lexists(live):
+                glb_mod._replace(live, os.path.join(backup_dir, name))
+                backed_up.append(name)
+            glb_mod._replace(staged, live)
+            placed.append(name)
+        _write_json_atomic(world_path, world_doc)
+    except BaseException as exc:
+        unrestored = []
+        restore = set(backed_up)
+        for name in reversed(placed):
+            if name not in restore:
+                try:
+                    os.remove(os.path.join(chunks_dir, name))
+                except OSError:
+                    pass
+        for name in reversed(backed_up):
+            try:
+                glb_mod._replace(os.path.join(backup_dir, name), os.path.join(chunks_dir, name))
+            except OSError:
+                unrestored.append(name)
+        if unrestored:
+            raise OSError(
+                f"publishing chunks failed ({exc!r}) and {len(unrestored)} previous chunk(s) could not be "
+                f"put back; they are in {backup_dir} (kept by later builds until restored or deleted): "
+                f"{', '.join(sorted(unrestored))}"
+            ) from exc
+        raise
+
+
 def build_world(
     assets_dir: str,
     out_dir: str,
@@ -537,13 +790,27 @@ def build_world(
     limit: int | None = None,
     jobs: int = 1,
     base_color_param: str | None = None,
+    placements: str | None = None,
+    lod_levels=DEFAULT_LOD_LEVELS,
+    region=None,
 ) -> dict:
     """Build world.json and chunk .glb files from rpf9dump asset exports.
+
+    With ``placements`` (a ``world_index.py --entities-out`` file), every selected entity whose archetype
+    resolves to an exported model becomes one placed instance; models are not placed at their own coordinates.
+    world.json's stats then carry a ``placements`` block with the counts of each outcome.
 
     Unless limit=0 explicitly requests an empty world, raise ValueError before changing
     the output if no readable model manifests or no usable selected models are found.
     Individual unusable models are still skipped when other selected models can load.
-    This input check does not provide rollback for failures during output writing.
+
+    Chunks are written to a staging directory inside out_dir and verified before any live
+    chunk is replaced. If writing, verifying or publishing fails, or the build is interrupted,
+    the staging directory is removed and the previous world.json and chunks stay as they were.
+    Publishing renames one chunk at a time and then replaces world.json, so a reader during
+    those renames can see old and new chunks mixed, and a hard kill there leaves them mixed
+    under the old world.json. A staging directory whose previous/ still holds chunks is kept
+    by later builds as a recovery copy; other leftover staging is removed by the next build.
     """
     if chunk_size <= 0 or not math.isfinite(chunk_size):
         raise ValueError(f"chunk_size must be positive, got {chunk_size!r}")
@@ -555,6 +822,15 @@ def build_world(
         raise ValueError(f"max_tex_size must be non-negative, got {max_tex_size!r}")
     if base_color_param is not None:
         base_color_param = _parse_param_hash(base_color_param)
+    if placements is not None:
+        if grid_layout:
+            raise ValueError("--placements and --grid-layout cannot be combined")
+        if up_axis != "z":
+            raise ValueError("--placements needs the rpf9dump OBJ axes (--up z)")
+        if not os.path.isfile(placements):
+            raise FileNotFoundError(f"placements file does not exist: {placements}")
+        if region is not None and (len(region) != 4 or not (region[0] < region[2] and region[1] < region[3])):
+            raise ValueError(f"region must be MINX,MINY,MAXX,MAXY with min < max, got {region!r}")
     workers = max(1, int(jobs))
 
     if not os.path.exists(assets_dir):
@@ -584,23 +860,22 @@ def build_world(
 
     ttpf_index = index_ttpf_textures(assets_dir) if textures else {}
 
-    loaded_models: list[dict] = []
-    for models_dir, item in entries:
+    def load_model(models_dir: str, item: dict, axis: str) -> dict | None:
         rel_file = item.get("File")
         if not isinstance(rel_file, str) or not rel_file.strip():
-            continue
+            return None
         obj_path = os.path.join(models_dir, rel_file)
         if not os.path.isfile(obj_path):
-            continue
+            return None
         try:
-            prims = glb_mod.parse_obj(obj_path, is_path=True, up_axis=up_axis)
+            prims = glb_mod.parse_obj(obj_path, is_path=True, up_axis=axis)
         except (OSError, glb_mod.GlbError, ValueError):
-            continue
+            return None
         if not prims:
-            continue
+            return None
         bounds = glb_mod.compute_bounds(prims)
         if bounds is None or len(bounds) != 6 or not all(math.isfinite(v) for v in bounds):
-            continue
+            return None
 
         tex_map = (
             resolve_model_textures(models_dir, item, ttpf_index, base_color_param)
@@ -631,12 +906,49 @@ def build_world(
             else:
                 p["material"] = ""
 
-        loaded_models.append({
-            "prims": prims,
-            "bounds": bounds,
-            "mat_to_dds": mat_to_dds,
-        })
+        return {"prims": prims, "bounds": bounds, "mat_to_dds": mat_to_dds}
 
+    loaded_models: list[dict] = []
+    placement_stats: dict | None = None
+    if placements is None:
+        for models_dir, item in entries:
+            model = load_model(models_dir, item, up_axis)
+            if model is not None:
+                loaded_models.append(model)
+    else:
+        rows, placement_stats = load_placements(placements, lod_levels, region)
+        index = model_name_index(entries, _get_world_names())
+        cache: dict[tuple[str, str], dict | None] = {}
+        used: set[tuple[str, str]] = set()
+        for outcome in ("placed", "placed_unverified", "unresolved_archetype", "key_mismatch", "model_not_loadable"):
+            placement_stats[outcome] = 0
+        for row in rows:
+            found, outcome = resolve_placement(index, row["_arch"], row.get("key"))
+            if found is None:
+                placement_stats[outcome] += 1
+                continue
+            models_dir, item = found
+            ck = (models_dir, str(item.get("File")))
+            if ck not in cache:
+                cache[ck] = load_model(models_dir, item, "y")   # RAGE axes; converted after the transform
+            model = cache[ck]
+            if model is None:
+                placement_stats["model_not_loadable"] += 1
+                continue
+            prims = place_primitives(model["prims"], row["_rot"], row["_sxy"], row["_sz"], row["_pos"])
+            bounds = glb_mod.compute_bounds(prims)
+            if bounds is None or len(bounds) != 6 or not all(math.isfinite(v) for v in bounds):
+                placement_stats["model_not_loadable"] += 1
+                continue
+            loaded_models.append({"prims": prims, "bounds": bounds, "mat_to_dds": model["mat_to_dds"]})
+            placement_stats[outcome] += 1
+            used.add(ck)
+        placement_stats["distinct_models"] = len(used)
+
+    if not loaded_models and limit != 0 and placements is not None:
+        raise ValueError(
+            f"No entity in {placements} could be placed ({placement_stats}); output left unchanged"
+        )
     if not loaded_models and limit != 0:
         raise ValueError(
             f"No usable models in {assets_dir} ({len(entries)} selected manifest items); "
@@ -656,8 +968,48 @@ def build_world(
 
     abs_out = os.path.abspath(out_dir)
     chunks_dir = os.path.join(abs_out, "chunks")
-    os.makedirs(chunks_dir, exist_ok=True)
+    created_dirs = [d for d in (abs_out, chunks_dir) if not os.path.isdir(d)]
+    os.makedirs(abs_out, exist_ok=True)
+    _remove_stale_staging(abs_out)
+    staging_dir = tempfile.mkdtemp(prefix=CHUNK_STAGING_PREFIX, dir=abs_out)
+    try:
+        world_doc = _build_staged_world(
+            staging_dir, chunks_dir, os.path.join(abs_out, "world.json"), cells, loaded_models,
+            glb_mod=glb_mod, dds_mod=dds_mod, textures=textures, max_tex_size=max_tex_size,
+            workers=workers, chunk_size=chunk_size, grid_layout=grid_layout,
+            placement_stats=placement_stats,
+        )
+    except BaseException:
+        if not _holds_unrestored_chunks(staging_dir):
+            shutil.rmtree(staging_dir, ignore_errors=True)
+        for d in reversed(created_dirs):
+            try:
+                os.rmdir(d)  # only if this build created it and left it empty
+            except OSError:
+                pass
+        raise
+    shutil.rmtree(staging_dir, ignore_errors=True)
+    _prune_stale_chunks(chunks_dir, {f"{c['id']}.glb" for c in world_doc["chunks"]})
+    return world_doc
 
+
+def _build_staged_world(
+    staging_dir: str,
+    chunks_dir: str,
+    world_path: str,
+    cells: dict[tuple[int, int], list[dict]],
+    loaded_models: list[dict],
+    *,
+    glb_mod,
+    dds_mod,
+    textures: bool,
+    max_tex_size: int,
+    workers: int,
+    chunk_size: float,
+    grid_layout: bool,
+    placement_stats: dict | None = None,
+) -> dict:
+    """Write every chunk into staging_dir, verify them all, then publish them with world.json."""
     # Thread-safe single-flight PNG decode cache keyed by normalized DDS path.
     tex_lock = threading.Lock()
     tex_cache: dict[str, bytes | None] = {}
@@ -693,7 +1045,7 @@ def build_world(
             ev.set()
         return png_bytes
 
-    def build_cell(cell_key: tuple[int, int], cell_models: list[dict]) -> tuple[dict, int, int]:
+    def build_cell(cell_key: tuple[int, int], cell_models: list[dict]) -> tuple[dict, int, int, int]:
         ix, iz = cell_key
         cell_prims: list[dict] = []
         cell_dds: dict[str, str] = {}
@@ -726,7 +1078,7 @@ def build_world(
                     p["material"] = ""
 
         chunk_id = f"c_{ix}_{iz}"
-        glb_path = os.path.join(chunks_dir, f"{chunk_id}.glb")
+        glb_path = os.path.join(staging_dir, f"{chunk_id}.glb")
         info = glb_mod.write_glb(glb_path, cell_prims, materials=materials if materials else None)
         chunk_rec = {
             "id": chunk_id,
@@ -735,7 +1087,7 @@ def build_world(
             "models": len(cell_models),
             "triangles": info["triangles"],
         }
-        return chunk_rec, int(info.get("textures", 0)), cell_skipped
+        return chunk_rec, int(info.get("textures", 0)), cell_skipped, int(info["bytes"])
 
     sorted_cells = sorted(cells.items(), key=lambda kv: kv[0])
     chunks: list[dict] = []
@@ -748,9 +1100,17 @@ def build_world(
     else:
         with ThreadPoolExecutor(max_workers=workers) as pool:
             futures = [pool.submit(build_cell, k, ms) for k, ms in sorted_cells]
-            cell_results = [f.result() for f in futures]
+            try:
+                cell_results = [f.result() for f in futures]
+            except BaseException:
+                for f in futures:
+                    f.cancel()  # stop cells that have not started; running ones finish before cleanup
+                raise
 
-    for chunk_rec, embedded_count, skipped_count in cell_results:
+    for chunk_rec, _, _, size in cell_results:
+        _verify_staged_chunk(os.path.join(staging_dir, f"{chunk_rec['id']}.glb"), size, glb_mod)
+
+    for chunk_rec, embedded_count, skipped_count, _ in cell_results:
         chunks.append(chunk_rec)
         total_triangles += int(chunk_rec["triangles"])
         textures_embedded += embedded_count
@@ -760,7 +1120,7 @@ def build_world(
     world_doc = {
         "spawn": spawn,
         "chunk_size": float(chunk_size),
-        "layout": "grid" if grid_layout else "spatial",
+        "layout": "grid" if grid_layout else ("placements" if placement_stats is not None else "spatial"),
         "chunks": chunks,
         "stats": {
             "models": len(loaded_models),
@@ -770,9 +1130,10 @@ def build_world(
             "textures_skipped": textures_skipped,
         },
     }
+    if placement_stats is not None:
+        world_doc["stats"]["placements"] = dict(placement_stats)
 
-    _write_json_atomic(os.path.join(abs_out, "world.json"), world_doc)
-    _prune_stale_chunks(chunks_dir, {f"{c['id']}.glb" for c in chunks})
+    _publish_world(staging_dir, chunks_dir, [f"{c['id']}.glb" for c in chunks], world_path, world_doc, glb_mod)
     return world_doc
 
 
@@ -811,6 +1172,26 @@ def _param_hash(text: str) -> str:
         return _parse_param_hash(text)
     except ValueError:
         raise argparse.ArgumentTypeError(f"invalid 32-bit hex value: {text!r}") from None
+
+
+def _lod_levels(text: str) -> tuple[int, ...]:
+    try:
+        levels = tuple(int(v, 0) for v in text.split(",") if v.strip())
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not a comma-separated list of lodLevel numbers: {text!r}") from None
+    if not levels or any(v < 0 or v > 255 for v in levels):
+        raise argparse.ArgumentTypeError(f"lodLevel values must be 0..255, got {text!r}")
+    return levels
+
+
+def _region(text: str) -> tuple[float, float, float, float]:
+    try:
+        vals = tuple(float(v) for v in text.split(","))
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"region must be MINX,MINY,MAXX,MAXY, got {text!r}") from None
+    if len(vals) != 4 or not all(math.isfinite(v) for v in vals) or not (vals[0] < vals[2] and vals[1] < vals[3]):
+        raise argparse.ArgumentTypeError(f"region must be MINX,MINY,MAXX,MAXY with min < max, got {text!r}")
+    return vals
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -880,6 +1261,27 @@ def main(argv: list[str] | None = None) -> int:
         "(e.g. C8E8C282 for character materials); materials without a resolvable match stay clay. "
         "Default: first resolvable reference.",
     )
+    ap.add_argument(
+        "--placements",
+        default=None,
+        metavar="ENTITIES",
+        help="Instance models at their map placements from a world_index.py --entities-out file "
+        "instead of at their own coordinates.",
+    )
+    ap.add_argument(
+        "--lod-levels",
+        type=_lod_levels,
+        default=DEFAULT_LOD_LEVELS,
+        metavar="N,N",
+        help="With --placements: entity lodLevel values to place (default: 0,5 = HD and ORPHAN_HD).",
+    )
+    ap.add_argument(
+        "--region",
+        type=_region,
+        default=None,
+        metavar="MINX,MINY,MAXX,MAXY",
+        help="With --placements: only entities whose RAGE world X/Y position lies in this box (metres).",
+    )
     args = ap.parse_args(argv)
 
     try:
@@ -894,6 +1296,9 @@ def main(argv: list[str] | None = None) -> int:
             limit=args.limit,
             jobs=args.jobs,
             base_color_param=args.base_color_param,
+            placements=args.placements,
+            lod_levels=args.lod_levels,
+            region=args.region,
         )
     except (FileNotFoundError, ValueError, OSError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
@@ -905,6 +1310,9 @@ def main(argv: list[str] | None = None) -> int:
         f"({st['textures_skipped']} skipped) -> {os.path.abspath(args.out)}",
         flush=True,
     )
+    if "placements" in st:
+        pl = st["placements"]
+        print("placements: " + ", ".join(f"{k} {pl[k]}" for k in sorted(pl)), flush=True)
     return 0
 
 

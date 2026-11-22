@@ -527,9 +527,10 @@ class MemFamily(Family):
         # raw V#: base SCR_BASE, stride 0, num_records = raw_slots * SLOT bytes; word 3 as the push-constant V#
         out += [f"s_mov_b32 s{VRAW}, {SCR_BASE:#x}", f"s_mov_b32 s{VRAW + 1}, 0",
                 f"s_mov_b32 s{VRAW + 2}, {self.raw_slots * SLOT:#x}", f"s_mov_b32 s{VRAW + 3}, s3",
-                # structured V#: same base, stride SLOT (dword1[29:16]), num_records = idx_slots elements
+                # structured V#: same base, stride SLOT (dword1[29:16]), num_records = idx_slots elements, OOB_SELECT 1 (index check);
+                # the raw one keeps the push-constant V#'s OOB_SELECT 3
                 f"s_mov_b32 s{VIDX}, {SCR_BASE:#x}", f"s_mov_b32 s{VIDX + 1}, {SLOT << 16:#x}",
-                f"s_mov_b32 s{VIDX + 2}, {self.idx_slots:#x}", f"s_mov_b32 s{VIDX + 3}, s3",
+                f"s_mov_b32 s{VIDX + 2}, {self.idx_slots:#x}", f"s_mov_b32 s{VIDX + 3}, 0x11016fac",
                 f"s_mov_b32 s52, {self.soff:#x}",
                 f"v_mul_u32_u24_e32 v{ADDR}, {SLOT}, v0"]          # raw: byte offset of the thread's slot
         for op in self.ops:

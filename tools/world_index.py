@@ -12,10 +12,14 @@ It does not decrypt the archive table and does not extract models or textures.
 Usage:
     python -I world_index.py <archive.rpf|folder> [--out FILE] [--csv FILE]
                              [--start N] [--limit BYTES] [--max-inflate BYTES]
-                             [--archetypes-out FILE]
+                             [--archetypes-out FILE] [--entities-out FILE]
 
 ``--archetypes-out`` also writes the aggregate archetype file that ``world_names.py resolve --archetypes``
 reads: entity count per ``archetypeName`` hash and the entity's 64-bit archetype key. Counts and hashes only.
+
+``--entities-out`` writes one JSON line per complete ``CEntityDef`` (archetype hash and 64-bit key, position,
+stored rotation, scales and LOD fields), the placement input of ``world_build.py --placements``. The rows are
+derived from your own copy of the game: keep the file in your local work folder.
 
 For a 76 GB archive, bound the run with --start/--limit. Coverage and the scanned window are written to the
 JSON summary.
@@ -142,8 +146,10 @@ def _r4(values):
 def parse_resource(b, collect=None):
     """Return a row dict for a 0x7a resource, or None if the header/schema does not validate.
 
-    When ``collect`` is a list, one dict per CEntityDef is appended to it (local analysis only; the CLI does
-    not use this, so the JSON stays an aggregate index).
+    When ``collect`` is given (a list, or an object with ``append`` such as ``ArchetypeCounts``), one dict per
+    CEntityDef is appended to it. ``complete`` is False for an entity whose record is not entirely inside ``b``,
+    including every entity of a block whose start lies past the end of ``b``. The CLI uses it only for
+    ``--archetypes-out``, which writes aggregate counts.
     """
     if len(b) < 0x50 or b[0x10:0x14] != SIGNATURE or b[0x14] != VERSION:
         return None
@@ -198,7 +204,13 @@ def parse_resource(b, collect=None):
     positions = []
     lod_dists = []
     for name, size, off in blocks:
-        if name != ENTITY or off is None or entity_size == 0 or size % entity_size:
+        if name != ENTITY or entity_size == 0 or size % entity_size:
+            continue
+        if off is None:
+            # The block starts past the bytes read (e.g. beyond --max-inflate): report its entities as incomplete.
+            if collect is not None:
+                for _ in range(size // entity_size):
+                    collect.append({"complete": False, "archetype": None})
             continue
         for k in range(size // entity_size):
             o = off + k * entity_size
@@ -282,16 +294,16 @@ def _needs_continuation(b):
     return False
 
 
-def _inflate_stream(m, s, size, max_inflate, keep=False):
-    """Inflate one zlib stream. Returns (data, used, eof, is_meta); data is kept for 0x7a or keep=True."""
+def _inflate_stream(m, s, end, max_inflate, keep=False):
+    """Inflate one zlib stream within m[s:end]. Returns (data, used, eof, is_meta); data is kept for 0x7a or keep=True."""
     d = zlib.decompressobj()
     chunks = []
     kept = 0
     head = bytearray()
     is_meta = False
     p = s
-    while not d.eof and p < size:
-        piece = m[p:p + CHUNK]
+    while not d.eof and p < end:
+        piece = m[p:min(p + CHUNK, end)]
         if not piece:
             break
         produced = d.decompress(piece)
@@ -332,7 +344,7 @@ def scan_rpf(path, start=None, limit=None, max_inflate=CAP, collect=None):
                 pos = s + 1
                 continue
             try:
-                data, used, eof, is_meta = _inflate_stream(m, s, size, max_inflate)
+                data, used, eof, is_meta = _inflate_stream(m, s, end, max_inflate)
             except zlib.error:
                 pos = s + 1
                 continue
@@ -340,26 +352,28 @@ def scan_rpf(path, start=None, limit=None, max_inflate=CAP, collect=None):
                 pos = s + 1
                 continue
             consumed = 1
+            tail = s + used  # end of the last joined stream; `used` leaves out the padding between streams
             if is_meta:
                 # Large resources put the system page in one stream and a small continuation in the next.
                 # Append contiguous zlib streams until the resource's own schema resolves.
                 for _ in range(2):
                     if parse_resource(data) is not None and not _needs_continuation(data):
                         break
-                    nxt = (s + used + 15) & ~15
-                    if nxt >= size:
+                    nxt = (tail + 15) & ~15
+                    if nxt >= end:
                         break
-                    mt = ZHDR.match(m, nxt, size)
+                    mt = ZHDR.match(m, nxt, end)
                     if not mt:
                         break
                     try:
-                        more, mused, meof, _ = _inflate_stream(m, nxt, size, max_inflate, keep=True)
+                        more, mused, meof, _ = _inflate_stream(m, nxt, end, max_inflate, keep=True)
                     except zlib.error:
                         break
                     if not meof or not more:
                         break
                     data += more
                     used += mused
+                    tail = nxt + mused
                     consumed += 1
                 row = parse_resource(data, collect)
                 if row is not None:
@@ -368,7 +382,7 @@ def scan_rpf(path, start=None, limit=None, max_inflate=CAP, collect=None):
                     rows.append(row)
             streams += consumed
             scanned += used
-            pos = s + used
+            pos = tail
             if pos <= s:
                 pos = s + 1
         return rows, {"path": os.path.abspath(path), "bytes": size,
@@ -450,11 +464,46 @@ class ArchetypeCounts:
                             "incomplete_entities": self.incomplete}}
 
 
+class EntityRows:
+    """A ``parse_resource`` collector that writes one JSON line per complete entity (``--entities-out``)."""
+
+    FIELDS = ("position", "rotation", "scale_xy", "scale_z", "lod_level", "parent_index", "num_children",
+              "lod_dist", "child_lod_dist")
+
+    def __init__(self, handle):
+        self.handle = handle
+        self.written = 0
+        self.incomplete = 0
+
+    def append(self, entity):
+        if not entity.get("complete", True) or entity.get("archetype") is None:
+            self.incomplete += 1
+            return
+        row = {"archetype": f"{entity['archetype']:08x}"}
+        if entity.get("archetype_key"):
+            row["key"] = f"{entity['archetype_key']:016x}"
+        for k in self.FIELDS:
+            row[k] = entity.get(k)
+        self.handle.write(json.dumps(row, separators=(",", ":")) + "\n")
+        self.written += 1
+
+
+class _Both:
+    """Feed one entity stream to two collectors."""
+
+    def __init__(self, *sinks):
+        self.sinks = [x for x in sinks if x is not None]
+
+    def append(self, entity):
+        for x in self.sinks:
+            x.append(entity)
+
+
 def _count(minimum):
-    """An argparse type for a whole number of at least `minimum`."""
+    """An argparse type for a whole number (decimal or 0x hex) of at least `minimum`."""
     def parse(text):
         try:
-            value = int(text)
+            value = int(text, 0)
         except ValueError:
             raise argparse.ArgumentTypeError(f"not a whole number: {text!r}") from None
         if value < minimum:
@@ -471,17 +520,31 @@ def main(argv=None):
     ap.add_argument("--csv", help="optional CSV output")
     ap.add_argument("--start", type=_count(0), help="first byte of an RPF9 data-area window")
     ap.add_argument("--limit", type=_count(1), help="window size in bytes (default: to end of archive)")
-    ap.add_argument("--max-inflate", type=int, default=CAP,
+    ap.add_argument("--max-inflate", type=_count(1), default=CAP,
                     help="stop keeping bytes above this per resource, default 64 MiB")
     ap.add_argument("--archetypes-out",
                     help="also write entity counts and 64-bit keys per archetype hash (world_names resolve input)")
+    ap.add_argument("--entities-out",
+                    help="also write one JSON line per complete entity (world_build --placements input; local only)")
     a = ap.parse_args(argv)
     agg = ArchetypeCounts() if a.archetypes_out else None
+    ent_handle = ent = None
+    if a.entities_out:
+        os.makedirs(os.path.dirname(os.path.abspath(a.entities_out)), exist_ok=True)
+        ent_handle = open(a.entities_out, "w", encoding="utf-8", newline="\n")
+        ent = EntityRows(ent_handle)
     try:
-        rows, stats = scan_path(a.path, a.start, a.limit, a.max_inflate, agg)
-    except ValueError as e:                 # a --start outside an archive's data area; nothing is written
+        sink = _Both(agg, ent) if agg is not None and ent is not None else (agg if agg is not None else ent)
+        rows, stats = scan_path(a.path, a.start, a.limit, a.max_inflate, sink)
+    except (OSError, ValueError) as e:      # a missing path or --start outside an archive's data area
         print(f"ERROR: {e}", file=sys.stderr)
+        if ent_handle is not None:
+            ent_handle.close()
+            os.remove(a.entities_out)       # no partial placement file
         return 2
+    finally:
+        if ent_handle is not None:
+            ent_handle.close()
     summary = dict(stats)
     summary["resources"] = len(rows)
     summary["maps"] = sum(1 for r in rows if r["kind"] == "map")
@@ -514,6 +577,8 @@ def main(argv=None):
         with open(a.archetypes_out, "w", encoding="utf-8") as f:
             json.dump(agg.to_json(), f, indent=1, sort_keys=True)
         summary["archetype_file"] = agg.to_json()["summary"]
+    if ent is not None:
+        summary["entity_rows"] = {"written": ent.written, "incomplete": ent.incomplete}
     print(json.dumps(summary, indent=1))
     return 0
 

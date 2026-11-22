@@ -221,7 +221,7 @@ def scan_rpf(path, start=None, limit=None, max_inflate=MAX_INFLATE):
                     last = pos = s + blen
                     continue
                 d = zlib.decompressobj()
-                p, total, head = s, 0, b""
+                p, total, head, psin = s, 0, b"", bytearray()
                 too_big = False
                 try:
                     while not d.eof and p < end:   # inside the --limit window, as in story_index (#712)
@@ -239,6 +239,8 @@ def scan_rpf(path, start=None, limit=None, max_inflate=MAX_INFLATE):
                                     break
                                 if len(head) < 256:
                                     head += chunk[:256 - len(head)]
+                                if len(head) < 4 or head[:4] == b"PSIN":   # classify walks the whole PSIN chain
+                                    psin += chunk
                             if not block:
                                 break
                         if too_big:
@@ -254,7 +256,7 @@ def scan_rpf(path, start=None, limit=None, max_inflate=MAX_INFLATE):
                 z, u = _gap(m[last:s])
                 zero += z
                 unread += u
-                row = classify(head, s, used)
+                row = classify(bytes(psin) if head[:4] == b"PSIN" else head, s, used)
                 row["size"] = total
                 rows.append(row)
                 last = pos = s + used
@@ -370,6 +372,14 @@ def main():
     folder = os.path.dirname(os.path.abspath(args.out))
     if not os.path.isdir(folder):
         ap.error(f"{folder} is not a folder, so {args.out} cannot be written")
+    try:
+        overwrites_source = os.path.samefile(args.source, args.out)
+    except FileNotFoundError:
+        overwrites_source = False
+    except OSError as e:
+        ap.error(f"cannot compare source and output paths: {e}")
+    if overwrites_source:
+        ap.error("output must not overwrite the source archive")
     try:
         if os.path.isdir(args.source):
             rows, summary = scan_dir(args.source, args.max_inflate)

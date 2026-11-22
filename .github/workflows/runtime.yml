@@ -92,11 +92,19 @@ jobs:
           -DCMAKE_MSVC_DEBUG_INFORMATION_FORMAT=Embedded
       - name: Build
         run: cmake --build runtime/build
-      - name: Verify the descriptor test shader
+      - name: Verify the descriptor test shaders
         shell: pwsh
         run: |
-          if (!(Test-Path -LiteralPath runtime/build/generated/cs_sample.spv -PathType Leaf)) {
-            throw 'The Windows runtime build did not compile the descriptor test shader'
+          $shaders = @(
+            'LEONIDA_TEST_CS_SAMPLE_SPV', 'LEONIDA_TEST_MS_FLOAT_SPV',
+            'LEONIDA_TEST_MS_UINT_SPV', 'LEONIDA_TEST_MS_SINT_SPV',
+            'LEONIDA_TEST_MSAA_VERT_SPV', 'LEONIDA_TEST_MSAA_FRAG_SPV'
+          )
+          foreach ($shader in $shaders) {
+            $path = "runtime/build/generated/$shader.spv"
+            if (!(Test-Path -LiteralPath $path -PathType Leaf)) {
+              throw "The Windows runtime build did not compile $path"
+            }
           }
       # For the wine job: the test list, the checkout it was made in, and the built executables and DLLs. Only what
       # this repository builds goes in; there is no game data on the runner.
@@ -121,8 +129,7 @@ jobs:
 
   # Runs the Windows build's tests under Wine, so a change that breaks the loader on Linux (through Wine or Proton)
   # shows up. The required ones are the loader and the stand-in game run end to end; the table in the job summary
-  # shows the rest. run_tiny_game_exit_code isn't required: under Wine the process now and then exits 0 although
-  # gta6rt calls ExitProcess(1) (#634, finding).
+  # shows the rest.
   # Two Wines: Ubuntu's own (9.0) and WineHQ's current stable, which is closer to what Proton users run.
   wine:
     needs: windows
@@ -178,7 +185,7 @@ jobs:
           --windows-root "$(cat runtime/build/windows-root.txt)"
           --summary "$GITHUB_STEP_SUMMARY" --label "$(wine --version)"
           --require loader --require pe_loader --require loader_tls --require unimplemented_policy
-          --require run_tiny_game
+          --require run_tiny_game --require run_tiny_game_exit_code
 
   # Also runs the hand-written GPU tests (runtime/test/shaders) on Mesa's llvmpipe, a software Vulkan driver, so a
   # translator or harness change that breaks a test result shows up on every pull request, without a GPU.
@@ -243,9 +250,18 @@ jobs:
           check
           grep -Fx 'ps pipelines: 1 ok, 0 failed, 0 skipped' "$dir/check.log"
           grep -Fx 'vs pipelines: 1 ok, 0 failed, 0 skipped' "$dir/check.log"
+          if grep -F 'cache feedback' "$dir/check.log"; then exit 1; fi  # opt-in: nothing without the flag
 
           check --max-bytes 1
           grep -F 'big modules skipped: 2' "$dir/check.log"
+
+          # --cache-feedback: hits + no hit reported + unavailable == ok per stage; no particular bit is required
+          check --cache-feedback
+          for st in ps vs; do
+            awk -v st="$st" '$1 == st && $2 == "pipelines:" { ok = $3 }
+              $1 == st && $2 == "cache" && $3 == "feedback:" { sum = $4 + $6 + $10; seen = 1 }
+              END { exit !(seen && ok == 1 && sum == ok) }' "$dir/check.log"
+          done
       - name: GPU tests on llvmpipe, compute with wave64 emulation
         # llvmpipe has 8-wide subgroups, so the wave64 compute tests only run emulated. The emulated mesh tests are
         # left out: llvmpipe's LLVM backend aborts compiling them ("Cannot emit physreg copy instruction").
