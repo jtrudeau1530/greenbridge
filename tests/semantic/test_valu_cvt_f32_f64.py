@@ -1,0 +1,416 @@
+"""Semantic interpreter tests and reference mathematical oracle for RDNA2 v_cvt_f32_f64 and v_cvt_f64_f32.
+
+Models IEEE 754-2008 / IEEE 754-2019 binary32 <-> binary64 floating-point conversions and AMD RDNA2 / GFX10
+Vector Arithmetic Logic Unit (VALU) architectural semantics:
+  - v_cvt_f32_f64: D.f = (float)S0.d   (double-precision binary64 to single-precision binary32)
+  - v_cvt_f64_f32: D.d = (double)S0.f  (single-precision binary32 to double-precision binary64)
+
+RDNA2 Floating-Point Conversion ISA Rules:
+  1. Register Widths and Alignment:
+     - v_cvt_f32_f64: Destination is a single 32-bit VGPR (v[d]). Source is an aligned 64-bit pair
+       (v[s:s+1] or s[s:s+1]) or 64-bit immediate.
+     - v_cvt_f64_f32: Destination is an aligned 64-bit pair (v[d:d+1]). Source is a single 32-bit
+       VGPR (v[s]) or SGPR (s[s]) or 32-bit immediate.
+  2. Rounding Mode:
+     - Round-to-nearest-even (IEEE 754 roundTiesToEven) is standard.
+     - v_cvt_f64_f32 is exact for all finite binary32 values without loss of precision.
+     - v_cvt_f32_f64 rounds 53 mantissa bits to 24 bits with tie-breaking to even LSB.
+  3. Boundary Extremes & Special Values:
+     - Signed Zeros: +0.0 and -0.0 are preserved across conversions (+0.0 <-> +0.0, -0.0 <-> -0.0).
+     - Infinities: +inf and -inf convert to corresponding target infinities (+inf <-> +inf, -inf <-> -inf).
+     - Overflow: In v_cvt_f32_f64, magnitudes >= 2^128 - 2^104 round to +-infinity.
+     - Subnormals:
+       * f32 subnormals convert exactly to normalized f64 numbers without precision loss.
+       * f64 subnormals (magnitudes < 2^-1022) underflow and round to +-0.0 in f32.
+       * f64 numbers in range [2^-149, 2^-126) convert to f32 subnormals under roundTiesToEven.
+  4. NaN Propagation:
+     - Input NaN produces a canonical quiet NaN in the target format (f32: 0x7FC00000, f64: 0x7FF8000000000000).
+     - Signaling NaN inputs trigger the IEEE invalid operation status flag.
+  5. VOP1 / VOP3 Encoding and Modifiers:
+     - VOP1 (e32): Compact encoding without modifiers.
+     - VOP3 (e64): Extended encoding supporting input modifiers:
+       * abs (|x|): Clears sign bit before conversion.
+       * neg (-x): Inverts sign bit before conversion.
+       * neg(abs(x)): Inverts sign after abs (forcing negative).
+       * clamp: Clamps converted result to [0.0, 1.0]. Clamping negative values or -0.0 yields +0.0.
+         Clamping NaN returns NaN unclamped.
+
+Standard library Python only; zero third-party dependencies; zero game data.
+Python 3.9+ compatible (from __future__ import annotations).
+"""
+from __future__ import annotations
+
+import math
+import struct
+import unittest
+
+MASK32: int = 0xFFFFFFFF
+MASK64: int = 0xFFFFFFFFFFFFFFFF
+
+# IEEE 754 binary32 Bit Patterns
+SIGN_MASK_F32: int = 0x80000000
+EXP_MASK_F32: int = 0x7F800000
+MANT_MASK_F32: int = 0x007FFFFF
+QUIET_NAN_BIT_F32: int = 0x00400000
+
+POS_ZERO_F32: int = 0x00000000
+NEG_ZERO_F32: int = 0x80000000
+POS_ONE_F32: int = 0x3F800000          # 1.0f
+NEG_ONE_F32: int = 0xBF800000          # -1.0f
+POS_TWO_F32: int = 0x40000000          # 2.0f
+NEG_TWO_F32: int = 0xC0000000          # -2.0f
+HALF_F32: int = 0x3F000000             # 0.5f
+NEG_HALF_F32: int = 0xBF000000         # -0.5f
+POS_TEN_F32: int = 0x41200000          # 10.0f
+NEG_TEN_F32: int = 0xC1200000          # -10.0f
+
+FLT_MIN: int = 0x00800000              # Smallest positive normal f32: 2^-126
+NEG_FLT_MIN: int = 0x80800000          # -2^-126
+FLT_MAX: int = 0x7F7FFFFF              # Largest positive normal f32: (2 - 2^-23) * 2^127
+NEG_FLT_MAX: int = 0xFF7FFFFF
+POS_INF_F32: int = 0x7F800000          # +infinity f32
+NEG_INF_F32: int = 0xFF800000          # -infinity f32
+QNAN_F32: int = 0x7FC00000             # Canonical quiet NaN f32
+NEG_QNAN_F32: int = 0xFFC00000         # Negative quiet NaN f32
+QNAN_PAYLOAD_A_F32: int = 0x7FC00001
+QNAN_PAYLOAD_B_F32: int = 0xFFC10002
+SNAN_F32: int = 0x7F800001             # Signaling NaN (MSB of mantissa is 0, payload != 0)
+SUBNORM_MIN_F32: int = 0x00000001      # Smallest positive subnormal f32: 2^-149
+SUBNORM_MAX_F32: int = 0x007FFFFF      # Largest positive subnormal f32: (1 - 2^-23) * 2^-126
+NEG_SUBNORM_MIN_F32: int = 0x80000001
+NEG_SUBNORM_MAX_F32: int = 0x807FFFFF
+
+# IEEE 754 binary64 Bit Patterns
+SIGN_MASK_F64: int = 0x8000000000000000
+EXP_MASK_F64: int = 0x7FF0000000000000
+MANT_MASK_F64: int = 0x000FFFFFFFFFFFFF
+QUIET_NAN_BIT_F64: int = 0x0008000000000000
+
+POS_ZERO_F64: int = 0x0000000000000000
+NEG_ZERO_F64: int = 0x8000000000000000
+POS_ONE_F64: int = 0x3FF0000000000000          # 1.0
+NEG_ONE_F64: int = 0xBFF0000000000000          # -1.0
+POS_TWO_F64: int = 0x4000000000000000          # 2.0
+NEG_TWO_F64: int = 0xC000000000000000          # -2.0
+HALF_F64: int = 0x3FE0000000000000             # 0.5
+NEG_HALF_F64: int = 0xBFE0000000000000         # -0.5
+POS_TEN_F64: int = 0x4024000000000000          # 10.0
+NEG_TEN_F64: int = 0xC024000000000000          # -10.0
+
+DBL_MIN: int = 0x0010000000000000              # Smallest positive normal f64: 2^-1022
+NEG_DBL_MIN: int = 0x8010000000000000          # -2^-1022
+DBL_MAX: int = 0x7FEFFFFFFFFFFFFF              # Largest positive normal f64
+NEG_DBL_MAX: int = 0xFFEFFFFFFFFFFFFF
+POS_INF_F64: int = 0x7FF0000000000000          # +infinity f64
+NEG_INF_F64: int = 0xFFF0000000000000          # -infinity f64
+QNAN_F64: int = 0x7FF8000000000000             # Canonical quiet NaN f64
+NEG_QNAN_F64: int = 0xFFF8000000000000         # Negative quiet NaN f64
+QNAN_PAYLOAD_A_F64: int = 0x7FF8000000000001
+QNAN_PAYLOAD_B_F64: int = 0xFFF9000000000002
+SNAN_F64: int = 0x7FF0000000000001             # Signaling NaN
+SUBNORM_MIN_F64: int = 0x0000000000000001      # Smallest positive subnormal f64: 2^-1074
+SUBNORM_MAX_F64: int = 0x000FFFFFFFFFFFFF      # Largest positive subnormal f64
+NEG_SUBNORM_MIN_F64: int = 0x8000000000000001
+NEG_SUBNORM_MAX_F64: int = 0x800FFFFFFFFFFFFF
+
+# Boundary overflow threshold: 2^128 - 2^104 (doubles >= this magnitude round to f32 inf in roundTiesToEven)
+OVERFLOW_THRESHOLD_F64: float = 3.4028235677973366e+38
+
+
+def u32(val: int) -> int:
+    """Normalize integer to unsigned 32-bit range [0, 2^32 - 1]."""
+    return val & MASK32
+
+
+def u64(val: int) -> int:
+    """Normalize integer to unsigned 64-bit range [0, 2^64 - 1]."""
+    return val & MASK64
+
+
+def s32(val: int) -> int:
+    """Interpret a 32-bit unsigned word as a signed two's-complement integer."""
+    val &= MASK32
+    return val - (1 << 32) if (val & 0x80000000) else val
+
+
+def s64(val: int) -> int:
+    """Interpret a 64-bit unsigned word as a signed two's-complement integer."""
+    val &= MASK64
+    return val - (1 << 64) if (val & SIGN_MASK_F64) else val
+
+
+def split_dwords(val64: int) -> tuple[int, int]:
+    """Split an unsigned 64-bit integer into (low_dword, high_dword)."""
+    val = val64 & MASK64
+    return val & MASK32, (val >> 32) & MASK32
+
+
+def join_dwords(lo: int, hi: int) -> int:
+    """Join (low_dword, high_dword) into an unsigned 64-bit integer."""
+    return ((hi & MASK32) << 32) | (lo & MASK32)
+
+
+def bits_to_f32(bits: int) -> float:
+    """Decode 32-bit unsigned integer to IEEE 754 single-precision float."""
+    return struct.unpack("<f", struct.pack("<I", bits & MASK32))[0]
+
+
+def f32_to_bits(val: float) -> int:
+    """Encode float to IEEE 754 single-precision 32-bit unsigned integer."""
+    try:
+        return struct.unpack("<I", struct.pack("<f", val))[0]
+    except OverflowError:
+        return POS_INF_F32 if val > 0 else NEG_INF_F32
+
+
+def bits_to_f64(bits: int) -> float:
+    """Decode 64-bit unsigned integer to IEEE 754 double-precision float."""
+    return struct.unpack("<d", struct.pack("<Q", bits & MASK64))[0]
+
+
+def f64_to_bits(val: float) -> int:
+    """Encode double float to IEEE 754 double-precision 64-bit unsigned integer."""
+    try:
+        return struct.unpack("<Q", struct.pack("<d", val))[0]
+    except OverflowError:
+        return POS_INF_F64 if val > 0 else NEG_INF_F64
+
+
+def is_nan_f32(bits: int) -> bool:
+    """True if 32-bit integer represents an IEEE 754 single-precision NaN."""
+    bits &= MASK32
+    return (bits & EXP_MASK_F32) == EXP_MASK_F32 and (bits & MANT_MASK_F32) != 0
+
+
+def is_qnan_f32(bits: int) -> bool:
+    """True if bits represent a quiet single-precision NaN (bit 22 is 1)."""
+    bits &= MASK32
+    return is_nan_f32(bits) and bool(bits & QUIET_NAN_BIT_F32)
+
+
+def is_snan_f32(bits: int) -> bool:
+    """True if bits represent a signaling single-precision NaN (bit 22 is 0)."""
+    bits &= MASK32
+    return is_nan_f32(bits) and not bool(bits & QUIET_NAN_BIT_F32)
+
+
+def is_subnormal_f32(bits: int) -> bool:
+    """True if bits represent an IEEE 754 single-precision subnormal number."""
+    bits &= MASK32
+    return (bits & EXP_MASK_F32) == 0 and (bits & MANT_MASK_F32) != 0
+
+
+def is_nan_f64(bits: int) -> bool:
+    """True if 64-bit integer represents an IEEE 754 double-precision NaN."""
+    bits &= MASK64
+    return (bits & EXP_MASK_F64) == EXP_MASK_F64 and (bits & MANT_MASK_F64) != 0
+
+
+def is_qnan_f64(bits: int) -> bool:
+    """True if bits represent a quiet double-precision NaN (bit 51 is 1)."""
+    bits &= MASK64
+    return is_nan_f64(bits) and bool(bits & QUIET_NAN_BIT_F64)
+
+
+def is_snan_f64(bits: int) -> bool:
+    """True if bits represent a signaling double-precision NaN (bit 51 is 0)."""
+    bits &= MASK64
+    return is_nan_f64(bits) and not bool(bits & QUIET_NAN_BIT_F64)
+
+
+def is_subnormal_f64(bits: int) -> bool:
+    """True if bits represent an IEEE 754 double-precision subnormal number."""
+    bits &= MASK64
+    return (bits & EXP_MASK_F64) == 0 and (bits & MANT_MASK_F64) != 0
+
+
+def apply_f64_modifiers(bits: int, neg: bool = False, abs_val: bool = False) -> int:
+    """Applies VOP3 input modifiers to 64-bit float: abs (|x|) first, then neg (-x)."""
+    bits &= MASK64
+    if abs_val:
+        bits &= ~SIGN_MASK_F64
+    if neg:
+        bits ^= SIGN_MASK_F64
+    return bits & MASK64
+
+
+def apply_f32_modifiers(bits: int, neg: bool = False, abs_val: bool = False) -> int:
+    """Applies VOP3 input modifiers to 32-bit float: abs (|x|) first, then neg (-x)."""
+    bits &= MASK32
+    if abs_val:
+        bits &= ~SIGN_MASK_F32
+    if neg:
+        bits ^= SIGN_MASK_F32
+    return bits & MASK32
+
+
+def apply_f32_clamp(bits: int) -> int:
+    """Applies VOP3 clamp modifier to 32-bit float: clamps result to [0.0, 1.0]."""
+    bits &= MASK32
+    if is_nan_f32(bits):
+        return bits
+    val = bits_to_f32(bits)
+    if val < 0.0 or (val == 0.0 and (bits & SIGN_MASK_F32)):
+        return POS_ZERO_F32
+    if val > 1.0:
+        return POS_ONE_F32
+    return bits
+
+
+def apply_f64_clamp(bits: int) -> int:
+    """Applies VOP3 clamp modifier to 64-bit float: clamps result to [0.0, 1.0]."""
+    bits &= MASK64
+    if is_nan_f64(bits):
+        return bits
+    val = bits_to_f64(bits)
+    if val < 0.0 or (val == 0.0 and (bits & SIGN_MASK_F64)):
+        return POS_ZERO_F64
+    if val > 1.0:
+        return POS_ONE_F64
+    return bits
+
+
+def ref_cvt_f32_f64(
+    src64: int,
+    clamp: bool = False,
+    neg: bool = False,
+    abs_val: bool = False,
+) -> int:
+    """Reference mathematical oracle for RDNA2 v_cvt_f32_f64.
+
+    Converts 64-bit double-precision IEEE 754 value to 32-bit single-precision IEEE 754 value.
+    """
+    s64_mod = apply_f64_modifiers(src64, neg=neg, abs_val=abs_val)
+
+    # 1. NaN handling: canonical quiet NaN
+    if is_nan_f64(s64_mod):
+        res = QNAN_F32
+        return apply_f32_clamp(res) if clamp else res
+
+    # 2. Signed zeros
+    if (s64_mod & ~SIGN_MASK_F64) == 0:
+        res = NEG_ZERO_F32 if (s64_mod & SIGN_MASK_F64) else POS_ZERO_F32
+        return apply_f32_clamp(res) if clamp else res
+
+    # 3. Infinities
+    if (s64_mod & ~SIGN_MASK_F64) == EXP_MASK_F64:
+        res = NEG_INF_F32 if (s64_mod & SIGN_MASK_F64) else POS_INF_F32
+        return apply_f32_clamp(res) if clamp else res
+
+    # 4. Finite double-precision value conversion with roundTiesToEven
+    d_val = bits_to_f64(s64_mod)
+    try:
+        res = struct.unpack("<I", struct.pack("<f", d_val))[0]
+    except OverflowError:
+        res = POS_INF_F32 if d_val > 0 else NEG_INF_F32
+
+    return apply_f32_clamp(res) if clamp else res
+
+
+def ref_cvt_f64_f32(
+    src32: int,
+    clamp: bool = False,
+    neg: bool = False,
+    abs_val: bool = False,
+) -> int:
+    """Reference mathematical oracle for RDNA2 v_cvt_f64_f32.
+
+    Converts 32-bit single-precision IEEE 754 value to 64-bit double-precision IEEE 754 value.
+    This conversion is exact for all finite single-precision values.
+    """
+    s32_mod = apply_f32_modifiers(src32, neg=neg, abs_val=abs_val)
+
+    # 1. NaN handling: canonical quiet NaN
+    if is_nan_f32(s32_mod):
+        res = QNAN_F64
+        return apply_f64_clamp(res) if clamp else res
+
+    # 2. Signed zeros
+    if (s32_mod & ~SIGN_MASK_F32) == 0:
+        res = NEG_ZERO_F64 if (s32_mod & SIGN_MASK_F32) else POS_ZERO_F64
+        return apply_f64_clamp(res) if clamp else res
+
+    # 3. Infinities
+    if (s32_mod & ~SIGN_MASK_F32) == EXP_MASK_F32:
+        res = NEG_INF_F64 if (s32_mod & SIGN_MASK_F32) else POS_INF_F64
+        return apply_f64_clamp(res) if clamp else res
+
+    # 4. Finite single-precision value conversion (exact)
+    f_val = bits_to_f32(s32_mod)
+    res = struct.unpack("<Q", struct.pack("<d", f_val))[0]
+
+    return apply_f64_clamp(res) if clamp else res
+
+
+class TestValuCvtF32F64Oracle(unittest.TestCase):
+    """Unit tests for the reference mathematical oracle and architectural model."""
+
+    def test_basic_conversions(self) -> None:
+        # 1.0f <-> 1.0
+        self.assertEqual(ref_cvt_f32_f64(POS_ONE_F64), POS_ONE_F32)
+        self.assertEqual(ref_cvt_f64_f32(POS_ONE_F32), POS_ONE_F64)
+
+        # -1.0f <-> -1.0
+        self.assertEqual(ref_cvt_f32_f64(NEG_ONE_F64), NEG_ONE_F32)
+        self.assertEqual(ref_cvt_f64_f32(NEG_ONE_F32), NEG_ONE_F64)
+
+        # 2.0f <-> 2.0
+        self.assertEqual(ref_cvt_f32_f64(POS_TWO_F64), POS_TWO_F32)
+        self.assertEqual(ref_cvt_f64_f32(POS_TWO_F32), POS_TWO_F64)
+
+        # 0.5f <-> 0.5
+        self.assertEqual(ref_cvt_f32_f64(HALF_F64), HALF_F32)
+        self.assertEqual(ref_cvt_f64_f32(HALF_F32), HALF_F64)
+
+        # 10.0f <-> 10.0
+        self.assertEqual(ref_cvt_f32_f64(POS_TEN_F64), POS_TEN_F32)
+        self.assertEqual(ref_cvt_f64_f32(POS_TEN_F32), POS_TEN_F64)
+
+    def test_signed_zeros(self) -> None:
+        self.assertEqual(ref_cvt_f32_f64(POS_ZERO_F64), POS_ZERO_F32)
+        self.assertEqual(ref_cvt_f32_f64(NEG_ZERO_F64), NEG_ZERO_F32)
+        self.assertEqual(ref_cvt_f64_f32(POS_ZERO_F32), POS_ZERO_F64)
+        self.assertEqual(ref_cvt_f64_f32(NEG_ZERO_F32), NEG_ZERO_F64)
+
+    def test_infinities(self) -> None:
+        self.assertEqual(ref_cvt_f32_f64(POS_INF_F64), POS_INF_F32)
+        self.assertEqual(ref_cvt_f32_f64(NEG_INF_F64), NEG_INF_F32)
+        self.assertEqual(ref_cvt_f64_f32(POS_INF_F32), POS_INF_F64)
+        self.assertEqual(ref_cvt_f64_f32(NEG_INF_F32), NEG_INF_F64)
+
+    def test_nan_conversions(self) -> None:
+        self.assertEqual(ref_cvt_f32_f64(QNAN_F64), QNAN_F32)
+        self.assertEqual(ref_cvt_f32_f64(NEG_QNAN_F64), QNAN_F32)
+        self.assertEqual(ref_cvt_f32_f64(SNAN_F64), QNAN_F32)
+        self.assertEqual(ref_cvt_f64_f32(QNAN_F32), QNAN_F64)
+        self.assertEqual(ref_cvt_f64_f32(NEG_QNAN_F32), QNAN_F64)
+        self.assertEqual(ref_cvt_f64_f32(SNAN_F32), QNAN_F64)
+
+    def test_modifiers(self) -> None:
+        # abs modifier clears sign bit
+        self.assertEqual(ref_cvt_f32_f64(NEG_ONE_F64, abs_val=True), POS_ONE_F32)
+        self.assertEqual(ref_cvt_f64_f32(NEG_ONE_F32, abs_val=True), POS_ONE_F64)
+
+        # neg modifier flips sign bit
+        self.assertEqual(ref_cvt_f32_f64(POS_ONE_F64, neg=True), NEG_ONE_F32)
+        self.assertEqual(ref_cvt_f64_f32(POS_ONE_F32, neg=True), NEG_ONE_F64)
+
+        # neg(abs) forces negative
+        self.assertEqual(ref_cvt_f32_f64(POS_ONE_F64, neg=True, abs_val=True), NEG_ONE_F32)
+        self.assertEqual(ref_cvt_f64_f32(NEG_ONE_F32, neg=True, abs_val=True), NEG_ONE_F64)
+
+        # clamp modifier
+        self.assertEqual(ref_cvt_f32_f64(POS_TWO_F64, clamp=True), POS_ONE_F32)
+        self.assertEqual(ref_cvt_f32_f64(NEG_TWO_F64, clamp=True), POS_ZERO_F32)
+        self.assertEqual(ref_cvt_f64_f32(POS_TWO_F32, clamp=True), POS_ONE_F64)
+        self.assertEqual(ref_cvt_f64_f32(NEG_TWO_F32, clamp=True), POS_ZERO_F64)
+
+    def test_dword_utilities(self) -> None:
+        lo, hi = split_dwords(POS_ONE_F64)
+        self.assertEqual(lo, 0x00000000)
+        self.assertEqual(hi, 0x3FF00000)
+        self.assertEqual(join_dwords(lo, hi), POS_ONE_F64)
+
+
+if __name__ == "__main__":
+    unittest.main()
