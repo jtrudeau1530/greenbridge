@@ -29,8 +29,11 @@ other machine.
 ## Dry run
 
 ```powershell
-gta6rt --dry-run <image.exe|image.dll> [--game-dir <package>]
+gta6rt --dry-run <image.exe|image.dll> [--game-dir <package>] [--overlay <dir>]
 ```
+
+`--overlay` is where a mapped title's writes go (default `<game-dir>\overlay`); `GAME:` paths read from
+`--game-dir`. See [Console paths and the write overlay](../docs/runtime_imports.md#console-paths-and-the-write-overlay).
 
 The dry run maps the image and the bundled modules it imports, applies base relocations, binds every
 import through the shim registry, a host DLL, or another bundled module, parses exports, installs static
@@ -146,6 +149,11 @@ Current limits, by design:
   `XMemVirtualQuery(process, address, out)`. Allocations are 64-byte aligned; the working-set and
   virtual-query outputs fill the observed 64-byte structures and return `FALSE`/`0` on a null or bad
   address.
+- The `kernel32.dll` file API — `CreateFileA/W`, `FindFirstFileA/W`/`FindNextFileA/W`/`FindClose`,
+  `GetFileAttributesA/W`, `GetFileAttributesExA/W` and `DeleteFileA/W`: a `GAME:` path maps under `--game-dir`, an
+  open that can write and a delete go to `--overlay DIR` (default `<game-dir>\overlay`), which reads prefer, and a path
+  that climbs above `GAME:` is refused. The package is never modified. See
+  [docs/runtime_imports.md](../docs/runtime_imports.md#console-paths-and-the-write-overlay).
 - `d3d12_xs.dll` — `D3D12SerializeVersionedRootSignature` and
   `D3D12CreateRootSignatureDeserializer`, with the console root-signature high byte (`0x03000000`)
   cleared on a copy before forwarding to the PC `d3d12.dll`. `D3D12XboxCreateDevice` wraps a device in
@@ -190,6 +198,10 @@ SDK, or `-DLEONIDA_VULKAN_HEADERS_FETCH=ON` to download the pinned Khronos Vulka
   and five draws plus a culled triangle, compared pixel by pixel. They also cover an unbound render target and
   DSV, a rebound root signature, instance step rate 0, an unbound vertex slot, and PSOs, buffers and heaps that
   must be refused. A second pass draws a full-screen triangle with no vertex input and an XOR logic op.
+- `d3d12_translated_draw_test` — milestone M1.5: the same with translator output. `test/shaders/vs_m15.asm` (vertex
+  fetch through a V#) and `ps_m15.asm` (constants read through the code base) are built by `test/shaders/build.py`
+  and found by FSSM hash; three draws into a float target, compared bit for bit. Needs `llvm-mc` (`LLVM_MC`) and the
+  Vulkan SDK's `spirv-as` and `spirv-val` at build time.
 - `d3d12_compute_test` — the compute path: root signature, a compute PSO found by its FSSM hash in a
   translator-style index, root arguments through the GPU address arena, and two dispatches.
 - `d3d12_present_test` — milestone M0: opens a window and presents 60 cleared frames through the proxy on

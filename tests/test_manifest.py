@@ -142,6 +142,35 @@ class ManifestCreateVerifyTest(unittest.TestCase):
         self.assertEqual(serial_doc["files"], parallel_doc["files"])
         self.assertEqual(json.dumps(serial_doc["files"]), json.dumps(parallel_doc["files"]))
 
+    def test_create_cannot_overwrite_a_file_it_hashes(self):
+        target = os.path.join(self.pkg, "alpha.bin")
+        with open(target, "rb") as f:
+            before = f.read()
+        with contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(manifest.ManifestError):
+                manifest.create(self.pkg, target, jobs=1)
+        with open(target, "rb") as f:
+            self.assertEqual(f.read(), before)
+
+    def test_create_cannot_overwrite_a_hard_link_to_a_hashed_file(self):
+        alias = os.path.join(self.tmp.name, "alias.json")
+        try:
+            os.link(os.path.join(self.pkg, "alpha.bin"), alias)
+        except OSError:
+            self.skipTest("hard links are not available")
+        with contextlib.redirect_stdout(io.StringIO()), self.assertRaises(manifest.ManifestError):
+            manifest.create(self.pkg, alias, jobs=1)
+
+    def test_create_can_still_write_a_new_manifest_inside_the_package(self):
+        out = os.path.join(self.pkg, "manifest.json")
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(manifest.create(self.pkg, out, jobs=1), 0)
+        self.assertTrue(os.path.isfile(out))
+
+    def test_create_rejects_a_folder_as_out(self):
+        with contextlib.redirect_stdout(io.StringIO()), self.assertRaises(manifest.ManifestError):
+            manifest.create(self.pkg, self.pkg, jobs=1)
+
     def test_verify_intact_directory_returns_zero(self):
         with contextlib.redirect_stdout(io.StringIO()):
             manifest.create(self.pkg, self.out_manifest, jobs=1)

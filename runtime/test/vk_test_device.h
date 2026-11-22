@@ -91,6 +91,9 @@ public:
     bool storage_buffer_8bit = false; // storageBuffer8BitAccess enabled
     bool conditional_rendering = false;  // VK_EXT_conditional_rendering enabled, where available
     bool host_image_copy = false;  // VK_EXT_host_image_copy and hostImageCopy enabled
+    // create(true) only: VK_KHR (else EXT) swapchain_maintenance1 and its feature enabled, with the surface half on the
+    // instance, so a vsync swapchain can switch to IMMEDIATE or FIFO_RELAXED per present.
+    bool swapchain_maintenance1 = false;
     bool shader_fma = false;       // VK_KHR_shader_fma and shaderFmaFloat32 enabled (OpFmaKHR, rdna2spirv.py --fma khr)
     bool occlusion_query_precise = false;    // occlusionQueryPrecise enabled
     bool pipeline_statistics_query = false;  // pipelineStatisticsQuery enabled
@@ -181,9 +184,29 @@ public:
         VkInstanceCreateInfo instance_info{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
         instance_info.pApplicationInfo = &app;
         std::vector<const char*> instance_extensions;
+        bool surface_m1_khr = false, surface_m1_ext = false;
         if (presentation) {
             instance_extensions.push_back("VK_KHR_surface");
             instance_extensions.push_back("VK_KHR_win32_surface");
+            const auto enumerate_instance = reinterpret_cast<PFN_vkEnumerateInstanceExtensionProperties>(
+                instance_proc(nullptr, "vkEnumerateInstanceExtensionProperties"));
+            std::uint32_t count = 0;
+            enumerate_instance(nullptr, &count, nullptr);
+            std::vector<VkExtensionProperties> available(count);
+            enumerate_instance(nullptr, &count, available.data());
+            bool caps2 = false;
+            for (const auto& e : available) {
+                caps2 = caps2 || std::strcmp(e.extensionName, "VK_KHR_get_surface_capabilities2") == 0;
+                surface_m1_khr = surface_m1_khr || std::strcmp(e.extensionName, "VK_KHR_surface_maintenance1") == 0;
+                surface_m1_ext = surface_m1_ext || std::strcmp(e.extensionName, "VK_EXT_surface_maintenance1") == 0;
+            }
+            if (caps2 && (surface_m1_khr || surface_m1_ext)) {
+                instance_extensions.push_back("VK_KHR_get_surface_capabilities2");
+                if (surface_m1_khr) instance_extensions.push_back("VK_KHR_surface_maintenance1");
+                if (surface_m1_ext) instance_extensions.push_back("VK_EXT_surface_maintenance1");
+            } else {
+                surface_m1_khr = surface_m1_ext = false;
+            }
         }
         if (validation) {
             std::vector<VkLayerProperties> layers;
@@ -268,7 +291,8 @@ public:
         std::printf("device: %s%s\n", chosen.deviceName, validation ? " (validation on)" : "");
 
         VkPhysicalDeviceVulkan13Features features13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
-        VkPhysicalDeviceVulkan12Features features12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &features13};
+        VkPhysicalDeviceVulkan11Features features11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES, &features13};
+        VkPhysicalDeviceVulkan12Features features12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &features11};
         VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &features12};
         instance_fn<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2")(physical, &features);
         if (!features13.dynamicRendering || !features13.synchronization2 || !features12.timelineSemaphore ||
@@ -302,7 +326,11 @@ public:
                                                   conditional_rendering ? &enable_conditional : nullptr};
         enable13.dynamicRendering = VK_TRUE;
         enable13.synchronization2 = VK_TRUE;
-        VkPhysicalDeviceVulkan12Features enable12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &enable13};
+        // shaderDrawParameters, where available: translated vertex shaders will read BaseVertex and BaseInstance once PR 436
+        // (zero-based VS ids) is in; harmless before.
+        VkPhysicalDeviceVulkan11Features enable11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES, &enable13};
+        enable11.shaderDrawParameters = features11.shaderDrawParameters;
+        VkPhysicalDeviceVulkan12Features enable12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &enable11};
         enable12.timelineSemaphore = VK_TRUE;
         enable12.separateDepthStencilLayouts = VK_TRUE;
         storage_buffer_8bit = features12.storageBuffer8BitAccess == VK_TRUE;
@@ -336,6 +364,7 @@ public:
         enable.shaderSampledImageArrayDynamicIndexing = bindless;
         enable.shaderStorageImageArrayDynamicIndexing = bindless;
         enable.logicOp = features.features.logicOp;  // d3d12_draw_test's logic-op draw, where available
+        enable.shaderInt64 = features.features.shaderInt64;  // translated shaders declare Int64 for their addresses
         const char* conditional_extension = VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME;
 
         // VK_EXT_host_image_copy where the device has it, for the D3D12 layer's CPU texture copies.
@@ -401,6 +430,27 @@ public:
         if (host_image_copy) device_extensions.push_back(host_image_copy_name);
         const char* swapchain = "VK_KHR_swapchain";
         if (presentation) device_extensions.push_back(swapchain);
+        VkPhysicalDeviceSwapchainMaintenance1FeaturesKHR swapchain_m1{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SWAPCHAIN_MAINTENANCE_1_FEATURES_KHR};
+        if (presentation) {
+            const auto has = [&](const char* name) {
+                return std::any_of(extensions.begin(), extensions.end(),
+                                   [&](const auto& e) { return std::strcmp(e.extensionName, name) == 0; });
+            };
+            const char* name = surface_m1_khr && has("VK_KHR_swapchain_maintenance1") ? "VK_KHR_swapchain_maintenance1"
+                               : surface_m1_ext && has("VK_EXT_swapchain_maintenance1") ? "VK_EXT_swapchain_maintenance1"
+                                                                                       : nullptr;
+            if (name) {
+                VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &swapchain_m1};
+                instance_fn<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2")(physical, &query);
+                if (swapchain_m1.swapchainMaintenance1 == VK_TRUE) {
+                    swapchain_m1.pNext = enable13.pNext;
+                    enable13.pNext = &swapchain_m1;
+                    device_extensions.push_back(name);
+                    swapchain_maintenance1 = true;
+                }
+            }
+        }
 #ifdef VK_KHR_SHADER_FMA_EXTENSION_NAME
         if (shader_fma) device_extensions.push_back(VK_KHR_SHADER_FMA_EXTENSION_NAME);
 #endif

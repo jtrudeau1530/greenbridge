@@ -6,8 +6,8 @@
 //   LEONIDA_GOTO=<frame>              (optional: also BinkGoto that frame)
 //   LEONIDA_RUN_DLLMAIN=1             (optional: call the image entry point as DllMain before BinkOpen)
 //
-// With either required variable unset the test prints "SKIP (no package/movie)" and exits 0, so ctest stays green
-// on machines without the package. Output frames are written under %TEMP%\leonida_bink and are never committed.
+// With either required variable unset the test prints "SKIP (no package/movie)" and exits 77 (CTest skip).
+// Output frames are written under %TEMP%\leonida_bink and are never committed.
 #include <windows.h>
 
 #include <algorithm>
@@ -169,7 +169,7 @@ int main() {
     const std::string movie_arg = env("LEONIDA_MOVIE");
     if (game_dir_arg.empty() || movie_arg.empty()) {
         std::printf("SKIP (no package/movie)\n");
-        return 0;
+        return 77;
     }
 
     const std::filesystem::path game_dir = game_dir_arg;

@@ -213,7 +213,7 @@ contains the schedule entry `KeyLento/Perschars/Peds/Unique/Mandy` (pack
 
 | Container | Search | Mandy drawable |
 |---|---|---|
-| `packs.rpf` | 144,364 streams / 9.74 GB; 24,034 decoded models; 12,338 name records | none |
+| `packs.rpf` | 144,364 streams / 9.74 GB; 26,585 decoded models at `e293917` (24,034 at `917e9b9`); 12,338 name records | none |
 | `data.rpf` | 28,509 streams / 1.41 GB | none (localization/UI text only) |
 | `common.rpf` | 954 streams / 50 MB | none (schedule and ped-appearance XML) |
 | `levels.rpf` | 2,051 page-aligned nested archives, every zlib stream's first 4 MiB | none (an iFruit billboard and a house photo prop are the only name hits) |
