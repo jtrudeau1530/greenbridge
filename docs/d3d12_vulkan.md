@@ -842,7 +842,7 @@ and any validation error fails them.
   `OMSetFrontAndBackStencilRef(1, 2)` with the recorded values, and the reference count around the query. It
   creates only an allocator and a list, so it needs no GPU or Vulkan loader.
 - `d3d12_depth_resolve_test`: depth and stencil `ResolveSubresourceRegion` of a 4x D32 or D24S8 target cleared with
-  three overlapping values, whole and by rectangle, compared with the PC runtime on the default adapter and WARP;
+  three overlapping values, whole and by rectangle, compared with the PC runtime on the layer's own adapter and WARP;
   the refused calls must fail `Close` and leave the destination as cleared.
 - `d3d12_vulkan_device_test`: the Vulkan device behind the Xbox-ABI proxy, called the way the game will call it.
   It creates heaps through slot 14 and reads their start handles in RAX, creates a render target through slot 76
@@ -856,8 +856,12 @@ and any validation error fails them.
   run repeats on a standalone device, the path `LEONIDA_D3D12=vulkan` takes. That standalone run also covers
   heaps and placed resources: a castable list on a placed texture is cleared through an RTV in a cast format and
   read back against the host's answer, and refused lists match the host's `E_INVALIDARG` (D3D-90).
-  The comparison tests run against a PC D3D12 device: the default adapter, or the one named by
-  `LEONIDA_HOST_ADAPTER` (`warp`, or part of an adapter's name; the adapter used is printed). Some answers are the
+  The comparison tests run against a PC D3D12 device: the layer's own adapter (the default adapter when the Vulkan
+  device has no LUID or that adapter gives no D3D12 device), or the one named by
+  `LEONIDA_HOST_ADAPTER` (`warp`, or part of an adapter's name; the adapter used is printed). `d3d12_vulkan_device`
+  picks it through `runtime/test/d3d12_copy_compare.h`; `d3d12_copy_xfmt`, `d3d12_depth_resolve`,
+  `d3d12_fence_events`, `d3d12_indirect_zero`, `d3d12_node_mask`, `d3d12_query_rules` and `d3d12_resource_desc`,
+  which also compare with WARP, through `runtime/test/host_adapter.h`. Some answers are the
   driver's choice, so pick the host side when two adapters disagree: `GetResourceTiling` splits standard and packed
   mips differently on an NVIDIA, an AMD and a WARP host, and the test accepts any split.
   - Copies against the host (D3D-46, `d3d12_copy_compare.h`): the same scenario runs on the layer and on the host and
