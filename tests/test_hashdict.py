@@ -359,6 +359,32 @@ class CarveAndExtraCLITest(unittest.TestCase):
         self.assertEqual(p_lookup.returncode, 0, p_lookup.stderr)
         self.assertIn(f"{lookup_hash} model_prop", p_lookup.stdout)
 
+    def test_one_archive_folder_is_harvested_as_that_archive(self):
+        # <work>/carve/common (its own index.json, as the gamedata_* tools take it) used to give an empty
+        # dictionary with exit 0: only <carve>/<archive>/index.json was looked for.
+        p = self.run_tool(os.path.join(self.carve_dir, "common"), "--out", self.out_json)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("common: ", p.stdout)
+        with open(self.out_json, encoding="utf-8") as f:
+            d = json.load(f)
+        self.assertEqual(d.get(f"{hashdict.joaat('common_archive_asset'):08x}"), "common_archive_asset")
+        self.assertNotIn(f"{hashdict.joaat('bink2_skipped_asset'):08x}", d)
+        # An archive outside --archives still contributes only its PSIN/RBF0 blobs.
+        p = self.run_tool(os.path.join(self.carve_dir, "custom_pack"), "--out", self.out_json)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        with open(self.out_json, encoding="utf-8") as f:
+            self.assertEqual(json.load(f), {f"{hashdict.joaat('pso_metadata_token'):08x}": "pso_metadata_token"})
+
+    def test_out_naming_a_one_archive_index_is_refused(self):
+        index = os.path.join(self.carve_dir, "common", "index.json")
+        with open(index, "rb") as f:
+            before = f.read()
+        p = self.run_tool(os.path.join(self.carve_dir, "common"), "--out", index)
+        self.assertEqual(p.returncode, 2, p.stderr)
+        self.assertIn("is one of the inputs", p.stderr)
+        with open(index, "rb") as f:
+            self.assertEqual(f.read(), before)
+
     def test_build_requires_an_explicit_carve_directory(self):
         empty = os.path.join(self.dir, "empty")
         os.mkdir(empty)
