@@ -379,6 +379,17 @@ class Gen:
         self.emit(f"{v} = OpBitwiseOr %uint {keep} {sh16}")
         self.dst(d, v)
 
+    _DPP_MODS = ("row_mirror", "row_half_mirror")
+    _DPP_PREFIXES = ("dpp8:", "quad_perm:", "row_shl:", "row_shr:", "row_ror:",
+                     "row_share:", "row_xmask:", "fi:", "bound_ctrl:", "row_mask:", "bank_mask:")
+
+    @classmethod
+    def non_dpp_mods(cls, raw_op, mods):
+        """Return modifiers that do not belong to DPP control when raw_op is a _dpp form."""
+        if not raw_op.endswith("_dpp"):
+            return list(mods)
+        return [m for m in mods if m not in cls._DPP_MODS and not m.startswith(cls._DPP_PREFIXES)]
+
     @staticmethod
     def opsel_bits(mods, nsrc):
         """Parse the VOP3 ``op_sel:[...]`` modifier of an op with ``nsrc`` sources -> (source selects, dst bit).
@@ -4121,6 +4132,74 @@ class Gen:
             self.emit(f"{hi} = OpShiftLeftLogical %uint {halves[1]} {self.cu(16)}")
             self.emit(f"{r} = OpBitwiseOr %uint {halves[0]} {hi}")
             self.dst(a[0], r)
+        elif op in ("v_dot2_i32_i16", "v_dot2_u32_u16", "v_dot4_u32_u8", "v_dot8_i32_i4", "v_dot8_u32_u4"):
+            # Packed integer dot products (RDNA2 ISA VOP3P):
+            #   D = sum_{k=0..N-1} (S0.elem[k] * S1.elem[k]) + S2
+            # Wrapping at 32 bits by default; VOP3P clamp saturates to [INT32_MIN, INT32_MAX] (signed) or
+            # [0, UINT32_MAX] (unsigned). RDNA2 integer dot ops have no op_sel, neg_lo/neg_hi, DPP, or SDWA forms.
+            def bits(name):
+                m = next((m for m in mods if m.startswith(name + ":")), None)
+                return [int(v) for v in m.split("[")[1].rstrip("]").split(",")] if m else [0, 0, 0]
+            other = [m for m in mods if m != "clamp" and not m.startswith(("op_sel:", "op_sel_hi:"))]
+            if (other or ins["op"].endswith(("_dpp", "_sdwa")) or any(s.get("neg") or s.get("abs") for s in a) or
+                    any(bits("op_sel")) or any(bits("op_sel_hi"))):
+                raise Unsupported(op + " modifiers")
+            width = 16 if "_dot2_" in op else (8 if "_dot4" in op else 4)
+            signed = op.endswith(("i16", "i4"))
+            clamp = "clamp" in mods
+            ext = "OpBitFieldSExtract" if signed else "OpBitFieldUExtract"
+            x, y, acc = self.src_u(a[1]), self.src_u(a[2]), self.src_u(a[3])
+            prods = []
+            for off in range(0, 32, width):
+                xe, ye, p = self.tmp(), self.tmp(), self.tmp()
+                self.emit(f"{xe} = {ext} %uint {x} {self.cu(off)} {self.cu(width)}")
+                self.emit(f"{ye} = {ext} %uint {y} {self.cu(off)} {self.cu(width)}")
+                self.emit(f"{p} = OpIMul %uint {xe} {ye}")
+                prods.append(p)
+            if not clamp:
+                r = prods[0]
+                for term in prods[1:] + [acc]:
+                    nxt = self.tmp()
+                    self.emit(f"{nxt} = OpIAdd %uint {r} {term}")
+                    r = nxt
+            elif not signed:
+                r = prods[0]
+                for term in prods[1:] + [acc]:
+                    w, ovf, s = self.tmp(), self.tmp(), self.tmp()
+                    self.emit(f"{w} = OpIAdd %uint {r} {term}")
+                    self.emit(f"{ovf} = OpULessThan %bool {w} {r}")
+                    self.emit(f"{s} = OpSelect %uint {ovf} {self.cu(0xFFFFFFFF)} {w}")
+                    r = s
+            else:
+                def sadd_carry(lhs, rhs, carry_in):
+                    w, xw, yw, ob, ov, na, st, d, nc = (self.tmp() for _ in range(9))
+                    self.emit(f"{w} = OpIAdd %uint {lhs} {rhs}")
+                    self.emit(f"{xw} = OpBitwiseXor %uint {lhs} {w}")
+                    self.emit(f"{yw} = OpBitwiseXor %uint {rhs} {w}")
+                    self.emit(f"{ob} = OpBitwiseAnd %uint {xw} {yw}")
+                    self.emit(f"{ov} = OpUGreaterThanEqual %bool {ob} {self.cu(0x80000000)}")
+                    self.emit(f"{na} = OpUGreaterThanEqual %bool {lhs} {self.cu(0x80000000)}")
+                    self.emit(f"{st} = OpSelect %uint {na} {self.cu(0xFFFFFFFF)} {self.cu(1)}")
+                    self.emit(f"{d} = OpSelect %uint {ov} {st} {self.cu(0)}")
+                    self.emit(f"{nc} = OpIAdd %uint {carry_in} {d}")
+                    return w, nc
+                r = prods[0]
+                carry = self.cu(0)
+                for term in prods[1:]:
+                    if width == 16:
+                        r, carry = sadd_carry(r, term, carry)
+                    else:
+                        nxt = self.tmp()
+                        self.emit(f"{nxt} = OpIAdd %uint {r} {term}")
+                        r = nxt
+                r, carry = sadd_carry(r, acc, carry)
+                nz, neg_c, bound, sat = (self.tmp() for _ in range(4))
+                self.emit(f"{nz} = OpINotEqual %bool {carry} {self.cu(0)}")
+                self.emit(f"{neg_c} = OpUGreaterThanEqual %bool {carry} {self.cu(0x80000000)}")
+                self.emit(f"{bound} = OpSelect %uint {neg_c} {self.cu(0x80000000)} {self.cu(0x7FFFFFFF)}")
+                self.emit(f"{sat} = OpSelect %uint {nz} {bound} {r}")
+                r = sat
+            self.dst(a[0], r)
         elif op in ("v_pk_lshlrev_b16", "v_pk_lshrrev_b16", "v_pk_ashrrev_i16"):
             # Packed 16-bit shifts (VOP3P): result half h = src1 half (op_sel / op_sel_hi) shifted by src0 half & 15.
             def bits(name, default):
@@ -5213,6 +5292,28 @@ class Gen:
             r = self.fma_f16_odd(*vals)     # one rounding, to f16 (SHADER-55); omod/clamp keep round-to-odd valid
             r = self.clamp_mods(r, mods)
             self.f16_out(a[0], r, dhi)  # GFX10: f16 ops keep the other half
+        elif op == "v_pk_fmac_f16":
+            # VOP2 packed f16x2 fused multiply-accumulate into vdst:
+            #   D.f16[0] = fma(S0.f16[0], S1.f16[0], D.f16[0])
+            #   D.f16[1] = fma(S0.f16[1], S1.f16[1], D.f16[1])
+            if (self.non_dpp_mods(ins["op"], mods) or ins["op"].endswith("_sdwa") or
+                    any(s.get("neg") or s.get("abs") for s in a) or a[0]["k"] != "vgpr"):
+                raise Unsupported("v_pk_fmac_f16 modifiers")
+            vecs = []
+            for s in (a[1], a[2], a[0]):
+                u = self.src_h(s)
+                v2 = self.tmp()
+                self.emit(f"{v2} = OpExtInst %v2float %glsl UnpackHalf2x16 {u}")
+                vecs.append(v2)
+            comps = []
+            for k in (0, 1):
+                ex = [self.tmp() for _ in range(3)]
+                for e_, v_ in zip(ex, vecs):
+                    self.emit(f"{e_} = OpCompositeExtract %float {v_} {k}")
+                comps.append(self.fma_f16_odd(*ex))
+            p = self.tmp()
+            self.emit(f"{p} = OpCopyObject %uint {self.f16_pack2(comps[0], comps[1])}")
+            self.dst(a[0], p)
         elif op in ("v_pk_add_f16", "v_pk_mul_f16", "v_pk_max_f16", "v_pk_min_f16", "v_pk_fma_f16"):
             # Packed f16x2 (VOP3P). Result lo: source i takes its half from op_sel[i] (0 = lo, 1 = hi), negated by
             # neg_lo[i]. Result hi: half from op_sel_hi[i], negated by neg_hi[i]. Defaults: op_sel [0,0],
@@ -9991,7 +10092,7 @@ def read_before_write_vgprs(insns):
                 regs += range(x["r"], x["r"] + x.get("n", 1))
             elif x["k"] == "vlist":
                 regs += x["r"]
-        if (base_op(op) in ("v_fmac_f32", "v_mac_f32", "v_mac_legacy_f32", "v_fmac_f16", "v_dot4c_i32_i8") or
+        if (base_op(op) in ("v_fmac_f32", "v_mac_f32", "v_mac_legacy_f32", "v_fmac_f16", "v_dot4c_i32_i8", "v_pk_fmac_f16") or
                 (op.startswith("global_load_") and "_d16" in op)) and a[0]["k"] == "vgpr":   # d16 keeps a half
             regs.append(a[0]["r"])
         for r in regs:
@@ -10219,7 +10320,7 @@ def reg_reads_writes(insns):
                 regs += range(x["r"], x["r"] + x.get("n", 1))
             elif x["k"] == "vlist":
                 regs += x["r"]
-        if base_op(op) in ("v_fmac_f32", "v_mac_f32", "v_fmac_f16", "v_dot4c_i32_i8") and a[0]["k"] == "vgpr":
+        if base_op(op) in ("v_fmac_f32", "v_mac_f32", "v_mac_legacy_f32", "v_fmac_f16", "v_dot4c_i32_i8", "v_pk_fmac_f16") and a[0]["k"] == "vgpr":
             regs.append(a[0]["r"])
         rr.update(regs)
         if not reads_all and a[0]["k"] == "vgpr":
