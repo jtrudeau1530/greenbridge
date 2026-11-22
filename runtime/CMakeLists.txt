@@ -508,6 +508,16 @@ if(BUILD_TESTING)
     add_test(NAME run_tiny_game COMMAND gta6rt --run $<TARGET_FILE:tiny_game> -- hello 42)
     add_test(NAME run_tiny_game_exit_code COMMAND gta6rt --run $<TARGET_FILE:tiny_game> -- wrong args)
     set_tests_properties(run_tiny_game_exit_code PROPERTIES WILL_FAIL TRUE)
+    # Two modes at once are refused before anything is mapped (#886). The stand-in game's own arguments are passed,
+    # so a gta6rt that ignored the conflict would run it, print "running" and exit 0.
+    foreach(modes "dry-run;run" "dry-run;init" "init;run")
+      string(REPLACE ";" "_" name "${modes}")
+      list(TRANSFORM modes PREPEND "--")
+      add_test(NAME gta6rt_rejects_${name} COMMAND gta6rt ${modes} $<TARGET_FILE:tiny_game> -- hello 42)
+      set_tests_properties(gta6rt_rejects_${name} PROPERTIES
+        PASS_REGULAR_EXPRESSION "usage: gta6rt"
+        FAIL_REGULAR_EXPRESSION "running |module\\(s\\) mapped")
+    endforeach()
   endif()
   if(WIN32 AND TARGET root_signature_test)
     add_test(NAME root_signature COMMAND root_signature_test)
