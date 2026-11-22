@@ -279,6 +279,20 @@ void check_run_time_load() {
                   reinterpret_cast<SetSensitive>(slot(t, 27))(t, false) == S_OK &&
                   !reinterpret_cast<IsSensitive>(slot(t, 30))(t),
               "slots 27 and 30 set and read this thread's time-sensitive flag");
+        // Slot 8 (XAsyncBeginAlloc, private, signature not measured) must not report a begun call whose provider
+        // never received XAsyncOp::Begin: either it refuses, or the provider saw Begin exactly once.
+        static std::atomic<int> s_begins{0};
+        XAsyncProvider* provider = [](XAsyncOp op, const XAsyncProviderData*) -> HRESULT {
+            if (op == XAsyncOp::Begin) s_begins.fetch_add(1);
+            return S_OK;
+        };
+        XAsyncBlock alloc_block{};
+        using BeginAlloc = HRESULT(STDMETHODCALLTYPE*)(void*, XAsyncBlock*, const void*, const char*, XAsyncProvider*,
+                                                        size_t, size_t, void*);
+        const HRESULT alloc_hr =
+            reinterpret_cast<BeginAlloc>(slot(t, 8))(t, &alloc_block, nullptr, "test", provider, 16, 0, nullptr);
+        check(FAILED(alloc_hr) || s_begins.load() == 1,
+              "slot 8 (XAsyncBeginAlloc) never reports success for a call whose provider did not begin");
         void* unk = nullptr;
         const GUID iunknown = {0, 0, 0, {0xc0, 0, 0, 0, 0, 0, 0, 0x46}};
         using QI = HRESULT(STDMETHODCALLTYPE*)(void*, REFIID, void**);
