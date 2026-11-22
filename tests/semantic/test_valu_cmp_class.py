@@ -1108,5 +1108,132 @@ class TestValuCmpClassConditionCodesAndFlags(unittest.TestCase):
         self.assertFalse(ref_cmp_class_f64(SNAN_F64, CLASS_QNAN))
 
 
+class TestValuCmpClassIEEE754Boundaries(unittest.TestCase):
+    """Exhaustive unit tests for IEEE 754 boundary extremes, subnormals, and NaN handling."""
+
+    def test_signed_zeros_distinction(self) -> None:
+        # +0.0
+        self.assertTrue(ref_cmp_class_f32(POS_ZERO_F32, CLASS_POS_ZERO))
+        self.assertFalse(ref_cmp_class_f32(POS_ZERO_F32, CLASS_NEG_ZERO))
+        self.assertTrue(ref_cmp_class_f64(POS_ZERO_F64, CLASS_POS_ZERO))
+        self.assertFalse(ref_cmp_class_f64(POS_ZERO_F64, CLASS_NEG_ZERO))
+
+        # -0.0
+        self.assertTrue(ref_cmp_class_f32(NEG_ZERO_F32, CLASS_NEG_ZERO))
+        self.assertFalse(ref_cmp_class_f32(NEG_ZERO_F32, CLASS_POS_ZERO))
+        self.assertTrue(ref_cmp_class_f64(NEG_ZERO_F64, CLASS_NEG_ZERO))
+        self.assertFalse(ref_cmp_class_f64(NEG_ZERO_F64, CLASS_POS_ZERO))
+
+    def test_subnormal_boundaries(self) -> None:
+        # F32 subnormals
+        self.assertTrue(ref_cmp_class_f32(DENORM_MIN_F32, CLASS_POS_DENORMAL))
+        self.assertTrue(ref_cmp_class_f32(DENORM_MAX_F32, CLASS_POS_DENORMAL))
+        self.assertTrue(ref_cmp_class_f32(NEG_DENORM_MIN_F32, CLASS_NEG_DENORMAL))
+        self.assertTrue(ref_cmp_class_f32(NEG_DENORM_MAX_F32, CLASS_NEG_DENORMAL))
+        # Ensure subnormal does not match zero or normal
+        self.assertFalse(ref_cmp_class_f32(DENORM_MIN_F32, CLASS_MASK_ZERO))
+        self.assertFalse(ref_cmp_class_f32(DENORM_MAX_F32, CLASS_MASK_NORMAL))
+
+        # F64 subnormals
+        self.assertTrue(ref_cmp_class_f64(DENORM_MIN_F64, CLASS_POS_DENORMAL))
+        self.assertTrue(ref_cmp_class_f64(DENORM_MAX_F64, CLASS_POS_DENORMAL))
+        self.assertTrue(ref_cmp_class_f64(NEG_DENORM_MIN_F64, CLASS_NEG_DENORMAL))
+        self.assertTrue(ref_cmp_class_f64(NEG_DENORM_MAX_F64, CLASS_NEG_DENORMAL))
+        self.assertFalse(ref_cmp_class_f64(DENORM_MIN_F64, CLASS_MASK_ZERO))
+        self.assertFalse(ref_cmp_class_f64(DENORM_MAX_F64, CLASS_MASK_NORMAL))
+
+    def test_normal_boundaries(self) -> None:
+        # F32 normals
+        self.assertTrue(ref_cmp_class_f32(FLT_MIN_F32, CLASS_POS_NORMAL))
+        self.assertTrue(ref_cmp_class_f32(FLT_MAX_F32, CLASS_POS_NORMAL))
+        self.assertTrue(ref_cmp_class_f32(NEG_FLT_MIN_F32, CLASS_NEG_NORMAL))
+        self.assertTrue(ref_cmp_class_f32(NEG_FLT_MAX_F32, CLASS_NEG_NORMAL))
+
+        # F64 normals
+        self.assertTrue(ref_cmp_class_f64(DBL_MIN_F64, CLASS_POS_NORMAL))
+        self.assertTrue(ref_cmp_class_f64(DBL_MAX_F64, CLASS_POS_NORMAL))
+        self.assertTrue(ref_cmp_class_f64(NEG_DBL_MIN_F64, CLASS_NEG_NORMAL))
+        self.assertTrue(ref_cmp_class_f64(NEG_DBL_MAX_F64, CLASS_NEG_NORMAL))
+
+    def test_infinities_boundaries(self) -> None:
+        # F32 infinities
+        self.assertTrue(ref_cmp_class_f32(POS_INF_F32, CLASS_POS_INF))
+        self.assertFalse(ref_cmp_class_f32(POS_INF_F32, CLASS_NEG_INF))
+        self.assertTrue(ref_cmp_class_f32(NEG_INF_F32, CLASS_NEG_INF))
+        self.assertFalse(ref_cmp_class_f32(NEG_INF_F32, CLASS_POS_INF))
+
+        # F64 infinities
+        self.assertTrue(ref_cmp_class_f64(POS_INF_F64, CLASS_POS_INF))
+        self.assertFalse(ref_cmp_class_f64(POS_INF_F64, CLASS_NEG_INF))
+        self.assertTrue(ref_cmp_class_f64(NEG_INF_F64, CLASS_NEG_INF))
+        self.assertFalse(ref_cmp_class_f64(NEG_INF_F64, CLASS_POS_INF))
+
+    def test_nan_discrimination_snan_vs_qnan(self) -> None:
+        # Various sNaN payloads
+        f32_snans = [SNAN_F32, 0x7F800002, 0x7F8000FF, 0x7FBFFFFF, 0xFF800001, 0xFFBFFFFF]
+        for snan in f32_snans:
+            with self.subTest(snan=f"{snan:#010x}"):
+                self.assertTrue(ref_cmp_class_f32(snan, CLASS_SNAN))
+                self.assertFalse(ref_cmp_class_f32(snan, CLASS_QNAN))
+
+        # Various qNaN payloads
+        f32_qnans = [QNAN_F32, 0x7FC00001, 0x7FFFFFFF, 0xFFC00000, 0xFFFFFFFF]
+        for qnan in f32_qnans:
+            with self.subTest(qnan=f"{qnan:#010x}"):
+                self.assertTrue(ref_cmp_class_f32(qnan, CLASS_QNAN))
+                self.assertFalse(ref_cmp_class_f32(qnan, CLASS_SNAN))
+
+        # F64 sNaNs and qNaNs
+        f64_snans = [SNAN_F64, 0x7FF0000000000002, 0x7FF7FFFFFFFFFFFF, 0xFFF0000000000001]
+        for snan in f64_snans:
+            with self.subTest(snan=f"{snan:#018x}"):
+                self.assertTrue(ref_cmp_class_f64(snan, CLASS_SNAN))
+                self.assertFalse(ref_cmp_class_f64(snan, CLASS_QNAN))
+
+        f64_qnans = [QNAN_F64, 0x7FF8000000000001, 0x7FFFFFFFFFFFFFFF, 0xFFF8000000000000]
+        for qnan in f64_qnans:
+            with self.subTest(qnan=f"{qnan:#018x}"):
+                self.assertTrue(ref_cmp_class_f64(qnan, CLASS_QNAN))
+                self.assertFalse(ref_cmp_class_f64(qnan, CLASS_SNAN))
+
+    def test_partition_theorem_exactly_one_class_bit_set(self) -> None:
+        # Every floating point pattern must match exactly one class in [0..9]
+        samples_f32 = [
+            POS_ZERO_F32, NEG_ZERO_F32, POS_ONE_F32, NEG_ONE_F32,
+            DENORM_MIN_F32, NEG_DENORM_MIN_F32, FLT_MIN_F32, FLT_MAX_F32,
+            POS_INF_F32, NEG_INF_F32, QNAN_F32, SNAN_F32
+        ]
+        for val in samples_f32:
+            cls = classify_f32(val)
+            self.assertEqual(bin(cls).count("1"), 1)
+            self.assertTrue(0 <= int(math.log2(cls)) <= 9)
+
+        samples_f64 = [
+            POS_ZERO_F64, NEG_ZERO_F64, POS_ONE_F64, NEG_ONE_F64,
+            DENORM_MIN_F64, NEG_DENORM_MIN_F64, DBL_MIN_F64, DBL_MAX_F64,
+            POS_INF_F64, NEG_INF_F64, QNAN_F64, SNAN_F64
+        ]
+        for val in samples_f64:
+            cls = classify_f64(val)
+            self.assertEqual(bin(cls).count("1"), 1)
+            self.assertTrue(0 <= int(math.log2(cls)) <= 9)
+
+    def test_modifiers_on_boundary_extremes(self) -> None:
+        # abs(-0.0) -> +0.0
+        self.assertTrue(ref_cmp_class_f32(NEG_ZERO_F32, CLASS_POS_ZERO, abs_val=True))
+        # neg(+0.0) -> -0.0
+        self.assertTrue(ref_cmp_class_f32(POS_ZERO_F32, CLASS_NEG_ZERO, neg=True))
+        # neg(-0.0) -> +0.0
+        self.assertTrue(ref_cmp_class_f32(NEG_ZERO_F32, CLASS_POS_ZERO, neg=True))
+        # abs(-denorm) -> +denorm
+        self.assertTrue(ref_cmp_class_f64(NEG_DENORM_MIN_F64, CLASS_POS_DENORMAL, abs_val=True))
+        # neg(+denorm) -> -denorm
+        self.assertTrue(ref_cmp_class_f64(DENORM_MIN_F64, CLASS_NEG_DENORMAL, neg=True))
+        # abs(sNaN) preserves sNaN
+        self.assertTrue(ref_cmp_class_f64(SNAN_F64, CLASS_SNAN, abs_val=True))
+        # neg(qNaN) preserves qNaN
+        self.assertTrue(ref_cmp_class_f64(QNAN_F64, CLASS_QNAN, neg=True))
+
+
 if __name__ == "__main__":
     unittest.main()
