@@ -297,8 +297,33 @@ rated vehicles. Of the mod part names, only the 5 `RoofModName` values that are 
 49 chassis, 32 utility, 35 exterior-propset and 4 interior names match no archive entry, so they are probably
 fragment-part or kit names rather than models.
 
-Not measured here (hypothesis): whether the vehicle navmeshes are generated at runtime from these parameters or
-stored elsewhere, and which vehicles the 31 are (wagons, boats and trains would fit the field set).
+**Stored vs runtime-generated and vehicle classes (ASSET-332).** Cross-checking the 31 distinct `CVehiclePoints`
+models (and 55 `ModDefs/Item` part names) against `navmeshes.rpf`, `common.rpf` metadata, and other package
+archives resolves the earlier hypothesis: **vehicle navmeshes are pre-baked and stored in `navmeshes.rpf` Band 2**,
+so the port does not need a runtime Recast navmesh generator for these vehicles. The `CVehiclePoints` Recast fields
+are authoring/build-time inputs to that partition:
+
+- **Stored in `navmeshes.rpf` Band 2 (`flags = 7` dynamic partition):** the non-grid `PSIN` container at
+  `0x1749fe000` (`37,120` B, version `256`, `493` `LSNS` records) heading the `161` local-space dynamic navmeshes
+  (`0x174a02010..0x174b91010`) contains the lowercase `joaat` hash of **25 of the 31** `CVehiclePoints` model names
+  (100% of the 25 present in the `.yft` catalog) and **20 of the 55** `ModDefs/Item` part names. The remaining 6
+  models appear in neither the `.yft` catalog, `CVehiclePerformanceMaps`, `CTrainConfigs`, nor `PSIN 0x1749fe000`.
+- **Absent from other archives:** scanning `packs.rpf`, `data.rpf`, `common.rpf`, and `story000.rpf` finds **0**
+  `0x00010015` navmesh streams outside `navmeshes.rpf`.
+- **Dynamic partition dimensions (`161` `flags = 7` meshes):** extents `dx` `1.31..63.0` m, `dy` `2.94..69.38` m,
+  `dz` `0.0..13.2` m (`max(dx, dy)`: `81` `<= 10` m, `67` `10..25` m, `11` `25..60` m, `2` `> 60` m); `4..1,058`
+  vertices, `1..631` polygons, `2..1,694` special links, and `0` `+0xB8` volume records on all `161`.
+- **Vehicle class breakdown of the 31 `CVehiclePoints` models** (via `CVehiclePerformanceMaps` and `CTrainConfigs`
+  in `common.rpf`):
+
+| Class (`common.rpf` metadata) | `CVehiclePoints` models | Matched in `PSIN 0x1749fe000` | Broader `common.rpf` set in `PSIN 0x1749fe000` |
+|---|---:|---:|---:|
+| Watercraft (`CVehiclePerformanceMaps` Doc 1, `buoyancyOffsetZ != 0`) | 20 | 20 / 20 | 31 / 34 |
+| Ground/land (`CVehiclePerformanceMaps` Doc 0, `takeOffSpeed == 0`) | 4 | 4 / 4 | 12 / 251 |
+| Air (`CVehiclePerformanceMaps` Doc 0, `takeOffSpeed > 0`) | 0 | 0 | — |
+| Train (`CTrainConfigs`) | 1 | 1 / 1 | — |
+| Absent from `CVehiclePerformanceMaps`, `CTrainConfigs`, and `.yft` catalog | 6 | 0 / 6 | — |
+| **Total** | **31** | **25 / 31** | |
 
 ## Tools
 
