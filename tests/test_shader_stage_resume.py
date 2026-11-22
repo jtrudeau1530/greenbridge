@@ -2,7 +2,10 @@
 
 Standard library only; no game data: the tools are mocked or fed hand-made inputs.
 """
+import ast
+import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -95,14 +98,14 @@ class ShaderStageResumeTest(unittest.TestCase):
         self.ran.append("translate (emulated)" if emulate else "translate")
         self.touch(spirv, "index.json")
 
-    def run_stage(self, emulate=None):
+    def run_stage(self, emulate=None, jobs=2):
         self.ran = []
         kw = {} if emulate is None else {"emulate": emulate}
         with mock.patch.object(make_game, "py", self.fake_py), \
                 mock.patch.object(make_game, "need", lambda *a: None), \
                 mock.patch.object(make_game, "translate", self.fake_translate), \
                 mock.patch.object(make_game, "log", lambda *a: None):
-            make_game.shaders(os.path.join(self.work, "game"), self.work, 2, **kw)
+            make_game.shaders(os.path.join(self.work, "game"), self.work, jobs, **kw)
         return self.ran
 
     def test_fresh_folder_runs_every_step_then_nothing(self):
@@ -146,13 +149,14 @@ class ShaderStageResumeTest(unittest.TestCase):
         os.remove(os.path.join(self.dxbc, "fssm_index.json"))
         self.assertEqual(self.run_stage(), ["fssm_unpack.py", "shader_disasm.py", "translate"])
 
-    def test_folder_finished_before_the_markers_keeps_its_work(self):
+    def test_legacy_folder_keeps_its_disassembly_and_refreshes_translation_once(self):
         self.touch(self.dxbc, "index.json")
         self.touch(self.dxbc, "fssm_index.json")
         self.touch(self.dxbc, "disasm", "s0.s")
         self.touch(self.spirv, "index.json")                # translated by a build from before disasm.done
-        self.assertEqual(self.run_stage(), [])
+        self.assertEqual(self.run_stage(), ["translate"])
         self.assertTrue(os.path.isfile(os.path.join(self.dxbc, "disasm.done")))
+        self.assertEqual(self.run_stage(), [])
 
     def test_disasm_moved_from_the_old_place_is_kept_and_translated_again(self):
         self.touch(self.dxbc, "index.json")
@@ -244,6 +248,138 @@ class ShaderStageResumeTest(unittest.TestCase):
         self.run_stage(emulate=False)
         self.assertEqual(self.run_stage(emulate=True), ["translate (emulated)"])
         self.assertTrue(os.path.isfile(os.path.join(self.dxbc, "disasm.done")))
+
+    # The translation also depends on the translator's own files: one made from other files, or from unknown ones, is
+    # translated again once, and nothing before it is redone.
+    def sources_file(self):
+        return os.path.join(self.spirv, "translation_sources.sha256")
+
+    def record_sources(self, digest):
+        with open(self.sources_file(), "w", encoding="utf-8") as f:
+            f.write(digest + "\n")
+
+    def copy_tools(self):
+        tools = os.path.join(self.work, "tools")
+        os.makedirs(tools)
+        for name in make_game.TRANSLATION_SOURCES + ("shader_disasm.py",):
+            shutil.copy(os.path.join(make_game.TOOLS, name), tools)
+        patch = mock.patch.object(make_game, "TOOLS", tools)
+        patch.start()
+        self.addCleanup(patch.stop)
+        return tools
+
+    def test_an_unreadable_sources_file_translates_again(self):
+        self.run_stage()
+        with open(self.sources_file(), "wb") as f:
+            f.write(b"\xff\xfe\x00")
+        self.assertEqual(self.run_stage(), ["translate"])
+        self.assertEqual(self.run_stage(), [])
+
+    def test_editing_any_translation_source_translates_again_once(self):
+        tools = self.copy_tools()
+        self.run_stage()
+        for name in make_game.TRANSLATION_SOURCES:
+            with open(os.path.join(tools, name), "ab") as f:
+                f.write(b"\n")
+            self.assertEqual(self.run_stage(), ["translate"], name)
+            self.assertEqual(self.run_stage(), [], name)
+
+    def test_editing_another_tool_or_changing_jobs_keeps_the_translation(self):
+        tools = self.copy_tools()
+        self.run_stage()
+        with open(os.path.join(tools, "shader_disasm.py"), "ab") as f:
+            f.write(b"\n")
+        self.assertEqual(self.run_stage(), [])
+        self.assertEqual(self.run_stage(jobs=7), [])
+
+    def test_an_invalid_mode_file_refreshes_the_translation(self):
+        self.run_stage(emulate=True)
+        with open(os.path.join(self.spirv, "wave64_emulate.txt"), "wb") as f:
+            f.write(b"\xff")
+        self.assertEqual(self.run_stage(emulate=False), ["translate"])
+        self.assertEqual(self.mode(), "off")
+
+    def test_auto_keeps_emulating_when_translating_again_for_new_sources(self):
+        self.run_stage(emulate=True)
+        self.record_sources("0" * 64)
+        self.assertEqual(self.run_auto(emulate=False), ["translate (emulated)"])
+        self.assertEqual(self.mode(), "on")
+        self.assertEqual(self.run_auto(emulate=False), [])
+
+    def test_auto_keeps_emulating_through_a_failed_rebuild_for_new_sources(self):
+        self.run_stage(emulate=True)
+        self.record_sources("0" * 64)
+
+        def failing_translate(disasm, spirv, jobs, emulate=False):
+            self.assertTrue(emulate)
+            raise SystemExit(1)
+        with mock.patch.object(make_game, "py", self.fake_py), \
+                mock.patch.object(make_game, "need", lambda *a: None), \
+                mock.patch.object(make_game, "translate", failing_translate), \
+                mock.patch.object(make_game, "log", lambda *a: None):
+            with self.assertRaises(SystemExit):
+                make_game.shaders(os.path.join(self.work, "game"), self.work, 2, emulate=False, keep_emulated=True)
+        self.assertFalse(os.path.exists(os.path.join(self.spirv, "index.json")))
+        self.assertEqual(self.run_auto(emulate=False), ["translate (emulated)"])
+        self.assertEqual(self.mode(), "on")
+
+    def test_an_explicit_off_translates_natively_for_new_sources(self):
+        self.run_stage(emulate=True)
+        self.record_sources("0" * 64)
+        self.assertEqual(self.run_stage(emulate=False), ["translate"])
+        self.assertEqual(self.mode(), "off")
+
+    def test_a_kill_right_after_a_merge_for_new_sources_keeps_the_translation(self):
+        self.run_stage()
+        self.record_sources("0" * 64)
+        self.kill_after_merge(emulate=False)
+        self.assertEqual(self.run_stage(), [])                  # hours of translation are not redone
+
+
+class TranslationSourcesTest(unittest.TestCase):
+    def test_the_list_covers_every_local_module_the_translator_imports(self):
+        seen, todo = set(), ["rdna2spirv"]
+        while todo:
+            name = todo.pop()
+            if name in seen:
+                continue
+            seen.add(name)
+            with open(os.path.join(make_game.TOOLS, name + ".py"), encoding="utf-8") as f:
+                tree = ast.parse(f.read())
+            for node in ast.walk(tree):                     # function-level imports too
+                if isinstance(node, ast.Import):
+                    mods = [a.name for a in node.names]
+                elif isinstance(node, ast.ImportFrom) and node.module and not node.level:
+                    mods = [node.module]
+                else:
+                    continue
+                todo += [m.split(".")[0] for m in mods
+                         if os.path.isfile(os.path.join(make_game.TOOLS, m.split(".")[0] + ".py"))]
+        self.assertEqual({n + ".py" for n in seen},
+                         {n for n in make_game.TRANSLATION_SOURCES if n.endswith(".py")})
+
+
+class MergePublishesLastTest(unittest.TestCase):
+    """rdna2spirv.py --merge writes the stubs before index.json, which tells make_game.py the translation finished."""
+
+    def merge(self, out):
+        tool = os.path.join(make_game.TOOLS, "rdna2spirv.py")
+        return subprocess.run([sys.executable, "-I", tool, out, "--out", out, "--merge"], capture_output=True, text=True)
+
+    def test_a_failed_stub_write_leaves_no_index_and_a_retry_publishes_it(self):
+        with tempfile.TemporaryDirectory() as out:
+            with open(os.path.join(out, "index.part0.json"), "w", encoding="utf-8") as f:
+                json.dump({"s0": {"stage": "ps", "inputs": [0]}}, f)
+            blocker = os.path.join(out, "stubs")
+            open(blocker, "w").close()                      # a plain file where the stubs folder goes
+            r = self.merge(out)
+            self.assertNotEqual(r.returncode, 0, r.stdout + r.stderr)
+            self.assertFalse(os.path.exists(os.path.join(out, "index.json")))
+            os.remove(blocker)
+            r = self.merge(out)
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            self.assertTrue(os.path.isfile(os.path.join(out, "index.json")))
+            self.assertTrue(os.path.isfile(os.path.join(out, "stubs", "vs_0.spv")))
 
 
 if __name__ == "__main__":

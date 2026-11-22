@@ -346,6 +346,56 @@ class RttiScanCoreTest(unittest.TestCase):
             data = json.load(f)
         self.assertEqual(data["type_descriptors"], 1)
 
+    def test_output_it_cannot_write_is_one_line(self):
+        img_path = os.path.join(self.tmp.name, "unwritable.exe")
+        with open(img_path, "wb") as f:
+            f.write(make_synthetic_pe(text_bytes=b"\xc3" * 16, rdata_bytes=b"\x00" * 16))
+
+        for label, out in [
+            ("missing folder", os.path.join(self.tmp.name, "no_dir", "out.json")),
+            ("folder as file", self.tmp.name),
+        ]:
+            with self.subTest(label):
+                p = self.run_tool(img_path, "--out", out)
+                self.assertEqual(p.returncode, 1, p.stdout)
+                self.assertNotIn("Traceback", p.stderr)
+                self.assertTrue(p.stderr.startswith(f"ERROR: {out}: "), p.stderr)
+                self.assertEqual(len(p.stderr.strip().splitlines()), 1, p.stderr)
+                self.assertEqual(p.stdout, "")
+
+    def test_failed_write_keeps_previous_report(self):
+        # A write that fails after the file opens (full disk, locked range) used to leave a 0-byte report.
+        from unittest import mock
+        out = os.path.join(self.tmp.name, "kept.rtti.json")
+        with open(out, "w", encoding="utf-8") as f:
+            f.write('{"previous": true}')
+        real = tempfile.NamedTemporaryFile
+
+        def failing(*args, **kwargs):
+            handle = real(*args, **kwargs)
+
+            def fail_write(text):
+                handle.file.write(text[:8])
+                raise OSError(28, "No space left on device")
+
+            handle.write = fail_write
+            return handle
+
+        for label, patch in [
+            ("write", mock.patch.object(rtti_scan.tempfile, "NamedTemporaryFile", side_effect=failing)),
+            ("replace", mock.patch.object(rtti_scan.os, "replace", side_effect=PermissionError(13, "busy"))),
+        ]:
+            with self.subTest(label), patch, self.assertRaises(OSError):
+                rtti_scan.write_report(out, '{"new": true}')
+            with open(out, encoding="utf-8") as f:
+                self.assertEqual(f.read(), '{"previous": true}')
+            self.assertEqual(sorted(os.listdir(self.tmp.name)), ["kept.rtti.json"])
+
+        rtti_scan.write_report(out, '{"new": true}')
+        with open(out, encoding="utf-8") as f:
+            self.assertEqual(f.read(), '{"new": true}')
+        self.assertEqual(sorted(os.listdir(self.tmp.name)), ["kept.rtti.json"])
+
     def test_invalid_pe_images_rejected_cleanly(self):
         good = bytearray(make_synthetic_pe(text_bytes=b"\xc3" * 16, rdata_bytes=b"\x00" * 16))
         bad_pe32 = bytearray(good)

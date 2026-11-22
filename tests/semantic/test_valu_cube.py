@@ -22,6 +22,7 @@ Note on v_cubema_f32: RDNA2 ISA returns 2.0 * signed_major_axis (negative on -X/
 follow v_cubema_f32 with `v_rcp_f32_e64 dst, |src|`.
 """
 import itertools
+import math
 import os
 import struct
 import sys
@@ -44,7 +45,10 @@ STUB_DXBC = b"DXBC" + bytes(24) + struct.pack("<I", 0) + bytes(4)
 
 
 def f32(x: float) -> float:
-    return struct.unpack("<f", struct.pack("<f", x))[0]
+    try:
+        return struct.unpack("<f", struct.pack("<f", x))[0]
+    except OverflowError:
+        return math.copysign(math.inf, x)
 
 
 def f32_bits(x: float) -> int:
@@ -191,6 +195,14 @@ class CubeValuTests(unittest.TestCase):
         for label, (x, y, z) in faces:
             with self.subTest(face=label, x=x, y=y, z=z):
                 self.assert_cube(x, y, z)
+
+    def test_major_axis_doubling_boundary(self):
+        for major_bits, expected_ma in ((0x7EFFFFFF, 0x7F7FFFFF), (0x7F000000, 0x7F800000),
+                                        (0xFEFFFFFF, 0xFF7FFFFF), (0xFF000000, 0xFF800000)):
+            with self.subTest(major_bits=hex(major_bits)):
+                major = bits_f32(major_bits)
+                self.assertEqual(ref_cube_words(major, 1.0, 1.0)[3], expected_ma)
+                self.assert_cube(major, 1.0, 1.0)
 
     def test_axis_tie_cases(self):
         # |x| == |y| with |z| < |x| -> Y wins over X for all sign combinations.

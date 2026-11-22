@@ -25,6 +25,11 @@
 // is false; without it the caller flushes only when none is. With partially_bound (descriptorBindingPartiallyBound) only index 0 is written at
 // creation; otherwise every element of every array starts as the fallback.
 //
+// The table of binding 2 lives in DEVICE_LOCAL memory: every divergent T#/S# lookup reads it, and a HOST_VISIBLE
+// table measured 19-46x slower there at 100k entries on an RTX 2060 SUPER (vk_descriptor_bench, D3D-56, #639).
+// flush() takes the command buffer that will use the set: it uploads only the slots that changed, from a mapped
+// staging buffer, and barriers the copy before the draws. The table at creation is empty until that first flush.
+//
 // Not thread-safe: the owner serialises calls.
 
 #ifndef VK_NO_PROTOTYPES
@@ -111,12 +116,12 @@ public:
     BindlessSet(PFN_vkGetDeviceProcAddr get, VkDevice device, const VkPhysicalDeviceMemoryProperties& memory,
                 BindlessFeatures features = {})
         : device_(device), memory_(memory), features_(features) {
-        ok_ = vk_.load(get, device) && create_layout() && create_fallbacks() && create_table_buffer() && fill();
+        ok_ = vk_.load(get, device) && create_layout() && create_fallbacks() && create_table_buffers() && fill();
     }
 
     ~BindlessSet() {
         release_retired();
-        if (table_buffer_.buffer) destroy(table_buffer_);
+        destroy(table_buffers_);
         if (fallback_sampler_) vk_.vkDestroySampler(device_, fallback_sampler_, nullptr);
         for (const VkImageView view : fallback_views_) vk_.vkDestroyImageView(device_, view, nullptr);
         for (const auto& image : fallback_images_) {
@@ -213,7 +218,8 @@ public:
     bool insert_key(const DescriptorKey& key, std::uint32_t index) {
         const auto result = table_.insert_or_update(key.data(), index);
         table_dirty_ |= result != DescriptorTable::InsertResult::unchanged;
-        existing_entries_changed_ |= result == DescriptorTable::InsertResult::replaced;
+        existing_entries_changed_ |= result == DescriptorTable::InsertResult::replaced ||
+                                     result == DescriptorTable::InsertResult::added_with_relocation;
         return true;
     }
     // Erasing compacts the key's probe cluster, so other keys' entries may change slots.
@@ -226,35 +232,36 @@ public:
 
     // True when the next flush() will change entries a running shader may be probing, or replace the table's
     // buffer: the caller then flushes only once no command buffer that uses the set is still executing. Without
-    // it the flush only adds entries to the buffer in place, which a running lookup cannot see half done.
+    // it the flush only adds entries, and the copy of an entry is not atomic: a shader probing a different key
+    // could in principle see a torn entry that matches it, which is accepted as vanishingly unlikely because the
+    // added key is new (there is no live key equal to it).
     bool flush_needs_idle() const {
-        return table_dirty_ && (existing_entries_changed_ || table_.size_bytes() > table_buffer_.size);
+        return table_dirty_ && (existing_entries_changed_ || force_full_upload_ ||
+                                table_.size_bytes() > table_buffers_.table.size);
     }
 
-    // Writes the pending descriptor changes and the table: before the commands that use the set are executed.
-    // A table that has grown gets a new buffer (binding 2 is rewritten); the old one is kept until
-    // release_retired(). False when that buffer cannot be made: the set then still has the table as of the last
+    // True when the table's buffer was allocated in DEVICE_LOCAL memory (the fallback for a device without it is
+    // HOST_VISIBLE, which still works, just slower).
+    bool table_in_device_local_memory() const { return table_device_local_; }
+
+    // True when the command buffer that carried the last table upload reached the queue; false keeps the upload
+    // obligation, and the next flush() rebuilds the whole table (the changed-slot list was consumed when the copy
+    // was recorded). A failed vkQueueSubmit is the caller's signal, not ours.
+    void table_upload_result(bool submitted) {
+        if (!upload_in_flight_) return;
+        upload_in_flight_ = false;
+        if (submitted) return;
+        table_dirty_ = true;
+        force_full_upload_ = true;
+    }
+
+    // Writes the pending descriptor changes and uploads the table, in `command_buffer`, before the commands that use
+    // the set are recorded after it. A table that has grown gets new buffers (binding 2 is rewritten); the old ones
+    // stay until release_retired(). False when they cannot be made: the set then still has the table as of the last
     // flush.
-    bool flush() {
+    bool flush(VkCommandBuffer command_buffer) {
         bool written = true;
-        if (table_dirty_) {
-            const std::vector<std::uint32_t> words = table_.build_gpu_buffer();
-            const VkDeviceSize bytes = words.size() * sizeof(std::uint32_t);
-            if (bytes > table_buffer_.size) {
-                TableBuffer larger;
-                if (create(larger, bytes)) {
-                    retired_.push_back(table_buffer_);
-                    table_buffer_ = larger;
-                    write_table_binding();
-                } else {
-                    written = false;
-                }
-            }
-            if (written) {
-                std::memcpy(table_buffer_.mapped, words.data(), bytes);
-                table_dirty_ = existing_entries_changed_ = false;
-            }
-        }
+        if (table_dirty_ || !table_uploaded_) written = upload_table(command_buffer);
         if (!pending_.empty()) {
             std::vector<VkWriteDescriptorSet> writes(pending_.size());
             for (std::size_t i = 0; i < pending_.size(); ++i) {
@@ -275,7 +282,7 @@ public:
 
     // Frees the buffers of tables that have since grown: when nothing submitted before the last flush() still runs.
     void release_retired() {
-        for (auto& buffer : retired_) destroy(buffer);
+        for (auto& buffers : retired_) destroy(buffers);
         retired_.clear();
     }
 
@@ -287,7 +294,7 @@ private:
     X(vkDestroyBuffer) X(vkGetBufferMemoryRequirements) X(vkBindBufferMemory) X(vkAllocateMemory)              \
     X(vkFreeMemory) X(vkMapMemory) X(vkCreateImage) X(vkDestroyImage) X(vkGetImageMemoryRequirements)          \
     X(vkBindImageMemory) X(vkCreateImageView) X(vkDestroyImageView) X(vkCreateSampler) X(vkDestroySampler)     \
-    X(vkCmdPipelineBarrier) X(vkCmdClearColorImage)
+    X(vkCmdPipelineBarrier) X(vkCmdCopyBuffer) X(vkCmdUpdateBuffer) X(vkCmdClearColorImage)
 #define LEONIDA_BINDLESS_MEMBER(name) PFN_##name name = nullptr;
         LEONIDA_BINDLESS_FUNCTIONS(LEONIDA_BINDLESS_MEMBER)
 #undef LEONIDA_BINDLESS_MEMBER
@@ -314,6 +321,12 @@ private:
         VkDeviceMemory memory = VK_NULL_HANDLE;
         void* mapped = nullptr;
         std::size_t size = 0;
+    };
+
+    // The table and the mapped staging copy the CPU writes before vkCmdCopyBuffer moves the changes.
+    struct TableBuffers {
+        TableBuffer table;    // DEVICE_LOCAL when the device has it; what binding 2 names
+        TableBuffer staging;  // HOST_VISIBLE | HOST_COHERENT
     };
 
     struct Pending {
@@ -434,10 +447,11 @@ private:
         return vk_.vkCreateSampler(device_, &sampler, nullptr, &fallback_sampler_) == VK_SUCCESS;
     }
 
-    bool create(TableBuffer& out, std::size_t bytes) const {
+    bool create(TableBuffer& out, std::size_t bytes, bool device_local, bool* got_device_local = nullptr) const {
         VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
         info.size = bytes;
-        info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+        info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                     (device_local ? VK_BUFFER_USAGE_TRANSFER_DST_BIT : VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
         TableBuffer made;
         made.size = bytes;
         if (vk_.vkCreateBuffer(device_, &info, nullptr, &made.buffer) != VK_SUCCESS) return false;
@@ -445,12 +459,23 @@ private:
         vk_.vkGetBufferMemoryRequirements(device_, made.buffer, &requirements);
         VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
         allocation.allocationSize = requirements.size;
-        allocation.memoryTypeIndex = memory_type(
-            requirements.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-        const bool ready = allocation.memoryTypeIndex != 0xffffffffu &&
-                           vk_.vkAllocateMemory(device_, &allocation, nullptr, &made.memory) == VK_SUCCESS &&
-                           vk_.vkBindBufferMemory(device_, made.buffer, made.memory, 0) == VK_SUCCESS &&
-                           vk_.vkMapMemory(device_, made.memory, 0, VK_WHOLE_SIZE, 0, &made.mapped) == VK_SUCCESS;
+        allocation.memoryTypeIndex =
+            device_local ? memory_type(requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)
+                         : memory_type(requirements.memoryTypeBits,
+                                       VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        if (device_local && allocation.memoryTypeIndex == 0xffffffffu)
+            allocation.memoryTypeIndex = memory_type(requirements.memoryTypeBits,
+                                                     VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                                         VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        if (got_device_local)
+            *got_device_local = allocation.memoryTypeIndex != 0xffffffffu &&
+                                (memory_.memoryTypes[allocation.memoryTypeIndex].propertyFlags &
+                                 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0;
+        bool ready = allocation.memoryTypeIndex != 0xffffffffu &&
+                     vk_.vkAllocateMemory(device_, &allocation, nullptr, &made.memory) == VK_SUCCESS &&
+                     vk_.vkBindBufferMemory(device_, made.buffer, made.memory, 0) == VK_SUCCESS;
+        if (ready && !device_local)
+            ready = vk_.vkMapMemory(device_, made.memory, 0, VK_WHOLE_SIZE, 0, &made.mapped) == VK_SUCCESS;
         if (!ready) {
             destroy(made);
             return false;
@@ -465,17 +490,133 @@ private:
         buffer = {};
     }
 
-    bool create_table_buffer() {
-        const std::vector<std::uint32_t> words = table_.build_gpu_buffer();
-        const VkDeviceSize bytes = words.size() * sizeof(std::uint32_t);
-        if (!create(table_buffer_, bytes)) return false;
-        std::memcpy(table_buffer_.mapped, words.data(), bytes);
+    void destroy(TableBuffers& buffers) const {
+        destroy(buffers.staging);
+        destroy(buffers.table);
+    }
+
+    bool create_table_buffers() {
+        const std::size_t bytes = table_.size_bytes();
+        TableBuffers made;
+        bool device_local = false;
+        if (!create(made.table, bytes, true, &device_local) || !create(made.staging, bytes, false)) {
+            destroy(made);
+            return false;
+        }
+        table_buffers_ = made;
+        table_device_local_ = device_local;
+        table_uploaded_ = false;  // the first flush() uploads it, in the command buffer that will use it
         table_dirty_ = existing_entries_changed_ = false;
         return true;
     }
 
-    void write_table_binding() const {
-        const VkDescriptorBufferInfo info{table_buffer_.buffer, 0, VK_WHOLE_SIZE};
+    // Uploads what changed since the last call: the whole table when it grew (the mask moved) or was never uploaded,
+    // the changed slots otherwise. The copy and its barrier go into `command_buffer`, before the draws.
+    bool upload_table(VkCommandBuffer command_buffer) {
+        if (!command_buffer) return false;
+        const std::size_t bytes = table_.size_bytes();
+        bool full = force_full_upload_ || !table_uploaded_ || bytes > table_buffers_.table.size;
+        bool grew = false;
+        if (bytes > table_buffers_.table.size) {
+            TableBuffers larger;
+            bool device_local = false;
+            if (!create(larger.table, bytes, true, &device_local) || !create(larger.staging, bytes, false)) {
+                destroy(larger);
+                return false;
+            }
+            table_device_local_ = device_local;
+            retired_.push_back(table_buffers_);
+            table_buffers_ = larger;
+            write_table_binding(table_buffers_.table.buffer);
+            full = true;
+            grew = true;
+        }
+        const DescriptorTable::Changes changes = table_.take_changes();
+        full = full || changes.all;
+        bool recorded = false;
+        // The staging buffer is written only for buffers that were just created (first upload or growth): a later
+        // flush then either updates slots with vkCmdUpdateBuffer or rebuilds from a fresh pair, so no copy still in
+        // flight can be reading bytes the CPU rewrites.
+        const bool fresh = grew || !table_uploaded_;
+        const auto upload_all = [&]() {
+            const std::vector<std::uint32_t> words = table_.build_gpu_buffer();
+            if (fresh) {
+                std::memcpy(table_buffers_.staging.mapped, words.data(), bytes);
+                copy_table_range(command_buffer, 0, bytes);
+            } else {
+                update_table_range(command_buffer, 0, words.data(), bytes);
+            }
+            recorded = true;
+        };
+        if (full) {
+            upload_all();
+        } else if (!changes.slots.empty()) {
+            std::vector<std::uint32_t> slots = changes.slots;
+            std::sort(slots.begin(), slots.end());
+            slots.erase(std::unique(slots.begin(), slots.end()), slots.end());
+            bool staged = true;
+            for (std::size_t first = 0; staged && first < slots.size();) {
+                std::size_t last = first;
+                while (last + 1 < slots.size() && slots[last + 1] == slots[last] + 1) ++last;
+                const std::uint32_t count = std::uint32_t(last - first + 1);
+                std::vector<std::uint32_t> words(std::size_t(count) * 10);
+                staged = table_.read_slots(slots[first], count, words.data());
+                if (staged) {
+                    update_table_range(command_buffer, entry_offset(slots[first]), words.data(),
+                                       VkDeviceSize(words.size() * sizeof(std::uint32_t)));
+                    recorded = true;
+                }
+                first = last + 1;
+            }
+            if (!staged) upload_all();  // an inconsistent slot list: the whole table is still correct
+        }
+        if (!recorded) return true;  // nothing was copied: keep the obligation for the next flush
+        record_table_barrier(command_buffer);
+        upload_in_flight_ = true;
+        table_dirty_ = existing_entries_changed_ = false;
+        table_uploaded_ = true;
+        force_full_upload_ = false;
+        return true;
+    }
+
+    // Copies the data into the command buffer while recording (64 KiB per call, the Vulkan limit), so no staging
+    // buffer is read at execution: a later flush can rewrite its own staging without racing a pending copy.
+    void update_table_range(VkCommandBuffer command_buffer, VkDeviceSize offset, const void* data,
+                            VkDeviceSize size) const {
+        constexpr VkDeviceSize max_chunk = 65536;
+        const auto* bytes = static_cast<const std::uint8_t*>(data);
+        for (VkDeviceSize done = 0; done < size; done += max_chunk) {
+            const VkDeviceSize chunk = std::min(max_chunk, size - done);
+            vk_.vkCmdUpdateBuffer(command_buffer, table_buffers_.table.buffer, offset + done, chunk, bytes + done);
+        }
+    }
+
+    void copy_table_range(VkCommandBuffer command_buffer, VkDeviceSize offset, VkDeviceSize size) const {
+        const VkBufferCopy region{offset, offset, size};
+        vk_.vkCmdCopyBuffer(command_buffer, table_buffers_.staging.buffer, table_buffers_.table.buffer, 1, &region);
+    }
+
+    void record_table_barrier(VkCommandBuffer command_buffer) const {
+        VkBufferMemoryBarrier barrier{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+        barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.buffer = table_buffers_.table.buffer;
+        barrier.offset = 0;
+        barrier.size = VK_WHOLE_SIZE;
+        vk_.vkCmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0,
+                                 nullptr, 1, &barrier, 0, nullptr);
+    }
+
+    // The entry's first dword after the mask word; each entry is 10 dwords (40 bytes).
+    static constexpr VkDeviceSize entry_bytes = 10 * sizeof(std::uint32_t);
+    static VkDeviceSize entry_offset(std::uint32_t slot) {
+        return sizeof(std::uint32_t) + VkDeviceSize(slot) * entry_bytes;
+    }
+
+    void write_table_binding(VkBuffer buffer) const {
+        const VkDescriptorBufferInfo info{buffer, 0, VK_WHOLE_SIZE};
         VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
         write.dstSet = set_;
         write.dstBinding = bindless::table_binding;
@@ -502,7 +643,7 @@ private:
 
     // The table at binding 2 and the fallback at index 0 of every array, or in every element without partially_bound.
     bool fill() {
-        write_table_binding();
+        write_table_binding(table_buffers_.table.buffer);
         std::vector<std::vector<VkDescriptorImageInfo>> infos;
         std::vector<VkWriteDescriptorSet> writes;
         infos.reserve(bindless::bindings.size());
@@ -572,10 +713,14 @@ private:
     std::vector<Pending> pending_;
     std::unordered_map<std::uint64_t, std::size_t> pending_slots_;  // binding and index -> place in pending_
     DescriptorTable table_{64};
-    TableBuffer table_buffer_;
+    TableBuffers table_buffers_;
+    bool table_uploaded_ = false;  // the table's current contents are in table_buffers_.table
+    bool table_device_local_ = false;
     bool table_dirty_ = false;    // the table differs from the buffer
     bool existing_entries_changed_ = false;  // ... and not only by entries added
-    std::vector<TableBuffer> retired_;
+    bool upload_in_flight_ = false;   // a copy is recorded, not yet known to have reached the queue
+    bool force_full_upload_ = false;  // the last submit failed: rebuild the whole table on the next flush
+    std::vector<TableBuffers> retired_;
 };
 
 } // namespace leonida

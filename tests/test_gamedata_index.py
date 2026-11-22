@@ -6,6 +6,7 @@ Every fixture here is synthetic: small XML documents, a text list, a binary blob
 magics. The archive test builds a minimal RPF9-shaped file with a zlib stream and zero padding.
 """
 import csv
+import importlib.util
 import json
 import os
 import struct
@@ -17,6 +18,13 @@ import zlib
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOL = os.path.join(ROOT, "tools", "gamedata_index.py")
+
+
+def load_tool():
+    spec = importlib.util.spec_from_file_location("gamedata_index_under_test", TOOL)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def chunked(data: bytes, first: int = 65536):
@@ -154,6 +162,93 @@ class GamedataIndexTest(unittest.TestCase):
         self.assertEqual(s["types"]["xml"]["inflated"], len(xml))
         self.assertEqual(s["types"]["binary"]["files"], 1)
         self.assertEqual(s["roots"], {"RootA": {"files": 1, "inflated": len(xml)}})
+
+
+class XmlClassificationTest(unittest.TestCase):
+    """Synthetic XML classification cases; no game data, no files written."""
+
+    def setUp(self):
+        self.tool = load_tool()
+        self.bom = b"\xef\xbb\xbf"
+        self.decl = b'<?xml version="1.0"?>'
+
+    def test_declaration_after_bom_and_whitespace_is_detected(self):
+        for space in (b"", b"\n", b"   ", b"\r\n\t"):
+            with self.subTest(space=space):
+                data = self.bom + space + self.decl + b"\n<Root></Root>"
+                self.assertTrue(self.tool.has_xml_decl(data))
+                self.assertEqual(self.tool.stream_kind(data, {}), "decl")
+                self.assertEqual(self.tool.xml_root(data), "Root")
+                self.assertTrue(self.tool.standalone_xml(data))
+
+    def test_bom_only_empty_and_mid_document_declaration_have_no_leading_declaration(self):
+        for data in (b"", self.bom, self.bom + b"   ", b"<Root>" + self.decl + b"</Root>"):
+            with self.subTest(data=data):
+                self.assertFalse(self.tool.has_xml_decl(data))
+                self.assertEqual(self.tool.xml_root(data), "Root" if b"<Root>" in data else "")
+
+    def test_nested_same_name_root_is_not_a_closed_document(self):
+        for data in (b"<Foo><Foo></Foo>", b"<Foo><Foo></Foo>\n", b"<Foo><Foo>x</Foo>"):
+            with self.subTest(data=data):
+                self.assertFalse(self.tool.xml_complete("Foo", data))
+                self.assertFalse(self.tool.standalone_xml(self.decl + data))
+
+    def test_balanced_and_self_closing_roots_remain_complete(self):
+        for data in (b"<Foo></Foo>", b"<Foo>text<Foo>inner</Foo></Foo>",
+                     b"<Foo/>", b"  <Foo />\n", b"<Foo>\n</Foo>"):
+            with self.subTest(data=data):
+                self.assertTrue(self.tool.xml_complete("Foo", data))
+        self.assertFalse(self.tool.xml_complete("", b"<Foo></Foo>"))
+
+    def test_quoted_greater_than_in_attributes_does_not_end_a_tag(self):
+        for data in (b'<Foo><Foo attr="x>y"/></Foo>', b"<Foo><Foo attr='x>y'/></Foo>",
+                     b'<Foo attr="x>y">text</Foo>', b'<Foo attr="x>y"/>'):
+            with self.subTest(data=data):
+                self.assertTrue(self.tool.xml_complete("Foo", data))
+        # A real second open element still leaves the document incomplete.
+        self.assertFalse(self.tool.xml_complete("Foo", b'<Foo><Foo attr="x>y"></Foo>'))
+
+    def test_tags_inside_comments_and_cdata_do_not_count(self):
+        self.assertTrue(self.tool.xml_complete("Foo", b"<Foo><!-- <Foo> --><![CDATA[</Foo>]]></Foo>"))
+        for data in (b"<Foo><Foo><!-- </Foo> -->", b"<Foo><Foo><![CDATA[</Foo>]]>"):
+            with self.subTest(data=data):
+                self.assertFalse(self.tool.xml_complete("Foo", data))
+
+
+class XmlGroupingRegressionTest(GamedataIndexTest):
+    """The classification bugs must also show up in the index the tool writes."""
+
+    def test_bom_with_whitespace_is_grouped_as_an_xml_document(self):
+        doc = b"\xef\xbb\xbf\n" + b'<?xml version="1.0"?>' + b"\n<RootBom><Item/></RootBom>"
+        self.add(doc)
+        self.finish()
+        out = os.path.join(self.root, "index.json")
+        p = self.run_tool(self.carve, "--json", out)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        with open(out, encoding="utf-8") as f:
+            rows = json.load(f)["rows"]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["type"], "xml")
+        self.assertEqual(rows[0]["root"], "RootBom")
+        self.assertTrue(rows[0]["header"])
+        self.assertTrue(rows[0]["complete"])
+
+    def test_nested_open_root_stays_incomplete_after_continuation(self):
+        head = b"\xef\xbb\xbf" + b'<?xml version="1.0"?>' + b"\n<Foo><Foo>"
+        head += b"x" * (65536 - len(head))       # a full 64 KiB stream, so the next one is absorbed
+        tail = b"</Foo>"                         # closes only the nested Foo
+        self.add(head + tail, chunked(head + tail))
+        self.finish()
+        out = os.path.join(self.root, "index.json")
+        p = self.run_tool(self.carve, "--json", out)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        with open(out, encoding="utf-8") as f:
+            doc = json.load(f)
+        self.assertEqual(doc["summary"]["types"]["xml"]["files"], 1)
+        row = doc["rows"][0]
+        self.assertEqual(row["chunks"], 2)
+        self.assertTrue(row["header"])
+        self.assertFalse(row["complete"])
 
 
 if __name__ == "__main__":

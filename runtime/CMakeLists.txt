@@ -100,7 +100,10 @@ if(WIN32)
   target_compile_definitions(gta6rt PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
   target_compile_options(gta6rt PRIVATE /W4 /permissive- /utf-8)
   # Static shim tables register themselves at startup; keep the linker from dropping their objects.
-  target_link_options(gta6rt PRIVATE /OPT:NOREF)
+  # GTA6RT_HOST_BASE keeps the loader's own image off the default x64 EXE base (0x140000000), where a mapped EXE
+  # without relocations wants to go. Windows moves the EXE with ASLR anyway; Wine loads it at its preferred base.
+  set(GTA6RT_HOST_BASE /BASE:0x10000000000)
+  target_link_options(gta6rt PRIVATE /OPT:NOREF ${GTA6RT_HOST_BASE})
   target_link_libraries(gta6rt PRIVATE gta6rt_d3d12_xs_rootsig gta6rt_xtaskqueue psapi)
 
   # Root-signature forwarding test: needs a real PC d3d12.lib to serialize the synthetic descriptors.
@@ -193,6 +196,9 @@ include(CTest)
 if(BUILD_TESTING)
   add_executable(pipeline_cache_file_test test/pipeline_cache_file_test.cpp)
   add_test(NAME pipeline_cache_file COMMAND pipeline_cache_file_test)
+  # XDXR build descriptions (docs/xdxr.md); compared with d3d12.h where the Windows SDK provides it.
+  add_executable(xdxr_descs_test test/xdxr_descs_test.cpp)
+  add_test(NAME xdxr_descs COMMAND xdxr_descs_test)
   if(WIN32)
     # Loader tests. They build their own PE images, so they need neither the game nor any other input.
     add_executable(loader_test
@@ -202,7 +208,7 @@ if(BUILD_TESTING)
     )
     target_compile_definitions(loader_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
     target_compile_options(loader_test PRIVATE /W4 /permissive- /utf-8)
-    target_link_options(loader_test PRIVATE /OPT:NOREF)
+    target_link_options(loader_test PRIVATE /OPT:NOREF ${GTA6RT_HOST_BASE})
     add_dependencies(loader_test gta6rt_tls_host)
     add_test(NAME loader COMMAND loader_test)
     # PE loader tests use two locally built fixtures: a DLL with exports, imports and relocations, and an EXE that
@@ -212,6 +218,9 @@ if(BUILD_TESTING)
     add_library(tiny_dll SHARED test/fixtures/tiny_dll.cpp)
     target_compile_definitions(tiny_dll PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(tiny_dll PRIVATE /W4 /permissive- /utf-8 /GS-)
+    # tiny_fault_caught faults inside its own __try. MSVC always catches that; clang-cl only with asynchronous
+    # exceptions, otherwise the access violation escapes and the unwind-registration check fails.
+    target_compile_options(tiny_dll PRIVATE $<$<CXX_COMPILER_ID:Clang>:/EHa>)
     set_target_properties(tiny_dll PROPERTIES
       OUTPUT_NAME tiny_dll
       PREFIX ""
@@ -497,12 +506,16 @@ if(TARGET Vulkan::Headers)
     target_compile_definitions(d3d12_gcl8_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(d3d12_gcl8_test PRIVATE /W4 /permissive- /utf-8)
     add_test(NAME d3d12_gcl8 COMMAND d3d12_gcl8_test)
+    add_test(NAME d3d12_trace COMMAND Python3::Interpreter -I
+             "${CMAKE_CURRENT_SOURCE_DIR}/test/check_d3d12_trace.py" "$<TARGET_FILE:d3d12_gcl8_test>")
 
     # The Vulkan device behind the Xbox-ABI proxy, end to end.
     add_executable(d3d12_vulkan_device_test test/d3d12_vulkan_device_test.cpp)
     target_link_libraries(d3d12_vulkan_device_test PRIVATE gta6rt_d3d12_com)
     target_compile_definitions(d3d12_vulkan_device_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(d3d12_vulkan_device_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME d3d12_vulkan_device COMMAND d3d12_vulkan_device_test)
+    set_tests_properties(d3d12_vulkan_device PROPERTIES SKIP_RETURN_CODE 77)
 
     # ClearUnorderedAccessViewUint/Float on buffers and textures, read back through D3D12.
     add_executable(d3d12_uav_clear_test test/d3d12_uav_clear_test.cpp)

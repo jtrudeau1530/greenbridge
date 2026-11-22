@@ -18,6 +18,8 @@ import time
 import zlib
 
 # zlib stream start, or a Bink 2 video ('KB2' + revision letter, then u32 size-8).
+# RPF9 magic as it sits on disk: the tag "RPF9" stored little-endian (docs/rpf.md, docs/bvh.md).
+MAGIC = b"9FPR"
 ZHDR = re.compile(rb"\x78[\x01\x5e\x9c\xda]|KB2[a-z]")
 
 
@@ -67,6 +69,9 @@ def main() -> int:
         sys.exit(f"{a.archive}: empty file")
     if size < 8:
         sys.exit(f"{a.archive}: too short for an RPF9 header ({size} bytes)")
+    with open(a.archive, "rb") as fh:
+        if fh.read(4) != MAGIC:
+            sys.exit(f"{a.archive}: not an RPF9 archive (expected the magic {MAGIC.decode()} at offset 0)")
     if a.start is not None and not 0 <= a.start < size:
         sys.exit(f"{a.archive}: --start {a.start} is outside the file (0..{size - 1})")
     if a.start is None:

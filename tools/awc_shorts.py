@@ -88,8 +88,11 @@ def main(argv=None) -> int:
     ap.add_argument("--max-seconds", type=float, default=60.0)
     ap.add_argument("--jobs", type=int, default=max(1, (os.cpu_count() or 2) // 2))
     a = ap.parse_args(argv)
-    if a.min_seconds < 0 or a.max_seconds < a.min_seconds:
-        print("awc_shorts: error: require 0 <= min-seconds <= max-seconds", file=sys.stderr)
+    if not 0 <= a.min_seconds <= a.max_seconds:
+        print("awc_shorts: error: require 0 <= --min-seconds <= --max-seconds", file=sys.stderr)
+        return 2
+    if not os.path.exists(a.src):
+        print(f"awc_shorts: error: source does not exist: {a.src!r}", file=sys.stderr)
         return 2
     banks = _banks(a.src)
     os.makedirs(a.out, exist_ok=True)

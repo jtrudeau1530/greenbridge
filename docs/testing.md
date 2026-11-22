@@ -20,7 +20,12 @@ This page collects the setup steps and the problems testers have run into so far
   - `llvm-21` in WSL, with `LLVM_MC` set to the whole command:
     `LLVM_MC="wsl -d Ubuntu -e /usr/lib/llvm-21/bin/llvm-mc"`.
 
-  On Linux and macOS, the distribution's or Homebrew's `llvm-mc` on `PATH` is enough.
+  On Linux and macOS, the distribution's or Homebrew's `llvm-mc` on `PATH` is enough, if it is 21 or newer.
+
+  An older `llvm-mc` is not enough for everything. Ubuntu 24.04's `llvm-18` (18.1.3) runs `run_gpu_tests.py`,
+  `valu_fuzz.py --family mem` and `lds_fuzz.py`, but rejects `op_sel` on the 16-bit integer VOP3 forms that
+  `valu_fuzz.py --family f16` generates (`v_ashrrev_i16_e64 ... op_sel:[0,0,0]`: "not a valid operand"), so no f16
+  program assembles. 23.1.6 assembles them.
 - **SPIRV-Tools** (`spirv-as`, `spirv-val`): part of the Vulkan SDK, or a distribution package.
 - **A C++20 compiler, CMake and the Vulkan headers** to build the test programs:
   - Windows: Visual Studio 2022 with "Desktop development with C++", the Windows SDK 10.0.26100 or newer, and the
@@ -119,7 +124,7 @@ With more than one GPU, pick one through the Vulkan loader, for example
 | `gs_tri` and `ms_tri` fail on a Mac | MoltenVK has no geometry stage and no `VK_EXT_mesh_shader` | Current `main` reports them as skipped |
 | CMake stops with "needs the Windows SDK 10.0.26100 or newer", or MSVC reports `'Desc_1_2': is not a member of 'D3D12_VERSIONED_ROOT_SIGNATURE_DESC'` | A Windows SDK older than 10.0.26100 (10.0.22621 is the common one), which has no version 1.2 root signatures | `winget install Microsoft.WindowsSDK.10.0.26100`, or add it in the Visual Studio Installer, then delete `runtime/build` and configure again |
 | `run_gpu_tests.py` fails on a `dict \| None` annotation | Python older than 3.10 | Use Python 3.11+ |
-| A GPU test that uses `image_load` (or lighting built from real shaders) returns zero for every texel except pixel (0,0); the image is black | Reported by @Silliana in #603 (not reproduced here): the shader bounds-checks `image_load` against the width and height stored in the T# it reads from the descriptor, so a hand-built descriptor with no real size makes every other coordinate look out of range | Put the real width and height of the image in the T# (see `docs/d3d12_vulkan.md` §5.3, *Descriptor T#/S# parsing*); don't leave them zero |
+| A GPU test that uses `image_load` (or lighting built from real shaders) reads zeros from its image; @Silliana saw every texel except pixel (0,0) come back zero in their own layer (#603, not reproduced here) | In this runtime the shader turns the T# words into an index through the descriptor hash table (`runtime/src/descriptor_table.h`: a miss gives index 0), and index 0 is a 1×1 image of zeros (`runtime/src/vulkan_bindless.h`), so a hand-built or zeroed T# that was never registered reads zeros even at (0,0). The translator does not compare coordinates with the T# size, and `cs_imgload.asm` only uses its T# words as a hash key | Register the descriptor through the runtime (for D3D12, create it with `CreateShaderResourceView`) so its T# hits the table, with the image's real width and height (stored as size − 1, see `runtime/src/gfx10_descriptors.h`) |
 
 ## Posting your result
 

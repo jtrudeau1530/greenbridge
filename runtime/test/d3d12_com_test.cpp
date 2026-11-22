@@ -4,6 +4,7 @@
 // Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation; any validation error fails the test.
 #include "vk_test_device.h"
 #include "../shims/d3d12_com.h"
+#include "../shims/d3d12_trace.h"
 
 #include <array>
 #include <cstdint>
@@ -27,7 +28,9 @@ struct Ref {
 
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    if (argc == 2 && std::strcmp(argv[1], "--trace-d3d12") == 0) rt::d3d12_trace::set_enabled(true);
+    else if (argc != 1) return 2;
     using namespace leonida;
     vktest::Device d;
     EXPECT(d.create());
@@ -267,7 +270,7 @@ int main() {
         EXPECT(invalid_bundle_call([&](auto* b) { b->SetPredication(nullptr, 0, D3D12_PREDICATION_OP_EQUAL_ZERO); }));
 
         list->Barrier(1, &group);
-        list->DrawInstanced(3, 1, 0, 0);  // not implemented: reported once by its generated stub, recording continues
+        list->SetMarker(0, nullptr, 0);  // not implemented: reported once by its generated stub, recording continues
         EXPECT(list->Close() == S_OK);
         EXPECT(list->Close() == E_FAIL);  // already closed
 
