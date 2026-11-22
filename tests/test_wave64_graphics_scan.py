@@ -14,8 +14,9 @@ import wave64_graphics_scan as scan  # noqa: E402
 
 
 def fixture(name, lines):
-    """A synthetic disassembly: the real files start with shader_disasm's '; name' header, then asm."""
-    return name, "; %s  code 0x0..0x10 (header), gfx1013, 0 invalid words\n" % name[:-2] + "\n".join(lines) + "\n"
+    """A synthetic disassembly: the real files start with shader_disasm's '; name' header, then tab-prefixed asm."""
+    body = "\n".join("\t" + ln if not ln.startswith(";") else ln for ln in lines)
+    return name, "; %s  code 0x0..0x10 (header), gfx1013, 0 invalid words\n%s\n" % (name[:-2], body)
 
 
 PS_W64_SENSITIVE = fixture("ps_w64a.s", [
@@ -23,21 +24,35 @@ PS_W64_SENSITIVE = fixture("ps_w64a.s", [
     "s_cbranch_execz 42",
     "v_add_f32_e32 v0, v1, v2",
 ])
+PS_W64_EXEC_ONLY = fixture("ps_w64movexec.s", [
+    # the review's case: no WAVE64_RE marker, but a _b64 op with an exec operand classifies wave64,
+    # exactly as rdna2spirv.py's g.wave64 does
+    "s_mov_b64 exec, s[0:1]",
+    "s_cbranch_execz 42",
+])
 PS_W64_CLEAN = fixture("ps_w64clean.s", [
-    # _saveexec_b64 marks the shader wave64 for WAVE64_RE, but mask arithmetic alone is per-lane and exact
+    # _saveexec_b64 marks the shader wave64, but mask arithmetic alone is per-lane and exact
     "s_and_saveexec_b64 s[0:1], s[2:3], s[4:5]",
+    "v_add_f32_e32 v0, v1, v2",
+])
+PS_W64_BCNT_SPLIT = fixture("ps_w64bcnt.s", [
+    "s_bcnt1_i32_b64 s0, exec",      # wave-mask path outright
+    "s_bcnt1_i32_b64 s1, s[2:3]",    # register source: candidate, provenance unresolved
+])
+PS_W64_COMMENT = fixture("ps_w64comment.s", [
+    "; v_readlane_b32 mentioned in a comment must not count",
+    "s_wqm_b64 s[0:1], exec",        # WAVE64_RE marker only
     "v_add_f32_e32 v0, v1, v2",
 ])
 PS_W32 = fixture("ps_w32a.s", ["v_add_f32_e32 v0, v1, v2"])
 VS_W64 = fixture("vs_w64b.s", [
-    # a real wave64 shader always touches the 64-bit exec, which is what WAVE64_RE sees
     "s_or_saveexec_b64 s[0:1], s[2:3], exec",
     "v_readlane_b32 v1, v2, s4",
     "v_readlane_b32 v3, v4, s5",
 ])
 GS_W64 = fixture("gs_w64d.s", ["s_ff1_i32_b64 s0, s[2:3]"])
 CS_W64 = fixture("cs_w64c.s", ["v_mbcnt_hi_u32_b32 v1, v2, v3"])  # compute: never counted
-MS_W64 = fixture("ms_w64e.s", ["s_cbranch_execz 7"])             # mesh: never counted
+MS_W64 = fixture("ms_w64e.s", ["s_cbranch_execz 7"])              # mesh: wave64 regardless, never counted
 VS_UNKNOWN = fixture("xx_w64f.s", ["v_readfirstlane_b32 s1, v1"])  # stage '?': skipped
 
 
@@ -50,26 +65,46 @@ class ScanTests(unittest.TestCase):
             return scan.scan_directory(directory)
 
     def test_counts_wave64_graphics_only(self):
-        report = self.scan(PS_W64_SENSITIVE, PS_W64_CLEAN, PS_W32, VS_W64, GS_W64, CS_W64, MS_W64, VS_UNKNOWN)
+        report = self.scan(PS_W64_SENSITIVE, PS_W64_EXEC_ONLY, PS_W64_CLEAN, PS_W32, VS_W64, GS_W64,
+                           CS_W64, MS_W64, VS_UNKNOWN)
         ps, vs, gs = report["per_stage"]["ps"], report["per_stage"]["vs"], report["per_stage"]["gs"]
-        self.assertEqual(ps["shaders"], 3)
-        self.assertEqual(ps["wave64"], 2)
-        self.assertEqual(ps["with_cross_half"], 1)
+        self.assertEqual(ps["shaders"], 4)
+        self.assertEqual(ps["wave64"], 3)
+        self.assertEqual(ps["with_selected_op"], 2)
         self.assertEqual(vs["wave64"], 1)
         self.assertEqual(gs["wave64"], 1)
         self.assertEqual(report["other_stages"], {"shaders": 3, "wave64": 2})  # cs + ms wave64, xx unknown
 
+    def test_b64_exec_operand_classifies_wave64_without_a_marker(self):
+        report = self.scan(PS_W64_EXEC_ONLY)
+        b = report["per_stage"]["ps"]
+        self.assertEqual((b["wave64"], b["with_selected_op"]), (1, 1))
+        self.assertEqual(b["occurrences"], {"s_cbranch_execz": 1})  # s_mov_b64 exec is the classifier, not a hit
+
+    def test_mask_word_source_split(self):
+        report = self.scan(PS_W64_BCNT_SPLIT, GS_W64)
+        ps = report["per_stage"]["ps"]
+        self.assertEqual(ps["occurrences"], {"s_bcnt1_i32_b64": 2})
+        self.assertEqual(ps["mask_word_source"]["exec_vcc"], {"s_bcnt1_i32_b64": 1})
+        self.assertEqual(ps["mask_word_source"]["other"], {"s_bcnt1_i32_b64": 1})
+        self.assertEqual(report["per_stage"]["gs"]["mask_word_source"]["other"], {"s_ff1_i32_b64": 1})
+
     def test_occurrence_counts_per_op(self):
         report = self.scan(PS_W64_SENSITIVE, VS_W64, GS_W64)
-        ps = report["per_stage"]["ps"]["occurrences"]
-        self.assertEqual(ps, {"v_mbcnt_hi_u32_b32": 1, "s_cbranch_execz": 1})
+        self.assertEqual(report["per_stage"]["ps"]["occurrences"],
+                         {"v_mbcnt_hi_u32_b32": 1, "s_cbranch_execz": 1})
         self.assertEqual(report["per_stage"]["vs"]["occurrences"], {"v_readlane_b32": 2})
         self.assertEqual(report["per_stage"]["gs"]["occurrences"], {"s_ff1_i32_b64": 1})
 
-    def test_clean_wave64_shader_has_no_cross_half(self):
+    def test_comments_and_operand_text_never_count(self):
+        report = self.scan(PS_W64_COMMENT)
+        b = report["per_stage"]["ps"]
+        self.assertEqual((b["wave64"], b["with_selected_op"], b["occurrences"]), (1, 0, {}))
+
+    def test_clean_wave64_shader_has_no_selected_op(self):
         report = self.scan(PS_W64_CLEAN)
         b = report["per_stage"]["ps"]
-        self.assertEqual((b["wave64"], b["with_cross_half"], b["occurrences"]), (1, 0, {}))
+        self.assertEqual((b["wave64"], b["with_selected_op"], b["occurrences"]), (1, 0, {}))
 
     def test_stage_from_index_json_overrides_the_name(self):
         # stage_of reads <disasm>/../index.json (the carve index), like the translator does
@@ -82,7 +117,7 @@ class ScanTests(unittest.TestCase):
             with open(os.path.join(real, "ps_0001.s"), "w", encoding="utf-8") as f:
                 f.write(text)  # name prefix says ps_ but the index is what counts
             report = scan.scan_directory(real)
-            self.assertEqual(report["per_stage"]["ps"]["with_cross_half"], 1)
+            self.assertEqual(report["per_stage"]["ps"]["with_selected_op"], 1)
 
     def test_main_json_has_no_shader_names(self):
         # privacy rule: nothing from the game leaves the work folder, not even file names
@@ -97,6 +132,7 @@ class ScanTests(unittest.TestCase):
             blob = open(out, encoding="utf-8").read()
             self.assertNotIn(".s", blob)
             self.assertNotIn("ps_w64a", blob)
+            self.assertNotIn("comment", blob)
             self.assertIn("v_mbcnt_hi_u32_b32", blob)
 
 
