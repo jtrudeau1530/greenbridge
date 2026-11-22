@@ -1,6 +1,7 @@
 // Which adapter a test's host D3D12 reference devices run on, for the tests that create those devices themselves and
 // compare the layer with a hardware adapter and with WARP. copycmp::create_host (d3d12_copy_compare.h) answers the
-// same question for the tests that go through it, and the rule here is the same:
+// same question for the tests that go through it. It reads LEONIDA_HOST_ADAPTER and matches the name through wanted()
+// and named() below, so the two cannot come to read the variable differently. The rule:
 //   - LEONIDA_HOST_ADAPTER names the hardware side by part of an adapter's name, without case. A name that matches no
 //     adapter ends the run with an error: a typo must not turn the comparisons into a silent pass. "warp" leaves the
 //     hardware side out, since these tests always compare with WARP as well.
@@ -35,6 +36,28 @@ inline std::string description(IDXGIAdapter* adapter) {
     return text;
 }
 
+// LEONIDA_HOST_ADAPTER in lower case; empty when it is unset.
+inline std::string wanted() {
+    char want[128] = {};
+    GetEnvironmentVariableA("LEONIDA_HOST_ADAPTER", want, sizeof(want));
+    std::string needle(want);
+    for (char& c : needle) c = char(std::tolower(static_cast<unsigned char>(c)));
+    return needle;
+}
+
+// The first adapter whose name contains `needle` (lower case), with a reference the caller releases; null when none
+// does.
+inline IDXGIAdapter1* named(IDXGIFactory1* factory, const std::string& needle) {
+    for (UINT i = 0;; ++i) {
+        IDXGIAdapter1* candidate = nullptr;
+        if (FAILED(factory->EnumAdapters1(i, &candidate))) return nullptr;
+        std::string lower = description(candidate);
+        for (char& c : lower) c = char(std::tolower(static_cast<unsigned char>(c)));
+        if (lower.find(needle) != std::string::npos) return candidate;
+        candidate->Release();
+    }
+}
+
 // The adapter for one pass of a test's `for (const bool warp : {false, true})` loop, with a reference the caller
 // releases (null: the default adapter), and the name the test prints for it. False when the pass has no adapter: no
 // WARP on this PC, or LEONIDA_HOST_ADAPTER=warp on the hardware pass.
@@ -45,25 +68,15 @@ inline bool reference(IDXGIFactory4* factory, const vktest::Device& vk, bool war
         name = "WARP";
         return SUCCEEDED(factory->EnumWarpAdapter(IID_PPV_ARGS(adapter)));
     }
-    char want[128] = {};
-    GetEnvironmentVariableA("LEONIDA_HOST_ADAPTER", want, sizeof(want));
-    std::string needle(want);
-    for (char& c : needle) c = char(std::tolower(static_cast<unsigned char>(c)));
+    const std::string needle = wanted();
     if (needle == "warp") return false;
     if (!needle.empty()) {
-        for (UINT i = 0;; ++i) {
-            IDXGIAdapter1* candidate = nullptr;
-            if (FAILED(factory->EnumAdapters1(i, &candidate))) break;
-            name = description(candidate);
-            std::string lower = name;
-            for (char& c : lower) c = char(std::tolower(static_cast<unsigned char>(c)));
-            if (lower.find(needle) != std::string::npos) {
-                *adapter = candidate;
-                return true;
-            }
-            candidate->Release();
+        if (IDXGIAdapter1* found = named(factory, needle)) {
+            name = description(found);
+            *adapter = found;
+            return true;
         }
-        std::fprintf(stderr, "LEONIDA_HOST_ADAPTER=%s: no such adapter\n", want);
+        std::fprintf(stderr, "LEONIDA_HOST_ADAPTER=%s: no such adapter\n", needle.c_str());
         std::exit(1);
     }
     VkPhysicalDeviceIDProperties id{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES};
