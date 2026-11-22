@@ -82,6 +82,13 @@ order of section 3; `CopyAndCompactBVH` is #52, not the first):
 | #14-#29 | `BitonicPreSortCS`, `BitonicOuterSortCS`, `BitonicInnerSortCS`, `BitonicPreSort64CS`, `BitonicOuterSort64CS`, `BitonicInnerSort64CS`, `RadixReset`, `RadixCount`, `PrefixSum64`, `PrefixSum128`, `PrefixSum256`, `PrefixSum512`, `PrefixSum1024`, `PrefixSum2048`, `PrefixSum4096`, `RadixAlloc` |
 | #30-#46 | `RearrangeTriangles`, `RearrangeBVHs`, `LoadInstances`, `SplitInstances`, `LoadTriangles`, `LoadProceduralGeometry`, `ReloadTriangles`, `ReloadProcedurals`, `PT_ConstructBVH4`, `ConstructBVH4`, `RefitBVH4`, `BuildBVHSplits`, `BuildBVHSplits64`, `FindTreelets`, `ResetKDOP`, `BuildKDOP`, `BuildApexPointMap` |
 | #47-#53 | `GetBVHCompactedSize`, `DecompressHeader`, `LeafRehydration`, `Box16Rehydration`, `Box32Rehydration`, `CopyAndCompactBVH`, `GetBVHCompactedSize` (again) |
+container is created twice: **`GetBVHCompactedSize`** (RT-182). With `LEONIDA_BVH_RECORD62=1` the test prints each
+creation's container with its `ILDN` module name and the first bytes of its digest: creations 1 to 51 are 51
+distinct containers, `GetBVHCompactedSize` (5,284 bytes, 0x14a4) among them at 47; creation 52 is
+`CopyAndCompactBVH` (4,404 bytes, 0x1134); creation 53 is `GetBVHCompactedSize` again, with the same digest and
+size. So the 0x14a4-byte container `FUN_18001d400` passes for `XDXR PostBuildInfoQuery` is the
+`GetBVHCompactedSize` module, and the PSO for it is created twice. Measured on 1.0.2.1 with an RTX 5080 (driver
+621.01): all 53 creations return `S_OK`.
 
 ## 3. The 52 modules
 
