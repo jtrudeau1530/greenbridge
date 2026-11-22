@@ -633,5 +633,195 @@ class Wave64MaskDecompositionTests(unittest.TestCase):
                 self.assertEqual(direct_eq, swapped_eq)
 
 
+class Wave64BoundaryExtremesTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        asm = (
+            WAVE64_BUILD_VCC_AND_SGPR
+            # 0: vcc == s[6:7]
+            + "s_cmp_eq_u64 vcc, s[6:7]\n" + emit_store_scc(0)
+            # 1: vcc != s[6:7]
+            + "s_cmp_lg_u64 vcc, s[6:7]\n" + emit_store_scc(1)
+            # 2: vcc == 0 (zero boundary)
+            + "s_cmp_eq_u64 vcc, 0\n" + emit_store_scc(2)
+            # 3: vcc != 0
+            + "s_cmp_lg_u64 vcc, 0\n" + emit_store_scc(3)
+            # 4: vcc == -1 (all ones boundary)
+            + "s_cmp_eq_u64 vcc, -1\n" + emit_store_scc(4)
+            # 5: vcc != -1
+            + "s_cmp_lg_u64 vcc, -1\n" + emit_store_scc(5)
+            + "s_endpgm\n"
+        )
+        cls.spv = translate_cs("cs_w64_boundary", asm, threads=64)
+
+    def test_boundary_extremes(self):
+        cases = [
+            # All zeros
+            (0x00000000, 0x00000000, 0x00000000, 0x00000000),
+            # All ones
+            (0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF),
+            # Half-word zeros and ones
+            (0x00000000, 0xFFFFFFFF, 0x00000000, 0xFFFFFFFF),
+            (0xFFFFFFFF, 0x00000000, 0xFFFFFFFF, 0x00000000),
+            # INT64_MAX: 0x7FFFFFFF_FFFFFFFF
+            (0xFFFFFFFF, 0x7FFFFFFF, 0xFFFFFFFF, 0x7FFFFFFF),
+            # INT64_MIN: 0x80000000_00000000
+            (0x00000000, 0x80000000, 0x00000000, 0x80000000),
+            # Single bit at lane 0
+            (0x00000001, 0x00000000, 0x00000001, 0x00000000),
+            # Single bit at lane 31 (MSB of lo)
+            (0x80000000, 0x00000000, 0x80000000, 0x00000000),
+            # Single bit at lane 32 (LSB of hi)
+            (0x00000000, 0x00000001, 0x00000000, 0x00000001),
+            # Single bit at lane 63 (MSB of hi)
+            (0x00000000, 0x80000000, 0x00000000, 0x80000000),
+            # Corner bits: lane 0 and lane 63 set
+            (0x00000001, 0x80000000, 0x00000001, 0x80000000),
+        ]
+        for lo, hi, s6, s7 in cases:
+            with self.subTest(lo=hex(lo), hi=hex(hi), s6=hex(s6), s7=hex(s7)):
+                mask64 = pack_u64(lo, hi)
+                scalar64 = pack_u64(s6, s7)
+                mem = run_cs(self.spv, 64, s4=lo, s5=hi, s6=s6, s7=s7)
+
+                want = [
+                    int(mask64 == scalar64),
+                    int(mask64 != scalar64),
+                    int(mask64 == 0),
+                    int(mask64 != 0),
+                    int(mask64 == 0xFFFFFFFFFFFFFFFF),
+                    int(mask64 != 0xFFFFFFFFFFFFFFFF),
+                ]
+                self.assertEqual([mem[4 * k] for k in range(6)], want)
+
+
+class Wave64SignedVsUnsignedTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        asm = (
+            WAVE64_BUILD_VCC_AND_SGPR
+            # 0: unsigned lt: vcc_lo < s6
+            + "s_cmp_lt_u32 vcc_lo, s6\n" + emit_store_scc(0)
+            # 1: signed lt: vcc_lo < s6
+            + "s_cmp_lt_i32 vcc_lo, s6\n" + emit_store_scc(1)
+            # 2: unsigned gt: vcc_lo > s6
+            + "s_cmp_gt_u32 vcc_lo, s6\n" + emit_store_scc(2)
+            # 3: signed gt: vcc_lo > s6
+            + "s_cmp_gt_i32 vcc_lo, s6\n" + emit_store_scc(3)
+            # 4: unsigned lt: vcc_hi < s7
+            + "s_cmp_lt_u32 vcc_hi, s7\n" + emit_store_scc(4)
+            # 5: signed lt: vcc_hi < s7
+            + "s_cmp_lt_i32 vcc_hi, s7\n" + emit_store_scc(5)
+            # 6: 64-bit eq: vcc == s[6:7]
+            + "s_cmp_eq_u64 vcc, s[6:7]\n" + emit_store_scc(6)
+            # 7: 64-bit lg: vcc != s[6:7]
+            + "s_cmp_lg_u64 vcc, s[6:7]\n" + emit_store_scc(7)
+            + "s_endpgm\n"
+        )
+        cls.spv = translate_cs("cs_w64_signed_unsigned", asm, threads=64)
+
+    def test_signed_vs_unsigned_divergence_and_equality_invariance(self):
+        cases = [
+            # MSB set in vcc_lo (negative signed, large unsigned) vs 0
+            (0x80000000, 0x00000001, 0x00000000, 0x80000000),
+            # All ones in vcc_lo (-1 signed, 0xFFFFFFFF unsigned) vs 1
+            (0xFFFFFFFF, 0x7FFFFFFF, 0x00000001, 0x00000000),
+            # 0x7FFFFFFF vs 0x80000000 (signed: pos > neg; unsigned: 0x7fffffff < 0x80000000)
+            (0x7FFFFFFF, 0x7FFFFFFF, 0x80000000, 0x80000000),
+            # Exact match
+            (0x80000001, 0x80000002, 0x80000001, 0x80000002),
+        ]
+        for lo, hi, s6, s7 in cases:
+            with self.subTest(lo=hex(lo), hi=hex(hi), s6=hex(s6), s7=hex(s7)):
+                mem = run_cs(self.spv, 64, s4=lo, s5=hi, s6=s6, s7=s7)
+
+                u_lt_lo = int((lo & 0xFFFFFFFF) < (s6 & 0xFFFFFFFF))
+                s_lt_lo = int(_s32(lo) < _s32(s6))
+                u_gt_lo = int((lo & 0xFFFFFFFF) > (s6 & 0xFFFFFFFF))
+                s_gt_lo = int(_s32(lo) > _s32(s6))
+
+                u_lt_hi = int((hi & 0xFFFFFFFF) < (s7 & 0xFFFFFFFF))
+                s_lt_hi = int(_s32(hi) < _s32(s7))
+
+                eq_64 = int(lo == s6 and hi == s7)
+                lg_64 = int(lo != s6 or hi != s7)
+
+                want = [u_lt_lo, s_lt_lo, u_gt_lo, s_gt_lo, u_lt_hi, s_lt_hi, eq_64, lg_64]
+                self.assertEqual([mem[4 * k] for k in range(8)], want)
+
+
+class Wave64NegativeControlsTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        asm = (
+            WAVE64_BUILD_VCC_AND_SGPR
+            # 0: vcc == s[6:7]
+            + "s_cmp_eq_u64 vcc, s[6:7]\n" + emit_store_scc(0)
+            # 1: vcc != s[6:7]
+            + "s_cmp_lg_u64 vcc, s[6:7]\n" + emit_store_scc(1)
+            # 2: s[12:13] == s[6:7] (mask copied to SGPR pair vs scalar pair)
+            + "s_cmp_eq_u64 s[12:13], s[6:7]\n" + emit_store_scc(2)
+            # 3: s[12:13] != s[6:7]
+            + "s_cmp_lg_u64 s[12:13], s[6:7]\n" + emit_store_scc(3)
+            # 4: s[6:7] == s[6:7] (non-mask SGPR pair tautology)
+            + "s_cmp_eq_u64 s[6:7], s[6:7]\n" + emit_store_scc(4)
+            # 5: s[6:7] != s[6:7] (non-mask SGPR pair contradiction)
+            + "s_cmp_lg_u64 s[6:7], s[6:7]\n" + emit_store_scc(5)
+            + "s_endpgm\n"
+        )
+        cls.spv = translate_cs("cs_w64_neg_ctrl", asm, threads=64)
+
+    def test_single_bit_perturbations_break_equality(self):
+        """Starting from exact equality, perturbing any single bit must yield eq=0, lg=1."""
+        base_lo = 0x12345678
+        base_hi = 0x9ABCDEF0
+        bit_positions = [0, 1, 15, 31, 32, 47, 63]
+        for bit in bit_positions:
+            with self.subTest(bit=bit):
+                if bit < 32:
+                    p_s6 = base_lo ^ (1 << bit)
+                    p_s7 = base_hi
+                else:
+                    p_s6 = base_lo
+                    p_s7 = base_hi ^ (1 << (bit - 32))
+
+                mem = run_cs(self.spv, 64, s4=base_lo, s5=base_hi, s6=p_s6, s7=p_s7)
+                self.assertEqual(mem[0], 0)
+                self.assertEqual(mem[4], 1)
+                self.assertEqual(mem[8], 0)
+                self.assertEqual(mem[12], 1)
+                self.assertEqual(mem[16], 1)
+                self.assertEqual(mem[20], 0)
+
+    def test_mutual_exclusion_and_sgpr_orthogonality(self):
+        cases = [
+            (0x12345678, 0x9ABCDEF0, 0x12345678, 0x9ABCDEF0),
+            (0x12345678, 0x9ABCDEF0, 0x00000000, 0x00000000),
+            (0xAAAAAAAA, 0x55555555, 0x55555555, 0xAAAAAAAA),
+            (0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF),
+            (0x00000000, 0x00000000, 0x00000000, 0x00000000),
+        ]
+        for lo, hi, s6, s7 in cases:
+            with self.subTest(lo=hex(lo), hi=hex(hi), s6=hex(s6), s7=hex(s7)):
+                mem = run_cs(self.spv, 64, s4=lo, s5=hi, s6=s6, s7=s7)
+                vcc_eq, vcc_lg = mem[0], mem[4]
+                sgpr_eq, sgpr_lg = mem[8], mem[12]
+                tautology, contradiction = mem[16], mem[20]
+
+                # Negative control 1: strict mutual exclusion
+                self.assertEqual(vcc_eq ^ vcc_lg, 1)
+                self.assertEqual(vcc_eq + vcc_lg, 1)
+                self.assertEqual(sgpr_eq ^ sgpr_lg, 1)
+                self.assertEqual(sgpr_eq + sgpr_lg, 1)
+
+                # Negative control 2: VCC mask vs SGPR mask representation consistency
+                self.assertEqual(vcc_eq, sgpr_eq)
+                self.assertEqual(vcc_lg, sgpr_lg)
+
+                # Negative control 3: Baseline invariants
+                self.assertEqual(tautology, 1)
+                self.assertEqual(contradiction, 0)
+
+
 if __name__ == "__main__":
     unittest.main()
