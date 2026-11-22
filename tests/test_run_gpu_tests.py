@@ -50,7 +50,8 @@ class PackedFormatFixture(unittest.TestCase):
 
             output = io.StringIO()
             problem = "word 15: expected 0xffe00003, got 0xe00003ff"
-            with (patch.object(rgt, "assemble_to_s"), patch.object(rgt, "spirv_as"),
+            with (patch.object(rgt, "assemble_to_s", side_effect=lambda _mc, _src, dst, _name: Path(dst).touch()),
+                  patch.object(rgt, "spirv_as"),
                   patch.object(rgt, "run_cmd", side_effect=translate),
                   patch.object(rgt, "fmt_1010102_test", return_value=problem) as check_fmt,
                   contextlib.redirect_stdout(output)):
