@@ -1197,6 +1197,15 @@ if(TARGET Vulkan::Headers)
     add_test(NAME xbox_present COMMAND xbox_present_test)
     set_tests_properties(xbox_present PROPERTIES SKIP_RETURN_CODE 77)
 
+    # First light through D3D12 (docs/first_light.md): the real model and translated VS/PS that tools/first_light.py
+    # wrote to LEONIDA_FIRST_LIGHT_DIR, drawn through the device proxy. Skips (77) unless that variable is set.
+    add_executable(d3d12_first_light_test test/d3d12_first_light_test.cpp shims/d3d12_xs_device.cpp)
+    target_link_libraries(d3d12_first_light_test PRIVATE gta6rt_d3d12_com)
+    target_compile_definitions(d3d12_first_light_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_first_light_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME d3d12_first_light COMMAND d3d12_first_light_test)
+    set_tests_properties(d3d12_first_light PROPERTIES SKIP_RETURN_CODE 77)
+
     # M1.5 (D3D-53): a draw whose VS and PS are translator output. test/shaders/vs_m15.asm and ps_m15.asm are assembled
     # with llvm-mc and translated by tools/rdna2spirv.py through test/shaders/build.py, which also writes the FSSM
     # programs their index entries are keyed by. Needs llvm-mc with the AMDGPU target (LLVM_MC in the environment, as
