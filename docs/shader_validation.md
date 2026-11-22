@@ -340,6 +340,26 @@ The existing `runtime/test` tools already expose the hard parts (device selectio
 descriptor setup, readback). The differential runner should call them rather than grow a second
 Vulkan stack.
 
+### Integer VALU across the whole wave (`tools/wint_diff.py`)
+
+The one-lane fuzzers cannot see which lanes an instruction writes or the lane masks it reads and makes.
+`tools/wint_diff.py` runs seeded integer VALU programs on every lane of a wave32 or wave64 wave (`--wave 32|64|both`)
+with EXEC rewritten between instructions: compares into SGPR masks and VCC (e64 and e32), `v_cmpx` into EXEC,
+`v_cndmask_b32` on those masks, the carry-out and carry-in forms (`v_add/sub/subrev_co_u32`, `_co_ci_u32`, e64
+and e32), `v_mad_u64_u32`/`v_mad_i64_i32` with a mask carry-out, 16-bit e64/VOP3 ops with `op_sel` writing one half,
+data moved into an SGPR mask, and a set of 32-bit ops. The reference is a per-lane ISA model in the tool; the
+translated side runs in `tests/semantic/spirv_wave_interp.py`. Shrinking, skips and exit codes are those of
+`salu_diff.py`. Forms the translator is known to get wrong (VCC holding data read as a mask, #2206 for wave32 and
+open for wave64; a mask read as VALU data, #293) are left out unless `--known`. `--oracle hw` runs each program as
+one wave on an AMD GPU and compares every lane; on an RDNA2 iGPU (gfx1036) 1,000 programs in both wave sizes,
+the known forms included, matched the reference.
+
+```
+python -I tools/wint_diff.py --programs 2000 --seed 1 --wave both
+python -I tools/wint_diff.py --oracle hw --programs 500 --seed 1 --wave both
+python -I tests/test_wint_diff.py
+```
+
 ### LDS and `ds_*` on the GPU (`tools/lds_fuzz.py`, FUZZ-6)
 
 LDS ops are workgroup-wide, so `tools/lds_fuzz.py` runs on the GPU rather than one lane in the
