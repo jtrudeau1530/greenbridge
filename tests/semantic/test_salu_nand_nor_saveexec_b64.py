@@ -208,6 +208,81 @@ class SaveExecInstruction:
 
 
 # ==============================================================================
+# Deterministic Scalar Instruction Interpreter
+# ==============================================================================
+
+@dataclass
+class ScalarMachineState:
+    """Architectural scalar register file and status registers for a wavefront."""
+    sgprs: List[int] = field(default_factory=lambda: [0] * 256)
+    exec_mask: int = field(default=ALL64)
+    vcc: int = 0
+    scc: int = 0
+
+    def get_sgpr64(self, index: int) -> int:
+        return words_to_u64(self.sgprs[index], self.sgprs[index + 1])
+
+    def set_sgpr64(self, index: int, val: int) -> None:
+        lo, hi = u64_to_words(val)
+        self.sgprs[index] = lo
+        self.sgprs[index + 1] = hi
+
+    def read_reg64(self, reg: Reg64) -> int:
+        if reg.reg_type == RegType.SGPR:
+            return self.get_sgpr64(reg.index)
+        elif reg.reg_type == RegType.EXEC:
+            return self.exec_mask
+        elif reg.reg_type == RegType.VCC:
+            return self.vcc
+        elif reg.reg_type == RegType.SCC:
+            return self.scc
+        raise ValueError(f"Unknown register type: {reg.reg_type}")
+
+    def write_reg64(self, reg: Reg64, val: int) -> None:
+        if reg.reg_type == RegType.SGPR:
+            self.set_sgpr64(reg.index, val)
+        elif reg.reg_type == RegType.EXEC:
+            self.exec_mask = val & MASK64
+        elif reg.reg_type == RegType.VCC:
+            self.vcc = val & MASK64
+        elif reg.reg_type == RegType.SCC:
+            self.scc = val & 1
+        else:
+            raise ValueError(f"Unknown register type: {reg.reg_type}")
+
+
+class ScalarInterpreter:
+    """Deterministic scalar instruction interpreter for RDNA2 saveexec operations."""
+
+    def resolve_operand(self, op: Operand64, state: ScalarMachineState) -> int:
+        if isinstance(op, Reg64):
+            return state.read_reg64(op)
+        elif isinstance(op, Literal64):
+            return op.value
+        raise TypeError(f"Unsupported operand type: {type(op)}")
+
+    def step(self, instr: SaveExecInstruction, state: ScalarMachineState) -> Tuple[int, int, int]:
+        # Atomic read phase
+        s0 = self.resolve_operand(instr.ssrc0, state)
+        old_exec = state.exec_mask
+
+        # Computation phase
+        if instr.opcode == Opcode.S_NAND_SAVEEXEC_B64:
+            saved, new_exec, scc = oracle_s_nand_saveexec_b64(s0, old_exec)
+        elif instr.opcode == Opcode.S_NOR_SAVEEXEC_B64:
+            saved, new_exec, scc = oracle_s_nor_saveexec_b64(s0, old_exec)
+        else:
+            raise ValueError(f"Unsupported opcode: {instr.opcode}")
+
+        # Write-back phase
+        state.write_reg64(instr.sdst, saved)
+        state.exec_mask = new_exec
+        state.scc = scc
+
+        return saved, new_exec, scc
+
+
+# ==============================================================================
 # Phase 1 Unit Tests: Oracle and Architectural Model
 # ==============================================================================
 
@@ -365,6 +440,107 @@ class TestSymbolicAST(unittest.TestCase):
         self.assertEqual(instr1, instr2)
         s = {instr1, instr2}
         self.assertEqual(len(s), 1)
+
+
+# ==============================================================================
+# Phase 3 Unit Tests: Deterministic Scalar Instruction Interpreter
+# ==============================================================================
+
+class TestScalarInterpreter(unittest.TestCase):
+    """Verify deterministic execution and state transitions of ScalarInterpreter."""
+
+    def setUp(self) -> None:
+        self.interp = ScalarInterpreter()
+        self.state = ScalarMachineState()
+
+    def test_nand_saveexec_step(self) -> None:
+        # Initial: EXEC = 0xFFFF_FFFF_0000_0000, s[2:3] = 0xAAAA_AAAA_AAAA_AAAA
+        self.state.exec_mask = 0xFFFF_FFFF_0000_0000
+        self.state.set_sgpr64(2, 0xAAAA_AAAA_AAAA_AAAA)
+
+        instr = SaveExecInstruction(
+            opcode=Opcode.S_NAND_SAVEEXEC_B64,
+            sdst=Reg64(RegType.SGPR, 4),
+            ssrc0=Reg64(RegType.SGPR, 2),
+        )
+
+        saved, new_exec, scc = self.interp.step(instr, self.state)
+
+        # Saved destination s[4:5] must receive old EXEC
+        self.assertEqual(saved, 0xFFFF_FFFF_0000_0000)
+        self.assertEqual(self.state.get_sgpr64(4), 0xFFFF_FFFF_0000_0000)
+
+        # New EXEC = ~(0xAAAA_AAAA_AAAA_AAAA & 0xFFFF_FFFF_0000_0000) = ~(0xAAAA_AAAA_0000_0000)
+        expected_new_exec = (~(0xAAAA_AAAA_0000_0000)) & MASK64
+        self.assertEqual(new_exec, expected_new_exec)
+        self.assertEqual(self.state.exec_mask, expected_new_exec)
+        self.assertEqual(scc, 1)
+        self.assertEqual(self.state.scc, 1)
+
+    def test_nor_saveexec_step(self) -> None:
+        # Initial: EXEC = 0x0000_0000_FFFF_FFFF, literal = 0x0000_FFFF_0000_0000
+        self.state.exec_mask = 0x0000_0000_FFFF_FFFF
+
+        instr = SaveExecInstruction(
+            opcode=Opcode.S_NOR_SAVEEXEC_B64,
+            sdst=Reg64(RegType.SGPR, 0),
+            ssrc0=Literal64(0x0000_FFFF_0000_0000),
+        )
+
+        saved, new_exec, scc = self.interp.step(instr, self.state)
+
+        # Saved destination s[0:1] must receive old EXEC
+        self.assertEqual(saved, 0x0000_0000_FFFF_FFFF)
+        self.assertEqual(self.state.get_sgpr64(0), 0x0000_0000_FFFF_FFFF)
+
+        # New EXEC = ~(0x0000_FFFF_0000_0000 | 0x0000_0000_FFFF_FFFF) = ~(0x0000_FFFF_FFFF_FFFF)
+        expected_new_exec = (~(0x0000_FFFF_FFFF_FFFF)) & MASK64
+        self.assertEqual(new_exec, expected_new_exec)
+        self.assertEqual(self.state.exec_mask, expected_new_exec)
+        self.assertEqual(scc, 1)
+        self.assertEqual(self.state.scc, 1)
+
+    def test_step_determinism(self) -> None:
+        """Run identical step repeatedly to guarantee bit-level determinism."""
+        instr = SaveExecInstruction(
+            opcode=Opcode.S_NAND_SAVEEXEC_B64,
+            sdst=Reg64(RegType.SGPR, 6),
+            ssrc0=Literal64(0x0123_4567_89AB_CDEF),
+        )
+
+        results = []
+        for _ in range(5):
+            st = ScalarMachineState(exec_mask=0xF0F0_F0F0_F0F0_F0F0)
+            res = self.interp.step(instr, st)
+            results.append((res, st.get_sgpr64(6), st.exec_mask, st.scc))
+
+        for r in results[1:]:
+            self.assertEqual(r, results[0])
+
+    def test_chained_saveexec_sequence(self) -> None:
+        """Sequential saveexec pipeline verifying state accumulation."""
+        self.state.exec_mask = ALL64
+        # 1. NOR with 0x0000_0000_FFFF_FFFF -> new_exec = ~(ALL64 | ...) = 0
+        instr1 = SaveExecInstruction(
+            opcode=Opcode.S_NOR_SAVEEXEC_B64,
+            sdst=Reg64(RegType.SGPR, 10),
+            ssrc0=Literal64(0x0000_0000_FFFF_FFFF),
+        )
+        saved1, exec1, scc1 = self.interp.step(instr1, self.state)
+        self.assertEqual(saved1, ALL64)
+        self.assertEqual(exec1, 0)
+        self.assertEqual(scc1, 0)
+
+        # 2. NAND with 0x5555_5555_5555_5555 -> new_exec = ~(... & 0) = ALL64
+        instr2 = SaveExecInstruction(
+            opcode=Opcode.S_NAND_SAVEEXEC_B64,
+            sdst=Reg64(RegType.SGPR, 12),
+            ssrc0=Literal64(0x5555_5555_5555_5555),
+        )
+        saved2, exec2, scc2 = self.interp.step(instr2, self.state)
+        self.assertEqual(saved2, 0)
+        self.assertEqual(exec2, ALL64)
+        self.assertEqual(scc2, 1)
 
 
 if __name__ == "__main__":
