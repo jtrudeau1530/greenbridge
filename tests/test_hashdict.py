@@ -414,6 +414,27 @@ class OutputPathTest(unittest.TestCase):
             with open(out, encoding="utf-8") as f:
                 self.assertEqual(json.load(f), {})
 
+    def test_out_naming_an_input_is_refused_and_left_alone(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            carve = os.path.join(tmp, "carve")
+            os.makedirs(os.path.join(carve, "common"))
+            index = os.path.join(carve, "common", "index.json")
+            with open(index, "w", encoding="utf-8") as f:
+                json.dump({"files": []}, f)
+            extra = os.path.join(tmp, "names.txt")
+            with open(extra, "wb") as f:
+                f.write(b"adder\n")
+            for out in (extra, index):
+                with open(out, "rb") as f:
+                    before = f.read()
+                p = subprocess.run([sys.executable, "-I", TOOL, carve, "--extra", extra, "--out", out],
+                                   capture_output=True, text=True)
+                self.assertEqual(p.returncode, 2, p.stderr)
+                self.assertIn("is one of the inputs", p.stderr)
+                self.assertNotIn("Traceback", p.stderr)
+                with open(out, "rb") as f:
+                    self.assertEqual(f.read(), before)
+
 
 if __name__ == "__main__":
     unittest.main()
