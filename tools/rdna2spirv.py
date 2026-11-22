@@ -113,6 +113,17 @@ def mesh_compute_layout(maxv, maxp, clip_count, cull_count, params):
 import json as _json  # noqa: E402
 with open(os.path.join(os.path.dirname(__file__), "gfx10_formats.json"), encoding="utf-8") as _f:
     GFX10_FORMATS = {int(k): v for k, v in _json.load(_f).items()}
+# Measured natively on RDNA2 (gfx1036, all 128 7-bit V# FORMAT codes): MUBUF DST_SEL=1 produces 1.0 (0x3F800000 / d16
+# 0x3C00) iff FORMAT[6:0] is a valid float/normalized/scaled code (1..77 ending in _UNORM/_SNORM/_USCALED/_SSCALED/
+# _FLOAT), and integer 1 (0x00000001 / d16 0x0001) for UINT/SINT, INVALID (0), and reserved codes (78..127).
+_FLOAT_FMT_MASKS = tuple(
+    sum(
+        1 << (code - 32 * grp)
+        for code in range(32 * grp, 32 * grp + 32)
+        if GFX10_FORMATS.get(code, "").endswith(("_UNORM", "_SNORM", "_USCALED", "_SSCALED", "_FLOAT"))
+    )
+    for grp in range(3)
+)
 
 # User SGPRs s0..s(USER_SGPRS-1) are initialised from push constants (128 bytes = Vulkan's guaranteed minimum).
 USER_SGPRS = 32
@@ -1962,16 +1973,27 @@ class Gen:
             d3 = self.cu(sum((4 + c) << (3 * c) for c in range(len(widths))))
         else:
             comps = self.format_decode_call(fmt, words)
-        # DST_SEL swizzle: 0 -> 0, 1 -> 1.0 (float/norm) or integer 1 (UINT/SINT; SHADER-86), 4..7 -> X..W.
-        is_int_fmt, is_signed = "%false", "%false"
-        for code_v, (_, kind, _) in self.FORMATS.items():
-            if kind in ("u32", "i32", "uint", "sint"):
-                e, o = self.tmp(), self.tmp()
-                self.emit(f"{e} = OpIEqual %bool {fmt} {self.cu(code_v)}")
-                self.emit(f"{o} = OpLogicalOr %bool {is_int_fmt} {e}")
-                is_int_fmt = o
-                if d16 and kind in ("i32", "sint"):
-                    signed = self.tmp()
+        # DST_SEL swizzle: 0 -> 0, 1 -> 1.0 (float/norm/scaled) or integer 1 (UINT/SINT, INVALID or reserved;
+        # SHADER-86, SHADER-429), 4..7 -> X..W. On an out-of-bounds MUBUF load `words` are 0 so `comps` decode to 0,
+        # while DST_SEL=1 still produces 1.0f / 1 (MTBUF overrides `d3` above with 4..7 / 0, so OOB and INVALID stay 0).
+        grp, bit, fmask = self.tmp(), self.tmp(), self.cu(0)
+        self.emit(f"{grp} = OpShiftRightLogical %uint {fmt} {self.cu(5)}")
+        self.emit(f"{bit} = OpBitwiseAnd %uint {fmt} {self.cu(31)}")
+        for g_idx, mask_val in enumerate(_FLOAT_FMT_MASKS):
+            eq, nxt = self.tmp(), self.tmp()
+            self.emit(f"{eq} = OpIEqual %bool {grp} {self.cu(g_idx)}")
+            self.emit(f"{nxt} = OpSelect %uint {eq} {self.cu(mask_val)} {fmask}")
+            fmask = nxt
+        fsh, fbit, is_int_fmt = self.tmp(), self.tmp(), self.tmp()
+        self.emit(f"{fsh} = OpShiftRightLogical %uint {fmask} {bit}")
+        self.emit(f"{fbit} = OpBitwiseAnd %uint {fsh} {self.cu(1)}")
+        self.emit(f"{is_int_fmt} = OpIEqual %bool {fbit} {self.cu(0)}")
+        is_signed = "%false"
+        if d16:
+            for code_v, (_, kind, _) in self.FORMATS.items():
+                if kind in ("i32", "sint"):
+                    e, signed = self.tmp(), self.tmp()
+                    self.emit(f"{e} = OpIEqual %bool {fmt} {self.cu(code_v)}")
                     self.emit(f"{signed} = OpLogicalOr %bool {is_signed} {e}")
                     is_signed = signed
         dst1 = self.tmp()
@@ -1986,12 +2008,10 @@ class Gen:
                 self.emit(f"{e} = OpIEqual %bool {sel} {self.cu(code_v)}")
                 self.emit(f"{s} = OpSelect %uint {e} {src} {r}")
                 r = s
-            rb = self.tmp()
-            self.emit(f"{rb} = OpSelect %uint {in_b} {r} {self.cu(0)}")
             if d16:
-                outs.append(rb)
+                outs.append(r)
             else:
-                self.dst({"k": "vgpr", "r": vd["r"] + c, "n": 1}, rb)
+                self.dst({"k": "vgpr", "r": vd["r"] + c, "n": 1}, r)
         if d16:
             # D16 packs two results per register, saturating integer formats according to signedness.
             def int_half(word):
