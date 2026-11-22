@@ -182,5 +182,136 @@ OpReturn
             outs(body)
 
 
+
+
+class WaveInterpExtensions(unittest.TestCase):
+    def test_location_inputs_float_ops_and_convert(self):
+        mod = """OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint Fragment %main "main" %out %in0 %l
+OpDecorate %out Location 0
+OpDecorate %in0 Location 0
+OpDecorate %l BuiltIn SubgroupLocalInvocationId
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%uint = OpTypeInt 32 0
+%float = OpTypeFloat 32
+%v4float = OpTypeVector %float 4
+%v4uint = OpTypeVector %uint 4
+%_ptr_Output = OpTypePointer Output %v4uint
+%_ptr_Input = OpTypePointer Input %v4float
+%_ptr_Input_f = OpTypePointer Input %float
+%_ptr_Builtin = OpTypePointer Input %uint
+%out = OpVariable %_ptr_Output Output
+%in0 = OpVariable %_ptr_Input Input
+%l = OpVariable %_ptr_Builtin Input
+%c0 = OpConstant %uint 0
+%c1 = OpConstant %uint 1
+%f64 = OpConstant %float 64.0
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%px = OpAccessChain %_ptr_Input_f %in0 %c0
+%py = OpAccessChain %_ptr_Input_f %in0 %c1
+%fx = OpLoad %float %px
+%fy = OpLoad %float %py
+%sx = OpFMul %float %fx %f64
+%sy = OpFMul %float %fy %f64
+%ux = OpConvertFToU %uint %sx
+%uy = OpConvertFToU %uint %sy
+%sum = OpFAdd %float %fx %fy
+%us = OpConvertFToU %uint %sum
+%v = OpCompositeConstruct %v4uint %ux %uy %us %c0
+OpStore %out %v
+OpReturn
+OpFunctionEnd
+"""
+        res = run_wave(mod, wave=32, inputs={0: lambda lane: ((lane + 0.5) / 64.0, 1.5 / 64.0, 0.0, 0.0)})
+        for lane in range(32):
+            self.assertEqual(res["outputs"][lane]["%out"], (lane, 1, 0, 0))
+
+    def test_physical_storage_buffer_atomic_and_store(self):
+        mod = """OpCapability Shader
+OpCapability Int64
+OpCapability PhysicalStorageBufferAddresses
+OpMemoryModel PhysicalStorageBuffer64 GLSL450
+OpEntryPoint GLCompute %main "main" %out %l
+OpDecorate %out Location 0
+OpDecorate %l BuiltIn SubgroupLocalInvocationId
+OpDecorate %arr ArrayStride 4
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%uint = OpTypeInt 32 0
+%ulong = OpTypeInt 64 0
+%v4uint = OpTypeVector %uint 4
+%arr = OpTypeRuntimeArray %uint
+%_ptr_Output = OpTypePointer Output %v4uint
+%_ptr_Builtin = OpTypePointer Input %uint
+%_ptr_PSB_arr = OpTypePointer PhysicalStorageBuffer %arr
+%_ptr_PSB_u = OpTypePointer PhysicalStorageBuffer %uint
+%out = OpVariable %_ptr_Output Output
+%l = OpVariable %_ptr_Builtin Input
+%c0 = OpConstant %uint 0
+%c1 = OpConstant %uint 1
+%c0_64 = OpConstant %ulong 0
+%c64_64 = OpConstant %ulong 64
+%c4_64 = OpConstant %ulong 4
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%lane = OpLoad %uint %l
+%base = OpConvertUToPtr %_ptr_PSB_arr %c0_64
+%p0 = OpAccessChain %_ptr_PSB_u %base %c0
+%slot = OpAtomicIAdd %uint %p0 %c1 %c0 %c1
+%slot64 = OpUConvert %ulong %slot
+%off = OpIMul %ulong %slot64 %c4_64
+%addr = OpIAdd %ulong %c64_64 %off
+%sptr_arr = OpConvertUToPtr %_ptr_PSB_arr %addr
+%sptr = OpAccessChain %_ptr_PSB_u %sptr_arr %c0
+OpStore %sptr %lane Aligned 4
+%v = OpCompositeConstruct %v4uint %slot %c0 %c0 %c0
+OpStore %out %v
+OpReturn
+OpFunctionEnd
+"""
+        mem = {0: 0}
+        res = run_wave(mod, wave=32, memory=mem)
+        self.assertEqual(mem[0], 32)
+        self.assertEqual({mem[64 + 4 * i] for i in range(32)}, set(range(32)))
+
+    def test_quad_swap_and_broadcast(self):
+        mod = """OpCapability Shader
+OpCapability GroupNonUniformQuad
+OpMemoryModel Logical GLSL450
+OpEntryPoint Fragment %main "main" %out %l
+OpDecorate %out Location 0
+OpDecorate %l BuiltIn SubgroupLocalInvocationId
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%uint = OpTypeInt 32 0
+%v4uint = OpTypeVector %uint 4
+%_ptr_Output = OpTypePointer Output %v4uint
+%_ptr_Builtin = OpTypePointer Input %uint
+%out = OpVariable %_ptr_Output Output
+%l = OpVariable %_ptr_Builtin Input
+%c0 = OpConstant %uint 0
+%c1 = OpConstant %uint 1
+%c2 = OpConstant %uint 2
+%c3 = OpConstant %uint 3
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%lane = OpLoad %uint %l
+%sh = OpGroupNonUniformQuadSwap %uint %c3 %lane %c0
+%sv = OpGroupNonUniformQuadSwap %uint %c3 %lane %c1
+%sd = OpGroupNonUniformQuadSwap %uint %c3 %lane %c2
+%sb = OpGroupNonUniformQuadBroadcast %uint %c3 %lane %c0
+%v = OpCompositeConstruct %v4uint %sh %sv %sd %sb
+OpStore %out %v
+OpReturn
+OpFunctionEnd
+"""
+        res = run_wave(mod, wave=32)
+        for lane in range(32):
+            self.assertEqual(res["outputs"][lane]["%out"], (lane ^ 1, lane ^ 2, lane ^ 3, lane & ~3))
+
+
 if __name__ == "__main__":
     unittest.main()
