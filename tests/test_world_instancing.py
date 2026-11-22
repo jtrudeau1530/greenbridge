@@ -301,6 +301,24 @@ class InstancedBuildTest(unittest.TestCase):
         gltf, _ = read_chunk(out, doc["chunks"][0]["id"])
         self.assertEqual((len(gltf["images"]), len(gltf["meshes"])), (1, 1))
 
+    def test_texture_cache_respects_each_build_size(self) -> None:
+        assets = os.path.join(self.tmp, "tex_assets")
+        twb._write_param_fixture(assets, twb.PARAM_CASES["albedo-first"])
+        ents = os.path.join(self.tmp, "tex.jsonl")
+        twp.write_entities(ents, [twp.entity("tri", (10, 10, 0))])
+
+        for limit, expected in ((1, 1), (0, 4), (2, 2)):
+            with self.subTest(limit=limit):
+                out = os.path.join(self.tmp, f"world_{limit}")
+                doc = world_build.build_world(assets, out, placements=ents, jobs=1, max_tex_size=limit)
+                gltf, bin_data = read_chunk(out, doc["chunks"][0]["id"])
+                (image,) = gltf["images"]
+                view = gltf["bufferViews"][image["bufferView"]]
+                start = view.get("byteOffset", 0)
+                width, height, rgba = twb.parse_and_validate_png(bin_data[start:start + view["byteLength"]])
+                self.assertEqual((width, height), (expected, expected))
+                self.assertEqual(tuple(rgba[:4]), tuple(twb.ALBEDO_RGBA))
+
     def test_cli_instancing_option(self):
         ents = os.path.join(self.tmp, "cli.jsonl")
         twp.write_entities(ents, [twp.entity("test_box", (10, 10, 0))])

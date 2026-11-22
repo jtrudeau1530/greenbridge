@@ -439,13 +439,13 @@ def _pack_model_job(job: tuple) -> tuple[int, dict | None]:
     }
 
 
-_PNG_CACHE: dict[str, bytes | None] = {}
+_PNG_CACHE: dict[tuple[str, int], bytes | None] = {}
 _PNG_CACHE_BUDGET = 256 * 1024 * 1024
 
 
 def _png_for(dds_path: str, max_tex_size: int) -> bytes | None:
     """Decode a DDS to PNG once per worker, keeping at most about 256 MB of PNGs (oldest dropped first)."""
-    key = os.path.normcase(os.path.abspath(dds_path))
+    key = (os.path.normcase(os.path.abspath(dds_path)), max_tex_size)
     if key in _PNG_CACHE:
         return _PNG_CACHE[key]
     dds_mod = _get_dds_png()
