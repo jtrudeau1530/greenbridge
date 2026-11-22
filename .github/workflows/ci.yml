@@ -40,7 +40,7 @@ jobs:
           if ($LASTEXITCODE -eq 1) {
             git diff --quiet --no-renames "$env:GITHUB_SHA^1" "$env:GITHUB_SHA" -- . `
               ':(exclude,top)README.md' ':(exclude,top)CONTRIBUTING.md' `
-              ':(exclude,top)AGENTS.md' ':(exclude,top)SECURITY.md' ':(exclude,top,glob)docs/**/*.md'
+              ':(exclude,top)AGENTS.md' ':(exclude,top,glob)docs/**/*.md'
             $docsOnly = $LASTEXITCODE -eq 0
           }
           "docs-only=$($docsOnly.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
@@ -70,13 +70,13 @@ jobs:
       - name: Tests (standard library only, no game data)
         shell: bash
         run: |
-          for t in tests/test_*.py; do
+          while IFS= read -r t; do
             if grep -Eq "$PYTEST_FILE_MARKERS" "$t" || ! grep -q '__main__' "$t"; then
               continue
             fi
             echo "== $t"
             python -I "$t" || exit 1
-          done  # pytest-based files run in the translator-tests job
+          done < <(find tests -path 'tests/semantic' -prune -o -type f -name 'test_*.py' -print | LC_ALL=C sort)  # pytest-based files run in the translator-tests job
       - name: Build rpf9dump
         run: dotnet build tools/rpf9dump/rpf9dump.csproj -c Release
       - name: Test rpf9dump diagnostics
@@ -108,15 +108,16 @@ jobs:
           grep -q 'LLVM version 21\.' <<< "$version_out"
           grep -q 'amdgcn' <<< "$version_out"
       - name: Translator tests
+        shell: bash
         run: |
           pytest_files=()
-          for t in tests/test_*.py; do
+          while IFS= read -r t; do
             if grep -Eq "$PYTEST_FILE_MARKERS" "$t" || ! grep -q '__main__' "$t"; then
               pytest_files+=("$t")
             elif [[ "$t" == tests/test_tex_headers.py ]]; then
               pytest_files+=("$t::TestTextureDescriptorParsing::test_stdlib_qword_scanner_edge_cases_and_parity")
             fi
-          done
+          done < <(find tests -path 'tests/semantic' -prune -o -type f -name 'test_*.py' -print | LC_ALL=C sort)
           python -m pytest "${pytest_files[@]}" -q
   semantic-tests:
     needs: change-scope
@@ -145,4 +146,4 @@ jobs:
         with:
           node-version: "24"
       - name: Viewer chunk streaming (synthetic, no browser or game data)
-        run: node --test tests/test_viewer_streaming.cjs
+        run: node --test tests/test_*.cjs

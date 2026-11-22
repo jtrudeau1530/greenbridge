@@ -61,6 +61,8 @@ public:
     bool partially_bound = false;  // and its slots can stay empty
     bool conditional_rendering = false;  // VK_EXT_conditional_rendering enabled, where available
     bool host_image_copy = false;  // VK_EXT_host_image_copy and hostImageCopy enabled
+    bool occlusion_query_precise = false;    // occlusionQueryPrecise enabled
+    bool pipeline_statistics_query = false;  // pipelineStatisticsQuery enabled
 
     Device() = default;
     Device(const Device&) = delete;
@@ -289,6 +291,10 @@ public:
             enable13.pNext = &host_copy;
         }
 
+        enable.occlusionQueryPrecise = features.features.occlusionQueryPrecise;  // query heaps, where available
+        enable.pipelineStatisticsQuery = features.features.pipelineStatisticsQuery;
+        occlusion_query_precise = features.features.occlusionQueryPrecise == VK_TRUE;
+        pipeline_statistics_query = features.features.pipelineStatisticsQuery == VK_TRUE;
         VkDeviceCreateInfo device_info{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &enable12};
         device_info.queueCreateInfoCount = 1;
         device_info.pQueueCreateInfos = &queue_info;

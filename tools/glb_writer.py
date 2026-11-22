@@ -17,6 +17,7 @@ import itertools
 import json
 import math
 import os
+import stat
 import struct
 import sys
 import tempfile
@@ -857,6 +858,16 @@ def _replace(source: str, destination: str) -> None:
     os.replace(source, destination)
 
 
+def _output_mode(path: str) -> int:
+    """Permission bits for a published GLB: those of the file it replaces, or 0666 minus the umask."""
+    try:
+        return stat.S_IMODE(os.stat(path).st_mode)
+    except FileNotFoundError:
+        mask = os.umask(0)
+        os.umask(mask)
+        return 0o666 & ~mask
+
+
 def write_glb(
     path: str,
     primitives: list[dict],
@@ -881,6 +892,8 @@ def write_glb(
         ) as f:
             tmp_path = f.name
             f.write(glb_bytes)
+        # NamedTemporaryFile creates 0600; give the GLB the mode of the file it replaces, or a new file's.
+        os.chmod(tmp_path, _output_mode(out_path))
         # Close before replacement: Windows cannot rename an open staging file.
         _replace(tmp_path, out_path)
     except BaseException:

@@ -57,6 +57,11 @@ class OperandTests(unittest.TestCase):
         self.assertEqual(shader_ir.operand("1.5"), {"k": "fimm", "v": 1.5, "abs": False})
         self.assertEqual(shader_ir.operand("-2.5e1"), {"k": "fimm", "v": -25.0, "abs": False})
         self.assertEqual(shader_ir.operand("|1.0|"), {"k": "fimm", "v": 1.0, "abs": True})
+        # The regex accepts leading-zero decimals; int(core, 0) used to reject them and abort the run.
+        self.assertEqual(shader_ir.operand("010"), {"k": "imm", "v": 10})
+        self.assertEqual(shader_ir.operand("0001"), {"k": "imm", "v": 1})
+        self.assertEqual(shader_ir.operand("08"), {"k": "imm", "v": 8})
+        self.assertEqual(shader_ir.operand("-010"), {"k": "imm", "v": -10})
 
     def test_hardware_negation_of_constants(self):
         # The disassembler prints VOP3 inline negation as neg(0) / neg(5).
@@ -134,6 +139,11 @@ class ParseLineTests(unittest.TestCase):
         ins = shader_ir.parse_line("\tv_mov_b32 v0, v1 ; encoding: [0x0a,0xff]")
         self.assertEqual(ins["enc"], "0aff")
         self.assertEqual(len(ins["args"]), 2)
+
+    def test_leading_zero_decimal_operand_does_not_abort_a_line(self):
+        ins = shader_ir.parse_line("\tv_mov_b32_e32 v0, 010 ; encoding: [0x00,0x00,0x02,0x7e]")
+        self.assertEqual(ins["op"], "v_mov_b32_e32")
+        self.assertEqual(ins["args"][1], {"k": "imm", "v": 10})
 
     def test_comment_or_blank_lines_are_skipped(self):
         self.assertIsNone(shader_ir.parse_line("; only a comment"))

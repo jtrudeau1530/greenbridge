@@ -95,8 +95,10 @@ def scan_archive(path, start=None, limit=None):
                 d = zlib.decompressobj()
                 head, total_out, p = bytearray(), 0, s
                 try:
-                    while not d.eof and p < size:
-                        chunk = m[p:p + CHUNK]
+                    # --limit bounds the scanned window, not just the header search: a stream whose body
+                    # runs past `end` must not be counted, or the byte accounting exceeds the window.
+                    while not d.eof and p < end:
+                        chunk = m[p:min(p + CHUNK, end)]
                         if not chunk:
                             break
                         out = d.decompress(chunk)

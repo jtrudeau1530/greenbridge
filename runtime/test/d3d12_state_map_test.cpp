@@ -4,6 +4,7 @@
 #define VK_NO_PROTOTYPES
 #endif
 #include "../src/vulkan_replay.h"
+#include "../src/vulkan_memory.h"  // resizable_bar
 
 #ifdef _WIN32
 #include <windows.h>
@@ -128,6 +129,24 @@ constexpr bool video_queue_common_matches_sdk() {
     return leonida::d3d12_layout::video_queue_common == 30;
 }
 static_assert(video_queue_common_matches_sdk<D3D12_BARRIER_LAYOUT>());
+static_assert(leonida::d3d12_query_heap::occlusion == std::uint32_t(D3D12_QUERY_HEAP_TYPE_OCCLUSION));
+static_assert(leonida::d3d12_query_heap::timestamp == std::uint32_t(D3D12_QUERY_HEAP_TYPE_TIMESTAMP));
+static_assert(leonida::d3d12_query_heap::pipeline_statistics == std::uint32_t(D3D12_QUERY_HEAP_TYPE_PIPELINE_STATISTICS));
+static_assert(leonida::d3d12_query_heap::so_statistics == std::uint32_t(D3D12_QUERY_HEAP_TYPE_SO_STATISTICS));
+static_assert(leonida::d3d12_query_heap::video_decode_statistics ==
+              std::uint32_t(D3D12_QUERY_HEAP_TYPE_VIDEO_DECODE_STATISTICS));
+static_assert(leonida::d3d12_query_heap::copy_queue_timestamp == std::uint32_t(D3D12_QUERY_HEAP_TYPE_COPY_QUEUE_TIMESTAMP));
+static_assert(leonida::d3d12_query_heap::pipeline_statistics1 == std::uint32_t(D3D12_QUERY_HEAP_TYPE_PIPELINE_STATISTICS1));
+static_assert(leonida::d3d12_query::occlusion == std::uint32_t(D3D12_QUERY_TYPE_OCCLUSION));
+static_assert(leonida::d3d12_query::binary_occlusion == std::uint32_t(D3D12_QUERY_TYPE_BINARY_OCCLUSION));
+static_assert(leonida::d3d12_query::timestamp == std::uint32_t(D3D12_QUERY_TYPE_TIMESTAMP));
+static_assert(leonida::d3d12_query::pipeline_statistics == std::uint32_t(D3D12_QUERY_TYPE_PIPELINE_STATISTICS));
+static_assert(leonida::d3d12_query::so_statistics_stream0 == std::uint32_t(D3D12_QUERY_TYPE_SO_STATISTICS_STREAM0));
+static_assert(leonida::d3d12_query::so_statistics_stream3 == std::uint32_t(D3D12_QUERY_TYPE_SO_STATISTICS_STREAM3));
+static_assert(leonida::d3d12_query::video_decode_statistics == std::uint32_t(D3D12_QUERY_TYPE_VIDEO_DECODE_STATISTICS));
+static_assert(leonida::d3d12_query::pipeline_statistics1 == std::uint32_t(D3D12_QUERY_TYPE_PIPELINE_STATISTICS1));
+static_assert(leonida::query_result_size(leonida::d3d12_query::pipeline_statistics) ==
+              sizeof(D3D12_QUERY_DATA_PIPELINE_STATISTICS));
 #endif
 
 #include <cstdio>
@@ -360,6 +379,44 @@ int main() {
     merged.forget(1);
     CHECK(!merged.tracked(1));
 
-    std::printf("state map, enhanced barriers, subresource decoding and layout tracking OK\n");
+    // Resizable BAR detection (D3D-96) on the heap layouts real cards report.
+    {
+        constexpr VkDeviceSize mib = VkDeviceSize(1) << 20;
+        constexpr VkMemoryPropertyFlags local = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+        constexpr VkMemoryPropertyFlags host = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+        constexpr VkMemoryPropertyFlags cached = host | VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
+        constexpr VkMemoryHeapFlags vram = VK_MEMORY_HEAP_DEVICE_LOCAL_BIT;
+        struct Type {
+            VkMemoryPropertyFlags flags;
+            std::uint32_t heap;
+        };
+        const auto memory = [](std::initializer_list<VkMemoryHeap> heaps, std::initializer_list<Type> types) {
+            VkPhysicalDeviceMemoryProperties out{};
+            for (const VkMemoryHeap& heap : heaps) out.memoryHeaps[out.memoryHeapCount++] = heap;
+            for (const Type& type : types) out.memoryTypes[out.memoryTypeCount++] = {type.flags, type.heap};
+            return out;
+        };
+        // RTX 5060 Ti, driver 621.14, Resizable BAR on: the host-visible VRAM type is in the 15.67 GiB VRAM heap.
+        CHECK(resizable_bar(memory({{16829644800ull, vram}, {8551161856ull, 0}},
+                                   {{0, 1}, {local, 0}, {host, 1}, {cached, 1}, {local | host, 0}})));
+        // RTX 3090, driver 616.56, Resizable BAR off: that type is in a heap of its own, the 214 MiB BAR window.
+        CHECK(!resizable_bar(memory({{24ull << 30, vram}, {32ull << 30, 0}, {224395264ull, vram}},
+                                    {{local, 0}, {host, 1}, {cached, 1}, {local | host, 2}})));
+        // A 256 MiB window (AMD without Smart Access Memory, RADV without Resizable BAR) is not enough; one byte more is.
+        VkPhysicalDeviceMemoryProperties window =
+            memory({{8ull << 30, vram}, {16ull << 30, 0}, {256 * mib, vram}}, {{local, 0}, {host, 1}, {local | host, 2}});
+        CHECK(!resizable_bar(window));
+        window.memoryHeaps[2].size = 256 * mib + 1;
+        CHECK(resizable_bar(window));
+        // A GPU whose memory is all device-local and host-visible (an integrated GPU).
+        CHECK(resizable_bar(memory({{8ull << 30, vram}}, {{local, 0}, {local | host, 0}})));
+        // Not without HOST_COHERENT, not in a heap without DEVICE_LOCAL, not with a heap index past the heaps.
+        CHECK(!resizable_bar(memory({{8ull << 30, vram}}, {{local | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT, 0}})));
+        CHECK(!resizable_bar(memory({{8ull << 30, 0}}, {{local | host, 0}})));
+        CHECK(!resizable_bar(memory({{8ull << 30, vram}}, {{local | host, 1}})));
+        CHECK(!resizable_bar(VkPhysicalDeviceMemoryProperties{}));
+    }
+
+    std::printf("state map, enhanced barriers, subresource decoding, layout tracking and BAR detection OK\n");
     return 0;
 }

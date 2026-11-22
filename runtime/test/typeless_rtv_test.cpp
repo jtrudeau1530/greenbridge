@@ -143,6 +143,32 @@ int main() {
             ++checks;
         }
     }
+    // A predicate must preserve the selected mip/range and use attachments even for a whole UNORM view.
+    for (const auto& [format, expected] : formats) {
+        for (unsigned mip = 0; mip < 3; ++mip) {
+            for (bool partial : {false, true}) {
+                CommandList list;
+                const Rect oversized{-1, -1, 8, 8};
+                EXPECT(list.set_predication({2, 0, d3d12_predication::equal_zero}));
+                EXPECT(list.clear_render_target({1, mip, 1, 2, format}, color,
+                    partial ? std::span<const Rect>(&oversized, 1) : std::span<const Rect>{}));
+                EXPECT(list.close());
+                const auto resolve = [&](ResourceId id) { return id == 2 ? &predicate : &layered; };
+                reset_counters();
+                EXPECT(replay(list, VK_NULL_HANDLE, resolve, conditional) == ReplayResult::success);
+                EXPECT(image_clears == 0 && attachment_clears == 1);
+                EXPECT(requested_format == expected && requested_range.baseMipLevel == mip);
+                EXPECT(requested_range.baseArrayLayer == 1 && requested_range.layerCount == 2);
+                EXPECT(render_area.extent.width == std::max(1u, 5u >> mip));
+                EXPECT(render_area.extent.height == std::max(1u, 3u >> mip));
+                EXPECT(rendering_layers == 2 && captured_rect.baseArrayLayer == 0 && captured_rect.layerCount == 2);
+                EXPECT(captured_rect.rect.offset.x == 0 && captured_rect.rect.offset.y == 0);
+                EXPECT(captured_rect.rect.extent.width == render_area.extent.width);
+                EXPECT(captured_rect.rect.extent.height == render_area.extent.height);
+                ++checks;
+            }
+        }
+    }
     const auto rejects = [&](ResourceBinding r, TargetView view, ReplayResult expected = ReplayResult::invalid_clear) {
         CommandList list;
         if (!list.clear_render_target(view, color) || !list.close()) return false;
@@ -150,6 +176,30 @@ int main() {
     };
     EXPECT(rejects(binding, {1, 0, 0, 1})); // A typeless resource has no default typed RTV format.
     EXPECT(rejects(binding, {1, 0, 0, 1, static_cast<ColorViewFormat>(99)}));
+    for (const TargetView view : {
+             TargetView{1, 3, 0, 1, ColorViewFormat::rgba8_uint},
+             TargetView{1, UINT32_MAX, 0, 1, ColorViewFormat::rgba8_uint},
+             TargetView{1, 0, 4, 1, ColorViewFormat::rgba8_uint},
+             TargetView{1, 0, 3, 2, ColorViewFormat::rgba8_uint},
+             TargetView{1, 0, 1, UINT32_MAX, ColorViewFormat::rgba8_uint},
+             TargetView{1, 0, UINT32_MAX, 2, ColorViewFormat::rgba8_uint}}) {
+        EXPECT(rejects(layered, view, ReplayResult::invalid_subresource));
+        ++checks;
+    }
+    CommandList empty_range;
+    EXPECT(!empty_range.clear_render_target({1, 0, 0, 0, ColorViewFormat::rgba8_uint}, color));
+    ++checks;
+    // Both a range ending at the last layer and the complete layer range remain valid.
+    for (const TargetView view : {TargetView{1, 2, 3, 1, ColorViewFormat::rgba8_uint},
+                                  TargetView{1, 2, 0, 4, ColorViewFormat::rgba8_uint}}) {
+        CommandList list;
+        const Rect whole{0, 0, 1, 1};
+        EXPECT(list.clear_render_target(view, color, {&whole, 1}) && list.close());
+        EXPECT(run(list, layered, vk) == ReplayResult::success);
+        EXPECT(requested_range.baseMipLevel == 2 && requested_range.baseArrayLayer == view.first_layer);
+        EXPECT(requested_range.layerCount == view.layer_count && rendering_layers == view.layer_count);
+        ++checks;
+    }
     auto wrong = binding; wrong.rgba8_typeless = false;
     EXPECT(rejects(wrong, {1, 0, 0, 1, ColorViewFormat::rgba8_srgb}));
     wrong = binding; wrong.format = VK_FORMAT_R32_SFLOAT;

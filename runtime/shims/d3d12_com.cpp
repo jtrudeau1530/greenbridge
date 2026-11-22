@@ -49,6 +49,7 @@ const char* name(leonida::ReplayResult result) {
     case leonida::ReplayResult::invalid_subresource: return "invalid subresource";
     case leonida::ReplayResult::invalid_clear: return "invalid clear";
     case leonida::ReplayResult::invalid_copy: return "invalid copy or resolve";
+    case leonida::ReplayResult::invalid_query: return "invalid query";
     case leonida::ReplayResult::unsupported: return "unsupported";
     }
     return "?";
@@ -92,9 +93,11 @@ public:
     }
     D3D12_COMMAND_LIST_TYPE type() const { return type_; }
 
-    // E_INVALIDARG when a call during recording was invalid, as D3D12's Close reports it.
+    // E_INVALIDARG when a call during recording was invalid, or a query was begun and not ended, as D3D12's Close
+    // reports it.
     HRESULT STDMETHODCALLTYPE Close() override {
         constexpr auto method = "ID3D12GraphicsCommandList::Close";
+        if (list_.queries_open()) invalid_ = true;
         if (!list_.close()) return d3d12_trace::result(method, E_FAIL);
         return d3d12_trace::result(method, invalid_ ? E_INVALIDARG : S_OK);
     }
@@ -259,6 +262,36 @@ public:
                                         stencil, to_rects(count, rects)));
     }
 
+    // A null region discards the whole resource. Not allowed in a bundle.
+    void STDMETHODCALLTYPE DiscardResource(ID3D12Resource* resource, const D3D12_DISCARD_REGION* region) override {
+        if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);
+        if (!region) return check(list_.discard({resource_id(resource), 0, 0, false, true}));
+        if (region->NumRects && !region->pRects) return check(false);
+        check(list_.discard({resource_id(resource), region->FirstSubresource, region->NumSubresources,
+                             region->NumRects != 0}));
+    }
+
+    // GCL2. A null pModes means DEFAULT for every write. The address is resolved when the list is executed.
+    // Allowed in a bundle (the API restrictions table of "Recording command lists and bundles").
+    void STDMETHODCALLTYPE WriteBufferImmediate(UINT count, const D3D12_WRITEBUFFERIMMEDIATE_PARAMETER* params,
+                                                const D3D12_WRITEBUFFERIMMEDIATE_MODE* modes) override {
+        if (count && !params) return check(false);
+        for (UINT i = 0; i < count; ++i)
+            check(list_.write_immediate({params[i].Dest, params[i].Value, modes ? u(modes[i]) : 0}));
+    }
+
+    // GCL1. Not allowed in a bundle, as no copy is.
+    void STDMETHODCALLTYPE AtomicCopyBufferUINT(ID3D12Resource* dst, UINT64 dst_offset, ID3D12Resource* src,
+                                                UINT64 src_offset, UINT count, ID3D12Resource* const* resources,
+                                                const D3D12_SUBRESOURCE_RANGE_UINT64* ranges) override {
+        atomic_copy(4, dst, dst_offset, src, src_offset, count, resources, ranges);
+    }
+    void STDMETHODCALLTYPE AtomicCopyBufferUINT64(ID3D12Resource* dst, UINT64 dst_offset, ID3D12Resource* src,
+                                                  UINT64 src_offset, UINT count, ID3D12Resource* const* resources,
+                                                  const D3D12_SUBRESOURCE_RANGE_UINT64* ranges) override {
+        atomic_copy(8, dst, dst_offset, src, src_offset, count, resources, ranges);
+    }
+
     // The CPU handle's slot holds the view as the GFX10 descriptor a shader would load (docs/d3d12_vulkan.md
     // section 3.4): a T# for a texture, a V# for a buffer. It is read now, because the slot may be rewritten before
     // the list runs. The GPU handle names the same view in a shader-visible heap and is not needed.
@@ -277,6 +310,21 @@ public:
                                {std::bit_cast<std::uint32_t>(values[0]), std::bit_cast<std::uint32_t>(values[1]),
                                 std::bit_cast<std::uint32_t>(values[2]), std::bit_cast<std::uint32_t>(values[3])},
                                count, rects);
+    }
+
+    // Queries (docs/d3d12_vulkan.md section 4.6). Heap types, index ranges and the destination buffer are checked
+    // at ExecuteCommandLists, when the heap and the buffer are known.
+    void STDMETHODCALLTYPE BeginQuery(ID3D12QueryHeap* heap, D3D12_QUERY_TYPE type, UINT index) override {
+        check(list_.begin_query({query_heap_id(heap), u(type), index}));
+    }
+
+    void STDMETHODCALLTYPE EndQuery(ID3D12QueryHeap* heap, D3D12_QUERY_TYPE type, UINT index) override {
+        check(list_.end_query({query_heap_id(heap), u(type), index}));
+    }
+
+    void STDMETHODCALLTYPE ResolveQueryData(ID3D12QueryHeap* heap, D3D12_QUERY_TYPE type, UINT first, UINT count,
+                                            ID3D12Resource* dst, UINT64 offset) override {
+        check(list_.resolve_queries({query_heap_id(heap), u(type), first, count, resource_id(dst), offset}));
     }
 
     // GCL8. Vulkan can set the two faces independently with vkCmdSetStencilReference(VK_STENCIL_FACE_FRONT_BIT /
@@ -318,6 +366,17 @@ private:
 
     void check(bool ok) {
         if (!ok) invalid_ = true;
+    }
+
+    void atomic_copy(std::uint32_t bytes, ID3D12Resource* dst, UINT64 dst_offset, ID3D12Resource* src,
+                     UINT64 src_offset, UINT count, ID3D12Resource* const* resources,
+                     const D3D12_SUBRESOURCE_RANGE_UINT64* ranges) {
+        if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE || (count && (!resources || !ranges))) return check(false);
+        leonida::AtomicCopyBuffer copy{resource_id(dst), dst_offset, resource_id(src), src_offset, bytes, {}};
+        for (UINT i = 0; i < count; ++i)
+            copy.dependencies.push_back(
+                {resource_id(resources[i]), ranges[i].Subresource, ranges[i].Range.Begin, ranges[i].Range.End});
+        check(list_.atomic_copy(copy));
     }
 
     void clear_unordered_access(D3D12_CPU_DESCRIPTOR_HANDLE view, ID3D12Resource* resource, bool is_float,
@@ -493,7 +552,7 @@ public:
 
     CommandQueue(leonida::VulkanContext& context, VkQueue queue, std::uint32_t family,
                  const D3D12_COMMAND_QUEUE_DESC& desc, const QueueClock& clock)
-        : desc_(desc), queue_(context, queue, family), context_(context), vk_queue_(queue), family_(family),
+        : desc_(desc), context_(context), queue_(context, queue, family), vk_queue_(queue), family_(family),
           clock_(clock) {}
 
     ~CommandQueue() override {
@@ -566,6 +625,17 @@ public:
         std::lock_guard lock(mutex_);
         queue_.wait(f->semaphore(), value);
         return d3d12_trace::result(method, S_OK);
+    }
+
+    // Ticks per second of the timestamps EndQuery writes: one tick is timestampPeriod nanoseconds. Every D3D12
+    // queue of the device shares one VkQueue, so they share one frequency. E_FAIL when that queue has no
+    // timestamps (timestampValidBits 0), as D3D12 reports for a queue that does not support them.
+    HRESULT STDMETHODCALLTYPE GetTimestampFrequency(UINT64* frequency) override {
+        if (!frequency) return E_INVALIDARG;
+        const double period = context_.timestamp_period();
+        if (!(period > 0)) return E_FAIL;
+        *frequency = static_cast<UINT64>(1e9 / period + 0.5);
+        return S_OK;
     }
 
     // The GPU timestamp is in device ticks (what GetTimestampFrequency counts: 1e9 / timestampPeriod per second)
@@ -666,10 +736,10 @@ private:
     }
 
     D3D12_COMMAND_QUEUE_DESC desc_;
+    leonida::VulkanContext& context_;
     std::mutex mutex_;
     leonida::VulkanQueue queue_;
     leonida::ReplayResult last_result_ = leonida::ReplayResult::success;
-    leonida::VulkanContext& context_;
     VkQueue vk_queue_;
     std::uint32_t family_;
     QueueClock clock_;
