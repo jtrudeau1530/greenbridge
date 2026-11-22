@@ -404,6 +404,61 @@ Not measured here (hypothesis): which preset applies at a position (nearest `Loc
 how the Beaufort number maps onto the 0..1 curve input (Beaufort / 12 is one choice), and what the four
 `WavefrontShape` curves drive.
 
+## Timecycle documents
+
+Two of the three most repeated roots are the timecycle tables: 27 `timecycle_keyframe_data` and 49
+`timecycle_modifier_data` documents. All 76 parse. Counts below; no values, modifier names or region names.
+
+**Keyframe documents** (root attribute `version`, the same value in all 27):
+
+| Path | Count | Content |
+|---|---:|---|
+| `cycle` | 27 | exactly one per document; attributes `name`, `description`, `regions` |
+| `cycle/region` | 54 | exactly two per cycle; attribute `name` |
+| `cycle/region/<variable>` | 59,170 | one element per variable, text = **13** space-separated numbers |
+
+Every one of the 59,170 variables has 13 values, the same as GTA V's 13 time-of-day samples, so a keyframe
+document reads as one weather's day curve per variable and region. In 25 documents each region has
+**1,142 variables**; the other two have 515 and 520. Within every document the two regions list the same
+variables in the same order. The 1,142-variable set and the two short documents together use 1,301 distinct
+names: 362 of the 521 short-document names are in the 1,142 set and 159 are not, so the short documents
+follow an older or separate variable list rather than a prefix of the current one. A loader should therefore
+bind variables by element name, not by position.
+
+**Modifier documents** (root attribute `version`, the same value in all 49):
+
+| Path | Count | Content |
+|---|---:|---|
+| `modifier` | 4,593 | attributes `name`, `description`, `groupApplyTag`, `localApplyIndex`, `userFlags` on all; 4,592 distinct names |
+| `modifier/<variable>` | 29,738 | 29,727 hold 2 numbers, 11 are empty |
+| `modifier/submodifiers/item` | 8,043 | in 1,928 modifiers (4 items is the usual count: 1,252); attributes `flags` (29), `alpha` (14), `blendSpeed` (3) |
+| `modifier/axis` | 405 | in the 302 modifiers that carry `numAxes` and `numKeyframes`; attribute `controlValue` on all |
+| `modifier/axis/keyframe_t_value` | 302 | exactly one per axis modifier (on one of its axes), `numKeyframes` numbers |
+| `modifier/axis/<variable>` | 2,713 | `numKeyframes` numbers each |
+
+Modifiers come in two shapes:
+
+- **Plain** (4,291): variables are direct children with two numbers each, as in GTA V's modifier files.
+  Per modifier: 0 to 407 variables. 1,025 have none: 759 of those only list submodifiers and 266 are empty. The 1,054 modifier variable
+  names include 947 keyframe variables and 107 that occur only in modifiers.
+- **Axis-driven** (302): every variable sits inside an `axis` and has exactly `numKeyframes` values; the axis's
+  `keyframe_t_value` lists the input positions (one list per modifier, even with several axes). All 2,713 axis variables match their modifier's
+  `numKeyframes`, and all 302 `keyframe_t_value` lists have that length and are sorted ascending.
+  `numAxes` is 1 (235), 2 (49) or 4 (18) and always equals the number of `axis` children
+  (`(numAxes, numKeyframes)` most often `(1, 6)`: 93), and `numKeyframes` ranges from
+  2 to 25 (2 to 7 in 271 of the 302; 6 alone in 107). `controlValue` takes 43 distinct symbolic names, so the input is a named game
+  quantity rather than time of day. 61 axes add `input_min`/`input_max`, and 7 add `blendType`; 23 of the
+  302 position lists fall outside `[input_min, input_max]` or, without those attributes, outside 0..1, so
+  the range is not a clamp on the stored positions.
+
+`submodifiers/item` text is one token. 8,042 of the 8,043 items equal the `name` of a modifier in the same
+49 documents, so a submodifier is a by-name reference to another modifier, with its own blend attributes.
+The one unresolved item points outside this archive or at a document lost to the unread region.
+
+Not measured here (hypothesis): the hour of each of the 13 samples (GTA V's are fixed in code), how the two
+regions are chosen at runtime, what the two plain-modifier numbers are (GTA V reads them as a value pair
+blended by strength), and how `controlValue` maps onto game state.
+
 ## Relationship to `data.rpf` and `script.rpf`
 
 | Archive | Size | Streams | Inflated | Dominant payloads | XML | `RBF0` | `PSIN` |
