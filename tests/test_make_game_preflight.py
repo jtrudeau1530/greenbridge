@@ -556,6 +556,22 @@ class PreflightPrerequisiteTest(PreflightTestBase):
                 self.assertIn("--stages check,shaders,runtime", err)
                 self.assertIn("about 330 GB is needed", err)
 
+    def test_preflight_counts_assets_again_with_wav_even_when_exported(self):
+        # --wav decodes again over the exported audio (assets_exported says it is finished), so the 300 GB stays.
+        with tempfile.TemporaryDirectory() as tmp_work:
+            with mock.patch("sys.version_info", (3, 12, 0)), \
+                 mock.patch("make_game.assets_exported", return_value=True), \
+                 mock.patch("make_game.tool_available", return_value=True), \
+                 mock.patch("make_game.ensure_submodule", return_value=None), \
+                 mock.patch("shutil.which", return_value="/usr/bin/tool"), \
+                 mock.patch("os.path.isfile", return_value=True), \
+                 mock.patch("shutil.disk_usage", return_value=Usage(500 * 2**30, 250 * 2**30, 250 * 2**30)):
+                # Without --wav the exported assets are credited, so 250 GB free is enough for the asset tools.
+                make_game.preflight(["assets"], tmp_work, wav=False)
+                err = self.assert_fails(make_game.preflight, ["assets"], tmp_work, wav=True,
+                                        match="assets stage is optional")
+                self.assertIn("about 300 GB is needed", err)
+
     def test_ensure_submodule_present_is_noop(self):
         with tempfile.TemporaryDirectory() as tmp:
             core_dir = os.path.join(tmp, "third_party", "rpf9-explorer", "Core")
