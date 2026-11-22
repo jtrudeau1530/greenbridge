@@ -310,8 +310,10 @@ cross-half code on 32-wide subgroups.
 ## Day one, in order
 
 1. `scripts\first_look.ps1 -Exe ...` checks the exe is plain, lists the imports to shim, and does a dry run.
-2. Find the RPF9 table-of-contents key and decryption in the exe, then add a table reader to `rpf9_carve.py`. Carved
-   blobs then get real names and types, and the remaining unread data shows what it is.
+2. Read the RPF9 table of contents only where it is already plain on disk. Five archives have tables that look packed
+   or encrypted; under the ground rules above they stay unread and are recorded, not decrypted. Where a table is
+   readable, a reader in `rpf9_carve.py` gives carved blobs real names and types, and the remaining unread data shows
+   what it is.
 3. Find the texture and mesh resource structures in the exe (their loaders give exact field layouts), which turns
    carved blobs into named textures and meshes.
 4. Shader translation: already complete for all 26,503 shaders (see *Translator status*); the day-one work is
