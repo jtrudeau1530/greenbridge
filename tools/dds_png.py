@@ -922,9 +922,40 @@ def decode_dds(data: bytes) -> tuple[int, int, bytes]:
     return width, height, rgba
 
 
+def _box_spans(source: int, target: int) -> list:
+    """Source pixel indices and integer overlap weights for each output pixel."""
+    spans = []
+    for i in range(target):
+        # In these units a source pixel is target units wide, and an output pixel is source units wide.
+        left, right = i * source, (i + 1) * source
+        span = []
+        for j in range(left // target, (right - 1) // target + 1):
+            weight = min(right, (j + 1) * target) - max(left, j * target)
+            span.append((j, weight))
+        spans.append(span)
+    return spans
+
+
+def _resample_box(width: int, height: int, rgba: bytes, nw: int, nh: int) -> bytes:
+    x_spans = _box_spans(width, nw)
+    y_spans = _box_spans(height, nh)
+    area = width * height
+    out = bytearray(nw * nh * 4)
+    for y, rows in enumerate(y_spans):
+        for x, cols in enumerate(x_spans):
+            samples = [(4 * (sy * width + sx), wx * wy) for sy, wy in rows for sx, wx in cols]
+            dst = 4 * (y * nw + x)
+            for channel in range(4):
+                total = sum(rgba[offset + channel] * weight for offset, weight in samples)
+                out[dst + channel] = (total + area // 2) // area
+    return bytes(out)
+
+
 def _halve_rgba(width: int, height: int, rgba: bytes) -> tuple[int, int, bytes]:
     nw = max(1, width // 2)
     nh = max(1, height // 2)
+    if (width > 1 and width % 2) or (height > 1 and height % 2):
+        return nw, nh, _resample_box(width, height, rgba, nw, nh)
     row_bytes = width * 4
     out_row_bytes = nw * 4
     out = bytearray(nw * nh * 4)
@@ -962,7 +993,7 @@ def _halve_rgba(width: int, height: int, rgba: bytes) -> tuple[int, int, bytes]:
 
 
 def downscale_rgba(width: int, height: int, rgba: bytes, max_size: int) -> tuple[int, int, bytes]:
-    """Repeatedly halve RGBA8 via 2x2 box filter until max(w, h) <= max_size."""
+    """Repeatedly halve RGBA8 via a full-image box filter until max(w, h) <= max_size."""
     if width <= 0 or height <= 0:
         raise DdsError(f"Invalid image dimensions: {width}x{height}")
     expected = width * height * 4
