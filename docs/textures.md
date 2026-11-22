@@ -423,6 +423,41 @@ entry. Exporters must **not** fall back to the first texture in that case; a nor
 as a base colour is the usual symptom. The hashes are treated as measured corpus semantics, not
 as a claim that they are globally unique across every shader.
 
+### Map material texture parameters
+
+The character table above covers 246 records. Map drawables (buildings, roads, terrain, props) use more
+parameters. Five more names come from the case-sensitive joaat of the parameter name, the same check that
+names `0xC8E8C282` (`diffusetex`) in rpf9-explorer's `ModelTextureBindings`:
+
+| Parameter | Name (joaat) |
+|---|---|
+| `0x1E77BF4C` | `bumptex` |
+| `0xC6F46E79` | `speculartex` |
+| `0x739E3D0D` | `speculartex2` |
+| `0x3FB7964F` | `tinttexture` |
+| `0xC075F9B6` | `lookuptexture` (terrain materials) |
+
+Content check on map drawables: a random sample of 1,500 `.ydr`/`.yft` models (seed 7), each referenced
+texture counted once per parameter. A texture is "normal-map-like" when its mean colour (BC1 colour-0
+endpoints, BC7 mode-6 endpoints) has blue > 190 and red and green within 45 of 128; BC5 is two-channel.
+
+| Parameter | Normal-map-like | Not normal-like | BC5 | Formats (DXGI: count) |
+|---|---:|---:|---:|---|
+| `0x1E77BF4C` `bumptex` | 1,394 | 74 | 131 | 71: 1,659, 83: 131, 98: 106 |
+| `0xC6F46E79` `speculartex` | 69 | 1,469 | 0 | 71: 1,650, 98: 372, 28: 4 |
+| `0x739E3D0D` `speculartex2` | 5 | 851 | 0 | 98: 738, 71: 225, 72: 1 |
+| `0xC8E8C282` `diffusetex` | 28 | 1,887 | 0 | 72: 1,322, 99: 709, 78: 145 |
+| `0x3FB7964F` `tinttexture` | 0 | 61 | 0 | 72: 61, 99: 2, 78: 1 |
+
+So on map materials `bumptex` is the tangent-space normal map and `speculartex` is not a normal map. The
+character table above lists `0xC6F46E79` as the normal map; these character textures are mostly outside the
+measured catalog here, so that row is left unchanged, but it should be re-checked against the name.
+
+Three more parameters hold sRGB colour-like textures on map materials and are not in `ModelTextureBindings`
+(names not found): `0x17D3B5C2` (72: 47), `0x6994EF3F` (99: 25) and `0x7485DAFB` (99: 162, 78: 15, 72: 12;
+a tiling detail layer next to the two-layer `lyr0diffusetex`/`lyr1diffusetex` blend). `tinttexture` holds an
+ID/palette map on most materials and is not a base colour outside terrain.
+
 ## BCPack block structure and limits
 
 A BCPack chunk is not a self-describing container. The container gives it a decoded (virtual)
