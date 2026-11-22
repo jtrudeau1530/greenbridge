@@ -591,7 +591,11 @@ int main(int argc, char** argv) {
     }
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
     push(cmd, pl, pcs, 0, pc_bytes, pc);
-    if (mesh_compute)
+    // VKH_VERTICES=<n>: draw n vertices instead of one triangle, so a vertex shader fills whole waves (TEST-251).
+    const char* vertices_env = std::getenv("VKH_VERTICES");
+    if (const unsigned vertices = vertices_env ? unsigned(std::strtoul(vertices_env, nullptr, 10)) : 0; vertices && !mesh)
+        vkCmdDraw(cmd, vertices, 1, 0, 0);
+    else if (mesh_compute)
         vkCmdDraw(cmd, uint32_t(mesh_groups * mesh_prims * 3), 1, 0, 0);
     else if (mesh)
         reinterpret_cast<PFN_vkCmdDrawMeshTasksEXT>(vkGetDeviceProcAddr(dev, "vkCmdDrawMeshTasksEXT"))(cmd, groups[0], groups[1], groups[2]);
