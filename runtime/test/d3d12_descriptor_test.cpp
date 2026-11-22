@@ -507,6 +507,49 @@ int main() {
         std::memset(view_bytes(null_slot), 0x77, step);
         device->CreateShaderResourceView(volume.p, &flat_view, view_slot(null_slot));
         EXPECT(null_at(null_slot));
+
+        // D3D-75: plane 1 of a depth-stencil texture is its stencil. The T# is 8_UINT at the texture's own address,
+        // with the eight bits read as G and R, B, A as 0, 0, 1 (D3D12's X24_TYPELESS_G8_UINT / X32_..._G8X24_UINT).
+        // A stencil view of a colour texture, or one in another format, is a null descriptor.
+        for (const auto& [resource_format, stencil_view_format] :
+             {std::pair{DXGI_FORMAT_R24G8_TYPELESS, DXGI_FORMAT_X24_TYPELESS_G8_UINT},
+              std::pair{DXGI_FORMAT_R32G8X24_TYPELESS, DXGI_FORMAT_X32_TYPELESS_G8X24_UINT}}) {
+            D3D12_RESOURCE_DESC depth_desc = texture_desc;
+            depth_desc.Format = resource_format;
+            depth_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+            Ref<ID3D12Resource> depth_stencil;
+            EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &depth_desc,
+                                                             D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                             IID_PPV_ARGS(&depth_stencil.p))));
+            D3D12_SHADER_RESOURCE_VIEW_DESC plane_view{};
+            plane_view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+            plane_view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            plane_view.Texture2D.MipLevels = 1;
+            plane_view.Format = stencil_view_format;
+            plane_view.Texture2D.PlaneSlice = 1;
+            std::memset(view_bytes(null_slot), 0x77, step);
+            device->CreateShaderResourceView(depth_stencil.p, &plane_view, view_slot(null_slot));
+            g::Image stencil_image{};
+            EXPECT(image_at(null_slot, stencil_image));
+            EXPECT(stencil_image.format == g::stencil_format && stencil_image.type == g::ImageType::image_2d);
+            EXPECT((stencil_image.swizzle == g::Swizzle{g::select_zero, g::select_x, g::select_zero, g::select_one}));
+            EXPECT(stencil_image.width == size && stencil_image.mip_count == 1);
+
+            plane_view.Format = DXGI_FORMAT_R8_UINT;  // not a stencil view format
+            plane_view.Texture2D.PlaneSlice = 1;
+            std::memset(view_bytes(null_slot), 0x77, step);
+            device->CreateShaderResourceView(depth_stencil.p, &plane_view, view_slot(null_slot));
+            EXPECT(null_at(null_slot));
+        }
+        D3D12_SHADER_RESOURCE_VIEW_DESC colour_plane{};
+        colour_plane.Format = DXGI_FORMAT_X24_TYPELESS_G8_UINT;
+        colour_plane.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        colour_plane.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        colour_plane.Texture2D.MipLevels = 1;
+        colour_plane.Texture2D.PlaneSlice = 1;
+        std::memset(view_bytes(null_slot), 0x77, step);
+        device->CreateShaderResourceView(texture.p, &colour_plane, view_slot(null_slot));
+        EXPECT(null_at(null_slot));
         volume.reset();
         cube.reset();
         writable.reset();

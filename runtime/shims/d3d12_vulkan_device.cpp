@@ -340,7 +340,11 @@ struct DeviceState {
             log_once("set 0 has no array for this image type (1D array or multisampled):", int(image.type));
             return false;
         }
-        const VkFormat view_format = g::vulkan_view_format(image_format, image.format);
+        // A T# of 8_UINT on a depth-stencil image is a view of its stencil plane (image_descriptor, D3D-75). Vulkan
+        // views it in the image's own format with the stencil aspect, and returns the value in R, as a T# whose
+        // format is 8_UINT reads it from X.
+        const bool stencil = (aspects & VK_IMAGE_ASPECT_STENCIL_BIT) && image.format == g::stencil_format;
+        const VkFormat view_format = stencil ? image_format : g::vulkan_view_format(image_format, image.format);
         if (view_format == VK_FORMAT_UNDEFINED) {
             log_once("no Vulkan view format for the GFX10 format of a view:", int(image.format));
             return false;
@@ -353,8 +357,9 @@ struct DeviceState {
         view_info.components = g::vulkan_swizzle(image.swizzle, view_format);
         // The cast: MSVC's enums are ints, and it rejects int to VkImageAspectFlags in braces as narrowing.
         view_info.subresourceRange = {
-            VkImageAspectFlags((aspects & VK_IMAGE_ASPECT_DEPTH_BIT) ? VK_IMAGE_ASPECT_DEPTH_BIT
-                                                                     : VK_IMAGE_ASPECT_COLOR_BIT),
+            VkImageAspectFlags(stencil                                   ? VK_IMAGE_ASPECT_STENCIL_BIT
+                               : (aspects & VK_IMAGE_ASPECT_DEPTH_BIT) ? VK_IMAGE_ASPECT_DEPTH_BIT
+                                                                       : VK_IMAGE_ASPECT_COLOR_BIT),
             image.first_mip, image.mip_count, image.first_layer, image.layer_count};
         ImageEntry entry{dimension, 0, VK_NULL_HANDLE, VK_NULL_HANDLE, image.address};
         if (vk.vkCreateImageView(info.device, &view_info, nullptr, &entry.sampled) != VK_SUCCESS) return false;
@@ -904,8 +909,16 @@ struct TextureView {
 bool image_descriptor(const Resource& resource, const TextureView& view, leonida::gfx10::Image& out) {
     namespace g = leonida::gfx10;
     const D3D12_RESOURCE_DESC& desc = resource.desc();
-    if (view.plane != 0) {
-        log_once("views of the stencil plane are not supported; plane", int(view.plane));
+    // Plane 1 of a depth-stencil texture is its stencil, viewed as X24_TYPELESS_G8_UINT (D24S8) or
+    // X32_TYPELESS_G8X24_UINT (D32S8): eight unsigned bits in G, as D3D12 returns them. The T# is 8_UINT, the
+    // format of the console's separate stencil surface, and bind_image views the stencil aspect for it.
+    const bool stencil = view.plane == 1;
+    if (view.plane > 1 || (stencil && !(resource.aspects() & VK_IMAGE_ASPECT_STENCIL_BIT))) {
+        log_once("no such plane in this texture; plane", int(view.plane));
+        return false;
+    }
+    if (stencil && view.format != DXGI_FORMAT_X24_TYPELESS_G8_UINT && view.format != DXGI_FORMAT_X32_TYPELESS_G8X24_UINT) {
+        log_once("a stencil-plane view needs a stencil view format; format", int(view.format));
         return false;
     }
     // Every view here is a 2D one (plain, array or cube), which a volume or a multisampled image cannot back.
@@ -914,9 +927,11 @@ bool image_descriptor(const Resource& resource, const TextureView& view, leonida
         return false;
     }
     VkFormat named = resource.format();
-    if (view.format != DXGI_FORMAT_UNKNOWN) named = vulkan_format(view.format, false).format;
-    const std::uint32_t code = g::format_from_vulkan(named);
-    const VkFormat view_format = code ? g::vulkan_view_format(resource.format(), code) : VK_FORMAT_UNDEFINED;
+    if (view.format != DXGI_FORMAT_UNKNOWN && !stencil) named = vulkan_format(view.format, false).format;
+    const std::uint32_t code = stencil ? g::stencil_format : g::format_from_vulkan(named);
+    const VkFormat view_format = stencil ? resource.format()
+                                 : code  ? g::vulkan_view_format(resource.format(), code)
+                                         : VK_FORMAT_UNDEFINED;
     if (view_format == VK_FORMAT_UNDEFINED) {
         log_once("view format not supported for this texture:", int(view.format));
         return false;
@@ -944,7 +959,9 @@ bool image_descriptor(const Resource& resource, const TextureView& view, leonida
     }
     // D3D12's component mapping picks, for each of R, G, B, A, a channel of the format or a constant; the T#
     // says the same about the hardware's channels, which the format places.
-    const g::Swizzle channels = g::format_swizzle(view_format);
+    // A stencil view's format has its eight bits in G and no R, B or A of its own (0, 0, 1 when read).
+    const g::Swizzle channels = stencil ? g::Swizzle{g::select_zero, g::select_x, g::select_zero, g::select_one}
+                                        : g::format_swizzle(view_format);
     for (UINT i = 0; i < 4; ++i) {
         const UINT from = D3D12_DECODE_SHADER_4_COMPONENT_MAPPING(i, view.mapping);
         out.swizzle[i] = from < 4 ? channels[from]
