@@ -20,6 +20,7 @@
 #include "vulkan_loader.h"
 #include "../src/vulkan_bindless.h"
 
+#include <array>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -605,10 +606,32 @@ int main(int argc, char** argv) {
             vkDestroyImageView(dev, brief, nullptr);
         }
 
-        // 1. The T# behind three keys that share its first slot, the S#, and other keys that name the decoy.
         const DescriptorTable& table = set.table();
         const auto slot_count = [&] { return std::uint32_t(table.capacity()); };
         const std::uint32_t slots = slot_count(), home = hash_descriptor_key(tsharp) & (slots - 1);
+        // Fill eight adjacent home slots across the end of the table. The ninth key
+        // shares the first home and can fit only by moving a resident already on the GPU.
+        {
+            std::array<DescriptorKey, kDescriptorProbes + 1> keys{};
+            for (std::uint32_t i = 0; i < keys.size(); ++i) {
+                auto& key = keys[i];
+                key[0] = i + 1;
+                const auto target = (slots - 4 + i % kDescriptorProbes) & (slots - 1);
+                while ((hash_descriptor_key(key) & (slots - 1)) != target) ++key[7];
+            }
+            for (std::uint32_t i = 0; i < kDescriptorProbes; ++i) set.insert_key(keys[i], decoy_index);
+            EXPECT(!set.flush_needs_idle() && set.flush());
+            EXPECT(set.insert_key(keys.back(), gradient_index));
+            EXPECT(slot_count() == slots && set.flush_needs_idle());
+            EXPECT(set.flush() && !set.flush_needs_idle());
+            for (const auto& key : keys) {
+                EXPECT(table.lookup(key) == (key == keys.back() ? gradient_index : decoy_index));
+                EXPECT(set.erase_key(key));
+            }
+            EXPECT(table.size() == 0 && set.flush());
+        }
+
+        // 1. The T# behind three keys that share its first slot, the S#, and other keys that name the decoy.
         std::uint32_t ahead = 0;
         for (std::uint32_t k = 1; ahead < 3; ++k) {
             if ((hash_descriptor_key(numbered(k)) & (slots - 1)) != home) continue;

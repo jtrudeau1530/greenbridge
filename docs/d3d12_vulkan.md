@@ -1292,8 +1292,10 @@ struct entry {               // 10 uints = 40 bytes
 - Hash: FNV-1a over the eight key dwords as dwords (not bytes): `h = 2166136261; h = (h ^ key[i]) * 16777619`.
 - Probe: `slot = (h + k) & mask` for `k = 0..7`; the first entry whose eight key dwords match yields its
   `index`; no match yields 0.
-- The layer must keep the table sparse enough that no live key needs more than eight probes. Grow (rebuild into a
-  larger power-of-two table) when an insertion would exceed eight probes, or at 50% load. Update binding 2 after
+- The layer must keep the table sparse enough that no live key needs more than eight probes. When all eight slots are occupied,
+  the runtime tries to move one resident to the next empty slot within that resident's own probe window.
+  A relocation requires an idle flush because it overwrites a live slot. Grow when this fails or when the next
+  insertion would exceed 50% load. Update binding 2 after
   the rebuild, at a point where no in-flight command buffer reads the old table.
 - Insert on `CreateShaderResourceView`, `CreateUnorderedAccessView`, `CreateSampler`, `CopyDescriptors` and heap
   scans. A duplicate key updates the index in place.
