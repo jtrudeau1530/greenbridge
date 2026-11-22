@@ -674,5 +674,223 @@ class TestScalarInterpInterpreter(unittest.TestCase):
         self.assertEqual(lo, H_ONE)
 
 
+# ==============================================================================
+# SIMD Multi-Lane Divergence and 32/64-Bit EXEC Masking for v_interp_p2_f16
+# ==============================================================================
+
+class SIMDState:
+    """Wavefront state for SIMD execution (Wave32 or Wave64)."""
+
+    def __init__(self, wave_size: int = 64) -> None:
+        if wave_size not in (32, 64):
+            raise ValueError(f"Wave size must be 32 or 64, got {wave_size}")
+        self.wave_size = wave_size
+        self.lanes = [InterpolationRegisterFile() for _ in range(wave_size)]
+        self.attributes = AttributeBuffer()
+        self.exec_mask: int = (1 << wave_size) - 1
+        self.vcc: int = 0
+        self.scc: int = 0
+
+    def is_lane_active(self, lane: int) -> bool:
+        if not (0 <= lane < self.wave_size):
+            return False
+        return bool((self.exec_mask >> lane) & 1)
+
+    def set_vgpr_u32_wave(self, reg_idx: int, values: List[int]) -> None:
+        if len(values) != self.wave_size:
+            raise ValueError(f"Values length ({len(values)}) != wave_size ({self.wave_size})")
+        for lane in range(self.wave_size):
+            self.lanes[lane].write_vgpr_u32(reg_idx, values[lane])
+
+    def get_vgpr_u32_wave(self, reg_idx: int) -> List[int]:
+        return [self.lanes[lane].read_vgpr_u32(reg_idx) for lane in range(self.wave_size)]
+
+    def set_vgpr_f32_wave(self, reg_idx: int, values: List[float]) -> None:
+        if len(values) != self.wave_size:
+            raise ValueError(f"Values length ({len(values)}) != wave_size ({self.wave_size})")
+        for lane in range(self.wave_size):
+            self.lanes[lane].write_vgpr_f32(reg_idx, values[lane])
+
+    def get_vgpr_f32_wave(self, reg_idx: int) -> List[float]:
+        return [self.lanes[lane].read_vgpr_f32(reg_idx) for lane in range(self.wave_size)]
+
+
+class SIMDInterpInterpreter:
+    """SIMD instruction interpreter handling multi-lane divergence and EXEC masking."""
+
+    def step(self, inst: ASTInstruction, state: SIMDState) -> List[Optional[int]]:
+        inst.validate()
+        results: List[Optional[int]] = [None] * state.wave_size
+        p20_word = state.attributes.read_param_channel(2, inst.attr.attr_index, inst.attr.channel.value)
+
+        for lane in range(state.wave_size):
+            if not state.is_lane_active(lane):
+                continue
+
+            j_raw = state.lanes[lane].read_vgpr_u32(inst.src_j.vgpr_index)
+            j_mod = apply_f32_modifiers(j_raw, abs_mod=inst.src_j.abs_mod, neg_mod=inst.src_j.neg_mod)
+            j_f32 = u32_to_f32(j_mod)
+
+            p1_accum = state.lanes[lane].read_vgpr_f32(inst.dst.vgpr_index)
+            old_vdst = state.lanes[lane].read_vgpr_u32(inst.dst.vgpr_index)
+
+            res = ref_interp_p2_f16(
+                j_f32,
+                p20_word,
+                p1_accum,
+                high_src=inst.high_src,
+                high_dst=inst.high_dst,
+                old_vdst_u32=old_vdst,
+                clamp=inst.clamp,
+            )
+            state.lanes[lane].write_vgpr_u32(inst.dst.vgpr_index, res)
+            results[lane] = res
+
+        return results
+
+
+def ref_simd_interp_p2_f16(
+    j_coords: List[float],
+    p20_word: int,
+    p1_accums: List[float],
+    wave_size: int = 64,
+    exec_mask: Optional[int] = None,
+    prev_vdst: Optional[List[int]] = None,
+    *,
+    high_src: bool = False,
+    high_dst: bool = False,
+    clamp: bool = False,
+) -> List[int]:
+    """Reference SIMD execution oracle across wavefront lanes."""
+    active_mask = ((1 << wave_size) - 1) if exec_mask is None else (exec_mask & ((1 << wave_size) - 1))
+    fallback = [0] * wave_size if prev_vdst is None else prev_vdst
+    output = list(fallback)
+
+    for lane in range(wave_size):
+        if (active_mask >> lane) & 1:
+            output[lane] = ref_interp_p2_f16(
+                j_coords[lane],
+                p20_word,
+                p1_accums[lane],
+                high_src=high_src,
+                high_dst=high_dst,
+                old_vdst_u32=fallback[lane],
+                clamp=clamp,
+            )
+    return output
+
+
+class TestSIMDMultiLaneDivergence(unittest.TestCase):
+    """Test suite for SIMD multi-lane divergence and 32/64-bit EXEC masking."""
+
+    def test_wave32_all_active_divergence(self):
+        state = SIMDState(wave_size=32)
+        sim = SIMDInterpInterpreter()
+
+        # attr0.x p20 = (lo: 2.0, hi: 0.0)
+        p20_word = pack_f16_pair(f16_to_u16(2.0), 0)
+        state.attributes.write_param_channel(2, 0, 0, p20_word)
+
+        # Divergent j coordinates across 32 lanes: 0.0, 1.0/31, 2.0/31, ...
+        j_vals = [i / 31.0 for i in range(32)]
+        p1_vals = [1.0] * 32
+        state.set_vgpr_f32_wave(1, j_vals)
+        state.set_vgpr_f32_wave(0, p1_vals)
+
+        inst = ASTInstruction(
+            opcode=Opcode.V_INTERP_P2_F16,
+            dst=ASTOperand(0, high=False),
+            src_j=ASTOperand(1),
+            attr=AttributeRef(0, Channel.X),
+        )
+        sim.step(inst, state)
+        out_dwords = state.get_vgpr_u32_wave(0)
+
+        for lane in range(32):
+            expected_f = 1.0 + j_vals[lane] * 2.0
+            lo, _ = unpack_f16_pair(out_dwords[lane])
+            self.assertAlmostEqual(u16_to_f16(lo), expected_f, delta=0.01)
+
+    def test_wave64_divergent_exec_mask(self):
+        state = SIMDState(wave_size=64)
+        sim = SIMDInterpInterpreter()
+
+        p20_word = pack_f16_pair(f16_to_u16(4.0), 0)
+        state.attributes.write_param_channel(2, 1, 2, p20_word)
+
+        j_vals = [0.25] * 64
+        p1_vals = [2.0] * 64
+        sentinel_vdst = [0xDEADBEEF] * 64
+        state.set_vgpr_f32_wave(1, j_vals)
+        state.set_vgpr_f32_wave(0, p1_vals)
+        # Store canary in v0
+        state.set_vgpr_u32_wave(0, sentinel_vdst)
+        # Set p1_accum into f32 view (which sets dword)
+        state.set_vgpr_f32_wave(0, p1_vals)
+
+        # Alternating EXEC mask across 64 lanes
+        state.exec_mask = 0x55555555_55555555
+
+        inst = ASTInstruction(
+            opcode=Opcode.V_INTERP_P2_F16,
+            dst=ASTOperand(0, high=False),
+            src_j=ASTOperand(1),
+            attr=AttributeRef(1, Channel.Z),
+        )
+        sim.step(inst, state)
+        res_dwords = state.get_vgpr_u32_wave(0)
+
+        for lane in range(64):
+            if lane % 2 == 0:
+                # Active: 2.0 + 0.25 * 4.0 = 3.0 (0x4200)
+                lo, _ = unpack_f16_pair(res_dwords[lane])
+                self.assertEqual(u16_to_f16(lo), 3.0)
+            else:
+                # Inactive: untouched
+                self.assertEqual(res_dwords[lane], f32_to_u32(2.0))
+
+    def test_simd_oracle_validation(self):
+        wave_size = 64
+        j_coords = [float(i) / 64.0 for i in range(wave_size)]
+        p1_accums = [float(i % 10) for i in range(wave_size)]
+        p20_word = pack_f16_pair(f16_to_u16(3.0), f16_to_u16(7.0))
+        exec_mask = 0x00FF00FF_00FF00FF
+        prev_vdst = [0xCAFE0000 | i for i in range(wave_size)]
+
+        expected = ref_simd_interp_p2_f16(
+            j_coords,
+            p20_word,
+            p1_accums,
+            wave_size=wave_size,
+            exec_mask=exec_mask,
+            prev_vdst=prev_vdst,
+            high_src=True,
+            high_dst=False,
+            clamp=False,
+        )
+
+        state = SIMDState(wave_size=wave_size)
+        sim = SIMDInterpInterpreter()
+        state.attributes.write_param_channel(2, 2, 0, p20_word)
+        state.set_vgpr_f32_wave(1, j_coords)
+        state.set_vgpr_f32_wave(0, p1_accums)
+        state.set_vgpr_u32_wave(0, prev_vdst)
+        # Re-pack f32 into p1_accums
+        state.set_vgpr_f32_wave(0, p1_accums)
+        state.exec_mask = exec_mask
+
+        inst = ASTInstruction(
+            opcode=Opcode.V_INTERP_P2_F16,
+            dst=ASTOperand(0, high=False),
+            src_j=ASTOperand(1),
+            attr=AttributeRef(2, Channel.X),
+            high_src=True,
+            high_dst=False,
+        )
+        sim.step(inst, state)
+        actual = state.get_vgpr_u32_wave(0)
+        self.assertEqual(len(actual), wave_size)
+
+
 if __name__ == "__main__":
     unittest.main()
