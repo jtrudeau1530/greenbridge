@@ -53,6 +53,7 @@ FMA_KHR = False          # --fma khr: fused multiply-adds are OpFmaKHR (SPV_KHR_
 # maintenance8 outside gather. Implicit-LOD samples become Grad samples with the derivatives of the original
 # coordinate, so a per-pixel offset doesn't change the LOD. Gathers keep their Offset (shaderImageGatherExtended).
 TEXEL_OFFSET_FALLBACK = False
+FLOAT_CONTROLS = True    # False (--no-float-controls): no SignedZeroInfNanPreserve, for drivers without the property
 # --mesh-compute: mesh shaders become compute shaders (same workgroup size and code) for devices without
 # VK_EXT_mesh_shader. Instead of SetMeshOutputs and the mesh outputs, the epilogue writes the vertex and primitive
 # counts, each lane's vertex and each lane's primitive into this workgroup's slot of a buffer whose device address is
@@ -9207,6 +9208,12 @@ def assemble(gen):
         caps.append("ShaderLayer")
     if gen.uses_viewport:
         caps.append("ShaderViewportIndex")
+    if FLOAT_CONTROLS:
+        # RDNA2 float ops are IEEE: NaN, +-inf and -0 come out as computed. Without this execution mode Vulkan lets
+        # the driver assume none of them occur, and AMD's compiler does: a -0 product came back +0, and a NaN result
+        # narrowed to f16 with integer ops was never stored (RX 9070 XT; docs/design.md, "Float controls").
+        # Core in SPIR-V 1.4, so no extension at vulkan1.2; the runtime checks shaderSignedZeroInfNanPreserveFloat32.
+        caps.append("SignedZeroInfNanPreserve")
     pops = gen.uses_pops and gen.stage == "ps"
     exts = (["SPV_KHR_physical_storage_buffer"] if psb else []) + (["SPV_EXT_descriptor_indexing"] if tex else [])
     if gen.uses_fma_khr:
@@ -9240,6 +9247,8 @@ def assemble(gen):
             hdr.append("OpExecutionMode %main PixelInterlockOrderedEXT")
         if gen.writes_depth:
             hdr.append("OpExecutionMode %main DepthReplacing")
+    if FLOAT_CONTROLS:
+        hdr.append("OpExecutionMode %main SignedZeroInfNanPreserve 32")
     dec = []
     if vs:
         dec.append("OpDecorate %vertex_index BuiltIn VertexIndex")
@@ -11326,6 +11335,9 @@ def shader_meta(g, asm, src_path=None, fssm_path=None):
         m["subgroup_size"] = None
     if "Offset " in asm and re.search(r"OpImageSample\w+ [^\n]*Offset", asm):
         m["needs_maintenance8"] = True
+    if "SignedZeroInfNanPreserve" in caps:
+        # A property, not a feature: VkPhysicalDeviceFloatControlsProperties members the device must report true.
+        m["float_controls"] = ["shaderSignedZeroInfNanPreserveFloat32"]
     if g.uses_codebase:
         m["uses_code_base"] = True
     if g.cs:
@@ -11562,6 +11574,9 @@ def main():
                     help="optional dir with <name>.fssm sidecars: records fssm_sha256 per shader in the index")
     ap.add_argument("--dispatch-loop", action="store_true",
                     help="emit control flow the old way, as one loop around a switch (to compare with the default)")
+    ap.add_argument("--no-float-controls", action="store_true",
+                    help="don't declare SignedZeroInfNanPreserve (for a driver whose "
+                         "shaderSignedZeroInfNanPreserveFloat32 is false); NaN, inf and -0 are then not guaranteed")
     ap.add_argument("--wave64-emulate", action="store_true",
                     help="wave64 compute and mesh shaders exact on any subgroup size (32-wide NVIDIA, Intel): "
                          "cross-lane operations go through workgroup memory instead of subgroup operations")
@@ -11593,6 +11608,8 @@ def main():
     global STRUCTURED, WAVE64_EMULATE, WAVE64_GRAPHICS, BARY_FALLBACK, TEXEL_OFFSET_FALLBACK, MESH_COMPUTE, FMA_KHR, F16_HALVES
     FMA_KHR = a.fma == "khr"
     STRUCTURED = not a.dispatch_loop
+    global FLOAT_CONTROLS
+    FLOAT_CONTROLS = not a.no_float_controls
     WAVE64_EMULATE = a.wave64_emulate
     WAVE64_GRAPHICS = a.wave64_graphics
     BARY_FALLBACK = a.bary_fallback
