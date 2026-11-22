@@ -473,6 +473,43 @@ class TranslatorValueSemantics(unittest.TestCase):
         for address in (0x98, 0xAC, 0xCC):
             self.assertNotIn(address, memory)
 
+    def test_d16_xyz_typed_buffers(self):
+        # cs_fmt_d16_xyz.asm (derivation in its header): buffer_load_format_d16_xyz, tbuffer_load_format_d16_xy /
+        # _d16_xyz and buffer_store_format_d16_xyz.
+        def f16(x):
+            return struct.unpack("<H", struct.pack("<e", x))[0]
+
+        def f32(x):
+            return struct.unpack("<I", struct.pack("<f", x))[0]
+
+        def pack(lo, hi):
+            return (hi & 0xFFFF) << 16 | (lo & 0xFFFF)
+
+        sat16 = lambda v: min(v, 0xFFFF)             # unsigned 32-bit channel narrowed to 16 bits (docs/design.md)
+        keep_hi = lambda seed, lo: (seed & 0xFFFF0000) | lo   # an odd final component writes bits 15:0 only
+        spv = support.translate_fixture("cs_fmt_d16_xyz", fssm=CS_BOUNDS_FSSM)
+        memory = {}
+        support.run_fragment(
+            spv, inputs={"%wg_id": (0, 0, 0), "%local_id": (0, 0, 0)},
+            push_constants=[0, 0, 0x140, 0x31016FAC] + [0] * 28, memory=memory)
+        expected = {
+            0x00: pack(0x1234, 0xABCD), 0x04: keep_hi(0xA5A55A5A, 0x7FFF),                 # L1 16_16_16_16_UINT
+            0x08: pack(5, sat16(0x10000)), 0x0C: keep_hi(0x12345678, sat16(0xFFFFFFFF)),    # L2 32_32_32_UINT
+            0x10: pack(f16(1.0), f16(-2.0)),                                                  # L3 16_16_FLOAT
+            0x14: pack(f16(1.0), f16(-2.0)), 0x18: keep_hi(0xBEEF7777, 0x3555),             # L4 16_16_16_16_FLOAT
+            0x1C: pack(f16(255 / 255), f16(0 / 255)), 0x20: keep_hi(0xCAFE1111, f16(1.0)),  # L5 8_8_8_8_UNORM
+            0x24: pack(5, 0xFFFF), 0x28: keep_hi(0x0BAD0BAD, 0xFFFF),                       # L6 MTBUF 32_32_32_UINT
+            0x40: 0x0007, 0x44: 0x8001, 0x48: 0xFFFE,                                         # S1 to 32_32_32_UINT
+            0x50: f32(1.0), 0x54: f32(-2.0), 0x58: f32(0.5),                                  # S2 to 32_32_32_FLOAT
+        }
+        self.assertEqual(expected[0x00], 0xABCD1234)
+        self.assertEqual(expected[0x10], 0xC0003C00)
+        for address, word in expected.items():
+            with self.subTest(address=hex(address)):
+                self.assertEqual(f"{memory.get(address, 0):#010x}", f"{word:#010x}")
+        for address in (0x2C, 0x4C, 0x5C):
+            self.assertNotIn(address, memory)
+
     def test_s_ff0_s_ff1_read_an_immediate_as_a_value(self):
         # SHADER-46: an inline constant or literal is a 32-bit value. Read as a lane mask (all ones or zero from
         # bit 0), s_ff0 of 61 and of 0x0000ffff gave -1; the s_ff1 words guard the path it already got right.

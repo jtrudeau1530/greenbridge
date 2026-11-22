@@ -201,6 +201,14 @@ TBUFFER_STORE_WORDS = [
     0xFF0080FF, 0xA5A50284, 0xA5A50288, 0xA5A5028C, 0xA5A50290, 0xA5A50294, 0xA5A50298, 0xA5A5029C,
     0xA5A502FF, 0xA5A502A4, 0xA5A502A8, 0xA5A502AC, 0x3F800000, 0xA5A502B4, 0xA5A502B8, 0xA5A502BC,
     0xA5A502C0, 0xA5A502C4, 0xA5A502C8, 0xA5A502CC]
+# cs_fmt_d16_xyz.asm: d16_xyz / d16_xy typed-buffer loads (out[0..10]), the two d16_xyz stores (out[16..18] and
+# out[20..22]) and the inputs at 0x100 (out[64..72]); everything else is the untouched fill. Derivation in the header.
+FMT_D16_XYZ_WORDS = [
+    0xABCD1234, 0xA5A57FFF, 0xFFFF0005, 0x1234FFFF, 0xC0003C00, 0xC0003C00, 0xBEEF3555, 0x00003C00,
+    0xCAFE3C00, 0xFFFF0005, 0x0BADFFFF, *[0xEEEEEEEE] * 5,
+    0x00000007, 0x00008001, 0x0000FFFE, 0xEEEEEEEE, 0x3F800000, 0xC0000000, 0x3F000000, 0xEEEEEEEE,
+    *[0xEEEEEEEE] * 40,
+    0xABCD1234, 0x55557FFF, 0xC0003C00, 0x7BFF3555, 5, 0x10000, 0xFFFFFFFF, 0, 0x80FF00FF, *[0xEEEEEEEE] * 7]
 # Negative global_load/global_store offsets (cs_global_neg_offset.asm): 40 groups make a 0x2800-byte heap that holds
 # both the right addresses and the 4096-lower ones; only group 0 thread 0 runs, so no wave64 requirement.
 GLOBAL_OFFSET = [("cs_global_neg_offset", "40", [0x5EED1FFC, 0x8BAD1800, 0x5EED1FF0, 0x5EED1FF4,
@@ -485,6 +493,11 @@ def tbuffer_store_test(tools, spirv, env=None):
     """The 52 region words tbuffer_store_format_* leaves and the untouched words after them, up to the regions at
     0x200. The heap needs 0x2d0 bytes, so it is 192 words."""
     return dump_test(tools, spirv, "cs_tbuffer_store", TBUFFER_STORE_WORDS + [0xEEEEEEEE] * 76, 192, env)
+
+
+def fmt_d16_xyz_test(tools, spirv, env=None):
+    """The d16_xyz/d16_xy loads and d16_xyz stores of cs_fmt_d16_xyz.asm: the whole 80-word heap."""
+    return dump_test(tools, spirv, "cs_fmt_d16_xyz", FMT_D16_XYZ_WORDS, len(FMT_D16_XYZ_WORDS), env)
 
 
 class Skip(str):
@@ -1288,6 +1301,7 @@ def main():
     results.append(("cs_fmt_sint32", fmt_sint32_test(tools, spirv)))
     results.append(("cs_fmt_xy_xyz", fmt_xy_xyz_test(tools, spirv)))
     results.append(("cs_tbuffer_store", tbuffer_store_test(tools, spirv)))
+    results.append(("cs_fmt_d16_xyz", fmt_d16_xyz_test(tools, spirv)))
     for name, groups, want in GLOBAL_OFFSET:
         results.append((name, compute_test(tools, spirv, name, groups, "dump", expected_words=want)))
     results.append(("cs_user_sgprs", compute_test(tools, spirv, "cs_user_sgprs", "1", "dump",
