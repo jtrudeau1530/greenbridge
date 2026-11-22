@@ -39,10 +39,7 @@ class Harness(unittest.TestCase):
                 self.assertEqual(counts["mismatch"], 0, first)
                 self.assertEqual(counts["harness-error"], 0, first)
                 self.assertEqual(counts["skip"], {}, counts["skip"])
-                # Two typed-buffer questions await a hardware measurement and are counted apart (see mem_diff.py).
-                self.assertEqual(counts["pass"] + counts["norm-ulp1"] + counts["missing-w32"], 60)
-                if family != "buffer_format":
-                    self.assertEqual(counts["pass"], 60)
+                self.assertEqual(counts["pass"], 60)
 
 
 class Reference(unittest.TestCase):
@@ -95,29 +92,28 @@ class FormatDecode(unittest.TestCase):
     def test_decode_examples(self):
         # 8_8_8_8_UINT: X in the low byte; four channels, nothing missing.
         self.assertEqual(md.decode_element(0xDDCCBBAA, [8, 8, 8, 8], "UINT"), [0xAA, 0xBB, 0xCC, 0xDD])
-        # 16_16_SNORM: X = 0x8000 clamps to -1.0, Y = 0x7FFF is 1.0; Z/W missing -> 0, 1.0.
-        self.assertEqual(md.decode_element(0x7FFF8000, [16, 16], "SNORM"), [0xBF800000, 0x3F800000, 0, 0x3F800000])
+        # 16_16_SNORM: X = 0x8000 clamps to -1.0, Y = 0x7FFF is 1.0; Z/W repeat XYXY (SHADER-86).
+        self.assertEqual(md.decode_element(0x7FFF8000, [16, 16], "SNORM"),
+                         [0xBF800000, 0x3F800000, 0xBF800000, 0x3F800000])
         # 2_10_10_10_UNORM: X10 at bit 0 ... W2 at bit 30. All ones in X, W = 3 -> 1.0, Y = Z = 0.
         self.assertEqual(md.decode_element(0xC00003FF, [10, 10, 10, 2], "UNORM"),
                          [0x3F800000, 0, 0, 0x3F800000])
-        # 32_UINT: missing Y, Z, W -> 0, 0, 1 (integer one).
-        self.assertEqual(md.decode_element(7, [32], "UINT"), [7, 0, 0, 1])
+        # 32_UINT: missing Y/Z/W repeat X (SHADER-86).
+        self.assertEqual(md.decode_element(7, [32], "UINT"), [7, 7, 7, 7])
 
-    def test_open_questions_are_counted_apart(self):
-        """A 32-bit format's missing W (translator 0) and a UNORM 1-ULP difference are their own statuses."""
+    def test_shader86_closed_open_questions(self):
+        """Missing W repeats X; UNORM raw 3 matches correctly rounded 0x3c40c0c1 (no 1-ULP split)."""
         base = ["s_mov_b32 s0, 0x7000", "s_mov_b32 s1, 0", "s_mov_b32 s2, 0x100"]
         w32 = program(base + [f"s_mov_b32 s3, {22 << 12 | md.XYZW:#x}", "v_mov_b32 v2, 0",
                               "buffer_load_format_xyzw v[4:7], v2, s[0:3], 0 offen", "s_waitcnt vmcnt(0)",
                               "v_mov_b32 v8, v4", "v_mov_b32 v9, v5", "v_mov_b32 v10, v6", "v_mov_b32 v11, v7"],
                       {0x7000: 0x40000000})
-        w32.missing_w32_regs, w32.export_sources = {7}, {0: 4, 1: 5, 2: 6, 3: 7}
-        self.assertEqual(md.run_one("ps_mem_w32", w32)[0], "missing-w32")
+        self.assertEqual(md.run_one("ps_mem_w32", w32)[0], "match")
         unorm = program(base + [f"s_mov_b32 s3, {56 << 12 | md.XYZW:#x}", "v_mov_b32 v2, 0",
                                 "buffer_load_format_x v4, v2, s[0:3], 0 offen", "s_waitcnt vmcnt(0)",
                                 "v_mov_b32 v8, v4", "v_mov_b32 v9, v4", "v_mov_b32 v10, v4", "v_mov_b32 v11, v4"],
                         {0x7000: 3})
-        unorm.norm_regs, unorm.export_sources = {4}, {0: 4, 1: 4, 2: 4, 3: 4}
-        self.assertEqual(md.run_one("ps_mem_unorm3", unorm)[0], "norm-ulp1")
+        self.assertEqual(md.run_one("ps_mem_unorm3", unorm)[0], "match")
 
 
 class GlobalOffsetRegression(unittest.TestCase):

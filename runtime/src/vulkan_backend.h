@@ -33,7 +33,7 @@ struct VulkanDeviceFunctions {
     X(vkGetImageMemoryRequirements) X(vkBindImageMemory) X(vkCreateBuffer) X(vkDestroyBuffer)                  \
     X(vkGetBufferMemoryRequirements) X(vkBindBufferMemory) X(vkAllocateMemory) X(vkFreeMemory) X(vkMapMemory)  \
     X(vkUnmapMemory) X(vkCmdCopyBuffer) X(vkCmdCopyBufferToImage) X(vkCmdCopyImageToBuffer) X(vkCmdCopyImage)  \
-    X(vkCmdResolveImage) X(vkCreateSampler) X(vkDestroySampler)                                                \
+    X(vkCmdResolveImage) X(vkCmdFillBuffer) X(vkCmdUpdateBuffer) X(vkCreateSampler) X(vkDestroySampler)     \
     X(vkCmdBeginConditionalRenderingEXT) X(vkCmdEndConditionalRenderingEXT)
 #define LEONIDA_VK_MEMBER(name) PFN_##name name = nullptr;
     LEONIDA_VK_DEVICE_FUNCTIONS(LEONIDA_VK_MEMBER)
@@ -53,7 +53,8 @@ struct VulkanDeviceFunctions {
                vkDestroyImage && vkGetImageMemoryRequirements && vkBindImageMemory && vkCreateBuffer &&
                vkDestroyBuffer && vkGetBufferMemoryRequirements && vkBindBufferMemory && vkAllocateMemory &&
                vkFreeMemory && vkMapMemory && vkUnmapMemory && vkCmdCopyBuffer && vkCmdCopyBufferToImage &&
-               vkCmdCopyImageToBuffer && vkCmdCopyImage && vkCmdResolveImage;
+               vkCmdCopyImageToBuffer && vkCmdCopyImage && vkCmdResolveImage && vkCmdFillBuffer &&
+               vkCmdUpdateBuffer;
     }
 };
 
@@ -77,6 +78,8 @@ public:
         replay_.copy_image_to_buffer = vk.vkCmdCopyImageToBuffer;
         replay_.copy_image = vk.vkCmdCopyImage;
         replay_.resolve_image = vk.vkCmdResolveImage;
+        replay_.fill_buffer = vk.vkCmdFillBuffer;
+        replay_.update_buffer = vk.vkCmdUpdateBuffer;
         if (conditional_rendering) {  // a driver may hand out these pointers even when the extension is off
             replay_.begin_conditional_rendering = vk.vkCmdBeginConditionalRenderingEXT;
             replay_.end_conditional_rendering = vk.vkCmdEndConditionalRenderingEXT;

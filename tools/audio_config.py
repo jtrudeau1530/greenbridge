@@ -202,9 +202,13 @@ def main():
     ap.add_argument("--min-ms", type=int, default=MIN_MS, help="minimum duration (default 20000)")
     ap.add_argument("--max-ms", type=int, default=MAX_MS, help="maximum duration (default 2000000)")
     a = ap.parse_args()
+    if a.min_ms < 1 or a.max_ms < a.min_ms:
+        ap.error("require 1 <= min-ms <= max-ms")
 
     if not os.path.exists(a.src):
         sys.exit(f"{a.src}: does not exist")
+    if a.join and not os.path.isdir(a.src):
+        ap.error("--join applies to a directory, not a single file")
     try:
         names = load_names(a.names) if a.names else None
     except OSError as e:

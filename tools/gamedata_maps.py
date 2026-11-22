@@ -1,29 +1,57 @@
-"""Decode the MHIU and PAMH arrays in a carved RPF9 archive.
+"""Decode the MHIU and PAMH (HMAP) heightmaps in a carved RPF9 archive.
 
-Both payloads start with a 44-byte header. MHIU carries six float32 world bounds followed by a
-right-aligned square byte grid; the grid edge is recovered from the payload length and the
-zero-filled prefix before it. PAMH carries a width/height pair, six bounds and a row table followed
-by a width x height grid of little-endian u16 values.
+Both payloads start with a 44-byte header and then use a row table plus packed
+u8 heights. The layouts were measured on the Xbox Series 1.0.2.1 package and
+match the published GTA V `heightmap.dat` (`HMAP`) layout:
+
+`MHIU`
+    0x00  "MHIU"
+    0x04  u16 version
+    0x06  u16 width          (2048 in both measured payloads)
+    0x08  u16 height         (2048)
+    0x0A  u16 pad
+    0x0C  six f32 bounds     (min xyz, max xyz)
+    0x24  u32 data size      (bytes after this 44-byte header)
+    0x28  u32 unverified field
+    0x2C  height x 8-byte row headers `{u16 start, u16 count, i32 offset}`
+          then the packed u8 heights. A cell not covered by a row keeps the
+          measured default 23. The source index is `offset + start + i`.
+    The old "zero prefix + square grid" reading was an artifact: the prefix is
+    the zeroed row headers of the map's empty (default) rows.
+
+`PAMH` (`HMAP` read little-endian)
+    0x00  "PAMH"             (the `HMAP` magic stored little-endian)
+    0x04  u8 version major, u8 version minor
+    0x06  u16 pad
+    0x08  u32 compressed/flag word (GTA V writes 1; measured 0x1BBC8CED here)
+    0x0C  u16 width
+    0x0E  u16 height
+    0x10  six f32 bounds     (min xyz, max xyz)
+    0x28  u32 data size      (bytes after this 44-byte header)
+    0x2C  height x 8-byte row headers
+          then `width * height` u8 max rows and `width * height` u8 min rows.
+    On the measured file the first array is a flat 110 (2.5 m) sea-surface
+    layer and the second is the ground; min <= max in all 23,616 cells.
+
+Both formats scale a u8 value into the header's Z box:
+
+    z = min.z + value / 255 * (max.z - min.z)
 
     python -I gamedata_maps.py <carve_dir> [--json FILE]
 
-<carve_dir> is an rpf9_carve.py output directory (index.json plus <offset>.bin files). Only
-aggregate header fields, dimensions and cell counts are printed or written; the grid bytes are not.
-
-The checksum field is reported but not checked: it is neither CRC32 nor Adler32 of the payload. The
-MHIU prefix length is not stored in the header, so the reader accepts the largest square grid that
-ends at the payload end and has an all-zero prefix. Both payloads in the measured archive satisfy
-that rule. Standard library only.
+<carve_dir> is an rpf9_carve.py output directory (index.json plus <offset>.bin
+files). Only header fields, dimensions, row counts and value ranges are
+printed or written; the height bytes are not. Standard library only.
 """
 import argparse
 import json
-import math
 import os
 import struct
 import sys
 
 MAGIC = (b"MHIU", b"PAMH", b"SPS1Z")
 HEADER = 44
+DEFAULT_MHIU_HEIGHT = 23
 
 
 def _u16(blob: bytes, offset: int) -> int:
@@ -40,85 +68,149 @@ def _bounds(blob: bytes, offset: int) -> dict:
     return {"min": lo, "max": hi}
 
 
-def _square_grid(data: bytes) -> tuple[int, int]:
-    """Largest square byte grid ending at the payload end with a zero-filled prefix."""
-    edge = math.isqrt(len(data))
-    while edge >= 2:
-        prefix = len(data) - edge * edge
-        if not any(data[:prefix]):
-            return edge, prefix
-        edge -= 1
-    raise ValueError("no square grid with a zero-filled prefix")
+def _z(value: int, bounds: dict) -> float:
+    lo, hi = bounds["min"][2], bounds["max"][2]
+    return lo + value / 255.0 * (hi - lo)
+
+
+def _rows(blob: bytes, height: int) -> bytes:
+    end = HEADER + height * 8
+    if end > len(blob):
+        raise ValueError("row table is truncated")
+    return blob[HEADER:end]
 
 
 def parse_mhiu(blob: bytes) -> dict:
     if len(blob) < HEADER or blob[:4] != b"MHIU":
         raise ValueError("not an MHIU payload")
+    width = _u16(blob, 0x06)
+    height = _u16(blob, 0x08)
+    if not width or not height:
+        raise ValueError("MHIU has a zero grid dimension")
+    if width > 4096 or height > 4096:
+        raise ValueError(f"MHIU grid {width}x{height} is out of range")
+    bounds = _bounds(blob, 0x0C)
     size = _u32(blob, 0x24)
     if size != len(blob) - HEADER:
         raise ValueError(f"MHIU data size {size} does not match {len(blob) - HEADER} bytes")
-    data = blob[HEADER:]
-    edge, prefix = _square_grid(data)
+
+    rows = _rows(blob, height)
+    pixels = blob[HEADER + height * 8:]
+    heights = bytearray([DEFAULT_MHIU_HEIGHT]) * (width * height)
+    empty = filled_rows = filled_cells = 0
+    spans = []
+    for y in range(height):
+        start, count = struct.unpack_from("<HH", rows, y * 8)
+        offset = struct.unpack_from("<i", rows, y * 8 + 4)[0]
+        if count == 0:
+            empty += 1
+            continue
+        if start + count > width:
+            raise ValueError(f"MHIU row {y} leaves the {width}-cell width")
+        source = offset + start
+        if source < 0 or source + count > len(pixels):
+            raise ValueError(f"MHIU row {y} leaves the {len(pixels)}-byte pixel data")
+        heights[y * width + start:y * width + start + count] = \
+            pixels[source:source + count]
+        filled_rows += 1
+        filled_cells += count
+        spans.append((source, source + count))
+
+    spans.sort()
+    for (_, end), (start, _) in zip(spans, spans[1:]):
+        if start < end:
+            raise ValueError("MHIU row data overlaps")
+
     return {
         "type": "MHIU",
         "header": {
             "version": _u16(blob, 0x04),
-            "field06": _u16(blob, 0x06),
-            "field08": _u32(blob, 0x08),
-            "bounds": _bounds(blob, 0x0C),
+            "width": width,
+            "height": height,
+            "bounds": bounds,
             "data_size": size,
-            "checksum": _u32(blob, 0x28),
+            "field28": _u32(blob, 0x28),
+            "z_mapping": "min.z + value/255 * (max.z - min.z)",
         },
         "grid": {
             "dtype": "u8",
-            "width": edge,
-            "height": edge,
-            "cells": edge * edge,
-            "prefix_bytes": prefix,
+            "width": width,
+            "height": height,
+            "cells": width * height,
+            "default": DEFAULT_MHIU_HEIGHT,
+            "row_records": height,
+            "filled_rows": filled_rows,
+            "empty_rows": empty,
+            "filled_cells": filled_cells,
+            "data_bytes": len(pixels),
+            "z_at_default": round(_z(DEFAULT_MHIU_HEIGHT, bounds), 2),
         },
-        "_grid": data[prefix:],
+        "_grid": bytes(heights),
     }
 
 
 def parse_pamh(blob: bytes) -> dict:
     if len(blob) < HEADER or blob[:4] != b"PAMH":
         raise ValueError("not a PAMH payload")
-    size = _u32(blob, 0x28)
-    if size != len(blob) - HEADER:
-        raise ValueError(f"PAMH data size {size} does not match {len(blob) - HEADER} bytes")
     width = _u16(blob, 0x0C)
     height = _u16(blob, 0x0E)
     if not width or not height:
         raise ValueError("PAMH has a zero grid dimension")
-    row_bytes = height * 8
-    expect = row_bytes + width * height * 2
-    if size != expect:
-        raise ValueError(f"PAMH data size {size} does not match {width}x{height} plus row table")
-    data = blob[HEADER:]
-    for i in range(height):
-        reserved, row_width, row_offset = struct.unpack_from("<HHI", data, i * 8)
-        if reserved != 0 or row_width != width or row_offset != i * width:
-            raise ValueError(f"PAMH row {i} does not match the width/offset table")
+    bounds = _bounds(blob, 0x10)
+    size = _u32(blob, 0x28)
+    if size != len(blob) - HEADER:
+        raise ValueError(f"PAMH data size {size} does not match {len(blob) - HEADER} bytes")
+
+    rows = _rows(blob, height)
+    data = blob[HEADER + height * 8:]
+    body = size - height * 8
+    if body != width * height * 2:
+        raise ValueError(
+            f"PAMH data is {body} bytes; {width}x{height} needs "
+            f"{width * height * 2} for max and min rows")
+    half = width * height
+    maximum = bytearray(half)
+    minimum = bytearray(half)
+    for y in range(height):
+        start, count = struct.unpack_from("<HH", rows, y * 8)
+        offset = struct.unpack_from("<i", rows, y * 8 + 4)[0]
+        if start + count > width:
+            raise ValueError(f"PAMH row {y} leaves the {width}-cell width")
+        for i in range(count):
+            x = start + i
+            at = offset + x
+            if at < 0 or at >= half:
+                raise ValueError(f"PAMH row {y} leaves the {half}-cell row data")
+            maximum[y * width + x] = data[at]
+            minimum[y * width + x] = data[half + at]
+
+    inversions = sum(1 for hi, lo in zip(maximum, minimum) if lo > hi)
     return {
         "type": "PAMH",
         "header": {
-            "version": _u16(blob, 0x04),
-            "field06": _u16(blob, 0x06),
-            "checksum": _u32(blob, 0x08),
+            "version_major": blob[0x04],
+            "version_minor": blob[0x05],
+            "flag": _u32(blob, 0x08),
             "width": width,
             "height": height,
-            "bounds": _bounds(blob, 0x10),
+            "bounds": bounds,
             "data_size": size,
+            "z_mapping": "min.z + value/255 * (max.z - min.z)",
         },
         "grid": {
-            "dtype": "u16",
+            "dtype": "u8 max + u8 min",
             "width": width,
             "height": height,
             "cells": width * height,
             "row_records": height,
-            "prefix_bytes": row_bytes,
+            "max_min": min(maximum),
+            "max_max": max(maximum),
+            "min_min": min(minimum),
+            "min_max": max(minimum),
+            "min_above_max": inversions,
         },
-        "_grid": data[row_bytes:],
+        "_max": bytes(maximum),
+        "_min": bytes(minimum),
     }
 
 
@@ -202,11 +294,13 @@ def main() -> int:
     for p in payloads:
         g = p["grid"]
         if p["type"] == "MHIU":
-            print(f'MHIU {p["offset_hex"]}: {p["size"]:,} B, {g["width"]}x{g["height"]} u8, '
-                  f'{g["prefix_bytes"]:,} B zero prefix')
+            print(f'MHIU {p["offset_hex"]}: {p["size"]:,} B, '
+                  f'{g["width"]}x{g["height"]} u8, {g["filled_rows"]} filled rows, '
+                  f'{g["empty_rows"]} empty (default {g["default"]})')
         else:
-            print(f'PAMH {p["offset_hex"]}: {p["size"]:,} B, {g["width"]}x{g["height"]} u16, '
-                  f'{g["row_records"]} row records')
+            print(f'PAMH {p["offset_hex"]}: {p["size"]:,} B, '
+                  f'{g["width"]}x{g["height"]} u8 max+min, {g["row_records"]} row records, '
+                  f'{g["min_above_max"]} cells min>max')
     if not payloads:
         print("no MHIU or PAMH payloads")
     if a.json:

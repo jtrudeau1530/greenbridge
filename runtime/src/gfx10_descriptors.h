@@ -316,6 +316,9 @@ inline constexpr FormatRow format_table[] = {
     {182, VK_FORMAT_BC7_SRGB_BLOCK, channels_rgba},               // GFX10_FORMAT_BC7_SRGB
 };
 
+// The format of the console's separate stencil surface: what a T# of a depth-stencil texture's stencil plane names.
+inline constexpr std::uint32_t stencil_format = 5;  // GFX10_FORMAT_8_UINT
+
 inline constexpr const FormatRow* format_row(VkFormat format) {
     for (const FormatRow& row : format_table)
         if (row.vulkan == format) return &row;

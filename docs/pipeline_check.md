@@ -6,6 +6,10 @@ constant contract. It is a driver-level check: it proves the modules and pipelin
 the Vulkan implementation, not that the shader results are correct. Value-level checks are in
 `docs/shader_validation.md`.
 
+The checker exits nonzero if a module fails to load, a pipeline fails to compile, or the requested final
+cache save fails. It still finishes checking the other entries and attempts the final save so the next run
+can reuse successful pipelines. Entries reported as skipped do not count as failures.
+
 ## Corpus
 
 The translated corpus is 26,503 entries: 2,236 vertex, 12,101 pixel, 2,689 compute, 9,282 mesh and
@@ -95,8 +99,8 @@ pipeline is created with the runtime's resource contract. It does not prove:
 
 - that any shader computes the right values (see `docs/shader_validation.md`);
 - that the two incomplete shards are valid or invalid;
-- that the graphics pipelines (vertex/pixel/geometry/mesh) link and execute, since the tool creates
-  modules for those stages but only pipelines for compute;
+- that the graphics pipelines (vertex/pixel/geometry/mesh) execute or draw the right pixels: the tool
+  creates them with `vkCreateGraphicsPipelines` (dynamic rendering) but never draws with them;
 - that the game's descriptors, root signatures and push constants match the contract at run time
   (the missing executable still owns that).
 
