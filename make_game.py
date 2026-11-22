@@ -467,7 +467,9 @@ def assets_exported(work: str) -> bool:
     last marker assets() writes, after every model, texture and audio export before it succeeded; ogg.done is read
     too. A marker counts only when it holds what mark() writes, not because a file of that name exists.
     xma.done is written with or without ffmpeg, and every run decodes the XMA2 streams that have no .wav yet once
-    ffmpeg is on PATH. So with ffmpeg there, a stream still waiting for its .wav means the stage will write again."""
+    ffmpeg is on PATH. So with ffmpeg there, a stream still waiting for its .wav means the stage will write again.
+    Models and textures made by another decoder (DECODER_RECORD) don't change the answer: assets() removes each
+    such folder before it exports it again, so the new export goes into the space the old one held."""
     audio = os.path.join(work, "assets", "audio")
     for name, what in (("ogg.done", "awc_opus.py"), ("xma.done", "rpf9dump xma")):
         try:
@@ -1243,15 +1245,20 @@ TRANSLATION_SOURCES = ("rdna2spirv.py", "shader_ir.py", "cfg_structure.py", "fss
                        "gfx10_formats.json")
 
 
-def translation_sources_digest() -> str:
-    """SHA-256 over the name and exact bytes of each TRANSLATION_SOURCES file."""
-    h = hashlib.sha256()
-    for name in TRANSLATION_SOURCES:
-        with open(os.path.join(TOOLS, name), "rb") as f:
+def sources_digest(folder: str, names, lead: str = "") -> str:
+    """SHA-256 over lead, then the name and exact bytes of each named file in folder."""
+    h = hashlib.sha256(lead.encode())
+    for name in names:
+        with open(os.path.join(folder, name), "rb") as f:
             data = f.read()
         h.update(f"{name}\0{len(data)}\0".encode())
         h.update(data)
     return h.hexdigest()
+
+
+def translation_sources_digest() -> str:
+    """SHA-256 over the name and exact bytes of each TRANSLATION_SOURCES file."""
+    return sources_digest(TOOLS, TRANSLATION_SOURCES)
 
 
 def drop(*paths: str) -> None:
@@ -1356,6 +1363,27 @@ def translate(disasm: str, spirv: str, jobs: int, emulate: bool = False,
 
 
 # ---------------------------------------------------------------- assets
+DECODER_RECORD = "decoder.sha256"   # beside each model and texture manifest.json: the decoder_digest() that made it
+
+
+@functools.cache
+def decoder_digest() -> str:
+    """SHA-256 over the checked-out third_party/rpf9-explorer commit and the name and exact bytes of each
+    tools/rpf9dump source file: what the model and texture exports come from."""
+    sub = os.path.join(ROOT, "third_party", "rpf9-explorer")
+    pin = ""
+    # Asked only inside the submodule's own checkout: in an empty folder git answers with this repository's HEAD.
+    # shortcut: a copy without git metadata (source zips) has no pin to read, so only tools/rpf9dump is tracked
+    # there; hash third_party/rpf9-explorer/Core as well if such copies need it.
+    git = shutil.which("git")
+    if git and os.path.exists(os.path.join(sub, ".git")):
+        r = subprocess.run([git, "-C", sub, "rev-parse", "HEAD"], capture_output=True, text=True)
+        pin = r.stdout.strip() if r.returncode == 0 else ""
+    folder = os.path.join(TOOLS, "rpf9dump")
+    names = sorted(n for n in os.listdir(folder) if n.endswith((".cs", ".csproj", ".json")))
+    return sources_digest(folder, names, pin)
+
+
 def rpf9dump(work: str) -> str:
     exe = os.path.join(work, "tools", "rpf9dump", "rpf9dump.exe" if os.name == "nt" else "rpf9dump")
     core = os.path.join(ROOT, "third_party", "rpf9-explorer", "Core")
@@ -1405,13 +1433,26 @@ def assets(game: str, work: str, wav: bool, jobs: int) -> None:
 
     get_exporter = functools.cache(rpf9dump)
     out = os.path.join(work, "assets")
+    # An export also depends on the decoder, so its digest is kept beside the manifest, written before the export
+    # starts. A folder without it (from before the file existed) or with another one is exported again, as the
+    # shaders stage does for the translator.
+    decoder = decoder_digest()
     for rel in MODEL_ARCHIVES:
         src = os.path.join(game, rel)
         name = os.path.splitext(os.path.basename(rel))[0]
         for mode in ("models", "textures"):
-            if os.path.isfile(os.path.join(out, name, mode, "manifest.json")):
+            folder = os.path.join(out, name, mode)
+            record = os.path.join(folder, DECODER_RECORD)
+            if os.path.isdir(folder) and read_shader_setting(record) != decoder:
+                # rpf9dump keeps the files it finds, so another decoder's output is removed first.
+                log(f"assets: no matching decoder fingerprint for {mode} from {rel}: exporting again")
+                shutil.rmtree(folder)
+            elif os.path.isfile(os.path.join(folder, "manifest.json")):
                 continue
             log(f"assets: {mode} from {rel}")
+            os.makedirs(folder, exist_ok=True)
+            with open(record, "w", encoding="utf-8", newline="\n") as f:
+                f.write(decoder + "\n")
             run([get_exporter(work), mode, src, out])
     # Texture pools: data/ttdb/** and each pack's own pack/<name>/data/ttdb/** (pool names repeat across packs,
     # so pack pools go under ttpf_pack/<pack>/).
