@@ -692,12 +692,14 @@ class Gen:
         return r
 
     def f16_omod(self, h, mods):
-        """VOP3 mul:2 / mul:4 / div:2 on the rounded f16 bits ``h`` (low 16) of v_cvt_f16_f32, as an RX 6800 does it
-        (@shelbykb2 on #718): after the rounding and before clamp, so 65520 div:2 is inf. The hardware applies an omod
-        to an f16 result only with IEEE off and f16 denormals flushed, and a compiler emits one only for that mode (the
-        corpus argument of the f32 output modifier rows in docs/design.md), so this models that mode: a zero or
-        denormal f16, before or after the scaling, gives +0 (2^-15 mul:2 and -0 mul:2 measured 0x0000), inf and NaN
-        pass through, and a finite overflow gives inf (65504 under MODE toward zero, as f16_res)."""
+        """VOP3 mul:2 / mul:4 / div:2 on the rounded f16 bits ``h`` (low 16) of v_cvt_f16_f32, as measured on RDNA2
+        (RX 6800 on #718; gfx1036 across wave32/wave64 and MODE RNE/RTZ): after rounding and before clamp, so 65520
+        div:2 is inf in nearest mode and 32752 (0x77ff) toward zero. The hardware applies an omod to an f16 result
+        only with IEEE off and f16 denormals flushed, and a compiler emits one only for that mode (the corpus argument
+        of the f32 output modifier rows in docs/design.md), so this models that mode: a zero or denormal f16 before
+        the omod (e == 0, including -0.0) gives +0 (0x0000), div:2 underflowing a smallest normal (e == 1) flushes
+        to signed zero (h & 0x8000, so -2^-14 div:2 gives 0x8000), inf and NaN pass through, and finite mul:2/mul:4
+        overflow gives +-inf in nearest mode and +-65504 (0x7bff / 0xfbff) under MODE toward zero."""
         k = next((m for m in mods if m in ("mul:2", "mul:4", "div:2")), None)
         if k is None:
             return h
@@ -707,10 +709,15 @@ class Gen:
         self.emit(f"{sh} = OpShiftRightLogical %uint {h} {self.cu(10)}")
         self.emit(f"{e} = OpBitwiseAnd %uint {sh} {self.cu(31)}")
         self.emit(f"{special} = OpIEqual %bool {e} {self.cu(31)}")
-        # Zero and denormal results are flushed, and the omod makes -0 +0; div:2 takes exponent 1 to a denormal too.
-        self.emit(f"{tiny} = OpULessThan %bool {e} {self.cu(2 if d < 0 else 1)}")
+        # Zero and denormal inputs (e == 0) flush to +0 (including -0 -> +0). For div:2, underflowing a
+        # smallest normal (e == 1) flushes to signed zero (h & 0x8000: -2^-14 div:2 -> -0.0 on gfx1036).
+        self.emit(f"{tiny} = OpIEqual %bool {e} {self.cu(0)}")
         if d < 0:
-            self.emit(f"{scaled} = OpISub %uint {h} {self.cu(1 << 10)}")
+            sub_one, under, sign = t(), t(), t()
+            self.emit(f"{sub_one} = OpISub %uint {h} {self.cu(1 << 10)}")
+            self.emit(f"{under} = OpIEqual %bool {e} {self.cu(1)}")
+            self.emit(f"{sign} = OpBitwiseAnd %uint {h} {self.cu(0x8000)}")
+            self.emit(f"{scaled} = OpSelect %uint {under} {sign} {sub_one}")
         else:
             add, sign, over, inf, big = t(), t(), t(), t(), t()
             self.emit(f"{add} = OpIAdd %uint {h} {self.cu(d << 10)}")
