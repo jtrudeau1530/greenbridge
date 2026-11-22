@@ -17,10 +17,9 @@ method, scope and caveats. No game data is included.
 
 | Document | Measured content |
 |---|---|
-| [models.md](models.md) | 382,781 models (0 decode failures) at the `e293917` pin, including 159,511 drawable-dictionary children; the other archives measure 4,686 fragments, 30,343 bone-bound and 126,301,454 triangles, while the `levels.rpf` geometry cells are not independently reproduced; the re-count table is in models.md. |
-| [models.md](models.md) | 382,781 models (2.64 billion triangles, 0 decode failures) at the `e293917` pin, including 159,511 drawable-dictionary children and 55,417 fragments; the re-count table is in models.md. |
+| [models.md](models.md) | 382,781 models (0 decode failures) at the `e293917` pin, including 159,511 drawable-dictionary children; the other archives measure 4,686 fragments, 30,343 bone-bound and 126,301,454 triangles, while the `levels.rpf` geometry cells are not independently reproduced (**†**); the re-count table is in models.md. |
 | [character_models.md](character_models.md) | `packs.rpf` character parts at `e293917`: 26,585 rows / 11,335 unique names, 2,865 fragments (all a flat 25-vertex / 32-triangle 5x5 bounds grid at z=0), Lucia's 22 named records and the decoded 13-part export, the `player_story000_00` drawable set, slot-name token counts, texture coverage (184/215), and what is not decoded (fragment children, ped variation, hair, bind pose). |
-| [character_skeleton.md](character_skeleton.md) | Character `.#ft` fragments: the 597-name shared skeleton table (596 `joaat32` hashes), the 597-record instance tree with 580 measured parents, the model-side bone-hash mapping, and the measured vertex joint-index/skin-weight layouts (`tools/skin_streams.py`); the reference TRS is not the bind pose. |
+| [character_skeleton.md](character_skeleton.md) | Character `.#ft` fragments: the 597-name shared skeleton table (596 `joaat32` hashes), the 597-record instance tree with 580 measured parents, the model-side bone-hash mapping, and the measured vertex joint-index/skin-weight layouts (`tools/skin_streams.py`); the default bone transforms compose to the stored inverse bind matrices, and `tools/anim_glb.py` exports a skinned part with clips as an animated GLB. |
 | [resource_names.md](resource_names.md) | RPF9 named-resource index: bounded-inflate lookup for `name.#dr`/`#ft`/`#dd` without the TOC. |
 | [textures.md](textures.md) | 357,115 TTPF descriptors across 57 pools: `rpf9dump` (`e293917`) decodes 354,991 strict-clean (99.41%) directly including BCPack BC1/BC3/BC4/BC5; `tools/bcpack.py` decodes all six BCPack modes (BC1–BC7). |
 | [textures_arrays.md](textures_arrays.md) | All 697 multi-slice TTPF descriptors resolved (127 mip-major `SW_64KB_D` 2D arrays, 567 streaming slice-major `SW_4KB_S` cubemaps, 3 `SW_4KB_S` 3D volumes) plus 357,115/357,115 chunk-page metadata validation. |
@@ -28,7 +27,7 @@ method, scope and caveats. No game data is included.
 | [navmesh.md](navmesh.md) | 90,295 `navmeshes.rpf` streams (0 unclassified): 9,603 `0DRP` cover-point `0x7a` pages, 27,644 `0x00010015` navmesh tiles (`136×180` grid), 27,482 Band-3 sparse grids, 22 `PSIN`. |
 | [bvh.md](bvh.md) | 565,596 `core_bvh4.rpf` streams; 271,627 BVH4 streams and 269,106 instances, prebuilt acceleration data. |
 | [rbf0.md](rbf0.md) | 1,263 RBF0 resources, 475,461 elements; UI/Scaleform definitions, not a sectioned container; strict JSON/CSV/XML tree decoder. |
-| [gamedata.md](gamedata.md) | `common.rpf`: 954 streams, 266 XML documents / 118 roots; 0 RBF0/PSIN. |
+| [gamedata.md](gamedata.md) | `common.rpf`: 954 streams, 266 XML documents / 118 roots; 0 RBF0/PSIN; a streaming reader (`gamedata_reader.py`) converts 259 documents by root and `type`. |
 | [gamedata_graph.md](gamedata_graph.md) | `common.rpf` mount graph: 25 manifest documents, 30 content-set ids, 14 include refs (12 resolve), 3,386 target refs, 0 cycles. |
 | [world.md](world.md) | `levels.rpf` placement: 9,918 map files / 680,228 entities measured in 55% of the archive (lower bound; estimate 16k-39.6k / 1.03M-2.64M); `0x7a` resource layout. Building a placed world from entity rows (`world_build.py --placements`): shared geometry per chunk (`EXT_mesh_gpu_instancing`), bounded memory for the whole archive, and per-tier LOD chunk sets with distance bands (`--lod-sets`). |
 | [world_census.md](world_census.md) | Full `levels.rpf` pass: 23,535 maps / 1,670,442 entities, 98.32% stream coverage, sharded and exact; the SixNG 30,785-map difference reconciled map by map (interiors and entity groups). |
@@ -72,10 +71,10 @@ method, scope and caveats. No game data is included.
 | [fssm_crosscheck.md](fssm_crosscheck.md) | FSSM/RDNA2 facts cross-checked against SCARAB; code starts at `code_off + 0x28`. |
 | [fspx.md](fspx.md) | `FSPX`, the FidelityFX DLL's native compute programs (its shaders' `ACCC` part): directory as the DLL reads it, kind-0 dispatch state, the hash prologue, `gfx1030` for its `v_dot4` code; 13 of 29 translate with `tools/fspx_unpack.py`. |
 | [embedded_shaders.md](embedded_shaders.md) | DXBC containers embedded in the package's DLLs: 52 in `XboxBvhBuilder.dll` (console `FSSM` via the `XDAT`/`XBCH` record; 42/52 pass `spirv-val` today) and 29 `ACCC`/`FSPX` in the FidelityFX upscaler; the scan/extract tool and the four rules still missing. |
-| [first_light.md](first_light.md) | The first draw of a real game model with its own translated VS/PS on a GPU: 4,213 vertices / 7,968 triangles, 78.1% coverage on an RTX 2060 SUPER; `tools/first_light.py` and the `vk_harness` mesh mode. |
+| [first_light.md](first_light.md) | The first draw of a real game model with its own translated VS/PS on a GPU: 4,213 vertices / 7,968 triangles, 78.1% coverage on an RTX 2060 SUPER; `tools/first_light.py`, the `vk_harness` mesh mode, and the same draw through the D3D12 layer (`d3d12_first_light`). |
 | [coder.md](coder.md) | The compressed mass in `story000_script.rpf`: entry framing (`align16(entry+8)` payload), the 32-value tag alphabet, deflate-shaped but proprietary, variable-length 7/8-bit LSB-first codes with no stored table, and the `n7 = 116..127` search that finishes it. |
 | [mission_logic.md](mission_logic.md) | Mission state tables: 0x20 record layout (band counter, byte offsets), the 64-byte pool element with world transforms, case-folding joaat keys, 53.5 % of states named, 113 state-set clusters covering 82.4 % of files. |
 
 ## Other languages
 
-Community quickstarts (stable onboarding text only; English docs remain authoritative): [i18n/README.md](i18n/README.md) (`fr`, `pt-BR`, `zh-CN`, `pl-PL`, `tr`, `ru`, `ja`, `es`).
+Community quickstarts (stable onboarding text only; English docs remain authoritative): [i18n/README.md](i18n/README.md) (`fr`, `pt-BR`, `zh-CN`, `pl-PL`, `tr`, `ru`, `ja`, `es`, `it`, `de`).

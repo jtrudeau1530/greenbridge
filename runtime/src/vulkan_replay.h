@@ -76,7 +76,7 @@ struct ResourceBinding {
     std::uint32_t depth = 1;
     bool volume = false;               // one array layer, including at mips with a single slice
     std::uint32_t samples = 1;         // more than one: a multisampled 2D texture
-    bool rgba8_typeless = false;       // Original resource was R8G8B8A8_TYPELESS; views may reinterpret it.
+    bool typeless = false;  // A TYPELESS color resource: views name a format of its family (D3D-275).
     bool castable_view_formats = false;  // A creation-time castable list made the image mutable (D3D-85/D3D-90),
                                          // so views may reinterpret it as typeless resources do.
     // D24_UNORM_S8_UINT stored as D32_SFLOAT_S8_UINT (the GPU has no D24): footprint copies of the depth plane convert
@@ -855,6 +855,9 @@ struct ReplayFunctions {
     std::function<void(VkCommandBuffer, const std::vector<PredicatedCopyDispatch>&)> emit_predicated_copy;
     // Returns a 2D-array view of the range (caller-owned, alive until execution completes); rectangle clears.
     std::function<VkImageView(const ResourceBinding&, const VkImageSubresourceRange&)> image_view;
+    // Optional format check for color-attachment reinterpretation on mutable UAV clears; unset assumes every format
+    // except E5B9G9R9_UFLOAT_PACK32 supports COLOR_ATTACHMENT.
+    std::function<bool(VkFormat)> color_attachment_format;
     // Footprint copies of a depth24_as_float texture (depth24.h): `depth24_prepare` makes the scratch and descriptors
     // for a job while the list is checked, `depth24_run` records its dispatch. Without them such a copy is unsupported.
     std::function<bool(Depth24Job&, std::vector<Depth24Job>&)> depth24_prepare;  // whole copy in, dispatches out
@@ -917,7 +920,7 @@ struct Prepared {
     ResourceBinding binding;
     VkImageSubresourceRange range{};  // the barrier range, or the cleared view (cleared aspects only)
     VkImageView view = VK_NULL_HANDLE;
-    VkFormat clear_format = VK_FORMAT_UNDEFINED; // The RTV format, without changing the resource binding.
+    VkFormat clear_format = VK_FORMAT_UNDEFINED; // The clear view format (RTV or reinterpreted UAV), without changing the resource binding.
     std::vector<VkClearRect> rects;   // rectangle clears, clipped to the mip
     bool skip = false;                // every rectangle was empty
     ResourceBinding source;                   // copies: the source resource
@@ -1017,24 +1020,42 @@ inline VkClearColorValue render_target_clear_color(VkFormat format, const ClearC
     return value;
 }
 
-// Only the RGBA8 family is explicitly reinterpreted here. Legacy views retain their resource format. A typeless
-// resource or one created with a castable-format list (its image is mutable and lists the view formats) may be
-// reinterpreted; the reinterpretation itself is the UNORM image's.
+// The DXGI typeless family a color view format belongs to, by the Vulkan formats the layer maps its members to: the
+// same nonzero number for formats one typeless resource can be viewed as, 0 for a format of no such family.
+inline int typeless_view_family(VkFormat format) {
+    switch (format) {
+    case VK_FORMAT_R8G8B8A8_UNORM: case VK_FORMAT_R8G8B8A8_SRGB: case VK_FORMAT_R8G8B8A8_SNORM:
+    case VK_FORMAT_R8G8B8A8_UINT: case VK_FORMAT_R8G8B8A8_SINT: return 1;
+    case VK_FORMAT_B8G8R8A8_UNORM: case VK_FORMAT_B8G8R8A8_SRGB: return 2;
+    case VK_FORMAT_R16G16B16A16_SFLOAT: case VK_FORMAT_R16G16B16A16_UNORM: case VK_FORMAT_R16G16B16A16_SNORM:
+    case VK_FORMAT_R16G16B16A16_UINT: case VK_FORMAT_R16G16B16A16_SINT: return 3;
+    case VK_FORMAT_R32G32B32A32_SFLOAT: case VK_FORMAT_R32G32B32A32_UINT: case VK_FORMAT_R32G32B32A32_SINT: return 4;
+    case VK_FORMAT_R32G32_SFLOAT: case VK_FORMAT_R32G32_UINT: case VK_FORMAT_R32G32_SINT: return 5;
+    case VK_FORMAT_R16G16_SFLOAT: case VK_FORMAT_R16G16_UNORM: case VK_FORMAT_R16G16_SNORM:
+    case VK_FORMAT_R16G16_UINT: case VK_FORMAT_R16G16_SINT: return 6;
+    case VK_FORMAT_A2B10G10R10_UNORM_PACK32: case VK_FORMAT_A2B10G10R10_UINT_PACK32: return 7;
+    case VK_FORMAT_R8G8_UNORM: case VK_FORMAT_R8G8_SNORM: case VK_FORMAT_R8G8_UINT: case VK_FORMAT_R8G8_SINT: return 8;
+    case VK_FORMAT_R32_SFLOAT: case VK_FORMAT_R32_UINT: case VK_FORMAT_R32_SINT: return 9;
+    case VK_FORMAT_R16_SFLOAT: case VK_FORMAT_R16_UNORM: case VK_FORMAT_R16_SNORM: case VK_FORMAT_R16_UINT:
+    case VK_FORMAT_R16_SINT: return 10;
+    case VK_FORMAT_R8_UNORM: case VK_FORMAT_R8_SNORM: case VK_FORMAT_R8_UINT: case VK_FORMAT_R8_SINT: return 11;
+    default: return 0;
+    }
+}
+
+// The format a color view clears or renders in. A view of the resource's own format keeps it (a typeless resource
+// has none, so it needs an explicit one). A typeless resource, or one created with a castable-format list (its image
+// is mutable and lists the view formats), may be viewed in another format of its family: the image is mutable, so
+// the view reinterprets its bits (D3D-275; before it only the RGBA8 family was). A volume keeps its own format.
 inline VkFormat color_view_format(const ResourceBinding& resource, const TargetView& target) {
     if (target.format == ColorViewFormat::resource)
-        return resource.rgba8_typeless ? VK_FORMAT_UNDEFINED : resource.format;
-    VkFormat format = VK_FORMAT_UNDEFINED;
-    switch (target.format) {
-    case ColorViewFormat::rgba8_unorm: format = VK_FORMAT_R8G8B8A8_UNORM; break;
-    case ColorViewFormat::rgba8_srgb: format = VK_FORMAT_R8G8B8A8_SRGB; break;
-    case ColorViewFormat::rgba8_uint: format = VK_FORMAT_R8G8B8A8_UINT; break;
-    case ColorViewFormat::rgba8_sint: format = VK_FORMAT_R8G8B8A8_SINT; break;
-    case ColorViewFormat::rgba8_snorm: format = VK_FORMAT_R8G8B8A8_SNORM; break;
-    default: return VK_FORMAT_UNDEFINED;
-    }
-    if (!resource.rgba8_typeless && !resource.castable_view_formats)
+        return resource.typeless ? VK_FORMAT_UNDEFINED : resource.format;
+    const auto format = static_cast<VkFormat>(target.format);
+    const int family = typeless_view_family(format);
+    if (!family) return VK_FORMAT_UNDEFINED;
+    if (!resource.typeless && !resource.castable_view_formats)
         return format == resource.format ? format : VK_FORMAT_UNDEFINED;
-    if (resource.format != VK_FORMAT_R8G8B8A8_UNORM || resource.volume || resource.depth != 1)
+    if (family != typeless_view_family(resource.format) || resource.volume || resource.depth != 1)
         return VK_FORMAT_UNDEFINED;
     return format;
 }
@@ -2190,7 +2211,7 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             // Older ownerless replay callers omit the resource format for float-only clears. Preserve
             // that path; an explicit format or a typeless resource must still resolve a concrete RTV.
             if (p.clear_format == VK_FORMAT_UNDEFINED &&
-                (p.binding.rgba8_typeless || color_clear->target.format != ColorViewFormat::resource))
+                (p.binding.typeless || color_clear->target.format != ColorViewFormat::resource))
                 return ReplayResult::invalid_clear;
             const bool partial_volume = p.binding.volume &&
                 color_clear->target.layer_count != std::max(1u, p.binding.depth >> color_clear->target.mip);
@@ -2234,18 +2255,35 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             const TargetView target{view.resource, view.mip, view.first_layer, view.layer_count};
             if (!detail::view_range(p.binding, target, VK_IMAGE_ASPECT_COLOR_BIT, p.range))
                 return ReplayResult::invalid_subresource;
-            // The view's format turns the values into bytes; the image's own format clears them in.
+            // The view's format turns the values into bytes. When the view format differs from the image's backing
+            // format (a typeless or castable texture) and can be cleared as a color attachment, clear through a view of
+            // view_format instead of decoding into the backing format (which turns non-float bit patterns like
+            // R16G16_UNORM 1.0 = 0xffff or R32_UINT 0x7f800001 into SFLOAT NaNs that vkCmdClearColorImage quiets).
+            // Emulated R9G9B9E5_SHAREDEXP images (backed by R32_UINT) lack COLOR_ATTACHMENT on E5B9G9R9 and keep the
+            // bit-exact R32_UINT backing path.
             const VkFormat view_format = view.format ? VkFormat(view.format) : p.binding.format;
-            if (!uav_clear::encode(view_format, uav->is_float, uav->values, p.element) ||
-                !uav_clear::decode(p.binding.format, p.element, p.clear_color))
+            if (!uav_clear::encode(view_format, uav->is_float, uav->values, p.element))
                 return ReplayResult::unsupported;
-            if (!uav->rects.empty() && (!p.binding.color_attachment || p.binding.volume))
+            const auto* image_layout = uav_clear::layout(p.binding.format);
+            if (!image_layout || image_layout->bytes != p.element.size)
+                return ReplayResult::unsupported;
+            const bool attachment = p.binding.color_attachment && !p.binding.volume;
+            const bool view_attachable = vk.color_attachment_format
+                                             ? vk.color_attachment_format(view_format)
+                                             : view_format != VK_FORMAT_E5B9G9R9_UFLOAT_PACK32;
+            const bool reinterpret = view_format != p.binding.format && attachment && view_attachable;
+            const VkFormat clear_format = reinterpret ? view_format : p.binding.format;
+            if (!uav_clear::decode(clear_format, p.element, p.clear_color))
+                return ReplayResult::unsupported;
+            if (reinterpret) p.clear_format = view_format;
+            if (!uav->rects.empty() && !attachment)
                 return ReplayResult::unsupported;
             // Under a predicate a whole view is cleared as one rectangle where the image can be an attachment, as
             // render targets are; otherwise vkCmdClearColorImage runs unconditionally and is counted.
-            const bool attachment = p.binding.color_attachment && !p.binding.volume;
             if (predicated && uav->rects.empty() && !attachment) ++out.unpredicated_copies;
-            const auto rects = attachment ? clear_rects(uav->rects) : std::span<const Rect>(uav->rects);
+            const auto rects = (reinterpret && uav->rects.empty())
+                                   ? std::span<const Rect>(&whole_view, 1)
+                                   : attachment ? clear_rects(uav->rects) : std::span<const Rect>(uav->rects);
             if (const auto r = rect_view(rects, target, VK_IMAGE_ASPECT_COLOR_BIT); r != ReplayResult::success)
                 return r;
             if (!p.skip && p.rects.empty() && !vk.clear_color_image) return ReplayResult::unsupported;
@@ -3329,9 +3367,10 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             vk.xdxr_record(command_buffer, *xdxr_build);
         } else if (const auto* copy = std::get_if<CopyAccelerationStructure>(&command)) {
             vk.xdxr_copy(command_buffer, copy->src_va, copy->dst_va, p.xdxr_bytes);
-        } else if (const auto* info = std::get_if<AccelerationStructurePostbuild>(&command); info && !p.skip) {
-            for (std::size_t i = 0; i < info->sources.size(); ++i)
-                vk.xdxr_postbuild(command_buffer, info->sources[i], info->dest_va + 8 * i);
+        } else if (const auto* postbuild = std::get_if<AccelerationStructurePostbuild>(&command);
+                   postbuild && !p.skip) {
+            for (std::size_t s = 0; s < postbuild->sources.size(); ++s)
+                vk.xdxr_postbuild(command_buffer, postbuild->sources[s], postbuild->dest_va + 8 * s);
         } else if (const auto* build = std::get_if<BuildAccelerationStructure>(&command)) {
             // The build's addresses are console VAs into the GPU address arena (heap_base is its device address).
             // A null VA (no index buffer, no transform) stays null: heap_base + 0 would name the arena's zero page.

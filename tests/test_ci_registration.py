@@ -1,0 +1,226 @@
+"""Every test file under tests/ is selected by a CI job -- and that job can actually run its tests.
+
+    python -I tests/test_ci_registration.py
+
+``.github/workflows/ci.yml`` splits ``tests/test_*.py`` between two jobs with a single predicate
+(``PYTEST_FILE_MARKERS``, or no ``__main__``): the standard-library loop in ``check`` runs the rest with
+``python -I``, and ``translator-tests`` hands the matched files to pytest.  ``tests/semantic/`` goes to
+``unittest discover`` and ``tests/*.cjs`` to ``node --test``.  This is the test-file counterpart of
+``tests/test_ctest_registration.py``: it reads the patterns from the workflow (not from a copy, so it cannot
+drift) and fails on the three ways a test goes missing without CI turning red --
+
+* a file no job selects, because no glob matches its name: ``tests/thing_test.py`` matches neither
+  ``test_*.py`` nor ``test*.py``;
+* a file a job selects but whose tests that job cannot collect, e.g. a standard-library script that trips
+  ``PYTEST_FILE_MARKERS`` and keeps its checks under ``if __name__ == "__main__":`` -- the loop skips it and
+  pytest imports it, collects nothing, and the job stays green because the other files supply items; and
+* a file the loop runs with ``python -I`` that only *mentions* ``__main__`` (the loop decides with
+  ``grep -q '__main__'``, which a comment satisfies).
+
+Only the tracked test files and the workflow are read; no game files, no build tools, no pytest.
+"""
+import ast
+import fnmatch
+import os
+import re
+import subprocess
+import tempfile
+import unittest
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+WORKFLOW = os.path.join(".github", "workflows", "ci.yml")
+
+# What a file has to be called to claim it is a test. Any of these that no job selects is a bug, which is why
+# the suffix form (tests/thing_test.py) counts even though no job's glob matches it today.
+TEST_FILE = re.compile(r"^(?:test.*\.py|.*_test\.py|test.*\.cjs)$")
+
+
+def read(root, rel):
+    with open(os.path.join(root, rel), encoding="utf-8", errors="replace") as f:
+        return f.read()
+
+
+def ci_rules(root):
+    """(markers, pruned, loop_glob, semantic_dir, viewer_glob), exactly as the workflow spells them."""
+    text = read(root, WORKFLOW)
+
+    def find(pattern, what):
+        match = re.search(pattern, text, re.M)
+        if not match:
+            raise AssertionError(
+                f"ci.yml no longer spells {what} the way tests/test_ci_registration.py expects it to; "
+                "update this test together with the workflow")
+        return match.groups()
+
+    (markers,) = find(r"^\s*PYTEST_FILE_MARKERS:\s*'([^']+)'", "PYTEST_FILE_MARKERS")
+    # The check loop and the translator list share this one find expression.
+    pruned, loop_glob = find(r"-path\s+'([^']+)'\s+-prune\s+-o\s+-type\s+f\s+-name\s+'([^']+)'",
+                             "the tests/test_*.py scan")
+    (semantic,) = find(r"python\s+-m\s+unittest\s+discover\s+-s\s+(\S+)", "unittest discover -s")
+    (viewer,) = find(r"node\s+--test\s+(\S+)", "node --test")
+    if re.search(r"unittest\s+discover[^\n]*-p\s", text):
+        raise AssertionError("unittest discover now passes -p; this test assumes its default 'test*.py' pattern")
+    return markers, pruned.rstrip("/"), loop_glob, semantic.rstrip("/"), viewer
+
+
+def tracked_under_tests(root):
+    result = subprocess.run(["git", "ls-files", "-z", "--", "tests"], cwd=root, capture_output=True, text=True)
+    if result.returncode == 0:
+        return [n for n in result.stdout.split("\0") if n]
+    names = []                                     # no git: walk, as tests/test_docs_links.py does
+    for base, dirs, files in os.walk(os.path.join(root, "tests")):
+        dirs[:] = [d for d in dirs if d not in (".git", "third_party", "__pycache__")]
+        for name in files:
+            names.append(os.path.relpath(os.path.join(base, name), root).replace(os.sep, "/"))
+    return names
+
+
+def claimed_test_files(root):
+    """Tracked files under tests/ that claim to be tests: by name, or because they define one."""
+    found = []
+    for rel in tracked_under_tests(root):
+        name = rel.rsplit("/", 1)[-1]
+        if TEST_FILE.match(name):
+            found.append(rel)
+        elif name.endswith(".py"):
+            try:
+                if defines_a_test(read(root, rel)):
+                    found.append(rel)              # a test under a name no job's glob matches
+            except SyntaxError:
+                pass
+    return sorted(found)
+
+
+def job_of(root, rel, rules):
+    """Which job runs ``rel``: 'stdlib', 'pytest', 'semantic', 'viewer', or None for no job at all."""
+    markers, pruned, loop_glob, semantic, viewer = rules
+    if rel.startswith(semantic + "/"):
+        return "semantic" if fnmatch.fnmatchcase(rel.rsplit("/", 1)[-1], "test*.py") else None
+    if fnmatch.fnmatchcase(rel, viewer):
+        return "viewer"
+    if rel.startswith(pruned + "/"):
+        return None                                # the Python scans prune this whole tree
+    if fnmatch.fnmatchcase(rel.rsplit("/", 1)[-1], loop_glob):
+        source = read(root, rel)
+        if re.search(markers, source, re.M) or "__main__" not in source:
+            return "pytest"
+        return "stdlib"
+    return None
+
+
+def defines_a_test(source):
+    """Would the runner find a test here? TestCase subclasses (through local bases) and test* functions."""
+    tree = ast.parse(source)
+    bases = {node.name: [ast.unparse(b).rsplit(".", 1)[-1] for b in node.bases]
+             for node in tree.body if isinstance(node, ast.ClassDef)}
+
+    def is_test_case(name):
+        seen, stack = set(), [name]
+        while stack:
+            for base in bases.get(stack.pop(), []):
+                if base in seen:
+                    continue
+                seen.add(base)
+                if base == "TestCase":
+                    return True
+                stack.append(base)
+        return False
+
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name.startswith("test"):
+            return True
+        if isinstance(node, ast.ClassDef) and is_test_case(node.name):
+            if any(isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)) and item.name.startswith("test")
+                   for item in node.body):
+                return True
+    return False
+
+
+def has_main_guard(source):
+    """A real ``if __name__ == "__main__":`` block, not just the word in a comment or a docstring."""
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.If):
+            test = ast.dump(node.test)
+            if "__main__" in test and "__name__" in test:
+                return True
+    return False
+
+
+class RepositoryRegistrationTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.rules = ci_rules(ROOT)
+        cls.files = claimed_test_files(ROOT)
+
+    def test_the_scan_sees_the_repository(self):
+        # A glob that stops matching, or a git call that fails, must not turn the checks below into no-ops.
+        self.assertGreaterEqual(len(self.files), 300, f"only {len(self.files)} test files found: {self.files[:5]}")
+        self.assertTrue(any(f.startswith("tests/semantic/") for f in self.files))
+
+    def test_every_test_file_is_selected_by_a_job(self):
+        unselected = [f for f in self.files if job_of(ROOT, f, self.rules) is None]
+        self.assertEqual(unselected, [],
+                         "no CI job runs these test files: " + ", ".join(unselected) + "\n"
+                         "Rename them to tests/test_*.py (or tests/test_*.cjs), put them under tests/semantic/ "
+                         "as test*.py, or add the pattern to the job that should run them in ci.yml.")
+
+    def test_every_selected_file_exposes_a_test_to_its_runner(self):
+        # Selection is not execution: pytest imports a file it is handed and reports zero items without
+        # failing, and unittest discover ignores a module with no TestCase.
+        silent = []
+        for rel in self.files:
+            job = job_of(ROOT, rel, self.rules)
+            if job not in ("pytest", "semantic") or not rel.endswith(".py"):
+                continue
+            if not defines_a_test(read(ROOT, rel)):
+                silent.append((job, rel))
+        self.assertEqual(silent, [], "selected by CI, but the runner would collect no test:\n" + "\n".join(
+            f"  {rel}: {job} imports it and collects nothing, so the job stays green. Give it a unittest.TestCase "
+            f"or a module-level test* function, or take it out of that job's list in ci.yml."
+            for job, rel in silent))
+
+    def test_every_file_the_loop_runs_has_a_main_guard(self):
+        # The loop decides with `grep -q '__main__'`, which a comment satisfies; python -I would then import
+        # the file and run nothing.
+        guardless = [f for f in self.files
+                     if job_of(ROOT, f, self.rules) == "stdlib" and not has_main_guard(read(ROOT, f))]
+        self.assertEqual(guardless, [], "the check loop runs these with python -I, which executes no test:\n" +
+                         "\n".join(f"  {f}: no `if __name__ == \"__main__\":` block" for f in guardless))
+
+    def test_the_scan_flags_an_unlisted_file_and_a_file_pytest_cannot_collect(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, ".github", "workflows"))
+            os.makedirs(os.path.join(tmp, "tests", "semantic"))
+            with open(os.path.join(tmp, WORKFLOW), "w", encoding="utf-8") as f:
+                f.write(read(ROOT, WORKFLOW))
+            def write(name, text):
+                with open(os.path.join(tmp, name), "w", encoding="utf-8") as f:
+                    f.write(text)
+            write("tests/test_plain.py", "import unittest\n"
+                  "class T(unittest.TestCase):\n    def test_ok(self):\n        pass\n"
+                  "if __name__ == \"__main__\":\n    unittest.main()\n")
+            # Trips PYTEST_FILE_MARKERS, so the loop skips it; its only check is under __main__, so pytest
+            # collects nothing: the file no job executes.
+            write("tests/test_numpy_probe.py", "HAVE_NUMPY = False\n"
+                  "def check():\n    assert 1 + 1 == 2\n"
+                  "if __name__ == \"__main__\":\n    check()\n")
+            write("tests/left_out_test.py", "import unittest\n"
+                  "class T(unittest.TestCase):\n    def test_ok(self):\n        pass\n")
+            write("tests/semantic/test_case.py", "import unittest\n"
+                  "class T(unittest.TestCase):\n    def test_ok(self):\n        pass\n")
+            write("tests/semantic/pytest_style.py", "def test_looks_like_a_test():\n    pass\n")
+
+            rules = ci_rules(tmp)
+            found = claimed_test_files(tmp)
+            selected = {rel: job_of(tmp, rel, rules) for rel in found}
+
+            self.assertEqual(selected["tests/left_out_test.py"], None)
+            self.assertEqual(selected["tests/semantic/pytest_style.py"], None)
+            self.assertEqual(selected["tests/test_numpy_probe.py"], "pytest")
+            self.assertFalse(defines_a_test(read(tmp, "tests/test_numpy_probe.py")))
+            self.assertTrue(defines_a_test(read(tmp, "tests/test_plain.py")))
+            self.assertEqual(selected["tests/semantic/test_case.py"], "semantic")
+
+
+if __name__ == "__main__":
+    unittest.main()

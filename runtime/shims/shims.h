@@ -62,7 +62,7 @@ bool mapped_image_base(uint64_t address, uint64_t& base);
 // Loader. Registered in Loader::Loader and removed in Loader::~Loader.
 struct BundledModuleOps {
     void* (*find_loaded)(void* ctx, const std::string& dll_lower);
-    void* (*load_bundled)(void* ctx, const std::string& dll_lower, bool& handled);
+    void* (*load_bundled)(void* ctx, const std::string& dll_lower, uint32_t flags, bool& handled);
     void* (*get_proc)(void* ctx, void* module, const std::string& sym, bool& owns_handle);
     bool (*owns_handle)(void* ctx, void* module);
 };
@@ -70,7 +70,7 @@ void add_bundled_loader(void* ctx, const BundledModuleOps* ops);
 void remove_bundled_loader(void* ctx);
 
 void* find_loaded_bundled_module(const std::string& dll_lower);
-void* load_bundled_module(const std::string& dll_lower, bool& handled);
+void* load_bundled_module(const std::string& dll_lower, uint32_t flags, bool& handled);
 void* get_bundled_proc_address(void* module, const std::string& sym, bool& owns_handle);
 bool owns_bundled_module_handle(void* module);
 
