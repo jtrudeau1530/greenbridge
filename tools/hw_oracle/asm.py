@@ -68,7 +68,7 @@ class Kernel:
     raw=True means the lines already end with their own stores and s_endpgm and only get the output pointer in
     s[2:3]. threads: workgroup size; words: dwords read back; wave: 32 or 64. mode: the float MODE the kernel
     starts with (raw kernels only), a dict of MODE_FIELDS names to values; None keeps the assembler's defaults.
-    vgprs, sgprs: registers the kernel may use (raw kernels only; default 32 and 40)."""
+    vgprs, sgprs: registers a raw kernel may use (module_text writes them into the descriptor and the metadata)."""
 
     def __init__(self, lines, wave=32, threads=1, words=4, raw=False, mode=None, vgprs=32, sgprs=40):
         self.lines, self.wave, self.threads, self.words, self.raw = list(lines), wave, threads, words, raw
@@ -92,7 +92,7 @@ MODE_FIELDS = {
 }
 
 
-def raw_kernel_text(name, lines, arch, wave=32, mode=None, vgprs=32, sgprs=40):
+def raw_kernel_text(name, lines, arch, wave=32, mode=None):
     """A kernel whose body does its own stores. s[0:1] is the kernarg pointer, s[2:3] gets the output pointer."""
     fam = family(arch)
     modes = "".join(f"\n  {MODE_FIELDS[k]} {int(v)}" for k, v in sorted((mode or {}).items()))
@@ -109,8 +109,8 @@ def raw_kernel_text(name, lines, arch, wave=32, mode=None, vgprs=32, sgprs=40):
 .p2align 6
 .amdhsa_kernel {name}
   .amdhsa_user_sgpr_kernarg_segment_ptr 1
-  .amdhsa_next_free_vgpr {vgprs}
-  .amdhsa_next_free_sgpr {sgprs}
+  .amdhsa_next_free_vgpr 32
+  .amdhsa_next_free_sgpr 40
   .amdhsa_wavefront_size32 {1 if wave == 32 else 0}
   .amdhsa_system_vgpr_workitem_id 0{modes}
 .end_amdhsa_kernel
@@ -171,15 +171,17 @@ def module_text(programs, arch, prefix="k", wave=32):
         name = f"{prefix}{i}"
         res.append((prog.sgprs, prog.vgprs) if isinstance(prog, Kernel) and prog.raw else (40, 32))
         if isinstance(prog, Kernel):
-            text = (raw_kernel_text(name, prog.lines, arch, prog.wave, prog.mode, prog.vgprs, prog.sgprs)
-                    if prog.raw else kernel_text(name, prog.lines, arch))
+            text = raw_kernel_text(name, prog.lines, arch, prog.wave, prog.mode) if prog.raw else kernel_text(name, prog.lines, arch)
+            if prog.raw and (prog.vgprs, prog.sgprs) != (32, 40):
+                text = text.replace(".amdhsa_next_free_vgpr 32", f".amdhsa_next_free_vgpr {prog.vgprs}", 1)
+                text = text.replace(".amdhsa_next_free_sgpr 40", f".amdhsa_next_free_sgpr {prog.sgprs}", 1)
         else:
             text = kernel_text(name, prog, arch)
         names.append(name)
         starts.append(line_no + 1)
         parts.append(text.rstrip("\n"))
         line_no += text.count("\n") + 0
-    parts.append(metadata(names, wave).rstrip("\n"))
+    parts.append(metadata(names, wave, res).rstrip("\n"))
     return "\n".join(parts) + "\n", names, starts
 
 
