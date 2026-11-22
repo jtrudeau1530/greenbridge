@@ -6211,8 +6211,12 @@ public:
             // Measured against the host PC runtime: a request above the supported model is clamped down to it, 5.1
             // is echoed because it is D3D12's own baseline (WARP and the RTX 5070 both answer it with S_OK), and a
             // value below it is refused with E_INVALIDARG (0x5f crashed the host, so the test does not probe it).
-            // Refuse the same way instead of echoing an unrepresentable value back.
-            if (model->HighestShaderModel < D3D_SHADER_MODEL_5_1) return E_INVALIDARG;
+            // Refuse the same way instead of echoing an unrepresentable value back: below 5.1, and between 5.1 and
+            // 6.0, where no runtime defines a model (0x52-0x5f; E_INVALIDARG on the host runtime of an RTX 5070).
+            const UINT requested = static_cast<UINT>(model->HighestShaderModel);
+            if (requested < D3D_SHADER_MODEL_5_1 ||
+                (requested > D3D_SHADER_MODEL_5_1 && requested < D3D_SHADER_MODEL_6_0))
+                return E_INVALIDARG;
             if (model->HighestShaderModel > kHighestShaderModel) model->HighestShaderModel = kHighestShaderModel;
             return S_OK;
         }
