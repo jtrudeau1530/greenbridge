@@ -2368,6 +2368,32 @@ class Gen:
                 olds.append(old)
             for k, old in enumerate(olds):           # both exchanges before the first write (vdst may alias)
                 self.dst({"k": "vgpr", "r": d["r"] + k, "n": 1}, old)
+        elif op in ("ds_wrxchg_rtn_b64", "ds_wrxchg2_rtn_b64", "ds_wrxchg2st64_rtn_b64"):
+            # 64-bit exchanges: M[A] = DATA (two dwords, low first) and vdst gets the old 64 bits. wrxchg_rtn_b64 has
+            # one element at ADDR + offset; the 2 forms have two, at ADDR + offset0/offset1 * 8 (x64 for st64), as
+            # ds_write2_b64 addresses them, and vdst is four VGPRs. Each dword is its own 32-bit exchange: the memory
+            # ends as a 64-bit exchange leaves it (both dwords take DATA), with no Int64 atomics on Workgroup memory.
+            # The returned pair is two reads, so another lane's 64-bit op on the same element between them could be
+            # seen half done (as for ds_and/or/xor_b64).
+            two = op != "ds_wrxchg_rtn_b64"
+            d = a[0]
+            if d["k"] != "vgpr" or d.get("n") != (4 if two else 2):
+                raise Unsupported(op + " destination")
+            datas = a[2:4] if two else a[2:3]
+            if any(x["k"] != "vgpr" or x.get("n") != 2 for x in datas):
+                raise Unsupported(op + " data")
+            unit = 8 * (64 if "st64" in op else 1)
+            offs = ([self.mod_int(mods, f, 0) * unit for f in ("offset0", "offset1")] if two else [off])
+            addr = self.src_u(a[1])
+            vals = [[self.load_reg("vgpr", x["r"] + w) for w in range(2)] for x in datas]
+            olds = []
+            for o, val in zip(offs, vals):
+                for w in range(2):
+                    old = self.tmp()
+                    self.emit(f"{old} = OpAtomicExchange %uint {self.lds_ptr(addr, o + 4 * w)} {sc} {sem} {val[w]}")
+                    olds.append(old)
+            for k, old in enumerate(olds):           # every exchange before the first write (vdst may alias)
+                self.dst({"k": "vgpr", "r": d["r"] + k, "n": 1}, old)
         elif op in ("ds_cmpst_rtn_b32", "ds_cmpst_b32"):
             # tmp = M[A]; M[A] = (tmp == DATA) ? DATA2 : tmp; the _rtn_ form returns tmp, ds_cmpst_b32 drops it.
             d, ad, cmp_, src = (a[0], a[1], a[2], a[3]) if rtn else (None, a[0], a[1], a[2])
