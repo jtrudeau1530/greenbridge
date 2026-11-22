@@ -526,6 +526,7 @@ int main(int argc, char** argv) {
     }
     std::setvbuf(stdout, nullptr, _IOLBF, 1 << 16);   // failures reach a redirected log as they happen
     std::string dir = argv[1], cache_path, stats_path, inflight_path, skip_path;
+    bool cache_given = false;   // an empty cache_path alone can't tell "not given" from an empty argument
     uint32_t jobs = std::max(1u, std::thread::hardware_concurrency() / 2);
     size_t start = 0, count = 0, max_bytes = 0;
     size_t large_module_bytes = 4 * 1024 * 1024;
@@ -571,9 +572,11 @@ int main(int argc, char** argv) {
         else if (a.starts_with("--")) {   // not a cache path: an option this build doesn't know
             std::fprintf(stderr, "unknown option %s\n", a.c_str());
             return 2;
-        } else if (cache_path.empty()) cache_path = a;
-        else {
-            std::fprintf(stderr, "unexpected argument %s (the cache path is already %s)\n", a.c_str(),
+        } else if (!cache_given) {
+            cache_path = a;
+            cache_given = true;
+        } else {
+            std::fprintf(stderr, "unexpected argument '%s' (a cache path was already given: '%s')\n", a.c_str(),
                          cache_path.c_str());
             return 2;
         }
