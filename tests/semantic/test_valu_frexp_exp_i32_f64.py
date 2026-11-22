@@ -1083,5 +1083,128 @@ class TestValuFrexpExpI32F64IEEE754Boundaries(unittest.TestCase):
             self.assertEqual(ref_frexp_exp_i32_ext(val, neg=True, abs_val=True), base_exp)
 
 
+class TestValuFrexpExpI32F64NegativeControls(unittest.TestCase):
+    """Unit tests for negative controls, syntax rejection, and invalid AST inputs."""
+
+    def test_invalid_register_indices(self) -> None:
+        with self.assertRaises(ValueError):
+            Register(RegKind.VGPR, -1, count=1)
+        with self.assertRaises(ValueError):
+            Register(RegKind.VGPR, 256, count=1)
+        with self.assertRaises(ValueError):
+            Register(RegKind.VGPR, 255, count=2)
+
+    def test_invalid_register_counts(self) -> None:
+        with self.assertRaises(ValueError):
+            Register(RegKind.VGPR, 0, count=0)
+        with self.assertRaises(ValueError):
+            Register(RegKind.VGPR, 0, count=3)
+
+    def test_invalid_destination_kind(self) -> None:
+        # VALU destination cannot be SGPR
+        with self.assertRaises(ValueError):
+            Instruction(
+                opcode=Opcode.V_FREXP_EXP_I32_F64,
+                dst=Register(RegKind.SGPR, 0, count=1),
+                src0=Register(RegKind.VGPR, 2, count=2),
+            )
+
+    def test_invalid_operand_counts(self) -> None:
+        # Destination must be count=1
+        with self.assertRaises(ValueError):
+            Instruction(
+                opcode=Opcode.V_FREXP_EXP_I32_F64,
+                dst=Register(RegKind.VGPR, 0, count=2),
+                src0=Register(RegKind.VGPR, 2, count=2),
+            )
+        # Source must be count=2
+        with self.assertRaises(ValueError):
+            Instruction(
+                opcode=Opcode.V_FREXP_EXP_I32_F64,
+                dst=Register(RegKind.VGPR, 0, count=1),
+                src0=Register(RegKind.VGPR, 2, count=1),
+            )
+
+    def test_vop1_rejects_modifiers(self) -> None:
+        with self.assertRaises(ValueError):
+            Instruction(
+                opcode=Opcode.V_FREXP_EXP_I32_F64,
+                dst=Register(RegKind.VGPR, 0, count=1),
+                src0=Register(RegKind.VGPR, 2, count=2),
+                src0_mods=OperandModifiers(neg=True),
+                encoding=Encoding.VOP1,
+            )
+
+    def test_scalar_interpreter_out_of_bounds_access(self) -> None:
+        interp = ScalarVALUInterpreter()
+        with self.assertRaises(IndexError):
+            interp.read_reg_u32(RegKind.VGPR, 256)
+        with self.assertRaises(IndexError):
+            interp.write_reg_u32(RegKind.SGPR, 106, 0)
+
+    def test_simd_interpreter_invalid_wave_size(self) -> None:
+        with self.assertRaises(ValueError):
+            SIMDWavefrontInterpreter(wave_size=16)
+        with self.assertRaises(ValueError):
+            SIMDWavefrontInterpreter(wave_size=128)
+
+
+class TestValuFrexpExpI32F64MutationDetection(unittest.TestCase):
+    """Mutation tests: verifies that intentional sabotages/mutations of the oracle are caught."""
+
+    def test_mutation_wrong_bias(self) -> None:
+        # Sabotage: biased exponent - 1023 instead of biased exponent - 1022
+        def mutated_frexp_exp(bits: int) -> int:
+            exp_biased = (bits & EXP_MASK_F64) >> EXP_SHIFT_F64
+            if exp_biased in (0, 0x7FF):
+                return 0
+            return (exp_biased - 1023) & MASK32
+
+        with self.assertRaises(AssertionError):
+            self.assertEqual(s32(mutated_frexp_exp(POS_ONE_F64)), 1)
+
+    def test_mutation_subnormal_omission(self) -> None:
+        # Sabotage: flushing subnormals to zero in IEEE mode
+        def mutated_frexp_exp(bits: int) -> int:
+            exp_biased = (bits & EXP_MASK_F64) >> EXP_SHIFT_F64
+            if exp_biased == 0:
+                return 0
+            return (exp_biased - 1022) & MASK32
+
+        with self.assertRaises(AssertionError):
+            self.assertEqual(s32(mutated_frexp_exp(SUBNORM_MIN_F64)), -1073)
+
+    def test_mutation_special_value_leak(self) -> None:
+        # Sabotage: computing unbiased exponent for infinities and NaNs instead of returning 0
+        def mutated_frexp_exp(bits: int) -> int:
+            exp_biased = (bits & EXP_MASK_F64) >> EXP_SHIFT_F64
+            return (exp_biased - 1022) & MASK32
+
+        with self.assertRaises(AssertionError):
+            self.assertEqual(mutated_frexp_exp(POS_INF_F64), 0)
+        with self.assertRaises(AssertionError):
+            self.assertEqual(mutated_frexp_exp(QNAN_F64), 0)
+
+    def test_mutation_simd_exec_mask_leak(self) -> None:
+        # Sabotage: inactive lanes write to destination register
+        simd = SIMDWavefrontInterpreter(wave_size=32)
+        simd.set_exec_mask(0)  # all inactive
+        canary = 0x11223344
+        simd.write_lane_reg_u32(0, RegKind.VGPR, 0, canary)
+
+        inst = Instruction(
+            opcode=Opcode.V_FREXP_EXP_I32_F64,
+            dst=Register(RegKind.VGPR, 0, count=1),
+            src0=Immediate(2.0),
+        )
+        simd.step(inst)
+        self.assertEqual(simd.read_lane_reg_u32(0, RegKind.VGPR, 0), canary)
+
+        # Mutated unconditional write
+        simd.write_lane_reg_u32(0, RegKind.VGPR, 0, 2)
+        with self.assertRaises(AssertionError):
+            self.assertEqual(simd.read_lane_reg_u32(0, RegKind.VGPR, 0), canary)
+
+
 if __name__ == "__main__":
     unittest.main()
