@@ -30,7 +30,7 @@ method, scope and caveats. No game data is included.
 | [gamedata_graph.md](gamedata_graph.md) | `common.rpf` mount graph: 25 manifest documents, 30 content-set ids, 14 include refs (12 resolve), 3,386 target refs, 0 cycles. |
 | [world.md](world.md) | `levels.rpf` placement: 9,918 map files / 680,228 entities measured in 55% of the archive (lower bound; estimate 16k-39.6k / 1.03M-2.64M); `0x7a` resource layout. |
 | [world_census.md](world_census.md) | Full `levels.rpf` pass: 23,535 maps / 1,670,442 entities, 98.32% stream coverage, sharded and exact. |
-| [world_names.md](world_names.md) | Name resolution: `archetypeName` and map `name`/`parent` are lower-cased joaat; 64-bit keys are MurmurHash3 x64 low 64. 79,738 local names resolve 8,263/203,799 sampled entities; 5/23,535 map names, all five confirmed by the map 64-bit key. |
+| [world_names.md](world_names.md) | Name resolution: `archetypeName` and map `name`/`parent` are lower-cased joaat; 64-bit keys are MurmurHash3 x64 low 64. With `rpf9_names.py` names, 99.85% of the 1,670,435 entities a whole-archive `world_index` run reads resolve (64-bit verified); 5/23,535 map names, all five confirmed by the map 64-bit key. |
 | [page_directory.md](page_directory.md) | RPF9 `0DRP`: 0x60-byte header, `q38` 16-byte records; 15,768 pages / 60,880 records in `data.rpf`; targets and sizes, names still TOC-only. |
 | [psin.md](psin.md) | PSIN metadata container: header, section walk, 671 streams in the `script.rpf` carve. |
 | [story.md](story.md) | `story000.rpf` 18.65 GiB mixed: 264 Bink 2 streams / 3.33 GB, 225,281 `RSC8` headers, 442 nested RPF9; `story000_script` PSIN, `shared_minigame` mixed content. |
