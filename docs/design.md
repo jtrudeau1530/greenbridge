@@ -199,9 +199,20 @@ target and dumps the floats. Test shaders are in `<work>\gputest`.
   (r,g,r,g). That's fixed.
 - After the export fix, 2 of the 400 smoke-test shaders (`PS_ImposterShadow` variants) gave non-finite red values.
   The cause was round-to-nearest `pkrtz` overflowing to inf, fixed with exact RTZ. One variant is now fully finite.
-  The other still has 1 inf and 4 NaN in red, and RTZ can't create those from finite values, so they come from the
-  shader's own maths on the synthetic test inputs (hardware would pass them through too). That's consistent with
-  hardware, but unconfirmed without a reference.
+  The other was reported with 1 inf and 4 NaN in red, put down to the shader's own maths on the synthetic inputs.
+  **That doesn't reproduce, and the shader has no maths to produce it** (TEST-643): both variants are the same
+  nine-instruction body, whose red is `v_cvt_pkrtz_f16_f32` of v2 and 1.0. Both read only `SV_Position.z` (input
+  signature rw mask 4), so v2 is POS_Z_FLOAT, which the translator maps to `gl_FragCoord.z`; red is f16(depth),
+  finite for every rasterized fragment. Redrawn with `vk_harness` (64×64, a full-screen triangle with depth 0, 0.5
+  and 1 at its vertices, synthetic values on locations 0–15) on an AMD RDNA2 iGPU (gfx1036, driver 32.0.21043) and
+  an RTX 5090: 4,096 of 4,096 pixels written, 0 inf and 0 NaN in red, red in [0.0059, 0.744], for both variants as
+  translated by `main` and by the initial commit's translator; all eight images are bit-identical. **Measured on
+  the hardware** with the pixel-shader oracle (#3061's `ps_oracle.py`, not on `main` yet; same iGPU, wave64): with a
+  template PS that reads only `FragCoord.z` and front facing, the driver enables PERSP_CENTER, POS_Z_FLOAT and
+  FRONT_FACE, so v0/v1 are the barycentrics, v2 the depth and v3 the facing, as the translator assumes. The raw
+  body (its export made uncompressed, so the packed words come back as they are) over the same draw gives 0 inf
+  and 0 NaN in 4,096 of 4,096 pixels; each red half is the round-toward-zero f16 of that pixel's v2 (4,096 of
+  4,096, checked on the CPU), and the translated shaders' red equals it bit for bit on both GPUs.
 
 ### Translator status and runtime contract
 
