@@ -1195,6 +1195,10 @@ if(TARGET Vulkan::Headers)
     endif()
     add_test(NAME replay_cpu_bench_selftest COMMAND replay_cpu_bench --self-test)
     add_test(NAME vk_descriptor_bench_selftest COMMAND vk_descriptor_bench --self-test)
+    # The subgroup size a pipeline stage asks for, from synthetic index entries and device properties.
+    add_executable(subgroup_size_test test/subgroup_size_test.cpp)
+    target_link_libraries(subgroup_size_test PRIVATE Vulkan::Headers)
+    add_test(NAME subgroup_size COMMAND subgroup_size_test)
   endif()
 else()
   message(STATUS "Vulkan headers not found: GPU test tools, vk_pipeline_check, d3d12_state_map_test and "
