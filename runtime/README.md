@@ -123,6 +123,23 @@ clone of the helper from `%TEMP%\leonida_tls_host_<pid>_<slot>.dll`, so up to 16
 once and a further one is rejected with an error instead of sharing a slot. Images without a TLS
 directory (or with an all-zero one) load normally.
 
+An executable (an image without `IMAGE_FILE_DLL`, the game's EXE under `--run`, `--init` and `--dry-run`) gets
+module TLS index 0 instead, as Windows gives the process EXE. MSVC code built with `/GA` relies on that: it reads
+`ThreadLocalStoragePointer[0]` directly and never loads `_tls_index`. A `thread_local int v = 42;` EXE built
+`/O2 /GA /MD` printed `tls_index=0 value=42` natively but `tls_index=6 value=0` under `gta6rt --run` when it got a
+helper's index. Index 0 belongs to `gta6rt.exe` itself (measured: Windows gives it to the process EXE, the trace event below names
+it, and `gta6rt.exe` has a TLS block, 1350 bytes when measured, and no TLS callbacks), and all of its own TLS reads
+go through `_tls_index`.
+So the first time an executable is mapped, the loader moves `gta6rt.exe`'s block: it loads one more clone
+(`leonida_tls_host_<pid>_home.dll`), stops the other threads, swaps slots 0 and that clone's index on every thread
+and writes the clone's index into `gta6rt.exe`'s `_tls_index`. A thread started later swaps its own two slots in the
+helper's `DLL_THREAD_ATTACH` before anything else runs there. Slot 0 then holds a spare helper block, which the
+executable's template copy replaces on the loading thread, on threads started later, and through
+`install_tls_for_thread()` on older ones, exactly as a DLL's copy replaces a helper's. Both swapped pointers are
+blocks the OS allocated for that thread, and it frees every slot at thread exit, so nothing is swapped back; the move
+stays for the process lifetime and every later executable gets index 0 directly. The startup trace records it once
+(`tls_index0`). DLLs keep the helper indices and work next to the executable as before.
+
 Current limits, by design:
 
 - `load()` runs no image code. Static TLS is data, not code. The TLS index helper is the runtime's own
@@ -137,7 +154,18 @@ Current limits, by design:
   existed before `load()` gets nothing:
   call `install_tls_for_thread()` before mapped code runs on it and `uninstall_tls_for_thread()` before it
   exits. Mapped DLLs' `DllMain` is not called with thread events. Destroy the `Loader` on the thread that
-  called `load()`.
+  called `load()`. The executable's thread events come after the DLLs' ones, for attach and for detach, as
+  Windows orders an EXE's TLS callbacks.
+- One executable holds index 0 at a time. A second one mapped while the first is live gets a helper index and a
+  `[rt] loader: ... does not get module TLS index 0` line on stderr: its `_tls_index` code works, its `/GA` code
+  reads the first one's slot 0. The same happens when the move cannot be made: when no single module holds index
+  0, or when another thread keeps running `gta6rt.exe`'s own code for the 250 ms the move waits (a thread stopped
+  there could be between its load of `_tls_index` and its read of the slot). The next executable tries again.
+- The home clone stays loaded until the process ends (freeing it would free `gta6rt.exe`'s blocks), so its file
+  stays in `%TEMP%` until the next run's clean-up of dead processes' clones deletes it. Runtime code that runs on a
+  new thread before the helper's `DLL_THREAD_ATTACH` (a vectored exception handler during an earlier DLL's thread
+  attach) would read the clone's block in place of `gta6rt.exe`'s; a thread created to skip DLL thread attach never
+  swaps its slots.
 - The TOC of the game's RPF archives is encrypted and is not read here. The loader works on the PE
   files and on any images the caller passes it.
 
@@ -290,6 +318,7 @@ from the ANSI code page.
 | `kind` | When | Fields |
 |---|---|---|
 | `trace_open` | first line | `pid` |
+| `tls_index0` | the first executable is mapped and module TLS index 0 moves to it (once per process) | `owner` (the image that held index 0, `gta6rt.exe`), `moved_to` (the index its block moved to) |
 | `map` | a module is mapped, bound and protected | `module`, `base`, `size`, `relocated` |
 | `tls_callback` | before each TLS callback the Loader runs (process attach and detach; thread events run under the Windows loader lock and are not traced) | `module`, `at` (module+RVA), `reason` |
 | `dllmain` | after `DllMain(DLL_PROCESS_ATTACH)` returns | `module`, `result` |

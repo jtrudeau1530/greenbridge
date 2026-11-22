@@ -536,6 +536,32 @@ if(BUILD_TESTING)
       COMMAND loader_tls_test "$<TARGET_FILE:tiny_tls>"
     )
 
+    # Module TLS index 0 fixture: an EXE built /GA, so its thread_local reads go straight to
+    # ThreadLocalStoragePointer[0] as a game executable's can. The loader must give a mapped executable index 0;
+    # loader_tls_index0_test maps it next to tiny_tls.dll and run_tiny_tls_ga runs it under gta6rt. Ordinary test
+    # code, no game data. The test checks the /GA code shape only where the compiler is MSVC, which implements /GA.
+    add_executable(tiny_tls_ga test/fixtures/tiny_tls_ga.cpp)
+    target_compile_options(tiny_tls_ga PRIVATE /W4 /permissive- /utf-8 /EHsc /GA)
+    set_target_properties(tiny_tls_ga PROPERTIES
+      RUNTIME_OUTPUT_DIRECTORY "${TINY_FIXTURE_DIR}"
+      ARCHIVE_OUTPUT_DIRECTORY "${TINY_FIXTURE_DIR}"
+    )
+    add_executable(loader_tls_index0_test
+      test/loader_tls_index0_test.cpp
+      src/pe_loader.cpp
+      shims/registry.cpp
+    )
+    target_include_directories(loader_tls_index0_test PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/src
+    )
+    target_compile_definitions(loader_tls_index0_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
+      $<$<CXX_COMPILER_ID:MSVC>:LEONIDA_GA_FIXTURE_IS_GA=1>)
+    target_compile_options(loader_tls_index0_test PRIVATE /W4 /permissive- /utf-8 /EHsc)
+    add_dependencies(loader_tls_index0_test tiny_tls_ga tiny_tls gta6rt_tls_host)
+    add_test(NAME loader_tls_index0
+      COMMAND loader_tls_index0_test "$<TARGET_FILE:tiny_tls_ga>" "$<TARGET_FILE:tiny_tls>"
+    )
+
     # DisableThreadLibraryCalls from a mapped DllMain (shims/library_loader.cpp). The fixture is built without the CRT, so
     # DllMain's only work is that one call. No game files.
     add_library(dll_thread_calls SHARED test/fixtures/dll_thread_calls.cpp)
@@ -787,6 +813,11 @@ if(BUILD_TESTING)
     # The opt-in checks, one test each: thread_local on the game's threads, a C++ exception caught inside the image.
     add_test(NAME run_tiny_game_tls COMMAND gta6rt --run $<TARGET_FILE:tiny_game> -- hello 42 tls)
     add_test(NAME run_tiny_game_eh COMMAND gta6rt --run $<TARGET_FILE:tiny_game> -- hello 42 eh)
+    # A /GA executable under --run and --init reads its TLS from slot 0, and the trace names gta6rt.exe as the image
+    # whose index 0 moved.
+    add_test(NAME run_tiny_tls_ga COMMAND ${CMAKE_COMMAND}
+      "-DLOADER=$<TARGET_FILE:gta6rt>" "-DGUEST=$<TARGET_FILE:tiny_tls_ga>" "-DTRACE_DIR=${CMAKE_CURRENT_BINARY_DIR}"
+      "-DRUNNER=${CMAKE_CROSSCOMPILING_EMULATOR}" -P "${CMAKE_CURRENT_SOURCE_DIR}/test/check_tls_index0.cmake")
     # GAME: is the game folder, absolute, when gta6rt is given a bare image name or `--game-dir .`.
     add_test(NAME run_tiny_game_dir COMMAND ${CMAKE_COMMAND}
       "-DLOADER=$<TARGET_FILE:gta6rt>" "-DGUEST=$<TARGET_FILE:tiny_game>"

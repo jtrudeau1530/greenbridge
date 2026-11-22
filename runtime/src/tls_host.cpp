@@ -5,6 +5,11 @@
 // __declspec(thread) access in mapped code reads a valid TEB slot. The anchor itself is never used; the loader saves
 // and restores the helper's own block, so the helper's CRT TLS state is not disturbed.
 //
+// One more clone, leonida_tls_host_<pid>_home.dll, is loaded the first time an executable is mapped: the runtime's
+// own EXE, which Windows gave module TLS index 0, moves its block to that clone's index on every thread so the mapped
+// executable can take index 0. That clone stays loaded until the process ends, and its slot then holds the runtime's
+// live TLS, so nothing in this DLL may read or write its own TLS (gta6rt_tls_host_keep is never called).
+//
 // The Windows loader also calls this DLL's DllMain with DLL_THREAD_ATTACH on every new thread (after it has built that
 // thread's TLS array) and with DLL_THREAD_DETACH when a thread exits (before it frees the array). The loader registers
 // a callback here so it can give each new thread its own copy of the mapped image's TLS, and put this DLL's block back

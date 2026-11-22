@@ -48,10 +48,13 @@ struct Module {
     // the image's _tls_index. tls_index names TEB->ThreadLocalStoragePointer[tls_index], the array
     // __declspec(thread) reads; it is not a TlsAlloc slot. The loader reserves distinct indices by loading
     // gta6rt_tls_host.dll (and cloning it on demand for additional simultaneous TLS modules, up to 16 at a time).
+    // An executable gets index 0, as Windows gives the process EXE, because code built with /GA reads slot 0 without
+    // _tls_index: the first time one is mapped, the runtime's own EXE moves its block to a helper clone's index on
+    // every thread. Only one executable holds index 0 at a time; another one mapped meanwhile gets a helper index.
     // Every thread started after load() gets its own copy through the helper's DLL_THREAD_ATTACH, and gives it back
     // at DLL_THREAD_DETACH; install_tls_for_thread() is for threads that already existed.
     uint32_t tls_index = kNoTlsIndex;
-    uint32_t tls_slot = kNoTlsIndex;   // index into the loader's reserved TLS-host slot pool
+    uint32_t tls_slot = kNoTlsIndex;   // index into the loader's reserved TLS-host slot pool ; 16 is index 0, an executable's
     uint64_t tls_generation = 0;       // unique token per TLS initialisation, distinguishing reused slots/addresses
     void* tls_block = nullptr;         // calling thread's copy of the image's template
     void* tls_saved_block = nullptr;   // helper DLL block replaced in that thread, restored by ~Loader
