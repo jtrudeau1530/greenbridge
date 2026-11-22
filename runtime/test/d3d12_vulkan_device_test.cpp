@@ -2034,11 +2034,24 @@ int new_format_round_trips(ID3D12Device* device, const rt::d3d12::VulkanDeviceIn
             continue;
         }
         if (host.p) {
-            Ref<ID3D12Resource> native;
-            if (FAILED(host->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &desc,
-                                                     D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
-                                                     IID_PPV_ARGS(&native.p))))
-                fail(format, "the host refuses a texture the layer creates");
+            // A host runtime older than the format has nothing to match: A4B4G4R4_UNORM is not in Windows 10's D3D12,
+            // which reports no 2D texture support for it and refuses it. Compare only where the host itself says it
+            // has the format, so a host that reports it and still refuses the texture fails as before.
+            D3D12_FEATURE_DATA_FORMAT_SUPPORT host_support{format};
+            const bool host_has_format =
+                SUCCEEDED(host->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &host_support,
+                                                    sizeof(host_support))) &&
+                (host_support.Support1 & D3D12_FORMAT_SUPPORT1_TEXTURE2D);
+            if (!host_has_format) {
+                std::printf("new format %d: the host runtime has no such 2D texture (e.g. Windows 10), "
+                            "host comparison skipped\n", int(format));
+            } else {
+                Ref<ID3D12Resource> native;
+                if (FAILED(host->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &desc,
+                                                         D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                         IID_PPV_ARGS(&native.p))))
+                    fail(format, "the host refuses a texture the layer creates");
+            }
         }
         D3D12_PLACED_SUBRESOURCE_FOOTPRINT placed{};
         UINT rows = 0;
