@@ -15,10 +15,24 @@ Background & Specification Rules:
           idx = (addr >> 2) & (lds_dwords - 1)
           LDS[idx] = (LDS[idx] - vdata) & 0xFFFFFFFF
         Non-returning form: the prior value at LDS[idx] is discarded.
-    - Exact formula:
-        LDS[addr] = (LDS[addr] - val) mod 2^32
-    - Modulo 2^32 arithmetic:
-        All subtractions wrap strictly modulo 2^32 without trapping or saturating.
+    - `ds_sub_rtn_u32 vdst, vaddr, vdata [offset:N]`:
+        Atomically computes:
+          addr = (vaddr + byte_offset)
+          idx = (addr >> 2) & (lds_dwords - 1)
+          old_val = LDS[idx]
+          LDS[idx] = (old_val - vdata) & 0xFFFFFFFF
+          vdst = old_val
+        Returning form: writes the pre-subtraction value into destination VGPR vdst.
+    - Active lane masking:
+        LDS operations are vector instructions; in hardware, only active lanes
+        participate (inactive lanes do not modify LDS or destination VGPRs).
+    - Hardware wrapping & alignment:
+        Byte addresses are converted to dwords by shifting right by 2 (truncating
+        unaligned low bits). The dword index is masked with (lds_dwords - 1),
+        wrapping out-of-bounds addresses within the allocated power-of-two LDS slice.
+    - Modulo 2^32 arithmetic & underflow wrapping:
+        All subtractions wrap strictly modulo 2^32 without trapping or saturating
+        (e.g., 0 - 1 = 0xFFFFFFFF).
   * SPIR-V Representation:
     - LDS is declared as an array in the Workgroup storage class:
         %lds_arr = OpTypeArray %uint <lds_dwords>
@@ -336,6 +350,56 @@ class TestAtomicSubReferenceMath(unittest.TestCase):
         self.assertEqual(reference_atomic_sub(0x80000000, 0x1000), 0x7FFFF000)
         self.assertEqual(reference_atomic_sub(0xFFFFFFFF, 0x7FFFFFFF), 0x80000000)
 
+    def test_underflow_modulo_2_pow_32(self):
+        cases = [
+            (0, 1, 0xFFFFFFFF),
+            (0, 2, 0xFFFFFFFE),
+            (5, 10, 0xFFFFFFFB),
+            (0, 0xFFFFFFFF, 1),
+            (0x80000000, 1, 0x7FFFFFFF),
+            (0, 0x80000000, 0x80000000),
+            (0x10, 0x20, 0xFFFFFFF0),
+            (0xFFFFFFFF, 0xFFFFFFFF, 0),
+        ]
+        for init, sub, expected in cases:
+            with self.subTest(init=hex(init), sub=hex(sub)):
+                self.assertEqual(reference_atomic_sub(init, sub), expected)
+
+
+class TestLdsAddressingAndOffsets(unittest.TestCase):
+    """Verifies byte offset math, dword truncation, and power-of-two modulo wrapping."""
+
+    def test_aligned_dword_addressing(self):
+        lds_dwords = 256
+        for dword in (0, 1, 2, 64, 127, 255):
+            byte_addr = dword * 4
+            self.assertEqual(reference_lds_index(byte_addr, 0, lds_dwords), dword)
+
+    def test_unaligned_byte_truncation(self):
+        # LDS addressing ignores the lowest 2 bits (shifts right by 2)
+        lds_dwords = 128
+        # Any byte offset 0..3 added to aligned byte 16 maps to dword 4
+        for byte_off in (0, 1, 2, 3):
+            self.assertEqual(reference_lds_index(16, byte_off, lds_dwords), 4)
+        # Unaligned byte addresses 16..19 with 0 offset all map to dword 4
+        for unaligned_base in (16, 17, 18, 19):
+            self.assertEqual(reference_lds_index(unaligned_base, 0, lds_dwords), 4)
+
+    def test_static_offset_addition(self):
+        lds_dwords = 512
+        base = 32  # dword 8
+        offset = 64  # +16 dwords
+        self.assertEqual(reference_lds_index(base, offset, lds_dwords), 24)
+
+    def test_boundary_wrapping(self):
+        lds_dwords = 64  # 256 bytes
+        # Byte address 256 wraps to dword 0
+        self.assertEqual(reference_lds_index(256, 0, lds_dwords), 0)
+        # Byte address 260 wraps to dword 1
+        self.assertEqual(reference_lds_index(256, 4, lds_dwords), 1)
+        # Byte address 0xFFFFFFFC wraps to dword 63
+        self.assertEqual(reference_lds_index(0xFFFFFFFC, 0, lds_dwords), 63)
+
 
 class TestSpirvAtomicSubNonReturning(unittest.TestCase):
     """Executes SPIR-V compute kernels exercising non-returning ds_sub_u32 operations."""
@@ -531,6 +595,83 @@ OpFunctionEnd
         # r3 got 70 (lds became 40)
         self.assertEqual(lane_out[0]["%out"], 70)
         self.assertEqual(final_lds[4], 40)
+
+    def test_atomic_sub_underflow_wrap(self):
+        # Subtracting 1 from 0 underflows to 0xFFFFFFFF, returning 0
+        spvasm = """
+OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main" %out
+OpExecutionMode %main LocalSize 1 1 1
+%uint = OpTypeInt 32 0
+%_ptr_Output_uint = OpTypePointer Output %uint
+%out = OpVariable %_ptr_Output_uint Output
+%c32 = OpConstant %uint 32
+%c2 = OpConstant %uint 2
+%c0 = OpConstant %uint 0
+%c0_slot = OpConstant %uint 0
+%c1 = OpConstant %uint 1
+%lds_arr = OpTypeArray %uint %c32
+%_ptr_WG_lds = OpTypePointer Workgroup %lds_arr
+%_ptr_WG_uint = OpTypePointer Workgroup %uint
+%lds = OpVariable %_ptr_WG_lds Workgroup
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%ptr = OpAccessChain %_ptr_WG_uint %lds %c0_slot
+%old = OpAtomicISub %uint %ptr %c2 %c0 %c1
+OpStore %out %old
+OpReturn
+OpFunctionEnd
+"""
+        interp = LdsAtomicSubInterp(spvasm)
+        final_lds, lane_out = interp.run(seed_lds={0: 0})
+        self.assertEqual(lane_out[0]["%out"], 0)
+        self.assertEqual(final_lds[0], 0xFFFFFFFF)
+
+    def test_offset_and_wrapping_in_spirv(self):
+        # Simulates the full rdna2spirv sequence:
+        # byte_addr + offset -> shift right 2 -> bitwise and mask -> OpAccessChain
+        spvasm = """
+OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main" %out
+OpExecutionMode %main LocalSize 1 1 1
+%uint = OpTypeInt 32 0
+%_ptr_Output_uint = OpTypePointer Output %uint
+%out = OpVariable %_ptr_Output_uint Output
+%c16 = OpConstant %uint 16
+%c15 = OpConstant %uint 15
+%c2 = OpConstant %uint 2
+%c0 = OpConstant %uint 0
+%c_base = OpConstant %uint 60
+%c_offset = OpConstant %uint 16
+%c_val = OpConstant %uint 42
+%lds_arr = OpTypeArray %uint %c16
+%_ptr_WG_lds = OpTypePointer Workgroup %lds_arr
+%_ptr_WG_uint = OpTypePointer Workgroup %uint
+%lds = OpVariable %_ptr_WG_lds Workgroup
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%s1 = OpIAdd %uint %c_base %c_offset
+%i = OpShiftRightLogical %uint %s1 %c2
+%m = OpBitwiseAnd %uint %i %c15
+%ptr = OpAccessChain %_ptr_WG_uint %lds %m
+%old = OpAtomicISub %uint %ptr %c2 %c0 %c_val
+OpStore %out %old
+OpReturn
+OpFunctionEnd
+"""
+        # Base 60 + Offset 16 = 76
+        # 76 >> 2 = 19
+        # 19 & 15 = 3
+        interp = LdsAtomicSubInterp(spvasm)
+        final_lds, lane_out = interp.run(seed_lds={3: 500})
+        self.assertEqual(lane_out[0]["%out"], 500)
+        self.assertEqual(final_lds[3], 458)
 
 
 class TestWorkgroupMultiLaneAtomics(unittest.TestCase):
@@ -777,6 +918,131 @@ class TestTranslatorSubIntegration(unittest.TestCase):
         dest_reg, val_id = gen.stored_dsts[0]
         self.assertEqual(dest_reg["r"], 5)
         self.assertTrue(val_id.startswith("%t"))
+
+    def test_ds_sub_outside_compute_raises_unsupported(self):
+        # Pixel shader or vertex shader cannot execute LDS operations
+        for invalid_stage in ("ps", "vs", "gs"):
+            with self.subTest(stage=invalid_stage):
+                gen = self._make_mock_gen(stage=invalid_stage)
+                with self.assertRaises(rdna2spirv.Unsupported):
+                    gen.lds_op("ds_sub_u32", [{"r": 0}, {"r": 1}], [])
+
+
+class TestNegativeControlsAndErrors(unittest.TestCase):
+    """Verifies that invalid constructs, unmodelled opcodes, and malformed headers fail."""
+
+    def test_unsupported_storage_class_rejected(self):
+        spvasm = """
+OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+%uint = OpTypeInt 32 0
+%_ptr_UC = OpTypePointer UniformConstant %uint
+%u = OpVariable %_ptr_UC UniformConstant
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%main = OpFunction %void None %fn
+%entry = OpLabel
+OpReturn
+OpFunctionEnd
+"""
+        with self.assertRaises(UnsupportedConstruct):
+            LdsAtomicSubInterp(spvasm)
+
+    def test_unsupported_opcode_rejected(self):
+        spvasm = """
+OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+%uint = OpTypeInt 32 0
+%c16 = OpConstant %uint 16
+%lds_arr = OpTypeArray %uint %c16
+%_ptr_WG_lds = OpTypePointer Workgroup %lds_arr
+%lds = OpVariable %_ptr_WG_lds Workgroup
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%bad = OpSDiv %uint %c16 %c16
+OpReturn
+OpFunctionEnd
+"""
+        interp = LdsAtomicSubInterp(spvasm)
+        with self.assertRaises(UnsupportedConstruct):
+            interp.run()
+
+    def test_invalid_workgroup_size_rejected(self):
+        for dims in [(0, 1, 1), (1025, 1, 1), (32, 33, 1)]:
+            with self.subTest(dims=dims):
+                spvasm = f"""
+OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize {dims[0]} {dims[1]} {dims[2]}
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%main = OpFunction %void None %fn
+%entry = OpLabel
+OpReturn
+OpFunctionEnd
+"""
+                with self.assertRaises(WorkgroupBoundsError):
+                    LdsAtomicSubInterp(spvasm)
+
+    def test_atomic_on_non_lds_pointer_rejected(self):
+        spvasm = """
+OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+%uint = OpTypeInt 32 0
+%_ptr_fn_uint = OpTypePointer Function %uint
+%c2 = OpConstant %uint 2
+%c0 = OpConstant %uint 0
+%c5 = OpConstant %uint 5
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%local_v = OpVariable %_ptr_fn_uint Function
+%bad = OpAtomicISub %uint %local_v %c2 %c0 %c5
+OpReturn
+OpFunctionEnd
+"""
+        interp = LdsAtomicSubInterp(spvasm)
+        with self.assertRaises(UnsupportedConstruct):
+            interp.run()
+
+    def test_out_of_bounds_lds_access_rejected(self):
+        spvasm = """
+OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+%uint = OpTypeInt 32 0
+%c16 = OpConstant %uint 16
+%c2 = OpConstant %uint 2
+%c0 = OpConstant %uint 0
+%c_oob = OpConstant %uint 20
+%c5 = OpConstant %uint 5
+%lds_arr = OpTypeArray %uint %c16
+%_ptr_WG_lds = OpTypePointer Workgroup %lds_arr
+%_ptr_WG_uint = OpTypePointer Workgroup %uint
+%lds = OpVariable %_ptr_WG_lds Workgroup
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%ptr = OpAccessChain %_ptr_WG_uint %lds %c_oob
+%val = OpAtomicISub %uint %ptr %c2 %c0 %c5
+OpReturn
+OpFunctionEnd
+"""
+        interp = LdsAtomicSubInterp(spvasm)
+        with self.assertRaises(WorkgroupBoundsError):
+            interp.run()
 
 
 if __name__ == "__main__":
