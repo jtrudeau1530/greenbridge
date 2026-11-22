@@ -3827,6 +3827,36 @@ class Gen:
         self.emit(f"{d} = OpBitcast %double {v2}")
         return d
 
+    def round_f32_flushed(self, fn, x):
+        """v_floor_f32 / v_ceil_f32 / v_fract_f32 of the operand x (source modifiers applied) as RDNA2 computes them in
+        the MODE inferred for the game (IEEE 0, f32 denormals flushed), measured natively on gfx1036: a denormal
+        operand is a zero of its sign (floor(-1e-45) = -0, ceil(+1e-45) = +0, fract of either 0; using the denormal
+        gives -1.0, +1.0 and 0x3f7fffff), and a NaN operand passes through unchanged (signalling ones too).
+        fract(+-inf) is the negative quiet NaN 0xffc00000. Done here rather than left to the driver's f32 denormal
+        handling, which Vulkan does not fix."""
+        bits, mag, exp, den, sgn, sz, xf, r = (self.tmp() for _ in range(8))
+        self.emit(f"{bits} = OpBitcast %uint {x}")
+        self.emit(f"{mag} = OpBitwiseAnd %uint {bits} {self.cu(0x7FFFFFFF)}")
+        self.emit(f"{exp} = OpBitwiseAnd %uint {bits} {self.cu(0x7F800000)}")
+        self.emit(f"{den} = OpIEqual %bool {exp} {self.cu(0)}")
+        self.emit(f"{sgn} = OpBitwiseAnd %uint {bits} {self.cu(0x80000000)}")
+        self.emit(f"{sz} = OpSelect %uint {den} {sgn} {bits}")
+        self.emit(f"{xf} = OpBitcast %float {sz}")
+        self.emit(f"{r} = OpExtInst %float %glsl {fn} {xf}")
+        if fn == "Fract":
+            r = self.fract_below_one(r)
+        nan, inf, rb, keep, out = (self.tmp() for _ in range(5))
+        self.emit(f"{rb} = OpBitcast %uint {r}")
+        self.emit(f"{nan} = OpUGreaterThan %bool {mag} {self.cu(0x7F800000)}")
+        self.emit(f"{keep} = OpSelect %uint {nan} {bits} {rb}")
+        if fn == "Fract":
+            fixed = self.tmp()
+            self.emit(f"{inf} = OpIEqual %bool {mag} {self.cu(0x7F800000)}")
+            self.emit(f"{fixed} = OpSelect %uint {inf} {self.cu(0xFFC00000)} {keep}")
+            keep = fixed
+        self.emit(f"{out} = OpBitcast %float {keep}")
+        return out
+
     def fract_below_one(self, r):
         """v_fract: a Fract(x) that rounded up to 1.0 (x a tiny negative number) becomes 0x3f7fffff, the largest
         float below 1, as on hardware. A compare and select, not FMin, so the NaN of fract(+-inf) is kept."""
@@ -7060,10 +7090,10 @@ class Gen:
             r = self.tmp()
             if F1[op] == "rcp":
                 self.emit(f"{r} = OpFDiv %float %f1 {x}")
+            elif F1[op] in ("Floor", "Ceil", "Fract"):
+                r = self.round_f32_flushed(F1[op], x)
             else:
                 self.emit(f"{r} = OpExtInst %float %glsl {F1[op]} {x}")
-                if F1[op] == "Fract":
-                    r = self.fract_below_one(r)
             self.dst(a[0], self.tou(self.clamp_mods(r, mods)))
         elif op in ("v_frexp_mant_f32", "v_frexp_exp_i32_f32", "v_ldexp_f32"):
             # Bit-exact on the binary32 word (no float arithmetic). A normal input has biased exponent 1..254;
