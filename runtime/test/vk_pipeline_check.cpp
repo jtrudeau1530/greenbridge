@@ -26,8 +26,17 @@
 //                 that kills the driver (SIGFPE, SIGSEGV, ...) is recorded as failed ("MODULE CRASH") and the pass
 //                 goes on. A crashed batch is bisected to the module. Children run one after the other and share
 //                 cache.bin. Not compatible with --stats.
+//   --inflight-file F  keep the modules that are in the driver in F, one "name<TAB>phase" line each (phase: module
+//                 while vkCreateShaderModule runs, pipeline while its pipeline is created), so whoever ran the check
+//                 can tell which module was there when the process died. F is rewritten when a module over
+//                 --large-module-bytes enters or leaves the driver (it is alone then, so F names exactly it) and by
+//                 the 5 s watchdog for the others, and emptied at the end. make_game.py's pipelines stage reads it.
+//   --skip-file F modules named in F (one per line) are not compiled: each is reported as MODULE CRASH and counted
+//                 as a failed pipeline, as --isolate does for a module that killed the driver. make_game.py writes F
+//                 after a crash, so the next run checks everything else instead of dying on the same module.
 //   test hook     VK_PIPELINE_CHECK_SIMULATE_CRASH=<module name substring>[:SIGNAL] raises SIGNAL (default SIGFPE)
-//                 just before the pipeline of a matching module is created. Only for testing --isolate.
+//                 just before the pipeline of a matching module is created. For testing --isolate and the
+//                 pipelines stage's retry.
 #include "vulkan_loader.h"
 #include "vk_device_pick.h"
 #include "pipeline_cache_file.h"
@@ -78,6 +87,7 @@ struct ShaderMeta {
     bool writes_depth = false;
     bool needs_maintenance8 = false;
     std::vector<std::string> features;
+    std::vector<std::string> float_controls;   // VkPhysicalDeviceFloatControlsProperties members that must be true
     std::vector<uint32_t> inputs;
     std::vector<uint32_t> outputs;
     std::vector<uint32_t> params;
@@ -278,6 +288,7 @@ struct JsonParser {
             else if (k == "writes_depth") m.writes_depth = parse_bool();
             else if (k == "needs_maintenance8") m.needs_maintenance8 = parse_bool();
             else if (k == "features") m.features = parse_str_array();
+            else if (k == "float_controls") m.float_controls = parse_str_array();
             else if (k == "inputs") m.inputs = parse_u32_array();
             else if (k == "outputs") m.outputs = parse_u32_array();
             else if (k == "params") m.params = parse_u32_array();
@@ -296,25 +307,37 @@ struct JsonParser {
     }
 };
 
-std::map<std::string, ShaderMeta> read_index(const std::string& path, std::string& err) {
+std::map<std::string, ShaderMeta> read_index(const std::string& path, std::string& err, bool& unreadable) {
     std::ifstream f(path, std::ios::binary);
     std::map<std::string, ShaderMeta> out;
-    if (!f) { err = "cannot open the file"; return out; }   // a missing index must not read as an empty corpus
-    std::string s((std::istreambuf_iterator<char>(f)), {});
-    if (f.bad()) { err = "read error"; return out; }
+    unreadable = false;
+    if (!f) { err = "cannot open the file"; unreadable = true; return out; }   // a missing index must not read as an empty corpus
+    // Read with read() so that a failure shows in the stream state (istreambuf_iterator bypasses it).
+    f.seekg(0, std::ios::end);
+    const std::streamoff size = f.tellg();
+    f.seekg(0, std::ios::beg);
+    if (!f || size < 0) { err = "cannot determine the file size"; unreadable = true; return out; }
+    std::string s(static_cast<size_t>(size), '\0');
+    if (size > 0 && (!f.read(s.data(), size) || f.gcount() != size)) { err = "read error"; unreadable = true; return out; }
     JsonParser p{s, 0};
     p.ws();
     if (p.i >= s.size()) { err = "the file is empty (an intentionally empty index is {})"; return out; }
     if (!p.consume('{')) { err = "expected '{' at byte " + std::to_string(p.i); return out; }
+    // After the closing '}' only whitespace may remain ({}garbage is malformed).
+    auto closed = [&] {
+        p.ws();
+        if (p.i != s.size()) { err = "unexpected data after the top-level object at byte " + std::to_string(p.i); return std::map<std::string, ShaderMeta>{}; }
+        return std::move(out);
+    };
     while (!p.error && p.i < s.size()) {
-        if (p.consume('}')) return out;
+        if (p.consume('}')) return closed();
         const size_t before = p.i;
         std::string name = p.parse_string();
         if (p.error) break;
         if (!p.consume(':')) { p.fail("expected ':' after shader name"); break; }
         out[name] = p.parse_meta();
         if (p.error) break;
-        if (p.consume('}')) return out;
+        if (p.consume('}')) return closed();
         if (!p.consume(',') || p.i == before) { p.fail("expected ',' or '}' in index.json"); break; }
     }
     if (p.error) { err = p.error_msg; return {}; }
@@ -362,6 +385,7 @@ struct StageStats {
     uint32_t pipes_ok = 0;
     uint32_t pipes_bad = 0;
     uint32_t pipes_skipped = 0;
+    uint32_t crash_skipped = 0;  // --skip-file: counted in pipes_bad, not compiled
     uint32_t w32_ok = 0;
     uint32_t w32_bad = 0;
     uint32_t w32_unforced = 0;
@@ -517,11 +541,12 @@ int main(int argc, char** argv) {
         std::fprintf(stderr,
             "usage: vk_pipeline_check <spirv dir> [cache.bin] [--jobs N] [--start I] [--count N] [--slow SEC] "
             "[--max-bytes N] [--large-module-bytes N] [--stage all|cs|graphics | --compute-only | --graphics-only] "
-            "[--stats FILE] [--cache-feedback] [--isolate [--isolate-batch N]]\n");
+            "[--stats FILE] [--cache-feedback] [--isolate [--isolate-batch N]] [--inflight-file F] "
+            "[--skip-file F]\n");
         return 2;
     }
     std::setvbuf(stdout, nullptr, _IOLBF, 1 << 16);   // failures reach a redirected log as they happen
-    std::string dir = argv[1], cache_path, stats_path;
+    std::string dir = argv[1], cache_path, stats_path, inflight_path, skip_path;
     uint32_t jobs = std::max(1u, std::thread::hardware_concurrency() / 2);
     size_t start = 0, count = 0, max_bytes = 0;
     size_t large_module_bytes = 4 * 1024 * 1024;
@@ -555,6 +580,8 @@ int main(int argc, char** argv) {
         else if (a == "--max-bytes") valid = number(max_bytes);
         else if (a == "--large-module-bytes") valid = number(large_module_bytes);
         else if (a == "--stats") valid = !(stats_path = value()).empty();
+        else if (a == "--inflight-file") valid = !(inflight_path = value()).empty();
+        else if (a == "--skip-file") valid = !(skip_path = value()).empty();
         else if (a == "--cache-feedback") cache_feedback = true;
         else if (a == "--isolate") isolate = true;
         else if (a == "--isolate-child") iso_child = true;   // internal: the parent's child runs
@@ -562,7 +589,15 @@ int main(int argc, char** argv) {
             valid = number(isolate_batch);
             isolate_batch = std::max<size_t>(1, isolate_batch);
         }
-        else cache_path = a;
+        else if (a.starts_with("--")) {   // not a cache path: an option this build doesn't know
+            std::fprintf(stderr, "unknown option %s\n", a.c_str());
+            return 2;
+        } else if (cache_path.empty()) cache_path = a;
+        else {
+            std::fprintf(stderr, "unexpected argument %s (the cache path is already %s)\n", a.c_str(),
+                         cache_path.c_str());
+            return 2;
+        }
         if (!valid) {
             std::fprintf(stderr, "%s requires a valid value\n", a.c_str());
             return 2;
@@ -584,10 +619,25 @@ int main(int argc, char** argv) {
     }
 #endif
 
+    std::set<std::string> skip_names;   // --skip-file: modules that killed the driver in an earlier run
+    if (!skip_path.empty()) {
+        std::ifstream sf(skip_path);
+        if (!sf) {
+            std::fprintf(stderr, "error: cannot read --skip-file %s\n", skip_path.c_str());
+            return 2;
+        }
+        for (std::string line; std::getline(sf, line);) {
+            while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) line.pop_back();
+            if (!line.empty()) skip_names.insert(line);
+        }
+    }
+
     std::string index_err;
-    auto index = read_index(dir + "/index.json", index_err);
+    bool index_unreadable = false;
+    auto index = read_index(dir + "/index.json", index_err, index_unreadable);
     if (!index_err.empty()) {
-        std::fprintf(stderr, "error: cannot use %s/index.json: %s\n", dir.c_str(), index_err.c_str());
+        std::fprintf(stderr, index_unreadable ? "error: cannot read %s/index.json: %s\n" : "error: malformed JSON in %s/index.json: %s\n",
+                     dir.c_str(), index_err.c_str());
         return 2;
     }
     std::fprintf(stderr, "%zu shaders in index\n", index.size());
@@ -615,6 +665,7 @@ int main(int argc, char** argv) {
                                          "--max-bytes", std::to_string(max_bytes),
                                          "--large-module-bytes", std::to_string(large_module_bytes)};
         if (cache_feedback) pass.push_back("--cache-feedback");
+        if (!skip_path.empty()) pass.insert(pass.end(), {"--skip-file", skip_path});
         struct Agg { uint32_t mod_ok = 0, mod_bad = 0, pipe_ok = 0, pipe_bad = 0, pipe_skip = 0, big = 0, crashed = 0, fb[3] = {}; };
         std::map<std::string, Agg> agg;
         std::vector<std::string> crashes;
@@ -753,8 +804,10 @@ int main(int argc, char** argv) {
     }
     VkPhysicalDeviceProperties props; vkGetPhysicalDeviceProperties(pd, &props);
     VkPhysicalDeviceSubgroupSizeControlProperties sgProps{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES};
+    VkPhysicalDeviceFloatControlsProperties fcProps{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FLOAT_CONTROLS_PROPERTIES};
     VkPhysicalDeviceProperties2 props2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
     props2.pNext = &sgProps;
+    sgProps.pNext = &fcProps;
     vkGetPhysicalDeviceProperties2(pd, &props2);
     std::fprintf(stderr, "device: %s (subgroup %u..%u)\n", props.deviceName, sgProps.minSubgroupSize, sgProps.maxSubgroupSize);
 
@@ -875,6 +928,14 @@ int main(int argc, char** argv) {
             return "no VK_KHR_maintenance8";
 #endif
         }
+        // Execution modes the translator declares (SignedZeroInfNanPreserve 32) need a device property, not a feature.
+        for (const auto& fc : meta.float_controls) {
+            if (fc == "shaderSignedZeroInfNanPreserveFloat32") {
+                if (!fcProps.shaderSignedZeroInfNanPreserveFloat32) return "no " + fc;
+            } else {
+                return "unknown float control " + fc;
+            }
+        }
         for (const auto& feat : meta.features) {
             if (feat == "meshShader" && !(ext_mesh && mesh.meshShader)) return "no VK_EXT_mesh_shader";
             if (feat == "geometryShader" && !f2.features.geometryShader) return "no geometryShader";
@@ -964,7 +1025,22 @@ int main(int argc, char** argv) {
     std::map<std::string, VkShaderModule> stub_cache;
     std::atomic<size_t> next{0}, done{0};
     std::atomic<uint32_t> total_pipes_done{0};
-    std::map<std::thread::id, std::pair<std::string, std::chrono::steady_clock::time_point>> inflight;
+    // What each worker is doing in the driver: creating the shader module, then creating its pipeline.
+    struct InFlight {
+        std::string name;
+        std::chrono::steady_clock::time_point since;
+        const char* phase;   // "module" or "pipeline"
+    };
+    std::map<std::thread::id, InFlight> inflight;
+    // --inflight-file: rewrite the file from `inflight`, one "name<TAB>phase" line per module. Called with mu held, at
+    // the moments named in the header.
+    auto write_inflight = [&] {
+        if (inflight_path.empty()) return;
+        if (std::FILE* f = std::fopen(inflight_path.c_str(), "w")) {
+            for (const auto& [tid, job] : inflight) std::fprintf(f, "%s\t%s\n", job.name.c_str(), job.phase);
+            std::fclose(f);
+        }
+    };
     const auto t_start = std::chrono::steady_clock::now();
     auto elapsed = [&] { return std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count(); };
 
@@ -1034,6 +1110,7 @@ int main(int argc, char** argv) {
                            VkResult r, double sec, VkPipelineCreationFeedbackFlags fb_flags) {
         std::lock_guard<std::mutex> g(mu);
         inflight.erase(std::this_thread::get_id());
+        if (inflight.empty()) write_inflight();   // a large module just finished (it compiles alone)
         auto& st = stats[stage];
         st.seconds += sec;
         if (sec > st.max_sec) { st.max_sec = sec; st.max_name = name; }
@@ -1068,6 +1145,18 @@ int main(int argc, char** argv) {
             const std::string& name = *work[k].first;
             const ShaderMeta& meta = *work[k].second;
             const std::string& stage = meta.stage;
+            if (skip_names.count(name)) {   // --skip-file: it killed the driver in an earlier run
+                {
+                    std::lock_guard<std::mutex> g(mu);
+                    auto& st = stats[stage];
+                    st.pipes_bad++;
+                    st.crash_skipped++;
+                    std::printf("MODULE CRASH %s (%s, killed the driver in an earlier run; not retried)\n",
+                                name.c_str(), stage.c_str());
+                }
+                ++done;
+                continue;
+            }
             std::ifstream f(dir + "/" + name + ".spv", std::ios::binary | std::ios::ate);
             const std::streamoff file_size = f.tellg();
             if (max_bytes && std::cmp_greater(file_size, max_bytes)) {   // multi-MB ray-tracing shaders (#108)
@@ -1095,6 +1184,11 @@ int main(int argc, char** argv) {
             std::shared_lock parallel(compile_gate, std::defer_lock);
             if (isolated) exclusive.lock();
             else if (large_module_bytes) parallel.lock();
+            {   // in flight from here: vkCreateShaderModule can also take long or die in the driver
+                std::lock_guard<std::mutex> g(mu);
+                inflight[std::this_thread::get_id()] = {name, std::chrono::steady_clock::now(), "module"};
+                if (isolated) write_inflight();   // alone in flight: the file names exactly this module
+            }
 
             f.seekg(0);
             std::vector<char> code((std::istreambuf_iterator<char>(f)), {});
@@ -1132,7 +1226,11 @@ int main(int argc, char** argv) {
                         VK_STRUCTURE_TYPE_PIPELINE_CREATION_FEEDBACK_CREATE_INFO, nullptr, &fb, 0, nullptr};
                     if (feedback) cpi.pNext = &fci;
                     const auto t0 = std::chrono::steady_clock::now();
-                    { std::lock_guard<std::mutex> g(mu); inflight[std::this_thread::get_id()] = {name, t0}; }
+                    {
+                        std::lock_guard<std::mutex> g(mu);
+                        inflight[std::this_thread::get_id()] = {name, t0, "pipeline"};
+                        if (isolated) write_inflight();   // alone in flight: the file names exactly this module
+                    }
                     VkPipeline p = VK_NULL_HANDLE;
                     maybe_simulate_crash(name);
                     VkResult r = vkCreateComputePipelines(dev, cache, 1, &cpi, nullptr, &p);
@@ -1302,7 +1400,11 @@ int main(int argc, char** argv) {
                         if (feedback) gpci.pNext = &fci;  // keeps rend chained behind it
 
                         const auto t0 = std::chrono::steady_clock::now();
-                        { std::lock_guard<std::mutex> g(mu); inflight[std::this_thread::get_id()] = {name, t0}; }
+                        {
+                            std::lock_guard<std::mutex> g(mu);
+                            inflight[std::this_thread::get_id()] = {name, t0, "pipeline"};
+                            if (isolated) write_inflight();   // alone in flight: the file names exactly this module
+                        }
                         VkPipeline p = VK_NULL_HANDLE;
                         maybe_simulate_crash(name);
                         VkResult r = vkCreateGraphicsPipelines(dev, cache, 1, &gpci, nullptr, &p);
@@ -1316,6 +1418,10 @@ int main(int argc, char** argv) {
                 record_skip(name, stage, "unsupported stage " + stage);
             }
             if (sm) vkDestroyShaderModule(dev, sm, nullptr);
+            {   // out of the driver on every path (a pipeline, a skip, a failed module)
+                std::lock_guard<std::mutex> g(mu);
+                if (inflight.erase(std::this_thread::get_id()) && inflight.empty()) write_inflight();
+            }
             if (++done % 1000 == 0) {
                 std::lock_guard<std::mutex> g(mu);
                 std::fprintf(stderr, "  %zu/%zu (%.0fs)\n", size_t(done), work.size(), elapsed());
@@ -1335,9 +1441,13 @@ int main(int argc, char** argv) {
         while (!all_done) {
             if (watch_cv.wait_for(g, std::chrono::seconds(5), [&] { return all_done; })) break;
             const auto now = std::chrono::steady_clock::now();
+            write_inflight();   // --inflight-file: the modules compiling right now
             for (auto& [tid, job] : inflight) {
-                const double s = std::chrono::duration<double>(now - job.second).count();
-                if (s > 60 && int(s) % 60 < 5) std::fprintf(stderr, "  still compiling %s after %.0fs\n", job.first.c_str(), s);
+                const double s = std::chrono::duration<double>(now - job.since).count();
+                if (s > 60 && int(s) % 60 < 5)
+                    std::fprintf(stderr, "  still %s %s after %.0fs\n",
+                                 job.phase[0] == 'm' ? "creating the shader module of" : "compiling",
+                                 job.name.c_str(), s);
             }
             if (now - last_save > std::chrono::minutes(10)) {
                 g.unlock();
@@ -1351,6 +1461,8 @@ int main(int argc, char** argv) {
     {
         std::lock_guard<std::mutex> g(mu);
         all_done = true;
+        inflight.clear();
+        write_inflight();   // the pass finished: nothing was compiling when the process ended
     }
     watch_cv.notify_one();
     watch.join();
@@ -1390,6 +1502,9 @@ int main(int argc, char** argv) {
             if (cache_feedback)
                 std::printf("  %s cache feedback: %u hits, %u no hit reported, %u unavailable\n",
                             st.c_str(), s.feedback[0], s.feedback[1], s.feedback[2]);
+            if (s.crash_skipped)
+                std::printf("  %s not retried after killing the driver (--skip-file): %u (counted as failed)\n",
+                            st.c_str(), s.crash_skipped);
             if (!s.skip_reasons.empty()) {
                 for (const auto& [reason, cnt] : s.skip_reasons)
                     std::printf("  %s skipped (%s): %u\n", st.c_str(), reason.c_str(), cnt);

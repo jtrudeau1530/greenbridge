@@ -864,10 +864,54 @@ aggregate counts, sizes and schema/category names belong in git, issues or pull 
 synthetic data; CI never reads a game folder. This is the same rule as `AGENTS.md` and `CONTRIBUTING.md`, and
 it applies to this note as well.
 
+## Streaming reader (`tools/gamedata_reader.py`, ASSET-139)
+
+`tools/gamedata_reader.py` reads the carved documents with `iterparse` and turns each into plain Python values,
+without a schema per tag. Each top-level field is converted when its end tag arrives and then dropped, so memory is
+bounded by the largest field. The generic conversion follows the parser's own conventions:
+
+- `value=` is a scalar: bool, decimal or `0x` integer, float (a C `f` suffix allowed), else text.
+- `x/y/z/w` is a vector tuple.
+- `content=` is the array body. `short_array`, `float_array` and `float16_array` give number lists;
+  `vector2_array`, `vec3v_array`, `matrix33` and `matrix34` give tuples.
+- `type="Class"` is a polymorphic object `{"$type": ...}`, and `type="NULL"` is `None`.
+- `ref=` is `{"$ref": ...}`.
+- All-`Item` children are a list, or a dict when every one carries `key=`. A repeated tag is a list. A text-only
+  element is its text. Any other attribute is kept as `"@name"`.
+
+`register_root(tag)` and `register_type(name)` plug in a handler where a schema is known. Everything else stays
+generic.
+
+```
+python -I tools/gamedata_reader.py <work>/common [--root TAG] [--out DIR]   # counts; --out: one JSON per document (local only)
+```
+
+On the 1.0.2.1 carve of `common.rpf` the run takes about 5 s, with 0 conversion errors:
+
+| | count |
+|---|---:|
+| documents read | 259 of the 267 payloads |
+| roots | 111 |
+| not well-formed (the tail-only and incomplete carves counted above) | 8 |
+| scalars | 84,585 |
+| vectors | 20,825 |
+| arrays | 13,449 |
+| lists | 13,465 |
+| keyed maps | 526 |
+| polymorphic objects | 6,490 (317 `type` classes over 6,903 typed elements) |
+| `NULL` pointers | 278 |
+| references | 924 |
+| elements with extra attributes | 5,262 |
+
+The 7 roots missing from the 118 occur only in documents that are not well-formed. Counts only: the JSON that
+`--out` writes is the game's data and stays local. `tests/test_gamedata_reader.py` checks every convention,
+both dispatch tables, that streaming equals a whole-tree conversion, and the CLI, on synthetic XML.
+
 ## Next step
 
-The most useful next step is a **schema bridge**, not more carving: check whether the 118 XML root tags match
-RTTI class names in the executable, then build a streaming reader that dispatches on root and `type`. That
-turns the measured XML into the runtime's config layer without hand-writing 5,293 tags. The `MHIU`/`PAMH`
+The most useful next step is the other half of the **schema bridge**: check whether the 118 XML root tags (and the
+317 `type` classes) match RTTI class names in the executable, then register typed handlers for them in
+`tools/gamedata_reader.py`. That turns the measured XML into the runtime's config layer without hand-writing 5,293
+tags. The streaming reader that dispatches on root and `type` exists now (above). The `MHIU`/`PAMH`
 heightmaps are decoded by `tools/gamedata_maps.py`; every MHIU header field is identified (0x28 is the
 default height), and the row-table layouts and the value-to-Z mapping are measured.

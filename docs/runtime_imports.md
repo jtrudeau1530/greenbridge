@@ -95,9 +95,22 @@ and the `api-ms-win-core-file-*` sets a GDK title links against.
 - A path that climbs above `GAME:` with `..`, or names another drive, fails with `ERROR_INVALID_NAME`, so a title
   cannot reach outside the package and the overlay.
 
-`runtime/test/file_system_test.cpp` (ctest `file_system`) covers this over folders it makes in `%TEMP%`. Not mapped
-yet: `CreateDirectory*`/`RemoveDirectory*`, `MoveFile*`, `CopyFile*` and `SetFileAttributes*`; a title that makes a
-folder through them gets the host's error for a name like `GAME:\...`.
+- `CreateDirectory*` makes the folder in the overlay. A name the title can already see, including a folder only the
+  package has, fails with `ERROR_ALREADY_EXISTS`; a missing parent with `ERROR_PATH_NOT_FOUND`.
+- `RemoveDirectory*` needs the folder empty in the title's view (`ERROR_DIR_NOT_EMPTY` otherwise). An overlay folder is
+  removed; a package folder is hidden by a `.gta6rt-dir` marker inside its marker folder, and stays on disk. A marker
+  folder on its own (left by a file deleted below it) does not hide anything.
+- `MoveFile*` writes the destination in the overlay. A package file is copied there and its old name deleted by a
+  marker; an overlay file or an overlay-only folder is renamed. An existing destination needs
+  `MOVEFILE_REPLACE_EXISTING` even when only the package has it. Moving a package folder fails with
+  `ERROR_ACCESS_DENIED` (as deleting one does), a move between `GAME:` and a host path with `ERROR_NOT_SAME_DEVICE`, and
+  `MOVEFILE_DELAY_UNTIL_REBOOT` with `ERROR_INVALID_PARAMETER`.
+- `CopyFile`, `CopyFileEx` and `CopyFile2` read the source the way a read does and write a `GAME:` destination in the
+  overlay; fail-if-exists counts a name only the package has. Either side can be a host path.
+- `SetFileAttributes*` sets the attributes on the overlay copy, copying a package file up (or mirroring a package
+  folder) first, so the package keeps its own.
+
+`runtime/test/file_system_test.cpp` (ctest `file_system`) covers this over folders it makes in `%TEMP%`.
 
 ## When an unimplemented import is called
 
@@ -141,10 +154,10 @@ pseudo-handle, and `GetProcAddress` on it resolves through the registry. A name 
 with `ERROR_PROC_NOT_FOUND` and is logged once. Every other module goes to the host unchanged.
 
 `runtime/shims/xgameruntime.cpp` serves the five entry points. The initializers succeed offline and log the GDK
-version and mode once. `QueryApiImpl` serves `XThreadingImpl` and `XErrorImpl` (below); for any other class it logs
-the class and interface id and returns `0x80070032`, the documented error for a class the runtime doesn't provide, so
-the first boot with the executable lists the classes to implement next. `xgameruntime_test` drives this path through
-the api-set binding `XCurl.dll` uses, and calls the two classes slot by slot.
+version and mode once. `QueryApiImpl` serves `XThreadingImpl`, `XErrorImpl` and `XNetworkingImpl` (below); for any
+other class it logs the class and interface id and returns `0x80070032`, the documented error for a class the runtime
+doesn't provide, so the first boot with the executable lists the classes to implement next. `xgameruntime_test` drives
+this path through the api-set binding `XCurl.dll` uses, and calls the served classes slot by slot.
 
 ### Class layouts, measured
 
@@ -162,11 +175,13 @@ count and width, the function at that position of xgameruntime-docs' "Layout" li
 |---|---|---|
 | `XThreadingImpl` (`IXThreadingImpl`, 28 methods, slots 3-30) | 3-7 and 9-30 (`libHttpClient.GDK.dll`), 3, 5, 12, 16-18, 22, 29 (`XCurl.dll`) | e.g. 7 `XAsyncBegin` (5 args), 9 `XAsyncSchedule` (pointer, 32-bit), 10 `XAsyncComplete` (pointer, HRESULT, size), 12 `XTaskQueueCreate` (two 32-bit modes, pointer), 16 `XTaskQueueDispatch` (returns a byte), 19 `XTaskQueueSubmitDelayedCallback` (5 args), 22 `XTaskQueueTerminate` (pointer, bool, two pointers), 27 `XThreadSetTimeSensitive` (bool), 30 `XThreadIsTimeSensitive` (returns a byte). Slot 8 (`XAsyncBeginAlloc`, private) is never called; slot 28 (`XTaskQueueIsEmpty`, private) takes no arguments |
 | `XErrorImpl` (`IXErrorImpl`, slots 3-5) | 3 (`XCurl.dll`) | slot 3, the docs' `_unknown_`, takes an HRESULT and a pointer: `XErrorReport(HRESULT, const char*)` |
-| `XNetworkingImpl` (`IXNetworkingImpl2`, slots 3-20) | 11-17 (`XCurl.dll`) | the Utf16 `XNetworkingQuerySecurityInformationForUrl*` trio, `XNetworkingVerifyServerCertificate`, `XNetworkingGetConnectivityHint`, `XNetworkingRegister/UnregisterConnectivityHintChanged` (pointer, bool). Not served yet |
+| `XNetworkingImpl` (`IXNetworkingImpl2`, slots 3-20) | 11-17 (`XCurl.dll`) | the Utf16 `XNetworkingQuerySecurityInformationForUrl*` trio, `XNetworkingVerifyServerCertificate`, `XNetworkingGetConnectivityHint`, `XNetworkingRegister/UnregisterConnectivityHintChanged` (pointer, bool) |
 
 `XThreadingImpl` forwards each slot to `third_party/xtaskqueue`, the same implementation the named exports use;
 `XThreadSetTimeSensitive`/`XThreadIsTimeSensitive` keep a per-thread flag and the two private slots log once and
-answer 0. `XErrorImpl` logs each report and hands it to the callback `XErrorSetCallback` set.
+answer 0. `XErrorImpl` logs each report and hands it to the callback `XErrorSetCallback` set. `XNetworkingImpl`
+reports an initialized network with unrestricted internet access for connectivity hints offline, succeeds certificate
+verification, and tracks hint-change registration tokens.
 
 Which classes the package's GDK modules reference, from a byte search for the class and interface GUIDs that
 xgameruntime-docs lists (16-byte in-memory form, every `.dll` of the package; counts only, nothing else read):

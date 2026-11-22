@@ -51,6 +51,24 @@ tables or comments into Leonida. If a format fact learned from it is useful, ver
 write our own implementation. The model-recovery gap measured in [models.md](models.md) is in that submodule; the
 fix should go upstream, not into a copy.
 
+## meetox80/6stars
+
+<https://github.com/meetox80/6stars> — a macOS Swift/Metal engine that renders the world out of RPF9,
+with a Swift `RPFKit` format library and 44 Python research scripts. Independent work: it likewise
+does not decode the TOC.
+
+**Licence: none.** The repository has no `LICENSE` file (GitHub reports `license: null`); only the
+vendored cimgui/imgui carry MIT. With no grant, default copyright applies and the project is
+**all rights reserved** — stricter than PercyStar. **No 6stars code, comment, identifier or table may
+be copied into Leonida.**
+
+**What we use it for:** corroboration and a small number of hypotheses. As an independent reading of
+the same formats it matches our `CEntityDef` member hashes (9/9), the PRD0 header, the navmesh tile
+header, the meshlet group header and the PSIN/LSCH field layout. Its stream-role predicates and
+navmesh surface bits are recorded as hypotheses and tested from our own package, never copied.
+Where it disagrees with us (ETPF format and tile mode, the RDS5 codec field, `atArray` type `0x5C`,
+PSO member hashing) our measurements are the validated ones.
+
 ## p-portela/SCARAB
 
 <https://github.com/p-portela/SCARAB>

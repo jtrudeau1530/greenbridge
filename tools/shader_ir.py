@@ -192,6 +192,12 @@ def parse_line(line):
     if parts and len(parts[0].split()) == 2:
         parts = parts[0].split() + parts[1:]
     args = [operand(a) for a in parts]
+    if op.startswith(("v_add_f64", "v_cvt_f32_f64")):
+        for src, spelling in zip(args[1:], parts[1:]):
+            # LLVM prints inline integers in decimal and the separate literal dword in hex,
+            # even for two sources with the same numeric value (e.g. 0x1 and 1).
+            if src["k"] == "imm" and ("0x" in spelling or not -16 <= src["v"] <= 64):
+                src["f64_literal"] = True
     return {"op": op, "args": args, "mods": mods, "enc": enc.hex() if enc else None}
 
 
