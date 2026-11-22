@@ -13,7 +13,7 @@ A language is added when a contributor volunteers to maintain it and keeps the s
 | Language | File | Synced commit | Maintainer |
 |---|---|---|---|
 | Français (`fr`) | [`fr/quickstart.md`](fr/quickstart.md) | `e7584c52` | `@Urban225` |
-| Português (Brasil) (`pt-BR`) | [`pt-BR/quickstart.md`](pt-BR/quickstart.md) | `16282101` | `@Andretuta` |
+| Português (Brasil) (`pt-BR`) | [`pt-BR/quickstart.md`](pt-BR/quickstart.md) | `f847748c` | `@Andretuta` |
 | 简体中文 (`zh-CN`) | [`zh-CN/quickstart.md`](zh-CN/quickstart.md) | `003e7812` | `@liang-kai-shui` |
 | Polski (Polish) (`pl-PL`) | [`pl-PL/quickstart.md`](pl-PL/quickstart.md) | `c0ac5fd6` | `@Dom-in` |
 | Türkçe (`tr`) | [`tr/quickstart.md`](tr/quickstart.md) | `f85582e` | `@emirhan-karaca` |
