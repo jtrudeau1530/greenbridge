@@ -607,7 +607,7 @@ if(TARGET Vulkan::Headers)
       COMMAND "${Python3_EXECUTABLE}" -I ${CMAKE_CURRENT_SOURCE_DIR}/../tools/gen_d3d12_stubs.py --out ${LEONIDA_STUBS}
               ${_stubs_header}
               ID3D12GraphicsCommandList8 ID3D12CommandQueue ID3D12CommandAllocator ID3D12Fence1
-              ID3D12Device11 ID3D12DescriptorHeap ID3D12Resource ID3D12QueryHeap
+              ID3D12Device11 ID3D12DescriptorHeap ID3D12Resource ID3D12QueryHeap ID3D12CommandSignature
       DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/../tools/gen_d3d12_stubs.py ${LEONIDA_D3D12_HEADER}
       COMMENT "Generating D3D12 COM stubs"
       VERBATIM)
@@ -755,6 +755,44 @@ if(TARGET Vulkan::Headers)
     target_link_libraries(dxgi_swapchain_test PRIVATE gta6rt_d3d12_com)
     target_compile_definitions(dxgi_swapchain_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(dxgi_swapchain_test PRIVATE /W4 /permissive- /utf-8)
+
+    # ExecuteIndirect with CountBuffer (vkCmdDrawIndirectCount) + optional BLAS/TLAS/RayQueryKHR GPU test.
+    add_executable(d3d12_indirect_rt_test test/d3d12_indirect_rt_test.cpp)
+    target_link_libraries(d3d12_indirect_rt_test PRIVATE gta6rt_d3d12_com)
+    target_compile_definitions(d3d12_indirect_rt_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_indirect_rt_test PRIVATE /W4 /permissive- /utf-8)
+    if(Vulkan_GLSLANG_VALIDATOR_EXECUTABLE)
+      set(LEONIDA_TEST_VS_TRI ${CMAKE_CURRENT_BINARY_DIR}/generated/vs_tri.spv)
+      set(LEONIDA_TEST_FS_SOLID ${CMAKE_CURRENT_BINARY_DIR}/generated/fs_solid.spv)
+      set(LEONIDA_TEST_CS_RAYQUERY ${CMAKE_CURRENT_BINARY_DIR}/generated/cs_rayquery.spv)
+      add_custom_command(
+        OUTPUT ${LEONIDA_TEST_VS_TRI}
+        COMMAND ${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE} -V --target-env vulkan1.3 -o ${LEONIDA_TEST_VS_TRI}
+                ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/vs_tri.vert
+        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/vs_tri.vert
+        COMMENT "Compiling vs_tri.vert"
+        VERBATIM)
+      add_custom_command(
+        OUTPUT ${LEONIDA_TEST_FS_SOLID}
+        COMMAND ${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE} -V --target-env vulkan1.3 -o ${LEONIDA_TEST_FS_SOLID}
+                ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/fs_solid.frag
+        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/fs_solid.frag
+        COMMENT "Compiling fs_solid.frag"
+        VERBATIM)
+      add_custom_command(
+        OUTPUT ${LEONIDA_TEST_CS_RAYQUERY}
+        COMMAND ${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE} -V --target-env vulkan1.3 -o ${LEONIDA_TEST_CS_RAYQUERY}
+                ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/cs_rayquery.comp
+        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/cs_rayquery.comp
+        COMMENT "Compiling cs_rayquery.comp"
+        VERBATIM)
+      target_sources(d3d12_indirect_rt_test PRIVATE
+                     ${LEONIDA_TEST_VS_TRI} ${LEONIDA_TEST_FS_SOLID} ${LEONIDA_TEST_CS_RAYQUERY})
+      target_compile_definitions(d3d12_indirect_rt_test PRIVATE
+        LEONIDA_TEST_VS_TRI_SPV="${LEONIDA_TEST_VS_TRI}"
+        LEONIDA_TEST_FS_SOLID_SPV="${LEONIDA_TEST_FS_SOLID}"
+        LEONIDA_TEST_CS_RAYQUERY_SPV="${LEONIDA_TEST_CS_RAYQUERY}")
+    endif()
 
     # The loader can create this device instead of the host's (D3D12XboxCreateDevice, LEONIDA_D3D12=vulkan).
     if(TARGET gta6rt)
