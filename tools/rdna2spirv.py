@@ -197,6 +197,8 @@ class Gen:
         self.fixed_format_codes = set()  # static tbuffer/fixed format codes seen (validated against FORMATS)
         self.frag_inputs = {}      # PS: VGPR -> gl_FragCoord component, from the verified system-VGPR layout
         self.pixel_interpolants = None  # PS: (count, fp16_mask) from the FSSM pixel-input table; None = no table
+        self.v_interp_copy = {}   # PS: vgpr -> (root barycentric register v0/v1, program-order index of its
+                                  # single defining plain v_mov of it); valid I/J sources (SHADER-177)
         self.blocks = []      # per basic block: list of SPIR-V lines (dispatch-loop form), empty = straight-line
         self.succ = []        # per basic block: the blocks it can go to next (none = the program ends there)
         self.desc_fn = None   # lines of the descriptor-lookup function, once an instruction needs it
@@ -4975,6 +4977,13 @@ class Gen:
             attr = next((x for x in a if x["k"] == "attr"), None)
             if attr is None or self.stage != "ps":
                 raise Unsupported(op + " form")
+            if op == "v_interp_mov_f32":
+                sel = a[1] if len(a) > 1 else None
+                if not (sel and sel.get("k") == "interp" and sel.get("t") == "p0"):
+                    what = sel.get("t") if sel is not None and sel.get("k") == "interp" else "operand"
+                    raise Unsupported(f"v_interp_mov_f32 vertex select {what}: only p0 is modelled")
+            else:
+                self.interp_pair_src(op, a, ins)
             f = self.attribute(attr["a"], attr["c"], flat=op == "v_interp_mov_f32")
             if self.pixel_interpolants is not None and (self.pixel_interpolants[1] >> attr["a"]) & 1:
                 # 16-bit interpolant (FSSM table flag bit 4) read through a 32-bit op: the stored value only
@@ -5206,8 +5215,9 @@ class Gen:
             attr = next((x for x in a if x["k"] == "attr"), None)
             if attr is None or self.stage != "ps":
                 raise Unsupported(op + " form")
+            self.interp_pair_src(op, a, ins)
             # `high` (on both ops of the pair) selects the upper f16 of the packed channel (Mesa ACO
-            # emit_interp_instr passes high_16bits to p1ll and p2). Under --bary-fallback there are no per-vertex
+            # emit-interp_instr passes high_16bits to p1ll and p2). Under --bary-fallback there are no per-vertex
             # inputs, so the old smooth-f32 read stands and `high` cannot be told apart (docs/design.md).
             f = self.attribute(attr["a"], attr["c"], half=1 if "high" in mods else 0)
             if op == "v_interp_p2_f16":
@@ -6616,6 +6626,21 @@ class Gen:
                 self.emit(f"{comp} = OpCompositeExtract %float {res} {c}")
                 self.dst({"k": "vgpr", "r": vdata["r"] + out, "n": 1}, self.tou(comp))
                 out += 1
+
+
+    def interp_pair_src(self, op, a, ins):
+        """SHADER-177: the VGPR source of a v_interp_p1/p2 is the barycentric coordinate that op interpolates
+        with — p1 reads I = v0, p2 reads J = v1, per op. The model returns the attribute's interpolated value,
+        which is only that when the register really holds that coordinate: the hardware register, or a plain
+        v_mov copy rooted at it (self.v_interp_copy, from interp_copy_sources, which tracks each copy's root).
+        Anything else — the other coordinate, a copy rooted at the other one — is refused, not guessed at."""
+        want, role = (0, "I") if op.startswith("v_interp_p1") else (1, "J")
+        s = a[1] if len(a) > 1 else None
+        c = self.v_interp_copy.get(s["r"]) if (s is not None and s.get("k") == "vgpr") else None
+        if not (s and s.get("k") == "vgpr" and s.get("n", 1) == 1 and
+                (s["r"] == want or (c is not None and c[0] == want and c[1] < ins.get("seq", 1 << 62)))):
+            what = f"v{s['r']}" if s is not None and s.get("k") == "vgpr" else "operand"
+            raise Unsupported(f"{op} {role} source {what}: only v{want} (or a plain v_mov copy of it) is modelled")
 
     def attribute(self, n, comp, flat=False, half=None):
         """Component `comp` of fragment input attribute n (declared as a vec4 Input at Location n).
@@ -8754,6 +8779,8 @@ def translate(path):
         size = (g.cs or g.ms)["size"]
         g.x_lanes = -(-size[0] * size[1] * size[2] // 64) * 64
     insns = fold_far_branches(insns)
+    if stage == "ps":
+        g.v_interp_copy = interp_copy_sources(insns)   # before v_interp runs: I/J guards (SHADER-177)
     branchy = any(base_op(i["op"]) in BRANCHES for i in insns)
     if not branchy and not g.emulate:
         g.park_masks(([insns], [[]]))
@@ -8922,6 +8949,45 @@ def needs_barrier_rounds(g, blocks, succ):
     top = {it[1] for it in tree if it[0] == "block"} if tree is not None else set()
     return not with_barrier <= top
 
+def interp_copy_sources(insns):
+    """SHADER-177: the VGPRs a v_interp may name as its I/J barycentric source besides v0/v1, as
+    {vgpr: (root coordinate v0/v1 the copy chain carries, program-order index of the defining instruction)}.
+    A register qualifies when its single write in the whole shader is one plain v_mov_b32 from v0/v1 — which
+    must itself be unwritten up to that point: a copy of an already-overwritten v0/v1 carries a computed value,
+    not the pair, while a write after the copy is fine (the copy saved the value) — or from another
+    qualifying register defined earlier (compilers copy the pair out of v0/v1; the corpus has one
+    shader that reads its J through such a copy). One definition means every read that is not undefined
+    garbage reads the copied barycentric
+    value, whatever the control flow. Every VGPR destination counts as a write (memory stores only
+    read their data operand; tfe's extra status VGPR is one too)."""
+    writes = {}
+    for i, ins in enumerate(insns):
+        ins["seq"] = i      # program order: also unique without encoding comments (test fixtures share a pc)
+        a = ins["args"]
+        if not (a and a[0].get("k") == "vgpr") or base_op(ins["op"]).startswith(
+                ("buffer_store", "tbuffer_store", "scratch_store", "global_store", "image_store", "ds_write")):
+            continue
+        for r in range(a[0]["r"], a[0]["r"] + a[0].get("n", 1) + (1 if "tfe" in ins["mods"] else 0)):
+            writes.setdefault(r, []).append(ins)
+    copies = {}
+    grew = True
+    while grew:      # copy chains resolve over passes: v15 = v14 after v14 = v1
+        grew = False
+        for r, ws in writes.items():
+            if r in copies or len(ws) != 1:
+                continue
+            ins = ws[0]
+            a = ins["args"]
+            s = a[1] if len(a) > 1 else None
+            plain = (base_op(ins["op"]) == "v_mov_b32" and not ins["mods"] and a[0].get("n", 1) == 1
+                     and not a[0].get("sdwa_dst")
+                     and s is not None and s.get("k") == "vgpr" and s.get("n", 1) == 1
+                     and not s.get("neg") and not s.get("abs") and not s.get("sdwa_sel"))
+            if plain and ((s["r"] in (0, 1) and not any(w["seq"] < ins["seq"] for w in writes.get(s["r"], ()))) or
+                          (s["r"] in copies and copies[s["r"]][1] < ins["seq"])):
+                copies[r] = (s["r"] if s["r"] in (0, 1) else copies[s["r"]][0], ins["seq"])
+                grew = True
+    return copies
 
 def x_spill(g, parts):
     """Emulated wave64 and barrier rounds: the segments of one block run in different rounds, i.e. in different
