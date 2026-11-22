@@ -394,6 +394,58 @@ This mapping is the strongest evidence that the codec field is the GDK's
 `DSTORAGE_BCPACK_MODE` (1 = BC1 … 7 = BC7), not a generic compression id. The field is per
 chunk, so a texture can mix zlib and BCPack mips; 15,201 partial exports do.
 
+### From a chunk entry to `bcpack.decode`
+
+`tools/bcpack.py` takes the codec as the BCPack mode (1–7), not the on-disk tag. Per codec:
+
+| Blocks | Tag in the chunk entry | `decode` codec | Lane widths in stream order (bits) | Symbols per lane per block |
+|---|---:|---:|---|---:|
+| BC1 | `0x04` | 1 | 8,8,5,6,5,5,6,5,8,8,8,8 | 1 |
+| BC3 | `0x0c` | 3 | 4,4,8,6,6,6,6,5,6,5,8,8 | 2 |
+| BC4 | `0x10` | 4 | 8,8,8,8,6,6,6,6,6,6,6,6 | 1 |
+| BC5 | `0x14` | 5 | 4,4,8,8,6,6,6,6,6,6,6,6 | 2 |
+| BC6H | `0x18` | 6 | 4,4,8,8,8,5,5,5,6,6,6,8,8,8,8,5 | 2 |
+| BC7 | `0x1c` | 7 | 4,4,8,8,8,8,8,7,7,5,6,8,8,8,8,5 | 2 |
+
+The widths are `LANE_WIDTHS` in `tools/bcpack.py`. The tag is `(v >> 24) & 0x3c`, the codec field
+above shifted left by 2; tags `0x00` (raw) and `0x20` (zlib) are not BCPack and are handled
+before it. Each lane emits `decoded_bytes / 8` symbols (`ELEMENT_BYTES = 8`), so the decoded
+byte count of the chunk must be passed as `out_size` and must be a whole number of blocks.
+
+For entry `v` and the next entry `nxt` (this is what `TtpfReader` in `tools/ttpf_mips.py` does):
+
+- input: the bytes from `(v & 0x3FFFFFF) * 256` up to `(nxt & 0x3FFFFFF) * 256 − (v >> 52)`;
+- `out_size`: `((nxt >> 30) & 0x3FFFFF) * 4096 − ((v >> 30) & 0x3FFFFF) * 4096`.
+
+The decoded blocks are still in the surface's tiled storage order; `ttpf_mips.py` detiles them
+before writing a linear DDS.
+
+A synthetic one-block BC7 chunk (no game data; the encoder is in `tests/test_bcpack.py`) with a
+byte-exact result in strict mode, which `tests/test_bcpack.py` runs as
+`test_bc7_fixed_stream_strict`:
+
+```python
+import sys
+sys.path.insert(0, "tools")
+import bcpack
+
+packed = bytes.fromhex("""
+101010101010101004040303030304040101010101010140
+000000000000024002027546281800000101df5f4b7c0341
+020202411010101004040403101010104004100103030304
+4001080001010104000000080000000041020994e4db27a4
+410511fe6b020005
+""")
+blocks, provisional = bcpack.decode_with_info(packed, 7, 16)
+assert blocks == bytes.fromhex("40 31 72 04 a5 68 19 be 02 34 56 78 9a bc de f0")
+assert not provisional   # strict mode: nothing unconfirmed was used
+```
+
+`decode_with_info` returns the set of unconfirmed history entries used; it is empty in
+strict mode, which raises `BcpackProvisionalError` instead of using one.
+(Byte-exact blocks, a clean entropy end state and a DDS with fitted colours are three
+different levels of confirmation; this example shows the first.)
+
 ### The descriptor `mode` is tiling, not codec
 
 The ETPF descriptor's `mode` field (`b >> 23`) is the mip/tile family: mode 0 uses 64 KiB
