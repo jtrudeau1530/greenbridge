@@ -817,6 +817,11 @@ struct DeviceState {
             log_once("set 0 has no array for this image type:", int(image.type));
             return false;
         }
+        const bool depth_or_stencil = (aspects & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) != 0;
+        if (storage && depth_or_stencil) {
+            log_once("storage view not supported for depth-stencil image format:", int(image_format));
+            return false;
+        }
         // A T# of 8_UINT on a depth-stencil image is a view of its stencil plane (image_descriptor, D3D-75). Vulkan
         // views it in the image's own format with the stencil aspect, and returns the value in R, as a T# whose
         // format is 8_UINT reads it from X.
@@ -829,7 +834,8 @@ struct DeviceState {
             view_format = rgb96_view_format(image_format, image.format);
             channels_format = rgb96_named_format(view_format);
         }
-        if (view_format == VK_FORMAT_UNDEFINED) {
+        if (view_format == VK_FORMAT_UNDEFINED ||
+            (depth_or_stencil && !g::is_depth_stencil_format(view_format))) {
             log_once("no Vulkan view format for the GFX10 format of a view:", int(image.format));
             return false;
         }
@@ -3148,17 +3154,31 @@ bool image_descriptor(const Resource& resource, const TextureView& view, leonida
             return false;
         }
     }
-    // The depth plane of a depth-stencil texture, as R24_UNORM_X8_TYPELESS (D24S8) or R32_FLOAT_X8X24_TYPELESS
-    // (D32S8): the texture's own depth format, whose T# code is the console's depth format (8_24_UNORM or
-    // X24_8_32_FLOAT) with the depth in R; bind_image views the depth aspect for it. As in D3D12, each view format
-    // belongs to its own family only: the other family's depth view leaves the slot null, whatever format backs the
-    // texture (a D24 texture may be D32_SFLOAT_S8_UINT underneath).
-    const DXGI_FORMAT family = desc.Format;
-    const bool d24_family = family == DXGI_FORMAT_R24G8_TYPELESS || family == DXGI_FORMAT_D24_UNORM_S8_UINT;
-    const bool d32s8_family = family == DXGI_FORMAT_R32G8X24_TYPELESS || family == DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
-    const bool depth_plane = ((view.format == DXGI_FORMAT_R24_UNORM_X8_TYPELESS && d24_family) ||
-                              (view.format == DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS && d32s8_family)) &&
-                             (resource.aspects() & VK_IMAGE_ASPECT_DEPTH_BIT);
+    // Depth and depth-stencil textures can only be viewed through their own family's depth-plane SRV format (or
+    // UNKNOWN on typed depth textures): in Vulkan a depth image's view format must equal the image's own depth
+    // format (VUID-VkImageViewCreateInfo-image-01762 / 09594), so colour view formats such as R16_FLOAT on D16 or
+    // R32_UINT on D32 must be rejected. Each view format belongs to its own DXGI family only, whatever format
+    // backs the texture (a D24 texture may be D32_SFLOAT_S8_UINT underneath).
+    const bool depth_plane = (resource.aspects() & VK_IMAGE_ASPECT_DEPTH_BIT) && !stencil;
+    if (depth_plane) {
+        const bool depth_format_fits =
+            (desc.Format == DXGI_FORMAT_D16_UNORM &&
+             (view.format == DXGI_FORMAT_UNKNOWN || view.format == DXGI_FORMAT_R16_UNORM)) ||
+            (desc.Format == DXGI_FORMAT_R16_TYPELESS && view.format == DXGI_FORMAT_R16_UNORM) ||
+            (desc.Format == DXGI_FORMAT_D32_FLOAT &&
+             (view.format == DXGI_FORMAT_UNKNOWN || view.format == DXGI_FORMAT_R32_FLOAT)) ||
+            (desc.Format == DXGI_FORMAT_R32_TYPELESS && view.format == DXGI_FORMAT_R32_FLOAT) ||
+            (desc.Format == DXGI_FORMAT_D24_UNORM_S8_UINT &&
+             (view.format == DXGI_FORMAT_UNKNOWN || view.format == DXGI_FORMAT_R24_UNORM_X8_TYPELESS)) ||
+            (desc.Format == DXGI_FORMAT_R24G8_TYPELESS && view.format == DXGI_FORMAT_R24_UNORM_X8_TYPELESS) ||
+            (desc.Format == DXGI_FORMAT_D32_FLOAT_S8X24_UINT &&
+             (view.format == DXGI_FORMAT_UNKNOWN || view.format == DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS)) ||
+            (desc.Format == DXGI_FORMAT_R32G8X24_TYPELESS && view.format == DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS);
+        if (!depth_format_fits) {
+            log_once("incompatible depth shader-resource view format:", int(view.format));
+            return false;
+        }
+    }
     if (view.format != DXGI_FORMAT_UNKNOWN && !stencil && !depth_plane) {
         if ((view.format == DXGI_FORMAT_A8_UNORM) != (desc.Format == DXGI_FORMAT_A8_UNORM)) {
             log_once("incompatible typed A8 view format:", int(view.format));
@@ -3173,6 +3193,10 @@ bool image_descriptor(const Resource& resource, const TextureView& view, leonida
             return false;
         }
         named = texture_storage_format(view.format, false).format;
+        if (g::is_depth_stencil_format(named)) {
+            log_once("depth-stencil view format on a colour texture:", int(view.format));
+            return false;
+        }
     }
     // A 96-bit texture takes views of its own family only (and a four-channel texture none of it), and only the
     // TYPELESS one is cast between FLOAT, UINT and SINT. Its T# names the three-channel format: the swizzle below
