@@ -179,7 +179,7 @@ def build_navmesh(
     poly_sizes=(3, 4),
     n_links=2,
     n_link_idx=3,
-    n_volumes=1,
+    n_volumes=2,
     water_poly=False,
     tiny_bm_cont=False,
     corrupt_checksum=False,
@@ -243,6 +243,19 @@ def build_navmesh(
     if n_volumes and not corrupt_null_vol:
         vo = alloc(96 * n_volumes)
         struct.pack_into("<Q", buf, 0xB8, BASE + vo)
+        for p in range(n_volumes // 2):
+            o0 = vo + (2 * p) * 96
+            o1 = o0 + 96
+            hdr = struct.pack("<Q3f", 0x1122334455667788 + p, x0 + 16.0, y0 + 16.0, 0.3)
+            buf[o0:o0 + 20] = hdr
+            buf[o1:o1 + 20] = hdr
+            buf[o0 + 0x14], buf[o0 + 0x15] = 0, 8
+            buf[o1 + 0x14], buf[o1 + 0x15] = 8, 4
+            struct.pack_into("<16h", buf, o0 + 0x16, 410, 616, -408, 616, -536, 488, -536, -491,
+                             -408, -619, 410, -619, 538, -491, 538, 488)
+            struct.pack_into("<8h", buf, o1 + 0x16, -408, 488, -408, -491, 410, -491, 410, 488)
+            struct.pack_into("<2H", buf, o0 + 0x56, 2006, 1095)
+            struct.pack_into("<2H", buf, o1 + 0x56, 2006, 1095)
 
     def put_split(hdr_at, stride, data_bytes, total):
         per = nd.SPLIT_BLOCK // stride
@@ -452,6 +465,8 @@ class NavmeshDecodeTest(unittest.TestCase):
         self.assertEqual(doc["0drp"]["first_node"]["id1_index_ffffffff"], 3)
         self.assertEqual(doc["navmesh"]["static_sectors"], 4)
         self.assertEqual(doc["navmesh"]["quadtree"], {"nodes": 12, "leaves": 6, "max_depth": 1})
+        self.assertEqual(doc["navmesh"]["volumes"],
+                         {"pairs": 2, "flags": {"0": 2, "8": 2}, "vertex_counts": {"4": 2, "8": 2}})
         self.assertEqual(doc["navmesh"]["water_bit3"], {"b3_0_w_0": 4, "b3_1_w_1": 2})
         self.assertEqual(doc["grid"]["sectors"], 4)
         self.assertEqual(doc["grid"]["sectors_not_in_navmesh"], 0)
@@ -523,8 +538,20 @@ class NavmeshDecodeTest(unittest.TestCase):
         self.assertEqual(cn["indices_below_vertices"]["fail"], 1)
         self.assertEqual(cn["links_in_bounds"]["fail"], 1)
         self.assertEqual(cn["volumes_in_bounds"]["fail"], 1)
+        self.assertEqual(cn["volumes_valid"]["fail"], 1)
         self.assertEqual(cn["polygons_chain"]["fail"], 1)
         self.assertEqual(cn["quadtree_valid"]["fail"], 1)
+
+        # A malformed second volume pair must not partially increment navmesh.volumes counters.
+        tile = bytearray(build_navmesh(n_volumes=4)[0])
+        vstart = nd.offset_of(struct.unpack_from("<Q", tile, 0xB8)[0])
+        tile[vstart + 3 * 96 + 0x14] = 7
+        st = nd.new_stats()["navmesh"]
+        _, chk = nd.decode_navmesh(bytes(tile), 1, st, True)
+        self.assertFalse(chk["volumes_valid"])
+        self.assertEqual(st["volumes"]["pairs"], 0)
+        self.assertEqual(dict(st["volumes"]["flags"]), {})
+        self.assertEqual(dict(st["volumes"]["vertex_counts"]), {})
 
         cg = doc["checks"]["grid"]
         self.assertEqual(cg["control_bytes"]["fail"], 1)
