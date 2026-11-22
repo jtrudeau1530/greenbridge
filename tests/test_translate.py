@@ -781,12 +781,15 @@ def _gather_address_bit_offsets(text: str) -> list[int]:
 @pytest.mark.parametrize("my", range(4))
 def test_gather4_l_literal_sampler_emits_only_the_code_its_modes_need(mx, my, make_shader):
     """CLAMP_X = bits [2:0], CLAMP_Y = [5:3]; 0 wrap, 1 mirror, 2 clamp, 3 mirror once. Each axis maps its two
-    texel coordinates: wrap = 1 OpSMod, mirror = 1 OpSMod + 1 OpSLessThan, mirror once = 1 OpSGreaterThanEqual."""
+    texel coordinates: wrap = 1 OpSRem + 1 OpSLessThan (the modulo's fix-up), mirror = the same + 1 OpSLessThan
+    (the reflection), mirror once = 1 OpSGreaterThanEqual. No OpSMod: AMD's Windows driver gave it the dividend's
+    sign for a negative coordinate (Gen.gather_addr)."""
     shader = make_shader(_gather_l(mx | my << 3))
     text = shader.translate()
     shader.validate(text)
-    assert _count(text, "OpSMod") == 2 * (mx in (0, 1)) + 2 * (my in (0, 1))
-    assert _count(text, "OpSLessThan") == 2 * (mx == 1) + 2 * (my == 1)
+    assert _count(text, "OpSMod") == 0
+    assert _count(text, "OpSRem") == 2 * (mx in (0, 1)) + 2 * (my in (0, 1))
+    assert _count(text, "OpSLessThan") == 2 * (mx in (0, 1)) + 2 * (mx == 1) + 2 * (my in (0, 1)) + 2 * (my == 1)
     assert _count(text, "OpSGreaterThanEqual") == 2 * (mx == 3) + 2 * (my == 3)
     assert _gather_address_bit_offsets(text) == []      # the sampler modes are literals
 
@@ -832,8 +835,11 @@ def test_gather4_l_run_time_sampler_selects_the_mode_from_the_sgpr(make_shader):
     text = shader.translate()
     shader.validate(text)
     assert _gather_address_bit_offsets(text) == [0, 3]      # CLAMP_X and CLAMP_Y
-    # OpSLessThan: 4 for mirror, 8 for the border-mode range tests (SHADER-348: two per texel coordinate)
-    assert _count(text, "OpSMod") == 8 and _count(text, "OpSLessThan") == 12 and _count(text, "OpSGreaterThanEqual") == 4
+    # Four coordinates, each through all four modes: wrap and mirror an OpSRem and a fix-up OpSLessThan each (8),
+    # mirror one more OpSLessThan (4), SHADER-348 border-mode range tests two OpSLessThan each (8), mirror once an
+    # OpSGreaterThanEqual (4).
+    assert _count(text, "OpSMod") == 0 and _count(text, "OpSRem") == 8
+    assert _count(text, "OpSLessThan") == 20 and _count(text, "OpSGreaterThanEqual") == 4
 
 
 @pytest.mark.parametrize("word0", [4, 0x28, 0x8000])
