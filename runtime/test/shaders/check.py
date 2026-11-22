@@ -945,14 +945,17 @@ def bindless_test(tools, spirv, pixel="ps_tex"):
 # Samples with a16 coordinates after whole-VGPR arguments (gradients, a bias, a clamp). On the 8x8 gradient every
 # pixel must be the texel its own (u, v) reads. ps_texture_grad_cl_a16 draws on the two-mip texture instead, where its
 # clamp picks mip 0 left of x = 32 and mip 1 from there on.
-GRADIENT_TESTS = ("ps_texture_grad_a16", "ps_texture_bias_a16", "ps_texture_grad_cl_a16")
+GRADIENT_TESTS = ("ps_texture_grad_a16", "ps_texture_bias_a16", "ps_texture_grad_cl_a16", "ps_texture_cl", "ps_texture_b_cl")
+# ps_texture_cl / ps_texture_b_cl (image_sample_cl / _b_cl) draw on the two-mip texture too: the left half reads mip 0 (red,
+# the top-left quadrant), the right half mip 1 (cyan) where the clamp is 1.
+CLAMP_TESTS = ("ps_texture_cl", "ps_texture_b_cl")
 
 
 def texture_gradient_a16_test(tools: str, spirv: str, name: str = "ps_texture_grad_a16") -> str:
     """Check every pixel of one of the GRADIENT_TESTS samples."""
     vs = os.path.join(spirv, "vs_ids.spv")
     fs = os.path.join(spirv, name + ".spv")
-    two_mip = name == "ps_texture_grad_cl_a16"
+    two_mip = name == "ps_texture_grad_cl_a16" or name in CLAMP_TESTS
     with tempfile.TemporaryDirectory(prefix="leonida-texture-") as tmp:
         raw = Path(tmp) / "pixels.raw"
         code, out = run(os.path.join(tools, "vk_texture_test" + EXE), vs, fs, raw,
@@ -969,7 +972,9 @@ def texture_gradient_a16_test(tools: str, spirv: str, name: str = "ps_texture_gr
     first = ""
     for index, pixel in enumerate(struct.iter_unpack("<4f", data)):
         x, y = index % 64, index // 64
-        if two_mip:   # mip 1 (cyan) where the clamp is 1, else mip 0's red and blue quadrants
+        if name in CLAMP_TESTS:   # mip 1 (cyan) where the clamp is 1, else mip 0's top-left quadrant (red)
+            want = (0.0, 1.0, 1.0, 1.0) if x >= 32 else (1.0, 0.0, 0.0, 1.0)
+        elif two_mip:   # mip 1 (cyan) where the clamp is 1, else mip 0's red and blue quadrants
             want = (0.0, 1.0, 1.0, 1.0) if x >= 32 else (1.0, 0.0, 0.0, 1.0) if y < 32 else (0.0, 0.0, 1.0, 1.0)
         else:
             want = (32 * (x // 8) / 255, 32 * (y // 8) / 255, 128 / 255, 1.0)
