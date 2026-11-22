@@ -28,6 +28,12 @@ Arithmetic Properties:
   - Upper bit discard:
     - Bits [7:1] of each byte lane in src2 are strictly ignored by hardware and translator.
 
+SIMD Multi-Lane Execution:
+  RDNA2 executes VALU instructions in SIMD wavefronts of 32 lanes (Wave32) or 64
+  lanes (Wave64). Each active lane executes packed byte interpolation independently.
+  Inactive lanes (where bit `i` of the `EXEC` mask is 0) preserve their prior VGPR
+  contents unmodified.
+
 SPIR-V Lowering in rdna2spirv:
   Lowers to 4 parallel lane extractions via OpBitFieldUExtract (offset 0, 8, 16, 24 with
   widths 8 for src0/src1 and width 1 for src2), two OpIAdd operations, OpShiftRightLogical
@@ -59,6 +65,7 @@ import spirv_mini_interp as si  # noqa: E402
 
 MASK8 = 0xFF
 MASK32 = 0xFFFFFFFF
+MASK64 = 0xFFFFFFFFFFFFFFFF
 STUB_DXBC = b"DXBC" + bytes(24) + struct.pack("<I", 0) + bytes(4)
 
 _TMP_DIR: tempfile.TemporaryDirectory | None = None
@@ -144,6 +151,133 @@ def ref_lerp_fixed_point_blend(s0: int, s1: int, round_nearest: bool = True) -> 
     """Alternative formulation modeling fixed-point average with round-half-up bias."""
     r_word = 0x01010101 if round_nearest else 0
     return ref_lerp_u8_word(s0, s1, r_word)
+
+
+# ---------------------------------------------------------------------------
+# SIMD Wave Multi-Lane Reference Interpreter
+# ---------------------------------------------------------------------------
+
+class SimdWaveLerpInterpreter:
+    """Multi-lane SIMD wave reference interpreter modeling RDNA2 Wave32/Wave64 execution.
+
+    Models:
+      - Wave sizes: Wave32 (32 lanes) and Wave64 (64 lanes)
+      - Per-lane VGPR state: 256 vector registers per SIMD lane
+      - Uniform SGPR state: 106 scalar registers shared across the wavefront
+      - 64-bit EXEC mask: controls active vs inactive lanes
+      - Inactive lane preservation: disabled lanes retain previous VGPR contents
+      - Instruction execution: v_lerp_u8, v_mov_b32, s_mov_b32, s_mov_b64
+    """
+
+    def __init__(self, wave_size: int = 64) -> None:
+        if wave_size not in (32, 64):
+            raise ValueError(f"Unsupported wave size {wave_size}; must be 32 or 64")
+        self.wave_size = wave_size
+        self.vgprs: list[list[int]] = [[0] * 256 for _ in range(wave_size)]
+        self.sgprs: list[int] = [0] * 106
+        self.exec_mask: int = (1 << wave_size) - 1
+
+    def set_exec_mask(self, mask: int) -> None:
+        """Set the active lane mask."""
+        limit = (1 << self.wave_size) - 1
+        self.exec_mask = mask & limit
+
+    def get_exec_mask(self) -> int:
+        return self.exec_mask
+
+    def is_lane_active(self, lane: int) -> bool:
+        return bool((self.exec_mask >> lane) & 1)
+
+    def set_lane_vgpr(self, lane: int, reg: int, val: int) -> None:
+        self.vgprs[lane][reg] = val & MASK32
+
+    def get_lane_vgpr(self, lane: int, reg: int) -> int:
+        return self.vgprs[lane][reg] & MASK32
+
+    def set_sgpr(self, reg: int, val: int) -> None:
+        self.sgprs[reg] = val & MASK32
+
+    def get_sgpr(self, reg: int) -> int:
+        return self.sgprs[reg] & MASK32
+
+    def _resolve_operand(self, op: str | int, lane: int) -> int:
+        """Resolve a register operand or immediate literal for a given SIMD lane."""
+        if isinstance(op, int):
+            return op & MASK32
+        op_str = op.strip().lower()
+        if op_str.startswith("v"):
+            reg_idx = int(op_str[1:])
+            return self.vgprs[lane][reg_idx] & MASK32
+        if op_str.startswith("s"):
+            reg_idx = int(op_str[1:])
+            return self.sgprs[reg_idx] & MASK32
+        return int(op_str, 0) & MASK32
+
+    def v_lerp_u8(self, vdst: int, src0: str | int, src1: str | int, src2: str | int) -> None:
+        """Execute packed 8-bit linear interpolation across all active SIMD lanes."""
+        for lane in range(self.wave_size):
+            if (self.exec_mask >> lane) & 1:
+                v0 = self._resolve_operand(src0, lane)
+                v1 = self._resolve_operand(src1, lane)
+                v2 = self._resolve_operand(src2, lane)
+                self.vgprs[lane][vdst] = ref_lerp_u8_word(v0, v1, v2)
+
+    def v_mov_b32(self, vdst: int, src: str | int) -> None:
+        """Execute 32-bit vector move across active lanes."""
+        for lane in range(self.wave_size):
+            if (self.exec_mask >> lane) & 1:
+                self.vgprs[lane][vdst] = self._resolve_operand(src, lane)
+
+    def s_mov_b32(self, sdst: int, src: str | int) -> None:
+        """Execute uniform scalar move."""
+        self.sgprs[sdst] = self._resolve_operand(src, 0)
+
+    def s_mov_b64(self, sdst: int, val: int) -> None:
+        """Execute 64-bit scalar move into a register pair."""
+        self.sgprs[sdst] = val & MASK32
+        self.sgprs[sdst + 1] = (val >> 32) & MASK32
+
+    def run_instruction(self, line: str) -> None:
+        """Parse and execute a single RDNA assembly instruction."""
+        clean = line.split(";")[0].strip()
+        if not clean:
+            return
+        parts = clean.replace(",", " ").split()
+        op = parts[0].lower()
+        args = parts[1:]
+
+        if op == "v_lerp_u8":
+            dst = int(args[0].lower().replace("v", ""))
+            self.v_lerp_u8(dst, args[1], args[2], args[3])
+        elif op == "v_mov_b32":
+            dst = int(args[0].lower().replace("v", ""))
+            self.v_mov_b32(dst, args[1])
+        elif op == "s_mov_b32":
+            dst_str = args[0].lower()
+            if dst_str == "exec_lo":
+                val = self._resolve_operand(args[1], 0)
+                self.set_exec_mask((self.exec_mask & ~0xFFFFFFFF) | (val & 0xFFFFFFFF))
+            elif dst_str == "exec_hi":
+                val = self._resolve_operand(args[1], 0)
+                self.set_exec_mask((self.exec_mask & 0xFFFFFFFF) | ((val & 0xFFFFFFFF) << 32))
+            else:
+                dst = int(dst_str.replace("s", ""))
+                self.s_mov_b32(dst, args[1])
+        elif op == "s_mov_b64":
+            dst_str = args[0].lower()
+            val = int(args[1], 0) if args[1].startswith("0x") or args[1].isdigit() or (args[1].startswith("-") and args[1][1:].isdigit()) else self._resolve_operand(args[1], 0)
+            if dst_str == "exec":
+                self.set_exec_mask(val)
+            else:
+                dst = int(dst_str.replace("s[", "").replace("]", "").split(":")[0].replace("s", ""))
+                self.s_mov_b64(dst, val)
+        else:
+            raise NotImplementedError(f"Instruction {op} not implemented in wave interpreter")
+
+    def run_program(self, lines: list[str]) -> None:
+        """Execute a sequence of assembly instructions in order."""
+        for line in lines:
+            self.run_instruction(line)
 
 
 # ---------------------------------------------------------------------------
@@ -322,6 +456,208 @@ class TestLerpU8ReferenceOracle(unittest.TestCase):
         self.assertEqual((res >> 16) & 0xFF, 0x00)
         self.assertEqual((res >> 24) & 0xFF, 0xFF)
 
+
+# ---------------------------------------------------------------------------
+# Commit 2 Tests: Multi-Lane SIMD Wave Interpreter
+# ---------------------------------------------------------------------------
+
+class TestSimdWaveLerpInterpreter(unittest.TestCase):
+    """Verifies SIMD wave execution, lane divergence, and inactive lane preservation under EXEC mask."""
+
+    def test_wave64_uniform_execution(self) -> None:
+        """All 64 lanes active with uniform operands produce identical results."""
+        wave = SimdWaveLerpInterpreter(wave_size=64)
+        wave.set_exec_mask(MASK64)
+
+        s0 = 0x80402010
+        s1 = 0x20406080
+        s2 = 0x01000100
+
+        expected = ref_lerp_u8_word(s0, s1, s2)
+
+        for lane in range(64):
+            wave.set_lane_vgpr(lane, 1, s0)
+            wave.set_lane_vgpr(lane, 2, s1)
+            wave.set_lane_vgpr(lane, 3, s2)
+
+        wave.v_lerp_u8(vdst=0, src0="v1", src1="v2", src2="v3")
+
+        for lane in range(64):
+            self.assertEqual(wave.get_lane_vgpr(lane, 0), expected)
+
+    def test_wave32_divergent_operands(self) -> None:
+        """Wave32 with unique operands per lane produces lane-isolated outputs."""
+        wave = SimdWaveLerpInterpreter(wave_size=32)
+        wave.set_exec_mask(0xFFFFFFFF)
+
+        expected_results = []
+        for lane in range(32):
+            s0 = pack_bytes_u32(lane * 4, (lane * 7) & 0xFF, 128, 255 - lane)
+            s1 = pack_bytes_u32(255 - lane * 4, lane, (lane * 3) & 0xFF, lane)
+            s2 = pack_bytes_u32(lane & 1, (lane >> 1) & 1, 1, 0)
+
+            wave.set_lane_vgpr(lane, 1, s0)
+            wave.set_lane_vgpr(lane, 2, s1)
+            wave.set_lane_vgpr(lane, 3, s2)
+            expected_results.append(ref_lerp_u8_word(s0, s1, s2))
+
+        wave.v_lerp_u8(vdst=0, src0="v1", src1="v2", src2="v3")
+
+        for lane in range(32):
+            self.assertEqual(wave.get_lane_vgpr(lane, 0), expected_results[lane])
+
+    def test_wave64_exec_mask_inactive_lanes_preserved(self) -> None:
+        """Inactive lanes under EXEC mask must retain their previous VGPR contents."""
+        wave = SimdWaveLerpInterpreter(wave_size=64)
+        canary = 0xDEADBEEF
+
+        # Pre-populate all lanes with canary in destination v0
+        for lane in range(64):
+            wave.set_lane_vgpr(lane, 0, canary)
+            wave.set_lane_vgpr(lane, 1, 0x11223344)
+            wave.set_lane_vgpr(lane, 2, 0x55667788)
+            wave.set_lane_vgpr(lane, 3, 0x01010101)
+
+        # Only lower 32 lanes active: EXEC = 0x00000000FFFFFFFF
+        active_mask = 0xFFFFFFFF
+        wave.set_exec_mask(active_mask)
+
+        wave.v_lerp_u8(vdst=0, src0="v1", src1="v2", src2="v3")
+
+        expected_active = ref_lerp_u8_word(0x11223344, 0x55667788, 0x01010101)
+
+        # Active lanes must be updated
+        for lane in range(32):
+            self.assertEqual(wave.get_lane_vgpr(lane, 0), expected_active)
+
+        # Inactive lanes must be unmodified
+        for lane in range(32, 64):
+            self.assertEqual(wave.get_lane_vgpr(lane, 0), canary)
+
+    def test_wave32_checkerboard_divergence(self) -> None:
+        """Checkerboard active mask (even lanes active, odd inactive)."""
+        wave = SimdWaveLerpInterpreter(wave_size=32)
+        canary = 0xCAFEBABE
+
+        for lane in range(32):
+            wave.set_lane_vgpr(lane, 0, canary)
+            wave.set_lane_vgpr(lane, 1, 0x00FF00FF)
+            wave.set_lane_vgpr(lane, 2, 0xFF00FF00)
+            wave.set_lane_vgpr(lane, 3, 0)
+
+        # Even lanes active: 0x55555555
+        checkerboard = 0x55555555
+        wave.set_exec_mask(checkerboard)
+
+        wave.v_lerp_u8(vdst=0, src0="v1", src1="v2", src2="v3")
+
+        expected_active = ref_lerp_u8_word(0x00FF00FF, 0xFF00FF00, 0)
+
+        for lane in range(32):
+            if lane % 2 == 0:
+                self.assertEqual(wave.get_lane_vgpr(lane, 0), expected_active)
+            else:
+                self.assertEqual(wave.get_lane_vgpr(lane, 0), canary)
+
+    def test_wave64_sparse_exec_masks(self) -> None:
+        """Sparse lane activation: only lane 0, lane 31, and lane 63 active."""
+        wave = SimdWaveLerpInterpreter(wave_size=64)
+        sparse_mask = (1 << 0) | (1 << 31) | (1 << 63)
+        wave.set_exec_mask(sparse_mask)
+
+        for lane in range(64):
+            wave.set_lane_vgpr(lane, 0, 0x12340000 | lane)
+            wave.set_lane_vgpr(lane, 1, 0x10101010)
+            wave.set_lane_vgpr(lane, 2, 0x20202020)
+            wave.set_lane_vgpr(lane, 3, 0)
+
+        wave.v_lerp_u8(vdst=0, src0="v1", src1="v2", src2="v3")
+
+        expected_val = ref_lerp_u8_word(0x10101010, 0x20202020, 0)
+        for lane in range(64):
+            if lane in (0, 31, 63):
+                self.assertEqual(wave.get_lane_vgpr(lane, 0), expected_val)
+            else:
+                self.assertEqual(wave.get_lane_vgpr(lane, 0), 0x12340000 | lane)
+
+    def test_wave_all_lanes_disabled(self) -> None:
+        """When EXEC is 0, no VGPR in any lane is modified."""
+        wave = SimdWaveLerpInterpreter(wave_size=64)
+        wave.set_exec_mask(0)
+
+        for lane in range(64):
+            wave.set_lane_vgpr(lane, 0, 0x55555555)
+
+        wave.v_lerp_u8(vdst=0, src0=0xFFFFFFFF, src1=0xFFFFFFFF, src2=1)
+
+        for lane in range(64):
+            self.assertEqual(wave.get_lane_vgpr(lane, 0), 0x55555555)
+
+    def test_wave_mixed_operands_sgpr_and_inline(self) -> None:
+        """Operand resolution combining SGPR source, VGPR source, and inline constant."""
+        wave = SimdWaveLerpInterpreter(wave_size=32)
+        wave.set_exec_mask(0xFFFFFFFF)
+
+        wave.set_sgpr(4, 0x40404040)
+        for lane in range(32):
+            wave.set_lane_vgpr(lane, 1, 0x60606060)
+
+        # src0=s4, src1=v1, src2=inline constant 1
+        wave.v_lerp_u8(vdst=0, src0="s4", src1="v1", src2=1)
+
+        expected = ref_lerp_u8_word(0x40404040, 0x60606060, 1)
+        for lane in range(32):
+            self.assertEqual(wave.get_lane_vgpr(lane, 0), expected)
+
+    def test_wave_program_execution(self) -> None:
+        """Assembly program sequence execution on wave interpreter."""
+        wave = SimdWaveLerpInterpreter(wave_size=32)
+        program = [
+            "s_mov_b32 s2, 0x10203040",
+            "v_mov_b32 v1, 0x30405060",
+            "v_lerp_u8 v0, s2, v1, 1",
+        ]
+        wave.run_program(program)
+        expected = ref_lerp_u8_word(0x10203040, 0x30405060, 1)
+        for lane in range(32):
+            self.assertEqual(wave.get_lane_vgpr(lane, 0), expected)
+
+    def test_hierarchical_interpolation_pipeline(self) -> None:
+        """Hierarchical multi-stage bilinear-style byte interpolation pipeline."""
+        wave = SimdWaveLerpInterpreter(wave_size=32)
+        wave.set_exec_mask(0xFFFFFFFF)
+
+        # Blend A and B into v3 with round 0
+        # Blend C and D into v4 with round 0
+        # Blend v3 and v4 into v0 with round 1
+        va = 0x10203040
+        vb = 0x50607080
+        vc = 0x20304050
+        vd = 0x60708090
+
+        for lane in range(32):
+            wave.set_lane_vgpr(lane, 1, va)
+            wave.set_lane_vgpr(lane, 2, vb)
+            wave.set_lane_vgpr(lane, 5, vc)
+            wave.set_lane_vgpr(lane, 6, vd)
+
+        wave.v_lerp_u8(vdst=3, src0="v1", src1="v2", src2=0)
+        wave.v_lerp_u8(vdst=4, src0="v5", src1="v6", src2=0)
+        wave.v_lerp_u8(vdst=0, src0="v3", src1="v4", src2=1)
+
+        ab = ref_lerp_u8_word(va, vb, 0)
+        cd = ref_lerp_u8_word(vc, vd, 0)
+        expected_final = ref_lerp_u8_word(ab, cd, 1)
+
+        for lane in range(32):
+            self.assertEqual(wave.get_lane_vgpr(lane, 3), ab)
+            self.assertEqual(wave.get_lane_vgpr(lane, 4), cd)
+            self.assertEqual(wave.get_lane_vgpr(lane, 0), expected_final)
+
+
+# ---------------------------------------------------------------------------
+# Synthetic Shader Execution Tests
+# ---------------------------------------------------------------------------
 
 class TestLerpU8SyntheticShaderTranslation(unittest.TestCase):
     """End-to-end SPIR-V translation and spirv_mini_interp execution tests."""
