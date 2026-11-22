@@ -817,5 +817,171 @@ class TestRegisterAliasingAndPreservation(unittest.TestCase):
                 self.assertEqual(self.state.read_sgpr(i), (i * 0x0101_0101) & MASK_U32)
 
 
+# ==============================================================================
+# Condition Codes, Status Flags, and Carry/Borrow Generation
+# ==============================================================================
+
+@dataclass(frozen=True)
+class SALUStatusFlags:
+    """Architectural and algebraic condition flags for SALU operations."""
+    carry_or_borrow: int
+    zero: bool
+    sign: bool
+    signed_overflow: bool
+    parity_even: bool
+
+
+def evaluate_salu_flags(
+    opcode: SOPOpcode, src0: int, src1: int, result: int, cc: int
+) -> SALUStatusFlags:
+    """Evaluate architectural condition codes and algebraic status flags."""
+    s0 = src0 & MASK_U32
+    s1 = src1 & MASK_U32
+    res = result & MASK_U32
+
+    zero = (res == 0)
+    sign = bool(res & SIGN_BIT_U32)
+
+    is_add = opcode in (SOPOpcode.S_ADD_CO_U32, SOPOpcode.S_ADD_U32)
+    if is_add:
+        # Addition overflow occurs when operands have same sign, but result has different sign
+        signed_overflow = bool((~(s0 ^ s1) & (s0 ^ res)) & SIGN_BIT_U32)
+    else:
+        # Subtraction overflow occurs when operands have different signs, and result sign differs from s0
+        signed_overflow = bool(((s0 ^ s1) & (s0 ^ res)) & SIGN_BIT_U32)
+
+    parity_even = (bin(res).count("1") % 2 == 0)
+
+    return SALUStatusFlags(
+        carry_or_borrow=cc,
+        zero=zero,
+        sign=sign,
+        signed_overflow=signed_overflow,
+        parity_even=parity_even,
+    )
+
+
+def simulate_64bit_add(a64: int, b64: int) -> Tuple[int, int]:
+    """Simulate 64-bit addition via s_add_co_u32 (lo) and s_addc_u32 (hi with SCC carry)."""
+    a_lo, a_hi = a64 & MASK_U32, (a64 >> 32) & MASK_U32
+    b_lo, b_hi = b64 & MASK_U32, (b64 >> 32) & MASK_U32
+
+    # Step 1: low dword s_add_co_u32
+    r_lo, carry = oracle_s_add_co_u32(a_lo, b_lo)
+
+    # Step 2: high dword s_addc_u32 (add with carry)
+    r_hi_temp = a_hi + b_hi + carry
+    r_hi = r_hi_temp & MASK_U32
+    carry_out = 1 if r_hi_temp >= MODULO_U32 else 0
+
+    res64 = (r_hi << 32) | r_lo
+    return res64, carry_out
+
+
+def simulate_64bit_sub(a64: int, b64: int) -> Tuple[int, int]:
+    """Simulate 64-bit subtraction via s_sub_co_u32 (lo) and s_subb_u32 (hi with SCC borrow)."""
+    a_lo, a_hi = a64 & MASK_U32, (a64 >> 32) & MASK_U32
+    b_lo, b_hi = b64 & MASK_U32, (b64 >> 32) & MASK_U32
+
+    # Step 1: low dword s_sub_co_u32
+    r_lo, borrow = oracle_s_sub_co_u32(a_lo, b_lo)
+
+    # Step 2: high dword s_subb_u32 (sub with borrow)
+    diff_hi = a_hi - b_hi - borrow
+    r_hi = diff_hi & MASK_U32
+    borrow_out = 1 if a_hi < (b_hi + borrow) else 0
+
+    res64 = (r_hi << 32) | r_lo
+    return res64, borrow_out
+
+
+class TestConditionCodesAndStatusFlags(unittest.TestCase):
+    """Verification of condition codes, signed overflow, and multi-word ripple carry/borrow."""
+
+    def test_signed_overflow_vs_unsigned_carry_addition(self) -> None:
+        # Case 1: 0x7FFF_FFFF + 1 = 0x8000_0000 (signed overflow, no carry)
+        res, cc = oracle_s_add_co_u32(0x7FFF_FFFF, 1)
+        flags = evaluate_salu_flags(SOPOpcode.S_ADD_CO_U32, 0x7FFF_FFFF, 1, res, cc)
+        self.assertEqual(res, 0x8000_0000)
+        self.assertEqual(cc, 0)
+        self.assertTrue(flags.signed_overflow)
+        self.assertTrue(flags.sign)
+        self.assertFalse(flags.zero)
+
+        # Case 2: 0xFFFF_FFFF + 1 = 0 (carry, no signed overflow)
+        res2, cc2 = oracle_s_add_co_u32(MAX_U32, 1)
+        flags2 = evaluate_salu_flags(SOPOpcode.S_ADD_CO_U32, MAX_U32, 1, res2, cc2)
+        self.assertEqual(res2, 0)
+        self.assertEqual(cc2, 1)
+        self.assertFalse(flags2.signed_overflow)
+        self.assertFalse(flags2.sign)
+        self.assertTrue(flags2.zero)
+
+        # Case 3: 0x8000_0000 + 0x8000_0000 = 0 (both signed overflow AND carry)
+        res3, cc3 = oracle_s_add_co_u32(0x8000_0000, 0x8000_0000)
+        flags3 = evaluate_salu_flags(SOPOpcode.S_ADD_CO_U32, 0x8000_0000, 0x8000_0000, res3, cc3)
+        self.assertEqual(res3, 0)
+        self.assertEqual(cc3, 1)
+        self.assertTrue(flags3.signed_overflow)
+        self.assertTrue(flags3.zero)
+
+    def test_signed_overflow_vs_unsigned_borrow_subtraction(self) -> None:
+        # Case 1: 0x8000_0000 - 1 = 0x7FFF_FFFF (signed overflow, no borrow)
+        res, cc = oracle_s_sub_co_u32(0x8000_0000, 1)
+        flags = evaluate_salu_flags(SOPOpcode.S_SUB_CO_U32, 0x8000_0000, 1, res, cc)
+        self.assertEqual(res, 0x7FFF_FFFF)
+        self.assertEqual(cc, 0)
+        self.assertTrue(flags.signed_overflow)
+        self.assertFalse(flags.sign)
+
+        # Case 2: 0 - 1 = 0xFFFF_FFFF (borrow, no signed overflow)
+        res2, cc2 = oracle_s_sub_co_u32(0, 1)
+        flags2 = evaluate_salu_flags(SOPOpcode.S_SUB_CO_U32, 0, 1, res2, cc2)
+        self.assertEqual(res2, MAX_U32)
+        self.assertEqual(cc2, 1)
+        self.assertFalse(flags2.signed_overflow)
+        self.assertTrue(flags2.sign)
+
+        # Case 3: 0x7FFF_FFFF - 0x8000_0000 = 0xFFFF_FFFF (both signed overflow AND borrow)
+        res3, cc3 = oracle_s_sub_co_u32(0x7FFF_FFFF, 0x8000_0000)
+        flags3 = evaluate_salu_flags(SOPOpcode.S_SUB_CO_U32, 0x7FFF_FFFF, 0x8000_0000, res3, cc3)
+        self.assertEqual(res3, MAX_U32)
+        self.assertEqual(cc3, 1)
+        self.assertTrue(flags3.signed_overflow)
+        self.assertTrue(flags3.sign)
+
+    def test_64bit_ripple_carry_multi_word_addition(self) -> None:
+        test_pairs = [
+            (0x0000_0000_FFFF_FFFF, 0x0000_0000_0000_0001),
+            (0x1234_5678_FFFF_FFFF, 0x0000_0000_0000_0001),
+            (0x7FFF_FFFF_FFFF_FFFF, 0x0000_0000_0000_0001),
+            (0xFFFF_FFFF_FFFF_FFFF, 0x0000_0000_0000_0001),
+            (0xAAAA_AAAA_5555_5555, 0x5555_5555_AAAA_AAAA),
+        ]
+        for a, b in test_pairs:
+            with self.subTest(a=hex(a), b=hex(b)):
+                res64, carry_out = simulate_64bit_add(a, b)
+                expected_sum = (a + b) & 0xFFFF_FFFF_FFFF_FFFF
+                expected_carry = 1 if (a + b) >= (1 << 64) else 0
+                self.assertEqual(res64, expected_sum)
+                self.assertEqual(carry_out, expected_carry)
+
+    def test_64bit_ripple_borrow_multi_word_subtraction(self) -> None:
+        test_pairs = [
+            (0x0000_0001_0000_0000, 0x0000_0000_0000_0001),
+            (0x1000_0000_0000_0000, 0x0000_0000_0000_0001),
+            (0x0000_0000_0000_0000, 0x0000_0000_0000_0001),
+            (0x1234_5678_0000_0000, 0x0000_0000_0000_0005),
+            (0xFFFF_FFFF_FFFF_FFFF, 0x0000_0000_0000_0001),
+        ]
+        for a, b in test_pairs:
+            with self.subTest(a=hex(a), b=hex(b)):
+                res64, borrow_out = simulate_64bit_sub(a, b)
+                expected_diff = (a - b) & 0xFFFF_FFFF_FFFF_FFFF
+                expected_borrow = 1 if a < b else 0
+                self.assertEqual(res64, expected_diff)
+                self.assertEqual(borrow_out, expected_borrow)
+
+
 if __name__ == "__main__":
     unittest.main()
