@@ -928,7 +928,7 @@ int compare_resolves(ID3D12Device* ours) {
 
 int main() {
     vktest::Device d;
-    EXPECT(d.create());
+    if (!d.create()) return 77;   // no Vulkan GPU: CTest treats 77 as skipped
     EXPECT(d.depth_format_usable(VK_FORMAT_D32_SFLOAT_S8_UINT));
     constexpr UINT size = 8, small_size = 4;
     unsigned mismatches = 0;
