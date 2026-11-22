@@ -171,7 +171,7 @@ int main() {
 
     constexpr UINT elements = 64, bytes = elements * 4;
     const std::uint32_t table_values[4] = {1000, 2000, 3000, 4000};
-    std::vector<std::uint32_t> first(elements), second(elements);
+    std::vector<std::uint32_t> first(elements), second(elements), third(elements);
     std::vector<std::uint32_t> cbv_a_out(elements), cbv_oob_out(elements), cbv_b_out(elements), cbv_null_out(elements);
     {
         rt::d3d12::VulkanDeviceInfo info{};
@@ -281,7 +281,7 @@ int main() {
         const D3D12_HEAP_PROPERTIES default_heap{D3D12_HEAP_TYPE_DEFAULT};
         const D3D12_HEAP_PROPERTIES upload_heap{D3D12_HEAP_TYPE_UPLOAD};
         const D3D12_HEAP_PROPERTIES readback_heap{D3D12_HEAP_TYPE_READBACK};
-        Ref<ID3D12Resource> out_a, out_b, constants, readback;
+        Ref<ID3D12Resource> out_a, out_b, out_c, constants, readback;
         const auto uav = buffer_desc(bytes, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
         EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &uav,
                                                          D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
@@ -289,16 +289,21 @@ int main() {
         EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &uav,
                                                          D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
                                                          IID_PPV_ARGS(&out_b.p))));
+        EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &uav,
+                                                         D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
+                                                         IID_PPV_ARGS(&out_c.p))));
         const auto constants_desc = buffer_desc(256, D3D12_RESOURCE_FLAG_NONE);
         EXPECT(SUCCEEDED(device->CreateCommittedResource(&upload_heap, D3D12_HEAP_FLAG_NONE, &constants_desc,
                                                          D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
                                                          IID_PPV_ARGS(&constants.p))));
-        const auto readback_desc = buffer_desc(2 * bytes, D3D12_RESOURCE_FLAG_NONE);
+        const auto readback_desc = buffer_desc(3 * bytes, D3D12_RESOURCE_FLAG_NONE);
         EXPECT(SUCCEEDED(device->CreateCommittedResource(&readback_heap, D3D12_HEAP_FLAG_NONE, &readback_desc,
                                                          D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
                                                          IID_PPV_ARGS(&readback.p))));
-        const D3D12_GPU_VIRTUAL_ADDRESS va_a = out_a->GetGPUVirtualAddress(), va_b = out_b->GetGPUVirtualAddress();
-        EXPECT(va_a >= 0x10000 && va_b >= 0x10000 && va_a != va_b && va_a < (1ull << 32) && va_b < (1ull << 32));
+        const D3D12_GPU_VIRTUAL_ADDRESS va_a = out_a->GetGPUVirtualAddress(), va_b = out_b->GetGPUVirtualAddress(),
+                                        va_c = out_c->GetGPUVirtualAddress();
+        EXPECT(va_a >= 0x10000 && va_b >= 0x10000 && va_c >= 0x10000 && va_a != va_b && va_a != va_c && va_b != va_c &&
+               va_a < (1ull << 32) && va_b < (1ull << 32) && va_c < (1ull << 32));
         EXPECT(va_a % D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT == 0);
         EXPECT(constants->GetGPUVirtualAddress() != 0);  // device address - heap base: wraps, still valid
         void* mapped = nullptr;
@@ -354,22 +359,39 @@ int main() {
             list->SetPipelineState(own_pso.p);
             held_root = own_root.p;  // still alive: the list holds it
         }
+        // Setting the bound root signature again keeps the arguments, as D3D12 does (TEST-280), and setting a
+        // graphics root signature does not disturb the compute root arguments.
         const std::uint32_t base_and_step[2] = {7, 3};
-        list->SetComputeRoot32BitConstants(0, 2, base_and_step, 0);
+        list->SetComputeRoot32BitConstant(0, base_and_step[0], 0);
+        list->SetComputeRootSignature(held_root);
+        list->SetComputeRoot32BitConstant(0, base_and_step[1], 1);
         list->SetComputeRootUnorderedAccessView(1, va_a);
         list->SetComputeRootDescriptorTable(2, D3D12_GPU_DESCRIPTOR_HANDLE{gpu});
-        // Setting the bound root signature again keeps the arguments, as D3D12 does.
         list->SetComputeRootSignature(held_root);
+        list->SetGraphicsRootSignature(root.p);
+        list->SetGraphicsRoot32BitConstant(0, 999, 0);
+        list->SetGraphicsRootSignature(root.p);
+        list->SetGraphicsRoot32BitConstant(0, 888, 1);
         list->Dispatch(1, 1, 1);
         list->SetComputeRoot32BitConstant(0, 100, 0);
         list->SetComputeRootUnorderedAccessView(1, va_b);
         list->Dispatch(1, 1, 1);
-        D3D12_RESOURCE_BARRIER barriers[2] = {
+        // Switching to a different root-signature object (root.p != held_root) resets the bound arguments to zero
+        // (clearing s0 = 100 to 0), whereas rebinding root.p afterwards keeps the arguments set on it (s1 = 5).
+        list->SetComputeRootSignature(root.p);
+        list->SetComputeRoot32BitConstant(0, 5, 1);  // offset 1 (s1 = 5); offset 0 (s0) stays 0 from the switch
+        list->SetComputeRootUnorderedAccessView(1, va_c);
+        list->SetComputeRootDescriptorTable(2, D3D12_GPU_DESCRIPTOR_HANDLE{gpu});
+        list->SetComputeRootSignature(root.p);
+        list->Dispatch(1, 1, 1);
+        D3D12_RESOURCE_BARRIER barriers[3] = {
             transition(out_a.p, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE),
-            transition(out_b.p, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE)};
-        list->ResourceBarrier(2, barriers);
+            transition(out_b.p, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE),
+            transition(out_c.p, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE)};
+        list->ResourceBarrier(3, barriers);
         list->CopyBufferRegion(readback.p, 0, out_a.p, 0, bytes);
         list->CopyBufferRegion(readback.p, bytes, out_b.p, 0, bytes);
+        list->CopyBufferRegion(readback.p, 2 * bytes, out_c.p, 0, bytes);
         EXPECT(list->Close() == S_OK);
         ID3D12CommandList* lists[] = {list.p};
         queue->ExecuteCommandLists(1, lists);
@@ -381,6 +403,7 @@ int main() {
         EXPECT(SUCCEEDED(readback->Map(0, nullptr, &results)));
         std::memcpy(first.data(), results, bytes);
         std::memcpy(second.data(), static_cast<const std::uint8_t*>(results) + bytes, bytes);
+        std::memcpy(third.data(), static_cast<const std::uint8_t*>(results) + 2 * bytes, bytes);
 
         // CreateConstantBufferView: populate shader-visible descriptor heap slots with GFX10 V# descriptors for a
         // 512-byte arena constant buffer (two 256-byte CBVs: A at +0, B at +256) and null CBVs.
@@ -504,10 +527,14 @@ int main() {
             std::memcpy(cbv_null_out.data(), src_bytes + 3 * bytes, bytes);
         }
 
-        for (auto* r : {&out_a, &out_b, &constants, &readback}) r->reset();
+        for (auto* r : {&out_a, &out_b, &out_c, &constants, &readback}) r->reset();
         pso67.reset();
         unknown67.reset();
         pso.reset();
+        pso67.reset();  // the slot-67 PSO holds the device like any other; released before the count is checked
+        unknown.reset();
+        unknown67.reset();
+        junk.reset();
         root.reset();
         heap.reset();
         list.reset();
@@ -522,8 +549,10 @@ int main() {
     for (std::uint32_t i = 0; i < elements; ++i) {
         const std::uint32_t a = 7 + 3 * i + table_values[i % 4] + code_word;
         const std::uint32_t b = 100 + 3 * i + table_values[i % 4] + code_word;
-        if ((first[i] != a || second[i] != b) && mismatches++ < 4)
-            std::fprintf(stderr, "element %u: got %u and %u, want %u and %u\n", i, first[i], second[i], a, b);
+        const std::uint32_t c = 5 * i + table_values[i % 4] + code_word;
+        if ((first[i] != a || second[i] != b || third[i] != c) && mismatches++ < 4)
+            std::fprintf(stderr, "element %u: got %u, %u and %u, want %u, %u and %u\n", i, first[i], second[i],
+                         third[i], a, b, c);
     }
     EXPECT(!mismatches);
     UINT cbv_b_diff = 0, cbv_null_diff = 0;
@@ -552,6 +581,6 @@ int main() {
         return 1;
     }
     std::printf("compute: root constants, a root UAV and a descriptor table reached the shader through the GPU "
-                "address arena; %u elements matched in each of two dispatches\n", elements);
+                "address arena; %u elements matched in each of three dispatches\n", elements);
     return 0;
 }

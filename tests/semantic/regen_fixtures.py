@@ -23,7 +23,7 @@ SHADERS = ("cs_smem_bounds", "cs_smem_stride_align", "cs_smem_sload_neg", "cs_bu
            "ps_legacy_mul", "ps_vcc_x2", "ps_vcmpx_forms", "ps_flat", "cs_bounds", "cs_fmt_1010102", "cs_fmt_sint32", "cs_w64x_readlane",
            "cs_w64x_writelane", "cs_w64x_bpermute", "cs_w32_permute", "cs_w32_int_ext", "cs_w32_salu64", "cs_w32_misc_ext", "cs_w32_new_ops", "cs_w64x_permute", "cs_w64x_ballot", "cs_w64x_readfirstlane",
            "cs_w64x_load_ballot_load", "cs_w64x_partial", "cs_wave64_ballot", "cs_wm_bfm64", "cs_wm_half_cmp",
-           "cs_wavemask", "cs_cvt_f32_sat", "ps_scc_minmax", "ps_fma_literal", "ps_f16_vop2",
+           "cs_wavemask", "cs_cvt_f32_sat", "ps_scc_minmax", "ps_fma_literal", "ps_f16_vop2", "ps_outmods_f16",
            "ps_f32_mods", "ps_f64_mods", "ps_sff_imm", "cs_w32_lds_u8_d16", "cs_w32_lane_wrap", "ps_bary",
            "cs_oob_select", "cs_oob_tail", "cs_w32_mask_imm", "cs_w64_mask_imm",
            "cs_buf_swizzle",   # swizzled MUBUF / ADD_TID (test_buffer_swizzle.py)
@@ -33,7 +33,8 @@ SHADERS = ("cs_smem_bounds", "cs_smem_stride_align", "cs_smem_sload_neg", "cs_bu
            "ps_f16_pack_mods",          # v_pack_b32_f16 neg/abs (SHADER-260)
            "cs_w64x_andn2_exec",   # s_andn2_saveexec_b64 / s_andn2_wrexec_b64 (test_andn2_exec_b64.py)
            "cs_w64x_saveexec_b64",   # s_and/s_or/s_andn2_saveexec_b64, s_andn2_wrexec_b64 (test_saveexec_b64.py)
-           "ps_valu16_mad", "ps_valu16_subrev")   # v_mad_u32_u16 / v_mad_i32_i16, v_subrev_f16
+           "ps_valu16_mad", "ps_valu16_subrev",   # v_mad_u32_u16 / v_mad_i32_i16, v_subrev_f16
+           "cs_cvt_pk_u8")   # v_cvt_pk_u8_f32 rounding and NaN (test_cvt_pk_u8.py)
 
 
 def render(name):

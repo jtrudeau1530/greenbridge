@@ -564,6 +564,114 @@ def build_cases():
         ], "v_cvt_pknorm_i16/u16_f32 ties at +-0.5 and +-1.0 endpoints"),
     ]
 
+    # 20. Packed 16-bit integer ops (v_pk_add/sub_u16/i16, v_pk_mul_lo_u16, v_pk_mad_u16/i16, v_pk_min/max_u16/i16)
+    cases += [
+        _valu4_case("valu_pk_int16", "v_pk_add_sub_u16_i16_clamp", [
+            "v_mov_b32 v1, 0xffff8000", "v_mov_b32 v2, 0x00028001",
+            "v_pk_add_u16 v8, v1, v2",               # wraps both halves
+            "v_pk_add_u16 v9, v1, v2 clamp",         # saturates both halves to 0xffff
+            "v_mov_b32 v3, 0x00010005", "v_mov_b32 v4, 0x00020003",
+            "v_pk_sub_u16 v10, v3, v4 clamp",        # hi clamps to 0, lo = 2
+            "v_mov_b32 v5, 0x7fff8000", "v_mov_b32 v6, 0x0001ffff",
+            "v_pk_add_i16 v11, v5, v6 clamp",        # hi clamps +32767, lo clamps -32768
+        ], "v_pk_add/sub_u16/i16 wrap and clamp saturation"),
+        _valu4_case("valu_pk_int16", "v_pk_sub_i16_mul_minmax", [
+            "v_mov_b32 v1, 0x80007fff", "v_mov_b32 v2, 0x0001ffff",
+            "v_pk_sub_i16 v8, v1, v2 clamp",         # hi clamps -32768, lo clamps +32767
+            "v_mov_b32 v3, 0x01000010", "v_mov_b32 v4, 0x02000020",
+            "v_pk_mul_lo_u16 v9, v3, v4",            # hi wraps to 0x0000, lo = 0x0200
+            "v_mov_b32 v5, 0xffff0005", "v_mov_b32 v6, 0x0001fffb",
+            "v_pk_min_i16 v10, v5, v6",
+            "v_pk_max_u16 v11, v5, v6",
+        ], "v_pk_sub_i16 clamp, v_pk_mul_lo_u16, v_pk_min_i16 and v_pk_max_u16"),
+        _valu4_case("valu_pk_int16", "v_pk_mad_u16_i16_clamp", [
+            "v_mov_b32 v1, 0x0100ffff", "v_mov_b32 v2, 0x02000002", "v_mov_b32 v3, 0x00010001",
+            "v_pk_mad_u16 v8, v1, v2, v3",           # wraps both halves
+            "v_pk_mad_u16 v9, v1, v2, v3 clamp",     # saturates both halves to 0xffff
+            "v_mov_b32 v4, 0x7fff8000", "v_mov_b32 v5, 0x00020002", "v_mov_b32 v6, 0x0001ffff",
+            "v_pk_mad_i16 v10, v4, v5, v6",          # wraps both halves
+            "v_pk_mad_i16 v11, v4, v5, v6 clamp",    # hi -> 0x7fff, lo -> 0x8000
+        ], "v_pk_mad_u16 / v_pk_mad_i16 wrap and full-width clamp"),
+        _valu4_case("valu_pk_int16", "v_pk_int16_opsel_minmax", [
+            "v_mov_b32 v1, 0x00100001", "v_mov_b32 v2, 0x00200002",
+            "v_pk_add_i16 v8, v1, v2 op_sel:[1,0] op_sel_hi:[0,1]",
+            "v_pk_sub_i16 v9, v1, v2 op_sel:[0,1] op_sel_hi:[1,0]",
+            "v_mov_b32 v3, 0xffff0005", "v_mov_b32 v4, 0x0001fffb",
+            "v_pk_max_i16 v10, v3, v4",
+            "v_pk_min_u16 v11, v3, v4",
+        ], "v_pk_*_i16/u16 op_sel/op_sel_hi, v_pk_max_i16 and v_pk_min_u16"),
+    ]
+
+    # 21. 16-bit three-operand min/max/median (v_min3/max3_f16, v_min3/max3/med3_i16/u16)
+    cases += [
+        _valu4_case("valu_min3_max3_med3_16", "v_min3_max3_f16_nan_zero", [
+            f"v_mov_b32 v8, 0x{SENTINEL:08x}",
+            f"v_mov_b32 v9, 0x{SENTINEL:08x}",
+            f"v_mov_b32 v10, 0x{SENTINEL:08x}",
+            f"v_mov_b32 v11, 0x{SENTINEL:08x}",
+            "v_mov_b32 v1, 0x00007e00", "v_mov_b32 v2, 0x00003c00", "v_mov_b32 v3, 0x00004000",
+            "v_min3_f16 v8, v1, v2, v3",             # NaN yields other operand, hi kept
+            "v_max3_f16 v9, v2, v1, v3",
+            "v_mov_b32 v4, 0x00000000", "v_mov_b32 v5, 0x00008000", "v_mov_b32 v6, 0x0000bc00",
+            "v_min3_f16 v10, v4, v5, v2",            # -0 orders below +0
+            "v_max3_f16 v11, v4, v5, v6 clamp",      # +0 > -0 > -1.0, clamped to [0, 1]
+        ], "v_min3_f16 / v_max3_f16 NaN, -0/+0 ordering, clamp and untouched hi half"),
+        _valu4_case("valu_min3_max3_med3_16", "v_min3_max3_med3_i16_u16", [
+            f"v_mov_b32 v8, 0x{SENTINEL:08x}",
+            f"v_mov_b32 v9, 0x{SENTINEL:08x}",
+            f"v_mov_b32 v10, 0x{SENTINEL:08x}",
+            f"v_mov_b32 v11, 0x{SENTINEL:08x}",
+            "v_mov_b32 v1, 0xfff00005", "v_mov_b32 v2, 0x00010002", "v_mov_b32 v3, 0x0003fff8",
+            "v_min3_i16 v8, v1, v2, v3 op_sel:[1,0,0,1]",   # writes hi, keeps lo
+            "v_max3_u16 v9, v1, v2, v3 op_sel:[1,0,0,0]",   # writes lo, keeps hi
+            "v_min3_u16 v10, v1, v2, v3 op_sel:[1,0,0,0]",
+            "v_max3_i16 v11, v1, v2, v3 op_sel:[1,0,0,1]",
+        ], "v_min3/max3_i16/u16 with op_sel and untouched destination half"),
+        _valu4_case("valu_min3_max3_med3_16", "v_med3_i16_u16_opsel", [
+            f"v_mov_b32 v8, 0x{SENTINEL:08x}",
+            f"v_mov_b32 v9, 0x{SENTINEL:08x}",
+            f"v_mov_b32 v10, 0x{SENTINEL:08x}",
+            f"v_mov_b32 v11, 0x{SENTINEL:08x}",
+            "v_mov_b32 v1, 0xfff00010", "v_mov_b32 v2, 0x00050020", "v_mov_b32 v3, 0x0001fff5",
+            "v_med3_i16 v8, v1, v2, v3 op_sel:[1,1,0,1]",   # signed median of -16, 5, -11 = -11 in hi
+            "v_med3_u16 v9, v1, v2, v3 op_sel:[1,1,0,0]",   # unsigned median of 0xfff0, 5, 0xfff5 = 0xfff0 in lo
+            "v_med3_i16 v10, v1, v2, v3",
+            "v_med3_u16 v11, v1, v2, v3",
+        ], "v_med3_i16 / v_med3_u16 signed vs unsigned median with op_sel"),
+    ]
+
+    # 22. v_swaprel_b32 (M0[25:16] dst offset, M0[9:0] src offset, ignored upper M0 bits, self-swap, inactive EXEC)
+    cases += [
+        _valu4_case("valu_swaprel", "v_swaprel_offsets_and_ignored_m0", [
+            "v_mov_b32 v8, 0x11111111", "v_mov_b32 v9, 0x22222222",
+            "v_mov_b32 v10, 0x33333333", "v_mov_b32 v11, 0x44444444",
+            "s_mov_b32 m0, 0xfc01fc02",      # dst_off=1 (v9), src_off=2 (v10); upper M0 bits ignored
+            "v_swaprel_b32 v8, v8",
+        ], "v_swaprel_b32 M0[25:16] and M0[9:0] offsets with ignored upper M0 bits"),
+        _valu4_case("valu_swaprel", "v_swaprel_self_and_inactive_exec", [
+            "v_mov_b32 v8, 0x12345678", "v_mov_b32 v9, 0x9abcdef0",
+            "v_mov_b32 v10, 0x55555555", "v_mov_b32 v11, 0x66666666",
+            "s_mov_b32 m0, 0x00000001",
+            "v_swaprel_b32 v9, v8",          # self-swap v9 <-> v9 (unchanged)
+            "s_mov_b32 m0, 0x00010002",
+            "{smov} {stmp}, {exec}",
+            "{smov} {exec}, 0",
+            "v_swaprel_b32 v8, v8",          # inactive lane leaves v9 and v10 untouched
+            "{smov} {exec}, {stmp}",
+        ], "v_swaprel_b32 self-swap and inactive EXEC lane preservation"),
+    ]
+
+    # 23. v_pack_b32_f16 source abs / -|src| modifiers (including -0 and -qNaN payload)
+    cases += [
+        _valu4_case("valu_pack_b32_f16_abs", "v_pack_b32_f16_abs_neg_opsel", [
+            "v_mov_b32 v1, 0xfe01bc00", "v_mov_b32 v2, 0x8000fe05",
+            "v_pack_b32_f16 v8, |v1|, |v2|",
+            "v_pack_b32_f16 v9, |v1|, |v2| op_sel:[1,1]",
+            "v_pack_b32_f16 v10, -|v1|, -|v2| op_sel:[1,0]",
+            "v_pack_b32_f16 v11, -v1, |v2| op_sel:[0,1]",
+        ], "v_pack_b32_f16 abs and -|src| with op_sel on -1.0, -0.0 and -qNaN payloads"),
+    ]
+
     return cases
 
 
