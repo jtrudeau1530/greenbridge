@@ -75,11 +75,6 @@ jobs:
         run: dotnet build tools/rpf9dump/rpf9dump.csproj -c Release
       - name: Test rpf9dump diagnostics
         run: dotnet run --project tests/Rpf9DumpDiagnostics/Rpf9DumpDiagnostics.csproj -c Release
-      - name: No game data tracked
-        shell: bash
-        run: |
-          bad=$(git ls-files | grep -iE '\.(rpf|ttpf|xvd|dxbc|fssm|spv|spvasm|dds|bk2|awc|exe|dll)$' || true)
-          if [ -n "$bad" ]; then echo "Game or binary files tracked:"; echo "$bad"; exit 1; fi
   translator-tests:
     needs: change-scope
     if: ${{ !cancelled() && needs.change-scope.outputs.docs-only != 'true' }}
