@@ -280,8 +280,16 @@ public:
     }
     BOOL STDMETHODCALLTYPE IsTemporaryMonoSupported() override { return FALSE; }
     HRESULT STDMETHODCALLTYPE GetRestrictToOutput(IDXGIOutput**) override { return E_NOTIMPL; }
-    HRESULT STDMETHODCALLTYPE SetBackgroundColor(const DXGI_RGBA*) override { return S_OK; }
-    HRESULT STDMETHODCALLTYPE GetBackgroundColor(DXGI_RGBA*) override { return E_NOTIMPL; }
+    HRESULT STDMETHODCALLTYPE SetBackgroundColor(const DXGI_RGBA* color) override {
+        if (!color) return E_INVALIDARG;
+        background_color_ = *color;
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE GetBackgroundColor(DXGI_RGBA* color) override {
+        if (!color) return E_INVALIDARG;
+        *color = background_color_;
+        return S_OK;
+    }
     HRESULT STDMETHODCALLTYPE SetRotation(DXGI_MODE_ROTATION) override { return S_OK; }
     HRESULT STDMETHODCALLTYPE GetRotation(DXGI_MODE_ROTATION* r) override {
         if (r) *r = DXGI_MODE_ROTATION_IDENTITY;
@@ -317,8 +325,16 @@ public:
             return nullptr;
         return dup;
     }
-    HRESULT STDMETHODCALLTYPE SetMatrixTransform(const DXGI_MATRIX_3X2_F*) override { return S_OK; }
-    HRESULT STDMETHODCALLTYPE GetMatrixTransform(DXGI_MATRIX_3X2_F*) override { return E_NOTIMPL; }
+    HRESULT STDMETHODCALLTYPE SetMatrixTransform(const DXGI_MATRIX_3X2_F* matrix) override {
+        if (!matrix) return E_INVALIDARG;
+        matrix_transform_ = *matrix;
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE GetMatrixTransform(DXGI_MATRIX_3X2_F* matrix) override {
+        if (!matrix) return E_INVALIDARG;
+        *matrix = matrix_transform_;
+        return S_OK;
+    }
 
     // IDXGISwapChain3
     UINT STDMETHODCALLTYPE GetCurrentBackBufferIndex() override { return swapchain_.current_back_buffer_index(); }
@@ -382,6 +398,8 @@ private:
     std::vector<BackBufferResource*> buffers_;
     std::atomic<UINT> present_count_{0};
     std::atomic<UINT> max_frame_latency_{2};
+    DXGI_RGBA background_color_{0, 0, 0, 0};
+    DXGI_MATRIX_3X2_F matrix_transform_{1, 0, 0, 1, 0, 0};
 };
 
 struct ReservationState {
