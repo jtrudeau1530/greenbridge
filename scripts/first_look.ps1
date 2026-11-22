@@ -28,6 +28,7 @@ $rt = Join-Path $root "runtime\build\gta6rt.exe"
 if (-not (Test-Path $rt)) { & (Join-Path $PSScriptRoot "build_runtime.ps1") }
 Write-Host "`n== Loader dry run (map, relocate, bind imports; nothing executes)"
 & $rt --dry-run $Exe --game-dir $GameDir 2>&1 | Tee-Object (Join-Path $out "dryrun.txt") | Select-Object -Last 40
+$dryRunExitCode = $LASTEXITCODE
 
 # Shim to-do list, grouped by DLL, most functions first.
 $report = Get-Content (Join-Path $out "$([IO.Path]::GetFileName($Exe)).json") -Raw | ConvertFrom-Json
@@ -39,3 +40,4 @@ $lines
 $enc = $report.sections | Where-Object { $_.looks_encrypted } | ForEach-Object { $_.name }
 if ($enc) { Write-Warning "High-entropy sections (still encrypted or packed): $($enc -join ', ')" }
 Write-Host "`nReports: $out"
+exit $dryRunExitCode
