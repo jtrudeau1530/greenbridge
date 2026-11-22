@@ -2,6 +2,7 @@
 // Huffman blocks, compressed from synthetic data with Python's zlib), the JSON reader, FSSM extraction from a
 // synthetic DXBC container, and index lookup by content hash. No game data.
 #include "../src/shader_library.h"
+#include "test_temp_dir.h"
 
 #include <cstdio>
 #include <filesystem>
@@ -343,7 +344,8 @@ int main() {
     CHECK(fssm_program(container({{dynamic, 600}, {fixed, 25}})) == bytes("hello hello hello leonida"));
 
     // An index with one findable shader, one without a hash, and the module next to it.
-    const auto dir = std::filesystem::temp_directory_path() / "leonida_shader_library_test";
+    const testfiles::ScratchDir scratch("leonida_shader_library_test");
+    const auto& dir = scratch.path();
     std::filesystem::create_directories(dir);
     const std::string hash = sha256_hex(skewed(600));
     const std::string hash2 = sha256_hex(bytes("another program"));

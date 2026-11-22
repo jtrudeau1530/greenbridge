@@ -9,6 +9,7 @@
 // The shader (test/glsl/cs_user_data.comp) is written to the translator's push-constant and address contract.
 // No game data. Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation.
 #include "shader_fixture_path.h"
+#include "test_temp_dir.h"
 #include "vk_test_device.h"
 #include "../shims/d3d12_com.h"
 #include "../src/gfx10_descriptors.h"
@@ -268,10 +269,9 @@ int main() {
     for (std::uint32_t i = 0; i < 14; ++i) put32(fssm, 0xbf810000u + i);  // filler, s_endpgm-like words
     const auto container = shader_container(fssm);
     EXPECT(leonida::fssm_program(container) == fssm);
-    const auto library = std::filesystem::temp_directory_path() / "leonida_compute_test";
-    std::filesystem::create_directories(library);
-    std::filesystem::copy_file(vktest::shader_fixture_path(LEONIDA_TEST_CS_SPV), library / "cs_user_data.spv",
-                               std::filesystem::copy_options::overwrite_existing);
+    const testfiles::ScratchDir scratch("leonida_compute_test");
+    const auto& library = scratch.path();
+    EXPECT(testfiles::copy_file(vktest::shader_fixture_path(LEONIDA_TEST_CS_SPV), library / "cs_user_data.spv"));
     {
         std::ofstream index(library / "index.json", std::ios::binary);
         // An entry for the same program with set-0 bindings comes first, as in one group of the corpus: the PSO
@@ -702,7 +702,6 @@ int main() {
         fence.reset();
         EXPECT(rt::d3d12_xs::device_proxy_ref_count(device.p) == 1);
     }
-    std::filesystem::remove_all(library);
 
     unsigned mismatches = 0;
     for (std::uint32_t i = 0; i < elements; ++i) {

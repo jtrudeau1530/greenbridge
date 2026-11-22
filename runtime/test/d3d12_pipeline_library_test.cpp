@@ -9,6 +9,7 @@
 //   - GPU execution of both loaded compute and loaded graphics PSOs under LEONIDA_VK_VALIDATION=1.
 // No game data.
 #include "shader_fixture_path.h"
+#include "test_temp_dir.h"
 #include "vk_test_device.h"
 #include "d3d12_test_shaders.h"
 #include "../shims/d3d12_com.h"
@@ -68,14 +69,11 @@ int main() {
     const auto vs_dxbc = shader_container(vs_prog);
     const auto ps_dxbc = shader_container(ps_prog);
 
-    const auto lib_dir = std::filesystem::temp_directory_path() / "leonida_pipeline_library_test";
-    std::filesystem::create_directories(lib_dir);
-    std::filesystem::copy_file(vktest::shader_fixture_path(LEONIDA_TEST_CS_SPV), lib_dir / "cs.spv",
-                               std::filesystem::copy_options::overwrite_existing);
-    std::filesystem::copy_file(vktest::shader_fixture_path(LEONIDA_TEST_VS_SPV), lib_dir / "vs.spv",
-                               std::filesystem::copy_options::overwrite_existing);
-    std::filesystem::copy_file(vktest::shader_fixture_path(LEONIDA_TEST_PS_SPV), lib_dir / "ps.spv",
-                               std::filesystem::copy_options::overwrite_existing);
+    const testfiles::ScratchDir scratch("leonida_pipeline_library_test");
+    const auto& lib_dir = scratch.path();
+    EXPECT(testfiles::copy_file(vktest::shader_fixture_path(LEONIDA_TEST_CS_SPV), lib_dir / "cs.spv"));
+    EXPECT(testfiles::copy_file(vktest::shader_fixture_path(LEONIDA_TEST_VS_SPV), lib_dir / "vs.spv"));
+    EXPECT(testfiles::copy_file(vktest::shader_fixture_path(LEONIDA_TEST_PS_SPV), lib_dir / "ps.spv"));
     {
         std::ofstream idx(lib_dir / "index.json", std::ios::binary);
         idx << "{\"cs\": {\"stage\": \"cs\", \"fssm_sha256\": \"" << leonida::sha256_hex(cs_prog)
