@@ -331,6 +331,23 @@ class ClipChannelTest(unittest.TestCase):
         self.assertNotIn(("mover", "translation"), out)
         self.assertEqual(tally["tracks_mover_skipped"], 1)
 
+    def test_single_frame_pose_window_keeps_only_that_frame(self):
+        out, _ = self.channels(2 / 30, 2 / 30, 1.0)
+        times = [t for t, _v in out[(0, "rotation")]]
+        self.assertEqual(len(times), 1)
+        self.assertAlmostEqual(times[0], 0.0, places=6)
+
+    def test_select_clips_handles_non_hex_0x_names_and_bad_selectors(self):
+        d = {
+            "clips": [
+                {"kind": "clip", "name": "other.clip", "hash": 0x11111111},
+                {"kind": "clip", "name": "0x_intro.clip", "hash": 0x22222222},
+            ]
+        }
+        self.assertEqual([c["hash"] for c in anim_glb.select_clips(d, ["0x_intro"])], [0x22222222])
+        with self.assertRaisesRegex(anim_glb.ExportError, "0xbad"):
+            anim_glb.select_clips(d, ["0xbad"])
+
 
 class ExportTest(unittest.TestCase):
     def setUp(self):
