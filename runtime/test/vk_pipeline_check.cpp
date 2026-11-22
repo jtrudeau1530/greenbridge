@@ -9,7 +9,7 @@
 // whose required features or partner stubs are unavailable are reported as skipped rather than failed.
 //   [cache.bin]   loaded first if it exists (a stopped run resumes: cached pipelines are instant), saved every
 //                 10 minutes and at the end
-//   --jobs N      compile on N threads (default: half the hardware threads)
+//   --jobs N      compile on up to N worker threads (default: half the hardware threads)
 //   --large-module-bytes N  compile modules larger than N bytes alone (default: 4194304; 0 disables isolation)
 //   --start I --count N   check only index entries [I, I+N) (sorted by name)
 //   --slow SEC    print pipelines slower than SEC (default 30); compiles past 60 s are named while running
@@ -1014,8 +1014,9 @@ int main(int argc, char** argv) {
         }
     };
 
+    const auto worker_count = static_cast<unsigned>(std::min<size_t>(jobs, work.size()));
     std::fprintf(stderr, "checking %zu shaders [%zu, %zu) (stage=%s) on %u threads\n",
-                 work.size(), lo, hi, stage_filter.c_str(), jobs);
+                 work.size(), lo, hi, stage_filter.c_str(), worker_count);
 
     std::mutex mu;  // guards counters, stdout, stub cache and in-flight table
     std::shared_mutex compile_gate;  // large modules exclude other shader and pipeline work
@@ -1431,7 +1432,7 @@ int main(int argc, char** argv) {
     if (iso_child) std::printf("ISO-READY\n");
     std::fflush(stdout);
     std::vector<std::thread> pool;
-    for (uint32_t t = 0; t < jobs; t++) pool.emplace_back(worker);
+    for (unsigned t = 0; t < worker_count; t++) pool.emplace_back(worker);
     // Watchdog: names every compile running past 60 s (about once a minute) and saves the cache every 10 minutes.
     std::condition_variable watch_cv;
     bool all_done = false;
@@ -1532,7 +1533,7 @@ int main(int argc, char** argv) {
     if (isolated_modules)
         std::printf("large modules checked exclusively: %zu (over %zu bytes)\n", isolated_modules,
                     large_module_bytes);
-    std::printf("wall time: %.1fs on %u threads\n", elapsed(), jobs);
+    std::printf("wall time: %.1fs on %u threads\n", elapsed(), worker_count);
     const bool cache_saved = save_cache(true);  // keep successful pipelines even if another entry failed
     if (stats_out) std::fclose(stats_out);
     return (check_failed || !cache_saved) ? 1 : 0;
