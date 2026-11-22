@@ -137,3 +137,126 @@ def test_cli_rejects_malformed_stage_assignment():
                 assert "expected STAGE=SGPR" in result.stderr
                 assert "Traceback" not in result.stderr
                 assert not report.exists()
+
+
+TOOL = os.path.join(ROOT, "tools", "user_sgpr_census.py")
+
+
+def run_cli(*args):
+    return subprocess.run([sys.executable, "-I", TOOL, *map(str, args)], capture_output=True, text=True,
+                          encoding="utf-8", errors="replace")
+
+
+def assert_one_error_line(result, *fragments):
+    assert result.returncode == 2, result.stdout + result.stderr
+    assert "Traceback" not in result.stderr
+    lines = result.stderr.splitlines()
+    assert len(lines) == 1 and lines[0].startswith("ERROR: "), result.stderr
+    for fragment in fragments:
+        assert fragment in lines[0]
+    assert result.stdout == ""
+
+
+@pytest.mark.parametrize("kind", ["missing", "folder", "empty", "not-json", "not-utf8", "nested-too-deep"])
+def test_cli_unreadable_index_is_one_error_line(tmp_path, kind):
+    index = tmp_path / "index.json"
+    if kind == "folder":
+        index.mkdir()
+    elif kind != "missing":
+        index.write_bytes({"empty": b"", "not-json": b"{not json", "not-utf8": b"\xff\xfe{}",
+                           "nested-too-deep": b"[" * 100000}[kind])
+    report = tmp_path / "report.json"
+
+    result = run_cli(index, "--json", report)
+
+    assert_one_error_line(result, "cannot read", str(index))
+    assert not report.exists()
+
+
+WRONG_SHAPES = [
+    ([], "expected a JSON object of shader -> metadata entries"),
+    ("text", "expected a JSON object of shader -> metadata entries"),
+    ({"a.ps": []}, "a.ps: each shader entry must be a JSON object"),
+    ({"a.ps": {"stage": 3}}, "a.ps: 'stage' must be a string"),
+    ({"a.ps": {"stage": "ps", "user_sgpr_reads": {"sgpr": 8}}}, "a.ps: 'user_sgpr_reads' must be a JSON array"),
+    ({"a.ps": {"stage": "ps", "user_sgpr_reads": [8]}}, "a.ps: each read needs 'sgpr' and 'kind' fields"),
+    ({"a.ps": {"stage": "ps", "user_sgpr_reads": [{"sgpr": 8}]}}, "a.ps: each read needs 'sgpr' and 'kind' fields"),
+    ({"a.ps": {"stage": "ps", "user_sgpr_reads": [{"kind": "const32"}]}},
+     "a.ps: each read needs 'sgpr' and 'kind' fields"),
+    ({"a.ps": {"stage": "ps", "user_sgpr_reads": [{"sgpr": "8", "kind": "ptr32_lo"}]}},
+     "a.ps: each read 'sgpr' must be a nonnegative integer"),
+    ({"a.ps": {"stage": "ps", "user_sgpr_reads": [{"sgpr": -1, "kind": "ptr32_lo"}]}},
+     "a.ps: each read 'sgpr' must be a nonnegative integer"),
+    ({"a.ps": {"stage": "ps", "user_sgpr_reads": [{"sgpr": True, "kind": "ptr32_lo"}]}},
+     "a.ps: each read 'sgpr' must be a nonnegative integer"),
+    ({"a.ps": {"stage": "ps", "user_sgpr_reads": [{"sgpr": 8.5, "kind": "ptr32_lo"}]}},
+     "a.ps: each read 'sgpr' must be a nonnegative integer"),
+    ({"a.ps": {"stage": "ps", "user_sgpr_reads": [{"sgpr": 8, "kind": None}]}},
+     "a.ps: each read kind must be a string"),
+    # A good entry first: the whole index is checked, not only its first shader.
+    ({**INDEX, "z.ps": {"stage": "ps", "user_sgpr_reads": [{"sgpr": 8, "kind": ["ptr32_lo"]}]}},
+     "z.ps: each read kind must be a string"),
+]
+
+
+@pytest.mark.parametrize("document,message", WRONG_SHAPES, ids=[str(i) for i in range(len(WRONG_SHAPES))])
+def test_wrongly_shaped_index_is_one_error_line(tmp_path, capsys, document, message):
+    index = tmp_path / "index.json"
+    report = tmp_path / "report.json"
+    index.write_text(json.dumps(document), encoding="utf-8")
+
+    assert usc.main([str(index), "--json", str(report), "--base", "ps=8", "--expect", "ps=8"]) == 2
+
+    captured = capsys.readouterr()
+    assert captured.err == f"ERROR: {index}: {message}\n"
+    assert captured.out == ""
+    assert not report.exists()
+
+
+def test_cli_wrongly_shaped_index_has_no_traceback(tmp_path):
+    index = tmp_path / "index.json"
+    index.write_text(json.dumps({"a.ps": {"stage": "ps", "user_sgpr_reads": [{"sgpr": 8}, {"sgpr": 9, "kind": "x"}]}}),
+                     encoding="utf-8")
+
+    assert_one_error_line(run_cli(index), "a.ps: each read needs 'sgpr' and 'kind' fields")
+
+
+def test_entries_without_stage_or_reads_are_still_counted(tmp_path, capsys):
+    index = tmp_path / "index.json"
+    index.write_text(json.dumps({"a": {}, "b": {"user_sgpr_reads": None}, "c.ps": {"stage": "ps"},
+                                 "d.ps": {"stage": "ps", "user_sgpr_reads": reads((8, "ptr32_lo"))}}),
+                     encoding="utf-8")
+    report = tmp_path / "report.json"
+
+    assert usc.main([str(index), "--json", str(report)]) == 0
+
+    summary = json.loads(report.read_text(encoding="utf-8"))
+    assert (summary["?"]["shaders"], summary["ps"]["shaders"]) == (2, 2)
+    assert summary["ps"]["lowest_pointer_sgpr"] == {"s8": 1}
+    assert capsys.readouterr().err == ""
+
+
+@pytest.mark.parametrize("kind", ["missing-folder", "folder", "under-a-file"])
+def test_cli_unwritable_report_is_one_error_line(tmp_path, kind):
+    index = tmp_path / "index.json"
+    index.write_text(json.dumps(INDEX), encoding="utf-8")
+    if kind == "missing-folder":
+        report = tmp_path / "missing" / "report.json"
+    elif kind == "folder":
+        report = tmp_path / "report.json"
+        report.mkdir()
+    else:
+        blocker = tmp_path / "blocker"
+        blocker.write_bytes(b"keep")
+        report = blocker / "report.json"
+
+    result = run_cli(index, "--json", report)
+
+    assert result.returncode == 2, result.stdout + result.stderr
+    assert "Traceback" not in result.stderr
+    lines = result.stderr.splitlines()
+    assert len(lines) == 1 and lines[0].startswith(f"ERROR: cannot write {report}: "), result.stderr
+    assert "ps: 3 shaders" in result.stdout          # the census itself ran and was printed
+    assert json.loads(index.read_text(encoding="utf-8")) == INDEX
+    if kind == "under-a-file":
+        assert blocker.read_bytes() == b"keep"

@@ -27,6 +27,15 @@ int main() {
     if (GetModuleHandleW(L"tiny_bundled_dll.dll") != nullptr)
         return fail("GetModuleHandleW before LoadLibrary should be NULL", 0);
 
+    // DONT_RESOLVE_DLL_REFERENCES must fail explicitly rather than silently resolving imports and running DllMain.
+    SetLastError(0);
+    if (LoadLibraryExW(L"tiny_bundled_dll.dll", nullptr, DONT_RESOLVE_DLL_REFERENCES) != nullptr ||
+        GetLastError() != ERROR_NOT_SUPPORTED) {
+        return fail("LoadLibraryExW(DONT_RESOLVE_DLL_REFERENCES) fails with ERROR_NOT_SUPPORTED", GetLastError());
+    }
+    if (GetModuleHandleW(L"tiny_bundled_dll.dll") != nullptr)
+        return fail("DONT_RESOLVE_DLL_REFERENCES must not map or register the bundled DLL", 0);
+
     HMODULE mod = LoadLibraryW(L"tiny_bundled_dll.dll");
     if (!mod) return fail("LoadLibraryW(tiny_bundled_dll.dll)", GetLastError());
 

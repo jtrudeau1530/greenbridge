@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 
 #include "shims.h"
 
@@ -84,6 +85,100 @@ BOOL __stdcall XMemGetWorkingSetStatistics(uint32_t /*kind*/, void* stats) {
     return TRUE;
 }
 
+// XMem allocation-type page bits select the guest page granularity and must not be forwarded as Win32 flags.
+constexpr DWORD kXmemLargePages = 0x20000000;
+constexpr DWORD kXmem64kPages = 0x20400000;
+constexpr DWORD kXmemPageModeMask = kXmem64kPages;
+constexpr SIZE_T kXmemPageSize64k = 0x10000;
+constexpr DWORD kXmemHostAllocationTypeMask =
+    MEM_COMMIT | MEM_RESERVE | MEM_RESET | MEM_TOP_DOWN | MEM_WRITE_WATCH | 0x01000000;
+
+bool round_up_size(SIZE_T value, SIZE_T alignment, SIZE_T& rounded) {
+    const SIZE_T max = (std::numeric_limits<SIZE_T>::max)();
+    if (alignment == 0 || (alignment & (alignment - 1)) != 0 || value > max - (alignment - 1)) return false;
+    rounded = (value + alignment - 1) & ~(alignment - 1);
+    return true;
+}
+
+void* WINAPI XMemVirtualAlloc(void* address, SIZE_T size, DWORD allocation_type, ULONGLONG attributes, DWORD protect) {
+    // Host-backed support covers ordinary and 64 KiB guest reservations. The 2 MiB guest mode needs an aligned
+    // reservation strategy that this shim does not provide, so fail explicitly instead of returning a misaligned
+    // region. Nonzero attribute flags also fail until their host mapping is known.
+    if (size == 0) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return nullptr;
+    }
+    if (attributes != 0) {
+        SetLastError(ERROR_NOT_SUPPORTED);
+        return nullptr;
+    }
+
+    const DWORD page_mode = allocation_type & kXmemPageModeMask;
+    if (page_mode == kXmemLargePages) {
+        SetLastError(ERROR_NOT_SUPPORTED);
+        return nullptr;
+    }
+    if (page_mode != 0 && page_mode != kXmem64kPages) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return nullptr;
+    }
+
+    const DWORD unsupported = allocation_type & ~(kXmemHostAllocationTypeMask | kXmemPageModeMask);
+    if (unsupported != 0) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return nullptr;
+    }
+
+    DWORD host_type = allocation_type & kXmemHostAllocationTypeMask;
+    if (host_type == 0) host_type = MEM_RESERVE | MEM_COMMIT;
+
+    SYSTEM_INFO system_info{};
+    GetSystemInfo(&system_info);
+    const SIZE_T page_granularity = page_mode == kXmem64kPages ? kXmemPageSize64k : system_info.dwPageSize;
+    const SIZE_T base_granularity =
+        page_mode == kXmem64kPages
+            ? kXmemPageSize64k
+            : ((host_type & MEM_RESERVE) ? system_info.dwAllocationGranularity : system_info.dwPageSize);
+    if (page_granularity == 0 || (page_granularity & (page_granularity - 1)) != 0 || base_granularity == 0 ||
+        (base_granularity & (base_granularity - 1)) != 0) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return nullptr;
+    }
+
+    if (address != nullptr) {
+        const uintptr_t requested = reinterpret_cast<uintptr_t>(address);
+        const uintptr_t max = (std::numeric_limits<uintptr_t>::max)();
+        if (size > max - requested) {
+            SetLastError(ERROR_INVALID_PARAMETER);
+            return nullptr;
+        }
+        const uintptr_t requested_end = requested + size;
+        const uintptr_t base = requested & ~(static_cast<uintptr_t>(base_granularity) - 1);
+        if (requested_end > max - (static_cast<uintptr_t>(page_granularity) - 1)) {
+            SetLastError(ERROR_INVALID_PARAMETER);
+            return nullptr;
+        }
+        const uintptr_t end = (requested_end + static_cast<uintptr_t>(page_granularity) - 1) &
+                              ~(static_cast<uintptr_t>(page_granularity) - 1);
+        address = reinterpret_cast<void*>(base);
+        size = static_cast<SIZE_T>(end - base);
+    } else if (page_mode == kXmem64kPages && !round_up_size(size, page_granularity, size)) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return nullptr;
+    }
+
+    return VirtualAlloc(address, size, host_type, protect);
+}
+
+UINT WINAPI XMemGetWriteWatch(DWORD flags, void* base_address, SIZE_T region_size, void** addresses, ULONG_PTR* count,
+                              ULONG* granularity) {
+    return GetWriteWatch(flags, base_address, region_size, addresses, count, granularity);
+}
+
+UINT WINAPI XMemResetWriteWatch(void* base_address, SIZE_T region_size) {
+    return ResetWriteWatch(base_address, region_size);
+}
+
 }  // namespace
 
 SHIM_TABLE(xmem,
@@ -91,4 +186,7 @@ SHIM_TABLE(xmem,
     {"xmem.dll", "XMemFree", reinterpret_cast<void*>(&XMemFree)},
     {"xmem.dll", "XMemVirtualQuery", reinterpret_cast<void*>(&XMemVirtualQuery)},
     {"xmem.dll", "XMemGetWorkingSetStatistics", reinterpret_cast<void*>(&XMemGetWorkingSetStatistics)},
+    {"xmem.dll", "XMemVirtualAlloc", reinterpret_cast<void*>(&XMemVirtualAlloc)},
+    {"xmem.dll", "XMemGetWriteWatch", reinterpret_cast<void*>(&XMemGetWriteWatch)},
+    {"xmem.dll", "XMemResetWriteWatch", reinterpret_cast<void*>(&XMemResetWriteWatch)},
 );

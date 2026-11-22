@@ -268,6 +268,18 @@ def self_test():
     return 0
 
 
+def write_report(path, doc):
+    """Write the JSON report, creating its folder; one ERROR line instead of a traceback on failure."""
+    try:
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            json.dump(doc, f, indent=1)
+    except OSError as e:
+        print(f"ERROR: cannot write {path}: {e}", file=sys.stderr)
+        return False
+    return True
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--formats", default=",".join(FORMATS))
@@ -283,6 +295,8 @@ def main(argv=None):
     bad = [f for f in fmts if f not in FORMATS] + [w for w in a.waves.split(",") if w and w not in ("32", "64")]
     if bad or not fmts or not waves:
         ap.error("unknown or empty: " + ", ".join(bad or ["--formats/--waves"]))
+    if a.json and os.path.isdir(a.json):
+        ap.error(f"--json {a.json} is a folder, not a file")
     from hw_oracle import asm, runner
     try:
         oracle = runner.open_oracle(arch=a.hw_arch)
@@ -327,9 +341,8 @@ def main(argv=None):
         return 2
     finally:
         oracle.close()
-    if a.json:
-        with open(a.json, "w", encoding="utf-8", newline="\n") as f:
-            json.dump(report, f, indent=1)
+    if a.json and not write_report(a.json, report):
+        return 2
     return rc
 
 
