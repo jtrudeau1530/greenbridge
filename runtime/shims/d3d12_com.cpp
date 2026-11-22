@@ -3,8 +3,11 @@
 #include "d3d12_stubs.h"  // generated
 #include "d3d12_com_object.h"
 #include "d3d12_trace.h"
+#include "../src/gfx10_descriptors.h"
 
+#include <array>
 #include <atomic>
+#include <bit>
 #include <condition_variable>
 #include <cstdio>
 #include <cstring>
@@ -254,6 +257,26 @@ public:
                                         stencil, to_rects(count, rects)));
     }
 
+    // The CPU handle's slot holds the view as the GFX10 descriptor a shader would load (docs/d3d12_vulkan.md
+    // section 3.4): a T# for a texture, a V# for a buffer. It is read now, because the slot may be rewritten before
+    // the list runs. The GPU handle names the same view in a shader-visible heap and is not needed.
+    void STDMETHODCALLTYPE ClearUnorderedAccessViewUint(D3D12_GPU_DESCRIPTOR_HANDLE, D3D12_CPU_DESCRIPTOR_HANDLE view,
+                                                        ID3D12Resource* resource, const UINT values[4], UINT count,
+                                                        const D3D12_RECT* rects) override {
+        if (!values) return check(false);
+        clear_unordered_access(view, resource, false, {values[0], values[1], values[2], values[3]}, count, rects);
+    }
+
+    void STDMETHODCALLTYPE ClearUnorderedAccessViewFloat(D3D12_GPU_DESCRIPTOR_HANDLE, D3D12_CPU_DESCRIPTOR_HANDLE view,
+                                                         ID3D12Resource* resource, const FLOAT values[4], UINT count,
+                                                         const D3D12_RECT* rects) override {
+        if (!values) return check(false);
+        clear_unordered_access(view, resource, true,
+                               {std::bit_cast<std::uint32_t>(values[0]), std::bit_cast<std::uint32_t>(values[1]),
+                                std::bit_cast<std::uint32_t>(values[2]), std::bit_cast<std::uint32_t>(values[3])},
+                               count, rects);
+    }
+
     // GCL8. Vulkan can set the two faces independently with vkCmdSetStencilReference(VK_STENCIL_FACE_FRONT_BIT /
     // BACK_BIT), but that state only matters when a pipeline uses it, and this layer has no pipeline or draw path
     // yet. Retain the values for that path and report that nothing consumed them, rather than emit a call whose
@@ -293,6 +316,67 @@ private:
 
     void check(bool ok) {
         if (!ok) invalid_ = true;
+    }
+
+    void clear_unordered_access(D3D12_CPU_DESCRIPTOR_HANDLE view, ID3D12Resource* resource, bool is_float,
+                                const std::array<std::uint32_t, 4>& values, UINT count, const D3D12_RECT* rects) {
+        leonida::UavView target{};
+        if (!view.ptr || !resource || !unordered_access_view(view, resource, target)) return check(false);
+        check(list_.clear_unordered_access(target, is_float, values, to_rects(count, rects)));
+    }
+
+    // The Vulkan format a descriptor's FORMAT and DST_SEL name: a UAV has no component mapping of its own, so its
+    // DST_SEL is the one its format reads R, G, B, A with (gfx10::format_swizzle), which tells B8G8R8A8 from
+    // R8G8B8A8. VK_FORMAT_UNDEFINED: not a format the table has.
+    static VkFormat descriptor_format(std::uint32_t code, const leonida::gfx10::Swizzle& swizzle) {
+        for (const auto& row : leonida::gfx10::format_table)
+            if (row.gfx10 == code && row.channels == swizzle) return row.vulkan;
+        return leonida::gfx10::vulkan_format(code);
+    }
+
+    // A V#: stride 0 and no format is a raw buffer of NUM_RECORDS bytes, a stride without a format a structured one
+    // of NUM_RECORDS records, and a format a typed one of NUM_RECORDS elements. Its address is a GPU VA, so the
+    // view starts at that minus the resource's own.
+    static bool unordered_access_view(D3D12_CPU_DESCRIPTOR_HANDLE handle, ID3D12Resource* resource,
+                                      leonida::UavView& out) {
+        namespace g = leonida::gfx10;
+        g::ImageWords words{};
+        std::memcpy(words.data(), reinterpret_cast<const void*>(handle.ptr), sizeof(words));
+        out.resource = resource_id(resource);
+        if (g::is_image(words)) {
+            g::Image image{};
+            if (!g::decode(words, image)) return false;
+            const bool volume = image.type == g::ImageType::image_3d;
+            out.buffer = false;
+            out.format = std::uint32_t(descriptor_format(image.format, image.swizzle));
+            out.mip = image.first_mip;
+            out.first_layer = volume ? 0 : image.first_layer;  // a 3D view clears every slice of its mip
+            out.layer_count = volume ? 1 : image.layer_count;
+            return out.format != VK_FORMAT_UNDEFINED;
+        }
+        g::BufferWords buffer_words{};
+        std::memcpy(buffer_words.data(), words.data(), sizeof(buffer_words));
+        g::Buffer buffer{};
+        if (!g::decode(buffer_words, buffer)) return false;
+        const UINT64 base = resource->GetGPUVirtualAddress();
+        if (buffer.address < base) return false;
+        out.buffer = true;
+        out.offset = buffer.address - base;
+        if (buffer.format) {
+            const VkFormat format = descriptor_format(buffer.format, buffer.swizzle);
+            const auto* layout = leonida::uav_clear::layout(format);
+            if (!layout) return false;  // not a typed-UAV format
+            out.format = std::uint32_t(format);
+            out.element_size = layout->bytes;
+            out.size = std::uint64_t(buffer.num_records) * layout->bytes;
+        } else if (buffer.stride) {
+            out.element_size = buffer.stride;
+            out.size = std::uint64_t(buffer.num_records) * buffer.stride;
+        } else {
+            out.element_size = 4;
+            out.size = buffer.num_records;
+        }
+        return true;
     }
 
     D3D12_COMMAND_LIST_TYPE type_;

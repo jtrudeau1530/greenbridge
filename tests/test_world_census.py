@@ -15,6 +15,7 @@ import sys
 import tempfile
 import unittest
 import zlib
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -418,13 +419,14 @@ class ScanShardTest(unittest.TestCase):
             self.assertEqual(r["incomplete"], 1)
             self.assertEqual(r["streams"], 4)
             self.assertEqual((r["meta"], r["meta_other"], r["map_meta"]), (1, 1, 0))
-            path = WC._shard_path(tmp, {"index": 0, "start": 0x40, "end": len(data)})
-            self.assertTrue(WC._shard_ok(path, {"index": 0, "start": 0x40, "end": len(data)}))
-            with open(path, encoding="utf-8") as f:
-                doc = json.load(f)
+            want = {"index": 0, "start": 0x40, "end": len(data)}
+            with open(arc, "rb") as f:
+                _, _, source_id = WC._source_info(f)
+            doc = WC._read_shard(tmp, want, source_id)
+            self.assertIsNotNone(doc)
             self.assertEqual(doc["map_first"], 0x40)
             self.assertEqual(len(doc["intervals"]), 4)
-            self.assertFalse(os.path.exists(path + ".tmp"))
+            self.assertEqual(sorted(os.listdir(tmp)), ["s.rpf", os.path.basename(WC._shard_path(tmp, want))])
             s = WC.summarize(arc, tmp, 0x40, len(data), 1 << 30, 0x40)
             self.assertTrue(s["complete"])
             self.assertFalse(s["census_exact"])  # the incomplete resource keeps the census from being exact
@@ -500,28 +502,32 @@ class ClassifyGapsTest(unittest.TestCase):
 
 
 class ShardFileTest(unittest.TestCase):
-    def test_shard_ok_and_load_shards(self):
+    def test_read_and_load_shards(self):
         with tempfile.TemporaryDirectory() as tmp:
             want = WC._expected_shards(0x40, 0x1000, 0x800)
             self.assertEqual(len(want), 2)
-            good = {"format": WC.FORMAT, "start": want[0]["start"], "end": want[0]["end"], "complete": True,
-                    "rows": []}
+            source_id = "one archive"
+            good = {**want[0], "format": WC.FORMAT, "complete": True, "source_id": source_id,
+                    "stats": {}, "rows": [], "intervals": [], "raw_pages": [], "raw_system": []}
             path0, path1 = WC._shard_path(tmp, want[0]), WC._shard_path(tmp, want[1])
             self.assertEqual(os.path.basename(path0), "shard_000_64_2112.json")
-            self.assertFalse(WC._shard_ok(path0, want[0]))  # missing
-            for doc, ok in ((good, True), ({**good, "format": WC.FORMAT - 1}, False),
-                            ({**good, "start": 0}, False), ({**good, "end": 0}, False),
-                            ({**good, "complete": False}, False), ({k: v for k, v in good.items() if k != "complete"}, False)):
+            self.assertIsNone(WC._read_shard(tmp, want[0], source_id))
+            for doc, valid in ((good, True), ({**good, "format": WC.FORMAT - 1}, False),
+                               ({**good, "start": 0}, False), ({**good, "end": 0}, False),
+                               ({**good, "index": 1}, False), ({**good, "complete": False}, False),
+                               ({k: v for k, v in good.items() if k != "complete"}, False),
+                               ({k: v for k, v in good.items() if k != "source_id"}, False),
+                               ({**good, "index": False}, False), ({**good, "rows": None}, False), ([], False)):
                 with self.subTest(doc=doc):
                     with open(path0, "w", encoding="utf-8") as f:
                         json.dump(doc, f)
-                    self.assertEqual(WC._shard_ok(path0, want[0]), ok)
+                    self.assertEqual(WC._read_shard(tmp, want[0], source_id), doc if valid else None)
             with open(path0, "w", encoding="utf-8") as f:
                 f.write("{")
-            self.assertFalse(WC._shard_ok(path0, want[0]))
+            self.assertIsNone(WC._read_shard(tmp, want[0], source_id))
             with open(path1, "w", encoding="utf-8") as f:
-                json.dump({**good, "start": want[1]["start"], "end": want[1]["end"]}, f)
-            self.assertEqual(list(WC._load_shards(tmp, want)), [1])
+                json.dump({**good, **want[1]}, f)
+            self.assertEqual(list(WC._load_shards(tmp, want, source_id)), [1])
 
 
 class AggregateTest(unittest.TestCase):
@@ -644,6 +650,113 @@ class MainTest(unittest.TestCase):
         self.assertEqual(code, 0)
         s = self.summary()
         self.assertEqual((s["scan_start"], s["scan_end"]), (0x40, 0x80))
+
+
+class CensusSourceTest(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.arc = os.path.join(tmp.name, "sample.rpf")
+        self.out = os.path.join(tmp.name, "out")
+        make_archive(self.arc)
+
+    def scan(self, archive, *flags, code=0, to_scan=None):
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            result = WC.main([archive, "--out", self.out, "--shard-size", "850", "--jobs", "1", *flags])
+        self.assertEqual(result, code, stdout.getvalue())
+        if to_scan is not None:
+            self.assertIn(f"4 shards, {to_scan} to scan", stdout.getvalue())
+        with open(os.path.join(self.out, "summary.json"), encoding="utf-8") as f:
+            summary = json.load(f)
+        with open(os.path.join(self.out, "maps.json"), encoding="utf-8") as f:
+            maps = json.load(f)
+        self.assertEqual(maps["summary"], {k: summary[k] for k in maps["summary"]})
+        self.assertEqual(len(maps["maps"]), summary["maps"])
+        self.assertEqual(sum(r["entities"] for r in maps["maps"]), summary["entities"])
+        return summary, maps["maps"]
+
+    def write_empty_archive(self, path):
+        size = os.path.getsize(self.arc)
+        with open(self.arc, "rb") as f:
+            header = f.read(0x40)
+        with open(path, "wb") as f:
+            f.write(header)
+            f.truncate(size)
+
+    def test_other_archive_with_same_size_and_header(self):
+        original, _ = self.scan(self.arc)
+        self.assertEqual(original["maps"], 4)
+        other = os.path.join(os.path.dirname(self.arc), "other.rpf")
+        self.write_empty_archive(other)
+
+        missing, _ = self.scan(other, "--merge-only", code=1)
+        self.assertEqual((missing["shards_complete"], missing["maps"]), (0, 0))
+        self.assertFalse(missing["census_exact"])
+        rebuilt, _ = self.scan(other, "--resume", to_scan=4)
+        self.assertEqual(rebuilt["maps"], 0)
+        self.assertTrue(rebuilt["census_exact"])
+        self.scan(other, "--resume", to_scan=0)
+
+    def test_files_without_file_ids_are_distinguished_by_name(self):
+        other = os.path.join(os.path.dirname(self.arc), "copy.rpf")
+        make_archive(other)
+        stamp = mock.Mock(st_size=os.path.getsize(other), st_dev=0, st_ino=0, st_mtime_ns=1, st_ctime_ns=1)
+        with open(self.arc, "rb") as first, open(other, "rb") as second:
+            with mock.patch.object(os, "fstat", return_value=stamp):
+                self.assertNotEqual(WC._source_info(first)[2], WC._source_info(second)[2])
+                self.assertEqual(WC._source_info(first)[2], WC._source_info(first)[2])
+
+    def test_edit_at_same_path_with_restored_mtime(self):
+        self.scan(self.arc)
+        before = os.stat(self.arc)
+        self.write_empty_archive(self.arc)
+        os.utime(self.arc, ns=(before.st_atime_ns, before.st_mtime_ns))
+        summary, _ = self.scan(self.arc, "--merge-only", code=1)
+        self.assertEqual((summary["shards_complete"], summary["maps"]), (0, 0))
+        self.assertFalse(summary["census_exact"])
+
+    def test_source_replaced_after_gap_audit(self):
+        other = os.path.join(os.path.dirname(self.arc), "replacement.rpf")
+        self.write_empty_archive(other)
+        audit = WC.classify_gaps
+
+        def swap_after_audit(*args):
+            coverage = audit(*args)
+            os.replace(other, self.arc)
+            return coverage
+
+        with mock.patch.object(WC, "classify_gaps", side_effect=swap_after_audit):
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                code = WC.main([self.arc, "--out", self.out, "--jobs", "1"])
+        self.assertEqual(code, 1)
+        self.assertFalse(os.path.exists(os.path.join(self.out, "summary.json")))
+        self.assertFalse(os.path.exists(os.path.join(self.out, "maps.json")))
+
+    def test_mixed_and_legacy_shards_preserve_valid_coverage(self):
+        original, rows = self.scan(self.arc)
+        foreign, legacy = original["shards"][:2]
+        for shard in (foreign, legacy):
+            path = WC._shard_path(self.out, shard)
+            with open(path, encoding="utf-8") as f:
+                doc = json.load(f)
+            if shard is foreign:
+                doc["source_id"] = "different archive"
+            else:
+                doc.pop("source_id", None)
+                doc["format"] = WC.FORMAT - 1
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(doc, f)
+
+        partial, present_rows = self.scan(self.arc, "--merge-only", code=1)
+        self.assertFalse(partial["census_exact"])
+        self.assertEqual(partial["shards_complete"], 2)
+        self.assertEqual(partial["missing_ranges"], [[s["start"], s["end"]] for s in (foreign, legacy)])
+        self.assertTrue(present_rows)
+        self.assertEqual(present_rows, [r for r in rows if r["offset"] >= legacy["end"]])
+        rebuilt, new_rows = self.scan(self.arc, "--resume", to_scan=2)
+        self.assertTrue(rebuilt["census_exact"])
+        self.assertEqual(new_rows, rows)
 
 
 if __name__ == "__main__":

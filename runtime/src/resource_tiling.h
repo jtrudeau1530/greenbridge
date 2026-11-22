@@ -4,13 +4,15 @@
 // (docs/d3d12_vulkan.md section 4.2). No Windows or Vulkan dependency.
 //
 // What D3D12 defines, and d3d12_vulkan_device_test compares with the PC runtime: the standard tile shape for each
-// element size, which mips are standard (at least one tile shape in every dimension) and which are packed (the
-// rest, from the first mip smaller than a tile on any axis), the tile counts of every standard mip, and the order
-// of the tiles: each array slice holds its standard mips in order, then its packed tiles.
+// element size, that a mip filling at least one tile shape in every dimension is standard, the tile counts of every
+// standard mip, and the order of the tiles: each array slice holds its standard mips in order, then its packed tiles.
 //
-// What a driver chooses: how many tiles the packed mips take. Here it is their tight linear size rounded up to
-// whole tiles (at least one). The PC runtime on an NVIDIA GPU sometimes reports one more; applications read the
-// number rather than assume it, and this layer backs every reserved resource fully, so any count is consistent.
+// What a driver chooses (D3D11.3 functional spec 5.9.2.8.5: a mip with any dimension below the tile "may or may not
+// be packed, depending on the IHV"): where the packed tail starts, and how many tiles the packed mips take. Here
+// the tail starts at the first mip smaller than a tile on any axis, as on an NVIDIA GPU; a Radeon 880M keeps one or
+// two more mips standard and WARP packs nothing, and the test accepts all of them. The packed size is their tight
+// linear size rounded up to whole tiles (at least one); NVIDIA sometimes reports one more. Applications read the
+// numbers rather than assume them, and this layer backs every reserved resource fully, so any split is consistent.
 
 #include <algorithm>
 #include <cstdint>

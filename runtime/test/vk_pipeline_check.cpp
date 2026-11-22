@@ -920,11 +920,14 @@ int main(int argc, char** argv) {
     for (auto& [st, _] : modules_bad) all_stages.insert(st);
     for (auto& [st, _] : stats) all_stages.insert(st);
 
+    bool check_failed = false;
     for (const auto& st : all_stages) {
         std::printf("%s: %u modules ok, %u failed\n", st.c_str(), modules_ok[st], modules_bad[st]);
+        if (modules_bad[st]) check_failed = true;
         const auto it = stats.find(st);
         if (it != stats.end()) {
             const auto& s = it->second;
+            if (s.pipes_bad) check_failed = true;
             const uint32_t compiled = s.pipes_ok + s.pipes_bad;
             std::printf("%s pipelines: %u ok, %u failed, %u skipped\n",
                         st.c_str(), s.pipes_ok, s.pipes_bad, s.pipes_skipped);
@@ -953,5 +956,6 @@ int main(int argc, char** argv) {
         std::printf("; checked %zu of %zu\n", work.size() - big_total, work.size());
     }
     std::printf("wall time: %.1fs on %u threads\n", elapsed(), jobs);
-    return save_cache(true) ? 0 : 1;
+    const bool cache_saved = save_cache(true);  // keep successful pipelines even if another entry failed
+    return (check_failed || !cache_saved) ? 1 : 0;
 }
