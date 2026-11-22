@@ -435,5 +435,131 @@ class TestRdna2SpirvTranslationBfeBfi(unittest.TestCase):
             self.assertEqual(words[0], expected)
 
 
+class TestBitfieldRoundtripAndComposition(unittest.TestCase):
+    """Verifies roundtrip invariants, untouched bits preservation, and mask composition."""
+
+    def test_extract_insert_roundtrip_exhaustive_offsets(self):
+        """For any word, extracting [off : off + wid] and re-inserting restores original word."""
+        test_patterns = [
+            0x12345678,
+            0xDEADBEEF,
+            0xA5A5A5A5,
+            0x00000001,
+            0x80000000,
+            0xFFFFFFFF,
+            0x00000000,
+            0xCAFEBABE,
+        ]
+        for base in test_patterns:
+            for off in (0, 1, 4, 7, 8, 12, 16, 20, 24, 28, 31):
+                for wid in (1, 2, 4, 8, 12, 16, 24, 32 - off):
+                    if off + wid > 32 or wid <= 0:
+                        continue
+                    with self.subTest(base=hex(base), off=off, wid=wid):
+                        extracted = ref_v_bfe_u32(base, off, wid)
+                        restored = pack_field(base, extracted, off, wid)
+                        self.assertEqual(restored, base)
+                        isolated = pack_field(0, extracted, off, wid)
+                        mask = make_mask(off, wid)
+                        self.assertEqual(isolated, base & mask)
+
+    def test_untouched_bits_preservation(self):
+        """Inserting a new field value modifies only the masked bits, leaving untouched bits intact."""
+        base = 0xDEADBEEF
+        for off in (0, 4, 8, 16, 24):
+            for wid in (1, 4, 8, 12):
+                if off + wid > 32:
+                    continue
+                mask = make_mask(off, wid)
+                new_val = 0x5A
+                inserted = pack_field(base, new_val, off, wid)
+                self.assertEqual(inserted & (~mask & MASK32), base & (~mask & MASK32))
+                extracted_new = ref_v_bfe_u32(inserted, off, wid)
+                self.assertEqual(extracted_new, new_val & ((1 << wid) - 1))
+
+    def test_rgba8_pack_unpack_roundtrip(self):
+        """Simulate packing and unpacking RGBA8 color components."""
+        r, g, b, a = 0x12, 0x34, 0x56, 0x78
+        packed = 0
+        packed = pack_field(packed, r, 0, 8)
+        packed = pack_field(packed, g, 8, 8)
+        packed = pack_field(packed, b, 16, 8)
+        packed = pack_field(packed, a, 24, 8)
+        self.assertEqual(packed, 0x78563412)
+
+        out_r = ref_v_bfe_u32(packed, 0, 8)
+        out_g = ref_v_bfe_u32(packed, 8, 8)
+        out_b = ref_v_bfe_u32(packed, 16, 8)
+        out_a = ref_v_bfe_u32(packed, 24, 8)
+        self.assertEqual((out_r, out_g, out_b, out_a), (r, g, b, a))
+
+    def test_hdr_r10g10b10a2_pack_unpack(self):
+        """Simulate packing and unpacking HDR10 R10G10B10A2 format."""
+        r10 = 0x3FF
+        g10 = 0x200
+        b10 = 0x155
+        a2 = 0x3
+
+        packed = 0
+        packed = pack_field(packed, r10, 0, 10)
+        packed = pack_field(packed, g10, 10, 10)
+        packed = pack_field(packed, b10, 20, 10)
+        packed = pack_field(packed, a2, 30, 2)
+
+        self.assertEqual(ref_v_bfe_u32(packed, 0, 10), r10)
+        self.assertEqual(ref_v_bfe_u32(packed, 10, 10), g10)
+        self.assertEqual(ref_v_bfe_u32(packed, 20, 10), b10)
+        self.assertEqual(ref_v_bfe_u32(packed, 30, 2), a2)
+
+    def test_rgb565_pack_unpack(self):
+        """Simulate packing and unpacking 16-bit RGB565 in low word."""
+        r5 = 0x1F
+        g6 = 0x2A
+        b5 = 0x0E
+
+        packed = 0
+        packed = pack_field(packed, r5, 0, 5)
+        packed = pack_field(packed, g6, 5, 6)
+        packed = pack_field(packed, b5, 11, 5)
+
+        self.assertEqual(ref_v_bfe_u32(packed, 0, 5), r5)
+        self.assertEqual(ref_v_bfe_u32(packed, 5, 6), g6)
+        self.assertEqual(ref_v_bfe_u32(packed, 11, 5), b5)
+        self.assertEqual(packed >> 16, 0)
+
+    def test_bfi_boolean_xor_equivalence(self):
+        """Verify algebraic equivalence: BFI(m, f, b) == ((m & (f ^ b)) ^ b)."""
+        test_tuples = [
+            (0x00FF0000, 0x12345678, 0x87654321),
+            (0xF0F0F0F0, 0xAAAAAAAA, 0x55555555),
+            (0x12345678, 0xDEADBEEF, 0xCAFEBABE),
+            (0xFFFFFFFF, 0x11111111, 0x22222222),
+            (0x00000000, 0x11111111, 0x22222222),
+        ]
+        for m, f, b in test_tuples:
+            bfi_std = ref_v_bfi_b32(m, f, b)
+            bfi_xor = ((m & (f ^ b)) ^ b) & MASK32
+            self.assertEqual(bfi_std, bfi_xor)
+
+    def test_shader_extract_insert_roundtrip(self):
+        """Run translated shader performing roundtrip extraction and re-insertion."""
+        base = 0x12345678
+        lines = [
+            f"v_mov_b32 v1, {base:#x}",
+            "v_mov_b32 v2, 8",
+            "v_mov_b32 v3, 8",
+            "v_bfe_u32 v4, v1, v2, v3",
+            "v_add_nc_u32 v4, 1, v4",
+            "v_lshlrev_b32 v4, 8, v4",
+            "v_mov_b32 v5, 0x0000FF00",
+            "v_bfi_b32 v0, v5, v4, v1",
+            "v_mov_b32 v1, v0",
+            "v_mov_b32 v2, v0",
+            "v_mov_b32 v3, v0",
+        ]
+        words = run_rdna_ps(lines, name="ps_bfe_bfi_roundtrip")
+        self.assertEqual(words[0], 0x12345778)
+
+
 if __name__ == "__main__":
     unittest.main()
