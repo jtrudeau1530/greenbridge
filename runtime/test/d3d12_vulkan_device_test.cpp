@@ -1434,7 +1434,7 @@ bool integer_format(DXGI_FORMAT format) {
 // FORMAT_SUPPORT bits that D3D12 defines per format rather than per GPU, compared with the host PC runtime on the
 // same adapter for every format both support. Two kinds of check:
 // - against the host: no 1D, 3D, depth-stencil, MIP or atomics the host lacks; storage-only (TYPELESS) formats
-//   stay storage-only; depth formats aren't shader resources; MIP wherever the host has it;
+//   stay storage-only; depth formats are neither shader resources nor UAVs; MIP wherever the host has it;
 // - rules and consistency within the layer: no sample, gather or resolve of integer formats; atomics only on
 //   R32_UINT/R32_SINT, and R32_UINT typed UAVs carry them; gather with sample; typed load with typed store;
 //   MULTISAMPLE_RENDERTARGET only with quality levels, and on depth formats whenever there are quality levels.
@@ -1507,8 +1507,9 @@ int compare_format_support(ID3D12Device* ours, const rt::d3d12::VulkanDeviceInfo
         if ((h1 & dims) && !(h1 & ~storage_only) && !(h2 & ~UINT(D3D12_FORMAT_SUPPORT2_TILED)) &&
             ((o1 & ~storage_only) || o2))
             fail(f, "a storage-only (TYPELESS) format reported with uses of its own", o1, o2, h1, h2);
-        if ((h1 & D3D12_FORMAT_SUPPORT1_DEPTH_STENCIL) && (o1 & shader_reads & ~h1))
-            fail(f, "a depth format reported as a shader resource", o1, o2, h1, h2);
+        if ((h1 & D3D12_FORMAT_SUPPORT1_DEPTH_STENCIL) &&
+            ((o1 & (shader_reads | D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW) & ~h1) || (o2 & ~h2)))
+            fail(f, "a depth format reported as a shader resource or UAV", o1, o2, h1, h2);
         if ((h1 & D3D12_FORMAT_SUPPORT1_MIP) && (o1 & (dims | D3D12_FORMAT_SUPPORT1_DEPTH_STENCIL)) &&
             !(o1 & D3D12_FORMAT_SUPPORT1_MIP))
             fail(f, "no MIP where the host has mips", o1, o2, h1, h2);

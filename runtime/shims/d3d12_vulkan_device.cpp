@@ -3239,13 +3239,17 @@ public:
                 if (DeviceState::numeric_class(vk_fmt) != 0) s1 &= ~D3D12_FORMAT_SUPPORT1_MULTISAMPLE_RESOLVE;
                 // Block-compressed textures are 2D, 3D or cubes: 1D has no 4x4 blocks.
                 if (block_compressed) s1 &= ~D3D12_FORMAT_SUPPORT1_TEXTURE1D;
-                // Depth formats are 2D and cube resources whose shaders read them through a colour view
-                // (R32_FLOAT, R24_UNORM_X8_TYPELESS, ...), not 3D and not shader resources themselves. Native D3D12
-                // also allows 1D, but the layer refuses 1D depth-stencil resources (CreateCommittedResource).
-                if (depth)
+                // Depth formats are 2D and cube resources whose shaders read and write them through a colour view
+                // (R32_FLOAT, R24_UNORM_X8_TYPELESS, ...): not 3D, not shader resources or UAVs themselves (NVIDIA
+                // gives D32_SFLOAT and D16_UNORM STORAGE_IMAGE). Native D3D12 also allows 1D, but the layer refuses
+                // 1D depth-stencil resources (CreateCommittedResource).
+                if (depth) {
                     s1 &= ~(D3D12_FORMAT_SUPPORT1_TEXTURE1D | D3D12_FORMAT_SUPPORT1_TEXTURE3D | D3D12_FORMAT_SUPPORT1_SHADER_LOAD |
                             D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE | D3D12_FORMAT_SUPPORT1_SHADER_GATHER |
-                            D3D12_FORMAT_SUPPORT1_BUFFER | D3D12_FORMAT_SUPPORT1_IA_VERTEX_BUFFER);
+                            D3D12_FORMAT_SUPPORT1_BUFFER | D3D12_FORMAT_SUPPORT1_IA_VERTEX_BUFFER |
+                            D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW);
+                    s2 = D3D12_FORMAT_SUPPORT2_NONE;
+                }
                 // A TYPELESS format is only storage: views give it a type, so it is a texture with mips and
                 // nothing a view would do (no buffer, shader, render-target or UAV use of its own).
                 if (chosen.typeless) {

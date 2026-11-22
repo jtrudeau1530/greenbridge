@@ -1130,8 +1130,8 @@ The trace will enumerate them.
     that works on 2D UAVs only: the translator's image atomics and the `r32ui` slots cover 2D and 3D, and the
     layer creates no 3D UAV views yet. There is no `image_atomic_swap`, and `R32_SINT` gets no `r32ui` view.
   - `MULTISAMPLE_RENDERTARGET` for depth formats, from the same usages `MULTISAMPLE_QUALITY_LEVELS` queries.
-  - No integer resolve, no 1D block-compressed. Depth formats are 2D and cube only: no 3D, no shader reads, buffer
-    or vertex use, and no 1D, which native D3D12 allows but the layer's resource creation refuses.
+  - No integer resolve, no 1D block-compressed. Depth formats are 2D and cube only: no 3D, shader reads, UAVs,
+    buffer or vertex use, and no 1D, which native D3D12 allows but the layer's resource creation refuses.
   - TYPELESS formats report texture dimensions and `MIP` only.
 
   `d3d12_vulkan_device_test` checks these bits for every format that both the layer and native D3D12 on the same
