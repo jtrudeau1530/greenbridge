@@ -230,12 +230,19 @@ struct DeviceState {
         return properties.optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT;
     }
 
-    // Whether the GPU has this format and usage in this sample count: not every format has every count.
-    bool samples_usable(const VkImageCreateInfo& image) const {
-        VkImageFormatProperties properties{};
-        return image_format_properties(info.physical, image.format, image.imageType, image.tiling, image.usage,
-                                       image.flags, &properties) == VK_SUCCESS &&
-               (properties.sampleCounts & image.samples);
+    // The limits apply to this exact combination of format, type, tiling, usage and create flags.
+    HRESULT check_image_support(const VkImageCreateInfo& create) const {
+        VkImageFormatProperties limits{};
+        const VkResult result = image_format_properties(info.physical, create.format, create.imageType, create.tiling,
+                                                        create.usage, create.flags, &limits);
+        if (result == VK_ERROR_FORMAT_NOT_SUPPORTED) return E_INVALIDARG;
+        if (result == VK_ERROR_OUT_OF_HOST_MEMORY || result == VK_ERROR_OUT_OF_DEVICE_MEMORY) return E_OUTOFMEMORY;
+        if (result != VK_SUCCESS) return E_FAIL;
+        if (create.extent.width > limits.maxExtent.width || create.extent.height > limits.maxExtent.height ||
+            create.extent.depth > limits.maxExtent.depth || create.mipLevels > limits.maxMipLevels ||
+            create.arrayLayers > limits.maxArrayLayers || !(limits.sampleCounts & create.samples))
+            return E_INVALIDARG;
+        return S_OK;
     }
 
     // The format a texture description is created with, D24S8's fallback included.
@@ -250,14 +257,7 @@ struct DeviceState {
 
     // The memory an image made from `create` needs, or false if the device can't make that image.
     bool memory_requirements(const VkImageCreateInfo& create, VkMemoryRequirements& out) const {
-        VkImageFormatProperties limits{};
-        if (!image_format_properties ||
-            image_format_properties(info.physical, create.format, create.imageType, VK_IMAGE_TILING_OPTIMAL,
-                                    create.usage, create.flags, &limits) != VK_SUCCESS ||
-            create.extent.width > limits.maxExtent.width || create.extent.height > limits.maxExtent.height ||
-            create.extent.depth > limits.maxExtent.depth || create.mipLevels > limits.maxMipLevels ||
-            create.arrayLayers > limits.maxArrayLayers || !(limits.sampleCounts & create.samples))
-            return false;
+        if (FAILED(check_image_support(create))) return false;
         if (image_requirements) {
             VkDeviceImageMemoryRequirements query{VK_STRUCTURE_TYPE_DEVICE_IMAGE_MEMORY_REQUIREMENTS};
             query.pCreateInfo = &create;
@@ -585,10 +585,13 @@ public:
         // Textures the CPU reads and writes (WriteToSubresource/ReadFromSubresource) copy on the host when they can.
         host_transfer_ = cpu_visible() && samples == 1 && device_.host_transfer_format(format.format);
         if (host_transfer_) info.usage |= VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT;
-        if ((samples > 1 || (info.flags & VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT)) && !device_.samples_usable(info)) {
-            log_once("image configuration not supported by the GPU for this format:", int(format.format));
-            return E_INVALIDARG;
+        HRESULT support = device_.check_image_support(info);
+        if (support == E_INVALIDARG && host_transfer_) {
+            host_transfer_ = false;  // staging copies do not require host-transfer usage
+            info.usage &= ~VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT;
+            support = device_.check_image_support(info);
         }
+        if (FAILED(support)) return support;
         if (vk.vkCreateImage(device_.info.device, &info, nullptr, &image_) != VK_SUCCESS) return E_OUTOFMEMORY;
         VkMemoryRequirements requirements{};
         vk.vkGetImageMemoryRequirements(device_.info.device, image_, &requirements);

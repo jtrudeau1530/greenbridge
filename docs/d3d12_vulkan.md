@@ -965,7 +965,8 @@ The trace will enumerate them.
   the driver's), as on D3D12.
 - `WriteToSubresource`/`ReadFromSubresource` (implemented in `d3d12_vulkan_device.cpp`) complete before they
   return, as D3D12 requires; a read cannot wait for a later submit. Textures in CPU-visible custom heaps are
-  created with `VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT` when the device has `VK_EXT_host_image_copy`, moved to
+  created with `VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT` when the device supports that usage with the requested
+  image format and flags, moved to
   `GENERAL` and zero-filled on the host at creation, and copied with `vkCopyMemoryToImageEXT`/
   `vkCopyImageToMemoryEXT` while they stay in `GENERAL` (D3D12's `COMMON`). Every other case (no extension, a
   texture a barrier has moved, a default-heap texture, which D3D12 does not allow but the layer copies and logs) is
