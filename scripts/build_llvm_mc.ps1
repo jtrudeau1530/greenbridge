@@ -88,7 +88,8 @@ $probe = & $exe --disassemble -triple=amdgcn -mcpu=gfx1013 $probeFile
 if ($LASTEXITCODE -ne 0 -or -not ($probe -match "s_endpgm")) { throw "the built llvm-mc didn't disassemble an s_endpgm" }
 
 New-Item -ItemType Directory -Force $Dest | Out-Null
-$final = Join-Path $Dest "llvm-mc.exe"
+# LLVM_MC is saved for future terminals, whose working directory can differ from this one.
+$final = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath((Join-Path $Dest "llvm-mc.exe"))
 Copy-Item -Force $exe $final
 if (-not $Keep) {
     try {
