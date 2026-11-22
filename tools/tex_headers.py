@@ -207,6 +207,18 @@ def gfx10_tile_bytes(mode):
     return COMPACT_TILE_64K if gfx10_tile_mode(mode) == 0 else COMPACT_TILE_4K
 
 
+def joaat(s: str) -> int:
+    """Standard Jenkins One-at-a-Time 32-bit hash of lowercase ASCII string."""
+    h = 0
+    for c in s.lower().encode("latin-1", "replace"):
+        h = (h + c) & 0xFFFFFFFF
+        h = (h + (h << 10)) & 0xFFFFFFFF
+        h ^= h >> 6
+    h = (h + (h << 3)) & 0xFFFFFFFF
+    h ^= h >> 11
+    return (h + (h << 15)) & 0xFFFFFFFF
+
+
 def parse_texture_dict_page(data: bytes):
     """Parse a small RAGE texture dictionary system page (e.g. the 400-byte stream in textures.rpf).
 
@@ -217,34 +229,46 @@ def parse_texture_dict_page(data: bytes):
       Within each grcTexture descriptor:
         +0x10: dtype (0x980)
         +0x18: data pointer (0x60000000 + GPU data offset)
-        +0x38: u16 width, u16 height, u16 depth, u8 mips, u8 DXGI format
+        +0x38: u16 width, u16 height, u16 depth, u8 b6, u8 DXGI format
+        +0x40: u64 flags (bits 16..23: mip count)
     """
     if len(data) < 400:
         raise ValueError(f"texture dictionary page truncated: expected >= 400 bytes, got {len(data)}")
 
-    p0 = struct.unpack_from("<Q", data, 0x170)[0] & 0x0FFFFFFF
-    p1 = struct.unpack_from("<Q", data, 0x178)[0] & 0x0FFFFFFF
+    p0 = struct.unpack_from("<Q", data, 0x170)[0]
+    p1 = struct.unpack_from("<Q", data, 0x178)[0]
     h0 = struct.unpack_from("<I", data, 0x180)[0]
     h1 = struct.unpack_from("<I", data, 0x184)[0]
 
     names_raw = data[0x140:0x170]
     names = [s.decode("latin1") for s in names_raw.split(b"\x00") if s]
+    names_by_hash = {joaat(n): n for n in names}
 
     textures = []
-    for idx, (ptr, thash) in enumerate([(p0, h0), (p1, h1)]):
-        if ptr + 0x40 > len(data):
+    for raw_ptr, thash in [(p0, h0), (p1, h1)]:
+        if raw_ptr == 0:
+            continue
+        # Validate that the pointer is in the system page segment (0x5...)
+        if (raw_ptr >> 28) & 0xF != 5:
+            continue
+        ptr = raw_ptr & 0x0FFFFFFF
+        if ptr + 0x48 > len(data):
             continue
         dtype = struct.unpack_from("<Q", data, ptr + 0x10)[0]
         data_off = struct.unpack_from("<Q", data, ptr + 0x18)[0] & 0x0FFFFFFF
-        w, height, depth, mips, fmt = struct.unpack_from("<HHHBB", data, ptr + 0x38)
-        name = names[idx] if idx < len(names) else f"tex_{thash:08x}"
+        w, height, depth, b6, fmt = struct.unpack_from("<HHHBB", data, ptr + 0x38)
+        flags = struct.unpack_from("<Q", data, ptr + 0x40)[0]
+        mips = (flags >> 16) & 0xFF
+        name = names_by_hash.get(thash, f"tex_{thash:08x}")
         textures.append({
             "name": name,
             "hash": thash,
             "width": w,
             "height": height,
             "depth": depth,
+            "b6": b6,
             "mips": mips,
+            "flags": flags,
             "format": fmt,
             "format_name": DXGI.get(fmt, f"dxgi{fmt}"),
             "data_offset": data_off,
