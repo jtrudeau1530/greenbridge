@@ -1808,9 +1808,13 @@ Implemented (`QueryHeap` in `runtime/shims/d3d12_vulkan_device.cpp`, the query c
   submission's physical pool. Resolving it sums the 64-bit counts on the GPU, then copies the result to the
   destination. Both occlusion compute helpers reuse one scratch buffer per queue. Logical results and in-flight
   submissions retain the pool independently, so later resolves and
-  overwrites can be recorded before the earlier commands complete. `vk_overlapping_occlusion` checks crossing
-  and nested scopes, more than one scratch chunk, alternating binary and ordinary resolves under a predicate,
-  and gated submissions on a GPU.
+  overwrites can be recorded before the earlier commands complete. A resolve while an ordinary query is active
+  ends the active physical query before the resolve and begins the next one after it, and a list with such a
+  resolve takes this path even without an overlap: AMD's Windows driver on a Radeon 8060S times out (TDR) on a
+  query copy and summing dispatch recorded while a query of the same pool is active (D3D-189, #1540).
+  `vk_overlapping_occlusion` checks crossing and nested scopes, a resolve inside a single active query, more than
+  one scratch chunk, alternating binary and ordinary resolves under a predicate, and gated submissions on a GPU;
+  `--bisect` runs its patterns one per submission to find one that hangs a device.
 - **Timestamps.** `GetTimestampFrequency` is `1e9 / timestampPeriod` (1 GHz on the test GPU). Every D3D12 queue
   shares one `VkQueue` for now (question 12), so they share one frequency.
 

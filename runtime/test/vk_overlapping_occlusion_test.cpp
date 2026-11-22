@@ -178,9 +178,10 @@ int run(vktest::Device& d, const char* vertex, const char* fragment, const Bisec
     Fixture fixture{d};
     EXPECT(fixture.create(vertex, fragment));
     constexpr std::uint32_t bursts = 130;
-    Draws schedule{fixture, {8, 4, 2, 8, 4, 2, 3}};
+    // crossing ends four physical queries (the resolve inside it splits the last one), nested three.
+    Draws schedule{fixture, {8, 4, 2, 0, 8, 4, 2, 3}};
     schedule.extents.insert(schedule.extents.end(), 2 * bursts + 1, 1);
-    schedule.extents.insert(schedule.extents.end(), {2, 0, 0, 0});
+    schedule.extents.insert(schedule.extents.end(), {2, 0, 0, 0, 1, 1});
     schedule.every = bisect.enabled;
     draws = &schedule;
     VulkanContext context(get_device_proc, d.device, true, d.conditional_rendering);
@@ -236,6 +237,10 @@ int run(vktest::Device& d, const char* vertex, const char* fragment, const Bisec
             EXPECT(l->resolve_queries({a, occ, 0, 1, dst_id, 8}) && l->end_query({a, occ, 1}));
             EXPECT(l->resolve_queries({a, occ, 0, 2, dst_id, 24}));
         }
+        if (auto* l = add("active")) {  // a resolve inside one active query, without an overlap
+            EXPECT(l->begin_query({a, occ, 0}) && l->end_query({a, occ, 0}) && l->begin_query({a, occ, 3}));
+            EXPECT(l->resolve_queries({a, occ, 0, 1, dst_id, 128}) && l->end_query({a, occ, 3}));
+        }
         if (auto* l = add("nested")) {  // the same index in two heaps, one inside the other
             EXPECT(l->begin_query({a, occ, 2}) && l->begin_query({b, occ, 2}));
             EXPECT(l->end_query({b, occ, 2}) && l->end_query({a, occ, 2}));
@@ -270,6 +275,14 @@ int run(vktest::Device& d, const char* vertex, const char* fragment, const Bisec
             EXPECT(l->resolve_queries({a, occ, 0, 2, dst_id, 112}));
         }
         EXPECT(!lists.empty());
+        // After a TDR, AMD's Windows driver lets vkQueueWaitIdle succeed (#1540); the queue's timeline then reads
+        // UINT64_MAX, so that is checked as well.
+        const auto get_value = d.fn<PFN_vkGetSemaphoreCounterValue>("vkGetSemaphoreCounterValue");
+        const auto lost = [&] {
+            std::uint64_t value = 0;
+            const VkSemaphore timeline = context.retire_timeline();
+            return timeline && (get_value(d.device, timeline, &value) != VK_SUCCESS || value == UINT64_MAX);
+        };
         if (bisect.gated) queue.wait(gate.semaphore(), 1);
         for (auto& [name, list] : lists) {
             EXPECT(list.close());
@@ -281,15 +294,15 @@ int run(vktest::Device& d, const char* vertex, const char* fragment, const Bisec
                 std::printf("%s: execute returned %d\n", name, int(result));
                 return 1;
             }
-            if (!bisect.gated && !queue.idle()) {
-                std::printf("%s: vkQueueWaitIdle failed (device lost?)\n", name);
+            if (!bisect.gated && (!queue.idle() || lost())) {
+                std::printf("%s: device lost\n", name);
                 return 1;
             }
         }
         if (bisect.gated) {
             EXPECT(gate.signal(1));
-            if (!queue.idle()) {
-                std::printf("gated: vkQueueWaitIdle failed (device lost?)\n");
+            if (!queue.idle() || lost()) {
+                std::printf("gated: device lost\n");
                 return 1;
             }
         }
@@ -377,13 +390,22 @@ int run(vktest::Device& d, const char* vertex, const char* fragment, const Bisec
     EXPECT(replace.close());
     const CommandList* fourth[] = {&replace};
     EXPECT(queue.execute(fourth) == ReplayResult::success);
+
+    // A resolve inside one active query, with no overlap: the active query is paused around it (D3D-189).
+    CommandList single;
+    EXPECT(single.begin_query({a, occ, 3}));
+    EXPECT(single.resolve_queries({a, occ, 0, 1, dst_id, 128}));
+    EXPECT(single.end_query({a, occ, 3}));
+    EXPECT(single.close());
+    const CommandList* fifth[] = {&single};
+    EXPECT(queue.execute(fifth) == ReplayResult::success);
     EXPECT(!schedule.overflow && schedule.next == schedule.extents.size());
     EXPECT(gate.signal(1));
     EXPECT(queue.idle());
 
     const std::map<VkDeviceSize, std::uint64_t> expected = {
         {8, 80}, {24, 80}, {32, 20}, {40, 84}, {48, 16}, {56, 0}, {64, 1}, {72, 80}, {80, 1},
-        {88, 2 * bursts + 1}, {96, 1}, {112, 4}, {120, 0},
+        {88, 2 * bursts + 1}, {96, 1}, {112, 4}, {120, 0}, {128, 4},
     };
     for (VkDeviceSize offset = 0; offset < size; offset += 8) {
         const auto it = expected.find(offset - binding_offset);
@@ -397,7 +419,7 @@ int run(vktest::Device& d, const char* vertex, const char* fragment, const Bisec
         }
     }
     std::printf("crossing 80/20; nested 84/16; %u segments summed; alternating binary results 1/1; "
-                "offsets and gated overwrites exact\n",
+                "resolve inside an active query 4; offsets and gated overwrites exact\n",
                 2 * bursts + 1);
     EXPECT(copy_control.check());
     return 0;
