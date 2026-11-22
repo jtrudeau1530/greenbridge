@@ -338,8 +338,25 @@ class RunFolderTests(unittest.TestCase):
                 work, outside = self.linked(kind, "")
                 with self.assertRaises(SystemExit) as refused:
                     fl.reset_run_folders(str(work))
-                self.assertIn(str(work / "first_light" / "dxbc"), str(refused.exception))
+                self.assertIn(str(work / "first_light"), str(refused.exception))
+                self.assertNotIn("\n", str(refused.exception))
                 self.assertEqual(self.files(outside), ["dxbc/keep.dxbc", "keep.dxbc"])
+
+    def test_a_linked_first_light_with_no_run_folders_is_refused_too(self) -> None:
+        # Nothing stale lies behind the link, so only the check of first_light itself can refuse it; without that
+        # check the new dxbc was created in the folder the link points to, outside the work folder.
+        for kind in LINK_KINDS:
+            with self.subTest(kind=kind):
+                work, outside = self.tmp / kind / "work", self.tmp / kind / "outside"
+                outside.mkdir(parents=True)
+                work.mkdir()
+                if not link_folder(kind, work / "first_light", outside):
+                    self.skipTest(f"cannot create a {kind} here")
+                with self.assertRaises(SystemExit) as refused:
+                    fl.reset_run_folders(str(work))
+                self.assertIn(str(work / "first_light"), str(refused.exception))
+                self.assertNotIn("\n", str(refused.exception))
+                self.assertEqual(os.listdir(outside), [])
 
     def test_a_file_that_cannot_be_removed_stops_the_run(self) -> None:
         self.prepare("first")

@@ -64,6 +64,15 @@ def reset_run_folders(work: str) -> str:
     """
     base = os.path.join(work, "first_light")
     real_base = os.path.join(os.path.realpath(work), "first_light")
+    # first_light itself is checked first: when it is a link to a folder with no dxbc or spirv in it, there is
+    # nothing stale to judge below, and the new dxbc would be created on the far side of the link.
+    if os.path.lexists(base) and (
+        not os.path.isdir(base) or os.path.normcase(os.path.realpath(base)) != os.path.normcase(real_base)
+    ):
+        raise SystemExit(
+            f"{base} is a symlink, a junction or a file: each run removes and creates folders under it and does "
+            "not follow a link to do it; remove it and run again"
+        )
     stale = [os.path.join(base, name) for name in ("dxbc", "spirv") if os.path.lexists(os.path.join(base, name))]
     for folder in stale:  # both are checked before either is removed
         real = os.path.join(real_base, os.path.basename(folder))
