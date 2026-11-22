@@ -81,7 +81,7 @@ CS_SMEM = [0x5eed0024, 0x5eed0028, 0x5eed002c, 0x5eed0030, 0x5eed0010, 0x5eed001
 WAVE32_DUMPS = ("cs_store", "cs_smem_soffset_imm", "cs_wqm_w32", "cs_w32_lane_wrap", "cs_movrelsd_2", "cs_w32_permute",
                 "cs_barrier_divergent", "cs_barrier_early_end", "cs_barrier_loop", "cs_w32_lds_u8_d16", "cs_bpermute32",
                 "cs_w32_partial_scmp", "cs_exec_const", "cs_w32_mask_imm", "cs_w32_int_ext",
-                "cs_w32_salu64", "cs_w32_misc_ext", "cs_w32_new_ops")
+                "cs_w32_salu64", "cs_w32_misc_ext", "cs_w32_new_ops", "cs_w32_sincos")
 # Wave32 lane-mask dumps: their EXEC/VCC masks and lane selects cover 32 lanes, so a device whose widest subgroup is
 # narrower (Mesa llvmpipe: 8) can't produce their words. They are skipped there, as ps_bitmask_perm is. They run with
 # 32 lanes requested (WAVE32_LANE_ENV), as run_gpu_tests.py does: a device with a range like 8..32 (Intel ANV) may
@@ -130,6 +130,8 @@ CS_DUMPS = [*CS_DPP, ("cs_store", CS_STORE), ("cs_smem_soffset_imm", CS_SMEM),
             ("cs_wqm_w64", [20, 4, 12, 8, 1, 0, 15728895, 20]), ("cs_wqm_w32", [12, 1, 4, 0, 8, 15728880, 4, 32]),
             ("cs_bpermute32", [0, 50, 162, 99, 36, 218, 183, 15]),
             ("cs_w32_partial_scmp", [0, 1, 1, 0, 1, 1, 1, 1]),   # a 20-thread wave32: s_cmp mask, -1
+            # SHADER-88: v_sin/v_cos reduce the angle in turns (a regression guard, tolerance 1e-3)
+            ("cs_w32_sincos", [1, 1, 1, 1, 1, 1]),
             ("cs_wqm_w64_half", [11, 14, 0, 1, 6, 8, 12, 2]),
             # SHADER-91: two s_barrier sites in wave-uniform branches meet like one barrier; wave 0 reads wave 3
             ("cs_barrier_divergent", [127, 126, 125, 124, 123, 122, 121, 120]),
