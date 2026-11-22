@@ -793,6 +793,9 @@ struct ReplayFunctions {
     PFN_vkCmdEndQuery end_query = nullptr;
     PFN_vkCmdWriteTimestamp write_timestamp = nullptr;
     PFN_vkCmdCopyQueryPoolResults copy_query_pool_results = nullptr;
+    // Set only where a copy of timestamp results is not ordered after the timestamps written before it (MoltenVK on
+    // Apple GPUs, docs/d3d12_vulkan.md section 4.6): records what orders them, before each timestamp resolve.
+    std::function<void(VkCommandBuffer)> order_timestamp_copy;
     std::function<void(VkCommandBuffer, VkQueryPool, std::uint32_t, std::uint32_t, VkBuffer, VkDeviceSize)>
         sum_occlusion;
     PFN_vkCmdBindPipeline bind_pipeline = nullptr;              // dispatches
@@ -2858,6 +2861,9 @@ inline void emit_query(const PreparedList& list, const detail::PreparedQuery& qu
         const bool suspend = predicate.buffer && !query.resolves.empty();
         end_statistics();
         if (suspend) vk.end_conditional_rendering(cb);
+        if (resolve.type == d3d12_query::timestamp && vk.order_timestamp_copy &&
+            std::any_of(query.resolves.begin(), query.resolves.end(), [](const auto& run) { return run.pool; }))
+            vk.order_timestamp_copy(cb);
         for (const auto& run : query.resolves) {
             if (!run.pool) {
                 vk.fill_buffer(cb, dst, run.offset, VkDeviceSize(run.count) * size, 0);

@@ -5482,6 +5482,33 @@ int main() {
             EXPECT(submit_and_wait());
             EXPECT(u64(again_at) >= t1 && u64(again_at + 8) == t1);
 
+            // A timestamp written by one execution and resolved by the next, with nothing waited for in between, as
+            // a game resolves last frame's timestamps. The resolve reads the new value (on MoltenVK only because the
+            // queue orders the two; docs/d3d12_vulkan.md section 4.6).
+            {
+                constexpr UINT64 later_at = 2048;
+                Ref<ID3D12CommandAllocator> writer_allocator;
+                Ref<ID3D12GraphicsCommandList> writer;
+                EXPECT(SUCCEEDED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                                                IID_PPV_ARGS(&writer_allocator.p))));
+                EXPECT(SUCCEEDED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, writer_allocator.p,
+                                                           nullptr, IID_PPV_ARGS(&writer.p))));
+                writer->CopyBufferRegion(readback.p, 8192, upload.p, 0, 32768);
+                writer->EndQuery(timestamps.p, D3D12_QUERY_TYPE_TIMESTAMP, 2);
+                EXPECT(writer->Close() == S_OK);
+                EXPECT(SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.p, nullptr)));
+                list->ResolveQueryData(timestamps.p, D3D12_QUERY_TYPE_TIMESTAMP, 0, 3, readback.p, later_at);
+                EXPECT(list->Close() == S_OK);
+                ID3D12CommandList* const writers[] = {writer.p};
+                queue->ExecuteCommandLists(1, writers);
+                EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
+                queue->ExecuteCommandLists(1, lists);
+                EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
+                EXPECT(submit_and_wait());
+                EXPECT(u64(later_at) == u64(again_at) && u64(later_at + 8) == t1);
+                EXPECT(u64(later_at + 16) >= u64(again_at) && u64(later_at + 16) != 0xcdcdcdcdcdcdcdcdull);
+            }
+
             // Lists that break the rules. Close reports what it can see; the rest is refused at execution, and
             // nothing is submitted.
             const auto refuse = [&](HRESULT close, leonida::ReplayResult result, auto&& record) {
