@@ -27,6 +27,7 @@
 #include <limits>
 #include <map>
 #include <numeric>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -967,7 +968,7 @@ struct Options {
     std::uint32_t reps = 25u;
     std::uint32_t warmup = 5u;
     double max_dispatch_ms = 120.0;
-    int device_index = -1;
+    std::optional<std::uint32_t> device_index;
     MemoryFilter mem_filter = MemoryFilter::All;
     bool list_devices = false;
     bool csv = false;
@@ -988,9 +989,9 @@ void print_usage() {
         "  --device N           select physical device index from --list-devices\n"
         "  --list-devices       list Vulkan physical devices and exit\n"
         "  --quick              fast check profile (sizes 1000,10000; groups 16; iters 4; reps 3)\n"
-        "  --csv                emit machine-readable CSV lines\n"
+        "  --csv                emit CSV with timing_status and empty fields for unavailable measurements\n"
         "  --dump-spv PREFIX    write the 3 SPIR-V compute modules to PREFIX_*.spv and exit\n"
-        "  --self-test          CPU-only check of SPIR-V encoding and DescriptorTable oracle\n"
+        "  --self-test          CPU-only checks for CLI, SPIR-V encoding and descriptor lookup\n"
         "  --help               print this message\n");
 }
 
@@ -1003,7 +1004,7 @@ bool parse_u32(const char* s, std::uint32_t& out) {
     return true;
 }
 
-bool parse_args(int argc, char** argv, Options& opt, bool& show_help) {
+bool parse_args(int argc, const char* const* argv, Options& opt, bool& show_help) {
     show_help = false;
     for (int i = 1; i < argc; ++i) {
         const std::string_view arg(argv[i]);
@@ -1053,7 +1054,7 @@ bool parse_args(int argc, char** argv, Options& opt, bool& show_help) {
             const char* v = nullptr;
             std::uint32_t idx = 0u;
             if (!need_val(v) || !parse_u32(v, idx)) return false;
-            opt.device_index = static_cast<int>(idx);
+            opt.device_index = idx;
         } else if (arg == "--dump-spv") {
             const char* v = nullptr;
             if (!need_val(v)) return false;
@@ -1153,6 +1154,15 @@ struct MemoryPlacement {
 };
 
 int run_self_test() {
+    const char* const device_args[] = {"vk_descriptor_bench", "--device", "4294967295"};
+    Options device_options;
+    bool show_help = false;
+    if (device_options.device_index.has_value() || !parse_args(3, device_args, device_options, show_help) ||
+        device_options.device_index != std::numeric_limits<std::uint32_t>::max()) {
+        std::fprintf(stderr, "self-test: explicit device index became automatic selection\n");
+        return 1;
+    }
+
     const struct {
         const char* name;
         ShaderKind kind;
@@ -1340,13 +1350,14 @@ int main(int argc, char** argv) {
     VkPhysicalDeviceProperties pd_props{};
     std::uint32_t qi = 0;
     std::uint32_t ts_valid_bits = 0;
-    if (opt.device_index >= 0) {
-        if (static_cast<std::uint32_t>(opt.device_index) >= pd_count) {
-            std::fprintf(stderr, "invalid --device index %d (found %u devices)\n", opt.device_index, pd_count);
+    if (opt.device_index.has_value()) {
+        const std::uint32_t device_index = *opt.device_index;
+        if (device_index >= pd_count) {
+            std::fprintf(stderr, "invalid --device index %u (found %u devices)\n", device_index, pd_count);
             destroy_instance();
             return 2;
         }
-        VkPhysicalDevice cand = pds[static_cast<std::size_t>(opt.device_index)];
+        VkPhysicalDevice cand = pds[device_index];
         VkPhysicalDeviceProperties p{};
         vkGetPhysicalDeviceProperties(cand, &p);
         if (p.apiVersion < VK_API_VERSION_1_1 || !find_compute_queue(cand, qi, ts_valid_bits)) {
@@ -1766,7 +1777,7 @@ int main(int argc, char** argv) {
     } else {
         std::printf("# device,%s,%s\n", pd_props.deviceName, driver_desc.c_str());
         std::printf("entries,capacity,load_pct,size_bytes,mean_probes,max_probes,placement,mem_type,flags,scenario,"
-                    "groups,iters,reps,unique_keys,med_ms,min_ms,max_ms,us_per_1m_lk,net_us_per_1m_lk,glk_per_s\n");
+                    "groups,iters,reps,unique_keys,med_ms,min_ms,max_ms,us_per_1m_lk,net_us_per_1m_lk,glk_per_s,timing_status\n");
     }
 
     const std::array<ScenarioSpec, 11> scenarios{{
@@ -2127,46 +2138,53 @@ int main(int argc, char** argv) {
                 const double min_ms = samples_ms.front();
                 const double max_ms = samples_ms.back();
 
-                if (std::strcmp(sc.name, "baseline_uniform") == 0) {
-                    base_uniform_us_per_1m = (med_ms > 0.0) ? (med_ms * 1e9 / eff_single_lookups) : 0.0;
-                }
-                if (std::strcmp(sc.name, "baseline_divergent") == 0) {
-                    base_divergent_us_per_1m = (med_ms > 0.0) ? (med_ms * 1e9 / eff_single_lookups) : 0.0;
-                }
+                const bool is_lookup = sc.lookups_per_iter > 0.0;
+                double& baseline_us = sc.divergent ? base_divergent_us_per_1m : base_uniform_us_per_1m;
+                if (!is_lookup) baseline_us = med_ms * 1e9 / eff_single_lookups;
 
-                if (sc.lookups_per_iter <= 0.0) {
-                    if (!opt.csv) {
-                        std::printf("  %-22s %7u %9.4f %9.4f %9.4f %11s %12s %9s", sc.name, unique_keys, med_ms,
-                                    min_ms, max_ms, "-", "-", "-");
-                        if (was_scaled) std::printf(" [scaled %ux%u, n=%u]", eff_groups, eff_iters, eff_reps);
-                        std::printf("\n");
-                    } else {
-                        std::printf("%u,%u,%.2f,%llu,%.4f,%u,%s,%u,\"%s\",%s,%u,%u,%u,%u,%.6f,%.6f,%.6f,,,\n",
-                                    ds.entry_count, ds.capacity, ds.load_pct, static_cast<unsigned long long>(map_bytes),
-                                    ds.mean_probes, ds.max_probes, pl_cfg.label, pl_cfg.memory_type_index,
-                                    format_mem_flags(pl_cfg.flags).c_str(), sc.name, eff_groups, eff_iters, eff_reps,
-                                    unique_keys, med_ms, min_ms, max_ms);
-                    }
+                const bool have_times = max_ms > 0.0;
+                const bool have_rate = is_lookup && med_ms > 0.0;
+                const double total_lookups = eff_single_lookups * sc.lookups_per_iter;
+                const double us_per_1m = have_rate ? med_ms * 1e9 / total_lookups : 0.0;
+                const double net_us_per_1m = have_rate ? std::max(0.0, us_per_1m - baseline_us / sc.lookups_per_iter) : 0.0;
+                const double glk_s = med_ms > 1e-9 ? total_lookups / (med_ms * 1e6) : 0.0;
+
+                const char* status = nullptr;
+                if (!have_times) status = use_gpu_timestamps ? "GPU timestamps did not advance" : "host clock did not advance";
+                else if (med_ms == 0.0) status = "median below timer resolution";
+                else if (is_lookup && baseline_us == 0.0) status = "baseline timing unavailable";
+
+                if (opt.csv) {
+                    std::printf("%u,%u,%.2f,%llu,%.4f,%u,%s,%u,\"%s\",%s,%u,%u,%u,%u", ds.entry_count, ds.capacity,
+                                ds.load_pct, static_cast<unsigned long long>(map_bytes), ds.mean_probes, ds.max_probes,
+                                pl_cfg.label, pl_cfg.memory_type_index, format_mem_flags(pl_cfg.flags).c_str(), sc.name,
+                                eff_groups, eff_iters, eff_reps, unique_keys);
                 } else {
-                    const double total_lookups = eff_single_lookups * sc.lookups_per_iter;
-                    const double us_per_1m = (med_ms > 0.0) ? (med_ms * 1e9 / total_lookups) : 0.0;
-                    const double base_us = sc.divergent ? base_divergent_us_per_1m : base_uniform_us_per_1m;
-                    const double net_us_per_1m = std::max(0.0, us_per_1m - (base_us / sc.lookups_per_iter));
-                    const double glk_s = (med_ms > 1e-9) ? (total_lookups / (med_ms * 1e6)) : 0.0;
-                    if (!opt.csv) {
-                        std::printf("  %-22s %7u %9.4f %9.4f %9.4f %11.3f %12.3f %9.2f", sc.name, unique_keys, med_ms,
-                                    min_ms, max_ms, us_per_1m, net_us_per_1m, glk_s);
-                        if (was_scaled) std::printf(" [scaled %ux%u, n=%u]", eff_groups, eff_iters, eff_reps);
-                        std::printf("\n");
-                    } else {
-                        std::printf(
-                            "%u,%u,%.2f,%llu,%.4f,%u,%s,%u,\"%s\",%s,%u,%u,%u,%u,%.6f,%.6f,%.6f,%.4f,%.4f,%.4f\n",
-                            ds.entry_count, ds.capacity, ds.load_pct, static_cast<unsigned long long>(map_bytes),
-                            ds.mean_probes, ds.max_probes, pl_cfg.label, pl_cfg.memory_type_index,
-                            format_mem_flags(pl_cfg.flags).c_str(), sc.name, eff_groups, eff_iters, eff_reps,
-                            unique_keys, med_ms, min_ms, max_ms, us_per_1m, net_us_per_1m, glk_s);
-                    }
+                    std::printf("  %-22s %7u", sc.name, unique_keys);
                 }
+                const auto metric = [&](double value, bool available, int width, int precision, int csv_precision) {
+                    if (opt.csv) {
+                        std::putchar(',');
+                        if (available) std::printf("%.*f", csv_precision, value);
+                    } else if (available) {
+                        std::printf(" %*.*f", width, precision, value);
+                    } else {
+                        std::printf(" %*s", width, "-");
+                    }
+                };
+                metric(med_ms, have_times, 9, 4, 6);
+                metric(min_ms, have_times, 9, 4, 6);
+                metric(max_ms, have_times, 9, 4, 6);
+                metric(us_per_1m, have_rate, 11, 3, 4);
+                metric(net_us_per_1m, have_rate && baseline_us > 0.0, 12, 3, 4);
+                metric(glk_s, have_rate, 9, 2, 4);
+                if (opt.csv) {
+                    std::printf(",%s", status ? status : "ok");
+                } else {
+                    if (was_scaled) std::printf(" [scaled %ux%u, n=%u]", eff_groups, eff_iters, eff_reps);
+                    if (status) std::printf(" [%s]", status);
+                }
+                std::putchar('\n');
                 std::fflush(stdout);
             }
         }

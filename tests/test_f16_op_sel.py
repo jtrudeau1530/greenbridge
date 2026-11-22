@@ -96,4 +96,4 @@ def test_translation_is_deterministic(tmp_path):
 
 def test_other_unsupported_instructions_are_still_rejected(tmp_path):
     with pytest.raises(rdna2spirv.Unsupported):
-        translate(tmp_path, "v_mqsad_u32_u8 v[8:11], v[2:3], v1, v[4:7]")
+        translate(tmp_path, "v_sat_pk_u8_i16 v3, v1")

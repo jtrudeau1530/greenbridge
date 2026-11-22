@@ -43,8 +43,14 @@ GFX10_FORMATS = {int(k): v for k, v in _json.load(open(os.path.join(os.path.dirn
 # User SGPRs s0..s(USER_SGPRS-1) are initialised from push constants (128 bytes = Vulkan's guaranteed minimum).
 USER_SGPRS = 32
 
-NOOPS = {"s_sleep", "v_nop", "s_nop", "s_inst_prefetch", "s_endpgm", "s_setprio", "s_clause", "s_delay_alu", "s_waitcnt",
-         "s_waitcnt_vscnt", "s_waitcnt_vmcnt", "s_waitcnt_expcnt", "s_waitcnt_lgkmcnt", "s_waitcnt_depctr"}
+# v_pipeflush (GFX10 VOP1) only flushes the VALU pipeline: no register, memory or EXEC effect to translate.
+# s_icache_inv invalidates the instruction cache; s_ttracedata / s_ttracedata_imm send thread-trace data;
+# s_code_end pads the end of a code object; s_version records the ISA version. None of them has a register, memory,
+# SCC or EXEC effect. (Data-cache invalidations such as buffer_gl0_inv are about cross-wave coherence and are not
+# here.)
+NOOPS = {"s_sleep", "v_nop", "v_pipeflush", "s_nop", "s_inst_prefetch", "s_endpgm", "s_setprio", "s_clause",
+         "s_delay_alu", "s_waitcnt", "s_waitcnt_vscnt", "s_waitcnt_vmcnt", "s_waitcnt_expcnt", "s_waitcnt_lgkmcnt",
+         "s_waitcnt_depctr", "s_icache_inv", "s_ttracedata", "s_ttracedata_imm", "s_code_end", "s_version"}
 
 F2 = {"v_add_f32": "OpFAdd", "v_sub_f32": "OpFSub", "v_mul_f32": "OpFMul",
       "v_max_f32": "max", "v_min_f32": "min"}
@@ -150,6 +156,7 @@ class Gen:
         self.blocks = []      # per basic block: list of SPIR-V lines (dispatch-loop form), empty = straight-line
         self.succ = []        # per basic block: the blocks it can go to next (none = the program ends there)
         self.desc_fn = None   # lines of the descriptor-lookup function, once an instruction needs it
+        self.sgpr_imm = {}    # SGPR -> literal an s_mov_b32 put there earlier in this basic block (see gather_addr_modes)
         self.desc_cache = {}  # (first SGPR, dwords) -> id of the %desc_lookup_fn result in the current basic block
         self._scan = (None, 0, [])   # (body list, lines already seen, open merge labels): see desc_cache_ok
         self.block_label = "%entry"   # label of the SPIR-V block the current instruction starts in
@@ -184,6 +191,7 @@ class Gen:
 
     def store_reg(self, kind, r, val):
         if kind == "sgpr":
+            self.sgpr_imm.pop(r, None)
             self.x_tok[("sgpr", r)] = val
             if self.desc_cache:          # every write to the %sgpr array comes through here (see desc_lookup_sgpr)
                 self.desc_cache = {k: v for k, v in self.desc_cache.items() if not (k[0] <= r < k[0] + k[1])}
@@ -371,6 +379,14 @@ class Gen:
         self.emit(f"{v2} = OpExtInst %v2float %glsl UnpackHalf2x16 {u}")
         self.emit(f"{f} = OpCompositeExtract %float {v2} {1 if hi else 0}")
         return self.modify_f(f, s)
+
+    def fma_mix_srcs(self, a, mods):
+        """Read the 3 operands of v_fma_mix*: f16 at op_sel[i] when op_sel_hi[i] is set (via src_h so fimm is binary16), else f32."""
+        sel = next((m for m in mods if m.startswith("op_sel:")), "op_sel:[0,0,0]")
+        selhi = next((m for m in mods if m.startswith("op_sel_hi:")), "op_sel_hi:[0,0,0]")
+        sb = [int(x) for x in sel.split("[")[1].rstrip("]").split(",")]
+        hb = [int(x) for x in selhi.split("[")[1].rstrip("]").split(",")]
+        return [self.f16_in(src, sb[i]) if hb[i] else self.src_f(src) for i, src in enumerate(a[1:4])]
 
     def f16_bits(self, f, rtz=False):
         """f32 ``f`` -> f16 bits in the low 16 bits of a %uint, computed with integer ops only (SHADER-56).
@@ -684,7 +700,46 @@ class Gen:
                    "ge": "OpSGreaterThanEqual" if s else "OpUGreaterThanEqual",
                    "eq": "OpIEqual", "ne": "OpINotEqual", "lg": "OpINotEqual"}
         elif ty in ("u32", "i32"):
-            x, y = self.src_u(srcs[0]), self.src_u(srcs[1])
+            use_wave_equal = False
+            wave_equal_half = None
+            m0, m1 = self.holds_lane_mask(srcs[0]), self.holds_lane_mask(srcs[1])
+            if scalar and (m0 or m1):
+                h0 = self.mask_half(srcs[0]) if m0 else None
+                h1 = self.mask_half(srcs[1]) if m1 else None
+
+                def _is_u32_zero_or_all_ones(src):
+                    return src["k"] == "imm" and (src["v"] & 0xFFFFFFFF) in (0, 0xFFFFFFFF)
+
+                can_vote = False
+                if cond in ("eq", "ne", "lg"):
+                    if m0 and m1:
+                        if not self.wave64:
+                            can_vote = h0 != "hi" and h1 != "hi"
+                        elif h0 is not None and h0 == h1:
+                            can_vote = True
+                            wave_equal_half = h0
+                    else:
+                        other = srcs[1] if m0 else srcs[0]
+                        mh = h0 if m0 else h1
+                        if _is_u32_zero_or_all_ones(other):
+                            if not self.wave64:
+                                can_vote = mh != "hi"
+                            elif mh is not None:
+                                can_vote = True
+                                wave_equal_half = mh
+
+                if can_vote:
+                    use_wave_equal = True
+                    x, y = self.src_u(srcs[0]), self.src_u(srcs[1])
+                else:
+                    def _mask_word(src, is_mask):
+                        if not is_mask:
+                            return self.src_u(src)
+                        lo, hi = self.wave_mask(src)
+                        return hi if self.mask_half(src) == "hi" else lo
+                    x, y = _mask_word(srcs[0], m0), _mask_word(srcs[1], m1)
+            else:
+                x, y = self.src_u(srcs[0]), self.src_u(srcs[1])
             if ty == "i32":
                 x, y = self.as_int(x), self.as_int(y)
             s = ty == "i32"
@@ -694,14 +749,28 @@ class Gen:
                    "eq": "OpIEqual", "ne": "OpINotEqual", "lg": "OpINotEqual"}
         else:
             raise Unsupported(op)
-        if cond not in ops:
-            raise Unsupported(op)
+        is_float = ty in ("f32", "f16")
         b, r = self.tmp(), self.tmp()
-        self.emit(f"{b} = {ops[cond]} %bool {x} {y}")
-        mask_halves = [self.mask_half(s) for s in srcs if self.holds_lane_mask(s)]
-        if scalar and mask_halves and ty in ("u32", "i32") and cond in ("eq", "ne", "lg"):
-            half = mask_halves[0] if (self.wave64 and len(set(mask_halves)) == 1) else None
-            b = self.wave_equal(b, cond == "eq", half=half)
+        if cond in (("f", "tru", "o", "u") if is_float else ("f", "t")):
+            # Constant compares: f is always false, t / tru always true. o (ordered) is true when neither source
+            # is NaN, u (unordered) when either is.
+            if cond in ("o", "u"):
+                nx, ny, either = self.tmp(), self.tmp(), self.tmp()
+                self.emit(f"{nx} = OpIsNan %bool {x}")
+                self.emit(f"{ny} = OpIsNan %bool {y}")
+                self.emit(f"{either} = OpLogicalOr %bool {nx} {ny}")
+                if cond == "u":
+                    b = either
+                else:
+                    self.emit(f"{b} = OpLogicalNot %bool {either}")
+            else:
+                self.emit(f"{b} = OpCopyObject %bool {'%false' if cond == 'f' else '%true'}")
+        elif cond not in ops:
+            raise Unsupported(op)
+        else:
+            self.emit(f"{b} = {ops[cond]} %bool {x} {y}")
+        if scalar and ty in ("u32", "i32") and use_wave_equal:
+            b = self.wave_equal(b, cond == "eq", half=wave_equal_half)
         # Lane masks are all-ones/zero per invocation (one lane), SCC is 1/0. A VOPC result bit is 0 for lanes
         # that are off in EXEC (as on hardware), so wave-wide reductions of the mask (s_cbranch_vccz) are exact.
         bm = b
@@ -878,7 +947,8 @@ class Gen:
                7: (2, "unorm", (16,)), 23: (4, "unorm", (16, 16)), 24: (4, "snorm", (16, 16)),
                65: (8, "unorm", (16, 16, 16, 16)), 66: (8, "snorm", (16, 16, 16, 16)),
                44: (4, "unorm", (2, 10, 10, 10)), 50: (4, "unorm", (10, 10, 10, 2)),
-               69: (8, "uint", (16, 16, 16, 16)), 27: (4, "uint", (16, 16))}
+               69: (8, "uint", (16, 16, 16, 16)), 27: (4, "uint", (16, 16)),
+               2: (1, "snorm", (8,)), 8: (2, "snorm", (16,)), 15: (2, "snorm", (8, 8))}
 
     def encode_format(self, fcomps, icomps, code):
         """Encode one element of format `code` -> list of uint ids (whole dwords; elements under 4 bytes return one
@@ -895,10 +965,7 @@ class Gen:
         bit = 0
         for c, w in enumerate(widths):
             if kind == "f16":
-                v2, h = self.tmp(), self.tmp()
-                self.emit(f"{v2} = OpCompositeConstruct %v2float {self.tof(fcomps[c])} %f0")
-                self.emit(f"{h} = OpExtInst %uint %glsl PackHalf2x16 {v2}")
-                field = h
+                field = self.f16_bits(self.tof(fcomps[c]))
             elif kind == "unorm":
                 cl, sc, rd, u = self.tmp(), self.tmp(), self.tmp(), self.tmp()
                 self.emit(f"{cl} = OpExtInst %float %glsl FClamp {self.tof(fcomps[c])} %f0 %f1")
@@ -923,11 +990,51 @@ class Gen:
             bit += w
         return words
 
+    def norm_bits(self, m, n):
+        """f32 bits of m / (2^n - 1), correctly rounded, for an n-bit unsigned id m (1 <= n <= 16), integer ops only.
+
+        In binary, m / (2^n - 1) is m's n bits repeated forever. T = m * sum(2^(64 - n(k+1))) holds the first 64 of
+        them (the partial block at the bottom is dropped, below every bit used here). For 0 < m < 2^n - 1 the top 1 of
+        T is in its high dword (T >= 2^(64-n)), so p = FindUMsb(T >> 32) is 16..31 and the value is in [2^(p-32),
+        2^(p-31)). The mantissa is T >> (p + 9) (24 bits with the hidden one) and the round bit the one below it. The
+        repeating tail is never all zero, so a tie can't happen: round to nearest is "add the round bit". A carry
+        out of the mantissa moves into the exponent through the plain add. 0 and 2^n - 1 are exact (0 and 1.0)."""
+        rep = sum(1 << (64 - n * (k + 1)) for k in range(64 // n))
+        m64, t, h64, hi, pi, p, s, s64, q64, q, s1, s164, r64, rb, e, eb, b0, b1, b2, z, one, b3, b4 = \
+            (self.tmp() for _ in range(23))
+        self.emit(f"{m64} = OpUConvert %ulong {m}")
+        self.emit(f"{t} = OpIMul %ulong {m64} {self.cl(rep)}")
+        self.emit(f"{h64} = OpShiftRightLogical %ulong {t} {self.cl(32)}")
+        self.emit(f"{hi} = OpUConvert %uint {h64}")
+        self.emit(f"{pi} = OpExtInst %int %glsl FindUMsb {hi}")
+        self.emit(f"{p} = OpBitcast %uint {pi}")
+        self.emit(f"{s} = OpIAdd %uint {p} {self.cu(9)}")               # m = 0 gives p = -1: s = 8, result unused
+        self.emit(f"{s64} = OpUConvert %ulong {s}")
+        self.emit(f"{q64} = OpShiftRightLogical %ulong {t} {s64}")
+        self.emit(f"{q} = OpUConvert %uint {q64}")
+        self.emit(f"{s1} = OpISub %uint {s} {self.cu(1)}")
+        self.emit(f"{s164} = OpUConvert %ulong {s1}")
+        self.emit(f"{r64} = OpShiftRightLogical %ulong {t} {s164}")
+        self.emit(f"{rb} = OpUConvert %uint {r64}")
+        self.emit(f"{e} = OpIAdd %uint {p} {self.cu(95)}")              # biased exponent p - 32 + 127
+        self.emit(f"{eb} = OpShiftLeftLogical %uint {e} {self.cu(23)}")
+        self.emit(f"{b0} = OpISub %uint {q} {self.cu(0x800000)}")       # drop the hidden one
+        self.emit(f"{b1} = OpIAdd %uint {eb} {b0}")
+        self.emit(f"{b2} = OpBitwiseAnd %uint {rb} {self.cu(1)}")
+        self.emit(f"{b3} = OpIAdd %uint {b1} {b2}")
+        self.emit(f"{z} = OpIEqual %bool {m} {self.cu(0)}")
+        self.emit(f"{one} = OpIEqual %bool {m} {self.cu((1 << n) - 1)}")
+        self.emit(f"{b4} = OpSelect %uint {one} {self.cu(0x3F800000)} {b3}")
+        res = self.tmp()
+        self.emit(f"{res} = OpSelect %uint {z} {self.cu(0)} {b4}")
+        return res
+
     def decode_format(self, words, code):
         """Decode one element of format `code` from raw dwords -> 4 uint ids holding f32 bits (or uint for *_UINT/uint).
 
         Missing channels repeat the format's own (component c = c mod n): measured on RX 6700 for SHADER-86.
-        UNORM/SNORM use correctly rounded OpFDiv by (2^n-1), not a reciprocal multiply."""
+        UNORM/SNORM give the correctly rounded quotient, as the RX 6700 does, built with integer ops (norm_bits):
+        OpFDiv is allowed 2.5 ULP and the AMD and NVIDIA drivers return the reciprocal-multiply result for it (#599)."""
         try:
             size, kind, widths = self.FORMATS[code]
         except KeyError:
@@ -949,17 +1056,20 @@ class Gen:
                 self.emit(f"{x} = OpCompositeExtract %float {v2} 0")
                 out.append(self.tou(x))
             elif kind == "unorm":
-                c, x = self.tmp(), self.tmp()
-                self.emit(f"{c} = OpConvertUToF %float {f}")
-                self.emit(f"{x} = OpFDiv %float {c} {self.fconst(float((1 << w) - 1))}")
-                out.append(self.tou(x))
+                out.append(self.norm_bits(f, w))
             elif kind == "snorm":
-                si, c, x, cl = self.tmp(), self.tmp(), self.tmp(), self.tmp()
+                # magnitude over 2^(w-1)-1 with the same integer rounding; the most negative code is -1.0
+                si, neg, ab, au, sg, sel, lo, res = (self.tmp() for _ in range(8))
                 self.emit(f"{si} = OpBitFieldSExtract %int {self.as_int(src)} {self.cu(bit % 32)} {self.cu(w)}")
-                self.emit(f"{c} = OpConvertSToF %float {si}")
-                self.emit(f"{x} = OpFDiv %float {c} {self.fconst(float((1 << (w - 1)) - 1))}")
-                self.emit(f"{cl} = OpExtInst %float %glsl FMax {x} {self.fconst(-1.0)}")
-                out.append(self.tou(cl))
+                self.emit(f"{neg} = OpSLessThan %bool {si} {self.as_int(self.cu(0))}")
+                self.emit(f"{ab} = OpExtInst %int %glsl SAbs {si}")
+                self.emit(f"{au} = OpBitcast %uint {ab}")
+                mag = self.norm_bits(au, w - 1)
+                self.emit(f"{sg} = OpBitwiseOr %uint {mag} {self.cu(0x80000000)}")
+                self.emit(f"{sel} = OpSelect %uint {neg} {sg} {mag}")
+                self.emit(f"{lo} = OpULessThan %bool {au} {self.cu(1 << (w - 1))}")
+                self.emit(f"{res} = OpSelect %uint {lo} {sel} {self.cu(0xBF800000)}")
+                out.append(res)
             else:   # uint: raw integer
                 out.append(f)
             bit += w
@@ -1179,9 +1289,8 @@ class Gen:
                     is_int = o
             for i in range(0, len(outs), 2):
                 lo, hi = outs[i], (outs[i + 1] if i + 1 < len(outs) else self.cu(0))
-                v2, ph, il, ih, ishi, pi, r = (self.tmp() for _ in range(7))
-                self.emit(f"{v2} = OpCompositeConstruct %v2float {self.tof(lo)} {self.tof(hi)}")
-                self.emit(f"{ph} = OpExtInst %uint %glsl PackHalf2x16 {v2}")
+                ph = self.f16_pack2(self.tof(lo), self.tof(hi))
+                il, ih, pi, r = (self.tmp() for _ in range(4))
                 self.emit(f"{il} = OpBitwiseAnd %uint {lo} {self.cu(0xFFFF)}")
                 self.emit(f"{ih} = OpShiftLeftLogical %uint {hi} {self.cu(16)}")
                 self.emit(f"{pi} = OpBitwiseOr %uint {il} {ih}")
@@ -1545,20 +1654,38 @@ class Gen:
             for k in range(sizes[op.rsplit("_", 1)[1]]):
                 v = self.load_reg("vgpr", a[1]["r"] + k)
                 self.emit(f"OpStore {self.lds_ptr(addr, off + 4 * k)} {v}")
-        elif op in ("ds_read2_b32", "ds_read2st64_b32", "ds_write2_b32", "ds_write2st64_b32"):
-            unit = 4 * (64 if "st64" in op else 1)
+        elif op in ("ds_read2_b32", "ds_read2st64_b32", "ds_write2_b32", "ds_write2st64_b32",
+                    "ds_read2_b64", "ds_read2st64_b64", "ds_write2_b64", "ds_write2st64_b64"):
+            # Two elements at ADDR + offset0 * unit and ADDR + offset1 * unit; unit = element size (4 or 8 bytes),
+            # times 64 for st64. A b64 element is two consecutive dwords (low first): read2_b64 fills
+            # v[d:d+3], write2_b64 takes two VGPR pairs.
+            words = 2 if op.endswith("_b64") else 1
+            unit = 4 * words * (64 if "st64" in op else 1)
             offs = (self.mod_int(mods, "offset0", 0) * unit, self.mod_int(mods, "offset1", 0) * unit)
             if op.startswith("ds_read2"):
                 addr = self.src_u(a[1])
-                for k, o in enumerate(offs):
-                    v = self.tmp()
-                    self.emit(f"{v} = OpLoad %uint {self.lds_ptr(addr, o)}")
+                vals = []
+                for o in offs:
+                    for w in range(words):
+                        v = self.tmp()
+                        self.emit(f"{v} = OpLoad %uint {self.lds_ptr(addr, o + 4 * w)}")
+                        vals.append(v)
+                for k, v in enumerate(vals):         # every load before the first write (vdst may alias vaddr)
                     self.dst({"k": "vgpr", "r": a[0]["r"] + k, "n": 1}, v)
             else:
                 addr = self.src_u(a[0])
                 for k, o in enumerate(offs):
-                    self.emit(f"OpStore {self.lds_ptr(addr, o)} {self.src_u(a[1 + k])}")
-        elif op in ("ds_read_u16", "ds_read_i16", "ds_read_u8", "ds_read_i8", "ds_read_u16_d16_hi", "ds_read_u16_d16"):
+                    data = a[1 + k]
+                    for w in range(words):
+                        if words == 1:
+                            v = self.src_u(data)
+                        elif data["k"] == "vgpr" and data.get("n") == 2:
+                            v = self.load_reg("vgpr", data["r"] + w)
+                        else:
+                            raise Unsupported(op + " data")
+                        self.emit(f"OpStore {self.lds_ptr(addr, o + 4 * w)} {v}")
+        elif op in ("ds_read_u16", "ds_read_i16", "ds_read_u8", "ds_read_i8", "ds_read_u16_d16_hi", "ds_read_u16_d16",
+                    "ds_read_u8_d16", "ds_read_u8_d16_hi", "ds_read_i8_d16", "ds_read_i8_d16_hi"):
             bits = 16 if "16" in op.split("_")[2] else 8
             addr = self.src_u(a[1])
             s1, sh, sh2, w, v = (self.tmp() for _ in range(5))
@@ -1570,6 +1697,8 @@ class Gen:
             self.emit(f"{v} = {f} %uint {w} {sh2} {self.cu(bits)}")
             d = a[0]
             if "_d16" in op:
+                # u8/i8: v is the 8-bit field extended to 32 bits; the insert keeps only its low 16 bits, so the
+                # i8 sign extension is 8 -> 16 as the ISA says. The other half of the destination is kept.
                 hi = op.endswith("_hi")
                 r = self.tmp()
                 self.emit(f"{r} = OpBitFieldInsert %uint {self.load_reg('vgpr', d['r'])} {v} "
@@ -1603,13 +1732,14 @@ class Gen:
             self.emit(f"{old} = {self.LDS_ATOMICS[name]} %uint {p} {sc} {sem} {self.src_u(dat)}")
             if d is not None:
                 self.dst(d, old)
-        elif op == "ds_cmpst_rtn_b32":
-            # tmp = M[A]; M[A] = (tmp == DATA) ? DATA2 : tmp; return tmp
-            d, ad, cmp_, src = a[0], a[1], a[2], a[3]
+        elif op in ("ds_cmpst_rtn_b32", "ds_cmpst_b32"):
+            # tmp = M[A]; M[A] = (tmp == DATA) ? DATA2 : tmp; the _rtn_ form returns tmp, ds_cmpst_b32 drops it.
+            d, ad, cmp_, src = (a[0], a[1], a[2], a[3]) if rtn else (None, a[0], a[1], a[2])
             p = self.lds_ptr(self.src_u(ad), off)
             old = self.tmp()
             self.emit(f"{old} = OpAtomicCompareExchange %uint {p} {sc} {sem} {sem} {self.src_u(src)} {self.src_u(cmp_)}")
-            self.dst(d, old)
+            if d is not None:
+                self.dst(d, old)
         else:
             raise Unsupported(op)
         self.emit(f"OpBranch {lbl_end}")
@@ -1623,27 +1753,32 @@ class Gen:
         self.uses_psb = True
         return self.lconsts[v]
 
+    def local_index(self):
+        """LocalInvocationIndex of a compute or mesh shader invocation (thread i of its workgroup): the mesh shader
+        loads the built-in; a compute shader flattens LocalInvocationId with the group size from its header."""
+        li = self.tmp()
+        if self.stage == "ms":
+            self.emit(f"{li} = OpLoad %uint %local_index")
+            return li
+        lid, x, y, z, lx, t1, t2 = (self.tmp() for _ in range(7))
+        sx, sy, _ = self.cs["size"]
+        self.emit(f"{lid} = OpLoad %v3uint %local_id")
+        self.emit(f"{x} = OpCompositeExtract %uint {lid} 0")
+        self.emit(f"{y} = OpCompositeExtract %uint {lid} 1")
+        self.emit(f"{z} = OpCompositeExtract %uint {lid} 2")
+        self.emit(f"{t1} = OpIMul %uint {y} {self.cu(sx)}")
+        self.emit(f"{t2} = OpIMul %uint {z} {self.cu(sx * sy)}")
+        self.emit(f"{lx} = OpIAdd %uint {x} {t1}")
+        self.emit(f"{li} = OpIAdd %uint {lx} {t2}")
+        return li
+
     def wave_lane(self):
         """This invocation's hardware lane within its wave. Compute and mesh shaders: LocalInvocationIndex mod the
         wave size (exact: thread i of a group is wave i / W, lane i % W). Other stages: the subgroup lane, which is
         the hardware lane when the runtime runs them with subgroup size == wave size."""
         lane = self.tmp()
-        if self.stage == "ms":
-            li = self.tmp()
-            self.emit(f"{li} = OpLoad %uint %local_index")
-            self.emit(f"{lane} = OpBitwiseAnd %uint {li} {self.cu(63 if self.wave64 else 31)}")
-        elif self.stage == "cs":
-            lid, x, y, z, lx, lxy, t1, t2, li = (self.tmp() for _ in range(9))
-            sx, sy, _ = self.cs["size"]
-            self.emit(f"{lid} = OpLoad %v3uint %local_id")
-            self.emit(f"{x} = OpCompositeExtract %uint {lid} 0")
-            self.emit(f"{y} = OpCompositeExtract %uint {lid} 1")
-            self.emit(f"{z} = OpCompositeExtract %uint {lid} 2")
-            self.emit(f"{t1} = OpIMul %uint {y} {self.cu(sx)}")
-            self.emit(f"{t2} = OpIMul %uint {z} {self.cu(sx * sy)}")
-            self.emit(f"{lx} = OpIAdd %uint {x} {t1}")
-            self.emit(f"{li} = OpIAdd %uint {lx} {t2}")
-            self.emit(f"{lane} = OpBitwiseAnd %uint {li} {self.cu(63 if self.wave64 else 31)}")
+        if self.stage in ("cs", "ms"):
+            self.emit(f"{lane} = OpBitwiseAnd %uint {self.local_index()} {self.cu(63 if self.wave64 else 31)}")
         else:
             self.uses_subgroup = True
             self.emit(f"{lane} = OpLoad %uint %sg_lane")
@@ -1673,6 +1808,7 @@ class Gen:
         self.emit(f"OpStore %pc {self.cu(seg)}")
         self.x_marks.append((len(self.body), seg))
         self.desc_cache.clear()
+        self.sgpr_imm.clear()
         self.block_label = f"%blk{seg}"
         self.x_dirty = set()
 
@@ -2364,6 +2500,8 @@ class Gen:
                                  const)
         elif op == "v_mov_b32" or op == "s_mov_b32":
             self.dst(a[0], self.src_u(a[1]))
+            if op == "s_mov_b32" and a[0]["k"] == "sgpr" and a[1]["k"] == "imm" and self.desc_cache_ok():
+                self.sgpr_imm[a[0]["r"]] = a[1]["v"] & 0xFFFFFFFF      # a literal S# word, see gather_addr_modes
         elif op == "s_mov_b64":
             self.mov64(a[0], a[1])
         elif op in ("v_max3_f32", "v_min3_f32"):
@@ -2379,6 +2517,24 @@ class Gen:
             self.emit(f"{m} = OpBitwiseAnd %uint {x} {y}")
             self.emit(f"{r} = OpBitwiseOr %uint {m} {z}")
             self.dst(a[0], r)
+        elif op == "s_brev_b64":
+            # D = the 64 bits of S0 in reverse order: D.lo = reverse(S0.hi), D.hi = reverse(S0.lo). SCC is not
+            # written. The pair is 64-bit data (as for s_lshl_b64); a lane-mask source stays Unsupported (#210).
+            d, x = a[0], a[1]
+            if d["k"] != "sgpr" or d.get("n") != 2 or self.holds_lane_mask(x):
+                raise Unsupported(op + " operands")
+            if x["k"] == "sgpr" and x.get("n") == 2:
+                lo, hi = self.load_reg("sgpr", x["r"]), self.load_reg("sgpr", x["r"] + 1)
+            elif x["k"] == "imm":
+                v = x["v"] & 0xFFFFFFFFFFFFFFFF          # 64-bit inline/literal constant: sign-extended
+                lo, hi = self.cu(v & 0xFFFFFFFF), self.cu(v >> 32)
+            else:
+                raise Unsupported(op + " source")
+            rlo, rhi = self.tmp(), self.tmp()
+            self.emit(f"{rlo} = OpBitReverse %uint {hi}")
+            self.emit(f"{rhi} = OpBitReverse %uint {lo}")
+            self.store_reg("sgpr", d["r"], rlo)
+            self.store_reg("sgpr", d["r"] + 1, rhi)
         elif op == "s_brev_b32":
             x = self.src_u(a[1])
             r = self.tmp()
@@ -2731,6 +2887,41 @@ class Gen:
             r = self.tmp()
             self.emit(f"{r} = OpISub %uint {y} {x}")
             self.dst(a[0], r)
+        elif op in ("s_flbit_i32_b64", "s_flbit_i32_i64"):
+            # Leading-bit count of a 64-bit value, from bit 63 down: b64 counts the zeros before the first 1; i64
+            # counts the bits before the first one that differs from the sign bit (b64 of ~S0 when S0 < 0). -1 when
+            # there is none (0, and for i64 also -1). SCC is not written. The pair is 64-bit data (as for
+            # s_lshl_b64); a lane-mask source stays Unsupported (#210).
+            x = a[1]
+            if self.holds_lane_mask(x):
+                raise Unsupported(op + " of a lane mask")
+            if x["k"] == "sgpr" and x.get("n") == 2:
+                lo, hi = self.load_reg("sgpr", x["r"]), self.load_reg("sgpr", x["r"] + 1)
+            elif x["k"] == "imm":
+                v = x["v"] & 0xFFFFFFFFFFFFFFFF
+                lo, hi = self.cu(v & 0xFFFFFFFF), self.cu(v >> 32)
+            else:
+                raise Unsupported(op + " source")
+            if op == "s_flbit_i32_i64":
+                neg, nlo, nhi, slo, shi = (self.tmp() for _ in range(5))
+                self.emit(f"{neg} = OpSLessThan %bool {self.as_int(hi)} {self.as_int(self.cu(0))}")
+                self.emit(f"{nlo} = OpNot %uint {lo}")
+                self.emit(f"{nhi} = OpNot %uint {hi}")
+                self.emit(f"{slo} = OpSelect %uint {neg} {nlo} {lo}")
+                self.emit(f"{shi} = OpSelect %uint {neg} {nhi} {hi}")
+                lo, hi = slo, shi
+            mh, ml, mhu, mlu, ch, cl, hz, lz, r0, r = (self.tmp() for _ in range(10))
+            self.emit(f"{mh} = OpExtInst %int %glsl FindUMsb {hi}")
+            self.emit(f"{ml} = OpExtInst %int %glsl FindUMsb {lo}")
+            self.emit(f"{mhu} = OpBitcast %uint {mh}")
+            self.emit(f"{mlu} = OpBitcast %uint {ml}")
+            self.emit(f"{ch} = OpISub %uint {self.cu(31)} {mhu}")          # zeros above the top 1 of the high half
+            self.emit(f"{cl} = OpISub %uint {self.cu(63)} {mlu}")          # 32 + zeros above the top 1 of the low half
+            self.emit(f"{hz} = OpIEqual %bool {hi} {self.cu(0)}")
+            self.emit(f"{lz} = OpIEqual %bool {lo} {self.cu(0)}")
+            self.emit(f"{r0} = OpSelect %uint {lz} {self.cu(0xFFFFFFFF)} {cl}")
+            self.emit(f"{r} = OpSelect %uint {hz} {r0} {ch}")
+            self.dst(a[0], r)
         elif op in ("s_ff1_i32_b64", "s_ff1_i32_b32", "s_ff0_i32_b64", "s_ff0_i32_b32"):
             # Lowest set (ff1) or zero (ff0) bit of a mask, -1 if none. For a lane mask that is the wave's first lane.
             if self.holds_lane_mask(a[1]):
@@ -2996,6 +3187,32 @@ class Gen:
             if code is None or code not in self.FORMATS:
                 raise Unsupported(op + " " + name)
             self.buffer_load_format(op[1:], a, mods, fixed_fmt=code)
+        elif op in ("s_bitset0_b64", "s_bitset1_b64"):
+            # D[S0 & 63] = 0 / 1 in the SGPR pair D (D is both source and destination); SCC is not written. The pair
+            # is 64-bit data (as for s_lshl_b64); a pair that lane_masks.py marks as a lane mask stays Unsupported.
+            d = a[0]
+            if d["k"] != "sgpr" or d.get("n") != 2 or self.holds_lane_mask(d):
+                raise Unsupported(op + " destination")
+            b = self.src_u(a[1])
+            m, low, bit, sh = self.tmp(), self.tmp(), self.tmp(), self.tmp()
+            self.emit(f"{m} = OpBitwiseAnd %uint {b} {self.cu(63)}")
+            self.emit(f"{low} = OpULessThan %bool {m} {self.cu(32)}")
+            self.emit(f"{bit} = OpBitwiseAnd %uint {m} {self.cu(31)}")
+            self.emit(f"{sh} = OpShiftLeftLogical %uint {self.cu(1)} {bit}")
+            for half in (0, 1):
+                old, want, mk, r = self.tmp(), self.tmp(), self.tmp(), self.tmp()
+                self.emit(f"{old} = OpCopyObject %uint {self.load_reg('sgpr', d['r'] + half)}")
+                # The bit lands in this half when (m < 32) matches (half == 0).
+                if half == 0:
+                    self.emit(f"{mk} = OpSelect %uint {low} {sh} {self.cu(0)}")
+                else:
+                    self.emit(f"{mk} = OpSelect %uint {low} {self.cu(0)} {sh}")
+                if op == "s_bitset1_b64":
+                    self.emit(f"{r} = OpBitwiseOr %uint {old} {mk}")
+                else:
+                    self.emit(f"{want} = OpNot %uint {mk}")
+                    self.emit(f"{r} = OpBitwiseAnd %uint {old} {want}")
+                self.store_reg("sgpr", d["r"] + half, r)
         elif op == "s_bitset1_b32":
             # sD |= 1 << (src & 31)   (sD is both source and destination)
             b = self.src_u(a[1])
@@ -3400,6 +3617,57 @@ class Gen:
             self.emit(f"{r} = OpExtInst %float %glsl FClamp {vals[2]} {lo_} {hi_}")
             r = self.clamp_mods(r, mods)
             self.f16_out(a[0], r, dhi)    # opsel-capable VOP3: keeps the other half (Mesa ACO can_use_opsel)
+        elif op in ("v_qsad_pk_u16_u8", "v_mqsad_pk_u16_u8"):
+            # Four byte-SADs packed as u16 (RDNA ISA pseudocode): for k = 0..3, D.u16[k] = (S2.u16[k] + SAD of the
+            # 32-bit window S0[8k+31 : 8k] of the 64-bit S0 against S1) & 0xFFFF. The m form is masked: a byte where
+            # S1's byte is 0 is skipped (as v_msad_u8). clamp is not modelled: rejected rather than guessed.
+            if a[0].get("n") != 2 or "clamp" in mods:
+                raise Unsupported(op + " operands")
+
+            def pair(sv):
+                if sv["k"] in ("vgpr", "sgpr") and sv.get("n") == 2:
+                    return self.load_reg(sv["k"], sv["r"]), self.load_reg(sv["k"], sv["r"] + 1)
+                if sv["k"] == "imm":
+                    v = sv["v"] & 0xFFFFFFFFFFFFFFFF          # 64-bit inline/literal constant: sign-extended
+                    return self.cu(v & 0xFFFFFFFF), self.cu(v >> 32)
+                raise Unsupported(op + " operands")
+            (x_lo, x_hi), y, (c_lo, c_hi) = pair(a[1]), self.src_u(a[2]), pair(a[3])
+            words = []
+            for k in range(4):
+                if k == 0:
+                    win = x_lo
+                else:
+                    t1, t2, win = self.tmp(), self.tmp(), self.tmp()
+                    self.emit(f"{t1} = OpShiftRightLogical %uint {x_lo} {self.cu(8 * k)}")
+                    self.emit(f"{t2} = OpShiftLeftLogical %uint {x_hi} {self.cu(32 - 8 * k)}")
+                    self.emit(f"{win} = OpBitwiseOr %uint {t1} {t2}")
+                acc_w = c_lo if k < 2 else c_hi
+                total = self.tmp()
+                self.emit(f"{total} = OpBitFieldUExtract %uint {acc_w} {self.cu(16 * (k % 2))} {self.cu(16)}")
+                for off in (0, 8, 16, 24):
+                    xb, yb, hi_, lo_, d, t = (self.tmp() for _ in range(6))
+                    self.emit(f"{xb} = OpBitFieldUExtract %uint {win} {self.cu(off)} {self.cu(8)}")
+                    self.emit(f"{yb} = OpBitFieldUExtract %uint {y} {self.cu(off)} {self.cu(8)}")
+                    self.emit(f"{hi_} = OpExtInst %uint %glsl UMax {xb} {yb}")
+                    self.emit(f"{lo_} = OpExtInst %uint %glsl UMin {xb} {yb}")
+                    self.emit(f"{d} = OpISub %uint {hi_} {lo_}")
+                    if op == "v_mqsad_pk_u16_u8":
+                        md = self.tmp()
+                        self.emit(f"{md} = OpSelect %uint {self.tmp_bool_nz(yb)} {d} {self.cu(0)}")
+                        d = md
+                    self.emit(f"{t} = OpIAdd %uint {total} {d}")
+                    total = t
+                w = self.tmp()
+                self.emit(f"{w} = OpBitwiseAnd %uint {total} {self.cu(0xFFFF)}")
+                words.append(w)
+            out = []
+            for lo16, hi16 in ((words[0], words[1]), (words[2], words[3])):
+                sh, o = self.tmp(), self.tmp()
+                self.emit(f"{sh} = OpShiftLeftLogical %uint {hi16} {self.cu(16)}")
+                self.emit(f"{o} = OpBitwiseOr %uint {lo16} {sh}")
+                out.append(o)
+            self.dst({"k": "vgpr", "r": a[0]["r"], "n": 1}, out[0])
+            self.dst({"k": "vgpr", "r": a[0]["r"] + 1, "n": 1}, out[1])
         elif op in ("v_sad_u8", "v_sad_hi_u8", "v_sad_u16", "v_sad_u32", "v_msad_u8"):
             # Sums of absolute differences (RDNA ISA pseudocode), all unsigned and wrapping at 32 bits:
             #   v_sad_u8:    S2 + sum over the 4 bytes of |S0.b - S1.b|
@@ -3441,6 +3709,49 @@ class Gen:
             r = self.tmp()
             self.emit(f"{r} = OpIAdd %uint {total} {acc}")
             self.dst(a[0], r)
+        elif op == "v_mqsad_u32_u8":
+            # Four masked byte-SADs with full 32-bit accumulators (RDNA ISA pseudocode): for k = 0..3,
+            # D[k] = S2[k] + v_msad_u8 of the 32-bit window S0[8k+31 : 8k] of the 64-bit S0 against S1, wrapping at
+            # 32 bits; a byte where S1's byte is 0 adds nothing. S2 and D are 128-bit (four VGPRs).
+            # clamp is not modelled: rejected rather than guessed.
+            if a[0].get("n") != 4 or "clamp" in mods:
+                raise Unsupported(op + " operands")
+            s0, s2 = a[1], a[3]
+            if s0["k"] in ("vgpr", "sgpr") and s0.get("n") == 2:
+                x_lo, x_hi = self.load_reg(s0["k"], s0["r"]), self.load_reg(s0["k"], s0["r"] + 1)
+            elif s0["k"] == "imm":
+                v = s0["v"] & 0xFFFFFFFFFFFFFFFF                  # 64-bit inline/literal constant: sign-extended
+                x_lo, x_hi = self.cu(v & 0xFFFFFFFF), self.cu(v >> 32)
+            else:
+                raise Unsupported(op + " operands")
+            if s2["k"] == "vgpr" and s2.get("n") == 4:
+                accs = [self.load_reg("vgpr", s2["r"] + k) for k in range(4)]
+            else:
+                raise Unsupported(op + " operands")
+            y = self.src_u(a[2])
+            outs = []
+            for k in range(4):
+                if k == 0:
+                    win = x_lo
+                else:
+                    t1, t2, win = self.tmp(), self.tmp(), self.tmp()
+                    self.emit(f"{t1} = OpShiftRightLogical %uint {x_lo} {self.cu(8 * k)}")
+                    self.emit(f"{t2} = OpShiftLeftLogical %uint {x_hi} {self.cu(32 - 8 * k)}")
+                    self.emit(f"{win} = OpBitwiseOr %uint {t1} {t2}")
+                total = accs[k]
+                for off in (0, 8, 16, 24):
+                    xb, yb, hi_, lo_, d, md, t = (self.tmp() for _ in range(7))
+                    self.emit(f"{xb} = OpBitFieldUExtract %uint {win} {self.cu(off)} {self.cu(8)}")
+                    self.emit(f"{yb} = OpBitFieldUExtract %uint {y} {self.cu(off)} {self.cu(8)}")
+                    self.emit(f"{hi_} = OpExtInst %uint %glsl UMax {xb} {yb}")
+                    self.emit(f"{lo_} = OpExtInst %uint %glsl UMin {xb} {yb}")
+                    self.emit(f"{d} = OpISub %uint {hi_} {lo_}")
+                    self.emit(f"{md} = OpSelect %uint {self.tmp_bool_nz(yb)} {d} {self.cu(0)}")
+                    self.emit(f"{t} = OpIAdd %uint {total} {md}")
+                    total = t
+                outs.append(total)
+            for k in range(4):               # every source is read before the first write
+                self.dst({"k": "vgpr", "r": a[0]["r"] + k, "n": 1}, outs[k])
         elif op == "v_xad_u32":
             x, y, z = (self.src_u(t) for t in a[1:4])
             t, r = self.tmp(), self.tmp()
@@ -3541,7 +3852,19 @@ class Gen:
             self.emit(f"OpStore %scc {z}")
         elif op in ("s_cmp_eq_u64", "s_cmp_lg_u64"):
             # 64-bit compare of masks/pointers: equal iff both halves are equal.
-            def halves(s):
+            m0, m1 = self.holds_lane_mask(a[0]), self.holds_lane_mask(a[1])
+
+            def _is_u64_zero_or_all_ones(src):
+                if src["k"] != "imm":
+                    return False
+                v = src["v"] & 0xFFFFFFFFFFFFFFFF
+                return v == 0 or (self.wave64 and v == 0xFFFFFFFFFFFFFFFF)
+
+            use_vote = (m0 and m1) or (m0 and _is_u64_zero_or_all_ones(a[1])) or (m1 and _is_u64_zero_or_all_ones(a[0]))
+
+            def halves(s, is_mask):
+                if is_mask and not use_vote:
+                    return self.wave_mask(s)
                 if s["k"] == "sgpr" and s.get("n") == 2:
                     return self.load_reg("sgpr", s["r"]), self.load_reg("sgpr", s["r"] + 1)
                 if s["k"] == "imm":
@@ -3549,12 +3872,13 @@ class Gen:
                     return self.cu(v & 0xFFFFFFFF), self.cu(v >> 32)
                 m = self.mask_src(s)
                 return m, m
-            (x0, x1), (y0, y1) = halves(a[0]), halves(a[1])
+
+            (x0, x1), (y0, y1) = halves(a[0], m0), halves(a[1], m1)
             e0, e1, eq, r = (self.tmp() for _ in range(4))
             self.emit(f"{e0} = OpIEqual %bool {x0} {y0}")
             self.emit(f"{e1} = OpIEqual %bool {x1} {y1}")
             self.emit(f"{eq} = OpLogicalAnd %bool {e0} {e1}")
-            if self.holds_lane_mask(a[0]) or self.holds_lane_mask(a[1]):
+            if use_vote:
                 eq = self.wave_equal(eq, True)
             if op == "s_cmp_lg_u64":
                 ne = self.tmp()
@@ -3731,6 +4055,14 @@ class Gen:
             self.emit(f"{ovf} = OpBitwiseOr %uint {out} {c}")
             self.dst(a[0], r)
             self.scc_nonzero(ovf)
+        elif op == "s_get_waveid_in_workgroup":
+            # D = this wave's index in its workgroup: thread i of a group is in wave i / W (W = 64 or 32), the rule
+            # wave_lane uses for the lane. Only compute and mesh shaders have a workgroup. SCC is not written.
+            if self.stage not in ("cs", "ms"):
+                raise Unsupported(op + " outside compute")
+            r = self.tmp()
+            self.emit(f"{r} = OpShiftRightLogical %uint {self.local_index()} {self.cu(6 if self.wave64 else 5)}")
+            self.dst(a[0], r)
         elif op == "s_getpc_b64":
             # Address of the next instruction: code base (push constants 34-35: where the runtime put this shader's
             # FSSM blob in the Xbox VA window) + offset of the next instruction within the blob.
@@ -3791,21 +4123,7 @@ class Gen:
             self.wqm(op, a)
         elif op == "v_fma_mix_f32":
             # Each source is f32, or (op_sel_hi bit set) an f16 from the low/high half chosen by op_sel.
-            sel = next((m for m in mods if m.startswith("op_sel:")), "op_sel:[0,0,0]")
-            selhi = next((m for m in mods if m.startswith("op_sel_hi:")), "op_sel_hi:[0,0,0]")
-            sb = [int(x) for x in sel.split("[")[1].rstrip("]").split(",")]
-            hb = [int(x) for x in selhi.split("[")[1].rstrip("]").split(",")]
-            vals = []
-            for i, src in enumerate(a[1:4]):
-                if hb[i]:
-                    u = self.src_u({**src, "neg": False, "abs": False})
-                    v2, f = self.tmp(), self.tmp()
-                    self.emit(f"{v2} = OpExtInst %v2float %glsl UnpackHalf2x16 {u}")
-                    self.emit(f"{f} = OpCompositeExtract %float {v2} {sb[i]}")
-                    f = self.tof(self.modify(self.tou(f), src))
-                    vals.append(f)
-                else:
-                    vals.append(self.src_f(src))
+            vals = self.fma_mix_srcs(a, mods)
             r = self.tmp()
             self.emit(f"{r} = OpExtInst %float %glsl Fma {vals[0]} {vals[1]} {vals[2]}")
             self.dst(a[0], self.tou(self.clamp_mods(r, mods)))
@@ -3853,6 +4171,20 @@ class Gen:
         elif op == "s_movk_i32":
             v = a[1]["v"] & 0xFFFF
             self.dst(a[0], self.cu(v - 0x10000 if v & 0x8000 else v))
+        elif op in ("s_cmov_b32", "s_cmovk_i32"):
+            # D = SCC ? S0 : D (s_cmovk_i32: S0 is the 16-bit immediate, sign-extended). SCC is read, not written.
+            if a[0]["k"] != "sgpr":
+                raise Unsupported(op + " destination")
+            if op == "s_cmovk_i32":
+                v = a[1]["v"] & 0xFFFF
+                x = self.cu((v - 0x10000 if v & 0x8000 else v) & 0xFFFFFFFF)
+            else:
+                x = self.src_u(a[1])
+            old, c, r = self.tmp(), self.tmp(), self.tmp()
+            self.emit(f"{old} = OpCopyObject %uint {self.load_reg('sgpr', a[0]['r'])}")
+            self.emit(f"{c} = OpLoad %uint %scc")
+            self.emit(f"{r} = OpSelect %uint {self.tmp_bool_nz(c)} {x} {old}")
+            self.dst(a[0], r)
         elif op.startswith("v_cmp_") and not op.startswith("v_cmp_class") and not op.endswith(("_u64", "_i64")):
             self.compare(op, a, scalar=False)
         elif op.startswith("v_cmpx_") and not op.startswith("v_cmpx_class") and not op.endswith(("_u64", "_i64")):
@@ -3881,6 +4213,64 @@ class Gen:
             self.set_exec(r)
             self.mask_dst(a[0], r)
             self.scc_from_mask(r)
+        elif op in ("s_bfe_u64", "s_bfe_i64"):
+            # 64-bit bitfield extract: offset = S1[5:0], width = S1[22:16] (0-127). A width of 0 gives 0; a field
+            # running past bit 63 stops there (LLVM constantFoldBFE: Src0 >> Offset, arithmetic for i64), so the
+            # width is cut to 64 - offset. SCC = (D != 0). The pair is 64-bit data (as for s_lshl_b64); a lane-mask
+            # source stays Unsupported (#210).
+            d, x = a[0], a[1]
+            if d["k"] != "sgpr" or d.get("n") != 2 or self.holds_lane_mask(x):
+                raise Unsupported(op + " operands")
+            if x["k"] == "sgpr" and x.get("n") == 2:
+                lo, hi = self.load_reg("sgpr", x["r"]), self.load_reg("sgpr", x["r"] + 1)
+            elif x["k"] == "imm":
+                v = x["v"] & 0xFFFFFFFFFFFFFFFF
+                lo, hi = self.cu(v & 0xFFFFFFFF), self.cu(v >> 32)
+            else:
+                raise Unsupported(op + " source")
+            ctl = self.src_u(a[2])
+            off, wid, room, fits, w, l64, h64, t, v64 = (self.tmp() for _ in range(9))
+            self.emit(f"{off} = OpBitwiseAnd %uint {ctl} {self.cu(63)}")
+            self.emit(f"{wid} = OpBitFieldUExtract %uint {ctl} {self.cu(16)} {self.cu(7)}")
+            self.emit(f"{room} = OpISub %uint {self.cu(64)} {off}")
+            self.emit(f"{fits} = OpULessThan %bool {wid} {room}")
+            self.emit(f"{w} = OpSelect %uint {fits} {wid} {room}")              # 0..64, and off + w <= 64
+            self.emit(f"{l64} = OpUConvert %ulong {lo}")
+            self.emit(f"{h64} = OpUConvert %ulong {hi}")
+            self.emit(f"{t} = OpShiftLeftLogical %ulong {h64} %c64_32")
+            self.emit(f"{v64} = OpBitwiseOr %ulong {t} {l64}")
+            # Shift the field to the top, then back down: both amounts stay in 0..63 whenever w >= 1; w = 0 is
+            # handled by the final select, so its (clamped) shifts never decide the result.
+            wz = self.tmp()
+            self.emit(f"{wz} = OpIEqual %bool {w} {self.cu(0)}")
+            w1, up, down, up64, down64, sh, field = (self.tmp() for _ in range(7))
+            self.emit(f"{w1} = OpSelect %uint {wz} {self.cu(1)} {w}")
+            ow = self.tmp()
+            self.emit(f"{ow} = OpIAdd %uint {off} {w1}")
+            self.emit(f"{up} = OpISub %uint {self.cu(64)} {ow}")
+            self.emit(f"{down} = OpISub %uint {self.cu(64)} {w1}")
+            self.emit(f"{up64} = OpUConvert %ulong {up}")
+            self.emit(f"{down64} = OpUConvert %ulong {down}")
+            self.emit(f"{sh} = OpShiftLeftLogical %ulong {v64} {up64}")
+            if op == "s_bfe_u64":
+                self.emit(f"{field} = OpShiftRightLogical %ulong {sh} {down64}")
+            else:
+                si_, ri = self.tmp(), self.tmp()
+                self.emit(f"{si_} = OpBitcast %long {sh}")
+                self.emit(f"{ri} = OpShiftRightArithmetic %long {si_} {down64}")
+                self.emit(f"{field} = OpBitcast %ulong {ri}")
+            flo, fh, fhi, rlo, rhi = (self.tmp() for _ in range(5))
+            self.emit(f"{flo} = OpUConvert %uint {field}")
+            self.emit(f"{fh} = OpShiftRightLogical %ulong {field} %c64_32")
+            self.emit(f"{fhi} = OpUConvert %uint {fh}")
+            self.emit(f"{rlo} = OpSelect %uint {wz} {self.cu(0)} {flo}")
+            self.emit(f"{rhi} = OpSelect %uint {wz} {self.cu(0)} {fhi}")
+            self.store_reg("sgpr", d["r"], rlo)
+            self.store_reg("sgpr", d["r"] + 1, rhi)
+            orr = self.tmp()
+            self.emit(f"{orr} = OpBitwiseOr %uint {rlo} {rhi}")
+            self.scc_nonzero(orr)
+            self.uses_psb = True        # Int64 capability and %ulong / %long come with the PSB declarations
         elif op in ("s_bfe_u32", "s_bfe_i32"):
             # src1 packs offset in bits [4:0] and width in bits [22:16].
             x, ctl = self.src_u(a[1]), self.src_u(a[2])
@@ -3992,7 +4382,9 @@ class Gen:
                 raise Unsupported(op + " form")
             f = self.attribute(attr["a"], attr["c"])
             if op == "v_interp_p2_f16":
-                self.dst(a[0], self.f16_bits(f))
+                # VOP3 clamp applies to the f16 result (ACO: dst(F16); llvm-mc takes clamp but no omod on this op).
+                # Until 2026-11-22 it was dropped.
+                self.dst(a[0], self.f16_bits(self.clamp_mods(f, mods)))
             else:   # p1ll/p1lv produce the f32 intermediate consumed by p2_f16
                 self.dst(a[0], self.tou(f))
         elif op.startswith("s_cmp_"):
@@ -4006,16 +4398,6 @@ class Gen:
             self.compare("s_cmp_" + op[len("s_cmpk_"):], [a[0], {"k": "imm", "v": v}], scalar=True)
         elif op.startswith("s_bitcmp"):
             self.bitcmp(op, a)
-        elif op == "s_bfm_b32":
-            # Bitfield mask: ((1 << width) - 1) << offset, width/offset from the low 5 bits of the sources.
-            w, o = self.src_u(a[1]), self.src_u(a[2])
-            wm, om, one, m1, r = (self.tmp() for _ in range(5))
-            self.emit(f"{wm} = OpBitwiseAnd %uint {w} {self.cu(31)}")
-            self.emit(f"{om} = OpBitwiseAnd %uint {o} {self.cu(31)}")
-            self.emit(f"{one} = OpShiftLeftLogical %uint {self.cu(1)} {wm}")
-            self.emit(f"{m1} = OpISub %uint {one} {self.cu(1)}")
-            self.emit(f"{r} = OpShiftLeftLogical %uint {m1} {om}")
-            self.dst(a[0], r)
         elif op == "s_mul_hi_u32":
             x, y = self.src_u(a[1]), self.src_u(a[2])
             s, r = self.tmp(), self.tmp()
@@ -4042,35 +4424,11 @@ class Gen:
             self.dst(a[0], r)
             self.scc_nonzero(r)
         elif op in ("v_fma_mixlo_f16", "v_fma_mixhi_f16"):
-            sel = next((m for m in mods if m.startswith("op_sel:")), "op_sel:[0,0,0]")
-            selhi = next((m for m in mods if m.startswith("op_sel_hi:")), "op_sel_hi:[0,0,0]")
-            sb = [int(x) for x in sel.split("[")[1].rstrip("]").split(",")]
-            hb = [int(x) for x in selhi.split("[")[1].rstrip("]").split(",")]
-            vals = []
-            for i, src in enumerate(a[1:4]):
-                if hb[i]:
-                    u = self.src_u({**src, "neg": False, "abs": False})
-                    v2, f = self.tmp(), self.tmp()
-                    self.emit(f"{v2} = OpExtInst %v2float %glsl UnpackHalf2x16 {u}")
-                    self.emit(f"{f} = OpCompositeExtract %float {v2} {sb[i]}")
-                    vals.append(self.modify_f(f, src))
-                else:
-                    vals.append(self.src_f(src))
-            r, v, p, h16 = self.tmp(), self.tmp(), self.tmp(), self.tmp()
+            vals = self.fma_mix_srcs(a, mods)
+            r = self.tmp()
             self.emit(f"{r} = OpExtInst %float %glsl Fma {vals[0]} {vals[1]} {vals[2]}")
             r = self.clamp_mods(r, mods)
-            self.emit(f"{h16} = OpCopyObject %uint {self.f16_bits(r)}")
-            old = self.load_reg("vgpr", a[0]["r"])
-            keep, newv = self.tmp(), self.tmp()
-            if op == "v_fma_mixlo_f16":
-                self.emit(f"{keep} = OpBitwiseAnd %uint {old} {self.cu(0xFFFF0000)}")
-                self.emit(f"{newv} = OpBitwiseOr %uint {keep} {h16}")
-            else:
-                sh = self.tmp()
-                self.emit(f"{keep} = OpBitwiseAnd %uint {old} {self.cu(0xFFFF)}")
-                self.emit(f"{sh} = OpShiftLeftLogical %uint {h16} {self.cu(16)}")
-                self.emit(f"{newv} = OpBitwiseOr %uint {keep} {sh}")
-            self.dst(a[0], newv)
+            self.f16_out(a[0], r, hi=(op == "v_fma_mixhi_f16"))
         elif op == "v_cvt_pk_u8_f32":
             # Convert src0 to u8 (round to nearest even, clamp) and insert it at byte src1 of src2.
             x, byte, base = self.src_f(a[1]), self.src_u(a[2]), self.src_u(a[3])
@@ -4092,6 +4450,28 @@ class Gen:
             s, r = self.tmp(), self.tmp()
             self.emit(f"{s} = OpUMulExtended %umul {x} {y}")
             self.emit(f"{r} = OpCompositeExtract %uint {s} 1")
+            self.dst(a[0], r)
+        elif op in ("v_cvt_pk_u16_u32", "v_cvt_pk_i16_i32"):
+            # D = {sat16(S1), sat16(S0)} (RDNA ISA pseudocode: u32_to_u16 / i32_to_i16 saturate): the low half from
+            # S0, the high half from S1; u16 clamps to [0, 0xFFFF], i16 to [-32768, 32767]. The whole dword is
+            # written. clamp is not modelled: rejected rather than guessed.
+            if "clamp" in mods:
+                raise Unsupported(op + " clamp")
+            halves = []
+            for src in a[1:3]:
+                x, h = self.src_u(src), self.tmp()
+                if op == "v_cvt_pk_u16_u32":
+                    self.emit(f"{h} = OpExtInst %uint %glsl UMin {x} {self.cu(0xFFFF)}")
+                else:
+                    xi, c, cu_ = self.as_int(x), self.tmp(), self.tmp()
+                    self.emit(f"{c} = OpExtInst %int %glsl SClamp {xi} {self.as_int(self.cu(0xFFFF8000))} "
+                              f"{self.as_int(self.cu(0x7FFF))}")
+                    self.emit(f"{cu_} = OpBitcast %uint {c}")
+                    self.emit(f"{h} = OpBitwiseAnd %uint {cu_} {self.cu(0xFFFF)}")
+                halves.append(h)
+            sh, r = self.tmp(), self.tmp()
+            self.emit(f"{sh} = OpShiftLeftLogical %uint {halves[1]} {self.cu(16)}")
+            self.emit(f"{r} = OpBitwiseOr %uint {halves[0]} {sh}")
             self.dst(a[0], r)
         elif op == "v_cvt_pkrtz_f16_f32":
             # Packs two f32 as f16 into one dword with round-toward-zero (exact, see f16_rtz). The earlier
@@ -4170,6 +4550,32 @@ class Gen:
             self.emit(f"{m} = OpBitwiseAnd %uint {s} {self.cu(0xFF)}")
             self.emit(f"{r} = OpConvertUToF %float {m}")
             self.dst(a[0], self.tou(self.clamp_mods(r, mods)))
+        elif op in ("v_cvt_flr_i32_f32", "v_cvt_rpi_i32_f32"):
+            # RDNA ISA pseudocode: flr = f32_to_i32(floor(S0)), rpi = f32_to_i32(floor(S0 + 0.5)), the + 0.5 rounded
+            # in binary32 like any f32 add. f32_to_i32 saturates as v_cvt_i32_f32 does (#300): +-2^31 and beyond go to
+            # INT_MAX / INT_MIN, NaN to 0. Source neg/abs apply before the rounding.
+            x = self.src_f(a[1])
+            if op == "v_cvt_rpi_i32_f32":
+                t = self.tmp()
+                self.emit(f"{t} = OpFAdd %float {x} {self.fconst(0.5)}")
+                x = t
+            fl = self.tmp()
+            self.emit(f"{fl} = OpExtInst %float %glsl Floor {x}")
+            bits = self.tou(fl)
+            magnitude, negative, not_nan, bound, in_range, saturated, safe, signed, converted, result = \
+                (self.tmp() for _ in range(10))
+            self.emit(f"{magnitude} = OpBitwiseAnd %uint {bits} {self.cu(0x7FFFFFFF)}")
+            self.emit(f"{in_range} = OpULessThan %bool {magnitude} {self.cu(0x4F000000)}")  # |x| < 2^31
+            self.emit(f"{negative} = OpINotEqual %bool {bits} {magnitude}")
+            self.emit(f"{not_nan} = OpULessThan %bool {magnitude} {self.cu(0x7F800001)}")
+            self.emit(f"{bound} = OpSelect %uint {negative} {self.cu(0x80000000)} {self.cu(0x7FFFFFFF)}")
+            self.emit(f"{saturated} = OpSelect %uint {not_nan} {bound} {self.cu(0)}")
+            # Convert only an in-range operand: SPIR-V leaves the out-of-range conversion undefined.
+            self.emit(f"{safe} = OpSelect %uint {in_range} {bits} {self.cu(0)}")
+            self.emit(f"{signed} = OpConvertFToS %int {self.tof(safe)}")
+            self.emit(f"{converted} = OpBitcast %uint {signed}")
+            self.emit(f"{result} = OpSelect %uint {in_range} {converted} {saturated}")
+            self.dst(a[0], result)
         elif op in ("v_cvt_u32_f32", "v_cvt_i32_f32"):
             # Compare binary32 words before converting: the raw SPIR-V conversion
             # must only see a representable operand, even when its result is discarded.
@@ -4295,6 +4701,23 @@ class Gen:
                 m = self.tmp()
                 self.emit(f"{m} = OpSelect %uint {self.tmp_bool_nz(bit64)} {self.cu(0xFFFFFFFF)} {self.cu(0)}")
                 self.mask_dst(sd, m)
+        elif op in ("v_mad_u32_u16", "v_mad_i32_i16"):
+            # D = S0.half * S1.half + S2 (RDNA ISA pseudocode), wrapping at 32 bits: the 16-bit halves zero-extended
+            # (u16) or sign-extended (i16); op_sel bits 0 / 1 read the high half of S0 / S1. S2 and D are whole
+            # dwords, so an op_sel bit on them, and clamp, are not modelled: rejected rather than guessed.
+            sel, dhi = self.opsel_bits(mods, 3)
+            if sel[2] or dhi or "clamp" in mods:
+                raise Unsupported(op + " op_sel/clamp")
+            ext = "OpBitFieldSExtract" if op == "v_mad_i32_i16" else "OpBitFieldUExtract"
+            hs = []
+            for i, src in enumerate(a[1:3]):
+                h = self.tmp()
+                self.emit(f"{h} = {ext} %uint {self.src_u(src)} {self.cu(16 * sel[i])} {self.cu(16)}")
+                hs.append(h)
+            m, r = self.tmp(), self.tmp()
+            self.emit(f"{m} = OpIMul %uint {hs[0]} {hs[1]}")
+            self.emit(f"{r} = OpIAdd %uint {m} {self.src_u(a[3])}")
+            self.dst(a[0], r)
         elif op == "v_mad_u32_u24":
             x, y, z = (self.src_u(t) for t in a[1:4])
             xm, ym, p, r = self.tmp(), self.tmp(), self.tmp(), self.tmp()
@@ -4487,6 +4910,78 @@ class Gen:
         self._scan = (body, len(body), open_)
         return not open_
 
+    # SQ_IMG_SAMP_WORD0 address modes (Mesa src/amd/registers/gfx10-rsrc.json: CLAMP_X = bits [2:0], CLAMP_Y = [5:3];
+    # values: SQ_TEX_* in Mesa's gfx6.json, as RADV's radv_tex_wrap maps VkSamplerAddressMode onto them): 0 wrap, 1 mirror, 2 clamp last texel, 3 mirror once last texel,
+    # 4 clamp half border, 5 mirror once half border, 6 clamp border, 7 mirror once border.
+    def gather_addr_modes(self, s_op):
+        """(x, y) address modes of an S# for the gather emulation, each either a Python int (the S# word 0 is a
+        literal an s_mov_b32 wrote earlier in this basic block) or the id of a uint computed from the S# at run time.
+
+        A literal S# whose mode needs a border colour (4..7), or that sets FORCE_UNNORMALIZED, is Unsupported: the
+        four fetches can't reproduce it. A run-time S# can't be judged at translation time, so modes 4..7 are
+        treated as clamp-to-edge there, and FORCE_UNNORMALIZED (bit 15) is not applied (the two remaining
+        approximations)."""
+        if s_op["k"] != "sgpr" or s_op.get("n", 1) < 4:
+            raise Unsupported("descriptor operand")
+        lit = self.sgpr_imm.get(s_op["r"])
+        if lit is not None:
+            if lit & 0x8000:
+                raise Unsupported("image_gather4_l with FORCE_UNNORMALIZED")
+            m = (lit & 7, lit >> 3 & 7)
+            if max(m) > 3:
+                raise Unsupported(f"image_gather4_l address mode {max(m)} (border)")
+            return m
+        w0 = self.load_reg("sgpr", s_op["r"])
+        out = []
+        for k in range(2):
+            m = self.tmp()
+            self.emit(f"{m} = OpBitFieldUExtract %uint {w0} {self.cu(3 * k)} {self.cu(3)}")
+            out.append(m)
+        return tuple(out)
+
+    def gather_addr(self, c, n, mode):
+        """Texel coordinate c (int id) after the address mode (int, or a uint id) for an axis of n texels (int id):
+        wrap: c mod n; mirror: c mod 2n, reflected in the upper half; mirror once: the negative side reflected
+        (-1 - c), then clamped; otherwise (clamp, and border modes at run time) clamped to [0, n-1]. As in the
+        Vulkan address-mode definitions (and RADV's radv_tex_wrap mapping of them onto SQ_TEX_*). A literal mode
+        emits only the code it needs; a run-time one emits all four and selects."""
+        zero, one = self.as_int(self.cu(0)), self.as_int(self.cu(1))
+        static = isinstance(mode, int)
+        want = {mode if mode <= 3 else 2} if static else {0, 1, 2, 3}
+        nm1 = self.tmp()
+        self.emit(f"{nm1} = OpISub %int {n} {one}")
+        res = {}
+        if 2 in want:
+            res[2] = self.tmp()
+            self.emit(f"{res[2]} = OpExtInst %int %glsl SClamp {c} {zero} {nm1}")
+        if 0 in want:
+            res[0] = self.tmp()
+            self.emit(f"{res[0]} = OpSMod %int {c} {n}")
+        if 1 in want:
+            n2, p, hi, rf, lt, res[1] = (self.tmp() for _ in range(6))
+            self.emit(f"{n2} = OpIAdd %int {n} {n}")
+            self.emit(f"{p} = OpSMod %int {c} {n2}")
+            self.emit(f"{hi} = OpISub %int {n2} {one}")
+            self.emit(f"{rf} = OpISub %int {hi} {p}")
+            self.emit(f"{lt} = OpSLessThan %bool {p} {n}")
+            self.emit(f"{res[1]} = OpSelect %int {lt} {p} {rf}")
+        if 3 in want:
+            neg, refl, ge, mo, res[3] = (self.tmp() for _ in range(5))
+            self.emit(f"{neg} = OpISub %int {zero} {c}")
+            self.emit(f"{refl} = OpISub %int {neg} {one}")
+            self.emit(f"{ge} = OpSGreaterThanEqual %bool {c} {zero}")
+            self.emit(f"{mo} = OpSelect %int {ge} {c} {refl}")
+            self.emit(f"{res[3]} = OpExtInst %int %glsl SClamp {mo} {zero} {nm1}")
+        if static:
+            return res[mode if mode <= 3 else 2]
+        r = res[2]
+        for val in (3, 1, 0):
+            eq, nr = self.tmp(), self.tmp()
+            self.emit(f"{eq} = OpIEqual %bool {mode} {self.cu(val)}")
+            self.emit(f"{nr} = OpSelect %int {eq} {res[val]} {r}")
+            r = nr
+        return r
+
     def desc_lookup_sgpr(self, a, n):
         """desc_lookup for an SGPR descriptor range (n=8: T#, n=4: S#), cached for the rest of the basic block.
 
@@ -4568,14 +5063,26 @@ class Gen:
         self.emit(f"{img} = OpLoad %{itype} {ip}")
         coords = [self.load_reg("vgpr", r) for r in addr]
         if a16:
-            # Non-G16 image_sample_d keeps its gradients in full VGPRs. Only the coordinates
-            # that follow them are packed as f16 pairs (low half first).
-            gradient_words = 2 * min(ncoord, 2) if op == "image_sample_d" else 0
-            unpacked = coords[:gradient_words]
-            for c in coords[gradient_words:]:
+            # GFX10 A16 packs only the coordinates, and the LOD or clamp after them, as f16 pairs (low half first).
+            # The extra arguments before them keep a whole VGPR each, and so do non-G16 gradients (LLVM AMDGPU
+            # getAddrSizeMIMGOp: the extra arguments' words, the gradients, then the packed halves; llvm-mc wants
+            # v[0:2] for a 2D image_sample_c_b ... a16). A bias is an f16 in the low half of its VGPR, a z-compare
+            # an f32. Until 2026-11-21 those were unpacked as pairs too, and the coordinates after them were read a
+            # half early. A texel offset comes first; samples with one stop under a16 further down.
+            extras = op[len("image_sample"):] if op.startswith("image_sample") else ""
+            w_off = 1 if extras.endswith("_o") else 0
+            extras = extras[:-2] if w_off else extras
+            w_bias = 1 if extras in ("_b", "_c_b") else 0
+            w_grad = 2 * min(ncoord, 2) if extras in ("_d", "_d_cl") else 0
+            whole = w_off + w_bias + (1 if extras.startswith("_c") else 0) + w_grad
+            unpacked = []
+            for i, c in enumerate(coords):
+                if i < whole and not w_off <= i < w_off + w_bias:
+                    unpacked.append(c)            # offset, z-compare or gradient: the whole word
+                    continue
                 v2 = self.tmp()
                 self.emit(f"{v2} = OpExtInst %v2float %glsl UnpackHalf2x16 {c}")
-                for k in (0, 1):
+                for k in ((0,) if i < whole else (0, 1)):   # a bias is the low half only
                     f = self.tmp()
                     self.emit(f"{f} = OpCompositeExtract %float {v2} {k}")
                     unpacked.append(self.tou(f))
@@ -4630,13 +5137,14 @@ class Gen:
             if op == "image_gather4_l":
                 # Gather at an explicit LOD: Vulkan gathers have no Lod operand without an AMD extension, so fetch
                 # the 2x2 footprint at mip round(lod) (clamped to the mip range) in gather order
-                # (u0,v1) (u1,v1) (u1,v0) (u0,v0). Coordinates are clamped to the edge: the sampler's wrap/mirror
-                # addressing is not reproduced at the image border.
+                # (u0,v1) (u1,v1) (u1,v0) (u0,v0). Each texel coordinate goes through the S#'s own address mode
+                # (CLAMP_X/CLAMP_Y, see gather_addr_modes / gather_addr).
                 if bin(dmask).count("1") != 1 or ncoord != 2 or len(f) < 3 or d16:
                     raise Unsupported("image_gather4_l form")
+                modes = self.gather_addr_modes(a[3])
                 self.uses_query = True
                 ch = dmask.bit_length() - 1
-                lv, lvm, rl, mi, mc, mz, sz, uvf, szf, st, half, flo, i0, one2, i1, smax = (self.tmp() for _ in range(16))
+                lv, lvm, rl, mi, mc, mz, sz, uvf, szf, st, half, flo, i0, one2, i1 = (self.tmp() for _ in range(15))
                 self.emit(f"{lv} = OpImageQueryLevels %int {img}")
                 self.emit(f"{lvm} = OpISub %int {lv} {self.as_int(self.cu(1))}")
                 self.emit(f"{rl} = OpExtInst %float %glsl RoundEven {f[2]}")
@@ -4659,21 +5167,21 @@ class Gen:
                 c1 = self.as_int(self.cu(1))
                 self.emit(f"{one2} = OpCompositeConstruct %v2int {c1} {c1}")
                 self.emit(f"{i1} = OpIAdd %v2int {i0} {one2}")
-                self.emit(f"{smax} = OpISub %v2int {sz} {one2}")
                 x0, y0, x1, y1 = (self.tmp() for _ in range(4))
                 self.emit(f"{x0} = OpCompositeExtract %int {i0} 0")
                 self.emit(f"{y0} = OpCompositeExtract %int {i0} 1")
                 self.emit(f"{x1} = OpCompositeExtract %int {i1} 0")
                 self.emit(f"{y1} = OpCompositeExtract %int {i1} 1")
-                zero2 = self.tmp()
-                c0 = self.as_int(self.cu(0))
-                self.emit(f"{zero2} = OpCompositeConstruct %v2int {c0} {c0}")
+                szx, szy = self.tmp(), self.tmp()
+                self.emit(f"{szx} = OpCompositeExtract %int {sz} 0")
+                self.emit(f"{szy} = OpCompositeExtract %int {sz} 1")
+                ax = [self.gather_addr(c, szx, modes[0]) for c in (x0, x1)]
+                ay = [self.gather_addr(c, szy, modes[1]) for c in (y0, y1)]
                 comps = []
-                for xx, yy in ((x0, y1), (x1, y1), (x1, y0), (x0, y0)):
-                    cc, cl, tx, comp = self.tmp(), self.tmp(), self.tmp(), self.tmp()
+                for xx, yy in ((ax[0], ay[1]), (ax[1], ay[1]), (ax[1], ay[0]), (ax[0], ay[0])):
+                    cc, tx, comp = self.tmp(), self.tmp(), self.tmp()
                     self.emit(f"{cc} = OpCompositeConstruct %v2int {xx} {yy}")
-                    self.emit(f"{cl} = OpExtInst %v2int %glsl SClamp {cc} {zero2} {smax}")
-                    self.emit(f"{tx} = OpImageFetch %v4float {img} {cl} Lod {mc}")
+                    self.emit(f"{tx} = OpImageFetch %v4float {img} {cc} Lod {mc}")
                     self.emit(f"{comp} = OpCompositeExtract %float {tx} {ch}")
                     comps.append(comp)
                 for i, comp in enumerate(comps):
@@ -4730,9 +5238,9 @@ class Gen:
                     self.emit(f"{off} = OpCompositeConstruct {'%v3int' if n_off == 3 else '%v2int'} {' '.join(parts)}")
                 self.uses_img_offset = True
             minlod = None
-            if kind == "_d_cl":
-                # Same as _d plus a trailing min-LOD clamp coordinate.
-                minlod, f, kind = f[-1], f[:-1], "_d"
+            clamp = kind == "_d_cl"        # _d plus a min-LOD clamp, read after the gradients
+            if clamp:
+                kind = "_d"
                 self.uses_minlod = True
             ref = None
             if kind.startswith("_c"):
@@ -4755,6 +5263,12 @@ class Gen:
                     self.emit(f"{gx} = OpCompositeConstruct %v2float {f[0]} {f[1]}")
                     self.emit(f"{gy} = OpCompositeConstruct %v2float {f[2]} {f[3]}")
                     grads, f = (gx, gy), f[4:]
+            if clamp:
+                # The clamp is the component right after the coordinates. Under a16 an f16 pad may follow it, so
+                # it isn't the last one there (taking the last one read that pad until 2026-11-21).
+                if len(f) <= ncoord:
+                    raise Unsupported(op + " coords")
+                minlod, f = f[ncoord], f[:ncoord]
             if len(f) < ncoord:
                 raise Unsupported(op + " coords")
             if dim == "dim:SQ_RSRC_IMG_CUBE":
@@ -4797,9 +5311,7 @@ class Gen:
                 if d16:
                     # d16: the compare result is an f16 in the low half, as in the other d16 paths below. Until
                     # 2026-11-21 it was written as f32 bits, whose low half is 0 for every result (1.0 = 0x3f800000).
-                    v2, r = self.tmp(), self.tmp()
-                    self.emit(f"{v2} = OpCompositeConstruct %v2float {d} %f0")
-                    self.emit(f"{r} = OpExtInst %uint %glsl PackHalf2x16 {v2}")
+                    r = self.f16_bits(d)
                 else:
                     r = self.tou(d)
                 self.dst({"k": "vgpr", "r": vdata["r"], "n": 1}, r)
@@ -5636,6 +6148,21 @@ class Gen:
                 self.emit(f"{sel} = OpSelect %float {act} {fval} {old}")
                 self.emit(f"OpStore {ptr} {sel}")
             return
+        if tgt == "mrtz" and self.stage == "ps":
+            # Depth export: x is the fragment depth when it's on in an uncompressed export (RGBA = Z, stencil,
+            # sample mask, alpha; Mesa ac_shader_util.c ac_get_spi_shader_z_format). A compressed mrtz is the 16-bit
+            # stencil and sample mask format, which never holds Z (ac_nir_lower_ps_late.c emit_ps_mrtz_export), and
+            # with x off no depth is exported. Until 2026-11-22 both wrote one anyway: 0.0, or an f16 half of the
+            # stencil word under compr. Stencil, sample mask and alpha aren't modelled.
+            x = a[1] if len(a) > 1 else None
+            if "compr" in ins["mods"] or x is None or (x["k"] == "special" and x["t"] == "off"):
+                return
+            self.writes_depth = True
+            old, sel = self.tmp(), self.tmp()
+            self.emit(f"{old} = OpLoad %float %out_depth")
+            self.emit(f"{sel} = OpSelect %float {self.active_b()} {self.src_f(x)} {old}")
+            self.emit(f"OpStore %out_depth {sel}")
+            return
         comps = []
         if "compr" in ins["mods"]:
             # Compressed export: two registers, each holding two f16 values (x,y) and (z,w). LLVM lists each register
@@ -5666,14 +6193,6 @@ class Gen:
         v = self.tmp()
         self.emit(f"{v} = OpCompositeConstruct %v4float {' '.join(comps)}")
         name = {"pos0": "%out_pos"}.get(tgt)
-        if tgt == "mrtz" and self.stage == "ps":
-            # Depth export: component x is the fragment depth (stencil/mask exports aren't modelled).
-            self.writes_depth = True
-            old, sel = self.tmp(), self.tmp()
-            self.emit(f"{old} = OpLoad %float %out_depth")
-            self.emit(f"{sel} = OpSelect %float {self.active_b()} {comps[0]} {old}")
-            self.emit(f"OpStore %out_depth {sel}")
-            return
         if name is None:
             if tgt.startswith("param") and self.stage == "vs":
                 name = f"%out_param{int(tgt[5:])}"
@@ -7034,6 +7553,7 @@ def translate(path):
         g.x_tok, g.x_mcache = {}, {}     # a register's value is only known from where this block wrote it
         g.x_gen += 1
         g.desc_cache.clear()            # a cached lookup is only good inside the block that made it
+        g.sgpr_imm.clear()
         term = None
         for ins in blk:
             op = base_op(ins["op"])
@@ -7426,9 +7946,10 @@ def main():
         merged = {}
         for part in sorted(_gl.glob(os.path.join(a.out, "index.part*.json"))):
             merged.update(_js.load(open(part, encoding="utf-8")))
-        write_index(os.path.join(a.out, "index.json"), merged)
+        # The stubs go first: index.json is what tells make_game.py the translation finished.
         import spirv_stubs
         spirv_stubs.generate_for_index(a.out, merged)
+        write_index(os.path.join(a.out, "index.json"), merged)
         print(f"merged {len(merged)} entries")
         return 0
     files = [a.src] if a.src.endswith(".s") else sorted(os.path.join(a.src, f) for f in os.listdir(a.src) if f.endswith(".s"))

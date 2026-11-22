@@ -75,7 +75,8 @@ COMPUTE = [("cs_lds", "4", "mirror64"), ("cs_exec64", "1", "exec64"), ("cs_bvh",
            ("cs_workgroup_yz", "2x3x4", "workgroup_yz")]
 CS_STORE = [0x400080ff, 0xe00003ff, 0x3c004000, 0xeeeeeeee, 0x40003c00, 0xbc003800]
 CS_SMEM = [0x5eed0024, 0x5eed0028, 0x5eed002c, 0x5eed0030, 0x5eed0010, 0x5eed0014, 0x5eed0018, 0x5eed001c]
-WAVE32_DUMPS = ("cs_store", "cs_smem_soffset_imm", "cs_wqm_w32", "cs_w32_lane_wrap", "cs_movrelsd_2", "cs_w32_permute")
+WAVE32_DUMPS = ("cs_store", "cs_smem_soffset_imm", "cs_wqm_w32", "cs_w32_lane_wrap", "cs_movrelsd_2", "cs_w32_permute",
+                "cs_barrier_divergent", "cs_w32_lds_u8_d16")
 # Wave32 lane-mask dumps: their EXEC/VCC masks and lane selects cover 32 lanes, so a device whose widest subgroup is
 # narrower (Mesa llvmpipe: 8) can't produce their words. They are skipped there, as ps_bitmask_perm is.
 WAVE32_LANE_DUMPS = ("cs_wqm_w32", "cs_w32_lane_wrap", "cs_w32_permute")
@@ -86,16 +87,23 @@ CS_DUMPS = [("cs_store", CS_STORE), ("cs_smem_soffset_imm", CS_SMEM),
             ("cs_movrelsd_2", [11, 33, 33, 55, 1717, 77, 1515, 1717]),
             # SHADER-90: ds_permute_b32, the forward (scatter) permute; unwritten lane 0, EXEC gates the destination
             ("cs_w32_permute", [218, 29, 8, 211, 0, 15, 99, 15]),
+            # SHADER-85: 8-bit LDS reads into one half of a VGPR, the other half kept
+            ("cs_w32_lds_u8_d16", [0xBEEF00FF, 0x00FF1234, 0xBEEFFF80, 0xFF801234, 0xBEEF007F, 0x007F1234, 0xBEEF0080, 0xFFFF1234]),
             ("cs_wave64_ballot", [32, 16, 24, 40, 8, 48]),
             ("cs_wm_half_ops", [32, 16, 16, 0, 16]), ("cs_wm_half_cmp", [1, 0, 1, 1]),
             ("cs_wm_bfm64", [16, 8, 8, 40]), ("cs_wm_scc_rfl", [55, 48]),
             # mask-only wave64: s_bcnt1_i32_b64 on ordinary SGPRs, no WAVE64_RE EXEC markers (#210 / SHADER-28)
             ("cs_w64_mask_detect", [48]),
             ("cs_wqm_w64", [20, 4, 12, 8, 1, 0, 15728895, 20]), ("cs_wqm_w32", [12, 1, 4, 0, 8, 15728880, 4, 32]),
-            ("cs_wqm_w64_half", [11, 14, 0, 1, 6, 8, 12, 2])]
+            ("cs_wqm_w64_half", [11, 14, 0, 1, 6, 8, 12, 2]),
+            # SHADER-91: two s_barrier sites in wave-uniform branches meet like one barrier; wave 0 reads wave 3
+            ("cs_barrier_divergent", [127, 126, 125, 124, 123, 122, 121, 120])]
 # num_records bounds check (cs_bounds.asm): one thread, so no 64-wide subgroup requirement.
 BOUNDS = [("cs_bounds", [0x12345678, 0x12345678, 0x00000000, 0xEEEEEEEE])]
 CMPX_CLASS_WORDS = [0xEEEEEEEE] * 3 + [0x22] + [0x11] * 4
+# cs_fmt_1010102.asm: descriptor loads, immediate-format load, raw input words and the two packed stores.
+FMT_1010102_WORDS = [0, 0x3F800000, 0, 0x3F800000, 0x3F800000, 0, 0x3F800000, 0,
+                     0, 0x3F800000, 0, 0x3F800000, 0xC00FFC00, 0x003FF003, 0xE00003FF, 0xFFE00003]
 # Negative global_load/global_store offsets (cs_global_neg_offset.asm): 40 groups make a 0x2800-byte heap that holds
 # both the right addresses and the 4096-lower ones; only group 0 thread 0 runs, so no wave64 requirement.
 GLOBAL_OFFSET = [("cs_global_neg_offset", "40", [0x5EED1FFC, 0x8BAD1800, 0x5EED1FF0, 0x5EED1FF4,
@@ -155,10 +163,14 @@ PIXEL_BITS = {"ps_legacy_mul": (0, 0, 0, 0x40c00000),
               "ps_f16_vop1b": (0xaaaa3400, 0xaaaa4000, 0xaaaab400, 0xaaaa3800),
               "ps_f16_const": (0xaaaa3d00, 0x38005555, 0xaaaa3800, 0x3f000000),
               "ps_f16_const2": (0x42003d00, 0x3d004200, 0xaaaabc00, 3),
-              "ps_f16_pack": (0x34003c00, 0x38003400, 0x34000000, 0x44004200)}
+              "ps_f16_pack": (0x34003c00, 0x38003400, 0x34000000, 0x44004200),
+              "ps_sff_imm": (2, 1, 20, 16)}
 # Pixel shaders that read memory: vk_harness puts this V# in s[0:3] and seeds the heap it points at, as
 # tests/semantic/test_value_semantics.py does for the interpreter.
 PIXEL_ENV = {"ps_vcc_x2": {"VKH_SGPRS": "0x1000,0,16,0", "VKH_HEAP": "0x1000=0x11223344,0x1004=0x55667788"}}
+# ps_gather_wrap.asm (SHADER-36): image_gather4_l_o under each S# address mode, run by vk_texture_test (the 8x8 gradient
+# texture); the expected channels are derived in the .asm header.
+GATHER_WRAP = (5090733.0, 14942181.0, 258623.0, 9702309.0)
 CLIP_TESTS = ("vs_clip", "vs_clip_param4", "vs_clip_undeclared")
 # One definition: a later assignment used to drop ps_texoff (and any entry added by an earlier assignment) from
 # the standalone run. Keep every pixel fixture in this tuple.
@@ -201,6 +213,28 @@ def run(*cmd, env=None):
 def failure(code, output, lines):
     details = "\n".join(output.strip().splitlines()[-lines:])
     return f"exit {code}: {details or 'no test output'}"
+
+
+def fmt_1010102_test(tools, spirv, env=None):
+    """Check both packed stores and the untouched tail. The console dump stops at word 7."""
+    want = FMT_1010102_WORDS + [0xEEEEEEEE] * 48
+    with tempfile.TemporaryDirectory(prefix="leonida-fmt-") as tmp:
+        dump = Path(tmp) / "out.bin"
+        # VKC_OUT_WORDS sets a minimum. Pin this dispatch to a single group's 64 words.
+        child = dict(os.environ if env is None else env, VKC_DUMP=str(dump), VKC_OUT_WORDS="64")
+        code, out = run(os.path.join(tools, "vk_compute_test" + EXE), os.path.join(spirv, "cs_fmt_1010102.spv"),
+                        "1", "dump", env=child)
+        if code:
+            return failure(code, out, 3)
+        if not dump.is_file():
+            return "no VKC_DUMP file written"
+        data = dump.read_bytes()
+    if len(data) != 4 * len(want):
+        return f"expected {4 * len(want)} dump bytes, got {len(data)}"
+    for i, (expected, got) in enumerate(zip(want, struct.unpack("<64I", data))):
+        if got != expected:
+            return f"word {i}: expected {expected:#010x}, got {got:#010x}"
+    return ""
 
 
 class Skip(str):
@@ -373,14 +407,24 @@ def bindless_test(tools, spirv):
     return "" if code == 0 and m and m.group(2) == "0" else failure(code, out, 3)
 
 
-def texture_gradient_a16_test(tools: str, spirv: str) -> str:
-    """Check every pixel of the mixed f32-gradient/a16-coordinate sample."""
+# Samples with a16 coordinates after whole-VGPR arguments (gradients, a bias, a clamp). On the 8x8 gradient every
+# pixel must be the texel its own (u, v) reads. ps_texture_grad_cl_a16 draws on the two-mip texture instead, where its
+# clamp picks mip 0 left of x = 32 and mip 1 from there on.
+GRADIENT_TESTS = ("ps_texture_grad_a16", "ps_texture_bias_a16", "ps_texture_grad_cl_a16")
+
+
+def texture_gradient_a16_test(tools: str, spirv: str, name: str = "ps_texture_grad_a16") -> str:
+    """Check every pixel of one of the GRADIENT_TESTS samples."""
     vs = os.path.join(spirv, "vs_ids.spv")
-    fs = os.path.join(spirv, "ps_texture_grad_a16.spv")
+    fs = os.path.join(spirv, name + ".spv")
+    two_mip = name == "ps_texture_grad_cl_a16"
     with tempfile.TemporaryDirectory(prefix="leonida-texture-") as tmp:
         raw = Path(tmp) / "pixels.raw"
         code, out = run(os.path.join(tools, "vk_texture_test" + EXE), vs, fs, raw,
-                        "0", "92", "c00000", "14500000", "0")
+                        "0", "92", "c00000", "14500000", "0", *(["--two-mip"] if two_mip else []))
+        if code == UNSUPPORTED:   # vk_texture_test: e.g. no shaderResourceMinLod for the d_cl clamp
+            m = re.search(r"unsupported: .*", out)
+            return Skip(f"SKIP ({m.group(0) if m else 'unsupported device'})")
         if code or not raw.is_file():
             return failure(code, out, 3)
         data = raw.read_bytes()
@@ -390,7 +434,10 @@ def texture_gradient_a16_test(tools: str, spirv: str) -> str:
     first = ""
     for index, pixel in enumerate(struct.iter_unpack("<4f", data)):
         x, y = index % 64, index // 64
-        want = (32 * (x // 8) / 255, 32 * (y // 8) / 255, 128 / 255, 1.0)
+        if two_mip:   # mip 1 (cyan) where the clamp is 1, else mip 0's red and blue quadrants
+            want = (0.0, 1.0, 1.0, 1.0) if x >= 32 else (1.0, 0.0, 0.0, 1.0) if y < 32 else (0.0, 0.0, 1.0, 1.0)
+        else:
+            want = (32 * (x // 8) / 255, 32 * (y // 8) / 255, 128 / 255, 1.0)
         if any(not math.isclose(actual, expected, rel_tol=0, abs_tol=1e-6)
                for actual, expected in zip(pixel, want)):
             if not wrong:
@@ -418,6 +465,22 @@ def pixels(tools, spirv, name, fmt):
     if len(data) != 64 * 64 * 16:  # default harness viewport, four 32-bit components per pixel
         return None, out
     return list(struct.iter_unpack(fmt, data)), out
+
+
+def gather_wrap_test(tools, spirv):
+    """ps_gather_wrap through vk_texture_test: every one of the 64x64 pixels must hold GATHER_WRAP."""
+    shader = os.path.join(spirv, "ps_gather_wrap.spv")
+    if not os.path.isfile(shader):
+        return "missing ps_gather_wrap.spv"
+    with tempfile.TemporaryDirectory(prefix="leonida-gather-") as tmp:
+        raw = Path(tmp) / "gather.raw"
+        code, out = run(os.path.join(tools, "vk_texture_test" + EXE), os.path.join(spirv, "vs_ids.spv"), shader, raw,
+                        "0", "92", "c00000", "14500000", "0")
+        data = raw.read_bytes() if code == 0 and raw.is_file() else b""
+    if len(data) != 64 * 64 * 16:
+        return failure(code, out, 3)
+    wrong = sum(p != GATHER_WRAP for p in struct.iter_unpack("<4f", data))
+    return "" if not wrong else f"{wrong} of 4096 pixels differ from {GATHER_WRAP}"
 
 
 def texoff_words(px, py):
@@ -607,6 +670,7 @@ def main():
         results.append((name, compute_test(tools, spirv, name, "1", "dump", expected_words=want)))
     results.append(("cs_cmpx_class_f32", compute_test(tools, spirv, "cs_cmpx_class_f32", "1", "dump",
                                                       expected_words=CMPX_CLASS_WORDS)))
+    results.append(("cs_fmt_1010102", fmt_1010102_test(tools, spirv)))
     for name, groups, want in GLOBAL_OFFSET:
         results.append((name, compute_test(tools, spirv, name, groups, "dump", expected_words=want)))
     results.append(("cs_user_sgprs", compute_test(tools, spirv, "cs_user_sgprs", "1", "dump",
@@ -633,9 +697,11 @@ def main():
         results.append((name, clip_test(tools, spirv, name)))
     for name in PIXEL_TESTS:
         results.append((name, pixel_test(tools, spirv, name)))
+    results.append(("ps_gather_wrap", gather_wrap_test(tools, spirv)))
     results.append(("ps_tex", bindless_test(tools, spirv)))
     results.append((TEXTURE_MIP_TEST, texture_mip_test(tools, spirv)))
-    results.append(("ps_texture_grad_a16", texture_gradient_a16_test(tools, spirv)))
+    for name in GRADIENT_TESTS:
+        results.append((name, texture_gradient_a16_test(tools, spirv, name)))
     for name, problem in results:
         if problem is None:
             problem = "SKIP (full 64-wide compute subgroups unavailable)"

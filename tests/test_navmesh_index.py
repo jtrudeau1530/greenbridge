@@ -226,5 +226,44 @@ class MissingInputTest(unittest.TestCase):
             self.assertFalse(os.path.exists(out))
 
 
+class LimitWindowTest(unittest.TestCase):
+    """--limit must bound the bytes read, not just where signatures are searched."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.rpf = os.path.join(self.tmp.name, "window.rpf")
+        self.streams = make_rpf(self.rpf)
+        self.mod = load_tool_module()
+
+    def summary(self, limit):
+        _rows, summary = self.mod.scan_archive(self.rpf, limit=limit)
+        self.assertLessEqual(summary["compressed_bytes"], summary["span"])
+        self.assertLessEqual(summary["readable_fraction"], 1.0)
+        self.assertEqual(summary["compressed_bytes"] + summary["zero_padding"] + summary["unread_bytes"],
+                         summary["span"])
+        return summary
+
+    def test_stream_crossing_the_limit_is_not_counted(self):
+        # The zlib header is inside the window but its body is not: counting it would make the
+        # compressed bytes exceed the span and readable_fraction greater than 1.
+        summary = self.summary(10)
+        self.assertEqual(summary["span"], 10)
+        self.assertEqual(summary["streams"], 0)
+        self.assertEqual(summary["compressed_bytes"], 0)
+
+    def test_stream_ending_at_the_limit_is_counted(self):
+        summary = self.summary(len(self.streams[0]))
+        self.assertEqual(summary["span"], len(self.streams[0]))
+        self.assertEqual(summary["streams"], 1)
+        self.assertEqual(summary["compressed_bytes"], len(self.streams[0]))
+        self.assertEqual(summary["readable_fraction"], 1.0)
+
+    def test_window_too_short_for_a_signature_has_no_streams(self):
+        summary = self.summary(1)
+        self.assertEqual(summary["streams"], 0)
+        self.assertEqual(summary["span"], 1)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -8,6 +8,7 @@
 //     image, and a packed RGB9E5 view with distinct channels and varying shared exponents. The sampler wraps
 //     in U and the shader samples one tile to the right, so a missed S# would show as well (the fallback
 //     sampler clamps).
+//   - Default and mip-1 volume SRVs: sample a 4x4x4 grid through each view of one uploaded 8x8x4 texture.
 //   - UINT border colours (#538, Vonsek's case): an R8G8B8A8_UINT texture sampled one tile to the right through
 //     CreateSampler2 samplers that clamp to a UINT (0,0,0,0) and (1,1,1,1) border, and a float white border on
 //     the UNORM texture. Every texel is the border: 0, 1 and 255 in each channel. Both white borders are built in
@@ -204,6 +205,7 @@ int main() {
         info.device = d.device;
         info.queue = d.queue;
         info.queue_family = d.family;
+        info.texture_compression_bc = d.bc;
         info.bindless = d.bindless;
         info.bindless_partially_bound = d.partially_bound;
         ID3D12Device* inner = nullptr;
@@ -212,6 +214,15 @@ int main() {
         EXPECT(SUCCEEDED(rt::d3d12_xs::create_device_proxy(inner, __uuidof(ID3D12Device),
                                                            reinterpret_cast<void**>(&device.p))));
         rt::d3d12::set_device_outer(inner, device.p);  // the proxy now owns `inner`
+
+        D3D12_FEATURE_DATA_D3D12_OPTIONS8 options8{};
+        EXPECT(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS8, &options8, sizeof(options8)) == S_OK);
+        EXPECT(options8.UnalignedBlockTexturesSupported == (d.bc ? TRUE : FALSE));
+        for (UINT query_size : {0u, UINT(sizeof(options8) - 1), UINT(sizeof(options8) + 1)}) {
+            D3D12_FEATURE_DATA_D3D12_OPTIONS8 output[] = {{83}, {42}};
+            EXPECT(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS8, output, query_size) == E_INVALIDARG);
+            EXPECT(output[0].UnalignedBlockTexturesSupported == 83 && output[1].UnalignedBlockTexturesSupported == 42);
+        }
 
         // --- Copies. Two host-side heaps; slot i of the source holds 32 bytes of (0x10 * (i + 1) + byte index).
         {
@@ -331,11 +342,65 @@ int main() {
                                 y * uint_placed.Footprint.RowPitch + x * 4,
                             texel(x, y).data(), 4);
 
+        constexpr DXGI_FORMAT byte_formats[] = {DXGI_FORMAT_A8_UNORM, DXGI_FORMAT_R8_UNORM};
+        D3D12_FEATURE_DATA_FORMAT_SUPPORT support{DXGI_FORMAT_A8_UNORM};
+        EXPECT(SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &support, sizeof(support))));
+        EXPECT((support.Support1 & D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE) != 0);
+        EXPECT((support.Support1 & D3D12_FORMAT_SUPPORT1_MIP) != 0);
+        EXPECT(!(support.Support1 & (D3D12_FORMAT_SUPPORT1_RENDER_TARGET | D3D12_FORMAT_SUPPORT1_BLENDABLE |
+                                     D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW)) && !support.Support2);
+        for (UINT count : {1u, 4u}) {
+            D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS levels{DXGI_FORMAT_A8_UNORM, count};
+            EXPECT(SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &levels,
+                                                         sizeof(levels))));
+            EXPECT(levels.NumQualityLevels == (count == 1 ? 1u : 0u));
+        }
+        for (auto flag : {D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL,
+                          D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS}) {
+            auto desc = texture_desc;
+            desc.Format = DXGI_FORMAT_A8_UNORM;
+            desc.Flags = flag;
+            EXPECT(FAILED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &desc,
+                                                          D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                          __uuidof(ID3D12Resource), nullptr)));
+            EXPECT(device->GetResourceAllocationInfo(0, 1, &desc).SizeInBytes == UINT64_MAX);
+        }
+        Ref<ID3D12Resource> byte_textures[2];
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT byte_placed[2]{}, a8_mip_placed{};
+        for (UINT f = 0; f < 2; ++f) {
+            auto desc = texture_desc;
+            desc.Format = byte_formats[f];
+            if (desc.Format == DXGI_FORMAT_A8_UNORM) {
+                desc.MipLevels = 2;
+                device->GetCopyableFootprints(&desc, 1, 1, 24576, &a8_mip_placed, nullptr, nullptr, nullptr);
+            }
+            EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &desc,
+                                                              D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                              IID_PPV_ARGS(&byte_textures[f].p))));
+            device->GetCopyableFootprints(&desc, 0, 1, 16384, &byte_placed[f], nullptr, nullptr, nullptr);
+            EXPECT(byte_placed[f].Footprint.Format == desc.Format);
+        }
+        EXPECT(byte_placed[0].Offset == byte_placed[1].Offset &&
+               byte_placed[0].Footprint.RowPitch == byte_placed[1].Footprint.RowPitch);
+        for (UINT y = 0; y < size; ++y) {
+            auto* row = static_cast<std::uint8_t*>(mapped) + byte_placed[0].Offset + y * byte_placed[0].Footprint.RowPitch;
+            for (UINT x = 0; x < size; ++x) row[x] = std::uint8_t(1 + 3 * (y * size + x));
+        }
+
+        constexpr UINT mip_size = size / 2;
+        EXPECT(a8_mip_placed.Offset == 24576 && a8_mip_placed.Footprint.Width == mip_size &&
+               a8_mip_placed.Footprint.Height == mip_size &&
+               a8_mip_placed.Footprint.RowPitch == D3D12_TEXTURE_DATA_PITCH_ALIGNMENT);
+        for (UINT y = 0; y < mip_size; ++y) {
+            auto* row = static_cast<std::uint8_t*>(mapped) + a8_mip_placed.Offset + y * a8_mip_placed.Footprint.RowPitch;
+            for (UINT x = 0; x < mip_size; ++x) row[x] = std::uint8_t(208 + y * mip_size + x);
+        }
+
         // Shader-visible heaps, start handles in the Xbox shape.
         const UINT step = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
         const UINT sampler_step = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER);
         Ref<ID3D12DescriptorHeap> view_heap, sampler_heap;
-        D3D12_DESCRIPTOR_HEAP_DESC heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 8,
+        D3D12_DESCRIPTOR_HEAP_DESC heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 10,
                                              D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
         EXPECT(SUCCEEDED(device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&view_heap.p))));
         heap_desc = {D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, 4, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
@@ -488,16 +553,57 @@ int main() {
         read_view.Texture2D.MostDetailedMip = 2;
         device->CreateShaderResourceView(writable.p, &read_view, view_slot(null_slot));
         EXPECT(null_at(null_slot));
-        // A volume has no 2D view: neither the default view nor an explicit one may become a 2D-array T#.
+        // A volume has a depth, one Vulkan array layer and a view-relative mip range.
         D3D12_RESOURCE_DESC volume_desc = texture_desc;
         volume_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE3D;
         volume_desc.DepthOrArraySize = 4;
+        volume_desc.MipLevels = 2;
         Ref<ID3D12Resource> volume;
         EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &volume_desc,
-                                                         D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                         D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
                                                          IID_PPV_ARGS(&volume.p))));
-        std::memset(view_bytes(null_slot), 0x77, step);
-        device->CreateShaderResourceView(volume.p, nullptr, view_slot(null_slot));
+        constexpr UINT volume_all = 8, volume_mip = 9;
+        device->CreateShaderResourceView(volume.p, nullptr, view_slot(volume_all));
+        g::Image vol{};
+        EXPECT(image_at(volume_all, vol) && vol.type == g::ImageType::image_3d);
+        EXPECT(vol.width == size && vol.height == size && vol.depth == 4 && vol.layer_count == 1);
+        EXPECT(vol.first_mip == 0 && vol.mip_count == 2);
+        D3D12_SHADER_RESOURCE_VIEW_DESC volume_view{};
+        volume_view.Format = volume_desc.Format;
+        volume_view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE3D;
+        volume_view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        volume_view.Texture3D = {1, 1, 0};
+        device->CreateShaderResourceView(volume.p, &volume_view, view_slot(volume_mip));
+        EXPECT(image_at(volume_mip, vol) && vol.type == g::ImageType::image_3d);
+        EXPECT(vol.first_mip == 1 && vol.mip_count == 1 && vol.depth == 4 && vol.resource_mips == 2);
+        // D3D12 requires DENY_SHADER_RESOURCE to accompany ALLOW_DEPTH_STENCIL. If the layer accepts
+        // this transfer-only volume at creation, requesting an SRV must still clear the destination.
+        D3D12_RESOURCE_DESC denied_desc = volume_desc;
+        denied_desc.Flags = D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE;
+        Ref<ID3D12Resource> denied_volume;
+        const HRESULT denied_hr = device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &denied_desc,
+                D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&denied_volume.p));
+        EXPECT(denied_hr == S_OK || denied_hr == E_INVALIDARG);
+        if (denied_hr == S_OK) {
+            device->CopyDescriptorsSimple(1, view_slot(null_slot), view_slot(volume_mip),
+                                          D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+            EXPECT(!null_at(null_slot));
+            device->CreateShaderResourceView(denied_volume.p, &volume_view, view_slot(null_slot));
+            EXPECT(null_at(null_slot));
+            denied_volume.reset();
+        }
+        volume_view.Texture3D.MostDetailedMip = 2;
+        device->CreateShaderResourceView(volume.p, &volume_view, view_slot(null_slot));
+        EXPECT(null_at(null_slot));
+        volume_view.Texture3D.MostDetailedMip = 0;
+        device->CreateShaderResourceView(texture.p, &volume_view, view_slot(null_slot));
+        EXPECT(null_at(null_slot));
+        volume_view.Texture3D.ResourceMinLODClamp = 0.5f;
+        device->CreateShaderResourceView(volume.p, &volume_view, view_slot(null_slot));
+        EXPECT(null_at(null_slot));
+        volume_view.Texture3D.ResourceMinLODClamp = 0;
+        volume_view.Format = DXGI_FORMAT_R8G8B8A8_UINT;
+        device->CreateShaderResourceView(volume.p, &volume_view, view_slot(null_slot));
         EXPECT(null_at(null_slot));
         D3D12_SHADER_RESOURCE_VIEW_DESC flat_view{};
         flat_view.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
@@ -507,17 +613,75 @@ int main() {
         std::memset(view_bytes(null_slot), 0x77, step);
         device->CreateShaderResourceView(volume.p, &flat_view, view_slot(null_slot));
         EXPECT(null_at(null_slot));
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT volume_placed[2]{};
+        // Place both volume mips after the UINT texture, leaving the lower offsets for the RGBA8 and RGB9E5 uploads.
+        const UINT64 volume_start = uint_placed.Offset + UINT64(uint_placed.Footprint.RowPitch) * uint_placed.Footprint.Height;
+        device->GetCopyableFootprints(&volume_desc, 0, 2, volume_start, volume_placed, nullptr, nullptr, nullptr);
+        const auto& last = volume_placed[1];
+        EXPECT(last.Offset + UINT64(last.Footprint.RowPitch) * last.Footprint.Height * last.Footprint.Depth <= upload_desc.Width);
+        for (UINT mip = 0; mip < 2; ++mip) {
+            const auto& fp = volume_placed[mip].Footprint;
+            for (UINT z = 0; z < fp.Depth; ++z)
+                for (UINT y = 0; y < fp.Height; ++y)
+                    for (UINT x = 0; x < fp.Width; ++x) {
+                        const std::uint8_t rgba[]{std::uint8_t(x * 19), std::uint8_t(y * 23),
+                                                  std::uint8_t(z * 53), std::uint8_t(mip ? 101 : 237)};
+                        const auto offset = volume_placed[mip].Offset + (z * fp.Height + y) * fp.RowPitch + 4 * x;
+                        std::memcpy(static_cast<std::uint8_t*>(mapped) + offset, rgba, 4);
+                    }
+        }
+
+        constexpr UINT a8_mip_slot = 4, byte_view_count = a8_mip_slot + 1;
+        D3D12_DESCRIPTOR_HEAP_DESC byte_heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, byte_view_count,
+                                                  D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+        Ref<ID3D12DescriptorHeap> byte_heap;
+        EXPECT(SUCCEEDED(device->CreateDescriptorHeap(&byte_heap_desc, IID_PPV_ARGS(&byte_heap.p))));
+        const auto byte_cpu = reinterpret_cast<XboxHeapHandleFn>(slot(byte_heap.p, 9))(byte_heap.p);
+        const UINT byte_step = device->GetDescriptorHandleIncrementSize(byte_heap_desc.Type);
+        EXPECT(byte_cpu && byte_step >= sizeof(g::ImageWords));
+        const auto byte_slot = [&](UINT i) { return D3D12_CPU_DESCRIPTOR_HANDLE{SIZE_T(byte_cpu + i * byte_step)}; };
+        const auto byte_bytes = [&](UINT i) { return reinterpret_cast<std::uint8_t*>(byte_slot(i).ptr); };
+        D3D12_SHADER_RESOURCE_VIEW_DESC byte_view{};
+        byte_view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        byte_view.Shader4ComponentMapping = D3D12_ENCODE_SHADER_4_COMPONENT_MAPPING(
+            D3D12_SHADER_COMPONENT_MAPPING_FROM_MEMORY_COMPONENT_3, D3D12_SHADER_COMPONENT_MAPPING_FROM_MEMORY_COMPONENT_0,
+            D3D12_SHADER_COMPONENT_MAPPING_FORCE_VALUE_1, D3D12_SHADER_COMPONENT_MAPPING_FORCE_VALUE_0);
+        byte_view.Texture2D.MipLevels = 1;
+        for (UINT f = 0; f < 2; ++f) {
+            byte_view.Format = byte_formats[1 - f];
+            std::memset(byte_bytes(2 * f), 0x77, byte_step);
+            device->CreateShaderResourceView(byte_textures[f].p, &byte_view, byte_slot(2 * f));
+            EXPECT(std::all_of(byte_bytes(2 * f), byte_bytes(2 * f) + byte_step,
+                               [](std::uint8_t byte) { return byte == 0; }));
+            device->CreateShaderResourceView(byte_textures[f].p, nullptr, byte_slot(2 * f));
+            byte_view.Format = byte_formats[f];
+            device->CreateShaderResourceView(byte_textures[f].p, &byte_view, byte_slot(2 * f + 1));
+        }
+        byte_view.Format = DXGI_FORMAT_A8_UNORM;
+        byte_view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        byte_view.Texture2D.MostDetailedMip = 1;
+        device->CreateShaderResourceView(byte_textures[0].p, &byte_view, byte_slot(a8_mip_slot));
 
         // D3D-75: plane 1 of a depth-stencil texture is its stencil. The T# is 8_UINT at the texture's own address,
         // with the eight bits read as G and R, B, A as 0, 0, 1 (D3D12's X24_TYPELESS_G8_UINT / X32_..._G8X24_UINT).
         // A stencil view of a colour texture, or one in another format, is a null descriptor.
-        // Plane 0, as R24_UNORM_X8_TYPELESS or R32_FLOAT_X8X24_TYPELESS, is a depth T# of the console's depth format
-        // at the same address, the depth read as R.
-        for (const auto& [resource_format, stencil_view_format, depth_view_format, depth_vk] :
+        // Plane 0, as R24_UNORM_X8_TYPELESS or R32_FLOAT_X8X24_TYPELESS, is a depth T# of the format backing the
+        // texture at the same address, the depth read as R. A GPU without a usable D24 backs R24G8 with
+        // D32_SFLOAT_S8_UINT (the layer's depth_usable rule), so the expected code follows the backing. Each depth
+        // view format belongs to its own family only: the other one's is a null descriptor, as D3D12 refuses it.
+        VkFormatProperties d24_properties{};
+        d.instance_fn<PFN_vkGetPhysicalDeviceFormatProperties>("vkGetPhysicalDeviceFormatProperties")(
+            d.physical, VK_FORMAT_D24_UNORM_S8_UINT, &d24_properties);
+        const VkFormat d24_backing =
+            (d24_properties.optimalTilingFeatures & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT)
+                ? VK_FORMAT_D24_UNORM_S8_UINT
+                : VK_FORMAT_D32_SFLOAT_S8_UINT;
+        for (const auto& [resource_format, stencil_view_format, depth_view_format, other_depth_view_format, depth_vk] :
              {std::tuple{DXGI_FORMAT_R24G8_TYPELESS, DXGI_FORMAT_X24_TYPELESS_G8_UINT,
-                         DXGI_FORMAT_R24_UNORM_X8_TYPELESS, VK_FORMAT_D24_UNORM_S8_UINT},
+                         DXGI_FORMAT_R24_UNORM_X8_TYPELESS, DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS, d24_backing},
               std::tuple{DXGI_FORMAT_R32G8X24_TYPELESS, DXGI_FORMAT_X32_TYPELESS_G8X24_UINT,
-                         DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS, VK_FORMAT_D32_SFLOAT_S8_UINT}}) {
+                         DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS, DXGI_FORMAT_R24_UNORM_X8_TYPELESS,
+                         VK_FORMAT_D32_SFLOAT_S8_UINT}}) {
             D3D12_RESOURCE_DESC depth_desc = texture_desc;
             depth_desc.Format = resource_format;
             depth_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
@@ -548,11 +712,40 @@ int main() {
             EXPECT(depth_image.format == g::format_from_vulkan(depth_vk) && depth_image.format != 0);
             EXPECT(depth_image.address == stencil_image.address && depth_image.swizzle[0] == g::select_x);
 
+            plane_view.Format = other_depth_view_format;  // the other depth family's view format
+            std::memset(view_bytes(null_slot), 0x77, step);
+            device->CreateShaderResourceView(depth_stencil.p, &plane_view, view_slot(null_slot));
+            EXPECT(null_at(null_slot));
+
             plane_view.Format = DXGI_FORMAT_R8_UINT;  // not a stencil view format
             plane_view.Texture2D.PlaneSlice = 1;
             std::memset(view_bytes(null_slot), 0x77, step);
             device->CreateShaderResourceView(depth_stencil.p, &plane_view, view_slot(null_slot));
             EXPECT(null_at(null_slot));
+
+            // The other family's stencil view format is refused too, as D3D12 refuses it: X24_TYPELESS_G8_UINT
+            // belongs to R24G8 only, X32_TYPELESS_G8X24_UINT to R32G8X24 only.
+            plane_view.Format = stencil_view_format == DXGI_FORMAT_X24_TYPELESS_G8_UINT
+                                    ? DXGI_FORMAT_X32_TYPELESS_G8X24_UINT
+                                    : DXGI_FORMAT_X24_TYPELESS_G8_UINT;
+            std::memset(view_bytes(null_slot), 0x77, step);
+            device->CreateShaderResourceView(depth_stencil.p, &plane_view, view_slot(null_slot));
+            EXPECT(null_at(null_slot));
+
+            // Both planes of a depth-stencil resource can be denied to shaders. Start each negative
+            // case with a live SRV so leaving a stale T# in the destination also fails.
+            depth_desc.Flags |= D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE;
+            Ref<ID3D12Resource> denied;
+            EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &depth_desc,
+                            D3D12_RESOURCE_STATE_DEPTH_WRITE, nullptr, IID_PPV_ARGS(&denied.p))));
+            for (UINT plane = 0; plane < 2; ++plane) {
+                plane_view.Format = plane == 0 ? depth_view_format : stencil_view_format;
+                plane_view.Texture2D.PlaneSlice = plane;
+                device->CreateShaderResourceView(depth_stencil.p, &plane_view, view_slot(null_slot));
+                EXPECT(!null_at(null_slot));
+                device->CreateShaderResourceView(denied.p, &plane_view, view_slot(null_slot));
+                EXPECT(null_at(null_slot));
+            }
         }
         D3D12_SHADER_RESOURCE_VIEW_DESC colour_plane{};
         colour_plane.Format = DXGI_FORMAT_X24_TYPELESS_G8_UINT;
@@ -563,7 +756,6 @@ int main() {
         std::memset(view_bytes(null_slot), 0x77, step);
         device->CreateShaderResourceView(texture.p, &colour_plane, view_slot(null_slot));
         EXPECT(null_at(null_slot));
-        volume.reset();
         cube.reset();
         writable.reset();
 
@@ -589,6 +781,28 @@ int main() {
                 std::memcpy(row + x * 4, &packed_values[(x + y) % 4], 4);
         }
 
+        // OPTIONS8 applies to the top-level mip. The four BC1 blocks cover 4x4, 3x4, 4x1 and 3x1 texels.
+        constexpr UINT bc_width = 7, bc_height = 5;
+        Ref<ID3D12Resource> bc;
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT bc_placed{};
+        if (options8.UnalignedBlockTexturesSupported) {
+            auto bc_desc = texture_desc;
+            bc_desc.Width = bc_width;
+            bc_desc.Height = bc_height;
+            bc_desc.Format = DXGI_FORMAT_BC1_UNORM;
+            EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &bc_desc,
+                                                             D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                             IID_PPV_ARGS(&bc.p))));
+            device->CreateShaderResourceView(bc.p, nullptr, view_slot(null_slot));
+            device->GetCopyableFootprints(&bc_desc, 0, 1, 8192, &bc_placed, nullptr, nullptr, nullptr);
+            EXPECT(bc_placed.Offset == 8192 && bc_placed.Footprint.RowPitch == D3D12_TEXTURE_DATA_PITCH_ALIGNMENT);
+            // Endpoint 0 is RGB565 red, green, blue or white. Every two-bit selector picks that endpoint.
+            constexpr std::uint64_t blocks[2][2] = {{0xf800, 0x07e0}, {0x001f, 0xffff}};
+            for (UINT row = 0; row < 2; ++row)
+                std::memcpy(static_cast<std::uint8_t*>(mapped) + bc_placed.Offset + row * bc_placed.Footprint.RowPitch,
+                            blocks[row], sizeof(blocks[row]));
+        }
+
         D3D12_COMMAND_QUEUE_DESC queue_desc{};
         Ref<ID3D12CommandQueue> queue;
         Ref<ID3D12CommandAllocator> allocator;
@@ -598,6 +812,23 @@ int main() {
         EXPECT(SUCCEEDED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator.p))));
         EXPECT(SUCCEEDED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.p, nullptr,
                                                    IID_PPV_ARGS(&list.p))));
+        for (UINT f = 0; f < 2; ++f) {
+            D3D12_TEXTURE_COPY_LOCATION to{}, from{};
+            to.pResource = byte_textures[f].p;
+            to.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            from.pResource = upload.p;
+            from.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+            from.PlacedFootprint = byte_placed[f];
+            list->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
+            if (byte_formats[f] == DXGI_FORMAT_A8_UNORM) {
+                to.SubresourceIndex = 1;
+                from.PlacedFootprint = a8_mip_placed;
+                list->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
+            }
+            const auto ready = transition(to.pResource, D3D12_RESOURCE_STATE_COPY_DEST,
+                                          D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            list->ResourceBarrier(1, &ready);
+        }
         EXPECT(SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence.p))));
 
         // Upload, then the texture into a shader-resource state. Executing the list also brings set 0 up to date.
@@ -614,10 +845,25 @@ int main() {
         to_texture.pResource = packed.p;
         from_upload.PlacedFootprint = packed_placed;
         list->CopyTextureRegion(&to_texture, 0, 0, 0, &from_upload, nullptr);
+        if (bc.p) {
+            to_texture.pResource = bc.p;
+            from_upload.PlacedFootprint = bc_placed;
+            list->CopyTextureRegion(&to_texture, 0, 0, 0, &from_upload, nullptr);
+            const auto barrier =
+                transition(bc.p, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            list->ResourceBarrier(1, &barrier);
+        }
+        to_texture.pResource = volume.p;
+        for (UINT mip = 0; mip < 2; ++mip) {
+            to_texture.SubresourceIndex = mip;
+            from_upload.PlacedFootprint = volume_placed[mip];
+            list->CopyTextureRegion(&to_texture, 0, 0, 0, &from_upload, nullptr);
+        }
         const D3D12_RESOURCE_BARRIER sampled[] = {
             transition(texture.p, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
             transition(packed.p, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
-            transition(uint_texture.p, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)};
+            transition(uint_texture.p, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+            transition(volume.p, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)};
         list->ResourceBarrier(UINT(std::size(sampled)), sampled);
         EXPECT(list->Close() == S_OK);
         ID3D12CommandList* lists[] = {list.p};
@@ -641,6 +887,64 @@ int main() {
         }
         EXPECT(sample_through_set(d, set0, set0_layout, keys, results.data()));
         sampled_through_set = true;
+        if (bc.p) {
+            SampleKeys bc_key = keys[0];
+            std::memcpy(bc_key.tsharp, view_bytes(null_slot), sizeof(bc_key.tsharp));
+            std::array<std::uint8_t, bytes> samples{};
+            EXPECT(sample_through_set(d, set0, set0_layout, {&bc_key, 1}, samples.data()));
+            constexpr std::uint8_t colors[2][2][4] = {{{255, 0, 0, 255}, {0, 255, 0, 255}},
+                                                      {{0, 0, 255, 255}, {255, 255, 255, 255}}};
+            for (UINT y = 0; y < size; ++y) {
+                for (UINT x = 0; x < size; ++x) {
+                    // cs_sample.comp samples at the centres of an 8x8 grid with nearest filtering.
+                    const UINT tex_x = (2 * x + 1) * bc_width / (2 * size);
+                    const UINT tex_y = (2 * y + 1) * bc_height / (2 * size);
+                    EXPECT(std::memcmp(samples.data() + 4 * (y * size + x), colors[tex_y / 4][tex_x / 4], 4) == 0);
+                }
+            }
+            std::printf("OPTIONS8: 64 point samples of a 7x5 BC1 top mip matched\n");
+        }
+
+        SampleKeys volumes[2]{};
+        std::array<std::uint8_t, 2 * bytes> volume_pixels{};
+        for (UINT mip = 0; mip < 2; ++mip) {
+            std::memcpy(volumes[mip].tsharp, view_bytes(mip ? volume_mip : volume_all), sizeof(volumes[mip].tsharp));
+            std::memcpy(volumes[mip].ssharp, sampler_bytes, sizeof(volumes[mip].ssharp));
+            volumes[mip].first = mip * texels;
+        }
+        EXPECT(sample_through_set(d, set0, set0_layout, volumes, volume_pixels.data()));
+        unsigned volume_errors = 0;
+        for (UINT mip = 0; mip < 2; ++mip)
+            for (UINT i = 0; i < texels; ++i) {
+                const UINT x = i % 4, y = (i / 4) % 4, z = i / 16;
+                const std::uint8_t expected[]{
+                    std::uint8_t((mip ? x : 2 * x + 1) * 19), std::uint8_t((mip ? y : 2 * y + 1) * 23),
+                    std::uint8_t((mip ? z / 2 : z) * 53), std::uint8_t(mip ? 101 : 237)};
+                if (std::memcmp(&volume_pixels[(mip * texels + i) * 4], expected, 4)) ++volume_errors;
+            }
+        std::printf("volume SRVs: %u of %u sampled RGBA texels differ\n", volume_errors, 2 * texels);
+        EXPECT(volume_errors == 0);
+
+        SampleKeys byte_keys[byte_view_count]{};
+        for (UINT k = 0; k < byte_view_count; ++k) {
+            std::memcpy(byte_keys[k].tsharp, byte_bytes(k), sizeof(byte_keys[k].tsharp));
+            std::memcpy(byte_keys[k].ssharp, sampler_bytes, sizeof(byte_keys[k].ssharp));
+            byte_keys[k].first = k * texels;
+        }
+        std::array<std::uint8_t, byte_view_count * bytes> byte_results{};
+        EXPECT(sample_through_set(d, set0, set0_layout, byte_keys, byte_results.data()));
+        for (UINT i = 0; i < texels; ++i) {
+            const auto value = std::uint8_t(1 + 3 * i);
+            const std::uint8_t expected[4][4] = {{0, 0, 0, value}, {value, 0, 255, 0},
+                                                 {value, 0, 0, 255}, {255, value, 255, 0}};
+            for (UINT k = 0; k < 4; ++k)
+                EXPECT(std::memcmp(byte_results.data() + k * bytes + 4 * i, expected[k], 4) == 0);
+            const UINT mip_texel = (i / size / 2) * mip_size + (i % size) / 2;
+            const std::uint8_t mip_expected[] = {0, 0, 0, std::uint8_t(208 + mip_texel)};
+            EXPECT(std::memcmp(byte_results.data() + a8_mip_slot * bytes + 4 * i, mip_expected, 4) == 0);
+        }
+        std::printf("A8 mip 1: %u samples matched across %u texels\n", texels, mip_size * mip_size);
+        std::printf("A8 and R8 default and remapped views: %u texels matched each\n", texels);
 
         // The border samplers, one tile to the right: every texel is the border.
         SampleKeys border_keys[3] = {};
@@ -657,6 +961,7 @@ int main() {
 
         // A destroyed texture takes its views out of the set: the next ExecuteCommandLists writes that, and nothing
         // may still name the destroyed image views (the validation layer reports a set that does).
+        bc.reset();
         packed.reset();
         texture.reset();
         EXPECT(SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.p, nullptr)));
@@ -672,52 +977,72 @@ int main() {
         EXPECT(sample_through_set(d, set0, set0_layout, {&gone, 1}, after_destruction.data()));
 #endif
 
-        // D3D-61, B4G4R4A4_UNORM: four bits a channel, B in bits 0-3, G 4-7, R 8-11, A 12-15. Each texel has a
-        // different value in every channel, so a swapped pair shows. Its footprint has two-byte texels; the view
-        // samples as RGBA8 with each nibble n read as n * 17.
-        {
-            D3D12_RESOURCE_DESC packed_desc = texture_desc;
-            packed_desc.Format = DXGI_FORMAT_B4G4R4A4_UNORM;
-            Ref<ID3D12Resource> packed;
-            EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &packed_desc,
+        struct PackedFormat {
+            DXGI_FORMAT dxgi;
+            VkFormat vk;
+            const char* name;
+        };
+        constexpr PackedFormat packed_formats[] = {
+            {DXGI_FORMAT_B4G4R4A4_UNORM, VK_FORMAT_A4R4G4B4_UNORM_PACK16, "B4G4R4A4"},
+            {DXGI_FORMAT_B5G5R5A1_UNORM, VK_FORMAT_A1R5G5B5_UNORM_PACK16, "B5G5R5A1"}
+        };
+        UINT64 packed_signal = 2;
+        for (const auto& format : packed_formats) {
+            D3D12_RESOURCE_DESC format_desc = texture_desc;
+            format_desc.Format = format.dxgi;
+            Ref<ID3D12Resource> format_texture;
+            EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &format_desc,
                                                              D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
-                                                             IID_PPV_ARGS(&packed.p))));
-            D3D12_PLACED_SUBRESOURCE_FOOTPRINT packed_placed{};
+                                                             IID_PPV_ARGS(&format_texture.p))));
+            D3D12_PLACED_SUBRESOURCE_FOOTPRINT format_footprint{};
             UINT64 row_size = 0;
-            device->GetCopyableFootprints(&packed_desc, 0, 1, 49152, &packed_placed, nullptr, &row_size, nullptr);
-            EXPECT(packed_placed.Footprint.Format == DXGI_FORMAT_B4G4R4A4_UNORM && row_size == size * 2 &&
-                   packed_placed.Footprint.RowPitch == 256);
-            const auto nibbles = [](UINT x, UINT y) {  // R, G, B, A
-                return std::array<UINT, 4>{x, y + 8, (x + y) & 15, 15 - x};
+            device->GetCopyableFootprints(&format_desc, 0, 1, 49152, &format_footprint, nullptr, &row_size, nullptr);
+            EXPECT(format_footprint.Footprint.Format == format.dxgi && row_size == size * 2 &&
+                   format_footprint.Footprint.RowPitch == 256);
+            constexpr std::uint16_t b5_words[] = {0xfc00, 0x7c00, 0x83e1, 0xc117};
+            constexpr std::array<std::uint8_t, 4> b5_rgba[] = {
+                {255, 0, 0, 255}, {255, 0, 0, 0}, {0, 255, 8, 255}, {132, 66, 189, 255}
             };
+            std::array<std::array<std::uint8_t, 4>, texels> expected{};
             for (UINT y = 0; y < size; ++y)
                 for (UINT x = 0; x < size; ++x) {
-                    const auto n = nibbles(x, y);
-                    const std::uint16_t word = std::uint16_t(n[2] | (n[1] << 4) | (n[0] << 8) | (n[3] << 12));
-                    std::memcpy(static_cast<std::uint8_t*>(mapped) + packed_placed.Offset +
-                                    y * packed_placed.Footprint.RowPitch + x * 2,
+                    auto& rgba = expected[y * size + x];
+                    std::uint16_t word;
+                    if (format.dxgi == DXGI_FORMAT_B5G5R5A1_UNORM) {
+                        const UINT i = (x + y) % std::size(b5_words);
+                        word = b5_words[i];
+                        rgba = b5_rgba[i];
+                    } else {
+                        const UINT r = x, g = y + 8, b = (x + y) & 15, a = 15 - x;
+                        word = std::uint16_t(b | (g << 4) | (r << 8) | (a << 12));
+                        rgba = {std::uint8_t(r * 17), std::uint8_t(g * 17), std::uint8_t(b * 17), std::uint8_t(a * 17)};
+                    }
+                    std::memcpy(static_cast<std::uint8_t*>(mapped) + format_footprint.Offset +
+                                    y * format_footprint.Footprint.RowPitch + x * 2,
                                 &word, 2);
                 }
             // Set 0 takes in a view at the next ExecuteCommandLists, so it is made before the upload runs.
-            device->CreateShaderResourceView(packed.p, nullptr, view_slot(null_slot));
+            device->CreateShaderResourceView(format_texture.p, nullptr, view_slot(null_slot));
             EXPECT(SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.p, nullptr)));
-            D3D12_TEXTURE_COPY_LOCATION to_packed{packed.p, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {}};
+            D3D12_TEXTURE_COPY_LOCATION to_packed{format_texture.p, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {}};
             to_packed.SubresourceIndex = 0;
             D3D12_TEXTURE_COPY_LOCATION from_packed{upload.p, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, {}};
-            from_packed.PlacedFootprint = packed_placed;
+            from_packed.PlacedFootprint = format_footprint;
             list->CopyTextureRegion(&to_packed, 0, 0, 0, &from_packed, nullptr);
             const D3D12_RESOURCE_BARRIER readable =
-                transition(packed.p, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                transition(format_texture.p, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
             list->ResourceBarrier(1, &readable);
             EXPECT(list->Close() == S_OK);
             queue->ExecuteCommandLists(1, lists);
             EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
-            EXPECT(SUCCEEDED(queue->Signal(fence.p, 3)) && SUCCEEDED(fence->SetEventOnCompletion(3, nullptr)));
+            ++packed_signal;
+            EXPECT(SUCCEEDED(queue->Signal(fence.p, packed_signal)) &&
+                   SUCCEEDED(fence->SetEventOnCompletion(packed_signal, nullptr)));
 
             g::Image packed_image{};
             EXPECT(image_at(null_slot, packed_image));
-            EXPECT(packed_image.format == g::format_from_vulkan(VK_FORMAT_A4R4G4B4_UNORM_PACK16) &&
-                   packed_image.format != 0);
+            EXPECT(packed_image.format == g::format_from_vulkan(format.vk) && packed_image.format != 0);
+            if (format.dxgi == DXGI_FORMAT_B5G5R5A1_UNORM) EXPECT(packed_image.swizzle == g::channels_bgra);
 #ifdef LEONIDA_TEST_CS_SAMPLE_SPV
             SampleKeys packed_keys{};
             std::memcpy(packed_keys.tsharp, view_bytes(null_slot), sizeof(packed_keys.tsharp));
@@ -725,22 +1050,23 @@ int main() {
             std::vector<std::uint8_t> packed_results(bytes);
             EXPECT(sample_through_set(d, set0, set0_layout, {&packed_keys, 1}, packed_results.data()));
             for (UINT i = 0; i < texels; ++i) {
-                const auto n = nibbles(i % size, i / size);
-                const std::uint8_t want[4] = {std::uint8_t(n[0] * 17), std::uint8_t(n[1] * 17),
-                                              std::uint8_t(n[2] * 17), std::uint8_t(n[3] * 17)};
-                if (std::memcmp(&packed_results[i * 4], want, 4) != 0) {
-                    std::fprintf(stderr, "B4G4R4A4 texel %u: got %02x %02x %02x %02x, want %02x %02x %02x %02x\n", i,
+                const auto& want = expected[i];
+                if (std::memcmp(&packed_results[i * 4], want.data(), 4) != 0) {
+                    std::fprintf(stderr, "%s texel %u: got %02x %02x %02x %02x, want %02x %02x %02x %02x\n", format.name, i,
                                  packed_results[i * 4], packed_results[i * 4 + 1], packed_results[i * 4 + 2],
                                  packed_results[i * 4 + 3], want[0], want[1], want[2], want[3]);
                     EXPECT(false);
-                    break;
                 }
             }
+            std::printf("%s sampled: %u texels matched\n", format.name, texels);
 #endif
         }
 
         upload.reset();
+        volume.reset();
         uint_texture.reset();
+        for (auto& resource : byte_textures) resource.reset();
+        byte_heap.reset();
         view_heap.reset();
         sampler_heap.reset();
         list.reset();

@@ -41,20 +41,22 @@ def mhiu_payload(width: int, height: int, rows, pixels: bytes,
     struct.pack_into("<HH", head, 0x06, width, height)
     struct.pack_into("<6f", head, 0x0C, -10.0, -20.0, -30.0, 40.0, 50.0, 60.0)
     struct.pack_into("<I", head, 0x24, len(data))
-    struct.pack_into("<I", head, 0x28, 0x12345678)
+    head[0x28] = default
+    head[0x29:0x2C] = bytes.fromhex("a55a3c")
     return bytes(head) + data
 
 
 def pamh_payload(width: int, height: int, maximum, minimum,
-                 flag: int = 0x1BBC8CED) -> bytes:
+                 padding: int = 0x1BBC8CED,
+                 version: tuple = (1, 2)) -> bytes:
     rows = b"".join(struct.pack("<HHi", 0, width, i * width)
                     for i in range(height))
     data = rows + bytes(maximum) + bytes(minimum)
     head = bytearray(44)
     head[:4] = b"PAMH"
-    head[0x04] = 1
-    head[0x05] = 2
-    struct.pack_into("<I", head, 0x08, flag)
+    head[0x04] = version[0]
+    head[0x05] = version[1]
+    struct.pack_into("<I", head, 0x08, padding)
     struct.pack_into("<HH", head, 0x0C, width, height)
     struct.pack_into("<6f", head, 0x10, -10.0, -20.0, -30.0, 40.0, 50.0, 60.0)
     struct.pack_into("<I", head, 0x28, len(data))
@@ -109,14 +111,32 @@ class GamedataMapsTest(unittest.TestCase):
         self.assertEqual(p["header"]["width"], 4)
         self.assertEqual(p["header"]["height"], 3)
         self.assertEqual(p["header"]["bounds"]["min"], [-10.0, -20.0, -30.0])
-        self.assertEqual(p["header"]["field28"], 0x12345678)
+        self.assertEqual(p["header"]["default_height"], 23)
+        self.assertEqual(p["header"]["pad_29"], "a55a3c")
         self.assertEqual(p["grid"]["filled_rows"], 2)
         self.assertEqual(p["grid"]["empty_rows"], 1)
         self.assertEqual(p["grid"]["filled_cells"], 6)
         self.assertEqual(p["grid"]["default"], 23)
+        self.assertEqual(p["grid"]["span_ends_at_default"], 0)
         self.assertEqual(list(p["_grid"]), [23, 23, 23, 23,
                                             23, 7, 8, 23,
                                             9, 10, 11, 12])
+
+    def test_mhiu_default_comes_from_the_header_byte(self):
+        payload = mhiu_payload(3, 2, [(0, 0, []), (1, 1, [40])], pixels=b"",
+                               default=99)
+        p = gamedata_maps.parse_mhiu(payload)
+        self.assertEqual(p["header"]["default_height"], 99)
+        self.assertEqual(p["grid"]["default"], 99)
+        self.assertEqual(list(p["_grid"]), [99, 99, 99, 99, 40, 99])
+        # z = -30 + 99/255 * 90
+        self.assertAlmostEqual(p["grid"]["z_at_default"], 4.94, places=2)
+
+    def test_mhiu_counts_span_ends_on_the_default(self):
+        payload = mhiu_payload(4, 2, [(0, 3, [23, 5, 6]), (1, 3, [7, 8, 23])],
+                               pixels=b"")
+        p = gamedata_maps.parse_mhiu(payload)
+        self.assertEqual(p["grid"]["span_ends_at_default"], 2)
 
     def test_mhiu_rejects_a_row_past_the_pixels(self):
         payload = mhiu_payload(4, 1, [(0, 4, [1, 2, 3, 4])], pixels=b"")
@@ -132,11 +152,49 @@ class GamedataMapsTest(unittest.TestCase):
         p = gamedata_maps.parse_pamh(payload)
         self.assertEqual(p["header"]["version_major"], 1)
         self.assertEqual(p["header"]["version_minor"], 2)
-        self.assertEqual(p["header"]["flag"], 0x1BBC8CED)
+        self.assertEqual(p["header"]["padding08"], 0x1BBC8CED)
         self.assertEqual(p["header"]["bounds"]["max"], [40.0, 50.0, 60.0])
         self.assertEqual(list(p["_max"]), [1, 2, 3, 4, 5, 6])
         self.assertEqual(list(p["_min"]), [0, 1, 2, 3, 4, 7])
         self.assertEqual(p["grid"]["min_above_max"], 1)
+
+    def test_pamh_padding_word_does_not_change_the_arrays(self):
+        args = (3, 2, [1, 2, 3, 4, 5, 6], [0, 1, 2, 3, 4, 7])
+        zero = gamedata_maps.parse_pamh(pamh_payload(*args, padding=0))
+        measured = gamedata_maps.parse_pamh(pamh_payload(*args, padding=0x1BBC8CED))
+        ascii_tail = gamedata_maps.parse_pamh(pamh_payload(*args, padding=0x74680001))
+        self.assertEqual((zero["header"]["padding08"], measured["header"]["padding08"],
+                          ascii_tail["header"]["padding08"]),
+                         (0, 0x1BBC8CED, 0x74680001))
+        self.assertEqual(zero["_max"], measured["_max"])
+        self.assertEqual(zero["_min"], ascii_tail["_min"])
+        self.assertEqual(measured["grid"], ascii_tail["grid"])
+
+    def test_pamh_census_groups_tiles_by_grid(self):
+        self.add(pamh_payload(4, 3, [1] * 12, [0] * 12, padding=0, version=(1, 1)))
+        self.add(pamh_payload(4, 3, [2] * 12, [0] * 12,
+                              padding=0x74680001, version=(1, 2)))
+        self.add(pamh_payload(2, 2, [3] * 4, [0] * 4, version=(1, 2)))
+        self.finish()
+
+        p, data = self.run_tool()
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        census = data["pamh_census"]
+        self.assertEqual([(g["width"], g["height"], g["tiles"]) for g in census],
+                         [(4, 3, 2), (2, 2, 1)])
+        first = census[0]
+        self.assertEqual((first["full_width_row_tiles"], first["padding08_zero"],
+                          first["padding08_distinct"]), (2, 1, 2))
+        self.assertEqual(first["version_minor"], {"1": 1, "2": 1})
+        self.assertEqual(first["bounds_min"], [-10.0, -20.0, -30.0])
+        self.assertIn("PAMH census 4x3: 2 tiles", p.stdout)
+
+    def test_pamh_row_table_full_width_count(self):
+        payload = pamh_payload(3, 2, [1] * 6, [0] * 6)
+        head = bytearray(payload)
+        struct.pack_into("<HH", head, 44, 0, 2)
+        p = gamedata_maps.parse_pamh(bytes(head))
+        self.assertEqual(p["grid"]["full_width_rows"], 1)
 
     def test_pamh_rejects_a_short_row_body(self):
         payload = pamh_payload(2, 2, [1, 2, 3, 4], [0, 1, 2, 3])

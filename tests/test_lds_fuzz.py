@@ -113,6 +113,47 @@ class Model(unittest.TestCase):
         regs, lds = p.model()
         self.assertEqual(regs[0][20], (old & 0xFFFF) | (struct.unpack_from("<H", lds, 0)[0] << 16))
 
+    def test_u8_d16_read_zero_extends_into_low_half(self):
+        # Tests for the four 8-bit d16 reads written by @0xTehuti in #605.
+        p = f.Program(1, 0, 64)
+        p.ops = [{"kind": "read", "name": "ds_read_u8_d16", "addr": (0, 0, 0), "dst": 20, "exec": None}]
+        before = f.Program(1, 0, 64)
+        before.ops = []
+        old = before.model()[0][0][20]
+        regs, lds = p.model()
+        self.assertEqual(regs[0][20], (old & 0xFFFF0000) | lds[0])
+
+    def test_u8_d16_hi_read_zero_extends_into_high_half(self):
+        p = f.Program(1, 0, 64)
+        p.ops = [{"kind": "read", "name": "ds_read_u8_d16_hi", "addr": (0, 0, 0), "dst": 20, "exec": None}]
+        before = f.Program(1, 0, 64)
+        before.ops = []
+        old = before.model()[0][0][20]
+        regs, lds = p.model()
+        self.assertEqual(regs[0][20], (old & 0xFFFF) | (lds[0] << 16))
+
+    def test_i8_d16_read_sign_extends_into_low_half(self):
+        p = f.Program(1, 0, 64)
+        p.ops = [{"kind": "read", "name": "ds_read_i8_d16", "addr": (0, 0, 0), "dst": 20, "exec": None}]
+        before = f.Program(1, 0, 64)
+        before.ops = []
+        old = before.model()[0][0][20]
+        regs, lds = p.model()
+        byte = lds[0]
+        sext = byte - 256 if byte & 0x80 else byte
+        self.assertEqual(regs[0][20], (old & 0xFFFF0000) | (sext & 0xFFFF))
+
+    def test_i8_d16_hi_read_sign_extends_into_high_half(self):
+        p = f.Program(1, 0, 64)
+        p.ops = [{"kind": "read", "name": "ds_read_i8_d16_hi", "addr": (0, 0, 0), "dst": 20, "exec": None}]
+        before = f.Program(1, 0, 64)
+        before.ops = []
+        old = before.model()[0][0][20]
+        regs, lds = p.model()
+        byte = lds[0]
+        sext = byte - 256 if byte & 0x80 else byte
+        self.assertEqual(regs[0][20], (old & 0xFFFF) | ((sext & 0xFFFF) << 16))
+
     def test_cmpst_stores_data2_when_data_matches(self):
         p = f.Program(1, 0, 64)
         p.ops = [{"kind": "cmpst", "addr": (4, 0, 0), "src": 20, "src2": 21, "dst": 22, "exec": None,

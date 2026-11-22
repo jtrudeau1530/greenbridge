@@ -9,7 +9,7 @@
 //   gta6rt --init <image> [--game-dir DIR]
 //       The same mapping, then each loaded DLL's TLS callbacks and DllMain(DLL_PROCESS_ATTACH) are run.
 //
-//   gta6rt --run <exe> [--game-dir DIR] [-- game arguments...]
+//   gta6rt --run <exe> [--game-dir DIR] [--trace-d3d12] [-- game arguments...]
 //       The same, then the EXE's own TLS callbacks and its entry point, on a game thread. The game's argv and
 //       command line are <exe name> plus the arguments after "--"; exit/ExitProcess from the game end the run
 //       (shims/process.cpp). gta6rt prints the binding report first and returns the game's exit code.
@@ -21,6 +21,7 @@
 #include <vector>
 
 #include "pe_loader.h"
+#include "../shims/d3d12_trace.h"
 #include "../shims/process_shim.h"
 #include "../shims/shims.h"
 
@@ -38,8 +39,8 @@ const char* binding_name(rt::Binding b) {
 int usage() {
     std::fprintf(stderr,
                  "usage: gta6rt --dry-run <image> [--game-dir DIR]\n"
-                 "       gta6rt --init <image> [--game-dir DIR]\n"
-                 "       gta6rt --run <exe> [--game-dir DIR] [-- game arguments...]\n");
+                 "       gta6rt --init <image> [--game-dir DIR] [--trace-d3d12]\n"
+                 "       gta6rt --run <exe> [--game-dir DIR] [--trace-d3d12] [-- game arguments...]\n");
     return 2;
 }
 
@@ -47,7 +48,7 @@ int usage() {
 
 int wmain(int argc, wchar_t** argv) {
     std::filesystem::path image, game_dir;
-    bool dry_run = false, init = false, run = false;
+    bool dry_run = false, init = false, run = false, trace_d3d12 = false;
     std::vector<std::string> game_args;
     for (int i = 1; i < argc; ++i) {
         std::wstring a = argv[i];
@@ -58,6 +59,7 @@ int wmain(int argc, wchar_t** argv) {
         if (a == L"--dry-run") dry_run = true;
         else if (a == L"--init") init = true;
         else if (a == L"--run") run = true;
+        else if (a == L"--trace-d3d12") trace_d3d12 = true;
         else if (a == L"--game-dir" && i + 1 < argc) game_dir = argv[++i];
         else if (image.empty()) image = a;
         else return usage();
@@ -65,6 +67,7 @@ int wmain(int argc, wchar_t** argv) {
     if (image.empty()) return usage();
     if (!dry_run && !init && !run) return usage();
     if (game_dir.empty()) game_dir = image.parent_path();
+    rt::d3d12_trace::set_enabled(trace_d3d12);
 
     try {
         rt::Loader loader(game_dir);

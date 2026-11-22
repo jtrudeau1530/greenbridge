@@ -3,8 +3,10 @@
 // The command-list IR (docs/d3d12_vulkan.md section 3.2): what a D3D12 command list records, kept until
 // ExecuteCommandLists replays it on Vulkan (vulkan_replay.h). This slice covers legacy and enhanced barriers and
 // render-target, depth-stencil and unordered-access clears (whole views or rectangles), copies, resolves,
-// predication and debug markers. It has no Windows or Vulkan dependency.
+// predication, discards, immediate buffer writes, atomic copies, queries and debug markers. It has no Windows or
+// Vulkan dependency.
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <optional>
@@ -149,6 +151,57 @@ inline constexpr std::uint32_t texture_barrier_discard = 0x1;
 
 // Portable color-view interpretation. Other views inherit their resource format as before.
 enum class ColorViewFormat : std::uint32_t { resource, rgba8_unorm, rgba8_srgb, rgba8_uint };
+
+// D3D12_QUERY_HEAP_TYPE and D3D12_QUERY_TYPE.
+namespace d3d12_query_heap {
+inline constexpr std::uint32_t occlusion = 0;
+inline constexpr std::uint32_t timestamp = 1;
+inline constexpr std::uint32_t pipeline_statistics = 2;
+inline constexpr std::uint32_t so_statistics = 3;
+inline constexpr std::uint32_t video_decode_statistics = 4;
+inline constexpr std::uint32_t copy_queue_timestamp = 5;
+inline constexpr std::uint32_t pipeline_statistics1 = 7;
+} // namespace d3d12_query_heap
+
+namespace d3d12_query {
+inline constexpr std::uint32_t occlusion = 0;
+inline constexpr std::uint32_t binary_occlusion = 1;
+inline constexpr std::uint32_t timestamp = 2;
+inline constexpr std::uint32_t pipeline_statistics = 3;
+inline constexpr std::uint32_t so_statistics_stream0 = 4;
+inline constexpr std::uint32_t so_statistics_stream3 = 7;
+inline constexpr std::uint32_t video_decode_statistics = 8;
+inline constexpr std::uint32_t pipeline_statistics1 = 10;
+} // namespace d3d12_query
+
+// Whether a heap of `heap_type` holds queries of `query_type` (the D3D12 pairing rules).
+constexpr bool query_fits_heap(std::uint32_t heap_type, std::uint32_t query_type) {
+    namespace h = d3d12_query_heap;
+    namespace q = d3d12_query;
+    switch (heap_type) {
+    case h::occlusion: return query_type == q::occlusion || query_type == q::binary_occlusion;
+    case h::timestamp:
+    case h::copy_queue_timestamp: return query_type == q::timestamp;
+    case h::pipeline_statistics: return query_type == q::pipeline_statistics;
+    case h::so_statistics: return query_type >= q::so_statistics_stream0 && query_type <= q::so_statistics_stream3;
+    case h::video_decode_statistics: return query_type == q::video_decode_statistics;
+    case h::pipeline_statistics1: return query_type == q::pipeline_statistics1;
+    default: return false;
+    }
+}
+
+// Bytes one resolved query takes: a UINT64 for occlusion and timestamps, D3D12_QUERY_DATA_PIPELINE_STATISTICS
+// (11 UINT64s) for pipeline statistics. 0 for the types this layer does not resolve.
+constexpr std::uint32_t query_result_size(std::uint32_t query_type) {
+    namespace q = d3d12_query;
+    switch (query_type) {
+    case q::occlusion:
+    case q::binary_occlusion:
+    case q::timestamp: return 8;
+    case q::pipeline_statistics: return 11 * 8;
+    default: return 0;
+    }
+}
 
 // A view captured by value while recording: the CPU descriptor slot may be rewritten after the call.
 struct TargetView {
@@ -310,6 +363,50 @@ struct ClearDepthStencil {
     std::vector<Rect> rects;
 };
 
+// DiscardResource. whole: the whole resource (a null region); first_subresource and count are then ignored.
+// Otherwise count subresources from first_subresource, an explicit range even when count is all_subresources.
+// partial: the region had rectangles, so only part of each subresource is discarded.
+struct DiscardResource {
+    ResourceId resource;
+    std::uint32_t first_subresource;
+    std::uint32_t count;
+    bool partial;
+    bool whole = false;
+};
+
+// D3D12_WRITEBUFFERIMMEDIATE_MODE.
+namespace write_immediate_mode {
+inline constexpr std::uint32_t normal = 0;      // DEFAULT: ordered like any copy write
+inline constexpr std::uint32_t marker_in = 1;   // after every earlier command has started
+inline constexpr std::uint32_t marker_out = 2;  // after every earlier command has finished
+} // namespace write_immediate_mode
+
+// One D3D12_WRITEBUFFERIMMEDIATE_PARAMETER: a 32-bit value written at a GPU virtual address.
+struct WriteImmediate {
+    std::uint64_t address;
+    std::uint32_t value;
+    std::uint32_t mode;
+};
+
+// D3D12_SUBRESOURCE_RANGE_UINT64 of a dependent resource: [begin, end) in bytes of one subresource.
+struct DependentRange {
+    ResourceId resource;
+    std::uint32_t subresource;
+    std::uint64_t begin;
+    std::uint64_t end;
+};
+
+// AtomicCopyBufferUINT (bytes 4) and AtomicCopyBufferUINT64 (bytes 8). The copy runs once every earlier write to
+// the dependent resources has finished.
+struct AtomicCopyBuffer {
+    ResourceId dst;
+    std::uint64_t dst_offset;
+    ResourceId src;
+    std::uint64_t src_offset;
+    std::uint32_t bytes;
+    std::vector<DependentRange> dependencies;
+};
+
 // What a UAV descriptor said when ClearUnorderedAccessView* was recorded (the CPU slot may be rewritten after).
 // A buffer view is a byte range of the buffer and an element format; a texture view is one mip and a layer range.
 struct UavView {
@@ -351,6 +448,34 @@ struct Predication {
     std::uint32_t op;  // d3d12_predication
 };
 
+// Query heaps are identified like resources, by the COM object's pointer value. A heap's type and size are checked
+// at replay, when the heap is known.
+using QueryHeapId = std::uintptr_t;
+
+// BeginQuery: occlusion and pipeline statistics only (D3D12 has no Begin for timestamps).
+struct BeginQuery {
+    QueryHeapId heap;
+    std::uint32_t type;
+    std::uint32_t index;
+};
+
+// EndQuery; for a timestamp, the time at which every earlier command has finished.
+struct EndQuery {
+    QueryHeapId heap;
+    std::uint32_t type;
+    std::uint32_t index;
+};
+
+// ResolveQueryData: `count` results from `first` on, written to the buffer `dst` at `offset`.
+struct ResolveQueries {
+    QueryHeapId heap;
+    std::uint32_t type;
+    std::uint32_t first;
+    std::uint32_t count;
+    ResourceId dst;
+    std::uint64_t offset;
+};
+
 // SetMarker, BeginEvent and EndEvent, replayed as VK_EXT_debug_utils labels when the device has them (and skipped
 // when it does not). The label is UTF-8; an end has none.
 struct DebugMarker {
@@ -361,7 +486,8 @@ struct DebugMarker {
 
 using Command = std::variant<TransitionBarrier, UavBarrier, AliasingBarrier, GlobalBarrier, BufferBarrier,
                              TextureBarrier, ClearRenderTarget, ClearDepthStencil, CopyBuffer, CopyTexture,
-                             CopyResource, ResolveSubresource, Predication, ClearUnorderedAccess,
+                             CopyResource, ResolveSubresource, Predication, ClearUnorderedAccess, DiscardResource,
+                             WriteImmediate, AtomicCopyBuffer, BeginQuery, EndQuery, ResolveQueries,
                              DebugMarker>;
 
 class CommandList {
@@ -452,6 +578,35 @@ public:
         return append(ClearDepthStencil{target, flags, depth, stencil, {rects.begin(), rects.end()}});
     }
 
+    // DiscardResource: a count of 0 discards nothing, as in D3D12. An explicit range must end before
+    // all_subresources, the largest index plus one; whether it fits the resource is checked at replay.
+    bool discard(const DiscardResource& discard) {
+        if (!discard.resource) return false;
+        if (discard.whole) return append(DiscardResource{discard.resource, 0, 0, discard.partial, true});
+        if (discard.count == 0) return !closed_;
+        if (std::uint64_t(discard.first_subresource) + discard.count > all_subresources) return false;
+        return append(discard);
+    }
+
+    // WriteBufferImmediate: D3D12 requires a 4-byte aligned, non-null address and one of the three modes.
+    bool write_immediate(const WriteImmediate& write) {
+        if (!write.address || write.address % 4 || write.mode > write_immediate_mode::marker_out) return false;
+        return append(write);
+    }
+
+    // AtomicCopyBufferUINT/UINT64, with the rules of the D3D12 debug layer's ATOMICCOPYBUFFER_* messages (IDs
+    // 1027-1040 in d3d12sdklayers.h): both offsets aligned to the copy's size and at least one dependency, each on a
+    // named resource. A copy of a value onto itself (vkCmdCopyBuffer forbids the overlap) is refused too.
+    bool atomic_copy(const AtomicCopyBuffer& copy) {
+        if ((copy.bytes != 4 && copy.bytes != 8) || !copy.dst || !copy.src) return false;
+        if (copy.dst == copy.src && copy.dst_offset == copy.src_offset) return false;
+        if (copy.dst_offset % copy.bytes || copy.src_offset % copy.bytes) return false;
+        if (copy.dependencies.empty()) return false;
+        for (const auto& d : copy.dependencies)
+            if (!d.resource) return false;
+        return append(copy);
+    }
+
     // A view of nothing (no resource, an empty buffer range or no layers) is invalid, as is a rectangle that is
     // inside out. Ranges against the resource are checked at replay.
     bool clear_unordered_access(const UavView& view, bool is_float, const std::array<std::uint32_t, 4>& values,
@@ -480,6 +635,37 @@ public:
         return append(predication);
     }
 
+    // Queries. D3D12 rules for the calls themselves: timestamps have only an EndQuery; any other query is begun and
+    // ended in the same list, with the same type, and is not begun again while it is running.
+    bool begin_query(const BeginQuery& query) {
+        if (closed_ || !query.heap || query.type == d3d12_query::timestamp) return false;
+        if (find_active(query.heap, query.index) != active_.end()) return false;
+        active_.push_back(query);
+        return append(query);
+    }
+
+    bool end_query(const EndQuery& query) {
+        if (closed_ || !query.heap) return false;
+        if (query.type != d3d12_query::timestamp) {
+            const auto it = find_active(query.heap, query.index);
+            if (it == active_.end() || it->type != query.type) return false;
+            active_.erase(it);
+        }
+        return append(query);
+    }
+
+    // The offset is a multiple of 8, as D3D12 requires. A resolve of no queries records nothing.
+    bool resolve_queries(const ResolveQueries& resolve) {
+        if (closed_ || !resolve.heap || !resolve.dst || resolve.offset % 8) return false;
+        if (resolve.count > ~std::uint32_t(0) - resolve.first) return false;
+        for (const BeginQuery& running : active_)
+            if (running.heap == resolve.heap && running.index - resolve.first < resolve.count) return false;
+        return resolve.count ? append(resolve) : true;
+    }
+
+    // A query begun and not ended. Such a list still closes (D3D12's Close reports the error), but is not replayed.
+    bool queries_open() const { return !active_.empty(); }
+
     // Debug markers. D3D12 does not ask a list to balance its events (one list may end what another began), so
     // they are recorded as given; the replay balances them per submission (vulkan_replay.h, emit).
     bool marker(DebugMarker::Kind kind, std::string label = {}) {
@@ -496,6 +682,7 @@ public:
     bool reset() {
         if (!closed_) return false;
         commands_.clear();
+        active_.clear();
         closed_ = false;
         return true;
     }
@@ -526,7 +713,13 @@ private:
         return true;
     }
 
+    std::vector<BeginQuery>::iterator find_active(QueryHeapId heap, std::uint32_t index) {
+        return std::find_if(active_.begin(), active_.end(),
+                            [&](const BeginQuery& q) { return q.heap == heap && q.index == index; });
+    }
+
     std::vector<Command> commands_;
+    std::vector<BeginQuery> active_;  // queries begun and not yet ended
     bool closed_ = false;
 };
 

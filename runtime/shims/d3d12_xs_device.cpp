@@ -8,6 +8,7 @@
 // are IUnknown (0-2), slot 14 (which wraps the heap), 62 and 76, plus the heap proxy's 9/10 conversion from the
 // PC hidden-pointer form to the Xbox RAX form.
 #include "d3d12_xs_device.h"
+#include "d3d12_trace.h"
 
 #include <windows.h>
 
@@ -324,8 +325,9 @@ HRESULT create_heap_proxy(ID3D12DescriptorHeap* real, DeviceProxy* device, REFII
         proxy_release(device);
         return hr;
     }
-    std::fprintf(stderr, "[rt] d3d12_xs: heap proxy %p wraps PC heap %p (device proxy %p)\n",
-                 static_cast<void*>(proxy), static_cast<void*>(real), static_cast<void*>(device));
+    if (!d3d12_trace::enabled())
+        std::fprintf(stderr, "[rt] d3d12_xs: heap proxy %p wraps PC heap %p (device proxy %p)\n",
+                     static_cast<void*>(proxy), static_cast<void*>(real), static_cast<void*>(device));
     heap_release(proxy);
     return S_OK;
 }
@@ -518,8 +520,9 @@ HRESULT create_device_proxy(ID3D12Device* real, REFIID riid, void** out) {
         delete proxy;
         return hr;
     }
-    std::fprintf(stderr, "[rt] d3d12_xs: device proxy %p wraps PC device %p (%u PC vtable slots)\n",
-                 static_cast<void*>(proxy), static_cast<void*>(real), slot_count);
+    if (!d3d12_trace::enabled())
+        std::fprintf(stderr, "[rt] d3d12_xs: device proxy %p wraps PC device %p (%u PC vtable slots)\n",
+                     static_cast<void*>(proxy), static_cast<void*>(real), slot_count);
     proxy_release(proxy);  // drop the creation reference; `out` holds the caller's reference
     return S_OK;
 }

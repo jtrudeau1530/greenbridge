@@ -52,7 +52,7 @@ work on booting can start as soon as one is available to a developer.
 | Audio banks (AWC: Opus, XMA2) | ✅ Exported whole. Opus repackaged **losslessly** as Ogg Opus; PCM (codec 0/2) as WAV; XMA2 decoded with ffmpeg. `--wav` adds 16-bit PCM WAV ([notes](docs/audio.md)) |
 | Music/radio config | ? Measured. **1,589** audio-config records with exact durations and AWC stream ids; station grouping and content-id lists; no per-track start offsets ([notes](docs/audio_config.md)) |
 | PE loader and import shims | ⚠️ Runs a stand-in executable end to end (`gta6rt --run`: CRT startup, statics, heap, files, threads, GDK imports through the shims, exit code back). Untested against the real executable |
-| Xbox D3D12 → Vulkan | ⚠️ In progress. A Vulkan-backed device behind the Xbox-ABI proxy creates queues, command lists, fences, descriptor heaps, committed and reserved resources, render-target and depth views, and texture views and samplers (which go into the bindless set). Barriers, clears, uploads, copies (BC included) and colour resolves run on Vulkan, checked on one GPU. No buffer views, root signatures, pipelines, draws or swapchain yet ([plan](docs/d3d12_vulkan.md)) |
+| Xbox D3D12 → Vulkan | ⚠️ In progress. A Vulkan-backed device behind the Xbox-ABI proxy creates queues, command lists, fences, descriptor heaps, committed and reserved resources, render-target and depth views, texture views and samplers (which go into the bindless set), and query heaps. Barriers, clears, uploads, copies (BC included), colour resolves and occlusion, timestamp and pipeline-statistics queries run on Vulkan, checked on one GPU. No buffer views, root signatures, pipelines, draws or swapchain yet ([plan](docs/d3d12_vulkan.md)) |
 | Booting, story mode, anything playable | ❌ No |
 
 ## How to build
@@ -108,8 +108,11 @@ python -I make_game.py --wave64-emulate off            # auto (default), on or o
 it. The default, `auto`, asks `vulkaninfo` (part of the Vulkan SDK) and turns it on unless every GPU reports 64-wide
 subgroups, or when it can't tell; it also turns it on when the GPU the runtime would use can't be made to run
 compute and mesh shaders 64-wide. The mode is saved next to the translated shaders, and changing it translates them
-again. With `auto`, shaders already translated with emulation are kept even when this run would not emulate (they are
-exact on every GPU); `--wave64-emulate off` translates them natively.
+again. With `auto`, a work folder that previously used emulation keeps it for later translations and retries, even if
+the current GPU supports native wave64. Use `--wave64-emulate off` to translate it natively.
+
+The build records which translator sources produced the shaders. A change to those files reruns translation using the
+saved disassembly. Older work folders need one translation after upgrading to record this information.
 
 Stages run in order: `check`, `shaders`, `assets`, `runtime`, `pipelines` (creates every translated shader on your
 GPU driver and saves a pipeline cache, so the first boot doesn't compile them). The shader translation is the longest step: it runs
@@ -130,9 +133,23 @@ cmake --build runtime/build/linux --parallel
 
 Pass the directory containing `index.json` and the translated SPIR-V files to `vk_pipeline_check`.
 
-`make_game.py` runs on Linux too, without the `runtime` stage, which builds on Windows only for now: without
-`--stages` it is left out, and asking for it fails before any work starts. The `pipelines` stage uses the
-`vk_pipeline_check` built above (`runtime/build/linux`, or `runtime/build`).
+`make_game.py` runs on Linux too. The `pipelines` stage uses the `vk_pipeline_check` built above
+(`runtime/build/linux`, or `runtime/build`). The `runtime` stage builds on Windows only, so on Linux it needs a
+Windows build of `runtime/`; without one it is left out of the default stages, and asking for it fails before any
+work starts.
+
+### Running the loader on Linux
+
+The loader is a Windows program and runs under Wine or Proton; CI runs its tests under Wine on every change to
+`runtime/` (the `wine` job of the Runtime workflow). Give the `runtime` stage a folder with `gta6rt.exe` and
+`gta6rt_tls_host.dll`, such as the `runtime-windows` artifact of that workflow's `windows` job, unzipped:
+
+```sh
+python3 -I make_game.py --runtime-build ~/Downloads/runtime-windows
+```
+
+It copies both files into `--out` and writes `gta6rt.sh` next to them, which starts `gta6rt.exe` with `wine`, or
+with the Wine named by `WINE` (for Proton, its `files/bin/wine`). The same option skips the build on Windows.
 
 ## How it works
 

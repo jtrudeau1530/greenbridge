@@ -21,7 +21,8 @@
 //   use the same attachment path because vkCmdClearColorImage has no view-format argument;
 // - enhanced barriers need pipeline_barrier2 (synchronization2, Vulkan 1.3);
 // - unordered-access clears need fill_buffer, update_buffer and copy_buffer for buffers; texture views cleared with
-//   rectangles need color_attachment usage on the image (ResourceBinding::color_attachment).
+//   rectangles need color_attachment usage on the image (ResourceBinding::color_attachment);
+// - query commands need the query functions, fill_buffer and query_pool; resolve destinations have TRANSFER_DST usage.
 // A list that needs a missing function fails with ReplayResult::unsupported before anything is written.
 
 #include "command_list.h"
@@ -59,7 +60,9 @@ struct ResourceBinding {
     // use GENERAL too, so the descriptor's layout is right in both.
     bool sampled_in_general = false;
     VkBuffer buffer = VK_NULL_HANDLE;  // a buffer resource, for copies
+    VkDeviceSize buffer_offset = 0;    // where it starts in `buffer` (the GPU address arena holds many)
     VkDeviceSize size = 0;             // its size in bytes
+    std::uint64_t va = 0;              // a buffer's console VA (GetGPUVirtualAddress), for vertex/index views
     std::uint32_t depth = 1;
     bool volume = false;               // one array layer, including at mips with a single slice
     std::uint32_t samples = 1;         // more than one: a multisampled 2D texture
@@ -571,6 +574,16 @@ private:
     std::unordered_map<ResourceId, Entry> entries_;
 };
 
+// A D3D12 query heap on Vulkan. `ended` is kept on the host: which queries hold a result, updated as lists are
+// emitted in submission order. A resolve of a query that was never ended writes zeros instead of waiting on it.
+struct QueryPool {
+    VkQueryPool pool = VK_NULL_HANDLE;
+    std::uint32_t heap_type = 0;  // d3d12_query_heap
+    std::uint32_t count = 0;
+    bool precise = false;         // occlusionQueryPrecise: D3D12_QUERY_TYPE_OCCLUSION counts exact samples
+    std::vector<bool> ended;
+};
+
 struct ReplayFunctions {
     PFN_vkCmdPipelineBarrier pipeline_barrier = nullptr;
     PFN_vkCmdClearColorImage clear_color_image = nullptr;
@@ -586,17 +599,26 @@ struct ReplayFunctions {
     PFN_vkCmdCopyImage copy_image = nullptr;
     PFN_vkCmdResolveImage resolve_image = nullptr;              // resolves
     PFN_vkCmdFillBuffer fill_buffer = nullptr;                  // unordered-access buffer clears, with copy_buffer
-    PFN_vkCmdUpdateBuffer update_buffer = nullptr;
+    PFN_vkCmdUpdateBuffer update_buffer = nullptr;              // WriteBufferImmediate, unordered-access clears
+    // The buffer and offset holding [va, va + size), from ResourceBinding::va; WriteBufferImmediate.
+    std::function<bool(std::uint64_t va, std::uint64_t size, VkBuffer&, VkDeviceSize&)> buffer_at;
     // VK_EXT_conditional_rendering: SetPredication. The predicate buffer must have been created with
     // VK_BUFFER_USAGE_CONDITIONAL_RENDERING_BIT_EXT.
     PFN_vkCmdBeginConditionalRenderingEXT begin_conditional_rendering = nullptr;
     PFN_vkCmdEndConditionalRenderingEXT end_conditional_rendering = nullptr;
+    PFN_vkCmdResetQueryPool reset_query_pool = nullptr;  // queries, with fill_buffer for unavailable results
+    PFN_vkCmdBeginQuery begin_query = nullptr;
+    PFN_vkCmdEndQuery end_query = nullptr;
+    PFN_vkCmdWriteTimestamp write_timestamp = nullptr;
+    PFN_vkCmdCopyQueryPoolResults copy_query_pool_results = nullptr;
     // VK_EXT_debug_utils, set only when the instance enabled it; debug markers are skipped without them.
     PFN_vkCmdInsertDebugUtilsLabelEXT insert_label = nullptr;
     PFN_vkCmdBeginDebugUtilsLabelEXT begin_label = nullptr;
     PFN_vkCmdEndDebugUtilsLabelEXT end_label = nullptr;
     // Returns a 2D-array view of the range (caller-owned, alive until execution completes); rectangle clears.
     std::function<VkImageView(const ResourceBinding&, const VkImageSubresourceRange&)> image_view;
+    // Returns the query heap with that ID, or nullptr; it stays valid while the lists that use it run.
+    std::function<QueryPool*(QueryHeapId)> query_pool;
     bool separate_depth_stencil_layouts = false;  // must match the LayoutTracker, if one is used
 };
 
@@ -608,6 +630,7 @@ enum class ReplayResult {
     invalid_clear,
     invalid_copy,
     invalid_predication,
+    invalid_query,
     unsupported
 };
 
@@ -626,57 +649,60 @@ struct Prepared {
     std::vector<VkBufferImageCopy> buffer_image_copies;  // one direction, given by which side is an image
     std::vector<VkImageCopy> image_copies;
     VkImageResolve resolve{};  // resolves
+    std::vector<VkImageSubresourceRange> discards;  // DiscardResource: the subresources to discard
+    VkBuffer write_buffer = VK_NULL_HANDLE;          // WriteBufferImmediate: where the address lands
+    VkDeviceSize write_offset = 0;
     uav_clear::Element element;                      // unordered-access clears: one element of the view's format
     VkClearColorValue clear_color{};                 // ... the value that writes it into the image
     std::vector<std::array<VkDeviceSize, 2>> fills;  // ... buffer byte ranges, offset and size
+    QueryPool* queries = nullptr;  // query commands: the heap
 };
 
-// ClearRenderTargetView takes FLOATs even for integer RTVs. For the UINT formats currently exposed by
-// the device, Windows D3D12 (WARP and AMD) clamps to the component range and truncates fractions. Vulkan
-// instead interprets the matching union member as an integer already; copying float bits changes the value.
+// ClearRenderTargetView takes FLOATs even for integer RTVs. Windows D3D12 (WARP and AMD) clamps to the
+// component range and truncates fractions. Vulkan instead interprets the matching union member as an integer
+// already; copying float bits changes the value without a validation error.
 inline VkClearColorValue render_target_clear_color(VkFormat format, const ClearColor& input) {
-    // Integer formats convert the float numerically: NaN maps to zero, negatives clamp to the low end, positive
-    // overflow to the high end, and fractions truncate toward zero. Unsigned uses uint32, signed uses int32.
-    std::uint32_t unsigned_maximum = 0;
-    std::int64_t signed_minimum = 0, signed_maximum = 0;
-    bool is_signed = false;
+    // Integer formats convert the float numerically: NaN maps to zero, values below the range clamp to the low
+    // end, positive overflow (and +infinity) to the high end, and fractions truncate toward zero. Unsigned uses
+    // uint32, signed int32. A2B10G10R10 clamps RGB to 10 bits and alpha (channel 3) to 2 bits.
+    constexpr double u32_max = 4294967295.0, s32_min = -2147483648.0, s32_max = 2147483647.0;
+    double low = 0, high = 0, alpha_high = 0;
+    bool is_integer = true, is_signed = false;
     switch (format) {
-    case VK_FORMAT_R8G8B8A8_UINT: unsigned_maximum = 255; break;
+    case VK_FORMAT_R8_UINT:
+    case VK_FORMAT_R8G8_UINT:
+    case VK_FORMAT_R8G8B8A8_UINT: high = 255; break;
+    case VK_FORMAT_R16_UINT:
+    case VK_FORMAT_R16G16_UINT:
+    case VK_FORMAT_R16G16B16A16_UINT: high = 65535; break;
     case VK_FORMAT_R32_UINT:
-    case VK_FORMAT_R32G32B32A32_UINT: unsigned_maximum = std::numeric_limits<std::uint32_t>::max(); break;
-    case VK_FORMAT_R8G8B8A8_SINT: signed_minimum = -128; signed_maximum = 127; is_signed = true; break;
+    case VK_FORMAT_R32G32_UINT:
+    case VK_FORMAT_R32G32B32A32_UINT: high = u32_max; break;
+    case VK_FORMAT_A2B10G10R10_UINT_PACK32: high = 1023; alpha_high = 3; break;
+    case VK_FORMAT_R8_SINT:
+    case VK_FORMAT_R8G8_SINT:
+    case VK_FORMAT_R8G8B8A8_SINT: low = -128; high = 127; is_signed = true; break;
+    case VK_FORMAT_R16_SINT:
+    case VK_FORMAT_R16G16_SINT:
+    case VK_FORMAT_R16G16B16A16_SINT: low = -32768; high = 32767; is_signed = true; break;
     case VK_FORMAT_R32_SINT:
-    case VK_FORMAT_R32G32B32A32_SINT:
-        signed_minimum = std::numeric_limits<std::int32_t>::min();
-        signed_maximum = std::numeric_limits<std::int32_t>::max();
-        is_signed = true;
-        break;
-    default: break;
+    case VK_FORMAT_R32G32_SINT:
+    case VK_FORMAT_R32G32B32A32_SINT: low = s32_min; high = s32_max; is_signed = true; break;
+    default: is_integer = false; break;
     }
+    if (format != VK_FORMAT_A2B10G10R10_UINT_PACK32) alpha_high = high;
     VkClearColorValue value{};
     for (std::size_t i = 0; i < input.size(); ++i) {
-        if (is_signed) {
-            const double v = double(input[i]);
-            std::int32_t out;
-            if (v != v) {
-                out = 0;  // NaN
-            } else if (v <= double(signed_minimum)) {
-                out = static_cast<std::int32_t>(signed_minimum);
-            } else if (v >= double(signed_maximum)) {
-                out = static_cast<std::int32_t>(signed_maximum);
-            } else {
-                out = static_cast<std::int32_t>(v);  // truncates toward zero
-            }
-            value.int32[i] = out;
-        } else if (!unsigned_maximum) {
+        if (!is_integer) {
             value.float32[i] = input[i];
-        } else if (!(input[i] > 0.0f)) {
-            value.uint32[i] = 0; // NaN, negative values and either zero; no out-of-range float-to-int cast.
-        } else if (double(input[i]) >= double(unsigned_maximum)) {
-            value.uint32[i] = unsigned_maximum; // Includes +infinity; UINT32_MAX itself is not representable as float.
-        } else {
-            value.uint32[i] = static_cast<std::uint32_t>(input[i]);
+            continue;
         }
+        const double maximum = i == 3 ? alpha_high : high;
+        const double v = double(input[i]);
+        // In range the cast truncates toward zero; out-of-range values never reach a float-to-int cast.
+        const double clamped = v != v ? 0.0 : v <= low ? low : v >= maximum ? maximum : v;
+        if (is_signed) value.int32[i] = static_cast<std::int32_t>(clamped);
+        else value.uint32[i] = static_cast<std::uint32_t>(clamped);
     }
     return value;
 }
@@ -1084,10 +1110,25 @@ inline VkImageLayout copy_layout(const ReplayFunctions& vk, VkCommandBuffer comm
     const VkImageLayout target = image_layout(resource, wanted);
     auto pieces = current(tracker, id, range, target);
     initialize(vk, command_buffer, resource, id, pieces, target, tracker);
-    if (pieces.size() == 1 && (pieces[0].layout == target || pieces[0].layout == VK_IMAGE_LAYOUT_GENERAL))
+    // D3D12 orders back-to-back copies and resolves on a resource that stays in COPY_DEST or COPY_SOURCE without a
+    // barrier from the application; Vulkan does not. A piece already in the transfer layout gets no layout
+    // transition, so an earlier transfer write to it is ordered here instead (write-after-write and read-after-write,
+    // which synchronization validation reports otherwise).
+    const auto after_transfer_writes = [&] {
+        memory_barrier(vk, command_buffer, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, access,
+                       VK_PIPELINE_STAGE_TRANSFER_BIT);
+    };
+    if (pieces.size() == 1 && (pieces[0].layout == target || pieces[0].layout == VK_IMAGE_LAYOUT_GENERAL)) {
+        after_transfer_writes();
         return pieces[0].layout;
+    }
+    bool ordered = false;
     for (const auto& piece : pieces) {
-        if (piece.layout == target) continue;
+        if (piece.layout == target) {
+            if (!ordered) after_transfer_writes();
+            ordered = true;
+            continue;
+        }
         image_barrier(vk, command_buffer, resource, piece.range, piece.layout, target,
                       VK_ACCESS_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, access,
                       VK_PIPELINE_STAGE_TRANSFER_BIT);
@@ -1132,6 +1173,21 @@ inline std::pair<ResourceId, ResourceId> copy_ids(const Command& command) {
     return {0, 0};
 }
 
+// The heap, type and query range of a query command; count 0 for any other command.
+struct QueryRange {
+    QueryHeapId heap = 0;
+    std::uint32_t type = 0;
+    std::uint32_t first = 0;
+    std::uint32_t count = 0;
+};
+
+inline QueryRange query_range(const Command& command) {
+    if (const auto* q = std::get_if<BeginQuery>(&command)) return {q->heap, q->type, q->index, 1};
+    if (const auto* q = std::get_if<EndQuery>(&command)) return {q->heap, q->type, q->index, 1};
+    if (const auto* q = std::get_if<ResolveQueries>(&command)) return {q->heap, q->type, q->first, q->count};
+    return {};
+}
+
 // A list checked against the current resources, ready to emit.
 class PreparedList {
 public:
@@ -1148,6 +1204,7 @@ public:
 template<typename Resolve>
 ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFunctions& vk, PreparedList& out) {
     if (!list.closed()) return ReplayResult::list_open;
+    if (list.queries_open()) return ReplayResult::invalid_query;  // a Vulkan query must end in its command buffer
     const auto commands = list.commands();
     out.list = &list;
     out.commands.assign(commands.size(), {});
@@ -1162,6 +1219,12 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
         return predicated && rects.empty() ? std::span<const Rect>(&whole_view, 1) : rects;
     };
     out.unpredicated_copies = 0;
+    const bool queries = vk.reset_query_pool && vk.begin_query && vk.end_query && vk.write_timestamp &&
+                         vk.copy_query_pool_results && vk.fill_buffer && vk.query_pool;
+    // Vulkan allows one active query of each type in a command buffer (VUID-vkCmdBeginQuery-queryPool-01922);
+    // D3D12 lets queries overlap. Overlapping occlusion (either kind) or pipeline-statistics queries need virtual
+    // queries (end the running Vulkan query, start another, sum on resolve); until then such a list is unsupported.
+    bool occlusion_active = false, statistics_active = false;
 
     for (std::size_t i = 0; i < commands.size(); ++i) {
         const auto& command = commands[i];
@@ -1299,6 +1362,45 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             p.source = *source;
             if (const auto result = detail::prepare_resolve(*resolve_command, p); result != ReplayResult::success)
                 return result;
+        } else if (const auto* discard = std::get_if<DiscardResource>(&command)) {
+            // Buffers and partial (rectangle) discards keep their contents, which "undefined" allows.
+            if (!bind(discard->resource)) return ReplayResult::unresolved_resource;
+            const std::uint64_t end = std::uint64_t(discard->first_subresource) + discard->count;
+            if (!p.binding.image) {
+                if (!discard->whole && end > 1) return ReplayResult::invalid_subresource;
+            } else if (discard->whole) {
+                VkImageSubresourceRange range{};
+                if (!image_range(p.binding, all_subresources, range)) return ReplayResult::invalid_subresource;
+                if (!discard->partial) p.discards.push_back(range);
+            } else {
+                for (std::uint64_t i = discard->first_subresource; i < end; ++i) {
+                    const auto s = static_cast<std::uint32_t>(i);
+                    VkImageSubresourceRange range{};
+                    if (!image_range(p.binding, s, range)) return ReplayResult::invalid_subresource;
+                    if (!discard->partial) p.discards.push_back(range);
+                }
+            }
+        } else if (const auto* write = std::get_if<WriteImmediate>(&command)) {
+            if (!vk.update_buffer || !vk.buffer_at) return ReplayResult::unsupported;
+            if (!vk.buffer_at(write->address, 4, p.write_buffer, p.write_offset)) return ReplayResult::unresolved_resource;
+            if (p.write_offset % 4) return ReplayResult::invalid_copy;
+        } else if (const auto* atomic = std::get_if<AtomicCopyBuffer>(&command)) {
+            if (!vk.copy_buffer) return ReplayResult::unsupported;
+            if (predicated) ++out.unpredicated_copies;  // a transfer command, like the copies
+            const ResourceBinding* source = resolve(atomic->src);
+            if (!bind(atomic->dst) || !source) return ReplayResult::unresolved_resource;
+            p.source = *source;
+            if (!p.binding.buffer || !p.source.buffer || !detail::within(atomic->dst_offset, atomic->bytes, p.binding.size) ||
+                !detail::within(atomic->src_offset, atomic->bytes, p.source.size))
+                return ReplayResult::invalid_copy;
+            for (const auto& d : atomic->dependencies) {
+                const ResourceBinding* dependent = resolve(d.resource);
+                if (!dependent) return ReplayResult::unresolved_resource;
+                if (!dependent->image && (d.subresource != 0 || d.begin > d.end || d.end > dependent->size))
+                    return ReplayResult::invalid_copy;
+            }
+            p.buffer_copies.push_back({p.source.buffer_offset + atomic->src_offset,
+                                       p.binding.buffer_offset + atomic->dst_offset, atomic->bytes});
         } else if (const auto* predication = std::get_if<Predication>(&command)) {
             predicated = predication->buffer != 0;
             if (!predicated) continue;
@@ -1308,6 +1410,30 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             // aligned one, so its low word is read (docs/d3d12_vulkan.md section 4.7).
             if (!p.binding.buffer || !detail::within(predication->offset, 4, p.binding.size))
                 return ReplayResult::invalid_predication;
+        } else if (const QueryRange range = query_range(command); range.count) {
+            // BeginQuery, EndQuery and ResolveQueryData are not among D3D12's predicated calls, and Vulkan's
+            // conditional rendering leaves query commands and transfers alone, so a predicate changes nothing here.
+            if (!queries) return ReplayResult::unsupported;
+            p.queries = vk.query_pool(range.heap);
+            if (!p.queries) return ReplayResult::unresolved_resource;
+            if (!query_fits_heap(p.queries->heap_type, range.type)) return ReplayResult::invalid_query;
+            if (range.first >= p.queries->count || range.count > p.queries->count - range.first)
+                return ReplayResult::invalid_query;
+            if (!query_result_size(range.type)) return ReplayResult::unsupported;
+            if (range.type != d3d12_query::timestamp && !std::holds_alternative<ResolveQueries>(command)) {
+                bool& active = range.type == d3d12_query::pipeline_statistics ? statistics_active : occlusion_active;
+                const bool begin = std::holds_alternative<BeginQuery>(command);
+                if (begin && active) return ReplayResult::unsupported;
+                active = begin;  // the list pairs every End with its Begin
+            }
+            if (const auto* resolve_queries = std::get_if<ResolveQueries>(&command)) {
+                // The destination is a buffer, as D3D12 requires, large enough for every result.
+                if (!bind(resolve_queries->dst)) return ReplayResult::unresolved_resource;
+                if (!p.binding.buffer ||
+                    !detail::within(resolve_queries->offset, std::uint64_t(range.count) * query_result_size(range.type),
+                                    p.binding.size))
+                    return ReplayResult::invalid_query;
+            }
         }
     }
     return ReplayResult::success;
@@ -1614,6 +1740,80 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             } else if (labels) {
                 vk.end_label(command_buffer);
                 --labels;
+            }
+        } else if (std::holds_alternative<DiscardResource>(command)) {
+            // oldLayout = UNDEFINED tells the driver the contents may go; the image stays in the layout the tracker
+            // has for it, so later commands see no change. Without a tracker the layout is unknown, and a part
+            // never used yet is still to be zero-filled: both are left alone. Without separate depth/stencil
+            // layouts, discarding one plane would also discard the other, so that is left alone too.
+            constexpr VkAccessFlags any_memory = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+            for (const auto& range : p.discards) {
+                if (!tracker || detail::planes_for_layout(p.binding, range, separate).aspectMask != range.aspectMask)
+                    continue;
+                std::vector<LayoutPiece> pieces;
+                if (!tracker->pieces(id, range, pieces)) continue;
+                for (const auto& piece : pieces)
+                    if (piece.layout != VK_IMAGE_LAYOUT_UNDEFINED)
+                        detail::image_barrier(vk, command_buffer, p.binding, piece.range, VK_IMAGE_LAYOUT_UNDEFINED,
+                                              piece.layout, VK_ACCESS_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                              any_memory, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+            }
+        } else if (const auto* write = std::get_if<WriteImmediate>(&command)) {
+            // vkCmdUpdateBuffer runs in the transfer stage. MARKER_OUT waits for every earlier command to finish
+            // and sees its writes. MARKER_IN only needs them started, which Vulkan cannot express (TOP_OF_PIPE in a
+            // first scope is no stage at all), so it waits for them to finish too, without their writes. DEFAULT is
+            // ordered like any copy, by the application's barriers.
+            if (write->mode == write_immediate_mode::marker_out)
+                detail::memory_barrier(vk, command_buffer, VK_ACCESS_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                       VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+            else if (write->mode == write_immediate_mode::marker_in)
+                detail::memory_barrier(vk, command_buffer, 0, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0,
+                                       VK_PIPELINE_STAGE_TRANSFER_BIT);
+            vk.update_buffer(command_buffer, p.write_buffer, p.write_offset, 4, &write->value);
+        } else if (std::holds_alternative<AtomicCopyBuffer>(command)) {
+            // Every earlier write, to the dependent resources among others, finishes and is visible before the copy.
+            // Vulkan promises no atomicity for a transfer; that a naturally aligned 4- or 8-byte copy is one write
+            // is an assumption about the hardware (docs/d3d12_vulkan.md, section 4.2).
+            detail::memory_barrier(vk, command_buffer, VK_ACCESS_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                   VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
+                                   VK_PIPELINE_STAGE_TRANSFER_BIT);
+            vk.copy_buffer(command_buffer, p.source.buffer, p.binding.buffer, 1, p.buffer_copies.data());
+        } else if (const auto* begin = std::get_if<BeginQuery>(&command)) {
+            // D3D12 queries need no reset; a Vulkan query is reset before every use. Nothing here runs inside a
+            // render pass, where a reset is not allowed: a draw path that opens one around queries must reset
+            // them before it.
+            QueryPool& heap = *p.queries;
+            vk.reset_query_pool(command_buffer, heap.pool, begin->index, 1);
+            heap.ended[begin->index] = false;
+            const bool precise = begin->type == d3d12_query::occlusion && heap.precise;
+            vk.begin_query(command_buffer, heap.pool, begin->index, precise ? VK_QUERY_CONTROL_PRECISE_BIT : 0);
+        } else if (const auto* end = std::get_if<EndQuery>(&command)) {
+            QueryPool& heap = *p.queries;
+            if (end->type == d3d12_query::timestamp) {
+                vk.reset_query_pool(command_buffer, heap.pool, end->index, 1);
+                vk.write_timestamp(command_buffer, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, heap.pool, end->index);
+            } else {
+                vk.end_query(command_buffer, heap.pool, end->index);
+            }
+            heap.ended[end->index] = true;
+        } else if (const auto* resolve = std::get_if<ResolveQueries>(&command)) {
+            // Runs of ended queries are copied as UINT64s, waiting for their results; D3D12 leaves a query that
+            // was never ended undefined, and it is written as zeros here rather than waited on forever.
+            const QueryPool& heap = *p.queries;
+            const std::uint32_t size = query_result_size(resolve->type);
+            std::uint32_t index = resolve->first;
+            const std::uint32_t last = resolve->first + resolve->count;
+            while (index < last) {
+                const bool ended = heap.ended[index];
+                std::uint32_t run = 1;
+                while (index + run < last && heap.ended[index + run] == ended) ++run;
+                const VkDeviceSize offset = resolve->offset + VkDeviceSize(index - resolve->first) * size;
+                if (ended)
+                    vk.copy_query_pool_results(command_buffer, heap.pool, index, run, p.binding.buffer, offset, size,
+                                               VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+                else
+                    vk.fill_buffer(command_buffer, p.binding.buffer, offset, VkDeviceSize(run) * size, 0);
+                index += run;
             }
         }
     }

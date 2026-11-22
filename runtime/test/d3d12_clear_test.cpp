@@ -291,7 +291,10 @@ int main(int argc, char** argv) {
         const std::array<float, 4> int_values[] = {
             {1, 2, 3, 4}, {1.5f, 2.5f, 3.5f, 4.5f}, {-1, -0.0f, 254.5f, 255.5f},
             {256, 65536, 16777216, 4294967296.0f}, {nan, inf, -inf, 0.5f},
-            {0.499f, 0.501f, 1.499f, 1.501f}, {4294967040.0f, std::numeric_limits<float>::max(), 255, 0}
+            {0.499f, 0.501f, 1.499f, 1.501f}, {4294967040.0f, std::numeric_limits<float>::max(), 255, 0},
+            // Component-range boundaries for the 8-, 16-, 10- and 2-bit formats and the signed 32-bit limits.
+            {127.5f, 128, -128.5f, -129}, {32767.5f, 32768, -32768.5f, -32769},
+            {65535.5f, 65536, 1023.5f, 1024}, {3.5f, 4, 2147483520.0f, -2147483648.0f}
         };
         // Float-valued formats (UNORM/SNORM/FLOAT); out-of-range values exercise clamping. NaN/inf and SRGB are
         // omitted: NaN/inf conversion is driver-defined, and the linear->sRGB encoding rounds differently at the .5
@@ -299,17 +302,31 @@ int main(int argc, char** argv) {
         const std::array<float, 4> float_values[] = {
             {0, 0.25f, 0.5f, 1}, {1, 1, 1, 1}, {0.5f, 0.5f, 0.5f, 0.5f}, {-0.5f, 0, 1.5f, 2}
         };
-        struct ColorFormat { DXGI_FORMAT format; unsigned bytes; const std::array<float, 4>* values; unsigned count; };
-        const ColorFormat color_formats[] = {
-            {DXGI_FORMAT_R8G8B8A8_UNORM, 4, float_values, std::size(float_values)},
-            {DXGI_FORMAT_R8G8B8A8_SNORM, 4, float_values, std::size(float_values)},
-            {DXGI_FORMAT_R32G32B32A32_FLOAT, 16, float_values, std::size(float_values)},
-            {DXGI_FORMAT_R8G8B8A8_UINT, 4, int_values, std::size(int_values)},
-            {DXGI_FORMAT_R32_UINT, 4, int_values, std::size(int_values)},
-            {DXGI_FORMAT_R32G32B32A32_UINT, 16, int_values, std::size(int_values)},
-            {DXGI_FORMAT_R8G8B8A8_SINT, 4, int_values, std::size(int_values)},
-            {DXGI_FORMAT_R32_SINT, 4, int_values, std::size(int_values)},
+        struct ColorFormat {
+            DXGI_FORMAT format; const char* name; unsigned bytes; const std::array<float, 4>* values; unsigned count;
         };
+        const unsigned nf = unsigned(std::size(float_values)), ni = unsigned(std::size(int_values));
+        const ColorFormat color_formats[] = {
+            {DXGI_FORMAT_R8G8B8A8_UNORM, "R8G8B8A8_UNORM", 4, float_values, nf},
+            {DXGI_FORMAT_R8G8B8A8_SNORM, "R8G8B8A8_SNORM", 4, float_values, nf},
+            {DXGI_FORMAT_R32G32B32A32_FLOAT, "R32G32B32A32_FLOAT", 16, float_values, nf},
+            {DXGI_FORMAT_R8G8_UINT, "R8G8_UINT", 2, int_values, ni},
+            {DXGI_FORMAT_R8G8B8A8_UINT, "R8G8B8A8_UINT", 4, int_values, ni},
+            {DXGI_FORMAT_R16G16_UINT, "R16G16_UINT", 4, int_values, ni},
+            {DXGI_FORMAT_R16G16B16A16_UINT, "R16G16B16A16_UINT", 8, int_values, ni},
+            {DXGI_FORMAT_R32_UINT, "R32_UINT", 4, int_values, ni},
+            {DXGI_FORMAT_R32G32_UINT, "R32G32_UINT", 8, int_values, ni},
+            {DXGI_FORMAT_R32G32B32A32_UINT, "R32G32B32A32_UINT", 16, int_values, ni},
+            {DXGI_FORMAT_R10G10B10A2_UINT, "R10G10B10A2_UINT", 4, int_values, ni},
+            {DXGI_FORMAT_R8G8_SINT, "R8G8_SINT", 2, int_values, ni},
+            {DXGI_FORMAT_R8G8B8A8_SINT, "R8G8B8A8_SINT", 4, int_values, ni},
+            {DXGI_FORMAT_R16G16_SINT, "R16G16_SINT", 4, int_values, ni},
+            {DXGI_FORMAT_R16G16B16A16_SINT, "R16G16B16A16_SINT", 8, int_values, ni},
+            {DXGI_FORMAT_R32_SINT, "R32_SINT", 4, int_values, ni},
+            {DXGI_FORMAT_R32G32_SINT, "R32G32_SINT", 8, int_values, ni},
+            {DXGI_FORMAT_R32G32B32A32_SINT, "R32G32B32A32_SINT", 16, int_values, ni},
+        };
+        unsigned format_failures = 0;
         for (const auto& cf : color_formats) {
             for (unsigned i = 0; i < cf.count; ++i) {
                 // Different colours outside and inside the rectangle exercise both Vulkan clear paths.
@@ -317,20 +334,25 @@ int main(int argc, char** argv) {
                 const auto& part = cf.values[(i + 1) % cf.count];
                 std::vector<unsigned char> actual, expected;
                 if (!clear_and_read(ours.p, cf.format, cf.bytes, full.data(), part.data(), actual) ||
-                    !clear_and_read(host.p, cf.format, cf.bytes, full.data(), part.data(), expected)) return 1;
+                    !clear_and_read(host.p, cf.format, cf.bytes, full.data(), part.data(), expected)) {
+                    std::fprintf(stderr, "%s case %u: clear or readback failed\n", cf.name, i);
+                    return 1;
+                }
                 if (actual != expected) {
                     for (std::size_t b = 0; b < actual.size(); ++b) {
                         if (actual[b] != expected[b]) {
-                            std::fprintf(stderr, "format %d case %u byte %zu: Vulkan %02x, WARP %02x\n",
-                                int(cf.format), i, b, unsigned(actual[b]), unsigned(expected[b]));
+                            std::fprintf(stderr, "%s case %u byte %zu: Vulkan %02x, WARP %02x\n",
+                                cf.name, i, b, unsigned(actual[b]), unsigned(expected[b]));
                             break;
                         }
                     }
-                    return 1;
+                    ++format_failures;
+                    break; // first mismatch per format; keep checking the other formats
                 }
                 ++cases_checked;
             }
         }
+        // Color mismatches are reported at the end so depth/stencil and the validation counter still run.
         // Depth (and stencil) clears, full and rectangle. Depth is [0,1]; stencil is a byte.
         struct DepthFormat { DXGI_FORMAT format; unsigned depth_bytes; bool has_stencil; };
         const DepthFormat depth_formats[] = {
@@ -351,15 +373,31 @@ int main(int argc, char** argv) {
                                           stencil_part, expected, expected_stencil))
                     return 1;
                 if (actual != expected || actual_stencil != expected_stencil) {
-                    std::fprintf(stderr, "depth format %d case %u: depth/stencil readback mismatch\n", int(df.format), i);
-                    return 1;
+                    std::size_t b = 0;
+                    while (b < actual.size() && b < expected.size() && actual[b] == expected[b]) ++b;
+                    if (b < actual.size() && b < expected.size())
+                        std::fprintf(stderr, "depth format %d case %u byte %zu: Vulkan %02x, WARP %02x\n",
+                            int(df.format), i, b, unsigned(actual[b]), unsigned(expected[b]));
+                    else
+                        std::fprintf(stderr, "depth format %d case %u: stencil readback mismatch\n", int(df.format), i);
+                    ++format_failures;
+                    break; // first mismatch per format; keep checking the other formats
                 }
                 ++cases_checked;
             }
         }
+        if (format_failures) {
+            std::fprintf(stderr, "d3d12_clear_test: %u color/depth format(s) differ from WARP\n", format_failures);
+            return 1;
+        }
         return 0;
     }; // Destroy the D3D12 objects before checking the Vulkan validation counter.
-    if (compare() || vk.validation_errors() != errors_before) return 1;
+    const int compare_failed = compare();
+    const auto validation_errors = vk.validation_errors() - errors_before;
+    if (validation_errors)
+        std::fprintf(stderr, "d3d12_clear_test: %llu new Vulkan validation error(s)\n",
+            static_cast<unsigned long long>(validation_errors));
+    if (compare_failed || validation_errors) return 1;
     if (volume_only) return 0;
     std::printf("RTV and DSV clears: %u full/rectangle readbacks matched WARP\n", cases_checked);
     return 0;

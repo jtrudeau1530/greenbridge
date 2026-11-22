@@ -284,7 +284,7 @@ Hash-only or opaque:
 - map file `name`/`parent` (32-bit hashes; `parent` is non-zero in 2,089 of the 23,535 census maps). A local
   dictionary resolves 5 names and 1 parent; all five names are confirmed by the map root's 64-bit key. The
   remaining map-cell names are not in the local model/XML exports;
-- most `archetypeName` values. The repo's model export reports 155,598 models with names/bounds, but the local
+- most `archetypeName` values. The repo's model export reports 350,248 models with names/bounds, but the local
   dictionary used here contains 79,738 exact names. It resolves 5,107 of 24,105 distinct archetype hashes
   (8,263 of 203,799 entities, 4.05%) in the two 1 GiB windows in [world_names.md](world_names.md); every match
   is confirmed by the 64-bit key. The unresolved 95.95% are hash-only because their names are not in the local

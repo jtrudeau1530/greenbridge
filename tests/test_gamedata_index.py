@@ -200,6 +200,14 @@ class XmlClassificationTest(unittest.TestCase):
                 self.assertTrue(self.tool.xml_complete("Foo", data))
         self.assertFalse(self.tool.xml_complete("", b"<Foo></Foo>"))
 
+    def test_quoted_greater_than_in_attributes_does_not_end_a_tag(self):
+        for data in (b'<Foo><Foo attr="x>y"/></Foo>', b"<Foo><Foo attr='x>y'/></Foo>",
+                     b'<Foo attr="x>y">text</Foo>', b'<Foo attr="x>y"/>'):
+            with self.subTest(data=data):
+                self.assertTrue(self.tool.xml_complete("Foo", data))
+        # A real second open element still leaves the document incomplete.
+        self.assertFalse(self.tool.xml_complete("Foo", b'<Foo><Foo attr="x>y"></Foo>'))
+
     def test_tags_inside_comments_and_cdata_do_not_count(self):
         self.assertTrue(self.tool.xml_complete("Foo", b"<Foo><!-- <Foo> --><![CDATA[</Foo>]]></Foo>"))
         for data in (b"<Foo><Foo><!-- </Foo> -->", b"<Foo><Foo><![CDATA[</Foo>]]>"):

@@ -150,15 +150,16 @@ int main() {
                         s.ComparisonFunc, s.BorderColor, s.MinLOD, s.MaxLOD, s.ShaderRegister, s.RegisterSpace,
                         s.ShaderVisibility};
     }
-    // Two ranges, so the range stride (20 bytes in 1.0, 24 with flags) is under test too.
+    // Two ranges, so the range stride (20 bytes in 1.0, 24 with flags) is under test too. Every field differs from
+    // its neighbours (an explicit table offset, nonzero registers and spaces, distinct flags), so a swapped or
+    // shifted field read shows up instead of matching by accident.
     D3D12_DESCRIPTOR_RANGE range0[2] = {
         {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 3, 1, 0, D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND},
-        {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 2, 0, 0, D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND}};
+        {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 2, 4, 2, 7}};
     D3D12_DESCRIPTOR_RANGE1 range1[2] = {
         {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 3, 1, 0, D3D12_DESCRIPTOR_RANGE_FLAG_DATA_STATIC,
          D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND},
-        {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 2, 0, 0, D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE,
-         D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND}};
+        {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 2, 4, 2, D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE, 7}};
     D3D12_ROOT_PARAMETER params0[2]{};
     params0[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
     params0[0].DescriptorTable = {2, range0};
@@ -181,8 +182,23 @@ int main() {
                got.visibility == static_cast<Visibility>(want.ShaderVisibility) &&
                got.flags == (flags ? uint32_t(want.Flags) : 0u);
     };
+    // Ranges as the model should hold them: 1.0 has no range flags (0 in the model); 1.1 and 1.2 use range1.
+    const auto same_ranges = [&](const std::vector<DescriptorRange>& got, bool range_flags) {
+        if (got.size() != 2) return false;
+        for (int i = 0; i < 2; ++i) {
+            const D3D12_DESCRIPTOR_RANGE1& want = range1[i];
+            if (got[i].range_type != uint32_t(want.RangeType) || got[i].num_descriptors != want.NumDescriptors ||
+                got[i].base_shader_register != want.BaseShaderRegister ||
+                got[i].register_space != want.RegisterSpace ||
+                got[i].flags != (range_flags ? uint32_t(want.Flags) : 0u) ||
+                got[i].offset_in_table != want.OffsetInDescriptorsFromTableStart)
+                return false;
+        }
+        return true;
+    };
     const auto serialize = [&](const D3D12_VERSIONED_ROOT_SIGNATURE_DESC& d, Version version, const char* name,
                                bool sampler_flags) {
+        const bool range_flags = version != Version::V1_0;
         Blobs out;
         char what[160];
         const HRESULT result = D3D12SerializeVersionedRootSignature(&d, &out.blob, &out.error);
@@ -206,6 +222,8 @@ int main() {
                   got.params[1].descriptor_space == 1 && got.static_samplers.size() == 2,
               what);
         if (got.static_samplers.size() != 2) return;
+        std::snprintf(what, sizeof(what), "%s: every range field round-trips (flags before the table offset)", name);
+        check(same_ranges(got.params[0].ranges, range_flags), what);
         std::snprintf(what, sizeof(what), "%s: every sampler field round-trips", name);
         check(same_sampler(got.static_samplers[0], samplers[0], sampler_flags) &&
                   same_sampler(got.static_samplers[1], samplers[1], sampler_flags),
@@ -215,6 +233,7 @@ int main() {
         const DecodeResult again = decode_canonical(bytes.data(), bytes.size());
         std::snprintf(what, sizeof(what), "%s: canonical codec round-trips the parsed model", name);
         check(again.ok && again.sig.version == version && again.sig.static_samplers.size() == 2 &&
+                  again.sig.params.size() == 2 && same_ranges(again.sig.params[0].ranges, range_flags) &&
                   same_sampler(again.sig.static_samplers[0], samplers[0], sampler_flags) &&
                   same_sampler(again.sig.static_samplers[1], samplers[1], sampler_flags),
               what);

@@ -94,7 +94,9 @@ def xml_complete(root: str, data: bytes) -> bool:
         return False
     text = XML_NON_TAG.sub(b"", data)
     name = re.escape(root.encode("ascii", "replace"))
-    opens = re.findall(rb"<" + name + rb"(?=[\s/>])[^>]*>", text)
+    # A quoted attribute value may contain '>'; consume quoted strings as one unit or a self-closing
+    # tag with such a value is mistaken for an unclosed element.
+    opens = re.findall(rb"<" + name + rb"(?=[\s/>])(?:\"[^\"]*\"|'[^']*'|[^'\">])*>", text)
     closes = re.findall(rb"</" + name + rb"\s*>", text)
     self_closed = sum(1 for tag in opens if tag.rstrip().endswith(b"/>"))
     if len(opens) - self_closed > len(closes):

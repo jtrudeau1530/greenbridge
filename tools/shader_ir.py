@@ -67,7 +67,9 @@ def operand(tok):
     if core in SPECIAL:
         return {"k": "special", "t": core, "neg": neg, "abs": absm}
     if re.fullmatch(r"-?(0x[0-9a-fA-F]+|\d+)", core):
-        v = int(core, 0)
+        # int(core, 0) rejects the leading-zero decimals this regex accepts ('010', '08', '0001'),
+        # which aborts a whole parse_file() run on one disassembly line.
+        v = int(core, 16) if core.lower().startswith("0x") else int(core, 10)
         return {"k": "imm", "v": -v if neg else v}
     if re.fullmatch(r"-?\d+\.\d+(e[+-]?\d+)?", core):
         return {"k": "fimm", "v": float(core) * (-1 if neg else 1), "abs": absm}

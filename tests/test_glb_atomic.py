@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import sys
 import tempfile
+import threading
 import unittest
 from unittest import mock
 
@@ -101,6 +102,107 @@ class GlbAtomicTests(unittest.TestCase):
             self.assertEqual(target.read_bytes(), b"previous export")
             self.assertEqual(sibling.read_bytes(), b"unrelated file")
             self.assertEqual(set(os.listdir(directory)), {target.name, sibling.name})
+
+    def test_transient_sharing_violation_is_retried(self):
+        prims = self.primitives()
+        replace = os.replace
+        calls = []
+
+        def busy_twice(source, destination):
+            calls.append(source)
+            if len(calls) <= 2:
+                raise PermissionError(13, "sharing violation")
+            replace(source, destination)
+
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "mesh.glb"
+            target.write_bytes(b"previous export")
+            with mock.patch.object(glb_writer, "_REPLACE_RETRY", True), \
+                    mock.patch.object(glb_writer.time, "sleep") as sleep, \
+                    mock.patch.object(glb_writer.os, "replace", side_effect=busy_twice):
+                glb_writer.write_glb(target, prims)
+
+            self.assertEqual(target.read_bytes(), glb_writer.build_glb(prims))
+            self.assertEqual(len(calls), 3)
+            self.assertEqual(sleep.call_count, 2)
+            self.assertEqual(os.listdir(directory), [target.name])
+
+    def test_lasting_sharing_violation_still_raises_after_retries(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "mesh.glb"
+            target.write_bytes(b"previous export")
+            replace = mock.Mock(side_effect=PermissionError("busy"))
+            with mock.patch.object(glb_writer, "_REPLACE_RETRY", True), \
+                    mock.patch.object(glb_writer.time, "sleep"), \
+                    mock.patch.object(glb_writer.os, "replace", replace):
+                with self.assertRaisesRegex(PermissionError, "busy"):
+                    glb_writer.write_glb(target, self.primitives())
+
+            self.assertEqual(replace.call_count, len(glb_writer._REPLACE_DELAYS) + 1)
+            self.assertEqual(target.read_bytes(), b"previous export")
+            self.assertEqual(os.listdir(directory), [target.name])
+
+    def test_other_errors_are_not_retried(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "mesh.glb"
+            replace = mock.Mock(side_effect=FileNotFoundError("gone"))
+            with mock.patch.object(glb_writer, "_REPLACE_RETRY", True), \
+                    mock.patch.object(glb_writer.time, "sleep") as sleep, \
+                    mock.patch.object(glb_writer.os, "replace", replace):
+                with self.assertRaises(FileNotFoundError):
+                    glb_writer.write_glb(target, self.primitives())
+            self.assertEqual(replace.call_count, 1)
+            sleep.assert_not_called()
+
+    @unittest.skipUnless(os.name == "nt", "sharing violations on replace are Windows-only")
+    def test_threads_writing_one_file_all_publish(self):
+        # Before the retry, 8 threads x 40 writes to one path failed 43-152 of 320
+        # calls with PermissionError on Windows 11 (#425 review).
+        payloads = [self.primitives(size) for size in range(1, 9)]
+        allowed = {glb_writer.build_glb(p) for p in payloads}
+        errors = []
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "mesh.glb"
+
+            def worker(prims):
+                for _ in range(40):
+                    try:
+                        glb_writer.write_glb(target, prims)
+                    except OSError as exc:
+                        errors.append(exc)
+
+            threads = [threading.Thread(target=worker, args=(p,)) for p in payloads]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+
+            self.assertEqual(errors, [])
+            self.assertIn(target.read_bytes(), allowed)
+            self.assertEqual(os.listdir(directory), [target.name])
+
+    @unittest.skipUnless(os.name == "posix", "POSIX permission bits")
+    def test_published_glb_keeps_permission_bits(self):
+        # The staging file is created 0600; the published GLB must not lose group/other read.
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "mesh.glb"
+            old = os.umask(0o022)
+            try:
+                glb_writer.write_glb(target, self.primitives())
+                self.assertEqual(target.stat().st_mode & 0o777, 0o644)
+                os.chmod(target, 0o640)
+                glb_writer.write_glb(target, self.primitives(2))
+                self.assertEqual(target.stat().st_mode & 0o777, 0o640)
+            finally:
+                os.umask(old)
+
+    def test_published_glb_is_writable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "mesh.glb"
+            glb_writer.write_glb(target, self.primitives())
+            self.assertTrue(os.access(target, os.W_OK))
+            glb_writer.write_glb(target, self.primitives(2))
+            self.assertEqual(target.read_bytes(), glb_writer.build_glb(self.primitives(2)))
 
     def test_creates_missing_parent_directory(self):
         with tempfile.TemporaryDirectory() as directory:

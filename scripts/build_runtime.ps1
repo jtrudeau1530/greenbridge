@@ -1,6 +1,8 @@
 # Builds runtime\build\gta6rt.exe with MSVC at BelowNormal priority, on half the cores.
 # Uses VS's CMake + Ninja when the "C++ CMake tools" component is installed, otherwise calls cl.exe directly.
-param([switch]$Debug)
+# The GameInput controller shim (SDL3, docs/gameinput.md) is built only on the CMake path: with an installed SDL3, or
+# with -FetchSdl3, which lets CMake download the pinned SDL3 release. The cl.exe fallback never builds it.
+param([switch]$Debug, [switch]$FetchSdl3)
 $ErrorActionPreference = "Stop"
 
 $root = Split-Path $PSScriptRoot -Parent
@@ -18,14 +20,17 @@ $cmakeDir = Join-Path $vs "Common7\IDE\CommonExtensions\Microsoft\CMake"
 $cmake = Join-Path $cmakeDir "CMake\bin\cmake.exe"
 $ninja = Join-Path $cmakeDir "Ninja\ninja.exe"
 $cfg = if ($Debug) { "Debug" } else { "RelWithDebInfo" }
+$sdl = if ($FetchSdl3) { "-DLEONIDA_SDL3_FETCH=ON" } else { "" }
 
 if ((Test-Path $cmake) -and (Test-Path $ninja)) {
     $body = @"
-"$cmake" -S "$src" -B "$out" -G Ninja "-DCMAKE_MAKE_PROGRAM=$ninja" -DCMAKE_BUILD_TYPE=$cfg || exit /b 1
+"$cmake" -S "$src" -B "$out" -G Ninja "-DCMAKE_MAKE_PROGRAM=$ninja" -DCMAKE_BUILD_TYPE=$cfg $sdl || exit /b 1
 "$cmake" --build "$out" -j $jobs || exit /b 1
 "@
 } else {
-    # Keep this list in step with runtime\CMakeLists.txt.
+    # Keep this list in step with runtime\CMakeLists.txt. Optional parts that need a dependency are left out here:
+    # the GameInput shim (SDL3), so controllers go through the host's GameInput.dll, if any, as without the shim.
+    Write-Warning "VS C++ CMake tools not found: building with cl.exe directly, without the GameInput shim (SDL3). Install the CMake tools component to get it."
     $files = "src\main.cpp", "src\pe_loader.cpp", "shims\registry.cpp", "shims\xmem.cpp", "shims\d3d12_xs.cpp", "shims\d3d12_xs_device.cpp", "shims\d3d12_xs_rootsig.cpp" | ForEach-Object { "`"$src\$_`"" }
     $opt = if ($Debug) { "/Od /MDd" } else { "/O2 /MD" }
     $body = @"
