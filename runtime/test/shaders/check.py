@@ -331,6 +331,7 @@ CLIP_TESTS = ("vs_clip", "vs_clip_param4", "vs_clip_undeclared")
 # One definition: a later assignment used to drop ps_texoff (and any entry added by an earlier assignment) from
 # the standalone run. Keep every pixel fixture in this tuple.
 PIXEL_TESTS = sorted((*PIXEL_BITS, "ps_bary", "ps_flat", "ps_bitmask_perm", "ps_texoff", "ps_texoff_implicit",
+                      "ps_texoff_forms",
                       "ps_uniform_branch", "ps_wqm", "ps_scc_mask32", "ps_interp_f16_high", "ps_ij_computed",
                       "ps_mandelbrot"))
 # Pixel fixtures drawn with another vertex shader than vs_ids.
@@ -910,11 +911,15 @@ def texture_constant_test(tools, spirv, name):
     return "" if not wrong else f"{wrong} of 4096 pixels differ from {expected}"
 
 
-def texoff_words(px, py):
-    """ps_texoff's mrt0 words at pixel (px, py), from the rule in docs/design.md (derivation in ps_texoff.asm)."""
+def texoff_words(px, py, name="ps_texoff"):
+    """ps_texoff's mrt0 words at pixel (px, py), from the rule in docs/design.md (derivation in ps_texoff.asm).
+    ps_texoff_forms (image_sample_o, image_sample_b_o, image_gather4_l_o) puts the per-pixel sample in .x and .y and
+    the same two gathers in .z and .w (derivation in ps_texoff_forms.asm)."""
     bx, by = px >> 3, py >> 3                          # per-pixel offset (bx - 4, by - 4) from texel (4, 4)
     x0, y0 = max(bx - 1, 0), max(by - 1, 0)            # gather footprint 3..4 moved by the offset, clamped at 0
-    return (bx | by << 4, 0x0761, x0 | bx << 4 | bx << 8 | x0 << 12, by | by << 4 | y0 << 8 | y0 << 12)
+    sample = bx | by << 4
+    return (sample, sample if name == "ps_texoff_forms" else 0x0761, x0 | bx << 4 | bx << 8 | x0 << 12,
+            by | by << 4 | y0 << 8 | y0 << 12)
 
 
 # LEONIDA_TEXOFF_FALLBACK=1 (set for build.py too): image_sample*_o was translated with --texel-offset-fallback, so
@@ -922,7 +927,7 @@ def texoff_words(px, py):
 TEXOFF_FALLBACK = os.environ.get("LEONIDA_TEXOFF_FALLBACK") == "1"
 
 
-def texoff_problem(data, output, all_offsets=None):
+def texoff_problem(data, output, all_offsets=None, name="ps_texoff"):
     """Judge ps_texoff's 64x64 RGBA32 dump: (failure text or "", what was covered). The +16 / -32 sample (bits 8-15
     of .y) is only defined, and so only judged, where vk_texture_test printed texel offset limits that cover it."""
     m = re.search(r"texel offset limits: (-?\d+)\.\.(-?\d+)", output)
@@ -931,18 +936,22 @@ def texoff_problem(data, output, all_offsets=None):
         wide = True                    # the offset is a coordinate shift: no device limit applies
     if len(data) != 64 * 64 * 16:
         return "vk_texture_test returned an unexpected pixel count", ""
+    if name == "ps_texoff_forms":
+        wide = True                    # every offset there is in -4..3, inside Vulkan's guaranteed -8..7
     keep = (0xFFFFFFFF, 0xFFFFFFFF if wide else 0xFFFF00FF, 0xFFFFFFFF, 0xFFFFFFFF)
     px = list(struct.iter_unpack("<4I", data))
     bad = [(i, got) for i, got in enumerate(px)
-           if any((g ^ w) & k for g, w, k in zip(got, texoff_words(i % 64, i // 64), keep))]
+           if any((g ^ w) & k for g, w, k in zip(got, texoff_words(i % 64, i // 64, name), keep))]
     limits = f"{m.group(1)}..{m.group(2)}" if m else "unknown"
     covered = ("offsets +16/-32 judged" + (" (texel offset fallback)" if wide and not (
         bool(m) and int(m.group(1)) <= -32 and int(m.group(2)) >= 16) else "")) if wide else f"offsets +16/-32 not judged (device texel offset limits {limits})"
+    if name == "ps_texoff_forms":
+        covered = "offsets -4..3 on image_sample_o, image_sample_b_o and image_gather4_l_o"
     if not bad:
         return "", covered
     i, got = bad[0]
     return (f"{len(bad)} of {len(px)} pixels differ; first at ({i % 64},{i // 64}): got {[hex(x) for x in got]}, "
-            f"want {[hex(x) for x in texoff_words(i % 64, i // 64)]} ({covered})"), covered
+            f"want {[hex(x) for x in texoff_words(i % 64, i // 64, name)]} ({covered})"), covered
 
 
 def texoff_env(base=None):
@@ -965,7 +974,7 @@ def texoff_test(tools, spirv, name):
             return Skip(f"SKIP ({m.group(0) if m else 'unsupported device'})")
         if code or not raw.is_file():
             return failure(code, out, 2)
-        return texoff_problem(raw.read_bytes(), out)[0]
+        return texoff_problem(raw.read_bytes(), out, name=name)[0]
 
 
 def store_words(name):
@@ -1173,7 +1182,7 @@ def pixel_test(tools, spirv, name):
         return Skip("SKIP (computed I/J pairs need PerVertexKHR inputs: no --bary-fallback / --f16-interp-fallback)")
     if not os.path.isfile(path):
         return f"missing {name}.spv"
-    if name in ("ps_texoff", "ps_texoff_implicit"):
+    if name in ("ps_texoff", "ps_texoff_implicit", "ps_texoff_forms"):
         return texoff_test(tools, spirv, name)
     if name == "ps_interp_f16_high" and BARY_FALLBACK:
         return Skip("SKIP (per-vertex interpolants need VK_KHR_fragment_shader_barycentric)")

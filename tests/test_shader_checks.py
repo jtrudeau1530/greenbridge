@@ -821,10 +821,34 @@ if __name__ == "__main__":
     unittest.main()
 
 
+class TexelOffsetFormsChecks(unittest.TestCase):
+    """ps_texoff_forms (image_sample_o, image_sample_b_o, image_gather4_l_o): the judgement of a dump."""
+
+    @staticmethod
+    def dump(words):
+        return b"".join(struct.pack("<4I", *words(i % 64, i // 64)) for i in range(64 * 64))
+
+    def test_the_rule_passes_and_both_samples_are_judged(self):
+        good = self.dump(lambda px, py: check.texoff_words(px, py, "ps_texoff_forms"))
+        problem, covered = check.texoff_problem(good, "device: gpu\n", name="ps_texoff_forms")
+        self.assertEqual(problem, "")
+        self.assertIn("image_sample_b_o", covered)
+        self.assertEqual(check.texoff_words(20, 50, "ps_texoff_forms"), (0x62, 0x62, 0x1221, 0x5566))
+
+    def test_a_dropped_or_swapped_offset_fails(self):
+        for label, broken in (("dropped in .y", lambda px, py: (lambda w: (w[0], 0x44, w[2], w[3]))(
+                                  check.texoff_words(px, py, "ps_texoff_forms"))),
+                              ("swapped in .x", lambda px, py: (lambda w: ((py >> 3) | (px >> 3) << 4, *w[1:]))(
+                                  check.texoff_words(px, py, "ps_texoff_forms")))):
+            with self.subTest(label):
+                problem, _ = check.texoff_problem(self.dump(broken), "device: gpu\n", name="ps_texoff_forms")
+                self.assertIn("pixels differ", problem)
+
+
 class PixelTestRegistry(unittest.TestCase):
     def test_pixel_tests_include_every_pixel_fixture(self):
         # A repeated PIXEL_TESTS assignment silently dropped ps_texoff once; keep the registry explicit.
-        for name in ("ps_texoff", "ps_wqm", "ps_scc_mask32"):
+        for name in ("ps_texoff", "ps_texoff_forms", "ps_wqm", "ps_scc_mask32"):
             with self.subTest(name=name):
                 self.assertIn(name, check.PIXEL_TESTS)
         self.assertEqual(len(check.PIXEL_TESTS), len(set(check.PIXEL_TESTS)))
