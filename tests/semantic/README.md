@@ -4,6 +4,12 @@ Standard library only; no GPU, no LLVM, no SPIRV-Tools, no game files.
 
     python -m unittest discover -s tests/semantic -v
 
+Every file here must call `tools/rdna2spirv.py` (directly, through `support.py`, or by running the tool) and assert
+on what it emitted. A test that reimplements the instruction in Python passes whatever the translator does, so it is
+not a regression test. `tests/test_semantic_translator_use.py` enforces this; the interpreter self-tests and the
+files whose subject is hand-written SPIR-V are listed there with a reason. The guard checks that a file reaches the
+translator, not that every assertion depends on it.
+
 What they check (`tools/rdna2spirv.py`, pixel shaders plus one compute shader):
 
 - `test_ps_semantics.py` translates `ps_sdwa`, `ps_ops`, `ps_ops2`, `ps_ops3`, `ps_ops4` and `ps_legacy_mul` and
