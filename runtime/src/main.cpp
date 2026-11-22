@@ -19,8 +19,10 @@
 #include <windows.h>
 
 #include <cstdio>
+#include <filesystem>
 #include <map>
 #include <string>
+#include <system_error>
 #include <vector>
 
 #include "base_reservation.h"
@@ -76,7 +78,16 @@ int wmain(int argc, wchar_t** argv) {
     if (image.empty()) return usage();
     // Exactly one mode: --dry-run --run would otherwise initialise the modules and call the entry point.
     if (dry_run + init + run != 1) return usage();
-    if (game_dir.empty()) game_dir = image.parent_path();
+    // The console folders are fixed once, as absolute paths. A bare image name (`gta6rt --run game.exe` from the
+    // game folder) has an empty parent path, which left GAME: with no root; and a relative --game-dir or --overlay
+    // would follow the title's later SetCurrentDirectory. If absolute() fails the path stays as given.
+    const auto absolute_or_same = [](const std::filesystem::path& p) {
+        std::error_code ec;
+        std::filesystem::path a = std::filesystem::absolute(p, ec);
+        return ec ? p : a;
+    };
+    game_dir = game_dir.empty() ? absolute_or_same(image).parent_path() : absolute_or_same(game_dir);
+    if (!overlay_dir.empty()) overlay_dir = absolute_or_same(overlay_dir);
     // An image without relocations whose range this process already uses (arm64 Wine on macOS) runs in a new
     // process that has the range reserved from the start (base_reservation.h); that process does not do this again.
     if (!rt::base_reservation::inherited())
