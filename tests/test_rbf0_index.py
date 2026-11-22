@@ -264,6 +264,15 @@ class ArgumentTest(unittest.TestCase):
             self.assertNotIn("Traceback", p.stderr)
             self.assertFalse(os.path.exists(out))
 
+    def test_directory_rejects_archive_ranges(self):
+        out = os.path.join(self.root, "index.json")
+        for flag in ("--start", "--limit"):
+            with self.subTest(flag=flag):
+                result = self.run_tool(self.root, out, flag, "1")
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn("apply to a single archive", result.stderr)
+                self.assertFalse(os.path.exists(out))
+
     def run_tool(self, *args):
         return subprocess.run([sys.executable, "-I", TOOL, *args, "--quiet"],
                               capture_output=True, text=True, encoding="utf-8", errors="replace")

@@ -514,6 +514,8 @@ def main():
     a = ap.parse_args()
     if a.strings < 0:
         ap.exit(2, f"{ap.prog}: error: argument --strings: must be 0 or more\n")
+    if os.path.isdir(a.source) and (a.start is not None or a.limit is not None):
+        ap.error("--start and --limit apply to a single archive, not a directory")
     if os.path.isdir(a.out):
         ap.error(f"{a.out} is a folder, not a .csv or .json file")
     folder = os.path.dirname(os.path.abspath(a.out))
