@@ -228,8 +228,7 @@ def _in_skipped(node, skip):
 
 
 def probe_llvm_mc(llvm_mc, names, mcpu="gfx1013"):
-    """Ask llvm-mc about each name with no operands: 'invalid instruction' = no such mnemonic in LLVM at all,
-    'not supported on this GPU' = a mnemonic of another generation, anything else = known for the target."""
+    """Ask llvm-mc about each mnemonic without operands and distinguish tool failures from opcode diagnostics."""
     out = {}
     for n in names:
         try:
@@ -237,13 +236,16 @@ def probe_llvm_mc(llvm_mc, names, mcpu="gfx1013"):
                                text=True, timeout=30)
         except OSError as e:
             return {"error": str(e)}
-        text = r.stderr + r.stdout
-        if "invalid instruction" in text:
+        text = r.stderr + "\n" + r.stdout
+        if "error: invalid instruction" in text:
             out[n] = "unknown to LLVM"
-        elif "not supported on this GPU" in text:
+        elif "error: instruction not supported on this GPU" in text:
             out[n] = f"LLVM: other GPU only (not {mcpu})"
-        else:
+        elif r.returncode == 0 or "error: too few operands for instruction" in text:
             out[n] = f"LLVM: valid on {mcpu}"
+        else:
+            diagnostic = next((line.strip() for line in text.splitlines() if line.strip()), "no diagnostic")
+            out[n] = f"LLVM probe failed (exit {r.returncode}): {diagnostic}"
     return out
 
 
