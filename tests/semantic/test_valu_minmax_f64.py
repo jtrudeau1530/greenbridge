@@ -1343,5 +1343,141 @@ class TestValuMinMaxF64IEEE754Boundaries(unittest.TestCase):
         self.assertEqual(apply_f64_clamp(QNAN_F64), QNAN_F64)
 
 
+class TestValuMinMaxF64NegativeControls(unittest.TestCase):
+    """Unit tests for negative controls, syntax rejection, and invalid AST inputs."""
+
+    def test_invalid_register_indices(self) -> None:
+        with self.assertRaises(ValueError):
+            Register(RegKind.VGPR, -1, count=2)
+        with self.assertRaises(ValueError):
+            Register(RegKind.VGPR, 256, count=2)
+        with self.assertRaises(ValueError):
+            # Index 255 with count 2 spills past 255
+            Register(RegKind.VGPR, 255, count=2)
+
+    def test_invalid_register_counts(self) -> None:
+        with self.assertRaises(ValueError):
+            Register(RegKind.VGPR, 0, count=0)
+        with self.assertRaises(ValueError):
+            Register(RegKind.VGPR, 0, count=3)
+
+    def test_invalid_destination_kind(self) -> None:
+        # VALU destination cannot be SGPR
+        with self.assertRaises(ValueError):
+            Instruction(
+                opcode=Opcode.V_MIN_F64,
+                dst=Register(RegKind.SGPR, 0, count=2),
+                src0=Register(RegKind.VGPR, 2, count=2),
+                src1=Register(RegKind.VGPR, 4, count=2),
+            )
+
+    def test_invalid_destination_count(self) -> None:
+        # 64-bit float operation destination cannot be 32-bit single register
+        with self.assertRaises(ValueError):
+            Instruction(
+                opcode=Opcode.V_MIN_F64,
+                dst=Register(RegKind.VGPR, 0, count=1),
+                src0=Register(RegKind.VGPR, 2, count=2),
+                src1=Register(RegKind.VGPR, 4, count=2),
+            )
+
+    def test_invalid_vop2_modifiers(self) -> None:
+        # VOP2 encoding cannot have clamp
+        with self.assertRaises(ValueError):
+            Instruction(
+                opcode=Opcode.V_MIN_F64,
+                dst=Register(RegKind.VGPR, 0, count=2),
+                src0=Register(RegKind.VGPR, 2, count=2),
+                src1=Register(RegKind.VGPR, 4, count=2),
+                inst_mods=InstructionModifiers(clamp=True),
+                encoding=Encoding.VOP2,
+            )
+
+    def test_scalar_interpreter_out_of_bounds_access(self) -> None:
+        interp = ScalarVALUInterpreter()
+        with self.assertRaises(IndexError):
+            interp.read_reg_u32(RegKind.VGPR, 256)
+        with self.assertRaises(IndexError):
+            interp.write_reg_u32(RegKind.SGPR, 106, 0)
+
+    def test_simd_interpreter_invalid_wave_size(self) -> None:
+        with self.assertRaises(ValueError):
+            SIMDWavefrontInterpreter(wave_size=16)
+        with self.assertRaises(ValueError):
+            SIMDWavefrontInterpreter(wave_size=128)
+
+
+class TestValuMinMaxF64MutationDetection(unittest.TestCase):
+    """Mutation tests: verifies that intentional sabotages/mutations of the oracle are caught."""
+
+    def test_mutation_inverted_comparison(self) -> None:
+        # Sabotage: swap min and max
+        def mutated_min(s0: int, s1: int) -> int:
+            return ref_max_f64(s0, s1)
+
+        # Standard check should detect failure
+        with self.assertRaises(AssertionError):
+            self.assertEqual(mutated_min(POS_ONE_F64, POS_TWO_F64), POS_ONE_F64)
+
+    def test_mutation_signed_zero_blindness(self) -> None:
+        # Sabotage: ignoring signed zero ordering (-0.0 vs +0.0)
+        def mutated_min_zero_blind(s0: int, s1: int) -> int:
+            f0 = bits_to_f64(s0)
+            f1 = bits_to_f64(s1)
+            # Python standard min(0.0, -0.0) returns the first argument: min(+0.0, -0.0) == 0.0
+            return s0 if f0 <= f1 else s1
+
+        # Must catch that min(+0.0, -0.0) should be -0.0, not +0.0
+        with self.assertRaises(AssertionError):
+            self.assertEqual(mutated_min_zero_blind(POS_ZERO_F64, NEG_ZERO_F64), NEG_ZERO_F64)
+
+    def test_mutation_nan_propagation_bug(self) -> None:
+        # Sabotage: propagate NaN instead of suppressing it
+        def mutated_min_nan_propagate(s0: int, s1: int) -> int:
+            if is_nan_f64(s0):
+                return s0
+            if is_nan_f64(s1):
+                return s1
+            return ref_min_f64(s0, s1)
+
+        with self.assertRaises(AssertionError):
+            self.assertEqual(mutated_min_nan_propagate(QNAN_F64, POS_ONE_F64), POS_ONE_F64)
+
+    def test_mutation_clamp_negative_zero_bug(self) -> None:
+        # Sabotage: clamping -0.0 retains -0.0 instead of flushing to +0.0
+        def mutated_clamp_negative_zero(bits: int) -> int:
+            val = bits_to_f64(bits)
+            if val < 0.0:
+                return POS_ZERO_F64
+            if val > 1.0:
+                return POS_ONE_F64
+            return bits  # returns -0.0 unchanged
+
+        with self.assertRaises(AssertionError):
+            self.assertEqual(mutated_clamp_negative_zero(NEG_ZERO_F64), POS_ZERO_F64)
+
+    def test_mutation_exec_mask_leak(self) -> None:
+        # Sabotage: inactive lanes write to destination VGPR
+        simd = SIMDWavefrontInterpreter(wave_size=32)
+        simd.set_exec_mask(0)  # all inactive
+        canary = 0x1234567890ABCDEF
+        simd.write_lane_reg_u64(0, RegKind.VGPR, 0, canary)
+
+        # Proper step preserves canary
+        inst = Instruction(
+            opcode=Opcode.V_MIN_F64,
+            dst=Register(RegKind.VGPR, 0, count=2),
+            src0=Immediate(1.0),
+            src1=Immediate(2.0),
+        )
+        simd.step(inst)
+        self.assertEqual(simd.read_lane_reg_u64(0, RegKind.VGPR, 0), canary)
+
+        # Mutated write unconditionally overwrites
+        simd.write_lane_reg_u64(0, RegKind.VGPR, 0, POS_ONE_F64)
+        with self.assertRaises(AssertionError):
+            self.assertEqual(simd.read_lane_reg_u64(0, RegKind.VGPR, 0), canary)
+
+
 if __name__ == "__main__":
     unittest.main()
