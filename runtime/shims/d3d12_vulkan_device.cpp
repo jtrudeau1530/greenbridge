@@ -349,7 +349,13 @@ struct DeviceState {
         // views it in the image's own format with the stencil aspect, and returns the value in R, as a T# whose
         // format is 8_UINT reads it from X.
         const bool stencil = (aspects & VK_IMAGE_ASPECT_STENCIL_BIT) && image.format == g::stencil_format;
-        const VkFormat view_format = stencil ? image_format : g::vulkan_view_format(image_format, image.format);
+        // A depth-plane T# (8_24_UNORM or X24_8_32_FLOAT, image_descriptor) is likewise a view in the image's own
+        // format with the depth aspect: a D24 texture stored as D32 has the D24 code but cannot be viewed as D24.
+        const bool depth_plane = (aspects & VK_IMAGE_ASPECT_DEPTH_BIT) && (aspects & VK_IMAGE_ASPECT_STENCIL_BIT) &&
+                                 (image.format == g::format_from_vulkan(VK_FORMAT_D24_UNORM_S8_UINT) ||
+                                  image.format == g::format_from_vulkan(VK_FORMAT_D32_SFLOAT_S8_UINT));
+        const VkFormat view_format = (stencil || depth_plane) ? image_format
+                                                              : g::vulkan_view_format(image_format, image.format);
         if (view_format == VK_FORMAT_UNDEFINED) {
             log_once("no Vulkan view format for the GFX10 format of a view:", int(image.format));
             return false;
@@ -943,10 +949,23 @@ bool image_descriptor(const Resource& resource, const TextureView& view, leonida
                              (resource.aspects() & VK_IMAGE_ASPECT_DEPTH_BIT);
     if (view.format != DXGI_FORMAT_UNKNOWN && !stencil && !depth_plane)
         named = vulkan_format(view.format, false).format;
+    if (depth_plane) {
+        // The T# describes the texture as the application created it, which is what the console's own descriptor
+        // says: 8_24_UNORM for a D24 texture even where the layer stores it as D32_SFLOAT_S8_UINT (no D24 on the
+        // GPU). The view itself (bind_image) is of the image as stored. The view's family must be the texture's.
+        const bool d24_view = view.format == DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+        const bool d24_texture = desc.Format == DXGI_FORMAT_R24G8_TYPELESS || desc.Format == DXGI_FORMAT_D24_UNORM_S8_UINT;
+        const bool d32_texture = desc.Format == DXGI_FORMAT_R32G8X24_TYPELESS || desc.Format == DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
+        if (d24_view ? !d24_texture : !d32_texture) {
+            log_once("a depth-plane view of a texture of another depth format:", int(view.format));
+            return false;
+        }
+        named = d24_view ? VK_FORMAT_D24_UNORM_S8_UINT : VK_FORMAT_D32_SFLOAT_S8_UINT;
+    }
     const std::uint32_t code = stencil ? g::stencil_format : g::format_from_vulkan(named);
-    const VkFormat view_format = stencil ? resource.format()
-                                 : code  ? g::vulkan_view_format(resource.format(), code)
-                                         : VK_FORMAT_UNDEFINED;
+    const VkFormat view_format = (stencil || depth_plane) ? resource.format()
+                                 : code                   ? g::vulkan_view_format(resource.format(), code)
+                                                          : VK_FORMAT_UNDEFINED;
     if (view_format == VK_FORMAT_UNDEFINED) {
         log_once("view format not supported for this texture:", int(view.format));
         return false;

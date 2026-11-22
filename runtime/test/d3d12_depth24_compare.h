@@ -8,6 +8,7 @@
 #pragma once
 #include "d3d12_copy_compare.h"
 #include "../src/depth24.h"
+#include "../src/gfx10_descriptors.h"
 
 #include <cmath>
 
@@ -109,8 +110,8 @@ inline void run_depth24_clears(Run& run, ID3D12Device* host, const std::vector<f
     run.device->CreateDepthStencilView(wide_tex.p, &dsv, handle(whole));
 
     // Shader-resource views of a typeless D24 texture: R24_UNORM_X8 reads the depth plane, X24_TYPELESS_G8_UINT the
-    // stencil plane. The layer writes a descriptor into the slot (the host's is opaque and no shader runs here), so
-    // all that can be reported is whether it wrote one.
+    // stencil plane. The layer writes a T# into the slot (the host's is opaque and no shader runs here), so what can be
+    // checked is that it is the one the console's own descriptor would be.
     if (run.ours && format == DXGI_FORMAT_R24G8_TYPELESS) {
         Ptr<ID3D12DescriptorHeap> srv_heap;
         const D3D12_DESCRIPTOR_HEAP_DESC srv_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 2, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
@@ -131,15 +132,18 @@ inline void run_depth24_clears(Run& run, ID3D12Device* host, const std::vector<f
             srv.Texture2D.PlaneSlice = plane;
             const D3D12_CPU_DESCRIPTOR_HANDLE slot{base + size_t(plane) * srv_step};
             run.device->CreateShaderResourceView(tex[0].p, &srv, slot);
-            const auto* words = reinterpret_cast<const std::uint32_t*>(slot.ptr);
-            bool empty = true;
-            for (int i = 0; i < 8; ++i) empty = empty && words[i] == 0;
-            // Known gap, not a failure: the layer has no T# format for these two views of a typeless depth texture
-            // (image_descriptor: R24_UNORM_X8_TYPELESS has no Vulkan mapping, and views of the stencil plane are
-            // refused), so the slot stays empty. Printed so that a change shows up.
-            std::printf("depth24 typeless: the shader-resource view of %s %s\n",
-                        plane ? "X24_TYPELESS_G8_UINT" : "R24_UNORM_X8_TYPELESS",
-                        empty ? "is not supported by the layer (empty descriptor, known gap)" : "wrote a descriptor");
+            leonida::gfx10::ImageWords image_words{};
+            std::memcpy(image_words.data(), reinterpret_cast<const void*>(slot.ptr), sizeof(image_words));
+            leonida::gfx10::Image decoded{};
+            // The T# is the texture as the application made it (8_24_UNORM for D24, the console's format) whether or not
+            // the GPU stores it as D24; the stencil plane is 8_UINT.
+            const std::uint32_t want = plane ? leonida::gfx10::stencil_format
+                                             : leonida::gfx10::format_from_vulkan(VK_FORMAT_D24_UNORM_S8_UINT);
+            if (!leonida::gfx10::is_image(image_words) || !leonida::gfx10::decode(image_words, decoded) || decoded.format != want || !want) {
+                out.error = std::string("the shader-resource view of ") + (plane ? "X24_TYPELESS_G8_UINT" : "R24_UNORM_X8_TYPELESS") +
+                            " did not write the expected T#";
+                return;
+            }
         }
     }
 

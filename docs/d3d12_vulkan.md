@@ -378,7 +378,8 @@ Known gaps in the descriptor path: buffer shader-resource and unordered-access v
 (the V# a shader would load for them; the structure is in `gfx10_descriptors.h`, the views are not written);
 views of 1D, 3D and multisampled textures; depth-plane views (`R24_UNORM_X8_TYPELESS`,
 `R32_FLOAT_X8X24_TYPELESS`) are a T# of the texture's depth format (8_24_UNORM, X24_8_32_FLOAT) through the
-depth aspect, and stencil-plane views (`PlaneSlice` 1, as
+depth aspect (the format the application created, so 8_24_UNORM for a D24 texture even where the layer stores it as
+`D32_SFLOAT_S8_UINT`; the view is of the stored image), and stencil-plane views (`PlaneSlice` 1, as
 `X24_TYPELESS_G8_UINT` or `X32_TYPELESS_G8X24_UINT`) are an 8_UINT T# that set 0 shows through the stencil
 aspect, in its float-typed sampled arrays like other UINT views; descriptors the game writes itself, which need
 the execute-time scan of section 3.4 (only descriptors made through the device are registered); static samplers
@@ -492,11 +493,11 @@ and any validation error fails them.
     planes read back. The layer is checked against the reference (`depth24_quantize`), and against the host byte for byte
     where the host agrees with it; NVIDIA's host rounds some ties the other way (478 of 5215 values) and is logged as a host quirk, not a failure. It also clears an
     `R24G8_TYPELESS` texture through a typed D24 DSV (200 values, compared the same way), and reports whether
-    shader-resource views of both planes (`R24_UNORM_X8_TYPELESS`, `X24_TYPELESS_G8_UINT`) write a descriptor. They do
-    not: the layer has no T# format for the depth view (no Vulkan mapping for `R24_UNORM_X8_TYPELESS`) and refuses
-    views of the stencil plane, with any depth format, so such an SRV is an empty slot. That is a known gap, not
-    fixed here; an SRV read is not compared in any case (no shader runs in these tests and the host's descriptor is
-    opaque). It also runs an upload and readback under a `SetPredication` that skips copies, which the
+    shader-resource views of both planes (`R24_UNORM_X8_TYPELESS`, `X24_TYPELESS_G8_UINT`) write the T# the console's
+    descriptor would be: 8_24_UNORM for the depth plane, even where the layer stores the texture as
+    `D32_SFLOAT_S8_UINT` (the view is then of the stored image, in its own format with the depth aspect), and 8_UINT
+    for the stencil plane. An SRV read is not compared with the host (no shader runs in these tests and the host's
+    descriptor is opaque). It also runs an upload and readback under a `SetPredication` that skips copies, which the
     layer must still convert and which is compared with the host's unpredicated run. `depth24_convert_test` runs the
     compute pass on the GPU for all 16777216 words (to float, and back), 16777216 float bit patterns against
     `depth24_quantize` (with a 1 MiB range so the copy splits into 65 dispatches), and a pitched copy at an offset
