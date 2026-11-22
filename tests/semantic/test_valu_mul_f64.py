@@ -637,6 +637,87 @@ class SIMDWavefront:
         return self.load_vgpr_pair_wave(dst_reg)
 
 
+# ==============================================================================
+# Condition Codes, Status Flags, and Carry/Borrow Isolation for v_mul_f64
+# ==============================================================================
+
+@dataclass
+class StatusFlags:
+    invalid_op: bool = False
+    overflow: bool = False
+    underflow: bool = False
+    inexact: bool = False
+    zero: bool = False
+    negative: bool = False
+    nan: bool = False
+
+
+def compute_mul_f64_status_flags(src0: int, src1: int, result: int) -> StatusFlags:
+    flags = StatusFlags()
+    s0 = src0 & MASK64
+    s1 = src1 & MASK64
+    res = result & MASK64
+
+    # Invalid operation: SNaN operand or 0 * Inf
+    if is_f64_snan(s0) or is_f64_snan(s1):
+        flags.invalid_op = True
+    elif (is_f64_zero(s0) and is_f64_inf(s1)) or (is_f64_inf(s0) and is_f64_zero(s1)):
+        flags.invalid_op = True
+
+    if is_f64_nan(res):
+        flags.nan = True
+    else:
+        flags.negative = bool(f64_sign(res))
+        if is_f64_zero(res):
+            flags.zero = True
+            if not is_f64_zero(s0) and not is_f64_zero(s1) and not is_f64_inf(s0) and not is_f64_inf(s1):
+                flags.underflow = True
+        else:
+            # Check overflow: finite * finite -> inf
+            if not is_f64_inf(s0) and not is_f64_inf(s1) and is_f64_inf(res):
+                flags.overflow = True
+                flags.inexact = True
+            # Check underflow: finite non-zero * finite non-zero -> subnormal
+            elif not is_f64_zero(s0) and not is_f64_zero(s1) and is_f64_subnormal(res):
+                flags.underflow = True
+
+    return flags
+
+
+def ref_cmp_f64(op: str, src0: int, src1: int) -> bool:
+    """Evaluate double-precision IEEE-754 comparison condition codes."""
+    if op in ("u", "unordered"):
+        return is_f64_nan(src0) or is_f64_nan(src1)
+
+    if is_f64_nan(src0) or is_f64_nan(src1):
+        return op in ("neq", "ne", "!=")
+
+    v0 = u64_to_f64(src0)
+    v1 = u64_to_f64(src1)
+    if op in ("eq", "=="):
+        return v0 == v1
+    elif op in ("ne", "neq", "!="):
+        return v0 != v1
+    elif op in ("lt", "<"):
+        return v0 < v1
+    elif op in ("le", "<="):
+        return v0 <= v1
+    elif op in ("gt", ">"):
+        return v0 > v1
+    elif op in ("ge", ">="):
+        return v0 >= v1
+    raise ValueError(f"Unknown comparison operator: {op}")
+
+
+def generate_condition_mask_f64(op: str, src0_lanes: list[int], src1_lanes: list[int]) -> int:
+    """Generate a 32-bit or 64-bit condition mask (VCC) from per-lane comparisons."""
+    mask = 0
+    for lane, (s0, s1) in enumerate(zip(src0_lanes, src1_lanes)):
+        if ref_cmp_f64(op, s0, s1):
+            mask |= (1 << lane)
+    return mask
+
+
 class TestVMulF64ReferenceOracle(unittest.TestCase):
     """Test suite for reference mathematical oracle and architectural model."""
 
@@ -1063,6 +1144,99 @@ class TestRegisterAliasing(unittest.TestCase):
             interp.execute_asm("v_mul_f64 v[0:1], v[0:1], v[2:3]")
 
         self.assertEqual(u64_to_f64(interp.vgpr.get_vgpr_pair(0)), 32.0)
+
+
+class TestConditionCodesAndStatusFlags(unittest.TestCase):
+    """Test suite for condition codes, status flags, and carry/borrow isolation."""
+
+    def test_status_flags_invalid_operation(self) -> None:
+        # 0.0 * Inf
+        res = ref_mul_f64(F64_POS_ZERO, F64_POS_INF)
+        flags = compute_mul_f64_status_flags(F64_POS_ZERO, F64_POS_INF, res)
+        self.assertTrue(flags.invalid_op)
+        self.assertTrue(flags.nan)
+
+        # SNaN * 2.0 (SNaN has quiet bit = 0)
+        snan = (F64_POS_INF | 0x0001000000000000) & ~F64_QUIET_BIT
+        res_snan = ref_mul_f64(snan, F64_TWO)
+        flags_snan = compute_mul_f64_status_flags(snan, F64_TWO, res_snan)
+        self.assertTrue(flags_snan.invalid_op)
+        self.assertTrue(flags_snan.nan)
+
+    def test_status_flags_overflow(self) -> None:
+        # (1e200) * (1e200) overflows binary64
+        val = f64_to_u64(1e200)
+        res = ref_mul_f64(val, val)
+        flags = compute_mul_f64_status_flags(val, val, res)
+        self.assertTrue(flags.overflow)
+        self.assertTrue(flags.inexact)
+        self.assertEqual(res, F64_POS_INF)
+
+    def test_status_flags_underflow(self) -> None:
+        # (1e-200) * (1e-200) underflows to 0.0
+        val = f64_to_u64(1e-200)
+        res = ref_mul_f64(val, val)
+        flags = compute_mul_f64_status_flags(val, val, res)
+        self.assertTrue(flags.underflow)
+        self.assertTrue(flags.zero)
+
+    def test_status_flags_zero_and_negative(self) -> None:
+        # -2.0 * 3.0 = -6.0 (negative, non-zero)
+        v0 = f64_to_u64(-2.0)
+        v1 = f64_to_u64(3.0)
+        r1 = ref_mul_f64(v0, v1)
+        flags1 = compute_mul_f64_status_flags(v0, v1, r1)
+        self.assertTrue(flags1.negative)
+        self.assertFalse(flags1.zero)
+
+        # -0.0 * 3.0 = -0.0 (negative zero)
+        r2 = ref_mul_f64(F64_NEG_ZERO, v1)
+        flags2 = compute_mul_f64_status_flags(F64_NEG_ZERO, v1, r2)
+        self.assertTrue(flags2.negative)
+        self.assertTrue(flags2.zero)
+
+    def test_vcc_and_scc_preserved(self) -> None:
+        # Floating point v_mul_f64 does not generate carry/borrow and never writes VCC or SCC
+        interp = ScalarInterpreter()
+        interp.vcc = 0x12345678_9ABCDEF0
+        interp.scc = 1
+        interp.vgpr.set_vgpr_pair(2, f64_to_u64(4.0))
+        interp.vgpr.set_vgpr_pair(4, f64_to_u64(5.0))
+
+        interp.execute_asm("v_mul_f64 v[0:1], v[2:3], v[4:5]")
+        self.assertEqual(interp.vcc, 0x12345678_9ABCDEF0)
+        self.assertEqual(interp.scc, 1)
+
+        sim = SIMDWavefront(wave_size=32)
+        sim.vcc = 0xCAFEBABE
+        sim.store_vgpr_pair_wave(2, [f64_to_u64(2.0)] * 32)
+        sim.store_vgpr_pair_wave(4, [f64_to_u64(3.0)] * 32)
+        sim.step_v_mul_f64(0, 2, 4)
+        self.assertEqual(sim.vcc, 0xCAFEBABE)
+
+    def test_condition_code_generation(self) -> None:
+        # Generate condition codes from comparisons on multiplication results
+        v_zero = [F64_POS_ZERO] * 4
+        # Four lanes: products will be [-4.0, 0.0, 4.0, NaN]
+        s0 = [f64_to_u64(-2.0), f64_to_u64(0.0), f64_to_u64(2.0), F64_POS_ZERO]
+        s1 = [f64_to_u64(2.0), f64_to_u64(5.0), f64_to_u64(2.0), F64_POS_INF]
+        prods = [ref_mul_f64(a, b) for a, b in zip(s0, s1)]
+
+        # Compare < 0: only lane 0 (-4.0 < 0) -> bit 0
+        mask_lt = generate_condition_mask_f64("<", prods, v_zero)
+        self.assertEqual(mask_lt, 0b0001)
+
+        # Compare == 0: only lane 1 (0.0 == 0) -> bit 1
+        mask_eq = generate_condition_mask_f64("==", prods, v_zero)
+        self.assertEqual(mask_eq, 0b0010)
+
+        # Compare > 0: only lane 2 (4.0 > 0) -> bit 2
+        mask_gt = generate_condition_mask_f64(">", prods, v_zero)
+        self.assertEqual(mask_gt, 0b0100)
+
+        # Compare unordered: only lane 3 (NaN) -> bit 3
+        mask_u = generate_condition_mask_f64("u", prods, v_zero)
+        self.assertEqual(mask_u, 0b1000)
 
 
 if __name__ == "__main__":
