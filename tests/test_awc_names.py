@@ -249,6 +249,17 @@ class TestCli(unittest.TestCase):
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             A.main([ROOT])
 
+    def test_malformed_banks_json(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            words = write(os.path.join(tmp, "words.json"), json.dumps(["x"]))
+            for doc in ([1], [["Path"]]):
+                banks = write(os.path.join(tmp, "banks.json"), json.dumps(doc))
+                err = io.StringIO()
+                with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+                    self.assertEqual(A.main(["--words", words, banks]), 2)
+                self.assertEqual(err.getvalue().count("\n"), 1, err.getvalue())
+                self.assertIn("awc_names: error:", err.getvalue())
+
     def test_missing_input(self):
         with contextlib.redirect_stderr(io.StringIO()):
             self.assertEqual(A.main(["/nonexistent", "--words", "/nonexistent.txt"]), 2)

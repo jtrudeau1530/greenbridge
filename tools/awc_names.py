@@ -116,8 +116,12 @@ def load_banks(source: str) -> dict:
                 grouped[label].append(int(row["stream"], 16) & M29)
             return dict(grouped)
         banks = doc.get("Banks", doc) if isinstance(doc, dict) else doc
+        if not isinstance(banks, list):
+            raise ValueError("expected a list of banks")
         out = {}
         for bank in banks:
+            if not isinstance(bank, dict):
+                raise ValueError(f"expected each bank to be an object, got {type(bank).__name__}")
             out[bank["Path"]] = [int(s["Id"], 16) & M29 for s in bank.get("Streams") or []]
         return out
     if os.path.isfile(source):
