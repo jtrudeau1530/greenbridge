@@ -12,6 +12,7 @@ the capabilities, which binding and component type each fetch reads, and, with a
 picks the branch, the branch taken for all 512 FORMAT values with a hit and with a miss.
 runtime/test/shaders/cs_imgload.asm checks the result on a GPU (vk_store_test load).
 """
+import itertools
 import os
 import re
 import shutil
@@ -253,15 +254,30 @@ class LoadOnlyShaders(unittest.TestCase):
 
 
 class TypedGatherShaders(unittest.TestCase):
-    def test_2d_sample_lz_uses_matching_typed_view_at_level_zero(self):
-        for dst, modifier in (("v[0:3]", ""), ("v[0:1]", " d16")):
-            with self.subTest(modifier=modifier):
-                m = Module(translate([f"image_sample_lz {dst}, v[4:5], s[0:7], s[8:11] "
+    def test_2d_lod_samples_use_matching_typed_views(self):
+        instructions = (("image_sample_lz", "v[4:5]"), ("image_sample_l", "v[4:6]"))
+        destinations = (("v[0:3]", ""), ("v[0:1]", " d16"))
+        for (name, addr), (dst, modifier) in itertools.product(instructions, destinations):
+            with self.subTest(name=name, modifier=modifier):
+                m = Module(translate([f"{name} {dst}, {addr}, s[0:7], s[8:11] "
                                       f"dmask:0xf dim:SQ_RSRC_IMG_2D{modifier}"]))
                 samples = [args for _, op, args in m.order if op == "OpImageSampleExplicitLod"]
                 self.assertEqual({args[0] for args in samples}, {"%v4float", "%v4uint_st", "%v4int_st"})
+                # T# word 1 for R32_UINT, R32_SINT and R32_FLOAT, respectively.
+                for fmt, expected in ((20, "uint"), (21, "sint"), (22, "float")):
+                    self.assertEqual(m.branch(fmt << 20, 5), expected)
+                    self.assertEqual(m.branch(fmt << 20, 0), "float")
                 for ty, sampled, _, mask, lod in samples:
-                    self.assertEqual((mask, lod), ("Lod", "%f0"))
+                    self.assertEqual(mask, "Lod")
+                    if name == "image_sample_lz":
+                        self.assertEqual(lod, "%f0")
+                    else:
+                        op, cast = m.defs[lod]
+                        self.assertEqual(op, "OpBitcast")
+                        op, load = m.defs[cast[1]]
+                        self.assertEqual(op, "OpLoad")
+                        op, ptr = m.defs[load[1]]
+                        self.assertEqual((op, ptr[1], m.value(ptr[2], 0, 0)), ("OpAccessChain", "%vgpr", 6))
                     op, pair = m.defs[sampled]
                     self.assertEqual(op, "OpSampledImage")
                     _, image = m.defs[pair[1]]
