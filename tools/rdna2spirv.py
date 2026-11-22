@@ -5229,6 +5229,24 @@ class Gen:
             self.emit(f"{c} = OpLoad %uint %scc")
             self.emit(f"{r} = OpSelect %uint {self.tmp_bool_nz(c)} {x} {old}")
             self.dst(a[0], r)
+        elif op == "s_cmov_b64":
+            # RDNA2 ISA SOP1: D = SCC ? S0 : D, SCC read and not written (LLVM AMDGPU SOPInstructions.td:
+            # S_CMOV_B64 : SOP1_64 under Uses = [SCC]). Plain 64-bit data only: a lane-mask pair holds one
+            # lane's bit here, so selecting it as data would silently read a bool instead of the wave's mask
+            # (issue #210). Those operands keep failing loudly.
+            if self.is_mask_op(a[1]):
+                raise Unsupported("s_cmov_b64 source")
+            if a[0]["k"] != "sgpr" or a[0].get("n") != 2 or self.holds_lane_mask(a[0]):
+                raise Unsupported("s_cmov_b64 destination")
+            (xlo, xhi) = self.src64_data(a[1], op)
+            # Read both old dwords before any store, so D overlapping S0 stays exact.
+            oldlo, oldhi = self.load_reg("sgpr", a[0]["r"]), self.load_reg("sgpr", a[0]["r"] + 1)
+            c, rlo, rhi = self.tmp(), self.tmp(), self.tmp()
+            self.emit(f"{c} = OpLoad %uint %scc")
+            b = self.tmp_bool_nz(c)
+            self.emit(f"{rlo} = OpSelect %uint {b} {xlo} {oldlo}")
+            self.emit(f"{rhi} = OpSelect %uint {b} {xhi} {oldhi}")
+            self.dst64_data(a[0], rlo, rhi, op)
         elif op.startswith("v_cmp_") and not op.startswith("v_cmp_class") and not op.endswith(("_u64", "_i64")):
             self.compare(op, a, scalar=False, mods=mods)
         elif op.startswith("v_cmpx_") and not op.startswith("v_cmpx_class") and not op.endswith(("_u64", "_i64")):

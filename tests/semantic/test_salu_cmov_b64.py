@@ -124,8 +124,11 @@ class DataPairTests(unittest.TestCase):
 
     def test_immediate_and_null_sources(self):
         old = 0x55667788_11223344
-        for src_asm, src in (("0x12345678_9ABCDEF0", 0x12345678_9ABCDEF0),
-                             ("0", 0), ("-1", MASK64), ("null", 0)):
+        # shader_ir leaves a literal wider than 32 bits as a raw operand, which
+        # src64_data does not accept (the same holds for s_mov_b64); use the
+        # immediate forms the parser actually delivers.
+        for src_asm, src in (("0x12345678", 0x12345678), ("42", 42),
+                             ("0", 0), ("-1", MASK64), ("-2", MASK64 - 1), ("null", 0)):
             for scc in (0, 1):
                 with self.subTest(src=src_asm, scc=scc):
                     want = ref_cmov64(old, src, scc)
@@ -140,8 +143,8 @@ class DataPairTests(unittest.TestCase):
     def test_destination_aliasing(self):
         a64 = 0x55667788_11223344
         b64 = 0xDDEEFF00_99AABBCC
-        # s[3:4] = (s4 << 32) | s3, with s4 = low(a64), s3 = high(b64).
-        overlap_val = ((a64 & MASK32) << 32) | (b64 >> 32)
+        # s[3:4] = (s4 << 32) | s3, with s4 = low(a64), s3 = low(b64).
+        overlap_val = ((a64 & MASK32) << 32) | (b64 & MASK32)
         for source, src_val in (("s[4:5]", a64), ("s[3:4]", overlap_val)):
             for scc in (0, 1):
                 with self.subTest(source=source, scc=scc):
@@ -150,6 +153,22 @@ class DataPairTests(unittest.TestCase):
                     lines += [scc_line(scc), f"s_cmov_b64 s[4:5], {source}"]
                     lines += export_pair_lines(4) + ["v_mov_b32 v2, 0", "v_mov_b32 v3, 0"]
                     words = run_ps(lines)
+                    self.assertEqual(words, [want & MASK32, want >> 32, 0, 0])
+
+    def test_constant_pairs_are_not_mistaken_for_masks(self):
+        # 0 / -1 are EITHER in tools/lane_masks.py (the same bits as data), so
+        # they must not be mistaken for lane masks here.
+        for src_asm, src in (("-1", MASK64), ("0", 0)):
+            for scc in (0, 1):
+                with self.subTest(src=src_asm, scc=scc):
+                    want = ref_cmov64(0x11223344_55667788, src, scc)
+                    words = run_ps(
+                        load_pair_lines(2, 0x11223344_55667788)
+                        + [f"s_mov_b64 s[4:5], {src_asm}", scc_line(scc),
+                           "s_cmov_b64 s[2:3], s[4:5]"]
+                        + export_pair_lines(2)
+                        + ["v_mov_b32 v2, 0", "v_mov_b32 v3, 0"]
+                    )
                     self.assertEqual(words, [want & MASK32, want >> 32, 0, 0])
 
     def test_scc_is_not_written(self):
