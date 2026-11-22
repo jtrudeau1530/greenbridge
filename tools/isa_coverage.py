@@ -346,6 +346,8 @@ def main(argv=None):
         ap.error(f"--isa {a.isa}: {e.strerror or e}")
     except ET.ParseError as e:
         ap.error(f"--isa {a.isa}: invalid XML ({e})")
+    if not isa["instructions"]:
+        ap.error(f"--isa {a.isa}: no instructions (not the AMD ISA XML spec?)")
     if "RDNA 2" not in isa["architecture"]:
         print(f"warning: {a.isa} describes {isa['architecture']!r}, not AMD RDNA 2", file=sys.stderr)
     try:

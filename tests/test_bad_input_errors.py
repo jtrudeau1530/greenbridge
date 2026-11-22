@@ -112,6 +112,19 @@ class BadInputTest(unittest.TestCase):
                 f.write("nope")
             self.assert_error_exit_2(run("isa_coverage.py", "--isa", bad), bad)
 
+    def test_isa_coverage_isa_xml_with_no_instructions(self):
+        """Well-formed XML that is not the ISA spec: zero instructions is one error line, not a ZeroDivisionError."""
+        with tempfile.TemporaryDirectory() as tmp:
+            for i, content in enumerate(("<a/>", "<isa><ISA/></isa>",
+                                         "<isa><Document><SchemaVersion>1</SchemaVersion></Document></isa>")):
+                with self.subTest(content=content):
+                    xml = os.path.join(tmp, f"no-instructions-{i}.xml")
+                    with open(xml, "w", encoding="utf-8", newline="\n") as f:
+                        f.write(content)
+                    p = run("isa_coverage.py", "--isa", xml)
+                    self.assert_error_exit_2(p, xml)
+                    self.assertIn("no instructions", p.stderr.lower())
+
     def test_isa_coverage_translator_file_missing(self):
         with tempfile.TemporaryDirectory() as tmp:
             isa = os.path.join(tmp, "isa.xml")
