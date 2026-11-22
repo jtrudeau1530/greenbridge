@@ -4,12 +4,16 @@ from the RDNA ISA rules in its docstring. No GPU, no llvm-mc, no game files.
     python -I tests/test_crosslane_fuzz.py
 """
 import argparse
+import contextlib
+import io
 import os
 import random
 import re
 import subprocess
 import sys
+import tempfile
 import unittest
+from unittest import mock
 
 TOOLS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tools")
 TOOL = os.path.join(TOOLS, "crosslane_fuzz.py")
@@ -281,6 +285,77 @@ class HardwareOracle(unittest.TestCase):
         self.assertEqual(sum(st["match"] for st in stats.values()), 12)
         for st in stats.values():
             self.assertEqual((st["mismatch"], st["hyp_only"], st["rejected"]), (0, 0, 0))
+
+class HarnessErrors(unittest.TestCase):
+    """A program the GPU harness hangs or crashes on is one reported failure, not the end of the run."""
+
+    def test_timeout_is_a_harness_error(self):
+        prog = X.make_program(1, 32, 4)
+        with tempfile.TemporaryDirectory() as work, \
+                mock.patch.object(X.subprocess, "run", side_effect=subprocess.TimeoutExpired(["x"], 60)):
+            with self.assertRaises(X.HarnessError) as ctx:
+                X.run_gpu("vk_compute_test", "p.spv", prog, work, False)
+        self.assertIn("timed out after 60 s", str(ctx.exception))
+
+    def test_missing_dump_is_a_harness_error_with_the_exit_code(self):
+        prog = X.make_program(1, 32, 4)
+        done = subprocess.CompletedProcess(["x"], 3, stdout="", stderr="device lost\n")
+        with tempfile.TemporaryDirectory() as work, mock.patch.object(X.subprocess, "run", return_value=done):
+            with self.assertRaises(X.HarnessError) as ctx:
+                X.run_gpu("vk_compute_test", "p.spv", prog, work, False)
+        self.assertIn("no dump (exit 3): device lost", str(ctx.exception))
+
+    def _main(self, run_gpu, argv):
+        """main() with the assembler, translator and GPU replaced: every program 'translates'."""
+        def translate(work, emulate):
+            spdir = os.path.join(work, "spirv_emu" if emulate else "spirv_nat")
+            os.makedirs(spdir, exist_ok=True)
+            for name in names:
+                open(os.path.join(spdir, name + ".spv"), "wb").close()
+            return spdir, ""
+
+        names = []
+        out = io.StringIO()
+        with mock.patch.object(X, "assemble", side_effect=lambda mc, p, *a: names.append(p.name)), \
+                mock.patch.object(X, "translate", side_effect=translate), \
+                mock.patch.object(X, "run_gpu", side_effect=run_gpu), \
+                mock.patch.object(sys, "argv", ["crosslane_fuzz.py"] + argv), \
+                contextlib.redirect_stdout(out):
+            code = X.main()
+        return code, out.getvalue()
+
+    @staticmethod
+    def _expected_words(prog):
+        exp, _ = prog.expected()
+        words = [0] * (prog.group * len(X.OUT_REGS))
+        for (tid, j), v in exp.items():
+            words[tid * len(X.OUT_REGS) + j] = v
+        return words
+
+    def test_run_goes_on_after_a_hang_and_exits_2(self):
+        calls = []
+
+        def run_gpu(exe, spv, prog, work, emulate):
+            calls.append(prog.name)
+            if len(calls) == 2:
+                raise X.HarnessError("vk_compute_test timed out after 60 s")
+            return self._expected_words(prog)
+
+        with tempfile.TemporaryDirectory() as keep:
+            code, out = self._main(run_gpu, ["--programs", "4", "--wave", "32", "--modes", "native",
+                                             "--no-maskdata", "--keep", keep])
+            kept = os.listdir(keep)
+        self.assertEqual(len(calls), 4)
+        self.assertEqual(code, 2)
+        self.assertIn(f"{calls[1]} [native] harness error: vk_compute_test timed out after 60 s", out)
+        self.assertIn("programs 4, match 3, mismatch 0, hyp_only 0, rejected 0, harness_errors 1", out)
+        self.assertEqual(kept, [f"{calls[1]}_native.asm"])
+
+    def test_clean_run_still_exits_0(self):
+        code, out = self._main(lambda exe, spv, prog, work, emulate: self._expected_words(prog),
+                               ["--programs", "3", "--wave", "32", "--modes", "native", "--no-maskdata"])
+        self.assertEqual(code, 0)
+        self.assertIn("match 3, mismatch 0, hyp_only 0, rejected 0, harness_errors 0", out)
 
 
 if __name__ == "__main__":
