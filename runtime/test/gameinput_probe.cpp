@@ -27,8 +27,10 @@ std::vector<IGameInputDevice*> g_devices;
 
 void CALLBACK on_device(GameInputCallbackToken, void*, IGameInputDevice* device, uint64_t, uint32_t current, uint32_t previous) {
     const GameInputDeviceInfo* i = device->GetDeviceInfo();
-    std::printf("\n%s %s (%04x:%04x) motors=0x%x\n", (current & GameInputDeviceConnected) ? "connected   " : "disconnected",
-                i->displayName ? i->displayName->data : "?", i->vendorId, i->productId, i->supportedRumbleMotors);
+    std::printf("\n%s %s (%04x:%04x) motors=0x%x forcefeedback=%u haptic=%u\n",
+                (current & GameInputDeviceConnected) ? "connected   " : "disconnected",
+                i->displayName ? i->displayName->data : "?", i->vendorId, i->productId, i->supportedRumbleMotors,
+                i->forceFeedbackMotorCount, i->hapticFeedbackMotorCount);
     // Raw HID (RT-175): the report tables read from the pad's HID report descriptor, or why there are none.
     if (current & GameInputDeviceConnected) {
         if (!(current & GameInputDeviceRawIoEnabled)) {

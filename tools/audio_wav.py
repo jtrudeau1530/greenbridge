@@ -128,8 +128,11 @@ def ogg_output_samples(path: str) -> int:
 
 def collect(src: str):
     """([(input, relative output stem)], number of .ogg/.opus files that are not Ogg Opus)."""
+    def scan_failed(exc: OSError) -> None:
+        raise exc
+
     files, not_opus = [], 0
-    for root, dirs, names in os.walk(src):
+    for root, dirs, names in os.walk(src, onerror=scan_failed):
         dirs.sort()
         for name in sorted(names):
             if not name.lower().endswith(EXTS):
@@ -447,7 +450,11 @@ def main(argv=None) -> int:
         not_opus = 0
         default_out = os.path.dirname(src)
     elif os.path.isdir(src):
-        items, not_opus = collect(src)
+        try:
+            items, not_opus = collect(src)
+        except OSError as exc:
+            error(f"cannot scan {exc.filename or src}: {exc.strerror or exc}")
+            return 2
         default_out = os.path.join(src, "wav")
     else:
         error(f"source not found: {a.src}")

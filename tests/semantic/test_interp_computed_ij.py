@@ -130,6 +130,42 @@ class ComputedIJ(unittest.TestCase):
         self.assertNotIn("PerVertexKHR", spv)
         self.assertNotIn("%bary", spv)
 
+    def test_only_i_overwritten_preserves_hardware_j(self):
+        """Overwriting only v0 promotes the pair to computed I/J; untouched v1 must still load BaryCoordKHR.z."""
+        _, w = run(["v_mov_b32_e32 v0, 0",
+                    "v_interp_p1_f32_e32 v2, v0, attr0.x", "v_interp_p2_f32_e32 v2, v1, attr0.x",
+                    "v_interp_p1_f32_e32 v3, v0, attr0.y", "v_interp_p2_f32_e32 v3, v1, attr0.y",
+                    "exp mrt0 v2, v3, v2, v3 done vm", "s_endpgm"])
+        self.assertEqual(floats(w[:2]), (0.0, 2 * J))
+
+    def test_only_j_overwritten_preserves_hardware_i(self):
+        """Overwriting only v1 promotes the pair to computed I/J; untouched v0 must still load BaryCoordKHR.y."""
+        _, w = run(["v_mov_b32_e32 v1, 0",
+                    "v_interp_p1_f32_e32 v2, v0, attr0.x", "v_interp_p2_f32_e32 v2, v1, attr0.x",
+                    "v_interp_p1_f32_e32 v3, v0, attr0.y", "v_interp_p2_f32_e32 v3, v1, attr0.y",
+                    "exp mrt0 v2, v3, v2, v3 done vm", "s_endpgm"])
+        self.assertEqual(floats(w[:2]), (2 * I, 0.0))
+
+    def test_conditional_overwrite_preserves_hardware_barycentrics_on_untaken_path(self):
+        """When a branch conditionally overwrites v0, the untaken path must still interpolate with hardware (I, J)."""
+        asm = [
+            "s_cmp_eq_u32 s0, 1    ; encoding: [0,0,0,0]",
+            "s_cbranch_scc0 1    ; encoding: [0,0,0,0]",
+            "v_mov_b32_e32 v0, 0    ; encoding: [0,0,0,0]",
+            "v_interp_p1_f32_e32 v2, v0, attr0.x    ; encoding: [0,0,0,0]",
+            "v_interp_p2_f32_e32 v2, v1, attr0.x    ; encoding: [0,0,0,0]",
+            "v_interp_p1_f32_e32 v3, v0, attr0.y    ; encoding: [0,0,0,0]",
+            "v_interp_p2_f32_e32 v3, v1, attr0.y    ; encoding: [0,0,0,0]",
+            "exp mrt0 v2, v3, v2, v3 done vm    ; encoding: [0,0,0,0,0,0,0,0]",
+            "s_endpgm    ; encoding: [0,0,0,0]",
+        ]
+        spv = support.translate_lines("ps_ij_cond", asm)
+        inputs = support.varyings(spv, {0: ATTR0}, BARY)
+        w_untaken = support.mrt0_words(spv, inputs=inputs, push_constants=[0] * 36)
+        w_taken = support.mrt0_words(spv, inputs=inputs, push_constants=[1] + [0] * 35)
+        self.assertEqual(floats(w_untaken[:2]), (2 * I, 2 * J))
+        self.assertEqual(floats(w_taken[:2]), (0.0, 2 * J))
+
 
 class ComputedIJRefusals(unittest.TestCase):
     def refuse(self, asm, message):

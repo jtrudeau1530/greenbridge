@@ -85,6 +85,21 @@ class AuditShader4RegsTests(unittest.TestCase):
             for limit, count in ((None, 2), (0, 0), (1, 1)):
                 self.assertEqual(audit_mod.audit(disasm, limit=limit)["cs"]["count"], count)
 
+    def test_directory_named_like_shader_is_skipped_by_limit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            disasm = os.path.join(tmp, "disasm")
+            os.mkdir(disasm)
+            # A directory that sorts before the real shader must not consume the --limit slot.
+            os.mkdir(os.path.join(disasm, "cs_a.s"))
+            with open(os.path.join(disasm, "cs_b.s"), "w", encoding="utf-8") as f:
+                f.write("\ts_endpgm\n")
+            with open(os.path.join(disasm, "index.json"), "w", encoding="utf-8") as f:
+                json.dump({"cs_b": {"stage": "cs"}}, f)
+
+            # Without scanning regular files only, the directory cs_a.s would be parsed,
+            # raising IsADirectoryError or consuming the sole limit slot.
+            self.assertEqual(audit_mod.audit(disasm, limit=1)["cs"]["count"], 1)
+
     def test_bad_input_and_output_paths_are_one_error_line(self):
         with tempfile.TemporaryDirectory() as tmp:
             disasm = os.path.join(tmp, "disasm")

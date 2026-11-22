@@ -180,6 +180,18 @@ class FspxStage(unittest.TestCase):
         self.assertTrue(os.path.isfile(os.path.join(self.spirv, "fspx_build.json")))
         self.assertEqual(self.run_step(), [])
 
+    def test_missing_cached_module_is_rebuilt(self) -> None:
+        self.translations = {"upscaler_00": ("c" * 64, "s" * 64, b"synthetic module")}
+        self.assertEqual(self.run_step(), ["fspx_unpack.py", "rdna2spirv.py"])
+        self.assertEqual(self.run_step(), [])
+        module = os.path.join(self.spirv, "upscaler_00.spv")
+        os.remove(module)
+
+        self.assertEqual(self.run_step(), ["fspx_unpack.py", "rdna2spirv.py"])
+        with open(module, "rb") as f:
+            self.assertEqual(f.read(), b"synthetic module")
+        self.assertEqual(self.run_step(), [])
+
     def test_no_dll_no_step(self):
         os.remove(self.dll)
         self.assertEqual(self.run_step(), [])
@@ -269,6 +281,9 @@ class ShadersStageWithTheDll(unittest.TestCase):
                         f.write('[{"name": "shader"}]')
                 elif tool == "shader_disasm.py":
                     os.makedirs(os.path.join(dxbc, "disasm"), exist_ok=True)
+                    # make_game checks that every unpacked shader got a non-empty listing
+                    with open(os.path.join(dxbc, "disasm", "shader.s"), "w") as f:
+                        f.write("s_endpgm\n")
                 elif tool == "rdna2spirv.py":
                     touch(args[args.index("--out") + 1], "index.json")
                     with open(os.path.join(args[args.index("--out") + 1], "index.json"), "w") as f:

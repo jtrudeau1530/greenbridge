@@ -657,18 +657,49 @@ def unpacked_shader_stems(dxbc: str) -> set[str] | None:
     return unpacked if unpacked and unpacked <= carved else None
 
 
-def disassembly_matches(dxbc: str, signature: str) -> bool:
-    if read_shader_setting(os.path.join(dxbc, "disasm.done")) != signature:
-        return False
-    names = unpacked_shader_stems(dxbc)
-    if names is None:
-        return False
+def disassembly_listings(dxbc: str) -> set[str] | None:
     try:
         with os.scandir(os.path.join(dxbc, "disasm")) as entries:
-            return all(entry.name[:-2] in names for entry in entries
-                       if entry.name.endswith(".s") and entry.is_file())
+            listings = set()
+            for entry in entries:
+                if not entry.name.endswith(".s"):
+                    continue
+                if entry.is_symlink():
+                    return None
+                if entry.is_file() and entry.stat().st_size > 0:
+                    listings.add(entry.name[:-2])
+            return listings
     except OSError:
-        return False
+        return None
+
+
+def disassembly_status(dxbc: str, signature: str) -> tuple[bool, bool, set[str]]:
+    """Report readiness, whether existing listings can be reused, and any repair inventory."""
+    done = read_shader_setting(os.path.join(dxbc, "disasm.done"))
+    marker = done or read_shader_setting(os.path.join(dxbc, "disasm.started"))
+    inactive = (False, False, set())
+    if not marker:
+        return inactive
+    active = unpacked_shader_stems(dxbc)
+    listings = disassembly_listings(dxbc)
+    if active is None or listings is None or not listings <= active:
+        return inactive
+    if marker == signature:
+        # Older completion markers recorded only LLVM. Require a listing for every input.
+        return (listings == active, False, set()) if done else (False, True, set())
+    try:
+        metadata = json.loads(marker)
+    except ValueError:
+        return inactive
+    if not isinstance(metadata, dict) or metadata.get("llvm") != signature:
+        return inactive
+    recorded = metadata.get("listings")
+    if not isinstance(recorded, list) or not recorded or not all(isinstance(name, str) for name in recorded):
+        return inactive
+    expected = set(recorded)
+    if not listings <= expected <= active:
+        return inactive
+    return bool(done) and listings == expected, True, expected
 
 
 def shader_outputs_reusable(work: str, emulate: bool, keep_emulated: bool,
@@ -686,15 +717,15 @@ def shader_outputs_reusable(work: str, emulate: bool, keep_emulated: bool,
             and read_shader_setting(os.path.join(spirv, "translator_flags.txt")) == translator_flags_setting(fallbacks)
             and read_shader_setting(os.path.join(spirv, "translation_sources.sha256")) == translation_sources_digest()
             and os.path.isfile(os.path.join(dxbc, "disasm.done"))
-            and disassembly_matches(dxbc, llvm_mc_signature()))
+            and disassembly_status(dxbc, llvm_mc_signature())[0])
 
 
-def clear_shader_disassembly(work: str, disasm: str) -> None:
-    """Remove generated assembly so a failed decode cannot leave a file from an older run."""
+def prepare_shader_disassembly(work: str, disasm: str, resume: bool) -> None:
+    """Check the output path and remove old listings before starting a new run."""
     expected = os.path.join(os.path.realpath(work), "shaders", "dxbc", "disasm")
     if os.path.normcase(os.path.realpath(disasm)) != os.path.normcase(expected):
         fail(f"The shader disassembly folder must be inside the work folder: {disasm}")
-    if os.path.isdir(disasm):
+    if not resume and os.path.isdir(disasm):
         with os.scandir(disasm) as entries:
             for entry in entries:
                 if entry.name.endswith(".s") and (entry.is_file(follow_symlinks=False) or entry.is_symlink()):
@@ -711,31 +742,50 @@ def shaders(game: str, work: str, jobs: int, emulate: bool = False, keep_emulate
     # or holds many files: a run stopped part-way leaves both. Re-running a stage drops the later stages' proof.
     carved = os.path.join(dxbc, "index.json")             # shader_carve.py, renamed into place at the end
     unpacked = os.path.join(dxbc, "fssm_index.json")      # fssm_unpack.py, the same
-    disassembled = os.path.join(dxbc, "disasm.done")      # records the LLVM command and version after a successful run
+    disassembly_started = os.path.join(dxbc, "disasm.started")
+    disassembled = os.path.join(dxbc, "disasm.done")      # records LLVM and the listings produced
     translated = os.path.join(spirv, "index.json")        # rdna2spirv.py --merge, renamed into place
     shard_plan = os.path.join(spirv, SHARD_PLAN)          # lets translate() keep finished shards; see there
     signature = llvm_mc_signature()
     if not os.path.isfile(carved):
         log("shaders: carving shaders.rpf")
-        drop(translated, shard_plan, disassembled, unpacked)
+        drop(translated, shard_plan, disassembled, disassembly_started, unpacked)
         py("shader_carve.py", src, dxbc)
     if unpacked_shader_stems(dxbc) is None:
         log("shaders: unpacking native code")
-        drop(translated, shard_plan, disassembled)
+        drop(translated, shard_plan, disassembled, disassembly_started)
         py("fssm_unpack.py", dxbc, "--carve-index", carved)
     # rdna2spirv.py finds index.json, the .dxbc files and fssm/ in the parent of the .s files' folder, so the
     # disassembly must sit inside the carve folder: next to it, every stage reads as "?" and is rejected.
     disasm = os.path.join(dxbc, "disasm")
-    if not disassembly_matches(dxbc, signature):
+    complete, resume, expected = disassembly_status(dxbc, signature)
+    if not complete:
         if os.path.isfile(disassembled) or os.path.isfile(translated):
             log("shaders: llvm-mc changed or the saved disassembly could not be verified")
-        log("shaders: disassembling (gfx1013)")
-        drop(translated, shard_plan, disassembled)
-        clear_shader_disassembly(work, disasm)
+        log("shaders: resuming disassembly (gfx1013)" if resume else "shaders: disassembling (gfx1013)")
+        drop(translated, shard_plan)
+        if not resume:
+            drop(disassembly_started, disassembled)
+        prepare_shader_disassembly(work, disasm, resume)
+        if not os.path.isfile(disassembly_started) or os.path.isfile(disassembled):
+            marker = disassembly_started + ".tmp"
+            with open(marker, "w", encoding="utf-8", newline="\n") as f:
+                start = json.dumps({"llvm": signature, "listings": sorted(expected)}) if expected else signature
+                f.write(start + "\n")
+            os.replace(marker, disassembly_started)
+        drop(disassembled)
+        resume_args = ("--skip-existing",) if resume else ()
         py("shader_disasm.py", os.path.join(dxbc, "fssm"), "--unpack-index", unpacked,
-           "--out", disasm, "--mcpu", "gfx1013", "--jobs", jobs)
-        with open(disassembled, "w", encoding="utf-8", newline="\n") as f:
-            f.write(signature + "\n")
+           "--out", disasm, "--mcpu", "gfx1013", "--jobs", jobs, *resume_args)
+        listings = disassembly_listings(dxbc)
+        if not listings or not expected <= listings:
+            fail("Shader disassembly did not restore all expected listings")
+        marker = disassembled + ".tmp"
+        with open(marker, "w", encoding="utf-8", newline="\n") as f:
+            json.dump({"llvm": signature, "listings": sorted(listings)}, f)
+            f.write("\n")
+        os.replace(marker, disassembled)
+        drop(disassembly_started)
     # The translation also depends on the translator's own files, so their digest is kept beside it. A folder without
     # it (from before the file existed), with an unreadable one or with another one is translated again; carving, unpacking and
     # disassembly stay current.
@@ -812,14 +862,23 @@ def fspx_settings(dll: str, mc_signature: str, emulate: bool, fallbacks: tuple[s
                       sort_keys=True)
 
 
+def fspx_cache_complete(spirv: str) -> bool:
+    """Check that the FSPX translation index and its named modules are present."""
+    try:
+        index = json.loads(read_shader_setting(os.path.join(spirv, "index.json")))
+    except ValueError:
+        return False
+    return isinstance(index, dict) and all(os.path.isfile(os.path.join(spirv, name + ".spv")) for name in index)
+
+
 def fspx_shaders(game: str, work: str, mc_signature: str, emulate: bool = False,
                  fallbacks: tuple[str, ...] = ()) -> None:
     """The FidelityFX DLL's compute programs (docs/fspx.md): tools/fspx_unpack.py unpacks and disassembles them into
     <work>/shaders/fspx, rdna2spirv.py translates them into <work>/shaders/spirv/fspx, where the runtime's shader
     library finds them by fspx_code_sha256. The game's own shaders neither feed nor depend on this step.
 
-    The 29 programs take seconds, so the step runs whole: it counts as finished when spirv/fspx/index.json is there
-    and fspx_build.json, written after it, matches this run's settings (fspx_settings)."""
+    The 29 programs take seconds, so the step runs whole. Reuse requires the translation index, its named modules
+    and a matching fspx_build.json (fspx_settings)."""
     dll = os.path.join(game, FSPX_DLL)
     unpacked = os.path.join(work, "shaders", "fspx")
     spirv = os.path.join(work, "shaders", "spirv", "fspx")
@@ -829,7 +888,7 @@ def fspx_shaders(game: str, work: str, mc_signature: str, emulate: bool = False,
         log(f"shaders: no {FSPX_DLL} in the game folder, so no FSPX programs to translate")
         return
     settings = fspx_settings(dll, mc_signature, emulate, fallbacks)
-    if os.path.isfile(translated) and read_shader_setting(settings_file) == settings:
+    if read_shader_setting(settings_file) == settings and fspx_cache_complete(spirv):
         return
     log(f"shaders: unpacking and translating the FSPX programs of {FSPX_DLL}")
     drop(translated, settings_file)
@@ -885,7 +944,7 @@ WAVE64_MODES = ("auto", "on", "off")
 # The translator's fallback flags make_game.py can forward, and the argparse attribute each one reads.
 FALLBACK_FLAGS = (("--no-float-controls", "no_float_controls"), ("--bary-fallback", "bary_fallback"),
                   ("--texel-offset-fallback", "texel_offset_fallback"), ("--mesh-compute", "mesh_compute"),
-                  ("--f16-interp-fallback", "f16_interp_fallback"))
+                  ("--f16-interp-fallback", "f16_interp_fallback"), ("--pc-tail-ubo", "pc_tail_ubo"))
 
 
 def fallback_flags(a) -> tuple[str, ...]:
@@ -915,10 +974,10 @@ def smallest_max_subgroup(vulkaninfo_text: str):
     return min(per_device)
 
 
-def wave64_settings(mode: str) -> tuple[bool, bool]:
+def wave64_settings(mode: str, *, mesh_compute: bool = False) -> tuple[bool, bool]:
     """Return whether to translate with emulation and whether to reuse emulated shaders. A wave64 compute or mesh
     shader is only exact without it when the GPU gives it 64-wide subgroups; with it, it is exact on any subgroup
-    size, at the cost of a workgroup barrier per segment. "auto" keeps emulation off on native-wave64 RDNA2
+    size, at the cost of a workgroup barrier per segment. "auto" keeps emulation off on native-wave64 RDNA1/2
     under the AMD Windows driver. Elsewhere it turns emulation on unless every Vulkan device reports
     maxSubgroupSize >= 64 and the runtime probe does not rule out native wave64."""
     if mode == "on":
@@ -926,13 +985,19 @@ def wave64_settings(mode: str) -> tuple[bool, bool]:
     if mode == "off":
         return False, False
     gpu = runtime_gpu_info()
-    native64 = bool(gpu["native64"]) if "native64" in gpu else None
-    if gpu.get("rdna2_amd_windows") and native64:
-        # #857: AMD's Windows compiler for RDNA2 crashes on many emulated LDS compute pipelines.
+    rdna1 = gpu.get("rdna1_amd_windows", False)
+    # On RDNA1 the native mesh modules cannot run. Both the default build's compute pipelines and
+    # any mesh shaders translated with --mesh-compute use the GPU's compute subgroup capabilities.
+    compute_only = mesh_compute or (rdna1 and gpu.get("mesh_in_supported_stages") is False)
+    native64 = gpu.get("native64")
+    if compute_only:
+        native64 = gpu.get("native64_compute", native64)
+    if native64 and (rdna1 or gpu.get("rdna2_amd_windows")):
+        # #857: AMD's Windows compiler for RDNA1/2 crashes on many emulated LDS compute pipelines.
         # The runtime probe can identify that GPU even when vulkaninfo is unavailable.
-        log(f"shaders: the runtime's GPU ({gpu.get('device', '?')}) is RDNA2 on the AMD Windows driver "
-            "and runs wave64 natively. That driver can crash on emulated wave64 code (#857), so auto uses "
-            "native wave64 and does not reuse emulated outputs (--wave64-emulate on to force emulation)")
+        log(f"shaders: the runtime's GPU ({gpu.get('device', '?')}) is {'RDNA1' if rdna1 else 'RDNA2'} "
+            "on the AMD Windows driver and runs wave64 natively. That driver can crash on emulated wave64 code "
+            "(#857), so auto uses native wave64 and rebuilds emulated outputs (--wave64-emulate on to force emulation)")
         return False, False
     exe = shutil.which("vulkaninfo")
     size = None
@@ -948,16 +1013,17 @@ def wave64_settings(mode: str) -> tuple[bool, bool]:
         return True, True
     on = size < 64
     if not on and native64 is False:
-        log(f"shaders: smallest maximum subgroup size is {size}, but the Vulkan query found no 64-wide path for both "
-            "compute and mesh (fixed default size or required-size control): wave64 emulation on")
+        stages = "compute" if compute_only else "both compute and mesh"
+        log(f"shaders: smallest maximum subgroup size is {size}, but the Vulkan query found no 64-wide path for "
+            f"{stages} (fixed default size or required-size control): wave64 emulation on")
         return True, True
     log(f"shaders: smallest maximum subgroup size is {size}: wave64 emulation {'on' if on else 'off'}")
     return on, True
 
 
-def wave64_emulate(mode: str) -> bool:
+def wave64_emulate(mode: str, *, mesh_compute: bool = False) -> bool:
     """Whether a new translation uses wave64 emulation."""
-    return wave64_settings(mode)[0]
+    return wave64_settings(mode, mesh_compute=mesh_compute)[0]
 
 
 def runtime_gpu_info() -> dict:
@@ -981,6 +1047,12 @@ def runtime_gpu_per_vertex():
         return None if v is None else bool(v)
     except (OSError, ValueError, IndexError, subprocess.SubprocessError):
         return None
+
+
+def runtime_gpu_max_push_constants():
+    """max_push_constants_size as tools/vk_subgroup_info.py answers for the GPU the runtime would use, or None."""
+    v = runtime_gpu_info().get("max_push_constants_size")
+    return int(v) if isinstance(v, int) and not isinstance(v, bool) and v > 0 else None
 
 
 # Source and data files that produce the translated modules, metadata and partner stubs.
@@ -1511,8 +1583,8 @@ def main() -> int:
                          "instead of building it (off Windows: instead of the clang-cl + xwin cross-build)")
     ap.add_argument("--wave64-emulate", choices=WAVE64_MODES, default="auto",
                     help="translate wave64 compute and mesh shaders to be exact on any subgroup size (needed on "
-                         "32-wide GPUs: NVIDIA, Intel). auto (default) turns it on unless vulkaninfo shows that "
-                         "every GPU has 64-wide subgroups")
+                         "32-wide GPUs: NVIDIA, Intel). auto (default) checks GPU subgroup support and prefers "
+                         "native wave64 on affected AMD Windows drivers")
     ap.add_argument("--no-float-controls", action="store_true",
                     help="translate without SignedZeroInfNanPreserve (Depends on: #664), for devices whose "
                          "vk_pipeline_check skips a shader without shaderSignedZeroInfNanPreserveFloat32")
@@ -1529,6 +1601,10 @@ def main() -> int:
     ap.add_argument("--mesh-compute", action="store_true",
                     help="translate mesh shaders to compute shaders writing an output buffer, for devices "
                          "without VK_EXT_mesh_shader")
+    ap.add_argument("--pc-tail-ubo", action="store_true",
+                    help="keep s0..s31 in 128 push-constant bytes and move heap/code base to a set-1 uniform "
+                         "block; on by itself when the runtime's GPU reports maxPushConstantsSize below what "
+                         "the shaders need (144, or 152 with --mesh-compute)")
     a = ap.parse_args()
     stages = STAGES
     if a.stages is not None:
@@ -1589,12 +1665,19 @@ def main() -> int:
             stages = [s for s in stages if s not in WINDOWS_ONLY]
             log(f"{', '.join(WINDOWS_ONLY)}: left out, the cross-build needs {'; '.join(lacking)} "
                 "(or pass --runtime-build)")
-    emulate, keep_emulated = (wave64_settings(a.wave64_emulate) if "shaders" in stages
+    emulate, keep_emulated = (wave64_settings(a.wave64_emulate, mesh_compute=a.mesh_compute) if "shaders" in stages
                               else (False, a.wave64_emulate == "auto"))
     if "shaders" in stages and not a.f16_interp_fallback and runtime_gpu_per_vertex() is False:
         log("shaders: the GPU the runtime would use can't take PerVertexKHR inputs (MoltenVK, or no "
             "fragmentShaderBarycentric): translating with --f16-interp-fallback")
         a.f16_interp_fallback = True
+    if "shaders" in stages and not a.pc_tail_ubo:
+        need_pc = 152 if a.mesh_compute else 144
+        max_pc = runtime_gpu_max_push_constants()
+        if max_pc is not None and max_pc < need_pc:
+            log(f"shaders: the GPU the runtime would use reports maxPushConstantsSize = {max_pc} (< {need_pc}): "
+                "translating with --pc-tail-ubo")
+            a.pc_tail_ubo = True
     fallbacks = fallback_flags(a) if "shaders" in stages else ()
     preflight(stages, work, a.wav, runtime_build, emulate=emulate, keep_emulated=keep_emulated,
               fallbacks=fallbacks, jobs=a.jobs)

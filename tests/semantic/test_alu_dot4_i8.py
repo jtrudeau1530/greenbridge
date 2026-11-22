@@ -150,13 +150,19 @@ class Dot4I8(unittest.TestCase):
         # The table can tell the two readings apart: the plain rule gives another word in four of the five cases.
         self.assertEqual(sum(ref(a, b, c) != m for a, b, c, m in MEASURED_OP_SEL), 4)
 
-    def test_op_sel_is_refused(self):
-        lines = ["v_mov_b32_e32 v1, 1", "v_mov_b32_e32 v2, 1", "v_mov_b32_e32 v3, 0",
-                 "v_dot4_i32_i8 v8, v1, v2, v3 op_sel:[0,1,0] op_sel_hi:[1,0,1]",
-                 "exp mrt0 v8, v8, v8, v8 done vm", "s_endpgm"]
-        with self.assertRaises(rdna2spirv.Unsupported) as refused:
-            support.translate_lines("ps_dot4_op_sel", lines)
-        self.assertEqual(str(refused.exception), "v_dot4_i32_i8 op_sel")
+    def test_op_sel_matches_hardware_words(self):
+        for a, b, addend, measured in MEASURED_OP_SEL:
+            with self.subTest(a=f"{a:#010x}", b=f"{b:#010x}", addend=f"{addend:#010x}"):
+                lines = [
+                    f"v_mov_b32_e32 v1, 0x{a:08x}",
+                    f"v_mov_b32_e32 v2, 0x{b:08x}",
+                    f"v_mov_b32_e32 v3, 0x{addend:08x}",
+                    "v_dot4_i32_i8 v8, v1, v2, v3 op_sel:[0,1,0] op_sel_hi:[1,0,1]",
+                    "exp mrt0 v8, v8, v8, v8 done vm",
+                    "s_endpgm",
+                ]
+                spv = support.translate_lines("ps_dot4_op_sel", lines)
+                self.assertEqual(support.mrt0_words(spv), [measured] * 4)
 
     def test_the_neg_reference_reproduces_the_hardware_words(self):
         for neg_lo, neg_hi, a, b, addend, measured in MEASURED_NEG:
@@ -181,12 +187,56 @@ class Dot4I8(unittest.TestCase):
                  "exp mrt0 v8, v8, v8, v8 done vm", "s_endpgm"]
         self.assertEqual(support.mrt0_words(support.translate_lines("ps_dot4_neg_zero", lines)), [0xAA] * 4)
 
-    def test_clamp_is_refused(self):
-        lines = ["v_mov_b32_e32 v1, 1", "v_mov_b32_e32 v2, 1", "v_mov_b32_e32 v3, 0",
-                 "v_dot4_i32_i8 v8, v1, v2, v3 clamp", "exp mrt0 v8, v8, v8, v8 done vm", "s_endpgm"]
-        with self.assertRaises(rdna2spirv.Unsupported) as refused:
-            support.translate_lines("ps_dot4_clamp", lines)
-        self.assertEqual(str(refused.exception), "v_dot4_i32_i8 clamp")
+    def test_op_sel_source0_swap_and_broadcast(self):
+        # Swapping S0's halves instead of S1's gives the same result when sources are swapped.
+        a, b, addend, measured = MEASURED_OP_SEL[0]
+        lines = [
+            f"v_mov_b32_e32 v1, 0x{b:08x}",
+            f"v_mov_b32_e32 v2, 0x{a:08x}",
+            f"v_mov_b32_e32 v3, 0x{addend:08x}",
+            "v_dot4_i32_i8 v8, v1, v2, v3 op_sel:[1,0,0] op_sel_hi:[0,1,1]",
+            # Broadcast low half of both S0 and S1 into both halves: 2 * (b0*s1_b0 + b1*s1_b1)
+            "v_dot4_i32_i8 v9, v2, v1, v3 op_sel:[0,0,0] op_sel_hi:[0,0,1]",
+            "exp mrt0 v8, v9, v8, v9 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_dot4_op_sel_s0", lines)
+        # a=0x04030201 (lo=0x0201: bytes 1,2), b=0x08070605 (lo=0x0605: bytes 5,6) -> 2*(1*5 + 2*6) = 34
+        self.assertEqual(support.mrt0_words(spv), [measured, 34, measured, 34])
+
+    def test_clamp_matches_hardware_saturation(self):
+        # The two overflowing hardware cases (gfx1036) saturate to 0x7FFFFFFF / 0x80000000; non-overflowing cases stay exact.
+        cases = [
+            (0x7F7F7F7F, 0x7F7F7F7F, 0x7FFFFFFF, 0x7FFFFFFF),   # positive overflow -> INT32_MAX
+            (0x80808080, 0x7F7F7F7F, 0x80000000, 0x80000000),   # negative overflow -> INT32_MIN
+            (0x01020304, 0x05060708, 0x000003E8, 0x0000042E),   # positive non-overflow
+            (0xFF80017F, 0x7F7F80FF, 0x00000000, 0xFFFFBF02),   # negative non-overflow
+            (0x7F7F7F7F, 0x7F7F7F7F, 0x80000000, (0x80000000 + 4 * 127 * 127) & 0xFFFFFFFF),  # opposite signs, no ov
+        ]
+        for a, b, addend, expected in cases:
+            with self.subTest(a=f"{a:#010x}", b=f"{b:#010x}", addend=f"{addend:#010x}"):
+                lines = [
+                    f"v_mov_b32_e32 v1, 0x{a:08x}",
+                    f"v_mov_b32_e32 v2, 0x{b:08x}",
+                    f"v_mov_b32_e32 v3, 0x{addend:08x}",
+                    "v_dot4_i32_i8 v8, v1, v2, v3 clamp",
+                    "exp mrt0 v8, v8, v8, v8 done vm",
+                    "s_endpgm",
+                ]
+                spv = support.translate_lines("ps_dot4_clamp", lines)
+                self.assertEqual(support.mrt0_words(spv), [expected] * 4)
+
+    def test_unsupported_modifiers_refused(self):
+        # Non-default S2 half selection on v_dot4_i32_i8 and clamp/op_sel on VOP2 v_dot4c_i32_i8 stay refused.
+        for name, inst, err in (
+            ("ps_dot4_s2_opsel", "v_dot4_i32_i8 v8, v1, v2, v3 op_sel:[0,0,1]", "v_dot4_i32_i8 op_sel"),
+            ("ps_dot4c_clamp", "v_dot4c_i32_i8 v8, v1, v2 clamp", "v_dot4c_i32_i8 clamp"),
+        ):
+            lines = ["v_mov_b32_e32 v1, 1", "v_mov_b32_e32 v2, 1", "v_mov_b32_e32 v3, 0",
+                     inst, "exp mrt0 v8, v8, v8, v8 done vm", "s_endpgm"]
+            with self.assertRaises(rdna2spirv.Unsupported) as refused:
+                support.translate_lines(name, lines)
+            self.assertEqual(str(refused.exception), err)
 
 
 if __name__ == "__main__":
