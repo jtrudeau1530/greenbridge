@@ -233,6 +233,27 @@ class ScanTest(unittest.TestCase):
         self.assertEqual({r["kind"] for r in rows}, {"bvh4", "instance208", "raw"})
         self.assertEqual(summary[0]["streams"], 3)
 
+    def test_carved_bvh_fill_requires_all_declared_node_bytes(self) -> None:
+        n = 1200
+        complete = bvh_payload(n)
+        chunk = complete[:65536]
+        for name, payload in (("complete.bin", complete), ("chunk.bin", chunk)):
+            with open(os.path.join(self.dir, name), "wb") as f:
+                f.write(payload)
+
+        rows, _ = bvh_index.scan_dir(self.dir)
+        by_kind = {row["kind"]: row for row in rows}
+        self.assertEqual(by_kind["bvh4"]["fill"]["total"], n * 64)
+        self.assertEqual(by_kind["bvh4-chunk"]["node_count"], n)
+        self.assertNotIn("fill", by_kind["bvh4-chunk"])
+
+        archive = os.path.join(self.dir, "chunks.rpf")
+        with open(archive, "wb") as f:
+            f.write(make_rpf([chunk]))
+        (archived,), _ = bvh_index.scan_rpf(archive)
+        self.assertEqual(archived["kind"], "bvh4-chunk")
+        self.assertNotIn("fill", archived)
+
     def test_empty_and_short_archives_have_no_streams(self):
         for name, data in (("empty.rpf", b""), ("short.rpf", b"9FPR")):
             path = os.path.join(self.dir, name)

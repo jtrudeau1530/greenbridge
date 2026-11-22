@@ -327,7 +327,8 @@ def scan_dir(path, max_inflate=1 << 28):
                 tail = head
         row = classify(head, size, tail)
         row.update(source=p, offset=0, stored=size, size=size)
-        if row["kind"] in ("bvh4", "bvh4-chunk"):
+        # A chunk exposes the header but has only a prefix of the declared node buffer.
+        if row["kind"] == "bvh4":
             with open(p, "rb") as f:
                 body = f.read(HEAD + row["node_count"] * 64)[HEAD:]
             row["fill"] = {("%02x" % b): body.count(bytes([b])) for b in FILL_BYTES}
