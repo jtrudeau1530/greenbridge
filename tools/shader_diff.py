@@ -332,11 +332,10 @@ def main(argv=None):
     for reason, n in sorted(counts["skip"].items()):
         print(f"  skip x{n}: {reason}")
     if first_failure is not None:
-        print("FIRST MISMATCH:\n" + first_failure)
-        return 1
+        print("FIRST FAILURE:\n" + first_failure)
     if counts["harness-error"]:
         return 2
-    return 0
+    return 1 if counts["mismatch"] else 0
 
 
 if __name__ == "__main__":
