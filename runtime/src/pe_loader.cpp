@@ -669,6 +669,8 @@ void Loader::parse_exports(Module& m) {
     auto add_export = [&](const std::string& key, uint32_t rva) {
         if (rva >= dir_begin && rva < dir_end)
             m.forwarders[key] = read_string(m.name, m.base, m.size, rva, "a forwarded export");
+        else if (rva >= m.size)  // base + rva would point past the mapping, and a caller would jump there
+            throw std::runtime_error(m.name + ": export " + key + " points outside the image");
         else
             m.exports[key] = m.base + rva;
     };
