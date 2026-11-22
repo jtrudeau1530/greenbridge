@@ -1389,16 +1389,20 @@ Implemented (`QueryHeap` in `runtime/shims/d3d12_vulkan_device.cpp`, the query c
 - **Queries never ended.** D3D12 leaves their result undefined; a Vulkan copy with `WAIT_BIT` would wait for them
   forever. Each heap records on the host which queries were ended, in submission order, and a resolve writes zeros
   (`vkCmdFillBuffer`) for the ones that were not.
+- **Overlapping ordinary occlusion.** On a graphics queue with compute, the replay opens a new physical query
+  whenever the set of active ordinary queries changes. Each logical query keeps a contiguous range in the
+  submission's physical pool. Resolving it sums the 64-bit counts on the GPU, then copies the result to the
+  destination. Logical results and in-flight submissions retain the pool independently, so later resolves and
+  overwrites can be recorded before the earlier commands complete. `vk_overlapping_occlusion` checks crossing
+  and nested scopes, more than one scratch chunk, resolution under a predicate, and gated submissions on a GPU.
 - **Timestamps.** `GetTimestampFrequency` is `1e9 / timestampPeriod` (1 GHz on the test GPU). Every D3D12 queue
   shares one `VkQueue` for now (question 12), so they share one frequency.
 
 Not implemented yet:
 
-- **Overlapping queries.** Vulkan allows one active query of each type in a command buffer
-  (`VUID-vkCmdBeginQuery-queryPool-01922`); D3D12 lets occlusion queries overlap. A list that begins an occlusion
-  query (either kind) or a pipeline-statistics query while another of the same kind runs is refused with
-  `ReplayResult::unsupported`. The fix is virtual queries: end the running Vulkan query, start another, and sum the
-  pieces when resolving (a compute pass). The trace will show whether the game overlaps them.
+- **Overlapping binary occlusion and pipeline-statistics queries** are refused with `ReplayResult::unsupported`.
+  Ordinary occlusion resolves that need a sum are also refused during an active pipeline-statistics query, since
+  the internal dispatch would change its compute-invocation count.
 - **Binary occlusion** is not clamped: Vulkan writes the sample count (or, without the precise bit, any non-zero
   value) where D3D12 writes 1. Predication only compares with zero, but a game that reads the value needs the clamp,
   a small compute pass over the resolved range once the compute path (D3D-3) exists.

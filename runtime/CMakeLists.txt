@@ -560,6 +560,31 @@ if(TARGET Vulkan::Headers)
       target_compile_definitions(${tool} PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     endif()
   endforeach()
+  if(NOT Vulkan_GLSLANG_VALIDATOR_EXECUTABLE)
+    find_program(Vulkan_GLSLANG_VALIDATOR_EXECUTABLE glslangValidator HINTS "$ENV{VULKAN_SDK}/Bin" "$ENV{VULKAN_SDK}/bin")
+  endif()
+  if(Vulkan_GLSLANG_VALIDATOR_EXECUTABLE)
+    add_executable(vk_overlapping_occlusion_test test/vk_overlapping_occlusion_test.cpp)
+    target_link_libraries(vk_overlapping_occlusion_test PRIVATE Vulkan::Headers ${CMAKE_DL_LIBS})
+    if(WIN32)
+      target_compile_definitions(vk_overlapping_occlusion_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    endif()
+    foreach(stage vert frag)
+      set(source "${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/overlapping_occlusion.${stage}")
+      set(output "${CMAKE_CURRENT_BINARY_DIR}/overlapping_occlusion.${stage}.spv")
+      add_custom_command(OUTPUT "${output}"
+                         COMMAND "${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE}" -V --target-env vulkan1.0
+                                 -o "${output}" "${source}"
+                         DEPENDS "${source}" VERBATIM)
+      target_sources(vk_overlapping_occlusion_test PRIVATE "${output}")
+    endforeach()
+    if(BUILD_TESTING)
+      add_test(NAME vk_overlapping_occlusion COMMAND vk_overlapping_occlusion_test
+               "${CMAKE_CURRENT_BINARY_DIR}/overlapping_occlusion.vert.spv"
+               "${CMAKE_CURRENT_BINARY_DIR}/overlapping_occlusion.frag.spv")
+      set_tests_properties(vk_overlapping_occlusion PROPERTIES SKIP_RETURN_CODE 77)
+    endif()
+  endif()
   # D3D12 COM objects over the Vulkan backend. Their method stubs are generated from the SDK's d3d12.h at build
   # time (tools/gen_d3d12_stubs.py), so nothing derived from the SDK header is checked in.
   find_package(Python3 COMPONENTS Interpreter QUIET)
@@ -637,9 +662,6 @@ if(TARGET Vulkan::Headers)
     target_link_libraries(d3d12_descriptor_test PRIVATE gta6rt_d3d12_com)
     target_compile_definitions(d3d12_descriptor_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(d3d12_descriptor_test PRIVATE /W4 /permissive- /utf-8)
-    if(NOT Vulkan_GLSLANG_VALIDATOR_EXECUTABLE)
-      find_program(Vulkan_GLSLANG_VALIDATOR_EXECUTABLE glslangValidator HINTS "$ENV{VULKAN_SDK}/Bin" "$ENV{VULKAN_SDK}/bin")
-    endif()
     if(Vulkan_GLSLANG_VALIDATOR_EXECUTABLE)
       set(LEONIDA_TEST_CS_SAMPLE ${CMAKE_CURRENT_BINARY_DIR}/generated/cs_sample.spv)
       add_custom_command(
