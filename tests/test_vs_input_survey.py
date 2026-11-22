@@ -76,6 +76,43 @@ def test_vs_input_survey():
         check(out.returncode == 0 and "exp prim 1" in out.stdout and "NGG markers present" in out.stdout,
               "a primitive export flips the verdict away from legacy")
         check("a_vs" not in out.stdout and "c_vs" not in out.stdout, "the summary prints counts, not shader names")
+
+    # bad inputs and outputs: one error line, exit 2, no traceback, and index.json is never overwritten
+    tool = os.path.join(ROOT, "scripts", "vs_input_survey.py")
+
+    def cli(*args):
+        return subprocess.run([sys.executable, "-I", tool, *args], capture_output=True, text=True)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        d = os.path.join(tmp, "dxbc")
+        os.mkdir(d)
+        plain = os.path.join(tmp, "plain")
+        with open(plain, "w") as f:
+            f.write("x")
+        idx = os.path.join(d, "index.json")
+        cases = {
+            "missing folder": [os.path.join(tmp, "nope")],
+            "a file as the folder": [plain],
+            "folder without index.json": [d],
+        }
+        for what, args in cases.items():
+            r = cli(*args)
+            check(r.returncode == 2 and "Traceback" not in r.stderr and len(r.stderr.strip().splitlines()) == 1,
+                  f"{what}: one error line, exit 2")
+        for what, body in (("junk bytes", b"\xff\xfe\x80"), ("empty file", b""), ("not a list", b'{"a": 1}'),
+                           ("a list of non-objects", b"[1, 2]")):
+            with open(idx, "wb") as f:
+                f.write(body)
+            r = cli(d)
+            check(r.returncode == 2 and "Traceback" not in r.stderr and len(r.stderr.strip().splitlines()) == 1,
+                  f"index.json {what}: one error line, exit 2")
+        with open(idx, "w") as f:
+            f.write("[]")
+        r = cli(d, "--json", os.path.join(plain, "sub", "r.json"))
+        check(r.returncode == 2 and "Traceback" not in r.stderr, "--json under a regular file: one error, exit 2")
+        r = cli(d, "--json", idx)
+        with open(idx) as f:
+            check(r.returncode == 2 and f.read() == "[]", "--json equal to index.json is refused and leaves it alone")
     assert failures == 0, f"{failures} vs_input_survey check(s) failed"
 
 

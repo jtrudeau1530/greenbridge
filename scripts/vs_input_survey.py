@@ -78,6 +78,8 @@ def read_before_write(insns):
 def survey(dxbc_dir):
     with open(os.path.join(dxbc_dir, "index.json"), encoding="utf-8") as f:
         index = json.load(f)
+    if not isinstance(index, list) or not all(isinstance(e, dict) for e in index):
+        raise ValueError("index.json is not a list of shader entries")
     names = [os.path.splitext(e["file"])[0] for e in index if e.get("stage") == "vs"]
     markers, vgprs, families = Counter(), Counter(), Counter()
     missing = 0
@@ -115,7 +117,15 @@ def main():
     ap.add_argument("dxbc", help="<work>/shaders/dxbc from make_game.py")
     ap.add_argument("--json", help="also write the counts as JSON")
     a = ap.parse_args()
-    r = survey(a.dxbc)
+    index_path = os.path.join(a.dxbc, "index.json")
+    if a.json and os.path.exists(a.json) and os.path.exists(index_path) and os.path.samefile(a.json, index_path):
+        print(f"vs_input_survey: error: --json would overwrite the input {index_path}", file=sys.stderr)
+        return 2
+    try:
+        r = survey(a.dxbc)
+    except (OSError, ValueError) as e:  # missing or non-folder <dxbc>, unreadable, non-UTF-8 or malformed index.json
+        print(f"vs_input_survey: error: cannot read {index_path}: {e}", file=sys.stderr)
+        return 2
     m = r["markers"]
     print(f"{r['vertex_shaders']} vertex shaders ({r['missing_listings']} without a listing)")
     print(f"NGG markers: exp prim {m.get('exp prim', 0)}, s_sendmsg {m.get('s_sendmsg', 0)}, v_mbcnt {m.get('v_mbcnt', 0)}")
@@ -125,8 +135,12 @@ def main():
     legacy = not (m.get("exp prim") or m.get("s_sendmsg") or m.get("v_mbcnt"))
     print("layout:", "legacy (non-NGG) VS" if legacy else "NGG markers present: check the VS input layout")
     if a.json:
-        with open(a.json, "w", encoding="utf-8", newline="\n") as f:
-            json.dump(r, f, indent=1)
+        try:
+            with open(a.json, "w", encoding="utf-8", newline="\n") as f:
+                json.dump(r, f, indent=1)
+        except OSError as e:
+            print(f"vs_input_survey: error: cannot write {a.json}: {e.strerror or e}", file=sys.stderr)
+            return 2
     return 0
 
 
