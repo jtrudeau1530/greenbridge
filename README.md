@@ -153,7 +153,7 @@ Pass the directory containing `index.json` and the translated SPIR-V files to `v
 
 The loader is a Windows program and runs under Wine or Proton; CI runs its tests under Wine on every change to
 `runtime/` (the `wine` job of the Runtime workflow). On Linux the `runtime` stage cross-builds it into
-`runtime/build/windows` with clang-cl and lld-link (LLVM 19+; plain names, or all five LLVM tools with one version
+`runtime/build/windows` with clang-cl and lld-link (LLVM 19+, but not 22.1.7 or 22.1.8, see [docs/testing.md](docs/testing.md#known-problems); plain names, or all five LLVM tools with one version
 suffix such as `clang-cl-21`) against the MSVC CRT and Windows SDK that
 [xwin](https://github.com/Jake-Shadle/xwin) lays out, in `XWIN_DIR` or `~/.local/share/xwin-sdk`
 ([docs/testing.md](docs/testing.md#the-windows-runtime-on-linux-under-wine-or-proton) has the one-time `xwin`
