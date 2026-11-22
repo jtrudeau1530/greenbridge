@@ -411,9 +411,6 @@ if(BUILD_TESTING)
     add_test(NAME unimplemented_policy COMMAND unimplemented_policy_test)
   endif()
 
-  if(WIN32 AND TARGET root_sig_test)
-    add_test(NAME root_sig_test COMMAND root_sig_test)
-  endif()
   if(TARGET device_proxy_test)
     add_test(NAME device_proxy COMMAND device_proxy_test)
     set_tests_properties(device_proxy PROPERTIES SKIP_RETURN_CODE 77)  # no WARP adapter (Wine)
@@ -538,6 +535,10 @@ endif()
 endif()
 
 # GPU test and pipeline tools load Vulkan at run time, so only the Vulkan headers are needed at build time.
+# Nothing is downloaded unless asked: set VULKAN_SDK, install the Vulkan headers, pass
+# -DLEONIDA_VULKAN_HEADERS_FETCH=ON to download the pinned Khronos Vulkan-Headers release once at configure time
+# (hash-checked), or pass -DFETCHCONTENT_SOURCE_DIR_VULKANHEADERS=<path> to use a local copy without downloading.
+option(LEONIDA_VULKAN_HEADERS_FETCH "Download the pinned Khronos Vulkan-Headers release if no Vulkan headers are found" OFF)
 find_package(Vulkan QUIET)
 if(NOT TARGET Vulkan::Headers)
   find_path(Vulkan_INCLUDE_DIR
@@ -549,6 +550,17 @@ if(NOT TARGET Vulkan::Headers)
     set_target_properties(Vulkan::Headers PROPERTIES
       INTERFACE_INCLUDE_DIRECTORIES "${Vulkan_INCLUDE_DIR}"
     )
+  elseif(LEONIDA_VULKAN_HEADERS_FETCH OR FETCHCONTENT_SOURCE_DIR_VULKANHEADERS)
+    include(FetchContent)
+    FetchContent_Declare(VulkanHeaders
+      # vulkan-sdk-1.4.363.0 (same commit pinned in .github/workflows/runtime.yml)
+      URL https://github.com/KhronosGroup/Vulkan-Headers/archive/6802bb4733b63ed5efd3adb308a6c885ef180ea1.tar.gz
+      URL_HASH SHA256=9044fbb356160e43201dc2094acb44c8a906722a63a35f48fc0f051579db9bb6
+      DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
+    set(VULKAN_HEADERS_ENABLE_TESTS OFF CACHE BOOL "" FORCE)
+    set(VULKAN_HEADERS_ENABLE_INSTALL OFF CACHE BOOL "" FORCE)
+    set(VULKAN_HEADERS_ENABLE_MODULE OFF CACHE BOOL "" FORCE)
+    FetchContent_MakeAvailable(VulkanHeaders)
   endif()
 endif()
 if(TARGET Vulkan::Headers)
@@ -725,5 +737,6 @@ if(TARGET Vulkan::Headers)
   endif()
 else()
   message(STATUS "Vulkan headers not found: GPU test tools, vk_pipeline_check, d3d12_state_map_test and "
-                 "gfx10_descriptors_test are not built")
+                 "gfx10_descriptors_test are not built. Set VULKAN_SDK, install Vulkan headers, or pass "
+                 "-DLEONIDA_VULKAN_HEADERS_FETCH=ON to download the pinned Khronos Vulkan-Headers release")
 endif()

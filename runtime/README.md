@@ -156,8 +156,9 @@ ctest --test-dir runtime/build -C RelWithDebInfo --output-on-failure
 ```
 
 On Windows the build configures the CPU tests that do not need a GPU or game files, including the
-root-signature forwarding test (`root_sig_test`) and the clear-command test. The Vulkan tools are built
-when the Vulkan SDK is found:
+root-signature forwarding test (`root_sig_test`) and the clear-command test. The Vulkan tools and
+D3D12-over-Vulkan COM targets are built when Vulkan headers are found (via `VULKAN_SDK`, an installed
+SDK, or `-DLEONIDA_VULKAN_HEADERS_FETCH=ON` to download the pinned Khronos Vulkan-Headers release):
 
 - `vk_harness` — hand-written RDNA2 shader programs on a real Vulkan device.
 - `vk_texture_test`, `vk_compute_test`, `vk_store_test` — texture, LDS/compute, and buffer-store paths.
