@@ -382,6 +382,15 @@ def _write_csv(path, fields, rows):
     return n
 
 
+def _same_output_path(first: str, second: str) -> bool:
+    if os.path.normcase(os.path.realpath(first)) == os.path.normcase(os.path.realpath(second)):
+        return True
+    try:
+        return os.path.samefile(first, second)
+    except OSError:
+        return False
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("sources", nargs="+", help="rpf9_carve.py directory, .rpf archive, or resource files/dirs")
@@ -390,13 +399,17 @@ def main(argv=None) -> int:
     ap.add_argument("--tables", help="CSV: one row per string table (source, offset, lang, group, counts)")
     ap.add_argument("--strings", help="CSV: every string (source, offset, lang, hash, label, text)")
     a = ap.parse_args(argv)
-    outs = [p for p in (a.dialogue, a.tables, a.strings) if p]
-    seen = set()
-    for p in outs:
-        key = os.path.normcase(os.path.realpath(p))
-        if key in seen:
+    out_flags = [(flag, path) for flag, path in (("--dialogue", a.dialogue), ("--tables", a.tables),
+                                                 ("--strings", a.strings)) if path]
+    outs = [path for _, path in out_flags]
+    seen = []
+    for flag, p in out_flags:
+        if any(_same_output_path(p, prev) for prev in seen):
             ap.error("outputs must be distinct files")
-        seen.add(key)
+        seen.append(p)
+        parent = os.path.dirname(os.path.abspath(p))
+        if not os.path.isdir(parent):
+            ap.error(f"{flag} parent directory does not exist: {parent}")
     for path in a.sources + a.labels:
         if not os.path.exists(path):
             print(f"text_tables: error: {path}: no such file or directory", file=sys.stderr)
@@ -405,14 +418,18 @@ def main(argv=None) -> int:
             ap.error("an output must not overwrite an input")
 
     scan = Scan()
-    for source in a.sources:
-        starts = archive_starts(source)
-        for label, offset, data in blobs(source):
-            nested = archive_of(starts, offset) if starts else None
-            scan.add(label, offset, data, None if nested is None else (source, nested))
-    names = {}
-    for path in a.labels:
-        names.update(read_labels(path))
+    try:
+        for source in a.sources:
+            starts = archive_starts(source)
+            for label, offset, data in blobs(source):
+                nested = archive_of(starts, offset) if starts else None
+                scan.add(label, offset, data, None if nested is None else (source, nested))
+        names = {}
+        for path in a.labels:
+            names.update(read_labels(path))
+    except (OSError, ValueError, RuntimeError) as error:
+        print(f"text_tables: error: cannot read input: {error}", file=sys.stderr)
+        return 2
     for labels in scan.pairs.values():               # dialogue labels name themselves
         for label in labels:
             names[joaat(label)] = label

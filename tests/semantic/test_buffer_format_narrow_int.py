@@ -10,7 +10,8 @@ same V# and instruction the translated shader gets here:
 - stores: `buffer_store_format_x/xy/xyzw` of four value sets into a buffer filled with 0xDEAD0000, with the V#
   selectors the runtime gives each format (gfx10_descriptors.h: X001, XY01, XYZW). UINT saturates to the channel
   (unsigned), SINT clamps the signed 32-bit value to [-2^(w-1), 2^(w-1) - 1]; a 1-2 byte element keeps the rest
-  of its dword.
+  of its dword. `buffer_store_format_d16_xyzw` (D16_STORES) reads each 16-bit half as a signed integer for SINT and
+  clamps it the same way, so 0xff80 stores -128 into 8_SINT.
 
 Formats 27, 60 and 69 (16_16_UINT, 8_8_8_8_UINT, 16_16_16_16_UINT) were decoded before; they are the control.
 """
@@ -203,6 +204,47 @@ STORES = {  # (format, value set, components): the two dwords at the element, 0x
 }
 
 
+D16_VALUES = {"ewann": (0xFF80FF80, 0x8000FF80), "edge": (0x7FFF0080, 0xFF7F0005), "small": (0x00010005, 0xFFFF0000)}
+D16_STORES = {  # (format, register pair): buffer_store_format_d16_xyzw v[2:3], the two dwords at the element
+    (5, 'ewann'): (0xDEAD00FF, 0xDEAD0000),
+    (5, 'edge'): (0xDEAD0080, 0xDEAD0000),
+    (5, 'small'): (0xDEAD0005, 0xDEAD0000),
+    (6, 'ewann'): (0xDEAD0080, 0xDEAD0000),
+    (6, 'edge'): (0xDEAD007F, 0xDEAD0000),
+    (6, 'small'): (0xDEAD0005, 0xDEAD0000),
+    (11, 'ewann'): (0xDEADFF80, 0xDEAD0000),
+    (11, 'edge'): (0xDEAD0080, 0xDEAD0000),
+    (11, 'small'): (0xDEAD0005, 0xDEAD0000),
+    (12, 'ewann'): (0xDEADFF80, 0xDEAD0000),
+    (12, 'edge'): (0xDEAD0080, 0xDEAD0000),
+    (12, 'small'): (0xDEAD0005, 0xDEAD0000),
+    (18, 'ewann'): (0xDEADFFFF, 0xDEAD0000),
+    (18, 'edge'): (0xDEADFF80, 0xDEAD0000),
+    (18, 'small'): (0xDEAD0105, 0xDEAD0000),
+    (19, 'ewann'): (0xDEAD8080, 0xDEAD0000),
+    (19, 'edge'): (0xDEAD7F7F, 0xDEAD0000),
+    (19, 'small'): (0xDEAD0105, 0xDEAD0000),
+    (27, 'ewann'): (0xFF80FF80, 0xDEAD0000),
+    (27, 'edge'): (0x7FFF0080, 0xDEAD0000),
+    (27, 'small'): (0x00010005, 0xDEAD0000),
+    (28, 'ewann'): (0xFF80FF80, 0xDEAD0000),
+    (28, 'edge'): (0x7FFF0080, 0xDEAD0000),
+    (28, 'small'): (0x00010005, 0xDEAD0000),
+    (60, 'ewann'): (0xFFFFFFFF, 0xDEAD0000),
+    (60, 'edge'): (0xFF05FF80, 0xDEAD0000),
+    (60, 'small'): (0xFF000105, 0xDEAD0000),
+    (61, 'ewann'): (0x80808080, 0xDEAD0000),
+    (61, 'edge'): (0x80057F7F, 0xDEAD0000),
+    (61, 'small'): (0xFF000105, 0xDEAD0000),
+    (69, 'ewann'): (0xFF80FF80, 0x8000FF80),
+    (69, 'edge'): (0x7FFF0080, 0xFF7F0005),
+    (69, 'small'): (0x00010005, 0xFFFF0000),
+    (70, 'ewann'): (0xFF80FF80, 0x8000FF80),
+    (70, 'edge'): (0x7FFF0080, 0xFF7F0005),
+    (70, 'small'): (0x00010005, 0xFFFF0000),
+}
+
+
 def run(fmt: int, body: str, dst_sel: int, memory: dict) -> tuple:
     """Translate a pixel shader whose V# (s[0:3], raw, 256 bytes) points at BASE with this format and selectors."""
     with tempfile.TemporaryDirectory() as tmp:
@@ -237,6 +279,16 @@ def store(fmt: int, values: tuple, n: int, channels: int) -> tuple:
     return memory[BASE], memory[BASE + 4]
 
 
+def store_d16(fmt: int, pair: tuple, channels: int) -> tuple:
+    """buffer_store_format_d16_xyzw of two registers (x | y << 16, z | w << 16): each half is a 16-bit integer, signed
+    for SINT, then saturated or clamped like a full-width store."""
+    memory = {BASE: 0xDEAD0000, BASE + 4: 0xDEAD0000}
+    body = (f"\tv_mov_b32 v2, {pair[0]:#x}\n\tv_mov_b32 v3, {pair[1]:#x}\n"
+            "\tbuffer_store_format_d16_xyzw v[2:3], v1, s[0:3], 0 offen\n\texp mrt0 v2, v2, v2, v2 done vm\n\ts_endpgm\n")
+    run(fmt, body, RUNTIME_SEL[channels], memory)
+    return memory[BASE], memory[BASE + 4]
+
+
 class NarrowIntegerLoads(unittest.TestCase):
     def test_measured_words(self):
         for fmt, (xyzw, x011, d16) in LOADS.items():
@@ -251,6 +303,12 @@ class NarrowIntegerStores(unittest.TestCase):
         for (fmt, values, n), want in STORES.items():
             with self.subTest(fmt=fmt, values=values, n=n):
                 self.assertEqual(store(fmt, VALUES[values], n, CHANNELS[fmt]), want)
+
+    def test_measured_d16_words(self):
+        # A d16 SINT half is sign-extended before the clamp: 0xff80 stores -128 (0x80) into 8_SINT, not 127.
+        for (fmt, pair), want in D16_STORES.items():
+            with self.subTest(fmt=fmt, pair=pair):
+                self.assertEqual(store_d16(fmt, D16_VALUES[pair], CHANNELS[fmt]), want)
 
 
 if __name__ == "__main__":
