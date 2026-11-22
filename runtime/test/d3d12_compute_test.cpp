@@ -392,15 +392,15 @@ int main() {
             Ref<ID3DBlob> blob;
             EXPECT(pso->GetCachedBlob(&blob.p) == S_OK && blob.p);
             const auto* p = static_cast<const std::uint8_t*>(blob->GetBufferPointer());
-            std::vector<std::uint8_t> bytes(p, p + blob->GetBufferSize());
+            std::vector<std::uint8_t> blob_bytes(p, p + blob->GetBufferSize());
             auto attempt = [&](const std::vector<std::uint8_t>& b) {
                 D3D12_COMPUTE_PIPELINE_STATE_DESC d = pso_desc;
                 d.CachedPSO = {b.data(), b.size()};
                 Ref<ID3D12PipelineState> made;
                 return device->CreateComputePipelineState(&d, IID_PPV_ARGS(&made.p));
             };
-            for (std::size_t at = 0; at < bytes.size(); ++at) {
-                auto changed = bytes;
+            for (std::size_t at = 0; at < blob_bytes.size(); ++at) {
+                auto changed = blob_bytes;
                 changed[at] ^= 0x01;
                 EXPECT(attempt(changed) == E_INVALIDARG);
             }
@@ -410,11 +410,11 @@ int main() {
                 for (int i = 0; i < 4; ++i) b[b.size() - 4 + i] = std::uint8_t(sum >> (8 * i));
                 return b;
             };
-            EXPECT(attempt(resealed(bytes, 8)) == D3D12_ERROR_ADAPTER_NOT_FOUND);   // vendor
-            EXPECT(attempt(resealed(bytes, 12)) == D3D12_ERROR_ADAPTER_NOT_FOUND);  // device
-            EXPECT(attempt(resealed(bytes, 16)) == D3D12_ERROR_DRIVER_VERSION_MISMATCH);
-            EXPECT(attempt(resealed(bytes, 20)) == D3D12_ERROR_DRIVER_VERSION_MISMATCH);  // pipelineCacheUUID
-            EXPECT(attempt(resealed(bytes, 4)) == E_INVALIDARG);  // version
+            EXPECT(attempt(resealed(blob_bytes, 8)) == D3D12_ERROR_ADAPTER_NOT_FOUND);   // vendor
+            EXPECT(attempt(resealed(blob_bytes, 12)) == D3D12_ERROR_ADAPTER_NOT_FOUND);  // device
+            EXPECT(attempt(resealed(blob_bytes, 16)) == D3D12_ERROR_DRIVER_VERSION_MISMATCH);
+            EXPECT(attempt(resealed(blob_bytes, 20)) == D3D12_ERROR_DRIVER_VERSION_MISMATCH);  // pipelineCacheUUID
+            EXPECT(attempt(resealed(blob_bytes, 4)) == E_INVALIDARG);  // version
         }
 
         // A device whose maxPushConstantsSize is the Vulkan minimum (128 bytes) cannot hold the 144-byte block, so
