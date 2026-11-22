@@ -171,13 +171,23 @@ def main(argv=None) -> int:
                     help="llvm-mc CPU for --disasm (default gfx1030: the programs use v_dot4 instructions, which "
                          "gfx1010 and gfx1013 do not decode)")
     a = ap.parse_args(argv)
-    os.makedirs(os.path.join(a.out, "fspx"), exist_ok=True)
+    fspx_dir = os.path.join(a.out, "fspx")
+    try:
+        os.makedirs(fspx_dir, exist_ok=True)
+    except OSError as error:
+        print(f"cannot create output directory {fspx_dir}: {error}", file=sys.stderr)
+        return 2
     disasm = None
     if a.disasm:
         sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
         import shader_disasm  # noqa: E402  (resolves LLVM_MC at import)
         disasm = shader_disasm
-        os.makedirs(os.path.join(a.out, "disasm"), exist_ok=True)
+        disasm_dir = os.path.join(a.out, "disasm")
+        try:
+            os.makedirs(disasm_dir, exist_ok=True)
+        except OSError as error:
+            print(f"cannot create output directory {disasm_dir}: {error}", file=sys.stderr)
+            return 2
     index, bad = [], 0
     used_names = set()
     for path in a.files:
