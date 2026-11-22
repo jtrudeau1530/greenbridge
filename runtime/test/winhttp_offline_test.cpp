@@ -10,6 +10,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <vector>
 
 #include "shims.h"
 
@@ -284,6 +285,69 @@ int main() {
     g_seen = nullptr;
     CloseHandle(seen.error_event);
     CloseHandle(seen.closing_event);
+
+    // WINHTTP_OPTION_CONTEXT_VALUE is inherited like the callback: a handle starts with the context its parent has
+    // when it is created, and keeps it when the parent's changes later. The host's winhttp.dll gave these values.
+    {
+        struct Event {
+            HINTERNET handle;
+            DWORD status;
+            DWORD_PTR context;
+        };
+        static std::vector<Event> events;  // a synchronous session: every callback runs on this thread
+        const WINHTTP_STATUS_CALLBACK record = [](HINTERNET handle, DWORD_PTR context, DWORD status, LPVOID, DWORD) {
+            events.push_back({handle, status, context});
+        };
+        const auto context_of = [&](HINTERNET handle) -> DWORD_PTR {
+            DWORD_PTR value = ~DWORD_PTR{0};
+            DWORD size = sizeof(value);
+            return query_option(handle, WINHTTP_OPTION_CONTEXT_VALUE, &value, &size) ? value : ~DWORD_PTR{0};
+        };
+        const auto set_context = [&](HINTERNET handle, DWORD_PTR value) {
+            return set_option(handle, WINHTTP_OPTION_CONTEXT_VALUE, &value, sizeof(value)) != FALSE;
+        };
+        const auto context_at = [&](HINTERNET handle, DWORD status) -> DWORD_PTR {
+            for (const Event& e : events)
+                if (e.handle == handle && e.status == status) return e.context;
+            return ~DWORD_PTR{0};
+        };
+
+        const HINTERNET session = open(L"test", WINHTTP_ACCESS_TYPE_NO_PROXY, nullptr, nullptr, 0);
+        set_callback(session, record, WINHTTP_CALLBACK_FLAG_HANDLES, 0);
+        check(set_context(session, 7), "WINHTTP_OPTION_CONTEXT_VALUE can be set on a session");
+        const HINTERNET connection = connect(session, L"127.0.0.1", 1, 0);
+        const HINTERNET request = open_request(connection, L"GET", L"/", nullptr, WINHTTP_NO_REFERER,
+                                               WINHTTP_DEFAULT_ACCEPT_TYPES, 0);
+        check(context_of(connection) == 7 && context_of(request) == 7,
+              "a connection and a request start with the session's context");
+        check(context_at(connection, WINHTTP_CALLBACK_STATUS_HANDLE_CREATED) == 7 &&
+                  context_at(request, WINHTTP_CALLBACK_STATUS_HANDLE_CREATED) == 7,
+              "and their HANDLE_CREATED callbacks carry it");
+
+        check(set_context(request, 9) && context_of(request) == 9 && context_of(connection) == 7,
+              "a context set on the request replaces the inherited one for that request only");
+        check(set_context(session, 11) && context_of(connection) == 7 && context_of(request) == 9,
+              "a context set on the session later does not change handles that exist");
+        const HINTERNET late = connect(session, L"127.0.0.1", 1, 0);
+        check(context_of(late) == 11, "a connection made after that starts with the new one");
+
+        const HINTERNET sent = open_request(connection, L"GET", L"/", nullptr, WINHTTP_NO_REFERER,
+                                            WINHTTP_DEFAULT_ACCEPT_TYPES, 0);
+        check(context_of(sent) == 7, "a request starts with its connection's context, not the session's");
+        send(sent, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0x51);
+        check(context_of(sent) == 0x51, "the context WinHttpSendRequest is given replaces the inherited one");
+
+        close(sent);
+        close(request);
+        close(late);
+        close(connection);
+        close(session);
+        check(context_at(sent, WINHTTP_CALLBACK_STATUS_HANDLE_CLOSING) == 0x51 &&
+                  context_at(request, WINHTTP_CALLBACK_STATUS_HANDLE_CLOSING) == 9 &&
+                  context_at(late, WINHTTP_CALLBACK_STATUS_HANDLE_CLOSING) == 11 &&
+                  context_at(connection, WINHTTP_CALLBACK_STATUS_HANDLE_CLOSING) == 7,
+              "HANDLE_CLOSING carries each handle's own context");
+    }
 
     // WinHttpCrackUrl is parsing only and stays the host's.
     {
