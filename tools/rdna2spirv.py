@@ -5826,10 +5826,16 @@ class Gen:
             self.emit(f"{r} = OpCompositeExtract %uint {s2} 0")
             self.emit(f"{c2} = OpCompositeExtract %uint {s2} 1")
             self.emit(f"{carry} = OpBitwiseOr %uint {c1} {c2}")
+            carry_nz = self.tmp_bool_nz(carry)
+            if "clamp" in mods:
+                # Hardware saturates D (0xffffffff on add carry, 0 on sub borrow) while reporting the real carry/borrow.
+                clamped = self.tmp()
+                self.emit(f"{clamped} = OpSelect %uint {carry_nz} {self.cu(0) if sub else self.cu(0xFFFFFFFF)} {r}")
+                r = clamped
             self.dst(vd, r)
             if not (cd["k"] == "special" and cd["t"] == "null"):
                 cm, m = self.tmp(), self.tmp()
-                self.emit(f"{cm} = OpLogicalAnd %bool {self.tmp_bool_nz(carry)} {self.active_b()}")  # inactive lanes write 0
+                self.emit(f"{cm} = OpLogicalAnd %bool {carry_nz} {self.active_b()}")  # inactive lanes write 0
                 self.emit(f"{m} = OpSelect %uint {cm} {self.cu(0xFFFFFFFF)} {self.cu(0)}")
                 self.mask_dst(cd, m)
         elif op == "v_mul_legacy_f32":
