@@ -130,9 +130,23 @@ cmake --build runtime/build/linux --parallel
 
 Pass the directory containing `index.json` and the translated SPIR-V files to `vk_pipeline_check`.
 
-`make_game.py` runs on Linux too, without the `runtime` stage, which builds on Windows only for now: without
-`--stages` it is left out, and asking for it fails before any work starts. The `pipelines` stage uses the
-`vk_pipeline_check` built above (`runtime/build/linux`, or `runtime/build`).
+`make_game.py` runs on Linux too. The `pipelines` stage uses the `vk_pipeline_check` built above
+(`runtime/build/linux`, or `runtime/build`). The `runtime` stage builds on Windows only, so on Linux it needs a
+Windows build of `runtime/`; without one it is left out of the default stages, and asking for it fails before any
+work starts.
+
+### Running the loader on Linux
+
+The loader is a Windows program and runs under Wine or Proton; CI runs its tests under Wine on every change to
+`runtime/` (the `wine` job of the Runtime workflow). Give the `runtime` stage a folder with `gta6rt.exe` and
+`gta6rt_tls_host.dll`, such as the `runtime-windows` artifact of that workflow's `windows` job, unzipped:
+
+```sh
+python3 -I make_game.py --runtime-build ~/Downloads/runtime-windows
+```
+
+It copies both files into `--out` and writes `gta6rt.sh` next to them, which starts `gta6rt.exe` with `wine`, or
+with the Wine named by `WINE` (for Proton, its `files/bin/wine`). The same option skips the build on Windows.
 
 ## How it works
 
