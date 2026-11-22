@@ -1170,9 +1170,6 @@ The layer's descriptor model:
   `VK_EXT_image_view_min_lod`. Vulkan allows the image-view minimum to be rounded down to an integer.
   With nearest mip filtering, the UHD 770 and Arrow Lake Xe-LPG returned mip 0 for a 2D minimum of 0.75.
   The Xe-LPG also returned mip 1 for a 2D-array minimum of 1.75. RTX and Radeon returned mips 1 and 2.
-  On Intel integrated GPUs the layer therefore passes the clamp rounded to the nearest level
-  (`ceil(minLod + 0.5) - 1`), which point mip filtering selects exactly; linear mip filtering then blends from that
-  whole level instead of the fraction (D3D-219). `LEONIDA_MIN_LOD_INTEGER=1` or `0` forces the rounding on or off.
   See [Vulkan image-level selection](https://docs.vulkan.org/spec/latest/chapters/textures.html#textures-image-level-selection)
   and the [Intel readbacks](https://github.com/ItsNotRexed/Leonida/pull/1015#issuecomment-7075135647).
   If the logical device lacks the feature, the runtime logs the unsupported view
