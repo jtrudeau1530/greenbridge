@@ -404,6 +404,28 @@ python -I tools/bvh_geometry_check.py <dehydrated.bin> --geom <vertices.f32>[,<i
 python -I tests/test_bvh_geometry_check.py
 ```
 
+`tools/bvh_match.py` finds the drawable geometry a dehydrated BLAS was built from, on top of `rpf9dump`'s model
+export rather than a second decoder. It reads the leaf signature (triangles per geometry index, a leaf that holds two
+primitives counting as two), keeps every (drawable, model) of a `rpf9dump models` manifest whose per-geometry triangle
+counts contain that signature as an ordered subsequence, and checks the survivors with
+`tools/bvh_geometry_check.py` from the model's exported OBJ and the 3x4 at `+0x50` of the instance descriptor. The
+geometries of the two shaders the BVH leaves out are filtered with `--skip-shaders`: those name hashes are game data,
+as §4a says, so the rule is off unless the user passes them. A geometry whose shader index the manifest cannot resolve
+keeps its place and the checks decide. Measured on the ten BLAS of the sample pack, against one 1 GiB window of
+`levels.rpf`: 1,228 models exported, 1 to 374 candidates from the signature per BLAS, and exactly one consistent
+candidate each.
+
+`rpf9dump models` and `rpf9dump textures` take `--start`/`--length` to export a window of a file. A window need not be a
+valid archive - a slice of `levels.rpf` cut at an offset has no `9FPR` header - because both modes read every resource
+from its own compression blocks; a sub-range is never written to the index cache, which describes a whole file.
+
+```powershell
+dotnet build tools/rpf9dump/rpf9dump.csproj -c Release
+dotnet tools/rpf9dump/bin/Release/net8.0/rpf9dump.dll models <levels.rpf> <out> --start 3221225472 --length 1073741824
+python -I tools/bvh_match.py <dehydrated.bin> <out>/levels/models/manifest.json --descriptor <instance208.bin> [--skip-shaders H,H]
+python -I tests/test_bvh_match.py
+```
+
 ## 7a. Building runtime BVHs: `tools/xdxr_bvh.py`
 
 The Vulkan layer has to write acceleration structures in this runtime layout, because the game's traversal shaders

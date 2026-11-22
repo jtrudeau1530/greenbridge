@@ -259,7 +259,7 @@ failures, no duplicate model names, and 2.22 billion triangles (1.95 billion bef
 ## How the exporter works
 
 ```
-rpf9dump models <archive.rpf> <outdir>
+rpf9dump models <archive.rpf> <outdir> [--start BYTES] [--length BYTES]
 ```
 
 `FindCandidateOffsets` scans 4 MiB blocks for a page-aligned 16-byte zero prefix followed by a zlib
@@ -267,6 +267,15 @@ stream at page offset +16. It inflates the first 176 bytes and keeps the offset 
 a drawable or fragment header (`RageModelDecoder.LooksLikeResource`). `RecoverAtOffsets` follows
 the following zlib blocks, splits the inflated bytes into the system segment and the graphics
 segment, probes the extents, and calls `RageModelDecoder.Decode`.
+
+`--start`/`--length` scan one window of the file instead of the whole archive. Neither `models`
+nor `textures` needs the archive directory: the entry list comes from this run's scan or from the
+index cache, and every resource is read from its own compression blocks
+(`tools/rpf9dump/Segments.cs`). A window is therefore a raw slice - a copy of `levels.rpf` from an
+offset, which has no `9FPR` header - and the scan covers exactly the slice. A sub-range is never
+written to the index cache, which describes a whole file; the manifest records `Scan.Start` and
+`Scan.Length` for it. One measured 1 GiB slice of `levels.rpf`: 1,228 models scanned, recovered,
+decoded and exported in about 2 s (497 MB of OBJ and manifest).
 
 To locate a named drawable before decoding, `tools/rpf9_names.py` indexes the measured
 `name.#dr`/`#ft`/`#dd` spellings in bounded zlib prefixes without the encrypted TOC; see
@@ -277,6 +286,12 @@ For each returned entry, `tools/rpf9dump/Program.cs` reads the segments, splits 
 `<outdir>/<archive>/models/manifest.json` with `src`, `Count`, and `Items[]`. Each item records the
 offset, OBJ name, model name, mesh/vertex/triangle counts, fragment and bone-binding flags, bounds,
 per-mesh shader indices, embedded textures, and material texture references.
+
+Three arrays describe the geometries one by one, in the same order as the OBJ's `o` groups:
+`MeshTris` (triangles), `MeshModels` (the position of the model in the drawable's primary-LOD model
+list) and `MeshGeoms` (the position of the geometry in that model). That pair is the geometry index
+a dehydrated BLAS leaf stores ([bvh.md](bvh.md) §4a), which is what `tools/bvh_match.py` matches on;
+`MeshShaders` maps each geometry to its entry in `Materials`, and therefore to its shader name hash.
 
 The manifest has no failure, skip, or layout fields. `Program.cs` increments `fail` only when a
 model entry returned by the carver fails `RageModelDecoder.Decode`; `skip` is not used in models
