@@ -7972,6 +7972,26 @@ def pos_export_layout(osg1, insns):
     return pos_map, misc_svs, clip_n, cull_n
 
 
+def check_interpolation_modes(modes, insns):
+    """Refuse a PS whose FSSM input modes (tools/fssm_header.py, flags bits 0-1) are not the two this
+    translator models.  v_interp_mov_f32 reads a flat input (mode 1, declared Flat); v_interp_p1/p2 and
+    the f16 forms read a perspective-centre input (mode 2: the v0/v1 pair, BaryCoordKHR, attribute
+    inputs without NoPerspective/Centroid/Sample).  In the corpus every read position agrees (12,101 of
+    12,101 PS) and modes 0 and 3 never occur; a disagreement would mean another interpolation (centroid,
+    sample, linear) or a different table, so it is rejected rather than read as perspective-centre.
+    Positions past the table are not checked (the 10 kind-7 tables undercount)."""
+    for ins in insns:
+        op = base_op(ins["op"])
+        if not op.startswith("v_interp_"):
+            continue
+        attr = next((x for x in ins["args"] if x["k"] == "attr"), None)
+        if attr is None or attr["a"] >= len(modes):
+            continue
+        want = fssm_header.MODE_FLAT if op == "v_interp_mov_f32" else fssm_header.MODE_LINEAR
+        if modes[attr["a"]] != want:
+            raise Unsupported(f"PS input {attr['a']} interpolation mode {modes[attr['a']]} read by {op}")
+
+
 def mesh_psv(path, name):
     """PSV0 runtime info of a mesh shader: MSInfo (GroupSharedBytesUsed, GroupSharedViewIDDependentBytes,
     PayloadSizeInBytes, u16 MaxOutputVertices, u16 MaxOutputPrimitives), wave lane counts, then PSVRuntimeInfo1
@@ -8181,9 +8201,12 @@ def translate(path):
         try:
             with open(os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(path))), "fssm",
                                    info["name"] + ".fssm"), "rb") as f:
-                count, fp16 = fssm_header.interpolants(f.read())
+                blob = f.read()
+            count, fp16 = fssm_header.interpolants(blob)
+            modes = fssm_header.interpolation_modes(blob)
         except OSError:
-            count, fp16 = 0, 0
+            count, fp16, modes = 0, 0, []
+        check_interpolation_modes(modes, insns)
         if count:
             g.pixel_interpolants = (count, fp16)
             for n in range(count):

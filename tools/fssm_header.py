@@ -9,7 +9,8 @@ table of 8-byte input records starts at offset 0x138.  A record is present while
     byte 3      running index (same semantic id, next index)
     bytes 4-5   unused here
     byte 6      parameter slot
-    byte 7      flags; bit 4 (0x10) marks a 16-bit interpolant
+    byte 7      flags; bits 0-1 the interpolation mode (1 = constant/flat, 2 = linear, i.e.
+                perspective-correct at the pixel centre), bit 4 (0x10) marks a 16-bit interpolant
 
 The record's position in the table is the `v_interp attr<N>` number the code uses, not byte 6 - 1.
 
@@ -30,6 +31,16 @@ that undercount.  A 200-PS spot check agreed on 187/200.  Flag bit 4 matched the
 opcodes in 12,067/12,101 (99.7%).  `rdna2spirv.py` consumes it in the PS input path (pixel_interpolants:
 every table position declared as a fragment input, 16-bit-flagged positions
 rounded f32->f16->f32 on 32-bit reads).
+
+Interpolation mode (SHADER-181).  On the same corpus the mode bits are 2 in 51,191 records and 1 in
+4,600; 0 and 3 never occur.  They agree with the code in all 12,101 PS: every position with mode 1
+is read only by `v_interp_mov_f32` (4,295 read positions), every position with mode 2 only by
+`v_interp_p1/p2` or the f16 forms (49,594), and no position is read both ways.  On the DXBC side
+PSV0's per-input InterpolationMode is `linear` (79,577 inputs) or `constant` (6,333) for every PS
+attribute; no centroid, sample or noperspective attribute exists, and ISG1 has no mode field.  The
+FSSM stores no SPI_PS_INPUT_ENA/ADDR word: no header field, code-section header or tail record
+tracks the enabled inputs.  Bit 3 (0x08) is set in 11,619 records, always with mode 1 or 2; its
+meaning is not identified.
 
 The post-`code_end` tail carries a binding table.  After 16 bytes of `0xBF9F0000` filler and an
 8-byte header, 20-byte records run until a `0xFFFFFFFF` sentinel; then `u32 0`, `u16 0`, `u16`
@@ -54,6 +65,10 @@ TABLE_OFFSET = 0x138
 RECORD_SIZE = 8
 RECORD_KIND = 6
 FLAG_FP16 = 0x10
+MODE_MASK = 0x03
+MODE_FLAT = 1
+MODE_LINEAR = 2
+MODE_NAMES = {MODE_FLAT: "flat", MODE_LINEAR: "linear"}
 DIRECTORY_OFFSET = 0x120
 DIRECTORY_SIZE = 0x12C
 DIRECTORY_NEXT = 0x130
@@ -106,6 +121,20 @@ def interpolants(blob):
         if entry["flags"] & FLAG_FP16:
             mask |= 1 << position
     return len(inputs), mask
+
+
+def interpolation_modes(blob):
+    """Return the interpolation mode (flags bits 0-1) of each pixel input, in table order.
+
+    MODE_FLAT (1) is a constant input read through v_interp_mov; MODE_LINEAR (2) is interpolated
+    perspective-correct at the pixel centre through v_interp_p1/p2.  0 and 3 never occur in the
+    corpus and have no known meaning.
+    """
+    return [entry["flags"] & MODE_MASK for entry in pixel_inputs(blob)]
+
+
+def mode_name(mode):
+    return MODE_NAMES.get(mode, f"mode{mode}")
 
 
 def directory_ok(blob):
@@ -237,6 +266,7 @@ def tally(rows, stages_known):
         # and must not show up as a 0:N bucket in the reported corpus counts.
         counts = Counter(row["entries"] for row in ps)
         scope = "all"
+    modes = Counter(mode_name(entry["flags"] & MODE_MASK) for row in ps for entry in row["inputs"])
     return {
         "files": len(rows),
         "directory_ok": sum(row["directory_ok"] for row in rows),
@@ -244,6 +274,7 @@ def tally(rows, stages_known):
         "entries": sum(row["entries"] for row in ps),
         "entry_counts": dict(sorted(counts.items())),
         "entry_counts_scope": scope,
+        "modes": dict(sorted(modes.items())),
         "stage_source": "index.json" if stages_known else "table-only",
     }
 
@@ -304,6 +335,8 @@ def main(argv=None):
     total = summary
     print(f"{total['files']} files, directory_ok {total['directory_ok']}, "
           f"PS with table {total['ps_with_table']}, entries {total['entries']}")
+    if total["modes"]:
+        print("interpolation modes: " + ", ".join(f"{k}:{v}" for k, v in total["modes"].items()))
     label = "PS entry counts" if total["entry_counts_scope"] == "ps" else "entry counts"
     print(label + ": " + ", ".join(f"{k}:{v}" for k, v in total["entry_counts"].items()))
     if total["stage_source"] == "table-only":
