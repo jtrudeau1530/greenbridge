@@ -111,6 +111,8 @@ python -I scripts/run_gpu_tests.py --build runtime/build/linux     # Windows: th
 ```
 
 `--filter <text>` runs only matching tests, and `--work <dir>` keeps the intermediate files.
+Add `--require-pass` when verifying a specific path: an all-skipped run exits 1 instead of 0.
+Skips still appear as `SKIP`, and individual skips are allowed if at least one test passes and none fail.
 
 A GPU test program that runs longer than 120 seconds is killed and counted as a failure, so a hung driver does
 not stall the suite. `LEONIDA_GPU_TEST_TIMEOUT` sets the limit in seconds for both `check.py` and

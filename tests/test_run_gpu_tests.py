@@ -66,9 +66,9 @@ class TextureTestOnASmallPushConstantDevice(unittest.TestCase):
     """vk_texture_test exits 77 on a device with 128 push constant bytes: a SKIP, not a FAIL."""
     UNSUPPORTED_MSG = "unsupported: need 144 push constant bytes, device has 128\n"
 
-    def run_one(self, name):
+    def run_one(self, name, require_pass=False):
         with tempfile.TemporaryDirectory() as tmp:
-            args = SimpleNamespace(filter=name, build=tmp, llvm_mc="unused")
+            args = SimpleNamespace(filter=name, build=tmp, llvm_mc="unused", require_pass=require_pass)
 
             def launch(cmd: list[str], **_kwargs: object) -> SimpleNamespace:
                 if cmd[:3] == [sys.executable, "-I", rgt.TRANSLATOR]:
@@ -92,6 +92,12 @@ class TextureTestOnASmallPushConstantDevice(unittest.TestCase):
                 self.assertIn("SKIP (unsupported: need 144 push constant bytes, device has 128)", out)
                 self.assertIn("0/1 passed, 1 skipped", out)
                 self.assertNotIn("no runnable", out)
+
+    def test_require_pass_rejects_a_skip_only_run(self):
+        rc, out = self.run_one("ps_gather_wrap", require_pass=True)
+        self.assertEqual(rc, 1, out)
+        self.assertIn("0/1 passed, 1 skipped", out)
+        self.assertIn("--require-pass: no GPU tests passed", out)
 
 
 class BindlessTestOnASmallPushConstantDevice(unittest.TestCase):

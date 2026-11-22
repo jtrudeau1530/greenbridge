@@ -1,7 +1,7 @@
 """Assemble, translate, and run the synthetic RDNA2->SPIR-V GPU test suite on Vulkan.
 
 Usage:
-    python -I scripts/run_gpu_tests.py [--llvm-mc CMD] [--build DIR] [--work DIR] [--filter SUBSTR]
+    python -I scripts/run_gpu_tests.py [--llvm-mc CMD] [--build DIR] [--work DIR] [--filter SUBSTR] [--require-pass]
 
 --llvm-mc (or LLVM_MC) is a path or a whole command, e.g. "wsl -d Ubuntu -e /usr/lib/llvm-21/bin/llvm-mc".
 """
@@ -601,6 +601,7 @@ def main() -> int:
                          "subfolder that has the test programs is found by itself")
     ap.add_argument("--work", default=None)
     ap.add_argument("--filter", default="")
+    ap.add_argument("--require-pass", action="store_true", help="exit 1 if no GPU test passes")
     a = ap.parse_args()
     # Some test programs run with their working directory in <work>/spirv (vk_texture_test), so a relative path
     # given here would point somewhere else for them.
@@ -1281,7 +1282,12 @@ def run_suite(a, work: str) -> int:
         skipped += ok is None
         print(f"  {tag:4s}  {name:<20s}  {detail}")
     print(f"\n{passed}/{len(results)} passed" + (f", {skipped} skipped" if skipped else ""))
-    return 0 if passed + skipped == len(results) else 1
+    if passed + skipped != len(results):
+        return 1
+    if getattr(a, "require_pass", False) and not passed:
+        print("error: --require-pass: no GPU tests passed", file=sys.stderr)
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
