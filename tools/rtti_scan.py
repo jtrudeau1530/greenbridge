@@ -16,9 +16,11 @@ complete object, number of slots that point into executable sections).
 """
 import argparse
 import json
+import os
 import re
 import struct
 import sys
+import tempfile
 
 
 
@@ -187,6 +189,26 @@ def scan_pe64_rtti(data: bytes) -> dict:
     }
 
 
+def write_report(path, text):
+    """Write the report next to its destination and swap it in, so a write that fails part-way (a full disk, a
+    locked range) leaves the previous report as it was instead of an empty or truncated file."""
+    parent = os.path.dirname(os.path.abspath(path))
+    tmp = None
+    try:
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=parent, prefix=".rtti-", suffix=".tmp",
+                                         delete=False) as f:
+            tmp = f.name
+            f.write(text)
+        os.replace(tmp, path)
+    except BaseException:
+        if tmp is not None:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+        raise
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("image")
@@ -203,8 +225,7 @@ def main():
     out = {"image": a.image, **scanned}
     path = a.out or re.sub(r"\.(exe|dll)$", "", a.image, flags=re.I) + ".rtti.json"
     try:
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(out, f, indent=1)
+        write_report(path, json.dumps(out, indent=1))
     except OSError as exc:
         print(f"ERROR: {path}: {exc.strerror or exc}", file=sys.stderr)
         return 1
