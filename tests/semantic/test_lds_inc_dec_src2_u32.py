@@ -327,6 +327,67 @@ class SIMDInterpreter:
             state.lds.write_dword(idx_a, new_a)
 
 
+# ==============================================================================
+# Condition Codes, Status Flags, and Carry/Borrow Evaluation
+# ==============================================================================
+
+@dataclass(frozen=True)
+class ArithmeticStatusFlags:
+    """Condition codes and arithmetic status flags for 32-bit operations."""
+    zero: bool
+    sign: bool
+    carry: bool
+    borrow: bool
+    overflow: bool
+    wrapped: bool
+
+
+def evaluate_src2_status_flags(
+    opcode: DSOpcode,
+    val_a: int,
+    val_b: int,
+    result: int,
+) -> ArithmeticStatusFlags:
+    """Evaluate condition codes, arithmetic flags, and carry/borrow generation."""
+    a = u32(val_a)
+    b = u32(val_b)
+    res = u32(result)
+
+    zero = (res == 0)
+    sign = bool(res & 0x80000000)
+    carry = False
+    borrow = False
+    overflow = False
+    wrapped = False
+
+    if opcode == DSOpcode.DS_ADD_SRC2_U32:
+        # Unsigned carry occurs when the sum exceeds 32 bits
+        carry = (a + b) > MASK32
+        # Signed overflow: adding two positive numbers yields negative, or two negative yields positive
+        sa, sb, sres = s32(a), s32(b), s32(res)
+        overflow = ((sa > 0 and sb > 0 and sres < 0) or (sa < 0 and sb < 0 and sres > 0))
+    elif opcode == DSOpcode.DS_SUB_SRC2_U32:
+        # Unsigned borrow occurs when minuend is strictly less than subtrahend
+        borrow = (a < b)
+        sa, sb, sres = s32(a), s32(b), s32(res)
+        overflow = ((sa > 0 and sb < 0 and sres < 0) or (sa < 0 and sb > 0 and sres > 0))
+    elif opcode == DSOpcode.DS_INC_SRC2_U32:
+        wrapped = (a >= b)
+        carry = wrapped  # Carry out occurs upon wrap reset to zero
+    elif opcode == DSOpcode.DS_DEC_SRC2_U32:
+        wrapped = (a == 0 or a > b)
+        borrow = wrapped  # Borrow out occurs upon wrapping to limit b
+
+    return ArithmeticStatusFlags(
+        zero=zero,
+        sign=sign,
+        carry=carry,
+        borrow=borrow,
+        overflow=overflow,
+        wrapped=wrapped,
+    )
+
+
 class TestReferenceModelAndOracle(unittest.TestCase):
     """Unit tests for reference mathematical oracle and architectural model."""
 
@@ -678,21 +739,18 @@ class TestRegisterAliasing(unittest.TestCase):
 
     def test_base_address_vgpr_preservation_scalar(self) -> None:
         state = ScalarMachineState(lds_dwords=1024)
-        # Populate entire VGPR file with sentinel patterns
         for reg in range(DEFAULT_NUM_VGPRS):
             state.set_vgpr(reg, 0x12340000 | reg)
 
         v7 = RegisterOperand(7, RegType.VGPR)
-        state.set_vgpr(7, 0x100)  # vaddr points to dword 64
+        state.set_vgpr(7, 0x100)
         instr = DSSrc2Instruction(
             DSOpcode.DS_ADD_SRC2_U32,
             LDSAddressExpression(v7, offset0=0, offset1=1),
         )
         self.scalar_interp.execute(instr, state)
 
-        # v7 must retain 0x100 exactly
         self.assertEqual(state.get_vgpr(7), 0x100)
-        # All other VGPRs must remain intact
         for reg in range(DEFAULT_NUM_VGPRS):
             if reg != 7:
                 self.assertEqual(state.get_vgpr(reg), 0x12340000 | reg)
@@ -715,11 +773,10 @@ class TestRegisterAliasing(unittest.TestCase):
                 self.assertEqual(state.get_lane_vgpr(lane, reg), (lane << 16) | reg)
 
     def test_secondary_memory_operand_preservation(self) -> None:
-        # When A != B, verify LDS[B] is preserved exactly across all opcodes
         state = ScalarMachineState(lds_dwords=1024)
-        state.set_vgpr(0, 0x20)  # dword 8
-        state.set_lds(8, 100)    # A
-        state.set_lds(9, 25)     # B
+        state.set_vgpr(0, 0x20)
+        state.set_lds(8, 100)
+        state.set_lds(9, 25)
 
         v0 = RegisterOperand(0, RegType.VGPR)
         for opcode in (
@@ -730,11 +787,9 @@ class TestRegisterAliasing(unittest.TestCase):
         ):
             instr = DSSrc2Instruction(opcode, LDSAddressExpression(v0, offset0=0, offset1=1))
             self.scalar_interp.execute(instr, state)
-            # Secondary operand B must NEVER be mutated
             self.assertEqual(state.get_lds(9), 25)
 
     def test_address_aliasing_same_cell_inc(self) -> None:
-        # Full address aliasing: offset0 == offset1 -> A == B
         state = ScalarMachineState(lds_dwords=1024)
         state.set_vgpr(0, 0)
         v0 = RegisterOperand(0, RegType.VGPR)
@@ -746,13 +801,9 @@ class TestRegisterAliasing(unittest.TestCase):
         for val in (0, 1, 42, 0x7FFFFFFF, MASK32):
             state.set_lds(2, val)
             self.scalar_interp.execute(instr, state)
-            # Since val_a >= val_a is always True, it must reset to 0 unconditionally!
             self.assertEqual(state.get_lds(2), 0)
 
     def test_address_aliasing_same_cell_dec(self) -> None:
-        # When A == B:
-        # If val == 0: wraps to val_b (which is 0) -> 0
-        # If val > 0: val_a > val_b is False, val_a == 0 is False -> val_a - 1
         state = ScalarMachineState(lds_dwords=1024)
         state.set_vgpr(0, 0)
         v0 = RegisterOperand(0, RegType.VGPR)
@@ -761,18 +812,15 @@ class TestRegisterAliasing(unittest.TestCase):
             LDSAddressExpression(v0, offset0=5, offset1=5),
         )
 
-        # 0 -> 0
         state.set_lds(5, 0)
         self.scalar_interp.execute(instr, state)
         self.assertEqual(state.get_lds(5), 0)
 
-        # 10 -> 9
         state.set_lds(5, 10)
         self.scalar_interp.execute(instr, state)
         self.assertEqual(state.get_lds(5), 9)
 
     def test_address_aliasing_same_cell_add(self) -> None:
-        # When A == B: val_a + val_a = 2 * val_a
         state = ScalarMachineState(lds_dwords=1024)
         state.set_vgpr(0, 0)
         v0 = RegisterOperand(0, RegType.VGPR)
@@ -785,13 +833,11 @@ class TestRegisterAliasing(unittest.TestCase):
         self.scalar_interp.execute(instr, state)
         self.assertEqual(state.get_lds(1), 42)
 
-        # Overflow wrapping
         state.set_lds(1, 0x80000000)
         self.scalar_interp.execute(instr, state)
         self.assertEqual(state.get_lds(1), 0)
 
     def test_address_aliasing_same_cell_sub(self) -> None:
-        # When A == B: val_a - val_a = 0 unconditionally
         state = ScalarMachineState(lds_dwords=1024)
         state.set_vgpr(0, 0)
         v0 = RegisterOperand(0, RegType.VGPR)
@@ -804,6 +850,102 @@ class TestRegisterAliasing(unittest.TestCase):
             state.set_lds(3, val)
             self.scalar_interp.execute(instr, state)
             self.assertEqual(state.get_lds(3), 0)
+
+
+class TestConditionCodesAndStatusFlags(unittest.TestCase):
+    """Unit tests for condition codes, status flags, and carry/borrow generation."""
+
+    def test_add_carry_generation(self) -> None:
+        # 0xFFFFFFFF + 1 = 0 (carry out)
+        flags = evaluate_src2_status_flags(
+            DSOpcode.DS_ADD_SRC2_U32, MASK32, 1, 0
+        )
+        self.assertTrue(flags.carry)
+        self.assertTrue(flags.zero)
+        self.assertFalse(flags.sign)
+        self.assertFalse(flags.borrow)
+
+        # Normal addition without carry
+        flags_norm = evaluate_src2_status_flags(
+            DSOpcode.DS_ADD_SRC2_U32, 10, 20, 30
+        )
+        self.assertFalse(flags_norm.carry)
+        self.assertFalse(flags_norm.zero)
+        self.assertFalse(flags_norm.sign)
+
+    def test_add_signed_overflow(self) -> None:
+        # Positive + Positive yielding Negative
+        flags = evaluate_src2_status_flags(
+            DSOpcode.DS_ADD_SRC2_U32, 0x7FFFFFFF, 1, 0x80000000
+        )
+        self.assertTrue(flags.overflow)
+        self.assertTrue(flags.sign)
+        self.assertFalse(flags.carry)
+
+    def test_sub_borrow_generation(self) -> None:
+        # 0 - 1 = 0xFFFFFFFF (borrow out)
+        flags = evaluate_src2_status_flags(
+            DSOpcode.DS_SUB_SRC2_U32, 0, 1, MASK32
+        )
+        self.assertTrue(flags.borrow)
+        self.assertFalse(flags.zero)
+        self.assertTrue(flags.sign)
+        self.assertFalse(flags.carry)
+
+        # Equal values subtraction: 10 - 10 = 0 (zero flag, no borrow)
+        flags_zero = evaluate_src2_status_flags(
+            DSOpcode.DS_SUB_SRC2_U32, 10, 10, 0
+        )
+        self.assertFalse(flags_zero.borrow)
+        self.assertTrue(flags_zero.zero)
+
+    def test_inc_wrap_flag_generation(self) -> None:
+        # val_a < val_b: no wrap
+        flags_no_wrap = evaluate_src2_status_flags(
+            DSOpcode.DS_INC_SRC2_U32, 2, 5, 3
+        )
+        self.assertFalse(flags_no_wrap.wrapped)
+        self.assertFalse(flags_no_wrap.carry)
+        self.assertFalse(flags_no_wrap.zero)
+
+        # val_a == val_b: wrap triggered
+        flags_wrap = evaluate_src2_status_flags(
+            DSOpcode.DS_INC_SRC2_U32, 5, 5, 0
+        )
+        self.assertTrue(flags_wrap.wrapped)
+        self.assertTrue(flags_wrap.carry)
+        self.assertTrue(flags_wrap.zero)
+
+        # val_a > val_b: wrap triggered
+        flags_over = evaluate_src2_status_flags(
+            DSOpcode.DS_INC_SRC2_U32, 10, 5, 0
+        )
+        self.assertTrue(flags_over.wrapped)
+        self.assertTrue(flags_over.carry)
+        self.assertTrue(flags_over.zero)
+
+    def test_dec_wrap_flag_generation(self) -> None:
+        # val_a == 0: wraps to val_b
+        flags_zero = evaluate_src2_status_flags(
+            DSOpcode.DS_DEC_SRC2_U32, 0, 8, 8
+        )
+        self.assertTrue(flags_zero.wrapped)
+        self.assertTrue(flags_zero.borrow)
+        self.assertFalse(flags_zero.zero)
+
+        # val_a > val_b: wraps to val_b
+        flags_greater = evaluate_src2_status_flags(
+            DSOpcode.DS_DEC_SRC2_U32, 12, 8, 8
+        )
+        self.assertTrue(flags_greater.wrapped)
+        self.assertTrue(flags_greater.borrow)
+
+        # 0 < val_a <= val_b: normal decrement
+        flags_norm = evaluate_src2_status_flags(
+            DSOpcode.DS_DEC_SRC2_U32, 5, 8, 4
+        )
+        self.assertFalse(flags_norm.wrapped)
+        self.assertFalse(flags_norm.borrow)
 
 
 if __name__ == "__main__":
