@@ -584,6 +584,23 @@ if(BUILD_TESTING)
     add_test(NAME bink_decode COMMAND bink_decode_test)
     set_tests_properties(bink_decode PROPERTIES SKIP_RETURN_CODE 77)
 
+    # Optional local viewer: plays a .bk2 in a window through the package's Bink2Scarlett.dll (test/bink_play.cpp).
+    # The CTest entry is the headless smoke run; it skips unless LEONIDA_GAME_DIR and LEONIDA_MOVIE are set.
+    add_executable(bink_play
+      test/bink_play.cpp
+      src/pe_loader.cpp
+      shims/registry.cpp
+      shims/xmem.cpp
+    )
+    target_compile_definitions(bink_play PRIVATE
+      WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE _CRT_SECURE_NO_WARNINGS)
+    target_compile_options(bink_play PRIVATE /W4 /permissive- /EHsc /utf-8)
+    target_link_options(bink_play PRIVATE /OPT:NOREF)
+    target_link_libraries(bink_play PRIVATE psapi user32 gdi32)
+    add_dependencies(bink_play gta6rt_tls_host)
+    add_test(NAME bink_play_headless COMMAND bink_play --headless --frames 30)
+    set_tests_properties(bink_play_headless PROPERTIES SKIP_RETURN_CODE 77)
+
     # Optional: skips unless LEONIDA_GAME_DIR is set. Drives the package's FSR DLL on the Xbox-ABI device proxy.
     if(D3D12_LIBRARY AND DXGI_LIBRARY)
       add_executable(fsr_dispatch_test
