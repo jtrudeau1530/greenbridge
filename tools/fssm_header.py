@@ -229,7 +229,9 @@ def tally(rows, stages_known):
     else:
         # Without a stage index, a non-empty table is the only PS signal the blob carries.
         ps = [row for row in rows if row["entries"]]
-        counts = Counter(row["entries"] for row in rows)
+        # Keep the histogram in the same scope as ps_with_table/entries: non-PS blobs have no table
+        # and must not show up as a 0:N bucket in the reported corpus counts.
+        counts = Counter(row["entries"] for row in ps)
         scope = "all"
     return {
         "files": len(rows),
