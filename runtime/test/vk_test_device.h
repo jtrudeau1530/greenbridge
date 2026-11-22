@@ -4,7 +4,9 @@
 #pragma once
 
 #include "vulkan_loader.h"
+#include "../src/vulkan_device_filter.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -59,6 +61,7 @@ public:
     bool bc = false;  // textureCompressionBC enabled
     bool bindless = false;         // the features the bindless set 0 needs are enabled
     bool partially_bound = false;  // and its slots can stay empty
+    bool image_view_min_lod = false;
     bool conditional_rendering = false;  // VK_EXT_conditional_rendering enabled, where available
     bool host_image_copy = false;  // VK_EXT_host_image_copy and hostImageCopy enabled
     bool occlusion_query_precise = false;    // occlusionQueryPrecise enabled
@@ -184,7 +187,7 @@ public:
         for (auto candidate : devices) {
             VkPhysicalDeviceProperties props{};
             properties_of(candidate, &props);
-            if (props.apiVersion < VK_API_VERSION_1_3) continue;
+            if (props.apiVersion < VK_API_VERSION_1_3 || !leonida::vulkan_device_wanted(props.deviceName)) continue;
             std::uint32_t family_count = 0;
             families_of(candidate, &family_count, nullptr);
             std::vector<VkQueueFamilyProperties> families(family_count);
@@ -200,6 +203,12 @@ public:
             }
         }
         if (!physical) {
+            if (const std::string filter = leonida::vulkan_device_filter(); !filter.empty()) {
+                // A filter that matches nothing fails the test instead of skipping it.
+                std::fprintf(stderr, "LEONIDA_VK_DEVICE=%s: no Vulkan 1.3 device with a graphics queue matches\n",
+                             filter.c_str());
+                return DeviceStatus::failed;
+            }
             std::fprintf(stderr, "no Vulkan 1.3 device with a graphics queue\n");
             return DeviceStatus::unavailable;
         }
@@ -277,6 +286,18 @@ public:
         enumerate_extensions(physical, nullptr, &extension_count, nullptr);
         std::vector<VkExtensionProperties> extensions(extension_count);
         enumerate_extensions(physical, nullptr, &extension_count, extensions.data());
+        VkPhysicalDeviceImageViewMinLodFeaturesEXT min_lod{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_VIEW_MIN_LOD_FEATURES_EXT};
+        if (std::any_of(extensions.begin(), extensions.end(), [](const auto& e) {
+                return std::strcmp(e.extensionName, VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME) == 0;
+            })) {
+            VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &min_lod};
+            instance_fn<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2")(physical, &query);
+            image_view_min_lod = min_lod.minLod == VK_TRUE;
+            if (image_view_min_lod) {
+                min_lod.pNext = enable13.pNext;
+                enable13.pNext = &min_lod;
+            }
+        }
         VkPhysicalDeviceHostImageCopyFeaturesEXT host_copy{
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_IMAGE_COPY_FEATURES_EXT};
         for (const auto& extension : extensions) {
@@ -300,6 +321,7 @@ public:
         device_info.pQueueCreateInfos = &queue_info;
         device_info.pEnabledFeatures = &enable;
         std::vector<const char*> device_extensions;
+        if (image_view_min_lod) device_extensions.push_back(VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME);
         if (conditional_rendering) device_extensions.push_back(conditional_extension);
         if (host_image_copy) device_extensions.push_back(host_image_copy_name);
         device_info.enabledExtensionCount = std::uint32_t(device_extensions.size());

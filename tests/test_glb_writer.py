@@ -646,6 +646,36 @@ class TestObjParserAndBounds(unittest.TestCase):
         self.assertAlmostEqual(uvs[2][0], 0.0)
         self.assertAlmostEqual(uvs[2][1], 0.0)   # 1.0 - 1.0
 
+    def test_parse_obj_generated_normals_cross_uv_seams(self):
+        # The second triangle has twice the area of the first and a different UV
+        # on each shared corner. They contribute +2Y and +Z to the shared normals.
+        expected = (0.0, 2 / math.sqrt(5), 1 / math.sqrt(5))
+        for suffix in ("", "/1"):
+            with self.subTest(explicit_normal=bool(suffix)):
+                obj_text = "\n".join([
+                    "v 0 0 0", "v 1 0 0", "v 0 1 0", "v 0 0 2",
+                    "vt 0 0", "vt 1 0", "vt 0 1", "vt .75 0", "vt .25 0", "vt .25 1",
+                    "vn 1 0 0",
+                    "s 1",
+                    "f 1/1 2/2 3/3",
+                    f"f 2/4 1/5{suffix} 4/6",
+                ])
+                prim, = glb_writer.parse_obj(obj_text, is_path=False, up_axis="y")
+                self.assertEqual(len(prim["positions"]), 6)
+                normals = {
+                    (position, uv): normal
+                    for position, uv, normal in zip(prim["positions"], prim["uvs"], prim["normals"])
+                }
+                shared_edge = [
+                    ((0.0, 0.0, 0.0), (0.0, 1.0), expected),
+                    ((0.0, 0.0, 0.0), (0.25, 1.0), (1.0, 0.0, 0.0) if suffix else expected),
+                    ((1.0, 0.0, 0.0), (1.0, 1.0), expected),
+                    ((1.0, 0.0, 0.0), (0.75, 1.0), expected),
+                ]
+                for position, uv, expected_normal in shared_edge:
+                    for actual, target in zip(normals[position, uv], expected_normal):
+                        self.assertAlmostEqual(actual, target)
+
     def test_parse_obj_quad_fan_triangulation(self):
         obj_text = "\n".join([
             "v 0 0 0",

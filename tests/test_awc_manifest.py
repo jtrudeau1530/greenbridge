@@ -97,7 +97,7 @@ class ManifestTest(unittest.TestCase):
         self.assertNotIn("Traceback", p.stderr)
         self.assertIn("warning", p.stderr.lower())
         self.assertIn("bad.awc", p.stderr)
-        self.assertIn("2 banks, 5 streams, 2 streamed-music channels", p.stderr)
+        self.assertIn("1 banks, 5 streams, 2 streamed-music channels", p.stderr)
         reader = csv.DictReader(io.StringIO(p.stdout))
         self.assertEqual(reader.fieldnames, HEADER)
         rows = {r["stream"]: r for r in reader}
@@ -135,6 +135,20 @@ class ManifestTest(unittest.TestCase):
         self.assertEqual([r["stream"] for r in doc["streams"]], ["00000010", "00000020", "00000030"])
         self.assertIs(doc["streams"][0]["streamed_music"], False)
         self.assertAlmostEqual(doc["streams"][0]["duration_s"], 0.1, places=6)
+
+    def test_invalid_banks_are_not_counted(self):
+        for name in ("bad1.awc", "bad2.awc"):
+            with open(os.path.join(self.tmp.name, name), "wb") as f:
+                f.write(b"not an AWC")
+        p = self.run_tool(self.tmp.name, "--format", "json")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("warning", p.stderr.lower())
+        self.assertIn("bad1.awc", p.stderr)
+        self.assertIn("bad2.awc", p.stderr)
+        self.assertIn("0 banks, 0 streams, 0 streamed-music channels", p.stderr)
+        doc = json.loads(p.stdout)
+        self.assertEqual((doc["bank_count"], doc["stream_count"]), (0, 0))
+        self.assertEqual(doc["streams"], [])
 
     def test_failed_write_keeps_the_previous_manifest(self):
         out = os.path.join(self.tmp.name, "manifest.json")

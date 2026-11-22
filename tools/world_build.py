@@ -37,6 +37,7 @@ except ImportError:  # pragma: no cover - sibling module may not be present duri
 
 
 GRID_GAP = 4.0
+SPAWN_SPAN_CAP = 1200.0
 
 
 def _get_dds_png():
@@ -442,7 +443,9 @@ def _compute_spawn(chunks: list[dict]) -> list[float]:
     cx = 0.5 * (b[0] + b[3])
     max_y = b[4]
     max_z = b[5]
-    span = max(b[3] - b[0], b[4] - b[1], b[5] - b[2])
+    # The viewer loads chunks within 1400 m. Limiting the offsets to 300 m up and 720 m back
+    # keeps the camera within 780 m of the chosen chunk's bounds, even for very large models.
+    span = min(max(b[3] - b[0], b[4] - b[1], b[5] - b[2]), SPAWN_SPAN_CAP)
     return [
         float(cx),
         float(max_y + max(8.0, 0.25 * span)),

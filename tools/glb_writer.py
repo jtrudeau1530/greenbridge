@@ -21,7 +21,9 @@ import stat
 import struct
 import sys
 import tempfile
+import threading
 import time
+from collections.abc import Iterable
 
 GLB_MAGIC = b"glTF"
 GLB_VERSION = 2
@@ -75,7 +77,7 @@ def _normalize3(nx: float, ny: float, nz: float) -> tuple[float, float, float]:
 
 def _compute_smooth_normals(
     positions: list[tuple[float, float, float]],
-    indices: list[int],
+    indices: Iterable[int],
 ) -> list[tuple[float, float, float]]:
     """Compute area-weighted smooth vertex normals with (0, 1, 0) fallback."""
     n = len(positions)
@@ -83,10 +85,8 @@ def _compute_smooth_normals(
     ay = [0.0] * n
     az = [0.0] * n
 
-    for t in range(0, len(indices) - 2, 3):
-        i0 = indices[t]
-        i1 = indices[t + 1]
-        i2 = indices[t + 2]
+    index_iter = iter(indices)
+    for i0, i1, i2 in zip(index_iter, index_iter, index_iter):
         p0 = positions[i0]
         p1 = positions[i1]
         p2 = positions[i2]
@@ -390,11 +390,17 @@ def parse_obj(
             continue
 
         if builder["has_missing_normal"]:
-            computed = _compute_smooth_normals(positions, indices)
-            raw_normals = builder["normals"]
+            # UVs and explicit normals split render vertices, but generated normals
+            # share the first render vertex's accumulator for each OBJ position.
+            first_vertex: dict[int, int] = {}
+            normal_vertices = [
+                first_vertex.setdefault(corner[0], vertex)
+                for corner, vertex in builder["vert_map"].items()
+            ]
+            computed = _compute_smooth_normals(positions, (normal_vertices[i] for i in indices))
             normals = [
-                raw_normals[i] if raw_normals[i] is not None else computed[i]
-                for i in range(len(positions))
+                normal if normal is not None else computed[normal_vertex]
+                for normal, normal_vertex in zip(builder["normals"], normal_vertices)
             ]
         else:
             normals = builder["normals"]
@@ -858,13 +864,19 @@ def _replace(source: str, destination: str) -> None:
     os.replace(source, destination)
 
 
+# os.umask can only be read by setting it, and the umask is process-wide: two writers reading it at once could
+# leave it at 0 for the whole process. One lock makes the set-and-restore atomic for every writer in this module.
+_UMASK_LOCK = threading.Lock()
+
+
 def _output_mode(path: str) -> int:
     """Permission bits for a published GLB: those of the file it replaces, or 0666 minus the umask."""
     try:
         return stat.S_IMODE(os.stat(path).st_mode)
     except FileNotFoundError:
-        mask = os.umask(0)
-        os.umask(mask)
+        with _UMASK_LOCK:
+            mask = os.umask(0)
+            os.umask(mask)
         return 0o666 & ~mask
 
 

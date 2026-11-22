@@ -115,11 +115,16 @@ int main() {
     check(SUCCEEDED(hr) && factory, "DXGI factory created");
     ComPtr<IDXGIAdapter> warp;
     if (factory) hr = factory->EnumWarpAdapter(IID_PPV_ARGS(warp.GetAddressOf()));
-    check(SUCCEEDED(hr) && warp, "WARP adapter enumerated");
-    if (!warp) {
-        std::printf("device_proxy_test: FAILED (no WARP)\n");
+    if (!factory) {
+        std::printf("device_proxy_test: FAILED (no DXGI factory)\n");
         return 1;
     }
+    if (!warp) {
+        // Windows always has WARP; Wine doesn't. CTest reads exit code 77 as a skip (SKIP_RETURN_CODE).
+        std::printf("SKIP device_proxy_test: no WARP adapter (0x%08lX)\n", static_cast<unsigned long>(hr));
+        return 77;
+    }
+    check(true, "WARP adapter enumerated");
 
     auto create_device = reinterpret_cast<XboxCreateDeviceFn>(
         rt::shims::find("d3d12_xs.dll", "D3D12XboxCreateDevice"));
@@ -150,6 +155,8 @@ int main() {
     check(rt::d3d12_xs::device_slot_overridden(14), "device slot 14 is the descriptor-heap override");
     check(rt::d3d12_xs::device_slot_overridden(62), "device slot 62 is the compute-PSO override");
     check(rt::d3d12_xs::device_slot_overridden(76), "device slot 76 is the resource override");
+    check(rt::d3d12_xs::device_slot_overridden(67),
+          "device slot 67 is refused (console native-code compute pipeline, not PC CreateProtectedResourceSession1)");
 
     void** proxy_vtbl = *reinterpret_cast<void***>(device.Get());
     void** real_vtbl = real ? *reinterpret_cast<void***>(real) : nullptr;

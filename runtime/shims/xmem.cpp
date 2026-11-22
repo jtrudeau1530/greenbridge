@@ -4,7 +4,7 @@
 //   XMemAlloc(size, attributes)
 //   XMemFree(ptr, attributes)
 //   XMemVirtualQuery(process, address, out64)
-//   XMemGetWorkingSetStatistics(out)
+//   XMemGetWorkingSetStatistics(kind, out)   (kind 0x20000001 at all seven FSR call sites)
 //
 // ASSUMPTION: the attribute word is not decoded by the measured call sites (one passes 0x5e50000). Until a call
 // site shows the alignment/type fields, every block is 64-byte aligned (covers cache lines and SIMD) and a size of
@@ -58,10 +58,14 @@ SIZE_T __stdcall XMemVirtualQuery(HANDLE process, const void* address, void* out
     return written;
 }
 
-// GDK: BOOL XMemGetWorkingSetStatistics(XMEM_WORKING_SET_STATISTICS*). The layout is not fully known. The FidelityFX
-// upscaler reads a 64-bit size at +8 and treats FALSE as "no data", so only the first 16 bytes are touched: zero at
-// +0 (unknown) and the process working set at +8. Do not claim more of the struct than is measured.
-BOOL __stdcall XMemGetWorkingSetStatistics(void* stats) {
+// BOOL XMemGetWorkingSetStatistics(UINT32 kind, XMEM_WORKING_SET_STATISTICS* stats). Measured at all seven call sites
+// in amd_fidelityfx_upscaler_xbox.dll (1.0.2.1; calls at RVAs 0x26b3, 0x2ea1, 0x39a9, 0x7452, 0x74d2, 0x7568,
+// 0x75b1): ECX is the constant 0x20000001 (its meaning is not known) and RDX points at a stack buffer (0x80 bytes
+// where the frame shows it). The caller reads a 64-bit size at +8 and treats a zero return as "no data". Taking the
+// pointer from the first argument wrote to address 0x20000001.
+// Only the first 16 bytes are touched: zero at +0 (unknown) and the process working set at +8. Do not claim more of
+// the struct than is measured.
+BOOL __stdcall XMemGetWorkingSetStatistics(uint32_t /*kind*/, void* stats) {
     if (!stats) {
         static std::atomic<bool> warned{false};
         if (!warned.exchange(true, std::memory_order_relaxed)) {

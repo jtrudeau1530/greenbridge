@@ -12,6 +12,7 @@
 //     effect (SDL_SendGamepadEffect), as set by LEONIDA_DS_TRIGGERS. That is an approximation of the Xbox impulse
 //     trigger signal, not the PS5 version's authored effects.
 //   - DualSense/DualShock 4 lightbar colour (LEONIDA_DS_LIGHTBAR) and the player LEDs by connection order
+//   - the keyboard pad (LEONIDA_KEYBOARD_PAD): one SDL virtual gamepad whose buttons the keyboard presses, for menus
 //
 // One thread owns SDL: the background poll thread by default, or the caller of rt::gameinput::poll() when
 // LEONIDA_GAMEINPUT_THREAD=0. Title calls never touch SDL: they read the latest snapshot and leave rumble requests
@@ -113,6 +114,12 @@ rt::gameinput::Config read_config() {
     }
     if (env("LEONIDA_RUMBLE") == "0") c.rumble = false;
     if (env("LEONIDA_GAMEINPUT_THREAD") == "0") c.background_thread = false;
+    const std::string k = env("LEONIDA_KEYBOARD_PAD");
+    if (k == "1" || k == "on" || k == "focus") c.keyboard_pad = rt::gameinput::KeyboardPadMode::Focused;
+    else if (k == "always") c.keyboard_pad = rt::gameinput::KeyboardPadMode::Always;
+    else if (!k.empty() && k != "0" && k != "off")
+        std::fprintf(stderr, "[rt] gameinput: LEONIDA_KEYBOARD_PAD=%s unknown (1, always or off), keyboard pad off\n",
+                     k.c_str());
     return c;
 }
 
@@ -741,6 +748,101 @@ void refresh_battery(Device* d, uint64_t now) {
     d->battery = b;
 }
 
+// ---- keyboard pad (poll thread only) ----------------------------------------------------------------------------
+//
+// The title reads gamepads, not the keyboard, so keys reach it as one more pad: an SDL virtual gamepad that this
+// code presses buttons on each poll. It then goes through open_pad and read_pad like any controller, so it gets a
+// device object, a player slot, readings, callbacks and UI navigation the same way. It has no motors, so rumble sent
+// to it is dropped. Keys are read with GetAsyncKeyState, which needs no window or message loop and works under Wine.
+
+constexpr rt::gameinput::KeyBinding kKeyBindings[] = {
+    {VK_UP, SDL_GAMEPAD_BUTTON_DPAD_UP, "Up"},
+    {VK_DOWN, SDL_GAMEPAD_BUTTON_DPAD_DOWN, "Down"},
+    {VK_LEFT, SDL_GAMEPAD_BUTTON_DPAD_LEFT, "Left"},
+    {VK_RIGHT, SDL_GAMEPAD_BUTTON_DPAD_RIGHT, "Right"},
+    {VK_RETURN, SDL_GAMEPAD_BUTTON_SOUTH, "Enter"},
+    {VK_BACK, SDL_GAMEPAD_BUTTON_EAST, "Backspace"},
+    {'X', SDL_GAMEPAD_BUTTON_WEST, "X"},
+    {'Y', SDL_GAMEPAD_BUTTON_NORTH, "Y"},
+    {'Q', SDL_GAMEPAD_BUTTON_LEFT_SHOULDER, "Q"},
+    {'E', SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER, "E"},
+    {VK_ESCAPE, SDL_GAMEPAD_BUTTON_START, "Esc"},
+    {VK_TAB, SDL_GAMEPAD_BUTTON_BACK, "Tab"},
+};
+
+bool async_key_down(int vk) { return (GetAsyncKeyState(vk) & 0x8000) != 0; }
+
+bool foreground_is_ours() {
+    const HWND w = GetForegroundWindow();
+    DWORD pid = 0;
+    return w && GetWindowThreadProcessId(w, &pid) && pid == GetCurrentProcessId();
+}
+
+std::atomic<rt::gameinput::KeyDownFn> g_key_down{async_key_down};
+std::atomic<rt::gameinput::HasFocusFn> g_has_focus{foreground_is_ours};
+
+struct KeyboardPad {
+    SDL_JoystickID id = 0;
+    SDL_Joystick* js = nullptr;
+    bool failed = false;  // attaching failed once; not retried every 2 ms
+};
+KeyboardPad g_keyboard;
+
+void detach_keyboard_pad() {
+    if (g_keyboard.js) SDL_CloseJoystick(g_keyboard.js);
+    if (g_keyboard.id) SDL_DetachVirtualJoystick(g_keyboard.id);
+    if (g_keyboard.id) std::fprintf(stderr, "[rt] gameinput: keyboard pad removed\n");
+    g_keyboard = {};
+}
+
+bool attach_keyboard_pad() {
+    SDL_VirtualJoystickDesc d;
+    SDL_INIT_INTERFACE(&d);
+    d.type = SDL_JOYSTICK_TYPE_GAMEPAD;
+    d.naxes = SDL_GAMEPAD_AXIS_COUNT;
+    d.nbuttons = SDL_GAMEPAD_BUTTON_COUNT;
+    d.button_mask = (1u << SDL_GAMEPAD_BUTTON_COUNT) - 1;
+    d.axis_mask = (1u << SDL_GAMEPAD_AXIS_COUNT) - 1;
+    d.name = "Keyboard pad (Leonida)";
+    g_keyboard.id = SDL_AttachVirtualJoystick(&d);
+    g_keyboard.js = g_keyboard.id ? SDL_OpenJoystick(g_keyboard.id) : nullptr;
+    if (!g_keyboard.js) {
+        std::fprintf(stderr, "[rt] gameinput: cannot attach the keyboard pad: %s\n", SDL_GetError());
+        detach_keyboard_pad();
+        g_keyboard.failed = true;
+        return false;
+    }
+    // Triggers at rest: SDL maps a full-range virtual axis to the trigger, so -32768 is released, 0 half pulled.
+    SDL_SetJoystickVirtualAxis(g_keyboard.js, SDL_GAMEPAD_AXIS_LEFT_TRIGGER, -32768);
+    SDL_SetJoystickVirtualAxis(g_keyboard.js, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER, -32768);
+    std::fprintf(stderr, "[rt] gameinput: keyboard pad attached (arrows d-pad, Enter A, Backspace B, X X, Y Y, "
+                         "Q/E shoulders, Esc Menu, Tab View)\n");
+    return true;
+}
+
+// Before SDL_UpdateGamepads, so the buttons set here are in this poll's reading.
+void update_keyboard_pad() {
+    rt::gameinput::KeyboardPadMode mode;
+    {
+        std::lock_guard lock(g().mu);
+        mode = g().config.keyboard_pad;
+    }
+    if (mode == rt::gameinput::KeyboardPadMode::Off) {
+        if (g_keyboard.id) detach_keyboard_pad();
+        g_keyboard.failed = false;
+        return;
+    }
+    if (!g_keyboard.js && (g_keyboard.failed || !attach_keyboard_pad())) return;
+
+    bool down[SDL_GAMEPAD_BUTTON_COUNT] = {};
+    // Out of focus every button is released, so a key held while switching windows does not stay pressed.
+    if (mode == rt::gameinput::KeyboardPadMode::Always || g_has_focus.load()()) {
+        const rt::gameinput::KeyDownFn key_down = g_key_down.load();
+        for (const auto& b : kKeyBindings) down[b.sdl_button] |= key_down(b.virtual_key);
+    }
+    for (const auto& b : kKeyBindings) SDL_SetJoystickVirtualButton(g_keyboard.js, b.sdl_button, down[b.sdl_button]);
+}
+
 bool init_sdl() {
     State& s = g();
     if (s.sdl_ready) return true;
@@ -770,6 +872,7 @@ void poll_once() {
     State& s = g();
     std::lock_guard pl(s.poll_mu);
     if (!init_sdl()) return;
+    update_keyboard_pad();
     SDL_UpdateGamepads();
     const uint64_t now = now_us();
 
@@ -1174,6 +1277,16 @@ bool output_state(int i, OutputState* out) {
     if (i < 0 || i >= static_cast<int>(g().connected.size()) || !out) return false;
     *out = g().connected[static_cast<size_t>(i)]->sent;
     return true;
+}
+
+void set_keyboard_source(KeyDownFn key_down, HasFocusFn has_focus) {
+    g_key_down = key_down ? key_down : async_key_down;
+    g_has_focus = has_focus ? has_focus : foreground_is_ours;
+}
+
+const KeyBinding* keyboard_bindings(int* count) {
+    if (count) *count = static_cast<int>(std::size(kKeyBindings));
+    return kKeyBindings;
 }
 
 }  // namespace rt::gameinput

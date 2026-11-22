@@ -22,6 +22,13 @@ void check(bool condition, const char* what) {
     if (!condition) ++g_failures;
 }
 
+// Checks of the host serializer itself, not of the shim: Microsoft's d3d12.dll rejects the Xbox flag byte, Wine's
+// (vkd3d) doesn't validate it. Runtime-dependent, as the host deserializer check below.
+void check_host_rejects(HRESULT hr, const char* what) {
+    if (FAILED(hr)) check(true, what);
+    else std::printf("SKIP %s (this host's serializer accepts it; runtime-dependent)\n", what);
+}
+
 struct Blobs {
     ID3DBlob* blob = nullptr;
     ID3DBlob* error = nullptr;
@@ -85,7 +92,7 @@ void test_versioned_1_0() {
     {
         Blobs blobs;
         HRESULT hr = D3D12SerializeVersionedRootSignature(&xbox, &blobs.blob, &blobs.error);
-        check(FAILED(hr), "versioned 1.0 with Xbox flags 0x03000000 is rejected by the PC serializer");
+        check_host_rejects(hr, "versioned 1.0 with Xbox flags 0x03000000 is rejected by the PC serializer");
     }
 
     D3D12_VERSIONED_ROOT_SIGNATURE_DESC cleared{};
@@ -109,7 +116,7 @@ void test_versioned_1_1() {
     {
         Blobs blobs;
         HRESULT hr = D3D12SerializeVersionedRootSignature(&xbox, &blobs.blob, &blobs.error);
-        check(FAILED(hr), "versioned 1.1 with Xbox flags 0x03000000 is rejected by the PC serializer");
+        check_host_rejects(hr, "versioned 1.1 with Xbox flags 0x03000000 is rejected by the PC serializer");
     }
 
     D3D12_VERSIONED_ROOT_SIGNATURE_DESC cleared{};
@@ -146,7 +153,7 @@ void test_versioned_1_2(bool supports_1_2) {
     {
         Blobs blobs;
         HRESULT hr = D3D12SerializeVersionedRootSignature(&xbox, &blobs.blob, &blobs.error);
-        check(FAILED(hr), "versioned 1.2 with Xbox flags 0x03000000 is rejected by the PC serializer");
+        check_host_rejects(hr, "versioned 1.2 with Xbox flags 0x03000000 is rejected by the PC serializer");
     }
 
     Blobs blobs;
@@ -251,7 +258,7 @@ void test_legacy_entry_point() {
     {
         Blobs blobs;
         HRESULT hr = D3D12SerializeRootSignature(&xbox, D3D_ROOT_SIGNATURE_VERSION_1_0, &blobs.blob, &blobs.error);
-        check(FAILED(hr), "legacy serializer rejects flags 0x03000000");
+        check_host_rejects(hr, "legacy serializer rejects flags 0x03000000");
     }
 
     D3D12_ROOT_SIGNATURE_DESC cleared{};
