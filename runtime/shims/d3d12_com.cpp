@@ -45,14 +45,19 @@ public:
     // {7d0e6b51-34a2-4f0c-9a61-0c5b2e8f4a10}
     static constexpr GUID kTag{0x7d0e6b51, 0x34a2, 0x4f0c, {0x9a, 0x61, 0x0c, 0x5b, 0x2e, 0x8f, 0x4a, 0x10}};
     explicit CommandAllocator(D3D12_COMMAND_LIST_TYPE type) : type_(type) {}
-    // Lists own their recorded commands, so there is nothing to free. D3D12 forbids resetting an allocator whose
-    // lists are still executing; that is the application's job, as on D3D12.
-    HRESULT STDMETHODCALLTYPE Reset() override { return S_OK; }
+    // Lists own their recorded commands, so there is nothing to free. As on the PC runtime (D3D-51, measured by
+    // d3d12_vulkan_device_test): E_FAIL while a list is recording into this allocator, and S_OK while its lists are
+    // still executing on the GPU (keeping that safe is the application's job on D3D12 too).
+    HRESULT STDMETHODCALLTYPE Reset() override { return recording_ ? E_FAIL : S_OK; }
     D3D12_COMMAND_LIST_TYPE type() const { return type_; }
+    // The one list that is recording into this allocator, or null. D3D12 allows one at a time.
+    const void* recording() const { return recording_; }
+    void set_recording(const void* list) { recording_ = list; }
     static CommandAllocator* from(IUnknown* object) { return Child::from<CommandAllocator>(object); }
 
 private:
     D3D12_COMMAND_LIST_TYPE type_;
+    const void* recording_ = nullptr;
 };
 
 class GraphicsCommandList final
@@ -65,6 +70,14 @@ public:
     // {2f8a7c33-91d4-4b6e-8e05-6d3f1a9b2c47}
     static constexpr GUID kTag{0x2f8a7c33, 0x91d4, 0x4b6e, {0x8e, 0x05, 0x6d, 0x3f, 0x1a, 0x9b, 0x2c, 0x47}};
     explicit GraphicsCommandList(D3D12_COMMAND_LIST_TYPE type) : type_(type) {}
+    ~GraphicsCommandList() override { stop_recording(); }
+
+    // While open, the list holds a reference to the allocator it records into and marks it busy.
+    void record_into(CommandAllocator* allocator) {
+        allocator->AddRef();
+        allocator->set_recording(this);
+        allocator_ = allocator;
+    }
 
     const leonida::CommandList& commands() const { return list_; }
     UINT front_stencil_ref() const { return front_stencil_ref_; }
@@ -76,13 +89,17 @@ public:
     // E_INVALIDARG when a call during recording was invalid, as D3D12's Close reports it.
     HRESULT STDMETHODCALLTYPE Close() override {
         if (!list_.close()) return E_FAIL;
+        stop_recording();
         return invalid_ ? E_INVALIDARG : S_OK;
     }
 
     HRESULT STDMETHODCALLTYPE Reset(ID3D12CommandAllocator* allocator, ID3D12PipelineState* state) override {
         CommandAllocator* command_allocator = CommandAllocator::from(allocator);
         if (!command_allocator || command_allocator->type() != type_) return E_INVALIDARG;
+        // Another list recording into the allocator: E_INVALIDARG, as on the PC runtime (D3D-51).
+        if (command_allocator->recording() && command_allocator->recording() != this) return E_INVALIDARG;
         if (!list_.reset()) return E_FAIL;  // D3D12 resets only closed lists
+        record_into(command_allocator);
         invalid_ = false;
         front_stencil_ref_ = back_stencil_ref_ = 0;  // Reset returns every list state to its default
         stencil_ref_set_ = false;
@@ -260,7 +277,15 @@ private:
         if (!ok) invalid_ = true;
     }
 
+    void stop_recording() {
+        if (!allocator_) return;
+        if (allocator_->recording() == this) allocator_->set_recording(nullptr);
+        allocator_->Release();
+        allocator_ = nullptr;
+    }
+
     D3D12_COMMAND_LIST_TYPE type_;
+    CommandAllocator* allocator_ = nullptr;  // referenced while the list is open
     leonida::CommandList list_;
     bool invalid_ = false;
     UINT front_stencil_ref_ = 0;
@@ -444,9 +469,12 @@ HRESULT create_command_list(D3D12_COMMAND_LIST_TYPE type, ID3D12CommandAllocator
     *out = nullptr;
     CommandAllocator* command_allocator = CommandAllocator::from(allocator);
     if (!command_allocator || command_allocator->type() != type) return E_INVALIDARG;
+    // A list is created open, so the allocator must be free: E_INVALIDARG as on the PC runtime (D3D-51).
+    if (command_allocator->recording()) return E_INVALIDARG;
     if (type != D3D12_COMMAND_LIST_TYPE_DIRECT && type != D3D12_COMMAND_LIST_TYPE_BUNDLE)
         stub("create_command_list(non-direct type)");
     auto* object = new GraphicsCommandList(type);  // created open, as D3D12 does
+    object->record_into(command_allocator);
     object->attach_device(device);
     return hand_out(object, riid, out);
 }
