@@ -153,6 +153,19 @@ class ValidationGateTests(unittest.TestCase):
             self.assertEqual((code, err), (0, ""))
             self.assertTrue(os.path.isfile(out))
 
+    def test_reports_atlas_output_write_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            parent = os.path.join(tmp, "existing-file")
+            with open(parent, "w", encoding="utf-8") as f:
+                f.write("keep me")
+            out = os.path.join(parent, "atlas.json")
+            code, err = self.main_with(argv=["turing_atlas.py", "--out", out])
+
+            self.assertEqual(code, 2)
+            self.assertIn(f"cannot write {out}", err)
+            with open(parent, encoding="utf-8") as f:
+                self.assertEqual(f.read(), "keep me")
+
     def test_out_cannot_be_a_directory(self):
         with tempfile.TemporaryDirectory() as tmp:
             code, err = self.main_with(argv=["turing_atlas.py", "--out", tmp])
