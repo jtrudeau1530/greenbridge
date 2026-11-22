@@ -18,8 +18,9 @@ second device stand in for the missing size: W64G_SAVE_REF=<dir> stores each 64-
 it (or that has 64 as its only size: AMD GCN), and W64G_REF=<dir> compares every run of the other device with those
 files (equal for A and B, different for C).
 
-A device whose fragment subgroup can be narrower than 32 (Intel: 8..32, pixel shaders 16 wide) and that could not be
-held to 32 or 64 skips the tier A and B pixel fixtures, which assume subgroups of 32 or more lanes (TEST-433).
+A device whose subgroups can be narrower than 32 (Intel: 8..32) and that could not be held to 32 or 64 skips the tier
+A and B pixel fixtures: its fragment stage may run fewer live lanes than 32 (Intel UHD 770 reports 32 but runs 16 live
+invocations), and tiers A and B assume 32 or 64 live lanes (TEST-433).
 
 The vs_w64_* fixtures (TEST-251) are vertex shaders: Vulkan cannot require a vertex subgroup size, so the two sizes
 come from RADV, which runs the VS stage as wave64 by default and as wave32 with RADV_PERFTEST=gewave32 (GFX10+).
@@ -340,13 +341,13 @@ def check(tools, spirv, name):
             if size is None or applied:
                 runs[size] = (words, heap)
         compared = False
-        # Tiers A and B mean exact on subgroups of 32 or 64 lanes. A device whose fragment subgroup can be narrower
-        # (Intel: 8..32, pixel shaders often 16 wide) and that could not be held to 32 or 64 has no such run: reads
-        # across 16 lanes leave its subgroup there.
+        # Tiers A and B mean exact on 32 or 64 live lanes. A device whose subgroups can be narrower than 32 (Intel:
+        # 8..32) and that could not be held to 32 or 64 may run fewer live lanes than it reports (UHD 770: 16 live
+        # behind a reported 32): reads across them return garbage.
         if tier in ("A", "B") and name.startswith("ps_") and 64 not in runs and 32 not in runs \
                 and _device_min[0] is not None and _device_min[0] < 32:
-            return Skip(f"SKIP (the fragment subgroup can be narrower than 32 here ({_device_min[0]}..) and could not "
-                        "be required: tiers A and B assume 32 or 64 lanes)")
+            return Skip(f"SKIP (the fragment stage may run fewer live lanes than 32 here ({_device_min[0]}..) "
+                        "and 32 or 64 could not be required: tiers A and B assume 32 or 64 live lanes)")
         if save and 64 in runs:
             Path(save).mkdir(parents=True, exist_ok=True)
             (Path(save) / (name + ".ref64.raw")).write_bytes(b"".join(struct.pack("<4I", *w) for w in runs[64][0]))
