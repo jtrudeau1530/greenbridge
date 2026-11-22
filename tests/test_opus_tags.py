@@ -86,6 +86,7 @@ class TestRetag(unittest.TestCase):
         self.assertEqual(old[old_pages[2][0]:], new[new_pages[2][0]:])
         self.assertTrue(crc_ok(new))
         self.assertEqual(read_tags(new), (T.VENDOR, ["TITLE=" + "x" * 3000]))
+        self.assertEqual(T.retag(new, T.tags_packet([("TITLE", "x" * 3000)])), new)
 
     def test_rejects_what_it_cannot_rewrite(self):
         with tempfile.TemporaryDirectory() as d:
@@ -126,6 +127,23 @@ class TestFolder(unittest.TestCase):
     def tags(self, *parts):
         with open(os.path.join(self.opus, *parts), "rb") as f:
             return read_tags(f.read())[1]
+
+    def test_preserves_file_with_an_extra_packet_on_the_tags_page(self) -> None:
+        path = os.path.join(self.opus, "story", "bank_01", "0ABCDEF1.ogg")
+        with open(path, "rb") as f:
+            data = f.read()
+        tags_at, tags_end = list(T.pages(data))[1]
+        serial, = struct.unpack_from("<I", data, tags_at + 14)
+        mixed_page = awc_opus.ogg_page(serial, 1, 960, [T.tags_packet([]), PACKET], 0)
+        original = data[:tags_at] + mixed_page + data[tags_end:]
+        with open(path, "wb") as f:
+            f.write(original)
+
+        stats = T.tag_folder(self.opus, T.load_names(self.names, "story"))
+
+        with open(path, "rb") as f:
+            self.assertTrue(f.read() == original, "tagging changed a file whose tags page includes audio")
+        self.assertEqual(stats["skipped: the OpusTags page contains another packet"], 1)
 
     def test_names_and_dialogue(self):
         names = T.load_names(self.names, "story")
