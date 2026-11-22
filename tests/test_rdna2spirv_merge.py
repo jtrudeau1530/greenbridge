@@ -195,6 +195,17 @@ class MergeCliTest(unittest.TestCase):
         self.assertNotIn("Traceback", result.stderr)
         self.assertFalse((self.out / "index.json").exists())
 
+    def test_cli_removes_the_previous_index_when_the_merge_fails(self):
+        # The old index describes the previous corpus; after a failed merge the parts no longer match it.
+        (self.out / "index.json").write_text(json.dumps({"old": {}}), encoding="utf-8")
+        self.part(0, {"a": {}})
+        self.marker(0, 2)
+        self.marker(1, 2)
+        result = self.run_merge()
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("ERROR: incomplete shard set", result.stderr)
+        self.assertFalse((self.out / "index.json").exists())
+
     def test_cli_merges_a_complete_set(self):
         self.part(0, {"a": {}})
         self.part(1, {"b": {}})
