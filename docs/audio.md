@@ -299,6 +299,10 @@ Each positional source is reported and thresholded on its own. A source is a dir
 bank, or an `audio_manifest.json` from `rpf9dump audio` (read without opening the banks). Pure Python; the run above
 took about 3 minutes on one core.
 
+You can also pass the JSON inventory written by `awc_manifest.py --out inventory.json`. The naming tool reads
+the plain stream IDs and streamed-music channel IDs directly from its rows. Bank labels keep the nested path
+and drop the `.awc` extension to match the export folders. Banks with no stream rows have no names in this inventory.
+
 ## Tags: names and subtitles
 
 `awc_opus.py` writes an empty `OpusTags` header, so a player shows only the stream id. `tools/opus_tags.py` fills
