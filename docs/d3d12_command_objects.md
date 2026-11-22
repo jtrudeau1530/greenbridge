@@ -544,6 +544,27 @@ them, and it is the simplest contract for a layer that does not want to decode t
 executable makes the same check before writing is unknown until it is available; it is compiled against the same
 console headers.
 
+**Every inline write in the package's DLLs checks first.** `tools/inline_scan.py` finds each cursor store-back
+(`mov [list+18h],reg` after stores through the cursor) and looks for the compare in front of it. On the 1.0.2.1
+DLLs (dumpbin 14.44 listings):
+
+| Image | Inline writes | Checked | Not checked | Limit compared | Fallback slot (sites) |
+|---|---:|---:|---:|---|---|
+| `XboxBvhBuilder.dll` | 196 | 196 | 0 | `+0x30` ×165, `+0x28` ×30, a register loaded in another block ×1 | 45 ×71, 37 ×35, 25 ×34, 14 ×24, 39 ×16, 43 ×9, 80 ×4; 3 reach theirs through a shared jump the tool does not follow |
+| `amd_fidelityfx_upscaler_xbox.dll` | 9 | 9 | 0 | `+0x30` ×8, `+0x28` ×1 | 35 ×6, 25, 41, 14 |
+
+**Measured.** The packet headers it reads back are the two dispatch forms above: `0x4002c400` (26 four-word
+dispatches in the builder, one in FSR) and `0x4003cc00` (the builder's four five-word ones). The other 14 DLLs have
+no inline write, except one checked site in `libHttpClient.GDK.dll`, which imports nothing from D3D12: read a
+result as an upper bound of about one site per image. Removing the compare and branch in front of the builder's
+`0x14972` write turns exactly that site into "not checked", so a missing check is visible.
+
+On the executable, `python -I tools/inline_scan.py <exe> --sites` answers the question in one pass (see the day-one
+list in `docs/design.md`): no unchecked site means a cursor-at-limit layer sees every command the game records; each
+unchecked site is listed by RVA and is a write that layer never sees. Its fallback-slot line is the set of console
+list methods the game reaches through the vtable. Limit offsets other than `+0x28`/`+0x30` would be command kinds
+the DLLs never write (draws, input-assembler and output-merger state); read a few of those sites by hand.
+
 **The five-word dispatch.** The BVH builder also writes `0x4003cc00, x, 1, 1, W`:
 
 - **Sites:** `0x14972`, `0x15215`, `0x1536a` and `0x1d002`, each checked against the dispatch limit `+0x28`. The
