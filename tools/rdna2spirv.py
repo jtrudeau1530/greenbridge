@@ -591,8 +591,10 @@ class Gen:
         exact - r = (s - r) + (se + pe), where p = x*y, pe = Fma(x, y, -p) is the exact product error, s = p + z and se
         the TwoSum error of that sum. When that is non-zero and r is even, r moves one f32 ulp towards it (the exact
         value lies between r and its neighbour, so the neighbour is the odd one). A zero, infinite or NaN r is
-        left alone (an f32 subnormal narrows to +-0 either way). Sign-exact except where se + pe itself rounds to
-        the opposite side of s - r, which needs an f32-ulp-level cancellation."""
+        left alone (an f32 subnormal narrows to +-0 either way), except that a finite exact value whose f32 Fma
+        overflowed to +-inf becomes +-FLT_MAX (toward zero it is 65504 in f16). A tiny product takes the residual
+        sign from its operands (below). Sign-exact except where se + pe itself rounds to the opposite side of
+        s - r, which needs an f32-ulp-level cancellation, or where x*y overflows while z cancels it."""
         t = self.tmp
         r, p, np_, pe, s_, bb, sb, da, db, se = (t() for _ in range(10))
         self.emit(f"{r} = OpExtInst %float %glsl Fma {x} {y} {z}")
@@ -620,9 +622,26 @@ class Gen:
         self.emit(f"{rnz} = OpFUnordNotEqual %bool {res} %f0")                       # true for a NaN residual too...
         self.emit(f"{rfin} = OpFOrdEqual %bool {res} {res}")                         # ...so require a non-NaN one
         inexact = self.emit_land(rnz, rfin)
-        self.emit(f"{need} = OpLogicalAnd %bool {self.emit_land(even, inexact)} {self.emit_land(nzr, ok)}")
-        ebits, xs, same, up, dn, adj, out, rr = (t() for _ in range(8))
-        self.emit(f"{ebits} = OpBitcast %uint {res}")
+        # A tiny product (|x*y| < 2^-64, or flushed to 0) has its error pe below the f32 normal range (pe's lowest bit is
+        # 2^-47 of p's), so pe and the residual can underflow or be flushed and read as exact. z dominates there
+        # (anything the f16 result can see has an f32 ulp far above 2^-64), so the residual's sign is the
+        # product's: sign(x) xor sign(y), whatever the driver does with denormals.
+        xb, yb, pb, pmag, ptiny, xnz, ynz, tiny, tsign, ebits0 = (t() for _ in range(10))
+        self.emit(f"{pb} = OpBitcast %uint {p}")
+        self.emit(f"{pmag} = OpBitwiseAnd %uint {pb} {self.cu(0x7FFFFFFF)}")
+        self.emit(f"{ptiny} = OpULessThan %bool {pmag} {self.cu(0x1F800000)}")
+        self.emit(f"{xnz} = OpFUnordNotEqual %bool {x} %f0")
+        self.emit(f"{ynz} = OpFUnordNotEqual %bool {y} %f0")
+        self.emit(f"{tiny} = OpLogicalAnd %bool {ptiny} {self.emit_land(xnz, ynz)}")
+        self.emit(f"{xb} = OpBitcast %uint {x}")
+        self.emit(f"{yb} = OpBitcast %uint {y}")
+        self.emit(f"{tsign} = OpBitwiseXor %uint {xb} {yb}")
+        inexact2, ebits = t(), t()
+        self.emit(f"{inexact2} = OpLogicalOr %bool {inexact} {tiny}")
+        self.emit(f"{need} = OpLogicalAnd %bool {self.emit_land(even, inexact2)} {self.emit_land(nzr, ok)}")
+        self.emit(f"{ebits0} = OpBitcast %uint {res}")
+        self.emit(f"{ebits} = OpSelect %uint {tiny} {tsign} {ebits0}")
+        xs, same, up, dn, adj, out, rr = (t() for _ in range(7))
         self.emit(f"{xs} = OpBitwiseXor %uint {rbits} {ebits}")
         self.emit(f"{same} = OpULessThan %bool {xs} {self.cu(0x80000000)}")           # same sign: away from zero
         self.emit(f"{up} = OpIAdd %uint {rbits} {self.cu(1)}")
@@ -630,7 +649,22 @@ class Gen:
         self.emit(f"{adj} = OpSelect %uint {same} {up} {dn}")
         self.emit(f"{out} = OpSelect %uint {need} {adj} {rbits}")
         self.emit(f"{rr} = OpBitcast %float {out}")
-        return rr
+        # Fma overflowed to +-inf with finite operands: the exact value is finite, so toward zero it is +-FLT_MAX.
+        ri, xi, yi, zi, anyi, ovf, sg, mx, fin, rfl = (t() for _ in range(10))
+        self.emit(f"{ri} = OpIsInf %bool {r}")
+        self.emit(f"{xi} = OpIsInf %bool {x}")
+        self.emit(f"{yi} = OpIsInf %bool {y}")
+        self.emit(f"{zi} = OpIsInf %bool {z}")
+        xyi, nai = t(), t()
+        self.emit(f"{xyi} = OpLogicalOr %bool {xi} {yi}")
+        self.emit(f"{anyi} = OpLogicalOr %bool {xyi} {zi}")
+        self.emit(f"{nai} = OpLogicalNot %bool {anyi}")
+        self.emit(f"{ovf} = OpLogicalAnd %bool {ri} {nai}")
+        self.emit(f"{sg} = OpBitwiseAnd %uint {rbits} {self.cu(0x80000000)}")
+        self.emit(f"{mx} = OpBitwiseOr %uint {sg} {self.cu(0x7F7FFFFF)}")
+        self.emit(f"{fin} = OpSelect %uint {ovf} {mx} {out}")
+        self.emit(f"{rfl} = OpBitcast %float {fin}")
+        return rfl
 
     def emit_land(self, a, b):
         r = self.tmp()
@@ -2874,7 +2908,7 @@ class Gen:
             self.emit(f"{t} = OpFMul %float {f} {self.fconst(6.283185307179586)}")
             self.emit(f"{r} = OpExtInst %float %glsl {'Sin' if 'sin' in op else 'Cos'} {t}")
             r = self.clamp_mods(r, mods)
-            self.write_lo16(a[0], self.f16_bits(r))    # ignores MODE rounding on hardware (RX 6800, SHADER-35)
+            self.write_lo16(a[0], self.f16_bits(r))    # sin ignores MODE rounding on hardware (RX 6800, SHADER-35); cos is unmeasured, assumed like it
         elif op in ("v_pk_lshlrev_b16", "v_pk_lshrrev_b16", "v_pk_ashrrev_i16"):
             # Packed 16-bit shifts (VOP3P): result half h = src1 half (op_sel / op_sel_hi) shifted by src0 half & 15.
             def bits(name, default):
@@ -4075,9 +4109,10 @@ class Gen:
             r = self.clamp_mods(r, mods)
             # 0x3c00 -> 0x3bff only when 0x3c00 is Fract's own rounding: after mul:2 fract(0.5) is a true 1.0.
             omod = any(m in ("mul:2", "mul:4", "div:2") for m in mods)
-            # rcp/rsq/sqrt (and sin/cos below) ignore MODE rounding on hardware (RX 6800, SHADER-35): nearest even always.
+            # rcp/rsq/sqrt (and sin below) ignore MODE rounding on hardware (RX 6800, SHADER-35); exp, log (and cos
+            # below) are unmeasured, assumed like them: nearest even always.
             self.f16_out(a[0], r, dhi, fract=fn == "Fract" and not omod,
-                         mode=op not in ("v_rcp_f16", "v_rsq_f16", "v_sqrt_f16"))  # GFX10: f16 ops keep the other half
+                         mode=op not in ("v_rcp_f16", "v_rsq_f16", "v_sqrt_f16", "v_exp_f16", "v_log_f16"))  # GFX10: f16 ops keep the other half
         elif op == "v_not_b32":
             x = self.src_u(a[1])
             r = self.tmp()

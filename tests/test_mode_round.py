@@ -86,7 +86,7 @@ def test_add_f64(prefix, want, tmp_path):
 
 
 @pytest.mark.parametrize("a,b,prefix,want", [
-    (0x4000, 0x0001, "", 0x4000),            # 2 + 2^-24: an f32 tie below 2.0's neighbour; both modes give 2.0
+    (0x4000, 0x0001, "", 0x4000),            # 2 + 2^-24: a quarter f16 ulp above 2.0; both modes give 2.0
     (0x4000, 0x0001, RTZ, 0x4000),
     (0x7BFF, 0x4C00, "", 0x7C00),            # 65504 + 16 = 65520: the tie rounds to inf, toward zero stays 65504
     (0x7BFF, 0x4C00, RTZ, 0x7BFF),
@@ -117,10 +117,10 @@ def test_add_f64_with_omod_not_asserted(prefix, want, tmp_path):
 
 @pytest.mark.parametrize("op,src", [
     ("v_rcp_f16_e32", 0x3037), ("v_rsq_f16_e32", 0x3037), ("v_sqrt_f16_e32", 0x4200), ("v_sin_f16_e32", 0x3037),
-    ("v_cos_f16_e32", 0x3037),
+    ("v_cos_f16_e32", 0x3037), ("v_exp_f16_e32", 0x3037), ("v_log_f16_e32", 0x4a37),
 ])
 def test_transcendental_f16_ignores_mode(op, src, tmp_path):
-    # RX 6800: rcp/sqrt/rsq/sin give the same words in every rounding mode
+    # RX 6800: rcp/sqrt/rsq/sin give the same words in every rounding mode; cos, exp and log are unmeasured, assumed alike
     got = []
     for prefix in ("", RNE, RTZ):
         asm = f"v_mov_b32 v1, {src:#x}\n{prefix}{op} v2, v1\n"
@@ -128,8 +128,8 @@ def test_transcendental_f16_ignores_mode(op, src, tmp_path):
     assert got[0] == got[1] == got[2]
 
 
-def test_transcendental_f16_without_write_matches(tmp_path):
-    # the same four, written in a program that sets MODE after them: still nearest even, as without any write
+def test_transcendental_f16_nearest_after_rtz_write(tmp_path):
+    # MODE is set toward zero before the ops: they still give the nearest-even words
     for op, src, want in (("v_rcp_f16_e32", 0x3037, 0x4798), ("v_rsq_f16_e32", 0x3037, 0x4183),
                           ("v_sqrt_f16_e32", 0x4200, 0x3EEE), ("v_sin_f16_e32", 0x3037, 0x39E4)):
         asm = f"v_mov_b32 v1, {src:#x}\n{RTZ}{op} v2, v1\n"
@@ -168,3 +168,27 @@ def test_add_f64_overflow_saturates(tmp_path):
 def test_unmodelled_mode_writes_are_refused(asm, tmp_path):
     with pytest.raises(rdna2spirv.Unsupported):
         translate_listing(tmp_path, asm)
+
+
+@pytest.mark.parametrize("x,y,z,want", [
+    (0x99800000, 0x19800000, 0x3F800000, 0x3BFF),    # 1 - 2^-152: the product error underflows in f32
+    (0x9F000000, 0x1F000000, 0x3F800000, 0x3BFF),    # 1 - 2^-128: the product is an f32 subnormal (flushed on some drivers)
+    (0x1F000000, 0x1F000000, 0x3F800000, 0x3C00),    # 1 + 2^-128 toward zero is 1.0
+    (0x99800000, 0x19800000, 0xBF800000, 0xBC00),    # -1 - 2^-152 toward zero is -1.0
+    (0x19800000, 0x19800000, 0xBF800000, 0xBBFF),    # -1 + 2^-200 toward zero is -(1 - 2^-11)
+])
+def test_fma_mix_tiny_product(x, y, z, want, tmp_path):
+    asm = (f"v_mov_b32 v1, {x:#x}\nv_mov_b32 v2, {y:#x}\nv_mov_b32 v4, {z:#x}\n"
+           f"{RTZ}v_fma_mixlo_f16 v3, v1, v2, v4\n")
+    assert vgprs(tmp_path, asm)[3] & 0xFFFF == want
+
+
+@pytest.mark.parametrize("x,y,z,want", [
+    (0x5F800000, 0x5F800000, 0x00000000, 0x7BFF),    # 2^128 is finite exactly: f32 Fma gives inf, toward zero 65504
+    (0xDF800000, 0x5F800000, 0x00000000, 0xFBFF),
+    (0x7F800000, 0x3F800000, 0x00000000, 0x7C00),    # a real inf stays inf
+])
+def test_fma_mix_f32_overflow_toward_zero(x, y, z, want, tmp_path):
+    asm = (f"v_mov_b32 v1, {x:#x}\nv_mov_b32 v2, {y:#x}\nv_mov_b32 v4, {z:#x}\n"
+           f"{RTZ}v_fma_mixlo_f16 v3, v1, v2, v4\n")
+    assert vgprs(tmp_path, asm)[3] & 0xFFFF == want
