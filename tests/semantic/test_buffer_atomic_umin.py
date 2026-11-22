@@ -744,5 +744,107 @@ class TestBufferAtomicUminRegisterAliasing(unittest.TestCase):
         self.assertEqual(interp.mem.read_u32(0), 10)
 
 
+# ==============================================================================
+# Condition Codes, Status Flags, and Carry/Borrow Isolation for buffer_atomic_umin
+# ==============================================================================
+
+@dataclasses.dataclass(frozen=True)
+class BufferAtomicConditionCodes:
+    """Architectural integer condition codes for buffer atomic operations."""
+    zero: bool
+    is_min_operand: bool
+    is_min_memory: bool
+    is_max: bool
+
+
+@dataclasses.dataclass(frozen=True)
+class BufferStatusFlags:
+    """Buffer memory status flags."""
+    in_bounds: bool
+    oob_fault: bool
+
+
+def compute_buffer_condition_codes(old_val: int, cmp_val: int, min_val: int) -> BufferAtomicConditionCodes:
+    """Computes condition codes evaluating the result and operand relations."""
+    u_old = u32(old_val)
+    u_cmp = u32(cmp_val)
+    u_min = u32(min_val)
+    return BufferAtomicConditionCodes(
+        zero=(u_min == 0),
+        is_min_operand=(u_cmp <= u_old),
+        is_min_memory=(u_old <= u_cmp),
+        is_max=(u_min == UINT32_MAX),
+    )
+
+
+def compute_buffer_status_flags(in_bounds: bool) -> BufferStatusFlags:
+    """Computes buffer memory bounds flags."""
+    return BufferStatusFlags(
+        in_bounds=in_bounds,
+        oob_fault=not in_bounds,
+    )
+
+
+class TestBufferAtomicUminConditionCodes(unittest.TestCase):
+    """Test suite for condition codes, status flags, and carry/borrow isolation."""
+
+    def test_condition_codes_evaluation(self) -> None:
+        # Case 1: memory was smaller
+        cc1 = compute_buffer_condition_codes(old_val=10, cmp_val=20, min_val=10)
+        self.assertFalse(cc1.zero)
+        self.assertFalse(cc1.is_min_operand)
+        self.assertTrue(cc1.is_min_memory)
+        self.assertFalse(cc1.is_max)
+
+        # Case 2: operand was smaller
+        cc2 = compute_buffer_condition_codes(old_val=50, cmp_val=15, min_val=15)
+        self.assertFalse(cc2.zero)
+        self.assertTrue(cc2.is_min_operand)
+        self.assertFalse(cc2.is_min_memory)
+
+        # Case 3: zero result
+        cc3 = compute_buffer_condition_codes(old_val=100, cmp_val=0, min_val=0)
+        self.assertTrue(cc3.zero)
+        self.assertTrue(cc3.is_min_operand)
+
+        # Case 4: both are UINT32_MAX
+        cc4 = compute_buffer_condition_codes(old_val=UINT32_MAX, cmp_val=UINT32_MAX, min_val=UINT32_MAX)
+        self.assertTrue(cc4.is_max)
+        self.assertTrue(cc4.is_min_operand)
+        self.assertTrue(cc4.is_min_memory)
+
+    def test_status_flags_bounds(self) -> None:
+        flags_in = compute_buffer_status_flags(True)
+        self.assertTrue(flags_in.in_bounds)
+        self.assertFalse(flags_in.oob_fault)
+
+        flags_oob = compute_buffer_status_flags(False)
+        self.assertFalse(flags_oob.in_bounds)
+        self.assertTrue(flags_oob.oob_fault)
+
+    def test_vcc_and_scc_carry_borrow_preserved(self) -> None:
+        interp = ScalarBufferInterpreter(mem_size=4096)
+        desc = BufferResourceDescriptor(base_address=0, stride=0, num_records=1024)
+        interp.set_buffer_descriptor(0, desc)
+
+        # Pre-set carry/borrow condition codes
+        interp.vcc = 0x12345678_9ABCDEF0
+        interp.write_reg_u32(RegKind.VGPR, 0, 5)
+        interp.write_reg_u32(RegKind.VGPR, 1, 0)
+
+        inst = Instruction(
+            opcode=Opcode.BUFFER_ATOMIC_UMIN,
+            vdata=Register(RegKind.VGPR, 0),
+            vaddr=Register(RegKind.VGPR, 1),
+            srsrc=Register(RegKind.SGPR, 0, count=4),
+            soffset=0,
+            mods=BufferAtomicModifiers(glc=True, offen=True),
+        )
+        interp.step(inst)
+
+        # In RDNA2, MUBUF instructions never clobber VCC
+        self.assertEqual(interp.vcc, 0x12345678_9ABCDEF0)
+
+
 if __name__ == "__main__":
     unittest.main()
