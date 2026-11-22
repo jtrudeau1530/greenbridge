@@ -55,6 +55,12 @@ cmake --build runtime/build/linux --parallel
 
 On macOS, add `-DVulkan_INCLUDE_DIR=/opt/homebrew/include` to the first command.
 
+The test programs and `scripts/run_gpu_tests.py` should come from the same commit. Some checks tolerate an older
+binary (`unpinned_subgroup_skip`), but mixing them can report false failures in the compute tests: 28 `cs_*`
+failures on both an RTX 5070 Ti Laptop and a Radeon 610M with the `426023a` script and `48ad23f` binaries, where
+either matching pair is clean. If you cannot build locally, the `runtime-windows` artifact of the Runtime workflow
+belongs to the commit that built it; check that commit out as well.
+
 ## Run them
 
 The whole suite, assembled, translated and run in one go:
