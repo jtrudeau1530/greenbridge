@@ -127,6 +127,23 @@ class Cli(unittest.TestCase):
         self.assertEqual(r.returncode, 2)
         self.assertIn("v_exp_f32", r.stderr)
 
+    def test_empty_and_malformed_selections_fail_before_opening_oracle(self):
+        cases = [
+            (["--ops", ""], "--ops"),
+            (["--modes", ","], "--modes"),
+            (["--waves", ""], "--waves"),
+            (["--waves", "32,nope"], "--waves"),
+            (["--waves", "16"], "16"),
+        ]
+        for argv, message in cases:
+            with self.subTest(argv=argv), mock.patch.object(runner, "open_oracle") as open_oracle:
+                error = io.StringIO()
+                with self.assertRaises(SystemExit) as raised, redirect_stderr(error):
+                    sw.main(argv)
+                self.assertEqual(raised.exception.code, 2)
+                self.assertIn(message, error.getvalue())
+                open_oracle.assert_not_called()
+
     def test_json_empty_string_exits_1_before_opening_oracle(self):
         err = io.StringIO()
         with mock.patch.object(runner, "open_oracle") as open_oracle, redirect_stderr(err):
