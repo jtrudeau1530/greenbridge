@@ -65,6 +65,24 @@ class ReportPathTest(unittest.TestCase):
             self.assertIn("would overwrite the input", result.stderr)
             self.assertEqual(index.read_text(encoding="utf-8"), before)
 
+    def test_json_cannot_be_a_directory(self):
+        with tempfile.TemporaryDirectory() as td:
+            carve = self.make_carve(td)
+            outdir = pathlib.Path(td) / "outdir"
+            outdir.mkdir()
+            result = self.run_tool(carve, "--json", str(outdir))
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertIn("is a directory", result.stderr)
+
+    def test_csv_cannot_be_a_directory(self):
+        with tempfile.TemporaryDirectory() as td:
+            carve = self.make_carve(td)
+            outdir = pathlib.Path(td) / "outdir"
+            outdir.mkdir()
+            result = self.run_tool(carve, "--csv", str(outdir))
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertIn("is a directory", result.stderr)
+
     def test_json_and_csv_must_differ(self):
         with tempfile.TemporaryDirectory() as td:
             carve = self.make_carve(td)

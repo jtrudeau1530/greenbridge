@@ -374,6 +374,8 @@ def main() -> int:
         protected.append(os.path.join(a.carve_dir, "index.json"))
     for flag, path in (("--json", a.json), ("--csv", a.csv)):
         if path:
+            if os.path.isdir(path):
+                ap.error(f"{flag} is a directory: {path}")
             for input_path in protected:
                 if same_report_path(path, input_path):
                     ap.error(f"{flag} would overwrite the input {input_path}")
