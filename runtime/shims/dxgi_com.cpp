@@ -1,6 +1,7 @@
 #include "dxgi_com.h"
 #include "d3d12_stubs.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cstdio>
 #include <cstring>
@@ -24,6 +25,14 @@ void stub(const char* method) {
 
 bool valid_flip_buffer_count(UINT count) {
     return count >= 2 && count <= DXGI_MAX_SWAP_CHAIN_BUFFERS;
+}
+
+bool is_direct_present_queue(IUnknown* candidate) {
+    ID3D12CommandQueue* queue = nullptr;
+    if (!candidate || FAILED(candidate->QueryInterface(IID_PPV_ARGS(&queue))) || !queue) return false;
+    const bool direct = queue->GetDesc().Type == D3D12_COMMAND_LIST_TYPE_DIRECT;
+    queue->Release();
+    return direct;
 }
 
 VkFormat dxgi_to_vk_format(DXGI_FORMAT fmt) {
@@ -239,6 +248,11 @@ public:
     }
 
     HRESULT STDMETHODCALLTYPE ResizeBuffers(UINT count, UINT width, UINT height, DXGI_FORMAT fmt, UINT flags) override {
+        return resize_buffers(count, width, height, fmt, flags, nullptr, nullptr);
+    }
+
+    HRESULT resize_buffers(UINT count, UINT width, UINT height, DXGI_FORMAT fmt, UINT flags,
+                           const UINT* node_masks, IUnknown* const* present_queues) {
         if (count != 0 && !valid_flip_buffer_count(count)) return E_INVALIDARG;
         VkFormat vk_fmt = VK_FORMAT_UNDEFINED;
         if (fmt != DXGI_FORMAT_UNKNOWN) {
@@ -251,6 +265,11 @@ public:
         // DXGI refuses to resize while the app still holds a back buffer reference.
         for (auto* bb : buffers_)
             if (bb->held_by_app()) return DXGI_ERROR_INVALID_CALL;
+        const std::size_t target_count = count ? count : buffers_.size();
+        if (node_masks && !std::all_of(node_masks, node_masks + target_count, [](UINT mask) { return mask <= 1; }))
+            return DXGI_ERROR_INVALID_CALL;
+        if (present_queues && !std::all_of(present_queues, present_queues + target_count, is_direct_present_queue))
+            return DXGI_ERROR_INVALID_CALL;
         unregister_buffers();
         const VkExtent2D size = size_or_client(width, height, swapchain_.extent());
         const std::uint32_t w = size.width;
@@ -413,9 +432,9 @@ public:
         return S_OK;
     }
     HRESULT STDMETHODCALLTYPE SetColorSpace1(DXGI_COLOR_SPACE_TYPE) override { return S_OK; }
-    HRESULT STDMETHODCALLTYPE ResizeBuffers1(UINT count, UINT w, UINT h, DXGI_FORMAT fmt, UINT flags, const UINT*,
-                                             IUnknown* const*) override {
-        return ResizeBuffers(count, w, h, fmt, flags);
+    HRESULT STDMETHODCALLTYPE ResizeBuffers1(UINT count, UINT w, UINT h, DXGI_FORMAT fmt, UINT flags,
+                                             const UINT* node_masks, IUnknown* const* present_queues) override {
+        return resize_buffers(count, w, h, fmt, flags, node_masks, present_queues);
     }
 
 private:
