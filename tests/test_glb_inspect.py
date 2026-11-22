@@ -538,6 +538,24 @@ class GlbInspectTests(unittest.TestCase):
             self.assertTrue(any("output accessor is missing" in issue for issue in issues))
             self.assertEqual(report["animations"][0]["target_node_count"], 1)
 
+    def test_animation_type_mismatches_are_reported(self):
+        gltf = animated_gltf()
+        gltf["accessors"][2]["type"] = "VEC3"
+        gltf["accessors"][3]["type"] = "VEC4"
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "types.glb")
+            out = os.path.join(folder, "report.json")
+            with open(path, "wb") as handle:
+                handle.write(glb(gltf, triangle_bin()))
+
+            result = self.run_tool(path, "--json", out)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            with open(out, encoding="utf-8") as handle:
+                report = json.load(handle)
+            issues = report["animations"][0]["issues"]
+            self.assertTrue(any("input accessor type is VEC3, expected SCALAR" in issue for issue in issues))
+            self.assertTrue(any("path 'translation' expects VEC3 output, got VEC4" in issue for issue in issues))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -214,6 +214,11 @@ def _accessor_max(accessor: dict | None) -> float | None:
     return None
 
 
+def _accessor_type(gltf: dict, index: object) -> str | None:
+    accessor = _accessor(gltf, index)
+    return _text(accessor.get("type")) if accessor is not None else None
+
+
 def _animation_report(gltf: dict, index: int, animation: dict) -> dict:
     """Summarize an animation and flag references that cannot be resolved."""
     raw_samplers = _array(animation.get("samplers"))
@@ -233,12 +238,16 @@ def _animation_report(gltf: dict, index: int, animation: dict) -> dict:
         output_accessor = _accessor(gltf, output_index)
         input_count = _accessor_count(gltf, input_index)
         output_count = _accessor_count(gltf, output_index)
+        input_type = _accessor_type(gltf, input_index)
+        output_type = _accessor_type(gltf, output_index)
         interpolation = _text(sampler.get("interpolation")) or "LINEAR"
         duration = _accessor_max(input_accessor)
         if input_accessor is None:
             issues.append(f"sampler[{sampler_index}] input accessor is missing")
         elif input_count is None or input_count == 0:
             issues.append(f"sampler[{sampler_index}] input accessor has no keyframes")
+        if input_type is not None and input_type != "SCALAR":
+            issues.append(f"sampler[{sampler_index}] input accessor type is {input_type}, expected SCALAR")
         if output_accessor is None:
             issues.append(f"sampler[{sampler_index}] output accessor is missing")
         if input_count is not None and output_count is not None:
@@ -254,8 +263,10 @@ def _animation_report(gltf: dict, index: int, animation: dict) -> dict:
             "index": sampler_index,
             "input_accessor": input_index,
             "input_count": input_count,
+            "input_type": input_type,
             "output_accessor": output_index,
             "output_count": output_count,
+            "output_type": output_type,
             "interpolation": interpolation,
             "duration": duration,
         })
@@ -288,6 +299,15 @@ def _animation_report(gltf: dict, index: int, animation: dict) -> dict:
             issues.append(f"channel[{channel_index}] has unknown target path {path!r}")
         else:
             paths[path] = paths.get(path, 0) + 1
+            expected_type = {"translation": "VEC3", "rotation": "VEC4",
+                             "scale": "VEC3", "weights": "SCALAR"}[path]
+            sampler = samplers[sampler_index] if sampler_index is not None and sampler_index < len(samplers) else None
+            output_type = sampler["output_type"] if sampler is not None else None
+            if output_type is not None and output_type != expected_type:
+                issues.append(
+                    f"channel[{channel_index}] path {path!r} expects {expected_type} output, "
+                    f"got {output_type}"
+                )
         channels.append({
             "index": channel_index,
             "sampler": sampler_index,
