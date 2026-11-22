@@ -534,6 +534,45 @@ Slot usage (block counts): slot 0 tag `0x42` in all 60,442; slot 2 `0x21` in 57,
 (24,876), slot 8 `0x25` (21,519), slot 13 `0x26` (17,928), slot 11 `0x27` (11,120) and 21 rarer slot/tag
 pairs, including `0x84` and `0x4b` in slot 17 (5,452 and 3,714).
 
+**What the skinned mesh shaders read from slots 6, 8 and 17 (shader reading; slot 17 is only partly
+checked on the data).** The 363 mesh shaders that contain a `BUF_FMT_16_16_16_16_UINT` load take each
+stream's type from the low four bits of a per-slot descriptor word in a constant buffer (one dword per
+slot: `+0x18` is slot 6, `+0x20` slot 8, `+0x44` slot 17; stride `((w >> 3) & 60)` bytes). They choose
+the load from that type:
+
+| Slot | Type | Load |
+| --- | --- | --- |
+| 6 | 6 (tag `0x26`) | `tbuffer_load_format_xyzw ... BUF_FMT_8_8_8_8_UNORM` |
+| 6 | other | `buffer_load_dwordx4` (four raw dwords) |
+| 8 | 5 (tag `0x25`) | `tbuffer_load_format_xyzw ... BUF_FMT_8_8_8_8_UINT` |
+| 8 | other (type 11 is tag `0x4b`) | `tbuffer_load_format_xyzw ... BUF_FMT_16_16_16_16_UINT` |
+
+198 of the 363 also read slot 17 with `buffer_load_dwordx2` (the first 8 bytes):
+
+- u16 0 bit 15 set: that vertex skips the step.
+- Otherwise u16 0 is an element index, checked against a count from a table.
+- That element's entry holds eight u16 point indices.
+- u16 1-3 are three coordinates, each `v / 65535` (`v_mul_f32 0x37800080`).
+- The shader fetches the eight points and blends them with the trilinear weights `(1-a)(1-b)(1-c)` ... `abc`.
+
+That is a deformation-lattice binding.
+
+On the data (core_restofworld, first 500 streams), slot 17's width follows the skin influence count:
+
+- All 338 blocks with tag `0x84` (16 bytes) have two weight/index pairs (slots 6-9, eight influences).
+- All 121 blocks with `0x4b` (8 bytes) have one (slots 6 and 8, four influences).
+- Bit 15 of u16 0 is set on 20,898 of 186,727 `0x84` vertices (11.2%) and 5,973 of 12,336 `0x4b` vertices
+  (48.4%).
+- For `0x84`, bit 15 of the second 8 bytes' first u16 is set on 117,067 (62.7%). Those 8 bytes may be a
+  second binding, but no shader read of them was traced.
+
+Element indices are mostly unique per vertex (115,101 distinct non-flagged values over the 186,727 `0x84`
+vertices), so few elements are shared by enough vertices to test the coordinates. In the 39 elements with
+8 or more vertices, positions are an affine function of the three coordinates: the median rms residual is
+1.6% of the block extent, against 25% with the coordinates shuffled within the element. That is consistent
+with the reading, but too few elements to confirm it. In these samples no block puts tag `0x4b` in
+slot 8.
+
 **Tag `0x28` is two signed 16-bit values.** Over the triangle edges of the slot 3 stream, a difference of more
 than 0x8000 between neighbouring vertices occurs 1,597,530 times when the values are read as unsigned and
 18,791 times when they are read as signed (85 times fewer); slot 4 gives 1,680,055 against 5,570. Read as
