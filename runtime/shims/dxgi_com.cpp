@@ -781,6 +781,7 @@ public:
         if (!out) return E_POINTER;
         *out = nullptr;
         if (!hwnd || !desc) return E_INVALIDARG;
+        if (desc->SampleDesc.Count != 1 || desc->SampleDesc.Quality != 0) return DXGI_ERROR_INVALID_CALL;
         if (!valid_flip_buffer_count(desc->BufferCount)) return DXGI_ERROR_INVALID_CALL;
         const VkFormat vk_fmt = dxgi_to_vk_format(desc->Format);
         if (vk_fmt == VK_FORMAT_UNDEFINED) return DXGI_ERROR_INVALID_CALL;
