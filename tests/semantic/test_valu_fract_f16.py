@@ -3,6 +3,8 @@ from __future__ import annotations
 import math
 import struct
 import unittest
+from dataclasses import dataclass, field
+from enum import Enum, auto
 from fractions import Fraction
 from typing import List, Optional, Tuple, Union
 
@@ -231,6 +233,123 @@ def oracle_v_fract_f16(
 
 
 # ==============================================================================
+# Symbolic AST Opcode Definitions and Typed Expressions
+# ==============================================================================
+
+class RegType(Enum):
+    VGPR = auto()
+    SGPR = auto()
+
+
+class RegHalf(Enum):
+    LO = 0
+    HI = 1
+
+
+@dataclass(frozen=True)
+class Reg16:
+    """Represents an architectural 16-bit register operand (e.g., v0.l, v0.h, s2.l)."""
+    index: int
+    reg_type: RegType
+    half: RegHalf = RegHalf.LO
+
+    def __post_init__(self) -> None:
+        if not (0 <= self.index <= 255):
+            raise ValueError(f"Register index {self.index} out of range [0, 255]")
+
+    @property
+    def name(self) -> str:
+        prefix = "v" if self.reg_type == RegType.VGPR else "s"
+        suffix = ".l" if self.half == RegHalf.LO else ".h"
+        return f"{prefix}{self.index}{suffix}"
+
+
+@dataclass(frozen=True)
+class Literal16:
+    """Represents a 16-bit literal or inline float/integer constant."""
+    bits: int
+
+    def __post_init__(self) -> None:
+        if not (0 <= self.bits <= 0xFFFF):
+            raise ValueError(f"16-bit literal bits {self.bits:#x} out of range [0, 0xFFFF]")
+
+    @classmethod
+    def from_float(cls, val: float) -> Literal16:
+        return cls(f16_to_bits(val))
+
+    @property
+    def float_value(self) -> float:
+        return bits_to_f16(self.bits)
+
+    @property
+    def name(self) -> str:
+        if self.bits == POS_ZERO:
+            return "0.0"
+        if self.bits == NEG_ZERO:
+            return "-0.0"
+        f = self.float_value
+        if math.isnan(f):
+            return "nan"
+        if math.isinf(f):
+            return "inf" if f > 0 else "-inf"
+        return f"{f:g}"
+
+
+@dataclass(frozen=True)
+class VOP1Operand:
+    """Typed expression operand with optional input modifiers (abs, neg)."""
+    source: Union[Reg16, Literal16]
+    abs_mod: bool = False
+    neg_mod: bool = False
+
+    def disassemble(self) -> str:
+        s = self.source.name
+        if self.abs_mod:
+            s = f"|{s}|"
+        if self.neg_mod:
+            s = f"-{s}"
+        return s
+
+
+@dataclass(frozen=True)
+class VFractF16Instruction:
+    """Symbolic AST node representing a RDNA2 v_fract_f16 instruction."""
+    dst: Reg16
+    src: VOP1Operand
+    clamp: bool = False
+    mul: int = 1
+    div: int = 1
+
+    def __post_init__(self) -> None:
+        if self.dst.reg_type != RegType.VGPR:
+            raise TypeError(f"Destination of VALU instruction must be VGPR, got {self.dst.reg_type}")
+        if self.mul not in (1, 2, 4):
+            raise ValueError(f"Unsupported mul modifier: {self.mul}")
+        if self.div not in (1, 2):
+            raise ValueError(f"Unsupported div modifier: {self.div}")
+
+    def disassemble(self) -> str:
+        is_vop3 = (
+            self.clamp
+            or self.mul != 1
+            or self.div != 1
+            or self.src.abs_mod
+            or self.src.neg_mod
+            or self.dst.half != RegHalf.LO
+            or (isinstance(self.src.source, Reg16) and self.src.source.half != RegHalf.LO)
+        )
+        mnemonic = "v_fract_f16_e64" if is_vop3 else "v_fract_f16_e32"
+        s = f"{mnemonic} {self.dst.name}, {self.src.disassemble()}"
+        if self.mul != 1:
+            s += f" mul:{self.mul}"
+        if self.div != 1:
+            s += f" div:{self.div}"
+        if self.clamp:
+            s += " clamp"
+        return s
+
+
+# ==============================================================================
 # Unit Tests
 # ==============================================================================
 
@@ -344,6 +463,76 @@ class TestReferenceOracleF16(unittest.TestCase):
         self.assertEqual(oracle_v_fract_f16(H_0P5, div=2), H_0P25)
         # fract(0.75) * 2 = 1.5 clamped to 1.0
         self.assertEqual(oracle_v_fract_f16(H_0P75, mul=2, clamp=True), H_1P0)
+
+
+class TestSymbolicAST(unittest.TestCase):
+    """Unit tests for symbolic AST opcode definitions and typed expressions."""
+
+    def test_reg16_properties_and_bounds(self) -> None:
+        v0_lo = Reg16(0, RegType.VGPR, RegHalf.LO)
+        self.assertEqual(v0_lo.name, "v0.l")
+        v5_hi = Reg16(5, RegType.VGPR, RegHalf.HI)
+        self.assertEqual(v5_hi.name, "v5.h")
+        s2_lo = Reg16(2, RegType.SGPR, RegHalf.LO)
+        self.assertEqual(s2_lo.name, "s2.l")
+
+        with self.assertRaises(ValueError):
+            Reg16(-1, RegType.VGPR)
+        with self.assertRaises(ValueError):
+            Reg16(256, RegType.VGPR)
+
+    def test_literal16_properties(self) -> None:
+        lit_zero = Literal16(POS_ZERO)
+        self.assertEqual(lit_zero.name, "0.0")
+        lit_neg_zero = Literal16(NEG_ZERO)
+        self.assertEqual(lit_neg_zero.name, "-0.0")
+        lit_half = Literal16.from_float(0.5)
+        self.assertEqual(lit_half.bits, H_0P5)
+        self.assertEqual(lit_half.name, "0.5")
+
+        with self.assertRaises(ValueError):
+            Literal16(0x10000)
+
+    def test_vop1_operand_disassembly(self) -> None:
+        src_raw = VOP1Operand(Reg16(1, RegType.VGPR, RegHalf.LO))
+        self.assertEqual(src_raw.disassemble(), "v1.l")
+
+        src_abs = VOP1Operand(Reg16(1, RegType.VGPR, RegHalf.LO), abs_mod=True)
+        self.assertEqual(src_abs.disassemble(), "|v1.l|")
+
+        src_neg_abs = VOP1Operand(Reg16(1, RegType.VGPR, RegHalf.LO), abs_mod=True, neg_mod=True)
+        self.assertEqual(src_neg_abs.disassemble(), "-|v1.l|")
+
+    def test_instruction_disassembly(self) -> None:
+        # Simple VOP1 e32 form
+        instr_e32 = VFractF16Instruction(
+            dst=Reg16(0, RegType.VGPR, RegHalf.LO),
+            src=VOP1Operand(Reg16(1, RegType.VGPR, RegHalf.LO)),
+        )
+        self.assertEqual(instr_e32.disassemble(), "v_fract_f16_e32 v0.l, v1.l")
+
+        # VOP3 e64 form with clamp and high half
+        instr_e64 = VFractF16Instruction(
+            dst=Reg16(0, RegType.VGPR, RegHalf.HI),
+            src=VOP1Operand(Reg16(1, RegType.VGPR, RegHalf.LO), abs_mod=True, neg_mod=True),
+            clamp=True,
+            mul=2,
+        )
+        self.assertEqual(instr_e64.disassemble(), "v_fract_f16_e64 v0.h, -|v1.l| mul:2 clamp")
+
+    def test_instruction_type_enforcement(self) -> None:
+        with self.assertRaises(TypeError):
+            VFractF16Instruction(
+                dst=Reg16(0, RegType.SGPR, RegHalf.LO),
+                src=VOP1Operand(Reg16(1, RegType.VGPR, RegHalf.LO)),
+            )
+
+        with self.assertRaises(ValueError):
+            VFractF16Instruction(
+                dst=Reg16(0, RegType.VGPR, RegHalf.LO),
+                src=VOP1Operand(Reg16(1, RegType.VGPR, RegHalf.LO)),
+                mul=3,
+            )
 
 
 if __name__ == "__main__":
