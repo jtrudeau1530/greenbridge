@@ -19,6 +19,9 @@ Standard library only: Python 3.9+ compatible, zero game data, zero external dep
 """
 from __future__ import annotations
 
+import abc
+from dataclasses import dataclass
+import enum
 import math
 import struct
 import unittest
@@ -265,6 +268,153 @@ class VALURegisterFile:
         self.set_vgpr(idx + 1, hi)
 
 
+# ==============================================================================
+# Symbolic AST Opcode Definitions and Typed Expressions for v_mul_f64
+# ==============================================================================
+
+class OperandKind(enum.Enum):
+    VGPR_PAIR = "vgpr_pair"
+    SGPR_PAIR = "sgpr_pair"
+    LITERAL_64 = "literal_64"
+    INLINE_IMM = "inline_imm"
+
+
+@dataclass
+class ASTOperand:
+    kind: OperandKind
+    reg_idx: int = 0
+    imm_val: int = 0
+    neg: bool = False
+    abs_val: bool = False
+
+    def format_asm(self) -> str:
+        if self.kind == OperandKind.VGPR_PAIR:
+            s = f"v[{self.reg_idx}:{self.reg_idx + 1}]"
+        elif self.kind == OperandKind.SGPR_PAIR:
+            s = f"s[{self.reg_idx}:{self.reg_idx + 1}]"
+        elif self.kind == OperandKind.LITERAL_64:
+            s = f"0x{self.imm_val:016x}"
+        elif self.kind == OperandKind.INLINE_IMM:
+            s = f"{self.imm_val}"
+        else:
+            s = "unknown"
+        if self.abs_val:
+            s = f"|{s}|"
+        if self.neg:
+            s = f"-{s}"
+        return s
+
+
+@dataclass
+class ASTInstruction:
+    opcode: str
+    dst: ASTOperand
+    src0: ASTOperand
+    src1: ASTOperand
+    clamp: bool = False
+    omod: int = 0
+
+    def validate(self) -> None:
+        if self.opcode != "v_mul_f64":
+            raise ValueError(f"Invalid opcode for v_mul_f64 AST: {self.opcode}")
+        if self.dst.kind != OperandKind.VGPR_PAIR:
+            raise ValueError(f"Destination must be a VGPR pair, got {self.dst.kind}")
+        if not (0 <= self.dst.reg_idx <= 254):
+            raise ValueError(f"Destination VGPR pair index out of range: {self.dst.reg_idx}")
+        if self.dst.neg or self.dst.abs_val:
+            raise ValueError("Destination operand cannot have neg or abs modifiers")
+        for name, src in [("src0", self.src0), ("src1", self.src1)]:
+            if src.kind == OperandKind.VGPR_PAIR:
+                if not (0 <= src.reg_idx <= 254):
+                    raise ValueError(f"{name} VGPR pair index out of range: {src.reg_idx}")
+            elif src.kind == OperandKind.SGPR_PAIR:
+                if not (0 <= src.reg_idx <= 104):
+                    raise ValueError(f"{name} SGPR pair index out of range: {src.reg_idx}")
+
+    def format_asm(self) -> str:
+        s = f"{self.opcode} {self.dst.format_asm()}, {self.src0.format_asm()}, {self.src1.format_asm()}"
+        if self.clamp:
+            s += " clamp"
+        return s
+
+
+class F64Expression(abc.ABC):
+    @abc.abstractmethod
+    def evaluate(self, env: dict[str, int]) -> int:
+        pass
+
+
+@dataclass
+class F64Constant(F64Expression):
+    bits: int
+
+    def evaluate(self, env: dict[str, int]) -> int:
+        return self.bits & MASK64
+
+
+@dataclass
+class F64Variable(F64Expression):
+    name: str
+
+    def evaluate(self, env: dict[str, int]) -> int:
+        if self.name not in env:
+            raise KeyError(f"Variable {self.name} not found in environment")
+        return env[self.name] & MASK64
+
+
+@dataclass
+class F64UnaryOp(F64Expression):
+    op: str  # "abs", "neg", "neg_abs"
+    operand: F64Expression
+
+    def evaluate(self, env: dict[str, int]) -> int:
+        val = self.operand.evaluate(env)
+        if self.op == "abs":
+            return apply_input_modifiers_f64(val, abs_val=True)
+        elif self.op == "neg":
+            return apply_input_modifiers_f64(val, neg=True)
+        elif self.op == "neg_abs":
+            return apply_input_modifiers_f64(val, neg=True, abs_val=True)
+        raise ValueError(f"Unknown unary operator: {self.op}")
+
+
+@dataclass
+class F64Mul(F64Expression):
+    lhs: F64Expression
+    rhs: F64Expression
+    clamp: bool = False
+
+    def evaluate(self, env: dict[str, int]) -> int:
+        v_lhs = self.lhs.evaluate(env)
+        v_rhs = self.rhs.evaluate(env)
+        return ref_mul_f64(v_lhs, v_rhs, clamp=self.clamp)
+
+
+def instruction_to_expression(inst: ASTInstruction) -> F64Mul:
+    """Translate an ASTInstruction to a typed symbolic expression tree."""
+    inst.validate()
+
+    def build_operand_expr(op: ASTOperand, prefix: str) -> F64Expression:
+        if op.kind in (OperandKind.VGPR_PAIR, OperandKind.SGPR_PAIR):
+            expr: F64Expression = F64Variable(f"{prefix}_{op.reg_idx}")
+        elif op.kind in (OperandKind.LITERAL_64, OperandKind.INLINE_IMM):
+            expr = F64Constant(op.imm_val)
+        else:
+            raise ValueError(f"Unsupported operand kind: {op.kind}")
+
+        if op.abs_val and op.neg:
+            expr = F64UnaryOp("neg_abs", expr)
+        elif op.abs_val:
+            expr = F64UnaryOp("abs", expr)
+        elif op.neg:
+            expr = F64UnaryOp("neg", expr)
+        return expr
+
+    lhs = build_operand_expr(inst.src0, "src0")
+    rhs = build_operand_expr(inst.src1, "src1")
+    return F64Mul(lhs, rhs, clamp=inst.clamp)
+
+
 class TestVMulF64ReferenceOracle(unittest.TestCase):
     """Test suite for reference mathematical oracle and architectural model."""
 
@@ -360,6 +510,79 @@ class TestVMulF64ReferenceOracle(unittest.TestCase):
 
         with self.assertRaises(IndexError):
             rf.get_vgpr_pair(15)
+
+
+class TestSymbolicAST(unittest.TestCase):
+    """Test suite for symbolic AST definitions and typed expressions."""
+
+    def test_ast_creation_and_formatting(self) -> None:
+        dst = ASTOperand(kind=OperandKind.VGPR_PAIR, reg_idx=0)
+        src0 = ASTOperand(kind=OperandKind.VGPR_PAIR, reg_idx=2)
+        src1 = ASTOperand(kind=OperandKind.SGPR_PAIR, reg_idx=4)
+        inst = ASTInstruction(opcode="v_mul_f64", dst=dst, src0=src0, src1=src1)
+        inst.validate()
+        self.assertEqual(inst.format_asm(), "v_mul_f64 v[0:1], v[2:3], s[4:5]")
+
+        # With clamp and modifiers
+        src0_mod = ASTOperand(kind=OperandKind.VGPR_PAIR, reg_idx=2, neg=True, abs_val=True)
+        inst_clamp = ASTInstruction(opcode="v_mul_f64", dst=dst, src0=src0_mod, src1=src1, clamp=True)
+        inst_clamp.validate()
+        self.assertEqual(inst_clamp.format_asm(), "v_mul_f64 v[0:1], -|v[2:3]|, s[4:5] clamp")
+
+    def test_typed_expression_evaluation(self) -> None:
+        c1 = F64Constant(f64_to_u64(2.5))
+        c2 = F64Constant(f64_to_u64(4.0))
+        mul_expr = F64Mul(lhs=c1, rhs=c2)
+        res = mul_expr.evaluate({})
+        self.assertEqual(u64_to_f64(res), 10.0)
+
+        # Unary operations
+        neg_c1 = F64UnaryOp("neg", c1)
+        res_neg = F64Mul(lhs=neg_c1, rhs=c2).evaluate({})
+        self.assertEqual(u64_to_f64(res_neg), -10.0)
+
+    def test_instruction_to_expression(self) -> None:
+        dst = ASTOperand(kind=OperandKind.VGPR_PAIR, reg_idx=0)
+        src0 = ASTOperand(kind=OperandKind.VGPR_PAIR, reg_idx=2, neg=True)
+        src1 = ASTOperand(kind=OperandKind.LITERAL_64, imm_val=f64_to_u64(3.0))
+        inst = ASTInstruction(opcode="v_mul_f64", dst=dst, src0=src0, src1=src1, clamp=False)
+
+        expr = instruction_to_expression(inst)
+        env = {"src0_2": f64_to_u64(4.0)}
+        res = expr.evaluate(env)
+        # -4.0 * 3.0 = -12.0
+        self.assertEqual(u64_to_f64(res), -12.0)
+
+    def test_ast_validation_errors(self) -> None:
+        # Invalid opcode
+        bad_op = ASTInstruction(
+            opcode="v_add_f64",
+            dst=ASTOperand(OperandKind.VGPR_PAIR, 0),
+            src0=ASTOperand(OperandKind.VGPR_PAIR, 2),
+            src1=ASTOperand(OperandKind.VGPR_PAIR, 4),
+        )
+        with self.assertRaises(ValueError):
+            bad_op.validate()
+
+        # Destination cannot be SGPR
+        bad_dst = ASTInstruction(
+            opcode="v_mul_f64",
+            dst=ASTOperand(OperandKind.SGPR_PAIR, 0),
+            src0=ASTOperand(OperandKind.VGPR_PAIR, 2),
+            src1=ASTOperand(OperandKind.VGPR_PAIR, 4),
+        )
+        with self.assertRaises(ValueError):
+            bad_dst.validate()
+
+        # Destination out of bounds
+        oob_dst = ASTInstruction(
+            opcode="v_mul_f64",
+            dst=ASTOperand(OperandKind.VGPR_PAIR, 256),
+            src0=ASTOperand(OperandKind.VGPR_PAIR, 2),
+            src1=ASTOperand(OperandKind.VGPR_PAIR, 4),
+        )
+        with self.assertRaises(ValueError):
+            oob_dst.validate()
 
 
 if __name__ == "__main__":
