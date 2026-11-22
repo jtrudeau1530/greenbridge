@@ -12,6 +12,7 @@ import argparse
 import functools
 import http.server
 import os
+import sys
 import urllib.parse
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -160,4 +161,8 @@ def main():
 
 
 if __name__ == "__main__":
+    try:  # a redirected stdout is strict ANSI code page under -I; write '?' for what it cannot encode
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
     main()
