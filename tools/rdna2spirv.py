@@ -280,10 +280,7 @@ class Gen:
     def f16_out(self, d, r, hi=0):
         """Narrow f32 ``r`` to f16 (round to nearest) and write it to the low half of ``d``, or to the high half when
         ``hi`` (op_sel destination bit). Either way the other half is kept (see write_lo16)."""
-        w2, p, lo = self.tmp(), self.tmp(), self.tmp()
-        self.emit(f"{w2} = OpCompositeConstruct %v2float {r} %f0")
-        self.emit(f"{p} = OpExtInst %uint %glsl PackHalf2x16 {w2}")
-        self.emit(f"{lo} = OpBitwiseAnd %uint {p} {self.cu(0xFFFF)}")
+        lo = self.f32_to_f16_int(r)
         if not hi:
             self.write_lo16(d, lo)
             return
@@ -305,6 +302,87 @@ class Gen:
         self.emit(f"{back} = OpExtInst %v2float %glsl UnpackHalf2x16 {p}")
         self.emit(f"{r} = OpCompositeExtract %float {back} 0")
         return r
+
+    def f32_to_f16_int(self, f):
+        """Convert f32 to IEEE-754 binary16 (round-to-nearest-even, RTE) using only integer SPIR-V ops.
+
+        Workaround for an amdvlk64 pipeline-creation crash (0xC0000005) when GLSL.std.450 PackHalf2x16 on an
+        OpImageSampleExplicitLod result feeds a structured loop with OpGroupNonUniformAny. Preserves +-0,
+        f16 subnormals, +-Inf, and canonical quiet NaNs (sign | 0x7E00 | (mant >> 13)); all shift counts stay
+        in [14, 24]. Used only for d16 image_sample*/image_gather4* results."""
+        u = self.tou(f)
+        sh_s, sign, sh_e, exp, mant = (self.tmp() for _ in range(5))
+        self.emit(f"{sh_s} = OpShiftRightLogical %uint {u} {self.cu(16)}")
+        self.emit(f"{sign} = OpBitwiseAnd %uint {sh_s} {self.cu(0x8000)}")
+        self.emit(f"{sh_e} = OpShiftRightLogical %uint {u} {self.cu(23)}")
+        self.emit(f"{exp} = OpBitwiseAnd %uint {sh_e} {self.cu(0xFF)}")
+        self.emit(f"{mant} = OpBitwiseAnd %uint {u} {self.cu(0x7FFFFF)}")
+
+        # Special: exp == 255 -> Inf or quiet NaN.
+        is_spec, is_nan, m_hi, nan_p, nan_r, inf_r, spec_r = (self.tmp() for _ in range(7))
+        self.emit(f"{is_spec} = OpIEqual %bool {exp} {self.cu(255)}")
+        self.emit(f"{is_nan} = OpINotEqual %bool {mant} {self.cu(0)}")
+        self.emit(f"{m_hi} = OpShiftRightLogical %uint {mant} {self.cu(13)}")
+        self.emit(f"{nan_p} = OpBitwiseOr %uint {self.cu(0x7E00)} {m_hi}")
+        self.emit(f"{nan_r} = OpBitwiseOr %uint {sign} {nan_p}")
+        self.emit(f"{inf_r} = OpBitwiseOr %uint {sign} {self.cu(0x7C00)}")
+        self.emit(f"{spec_r} = OpSelect %uint {is_nan} {nan_r} {inf_r}")
+
+        # Normal: exp >= 113 -> RTE via +(0xFFF + lsb), overflow >= 0x7C00 clamps to Inf.
+        is_norm, n_exp, lsb, r_add, rounded, r_hi, n_sh, raw_n, e_gt, n_ge, ovf, n_mag, norm_r = (
+            self.tmp() for _ in range(13))
+        self.emit(f"{is_norm} = OpUGreaterThanEqual %bool {exp} {self.cu(113)}")
+        self.emit(f"{n_exp} = OpISub %uint {exp} {self.cu(112)}")
+        self.emit(f"{lsb} = OpBitwiseAnd %uint {m_hi} {self.cu(1)}")
+        self.emit(f"{r_add} = OpIAdd %uint {self.cu(0xFFF)} {lsb}")
+        self.emit(f"{rounded} = OpIAdd %uint {mant} {r_add}")
+        self.emit(f"{r_hi} = OpShiftRightLogical %uint {rounded} {self.cu(13)}")
+        self.emit(f"{n_sh} = OpShiftLeftLogical %uint {n_exp} {self.cu(10)}")
+        self.emit(f"{raw_n} = OpIAdd %uint {n_sh} {r_hi}")
+        self.emit(f"{e_gt} = OpUGreaterThan %bool {exp} {self.cu(142)}")
+        self.emit(f"{n_ge} = OpUGreaterThanEqual %bool {raw_n} {self.cu(0x7C00)}")
+        self.emit(f"{ovf} = OpLogicalOr %bool {e_gt} {n_ge}")
+        self.emit(f"{n_mag} = OpSelect %uint {ovf} {self.cu(0x7C00)} {raw_n}")
+        self.emit(f"{norm_r} = OpBitwiseOr %uint {sign} {n_mag}")
+
+        # Subnormal / underflow: 102 <= exp <= 112 (shift strictly in [14, 24] for all exp).
+        full_m, ge102, le112, in_sub, raw_s, s, q, sm1, hbit, sh1, rmask, rem = (self.tmp() for _ in range(12))
+        gt_h, eq_h, q_odd_u, q_odd, tie, rup, inc, smag, sub_m, sub_r, fin_r, res = (self.tmp() for _ in range(12))
+        self.emit(f"{full_m} = OpBitwiseOr %uint {mant} {self.cu(0x800000)}")
+        self.emit(f"{ge102} = OpUGreaterThanEqual %bool {exp} {self.cu(102)}")
+        self.emit(f"{le112} = OpULessThanEqual %bool {exp} {self.cu(112)}")
+        self.emit(f"{in_sub} = OpLogicalAnd %bool {ge102} {le112}")
+        self.emit(f"{raw_s} = OpISub %uint {self.cu(126)} {exp}")
+        self.emit(f"{s} = OpSelect %uint {in_sub} {raw_s} {self.cu(24)}")
+        self.emit(f"{q} = OpShiftRightLogical %uint {full_m} {s}")
+        self.emit(f"{sm1} = OpISub %uint {s} {self.cu(1)}")
+        self.emit(f"{hbit} = OpShiftLeftLogical %uint {self.cu(1)} {sm1}")
+        self.emit(f"{sh1} = OpShiftLeftLogical %uint {self.cu(1)} {s}")
+        self.emit(f"{rmask} = OpISub %uint {sh1} {self.cu(1)}")
+        self.emit(f"{rem} = OpBitwiseAnd %uint {full_m} {rmask}")
+        self.emit(f"{gt_h} = OpUGreaterThan %bool {rem} {hbit}")
+        self.emit(f"{eq_h} = OpIEqual %bool {rem} {hbit}")
+        self.emit(f"{q_odd_u} = OpBitwiseAnd %uint {q} {self.cu(1)}")
+        self.emit(f"{q_odd} = OpINotEqual %bool {q_odd_u} {self.cu(0)}")
+        self.emit(f"{tie} = OpLogicalAnd %bool {eq_h} {q_odd}")
+        self.emit(f"{rup} = OpLogicalOr %bool {gt_h} {tie}")
+        self.emit(f"{inc} = OpSelect %uint {rup} {self.cu(1)} {self.cu(0)}")
+        self.emit(f"{smag} = OpIAdd %uint {q} {inc}")
+        self.emit(f"{sub_m} = OpSelect %uint {in_sub} {smag} {self.cu(0)}")
+        self.emit(f"{sub_r} = OpBitwiseOr %uint {sign} {sub_m}")
+
+        self.emit(f"{fin_r} = OpSelect %uint {is_norm} {norm_r} {sub_r}")
+        self.emit(f"{res} = OpSelect %uint {is_spec} {spec_r} {fin_r}")
+        return res
+
+    def pack_f16_pair_int(self, f0, f1):
+        """Pack two f32 values into one u32 (lo f16 | hi f16 << 16) via pure integer SPIR-V ops."""
+        lo = self.f32_to_f16_int(f0)
+        hi = self.f32_to_f16_int(f1)
+        hi_s, out = self.tmp(), self.tmp()
+        self.emit(f"{hi_s} = OpShiftLeftLogical %uint {hi} {self.cu(16)}")
+        self.emit(f"{out} = OpBitwiseOr %uint {lo} {hi_s}")
+        return out
 
     def f16_rtz(self, f):
         """f32 -> f16 bits (low 16) with round-toward-zero, as v_cvt_pkrtz does: pack to nearest, and if that
@@ -2938,7 +3016,7 @@ class Gen:
                 self.emit(f"{vv} = OpCompositeConstruct %v2float {comps[0]} {comps[1]}")
                 srcs.append(vv)
             vx, vy = srcs[:2]
-            r, p = self.tmp(), self.tmp()
+            r = self.tmp()
             if op == "v_pk_fma_f16":
                 self.emit(f"{r} = OpExtInst %v2float %glsl Fma {vx} {vy} {srcs[2]}")
             elif op in ("v_pk_add_f16", "v_pk_mul_f16"):
@@ -2952,7 +3030,10 @@ class Gen:
                 self.emit(f"{o2} = OpCompositeConstruct %v2float %f1 %f1")
                 self.emit(f"{c} = OpExtInst %v2float %glsl FClamp {r} {z2} {o2}")
                 r = c
-            self.emit(f"{p} = OpExtInst %uint %glsl PackHalf2x16 {r}")
+            r0, r1 = self.tmp(), self.tmp()
+            self.emit(f"{r0} = OpCompositeExtract %float {r} 0")
+            self.emit(f"{r1} = OpCompositeExtract %float {r} 1")
+            p = self.pack_f16_pair_int(r0, r1)
             self.dst(a[0], p)
         elif op in ("v_movrels_b32", "v_movreld_b32", "v_movrelsd_b32"):
             # Relative VGPR indexing through M0: movrels reads VGPR[src + M0], movreld writes VGPR[dst + M0],
