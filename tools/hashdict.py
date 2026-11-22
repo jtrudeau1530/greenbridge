@@ -3,6 +3,7 @@
 Sources: printable runs in carved blobs (selected archives fully; PSO/RBF blobs everywhere), shader names, and
 any extra text/binary files given (e.g. the exe once it arrives: run with --extra path\\to\\exe).
 When multiple names share a hash, the dictionary keeps the lexicographically first spelling.
+The output cannot overwrite an input index, extra file, or harvested blob (including hard-link aliases).
 
 Usage:
     python -I hashdict.py <carve dir> --out hashes.json [--archives a,b] [--extra f1 f2 ...] [--min 3]
