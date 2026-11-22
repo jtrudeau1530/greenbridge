@@ -600,6 +600,13 @@ def run_suite(a, work: str) -> int:
             vals = words[:len(want)] if words else []
             results.append((name, rc == 0 and vals == want,
                             " ".join(hex(x) for x in vals) if vals else msg))
+        elif name == "cs_global_neg_offset":
+            # Negative global_load/global_store offsets (cs_global_neg_offset.asm): 40 groups give a 0x2800-byte
+            # heap holding both the right addresses and the 4096-lower ones. One thread, no wave64 requirement.
+            rc, msg = run_cmd([vk_compute, spv, "40", "dump"], env=cs_env)
+            want = [0x5EED1FFC, 0x8BAD1800, 0x5EED1FF0, 0x5EED1FF4, 0x9E, 0xFFFF8BAD, 0x57023FFC, 0xEEEEEEEE]
+            ok, detail = judge_cs_dump(rc, msg, want, wave64=False, partial=False, emulated=False, hexwords=True)
+            results.append((name, ok, detail))
         elif name == "cs_wavemask":
             # Whole-wave mask test, as in check.py: needs a 64-wide subgroup, skipped where the device has none.
             # With LEONIDA_W64_EMULATE=1 it was translated with --wave64-emulate and runs on any subgroup size.
