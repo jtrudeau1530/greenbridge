@@ -1013,24 +1013,24 @@ struct entry {               // 10 uints = 40 bytes
   per-thread and merge at submit. The shader only reads the table, and D3D12 already forbids modifying a descriptor
   that an in-flight command list is using, so the same rule applies.
 
-**Measured (D3D-56, `runtime/test/vk_descriptor_bench.cpp`).** Measured on an NVIDIA GeForce RTX 5080 (discrete, `0x10de:0x2c02`, subgroup 32, driver `NVIDIA 616.56`) using 64-bit Vulkan GPU timestamps (`1.000 ns` period), dispatching `4096 x 64` invocations x `64` iterations (`16.78M` single / `33.55M` T#+S# pair lookups, median of 25 reps; slow PCIe miss/latency dispatches auto-scaled below 120 ms, median of 9 reps) against `leonida::DescriptorTable` (90% T# / 10% S#) with the exact `tools/rdna2spirv.py` `desc_probe` loop:
+**Measured (D3D-56, `runtime/test/vk_descriptor_bench.cpp`).** Measured on an NVIDIA GeForce RTX 5080 (discrete, `0x10de:0x2c02`, subgroup 32, driver `NVIDIA 616.56`) using 64-bit Vulkan GPU timestamps (`1.000 ns` period) against `leonida::DescriptorTable` (90% T# / 10% S#) with the exact `tools/rdna2spirv.py` `desc_probe` loop. Unless noted, dispatches run `4096 x 64` invocations x `64` iterations (`16.78M` single / `33.55M` T#+S# pair lookups, median of 25 reps); wave-uniform sweeps use `group_stride = iters` (`64`), `lane_stride = 0` so all distinct entries are visited (at 100k: `90,000` T#, `10,000` S#, `100,000` T#+S# pairs, `131,072` miss keys; `uniform_hot_tsharp` repeats `1` key and measures `4.6–4.8 us/1M` in `device_local`):
 
 | Entries (cap / load / bytes / mean probes) | Placement | `uniform_tsharp_hit` (us/1M, Glk/s) | `uniform_pair_ts` (us/1M, Glk/s) | `divergent_tsharp_hit` (us/1M, Glk/s) | `divergent_pair_ts` (us/1M, Glk/s) | `divergent_miss` (us/1M, Glk/s) |
 |---|---|---|---|---|---|---|
-| 1k (4,096 / 24.4% / 160 KiB / 1.316) | `device_local` | 5.518 (181.23) | 4.905 (203.88) | 25.690 (38.93) | 25.166 (39.74) | 98.448 (10.16) |
-| 1k | `host_visible` | 5.882 (170.00) | 5.099 (196.11) | 27.719 (36.08) | 24.382 (41.01) | 425.987 (2.35) |
-| 1k | `host_device_local` | 5.501 (181.79) | 4.889 (204.56) | 25.978 (38.49) | 25.256 (39.59) | 99.991 (10.00) |
-| 10k (65,536 / 15.3% / 2.50 MiB / 1.310) | `device_local` | 6.235 (160.38) | 5.489 (182.17) | 37.640 (26.57) | 35.340 (28.30) | 204.462 (4.89) |
-| 10k | `host_visible` | 14.204 (70.40) | 22.025 (45.40) | 7825.638 (0.13) | 5242.728 (0.19) | 138304.047 (0.01) |
-| 10k | `host_device_local` | 6.275 (159.36) | 5.485 (182.33) | 37.464 (26.69) | 35.184 (28.42) | 204.924 (4.88) |
-| 100k (2,097,152 / 4.8% / 80.00 MiB / 1.088) | `device_local` | 5.579 (179.24) | 5.121 (195.27) | 34.840 (28.70) | 40.156 (24.90) | 203.733 (4.91) |
-| 100k | `host_visible` | 15.985 (62.56) | 42.912 (23.30) | 2011.875 (0.50) | 13465.384 (0.07) | 162129.255 (0.01) |
-| 100k | `host_device_local` | 5.594 (178.75) | 5.121 (195.27) | 72.279 (13.84) | 99.028 (10.10) | 692.188 (1.44) |
+| 1k (4,096 / 24.4% / 160 KiB / 1.316; 900 T#, 1k pair, 1,024 miss) | `device_local` | 5.892 (169.73) | 5.076 (196.99) | 25.715 (38.89) | 25.193 (39.69) | 98.454 (10.16) |
+| 1k | `host_visible` | 6.969 (143.48) | 5.385 (185.69) | 28.193 (35.47) | 24.448 (40.90) | 430.849 (2.32) |
+| 1k | `host_device_local` | 5.926 (168.74) | 5.095 (196.25) | 25.862 (38.67) | 25.267 (39.58) | 100.008 (10.00) |
+| 10k (65,536 / 15.3% / 2.50 MiB / 1.310; 9k T#, 10k pair, 16,384 miss) | `device_local` | 6.123 (163.33) | 5.368 (186.28) | 37.697 (26.53) | 35.273 (28.35) | 203.882 (4.90) |
+| 10k | `host_visible` | 58.622 (17.06) | 19.384 (51.59) | 7626.535 (0.13) | 6392.434 (0.16) | 135855.749 (0.01; `4096x17`, n=9) |
+| 10k | `host_device_local` | 6.124 (163.28) | 5.344 (187.11) | 36.499 (27.40) | 34.738 (28.79) | 202.518 (4.94) |
+| 100k (2,097,152 / 4.8% / 80.00 MiB / 1.088; 90k T#, 100k pair, 131,072 miss) | `device_local` | 5.432 (184.09) | 4.766 (209.84) | 34.504 (28.98) | 39.566 (25.27) | 217.159 (4.60) |
+| 100k | `host_visible` | 151.640 (6.59) | 129.732 (7.71) | 11548.004 (0.09) | 2336.777 (0.43) | 163852.450 (0.01; `4096x15`, n=9) |
+| 100k | `host_device_local` | 5.468 (182.87) | 4.764 (209.93) | 72.233 (13.84) | 99.000 (10.10) | 690.168 (1.45) |
 
 Three consequences for the runtime and table layout (open on AMD/Intel/Apple GPUs via `vk_descriptor_bench`):
 
-1. **In `DEVICE_LOCAL` VRAM, the hash probe itself is cheap at all three sizes:** wave-uniform lookups run at `5.5–6.2 us / 1M` (`3.1–3.8 us / 1M` net after subtracting the `baseline_uniform` key-read dispatch), and divergent lookups hit `25.7–37.6 us / 1M` (`17.2–28.9 us / 1M` net).
-2. **`BindlessSet::create()` currently allocates PCIe `HOST_VISIBLE | HOST_COHERENT` system memory (`runtime/src/vulkan_bindless.h`):** once divergent working sets exceed cache at 10k–100k entries, `host_visible` slows down by **58x–208x** on divergent hits (**148x–335x** on T#+S# pairs, **676x–796x** on 8-probe misses). `host_device_local` (ReBAR `DEVICE_LOCAL | HOST_VISIBLE | HOST_COHERENT`) matches `device_local` within 1% at 1k–10k and is 2.1x–3.4x slower than pure `device_local` on divergent lookups at 100k (80 MiB, spilling L2) while staying 28x–234x faster than `host_visible`. Staging binding 2 to `DEVICE_LOCAL` (or preferring `DEVICE_LOCAL | HOST_VISIBLE` when small) avoids this cliff without touching the shader contract.
+1. **In `DEVICE_LOCAL` VRAM, the hash probe itself is cheap at all three sizes:** wave-uniform full-table sweeps run at `5.4–6.1 us / 1M` (`3.0–3.7 us / 1M` net after subtracting the `baseline_uniform` key-read dispatch), and divergent lookups hit `25.7–37.7 us / 1M` (`17.2–28.9 us / 1M` net).
+2. **`BindlessSet::create()` currently allocates PCIe `HOST_VISIBLE | HOST_COHERENT` system memory (`runtime/src/vulkan_bindless.h`):** once working sets exceed cache at 10k–100k entries, `host_visible` slows down by **9.6x–28x** even on wave-uniform full sweeps, **202x–335x** on divergent T# hits (`59x–181x` on T#+S# pairs), and **666x–755x** on 8-probe misses. `host_device_local` (ReBAR `DEVICE_LOCAL | HOST_VISIBLE | HOST_COHERENT`) matches `device_local` across all 1k–10k cases and 100k uniform sweeps, and is 2.1x–3.2x slower than pure `device_local` on 100k divergent lookups (80 MiB, spilling L2) while staying 24x–237x faster than `host_visible`. Staging binding 2 to `DEVICE_LOCAL` (or preferring `DEVICE_LOCAL | HOST_VISIBLE` when small) avoids this cliff without touching the shader contract.
 3. **Power-of-two linear probing with an 8-probe hard limit inflates large tables:** `DescriptorTable` reaches only `15.3%` load at 10k (`2.50 MiB`) and `4.8%` load at 100k (`80.00 MiB`, `max_probes=5`) because any 9-probe collision forces a full 2x capacity double. Bounded-window displacement (for example Robin Hood / backshift within the existing 8-slot window) can raise load factor without changing translated shaders.
 
 ### 5.2 Per-stage code base
@@ -1270,7 +1270,7 @@ Xodus is LGPL-2.1 and is cited only for its coverage number, not as a code sourc
 - **The arena.** A single BDA arena is required by the shader contract for buffers, descriptor tables and code; the
   game's buffer working set may exceed `maxBufferSize` or PC VRAM. Host-visible arenas are slow; device-local
   arenas need staging and careful upload/readback handling. This is the main performance risk.
-- **Hash-table cost.** Every image/sampler access hashes a T#/S# and probes a storage buffer. **Measured (D3D-56, section 5.1)** on an RTX 5080 (driver 616.56): in `DEVICE_LOCAL` VRAM the lookup itself stays fast up to 100k entries (`3.1–3.8 us/1M` net wave-uniform, `17.2–28.9 us/1M` net divergent hits), whereas `HOST_VISIBLE | HOST_COHERENT` system memory (current `BindlessSet::create()`) drops 58x–796x on divergent lookups at 10k–100k entries, and linear probing's 8-probe limit doubles a 100k table to `80.00 MiB` (`4.8%` load). Staging binding 2 to `DEVICE_LOCAL` and improving slot placement within the 8-probe window are open optimisations; AMD/Intel/Apple numbers remain open via `vk_descriptor_bench`.
+- **Hash-table cost.** Every image/sampler access hashes a T#/S# and probes a storage buffer. **Measured (D3D-56, section 5.1)** on an RTX 5080 (driver 616.56): in `DEVICE_LOCAL` VRAM the lookup itself stays fast up to 100k entries (`3.0–3.7 us/1M` net wave-uniform full sweeps, `17.2–28.9 us/1M` net divergent hits), whereas `HOST_VISIBLE | HOST_COHERENT` system memory (current `BindlessSet::create()`) drops 9.6x–28x on uniform full sweeps and 59x–755x on divergent lookups at 10k–100k entries, and linear probing's 8-probe limit doubles a 100k table to `80.00 MiB` (`4.8%` load). Staging binding 2 to `DEVICE_LOCAL` and improving slot placement within the 8-probe window are open optimisations; AMD/Intel/Apple numbers remain open via `vk_descriptor_bench`.
 - **Wave64.** On NVIDIA, wave64 shaders use the translator's 32-wide approximation; cross-half ops are approximate.
   AMD GPUs with 64-wide subgroups are exact. This is a known fidelity gap, not specific to the layer.
 - **Xbox tiling/DCC.** Slot 76 and layout `0x101` are known, but the tiled data layout, detile path and DCC remain
