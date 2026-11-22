@@ -136,12 +136,22 @@ def main():
             reason = getattr(e, "strerror", None) or (f"no {e} key" if isinstance(e, KeyError) else e)
             print(f"ERROR: cannot read {p}: {reason}", file=sys.stderr)
             return 2
-        for r in rows:
+        for row_idx, r in enumerate(rows):
             if r.get("type") == "bink2":
                 continue
-            meta = r["head"].startswith("5053494e") or r["head"].startswith("52424630")
+            head = r.get("head")
+            off = r.get("off")
+            err = None
+            if not isinstance(head, str):
+                err = f"row {row_idx} has a non-string head"
+            elif not isinstance(off, int) or isinstance(off, bool) or off < 0:
+                err = f"row {row_idx} has an invalid offset"
+            if err is not None:
+                print(f"ERROR: cannot read {p}: {err}", file=sys.stderr)
+                return 2
+            meta = head.startswith("5053494e") or head.startswith("52424630")
             if arch in full or meta:
-                blob = os.path.join(arch_dir, f"{r['off']:012x}.bin")
+                blob = os.path.join(arch_dir, f"{off:012x}.bin")
                 try:
                     with open(blob, "rb") as f:
                         if output_stat is not None and os.path.samestat(os.fstat(f.fileno()), output_stat):

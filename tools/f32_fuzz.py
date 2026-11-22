@@ -304,7 +304,8 @@ def cube(op, x, y, z):
         return {"z": neg(x) if lt0(z) else x, "y": x, "x": z if lt0(x) else neg(z)}[major]
     if op == "v_cubetc_f32":
         return {"z": neg(y), "y": neg(z) if lt0(y) else z, "x": neg(y)}[major]
-    return mul(bits(2.0), {"z": z, "y": y, "x": x}[major])
+    m = {"z": z, "y": y, "x": x}[major]
+    return 0 if is_zero(m) else mul(bits(2.0), m)
 
 
 def cmp_class(x, mask):

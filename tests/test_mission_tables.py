@@ -149,6 +149,23 @@ class TestElement(unittest.TestCase):
         second = by_archetype[0x99887766]
         self.assertEqual([round(value, 4) for value in second["pos"]], [-10.0, 20.0, 30.0])
 
+    def test_resolves_later_slots_when_first_slot_is_missing(self) -> None:
+        blob = blob_with(
+            [(0x100, record(0x11111111, 7, 0x180, 2)),
+             (0x120, record(0x22222222, 7, 0x200, 1))],
+            [(0x1C0, good_element(archetype=0xAABBCCDD, pos=(10.0, 20.0, 30.0))),
+             (0x200, good_element(archetype=0x99887766))],
+        )
+
+        result = M.parse_blob(bytes(blob), "missing-first-slot.bin")
+
+        self.assertEqual((result["records"], result["entities"]), (2, 2))
+        self.assertEqual(result["skipped_slots"], 1)
+        self.assertEqual(result["unresolved_records"], 0)
+        first = result["entity_list"][0]
+        self.assertEqual((first["offset"], first["archetype"], first["pos"]),
+                         (0x1C0, 0xAABBCCDD, [10.0, 20.0, 30.0]))
+
     def test_mismatched_duplicated_position_is_not_an_entity(self):
         broken = bytearray(good_element(archetype=0xDEADBEEF, link=0x00000001))
         struct.pack_into("<I", broken, 0x1C, 0x7FC00000)  # pos.x copy no longer equals pos.x
@@ -218,6 +235,16 @@ class TestBlockIndexed(unittest.TestCase):
         self.assertEqual(skipped, 0)
         self.assertEqual([address for address, _element in found], [base + 0x1070, base + 0x10E0])
 
+    def test_block_indexed_slots_resume_after_the_first_slot(self) -> None:
+        blocks = [(0x11, 0x100, 0x1000)]
+        record = {"kind": 1, "band": 0, "poolOffset": 0, "count": 2}
+        address = 0x100 + 112
+        entity = {"pos": [1.0, 2.0, 3.0], "archetype": 0x1000}
+
+        found, mode, skipped = M.resolve(record, {address: entity}, None, blocks, 112)
+
+        self.assertEqual((found, mode, skipped), ([(address, entity)], "block", 1))
+
     def test_psin_container_resolves_a_112_byte_slot_array(self):
         slots = bytearray(0x1240)
         for index, (position, rotation) in enumerate((
@@ -278,6 +305,16 @@ class TestBrokenInput(unittest.TestCase):
         self.assertEqual(result["unresolved_records"], 1)
         self.assertEqual(result["entity_list"][0]["archetype"], 0xABCDEF01)
         self.assertIn(0x22222222, {state["key"] for state in result["states"]})
+
+    def test_rejected_lone_record_does_not_skip_adjacent_table(self):
+        # 24-byte prefix + valid 2-record chunk at +0x18: bytes 0x00..0x1F decode as a rejected lone
+        # false positive, so advancing by 32 bytes instead of 4 used to jump past +0x18 and drop the table.
+        prefix = struct.pack("<6I", 0x12345678, 0, 0, 0, 0x99990001, 0)
+        rec0 = struct.pack("<8I", 0x00010001, 0, 1, 0, (0x0000 << 16) | 3, 0, (1 << 16) | 1, 0)
+        rec1 = struct.pack("<8I", 0x11223344, 0, 1, 0, (0x0080 << 16) | 3, 0, (1 << 16) | 1, 0)
+        result = M.parse_blob(prefix + rec0 + rec1, "after_false_positive.bin")
+        self.assertEqual(result["chunks"], 1)
+        self.assertEqual(result["records"], 2)
 
 
 class TestCli(unittest.TestCase):

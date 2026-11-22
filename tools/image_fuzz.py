@@ -94,11 +94,18 @@ def assemble(asm: str, name: str, work: str) -> None:
         f.write(bytes(32))  # chunk count 0: no signatures, the stage comes from the name
 
 
-def translate(work: str) -> str:
+def pc_tail_env() -> bool:
+    """True when LEONIDA_PC_TAIL_UBO asks for rdna2spirv.py --pc-tail-ubo (128-byte push constants)."""
+    return (os.environ.get("LEONIDA_PC_TAIL_UBO") or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def translate(work: str, pc_tail: bool = False) -> str:
     """Translate work/disasm into work/spirv and return that directory."""
     spirv = os.path.join(work, "spirv")
-    r = subprocess.run([sys.executable, "-I", TRANSLATOR, os.path.join(work, "disasm"), "--out", spirv],
-                       capture_output=True, text=True)
+    cmd = [sys.executable, "-I", TRANSLATOR, os.path.join(work, "disasm"), "--out", spirv]
+    if pc_tail:
+        cmd.append("--pc-tail-ubo")
+    r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode:
         raise SystemExit(f"translator failed:\n{r.stdout}\n{r.stderr}")
     return spirv
@@ -253,7 +260,7 @@ def exit_status(returncode: int) -> str:
     return f"exit {returncode}"
 
 
-def run_case(fmt_name, width, height, rng, work, build, keep, show, dmask=0xf, data=None) -> bool:
+def run_case(fmt_name, width, height, rng, work, build, keep, show, dmask=0xf, data=None, pc_tail=False) -> bool:
     """data: the (texel bytes, T# words) to use instead of drawing them from rng (main draws all cases up front, so
     the translator and the hardware oracle see the same textures)."""
     vk_format, _, _, model = FORMATS[fmt_name]
@@ -262,7 +269,7 @@ def run_case(fmt_name, width, height, rng, work, build, keep, show, dmask=0xf, d
     if not os.path.exists(os.path.join(work, "disasm", "vs_ids.s")):
         with open(os.path.join(SHADERS, "vs_ids.asm"), encoding="utf-8") as f:
             assemble(f.read(), "vs_ids", work)
-    spirv = translate(work)
+    spirv = translate(work, pc_tail=True) if pc_tail else translate(work)
     texels, tsharp = data if data is not None else make_texels(fmt_name, width, height, rng)
     texels_path = os.path.join(work, "texels.bin")
     with open(texels_path, "wb") as f:
@@ -276,8 +283,11 @@ def run_case(fmt_name, width, height, rng, work, build, keep, show, dmask=0xf, d
     if not os.path.exists(harness):
         raise SystemExit(f"{harness} not found: build the runtime first "
                          f"(cmake --build <build> --target {HARNESS})")
+    run_kw = {"capture_output": True, "text": True}
+    if pc_tail:
+        run_kw["env"] = dict(os.environ, LEONIDA_PC_TAIL_UBO="1")
     r = subprocess.run([harness, os.path.join(spirv, "vs_ids.spv"), os.path.join(spirv, "ps_image_load.spv"),
-                        out_path, spec_path], capture_output=True, text=True)
+                        out_path, spec_path], **run_kw)
     if r.returncode == 77:   # a device limit or missing feature, named on the harness's "unsupported:" line
         why = next((ln for ln in f"{r.stdout}\n{r.stderr}".splitlines() if ln.startswith("unsupported:")),
                    "the device does not support the set")
@@ -516,10 +526,12 @@ def run_translator(cases, a, work) -> tuple:
     """The translator oracle over the cases. Returns (passed, failed, skipped, {case index: True/False/None})."""
     passed = failed = skipped = 0
     verdicts = {}
+    pc_tail = bool(getattr(a, "pc_tail_ubo", False))
     for c in cases:
         if a.show:
             print(f"[{c.index + 1}/{len(cases)}] {c.fmt} {c.width}x{c.height} (work {work})")
-        result = run_case(c.fmt, c.width, c.height, None, work, a.build, False, a.show, c.dmask, c.data)
+        result = run_case(c.fmt, c.width, c.height, None, work, a.build, False, a.show, c.dmask, c.data,
+                          pc_tail=pc_tail)
         verdicts[c.index] = result
         if result is None:
             skipped += 1
@@ -550,8 +562,12 @@ def main() -> int:
     ap.add_argument("--negative-control", action="store_true",
                     help="hw: check that deliberately wrong models and a wrong T# FORMAT are caught by the hardware words")
     ap.add_argument("--max-report", type=int, default=6, help="hw: mismatching words to print per case")
+    ap.add_argument("--pc-tail-ubo", action="store_true",
+                    help="translate with rdna2spirv.py --pc-tail-ubo and run vk_image_fuzz with 128-byte push "
+                         "constants (also set by LEONIDA_PC_TAIL_UBO=1)")
     ap.add_argument("--self-test", action="store_true")
     a = ap.parse_args()
+    a.pc_tail_ubo = a.pc_tail_ubo or pc_tail_env()
     if a.self_test:
         return self_test()
     backends = tuple(dict.fromkeys(t.strip() for t in a.oracle.split(",")))

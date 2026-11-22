@@ -282,11 +282,10 @@ class TestInstructionDecoderBoundary(unittest.TestCase):
                     self.gen._insn({"op": op, "args": [], "mods": []})
                 self.assertEqual(str(cm.exception), op)
 
-    def test_disallowed_mode_opcodes(self):
-        for op in ("s_denorm_mode", "s_round_mode"):
-            with self.subTest(op=op):
-                with self.assertRaisesRegex(rdna2spirv.Unsupported, r"\(not in the corpus; MODE is modelled through s_setreg only\)"):
-                    self.gen._insn({"op": op, "args": [], "mods": []})
+    def test_mode_opcodes_without_immediates(self):
+        for op, error in (("s_denorm_mode", "denormal mode"), ("s_round_mode", "requires an immediate")):
+            with self.subTest(op=op), self.assertRaisesRegex(rdna2spirv.Unsupported, error):
+                self.gen._insn({"op": op, "args": [], "mods": []})
 
     def test_dpp_invalid_opcodes_and_boundary_modifiers(self):
         # DPP combined with SDWA
