@@ -1065,5 +1065,62 @@ class TestValuSadU32StatusFlags(unittest.TestCase):
         self.assertTrue(flags_neg.sign)
 
 
+class TestValuSadU32IEEE754Boundaries(unittest.TestCase):
+    """Unit tests for IEEE 754 bit-pattern extremes, subnormals, and NaN payload distances."""
+
+    POS_ZERO_F32: int = 0x0000_0000
+    NEG_ZERO_F32: int = 0x8000_0000
+    POS_INF_F32: int = 0x7F80_0000
+    NEG_INF_F32: int = 0xFF80_0000
+    QNAN_F32: int = 0x7FC0_0000
+    SNAN_F32: int = 0x7F80_0001
+    MIN_NORMAL_F32: int = 0x0080_0000
+    MAX_SUBNORMAL_F32: int = 0x007F_FFFF
+    MIN_SUBNORMAL_F32: int = 0x0000_0001
+
+    @staticmethod
+    def f32_to_bits(val: float) -> int:
+        return struct.unpack("<I", struct.pack("<f", val))[0]
+
+    def test_ieee754_ulp_distance(self) -> None:
+        # 1.0f in binary32 is 0x3F800000
+        # The next adjacent float is 1.0000001192092896f (0x3F800001)
+        b_one = self.f32_to_bits(1.0)
+        b_next = b_one + 1
+        dist = ref_sad_u32(b_one, b_next, 0)
+        self.assertEqual(dist, 1)
+
+    def test_signed_zero_bit_distance(self) -> None:
+        # Distance between +0.0 (0x00000000) and -0.0 (0x80000000)
+        dist = ref_sad_u32(self.POS_ZERO_F32, self.NEG_ZERO_F32, 0)
+        self.assertEqual(dist, 0x8000_0000)
+
+    def test_subnormal_to_normal_boundary_step(self) -> None:
+        # Between max subnormal (0x007FFFFF) and min normal (0x00800000)
+        step = ref_sad_u32(self.MIN_NORMAL_F32, self.MAX_SUBNORMAL_F32, 0)
+        self.assertEqual(step, 1)
+
+    def test_nan_payload_distance(self) -> None:
+        # Distance between infinity and canonical quiet NaN is exactly the quiet bit (0x00400000)
+        dist = ref_sad_u32(self.POS_INF_F32, self.QNAN_F32, 0)
+        self.assertEqual(dist, 0x0040_0000)
+
+    def test_signaling_nan_payload(self) -> None:
+        # Distance between +Inf (0x7F800000) and signaling NaN with payload 1 (0x7F800001)
+        dist = ref_sad_u32(self.POS_INF_F32, self.SNAN_F32, 0)
+        self.assertEqual(dist, 1)
+
+    def test_nan_clamp_saturation(self) -> None:
+        # Adding accumulator to NaN distance that overflows 32-bit space saturates to 0xFFFFFFFF
+        dist_clamped = ref_sad_u32(self.NEG_INF_F32, self.POS_ZERO_F32, 0x1000, clamp=True)
+        # |0xFF800000 - 0| + 0x1000 = 0xFF801000 (< 0xFFFFFFFF, no overflow)
+        self.assertEqual(dist_clamped, 0xFF80_1000)
+
+        # Extreme overflow with clamp
+        dist_overflow_clamped = ref_sad_u32(self.NEG_INF_F32, self.POS_ZERO_F32, 0x0080_0000, clamp=True)
+        # 0xFF800000 + 0x00800000 = 0x100000000 -> clamps to 0xFFFFFFFF
+        self.assertEqual(dist_overflow_clamped, MASK32)
+
+
 if __name__ == "__main__":
     unittest.main()
