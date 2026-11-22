@@ -847,8 +847,12 @@ and any validation error fails them.
     - **MIP_FILTER none with the T#'s MIN_LOD.** The level is the base raised to floor(MIN_LOD): 2.5 reads level 2,
       the same as Vulkan.
 
-    So the runtime's Vulkan sampler and view read one level lower than the console on 8 of the 43 rows: an exact
-    half-level LOD, or a fractional ResourceMinLODClamp. LOD 1.49 reads level 1 on both.
+    So a host whose Vulkan driver follows the spec's nearest rule reads one level lower than the console on 8 of
+    the 43 rows: an exact half-level LOD, or a fractional ResourceMinLODClamp. LOD 1.49 reads level 1 on both. The
+    AMD driver does not follow it. Through the runtime's own path (`vk_sampler_test`, `vulkan_sampler(decode(S#))`),
+    an S# LOD_BIAS of +0.5 on `image_sample_lz` reads level 1, like the console, on the same gfx1036 and on an RX 7800
+    XT (both AMD 26.10.1). So on AMD hosts the S# case matches. Other hosts (NVIDIA, Intel, Mesa) are not measured
+    here.
   - **Layout.** gfx1036 lays a linear mip chain out smallest level first, each row padded to 256 bytes. Levels 6..0
     of the 64-wide R32 chain start at dwords 0, 64, 192, 448, 960, 1984 and 4032.
 
