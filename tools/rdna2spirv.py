@@ -3724,12 +3724,13 @@ class Gen:
         self.emit(f"{do} = OpLabel")
         self.emit(f"{p} = OpAccessChain %_ptr_WG_uint %lds {i}")
         r = fn(p)
+        done_lbl = self.current_label_placeholder()
         self.emit(f"OpBranch {end}")
         self.emit(f"{end} = OpLabel")
         if r is None:
             return None
         v = self.tmp()
-        self.emit(f"{v} = OpPhi %uint {r} {do} {self.cu(0)} {pre}")
+        self.emit(f"{v} = OpPhi %uint {r} {done_lbl} {self.cu(0)} {pre}")
         return v
 
     def lds_load(self, addr, byte_off):
@@ -3999,50 +4000,56 @@ class Gen:
             if dat["k"] != "vgpr" or dat.get("n", 1) != 1 or \
                     (d is not None and (d["k"] != "vgpr" or d.get("n", 1) != 1)):
                 raise Unsupported(op + " operands")
-            p = self.lds_ptr(self.src_u(ad), off)
+            addr = self.src_u(ad)
             val = self.src_u(dat)
             val_f = None
             if name in ("ds_min_f32", "ds_max_f32"):
                 val_f = self.tmp()
                 self.emit(f"{val_f} = OpBitcast %float {val}")
-            lbl_hdr, lbl_cont, lbl_exit = (self.tmp() + s for s in ("_hdr", "_cont", "_exit"))
-            init = self.tmp()
-            self.emit(f"{init} = OpAtomicLoad %uint {p} {sc} {sem}")
-            self.emit(f"OpBranch {lbl_hdr}")
-            self.emit(f"{lbl_hdr} = OpLabel")
-            cur, got = self.tmp(), self.tmp()
-            self.emit(f"{cur} = OpPhi %uint {init} {lbl_do} {got} {lbl_cont}")
-            if name == "ds_inc_u32":
-                wrap, step, new_u = self.tmp(), self.tmp(), self.tmp()
-                self.emit(f"{wrap} = OpUGreaterThanEqual %bool {cur} {val}")
-                self.emit(f"{step} = OpIAdd %uint {cur} {self.cu(1)}")
-                self.emit(f"{new_u} = OpSelect %uint {wrap} {self.cu(0)} {step}")
-            elif name == "ds_dec_u32":
-                is_z, gt, wrap, step, new_u = (self.tmp() for _ in range(5))
-                self.emit(f"{is_z} = OpIEqual %bool {cur} {self.cu(0)}")
-                self.emit(f"{gt} = OpUGreaterThan %bool {cur} {val}")
-                self.emit(f"{wrap} = OpLogicalOr %bool {is_z} {gt}")
-                self.emit(f"{step} = OpISub %uint {cur} {self.cu(1)}")
-                self.emit(f"{new_u} = OpSelect %uint {wrap} {val} {step}")
-            elif name == "ds_rsub_u32":
-                new_u = self.tmp()
-                self.emit(f"{new_u} = OpISub %uint {val} {cur}")
-            else:
-                cur_f, new_f, new_u = self.tmp(), self.tmp(), self.tmp()
-                self.emit(f"{cur_f} = OpBitcast %float {cur}")
-                glsl_op = "NMin" if name == "ds_min_f32" else "NMax"
-                self.emit(f"{new_f} = OpExtInst %float %glsl {glsl_op} {cur_f} {val_f}")
-                self.emit(f"{new_u} = OpBitcast %uint {new_f}")
-            done = self.tmp()
-            self.emit(f"{got} = OpAtomicCompareExchange %uint {p} {sc} {sem} {sem} {new_u} {cur}")
-            self.emit(f"{done} = OpIEqual %bool {got} {cur}")
-            self.emit(f"OpLoopMerge {lbl_exit} {lbl_cont} None")
-            self.emit(f"OpBranchConditional {done} {lbl_exit} {lbl_cont}")
-            self.emit(f"{lbl_cont} = OpLabel")
-            self.emit(f"OpBranch {lbl_hdr}")
-            self.emit(f"{lbl_exit} = OpLabel")
+
+            def cas(p):
+                entry_lbl = self.current_label_placeholder()
+                lbl_hdr, lbl_cont, lbl_exit = (self.tmp() + s for s in ("_hdr", "_cont", "_exit"))
+                init = self.tmp()
+                self.emit(f"{init} = OpAtomicLoad %uint {p} {sc} {sem}")
+                self.emit(f"OpBranch {lbl_hdr}")
+                self.emit(f"{lbl_hdr} = OpLabel")
+                cur, got = self.tmp(), self.tmp()
+                self.emit(f"{cur} = OpPhi %uint {init} {entry_lbl} {got} {lbl_cont}")
+                if name == "ds_inc_u32":
+                    wrap, step, new_u = self.tmp(), self.tmp(), self.tmp()
+                    self.emit(f"{wrap} = OpUGreaterThanEqual %bool {cur} {val}")
+                    self.emit(f"{step} = OpIAdd %uint {cur} {self.cu(1)}")
+                    self.emit(f"{new_u} = OpSelect %uint {wrap} {self.cu(0)} {step}")
+                elif name == "ds_dec_u32":
+                    is_z, gt, wrap, step, new_u = (self.tmp() for _ in range(5))
+                    self.emit(f"{is_z} = OpIEqual %bool {cur} {self.cu(0)}")
+                    self.emit(f"{gt} = OpUGreaterThan %bool {cur} {val}")
+                    self.emit(f"{wrap} = OpLogicalOr %bool {is_z} {gt}")
+                    self.emit(f"{step} = OpISub %uint {cur} {self.cu(1)}")
+                    self.emit(f"{new_u} = OpSelect %uint {wrap} {val} {step}")
+                elif name == "ds_rsub_u32":
+                    new_u = self.tmp()
+                    self.emit(f"{new_u} = OpISub %uint {val} {cur}")
+                else:
+                    cur_f, new_f, new_u = self.tmp(), self.tmp(), self.tmp()
+                    self.emit(f"{cur_f} = OpBitcast %float {cur}")
+                    glsl_op = "NMin" if name == "ds_min_f32" else "NMax"
+                    self.emit(f"{new_f} = OpExtInst %float %glsl {glsl_op} {cur_f} {val_f}")
+                    self.emit(f"{new_u} = OpBitcast %uint {new_f}")
+                done = self.tmp()
+                self.emit(f"{got} = OpAtomicCompareExchange %uint {p} {sc} {sem} {sem} {new_u} {cur}")
+                self.emit(f"{done} = OpIEqual %bool {got} {cur}")
+                self.emit(f"OpLoopMerge {lbl_exit} {lbl_cont} None")
+                self.emit(f"OpBranchConditional {done} {lbl_exit} {lbl_cont}")
+                self.emit(f"{lbl_cont} = OpLabel")
+                self.emit(f"OpBranch {lbl_hdr}")
+                self.emit(f"{lbl_exit} = OpLabel")
+                return cur if d is not None else None
+
+            old = self.lds_access(addr, off, cas)        # bounds-checked when lds_bound is set (SHADER-309)
             if d is not None:
-                self.dst(d, cur)
+                self.dst(d, old)
         else:
             raise Unsupported(op)
         self.emit(f"OpBranch {lbl_end}")
