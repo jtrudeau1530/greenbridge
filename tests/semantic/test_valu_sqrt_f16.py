@@ -1046,5 +1046,148 @@ class TestIEEE754BoundaryExtremes(unittest.TestCase):
             self.assertEqual(res, expected)
 
 
+class TestNegativeControlsAndMutations(unittest.TestCase):
+    """Unit tests for negative controls, syntax rejection, and mutation detection."""
+
+    def test_syntax_rejection_invalid_register_indices(self) -> None:
+        with self.assertRaises(ValueError):
+            RegHalf(-1, RegType.VGPR)
+        with self.assertRaises(ValueError):
+            RegHalf(256, RegType.VGPR)
+        with self.assertRaises(ValueError):
+            RegHalf(300, RegType.SGPR)
+
+    def test_syntax_rejection_valu_destination_must_be_vgpr(self) -> None:
+        dst_sgpr = RegHalf(0, RegType.SGPR)
+        src = VOP3Operand(RegHalf(2, RegType.VGPR))
+        with self.assertRaises(TypeError):
+            VSqrtF16Instruction(dst=dst_sgpr, src0=src)
+
+    def test_syntax_rejection_invalid_lane_count(self) -> None:
+        with self.assertRaises(ValueError):
+            SIMDState(num_lanes=16)
+        with self.assertRaises(ValueError):
+            SIMDState(num_lanes=128)
+
+    def test_negative_control_bit_flip_detection(self) -> None:
+        s0 = FOUR_F16
+        correct = oracle_v_sqrt_f16(s0)
+        self.assertEqual(correct, TWO_F16)
+
+        # Perturb single mantissa bit
+        corrupted_mantissa = correct ^ 0x1
+        self.assertNotEqual(correct, corrupted_mantissa)
+
+        # Perturb single exponent bit
+        corrupted_exp = correct ^ (1 << 10)
+        self.assertNotEqual(correct, corrupted_exp)
+
+        # Perturb sign bit
+        corrupted_sign = correct ^ SIGN_MASK
+        self.assertNotEqual(correct, corrupted_sign)
+
+    def test_mutation_sqrt_to_identity_or_rcp(self) -> None:
+        """Mutant: Return input operand unchanged instead of square root."""
+        def mutant_sqrt(s0_bits: int) -> int:
+            return s0_bits
+
+        s0 = FOUR_F16
+        correct = oracle_v_sqrt_f16(s0)
+        mutant = mutant_sqrt(s0)
+        self.assertNotEqual(correct, mutant)
+
+    def test_mutation_ignore_abs_modifier(self) -> None:
+        """Mutant: Ignore abs modifier on negative operand."""
+        def mutant_apply_mod(bits: int, abs_mod: bool, neg_mod: bool) -> int:
+            res = bits & 0xFFFF
+            if neg_mod:
+                res ^= SIGN_MASK
+            return res
+
+        val = FOUR_F16 | SIGN_MASK  # -4.0
+        correct = apply_f16_modifiers(val, abs_mod=True, neg_mod=False)
+        mutant = mutant_apply_mod(val, abs_mod=True, neg_mod=False)
+        self.assertEqual(correct, FOUR_F16)
+        self.assertNotEqual(correct, mutant)
+
+    def test_mutation_ignore_neg_modifier(self) -> None:
+        """Mutant: Ignore neg modifier on positive operand."""
+        def mutant_apply_mod(bits: int, abs_mod: bool, neg_mod: bool) -> int:
+            res = bits & 0xFFFF
+            if abs_mod:
+                res &= ~SIGN_MASK
+            return res
+
+        val = FOUR_F16
+        correct = apply_f16_modifiers(val, abs_mod=False, neg_mod=True)
+        mutant = mutant_apply_mod(val, abs_mod=False, neg_mod=True)
+        self.assertEqual(correct, FOUR_F16 | SIGN_MASK)
+        self.assertNotEqual(correct, mutant)
+
+    def test_mutation_ignore_clamp_upper_bound(self) -> None:
+        """Mutant: Clamp modifier fails to clamp values exceeding 1.0."""
+        s0 = FOUR_F16
+        expected = oracle_v_sqrt_f16(s0, clamp=True)
+        self.assertEqual(expected, ONE_F16)
+
+        # Mutant unclamped
+        unclamped = oracle_v_sqrt_f16(s0, clamp=False)
+        self.assertNotEqual(expected, unclamped)
+
+    def test_mutation_ignore_exec_mask(self) -> None:
+        """Mutant: Inactive SIMD lanes are overwritten despite EXEC mask."""
+        sentinel = 0xCAFE
+        state = SIMDState(num_lanes=32, exec_mask=0x0000_0000)
+        for lane in range(32):
+            state.set_vgpr16(lane, 4, HalfSelect.LO, sentinel)
+
+        class MutantSIMDInterpreter(SIMDInterpreter):
+            def step(self, instr: VSqrtF16Instruction, state: SIMDState) -> List[Optional[int]]:
+                results = []
+                for lane in range(state.num_lanes):
+                    res = oracle_v_sqrt_f16(FOUR_F16)
+                    state.set_vgpr16(lane, instr.dst.index, instr.dst.half, res)
+                    results.append(res)
+                return results
+
+        mutant_interp = MutantSIMDInterpreter()
+        instr = VSqrtF16Instruction(
+            dst=RegHalf(4, RegType.VGPR, HalfSelect.LO),
+            src0=VOP3Operand(Literal16.from_float(4.0)),
+        )
+        mutant_interp.step(instr, state)
+        corrupted_lanes = [
+            lane for lane in range(32)
+            if state.get_vgpr16(lane, 4, HalfSelect.LO) != sentinel
+        ]
+        self.assertEqual(len(corrupted_lanes), 32)
+
+    def test_mutation_subnormal_flush_to_zero(self) -> None:
+        """Mutant: Subnormal input is flushed to zero instead of producing normalized root."""
+        sub = 0x0001
+        correct = oracle_v_sqrt_f16(sub)
+        self.assertEqual(correct, 0x0C00)
+
+        # FTZ mutant
+        ftz_mutant = POS_ZERO
+        self.assertNotEqual(correct, ftz_mutant)
+
+    def test_mutation_skip_snan_quietening(self) -> None:
+        """Mutant: Signaling NaN is not quietened."""
+        snan = 0x7C05
+        res = oracle_v_sqrt_f16(snan)
+        self.assertTrue(is_qnan(res))
+        self.assertNotEqual(res, snan)
+
+    def test_mutation_negative_operand_not_producing_nan(self) -> None:
+        """Mutant: Negative operand returns zero instead of Canonical Quiet NaN."""
+        s0 = FOUR_F16 | SIGN_MASK
+        expected = oracle_v_sqrt_f16(s0)
+        self.assertEqual(expected, CANONICAL_QNAN)
+
+        buggy_result = POS_ZERO
+        self.assertNotEqual(expected, buggy_result)
+
+
 if __name__ == "__main__":
     unittest.main()
