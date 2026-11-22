@@ -438,6 +438,16 @@ def scan_archive(path, sample, log):
     return stats
 
 
+def same_output_path(first, second):
+    """True when writing ``second`` would truncate ``first`` (same file, path or hard link)."""
+    if os.path.normcase(os.path.realpath(first)) == os.path.normcase(os.path.realpath(second)):
+        return True
+    try:
+        return os.path.samefile(first, second)
+    except OSError:
+        return False
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("inputs", nargs="+", help="RPF9 archives to scan")
@@ -445,10 +455,23 @@ def main(argv=None):
                     help="meshes validated per layout per archive (the census covers every mesh)")
     ap.add_argument("--json", help="write the full tallies to this file")
     a = ap.parse_args(argv)
-    report, t0 = {}, time.time()
+    if a.sample < 1:
+        print("error: --sample must be at least 1", file=sys.stderr)
+        return 2
     for path in a.inputs:
         if not os.path.isfile(path):
-            sys.exit(f"{path}: not a file")
+            print(f"error: {path} is not a file", file=sys.stderr)
+            return 2
+    if a.json:
+        if os.path.isdir(a.json):
+            print(f"error: --json {a.json} is a directory", file=sys.stderr)
+            return 2
+        for path in a.inputs:
+            if same_output_path(a.json, path):
+                print(f"error: --json would overwrite the input {path}", file=sys.stderr)
+                return 2
+    report, t0 = {}, time.time()
+    for path in a.inputs:
         stats = scan_archive(path, a.sample, lambda text: print(text, flush=True))
         report[path] = stats
         print(f"{os.path.basename(path)}: {stats['resources']} resources, {stats['meshes']} skin meshes, "
@@ -457,8 +480,15 @@ def main(argv=None):
             row = stats["layouts"][layout]
             print(f"  {layout:26s} {row['meshes']:8d} meshes {row['vertices']:12d} vertices")
     if a.json:
-        with open(a.json, "w", encoding="utf-8") as fh:
-            json.dump(report, fh, indent=1)
+        try:
+            parent = os.path.dirname(os.path.abspath(a.json))
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            with open(a.json, "w", encoding="utf-8") as fh:
+                json.dump(report, fh, indent=1)
+        except OSError as exc:
+            print(f"error: cannot write {a.json}: {exc.strerror or exc}", file=sys.stderr)
+            return 2
     return 0
 
 
