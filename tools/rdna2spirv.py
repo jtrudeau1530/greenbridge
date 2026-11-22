@@ -4629,9 +4629,11 @@ class Gen:
             def f64(sv):
                 if sv["k"] in ("vgpr", "sgpr") and sv.get("n") == 2:
                     lo, hi = self.load_reg(sv["k"], sv["r"]), self.load_reg(sv["k"], sv["r"] + 1)
-                elif sv["k"] == "imm" or sv["k"] == "fimm":
-                    import struct as _st
-                    bits = _st.unpack("<Q", _st.pack("<d", float(sv["v"])))[0] if sv["k"] == "fimm" else sv["v"] & 0xFFFFFFFFFFFFFFFF
+                elif sv.get("f64_literal"):
+                    lo, hi = self.cu(0), self.cu(sv["v"] & 0xFFFFFFFF)
+                elif sv["k"] in ("imm", "fimm"):
+                    bits = (struct.unpack("<Q", struct.pack("<d", sv["v"]))[0]
+                            if sv["k"] == "fimm" else sv["v"] & 0xFFFFFFFFFFFFFFFF)
                     lo, hi = self.cu(bits & 0xFFFFFFFF), self.cu(bits >> 32)
                 else:
                     raise Unsupported(op + " operand")
