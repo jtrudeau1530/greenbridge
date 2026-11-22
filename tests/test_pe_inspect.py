@@ -513,6 +513,36 @@ class DirectoryCountTest(unittest.TestCase):
         self.assertEqual((r["imports"], r["exports"], r["has_relocs"]), ([], [], False))
 
 
+class ImportDescriptorBoundsTest(unittest.TestCase):
+    DIRECTORIES = (
+        ("normal", pe_inspect.DIR_IMPORT, 20, ["kernel32.dll", "xmem.dll"]),
+        ("delay", pe_inspect.DIR_DELAY_IMPORT, 32, ["xmem.dll", "d3d12_xs.dll"]),
+    )
+
+    def test_import_descriptors_fit_the_declared_directory(self):
+        for kind, index, step, dlls in self.DIRECTORIES:
+            for size, count in ((step - 1, 0), (2 * step - 1, 1), (2 * step, 2)):
+                with self.subTest(kind=kind, size=size):
+                    data = bytearray(build_image(is64=False))
+                    struct.pack_into("<I", data, OPT + 96 + index * 8 + 4, size)
+                    imports = pe_inspect._imports(pe_inspect.PeImage(data), kind, index, delay=kind == "delay")
+                    self.assertEqual([entry["dll"] for entry in imports], dlls[:count])
+
+    def test_import_descriptors_fit_the_file_backed_section(self):
+        for kind, index, step, dlls in self.DIRECTORIES:
+            for extra in (0, 1):
+                with self.subTest(kind=kind, extra=extra):
+                    data = bytearray(build_image(is64=False)) + b"\0"
+                    directory = OPT + 96 + index * 8
+                    source_rva = struct.unpack_from("<I", data, directory)[0]
+                    source = TEXT_RAW + source_rva - TEXT_RVA
+                    rva = TEXT_RVA + TEXT_SIZE - step + extra
+                    place(data, rva, data[source:source + step])
+                    struct.pack_into("<II", data, directory, rva, step)
+                    imports = pe_inspect._imports(pe_inspect.PeImage(data), kind, index, delay=kind == "delay")
+                    self.assertEqual([entry["dll"] for entry in imports], dlls[:1 - extra])
+
+
 class SectionSpanTest(unittest.TestCase):
     """An RVA belongs to the section whose virtual span holds it, not to an earlier section's raw tail."""
 

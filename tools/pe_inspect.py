@@ -119,10 +119,10 @@ class PeImage:
     def directory(self, index: int) -> tuple[int, int]:
         return self.directories[index] if index < len(self.directories) else (0, 0)
 
-    def offset(self, rva: int) -> int | None:
-        """File offset of an RVA, or None when no file bytes back it."""
+    def offset(self, rva: int, size: int = 1) -> int | None:
+        """File offset of an RVA span wholly backed by headers or one section."""
         if rva < self.size_of_headers:
-            return rva if rva < len(self.data) else None
+            return rva if 0 <= rva and rva + size <= min(self.size_of_headers, len(self.data)) else None
         for s in self.sections:
             # A section is VirtualSize bytes in memory (SizeOfRawData when that is 0). File bytes past it are not
             # mapped, as in runtime/src/pe_loader.cpp: with SizeOfRawData larger than the span to the next
@@ -130,10 +130,10 @@ class PeImage:
             span = s["vsize"] or s["rawsize"]
             if s["rva"] <= rva < s["rva"] + span:
                 delta = rva - s["rva"]
-                if delta >= min(s["rawsize"], span):
+                if delta + size > min(s["rawsize"], span):
                     return None
                 at = s["rawptr"] + delta
-                return at if at < len(self.data) else None
+                return at if at + size <= len(self.data) else None
         return None
 
     def section_data(self, section: dict) -> bytes:
@@ -173,15 +173,12 @@ def _imports(img: PeImage, kind: str, index: int, delay: bool = False) -> list[d
     rva, size = img.directory(index)
     if not rva or not size:
         return []
-    at = img.offset(rva)
-    if at is None:
-        return []
 
     entries = []
     step = 32 if delay else 20
-    for i in range(MAX_ENTRIES):
-        base = at + i * step
-        if base + step > len(img.data):
+    for i in range(min(size // step, MAX_ENTRIES)):
+        base = img.offset(rva + i * step, step)
+        if base is None:
             break
         if delay:
             (attributes, dll_rva, _handle, iat_rva, int_rva, _bound, _unload,
