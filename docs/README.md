@@ -31,7 +31,7 @@ method, scope and caveats. No game data is included.
 | [navmesh.md](navmesh.md) | 90,295 `navmeshes.rpf` streams (0 unclassified): 9,603 `0DRP` cover-point `0x7a` pages, 27,644 `0x00010015` navmesh tiles (`136×180` grid), 27,482 Band-3 sparse grids, 22 `PSIN`. |
 | [bvh.md](bvh.md) | 565,596 `core_bvh4.rpf` streams; 271,627 BVH4 streams and 269,106 instances, prebuilt acceleration data. |
 | [rbf0.md](rbf0.md) | 1,263 RBF0 resources, 475,461 elements; UI/Scaleform definitions, not a sectioned container; strict JSON/CSV/XML tree decoder. |
-| [gamedata.md](gamedata.md) | `common.rpf`: 954 streams, 266 XML documents / 118 roots; 0 RBF0/PSIN. |
+| [gamedata.md](gamedata.md) | `common.rpf`: 954 streams, 266 XML documents / 118 roots; 0 RBF0/PSIN; a streaming reader (`gamedata_reader.py`) converts 259 documents by root and `type`. |
 | [gamedata_graph.md](gamedata_graph.md) | `common.rpf` mount graph: 25 manifest documents, 30 content-set ids, 14 include refs (12 resolve), 3,386 target refs, 0 cycles. |
 | [world.md](world.md) | `levels.rpf` placement: 9,918 map files / 680,228 entities measured in 55% of the archive (lower bound; estimate 16k-39.6k / 1.03M-2.64M); `0x7a` resource layout. Building a placed world from entity rows (`world_build.py --placements`): shared geometry per chunk (`EXT_mesh_gpu_instancing`), bounded memory for the whole archive, and per-tier LOD chunk sets with distance bands (`--lod-sets`). |
 | [world_census.md](world_census.md) | Full `levels.rpf` pass: 23,535 maps / 1,670,442 entities, 98.32% stream coverage, sharded and exact; the SixNG 30,785-map difference reconciled map by map (interiors and entity groups). |
