@@ -34,7 +34,7 @@ import spirv_mini_interp as si  # noqa: E402
 
 M32 = 0xFFFFFFFF
 STUB_DXBC = b"DXBC" + bytes(24) + struct.pack("<I", 0) + bytes(4)
-VSHARP = [0, 0, 0xFFFFFFFF, 0]          # s[0:3]: raw buffer, any offset in range
+VSHARP = [0, 0, 0xFFFFFFFF, 0x31016FAC]  # s[0:3]: raw buffer (OOB_SELECT 3), any offset in range
 
 # (instruction, size in bytes). VCC lane i = bit (i & 31) of (s4 if i < 32 else s5).
 BUILD_VCC = [
