@@ -662,6 +662,18 @@ class TestMainAndCLI(unittest.TestCase):
             self.assertIn("spirv-val failed", err)
             self.assertIn("validation error", err)
 
+    def test_main_rejects_non_object_index(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            for index in ([], ["ps"], None):
+                with self.subTest(index=index):
+                    with open(os.path.join(tmp, "index.json"), "w", encoding="utf-8", newline="\n") as f:
+                        json.dump(index, f)
+
+                    code, out, err = self._call_main(["bary_fallback_gs.py", tmp])
+                    self.assertEqual(code, 1)
+                    self.assertEqual(out, "")
+                    self.assertIn("translation index must be a JSON object", err)
+
     def test_cli_subprocess_isolated_mode(self):
         def run_cli(*args):
             return subprocess.run(

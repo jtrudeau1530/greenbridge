@@ -1,0 +1,130 @@
+// PresentX plane composition (docs/d3d12_vulkan.md section 4.5): one or two planes, each scaled from a source rectangle to
+// a destination rectangle of the output, plane 1 blended over plane 0, written to an RGBA16F image the presenter then
+// copies to the swapchain. present_compose_spv.h is this file compiled with
+// `glslc --target-env=vulkan1.1 -O -mfmt=c` (see the header for the command); keep them together.
+//
+// Every plane is read with texelFetch (no sampler: the filtering is done here, so it works on any sampled format and
+// only reads texels inside the source rectangle). Values are the encoded ones of the plane's colour space: SDR planes
+// hold G2.2 values, HDR10 planes hold ST.2084 (PQ) Rec.2020 values. An sRGB-format source is decoded by the texture unit,
+// so `flag_srgb_source` encodes it again with the sRGB curve and the bytes come out as they went in.
+//
+// Conversions (all provisional, docs section 4.5): SDR -> HDR10: pow 2.2, Rec.709 -> Rec.2020, times the SDR white level
+// in nits, PQ. HDR10 -> SDR: PQ, Rec.2020 -> Rec.709, divided by the white level, clipped to 0..1, pow 1/2.2 (no
+// tone mapping). Same space: untouched. Plane 1 is blended after conversion, in the output's encoded space.
+#version 450
+#extension GL_EXT_samplerless_texture_functions : require
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform texture2D plane0;
+layout(set = 0, binding = 1) uniform texture2D plane1;
+layout(set = 0, binding = 2, rgba16f) uniform writeonly image2D out_image;
+
+const uint flag_point = 1u;
+const uint flag_srgb_source = 2u;
+const uint flag_hdr10 = 4u;
+const uint flag_straight_alpha = 8u;
+
+layout(push_constant) uniform Push {
+    vec4 dest0;  // destination rectangle in output pixels: left, top, right, bottom
+    vec4 dest1;
+    vec4 src0;   // source rectangle in texels
+    vec4 src1;
+    uint flags0;
+    uint flags1;
+    uint plane_count;
+    uint out_hdr;     // 1: the output holds PQ Rec.2020 values
+    float sdr_white;  // nits of SDR white, for the conversions
+    uint width, height;
+    uint pad;
+} pc;
+
+vec3 srgb_encode(vec3 c) {
+    c = clamp(c, 0.0, 1.0);
+    return mix(c * 12.92, 1.055 * pow(c, vec3(1.0 / 2.4)) - 0.055, greaterThan(c, vec3(0.0031308)));
+}
+
+// `pre`: straight-alpha data is filtered premultiplied (colour * alpha), else a transparent texel would drag the colour of its neighbours down.
+vec4 fetch_texel(texture2D t, ivec2 i, bool pre) {
+    vec4 c = texelFetch(t, i, 0);
+    return pre ? vec4(c.rgb * c.a, c.a) : c;
+}
+
+// The plane's value at output pixel `pixel` (its centre), in the plane's own encoding.
+vec4 fetch_plane(texture2D t, vec4 dest, vec4 src, uint flags, ivec2 pixel) {
+    vec2 p = (vec2(pixel) + 0.5 - dest.xy) / (dest.zw - dest.xy);  // 0..1 across the destination rectangle
+    vec2 s = src.xy + p * (src.zw - src.xy);                        // continuous texel coordinates
+    vec2 lo = src.xy, hi = src.zw - 1.0;
+    bool pre = (flags & flag_straight_alpha) != 0u;
+    vec4 c;
+    if ((flags & flag_point) != 0u) {
+        c = fetch_texel(t, ivec2(clamp(floor(s), lo, hi)), false);
+    } else {
+        vec2 f = clamp(s - 0.5, lo, hi);  // the texel whose centre is at or before the sample, clamped inside the rectangle
+        vec2 base = floor(f), w = f - base;
+        ivec2 i0 = ivec2(base), i1 = ivec2(min(base + 1.0, hi));
+        c = mix(mix(fetch_texel(t, ivec2(i0.x, i0.y), pre), fetch_texel(t, ivec2(i1.x, i0.y), pre), w.x),
+                mix(fetch_texel(t, ivec2(i0.x, i1.y), pre), fetch_texel(t, ivec2(i1.x, i1.y), pre), w.x), w.y);
+        if (pre) c.rgb = c.a > 0.0 ? c.rgb / c.a : vec3(0.0);  // back to unassociated colour
+    }
+    if ((flags & flag_srgb_source) != 0u) c.rgb = srgb_encode(c.rgb);
+    return c;
+}
+
+const float m1 = 0.1593017578125, m2 = 78.84375, c1 = 0.8359375, c2 = 18.8515625, c3 = 18.6875;
+
+vec3 pq_to_nits(vec3 e) {
+    vec3 ep = pow(clamp(e, 0.0, 1.0), vec3(1.0 / m2));
+    return 10000.0 * pow(max(ep - c1, 0.0) / (c2 - c3 * ep), vec3(1.0 / m1));
+}
+
+vec3 nits_to_pq(vec3 nits) {
+    vec3 y = pow(clamp(nits / 10000.0, 0.0, 1.0), vec3(m1));
+    return pow((c1 + c2 * y) / (1.0 + c3 * y), vec3(m2));
+}
+
+vec3 bt709_to_bt2020(vec3 v) {
+    return vec3(dot(vec3(0.627404, 0.329283, 0.043313), v), dot(vec3(0.069097, 0.919540, 0.011362), v),
+                dot(vec3(0.016391, 0.088013, 0.895595), v));
+}
+
+vec3 bt2020_to_bt709(vec3 v) {
+    return vec3(dot(vec3(1.660491, -0.587641, -0.072850), v), dot(vec3(-0.124550, 1.132900, -0.008349), v),
+                dot(vec3(-0.018151, -0.100579, 1.118730), v));
+}
+
+// `c` in the encoding of the plane (hdr: PQ Rec.2020, else G2.2 Rec.709) to the output's.
+vec3 to_output(vec3 c, bool plane_hdr) {
+    bool out_hdr = pc.out_hdr != 0u;
+    if (plane_hdr == out_hdr) return c;
+    if (!plane_hdr) return nits_to_pq(bt709_to_bt2020(pow(clamp(c, 0.0, 1.0), vec3(2.2))) * pc.sdr_white);
+    return pow(clamp(bt2020_to_bt709(pq_to_nits(c)) / pc.sdr_white, 0.0, 1.0), vec3(1.0 / 2.2));
+}
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (pixel.x >= int(pc.width) || pixel.y >= int(pc.height)) return;
+    vec2 centre = vec2(pixel) + 0.5;
+
+    vec3 base = vec3(0.0);  // outside plane 0's rectangle: black
+    if (all(greaterThanEqual(centre, pc.dest0.xy)) && all(lessThan(centre, pc.dest0.zw))) {
+        vec4 c = fetch_plane(plane0, pc.dest0, pc.src0, pc.flags0 & ~flag_straight_alpha, pixel);
+        base = to_output(c.rgb, (pc.flags0 & flag_hdr10) != 0u);
+    }
+    if (pc.plane_count > 1u && all(greaterThanEqual(centre, pc.dest1.xy)) && all(lessThan(centre, pc.dest1.zw))) {
+        vec4 c = fetch_plane(plane1, pc.dest1, pc.src1, pc.flags1, pixel);
+        bool hdr = (pc.flags1 & flag_hdr10) != 0u;
+        float a = clamp(c.a, 0.0, 1.0);
+        bool straight = (pc.flags1 & flag_straight_alpha) != 0u;
+        vec3 over;
+        if (hdr == (pc.out_hdr != 0u)) {
+            over = c.rgb;  // already in the output's space: no conversion, so no un-premultiplying either
+        } else {
+            vec3 colour = straight || a <= 0.0 ? c.rgb : c.rgb / a;  // convert unassociated colour
+            over = to_output(colour, hdr);
+            if (!straight) over *= a;
+        }
+        base = straight ? mix(base, over, a) : over + (1.0 - a) * base;
+    }
+    imageStore(out_image, pixel, vec4(base, 1.0));
+}

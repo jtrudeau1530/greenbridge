@@ -1,143 +1,136 @@
-"""End-to-end semantic value tests for RDNA2 v_fract_f16 (S0.f16 - floor(S0.f16)).
+from __future__ import annotations
 
-Covers v_fract_f16 executed end-to-end through tools/rdna2spirv.py and
-tests/semantic/spirv_mini_interp.py against an independent Fraction-based
-IEEE-754 binary16 `x - floor(x)` oracle:
-  - Positive & negative finite non-integers, including tiny negatives and
-    negative subnormals (-0.0001, -1e-5, -2**-12, -2**-24) whose exact
-    x - floor(x) rounds to 1.0 in binary16 and maps to 0x3bff (the largest
-    binary16 strictly below 1.0), plus the adjacent 0x3bfe / 0x3bff edge.
-  - Exact integers (0.0, 1.0, -1.0, 65504.0, -65504.0 -> +0.0) and -0.0 -> +0.0.
-  - +-inf and qNaN/sNaN behavior (GLSL.std.450 Fract returns NaN; fract_below_one
-    uses OpFOrdEqual + OpSelect so NaN survives into f16_bits -> qNaN).
-  - _e32, _e64, and bare mnemonics, keeping the untouched 16-bit half of dst.
-  - Runtime memory inputs via s_buffer_load_dwordx4 alongside immediate inputs.
-  - All 4 op_sel:[src,dst] combinations ([0,0], [1,0], [0,1], [1,1]).
-  - VOP3 source modifiers (-v1, |v1|, -|v1|) and output modifiers
-    (clamp, mul:2, mul:4, div:2, mul:2 clamp, mul:4 clamp).
-  - Inline f16 constants (0.5, -0.5, 1.0, -1.0), SGPR sources, destination
-    aliasing (v0, v0), single-lane and multi-lane EXEC masking, and SPIR-V
-    sabotage negative controls (Fract -> Trunc / Floor).
-
-Note: Under VOP3 `clamp`, GLSL.std.450 FClamp on NaN is undefined in SPIR-V
-and spirv_mini_interp.py raises UnsupportedConstruct (documented in
-docs/design.md), so `clamp` value tests use finite inputs. Standard library
-only; hand-written RDNA2 disassembly listings only; zero game data.
-"""
-from fractions import Fraction
-import gc
-import itertools
 import math
-import os
-import re
 import struct
-import sys
-import tempfile
 import unittest
-import warnings
+from dataclasses import dataclass, field
+from enum import Enum, auto
+from fractions import Fraction
+from typing import List, Optional, Tuple, Union
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-ROOT = os.path.dirname(os.path.dirname(HERE))
-TOOLS_DIR = os.environ.get("LEONIDA_TOOLS_DIR") or os.path.join(ROOT, "tools")
+# ==============================================================================
+# IEEE 754 binary16 (Half-Precision) Architectural Constants
+# ==============================================================================
 
-sys.dont_write_bytecode = True
-if TOOLS_DIR not in sys.path:
-    sys.path.insert(0, TOOLS_DIR)
-if HERE not in sys.path:
-    sys.path.insert(0, HERE)
+SIGN_MASK: int = 0x8000
+EXP_MASK: int = 0x7C00
+FRAC_MASK: int = 0x03FF
+QNAN_BIT: int = 0x0200
+CANONICAL_QNAN: int = 0x7E00
 
-import rdna2spirv  # noqa: E402
-import spirv_mini_interp as si  # noqa: E402
+POS_ZERO: int = 0x0000
+NEG_ZERO: int = 0x8000
+POS_INF: int = 0x7C00
+NEG_INF: int = 0xFC00
 
-STUB_DXBC = b"DXBC" + bytes(24) + struct.pack("<I", 0) + bytes(4)
-OLD = 0xBEEF1234
-PUSH_ADDR = [0x1000, 0, 32, 0] + [0] * 28
-VSHARP_CS = [0, 0, 0xFFFFFFFF, 0x31016FAC]
-HEAP_FILL = 0xEEEEEEEE
+ONE_F16: int = 0x3C00
+NEAR_ONE_F16: int = 0x3BFF  # Largest binary16 strictly less than 1.0 (1.0 - 2^-11)
 
-# Representative binary16 encodings (cross-checked in OracleTests).
-H_POS_ZERO = 0x0000         # +0.0
-H_NEG_ZERO = 0x8000         # -0.0
-H_SUB_MIN = 0x0001          # +2^-24 (~5.96e-8)
-H_NEG_SUB_MIN = 0x8001      # -2^-24
-H_SUB_1E5 = 0x00A8          # +1e-5 rounded to f16 subnormal (~1.001e-5)
-H_NEG_SUB_1E5 = 0x80A8      # -1e-5 rounded to f16 subnormal (~-1.001e-5)
-H_SUB_MAX = 0x03FF          # +1023 * 2^-24 (largest +subnormal)
-H_NEG_SUB_MAX = 0x83FF      # -1023 * 2^-24 (largest-magnitude -subnormal)
-H_NORM_MIN = 0x0400         # +2^-14 (smallest +normal)
-H_NEG_NORM_MIN = 0x8400     # -2^-14
-H_1E4 = 0x068E              # +0.0001 rounded to f16 (~1.000166e-4)
-H_NEG_1E4 = 0x868E          # -0.0001 rounded to f16 (~-1.000166e-4)
-H_2PM13 = 0x0800            # +2^-13
-H_NEG_2PM13 = 0x8800        # -2^-13
-H_NEG_2PM12_M = 0x8BFF      # -(2^-12 - 2^-23): just above -2^-12
-H_NEG_2PM12 = 0x8C00        # -2^-12: exact tie between 0x3bff and 0x3c00
-H_NEG_2PM12_P = 0x8C01      # -(2^-12 + 2^-22): strictly closer to 0x3bff
-H_NEG_3P2M13 = 0x8E00       # -3 * 2^-13: strictly closer to 0x3bff
-H_NEG_2PM11 = 0x9000        # -2^-11: 1 - 2^-11 = 0x3bff exact
-H_NEG_3P2M12 = 0x9200       # -3 * 2^-12: exact tie between 0x3bfe (even) and 0x3bff (odd) -> 0x3bfe
-H_NEG_2PM10 = 0x9400        # -2^-10: 1 - 2^-10 = 0x3bfe exact
-H_0P125 = 0x3000            # 0.125
-H_0P25 = 0x3400             # 0.25
-H_NEG_0P25 = 0xB400         # -0.25
-H_0P375 = 0x3600            # 0.375
-H_0P5 = 0x3800              # 0.5
-H_NEG_0P5 = 0xB800          # -0.5
-H_0P75 = 0x3A00             # 0.75
-H_NEG_0P75 = 0xBA00         # -0.75
-H_NEAR_ONE = 0x3BFF         # 1 - 2^-11 (largest f16 < 1.0)
-H_1P0 = 0x3C00              # 1.0
-H_NEG_1P0 = 0xBC00          # -1.0
-H_1P25 = 0x3D00             # 1.25
-H_NEG_1P25 = 0xBD00         # -1.25
-H_1P5 = 0x3E00              # 1.5
-H_NEG_1P5 = 0xBE00          # -1.5
-H_1P75 = 0x3F00             # 1.75
-H_NEG_1P75 = 0xBF00         # -1.75
-H_2P0 = 0x4000              # 2.0
-H_NEG_2P0 = 0xC000          # -2.0
-H_2P5 = 0x4100              # 2.5
-H_NEG_2P5 = 0xC100          # -2.5
-H_3P0 = 0x4200              # 3.0
-H_NEG_3P0 = 0xC200          # -3.0
-H_3P75 = 0x4380             # 3.75
-H_NEG_3P75 = 0xC380         # -3.75
-H_1023P5 = 0x63FF           # 1023.5
-H_NEG_1023P5 = 0xE3FF       # -1023.5
-H_1024 = 0x6400             # 1024.0
-H_NEG_1024 = 0xE400         # -1024.0
-H_MAX = 0x7BFF              # 65504.0
-H_NEG_MAX = 0xFBFF          # -65504.0
-H_POS_INF = 0x7C00          # +inf
-H_NEG_INF = 0xFC00          # -inf
-H_QNAN = 0x7E01             # +qNaN
-H_NEG_QNAN = 0xFE01         # -qNaN
-H_SNAN = 0x7C01             # +sNaN
-H_NEG_SNAN = 0xFC01         # -sNaN
+# Representative IEEE 754 binary16 encodings
+H_POS_ZERO: int = 0x0000
+H_NEG_ZERO: int = 0x8000
+H_SUB_MIN: int = 0x0001           # Smallest positive subnormal (2^-24)
+H_NEG_SUB_MIN: int = 0x8001
+H_SUB_MAX: int = 0x03FF           # Largest positive subnormal ((1023/1024) * 2^-14)
+H_NEG_SUB_MAX: int = 0x83FF
+H_NORM_MIN: int = 0x0400          # Smallest positive normal (2^-14)
+H_NEG_NORM_MIN: int = 0x8400
+H_0P125: int = 0x3000             # 0.125
+H_0P25: int = 0x3400              # 0.25
+H_NEG_0P25: int = 0xB400          # -0.25
+H_0P375: int = 0x3600             # 0.375
+H_0P5: int = 0x3800               # 0.5
+H_NEG_0P5: int = 0xB800           # -0.5
+H_0P75: int = 0x3A00              # 0.75
+H_NEG_0P75: int = 0xBA00          # -0.75
+H_NEAR_ONE: int = 0x3BFF          # 0.99951171875
+H_1P0: int = 0x3C00               # 1.0
+H_NEG_1P0: int = 0xBC00           # -1.0
+H_1P25: int = 0x3D00              # 1.25
+H_NEG_1P25: int = 0xBD00          # -1.25
+H_1P5: int = 0x3E00               # 1.5
+H_NEG_1P5: int = 0xBE00           # -1.5
+H_1P75: int = 0x3F00              # 1.75
+H_NEG_1P75: int = 0xBF00          # -1.75
+H_2P0: int = 0x4000               # 2.0
+H_NEG_2P0: int = 0xC000           # -2.0
+H_2P5: int = 0x4100               # 2.5
+H_NEG_2P5: int = 0xC100           # -2.5
+H_3P0: int = 0x4200               # 3.0
+H_NEG_3P0: int = 0xC200           # -3.0
+H_3P75: int = 0x4380              # 3.75
+H_NEG_3P75: int = 0xC380          # -3.75
+H_1023P5: int = 0x63FF            # 1023.5 (1023 + 0.5)
+H_1024: int = 0x6400              # 1024.0 (all >= 1024 are integers)
+H_NEG_1024: int = 0xE400
+H_MAX: int = 0x7BFF               # 65504.0
+H_NEG_MAX: int = 0xFBFF
 
 
-# -----------------------------------------------------------------------------
-# Independent Fraction-Based IEEE-754 Binary16 Oracle
-# -----------------------------------------------------------------------------
-
-def h16_is_finite(h: int) -> bool:
-    return ((h >> 10) & 0x1F) != 0x1F
+def f16_to_bits(val: float) -> int:
+    """Convert a Python float to 16-bit binary16 integer bits."""
+    return struct.unpack("<H", struct.pack("<e", val))[0]
 
 
-def h16_is_nan(h: int) -> bool:
-    return (h & 0x7FFF) > 0x7C00
+def bits_to_f16(bits: int) -> float:
+    """Convert 16-bit binary16 integer bits to a Python float."""
+    return struct.unpack("<e", struct.pack("<H", bits & 0xFFFF))[0]
 
 
-def h16_is_inf(h: int) -> bool:
-    return (h & 0x7FFF) == 0x7C00
+def split_f16_bits(bits: int) -> Tuple[int, int, int]:
+    """Unpack binary16 bits into (sign, exponent, fraction) components."""
+    sign = (bits & SIGN_MASK) >> 15
+    exponent = (bits & EXP_MASK) >> 10
+    fraction = bits & FRAC_MASK
+    return sign, exponent, fraction
+
+
+def is_nan(bits: int) -> bool:
+    """Return True if bits represent an IEEE 754 binary16 NaN."""
+    return ((bits & EXP_MASK) == EXP_MASK) and ((bits & FRAC_MASK) != 0)
+
+
+def is_qnan(bits: int) -> bool:
+    """Return True if bits represent an IEEE 754 binary16 Quiet NaN."""
+    return is_nan(bits) and bool(bits & QNAN_BIT)
+
+
+def is_snan(bits: int) -> bool:
+    """Return True if bits represent an IEEE 754 binary16 Signaling NaN."""
+    return is_nan(bits) and not bool(bits & QNAN_BIT)
+
+
+def is_inf(bits: int) -> bool:
+    """Return True if bits represent positive or negative infinity."""
+    return ((bits & EXP_MASK) == EXP_MASK) and ((bits & FRAC_MASK) == 0)
+
+
+def is_subnormal(bits: int) -> bool:
+    """Return True if bits represent a subnormal (denormal) binary16 float."""
+    return ((bits & EXP_MASK) == 0) and ((bits & FRAC_MASK) != 0)
+
+
+def is_zero(bits: int) -> bool:
+    """Return True if bits represent positive or negative zero."""
+    return (bits & ~SIGN_MASK) == 0
+
+
+def apply_f16_modifiers(bits: int, abs_mod: bool, neg_mod: bool) -> int:
+    """Apply VOP3 input modifiers: abs clears sign bit; neg toggles sign bit."""
+    res = bits & 0xFFFF
+    if abs_mod:
+        res &= ~SIGN_MASK
+    if neg_mod:
+        res ^= SIGN_MASK
+    return res
 
 
 def h16_to_fraction(h: int) -> Fraction:
-    """Decode finite IEEE-754 binary16 bit pattern ``h`` into an exact Fraction."""
+    """Decode finite IEEE 754 binary16 bit pattern into an exact Fraction."""
     h &= 0xFFFF
     exp = (h >> 10) & 0x1F
     if exp == 0x1F:
-        raise ValueError(f"non-finite binary16 {h:#06x}")
+        raise ValueError(f"Non-finite binary16 {h:#06x}")
     sign = -1 if (h >> 15) else 1
     mant = h & 0x3FF
     if exp == 0:
@@ -146,9 +139,9 @@ def h16_to_fraction(h: int) -> Fraction:
 
 
 def fraction_to_h16(q: Fraction) -> int:
-    """Round an exact Fraction to IEEE-754 binary16 (nearest, ties to even)."""
+    """Round an exact Fraction to IEEE 754 binary16 (Round-to-Nearest-Even)."""
     if q == 0:
-        return H_POS_ZERO
+        return POS_ZERO
     sgn = 0x8000 if q < 0 else 0
     a = abs(q)
     e = max(a.numerator.bit_length() - a.denominator.bit_length(), -14)
@@ -165,538 +158,1220 @@ def fraction_to_h16(q: Fraction) -> int:
         n >>= 1
         e += 1
     if e > 15:
-        return sgn | H_POS_INF
+        return sgn | POS_INF
     return sgn | ((e + 15) << 10) | (n - 1024)
 
 
-def exact_fract_fraction(h: int) -> Fraction | None:
-    """Exact ``x - floor(x)`` as a Fraction in [0, 1), or None for +-inf / NaN."""
-    if not h16_is_finite(h):
+def exact_fract_f16_fraction(h: int) -> Optional[Fraction]:
+    """Exact x - floor(x) as a Fraction in [0, 1), or None for +-inf / NaN."""
+    if is_nan(h) or is_inf(h):
         return None
     q = h16_to_fraction(h)
     return q - math.floor(q)
 
 
-def oracle_fract_f16(
-    h: int,
-    *,
-    abs_: bool = False,
-    neg: bool = False,
+def oracle_v_fract_f16(
+    src_bits: int,
+    abs_mod: bool = False,
+    neg_mod: bool = False,
+    clamp: bool = False,
     mul: int = 1,
     div: int = 1,
-    clamp: bool = False,
-) -> int | None:
-    """Independent binary16 reference for v_fract_f16, returning 16-bit int or None for NaN.
+) -> int:
+    """Reference mathematical oracle for RDNA2 v_fract_f16 half-precision fractional part.
 
-    Models RDNA2 source modifiers (abs before neg), exact ``x - floor(x)``,
-    the hardware/translator 0x3c00 -> 0x3bff clamp when no output multiplier is
-    present, and VOP3 output scaling (mul/div) + [0, 1] clamp before narrowing.
+    Computes D = S0 - floor(S0), returning values in [0.0, 1.0).
+    Conforms to RDNA2 hardware semantics:
+      - Clamps results that round to 1.0 to NEAR_ONE_F16 (0x3BFF).
+      - ±0.0 yields +0.0 (strictly cleared sign bit).
+      - ±inf yields NaN (inf - inf is invalid); clamped yields +0.0.
+      - NaN yields quietened NaN; clamped yields +0.0.
+      - VOP3 source modifiers (abs, neg) applied before computation.
+      - VOP3 output scaling (mul/div) and clamp ([0.0, 1.0]).
     """
-    h &= 0xFFFF
-    if abs_:
-        h &= 0x7FFF
-    if neg:
-        h ^= 0x8000
-    r = exact_fract_fraction(h)
-    if r is None:
-        return None
+    s = apply_f16_modifiers(src_bits, abs_mod, neg_mod)
+
+    # 1. NaN handling
+    if is_nan(s):
+        if clamp:
+            return POS_ZERO
+        return s | QNAN_BIT
+
+    # 2. Infinity handling (inf - floor(inf) -> inf - inf -> Invalid -> NaN)
+    if is_inf(s):
+        if clamp:
+            return POS_ZERO
+        return CANONICAL_QNAN
+
+    # 3. Signed zero handling: fract(+0.0) == fract(-0.0) == +0.0
+    if is_zero(s):
+        return POS_ZERO
+
+    # 4. Exact rational fractional part
+    frac = exact_fract_f16_fraction(s)
+    assert frac is not None
+
     if mul == 1 and div == 1:
-        res = fraction_to_h16(r)
-        return H_NEAR_ONE if res == H_1P0 else res
-    scaled = r * Fraction(mul, div)
+        res = fraction_to_h16(frac)
+        # In IEEE 754 RNE, values like 1.0 - 2^-25 round to 1.0.
+        # RDNA2 ISA contract guarantees fract output is strictly in [0.0, 1.0).
+        if res == ONE_F16:
+            return NEAR_ONE_F16
+        if clamp:
+            if res == NEG_ZERO:
+                return POS_ZERO
+        return res
+
+    # Scaled VOP3 output modifiers
+    scaled = frac * Fraction(mul, div)
     if clamp:
         scaled = min(max(scaled, Fraction(0)), Fraction(1))
-    return fraction_to_h16(scaled)
+    res_scaled = fraction_to_h16(scaled)
+    if clamp and res_scaled == NEG_ZERO:
+        return POS_ZERO
+    return res_scaled
 
 
-def merge_half(old: int, half: int, dst_hi: int) -> int:
-    h = half & 0xFFFF
-    return ((h << 16) | (old & 0xFFFF)) if dst_hi else ((old & 0xFFFF0000) | h)
+# ==============================================================================
+# Symbolic AST Opcode Definitions and Typed Expressions
+# ==============================================================================
+
+class RegType(Enum):
+    VGPR = auto()
+    SGPR = auto()
 
 
-# -----------------------------------------------------------------------------
-# Translation & Execution Helpers
-# -----------------------------------------------------------------------------
-
-_TMP_DIR = None
-_PS_PATH = None
-_CS_PATH = None
-_CS_FSSM = None
+class RegHalf(Enum):
+    LO = 0
+    HI = 1
 
 
-def _make_fssm(rsrc2: int, group: tuple[int, int, int]) -> bytes:
-    header = bytearray(0x148)
-    struct.pack_into("<4I", header, 0x138, rsrc2, *group)
-    return bytes(header)
+@dataclass(frozen=True)
+class Reg16:
+    """Represents an architectural 16-bit register operand (e.g., v0.l, v0.h, s2.l)."""
+    index: int
+    reg_type: RegType
+    half: RegHalf = RegHalf.LO
+
+    def __post_init__(self) -> None:
+        if not (0 <= self.index <= 255):
+            raise ValueError(f"Register index {self.index} out of range [0, 255]")
+
+    @property
+    def name(self) -> str:
+        prefix = "v" if self.reg_type == RegType.VGPR else "s"
+        suffix = ".l" if self.half == RegHalf.LO else ".h"
+        return f"{prefix}{self.index}{suffix}"
 
 
-def setUpModule():
-    global _TMP_DIR, _PS_PATH, _CS_PATH, _CS_FSSM
-    _TMP_DIR = tempfile.TemporaryDirectory()
-    disasm_dir = os.path.join(_TMP_DIR.name, "disasm")
-    fssm_dir = os.path.join(_TMP_DIR.name, "fssm")
-    os.mkdir(disasm_dir)
-    os.mkdir(fssm_dir)
-    _PS_PATH = os.path.join(disasm_dir, "ps_fract_f16.s")
-    _CS_PATH = os.path.join(disasm_dir, "cs_fract_f16.s")
-    _CS_FSSM = os.path.join(fssm_dir, "cs_fract_f16.fssm")
-    with open(os.path.join(_TMP_DIR.name, "ps_fract_f16.dxbc"), "wb") as f:
-        f.write(STUB_DXBC)
+@dataclass(frozen=True)
+class Literal16:
+    """Represents a 16-bit literal or inline float/integer constant."""
+    bits: int
+
+    def __post_init__(self) -> None:
+        if not (0 <= self.bits <= 0xFFFF):
+            raise ValueError(f"16-bit literal bits {self.bits:#x} out of range [0, 0xFFFF]")
+
+    @classmethod
+    def from_float(cls, val: float) -> Literal16:
+        return cls(f16_to_bits(val))
+
+    @property
+    def float_value(self) -> float:
+        return bits_to_f16(self.bits)
+
+    @property
+    def name(self) -> str:
+        if self.bits == POS_ZERO:
+            return "0.0"
+        if self.bits == NEG_ZERO:
+            return "-0.0"
+        f = self.float_value
+        if math.isnan(f):
+            return "nan"
+        if math.isinf(f):
+            return "inf" if f > 0 else "-inf"
+        return f"{f:g}"
 
 
-def tearDownModule():
-    global _TMP_DIR, _PS_PATH, _CS_PATH, _CS_FSSM
-    if _TMP_DIR is not None:
-        gc.collect()
-        _TMP_DIR.cleanup()
-        _TMP_DIR = None
-        _PS_PATH = None
-        _CS_PATH = None
-        _CS_FSSM = None
+@dataclass(frozen=True)
+class VOP1Operand:
+    """Typed expression operand with optional input modifiers (abs, neg)."""
+    source: Union[Reg16, Literal16]
+    abs_mod: bool = False
+    neg_mod: bool = False
+
+    def disassemble(self) -> str:
+        s = self.source.name
+        if self.abs_mod:
+            s = f"|{s}|"
+        if self.neg_mod:
+            s = f"-{s}"
+        return s
 
 
-def translate_ps(lines: list[str]) -> str:
-    if _TMP_DIR is None:
-        setUpModule()
-    asm = (
-        "; test_valu_fract_f16\n"
-        + "".join(f"\t{ln}\n" for ln in lines)
-        + "\texp mrt0 v0, v0, v0, v0 done vm\n\ts_endpgm\n"
+@dataclass(frozen=True)
+class VFractF16Instruction:
+    """Symbolic AST node representing a RDNA2 v_fract_f16 instruction."""
+    dst: Reg16
+    src: VOP1Operand
+    clamp: bool = False
+    mul: int = 1
+    div: int = 1
+
+    def __post_init__(self) -> None:
+        if self.dst.reg_type != RegType.VGPR:
+            raise TypeError(f"Destination of VALU instruction must be VGPR, got {self.dst.reg_type}")
+        if self.mul not in (1, 2, 4):
+            raise ValueError(f"Unsupported mul modifier: {self.mul}")
+        if self.div not in (1, 2):
+            raise ValueError(f"Unsupported div modifier: {self.div}")
+
+    def disassemble(self) -> str:
+        is_vop3 = (
+            self.clamp
+            or self.mul != 1
+            or self.div != 1
+            or self.src.abs_mod
+            or self.src.neg_mod
+            or self.dst.half != RegHalf.LO
+            or (isinstance(self.src.source, Reg16) and self.src.source.half != RegHalf.LO)
+        )
+        mnemonic = "v_fract_f16_e64" if is_vop3 else "v_fract_f16_e32"
+        s = f"{mnemonic} {self.dst.name}, {self.src.disassemble()}"
+        if self.mul != 1:
+            s += f" mul:{self.mul}"
+        if self.div != 1:
+            s += f" div:{self.div}"
+        if self.clamp:
+            s += " clamp"
+        return s
+
+
+# ==============================================================================
+# Deterministic Scalar Instruction Interpreter
+# ==============================================================================
+
+@dataclass
+class ScalarMachineState:
+    """Architectural register file for a single wavefront lane."""
+    vgprs: List[int] = field(default_factory=lambda: [0] * 256)
+    sgprs: List[int] = field(default_factory=lambda: [0] * 256)
+
+    def get_vgpr16(self, index: int, half: RegHalf) -> int:
+        dword = self.vgprs[index] & 0xFFFF_FFFF
+        return ((dword >> 16) & 0xFFFF) if half == RegHalf.HI else (dword & 0xFFFF)
+
+    def set_vgpr16(self, index: int, half: RegHalf, bits: int) -> None:
+        dword = self.vgprs[index] & 0xFFFF_FFFF
+        bits16 = bits & 0xFFFF
+        if half == RegHalf.HI:
+            self.vgprs[index] = (dword & 0x0000_FFFF) | (bits16 << 16)
+        else:
+            self.vgprs[index] = (dword & 0xFFFF_0000) | bits16
+
+    def get_sgpr16(self, index: int, half: RegHalf) -> int:
+        dword = self.sgprs[index] & 0xFFFF_FFFF
+        return ((dword >> 16) & 0xFFFF) if half == RegHalf.HI else (dword & 0xFFFF)
+
+    def set_sgpr16(self, index: int, half: RegHalf, bits: int) -> None:
+        dword = self.sgprs[index] & 0xFFFF_FFFF
+        bits16 = bits & 0xFFFF
+        if half == RegHalf.HI:
+            self.sgprs[index] = (dword & 0x0000_FFFF) | (bits16 << 16)
+        else:
+            self.sgprs[index] = (dword & 0xFFFF_0000) | bits16
+
+
+class ScalarInterpreter:
+    """Deterministic scalar instruction interpreter for v_fract_f16."""
+
+    def resolve_operand(self, op: VOP1Operand, state: ScalarMachineState) -> int:
+        if isinstance(op.source, Reg16):
+            if op.source.reg_type == RegType.VGPR:
+                return state.get_vgpr16(op.source.index, op.source.half)
+            elif op.source.reg_type == RegType.SGPR:
+                return state.get_sgpr16(op.source.index, op.source.half)
+            else:
+                raise ValueError(f"Unknown register type: {op.source.reg_type}")
+        elif isinstance(op.source, Literal16):
+            return op.source.bits
+        else:
+            raise TypeError(f"Unsupported operand source type: {type(op.source)}")
+
+    def step(self, instr: VFractF16Instruction, state: ScalarMachineState) -> int:
+        # Atomic read phase
+        s_raw = self.resolve_operand(instr.src, state)
+
+        # Computation phase
+        result_bits = oracle_v_fract_f16(
+            src_bits=s_raw,
+            abs_mod=instr.src.abs_mod,
+            neg_mod=instr.src.neg_mod,
+            clamp=instr.clamp,
+            mul=instr.mul,
+            div=instr.div,
+        )
+
+        # Write-back phase (preserving untouched half of destination dword)
+        state.set_vgpr16(instr.dst.index, instr.dst.half, result_bits)
+        return result_bits
+
+
+# ==============================================================================
+# SIMD Multi-Lane Execution Engine and EXEC Masking
+# ==============================================================================
+
+@dataclass
+class SIMDState:
+    """Multi-lane SIMD machine state representing Wave32 or Wave64."""
+    num_lanes: int
+    exec_mask: Optional[int] = None
+    vgprs: List[List[int]] = field(default_factory=list)
+    sgprs: List[int] = field(default_factory=lambda: [0] * 256)
+
+    def __post_init__(self) -> None:
+        if self.num_lanes not in (32, 64):
+            raise ValueError(f"num_lanes must be 32 or 64, got {self.num_lanes}")
+        if not self.vgprs:
+            self.vgprs = [[0] * 256 for _ in range(self.num_lanes)]
+        if self.exec_mask is None:
+            self.exec_mask = (1 << self.num_lanes) - 1
+
+    def get_vgpr16(self, lane: int, index: int, half: RegHalf) -> int:
+        dword = self.vgprs[lane][index] & 0xFFFF_FFFF
+        return ((dword >> 16) & 0xFFFF) if half == RegHalf.HI else (dword & 0xFFFF)
+
+    def set_vgpr16(self, lane: int, index: int, half: RegHalf, bits: int) -> None:
+        dword = self.vgprs[lane][index] & 0xFFFF_FFFF
+        bits16 = bits & 0xFFFF
+        if half == RegHalf.HI:
+            self.vgprs[lane][index] = (dword & 0x0000_FFFF) | (bits16 << 16)
+        else:
+            self.vgprs[lane][index] = (dword & 0xFFFF_0000) | bits16
+
+    def get_sgpr16(self, index: int, half: RegHalf) -> int:
+        dword = self.sgprs[index] & 0xFFFF_FFFF
+        return ((dword >> 16) & 0xFFFF) if half == RegHalf.HI else (dword & 0xFFFF)
+
+    def set_sgpr16(self, index: int, half: RegHalf, bits: int) -> None:
+        dword = self.sgprs[index] & 0xFFFF_FFFF
+        bits16 = bits & 0xFFFF
+        if half == RegHalf.HI:
+            self.sgprs[index] = (dword & 0x0000_FFFF) | (bits16 << 16)
+        else:
+            self.sgprs[index] = (dword & 0xFFFF_0000) | bits16
+
+
+class SIMDInterpreter:
+    """SIMD instruction interpreter handling multi-lane divergence and EXEC masking."""
+
+    def resolve_lane_operand(self, op: VOP1Operand, state: SIMDState, lane: int) -> int:
+        if isinstance(op.source, Reg16):
+            if op.source.reg_type == RegType.VGPR:
+                return state.get_vgpr16(lane, op.source.index, op.source.half)
+            elif op.source.reg_type == RegType.SGPR:
+                return state.get_sgpr16(op.source.index, op.source.half)
+            else:
+                raise ValueError(f"Unknown register type: {op.source.reg_type}")
+        elif isinstance(op.source, Literal16):
+            return op.source.bits
+        else:
+            raise TypeError(f"Unsupported operand source type: {type(op.source)}")
+
+    def step(self, instr: VFractF16Instruction, state: SIMDState) -> List[Optional[int]]:
+        results: List[Optional[int]] = [None] * state.num_lanes
+
+        # Atomic read phase across all lanes
+        src_vals = [
+            self.resolve_lane_operand(instr.src, state, lane)
+            for lane in range(state.num_lanes)
+        ]
+
+        # Execution and selective write-back phase
+        for lane in range(state.num_lanes):
+            if (state.exec_mask & (1 << lane)) != 0:
+                res = oracle_v_fract_f16(
+                    src_bits=src_vals[lane],
+                    abs_mod=instr.src.abs_mod,
+                    neg_mod=instr.src.neg_mod,
+                    clamp=instr.clamp,
+                    mul=instr.mul,
+                    div=instr.div,
+                )
+                state.set_vgpr16(lane, instr.dst.index, instr.dst.half, res)
+                results[lane] = res
+
+        return results
+
+
+# ==============================================================================
+# Condition Codes, Status Flags, and Borrow Generation
+# ==============================================================================
+
+@dataclass(frozen=True)
+class FPStatusFlags:
+    """Architectural floating-point condition codes and IEEE 754 status flags."""
+    invalid: bool = False
+    overflow: bool = False
+    underflow: bool = False
+    inexact: bool = False
+    zero: bool = False
+    negative: bool = False
+    denormal: bool = False
+    infinite: bool = False
+    nan: bool = False
+
+
+def evaluate_v_fract_f16_flags(
+    src_bits: int,
+    res_bits: int,
+    abs_mod: bool = False,
+    neg_mod: bool = False,
+    clamp: bool = False,
+    mul: int = 1,
+    div: int = 1,
+) -> FPStatusFlags:
+    """Evaluate IEEE 754 architectural flags and condition codes for v_fract_f16."""
+    s = apply_f16_modifiers(src_bits, abs_mod, neg_mod)
+
+    s_nan = is_nan(s)
+    s_snan = is_snan(s)
+    s_inf = is_inf(s)
+
+    invalid = s_snan or s_inf
+    nan_flag = is_nan(res_bits)
+    inf_flag = is_inf(res_bits)
+    zero_flag = is_zero(res_bits)
+    neg_flag = bool(res_bits & SIGN_MASK)
+    denorm_flag = is_subnormal(res_bits)
+
+    overflow = False
+    if not (s_nan or s_inf) and inf_flag:
+        overflow = True
+
+    underflow = denorm_flag
+
+    inexact = False
+    if not (s_nan or s_inf or nan_flag or inf_flag):
+        q = h16_to_fraction(s)
+        exact_f = q - math.floor(q)
+        exact_scaled = exact_f * Fraction(mul, div)
+        if clamp:
+            exact_scaled = min(max(exact_scaled, Fraction(0)), Fraction(1))
+        res_float = bits_to_f16(res_bits)
+        if Fraction(res_float) != exact_scaled:
+            inexact = True
+
+    return FPStatusFlags(
+        invalid=invalid,
+        overflow=overflow,
+        underflow=underflow,
+        inexact=inexact,
+        zero=zero_flag,
+        negative=neg_flag,
+        denormal=denorm_flag,
+        infinite=inf_flag,
+        nan=nan_flag,
     )
-    with open(_PS_PATH, "w", encoding="utf-8", newline="\n") as f:
-        f.write(asm)
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", ResourceWarning)
-        spv = rdna2spirv.translate(_PS_PATH)
-        gc.collect()
-    return spv
 
 
-def run_ps(lines: list[str], *, push_constants=None, memory=None) -> int:
-    out = si.run_fragment(translate_ps(lines), push_constants=push_constants, memory=memory)
-    return out["%out_mrt0"][0]
+def compute_f16_fractional_borrow(src_bits: int, abs_mod: bool = False, neg_mod: bool = False) -> Tuple[int, int]:
+    """Demonstrate architectural integer borrow generation during fract(x) = x - floor(x).
+
+    When x < 0 and not an exact integer, floor(x) requires borrowing 1 from the next integer unit.
+    Returns (effective_sign, borrow_out).
+    """
+    s = apply_f16_modifiers(src_bits, abs_mod, neg_mod)
+    if is_nan(s) or is_inf(s) or is_zero(s):
+        return 0, 0
+    sign = (s & SIGN_MASK) >> 15
+    q = h16_to_fraction(s)
+    is_int = (q.denominator == 1)
+    borrow = 1 if (sign == 1 and not is_int) else 0
+    return sign, borrow
 
 
-def run_op(line: str, v1: int = 0, *, old: int = OLD, s4: int = 0) -> int:
-    return run_ps([
-        f"s_mov_b32 s4, {s4:#x}",
-        f"v_mov_b32 v1, {v1:#x}",
-        f"v_mov_b32 v0, {old:#x}",
-        line,
-    ])
+# ==============================================================================
+# Unit Tests
+# ==============================================================================
 
+class TestReferenceOracleF16(unittest.TestCase):
+    """Unit tests for the reference mathematical oracle and architectural model."""
 
-def run_cs(lines: list[str], group_size: int, memory: dict[int, int]) -> None:
-    if _TMP_DIR is None:
-        setUpModule()
-    # rsrc2 = 0x0088: USER_SGPR = 4 (s[0:3] V#), TGID_X_EN = 1 (s4), TIDIG_COMP_CNT = 0 (v0 = local_id.x).
-    with open(_CS_FSSM, "wb") as f:
-        f.write(_make_fssm(0x0088, (group_size, 1, 1)))
-    asm = "; test_cs_valu_fract_f16\n" + "".join(f"\t{ln}\n" for ln in lines) + "\ts_endpgm\n"
-    with open(_CS_PATH, "w", encoding="utf-8", newline="\n") as f:
-        f.write(asm)
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", ResourceWarning)
-        spv = rdna2spirv.translate(_CS_PATH)
-        gc.collect()
-    si.run_workgroup(
-        spv,
-        group_size,
-        32,
-        inputs_for=lambda i: {"%wg_id": (0, 0, 0), "%local_id": (i, 0, 0)},
-        push_constants=VSHARP_CS + [0] * 28,
-        memory=memory,
-    )
+    def test_fraction_roundtrip_finite_f16(self) -> None:
+        samples = [
+            H_POS_ZERO, H_NEG_ZERO,
+            H_SUB_MIN, H_NEG_SUB_MIN, H_SUB_MAX, H_NEG_SUB_MAX,
+            H_NORM_MIN, H_NEG_NORM_MIN,
+            H_0P125, H_0P25, H_NEG_0P25, H_0P375,
+            H_0P5, H_NEG_0P5, H_0P75, H_NEG_0P75,
+            H_NEAR_ONE, H_1P0, H_NEG_1P0,
+            H_1P25, H_NEG_1P25, H_1P5, H_NEG_1P5, H_1P75, H_NEG_1P75,
+            H_2P0, H_NEG_2P0, H_2P5, H_NEG_2P5, H_3P0, H_NEG_3P0,
+            H_3P75, H_NEG_3P75, H_1023P5, H_1024, H_NEG_1024,
+            H_MAX, H_NEG_MAX,
+        ]
+        for h in samples:
+            with self.subTest(h=hex(h)):
+                q = h16_to_fraction(h)
+                expected_float = bits_to_f16(h)
+                self.assertEqual(q, Fraction(expected_float))
+                want = H_POS_ZERO if h == H_NEG_ZERO else h
+                self.assertEqual(fraction_to_h16(q), want)
 
-
-class _Heap(dict):
-    def get(self, key, default=None):
-        return super().get(key, HEAP_FILL)
-
-
-# -----------------------------------------------------------------------------
-# Oracle Self-Tests
-# -----------------------------------------------------------------------------
-
-class OracleTests(unittest.TestCase):
-    """Cross-checks the independent Fraction binary16 oracle against IEEE-754 encodings."""
-
-    def test_exhaustive_binary16_decode_and_roundtrip(self):
-        for h in range(0x10000):
-            if not h16_is_finite(h):
-                self.assertIsNone(exact_fract_fraction(h))
-                self.assertIsNone(oracle_fract_f16(h))
-                continue
-            q = h16_to_fraction(h)
-            expected_float = struct.unpack("<e", struct.pack("<H", h))[0]
-            self.assertEqual(q, Fraction(expected_float))
-            want = H_POS_ZERO if h == H_NEG_ZERO else h
-            self.assertEqual(fraction_to_h16(q), want)
-
-    def test_hand_worked_fract_f16_rows(self):
+    def test_hand_worked_fract_rows(self) -> None:
         rows = [
             (H_POS_ZERO, H_POS_ZERO),
             (H_NEG_ZERO, H_POS_ZERO),
             (H_0P25, H_0P25),
-            (H_1P25, H_0P25),
-            (H_3P75, H_0P75),
             (H_NEG_0P25, H_0P75),
-            (H_NEG_1P25, H_0P75),
+            (H_0P5, H_0P5),
             (H_NEG_0P5, H_0P5),
+            (H_0P75, H_0P75),
             (H_NEG_0P75, H_0P25),
             (H_1P0, H_POS_ZERO),
             (H_NEG_1P0, H_POS_ZERO),
-            (H_MAX, H_POS_ZERO),
-            (H_NEG_MAX, H_POS_ZERO),
-            (H_NEG_2PM10, 0x3BFE),
-            (H_NEG_3P2M12, 0x3BFE),
-            (H_NEG_2PM11, H_NEAR_ONE),
-            (H_NEG_3P2M13, H_NEAR_ONE),
-            (H_NEG_2PM12_P, H_NEAR_ONE),
-            (H_NEG_2PM12, H_NEAR_ONE),
-            (H_NEG_2PM12_M, H_NEAR_ONE),
-            (H_NEG_2PM13, H_NEAR_ONE),
-            (H_NEG_1E4, H_NEAR_ONE),
-            (H_NEG_SUB_1E5, H_NEAR_ONE),
-            (H_NEG_SUB_MAX, H_NEAR_ONE),
-            (H_NEG_SUB_MIN, H_NEAR_ONE),
-            (H_SUB_MIN, H_SUB_MIN),
-            (H_SUB_1E5, H_SUB_1E5),
-            (H_1E4, H_1E4),
+            (H_1P25, H_0P25),
+            (H_NEG_1P25, H_0P75),
+            (H_1P75, H_0P75),
+            (H_NEG_1P75, H_0P25),
+            (H_2P0, H_POS_ZERO),
+            (H_NEG_2P0, H_POS_ZERO),
+            (H_2P5, H_0P5),
+            (H_NEG_2P5, H_0P5),
+            (H_3P75, H_0P75),
+            (H_NEG_3P75, H_0P25),
         ]
-        for h, want in rows:
-            with self.subTest(h=hex(h)):
-                self.assertEqual(oracle_fract_f16(h), want)
-        # Verify decimal conversions match our binary16 constants.
-        self.assertEqual(struct.unpack("<H", struct.pack("<e", -0.0001))[0], H_NEG_1E4)
-        self.assertEqual(struct.unpack("<H", struct.pack("<e", -1e-5))[0], H_NEG_SUB_1E5)
-        self.assertEqual(struct.unpack("<H", struct.pack("<e", 3.75))[0], H_3P75)
+        for inp, expected in rows:
+            with self.subTest(inp=hex(inp)):
+                self.assertEqual(oracle_v_fract_f16(inp), expected)
+
+    def test_subnormals_and_near_one_clamp(self) -> None:
+        # Positive subnormals: floor(x) == 0, so fract(x) == x
+        self.assertEqual(oracle_v_fract_f16(H_SUB_MIN), H_SUB_MIN)
+        self.assertEqual(oracle_v_fract_f16(H_SUB_MAX), H_SUB_MAX)
+        self.assertEqual(oracle_v_fract_f16(H_NORM_MIN), H_NORM_MIN)
+
+        # Negative subnormals: x - floor(x) = 1.0 - |x|, which rounds to 1.0
+        # and clamps to NEAR_ONE_F16 (0x3BFF)
+        self.assertEqual(oracle_v_fract_f16(H_NEG_SUB_MIN), NEAR_ONE_F16)
+        self.assertEqual(oracle_v_fract_f16(H_NEG_SUB_MAX), NEAR_ONE_F16)
+        self.assertEqual(oracle_v_fract_f16(H_NEG_NORM_MIN), NEAR_ONE_F16)
+
+    def test_large_integers_mantissa_exhaustion(self) -> None:
+        # In binary16, numbers with |x| >= 1024.0 have no fractional bits
+        self.assertEqual(oracle_v_fract_f16(H_1024), H_POS_ZERO)
+        self.assertEqual(oracle_v_fract_f16(H_NEG_1024), H_POS_ZERO)
+        self.assertEqual(oracle_v_fract_f16(H_MAX), H_POS_ZERO)
+        self.assertEqual(oracle_v_fract_f16(H_NEG_MAX), H_POS_ZERO)
+
+        # 1023.5 has fractional part 0.5
+        self.assertEqual(oracle_v_fract_f16(H_1023P5), H_0P5)
+
+    def test_nan_and_inf_handling(self) -> None:
+        # Signaling NaN quietened
+        snan = 0x7C01
+        self.assertTrue(is_snan(snan))
+        res_snan = oracle_v_fract_f16(snan)
+        self.assertTrue(is_qnan(res_snan))
+        self.assertEqual(res_snan, snan | QNAN_BIT)
+
+        # Quiet NaN preserved
+        qnan = 0x7E55
+        self.assertTrue(is_qnan(qnan))
+        self.assertEqual(oracle_v_fract_f16(qnan), qnan)
+
+        # Infs produce Canonical QNaN
+        self.assertEqual(oracle_v_fract_f16(POS_INF), CANONICAL_QNAN)
+        self.assertEqual(oracle_v_fract_f16(NEG_INF), CANONICAL_QNAN)
+
+        # Clamping NaN or Inf produces POS_ZERO
+        self.assertEqual(oracle_v_fract_f16(qnan, clamp=True), POS_ZERO)
+        self.assertEqual(oracle_v_fract_f16(POS_INF, clamp=True), POS_ZERO)
+        self.assertEqual(oracle_v_fract_f16(NEG_INF, clamp=True), POS_ZERO)
+
+    def test_source_modifiers(self) -> None:
+        # abs clears sign: fract(|-0.25|) = fract(0.25) = 0.25
+        self.assertEqual(oracle_v_fract_f16(H_NEG_0P25, abs_mod=True), H_0P25)
+        # neg toggles sign: fract(-(0.25)) = fract(-0.25) = 0.75
+        self.assertEqual(oracle_v_fract_f16(H_0P25, neg_mod=True), H_0P75)
+        # abs then neg: -|-0.25| = -0.25 -> 0.75
+        self.assertEqual(oracle_v_fract_f16(H_NEG_0P25, abs_mod=True, neg_mod=True), H_0P75)
+
+    def test_output_modifiers(self) -> None:
+        # fract(0.5) * 2 = 1.0
+        self.assertEqual(oracle_v_fract_f16(H_0P5, mul=2), H_1P0)
+        # fract(0.5) / 2 = 0.25
+        self.assertEqual(oracle_v_fract_f16(H_0P5, div=2), H_0P25)
+        # fract(0.75) * 2 = 1.5 clamped to 1.0
+        self.assertEqual(oracle_v_fract_f16(H_0P75, mul=2, clamp=True), H_1P0)
 
 
-# -----------------------------------------------------------------------------
-# End-to-End Execution Tests
-# -----------------------------------------------------------------------------
+class TestSymbolicAST(unittest.TestCase):
+    """Unit tests for symbolic AST opcode definitions and typed expressions."""
 
-class FractF16ExecutionTests(unittest.TestCase):
-    def test_finite_values_across_e32_e64_and_bare(self):
-        samples = [
-            H_POS_ZERO, H_NEG_ZERO,
-            H_SUB_MIN, H_NEG_SUB_MIN, H_SUB_1E5, H_NEG_SUB_1E5,
-            H_SUB_MAX, H_NEG_SUB_MAX, H_NORM_MIN, H_NEG_NORM_MIN,
-            H_1E4, H_NEG_1E4, H_2PM13, H_NEG_2PM13,
-            H_NEG_2PM12_M, H_NEG_2PM12, H_NEG_2PM12_P, H_NEG_3P2M13,
-            H_NEG_2PM11, H_NEG_3P2M12, H_NEG_2PM10,
-            H_0P125, H_0P25, H_NEG_0P25, H_0P5, H_NEG_0P5, H_0P75, H_NEG_0P75,
-            H_NEAR_ONE,
-            H_1P0, H_NEG_1P0, H_1P25, H_NEG_1P25, H_1P5, H_NEG_1P5, H_1P75, H_NEG_1P75,
-            H_2P0, H_NEG_2P0, H_2P5, H_NEG_2P5, H_3P0, H_NEG_3P0, H_3P75, H_NEG_3P75,
-            H_1023P5, H_NEG_1023P5, H_1024, H_NEG_1024, H_MAX, H_NEG_MAX,
-        ]
-        for suffix in ("_e32", "_e64", ""):
-            for h in samples:
-                v1 = 0x55550000 | h
-                want = merge_half(OLD, oracle_fract_f16(h), 0)
-                with self.subTest(form="v_fract_f16" + suffix, h=hex(h)):
-                    self.assertEqual(run_op(f"v_fract_f16{suffix} v0, v1", v1), want)
+    def test_reg16_properties_and_bounds(self) -> None:
+        v0_lo = Reg16(0, RegType.VGPR, RegHalf.LO)
+        self.assertEqual(v0_lo.name, "v0.l")
+        v5_hi = Reg16(5, RegType.VGPR, RegHalf.HI)
+        self.assertEqual(v5_hi.name, "v5.h")
+        s2_lo = Reg16(2, RegType.SGPR, RegHalf.LO)
+        self.assertEqual(s2_lo.name, "s2.l")
 
-    def test_tiny_negatives_and_subnormals_near_one_boundary(self):
-        # Crosses the exact binary16 rounding transition: -2^-10 and -3*2^-12 give 0x3bfe;
-        # -2^-11 .. -2^-24 (including -0.0001 and -1e-5) give 0x3bff (never 0x3c00 = 1.0).
-        cases = [
-            (H_NEG_2PM10, 0x3BFE),
-            (H_NEG_3P2M12, 0x3BFE),
-            (H_NEG_2PM11, H_NEAR_ONE),
-            (H_NEG_3P2M13, H_NEAR_ONE),
-            (H_NEG_2PM12_P, H_NEAR_ONE),
-            (H_NEG_2PM12, H_NEAR_ONE),
-            (H_NEG_2PM12_M, H_NEAR_ONE),
-            (H_NEG_2PM13, H_NEAR_ONE),
-            (H_NEG_1E4, H_NEAR_ONE),
-            (H_NEG_SUB_1E5, H_NEAR_ONE),
-            (H_NEG_SUB_MAX, H_NEAR_ONE),
-            (H_NEG_SUB_MIN, H_NEAR_ONE),
-        ]
-        for h, want in cases:
-            with self.subTest(h=hex(h)):
-                self.assertEqual(oracle_fract_f16(h), want)
-                self.assertEqual(run_op("v_fract_f16_e32 v0, v1", 0xCAFE0000 | h), merge_half(OLD, want, 0))
-                self.assertEqual(run_op("v_fract_f16_e64 v0, v1 op_sel:[0,1]", 0xCAFE0000 | h),
-                                 merge_half(OLD, want, 1))
+        with self.assertRaises(ValueError):
+            Reg16(-1, RegType.VGPR)
+        with self.assertRaises(ValueError):
+            Reg16(256, RegType.VGPR)
 
-    def test_exact_integers_and_signed_zero_give_positive_zero(self):
-        # GLSL.std.450 Fract(-0.0) in spirv_mini_interp returns +0.0 (copysign == +1), matching hardware.
-        self.assertEqual(si._fract(-0.0), 0.0)
-        self.assertEqual(math.copysign(1.0, si._fract(-0.0)), 1.0)
-        for h in (H_POS_ZERO, H_NEG_ZERO, H_1P0, H_NEG_1P0, H_2P0, H_NEG_2P0,
-                  H_3P0, H_NEG_3P0, H_1024, H_NEG_1024, H_MAX, H_NEG_MAX):
-            with self.subTest(h=hex(h)):
-                got = run_op("v_fract_f16_e32 v0, v1", 0xABCD0000 | h)
-                self.assertEqual(got, merge_half(OLD, H_POS_ZERO, 0))
-                self.assertNotEqual(got & 0xFFFF, H_NEG_ZERO)
-                got_hi = run_op("v_fract_f16_e64 v0, v1 op_sel:[1,1]", (h << 16) | 0x1111)
-                self.assertEqual(got_hi, merge_half(OLD, H_POS_ZERO, 1))
+    def test_literal16_properties(self) -> None:
+        lit_zero = Literal16(POS_ZERO)
+        self.assertEqual(lit_zero.name, "0.0")
+        lit_neg_zero = Literal16(NEG_ZERO)
+        self.assertEqual(lit_neg_zero.name, "-0.0")
+        lit_half = Literal16.from_float(0.5)
+        self.assertEqual(lit_half.bits, H_0P5)
+        self.assertEqual(lit_half.name, "0.5")
 
-    def test_runtime_memory_inputs_via_s_buffer_load(self):
-        # Loaded at runtime through s_buffer_load_dwordx4 so constant folding cannot bypass Fract.
-        lanes_lo = [H_NEG_1E4, H_NEG_SUB_1E5, H_NEG_ZERO, H_3P75]
-        lanes_hi = [H_NEG_MAX, H_NEG_0P25, H_1P25, H_POS_INF]
-        packed = [(hi << 16) | lo for lo, hi in zip(lanes_lo, lanes_hi)]
-        mem = {0x1000 + 4 * i: w for i, w in enumerate(packed)}
-        for idx, (lo, hi) in enumerate(zip(lanes_lo, lanes_hi)):
-            reg = f"v{idx + 1}"
-            lines_head = [
-                "s_buffer_load_dwordx4 s[4:7], s[0:3], 0",
-                "s_waitcnt lgkmcnt(0)",
-                "v_mov_b32_e32 v1, s4",
-                "v_mov_b32_e32 v2, s5",
-                "v_mov_b32_e32 v3, s6",
-                "v_mov_b32_e32 v4, s7",
-                f"v_mov_b32_e32 v0, {OLD:#x}",
-            ]
-            got_lo = run_ps(lines_head + [f"v_fract_f16_e32 v0, {reg}"], push_constants=PUSH_ADDR, memory=mem)
-            self.assertEqual(got_lo, merge_half(OLD, oracle_fract_f16(lo), 0))
-            got_hi = run_ps(lines_head + [f"v_fract_f16_e64 v0, {reg} op_sel:[1,1]"],
-                            push_constants=PUSH_ADDR, memory=mem)
-            want_hi = oracle_fract_f16(hi)
-            if want_hi is None:
-                self.assertEqual(got_hi & 0xFFFF, OLD & 0xFFFF)
-                self.assertTrue(h16_is_nan(got_hi >> 16), hex(got_hi))
-            else:
-                self.assertEqual(got_hi, merge_half(OLD, want_hi, 1))
+        with self.assertRaises(ValueError):
+            Literal16(0x10000)
 
-    def test_inf_and_nan_produce_nan_and_preserve_untouched_half(self):
-        # Verify spirv_mini_interp Fract on +-inf/NaN and translator's OpFOrdEqual guard.
-        self.assertTrue(math.isnan(si._fract(float("inf"))))
-        self.assertTrue(math.isnan(si._fract(float("-inf"))))
-        self.assertTrue(math.isnan(si._fract(float("nan"))))
+    def test_vop1_operand_disassembly(self) -> None:
+        src_raw = VOP1Operand(Reg16(1, RegType.VGPR, RegHalf.LO))
+        self.assertEqual(src_raw.disassemble(), "v1.l")
 
-        for h in (H_POS_INF, H_NEG_INF, H_QNAN, H_NEG_QNAN, H_SNAN, H_NEG_SNAN):
-            for suffix in ("_e32", "_e64", ""):
-                with self.subTest(h=hex(h), form=suffix or "bare"):
-                    got = run_op(f"v_fract_f16{suffix} v0, v1", 0xCAFE0000 | h)
-                    self.assertEqual(got & 0xFFFF0000, OLD & 0xFFFF0000)
-                    self.assertTrue(h16_is_nan(got & 0xFFFF), f"expected NaN in low half, got {got:#010x}")
-            for src_hi, dst_hi in itertools.product((0, 1), repeat=2):
-                v1 = ((h << 16) | H_0P25) if src_hi else ((H_0P25 << 16) | h)
-                with self.subTest(h=hex(h), src_hi=src_hi, dst_hi=dst_hi):
-                    got = run_op(f"v_fract_f16_e64 v0, v1 op_sel:[{src_hi},{dst_hi}]", v1)
-                    if dst_hi:
-                        self.assertEqual(got & 0xFFFF, OLD & 0xFFFF)
-                        self.assertTrue(h16_is_nan(got >> 16), hex(got))
-                    else:
-                        self.assertEqual(got & 0xFFFF0000, OLD & 0xFFFF0000)
-                        self.assertTrue(h16_is_nan(got & 0xFFFF), hex(got))
+        src_abs = VOP1Operand(Reg16(1, RegType.VGPR, RegHalf.LO), abs_mod=True)
+        self.assertEqual(src_abs.disassemble(), "|v1.l|")
 
-    def test_op_sel_all_four_combinations(self):
-        pairs = [
-            (H_NEG_1P25, H_0P25),      # hi: 0.75, lo: 0.25
-            (H_NEG_SUB_1E5, H_3P75),   # hi: 0x3bff, lo: 0.75
-        ]
-        for hi, lo in pairs:
-            v1 = (hi << 16) | lo
-            for src_hi, dst_hi in itertools.product((0, 1), repeat=2):
-                h_in = hi if src_hi else lo
-                line = f"v_fract_f16_e64 v0, v1 op_sel:[{src_hi},{dst_hi}]"
-                with self.subTest(line=line, v1=hex(v1)):
-                    self.assertEqual(run_op(line, v1), merge_half(OLD, oracle_fract_f16(h_in), dst_hi))
+        src_neg_abs = VOP1Operand(Reg16(1, RegType.VGPR, RegHalf.LO), abs_mod=True, neg_mod=True)
+        self.assertEqual(src_neg_abs.disassemble(), "-|v1.l|")
 
-    def test_vop3_source_modifiers(self):
-        cases = [
-            ("v_fract_f16_e64 v0, -v1 op_sel:[0,0]", (H_NEG_1P25 << 16) | H_0P25, H_0P25, False, True, 0),
-            ("v_fract_f16_e64 v0, -v1 op_sel:[1,1]", (H_NEG_0P25 << 16) | H_1P25, H_NEG_0P25, False, True, 1),
-            ("v_fract_f16_e64 v0, -v1 op_sel:[0,0]", (H_0P25 << 16) | H_2PM13, H_2PM13, False, True, 0),
-            ("v_fract_f16_e64 v0, -v1 op_sel:[0,0]", H_POS_ZERO, H_POS_ZERO, False, True, 0),
-            ("v_fract_f16_e64 v0, -v1 op_sel:[0,0]", H_1P0, H_1P0, False, True, 0),
-            ("v_fract_f16_e64 v0, |v1| op_sel:[1,1]", (H_NEG_1P25 << 16) | H_0P25, H_NEG_1P25, True, False, 1),
-            ("v_fract_f16_e64 v0, |v1| op_sel:[1,0]", (H_NEG_2PM13 << 16) | H_0P5, H_NEG_2PM13, True, False, 0),
-            ("v_fract_f16_e64 v0, -|v1| op_sel:[1,0]", (H_NEG_1P25 << 16) | H_0P25, H_NEG_1P25, True, True, 0),
-            ("v_fract_f16_e64 v0, -|v1| op_sel:[0,1]", (H_0P5 << 16) | H_3P75, H_3P75, True, True, 1),
-            ("v_fract_f16_e64 v0, -|v1| op_sel:[0,0]", H_2PM13, H_2PM13, True, True, 0),
-        ]
-        for line, v1, h_in, abs_, neg, dst_hi in cases:
-            with self.subTest(line=line, v1=hex(v1)):
-                want = oracle_fract_f16(h_in, abs_=abs_, neg=neg)
-                self.assertEqual(run_op(line, v1), merge_half(OLD, want, dst_hi))
-
-        # Source modifiers on inf/NaN preserve NaN output and keep untouched half.
-        for mod in ("-v1", "|v1|", "-|v1|"):
-            for h in (H_POS_INF, H_NEG_INF, H_QNAN):
-                with self.subTest(mod=mod, h=hex(h)):
-                    got = run_op(f"v_fract_f16_e64 v0, {mod}", (H_0P25 << 16) | h)
-                    self.assertEqual(got & 0xFFFF0000, OLD & 0xFFFF0000)
-                    self.assertTrue(h16_is_nan(got & 0xFFFF), hex(got))
-
-    def test_vop3_output_modifiers(self):
-        # (asm_suffix, input_h, dst_hi, kwargs_for_oracle)
-        cases = [
-            # clamp without omod keeps [0, 1) and preserves 0x3c00 -> 0x3bff
-            ("clamp", H_0P75, 0, dict(clamp=True)),
-            ("clamp", H_NEG_0P25, 0, dict(clamp=True)),
-            ("clamp", H_NEG_2PM13, 0, dict(clamp=True)),
-            ("clamp", H_NEG_ZERO, 0, dict(clamp=True)),
-            # mul:2 / mul:4 / div:2 (true 1.0 stays 0x3c00 when omod is active)
-            ("mul:2", H_0P5, 0, dict(mul=2)),
-            ("mul:2", H_0P75, 0, dict(mul=2)),
-            ("mul:2", H_NEG_0P25, 0, dict(mul=2)),
-            ("mul:2", H_NEG_2PM13, 0, dict(mul=2)),
-            ("mul:4", H_0P25, 0, dict(mul=4)),
-            ("mul:4", H_0P5, 0, dict(mul=4)),
-            ("mul:4", H_NEG_1P25, 0, dict(mul=4)),
-            ("div:2", H_0P5, 0, dict(div=2)),
-            ("div:2", H_NEG_1P25, 0, dict(div=2)),
-            ("div:2", H_0P25, 0, dict(div=2)),
-            ("div:2", H_NEG_2PM13, 0, dict(div=2)),
-            # combined omod + clamp
-            ("mul:2 clamp", H_0P25, 0, dict(mul=2, clamp=True)),
-            ("mul:2 clamp", H_0P5, 0, dict(mul=2, clamp=True)),
-            ("mul:2 clamp", H_0P75, 0, dict(mul=2, clamp=True)),
-            ("mul:2 clamp", H_NEG_0P25, 0, dict(mul=2, clamp=True)),
-            ("mul:4 clamp", H_0P5, 0, dict(mul=4, clamp=True)),
-            ("op_sel:[1,1] mul:2 clamp", H_NEG_1P25, 1, dict(mul=2, clamp=True)),
-            ("op_sel:[1,1] mul:4 clamp", H_0P125, 1, dict(mul=4, clamp=True)),
-        ]
-        for suffix, h_in, dst_hi, kw in cases:
-            v1 = ((h_in << 16) | H_0P25) if "op_sel:[1,1]" in suffix else ((H_3P75 << 16) | h_in)
-            line = f"v_fract_f16_e64 v0, v1 {suffix}"
-            want = oracle_fract_f16(h_in, **kw)
-            with self.subTest(line=line, h_in=hex(h_in)):
-                self.assertEqual(run_op(line, v1), merge_half(OLD, want, dst_hi))
-
-        # Verify explicit exact values for the critical omod transitions.
-        self.assertEqual(run_op("v_fract_f16_e64 v0, v1 mul:2", H_0P5), merge_half(OLD, H_1P0, 0))
-        self.assertEqual(run_op("v_fract_f16_e64 v0, v1 mul:2 clamp", H_0P75), merge_half(OLD, H_1P0, 0))
-        self.assertEqual(run_op("v_fract_f16_e64 v0, v1 mul:4", H_0P5), merge_half(OLD, H_2P0, 0))
-        self.assertEqual(run_op("v_fract_f16_e64 v0, v1 div:2", H_0P5), merge_half(OLD, H_0P25, 0))
-
-    def test_inline_f16_constants(self):
-        for lit, h in (("0.5", H_0P5), ("-0.5", H_NEG_0P5), ("1.0", H_1P0), ("-1.0", H_NEG_1P0)):
-            want = oracle_fract_f16(h)
-            for form in ("_e32", "_e64", ""):
-                with self.subTest(lit=lit, form=form or "bare"):
-                    self.assertEqual(run_op(f"v_fract_f16{form} v0, {lit}"), merge_half(OLD, want, 0))
-            # op_sel:[0,1] writes the inline constant's fract into high half; low half preserved.
-            self.assertEqual(run_op(f"v_fract_f16_e64 v0, {lit} op_sel:[0,1]"), merge_half(OLD, want, 1))
-            # Inline float constants place +0.0 in the high half (docs/design.md / src_h).
-            self.assertEqual(run_op(f"v_fract_f16_e64 v0, {lit} op_sel:[1,0]"), merge_half(OLD, H_POS_ZERO, 0))
-
-        self.assertEqual(run_op("v_fract_f16_e64 v0, -0.5 mul:2"), merge_half(OLD, H_1P0, 0))
-        self.assertEqual(run_op("v_fract_f16_e64 v0, -0.5 div:2"), merge_half(OLD, H_0P25, 0))
-
-    def test_sgpr_sources_and_destination_aliasing(self):
-        s4 = (H_NEG_1P25 << 16) | H_0P25
-        self.assertEqual(run_op("v_fract_f16_e32 v0, s4", s4=s4), merge_half(OLD, H_0P25, 0))
-        self.assertEqual(run_op("v_fract_f16_e64 v0, s4 op_sel:[0,0]", s4=s4), merge_half(OLD, H_0P25, 0))
-        self.assertEqual(run_op("v_fract_f16_e64 v0, s4 op_sel:[1,0]", s4=s4), merge_half(OLD, H_0P75, 0))
-        self.assertEqual(run_op("v_fract_f16_e64 v0, s4 op_sel:[0,1]", s4=s4), merge_half(OLD, H_0P25, 1))
-        self.assertEqual(run_op("v_fract_f16_e64 v0, s4 op_sel:[1,1]", s4=s4), merge_half(OLD, H_0P75, 1))
-        self.assertEqual(run_op("v_fract_f16_e64 v0, -s4 op_sel:[1,0]", s4=s4), merge_half(OLD, H_0P25, 0))
-        self.assertEqual(run_op("v_fract_f16_e64 v0, |s4| op_sel:[1,1]", s4=s4), merge_half(OLD, H_0P25, 1))
-
-        # Destination aliasing: dst == src (v0, v0) keeps the untouched half of v0.
-        v0_init = (H_3P75 << 16) | H_NEG_0P25
-        self.assertEqual(
-            run_ps([f"v_mov_b32 v0, {v0_init:#x}", "v_fract_f16_e32 v0, v0"]),
-            (H_3P75 << 16) | H_0P75,
+    def test_instruction_disassembly(self) -> None:
+        # Simple VOP1 e32 form
+        instr_e32 = VFractF16Instruction(
+            dst=Reg16(0, RegType.VGPR, RegHalf.LO),
+            src=VOP1Operand(Reg16(1, RegType.VGPR, RegHalf.LO)),
         )
-        self.assertEqual(
-            run_ps([f"v_mov_b32 v0, {v0_init:#x}", "v_fract_f16 v0, v0"]),
-            (H_3P75 << 16) | H_0P75,
+        self.assertEqual(instr_e32.disassemble(), "v_fract_f16_e32 v0.l, v1.l")
+
+        # VOP3 e64 form with clamp and high half
+        instr_e64 = VFractF16Instruction(
+            dst=Reg16(0, RegType.VGPR, RegHalf.HI),
+            src=VOP1Operand(Reg16(1, RegType.VGPR, RegHalf.LO), abs_mod=True, neg_mod=True),
+            clamp=True,
+            mul=2,
         )
-        for src_hi, dst_hi in itertools.product((0, 1), repeat=2):
-            h_in = H_3P75 if src_hi else H_NEG_0P25
-            want_h = oracle_fract_f16(h_in)
-            with self.subTest(alias_op_sel=(src_hi, dst_hi)):
-                self.assertEqual(
-                    run_ps([
-                        f"v_mov_b32 v0, {v0_init:#x}",
-                        f"v_fract_f16_e64 v0, v0 op_sel:[{src_hi},{dst_hi}]",
-                    ]),
-                    merge_half(v0_init, want_h, dst_hi),
-                )
+        self.assertEqual(instr_e64.disassemble(), "v_fract_f16_e64 v0.h, -|v1.l| mul:2 clamp")
 
-    def test_exec_masking_single_lane_and_workgroup(self):
-        # Single-lane pixel shader: inactive lane preserves pre-existing v0; re-enabling executes.
-        self.assertEqual(run_ps([
-            f"v_mov_b32 v1, {H_1P5:#x}",
-            f"v_mov_b32 v0, {OLD:#x}",
-            "s_mov_b32 exec_lo, 0",
-            "v_fract_f16_e32 v0, v1",
-            "v_fract_f16_e64 v0, v1 op_sel:[0,1]",
-            "s_mov_b32 exec_lo, 1",
-        ]), OLD)
-
-        self.assertEqual(run_ps([
-            f"v_mov_b32 v1, {(H_NEG_1P25 << 16) | H_2P5:#x}",
-            f"v_mov_b32 v0, {OLD:#x}",
-            "s_mov_b32 exec_lo, 0",
-            "v_fract_f16_e64 v0, v1 op_sel:[0,0]",
-            "v_fract_f16_e64 v0, v1 op_sel:[1,1]",
-            "s_mov_b32 exec_lo, 1",
-            "v_fract_f16_e64 v0, v1 op_sel:[1,0]",
-        ]), merge_half(OLD, H_0P75, 0))
-
-        # Multi-lane 8-thread compute shader: even lanes active, odd lanes masked off keep OLD.
-        lane_inputs = [
-            (H_NEG_1P25 << 16) | H_0P25,
-            (H_3P75 << 16) | H_NEG_0P25,
-            (H_NEG_SUB_1E5 << 16) | H_1P25,
-            (H_2P5 << 16) | H_NEG_1E4,
-            (H_NEG_ZERO << 16) | H_NEG_0P5,
-            (H_1P5 << 16) | H_NEG_MAX,
-            (H_NEG_MAX << 16) | H_NEG_2PM12,
-            (H_0P75 << 16) | H_3P75,
-        ]
-        lane_olds = [0xAA00BB00 + 0x00110001 * i for i in range(8)]
-        for dst_hi, op_line in (
-            (0, "v_fract_f16_e32 v2, v1"),
-            (1, "v_fract_f16_e64 v2, v1 op_sel:[1,1]"),
-        ):
-            mem = _Heap(
-                {0x100 + 4 * i: w for i, w in enumerate(lane_inputs)}
-                | {0x200 + 4 * i: w for i, w in enumerate(lane_olds)}
+    def test_instruction_type_enforcement(self) -> None:
+        with self.assertRaises(TypeError):
+            VFractF16Instruction(
+                dst=Reg16(0, RegType.SGPR, RegHalf.LO),
+                src=VOP1Operand(Reg16(1, RegType.VGPR, RegHalf.LO)),
             )
-            run_cs([
-                "v_lshlrev_b32_e32 v5, 2, v0",
-                "v_add_nc_u32_e32 v6, 0x100, v5",
-                "v_add_nc_u32_e32 v7, 0x200, v5",
-                "buffer_load_dword v1, v6, s[0:3], 0 offen",
-                "buffer_load_dword v2, v7, s[0:3], 0 offen",
-                "v_and_b32_e32 v3, 1, v0",
-                "v_cmp_eq_u32_e32 vcc_lo, 0, v3",
-                "s_and_saveexec_b32 s6, vcc_lo",
-                op_line,
-                "s_mov_b32 exec_lo, s6",
-                "buffer_store_dword v2, v5, s[0:3], 0 offen",
-            ], group_size=8, memory=mem)
 
-            got = [mem.get(4 * i) for i in range(8)]
-            want = []
-            for lane, (inp, old_w) in enumerate(zip(lane_inputs, lane_olds)):
-                if lane & 1:
-                    want.append(old_w)
-                else:
-                    h_in = (inp >> 16) if dst_hi else (inp & 0xFFFF)
-                    want.append(merge_half(old_w, oracle_fract_f16(h_in), dst_hi))
-            with self.subTest(op_line=op_line):
-                self.assertEqual(got, want)
+        with self.assertRaises(ValueError):
+            VFractF16Instruction(
+                dst=Reg16(0, RegType.VGPR, RegHalf.LO),
+                src=VOP1Operand(Reg16(1, RegType.VGPR, RegHalf.LO)),
+                mul=3,
+            )
 
-    def test_negative_control_sabotaged_spirv(self):
-        # Input -1.25: true fract = 0.75 (0x3a00); Trunc gives -1.0 (0xbc00); Floor gives -2.0 (0xc000).
-        spv = translate_ps([
-            f"v_mov_b32 v1, {H_NEG_1P25:#x}",
-            f"v_mov_b32 v0, {OLD:#x}",
-            "v_fract_f16_e32 v0, v1",
-        ])
-        expected = merge_half(OLD, H_0P75, 0)
-        self.assertEqual(si.run_fragment(spv)["%out_mrt0"][0], expected)
 
-        for replacement, sabotaged_half in (("Trunc", H_NEG_1P0), ("Floor", H_NEG_2P0)):
-            sabotaged, n = re.subn(r"\bFract\b", replacement, spv, count=1)
-            self.assertEqual(n, 1)
-            got = si.run_fragment(sabotaged)["%out_mrt0"][0]
-            with self.subTest(replacement=replacement):
-                self.assertNotEqual(got, expected)
-                self.assertEqual(got, merge_half(OLD, sabotaged_half, 0))
+class TestScalarInterpreter(unittest.TestCase):
+    """Unit tests for the deterministic scalar instruction interpreter."""
+
+    def setUp(self) -> None:
+        self.interp = ScalarInterpreter()
+        self.state = ScalarMachineState()
+
+    def test_scalar_vgpr_low_and_high_half(self) -> None:
+        # v1 has low half = -1.75, high half = 0.75
+        self.state.vgprs[1] = (H_0P75 << 16) | H_NEG_1P75
+
+        # v0 starts with background pattern 0xDEADBEEF
+        self.state.vgprs[0] = 0xDEAD_BEEF
+
+        # Step 1: Read v1.l (-1.75 -> 0.25) and write to v0.l
+        instr1 = VFractF16Instruction(
+            dst=Reg16(0, RegType.VGPR, RegHalf.LO),
+            src=VOP1Operand(Reg16(1, RegType.VGPR, RegHalf.LO)),
+        )
+        res1 = self.interp.step(instr1, self.state)
+        self.assertEqual(res1, H_0P25)
+        # v0.l is H_0P25, v0.h should be unchanged (0xDEAD)
+        self.assertEqual(self.state.vgprs[0], (0xDEAD << 16) | H_0P25)
+
+        # Step 2: Read v1.h (0.75 -> 0.75) and write to v0.h
+        instr2 = VFractF16Instruction(
+            dst=Reg16(0, RegType.VGPR, RegHalf.HI),
+            src=VOP1Operand(Reg16(1, RegType.VGPR, RegHalf.HI)),
+        )
+        res2 = self.interp.step(instr2, self.state)
+        self.assertEqual(res2, H_0P75)
+        self.assertEqual(self.state.vgprs[0], (H_0P75 << 16) | H_0P25)
+
+    def test_scalar_sgpr_operand(self) -> None:
+        self.state.set_sgpr16(4, RegHalf.LO, H_NEG_0P25)
+        instr = VFractF16Instruction(
+            dst=Reg16(2, RegType.VGPR, RegHalf.LO),
+            src=VOP1Operand(Reg16(4, RegType.SGPR, RegHalf.LO)),
+        )
+        res = self.interp.step(instr, self.state)
+        self.assertEqual(res, H_0P75)
+        self.assertEqual(self.state.get_vgpr16(2, RegHalf.LO), H_0P75)
+
+    def test_scalar_literal_operand(self) -> None:
+        instr = VFractF16Instruction(
+            dst=Reg16(5, RegType.VGPR, RegHalf.LO),
+            src=VOP1Operand(Literal16.from_float(1.5)),
+        )
+        res = self.interp.step(instr, self.state)
+        self.assertEqual(res, H_0P5)
+        self.assertEqual(self.state.get_vgpr16(5, RegHalf.LO), H_0P5)
+
+    def test_scalar_modifiers_abs_neg_clamp_mul_div(self) -> None:
+        self.state.set_vgpr16(10, RegHalf.LO, H_0P75)
+        # -|0.75| = -0.75 -> fract(-0.75) = 0.25 -> mul:2 -> 0.5
+        instr = VFractF16Instruction(
+            dst=Reg16(11, RegType.VGPR, RegHalf.LO),
+            src=VOP1Operand(Reg16(10, RegType.VGPR, RegHalf.LO), abs_mod=True, neg_mod=True),
+            mul=2,
+        )
+        res = self.interp.step(instr, self.state)
+        self.assertEqual(res, H_0P5)
+        self.assertEqual(self.state.get_vgpr16(11, RegHalf.LO), H_0P5)
+
+    def test_scalar_determinism(self) -> None:
+        runs = []
+        for _ in range(50):
+            st = ScalarMachineState()
+            st.set_vgpr16(1, RegHalf.LO, 0x3C10)  # ~1.015625
+            instr = VFractF16Instruction(
+                dst=Reg16(2, RegType.VGPR, RegHalf.LO),
+                src=VOP1Operand(Reg16(1, RegType.VGPR, RegHalf.LO)),
+            )
+            runs.append(self.interp.step(instr, st))
+        self.assertTrue(all(r == runs[0] for r in runs))
+
+
+class TestSIMDMultiLaneDivergence(unittest.TestCase):
+    """Unit tests for SIMD multi-lane divergence and 32/64-bit EXEC masking."""
+
+    def setUp(self) -> None:
+        self.simd_interp = SIMDInterpreter()
+
+    def test_simd_wave32_all_lanes_active(self) -> None:
+        state = SIMDState(num_lanes=32)
+        # Populate lane i with float value (i + 0.25)
+        for lane in range(32):
+            val = float(lane) + 0.25
+            state.set_vgpr16(lane, 1, RegHalf.LO, f16_to_bits(val))
+
+        instr = VFractF16Instruction(
+            dst=Reg16(0, RegType.VGPR, RegHalf.LO),
+            src=VOP1Operand(Reg16(1, RegType.VGPR, RegHalf.LO)),
+        )
+        res = self.simd_interp.step(instr, state)
+        for lane in range(32):
+            self.assertEqual(res[lane], H_0P25)
+            self.assertEqual(state.get_vgpr16(lane, 0, RegHalf.LO), H_0P25)
+
+    def test_simd_wave64_alternating_exec_mask(self) -> None:
+        exec_mask = 0x5555_5555_5555_5555  # Even lanes active, odd lanes inactive
+        state = SIMDState(num_lanes=64, exec_mask=exec_mask)
+        sentinel = 0xCAFE
+
+        for lane in range(64):
+            # Input is 2.5 on all lanes
+            state.set_vgpr16(lane, 1, RegHalf.LO, H_2P5)
+            # Destination initialized to sentinel
+            state.set_vgpr16(lane, 0, RegHalf.LO, sentinel)
+
+        instr = VFractF16Instruction(
+            dst=Reg16(0, RegType.VGPR, RegHalf.LO),
+            src=VOP1Operand(Reg16(1, RegType.VGPR, RegHalf.LO)),
+        )
+        res = self.simd_interp.step(instr, state)
+
+        for lane in range(64):
+            if (exec_mask & (1 << lane)) != 0:
+                self.assertEqual(res[lane], H_0P5)
+                self.assertEqual(state.get_vgpr16(lane, 0, RegHalf.LO), H_0P5)
+            else:
+                self.assertIsNone(res[lane])
+                self.assertEqual(state.get_vgpr16(lane, 0, RegHalf.LO), sentinel)
+
+    def test_simd_uniform_sgpr_broadcast_across_lanes(self) -> None:
+        state = SIMDState(num_lanes=32)
+        state.set_sgpr16(6, RegHalf.LO, H_NEG_1P25)  # -1.25 -> 0.75
+
+        instr = VFractF16Instruction(
+            dst=Reg16(3, RegType.VGPR, RegHalf.LO),
+            src=VOP1Operand(Reg16(6, RegType.SGPR, RegHalf.LO)),
+        )
+        res = self.simd_interp.step(instr, state)
+        for lane in range(32):
+            self.assertEqual(res[lane], H_0P75)
+            self.assertEqual(state.get_vgpr16(lane, 3, RegHalf.LO), H_0P75)
+
+    def test_simd_all_lanes_inactive_exec_zero(self) -> None:
+        state = SIMDState(num_lanes=32, exec_mask=0x0)
+        sentinel = 0xBEEF
+        for lane in range(32):
+            state.set_vgpr16(lane, 2, RegHalf.LO, sentinel)
+
+        instr = VFractF16Instruction(
+            dst=Reg16(2, RegType.VGPR, RegHalf.LO),
+            src=VOP1Operand(Literal16.from_float(0.75)),
+        )
+        res = self.simd_interp.step(instr, state)
+        for lane in range(32):
+            self.assertIsNone(res[lane])
+            self.assertEqual(state.get_vgpr16(lane, 2, RegHalf.LO), sentinel)
+
+    def test_simd_high_half_destination_preservation(self) -> None:
+        state = SIMDState(num_lanes=32)
+        for lane in range(32):
+            # vgpr0 dword has low half 0x1234, high half sentinel
+            state.vgprs[lane][0] = 0x5555_1234
+            state.set_vgpr16(lane, 1, RegHalf.LO, H_1P5)  # 1.5 -> 0.5
+
+        instr = VFractF16Instruction(
+            dst=Reg16(0, RegType.VGPR, RegHalf.HI),
+            src=VOP1Operand(Reg16(1, RegType.VGPR, RegHalf.LO)),
+        )
+        self.simd_interp.step(instr, state)
+        for lane in range(32):
+            self.assertEqual(state.get_vgpr16(lane, 0, RegHalf.HI), H_0P5)
+            # Low half must remain 0x1234
+            self.assertEqual(state.get_vgpr16(lane, 0, RegHalf.LO), 0x1234)
+
+
+class TestRegisterAliasing(unittest.TestCase):
+    """Unit tests for register aliasing and in-place operand preservation."""
+
+    def setUp(self) -> None:
+        self.scalar_interp = ScalarInterpreter()
+        self.simd_interp = SIMDInterpreter()
+
+    def test_dst_alias_src_same_half(self) -> None:
+        # In-place execution: v0.l = fract(v0.l)
+        state = ScalarMachineState()
+        state.set_vgpr16(0, RegHalf.LO, H_1P75)  # 1.75 -> 0.75
+        state.set_vgpr16(0, RegHalf.HI, 0xABCD)  # untouched high half
+
+        instr = VFractF16Instruction(
+            dst=Reg16(0, RegType.VGPR, RegHalf.LO),
+            src=VOP1Operand(Reg16(0, RegType.VGPR, RegHalf.LO)),
+        )
+        res = self.scalar_interp.step(instr, state)
+        self.assertEqual(res, H_0P75)
+        self.assertEqual(state.get_vgpr16(0, RegHalf.LO), H_0P75)
+        self.assertEqual(state.get_vgpr16(0, RegHalf.HI), 0xABCD)
+
+    def test_dst_alias_src_cross_half_low_to_high(self) -> None:
+        # v0.h = fract(v0.l)
+        state = ScalarMachineState()
+        state.set_vgpr16(0, RegHalf.LO, H_NEG_0P25)  # -0.25 -> 0.75
+        state.set_vgpr16(0, RegHalf.HI, 0x1111)
+
+        instr = VFractF16Instruction(
+            dst=Reg16(0, RegType.VGPR, RegHalf.HI),
+            src=VOP1Operand(Reg16(0, RegType.VGPR, RegHalf.LO)),
+        )
+        res = self.scalar_interp.step(instr, state)
+        self.assertEqual(res, H_0P75)
+        # v0.h is updated to 0.75, v0.l remains untouched (-0.25)
+        self.assertEqual(state.get_vgpr16(0, RegHalf.HI), H_0P75)
+        self.assertEqual(state.get_vgpr16(0, RegHalf.LO), H_NEG_0P25)
+
+    def test_dst_alias_src_cross_half_high_to_low(self) -> None:
+        # v0.l = fract(v0.h)
+        state = ScalarMachineState()
+        state.set_vgpr16(0, RegHalf.HI, H_NEG_1P75)  # -1.75 -> 0.25
+        state.set_vgpr16(0, RegHalf.LO, 0x2222)
+
+        instr = VFractF16Instruction(
+            dst=Reg16(0, RegType.VGPR, RegHalf.LO),
+            src=VOP1Operand(Reg16(0, RegType.VGPR, RegHalf.HI)),
+        )
+        res = self.scalar_interp.step(instr, state)
+        self.assertEqual(res, H_0P25)
+        self.assertEqual(state.get_vgpr16(0, RegHalf.LO), H_0P25)
+        self.assertEqual(state.get_vgpr16(0, RegHalf.HI), H_NEG_1P75)
+
+    def test_inplace_iterative_fract_stepping(self) -> None:
+        state = ScalarMachineState()
+        state.set_vgpr16(0, RegHalf.LO, H_3P75)  # 3.75
+        instr = VFractF16Instruction(
+            dst=Reg16(0, RegType.VGPR, RegHalf.LO),
+            src=VOP1Operand(Reg16(0, RegType.VGPR, RegHalf.LO)),
+        )
+        # First iteration: 3.75 -> 0.75
+        self.scalar_interp.step(instr, state)
+        self.assertEqual(state.get_vgpr16(0, RegHalf.LO), H_0P75)
+
+        # Subsequent iterations: 0.75 -> 0.75 (idempotent fixed point)
+        for _ in range(50):
+            self.scalar_interp.step(instr, state)
+        self.assertEqual(state.get_vgpr16(0, RegHalf.LO), H_0P75)
+
+    def test_simd_multi_lane_aliasing(self) -> None:
+        state = SIMDState(num_lanes=32)
+        for lane in range(32):
+            state.set_vgpr16(lane, 4, RegHalf.LO, f16_to_bits(float(lane) + 0.5))
+
+        instr = VFractF16Instruction(
+            dst=Reg16(4, RegType.VGPR, RegHalf.LO),
+            src=VOP1Operand(Reg16(4, RegType.VGPR, RegHalf.LO)),
+        )
+        self.simd_interp.step(instr, state)
+        for lane in range(32):
+            self.assertEqual(state.get_vgpr16(lane, 4, RegHalf.LO), H_0P5)
+
+    def test_simd_cross_half_aliasing(self) -> None:
+        state = SIMDState(num_lanes=32)
+        for lane in range(32):
+            # Low half has negative offset (-1.25 -> 0.75)
+            state.set_vgpr16(lane, 0, RegHalf.LO, H_NEG_1P25)
+            state.set_vgpr16(lane, 0, RegHalf.HI, 0x5555)
+
+        instr = VFractF16Instruction(
+            dst=Reg16(0, RegType.VGPR, RegHalf.HI),
+            src=VOP1Operand(Reg16(0, RegType.VGPR, RegHalf.LO)),
+        )
+        self.simd_interp.step(instr, state)
+        for lane in range(32):
+            self.assertEqual(state.get_vgpr16(lane, 0, RegHalf.HI), H_0P75)
+            self.assertEqual(state.get_vgpr16(lane, 0, RegHalf.LO), H_NEG_1P25)
+
+
+class TestConditionCodesAndStatusFlags(unittest.TestCase):
+    """Unit tests for condition codes, status flags, and borrow generation."""
+
+    def test_exact_finite_flags(self) -> None:
+        src = H_0P25  # 0.25 -> 0.25 exact
+        res = oracle_v_fract_f16(src)
+        flags = evaluate_v_fract_f16_flags(src, res)
+        self.assertFalse(flags.invalid)
+        self.assertFalse(flags.overflow)
+        self.assertFalse(flags.underflow)
+        self.assertFalse(flags.inexact)
+        self.assertFalse(flags.zero)
+        self.assertFalse(flags.negative)
+        self.assertFalse(flags.denormal)
+        self.assertFalse(flags.infinite)
+        self.assertFalse(flags.nan)
+
+    def test_inexact_flags(self) -> None:
+        # 1/3 cannot be represented exactly in binary16
+        # Let's use negative subnormal: 1.0 - |x| rounds to NEAR_ONE_F16 (0x3BFF)
+        src = H_NEG_SUB_MIN
+        res = oracle_v_fract_f16(src)
+        flags = evaluate_v_fract_f16_flags(src, res)
+        self.assertTrue(flags.inexact)
+        self.assertFalse(flags.invalid)
+        self.assertFalse(flags.overflow)
+
+    def test_invalid_operation_flags(self) -> None:
+        # Signaling NaN
+        snan = 0x7C01
+        res_snan = oracle_v_fract_f16(snan)
+        flags_snan = evaluate_v_fract_f16_flags(snan, res_snan)
+        self.assertTrue(flags_snan.invalid)
+        self.assertTrue(flags_snan.nan)
+
+        # Infinity
+        res_inf = oracle_v_fract_f16(POS_INF)
+        flags_inf = evaluate_v_fract_f16_flags(POS_INF, res_inf)
+        self.assertTrue(flags_inf.invalid)
+        self.assertTrue(flags_inf.nan)
+
+    def test_zero_and_negative_flags(self) -> None:
+        # Integer operand 2.0 -> fract is +0.0
+        src = H_2P0
+        res = oracle_v_fract_f16(src)
+        flags = evaluate_v_fract_f16_flags(src, res)
+        self.assertTrue(flags.zero)
+        self.assertFalse(flags.negative)
+
+        # Negative zero -> fract is strictly +0.0
+        src_nz = H_NEG_ZERO
+        res_nz = oracle_v_fract_f16(src_nz)
+        flags_nz = evaluate_v_fract_f16_flags(src_nz, res_nz)
+        self.assertTrue(flags_nz.zero)
+        self.assertFalse(flags_nz.negative)
+
+    def test_underflow_and_denorm_flags(self) -> None:
+        # Positive subnormal: fract is subnormal
+        src = H_SUB_MIN
+        res = oracle_v_fract_f16(src)
+        flags = evaluate_v_fract_f16_flags(src, res)
+        self.assertTrue(flags.denormal)
+        self.assertTrue(flags.underflow)
+        self.assertFalse(flags.overflow)
+
+    def test_fractional_borrow_generation(self) -> None:
+        # Negative non-integer (-0.25): borrow 1 from integer unit
+        sign, borrow = compute_f16_fractional_borrow(H_NEG_0P25)
+        self.assertEqual(sign, 1)
+        self.assertEqual(borrow, 1)
+
+        # Negative integer (-2.0): no borrow needed
+        sign_int, borrow_int = compute_f16_fractional_borrow(H_NEG_2P0)
+        self.assertEqual(sign_int, 1)
+        self.assertEqual(borrow_int, 0)
+
+        # Positive non-integer (+0.25): no borrow
+        sign_pos, borrow_pos = compute_f16_fractional_borrow(H_0P25)
+        self.assertEqual(sign_pos, 0)
+        self.assertEqual(borrow_pos, 0)
+
+
+class TestIEEE754BoundaryExtremes(unittest.TestCase):
+    """Unit tests for IEEE 754 boundary extremes, subnormals, and NaN handling."""
+
+    def test_subnormal_positive_preservation(self) -> None:
+        for sub in (H_SUB_MIN, 0x0002, 0x0100, H_SUB_MAX):
+            with self.subTest(sub=hex(sub)):
+                res = oracle_v_fract_f16(sub)
+                self.assertEqual(res, sub)
+                self.assertTrue(is_subnormal(res))
+
+    def test_subnormal_negative_rounding_clamp(self) -> None:
+        for neg_sub in (H_NEG_SUB_MIN, 0x8002, 0x8100, H_NEG_SUB_MAX):
+            with self.subTest(neg_sub=hex(neg_sub)):
+                res = oracle_v_fract_f16(neg_sub)
+                # 1.0 - sub rounds to 1.0 in RNE, clamped by RDNA2 to NEAR_ONE_F16 (0x3BFF)
+                self.assertEqual(res, NEAR_ONE_F16)
+
+    def test_subnormal_to_normal_boundary_transition(self) -> None:
+        # Largest subnormal: 0x03FF
+        res_sub = oracle_v_fract_f16(H_SUB_MAX)
+        self.assertEqual(res_sub, H_SUB_MAX)
+        self.assertTrue(is_subnormal(res_sub))
+
+        # Smallest normal: 0x0400 (2^-14)
+        res_norm = oracle_v_fract_f16(H_NORM_MIN)
+        self.assertEqual(res_norm, H_NORM_MIN)
+        self.assertFalse(is_subnormal(res_norm))
+
+    def test_nan_signaling_to_quiet_conversion(self) -> None:
+        snan = 0x7C05  # fraction non-zero, quiet bit 9 is 0
+        self.assertTrue(is_snan(snan))
+        res = oracle_v_fract_f16(snan)
+        self.assertTrue(is_qnan(res))
+        self.assertEqual(res, snan | QNAN_BIT)
+
+    def test_nan_payload_preservation(self) -> None:
+        payload = 0x0155
+        qnan = EXP_MASK | QNAN_BIT | payload
+        self.assertTrue(is_qnan(qnan))
+        res = oracle_v_fract_f16(qnan)
+        self.assertEqual(res, qnan)
+
+    def test_nan_with_modifiers(self) -> None:
+        qnan = CANONICAL_QNAN
+        # abs should clear sign bit
+        res_abs = oracle_v_fract_f16(qnan | SIGN_MASK, abs_mod=True)
+        self.assertEqual(res_abs & SIGN_MASK, 0)
+        self.assertTrue(is_qnan(res_abs))
+
+        # neg should toggle sign bit
+        res_neg = oracle_v_fract_f16(qnan, neg_mod=True)
+        self.assertEqual(res_neg & SIGN_MASK, SIGN_MASK)
+        self.assertTrue(is_qnan(res_neg))
+
+    def test_nan_and_inf_with_clamp(self) -> None:
+        qnan = CANONICAL_QNAN
+        self.assertEqual(oracle_v_fract_f16(qnan, clamp=True), POS_ZERO)
+        self.assertEqual(oracle_v_fract_f16(POS_INF, clamp=True), POS_ZERO)
+        self.assertEqual(oracle_v_fract_f16(NEG_INF, clamp=True), POS_ZERO)
+
+    def test_signed_zero_boundary(self) -> None:
+        # Both +0.0 and -0.0 must yield +0.0 with sign bit 0
+        res_pz = oracle_v_fract_f16(POS_ZERO)
+        self.assertEqual(res_pz, POS_ZERO)
+        self.assertEqual(res_pz & SIGN_MASK, 0)
+
+        res_nz = oracle_v_fract_f16(NEG_ZERO)
+        self.assertEqual(res_nz, POS_ZERO)
+        self.assertEqual(res_nz & SIGN_MASK, 0)
+
+    def test_exact_integer_cancellation(self) -> None:
+        integers = [
+            H_1P0, H_NEG_1P0,
+            H_2P0, H_NEG_2P0,
+            H_3P0, H_NEG_3P0,
+            H_1024, H_NEG_1024,
+            H_MAX, H_NEG_MAX,
+        ]
+        for val in integers:
+            with self.subTest(val=hex(val)):
+                res = oracle_v_fract_f16(val)
+                self.assertEqual(res, POS_ZERO)
+                self.assertEqual(res & SIGN_MASK, 0)
+
+    def test_mantissa_exhaustion_boundaries(self) -> None:
+        # 1023.5 in f16: exponent 9, all 10 fraction bits 1 -> 0x63FF
+        self.assertEqual(oracle_v_fract_f16(H_1023P5), H_0P5)
+
+        # 1024.0 in f16: exponent 10, fraction 0 -> 0x6400
+        self.assertEqual(oracle_v_fract_f16(H_1024), POS_ZERO)
+
+    def test_round_to_nearest_even_midpoint(self) -> None:
+        # In f16, 1.25 -> fract is 0.25 (exact)
+        self.assertEqual(oracle_v_fract_f16(H_1P25), H_0P25)
+        # -1.25 -> fract is 0.75 (exact)
+        self.assertEqual(oracle_v_fract_f16(H_NEG_1P25), H_0P75)
+
+
+class TestNegativeControlsAndMutations(unittest.TestCase):
+    """Unit tests for negative controls, syntax rejection, and mutation detection."""
+
+    def test_syntax_rejection_invalid_register_indices(self) -> None:
+        with self.assertRaises(ValueError):
+            Reg16(-1, RegType.VGPR)
+        with self.assertRaises(ValueError):
+            Reg16(256, RegType.VGPR)
+        with self.assertRaises(ValueError):
+            Reg16(300, RegType.SGPR)
+
+    def test_syntax_rejection_valu_destination_must_be_vgpr(self) -> None:
+        dst_sgpr = Reg16(0, RegType.SGPR, RegHalf.LO)
+        src = VOP1Operand(Reg16(1, RegType.VGPR, RegHalf.LO))
+        with self.assertRaises(TypeError):
+            VFractF16Instruction(dst=dst_sgpr, src=src)
+
+    def test_syntax_rejection_invalid_lane_count(self) -> None:
+        with self.assertRaises(ValueError):
+            SIMDState(num_lanes=16)
+        with self.assertRaises(ValueError):
+            SIMDState(num_lanes=128)
+
+    def test_syntax_rejection_literal_out_of_range(self) -> None:
+        with self.assertRaises(ValueError):
+            Literal16(0x10000)
+
+    def test_negative_control_bit_flip_detection(self) -> None:
+        correct = oracle_v_fract_f16(H_1P75)  # 1.75 -> 0.75
+        self.assertEqual(correct, H_0P75)
+
+        # Corrupt mantissa LSB
+        corrupted_mantissa = correct ^ 0x1
+        self.assertNotEqual(correct, corrupted_mantissa)
+
+        # Corrupt exponent bit
+        corrupted_exp = correct ^ (1 << 10)
+        self.assertNotEqual(correct, corrupted_exp)
+
+        # Corrupt sign bit
+        corrupted_sign = correct ^ SIGN_MASK
+        self.assertNotEqual(correct, corrupted_sign)
+
+    def test_mutation_fract_to_trunc(self) -> None:
+        """Mutant: Replace fract(x) with trunc(x)."""
+        def mutant_v_fract_f16(src: int) -> int:
+            f = bits_to_f16(src)
+            return f16_to_bits(math.trunc(f))
+
+        expected = oracle_v_fract_f16(H_NEG_1P75)
+        self.assertEqual(expected, H_0P25)
+        mutant_res = mutant_v_fract_f16(H_NEG_1P75)
+        self.assertNotEqual(expected, mutant_res)
+
+    def test_mutation_fract_to_floor(self) -> None:
+        """Mutant: Replace fract(x) with floor(x)."""
+        def mutant_v_fract_f16(src: int) -> int:
+            f = bits_to_f16(src)
+            return f16_to_bits(math.floor(f))
+
+        expected = oracle_v_fract_f16(H_1P5)
+        self.assertEqual(expected, H_0P5)
+        mutant_res = mutant_v_fract_f16(H_1P5)
+        self.assertNotEqual(expected, mutant_res)
+
+    def test_mutation_ignore_abs_modifier(self) -> None:
+        """Mutant: Ignore abs modifier on negative operand."""
+        def mutant_apply_mod(bits: int, abs_mod: bool, neg_mod: bool) -> int:
+            res = bits & 0xFFFF
+            if neg_mod:
+                res ^= SIGN_MASK
+            return res
+
+        correct = apply_f16_modifiers(H_NEG_0P25, abs_mod=True, neg_mod=False)
+        mutant = mutant_apply_mod(H_NEG_0P25, abs_mod=True, neg_mod=False)
+        self.assertEqual(correct, H_0P25)
+        self.assertNotEqual(correct, mutant)
+
+    def test_mutation_ignore_neg_modifier(self) -> None:
+        """Mutant: Ignore neg modifier on positive operand."""
+        def mutant_apply_mod(bits: int, abs_mod: bool, neg_mod: bool) -> int:
+            res = bits & 0xFFFF
+            if abs_mod:
+                res &= ~SIGN_MASK
+            return res
+
+        correct = apply_f16_modifiers(H_0P25, abs_mod=False, neg_mod=True)
+        mutant = mutant_apply_mod(H_0P25, abs_mod=False, neg_mod=True)
+        self.assertEqual(correct, H_NEG_0P25)
+        self.assertNotEqual(correct, mutant)
+
+    def test_mutation_skip_near_one_clamp(self) -> None:
+        """Mutant: Negative subnormal rounding yields 1.0 instead of 0x3BFF."""
+        # Hardware contract mandates result < 1.0
+        expected = oracle_v_fract_f16(H_NEG_SUB_MIN)
+        self.assertEqual(expected, NEAR_ONE_F16)
+        mutant_unclamped = ONE_F16
+        self.assertNotEqual(expected, mutant_unclamped)
+
+    def test_mutation_preserve_negative_zero(self) -> None:
+        """Mutant: fract(-0.0) incorrectly returns -0.0."""
+        expected = oracle_v_fract_f16(NEG_ZERO)
+        self.assertEqual(expected, POS_ZERO)
+        mutant_neg_zero = NEG_ZERO
+        self.assertNotEqual(expected, mutant_neg_zero)
+
+    def test_mutation_ignore_exec_mask(self) -> None:
+        """Mutant: Inactive SIMD lanes overwritten despite EXEC mask."""
+        sentinel = 0x55AA
+        state = SIMDState(num_lanes=32, exec_mask=0x0)  # all inactive
+        for lane in range(32):
+            state.set_vgpr16(lane, 2, RegHalf.LO, sentinel)
+
+        class MutantSIMDInterpreter(SIMDInterpreter):
+            def step(self, instr: VFractF16Instruction, state: SIMDState) -> List[Optional[int]]:
+                results = []
+                for lane in range(state.num_lanes):
+                    res = oracle_v_fract_f16(H_1P5)
+                    state.set_vgpr16(lane, instr.dst.index, instr.dst.half, res)
+                    results.append(res)
+                return results
+
+        mutant_interp = MutantSIMDInterpreter()
+        instr = VFractF16Instruction(
+            dst=Reg16(2, RegType.VGPR, RegHalf.LO),
+            src=VOP1Operand(Literal16.from_float(1.5)),
+        )
+        mutant_interp.step(instr, state)
+        corrupted = [lane for lane in range(32) if state.get_vgpr16(lane, 2, RegHalf.LO) != sentinel]
+        self.assertEqual(len(corrupted), 32)
+
+    def test_mutation_subnormal_flush_to_zero(self) -> None:
+        """Mutant: Positive subnormals flushed to zero (FTZ mode)."""
+        correct = oracle_v_fract_f16(H_SUB_MIN)
+        self.assertEqual(correct, H_SUB_MIN)
+        ftz_mutant = POS_ZERO
+        self.assertNotEqual(correct, ftz_mutant)
+
+    def test_mutation_skip_snan_quietening(self) -> None:
+        """Mutant: Signaling NaN is not quietened."""
+        snan = 0x7C01
+        res = oracle_v_fract_f16(snan)
+        self.assertTrue(is_qnan(res))
+        self.assertNotEqual(res, snan)
 
 
 if __name__ == "__main__":

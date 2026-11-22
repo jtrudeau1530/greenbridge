@@ -633,6 +633,28 @@ class ArchiveTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "no clip dictionary"):
             anim_clips.decode_one(self.rpf, self.offsets[3], 2)
 
+    def test_decode_prints_track_values_from_a_six_page_dictionary(self) -> None:
+        data = bytearray(two_sequence_dictionary("six-pages@dict"))
+        page_map = struct.unpack_from("<Q", data, 8)[0] - SYSTEM
+        data[page_map + 8] = 6
+        pages = [data[i:i + 256] for i in range(0, 5 * 256, 256)] + [data[5 * 256:]]
+        self.assertTrue(all(len(page) >= 64 for page in pages))
+        path = os.path.join(self.tmp.name, "six-pages.rpf")
+        root, *_ = write_rpf(path, pages)
+        _, summary = anim_clips.scan(path)
+        self.assertEqual(summary["pages"], {"6": 1})
+        self.assertEqual(summary["counts"]["animations_decoded"], 1)
+
+        result = subprocess.run(
+            [sys.executable, "-I", TOOL, path, "--decode", str(root), "--frames", "3"],
+            capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        animation = json.loads(result.stdout)["packs"][0]["animations"][0]
+        self.assertEqual(animation["decoded_frames"], NF)
+        self.assertEqual(animation["decoded"]["2"], [[1.0, 2.0, 3.0]] * 3)
+        self.assertEqual(animation["decoded"]["4"], [[0.0], [1.5], [3.0]])
+
     def test_budget_rejects_nan_and_negative(self):
         for value in ("nan", "-1"):
             r = subprocess.run(

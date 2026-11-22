@@ -783,7 +783,14 @@ class PipelineExecutionTest(unittest.TestCase):
         self.tmp.cleanup()
 
     @patch("subprocess.run")
-    def test_main_cli_pipeline_success(self, mock_run):
+    def test_main_cli_pipeline_success(self, mock_run) -> None:
+        self.assert_pipeline_outcome(mock_run, 64 * 64 * 16, "identical")
+
+    @patch("subprocess.run")
+    def test_main_rejects_identical_truncated_images(self, mock_run) -> None:
+        self.assert_pipeline_outcome(mock_run, 16, "dispatch form failed to run")
+
+    def assert_pipeline_outcome(self, mock_run, image_size: int, expected: str) -> None:
         import json
 
         # Prepare synthetic index
@@ -833,7 +840,7 @@ class PipelineExecutionTest(unittest.TestCase):
                 # Harness call
                 raw_path = args[3]
                 with open(raw_path, "wb") as f:
-                    f.write(b"\x00\x00\x00\x00" * 16)
+                    f.write(bytes(image_size))
                 return SimpleNamespace(returncode=0, stdout="OK")
 
         mock_run.side_effect = side_effect
@@ -854,7 +861,7 @@ class PipelineExecutionTest(unittest.TestCase):
         self.assertTrue(os.path.isfile(outcomes_file))
         with open(outcomes_file, "r", encoding="utf-8") as f:
             content = f.read()
-        self.assertIn("ps_test\tidentical", content)
+        self.assertEqual(content, f"ps_test\t{expected}\n")
 
 
 if __name__ == "__main__":
