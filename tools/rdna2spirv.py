@@ -4251,6 +4251,32 @@ class Gen:
             self.emit(f"{m} = OpBitwiseAnd %uint {s} {self.cu(0xFF)}")
             self.emit(f"{r} = OpConvertUToF %float {m}")
             self.dst(a[0], self.tou(self.clamp_mods(r, mods)))
+        elif op in ("v_cvt_flr_i32_f32", "v_cvt_rpi_i32_f32"):
+            # RDNA ISA pseudocode: flr = f32_to_i32(floor(S0)), rpi = f32_to_i32(floor(S0 + 0.5)), the + 0.5 rounded
+            # in binary32 like any f32 add. f32_to_i32 saturates as v_cvt_i32_f32 does (#300): +-2^31 and beyond go to
+            # INT_MAX / INT_MIN, NaN to 0. Source neg/abs apply before the rounding.
+            x = self.src_f(a[1])
+            if op == "v_cvt_rpi_i32_f32":
+                t = self.tmp()
+                self.emit(f"{t} = OpFAdd %float {x} {self.fconst(0.5)}")
+                x = t
+            fl = self.tmp()
+            self.emit(f"{fl} = OpExtInst %float %glsl Floor {x}")
+            bits = self.tou(fl)
+            magnitude, negative, not_nan, bound, in_range, saturated, safe, signed, converted, result = \
+                (self.tmp() for _ in range(10))
+            self.emit(f"{magnitude} = OpBitwiseAnd %uint {bits} {self.cu(0x7FFFFFFF)}")
+            self.emit(f"{in_range} = OpULessThan %bool {magnitude} {self.cu(0x4F000000)}")  # |x| < 2^31
+            self.emit(f"{negative} = OpINotEqual %bool {bits} {magnitude}")
+            self.emit(f"{not_nan} = OpULessThan %bool {magnitude} {self.cu(0x7F800001)}")
+            self.emit(f"{bound} = OpSelect %uint {negative} {self.cu(0x80000000)} {self.cu(0x7FFFFFFF)}")
+            self.emit(f"{saturated} = OpSelect %uint {not_nan} {bound} {self.cu(0)}")
+            # Convert only an in-range operand: SPIR-V leaves the out-of-range conversion undefined.
+            self.emit(f"{safe} = OpSelect %uint {in_range} {bits} {self.cu(0)}")
+            self.emit(f"{signed} = OpConvertFToS %int {self.tof(safe)}")
+            self.emit(f"{converted} = OpBitcast %uint {signed}")
+            self.emit(f"{result} = OpSelect %uint {in_range} {converted} {saturated}")
+            self.dst(a[0], result)
         elif op in ("v_cvt_u32_f32", "v_cvt_i32_f32"):
             # Compare binary32 words before converting: the raw SPIR-V conversion
             # must only see a representable operand, even when its result is discarded.
