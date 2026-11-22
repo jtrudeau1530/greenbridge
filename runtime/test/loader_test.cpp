@@ -397,6 +397,42 @@ void test_imports() {
     }
 }
 
+void test_import_name_rvas() {
+    for (bool delay : {false, true}) {
+        auto img = make_import_image("testshim.dll", "F");
+        if (delay) {
+            std::fill(img.begin() + 0x200, img.begin() + 0x240, uint8_t{0});
+            auto* d = reinterpret_cast<IMAGE_DELAYLOAD_DESCRIPTOR*>(img.data() + 0x200);
+            d->Attributes.AllAttributes = 1;
+            d->DllNameRVA = 0x1060;
+            d->ImportNameTableRVA = 0x1100;
+            d->ImportAddressTableRVA = 0x1180;
+            auto* nt = nt_of(img);
+            nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT] = {};
+            auto& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT];
+            dir.VirtualAddress = 0x1000;
+            dir.Size = 2 * sizeof(IMAGE_DELAYLOAD_DESCRIPTOR);
+        }
+        const char* valid = delay ? "a valid delay-import name RVA loads" : "a valid import name RVA loads";
+        std::string error;
+        if (load(write_image(img), error) != 0)
+            failed(valid, error);
+        else
+            pass(valid);
+
+        *reinterpret_cast<uint64_t*>(img.data() + 0x300) = (1ull << 32) | 0x1120;
+        const char* invalid = delay ? "a delay-import name RVA with high bits is rejected"
+                                    : "an import name RVA with high bits is rejected";
+        error.clear();
+        if (load(write_image(img), error) == 0)
+            failed(invalid, "the image loaded");
+        else if (error.find("an import name runs past the image") == std::string::npos)
+            failed(invalid, error);
+        else
+            pass(invalid);
+    }
+}
+
 void test_delay_imports() {
     {
         auto img = make_image();
@@ -1099,6 +1135,7 @@ int main() {
         test_relocations();
         test_exports();
         test_imports();
+        test_import_name_rvas();
         test_delay_imports();
         test_initialise();
         test_initialise_rejects();

@@ -1051,8 +1051,8 @@ void Loader::bind_imports(Module& m) {
             uint16_t ord = by_ord ? (uint16_t)IMAGE_ORDINAL64(lookup->u1.Ordinal) : 0;
             std::string name;
             if (!by_ord) {
+                require_range(m.name, lookup->u1.AddressOfData, sizeof(uint16_t), m.size, "an import name");
                 uint32_t hint = static_cast<uint32_t>(lookup->u1.AddressOfData);
-                require_range(m.name, hint, sizeof(uint16_t), m.size, "an import name");
                 name = read_string(m.name, m.base, m.size, hint + sizeof(uint16_t), "an import name");
             }
             at<IMAGE_THUNK_DATA64>(m.base, static_cast<uint32_t>(iat_rva))->u1.Function =
