@@ -390,6 +390,71 @@ int main() {
         EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
         EXPECT(SUCCEEDED(queue->Signal(fence.p, 3)) && SUCCEEDED(fence->SetEventOnCompletion(3, nullptr)));
 
+        // Each parent draw starts with a 0.25 blend factor, then executes one of four bundles.
+        // Empty and reset bundles preserve it. Explicit zero and nullptr replace it with zero and one.
+        {
+            D3D12_GRAPHICS_PIPELINE_STATE_DESC blend_desc = fullscreen_desc;
+            blend_desc.BlendState.RenderTarget[0] = {
+                TRUE, FALSE, D3D12_BLEND_BLEND_FACTOR, D3D12_BLEND_ZERO, D3D12_BLEND_OP_ADD,
+                D3D12_BLEND_ONE, D3D12_BLEND_ZERO, D3D12_BLEND_OP_ADD, D3D12_LOGIC_OP_NOOP,
+                D3D12_COLOR_WRITE_ENABLE_ALL};
+            Ref<ID3D12PipelineState> blend_pso;
+            EXPECT(SUCCEEDED(device->CreateGraphicsPipelineState(&blend_desc, IID_PPV_ARGS(&blend_pso.p))));
+            Ref<ID3D12CommandAllocator> bundle_allocator;
+            EXPECT(SUCCEEDED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_BUNDLE,
+                                                           IID_PPV_ARGS(&bundle_allocator.p))));
+            constexpr UINT strip_count = 4, strip_width = size / strip_count;
+            constexpr std::array<std::uint8_t, strip_count> expected_red = {64, 0, 255, 64};
+            std::array<Ref<ID3D12GraphicsCommandList>, strip_count> bundles;
+            const float zero_factor[4] = {0, 0, 0, 0};
+            const float parent_factor[4] = {0.25f, 0.25f, 0.25f, 0.25f};
+            for (UINT i = 0; i < strip_count; ++i) {
+                auto& bundle = bundles[i];
+                EXPECT(SUCCEEDED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_BUNDLE, bundle_allocator.p,
+                                                           nullptr, IID_PPV_ARGS(&bundle.p))));
+                if (i == 1 || i == 3) bundle->OMSetBlendFactor(zero_factor);
+                if (i == 2) bundle->OMSetBlendFactor(nullptr);
+                EXPECT(bundle->Close() == S_OK);
+                if (i == 3) {
+                    EXPECT(SUCCEEDED(bundle->Reset(bundle_allocator.p, nullptr)));
+                    EXPECT(bundle->Close() == S_OK);
+                }
+            }
+
+            EXPECT(SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.p, blend_pso.p)));
+            list->ResourceBarrier(1, &to_target);
+            list->ClearRenderTargetView(rtv, blue, 0, nullptr);
+            list->SetGraphicsRootSignature(root.p);
+            list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            list->RSSetViewports(1, &viewport);
+            list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+            list->SetGraphicsRootConstantBufferView(1, upload_va + 512);
+            for (UINT i = 0; i < strip_count; ++i) {
+                const D3D12_RECT strip{LONG(i * strip_width), 0, LONG((i + 1) * strip_width), LONG(size)};
+                list->RSSetScissorRects(1, &strip);
+                list->OMSetBlendFactor(parent_factor);
+                list->ExecuteBundle(bundles[i].p);
+                list->DrawInstanced(3, 1, 0, 0);
+            }
+            list->ResourceBarrier(1, &to_copy);
+            list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+            EXPECT(list->Close() == S_OK);
+            queue->ExecuteCommandLists(1, lists);
+            EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
+            EXPECT(SUCCEEDED(queue->Signal(fence.p, 4)) && SUCCEEDED(fence->SetEventOnCompletion(4, nullptr)));
+            const auto* result = static_cast<const std::uint8_t*>(mapped);
+            for (UINT row = 0; row < size; ++row) {
+                for (UINT col = 0; col < size; ++col) {
+                    const auto* got = result + row * 256 + col * 4;
+                    const auto red = expected_red[col / strip_width];
+                    if (got[0] == red && got[1] == 0 && got[2] == 0 && got[3] == 255) continue;
+                    std::fprintf(stderr, "bundle blend pixel (%u, %u): got %u,%u,%u,%u, expected red %u\n",
+                                 col, row, got[0], got[1], got[2], got[3], red);
+                    return 1;
+                }
+            }
+        }
+
         // A draw without a topology is invalid; Close reports it.
         EXPECT(SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.p, pso.p)));
         list->SetGraphicsRootSignature(root.p);
