@@ -245,7 +245,8 @@ class StageValidationAndSequencingTest(unittest.TestCase):
             call.assets(os.path.abspath(self.game_dir), os.path.abspath(self.work_dir), False, unittest.mock.ANY),
             call.runtime(os.path.abspath(self.game_dir), os.path.abspath(self.out_dir), unittest.mock.ANY, None,
                          unittest.mock.ANY),
-            call.pipelines(os.path.abspath(self.work_dir), os.path.abspath(self.out_dir), unittest.mock.ANY),
+            call.pipelines(os.path.abspath(self.work_dir), os.path.abspath(self.out_dir), unittest.mock.ANY,
+                           runtime_build=None),
         ]
         self.assertEqual(manager.mock_calls, expected_calls)
 
