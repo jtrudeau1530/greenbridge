@@ -1155,5 +1155,121 @@ class TestSaluAndSaveexecB64RegisterAliasing(unittest.TestCase):
         self.assertEqual(state.exec, 0xFEEDFACECAFEBEEF)
 
 
+class TestSaluAndSaveexecB64ConditionCodes(unittest.TestCase):
+    """Unit tests for condition codes, status flags, and carry/borrow generation."""
+
+    def test_scc_monotonic_zero_absorption(self) -> None:
+        """Verify when EXEC is zero, any s_and_saveexec_b64 maintains zero EXEC and SCC=0."""
+        state = ScalarRegisterState(exec=0, scc=0)
+        interp = ScalarSALUInterpreter(state)
+
+        for mask in (ALL_LANES_64, EVEN_LANES_64, 1, 0x8000000000000000):
+            inst = Instruction(
+                Opcode.S_AND_SAVEEXEC_B64,
+                dst=Register(RegKind.SGPR, 0, size=64),
+                src0=Operand(imm=mask, size=64),
+            )
+            interp.step(inst)
+            self.assertEqual(state.read_sgpr64(0), 0)
+            self.assertEqual(state.exec, 0)
+            self.assertEqual(state.scc, 0, f"SCC violated for mask {mask:#x}")
+
+    def test_scc_transition_matrix(self) -> None:
+        """Verify full 2x2 state transition matrix for SCC."""
+        interp = ScalarSALUInterpreter()
+
+        # 0 -> 1 transition
+        interp.state.exec = ALL_LANES_64
+        interp.state.scc = 0
+        inst_to_1 = Instruction(
+            Opcode.S_AND_SAVEEXEC_B64,
+            dst=Register(RegKind.SGPR, 0, size=64),
+            src0=Operand(imm=1, size=64),
+        )
+        interp.step(inst_to_1)
+        self.assertEqual(interp.state.scc, 1)
+
+        # 1 -> 1 transition
+        interp.state.exec = ALL_LANES_64
+        interp.state.scc = 1
+        inst_keep_1 = Instruction(
+            Opcode.S_AND_SAVEEXEC_B64,
+            dst=Register(RegKind.SGPR, 0, size=64),
+            src0=Operand(imm=EVEN_LANES_64, size=64),
+        )
+        interp.step(inst_keep_1)
+        self.assertEqual(interp.state.scc, 1)
+
+        # 1 -> 0 transition
+        interp.state.exec = ALL_LANES_64
+        interp.state.scc = 1
+        inst_to_0 = Instruction(
+            Opcode.S_AND_SAVEEXEC_B64,
+            dst=Register(RegKind.SGPR, 0, size=64),
+            src0=Operand(imm=0, size=64),
+        )
+        interp.step(inst_to_0)
+        self.assertEqual(interp.state.scc, 0)
+
+        # 0 -> 0 transition
+        interp.state.exec = 0
+        interp.state.scc = 0
+        inst_keep_0 = Instruction(
+            Opcode.S_AND_SAVEEXEC_B64,
+            dst=Register(RegKind.SGPR, 0, size=64),
+            src0=Operand(imm=0, size=64),
+        )
+        interp.step(inst_keep_0)
+        self.assertEqual(interp.state.scc, 0)
+
+    def test_scc_divergence_branching_scc0_scc1(self) -> None:
+        """Verify control flow branching on SCC0 and SCC1 after saveexec."""
+        prog = Program()
+        # s_and_saveexec_b64 s[0:1], 0 -> exec=0, scc=0
+        prog.add_instruction(Instruction(Opcode.S_AND_SAVEEXEC_B64, dst=Register(RegKind.SGPR, 0, size=64),
+                                         src0=Operand(imm=0, size=64)))
+        # s_cbranch_scc0 branch_target
+        prog.add_instruction(Instruction(Opcode.S_CBRANCH_SCC0, label_target="scc_zero_target"))
+        prog.add_instruction(Instruction(Opcode.S_MOV_B32, dst=Register(RegKind.SGPR, 10, size=32),
+                                         src0=Operand(imm=111, size=32)))
+        prog.add_label("scc_zero_target")
+        prog.add_instruction(Instruction(Opcode.S_MOV_B32, dst=Register(RegKind.SGPR, 10, size=32),
+                                         src0=Operand(imm=222, size=32)))
+        prog.add_instruction(Instruction(Opcode.S_ENDPGM))
+
+        interp = ScalarSALUInterpreter()
+        state = interp.run(prog)
+        self.assertEqual(state.read_sgpr32(10), 222)
+
+    def test_status_flags_carry_borrow_unaffected(self) -> None:
+        """Verify execution leaves non-SCC architectural status invariant."""
+        state = ScalarRegisterState(exec=ALL_LANES_64, m0=0xDEADBEEF)
+        interp = ScalarSALUInterpreter(state)
+
+        inst = Instruction(
+            Opcode.S_AND_SAVEEXEC_B64,
+            dst=Register(RegKind.SGPR, 2, size=64),
+            src0=Operand(imm=0x12345678, size=64),
+        )
+        interp.step(inst)
+        self.assertEqual(state.m0, 0xDEADBEEF)
+
+    def test_scc_single_bit_boundary_detection(self) -> None:
+        """Verify MSB (lane 63) and LSB (lane 0) boundary bits accurately trigger SCC=1."""
+        interp = ScalarSALUInterpreter()
+
+        # Lane 0
+        interp.state.exec = ALL_LANES_64
+        interp.step(Instruction(Opcode.S_AND_SAVEEXEC_B64, dst=Register(RegKind.SGPR, 0, size=64),
+                                src0=Operand(imm=1, size=64)))
+        self.assertEqual(interp.state.scc, 1)
+
+        # Lane 63
+        interp.state.exec = ALL_LANES_64
+        interp.step(Instruction(Opcode.S_AND_SAVEEXEC_B64, dst=Register(RegKind.SGPR, 0, size=64),
+                                src0=Operand(imm=1 << 63, size=64)))
+        self.assertEqual(interp.state.scc, 1)
+
+
 if __name__ == "__main__":
     unittest.main()
