@@ -1,6 +1,8 @@
 """Synthetic tests for tools/opus_tags.py (no game data: invented banks, names and subtitles)."""
+import codecs
 import csv
 import os
+from pathlib import Path
 import struct
 import subprocess
 import sys
@@ -179,6 +181,15 @@ class TestFolder(unittest.TestCase):
                            capture_output=True, text=True)
         self.assertEqual(r.returncode, 2)
         self.assertEqual(len(r.stderr.strip().splitlines()), 1)
+
+    def test_cli_reads_utf8_bom_in_names_and_dialogue(self):
+        for path in map(Path, (self.names, self.dialogue)):
+            path.write_bytes(codecs.BOM_UTF8 + path.read_bytes())
+        result = subprocess.run([sys.executable, "-I", TOOL, self.opus, "--names", self.names,
+                                 "--source", "story", "--dialogue", self.dialogue], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.tags("story", "bank_02", "1FFFFFFF.ogg"), ["TITLE=door_slam_03"])
+        self.assertIn("SUBTITLE=Move. Now.", self.tags("story", "bank_01", "0ABCDEF1.ogg"))
 
 
 if __name__ == "__main__":
