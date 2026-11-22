@@ -6,6 +6,7 @@ shader was reported "clean" (and make_game.py translated nothing). The probe now
 
     python -I tests/test_shader_disasm.py
 """
+import json
 import os
 import subprocess
 import sys
@@ -183,6 +184,18 @@ class DisasmInputTest(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(os.listdir(out), ["b_shader.s"])
+
+    def test_unpack_index_selects_current_blobs(self):
+        self.write("current.fssm", fssm())
+        self.write("obsolete.fssm", fssm())
+        index = os.path.join(self.dir, "fssm_index.json")
+        with open(index, "w", encoding="utf-8") as f:
+            json.dump([{"name": "current"}], f)
+        out = os.path.join(self.dir, "out")
+        result = self.run_tool(self.src, "--out", out, "--unpack-index", index)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(os.listdir(out), ["current.s"])
+        self.assertTrue(os.path.isfile(os.path.join(self.src, "obsolete.fssm")))
 
     def test_jobs_and_limit_must_be_at_least_one(self):
         self.write("one.fssm", fssm())

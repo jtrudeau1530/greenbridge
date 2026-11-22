@@ -21,7 +21,7 @@ The FSSM blob is the precompiled RDNA2 program plus its metadata. It contains th
 the code.
 
 Usage:
-    python -I fssm_unpack.py <carved_shader_dir> [--payload first|last]
+    python -I fssm_unpack.py <carved_shader_dir> [--carve-index FILE] [--payload first|last]
     (writes <dir>/fssm/<name>.fssm and fssm_index.json)
 """
 import argparse
@@ -31,6 +31,9 @@ import struct
 import sys
 import zlib
 from collections import Counter
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from shader_stage_manifest import shader_stems  # noqa: E402
 
 # Defensive per-blob ceiling, not a maximum defined by the XBCH format.
 # 64 MiB matches the repository's existing per-resource cap in tools/world_index.py.
@@ -107,6 +110,7 @@ def unpack(dxbc: bytes, payload: str = "last"):
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="Unpack the FSSM program from each carved shader container.")
     ap.add_argument("src", help="carved shader directory")
+    ap.add_argument("--carve-index", help="unpack only the DXBC files listed in this carve index")
     ap.add_argument("--payload", choices=("first", "last"), default="last",
                     help="tag-0x0D payload when a container has more than one (default: last)")
     a = ap.parse_args(argv)
@@ -117,18 +121,24 @@ def main(argv=None) -> int:
         print(f"ERROR: {src} {what}. Give the folder with the carved .dxbc files.", file=sys.stderr)
         return 2
     try:
-        with os.scandir(src) as entries:
-            shaders = sorted((entry for entry in entries
-                              if entry.name.endswith(".dxbc") and entry.is_file()),
-                             key=lambda entry: entry.name)
-    except OSError as e:
-        print(f"ERROR: cannot list {src}: {e.strerror or e}", file=sys.stderr)
+        if a.carve_index:
+            names = shader_stems(a.carve_index, "file", ".dxbc")
+            shaders = sorted(os.path.join(src, name + ".dxbc") for name in names)
+            for path in shaders:
+                if not os.path.isfile(path):
+                    raise ValueError(f"{a.carve_index}: declared shader file is missing: {path}")
+        else:
+            with os.scandir(src) as entries:
+                shaders = sorted(entry.path for entry in entries
+                                 if entry.name.endswith(".dxbc") and entry.is_file())
+    except (OSError, ValueError) as e:
+        print(f"ERROR: cannot list shaders in {src}: {e}", file=sys.stderr)
         return 2
     out = os.path.join(src, "fssm")
     os.makedirs(out, exist_ok=True)
     rows, problems = [], Counter()
     for shader in shaders:
-        with open(shader.path, "rb") as f:
+        with open(shader, "rb") as f:
             d = f.read()
         try:
             fssm, ents = unpack(d, payload=a.payload)
@@ -138,7 +148,7 @@ def main(argv=None) -> int:
         if fssm is None:
             problems["no XBCH"] += 1
             continue
-        stem = shader.name[:-5]
+        stem = os.path.basename(shader)[:-5]
         with open(os.path.join(out, stem + ".fssm"), "wb") as f:
             f.write(fssm)
         ends = [i for i in range(0, len(fssm) - 3, 4) if fssm[i:i + 4] == b"\x00\x00\x81\xbf"]

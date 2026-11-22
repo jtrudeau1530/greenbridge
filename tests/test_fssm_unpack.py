@@ -463,6 +463,20 @@ class TestMainDirectoryProcessing(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
+    def test_carve_index_selects_current_containers(self):
+        shader = make_dxbc([(b"DXIL", make_xdat({0x0D: make_xbch(make_fssm())}))])
+        for name in ("current", "obsolete"):
+            with open(os.path.join(self.src, name + ".dxbc"), "wb") as f:
+                f.write(shader)
+        index = os.path.join(self.src, "index.json")
+        with open(index, "w", encoding="utf-8") as f:
+            json.dump([{"file": "current.dxbc"}], f)
+        result = subprocess.run([sys.executable, "-I", TOOL, self.src, "--carve-index", index],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(os.listdir(os.path.join(self.src, "fssm")), ["current.fssm"])
+        self.assertTrue(os.path.isfile(os.path.join(self.src, "obsolete.dxbc")))
+
     def test_main_rejects_invalid_fssm_magic(self):
         bad_payload = b"JUNK\x01\x01" + bytes(58)
         bad_dxbc = make_dxbc([(b"DXIL", make_xdat({0x0D: make_xbch(bad_payload)}))])

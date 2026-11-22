@@ -101,7 +101,11 @@ class RecordedFlagsTest(unittest.TestCase):
     def touch(self, *parts):
         p = os.path.join(*parts)
         os.makedirs(os.path.dirname(p), exist_ok=True)
-        open(p, "w").close()
+        with open(p, "w", encoding="utf-8") as f:
+            if p == os.path.join(self.dxbc, "index.json"):
+                json.dump([{"file": "shader.dxbc"}], f)
+            elif p == os.path.join(self.dxbc, "fssm_index.json"):
+                json.dump([{"name": "shader"}], f)
 
     def run_stage(self, fallbacks=()):
         ran = []

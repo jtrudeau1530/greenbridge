@@ -487,8 +487,8 @@ class PreflightPrerequisiteTest(PreflightTestBase):
         for name, changed, settings, legacy_layout, reusable in cases:
             with self.subTest(name=name), tempfile.TemporaryDirectory() as work:
                 files = {
-                    "dxbc/index.json": "{}",
-                    "dxbc/fssm_index.json": "{}",
+                    "dxbc/index.json": '[{"file": "shader.dxbc"}]',
+                    "dxbc/fssm_index.json": '[{"name": "shader"}]',
                     "dxbc/disasm.done": "test llvm-mc 21",
                     "spirv/index.json": "{}",
                     "spirv/translation_sources.sha256": fingerprint,

@@ -88,15 +88,21 @@ class ShaderStageResumeTest(unittest.TestCase):
     def touch(self, *parts):
         p = os.path.join(*parts)
         os.makedirs(os.path.dirname(p), exist_ok=True)
-        open(p, "w").close()
+        with open(p, "w", encoding="utf-8") as f:
+            if p == os.path.join(self.dxbc, "index.json"):
+                json.dump([{"file": "s0.dxbc"}], f)
+            elif p == os.path.join(self.dxbc, "fssm_index.json"):
+                json.dump([{"name": "s0"}], f)
 
     def fake_py(self, tool, *args):
         self.ran.append(tool)
         if tool == "shader_carve.py":
             self.touch(self.dxbc, "index.json")
         elif tool == "fssm_unpack.py":
+            self.assertEqual(args[-2:], ("--carve-index", os.path.join(self.dxbc, "index.json")))
             self.touch(self.dxbc, "fssm_index.json")
         elif tool == "shader_disasm.py":
+            self.assertEqual(args[1:3], ("--unpack-index", os.path.join(self.dxbc, "fssm_index.json")))
             os.makedirs(os.path.join(self.dxbc, "disasm"), exist_ok=True)
 
     def fake_translate(self, disasm, spirv, jobs, emulate=False, fallbacks=()):
@@ -197,6 +203,22 @@ class ShaderStageResumeTest(unittest.TestCase):
         self.run_stage()
         os.remove(os.path.join(self.dxbc, "fssm_index.json"))
         self.assertEqual(self.run_stage(), ["fssm_unpack.py", "shader_disasm.py", "translate"])
+
+    def test_old_unpack_index_with_a_noncurrent_shader_is_refreshed(self):
+        self.run_stage()
+        with open(os.path.join(self.dxbc, "fssm_index.json"), "w", encoding="utf-8") as f:
+            json.dump([{"name": "s0"}, {"name": "removed"}], f)
+        self.assertFalse(make_game.shader_outputs_reusable(self.work, False, False))
+        self.assertEqual(self.run_stage(), ["fssm_unpack.py", "shader_disasm.py", "translate"])
+        self.assertEqual(self.run_stage(), [])
+
+    def test_old_disassembly_with_a_noncurrent_shader_is_refreshed(self):
+        self.run_stage()
+        self.touch(self.dxbc, "disasm", "removed.s")
+        self.assertFalse(make_game.shader_outputs_reusable(self.work, False, False))
+        self.assertEqual(self.run_stage(), ["shader_disasm.py", "translate"])
+        self.assertFalse(os.path.exists(os.path.join(self.dxbc, "disasm", "removed.s")))
+        self.assertEqual(self.run_stage(), [])
 
     def test_legacy_folder_without_llvm_version_refreshes_disassembly_once(self):
         self.touch(self.dxbc, "index.json")

@@ -6,7 +6,7 @@ The code ends with s_endpgm (0xBF810000). If the header guess doesn't hold for a
 scanning back from the first s_endpgm to the start that decodes with no invalid instructions.
 
 Usage:
-    python -I shader_disasm.py <fssm dir or file> [--out DIR] [--mcpu gfx1013] [--limit N]
+    python -I shader_disasm.py <fssm dir or file> [--unpack-index FILE] [--out DIR] [--mcpu gfx1013] [--limit N]
 Writes <out>/<name>.s and prints a summary (decoded cleanly / with invalid words / failed).
 Set LLVM_MC to llvm-mc's path, or to a whole command such as
 'wsl -d Ubuntu -e /usr/lib/llvm-21/bin/llvm-mc' when the tool is not on PATH.
@@ -20,6 +20,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from mc_command import mc_command  # noqa: E402
+from shader_stage_manifest import shader_stems  # noqa: E402
 
 TRIPLE = "amdgcn--amdpal"
 ENDPGM = b"\x00\x00\x81\xbf"
@@ -130,17 +131,30 @@ def one(path, out, mcpu):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("src")
+    ap.add_argument("--unpack-index", help="disassemble only the FSSMs listed in this unpack index")
     ap.add_argument("--out")
     ap.add_argument("--mcpu", default="gfx1013")
     ap.add_argument("--limit", type=positive_int)
     ap.add_argument("--jobs", type=positive_int, default=max(1, (os.cpu_count() or 2) // 2))
     a = ap.parse_args()
     if os.path.isfile(a.src):
+        if a.unpack_index:
+            ap.error("--unpack-index requires an FSSM directory")
         files = [a.src]
     elif os.path.isdir(a.src):
-        with os.scandir(a.src) as entries:
-            files = sorted(entry.path for entry in entries
-                           if entry.name.endswith(".fssm") and entry.is_file())
+        try:
+            if a.unpack_index:
+                names = shader_stems(a.unpack_index, "name")
+                files = sorted(os.path.join(a.src, name + ".fssm") for name in names)
+                for path in files:
+                    if not os.path.isfile(path):
+                        raise ValueError(f"{a.unpack_index}: declared FSSM file is missing: {path}")
+            else:
+                with os.scandir(a.src) as entries:
+                    files = sorted(entry.path for entry in entries
+                                   if entry.name.endswith(".fssm") and entry.is_file())
+        except (OSError, ValueError) as e:
+            fail(f"cannot list shaders in {a.src}: {e}")
     else:
         fail(f"{a.src} is not a file or folder")
     if not files:
