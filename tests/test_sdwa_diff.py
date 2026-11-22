@@ -132,9 +132,18 @@ class Generator(unittest.TestCase):
         self.assertEqual(set(d.KNOWN_DIVERGENCES), {"shift-const-sel"})
         lines = self.lines()
         self.assertTrue(any(d.OPS[line.split()[0][:-5]][2] == 16 and "dst_sel:DWORD" in line for line in lines))
-        self.assertTrue(any(d.OPS[line.split()[0][:-5]][0] == "f16" and
-                            any(f", {c} " in line or f", {c}," in line for c in d.FLOAT_CONSTS) and
-                            "src0_sel:DWORD" not in line for line in lines))
+        # each source on its own: the same operand is a float constant and its own selector is not DWORD
+        selected = set()
+        for line in lines:
+            op, args, mods, _ = d.parse(line)
+            family, form = d.OPS[op][:2]
+            if family != "f16":
+                continue
+            srcs = args[1:3] if form != "vop1" else args[1:2]
+            for i, a in enumerate(srcs):
+                if a in d.FLOAT_CONSTS and mods.get(f"src{i}_sel", "DWORD") != "DWORD":
+                    selected.add(i)
+        self.assertEqual(selected, {0, 1})
 
 
 class Translated(unittest.TestCase):
