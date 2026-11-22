@@ -411,6 +411,11 @@ values are not recoverable by name enumeration. `common.rpf` contains one variat
 `joaat32` of all 67 keys gives 0 hits against the 18. The `3cba3fe6` float (0.942 / 0.971 for
 Lucia and Monalisa) is a body/height scale, not a name. There is no component/outfit-name
 manager in `common.rpf`; `outfit_NN` exists only as a hash in the packs table.
+values are not recoverable by name enumeration. `common.rpf` holds `CPedVariationBodyTypeManager`
+(77,422 bytes, 67 keys) and `CPedComponentSetManager`; neither maps a variation index to a
+drawable plus texture. The first manager's keys are literal model names, and `joaat32` of all
+67 gives 0 hits against the 18. The `3cba3fe6` float (0.942 / 0.971 for Lucia and Monalisa) is a
+per-character scale, not a name; `outfit_NN` exists only as a hash in the packs table.
 
 The entities linked to Mandy carry three different per-state archetype hashes
 (`0x18BB2550`, `0x73E83886`, `0x57DDFFC2`), which fits her outfit changing between states, not
