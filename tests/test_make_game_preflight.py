@@ -513,7 +513,10 @@ class PreflightPrerequisiteTest(PreflightTestBase):
                         with open(path, "w", encoding="utf-8") as handle:
                             handle.write(content + "\n")
                 disasm_parts = ("disasm",) if legacy_layout else ("dxbc", "disasm")
-                os.makedirs(os.path.join(shader_root, *disasm_parts))
+                disasm = os.path.join(shader_root, *disasm_parts)
+                os.makedirs(disasm)
+                with open(os.path.join(disasm, "shader.s"), "w", encoding="utf-8", newline="\n") as f:
+                    f.write("synthetic listing\n")
                 with mock.patch("sys.version_info", (3, 12, 0)), \
                      mock.patch("make_game.llvm_mc_signature", return_value="test llvm-mc 21"), \
                      mock.patch("make_game.tool_available", return_value=True), \

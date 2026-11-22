@@ -106,6 +106,8 @@ class RecordedFlagsTest(unittest.TestCase):
                 json.dump([{"file": "shader.dxbc"}], f)
             elif p == os.path.join(self.dxbc, "fssm_index.json"):
                 json.dump([{"name": "shader"}], f)
+            elif p.endswith(".s"):
+                f.write("synthetic listing\n")
 
     def run_stage(self, fallbacks=()):
         ran = []
@@ -116,7 +118,7 @@ class RecordedFlagsTest(unittest.TestCase):
             elif tool == "fssm_unpack.py":
                 self.touch(self.dxbc, "fssm_index.json")
             elif tool == "shader_disasm.py":
-                os.makedirs(os.path.join(self.dxbc, "disasm"), exist_ok=True)
+                self.touch(self.dxbc, "disasm", "shader.s")
 
         def fake_translate(disasm, spirv, jobs, emulate=False, fallbacks=()):
             ran.append("translate")
