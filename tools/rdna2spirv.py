@@ -2364,6 +2364,44 @@ class Gen:
             z = self.tmp()
             self.emit(f"{z} = OpSelect %uint {self.tmp_bool_nz(r)} {self.cu(1)} {self.cu(0)}")
             self.emit(f"OpStore %scc {z}")
+        elif op in ("v_add_nc_i32", "v_sub_nc_i32") or \
+                (op in ("v_add_nc_u32", "v_sub_nc_u32", "v_subrev_nc_u32") and "clamp" in mods):
+            # 32-bit add/sub without carry out. The VOP3 clamp bit saturates an integer result (GFX9+: LLVM selects
+            # uaddsat/usubsat to v_add/sub_nc_u32 clamp and saddsat/ssubsat to v_add/sub_nc_i32 clamp): unsigned to
+            # [0, 0xFFFFFFFF], signed to [0x80000000, 0x7FFFFFFF]. Without clamp the result wraps.
+            x, y = self.src_u(a[1]), self.src_u(a[2])
+            if op == "v_subrev_nc_u32":
+                x, y = y, x
+            sub = "_sub" in op
+            r = self.tmp()
+            if op.endswith("_u32"):
+                s_, w, c = self.tmp(), self.tmp(), self.tmp()
+                self.emit(f"{s_} = {'OpISubBorrow' if sub else 'OpIAddCarry'} %umul {x} {y}")
+                self.emit(f"{w} = OpCompositeExtract %uint {s_} 0")
+                self.emit(f"{c} = OpCompositeExtract %uint {s_} 1")
+                sat = self.cu(0) if sub else self.cu(0xFFFFFFFF)
+                self.emit(f"{r} = OpSelect %uint {self.tmp_bool_nz(c)} {sat} {w}")
+            else:
+                w = self.tmp()
+                self.emit(f"{w} = {'OpISub' if sub else 'OpIAdd'} %uint {x} {y}")
+                if "clamp" in mods:
+                    # Signed overflow: add when x and y share a sign that w lacks; sub when x and y differ in sign
+                    # and w differs from x. The saturated value follows x's sign.
+                    t1, t2, ov, neg, lim = (self.tmp() for _ in range(5))
+                    if sub:
+                        self.emit(f"{t1} = OpBitwiseXor %uint {x} {y}")
+                    else:
+                        self.emit(f"{t1} = OpBitwiseXor %uint {y} {w}")
+                    self.emit(f"{t2} = OpBitwiseXor %uint {x} {w}")
+                    ovm = self.tmp()
+                    self.emit(f"{ovm} = OpBitwiseAnd %uint {t1} {t2}")
+                    self.emit(f"{ov} = OpSLessThan %bool {self.as_int(ovm)} {self.as_int(self.cu(0))}")
+                    self.emit(f"{neg} = OpSLessThan %bool {self.as_int(x)} {self.as_int(self.cu(0))}")
+                    self.emit(f"{lim} = OpSelect %uint {neg} {self.cu(0x80000000)} {self.cu(0x7FFFFFFF)}")
+                    self.emit(f"{r} = OpSelect %uint {ov} {lim} {w}")
+                else:
+                    r = w
+            self.dst(a[0], r)
         elif op == "v_subrev_nc_u32":
             x, y = self.src_u(a[1]), self.src_u(a[2])
             r = self.tmp()
