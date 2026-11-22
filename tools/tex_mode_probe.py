@@ -2,7 +2,7 @@
 
 Candidates: every addrlib 4K/64K pattern for the element size, crossed with two placements of the top mip
 (at the texture's data offset, or at the end of its mip chain, since GFX10 stores mips smallest first).
-Scored with exact BC1/BC3 block averages (smoothness relative to the image's own spread).
+Scored with average RGB colours for BC1, BC2 and BC3 blocks (smoothness relative to the image's own spread).
 
 Usage:
     python -I tex_mode_probe.py <textures_index.json> <carve dir> [--fmt BC1] [--n 12]

@@ -214,6 +214,15 @@ records. No unhandled layout tag appears:
 `data.rpf` or the `levels.rpf` samples. `data.rpf` uses `(8, 16)` exclusively; the 674
 `(12, 6)` geometries are spread over 256 models in the levels sample.
 
+## Character skeletons
+
+World drawables do not carry the shared 597-name humanoid skeleton. Character `.#ft` fragments
+store that name/hash table, and each character `#dr` model points at a local bone-hash array that
+maps into it. The measured name table, the following 597-record hierarchy/reference-TRS table,
+the model mapping and the texture-parameter split are in
+[character_skeleton.md](character_skeleton.md). No character bind matrices were recovered; that
+page records the reference-pose caveat rather than inventing a bind pose.
+
 ## What to do next
 
 1. Merge [rpf9-explorer PR #1](https://github.com/breadbbbb/rpf9-explorer/pull/1).

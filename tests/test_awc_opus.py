@@ -7,9 +7,11 @@ import importlib.util
 import io
 import os
 import struct
+import subprocess
 import sys
 import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -241,6 +243,33 @@ class ExportBankTest(unittest.TestCase):
             f.write(bank)
         return path, pcm16, floats
 
+    def test_recursive_cli_preserves_bank_paths(self):
+        src = Path(self.tmp.name) / "banks"
+        samples = {"north/shared": 11, "south/shared": 22, "flat": 33}
+        fmt = format_block(1, 48000, 0, 1)
+        for stem, sample in samples.items():
+            bank = src / (stem + ".awc")
+            bank.parent.mkdir(parents=True, exist_ok=True)
+            bank.write_bytes(build_bank([(1, fmt, struct.pack("<h", sample))]))
+
+        for jobs in (1, 2):
+            with self.subTest(jobs=jobs):
+                out = Path(self.out) / str(jobs)
+                previous = out / "shared" / "00000001.wav"
+                previous.parent.mkdir(parents=True)
+                previous.write_bytes(b"previous export")
+                subprocess.run([sys.executable, "-I", awc.__file__, src, out, "--jobs", str(jobs)],
+                               check=True, capture_output=True)
+                for stem, sample in samples.items():
+                    self.assertEqual(read_wav(out / stem / "00000001.wav")["pcm"], struct.pack("<h", sample))
+                self.assertEqual(previous.read_bytes(), b"previous export")
+
+    def test_single_bank_cli_keeps_flat_output(self):
+        bank, pcm, _ = self.make_bank()
+        subprocess.run([sys.executable, "-I", awc.__file__, bank, self.out, "--jobs", "1"],
+                       check=True, capture_output=True)
+        self.assertEqual(read_wav(Path(self.out) / "synthetic" / "00000001.wav")["pcm"], pcm)
+
     def test_pcm16_and_float_and_opus(self):
         bank, pcm16, floats = self.make_bank()
         counts = awc.export_bank(bank, self.out)
@@ -351,6 +380,19 @@ class StreamedMusicTest(unittest.TestCase):
 
 
 class MalformedBankTest(unittest.TestCase):
+    def test_truncated_pcm_bank_creates_no_outputs(self):
+        pcm = b"\x01\x00" * 4
+        fmt = format_block(4, 48000, 0, 1)
+        bank = build_bank([(1, fmt, pcm), (2, fmt, pcm)])
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "short.awc")
+            with open(path, "wb") as f:
+                f.write(bank[:-2])
+            out = os.path.join(tmp, "out")
+            with self.assertRaisesRegex(ValueError, "0x55.*outside"):
+                awc.export_bank(path, out)
+            self.assertFalse(os.path.exists(out))
+
     def test_bad_magic_raises_value_error(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "bad.awc")

@@ -264,6 +264,7 @@ int main() {
         EXPECT(invalid_bundle_call([&](auto* b) { b->ClearRenderTargetView(rtv_handle, bundle_clear_color, 0, nullptr); }));
         EXPECT(invalid_bundle_call([&](auto* b) { b->ClearDepthStencilView(dsv_handle, D3D12_CLEAR_FLAG_DEPTH,
                                                                             0.5f, 0, 0, nullptr); }));
+        EXPECT(invalid_bundle_call([&](auto* b) { b->SetPredication(nullptr, 0, D3D12_PREDICATION_OP_EQUAL_ZERO); }));
 
         list->Barrier(1, &group);
         list->DrawInstanced(3, 1, 0, 0);  // not implemented: reported once by its generated stub, recording continues

@@ -167,39 +167,47 @@ def scan_document(doc: dict) -> dict:
 
 
 def _strongly_connected(nodes: list, adjacency: dict) -> list:
-    """Tarjan's algorithm; recursion depth is bounded by the document count."""
+    """Tarjan's algorithm with an explicit stack for deep include chains."""
     index = {}
     low = {}
     stack = []
     on_stack = set()
     components = []
-    counter = 0
+    pending = []
 
-    def visit(node):
-        nonlocal counter
-        index[node] = low[node] = counter
-        counter += 1
+    def enter(node):
+        index[node] = low[node] = len(index)
         stack.append(node)
         on_stack.add(node)
-        for neighbour in adjacency.get(node, ()):
-            if neighbour not in index:
-                visit(neighbour)
-                low[node] = min(low[node], low[neighbour])
-            elif neighbour in on_stack:
-                low[node] = min(low[node], index[neighbour])
-        if low[node] == index[node]:
-            component = []
-            while True:
-                member = stack.pop()
-                on_stack.discard(member)
-                component.append(member)
-                if member == node:
-                    break
-            components.append(component)
+        pending.append((node, iter(adjacency.get(node, ()))))
 
-    for node in nodes:
-        if node not in index:
-            visit(node)
+    for root in nodes:
+        if root in index:
+            continue
+        enter(root)
+        while pending:
+            node, neighbours = pending[-1]
+            neighbour = next(neighbours, None)
+            if neighbour is not None:
+                if neighbour not in index:
+                    enter(neighbour)
+                elif neighbour in on_stack:
+                    low[node] = min(low[node], index[neighbour])
+                continue
+
+            pending.pop()
+            if low[node] == index[node]:
+                component = []
+                while True:
+                    member = stack.pop()
+                    on_stack.remove(member)
+                    component.append(member)
+                    if member == node:
+                        break
+                components.append(component)
+            if pending:
+                parent = pending[-1][0]
+                low[parent] = min(low[parent], low[node])
     return components
 
 

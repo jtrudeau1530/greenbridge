@@ -250,5 +250,18 @@ class ArchiveTest(unittest.TestCase):
             self.assertFalse(os.path.exists(out))
 
 
+    def test_cli_rejects_start_or_limit_for_a_directory(self):
+        folder = os.path.join(self.root, "carved")
+        os.makedirs(folder)
+        out = os.path.join(self.root, "dir.json")
+        for extra in (("--start", "0"), ("--limit", "100")):
+            p = subprocess.run([sys.executable, "-I", TOOL, folder, out, "--quiet", *extra],
+                               capture_output=True, text=True, encoding="utf-8", errors="replace")
+            self.assertEqual(p.returncode, 2, p.stderr)
+            self.assertIn("single archive", p.stderr)
+            self.assertEqual(p.stdout, "")
+            self.assertFalse(os.path.exists(out))
+
+
 if __name__ == "__main__":
     unittest.main()

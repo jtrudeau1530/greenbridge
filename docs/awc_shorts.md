@@ -10,8 +10,10 @@ python -I tools\awc_shorts.py <bank.awc | directory> <out> `
 ```
 
 The output is `<out>\<bank>\<stream id>.ogg` plus `<out>\shorts.csv` with bank, stream id, duration,
-packet channel count, packet count and relative path. Existing files are overwritten; malformed banks
-are reported and skipped.
+packet channel count, packet count and relative path. For a directory scan, `<bank>` keeps the
+path relative to the source directory, without the `.awc` extension. For example, a nested
+`left/shared.awc` has a `bank` value of `left/shared`. Existing files are overwritten, and malformed
+banks are reported and skipped.
 
 ## Duration and channels
 

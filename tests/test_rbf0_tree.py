@@ -12,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 from xml.etree import ElementTree as ET
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -381,6 +382,15 @@ class OutputTest(unittest.TestCase):
         self.assertEqual(summary["roots"], {"OtherRoot": 1})
         docs, _ = rbf0_tree.decode_source(self.root, limit=1)
         self.assertEqual(len(docs), 1)
+
+    def test_decode_source_validates_selection_before_reading(self):
+        for settings, message in (({"limit": 0}, "--limit must be at least 1"),
+                                  ({"limit": -1}, "--limit must be at least 1"),
+                                  ({"offset": -1}, "--offset must be non-negative")):
+            with self.subTest(settings=settings), patch.object(
+                    rbf0_tree, "_rows", side_effect=AssertionError("invalid selection reached the source reader")):
+                with self.assertRaisesRegex(ValueError, message):
+                    rbf0_tree.decode_source(self.root, **settings)
 
     def test_bad_resource_exit_code(self):
         with open(os.path.join(self.root, "00000000.bin"), "wb") as f:

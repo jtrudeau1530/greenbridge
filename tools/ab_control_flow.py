@@ -34,13 +34,95 @@ BRANCH = re.compile(r"^\ts_c?branch", re.M)
 BACK = re.compile(r"^\ts_c?branch\S* (\d+)", re.M)
 CLEAR = struct.pack("<4f", -1, -1, -1, -1)      # what vk_texture_test clears the image to
 LOCATIONS = 32      # every pixel-shader input location gets a defined value
+SUPPORTED_BINDINGS = {0, 1, 2}
+HOSTED_FEATURES = {"bufferDeviceAddress", "runtimeDescriptorArray", "shaderInt64"}
 
 
-def test_vertex_shader(out_dir):
-    """A full-screen triangle that writes every input location a pixel shader can read: location 0 is
-    (u, v, 0, 1) with u and v running 0..1 across the image, the rest are zero. The game's pass-through vertex
-    shader writes location 0 only, which leaves every other pixel input undefined, and a shader that uses one as
-    a buffer index then reads from wherever that lands."""
+def is_backward_branch(disassembly):
+    """Return whether the disassembly contains a branch to the backward half of the address space."""
+    return any(int(target) >= 0x8000 for target in BACK.findall(disassembly))
+
+
+def supported_pixel_shaders(index):
+    """Return sorted pixel-shader names whose bindings and features are available in the harness."""
+    return sorted(name for name, metadata in index.items()
+                  if metadata.get("stage") == "ps"
+                  and set(metadata.get("bindings", [])) <= SUPPORTED_BINDINGS
+                  and set(metadata.get("features", [])) <= HOSTED_FEATURES)
+
+
+def select_candidates(index, disasm_dir, spirv_dir, count=150, loops="none", names_file=None):
+    """Select shaders from synthetic or real metadata/disassembly inputs.
+
+    An explicit names file intentionally bypasses automatic metadata, disassembly, SPIR-V and loop filtering,
+    matching the CLI's documented "run exactly these shaders" behavior.
+    """
+    if loops not in ("none", "only"):
+        raise ValueError("loops must be 'none' or 'only'")
+    if count < 1:       # the check below runs after the first append, so 0 or less still picked one shader
+        raise ValueError("count must be at least 1")
+    if names_file:
+        with open(names_file, encoding="utf-8") as f:
+            return [name for name in f.read().split("\n") if name]
+
+    picked = []
+    for name in supported_pixel_shaders(index):
+        asm_path = os.path.join(disasm_dir, name + ".s")
+        spv_path = os.path.join(spirv_dir, name + ".spv")
+        if not os.path.isfile(spv_path) or not os.path.isfile(asm_path):
+            continue
+        with open(asm_path, encoding="utf-8", errors="replace") as f:
+            text = f.read()
+        if NEEDS.search(text) or len(BRANCH.findall(text)) < 2:
+            continue
+        if is_backward_branch(text) != (loops == "only"):
+            continue
+        picked.append(name)
+        if len(picked) >= count:
+            break
+    return picked
+
+
+def classify_result(translation_valid, dispatch_runs, structured_runs):
+    """Classify one shader's A/B result from each form's repeated harness outcomes.
+
+    A run is bytes on success, None when the harness failed, or the string "timeout". Every run of each form
+    must agree before the two forms are compared.
+    """
+    if not translation_valid:
+        return "a translation is invalid"
+
+    dispatch = dispatch_runs[0] if dispatch_runs else None
+    structured = structured_runs[0] if structured_runs else None
+    if (any(result != dispatch for result in dispatch_runs[1:])
+            or any(result != structured for result in structured_runs[1:])):
+        return "unstable from run to run"
+
+    if dispatch is None or structured is None:
+        return "dispatch form failed to run" if dispatch is None else "structured form failed to run"
+    if dispatch == "timeout" or structured == "timeout":
+        if dispatch == "timeout" and structured == "timeout":
+            return "neither terminates"
+        return "ONLY ONE FORM TERMINATES"
+    return "identical" if dispatch == structured else "DIFFERENT"
+
+
+def write_outcomes(out_dir, outcomes):
+    """Write (shader name, outcome) pairs to the harness's tab-separated report."""
+    os.makedirs(out_dir, exist_ok=True)
+    path = os.path.join(out_dir, "outcomes.tsv")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("".join(f"{name}\t{outcome}\n" for name, outcome in outcomes))
+    return path
+
+
+def test_vertex_shader(out_dir, runner=None):
+    """Generate a full-screen triangle vertex shader and assemble/validate it.
+
+    runner is injectable so tests can exercise source generation without requiring SPIR-V Tools.
+    """
+    if runner is None:
+        runner = subprocess.run
     nl = "\n"
     asm = f"""OpCapability Shader
 OpMemoryModel Logical GLSL450
@@ -89,25 +171,38 @@ OpFunctionEnd
     os.makedirs(out_dir, exist_ok=True)
     with open(src, "w", encoding="utf-8") as f:
         f.write(asm)
-    subprocess.run(["spirv-as", "--target-env", "vulkan1.2", src, "-o", dst], check=True)
-    subprocess.run(["spirv-val", "--target-env", "vulkan1.2", dst], check=True)
+    runner(["spirv-as", "--target-env", "vulkan1.2", src, "-o", dst], check=True)
+    runner(["spirv-val", "--target-env", "vulkan1.2", dst], check=True)
     return dst
 
 
-def main():
+def positive_int(text):
+    """--count, --runs and --timeout: a whole number of at least 1. --runs 0 rendered nothing and reported every
+    shader as "dispatch form failed to run"; --count 0 still ran one shader."""
+    try:
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not a whole number: {text!r}") from None
+    if value < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return value
+
+
+def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("repo")
     ap.add_argument("shaders")
     ap.add_argument("out")
-    ap.add_argument("--count", type=int, default=150)
+    ap.add_argument("--count", type=positive_int, default=150)
     ap.add_argument("--harness", help="path to vk_texture_test (default: the Windows build in the repo)")
     ap.add_argument("--loops", choices=("none", "only"), default="none",
                     help="'only': shaders with backward branches. Use a software driver for those: one that never "
                          "terminates is killed after --timeout seconds, where a real GPU would reset its driver")
-    ap.add_argument("--timeout", type=int, default=60)
+    ap.add_argument("--timeout", type=positive_int, default=60)
     ap.add_argument("--names", help="run exactly the shaders listed in this file (one per line), no selection")
-    ap.add_argument("--runs", type=int, default=1, help="render each form this many times; all must agree")
-    a = ap.parse_args()
+    ap.add_argument("--runs", type=positive_int, default=1,
+                    help="render each form this many times; all must agree")
+    a = ap.parse_args(argv)
     disasm = os.path.join(a.shaders, "dxbc", "disasm")
     old = os.path.join(a.shaders, "spirv")
     new = os.path.join(a.out, "new")
@@ -118,28 +213,13 @@ def main():
     vs = test_vertex_shader(a.out)
 
     import json
-    index = json.load(open(os.path.join(old, "index.json"), encoding="utf-8"))
-    hosted = {"bufferDeviceAddress", "runtimeDescriptorArray", "shaderInt64"}     # what the harness enables
-    picked, loops = [], 0
-    names = sorted(n for n, m in index.items() if m.get("stage") == "ps" and set(m.get("bindings", [])) <= {0, 1, 2}
-                   and set(m.get("features", [])) <= hosted)
+    with open(os.path.join(old, "index.json"), encoding="utf-8") as f:
+        index = json.load(f)
+    names = supported_pixel_shaders(index)
     print(f"{len(names)} pixel shaders use only the bindings and features the harness provides")
-    if a.names:
-        with open(a.names, encoding="utf-8") as f:
-            picked = [x for x in f.read().split("\n") if x]
-        names = []
-    for n in names:
-        text = open(os.path.join(disasm, n + ".s"), encoding="utf-8", errors="replace").read()
-        if NEEDS.search(text) or len(BRANCH.findall(text)) < 2 or not os.path.isfile(os.path.join(old, n + ".spv")):
-            continue
-        has_loop = any(int(x) >= 0x8000 for x in BACK.findall(text))     # a backward branch: a loop
-        if has_loop != (a.loops == "only"):
-            continue
-        picked.append(n)
-        if len(picked) >= a.count:
-            break
-    branches = sorted(len(BRANCH.findall(open(os.path.join(disasm, n + ".s"), encoding="utf-8", errors="replace").read()))
-                      for n in picked)
+    picked = select_candidates(index, disasm, old, count=a.count, loops=a.loops, names_file=a.names)
+    branches = sorted(len(BRANCH.findall(open(os.path.join(disasm, name + ".s"), encoding="utf-8",
+                                                 errors="replace").read())) for name in picked)
     print(f"{len(picked)} branchy pixel shaders picked ({'with loops' if a.loops == 'only' else 'loop-free'}); "
           f"branches per shader: median {branches[len(branches) // 2] if branches else 0}, "
           f"max {branches[-1] if branches else 0}")
@@ -151,33 +231,34 @@ def main():
     differ = []
     outcomes = []
 
-    def note(n, what):
+    def note(name, what):
         res[what] += 1
-        outcomes.append((n, what))
+        outcomes.append((name, what))
+
     tool = os.path.join(a.repo, "tools", "rdna2spirv.py")
-    for n in picked:
-        src = os.path.join(disasm, n + ".s")
+    for name in picked:
+        src = os.path.join(disasm, name + ".s")
         r1 = subprocess.run([sys.executable, "-I", tool, src, "--out", new], capture_output=True, text=True)
         r2 = subprocess.run([sys.executable, "-I", tool, src, "--out", loopdir, "--dispatch-loop"],
                             capture_output=True, text=True)
         if "1 pass spirv-val" not in r1.stdout or "1 pass spirv-val" not in r2.stdout:
-            note(n, "a translation is invalid")
+            note(name, "a translation is invalid")
             continue
-        imgs = []
-        unstable = False
         # A shader that exports no colour (depth-only passes with an alpha test) leaves the colour of the pixels
         # it keeps undefined: garbage on a GPU, different every run. What it does decide is which pixels survive,
         # so compare that: a killed pixel still holds the clear colour.
-        colour = "%out_mrt0" in open(os.path.join(new, n + ".spvasm"), encoding="utf-8").read()
+        colour = "%out_mrt0" in open(os.path.join(new, name + ".spvasm"), encoding="utf-8").read()
         res["exports no colour: compared by surviving pixels"] += not colour
-        for tag, fs in (("old", os.path.join(loopdir, n + ".spv")), ("new", os.path.join(new, n + ".spv"))):
+        images = []
+        for tag, spirv in (("old", os.path.join(loopdir, name + ".spv")),
+                           ("new", os.path.join(new, name + ".spv"))):
             raw = os.path.join(a.out, f"{tag}.raw")
             got = []
             for _ in range(a.runs):
                 if os.path.isfile(raw):
                     os.remove(raw)
                 try:
-                    h = subprocess.run([harness, vs, fs, raw, "8", "92", "c00000", "14500000", "0"],
+                    h = subprocess.run([harness, vs, spirv, raw, "8", "92", "c00000", "14500000", "0"],
                                        capture_output=True, text=True, timeout=a.timeout)
                     img = open(raw, "rb").read() if h.returncode == 0 and os.path.isfile(raw) else None
                     if img is not None and not colour:
@@ -186,29 +267,20 @@ def main():
                 except subprocess.TimeoutExpired:
                     got.append("timeout")
                     break
-            unstable |= any(g != got[0] for g in got)
-            imgs.append(got[0])
-        if unstable:
-            note(n, "unstable from run to run")
-            continue
-        if "timeout" in imgs:
-            note(n, "neither terminates" if imgs[0] == imgs[1] else "ONLY ONE FORM TERMINATES")
-            if imgs[0] != imgs[1]:
-                differ.append(n)
-        elif imgs[0] is None or imgs[1] is None:
-            note(n, "dispatch form failed to run" if imgs[0] is None else "structured form failed to run")
-        elif imgs[0] == imgs[1]:
-            note(n, "identical")
+            images.append(got)
+        outcome = classify_result(True, images[0], images[1])
+        note(name, outcome)
+        if outcome in ("DIFFERENT", "ONLY ONE FORM TERMINATES"):
+            differ.append(name)
+        elif outcome == "identical":
+            image = images[1][0]
             step = 16 if colour else 1
-            res["identical and not all one colour"] += len(set(imgs[1][i:i + step] for i in range(0, len(imgs[1]), step))) > 1
-        else:
-            note(n, "DIFFERENT")
-            differ.append(n)
+            res["identical and not all one colour"] += len(
+                set(image[i:i + step] for i in range(0, len(image), step))) > 1
     print(dict(res))
-    for n in differ[:8]:
-        print("   differs:", n[:70])
-    with open(os.path.join(a.out, "outcomes.tsv"), "w", encoding="utf-8") as f:
-        f.write("".join(f"{n}\t{o}\n" for n, o in outcomes))
+    for name in differ[:8]:
+        print("   differs:", name[:70])
+    write_outcomes(a.out, outcomes)
     return 0
 
 

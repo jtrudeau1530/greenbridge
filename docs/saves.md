@@ -43,7 +43,7 @@ blocks, which confirms the framing, padding and offsets. The JSAV carries no che
 
 Block conventions:
 - Each block is `{"$0x<group>":{"$0x<hash>":{...}}}`, with one group hash for code blocks and one for script blocks. The inner hash equals the index entry's hash. **confirmed**
-- Keys are 32-bit hashes written as `"$0x%08x"`. They aren't the lowercase joaat of obvious names; the hash function and seed are a **hypothesis** to check against the executable.
+- Keys are 32-bit hashes written as `"$0x%08x"`: the **case-sensitive** joaat (seed 0, no lower-casing) of the engine or script name, the same rule as the member hashes in [world_names.md](world_names.md). **confirmed**, see [Key names](#key-names).
 - Reserved, unhashed keys **(confirmed)**:
   - `$x $y $z $w` vectors and quaternions
   - `$content` + `$data` typed arrays (`int_array`, `int64_array`, `char_array`, `float_array`, `short_array`)
@@ -112,6 +112,31 @@ Checked: four imported blobs (2 KB to 1.2 MB) read back byte-identical through t
 name, and `--map` overrides it. Confirm or fix them from the executable's `XGameSaveCreateContainer` and
 `XGameSaveSubmitBlobWrite` calls.
 
+## Key names
+
+The hash was found from structure, before trying a dictionary: the code and script group keys are the joaat of names
+derived from the clear-text JSON wrappers around them, with case kept. Measured on the sample set (two story saves
+plus settings, **1,059 distinct keys**), with a dictionary of 1.14 million identifier-like strings harvested by
+`tools/save_keys.py` from the raw bytes and zlib streams of four of the game's own data archives (`common`, `script`,
+`data`, `appdata0`):
+
+| Method | Keys resolved | Expected by chance |
+|---|---|---|
+| joaat, case-sensitive, strings as found | 128 | 0.3 |
+| joaat, lower-cased | 45 (1 not found case-sensitively) | 0.3 |
+| FNV-1, FNV-1a, MurmurHash3-32 | 0 | 0.3 |
+| CRC-32, MurmurHash3-64 low or high half | 1 each | 0.3 |
+| + one- and two-word Pascal/camel/snake names from the 3,000 most frequent words (`--compose 3000`) | +134 | about 7 |
+| + block ids only (82 targets): one or two PascalCase words; script blocks share a fixed name prefix | 33 of 82 (14 code, 19 script) | 0.6 |
+| **Total** | **278 of 1,059 (26%)**, 1 ambiguous | at most about 8 |
+
+Every family except case-sensitive joaat stays at chance level. Code block ids are bare PascalCase nouns, script block
+ids add a common prefix, code fields are PascalCase and many settings fields are camelCase **(likely)**. The other ~780
+names aren't in the data archives: they're code-only or script-local names, so the executable's strings should
+resolve most of them. The resolved names are game data and stay local; only counts belong here.
+
+`save_keys.py resolve` prints these counts for any dictionary. `--out` writes the hash -> name table for local use.
+
 ## Tool
 
 ```powershell
@@ -121,6 +146,9 @@ python -I tools/saves.py extract <JSAV|ASAV> <outdir>   # blocks/*.json, index.j
 python -I tools/saves.py pack    <outdir> <JSAV>        # after editing blocks/*.json
 python -I tools/saves.py diff    <JSAV a> <JSAV b>
 python -I tools/saves.py import  <save folder>... [--out DIR] [--map OLD=CONTAINER/BLOB] [--dry-run] [--force]
+python -I tools/save_keys.py collect <save file or extract folder>...           # distinct $0x… keys
+python -I tools/save_keys.py resolve <saves>... --dict <files>... [--compose N] [--out FILE]
 ```
 
-`tests/test_saves.py` covers all of it on synthetic containers built in the test.
+`tests/test_saves.py` and `tests/test_save_keys.py` cover all of it on synthetic containers and names built in the
+tests.

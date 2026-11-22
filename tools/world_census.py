@@ -639,26 +639,43 @@ def positive_int(text):
     return value
 
 
+# ProcessPoolExecutor on Windows raises ValueError above 61 workers (WaitForMultipleObjects' handle limit).
+MAX_JOBS = 61 if os.name == "nt" else None
+
+
+def job_count(text):
+    """--jobs: at least 1, and at most MAX_JOBS where the platform has a limit."""
+    value = positive_int(text)
+    if MAX_JOBS is not None and value > MAX_JOBS:
+        raise argparse.ArgumentTypeError(f"must be at most {MAX_JOBS} on this platform")
+    return value
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("archive")
     ap.add_argument("--out", default=os.path.join("work", "world", "census"))
     ap.add_argument("--shard-size", type=positive_int, default=2 << 30)
-    ap.add_argument("--jobs", type=positive_int, default=max(1, min(12, (os.cpu_count() or 2) // 2)))
+    ap.add_argument("--jobs", type=job_count, default=max(1, min(12, (os.cpu_count() or 2) // 2)))
     ap.add_argument("--start", type=int)
     ap.add_argument("--limit", type=int)
     ap.add_argument("--resume", action="store_true")
     ap.add_argument("--merge-only", action="store_true")
     a = ap.parse_args(argv)
-    with open(a.archive, "rb") as f:
-        head = f.read(8)
+    try:
+        with open(a.archive, "rb") as f:
+            head = f.read(8)
+            size = os.fstat(f.fileno()).st_size
+    except OSError as e:
+        print(f"{a.archive}: {e.strerror or e}", file=sys.stderr)
+        return 2
     if head[:4] != b"9FPR":
         print("not an RPF9 archive", file=sys.stderr)
         return 2
     data_start = struct.unpack_from("<I", head, 4)[0]
-    size = os.path.getsize(a.archive)
     start = a.start if a.start is not None else data_start
-    end = min(size, start + a.limit) if a.limit else size
+    # `is not None`: --limit 0 is an empty range (refused below), not "no limit".
+    end = min(size, start + a.limit) if a.limit is not None else size
     if start < data_start or start >= end:
         print("bad scan range", file=sys.stderr)
         return 2
