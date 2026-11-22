@@ -534,6 +534,23 @@ class NavmeshDecodeTest(unittest.TestCase):
         self.assertEqual(doc["resources"]["psin"]["incomplete"], 1)
         self.assertEqual(doc["psin"]["complete"], 0)
 
+    def test_psin_first_section_at_eof_is_incomplete(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            carve = os.path.join(tmp, "carve")
+            os.mkdir(carve)
+            with open(os.path.join(carve, "000000000000.bin"), "wb") as f:
+                f.write(struct.pack(">4sI", b"PSIN", 64) + bytes(56))
+            out = os.path.join(tmp, "out.json")
+            proc = subprocess.run([sys.executable, "-I", TOOL, carve, "--quiet", "--out", out],
+                                  capture_output=True, text=True)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            with open(out, encoding="utf-8") as f:
+                doc = json.load(f)
+
+        self.assertEqual(doc["resources"]["psin"]["resources"], 1)
+        self.assertEqual(doc["resources"]["psin"]["incomplete"], 1)
+        self.assertEqual(doc["psin"]["complete"], 0)
+
     def test_carved_directory_mode_and_window_limit(self):
         sector = (260 << 9) | 250
         p0, p1 = build_0drp(total_size=0x1000, split_at=0x1000, node_count=2, override_n4e=0)
