@@ -1335,5 +1335,126 @@ class TestPermB32StatusFlagsAndConditionCodes(unittest.TestCase):
         self.assertTrue(flags_sub.carry)
 
 
+# ==============================================================================
+# IEEE 754 Boundary Extremes, Subnormals, and NaN Handling
+# ==============================================================================
+
+# IEEE 754 Binary32 (single precision) architectural constants
+F32_POS_ZERO: int = 0x0000_0000
+F32_NEG_ZERO: int = 0x8000_0000
+F32_POS_INF: int = 0x7F80_0000
+F32_NEG_INF: int = 0xFF80_0000
+F32_QNAN: int = 0x7FC0_0000
+F32_SNAN: int = 0x7F80_0001
+F32_NEG_QNAN: int = 0xFFC0_0000
+
+F32_POS_MIN_NORMAL: int = 0x0080_0000
+F32_POS_MAX_NORMAL: int = 0x7F7F_FFFF
+F32_POS_MIN_SUBNORM: int = 0x0000_0001
+F32_POS_MAX_SUBNORM: int = 0x007F_FFFF
+
+# IEEE 754 Binary16 (half precision) constants
+F16_POS_ZERO: int = 0x0000
+F16_NEG_ZERO: int = 0x8000
+F16_POS_INF: int = 0x7C00
+F16_NEG_INF: int = 0xFC00
+F16_QNAN: int = 0x7E00
+F16_SNAN: int = 0x7D00
+
+
+def bswap_f32_bits(f_bits: int) -> int:
+    """Byte-swap an IEEE 754 float32 using v_perm_b32."""
+    sel = PermSelectorWord.bswap_src1().raw
+    return oracle_v_perm_b32(0, f_bits, sel)
+
+
+def unpack_pk_f16_lo(packed: int) -> int:
+    """Unpack lower 16-bit float into 32-bit register with zero-extension using v_perm_b32."""
+    sel = make_selector(0, 1, SEL_ZERO, SEL_ZERO)
+    return oracle_v_perm_b32(0, packed, sel)
+
+
+def unpack_pk_f16_hi(packed: int) -> int:
+    """Unpack upper 16-bit float into 32-bit register with zero-extension using v_perm_b32."""
+    sel = make_selector(2, 3, SEL_ZERO, SEL_ZERO)
+    return oracle_v_perm_b32(0, packed, sel)
+
+
+class TestPermB32IEEE754Boundaries(unittest.TestCase):
+    """Test suite for IEEE 754 boundary extremes, subnormals, and NaN handling."""
+
+    def test_f32_endian_swapping_preserves_nan_payloads(self):
+        # Signaling NaN with custom payload
+        snan = 0x7F80_1234
+        swapped = bswap_f32_bits(snan)
+        restored = bswap_f32_bits(swapped)
+        self.assertEqual(restored, snan)
+
+        # Quiet NaN
+        qnan = F32_QNAN
+        self.assertEqual(bswap_f32_bits(bswap_f32_bits(qnan)), qnan)
+
+        # Negative Quiet NaN
+        neg_qnan = F32_NEG_QNAN
+        self.assertEqual(bswap_f32_bits(bswap_f32_bits(neg_qnan)), neg_qnan)
+
+    def test_f32_subnormal_byte_manipulation(self):
+        # Smallest positive subnormal: 0x00000001 (byte 0 has bit 0 set)
+        min_sub = F32_POS_MIN_SUBNORM
+        swapped = bswap_f32_bits(min_sub)
+        # In big endian, bit 0 is in byte 3 (MSB position of word): 0x01000000
+        self.assertEqual(swapped, 0x0100_0000)
+        self.assertEqual(bswap_f32_bits(swapped), min_sub)
+
+        # Largest subnormal: 0x007FFFFF
+        max_sub = F32_POS_MAX_SUBNORM
+        self.assertEqual(bswap_f32_bits(bswap_f32_bits(max_sub)), max_sub)
+
+    def test_f32_infinity_and_zero_byte_isolation(self):
+        # Positive and negative zero
+        self.assertEqual(bswap_f32_bits(bswap_f32_bits(F32_POS_ZERO)), F32_POS_ZERO)
+        self.assertEqual(bswap_f32_bits(bswap_f32_bits(F32_NEG_ZERO)), F32_NEG_ZERO)
+
+        # Positive and negative infinity
+        self.assertEqual(bswap_f32_bits(bswap_f32_bits(F32_POS_INF)), F32_POS_INF)
+        self.assertEqual(bswap_f32_bits(bswap_f32_bits(F32_NEG_INF)), F32_NEG_INF)
+
+        # Extract exponent byte (bits 30..23 span byte 2 and byte 3)
+        # Using v_perm_b32 to extract byte 2 and byte 3 into lower 16 bits
+        sel_exp = make_selector(2, 3, SEL_ZERO, SEL_ZERO)
+        exp_words = oracle_v_perm_b32(0, F32_POS_INF, sel_exp)
+        # F32_POS_INF = 0x7F800000 -> byte 2=0x80, byte 3=0x7F -> 0x00007F80
+        self.assertEqual(exp_words, 0x00007F80)
+
+    def test_f16_unpacking_and_zero_extension(self):
+        # Packed pair of f16 values: lo = +1.0 (0x3C00), hi = -1.0 (0xBC00)
+        # packed dword: 0xBC00_3C00
+        packed = 0xBC00_3C00
+        unpacked_lo = unpack_pk_f16_lo(packed)
+        self.assertEqual(unpacked_lo, 0x0000_3C00)
+
+        unpacked_hi = unpack_pk_f16_hi(packed)
+        self.assertEqual(unpacked_hi, 0x0000_BC00)
+
+    def test_f32_sign_bit_sign_extension(self):
+        # Sign-extend sign bit of float: bit 31 is in byte 3
+        # Selector 8 performs sign extension of S1 bit 31
+        sel_sign = make_selector(8, 8, 8, 8)
+
+        # Positive float: sign bit 0 -> 0x00000000
+        pos_float = 0x3F80_0000  # +1.0f
+        mask_pos = oracle_v_perm_b32(0, pos_float, sel_sign)
+        self.assertEqual(mask_pos, 0x0000_0000)
+
+        # Negative float: sign bit 1 -> 0xFFFFFFFF
+        neg_float = 0xBF80_0000  # -1.0f
+        mask_neg = oracle_v_perm_b32(0, neg_float, sel_sign)
+        self.assertEqual(mask_neg, 0xFFFF_FFFF)
+
+        # Negative Quiet NaN
+        mask_nan = oracle_v_perm_b32(0, F32_NEG_QNAN, sel_sign)
+        self.assertEqual(mask_nan, 0xFFFF_FFFF)
+
+
 if __name__ == "__main__":
     unittest.main()
