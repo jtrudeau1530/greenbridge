@@ -345,10 +345,34 @@ bool lookup_in_loader(void* ctx, uint64_t address, std::string& module, uint32_t
     }
     return false;
 }
+
+void* bundled_find_loaded(void* ctx, const std::string& dll_lower) {
+    return static_cast<Loader*>(ctx)->find_loaded_module(dll_lower);
+}
+
+void* bundled_load(void* ctx, const std::string& dll_lower, bool& handled) {
+    return static_cast<Loader*>(ctx)->load_runtime_module(dll_lower, handled);
+}
+
+void* bundled_get_proc(void* ctx, void* module, const std::string& sym, bool& owns_handle) {
+    return static_cast<Loader*>(ctx)->resolve_module_export(module, sym, owns_handle);
+}
+
+bool bundled_owns_handle(void* ctx, void* module) {
+    return static_cast<Loader*>(ctx)->owns_module_handle(module);
+}
+
+const shims::BundledModuleOps kBundledOps{
+    &bundled_find_loaded,
+    &bundled_load,
+    &bundled_get_proc,
+    &bundled_owns_handle,
+};
 }  // namespace
 
 Loader::Loader(std::filesystem::path game_dir) : game_dir_(std::move(game_dir)) {
     shims::add_module_lookup(this, &lookup_in_loader);
+    shims::add_bundled_loader(this, &kBundledOps);
 }
 
 Loader::~Loader() {
@@ -372,6 +396,7 @@ Loader::~Loader() {
             entry(m.base, DLL_PROCESS_DETACH, nullptr);  // explicit unload; the return value is ignored
         }
     }
+    shims::remove_bundled_loader(this);
     shims::remove_module_lookup(this);
     for (auto* m : order_) {
         // TLS state must go away before the image and its TLS block are unmapped.
@@ -394,6 +419,7 @@ Loader::~Loader() {
 }
 
 Module& Loader::load(const std::filesystem::path& image) {
+    std::lock_guard lock(mutex_);
     std::string key = lower(image.filename().string());
     if (auto it = by_name_.find(key); it != by_name_.end()) return *it->second;
     Module& m = map_image(image);
@@ -402,6 +428,86 @@ Module& Loader::load(const std::filesystem::path& image) {
     register_unwind(m);
     init_order_.push_back(&m);
     return m;
+}
+
+void* Loader::find_loaded_module(const std::string& dll_lower) const {
+    std::lock_guard lock(mutex_);
+    auto it = by_name_.find(dll_lower);
+    return it == by_name_.end() ? nullptr : static_cast<void*>(it->second->base);
+}
+
+void* Loader::load_runtime_module(const std::string& dll_lower, bool& handled) {
+    handled = false;
+    if (dll_lower.empty() || prefer_host_copy(dll_lower)) return nullptr;
+
+    std::lock_guard lock(mutex_);
+    if (auto it = by_name_.find(dll_lower); it != by_name_.end()) {
+        handled = true;
+        try {
+            initialise();
+            return static_cast<void*>(it->second->base);
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "[rt] loader: run-time initialise of %s failed: %s\n", dll_lower.c_str(), e.what());
+            SetLastError(ERROR_DLL_INIT_FAILED);
+            return nullptr;
+        }
+    }
+
+    const std::filesystem::path candidate = game_dir_ / dll_lower;
+    std::error_code ec;
+    if (!std::filesystem::is_regular_file(candidate, ec)) return nullptr;
+
+    handled = true;
+    try {
+        Module& m = load(candidate);
+        initialise();
+        std::fprintf(stderr, "[rt] loader: %s mapped from game_dir (run-time load)\n", m.name.c_str());
+        return static_cast<void*>(m.base);
+    } catch (const std::exception& e) {
+        // Do not leave a failed run-time load indexed by name so later GetModuleHandle/LoadLibrary calls do not
+        // observe a half-initialised module. ~Loader still frees any VirtualAlloc'd mapping in order_.
+        by_name_.erase(dll_lower);
+        std::fprintf(stderr, "[rt] loader: run-time load of %s failed: %s\n", dll_lower.c_str(), e.what());
+        SetLastError(ERROR_DLL_INIT_FAILED);
+        return nullptr;
+    }
+}
+
+void* Loader::resolve_module_export(void* module_handle, const std::string& sym, bool& owns_handle) {
+    owns_handle = false;
+    if (!module_handle) return nullptr;
+    std::lock_guard lock(mutex_);
+    Module* target = nullptr;
+    for (Module* m : order_) {
+        if (m->base == module_handle) {
+            target = m;
+            break;
+        }
+    }
+    if (!target) return nullptr;
+    owns_handle = true;
+    if (auto it = target->exports.find(sym); it != target->exports.end()) return it->second;
+    if (auto it = target->forwarders.find(sym); it != target->forwarders.end()) {
+        try {
+            Binding binding = Binding::Unimplemented;
+            void* fn = resolve_forwarder(it->second, binding, 0);
+            if (binding == Binding::Module) initialise();
+            return fn;
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "[rt] loader: forwarder %s from %s failed: %s\n", it->second.c_str(),
+                         target->name.c_str(), e.what());
+            return nullptr;
+        }
+    }
+    return nullptr;
+}
+
+bool Loader::owns_module_handle(void* module_handle) const {
+    if (!module_handle) return false;
+    std::lock_guard lock(mutex_);
+    for (const Module* m : order_)
+        if (m->base == module_handle) return true;
+    return false;
 }
 
 // x64 has no frame-pointer chain to fall back on: without its .pdata registered, an exception raised in (or passing

@@ -387,6 +387,33 @@ if(BUILD_TESTING)
     set_target_properties(tiny_gdk_load PROPERTIES
       RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/fixtures/game/$<CONFIG>"
     )
+    # Run-time LoadLibrary of a bundled Xbox DLL (importing xmem.dll) through rt::Loader.
+    add_library(xmem_stub SHARED test/fixtures/xmem_stub.cpp test/fixtures/xmem_stub.def)
+    target_compile_definitions(xmem_stub PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(xmem_stub PRIVATE /W4 /permissive- /utf-8)
+    set_target_properties(xmem_stub PROPERTIES
+      OUTPUT_NAME xmem
+      PREFIX ""
+      RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/fixtures/stubs/$<CONFIG>"
+      ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/fixtures/stubs/$<CONFIG>"
+    )
+    add_library(tiny_bundled_dll SHARED test/fixtures/tiny_bundled_dll.cpp test/fixtures/tiny_bundled_dll.def)
+    target_link_libraries(tiny_bundled_dll PRIVATE xmem_stub)
+    target_compile_definitions(tiny_bundled_dll PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(tiny_bundled_dll PRIVATE /W4 /permissive- /utf-8)
+    set_target_properties(tiny_bundled_dll PROPERTIES
+      OUTPUT_NAME tiny_bundled_dll
+      PREFIX ""
+      RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/fixtures/game/$<CONFIG>"
+      ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/fixtures/stubs/$<CONFIG>"
+    )
+    add_executable(tiny_bundled_load test/fixtures/tiny_bundled_load.cpp)
+    target_compile_definitions(tiny_bundled_load PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(tiny_bundled_load PRIVATE /W4 /permissive- /utf-8)
+    add_dependencies(tiny_bundled_load tiny_bundled_dll)
+    set_target_properties(tiny_bundled_load PROPERTIES
+      RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/fixtures/game/$<CONFIG>"
+    )
     add_executable(tiny_game test/fixtures/tiny_game.cpp)
     target_link_libraries(tiny_game PRIVATE xgameruntime_stub)
     target_compile_definitions(tiny_game PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX _CRT_SECURE_NO_WARNINGS)  # plain fopen, as games use
@@ -607,6 +634,9 @@ if(BUILD_TESTING)
     add_test(NAME run_tiny_gdk_load COMMAND ${CMAKE_COMMAND}
       "-DLOADER=$<TARGET_FILE:gta6rt>" "-DGUEST=$<TARGET_FILE:tiny_gdk_load>"
       "-DRUNNER=${CMAKE_CROSSCOMPILING_EMULATOR}" -P "${CMAKE_CURRENT_SOURCE_DIR}/test/check_loaded_gdk.cmake")
+    add_test(NAME run_tiny_bundled_load COMMAND ${CMAKE_COMMAND}
+      "-DLOADER=$<TARGET_FILE:gta6rt>" "-DGUEST=$<TARGET_FILE:tiny_bundled_load>"
+      "-DRUNNER=${CMAKE_CROSSCOMPILING_EMULATOR}" -P "${CMAKE_CURRENT_SOURCE_DIR}/test/check_loaded_bundled.cmake")
     add_test(NAME run_tiny_game COMMAND gta6rt --run $<TARGET_FILE:tiny_game> -- hello 42)
     add_test(NAME run_tiny_game_exit_code COMMAND tiny_game_exit_code_test
              "$<TARGET_FILE:gta6rt>" "$<TARGET_FILE:tiny_game>")
