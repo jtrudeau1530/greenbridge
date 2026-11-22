@@ -10,6 +10,11 @@
 // a container. Containers with more than one 0x0D payload are counted, and their first payload must not stand in for
 // the last: that is the rule fssm_program follows, so a regression to the first payload fails here.
 //
+// A container with no index entry under its name at all is reported apart, as "not translated": the translator left
+// it out (for example a module over SPIR-V's id bound), so the lookup has nothing to find. That still fails the test,
+// but it points at the shaders stage instead of looking like a lookup regression. Only a container whose own entry
+// exists and is not reached by its program hash is a lookup failure.
+//
 // Without LEONIDA_SHADERS it prints SKIP and exits 77 (SKIP_RETURN_CODE). It reads the work folder in place, writes
 // nothing, and prints counts; on a failure it names at most a few shaders, which stay on your machine.
 #include "../src/shader_library.h"
@@ -82,6 +87,30 @@ bool own_entry(const leonida::ShaderEntry& entry, const std::string& stem) {
     return entry.name == stem || entry.name.rfind(stem + "~", 0) == 0;
 }
 
+// The index.json names ShaderLibrary::load counts: entries with a string stage and fssm_sha256. Read here rather than
+// through the library, which keys its entries by (stage, hash) and has no lookup by name.
+bool index_names(const std::string& spirv_dir, std::set<std::string>& names) {
+    std::ifstream file(fs::path(spirv_dir) / "index.json", std::ios::binary);
+    if (!file) return false;
+    const std::string text((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+    leonida::Json root;
+    if (!leonida::JsonReader(text).parse(root) || root.kind != leonida::Json::Kind::object) return false;
+    for (const auto& [name, meta] : root.object) {
+        const leonida::Json* hash = meta.find("fssm_sha256");
+        const leonida::Json* stage = meta.find("stage");
+        if (hash && hash->kind == leonida::Json::Kind::string && stage && stage->kind == leonida::Json::Kind::string)
+            names.insert(name);
+    }
+    return true;
+}
+
+// Whether the index has an entry named after the container: the stem itself or one of its `~N` duplicates.
+bool indexed(const std::set<std::string>& names, const std::string& stem) {
+    for (auto it = names.lower_bound(stem); it != names.end() && it->rfind(stem, 0) == 0; ++it)
+        if (it->size() == stem.size() || (*it)[stem.size()] == '~') return true;
+    return false;
+}
+
 }  // namespace
 
 int main() {
@@ -105,13 +134,18 @@ int main() {
         std::fprintf(stderr, "FAIL loading %s: %s\n", spirv_dir.c_str(), error.c_str());
         return 1;
     }
+    std::set<std::string> names;
+    if (!index_names(spirv_dir, names)) {
+        std::fprintf(stderr, "FAIL reading the entry names of %s/index.json\n", spirv_dir.c_str());
+        return 1;
+    }
     std::error_code ec;
     if (!fs::is_directory(dxbc_dir, ec)) {
         std::fprintf(stderr, "FAIL no DXBC folder %s (set LEONIDA_SHADER_DXBC)\n", dxbc_dir.c_str());
         return 1;
     }
 
-    std::size_t containers = 0, multi = 0;
+    std::size_t containers = 0, multi = 0, untranslated = 0;
     std::set<std::string> reached;
     for (const auto& item : fs::directory_iterator(dxbc_dir)) {
         if (!item.is_regular_file() || item.path().extension() != ".dxbc") continue;
@@ -135,7 +169,11 @@ int main() {
             reached.insert(entry->name);
             if (library.spirv(*entry).empty()) fail("no SPIR-V module for", entry->name);
         }
-        if (!found) fail("not found under its " + stage + " stage", stem);
+        if (!found && !indexed(names, stem)) {
+            if (untranslated++ < 8) std::fprintf(stderr, "NOT TRANSLATED (no index entry): %s\n", stem.c_str());
+        } else if (!found) {
+            fail("not found under its " + stage + " stage", stem);
+        }
 
         // The 0x0D payloads that differ from the last: none of them may be what the index has for this container.
         const auto programs = all_programs(bytes);
@@ -154,6 +192,11 @@ int main() {
     if (reached.size() != library.size())
         fail(std::to_string(library.size() - reached.size()) + " index entries reached by no container", spirv_dir);
     std::printf("%zu containers, %zu index entries, %zu reached; %zu containers with more than one program; "
-                "%d failures\n", containers, library.size(), reached.size(), multi, failures);
-    return failures ? 1 : 0;
+                "%zu not translated; %d failures\n", containers, library.size(), reached.size(), multi, untranslated,
+                failures);
+    if (untranslated)
+        std::fprintf(stderr, "%zu container(s) have no index entry: the translator left them out, so the lookup had "
+                             "nothing to find. Run the shaders stage again with a current translator.\n",
+                     untranslated);
+    return failures || untranslated ? 1 : 0;
 }
