@@ -500,7 +500,10 @@ int main(int argc, char** argv) {
             stages[2].pNext = &reqSg;
         else if (!mesh && !gs_tested && (sgProps.requiredSubgroupSizeStages & VK_SHADER_STAGE_FRAGMENT_BIT))
             stages[1].pNext = &reqSg;
-        if (stages[1].pNext == &reqSg) std::fprintf(stderr, "fragment subgroup size: %u\n", req_sg);
+        // A device with one subgroup size runs every stage at it, required or not (AMD GCN: 64, with only COMPUTE
+        // in requiredSubgroupSizeStages), so the fragment stage of a plain draw already has the size asked for.
+        const bool fixed = !mesh && !gs_tested && sgProps.minSubgroupSize == sgProps.maxSubgroupSize;
+        if (stages[1].pNext == &reqSg || fixed) std::fprintf(stderr, "fragment subgroup size: %u\n", req_sg);
     } else if (req_sg > 0) {
         std::fprintf(stderr, "fragment subgroup size: %u not available\n", req_sg);
     }

@@ -14,6 +14,7 @@ import unittest
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import support  # noqa: E402,F401  (sets the tools path)
+import rdna2spirv  # noqa: E402
 from test_wave64_halves import (  # noqa: E402
     AGG_HEAD,
     AGG_RANK,
@@ -227,6 +228,17 @@ class SoundnessRegressions(unittest.TestCase):
             "v_movreld_b32 v6, v5",
         ], contains=["lane-id"])
 
+    def test_v_movreld_b32_nonzero_offset_propagates_taint(self):
+        self.assert_tier_c_and_diverges("vs_vmovreld_src_off1", [
+            "v_mbcnt_lo_u32_b32 v8, -1, 0",
+            "v_mbcnt_hi_u32_b32 v8, -1, v8",
+            "s_mov_b32 m0, 1",
+            "v_movreld_b32 v5, v8",
+        ], contains=["lane-id"])
+        w64g = rdna2spirv.translate.last_gen.w64g
+        self.assertIn("exp", [op for _, _, op in w64g["sites"]],
+                      f"expected downstream exp sink to observe propagated taint: {w64g['sites']}")
+
     def test_v_add_co_ci_u32_reads_implicit_vcc(self):
         self.assert_tier_c_and_diverges("vs_add_co_ci_vcc", [
             "v_mbcnt_lo_u32_b32 v4, -1, 0",
@@ -314,6 +326,26 @@ class SoundnessRegressions(unittest.TestCase):
             + ATOMIC + [x.format(rank="v10") for x in SLOT] + ["s_mov_b64 exec, s[10:11]"]
         ), "C", contains=["lane-count"])
 
+    def test_s_andn2_exec_in_vote_branch_is_unsafe(self):
+        for tag, op in (("saveexec", "s_andn2_saveexec_b64"), ("wrexec", "s_andn2_wrexec_b64")):
+            self.assert_tier_c_and_diverges(f"vs_vote_{tag}_andn2", [
+                "v_cmp_eq_u32_e32 vcc, 1, v0",
+                "s_cbranch_vccz 1",
+                f"{op} s[14:15], vcc",
+                "v_mov_b32_e32 v6, 9",
+                "s_mov_b64 exec, s[10:11]",
+            ], contains=["unsafe-vote-branch"])
+
+    def test_s_andn1_exec_in_vote_branch_is_unsafe(self):
+        for tag, op in (("saveexec", "s_andn1_saveexec_b64"), ("wrexec", "s_andn1_wrexec_b64")):
+            self.assert_tier_c_and_diverges(f"vs_vote_{tag}_andn1", [
+                "v_cmp_eq_u32_e32 vcc, 1, v0",
+                "s_cbranch_vccz 3",
+                f"{op} s[14:15], vcc",
+                "v_mov_b32_e32 v6, 9",
+                "s_mov_b64 exec, s[10:11]",
+            ], contains=["unsafe-vote-branch"])
+
     # -- Clean controls (no false positives)
     def test_clean_controls_stay_invariant(self):
         for name, body in (
@@ -325,6 +357,7 @@ class SoundnessRegressions(unittest.TestCase):
                                     "v_mov_b32_e32 v8, 11", "v_swap_b32 v6, v8"]),
                 ("vs_clean_vmovrels", ["v_mov_b32_e32 v8, 5", "s_mov_b32 m0, 0", "v_movrels_b32 v6, v8"]),
                 ("vs_clean_vmovreld", ["v_mov_b32_e32 v5, 9", "s_mov_b32 m0, 0", "v_movreld_b32 v6, v5"]),
+                ("vs_clean_vmovreld_off1", ["v_mov_b32_e32 v8, 9", "s_mov_b32 m0, 1", "v_movreld_b32 v5, v8"]),
                 ("vs_clean_andn2_saveexec", ["v_cmp_eq_u32_e32 vcc, 1, v0",
                                              "s_and_saveexec_b64 s[12:13], vcc",
                                              "v_mov_b32_e32 v6, 5",

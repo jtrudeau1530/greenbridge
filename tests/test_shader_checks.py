@@ -3,6 +3,7 @@ import ast
 import contextlib
 import io
 import json
+import re
 import struct
 from pathlib import Path
 import sys
@@ -30,7 +31,7 @@ WAVE32_WORDS = {n: w for n, w in check.CS_DUMPS if n in check.WAVE32_DUMPS and n
 
 # All check.py cases, including the four vk_store_test shaders and the three mesh fixtures, and TEST-184's
 # vk_store_test "words" fixtures and image_get_lod draws.
-TOTAL = (len(check.COMPUTE) + 5 + len(check.CS_DUMPS) + len(check.W64X_DUMPS) + len(check.W64X_PARTIAL) + 4
+TOTAL = (len(check.COMPUTE) + 6 + len(check.CS_DUMPS) + len(check.W64X_DUMPS) + len(check.W64X_PARTIAL) + 4
          + len(check.PIXEL_TESTS) + len(check.CLIP_TESTS) + len(check.BOUNDS) + len(check.GLOBAL_OFFSET)
          + len(check.MIP_TEST_PASSES) + len(check.GRADIENT_TESTS)
          + len(check.STORE_WORDS) + len(check.GET_LOD_TESTS)
@@ -70,6 +71,10 @@ class Wave64Checks(unittest.TestCase):
             if name == "cs_fmt_sint32":
                 self.assertEqual((args, env["VKC_OUT_WORDS"]), (("1", "dump"), "64"))
                 Path(env["VKC_DUMP"]).write_bytes(struct.pack("<64I", *check.FMT_SINT32_WORDS))
+                return 0, ""
+            if name == "cs_fmt_int_narrow":
+                self.assertEqual((args, env["VKC_OUT_WORDS"]), (("1", "dump"), "136"))
+                Path(env["VKC_DUMP"]).write_bytes(struct.pack("<136I", *check.FMT_INT_NARROW_WORDS))
                 return 0, ""
             if name in ("cs_fmt_xy_xyz", "cs_tbuffer_store"):
                 self.assertEqual((args, env["VKC_OUT_WORDS"]), (("1", "dump"), "192"))
@@ -358,12 +363,31 @@ class PixelDeviceLimits(unittest.TestCase):
         self.assertIn("64-wide fragment subgroup", problem)
         self.assertIn("8..8", problem)
 
+    def test_wave64_pixel_shader_skips_where_the_harness_says_64_is_not_available(self):
+        # vk_harness.cpp's line for a size the device could not take; it must not read as "64 was required".
+        out = "device: fake (subgroup 32..32)\nfragment subgroup size: 64 not available\nok 64x64\n"
+        problem = self.run_pixel("ps_w64x_readlane", 0, out, data=self.readlane_pixels())
+        self.assertIsInstance(problem, check.Skip)
+        self.assertIn("64-wide fragment subgroup", problem)
+
     def test_wave64_pixel_shader_is_judged_when_64_was_required(self):
-        out = "device: fake (subgroup 32..64)\nfragment subgroup size: 64 required\nok 64x64\n"
+        # The line as vk_harness.cpp prints it when the size took effect: "fragment subgroup size: %u\n".
+        out = "device: fake (subgroup 32..64)\nfragment subgroup size: 64\nok 64x64\n"
         self.assertEqual(self.run_pixel("ps_w64x_readlane", 0, out, data=self.readlane_pixels()), "")
         problem = self.run_pixel("ps_w64x_readlane", 0, out, data=self.readlane_pixels((0, 0, 0, 0)))
         self.assertNotIsInstance(problem, check.Skip)
         self.assertIn("pixels differ", problem)
+
+    def test_wide_pixel_skip_reads_the_line_vk_harness_prints(self):
+        # Keeps the check and the harness in step: the format string is read from vk_harness.cpp, not written here.
+        harness = Path(__file__).resolve().parents[1] / "runtime" / "test" / "vk_harness.cpp"
+        source = harness.read_text(encoding="utf-8")
+        formats = re.findall(r'"(fragment subgroup size: %u[^"]*)\\n"', source)
+        self.assertEqual(sorted(formats), ["fragment subgroup size: %u", "fragment subgroup size: %u not available"])
+        taken, refused = (f.replace("%u", "64") + "\n" for f in sorted(formats))
+        self.assertIsNone(check.wide_pixel_skip("ps_w64x_readlane", "device: fake (subgroup 32..64)\n" + taken))
+        self.assertIsInstance(check.wide_pixel_skip("ps_w64x_readlane", "device: fake (subgroup 32..32)\n" + refused),
+                              check.Skip)
 
     def test_bitmask_perm_skips_when_variable_device_runs_narrow_fragment_subgroup(self):
         out = "device: Intel(R) HD Graphics 530 (subgroup 8..32)\nok 64x64\n"
@@ -462,6 +486,60 @@ class SeededPixelTests(unittest.TestCase):
         problem, _ = self.run_pixel_test((), code=77, out="unsupported: VKH_HEAP needs bufferDeviceAddress\n")
         self.assertIsInstance(problem, check.Skip)
         self.assertIn("needs bufferDeviceAddress", problem)
+
+
+class SignedZeroUnjudgedWords(unittest.TestCase):
+    """cs_signed_zero_nan's -0 products (words 0, 2 and 3) aren't judged on Apple GPUs, which return +0 for them with
+    or without SignedZeroInfNanPreserve (#1203), and its 0 * inf NaN check (word 5) isn't judged on Mesa llvmpipe,
+    which returns 0 there with or without it (#664). Their other words still are, and every other device judges all."""
+    APPLE_WORDS = [0, 0x80000000, 0, 0, 1, 1, 1, 0x7C00]   # what MoltenVK returned in #664
+    LLVMPIPE = "llvmpipe (LLVM 21.1.8, 256 bits)"
+    LLVMPIPE_WORDS = [0x80000000, 0x80000000, 0x80008000, 0x8000, 1, 0, 1, 0x7C00]   # what llvmpipe returned in #664
+
+    def compute(self, device, words, subgroup="32..32"):
+        out = f"device: {device} (subgroup {subgroup})\nout[0..7] = " + " ".join(map(str, words)) + "\n"
+        with patch.object(check, "run", return_value=(0, out)):
+            return check.compute_test("tools", "spirv", "cs_signed_zero_nan", "1", "dump",
+                                      expected_words=check.SIGNED_ZERO_NAN)
+
+    def test_apple_does_not_judge_the_minus_zero_products(self):
+        self.assertEqual(self.compute("Apple M1 Max", self.APPLE_WORDS), "")
+
+    def test_apple_still_judges_the_nan_checks(self):
+        words = list(self.APPLE_WORDS)
+        words[4] = 0   # an x != x NaN check folded to false, as without the execution mode
+        self.assertNotEqual(self.compute("Apple M1 Max", words), "")
+
+    def test_llvmpipe_does_not_judge_the_zero_times_inf_check(self):
+        self.assertEqual(self.compute(self.LLVMPIPE, self.LLVMPIPE_WORDS, "8..8"), "")
+
+    def test_llvmpipe_still_judges_the_other_words(self):
+        for i, wrong in ((4, 0), (6, 0), (0, 0), (7, 0)):   # a folded NaN check, a lost -0, a lost NaN conversion
+            words = list(self.LLVMPIPE_WORDS)
+            words[i] = wrong
+            self.assertNotEqual(self.compute(self.LLVMPIPE, words, "8..8"), "", i)
+
+    def test_other_devices_judge_every_word(self):
+        self.assertNotEqual(self.compute("AMD Radeon RX 9070 XT", self.APPLE_WORDS), "")
+        self.assertNotEqual(self.compute("AMD Radeon RX 9070 XT", self.LLVMPIPE_WORDS), "")
+        self.assertEqual(self.compute("AMD Radeon RX 9070 XT", check.SIGNED_ZERO_NAN), "")
+
+    def test_only_cs_signed_zero_nan_has_unjudged_words(self):
+        out = "device: Apple M1 Max (subgroup 32..32)\n"
+        self.assertEqual(check.judged_words("cs_store", out, check.CS_STORE), check.CS_STORE)
+
+    def test_run_gpu_tests_uses_the_same_rule(self):
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+        import run_gpu_tests
+        for device, words in (("Apple M1 Max (subgroup 32..32)", self.APPLE_WORDS),
+                              (self.LLVMPIPE + " (subgroup 8..8)", self.LLVMPIPE_WORDS)):
+            msg = f"device: {device}\nout[0..7] = " + " ".join(map(str, words)) + "\n"
+            want = check.judged_words("cs_signed_zero_nan", msg, check.SIGNED_ZERO_NAN)
+            ok, _ = run_gpu_tests.judge_cs_dump(0, msg, want, wave64=False, partial=False, emulated=False)
+            self.assertTrue(ok, device)
+            ok, _ = run_gpu_tests.judge_cs_dump(0, msg, check.SIGNED_ZERO_NAN, wave64=False, partial=False,
+                                                emulated=False)
+            self.assertFalse(ok, device)
 
 
 class TextureMipChecks(unittest.TestCase):
@@ -781,7 +859,6 @@ class Wave32LaneDumps(unittest.TestCase):
                 self.assertNotIsInstance(self.run_dump(name, 0, out + self.words(name, flip=True)), check.Skip)
 
 
-
 class SamplerMipChecks(unittest.TestCase):
     """The S#/T# oracle check.py judges vk_sampler_test with, against hand-worked levels."""
 
@@ -818,6 +895,7 @@ class SamplerMipChecks(unittest.TestCase):
         swapped = b"".join(struct.pack("<4f", *check.sampler_texel(0, y, x), *check.sampler_texel(1, y, x))
                            for y in range(64) for x in range(64))
         self.assertTrue(check.sampler_mismatch(swapped, words, view).startswith("(32,0):"))
+
 
 if __name__ == "__main__":
     unittest.main()

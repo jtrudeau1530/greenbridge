@@ -28,7 +28,8 @@ methods are still open.
 
 - Python tools run with `python -I` and use only the standard library unless a file says otherwise.
 - A text file a tool writes (JSON, CSV, a manifest, an assembly listing) names its line ending: `open(path, "w",
-  encoding="utf-8", newline="\n")`, so the output is LF on Windows too and the same input gives the same bytes on every
+  encoding="utf-8", newline="\n")` (the same for `Path.open`, `Path.write_text` and a text-mode
+  `tempfile.NamedTemporaryFile`), so the output is LF on Windows too and the same input gives the same bytes on every
   platform. `tests/test_text_write_line_endings.py` fails for a writer that forgets it.
 - `tools/rpf9dump` needs the submodule: `git submodule update --init`.
 - A new shader-translator rule goes into the contract table in `docs/design.md`, with how it was confirmed: a GPU

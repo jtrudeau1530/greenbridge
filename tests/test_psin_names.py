@@ -161,6 +161,69 @@ class TestCli(unittest.TestCase):
         self.assertEqual(r.returncode, 2)
         self.assertEqual(len(r.stderr.strip().splitlines()), 1)
 
+    def test_names_json_of_another_shape_is_one_line(self):
+        """--names x.json that is not what rpf9_names.py writes used to end in AttributeError or TypeError."""
+        top_message = "expected rpf9_names.py JSON, an object with a 'files' array"
+        row_message = "each 'files' row must be an object whose 'names' is an array of strings"
+        cases = [
+            ([], top_message),
+            ("names", top_message),
+            ({"files": None}, top_message),
+            ({"files": {"names": ["prop_crate_01"]}}, top_message),
+            ({"files": [3]}, row_message),
+            ({"files": [{"names": ["prop_crate_01"]}, ["prop_barrel_02"]]}, row_message),
+            ({"files": [{"names": "prop_crate_01"}]}, row_message),
+            ({"files": [{"names": None}]}, row_message),
+            ({"files": [{"names": ["prop_crate_01", 5]}]}, row_message),
+        ]
+        with tempfile.TemporaryDirectory() as d:
+            src = os.path.join(d, "c")
+            os.mkdir(src)
+            with open(os.path.join(src, "0001.bin"), "wb") as f:
+                f.write(sample())
+            good = os.path.join(d, "good.txt")
+            with open(good, "w", encoding="utf-8", newline="\n") as f:
+                f.write("\n".join(NAMES))
+            refs = os.path.join(d, "refs.tsv")
+            with open(refs, "w", encoding="utf-8", newline="\n") as f:
+                f.write("an earlier report\n")
+            for i, (document, message) in enumerate(cases):
+                with self.subTest(document=document):
+                    bad = os.path.join(d, f"bad{i}.json")
+                    with open(bad, "w", encoding="utf-8", newline="\n") as f:
+                        json.dump(document, f)
+                    # A good list first: every --names file is checked, and the message names the bad one.
+                    r = self.run_tool(src, "--names", good, "--names", bad, "--refs", refs)
+                    self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+                    self.assertNotIn("Traceback", r.stderr)
+                    self.assertEqual(r.stderr, f"ERROR: {bad}: {message}\n")
+                    self.assertEqual(r.stdout, "")
+                    with open(refs, encoding="utf-8") as f:
+                        self.assertEqual(f.read(), "an earlier report\n")
+
+    def test_names_file_that_is_not_json_names_the_file(self):
+        with tempfile.TemporaryDirectory() as d:
+            for i, blob in enumerate((b"", b"{not json", b"\xff\xfe{}")):
+                with self.subTest(blob=blob):
+                    bad = os.path.join(d, f"bad{i}.json")
+                    with open(bad, "wb") as f:
+                        f.write(blob)
+                    r = self.run_tool(d, "--names", bad)
+                    self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+                    lines = r.stderr.splitlines()
+                    self.assertEqual(len(lines), 1, r.stderr)
+                    self.assertTrue(lines[0].startswith(f"ERROR: {bad}: not JSON: "), r.stderr)
+
+    def test_names_json_without_files_or_names_still_loads(self):
+        with tempfile.TemporaryDirectory() as d:
+            paths = []
+            for i, document in enumerate(({}, {"summary": {}}, {"files": []}, {"files": [{}, {"names": []}]},
+                                          {"files": [{"names": ["prop_crate_01.#dr"]}]})):
+                paths.append(os.path.join(d, f"n{i}.json"))
+                with open(paths[-1], "w", encoding="utf-8", newline="\n") as f:
+                    json.dump(document, f)
+            self.assertEqual(N.load_names(paths), {"prop_crate_01"})
+
 
 if __name__ == "__main__":
     unittest.main()
