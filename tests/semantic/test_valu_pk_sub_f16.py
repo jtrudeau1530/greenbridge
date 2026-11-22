@@ -1349,5 +1349,112 @@ class TestIEEE754BoundaryExtremes(unittest.TestCase):
         self.assertEqual(bits_to_f16(r_hi), 6.0)
 
 
+class TestNegativeControlsAndMutations(unittest.TestCase):
+    """Unit tests for negative controls, syntax rejection, and mutation detection."""
+
+    def setUp(self) -> None:
+        self.interp = ScalarInterpreter()
+        self.simd_interp = SIMDInterpreter()
+
+    def test_negative_control_invalid_register_indices(self) -> None:
+        with self.assertRaises(ValueError):
+            Reg32(-1, RegType.VGPR)
+        with self.assertRaises(ValueError):
+            Reg32(256, RegType.VGPR)
+        with self.assertRaises(ValueError):
+            Reg32(-5, RegType.SGPR)
+        with self.assertRaises(ValueError):
+            Reg32(300, RegType.SGPR)
+
+    def test_negative_control_sgpr_destination_rejected(self) -> None:
+        with self.assertRaises(TypeError):
+            VPkSubF16Instruction(
+                dst=Reg32(0, RegType.SGPR),
+                src0=VOP3POperand(Reg32(1, RegType.VGPR)),
+                src1=VOP3POperand(Reg32(2, RegType.VGPR)),
+            )
+
+    def test_negative_control_invalid_op_sel(self) -> None:
+        v = Reg32(0, RegType.VGPR)
+        with self.assertRaises(ValueError):
+            VOP3POperand(v, op_sel_lo=-1)
+        with self.assertRaises(ValueError):
+            VOP3POperand(v, op_sel_hi=2)
+
+    def test_negative_control_invalid_simd_lane_count(self) -> None:
+        with self.assertRaises(ValueError):
+            SIMDState(num_lanes=16)
+        with self.assertRaises(ValueError):
+            SIMDState(num_lanes=48)
+        with self.assertRaises(ValueError):
+            SIMDState(num_lanes=128)
+
+    def test_negative_control_unsupported_operand_type(self) -> None:
+        state = ScalarMachineState()
+        dummy_op = VOP3POperand(source=None)  # type: ignore
+        with self.assertRaises(TypeError):
+            self.interp.resolve_operand(dummy_op, state)
+
+    def test_mutation_detection_addition_vs_subtraction(self) -> None:
+        s0 = pack_2xf16(f16_to_bits(10.0), f16_to_bits(20.0))
+        s1 = pack_2xf16(f16_to_bits(4.0), f16_to_bits(5.0))
+        oracle_res = oracle_v_pk_sub_f16(s0, s1)
+
+        # Mutate to addition
+        mutated_lo = f16_to_bits(10.0 + 4.0)
+        mutated_hi = f16_to_bits(20.0 + 5.0)
+        mutated_res = pack_2xf16(mutated_lo, mutated_hi)
+        self.assertNotEqual(oracle_res, mutated_res)
+
+    def test_mutation_detection_clamp_omission(self) -> None:
+        # Results exceed 1.0 or fall below 0.0
+        s0 = pack_2xf16(f16_to_bits(2.0), f16_to_bits(0.2))
+        s1 = pack_2xf16(f16_to_bits(0.5), f16_to_bits(0.8))
+        clamped_oracle = oracle_v_pk_sub_f16(s0, s1, clamp=True)
+        unclamped = oracle_v_pk_sub_f16(s0, s1, clamp=False)
+        self.assertNotEqual(clamped_oracle, unclamped)
+        c_lo, c_hi = unpack_2xf16(clamped_oracle)
+        self.assertEqual(c_lo, ONE_F16)
+        self.assertEqual(c_hi, POS_ZERO_F16)
+
+    def test_mutation_detection_op_sel_swapping(self) -> None:
+        s0 = pack_2xf16(f16_to_bits(10.0), f16_to_bits(50.0))
+        s1 = pack_2xf16(f16_to_bits(2.0), f16_to_bits(100.0))
+        res_default = oracle_v_pk_sub_f16(s0, s1, op_sel=(0, 0), op_sel_hi=(1, 1))
+        res_swapped = oracle_v_pk_sub_f16(s0, s1, op_sel=(1, 1), op_sel_hi=(0, 0))
+        self.assertNotEqual(res_default, res_swapped)
+
+    def test_mutation_detection_negation_omission(self) -> None:
+        s0 = pack_2xf16(f16_to_bits(5.0), f16_to_bits(5.0))
+        s1 = pack_2xf16(f16_to_bits(2.0), f16_to_bits(2.0))
+        res_neg = oracle_v_pk_sub_f16(s0, s1, neg_lo=(True, False))
+        res_no_neg = oracle_v_pk_sub_f16(s0, s1, neg_lo=(False, False))
+        self.assertNotEqual(res_neg, res_no_neg)
+        r_lo, _ = unpack_2xf16(res_neg)
+        self.assertEqual(bits_to_f16(r_lo), -7.0)  # -5.0 - 2.0 = -7.0
+
+    def test_mutation_detection_nan_quietening_omission(self) -> None:
+        snan = 0x7C03
+        res = oracle_sub_f16(snan, f16_to_bits(1.0))
+        self.assertNotEqual(res, snan)
+        self.assertEqual(res, snan | QNAN_BIT_F16)
+
+    def test_mutation_detection_inactive_lane_write(self) -> None:
+        sentinel = 0x55AA_55AA
+        state = SIMDState(num_lanes=32, exec_mask=0x0000_0001)  # only lane 0 active
+        for lane in range(32):
+            state.set_vgpr(lane, 0, sentinel)
+
+        instr = VPkSubF16Instruction(
+            dst=Reg32(0, RegType.VGPR),
+            src0=VOP3POperand(Literal32.from_floats(5.0, 5.0)),
+            src1=VOP3POperand(Literal32.from_floats(2.0, 2.0)),
+        )
+        self.simd_interp.step(instr, state)
+        self.assertNotEqual(state.get_vgpr(0, 0), sentinel)
+        for lane in range(1, 32):
+            self.assertEqual(state.get_vgpr(lane, 0), sentinel)
+
+
 if __name__ == "__main__":
     unittest.main()
