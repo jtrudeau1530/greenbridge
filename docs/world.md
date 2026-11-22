@@ -262,15 +262,14 @@ that was a lower bound, and the full pass settles the extrapolation. See
 coverage.
 
 The full count is lower than SixNG's published 30,785 map files / 2,249,490 entities
-(https://github.com/holdmysocks/SixNG). A census of the other ten non-radio archives found no maps
-outside `levels.rpf`, so the 7,250-map / 579,048-entity difference is not explained by other archives;
-duplicate map payloads and map-name hashes are zero, and the 138,839 `CMapData`-only metadata
-resources cannot account for the 579,048 entities (see
-[world_census.md](world_census.md#other-archives)). The census counts only
-validated `0x7a` resources whose schema includes `CMapData` and whose entity table is self-consistent;
-SixNG may count archive entries, nested maps, or map resources that this scanner rejects. Treat the
-23,535 / 1,670,442 figure as the measured count for this package and this validation rule, not as a
-claim about a different enumeration method.
+(https://github.com/holdmysocks/SixNG), and the whole difference is now accounted for map by map (see
+[world_census.md](world_census.md#the-sixng-difference-map-by-map)). The 23,528 maps both count agree
+on every entity count. SixNG also counts 7,257 `0x7a` resources that have `CEntityDef` objects but no
+`CMapData` struct: 961 interior archetype resources (`CMloArchetypeDef`, 540,665 entities in interior
+space) and 6,296 `35abc248` entity groups (39,622 entities in group-local space). It misses 7 maps
+(1,239 entities) whose entity data is in a continuation page. 7,257 − 7 = 7,250 maps and 580,287 −
+1,239 = 579,048 entities. The 23,535 / 1,670,442 census figure is the count of world placement
+lists; interiors and entity groups need the transform of whatever places them.
 
 ## What is readable, what is hash-only
 

@@ -29,7 +29,7 @@ method, scope and caveats. No game data is included.
 | [gamedata.md](gamedata.md) | `common.rpf`: 954 streams, 266 XML documents / 118 roots; 0 RBF0/PSIN. |
 | [gamedata_graph.md](gamedata_graph.md) | `common.rpf` mount graph: 25 manifest documents, 30 content-set ids, 14 include refs (12 resolve), 3,386 target refs, 0 cycles. |
 | [world.md](world.md) | `levels.rpf` placement: 9,918 map files / 680,228 entities measured in 55% of the archive (lower bound; estimate 16k-39.6k / 1.03M-2.64M); `0x7a` resource layout. |
-| [world_census.md](world_census.md) | Full `levels.rpf` pass: 23,535 maps / 1,670,442 entities, 98.32% stream coverage, sharded and exact. |
+| [world_census.md](world_census.md) | Full `levels.rpf` pass: 23,535 maps / 1,670,442 entities, 98.32% stream coverage, sharded and exact; the SixNG 30,785-map difference reconciled map by map (interiors and entity groups). |
 | [world_names.md](world_names.md) | Name resolution: `archetypeName` and map `name`/`parent` are lower-cased joaat; 64-bit keys are MurmurHash3 x64 low 64. With `rpf9_names.py` names, 99.85% of the 1,670,435 entities a whole-archive `world_index` run reads resolve (64-bit verified); 5/23,535 map names, all five confirmed by the map 64-bit key. |
 | [page_directory.md](page_directory.md) | RPF9 `0DRP`: 0x60-byte header, `q38` 16-byte records; 15,768 pages / 60,880 records in `data.rpf`; targets and sizes, names still TOC-only. |
 | [psin.md](psin.md) | PSIN metadata container: header, section walk, `LSCH`/`LENM` schema, and the instance data (block table, pointers, arrays, maps) read through it on 17,507 containers, 99.986% of block bytes reached. |
