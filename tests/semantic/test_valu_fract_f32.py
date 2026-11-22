@@ -18,9 +18,13 @@ against independent Fraction-based IEEE-754 `x - floor(x)` reference oracles:
   - Special IEEE-754 values:
     * +0.0 -> +0.0 and -0.0 -> +0.0 (sign bit strictly 0).
     * +-inf -> NaN and NaN -> NaN.
-  - Hardware/translator rounding boundary: when x - floor(x) rounds to 1.0
-    (e.g. tiny negatives), the result is clamped to 0x3F7FFFFF (f32, largest
-    float < 1.0) and 0x3BFF (f16, largest half < 1.0).
+  - Subnormal bounds and rounding transitions:
+    * Positive subnormals (x in (0, 2^-126) for f32, (0, 2^-14) for f16) have
+      floor(x) == 0, so fract(x) == x exact.
+    * Negative subnormals and tiny negatives: x - floor(x) = 1.0 - |x|, which
+      rounds to 1.0 in IEEE-754 nearest-even. The RDNA2 hardware contract and
+      translator clamp any result that rounded up to 1.0 to 0x3F7FFFFF (f32,
+      largest float < 1.0) and 0x3BFF (f16, largest half < 1.0).
   - Forms: _e32, _e64, and bare mnemonics.
   - Half-precision op_sel combinations ([0,0], [1,0], [0,1], [1,1]) preserving
     untouched halves of destination VGPRs.
@@ -28,6 +32,10 @@ against independent Fraction-based IEEE-754 `x - floor(x)` reference oracles:
     (clamp, mul:2, mul:4, div:2, mul:2 clamp, mul:4 clamp).
   - Inline constants (0.5, -0.5, 1.0, -1.0), SGPR sources (s4), destination
     aliasing (v0, v0), and runtime memory inputs via s_buffer_load_dwordx4.
+  - Negative controls: mutating SPIR-V Fract to Trunc/Floor or removing the
+    rounding clamp fails test assertions.
+  - Multi-lane SIMD divergence under EXEC mask across 8-thread, 16-thread, and
+    32-thread compute wavefronts.
 
 Zero game data; hand-written RDNA2 assembly only; standard library Python only.
 """
@@ -37,6 +45,7 @@ import gc
 import itertools
 import math
 import os
+import re
 import struct
 import sys
 import tempfile
@@ -65,6 +74,19 @@ HEAP_FILL = 0xEEEEEEEE
 # Representative IEEE-754 binary32 bit encodings.
 F_POS_ZERO = 0x00000000      # +0.0
 F_NEG_ZERO = 0x80000000      # -0.0
+F_SUB_MIN = 0x00000001       # +2^-149 (smallest positive subnormal)
+F_NEG_SUB_MIN = 0x80000001   # -2^-149
+F_SUB_1E40 = 0x000116C2      # ~+1.0003e-40 (subnormal)
+F_NEG_SUB_1E40 = 0x800116C2  # ~-1.0003e-40
+F_SUB_MAX = 0x007FFFFF       # largest positive subnormal (2^-126 - 2^-149)
+F_NEG_SUB_MAX = 0x807FFFFF   # largest negative subnormal magnitude
+F_NORM_MIN = 0x00800000      # +2^-126 (smallest positive normal)
+F_NEG_NORM_MIN = 0x80800000  # -2^-126
+F_NEG_1E10 = 0xAEDBE6FF      # -1e-10
+F_NEG_2PM26 = 0xB2800000     # -2^-26
+F_NEG_2PM25 = 0xB3000000     # -2^-25 (exact rounding midpoint to 1.0)
+F_NEG_2PM24 = 0xB3800000     # -2^-24: 1 - 2^-24 = 0x3F7FFFFF exact
+F_NEG_2PM23 = 0xB4000000     # -2^-23: 1 - 2^-23 = 0x3F7FFFFE exact
 F_0P125 = 0x3E000000         # 0.125
 F_0P25 = 0x3E800000          # 0.25
 F_NEG_0P25 = 0xBE800000      # -0.25
@@ -110,6 +132,12 @@ F_NEG_SNAN = 0xFF800001      # -sNaN
 # Representative IEEE-754 binary16 bit encodings.
 H_POS_ZERO = 0x0000          # +0.0
 H_NEG_ZERO = 0x8000          # -0.0
+H_SUB_MIN = 0x0001           # +2^-24
+H_NEG_SUB_MIN = 0x8001       # -2^-24
+H_SUB_MAX = 0x03FF           # largest positive subnormal
+H_NEG_SUB_MAX = 0x83FF       # largest negative subnormal
+H_NORM_MIN = 0x0400          # +2^-14
+H_NEG_NORM_MIN = 0x8400      # -2^-14
 H_0P125 = 0x3000             # 0.125
 H_0P25 = 0x3400              # 0.25
 H_NEG_0P25 = 0xB400          # -0.25
@@ -445,6 +473,9 @@ class OracleF32Tests(unittest.TestCase):
     def test_fraction_decode_and_roundtrip(self):
         samples = [
             F_POS_ZERO, F_NEG_ZERO,
+            F_SUB_MIN, F_NEG_SUB_MIN, F_SUB_1E40, F_NEG_SUB_1E40,
+            F_SUB_MAX, F_NEG_SUB_MAX, F_NORM_MIN, F_NEG_NORM_MIN,
+            F_NEG_1E10, F_NEG_2PM26, F_NEG_2PM25, F_NEG_2PM24, F_NEG_2PM23,
             F_0P125, F_0P25, F_NEG_0P25, F_0P375,
             F_0P5, F_NEG_0P5, F_0P75, F_NEG_0P75,
             F_NEAR_ONE, F_1P0, F_NEG_1P0,
@@ -467,6 +498,19 @@ class OracleF32Tests(unittest.TestCase):
         rows = [
             (F_POS_ZERO, F_POS_ZERO),
             (F_NEG_ZERO, F_POS_ZERO),
+            (F_SUB_MIN, F_SUB_MIN),
+            (F_SUB_1E40, F_SUB_1E40),
+            (F_SUB_MAX, F_SUB_MAX),
+            (F_NORM_MIN, F_NORM_MIN),
+            (F_NEG_SUB_MIN, F_NEAR_ONE),
+            (F_NEG_SUB_1E40, F_NEAR_ONE),
+            (F_NEG_SUB_MAX, F_NEAR_ONE),
+            (F_NEG_NORM_MIN, F_NEAR_ONE),
+            (F_NEG_1E10, F_NEAR_ONE),
+            (F_NEG_2PM26, F_NEAR_ONE),
+            (F_NEG_2PM25, F_NEAR_ONE),
+            (F_NEG_2PM24, F_NEAR_ONE),
+            (F_NEG_2PM23, 0x3F7FFFFE),
             (F_0P25, F_0P25),
             (F_NEG_0P25, F_0P75),
             (F_0P5, F_0P5),
@@ -508,7 +552,6 @@ class OracleF32Tests(unittest.TestCase):
             0.0, 0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0, 42.125, 100.875,
         ]
         for val in test_inputs:
-            w = struct.unpack("<f", struct.pack("<f", val))[0]
             bits = struct.unpack("<I", struct.pack("<f", val))[0]
             res_w = oracle_fract_f32(bits)
             res_val = struct.unpack("<f", struct.pack("<I", res_w))[0]
@@ -544,6 +587,8 @@ class OracleF16Tests(unittest.TestCase):
     def test_fraction_roundtrip_f16(self):
         samples = [
             H_POS_ZERO, H_NEG_ZERO,
+            H_SUB_MIN, H_NEG_SUB_MIN, H_SUB_MAX, H_NEG_SUB_MAX,
+            H_NORM_MIN, H_NEG_NORM_MIN,
             H_0P125, H_0P25, H_NEG_0P25, H_0P375,
             H_0P5, H_NEG_0P5, H_0P75, H_NEG_0P75,
             H_NEAR_ONE, H_1P0, H_NEG_1P0,
@@ -565,6 +610,12 @@ class OracleF16Tests(unittest.TestCase):
         rows = [
             (H_POS_ZERO, H_POS_ZERO),
             (H_NEG_ZERO, H_POS_ZERO),
+            (H_SUB_MIN, H_SUB_MIN),
+            (H_NEG_SUB_MIN, H_NEAR_ONE),
+            (H_SUB_MAX, H_SUB_MAX),
+            (H_NEG_SUB_MAX, H_NEAR_ONE),
+            (H_NORM_MIN, H_NORM_MIN),
+            (H_NEG_NORM_MIN, H_NEAR_ONE),
             (H_0P25, H_0P25),
             (H_NEG_0P25, H_0P75),
             (H_0P5, H_0P5),
@@ -624,7 +675,6 @@ class PrecisionF32VsF16Tests(unittest.TestCase):
     """Contrasts precision limits and verifies mathematical agreement between f32 and f16."""
 
     def test_common_exact_fractions_identical_mathematics(self):
-        # Pairs of (f32_pattern, f16_pattern) representing the exact same mathematical number
         pairs = [
             (F_0P25, H_0P25),
             (F_NEG_0P25, H_NEG_0P25),
@@ -932,6 +982,253 @@ class FractF16AndEdgeCaseExecutionTests(unittest.TestCase):
         self.assertEqual(out[1] & 0xFFFF, H_0P25)
         self.assertEqual(out[2], F_0P75)
         self.assertEqual(out[3] & 0xFFFF, H_0P25)
+
+
+# -----------------------------------------------------------------------------
+# Subnormal Bounds, Negative Controls, and SIMD Tests
+# -----------------------------------------------------------------------------
+
+class SubnormalAndRoundingBoundaryTests(unittest.TestCase):
+    """Audits subnormal numbers, boundary rounding transitions, and clamp behavior."""
+
+    def test_f32_positive_subnormals(self):
+        # Positive subnormals x have floor(x) == 0, so fract(x) == x.
+        cases = [
+            F_SUB_MIN,
+            F_SUB_1E40,
+            F_SUB_MAX,
+            F_NORM_MIN,
+        ]
+        for w in cases:
+            with self.subTest(w=hex(w)):
+                self.assertEqual(oracle_fract_f32(w), w)
+                self.assertEqual(run_op("v_fract_f32_e32 v0, v1", w), w)
+                self.assertEqual(run_op("v_fract_f32 v0, v1", w), w)
+
+    def test_f32_tiny_negatives_and_rounding_transition(self):
+        # For x in (-2^-24, 0), exact x - floor(x) rounds to 1.0 in binary32.
+        # Under RDNA2 hardware semantics and fract_below_one, this must return 0x3F7FFFFF (never 1.0).
+        cases = [
+            (F_NEG_SUB_MIN, F_NEAR_ONE),
+            (F_NEG_SUB_1E40, F_NEAR_ONE),
+            (F_NEG_SUB_MAX, F_NEAR_ONE),
+            (F_NEG_NORM_MIN, F_NEAR_ONE),
+            (F_NEG_1E10, F_NEAR_ONE),
+            (F_NEG_2PM26, F_NEAR_ONE),
+            (F_NEG_2PM25, F_NEAR_ONE),     # exact tie -> rounds to 1.0 -> clamped to 0x3F7FFFFF
+            (F_NEG_2PM24, F_NEAR_ONE),     # 1 - 2^-24 = 0x3F7FFFFF exact
+            (F_NEG_2PM23, 0x3F7FFFFE),     # 1 - 2^-23 = 0x3F7FFFFE exact
+        ]
+        for inp, want in cases:
+            with self.subTest(inp=hex(inp)):
+                self.assertEqual(oracle_fract_f32(inp), want)
+                self.assertEqual(run_op("v_fract_f32_e32 v0, v1", inp), want)
+                self.assertEqual(run_op("v_fract_f32_e64 v0, v1", inp), want)
+
+    def test_f16_subnormals_and_boundary(self):
+        # Positive subnormals retain exact bits; negative subnormals clamp to 0x3BFF.
+        self.assertEqual(run_op("v_fract_f16_e32 v0, v1", H_SUB_MIN), merge_half(OLD, H_SUB_MIN, 0))
+        self.assertEqual(run_op("v_fract_f16_e32 v0, v1", H_SUB_MAX), merge_half(OLD, H_SUB_MAX, 0))
+        self.assertEqual(run_op("v_fract_f16_e32 v0, v1", H_NEG_SUB_MIN), merge_half(OLD, H_NEAR_ONE, 0))
+        self.assertEqual(run_op("v_fract_f16_e32 v0, v1", H_NEG_SUB_MAX), merge_half(OLD, H_NEAR_ONE, 0))
+
+
+class NegativeControlSabotageTests(unittest.TestCase):
+    """Validates that test assertions detect invalid SPIR-V translations or omitted clamps."""
+
+    def test_sabotage_fract_to_trunc(self):
+        # fract(-1.25) == 0.75; trunc(-1.25) == -1.0 (0xBF800000)
+        spv = translate_ps([
+            f"v_mov_b32 v1, {F_NEG_1P25:#x}",
+            "v_fract_f32_e32 v0, v1",
+        ])
+        expected = F_0P75
+        self.assertEqual(si.run_fragment(spv)["%out_mrt0"][0], expected)
+
+        sabotaged, count = re.subn(r"\bFract\b", "Trunc", spv, count=1)
+        self.assertEqual(count, 1)
+        got = si.run_fragment(sabotaged)["%out_mrt0"][0]
+        self.assertNotEqual(got, expected)
+        self.assertEqual(got, F_NEG_1P0)
+
+    def test_sabotage_fract_to_floor(self):
+        # fract(-1.25) == 0.75; floor(-1.25) == -2.0 (0xC0000000)
+        spv = translate_ps([
+            f"v_mov_b32 v1, {F_NEG_1P25:#x}",
+            "v_fract_f32_e32 v0, v1",
+        ])
+        expected = F_0P75
+        self.assertEqual(si.run_fragment(spv)["%out_mrt0"][0], expected)
+
+        sabotaged, count = re.subn(r"\bFract\b", "Floor", spv, count=1)
+        self.assertEqual(count, 1)
+        got = si.run_fragment(sabotaged)["%out_mrt0"][0]
+        self.assertNotEqual(got, expected)
+        self.assertEqual(got, F_NEG_2P0)
+
+    def test_sabotage_clamp_selection(self):
+        # For x = -1e-10, GLSL.std.450 Fract rounds to 1.0 (0x3F800000).
+        # Without OpSelect clamp to 0x3F7FFFFF, result incorrectly violates [0.0, 1.0).
+        spv = translate_ps([
+            f"v_mov_b32 v1, {F_NEG_1E10:#x}",
+            "v_fract_f32_e32 v0, v1",
+        ])
+        expected = F_NEAR_ONE
+        self.assertEqual(si.run_fragment(spv)["%out_mrt0"][0], expected)
+
+        # Bypass the OpSelect clamp by replacing OpSelect %float %cond %clamped %raw with OpCopyObject %float %raw
+        sabotaged, count = re.subn(r"OpSelect %float %\w+ %\w+ (%\w+)", r"OpCopyObject %float \1", spv, count=1)
+        self.assertEqual(count, 1)
+        got = si.run_fragment(sabotaged)["%out_mrt0"][0]
+        self.assertNotEqual(got, expected)
+        self.assertEqual(got, F_1P0)
+
+
+class SimdDivergenceAndMaskingTests(unittest.TestCase):
+    """Audits multi-lane SIMD divergence, thread masking, and inactive lane preservation."""
+
+    def test_single_lane_exec_masking(self):
+        # exec_lo = 0 masks off execution -> pre-existing OLD preserved
+        self.assertEqual(run_ps([
+            f"v_mov_b32 v1, {F_1P5:#x}",
+            f"v_mov_b32 v0, {OLD:#x}",
+            "s_mov_b32 exec_lo, 0",
+            "v_fract_f32_e32 v0, v1",
+            "s_mov_b32 exec_lo, 1",
+        ]), OLD)
+
+        # re-enabling exec_lo executes normally
+        self.assertEqual(run_ps([
+            f"v_mov_b32 v1, {F_NEG_1P75:#x}",
+            f"v_mov_b32 v0, {OLD:#x}",
+            "s_mov_b32 exec_lo, 0",
+            "v_fract_f32_e32 v0, v1",
+            "s_mov_b32 exec_lo, 1",
+            "v_fract_f32_e32 v0, v1",
+        ]), F_0P25)
+
+    def test_multi_lane_divergence_8_threads(self):
+        # 8 compute threads: even threads active, odd threads masked off.
+        inputs = [
+            F_NEG_0P25,    # lane 0 (active): -0.25 -> 0.75
+            F_NEG_1P75,    # lane 1 (masked off)
+            F_NEG_1E10,    # lane 2 (active): -1e-10 -> 0x3F7FFFFF
+            F_3P75,        # lane 3 (masked off)
+            F_42P0,        # lane 4 (active): 42.0 -> +0.0
+            F_2P23,        # lane 5 (masked off)
+            F_2P23_M0P5,   # lane 6 (active): 2^23 - 0.5 -> 0.5
+            F_NEG_ZERO,    # lane 7 (masked off)
+        ]
+        lane_olds = [0xD0000000 + 0x01010101 * i for i in range(8)]
+        mem = _Heap(
+            {0x100 + 4 * i: w for i, w in enumerate(inputs)}
+            | {0x200 + 4 * i: w for i, w in enumerate(lane_olds)}
+        )
+
+        run_cs([
+            "v_lshlrev_b32_e32 v5, 2, v0",
+            "v_add_nc_u32_e32 v6, 0x100, v5",
+            "v_add_nc_u32_e32 v7, 0x200, v5",
+            "buffer_load_dword v1, v6, s[0:3], 0 offen",
+            "buffer_load_dword v2, v7, s[0:3], 0 offen",
+            "v_and_b32_e32 v3, 1, v0",
+            "v_cmp_eq_u32_e32 vcc_lo, 0, v3",
+            "s_and_saveexec_b32 s6, vcc_lo",
+            "v_fract_f32_e32 v2, v1",
+            "s_mov_b32 exec_lo, s6",
+            "buffer_store_dword v2, v5, s[0:3], 0 offen",
+        ], group_size=8, memory=mem)
+
+        got = [mem.get(4 * i) for i in range(8)]
+        want = []
+        for lane, (inp, old_val) in enumerate(zip(inputs, lane_olds)):
+            if lane % 2 == 1:
+                want.append(old_val)
+            else:
+                want.append(oracle_fract_f32(inp))
+        self.assertEqual(got, want)
+
+    def test_wavefront_32_threads_divergence(self):
+        inputs = [
+            F_NEG_0P25, F_NEG_1P75, F_0P25, F_0P75,
+            F_1P25, F_NEG_1P25, F_2P5, F_NEG_2P5,
+            F_3P75, F_NEG_3P75, F_42P0, F_NEG_42P0,
+            F_POS_ZERO, F_NEG_ZERO, F_1P0, F_NEG_1P0,
+            F_2P0, F_NEG_2P0, F_3P0, F_NEG_3P0,
+            F_1023P5, F_1024P0, F_1024P25, F_2P23_M0P5,
+            F_2P23, F_NEG_2P23, F_2P24, F_NEG_2P24,
+            F_NEAR_ONE, 0x3F7FFFFE, F_SUB_MIN, F_NEG_SUB_MIN,
+        ]
+        olds = [0xA0000000 + i for i in range(32)]
+        mem = _Heap(
+            {0x100 + 4 * i: inputs[i] for i in range(32)}
+            | {0x200 + 4 * i: olds[i] for i in range(32)}
+        )
+
+        run_cs([
+            "v_lshlrev_b32_e32 v5, 2, v0",
+            "v_add_nc_u32_e32 v6, 0x100, v5",
+            "v_add_nc_u32_e32 v7, 0x200, v5",
+            "buffer_load_dword v1, v6, s[0:3], 0 offen",
+            "buffer_load_dword v2, v7, s[0:3], 0 offen",
+            "v_and_b32_e32 v3, 1, v0",
+            "v_cmp_eq_u32_e32 vcc_lo, 0, v3",
+            "s_and_saveexec_b32 s6, vcc_lo",
+            "v_fract_f32_e32 v2, v1",
+            "s_mov_b32 exec_lo, s6",
+            "buffer_store_dword v2, v5, s[0:3], 0 offen",
+        ], group_size=32, memory=mem)
+
+        got = [mem.get(4 * i) for i in range(32)]
+        want = []
+        for i in range(32):
+            if i % 2 == 1:
+                want.append(olds[i])
+            else:
+                want.append(oracle_fract_f32(inputs[i]))
+        self.assertEqual(got, want)
+
+    def test_joint_f32_f16_simd_divergence(self):
+        # 16 threads executing both v_fract_f32 and v_fract_f16 under divergence
+        f32_inputs = [F_NEG_0P25, F_1P75, F_3P75, F_NEG_1P25] * 4
+        f16_inputs = [H_NEG_1P75, H_0P25, H_NEG_0P25, H_1023P5] * 4
+        lane_olds = [0x55000000 + i for i in range(16)]
+
+        mem = _Heap(
+            {0x100 + 4 * i: f32_inputs[i] for i in range(16)}
+            | {0x200 + 4 * i: f16_inputs[i] for i in range(16)}
+            | {0x300 + 4 * i: lane_olds[i] for i in range(16)}
+        )
+
+        run_cs([
+            "v_lshlrev_b32_e32 v5, 2, v0",
+            "v_add_nc_u32_e32 v6, 0x100, v5",
+            "v_add_nc_u32_e32 v7, 0x200, v5",
+            "v_add_nc_u32_e32 v8, 0x300, v5",
+            "buffer_load_dword v1, v6, s[0:3], 0 offen",
+            "buffer_load_dword v2, v7, s[0:3], 0 offen",
+            "buffer_load_dword v3, v8, s[0:3], 0 offen",
+            "v_and_b32_e32 v4, 1, v0",
+            "v_cmp_eq_u32_e32 vcc_lo, 0, v4",
+            "s_and_saveexec_b32 s6, vcc_lo",
+            "v_fract_f32_e32 v1, v1",
+            "v_fract_f16_e32 v2, v2",
+            "v_and_b32_e32 v2, 0xffff, v2",
+            "v_add_nc_u32_e32 v3, v1, v2",
+            "s_mov_b32 exec_lo, s6",
+            "buffer_store_dword v3, v5, s[0:3], 0 offen",
+        ], group_size=16, memory=mem)
+
+        got = [mem.get(4 * i) for i in range(16)]
+        want = []
+        for i in range(16):
+            if i % 2 == 1:
+                want.append(lane_olds[i])
+            else:
+                f32_res = oracle_fract_f32(f32_inputs[i])
+                f16_res = oracle_fract_f16(f16_inputs[i])
+                want.append((f32_res + f16_res) & 0xFFFFFFFF)
+        self.assertEqual(got, want)
 
 
 if __name__ == "__main__":
