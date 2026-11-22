@@ -13780,7 +13780,7 @@ def main():
                          "(guaranteed single rounding; needs VK_KHR_shader_fma + shaderFmaFloat32, listed in the "
                          "shader's metadata as capability FMAKHR / feature shaderFmaFloat32), exact = a single "
                          "rounding built from NoContraction f32 ops, for a device that splits Fma and has no "
-                         "VK_KHR_shader_fma (about 110 instructions per multiply-add; no extension needed)")
+                         "VK_KHR_shader_fma (about 110 instructions, 31 NoContraction decorations and 13 constants per multiply-add; no extension needed)")
     ap.add_argument("--f16-interp-fallback", action="store_true",
                     help="16-bit interpolation without PerVertexKHR inputs, for devices that can't compile them "
                          "(MoltenVK): VS and mesh params also export their f16 halves decoded to f32, which the PS "
