@@ -4615,9 +4615,10 @@ class Gen:
         elif op == "v_pack_b32_f16":
             # dst = f16(src0) | f16(src1) << 16, each taken from the low half (op_sel picks high halves).
             # neg/abs act on the selected 16-bit half of each source as plain bit moves, abs (clear bit 15) first and
-            # neg (xor bit 15) second: on a Radeon 680M (gfx1036) ``-v0`` turned 0x7c01 into 0xfc01 under IEEE 0 and
-            # 0xfe01 under IEEE 1, in either half and with op_sel (#1548 SHADER-260). abs rests on the ISA's sign
-            # clear, it was not measured on this instruction. Only the IEEE 1 sNaN quieting is open (SHADER-190).
+            # neg (xor bit 15) second: on an AMD Radeon Graphics RDNA2 iGPU (gfx1036) ``-v0``, ``|v0|``, and ``-|v0|``
+            # were measured with 1,088 raw kernels across wave32 and wave64 (0 mismatches; #1548 SHADER-260). abs clears
+            # bit 15, neg flips it, and -|v0| sets bit 15 across all edge floats and NaNs; under IEEE 0 sNaN payloads are
+            # kept, under IEEE 1 they are quieted (SHADER-190). The translator moves the bits, which is exact under IEEE 0.
             sel = next((m for m in mods if m.startswith("op_sel:")), "op_sel:[0,0,0]")
             sb = [int(x) for x in sel.split("[")[1].rstrip("]").split(",")]
             halves = []
@@ -4630,8 +4631,8 @@ class Gen:
                 m = self.tmp()
                 self.emit(f"{m} = OpBitwiseAnd %uint {u} {self.cu(0xFFFF)}")
                 if src.get("abs"):
-                    # The ISA defines ABS on a float operand as |S|, a clear of the sign bit, and it is applied before
-                    # neg; no hardware run of this instruction with `abs` exists yet.
+                    # The ISA defines ABS on a float operand as |S|, clearing the sign bit (bit 15), applied before
+                    # neg. Measured natively on gfx1036 across 1,088 raw kernels: clears bit 15 on all values.
                     a_ = self.tmp()
                     self.emit(f"{a_} = OpBitwiseAnd %uint {m} {self.cu(0x7FFF)}")
                     m = a_

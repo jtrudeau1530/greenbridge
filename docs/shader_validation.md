@@ -687,12 +687,11 @@ vscnt wait plus `s_dcache_inv`; vector accesses only need `s_waitcnt vmcnt(0)`.
 - **Hardware, same protocol** (seeds 101 to 105 x 2,000 programs x wave32 and native wave64 per family): **`f16` 20,000 of 20,000 and `mem` 20,000 of 20,000 match, 0 mismatches, 0 assembler rejections.** On a gfx1030, ROCm 6.2's clang 19 rejected 3,768 of 4,000 `f16` programs (#1365); clang 23 rejects none.
 - **Negative controls**, in the order above: `f16` 992, 865, 826, 430, 280 and 879 caught; `mem` 514, 57, 354, 60, 37, 580, 214 and 89 caught. The unperturbed model gives 0 mismatches.
 - **`translator,hw` at seed 3** (100 programs, the same GPU through the AMD Vulkan driver): `mem` 200 of 200 match, `f16` 199 of 200. The one difference, `s3_22_w64`, is a driver mismatch of the #1506 kind. The hardware and `tests/semantic/spirv_mini_interp.py` both give the model's value for it, and the same emulated SPIR-V matches on NVIDIA.
-- **`v_pack_b32_f16` with signaling NaNs**, measured with hand-written raw kernels in both wave sizes and both IEEE modes. The inputs were five signaling-NaN halves, quiet NaNs, ±0, +inf and a denormal, in either half, with `op_sel` and with `neg`.
-  - IEEE mode 1, the assembler's default: a signaling-NaN half is quieted. Bit 9 is set and the sign and payload are kept, as on gfx1150.
-  - IEEE mode 0: the half is moved unchanged.
-  - `neg` flips the sign before any quieting (`0x7c01` gives `0xfe01` under mode 1 and `0xfc01` under mode 0).
-  - Every other input is moved unchanged.
-  - The translator moves the bits, which is exact under IEEE mode 0. Which mode the game's shaders run in is not recorded here.
+- **`v_pack_b32_f16` with modifiers (`neg`, `abs`, `-|x|`) and signaling NaNs**, measured with 1,088 hand-written raw kernels in both wave sizes (wave32 and wave64, 100% parity) and both IEEE modes on gfx1036 (driver 32.0.21045.29003). The inputs covered normal floats (±1.0), zeros (±0.0), infinities (±inf), subnormals (±min_sub), quiet NaNs, and signaling-NaN halves, in either half with `op_sel`.
+  - IEEE mode 1, the assembler's default: a signaling-NaN half is quieted (bit 9 set; sign bit cleared by `abs` and flipped by `neg`, e.g. `0xfc01` → `0x7e01` under `abs`, `0xfe01` under `-|x|`).
+  - IEEE mode 0: the half is moved as pure bit operations (`& 0x7FFF` for `abs`, `^ 0x8000` for `neg`, `(x & 0x7FFF) ^ 0x8000` for `-|x|`), with `sNaN` payload and quiet bit preserved untouched.
+  - Wave32 and wave64 produce identical results across all 1,088 kernels (0 differences).
+  - The translator implements the IEEE mode 0 bit moves, which is exact on hardware.
 
 *Findings.* The OOB_SELECT per-mode rules, the per-dword straddle rule and the `s_buffer_load` bound of design.md hold
 on gfx1150 (they were measured on RDNA2 and, for the vector part, on this GPU before; the `s_buffer_load` bound and the
