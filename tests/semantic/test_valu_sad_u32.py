@@ -42,7 +42,7 @@ from enum import Enum, auto
 import math
 import struct
 import unittest
-from typing import Sequence, Tuple, Union
+from typing import List, Sequence, Tuple, Union
 
 # Architectural 32-bit and 64-bit masks
 MASK8 = 0xFF
@@ -289,6 +289,113 @@ class VMqsadU32Instruction:
         return f"v_mqsad_u32 {self.dst.disassemble()}, {self.src0.disassemble()}, {self.src1.disassemble()}, {self.src2.disassemble()}{suffix}"
 
 
+SadInstruction = Union[VSadU32Instruction, VSadHiU32Instruction, VMqsadU32Instruction]
+
+
+# ==============================================================================
+# Deterministic Scalar Instruction Interpreter
+# ==============================================================================
+
+class ScalarRegisterFile:
+    """Architectural register file for a single scalar/lane execution context."""
+
+    def __init__(self) -> None:
+        self.vgprs: List[int] = [0] * 256
+        self.sgprs: List[int] = [0] * 106
+
+    def read(self, op: Operand) -> int | Tuple[int, ...]:
+        """Read operand value as unsigned 32-bit dword or tuple of dwords."""
+        if op.reg_type == RegType.LITERAL:
+            assert op.literal_value is not None
+            return op.literal_value
+        if op.reg_type == RegType.VGPR:
+            if op.count == 1:
+                return self.vgprs[op.index] & MASK32
+            return tuple(self.vgprs[op.index + i] & MASK32 for i in range(op.count))
+        if op.reg_type == RegType.SGPR:
+            if op.count == 1:
+                return self.sgprs[op.index] & MASK32
+            return tuple(self.sgprs[op.index + i] & MASK32 for i in range(op.count))
+        raise ValueError(f"Unknown operand type: {op.reg_type}")
+
+    def read_u64(self, op: Operand) -> int:
+        """Read 64-bit qword from 2-register operand."""
+        if op.count != 2:
+            raise ValueError(f"Operand count must be 2 for 64-bit read, got {op.count}")
+        words = self.read(op)
+        assert isinstance(words, tuple) and len(words) == 2
+        return (words[1] << 32) | words[0]
+
+    def write(self, op: Operand, value: int | Sequence[int]) -> None:
+        """Write value to register operand (VGPR or SGPR)."""
+        if op.reg_type == RegType.VGPR:
+            if op.count == 1:
+                assert isinstance(value, int)
+                self.vgprs[op.index] = u32(value)
+            else:
+                assert isinstance(value, (list, tuple)) and len(value) == op.count
+                for i in range(op.count):
+                    self.vgprs[op.index + i] = u32(value[i])
+        elif op.reg_type == RegType.SGPR:
+            if op.count == 1:
+                assert isinstance(value, int)
+                self.sgprs[op.index] = u32(value)
+            else:
+                assert isinstance(value, (list, tuple)) and len(value) == op.count
+                for i in range(op.count):
+                    self.sgprs[op.index + i] = u32(value[i])
+        else:
+            raise TypeError("Cannot write to literal operand")
+
+
+class ScalarVALUInterpreter:
+    """Deterministic instruction interpreter for VALU SAD instructions on a scalar register file."""
+
+    def __init__(self, regs: ScalarRegisterFile | None = None) -> None:
+        self.regs: ScalarRegisterFile = regs if regs is not None else ScalarRegisterFile()
+
+    def execute_sad_u32(self, instr: VSadU32Instruction) -> int:
+        s0 = self.regs.read(instr.src0)
+        s1 = self.regs.read(instr.src1)
+        s2 = self.regs.read(instr.src2)
+        assert isinstance(s0, int) and isinstance(s1, int) and isinstance(s2, int)
+        result = ref_sad_u32(s0, s1, s2, clamp=instr.clamp)
+        self.regs.write(instr.dst, result)
+        return result
+
+    def execute_sad_hi_u32(self, instr: VSadHiU32Instruction) -> int:
+        s0 = self.regs.read(instr.src0)
+        s1 = self.regs.read(instr.src1)
+        s2 = self.regs.read(instr.src2)
+        assert isinstance(s0, int) and isinstance(s1, int) and isinstance(s2, int)
+        result = ref_sad_hi_u32(s0, s1, s2)
+        self.regs.write(instr.dst, result)
+        return result
+
+    def execute_mqsad_u32(self, instr: VMqsadU32Instruction) -> Tuple[int, int, int, int]:
+        s0_64 = self.regs.read_u64(instr.src0)
+        s1_32 = self.regs.read(instr.src1)
+        s2_128 = self.regs.read(instr.src2)
+        assert isinstance(s1_32, int)
+        assert isinstance(s2_128, tuple) and len(s2_128) == 4
+        result = ref_mqsad_u32(s0_64, s1_32, s2_128, masked=instr.masked)
+        self.regs.write(instr.dst, result)
+        return result
+
+    def step(self, instr: SadInstruction) -> int | Tuple[int, int, int, int]:
+        if isinstance(instr, VSadU32Instruction):
+            return self.execute_sad_u32(instr)
+        if isinstance(instr, VSadHiU32Instruction):
+            return self.execute_sad_hi_u32(instr)
+        if isinstance(instr, VMqsadU32Instruction):
+            return self.execute_mqsad_u32(instr)
+        raise TypeError(f"Unsupported instruction AST: {type(instr)}")
+
+    def run_program(self, instructions: Sequence[SadInstruction]) -> None:
+        for instr in instructions:
+            self.step(instr)
+
+
 # ==============================================================================
 # Unit Tests
 # ==============================================================================
@@ -318,8 +425,6 @@ class TestValuSadU32Oracle(unittest.TestCase):
             )
 
     def test_abs_diff_u32_unsigned_vs_signed_distinction(self) -> None:
-        # In signed arithmetic |0 - 0xFFFFFFFF| would be |-(-1)| = 1.
-        # In unsigned arithmetic |0 - 0xFFFFFFFF| = 0xFFFFFFFF.
         self.assertEqual(ref_abs_diff_u32(0, MASK32), MASK32)
         self.assertEqual(ref_abs_diff_u32(MASK32, 0), MASK32)
 
@@ -336,32 +441,24 @@ class TestValuSadU32Oracle(unittest.TestCase):
             self.assertLessEqual(d_ac, d_ab + d_bc)
 
     def test_sad_u32_basic_and_identity(self) -> None:
-        # Identity: |a - a| + s2 == s2
         for val in [0, 1, 0x1234_5678, MASK32]:
             self.assertEqual(ref_sad_u32(val, val, 0x9999), 0x9999)
             self.assertEqual(ref_sad_u32(val, val, 0), 0)
 
     def test_sad_u32_wraparound_and_clamp(self) -> None:
-        # diff = 0xFFFFFFFF, acc = 1 -> wraps to 0 without clamp, clamps to 0xFFFFFFFF with clamp
         self.assertEqual(ref_sad_u32(0, MASK32, 1, clamp=False), 0)
         self.assertEqual(ref_sad_u32(0, MASK32, 1, clamp=True), MASK32)
-
-        # diff = 0xFFFFFFFF, acc = 0xFFFFFFFF -> wraps to 0xFFFFFFFE, clamps to 0xFFFFFFFF
         self.assertEqual(ref_sad_u32(0, MASK32, MASK32, clamp=False), 0xFFFF_FFFE)
         self.assertEqual(ref_sad_u32(0, MASK32, MASK32, clamp=True), MASK32)
-
-        # non-overflow sum respects clamp
         self.assertEqual(ref_sad_u32(10, 5, 20, clamp=True), 25)
 
     def test_sad_hi_u32_carry_bounds(self) -> None:
-        # Carry is strictly in {0, 1}
         self.assertEqual(ref_sad_hi_u32(10, 5, 20), 0)
         self.assertEqual(ref_sad_hi_u32(0, MASK32, 0), 0)
         self.assertEqual(ref_sad_hi_u32(0, MASK32, 1), 1)
         self.assertEqual(ref_sad_hi_u32(0, MASK32, MASK32), 1)
 
     def test_multi_precision_64bit_synthesis(self) -> None:
-        # Full 64-bit SAD = (ref_sad_hi_u32 << 32) | ref_sad_u32
         test_cases = [
             (0, MASK32, 1, (1 << 32)),
             (0, MASK32, MASK32, (2 * MASK32)),
@@ -375,21 +472,9 @@ class TestValuSadU32Oracle(unittest.TestCase):
             self.assertEqual(combined_64, expected_64)
 
     def test_quad_byte_sad_masked_vs_unmasked(self) -> None:
-        win = 0x0403_0201  # bytes: 1, 2, 3, 4
-        s1 = 0x0400_0200   # bytes: 0, 2, 0, 4 (bytes 0 and 2 are 0)
-
-        # Masked: skips byte 0 and byte 2 in s1
-        # byte 0 (1 vs 0): skipped
-        # byte 1 (2 vs 2): |2 - 2| = 0
-        # byte 2 (3 vs 0): skipped
-        # byte 3 (4 vs 4): |4 - 4| = 0
+        win = 0x0403_0201
+        s1 = 0x0400_0200
         self.assertEqual(ref_quad_byte_sad(win, s1, masked=True), 0)
-
-        # Unmasked: includes all 4 bytes
-        # byte 0: |1 - 0| = 1
-        # byte 1: |2 - 2| = 0
-        # byte 2: |3 - 0| = 3
-        # byte 3: |4 - 4| = 0 -> total = 4
         self.assertEqual(ref_quad_byte_sad(win, s1, masked=False), 4)
 
     def test_mqsad_u32_sliding_window(self) -> None:
@@ -399,7 +484,7 @@ class TestValuSadU32Oracle(unittest.TestCase):
         self.assertEqual(byte_window_u32(s0_64, 2), 0x0605_0403)
         self.assertEqual(byte_window_u32(s0_64, 3), 0x0706_0504)
 
-        s1_32 = 0x0403_0201  # exactly matches W_0
+        s1_32 = 0x0403_0201
         s2_128 = (10, 20, 30, 40)
         res = ref_mqsad_u32(s0_64, s1_32, s2_128, masked=False)
         self.assertEqual(res[0], 10)
@@ -478,7 +563,6 @@ class TestValuSadU32SymbolicAST(unittest.TestCase):
         self.assertEqual(instr.disassemble(), "v_mqsad_u32 v[0:3], v[4:5], v6, v[8:11]")
 
     def test_ast_type_and_count_validation(self) -> None:
-        # Destination must be VGPR
         with self.assertRaises(TypeError):
             VSadU32Instruction(
                 dst=Operand.sgpr(0),
@@ -486,7 +570,6 @@ class TestValuSadU32SymbolicAST(unittest.TestCase):
                 src1=Operand.vgpr(2),
                 src2=Operand.vgpr(3),
             )
-        # Destination count must match opcode expectation
         with self.assertRaises(ValueError):
             VSadU32Instruction(
                 dst=Operand.vgpr(0, count=2),
@@ -496,11 +579,106 @@ class TestValuSadU32SymbolicAST(unittest.TestCase):
             )
         with self.assertRaises(ValueError):
             VMqsadU32Instruction(
-                dst=Operand.vgpr(0, count=1),  # needs 4
+                dst=Operand.vgpr(0, count=1),
                 src0=Operand.vgpr(4, count=2),
                 src1=Operand.vgpr(6, count=1),
                 src2=Operand.vgpr(8, count=4),
             )
+
+
+class TestValuSadU32ScalarInterpreter(unittest.TestCase):
+    """Unit tests for deterministic scalar instruction interpreter."""
+
+    def setUp(self) -> None:
+        self.rf = ScalarRegisterFile()
+        self.interp = ScalarVALUInterpreter(self.rf)
+
+    def test_scalar_sad_u32_basic(self) -> None:
+        self.rf.vgprs[1] = 50
+        self.rf.vgprs[2] = 20
+        self.rf.vgprs[3] = 100
+        instr = VSadU32Instruction(
+            dst=Operand.vgpr(0),
+            src0=Operand.vgpr(1),
+            src1=Operand.vgpr(2),
+            src2=Operand.vgpr(3),
+        )
+        res = self.interp.step(instr)
+        self.assertEqual(res, 130)
+        self.assertEqual(self.rf.vgprs[0], 130)
+
+    def test_scalar_sad_u32_with_sgpr_and_literal(self) -> None:
+        self.rf.vgprs[1] = 100
+        self.rf.sgprs[5] = 40
+        instr = VSadU32Instruction(
+            dst=Operand.vgpr(0),
+            src0=Operand.vgpr(1),
+            src1=Operand.sgpr(5),
+            src2=Operand.literal(20),
+        )
+        # |100 - 40| + 20 = 80
+        res = self.interp.step(instr)
+        self.assertEqual(res, 80)
+        self.assertEqual(self.rf.vgprs[0], 80)
+
+    def test_scalar_sad_hi_u32_overflow_carry(self) -> None:
+        self.rf.vgprs[1] = 0
+        self.rf.vgprs[2] = MASK32
+        self.rf.vgprs[3] = 10
+        instr = VSadHiU32Instruction(
+            dst=Operand.vgpr(0),
+            src0=Operand.vgpr(1),
+            src1=Operand.vgpr(2),
+            src2=Operand.vgpr(3),
+        )
+        res = self.interp.step(instr)
+        self.assertEqual(res, 1)
+        self.assertEqual(self.rf.vgprs[0], 1)
+
+    def test_64bit_sad_synthesis_program(self) -> None:
+        # Program:
+        #   v_sad_u32 v0, v2, v3, v4
+        #   v_sad_hi_u32 v1, v2, v3, v4
+        # Input: |v2 - v3| + v4
+        self.rf.vgprs[2] = 0x8000_0000
+        self.rf.vgprs[3] = 0
+        self.rf.vgprs[4] = 0x8000_0005
+        # |0x80000000 - 0| + 0x80000005 = 0x100000005 -> hi=1, lo=5
+        prog = [
+            VSadU32Instruction(Operand.vgpr(0), Operand.vgpr(2), Operand.vgpr(3), Operand.vgpr(4)),
+            VSadHiU32Instruction(Operand.vgpr(1), Operand.vgpr(2), Operand.vgpr(3), Operand.vgpr(4)),
+        ]
+        self.interp.run_program(prog)
+        self.assertEqual(self.rf.vgprs[0], 5)
+        self.assertEqual(self.rf.vgprs[1], 1)
+        res_64 = (self.rf.vgprs[1] << 32) | self.rf.vgprs[0]
+        self.assertEqual(res_64, 0x1_0000_0005)
+
+    def test_scalar_mqsad_u32_execution(self) -> None:
+        # v[4:5] = 64-bit source
+        self.rf.vgprs[4] = 0x0403_0201
+        self.rf.vgprs[5] = 0x0807_0605
+        # v6 = template 32-bit
+        self.rf.vgprs[6] = 0x0403_0201
+        # v[8:11] = accumulators
+        self.rf.vgprs[8] = 100
+        self.rf.vgprs[9] = 200
+        self.rf.vgprs[10] = 300
+        self.rf.vgprs[11] = 400
+
+        instr = VMqsadU32Instruction(
+            dst=Operand.vgpr(0, count=4),
+            src0=Operand.vgpr(4, count=2),
+            src1=Operand.vgpr(6, count=1),
+            src2=Operand.vgpr(8, count=4),
+            masked=False,
+        )
+        res = self.interp.step(instr)
+        self.assertEqual(res, (100, 204, 308, 412))
+        self.assertEqual(self.rf.vgprs[0], 100)
+        self.assertEqual(self.rf.vgprs[1], 204)
+        self.assertEqual(self.rf.vgprs[2], 308)
+        self.assertEqual(self.rf.vgprs[3], 412)
 
 
 if __name__ == "__main__":
