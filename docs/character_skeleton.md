@@ -193,10 +193,10 @@ key. Across the measured character materials, the texture content separates clea
 | Parameter | Common formats | Measured role |
 |---|---|---|
 | `0xC8E8C282` | BC1/BC3/BC7 sRGB, some BC1/BC7 UNORM | **sRGB albedo** when present |
-| `0xC6F46E79` | BC7 UNORM, BC1 UNORM | tangent-space normal map |
-| `0x1E77BF4C` | BC5 UNORM, some BC1/BC7 | normal/detail normal |
-| `0x739E3D0D` | BC7 UNORM, some BC1 | ORM/mask |
-| `0x8ADB8480` | BC4 UNORM | mask |
+| `0xC6F46E79` | BC7 UNORM, BC1 UNORM | `speculartex`: specular/gloss (packed), not a normal map |
+| `0x1E77BF4C` | BC5 UNORM, some BC1/BC7 | `bumptex`: tangent-space normal/detail normal |
+| `0x739E3D0D` | BC7 UNORM, some BC1 | `speculartex2`: ORM/mask (packed) |
+| `0x8ADB8480` | BC4 UNORM | `materialid`: ID/palette map |
 
 This is a measured corpus split, not a claim that the hashes are globally unique semantics.
 The practical rule for exporters: use `0xC8E8C282` as albedo, and **do not fall back to the

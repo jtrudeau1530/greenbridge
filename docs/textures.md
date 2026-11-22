@@ -525,18 +525,19 @@ rather than by array order:
 
 | Parameter | Common formats | Measured role |
 |---|---|---|
-| `0xC8E8C282` | BC1/BC3/BC7 sRGB, some BC1/BC7 UNORM | sRGB albedo |
-| `0xC6F46E79` | BC7 UNORM, BC1 UNORM | tangent-space normal map |
-| `0x1E77BF4C` | BC5 UNORM, some BC1/BC7 | normal/detail normal |
-| `0x739E3D0D` | BC7 UNORM, some BC1 | ORM/mask |
-| `0x8ADB8480` | BC4 UNORM | mask |
+| `0xC8E8C282` | BC1/BC3/BC7 sRGB, some BC1/BC7 UNORM | **sRGB albedo** when present |
+| `0xC6F46E79` | BC7 UNORM, BC1 UNORM | `speculartex`: specular/gloss (packed), not a normal map |
+| `0x1E77BF4C` | BC5 UNORM, some BC1/BC7 | `bumptex`: tangent-space normal/detail normal |
+| `0x739E3D0D` | BC7 UNORM, some BC1 | `speculartex2`: ORM/mask (packed) |
+| `0x8ADB8480` | BC4 UNORM | `materialid`: ID/palette map |
 
 The counts in the 246-record character corpus are 215 references each for `0xC6F46E79`,
-`0x1E77BF4C` and `0x739E3D0D`, 164 for `0x8ADB8480`, and 64 for `0xC8E8C282`. Not every
-material carries an albedo: the jacket, crop tee and some sports pieces have no `0xC8E8C282`
-entry. Exporters must **not** fall back to the first texture in that case; a normal map painted
-as a base colour is the usual symptom. The hashes are treated as measured corpus semantics, not
-as a claim that they are globally unique across every shader.
+`0x1E77BF4C` and `0x739E3D0D`, 164 for `0x8ADB8480`, and 64 for `0xC8E8C282`. The garment
+shaders (`d5ed50f4`, `ea8d09d0`, `39ddb9ca`) do not declare a `0xC8E8C282` slot at all, so the
+jacket, crop tee and other garments have no albedo by shader design, not because a texture is
+missing. Exporters must **not** fall back to the first texture in that case; a `speculartex`
+sheet painted as a base colour is the usual symptom. The hashes are treated as measured corpus
+semantics, not as a claim that they are globally unique across every shader.
 
 ### Map material texture parameters
 
@@ -564,9 +565,10 @@ endpoints, BC7 mode-6 endpoints) has blue > 190 and red and green within 45 of 1
 | `0xC8E8C282` `diffusetex` | 28 | 1,887 | 0 | 72: 1,322, 99: 709, 78: 145 |
 | `0x3FB7964F` `tinttexture` | 0 | 61 | 0 | 72: 61, 99: 2, 78: 1 |
 
-So on map materials `bumptex` is the tangent-space normal map and `speculartex` is not a normal map. The
-character table above lists `0xC6F46E79` as the normal map; these character textures are mostly outside the
-measured catalog here, so that row is left unchanged, but it should be re-checked against the name.
+So on map materials `bumptex` is the tangent-space normal map and `speculartex` is not a normal map.
+The character corpus re-check resolves the same way: `0xC6F46E79` is `speculartex` on characters too,
+and `0x1E77BF4C` (`bumptex`) is the normal map. The earlier character row that said otherwise has been
+corrected.
 
 Three more parameters hold sRGB colour-like textures on map materials and are not in `ModelTextureBindings`
 (names not found): `0x17D3B5C2` (72: 47), `0x6994EF3F` (99: 25) and `0x7485DAFB` (99: 162, 78: 15, 72: 12;
