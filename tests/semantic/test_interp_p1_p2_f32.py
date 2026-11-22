@@ -578,5 +578,199 @@ class TestInterpSymbolicAST(unittest.TestCase):
         self.assertEqual(expr_p2.to_math_string(), "(P20 * j + (P10 * i + P0))")
 
 
+@dataclass
+class ScalarMachineState:
+    """Complete architectural state for scalar single-thread RDNA2 execution."""
+    vgpr: VGPRFile = field(default_factory=VGPRFile)
+    sgpr: List[int] = field(default_factory=lambda: [0] * 106)
+    attributes: AttributeFile = field(default_factory=AttributeFile)
+    m0: int = 0
+    pc: int = 0
+
+
+class ScalarInterpInterpreter:
+    """Deterministic scalar instruction interpreter for RDNA2 VINTRP instructions."""
+
+    def resolve_src(self, operand: Operand, state: ScalarMachineState) -> int:
+        if operand.reg_type == RegType.VGPR:
+            return state.vgpr.get(int(operand.index_or_val))
+        elif operand.reg_type == RegType.SGPR:
+            return state.sgpr[int(operand.index_or_val) & 0x7F]
+        elif operand.reg_type == RegType.LITERAL:
+            if isinstance(operand.index_or_val, float):
+                return f32_to_bits(operand.index_or_val)
+            return int(operand.index_or_val) & MASK32
+        elif operand.reg_type == RegType.PARAM_SEL:
+            if isinstance(operand.index_or_val, ParamSel):
+                return operand.index_or_val.value
+            return int(operand.index_or_val)
+        raise ValueError(f"Unknown operand type: {operand.reg_type}")
+
+    def step(self, inst: InterpInstruction, state: ScalarMachineState) -> int:
+        chan = state.attributes.get_channel(inst.attr.attr_index, inst.attr.channel.value)
+        p0_bits = f32_to_bits(chan.p0)
+        p10_bits = f32_to_bits(chan.p10)
+        p20_bits = f32_to_bits(chan.p20)
+
+        if inst.opcode == InterpOpcode.V_INTERP_P1_F32:
+            s_bits = self.resolve_src(inst.src, state)
+            res = oracle_v_interp_p1_f32(
+                s_bits=s_bits,
+                p10_bits=p10_bits,
+                p0_bits=p0_bits,
+                abs_s=inst.src.abs_mod,
+                neg_s=inst.src.neg_mod,
+                clamp=inst.clamp,
+                omod=inst.omod,
+            )
+            state.vgpr.set(inst.dst, res)
+            state.pc += 1
+            return res
+
+        elif inst.opcode == InterpOpcode.V_INTERP_P2_F32:
+            s_bits = self.resolve_src(inst.src, state)
+            accum_bits = state.vgpr.get(inst.dst)
+            res = oracle_v_interp_p2_f32(
+                s_bits=s_bits,
+                p20_bits=p20_bits,
+                p1_accum_bits=accum_bits,
+                abs_s=inst.src.abs_mod,
+                neg_s=inst.src.neg_mod,
+                clamp=inst.clamp,
+                omod=inst.omod,
+            )
+            state.vgpr.set(inst.dst, res)
+            state.pc += 1
+            return res
+
+        elif inst.opcode == InterpOpcode.V_INTERP_MOV_F32:
+            param_sel = self.resolve_src(inst.src, state)
+            res = oracle_v_interp_mov_f32(
+                param_sel=param_sel,
+                p0_bits=p0_bits,
+                p10_bits=p10_bits,
+                p20_bits=p20_bits,
+                abs_val=inst.src.abs_mod,
+                neg_val=inst.src.neg_mod,
+                clamp=inst.clamp,
+                omod=inst.omod,
+            )
+            state.vgpr.set(inst.dst, res)
+            state.pc += 1
+            return res
+
+        raise NotImplementedError(f"Unsupported opcode: {inst.opcode}")
+
+    def run_program(self, instructions: List[InterpInstruction], state: ScalarMachineState) -> None:
+        for inst in instructions:
+            self.step(inst, state)
+
+
+class TestScalarInterpInterpreter(unittest.TestCase):
+    """Test suite for deterministic scalar instruction interpreter."""
+
+    def setUp(self) -> None:
+        self.interp = ScalarInterpInterpreter()
+        self.state = ScalarMachineState()
+
+    def test_scalar_p1_execution(self) -> None:
+        # attr0.x: v0=1.0, v1=5.0, v2=10.0 -> p0=1.0, p10=4.0, p20=9.0
+        self.state.attributes.set_attribute(0, 0, 1.0, 5.0, 10.0)
+        # v0 = i = 0.5
+        self.state.vgpr.set_f32(0, 0.5)
+
+        inst = InterpInstruction(
+            opcode=InterpOpcode.V_INTERP_P1_F32,
+            dst=2,
+            src=Operand(RegType.VGPR, 0),
+            attr=AttributeRef(0, Channel.X),
+        )
+        res_bits = self.interp.step(inst, self.state)
+        # 4.0 * 0.5 + 1.0 = 3.0
+        self.assertEqual(bits_to_f32(res_bits), 3.0)
+        self.assertEqual(self.state.vgpr.get_f32(2), 3.0)
+        self.assertEqual(self.state.pc, 1)
+
+    def test_scalar_p1_then_p2_pipeline(self) -> None:
+        # attr0.y: v0=2.0, v1=6.0, v2=14.0 -> p0=2.0, p10=4.0, p20=12.0
+        self.state.attributes.set_attribute(0, 1, 2.0, 6.0, 14.0)
+        # i = 0.25 (v0), j = 0.5 (v1)
+        self.state.vgpr.set_f32(0, 0.25)
+        self.state.vgpr.set_f32(1, 0.5)
+
+        program = [
+            InterpInstruction(
+                opcode=InterpOpcode.V_INTERP_P1_F32,
+                dst=2,
+                src=Operand(RegType.VGPR, 0),
+                attr=AttributeRef(0, Channel.Y),
+            ),
+            InterpInstruction(
+                opcode=InterpOpcode.V_INTERP_P2_F32,
+                dst=2,
+                src=Operand(RegType.VGPR, 1),
+                attr=AttributeRef(0, Channel.Y),
+            ),
+        ]
+        self.interp.run_program(program, self.state)
+        # p1: 4.0 * 0.25 + 2.0 = 3.0
+        # p2: 12.0 * 0.5 + 3.0 = 9.0
+        self.assertEqual(self.state.vgpr.get_f32(2), 9.0)
+        self.assertEqual(self.state.pc, 2)
+
+    def test_scalar_mov_flat(self) -> None:
+        # attr1.z: v0=7.0, v1=12.0, v2=25.0 -> p0=7.0, p10=5.0, p20=18.0
+        self.state.attributes.set_attribute(1, 2, 7.0, 12.0, 25.0)
+
+        inst_p0 = InterpInstruction(
+            opcode=InterpOpcode.V_INTERP_MOV_F32,
+            dst=3,
+            src=Operand(RegType.PARAM_SEL, ParamSel.P0),
+            attr=AttributeRef(1, Channel.Z),
+        )
+        self.interp.step(inst_p0, self.state)
+        self.assertEqual(self.state.vgpr.get_f32(3), 7.0)
+
+        inst_p10 = InterpInstruction(
+            opcode=InterpOpcode.V_INTERP_MOV_F32,
+            dst=4,
+            src=Operand(RegType.PARAM_SEL, ParamSel.P10),
+            attr=AttributeRef(1, Channel.Z),
+        )
+        self.interp.step(inst_p10, self.state)
+        self.assertEqual(self.state.vgpr.get_f32(4), 5.0)
+
+        inst_p20 = InterpInstruction(
+            opcode=InterpOpcode.V_INTERP_MOV_F32,
+            dst=5,
+            src=Operand(RegType.PARAM_SEL, ParamSel.P20),
+            attr=AttributeRef(1, Channel.Z),
+        )
+        self.interp.step(inst_p20, self.state)
+        self.assertEqual(self.state.vgpr.get_f32(5), 18.0)
+
+    def test_scalar_determinism(self) -> None:
+        self.state.attributes.set_attribute(2, 0, 3.14159, 2.71828, 1.41421)
+        self.state.vgpr.set_f32(10, 0.3333333)
+        self.state.vgpr.set_f32(11, 0.6666667)
+
+        prog = [
+            InterpInstruction(InterpOpcode.V_INTERP_P1_F32, 12, Operand(RegType.VGPR, 10), AttributeRef(2, Channel.X)),
+            InterpInstruction(InterpOpcode.V_INTERP_P2_F32, 12, Operand(RegType.VGPR, 11), AttributeRef(2, Channel.X)),
+        ]
+
+        self.interp.run_program(prog, self.state)
+        result1 = self.state.vgpr.get(12)
+
+        state2 = ScalarMachineState()
+        state2.attributes.set_attribute(2, 0, 3.14159, 2.71828, 1.41421)
+        state2.vgpr.set_f32(10, 0.3333333)
+        state2.vgpr.set_f32(11, 0.6666667)
+        self.interp.run_program(prog, state2)
+        result2 = state2.vgpr.get(12)
+
+        self.assertEqual(result1, result2)
+
+
 if __name__ == "__main__":
     unittest.main()
