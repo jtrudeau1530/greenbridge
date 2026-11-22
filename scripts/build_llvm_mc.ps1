@@ -70,9 +70,24 @@ $body = @"
 "@
 New-Item -ItemType Directory -Force $out | Out-Null
 # A .cmd file avoids cmd.exe's quote stripping on paths with spaces.
-# Switch cmd.exe to UTF-8 before it reads the paths in the batch file.
+# Switch cmd.exe to UTF-8 before reading paths, then restore the shared console even if the build fails.
 $bat = Join-Path $Temp "_build.cmd"
-$batchText = "@echo off`r`nchcp 65001 >nul`r`nset `"PATH=$installer;%PATH%`"`r`ncall `"$vcvars`" >nul || exit /b 1`r`n$body`r`n"
+$batchText = @(
+    '@echo off'
+    'setlocal'
+    'set "_leonida_cp="'
+    'for /f "tokens=2 delims=:." %%c in (''chcp'') do set "_leonida_cp=%%c"'
+    'chcp 65001 >nul'
+    'call :build'
+    'set "_leonida_exit=%errorlevel%"'
+    'if defined _leonida_cp chcp %_leonida_cp% >nul'
+    'exit /b %_leonida_exit%'
+    ':build'
+    "set `"PATH=$installer;%PATH%`""
+    "call `"$vcvars`" >nul || exit /b 1"
+    $body
+    ''
+) -join "`r`n"
 [System.IO.File]::WriteAllText($bat, $batchText, [System.Text.UTF8Encoding]::new($false))
 
 $p = Start-Process cmd.exe -ArgumentList "/c", "`"$bat`"" -NoNewWindow -PassThru
