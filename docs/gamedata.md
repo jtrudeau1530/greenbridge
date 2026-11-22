@@ -404,6 +404,90 @@ Not measured here (hypothesis): which preset applies at a position (nearest `Loc
 how the Beaufort number maps onto the 0..1 curve input (Beaufort / 12 is one choice), and what the four
 `WavefrontShape` curves drive.
 
+## Vehicle and tyre XML documents
+
+Four roots account for 37 of the 45 documents (4,547,932 inflated bytes) in the vehicles/tyres category:
+`CVehiclePoints` (32), `CVehicleBoneOffsetsArray` (2), `CVehiclePerformanceMaps` (2), and `CTyreDataSet` (1).
+All 37 parse cleanly with no truncation errors. Only counts, element/attribute names, encodings, and numeric
+ranges are recorded below; no vehicle names or entry values are included.
+
+### `CVehiclePoints` (32 documents, 33,516 B)
+
+Each document fits in one stream (370 to 10,425 B, median 592 B) and holds one vehicle entry (31 distinct
+`DefinitionName` values across the 32 documents; `DefinitionName` equals `ModelName` in all 32). Element tree:
+
+| Path | Count | Content |
+|---|---:|---|
+| `DefinitionName`, `ModelName` | 32 each | text identifier (equal in all 32) |
+| `Flags`, `iNumBoardingPoints` | 32 each | `value="0"` in all 32 |
+| `Points`, `Props`, `AuthoredMeshName` | 32 each | empty in all 32 |
+| `fNavOverrideRecastCellSize` | 32 | `value=` float `0.0000..0.0625` (median `0.0312`, 4 distinct values) |
+| `fMinPatchAreaBeforeCulling` | 31 | `value=` float `0.1000..4.0000` (median `1.0000`, 6 distinct values) |
+| `fNavMaxHeightChange`, `fNavMinZDist` | 30 each | `value=` constant `0.35` and `0.50` |
+| `fNavOverrideAgentRadius`, `fNavOverrideAgentHeight` | 30 each | `value=` `0.00..0.15` (4 values) and `0.00..1.20` (2 values) |
+| `fNavOverrideRecastCellHeight` | 26 | `value=` `0.00..0.04` (2 values) |
+| `ModDefs` / `ModDefs/Item` | 6 / 49 | 1 to 32 mod entries per document (median 4) |
+
+Every `ModDefs/Item` carries `ChassisModName` (49/49 non-empty), `PropsetExteriorModName` (35/49 non-empty),
+`UtilityModName` (32/49 non-empty), `InteriorModName` (4/49 non-empty), and `CargoModName` (0/49 non-empty);
+17 items also include `RoofModName` (8 non-empty). Cross-referencing `ModelName` against the two
+`CVehiclePerformanceMaps` documents matches 20 keys in the watercraft map and 4 in the land/air map, matching
+the navmesh-override fields used for walkable/boardable hulls and large vehicles.
+
+### `CVehicleBoneOffsetsArray` (2 documents, 4,303,883 B)
+
+Two documents share the `CVehicleBoneOffsetsArray` root (`boneOffsets/Item`, 2,481 entries total) with a clean
+split between identifier fields:
+
+| Document | Inflated B | Streams | `boneOffsets/Item` | Identifier field | `attachBones/Item` per entry | `numEntries` per entry |
+|---|---:|---:|---:|---|---:|---:|
+| Doc 0 | 4,283,195 | 66 | 2,447 | `name` (2,447/2,447; `vehicleName` empty) | 8..3,200 (median 8; 66,128 total, 9,345 non-empty) | 24..9,600 (median 24; 740,376 total) |
+| Doc 1 | 20,688 | 1 | 34 | `vehicleName` (34/34; `name` empty) | 4 in all 34 (136 total, all non-empty) | 12 in all 34 (408 total) |
+
+33 of Doc 1's 34 `vehicleName` entries match keys in `CVehiclePerformanceMaps` Doc 0 (0 in Doc 1).
+
+Each `boneOffsets/Item/offsets` block stores a palette-compressed float16 table with four elements: `numEntries`
+(`value=`), `bitsPerIndex` (`value=`), `packedIndices` (`content="short_array"`), and `palette`
+(`content="float16_array"`). Measured over all **2,481 / 2,481** tables (740,784 unpacked entries):
+
+- **`numEntries` divisibility:** exact multiple of `len(attachBones)` in all 2,481 entries (remainder 0) and exact
+  multiple of 12 in all 2,481 entries. `numEntries / len(attachBones)` is `3` in 2,319 entries (including all 34
+  of Doc 1 — one 3-component vector per bone slot); the remaining 162 entries take multiples of 3 from `9` to
+  `1,200` (`9, 12, 27, 36, 48, 75, 108, 300, 1200`).
+- **Bit width and palette:** `bitsPerIndex` is `1` (253 tables, palette length 2), `2` (1,951 tables, length
+  3..4), `3` (258 tables, length 5..8), or `4` (19 tables, length 9..14) — always minimal for `len(palette)`.
+  Palette values span `-30.90625` to `2.542969`, with `0.0` present in 2,119/2,481 palettes.
+- **Exact packing rule:** `packedIndices` holds 107,229 non-negative unsigned 16-bit integers (`0..65535`)
+  encoding a continuous **LSB-first bitstream** across 16-bit words. The array length equals
+  `floor(numEntries * bitsPerIndex / 16) + 1` in **2,481 / 2,481** tables (when `numEntries * bitsPerIndex` is a
+  multiple of 16 — 2,043 tables — the writer appends one trailing `0` word; all 2,043 trailing words and all
+  unused tail bits across all 2,481 tables are `0`).
+- **Bounds check:** unpacking all 740,784 indices produces **0 out-of-bounds** palette indices.
+
+### `CVehiclePerformanceMaps` (2 documents, 133,848 B)
+
+Two documents with disjoint `Map/Item[@key]` sets (285 distinct keys total, 0 overlap). Every `Map/Item` carries
+the exact same 10 scalar `value=` children: `topSpeed`, `accelZeroTwenty`, `accelZeroSixty`, `brakingSixtyZero`,
+`turnRadius`, `maxGforceLateral`, `maxGforceSteering`, `idlePitchAngle`, `buoyancyOffsetZ`, and `takeOffSpeed`.
+
+| Document | Inflated B | Streams | Entries | Non-zero road braking/turn/G | Non-zero `buoyancyOffsetZ` | Non-zero `takeOffSpeed` | `topSpeed` range (median) |
+|---|---:|---:|---:|---:|---:|---:|---|
+| Doc 0 (land/air) | 117,808 | 2 | 251 | 203..223 | 0 | 10 (max `57.64`) | `0.00..115.96` (`45.32`) |
+| Doc 1 (watercraft) | 16,040 | 1 | 34 | 0 | 34 (`-1.11..1.91`) | 1 (`21.54`) | `0.00..55.05` (`16.82`) |
+
+### `CTyreDataSet` (1 document, 76,685 B, 2 streams)
+
+One document containing 40 `TyreDataEntries/Item` records (40 distinct `key` attributes, max tree depth 5). Each
+entry combines up to four nested parameter groups with 12 direct scalar `value=` fields:
+
+| Path under `TyreDataEntries/Item` | Present | Schema |
+|---|---:|---|
+| `roadPerformance` | 40 / 40 | 8 scalars: `fPeakSlipAngle`, `fAdhesionLimitAngle`, `fLateralFrictionMult`, `fPeakSlipRatio`, `fAdhesionLimitRatio`, `fLongitudinalFrictionMult`, `fPeakForceCoefficient`, `fSlidingForceCoefficient` |
+| `offRoadPerformance` | 38 / 40 | identical 8-scalar schema (omitted on 2 entries) |
+| `roadPenalties`, `offRoadPenalties` | 40 / 40 each | identical 6-scalar schema: `fMaterialTractionLoss`, `fMaterialRollingDragGain`, `fMaterialSinkDragGain`, `fMaterialSurfaceDragGain`, `fWetTractionLoss`, `fWetDragGain` |
+| Direct scalars (required) | 40 / 40 each | `fLoadShapeVarianceScale`, `fDamageShapeVarianceScale`, `fDamageCoefficientScale`, `fOptimumTyreTemp` (all `100.0`), `fOptimumTyreTempRange` (all `100.0`), `fGripDropOffWithTemp` (`0.01..0.05`) |
+| Direct scalars (optional) | 36..39 / 40 | `fPuncturedTyreGripReduction`, `fBurstTyreGripReduction`, `fTractionStiffnessSpeedMult`, `fTractionStiffnessSpeedCap` (39 each); `fLoadStability` (37); `fLoadSensitivity` (36) |
+
 ## Relationship to `data.rpf` and `script.rpf`
 
 | Archive | Size | Streams | Inflated | Dominant payloads | XML | `RBF0` | `PSIN` |
