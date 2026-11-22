@@ -275,11 +275,13 @@ struct JsonParser {
 
 std::map<std::string, ShaderMeta> read_index(const std::string& path, std::string& err) {
     std::ifstream f(path, std::ios::binary);
-    std::string s((std::istreambuf_iterator<char>(f)), {});
     std::map<std::string, ShaderMeta> out;
+    if (!f) { err = "cannot open the file"; return out; }   // a missing index must not read as an empty corpus
+    std::string s((std::istreambuf_iterator<char>(f)), {});
+    if (f.bad()) { err = "read error"; return out; }
     JsonParser p{s, 0};
     p.ws();
-    if (p.i >= s.size()) return out;
+    if (p.i >= s.size()) { err = "the file is empty (an intentionally empty index is {})"; return out; }
     if (!p.consume('{')) { err = "expected '{' at byte " + std::to_string(p.i); return out; }
     while (!p.error && p.i < s.size()) {
         if (p.consume('}')) return out;
@@ -425,7 +427,7 @@ int main(int argc, char** argv) {
     std::string index_err;
     auto index = read_index(dir + "/index.json", index_err);
     if (!index_err.empty()) {
-        std::fprintf(stderr, "error: malformed JSON in %s/index.json: %s\n", dir.c_str(), index_err.c_str());
+        std::fprintf(stderr, "error: cannot use %s/index.json: %s\n", dir.c_str(), index_err.c_str());
         return 2;
     }
     std::fprintf(stderr, "%zu shaders in index\n", index.size());
