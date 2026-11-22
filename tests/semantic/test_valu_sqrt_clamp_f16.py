@@ -798,5 +798,166 @@ class TestRegisterAliasing(unittest.TestCase):
             self.assertEqual(state.get_vgpr16(lane, 0, HalfSelect.LO), HALF_F16)
 
 
+# ==============================================================================
+# Condition Codes, Status Flags, and Carry/Borrow Generation
+# ==============================================================================
+
+@dataclass(frozen=True)
+class FPStatusFlags:
+    """Architectural floating-point condition codes and IEEE 754 status flags."""
+    invalid: bool = False
+    overflow: bool = False
+    underflow: bool = False
+    inexact: bool = False
+    zero: bool = False
+    negative: bool = False
+    denormal: bool = False
+    infinite: bool = False
+    nan: bool = False
+    clamped: bool = False
+
+
+def evaluate_v_sqrt_clamp_f16_flags(
+    src0_bits: int,
+    res_bits: int,
+    abs0: bool = False,
+    neg0: bool = False,
+) -> FPStatusFlags:
+    """Evaluate IEEE 754 architectural flags and condition codes for v_sqrt_clamp_f16."""
+    s0 = apply_f16_modifiers(src0_bits, abs0, neg0)
+    s0_nan = is_nan(s0)
+    s0_snan = is_snan(s0)
+    s0_inf = is_inf(s0)
+    s0_neg = bool(s0 & SIGN_MASK) and (s0 != NEG_ZERO)
+
+    invalid = False
+    if s0_snan or (s0_neg and not s0_nan):
+        invalid = True
+
+    nan_flag = is_nan(res_bits)
+    inf_flag = is_inf(res_bits)
+    zero_flag = is_zero(res_bits)
+    neg_flag = bool(res_bits & SIGN_MASK)
+    denorm_flag = is_subnormal(res_bits)
+
+    clamped = False
+    if s0_nan or s0_neg or (s0_inf and not bool(s0 & SIGN_MASK)):
+        clamped = True
+    elif not zero_flag:
+        f0 = bits_to_f16(s0)
+        res_unclamped = math.sqrt(f0)
+        if res_unclamped > 1.0 or res_unclamped < 0.0:
+            clamped = True
+
+    inexact = False
+    if clamped:
+        inexact = True
+    elif not (s0_nan or s0_inf or nan_flag or inf_flag or zero_flag):
+        f0 = bits_to_f16(s0)
+        res_f = bits_to_f16(res_bits)
+        if Fraction(res_f) * Fraction(res_f) != Fraction(f0):
+            inexact = True
+
+    return FPStatusFlags(
+        invalid=invalid,
+        overflow=False,
+        underflow=False,
+        inexact=inexact,
+        zero=zero_flag,
+        negative=neg_flag,
+        denormal=denorm_flag,
+        infinite=inf_flag,
+        nan=nan_flag,
+        clamped=clamped,
+    )
+
+
+def compute_f16_root_borrow_carry(s0_bits: int) -> Tuple[int, int]:
+    """Demonstrate binary radix-2 digit-recurrence square root trial subtraction."""
+    _, exp0, frac0 = split_f16_bits(s0_bits)
+    m = (1 << 10) | frac0 if exp0 != 0 else frac0
+    rem = m
+    trial_sub = (1 << 10)
+    borrow = 1 if rem < trial_sub else 0
+    root = 1 if borrow == 0 else 0
+    return root, borrow
+
+
+class TestConditionCodesAndStatusFlags(unittest.TestCase):
+    """Unit tests for status flags, condition codes, and carry/borrow generation."""
+
+    def test_exact_finite_flags(self) -> None:
+        s0 = QUARTER_F16
+        res = ref_sqrt_clamp_f16(s0)
+        flags = evaluate_v_sqrt_clamp_f16_flags(s0, res)
+        self.assertFalse(flags.invalid)
+        self.assertFalse(flags.overflow)
+        self.assertFalse(flags.underflow)
+        self.assertFalse(flags.inexact)
+        self.assertFalse(flags.zero)
+        self.assertFalse(flags.negative)
+        self.assertFalse(flags.denormal)
+        self.assertFalse(flags.infinite)
+        self.assertFalse(flags.nan)
+        self.assertFalse(flags.clamped)
+
+    def test_inexact_flag(self) -> None:
+        # 0.5 -> sqrt(0.5) is irrational, inexact
+        s0 = HALF_F16
+        res = ref_sqrt_clamp_f16(s0)
+        flags = evaluate_v_sqrt_clamp_f16_flags(s0, res)
+        self.assertTrue(flags.inexact)
+        self.assertFalse(flags.invalid)
+
+    def test_invalid_operation_flag(self) -> None:
+        # Negative operand (-4.0) triggers invalid operation, but clamps to +0.0
+        s0_neg = FOUR_F16 | SIGN_MASK
+        res_neg = ref_sqrt_clamp_f16(s0_neg)
+        self.assertEqual(res_neg, POS_ZERO)
+        flags_neg = evaluate_v_sqrt_clamp_f16_flags(s0_neg, res_neg)
+        self.assertTrue(flags_neg.invalid)
+        self.assertTrue(flags_neg.clamped)
+        self.assertTrue(flags_neg.zero)
+
+        # Signaling NaN triggers invalid operation
+        snan = 0x7C01
+        res_snan = ref_sqrt_clamp_f16(snan)
+        flags_snan = evaluate_v_sqrt_clamp_f16_flags(snan, res_snan)
+        self.assertTrue(flags_snan.invalid)
+        self.assertTrue(flags_snan.clamped)
+
+    def test_clamped_flag_saturation(self) -> None:
+        # 4.0 saturates to 1.0 -> clamped flag set
+        s0 = FOUR_F16
+        res = ref_sqrt_clamp_f16(s0)
+        self.assertEqual(res, ONE_F16)
+        flags = evaluate_v_sqrt_clamp_f16_flags(s0, res)
+        self.assertTrue(flags.clamped)
+        self.assertTrue(flags.inexact)
+        self.assertFalse(flags.invalid)
+
+    def test_zero_and_negative_flags(self) -> None:
+        # +0.0
+        res_pz = ref_sqrt_clamp_f16(POS_ZERO)
+        flags_pz = evaluate_v_sqrt_clamp_f16_flags(POS_ZERO, res_pz)
+        self.assertTrue(flags_pz.zero)
+        self.assertFalse(flags_pz.negative)
+
+        # -0.0 clamps to +0.0, so negative flag is False
+        res_nz = ref_sqrt_clamp_f16(NEG_ZERO)
+        flags_nz = evaluate_v_sqrt_clamp_f16_flags(NEG_ZERO, res_nz)
+        self.assertTrue(flags_nz.zero)
+        self.assertFalse(flags_nz.negative)
+
+    def test_root_borrow_carry_generation(self) -> None:
+        root1, borrow1 = compute_f16_root_borrow_carry(ONE_F16)
+        self.assertEqual(borrow1, 0)
+        self.assertEqual(root1, 1)
+
+        root0, borrow0 = compute_f16_root_borrow_carry(0x0001)
+        self.assertEqual(borrow0, 1)
+        self.assertEqual(root0, 0)
+
+
 if __name__ == "__main__":
     unittest.main()
