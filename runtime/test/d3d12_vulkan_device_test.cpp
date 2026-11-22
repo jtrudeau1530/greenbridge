@@ -2883,12 +2883,8 @@ int compare_invalid_arguments(ID3D12Device* ours) {
         {"command queue: high priority", [](ID3D12Device* d) {
              return command_queue(d, {D3D12_COMMAND_LIST_TYPE_DIRECT, D3D12_COMMAND_QUEUE_PRIORITY_HIGH});
          }},
-        // CreateCommandSignature (no root signature).
-        {"command signature: null description", [](ID3D12Device* d) {
-             void* out = nullptr;
-             return released(d->CreateCommandSignature(nullptr, nullptr, __uuidof(ID3D12CommandSignature), &out),
-                             &out);
-         }},
+        // CreateCommandSignature (no root signature). A null description faults in the host runtime, so it is not
+        // compared.
         {"command signature: null output", [](ID3D12Device* d) {
              const D3D12_INDIRECT_ARGUMENT_DESC arg{D3D12_INDIRECT_ARGUMENT_TYPE_DRAW};
              const D3D12_COMMAND_SIGNATURE_DESC desc{16, 1, &arg, 0};
