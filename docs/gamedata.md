@@ -460,7 +460,8 @@ Measured over the 434 patches and 7,839 points:
   0.44), consistent with a wave travelling across the line towards the shore.
 - **`amplitude` is 1.0 at all 7,839 points**, so it carries no per-point variation in this build. The height
   presumably comes from elsewhere, for example the per-weather `ShoreWaveAmplitude`, `ShoreWaveMinAmplitude`,
-  `ShoreWaveMaxAmplitude` and `ShoreWaveWindScale` fields of the weather data.
+  `ShoreWaveMaxAmplitude` and `ShoreWaveWindScale` fields of the `CContentsOfWeatherXmlFile` weather data
+  (its layout is documented in #1175).
 - **`maxDistance`** ranges 3.0 to 120.4 (median 74.9): how far the wave runs from the line.
 - **`lateralCoord`** is a float in -2.94..3.50 with 7,820 distinct values. It is not arc length and not monotonic
   along 433 of the 434 patches, so it is not a running texture coordinate along the line.
