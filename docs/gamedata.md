@@ -242,9 +242,13 @@ same numeric fields; the rest are names (`type`, `clientSystemName`, tile prefix
 The tile count is the only reading under which the sector override's span matches: 16,384 / 512 = 32 and
 33,792 / 512 = 66, so `width`/`height` are world units, not tile or texel counts.
 
-Which corner `origin` names was tested against the 2,036,542 map placements of the local catalog (x 0.1th to
-99.9th percentile -9,955 to 4,577, y -8,096 to 9,440): with `origin` as the grid centre, 99.83% fall inside
-the grid; as the minimum corner, 1.0%; as the top-left corner with y growing downwards, 82.5%. The centre
+Which corner `origin` names was tested against entity positions from a local index of map resources: 2,036,542
+placements from 23,361 resources at every LOD level, 2,011,519 of them in `levels.rpf` and the rest in the
+minigame and story packs (x 0.1th to 99.9th percentile -9,955 to 4,577, y -8,096 to 9,440). This is a
+different count from the 1,670,442 entities of the levels census in [world_census.md](world_census.md); it was
+only used for the share below. With `origin` as the grid centre, 99.83% fall inside the grid; as the minimum
+corner, 1.0%; as the top-left corner with y growing downwards, 82.5%. The `levels.rpf` subset alone gives the
+same picture: 99.83%, 1.0% and 83.0%. The centre
 reading also gives a minimum x of exactly -13,312, the `PAMH` heightmap's minimum x above.
 
 Tile names: none of the four `tileTextureNamePrefix` values starts an archive entry name or a texture-dictionary
