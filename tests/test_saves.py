@@ -553,13 +553,14 @@ class MalformedJsavTest(unittest.TestCase):
     """A truncated or lying JSAV is one error line, not a struct.error traceback."""
 
     def test_excessive_json_body_nesting_is_a_validation_error(self):
-        block = b'{"nested":' + b'[' * 6000 + b'0' + b']' * 6000 + b'}'
+        # Linux CPython 3.12 can accept 6,000 levels; exercise the C decoder's higher limit too.
+        block = b'{"nested":' + b'[' * 100_000 + b'0' + b']' * 100_000 + b'}'
         data = saves.build_jsav(3, 1, [1], [1], [block])
         with self.assertRaisesRegex(ValueError, r"JSAV body is not valid UTF-8 JSON"):
             saves.parse_jsav(data)
 
     def test_all_read_commands_refuse_excessive_nesting_without_changing_exports(self):
-        block = b'{"nested":' + b'[' * 6000 + b'0' + b']' * 6000 + b'}'
+        block = b'{"nested":' + b'[' * 100_000 + b'0' + b']' * 100_000 + b'}'
         data = saves.build_jsav(3, 1, [1], [1], [block])
         with tempfile.TemporaryDirectory() as tmp:
             source, out = os.path.join(tmp, "deep.jsav"), os.path.join(tmp, "export")
