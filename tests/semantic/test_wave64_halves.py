@@ -516,6 +516,52 @@ class ReviewExecution(unittest.TestCase):
         self.assertEqual(whole, [4, 7])                                  # only vertex 33, in the second half
 
 
+class SccVotePolarity(unittest.TestCase):
+    """`s_cmp_eq_u64 m, 0` sets SCC when the mask is empty, `s_cmp_lg_u64 m, 0` (and the 64-bit logic ops, s_bcnt1)
+    when it is not: the side a vote runs when some lane votes yes is the not-taken side of `s_cbranch_scc1` after
+    cmp_eq and the taken one after cmp_lg."""
+    tier = Classification.tier
+    run_both = Execution.run_both
+    HEAD = ["v_cmp_gt_u32_e32 vcc, 20, v0", "s_and_b64 s[20:21], exec, vcc"]
+
+    def test_cmp_eq_jump_to_narrowing_is_c(self):
+        # scc1 (mask empty) jumps to the narrowing, the "yes" side skips it: a half with no lane < 20 empties EXEC,
+        # the wave never does
+        tier, whole, halves = self.run_both("vs_cmp_eq_wrong", vs(self.HEAD + [
+            "s_cmp_eq_u64 s[20:21], 0", "s_cbranch_scc1 1", "s_branch 1", "s_and_b64 exec, exec, s[20:21]",
+            "v_add_nc_u32_e32 v6, 3, v0"]))
+        self.assertEqual([w[0] for w in whole], [3 + k for k in range(64)])
+        self.assertEqual([w[0] for w in halves], [3 + k for k in range(32)] + [0] * 32)
+        self.assertEqual(tier, "C")
+
+    def test_cmp_eq_skip_when_empty_is_a(self):
+        # scc1 (mask empty) skips the narrowed region: the yes side narrows EXEC to the mask, the no side is the join
+        for name, cmp_, br in (("vs_cmp_eq_skip", "s_cmp_eq_u64 s[20:21], 0", "s_cbranch_scc1 2"),
+                               ("vs_cmp_eq_skip0", "s_cmp_eq_u64 0, s[20:21]", "s_cbranch_scc1 2"),
+                               ("vs_cmp_lg_skip", "s_cmp_lg_u64 s[20:21], 0", "s_cbranch_scc0 2")):
+            tier, whole, halves = self.run_both(name, vs(self.HEAD + [
+                cmp_, br, "s_and_b64 exec, exec, s[20:21]", "v_add_nc_u32_e32 v6, 3, v0",
+                "s_mov_b64 exec, s[10:11]"]))
+            self.assertEqual(tier, "A", name)
+            self.assertEqual(whole, halves, name)
+            self.assertEqual([w[0] for w in whole], [3 + k if k < 20 else 0 for k in range(64)], name)
+
+    def test_exec_restore_by_mov_is_not_an_exec_vote(self):
+        # s_mov_b64 writes no SCC: the branch after restoring EXEC reads the cmp_lg vote on the mask, not EXEC's
+        tier, whole, halves = self.run_both("vs_mov_exec_scc", vs(self.HEAD + [
+            "s_cmp_lg_u64 s[20:21], 0", "s_mov_b64 exec, s[10:11]", "s_cbranch_scc0 1",
+            "v_add_nc_u32_e32 v6, 3, v0"]))
+        self.assertEqual([w[0] for w in whole], [3 + k for k in range(64)])
+        self.assertEqual([w[0] for w in halves], [3 + k for k in range(32)] + [0] * 32)
+        self.assertEqual(tier, "C")
+
+    def test_cmp_eq_wrong_polarity_classification(self):
+        # the same skip with the branch sense flipped: scc0 after cmp_eq jumps over the narrowing when lanes vote yes
+        self.tier("vs_cmp_eq_scc0", vs(self.HEAD + [
+            "s_cmp_eq_u64 s[20:21], 0", "s_cbranch_scc0 2", "s_and_b64 exec, exec, s[20:21]",
+            "v_add_nc_u32_e32 v6, 3, v0", "s_mov_b64 exec, s[10:11]"]), "C", contains=["unsafe-vote-branch"])
+
+
 class Refusal(unittest.TestCase):
     def test_error_mode_refuses_tier_c(self):
         old = rdna2spirv.WAVE64_GRAPHICS
