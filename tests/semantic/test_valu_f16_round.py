@@ -884,5 +884,112 @@ class FractF16TranslationTests(unittest.TestCase):
         self.assertEqual(got_toggled, merge_half(OLD, H_0P75, 0))
 
 
+class TieBreakingSignedZerosAndNegativeControlTests(unittest.TestCase):
+    """End-to-end and negative control tests for tie-breaking to even, signed zeros, and mutants."""
+
+    def test_e2e_rndne_halfway_tie_breaking_even_matrix(self):
+        """End-to-end v_rndne_f16 execution strictly enforces round-to-nearest-even on halfway ties."""
+        ties = [
+            (H_0P5, H_POS_ZERO),       # 0.5 -> 0.0 (0 is even)
+            (H_1P5, H_2P0),            # 1.5 -> 2.0 (2 is even)
+            (H_2P5, H_2P0),            # 2.5 -> 2.0 (2 is even)
+            (H_3P5, H_4P0),            # 3.5 -> 4.0 (4 is even)
+            (f2h(4.5), H_4P0),         # 4.5 -> 4.0 (4 is even)
+            (f2h(5.5), f2h(6.0)),      # 5.5 -> 6.0 (6 is even)
+            (H_NEG_0P5, H_NEG_ZERO),   # -0.5 -> -0.0 (-0 is even, preserving sign)
+            (H_NEG_1P5, H_NEG_2P0),    # -1.5 -> -2.0
+            (H_NEG_2P5, H_NEG_2P0),    # -2.5 -> -2.0
+            (H_NEG_3P5, H_NEG_4P0),    # -3.5 -> -4.0
+            (f2h(-4.5), H_NEG_4P0),    # -4.5 -> -4.0
+            (f2h(-5.5), f2h(-6.0)),    # -5.5 -> -6.0
+            (H_1022P5, f2h(1022.0)),   # 1022.5 -> 1022.0
+            (H_1023P5, H_1024),        # 1023.5 -> 1024.0 (odd -> even)
+            (H_NEG_1022P5, f2h(-1022.0)),
+            (H_NEG_1023P5, f2h(-1024.0)),
+        ]
+        for inp, expected in ties:
+            with self.subTest(inp=hex(inp), expected=hex(expected)):
+                got = run_op("v_rndne_f16_e32 v0, v1", 0x12340000 | inp)
+                self.assertEqual(got, merge_half(OLD, expected, 0))
+
+    def test_e2e_rndne_opsel_high_half_destination(self):
+        """v_rndne_f16_e64 with op_sel:[0,1] writes to the high half while preserving the low half."""
+        v1 = (0x9999 << 16) | H_2P5  # low half is 2.5 (ties to 2.0)
+        got = run_op("v_rndne_f16_e64 v0, v1 op_sel:[0,1]", v1)
+        self.assertEqual(got, merge_half(OLD, H_2P0, 1))
+
+        v1_hi = (H_1P5 << 16) | 0x9999  # high half is 1.5 (ties to 2.0)
+        got_hi = run_op("v_rndne_f16_e64 v0, v1 op_sel:[1,1]", v1_hi)
+        self.assertEqual(got_hi, merge_half(OLD, H_2P0, 1))
+
+    def test_e2e_signed_zeros_exact_bit_patterns(self):
+        """Strict IEEE 754-2008 / 2019 roundToIntegral signed zero bit preservation (0x8000 vs 0x0000)."""
+        cases = [
+            ("v_floor_f16_e32", H_NEG_0P5, H_NEG_1P0),
+            ("v_ceil_f16_e32",  H_NEG_0P5, H_NEG_ZERO),
+            ("v_trunc_f16_e32", H_NEG_0P5, H_NEG_ZERO),
+            ("v_rndne_f16_e32", f2h(-0.4),  H_NEG_ZERO),
+            ("v_rndne_f16_e32", H_NEG_0P5, H_NEG_ZERO),
+            ("v_floor_f16_e32", H_NEG_ZERO, H_NEG_ZERO),
+            ("v_ceil_f16_e32",  H_NEG_ZERO, H_NEG_ZERO),
+            ("v_trunc_f16_e32", H_NEG_ZERO, H_NEG_ZERO),
+            ("v_rndne_f16_e32", H_NEG_ZERO, H_NEG_ZERO),
+            ("v_floor_f16_e32", H_POS_ZERO, H_POS_ZERO),
+            ("v_ceil_f16_e32",  H_POS_ZERO, H_POS_ZERO),
+            ("v_trunc_f16_e32", H_POS_ZERO, H_POS_ZERO),
+            ("v_rndne_f16_e32", H_POS_ZERO, H_POS_ZERO),
+        ]
+        for op, inp, expected in cases:
+            with self.subTest(op=op, inp=hex(inp), expected=hex(expected)):
+                got = run_op(f"{op} v0, v1", 0xFACE0000 | inp)
+                self.assertEqual(got, merge_half(OLD, expected, 0))
+                # Verify exact bitwise sign bit 0x8000
+                got_half = got & 0xFFFF
+                self.assertEqual(got_half & 0x8000, expected & 0x8000, f"Sign bit mismatch for {op} on {inp:#x}")
+
+    def test_negative_control_roundeven_sabotaged_to_trunc(self):
+        """Sabotaging RoundEven to Trunc in SPIR-V fails halfway tie-breaking."""
+        spv = translate_ps([f"v_mov_b32 v1, {H_1P5:#x}", f"v_mov_b32 v0, {OLD:#x}", "v_rndne_f16_e32 v0, v1"])
+        sabotaged, n = re.subn(r"\bRoundEven\b", "Trunc", spv, count=1)
+        self.assertEqual(n, 1)
+        got = si.run_fragment(sabotaged)["%out_mrt0"][0]
+        self.assertNotEqual(got, merge_half(OLD, H_2P0, 0))
+        self.assertEqual(got, merge_half(OLD, H_1P0, 0))
+
+    def test_negative_control_roundeven_sabotaged_to_ceil(self):
+        """Sabotaging RoundEven to Ceil in SPIR-V fails halfway tie-breaking on odd rounds."""
+        spv = translate_ps([f"v_mov_b32 v1, {H_2P5:#x}", f"v_mov_b32 v0, {OLD:#x}", "v_rndne_f16_e32 v0, v1"])
+        sabotaged, n = re.subn(r"\bRoundEven\b", "Ceil", spv, count=1)
+        self.assertEqual(n, 1)
+        got = si.run_fragment(sabotaged)["%out_mrt0"][0]
+        self.assertNotEqual(got, merge_half(OLD, H_2P0, 0))
+        self.assertEqual(got, merge_half(OLD, H_3P0, 0))
+
+    def test_negative_control_ceil_sabotaged_to_floor(self):
+        """Sabotaging Ceil to Floor in SPIR-V fails ceiling assertion."""
+        spv = translate_ps([f"v_mov_b32 v1, {H_1P25:#x}", f"v_mov_b32 v0, {OLD:#x}", "v_ceil_f16_e32 v0, v1"])
+        sabotaged, n = re.subn(r"\bCeil\b", "Floor", spv, count=1)
+        self.assertEqual(n, 1)
+        got = si.run_fragment(sabotaged)["%out_mrt0"][0]
+        self.assertNotEqual(got, merge_half(OLD, H_2P0, 0))
+        self.assertEqual(got, merge_half(OLD, H_1P0, 0))
+
+    def test_negative_control_clamp_omitted(self):
+        """Omitting FClamp in SPIR-V produces out-of-bounds unclamped float."""
+        spv = translate_ps([f"v_mov_b32 v1, {H_2P5:#x}", f"v_mov_b32 v0, {OLD:#x}", "v_trunc_f16_e64 v0, v1 mul:2 clamp"])
+        sabotaged, n = re.subn(r"OpExtInst %float %glsl FClamp (%\w+) %f0 %f1", r"OpCopyObject %float \1", spv)
+        self.assertEqual(n, 1)
+        got = si.run_fragment(sabotaged)["%out_mrt0"][0]
+        self.assertNotEqual(got, merge_half(OLD, H_1P0, 0))
+        self.assertEqual(got, merge_half(OLD, H_4P0, 0))
+
+    def test_negative_control_dropped_signed_zero_detected(self):
+        """A mutant that strips sign bits from -0.0 results is detected by bitwise check."""
+        for op, inp in [("v_ceil_f16_e32", H_NEG_0P5), ("v_trunc_f16_e32", H_NEG_0P5), ("v_rndne_f16_e32", f2h(-0.4))]:
+            got = run_op(f"{op} v0, v1", 0x11110000 | inp)
+            mutated = got & 0xFFFF7FFF
+            self.assertNotEqual(mutated, got, f"Sign bit mutation must differ for {op} on {inp:#x}")
+
+
 if __name__ == "__main__":
     unittest.main()
