@@ -7362,27 +7362,61 @@ class Gen:
             self.dst(a[0], r)
         elif op in ("v_dot4_i32_i8", "v_dot4c_i32_i8"):
             # The four products of the signed bytes of two dwords, summed, plus an addend: the third source for
-            # v_dot4_i32_i8 (VOP3P), the destination's old value for v_dot4c_i32_i8 (VOP2). The sum wraps at 32 bits.
-            # Measured on RDNA2 hardware (docs/design.md, "Signed-byte dot products"), where clamp saturates
-            # v_dot4_i32_i8 to a signed 32-bit value and op_sel picks the 16-bit half of a source each half of the
-            # product reads. llvm-mc prints neither for the programs measured, so both forms are refused, not guessed.
+            # v_dot4_i32_i8 (VOP3P), the destination's old value for v_dot4c_i32_i8 (VOP2). The sum wraps at 32 bits,
+            # or saturates to signed 32-bit [-2^31, 2^31-1] with clamp (VOP3P).
+            # Measured on RDNA2 hardware (docs/design.md, "Signed-byte dot products"): op_sel[k] picks the 16-bit half
+            # of source k (0=lo, 1=hi) for byte pairs 0..1, and op_sel_hi[k] picks the 16-bit half for byte pairs 2..3
+            # (defaults op_sel=[0,0,0], op_sel_hi=[1,1,1]). S2 (addend) is 32-bit; non-default S2 half-select is refused.
             # neg_lo/neg_hi are not ignored either: measured on v_dot4_i32_i8, they flip bit 15 and bit 31 of a
             # source dword (and take the addend's absolute value, then negate it), as if the operands were floats.
             # A set bit is refused; an all-zero field is the plain instruction.
-            if "clamp" in mods or any(m.startswith("op_sel") for m in mods):
-                raise Unsupported(op + (" clamp" if "clamp" in mods else " op_sel"))
+            def bits(name, default):
+                m = next((m for m in mods if m.startswith(name + ":")), None)
+                return [int(v) for v in m.split("[")[1].rstrip("]").split(",")] if m else default
+            is_vop3p = op == "v_dot4_i32_i8"
+            has_opsel = any(m.startswith("op_sel") for m in mods)
+            has_clamp = "clamp" in mods
+            if not is_vop3p and (has_opsel or has_clamp):
+                raise Unsupported(op + (" clamp" if has_clamp else " op_sel"))
             if any(m.startswith(("neg_lo", "neg_hi")) and "1" in m.split(":", 1)[-1] for m in mods):
                 raise Unsupported(op + " neg")
+            sel = bits("op_sel", [0, 0, 0])
+            selhi = bits("op_sel_hi", [1, 1, 1])
+            if len(sel) != 3 or len(selhi) != 3 or sel[2] != 0 or selhi[2] != 1:
+                raise Unsupported(op + " op_sel")
             x, y = self.src_u(a[1]), self.src_u(a[2])
-            acc = self.src_u(a[3]) if op == "v_dot4_i32_i8" else self.src_u(a[0])
-            for i in range(4):
-                xb, yb, prod, total = (self.tmp() for _ in range(4))
-                self.emit(f"{xb} = OpBitFieldSExtract %uint {x} {self.cu(8 * i)} {self.cu(8)}")
-                self.emit(f"{yb} = OpBitFieldSExtract %uint {y} {self.cu(8 * i)} {self.cu(8)}")
+            acc = self.src_u(a[3]) if is_vop3p else self.src_u(a[0])
+            x_offs = (16 * sel[0], 16 * sel[0] + 8, 16 * selhi[0], 16 * selhi[0] + 8)
+            y_offs = (16 * sel[1], 16 * sel[1] + 8, 16 * selhi[1], 16 * selhi[1] + 8)
+            dot = None
+            for xo, yo in zip(x_offs, y_offs):
+                xb, yb, prod = self.tmp(), self.tmp(), self.tmp()
+                self.emit(f"{xb} = OpBitFieldSExtract %uint {x} {self.cu(xo)} {self.cu(8)}")
+                self.emit(f"{yb} = OpBitFieldSExtract %uint {y} {self.cu(yo)} {self.cu(8)}")
                 self.emit(f"{prod} = OpIMul %uint {xb} {yb}")
-                self.emit(f"{total} = OpIAdd %uint {acc} {prod}")
-                acc = total
-            self.dst(a[0], acc)
+                if dot is None:
+                    dot = prod
+                else:
+                    s = self.tmp()
+                    self.emit(f"{s} = OpIAdd %uint {dot} {prod}")
+                    dot = s
+            total = self.tmp()
+            self.emit(f"{total} = OpIAdd %uint {acc} {dot}")
+            if has_clamp:
+                # dot is in [-65024, 65536], so signed 32-bit overflow can only happen once in acc + dot:
+                # iff acc and dot share a sign bit and total has the opposite sign bit.
+                same_x, not_same, diff_sum, ov_bits, ov_sign, is_ov, acc_neg, sat, clamped = (self.tmp() for _ in range(9))
+                self.emit(f"{same_x} = OpBitwiseXor %uint {acc} {dot}")
+                self.emit(f"{not_same} = OpNot %uint {same_x}")
+                self.emit(f"{diff_sum} = OpBitwiseXor %uint {acc} {total}")
+                self.emit(f"{ov_bits} = OpBitwiseAnd %uint {not_same} {diff_sum}")
+                self.emit(f"{ov_sign} = OpBitwiseAnd %uint {ov_bits} {self.cu(0x80000000)}")
+                self.emit(f"{is_ov} = OpINotEqual %bool {ov_sign} {self.cu(0)}")
+                self.emit(f"{acc_neg} = OpSLessThan %bool {acc} {self.cu(0)}")
+                self.emit(f"{sat} = OpSelect %uint {acc_neg} {self.cu(0x80000000)} {self.cu(0x7FFFFFFF)}")
+                self.emit(f"{clamped} = OpSelect %uint {is_ov} {sat} {total}")
+                total = clamped
+            self.dst(a[0], total)
         elif op == "v_mad_u32_u24":
             x, y, z = (self.src_u(t) for t in a[1:4])
             xm, ym, p, r = self.tmp(), self.tmp(), self.tmp(), self.tmp()
