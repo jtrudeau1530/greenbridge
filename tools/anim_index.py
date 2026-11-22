@@ -204,10 +204,18 @@ def parse_rbf0(data, offset=0):
                                    "source_offset": source_at, "rig_offset": rig_at})
     for row in rows:
         row["distinct_rigs"] = len({e["rig"] for e in row["entries"]})
-    stored = set(struct.unpack_from("<I", data, i)[0] for i in range(0, len(data) - 3))
     rig_names = {e["rig"] for row in rows for e in row["entries"]}
     names = {row["key"] for row in rows} | rig_names
-    stored_hashes = sum(1 for n in names if struct.pack("<I", joaat32(n)) in stored)
+    # Little-endian u32 at every byte offset (all four alignments), checked against the wanted hashes only.
+    wanted = {joaat32(n) for n in names}
+    found = set()
+    view = memoryview(data)
+    for a in range(4):
+        if found == wanted:
+            break
+        whole = a + (len(data) - a) // 4 * 4
+        found.update(h for (h,) in struct.iter_unpack("<I", view[a:whole]) if h in wanted)
+    stored_hashes = sum(1 for n in names if joaat32(n) in found)
     entries = [e for row in rows for e in row["entries"]]
     by_source = {}
     for source in RBF0_SOURCES:
