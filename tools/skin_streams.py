@@ -116,7 +116,7 @@ def resource_kind(b):
     """Drawable / drawable dictionary / fragment signature on the system page prefix, or None."""
     if len(b) < 192 or u64(b, 0) != 0:
         return None
-    if sys_ptr(u64(b, 32)) and sys_ptr(u64(b, 48)) and 0 < u16(b, 56) <= 4096 \
+    if sys_ptr(u64(b, 8)) and sys_ptr(u64(b, 32)) and sys_ptr(u64(b, 48)) and 0 < u16(b, 56) <= 4096 \
             and u16(b, 56) == u16(b, 58) == u16(b, 40) == u16(b, 42):
         return "dictionary"
     if all(sys_ptr(u64(b, at)) for at in (8, 24, 168)) \
