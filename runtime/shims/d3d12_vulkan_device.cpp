@@ -2611,6 +2611,25 @@ public:
                          entry->name.c_str());
             return E_NOTIMPL;
         }
+        // SHADER-309: a module over the device's maxComputeSharedMemorySize is invalid usage that spirv-val accepts
+        // and RADV dies on (#1721); some drivers report 32768. Refuse it here instead of creating the pipeline.
+        if (entry->lds_bytes) {
+            const auto& dinfo = device_.info;
+            if (const auto get_props = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(
+                    dinfo.get_instance_proc ? dinfo.get_instance_proc(dinfo.instance, "vkGetPhysicalDeviceProperties")
+                                            : nullptr)) {
+                VkPhysicalDeviceProperties props{};
+                get_props(dinfo.physical, &props);
+                if (entry->lds_bytes > props.limits.maxComputeSharedMemorySize) {
+                    std::fprintf(stderr,
+                                 "[rt] d3d12: %s declares %u bytes of workgroup memory, over the device's "
+                                 "maxComputeSharedMemorySize %u\n",
+                                 entry->name.c_str(), unsigned(entry->lds_bytes),
+                                 unsigned(props.limits.maxComputeSharedMemorySize));
+                    return E_NOTIMPL;
+                }
+            }
+        }
         const std::vector<std::uint32_t> words = library->spirv(*entry);
         if (words.empty()) {
             std::fprintf(stderr, "[rt] d3d12: %s.spv is missing or not SPIR-V\n", entry->name.c_str());

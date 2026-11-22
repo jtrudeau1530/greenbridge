@@ -39,6 +39,12 @@ import wave64_halves  # noqa: E402
 
 STRUCTURED = True     # False (--dispatch-loop): every shader with branches as one loop around a switch
 WAVE64_EMULATE = False   # --wave64-emulate: wave64 compute/mesh shaders exact on any subgroup size (Gen.x_round)
+# --max-shared-memory: a cap on a compute shader's Workgroup variables, LDS plus %x_buf (SHADER-309, #1721). The
+# default is the hard cap: 64 KiB, RDNA2's LDS per workgroup and the largest maxComputeSharedMemorySize drivers
+# report (RADV, NVIDIA). It is not the device limit: the AMD Windows (RDNA4) and Intel drivers report 32768, the
+# Vulkan minimum is 16384. The translator runs offline, so it records the exact total as lds_bytes in index.json and
+# the runtime compares that with the device's limit before it creates the pipeline. spirv-val checks neither.
+MAX_SHARED_BYTES = 65536
 WAVE64_GRAPHICS = "warn"   # --wave64-graphics: tier C wave64 VS/PS/GS (not exact on 32-wide subgroups): warn | error | off
 W64G_COUNTS = Counter()   # tiers of the wave64 VS/PS/GS translated so far, for the summary line
 # --bary-fallback: raw barycentric reads come from an ordinary perspective-interpolated vec3 input (the location is
@@ -193,6 +199,8 @@ class Gen:
         self.parked = {}               # (vgpr, lane) a mask is parked in -> the spare SGPR slot that keeps it per lane
         self.uses_lds = False
         self.lds_dwords = 16384        # CS: set from RSRC2 LDS_SIZE (power of two, covers every offset used)
+        self.lds_need = 0              # CS: dwords the program needs (LDS_SIZE, largest constant offset)
+        self.lds_declared = 0          # CS: dwords RSRC2 LDS_SIZE allocates (the hardware allocation, unclipped)
         self.cs = None             # CS: user SGPR count, enabled workgroup ids, thread-id VGPR count, group size
         self.ms = None             # MS: {"maxv", "maxp", "threads"} from PSV0
         self.ms_params = set()     # MS: param export indices used
@@ -2627,7 +2635,10 @@ class Gen:
         s1, i, m, p = self.tmp(), self.tmp(), self.tmp(), self.tmp()
         self.emit(f"{s1} = OpIAdd %uint {addr} {self.cu(byte_off)}")
         self.emit(f"{i} = OpShiftRightLogical %uint {s1} {self.cu(2)}")
-        self.emit(f"{m} = OpBitwiseAnd %uint {i} {self.cu(self.lds_dwords - 1)}")
+        if self.lds_dwords & (self.lds_dwords - 1):     # shrunk to fit the limit (fit_shared_memory)
+            self.emit(f"{m} = OpUMod %uint {i} {self.cu(self.lds_dwords)}")
+        else:
+            self.emit(f"{m} = OpBitwiseAnd %uint {i} {self.cu(self.lds_dwords - 1)}")
         self.emit(f"{p} = OpAccessChain %_ptr_WG_uint %lds {m}")
         return p
 
@@ -2874,6 +2885,23 @@ class Gen:
         mask = 2 * self.x_lanes
         sched = mask + 6 * w
         return w, mask, sched, sched + 6
+
+    def x_buf_bytes(self):
+        """Workgroup bytes of %x_buf: the wave64 exchange (emulate) or the barrier-round counts (bar_rounds)."""
+        return 4 * (self.x_sizes()[3] + 1) if self.emulate else 12 if self.bar_rounds else 0
+
+    def fit_shared_memory(self):
+        """SHADER-309: a compute shader's Workgroup memory, the LDS array plus %x_buf, must fit in MAX_SHARED_BYTES
+        (#1721: RADV dies on a module 4 bytes over 64 KiB; the device's own limit is the runtime's check). Called before any code is generated. The LDS array is a
+        power of two at least the program's need; when that plus %x_buf is over the limit but the need still fits,
+        the array shrinks to what is left (lds_ptr then wraps with OpUMod; addresses below the need are unchanged).
+        %x_buf is already sized to the workgroup, so when even the need does not fit, assemble refuses the shader."""
+        if not self.cs:
+            return
+        room = (MAX_SHARED_BYTES - self.x_buf_bytes()) // 4
+        if self.lds_dwords > room >= max(self.lds_need, 1):
+            self.lds_dwords = room
+            self.cu(room)
 
     def x_split(self):
         """End the current segment here: the rest of the block runs as a new segment in the next round."""
@@ -9686,6 +9714,15 @@ def assemble(gen):
             types += [f"%lds_arr = OpTypeArray %uint {gen.cu(gen.lds_dwords)}",
                       "%_ptr_WG_lds = OpTypePointer Workgroup %lds_arr", "%_ptr_WG_uint = OpTypePointer Workgroup %uint"]
             gvars += ["%lds = OpVariable %_ptr_WG_lds Workgroup"]
+        # SHADER-309: what fit_shared_memory could not shrink. The LDS counts at its RSRC2 allocation when that is
+        # larger than the array (clipped to 16384 dwords): a declared allocation over the cap is refused, not cut.
+        # A constant ds offset past 64 KiB is not counted: on hardware it is out of range (reads 0, writes dropped).
+        lds_b = 4 * max(gen.lds_dwords, gen.lds_declared) if gen.uses_lds else 0
+        wg = lds_b + gen.x_buf_bytes()
+        if wg > MAX_SHARED_BYTES:
+            raise Unsupported(f"CS workgroup memory {wg} B (LDS {lds_b} B + "
+                              f"{'wave64 exchange' if gen.emulate else 'barrier rounds'} {gen.x_buf_bytes()} B) "
+                              f"over maxComputeSharedMemorySize {MAX_SHARED_BYTES} B")
     if gen.frag_inputs or bary:
         dec += ["OpDecorate %frag_coord BuiltIn FragCoord"]
         gvars += ["%frag_coord = OpVariable %_ptr_Input_v4 Input"]
@@ -10861,6 +10898,8 @@ def translate(path):
         while n < need:
             n *= 2
         g.lds_dwords = min(n, 16384)
+        g.lds_need = need
+        g.lds_declared = ((rsrc2 >> 15) & 0x1FF) * 128
         g.cu(g.lds_dwords)
         g.cu(g.lds_dwords - 1)
         for i in range(user, user + 3):
@@ -10978,6 +11017,7 @@ def translate(path):
         halves_analysis(g, [insns], [[]])
         g.build_meta = _shader_meta.collect(path, info["name"], [insns], [[]],
                                             user_sgpr_limit=user_limit, system_sgprs=sys_sgprs)
+        g.fit_shared_memory()
         for ins in insns:
             if base_op(ins["op"]) == "s_endpgm":
                 break
@@ -11049,6 +11089,7 @@ def translate(path):
                                         user_sgpr_limit=user_limit, system_sgprs=sys_sgprs)
 
     g.bar_rounds = needs_barrier_rounds(g, blocks, succ)
+    g.fit_shared_memory()
     g.x_seg = len(blocks) + 1           # emulate: continuation segments are numbered after "done" (len(blocks))
     for n, blk in enumerate(blocks):
         g.body = []
@@ -11504,10 +11545,11 @@ def shader_meta(g, asm, src_path=None, fssm_path=None):
         m["gs_outputs"] = [r for r, _ in g.gs["out"]]
         m["gs_input_locations"] = sorted(r for r, sv in g.gs["in"] if sv != 1)
         m["gs_output_locations"] = sorted(r for r, sv in g.gs["out"] if sv != 1)
-    if g.uses_lds:
-        m["lds_bytes"] = 4 * g.lds_dwords
-    if g.emulate:
-        m["lds_bytes"] = m.get("lds_bytes", 0) + 4 * (g.x_sizes()[3] + 1)     # + %x_buf
+    # Every Workgroup byte of a compute shader (LDS + %x_buf of the emulation or the barrier rounds; SHADER-309): the
+    # runtime compares it with the device's maxComputeSharedMemorySize. A mesh shader also has its 4-byte %ms_counts.
+    lds = (4 * g.lds_dwords if g.uses_lds else 0) + (g.x_buf_bytes() if g.cs or g.emulate else 0) + (4 if g.ms else 0)
+    if lds:
+        m["lds_bytes"] = lds
     if g.vertex_inputs:
         m["vertex_inputs"] = [{"location": r, "type": {1: "uint", 2: "sint"}.get(t, "float")} for r, t in g.vertex_inputs]
     if getattr(g, "vertex_signature", None):
@@ -11725,6 +11767,7 @@ def _shard_arg(text):
 
 
 def main():
+    global MAX_SHARED_BYTES
     ap = argparse.ArgumentParser()
     ap.add_argument("src")
     ap.add_argument("--out", required=True)
@@ -11766,7 +11809,13 @@ def main():
                     help="16-bit interpolation without PerVertexKHR inputs, for devices that can't compile them "
                          "(MoltenVK): VS and mesh params also export their f16 halves decoded to f32, which the PS "
                          "reads as ordinary interpolated inputs (metadata: f16_halves)")
+    ap.add_argument("--max-shared-memory", type=int, default=MAX_SHARED_BYTES, metavar="BYTES",
+                    help="cap on a compute shader's workgroup memory, its LDS plus what --wave64-emulate adds "
+                         "(default %(default)s, the 64 KiB hard cap): over it the LDS array shrinks to the program's "
+                         "need, or the shader is refused (Unsupported). The device's own maxComputeSharedMemorySize "
+                         "(32768 on some drivers) is checked by the runtime against lds_bytes in index.json")
     a = ap.parse_args()
+    MAX_SHARED_BYTES = a.max_shared_memory
     global STRUCTURED, WAVE64_EMULATE, WAVE64_GRAPHICS, BARY_FALLBACK, TEXEL_OFFSET_FALLBACK, MESH_COMPUTE, FMA_KHR, F16_HALVES
     FMA_KHR = a.fma == "khr"
     STRUCTURED = not a.dispatch_loop

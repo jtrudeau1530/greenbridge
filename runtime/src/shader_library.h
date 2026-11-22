@@ -530,6 +530,9 @@ struct ShaderEntry {
     std::size_t binding_count = 0;  // set-0 bindings the module declares
     std::uint32_t push_constant_bytes = 0;
     std::array<std::uint32_t, 3> local_size{1, 1, 1};
+    // Workgroup memory the module declares: its LDS array plus what --wave64-emulate adds (SHADER-309). A compute
+    // pipeline needs it at or under the device's maxComputeSharedMemorySize (32768 on some drivers).
+    std::uint32_t lds_bytes = 0;
     bool uses_code_base = false;
     bool wave64 = false;
     // The subgroup size the translator assumed (64 for a wave64 shader, 32 otherwise); 0 when the entry says null,
@@ -616,6 +619,7 @@ private:
             e.fssm_sha256 = hash->string;
             if (const Json* b = meta.find("bindings"); b && b->kind == Json::Kind::array) e.binding_count = b->array.size();
             e.push_constant_bytes = u32(meta.find("push_constant_bytes"));
+            e.lds_bytes = u32(meta.find("lds_bytes"));
             if (const Json* l = meta.find("local_size"); l && l->kind == Json::Kind::array)
                 for (std::size_t i = 0; i < l->array.size() && i < 3; ++i) e.local_size[i] = u32(&l->array[i]);
             if (const Json* c = meta.find("uses_code_base"); c && c->kind == Json::Kind::boolean) e.uses_code_base = c->boolean;
