@@ -275,7 +275,7 @@ int main() {
                                   100, 100, frame_rect.right - frame_rect.left, frame_rect.bottom - frame_rect.top,
                                   nullptr, nullptr, window_class.hInstance, nullptr);
     EXPECT(window);
-    ShowWindow(window, SW_SHOWNORMAL);
+    ShowWindow(window, SW_SHOWNOACTIVATE);
     UpdateWindow(window);
     pump();
 
