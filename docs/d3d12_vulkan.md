@@ -2056,10 +2056,25 @@ on a PC device behind the Xbox-ABI proxy). Measured:
   compute PSOs (slot 62, 53 of 53 `S_OK`), CS bytecode 4–75 KB each. `~XboxBvhBuilder` returns and makes no device
   call. Created is not the same as correct: the shaders are Xbox DXIL with `@xbox.*` intrinsics (section 7.2), and
   nothing has been dispatched yet.
-- On an **RTX 4090** (driver 621.24) the first 48 PSOs return `S_OK`, and creating the 49th ends the process
-  with `0xC0000409` (fail-fast) on repeated runs; one run returned `E_OUTOFMEMORY` for it instead, which the
-  constructor threw. So the NVIDIA driver does not survive the builder's shaders as they are. The layer should not
-  hand Xbox DXIL to the PC driver.
+- **NVIDIA (RT-54).** On an RTX 3060 (616.64), an RTX 4090 (621.14) and an RTX 5070 Ti (621.24), all on Windows 11,
+  the first 48 PSOs return `S_OK`, and the 49th (38,248 bytes) never does. Some runs return `E_OUTOFMEMORY` for it,
+  which the constructor throws. Other runs end the process inside `nvwgf2umx.dll` with `0xC0000409`, after the
+  driver's LLVM 7.0.1 bitcode reader prints `Invalid record` or `Never resolved value found in function`. That
+  can't be caught. The D3D12 debug layer prints nothing first.
+  - **Cause: the input, not Leonida.** The proxy passes the bytecode through unchanged, so nothing is wrong in what
+    it forwards. The input is the problem: `LEONIDA_BVH_RECORD62=1 LEONIDA_BVH_DXIL=1` shows that every one of the
+    53 containers is signed, has the same 9 parts, and is shader model 6.5 / DXIL 1.5. But dxil.dll (Windows SDK
+    10.0.26100) rejects all 53 (`0x80aa0009`): the target triple is `dxil-ms-xb2` and the module carries
+    `xbox.compiler.options` metadata. Most also have Xbox-only externals (44 of 53), `extractvalue` on non-DXIL types
+    (16) or other disallowed instruction types (5). No PC driver has to accept this, and WARP happens to.
+  - **What sets the 49th apart: one error kind.** It is the only shader of the 53 that the validator reports for a
+    resource in a function signature (a non-entry function that takes a resource). Its other counts are 265
+    `extractvalue`, 6 Xbox externals and 514 `i64` mentions; the 36th shader has the same 265 and 468 and is created.
+  - **Workaround: the test switches to WARP on NVIDIA.** On an NVIDIA adapter (PCI vendor `0x10DE`), `bvh_builder_test`
+    now uses WARP unless `LEONIDA_BVH_HARDWARE=1`, and it prints the reason. WARP creates all 53 PSOs, and the
+    constructor and destructor return. It isn't known whether AMD hardware takes these shaders.
+  - **The runtime itself still shouldn't hand Xbox DXIL to a PC driver.** These shaders need lowering to PC DXIL or a
+    translation of their own (section 7.2, M6) before they can run on hardware.
 
 ### A.3 `amd_fidelityfx_upscaler_xbox.dll`
 
