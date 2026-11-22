@@ -337,6 +337,8 @@ def main(argv=None):
     r.add_argument("--compose", type=int, default=0, metavar="N")
     r.add_argument("--out")
     a = ap.parse_args(argv)
+    if a.cmd == "resolve" and a.compose < 0:
+        r.error("--compose must be 0 or more")
     return {"collect": cmd_collect, "resolve": cmd_resolve}[a.cmd](a) or 0
 
 
