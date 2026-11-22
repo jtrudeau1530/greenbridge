@@ -7,9 +7,11 @@ import importlib.util
 import io
 import os
 import struct
+import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -144,6 +146,38 @@ class ShortsTest(unittest.TestCase):
         self.assertEqual(result, 2)
         self.assertIn("missing.awc", err.getvalue())
         self.assertEqual(len(err.getvalue().splitlines()), 1)
+
+    def test_clip_write_error_preserves_catalog_in_both_worker_modes(self):
+        path = self.write("blocked.awc", 0xFC, 480000)
+        os.makedirs(os.path.join(self.out, "blocked", "00001234.ogg"))
+        index = os.path.join(self.out, "shorts.csv")
+        with open(index, "wb") as f:
+            f.write(b"previous catalog\n")
+        tool = os.path.join(ROOT, "tools", "awc_shorts.py")
+        for jobs in ("1", "2"):
+            with self.subTest(jobs=jobs):
+                result = subprocess.run([sys.executable, "-I", tool, path, self.out, "--jobs", jobs],
+                                        capture_output=True, text=True, timeout=60)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn("blocked", result.stderr)
+                self.assertNotIn("Traceback", result.stderr)
+                with open(index, "rb") as f:
+                    self.assertEqual(f.read(), b"previous catalog\n")
+
+    def test_partial_csv_write_preserves_catalog(self):
+        path = self.write("good.awc", 0xFC, 480000)
+        os.makedirs(self.out)
+        index = os.path.join(self.out, "shorts.csv")
+        with open(index, "wb") as f:
+            f.write(b"previous catalog\n")
+        args = [path, self.out, "--jobs", "1"]
+        with mock.patch.object(shorts.csv.DictWriter, "writerows", side_effect=OSError("disk full")), \
+                contextlib.redirect_stderr(io.StringIO()) as err:
+            self.assertEqual(shorts.main(args), 1)
+        self.assertIn("shorts.csv", err.getvalue())
+        with open(index, "rb") as f:
+            self.assertEqual(f.read(), b"previous catalog\n")
+        self.assertEqual(sorted(os.listdir(self.out)), ["good", "shorts.csv"])
 
     def test_nan_duration_bounds(self):
         path = self.write("good.awc", 0x78, 960)
