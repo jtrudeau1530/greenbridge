@@ -614,6 +614,31 @@ def find_test_programs(build: str, ext: str) -> str | None:
     return None
 
 
+def native_folder(path: str, ansi: str = "mbcs") -> str | None:
+    """`path` spelled so that the native programs this runner starts can open files under it, or None.
+
+    On Windows the test programs and the Vulkan SDK tools (spirv-val, spirv-as) read their command line in the ANSI
+    code page, so a character outside it, as in a Cyrillic or CJK user name under %TEMP%, reaches them as '?'. Such a
+    folder is replaced by its 8.3 short name, which is plain ASCII, when the volume keeps one. Elsewhere, and for a
+    path the code page holds, `path` comes back as it is. `ansi` is the codec of that code page (a parameter so a
+    test can pick a narrow one).
+    """
+    def fits(p: str) -> bool:
+        try:
+            p.encode(ansi)
+            return True
+        except UnicodeEncodeError:
+            return False
+
+    if os.name != "nt" or fits(path):
+        return path
+    import ctypes
+    buf = ctypes.create_unicode_buffer(32768)
+    n = ctypes.windll.kernel32.GetShortPathNameW(path, buf, len(buf))
+    short = buf.value if 0 < n < len(buf) else ""
+    return short if short and fits(short) else None
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--llvm-mc", default=os.environ.get("LLVM_MC", "llvm-mc"),
@@ -657,7 +682,14 @@ def main() -> int:
 
     work = a.work or tempfile.mkdtemp(prefix="leonida_gpu_tests_")
     try:
-        return run_suite(a, work)
+        os.makedirs(work, exist_ok=True)
+        native = native_folder(work)
+        if native is None:
+            print(f"error: the work folder {ascii(work)} has characters outside this PC's ANSI code page and no 8.3 "
+                  "short name, so the test programs and the Vulkan SDK tools can't open files in it. Pass --work "
+                  "with a folder whose path they can, such as C:\\leonida_gpu_work.", file=sys.stderr)
+            return 2
+        return run_suite(a, native)
     finally:
         if a.work is None:
             shutil.rmtree(work, ignore_errors=True)
