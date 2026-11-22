@@ -3562,6 +3562,16 @@ class Gen:
                     self.emit(f"{r} = {k} %uint {x} {y}")
                 else:
                     self.emit(f"{r} = OpExtInst %uint %glsl {'UMax' if 'max' in op else 'UMin'} {x} {y}")
+            if "clamp" in mods:
+                # VOP3 clamp saturates the unsigned add/sub to [0, 0xFFFF], as for the 32-bit ops (docs/design.md,
+                # "Integer clamp"). The operands are zero-extended, so a result past 0xFFFF is an overflow (add) or a
+                # borrow (sub). Other 16-bit ops: rejected rather than guessed.
+                if op not in ("v_add_u16", "v_sub_u16", "v_subrev_u16"):
+                    raise Unsupported(op + " clamp")
+                ov, sat = self.tmp(), self.tmp()
+                self.emit(f"{ov} = OpUGreaterThan %bool {r} {self.cu(0xFFFF)}")
+                self.emit(f"{sat} = OpSelect %uint {ov} {self.cu(0 if 'sub' in op else 0xFFFF)} {r}")
+                r = sat
             lo = self.tmp()
             self.emit(f"{lo} = OpBitwiseAnd %uint {r} {self.cu(0xFFFF)}")
             if e64 and sb[2]:
