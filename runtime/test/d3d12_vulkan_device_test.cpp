@@ -15,6 +15,8 @@
 
 #include <dxgi1_4.h>
 
+#include <dxgi1_4.h>
+
 #include <algorithm>
 #include <array>
 #include <cstdint>
