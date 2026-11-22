@@ -21,7 +21,10 @@
 #include <functional>
 #include <memory>
 #include <span>
+#include <string>
 #include <vector>
+
+#include "../src/root_signature.h"
 
 namespace leonida {
 class VulkanPresenter;
@@ -109,12 +112,19 @@ struct VulkanDeviceInfo {
     // The instance enabled VK_EXT_debug_utils: SetMarker/BeginEvent/EndEvent become debug labels. Otherwise they
     // do nothing.
     bool debug_utils = false;
-    // Vulkan 1.2 bufferDeviceAddress is enabled: buffers carry VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT and
-    // ID3D12Resource::GetGPUVirtualAddress() returns the Vulkan buffer device address.
+    // Vulkan 1.2 bufferDeviceAddress is enabled: buffers and shader-visible heaps then live in the GPU address
+    // arena and have console VAs (docs section 3.3), and GetGPUVirtualAddress returns those addresses; ray tracing
+    // needs it too. Without it, GetGPUVirtualAddress returns 0 and pipelines cannot be created.
     bool buffer_device_address = false;
     // Optional VK_KHR_acceleration_structure + VK_KHR_deferred_host_operations + VK_KHR_ray_query are enabled:
     // GetRaytracingAccelerationStructurePrebuildInfo and BuildRaytracingAccelerationStructure (BLAS + TLAS) work.
     bool ray_tracing = false;
+    // The core features enabled on `device`. Graphics PSOs that need independentBlend, fillModeNonSolid,
+    // depthBiasClamp or dualSrcBlend are refused unless it is set here.
+    VkPhysicalDeviceFeatures features{};
+    // The translator's output folder (spirv/index.json + <name>.spv) for pipeline creation; empty: the
+    // LEONIDA_SHADERS environment variable.
+    std::string shader_dir;
 };
 
 // A Vulkan-backed ID3D12Device (PC ABI, up to ID3D12Device11) on caller-owned Vulkan objects, which must outlive
@@ -212,6 +222,26 @@ private:
 
 // Null when `device` is not a Vulkan device created with presentation, or the window cannot be presented to.
 std::unique_ptr<WindowPresenter> create_window_presenter(ID3D12Device* device, HWND window);
+
+// Where each root parameter's arguments go in the 32 user-data dwords the translated shaders read, as
+// rt::rootsig::pack() lays them out (docs section 3.5). Built when a Vulkan device creates the root signature.
+struct RootArgumentLayout {
+    struct Parameter {
+        rt::rootsig::ParamType type;
+        std::uint32_t user_offset;     // first dword; unused for a parameter with no dwords
+        std::uint32_t constant_count;  // constants only
+    };
+    std::vector<Parameter> parameters;
+};
+
+// For the command list: the argument layout of a root signature from a Vulkan device, and the id it records for a
+// compute pipeline state (0: not a compute PSO of a Vulkan device).
+const RootArgumentLayout* root_signature_layout(ID3D12RootSignature* signature);
+std::uintptr_t compute_pipeline_id(ID3D12PipelineState* pipeline);
+std::uintptr_t graphics_pipeline_id(ID3D12PipelineState* pipeline);
+
+// The size of every descriptor slot (GetDescriptorHandleIncrementSize), for handle ranges.
+inline constexpr UINT descriptor_size = 32;
 
 // ExecuteCommandLists returns void; this is what the last call on the queue did.
 leonida::ReplayResult last_execute_result(ID3D12CommandQueue* queue);
