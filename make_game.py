@@ -1286,6 +1286,14 @@ def main() -> int:
 
 def cli() -> int:
     """main(), with Ctrl+C reported in one line instead of a traceback: every stage resumes on the next run."""
+    # A redirected stdout (make_game.py > build.log) is encoded with the console's ANSI code page on Windows, and
+    # -I ignores PYTHONUTF8, so a character outside that code page -- a Cyrillic, Greek or CJK user name in a
+    # found dump's path or in --out -- raises UnicodeEncodeError and ends the run. stderr escapes such
+    # characters already (backslashreplace); stdout is strict, so write '?' where the code page has no glyph.
+    try:
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
     try:
         return main()
     except KeyboardInterrupt:
