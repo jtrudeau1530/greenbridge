@@ -29,6 +29,7 @@ from compute_fixture import compute_header
 from check import (CMPX_CLASS_WORDS, TEST_PROGRAMS, TEXTURE_MIP_DEPENDENCIES, TEXTURE_MIP_TEST, Skip,
                    mesh_v5_test, not_found_message, pick_build_dir, start_failure, texture_mip_test)
 from check import TEXOFF_ARGS, texoff_problem   # ps_texoff's expected words and arguments live in check.py
+from check import WAVE32_LANE_DUMPS, narrow_subgroup_skip   # wave32 lane-mask dumps skip below 32 lanes, as in check.py
 
 
 def make_dxbc(chunks: list[tuple[bytes, bytes]]) -> bytes:
@@ -697,8 +698,12 @@ def run_suite(a, work: str) -> int:
             if partial and not emulated:
                 cs_env = dict(os.environ, VKC_SUBGROUP_SIZE="64")
             rc, msg = run_cmd([vk_compute, spv, "1", "dump"] + (["--require-wave64"] if wave64 else []), env=cs_env)
-            ok, detail = judge_cs_dump(rc, msg, want, wave64=wave64, partial=partial, emulated=emulated,
-                                       hexwords=name in ("cs_store", "cs_smem_soffset_imm"))
+            skip = narrow_subgroup_skip(msg) if name in WAVE32_LANE_DUMPS else None
+            if skip:   # e.g. Mesa llvmpipe's 8-wide subgroups: these 32-lane masks can't come out right
+                ok, detail = None, str(skip)
+            else:
+                ok, detail = judge_cs_dump(rc, msg, want, wave64=wave64, partial=partial, emulated=emulated,
+                                           hexwords=name in ("cs_store", "cs_smem_soffset_imm"))
             results.append((name, ok, detail))
         elif name == "cs_imgstore":
             rc, msg = run_cmd([vk_store, spv])
