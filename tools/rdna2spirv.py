@@ -5423,8 +5423,8 @@ class Gen:
             else:
                 iv = self.tmp()
                 self.emit(f"{iv} = OpCompositeConstruct {'%v2int' if ncoord == 2 else '%v3int'} {' '.join(ints)}")
-            if dim in self.STORE_DIMS and not d16:
-                self.image_load_typed(dim, self.load_reg("sgpr", a[2]["r"] + 1), iv, img, img_idx, dmask, vdata)
+            if dim in self.STORE_DIMS:
+                self.image_load_typed(dim, self.load_reg("sgpr", a[2]["r"] + 1), iv, img, img_idx, dmask, vdata, d16)
                 return
             res = self.tmp()
             self.emit(f"{res} = OpImageFetch %v4float {img} {iv} Lod {self.cu(0)}")
@@ -5703,7 +5703,7 @@ class Gen:
             flags.append(nz)
         return flags
 
-    def image_load_typed(self, dim, t1, iv, img, idx, dmask, vdata):
+    def image_load_typed(self, dim, t1, iv, img, idx, dmask, vdata, d16=False):
         """image_load with the image's numeric type decided at run time (T# FORMAT): UINT/SINT formats are read
         through the uint/sint storage views (OpImageRead, read-without-format), everything else through the float
         sampled view (OpImageFetch, as before). Vulkan requires the view's component type to match the format, so a
@@ -5716,14 +5716,30 @@ class Gen:
         act = self.active_b()
         L = {k: self.tmp() + "_" + k for k in ("s", "rest", "e2", "u", "f", "e3")}
 
-        def write(v4u):
-            k = 0
+        def write(v4u, f16=False):
+            xs = []
             for c in range(4):
                 if dmask >> c & 1:
                     x = self.tmp()
                     self.emit(f"{x} = OpCompositeExtract %uint {v4u} {c}")
+                    xs.append(x)
+            if not d16:
+                for k, x in enumerate(xs):
                     self.dst({"k": "vgpr", "r": vdata["r"] + k, "n": 1}, x)
-                    k += 1
+                return
+            # d16: two 16-bit results per VGPR, low half first: f16 (RTE) for the float view, the low 16 bits for
+            # integer views. shortcut: integers are truncated; AMD may saturate them (Mesa nir
+            # integer_dest_saturates, unverified), so values past 16 bits may differ; clamp once a GPU shows it.
+            for i in range(0, len(xs), 2):
+                pair = xs[i:i + 2] + [self.cu(0)] * (2 - len(xs[i:i + 2]))
+                if f16:
+                    w = self.pack_f16_pair_int(self.tof(pair[0]), self.tof(pair[1]))
+                else:
+                    lo, hi, w = self.tmp(), self.tmp(), self.tmp()
+                    self.emit(f"{lo} = OpBitwiseAnd %uint {pair[0]} {self.cu(0xFFFF)}")
+                    self.emit(f"{hi} = OpShiftLeftLogical %uint {pair[1]} {self.cu(16)}")
+                    self.emit(f"{w} = OpBitwiseOr %uint {lo} {hi}")
+                self.dst({"k": "vgpr", "r": vdata["r"] + i // 2, "n": 1}, w)
 
         def read(cls, ty):
             ip, im, r, b = self.tmp(), self.tmp(), self.tmp(), self.tmp()
@@ -5749,7 +5765,7 @@ class Gen:
         res, b = self.tmp(), self.tmp()
         self.emit(f"{res} = OpImageFetch %v4float {img} {iv} Lod {self.cu(0)}")
         self.emit(f"{b} = OpBitcast %v4uint_st {res}")
-        write(b)
+        write(b, f16=True)
         self.emit(f"OpBranch {L['e3']}")
         self.emit(f"{L['e3']} = OpLabel")
         self.emit(f"OpBranch {L['e2']}")
