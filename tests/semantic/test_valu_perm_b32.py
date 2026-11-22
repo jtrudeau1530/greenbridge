@@ -999,5 +999,171 @@ class TestPermB32SIMDMultiLane(unittest.TestCase):
             self.assertEqual(wave.get_lane_vgpr(0, lane), prior_dst[lane])
 
 
+# ==============================================================================
+# Register Aliasing and In-Place Operand Preservation
+# ==============================================================================
+
+class TestPermB32RegisterAliasing(unittest.TestCase):
+    """Test suite for register aliasing and in-place operand preservation."""
+
+    def test_dst_aliases_src0(self):
+        # v0 = perm(v0, v1, v2)
+        # v0 holds src0 (indices 4..7). In-place update must read old v0 bytes accurately.
+        rf = ScalarRegisterFile()
+        rf.set_vgpr(0, 0x11223344)  # src0 and dst
+        rf.set_vgpr(1, 0xAABBCCDD)  # src1
+        # Selector picks byte 0 of src1, byte 0 of src0, byte 1 of src1, byte 1 of src0
+        # src1[0]=0xDD, src0[0]=0x44, src1[1]=0xCC, src0[1]=0x33 -> 0x33CC44DD
+        sel = make_selector(0, 4, 1, 5)
+        rf.set_vgpr(2, sel)
+
+        interp = PermB32ScalarInterpreter(rf)
+        instr = ASTInstruction(
+            opcode=Opcode.V_PERM_B32,
+            dst=ASTOperand.vgpr(0),
+            src0=ASTOperand.vgpr(0),
+            src1=ASTOperand.vgpr(1),
+            src2=ASTOperand.vgpr(2),
+        )
+        interp.step(instr)
+        self.assertEqual(rf.get_vgpr(0), 0x33CC44DD)
+
+    def test_dst_aliases_src1(self):
+        # v1 = perm(v0, v1, v2)
+        # v1 holds src1 (indices 0..3)
+        rf = ScalarRegisterFile()
+        rf.set_vgpr(0, 0x11223344)  # src0
+        rf.set_vgpr(1, 0xAABBCCDD)  # src1 and dst
+        # Reverse src1: [DD, CC, BB, AA] -> [AA, BB, CC, DD] -> 0xDDCCBBAA
+        sel = PermSelectorWord.bswap_src1().raw
+        rf.set_vgpr(2, sel)
+
+        interp = PermB32ScalarInterpreter(rf)
+        instr = ASTInstruction(
+            opcode=Opcode.V_PERM_B32,
+            dst=ASTOperand.vgpr(1),
+            src0=ASTOperand.vgpr(0),
+            src1=ASTOperand.vgpr(1),
+            src2=ASTOperand.vgpr(2),
+        )
+        interp.step(instr)
+        self.assertEqual(rf.get_vgpr(1), 0xDDCCBBAA)
+
+    def test_dst_aliases_src2_selector(self):
+        # v2 = perm(v0, v1, v2)
+        # Selector register is overwritten by the result
+        rf = ScalarRegisterFile()
+        rf.set_vgpr(0, 0x12345678)
+        rf.set_vgpr(1, 0x9ABCDEF0)
+        # Identity of src0: 0x07060504
+        sel = PermSelectorWord.identity_src0().raw
+        rf.set_vgpr(2, sel)
+
+        interp = PermB32ScalarInterpreter(rf)
+        instr = ASTInstruction(
+            opcode=Opcode.V_PERM_B32,
+            dst=ASTOperand.vgpr(2),
+            src0=ASTOperand.vgpr(0),
+            src1=ASTOperand.vgpr(1),
+            src2=ASTOperand.vgpr(2),
+        )
+        interp.step(instr)
+        self.assertEqual(rf.get_vgpr(2), 0x12345678)
+
+    def test_full_aliasing_all_operands(self):
+        # v0 = perm(v0, v0, v0)
+        # All operands are the same register v0
+        rf = ScalarRegisterFile()
+        # Choose a value that serves as both data and selector:
+        # byte 0 = 0x01, byte 1 = 0x02, byte 2 = 0x03, byte 3 = 0x00 -> 0x00030201
+        val = 0x00030201
+        rf.set_vgpr(0, val)
+
+        # Expected:
+        # data pool: src0=val (bytes 4..7), src1=val (bytes 0..3)
+        # selector bytes: sel0=1, sel1=2, sel2=3, sel3=0
+        # byte 0: val[1] = 0x02
+        # byte 1: val[2] = 0x03
+        # byte 2: val[3] = 0x00
+        # byte 3: val[0] = 0x01
+        # Pack: [0x02, 0x03, 0x00, 0x01] -> 0x01000302
+        interp = PermB32ScalarInterpreter(rf)
+        instr = ASTInstruction(
+            opcode=Opcode.V_PERM_B32,
+            dst=ASTOperand.vgpr(0),
+            src0=ASTOperand.vgpr(0),
+            src1=ASTOperand.vgpr(0),
+            src2=ASTOperand.vgpr(0),
+        )
+        interp.step(instr)
+        self.assertEqual(rf.get_vgpr(0), 0x01000302)
+
+    def test_src0_aliases_src1_self_swizzle(self):
+        # v2 = perm(v0, v0, literal)
+        rf = ScalarRegisterFile()
+        rf.set_vgpr(0, 0x12345678)
+
+        # Select bytes from same register using indices 0..3 or 4..7
+        # Index 0 and 4 are both byte 0 (0x78)
+        sel = make_selector(0, 4, 1, 5)  # [0x78, 0x78, 0x56, 0x56] -> 0x56567878
+        interp = PermB32ScalarInterpreter(rf)
+        instr = ASTInstruction(
+            opcode=Opcode.V_PERM_B32,
+            dst=ASTOperand.vgpr(2),
+            src0=ASTOperand.vgpr(0),
+            src1=ASTOperand.vgpr(0),
+            src2=ASTOperand.literal(sel),
+        )
+        interp.step(instr)
+        self.assertEqual(rf.get_vgpr(2), 0x56567878)
+
+    def test_simd_wave_aliasing_with_exec_mask(self):
+        # Wave32: v1 = perm(v0, v1, v2) with half EXEC mask
+        wave = SIMDWaveState(num_lanes=32, exec_mask=0x0000FFFF)
+        src0_init = [0x11111111] * 32
+        src1_init = [0x22222222 + i for i in range(32)]
+        sel_bswap = [PermSelectorWord.bswap_src1().raw] * 32
+
+        wave.set_wave_vgpr(0, src0_init)
+        wave.set_wave_vgpr(1, src1_init)
+        wave.set_wave_vgpr(2, sel_bswap)
+
+        instr = ASTInstruction(
+            opcode=Opcode.V_PERM_B32,
+            dst=ASTOperand.vgpr(1),
+            src0=ASTOperand.vgpr(0),
+            src1=ASTOperand.vgpr(1),
+            src2=ASTOperand.vgpr(2),
+        )
+        wave.execute_instruction(instr)
+
+        for lane in range(16):
+            expected = oracle_v_perm_b32(src0_init[lane], src1_init[lane], sel_bswap[lane])
+            self.assertEqual(wave.get_lane_vgpr(1, lane), expected)
+        for lane in range(16, 32):
+            self.assertEqual(wave.get_lane_vgpr(1, lane), src1_init[lane])
+
+    def test_unwritten_registers_unaffected(self):
+        rf = ScalarRegisterFile()
+        rf.set_vgpr(3, 0x11111111)
+        rf.set_vgpr(4, 0x22222222)
+        rf.set_vgpr(5, 0x33333333)
+        rf.set_vgpr(6, 0x44444444)
+
+        interp = PermB32ScalarInterpreter(rf)
+        instr = ASTInstruction(
+            opcode=Opcode.V_PERM_B32,
+            dst=ASTOperand.vgpr(4),
+            src0=ASTOperand.vgpr(3),
+            src1=ASTOperand.vgpr(3),
+            src2=ASTOperand.literal(0),
+        )
+        interp.step(instr)
+
+        self.assertEqual(rf.get_vgpr(3), 0x11111111)
+        self.assertEqual(rf.get_vgpr(5), 0x33333333)
+        self.assertEqual(rf.get_vgpr(6), 0x44444444)
+
+
 if __name__ == "__main__":
     unittest.main()
