@@ -281,11 +281,12 @@ def main(argv=None) -> int:
     a = ap.parse_args(argv)
     if not a.words and not a.conversations:
         ap.error("give at least one --words or --conversations source")
-    for path in a.banks + a.words + a.conversations:
+    inputs = a.banks + a.words + a.conversations
+    for path in inputs:
         if not os.path.exists(path):
             print(f"awc_names: error: {path}: no such file or directory", file=sys.stderr)
             return 2
-    if a.out and any(os.path.exists(a.out) and os.path.samefile(p, a.out) for p in a.banks + a.words):
+    if a.out and os.path.exists(a.out) and any(os.path.samefile(p, a.out) for p in inputs):
         ap.error("--out must not overwrite an input")
 
     words = []
@@ -317,7 +318,7 @@ def main(argv=None) -> int:
     if a.out:
         try:
             if a.out.lower().endswith(".json"):
-                with open(a.out, "w", encoding="utf-8") as fh:
+                with open(a.out, "w", encoding="utf-8", newline="\n") as fh:
                     json.dump({"summary": summary, "streams": rows}, fh, indent=1)
             else:
                 with open(a.out, "w", encoding="utf-8", newline="") as fh:

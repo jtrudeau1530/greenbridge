@@ -229,10 +229,53 @@ The name controls resolve `cs_kenton`, `u_f_o_rhonda`, `cs_monalisa` and `cs_luc
 not. The delivered `mandy/` preview export is therefore a clearly labelled `cs_monalisa` proxy,
 not a verified Mandy model.
 
+Two further checks refine that negative. A missing `mandy` name is the common case, not an
+anomaly: of the 13 `KeyLento/Perschars/Peds/Unique` entries, two resolve cleanly by name
+(`kenton` -> `cs_kenton`, `rhonda` -> `u_f_o_rhonda`), one plausibly maps (`Bert` ->
+`hc_cs_herbert_watson`), and the other ten, including `Mandy`, have no name hit. Also, the
+package manifest lists 108 files and its `pack/` directory contains only `story000`,
+`core_restofworld`, `core_restofworld001`, `shared_minigame000` and their `_bvh4`/`_licenses`
+companions; there is no `psp_*` archive, so the `PSP_KeyLento_perschars_peds` pack named by the
+schedule is not present in this build. Mandy is therefore not disproven: her appearance is either
+a generic ped assembled at runtime or in a pack this package does not include.
+
 Caveats: `levels.rpf` was prefix-bounded at 4 MiB per inflated stream, raw RSC8 bodies and
 Bink/opaque regions were not decoded, and the encrypted RPF9 table of contents prevents a full
 path enumeration (27 top-level entries remain). The evidence supports a shared ped-appearance
 actor assembled from existing components, not a unique `mandy` resource.
+The mission binding is now measured. `COM_KBOS_NEIGHB` is the internal id of the "Pipework"
+mission: the replay table carries that `<MissionId>`, and the mission text names "Mandy's
+house", "Follow Mandy" and "Bert died". Five PSIN state tables in
+`pack/story000/story000_script.rpf` (`03fe4000`, `03fe8000`, `03feb000`, `03fee000`,
+`03ff0000`) contain both characters as entity link hashes: `0x03A885E6` (`Mandy`) and
+`0xE34ACBC8` (`Bert`); the schedule pack hash is `0x865F0DA9`
+(`PSP_KeyLento_perschars_peds`).
+
+The model binding is also decoded. `PERSCHARS_INFO` (`data.rpf@0x1AA5F000`, record 3499) maps
+`Name = 0x03A885E6` (`mandy`) to `ModelSetName = 0x03A885E6`; `CPedModelInfo__InitData`
+(`packs.rpf@0x11D1FF000`, record 1219) maps that link to `cs_mandy` (`0xD7C0CDFF`). `cs_mandy`
+is a live model id — a `story000.rpf` cutscene actor/voice table uses it — but there is **no
+named `cs_mandy` drawable**. Its 64-bit `ModelName` is `0x009B33B7D7C0CDFF`, and its `FragName`
+`0xC9888B65009B33B7` is byte-identical to `cs_lucia` and `cs_monalisa`: the shared female
+cutscene-ped fragment set. The realistic full-body in that family is `cs_lucia_legacypedcs`
+(874 v), so Mandy uses the same body as Lucia. Her nine-entry variation table has 18 u32 hashes;
+16 are unique to her, but none resolves to a shipped drawable or texture name.
+
+The entities linked to Mandy carry three different per-state archetype hashes
+(`0x18BB2550`, `0x73E83886`, `0x57DDFFC2`), which fits her outfit changing between states, not
+three models. None of those hashes resolves through the package name dictionary, any drawable
+or prop name pool, the `packs.rpf` PSOs, or a `0x7a` meta hash scan, so they are state/archetype
+ids, not model names. The archetype-to-component-set table is not in the readable archives;
+whether it is in the missing executable or an undecoded store is not established.
+
+`Mandy_FirstTingle`, `Mandy_ComingUp` and `Drug_Mandy_*` in `common.rpf` are MDMA drug effects,
+not the character. They are a red herring in any `mandy` name search.
+
+Caveats: the RPF9 table of contents is still not decoded; names come from carving and recovery
+(318,266 unique `levels.rpf` names, 24,034 `packs.rpf` names), and raw RSC8 bodies and
+Bink/opaque regions were not decoded. The evidence supports a shared ped-appearance actor: a
+`cs_mandy` model id, a body fragment shared with `cs_lucia` and `cs_monalisa`, and a variation
+table, not a unique `mandy` drawable.
 
 ## Reproduction
 

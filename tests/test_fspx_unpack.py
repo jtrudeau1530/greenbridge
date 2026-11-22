@@ -200,6 +200,26 @@ class Cli(unittest.TestCase):
             with open(os.path.join(out, "lib_01.dxbc"), "rb") as f:
                 self.assertEqual(f.read(), c)
 
+    def test_retains_programs_with_matching_input_stems(self):
+        container = Containers().container()
+        with tempfile.TemporaryDirectory() as tmp:
+            a = os.path.join(tmp, "a", "sample.dxbc")
+            b = os.path.join(tmp, "b", "sample.dll")
+            for path, data in ((a, container), (b, b"MZ" + bytes(62) + container)):
+                os.makedirs(os.path.dirname(path))
+                with open(path, "wb") as f:
+                    f.write(data)
+            out = os.path.join(tmp, "out")
+            code, _, err = self.run_tool(a, b, "--out", out)
+            self.assertEqual(code, 0, err)
+            with open(os.path.join(out, "index.json"), encoding="utf-8") as f:
+                index = json.load(f)
+            self.assertEqual([entry["file"] for entry in index], ["sample.dxbc", "sample_2.dxbc"])
+            for name, offset in (("sample", 0), ("sample_2", 64)):
+                with open(os.path.join(out, "fspx", name + ".json"), encoding="utf-8") as f:
+                    self.assertEqual(json.load(f)["source"]["offset"], offset)
+                self.assertTrue(os.path.isfile(os.path.join(out, name + ".dxbc")))
+
     def test_bare_payload_and_a_file_without_fspx(self):
         with tempfile.TemporaryDirectory() as t:
             bare = os.path.join(t, "one.fspx")
@@ -226,6 +246,24 @@ class Cli(unittest.TestCase):
             code, _, err = self.run_tool(src, "--out", os.path.join(t, "out"))
             self.assertEqual(code, 1)
             self.assertIn("FSPX status 5", err)
+
+    def test_short_kind0_unpacks_without_keyerror(self):
+        with tempfile.TemporaryDirectory() as t:
+            src = os.path.join(t, "short.fspx")
+            with open(src, "wb") as f:
+                f.write(make_fspx([(0, struct.pack("<2I", 1, 2)), (6, program())]))
+            out = os.path.join(t, "out")
+            code, _, err = self.run_tool(src, "--out", out)
+            self.assertEqual(code, 0)
+            self.assertEqual(err, "")
+            with open(os.path.join(out, "index.json"), encoding="utf-8") as f:
+                index = json.load(f)
+            self.assertEqual(len(index), 1)
+            self.assertNotIn("threads", index[0])
+            self.assertNotIn("wave32", index[0])
+            with open(os.path.join(out, "fspx", "short.json"), encoding="utf-8") as f:
+                meta = json.load(f)
+            self.assertEqual(meta["words"], [1, 2])
 
 
 class TranslatorSidecars(unittest.TestCase):

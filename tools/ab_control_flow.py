@@ -111,7 +111,7 @@ def write_outcomes(out_dir, outcomes):
     """Write (shader name, outcome) pairs to the harness's tab-separated report."""
     os.makedirs(out_dir, exist_ok=True)
     path = os.path.join(out_dir, "outcomes.tsv")
-    with open(path, "w", encoding="utf-8") as f:
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
         f.write("".join(f"{name}\t{outcome}\n" for name, outcome in outcomes))
     return path
 
@@ -169,7 +169,7 @@ OpFunctionEnd
 """
     src, dst = os.path.join(out_dir, "test_vs.spvasm"), os.path.join(out_dir, "test_vs.spv")
     os.makedirs(out_dir, exist_ok=True)
-    with open(src, "w", encoding="utf-8") as f:
+    with open(src, "w", encoding="utf-8", newline="\n") as f:
         f.write(asm)
     runner(["spirv-as", "--target-env", "vulkan1.2", src, "-o", dst], check=True)
     runner(["spirv-val", "--target-env", "vulkan1.2", dst], check=True)

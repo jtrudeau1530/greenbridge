@@ -194,6 +194,18 @@ class TestLoadPins(unittest.TestCase):
 
 
 class TestCli(unittest.TestCase):
+    def test_rejects_negative_max_skip(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            xml = os.path.join(tmp, "list.xml")
+            with open(xml, "w", encoding="utf-8") as f:
+                f.write(mount_xml([]))
+            err = io.StringIO()
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+                with self.assertRaises(SystemExit) as cm:
+                    names_mod.main([tmp, "--mount", xml, "--max-skip", "-1"])
+            self.assertEqual(cm.exception.code, 2)
+            self.assertIn("--max-skip must be 0 or more", err.getvalue())
+
     def test_archive_end_to_end(self):
         shapes = [(1280, 720, 40), (1920, 1080, 50), (512, 512, 15)]
         with tempfile.TemporaryDirectory() as tmp:

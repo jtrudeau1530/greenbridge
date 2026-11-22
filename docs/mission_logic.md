@@ -103,7 +103,56 @@ are no opcodes here, and no jump table. Two consequences for a runtime:
 
 ## Mission identity
 
-The package's own text metadata carries a 145-entry mission table. Only **one** of those ids is provably
-bound to one of these tables, so most outlines are unattributed. Joining ids to tables is an open problem;
-a plain joaat of the ids does not appear in the program data (0 of 290 variants in 170.9 MB), so the join
-is not by name hash.
+The package's own text metadata carries a 145-entry mission table. Two of those ids now have a
+reproducible binding to one of these tables, so most outlines are still unattributed. Joining ids to
+tables is an open problem; a plain joaat of the ids does not appear in the program data (0 of 290
+variants in 170.9 MB), so the join is not by name hash.
+
+## Binding a mission id to its tables
+
+This binding does not join on the id. It uses a **character** as the bridge: the mission's own text names
+a person, a name dictionary turns that name into a 32-bit hash, and the same hash appears as the
+`linkHash` of pool elements in a state table.
+
+1. **Start from a name the mission text uses.** `COM_KBOS_NEIGHB` is the replay-table id for the mission
+   publicly catalogued as **Pipework** (Mandy's rent). The text table at `data.rpf` stream
+   `0x19957A0` contains the line "You brought the cops to Mandy's house" and the line "Bert died".
+   The stream carries no mission id; the id-to-text step rests on the public name and the cast, not an
+   archive key.
+2. **Resolve the character and its schedule.** `common.rpf` stream `0x4C270` lists
+   `KeyLento/Perschars/Peds/Unique/Mandy` and `.../Bert` under the pack `PSP_KeyLento_perschars_peds`.
+   SixNG's name dictionary, which is lower-case joaat, resolves the pack to `0x865F0DA9`, Mandy to
+   `0x03A885E6` and Bert to `0xE34ACBC8`.
+3. **Scan the PSINs for the link hash.** In the 64-byte element above, `linkHash` is the dword at byte
+   `+0x34`, not the archetype dword. Inflating the five `story000_script.rpf` streams at `0x3FE4000`,
+   `0x3FE8000`, `0x3FEB000`, `0x3FEE000` and `0x3FF0000` and searching for those two hashes finds 28
+   elements: 15 Mandy and 13 Bert. A scan of all 2,309 PSIN streams finds those 28 hits in exactly these
+   five files.
+4. **Read the element.** Its start is `linkHash - 52`. The first dword is the archetype/state hash
+   described above. It does not resolve in the name dictionary, and the same character takes three
+   values, so it is an archetype/state hash rather than a character model name.
+
+| stream | Mandy elements | Mandy archetype | Bert elements | Bert archetype |
+|---|---:|---|---:|---|
+| `0x3FE4000` | 5 | `0x18BB2550` | 5 | `0xA5A1E67D` |
+| `0x3FE8000` | 3 | `0x73E83886` | 3 | `0x780A05A5` |
+| `0x3FEB000` | 3 | `0x73E83886` | 4 | `0x780A05A5` |
+| `0x3FEE000` | 3 | `0x73E83886` | 0 | - |
+| `0x3FF0000` | 1 | `0x57DDFFC2` | 1 | `0xCBA48304` |
+
+Mandy has three distinct archetype values in this set and Bert three; none resolves in the name
+dictionary.
+
+The five tables are bound to `COM_KBOS_NEIGHB` through two people the mission's own text names, both
+present as link hashes in the same five streams. It is a binding by cast, not by id: the public
+`Pipework` name is the outside link between the id and the text, and a mission whose cast is not in the
+dictionary still has no bridge.
+
+It does **not** turn `0x18BB2550`, `0x73E83886`, `0x57DDFFC2`, `0xA5A1E67D`, `0x780A05A5` or
+`0xCBA48304` into model names. None resolves in the same dictionary, and the first dword changes per
+state; it is an archetype/state hash, not a Mandy or Bert drawable. The table that would name those
+archetypes is not in the readable archives.
+
+This is **one more binding, not a general solution**. The other 143 ids in the mission table remain
+unattributed unless a character, schedule or other stable name gives them a bridge; joining ids to
+tables is still an open problem.

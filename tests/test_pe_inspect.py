@@ -636,5 +636,33 @@ class TruncatedImageTest(unittest.TestCase):
         self.assertLessEqual(len(exports), pe_inspect.MAX_ENTRIES + 2)
 
 
+class DeclaredOptionalHeaderSizeTest(unittest.TestCase):
+    """Reject optional headers smaller than the fields the parser reads."""
+
+    def test_declared_optional_header_too_small(self):
+        for is64 in (False, True):
+            for declared_size in (0, 2, 71):
+                with self.subTest(is64=is64, declared_size=declared_size):
+                    data = bytearray(build_image(is64=is64))
+                    pe_offset = struct.unpack_from("<I", data, 0x3C)[0]
+                    struct.pack_into("<H", data, pe_offset + 20, declared_size)
+
+                    with self.assertRaisesRegex(
+                        pe_inspect.PeFormatError, "truncated optional header"
+                    ):
+                        pe_inspect.PeImage(bytes(data))
+
+    def test_declared_optional_header_extends_beyond_file(self):
+        for is64 in (False, True):
+            with self.subTest(is64=is64):
+                data = bytearray(build_image(is64=is64))
+                pe_offset = struct.unpack_from("<I", data, 0x3C)[0]
+                struct.pack_into("<H", data, pe_offset + 20, 0xFFFF)
+
+                with self.assertRaisesRegex(
+                    pe_inspect.PeFormatError, "truncated optional header"
+                ):
+                    pe_inspect.PeImage(bytes(data))
+
 if __name__ == "__main__":
     unittest.main()

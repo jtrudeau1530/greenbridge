@@ -102,7 +102,7 @@ def main():
     out = {"overall": {k: entry(v) for k, v in top}, "per_archive": per}
     fd, temp = tempfile.mkstemp(dir=root, prefix=".types-", suffix=".tmp")
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
             json.dump(out, f, indent=1)
             f.flush()
             os.fsync(f.fileno())

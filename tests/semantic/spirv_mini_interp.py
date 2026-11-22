@@ -43,13 +43,29 @@ class InvalidModule(AssertionError):
 
 
 def check_structure(body):
-    """spirv-val's merge rule (SPIR-V 2.16.2): OpSelectionMerge must be the second-to-last instruction of its block,
+    """spirv-val's merge, phi and Function-variable rules (SPIR-V 2.16.1-2): OpSelectionMerge must be the second-to-last instruction of its block,
     directly before OpBranchConditional or OpSwitch, and OpLoopMerge directly before OpBranch or
     OpBranchConditional. Until 2026-11-22 the interpreter skipped merges, so a translator change that put an
     instruction between a merge and its branch (#1633: OpLoad %active) passed every semantic test while every
     driver rejected the module. `body` is the list of (result, opcode, operands, line) of a function."""
     follow = {"OpSelectionMerge": ("OpBranchConditional", "OpSwitch"),
               "OpLoopMerge": ("OpBranch", "OpBranchConditional")}
+    # OpPhi must come first in its block: only OpLabel or other OpPhi before it (SPIR-V 2.16.2, "OpPhi ... must be
+    # the first instructions of a block"). A phi emitted after an instruction of the merge block is rejected by
+    # spirv-val, and every translator path that merges a guarded load (OpPhi of the loaded and the kept value)
+    # depends on the order.
+    # Function-storage OpVariable belongs in the function's first block (SPIR-V 2.16.1).
+    prev, blocks = None, 0
+    for _, op, a, line in body:
+        if op == "OpPhi" and prev not in ("OpLabel", "OpPhi"):
+            raise InvalidModule(f"{line!r} follows {prev or 'the start of the function'}, not OpLabel or OpPhi")
+        if op == "OpFunction":
+            blocks = 0
+        elif op == "OpLabel":
+            blocks += 1
+        elif op == "OpVariable" and a[1:2] == ["Function"] and blocks > 1:
+            raise InvalidModule(f"{line!r} is a Function variable outside the function's first block")
+        prev = op
     for k, (_, op, _, line) in enumerate(body):
         if op in follow:
             nxt = body[k + 1][1] if k + 1 < len(body) else None
@@ -867,18 +883,6 @@ def _invocation(text, inputs, push_constants, memory, step=False):
                 values[res] = fma_f32(x, y, z)
         elif op == "OpFNegate":
             values[res] = f32(-val(a[1]))
-        elif op == "OpFDiv":
-            x, y = val(a[1]), val(a[2])
-            if not (isinstance(x, float) and isinstance(y, float)):
-                raise UnsupportedConstruct("OpFDiv on non-float")
-            if y == 0.0:
-                raise UnsupportedConstruct("OpFDiv by zero (undefined in SPIR-V)")
-            if math.isinf(x) and math.isinf(y):
-                values[res] = math.nan
-            elif math.isnan(x) or math.isnan(y):
-                values[res] = math.nan
-            else:
-                values[res] = f32(x / y)        # x/inf is a signed zero, as in Python
         elif op == "OpQuantizeToF16":
             # Single-instruction f32 -> f16 -> f32 round to nearest, with the
             # SPIR-V subnormal rule: a magnitude too small for a normal f16

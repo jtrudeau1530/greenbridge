@@ -51,8 +51,36 @@ using AsyncCompleteFn = void(__stdcall*)(XAsyncBlock*, HRESULT, size_t);
 using AsyncResultSizeFn = HRESULT(__stdcall*)(XAsyncBlock*, size_t*);
 using AsyncResultFn = HRESULT(__stdcall*)(XAsyncBlock*, const void*, size_t, void*, size_t*);
 
+struct XVersion {
+    union {
+        struct {
+            uint16_t major;
+            uint16_t minor;
+            uint16_t build;
+            uint16_t revision;
+        };
+        uint64_t Value;
+    };
+};
+static_assert(sizeof(XVersion) == 8, "XVersion must be 8 bytes per GDK spec");
+
+struct XSystemAnalyticsInfo {
+    XVersion osVersion;
+    XVersion hostingOsVersion;
+    char family[64];
+    char form[64];
+};
+static_assert(sizeof(XSystemAnalyticsInfo) == 144, "XSystemAnalyticsInfo must be 144 bytes per GDK spec");
+
+using AnalyticsInfoFn = XSystemAnalyticsInfo(__stdcall*)();
+using PackageIdentifierFn = HRESULT(__stdcall*)(size_t, char*);
+using PackageMountPathFn = HRESULT(__stdcall*)(void*, size_t, char*);
+using PackagedProcessFn = bool(__stdcall*)();
+
 const char* const kNames[] = {
     "XGameRuntimeInitialize", "XGameRuntimeUninitialize", "XSystemGetDeviceType", "XSystemGetConsoleId",
+    "XSystemGetAnalyticsInfo", "XPackageGetCurrentProcessPackageIdentifier", "XPackageGetMountPath",
+    "XPackageIsPackagedProcess",
     "XTaskQueueCreate", "XTaskQueueCreateComposite", "XTaskQueueGetPort", "XTaskQueueDuplicateHandle",
     "XTaskQueueCloseHandle", "XTaskQueueTerminate", "XTaskQueueDispatch", "XTaskQueueSubmitCallback",
     "XTaskQueueSubmitDelayedCallback", "XTaskQueueRegisterWaiter", "XTaskQueueUnregisterWaiter",
@@ -182,6 +210,89 @@ void check_run_time_load() {
     void* out = reinterpret_cast<void*>(1);
     check(query(&some_class, some_class, &out) == static_cast<HRESULT>(0x80070032) && out == nullptr,
           "QueryApiImpl refuses a class it doesn't provide yet (HRESULT 0x80070032) and clears the out pointer");
+
+    // XThreadingImpl and XErrorImpl, driven the way xgameruntime.lib's thunks in the package's DLLs do: QueryApiImpl
+    // with the class id as both ids, one vtable slot with `this` first, then Release (slot 2).
+    const GUID threading = {0x073b7dcb, 0x1fcf, 0x4030, {0x94, 0xbe, 0xe3, 0xc9, 0xeb, 0x62, 0x34, 0x28}};
+    const GUID error_cls = {0x8ca467f7, 0x22e8, 0x4096, {0x84, 0x56, 0xbb, 0x8a, 0xa1, 0x3f, 0x79, 0xd8}};
+    using Fn = void*;
+    auto slot = [](void* obj, int index) { return (*static_cast<Fn* const*>(obj))[index]; };
+    auto release = [&](void* obj) { reinterpret_cast<ULONG(STDMETHODCALLTYPE*)(void*)>(slot(obj, 2))(obj); };
+    auto get = [&](const GUID& cls) {
+        void* p = nullptr;
+        return query(&cls, cls, &p) == S_OK ? p : nullptr;
+    };
+    void* t = get(threading);
+    check(t != nullptr, "QueryApiImpl hands out XThreadingImpl for its class id");
+    if (t) {
+        void* again = get(threading);
+        check(again == t, "XThreadingImpl is one process-wide object");
+        release(again);
+        XTaskQueueHandle queue = nullptr;
+        using Create = HRESULT(STDMETHODCALLTYPE*)(void*, XTaskQueueDispatchMode, XTaskQueueDispatchMode,
+                                                  XTaskQueueHandle*);
+        check(reinterpret_cast<Create>(slot(t, 12))(t, XTaskQueueDispatchMode::Manual, XTaskQueueDispatchMode::Manual,
+                                                    &queue) == S_OK && queue,
+              "slot 12 is XTaskQueueCreate");
+        static std::atomic<int> s_ran{0};
+        using Submit = HRESULT(STDMETHODCALLTYPE*)(void*, XTaskQueueHandle, XTaskQueuePort, void*,
+                                                  XTaskQueueCallback*);
+        XTaskQueueCallback* cb = [](void* ctx, bool canceled) {
+            if (!canceled) static_cast<std::atomic<int>*>(ctx)->fetch_add(1);
+        };
+        check(reinterpret_cast<Submit>(slot(t, 18))(t, queue, XTaskQueuePort::Work, &s_ran, cb) == S_OK,
+              "slot 18 is XTaskQueueSubmitCallback");
+        using Dispatch = bool(STDMETHODCALLTYPE*)(void*, XTaskQueueHandle, XTaskQueuePort, uint32_t);
+        check(reinterpret_cast<Dispatch>(slot(t, 16))(t, queue, XTaskQueuePort::Work, 0) && s_ran.load() == 1,
+              "slot 16 is XTaskQueueDispatch: the callback ran on the work port");
+        XTaskQueueHandle dup = nullptr;
+        using Dup = HRESULT(STDMETHODCALLTYPE*)(void*, XTaskQueueHandle, XTaskQueueHandle*);
+        check(reinterpret_cast<Dup>(slot(t, 15))(t, queue, &dup) == S_OK && dup,
+              "slot 15 is XTaskQueueDuplicateHandle");
+        using Close = void(STDMETHODCALLTYPE*)(void*, XTaskQueueHandle);
+        reinterpret_cast<Close>(slot(t, 17))(t, dup);
+        reinterpret_cast<Close>(slot(t, 17))(t, queue);
+        using SetSensitive = HRESULT(STDMETHODCALLTYPE*)(void*, bool);
+        using IsSensitive = bool(STDMETHODCALLTYPE*)(void*);
+        check(reinterpret_cast<SetSensitive>(slot(t, 27))(t, true) == S_OK &&
+                  reinterpret_cast<IsSensitive>(slot(t, 30))(t) &&
+                  reinterpret_cast<SetSensitive>(slot(t, 27))(t, false) == S_OK &&
+                  !reinterpret_cast<IsSensitive>(slot(t, 30))(t),
+              "slots 27 and 30 set and read this thread's time-sensitive flag");
+        void* unk = nullptr;
+        const GUID iunknown = {0, 0, 0, {0xc0, 0, 0, 0, 0, 0, 0, 0x46}};
+        using QI = HRESULT(STDMETHODCALLTYPE*)(void*, REFIID, void**);
+        check(reinterpret_cast<QI>(slot(t, 0))(t, iunknown, &unk) == S_OK && unk == t &&
+                  reinterpret_cast<QI>(slot(t, 0))(t, error_cls, &unk) == E_NOINTERFACE && !unk,
+              "QueryInterface answers IUnknown and the class id, not another class");
+        release(t);
+        release(t);
+    }
+    void* e = get(error_cls);
+    check(e != nullptr, "QueryApiImpl hands out XErrorImpl for its class id");
+    if (e) {
+        struct Seen {
+            HRESULT hr;
+            char msg[32];
+        } seen{};
+        using Callback = bool(CALLBACK*)(HRESULT, const char*, void*);
+        Callback on_error = [](HRESULT hr, const char* msg, void* ctx) {
+            auto* s = static_cast<Seen*>(ctx);
+            s->hr = hr;
+            strncpy_s(s->msg, msg ? msg : "", _TRUNCATE);
+            return true;
+        };
+        using SetCallback = void(STDMETHODCALLTYPE*)(void*, Callback, void*);
+        using Report = void(STDMETHODCALLTYPE*)(void*, HRESULT, const char*);
+        reinterpret_cast<SetCallback>(slot(e, 4))(e, on_error, &seen);
+        reinterpret_cast<Report>(slot(e, 3))(e, E_FAIL, "offline test");
+        check(seen.hr == E_FAIL && std::strcmp(seen.msg, "offline test") == 0,
+              "slot 3 is XErrorReport and reaches the callback slot 4 (XErrorSetCallback) set");
+        reinterpret_cast<SetCallback>(slot(e, 4))(e, nullptr, nullptr);
+        using SetOptions = HRESULT(STDMETHODCALLTYPE*)(void*, uint32_t, uint32_t);
+        check(reinterpret_cast<SetOptions>(slot(e, 5))(e, 0, 0) == S_OK, "slot 5 is XErrorSetOptions");
+        release(e);
+    }
     check(uninit_api() == S_OK, "UninitializeApiImpl succeeds");
 
     HMODULE k32 = load_w(L"kernel32.dll");
@@ -228,6 +339,53 @@ int main() {
           "XSystemGetConsoleId rejects a buffer smaller than XSystemConsoleIdBytes");
     check(console_id(sizeof(id), id, &used) == S_OK && used == 39 && std::strlen(id) == 38,
           "XSystemGetConsoleId fills 39 bytes (38 characters and the terminator)");
+
+    auto analytics_info = get<AnalyticsInfoFn>("XSystemGetAnalyticsInfo");
+    XSystemAnalyticsInfo info = analytics_info();
+    check(info.osVersion.major == 10 && info.osVersion.minor == 0 && info.osVersion.build == 22000 &&
+              info.osVersion.revision == 0,
+          "XSystemGetAnalyticsInfo returns osVersion 10.0.22000.0");
+    check(info.hostingOsVersion.major == 10 && info.hostingOsVersion.minor == 0 &&
+              info.hostingOsVersion.build == 22000 && info.hostingOsVersion.revision == 0,
+          "XSystemGetAnalyticsInfo returns hostingOsVersion 10.0.22000.0");
+    check(std::strcmp(info.family, "Xbox") == 0, "XSystemGetAnalyticsInfo returns family 'Xbox'");
+    check(std::strcmp(info.form, "Xbox Series X") == 0, "XSystemGetAnalyticsInfo returns form 'Xbox Series X'");
+
+    auto package_id = get<PackageIdentifierFn>("XPackageGetCurrentProcessPackageIdentifier");
+    check(package_id(0, nullptr) == E_INVALIDARG, "XPackageGetCurrentProcessPackageIdentifier rejects null buffer and size 0");
+    char pkg_id[64] = {};
+    check(package_id(0, pkg_id) == E_INVALIDARG, "XPackageGetCurrentProcessPackageIdentifier rejects size 0 with buffer");
+    check(package_id(10, nullptr) == E_INVALIDARG, "XPackageGetCurrentProcessPackageIdentifier rejects null pointer with size");
+    check(package_id(16, pkg_id) == HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER),
+          "XPackageGetCurrentProcessPackageIdentifier rejects insufficient buffer");
+    check(package_id(sizeof(pkg_id), pkg_id) == S_OK && std::strlen(pkg_id) == 32,
+          "XPackageGetCurrentProcessPackageIdentifier fills 33-byte package identifier");
+
+    SetEnvironmentVariableA("LEONIDA_PACKAGE_ID", "CustomTestPackageId_123456789012");
+    check(package_id(sizeof(pkg_id), pkg_id) == S_OK &&
+              std::strcmp(pkg_id, "CustomTestPackageId_123456789012") == 0,
+          "XPackageGetCurrentProcessPackageIdentifier respects LEONIDA_PACKAGE_ID override");
+    SetEnvironmentVariableA("LEONIDA_PACKAGE_ID", nullptr);
+
+    auto mount_path = get<PackageMountPathFn>("XPackageGetMountPath");
+    check(mount_path(nullptr, 0, nullptr) == E_INVALIDARG, "XPackageGetMountPath rejects null buffer and size 0");
+    char mnt_path[MAX_PATH] = {};
+    check(mount_path(nullptr, 0, mnt_path) == E_INVALIDARG, "XPackageGetMountPath rejects size 0 with buffer");
+    check(mount_path(nullptr, 10, nullptr) == E_INVALIDARG, "XPackageGetMountPath rejects null pointer with size");
+
+    SetEnvironmentVariableA("LEONIDA_GAME_DIR", "C:\\LeonidaGameDir");
+    check(mount_path(nullptr, 5, mnt_path) == HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER),
+          "XPackageGetMountPath rejects insufficient buffer");
+    check(mount_path(nullptr, sizeof(mnt_path), mnt_path) == S_OK &&
+              std::strcmp(mnt_path, "C:\\LeonidaGameDir") == 0,
+          "XPackageGetMountPath returns configured game directory");
+    SetEnvironmentVariableA("LEONIDA_GAME_DIR", nullptr);
+
+    auto is_packaged = get<PackagedProcessFn>("XPackageIsPackagedProcess");
+    check(is_packaged() == true, "XPackageIsPackagedProcess returns true by default");
+    SetEnvironmentVariableA("LEONIDA_PACKAGED", "0");
+    check(is_packaged() == false, "XPackageIsPackagedProcess respects LEONIDA_PACKAGED=0 override");
+    SetEnvironmentVariableA("LEONIDA_PACKAGED", nullptr);
 
     // Work on the thread pool, completions dispatched by the "game loop" on this thread.
     auto create = get<QueueCreateFn>("XTaskQueueCreate");

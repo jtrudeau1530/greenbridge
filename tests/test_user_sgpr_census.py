@@ -1,7 +1,12 @@
 """tools/user_sgpr_census.py on hand-written index.json data (no game files, no GPU)."""
 import json
 import os
+from pathlib import Path
+import subprocess
 import sys
+import tempfile
+
+import pytest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
@@ -73,9 +78,62 @@ def test_the_two_packing_models_are_told_apart():
     assert b["below_base"] == {"s1:const32": 1}
 
 
+@pytest.mark.parametrize("output_kind", ["same-path", "relative-alias", "hard-link"])
+def test_json_report_refuses_to_overwrite_index(tmp_path, capsys, output_kind):
+    index = tmp_path / "index.json"
+    original = json.dumps(INDEX).encode("utf-8")
+    index.write_bytes(original)
+    output = index
+    if output_kind == "relative-alias":
+        subdir = tmp_path / "subdir"
+        subdir.mkdir()
+        output = subdir / ".." / index.name
+    elif output_kind == "hard-link":
+        output = tmp_path / "alias.json"
+        try:
+            output.hardlink_to(index)
+        except OSError as err:
+            pytest.skip(f"hard links unavailable: {err}")
+
+    with pytest.raises(SystemExit) as exc:
+        usc.main([str(index), "--json", str(output)])
+
+    assert exc.value.code == 2
+    assert "--json must not overwrite the input index" in capsys.readouterr().err
+    assert index.read_bytes() == original
+
+
+def test_json_report_accepts_a_separate_output(tmp_path):
+    index = tmp_path / "index.json"
+    output = tmp_path / "summary.json"
+    index.write_text(json.dumps(INDEX), encoding="utf-8")
+
+    assert usc.main([str(index), "--json", str(output)]) == 0
+    assert json.loads(output.read_text(encoding="utf-8"))["ps"]["lowest_pointer_sgpr"] == {"s8": 2, "s9": 1}
+    assert json.loads(index.read_text(encoding="utf-8")) == INDEX
+
+
 def test_expect_passes_and_fails(tmp_path, capsys):
     p = tmp_path / "index.json"
     p.write_text(json.dumps(INDEX), encoding="utf-8")
     assert usc.main([str(p), "--expect", "ps=8", "cs=4"]) == 0
     assert usc.main([str(p), "--expect", "ps=0"]) == 1
     assert "expected s0, got s8" in capsys.readouterr().err
+
+
+def test_cli_rejects_malformed_stage_assignment():
+    with tempfile.TemporaryDirectory() as tmp:
+        index = Path(tmp, "index.json")
+        report = Path(tmp, "report.json")
+        index.write_text(json.dumps(INDEX), encoding="utf-8")
+        tool = os.path.join(ROOT, "tools", "user_sgpr_census.py")
+        for option in ("--base", "--expect"):
+            for assignment in ("ps", "ps=bad", "=8", "ps=-1"):
+                result = subprocess.run(
+                    [sys.executable, "-I", tool, str(index), "--json", str(report), option, assignment],
+                    capture_output=True, text=True,
+                )
+                assert result.returncode == 2, result.stderr
+                assert "expected STAGE=SGPR" in result.stderr
+                assert "Traceback" not in result.stderr
+                assert not report.exists()

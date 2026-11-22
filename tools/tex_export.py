@@ -225,7 +225,7 @@ def main():
             pngs[t["export"]["png"]] += 1
         if i % 2000 == 0:
             print(f"[{i}/{len(texs)}] {dict(res)}", flush=True)
-    with open(os.path.join(a.out, "export_log.json"), "w", encoding="utf-8") as f:
+    with open(os.path.join(a.out, "export_log.json"), "w", encoding="utf-8", newline="\n") as f:
         json.dump(texs, f)
     print(f"{len(texs)} textures: {dict(res)} -> {a.out}")
     if a.png:
