@@ -638,6 +638,125 @@ class TestValuPackB32U16SIMDDivergence(unittest.TestCase):
             self.assertEqual(state.get_vgpr(lane, 0), self.CANARY_OLD)
 
 
+# ==============================================================================
+# Register Aliasing and In-Place Operand Preservation
+# ==============================================================================
+
+class TestValuPackB32U16RegisterAliasing(unittest.TestCase):
+    """Unit tests for register aliasing hazards and in-place operand preservation."""
+
+    def setUp(self) -> None:
+        self.interp = ScalarVALUInterpreter()
+        self.state = ScalarMachineState()
+
+    def test_dst_aliases_src0(self) -> None:
+        # v0 = v_pack_b32_u16 v0, v1
+        self.state.set_vgpr(0, 0xAAAA1111)
+        self.state.set_vgpr(1, 0xBBBB2222)
+        instr = VPackB32U16Instruction(
+            dst=Reg(0, RegType.VGPR),
+            src0=VOP3Operand(Reg(0, RegType.VGPR)),
+            src1=VOP3Operand(Reg(1, RegType.VGPR)),
+            op_sel=(0, 0),
+        )
+        res = self.interp.step(instr, self.state)
+        self.assertEqual(res, 0x22221111)
+        self.assertEqual(self.state.get_vgpr(0), 0x22221111)
+        # v1 remains unchanged
+        self.assertEqual(self.state.get_vgpr(1), 0xBBBB2222)
+
+    def test_dst_aliases_src1(self) -> None:
+        # v1 = v_pack_b32_u16 v0, v1
+        self.state.set_vgpr(0, 0xAAAA1111)
+        self.state.set_vgpr(1, 0xBBBB2222)
+        instr = VPackB32U16Instruction(
+            dst=Reg(1, RegType.VGPR),
+            src0=VOP3Operand(Reg(0, RegType.VGPR)),
+            src1=VOP3Operand(Reg(1, RegType.VGPR)),
+            op_sel=(0, 0),
+        )
+        res = self.interp.step(instr, self.state)
+        self.assertEqual(res, 0x22221111)
+        self.assertEqual(self.state.get_vgpr(1), 0x22221111)
+        # v0 remains unchanged
+        self.assertEqual(self.state.get_vgpr(0), 0xAAAA1111)
+
+    def test_dst_aliases_both_src0_and_src1_swap_halves(self) -> None:
+        # In-place half-word swap: v0 = v_pack_b32_u16 v0, v0 op_sel:[1,0]
+        # Low half becomes old high half (0x1234), High half becomes old low half (0x5678)
+        self.state.set_vgpr(0, 0x12345678)
+        instr = VPackB32U16Instruction(
+            dst=Reg(0, RegType.VGPR),
+            src0=VOP3Operand(Reg(0, RegType.VGPR)),
+            src1=VOP3Operand(Reg(0, RegType.VGPR)),
+            op_sel=(1, 0),
+        )
+        res = self.interp.step(instr, self.state)
+        self.assertEqual(res, 0x56781234)
+        self.assertEqual(self.state.get_vgpr(0), 0x56781234)
+
+    def test_inplace_self_duplicate_low(self) -> None:
+        # v0 = v_pack_b32_u16 v0, v0 op_sel:[0,0]
+        self.state.set_vgpr(0, 0x12345678)
+        instr = VPackB32U16Instruction(
+            dst=Reg(0, RegType.VGPR),
+            src0=VOP3Operand(Reg(0, RegType.VGPR)),
+            src1=VOP3Operand(Reg(0, RegType.VGPR)),
+            op_sel=(0, 0),
+        )
+        res = self.interp.step(instr, self.state)
+        self.assertEqual(res, 0x56785678)
+        self.assertEqual(self.state.get_vgpr(0), 0x56785678)
+
+    def test_inplace_self_duplicate_high(self) -> None:
+        # v0 = v_pack_b32_u16 v0, v0 op_sel:[1,1]
+        self.state.set_vgpr(0, 0x12345678)
+        instr = VPackB32U16Instruction(
+            dst=Reg(0, RegType.VGPR),
+            src0=VOP3Operand(Reg(0, RegType.VGPR)),
+            src1=VOP3Operand(Reg(0, RegType.VGPR)),
+            op_sel=(1, 1),
+        )
+        res = self.interp.step(instr, self.state)
+        self.assertEqual(res, 0x12341234)
+        self.assertEqual(self.state.get_vgpr(0), 0x12341234)
+
+    def test_aliased_clamping_inplace(self) -> None:
+        # v0 = v_pack_b32_u16 v0, v1 clamp
+        self.state.set_vgpr(0, 0x00030000)  # > 0xFFFF
+        self.state.set_vgpr(1, 0x00000042)
+        instr = VPackB32U16Instruction(
+            dst=Reg(0, RegType.VGPR),
+            src0=VOP3Operand(Reg(0, RegType.VGPR)),
+            src1=VOP3Operand(Reg(1, RegType.VGPR)),
+            clamp=True,
+        )
+        res = self.interp.step(instr, self.state)
+        self.assertEqual(res, 0x0042FFFF)
+        self.assertEqual(self.state.get_vgpr(0), 0x0042FFFF)
+
+    def test_simd_multi_lane_aliasing(self) -> None:
+        simd = SIMDInterpreter()
+        state = SIMDState(num_lanes=64)
+        for lane in range(64):
+            state.set_vgpr(lane, 0, (lane << 16) | 0x00AA)
+            state.set_vgpr(lane, 1, 0xBB00 | lane)
+
+        instr = VPackB32U16Instruction(
+            dst=Reg(0, RegType.VGPR),
+            src0=VOP3Operand(Reg(0, RegType.VGPR)),
+            src1=VOP3Operand(Reg(1, RegType.VGPR)),
+            op_sel=(1, 0),
+        )
+        # v0 receives low half = v0.hi (lane), high half = v1.lo (0xBB00 | lane)
+        simd.step(instr, state)
+        for lane in range(64):
+            expected = (((0xBB00 | lane) & MASK16) << 16) | (lane & MASK16)
+            self.assertEqual(state.get_vgpr(lane, 0), expected)
+            self.assertEqual(state.get_vgpr(lane, 1), 0xBB00 | lane)
+
+
+
 
 
 
