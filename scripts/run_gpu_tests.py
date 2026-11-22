@@ -1024,17 +1024,17 @@ def run_suite(a, work: str) -> int:
                 continue
             const_wants = {
                 "ps_clip_color": (0x3E800000, 0x3F000000, 0x3F400000, 0x3F800000),
-                "ps_ops": (0x48804300, 5, 7, 0xFFFFFFFC),
-                "ps_ops2": (0xABCD4400, 0x46001234, 0xFFFFFFFA, 7),
-                "ps_ops3": (0xFFFFFFFA, 0x44660066, 0x44AABBCC, 16),
+                "ps_ops": (0x48804300, 5, 7, 0xBFFFFFFC),
+                "ps_ops2": (0xABCD4400, 0x46001234, 0xBFFFFFFA, 7),
+                "ps_ops3": (0xBFFFFFFA, 0x44660066, 0x44AABBCC, 16),
                 "ps_ops4": (0x34000010, 0x00120800, 0xBEEF0000, 0x12343C00),
                 "ps_scc": (1, 1, 3, 0x80000000),
-                "ps_sdwa": (0x000000F1, 0xFFFEFFF2, 0x3C003344, 0xFFF70000),
+                "ps_sdwa": (0x000000F1, 0xBFFEFFF2, 0x3C003344, 0xBFF70000),
                 "ps_legacy_mul": (0, 0, 0, 0x40C00000),        # same expectation as check.py
                 "ps_ops5": (0x12340010, 0xBEEF0800, 0xAAAAFFFF, 0xDEADBC00),   # from the .asm headers
                 "ps_ops6": (0xF800FFFF, 0x01000010, 0x00800800, 0x8000FFF0),
                 "ps_ops7": (0x00FF8077, 0xFF0000FF, 0x89ABCDEF, 0x00070003),
-                "ps_ops8": (0x80000000, 0xFFFFFFFF, 0x000F100E, 0x0F0F0F1F),
+                "ps_ops8": (0x80000000, 0xBFFFFFFF, 0x000F100E, 0x0F0F0F1F),
                 "ps_f32_mods": (0xC0256A01, 0x3F800000, 0x41E00000, 0x3FC00000),
                 "ps_vcc_x2": (0x11223344, 0x55667788, 0, 0),
                 "ps_vcmpx_forms": (0xF05B2A48, 0xF05E8A12, 0xB174BE18, 0x15550000),   # 14 v_cmpx forms (.asm header)

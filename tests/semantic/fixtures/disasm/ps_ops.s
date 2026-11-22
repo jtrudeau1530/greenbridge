@@ -9,5 +9,6 @@
 	v_min3_u32 v4, v5, v6, v7
 	v_max3_i32 v8, v5, v6, v7
 	v_bfe_i32 v9, v6, 2, 4
+	v_xor_b32_e32 v9, 0x40000000, v9
 	exp mrt0 v3, v4, v8, v9 done vm
 	s_endpgm
