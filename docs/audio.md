@@ -125,8 +125,12 @@ then 16 bytes per channel:
 
 At the `0x55` data offset, each chunk starts with a 24-byte record per channel. The record's `+4` word is the
 channel's subblock count and `+8` is a repeated-prefix sample count to skip. The channel data are its run of
-2048-byte subblocks after the 2048-aligned header. The skipped samples repeat the previous chunk's tail, so the
-exporter drops whole packets until the count is consumed. Each descriptor channel becomes one Ogg Opus file.
+2048-byte subblocks after the 2048-aligned header. The skipped samples repeat the previous chunk's tail. The
+exporter verifies that the skip ends on a packet boundary and that the repeated packets match the previous
+packets for that channel group, then writes each verified overlap once. Each descriptor channel becomes one Ogg
+Opus file. Invalid repeat counts or payloads reject that music descriptor so independent streams can still export.
+The chunk size gives the distance between blocks. The final block may use fewer bytes. The channel table and
+all declared subblocks must fit within their own block and the `0x55` tag's data range.
 
 The descriptor's `channels` field is the number of channel groups, not necessarily the packet channel count.
 An Opus packet's TOC stereo bit (`packet[0] & 0x04`) gives the real count, and the descriptor's `samples` field
@@ -294,6 +298,10 @@ python -I tools/awc_names.py <work>/assets/audio/awc --words <temp>/hashes.json 
 Each positional source is reported and thresholded on its own. A source is a directory of `.awc` banks, a single
 bank, or an `audio_manifest.json` from `rpf9dump audio` (read without opening the banks). Pure Python; the run above
 took about 3 minutes on one core.
+
+You can also pass the JSON inventory written by `awc_manifest.py --out inventory.json`. The naming tool reads
+the plain stream IDs and streamed-music channel IDs directly from its rows. Bank labels keep the nested path
+and drop the `.awc` extension to match the export folders. Banks with no stream rows have no names in this inventory.
 
 ## Tags: names and subtitles
 

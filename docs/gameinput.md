@@ -115,7 +115,16 @@ subsystem, which this build leaves out) and works under Wine. With `LEONIDA_KEYB
 window of this process is in the foreground, so typing in another application presses nothing, and every button,
 stick and trigger is released when focus moves away (the cursor is read afresh when focus returns, so the right
 stick does not jump). `LEONIDA_KEYBOARD_PAD=always` reads them whatever has focus; a console tool such as
-`gameinput_probe` needs it, because its console window belongs to the terminal, not to the tool.
+  `gameinput_probe` needs it, because its console window belongs to the terminal, not to the tool.
+- Force feedback and haptics run through a fake haptic backend (`rt::gameinput::set_haptic_source`), because SDL's
+  virtual joysticks report no haptics: the motor count, axes and effect flags a wheel reports, and a pad without SDL
+  haptics reporting no motor at all; `CreateForceFeedbackEffect` and its `E_INVALIDARG` cases; a constant effect
+  becoming `SDL_HAPTIC_CONSTANT` at the right level, not re-sent while unchanged, updated once when the parameters
+  change; the effect's gain and the motor's device gain; a 50 Hz sine's period, phase, length and play count; a
+  spring's coefficients, saturations, dead zone and centre; a finished effect reporting stopped; `Paused` stopping it;
+  `LEONIDA_RUMBLE=0` silencing it and the mute lifting; the SDL effect destroyed when the title releases it; and, on a
+  pad with trigger motors, the two haptic motors, `SetHapticMotorState`'s intensity, deadline, `playCount` 0 and null,
+  and the trigger rumble sharing the one message.
 
 To try it by hand: `set LEONIDA_KEYBOARD_PAD=always`, then `gameinput_probe --seconds 20` and press keys.
 
@@ -148,6 +157,66 @@ uses:
 
 An effect is sent only when its bytes change, so a steady level costs one report.
 
+## Force feedback and haptics
+
+`IGameInputDevice` reports the motors a pad really has, and drives them. There are two kinds, and they come from two
+places:
+
+| GameInput | comes from | the shim reports |
+|---|---|---|
+| `forceFeedbackMotorCount`, `forceFeedbackMotorInfo` | SDL opened the pad's joystick as a haptic device (`SDL_OpenHapticFromJoystick`), which it does for a wheel or a stick, never for a gamepad | one motor at index 0: `supportedAxes` LinearX, `maxSimultaneousEffects` SDL's limit, and one flag per effect kind from SDL's feature bits |
+| `hapticFeedbackMotorCount`, `hapticFeedbackMotorInfo` | the trigger motors the pad already has for rumble: Xbox impulse triggers, or a DualSense with `LEONIDA_DS_TRIGGERS` on | two motors, left and right trigger, one waveform each |
+
+A pad with neither keeps the answer the shim gave before this existed: no force-feedback or haptic motors,
+`CreateForceFeedbackEffect` `E_INVALIDARG`, `IsForceFeedbackMotorPoweredOn` false, `SetHapticMotorState` `E_INVALIDARG`.
+The keyboard pad is one of those, and so is any pad SDL opens as a gamepad only.
+
+### Force feedback: `CreateForceFeedbackEffect`
+
+`IGameInputForceFeedbackEffect` is the title's object; SDL is touched only on the poll thread. `SetParams`, `SetGain`
+and `SetState` record the change and bump a version, and the next poll creates, updates, runs or stops the SDL effect,
+so a title call still costs a lock and a copy. GameInput's eleven effect kinds are SDL's eleven force-feedback effects:
+
+| GameInput kind | SDL type | fields |
+|---|---|---|
+| `Constant` | `SDL_HAPTIC_CONSTANT` | `level` = magnitude × gain |
+| `Ramp` | `SDL_HAPTIC_RAMP` | `start` and `end` from the start and end magnitude |
+| `SineWave`, `SquareWave`, `TriangleWave`, `SawtoothUpWave`, `SawtoothDownWave` | `SDL_HAPTIC_SINE`, `SQUARE`, `TRIANGLE`, `SAWTOOTHUP`, `SAWTOOTHDOWN` | `period` = 1000/frequency in ms, `magnitude`, `offset` = bias, `phase` = the effect's degrees × 100 |
+| `Spring`, `Friction`, `Damper`, `Inertia` | `SDL_HAPTIC_SPRING`, `FRICTION`, `DAMPER`, `INERTIA` | positive and negative coefficient, saturation and dead zone on all three axes, `center` from the magnitude |
+
+- Only the X magnitude is read, because the motor reports LinearX: the axis a wheel's or a stick's motor acts on. An
+effect for another axis is played on this one, not dropped.
+- `SetForceFeedbackMotorGain` is SDL's device gain (`SDL_SetHapticGain`, 0..100) and scales every effect on the motor;
+`IGameInputForceFeedbackEffect::SetGain` scales that one effect's levels. Both are clamped to 0..1.
+- The envelope: attack and release become SDL's `attack_length` and `fade_length` with the gains as their levels,
+`sustainGain` scales the magnitude, attack + sustain + release is SDL's `length`, and `playCount` is the iteration count,
+where 0 is "until stopped". No duration at all is a 60 s SDL length re-run every 20 s — the same refresh the rumble
+motors get — so an effect with no end keeps playing without being restarted every poll. An effect that plays its
+length reports `GameInputFeedbackStopped` afterwards.
+- An all-zero envelope (what a title that only sets a magnitude leaves behind) means "no envelope", not silence, so
+the effect plays at its own magnitude rather than at gain 0.
+- A new effect starts `GameInputFeedbackRunning`: `CreateForceFeedbackEffect` already carried its parameters, and the
+documented use — create once, `SetParams` per frame — never reaches `SetState`. `GameInputFeedbackPaused` stops the
+SDL effect, because SDL pauses the device where GameInput pauses one effect.
+- `LEONIDA_RUMBLE=0` stops every effect, like every other output path.
+- The kind is checked against the motor's flags when the effect is created, so a kind the pad does not list is
+`E_INVALIDARG`. SDL is not asked there — that is a title call — so if SDL still refuses an effect the poll thread sends
+nothing for it rather than guessing.
+
+### Haptics: `SetHapticMotorState`
+
+The trigger motors play one waveform each: an intensity, which is the one thing SDL lets the shim send on a trigger,
+through the same output as the trigger rumble — `SDL_RumbleGamepadTriggers`, or the DualSense effect block. `duration`
+and `repeatDelay` are microseconds, `playCount` 0 plays until the state is set again, and a null `params` stops the
+motor. The trigger rumble level and the haptic intensity share that one message, the stronger of the two winning, so a
+title mixing them does not get one cancel the other.
+
+**This is an approximation too, and a coarser one than the rumble.** A real haptic motor has a table of waveforms, each
+with its own HID usage; SDL exposes no such table — a DualSense takes one effects block and everything else takes a
+trigger impulse — so the shim reports a single waveform per motor (an intensity, usage 0x0F/0x58) instead of the pad's
+real ones, and plays any request as an intensity. A title that picks waveform 3 by name cannot be served beyond
+intensity 0; waveform indices other than 0 are `E_INVALIDARG`.
+
 ## Motion
 
 Pads whose SDL gamepad reports both a gyroscope and an accelerometer (a DualSense, a Switch Pro, Steam Input pads) get
@@ -179,7 +248,7 @@ sensors are enabled when the pad is opened, at SDL's requested rate, and every p
 | `LEONIDA_DS_TRIGGER_GAIN` | `1` | scales the trigger level before it becomes an effect, 0..4 |
 | `LEONIDA_DS_TRIGGER_FREQ` | `30` | vibration frequency of the `rumble` mode, 1..255 |
 | `LEONIDA_DS_LIGHTBAR` | unset | `RRGGBB` (hex) sets the DualSense/DualShock 4 lightbar when the pad connects; `off` turns it dark; unset keeps SDL's player colour |
-| `LEONIDA_RUMBLE` | `1` | `0` turns all rumble and trigger output off |
+| `LEONIDA_RUMBLE` | `1` | `0` turns all rumble, trigger and force-feedback output off |
 | `LEONIDA_GAMEINPUT_THREAD` | `1` | `0` stops the background poll thread; only `rt::gameinput::poll()` then reads the pads (tests) |
 | `LEONIDA_KEYBOARD_PAD` | `off` | `1` adds the [keyboard pad](#keyboard-pad), read while this process has focus; `always` reads keys whatever has focus |
 | `LEONIDA_MOUSE_SENSITIVITY` | `1` | scales how far the mouse moves the keyboard pad's right stick, 0.1..10 |
@@ -190,11 +259,13 @@ leave a DualSense to the generic driver, or `SDL_GAMECONTROLLERCONFIG` to add a 
 ## How it runs
 
 One thread owns SDL: a background thread started by the first `GameInputCreate` that polls every 2 ms. It opens new
-pads, closes removed ones, takes a reading of each, and applies rumble requests. Title calls never touch SDL: they read
-the latest reading or leave a rumble request, so a call costs a lock and a copy. Callbacks (device, reading, guide
+pads, closes removed ones, takes a reading of each, and applies rumble, haptic and force-feedback requests. Title calls
+never touch SDL: they read the latest reading or leave a request, so a call costs a lock and a copy. Callbacks (device, reading, guide
 button) run on that thread, as GameInput runs them on its own threads. Once the title creates a dispatcher
 (`IGameInput::CreateDispatcher`), callbacks are queued instead, the dispatcher's wait handle is signalled, and
-`IGameInputDispatcher::Dispatch` runs them on the title's thread.
+`IGameInputDispatcher::Dispatch` runs them on the title's thread, oldest first, within its quota: at least one queued
+event per call (a quota of 0 runs exactly one), no further event once the quota has passed, and the wait handle is
+signalled again while events remain.
 
 The API surface:
 
@@ -202,8 +273,10 @@ The API surface:
 |---|---|---|
 | `IGameInput` | `GetCurrentTimestamp` (µs), `GetCurrentReading`, `GetNextReading`, `GetPreviousReading`, `RegisterReadingCallback`, `RegisterDeviceCallback` (blocking and async enumeration), `RegisterGuideButtonCallback`, `RegisterKeyboardLayoutCallback` (never fires), `StopCallback`, `UnregisterCallback`, `CreateDispatcher`, `FindDeviceFromId`, `EnableOemDeviceSupport` (no-op), `SetFocusPolicy` (no-op) | `GetTemporalReading` (`E_NOTIMPL`, as in GameInput v0 itself; see below), `CreateAggregateDevice`, `FindDeviceFromObject/PlatformHandle/PlatformString` |
 | `IGameInputReading` | kind, sequence number, timestamp, device, gamepad state, UI navigation state, controller axes and buttons, motion state | raw report, keyboard, mouse, touch, arcade/flight stick, racing wheel (all return nothing) |
-| `IGameInputDevice` | device info, status, battery, `SetRumbleState` | force feedback and haptic motors (none reported), raw device I/O, power off, input synchronization (no-ops) |
+| `IGameInputDevice` | device info, status, battery, `SetRumbleState`, force-feedback motors with `CreateForceFeedbackEffect`/`IGameInputForceFeedbackEffect`, `IsForceFeedbackMotorPoweredOn`, `SetForceFeedbackMotorGain`, haptic trigger motors with `SetHapticMotorState` | raw device I/O, power off, input synchronization (no-ops) |
 | `IGameInputDispatcher` | `Dispatch`, `OpenWaitHandle` | the quota (the queue is short) |
+| `IGameInputDevice` | device info, status, battery, `SetRumbleState` | force feedback and haptic motors (none reported), raw device I/O, power off, input synchronization (no-ops) |
+| `IGameInputDispatcher` | `Dispatch` (with its quota), `OpenWaitHandle` | |
 
 A device object stays alive for the whole process. When a pad is unplugged its status drops to
 `GameInputDeviceNoStatus` and its device callback runs; when the same pad is plugged in again (matched by SDL GUID and
@@ -260,6 +333,12 @@ repository. Its struct offsets were checked by compiling both side by side with 
 shim fills (`GameInputDeviceInfo` 320 bytes with `deviceFamily` at 96 and the info pointers from 160,
 `GameInputGamepadState` 28 bytes, `GameInputControllerAxisInfo` 48, and the rest in `gameinput_abi.h`).
 
+The force-feedback and haptic declarations (`GameInputForceFeedbackMotorInfo`, `GameInputHapticWaveformInfo`,
+`GameInputHapticFeedbackMotorInfo`, the envelope and parameter structs, `IGameInputForceFeedbackEffect`) were
+transcribed from that header's public source and pinned with the same kind of `static_assert` on their sizes and
+fields — they were not compiled against it, since it is not in the repository. That is the one place the shim's ABI
+rests on a transcription rather than on a side-by-side compile.
+
 ## Tests
 
 - `gameinput_test` (CTest, no controller): turns SDL's real backends off and drives the shim through
@@ -269,7 +348,7 @@ shim fills (`GameInputDeviceInfo` 320 bytes with `deviceFamily` at 96 and the in
   the fact, both directions, two pads interleaved and filtered by device, ageing out, held readings, unplug and
   replug), the guide button, motor and trigger
   rumble as SDL receives them, the DualSense effect bytes in each `LEONIDA_DS_TRIGGERS` mode, the lightbar, a
-  dispatcher, async and blocking enumeration, unregistering, unplugging and replugging, and three identical pads
+  dispatcher and its quota, async and blocking enumeration, unregistering, unplugging and replugging, and three identical pads
   (an id each, `FindDeviceFromId` and device-filtered readings per pad, replugging one, two and all three, and the
   first twin's id equal to the single-pad id). Motion runs on a virtual pad with sensors (`nsensors` in the
   virtual-joystick description, fed with `SDL_SendJoystickVirtualSensorData`): the kind and `motionInfo` on a sensor
@@ -321,5 +400,19 @@ These need the game executable or a test on hardware:
 - **Mouse on the right stick**: the scale (1024 units per pixel per poll) and decay (7/8 per poll) are a starting
   point, not tuned in game. The title adds its own stick acceleration and deadzone on top, so aiming may feel slow
   near center or jumpy.
-- **DualSense effect parameters**: the `06` (vibration) and `01` (resistance) byte meanings follow SDL's
-  `testcontroller.c`; how strong 255 feels and what frequency suits the Xbox signal needs a session on a real pad.
+- **Force feedback on hardware**: which pads SDL opens as haptic devices on Windows (a DirectInput wheel or stick,
+  not an Xbox pad) and how many force-feedback motors a title would really see there. The shim reports one motor with
+  LinearX; whether a wheel wants a second axis, or LinearY for a stick, is unknown until one is attached.
+  `gameinput_probe` prints `forcefeedback=` and `haptic=` per pad.
+- **How a force-feedback effect feels**: the magnitudes go out 1:1 (SDL's -32767..32767 from GameInput's -1..1) with
+  no scaling beyond the two gains. Whether a game's curb weight, road texture and crash feel right, and whether
+  `SDL_SetHapticGain` is the right place for a motor's master gain on the driver SDL picks, needs a wheel in game.
+- **Envelope and phase units**: GameInput's `phase` is read as degrees (SDL takes hundredths of a degree) and its
+  durations as microseconds summed into SDL's `length`. Neither came from a measurement, only from the header's
+  remarks.
+- **A new effect starting stopped or running**: the shim starts it running, because the documented use creates an
+  effect once and only ever calls `SetParams`. A title that creates one and waits for `SetState` would play a frame
+  early; whether this one does is unknown until it runs.
+- **Haptic waveforms**: the single intensity waveform (usage 0x0F/0x58) is this shim's choice, not the pad's table, so
+  a title that asks for a particular waveform gets intensity-only behaviour. Whether the game uses haptic motors at
+  all — as opposed to `SetRumbleState` — is unknown.

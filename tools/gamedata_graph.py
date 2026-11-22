@@ -595,6 +595,13 @@ def main() -> int:
         if os.path.isdir(args.json):
             parser.error(f"--json is a directory: {args.json}")
         for target in args.targets:
+            if (os.path.isdir(target) and os.path.isfile(args.json)
+                    and not os.path.isfile(os.path.join(target, "index.json"))):
+                # Directory mode without index.json reads every nested *.xml; none may be the
+                # report we are about to open for writing.
+                for source in gx.xml_files(target):
+                    if gx.same_report_path(args.json, source):
+                        parser.error(f"--json would overwrite the input {source}")
             source = os.path.join(target, "index.json") if os.path.isdir(target) else target
             if gx.same_report_path(args.json, source):
                 parser.error(f"--json would overwrite the input {source}")

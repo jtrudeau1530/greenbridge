@@ -1205,6 +1205,7 @@ class TestTranslatorIntegrationB32(unittest.TestCase):
                 self.stage = stage
                 self.uses_lds = False
                 self.lds_dwords = 256
+                self.lds_bound = None       # not bounds-checked (SHADER-309)
                 self.wave64 = True
                 self._tmp = 0
                 self.emitted = []
@@ -1232,6 +1233,8 @@ class TestTranslatorIntegrationB32(unittest.TestCase):
             LDS_ATOMICS = rdna2spirv.Gen.LDS_ATOMICS
             mod_int = staticmethod(rdna2spirv.Gen.mod_int)
             lds_ptr = rdna2spirv.Gen.lds_ptr
+            lds_access = rdna2spirv.Gen.lds_access
+            lds_atomic = rdna2spirv.Gen.lds_atomic
             lds_op = rdna2spirv.Gen.lds_op
 
         return MockGen()

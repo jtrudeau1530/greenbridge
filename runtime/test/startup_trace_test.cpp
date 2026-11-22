@@ -139,6 +139,14 @@ bool call_faulting(void* fn) {
     return false;
 }
 
+void raise_bad_dbg_print() {
+    __try {
+        ULONG_PTR args[2] = {5, 0x1000};  // invalid string pointer in DBG_PRINTEXCEPTION_C
+        RaiseException(0x40010006, 0, 2, args);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+}
+
 std::string hex_rva(uint32_t rva) {
     char b[16];
     std::snprintf(b, sizeof b, "+0x%x", rva);
@@ -211,6 +219,8 @@ void test_trace(const fs::path& dir) {
         reinterpret_cast<VoidFn>(m.base + caller_rva(0))(nullptr);  // second call: no second event
         reinterpret_cast<VoidFn>(m.base + caller_rva(1))(kDebugText);
         reinterpret_cast<VoidFn>(m.base + caller_rva(1))(kAnsiText);
+        raise_bad_dbg_print();
+        OutputDebugStringA("after_bad_dbg_print");
         check(call_faulting(m.base + kFaultRva), "the access violation reached the test's handler");
         rt::startup_trace::event("exit", "\"code\":0");
     }
@@ -240,6 +250,11 @@ void test_trace(const fs::path& dir) {
     bool ansi_found = false;
     for (auto& l : lines) ansi_found |= l.find("\"kind\":\"debug_string\"") != std::string::npos && l.find(ansi) != std::string::npos;
     check(ansi_found, "an ANSI debug string with a byte above 0x7f is written as UTF-8");
+    bool after_bad_found = false;
+    for (auto& l : lines)
+        after_bad_found |=
+            l.find("\"kind\":\"debug_string\"") != std::string::npos && l.find("after_bad_dbg_print") != std::string::npos;
+    check(after_bad_found, "an SEH fault inside the VEH does not leave in_handler stuck true");
     check(valid_utf8(trace), "the whole trace is valid UTF-8");
 
     const std::string* e = find_line(lines, "exception");
