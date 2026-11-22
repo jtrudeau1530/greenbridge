@@ -79,16 +79,21 @@ that expands to `FSSM` ([fssm_crosscheck.md](fssm_crosscheck.md)). On all 52 con
 |---|---|
 | `tools/fssm_unpack.py` | **52/52** decompress to a valid `FSSM` blob (716 B to 101,320 B, median 2,200 B) |
 | `tools/shader_disasm.py --mcpu gfx1013` | **52/52** disassemble; 42 with no invalid word, 10 with invalid words in the code |
-| `tools/rdna2spirv.py` | **42** translate and pass `spirv-val` |
+| `tools/rdna2spirv.py` | **51** translate and pass `spirv-val` |
 
-The 10 untranslated programs stop at four rules:
+On current `main`, 51 of the 52 programs translate and pass `spirv-val`. The four earlier blockers were
+implemented in #1871 and #1968 (`427c1376`):
+
+* `tbuffer_load_format_x GFX10_FORMAT_8_UINT` (#1871) unblocked `LeafRehydration`.
+* `global_atomic_fmax` (#1968) unblocked `BuildKDOP`, `LoadInstances`, `ReloadProcedurals`, `LoadProceduralGeometry`, and `LoadTriangles`.
+* `global_atomic_fmin` (#1968) unblocked `PT_LoadInstances`.
+* `buffer_load_ushort` (#1968) unblocked `Box32Rehydration`, `ReloadTriangles`, and the load half of `Box16Rehydration`.
+
+The single remaining untranslated program stops at one rule:
 
 | module(s) | blocker |
 |---|---|
-| `BuildKDOP`, `LoadInstances`, `ReloadProcedurals`, `LoadProceduralGeometry`, `LoadTriangles` | `global_atomic_fmax` |
-| `PT_LoadInstances` | `global_atomic_fmin` |
-| `Box16Rehydration`, `Box32Rehydration`, `ReloadTriangles` | `buffer_load_ushort` |
-| `LeafRehydration` | `tbuffer_load_format_x GFX10_FORMAT_8_UINT` |
+| `Box16Rehydration` | `buffer_store_short` (#1864) |
 
 Reproduction, after `--extract` above:
 
@@ -100,16 +105,16 @@ python -I tools/rdna2spirv.py <work>/embedded/dxbc/disasm --out <work>/embedded/
 
 ## 5. What this changes
 
-* **The RT builder does not need a DXIL path for the console code.** Its programs are RDNA2 `FSSM`, and 41 of
+* **The RT builder does not need a DXIL path for the console code.** Its programs are RDNA2 `FSSM`, and 51 of
   52 already pass `spirv-val` with the translator the project uses for the game's 26,503 shaders. The bitcode in
   the same container is a second representation (the one the PC-compiler experiment measured); it is not what
   the console runtime executes.
-* **The four missing rules are small and have real fixtures.** `global_atomic_fmax`/`fmin` cover 6 programs,
-  `buffer_load_ushort` 3 and `tbuffer_load_format_x` with format 8 one. They are ordinary translator rules, not
-  a new compiler backend.
+* **The one missing rule is small and has real fixtures.** `buffer_store_short` (#1864) covers `Box16Rehydration`.
+  It is an ordinary translator rule, not a new compiler backend.
 * **The rehydration programs are the ones closest to the shipped data.** `Box16Rehydration`,
   `Box32Rehydration` and `LeafRehydration` are exactly the programs that would turn the dehydrated BVH packs
-  into runtime trees ([bvh.md](bvh.md) §3.1). Two of the four rules stand between them and translation.
+  into runtime trees ([bvh.md](bvh.md) §3.1). `LeafRehydration` translates since #1871, `Box32Rehydration`
+  translates since #1968 (`427c1376`), and only `Box16Rehydration` awaits #1864 (`buffer_store_short`).
 * **What is still open.** None of the 52 has been executed on a GPU; translation and `spirv-val` do not prove the
   output. Which of them the game actually creates is a call-site question (RT-5). The module-to-pipeline order
   above comes from `ILDN`, not from a runtime trace. The `STAT` bitcode and the `0x07 NOBC` record are not
