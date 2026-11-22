@@ -52,6 +52,7 @@ class FakeDevice:
     synchronization2: bool = True
     timeline_semaphore: bool = True
     separate_depth_stencil_layouts: bool = True
+    buffer_device_address: bool = True
     subgroup_size_control: bool = True
     queue_flags: tuple[int, ...] = (vk_info.VK_QUEUE_GRAPHICS_BIT,)
     subgroup_size: int = 32
@@ -207,6 +208,9 @@ class FakeVulkan:
                 ctypes.c_uint32.from_address(
                     node_addr + vk_info.F12_TIMELINE_SEMAPHORE
                 ).value = int(dev.timeline_semaphore)
+                ctypes.c_uint32.from_address(
+                    node_addr + vk_info.F12_BUFFER_DEVICE_ADDRESS
+                ).value = int(dev.buffer_device_address)
             elif stype == vk_info.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES:
                 ctypes.c_uint32.from_address(
                     node_addr + vk_info.F13_SUBGROUP_SIZE_CONTROL
@@ -419,6 +423,13 @@ class PhysicalDevicesTest(unittest.TestCase):
 
 
 class QueryTest(unittest.TestCase):
+    def setUp(self):
+        # A LEONIDA_VK_DEVICE in the caller's environment would narrow the fake devices too.
+        env = mock.patch.dict(vk_info.os.environ)
+        env.start()
+        self.addCleanup(env.stop)
+        vk_info.os.environ.pop("LEONIDA_VK_DEVICE", None)
+
     def _run_query(self, *devices):
         vk = FakeVulkan(devices=devices)
         with mock.patch.object(vk_info, "load_vulkan", return_value=vk):
@@ -468,6 +479,7 @@ class QueryTest(unittest.TestCase):
             ("below_1_3_by_one", FakeDevice(name="Almost13", api_version=vk_info.VK_API_VERSION_1_3 - 1)),
             ("no_dynamic_rendering", FakeDevice(name="NoDyn", dynamic_rendering=False)),
             ("no_synchronization2", FakeDevice(name="NoSync2", synchronization2=False)),
+            ("no_buffer_device_address", FakeDevice(name="NoBDA", buffer_device_address=False)),
             ("no_timeline_semaphore", FakeDevice(name="NoTimeline", timeline_semaphore=False)),
             ("no_separate_ds", FakeDevice(name="NoSepDS", separate_depth_stencil_layouts=False)),
             ("zero_queue_families", FakeDevice(name="NoQueues", queue_flags=())),
@@ -510,11 +522,19 @@ class QueryTest(unittest.TestCase):
             device_type=vk_info.VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU,
             dynamic_rendering=False,
         )
+        dozen = FakeDevice(name="Microsoft Direct3D12 (dGPU-1)",
+                           device_type=vk_info.VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU,
+                           vendor_id=vk_info.MICROSOFT_VENDOR_ID)
 
         cases = [
             ("discrete_beats_earlier_integrated", (igpu1, dgpu1), "dGPU-1"),
             ("discrete_beats_later_integrated", (dgpu1, igpu1), "dGPU-1"),
-            ("last_discrete_wins", (igpu1, dgpu1, dgpu2, igpu2), "dGPU-2"),
+            ("first_discrete_wins_a_tie", (igpu1, dgpu1, dgpu2, igpu2), "dGPU-1"),
+            ("integrated_beats_an_earlier_cpu", (cpu, igpu1), "iGPU-1"),
+            ("native_beats_a_later_dozen", (dgpu1, dozen), "dGPU-1"),
+            ("native_beats_an_earlier_dozen", (dozen, dgpu1), "dGPU-1"),
+            ("native_integrated_beats_dozen", (dozen, igpu1), "iGPU-1"),
+            ("dozen_when_it_is_all_there_is", (dozen, bad_dgpu), "Microsoft Direct3D12 (dGPU-1)"),
             ("unsuitable_later_discrete_does_not_override", (dgpu1, bad_dgpu), "dGPU-1"),
             ("first_non_discrete_when_no_discrete", (igpu1, cpu, igpu2), "iGPU-1"),
             ("first_suitable_non_discrete_after_rejected", (bad_dgpu, igpu1, igpu2), "iGPU-1"),
@@ -716,6 +736,13 @@ class QueryTest(unittest.TestCase):
 
 
 class MainCliTest(unittest.TestCase):
+    def setUp(self):
+        # A LEONIDA_VK_DEVICE in the caller's environment would narrow the fake devices too.
+        env = mock.patch.dict(vk_info.os.environ)
+        env.start()
+        self.addCleanup(env.stop)
+        vk_info.os.environ.pop("LEONIDA_VK_DEVICE", None)
+
     def test_main_exits_0_and_prints_single_line_json_on_stdout(self):
         vk = FakeVulkan(devices=(FakeDevice(name="CLI GPU"),))
         out, err = io.StringIO(), io.StringIO()
