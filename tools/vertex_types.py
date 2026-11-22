@@ -104,13 +104,14 @@ def group_edges(data, gat, group):
     ref_at = tri_at + 4 * group["triangles"]
     refs = struct.unpack_from(f"<{group['vertex_refs']}H", data, ref_at)
     tris = []
+    vbase = tbase = 0  # running sums: the record's u16 fields wrap past 65,535 (parse_group checks them mod 2^16)
     for m in range(meshlets):
-        w1 = struct.unpack_from("<I", data, rec_at + 16 * m + 4)[0]
-        vbase, tbase = w1 & 0xFFFF, w1 >> 16
         w0 = struct.unpack_from("<I", data, rec_at + 16 * m)[0]
-        tcount = ((w0 >> 7) & 0x7F) + 1
+        vcount, tcount = (w0 & 0x7F) + 1, ((w0 >> 7) & 0x7F) + 1
         for t in struct.unpack_from(f"<{tcount}I", data, tri_at + 4 * tbase):
             tris.append((refs[vbase + (t & 0x7F)], refs[vbase + ((t >> 7) & 0x7F)], refs[vbase + ((t >> 14) & 0x7F)]))
+        vbase += vcount
+        tbase += tcount
     return tris
 
 
