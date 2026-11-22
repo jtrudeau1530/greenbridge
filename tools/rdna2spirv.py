@@ -11076,6 +11076,12 @@ def exec_changes_after_vm(blocks, succ):
     return False
 
 
+def sdwa_reads_dst(op: str, mods: list[str]) -> bool:
+    """A byte or word insert with UNUSED_PRESERVE reads the rest of its destination."""
+    return (op.endswith("_sdwa") and "dst_unused:UNUSED_PRESERVE" in mods
+            and any(m.startswith(("dst_sel:BYTE_", "dst_sel:WORD_")) for m in mods))
+
+
 def read_before_write_vgprs(insns):
     """VGPRs a shader reads before writing them: for a fetch-calling VS these are the fetched attributes."""
     written, first = set(), []
@@ -11087,7 +11093,7 @@ def read_before_write_vgprs(insns):
                                    "global_store")) \
             or (op.startswith("global_atomic_") and "glc" not in ins["mods"])   # no vdst without glc
         regs = []
-        for x in (a if reads_all else a[1:]):
+        for x in (a if reads_all or sdwa_reads_dst(op, ins.get("mods", [])) else a[1:]):
             if x["k"] == "vgpr":
                 regs += range(x["r"], x["r"] + x.get("n", 1))
             elif x["k"] == "vlist":
@@ -11317,7 +11323,7 @@ def reg_reads_writes(insns):
         reads_all = op.startswith(("exp", "buffer_store", "tbuffer_store", "image_store", "v_cmp", "v_cmpx", "ds_write",
                                    "global_store"))
         regs = []
-        for x in (a if reads_all else a[1:]):
+        for x in (a if reads_all or sdwa_reads_dst(op, ins.get("mods", [])) else a[1:]):
             if x["k"] == "vgpr":
                 regs += range(x["r"], x["r"] + x.get("n", 1))
             elif x["k"] == "vlist":
