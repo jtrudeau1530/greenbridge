@@ -49,6 +49,7 @@ _TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
 if _TOOLS_DIR not in sys.path:
     sys.path.insert(0, _TOOLS_DIR)
 
+from pool_workers import process_workers  # noqa: E402
 import world_census as WC  # noqa: E402
 import world_index as WI  # noqa: E402
 
@@ -652,7 +653,7 @@ def scan(path, jobs=1, start=None, limit=None, lights_out=False):
         for w in windows:
             merge(scan_window(w))
     else:
-        with ProcessPoolExecutor(jobs) as ex:
+        with ProcessPoolExecutor(process_workers(jobs)) as ex:
             for r in ex.map(scan_window, windows):
                 merge(r)
     return total

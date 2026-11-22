@@ -36,6 +36,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from file_mode import published_mode  # noqa: E402
+from pool_workers import process_workers  # noqa: E402
 
 # ---- Ogg ----
 _CRC = []
@@ -417,7 +418,7 @@ def main(argv=None) -> int:
             if (i + 1) % 200 == 0:
                 print(f"  {i + 1}/{len(banks)} banks: {tot}", flush=True)
     else:
-        with ProcessPoolExecutor(max_workers=jobs) as ex:
+        with ProcessPoolExecutor(max_workers=process_workers(jobs)) as ex:
             futures = {ex.submit(export_bank, b, output_parent, a.pre_skip): b for b, output_parent in banks}
             for i, fut in enumerate(as_completed(futures), 1):
                 b = futures[fut]

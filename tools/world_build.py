@@ -41,6 +41,7 @@ if _TOOLS_DIR not in sys.path:
     sys.path.insert(0, _TOOLS_DIR)
 
 from file_mode import published_mode  # noqa: E402
+from pool_workers import process_workers  # noqa: E402
 
 try:
     import dds_png
@@ -514,6 +515,7 @@ def _run_jobs(fn, jobs, workers: int):
         return
     import collections
     from concurrent.futures import ProcessPoolExecutor
+    workers = process_workers(workers)
     window = 4 * workers
     with ProcessPoolExecutor(max_workers=workers) as pool:
         pending = collections.deque()
