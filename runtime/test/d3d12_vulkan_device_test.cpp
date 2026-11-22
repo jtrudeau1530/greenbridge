@@ -984,7 +984,7 @@ int compare_resolves(ID3D12Device* ours, VkSampleCountFlags color_sample_counts)
 
 int main() {
     vktest::Device d;
-    EXPECT(d.create());
+    if (!d.create()) return 77;   // no Vulkan GPU: CTest treats 77 as skipped
     EXPECT(d.depth_format_usable(VK_FORMAT_D32_SFLOAT_S8_UINT));
     VkSampleCountFlags depth_sample_counts = 0, color_sample_counts = 0;
     {
