@@ -720,5 +720,83 @@ class TestSIMDMultiLaneDivergence(unittest.TestCase):
             self.assertEqual(state.get_vgpr16(lane, 2, HalfSelect.LO), HALF_F16)
 
 
+class TestRegisterAliasing(unittest.TestCase):
+    """Unit tests for register aliasing and in-place operand preservation."""
+
+    def setUp(self) -> None:
+        self.scalar_interp = ScalarInterpreter()
+        self.simd_interp = SIMDInterpreter()
+
+    def test_dst_alias_src0_lo_to_lo(self) -> None:
+        state = ScalarMachineState()
+        state.set_vgpr16(0, HalfSelect.LO, QUARTER_F16)
+        instr = VSqrtClampF16Instruction(
+            dst=RegHalf(0, RegType.VGPR, HalfSelect.LO),
+            src0=VOP3Operand(RegHalf(0, RegType.VGPR, HalfSelect.LO)),
+        )
+        self.scalar_interp.step(instr, state)
+        self.assertEqual(state.get_vgpr16(0, HalfSelect.LO), HALF_F16)
+
+    def test_dst_alias_src0_hi_to_hi(self) -> None:
+        state = ScalarMachineState()
+        state.set_vgpr16(0, HalfSelect.HI, FOUR_F16)
+        instr = VSqrtClampF16Instruction(
+            dst=RegHalf(0, RegType.VGPR, HalfSelect.HI),
+            src0=VOP3Operand(RegHalf(0, RegType.VGPR, HalfSelect.HI)),
+        )
+        self.scalar_interp.step(instr, state)
+        # Clamped to 1.0
+        self.assertEqual(state.get_vgpr16(0, HalfSelect.HI), ONE_F16)
+
+    def test_dst_hi_src_lo_cross_half_alias(self) -> None:
+        state = ScalarMachineState()
+        state.set_vgpr16(0, HalfSelect.LO, QUARTER_F16)
+        state.set_vgpr16(0, HalfSelect.HI, 0x1234)
+        instr = VSqrtClampF16Instruction(
+            dst=RegHalf(0, RegType.VGPR, HalfSelect.HI),
+            src0=VOP3Operand(RegHalf(0, RegType.VGPR, HalfSelect.LO)),
+        )
+        self.scalar_interp.step(instr, state)
+        self.assertEqual(state.get_vgpr16(0, HalfSelect.HI), HALF_F16)
+        self.assertEqual(state.get_vgpr16(0, HalfSelect.LO), QUARTER_F16)
+
+    def test_dst_lo_src_hi_cross_half_alias(self) -> None:
+        state = ScalarMachineState()
+        state.set_vgpr16(0, HalfSelect.HI, FOUR_F16)
+        state.set_vgpr16(0, HalfSelect.LO, 0x5678)
+        instr = VSqrtClampF16Instruction(
+            dst=RegHalf(0, RegType.VGPR, HalfSelect.LO),
+            src0=VOP3Operand(RegHalf(0, RegType.VGPR, HalfSelect.HI)),
+        )
+        self.scalar_interp.step(instr, state)
+        self.assertEqual(state.get_vgpr16(0, HalfSelect.LO), ONE_F16)
+        self.assertEqual(state.get_vgpr16(0, HalfSelect.HI), FOUR_F16)
+
+    def test_inplace_iterative_evolution(self) -> None:
+        # Starting with 0.0625 -> sqrt is 0.25 -> sqrt is 0.5
+        state = ScalarMachineState()
+        state.set_vgpr16(0, HalfSelect.LO, f16_to_bits(0.0625))
+        instr = VSqrtClampF16Instruction(
+            dst=RegHalf(0, RegType.VGPR, HalfSelect.LO),
+            src0=VOP3Operand(RegHalf(0, RegType.VGPR, HalfSelect.LO)),
+        )
+        self.scalar_interp.step(instr, state)
+        self.assertEqual(state.get_vgpr16(0, HalfSelect.LO), QUARTER_F16)
+        self.scalar_interp.step(instr, state)
+        self.assertEqual(state.get_vgpr16(0, HalfSelect.LO), HALF_F16)
+
+    def test_simd_multi_lane_aliasing(self) -> None:
+        state = SIMDState(num_lanes=32, exec_mask=0xFFFF_FFFF)
+        for lane in range(32):
+            state.set_vgpr16(lane, 0, HalfSelect.LO, QUARTER_F16)
+        instr = VSqrtClampF16Instruction(
+            dst=RegHalf(0, RegType.VGPR, HalfSelect.LO),
+            src0=VOP3Operand(RegHalf(0, RegType.VGPR, HalfSelect.LO)),
+        )
+        self.simd_interp.step(instr, state)
+        for lane in range(32):
+            self.assertEqual(state.get_vgpr16(lane, 0, HalfSelect.LO), HALF_F16)
+
+
 if __name__ == "__main__":
     unittest.main()
