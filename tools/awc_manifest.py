@@ -5,7 +5,8 @@
 The AWC layout is read by tools/awc_opus.py (parse_awc + music_channels), so this manifest and the
 exporter agree on stream ids, codecs, sample rates and streamed-music descriptors. A directory is
 scanned recursively for *.awc. CSV is the default on stdout; --out writes a file and a .json
-extension selects JSON unless --format says otherwise. Unreadable banks are reported on stderr, skipped,
+extension selects JSON unless --format says otherwise. A report cannot replace an input bank, including one
+found during a directory scan. Unreadable banks are reported on stderr, skipped,
 and excluded from bank_count. The bank column gives the path relative to the scanned directory or the basename
 for a single file.
 
@@ -117,11 +118,21 @@ def _bank_rows(path: str, bank: str) -> list:
     return list(rows.values())
 
 
-def collect(src: str):
+def _same_report_path(first: str, second: str) -> bool:
+    if os.path.normcase(os.path.realpath(first)) == os.path.normcase(os.path.realpath(second)):
+        return True
+    try:
+        return os.path.samefile(first, second)
+    except OSError:
+        return False
+
+
+def collect(src: str, *, out: str | None = None):
     """(parsed bank count, rows, streamed-music row count); one warning per skipped bank.
 
     Invalid banks are reported on stderr and excluded from the bank count, so the summary cannot claim
-    that a directory was inventoried when none of its files could be read.
+    that a directory was inventoried when none of its files could be read. If out is given, refuse a report
+    that would replace any input bank before reading even the first bank (including invalid ones).
     """
     recursive = os.path.isdir(src)
     if recursive:
@@ -132,6 +143,10 @@ def collect(src: str):
         banks.sort(key=lambda p: (os.path.basename(p).lower(), p.lower()))
     else:
         banks = [src]
+    if out:
+        for path in banks:
+            if _same_report_path(out, path):
+                raise ValueError(f"--out would overwrite the input {path}")
     rows = []
     parsed = 0
     for path in banks:
@@ -197,7 +212,11 @@ def main(argv=None) -> int:
         print(f"awc_manifest: error: {a.src}: no such file or directory", file=sys.stderr)
         return 2
     fmt = a.format or ("json" if a.out and a.out.lower().endswith(".json") else "csv")
-    banks, rows, streamed = collect(a.src)
+    try:
+        banks, rows, streamed = collect(a.src, out=a.out)
+    except ValueError as e:
+        print(f"awc_manifest: error: {e}", file=sys.stderr)
+        return 2
     try:
         write_manifest(rows, banks, streamed, fmt, a.out)
     except OSError as e:
