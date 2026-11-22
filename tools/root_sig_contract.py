@@ -46,8 +46,8 @@ def pack_layout(sig):
         ptype = p.get("type", "")
         if ptype == "constants":
             count = p.get("count", 0)
-            if not isinstance(count, int) or count < 1:
-                return [], f"param {index}: constants need count >= 1"
+            if type(count) is not int or count < 1:
+                return [], f"param {index}: constants need an integer count >= 1"
             width, cost_add = count, count
         elif ptype in ("cbv", "srv", "uav"):
             width, cost_add = 2, 2
