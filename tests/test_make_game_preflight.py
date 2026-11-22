@@ -571,7 +571,7 @@ class PreflightPrerequisiteTest(PreflightTestBase):
             with mock.patch.object(make_game, "ROOT", tmp), \
                  mock.patch("shutil.which", return_value=None):
                 self.assert_fails(make_game.ensure_submodule,
-                                  match="third_party/rpf9-explorer is missing. Download the project with:")
+                                  match="git clone --recursive https://github.com/ItsNotRexed/Leonida")
 
 
 class GameDiscoveryTest(unittest.TestCase):

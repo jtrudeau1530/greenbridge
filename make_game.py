@@ -587,8 +587,9 @@ def ensure_submodule() -> None:
         r = subprocess.run([git, "-C", ROOT, "submodule", "update", "--init", "--recursive"])
         if r.returncode == 0 and os.path.isdir(core):
             return
-    fail("third_party/rpf9-explorer is missing. Download the project with: "
-         "git clone --recursive <this repository's URL>")
+    fail("third_party/rpf9-explorer is missing (a \"Download ZIP\" from GitHub leaves it out). Install Git "
+         "(https://git-scm.com/downloads) and download the project with: "
+         "git clone --recursive https://github.com/ItsNotRexed/Leonida")
 
 
 def check(game: str, full: bool) -> dict:
