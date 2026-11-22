@@ -63,30 +63,33 @@ zero-stream bank, so only `audio.rpf`'s bank and byte counts changed (banks 7,16
 them per stream in its scan tallies (`grid20_*`, `indexrun_*` summary keys): over the whole archive
 **387,233 `0x5a` entries / 0 invalid** and **4,853 `0xd9` groups / 0 invalid / 0 index overruns**. Every
 invariant below was measured on that full population; the field names describe structure, and the meaning of
-`value`, `s`, `t` and the last entry's tail float stays a labelled hypothesis.
+`p`, `z`, `s`, `t` and the trailer stays a labelled hypothesis.
 
-`0x5a` — `{u32 12345678; u32 unknown; N × 20-byte entries}` (`(size − 8) % 20 == 0` always):
+`0x5a` — `{u32 12345678; N × 20-byte entries; f32 trailer}` (`(size − 8) % 20 == 0` always). The framing is
+@kotorvr's ([finding](https://github.com/ItsNotRexed/Leonida/issues/3232#issuecomment-7084750136)), recounted
+for ASSET-256; read 4 bytes later, as before, each entry paired one entry's fields with the next one's
+position, and the trailer became the last "counter":
 
 ```
-0    f32  value          (3.658 .. 146.789 measured; spans up to 133 within one stream)
-4    u16  p              (a multiple of 32 on every measured entry)
-6    u16  z              (0 .. 16)
-8    u16  index_lo
-10   u16  index_hi       (index pairs tile 0..129 / 1..130 measured)
-12   u16  s
-14   u16  t
-16   u32  counter        (every entry but the last: a sample position, see below)
-16   f32  tail           (the last entry only: 2/3 = 0x3f2aaaab on 1,182 streams, 0.666812 on 1, 0.725624 on 2)
+0    u32  position       (a sample position at the stream's rate, see below)
+4    f32  value          (3.658 .. 146.789 measured; spans up to 133 within one stream)
+8    u16  p              (a multiple of 512 on every measured entry)
+10   u16  z              (0 .. 16)
+12   u16  index_lo
+14   u16  index_hi       (index pairs tile 0..129 / 1..130 measured)
+16   u16  s
+18   u16  t
+trailer: f32             (2/3 = 0x3f2aaaab on 1,182 streams, 0.666812 on 1, 0.725624 on 2)
 ```
 
-The counter is a sample position in the stream (ASSET-256, measured over all 1,185 streams and 386,048 counters,
-`tools/rsc8_audio.py`'s `grid20_counter_past_samples` = 0). On every entry but the last it ascends strictly and
-stays below the `0x76` sample count: the largest counter is 0.9986 of the stream's samples, the last one ends
-p10/p50/p90 0.8/1.85/5.4 mean entry steps before the stream's end, and the first entry-to-entry step averages
-the stream's samples-per-entry (p50 ratio 0.996). The last entry holds an f32 at `+16` in place of a counter.
-Read as a u32 it is about 1.06 × 10⁹, 2^9.9–2^15.2 times the sample count, which is what made the counter look
-finer than a sample before. What the tail float means is not known. Every one of these streams is mono XMA2
-(`0x76` codec 5) at 32,000 Hz (one at 32,007 Hz).
+The position is a sample position in the stream (ASSET-256, all 1,185 streams and 387,233 entries;
+`tools/rsc8_audio.py`'s `grid20_position_past_samples` = 0). It ascends strictly and stays below the `0x76`
+sample count: the largest is 0.9986 of the stream's samples, and the last one ends p10/p50/p90 0.8/1.85/5.4
+mean entry steps before the stream's end. One entry lasts one period of its `value` read as a frequency:
+`(position[k+1] − position[k]) × value[k] / rate` is within 1% of 1 on 365,803 of the 386,048 entry pairs
+(within 5%: 383,993), so `value` reads as a pitch in Hz. Read as a u32, the trailer is about 1.06 × 10⁹,
+2^9.9–2^15.2 times the sample count, which made the old "counter" look finer than a sample. Every one of these
+streams is mono XMA2 (`0x76` codec 5) at 32,000 Hz (one at 32,007 Hz).
 
 `0xd9` — `{u32 K; K × {u32 2; u32 len; u32 hash; len × u32}}`: the run values ascend strictly inside each
 group, exactly one distinct `hash` appears per stream, the group count always equals `K`, and **every run

@@ -847,12 +847,12 @@ def build_minimal_tag_bank(sid, tags):
     return bytes(hdr) + b"".join(parts)
 
 
-def build_synthetic_grid20(entries):
-    """8-byte header (magic 12345678, unknown) + 20-byte entries, field order as measured."""
-    out = struct.pack("<II", rsc8_audio.GRID20_MAGIC, 7)
-    for value, p, z, lo, hi, s, t, counter in entries:
-        out += struct.pack("<fHHHHHHI", value, p, z, lo, hi, s, t, counter)
-    return out
+def build_synthetic_grid20(entries, trailer=2 / 3):
+    """u32 magic 12345678 + 20-byte entries {u32 position, f32 value, 6 x u16} + f32 trailer (ASSET-256)."""
+    out = struct.pack("<I", rsc8_audio.GRID20_MAGIC)
+    for position, value, p, z, lo, hi, s, t in entries:
+        out += struct.pack("<IfHHHHHH", position, value, p, z, lo, hi, s, t)
+    return out + struct.pack("<f", trailer)
 
 
 def build_synthetic_indexruns(groups, declared=None, hash_=0x4C633D07):
@@ -865,10 +865,9 @@ def build_synthetic_indexruns(groups, declared=None, hash_=0x4C633D07):
 
 class UndocumentedTagsTest(unittest.TestCase):
     GRID = build_synthetic_grid20([
-        (14.21, 0, 0, 1, 2, 0x39CC, 0x4C15, 2894),
-        (14.12, 32, 0, 1, 2, 0x4193, 0x4C03, 5181),
-        # The last entry holds the f32 2/3 where the others hold their counter (ASSET-256).
-        (14.03, 32, 1, 2, 3, 0x49B5, 0x4B15, 0x3F2AAAAB),
+        (20, 14.21, 0, 0, 1, 2, 0x39CC, 0x4C15),
+        (2894, 14.12, 32, 0, 1, 2, 0x4193, 0x4C03),
+        (5181, 14.03, 32, 1, 2, 3, 0x49B5, 0x4B15),
     ])
     RUNS = build_synthetic_indexruns([(2, [1, 5, 9]), (2, [20, 21])])
 
@@ -876,16 +875,16 @@ class UndocumentedTagsTest(unittest.TestCase):
         g = rsc8_audio.decode_grid20_table(self.GRID)
         self.assertTrue(g["size_ok"])
         self.assertTrue(g["magic_ok"])
-        self.assertEqual(g["unknown"], 7)
         self.assertEqual(g["entries"], 3)
-        self.assertEqual(g["counter_first"], 2894)
-        self.assertEqual(g["counter_last"], 5181)
-        self.assertTrue(g["counter_increasing"])
+        self.assertEqual(g["position_first"], 20)
+        self.assertEqual(g["position_last"], 5181)
+        self.assertTrue(g["position_increasing"])
         self.assertAlmostEqual(g["tail_f32"], 2 / 3, places=6)
         self.assertTrue(g["p_multiple_of_32"])
-        empty = rsc8_audio.decode_grid20_table(struct.pack("<II", rsc8_audio.GRID20_MAGIC, 0))
+        empty = rsc8_audio.decode_grid20_table(build_synthetic_grid20([]))
         self.assertTrue(empty["size_ok"] and empty["magic_ok"])
         self.assertEqual(empty["entries"], 0)
+        self.assertIsNone(empty["position_last"])
 
     def test_grid20_flags_violations(self):
         bad_magic = struct.pack("<II", 87654321, 0) + self.GRID[8:]
@@ -893,22 +892,20 @@ class UndocumentedTagsTest(unittest.TestCase):
         self.assertFalse(rsc8_audio.decode_grid20_table(self.GRID[:-1])["size_ok"])
         self.assertFalse(rsc8_audio.decode_grid20_table(self.GRID[:6])["size_ok"])
         flat = build_synthetic_grid20([
-            (1.0, 0, 0, 0, 1, 0, 0, 500),
-            (2.0, 32, 0, 0, 1, 0, 0, 400),
-            (3.0, 64, 0, 0, 1, 0, 0, 0x3F2AAAAB),
+            (500, 1.0, 0, 0, 0, 1, 0, 0),
+            (400, 2.0, 32, 0, 0, 1, 0, 0),
         ])
-        self.assertFalse(rsc8_audio.decode_grid20_table(flat)["counter_increasing"])
-        # The last entry's f32 is not a counter: a small tail float after large counters is no violation.
+        self.assertFalse(rsc8_audio.decode_grid20_table(flat)["position_increasing"])
+        # The trailer is a float after the entries, not a position: its bits never enter the position checks.
         tail = build_synthetic_grid20([
-            (1.0, 0, 0, 0, 1, 0, 0, 500),
-            (2.0, 32, 0, 0, 1, 0, 0, 900),
-            (3.0, 64, 0, 0, 1, 0, 0, 0x3F000000),
-        ])
+            (500, 1.0, 0, 0, 0, 1, 0, 0),
+            (900, 2.0, 32, 0, 0, 1, 0, 0),
+        ], trailer=0.5)
         g = rsc8_audio.decode_grid20_table(tail)
-        self.assertTrue(g["counter_increasing"])
-        self.assertEqual(g["counter_last"], 900)
+        self.assertTrue(g["position_increasing"])
+        self.assertEqual(g["position_last"], 900)
         self.assertEqual(g["tail_f32"], 0.5)
-        skewed = build_synthetic_grid20([(1.0, 33, 0, 0, 1, 0, 0, 10)])
+        skewed = build_synthetic_grid20([(10, 1.0, 33, 0, 0, 1, 0, 0)])
         self.assertFalse(rsc8_audio.decode_grid20_table(skewed)["p_multiple_of_32"])
 
     def test_indexrun_group_parse(self):
@@ -956,7 +953,7 @@ class UndocumentedTagsTest(unittest.TestCase):
 
     def test_bank_tally_and_scan_summary(self):
         grid25 = build_synthetic_grid20([
-            (float(i), 32 * i, i % 17, i, i + 1, 0x39CC + i, 0x4C15 - i, 1000 + 7 * i)
+            (1000 + 7 * i, float(i), 32 * i, i % 17, i, i + 1, 0x39CC + i, 0x4C15 - i)
             for i in range(25)
         ])
         bank = build_minimal_tag_bank(0x00112233, {
@@ -970,7 +967,7 @@ class UndocumentedTagsTest(unittest.TestCase):
         self.assertEqual(res["grid20_streams"], 1)
         self.assertEqual(res["grid20_entries"], 25)
         self.assertEqual(res["grid20_invalid"], 0)
-        self.assertEqual(res["grid20_counter_past_samples"], 0)
+        self.assertEqual(res["grid20_position_past_samples"], 0)
         self.assertEqual(res["indexrun_streams"], 1)
         self.assertEqual(res["indexrun_groups"], 2)
         self.assertEqual(res["indexrun_invalid"], 0)
@@ -986,18 +983,17 @@ class UndocumentedTagsTest(unittest.TestCase):
         self.assertEqual(res_bad["indexrun_index_overruns"], 1)
         self.assertEqual(res_bad["grid20_invalid"], 0)
 
-        # Counters that reach the 0x76 sample count are counted (the package has none).
+        # Positions that reach the 0x76 sample count are counted (the package has none).
         long_grid = build_synthetic_grid20([
-            (1.0, 0, 0, 0, 1, 0, 0, 50000),
-            (2.0, 32, 0, 0, 1, 0, 0, 96000),
-            (3.0, 64, 0, 0, 1, 0, 0, 0x3F2AAAAB),
+            (50000, 1.0, 0, 0, 0, 1, 0, 0),
+            (96000, 2.0, 32, 0, 0, 1, 0, 0),
         ])
         past = build_minimal_tag_bank(0x00778899, {
             0x55: b"\xF8\x00" + bytes(62),
             0x76: struct.pack("<I", 96000) + bytes(4) + struct.pack("<H", 48000) + bytes(18) + b"\x0B\x01",
             0x5A: long_grid,
         })
-        self.assertEqual(rsc8_audio.decode_awc_bank(past)["grid20_counter_past_samples"], 1)
+        self.assertEqual(rsc8_audio.decode_awc_bank(past)["grid20_position_past_samples"], 1)
 
         with tempfile.TemporaryDirectory() as tmp:
             rpf = os.path.join(tmp, "synth.rpf")

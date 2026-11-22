@@ -59,7 +59,7 @@ is skipped.
 
 | Tag | Meaning |
 |---|---|
-| `0x5a` | 20-byte-entry grid table (`12345678` marker; see [rsc8_audio.md](rsc8_audio.md#the-undocumented-0x5a0xd9-companion-tags)) |
+| `0x5a` | 20-byte entries, a sample position and a pitch each (`12345678` marker; see [rsc8_audio.md](rsc8_audio.md#the-undocumented-0x5a0xd9-companion-tags)) |
 | `0xd9` | grouped ascending index runs into the sibling `0x5a` entries |
 
 Both appear only in `audio.rpf`, on 1,185 streams (32,000 Hz; 804 of them carry both).
