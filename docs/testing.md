@@ -81,7 +81,7 @@ python -I runtime/test/shaders/check.py <out dir> <folder with the test programs
 ## The Windows runtime on Linux, under Wine or Proton
 
 The Linux build above makes only the Vulkan programs. The loader (`gta6rt`), its shims and their tests are Windows
-programs; `runtime/cmake/clang-cl-xwin.cmake` cross-compiles them on Linux with clang-cl and lld-link (LLVM 19+: the
+programs; `runtime/cmake/clang-cl-xwin.cmake` cross-compiles them on Linux with clang-cl and lld-link (LLVM 19+, but not 22.1.7 or 22.1.8 (see Known problems): the
 MSVC STL that xwin lays out rejects older Clang; versioned names go in with `-DCMAKE_CXX_COMPILER=clang-cl-19` etc.)
 against an MSVC CRT and Windows SDK that [xwin](https://github.com/Jake-Shadle/xwin) downloads from Microsoft
 (running it means accepting Microsoft's licence), and `ctest` runs them through Wine:
