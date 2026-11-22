@@ -1,8 +1,7 @@
 """Synthetic unit tests for tools/bary_fallback_gs.py.
 
-Standard library only; no spirv-as/spirv-val binary, no GPU, and no game data:
-all index files are constructed in temporary directories and subprocess calls to
-spirv-as / spirv-val are mocked.
+Standard library only; no GPU or game data. Index files are constructed in temporary
+directories. The rebuild regression uses SPIRV-Tools when available.
 
     python -I tests/test_bary_fallback_gs.py
 """
@@ -10,7 +9,9 @@ import contextlib
 import io
 import json
 import os
+from pathlib import Path
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -24,6 +25,12 @@ if TOOLS_DIR not in sys.path:
     sys.path.insert(0, TOOLS_DIR)
 
 import bary_fallback_gs  # noqa: E402
+
+
+def _successful_spirv_tools(cmd: list[str], *, capture_output: bool, text: bool) -> subprocess.CompletedProcess[str]:
+    if cmd[0] == "spirv-as":
+        Path(cmd[-1]).write_bytes(b"synthetic binary")
+    return subprocess.CompletedProcess(cmd, 0, "", "")
 
 
 def _parse_spvasm(text: str) -> dict:
@@ -448,7 +455,7 @@ class TestBuildForIndex(unittest.TestCase):
                 self.assertTrue(text)
                 if cmd[0] == "spirv-as":
                     seen_asm_exists.append(os.path.isfile(cmd[3]))
-                return subprocess.CompletedProcess(cmd, 0, "", "")
+                return _successful_spirv_tools(cmd, capture_output=capture_output, text=text)
 
             with mock.patch.object(bary_fallback_gs.subprocess, "run", side_effect=fake_run) as run_mock:
                 built = bary_fallback_gs.build_for_index(tmp)
@@ -459,15 +466,18 @@ class TestBuildForIndex(unittest.TestCase):
             spv_b = os.path.join(tmp, "ps_b.bary_gs.spv")
             self.assertEqual(built, [spv_a, spv_b])
             self.assertEqual(seen_asm_exists, [True, True])
-            self.assertEqual(
-                [c.args[0] for c in run_mock.call_args_list],
-                [
-                    ["spirv-as", "--target-env", "vulkan1.2", asm_a, "-o", spv_a],
-                    ["spirv-val", "--target-env", "vulkan1.2", spv_a],
-                    ["spirv-as", "--target-env", "vulkan1.2", asm_b, "-o", spv_b],
-                    ["spirv-val", "--target-env", "vulkan1.2", spv_b],
-                ],
-            )
+            commands = [call.args[0] for call in run_mock.call_args_list]
+            self.assertEqual(len(commands), 4)
+            for asm, spv, assemble, validate in zip((asm_a, asm_b), built, commands[::2], commands[1::2], strict=True):
+                staged = Path(assemble[-1])
+                staged_asm = staged.with_suffix(".spvasm")
+                self.assertEqual(assemble, ["spirv-as", "--target-env", "vulkan1.2", str(staged_asm), "-o", str(staged)])
+                self.assertEqual(validate, ["spirv-val", "--target-env", "vulkan1.2", str(staged)])
+                self.assertTrue(Path(asm).is_file())
+                self.assertEqual(staged.name, Path(spv).name)
+                self.assertEqual(staged.parent.parent, Path(tmp))
+                self.assertFalse(staged.parent.exists())
+                self.assertEqual(Path(spv).read_bytes(), b"synthetic binary")
 
     def test_build_pair_forwards_suffix(self):
         index = {
@@ -479,20 +489,22 @@ class TestBuildForIndex(unittest.TestCase):
             with mock.patch.object(
                 bary_fallback_gs.subprocess,
                 "run",
-                return_value=subprocess.CompletedProcess([], 0, "", ""),
+                side_effect=_successful_spirv_tools,
             ) as run_mock:
                 built = bary_fallback_gs.build_for_index(tmp, pair=("vs_clip", "ps_a"))
 
             asm = os.path.join(tmp, "ps_a.bary_gs.clip3.spvasm")
             spv = os.path.join(tmp, "ps_a.bary_gs.clip3.spv")
             self.assertEqual(built, [spv])
-            self.assertEqual(
-                [c.args[0] for c in run_mock.call_args_list],
-                [
-                    ["spirv-as", "--target-env", "vulkan1.2", asm, "-o", spv],
-                    ["spirv-val", "--target-env", "vulkan1.2", spv],
-                ],
-            )
+            assemble, validate = [call.args[0] for call in run_mock.call_args_list]
+            staged = Path(assemble[-1])
+            staged_asm = staged.with_suffix(".spvasm")
+            self.assertEqual(assemble, ["spirv-as", "--target-env", "vulkan1.2", str(staged_asm), "-o", str(staged)])
+            self.assertEqual(validate, ["spirv-val", "--target-env", "vulkan1.2", str(staged)])
+            self.assertTrue(Path(asm).is_file())
+            self.assertEqual(staged.name, Path(spv).name)
+            self.assertEqual(staged.parent.parent, Path(tmp))
+            self.assertEqual(Path(spv).read_bytes(), b"synthetic binary")
 
     def test_spirv_as_failure_raises_runtime_error_and_stops(self):
         index = {"ps_a": {"stage": "ps", "inputs": [0], "bary_fallback_input": {"location": 1}}}
@@ -531,6 +543,31 @@ class TestBuildForIndex(unittest.TestCase):
             self.assertIn("val out", msg)
             self.assertIn("invalid spirv", msg)
             self.assertEqual(run_mock.call_count, 2)
+
+    @unittest.skipUnless(shutil.which("spirv-as") and shutil.which("spirv-val"), "needs SPIRV-Tools")
+    def test_invalid_rebuild_preserves_the_validated_pair(self) -> None:
+        index = {"ps_a": {"stage": "ps", "inputs": [0], "bary_fallback_input": {"location": 1}}}
+        with tempfile.TemporaryDirectory() as tmp:
+            self._write_index(tmp, index)
+            built, = bary_fallback_gs.build_for_index(tmp)
+            published = Path(built)
+            published_asm = published.with_suffix(".spvasm")
+            original = published.read_bytes()
+            original_asm = published_asm.read_bytes()
+            valid = bary_fallback_gs.gs_spvasm([0], 1)
+            invalid = valid.replace("OpStore %out_bary %bary0", "OpStore %out_bary %f1")
+            self.assertNotEqual(invalid, valid)
+            with mock.patch.object(bary_fallback_gs, "gs_spvasm", return_value=invalid):
+                with self.assertRaisesRegex(RuntimeError, "spirv-val failed"):
+                    bary_fallback_gs.build_for_index(tmp)
+            self.assertEqual(published.read_bytes(), original)
+            self.assertEqual(published_asm.read_bytes(), original_asm)
+            subprocess.run(["spirv-val", "--target-env", "vulkan1.2", published], check=True)
+            with tempfile.TemporaryDirectory() as verification:
+                reassembled = Path(verification) / published.name
+                subprocess.run(["spirv-as", "--target-env", "vulkan1.2", published_asm, "-o", reassembled], check=True)
+                self.assertEqual(reassembled.read_bytes(), original)
+            self.assertEqual(sorted(os.listdir(tmp)), ["index.json", "ps_a.bary_gs.spv", "ps_a.bary_gs.spvasm"])
 
     def test_missing_spirv_binaries_raise_file_not_found(self):
         index = {"ps_a": {"stage": "ps", "inputs": [0], "bary_fallback_input": {"location": 1}}}
@@ -595,7 +632,7 @@ class TestMainAndCLI(unittest.TestCase):
             with mock.patch.object(
                 bary_fallback_gs.subprocess,
                 "run",
-                return_value=subprocess.CompletedProcess([], 0, "", ""),
+                side_effect=_successful_spirv_tools,
             ):
                 code, out, err = self._call_main(["bary_fallback_gs.py", tmp])
                 self.assertEqual(code, 0)
