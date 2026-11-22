@@ -7144,7 +7144,7 @@ class Gen:
         gather_border); a literal S# with a half-border mode (4, 5), or that sets FORCE_UNNORMALIZED, is Unsupported:
         the four fetches can't reproduce it. A run-time S# can't be judged at translation time, so modes 4 and 5 are
         treated as clamp-to-edge there, and FORCE_UNNORMALIZED (bit 15) is not applied (the two remaining
-        approximations)."""
+        approximations, with gather_border_one's table colour at run time)."""
         if s_op["k"] != "sgpr" or s_op.get("n", 1) < 4:
             raise Unsupported("descriptor operand")
         lit = self.sgpr_imm.get(s_op["r"])
