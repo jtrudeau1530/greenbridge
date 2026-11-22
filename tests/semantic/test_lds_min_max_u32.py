@@ -348,5 +348,145 @@ class TestSymbolicAST(unittest.TestCase):
                 self.assertEqual(inst, parsed)
 
 
+class ScalarThreadState:
+    """Architectural state of a single scalar thread executing LDS instructions."""
+
+    def __init__(self, lds: Optional[LDSMemory] = None) -> None:
+        self.vgprs: List[int] = [0] * 256
+        self.lds: LDSMemory = lds if lds is not None else LDSMemory()
+
+    def get_vgpr(self, reg: VGPR) -> int:
+        """Read a 32-bit register value."""
+        return self.vgprs[reg.index] & MASK32
+
+    def set_vgpr(self, reg: VGPR, val: int) -> None:
+        """Write a 32-bit register value."""
+        self.vgprs[reg.index] = val & MASK32
+
+
+class ScalarDSInterpreter:
+    """Deterministic scalar instruction interpreter for RDNA2 DS min/max u32 opcodes."""
+
+    def execute(self, state: ScalarThreadState, inst: DSMinMaxU32Instruction) -> Optional[int]:
+        """Execute a single DS min/max instruction on the scalar thread state."""
+        addr = state.get_vgpr(inst.vaddr)
+        data = state.get_vgpr(inst.vdata)
+
+        if inst.opcode.is_min:
+            old_val = state.lds.atomic_min_u32(addr, data, offset=inst.offset.value)
+        elif inst.opcode.is_max:
+            old_val = state.lds.atomic_max_u32(addr, data, offset=inst.offset.value)
+        else:
+            raise ValueError(f"Unsupported opcode: {inst.opcode}")
+
+        if inst.opcode.is_return:
+            assert inst.vdst is not None
+            state.set_vgpr(inst.vdst, old_val)
+            return old_val
+        return None
+
+
+class TestScalarInterpreter(unittest.TestCase):
+    """Unit tests for deterministic scalar instruction execution of DS min/max u32."""
+
+    def setUp(self) -> None:
+        self.lds = LDSMemory(65536)
+        self.state = ScalarThreadState(lds=self.lds)
+        self.interp = ScalarDSInterpreter()
+
+    def test_scalar_ds_min_u32_non_returning(self) -> None:
+        self.lds.write_dword(5, 100)
+        self.state.set_vgpr(VGPR(1), 20)  # dword 5
+        self.state.set_vgpr(VGPR(2), 25)
+
+        inst = DSMinMaxU32Instruction(DSOpcode.DS_MIN_U32, vaddr=VGPR(1), vdata=VGPR(2))
+        res = self.interp.execute(self.state, inst)
+
+        self.assertIsNone(res)
+        self.assertEqual(self.lds.read_dword(5), 25)
+        self.assertEqual(self.state.get_vgpr(VGPR(1)), 20)
+        self.assertEqual(self.state.get_vgpr(VGPR(2)), 25)
+
+    def test_scalar_ds_max_u32_non_returning(self) -> None:
+        self.lds.write_dword(8, 10)
+        self.state.set_vgpr(VGPR(1), 32)  # dword 8
+        self.state.set_vgpr(VGPR(2), 80)
+
+        inst = DSMinMaxU32Instruction(DSOpcode.DS_MAX_U32, vaddr=VGPR(1), vdata=VGPR(2))
+        res = self.interp.execute(self.state, inst)
+
+        self.assertIsNone(res)
+        self.assertEqual(self.lds.read_dword(8), 80)
+
+    def test_scalar_ds_min_rtn_u32_returning(self) -> None:
+        self.lds.write_dword(12, 500)
+        self.state.set_vgpr(VGPR(1), 48)  # dword 12
+        self.state.set_vgpr(VGPR(2), 200)
+        self.state.set_vgpr(VGPR(0), 0xDEADBEEF)
+
+        inst = DSMinMaxU32Instruction(DSOpcode.DS_MIN_RTN_U32, vaddr=VGPR(1), vdata=VGPR(2), vdst=VGPR(0))
+        res = self.interp.execute(self.state, inst)
+
+        self.assertEqual(res, 500)
+        self.assertEqual(self.state.get_vgpr(VGPR(0)), 500)
+        self.assertEqual(self.lds.read_dword(12), 200)
+
+    def test_scalar_ds_max_rtn_u32_returning(self) -> None:
+        self.lds.write_dword(15, 20)
+        self.state.set_vgpr(VGPR(1), 60)  # dword 15
+        self.state.set_vgpr(VGPR(2), 100)
+        self.state.set_vgpr(VGPR(5), 0)
+
+        inst = DSMinMaxU32Instruction(DSOpcode.DS_MAX_RTN_U32, vaddr=VGPR(1), vdata=VGPR(2), vdst=VGPR(5))
+        res = self.interp.execute(self.state, inst)
+
+        self.assertEqual(res, 20)
+        self.assertEqual(self.state.get_vgpr(VGPR(5)), 20)
+        self.assertEqual(self.lds.read_dword(15), 100)
+
+    def test_scalar_offset_and_unaligned_address(self) -> None:
+        self.lds.write_dword(20, 1000)
+        self.state.set_vgpr(VGPR(1), 65)  # byte 65 (unaligned) + offset 15 = 80 -> dword 20
+        self.state.set_vgpr(VGPR(2), 250)
+
+        inst = DSMinMaxU32Instruction(
+            DSOpcode.DS_MIN_RTN_U32,
+            vaddr=VGPR(1),
+            vdata=VGPR(2),
+            vdst=VGPR(3),
+            offset=OffsetImmediate(15),
+        )
+        self.interp.execute(self.state, inst)
+
+        self.assertEqual(self.state.get_vgpr(VGPR(3)), 1000)
+        self.assertEqual(self.lds.read_dword(20), 250)
+
+    def test_sequential_atomic_chain(self) -> None:
+        self.lds.write_dword(0, 100)
+        self.state.set_vgpr(VGPR(1), 0)
+
+        # min with 150 -> remains 100
+        self.state.set_vgpr(VGPR(2), 150)
+        self.interp.execute(self.state, DSMinMaxU32Instruction(DSOpcode.DS_MIN_U32, VGPR(1), VGPR(2)))
+        self.assertEqual(self.lds.read_dword(0), 100)
+
+        # min with 30 -> becomes 30
+        self.state.set_vgpr(VGPR(2), 30)
+        self.interp.execute(self.state, DSMinMaxU32Instruction(DSOpcode.DS_MIN_U32, VGPR(1), VGPR(2)))
+        self.assertEqual(self.lds.read_dword(0), 30)
+
+        # max with 70 -> becomes 70
+        self.state.set_vgpr(VGPR(2), 70)
+        self.interp.execute(self.state, DSMinMaxU32Instruction(DSOpcode.DS_MAX_U32, VGPR(1), VGPR(2)))
+        self.assertEqual(self.lds.read_dword(0), 70)
+
+        # max rtn with 20 -> remains 70, returns 70
+        self.state.set_vgpr(VGPR(2), 20)
+        ret = self.interp.execute(self.state, DSMinMaxU32Instruction(DSOpcode.DS_MAX_RTN_U32, VGPR(1), VGPR(2), vdst=VGPR(4)))
+        self.assertEqual(ret, 70)
+        self.assertEqual(self.state.get_vgpr(VGPR(4)), 70)
+        self.assertEqual(self.lds.read_dword(0), 70)
+
+
 if __name__ == "__main__":
     unittest.main()
