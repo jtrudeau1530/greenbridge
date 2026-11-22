@@ -49,18 +49,41 @@ def _section_word(offset, fmt):
     return ((offset // 2) << 8) | fmt
 
 
-def _skin_buffer(j0, j1, w0, w1, *, omit_slot=None):
-    """Graphics buffer with the measured 23-word section header and 4-byte rows."""
-    offsets = {6: 0x100, 7: 0x110, 8: 0x120, 9: 0x130}
-    formats = {6: 0x26, 7: 0x26, 8: 0x25, 9: 0x25}
+def _skin_buffer(j0, j1, w0, w1, *, omit_slot=None, formats=None, offsets=None, size=0x160):
+    """Graphics buffer with the measured 23-word section header and per-slot rows."""
+    formats = {6: 0x26, 7: 0x26, 8: 0x25, 9: 0x25, **(formats or {})}
+    offsets = {6: 0x100, 7: 0x110, 8: 0x120, 9: 0x130, **(offsets or {})}
     data = {6: w0, 7: w1, 8: j0, 9: j1}
-    blob = bytearray(0x160)
+    blob = bytearray(size)
     for slot in (6, 7, 8, 9):
         if slot == omit_slot:
             continue
         struct.pack_into("<I", blob, slot * 4, _section_word(offsets[slot], formats[slot]))
-        blob[offsets[slot]:offsets[slot] + len(data[slot])] = data[slot]
+        end = offsets[slot] + len(data[slot])
+        if end > len(blob):
+            raise ValueError("test skin stream does not fit its buffer")
+        blob[offsets[slot]:end] = data[slot]
     return bytes(blob)
+
+
+def _packed_indices(rows):
+    """Pack four u8 joint indices per vertex into the 0x8C four-u32 layout.
+
+    Bits 12-31 get a recognisable pattern so a decoder that reads them fails.
+    """
+    return b"".join(
+        struct.pack("<4I", *(0xA5CF0000 | index for index in row)) for row in rows
+    )
+
+
+def _packed_buffer(j0_rows, j1_rows):
+    _j0, _j1, w0, w1 = _streams()
+    return _skin_buffer(
+        _packed_indices(j0_rows), _packed_indices(j1_rows), w0, w1,
+        formats={8: 0x8C, 9: 0x8C},
+        offsets={8: 0x120, 9: 0x160},
+        size=0x1A0,
+    )
 
 
 def _skeleton():
@@ -89,12 +112,14 @@ def _streams():
     return j0, j1, w0, w1
 
 
-def _component(root, *, own_skeleton=None, omit_slot=None):
+def _component(root, *, own_skeleton=None, omit_slot=None, buffer=None):
     directory = os.path.join(root, "component")
     os.makedirs(os.path.join(directory, "buffers"))
-    j0, j1, w0, w1 = _streams()
+    if buffer is None:
+        j0, j1, w0, w1 = _streams()
+        buffer = _skin_buffer(j0, j1, w0, w1, omit_slot=omit_slot)
     with open(os.path.join(directory, "buffers", "01_0.bin"), "wb") as handle:
-        handle.write(_skin_buffer(j0, j1, w0, w1, omit_slot=omit_slot))
+        handle.write(buffer)
     _write_glb(os.path.join(directory, "model.glb"))
     model = {
         "buffer_files": ["buffers/01_0.bin"],
@@ -102,7 +127,7 @@ def _component(root, *, own_skeleton=None, omit_slot=None):
         "vertex_count": 3,
         "drawable": {
             "name": "synthetic",
-            "buffers": [{"bytes": 0x160, "gfx_off": 0}],
+            "buffers": [{"bytes": len(buffer), "gfx_off": 0}],
             "geometries": [{"vertex_buffer": 0, "index_buffer": 0}],
             "models": [{"bone_palette": _palette()}],
             "strings": ["GM_TEST_L_UpperArm01_O"],
@@ -120,6 +145,11 @@ def _component(root, *, own_skeleton=None, omit_slot=None):
         model["drawable"]["skeleton"] = own_skeleton
     _write_json(os.path.join(directory, "model.json"), model)
     return directory
+
+
+def _read_model(directory):
+    with open(os.path.join(directory, "model.json"), encoding="utf-8") as handle:
+        return json.load(handle)
 
 
 def _skeleton_dir(root):
@@ -285,6 +315,38 @@ class SkinnedGlbTest(unittest.TestCase):
         w0, _ = _accessor(gltf, binary, primitive["attributes"]["WEIGHTS_0"])
         for vertex in range(3):
             self.assertAlmostEqual(sum(struct.unpack_from("<4f", w0, 16 * vertex)), 1.0, places=6)
+
+    def test_packed_joint_stream_decodes_to_four_u8_indices(self):
+        j0_rows = [(1, 2, 0, 0), (1, 2, 0, 0), (2, 1, 0, 0)]
+        j1_rows = [(3, 0, 0, 0)] * 3
+        component = _component(self.root, buffer=_packed_buffer(j0_rows, j1_rows))
+        model = _read_model(component)
+        streams = skinned_glb.read_skin_streams(component, model, model["meshes"][0])
+        self.assertEqual(streams["j0"], bytes([1, 2, 0, 0, 1, 2, 0, 0, 2, 1, 0, 0]))
+        self.assertEqual(streams["j1"], bytes([3, 0, 0, 0] * 3))
+
+    def test_packed_joint_index_above_u8_is_rejected(self):
+        j0_rows = [(1, 2, 0, 0), (1, 2, 0, 0), (256, 0, 0, 0)]
+        j1_rows = [(3, 0, 0, 0)] * 3
+        component = _component(self.root, buffer=_packed_buffer(j0_rows, j1_rows))
+        model = _read_model(component)
+        with self.assertRaisesRegex(skinned_glb.SkinError, "does not fit u8"):
+            skinned_glb.read_skin_streams(component, model, model["meshes"][0])
+
+    def test_short_packed_joint_stream_is_rejected(self):
+        j0 = _packed_indices([(1, 2, 0, 0)] * 3)[:47]
+        j1 = _packed_indices([(3, 0, 0, 0)] * 3)
+        _j0, _j1, w0, w1 = _streams()
+        buffer = _skin_buffer(
+            j0, j1, w0, w1,
+            formats={8: 0x8C, 9: 0x8C},
+            offsets={8: 0x150, 9: 0x120},
+            size=0x17F,
+        )
+        component = _component(self.root, buffer=buffer)
+        model = _read_model(component)
+        with self.assertRaisesRegex(skinned_glb.SkinError, "outside its graphics buffer"):
+            skinned_glb.read_skin_streams(component, model, model["meshes"][0])
 
     def test_missing_joint_stream_is_rejected(self):
         component = _component(self.root, omit_slot=8)

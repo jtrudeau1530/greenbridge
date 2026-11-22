@@ -34,6 +34,11 @@ jacket 6      WEIGHTS_0                       196,488   0x26        39,272
 jacket 7      WEIGHTS_1                       235,760   0x26        39,272
 =====  =====  ==============================  ========  ==========  =====
 
+Slots 8/9 may also use the packed layout, format ``0x8C``: 16 bytes per vertex,
+four little-endian u32 words whose low 12 bits are the joint index. The reader
+converts each vertex to the same 4 x u8 row as ``0x25`` and rejects an index
+above 255.
+
 The joint index is local to the drawable model's own palette: a sorted ``u32``
 joaat32 array at ``grmModel + 0x20`` with its length at ``grmModel + 0x0C``. The
 ped skeleton bind pose is ``drawable.skeleton[].bind_matrix`` from a decoded
@@ -85,6 +90,7 @@ COMPONENT_FLOAT = 5126
 JOINT_SLOTS = (8, 9)
 WEIGHT_SLOTS = (6, 7)
 INDEX_FORMAT = 0x25   # R8G8B8A8_UINT, one 4-byte element per vertex
+PACKED_INDEX_FORMAT = 0x8C  # R32G32B32A32_UINT, 16-byte element, index in bits 0..11
 WEIGHT_FORMAT = 0x26  # R8G8B8A8_UNORM
 COMPONENT_SIZES = {5120: 1, 5121: 1, 5122: 2, 5123: 2, 5125: 4, 5126: 4}
 TYPE_COMPONENTS = {"SCALAR": 1, "VEC2": 2, "VEC3": 3, "VEC4": 4, "MAT4": 16}
@@ -208,11 +214,34 @@ def model_json_path(path: str) -> tuple[str, str]:
     raise SkinError(f"{path}: expected a decoded model directory or its model.json")
 
 
+def _stream_bytes(blob: bytes, base: int, offset: int, size: int, slot: int) -> bytes:
+    """Slice a section at ``base + offset``, rejecting a short graphics buffer."""
+    start = base + offset
+    end = start + size
+    if start < base or end > len(blob):
+        raise SkinError(f"skin stream slot {slot} is outside its graphics buffer")
+    return blob[start:end]
+
+
+def _unpack_packed_joints(data: bytes, slot: int) -> bytes:
+    """Convert four packed u32 joint words per vertex to four u8 indices."""
+    out = bytearray()
+    for at in range(0, len(data), 16):
+        for word in struct.unpack_from("<4I", data, at):
+            index = word & 0xFFF
+            if index > 0xFF:
+                raise SkinError(f"skin stream slot {slot} joint index {index} does not fit u8")
+            out.append(index)
+    return bytes(out)
+
+
 def read_skin_streams(model_dir: str, model: dict, mesh: dict) -> dict:
     """Read one mesh's JOINTS_0/1 and WEIGHTS_0/1 streams.
 
-    Returns the four raw byte rows plus the vertex count, local palette length and
-    measured section table. The caller still maps local indices to GLB joints.
+    Joint slots accept the 4 x u8 layout (``0x25``) and the packed 4 x u32 layout
+    (``0x8C``); both become 4 x u8 per vertex. Returns the four raw byte rows plus the
+    vertex count, local palette length and measured section table. The caller still
+    maps local indices to GLB joints.
     """
     drawable = model.get("drawable")
     if not isinstance(drawable, dict):
@@ -277,16 +306,23 @@ def read_skin_streams(model_dir: str, model: dict, mesh: dict) -> dict:
         if slot not in sections:
             continue
         offset, fmt = sections[slot]
-        expected = WEIGHT_FORMAT if slot in WEIGHT_SLOTS else INDEX_FORMAT
-        if fmt != expected:
+        if slot in WEIGHT_SLOTS:
+            if fmt != WEIGHT_FORMAT:
+                raise SkinError(
+                    f"skin stream slot {slot} has format 0x{fmt:02x}; "
+                    f"expected 0x{WEIGHT_FORMAT:02x}"
+                )
+            rows[slot] = _stream_bytes(blob, base, offset, 4 * vertex_count, slot)
+        elif fmt == INDEX_FORMAT:
+            rows[slot] = _stream_bytes(blob, base, offset, 4 * vertex_count, slot)
+        elif fmt == PACKED_INDEX_FORMAT:
+            packed = _stream_bytes(blob, base, offset, 16 * vertex_count, slot)
+            rows[slot] = _unpack_packed_joints(packed, slot)
+        else:
             raise SkinError(
-                f"skin stream slot {slot} has format 0x{fmt:02x}; expected 0x{expected:02x}"
+                f"skin stream slot {slot} has format 0x{fmt:02x}; "
+                f"expected 0x{INDEX_FORMAT:02x} or 0x{PACKED_INDEX_FORMAT:02x}"
             )
-        start = base + offset
-        end = start + 4 * vertex_count
-        if start < base or end > len(blob):
-            raise SkinError(f"skin stream slot {slot} is outside its graphics buffer")
-        rows[slot] = blob[start:end]
 
     return {
         "j0": rows[8],
