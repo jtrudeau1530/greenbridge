@@ -239,6 +239,117 @@ def ref_v_pk_fma_clamp_f16(
     return pack_f16x2(res_lo, res_hi)
 
 
+# -----------------------------------------------------------------------------
+# Symbolic AST Opcode Definitions and Typed Expressions
+# -----------------------------------------------------------------------------
+
+class RegType(enum.Enum):
+    """Architecture register classification."""
+    VGPR = "v"
+    SGPR = "s"
+    LITERAL = "lit"
+    INLINE_CONST = "k"
+
+
+@dataclass(frozen=True)
+class Reg:
+    """Architectural register designator."""
+    index: int
+    reg_type: RegType = RegType.VGPR
+
+    def __post_init__(self) -> None:
+        if self.reg_type == RegType.VGPR:
+            if not (0 <= self.index <= 255):
+                raise ValueError(f"VGPR index out of valid architectural range [0, 255]: {self.index}")
+        elif self.reg_type == RegType.SGPR:
+            if not (0 <= self.index <= 105):
+                raise ValueError(f"SGPR index out of valid architectural range [0, 105]: {self.index}")
+
+    def __str__(self) -> str:
+        return f"{self.reg_type.value}{self.index}"
+
+
+@dataclass(frozen=True)
+class VOP3POperand:
+    """Typed operand for VOP3P 3-source vector instructions."""
+    reg: Optional[Reg] = None
+    literal_val: Optional[int] = None
+    inline_val: Optional[float] = None
+
+    def __post_init__(self) -> None:
+        sources = [self.reg is not None, self.literal_val is not None, self.inline_val is not None]
+        if sum(sources) != 1:
+            raise ValueError("VOP3POperand must have exactly one source (reg, literal_val, or inline_val)")
+
+    @property
+    def is_vgpr(self) -> bool:
+        return self.reg is not None and self.reg.reg_type == RegType.VGPR
+
+    @property
+    def is_sgpr(self) -> bool:
+        return self.reg is not None and self.reg.reg_type == RegType.SGPR
+
+    @property
+    def is_literal(self) -> bool:
+        return self.literal_val is not None
+
+    @property
+    def is_inline_const(self) -> bool:
+        return self.inline_val is not None
+
+    def __str__(self) -> str:
+        if self.reg is not None:
+            return str(self.reg)
+        if self.literal_val is not None:
+            return f"0x{self.literal_val:08x}"
+        return f"{self.inline_val}"
+
+
+@dataclass(frozen=True)
+class VPkFmaClampF16Instruction:
+    """Symbolic AST node representing AMD RDNA2 v_pk_fma_clamp_f16 instruction."""
+    dst: Reg
+    src0: VOP3POperand
+    src1: VOP3POperand
+    src2: VOP3POperand
+    op_sel: Tuple[int, int, int] = (0, 0, 0)
+    op_sel_hi: Tuple[int, int, int] = (1, 1, 1)
+    neg_lo: Tuple[int, int, int] = (0, 0, 0)
+    neg_hi: Tuple[int, int, int] = (0, 0, 0)
+    clamp: bool = True
+
+    def __post_init__(self) -> None:
+        if self.dst.reg_type != RegType.VGPR:
+            raise ValueError(f"Destination must be a VGPR, got {self.dst}")
+        for name, triplet in [
+            ("op_sel", self.op_sel),
+            ("op_sel_hi", self.op_sel_hi),
+            ("neg_lo", self.neg_lo),
+            ("neg_hi", self.neg_hi),
+        ]:
+            if len(triplet) != 3 or not all(x in (0, 1) for x in triplet):
+                raise ValueError(f"{name} modifier must be a tuple of 3 binary digits (0 or 1), got {triplet}")
+
+    def disasm(self) -> str:
+        """Format symbolic instruction into standard RDNA2 disassembly text."""
+        parts = [f"v_pk_fma_f16 {self.dst}, {self.src0}, {self.src1}, {self.src2}"]
+        if self.op_sel != (0, 0, 0):
+            parts.append(f"op_sel:[{self.op_sel[0]},{self.op_sel[1]},{self.op_sel[2]}]")
+        if self.op_sel_hi != (1, 1, 1):
+            parts.append(f"op_sel_hi:[{self.op_sel_hi[0]},{self.op_sel_hi[1]},{self.op_sel_hi[2]}]")
+        if self.neg_lo != (0, 0, 0):
+            parts.append(f"neg_lo:[{self.neg_lo[0]},{self.neg_lo[1]},{self.neg_lo[2]}]")
+        if self.neg_hi != (0, 0, 0):
+            parts.append(f"neg_hi:[{self.neg_hi[0]},{self.neg_hi[1]},{self.neg_hi[2]}]")
+        if self.clamp:
+            parts.append("clamp")
+        return " ".join(parts)
+
+
+# -----------------------------------------------------------------------------
+# Unit Tests
+# -----------------------------------------------------------------------------
+
 class TestReferenceOracleAndArchitecturalModel(unittest.TestCase):
     """Test suite for reference mathematical oracle and architectural model."""
 
@@ -292,6 +403,61 @@ class TestReferenceOracleAndArchitecturalModel(unittest.TestCase):
         )
         res_lo, _ = unpack_f16x2(res)
         self.assertEqual(res_lo, F16_POS_ZERO)
+
+
+class TestSymbolicASTDefinitions(unittest.TestCase):
+    """Test suite for symbolic AST opcode definitions and typed expressions."""
+
+    def test_reg_bounds_and_formatting(self) -> None:
+        v0 = Reg(0, RegType.VGPR)
+        v255 = Reg(255, RegType.VGPR)
+        s105 = Reg(105, RegType.SGPR)
+        self.assertEqual(str(v0), "v0")
+        self.assertEqual(str(v255), "v255")
+        self.assertEqual(str(s105), "s105")
+
+        with self.assertRaises(ValueError):
+            Reg(256, RegType.VGPR)
+        with self.assertRaises(ValueError):
+            Reg(106, RegType.SGPR)
+
+    def test_operand_creation_and_predicates(self) -> None:
+        op_vgpr = VOP3POperand(reg=Reg(5, RegType.VGPR))
+        op_sgpr = VOP3POperand(reg=Reg(10, RegType.SGPR))
+        op_lit = VOP3POperand(literal_val=0x3C003C00)
+        op_k = VOP3POperand(inline_val=1.0)
+
+        self.assertTrue(op_vgpr.is_vgpr)
+        self.assertTrue(op_sgpr.is_sgpr)
+        self.assertTrue(op_lit.is_literal)
+        self.assertTrue(op_k.is_inline_const)
+
+    def test_instruction_disassembly(self) -> None:
+        instr_default = VPkFmaClampF16Instruction(
+            dst=Reg(0, RegType.VGPR),
+            src0=VOP3POperand(reg=Reg(1, RegType.VGPR)),
+            src1=VOP3POperand(reg=Reg(2, RegType.VGPR)),
+            src2=VOP3POperand(reg=Reg(3, RegType.VGPR)),
+        )
+        self.assertEqual(instr_default.disasm(), "v_pk_fma_f16 v0, v1, v2, v3 clamp")
+
+    def test_instruction_validation(self) -> None:
+        with self.assertRaises(ValueError):
+            VPkFmaClampF16Instruction(
+                dst=Reg(0, RegType.SGPR),
+                src0=VOP3POperand(reg=Reg(1, RegType.VGPR)),
+                src1=VOP3POperand(reg=Reg(2, RegType.VGPR)),
+                src2=VOP3POperand(reg=Reg(3, RegType.VGPR)),
+            )
+
+        with self.assertRaises(ValueError):
+            VPkFmaClampF16Instruction(
+                dst=Reg(0, RegType.VGPR),
+                src0=VOP3POperand(reg=Reg(1, RegType.VGPR)),
+                src1=VOP3POperand(reg=Reg(2, RegType.VGPR)),
+                src2=VOP3POperand(reg=Reg(3, RegType.VGPR)),
+                op_sel=(0, 0),  # wrong length (needs 3)
+            )
 
 
 if __name__ == "__main__":
