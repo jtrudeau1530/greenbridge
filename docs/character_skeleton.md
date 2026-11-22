@@ -256,8 +256,15 @@ The model binding is also decoded. `PERSCHARS_INFO` (`data.rpf@0x1AA5F000`, reco
 (`packs.rpf@0x11D1FF000`, record 1219) maps that link to `cs_mandy` (`0xD7C0CDFF`). `cs_mandy`
 is a live model id — a `story000.rpf` cutscene actor/voice table uses it — but there is **no
 named `cs_mandy` drawable**. Its 64-bit `ModelName` is `0x009B33B7D7C0CDFF`, and its `FragName`
-`0xC9888B65009B33B7` is byte-identical to `cs_lucia` and `cs_monalisa`: the shared female
-cutscene-ped fragment set. The realistic full-body in that family is `cs_lucia_legacypedcs`
+`0xC9888B65009B33B7` is the shared female cutscene base, carried by **904** female rows:
+`player_story000_00` (Lucia's model id `0xE472B687`), `cs_monalisa` (`0x9CB9BCC6`) and
+`cs_mandy` (`0xD7C0CDFF`), plus 901 others. No ped-model row carries `joaat("cs_lucia")`
+(`0x95F1E309`); that is a name prefix, not a model id. A second base
+`0x0A704516C676E805` is shared by `cs_shanese` (`0x3570D92E`) and 11 unnamed female rows, and
+8 female models have wholly model-specific fragments. None resolves to a name, and neither
+table contains an adult-token, `mp_f_*`, `nude`, `topless`, `stripper`, `prostitute`, `dancer`,
+`escort`, `hooker`, `swim`, `lingerie` or `club` female model. The realistic full-body in the
+shared base is `cs_lucia_legacypedcs`
 (874 v), so Mandy uses the same body as Lucia. Her nine-entry variation table has 18 u32 hashes;
 16 are unique to her. A deeper search — 373,484 shipped names / 725,869 normalised variants plus
 about 25 million generated strings — gives **0/18** exact matches. The sibling nine-entry table
