@@ -968,8 +968,8 @@ bool image_descriptor(const Resource& resource, const TextureView& view, leonida
         log_once("view type incompatible with texture dimension or sample count; view type", int(view.type));
         return false;
     }
-    if (volume && (view.min_lod != 0 || (desc.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE))) {
-        log_once("volume SRV requires shader access and a zero ResourceMinLODClamp; flags", int(desc.Flags));
+    if (volume && view.min_lod != 0) {
+        log_once("volume SRV requires a zero ResourceMinLODClamp; format", int(desc.Format));
         return false;
     }
     VkFormat named = resource.format();
@@ -1570,6 +1570,10 @@ public:
             return;
         }
         if (!r->image()) return stub("ID3D12Device::CreateShaderResourceView(buffer)");
+        if (r->desc().Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) {
+            log_once("shader-resource view denied by resource flags; format", int(r->desc().Format));
+            return;
+        }
         TextureView view{};
         if (!desc) {
             if (r->desc().Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D)
