@@ -317,6 +317,17 @@ python -I tools/bvh_rehydrate.py <bvh4 stream> --header-offset 256 --geom ... --
 python -I tests/test_bvh_rehydrate.py
 ```
 
+`tools/bvh_geometry_check.py` says whether the geometry given to a rehydration is the geometry the BLAS was built
+from, using what the dehydrated stream stores (§4a): leaves inside and equal to `sceneBounds`, stored box overrides
+consistent with the rehydrated slots, and paired leaves sharing an edge in the index buffer, which needs no positions.
+On the 8 samples the right geometry passes every check and a wrong decode fails (175 of 181 leaves outside, or 11 of
+23 overrides inconsistent).
+
+```powershell
+python -I tools/bvh_geometry_check.py <dehydrated.bin> --geom <vertices.f32>[,<indices.u32>] [--json report.json]
+python -I tests/test_bvh_geometry_check.py
+```
+
 ## 7a. Building runtime BVHs: `tools/xdxr_bvh.py`
 
 The Vulkan layer has to write acceleration structures in this runtime layout, because the game's traversal shaders
