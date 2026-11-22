@@ -322,6 +322,27 @@ class CpuRefTest(unittest.TestCase):
         """, lane=1, sgpr={2: 0x00000002})
         self.assertEqual(self.vgpr(r, 2), 0x22222222)
 
+    def test_cndmask_e64_abs_and_neg_modify_bit31(self):
+        # FUZZ-20, measured natively on RDNA2 (gfx1035): VOP3 abs/neg on v_cndmask_b32_e64 clear/flip bit 31
+        # (float sign-bit moves, abs first then neg), not two's-complement integer abs/negate.
+        r = self.execute("""
+            v_mov_b32 v0, 0x80000005
+            v_mov_b32 v1, 0x00000005
+            v_mov_b32 v2, 0x12345678
+            s_mov_b32 s2, -1
+            v_cndmask_b32_e64 v3, v2, -v0, s2
+            v_cndmask_b32_e64 v4, v2, |v0|, s2
+            v_cndmask_b32_e64 v5, v2, -|v0|, s2
+            v_cndmask_b32_e64 v6, v2, -v1, s2
+            v_cndmask_b32_e64 v7, -v0, v2, 0
+            s_endpgm
+        """)
+        self.assertEqual(self.vgpr(r, 3), 0x00000005)
+        self.assertEqual(self.vgpr(r, 4), 0x00000005)
+        self.assertEqual(self.vgpr(r, 5), 0x80000005)
+        self.assertEqual(self.vgpr(r, 6), 0x80000005)
+        self.assertEqual(self.vgpr(r, 7), 0x00000005)
+
     def test_cndmask_respects_exec(self):
         r = self.execute("""
             v_mov_b32 v0, 0x11111111

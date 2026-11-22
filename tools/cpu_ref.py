@@ -392,9 +392,9 @@ class Machine:
         else:
             raise Unsupported(arg.get("t", kind), self.pc, "operand kind is not modelled")
         if arg.get("abs"):
-            value = abs(value - (1 << 32)) if value & SIGN32 else value
+            value &= 0x7FFFFFFF
         if arg.get("neg"):
-            value = (-value) & MASK32
+            value ^= SIGN32
         return value & MASK32
 
     def _float_src(self, arg, lane):
