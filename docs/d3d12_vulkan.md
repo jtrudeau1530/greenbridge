@@ -706,6 +706,15 @@ and any validation error fails them.
   slot probed, the fallback after the key is erased, the gradient again after the table has grown into a new
   buffer, another view at the same index, and the fallback after removal, with and without the
   descriptor-indexing flags. Last, it draws through a 2D image past 5000 others and a sampler past 2100 others.
+- `vk_sampler_test` (run the same way): the S# and T# mip fields as `gfx10_descriptors.h` maps them. `ps_ssharp.asm`
+  loads a T# and an S# from the heap and samples a 128x128 two-level texture twice, with `image_sample_lz` (LOD 0)
+  and `image_sample` (LOD 1 at this size). The sampler is `vulkan_sampler(decode(S#))` and the view's levels come
+  from `decode(T#)`. `check.py`'s `SAMPLER_CASES` cover a point mip filter, MAX_LOD 0, MIN_LOD 1, LOD_BIAS ±1,
+  MIP_FILTER_NONE with and without MIN_LOD, and a T# whose BASE_LEVEL is 1. Each pixel is judged against levels
+  worked out from the S# and T# bits in Python, independently of the header. On Vulkan, the sampler's minLod and
+  mipLodBias apply to an explicit LOD as well. That this matches the console for `image_sample_lz` and
+  `image_sample_l` is taken from radv, which writes these Vulkan fields straight into the S#; it was not measured
+  on RDNA2 here. The T#'s MIN_LOD (D3D12's ResourceMinLODClamp) is not covered by this test.
 - `d3d12_com_test`: drives the COM objects through their vtables. It also checks that a queue `Wait` on a fence
   the CPU has not signalled holds the GPU back.
 - `dxgi_swapchain_test`: creates a Win32 HWND and exercises `rt::d3d12::create_dxgi_factory`,
