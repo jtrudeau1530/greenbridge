@@ -87,11 +87,13 @@ and the `api-ms-win-core-file-*` sets a GDK title links against.
 - A `GAME:` path (any case, `\` or `/`) maps under `--game-dir`. A path without the prefix is a host path and is
   passed to the host unchanged.
 - An open that can write, and `DeleteFile`, use the overlay: `--overlay DIR`, default `<game-dir>\overlay`. A
-  write-open of a package file copies it into the overlay first, so `OPEN_EXISTING` keeps its bytes; a delete of a
+  write-open of a package file copies it into the overlay first, so `OPEN_EXISTING` keeps its bytes. The copy is
+  written under `<overlay>\.gta6rt-copy` and renamed into place, one copy-up at a time, so a process killed mid-copy
+  or two threads opening the same file never leave a truncated copy under its name; a delete of a
   package file leaves an empty marker under `<overlay>\.gta6rt-deleted`, which reads and listings treat as gone. The
   package is never written.
 - Reads prefer the overlay copy and then the package. `FindFirstFile` merges the two folders, the overlay winning on a
-  name, and hides deleted names and the marker folder.
+  name, and hides deleted names, the marker folder and the copy folder.
 - A path that climbs above `GAME:` with `..`, or names another drive, fails with `ERROR_INVALID_NAME`, so a title
   cannot reach outside the package and the overlay.
 

@@ -45,6 +45,11 @@ constexpr wchar_t kDeletedDir[] = L".gta6rt-deleted";
 // A removed package folder is marked by this file inside its marker folder: the marker folder itself can already
 // exist because files below it were deleted, and that alone does not hide the folder.
 constexpr wchar_t kRemovedDirMarker[] = L".gta6rt-dir";
+// Copy-up writes here first and then renames into place, so a half-copied file never sits under the title's name.
+constexpr wchar_t kCopyDir[] = L".gta6rt-copy";
+
+// The overlay root's own folders, which a title never sees in a listing.
+bool internal_dir(const wchar_t* name) { return _wcsicmp(name, kDeletedDir) == 0 || _wcsicmp(name, kCopyDir) == 0; }
 
 std::mutex g_mutex;
 std::filesystem::path g_game_dir;
@@ -234,7 +239,7 @@ bool empty_in_view(const Roots& r, const std::vector<std::wstring>& parts) {
         const std::filesystem::path p = join(r.overlay, parts);
         for (auto it = std::filesystem::directory_iterator(p, ec); !ec && it != std::filesystem::directory_iterator();
              it.increment(ec)) {
-            if (parts.empty() && same_name(it->path().filename().c_str(), kDeletedDir)) continue;
+            if (parts.empty() && internal_dir(it->path().filename().c_str())) continue;
             return false;
         }
     }
@@ -314,12 +319,32 @@ Target write_target(const std::wstring& path, bool copy_up) {
     // the contents (OPEN_EXISTING, TRUNCATE_EXISTING) has to fail on it instead. CREATE_ALWAYS and CREATE_NEW still
     // make a new overlay file, which reads prefer over the package and so over the marker.
     const std::filesystem::path package_path = join(r.game, parts);
+    // One copy-up at a time: a second thread writing the same file waits here and then finds the first one's copy, so
+    // it neither fails on the taken name nor collides with that file's open through a rename of its own.
+    static std::mutex s_copy_mutex;
+    std::unique_lock copy_lock(s_copy_mutex, std::defer_lock);
+    if (copy_up) copy_lock.lock();
     if (copy_up && !deleted(r.overlay, parts) && !std::filesystem::exists(t.path, ec) &&
         std::filesystem::is_regular_file(package_path, ec)) {
-        std::filesystem::copy_file(package_path, t.path, std::filesystem::copy_options::none, ec);
+        // Copied to a private name, then renamed into place: a process killed mid-copy leaves only a hidden leftover,
+        // not a truncated file that reads would prefer over the package.
+        static unsigned s_copies = 0;  // under s_copy_mutex
+        const std::filesystem::path staging = r.overlay / kCopyDir;
+        std::filesystem::create_directories(staging, ec);
+        const std::filesystem::path tmp =
+            staging / (std::to_wstring(::GetCurrentProcessId()) + L"-" + std::to_wstring(++s_copies));
+        if (!ec) std::filesystem::copy_file(package_path, tmp, std::filesystem::copy_options::overwrite_existing, ec);
         if (ec) {
             t.error = static_cast<DWORD>(ec.value());
+            std::filesystem::remove(tmp, ec);
             return t;
+        }
+        if (!::MoveFileExW(tmp.c_str(), t.path.c_str(), 0)) {
+            // The name taken means the title created the file itself meanwhile (CREATE_NEW and CREATE_ALWAYS don't
+            // copy up, so they don't take the lock); that file is what it wrote, so keep it.
+            const DWORD error = ::GetLastError();
+            std::filesystem::remove(tmp, ec);
+            if (!std::filesystem::exists(t.path, ec)) t.error = error;
         }
     }
     return t;
@@ -395,7 +420,7 @@ bool collect(const std::wstring& pattern, const std::vector<std::wstring>& parts
         const HANDLE h = ::FindFirstFileW(search.c_str(), &found);
         if (h == INVALID_HANDLE_VALUE) return;
         do {
-            if (overlay_root && same_name(found.cFileName, kDeletedDir)) continue;
+            if (overlay_root && internal_dir(found.cFileName)) continue;
             const bool dot = same_name(found.cFileName, L".") || same_name(found.cFileName, L"..");
             if (!overlay_root && !dot) {
                 std::vector<std::wstring> entry_parts = dirs;

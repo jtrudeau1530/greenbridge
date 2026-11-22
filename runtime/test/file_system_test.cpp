@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <filesystem>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "file_system.h"
@@ -605,6 +606,40 @@ int main() {
         check(hfa != INVALID_HANDLE_VALUE && std::string(fda.cFileName) == "cf2.txt",
               "FindFirstFileExA finds an overlay file under GAME:");
         if (hfa != INVALID_HANDLE_VALUE) find_close(hfa);
+    }
+
+    // Copy-up under two threads: both write-open the same untouched package file at once. Each open must succeed and
+    // the overlay copy must hold the package's bytes; the copy goes through a private name, so neither thread can find
+    // the name taken mid-copy or read a half-written file.
+    {
+        const std::string big(256 * 1024, 'p');  // long enough that the two copies overlap
+        bool all_opened = true, all_intact = true;
+        for (int round = 0; round < 50; ++round) {
+            const std::wstring name = L"race" + std::to_wstring(round) + L".bin";
+            write_path(package / "data" / name, big);
+            const std::wstring game = L"GAME:\\data\\" + name;
+            HANDLE handles[2] = {INVALID_HANDLE_VALUE, INVALID_HANDLE_VALUE};
+            std::thread threads[2];
+            for (int i = 0; i < 2; ++i)
+                threads[i] = std::thread([&, i] {
+                    handles[i] = create_w(game.c_str(), GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                          nullptr, OPEN_EXISTING, 0, nullptr);                });
+            for (auto& t : threads) t.join();
+            for (HANDLE h : handles) {
+                if (h == INVALID_HANDLE_VALUE) all_opened = false;
+                else ::CloseHandle(h);
+            }
+            if (read_path(overlay / "data" / name) != big) all_intact = false;
+        }
+        check(all_opened, "two threads write-opening one package file both succeed");
+        check(all_intact, "the overlay copy made under two threads holds the whole package file");
+        std::error_code ec;
+        check(std::filesystem::is_empty(overlay / ".gta6rt-copy", ec) && !ec, "copy-up leaves no staging file behind");
+
+        // A leftover from a process killed mid-copy stays out of the title's view.
+        write_path(overlay / ".gta6rt-copy" / "123-1", "half");
+        check(!contains(list(first_w, next_w, find_close, L"GAME:\\*"), L".gta6rt-copy"),
+              "the copy staging folder is hidden from a GAME: listing");
     }
 
     std::filesystem::remove_all(root);
