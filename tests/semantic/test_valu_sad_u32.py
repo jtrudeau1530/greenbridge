@@ -498,6 +498,38 @@ class SIMDVALUInterpreter:
 
 
 # ==============================================================================
+# Condition Codes, Status Flags, and Carry Generation
+# ==============================================================================
+
+@dataclass(frozen=True)
+class VALUStatusFlags:
+    """Architectural condition codes and status flags for 32-bit ALU operations."""
+    zero: bool
+    sign: bool
+    carry: bool
+    overflow: bool
+
+    @classmethod
+    def from_sad_u32(cls, s0: int, s1: int, s2: int) -> VALUStatusFlags:
+        diff = ref_abs_diff_u32(s0, s1)
+        acc = s2 & MASK32
+        full_sum = diff + acc
+        result = full_sum & MASK32
+
+        zero = (result == 0)
+        sign = bool(result & 0x8000_0000)
+        carry = (full_sum >= 0x1_0000_0000)
+        # Signed overflow between unsigned diff and unsigned acc
+        s_diff = s32(diff)
+        s_acc = s32(acc)
+        s_res = s32(result)
+        overflow = ((s_diff > 0 and s_acc > 0 and s_res < 0) or
+                    (s_diff < 0 and s_acc < 0 and s_res >= 0))
+
+        return cls(zero=zero, sign=sign, carry=carry, overflow=overflow)
+
+
+# ==============================================================================
 # Unit Tests
 # ==============================================================================
 
@@ -973,6 +1005,64 @@ class TestValuSadU32RegisterAliasing(unittest.TestCase):
         self.assertEqual(self.rf.vgprs[4], 308)
         self.assertEqual(self.rf.vgprs[5], 412)
         self.assertEqual(self.rf.vgprs[1], 0x0403_0201)
+
+
+class TestValuSadU32StatusFlags(unittest.TestCase):
+    """Unit tests for condition codes, status flags, and carry generation."""
+
+    def test_carry_flag_matches_v_sad_hi_u32(self) -> None:
+        test_inputs = [
+            (0, 0, 0),
+            (10, 5, 20),
+            (0, MASK32, 0),
+            (0, MASK32, 1),
+            (0, MASK32, MASK32),
+            (0x8000_0000, 0, 0x8000_0000),
+            (0x7FFF_FFFF, 0, 0x8000_0000),
+            (0x7FFF_FFFF, 0, 0x8000_0001),
+            (0xFFFF_0000, 0, 0x0001_0000),
+        ]
+        for s0, s1, s2 in test_inputs:
+            flags = VALUStatusFlags.from_sad_u32(s0, s1, s2)
+            sad_hi = ref_sad_hi_u32(s0, s1, s2)
+            self.assertEqual(
+                1 if flags.carry else 0,
+                sad_hi,
+                f"Carry flag mismatch for ({hex(s0)}, {hex(s1)}, {hex(s2)})",
+            )
+
+    def test_carry_generation_exact_boundary(self) -> None:
+        # Sum = 0xFFFFFFFF -> no carry
+        flags_no_carry = VALUStatusFlags.from_sad_u32(0, 0xFFFF_FFFE, 1)
+        self.assertFalse(flags_no_carry.carry)
+        self.assertFalse(flags_no_carry.zero)
+        self.assertTrue(flags_no_carry.sign)  # bit 31 is set
+
+        # Sum = 0x100000000 -> carry = True, zero = True, sign = False
+        flags_carry = VALUStatusFlags.from_sad_u32(0, MASK32, 1)
+        self.assertTrue(flags_carry.carry)
+        self.assertTrue(flags_carry.zero)
+        self.assertFalse(flags_carry.sign)
+
+    def test_zero_flag_behaviors(self) -> None:
+        # Diff = 0, acc = 0 -> zero = True, carry = False, sign = False
+        flags_zero = VALUStatusFlags.from_sad_u32(100, 100, 0)
+        self.assertTrue(flags_zero.zero)
+        self.assertFalse(flags_zero.carry)
+        self.assertFalse(flags_zero.sign)
+
+        # Diff = 5, acc = 0 -> zero = False
+        flags_nonzero = VALUStatusFlags.from_sad_u32(10, 5, 0)
+        self.assertFalse(flags_nonzero.zero)
+
+    def test_sign_flag_behaviors(self) -> None:
+        # Result < 0x80000000 -> sign = False
+        flags_pos = VALUStatusFlags.from_sad_u32(0, 0x7FFF_FFFF, 0)
+        self.assertFalse(flags_pos.sign)
+
+        # Result == 0x80000000 -> sign = True
+        flags_neg = VALUStatusFlags.from_sad_u32(0, 0x8000_0000, 0)
+        self.assertTrue(flags_neg.sign)
 
 
 if __name__ == "__main__":
