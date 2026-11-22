@@ -540,5 +540,36 @@ class Refusal(unittest.TestCase):
             rdna2spirv.WAVE64_GRAPHICS = old
 
 
+class GeometryRing(unittest.TestCase):
+    """TEST-251: a legacy GS's LDS write is an output slot from its offset alone (rdna2spirv.gs_ds drops the VGPR
+    address, the lane's GSVS area), so a lane id that only forms that address is no partition dependence; the data
+    written, and a lane id in a memory store's address, still are. GPU twins: gs_w64_a_ring, gs_w64_c_lane_id."""
+    PRO = ["s_bfe_i32 s0, s3, 0x80008", "s_bfm_b64 exec, s0, 0", "s_cmp_eq_u32 s0, 64", "s_cselect_b64 exec, -1, exec",
+           "v_mbcnt_lo_u32_b32 v13, -1, 0", "v_mbcnt_hi_u32_b32 v13, -1, v13"]
+    EPI = ["s_sendmsg sendmsg(MSG_GS, GS_OP_EMIT, 0)", "s_sendmsg sendmsg(MSG_GS, GS_OP_CUT, 0)",
+           "s_sendmsg sendmsg(MSG_GS_DONE, GS_OP_NOP)", "s_endpgm"]
+
+    def tier(self, body):
+        sys.path.insert(0, os.path.join(HERE, "..", "..", "runtime", "test", "shaders"))
+        import build                                       # gs_container: gs_tri's ISG1/OSG1
+        name = "gs_w64_ring_test"
+        translate_listing(name, listing(name, self.PRO + body + self.EPI), build.gs_container())
+        w = rdna2spirv.translate.last_gen.w64g
+        return w["tier"], w["reasons"]
+
+    def test_lane_id_in_the_ring_address_is_tier_a(self):
+        self.assertEqual(self.tier(["v_mul_u32_u24_e32 v12, 0x60, v13", "v_mov_b32_e32 v14, 0",
+                                    "ds_write2_b32 v12, v14, v14 offset0:0 offset1:1"]), ("A", []))
+
+    def test_lane_id_written_to_the_ring_is_tier_c(self):
+        self.assertEqual(self.tier(["v_mov_b32_e32 v12, 0", "ds_write2_b32 v12, v13, v13 offset0:0 offset1:1"]),
+                         ("C", ["lane-id"]))
+
+    def test_lane_id_in_a_memory_store_address_is_tier_c(self):
+        self.assertEqual(self.tier(["v_mov_b32_e32 v14, 0", "v_lshlrev_b32_e32 v12, 2, v13",
+                                    "buffer_store_dword v14, v12, s[4:7], 0 offen",
+                                    "ds_write2_b32 v14, v14, v14 offset0:0 offset1:1"]), ("C", ["lane-id"]))
+
+
 if __name__ == "__main__":
     unittest.main()
