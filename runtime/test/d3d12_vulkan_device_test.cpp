@@ -409,7 +409,10 @@ bool capture_resolve(ID3D12Device* device, DXGI_FORMAT format, UINT samples, Res
 
     const FLOAT green[4] = {0, 1, 0, 1};
     const FLOAT red[4] = {1, 0, 0, 1};
-    list->ClearRenderTargetView(src_rtv, green, 0, nullptr);
+    // Use a rectangle even for the full source: multisampled images are cleared as rendering attachments,
+    // not with vkCmdClearColorImage (which is for single-sample transfer clears).
+    const D3D12_RECT full_source{0, 0, LONG(src_width), LONG(src_height)};
+    list->ClearRenderTargetView(src_rtv, green, 1, &full_source);
     list->ClearRenderTargetView(dst_rtv, red, 0, nullptr);
     const D3D12_RESOURCE_BARRIER before_resolve[] = {
         transition(src.p, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_RESOLVE_SOURCE),
