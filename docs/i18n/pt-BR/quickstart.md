@@ -87,6 +87,41 @@ Os estágios executam nesta ordem: `check` → `shaders` → `assets` → `runti
 - **`--wave64-emulate`**: emula shaders compute/mesh wave64 em GPUs com subgrupos de 32 lanes (NVIDIA e Intel). O padrão `auto` consulta `vulkaninfo` e ativa a emulação automaticamente quando necessário.
 - **`--work`**: recomenda-se apontar para um disco com pelo menos 350 GB livres; o estágio `shaders` é o mais demorado e usa metade das threads da CPU por padrão (ajustável com `--jobs`).
 
+### Diagnóstico do Vulkan no Linux
+
+Com CMake 3.24+, um compilador C++20, os cabeçalhos de desenvolvimento e o carregador do Vulkan instalados,
+rode na raiz do repositório:
+
+```sh
+cmake -S runtime -B runtime/build/linux
+cmake --build runtime/build/linux --parallel
+./runtime/build/linux/vk_pipeline_check /caminho/para/spirv
+```
+
+Passe a pasta que contém `index.json` e os shaders SPIR-V traduzidos. O estágio `pipelines` de `make_game.py`
+usa esse verificador em `runtime/build/linux` ou `runtime/build`. Se ainda não existir, o script o compila
+antes de iniciar os estágios.
+
+### Runtime no Linux com Wine ou Proton
+
+No Linux, `make_game.py` pode compilar o runtime Windows em `runtime/build/windows` com `clang-cl`,
+`lld-link` e o SDK Windows com o CRT do MSVC instalado via [xwin](https://github.com/Jake-Shadle/xwin).
+O script procura o SDK em `XWIN_DIR` ou `~/.local/share/xwin-sdk`. Consulte o
+[guia de configuração](../../testing.md#the-windows-runtime-on-linux-under-wine-or-proton) para instalar
+as ferramentas e conferir as versões do LLVM conhecidas por causar problemas. Sem essas dependências,
+o estágio `runtime` fica fora da execução padrão no Linux.
+
+Você também pode reutilizar um build Windows já extraído, como o artefato `runtime-windows` do workflow
+Runtime. Passe a pasta que contém `gta6rt.exe` e `gta6rt_tls_host.dll`:
+
+```sh
+python3 -I make_game.py --runtime-build ~/Downloads/runtime-windows
+```
+
+Nos dois casos, o script copia os arquivos do runtime para o diretório indicado por `--out` e gera `gta6rt.sh` nessa pasta.
+O script inicia o runtime com `wine` por padrão. Para usar o Proton, aponte `WINE` para o `files/bin/wine`
+da instalação. No Windows, `--runtime-build` também permite reutilizar um build existente.
+
 ## Problemas comuns
 
 - **Baixou pelo botão "Download ZIP" do GitHub**: o ZIP não inclui o submódulo `third_party/rpf9-explorer`. Use `git clone --recursive` ou execute `git submodule update --init --recursive` dentro da pasta do repositório.
