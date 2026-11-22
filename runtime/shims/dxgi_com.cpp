@@ -188,6 +188,8 @@ public:
         const std::uint32_t cur = swapchain_.current_back_buffer_index();
         if (!swapchain_.present(cur)) return E_FAIL;
         ++present_count_;
+        LARGE_INTEGER qpc{};
+        if (QueryPerformanceCounter(&qpc)) last_present_qpc_.store(qpc.QuadPart, std::memory_order_relaxed);
         std::uint32_t next = 0;
         if (!swapchain_.acquire_next_image(next)) return E_FAIL;
         if (waitable_) ReleaseSemaphore(waitable_, 1, nullptr);
@@ -249,7 +251,16 @@ public:
 
     HRESULT STDMETHODCALLTYPE ResizeTarget(const DXGI_MODE_DESC*) override { return S_OK; }
     HRESULT STDMETHODCALLTYPE GetContainingOutput(IDXGIOutput**) override { return DXGI_ERROR_NOT_CURRENTLY_AVAILABLE; }
-    HRESULT STDMETHODCALLTYPE GetFrameStatistics(DXGI_FRAME_STATISTICS*) override { return E_NOTIMPL; }
+    HRESULT STDMETHODCALLTYPE GetFrameStatistics(DXGI_FRAME_STATISTICS* stats) override {
+        if (!stats) return E_INVALIDARG;
+        std::memset(stats, 0, sizeof(*stats));
+        const UINT count = present_count_.load(std::memory_order_relaxed);
+        stats->PresentCount = count;
+        stats->PresentRefreshCount = count;
+        stats->SyncRefreshCount = count;
+        stats->SyncQPCTime.QuadPart = last_present_qpc_.load(std::memory_order_relaxed);
+        return S_OK;
+    }
     HRESULT STDMETHODCALLTYPE GetLastPresentCount(UINT* p) override {
         if (!p) return E_INVALIDARG;
         *p = present_count_.load(std::memory_order_relaxed);
@@ -381,6 +392,7 @@ private:
     HANDLE waitable_ = nullptr;
     std::vector<BackBufferResource*> buffers_;
     std::atomic<UINT> present_count_{0};
+    std::atomic<LONGLONG> last_present_qpc_{0};
     std::atomic<UINT> max_frame_latency_{2};
 };
 
