@@ -1609,5 +1609,215 @@ class TestFmacF16IEEE754BoundaryExtremes(unittest.TestCase):
         self.assertEqual(f16_to_u16(res2), 0x3C02)
 
 
+class TestFmacF16NegativeControlsAndMutations(unittest.TestCase):
+    """Test suite for negative controls, syntax rejection, and mutation detection."""
+
+    def test_syntax_rejection_invalid_opcode(self):
+        class FakeOpcode(Enum):
+            V_ADD_F16 = "v_add_f16"
+
+        bad_inst = ASTInstruction(
+            opcode=FakeOpcode.V_ADD_F16,  # type: ignore
+            dst=ASTOperand.vgpr(0),
+            src0=ASTOperand.vgpr(1),
+            src1=ASTOperand.vgpr(2),
+        )
+        with self.assertRaises(ValueError):
+            bad_inst.validate()
+
+    def test_syntax_rejection_bad_dst_kind(self):
+        bad_inst = ASTInstruction(
+            opcode=Opcode.V_FMAC_F16,
+            dst=ASTOperand.sgpr(0),
+            src0=ASTOperand.vgpr(1),
+            src1=ASTOperand.vgpr(2),
+        )
+        with self.assertRaises(TypeError):
+            bad_inst.validate()
+
+    def test_syntax_rejection_bad_dst_type(self):
+        bad_inst = ASTInstruction(
+            opcode=Opcode.V_FMAC_F16,
+            dst=ASTOperand(OperandKind.VGPR, index=0, type_kind=TypeKind.UINT16),
+            src0=ASTOperand.vgpr(1),
+            src1=ASTOperand.vgpr(2),
+        )
+        with self.assertRaises(TypeError):
+            bad_inst.validate()
+
+    def test_syntax_rejection_dst_modifiers(self):
+        bad_inst_neg = ASTInstruction(
+            opcode=Opcode.V_FMAC_F16,
+            dst=ASTOperand.vgpr(0, neg=True),
+            src0=ASTOperand.vgpr(1),
+            src1=ASTOperand.vgpr(2),
+        )
+        with self.assertRaises(ValueError):
+            bad_inst_neg.validate()
+
+        bad_inst_abs = ASTInstruction(
+            opcode=Opcode.V_FMAC_F16,
+            dst=ASTOperand.vgpr(0, abs_=True),
+            src0=ASTOperand.vgpr(1),
+            src1=ASTOperand.vgpr(2),
+        )
+        with self.assertRaises(ValueError):
+            bad_inst_abs.validate()
+
+    def test_syntax_rejection_oob_indices(self):
+        bad_vgpr = ASTInstruction(
+            opcode=Opcode.V_FMAC_F16,
+            dst=ASTOperand.vgpr(256),
+            src0=ASTOperand.vgpr(1),
+            src1=ASTOperand.vgpr(2),
+        )
+        with self.assertRaises(ValueError):
+            bad_vgpr.validate()
+
+        bad_sgpr = ASTInstruction(
+            opcode=Opcode.V_FMAC_F16,
+            dst=ASTOperand.vgpr(0),
+            src0=ASTOperand.sgpr(106),
+            src1=ASTOperand.vgpr(2),
+        )
+        with self.assertRaises(ValueError):
+            bad_sgpr.validate()
+
+    def test_syntax_rejection_bad_src_type(self):
+        bad_src = ASTInstruction(
+            opcode=Opcode.V_FMAC_F16,
+            dst=ASTOperand.vgpr(0),
+            src0=ASTOperand(OperandKind.VGPR, index=1, type_kind=TypeKind.UINT32),
+            src1=ASTOperand.vgpr(2),
+        )
+        with self.assertRaises(TypeError):
+            bad_src.validate()
+
+    def test_mutation_unfused_intermediate_rounding_detected(self):
+        # Mutated logic: unfused multiplication followed by addition
+        def mutated_unfused_fmac(u0: int, u1: int, acc: int) -> int:
+            f0 = u16_to_f16(u0)
+            f1 = u16_to_f16(u1)
+            fa = u16_to_f16(acc)
+            prod_rounded = u16_to_f16(f16_to_u16(f0 * f1))
+            return f16_to_u16(prod_rounded + fa)
+
+        u0 = 0x3C01
+        u1 = 0x3C01
+        acc = 0xBC02
+
+        oracle_result = ref_fmac_f16_u16(u0, u1, acc)
+        mutated_result = mutated_unfused_fmac(u0, u1, acc)
+
+        # Oracle preserves the 2^-20 subnormal (0x0010), while mutated unfused flushes to 0.0
+        self.assertEqual(oracle_result, 0x0010)
+        self.assertEqual(mutated_result, 0x0000)
+        self.assertNotEqual(oracle_result, mutated_result)
+
+    def test_mutation_addition_subtraction_flip_detected(self):
+        def mutated_fmac_sub(u0: int, u1: int, acc: int) -> int:
+            f0 = u16_to_f16(u0)
+            f1 = u16_to_f16(u1)
+            fa = u16_to_f16(acc)
+            frac_diff = Fraction(f0) * Fraction(f1) - Fraction(fa)
+            return f16_to_u16(float(frac_diff))
+
+        u0 = f16_to_u16(2.0)
+        u1 = f16_to_u16(3.0)
+        acc = f16_to_u16(4.0)
+
+        oracle_result = ref_fmac_f16_u16(u0, u1, acc)     # 2 * 3 + 4 = 10.0
+        mutated_result = mutated_fmac_sub(u0, u1, acc)    # 2 * 3 - 4 = 2.0
+        self.assertEqual(u16_to_f16(oracle_result), 10.0)
+        self.assertEqual(u16_to_f16(mutated_result), 2.0)
+        self.assertNotEqual(oracle_result, mutated_result)
+
+    def test_mutation_dropped_clamp_detected(self):
+        def mutated_clamp(bits: int) -> int:
+            return bits  # mutated: no clamp
+
+        u0 = f16_to_u16(2.0)
+        u1 = f16_to_u16(3.0)
+        acc = f16_to_u16(0.0)
+
+        oracle_result = ref_fmac_f16_u16(u0, u1, acc, clamp=True)
+        mutated_result = mutated_clamp(ref_fmac_f16_u16(u0, u1, acc, clamp=False))
+
+        self.assertEqual(u16_to_f16(oracle_result), 1.0)
+        self.assertEqual(u16_to_f16(mutated_result), 6.0)
+        self.assertNotEqual(oracle_result, mutated_result)
+
+    def test_mutation_dropped_omod_detected(self):
+        def mutated_omod(bits: int, omod: int) -> int:
+            return bits  # mutated: dropped omod
+
+        u0 = f16_to_u16(1.5)
+        u1 = f16_to_u16(2.0)
+        acc = f16_to_u16(0.5)
+
+        oracle_result = ref_fmac_f16_u16(u0, u1, acc, omod=1)
+        mutated_result = mutated_omod(ref_fmac_f16_u16(u0, u1, acc, omod=0), 1)
+
+        self.assertEqual(u16_to_f16(oracle_result), 7.0)
+        self.assertEqual(u16_to_f16(mutated_result), 3.5)
+        self.assertNotEqual(oracle_result, mutated_result)
+
+    def test_mutation_sign_modifier_dropped_detected(self):
+        def mutated_apply_mods(bits: int, *, neg: bool = False, abs_: bool = False) -> int:
+            return bits  # mutated: ignores neg/abs
+
+        raw = f16_to_u16(3.5)
+        oracle_mod = apply_src_mods_u16(raw, neg=True)
+        mutated_mod = mutated_apply_mods(raw, neg=True)
+
+        self.assertEqual(u16_to_f16(oracle_mod), -3.5)
+        self.assertEqual(u16_to_f16(mutated_mod), 3.5)
+        self.assertNotEqual(oracle_mod, mutated_mod)
+
+    def test_mutation_subnormal_flush_detected(self):
+        def mutated_ftz_fmac(u0: int, u1: int, acc: int) -> int:
+            res = ref_fmac_f16_u16(u0, u1, acc)
+            if is_subnormal_f16(res):
+                return F16_POS_ZERO  # mutated: flush to zero
+            return res
+
+        u0 = 0x3C01
+        u1 = 0x3C01
+        acc = 0xBC02
+
+        oracle_result = ref_fmac_f16_u16(u0, u1, acc)
+        mutated_result = mutated_ftz_fmac(u0, u1, acc)
+
+        self.assertEqual(oracle_result, 0x0010)
+        self.assertEqual(mutated_result, 0x0000)
+        self.assertNotEqual(oracle_result, mutated_result)
+
+    def test_negative_control_canary_corruption(self):
+        wave = SIMDWaveState(wave_size=32)
+        wave.exec_mask = 0x00000001  # only lane 0 active
+        canary = 0xCAFE
+        for lane in range(32):
+            wave.set_lane_vgpr_half_u16(lane, 0, HalfSel.LO, canary)
+
+        wave.set_lane_vgpr_half_f16(0, 0, HalfSel.LO, 4.0)
+
+        inst = ASTInstruction(
+            opcode=Opcode.V_FMAC_F16,
+            dst=ASTOperand.vgpr(0, HalfSel.LO),
+            src0=ASTOperand.inline_const(2.0),
+            src1=ASTOperand.inline_const(3.0),
+        )
+        wave.execute(inst)
+
+        # Lane 0 computed 2 * 3 + 4 = 10.0
+        self.assertEqual(wave.get_lane_vgpr_half_f16(0, 0, HalfSel.LO), 10.0)
+        for lane in range(1, 32):
+            self.assertEqual(
+                wave.get_lane_vgpr_half_u16(lane, 0, HalfSel.LO),
+                canary,
+                f"Inactive lane {lane} was corrupted",
+            )
+
+
 if __name__ == "__main__":
     unittest.main()
