@@ -219,6 +219,20 @@ def valu_skip_reason(op, arch):
     return None
 
 
+# ---- true16: LLVM 23 makes GFX11's 16-bit operands half registers (v8.l) and rejects a bare v8 there ----
+# The one-source f16 ops the fuzzers and sweeps run here: the two conversions and f16_trans_sweep's seven.
+_F16_UNARY = "|".join(f"v_{op}_f16" for op in ("exp", "log", "rcp", "rsq", "sqrt", "sin", "cos"))
+_F16_DST = re.compile(rf"^([ \t]*(?:v_cvt_f16_f32|{_F16_UNARY})(?:_e32|_e64)?[ \t]+v\d+)(?=[ \t]*,)", re.M)
+_F16_SRC = re.compile(rf"^([ \t]*(?:v_cvt_f32_f16|{_F16_UNARY})(?:_e32|_e64)?[ \t]+v\d+(?:\.[lh])?[ \t]*,"
+                      r"[-| \ta-z(]*\bv\d+)\b(?!\.[lh])", re.M)
+
+
+def true16_spelling(text):
+    """The f16 operands of those ops written as the low half, which is what a bare register means there on GFX10
+    and to older assemblers. Line numbers don't change, so error lines still map to kernels."""
+    return _F16_SRC.sub(r"\1.l", _F16_DST.sub(r"\1.l", text))
+
+
 def failing_kernels(stderr, starts):
     """Indices of the kernels an assembler error message points into (error lines are 'file:LINE:COL: error')."""
     bad = set()

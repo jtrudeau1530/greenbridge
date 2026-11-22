@@ -71,6 +71,114 @@ class Text(unittest.TestCase):
         self.assertEqual(asm.failing_kernels(err2, starts), {1, 2})
 
 
+class True16(unittest.TestCase):
+    def test_the_low_half_is_named_only_on_the_f16_operand(self):
+        for old, new in (
+                ("v_cvt_f16_f32_e32 v8, v4", "v_cvt_f16_f32_e32 v8.l, v4"),
+                ("  v_cvt_f16_f32_e64 v8, -|v4|", "  v_cvt_f16_f32_e64 v8.l, -|v4|"),
+                ("v_cvt_f16_f32 v8, 0x3f800000", "v_cvt_f16_f32 v8.l, 0x3f800000"),
+                ("v_cvt_f32_f16_e32 v8, v4", "v_cvt_f32_f16_e32 v8, v4.l"),
+                ("v_cvt_f32_f16_e64 v8, -|v14| clamp mul:2", "v_cvt_f32_f16_e64 v8, -|v14.l| clamp mul:2"),
+                ("v_cvt_f32_f16 v8, abs(v4)", "v_cvt_f32_f16 v8, abs(v4.l)"),
+                ("v_exp_f16 v12, v2", "v_exp_f16 v12.l, v2.l"),              # both operands are f16
+                ("v_sqrt_f16_e64 v12, -|v2|", "v_sqrt_f16_e64 v12.l, -|v2.l|"),
+                ("v_rcp_f16 v12, 0x3c00", "v_rcp_f16 v12.l, 0x3c00")):
+            self.assertEqual(asm.true16_spelling(old), new)
+            self.assertEqual(asm.true16_spelling(new), new)        # already spelled that way
+        for same in ("v_cvt_pkrtz_f16_f32 v8, v4, v5", "v_cvt_f32_f16 v8, s4", "v_cvt_f32_f16 v8, 0x3c00",
+                     "v_cvt_f32_f16 v8, v4.h", "v_mov_b32 v8, v4"):
+            self.assertEqual(asm.true16_spelling(same), same)
+
+    def test_error_lines_still_map_back(self):
+        text = "v_mov_b32 v1, 0\nv_cvt_f32_f16 v8, 0x3c00\nv_cvt_f16_f32 v8, v1\nv_mov_b32 v9, 0\n"
+        out = asm.true16_spelling(text)
+        self.assertEqual(out, text.replace("v_cvt_f16_f32 v8,", "v_cvt_f16_f32 v8.l,"))
+
+
+class ToolchainFallbacks(unittest.TestCase):
+    """The two probes, with a stand-in for the assembler and the launcher."""
+
+    def oracle(self, arch="gfx1103"):
+        o = object.__new__(runner.Oracle)      # no tools, no GPU
+        o.arch, o.chunk = arch, 500
+        return o
+
+    def probe(self, loads, error="hipModuleLoadData(&mod, img) -> hip error 209"):
+        o = self.oracle()
+        seen = []
+
+        def launch(co, names, words=4):
+            seen.append(o.code_object)
+            if o.code_object in loads:
+                return 0, "# device=test arch=gfx1103\n", ""
+            return 3, "", error
+        o._assemble = lambda text, wave=32: ("k.co", "")
+        o._launch = launch
+        return o, seen
+
+    def test_a_runtime_that_takes_the_default_keeps_it(self):
+        o, seen = self.probe(loads={None, 5})
+        o._probe()
+        self.assertEqual(seen, [None])
+        self.assertIsNone(o.code_object)
+
+    def test_error_209_retries_as_v5_and_keeps_it(self):
+        o, seen = self.probe(loads={5})
+        self.assertEqual(o._probe(), "device=test arch=gfx1103")
+        self.assertEqual((seen, o.code_object), ([None, 5], 5))
+
+    def test_a_209_that_stays_and_other_errors_are_unavailable(self):
+        o, seen = self.probe(loads=set())
+        with self.assertRaisesRegex(runner.Unavailable, "209"):
+            o._probe()
+        self.assertEqual(seen, [None, 5])
+        o, seen = self.probe(loads={5}, error="hipMalloc -> hip error 2")
+        with self.assertRaisesRegex(runner.Unavailable, "error 2"):
+            o._probe()
+        self.assertEqual(seen, [None])
+
+    def test_v5_that_does_not_assemble_is_unavailable(self):
+        o, _ = self.probe(loads={5})
+        o._assemble = lambda text, wave=32: (None, "unknown argument") if o.code_object else ("k.co", "")
+        with self.assertRaisesRegex(runner.Unavailable, "unknown argument"):
+            o._probe()
+
+    def test_the_chosen_version_reaches_the_assembler(self):
+        o = self.oracle()
+        o.clang, o.lld = "clang", "ld.lld"
+        ok = subprocess.CompletedProcess([], 0, "", "")
+        with tempfile.TemporaryDirectory() as tmp, \
+                unittest.mock.patch.object(runner.subprocess, "run", return_value=ok) as run:
+            o.workdir = tmp
+            o._assemble("", 64)
+            self.assertFalse([a for a in run.call_args_list[0].args[0] if "code-object" in a])
+            o.code_object = 5
+            o._assemble("", 64)
+            args = run.call_args_list[2].args[0]
+        self.assertIn("-mcode-object-version=5", args)
+        self.assertIn("-mwavefrontsize64", args)
+
+    def test_true16_is_used_only_where_the_assembler_needs_it(self):
+        bare_only = lambda text, wave=32: (None, "error") if ".l" in text else ("k.co", "")
+        half_only = lambda text, wave=32: ("k.co", "") if ".l" in text else (None, "error")
+        neither = lambda text, wave=32: (None, "error")
+        for arch, assemble, want in (("gfx1150", bare_only, False), ("gfx1103", half_only, True),
+                                     ("gfx1103", neither, False), ("gfx1036", half_only, False)):
+            o = self.oracle(arch)
+            o._assemble = assemble
+            self.assertEqual(o._needs_true16(), want, arch)
+
+    def test_a_chunk_is_assembled_with_that_spelling(self):
+        for true16 in (False, True):
+            o = self.oracle()
+            o.true16, texts = true16, []
+            o._assemble = lambda text, wave=32: (texts.append(text) or "k.co", "")
+            o._launch = lambda co, names, words=4: (0, "k0 00003c00\n", "")
+            kernel = asm.Kernel(["v_cvt_f16_f32 v8, v1", "s_endpgm"], words=1, raw=True)
+            self.assertEqual(o.run([kernel], words=1), [[0x3C00]])
+            self.assertEqual("v8.l" in texts[0], true16)
+
+
 class Filters(unittest.TestCase):
     def test_literals(self):
         self.assertEqual(asm.literals("s_add_u32 s4, 0x100, s5"), {0x100})
@@ -339,6 +447,12 @@ class OnHardware(unittest.TestCase):
             self.assertEqual(rc, 0, err)
             got.append(int(out.splitlines()[-1].split()[1], 16))
         self.assertEqual(got, [0x3F800001, 0x3F800001, 0x3F800000, 0x3F800000])
+
+    def test_f16_conversions_run_with_either_assembler_spelling(self):
+        # 1.0 to f16 keeps the high half of the register; the low half back to f32 ignores it.
+        program = ["v_mov_b32 v1, 0x3f800000", "v_mov_b32 v8, 0xabcd0000", "v_cvt_f16_f32 v8, v1",
+                   "v_cvt_f32_f16 v9, v8", "v_mov_b32 v10, 0", "v_mov_b32 v11, 0"]
+        self.assertEqual(self.oracle.run([program]), [[0xABCD3C00, 0x3F800000, 0, 0]])
 
     def test_runs_a_program_and_reports_a_rejected_one(self):
         bad = ["s_add_u32 s4, 0x100, 0x200"] + PROG[-4:]     # two literals: the assembler refuses it
