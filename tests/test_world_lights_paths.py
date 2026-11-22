@@ -467,6 +467,17 @@ class ScanTest(unittest.TestCase):
         self.assertIn("bad.jsonl", lines[0])
         self.assertNotIn("Traceback", err.getvalue())
 
+    def test_lights_report_that_is_a_directory_leaves_no_partial(self):
+        lights = os.path.join(self.tmp.name, "lights.jsonl")
+        os.makedirs(lights)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            rc = T.main([self.rpf, "--entities", self.entities, "--lights-out", lights])
+        self.assertEqual(rc, 2)
+        self.assertFalse(os.path.exists(lights + ".partial"), "a failed replace left its staged report behind")
+        self.assertEqual(len(err.getvalue().strip().splitlines()), 1, err.getvalue())
+        self.assertNotIn("Traceback", err.getvalue())
+
     def test_bad_input_is_one_line(self):
         err = io.StringIO()
         with contextlib.redirect_stderr(err):

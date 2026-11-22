@@ -705,7 +705,10 @@ def summarize(total, entities=None, lights_out=None):
                                                  separators=(",", ":")) + "\n")
     except BaseException:
         if out is not None:
-            out.close()
+            try:
+                out.close()
+            except OSError:
+                pass
             out = None
         if staged is not None and os.path.exists(staged):
             os.remove(staged)
@@ -714,7 +717,13 @@ def summarize(total, entities=None, lights_out=None):
         if out is not None:
             out.close()
     if staged is not None:
-        os.replace(staged, lights_out)
+        try:
+            os.replace(staged, lights_out)
+        except BaseException:
+            # A destination that is a directory (or read-only) must not leave the staged copy behind.
+            if os.path.exists(staged):
+                os.remove(staged)
+            raise
     summary["placement"] = dict(placed)
     nodes = [n for part in total["nodes"] for n in part]
     links = [l for part in total["links"] for l in part]
