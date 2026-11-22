@@ -290,6 +290,7 @@ ID3D12Device* create_host() {
 }
 
 constexpr std::uint64_t kNoChild = 0xC41DFA11ull;  // the child process couldn't run the step
+constexpr int kMaxNotCompared = 11;  // values the host can't give: see the end of main
 
 // Step `index` on a fresh host device, in a child process (this executable with --host-step): its exit code is the
 // HRESULT, or a crash status, which counts as a fault.
@@ -308,6 +309,9 @@ std::uint64_t isolated(std::size_t index) {
     else TerminateProcess(process.hProcess, DWORD(kNoChild));
     CloseHandle(process.hThread);
     CloseHandle(process.hProcess);
+    // Checked before the crash statuses below, which kNoChild would otherwise fall into: a child that couldn't run
+    // its step is a broken test, not a host fault, and fails it.
+    if (code == DWORD(kNoChild)) return kNoChild;
     if ((code & 0xF0000000u) == 0xC0000000u) return kFaulted;  // an access violation or fail-fast the guard missed
     return code;
 }
@@ -377,6 +381,9 @@ int main(int argc, char** argv) {
             EXPECT(theirs.names == ours.names);
             int mismatches = 0, faulted = 0;
             for (std::size_t i = 0; i < ours.values.size(); ++i) {
+                if (theirs.values[i] == kNoChild)
+                    std::printf("residency %s: the host step's child process didn't run it\n", ours.names[i].c_str());
+                EXPECT(theirs.values[i] != kNoChild);
                 if (theirs.values[i] == kFaulted) {
                     std::printf("residency %s: the host faults, not compared (ours 0x%llx)\n", ours.names[i].c_str(),
                                 static_cast<unsigned long long>(ours.values[i]));
@@ -400,9 +407,13 @@ int main(int argc, char** argv) {
                                 static_cast<unsigned long long>(theirs.values[i]), same ? "" : "  MISMATCH");
                 mismatches += !same;
             }
-            std::printf("residency: %zu steps compared with the host (%d more not compared), %d mismatches\n",
-                        ours.values.size() - faulted, faulted, mismatches);
+            std::printf("residency: %zu values from %zu steps compared with the host (%d more not compared), "
+                        "%d mismatches\n", ours.values.size() - faulted, sizeof(kSteps) / sizeof(kSteps[0]), faulted,
+                        mismatches);
             EXPECT(mismatches == 0);
+            // The values left out are the null-pointer steps the host faults on and the backwards fence. A host that
+            // faulted on more would make the comparison vacuous while still passing, so the count is held to that.
+            EXPECT(faulted <= kMaxNotCompared);
         }
     }
     std::printf("d3d12_residency_test: OK\n");

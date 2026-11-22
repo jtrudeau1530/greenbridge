@@ -1657,11 +1657,11 @@ The trace will enumerate them.
 - Residency and power (D3D-33) are no-ops that still check their arguments (`d3d12_vulkan_device.cpp`, tested in
   `d3d12_vulkan_device_test`). Vulkan has no residency API: memory from `vkAllocateMemory` stays usable until
   `vkFreeMemory`, and paging under pressure is the kernel driver's job, so every pageable object is always resident.
-  The residency answers are the host runtime's: `d3d12_residency_test` runs the same 110 steps on both devices
+  The residency answers are the host runtime's: `d3d12_residency_test` runs the same 58 steps on both devices
   with a committed buffer, a heap, a placed buffer, a descriptor heap, a query heap and a fence, and compares every
   HRESULT, the device-removed reason after each step, and the value `EnqueueMakeResident` leaves the fence at
-  (RTX 3060, driver 610.88). Steps that leave the host runtime unusable run there in a child process with a fresh
-  device.
+  (110 values; RTX 3060, driver 610.88). Steps that leave the host runtime unusable run there in a child process with a
+  fresh device.
   - `MakeResident` and `Evict` return `S_OK` for any count of this device's pageable objects, the same one twice,
     an evicted one or a resident one. D3D12 documents `Evict` as a hint the runtime may defer, so dropping it is
     allowed.
