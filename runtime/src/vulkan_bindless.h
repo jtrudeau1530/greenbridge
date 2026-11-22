@@ -435,19 +435,21 @@ public:
                                      result == DescriptorTable::InsertResult::added_with_relocation;
         return true;
     }
-    // Erasing compacts the key's probe cluster, so other keys' entries may change slots.
+    // Erasing empties only the key's own slot; no other entry moves (DescriptorTable::erase), so it needs no idle.
+    // The caller erases a key once no submitted work uses it (its texture is gone), like D3D12 requires.
     bool erase_key(const DescriptorKey& key) {
         if (!table_.erase(key)) return false;
-        table_dirty_ = existing_entries_changed_ = true;
+        table_dirty_ = true;
         return true;
     }
     const DescriptorTable& table() const { return table_; }
 
-    // True when the next flush() will change entries a running shader may be probing, or replace the table's
-    // buffer: the caller then flushes only once no command buffer that uses the set is still executing. Without
-    // it the flush only adds entries, and the copy of an entry is not atomic: a shader probing a different key
-    // could in principle see a torn entry that matches it, which is accepted as vanishingly unlikely because the
-    // added key is new (there is no live key equal to it).
+    // True when the next flush() will change entries a running shader may be probing (a live key's index replaced
+    // or a live key moved by a relocating insert), or replace the table's buffer: the caller then flushes only once
+    // no command buffer that uses the set is still executing. Without it the flush only adds entries or empties the
+    // slots of erased keys, and the copy of an entry is not atomic: a shader probing a different key could in
+    // principle see a torn entry that matches it, which is accepted as vanishingly unlikely because the added or
+    // erased key is not live (no running work uses it).
     bool flush_needs_idle() const {
         return table_dirty_ && (existing_entries_changed_ || force_full_upload_ ||
                                 table_.size_bytes() > table_buffers_.table.size);

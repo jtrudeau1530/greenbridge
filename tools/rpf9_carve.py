@@ -162,7 +162,7 @@ def main() -> int:
                "bink2_files": sum(1 for r in rows if r.get("type") == "bink2"),
                "zero_padding": zero, "unread_bytes": unread,
                "span": span}
-    with open(os.path.join(a.out, "index.json"), "w", encoding="utf-8") as f:
+    with open(os.path.join(a.out, "index.json"), "w", encoding="utf-8", newline="\n") as f:
         json.dump({"summary": summary, "files": rows}, f)
     print(json.dumps(summary, indent=1))
     span = max(1, span)   # an empty data area (or --start at the end) has nothing to divide by

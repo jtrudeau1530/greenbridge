@@ -15,15 +15,19 @@
 #include "d3d12_xs_device.h"
 #include "dxgi_com.h"
 #include "../src/gfx10_descriptors.h"
+#include "../src/uav_clear.h"
 #include "../src/vulkan_bindless.h"
 #include "../src/vulkan_memory.h"
 #include "../src/resource_tiling.h"
 #include "../src/shader_library.h"
 #include "../src/vulkan_present.h"
 #include "../src/vulkan_device_filter.h"
+#include "../src/vulkan13_features.h"
 
 #include <vulkan/vulkan_win32.h>
-
+#ifdef _MSC_VER
+#pragma comment(lib, "advapi32.lib")
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -58,6 +62,8 @@ static_assert(sizeof(leonida::TargetView) <= kDescriptorSize);
 // "unsupported" at boot. Raise these when a front end for the higher version lands.
 constexpr D3D_SHADER_MODEL kHighestShaderModel = D3D_SHADER_MODEL_6_0;
 constexpr D3D_ROOT_SIGNATURE_VERSION kHighestRootSignatureVersion = D3D_ROOT_SIGNATURE_VERSION_1_1;
+
+std::atomic<int> g_global_realtime_privilege_override{-1};
 
 void log_once(const char* what, int value) {
     static std::mutex mutex;
@@ -381,12 +387,6 @@ struct DeviceState {
     // True when VK_FORMAT_E5B9G9R9_UFLOAT_PACK32 lacks native STORAGE_IMAGE but mutable R32_UINT+{R32_UINT,E5B9G9R9}
     // is supported, so R9G9B9E5_SHAREDEXP UAV textures are backed by R32_UINT with separate storage/sampled views.
     bool r9g9b9e5_uav_emulated = false;
-    // D3D-219: VK_EXT_image_view_min_lod may select levels with minLodInteger = floor(minLod), the spec's
-    // "alternative", while D3D12's ResourceMinLODClamp is fractional. Intel's integrated GPUs on Windows do: a 0.75
-    // clamp sampled at LOD 0 with point mip filtering reads mip 0 (UHD 770 101.7092, Arrow Lake Xe-LPG; #1015).
-    // bind_image gives such a driver the clamp rounded to the nearest level, which point mip filtering selects
-    // exactly. LEONIDA_MIN_LOD_INTEGER=1 or 0 forces it either way.
-    bool min_lod_integer = false;
 
     // Cached physical-device no-attachment sample counts for D3D12_OPTIONS19.
     UINT no_output_sample_counts = 0;
@@ -796,9 +796,6 @@ struct DeviceState {
                     log_once("SRV requires VK_EXT_image_view_min_lod; first mip", int(image.first_mip));
                     return false;
                 }
-                // A driver that floors the clamp (min_lod_integer) gets the level point mip filtering picks:
-                // nearest(d') = ceil(d' + 0.5) - 1, the spec's preferred rounding. It stays within the mip range.
-                if (min_lod_integer) clamp.minLod = std::ceil(clamp.minLod + 0.5f) - 1.0f;
                 clamp.pNext = view_info.pNext;
                 view_info.pNext = &clamp;
             }
@@ -1066,6 +1063,21 @@ const char* heap_properties_refusal(const D3D12_HEAP_PROPERTIES& heap) {
     if (custom ? !(page_given && pool_given) : (page_given || pool_given))
         return "CPU page property or memory pool (given only, and both, on custom heaps)";
     if (heap.CreationNodeMask > 1 || heap.VisibleNodeMask > 1) return "node mask (one node)";
+    return nullptr;
+}
+
+// Why the host would refuse this CreateHeap/CreateHeap1 description, or null if these checks pass (D3D-238). A probe
+// on an RX 5700 and WARP refuses an alignment other than 0, 64 KiB and 4 MiB, the heap properties above (a type of 0,
+// a custom heap without a CPU page property), and a heap that denies buffers and both kinds of texture.
+const char* heap_desc_refusal(const D3D12_HEAP_DESC& desc) {
+    if (!desc.SizeInBytes) return "zero size";
+    if (desc.Alignment && desc.Alignment != D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT &&
+        desc.Alignment != D3D12_DEFAULT_MSAA_RESOURCE_PLACEMENT_ALIGNMENT)
+        return "alignment (0, 64 KiB or 4 MiB)";
+    if (const char* why = heap_properties_refusal(desc.Properties)) return why;
+    constexpr UINT deny_all = D3D12_HEAP_FLAG_DENY_BUFFERS | D3D12_HEAP_FLAG_DENY_RT_DS_TEXTURES |
+                              D3D12_HEAP_FLAG_DENY_NON_RT_DS_TEXTURES;
+    if ((UINT(desc.Flags) & deny_all) == deny_all) return "heap flags denying every resource kind";
     return nullptr;
 }
 
@@ -2625,6 +2637,99 @@ struct TextureView {
     float min_lod = 0.0f;
 };
 
+// In-memory pipeline library (docs/d3d12_vulkan.md sections 3.6 and 4). D3D12 cached blobs are driver-specific
+// and ignored across runs; Serialize writes a versioned header so CreatePipelineLibrary recognizes our own blobs
+// and returns D3D12_ERROR_DRIVER_VERSION_MISMATCH for foreign or corrupt ones.
+class PipelineLibrary final
+    : public Child<PipelineLibrary, ID3D12PipelineLibrary1Stubs, ID3D12Object, ID3D12DeviceChild, ID3D12Pageable,
+                   ID3D12PipelineLibrary, ID3D12PipelineLibrary1> {
+public:
+    // {6e2a9d41-7b5f-4c83-8e14-2a9d6f3c5b10}
+    static constexpr GUID kTag{0x6e2a9d41, 0x7b5f, 0x4c83, {0x8e, 0x14, 0x2a, 0x9d, 0x6f, 0x3c, 0x5b, 0x10}};
+
+    struct Header {
+        std::uint32_t magic;
+        std::uint32_t version;
+        std::uint32_t count;
+        std::uint32_t reserved;
+    };
+    static constexpr std::uint32_t kMagic = 0x314C504Cu;  // "LPL1"
+    static constexpr std::uint32_t kVersion = 1;
+
+    ~PipelineLibrary() override {
+        std::lock_guard lock(mutex_);
+        for (auto& [name, pso] : entries_)
+            if (pso) pso->Release();
+        entries_.clear();
+    }
+
+    static bool valid_blob(const void* data, SIZE_T size) {
+        if (!data || size < sizeof(Header)) return false;
+        Header h{};
+        std::memcpy(&h, data, sizeof(h));
+        return h.magic == kMagic && h.version == kVersion && h.reserved == 0;
+    }
+
+    HRESULT STDMETHODCALLTYPE StorePipeline(LPCWSTR name, ID3D12PipelineState* pipeline) override {
+        if (!name || !*name || !pipeline) return E_INVALIDARG;
+        if (!PipelineState::from<PipelineState>(pipeline)) return E_INVALIDARG;
+        std::lock_guard lock(mutex_);
+        auto [it, inserted] = entries_.emplace(name, pipeline);
+        if (!inserted) return E_INVALIDARG;
+        pipeline->AddRef();
+        return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE LoadGraphicsPipeline(LPCWSTR name, const D3D12_GRAPHICS_PIPELINE_STATE_DESC* desc,
+                                                   REFIID riid, void** out) override {
+        if (!out) return E_POINTER;
+        *out = nullptr;
+        if (!name || !*name || !desc) return E_INVALIDARG;
+        return load_entry(name, false, true, riid, out);
+    }
+
+    HRESULT STDMETHODCALLTYPE LoadComputePipeline(LPCWSTR name, const D3D12_COMPUTE_PIPELINE_STATE_DESC* desc,
+                                                  REFIID riid, void** out) override {
+        if (!out) return E_POINTER;
+        *out = nullptr;
+        if (!name || !*name || !desc) return E_INVALIDARG;
+        return load_entry(name, true, false, riid, out);
+    }
+
+    HRESULT STDMETHODCALLTYPE LoadPipeline(LPCWSTR name, const D3D12_PIPELINE_STATE_STREAM_DESC* desc,
+                                           REFIID riid, void** out) override {
+        if (!out) return E_POINTER;
+        *out = nullptr;
+        if (!name || !*name || !desc || !desc->SizeInBytes || !desc->pPipelineStateSubobjectStream) return E_INVALIDARG;
+        return load_entry(name, false, false, riid, out);
+    }
+
+    SIZE_T STDMETHODCALLTYPE GetSerializedSize() override { return sizeof(Header); }
+
+    HRESULT STDMETHODCALLTYPE Serialize(void* data, SIZE_T size) override {
+        if (!data || size < sizeof(Header)) return E_INVALIDARG;
+        std::lock_guard lock(mutex_);
+        const Header h{kMagic, kVersion, static_cast<std::uint32_t>(entries_.size()), 0};
+        std::memcpy(data, &h, sizeof(h));
+        return S_OK;
+    }
+
+private:
+    HRESULT load_entry(LPCWSTR name, bool require_compute, bool require_graphics, REFIID riid, void** out) {
+        std::lock_guard lock(mutex_);
+        const auto it = entries_.find(name);
+        if (it == entries_.end()) return E_INVALIDARG;
+        PipelineState* ps = PipelineState::from<PipelineState>(it->second);
+        if (!ps) return E_INVALIDARG;
+        if (require_compute && !ps->compute()) return E_INVALIDARG;
+        if (require_graphics && !ps->graphics()) return E_INVALIDARG;
+        return it->second->QueryInterface(riid, out);
+    }
+
+    std::mutex mutex_;
+    std::unordered_map<std::wstring, ID3D12PipelineState*> entries_;
+};
+
 // The T# of a view: what the shader gets to know about it, in the structure the console's shaders read.
 // False (with a log) for a view set 0 cannot show yet.
 bool image_descriptor(const Resource& resource, const TextureView& view, leonida::gfx10::Image& out) {
@@ -2655,7 +2760,7 @@ bool image_descriptor(const Resource& resource, const TextureView& view, leonida
     const auto dimension = line ? D3D12_RESOURCE_DIMENSION_TEXTURE1D :
                            view.type == g::ImageType::image_3d ? D3D12_RESOURCE_DIMENSION_TEXTURE3D :
                                                                D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-    if (desc.Dimension != dimension || (line && desc.DepthOrArraySize != 1) || msaa != (desc.SampleDesc.Count > 1)) {
+    if (desc.Dimension != dimension || (line && view.layer_count != 1) || msaa != (desc.SampleDesc.Count > 1)) {
         log_once("view type incompatible with texture dimension or sample count; view type", int(view.type));
         return false;
     }
@@ -3059,15 +3164,6 @@ public:
         VkPhysicalDeviceProperties properties{};
         device_properties(info.physical, &properties);
         state_.max_sampler_lod_bias = properties.limits.maxSamplerLodBias;
-        {
-            constexpr std::uint32_t kIntelVendorId = 0x8086;
-            state_.min_lod_integer = properties.vendorID == kIntelVendorId &&
-                                     properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU;
-            char text[4] = {};
-            size_t length = 0;
-            if (getenv_s(&length, text, "LEONIDA_MIN_LOD_INTEGER") == 0 && length > 1)
-                state_.min_lod_integer = text[0] != '0';
-        }
         std::uint32_t family_count = 0;
         queue_families(info.physical, &family_count, nullptr);
         std::vector<VkQueueFamilyProperties> families(family_count);
@@ -3409,8 +3505,8 @@ public:
             log_once("CreateCommandQueue refused (type, priority, flags or node mask), type", desc->Type);
             return d3d12_trace::result(method, E_INVALIDARG);
         }
-        // Global realtime priority needs a privilege the host grants only on request; without it, this answer.
-        if (desc->Priority == D3D12_COMMAND_QUEUE_PRIORITY_GLOBAL_REALTIME) {
+        // Global realtime priority needs SeIncreaseBasePriorityPrivilege enabled in the token; without it, this answer.
+        if (desc->Priority == D3D12_COMMAND_QUEUE_PRIORITY_GLOBAL_REALTIME && !has_global_realtime_privilege()) {
             log_once("CreateCommandQueue refused (global realtime priority), type", desc->Type);
             return d3d12_trace::result(method, DXGI_ERROR_ACCESS_DENIED);
         }
@@ -3735,6 +3831,19 @@ public:
         return hand_out(pipeline, riid, out);
     }
 
+    // Device1: in-memory pipeline library (docs/d3d12_vulkan.md sections 3.6 and 4).
+    HRESULT STDMETHODCALLTYPE CreatePipelineLibrary(const void* blob, SIZE_T size, REFIID riid, void** out) override {
+        constexpr auto method = "ID3D12Device1::CreatePipelineLibrary";
+        if (out) *out = nullptr;
+        if (size > 0 && !blob) return d3d12_trace::result(method, E_INVALIDARG);
+        if (size > 0 && !PipelineLibrary::valid_blob(blob, size))
+            return d3d12_trace::result(method, D3D12_ERROR_DRIVER_VERSION_MISMATCH);
+        if (!out) return d3d12_trace::result(method, S_FALSE);
+        auto* lib = new PipelineLibrary();
+        lib->attach_device(identity());
+        return d3d12_trace::result(method, hand_out(lib, riid, out));
+    }
+
     UINT STDMETHODCALLTYPE GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE) override {
         return kDescriptorSize;
     }
@@ -3793,13 +3902,16 @@ public:
                                      r->allows_view_format(vulkan_format(requested, false).format));
                 if (typeless_rgba8 || (requested != rd.Format && listed &&
                                        rd.Format == DXGI_FORMAT_R8G8B8A8_UNORM)) {
-                    const bool plain = desc && desc->ViewDimension == D3D12_RTV_DIMENSION_TEXTURE2D;
-                    const bool array = desc && desc->ViewDimension == D3D12_RTV_DIMENSION_TEXTURE2DARRAY;
+                    const bool msaa = rd.SampleDesc.Count > 1;
+                    const bool plain = !msaa && desc && desc->ViewDimension == D3D12_RTV_DIMENSION_TEXTURE2D;
+                    const bool array = !msaa && desc && desc->ViewDimension == D3D12_RTV_DIMENSION_TEXTURE2DARRAY;
+                    const bool ms = msaa && desc && desc->ViewDimension == D3D12_RTV_DIMENSION_TEXTURE2DMS;
+                    const bool ms_array = msaa && desc && desc->ViewDimension == D3D12_RTV_DIMENSION_TEXTURE2DMSARRAY;
                     const UINT plane = plain ? desc->Texture2D.PlaneSlice :
                         array ? desc->Texture2DArray.PlaneSlice : 0;
                     // Subtraction keeps malformed layer ranges from overflowing during validation.
-                    if ((!plain && !array) || rd.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
-                        rd.SampleDesc.Count != 1 || plane || !view.resource || view.mip >= rd.MipLevels ||
+                    if ((!plain && !array && !ms && !ms_array) || rd.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
+                        plane || !view.resource || view.mip >= rd.MipLevels ||
                         !view.layer_count || view.first_layer >= rd.DepthOrArraySize ||
                         view.layer_count > rd.DepthOrArraySize - view.first_layer ||
                         !(rd.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET)) {
@@ -3933,9 +4045,10 @@ public:
         TextureView view{};
         if (!desc) {
             const bool array = r->desc().DepthOrArraySize > 1;
-            if (r->desc().Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D && !array)
+            if (r->desc().Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D && !array) {
                 view.type = ImageType::image_1d;
-            else if (r->desc().Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D)
+                view.layer_count = 1;
+            } else if (r->desc().Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D)
                 view.type = ImageType::image_3d;
             else if (r->desc().SampleDesc.Count > 1)
                 view.type = array ? ImageType::image_2d_msaa_array : ImageType::image_2d_msaa;
@@ -3949,6 +4062,7 @@ public:
                 view.type = ImageType::image_1d;
                 view.first_mip = desc->Texture1D.MostDetailedMip;
                 view.mip_count = desc->Texture1D.MipLevels;
+                view.layer_count = 1;
                 view.min_lod = desc->Texture1D.ResourceMinLODClamp;
                 break;
             case D3D12_SRV_DIMENSION_TEXTURE3D:
@@ -4005,6 +4119,95 @@ public:
         write_image_descriptor(*r, view, destination, false);
     }
 
+    // An unordered-access view of a buffer is a V# in the slot (docs section 3.4): the shader loads those four dwords
+    // through its descriptor table and reaches the bytes by the console VA in them. A structured view (format
+    // UNKNOWN and a stride) is `stride` and a record count, a raw one (R32_TYPELESS with the RAW flag) is a byte count,
+    // a typed one (any other format) is the format's GFX10_FORMAT code with the element size as the stride and an
+    // element count: the V# a buffer_load_format / buffer_store_format / buffer_atomic reads (OOB_SELECT 1, so the
+    // index is checked against NUM_RECORDS, docs/buffer_bounds.md). A slot left as zeros is a null descriptor.
+    // A UAV counter (docs section 3.4, "UAV counters") is a second, raw V# of 4 bytes in the slot's upper 16 bytes: the
+    // counter resource's address plus CounterOffsetInBytes. Append and consume are atomics a shader does on it.
+    void write_buffer_uav(ID3D12Resource* resource, ID3D12Resource* counter, const D3D12_UNORDERED_ACCESS_VIEW_DESC* desc,
+                          D3D12_CPU_DESCRIPTOR_HANDLE destination) {
+        namespace g = leonida::gfx10;
+        const D3D12_RESOURCE_DESC& rd = Resource::from<Resource>(resource)->desc();
+        if (!(rd.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) {
+            log_once("unordered-access view of a buffer created without ALLOW_UNORDERED_ACCESS; flags", int(rd.Flags));
+            return;
+        }
+        if (!desc || desc->ViewDimension != D3D12_UAV_DIMENSION_BUFFER) {
+            log_once("unordered-access view of a buffer needs a buffer view description; dimension",
+                     desc ? int(desc->ViewDimension) : -1);
+            return;
+        }
+        const D3D12_BUFFER_UAV& view = desc->Buffer;
+        const bool structured = desc->Format == DXGI_FORMAT_UNKNOWN;
+        const bool raw = desc->Format == DXGI_FORMAT_R32_TYPELESS && (view.Flags & D3D12_BUFFER_UAV_FLAG_RAW);
+        const bool typed = !structured && !raw;
+        std::uint32_t format_code = 0, element_bytes = 0;
+        g::Swizzle channels = g::identity_swizzle;
+        if (typed) {
+            // D3D12: a typed view has no RAW flag; its format is one of the typed-UAV formats the layer can name.
+            const Format mapped = vulkan_format(desc->Format, false);
+            const auto* layout = mapped.format != VK_FORMAT_UNDEFINED && !mapped.typeless && !mapped.rgb96 &&
+                                         !(view.Flags & D3D12_BUFFER_UAV_FLAG_RAW)
+                                     ? leonida::uav_clear::layout(mapped.format)
+                                     : nullptr;
+            format_code = layout ? g::format_from_vulkan(mapped.format) : 0;
+            if (!format_code || format_code >= 128) {  // the V#'s FORMAT is 7 bits
+                log_once("typed buffer unordered-access view format not supported; format", int(desc->Format));
+                return;
+            }
+            element_bytes = layout->bytes;
+            channels = g::format_swizzle(mapped.format);
+        }
+        const UINT64 unit = structured ? view.StructureByteStride : typed ? element_bytes : 4;
+        if (!unit || unit > 0x3fff || view.FirstElement > rd.Width / unit ||
+            (UINT64(view.FirstElement) + view.NumElements) > rd.Width / unit ||
+            UINT64(view.NumElements) * (structured || typed ? 1 : 4) > ~0u) {
+            log_once("unordered-access view of a buffer outside the resource or with a bad stride; elements",
+                     int(view.NumElements));
+            return;
+        }
+        // D3D12: a counter belongs to a structured view and sits in a buffer that allows unordered access, 4096-byte
+        // aligned with room for its 4 bytes; with no counter resource the offset is 0.
+        if (counter || view.CounterOffsetInBytes) {
+            const Resource* c = counter ? Resource::from<Resource>(counter) : nullptr;
+            const bool valid = c && !c->image() && structured &&
+                               (c->desc().Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) &&
+                               !(view.CounterOffsetInBytes % D3D12_UAV_COUNTER_PLACEMENT_ALIGNMENT) &&
+                               UINT64(view.CounterOffsetInBytes) + 4 <= c->desc().Width;
+            if (!valid) {
+                log_once("unordered-access view counter refused (a structured view, a buffer that allows unordered "
+                         "access, a 4096-aligned offset inside it); offset",
+                         int(view.CounterOffsetInBytes));
+                return;
+            }
+        }
+        const UINT64 va = resource->GetGPUVirtualAddress();
+        const UINT64 counter_va = counter ? counter->GetGPUVirtualAddress() : 0;
+        if (!va || (counter && !counter_va)) return;
+        g::Buffer buffer{};
+        buffer.address = va + view.FirstElement * unit;
+        buffer.stride = structured || typed ? std::uint32_t(unit) : 0;
+        buffer.num_records = std::uint32_t(structured || typed ? view.NumElements : UINT64(view.NumElements) * 4);
+        buffer.format = format_code;
+        buffer.swizzle = channels;
+        buffer.oob_select = typed ? g::OobSelect::structured
+                                  : structured ? g::OobSelect::structured_with_offset : g::OobSelect::raw;
+        const g::BufferWords words = g::encode(buffer);
+        std::memcpy(reinterpret_cast<void*>(destination.ptr), words.data(), sizeof(words));
+        if (counter) {
+            g::Buffer counter_buffer{};
+            counter_buffer.address = counter_va + view.CounterOffsetInBytes;
+            counter_buffer.num_records = 4;
+            counter_buffer.oob_select = g::OobSelect::raw;
+            const g::BufferWords counter_words = g::encode(counter_buffer);
+            std::memcpy(reinterpret_cast<char*>(destination.ptr) + sizeof(words), counter_words.data(),
+                        sizeof(counter_words));
+        }
+    }
+
     // An unordered-access view of a texture is a T# too, of one mip; set 0 also holds it as a storage image.
     void STDMETHODCALLTYPE CreateUnorderedAccessView(ID3D12Resource* resource, ID3D12Resource* counter,
                                                      const D3D12_UNORDERED_ACCESS_VIEW_DESC* desc,
@@ -4017,7 +4220,11 @@ public:
             if (resource) stub("ID3D12Device::CreateUnorderedAccessView(resource from another device)");
             return;
         }
-        if (!r->image() || counter) return stub("ID3D12Device::CreateUnorderedAccessView(buffer)");
+        if (!r->image()) return write_buffer_uav(resource, counter, desc, destination);
+        if (counter) {
+            log_once("unordered-access view of a texture with a counter resource; dimension", int(r->desc().Dimension));
+            return;
+        }
         if (!(r->desc().Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) {
             log_once("unordered-access view of a texture created without ALLOW_UNORDERED_ACCESS; flags",
                      int(r->desc().Flags));
@@ -4053,6 +4260,7 @@ public:
             return;
         }
         write_image_descriptor(*r, view, destination, true);
+        state_.context->note_storage_image(r->id());
     }
 
     // A sampler is an S# in the first 16 bytes of the slot; the shader finds the sampler by those four dwords.
@@ -4286,7 +4494,11 @@ public:
     // 64 KiB-aligned offset is simply that offset into the arena, and its console VA is the heap's place plus it.
     HRESULT STDMETHODCALLTYPE CreateHeap(const D3D12_HEAP_DESC* desc, REFIID riid, void** out) override {
         if (out) *out = nullptr;
-        if (!desc || !desc->SizeInBytes) return E_INVALIDARG;
+        if (!desc) return E_INVALIDARG;
+        if (const char* why = heap_desc_refusal(*desc)) {
+            log_once((std::string("CreateHeap refused (") + why + "), heap type").c_str(), int(desc->Properties.Type));
+            return E_INVALIDARG;
+        }
         if (!state_.arena.mapped) {
             log_once("heaps need the GPU address arena (bufferDeviceAddress); heap size in KiB:",
                      int(desc->SizeInBytes / 1024));
@@ -4304,6 +4516,18 @@ public:
             return S_FALSE;
         }
         return hand_out(heap, riid, out);
+    }
+
+    // Device4: CreateHeap with a protected session, which is refused as CreateCommittedResource1 refuses one. The host
+    // gives the same answers as CreateHeap for the D3D-238 descriptions.
+    HRESULT STDMETHODCALLTYPE CreateHeap1(const D3D12_HEAP_DESC* desc, ID3D12ProtectedResourceSession* session,
+                                          REFIID riid, void** out) override {
+        if (out) *out = nullptr;
+        if (session) {
+            log_once("protected resource session refused (not supported) by CreateHeap1", 1);
+            return E_INVALIDARG;
+        }
+        return CreateHeap(desc, riid, out);
     }
 
     HRESULT STDMETHODCALLTYPE CreatePlacedResource(ID3D12Heap* heap_interface, UINT64 heap_offset,
@@ -4360,18 +4584,22 @@ public:
         const bool tiled = is_tiled_layout(desc->Layout);
         const bool msaa = desc->SampleDesc.Count > 1;
         if (desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
+            if (heap->flags() & D3D12_HEAP_FLAG_DENY_BUFFERS) return E_INVALIDARG;
             if (desc->Layout != D3D12_TEXTURE_LAYOUT_ROW_MAJOR) return E_INVALIDARG;
             if (desc->Width > heap->bytes() || heap_offset > heap->bytes() - desc->Width) return E_INVALIDARG;
         } else {
             if (heap->properties().Type == D3D12_HEAP_TYPE_UPLOAD ||
                 heap->properties().Type == D3D12_HEAP_TYPE_READBACK)
                 return E_INVALIDARG;
+            const bool rt_ds = (desc->Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET |
+                                              D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)) != 0;
+            if (rt_ds && (heap->flags() & D3D12_HEAP_FLAG_DENY_RT_DS_TEXTURES)) return E_INVALIDARG;
+            if (!rt_ds && (heap->flags() & D3D12_HEAP_FLAG_DENY_NON_RT_DS_TEXTURES)) return E_INVALIDARG;
             if (tiled || msaa) {
                 if (tiled && desc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
                     desc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE3D)
                     return E_INVALIDARG;
                 if (msaa && desc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D) return E_INVALIDARG;
-                if (msaa && (heap->flags() & D3D12_HEAP_FLAG_DENY_RT_DS_TEXTURES)) return E_INVALIDARG;
                 const D3D12_RESOURCE_ALLOCATION_INFO alloc = allocation(*desc);
                 if (alloc.SizeInBytes == UINT64_MAX || heap->alignment() < alloc.Alignment ||
                     heap_offset % alloc.Alignment || alloc.SizeInBytes > heap->bytes() ||
@@ -5788,7 +6016,8 @@ HRESULT create_dxgi_factory(ID3D12Device* device, REFIID riid, void** out) {
                                     i.queue_family, riid, out);
 }
 
-// Creates its own Vulkan 1.3 instance and device. LEONIDA_VK_VALIDATION=1 adds VK_LAYER_KHRONOS_validation.
+// Creates its own Vulkan instance and a Vulkan 1.3 device, or a 1.2 device with VK_KHR_dynamic_rendering and
+// VK_KHR_synchronization2 (vulkan13_features.h). LEONIDA_VK_VALIDATION=1 adds VK_LAYER_KHRONOS_validation.
 HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     if (!out) return E_POINTER;
     *out = nullptr;
@@ -5901,22 +6130,21 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     bool chosen_bc = false;
     VkPhysicalDeviceFeatures chosen_features{};
     VkPhysicalDeviceVulkan12Features chosen12{};
-    VkPhysicalDeviceVulkan13Features chosen13{};
     bool chosen_draw_params = false;
+    leonida::Vulkan13Features v13, candidate13;
     for (VkPhysicalDevice candidate : physicals) {
         VkPhysicalDeviceProperties props{};
         vkGetPhysicalDeviceProperties(candidate, &props);
-        if (props.apiVersion < VK_API_VERSION_1_3 || !leonida::vulkan_device_wanted(props.deviceName)) continue;
-        VkPhysicalDeviceVulkan13Features f13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
-        VkPhysicalDeviceVulkan11Features f11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES, &f13};
+        if (!leonida::vulkan_device_wanted(props.deviceName)) continue;
+        candidate13.query(candidate, props.apiVersion, vkGetPhysicalDeviceFeatures2, vkEnumerateDeviceExtensionProperties);
+        if (!candidate13.usable()) continue;
+        VkPhysicalDeviceVulkan11Features f11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES};
         VkPhysicalDeviceVulkan12Features f12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &f11};
         VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &f12};
         vkGetPhysicalDeviceFeatures2(candidate, &features);
         const bool bc = features.features.textureCompressionBC;
         const bool draw_params = f11.shaderDrawParameters;
-        if (!f13.dynamicRendering || !f13.synchronization2 || !f12.timelineSemaphore ||
-            !f12.separateDepthStencilLayouts || !f12.bufferDeviceAddress)
-            continue;
+        if (!f12.timelineSemaphore || !f12.separateDepthStencilLayouts || !f12.bufferDeviceAddress) continue;
         std::uint32_t family_count = 0;
         vkGetPhysicalDeviceQueueFamilyProperties(candidate, &family_count, nullptr);
         std::vector<VkQueueFamilyProperties> families(family_count);
@@ -5930,18 +6158,22 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
                 chosen_bc = bc;
                 chosen_features = features.features;
                 chosen12 = f12;
-                chosen13 = f13;
                 chosen_draw_params = draw_params;
+                v13.choose(candidate13);
             }
             break;
         }
     }
     if (!info.physical)
         return fail(leonida::vulkan_device_filter().empty()
-                        ? "no Vulkan 1.3 GPU with dynamicRendering, synchronization2, timelineSemaphore and "
-                          "separateDepthStencilLayouts"
-                        : "no GPU named by LEONIDA_VK_DEVICE has Vulkan 1.3 with dynamicRendering, synchronization2, "
-                          "timelineSemaphore and separateDepthStencilLayouts");
+                        ? "no Vulkan 1.3 GPU (or 1.2 with VK_KHR_dynamic_rendering and VK_KHR_synchronization2) with "
+                          "dynamicRendering, synchronization2, timelineSemaphore and separateDepthStencilLayouts"
+                        : "no GPU named by LEONIDA_VK_DEVICE has Vulkan 1.3 (or 1.2 with VK_KHR_dynamic_rendering and "
+                          "VK_KHR_synchronization2) with dynamicRendering, synchronization2, timelineSemaphore and "
+                          "separateDepthStencilLayouts");
+    if (!v13.core)
+        std::fprintf(stderr, "[rt] d3d12: Vulkan 1.2 device: dynamicRendering and synchronization2 through their KHR "
+                             "extensions\n");
 
     // VK_EXT_conditional_rendering for SetPredication, VK_KHR_swapchain for DXGI presentation, and optional
     // VK_KHR_acceleration_structure + VK_KHR_ray_query for hardware BVH builds (BLAS + TLAS).
@@ -6011,17 +6243,13 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
         ext_chain = &enable_conditional;
     }
 
-    VkPhysicalDeviceVulkan13Features enable13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES, ext_chain};
-    enable13.dynamicRendering = VK_TRUE;
-    enable13.synchronization2 = VK_TRUE;
     // Subgroup size control: a pipeline stage asks for the size its shader was translated for (src/subgroup_size.h).
-    enable13.subgroupSizeControl = chosen13.subgroupSizeControl;
-    enable13.computeFullSubgroups = chosen13.computeFullSubgroups;
-    leonida::query_subgroup_size_caps(vkGetPhysicalDeviceProperties2, info.physical, chosen13.subgroupSizeControl,
-                                      chosen13.computeFullSubgroups, info.subgroup);
+    leonida::query_subgroup_size_caps(vkGetPhysicalDeviceProperties2, info.physical, v13.subgroup_size_control,
+                                      v13.compute_full_subgroups, info.subgroup);
     // Translated vertex shaders read BaseVertex / BaseInstance (SPIR-V DrawParameters) to give v0 / v3 the
     // hardware's zero-based vertex and instance ids (docs/design.md, Inputs and outputs).
-    VkPhysicalDeviceVulkan11Features enable11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES, &enable13};
+    VkPhysicalDeviceVulkan11Features enable11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES,
+                                              v13.enable(ext_chain)};
     enable11.shaderDrawParameters = chosen_draw_params ? VK_TRUE : VK_FALSE;
     if (!chosen_draw_params) std::fprintf(stderr, "[rt] d3d12: the GPU has no shaderDrawParameters\n");
     VkPhysicalDeviceVulkan12Features enable12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &enable11};
@@ -6094,8 +6322,8 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
         vkGetPhysicalDeviceFeatures2(info.physical, &query);
         info.image_view_min_lod = min_lod.minLod == VK_TRUE;
         if (info.image_view_min_lod) {
-            min_lod.pNext = enable13.pNext;
-            enable13.pNext = &min_lod;
+            min_lod.pNext = *v13.next();
+            *v13.next() = &min_lod;
         }
     }
     VkPhysicalDeviceHostImageCopyFeaturesEXT host_copy{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_IMAGE_COPY_FEATURES_EXT};
@@ -6106,8 +6334,8 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     const char* host_image_copy_name = VK_EXT_HOST_IMAGE_COPY_EXTENSION_NAME;
     info.host_image_copy = has_host_image_copy && host_copy.hostImageCopy;
     if (info.host_image_copy) {
-        host_copy.pNext = enable13.pNext;  // after the conditional rendering features, if any
-        enable13.pNext = &host_copy;
+        host_copy.pNext = *v13.next();  // after the conditional rendering features, if any
+        *v13.next() = &host_copy;
     } else {
         std::fprintf(stderr, "[rt] d3d12: no VK_EXT_host_image_copy; CPU texture copies use a staging submit\n");
     }
@@ -6124,8 +6352,8 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
         vkGetPhysicalDeviceFeatures2(info.physical, &query);
         info.shader_fma = shader_fma.shaderFmaFloat32 == VK_TRUE;
         if (info.shader_fma) {
-            shader_fma.pNext = enable13.pNext;
-            enable13.pNext = &shader_fma;
+            shader_fma.pNext = *v13.next();
+            *v13.next() = &shader_fma;
         }
     }
 #endif
@@ -6177,8 +6405,8 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
             VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &swapchain_m1};
             vkGetPhysicalDeviceFeatures2(info.physical, &query);
             if (swapchain_m1.swapchainMaintenance1 == VK_TRUE) {
-                swapchain_m1.pNext = enable13.pNext;
-                enable13.pNext = &swapchain_m1;
+                swapchain_m1.pNext = *v13.next();
+                *v13.next() = &swapchain_m1;
             } else {
                 swapchain_m1_name = nullptr;
             }
@@ -6192,6 +6420,7 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     device_info.pQueueCreateInfos = &queue_info;
     device_info.pEnabledFeatures = &enable;
     std::vector<const char*> device_extensions;
+    v13.add_extensions(device_extensions);
     if (info.image_view_min_lod) device_extensions.push_back(VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME);
     if (info.conditional_rendering) device_extensions.push_back(conditional_extension);
     if (info.host_image_copy) device_extensions.push_back(host_image_copy_name);
@@ -6243,6 +6472,31 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
         return E_FAIL;
     }
     return hand_out(device, riid, out);
+}
+
+bool has_global_realtime_privilege() {
+    const int override_state = g_global_realtime_privilege_override.load(std::memory_order_relaxed);
+    if (override_state >= 0) return override_state != 0;
+    HANDLE token = nullptr;
+    if (!OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, TRUE, &token) &&
+        !OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token))
+        return false;
+    LUID luid{};
+    BOOL enabled = FALSE;
+    if (LookupPrivilegeValueW(nullptr, L"SeIncreaseBasePriorityPrivilege", &luid)) {
+        PRIVILEGE_SET set{};
+        set.PrivilegeCount = 1;
+        set.Control = PRIVILEGE_SET_ALL_NECESSARY;
+        set.Privilege[0].Luid = luid;
+        set.Privilege[0].Attributes = SE_PRIVILEGE_ENABLED;
+        if (!PrivilegeCheck(token, &set, &enabled)) enabled = FALSE;
+    }
+    CloseHandle(token);
+    return enabled != FALSE;
+}
+
+void set_global_realtime_privilege_override_for_test(int state) {
+    g_global_realtime_privilege_override.store(state, std::memory_order_relaxed);
 }
 
 }  // namespace rt::d3d12

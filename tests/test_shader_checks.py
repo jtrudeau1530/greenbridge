@@ -16,6 +16,7 @@ import check
 
 GOOD_FMT = struct.pack("<64I", *check.FMT_1010102_WORDS, *[0xEEEEEEEE] * 48)
 GOOD_XY_XYZ = struct.pack("<192I", *check.FMT_XY_XYZ_WORDS, *[0xEEEEEEEE] * 108)
+GOOD_TBUFFER_STORE = struct.pack("<192I", *check.TBUFFER_STORE_WORDS, *[0xEEEEEEEE] * 140)
 FULL_WAVE = ((0, "compute subgroup size: 64\n0 mismatches\n"),
              (0, "compute subgroup size: 64\nout[0..7] = 32 16 24 40 8 48 4008636142 4008636142\n"))
 
@@ -29,7 +30,7 @@ WAVE32_WORDS = {n: w for n, w in check.CS_DUMPS if n in check.WAVE32_DUMPS and n
 
 # All check.py cases, including the four vk_store_test shaders and the three mesh fixtures, and TEST-184's
 # vk_store_test "words" fixtures and image_get_lod draws.
-TOTAL = (len(check.COMPUTE) + 4 + len(check.CS_DUMPS) + len(check.W64X_DUMPS) + len(check.W64X_PARTIAL) + 4
+TOTAL = (len(check.COMPUTE) + 5 + len(check.CS_DUMPS) + len(check.W64X_DUMPS) + len(check.W64X_PARTIAL) + 4
          + len(check.PIXEL_TESTS) + len(check.CLIP_TESTS) + len(check.BOUNDS) + len(check.GLOBAL_OFFSET)
          + len(check.MIP_TEST_PASSES) + len(check.GRADIENT_TESTS)
          + len(check.STORE_WORDS) + len(check.GET_LOD_TESTS)
@@ -70,9 +71,9 @@ class Wave64Checks(unittest.TestCase):
                 self.assertEqual((args, env["VKC_OUT_WORDS"]), (("1", "dump"), "64"))
                 Path(env["VKC_DUMP"]).write_bytes(struct.pack("<64I", *check.FMT_SINT32_WORDS))
                 return 0, ""
-            if name == "cs_fmt_xy_xyz":
+            if name in ("cs_fmt_xy_xyz", "cs_tbuffer_store"):
                 self.assertEqual((args, env["VKC_OUT_WORDS"]), (("1", "dump"), "192"))
-                Path(env["VKC_DUMP"]).write_bytes(GOOD_XY_XYZ)
+                Path(env["VKC_DUMP"]).write_bytes(GOOD_XY_XYZ if name == "cs_fmt_xy_xyz" else GOOD_TBUFFER_STORE)
                 return 0, "out[0..7] = 0 0 0 0 0 0 0 0\n"
             if name == "cs_user_sgprs":
                 # The seeded words come back only if check.py passed them in VKC_SGPRS.
@@ -256,6 +257,23 @@ class FloatToIntSweep(unittest.TestCase):
         problem, _ = self.sweep(wrong_for=0x4F000000)
         self.assertIn("1 of 16 inputs wrong", problem)
         self.assertIn("0x4f000000", problem)
+
+    def test_a_device_that_cannot_pin_the_wave_size_skips_instead_of_failing(self):
+        # Before: on a 4..32 device (Apple under MoltenVK) every dispatch came back as unpinned_subgroup_skip's Skip,
+        # and the sweep reported it as "16 of 16 inputs wrong, first 0x00000000: SKIP (...)", a failure.
+        calls = []
+
+        def harness(_tool, _shader, *_args, env=None):
+            calls.append(env.get("VKC_SUBGROUP_SIZE"))
+            return 1, "compute subgroup size: 32 not available\n"
+
+        with patch.object(check, "run", side_effect=harness), \
+                patch.object(check, "subgroup_size", return_value=32):
+            problem = check.cvt_f32_sat_test("tools", "spirv")
+        self.assertIsInstance(problem, check.Skip)
+        self.assertIn("can't run this shader at 32 lanes", problem)
+        self.assertNotIn("inputs wrong", problem)
+        self.assertEqual(calls, ["32"])   # the first dispatch decides; the other 15 would say the same
 
     def test_inputs_match_the_interpreter_test(self):
         # The GPU sweep and tests/semantic/test_float_to_int.py must judge the same inputs the same way.

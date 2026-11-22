@@ -635,7 +635,7 @@ def main() -> int:
     if args.json:
         public_rows = [{key: value for key, value in row.items() if key != "_scan"} for row in rows]
         _make_parent(args.json)
-        with open(args.json, "w", encoding="utf-8") as f:
+        with open(args.json, "w", encoding="utf-8", newline="\n") as f:
             json.dump({"summary": summary, "roots": agg["roots"], "rows": public_rows}, f, indent=1)
         print("wrote", args.json)
     return 0 if clean else 1

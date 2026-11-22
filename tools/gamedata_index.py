@@ -443,7 +443,7 @@ def main() -> int:
         write_csv(a.csv, rows)
     if a.json:
         _make_parent(a.json)
-        with open(a.json, "w", encoding="utf-8") as f:
+        with open(a.json, "w", encoding="utf-8", newline="\n") as f:
             json.dump({"summary": summary, "rows": rows}, f, indent=1)
 
     print(f'{summary["streams"]} streams, {summary["stored"]:,} stored, '

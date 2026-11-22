@@ -857,7 +857,7 @@ if(TARGET Vulkan::Headers)
               ${_stubs_header}
               ID3D12GraphicsCommandList8 ID3D12CommandQueue ID3D12CommandAllocator ID3D12Fence1
               ID3D12Device11 ID3D12DescriptorHeap ID3D12Heap ID3D12Resource ID3D12QueryHeap ID3D12RootSignature
-              ID3D12PipelineState ID3D12CommandSignature
+              ID3D12PipelineState ID3D12CommandSignature ID3D12PipelineLibrary1
       DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/../tools/gen_d3d12_stubs.py ${LEONIDA_D3D12_HEADER}
       COMMENT "Generating D3D12 COM stubs"
       VERBATIM)
@@ -1222,8 +1222,65 @@ if(TARGET Vulkan::Headers)
       target_compile_options(d3d12_m3_frame_test PRIVATE /W4 /permissive- /utf-8)
       add_test(NAME d3d12_m3_frame COMMAND d3d12_m3_frame_test)
       set_tests_properties(d3d12_m3_frame PROPERTIES SKIP_RETURN_CODE 77)
+
+      # M4 (synthetic part): compute PSOs, a UAV table (structured and raw buffers, an R32_UINT storage image), an indirect
+      # dispatch from arguments a first dispatch wrote, and a copy queue that streams the input in and reads the results
+      # back across queue fences. cs_m4_fill.asm and cs_m4_indirect.asm go through the same build; build.py publishes
+      # their synthetic FSSM programs (the compute header and the words their "fssm-data" comments give), which the
+      # test wraps in shader containers.
+      set(LEONIDA_M4_DIR ${CMAKE_CURRENT_BINARY_DIR}/generated/m4_shaders)
+      set(LEONIDA_M4_FILES ${LEONIDA_M4_DIR}/spirv/index.json ${LEONIDA_M4_DIR}/fssm/cs_m4_fill.fssm
+                           ${LEONIDA_M4_DIR}/fssm/cs_m4_indirect.fssm)
+      add_custom_command(
+        OUTPUT ${LEONIDA_M4_FILES}
+        COMMAND ${CMAKE_COMMAND} -E remove_directory ${LEONIDA_M4_DIR}
+        COMMAND ${CMAKE_COMMAND} -E env "LLVM_MC=${LEONIDA_LLVM_MC}" "LEONIDA_SPIRV_TOOLS=${LEONIDA_SPIRV_TOOLS_NATIVE}"
+                $<TARGET_FILE:Python3::Interpreter> -I ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build.py
+                ${LEONIDA_M4_DIR} cs_m4_fill cs_m4_indirect
+        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build.py
+                ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/compute_fixture.py
+                ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/cs_m4_fill.asm
+                ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/cs_m4_indirect.asm
+                ${CMAKE_CURRENT_SOURCE_DIR}/../tools/rdna2spirv.py
+        COMMENT "Translating cs_m4_fill and cs_m4_indirect for the compute test"
+        VERBATIM)
+      add_executable(d3d12_m4_compute_test test/d3d12_m4_compute_test.cpp shims/d3d12_xs_device.cpp ${LEONIDA_M4_FILES})
+      target_link_libraries(d3d12_m4_compute_test PRIVATE gta6rt_d3d12_com)
+      target_compile_definitions(d3d12_m4_compute_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
+                                 LEONIDA_TEST_M4_DIR="${LEONIDA_M4_DIR}")
+      target_compile_options(d3d12_m4_compute_test PRIVATE /W4 /permissive- /utf-8)
+      add_test(NAME d3d12_m4_compute COMMAND d3d12_m4_compute_test)
+      set_tests_properties(d3d12_m4_compute PROPERTIES SKIP_RETURN_CODE 77)
+
+      # Typed buffer UAVs and UAV counters: cs_buf_typed.asm writes typed views through V#s with a FORMAT, and
+      # cs_buf_counter.asm appends to and consumes from a structured view whose counter is the second V# of its slot;
+      # the test also compares typed-buffer and counter clears with the host runtime on the layer's adapter.
+      set(LEONIDA_BUFFER_UAV_DIR ${CMAKE_CURRENT_BINARY_DIR}/generated/buffer_uav_shaders)
+      set(LEONIDA_BUFFER_UAV_FILES ${LEONIDA_BUFFER_UAV_DIR}/spirv/index.json
+                                   ${LEONIDA_BUFFER_UAV_DIR}/fssm/cs_buf_typed.fssm
+                                   ${LEONIDA_BUFFER_UAV_DIR}/fssm/cs_buf_counter.fssm)
+      add_custom_command(
+        OUTPUT ${LEONIDA_BUFFER_UAV_FILES}
+        COMMAND ${CMAKE_COMMAND} -E remove_directory ${LEONIDA_BUFFER_UAV_DIR}
+        COMMAND ${CMAKE_COMMAND} -E env "LLVM_MC=${LEONIDA_LLVM_MC}" "LEONIDA_SPIRV_TOOLS=${LEONIDA_SPIRV_TOOLS_NATIVE}"
+                $<TARGET_FILE:Python3::Interpreter> -I ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build.py
+                ${LEONIDA_BUFFER_UAV_DIR} cs_buf_typed cs_buf_counter
+        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build.py
+                ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/compute_fixture.py
+                ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/cs_buf_typed.asm
+                ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/cs_buf_counter.asm
+                ${CMAKE_CURRENT_SOURCE_DIR}/../tools/rdna2spirv.py
+        COMMENT "Translating cs_buf_typed and cs_buf_counter for the buffer UAV test"
+        VERBATIM)
+      add_executable(d3d12_buffer_uav_test test/d3d12_buffer_uav_test.cpp shims/d3d12_xs_device.cpp ${LEONIDA_BUFFER_UAV_FILES})
+      target_link_libraries(d3d12_buffer_uav_test PRIVATE gta6rt_d3d12_com)
+      target_compile_definitions(d3d12_buffer_uav_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
+                                 LEONIDA_TEST_BUFFER_UAV_DIR="${LEONIDA_BUFFER_UAV_DIR}")
+      target_compile_options(d3d12_buffer_uav_test PRIVATE /W4 /permissive- /utf-8)
+      add_test(NAME d3d12_buffer_uav COMMAND d3d12_buffer_uav_test)
+      set_tests_properties(d3d12_buffer_uav PROPERTIES SKIP_RETURN_CODE 77)
     else()
-      message(STATUS "llvm-mc (set LLVM_MC) or the SDK's spirv-as/spirv-val not found: d3d12_translated_draw_test, d3d12_m2_textured_test and d3d12_m3_frame_test are not built")
+      message(STATUS "llvm-mc (set LLVM_MC) or the SDK's spirv-as/spirv-val not found: d3d12_translated_draw_test, d3d12_m2_textured_test, d3d12_m3_frame_test, d3d12_m4_compute_test and d3d12_buffer_uav_test are not built")
     endif()
     # ID3D12Resource::GetHeapProperties and ID3D12DescriptorHeap::GetDesc (node masks, resolved heap flags) against the
     # host runtime and WARP; run explicitly on a Vulkan GPU.
@@ -1387,6 +1444,16 @@ if(TARGET Vulkan::Headers)
       target_compile_options(d3d12_set0_compute_test PRIVATE /W4 /permissive- /utf-8)
       add_test(NAME d3d12_set0_compute COMMAND d3d12_set0_compute_test)
       set_tests_properties(d3d12_set0_compute PROPERTIES SKIP_RETURN_CODE 77)
+      add_executable(d3d12_pipeline_library_test test/d3d12_pipeline_library_test.cpp
+                     ${LEONIDA_TEST_CS} ${LEONIDA_TEST_VS} ${LEONIDA_TEST_PS})
+      target_link_libraries(d3d12_pipeline_library_test PRIVATE gta6rt_d3d12_com)
+      target_compile_definitions(d3d12_pipeline_library_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
+                                 LEONIDA_TEST_CS_SPV="${LEONIDA_TEST_CS}"
+                                 LEONIDA_TEST_VS_SPV="${LEONIDA_TEST_VS}"
+                                 LEONIDA_TEST_PS_SPV="${LEONIDA_TEST_PS}")
+      target_compile_options(d3d12_pipeline_library_test PRIVATE /W4 /permissive- /utf-8)
+      add_test(NAME d3d12_pipeline_library COMMAND d3d12_pipeline_library_test)
+      set_tests_properties(d3d12_pipeline_library PROPERTIES SKIP_RETURN_CODE 77)
     else()
       message(STATUS "glslangValidator not found: d3d12_compute_test, d3d12_draw_test and d3d12_set0_compute_test are not built")
     endif()

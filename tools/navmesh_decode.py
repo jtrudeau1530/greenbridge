@@ -1011,7 +1011,7 @@ def main(argv=None):
         print("error: %s" % exc, file=sys.stderr)
         return 2
     _make_parent(out)
-    with open(out, "w", encoding="utf-8") as f:
+    with open(out, "w", encoding="utf-8", newline="\n") as f:
         json.dump(summary, f, indent=1, allow_nan=False)
     if a.csv:
         write_csv(a.csv, rows)

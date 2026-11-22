@@ -751,7 +751,7 @@ def _write_reports(a, rows, stats, agg):
     summary["versions"] = sorted({r["version"] for r in rows})
     doc = {"summary": summary, "resources": rows}
     os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
-    with open(a.out, "w", encoding="utf-8") as f:
+    with open(a.out, "w", encoding="utf-8", newline="\n") as f:
         json.dump(doc, f, indent=1, sort_keys=True)
     if a.csv:
         cols = ["source", "offset", "size", "signature", "version", "kind", "structs", "enums", "blocks",
@@ -772,7 +772,7 @@ def _write_reports(a, rows, stats, agg):
                 w.writerow(r)
     if agg is not None:
         os.makedirs(os.path.dirname(os.path.abspath(a.archetypes_out)), exist_ok=True)
-        with open(a.archetypes_out, "w", encoding="utf-8") as f:
+        with open(a.archetypes_out, "w", encoding="utf-8", newline="\n") as f:
             json.dump(agg.to_json(), f, indent=1, sort_keys=True)
         summary["archetype_file"] = agg.to_json()["summary"]
     return summary

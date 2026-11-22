@@ -170,7 +170,7 @@ def create(game_dir: str, out: str, jobs: int = 1) -> int:
     os.makedirs(out_dir, exist_ok=True)
     with tempfile.TemporaryDirectory(dir=out_dir) as staging:
         staged = os.path.join(staging, "manifest.json")
-        with open(staged, "w", encoding="utf-8") as f:
+        with open(staged, "w", encoding="utf-8", newline="\n") as f:
             json.dump({"created": time.strftime("%Y-%m-%d %H:%M:%S"), "files": entries}, f, indent=1)
         os.replace(staged, out)
     print(f"{len(entries)} files, {total / 2**30:.1f} GiB -> {out}")

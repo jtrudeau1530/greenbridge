@@ -739,10 +739,10 @@ def assemble(mc, prog, src, disasm, fssm):
     if r.returncode or "error:" in r.stderr:
         raise RuntimeError(f"{prog.name} did not assemble:\n{r.stderr}\n{src}")
     code = "".join(ln for ln in r.stdout.splitlines(keepends=True) if not ln.lstrip().startswith("."))
-    with open(os.path.join(disasm, prog.name + ".s"), "w", encoding="utf-8") as f:
+    with open(os.path.join(disasm, prog.name + ".s"), "w", encoding="utf-8", newline="\n") as f:
         f.write(f"; {prog.name}  crosslane_fuzz\n{code}")
     asm_path = os.path.join(fssm, prog.name + ".asm")
-    with open(asm_path, "w", encoding="utf-8") as f:
+    with open(asm_path, "w", encoding="utf-8", newline="\n") as f:
         f.write(src)
     with open(os.path.join(fssm, prog.name + ".fssm"), "wb") as f:
         f.write(compute_fixture.compute_header(asm_path))
@@ -1008,7 +1008,7 @@ def main():
                 print(describe(p, bad))
             if args.keep:
                 os.makedirs(args.keep, exist_ok=True)
-                with open(os.path.join(args.keep, f"{p.name}_{mode}.asm"), "w", encoding="utf-8") as f:
+                with open(os.path.join(args.keep, f"{p.name}_{mode}.asm"), "w", encoding="utf-8", newline="\n") as f:
                     f.write(kept_source(p, mode, None, not args.no_hw_guard))
             if args.minimize and bad and what.startswith("mismatch"):
                 if mode == "hw":
@@ -1021,7 +1021,7 @@ def main():
                 print("  minimized:\n\t" + "\n\t".join(o.text + ("   ; hypothesis op" if i in hyp_ops else "")
                                                          for i, o in enumerate(ops)))
                 if args.keep:
-                    with open(os.path.join(args.keep, f"{p.name}_{mode}_min.asm"), "w", encoding="utf-8") as f:
+                    with open(os.path.join(args.keep, f"{p.name}_{mode}_min.asm"), "w", encoding="utf-8", newline="\n") as f:
                         f.write(kept_source(p, mode, ops, not args.no_hw_guard))
     finally:
         if oracle:

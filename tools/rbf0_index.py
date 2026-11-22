@@ -464,7 +464,7 @@ def write_output(path, records, summary, all_strings=False):
             doc["sample_strings"] = r["_all_strings"] if all_strings else r["sample"]
             doc["sample_truncated"] = not all_strings and r["strings"] > len(r["sample"])
             docs.append(doc)
-        with open(path, "w", encoding="utf-8") as f:
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
             json.dump({"summary": summary, "files": docs}, f, indent=1)
         return
     with open(path, "w", encoding="utf-8", newline="") as f:

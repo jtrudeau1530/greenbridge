@@ -460,9 +460,9 @@ def main(argv: list[str] | None = None) -> int:
             rc = 1
             continue
         try:
-            with open(json_path, "w", encoding="utf-8") as f:
+            with open(json_path, "w", encoding="utf-8", newline="\n") as f:
                 json.dump(r, f, indent=1)
-            with open(md_path, "w", encoding="utf-8") as f:
+            with open(md_path, "w", encoding="utf-8", newline="\n") as f:
                 f.write(to_markdown(r))
         except OSError as e:
             print(f"{img}: cannot write report ({e.strerror or e})", file=sys.stderr)

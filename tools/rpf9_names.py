@@ -207,7 +207,7 @@ def publish_report(path, rows, summary):
     os.makedirs(directory, exist_ok=True)
     with tempfile.TemporaryDirectory(dir=directory, prefix=".rpf9_names-") as stage_dir:
         temp = os.path.join(stage_dir, "report.json")
-        with open(temp, "w", encoding="utf-8") as f:
+        with open(temp, "w", encoding="utf-8", newline="\n") as f:
             json.dump({"summary": summary, "files": rows}, f, indent=1)
             f.write("\n")
         os.chmod(temp, published_mode(path))

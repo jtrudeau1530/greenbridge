@@ -28,6 +28,7 @@ execute_process(COMMAND ${RUNNER} "${TOOL}" "${TEST_DIR}"
                 --jobs 2 --start 3 --count 0 --max-bytes 0 --large-module-bytes 0
                 --slow 0.5 --stage cs --stats report.csv
                 RESULT_VARIABLE code OUTPUT_VARIABLE log ERROR_VARIABLE log TIMEOUT 5)
-if(NOT code STREQUAL "2" OR NOT log MATCHES "malformed JSON")
+# The index parser names the file and where it stopped (#1847: "index.json: expected '{' at byte 0").
+if(NOT code STREQUAL "2" OR NOT log MATCHES "index.json: ")
   message(FATAL_ERROR "Expected valid arguments to reach the malformed index, got ${code}\n${log}")
 endif()

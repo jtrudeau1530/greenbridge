@@ -21,10 +21,12 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <functional>
+#include <mutex>
 #include <string_view>
 #include <thread>
 #include <vector>
@@ -220,20 +222,36 @@ int main() {
 
         // Next present succeeds, runs the deferred zero-fill, commits GENERAL, and unlocks tracker_mutex_ before
         // vkQueuePresentKHR so other threads' emit() / layout() calls are not blocked by presentation.
-        std::atomic<bool> read_done{false};
+        std::mutex sync_mutex;
+        std::condition_variable sync_cv;
+        bool reader_started = false;
+        bool read_done = false;
         VkImageLayout seen_during_present = VK_IMAGE_LAYOUT_UNDEFINED;
         bool unblocked_during_present = false;
         std::thread reader;
         driver::on_next_present = [&] {
             reader = std::thread([&] {
-                seen_during_present = context.layout(1, 0);
-                read_done.store(true, std::memory_order_release);
+                {
+                    std::lock_guard lk(sync_mutex);
+                    reader_started = true;
+                }
+                sync_cv.notify_all();
+                const VkImageLayout layout = context.layout(1, 0);
+                {
+                    std::lock_guard lk(sync_mutex);
+                    seen_during_present = layout;
+                    read_done = true;
+                }
+                sync_cv.notify_all();
             });
-            std::this_thread::sleep_for(std::chrono::milliseconds(30));
-            unblocked_during_present = read_done.load(std::memory_order_acquire);
+            std::unique_lock lk(sync_mutex);
+            const bool started = sync_cv.wait_for(lk, std::chrono::seconds(2), [&] { return reader_started; });
+            unblocked_during_present =
+                started && sync_cv.wait_for(lk, std::chrono::milliseconds(500), [&] { return read_done; });
         };
-        EXPECT(presenter.present(1, true) == VK_SUCCESS);
+        const VkResult present_rc = presenter.present(1, true);
         if (reader.joinable()) reader.join();
+        EXPECT(present_rc == VK_SUCCESS);
         EXPECT(unblocked_during_present);
         EXPECT(seen_during_present == VK_IMAGE_LAYOUT_GENERAL);
         EXPECT(context.layout(1, 0) == VK_IMAGE_LAYOUT_GENERAL);
