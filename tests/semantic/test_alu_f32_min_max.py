@@ -17,6 +17,7 @@ RDNA2 Floating-Point Rules:
      max(+0.0, -0.0) = +0.0, max(-0.0, +0.0) = +0.0
   3. Infinities and Extreme Floats:
      -INF < -FLT_MAX < ... < -FLT_MIN < -0.0 < +0.0 < +FLT_MIN < ... < +FLT_MAX < +INF.
+     Subnormals are strictly preserved (not flushed to zero in IEEE mode).
   4. VOP2 (e32) and VOP3 (e64) Encoding Forms & Modifiers:
      Input modifiers: neg (-src), abs (|src|), and neg-abs (-|src|).
      Output modifier: clamp to [0.0, 1.0].
@@ -24,6 +25,8 @@ RDNA2 Floating-Point Rules:
      tools/rdna2spirv.py maps v_min_f32, v_max_f32, v_min3_f32, and v_max3_f32 to GLSL.std.450
      NMin and NMax (OpExtInst %float %glsl NMin/NMax), which enforce identical NaN-skipping and
      signed-zero rules. v_med3_f32 lowers to FClamp with an OpIsNan check selecting NMin(NMin(x, y), z).
+  6. Wavefront SIMD execution:
+     Evaluates lockstep execution across 32 and 64 lanes with divergent float inputs.
 
 Standard library Python only; zero third-party dependencies; zero game data.
 Python 3.9+ compatible (from __future__ import annotations).
@@ -80,7 +83,8 @@ POS_INF = 0x7F800000       # +infinity
 NEG_INF = 0xFF800000       # -infinity
 QNAN = 0x7FC00000          # Canonical quiet NaN
 NEG_QNAN = 0xFFC00000      # Negative quiet NaN
-QNAN_PAYLOAD = 0x7FC10001  # Quiet NaN with payload
+QNAN_PAYLOAD = 0x7FC10001  # Quiet NaN with payload A
+QNAN_PAYLOAD_B = 0xFFC20002  # Quiet NaN with payload B
 SNAN = 0x7F800001          # Signaling NaN
 SUBNORM_MIN = 0x00000001   # Smallest subnormal: 2^-149
 SUBNORM_MAX = 0x007FFFFF   # Largest positive subnormal
@@ -425,27 +429,19 @@ class TestF32ReferenceOracle3Op(unittest.TestCase):
                 self.assertEqual(ref_max3_f32(p0, p1, p2), expected)
 
     def test_med3_permutations(self) -> None:
-        # All permutations of {1.0, 2.0, 3.0} must have median 2.0
         for p in itertools.permutations([ONE, TWO, THREE]):
             self.assertEqual(ref_med3_f32(*p), TWO)
 
-        # All permutations of {-10.0, 0.0, 10.0} must have median 0.0
         for p in itertools.permutations([NEG_TEN, POS_ZERO, TEN]):
             self.assertEqual(ref_med3_f32(*p), POS_ZERO)
 
     def test_signed_zeros_3op(self) -> None:
-        # -0.0 < +0.0 ordered tie breaking:
-        # min3(+0.0, -0.0, 1.0) -> -0.0
         self.assertEqual(ref_min3_f32(POS_ZERO, NEG_ZERO, ONE), NEG_ZERO)
-        # max3(+0.0, -0.0, -1.0) -> +0.0
         self.assertEqual(ref_max3_f32(POS_ZERO, NEG_ZERO, NEG_ONE), POS_ZERO)
-        # med3(+0.0, -0.0, 1.0) -> +0.0 (sorted: -0.0, +0.0, 1.0)
         self.assertEqual(ref_med3_f32(POS_ZERO, NEG_ZERO, ONE), POS_ZERO)
-        # med3(+0.0, -0.0, -1.0) -> -0.0 (sorted: -1.0, -0.0, +0.0)
         self.assertEqual(ref_med3_f32(POS_ZERO, NEG_ZERO, NEG_ONE), NEG_ZERO)
 
     def test_med3_nan_fallback_to_min3(self) -> None:
-        # If any operand is NaN, v_med3_f32 evaluates min3(s0, s1, s2).
         self.assertEqual(ref_med3_f32(QNAN, TWO, THREE), TWO)
         self.assertEqual(ref_med3_f32(ONE, QNAN, THREE), ONE)
         self.assertEqual(ref_med3_f32(ONE, TWO, QNAN), ONE)
@@ -530,21 +526,14 @@ class TestVMin3VMax3VMed3Execution(unittest.TestCase):
                 self.assertEqual(got, expected)
 
     def test_signed_zeros_3op_execution(self) -> None:
-        # min3(+0, -0, 1.0) == -0.0
         self.assertEqual(run_f32_3op("v_min3_f32", POS_ZERO, NEG_ZERO, ONE), NEG_ZERO)
-        # max3(+0, -0, -1.0) == +0.0
         self.assertEqual(run_f32_3op("v_max3_f32", POS_ZERO, NEG_ZERO, NEG_ONE), POS_ZERO)
-        # med3(+0, -0, 1.0) == +0.0
         self.assertEqual(run_f32_3op("v_med3_f32", POS_ZERO, NEG_ZERO, ONE), POS_ZERO)
-        # med3(+0, -0, -1.0) == -0.0
         self.assertEqual(run_f32_3op("v_med3_f32", POS_ZERO, NEG_ZERO, NEG_ONE), NEG_ZERO)
 
     def test_extreme_values_3op_execution(self) -> None:
-        # min3(-INF, FLT_MIN, POS_INF) == -INF
         self.assertEqual(run_f32_3op("v_min3_f32", NEG_INF, FLT_MIN, POS_INF), NEG_INF)
-        # max3(-INF, FLT_MIN, POS_INF) == +INF
         self.assertEqual(run_f32_3op("v_max3_f32", NEG_INF, FLT_MIN, POS_INF), POS_INF)
-        # med3(-INF, FLT_MIN, POS_INF) == FLT_MIN
         self.assertEqual(run_f32_3op("v_med3_f32", NEG_INF, FLT_MIN, POS_INF), FLT_MIN)
 
 
@@ -596,27 +585,245 @@ class TestVALUModifiers3Op(unittest.TestCase):
     """Verifies VOP3 input modifiers (neg, abs) and output clamp for 3-op instructions."""
 
     def test_min3_modifiers(self) -> None:
-        # min3(-|2.0|, 3.0, 4.0) -> min3(-2.0, 3.0, 4.0) = -2.0
         got = run_f32_3op("v_min3_f32", TWO, THREE, FOUR, neg0=True, abs0=True)
         self.assertEqual(got, NEG_TWO)
 
     def test_max3_modifiers(self) -> None:
-        # max3(-2.0, -3.0, |-4.0|) -> max3(-2.0, -3.0, 4.0) = 4.0
         got = run_f32_3op("v_max3_f32", NEG_TWO, f32_to_bits(-3.0), f32_to_bits(-4.0), abs2=True)
         self.assertEqual(got, FOUR)
 
     def test_med3_modifiers(self) -> None:
-        # med3(|-1.0|, -2.0, 3.0) -> med3(1.0, -2.0, 3.0) = 1.0
         got = run_f32_3op("v_med3_f32", NEG_ONE, NEG_TWO, THREE, abs0=True)
         self.assertEqual(got, ONE)
 
     def test_clamp_modifier_3op(self) -> None:
-        # max3(2.0, 3.0, 4.0) clamp -> 4.0 clamped to 1.0
         got = run_f32_3op("v_max3_f32", TWO, THREE, FOUR, clamp=True)
         self.assertEqual(got, ONE)
-        # min3(-1.0, -2.0, -3.0) clamp -> -3.0 clamped to +0.0
         got = run_f32_3op("v_min3_f32", NEG_ONE, NEG_TWO, f32_to_bits(-3.0), clamp=True)
         self.assertEqual(got, POS_ZERO)
+
+
+class TestNaNPropagation(unittest.TestCase):
+    """Deep verification of NaN propagation, payloads, and NaN suppression across 2-op and 3-op."""
+
+    def test_nan_vs_finite_payload_preserved(self) -> None:
+        # Check diverse finite floats against NaNs with different signs and mantissas
+        finite_samples = [0x3E200000, 0x40490FDB, 0xC0000000, 0x00800000, 0x7F7FFFFF]
+        nan_samples = [QNAN, NEG_QNAN, QNAN_PAYLOAD, QNAN_PAYLOAD_B, SNAN]
+
+        for fin in finite_samples:
+            for nan in nan_samples:
+                with self.subTest(fin=hex(fin), nan=hex(nan)):
+                    # 2-operand
+                    self.assertEqual(run_f32_2op("v_min_f32", nan, fin), fin)
+                    self.assertEqual(run_f32_2op("v_min_f32", fin, nan), fin)
+                    self.assertEqual(run_f32_2op("v_max_f32", nan, fin), fin)
+                    self.assertEqual(run_f32_2op("v_max_f32", fin, nan), fin)
+
+    def test_both_nan_returns_quiet_nan(self) -> None:
+        got_min = run_f32_2op("v_min_f32", QNAN_PAYLOAD, QNAN_PAYLOAD_B)
+        self.assertTrue(is_nan_bits(got_min))
+        got_max = run_f32_2op("v_max_f32", QNAN_PAYLOAD, QNAN_PAYLOAD_B)
+        self.assertTrue(is_nan_bits(got_max))
+
+    def test_3way_nan_combinations(self) -> None:
+        # 1 NaN in 3-way: remaining 2 operands are evaluated
+        self.assertEqual(run_f32_3op("v_min3_f32", QNAN, ONE, TWO), ONE)
+        self.assertEqual(run_f32_3op("v_min3_f32", ONE, QNAN, TWO), ONE)
+        self.assertEqual(run_f32_3op("v_min3_f32", ONE, TWO, QNAN), ONE)
+        self.assertEqual(run_f32_3op("v_max3_f32", QNAN, ONE, TWO), TWO)
+        self.assertEqual(run_f32_3op("v_max3_f32", ONE, QNAN, TWO), TWO)
+        self.assertEqual(run_f32_3op("v_max3_f32", ONE, TWO, QNAN), TWO)
+        self.assertEqual(run_f32_3op("v_med3_f32", QNAN, ONE, TWO), ONE)  # med3 with NaN falls back to min3
+        self.assertEqual(run_f32_3op("v_med3_f32", ONE, QNAN, TWO), ONE)
+
+        # 2 NaNs in 3-way: the single non-NaN operand is returned
+        self.assertEqual(run_f32_3op("v_min3_f32", QNAN, QNAN_PAYLOAD, THREE), THREE)
+        self.assertEqual(run_f32_3op("v_max3_f32", QNAN, THREE, QNAN_PAYLOAD), THREE)
+
+        # 3 NaNs in 3-way: result is a NaN
+        self.assertTrue(is_nan_bits(run_f32_3op("v_min3_f32", QNAN, QNAN_PAYLOAD, NEG_QNAN)))
+        self.assertTrue(is_nan_bits(run_f32_3op("v_max3_f32", QNAN, QNAN_PAYLOAD, NEG_QNAN)))
+
+    def test_nan_with_modifiers(self) -> None:
+        # Negation or absolute value on NaN keeps NaN property, non-NaN operand still wins
+        got_neg = run_f32_2op("v_min_f32", QNAN, ONE, e64=True, neg0=True)
+        self.assertEqual(got_neg, ONE)
+        got_abs = run_f32_2op("v_max_f32", QNAN, TWO, e64=True, abs0=True)
+        self.assertEqual(got_abs, TWO)
+
+
+class TestSubnormalBehavior(unittest.TestCase):
+    """Verifies subnormal (denormal) floating point ordering, comparisons, and preservation."""
+
+    def test_subnormal_vs_signed_zeros(self) -> None:
+        # Positive subnormal is strictly greater than +0.0 and -0.0
+        self.assertEqual(run_f32_2op("v_min_f32", SUBNORM_MIN, POS_ZERO), POS_ZERO)
+        self.assertEqual(run_f32_2op("v_min_f32", SUBNORM_MIN, NEG_ZERO), NEG_ZERO)
+        self.assertEqual(run_f32_2op("v_max_f32", SUBNORM_MIN, POS_ZERO), SUBNORM_MIN)
+        self.assertEqual(run_f32_2op("v_max_f32", SUBNORM_MIN, NEG_ZERO), SUBNORM_MIN)
+
+        # Negative subnormal is strictly less than -0.0 and +0.0
+        self.assertEqual(run_f32_2op("v_min_f32", NEG_SUBNORM_MIN, NEG_ZERO), NEG_SUBNORM_MIN)
+        self.assertEqual(run_f32_2op("v_min_f32", NEG_SUBNORM_MIN, POS_ZERO), NEG_SUBNORM_MIN)
+        self.assertEqual(run_f32_2op("v_max_f32", NEG_SUBNORM_MIN, NEG_ZERO), NEG_ZERO)
+        self.assertEqual(run_f32_2op("v_max_f32", NEG_SUBNORM_MIN, POS_ZERO), POS_ZERO)
+
+    def test_subnormal_vs_flt_min(self) -> None:
+        # Smallest positive normal FLT_MIN (2^-126) > largest subnormal SUBNORM_MAX
+        self.assertEqual(run_f32_2op("v_min_f32", FLT_MIN, SUBNORM_MAX), SUBNORM_MAX)
+        self.assertEqual(run_f32_2op("v_max_f32", FLT_MIN, SUBNORM_MAX), FLT_MIN)
+        self.assertEqual(run_f32_2op("v_min_f32", NEG_FLT_MIN, NEG_SUBNORM_MAX), NEG_FLT_MIN)
+        self.assertEqual(run_f32_2op("v_max_f32", NEG_FLT_MIN, NEG_SUBNORM_MAX), NEG_SUBNORM_MAX)
+
+    def test_subnormal_scale_ordering(self) -> None:
+        chain = [
+            NEG_FLT_MIN,
+            NEG_SUBNORM_MAX,
+            NEG_SUBNORM_MIN,
+            NEG_ZERO,
+            POS_ZERO,
+            SUBNORM_MIN,
+            SUBNORM_MAX,
+            FLT_MIN,
+        ]
+        for i in range(len(chain) - 1):
+            a, b = chain[i], chain[i + 1]
+            self.assertEqual(ref_min_f32(a, b), a)
+            self.assertEqual(ref_max_f32(a, b), b)
+            self.assertEqual(run_f32_2op("v_min_f32", a, b), a)
+            self.assertEqual(run_f32_2op("v_max_f32", a, b), b)
+
+
+class TestWavefrontSIMDDivergence(unittest.TestCase):
+    """Executes lockstep multi-lane SIMD wavefronts to verify no cross-lane data corruption."""
+
+    @staticmethod
+    def _run_cs_divergent(wave_size: int, op: str) -> dict[int, int]:
+        fssm = bytearray(0x148)
+        struct.pack_into("<4I", fssm, 0x138, 0x8088, wave_size, 1, 1)
+
+        # Diverse operands per lane:
+        # lane % 4 == 0: (POS_ZERO, NEG_ZERO)
+        # lane % 4 == 1: (QNAN, 1.0 + lane)
+        # lane % 4 == 2: (NEG_INF, 2.0 + lane)
+        # lane % 4 == 3: (SUBNORM_MIN, FLT_MIN)
+        lines = [
+            "v_and_b32 v5, 3, v0",  # lane % 4
+            # Case 0:
+            "v_mov_b32 v1, 0x00000000",
+            "v_mov_b32 v2, 0x80000000",
+            # Case 1:
+            "v_cmp_eq_u32_e32 vcc_lo, 1, v5",
+            "v_cndmask_b32_e32 v1, v1, 0x7FC00000, vcc_lo",
+            "v_cvt_f32_u32 v6, v0",
+            "v_add_f32_e32 v6, 0x3F800000, v6",  # 1.0 + lane
+            "v_cndmask_b32_e32 v2, v2, v6, vcc_lo",
+            # Case 2:
+            "v_cmp_eq_u32_e32 vcc_lo, 2, v5",
+            "v_cndmask_b32_e32 v1, v1, 0xFF800000, vcc_lo",
+            "v_add_f32_e32 v6, 0x40000000, v6",  # 2.0 + lane
+            "v_cndmask_b32_e32 v2, v2, v6, vcc_lo",
+            # Case 3:
+            "v_cmp_eq_u32_e32 vcc_lo, 3, v5",
+            "v_cndmask_b32_e32 v1, v1, 0x00000001, vcc_lo",
+            "v_cndmask_b32_e32 v2, v2, 0x00800000, vcc_lo",
+            # ALU operation
+            f"{op} v3, v1, v2",
+            "v_lshlrev_b32 v4, 2, v0",
+            "buffer_store_dword v3, v4, s[0:3], 0 offen",
+            "s_endpgm",
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            os.mkdir(os.path.join(tmp, "disasm"))
+            src = os.path.join(tmp, "disasm", "cs_wave_divergent.s")
+            with open(src, "w", encoding="utf-8") as f:
+                f.write("; cs_wave_divergent\n" + "\n".join(f"\t{ln}" for ln in lines) + "\n")
+            with open(os.path.join(tmp, "cs_wave_divergent.dxbc"), "wb") as f:
+                f.write(STUB_DXBC)
+            os.mkdir(os.path.join(tmp, "fssm"))
+            with open(os.path.join(tmp, "fssm", "cs_wave_divergent.fssm"), "wb") as f:
+                f.write(fssm)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", ResourceWarning)
+                spv = rdna2spirv.translate(src)
+
+        mem: dict[int, int] = {}
+        push = [0, 0, 0x1000, 0x31016FAC] + [0] * 28
+        si.run_workgroup(
+            spv,
+            wave_size,
+            32,
+            inputs_for=lambda i: {"%wg_id": (0, 0, 0), "%local_id": (i, 0, 0), "%sg_lane": i},
+            push_constants=push,
+            memory=mem,
+        )
+        return mem
+
+    def test_wave32_divergence_min(self) -> None:
+        mem = self._run_cs_divergent(32, "v_min_f32")
+        for i in range(32):
+            mod = i % 4
+            if mod == 0:
+                want = ref_min_f32(POS_ZERO, NEG_ZERO)  # -0.0
+            elif mod == 1:
+                want = f32_to_bits(1.0 + float(i))
+            elif mod == 2:
+                want = NEG_INF
+            else:
+                want = SUBNORM_MIN
+            self.assertEqual(mem.get(4 * i), want, f"Lane {i} mismatch")
+
+    def test_wave64_divergence_max(self) -> None:
+        mem = self._run_cs_divergent(64, "v_max_f32")
+        for i in range(64):
+            mod = i % 4
+            if mod == 0:
+                want = ref_max_f32(POS_ZERO, NEG_ZERO)  # +0.0
+            elif mod == 1:
+                want = f32_to_bits(1.0 + float(i))
+            elif mod == 2:
+                want = f32_to_bits(3.0 + float(i))
+            else:
+                want = FLT_MIN
+            self.assertEqual(mem.get(4 * i), want, f"Lane {i} mismatch")
+
+
+class TestNegativeControls(unittest.TestCase):
+    """Negative controls ensuring non-compliant floating point behavior is rejected."""
+
+    def test_python_default_min_zero_divergence(self) -> None:
+        # Standard Python min(0.0, -0.0) yields +0.0 because 0.0 <= -0.0 evaluates to True.
+        # This confirms that naive Python float comparisons violate AMD RDNA2 semantics.
+        naive_python_min = min(0.0, -0.0)
+        self.assertEqual(f32_to_bits(naive_python_min), POS_ZERO)
+        # The reference oracle correctly yields -0.0 (0x80000000).
+        self.assertEqual(ref_min_f32(POS_ZERO, NEG_ZERO), NEG_ZERO)
+
+    def test_python_default_nan_divergence(self) -> None:
+        # Standard Python min(nan, 2.0) propagates NaN.
+        # IEEE 754-2008 and RDNA2 minNum instead suppress NaN in favor of the number.
+        naive_python_min = min(float("nan"), 2.0)
+        self.assertTrue(math.isnan(naive_python_min))
+        # The reference oracle correctly returns 2.0.
+        self.assertEqual(ref_min_f32(QNAN, TWO), TWO)
+
+    def test_clamp_on_all_nan_raises_unsupported(self) -> None:
+        # Clamping an all-NaN result is undefined in GLSL.std.450 / SPIR-V and raises UnsupportedConstruct.
+        with self.assertRaises(si.UnsupportedConstruct):
+            run_f32_2op("v_min_f32", QNAN, QNAN, e64=True, clamp=True)
+
+    def test_med3_third_operand_nan_fclamp_undefined(self) -> None:
+        # rdna2spirv lowers v_med3_f32 by evaluating FClamp(z, lo, hi) eagerly, which triggers
+        # UnsupportedConstruct in spirv_mini_interp when z is NaN (tracked by PR #2029).
+        with self.assertRaises(si.UnsupportedConstruct):
+            run_f32_3op("v_med3_f32", ONE, TWO, QNAN)
+
+    def test_bit_exactness_rejects_sign_mismatch(self) -> None:
+        # Negative control: verify that +0.0 and -0.0 are distinct 32-bit words.
+        self.assertNotEqual(POS_ZERO, NEG_ZERO)
+        self.assertEqual(POS_ZERO & SIGN_MASK, 0)
+        self.assertEqual(NEG_ZERO & SIGN_MASK, SIGN_MASK)
 
 
 if __name__ == "__main__":
