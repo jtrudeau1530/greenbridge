@@ -10,6 +10,7 @@ import sys
 import tempfile
 import unittest
 import unittest.mock
+from unittest import mock
 
 TOOLS = Path(__file__).resolve().parents[1] / "tools"
 sys.path.insert(0, str(TOOLS))
@@ -98,6 +99,21 @@ class Text(unittest.TestCase):
         self.assertEqual(asm.failing_kernels(err, starts), {1})
         err2 = err + f"k.s:{starts[2]}:1: error: x\n"
         self.assertEqual(asm.failing_kernels(err2, starts), {1, 2})
+
+
+class DetectArch(unittest.TestCase):
+    def test_amdgpu_arch_target_features_are_dropped(self):
+        for printed, want in (("gfx1010:xnack-\n", "gfx1010"), ("gfx1150\n", "gfx1150"),
+                              ("gfx1030:sramecc+:xnack-\ngfx1150\n", "gfx1030")):
+            with self.subTest(printed=printed):
+                done = subprocess.CompletedProcess([], 0, stdout=printed)
+                with mock.patch.dict(os.environ, {}, clear=False), \
+                        mock.patch.object(os.path, "isfile", return_value=True), \
+                        mock.patch.object(subprocess, "run", return_value=done):
+                    os.environ.pop("LEONIDA_HW_ARCH", None)
+                    arch = runner.detect_arch(os.path.join("opt", "clang"))
+                self.assertEqual(arch, want)
+                asm.family(arch)   # what Oracle() does next must accept it
 
 
 class True16(unittest.TestCase):
