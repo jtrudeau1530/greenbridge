@@ -88,6 +88,26 @@ def is_nan_f32(bits: int) -> bool:
     return ((bits & EXP_MASK_F32) == EXP_MASK_F32) and ((bits & MANT_MASK_F32) != 0)
 
 
+def is_snan_f32(bits: int) -> bool:
+    """Check if binary32 bit pattern represents a signaling NaN."""
+    return ((bits & EXP_MASK_F32) == EXP_MASK_F32) and ((bits & MANT_MASK_F32) != 0) and not (bits & 0x00400000)
+
+
+@dataclass
+class FPStatusFlags:
+    """Hardware floating-point exception status tracking (IEEE 754 / RDNA2 mode register)."""
+    invalid: bool = False
+    overflow: bool = False
+    underflow: bool = False
+    inexact: bool = False
+
+    def reset(self) -> None:
+        self.invalid = False
+        self.overflow = False
+        self.underflow = False
+        self.inexact = False
+
+
 def is_inf_f32(bits: int) -> bool:
     """Check if binary32 bit pattern represents +/- infinity."""
     return ((bits & EXP_MASK_F32) == EXP_MASK_F32) and ((bits & MANT_MASK_F32) == 0)
@@ -598,12 +618,14 @@ class ScalarVALUInterpreter:
         self.sgpr = [0] * self.num_sgprs
         self.vcc = 0
         self.exec = MASK64
+        self.flags = FPStatusFlags()
 
     def reset(self) -> None:
         self.vgpr = [0] * self.num_vgprs
         self.sgpr = [0] * self.num_sgprs
         self.vcc = 0
         self.exec = MASK64
+        self.flags.reset()
 
     def get_vgpr_u32(self, idx: int) -> int:
         if not (0 <= idx < self.num_vgprs):
@@ -649,7 +671,14 @@ class ScalarVALUInterpreter:
         s2 = self.eval_operand(ast.src2)
 
         if ast.opcode == "v_med3_f32":
+            if any(is_snan_f32(s) for s in (s0, s1, s2)):
+                self.flags.invalid = True
+            raw_res = ref_med3_f32(s0, s1, s2, clamp=False, omod="none")
             res = ref_med3_f32(s0, s1, s2, clamp=ast.clamp, omod=ast.omod)
+            if not is_inf_f32(raw_res) and is_inf_f32(res):
+                self.flags.overflow = True
+            if ast.clamp and (res != raw_res):
+                self.flags.inexact = True
         elif ast.opcode == "v_med3_i32":
             res = ref_med3_i32(s0, s1, s2, clamp=ast.clamp)
         elif ast.opcode == "v_med3_u32":
@@ -720,12 +749,14 @@ class SIMDVALUInterpreter:
         self.sgpr = [0] * self.num_sgprs
         self.vcc = 0
         self.exec = (1 << self.wave_size) - 1
+        self.flags = [FPStatusFlags() for _ in range(self.wave_size)]
 
     def reset(self) -> None:
         self.vgpr = [[0] * self.wave_size for _ in range(self.num_vgprs)]
         self.sgpr = [0] * self.num_sgprs
         self.vcc = 0
         self.exec = (1 << self.wave_size) - 1
+        self.flags = [FPStatusFlags() for _ in range(self.wave_size)]
 
     def get_vgpr_u32(self, reg: int, lane: int) -> int:
         if not (0 <= reg < self.num_vgprs):
@@ -785,7 +816,14 @@ class SIMDVALUInterpreter:
             s2 = s2_latched[lane]
 
             if ast.opcode == "v_med3_f32":
+                if any(is_snan_f32(s) for s in (s0, s1, s2)):
+                    self.flags[lane].invalid = True
+                raw_res = ref_med3_f32(s0, s1, s2, clamp=False, omod="none")
                 res = ref_med3_f32(s0, s1, s2, clamp=ast.clamp, omod=ast.omod)
+                if not is_inf_f32(raw_res) and is_inf_f32(res):
+                    self.flags[lane].overflow = True
+                if ast.clamp and (res != raw_res):
+                    self.flags[lane].inexact = True
             elif ast.opcode == "v_med3_i32":
                 res = ref_med3_i32(s0, s1, s2, clamp=ast.clamp)
             elif ast.opcode == "v_med3_u32":
@@ -1029,6 +1067,68 @@ class TestValuMed3RegisterAliasing(unittest.TestCase):
         interp.execute_asm("v_med3_i32 v0, s5, s5, s5")
         self.assertEqual(interp.get_vgpr_u32(0), 42)
         self.assertEqual(interp.get_sgpr_u32(5), 42)
+
+
+class TestValuMed3StatusFlags(unittest.TestCase):
+    """Test suite for condition codes, status flags, and VCC immutability."""
+
+    def test_vcc_immutability_scalar(self):
+        interp = ScalarVALUInterpreter()
+        interp.vcc = 0x123456789ABCDEF0
+        interp.execute_asm("v_med3_f32 v0, 1.0, 2.0, 3.0")
+        self.assertEqual(interp.vcc, 0x123456789ABCDEF0)
+
+        interp.execute_asm("v_med3_i32 v0, 10, 20, 30")
+        self.assertEqual(interp.vcc, 0x123456789ABCDEF0)
+
+        interp.execute_asm("v_med3_u32 v0, 100, 200, 300")
+        self.assertEqual(interp.vcc, 0x123456789ABCDEF0)
+
+    def test_vcc_immutability_simd(self):
+        sim = SIMDVALUInterpreter(wave_size=32)
+        sim.vcc = 0x5555555555555555
+        sim.exec = 0x0000FFFF
+        sim.execute_asm("v_med3_f32 v0, 1.0, 2.0, 3.0")
+        self.assertEqual(sim.vcc, 0x5555555555555555)
+
+    def test_snan_invalid_flag_scalar(self):
+        interp = ScalarVALUInterpreter()
+        interp.set_vgpr_u32(1, SNAN_F32)
+        interp.set_vgpr_u32(2, f32_to_bits(1.0))
+        interp.set_vgpr_u32(3, f32_to_bits(2.0))
+        res = interp.execute_asm("v_med3_f32 v0, v1, v2, v3")
+        self.assertTrue(interp.flags.invalid)
+        self.assertEqual(bits_to_f32(res), 1.0)
+
+    def test_overflow_flag_with_omod(self):
+        interp = ScalarVALUInterpreter()
+        interp.set_vgpr_u32(1, MAX_FINITE_F32)
+        interp.set_vgpr_u32(2, MAX_FINITE_F32)
+        interp.set_vgpr_u32(3, MAX_FINITE_F32)
+        res = interp.execute_asm("v_med3_f32 v0, v1, v2, v3 mul:4")
+        self.assertTrue(interp.flags.overflow)
+        self.assertEqual(res, POS_INF_F32)
+
+    def test_clamp_flag_inexact(self):
+        interp = ScalarVALUInterpreter()
+        interp.set_vgpr_u32(1, f32_to_bits(2.5))
+        interp.set_vgpr_u32(2, f32_to_bits(3.0))
+        interp.set_vgpr_u32(3, f32_to_bits(2.0))
+        res = interp.execute_asm("v_med3_f32 v0, v1, v2, v3 clamp")
+        self.assertTrue(interp.flags.inexact)
+        self.assertEqual(bits_to_f32(res), 1.0)
+
+    def test_no_flags_on_normal_and_integer_operations(self):
+        interp = ScalarVALUInterpreter()
+        interp.execute_asm("v_med3_i32 v0, -10, 0, 10")
+        self.assertFalse(interp.flags.invalid)
+        self.assertFalse(interp.flags.overflow)
+        self.assertFalse(interp.flags.inexact)
+
+        interp.execute_asm("v_med3_f32 v0, 0.25, 0.5, 0.75")
+        self.assertFalse(interp.flags.invalid)
+        self.assertFalse(interp.flags.overflow)
+        self.assertFalse(interp.flags.inexact)
 
 
 if __name__ == "__main__":
