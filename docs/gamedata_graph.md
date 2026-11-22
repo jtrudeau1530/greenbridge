@@ -107,6 +107,12 @@ This is not a runtime schema. The catalog knows 118 root names, 5,293 element na
 names, but not field types. It also cannot supply names for the archive targets: that needs a
 documented TOC reader, which is outside this work.
 
+`parentPath` inheritance is the one reference a loader can follow inside a document. The tool reports it
+under `parent_path_inheritance`: a locator of the form `../Tag[@attr='value']` is resolved against the
+siblings of the element that carries it, by exact string match. On this `common.rpf` all 40 sites take that
+form and all 40 resolve (none ambiguous), in one document; the linked items sit at inheritance depth 1 (35),
+2 (3), 3 (1) and 4 (1), with no cycles. These links stay outside the document graph and its edge counts.
+
 ## Limits
 
 - The table of contents is encrypted, so target paths are namespaces and strings, not document ids.
