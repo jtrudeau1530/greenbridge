@@ -15,7 +15,8 @@ hardware wave, the reference) and to 32 (the halves) through VKH_SUBGROUP_SIZE o
 A device that can require only one size (NVIDIA: 32 only) cannot run the comparison. There the default-size image is
 checked against the derived words (tiers A, B), the tier C check is skipped, and two environment variables let a
 second device stand in for the missing size: W64G_SAVE_REF=<dir> stores each 64-lane run of a device that can require
-it, and W64G_REF=<dir> compares every run of the other device with those files (equal for A and B, different for C).
+it (or that has 64 as its only size: AMD GCN), and W64G_REF=<dir> compares every run of the other device with those
+files (equal for A and B, different for C).
 
 The vs_w64_* fixtures (TEST-251) are vertex shaders: Vulkan cannot require a vertex subgroup size, so the two sizes
 come from RADV, which runs the VS stage as wave64 by default and as wave32 with RADV_PERFTEST=gewave32 (GFX10+).

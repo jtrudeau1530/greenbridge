@@ -6,9 +6,10 @@ was drawn on an AMD Radeon 880M with the fragment subgroup size required to 64 a
 on an RX 9070 XT and a Ryzen 9800X3D iGPU (RADV) with the VS stage at wave64 and at wave32 (RADV_PERFTEST=gewave32).
 Tier A and B fixtures gave identical words (and the words their header derives), tier C fixtures differed, so this
 test pins the translator's detector to what the hardware showed. The permute fixtures (TEST-319: ps_w64_a_permlane,
-_a_swizzle, _a_bpermute) gave the words their header derives on an RTX 5070 (32 only), not yet against a 64-lane
-run. Needs llvm-mc with the AMDGPU target and spirv-as / spirv-val, like the other tests that build
-shaders; the pure-Python parts run without them.
+_a_swizzle, _a_bpermute) gave the words their header derives on an RTX 5070 (32 only), and every fixture's
+RTX 5070 run matched (tiers A, B) or differed from (tier C) a 64-lane RX 580 (GCN, RADV) reference.
+Needs llvm-mc with the AMDGPU target and spirv-as / spirv-val, like the other tests that build shaders; the
+pure-Python parts run without them.
 """
 import json
 import os
