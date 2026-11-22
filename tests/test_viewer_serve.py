@@ -18,6 +18,8 @@ import sys
 import tempfile
 import threading
 import unittest
+import urllib.parse
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 VIEWER = ROOT / "viewer"
@@ -122,6 +124,27 @@ class SafeWorldPathTest(unittest.TestCase):
         for name in ("CON", "con.txt", "NUL", "COM1", "LPT9.log", "aux."):
             with self.subTest(name=name):
                 self.assertIsNone(self.resolve("/world/" + name))
+
+    def test_windows_device_aliases_are_refused_without_isreserved(self):
+        # Python 3.12 has no os.path.isreserved. Check the fallback on newer Pythons too,
+        # before realpath or any other filesystem call can touch a console or serial device.
+        names = ("COM\u00b9", "com\u00b2.glb", "COM\u00b3.json", "LPT\u00b9", "lpt\u00b2.glb",
+                 "LPT\u00b3.json", "CONIN$", "conout$.bin",
+                 "NUL .glb", "COM1 .glb", "LPT9  .json")
+        with mock.patch.object(serve.os.path, "isreserved", None, create=True):
+            with mock.patch.object(serve.os.path, "realpath",
+                                   side_effect=AssertionError("device path reached realpath")) as realpath:
+                for name in names:
+                    for prefix in ("/world/", "/world/sub/"):
+                        with self.subTest(name=name, prefix=prefix):
+                            self.assertIsNone(self.resolve(prefix + urllib.parse.quote(name, safe="")))
+                realpath.assert_not_called()
+
+    def test_device_like_regular_filenames_still_resolve(self):
+        for name in ("COM10.glb", "LPT10.json", "COM\u2074.glb", "COM1_mesh.glb", "console.glb",
+                     "my.CON", "input.CONIN$"):
+            with self.subTest(name=name):
+                self.assertIsNotNone(self.resolve("/world/" + urllib.parse.quote(name, safe="")))
 
     def test_a_missing_world_or_bad_argument_is_refused(self):
         self.assertIsNone(serve.safe_world_path("", "/world/ok.bin"))
@@ -258,6 +281,19 @@ class HandlerTest(unittest.TestCase):
                 status, _, body = raw_request(self.port, target, host=f"127.0.0.1:{self.port}")
                 self.assertEqual(status, 403)
                 self.assertNotIn(b"secret", body)
+
+    def test_windows_device_aliases_get_403_without_opening_them(self):
+        targets = ("/world/COM%C2%B9.glb", "/world/sub/lpt%C2%B2.json", "/world/CONIN%24",
+                   "/world/CONOUT%24.bin", "/world/NUL%20.glb")
+        with mock.patch.object(serve.os.path, "isreserved", None, create=True):
+            # If the path guard regresses, fail without ever opening an actual Windows device.
+            with mock.patch("builtins.open", side_effect=AssertionError("device path reached open")) as opened:
+                for method in ("GET", "HEAD"):
+                    for target in targets:
+                        with self.subTest(method=method, target=target):
+                            status, _, _ = raw_request(self.port, target, method=method)
+                            self.assertEqual(status, 403)
+                opened.assert_not_called()
 
     def test_the_viewer_page_itself_is_served(self):
         status, _, body = raw_request(self.port, "/index.html", host=f"127.0.0.1:{self.port}")

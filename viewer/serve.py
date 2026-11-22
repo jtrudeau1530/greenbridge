@@ -18,14 +18,18 @@ import urllib.parse
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 _WINDOWS_RESERVED_DEVICES = frozenset({
-    "CON", "PRN", "AUX", "NUL",
-    *(f"COM{i}" for i in range(1, 10)),
-    *(f"LPT{i}" for i in range(1, 10)),
+    "CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$",
+    # Windows also treats superscript 1/2/3 as device numbers. Keep this fallback
+    # complete for Python 3.12, which has no os.path.isreserved.
+    *(f"COM{i}" for i in "123456789\u00b9\u00b2\u00b3"),
+    *(f"LPT{i}" for i in "123456789\u00b9\u00b2\u00b3"),
 })
 
 
 def _is_reserved_segment(seg: str) -> bool:
-    stem = seg.rstrip(" .").split(".", 1)[0].upper()
+    # Spaces before an extension do not make a device into a normal filename:
+    # Windows treats e.g. "NUL .glb" as NUL (as does ntpath.isreserved in Python 3.13+).
+    stem = seg.split(".", 1)[0].rstrip(" ").upper()
     if stem in _WINDOWS_RESERVED_DEVICES:
         return True
     isreserved = getattr(os.path, "isreserved", None)
