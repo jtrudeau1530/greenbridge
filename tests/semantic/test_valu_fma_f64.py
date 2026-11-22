@@ -665,5 +665,160 @@ class TestFmaF64SymbolicAST(unittest.TestCase):
         self.assertEqual(u_folded.value, -5.5)
 
 
+class ScalarRegisterFile:
+    """Register file for a single scalar lane with 256 VGPRs and 106 SGPRs."""
+
+    def __init__(self) -> None:
+        self.vgprs = [0] * 256
+        self.sgprs = [0] * 106
+
+    def read_vgpr(self, idx: int) -> int:
+        return self.vgprs[idx]
+
+    def write_vgpr(self, idx: int, val: int) -> None:
+        self.vgprs[idx] = val & MASK32
+
+    def read_sgpr(self, idx: int) -> int:
+        return self.sgprs[idx]
+
+    def write_sgpr(self, idx: int, val: int) -> None:
+        self.sgprs[idx] = val & MASK32
+
+    def read_vgpr_pair_u64(self, idx: int) -> int:
+        return dwords_to_u64(self.vgprs[idx], self.vgprs[idx + 1])
+
+    def write_vgpr_pair_u64(self, idx: int, val: int) -> None:
+        lo, hi = u64_to_dwords(val)
+        self.vgprs[idx] = lo
+        self.vgprs[idx + 1] = hi
+
+    def read_vgpr_pair_f64(self, idx: int) -> float:
+        return u64_to_f64(self.read_vgpr_pair_u64(idx))
+
+    def write_vgpr_pair_f64(self, idx: int, val: float) -> None:
+        self.write_vgpr_pair_u64(idx, f64_to_u64(val))
+
+    def read_sgpr_pair_u64(self, idx: int) -> int:
+        return dwords_to_u64(self.sgprs[idx], self.sgprs[idx + 1])
+
+    def write_sgpr_pair_u64(self, idx: int, val: int) -> None:
+        lo, hi = u64_to_dwords(val)
+        self.sgprs[idx] = lo
+        self.sgprs[idx + 1] = hi
+
+    def read_sgpr_pair_f64(self, idx: int) -> float:
+        return u64_to_f64(self.read_sgpr_pair_u64(idx))
+
+    def write_sgpr_pair_f64(self, idx: int, val: float) -> None:
+        self.write_sgpr_pair_u64(idx, f64_to_u64(val))
+
+
+class FmaF64ScalarInterpreter:
+    """Deterministic scalar instruction interpreter for v_fma_f64."""
+
+    def __init__(self, reg_file: ScalarRegisterFile | None = None) -> None:
+        self.reg_file = reg_file if reg_file is not None else ScalarRegisterFile()
+
+    def resolve_source_f64(self, src: ASTOperand) -> float:
+        if src.kind == OperandKind.VGPR_PAIR:
+            val = self.reg_file.read_vgpr_pair_f64(src.index)
+        elif src.kind == OperandKind.SGPR_PAIR:
+            val = self.reg_file.read_sgpr_pair_f64(src.index)
+        elif src.kind in (OperandKind.INLINE_CONST, OperandKind.LITERAL_CONST):
+            val = float(src.value) if src.value is not None else 0.0
+        else:
+            raise ValueError(f"Unsupported operand kind: {src.kind}")
+
+        # Apply source modifiers
+        u = apply_src_mods_u64(f64_to_u64(val), neg=src.neg, abs_=src.abs_)
+        return u64_to_f64(u)
+
+    def execute(self, inst: ASTInstruction) -> None:
+        inst.validate()
+        s0 = self.resolve_source_f64(inst.src0)
+        s1 = self.resolve_source_f64(inst.src1)
+        s2 = self.resolve_source_f64(inst.src2)
+
+        res = ref_fma_f64(s0, s1, s2, clamp=inst.clamp, omod=inst.omod.value)
+        self.reg_file.write_vgpr_pair_f64(inst.dst.index, res)
+
+
+class TestFmaF64ScalarInterpreter(unittest.TestCase):
+    """Test suite for deterministic scalar instruction interpreter."""
+
+    def setUp(self) -> None:
+        self.rf = ScalarRegisterFile()
+        self.interp = FmaF64ScalarInterpreter(self.rf)
+
+    def test_scalar_interpreter_vgprs(self):
+        # v[0:1] = v[2:3] * v[4:5] + v[6:7]
+        self.rf.write_vgpr_pair_f64(2, 3.0)
+        self.rf.write_vgpr_pair_f64(4, 4.0)
+        self.rf.write_vgpr_pair_f64(6, 5.0)
+
+        inst = ASTInstruction(
+            opcode=Opcode.V_FMA_F64,
+            dst=ASTOperand.vgpr(0),
+            src0=ASTOperand.vgpr(2),
+            src1=ASTOperand.vgpr(4),
+            src2=ASTOperand.vgpr(6),
+        )
+        self.interp.execute(inst)
+        self.assertEqual(self.rf.read_vgpr_pair_f64(0), 17.0)
+
+    def test_scalar_interpreter_sgpr_and_constants(self):
+        # v[0:1] = s[0:1] * v[2:3] + inline_const(10.0)
+        self.rf.write_sgpr_pair_f64(0, 2.5)
+        self.rf.write_vgpr_pair_f64(2, 4.0)
+
+        inst = ASTInstruction(
+            opcode=Opcode.V_FMA_F64,
+            dst=ASTOperand.vgpr(0),
+            src0=ASTOperand.sgpr(0),
+            src1=ASTOperand.vgpr(2),
+            src2=ASTOperand.inline_const(10.0),
+        )
+        self.interp.execute(inst)
+        self.assertEqual(self.rf.read_vgpr_pair_f64(0), 20.0)
+
+    def test_scalar_interpreter_modifiers(self):
+        # v[0:1] = -|v[2:3]| * v[4:5] + 5.0 with clamp
+        # v[2:3] = -2.0 -> abs -> 2.0 -> neg -> -2.0
+        # -2.0 * 3.0 + 5.0 = -1.0 -> clamp -> 0.0
+        self.rf.write_vgpr_pair_f64(2, -2.0)
+        self.rf.write_vgpr_pair_f64(4, 3.0)
+
+        inst = ASTInstruction(
+            opcode=Opcode.V_FMA_F64,
+            dst=ASTOperand.vgpr(0),
+            src0=ASTOperand.vgpr(2, neg=True, abs_=True),
+            src1=ASTOperand.vgpr(4),
+            src2=ASTOperand.inline_const(5.0),
+            clamp=True,
+        )
+        self.interp.execute(inst)
+        self.assertEqual(self.rf.read_vgpr_pair_f64(0), 0.0)
+
+    def test_scalar_interpreter_deterministic_repeatability(self):
+        # Verify that repeating operations produces identical bit patterns
+        self.rf.write_vgpr_pair_f64(2, 1.23456789012345)
+        self.rf.write_vgpr_pair_f64(4, 9.87654321098765)
+        self.rf.write_vgpr_pair_f64(6, -3.14159265358979)
+
+        inst = ASTInstruction(
+            opcode=Opcode.V_FMA_F64,
+            dst=ASTOperand.vgpr(0),
+            src0=ASTOperand.vgpr(2),
+            src1=ASTOperand.vgpr(4),
+            src2=ASTOperand.vgpr(6),
+        )
+        self.interp.execute(inst)
+        res1 = self.rf.read_vgpr_pair_u64(0)
+
+        self.interp.execute(inst)
+        res2 = self.rf.read_vgpr_pair_u64(0)
+        self.assertEqual(res1, res2)
+
+
 if __name__ == "__main__":
     unittest.main()
