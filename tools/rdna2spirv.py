@@ -663,7 +663,7 @@ class Gen:
                 h1 = self.mask_half(srcs[1]) if m1 else None
 
                 def _is_u32_zero_or_all_ones(src):
-                    return src["k"] == "imm" and (src["v"] & 0xFFFFFFFF) in (0, 0xFFFFFFFF)
+                    return src["k"] == "imm" and (src["v"] & 0xFFFFFFFF) == 0
 
                 can_vote = False
                 if cond in ("eq", "ne", "lg"):
@@ -3909,7 +3909,7 @@ class Gen:
                 if src["k"] != "imm":
                     return False
                 v = src["v"] & 0xFFFFFFFFFFFFFFFF
-                return v == 0 or (self.wave64 and v == 0xFFFFFFFFFFFFFFFF)
+                return v == 0
 
             use_vote = (m0 and m1) or (m0 and _is_u64_zero_or_all_ones(a[1])) or (m1 and _is_u64_zero_or_all_ones(a[0]))
 

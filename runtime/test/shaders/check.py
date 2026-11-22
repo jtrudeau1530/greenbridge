@@ -76,10 +76,10 @@ COMPUTE = [("cs_lds", "4", "mirror64"), ("cs_exec64", "1", "exec64"), ("cs_bvh",
 CS_STORE = [0x400080ff, 0xe00003ff, 0x3c004000, 0xeeeeeeee, 0x40003c00, 0xbc003800]
 CS_SMEM = [0x5eed0024, 0x5eed0028, 0x5eed002c, 0x5eed0030, 0x5eed0010, 0x5eed0014, 0x5eed0018, 0x5eed001c]
 WAVE32_DUMPS = ("cs_store", "cs_smem_soffset_imm", "cs_wqm_w32", "cs_w32_lane_wrap", "cs_movrelsd_2", "cs_w32_permute",
-                "cs_barrier_divergent", "cs_w32_lds_u8_d16", "cs_bpermute32")
+                "cs_barrier_divergent", "cs_w32_lds_u8_d16", "cs_bpermute32", "cs_w32_partial_scmp")
 # Wave32 lane-mask dumps: their EXEC/VCC masks and lane selects cover 32 lanes, so a device whose widest subgroup is
 # narrower (Mesa llvmpipe: 8) can't produce their words. They are skipped there, as ps_bitmask_perm is.
-WAVE32_LANE_DUMPS = ("cs_wqm_w32", "cs_w32_lane_wrap", "cs_w32_permute", "cs_bpermute32")
+WAVE32_LANE_DUMPS = ("cs_wqm_w32", "cs_w32_lane_wrap", "cs_w32_permute", "cs_bpermute32", "cs_w32_partial_scmp")
 CS_DUMPS = [("cs_store", CS_STORE), ("cs_smem_soffset_imm", CS_SMEM),
             # SHADER-52: wave32 lane select is & 31; lane 40 wraps to 8
             ("cs_w32_lane_wrap", [25, 16, 777, 777]),
@@ -96,6 +96,7 @@ CS_DUMPS = [("cs_store", CS_STORE), ("cs_smem_soffset_imm", CS_SMEM),
             ("cs_w64_mask_detect", [48]),
             ("cs_wqm_w64", [20, 4, 12, 8, 1, 0, 15728895, 20]), ("cs_wqm_w32", [12, 1, 4, 0, 8, 15728880, 4, 32]),
             ("cs_bpermute32", [0, 50, 162, 99, 36, 218, 183, 15]),
+            ("cs_w32_partial_scmp", [0, 1, 1, 0, 1, 1, 1, 1]),   # a 20-thread wave32: s_cmp mask, -1
             ("cs_wqm_w64_half", [11, 14, 0, 1, 6, 8, 12, 2]),
             # SHADER-91: two s_barrier sites in wave-uniform branches meet like one barrier; wave 0 reads wave 3
             ("cs_barrier_divergent", [127, 126, 125, 124, 123, 122, 121, 120])]
@@ -140,7 +141,8 @@ W64X_DUMPS = [("cs_w64x_readlane", [121, 121, 16, 97, 16, 100, 100, 121]),
               ("cs_w64x_sbarrier", [605, 605, 686, 686, 3032, 3013, 3032, 3031]),         # 128-thread group
               ("cs_w64x_load_ballot_load", [43, 74, 75, 42, 42, 18, 41, 32])]
 # A 40-thread group (one partial wave) cannot use --require-wave64 (full subgroups), so it asks for subgroup size 64.
-W64X_PARTIAL = [("cs_w64x_partial", [40, 40, 528, 0, 0, 532, 539, 524820])]
+W64X_PARTIAL = [("cs_w64x_partial", [40, 40, 528, 0, 0, 532, 539, 524820]),
+                ("cs_w64x_partial_scmp", [0, 1, 0, 1, 1, 1, 1, 0])]
 PIXEL_BITS = {"ps_legacy_mul": (0, 0, 0, 0x40c00000),
               "ps_ops": (0x48804300, 5, 7, 0xfffffffc), "ps_ops2": (0xabcd4400, 0x46001234, 0xfffffffa, 7),
               "ps_ops3": (0xfffffffa, 0x44660066, 0x44aabbcc, 16), "ps_ops4": (0x34000010, 0x00120800, 0xbeef0000, 0x12343c00),
