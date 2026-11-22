@@ -13,11 +13,9 @@ harness itself). The GPU-side runners are described below: `tools/valu_fuzz.py` 
 check that the module computes what the RDNA2 program computes. Those are different questions, and
 this repository already has cases where only the second question had a useful answer:
 
-- All 26,503 shaders translate and pass `spirv-val` (Vulkan 1.2) at `43d4703`, after `dcd8ecf` fixed
-  the ID-bound regression (#881); the intervening `dedd75c` run was 26,501, and `793b06f` before
-  #223's LLVM 23 source-field fix was 25,032. Yet the SDWA source/destination selects were silently
-  ignored until 2026-11-20: validation passed for 3,826 of the 13,926 shaders translated at the time
-  and produced wrong values (`docs/design.md`, "SDWA").
+- All 26,503 shaders translate and pass `spirv-val` (Vulkan 1.2), yet the SDWA source/destination
+  selects were silently ignored until 2026-11-20. That passed validation for 3,826 of the 13,926
+  translated shaders and produced wrong values (`docs/design.md`, "SDWA").
 - The compressed-export bug was found by a GPU test, not by validation: LLVM prints `v4, v4, v5, v5`
   for a compressed pair, and the translated shader exported `(r, g, r, g)`.
 - `v_cvt_pkrtz_f16_f32` with round-to-nearest overflowed a finite value to infinity; the GPU smoke
