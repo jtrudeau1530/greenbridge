@@ -266,7 +266,9 @@ int main() {
         EXPECT(SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&copy_fence.p))));
         EXPECT(SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&compute_fence.p))));
 
-        // Copy list 1: stream the input in (the buffer is in COMMON and is promoted to COPY_DEST by the copy).
+        // Copy list 1: stream the input in (the buffer is in COMMON and is promoted to COPY_DEST by the copy). This is the
+        // first submission after the UAV views were written, and a copy queue: it must not initialize the storage image
+        // (the compute queue does, in the submission that dispatches), or the data written later would be at risk.
         stream_list->CopyBufferRegion(input.p, 0, upload.p, 0, in_bytes);
         EXPECT(stream_list->Close() == S_OK);
 

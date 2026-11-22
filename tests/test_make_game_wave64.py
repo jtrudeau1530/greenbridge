@@ -118,6 +118,20 @@ class DetectionGapsTest(unittest.TestCase):
         text = real_format(("Big GPU", 64, ALL)) + "VkPhysicalDeviceProperties:\n\tdeviceName        = Old GPU\n"
         self.assertIsNone(make_game.smallest_max_subgroup(text))      # one device says nothing: unknown, so on
 
+    def test_a_layered_api_name_is_not_another_device(self):
+        # VK_KHR_maintenance7 lists a layered driver's underlying API (MoltenVK on Metal) with its own deviceName,
+        # indented deeper and printed before the subgroup block: it is the same device, not one without a size.
+        layered = ("GPU0:\nVkPhysicalDeviceProperties:\n\tdeviceName        = Apple M2 Max\n"
+                   "VkPhysicalDeviceLayeredApiPropertiesListKHR:\n\tpLayeredApis: count = 1\n\t\t0:\n"
+                   "\t\t\tlayeredAPI = PHYSICAL_DEVICE_LAYERED_API_METAL_KHR\n\t\t\tdeviceName = Apple M2 Max\n"
+                   "VkPhysicalDeviceSubgroupSizeControlProperties:\n\tmaxSubgroupSize = 32\n")
+        self.assertEqual(make_game.smallest_max_subgroup(layered), 32)
+        layered_json = ('{"VkPhysicalDeviceProperties": {\n\t\t"deviceName": "Apple M2 Max"},\n'
+                        '\t"VkPhysicalDeviceLayeredApiPropertiesListKHR": {"pLayeredApis": [\n'
+                        '\t\t\t{"layeredAPI": 3,\n\t\t\t "deviceName": "Apple M2 Max"}]},\n'
+                        '\t"VkPhysicalDeviceSubgroupSizeControlProperties": {\n\t\t"maxSubgroupSize": 32}}')
+        self.assertEqual(make_game.smallest_max_subgroup(layered_json), 32)
+
     def test_a_device_printing_the_size_twice_does_not_hide_one_that_prints_none(self):
         twice = ("VkPhysicalDeviceProperties:\n\tdeviceName        = A\n"
                  "VkPhysicalDeviceSubgroupSizeControlProperties:\n\tmaxSubgroupSize = 64\n"
@@ -161,6 +175,46 @@ class DetectionGapsTest(unittest.TestCase):
         self.assertFalse(self.decide(real_format(("A", 64, ALL)), '{"error": "no Vulkan loader found"}'))
         self.assertFalse(self.decide(real_format(("A", 64, ALL)), "not json"))
         self.assertTrue(self.decide(real_format(("A", 32, ALL)), '{"native64": true}'))     # vulkaninfo wins: on
+
+
+class Rdna2AmdWindowsTest(unittest.TestCase):
+    """#857: AMD's Windows compiler for RDNA2 crashes on emulated LDS compute shaders. When the runtime's GPU is one
+    and runs wave64 natively, auto leaves emulation off even if another device (an Intel iGPU) is 32-wide."""
+
+    RX6700 = '{"device": "AMD Radeon RX 6700", "native64": true, "rdna2_amd_windows": true}'
+
+    def decide(self, vulkaninfo, tool, mode="auto"):
+        def fake_run(args, **kw):
+            if os.path.basename(str(args[-1])) == "vk_subgroup_info.py":
+                return subprocess.CompletedProcess(args, 0 if "native64" in tool else 1, stdout=tool, stderr="")
+            return subprocess.CompletedProcess(args, 0, stdout=vulkaninfo, stderr="")
+        logged = []
+        with mock.patch.object(make_game.shutil, "which", return_value="vulkaninfo"), \
+                mock.patch.object(make_game.subprocess, "run", side_effect=fake_run), \
+                mock.patch.object(make_game, "log", logged.append):
+            return make_game.wave64_emulate(mode), logged
+
+    def test_intel_igpu_and_rdna2_card_leaves_it_off(self):
+        on, logged = self.decide(real_format(("Intel iGPU", 32, ALL), ("AMD Radeon RX 6700", 64, ALL)), self.RX6700)
+        self.assertFalse(on)
+        self.assertIn("#857", logged[-1])
+        self.assertIn("AMD Radeon RX 6700", logged[-1])
+
+    def test_other_runtime_gpus_keep_emulation_on(self):
+        two = real_format(("Intel iGPU", 32, ALL), ("Big GPU", 64, ALL))
+        for label, tool in (("rdna3", '{"native64": true, "rdna2_amd_windows": false}'),
+                            ("older_tool_without_the_key", '{"native64": true}'),
+                            ("rdna2_without_native64", '{"native64": false, "rdna2_amd_windows": true}'),
+                            ("unreadable", '{"error": "no Vulkan loader found"}'),
+                            ("not_json", "not json")):
+            with self.subTest(case=label):
+                self.assertTrue(self.decide(two, tool)[0])
+
+    def test_rdna2_only_pc_is_unchanged(self):
+        self.assertFalse(self.decide(real_format(("AMD Radeon RX 6700", 64, ALL)), self.RX6700)[0])
+
+    def test_explicit_on_is_taken_as_given(self):
+        self.assertTrue(self.decide(real_format(("AMD Radeon RX 6700", 64, ALL)), self.RX6700, mode="on")[0])
 
 
 class KeepEmulatedFlagTest(unittest.TestCase):
