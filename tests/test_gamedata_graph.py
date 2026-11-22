@@ -97,6 +97,16 @@ class GamedataGraphTest(unittest.TestCase):
         return subprocess.run([sys.executable, "-I", TOOL, *args], cwd=self.root,
                               capture_output=True, text=True, encoding="utf-8", errors="replace")
 
+    def test_cli_reports_unwritable_graph_report(self):
+        self.finish()
+        out = os.path.join(self.root, "missing", "graph.json")
+
+        result = self.run_tool(self.carve, "--json", out)
+
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn(f"cannot write {out}", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+
     def test_cycle_at_end_of_a_deep_include_chain(self):
         size = sys.getrecursionlimit() + 50
         adjacency = {node: [node + 1] for node in range(size - 1)}
