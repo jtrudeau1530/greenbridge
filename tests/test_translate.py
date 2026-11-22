@@ -8,11 +8,13 @@ import math
 import os
 import re
 import struct
+from pathlib import Path
 
 import pytest
 
 import rdna2spirv
-from conftest import EMPTY_DXBC, KNOWN_VAL_ISSUES, ROOT, SAMPLE_DXBC, make_dxbc, mesh_psv0_chunk, requires_tools, signature_chunk
+from conftest import (EMPTY_DXBC, KNOWN_VAL_ISSUES, ROOT, SAMPLE_DXBC, Shader, make_dxbc, mesh_psv0_chunk,
+                      requires_tools, signature_chunk)
 
 pytestmark = requires_tools
 
@@ -293,6 +295,27 @@ def test_compute_bad_group_size_is_rejected(make_shader, group):
     shader = make_shader("s_endpgm\n", name="cs_test", cs_header=(0x8088, group))
     with pytest.raises(rdna2spirv.Unsupported):
         shader.translate()
+
+
+def test_geometry_emit_cut_starts_a_new_triangle_strip(tmp_path: Path) -> None:
+    asm = (Path(__file__).parent / "semantic" / "fixtures" / "gs_emit_cut.asm").read_text(encoding="utf-8")
+    position = [(0, 1, 0xf)]
+    dxbc = make_dxbc([signature_chunk(b"ISG1", position), signature_chunk(b"OSG1", position)])
+    shader = Shader(tmp_path, "gs_emit_cut", asm, dxbc=dxbc)
+    module = shader.translate()
+    shader.validate(module)
+    assert "OpExecutionMode %main OutputTriangleStrip" in module
+    # EXEC stays on throughout the fixture. Each end terminates the current strip after its last vertex.
+    strips: list[list[int]] = [[]]
+    vertex = 0
+    for event in re.findall(r"^\s*(OpEmitVertex|OpEndPrimitive)$", module, re.MULTILINE):
+        if event == "OpEndPrimitive":
+            strips.append([])
+        else:
+            strips[-1].append(vertex)
+            vertex += 1
+    assert strips == [[0, 1, 2], [3, 4, 5], []]
+    assert len(re.findall(r"OpEmitVertex\s+OpEndPrimitive", module)) == 2  # both run under the same EXEC guard
 
 
 def test_geometry_without_signatures_is_rejected(make_shader):

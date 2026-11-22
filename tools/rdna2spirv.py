@@ -5219,7 +5219,7 @@ class Gen:
         if op == "s_sendmsg" and a and self.stage == "gs":
             t = a[0].get("t", "")
             if "GS_OP_EMIT" in t:
-                self.gs_emit()
+                self.gs_emit(end_primitive="GS_OP_EMIT_CUT" in t)
             elif "GS_OP_CUT" in t:
                 self.gs_when_active("OpEndPrimitive")
             elif "MSG_GS_DONE" not in t:
@@ -10811,7 +10811,7 @@ class Gen:
             return
         raise Unsupported(op + " in gs")
 
-    def gs_emit(self):
+    def gs_emit(self, *, end_primitive: bool) -> None:
         nreg = self.gs["nreg"]
         act = self.active_b()
         do, end = self.tmp() + "_do", self.tmp() + "_end"
@@ -10828,6 +10828,8 @@ class Gen:
             self.emit(f"{v} = OpLoad %v4float {pp}")
             self.emit(f"OpStore {'%gs_out_pos' if sv == 1 else f'%gs_out{reg}'} {v}")
         self.emit("OpEmitVertex")
+        if end_primitive:
+            self.emit("OpEndPrimitive")
         k2 = self.tmp()
         self.emit(f"{k2} = OpIAdd %uint {k} {self.cu(1)}")
         self.emit(f"OpStore %gs_emitted {k2}")
