@@ -6531,7 +6531,8 @@ class Gen:
                     self.dst({"k": "vgpr", "r": vdata["r"] + out, "n": 1}, self.tou(comp))
                     out += 1
             return
-        if (dim != "dim:SQ_RSRC_IMG_2D" and not is3d_atomic) or "d16" in mods or "a16" in mods:
+        if ((dim != "dim:SQ_RSRC_IMG_2D" and not is3d_atomic) or "a16" in mods
+                or ("d16" in mods and op != "image_load_mip")):
             raise Unsupported(op + " " + dim.split("SQ_RSRC_IMG_")[-1])
         vdata, addr = a[0], self.addr_regs(a[1])
         idx = self.desc_lookup_sgpr(a[2], 8)
@@ -6646,7 +6647,7 @@ class Gen:
         xs = [self.as_int(self.load_reg("vgpr", r)) for r in addr[:3]]
         iv = self.tmp()
         self.emit(f"{iv} = OpCompositeConstruct %v2int {xs[0]} {xs[1]}")
-        self.image_load_typed(dim, self.load_reg("sgpr", a[2]["r"] + 1), iv, img, idx, dmask, vdata, xs[2])
+        self.image_load_typed(dim, self.load_reg("sgpr", a[2]["r"] + 1), iv, img, idx, dmask, vdata, xs[2], d16="d16" in mods)
 
 
     def interp_pair_src(self, op, a, ins):

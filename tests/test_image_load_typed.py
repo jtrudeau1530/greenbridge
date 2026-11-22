@@ -158,6 +158,21 @@ class LoadOnlyShaders(unittest.TestCase):
             self.assertEqual((op, source[1]), ("OpAccessChain", "%vgpr"))
             self.assertEqual(m.value(source[2], 0, 0), 6)
 
+    def test_2d_explicit_mip_d16_packs_only_selected_components(self):
+        listing = ["image_load_mip v0, v[4:6], s[0:7] dmask:0x9 dim:SQ_RSRC_IMG_2D d16",
+                   "s_waitcnt vmcnt(0)"]
+        m = Module(translate(listing))
+        self.assertEqual({image[0] for _, _, image in m.fetches()}, {"%float", "%uint", "%int"})
+        for rid, _, _ in m.fetches():
+            bits, = (r for r, op, args in m.order if op == "OpBitcast" and args[1] == rid)
+            components = [int(args[2]) for _, op, args in m.order if op == "OpCompositeExtract" and args[1] == bits]
+            self.assertEqual(components, [0, 3])
+        # All three branches write just v0: R in the low half and A in the high half.
+        writes = [m.defs[ptr][1] for ptr in re.findall(r"^\s*OpStore (%\w+) ", m.text, re.MULTILINE)]
+        vgprs = [m.value(pointer[2], 0, 0) for pointer in writes if len(pointer) > 2 and pointer[1] == "%vgpr"]
+        self.assertEqual(vgprs.count(0), 3)
+        self.assertNotIn(1, vgprs)
+
     def test_no_storage_image_capability_and_no_storage_binding(self):
         for dim in DIMS:
             with self.subTest(dim=dim):
