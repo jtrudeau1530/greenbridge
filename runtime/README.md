@@ -205,11 +205,16 @@ SDK, or `-DLEONIDA_VULKAN_HEADERS_FETCH=ON` to download the pinned Khronos Vulka
   Vulkan SDK's `spirv-as` and `spirv-val` at build time.
 - `d3d12_compute_test` — the compute path: root signature, a compute PSO found by its FSSM hash in a
   translator-style index, root arguments through the GPU address arena, and two dispatches.
+- `d3d12_fspx_compute_test` — compute PSOs from synthetic FSPX programs (`docs/fspx.md`): an `ACCC` container
+  through slot 62 and a bare kind-6 program, found by `fspx_code_sha256` in `<shaders>/fspx/index.json`, one
+  dispatch each that reads its kind-6 program as the code base; malformed directories and untranslated programs
+  are refused with `E_INVALIDARG`.
 - `d3d12_set0_compute_test` — set 0 from the compute bind point: a compute PSO whose index entry lists set-0
   bindings, and four dispatches that sample two SRVs, bytes no view was made for and a clamping sampler through
   the bindless set the layer binds.
 - `d3d12_present_test` — milestone M0: opens a window and presents 60 cleared frames through the proxy on
-  Vulkan, resizes it and presents 10 more, and checks the colour on screen. A driver double then injects an
+  Vulkan, resizes it and presents 10 more, and checks the colour in the presented images (the presenter's
+  capture) and on screen where GDI can read it. A driver double then injects an
   out-of-date and a suboptimal present, a failed semaphore during a swapchain recreation and a failed blit
   submission, which the presenter must survive. Set
   `LEONIDA_VK_VALIDATION=1` to run them under the Khronos validation layer.
@@ -272,6 +277,37 @@ $env:LEONIDA_D3D12 = 'vulkan'
 Each trace line contains a sequence number, a fixed API name and an outcome. `called` marks a void API call
 whose validation may be deferred. `ok`, `failed` and `unsupported` report known results. `ignored` marks a no-op.
 Share only the lines prefixed with `[d3d12-trace]`. Other runtime diagnostics are separate.
+
+### Startup trace: `--trace FILE`
+
+`--trace FILE` (with `--dry-run`, `--init` or `--run`, before the `--` separator) writes one JSON object per line
+to FILE, flushed per event so the file survives a crash ([shims/startup_trace.h](shims/startup_trace.h)). FILE must
+not exist yet: the trace is created before the loader reads anything, so gta6rt refuses an existing path (exit code 2)
+rather than risk truncating an input such as the image. The file is UTF-8; `OutputDebugStringA` text is converted
+from the ANSI code page.
+
+| `kind` | When | Fields |
+|---|---|---|
+| `trace_open` | first line | `pid` |
+| `map` | a module is mapped, bound and protected | `module`, `base`, `size`, `relocated` |
+| `tls_callback` | before each TLS callback the Loader runs (process attach and detach; thread events run under the Windows loader lock and are not traced) | `module`, `at` (module+RVA), `reason` |
+| `dllmain` | after `DllMain(DLL_PROCESS_ATTACH)` returns | `module`, `result` |
+| `unimplemented_call` | first call of each unimplemented import | `import` (`dll!name`), `caller` (module+RVA) |
+| `debug_string` | `OutputDebugStringA/W` with no debugger attached | `text` |
+| `exception` | any exception, before handlers run | `code`, `at`, `access`/`address` for access violations, `cpp` for C++ throws, `stack` (up to 16 frames) |
+| `exit` / `error` | `--run` returns, or the loader throws | `code` / `what` |
+
+Every line also has `seq` and `t` (seconds since the trace opened). Addresses are `module+0xRVA` for mapped images,
+`host:name.dll+0xRVA` for host modules. The exception handler only records: it returns `EXCEPTION_CONTINUE_SEARCH`,
+so the process behaves the same with or without the trace. It works with any `LEONIDA_UNIMPLEMENTED` policy.
+
+The file can quote what the game prints, so it stays on your machine. In issues and pull requests, share counts or
+lines from synthetic fixtures only.
+
+```powershell
+.\runtime\build\gta6rt.exe --run $gameExe --trace startup.jsonl
+Get-Content startup.jsonl | ConvertFrom-Json | Group-Object kind | Select-Object Count, Name
+```
 
 ### Typed clear regression
 

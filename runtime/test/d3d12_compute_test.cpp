@@ -11,8 +11,11 @@
 #include "vk_test_device.h"
 #include "../shims/d3d12_com.h"
 #include "../src/gfx10_descriptors.h"
+#include "../src/cached_pso.h"
 #include "../src/shader_library.h"
 #include "../shims/d3d12_xs_device.h"
+
+#include <dxgi1_4.h>
 
 #include <cstdint>
 #include <cstring>
@@ -136,6 +139,116 @@ D3D12_RESOURCE_BARRIER transition(ID3D12Resource* resource, D3D12_RESOURCE_STATE
     return barrier;
 }
 
+// The CachedPSO cases both devices answer, in this order: the same description, another Flags, an equal root
+// signature object, a root signature with other content, a truncated blob, a blob of junk, its first, middle and last
+// byte changed, a pointer with size 0, a null pointer with a size.
+constexpr int cached_case_count = 11;
+
+template<class Device>
+std::vector<HRESULT> cached_pso_cases(Device* device, D3D12_COMPUTE_PIPELINE_STATE_DESC desc,
+                                      const std::vector<std::uint8_t>& root_blob,
+                                      const std::vector<std::uint8_t>& other_root_blob) {
+    std::vector<HRESULT> out;
+    auto create = [&](D3D12_COMPUTE_PIPELINE_STATE_DESC d, const void* p, SIZE_T n) {
+        d.CachedPSO = {p, n};
+        ID3D12PipelineState* made = nullptr;
+        HRESULT hr = device->CreateComputePipelineState(&d, IID_PPV_ARGS(&made));
+        if (SUCCEEDED(hr) != (made != nullptr)) hr = E_UNEXPECTED;  // a result and its object disagree
+        if (made) made->Release();
+        return hr;
+    };
+    ID3D12PipelineState* pso = nullptr;
+    if (FAILED(device->CreateComputePipelineState(&desc, IID_PPV_ARGS(&pso)))) return out;
+    ID3DBlob* blob = nullptr;
+    const HRESULT got = pso->GetCachedBlob(&blob);
+    const HRESULT got_null = pso->GetCachedBlob(nullptr);
+    pso->Release();
+    if (FAILED(got) || !blob || got_null != S_OK) {
+        if (blob) blob->Release();
+        return out;
+    }
+    const auto* p = static_cast<const std::uint8_t*>(blob->GetBufferPointer());
+    std::vector<std::uint8_t> bytes(p, p + blob->GetBufferSize());
+    blob->Release();
+    ID3D12RootSignature* same_root = nullptr;
+    ID3D12RootSignature* other_root = nullptr;
+    device->CreateRootSignature(0, root_blob.data(), root_blob.size(), IID_PPV_ARGS(&same_root));
+    device->CreateRootSignature(0, other_root_blob.data(), other_root_blob.size(), IID_PPV_ARGS(&other_root));
+    if (!same_root || !other_root) return out;
+
+    out.push_back(create(desc, bytes.data(), bytes.size()));
+    D3D12_COMPUTE_PIPELINE_STATE_DESC flags = desc;
+    flags.Flags = D3D12_PIPELINE_STATE_FLAG_TOOL_DEBUG;
+    out.push_back(create(flags, bytes.data(), bytes.size()));
+    D3D12_COMPUTE_PIPELINE_STATE_DESC same = desc;
+    same.pRootSignature = same_root;
+    out.push_back(create(same, bytes.data(), bytes.size()));
+    D3D12_COMPUTE_PIPELINE_STATE_DESC other = desc;
+    other.pRootSignature = other_root;
+    out.push_back(create(other, bytes.data(), bytes.size()));
+    out.push_back(create(desc, bytes.data(), bytes.size() / 2));
+    const std::vector<std::uint8_t> junk(bytes.size(), 0xab);
+    out.push_back(create(desc, junk.data(), junk.size()));
+    for (const std::size_t at : {std::size_t(0), bytes.size() / 2, bytes.size() - 1}) {
+        bytes[at] ^= 0xff;
+        out.push_back(create(desc, bytes.data(), bytes.size()));
+        bytes[at] ^= 0xff;
+    }
+    out.push_back(create(desc, bytes.data(), 0));
+    out.push_back(create(desc, nullptr, 16));
+    same_root->Release();
+    other_root->Release();
+    return out;
+}
+
+// The same cases on the PC runtime, with an empty compute shader from d3dcompiler_47: the default adapter, then WARP.
+// Empty when the host has no D3D12 device or no compiler (Wine), which the caller reports as a skip.
+std::vector<std::vector<HRESULT>> host_cached_pso_cases(const std::vector<std::uint8_t>& root_blob,
+                                                        const std::vector<std::uint8_t>& other_root_blob) {
+    using CompileFn = HRESULT(WINAPI*)(LPCVOID, SIZE_T, LPCSTR, const void*, void*, LPCSTR, LPCSTR, UINT, UINT,
+                                       ID3DBlob**, ID3DBlob**);
+    using CreateDeviceFn = decltype(&::D3D12CreateDevice);
+    std::vector<std::vector<HRESULT>> out;
+    const HMODULE compiler = LoadLibraryExA("d3dcompiler_47.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    const HMODULE d3d12 = LoadLibraryExA("d3d12.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    const HMODULE dxgi = LoadLibraryExA("dxgi.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    if (!compiler || !d3d12 || !dxgi) return out;
+    const auto compile = reinterpret_cast<CompileFn>(reinterpret_cast<void*>(GetProcAddress(compiler, "D3DCompile")));
+    const auto create_device =
+        reinterpret_cast<CreateDeviceFn>(reinterpret_cast<void*>(GetProcAddress(d3d12, "D3D12CreateDevice")));
+    using FactoryFn = HRESULT(WINAPI*)(REFIID, void**);
+    const auto create_factory =
+        reinterpret_cast<FactoryFn>(reinterpret_cast<void*>(GetProcAddress(dxgi, "CreateDXGIFactory1")));
+    if (!compile || !create_device || !create_factory) return out;
+    static const char source[] = "[numthreads(1, 1, 1)] void main() {}";
+    ID3DBlob* shader = nullptr;
+    if (FAILED(compile(source, sizeof(source) - 1, nullptr, nullptr, nullptr, "main", "cs_5_0", 0, 0, &shader,
+                       nullptr)) || !shader)
+        return out;
+    IDXGIFactory4* factory = nullptr;
+    if (SUCCEEDED(create_factory(IID_PPV_ARGS(&factory)))) {
+        IDXGIAdapter* warp = nullptr;
+        factory->EnumWarpAdapter(IID_PPV_ARGS(&warp));
+        for (IUnknown* adapter : {static_cast<IUnknown*>(nullptr), static_cast<IUnknown*>(warp)}) {
+            ID3D12Device* host = nullptr;
+            if (FAILED(create_device(adapter, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&host)))) continue;
+            ID3D12RootSignature* root = nullptr;
+            if (SUCCEEDED(host->CreateRootSignature(0, root_blob.data(), root_blob.size(), IID_PPV_ARGS(&root)))) {
+                D3D12_COMPUTE_PIPELINE_STATE_DESC desc{};
+                desc.pRootSignature = root;
+                desc.CS = {shader->GetBufferPointer(), shader->GetBufferSize()};
+                out.push_back(cached_pso_cases(host, desc, root_blob, other_root_blob));
+                root->Release();
+            }
+            host->Release();
+        }
+        if (warp) warp->Release();
+        factory->Release();
+    }
+    shader->Release();
+    return out;
+}
+
 }  // namespace
 
 int main() {
@@ -171,7 +284,7 @@ int main() {
 
     constexpr UINT elements = 64, bytes = elements * 4;
     const std::uint32_t table_values[4] = {1000, 2000, 3000, 4000};
-    std::vector<std::uint32_t> first(elements), second(elements);
+    std::vector<std::uint32_t> first(elements), second(elements), third(elements);
     std::vector<std::uint32_t> cbv_a_out(elements), cbv_oob_out(elements), cbv_b_out(elements), cbv_null_out(elements);
     {
         rt::d3d12::VulkanDeviceInfo info{};
@@ -258,6 +371,51 @@ int main() {
             device.p, &native_desc, nullptr, &out_null) == E_POINTER && !out_null);
         EXPECT(reinterpret_cast<XboxNativeComputePipelineFn>(slot(device.p, 67))(
             device.p, &native_desc, &pso_iid, nullptr) == E_POINTER);
+        // GetCachedBlob and CachedPSO answer as the PC runtime does (src/cached_pso.h).
+        {
+            D3D12_VERSIONED_ROOT_SIGNATURE_DESC other_desc = root_desc;
+            other_desc.Desc_1_0.NumParameters = 2;
+            const auto other_root_blob = serialize(other_desc);
+            EXPECT(!other_root_blob.empty());
+            const std::vector<HRESULT> layer = cached_pso_cases(device.p, pso_desc, root_blob, other_root_blob);
+            EXPECT(int(layer.size()) == cached_case_count);
+            const std::vector<HRESULT> expected = {S_OK,         S_OK,         S_OK,         E_INVALIDARG,
+                                                   E_INVALIDARG, E_INVALIDARG, E_INVALIDARG, E_INVALIDARG,
+                                                   E_INVALIDARG, E_INVALIDARG, S_OK};
+            EXPECT(layer == expected);
+            const auto hosts = host_cached_pso_cases(root_blob, other_root_blob);
+            if (hosts.empty()) std::printf("SKIP: no host D3D12 device or compiler for the CachedPSO comparison\n");
+            for (const auto& host : hosts) EXPECT(host == layer);
+            if (!hosts.empty()) std::printf("cached PSO: %zu host adapter(s) gave the same %d answers\n", hosts.size(), cached_case_count);
+
+            // Every byte of the blob counts, and the adapter and driver fields give the runtime's own errors.
+            Ref<ID3DBlob> blob;
+            EXPECT(pso->GetCachedBlob(&blob.p) == S_OK && blob.p);
+            const auto* p = static_cast<const std::uint8_t*>(blob->GetBufferPointer());
+            std::vector<std::uint8_t> bytes(p, p + blob->GetBufferSize());
+            auto attempt = [&](const std::vector<std::uint8_t>& b) {
+                D3D12_COMPUTE_PIPELINE_STATE_DESC d = pso_desc;
+                d.CachedPSO = {b.data(), b.size()};
+                Ref<ID3D12PipelineState> made;
+                return device->CreateComputePipelineState(&d, IID_PPV_ARGS(&made.p));
+            };
+            for (std::size_t at = 0; at < bytes.size(); ++at) {
+                auto changed = bytes;
+                changed[at] ^= 0x01;
+                EXPECT(attempt(changed) == E_INVALIDARG);
+            }
+            auto resealed = [](std::vector<std::uint8_t> b, std::size_t at) {
+                b[at] ^= 0x01;
+                const std::uint32_t sum = leonida::cached_pso::fnv1a(b.data(), b.size() - 4);
+                for (int i = 0; i < 4; ++i) b[b.size() - 4 + i] = std::uint8_t(sum >> (8 * i));
+                return b;
+            };
+            EXPECT(attempt(resealed(bytes, 8)) == D3D12_ERROR_ADAPTER_NOT_FOUND);   // vendor
+            EXPECT(attempt(resealed(bytes, 12)) == D3D12_ERROR_ADAPTER_NOT_FOUND);  // device
+            EXPECT(attempt(resealed(bytes, 16)) == D3D12_ERROR_DRIVER_VERSION_MISMATCH);
+            EXPECT(attempt(resealed(bytes, 20)) == D3D12_ERROR_DRIVER_VERSION_MISMATCH);  // pipelineCacheUUID
+            EXPECT(attempt(resealed(bytes, 4)) == E_INVALIDARG);  // version
+        }
 
         // A device whose maxPushConstantsSize is the Vulkan minimum (128 bytes) cannot hold the 144-byte block, so
         // its PSOs are refused instead of creating a pipeline layout the spec forbids (#224's fallback flag).
@@ -281,7 +439,7 @@ int main() {
         const D3D12_HEAP_PROPERTIES default_heap{D3D12_HEAP_TYPE_DEFAULT};
         const D3D12_HEAP_PROPERTIES upload_heap{D3D12_HEAP_TYPE_UPLOAD};
         const D3D12_HEAP_PROPERTIES readback_heap{D3D12_HEAP_TYPE_READBACK};
-        Ref<ID3D12Resource> out_a, out_b, constants, readback;
+        Ref<ID3D12Resource> out_a, out_b, out_c, constants, readback;
         const auto uav = buffer_desc(bytes, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
         EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &uav,
                                                          D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
@@ -289,16 +447,21 @@ int main() {
         EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &uav,
                                                          D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
                                                          IID_PPV_ARGS(&out_b.p))));
+        EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &uav,
+                                                         D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
+                                                         IID_PPV_ARGS(&out_c.p))));
         const auto constants_desc = buffer_desc(256, D3D12_RESOURCE_FLAG_NONE);
         EXPECT(SUCCEEDED(device->CreateCommittedResource(&upload_heap, D3D12_HEAP_FLAG_NONE, &constants_desc,
                                                          D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
                                                          IID_PPV_ARGS(&constants.p))));
-        const auto readback_desc = buffer_desc(2 * bytes, D3D12_RESOURCE_FLAG_NONE);
+        const auto readback_desc = buffer_desc(3 * bytes, D3D12_RESOURCE_FLAG_NONE);
         EXPECT(SUCCEEDED(device->CreateCommittedResource(&readback_heap, D3D12_HEAP_FLAG_NONE, &readback_desc,
                                                          D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
                                                          IID_PPV_ARGS(&readback.p))));
-        const D3D12_GPU_VIRTUAL_ADDRESS va_a = out_a->GetGPUVirtualAddress(), va_b = out_b->GetGPUVirtualAddress();
-        EXPECT(va_a >= 0x10000 && va_b >= 0x10000 && va_a != va_b && va_a < (1ull << 32) && va_b < (1ull << 32));
+        const D3D12_GPU_VIRTUAL_ADDRESS va_a = out_a->GetGPUVirtualAddress(), va_b = out_b->GetGPUVirtualAddress(),
+                                        va_c = out_c->GetGPUVirtualAddress();
+        EXPECT(va_a >= 0x10000 && va_b >= 0x10000 && va_c >= 0x10000 && va_a != va_b && va_a != va_c && va_b != va_c &&
+               va_a < (1ull << 32) && va_b < (1ull << 32) && va_c < (1ull << 32));
         EXPECT(va_a % D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT == 0);
         EXPECT(constants->GetGPUVirtualAddress() != 0);  // device address - heap base: wraps, still valid
         void* mapped = nullptr;
@@ -354,22 +517,39 @@ int main() {
             list->SetPipelineState(own_pso.p);
             held_root = own_root.p;  // still alive: the list holds it
         }
+        // Setting the bound root signature again keeps the arguments, as D3D12 does (TEST-280), and setting a
+        // graphics root signature does not disturb the compute root arguments.
         const std::uint32_t base_and_step[2] = {7, 3};
-        list->SetComputeRoot32BitConstants(0, 2, base_and_step, 0);
+        list->SetComputeRoot32BitConstant(0, base_and_step[0], 0);
+        list->SetComputeRootSignature(held_root);
+        list->SetComputeRoot32BitConstant(0, base_and_step[1], 1);
         list->SetComputeRootUnorderedAccessView(1, va_a);
         list->SetComputeRootDescriptorTable(2, D3D12_GPU_DESCRIPTOR_HANDLE{gpu});
-        // Setting the bound root signature again keeps the arguments, as D3D12 does.
         list->SetComputeRootSignature(held_root);
+        list->SetGraphicsRootSignature(root.p);
+        list->SetGraphicsRoot32BitConstant(0, 999, 0);
+        list->SetGraphicsRootSignature(root.p);
+        list->SetGraphicsRoot32BitConstant(0, 888, 1);
         list->Dispatch(1, 1, 1);
         list->SetComputeRoot32BitConstant(0, 100, 0);
         list->SetComputeRootUnorderedAccessView(1, va_b);
         list->Dispatch(1, 1, 1);
-        D3D12_RESOURCE_BARRIER barriers[2] = {
+        // Switching to a different root-signature object (root.p != held_root) resets the bound arguments to zero
+        // (clearing s0 = 100 to 0), whereas rebinding root.p afterwards keeps the arguments set on it (s1 = 5).
+        list->SetComputeRootSignature(root.p);
+        list->SetComputeRoot32BitConstant(0, 5, 1);  // offset 1 (s1 = 5); offset 0 (s0) stays 0 from the switch
+        list->SetComputeRootUnorderedAccessView(1, va_c);
+        list->SetComputeRootDescriptorTable(2, D3D12_GPU_DESCRIPTOR_HANDLE{gpu});
+        list->SetComputeRootSignature(root.p);
+        list->Dispatch(1, 1, 1);
+        D3D12_RESOURCE_BARRIER barriers[3] = {
             transition(out_a.p, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE),
-            transition(out_b.p, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE)};
-        list->ResourceBarrier(2, barriers);
+            transition(out_b.p, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE),
+            transition(out_c.p, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE)};
+        list->ResourceBarrier(3, barriers);
         list->CopyBufferRegion(readback.p, 0, out_a.p, 0, bytes);
         list->CopyBufferRegion(readback.p, bytes, out_b.p, 0, bytes);
+        list->CopyBufferRegion(readback.p, 2 * bytes, out_c.p, 0, bytes);
         EXPECT(list->Close() == S_OK);
         ID3D12CommandList* lists[] = {list.p};
         queue->ExecuteCommandLists(1, lists);
@@ -381,6 +561,7 @@ int main() {
         EXPECT(SUCCEEDED(readback->Map(0, nullptr, &results)));
         std::memcpy(first.data(), results, bytes);
         std::memcpy(second.data(), static_cast<const std::uint8_t*>(results) + bytes, bytes);
+        std::memcpy(third.data(), static_cast<const std::uint8_t*>(results) + 2 * bytes, bytes);
 
         // CreateConstantBufferView: populate shader-visible descriptor heap slots with GFX10 V# descriptors for a
         // 512-byte arena constant buffer (two 256-byte CBVs: A at +0, B at +256) and null CBVs.
@@ -504,10 +685,14 @@ int main() {
             std::memcpy(cbv_null_out.data(), src_bytes + 3 * bytes, bytes);
         }
 
-        for (auto* r : {&out_a, &out_b, &constants, &readback}) r->reset();
+        for (auto* r : {&out_a, &out_b, &out_c, &constants, &readback}) r->reset();
         pso67.reset();
         unknown67.reset();
         pso.reset();
+        pso67.reset();  // the slot-67 PSO holds the device like any other; released before the count is checked
+        unknown.reset();
+        unknown67.reset();
+        junk.reset();
         root.reset();
         heap.reset();
         list.reset();
@@ -522,8 +707,10 @@ int main() {
     for (std::uint32_t i = 0; i < elements; ++i) {
         const std::uint32_t a = 7 + 3 * i + table_values[i % 4] + code_word;
         const std::uint32_t b = 100 + 3 * i + table_values[i % 4] + code_word;
-        if ((first[i] != a || second[i] != b) && mismatches++ < 4)
-            std::fprintf(stderr, "element %u: got %u and %u, want %u and %u\n", i, first[i], second[i], a, b);
+        const std::uint32_t c = 5 * i + table_values[i % 4] + code_word;
+        if ((first[i] != a || second[i] != b || third[i] != c) && mismatches++ < 4)
+            std::fprintf(stderr, "element %u: got %u, %u and %u, want %u, %u and %u\n", i, first[i], second[i],
+                         third[i], a, b, c);
     }
     EXPECT(!mismatches);
     UINT cbv_b_diff = 0, cbv_null_diff = 0;
@@ -552,6 +739,6 @@ int main() {
         return 1;
     }
     std::printf("compute: root constants, a root UAV and a descriptor table reached the shader through the GPU "
-                "address arena; %u elements matched in each of two dispatches\n", elements);
+                "address arena; %u elements matched in each of three dispatches\n", elements);
     return 0;
 }

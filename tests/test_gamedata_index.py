@@ -33,6 +33,9 @@ def chunked(data: bytes, first: int = 65536):
     return [data[:first], data[first:]] if len(data) > first else [data]
 
 
+T = load_tool()
+
+
 class GamedataIndexTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -67,6 +70,23 @@ class GamedataIndexTest(unittest.TestCase):
     def run_tool(self, target, *args):
         return subprocess.run([sys.executable, "-I", TOOL, target, *args], cwd=self.root,
                               capture_output=True, text=True, encoding="utf-8", errors="replace")
+
+    def test_a_resource_continues_after_any_whole_number_of_64k_blocks(self):
+        # A 0DRP resource whose first stream is 128 KiB continues in the next stream (docs/page_directory.md);
+        # a binary run of the same shape has no header proving that, so it keeps the exact 64 KiB rule.
+        page = bytes(T.PAGE_MARKER_AT) + T.PAGE_MARKER
+        resource = page + b"\x11" * (2 * 65536 - len(page))
+        self.add(resource, [resource, b"\x22" * 1000])
+        binary = bytes(range(256)) * 512                        # 128 KiB with no header
+        self.add(binary, [binary, bytes(range(255, -1, -1)) * 4])
+        self.finish()
+        out = os.path.join(self.root, "index.json")
+        p = self.run_tool(self.carve, "--json", out)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        with open(out, encoding="utf-8") as f:
+            data = json.load(f)
+        self.assertEqual([(r["type"], r["chunks"]) for r in data["rows"]],
+                         [("other", 2), ("binary", 1), ("binary", 1)])
 
     def test_rejects_a_shared_csv_and_json_destination(self):
         self.finish()
@@ -196,6 +216,20 @@ class GamedataIndexTest(unittest.TestCase):
         self.assertEqual(s["types"]["xml"]["inflated"], len(xml))
         self.assertEqual(s["types"]["binary"]["files"], 1)
         self.assertEqual(s["roots"], {"RootA": {"files": 1, "inflated": len(xml)}})
+
+    def test_unwritable_csv_or_json_is_one_error_line(self):
+        self.add(b'<?xml version="1.0"?><RootA/>')
+        self.finish()
+        blocker = os.path.join(self.root, "blocker")
+        with open(blocker, "wb") as f:
+            f.write(b"x")
+        for flag, name in (("--csv", "out.csv"), ("--json", "out.json")):
+            with self.subTest(flag=flag):
+                out = os.path.join(blocker, name)
+                p = self.run_tool(self.carve, flag, out)
+                self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
+                self.assertIn("ERROR: cannot write", p.stderr)
+                self.assertNotIn("Traceback", p.stderr)
 
 
 class XmlClassificationTest(unittest.TestCase):

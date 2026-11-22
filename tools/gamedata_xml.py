@@ -25,7 +25,6 @@ import os
 import re
 import statistics
 import sys
-import unicodedata
 import xml.etree.ElementTree as ET
 from collections import Counter, defaultdict
 
@@ -33,6 +32,7 @@ ROOT = os.path.dirname(os.path.abspath(__file__))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 import gamedata_index as gi  # noqa: E402
+from report_paths import same_report_path  # noqa: E402
 
 BOM = b"\xef\xbb\xbf"
 MACRO_REF = re.compile(r"\$\(([A-Za-z_][\w.-]*)\)")
@@ -191,10 +191,22 @@ def scan_xml(data: bytes) -> dict:
     except (ET.ParseError, LookupError, ValueError) as exc:
         # The parser also raises LookupError or ValueError for unsupported encoding declarations.
         report["error"] = str(exc)
+        # The parser stops at the error, so the comments after it would go uncounted (a truncated or tail-only
+        # document): count them in the bytes instead, still skipping comment-like text inside CDATA.
+        report["comments"] = raw_comment_count(data)
     if ended is not None:
         scan_refs(ended.tail, report)
     report["attributes"] = sorted(report["attrs"])
     return report
+
+
+CDATA = re.compile(rb"<!\[CDATA\[.*?(?:\]\]>|\Z)", re.S)
+
+
+def raw_comment_count(data: bytes) -> int:
+    """Comment starts in a document the parser could not finish, outside CDATA sections (an unclosed one runs to
+    the end of the data)."""
+    return CDATA.sub(b"", data).count(b"<!--")
 
 
 def looks_truncated(data: bytes, root: str) -> bool:
@@ -474,42 +486,6 @@ def _make_parent(path: str) -> None:
         os.makedirs(parent, exist_ok=True)
 
 
-_PC_CASE_SENSITIVE = 11  # <sys/unistd.h> on macOS; os.pathconf_names doesn't list it
-
-
-def _case_insensitive_volume(path):
-    """True when the volume that will hold `path` ignores letter case, as macOS's default APFS volume does.
-    os.path.normcase folds case only on Windows, so on macOS `R.json` and `r.json` would pass as two reports."""
-    if sys.platform != "darwin":
-        return False
-    while not os.path.exists(path):
-        parent = os.path.dirname(path)
-        if parent == path:
-            break
-        path = parent
-    try:
-        return os.pathconf(path, _PC_CASE_SENSITIVE) == 0
-    except (OSError, ValueError):
-        return True  # the macOS default; folding can only refuse a pair, never overwrite one
-
-
-def _path_key(path):
-    path = os.path.normcase(os.path.realpath(path))
-    if _case_insensitive_volume(path):
-        # APFS and HFS+ also treat composed and decomposed accents as one name.
-        path = unicodedata.normalize("NFD", path.casefold())
-    return path
-
-
-def same_report_path(first: str, second: str) -> bool:
-    if _path_key(first) == _path_key(second):
-        return True
-    try:
-        return os.path.samefile(first, second)
-    except OSError:
-        return False
-
-
 def write_csv(path: str, rows: list) -> None:
     _make_parent(path)
     fields = ["source", "offset_hex", "bytes", "chunks", "root", "category", "header", "complete",
@@ -630,13 +606,21 @@ def main() -> int:
         clean = check_report(rows)
     print_summary(summary, agg)
     if args.csv:
-        write_csv(args.csv, rows)
+        try:
+            write_csv(args.csv, rows)
+        except OSError as exc:
+            print(f"ERROR: cannot write {args.csv}: {exc.strerror or exc}", file=sys.stderr)
+            return 2
         print("wrote", args.csv)
     if args.json:
         public_rows = [{key: value for key, value in row.items() if key != "_scan"} for row in rows]
-        _make_parent(args.json)
-        with open(args.json, "w", encoding="utf-8", newline="\n") as f:
-            json.dump({"summary": summary, "roots": agg["roots"], "rows": public_rows}, f, indent=1)
+        try:
+            _make_parent(args.json)
+            with open(args.json, "w", encoding="utf-8", newline="\n") as f:
+                json.dump({"summary": summary, "roots": agg["roots"], "rows": public_rows}, f, indent=1)
+        except OSError as exc:
+            print(f"ERROR: cannot write {args.json}: {exc.strerror or exc}", file=sys.stderr)
+            return 2
         print("wrote", args.json)
     return 0 if clean else 1
 

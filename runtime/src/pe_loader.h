@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <map>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -105,6 +106,12 @@ public:
     void install_tls_for_thread(Module& m);
     void uninstall_tls_for_thread(Module& m);
 
+    // Run-time module lookup/loading used by the library_loader shim for bundled package DLLs.
+    void* find_loaded_module(const std::string& dll_lower) const;
+    void* load_runtime_module(const std::string& dll_lower, uint32_t flags, bool& handled);
+    void* resolve_module_export(void* module_handle, const std::string& sym, bool& owns_handle);
+    bool owns_module_handle(void* module_handle) const;
+
 private:
     void initialise(Module& m);
     static void set_initialised(Module& m, bool value);
@@ -117,6 +124,7 @@ private:
     void protect_sections(Module& m);
     void register_unwind(Module& m);
 
+    mutable std::recursive_mutex mutex_;
     std::filesystem::path game_dir_;
     std::map<std::string, Module*> by_name_;  // lower-case file name
     std::vector<Module*> order_;       // mapping order; owns the modules

@@ -120,7 +120,8 @@ def test_add_f64_with_omod_not_asserted(prefix, want, tmp_path):
     ("v_cos_f16_e32", 0x3037), ("v_exp_f16_e32", 0x3037), ("v_log_f16_e32", 0x4a37),
 ])
 def test_transcendental_f16_ignores_mode(op, src, tmp_path):
-    # RX 6800: rcp/sqrt/rsq/sin give the same words in every rounding mode; cos, exp and log are unmeasured, assumed alike
+    # RX 6800 (rcp/sqrt/rsq/sin) + gfx1036 exhaustive 65,536-input sweep (SHADER-132, wave32 & wave64):
+    # all seven f16 transcendentals give identical bits in RNE and RTZ.
     got = []
     for prefix in ("", RNE, RTZ):
         asm = f"v_mov_b32 v1, {src:#x}\n{prefix}{op} v2, v1\n"
@@ -129,9 +130,11 @@ def test_transcendental_f16_ignores_mode(op, src, tmp_path):
 
 
 def test_transcendental_f16_nearest_after_rtz_write(tmp_path):
-    # MODE is set toward zero before the ops: they still give the nearest-even words
+    # MODE is set toward zero before the ops: all seven still give the nearest-even words (gfx1036, SHADER-132)
     for op, src, want in (("v_rcp_f16_e32", 0x3037, 0x4798), ("v_rsq_f16_e32", 0x3037, 0x4183),
-                          ("v_sqrt_f16_e32", 0x4200, 0x3EEE), ("v_sin_f16_e32", 0x3037, 0x39E4)):
+                          ("v_sqrt_f16_e32", 0x4200, 0x3EEE), ("v_sin_f16_e32", 0x3037, 0x39E4),
+                          ("v_cos_f16_e32", 0x3037, 0x396A), ("v_exp_f16_e32", 0x3037, 0x3C62),
+                          ("v_log_f16_e32", 0x4A37, 0x4345)):
         asm = f"v_mov_b32 v1, {src:#x}\n{RTZ}{op} v2, v1\n"
         assert vgprs(tmp_path, asm)[2] & 0xFFFF == want, op
 

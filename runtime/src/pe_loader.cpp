@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "../shims/shims.h"
+#include "../shims/startup_trace.h"
 #include "base_reservation.h"
 
 namespace rt {
@@ -383,7 +384,9 @@ void uninstall_thread_block(Module& m) {
     release_thread_slot(slot);
 }
 
-void run_callbacks(Module& m, uint32_t reason) {
+// `trace`: record each callback in the startup trace. Only the Loader's own calls (process attach and detach) pass
+// true; the thread events run under the Windows loader lock and stay out of the trace.
+void run_callbacks(Module& m, uint32_t reason, bool trace = false) {
     auto* tls = tls_directory(m);
     if (!tls || !tls->AddressOfCallBacks) return;
     const uint64_t table_rva = rva_in(m, tls->AddressOfCallBacks, "the TLS callback table");
@@ -395,6 +398,10 @@ void run_callbacks(Module& m, uint32_t reason) {
         if (!fn) break;
         auto callback =
             reinterpret_cast<PIMAGE_TLS_CALLBACK>(m.base + rva_in(m, fn, "a TLS callback"));
+        if (trace && startup_trace::enabled())
+            startup_trace::event("tls_callback", "\"module\":" + startup_trace::quote(m.name) + ",\"at\":" +
+                                                     startup_trace::quote(startup_trace::where(reinterpret_cast<uint64_t>(callback))) +
+                                                     ",\"reason\":" + std::to_string(reason));
         callback(m.base, static_cast<DWORD>(reason), nullptr);
     }
 }
@@ -531,10 +538,34 @@ bool lookup_in_loader(void* ctx, uint64_t address, std::string& module, uint32_t
     }
     return false;
 }
+
+void* bundled_find_loaded(void* ctx, const std::string& dll_lower) {
+    return static_cast<Loader*>(ctx)->find_loaded_module(dll_lower);
+}
+
+void* bundled_load(void* ctx, const std::string& dll_lower, uint32_t flags, bool& handled) {
+    return static_cast<Loader*>(ctx)->load_runtime_module(dll_lower, flags, handled);
+}
+
+void* bundled_get_proc(void* ctx, void* module, const std::string& sym, bool& owns_handle) {
+    return static_cast<Loader*>(ctx)->resolve_module_export(module, sym, owns_handle);
+}
+
+bool bundled_owns_handle(void* ctx, void* module) {
+    return static_cast<Loader*>(ctx)->owns_module_handle(module);
+}
+
+const shims::BundledModuleOps kBundledOps{
+    &bundled_find_loaded,
+    &bundled_load,
+    &bundled_get_proc,
+    &bundled_owns_handle,
+};
 }  // namespace
 
 Loader::Loader(std::filesystem::path game_dir) : game_dir_(std::move(game_dir)) {
     shims::add_module_lookup(this, &lookup_in_loader);
+    shims::add_bundled_loader(this, &kBundledOps);
 }
 
 Loader::~Loader() {
@@ -558,6 +589,7 @@ Loader::~Loader() {
             entry(m.base, DLL_PROCESS_DETACH, nullptr);  // explicit unload; the return value is ignored
         }
     }
+    shims::remove_bundled_loader(this);
     shims::remove_module_lookup(this);
     for (auto* m : order_) {
         // TLS state must go away before the image and its TLS block are unmapped.
@@ -581,6 +613,7 @@ Loader::~Loader() {
 }
 
 Module& Loader::load(const std::filesystem::path& image) {
+    std::lock_guard lock(mutex_);
     std::string key = lower(image.filename().string());
     if (auto it = by_name_.find(key); it != by_name_.end()) return *it->second;
     Module& m = map_image(image);
@@ -588,7 +621,103 @@ Module& Loader::load(const std::filesystem::path& image) {
     protect_sections(m);
     register_unwind(m);
     init_order_.push_back(&m);
+    if (startup_trace::enabled())
+        startup_trace::event("map", "\"module\":" + startup_trace::quote(m.name) +
+                                        ",\"base\":" + startup_trace::quote(startup_trace::hex(reinterpret_cast<uint64_t>(m.base))) +
+                                        ",\"size\":" + startup_trace::quote(startup_trace::hex(m.size)) +
+                                        ",\"relocated\":" + (m.relocated ? "true" : "false"));
     return m;
+}
+
+void* Loader::find_loaded_module(const std::string& dll_lower) const {
+    std::lock_guard lock(mutex_);
+    auto it = by_name_.find(dll_lower);
+    return it == by_name_.end() ? nullptr : static_cast<void*>(it->second->base);
+}
+
+void* Loader::load_runtime_module(const std::string& dll_lower, uint32_t flags, bool& handled) {
+    handled = false;
+    if (dll_lower.empty() || prefer_host_copy(dll_lower)) return nullptr;
+
+    std::lock_guard lock(mutex_);
+    const auto existing = by_name_.find(dll_lower);
+    const std::filesystem::path candidate = game_dir_ / dll_lower;
+    std::error_code ec;
+    const bool is_bundled = existing != by_name_.end() || std::filesystem::is_regular_file(candidate, ec);
+    if (!is_bundled) return nullptr;
+
+    handled = true;
+    // Win32 DONT_RESOLVE_DLL_REFERENCES (0x1) forbids resolving dependencies or running TLS/DllMain; refuse it
+    // explicitly instead of silently performing a normal resolving + initialising load.
+    if ((flags & DONT_RESOLVE_DLL_REFERENCES) != 0) {
+        std::fprintf(stderr,
+                     "[rt] loader: LoadLibraryEx(%s, DONT_RESOLVE_DLL_REFERENCES) is not supported for bundled DLLs\n",
+                     dll_lower.c_str());
+        SetLastError(ERROR_NOT_SUPPORTED);
+        return nullptr;
+    }
+
+    if (existing != by_name_.end()) {
+        try {
+            initialise();
+            return static_cast<void*>(existing->second->base);
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "[rt] loader: run-time initialise of %s failed: %s\n", dll_lower.c_str(), e.what());
+            SetLastError(ERROR_DLL_INIT_FAILED);
+            return nullptr;
+        }
+    }
+
+    try {
+        Module& m = load(candidate);
+        initialise();
+        std::fprintf(stderr, "[rt] loader: %s mapped from game_dir (run-time load)\n", m.name.c_str());
+        return static_cast<void*>(m.base);
+    } catch (const std::exception& e) {
+        // Do not leave a failed run-time load indexed by name so later GetModuleHandle/LoadLibrary calls do not
+        // observe a half-initialised module. ~Loader still frees any VirtualAlloc'd mapping in order_.
+        by_name_.erase(dll_lower);
+        std::fprintf(stderr, "[rt] loader: run-time load of %s failed: %s\n", dll_lower.c_str(), e.what());
+        SetLastError(ERROR_DLL_INIT_FAILED);
+        return nullptr;
+    }
+}
+
+void* Loader::resolve_module_export(void* module_handle, const std::string& sym, bool& owns_handle) {
+    owns_handle = false;
+    if (!module_handle) return nullptr;
+    std::lock_guard lock(mutex_);
+    Module* target = nullptr;
+    for (Module* m : order_) {
+        if (m->base == module_handle) {
+            target = m;
+            break;
+        }
+    }
+    if (!target) return nullptr;
+    owns_handle = true;
+    if (auto it = target->exports.find(sym); it != target->exports.end()) return it->second;
+    if (auto it = target->forwarders.find(sym); it != target->forwarders.end()) {
+        try {
+            Binding binding = Binding::Unimplemented;
+            void* fn = resolve_forwarder(it->second, binding, 0);
+            if (binding == Binding::Module) initialise();
+            return fn;
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "[rt] loader: forwarder %s from %s failed: %s\n", it->second.c_str(),
+                         target->name.c_str(), e.what());
+            return nullptr;
+        }
+    }
+    return nullptr;
+}
+
+bool Loader::owns_module_handle(void* module_handle) const {
+    if (!module_handle) return false;
+    std::lock_guard lock(mutex_);
+    for (const Module* m : order_)
+        if (m->base == module_handle) return true;
+    return false;
 }
 
 // x64 has no frame-pointer chain to fall back on: without its .pdata registered, an exception raised in (or passing
@@ -645,7 +774,11 @@ void Loader::initialise(Module& m) {
     if ((nt->FileHeader.Characteristics & IMAGE_FILE_DLL) && m.entry_rva) {
         if (m.entry_rva >= m.size) throw std::runtime_error(m.name + ": the entry point is outside the image");
         auto entry = reinterpret_cast<BOOL(NTAPI*)(void*, DWORD, void*)>(m.base + m.entry_rva);
-        if (!entry(m.base, DLL_PROCESS_ATTACH, nullptr)) {
+        const BOOL ok = entry(m.base, DLL_PROCESS_ATTACH, nullptr);
+        if (startup_trace::enabled())
+            startup_trace::event("dllmain", "\"module\":" + startup_trace::quote(m.name) +
+                                                ",\"result\":" + std::to_string(ok));
+        if (!ok) {
             set_initialised(m, true);  // it ran: a second DLL_PROCESS_ATTACH would be wrong
             throw std::runtime_error(m.name + ": DllMain returned FALSE");
         }
@@ -855,7 +988,7 @@ void Loader::install_tls_for_thread(Module& m) { install_thread_block(m); }
 
 void Loader::uninstall_tls_for_thread(Module& m) { uninstall_thread_block(m); }
 
-void Loader::run_tls_callbacks(Module& m, uint32_t reason) { run_callbacks(m, reason); }
+void Loader::run_tls_callbacks(Module& m, uint32_t reason) { run_callbacks(m, reason, /*trace=*/true); }
 
 void Loader::parse_exports(Module& m) {
     auto* nt = at<IMAGE_NT_HEADERS64>(m.base, reinterpret_cast<IMAGE_DOS_HEADER*>(m.base)->e_lfanew);
@@ -879,6 +1012,8 @@ void Loader::parse_exports(Module& m) {
     auto add_export = [&](const std::string& key, uint32_t rva) {
         if (rva >= dir_begin && rva < dir_end)
             m.forwarders[key] = read_string(m.name, m.base, m.size, rva, "a forwarded export");
+        else if (rva >= m.size)  // base + rva would point past the mapping, and a caller would jump there
+            throw std::runtime_error(m.name + ": export " + key + " points outside the image");
         else
             m.exports[key] = m.base + rva;
     };
@@ -919,10 +1054,12 @@ void* Loader::resolve_forwarder(const std::string& spec, Binding& binding, int d
         }
     }
 
+    // shim_key, not the bare module name: forwarder strings usually leave out ".dll" ("MSVCP140.?foo"), and the host
+    // CRT copies are named with it, so a forwarded CRT symbol must skip the bundled Xbox build as a direct import does.
     const std::filesystem::path candidates[] = {game_dir_ / module, game_dir_ / (module + ".dll")};
     for (const auto& candidate : candidates) {
         std::error_code ec;
-        if (prefer_host_copy(lower(module)) || !std::filesystem::exists(candidate, ec)) continue;
+        if (prefer_host_copy(shim_key) || !std::filesystem::exists(candidate, ec)) continue;
         Module& dep = load(candidate);
         if (auto it = dep.exports.find(symbol); it != dep.exports.end()) {
             binding = Binding::Module;

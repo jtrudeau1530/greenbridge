@@ -45,6 +45,7 @@ ROOT = os.path.dirname(os.path.abspath(__file__))
 TOOLS = os.path.join(ROOT, "tools")
 sys.path.insert(0, TOOLS)
 from mc_command import mc_command  # noqa: E402
+from shader_stage_manifest import shader_stems  # noqa: E402
 
 VERSIONS = os.path.join(ROOT, "game")
 STAGES = ["check", "shaders", "assets", "runtime", "pipelines"]
@@ -86,11 +87,13 @@ def below_normal() -> None:
         k32.SetPriorityClass(k32.GetCurrentProcess(), 0x00004000)
 
 
-def run(args: list, hint: str = "", **kw) -> None:
+def run(args: list, hint: str = "", check: bool = True, **kw) -> int:
+    """Run a command, logging it. A non-zero exit stops the build unless check is False; returns the exit code."""
     log("  " + " ".join(os.path.basename(str(a)) if i == 0 else str(a) for i, a in enumerate(args)))
     r = subprocess.run([str(a) for a in args], **kw)
-    if r.returncode != 0:
+    if check and r.returncode != 0:
         fail(f"{os.path.basename(str(args[0]))} exited with {r.returncode}" + (f". {hint}" if hint else ""))
+    return r.returncode
 
 
 def py(tool: str, *args) -> None:
@@ -408,7 +411,7 @@ def preflight(stages: list, work: str, wav: bool = False, runtime_build: str | N
         missing.append("Python 3.12 or newer: https://www.python.org/downloads/")
     if "shaders" in stages:
         mc = mc_command()[0]
-        if not tool_available(mc):
+        if not (os.path.isfile(mc) or shutil.which(mc)):
             missing.append(
                 "llvm-mc (LLVM 21+ with the AMDGPU target). The official Windows LLVM build has no AMDGPU "
                 "target: build a native one with scripts\\build_llvm_mc.ps1, or install llvm-21 in WSL and set "
@@ -439,6 +442,8 @@ def preflight(stages: list, work: str, wav: bool = False, runtime_build: str | N
                 missing.append(pipeline_check_prerequisite(runtime_building))
     if missing:
         fail("Install these first, then run the build again:\n  - " + "\n  - ".join(dict.fromkeys(missing)))
+    if "pipelines" in stages and "shaders" not in stages:
+        require_translated_shaders(work)
     need = {s: MIN_FREE_GB.get(s, 0) for s in stages}
     # A rerun that only refreshes the shaders shouldn't need room for a second copy of exports already on disk.
     # --wav still counts it: the WAV decode writes several times the Ogg Opus size and has no marker.
@@ -452,8 +457,12 @@ def preflight(stages: list, work: str, wav: bool = False, runtime_build: str | N
         log(f"preflight: the shaders in {work} can be reused; not counting their {need['shaders']} GB")
         need_gb -= need["shaders"]
     if free_gb < need_gb:
+        hint = ""
+        if "assets" in stages and need.get("assets"):
+            hint = (" The assets stage is optional for running: use --stages check,shaders,runtime "
+                    "(about 30 GB; add pipelines if you need it).")
         fail(f"{free_gb:.0f} GB free on the drive of {work}, about {need_gb} GB is needed. "
-             "Free some space or choose another drive with --work.")
+             "Free some space or choose another drive with --work." + hint)
     if os.name != "nt" and not runtime_build and any(s in WINDOWS_ONLY for s in stages):
         cross_configure()
     if "pipelines" in stages and os.name != "nt" and not pipeline_check_exe():
@@ -638,9 +647,28 @@ def llvm_mc_signature() -> str:
     return json.dumps([command, version])
 
 
+def unpacked_shader_stems(dxbc: str) -> set[str] | None:
+    """Return current unpacked names, allowing the unpacker to skip non-FSSM containers."""
+    try:
+        carved = shader_stems(os.path.join(dxbc, "index.json"), "file", ".dxbc")
+        unpacked = shader_stems(os.path.join(dxbc, "fssm_index.json"), "name")
+    except (OSError, ValueError):
+        return None
+    return unpacked if unpacked and unpacked <= carved else None
+
+
 def disassembly_matches(dxbc: str, signature: str) -> bool:
-    return (os.path.isdir(os.path.join(dxbc, "disasm"))
-            and read_shader_setting(os.path.join(dxbc, "disasm.done")) == signature)
+    if read_shader_setting(os.path.join(dxbc, "disasm.done")) != signature:
+        return False
+    names = unpacked_shader_stems(dxbc)
+    if names is None:
+        return False
+    try:
+        with os.scandir(os.path.join(dxbc, "disasm")) as entries:
+            return all(entry.name[:-2] in names for entry in entries
+                       if entry.name.endswith(".s") and entry.is_file())
+    except OSError:
+        return False
 
 
 def shader_outputs_reusable(work: str, emulate: bool, keep_emulated: bool,
@@ -691,10 +719,10 @@ def shaders(game: str, work: str, jobs: int, emulate: bool = False, keep_emulate
         log("shaders: carving shaders.rpf")
         drop(translated, shard_plan, disassembled, unpacked)
         py("shader_carve.py", src, dxbc)
-    if not os.path.isfile(unpacked):
+    if unpacked_shader_stems(dxbc) is None:
         log("shaders: unpacking native code")
         drop(translated, shard_plan, disassembled)
-        py("fssm_unpack.py", dxbc)
+        py("fssm_unpack.py", dxbc, "--carve-index", carved)
     # rdna2spirv.py finds index.json, the .dxbc files and fssm/ in the parent of the .s files' folder, so the
     # disassembly must sit inside the carve folder: next to it, every stage reads as "?" and is rejected.
     disasm = os.path.join(dxbc, "disasm")
@@ -704,7 +732,8 @@ def shaders(game: str, work: str, jobs: int, emulate: bool = False, keep_emulate
         log("shaders: disassembling (gfx1013)")
         drop(translated, shard_plan, disassembled)
         clear_shader_disassembly(work, disasm)
-        py("shader_disasm.py", os.path.join(dxbc, "fssm"), "--out", disasm, "--mcpu", "gfx1013", "--jobs", jobs)
+        py("shader_disasm.py", os.path.join(dxbc, "fssm"), "--unpack-index", unpacked,
+           "--out", disasm, "--mcpu", "gfx1013", "--jobs", jobs)
         with open(disassembled, "w", encoding="utf-8", newline="\n") as f:
             f.write(signature + "\n")
     # The translation also depends on the translator's own files, so their digest is kept beside it. A folder without
@@ -756,7 +785,99 @@ def shaders(game: str, work: str, jobs: int, emulate: bool = False, keep_emulate
         with open(sources_file, "w", encoding="utf-8", newline="\n") as f:
             f.write(sources + "\n")
         translate(disasm, spirv, jobs, emulate=emulate, fallbacks=fallbacks)
+    fspx_shaders(game, work, signature, emulate=emulate, fallbacks=fallbacks)
     log("shaders: done")
+
+
+FSPX_DLL = "amd_fidelityfx_upscaler_xbox.dll"
+FSPX_TOOLS = ("fspx_unpack.py", "shader_disasm.py")   # with TRANSLATION_SOURCES, what the FSPX outputs come from
+
+
+def file_sha256(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def fspx_settings(dll: str, mc_signature: str, emulate: bool, fallbacks: tuple[str, ...]) -> str:
+    """What the FSPX outputs depend on, as one line: the DLL, the unpacking and translating tools, llvm-mc, the
+    wave64 mode and the fallback flags."""
+    tools = hashlib.sha256()
+    for name in FSPX_TOOLS:
+        tools.update(f"{name}\0".encode() + bytes.fromhex(file_sha256(os.path.join(TOOLS, name))))
+    return json.dumps({"dll": file_sha256(dll), "tools": tools.hexdigest(), "translator": translation_sources_digest(),
+                       "llvm_mc": mc_signature, "wave64_emulate": bool(emulate), "fallbacks": list(fallbacks)},
+                      sort_keys=True)
+
+
+def fspx_shaders(game: str, work: str, mc_signature: str, emulate: bool = False,
+                 fallbacks: tuple[str, ...] = ()) -> None:
+    """The FidelityFX DLL's compute programs (docs/fspx.md): tools/fspx_unpack.py unpacks and disassembles them into
+    <work>/shaders/fspx, rdna2spirv.py translates them into <work>/shaders/spirv/fspx, where the runtime's shader
+    library finds them by fspx_code_sha256. The game's own shaders neither feed nor depend on this step.
+
+    The 29 programs take seconds, so the step runs whole: it counts as finished when spirv/fspx/index.json is there
+    and fspx_build.json, written after it, matches this run's settings (fspx_settings)."""
+    dll = os.path.join(game, FSPX_DLL)
+    unpacked = os.path.join(work, "shaders", "fspx")
+    spirv = os.path.join(work, "shaders", "spirv", "fspx")
+    translated = os.path.join(spirv, "index.json")
+    settings_file = os.path.join(spirv, "fspx_build.json")
+    if not os.path.isfile(dll):
+        log(f"shaders: no {FSPX_DLL} in the game folder, so no FSPX programs to translate")
+        return
+    settings = fspx_settings(dll, mc_signature, emulate, fallbacks)
+    if os.path.isfile(translated) and read_shader_setting(settings_file) == settings:
+        return
+    log(f"shaders: unpacking and translating the FSPX programs of {FSPX_DLL}")
+    drop(translated, settings_file)
+    # A program that no longer translates must not keep a module from the run before.
+    for folder, suffixes in ((os.path.join(unpacked, "disasm"), (".s",)), (spirv, (".spv", ".spvasm"))):
+        if os.path.isdir(folder):
+            with os.scandir(folder) as entries:
+                for entry in entries:
+                    if entry.name.endswith(suffixes) and entry.is_file(follow_symlinks=False):
+                        os.unlink(entry.path)
+    py("fspx_unpack.py", dll, "--out", unpacked, "--disasm")
+    extra = (["--wave64-emulate"] if emulate else []) + list(fallbacks)
+    py("rdna2spirv.py", os.path.join(unpacked, "disasm"), "--out", spirv, "--no-asm", *extra)
+    clash = fspx_key_clash(spirv)
+    if clash:
+        drop(translated)   # the runtime must not load an index whose keys pick between different modules
+        fail(f"shaders: FSPX programs {clash[0]} and {clash[1]} have the same kind-6 and kind-0 bytes "
+             "(fspx_code_sha256 and fspx_state_sha256) but different translated modules, so the runtime could not "
+             "tell which one a pipeline means (docs/fspx.md, \"Build and run-time lookup\")")
+    with open(settings_file, "w", encoding="utf-8", newline="\n") as f:
+        f.write(settings + "\n")
+
+
+def fspx_key_clash(spirv: str):
+    """Two entries of <spirv>/index.json with the same fspx_code_sha256 and fspx_state_sha256 whose .spv files
+    differ, as (name, name), or None. The same kind-6 bytes with different kind-0 entries is allowed: the run time
+    picks by both keys when the bytecode carries kind 0, and refuses a bare kind-6 program whose modules differ."""
+    with open(os.path.join(spirv, "index.json"), encoding="utf-8") as f:
+        index = json.load(f)
+    first = {}
+    for name in sorted(index):
+        meta = index[name]
+        if not isinstance(meta, dict) or "fspx_code_sha256" not in meta:
+            continue
+        key = (meta["fspx_code_sha256"], meta.get("fspx_state_sha256"))
+        if key not in first:
+            first[key] = name
+            continue
+        modules = []
+        for n in (first[key], name):
+            try:
+                with open(os.path.join(spirv, n + ".spv"), "rb") as f:
+                    modules.append(f.read())
+            except OSError:
+                modules.append(None)
+        if modules[0] is None or modules[0] != modules[1]:
+            return first[key], name
+    return None
 
 
 WAVE64_MODES = ("auto", "on", "off")
@@ -794,16 +915,25 @@ def smallest_max_subgroup(vulkaninfo_text: str):
     return min(per_device)
 
 
-def wave64_emulate(mode: str) -> bool:
-    """Whether to translate with --wave64-emulate (docs/design.md, "Wave64 emulation"). A wave64 compute or mesh
+def wave64_settings(mode: str) -> tuple[bool, bool]:
+    """Return whether to translate with emulation and whether to reuse emulated shaders. A wave64 compute or mesh
     shader is only exact without it when the GPU gives it 64-wide subgroups; with it, it is exact on any subgroup
-    size, at the cost of a workgroup barrier per segment. "auto" turns it on unless every Vulkan device reports
-    maxSubgroupSize >= 64, so a PC with both a 64-wide and a 32-wide GPU, or one vulkaninfo can't read, gets the
-    output that is exact on all of them."""
+    size, at the cost of a workgroup barrier per segment. "auto" keeps emulation off on native-wave64 RDNA2
+    under the AMD Windows driver. Elsewhere it turns emulation on unless every Vulkan device reports
+    maxSubgroupSize >= 64 and the runtime probe does not rule out native wave64."""
     if mode == "on":
-        return True
+        return True, False
     if mode == "off":
-        return False
+        return False, False
+    gpu = runtime_gpu_info()
+    native64 = bool(gpu["native64"]) if "native64" in gpu else None
+    if gpu.get("rdna2_amd_windows") and native64:
+        # #857: AMD's Windows compiler for RDNA2 crashes on many emulated LDS compute pipelines.
+        # The runtime probe can identify that GPU even when vulkaninfo is unavailable.
+        log(f"shaders: the runtime's GPU ({gpu.get('device', '?')}) is RDNA2 on the AMD Windows driver "
+            "and runs wave64 natively. That driver can crash on emulated wave64 code (#857), so auto uses "
+            "native wave64 and does not reuse emulated outputs (--wave64-emulate on to force emulation)")
+        return False, False
     exe = shutil.which("vulkaninfo")
     size = None
     if exe:
@@ -815,36 +945,19 @@ def wave64_emulate(mode: str) -> bool:
     if size is None:
         log("shaders: couldn't read the GPU's subgroup size from vulkaninfo: wave64 emulation on "
             "(exact on every GPU; --wave64-emulate off to skip it on a GPU with 64-wide subgroups)")
-        return True
+        return True, True
     on = size < 64
-    if on:
-        gpu = runtime_gpu_info()
-        if gpu.get("rdna2_amd_windows") and gpu.get("native64"):
-            # #857: AMD's Windows compiler for RDNA2 crashes creating many emulated LDS compute pipelines. The
-            # runtime runs on this GPU, which takes wave64 natively, so the 32-wide device (an Intel iGPU next to
-            # an RX 6000 card, say) gets native wave64 modules it isn't used for.
-            log(f"shaders: smallest maximum subgroup size is {size}, but the runtime's GPU ({gpu.get('device', '?')}) "
-                "is RDNA2 on the AMD Windows driver, whose shader compiler crashes on emulated wave64 code (#857), "
-                "and runs wave64 natively: wave64 emulation off (--wave64-emulate on to force it)")
-            return False
-    if not on and runtime_gpu_native64() is False:
+    if not on and native64 is False:
         log(f"shaders: smallest maximum subgroup size is {size}, but the Vulkan query found no 64-wide path for both "
             "compute and mesh (fixed default size or required-size control): wave64 emulation on")
-        return True
+        return True, True
     log(f"shaders: smallest maximum subgroup size is {size}: wave64 emulation {'on' if on else 'off'}")
-    return on
+    return on, True
 
 
-def runtime_gpu_native64():
-    """Whether current translated shaders can use native wave64 on the GPU the runtime would use, or None when
-    the Vulkan query cannot tell. For the current SPIR-V 1.5 modules, either a fixed default size of 64 in both
-    stages or required-size support for both compute and mesh avoids emulation."""
-    try:
-        r = subprocess.run([sys.executable, "-I", os.path.join(TOOLS, "vk_subgroup_info.py")],
-                           capture_output=True, text=True, timeout=60)
-        return bool(json.loads(r.stdout.strip().splitlines()[-1])["native64"])
-    except (OSError, ValueError, IndexError, KeyError, subprocess.SubprocessError):
-        return None
+def wave64_emulate(mode: str) -> bool:
+    """Whether a new translation uses wave64 emulation."""
+    return wave64_settings(mode)[0]
 
 
 def runtime_gpu_info() -> dict:
@@ -872,7 +985,8 @@ def runtime_gpu_per_vertex():
 
 # Source and data files that produce the translated modules, metadata and partner stubs.
 TRANSLATION_SOURCES = ("rdna2spirv.py", "shader_ir.py", "cfg_structure.py", "fssm_header.py", "lane_masks.py", "wave64_halves.py",
-                       "shader_meta.py", "spirv_stubs.py", "gfx10_formats.json")
+                       "shader_meta.py", "spirv_stubs.py", "spirv_asm.py", "spirv_asm_tables.py",
+                       "gfx10_formats.json")
 
 
 def translation_sources_digest() -> str:
@@ -907,6 +1021,30 @@ def translator_digest() -> str:
             with open(path, "rb") as f:
                 h.update(name.encode("utf-8") + b"\0" + f.read() + b"\0")
     return h.hexdigest()
+
+
+def _stop_procs(procs: list) -> None:
+    """Terminate and reap any child processes still running after an interrupted or failed launch."""
+    for p in procs:
+        if p.poll() is None:
+            try:
+                p.terminate()
+            except OSError:
+                pass
+    for p in procs:
+        try:
+            p.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            try:
+                p.kill()
+            except OSError:
+                pass
+            try:
+                p.wait(timeout=5)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+        except OSError:
+            pass
 
 
 def translate(disasm: str, spirv: str, jobs: int, emulate: bool = False,
@@ -944,10 +1082,16 @@ def translate(disasm: str, spirv: str, jobs: int, emulate: bool = False,
         which = f"0..{jobs - 1}" if len(todo) == jobs else ",".join(str(i) for i in todo)
         log(f"  rdna2spirv.py {disasm} --out {spirv} --shard {which}/{jobs}" + "".join(" " + e for e in extra))
     # --no-asm: keep only the .spv modules; the .spvasm text would add ~35 GB for the corpus
-    procs = [subprocess.Popen([sys.executable, "-I", tool, disasm, "--out", spirv, "--shard", f"{i}/{jobs}", "--no-asm",
-                               *extra])
-             for i in todo]
-    bad = [f"shard {i} exited with {r}" for i, r in zip(todo, [p.wait() for p in procs]) if r != 0]
+    procs = []
+    try:
+        for i in todo:
+            procs.append(subprocess.Popen([sys.executable, "-I", tool, disasm, "--out", spirv,
+                                           "--shard", f"{i}/{jobs}", "--no-asm", *extra]))
+        codes = [p.wait() for p in procs]
+    except BaseException:
+        _stop_procs(procs)
+        raise
+    bad = [f"shard {i} exited with {r}" for i, r in zip(todo, codes) if r != 0]
     if bad:
         fail("rdna2spirv.py: " + ", ".join(bad))
     py("rdna2spirv.py", disasm, "--out", spirv, "--merge")
@@ -1236,22 +1380,116 @@ def pipeline_check_exe():
     return next((p for p in found if os.path.isfile(p)), None)
 
 
+def require_translated_shaders(work: str) -> str:
+    spirv = os.path.join(work, "shaders", "spirv")
+    if not os.path.isfile(os.path.join(spirv, "index.json")):
+        fail("No translated shaders yet: run the shaders stage first.")
+    return spirv
+
+
 def pipelines(work: str, out: str, jobs: "int | None" = None) -> None:
     exe = pipeline_check_exe()
-    spirv = os.path.join(work, "shaders", "spirv")
     if not exe and os.name == "nt":
         fail("vk_pipeline_check.exe wasn't built: run the runtime stage with the Vulkan SDK installed.")
     if not exe:
         fail("vk_pipeline_check wasn't built. With CMake 3.24+, a C++20 compiler and the Vulkan headers and "
              "loader installed, run: cmake -S runtime -B runtime/build/linux && "
              "cmake --build runtime/build/linux --parallel")
-    if not os.path.isfile(os.path.join(spirv, "index.json")):
-        fail("No translated shaders yet: run the shaders stage first.")
+    spirv = require_translated_shaders(work)
     log("pipelines: creating every shader module and compute pipeline on this GPU")
     os.makedirs(out, exist_ok=True)
+    cache = os.path.join(out, "pipeline_cache.bin")
+    inflight = os.path.join(out, "pipeline_inflight.txt")
+    skip = os.path.join(out, "pipeline_crashes.txt")
+    drop(inflight, skip)   # every module gets a fresh chance on each run (a new translator may have fixed it)
     # --jobs: make_game.py's own; without it vk_pipeline_check uses half the hardware threads whatever was asked
-    run([exe, spirv, os.path.join(out, "pipeline_cache.bin"), *(["--jobs", str(jobs)] if jobs else [])])
+    base = [exe, spirv, cache, *(["--jobs", str(jobs)] if jobs else [])]
+    if not checker_supports(exe, "--inflight-file", "--skip-file"):
+        # An older build takes any argument it doesn't know as the cache path, so it would write the cache into
+        # pipeline_inflight.txt and exit 0. Run it as before: a module that kills it stops the stage.
+        log("pipelines: this vk_pipeline_check has no --inflight-file; rebuild the runtime stage so a module that "
+            "crashes the driver is skipped instead of stopping the stage")
+        run(base)
+        log("pipelines: done")
+        return
+    base += ["--inflight-file", inflight]
+    crashed: "list[str]" = []
+    code = 0
+    for _ in range(PIPELINE_CRASH_RETRIES + 1):
+        code = run(base + (["--skip-file", skip] if crashed else []), check=False)
+        if code in (0, 1, 2) or interrupted(code):
+            break
+        # The driver took vk_pipeline_check down. Name the module it was compiling and check the rest without it:
+        # what was already compiled comes back from pipeline_cache.bin, saved every 10 minutes.
+        suspects = [n for n in read_names(inflight) if n not in crashed]
+        if len(suspects) > 1:   # several were compiling: keep the ones that also kill it on their own
+            suspects = [n for n in suspects if crashes_alone(exe, spirv, cache, n)]
+        if not suspects:
+            fail(f"vk_pipeline_check exited with {exit_label(code)} while no module could be named as the cause; "
+                 "run the pipelines stage again, and report it if it keeps happening")
+        for n in suspects:
+            log(f"pipelines: {n} took vk_pipeline_check down ({exit_label(code)}); checking the rest without it")
+        crashed += suspects
+        with open(skip, "w", encoding="utf-8", newline="\n") as f:
+            f.write("".join(n + "\n" for n in crashed))
+    else:
+        fail(f"vk_pipeline_check still crashed after {PIPELINE_CRASH_RETRIES} retries; modules that took it down: "
+             + ", ".join(crashed))
+    drop(inflight)
+    if code != 0:
+        why = f"; {len(crashed)} module(s) took the driver down and were counted as failed: " + ", ".join(crashed) \
+            if crashed else ""
+        fail(f"vk_pipeline_check exited with {exit_label(code)}{why}")
     log("pipelines: done")
+
+
+# How many times the pipelines stage restarts vk_pipeline_check after a module takes it down (each costs at most the
+# 10 minutes since the last cache checkpoint, plus loading the cache).
+PIPELINE_CRASH_RETRIES = 5
+
+
+def interrupted(code: int) -> bool:
+    """Ctrl+C or a kill, not a crash: SIGINT/SIGTERM off Windows, STATUS_CONTROL_C_EXIT on it."""
+    return code in (-2, -15) or (code & 0xFFFFFFFF) == 0xC000013A
+
+
+def exit_label(code: int) -> str:
+    """An exit code as Windows writes it (0x80000003 for an LLVM abort in the driver), or the signal off Windows."""
+    if code < 0:
+        return f"signal {-code}"
+    return f"{code} ({code:#010x})" if code > 255 else str(code)
+
+
+def checker_supports(exe: str, *options: str) -> bool:
+    """Whether this vk_pipeline_check build knows the options: run without arguments, it prints its usage (and exits
+    2) before touching Vulkan. Builds before --inflight-file don't reject unknown arguments, so asking is the only way
+    to tell."""
+    try:
+        r = subprocess.run([exe], capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    usage = (r.stdout or "") + (r.stderr or "")
+    return all(o in usage for o in options)
+
+
+def read_names(path: str) -> "list[str]":
+    """The module names in vk_pipeline_check's --inflight-file ("name<TAB>phase" lines)."""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            return [n for n in (line.split("\t", 1)[0].strip() for line in f) if n]
+    except OSError:
+        return []
+
+
+def crashes_alone(exe: str, spirv: str, cache: str, name: str) -> bool:
+    """Whether one module takes vk_pipeline_check down on its own: --start/--count select it in the checker's
+    name-sorted index (byte order, as its std::map)."""
+    with open(os.path.join(spirv, "index.json"), encoding="utf-8") as f:
+        names = sorted(json.load(f), key=lambda n: n.encode("utf-8"))
+    if name not in names:
+        return False
+    code = run([exe, spirv, cache, "--jobs", "1", "--start", str(names.index(name)), "--count", "1"], check=False)
+    return code not in (0, 1, 2) and not interrupted(code)
 
 
 def main() -> int:
@@ -1351,8 +1589,8 @@ def main() -> int:
             stages = [s for s in stages if s not in WINDOWS_ONLY]
             log(f"{', '.join(WINDOWS_ONLY)}: left out, the cross-build needs {'; '.join(lacking)} "
                 "(or pass --runtime-build)")
-    emulate = "shaders" in stages and wave64_emulate(a.wave64_emulate)
-    keep_emulated = a.wave64_emulate == "auto"
+    emulate, keep_emulated = (wave64_settings(a.wave64_emulate) if "shaders" in stages
+                              else (False, a.wave64_emulate == "auto"))
     if "shaders" in stages and not a.f16_interp_fallback and runtime_gpu_per_vertex() is False:
         log("shaders: the GPU the runtime would use can't take PerVertexKHR inputs (MoltenVK, or no "
             "fragmentShaderBarycentric): translating with --f16-interp-fallback")

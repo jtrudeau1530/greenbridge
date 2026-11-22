@@ -292,7 +292,7 @@ def collect_skeletons_dir(path):
     out = []
     for name in sorted(os.listdir(path)):
         full = os.path.join(path, name)
-        if not os.path.isfile(full) or os.path.getsize(full) > 16384:
+        if not os.path.isfile(full) or name.lower().endswith((".json", ".csv")) or os.path.getsize(full) > 16384:
             continue
         with open(full, "rb") as f:
             data = f.read()
@@ -308,9 +308,9 @@ def collect_skeletons_dir(path):
 def collect_rbf0_dir(path):
     """The same continuation rule for a carved directory sorted by offset."""
     entries = []
-    for name in os.listdir(path):
+    for name in sorted(os.listdir(path)):
         full = os.path.join(path, name)
-        if not os.path.isfile(full):
+        if not os.path.isfile(full) or name.lower().endswith((".json", ".csv")):
             continue
         m = re.match(r"([0-9a-fA-F]{6,})", name)
         offset = int(m.group(1), 16) if m else len(entries)
@@ -532,8 +532,40 @@ def main():
     ap.add_argument("--rigs", metavar="PATH", help="write parsed RBF0 rig-set/rig and SKEL_ JSON here")
     ap.add_argument("--quiet", action="store_true")
     a = ap.parse_args()
-    if a.rigs and same_report_path(a.out, a.rigs):
-        ap.error("index and --rigs must use different paths")
+    if same_report_path(a.source, a.out):
+        ap.error("output must not overwrite the source")
+    if a.rigs:
+        if same_report_path(a.source, a.rigs):
+            ap.error("--rigs must not overwrite the source")
+        if same_report_path(a.out, a.rigs):
+            ap.error("index and --rigs must use different paths")
+    if os.path.isdir(a.out):
+        ap.error(f"{a.out} is a folder, not a .csv or .json file")
+    if a.rigs and os.path.isdir(a.rigs):
+        ap.error(f"{a.rigs} is a folder, not a JSON file")
+    if os.path.isdir(a.source):
+        manifest = os.path.join(a.source, "index.json")
+        for flag, path in (("output", a.out), ("--rigs", a.rigs)):
+            if not path:
+                continue
+            if os.path.isfile(manifest) and same_report_path(manifest, path):
+                ap.error(f"{flag} would overwrite the carve manifest: {path}")
+            if os.path.isfile(path):
+                for name in os.listdir(a.source):
+                    inp = os.path.join(a.source, name)
+                    if os.path.isfile(inp) and not name.lower().endswith((".json", ".csv")):
+                        if same_report_path(inp, path):
+                            ap.error(f"{flag} would overwrite an input file: {path}")
+    if os.path.splitext(a.out)[1].lower() not in (".json", ".csv"):
+        ap.error("output must end in .json or .csv")
+    if a.rigs and os.path.splitext(a.rigs)[1].lower() != ".json":
+        ap.error("--rigs must end in .json")
+    for flag, path in (("output", a.out), ("--rigs", a.rigs)):
+        if not path:
+            continue
+        folder = os.path.dirname(os.path.abspath(path))
+        if not os.path.isdir(folder):
+            sys.exit(f"{path}: cannot write: folder does not exist: {folder}")
     try:
         if os.path.isdir(a.source):
             if a.start is not None or a.limit is not None:

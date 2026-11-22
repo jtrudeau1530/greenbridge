@@ -28,9 +28,12 @@ import re
 import subprocess
 import sys
 import tempfile
-import unicodedata
 import zlib
 from collections import defaultdict
+
+# -I keeps the script directory off sys.path, so add it explicitly before importing the sibling module.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from report_paths import same_report_path  # noqa: E402
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 CARVER = os.path.join(ROOT, "rpf9_carve.py")
@@ -237,7 +240,10 @@ def build_rows(rows: list, source) -> list:
             group = [i]
             detail = magic_name(data)
             j = i + 1
-            while j < n and rows[j - 1]["size"] == 65536:
+            # A resource's first stream may be any whole number of 64 KiB blocks (docs/page_directory.md: 128 and
+            # 192 KiB first streams continue in the next one). Only these headed kinds take that rule: a binary,
+            # text or XML run has no header proving a continuation, so it keeps the exact 64 KiB rule below.
+            while j < n and rows[j - 1]["size"] and rows[j - 1]["size"] % 65536 == 0:
                 nxt = source.read(rows[j])
                 nk = stream_kind(nxt, rows[j])
                 if nk in ("decl", "bink2", "rbf0", "psin", "other"):
@@ -357,42 +363,6 @@ def write_csv(path: str, rows: list) -> None:
         w.writerows(rows)
 
 
-_PC_CASE_SENSITIVE = 11  # <sys/unistd.h> on macOS; os.pathconf_names doesn't list it
-
-
-def _case_insensitive_volume(path):
-    """True when the volume that will hold `path` ignores letter case, as macOS's default APFS volume does.
-    os.path.normcase folds case only on Windows, so on macOS `R.json` and `r.json` would pass as two reports."""
-    if sys.platform != "darwin":
-        return False
-    while not os.path.exists(path):
-        parent = os.path.dirname(path)
-        if parent == path:
-            break
-        path = parent
-    try:
-        return os.pathconf(path, _PC_CASE_SENSITIVE) == 0
-    except (OSError, ValueError):
-        return True  # the macOS default; folding can only refuse a pair, never overwrite one
-
-
-def _path_key(path):
-    path = os.path.normcase(os.path.realpath(path))
-    if _case_insensitive_volume(path):
-        # APFS and HFS+ also treat composed and decomposed accents as one name.
-        path = unicodedata.normalize("NFD", path.casefold())
-    return path
-
-
-def same_report_path(first: str, second: str) -> bool:
-    if _path_key(first) == _path_key(second):
-        return True
-    try:
-        return os.path.samefile(first, second)
-    except OSError:
-        return False
-
-
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("target", help="carve directory or .rpf archive")
@@ -440,11 +410,19 @@ def main() -> int:
             source.close()
 
     if a.csv:
-        write_csv(a.csv, rows)
+        try:
+            write_csv(a.csv, rows)
+        except OSError as e:
+            print(f"ERROR: cannot write {a.csv}: {e.strerror or e}", file=sys.stderr)
+            return 2
     if a.json:
-        _make_parent(a.json)
-        with open(a.json, "w", encoding="utf-8", newline="\n") as f:
-            json.dump({"summary": summary, "rows": rows}, f, indent=1)
+        try:
+            _make_parent(a.json)
+            with open(a.json, "w", encoding="utf-8", newline="\n") as f:
+                json.dump({"summary": summary, "rows": rows}, f, indent=1)
+        except OSError as e:
+            print(f"ERROR: cannot write {a.json}: {e.strerror or e}", file=sys.stderr)
+            return 2
 
     print(f'{summary["streams"]} streams, {summary["stored"]:,} stored, '
           f'{summary["inflated"]:,} inflated')

@@ -72,11 +72,15 @@ def _clean_zero(v: float) -> float:
 def _normalize3(nx: float, ny: float, nz: float) -> tuple[float, float, float]:
     if not (math.isfinite(nx) and math.isfinite(ny) and math.isfinite(nz)):
         return (0.0, 1.0, 0.0)
-    length = math.sqrt(nx * nx + ny * ny + nz * nz)
-    if length <= 0.0 or not math.isfinite(length):
+    length = math.hypot(nx, ny, nz)
+    if length == 0.0:
         return (0.0, 1.0, 0.0)
-    inv = 1.0 / length
-    return (_clean_zero(nx * inv), _clean_zero(ny * inv), _clean_zero(nz * inv))
+    if length < sys.float_info.min or not math.isfinite(length):
+        # Scaling first keeps an unrepresentable or subnormal length from changing the direction.
+        scale = max(abs(nx), abs(ny), abs(nz))
+        nx, ny, nz = nx / scale, ny / scale, nz / scale
+        length = math.hypot(nx, ny, nz)
+    return (_clean_zero(nx / length), _clean_zero(ny / length), _clean_zero(nz / length))
 
 
 def _compute_smooth_normals(
@@ -242,7 +246,7 @@ def parse_obj(
     # Preserve order of appearance for (group_index, material_name) primitives.
     builders: dict[tuple[int, str], dict] = {}
 
-    for raw_line in text.splitlines():
+    for raw_line in text.removeprefix("\ufeff").splitlines():
         line = raw_line.strip()
         if not line or line[0] == "#":
             continue
@@ -532,10 +536,10 @@ def compute_bounds(primitives: list[dict]) -> list[float] | None:
 
 
 def _pack_f32(values: list[tuple[float, ...]], components: int) -> tuple[bytes, array.array]:
+    if any(len(item) != components for item in values):
+        raise GlbError(f"expected {components} floats per vertex")
     if _FLOAT32_CODE is not None:
         arr = array.array(_FLOAT32_CODE, itertools.chain.from_iterable(values))
-        if len(arr) != len(values) * components:
-            raise GlbError(f"expected {components} floats per vertex")
         if not all(map(math.isfinite, arr)):
             raise GlbError("non-finite float32 vertex attribute")
         raw = arr
@@ -547,8 +551,6 @@ def _pack_f32(values: list[tuple[float, ...]], components: int) -> tuple[bytes, 
 
     flat: list[float] = []
     for item in values:
-        if len(item) != components:
-            raise GlbError(f"expected {components} floats per vertex")
         for c in item:
             v = float(c)
             if not math.isfinite(v):
@@ -625,6 +627,8 @@ def pack_primitive(prim: dict) -> dict:
     positions = list(prim["positions"])
     indices = list(prim["indices"])
     vert_count = len(positions)
+    pos_bytes, pos_f32 = _pack_f32(positions, 3)
+    idx_bytes, idx_comp_type = _pack_indices(indices, vert_count)
     normals_in = prim.get("normals")
     if normals_in is None or len(normals_in) == 0:
         normals = _compute_smooth_normals(positions, indices)
@@ -637,7 +641,6 @@ def pack_primitive(prim: dict) -> dict:
         raise GlbError(
             f"normals length ({len(normals_in)}) does not match positions length ({vert_count})"
         )
-    pos_bytes, pos_f32 = _pack_f32(positions, 3)
     xs = pos_f32[0::3]
     ys = pos_f32[1::3]
     zs = pos_f32[2::3]
@@ -657,7 +660,6 @@ def pack_primitive(prim: dict) -> dict:
             for uv in uvs_in
         ]
         uv_bytes, _ = _pack_f32(clean_uvs, 2)
-    idx_bytes, idx_comp_type = _pack_indices(indices, vert_count)
     material = prim.get("material", "")
     return {
         "positions": pos_bytes,

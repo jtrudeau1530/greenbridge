@@ -29,12 +29,12 @@ keeps the game's inline markup (`~o~`, `~s~`, `~n~`, `~sl:0.05:0.9~`, `~COLOR_SU
 
 | Archive | Tables |
 |---|---:|
-| `data.rpf` | 14,440 |
+| `data.rpf` | 14,482 |
 | `story000.rpf` | 15,831 |
 | `shared_minigame000.rpf` | 78 |
-| **Total** | **30,349** tables, 7,172,826 strings |
+| **Total** | **30,391** tables, 7,252,163 strings |
 
-The same 14,440 `data.rpf` tables come out of a directory carved by `rpf9_carve.py`, the archive read directly, and
+The same 14,482 `data.rpf` tables come out of a directory carved by `rpf9_carve.py`, the archive read directly, and
 an older carve that wrote each resource as one file.
 
 ### Language
