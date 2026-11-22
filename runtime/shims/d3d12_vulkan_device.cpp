@@ -3583,9 +3583,11 @@ public:
     // The CUSTOM equivalent of a standard heap type, from the D3D12 documentation's table for a NUMA adapter
     // (D3D12_FEATURE_ARCHITECTURE answers UMA = FALSE): DEFAULT is GPU-only memory in L1, UPLOAD write-combined
     // and READBACK write-back system memory in L0, GPU_UPLOAD write-combined L1. CUSTOM and unknown types have
-    // no equivalent and get an all-zero answer (D3D12 reports them through the debug layer).
+    // no equivalent and get an all-zero answer (D3D12 reports them through the debug layer), with node 0 in both node
+    // masks as the host runtime gives it (d3d12_fence_timing_test compares CUSTOM, an unknown type and node mask 2).
     D3D12_HEAP_PROPERTIES STDMETHODCALLTYPE GetCustomHeapProperties(UINT node_mask, D3D12_HEAP_TYPE type) override {
         D3D12_HEAP_PROPERTIES properties{};
+        properties.CreationNodeMask = properties.VisibleNodeMask = 1;
         if (node_mask > 1) {
             log_once("GetCustomHeapProperties node mask", int(node_mask));
             return properties;
@@ -3612,8 +3614,6 @@ public:
             return properties;
         }
         properties.Type = D3D12_HEAP_TYPE_CUSTOM;
-        properties.CreationNodeMask = 1;
-        properties.VisibleNodeMask = 1;
         return properties;
     }
 
