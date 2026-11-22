@@ -773,7 +773,7 @@ def run_suite(a, work: str) -> int:
                       "cs_bpermute32", "cs_w64x_partial_scmp", "cs_w32_partial_scmp", "cs_barrier_early_end",
                       "cs_barrier_loop", "cs_w64x_andn2_exec"):
             cs_dump_wants = {
-                "cs_store": [0x400080FF, 0xE00003FF, 0x3C004000, 0xEEEEEEEE, 0x40003C00, 0xBC003800],
+                "cs_store": [0x400080FF, 0xE00003FF, 0x3C004000, 0xEEEEEEEE, 0x40003C00, 0xBC003800, 0x40FF8000, 0x3FF00000],
                 # base + soffset + imm (cs_smem_soffset_imm.asm); out[4..7] are seeds the shader leaves alone
                 "cs_smem_soffset_imm": [0x5EED0024, 0x5EED0028, 0x5EED002C, 0x5EED0030,
                                         0x5EED0010, 0x5EED0014, 0x5EED0018, 0x5EED001C],
