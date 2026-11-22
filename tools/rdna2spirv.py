@@ -5090,7 +5090,7 @@ class Gen:
             self.dst(a[0], r)
         elif op == "ds_swizzle_b32":
             self.swizzle(a, mods, ins)
-        elif op in ("v_add_f64", "v_cvt_f32_f64"):
+        elif op in ("v_add_f64", "v_cvt_f32_f64", "v_rcp_f64", "v_rsq_f64", "v_sqrt_f64"):
             # f64: register pairs as doubles (shaderFloat64). neg/abs modifiers apply to the double.
             def f64(sv):
                 if sv["k"] in ("vgpr", "sgpr") and sv.get("n") == 2:
@@ -5116,22 +5116,41 @@ class Gen:
                     d = t
                 return d
             self.uses_f64 = True
-            if op == "v_add_f64":
-                x, y = f64(a[1]), f64(a[2])
-                r, v2, lo, hi = self.tmp(), self.tmp(), self.tmp(), self.tmp()
-                self.emit(f"{r} = OpFAdd %double {x} {y}")
-                if self.round_mode:
-                    # MODE rounds the sum itself; clamp/omod then apply to the rounded value, as on the hardware.
-                    m2, mlo, mhi, n2, rd = (self.tmp() for _ in range(5))
-                    self.emit(f"{m2} = OpBitcast %v2uint_d {r}")
-                    self.emit(f"{mlo} = OpCompositeExtract %uint {m2} 0")
-                    self.emit(f"{mhi} = OpCompositeExtract %uint {m2} 1")
-                    mlo, mhi = self.f64_add_mode(x, y, r, mlo, mhi)
-                    self.emit(f"{n2} = OpCompositeConstruct %v2uint_d {mlo} {mhi}")
-                    self.emit(f"{rd} = OpBitcast %double {n2}")
-                    r = rd
-                # VOP3_Profile<VOP_F64_F64_F64>: HasClamp and HasOMod (LLVM VOPProfile, f64 is a modifier type).
+            if op == "v_cvt_f32_f64":
+                x = f64(a[1])
+                r = self.tmp()
+                self.emit(f"{r} = OpFConvert %float {x}")
+                self.dst(a[0], self.tou(self.clamp_mods(r, mods)))
+            else:
+                if op == "v_add_f64":
+                    x, y = f64(a[1]), f64(a[2])
+                    r = self.tmp()
+                    self.emit(f"{r} = OpFAdd %double {x} {y}")
+                    if self.round_mode:
+                        # MODE rounds the sum itself; clamp/omod then apply to the rounded value, as on the hardware.
+                        m2, mlo, mhi, n2, rd = (self.tmp() for _ in range(5))
+                        self.emit(f"{m2} = OpBitcast %v2uint_d {r}")
+                        self.emit(f"{mlo} = OpCompositeExtract %uint {m2} 0")
+                        self.emit(f"{mhi} = OpCompositeExtract %uint {m2} 1")
+                        mlo, mhi = self.f64_add_mode(x, y, r, mlo, mhi)
+                        self.emit(f"{n2} = OpCompositeConstruct %v2uint_d {mlo} {mhi}")
+                        self.emit(f"{rd} = OpBitcast %double {n2}")
+                        r = rd
+                elif op == "v_rcp_f64":
+                    x = f64(a[1])
+                    r = self.tmp()
+                    self.emit(f"{r} = OpFDiv %double {self.dconst(1.0)} {x}")
+                elif op == "v_rsq_f64":
+                    x = f64(a[1])
+                    r = self.tmp()
+                    self.emit(f"{r} = OpExtInst %double %glsl InverseSqrt {x}")
+                else:  # v_sqrt_f64
+                    x = f64(a[1])
+                    r = self.tmp()
+                    self.emit(f"{r} = OpExtInst %double %glsl Sqrt {x}")
+                # VOP3 f64 ops carry HasClamp and HasOMod (LLVM VOPProfile, f64 is a modifier type).
                 r = self.clamp_mods_f64(r, mods)
+                v2, lo, hi = self.tmp(), self.tmp(), self.tmp()
                 self.emit(f"{v2} = OpBitcast %v2uint_d {r}")
                 self.emit(f"{lo} = OpCompositeExtract %uint {v2} 0")
                 self.emit(f"{hi} = OpCompositeExtract %uint {v2} 1")
@@ -5140,11 +5159,6 @@ class Gen:
                     raise Unsupported(op + " destination")
                 self.dst({"k": "vgpr", "r": d["r"], "n": 1}, lo)
                 self.dst({"k": "vgpr", "r": d["r"] + 1, "n": 1}, hi)
-            else:
-                x = f64(a[1])
-                r = self.tmp()
-                self.emit(f"{r} = OpFConvert %float {x}")
-                self.dst(a[0], self.tou(self.clamp_mods(r, mods)))
         elif op in ("image_bvh_intersect_ray", "image_bvh64_intersect_ray"):
             self.image_bvh(op, a, mods)
         elif op == "s_bfm_b64":
