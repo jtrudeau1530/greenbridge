@@ -24,7 +24,7 @@ O projeto está em fase inicial: **o jogo ainda não dá boot**.
 ## Pré-requisitos
 
 - **Sua própria cópia** do pacote Xbox Series, versão `1.0.2.1` (pasta com `MicrosoftGame.Config` e os arquivos `.rpf` legíveis em disco).
-- **Windows 10/11 x64** com cerca de **350 GB livres** para arquivos intermediários (podem ficar em outro disco usando `--work`).
+- **Windows 10/11 x64** com cerca de **30 GB livres** para preparar só o runtime ou **350 GB** para o build completo.
 - [Python 3.12+](https://www.python.org/downloads/) (marque *"Add python.exe to PATH"*).
 - [.NET 8 SDK](https://dotnet.microsoft.com/download/dotnet/8.0).
 - [Vulkan SDK](https://vulkan.lunarg.com/) (`spirv-as`, `spirv-val` e `vulkaninfo`).
@@ -91,6 +91,20 @@ Os estágios executam nesta ordem: `check` → `shaders` → `assets` → `runti
 - **Flags de fallback do tradutor**: `--no-float-controls` (omite `SignedZeroInfNanPreserve`), `--bary-fallback` (lê baricêntricas de um input interpolado sem `VK_KHR_fragment_shader_barycentric`), `--texel-offset-fallback` (incorpora offsets `image_sample*_o` na coordenada sem `VK_KHR_maintenance8`) e `--mesh-compute` (traduz mesh shaders como compute sem `VK_EXT_mesh_shader`) são repassadas ao tradutor e salvas junto aos shaders; alterá-las retraduz os shaders (veja [`docs/design.md`](../../design.md)).
 - **`--work`**: recomenda-se apontar para um disco com pelo menos 350 GB livres para o build completo (ou ~30 GB com `--stages check,shaders,runtime`); o estágio `shaders` é o mais demorado e usa metade das threads da CPU por padrão (ajustável com `--jobs`).
 - **`--wav`**: fica desativado por padrão porque WAV PCM de 16 bits é várias vezes maior que Ogg Opus; quando ativado, decodifica os streams Ogg Opus para `work\assets\audio\wav` e pula arquivos WAV já existentes ao retomar um build.
+- **`--wave64-emulate`**: emula shaders compute/mesh wave64 em GPUs com subgrupos de 32 lanes (NVIDIA e Intel). O padrão `auto` consulta `vulkaninfo` e ativa a emulação automaticamente quando necessário.
+- **`--work`**: escolhe onde ficam os arquivos intermediários. O estágio `shaders` usa metade das threads da CPU por padrão (ajustável com `--jobs`).
+
+### Build com pouco espaço em disco
+
+Para preparar o runtime e os shaders com cerca de **30 GB livres**, execute na raiz do repositório:
+
+```powershell
+python -I make_game.py --stages check,shaders,runtime
+```
+
+O estágio `assets` serve às ferramentas de extração e ocupa cerca de 300 GB. A opção `--wav` aumenta ainda mais
+o espaço usado pelos áudios. Você pode apontar `--work` e `--out` para outro disco. Se o disco do pacote for
+somente leitura, passe `--overlay` ao iniciar o runtime e aponte para uma pasta em um disco gravável.
 
 ### Diagnóstico do Vulkan no Linux
 
@@ -132,7 +146,8 @@ da instalação. No Windows, `--runtime-build` também permite reutilizar um bui
 - **Baixou pelo botão "Download ZIP" do GitHub**: o ZIP não inclui o submódulo `third_party/rpf9-explorer`. Use `git clone --recursive` ou execute `git submodule update --init --recursive` dentro da pasta do repositório.
 - **`llvm-mc` recusa `gfx1013` / AMDGPU**: você provavelmente está com o instalador oficial do LLVM para Windows. Siga um dos passos de configuração do LLVM acima.
 - **Erro de `D3D12_ROOT_SIGNATURE_DESC2` ao compilar o runtime**: atualize o Windows SDK para `10.0.26100` ou mais recente pelo Visual Studio Installer ou `winget install Microsoft.WindowsSDK.10.0.26100`, apague a pasta de build e reconfigure.
-- **Falha por falta de espaço no drive `C:`**: passe `--work "D:\leonida-work"` para mover os arquivos temporários para outra partição.
+- **Falha por falta de espaço no drive `C:`**: passe `--work "D:\leonida-work"` para mover os arquivos
+  temporários ou siga o [build com pouco espaço em disco](#build-com-pouco-espaço-em-disco).
 
 ## Como contribuir e rodar os testes de GPU
 
