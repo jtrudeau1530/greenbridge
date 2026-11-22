@@ -379,6 +379,10 @@ if(BUILD_TESTING)
     set_target_properties(tiny_game PROPERTIES
       RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/fixtures/game/$<CONFIG>"
     )
+    add_executable(tiny_game_exit_code_test test/tiny_game_exit_code_test.cpp)
+    target_compile_definitions(tiny_game_exit_code_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(tiny_game_exit_code_test PRIVATE /W4 /permissive- /utf-8)
+    add_dependencies(tiny_game_exit_code_test gta6rt tiny_game)
     add_test(NAME pe_loader COMMAND pe_loader_test "$<TARGET_FILE:tiny_dll>" "$<TARGET_FILE:tiny_exe>")
 
     # Synthetic, hand-built images through Loader::load: range checks, wrapping RVAs, import-table termination and
@@ -566,10 +570,9 @@ if(BUILD_TESTING)
     add_test(NAME run_tiny_gdk_load COMMAND ${CMAKE_COMMAND}
       "-DLOADER=$<TARGET_FILE:gta6rt>" "-DGUEST=$<TARGET_FILE:tiny_gdk_load>"
       "-DRUNNER=${CMAKE_CROSSCOMPILING_EMULATOR}" -P "${CMAKE_CURRENT_SOURCE_DIR}/test/check_loaded_gdk.cmake")
-    # The stand-in game passes only with its own arguments; with others it exits 1, which --run passes through.
     add_test(NAME run_tiny_game COMMAND gta6rt --run $<TARGET_FILE:tiny_game> -- hello 42)
-    add_test(NAME run_tiny_game_exit_code COMMAND gta6rt --run $<TARGET_FILE:tiny_game> -- wrong args)
-    set_tests_properties(run_tiny_game_exit_code PROPERTIES WILL_FAIL TRUE)
+    add_test(NAME run_tiny_game_exit_code COMMAND tiny_game_exit_code_test
+             "$<TARGET_FILE:gta6rt>" "$<TARGET_FILE:tiny_game>")
     # Two modes at once are refused before anything is mapped (#886). The stand-in game's own arguments are passed,
     # so a gta6rt that ignored the conflict would run it, print "running" and exit 0.
     foreach(modes "dry-run;run" "dry-run;init" "init;run")
