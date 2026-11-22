@@ -432,6 +432,148 @@ def parse_vop_frexp_mant_f64(asm_line: str) -> InstructionAST:
     return ast
 
 
+class ScalarVALUInterpreter:
+    """Deterministic scalar instruction interpreter for RDNA2 VALU instructions."""
+
+    def __init__(self) -> None:
+        self.num_vgprs = 256
+        self.num_sgprs = 106
+        self.vgpr = [0] * self.num_vgprs
+        self.sgpr = [0] * self.num_sgprs
+        self.vcc = 0
+        self.exec = MASK64
+
+    def reset(self) -> None:
+        self.vgpr = [0] * self.num_vgprs
+        self.sgpr = [0] * self.num_sgprs
+        self.vcc = 0
+        self.exec = MASK64
+
+    def get_vgpr_u32(self, idx: int) -> int:
+        if not (0 <= idx < self.num_vgprs):
+            raise IndexError(f"VGPR index {idx} out of range [0, {self.num_vgprs})")
+        return self.vgpr[idx] & MASK32
+
+    def set_vgpr_u32(self, idx: int, val: int) -> None:
+        if not (0 <= idx < self.num_vgprs):
+            raise IndexError(f"VGPR index {idx} out of range [0, {self.num_vgprs})")
+        self.vgpr[idx] = val & MASK32
+
+    def get_vgpr_u64(self, idx: int) -> int:
+        if not (0 <= idx < self.num_vgprs - 1):
+            raise IndexError(f"64-bit VGPR base {idx} out of range [0, {self.num_vgprs - 1})")
+        lo = self.get_vgpr_u32(idx)
+        hi = self.get_vgpr_u32(idx + 1)
+        return join_dwords(lo, hi)
+
+    def set_vgpr_u64(self, idx: int, val64: int) -> None:
+        if not (0 <= idx < self.num_vgprs - 1):
+            raise IndexError(f"64-bit VGPR base {idx} out of range [0, {self.num_vgprs - 1})")
+        lo, hi = split_dwords(val64)
+        self.set_vgpr_u32(idx, lo)
+        self.set_vgpr_u32(idx + 1, hi)
+
+    def get_sgpr_u32(self, idx: int) -> int:
+        if not (0 <= idx < self.num_sgprs):
+            raise IndexError(f"SGPR index {idx} out of range [0, {self.num_sgprs})")
+        return self.sgpr[idx] & MASK32
+
+    def set_sgpr_u32(self, idx: int, val: int) -> None:
+        if not (0 <= idx < self.num_sgprs):
+            raise IndexError(f"SGPR index {idx} out of range [0, {self.num_sgprs})")
+        self.sgpr[idx] = val & MASK32
+
+    def get_sgpr_u64(self, idx: int) -> int:
+        if not (0 <= idx < self.num_sgprs - 1):
+            raise IndexError(f"64-bit SGPR base {idx} out of range [0, {self.num_sgprs - 1})")
+        lo = self.get_sgpr_u32(idx)
+        hi = self.get_sgpr_u32(idx + 1)
+        return join_dwords(lo, hi)
+
+    def set_sgpr_u64(self, idx: int, val64: int) -> None:
+        if not (0 <= idx < self.num_sgprs - 1):
+            raise IndexError(f"64-bit SGPR base {idx} out of range [0, {self.num_sgprs - 1})")
+        lo, hi = split_dwords(val64)
+        self.set_sgpr_u32(idx, lo)
+        self.set_sgpr_u32(idx + 1, hi)
+
+    def eval_operand_f64(self, op: Operand) -> int:
+        if op.data_type != DataType.F64:
+            raise TypeError(f"Expected DataType.F64, got {op.data_type}")
+        if op.kind == OperandKind.VGPR_PAIR:
+            val = self.get_vgpr_u64(op.reg_index)
+        elif op.kind == OperandKind.SGPR_PAIR:
+            val = self.get_sgpr_u64(op.reg_index)
+        elif op.kind == OperandKind.LITERAL_F64:
+            val = op.literal_val & MASK64
+        else:
+            raise ValueError(f"Unsupported operand kind for f64: {op.kind}")
+
+        if op.abs_mod:
+            val &= ~SIGN_MASK_F64
+        if op.neg_mod:
+            val ^= SIGN_MASK_F64
+        return val
+
+    def execute(self, ast: InstructionAST) -> int:
+        ast.validate()
+        if ast.opcode == "v_frexp_mant_f64":
+            s0_val = self.eval_operand_f64(ast.src0)
+            res = ref_frexp_mant_f64(
+                s0_val,
+                clamp=ast.clamp,
+                omod=ast.omod,
+            )
+            self.set_vgpr_u64(ast.dst.reg_index, res)
+            return res
+        raise NotImplementedError(f"Opcode {ast.opcode} not implemented in scalar interpreter")
+
+    def execute_asm(self, asm_line: str) -> int:
+        ast = parse_vop_frexp_mant_f64(asm_line)
+        return self.execute(ast)
+
+
+class TestValuFrexpMantF64ScalarInterpreter(unittest.TestCase):
+    """Unit tests for deterministic scalar instruction interpreter."""
+
+    def setUp(self):
+        self.interp = ScalarVALUInterpreter()
+
+    def test_scalar_interpreter_vgpr_sources(self):
+        # v[2:3] = 6.0 = 0.75 * 2^3 -> mantissa is 0.75
+        self.interp.set_vgpr_u64(2, f64_to_bits(6.0))
+        ast = parse_vop_frexp_mant_f64("v_frexp_mant_f64 v[0:1], v[2:3]")
+        res = self.interp.execute(ast)
+        self.assertEqual(bits_to_f64(res), 0.75)
+        self.assertEqual(self.interp.get_vgpr_u64(0), res)
+
+    def test_scalar_interpreter_sgpr_sources(self):
+        # s[0:1] = -12.0 -> mantissa is -0.75
+        self.interp.set_sgpr_u64(0, f64_to_bits(-12.0))
+        ast = parse_vop_frexp_mant_f64("v_frexp_mant_f64 v[4:5], s[0:1]")
+        res = self.interp.execute(ast)
+        self.assertEqual(bits_to_f64(res), -0.75)
+
+    def test_scalar_interpreter_literal_operand(self):
+        ast = parse_vop_frexp_mant_f64("v_frexp_mant_f64 v[2:3], 32.0")
+        res = self.interp.execute(ast)
+        self.assertEqual(bits_to_f64(res), 0.5)
+
+    def test_scalar_interpreter_input_modifiers(self):
+        # -|v[2:3]| with v[2:3] = 2.0 -> mantissa is -0.5
+        self.interp.set_vgpr_u64(2, f64_to_bits(2.0))
+        ast = parse_vop_frexp_mant_f64("v_frexp_mant_f64 v[0:1], -|v[2:3]|")
+        res = self.interp.execute(ast)
+        self.assertEqual(bits_to_f64(res), -0.5)
+
+    def test_scalar_interpreter_output_modifiers_clamp_omod(self):
+        # 1.0 -> mantissa 0.5, with mul:2 -> 1.0, clamp -> 1.0
+        self.interp.set_vgpr_u64(0, f64_to_bits(1.0))
+        ast = parse_vop_frexp_mant_f64("v_frexp_mant_f64 v[4:5], v[0:1] clamp mul:2")
+        res = self.interp.execute(ast)
+        self.assertEqual(bits_to_f64(res), 1.0)
+
+
 class TestValuFrexpMantF64SymbolicAST(unittest.TestCase):
     """Unit tests for symbolic AST opcode definitions and typed expressions."""
 
