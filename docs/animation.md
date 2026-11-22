@@ -187,7 +187,7 @@ at the next 16-byte boundary after the first. In **1,781/1,781** pairs the u64 a
 | 3 | 8 | `0x101`, `0x10F`, `0x207` |
 
 In every pair the declared payload lengths fit within page two. The instance blocks referenced by the
-`+0x38` table fit wholly within page one. Schema tables also occupy page two after the auxiliary payloads,
+[`+0x38` instance block table](navmesh.md#schema-tables-q28-q30-q38-q40) fit wholly within page one. Schema tables also occupy page two after the auxiliary payloads,
 and none overlaps the auxiliary table or its payloads. The same framing is measured independently for
 [navigation resources](navmesh.md#schema-tables-q28-q30-q38-q40). The meaning of the individual payloads
 in the animation archive remains open.
@@ -692,7 +692,9 @@ To reproduce the comparison:
    the first NUL-terminated `.#ft` suffix before the last NUL-terminated `skel` marker. Between them, hash
    the NUL-terminated ASCII runs matching `[A-Za-z0-9_]+` with `anim_index.joaat32`.
 2. Read aligned little-endian `{u32 hash, u32 index}` pairs in the page prefix ending before the suffix.
-   Retain hashes in the name set whose index is at most the number of distinct name hashes. This recovers
+   The archive scan retained a hash in the name set when its index was less than or equal to the number
+   of distinct name hashes. This inclusive filter selects candidates across pages. The reference
+   hash table itself uses zero-based indices 0 through 595. This recovers
    596 hashes on the [known reference page](character_skeleton.md#the-skeleton-name-table). Across the archive,
    2,849 pages yield a nonempty set, with 524 distinct sets. This check covers pages with that name and
    hash layout; other skeleton layouts remain open.
