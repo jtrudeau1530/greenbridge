@@ -453,8 +453,8 @@ class TranslatorValueSemantics(unittest.TestCase):
         self.check("ps_sdwa_f16_const", EXPECTED_SDWA_F16_CONST)
 
     def test_f16_denormal_operand_does_not_rely_on_unpack_half(self):
-        # NVIDIA's UnpackHalf2x16 reads f16 denormals as 0 (RTX 5060 Ti, 610.88). Word y multiplies the denormal
-        # 0x0040 by 1024.0, so it stays 0x1c00 only if the translator widens denormals without UnpackHalf2x16.
+        # On NVIDIA (RTX 5060 Ti, 610.88) UnpackHalf2x16 gives 0 for the denormal 0x0040 that word y's BYTE_1
+        # select produces. Here every denormal is flushed, so y stays 0x1c00 only if they skip UnpackHalf2x16.
         real = si.half_to_float
 
         def flushing(h):

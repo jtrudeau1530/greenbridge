@@ -476,9 +476,10 @@ class Gen:
     def f16_in(self, s, hi=0):
         """Read operand ``s`` as an f16 (low half, or high half when ``hi``) widened to f32, then apply its neg/abs.
 
-        RDNA2's f16 MODE keeps denormals, but NVIDIA's UnpackHalf2x16 reads them as 0 (RTX 5060 Ti, 610.88:
-        ps_sdwa_f16_const), so a half with a zero exponent field is widened exactly with integer ops instead:
-        sign * mantissa * 2^-24."""
+        RDNA2's f16 MODE keeps denormals, but on NVIDIA (RTX 5060 Ti, 610.88) UnpackHalf2x16 gives 0 for a denormal
+        that an SDWA BYTE_1 select produced, from an inline constant or a VGPR alike (ps_sdwa_f16_const), while the
+        same denormal in a register or a literal widens right. A half with a zero exponent field is therefore
+        widened exactly with integer ops: sign * mantissa * 2^-24."""
         u = self.src_h(s)
         v2, f = self.tmp(), self.tmp()
         self.emit(f"{v2} = OpExtInst %v2float %glsl UnpackHalf2x16 {u}")
