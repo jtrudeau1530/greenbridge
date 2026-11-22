@@ -229,6 +229,16 @@ The name controls resolve `cs_kenton`, `u_f_o_rhonda`, `cs_monalisa` and `cs_luc
 not. The delivered `mandy/` preview export is therefore a clearly labelled `cs_monalisa` proxy,
 not a verified Mandy model.
 
+Two further checks refine that negative. A missing `mandy` name is the common case, not an
+anomaly: of the 13 `KeyLento/Perschars/Peds/Unique` entries, two resolve cleanly by name
+(`kenton` -> `cs_kenton`, `rhonda` -> `u_f_o_rhonda`), one plausibly maps (`Bert` ->
+`hc_cs_herbert_watson`), and the other ten, including `Mandy`, have no name hit. Also, the
+package manifest lists 108 files and its `pack/` directory contains only `story000`,
+`core_restofworld`, `core_restofworld001`, `shared_minigame000` and their `_bvh4`/`_licenses`
+companions; there is no `psp_*` archive, so the `PSP_KeyLento_perschars_peds` pack named by the
+schedule is not present in this build. Mandy is therefore not disproven: her appearance is either
+a generic ped assembled at runtime or in a pack this package does not include.
+
 Caveats: `levels.rpf` was prefix-bounded at 4 MiB per inflated stream, raw RSC8 bodies and
 Bink/opaque regions were not decoded, and the encrypted RPF9 table of contents prevents a full
 path enumeration (27 top-level entries remain). The evidence supports a shared ped-appearance
