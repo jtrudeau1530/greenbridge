@@ -1757,8 +1757,8 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                 !vk.prepare_predicate(p.binding.buffer, p.binding.buffer_offset + predication->offset, p.predicate))
                 return ReplayResult::unsupported;
         } else if (const QueryRange range = query_range(command); range.count) {
-            // BeginQuery, EndQuery and ResolveQueryData are not among D3D12's predicated calls, and Vulkan's
-            // conditional rendering leaves query commands and transfers alone, so a predicate changes nothing here.
+            // BeginQuery, EndQuery and ResolveQueryData are not among D3D12's predicated calls, so a predicate does
+            // not suppress them (emit_query suspends conditional rendering around ResolveQueryData).
             if (!queries) return ReplayResult::unsupported;
             QueryPool* heap = vk.query_pool(range.heap);
             if (!heap) return ReplayResult::unresolved_resource;
@@ -1951,16 +1951,16 @@ inline void emit_query(const PreparedList& list, const detail::PreparedQuery& qu
         const bool binary = resolve.type == d3d12_query::binary_occlusion;
         const auto size = query_result_size(resolve.type);
         const auto dst = list.commands[query.command].binding.buffer;
-        bool suspended = false;
+        // ResolveQueryData is unconditional in D3D12. Suspend conditional rendering for the whole resolve rather
+        // than only before helper dispatches: on Intel's Windows Vulkan driver, vkCmdFillBuffer (used for un-ended
+        // queries) is suppressed inside an active conditional rendering scope after PredicateReducer::capture's
+        // compute dispatch (D3D-148).
+        const bool suspend = predicate.buffer && !query.resolves.empty();
+        if (suspend) vk.end_conditional_rendering(cb);
         for (const auto& run : query.resolves) {
             if (!run.pool) {
                 vk.fill_buffer(cb, dst, run.offset, VkDeviceSize(run.count) * size, 0);
             } else if (run.sum || binary) {
-                // ResolveQueryData is unconditional even when the helper uses a dispatch.
-                if (predicate.buffer && !suspended) {
-                    vk.end_conditional_rendering(cb);
-                    suspended = true;
-                }
                 const auto& resolve_occlusion = run.sum ? vk.sum_occlusion : vk.resolve_binary_occlusion;
                 resolve_occlusion(cb, run.pool, run.first, run.count, dst, run.offset);
             } else {
@@ -1968,7 +1968,7 @@ inline void emit_query(const PreparedList& list, const detail::PreparedQuery& qu
                                            VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
             }
         }
-        if (suspended) vk.begin_conditional_rendering(cb, &predicate);
+        if (suspend) vk.begin_conditional_rendering(cb, &predicate);
     }
 }
 
