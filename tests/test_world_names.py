@@ -231,6 +231,22 @@ class ResolveTest(unittest.TestCase):
 
 
 class CliTest(unittest.TestCase):
+    def test_build_xml_decodes_names_and_ignores_comments(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            xml = os.path.join(tmp, "names.xml")
+            out = os.path.join(tmp, "out.json")
+            with open(xml, "w", encoding="utf-8") as handle:
+                handle.write("<root><!-- <name>ghost</name><filename>ghost.rpf</filename> -->"
+                             "<name>A&amp;B</name></root>\n"
+                             '<?xml version="1.0"?><root>'
+                             "<filename>levels/Cell&#x26;Prop.rpf</filename></root>")
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(WN.main(["build", "--xml", xml, "--out", out]), 0)
+            with open(out, encoding="utf-8") as handle:
+                names = json.load(handle)["names"]
+            self.assertEqual(names, {WN.joaat_hex(name): [name]
+                                     for name in ("A&B", "Cell&Prop", "Cell&Prop.rpf")})
+
     def test_resolve_rejects_unrecognized_map_report(self):
         with tempfile.TemporaryDirectory() as tmp:
             dictionary = os.path.join(tmp, "names.json")

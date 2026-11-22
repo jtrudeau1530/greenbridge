@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import argparse
 import collections
+import html
 import json
 import os
 import re
@@ -268,16 +269,24 @@ class NameDictionary:
     def add_xml(self, path: str, *, source: str = "xml") -> int:
         with open(path, encoding="utf-8-sig", errors="replace") as handle:
             text = handle.read()
+
+        # Comments are dropped (an unterminated one runs to the end), CDATA and processing instructions are kept.
+        text = re.sub(r"(<!\[CDATA\[.*?\]\]>|<\?.*?\?>)|<!--.*?(?:-->|\Z)",
+                      lambda m: m[1] or "", text, flags=re.S)
+
         added = 0
         for match in re.finditer(r"<filename>(.*?)</filename>", text, re.S):
-            raw = match.group(1).strip().replace("\\", "/")
+            raw = html.unescape(match.group(1)).strip().replace("\\", "/")
             base = raw.rsplit("/", 1)[-1]
             added += int(self.add(base, source=source + "_filename"))
             if "." in base:
                 added += int(self.add(base.rsplit(".", 1)[0], source=source + "_filename"))
         for match in re.finditer(r"<(?:[A-Za-z0-9_]+:)?(?:name|Name|locationName)>(.*?)</", text, re.S):
-            value = match.group(1).strip()
-            if value and len(value) <= 120 and "<" not in value:
+            raw = match.group(1)
+            if "<" in raw:
+                continue
+            value = html.unescape(raw).strip()
+            if value and len(value) <= 120:
                 added += int(self.add(value, source=source + "_name"))
         return added
 
