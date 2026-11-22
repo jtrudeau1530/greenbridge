@@ -149,6 +149,8 @@ records, 0 invalid on `audio.rpf`). Over all of `audio.rpf`:
 +12   u32  extra    0 on 363,166 records, 1..6 on the rest
 ```
 
+The name word is 0 on 96 records (78 tags start with one); what a nameless record means is unknown.
+
 - **The name is a joaat of a lowercase word.** Four of the stored values are the hashes of `beat` (`0xe89ae78c`,
   17,770 records), `trackid` (`0xa6d93246`, 1,042), `intro` (`0xda8f5f53`, 835) and `outro` (`0x5d40b28d`, 825),
   as the [GTA6-Asset-Info](https://github.com/TrinitronClient/GTA6-Asset-Info) byte reference reports
@@ -161,8 +163,9 @@ records, 0 invalid on `audio.rpf`). Over all of `audio.rpf`:
 - The same reference states that an AWC tag id is the low byte of the joaat of the chunk name. That holds for
   `markers` (`0xbd`), `data` (`0x55`), `peak` (`0x36`), `seektable` (`0xa3`) and `streamformat` (`0x48`), which
   `tests/test_rsc8_audio.py` checks, and by the same rule `0x5a` and `0xd9` are `granulargrains` and
-  `granularloops`. It does not hold for `0x5c`, `0x76` and `0xb2` under the names `animation`, `format` and
-  `metadata`, so those three names stay open.
+  `granularloops`. Those spellings are this document's: the reference prints the last two as `seek_table` and
+  `stream_format`, and with the underscore the rule fails (`0xb8` and `0xf9`). It does not hold for `0x5c`,
+  `0x76` and `0xb2` under the names `animation`, `format` and `metadata` either, so those three names stay open.
 
 ## Binary format of `RSC8` (version `8001`)
 
