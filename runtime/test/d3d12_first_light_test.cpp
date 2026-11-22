@@ -381,6 +381,10 @@ int main() {
         std::printf("against vk_harness's image.raw (rows flipped): %u of %u pixels bit-exact, %u one f16 step apart, "
                     "%u different\n", exact, width * height, f16_step, differ);
         EXPECT(differ == 0);
+        // An adjacent half only appears where the f32 interpolant sits a few ulps from an f16 truncation boundary,
+        // about 2^-11 of values per channel: 1 pixel of 12,804 covered on the RTX 3060. Allow at most one covered
+        // pixel in a thousand, so a regression that moves the whole image by one half step (thousands) fails.
+        EXPECT(f16_step <= covered / 1000);
     }
     if (d.validation_errors()) {
         std::fprintf(stderr, "%u validation errors\n", d.validation_errors());
