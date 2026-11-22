@@ -1702,9 +1702,11 @@ public:
             }
         }
         if (info.host_image_copy) load_host_image_copy(get_device);
-        // The copies of a D24 texture stored as D32 convert on the GPU (vulkan_depth24.h).
-        // Only enable the converter when the GPU lacks native D24_UNORM_S8_UINT support.
-        if (!state_.depth_usable(VK_FORMAT_D24_UNORM_S8_UINT)) {
+        // The copies of a D24 texture stored as D32 convert on the GPU (vulkan_depth24.h), and so do the copies of
+        // a 96-bit texture, which every GPU stores as RGBA32 (D3D-62): the converter is there whether or not the
+        // GPU has a native D24_UNORM_S8_UINT. It costs nothing until a copy needs it (its pipeline is made on the
+        // first job, and a queue takes the tracker lock for it only when a list has such a copy).
+        {
             std::uint64_t max_storage_range = 1u << 27;  // the least Vulkan allows, if the limit cannot be read
             if (info.physical && info.get_instance_proc) {
                 if (const auto get_props = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(

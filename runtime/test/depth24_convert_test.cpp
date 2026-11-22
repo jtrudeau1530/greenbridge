@@ -347,6 +347,8 @@ int main() {
             }
         }
         std::printf("depth24: concurrent VulkanQueue::execute (lazy depth24 lock + parallel non-d24 prepare) ok\n");
+    }
+
     // 6. 96-bit texels (Depth24Job::rgb96, D3D-62): three words a texel in the footprint, four in the scratch, the
     // words copied as they are. A pitched copy at an offset, split into rows by the 1 KiB range.
     {

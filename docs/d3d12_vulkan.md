@@ -1221,8 +1221,10 @@ The trace will enumerate them.
     (`src/depth24_convert.comp` modes 2 and 3, `Depth24Job::rgb96`): the same scratch buffers, parts and lifetime,
     with texels of three words in the footprint and four in the scratch, copied as they are (an upload writes the
     fourth word as 0). The words are not interpreted, so NaN payloads, denormals and integers pass unchanged. On
-    an RX 9070 XT (AMD 26.11.2) an upload and a readback take 4.4 and 0.7 ms at 1024x1024 and 18 and 35 ms at
-    4096x4096 (`d3d12_rgb96_test`; single runs, each the first submission of a new queue).
+    an RX 9070 XT (AMD 26.11.2) an upload and a readback take about 5 and 2 ms at 1024x1024 and about 20 and 45 ms
+    at 4096x4096 (`d3d12_rgb96_test` with `LEONIDA_RGB96_LARGE` set; single runs that vary by a few ms, each the
+    first submission of a new queue). The converter is created on every device for this, whether or not the
+    GPU has a native D24.
   - Texture-to-texture copies and `CopyResource` are plain image copies, and only between two 96-bit textures.
   - `WriteToSubresource`/`ReadFromSubresource` always take the staged copy, as a D24 texture stored as D32 does:
     a host image copy would not repack.
