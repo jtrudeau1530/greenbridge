@@ -382,8 +382,8 @@ and any validation error fails them.
   run repeats on a standalone device, the path `LEONIDA_D3D12=vulkan` takes.
   The comparison tests run against a PC D3D12 device: the default adapter, or the one named by
   `LEONIDA_HOST_ADAPTER` (`warp`, or part of an adapter's name; the adapter used is printed). Some answers are the
-  driver's choice, so pick the host side when two adapters disagree: `GetResourceTiling` differs between an NVIDIA
-  host and an AMD or WARP host on a machine that has both.
+  driver's choice, so pick the host side when two adapters disagree: `GetResourceTiling` splits standard and packed
+  mips differently on an NVIDIA, an AMD and a WARP host, and the test accepts any split.
   - Copies against the host (D3D-46, `d3d12_copy_compare.h`): the same scenario runs on the layer and on the host and
     the bytes read back are compared; a failing case prints its name, the region (subresource, mip, slice, plane)
     and the first differing byte. Every case uploads deterministic bytes into a texture and then runs
@@ -848,8 +848,11 @@ The trace will enumerate them.
     committed resources instead; raising the tier is a decision for when the trace shows what the game does. The Xbox tiled layout word `0x101` is accepted as `64KB_UNDEFINED_SWIZZLE` (**Assumption**:
     that the console uses it for reserved resources too).
   - `GetResourceTiling`: the standard 64 KiB tile shapes, standard and packed mips (a mip is packed from the first
-    one smaller than a tile on any axis), each standard mip's tile counts, and the tile order (each array slice holds
-    its standard mips, then its packed tiles). The test compares all of these with the PC runtime for 18
+    one smaller than a tile on any axis, as an NVIDIA GPU does; D3D11.3 functional spec 5.9.2.8.5 only requires that
+    a mip filling a tile in every dimension stays standard, a smaller one "may or may not be packed, depending on the
+    IHV"), each standard mip's tile counts, and the tile order (each array slice holds
+    its standard mips, then its packed tiles). The test compares the tile shape and the tile counts of the mips both
+    sides keep standard with the PC runtime, and checks that no mip filling a tile is packed, for 18
     buffer, 2D, array, block-compressed and volume layouts, and skips a layout the host refuses: which ones a PC
     driver accepts varies (an RTX 3090 on driver 616.56, at tier 3, refuses texture arrays whose mips reach the
     packed tail, measured by @CharlyRien in #295; an RTX 5070 on 621.01 accepts them). How many tiles the packed mips take is the driver's
@@ -859,8 +862,10 @@ The trace will enumerate them.
     writes a tile index into packed subresources instead of the documented `D3D12_PACKED_TILE` (ours follows the
     documentation), and a resource that is not reserved has no tiles (all outputs zero), as on the PC runtime.
   - **Measured on AMD** (RX 9070 XT, RDNA4, driver 32.0.31041.1004, Windows 11, `main` `91b36cf`): the AMD PC
-    runtime splits standard and packed mips differently, so `d3d12_vulkan_device_test`'s tiling comparison fails
-    there. Tile shapes agree in all 17 texture layouts, and 11 of them match exactly; in the other 6, AMD keeps more
+    runtime splits standard and packed mips differently, which `d3d12_vulkan_device_test`'s tiling comparison used
+    to report as a failure; the spec leaves the split to the driver, so the comparison now takes any split (a Radeon
+    880M on 26.11.2 behaves the same, and WARP keeps every mip standard: it packs nothing, down to 1x1).
+    Tile shapes agree in all 17 texture layouts, and 11 of them match exactly; in the other 6, AMD keeps more
     mips as standard tiles before the packed tail:
 
     | Layout | Tile | Standard mips: ours | AMD |
