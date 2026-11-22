@@ -22,10 +22,10 @@ WAVE32_WORDS = {n: w for n, w in check.CS_DUMPS if n in check.WAVE32_DUMPS and n
 
 
 # every test check.py runs: compute, cs_wavemask, the dumps (#73, #152 cross-half, partial), the two store
-# tests, pixel tests, and three mesh fixtures (skipped here: build.py does not build mesh shaders)
+# tests, pixel tests, the two-mip draw and three mesh fixtures (skipped here: build.py does not build mesh shaders)
 TOTAL = (len(check.COMPUTE) + 1 + len(check.CS_DUMPS) + len(check.W64X_DUMPS) + len(check.W64X_PARTIAL) + 2
          + len(check.PIXEL_TESTS) + len(check.CLIP_TESTS) + len(check.BOUNDS) + len(check.GLOBAL_OFFSET)
-         + 6)  # three mesh fixtures, ps_tex, ps_texture_grad_a16 and cs_cmpx_class_f32
+         + 7)  # three mesh fixtures, ps_tex, cs_cmpx_class_f32 and both texture draws
 
 
 class Wave64Checks(unittest.TestCase):
@@ -90,9 +90,9 @@ class Wave64Checks(unittest.TestCase):
             output = io.StringIO()
             with (patch.object(sys, "argv", ["check.py", tmp]), patch.object(check, "run", side_effect=harness),
                   patch.object(check, "clip_test", return_value=""),
-                  patch.object(check, "pixel_test", return_value=""), patch.object(check, "bindless_test", return_value=""),
+                  patch.object(check, "pixel_test", return_value=""), patch.object(check, "texture_mip_test", return_value=""),
+                  patch.object(check, "bindless_test", return_value=""), patch.object(check, "W64_EMULATED", emulated),
                   patch.object(check, "texture_gradient_a16_test", return_value=""),
-                  patch.object(check, "W64_EMULATED", emulated),
                   contextlib.redirect_stdout(output)):
                 status = check.main()
         return status, output.getvalue()
@@ -276,6 +276,30 @@ class SeededPixelTests(unittest.TestCase):
         self.assertIsInstance(problem, check.Skip)
         self.assertIn("needs bufferDeviceAddress", problem)
 
+
+class TextureMipChecks(unittest.TestCase):
+    def test_mip_draw_reports_unsupported_device_and_preserves_other_failures(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            (directory / ("vk_texture_test" + check.EXE)).touch()
+            for shader in (check.TEXTURE_MIP_TEST, *check.TEXTURE_MIP_DEPENDENCIES):
+                (directory / (shader + ".spv")).touch()
+            with patch.object(check, "run", return_value=(77, "unsupported device")):
+                self.assertIsInstance(check.texture_mip_test(tmp, tmp), check.Skip)
+            with patch.object(check, "run", return_value=(1, "device lost")):
+                failure = check.texture_mip_test(tmp, tmp)
+                self.assertNotIsInstance(failure, check.Skip)
+                self.assertIn("device lost", failure)
+
+    def test_implicit_mip_checks_every_channel_through_last_pixel(self):
+        pixel = struct.pack("<4f", 0, 1, 1, 1)
+        image = pixel * (64 * 64)
+        self.assertEqual(check.texture_mip_mismatch(image, 1), "")
+        for channel in range(4):
+            damaged = bytearray(image)
+            struct.pack_into("<f", damaged, len(image) - 16 + 4 * channel, 0.5)
+            self.assertTrue(check.texture_mip_mismatch(damaged, 1).startswith("(63,63):"))
+        self.assertTrue(check.texture_mip_mismatch(image[:-1], 1))
 
 
 class TexelOffsetChecks(unittest.TestCase):

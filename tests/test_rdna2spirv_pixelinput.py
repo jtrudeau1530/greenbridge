@@ -130,14 +130,15 @@ def test_table_position_not_slot_is_the_attr_number(tmp_path):
     """The record's position is the v_interp attr number even when the slot bytes disagree."""
     table = fssm_blob([(4, 0xF, 0, 7, 0), (4, 0xF, 1, 3, FP16_FLAG)])
     spv = translate(write_case(tmp_path, "ps_pix_slots", READ_ATTR1, fssm=table))
-    assert "PackHalf2x16" in spv  # attr1 = table position 1 = flagged, whatever its slot says
+    assert "OpQuantizeToF16" in spv  # attr1 = table position 1 = flagged, whatever its slot says
 
 
 def test_fp16_read_rounds_to_nearest(tmp_path):
     """A 32-bit v_interp read of a flagged position sees the f16-rounded value."""
     table = fssm_blob([(4, 0xF, 0, 0, 0), (4, 0xF, 1, 1, FP16_FLAG)])
     spv = translate(write_case(tmp_path, "ps_pix_fp16", READ_ATTR1, fssm=table))
-    assert "PackHalf2x16" in spv
+    assert "OpQuantizeToF16" in spv  # single quantize, not a pack/unpack round-trip (folded by drivers)
+    assert "PackHalf2x16" not in spv
     f32_one_point_one = struct.unpack("<I", struct.pack("<f", 1.1))[0]
     want = f16_roundtrip_bits(f32_one_point_one)
     assert want != f32_one_point_one  # the fixture value is not f16-exact, so the check is meaningful

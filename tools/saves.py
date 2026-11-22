@@ -315,13 +315,18 @@ def save_slot(folder):
     """Return (folder label, payload filename, slot name, title) for one save folder."""
     meta_path = os.path.join(folder, 'chives.json')
     meta = json.loads(read(meta_path)) if os.path.isfile(meta_path) else {}
-    payload = None
+    found = []
     for name in sorted(os.listdir(folder)):
         fp = os.path.join(folder, name)
         if os.path.isfile(fp) and name not in ('chives.json', 'chives.dat') and kind_of(read(fp)[:8]) in ('ASAV', 'JSAV'):
-            payload = name
-    if payload is None:
+            found.append(name)
+    if not found:
         raise SystemExit(f'{folder}: no ASAV/JSAV payload found')
+    if len(found) > 1:
+        # One save per folder: refuse to guess (e.g. "slot1" next to an older "slot1.bak").
+        raise SystemExit(f'{folder}: {len(found)} ASAV/JSAV payloads, expected one: {", ".join(found)}; '
+                         'move the extra files out or import a folder per save')
+    payload = found[0]
     slot, title = payload, None
     d = read(os.path.join(folder, payload))
     if kind_of(d) == 'ASAV':

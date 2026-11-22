@@ -2,9 +2,9 @@
 
     python -I runtime/test/shaders/check.py <out dir of build.py> [dir with the test programs]
 
-The test programs are vk_compute_test, vk_store_test, vk_harness, vk_bindless_test and vk_texture_test
-(runtime/build by default). With the Visual Studio generator they are in runtime/build/RelWithDebInfo, Release
-and so on: that subfolder is found by itself (the newest complete one if there are several) and its name is printed.
+The test programs are vk_compute_test, vk_store_test, vk_harness, vk_texture_test and vk_bindless_test (runtime/build by default). With
+the Visual Studio generator they are in runtime/build/RelWithDebInfo, Release and so on: that subfolder is found by
+itself (the newest complete one if there are several) and its name is printed.
 Each line is one shader: ok, or what came back instead. The wave32 test ps_bitmask_perm is only judged on lanes
 0-31, since a GPU with 64-wide subgroups puts half the pixels in lanes it wasn't written for.
 The two whole-wave mask checks are skipped when the device cannot provide a full 64-wide compute subgroup.
@@ -75,10 +75,12 @@ COMPUTE = [("cs_lds", "4", "mirror64"), ("cs_exec64", "1", "exec64"), ("cs_bvh",
            ("cs_workgroup_yz", "2x3x4", "workgroup_yz")]
 CS_STORE = [0x400080ff, 0xe00003ff, 0x3c004000, 0xeeeeeeee, 0x40003c00, 0xbc003800]
 CS_SMEM = [0x5eed0024, 0x5eed0028, 0x5eed002c, 0x5eed0030, 0x5eed0010, 0x5eed0014, 0x5eed0018, 0x5eed001c]
-WAVE32_DUMPS = ("cs_store", "cs_smem_soffset_imm", "cs_wqm_w32", "cs_w32_lane_wrap")
+WAVE32_DUMPS = ("cs_store", "cs_smem_soffset_imm", "cs_wqm_w32", "cs_w32_lane_wrap", "cs_movrelsd_2")
 CS_DUMPS = [("cs_store", CS_STORE), ("cs_smem_soffset_imm", CS_SMEM),
             # SHADER-52: wave32 lane select is & 31; lane 40 wraps to 8
             ("cs_w32_lane_wrap", [25, 16, 777, 777]),
+            # v_movrelsd_2_b32: VGPR[D + M0[25:16]] = VGPR[S0 + M0[9:0]]
+            ("cs_movrelsd_2", [11, 33, 33, 55, 1717, 77, 1515, 1717]),
             ("cs_wave64_ballot", [32, 16, 24, 40, 8, 48]),
             ("cs_wm_half_ops", [32, 16, 16, 0, 16]), ("cs_wm_half_cmp", [1, 0, 1, 1]),
             ("cs_wm_bfm64", [16, 8, 8, 40]), ("cs_wm_scc_rfl", [55, 48]),
@@ -120,8 +122,19 @@ PIXEL_BITS = {"ps_legacy_mul": (0, 0, 0, 0x40c00000),
               "ps_ops8": (0x80000000, 0xffffffff, 0x000f100e, 0x0f0f0f1f),
               "ps_scc": (1, 1, 3, 0x80000000), "ps_sdwa": (0x000000f1, 0xfffefff2, 0x3c003344, 0xfff70000),
               "ps_vcc_x2": (0x11223344, 0x55667788, 0, 0),
+              "ps_med3_mods": (0x3f800000, 0x40400000, 0x40c00000, 0x3f400000),
               "ps_scc_minmax": (0x00030205, 0x00030207, 0x00030209, 0x00030203),
-              "ps_fma_literal": (0x41b80000, 0x41800000, 0x40e00000, 0x41a40000)}
+              "ps_fma_literal": (0x41b80000, 0x41800000, 0x40e00000, 0x41a40000),
+              # f16 op_sel, partial writes, inline constants: words measured on RDNA2 hardware (.asm headers)
+              "ps_f16_med3_opsel": (0xaaaa4100, 0xaaaa4200, 0xaaaa3e00, 0x40005555),
+              "ps_f16_med3_mods": (0x41005555, 0x3c005555, 0x41003800, 0xaaaaba00),
+              "ps_f16_vop2": (0xaaaa4000, 0xaaaac000, 0xaaaa3a00, 0x42003f00),
+              "ps_f16_vop2b": (0xaaaa3e00, 0xaaaab800, 0xaaaa3c00, 0x42003400),
+              "ps_f16_vop1": (0xaaaa4000, 0xaaaabc00, 0xaaaac000, 0xaaaa8000),
+              "ps_f16_vop1b": (0xaaaa3400, 0xaaaa4000, 0xaaaab400, 0xaaaa3800),
+              "ps_f16_const": (0xaaaa3d00, 0x38005555, 0xaaaa3800, 0x3f000000),
+              "ps_f16_const2": (0x42003d00, 0x3d004200, 0xaaaabc00, 3),
+              "ps_f16_pack": (0x34003c00, 0x38003400, 0x34000000, 0x44004200)}
 # Pixel shaders that read memory: vk_harness puts this V# in s[0:3] and seeds the heap it points at, as
 # tests/semantic/test_value_semantics.py does for the interpreter.
 PIXEL_ENV = {"ps_vcc_x2": {"VKH_SGPRS": "0x1000,0,16,0", "VKH_HEAP": "0x1000=0x11223344,0x1004=0x55667788"}}
@@ -132,6 +145,8 @@ PIXEL_TESTS = sorted((*PIXEL_BITS, "ps_bary", "ps_flat", "ps_bitmask_perm", "ps_
 TEXOFF_ARGS = ("2", "92", "0", "0", "0")              # ps_texoff: T# pointer in s2, then the shader's literal S#
 PIXEL_TESTS = sorted((*PIXEL_BITS, "ps_bary", "ps_flat", "ps_bitmask_perm", "ps_uniform_branch"))
 PIXEL_TESTS = sorted((*PIXEL_BITS, "ps_bary", "ps_flat", "ps_bitmask_perm", "ps_uniform_branch", "ps_wqm", "ps_scc_mask32"))
+TEXTURE_MIP_TEST = "ps_texture_mip0"
+TEXTURE_MIP_DEPENDENCIES = ("vs_ids", "ps_texture_sample")
 
 
 # Windows error codes for a program the system refuses to start, and who refused it.
@@ -402,6 +417,52 @@ def texoff_test(tools, spirv, name):
         return texoff_problem(raw.read_bytes(), out)[0]
 
 
+def texture_mip_mismatch(data: bytes, mip: int, *, transpose_uv: bool = False) -> str:
+    width = 64
+    if len(data) != width**2 * 16:
+        return f"expected {width**2} RGBA32F pixels, got {len(data)} bytes"
+    one = 0x3f800000
+    quadrants = ((one, 0, 0, one), (0, one, 0, one),
+                 (0, 0, one, one), (one, one, 0, 0))
+    for i, actual in enumerate(struct.iter_unpack("<4I", data)):
+        y, x = divmod(i, width)
+        # The normalized UV at each pixel center lies within the same quadrant of mip 0.
+        u, v = (y, x) if transpose_uv else (x, y)
+        expected = (0, one, one, one) if mip == 1 else quadrants[2 * (v >= width // 2) + (u >= width // 2)]
+        if actual != expected:
+            return f"({x},{y}): RGBA32F bits {actual} != {expected}"
+    return ""
+
+
+def texture_mip_test(tools: str, spirv: str) -> str:
+    tool = Path(tools) / ("vk_texture_test" + EXE)
+    if not tool.is_file():
+        return f"missing {tool}"
+    shaders = Path(spirv)
+    vertex = shaders / "vs_ids.spv"
+    with tempfile.TemporaryDirectory(prefix="leonida-mip-") as tmp:
+        for mip, name in enumerate((TEXTURE_MIP_TEST, "ps_texture_sample")):
+            fragment = shaders / (name + ".spv")
+            for shader in (vertex, fragment):
+                if not shader.is_file():
+                    return f"missing {shader}"
+            raw = Path(tmp) / f"mip{mip}.raw"
+            code, output = run(tool, vertex, fragment, raw, "0", "92", "c00000", "14500000", "0", "--two-mip")
+            if code == UNSUPPORTED:
+                return Skip(f"SKIP (texture mip test: {output.strip() or 'unsupported device'})")
+            if code or not raw.is_file():
+                return f"{name}: {failure(code, output, 4)}"
+            data = raw.read_bytes()
+            mismatch = texture_mip_mismatch(data, mip)
+            if mismatch:
+                return f"{name}: {mismatch}"
+            if not texture_mip_mismatch(data, 1 - mip).startswith("(0,0):"):
+                return f"{name}: wrong mip control missed the expected first pixel"
+            if mip == 0 and not texture_mip_mismatch(data, mip, transpose_uv=True).startswith("(32,0):"):
+                return f"{name}: transposed UV control missed the expected first pixel"
+    return ""
+
+
 def pixel_test(tools, spirv, name):
     path = os.path.join(spirv, name + ".spv")
     if not os.path.isfile(path):
@@ -526,6 +587,7 @@ def main():
     for name in PIXEL_TESTS:
         results.append((name, pixel_test(tools, spirv, name)))
     results.append(("ps_tex", bindless_test(tools, spirv)))
+    results.append((TEXTURE_MIP_TEST, texture_mip_test(tools, spirv)))
     results.append(("ps_texture_grad_a16", texture_gradient_a16_test(tools, spirv)))
     for name, problem in results:
         if problem is None:

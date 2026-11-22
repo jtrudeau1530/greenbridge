@@ -24,9 +24,10 @@ sys.path.insert(0, os.path.join(ROOT, "tools"))
 import mc_command  # noqa: E402
 sys.path.insert(0, SHADER_DIR)
 from build import CLIP_CASES, clip_container, shader_source
-from check import (CMPX_CLASS_WORDS, TEST_PROGRAMS, Skip, clip_test, mesh_v5_test, not_found_message,
-                   pick_build_dir, start_failure, texture_gradient_a16_test)
+from check import Skip, clip_test
 from compute_fixture import compute_header
+from check import (CMPX_CLASS_WORDS, TEST_PROGRAMS, TEXTURE_MIP_DEPENDENCIES, TEXTURE_MIP_TEST, Skip,
+                   mesh_v5_test, not_found_message, pick_build_dir, start_failure, texture_gradient_a16_test, texture_mip_test)
 from check import TEXOFF_ARGS, texoff_problem   # ps_texoff's expected words and arguments live in check.py
 
 
@@ -341,11 +342,16 @@ def check_wqm(raw_path: str) -> tuple[bool, str]:
 def check_uniform_branch(raw_path: str) -> tuple[bool, str]:
     px = read_raw_rgba32f(raw_path)
     u32 = read_raw_u32(raw_path)
+    """ps_uniform_branch / ps_scc_mask32: s5 = 8 wherever the lane's own bit is set; a lane with bit 0 gets 8 when
+    another lane of its wave has the bit (the wave-wide vote), else 7. All three kinds must occur, as in check.py:
+    without a (8, bit 0) pixel the vote is not shown, and a translator that decides per lane would pass."""
     bad = 0
     n8 = 0
     n7 = 0
+    n80 = 0
     first = ""
     for i, ((_, _, bary_i, _), (s5, bit, _, _)) in enumerate(zip(px, u32)):
+        n80 += s5 == 8 and bit == 0
         if bit == 1:
             if bary_i <= 0.27 or s5 != 8:
                 if not bad:
@@ -364,7 +370,12 @@ def check_uniform_branch(raw_path: str) -> tuple[bool, str]:
             n8 += 1
         elif s5 == 7:
             n7 += 1
-    return (bad == 0 and n8 > 0 and n7 > 0), (first if bad else f"s5==8: {n8}, s5==7: {n7} (4096 px)")
+    if bad:
+        return False, first
+    detail = f"s5==8: {n8} ({n80} of them with bit 0), s5==7: {n7} ({len(u32)} px)"
+    if not n80:
+        return False, "no bit=0 pixel got s5=8: the branch was decided per lane, not by the wave; " + detail
+    return (n8 - n80 > 0 and n7 > 0), detail
 
 
 def check_grad(raw_path: str, want_b: float, want_a: float) -> tuple[bool, str]:
@@ -424,6 +435,10 @@ def with_draw_shaders(asm_files: list[str]) -> list[str]:
         extra = DRAWN_WITH.get(shader_source(os.path.splitext(f)[0]))
         if extra and extra not in build:
             build.append(extra)
+    if TEXTURE_MIP_TEST + ".asm" in asm_files:
+        for name in TEXTURE_MIP_DEPENDENCIES:
+            if name + ".asm" not in build:
+                build.append(name + ".asm")
     return build
 
 
@@ -628,7 +643,7 @@ def run_suite(a, work: str) -> int:
                 results.append((name, rc == 0, msg.splitlines()[-1] if msg else ""))
             results.append((name,) + wavemask_check(vk_compute, spv, cs_env,
                                                     os.environ.get("LEONIDA_W64_EMULATE") == "1"))
-        elif name in ("cs_store", "cs_smem_soffset_imm", "cs_w32_lane_wrap", "cs_wave64_ballot", "cs_wm_half_ops", "cs_wm_half_cmp", "cs_wm_bfm64", "cs_wm_scc_rfl", "cs_wqm_w64", "cs_wqm_w32", "cs_wqm_w64_half",
+        elif name in ("cs_store", "cs_smem_soffset_imm", "cs_w32_lane_wrap", "cs_movrelsd_2", "cs_wave64_ballot", "cs_wm_half_ops", "cs_wm_half_cmp", "cs_wm_bfm64", "cs_wm_scc_rfl", "cs_wqm_w64", "cs_wqm_w32", "cs_wqm_w64_half",
 
                       "cs_w64_mask_detect",
                       "cs_w64x_readlane", "cs_w64x_writelane", "cs_w64x_readfirstlane", "cs_w64x_bpermute",
@@ -642,6 +657,8 @@ def run_suite(a, work: str) -> int:
                                         0x5EED0010, 0x5EED0014, 0x5EED0018, 0x5EED001C],
                 # SHADER-52: wave32 lane select & 31 (40 → 8)
                 "cs_w32_lane_wrap": [25, 16, 777, 777],
+                # v_movrelsd_2_b32: VGPR[D + M0[25:16]] = VGPR[S0 + M0[9:0]] (cs_movrelsd_2.asm)
+                "cs_movrelsd_2": [11, 33, 33, 55, 1717, 77, 1515, 1717],
                 "cs_wave64_ballot": [32, 16, 24, 40, 8, 48],
                 "cs_wm_half_ops": [32, 16, 16, 0, 16],
                 "cs_wm_half_cmp": [1, 0, 1, 1],
@@ -669,14 +686,14 @@ def run_suite(a, work: str) -> int:
                 "cs_w64x_load_ballot_load": [43, 74, 75, 42, 42, 18, 41, 32],
             }
             want = cs_dump_wants[name]
-            # Every dump but cs_store / cs_smem_soffset_imm / cs_w32_lane_wrap is a whole-wave (wave64) mask test:
+            # Every dump but cs_store / cs_smem_soffset_imm / cs_w32_lane_wrap / cs_movrelsd_2 is a whole-wave (wave64) mask test:
             # ask for a 64-wide subgroup and skip, as check.py does, where the device has none (vk_compute_test
             # exits 77) instead of reporting a failure. With LEONIDA_W64_EMULATE=1 they were translated with
             # --wave64-emulate and run on any subgroup size.
             # cs_w64x_partial (a 40-thread group) can't have full subgroups: it asks for size 64 without them.
             emulated = w64_emulated()
             partial = name == "cs_w64x_partial"
-            wave64 = name not in ("cs_store", "cs_smem_soffset_imm", "cs_wqm_w32", "cs_w32_lane_wrap") and not emulated and not partial
+            wave64 = name not in ("cs_store", "cs_smem_soffset_imm", "cs_wqm_w32", "cs_w32_lane_wrap", "cs_movrelsd_2") and not emulated and not partial
 
             if partial and not emulated:
                 cs_env = dict(os.environ, VKC_SUBGROUP_SIZE="64")
@@ -690,6 +707,10 @@ def run_suite(a, work: str) -> int:
         elif name == "cs_imgload":
             rc, msg = run_cmd([vk_store, spv, "load"])
             results.append((name, rc == 0, msg.splitlines()[-1] if msg else ""))
+        elif name == TEXTURE_MIP_TEST:
+            problem = texture_mip_test(a.build, spirv_dir)
+            ok = None if isinstance(problem, Skip) else not problem
+            results.append((name, ok, problem or "two passes, 4096 RGBA32F pixels each exact; wrong mip and UV rejected"))
         elif name == "ps_texture_grad_a16":
             problem = texture_gradient_a16_test(a.build, spirv_dir)
             results.append((name, not problem, problem or "4096 RGBA pixels matched"))
@@ -756,8 +777,19 @@ def run_suite(a, work: str) -> int:
                 "ps_ops7": (0x00FF8077, 0xFF0000FF, 0x89ABCDEF, 0x00070003),
                 "ps_ops8": (0x80000000, 0xFFFFFFFF, 0x000F100E, 0x0F0F0F1F),
                 "ps_vcc_x2": (0x11223344, 0x55667788, 0, 0),
+                "ps_med3_mods": (0x3F800000, 0x40400000, 0x40C00000, 0x3F400000),
                 "ps_scc_minmax": (0x00030205, 0x00030207, 0x00030209, 0x00030203),
                 "ps_fma_literal": (0x41B80000, 0x41800000, 0x40E00000, 0x41A40000),
+                # f16 op_sel / partial writes / inline constants: RDNA2 hardware words (see the .asm headers)
+                "ps_f16_med3_opsel": (0xAAAA4100, 0xAAAA4200, 0xAAAA3E00, 0x40005555),
+                "ps_f16_med3_mods": (0x41005555, 0x3C005555, 0x41003800, 0xAAAABA00),
+                "ps_f16_vop2": (0xAAAA4000, 0xAAAAC000, 0xAAAA3A00, 0x42003F00),
+                "ps_f16_vop2b": (0xAAAA3E00, 0xAAAAB800, 0xAAAA3C00, 0x42003400),
+                "ps_f16_vop1": (0xAAAA4000, 0xAAAABC00, 0xAAAAC000, 0xAAAA8000),
+                "ps_f16_vop1b": (0xAAAA3400, 0xAAAA4000, 0xAAAAB400, 0xAAAA3800),
+                "ps_f16_const": (0xAAAA3D00, 0x38005555, 0xAAAA3800, 0x3F000000),
+                "ps_f16_const2": (0x42003D00, 0x3D004200, 0xAAAABC00, 3),
+                "ps_f16_pack": (0x34003C00, 0x38003400, 0x34000000, 0x44004200),
             }
             if name in const_wants:
                 ok, detail = check_pixel_const(raw, const_wants[name])
