@@ -159,7 +159,7 @@ class Mad64WaveMaskTests(unittest.TestCase):
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore", ResourceWarning)
                 spv = rdna2spirv.translate(s_path)
-        pc = [0, 0, 0xFFFFFFFF, 0] + [0] * 28
+        pc = [0, 0, 0xFFFFFFFF, 0x31016FAC] + [0] * 28
         mem = si.run_workgroup(
             spv, 64, 64,
             inputs_for=lambda i: {"%wg_id": (0, 0, 0), "%local_id": (i, 0, 0), "%sg_lane": i},

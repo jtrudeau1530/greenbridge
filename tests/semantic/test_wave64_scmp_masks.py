@@ -36,7 +36,7 @@ import spirv_mini_interp as si  # noqa: E402
 
 STUB_DXBC = b"DXBC" + bytes(24) + struct.pack("<I", 0) + bytes(4)
 # COMPUTE_PGM_RSRC2: 0x8090 -> 8 user SGPRs (s[0:3]=V#, s4=lo, s5=hi, s6=cmp_lo, s7=cmp_hi), TGID_X.
-VSHARP = [0, 0, 0xFFFFFFFF, 0]
+VSHARP = [0, 0, 0xFFFFFFFF, 0x31016FAC]
 
 
 def make_fssm(threads):

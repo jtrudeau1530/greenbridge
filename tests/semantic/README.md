@@ -28,13 +28,16 @@ What they check (`tools/rdna2spirv.py`, pixel shaders plus one compute shader):
   asserts the words and the exact addresses loaded for the raw-buffer rule measured on an RX 6800 (per-dword
   `num_records` check on the exact byte offset); `MeasuredBoundsShaders` runs the four GPU tests of the SMEM and
   raw MUBUF rules (`cs_smem_bounds`, `cs_smem_stride_align`, `cs_smem_sload_neg`, `cs_buf_tail`).
+- `test_buffer_oob_select.py` runs 33 hand-tabulated MUBUF cases through the translator and the interpreter, loads
+  and stores, each with a literal and a run-time V#: the first-byte bound of every OOB_SELECT mode (the RDNA2 rules of
+  docs/buffer_bounds.md, docs/design.md Buffer bounds checking), and that a literal RAW V# with ADD_TID/INDEX_STRIDE is Unsupported.
 - `test_scalar_mem_smem.py` runs the code `Gen.scalar_load` emits with its own small evaluator (64-bit
   addresses, forward selection constructs) and asserts the SGPR values and the addresses read, including the
   measured SMEM truncation, `s_buffer_load` `NUM_RECORDS` bound and signed `s_load` immediate.
 - `test_alu_movrel.py` runs hand-written listings for `v_movrels_b32`, `v_movreld_b32` and `v_movrelsd_b32`
   (10 cases): sentinels in v1..v8, M0 set by `s_mov_b32`, then the indexed register and its neighbours are
   exported, so a write must land only in `VGPR[D.addr + M0]`. A plain-Python register-file model checks the
-  hand-written constants. `v_movrelsd_2_b32` is not handled by the translator yet.
+  hand-written constants. `v_movrelsd_2_b32` is covered by `test_alu_movrelsd_2.py`.
 - `spirv_wave_interp.py` runs every invocation of one subgroup at once through structured control flow
   (split at a selection, rejoin at its merge, loops until no invocation is left) with the subgroup
   operations the translator emits. It is the SPIR-V side of `tools/cf_diff.py` (FUZZ-8);
@@ -45,6 +48,11 @@ What they check (`tools/rdna2spirv.py`, pixel shaders plus one compute shader):
 - `test_float_nan_fract.py` runs float min/max/min3/max3/med3 with a quiet NaN and `v_fract` next to 1.0 (f32 and
   f16) with inputs from memory, and the GPU fixtures `ps_fnan_med3` and `ps_fnan_fract`; the expected words were
   measured on an AMD Radeon RX 6800 (gfx1030). A NaN result is asserted as "a NaN", not by its bits.
+- `test_rule_gpu_fixtures.py` runs the GPU fixtures for the `docs/design.md` rules that used to be CPU-only (TEST-175:
+  `v_cmp(x)_nlg`, `v_cvt_off_f32_i4`, the `v_fmac_f16` / `v_interp_p2/mov_f32` output modifiers and VOP3 modifiers on
+  constants) through the interpreter, and checks that the words each `.asm` header derives are the ones `check.py`
+  and `scripts/run_gpu_tests.py` expect. The two interp fixtures get the constants their vertex shader,
+  `vs_interp_consts`, exports.
 - `test_interp.py` tests the interpreter against the SPIR-V / GLSL.std.450 definitions. The interpreter raises
   `UnsupportedConstruct` for anything it does not model instead of approximating it. It can seed Input variables,
   PushConstant words and a flat physical-address memory map for the tests above.

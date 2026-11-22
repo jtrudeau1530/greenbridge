@@ -452,7 +452,7 @@ class LaneMaskPreservationTests(unittest.TestCase):
             64,
             64,
             inputs_for=lambda i: {"%wg_id": (0, 0, 0), "%local_id": (i, 0, 0), "%sg_lane": i},
-            push_constants=[0, 0, 0x1000, 0] + [0] * 28,
+            push_constants=[0, 0, 0x1000, 0x31016FAC] + [0] * 28,
             memory={},
         )
         self.assertEqual([mem.get(0), mem.get(4), mem.get(8), mem.get(12)], [0x11223344, 0x55667788, 24, 0])

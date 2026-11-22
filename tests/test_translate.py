@@ -66,6 +66,53 @@ def test_supported_instruction(case, make_shader):
     shader.validate(shader.translate())
 
 
+# VOP1/VOP2 DPP source controls. The source lane is a shuffle followed by row/bank masking; a lane that the
+# instruction leaves unwritten keeps its old destination, including for non-mov ops.
+DPP_CASES = {
+    "quad_perm": "v_mov_b32_dpp v1, v0 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf",
+    "quad_perm_masked": "v_mov_b32_dpp v1, v0 quad_perm:[1,0,3,2] row_mask:0x1 bank_mask:0x3",
+    "row_shl": "v_mov_b32_dpp v1, v0 row_shl:1 row_mask:0xf bank_mask:0xf",
+    "row_shr_bound": "v_mov_b32_dpp v1, v0 row_shr:1 row_mask:0xf bank_mask:0xf bound_ctrl:1",
+    "row_ror": "v_mov_b32_dpp v1, v0 row_ror:4 row_mask:0xf bank_mask:0xf",
+    "row_share": "v_mov_b32_dpp v1, v0 row_share:2 row_mask:0xf bank_mask:0xf",
+    "row_xmask": "v_mov_b32_dpp v1, v0 row_xmask:4 row_mask:0xf bank_mask:0xf",
+    "row_mirror": "v_mov_b32_dpp v1, v0 row_mirror row_mask:0xf bank_mask:0xf",
+    "row_half_mirror": "v_mov_b32_dpp v1, v0 row_half_mirror row_mask:0xf bank_mask:0xf",
+    "dpp8": "v_mov_b32_dpp v1, v0 dpp8:[7,6,5,4,3,2,1,0] fi:1",
+    "vop1_not_bank": "v_not_b32_dpp v1, v0 quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0x1",
+    "vop2_add_shr": "v_add_nc_u32_dpp v1, v0, v2 row_shr:1 row_mask:0xf bank_mask:0xf",
+}
+
+
+@pytest.mark.parametrize("case", sorted(DPP_CASES))
+def test_dpp_controls_translate_and_validate(case, make_shader):
+    shader = make_shader(program("v_mov_b32 v0, v0\n" + DPP_CASES[case]))
+    spvasm = shader.translate()
+    shader.validate(spvasm)
+    assert "OpGroupNonUniformShuffle" in spvasm
+
+
+@pytest.mark.parametrize("mods", [[], ["row_share:20"], ["row_shl:0"], ["row_shl:1", "row_shr:2"]])
+def test_dpp_bad_control_is_rejected(mods):
+    """A missing, out-of-range or duplicate DPP control must fail instead of guessing."""
+    gen = rdna2spirv.Gen("ps")
+    ins = {"op": "v_mov_b32_dpp", "args": [{"k": "vgpr", "r": 1}, {"k": "vgpr", "r": 0}], "mods": mods}
+    with pytest.raises(rdna2spirv.Unsupported):
+        gen.insn(ins)
+
+
+def test_dpp_wave64_emulation_goes_through_workgroup_memory(make_shader, monkeypatch):
+    """--wave64-emulate must not leave a subgroup shuffle in a DPP shader."""
+    shader = make_shader("s_mov_b64 exec, -1\n"
+                         "v_mov_b32_dpp v1, v0 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf\n"
+                         "s_endpgm\n", name="cs_dpp_w64")
+    monkeypatch.setattr(rdna2spirv, "WAVE64_EMULATE", True)
+    spvasm = shader.translate()
+    shader.validate(spvasm)
+    assert "OpGroupNonUniform" not in spvasm and "%sg_lane" not in spvasm
+    assert "%x_buf" in spvasm and "OpControlBarrier" in spvasm
+
+
 def test_translation_is_deterministic(make_shader):
     shader = make_shader(program(SUPPORTED["v_fma_f32"]))
     assert shader.translate() == shader.translate()
@@ -342,6 +389,7 @@ def test_vs_clip_distance_pos1(make_shader, n_comp, exp_line, mask):
     assert [int(x) for x in chains] == list(range(n_comp))
     assert _vgpr_to_index_map(spvasm, "%out_clip", "%_ptr_Output_float") == {i: 10 + i for i in range(n_comp)}
     meta = rdna2spirv.shader_meta(rdna2spirv.translate.last_gen, spvasm)
+    assert meta["clip_distance_count"] == n_comp
     assert "shaderClipDistance" in meta["features"]
     assert "shaderCullDistance" not in meta["features"]
     assert 1 not in meta.get("outputs", [])
@@ -392,6 +440,8 @@ def test_vs_clip_and_cull_distances_across_pos1_pos2(make_shader):
     meta = rdna2spirv.shader_meta(rdna2spirv.translate.last_gen, spvasm)
     assert "shaderClipDistance" in meta["features"]
     assert "shaderCullDistance" in meta["features"]
+    assert meta["clip_distance_count"] == 2
+    assert meta["cull_distance_count"] == 3
     assert not ({1, 2} & set(meta.get("outputs", [])))
     assert not ({1, 2} & set(meta.get("params", [])))
 
@@ -420,6 +470,7 @@ def test_pos1_without_osg1_is_ignored(make_shader):
     assert "OpCapability ClipDistance" not in vs_spv
     assert "BuiltIn ClipDistance" not in vs_spv
     vs_meta = rdna2spirv.shader_meta(rdna2spirv.translate.last_gen, vs_spv)
+    assert "clip_distance_count" not in vs_meta
     assert "shaderClipDistance" not in vs_meta["features"]
     assert 1 not in vs_meta.get("outputs", [])
 
@@ -648,6 +699,55 @@ def test_wave64_emulate_uses_no_subgroup_ops(path, make_shader, monkeypatch):
     shader.validate(emulated, KNOWN_VAL_ISSUES.get(stem))
     assert "OpGroupNonUniform" not in emulated and "%sg_lane" not in emulated
     assert "%x_buf" in emulated and emulated.count("OpControlBarrier") >= 2
+
+
+# SHADER-91: a native wave32 compute shader whose s_barrier isn't in a top-level block runs in barrier rounds.
+BARRIER_SAMPLES = ("cs_barrier_divergent", "cs_barrier_early_end", "cs_barrier_loop")
+
+
+@pytest.mark.parametrize("stem", BARRIER_SAMPLES)
+def test_nested_barrier_runs_in_barrier_rounds(stem, make_shader):
+    """No OpControlBarrier is left among the blocks (the cases of the switch over %pc): s_barrier ends a segment
+    there. The only two are before the round loop and at its end, where the whole workgroup is."""
+    with open(os.path.join(ROOT, "runtime", "test", "shaders", stem + ".asm"), encoding="utf-8") as f:
+        shader = make_shader(f.read(), stem)
+    asm = shader.translate()
+    shader.validate(asm)
+    assert rdna2spirv.translate.last_gen.control_flow == "barrier rounds"
+    blocks = asm[asm.index("OpSwitch %pcv"):asm.index("%sw_default = OpLabel")]
+    assert "OpControlBarrier" not in blocks and "OpStore %x_bar %true" in blocks
+    assert asm.count("OpControlBarrier") == 2
+    head, tail = asm.index("OpLoopMerge %loop_exit %loop_cont"), asm.index("%loop_cont = OpLabel")
+    assert asm.index("OpControlBarrier") < head and asm.rindex("OpControlBarrier") > tail
+    assert "OpAtomicIAdd" in asm[tail - 2000:tail] and "%x_buf = OpVariable" in asm
+
+
+def test_top_level_barrier_keeps_the_plain_translation(make_shader):
+    """A barrier in a block every invocation runs (the top level of the structured tree) stays one OpControlBarrier
+    in place: no rounds for a shader that doesn't need them."""
+    shader = make_shader("v_lshlrev_b32_e32 v2, 2, v0\nds_write_b32 v2, v0\ns_waitcnt lgkmcnt(0)\ns_barrier\n"
+                         "v_readfirstlane_b32 s5, v0\ns_cmp_lg_u32 s5, 0\ns_cbranch_scc1 2\n"   # skips the 2-dword read
+                         "ds_read_b32 v4, v2\ns_endpgm\n", "cs_barrier_top")
+    asm = shader.translate()
+    shader.validate(asm)
+    assert rdna2spirv.translate.last_gen.control_flow == "structured"
+    assert asm.count("OpControlBarrier") == 1 and "%x_bar" not in asm and "%x_buf" not in asm
+
+
+def test_barrier_rounds_are_wave32_compute_only(make_shader, monkeypatch):
+    """Native wave64 (AMD's 64-wide subgroups) keeps the barrier where s_barrier is; under --wave64-emulate the
+    emulated round loop already holds the only barrier."""
+    with open(os.path.join(ROOT, "runtime", "test", "shaders", "cs_barrier_divergent.asm"), encoding="utf-8") as f:
+        src = f.read()
+    shader = make_shader("s_mov_b64 exec, -1\n" + src, "cs_barrier_divergent_w64")   # a 64-bit EXEC write: wave64
+    asm = shader.translate()
+    gen = rdna2spirv.translate.last_gen
+    assert gen.wave64 and not gen.bar_rounds and gen.control_flow == "structured"
+    assert asm.count("OpControlBarrier") == 2 and "%x_bar" not in asm
+    monkeypatch.setattr(rdna2spirv, "WAVE64_EMULATE", True)
+    shader.translate()
+    gen = rdna2spirv.translate.last_gen
+    assert gen.emulate and not gen.bar_rounds and gen.control_flow == "emulated wave64 rounds"
 
 
 # SHADER-36: image_gather4_l(_o) runs every texel of its 2x2 footprint through the S#'s CLAMP_X/CLAMP_Y.
@@ -949,7 +1049,7 @@ def test_pk_f16_int_pack_repro_513(emulate, make_shader, monkeypatch):
     mem = spirv_mini_interp.run_workgroup(
         spv, 64, sg_size,
         inputs_for=lambda i: {"%wg_id": (0, 0, 0), "%local_id": (i, 0, 0), "%sg_lane": i % sg_size},
-        push_constants=[0, 0, 0xFFFFFFFF, 0] + [0] * 28,
+        push_constants=[0, 0, 0xFFFFFFFF, 0x31016FAC] + [0] * 28,
         memory={},
     )
     assert [mem[256 + 4 * i] for i in range(3)] == [0x3CD53CD5, 0x3D553D55, 0x3DD53DD5]
@@ -988,11 +1088,21 @@ def test_pk_and_scalar_f16_ops_emit_no_packhalf2x16(op_asm, make_shader):
 def test_buffer_format_f16_narrowing_avoids_packhalf2x16(make_shader, body):
     """The f16 of a d16 typed buffer load, and of an f16 format a typed buffer store writes, narrow with integer RTE
     like the d16 image results (#489): PackHalf2x16 rounds toward zero on AMD drivers."""
-    shader = make_shader("s_mov_b32 s0, 0x1000\ns_mov_b32 s1, 0\ns_mov_b32 s2, 0x100\ns_mov_b32 s3, 0x1fac\n"
+    shader = make_shader("s_mov_b32 s0, 0x1000\ns_mov_b32 s1, 0\ns_mov_b32 s2, 0x100\ns_mov_b32 s3, 0x31001fac\n"
                          "v_mov_b32 v1, 0\n" + body + "\ns_endpgm\n", "ps_buf_f16")
     spv = shader.translate()
     shader.validate(spv)
     assert "PackHalf2x16" not in spv
+
+
+def test_repeated_tbuffer_loads_share_normalization(make_shader):
+    """A packed fixed format with 10- and 2-bit fields needs two exact quotients, regardless of load count."""
+    load = "tbuffer_load_format_xyzw v[4:7], v0, s[0:3], 0 format:[BUF_FMT_2_10_10_10_UNORM] offen"
+    shader = make_shader((load + "\ns_waitcnt vmcnt(0)\n") * 8 + "exp mrt0 v4, v5, v6, v7 done vm\ns_endpgm\n",
+                         "ps_repeated_tbuffer")
+    spv = shader.translate()
+    shader.validate(spv)
+    assert spv.count("FindUMsb") == 2
 
 
 def test_image_sample_d16_avoids_packhalf2x16(make_shader):
@@ -1125,7 +1235,7 @@ def test_encode_format_f16_uses_f16_bits_rte(suffix, fmt_code, expected_word, ma
         f"s_mov_b32 s0, {base:#x}\n"
         "s_mov_b32 s1, 0\n"
         "s_mov_b32 s2, 0x100\n"
-        f"s_mov_b32 s3, {fmt_code << 12:#x}\n"
+        f"s_mov_b32 s3, {fmt_code << 12 | 0x30000000:#x}\n"
         "v_mov_b32 v1, 0\n"
         "v_mov_b32 v2, 0x3f801000\n"  # 1.0 + 2^-11 -> 0x3c00 (tie to even)
         "v_mov_b32 v3, 0x3f803000\n"  # 1.0 + 3*2^-11 -> 0x3c02 (tie to even)
@@ -1144,13 +1254,47 @@ def test_encode_format_f16_uses_f16_bits_rte(suffix, fmt_code, expected_word, ma
     assert mem[base] == expected_word
 
 
+@pytest.mark.parametrize("fmt, expected", [(56, 0x80000000), (57, 0x40810000)])
+@pytest.mark.parametrize("packed", [False, True])
+def test_normalized_buffer_store_nan(fmt, expected, packed, make_shader):
+    # RGBA = positive signaling NaN, negative quiet NaN, -infinity, +0.5.
+    # gfx1036 stored zero for both NaNs, clamped infinity and rounded 0.5 to even.
+    if packed:
+        inputs = "v_mov_b32 v4, 0xfe017c01\nv_mov_b32 v5, 0x3800fc00\n"
+        store = "buffer_store_format_d16_xyzw v[4:5]"
+    else:
+        inputs = ("v_mov_b32 v4, 0x7f800001\nv_mov_b32 v5, 0xffc01000\n"
+                  "v_mov_b32 v6, 0xff800000\nv_mov_b32 v7, 0.5\n")
+        store = "buffer_store_format_xyzw v[4:7]"
+    src = ("s_mov_b32 s0, 0x1000\ns_mov_b32 s1, 0\ns_mov_b32 s2, 4\n"
+           f"s_mov_b32 s3, {0x31000fac | fmt << 12:#x}\n" + inputs +
+           f"{store}, off, s[0:3], 0\ns_waitcnt vmcnt(0)\ns_endpgm\n")
+    shader = make_shader(src, name="ps_store_nan")
+    spv = shader.translate()
+    shader.validate(spv)
+    memory = {0x1000: 0xDEADBEEF}
+    _load_mini_interp().run_fragment(spv, memory=memory)
+    assert memory[0x1000] == expected
+
+
+@pytest.mark.parametrize("fmt", [22, 20])  # 32_FLOAT, 32_UINT
+def test_unnormalized_buffer_store_keeps_nan_bits(fmt, make_shader):
+    src = ("s_mov_b32 s0, 0x1000\ns_mov_b32 s1, 0\ns_mov_b32 s2, 4\n"
+           f"s_mov_b32 s3, {0x31000fac | fmt << 12:#x}\n"
+           "v_mov_b32 v4, 0xffc01000\nbuffer_store_format_x v4, off, s[0:3], 0\ns_endpgm\n")
+    shader = make_shader(src, name="ps_raw_store_nan")
+    memory = {0x1000: 0}
+    _load_mini_interp().run_fragment(shader.translate(), memory=memory)
+    assert memory[0x1000] == 0xFFC01000
+
+
 def test_remaining_d16_paths_avoid_packhalf2x16(make_shader):
     """buffer_format d16 and image_sample_c_lz d16 avoid PackHalf2x16 and validate with spirv-val."""
     tbuf_asm = (
         "s_mov_b32 s0, 0x1000\n"
         "s_mov_b32 s1, 0\n"
         "s_mov_b32 s2, 0x100\n"
-        f"s_mov_b32 s3, {77 << 12:#x}\n"  # format 77 = f32x4
+        f"s_mov_b32 s3, {77 << 12 | 0x30000000:#x}\n"  # format 77 = f32x4
         "v_mov_b32 v0, 0\n"
         "buffer_load_format_d16_xy v2, v0, s[0:3], 0 offen\n"
         "s_waitcnt vmcnt(0)\n"

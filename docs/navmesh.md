@@ -262,6 +262,37 @@ remain **open**.
 5. **Band-3 `grid` subsystem and EOF `PSIN` v79.** The Band-3 subsystem identity, `u64` key encoding and `u32[N]`
    payload bits are open, as is why the final `PSIN` (version `79`) terminates before `LSNS` ends.
 
+## Vehicle navmesh settings (`CVehiclePoints`, `common.rpf`)
+
+Navmeshes on vehicles that peds walk around on are configured outside this archive, by 32 `CVehiclePoints` XML
+documents in `common.rpf` (see [gamedata.md](gamedata.md)). One document per vehicle; counts only, no names.
+
+| Field | Documents | Values |
+|---|---:|---|
+| `DefinitionName`, `ModelName` | 32 | equal in all 32; 31 distinct (one model has two different documents) |
+| `Flags`, `iNumBoardingPoints` | 32 | one value each across all 32; `iNumBoardingPoints` is 0 |
+| `Points`, `Props`, `AuthoredMeshName` | 32 | empty in all 32 |
+| `fNavOverrideRecastCellSize` | 31 | 4 distinct values: 0, 0.03125, 0.0325, 0.0625 |
+| `fNavOverrideRecastCellHeight` | 26 | 2 distinct values, 0 or 0.04 |
+| `fNavOverrideAgentRadius` | 30 | 4 distinct values, 0 to 0.15 |
+| `fNavOverrideAgentHeight` | 30 | 0 or 1.2 |
+| `fNavMaxHeightChange`, `fNavMinZDist` | 30 | constant (0.35 and 0.5) |
+| `fMinPatchAreaBeforeCulling` | 31 | 6 distinct values, 0.1 to 4 |
+| `ModDefs/Item` | 6 documents, 49 items | `ChassisModName`, `UtilityModName`, `PropsetExteriorModName`, `InteriorModName`, `CargoModName` (always empty), `RoofModName` (on 17) |
+
+The field names are Recast's (cell size and height, agent radius and height, a minimum patch area), so a vehicle
+navmesh is built with Recast-style parameters per model, where 0 reads as "no override". The cell sizes are
+fine (at most 0.0625 world units) compared with a world navmesh, as a deck or wagon bed would need.
+
+Cross-checks against the local archive catalog: 25 of the 31 model names are `.yft` base names (6 are not in
+the catalog), and all 25 are also among the 319 models of the vehicle distant-light recipes; 4 are among the 252
+rated vehicles. Of the mod part names, only the 5 `RoofModName` values that are set resolve to a `.yft`; the
+49 chassis, 32 utility, 35 exterior-propset and 4 interior names match no archive entry, so they are probably
+fragment-part or kit names rather than models.
+
+Not measured here (hypothesis): whether the vehicle navmeshes are generated at runtime from these parameters or
+stored elsewhere, and which vehicles the 31 are (wagons, boats and trains would fit the field set).
+
 ## Tools
 
 - `tools/navmesh_index.py` (stdlib-only) performs the quick `0DRP` header inventory (`offset`, sizes, version, `+0x20`,

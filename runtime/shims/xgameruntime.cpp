@@ -77,6 +77,18 @@ HRESULT __stdcall XSystemGetConsoleId(size_t size, char* out, size_t* used) {
     return S_OK;
 }
 
+// uint64_t XSystemGetAppMemoryUsageLimit(). Reports total physical RAM, or 12 GB fallback for Series X.
+uint64_t __stdcall XSystemGetAppMemoryUsageLimit() {
+    MEMORYSTATUSEX ms{sizeof(ms)};
+    if (GlobalMemoryStatusEx(&ms)) return ms.ullTotalPhys;
+    return 12ULL * 1024 * 1024 * 1024;
+}
+
+// uint64_t XSystemGetAppMemoryUsage()
+uint64_t __stdcall XSystemGetAppMemoryUsage() {
+    return 0;
+}
+
 #define XGR(name) {"xgameruntime.dll", #name, reinterpret_cast<void*>(&name)}
 
 }  // namespace
@@ -86,6 +98,8 @@ SHIM_TABLE(xgameruntime,
     XGR(XGameRuntimeUninitialize),
     XGR(XSystemGetDeviceType),
     XGR(XSystemGetConsoleId),
+    XGR(XSystemGetAppMemoryUsageLimit),
+    XGR(XSystemGetAppMemoryUsage),
     // XTaskQueue (third_party/xtaskqueue)
     XGR(XTaskQueueCreate),
     XGR(XTaskQueueCreateComposite),

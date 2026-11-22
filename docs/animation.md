@@ -371,13 +371,19 @@ Every dictionary has 1 or 2 system pages and no graphics pages. Its pages are th
 each 16-byte aligned after the one before it. Join them, and a pointer `p` is the offset `p - 0x50000000` into
 the joined bytes.
 
-Measured: 61,510 root streams. 61,474 join into resources: 35,750 with one system page and 25,724 with two. In 36
-roots the page map says two pages, but the next stream does not start where the first one ends (16-byte aligned).
-Where their second page is was not found; these roots are counted as unresolved, not joined by guesswork. Of the
-joined resources, 61,469 are clip dictionaries. 4 have `RIG` plus a version at +0x70 instead of a pack array (rig
-dictionaries, not decoded here), and 1 has some other value there. Together the dictionaries use 87,198 streams
-(3,799,425,432 stored / 7,072,304,832 inflated bytes). By `anim_index.py` class those streams are: zero-prefix
-66,079, raw 20,845, name-table 273, skeleton-names 1.
+Measured: 61,510 root streams. 61,510 join into resources: 35,750 with one system page and 25,760 with two.
+In 36 roots the page map says two pages, but the next listed stream does not start where the first one ends. Their
+second page is right after the first stream, but `anim_index.py` does not list it: in 28 it is a zlib stream that
+inflates to 16–48 bytes (`anim_index.py` lists streams of 64 bytes or more), and in 8 it is a 16-byte raw page,
+like rpf9-explorer's raw system tail. `anim_clips.py` joins such a last page only when the joined pages then parse
+as a clip dictionary; all 36 do, so no root is left unresolved. That recovery runs only after the page map itself
+has been read from listed streams: a root whose page map is in such an unlisted last page stays unresolved ("page
+map not in the next stream"). No anim.rpf root has that layout. In `story000.rpf` 5 roots do, with the page map in
+a 32- or 48-byte zlib tail, and none of the 5 is a clip dictionary once that tail is joined. Of the joined resources, 61,505 are clip
+dictionaries. 4 have `RIG` plus a version at +0x70 instead of a pack array (rig dictionaries, not decoded here), and
+1 has some other value there. Together the dictionaries use 87,234 listed streams plus the 36 unlisted pages
+(3,802,124,713 stored / 7,077,351,104 inflated bytes in the listed streams). By `anim_index.py` class those
+streams are: zero-prefix 66,115, raw 20,845, name-table 273, skeleton-names 1.
 
 The other classes fit the same framing:
 
@@ -401,16 +407,24 @@ u32; u32 count}` with `Entry {u64 key; T *value; Entry *next}`. Hashes are `joaa
 |---|---|---|
 | dictionary (page offset 0) | `+0x38` atString | dictionary name |
 | | `+0x48` atMap | clips; key = `joaat32(dictionary name) << 32 \| clip hash` |
-| | `+0x68` u32 | `joaat32(dictionary name)` (all 61,469 dictionaries) |
-| | `+0x70` array, 16-byte items | `{pack *ptr; u32 pack hash; u32 0}`; a null pointer is a pack outside this resource (hash only) |
+| | `+0x68` u32 | `joaat32(dictionary name)` (all 61,505 dictionaries) |
+| | `+0x70` array, 16-byte items | `{pack *ptr; u32 hash; u32 0}`. With a pointer, a local pack and its `joaat32(name)`. With a null pointer, the hash is another clip dictionary's `joaat32(name)` (see `.motion` clips below) |
 | animation pack | `+0x38` atString | pack name (`<dictionary>-N`) |
 | | `+0x48` atMap | animations, key = `joaat32` of the animation name |
 | | `+0x68` u32 | `joaat32(pack name)` |
 | `.clip` (`+0x20` u32 < 16) | `+0x28` atString | `pack:/<name>.clip` |
 | | `+0x68` pointer | list `{entry *ptr; u16 count; u16 capacity}`, entries 0x38 bytes: `+0` animation pointer, `+8` animation hash, `+0x28`/`+0x2C` start/end (s), `+0x30` rate |
 | | `+0x78` f32 | duration (s) |
-| `.motion` (`+0x20` is a pointer) | `+0x30` atString | `pack:/<name>.motion`; parametric, not decoded |
-| `.motionmatcher` (`+0x20` is a pointer) | `+0x28` 16 bytes, `+0x38` atString | an id, then `pack:/<name>.motionmatcher`; not decoded |
+| `.motion` (`+0x20` is a pointer) | `+0x18` pointer | the dictionary root (page offset 0) |
+| | `+0x28` u32, `+0x2C` u32 | the clip hash (the low half of its `atMap` key) and `joaat32` of the dictionary name |
+| | `+0x30` atString | `pack:/<name>.motion` |
+| | `+0x58` u32 | 1 or 2; selects where the parameter node is (see `+0x120`, `+0x138`); most likely the number of blend parameters (not verified) |
+| | `+0x60` array, 16-byte items | children `{u64 0; u32 clip hash; u32 dictionary hash}`: the clips it blends |
+| | `+0x70` array, 0x28-byte items | one item per child: `{f32 child duration; f32 duration in the blend; {ptr; u16 count} curve of (child time, blend time) f32 pairs; 16 zero bytes}` |
+| | `+0x120` pointer (`+0x58` = 2) | a block whose `+0x18` points at the parameter node |
+| | `+0x138` pointer (`+0x58` = 1) | the parameter node: `{u64 0; u32 type; u32 0; ...}` |
+| parameter node, type 3 | `+0x10` array of u32, `+0x20` array of 8-byte items, `+0x30`/`+0x34` f32 | one sampled axis: its name hash(es), then `{u32 sample index; f32 value}` sorted by value, then min and max |
+| `.motionmatcher` (`+0x20` is a pointer) | `+0x28` 16 bytes, `+0x38` atString | an id, then `pack:/<name>.motionmatcher`; the rest is not decoded |
 | animation | `+0x24` u16 | frame count |
 | | `+0x28` f32 | duration = (frames − 1) / fps |
 | | `+0x50` array | sequence pointers |
@@ -423,27 +437,27 @@ animations of one clip covered different bones and could have different frame ra
 
 | Hash | Name | Tracks |
 |---|---|---:|
-| `0x98e1750c` | `bonerotation` | 7,668,345 |
-| `0xf791a95f` | `bonetranslation` | 2,438,782 |
-| `0x2deefadd` | `genericcontrol` | 1,453,479 |
-| `0xf5c3a5b6` | `generictranslation` | 69,798 |
-| `0x6ddef121` | `cameratranslation` | 69,597 |
+| `0x98e1750c` | `bonerotation` | 7,673,334 |
+| `0xf791a95f` | `bonetranslation` | 2,440,527 |
+| `0x2deefadd` | `genericcontrol` | 1,454,457 |
+| `0xf5c3a5b6` | `generictranslation` | 69,844 |
+| `0x6ddef121` | `cameratranslation` | 69,645 |
 | `0x364d3bdb` | `facialtranslation` | 63,394 |
-| `0x7aaa9f60` | `bonescale` | 24,581 |
-| `0xd9ad1a74` | `camerarotation` | 474 |
-| 36 other hashes | not named | 882,064 |
+| `0x7aaa9f60` | `bonescale` | 24,590 |
+| `0xd9ad1a74` | `camerarotation` | 476 |
+| 36 other hashes | not named | 882,732 |
 
 A bone hash is `joaat32` of the lowercased bone name, for example `skel_pelvis`. In one checked rig, 64 of 66
 track bones matched the skeleton's names; bone hash 0 is the whole-body (mover) track. **Formats:** 0 =
-quaternion `(x, y, z, w)`, 2 = vec3, 4 = float (7,929,875, 2,905,236 and 1,823,181 tracks; format 3 is used by 12,222
+quaternion `(x, y, z, w)`, 2 = vec3, 4 = float (7,935,044, 2,907,303 and 1,824,430 tracks; format 3 is used by 12,222
 tracks and is not mapped).
 
 ### Sequences
 
 An animation's frames are split over one or more sequences. Consecutive sequences **share one frame**, so
-`sum(sequence frames) = frames + sequences − 1` (true for 190,922 of 190,922 decoded animations). The repeated frame
-decodes to the same pose on both sides: 813,487 of 814,355 quaternion boundaries are the same rotation (|q₁·q₂| >
-0.9999, so q and −q count as equal), and 696,427 of 708,220 vec3/float boundaries agree within 1e-3. The cause of the
+`sum(sequence frames) = frames + sequences − 1` (true for 191,042 of 191,042 decoded animations). The repeated frame
+decodes to the same pose on both sides: 814,011 of 814,880 quaternion boundaries are the same rotation (|q₁·q₂| >
+0.9999, so q and −q count as equal), and 696,853 of 708,648 vec3/float boundaries agree within 1e-3. The cause of the
 remaining 0.1% and 1.7% was not investigated.
 
 A sequence is a 0x20-byte header and `length` bytes of data:
@@ -454,7 +468,7 @@ A sequence is a 0x20-byte header and `length` bytes of data:
 | `+0x0C` | u32 | frame-data offset in the data |
 | `+0x16` | u16 | frames in this sequence |
 | `+0x18` | u16 | bytes per frame |
-| `+0x1C` | u16 | sum of the type-4 bit widths (true in 212,171 of 212,171 sequences) |
+| `+0x1C` | u16 | sum of the type-4 bit widths (true in 212,306 of 212,306 sequences) |
 | `+0x1E` | u8 | 11 (the number of channel types) |
 
 The data holds, in order:
@@ -471,17 +485,17 @@ The data holds, in order:
 
 | Type | Definition | Value | Channels |
 |---|---|---|---:|
-| 0 | 3 × f32 x, y, z | constant quaternion, w = +√(1 − x² − y² − z²) | 3,577,278 |
-| 1 | 3 × f32 | constant vec3 | 2,532,086 |
-| 2 | f32 | constant | 5,424,535 |
+| 0 | 3 × f32 x, y, z | constant quaternion, w = +√(1 − x² − y² − z²) | 3,579,477 |
+| 1 | 3 × f32 | constant vec3 | 2,533,788 |
+| 2 | f32 | constant | 5,428,131 |
 | 3 | none | 32 frame bits = an f32 per frame | 40 |
-| 4 | u32 bits, f32 quantum, f32 offset | `bits` frame bits × quantum + offset | 7,594,553 |
-| 5 | u32 frame bits, u32 value bits, u32 words, f32 quantum, f32 offset, then the table (`words` u32, value-bits entries) | frame bits index the table; entry × quantum + offset | 484,234 |
+| 4 | u32 bits, f32 quantum, f32 offset | `bits` frame bits × quantum + offset | 7,600,074 |
+| 5 | u32 frame bits, u32 value bits, u32 words, f32 quantum, f32 offset, then the table (`words` u32, value-bits entries) | frame bits index the table; entry × quantum + offset | 484,616 |
 | 6 | — | not seen | 0 |
-| 7 | none | rebuilds one quaternion component (below) | 4,939,485 |
-| 8 | none | marks a quaternion with four stored components (below) | 227,467 |
+| 7 | none | rebuilds one quaternion component (below) | 4,942,792 |
+| 8 | none | marks a quaternion with four stored components (below) | 227,655 |
 | 9 | — | not seen | 0 |
-| 10 | variable, see below | second-order delta coding (GTA VI) | 6,832,164 |
+| 10 | variable, see below | second-order delta coding (GTA VI) | 6,836,654 |
 
 **Type 10** (new in this build, and the most common animated channel):
 
@@ -499,7 +513,7 @@ decode, per chunk:  x = start; v = 0
 ```
 
 Integrating a full chunk's 64th delta lands exactly on the next chunk's start value. That holds for
-all 48,114,845 of 48,114,845 chunk boundaries. There is one width code per 8 *deltas*: reading `ceil(frames / 8)`
+all 48,142,174 of 48,142,174 chunk boundaries. There is one width code per 8 *deltas*: reading `ceil(frames / 8)`
 codes runs into the lanes.
 
 **Quaternion tracks.** A track with a type-0 channel is a constant `(x, y, z, +√(1 − x² − y² − z²))`. Otherwise
@@ -507,23 +521,79 @@ its components come from scalar channels:
 
 - **Type 7** appears on a track that stores three components (comp 0–2). The missing component is
   `+√(1 − sum of squares)`, placed at the type-7 channel's comp position, and the stored three fill the other
-positions in order. Measured: 4,939,485 sequence tracks; the largest |x, y, z| overshoot before normalising is
+positions in order. Measured: 4,942,792 sequence tracks; the largest |x, y, z| overshoot before normalising is
 0.0971.
 - **Type 8** always sits at comp 0 on a track that stores all four components. Nothing is rebuilt; the four values
-  are normalised. Measured: 227,467 sequence tracks; |q| of the four stored values is within 0.0190 of 1.
+  are normalised. Measured: 227,655 sequence tracks; |q| of the four stored values is within 0.0190 of 1.
 
-Static quaternions: 3,577,278, and 0 of them have |x, y, z| > 1. The (x, y, z, w) order and the rebuilt sign fit the
+Static quaternions: 3,579,477, and 0 of them have |x, y, z| > 1. The (x, y, z, w) order and the rebuilt sign fit the
 boundary check above. An earlier local comparison against one skeleton's bind rotations also fits (dot products
 0.97–1.0); that comparison is not part of the tool.
 
 ### Coverage
 
-190,922 animations in 52,888 local packs; 190,922 decode with every check above passing and 0 fail (0 skipped by the
-time budget). 8,581 dictionaries have no local pack; dictionaries refer to 27,552 packs by hash only (18,593 distinct
-hashes), and none of those hashes is the hash of one of the 52,888 local packs. Clips: 312,065, of which 17,245 are
+191,042 animations in 52,923 local packs; 191,042 decode with every check above passing and 0 fail (0 skipped by the
+time budget). 8,582 dictionaries have no local pack; dictionaries refer to 27,559 packs by hash only (18,595 distinct
+hashes), and none of those hashes is the hash of one of the 52,923 local packs: they are dictionary hashes. In
+anim.rpf, 16,693 of the 18,595 distinct hashes are the `joaat32(name)` of a clip dictionary here (21,014 of the
+27,559 references). Clips: 312,263, of which 17,247 are
 `.motion` and 180 are `.motionmatcher` (`+0x20` is a pointer in both; the name is at `+0x30` for `.motion` and at
-`+0x38` for `.motionmatcher`, after a 16-byte id). Neither of those two kinds is decoded. Sequences: 212,171. A full
-run with `--jobs 44` took 5 min 44 s on 44 cores; the slowest dictionary took 32.7 s.
+`+0x38` for `.motionmatcher`, after a 16-byte id); `.motion` clips are described below. Sequences: 212,306. Before
+the gap-page join, a full run with `--jobs 44` took 5 min 44 s on 44 cores; the slowest dictionary takes about 32 s.
+
+### `.motion` and `.motionmatcher` clips
+
+A `.motion` clip has no animation of its own; it lists other clips (its children), which it presumably blends. Its
+fields are in the object table above. Measured on all 17,247 `.motion` clips:
+
+- `+0x18` points at the dictionary root, `+0x28` is the clip's own hash (the low half of its `atMap` key) and `+0x2C`
+  is the dictionary's `joaat32(name)`. `+0x58` is 1 on 8,932 and 2 on 8,315.
+- They have 159,584 children `{clip hash, dictionary hash}`. For every child, the dictionary hash is one of the
+  root's hash-only `+0x70` references (159,584 of 159,584), so those references are the dictionaries the
+  `.motion` clips draw from.
+- 114,925 children name a dictionary in anim.rpf, and 111,948 of those (97.4%) name a `.clip` of that
+  dictionary. The other 2,977 name a hash that is not a clip there.
+- The remaining 44,659 children name one of the 1,902 referenced dictionaries that are not in anim.rpf. A local
+  search of every clip-dictionary-like root page in `levels`, `packs`, `story000`, `story000_script`,
+  `story000_restofworld`, `core_restofworld`, `core_restofworld001`, `shared_minigame000`, `data`, `common` and
+  `script` found none of those hashes, so this package does not resolve them.
+- **Child times (`+0x70`).** One 0x28-byte item per child on all 17,247: the child's duration, its duration in the
+  blend, and a piecewise-linear curve from child time to blend time. Of the 159,584 items, 158,991 have equal
+  durations and the two points (0, 0) and (d, d), so the child plays at its own speed. 402 have a 5–82 point curve
+  from (0, 0) to (duration, blend duration), increasing in both coordinates, so the child is time-warped. The other
+  191 have two points, but 170 don't start at (0, 0) and 21 don't end at (d, d). For every child that names a
+  `.clip` in anim.rpf, the first float is bit-for-bit that `.clip`'s duration (`+0x78`): 111,948 of 111,948.
+- **Parameter node.** When `+0x58` is 1 the node is at `+0x138`; when it is 2, `+0x120` points at a block whose
+  `+0x18` is the node. Every `.motion` has one, and it starts `{u64 0, u32 type, u32 0}`. By type: 3 on 10,171, 1 on
+  3,557, 4 on 2,644, 5 on 482, 6 on 295, 8 on 98. Only type 3 is decoded here.
+- **Type 3: one sampled axis.** It has one u32 name hash, then 1–16 `{u32 sample index, f32 value}` items and the
+  axis min and max. On all 10,171 (29,123 samples), the items are sorted by value, min and max are the first and
+  last values, and the sample indices are 0..n−1 in some order. They are not child indices: the sample count
+  equals the child count on 4,589 of them. The name hashes are `joaat32` of a lower-case name. 88 distinct hashes
+  occur, and a word-list search resolved 10 of them, covering 5,604 axes: `yawangle` 2,524, `rotationz` 1,691,
+  `facingdirection` 638, `speed` 284, `surfaceincline` 271, `roll` 66, `verticalheight` 58, `pitch` 25,
+  `pitchangle` 25, `height` 22. The ranges fit the names: `speed` is within [0, 1], `surfaceincline` within
+  ±0.698 rad (40°), and `roll` within ±3.14. `anim_clips.py` reports every name as `motion_axis_name:<name or hash>`.
+- Not decoded: parameter node types other than 3, how a type-3 sample index maps to the children, and the rest of
+  the object from `+0x80`, including the `{ptr, count}` lists at `+0x90`.
+
+The 180 `.motionmatcher` clips sit in 142 dictionaries that hold only `.motionmatcher` clips and no local pack.
+The three motion matcher streams in [Bone tables and motion matchers](#bone-tables-and-motion-matchers)
+(`0x101c379a0`, `0x101c41d50`, `0x101ea66c0`) are the second system pages of three of those dictionaries, with 2, 1 and 2
+`.motionmatcher` clips. Their layout after the name is not decoded.
+
+### Other archives
+
+The same tool reads `story000.rpf` with no change: of 34,533 roots with the dictionary header, 34,518 join (7 with a
+gap page) and 9,190 are clip dictionaries. The other 25,328 roots have some other value at `+0x70` and are not clip
+dictionaries; 15 roots do not join. All 59,593 animations of those dictionaries decode with every check passing, and
+all 54,352,969 type-10 chunk boundaries close. Its 14 `.motion` clips have 75 children, and all 75 name a `.clip` of a
+dictionary in `story000.rpf`. None of its 9,188 distinct dictionary hashes is a dictionary in anim.rpf, and none is
+one of the 1,902 hashes anim.rpf refers to without having them.
+
+```
+python -I tools/anim_clips.py <package>\pack\story000\story000.rpf <work>\story000-clips.json --jobs 20
+```
 
 ## Readable, compressed and still opaque
 

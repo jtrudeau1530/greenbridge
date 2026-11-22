@@ -98,7 +98,8 @@ def code_range(b: bytes):
 
 
 def one(path, out, mcpu):
-    b = open(path, "rb").read()
+    with open(path, "rb") as f:
+        b = f.read()
     start, end, how = code_range(b)
     if end is None:
         return "no s_endpgm"
@@ -134,10 +135,14 @@ def main():
     ap.add_argument("--limit", type=positive_int)
     ap.add_argument("--jobs", type=positive_int, default=max(1, (os.cpu_count() or 2) // 2))
     a = ap.parse_args()
-    if not os.path.isfile(a.src) and not os.path.isdir(a.src):
+    if os.path.isfile(a.src):
+        files = [a.src]
+    elif os.path.isdir(a.src):
+        with os.scandir(a.src) as entries:
+            files = sorted(entry.path for entry in entries
+                           if entry.name.endswith(".fssm") and entry.is_file())
+    else:
         fail(f"{a.src} is not a file or folder")
-    files = [a.src] if os.path.isfile(a.src) else sorted(
-        os.path.join(a.src, f) for f in os.listdir(a.src) if f.endswith(".fssm"))
     if not files:
         fail(f"no .fssm files in {a.src}")
     files = files[: a.limit] if a.limit else files

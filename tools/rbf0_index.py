@@ -236,7 +236,7 @@ def join_resource(rows, index, read, check_gap=True):
     j = index + 1
     while j < len(rows) and chunks < MAX_CHUNKS and len(blob) < MAX_BYTES:
         nxt = rows[j]
-        if nxt["size"] > MAX_CHUNK or nxt["head"][:4] in (MAGIC, b"PSIN"):
+        if rows[j - 1]["size"] != MAX_CHUNK or nxt["size"] > MAX_CHUNK or nxt["head"][:4] in (MAGIC, b"PSIN"):
             break
         if check_gap and nxt["offset"] > rows[j - 1]["offset"] + rows[j - 1]["stored"] + 16:
             break
@@ -502,6 +502,16 @@ def byte_count(text):
     return value
 
 
+def same_output_path(first, second):
+    """True when writing ``second`` would truncate ``first`` (same file, path or hard link)."""
+    if os.path.normcase(os.path.realpath(first)) == os.path.normcase(os.path.realpath(second)):
+        return True
+    try:
+        return os.path.samefile(first, second)
+    except OSError:
+        return False
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("source", help="an .rpf archive or a directory of carved streams")
@@ -512,8 +522,12 @@ def main():
     ap.add_argument("--all-strings", action="store_true", help="write every readable string to JSON (game data)")
     ap.add_argument("--quiet", action="store_true")
     a = ap.parse_args()
+    if same_output_path(a.source, a.out):
+        ap.error("output must not overwrite the source")
     if a.strings < 0:
         ap.exit(2, f"{ap.prog}: error: argument --strings: must be 0 or more\n")
+    if os.path.isdir(a.source) and (a.start is not None or a.limit is not None):
+        ap.error("--start and --limit apply to a single archive, not a directory")
     if os.path.isdir(a.out):
         ap.error(f"{a.out} is a folder, not a .csv or .json file")
     folder = os.path.dirname(os.path.abspath(a.out))

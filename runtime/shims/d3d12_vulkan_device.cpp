@@ -61,6 +61,7 @@ struct Format {
     bool typeless = false;  // created with MUTABLE_FORMAT so typed views can reinterpret it
     bool d24_as_float = false;  // D24_UNORM_S8_UINT stored as D32_SFLOAT_S8_UINT (no D24 on the GPU)
     bool d24 = false;           // a D24_UNORM_S8_UINT family format, native or stored as D32
+    bool r9g9b9e5_as_r32_uint = false;  // R9G9B9E5_SHAREDEXP UAV stored as mutable R32_UINT (no E5B9G9R9 storage)
 };
 
 // DXGI -> Vulkan for the formats render targets, depth buffers and common textures use. Typeless depth families
@@ -197,33 +198,49 @@ leonida::TargetView volume_rtv(leonida::ResourceId id, const D3D12_RESOURCE_DESC
 
 // The VkImage a texture description becomes, with its mip count already resolved (MipLevels != 0). Shared by
 // texture creation and GetResourceAllocationInfo, so the sizes reported are the sizes later allocated.
+// Keeps the optional VkImageFormatListCreateInfo alongside VkImageCreateInfo so info.pNext stays valid.
 // attachment_usable: the GPU can render to `format`. A UAV texture then also gets COLOR_ATTACHMENT usage, because
 // ClearUnorderedAccessView* with rectangles clears through an attachment (vkCmdClearAttachments).
-VkImageCreateInfo texture_create_info(const D3D12_RESOURCE_DESC& desc, const Format& format, bool attachment_usable) {
-    const bool volume = desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
-    const bool one_d = desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D;
+struct TextureCreateInfo {
     VkImageCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
-    info.flags = format.typeless ? VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT : 0;
-    if (volume && (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET))
-        info.flags |= VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT;
-    info.imageType = volume ? VK_IMAGE_TYPE_3D : one_d ? VK_IMAGE_TYPE_1D : VK_IMAGE_TYPE_2D;
-    info.format = format.format;
-    info.extent = {std::uint32_t(desc.Width), one_d ? 1u : desc.Height,
-                   volume ? UINT(desc.DepthOrArraySize) : 1u};
-    info.mipLevels = desc.MipLevels;
-    info.arrayLayers = volume ? 1 : desc.DepthOrArraySize;
-    info.samples = VkSampleCountFlagBits(std::max(1u, desc.SampleDesc.Count));
-    info.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-    if (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) info.usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
-    if (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) info.usage |= VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
-    if (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) {
-        info.usage |= VK_IMAGE_USAGE_STORAGE_BIT;
-        if (!volume && info.samples == VK_SAMPLE_COUNT_1_BIT && attachment_usable)
-            info.usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+    VkImageFormatListCreateInfo format_list{VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO};
+    std::array<VkFormat, 2> view_formats{};
+
+    TextureCreateInfo(const D3D12_RESOURCE_DESC& desc, const Format& format, bool attachment_usable) {
+        const bool volume = desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+        const bool one_d = desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D;
+        info.flags = format.typeless ? VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT : 0;
+        if (volume && (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET))
+            info.flags |= VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT;
+        info.imageType = volume ? VK_IMAGE_TYPE_3D : one_d ? VK_IMAGE_TYPE_1D : VK_IMAGE_TYPE_2D;
+        info.format = format.format;
+        info.extent = {std::uint32_t(desc.Width), one_d ? 1u : desc.Height,
+                       volume ? UINT(desc.DepthOrArraySize) : 1u};
+        info.mipLevels = desc.MipLevels;
+        info.arrayLayers = volume ? 1 : desc.DepthOrArraySize;
+        info.samples = VkSampleCountFlagBits(std::max(1u, desc.SampleDesc.Count));
+        info.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        if (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) info.usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+        if (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) info.usage |= VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+        if (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) {
+            info.usage |= VK_IMAGE_USAGE_STORAGE_BIT;
+            if (!volume && info.samples == VK_SAMPLE_COUNT_1_BIT && attachment_usable)
+                info.usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+        }
+        if (!(desc.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE)) info.usage |= VK_IMAGE_USAGE_SAMPLED_BIT;
+        if (format.r9g9b9e5_as_r32_uint) {
+            // R32_UINT owns storage and attachment usages; E5B9G9R9 views restrict usage to SAMPLED_BIT.
+            info.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;
+            view_formats = {VK_FORMAT_R32_UINT, VK_FORMAT_E5B9G9R9_UFLOAT_PACK32};
+            format_list.viewFormatCount = 2;
+            format_list.pViewFormats = view_formats.data();
+            info.pNext = &format_list;
+        }
     }
-    if (!(desc.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE)) info.usage |= VK_IMAGE_USAGE_SAMPLED_BIT;
-    return info;
-}
+
+    TextureCreateInfo(const TextureCreateInfo&) = delete;
+    TextureCreateInfo& operator=(const TextureCreateInfo&) = delete;
+};
 
 // What a device's children need from it, kept apart from the COM class so children can hold a plain pointer.
 struct DeviceState {
@@ -244,13 +261,21 @@ struct DeviceState {
     bool subgroups_read = false;
     PFN_vkGetPhysicalDeviceFormatProperties format_properties = nullptr;
     PFN_vkGetPhysicalDeviceImageFormatProperties image_format_properties = nullptr;
+    PFN_vkGetPhysicalDeviceImageFormatProperties2 image_format_properties2 = nullptr;
     PFN_vkGetDeviceImageMemoryRequirements image_requirements = nullptr;  // Vulkan 1.3 or VK_KHR_maintenance4
     LUID luid{};       // VkPhysicalDeviceIDProperties::deviceLUID; zero when the driver reports none
     QueueClock clock;  // what every queue's GetClockCalibration uses
     PFN_vkGetPhysicalDeviceFormatProperties2 format_properties2 = nullptr;
+    // True when VK_FORMAT_E5B9G9R9_UFLOAT_PACK32 lacks native STORAGE_IMAGE but mutable R32_UINT+{R32_UINT,E5B9G9R9}
+    // is supported, so R9G9B9E5_SHAREDEXP UAV textures are backed by R32_UINT with separate storage/sampled views.
+    bool r9g9b9e5_uav_emulated = false;
 
     // Cached physical-device no-attachment sample counts for D3D12_OPTIONS19.
     UINT no_output_sample_counts = 0;
+    float max_sampler_lod_bias = 0;
+    // VkPhysicalDeviceDepthStencilResolveProperties: the modes a depth or stencil ResolveSubresourceRegion can use.
+    VkResolveModeFlags depth_resolve_modes = 0;
+    VkResolveModeFlags stencil_resolve_modes = 0;
 
     // VK_EXT_host_image_copy; null unless the device enabled it and its copies accept GENERAL.
     PFN_vkCopyMemoryToImageEXT copy_memory_to_image = nullptr;
@@ -271,14 +296,61 @@ struct DeviceState {
     bool color_attachment_usable(VkFormat format) const {
         VkFormatProperties properties{};
         format_properties(info.physical, format, &properties);
-        return properties.optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT;
+        return (properties.optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT) != 0;
     }
 
-    // The limits apply to this exact combination of format, type, tiling, usage and create flags.
+    bool storage_usable(VkFormat format) const {
+        VkFormatProperties properties{};
+        format_properties(info.physical, format, &properties);
+        return (properties.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) != 0;
+    }
+
+    bool sampled_usable(VkFormat format) const {
+        VkFormatProperties properties{};
+        format_properties(info.physical, format, &properties);
+        return (properties.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT) != 0;
+    }
+
+    // Whether the GPU needs and supports backing R9G9B9E5_SHAREDEXP UAV textures with a mutable R32_UINT image.
+    bool probe_r9g9b9e5_uav_emulation() const {
+        if (storage_usable(VK_FORMAT_E5B9G9R9_UFLOAT_PACK32)) return false;
+        if (!image_format_properties2 || !storage_usable(VK_FORMAT_R32_UINT) ||
+            !sampled_usable(VK_FORMAT_E5B9G9R9_UFLOAT_PACK32))
+            return false;
+        constexpr VkFormat view_formats[2] = {VK_FORMAT_R32_UINT, VK_FORMAT_E5B9G9R9_UFLOAT_PACK32};
+        VkImageFormatListCreateInfo list{VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO};
+        list.viewFormatCount = 2;
+        list.pViewFormats = view_formats;
+        VkPhysicalDeviceImageFormatInfo2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2, &list};
+        query.format = VK_FORMAT_R32_UINT;
+        query.type = VK_IMAGE_TYPE_2D;
+        query.tiling = VK_IMAGE_TILING_OPTIMAL;
+        query.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                      VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+        query.flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;
+        VkImageFormatProperties2 props{VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2};
+        return image_format_properties2(info.physical, &query, &props) == VK_SUCCESS;
+    }
+
+    // The limits apply to this exact combination of format, type, tiling, usage, create flags and pNext format list.
     HRESULT check_image_support(const VkImageCreateInfo& create) const {
         VkImageFormatProperties limits{};
-        const VkResult result = image_format_properties(info.physical, create.format, create.imageType, create.tiling,
-                                                        create.usage, create.flags, &limits);
+        VkResult result = VK_ERROR_FORMAT_NOT_SUPPORTED;
+        if (image_format_properties2) {
+            VkPhysicalDeviceImageFormatInfo2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2};
+            query.pNext = create.pNext;
+            query.format = create.format;
+            query.type = create.imageType;
+            query.tiling = create.tiling;
+            query.usage = create.usage;
+            query.flags = create.flags;
+            VkImageFormatProperties2 props{VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2};
+            result = image_format_properties2(info.physical, &query, &props);
+            limits = props.imageFormatProperties;
+        } else {
+            result = image_format_properties(info.physical, create.format, create.imageType, create.tiling,
+                                             create.usage, create.flags, &limits);
+        }
         if (result == VK_ERROR_FORMAT_NOT_SUPPORTED) return E_INVALIDARG;
         if (result == VK_ERROR_OUT_OF_HOST_MEMORY || result == VK_ERROR_OUT_OF_DEVICE_MEMORY) return E_OUTOFMEMORY;
         if (result != VK_SUCCESS) return E_FAIL;
@@ -313,6 +385,15 @@ struct DeviceState {
         subgroups.lane_min = size_control.minSubgroupSize ? size_control.minSubgroupSize : subgroup.subgroupSize;
         subgroups.lane_max = size_control.maxSubgroupSize ? size_control.maxSubgroupSize : subgroups.lane_min;
         if (subgroups.lane_max < subgroups.lane_min) subgroups.lane_max = subgroups.lane_min;
+        // D3D-121: Intel's D3D12 driver answers a fixed 16..16 on its integrated GPUs, where Vulkan reports the
+        // compiler's whole 8..32 choice. Measured on Xe-LP: UHD 770 (32.0.101.6129) and Raptor Lake-S Mobile
+        // (101.7092). Discrete Arc is not measured yet (TEST-57), so it keeps the Vulkan range.
+        constexpr uint32_t kIntelVendorId = 0x8086;
+        constexpr UINT kIntelD3D12Lanes = 16;
+        if (properties.properties.vendorID == kIntelVendorId &&
+            properties.properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU &&
+            subgroups.lane_min <= kIntelD3D12Lanes && kIntelD3D12Lanes <= subgroups.lane_max)
+            subgroups.lane_min = subgroups.lane_max = kIntelD3D12Lanes;
         return subgroups;
     }
 
@@ -329,7 +410,7 @@ struct DeviceState {
         return VK_SAMPLE_COUNT_1_BIT;
     }
 
-    // The format a texture description is created with, D24S8's fallback included.
+    // The format a texture description is created with, D24S8 and R9G9B9E5 UAV fallbacks included.
     Format texture_format(const D3D12_RESOURCE_DESC& desc) const {
         if (!xr_bias_compatible(desc)) return {};
         if (desc.Format == DXGI_FORMAT_A8_UNORM &&
@@ -337,7 +418,16 @@ struct DeviceState {
              (desc.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL |
                             D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))))
             return {};
-        if (!xr_bias_compatible(desc)) return {};
+        if (desc.Format == DXGI_FORMAT_R9G9B9E5_SHAREDEXP) {
+            if (desc.SampleDesc.Count != 1 ||
+                (desc.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL |
+                               D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE)))
+                return {};
+            if ((desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) && r9g9b9e5_uav_emulated) {
+                log_once("R9G9B9E5_SHAREDEXP UAV unavailable natively, using mutable R32_UINT; format", desc.Format);
+                return {VK_FORMAT_R32_UINT, VK_IMAGE_ASPECT_COLOR_BIT, false, false, false, true};
+            }
+        }
         Format format = texture_storage_format(desc.Format, desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL);
         format.d24 = format.format == VK_FORMAT_D24_UNORM_S8_UINT;  // native or not: clears are quantised
         if (format.format == VK_FORMAT_D24_UNORM_S8_UINT && !depth_usable(format.format)) {
@@ -416,16 +506,19 @@ struct DeviceState {
     }
 
     void release(const ImageEntry& entry) {  // descriptor_mutex held
-        bindless->remove_image(entry.dimension, entry.index);
-        context->vk.vkDestroyImageView(info.device, entry.sampled, nullptr);
-        if (entry.storage) context->vk.vkDestroyImageView(info.device, entry.storage, nullptr);
+        const std::uint64_t slot_handle =
+            (static_cast<std::uint64_t>(entry.dimension) << 32) | static_cast<std::uint64_t>(entry.index);
+        context->defer_destroy(leonida::DeferredDeletionQueue::Kind::bindless_slot, slot_handle);
+        context->defer_destroy(leonida::DeferredDeletionQueue::Kind::image_view, entry.sampled);
+        if (entry.storage) context->defer_destroy(leonida::DeferredDeletionQueue::Kind::image_view, entry.storage);
     }
 
     // Gives the T# `words` a view in set 0 and an entry in the hash table, unless it has them. `storage`: shaders
     // write through it too (an unordered-access view), so it also goes into the storage arrays, which are
     // shorter. False when set 0 cannot show the image; the descriptor then finds the fallback at index 0.
     bool bind_image(const leonida::gfx10::ImageWords& words, const leonida::gfx10::Image& image, VkImage vk_image,
-                    VkFormat image_format, VkImageAspectFlags aspects, bool storage) {
+                    VkFormat image_format, VkImageAspectFlags aspects, bool storage,
+                    bool r9g9b9e5_as_r32_uint = false) {
         namespace g = leonida::gfx10;
         std::lock_guard lock(descriptor_mutex);
         if (!bindless) return false;
@@ -449,7 +542,8 @@ struct DeviceState {
         // views it in the image's own format with the stencil aspect, and returns the value in R, as a T# whose
         // format is 8_UINT reads it from X.
         const bool stencil = (aspects & VK_IMAGE_ASPECT_STENCIL_BIT) && image.format == g::stencil_format;
-        const VkFormat view_format = stencil ? image_format : g::vulkan_view_format(image_format, image.format);
+        const VkFormat logical_format = r9g9b9e5_as_r32_uint ? VK_FORMAT_E5B9G9R9_UFLOAT_PACK32 : image_format;
+        const VkFormat view_format = stencil ? image_format : g::vulkan_view_format(logical_format, image.format);
         if (view_format == VK_FORMAT_UNDEFINED) {
             log_once("no Vulkan view format for the GFX10 format of a view:", int(image.format));
             return false;
@@ -464,9 +558,14 @@ struct DeviceState {
         view_info.image = vk_image;
         view_info.viewType = g::vulkan_view_type(image.type);
         view_info.format = view_format;
+        VkImageViewUsageCreateInfo sampled_usage{VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO};
+        if (r9g9b9e5_as_r32_uint) {
+            sampled_usage.usage = VK_IMAGE_USAGE_SAMPLED_BIT;
+            view_info.pNext = &sampled_usage;
+        }
         auto swizzle = image.swizzle;
         VkImageViewMinLodCreateInfoEXT clamp{VK_STRUCTURE_TYPE_IMAGE_VIEW_MIN_LOD_CREATE_INFO_EXT};
-        const bool color_2d = (image.type == g::ImageType::image_2d || image.type == g::ImageType::image_2d_array) &&
+        const bool color_2d = (image.type == g::ImageType::image_2d || image.type == g::ImageType::image_2d_array || image.type == g::ImageType::cube) &&
                               (aspects & VK_IMAGE_ASPECT_COLOR_BIT);
         if (!storage && color_2d) {
             // Use the clamp in the T# itself: views with identical keys must sample identically.
@@ -480,6 +579,7 @@ struct DeviceState {
                     log_once("2D SRV requires VK_EXT_image_view_min_lod; first mip", int(image.first_mip));
                     return false;
                 }
+                clamp.pNext = view_info.pNext;
                 view_info.pNext = &clamp;
             }
         }
@@ -494,14 +594,22 @@ struct DeviceState {
         if (vk.vkCreateImageView(info.device, &view_info, nullptr, &entry.sampled) != VK_SUCCESS) return false;
         leonida::StorageViews views{};
         if (storage) {
-            view_info.components = {};
-            if (vk.vkCreateImageView(info.device, &view_info, nullptr, &entry.storage) != VK_SUCCESS) {
+            VkImageViewCreateInfo storage_info = view_info;
+            storage_info.components = {};
+            VkImageViewUsageCreateInfo storage_usage{VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO};
+            const VkFormat storage_format = r9g9b9e5_as_r32_uint ? VK_FORMAT_R32_UINT : view_format;
+            if (r9g9b9e5_as_r32_uint) {
+                storage_info.format = storage_format;
+                storage_usage.usage = VK_IMAGE_USAGE_STORAGE_BIT;
+                storage_info.pNext = &storage_usage;
+            }
+            if (vk.vkCreateImageView(info.device, &storage_info, nullptr, &entry.storage) != VK_SUCCESS) {
                 vk.vkDestroyImageView(info.device, entry.sampled, nullptr);
                 return false;
             }
-            const int numeric = numeric_class(view_format);
+            const int numeric = numeric_class(storage_format);
             (numeric == 1 ? views.as_uint : numeric == 2 ? views.as_sint : views.as_float) = entry.storage;
-            if (view_format == VK_FORMAT_R32_UINT) views.r32ui = entry.storage;
+            if (storage_format == VK_FORMAT_R32_UINT) views.r32ui = entry.storage;
         }
         // Every state a shader can read or write the texture in is GENERAL (ResourceBinding::sampled_in_general).
         entry.index = bindless->add_image(dimension, entry.sampled, VK_IMAGE_LAYOUT_GENERAL, views, sampled_class);
@@ -549,7 +657,7 @@ struct DeviceState {
         const leonida::DescriptorKey key = leonida::make_ssharp_key(words.data());
         if (sampler_entries.count(key)) return true;
         const g::Sampler sampler = g::decode(words);
-        VkSamplerCreateInfo sampler_info = g::vulkan_sampler(sampler);
+        VkSamplerCreateInfo sampler_info = g::vulkan_sampler(sampler, max_sampler_lod_bias);
         // What vulkan_sampler leaves to its caller, and features this device may not have enabled.
         if (sampler_info.anisotropyEnable && !info.sampler_anisotropy) {
             log_once("anisotropic sampler without samplerAnisotropy; anisotropy", int(sampler.max_anisotropy));
@@ -657,18 +765,16 @@ public:
         : device_(device), desc_(desc), heap_(heap), heap_flags_(heap_flags) {}
 
     ~Resource() override {
-        auto& vk = device_.context->vk;
-        const VkDevice dev = device_.info.device;
         if (accel_) {
             device_.context->unregister_acceleration_structure(gpu_va_);
             if (buffer_va_ && buffer_va_ != gpu_va_) device_.context->unregister_acceleration_structure(buffer_va_);
-            if (vk.vkDestroyAccelerationStructureKHR) vk.vkDestroyAccelerationStructureKHR(dev, accel_, nullptr);
+            device_.context->defer_destroy(leonida::DeferredDeletionQueue::Kind::acceleration_structure, accel_);
         }
         if (image_address_) device_.forget_image(image_address_);
         device_.context->remove_resource(id());
-        if (image_) vk.vkDestroyImage(dev, image_, nullptr);
-        if (buffer_) vk.vkDestroyBuffer(dev, buffer_, nullptr);
-        if (memory_) vk.vkFreeMemory(dev, memory_, nullptr);
+        if (image_) device_.context->defer_destroy(leonida::DeferredDeletionQueue::Kind::image, image_);
+        if (buffer_) device_.context->defer_destroy(leonida::DeferredDeletionQueue::Kind::buffer, buffer_);
+        if (memory_) device_.context->defer_destroy(leonida::DeferredDeletionQueue::Kind::device_memory, memory_);
     }
 
     leonida::ResourceId id() const { return resource_id(this); }
@@ -676,9 +782,11 @@ public:
     VkBuffer buffer() const { return buffer_; }
     const D3D12_RESOURCE_DESC& desc() const { return desc_; }
     VkFormat format() const { return format_; }                  // of the image
+    bool r9g9b9e5_as_r32_uint() const { return r9g9b9e5_as_r32_uint_; }
     VkImageAspectFlags aspects() const { return aspects_; }
     std::uint64_t image_address() const { return image_address_; }  // what a T# names the texture by
     VkMemoryPropertyFlags memory_flags() const { return memory_flags_; }  // of the memory type behind it
+    const DeviceState& device_state() const { return device_; }
 
     HRESULT create_buffer(D3D12_RESOURCE_STATES initial_state = D3D12_RESOURCE_STATE_COMMON) {
         auto& vk = device_.context->vk;
@@ -746,6 +854,9 @@ public:
         leonida::ResourceBinding binding{};  // a buffer: no image
         binding.buffer = buffer_;
         binding.size = desc_.Width;
+        binding.host_readable = (heap_.Type == D3D12_HEAP_TYPE_READBACK ||
+                                 (heap_.Type == D3D12_HEAP_TYPE_CUSTOM &&
+                                  heap_.CPUPageProperty == D3D12_CPU_PAGE_PROPERTY_WRITE_BACK));
         device_.context->add_resource(id(), binding);
         return S_OK;
     }
@@ -756,8 +867,8 @@ public:
         const UINT depth = volume ? desc_.DepthOrArraySize : 1;
         const bool one_d = desc_.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D;
         if (desc_.MipLevels == 0) desc_.MipLevels = full_mips(desc_.Width, desc_.Height, depth);
-        VkImageCreateInfo info =
-            texture_create_info(desc_, format, device_.color_attachment_usable(format.format));
+        TextureCreateInfo create(desc_, format, device_.color_attachment_usable(format.format));
+        VkImageCreateInfo& info = create.info;
         const std::uint32_t samples = info.samples;
         // Textures the CPU reads and writes (WriteToSubresource/ReadFromSubresource) copy on the host when they can.
         // (A D24 texture stored as D32 goes through the staged copy: the host copy would not convert.)
@@ -797,6 +908,7 @@ public:
         // With the bindless set, a view's descriptor has one layout for as long as it lives (bind_image).
         binding.sampled_in_general = device_.bindless != nullptr;
         format_ = format.format;
+        r9g9b9e5_as_r32_uint_ = format.r9g9b9e5_as_r32_uint;
         aspects_ = format.aspects;
         image_address_ = device_.next_image_address.fetch_add(256);
         binding_ = binding;
@@ -1110,6 +1222,7 @@ private:
     VkAccelerationStructureKHR accel_ = VK_NULL_HANDLE;
     void* mapped_ = nullptr;
     VkFormat format_ = VK_FORMAT_UNDEFINED;
+    bool r9g9b9e5_as_r32_uint_ = false;
     VkImageAspectFlags aspects_ = 0;
     std::uint64_t image_address_ = 0;
     std::uint64_t buffer_va_ = 0;
@@ -1181,7 +1294,9 @@ bool image_descriptor(const Resource& resource, const TextureView& view, leonida
             return false;
         }
     }
-    VkFormat named = resource.format();
+    const VkFormat resource_format =
+        resource.r9g9b9e5_as_r32_uint() ? VK_FORMAT_E5B9G9R9_UFLOAT_PACK32 : resource.format();
+    VkFormat named = resource_format;
     if (volume) {
         const bool compatible = vulkan_format(desc.Format, false).typeless
             ? desc.Format == DXGI_FORMAT_R8G8B8A8_TYPELESS &&
@@ -1208,11 +1323,15 @@ bool image_descriptor(const Resource& resource, const TextureView& view, leonida
             log_once("incompatible typed A8 view format:", int(view.format));
             return false;
         }
+        if ((view.format == DXGI_FORMAT_R9G9B9E5_SHAREDEXP) != (desc.Format == DXGI_FORMAT_R9G9B9E5_SHAREDEXP)) {
+            log_once("incompatible R9G9B9E5 view format:", int(view.format));
+            return false;
+        }
         named = texture_storage_format(view.format, false).format;
     }
     const std::uint32_t code = stencil ? g::stencil_format : g::format_from_vulkan(named);
     const VkFormat view_format = stencil ? resource.format()
-                                 : code  ? g::vulkan_view_format(resource.format(), code)
+                                 : code  ? g::vulkan_view_format(resource_format, code)
                                          : VK_FORMAT_UNDEFINED;
     if (view_format == VK_FORMAT_UNDEFINED) {
         log_once("view format not supported for this texture:", int(view.format));
@@ -1414,6 +1533,12 @@ public:
             info.get_instance_proc(info.instance, "vkGetPhysicalDeviceFormatProperties"));
         state_.image_format_properties = reinterpret_cast<PFN_vkGetPhysicalDeviceImageFormatProperties>(
             info.get_instance_proc(info.instance, "vkGetPhysicalDeviceImageFormatProperties"));
+        state_.image_format_properties2 = reinterpret_cast<PFN_vkGetPhysicalDeviceImageFormatProperties2>(
+            info.get_instance_proc(info.instance, "vkGetPhysicalDeviceImageFormatProperties2"));
+        if (!state_.image_format_properties2) {
+            state_.image_format_properties2 = reinterpret_cast<PFN_vkGetPhysicalDeviceImageFormatProperties2>(
+                info.get_instance_proc(info.instance, "vkGetPhysicalDeviceImageFormatProperties2KHR"));
+        }
         const auto memory_properties = reinterpret_cast<PFN_vkGetPhysicalDeviceMemoryProperties>(
             info.get_instance_proc(info.instance, "vkGetPhysicalDeviceMemoryProperties"));
         const auto device_properties = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(
@@ -1423,6 +1548,7 @@ public:
         if (!get_device || !state_.format_properties || !state_.image_format_properties || !memory_properties ||
             !device_properties || !queue_families)
             return;
+        state_.r9g9b9e5_uav_emulated = state_.probe_r9g9b9e5_uav_emulation();
         memory_properties(info.physical, &state_.memory);
         {
             char text[4] = {};
@@ -1459,31 +1585,62 @@ public:
                 state_.no_output_sample_counts =
                     static_cast<UINT>(props.limits.framebufferNoAttachmentsSampleCounts & kD3D12SampleCounts);
             }
+            if (const auto get_props2 = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties2>(
+                    info.get_instance_proc(info.instance, "vkGetPhysicalDeviceProperties2"))) {
+                VkPhysicalDeviceDepthStencilResolveProperties resolve{
+                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_STENCIL_RESOLVE_PROPERTIES};
+                VkPhysicalDeviceProperties2 props{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &resolve};
+                get_props2(info.physical, &props);
+                state_.depth_resolve_modes = resolve.supportedDepthResolveModes;
+                state_.stencil_resolve_modes = resolve.supportedStencilResolveModes;
+            }
         }
 
         state_.context = std::make_unique<leonida::VulkanContext>(get_device, info.device,
                                                                   info.separate_depth_stencil_layouts,
                                                                   info.conditional_rendering, info.ray_tracing);
-        if (info.host_image_copy) load_host_image_copy(get_device);
-        // The copies of a D24 texture stored as D32 convert on the GPU (vulkan_depth24.h).
-        std::uint64_t max_storage_range = 1u << 27;  // the least Vulkan allows, if the limit cannot be read
-        if (info.physical && info.get_instance_proc) {
-            if (const auto get_props = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(
-                    info.get_instance_proc(info.instance, "vkGetPhysicalDeviceProperties"))) {
-                VkPhysicalDeviceProperties props{};
-                get_props(info.physical, &props);
-                max_storage_range = props.limits.maxStorageBufferRange;
+        if (info.conditional_rendering) {
+            const auto properties = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(
+                info.get_instance_proc(info.instance, "vkGetPhysicalDeviceProperties"));
+            const auto families = reinterpret_cast<PFN_vkGetPhysicalDeviceQueueFamilyProperties>(
+                info.get_instance_proc(info.instance, "vkGetPhysicalDeviceQueueFamilyProperties"));
+            if (properties && families) {
+                VkPhysicalDeviceProperties limits{};
+                properties(info.physical, &limits);
+                std::uint32_t count = 0;
+                families(info.physical, &count, nullptr);
+                std::vector<VkQueueFamilyProperties> queues(count);
+                families(info.physical, &count, queues.data());
+                if (info.queue_family < count && (queues[info.queue_family].queueFlags & VK_QUEUE_COMPUTE_BIT)) {
+                    state_.context->configure_predication(get_device, state_.memory, limits.limits.maxStorageBufferRange, info.queue_family);
+                    if (info.storage_buffer_8bit) state_.context->configure_predicated_copy(get_device, limits.limits);
+                }
             }
         }
-        state_.context->enable_depth24(get_device, [this](const VkMemoryRequirements& requirements) {
-            return state_.allocate(requirements, 0, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-        }, max_storage_range);
+        if (info.host_image_copy) load_host_image_copy(get_device);
+        // The copies of a D24 texture stored as D32 convert on the GPU (vulkan_depth24.h).
+        // Only enable the converter when the GPU lacks native D24_UNORM_S8_UINT support.
+        if (!state_.depth_usable(VK_FORMAT_D24_UNORM_S8_UINT)) {
+            std::uint64_t max_storage_range = 1u << 27;  // the least Vulkan allows, if the limit cannot be read
+            if (info.physical && info.get_instance_proc) {
+                if (const auto get_props = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(
+                        info.get_instance_proc(info.instance, "vkGetPhysicalDeviceProperties"))) {
+                    VkPhysicalDeviceProperties props{};
+                    get_props(info.physical, &props);
+                    max_storage_range = props.limits.maxStorageBufferRange;
+                }
+            }
+            state_.context->enable_depth24(get_device, [this](const VkMemoryRequirements& requirements) {
+                return state_.allocate(requirements, 0, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+            }, max_storage_range);
+        }
         if (info.bindless && state_.context->loaded() && !create_bindless(get_device))
             std::fprintf(stderr, "[rt] d3d12: the bindless set 0 could not be created\n");
         query_luid_and_clock(get_device);
         // Timestamps: what the one VkQueue every D3D12 queue submits to can write.
         VkPhysicalDeviceProperties properties{};
         device_properties(info.physical, &properties);
+        state_.max_sampler_lod_bias = properties.limits.maxSamplerLodBias;
         std::uint32_t family_count = 0;
         queue_families(info.physical, &family_count, nullptr);
         std::vector<VkQueueFamilyProperties> families(family_count);
@@ -1493,7 +1650,7 @@ public:
             if (family.timestampValidBits)
                 state_.context->set_timestamp_period(properties.limits.timestampPeriod);
             if (family.queueFlags & VK_QUEUE_COMPUTE_BIT)
-                state_.context->set_binary_occlusion_memory(state_.memory);
+                state_.context->set_occlusion_resolve_memory(state_.memory);
         }
 
         if (info.debug_utils) {
@@ -1523,17 +1680,36 @@ public:
             state_.info.get_instance_proc(state_.info.instance, "vkGetPhysicalDeviceProperties2"));
         if (get_properties) {
             VkPhysicalDeviceVulkan12Properties indexed{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_PROPERTIES};
-            VkPhysicalDeviceProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &indexed};
+            VkPhysicalDeviceVulkan11Properties v11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_PROPERTIES, &indexed};
+            VkPhysicalDeviceProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &v11};
             get_properties(state_.info.physical, &properties);
             features.ms_samples = {VK_SAMPLE_COUNT_4_BIT, state_.ms_fallback_samples(VK_FORMAT_R32_UINT),
                                    state_.ms_fallback_samples(VK_FORMAT_R32_SINT)};
-            leonida::bindless::limit_ms_bindings(features, properties.properties.limits, indexed);
+            if (!leonida::bindless::size_bindings(features, properties.properties.limits, v11, indexed))
+                std::fprintf(stderr, "[rt] d3d12: the device's descriptor limits are below the bindless set's default "
+                                     "sizes; it holds less\n");
         }
+        namespace b = leonida::bindless;
+        std::fprintf(stderr, "[rt] d3d12: bindless set: %u 2D images, %u samplers, %u 2D-array, %u 3D, %u 1D, "
+                             "%u storage indices in 2D\n",
+                     features.counts[b::sampled_binding(leonida::ImageDimension::dim_2d)],
+                     features.counts[b::sampler_binding],
+                     features.counts[b::sampled_binding(leonida::ImageDimension::dim_2d_array)],
+                     features.counts[b::sampled_binding(leonida::ImageDimension::dim_3d)],
+                     features.counts[b::sampled_binding(leonida::ImageDimension::dim_1d)],
+                     features.counts[b::storage_binding(leonida::ImageDimension::dim_2d, 0)]);
         state_.bindless = std::make_unique<leonida::BindlessSet>(get_device, state_.info.device, state_.memory, features);
         if (!state_.bindless->ok() || !state_.context->vk.vkCreateSampler) {
             state_.bindless.reset();
             return false;
         }
+        state_.context->set_bindless_release(
+            [](void* user, std::uint32_t dim, std::uint32_t idx) {
+                auto* st = static_cast<DeviceState*>(user);
+                std::lock_guard lock(st->descriptor_mutex);
+                if (st->bindless) st->bindless->remove_image(static_cast<leonida::ImageDimension>(dim), idx);
+            },
+            &state_);
         state_.context->set_bindless_prepare([this](VkCommandBuffer command_buffer) {
             std::lock_guard lock(state_.descriptor_mutex);
             if (!state_.bindless->fallbacks_ready()) state_.bindless->record_fallback_init(command_buffer);
@@ -1557,8 +1733,12 @@ public:
 
     ~Device() override {
         if (state_.context) {
-            std::lock_guard lock(state_.context->submit_mutex());
-            state_.context->vk.vkDeviceWaitIdle(state_.info.device);
+            {
+                std::lock_guard lock(state_.context->submit_mutex());
+                state_.context->vk.vkDeviceWaitIdle(state_.info.device);
+            }
+            state_.context->drain_deleted_resources(UINT64_MAX);
+            state_.context->set_bindless_release(nullptr, nullptr);
         }
         state_.staging_queue.reset();  // it uses the context
         if (state_.context && state_.bindless) {
@@ -1579,6 +1759,7 @@ public:
     bool upload_in_vram() const { return state_.upload_in_vram; }
     leonida::VulkanContext& context() { return *state_.context; }
     const leonida::BindlessSet* bindless() const { return state_.bindless.get(); }
+    bool bind_sampler(const leonida::gfx10::SamplerWords& words) { return state_.bind_sampler(words); }
     void own(const OwnedRuntime& owned) { owned_ = owned; }
     void set_outer(IUnknown* outer) { outer_ = outer; }
 
@@ -1630,7 +1811,9 @@ public:
                                                                 HANDLE event) override {
         return set_event_on_multiple_fence_completion(*state_.context, fences, values, count, flags, event);
     }
-    HRESULT STDMETHODCALLTYPE GetDeviceRemovedReason() override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE GetDeviceRemovedReason() override {
+        return (state_.context && state_.context->is_device_lost()) ? DXGI_ERROR_DEVICE_REMOVED : S_OK;
+    }
 
     // Residency and power (D3D-33, docs/d3d12_vulkan.md section 4.1). Vulkan has no residency API: memory from
     // vkAllocateMemory stays usable by the device until vkFreeMemory, and paging under pressure is the kernel
@@ -1840,7 +2023,7 @@ public:
 
     HRESULT STDMETHODCALLTYPE CreateQueryHeap(const D3D12_QUERY_HEAP_DESC* desc, REFIID riid, void** out) override {
         if (out) *out = nullptr;
-        if (!desc || !desc->Count) return E_INVALIDARG;
+        if (!desc || !desc->Count || desc->NodeMask > 1) return E_INVALIDARG;  // one node
         auto* heap = new QueryHeap(state_);
         heap->attach_device(identity());
         if (const HRESULT hr = heap->create(*desc); FAILED(hr)) {
@@ -1893,7 +2076,9 @@ public:
             const bool typeless_rgba8 = rd.Format == DXGI_FORMAT_R8G8B8A8_TYPELESS;
             const bool typed_rgba8 = rd.Format == DXGI_FORMAT_R8G8B8A8_UNORM ||
                 rd.Format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB || rd.Format == DXGI_FORMAT_R8G8B8A8_UINT;
-            if (rd.Format == DXGI_FORMAT_A8_UNORM || (desc && desc->Format == DXGI_FORMAT_A8_UNORM)) {
+            if (rd.Format == DXGI_FORMAT_A8_UNORM || (desc && desc->Format == DXGI_FORMAT_A8_UNORM) ||
+                rd.Format == DXGI_FORMAT_R9G9B9E5_SHAREDEXP ||
+                (desc && desc->Format == DXGI_FORMAT_R9G9B9E5_SHAREDEXP)) {
                 view = {};
             } else if (typeless_rgba8 || typed_rgba8) {
                 const DXGI_FORMAT requested = desc && desc->Format != DXGI_FORMAT_UNKNOWN ? desc->Format : rd.Format;
@@ -2865,6 +3050,15 @@ public:
                     s2 |= D3D12_FORMAT_SUPPORT2_UAV_TYPED_LOAD;
                 }
             }
+            if (fs->Format == DXGI_FORMAT_R9G9B9E5_SHAREDEXP && state_.r9g9b9e5_uav_emulated) {
+                s1 |= D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW;
+                s2 |= D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE;
+                VkFormatProperties r32{};
+                state_.format_properties(state_.info.physical, VK_FORMAT_R32_UINT, &r32);
+                if (r32.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_ATOMIC_BIT) {
+                    s2 |= D3D12_FORMAT_SUPPORT2_UAV_TYPED_LOAD;
+                }
+            }
             fs->Support1 = s1;
             fs->Support2 = s2;
             return d3d12_trace::result(method, S_OK);
@@ -2942,13 +3136,18 @@ private:
 
     static constexpr D3D12_RESOURCE_ALLOCATION_INFO kInvalidAllocation{UINT64_MAX,
                                                                        D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT};
-    static UINT64 align_up(UINT64 value, UINT64 to) { return (value + to - 1) / to * to; }
+    // Saturates at the last multiple of `to` instead of wrapping, as the PC runtime's totals do.
+    static UINT64 align_up(UINT64 value, UINT64 to) {
+        return value > UINT64_MAX - (to - 1) ? UINT64_MAX / to * to : (value + to - 1) / to * to;
+    }
 
-    // Lays `count` resources out one after another; `each` (optional) gets every resource's offset, size and alignment.
+    // Lays `count` resources out one after another; `each` (optional) gets every resource's offset, size and
+    // alignment. As on the PC runtime, the total is rounded up to the largest alignment (1 for no resources) and
+    // saturates near 2^64 rather than wrapping.
     template<class Desc, class Get>
     D3D12_RESOURCE_ALLOCATION_INFO place(UINT count, const Desc* descs, Get get,
                                          D3D12_RESOURCE_ALLOCATION_INFO1* each) {
-        D3D12_RESOURCE_ALLOCATION_INFO total{0, 0};
+        D3D12_RESOURCE_ALLOCATION_INFO total{0, 1};
         bool failed = count && !descs;
         for (UINT i = 0; i < count; ++i) {
             const D3D12_RESOURCE_ALLOCATION_INFO one = failed ? kInvalidAllocation : allocation(get(i));
@@ -2959,9 +3158,11 @@ private:
             }
             const UINT64 offset = align_up(total.SizeInBytes, one.Alignment);
             if (each) each[i] = {offset, one.Alignment, one.SizeInBytes};
-            total = {offset + one.SizeInBytes, std::max(total.Alignment, one.Alignment)};
+            total = {one.SizeInBytes > UINT64_MAX - offset ? UINT64_MAX : offset + one.SizeInBytes,
+                     std::max(total.Alignment, one.Alignment)};
         }
-        return failed ? kInvalidAllocation : total;
+        return failed ? kInvalidAllocation
+                      : D3D12_RESOURCE_ALLOCATION_INFO{align_up(total.SizeInBytes, total.Alignment), total.Alignment};
     }
 
     // One resource's size and alignment, or kInvalidAllocation for a description D3D12 (or this device) rejects.
@@ -3005,6 +3206,11 @@ private:
         if (samples > 1 && (volume || one_d || resolved.MipLevels != 1 ||
                             (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)))
             return kInvalidAllocation;
+        // The PC runtime: simultaneous access only single-sampled and without depth-stencil, and no volume depth.
+        const bool depth_stencil = desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+        if (((desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS) && (depth_stencil || samples > 1)) ||
+            (volume && depth_stencil))
+            return kInvalidAllocation;
         if (desc.Layout != D3D12_TEXTURE_LAYOUT_UNKNOWN)
             log_once("GetResourceAllocationInfo layout as UNKNOWN:", desc.Layout);
 
@@ -3014,13 +3220,14 @@ private:
             return kInvalidAllocation;
         }
         VkMemoryRequirements need{};
-        const VkImageCreateInfo image = texture_create_info(resolved, format, state_.color_attachment_usable(format.format));
-        if (!state_.memory_requirements(image, need)) return kInvalidAllocation;
+        const TextureCreateInfo create(resolved, format, state_.color_attachment_usable(format.format));
+        if (!state_.memory_requirements(create.info, need)) return kInvalidAllocation;
 
         // D3D12's alignment: 64 KiB, or 4 MiB with MSAA, unless the description asks for a small one (4 KiB, 64 KiB
-        // with MSAA). 4 KiB needs the resource to fit in 64 KiB and not be a render target or depth buffer; if it
-        // doesn't qualify, the PC runtime calls the description invalid rather than answering with 64 KiB. The MSAA
-        // 64 KiB alignment has no size limit there. Both measured in d3d12_vulkan_device_test.
+        // with MSAA). 4 KiB needs the top mip of one array slice to fit in 16 tiles of 4 KiB and the resource not to
+        // be a render target or depth buffer; mips and array slices don't count. If it doesn't qualify, the PC
+        // runtime calls the description invalid rather than answering with 64 KiB. The MSAA 64 KiB alignment has no
+        // size limit there. Both measured in d3d12_vulkan_device_test.
         UINT64 alignment = 0;
         if (samples > 1) {
             if (desc.Alignment && desc.Alignment != align_msaa_64k && desc.Alignment != align_msaa_4m)
@@ -3028,11 +3235,28 @@ private:
             alignment = desc.Alignment ? desc.Alignment : align_msaa_4m;
         } else {
             if (desc.Alignment && desc.Alignment != align_4k && desc.Alignment != align_64k) return kInvalidAllocation;
-            if (desc.Alignment == align_4k && ((desc.Flags & attachment) || need.size > align_64k))
+            if (desc.Alignment == align_4k && ((desc.Flags & attachment) || !small_tiles_fit(desc, format, need.size)))
                 return kInvalidAllocation;
             alignment = desc.Alignment ? desc.Alignment : align_64k;
         }
         return {align_up(need.size, alignment), alignment};
+    }
+
+    // Whether 16 tiles of 4 KiB (leonida::small_tile_shape; 4096 bytes of a row for 1D) cover the top mip of one
+    // array slice, the PC runtime's test for D3D12_SMALL_RESOURCE_PLACEMENT_ALIGNMENT.
+    static bool small_tiles_fit(const D3D12_RESOURCE_DESC& desc, const Format& format, VkDeviceSize vulkan_size) {
+        const leonida::BlockFormat block = leonida::block_format(format.format, VK_IMAGE_ASPECT_COLOR_BIT);
+        const bool volume = desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+        leonida::TileShape shape = leonida::small_tile_shape(volume, block.bytes);
+        if (desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D && shape.width) shape = {4096 / block.bytes, 1, 1};
+        // shortcut: untileable element sizes (3- and 12-byte formats) keep the whole-resource 64 KiB test; measure
+        // them on the PC runtime if a game asks for one.
+        if (!shape.width) return vulkan_size <= D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
+        const auto tiles = [](UINT64 texels, UINT64 per_block, UINT64 per_tile) {
+            return ((texels + per_block - 1) / per_block + per_tile - 1) / per_tile;
+        };
+        return tiles(desc.Width, block.block, shape.width) * tiles(desc.Height, block.block, shape.height) *
+                   tiles(volume ? desc.DepthOrArraySize : 1, 1, shape.depth) <= 16;
     }
 
     // Writes the view's T# into the slot and makes sure set 0 and the hash table know it. A view that cannot be
@@ -3043,7 +3267,7 @@ private:
         if (!image_descriptor(resource, view, image)) return;
         const leonida::gfx10::ImageWords words = leonida::gfx10::encode(image);
         const bool registered = state_.bind_image(words, image, resource.image(), resource.format(),
-                                                  resource.aspects(), storage);
+                                                  resource.aspects(), storage, resource.r9g9b9e5_as_r32_uint());
         if (leonida::gfx10::multisampled(image.type) && !registered) return;
         std::memcpy(reinterpret_cast<void*>(destination.ptr), words.data(), sizeof(words));
     }
@@ -3292,6 +3516,51 @@ bool color_resolve_format_matches(DXGI_FORMAT format, ID3D12Resource* dst, ID3D1
     return matches(dst) && matches(src);
 }
 
+bool depth_stencil_resolve_supported(DXGI_FORMAT format, ID3D12Resource* dst, UINT dst_subresource, UINT x, UINT y,
+                                     ID3D12Resource* src, UINT src_subresource, const D3D12_RECT* rect,
+                                     D3D12_RESOLVE_MODE mode) {
+    const Resource* d = Resource::from<Resource>(dst);
+    const Resource* s = Resource::from<Resource>(src);
+    if (!d || !s) return false;
+    // The format names the depth format, or one plane by its shader-resource format. Measured on the PC runtime
+    // (RTX 5070 and WARP): Close fails for AVERAGE with the depth format or a stencil plane; the depth plane's
+    // own format (R32_FLOAT, R24_UNORM_X8_TYPELESS) takes AVERAGE as well as MIN and MAX.
+    DXGI_FORMAT family = format;
+    int named_plane = -1;  // -1: any plane of the depth format
+    switch (format) {
+    case DXGI_FORMAT_R32_FLOAT: family = DXGI_FORMAT_D32_FLOAT, named_plane = 0; break;
+    case DXGI_FORMAT_R24_UNORM_X8_TYPELESS: family = DXGI_FORMAT_D24_UNORM_S8_UINT, named_plane = 0; break;
+    case DXGI_FORMAT_X24_TYPELESS_G8_UINT: family = DXGI_FORMAT_D24_UNORM_S8_UINT, named_plane = 1; break;
+    case DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS: family = DXGI_FORMAT_D32_FLOAT_S8X24_UINT, named_plane = 0; break;
+    case DXGI_FORMAT_X32_TYPELESS_G8X24_UINT: family = DXGI_FORMAT_D32_FLOAT_S8X24_UINT, named_plane = 1; break;
+    default: break;
+    }
+    const Format requested = vulkan_format(family, true);
+    if (requested.typeless || !(requested.aspects & VK_IMAGE_ASPECT_DEPTH_BIT)) return false;
+    // The plane a subresource index names (0 depth, 1 stencil), or -1.
+    const auto plane = [&](const Resource* r, UINT subresource) {
+        const D3D12_RESOURCE_DESC& desc = r->desc();
+        if (!(desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) ||
+            vulkan_format(desc.Format, true).format != requested.format)
+            return -1;
+        const UINT planes = (requested.aspects & VK_IMAGE_ASPECT_STENCIL_BIT) ? 2 : 1;
+        const UINT per_plane = UINT(desc.MipLevels) * desc.DepthOrArraySize;
+        return per_plane && subresource / per_plane < planes ? int(subresource / per_plane) : -1;
+    };
+    const int resolved = plane(d, dst_subresource);
+    if (resolved < 0 || resolved != plane(s, src_subresource) || (named_plane >= 0 && resolved != named_plane) ||
+        s->desc().SampleDesc.Count <= 1 || d->desc().SampleDesc.Count != 1)
+        return false;
+    VkResolveModeFlagBits wanted = VK_RESOLVE_MODE_MIN_BIT;
+    if (mode == D3D12_RESOLVE_MODE_MAX) wanted = VK_RESOLVE_MODE_MAX_BIT;
+    else if (mode == D3D12_RESOLVE_MODE_AVERAGE && named_plane == 0) wanted = VK_RESOLVE_MODE_AVERAGE_BIT;
+    else if (mode != D3D12_RESOLVE_MODE_MIN) return false;
+    // The rendering scope that replays it resolves pixels in place (vulkan_replay.h).
+    if (rect ? (LONG(x) != rect->left || LONG(y) != rect->top) : (x || y)) return false;
+    const DeviceState& state = d->device_state();
+    return (resolved ? state.stencil_resolve_modes : state.depth_resolve_modes) & wanted;
+}
+
 std::uint32_t device_max_push_constants_size(ID3D12Device* device) {
     if (!device) return 0;
     ID3D12Device* real = rt::d3d12_xs::device_proxy_real_device(device);
@@ -3333,6 +3602,16 @@ VkDescriptorSet bindless_set(ID3D12Device* device) {
 VkDescriptorSetLayout bindless_set_layout(ID3D12Device* device) {
     const leonida::BindlessSet* set = bindless_of(device);
     return set ? set->layout() : VK_NULL_HANDLE;
+}
+
+HRESULT register_samplers(ID3D12Device* device, std::span<const leonida::gfx10::SamplerWords> samplers) {
+    if (!device) return E_INVALIDARG;
+    ID3D12Device* real = rt::d3d12_xs::device_proxy_real_device(device);
+    Device* d = Device::from<Device>(real ? real : device);
+    if (!d) return E_INVALIDARG;
+    bool all = true;
+    for (const leonida::gfx10::SamplerWords& words : samplers) all = d->bind_sampler(words) && all;
+    return all ? S_OK : E_FAIL;
 }
 
 HRESULT create_dxgi_factory(ID3D12Device* device, REFIID riid, void** out) {
@@ -3385,8 +3664,6 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     app.apiVersion = VK_API_VERSION_1_3;
     VkInstanceCreateInfo instance_info{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
     instance_info.pApplicationInfo = &app;
-    instance_info.enabledExtensionCount = static_cast<std::uint32_t>(inst_exts.size());
-    instance_info.ppEnabledExtensionNames = inst_exts.empty() ? nullptr : inst_exts.data();
     const char* layer = "VK_LAYER_KHRONOS_validation";
     const VkValidationFeatureEnableEXT sync_validation = VK_VALIDATION_FEATURE_ENABLE_SYNCHRONIZATION_VALIDATION_EXT;
     VkValidationFeaturesEXT validation_features{VK_STRUCTURE_TYPE_VALIDATION_FEATURES_EXT};
@@ -3410,10 +3687,11 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
         enumerate(nullptr, &extension_count, extensions.data());
         for (const auto& e : extensions) has_debug_utils = has_debug_utils || std::strcmp(e.extensionName, debug_utils) == 0;
     }
-    if (has_debug_utils) {
-        instance_info.enabledExtensionCount = 1;
-        instance_info.ppEnabledExtensionNames = &debug_utils;
-    }
+    // One list: the surface extensions above (for DXGI presentation) and debug utils both go on the instance.
+    const bool instance_has_surface = !inst_exts.empty();
+    if (has_debug_utils) inst_exts.push_back(debug_utils);
+    instance_info.enabledExtensionCount = static_cast<std::uint32_t>(inst_exts.size());
+    instance_info.ppEnabledExtensionNames = inst_exts.empty() ? nullptr : inst_exts.data();
     OwnedRuntime owned{};
     if (create_instance(&instance_info, nullptr, &owned.instance) != VK_SUCCESS) {
         std::fprintf(stderr, "[rt] d3d12: vkCreateInstance (Vulkan 1.3) failed\n");
@@ -3550,6 +3828,8 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     enable12.separateDepthStencilLayouts = VK_TRUE;
     info.buffer_device_address = chosen12.bufferDeviceAddress == VK_TRUE;
     enable12.bufferDeviceAddress = info.buffer_device_address ? VK_TRUE : VK_FALSE;
+    info.storage_buffer_8bit = chosen12.storageBuffer8BitAccess == VK_TRUE;
+    enable12.storageBuffer8BitAccess = info.storage_buffer_8bit;
     // Where the GPU has them: what the bindless set 0 needs (VulkanDeviceInfo::bindless), and the sampler features
     // D3D12 samplers can ask for.
     info.bindless = chosen12.runtimeDescriptorArray && chosen_features.shaderSampledImageArrayDynamicIndexing &&
@@ -3639,7 +3919,8 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     if (info.conditional_rendering) device_extensions.push_back(conditional_extension);
     if (info.host_image_copy) device_extensions.push_back(host_image_copy_name);
     if (calibrated) device_extensions.push_back(calibrated);
-    if (has_swapchain) device_extensions.push_back(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
+    // VK_KHR_swapchain requires VK_KHR_surface on the instance (VUID-vkCreateDevice-ppEnabledExtensionNames-01387).
+    if (has_swapchain && instance_has_surface) device_extensions.push_back(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
     if (info.ray_tracing) {
         device_extensions.push_back(VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME);
         device_extensions.push_back(VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME);

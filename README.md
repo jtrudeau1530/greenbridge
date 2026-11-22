@@ -13,6 +13,7 @@
 </h4>
 
 <p align="center">
+  <a href="docs/i18n/README.md">Other languages</a> |
   <a href="#project-status">Status</a> |
   <a href="#how-to-build">How to build</a> |
   <a href="#how-it-works">How it works</a> |
@@ -45,7 +46,7 @@ work on booting can start as soon as one is available to a developer.
 |---|---|
 | Finding and checking your copy (Xbox Series 1.0.2.1) | ✅ Works |
 | Shaders: carve, unpack native RDNA2 code, disassemble | ✅ All 26,503 |
-| Shaders: RDNA2 → SPIR-V translation | ✅ **All 26,503** (disassembled with LLVM 21; LLVM 23 leaves 1,471 rejected for now, #644): 2,236 VS, 12,101 PS, 2,689 CS, 9,282 mesh, 195 geometry. All pass `spirv-val`, with a per-shader metadata index for pipeline creation. ⚠️ 21,545 are wave64: exact on 64-wide subgroups (AMD). On 32-wide subgroups (NVIDIA, Intel), compute and mesh shaders are exact with wave64 emulation (`--wave64-emulate`, on by default there); cross-half wave ops in vertex, pixel and geometry shaders are still approximate |
+| Shaders: RDNA2 → SPIR-V translation | ✅ **All 26,503 translated**: 2,236 VS, 12,101 PS, 2,689 CS, 9,282 mesh, 195 geometry, with a per-shader metadata index for pipeline creation. All 26,503 passed `spirv-val` in the [LLVM 23.1.5 Linux run at `c432cdc`](https://github.com/ItsNotRexed/Leonida/issues/644#issuecomment-7072972586). A [full-corpus run at `43d4703`](https://github.com/ItsNotRexed/Leonida/issues/881#issuecomment-7075507328) also validated all 26,503 after the SPIR-V ID-bound fix. ⚠️ 21,545 are wave64: exact on 64-wide subgroups (AMD). On 32-wide subgroups (NVIDIA, Intel), compute and mesh shaders are exact with wave64 emulation (`--wave64-emulate`, on by default there); cross-half wave ops in vertex, pixel and geometry shaders are still approximate |
 | Shader translator checked on a real GPU | ⚠️ The hand-written GPU tests (vertex fetch, texture sampling, exports, ALU ops, partial-register ops, barycentrics, wave-uniform branches, compute LDS/barriers/buffer stores, wave64 masks) have been run on more than 30 GPU and driver combinations, with results in [#166](https://github.com/ItsNotRexed/Leonida/issues/166): NVIDIA Turing, Ampere, Ada and Blackwell (Windows and Linux); AMD GCN3, RDNA1, RDNA2, RDNA3 and RDNA4 (Windows driver and RADV); Intel Gen9 (ANV); Apple M1 (MoltenVK, no geometry or mesh stages); and Mesa llvmpipe. Wave64 tests need 64-wide subgroups (AMD) or `LEONIDA_W64_EMULATE=1`. These are small test shaders: the game's own shaders are checked by `spirv-val` and by driver pipeline creation (`vk_pipeline_check`), not by their output |
 | Models (OBJ with real names, UVs, material references) | ✅ Exported. Not all layouts are decoded yet |
 | Texture dictionaries and world texture pools (DDS) | ✅ Exported. Pool entries stored as BCPack are still skipped by the export; a clean-room decoder (`tools/bcpack.py`) rebuilds BC1, BC3, BC4, BC5, BC6H and BC7 (most BC6H/BC7 chunks need a local history table, which the repo does not ship), and is not wired into `rpf9dump` yet ([notes](docs/textures.md)) |
@@ -111,6 +112,17 @@ compute and mesh shaders 64-wide. The mode is saved next to the translated shade
 again. With `auto`, a work folder that previously used emulation keeps it for later translations and retries, even if
 the current GPU supports native wave64. Use `--wave64-emulate off` to translate it natively.
 
+Four fallback flags are forwarded to the translator the same way, saved next to the translated shaders, and changing
+them translates them again: `--no-float-controls` (drop `SignedZeroInfNanPreserve`, for devices whose pipeline check
+skips a shader without `shaderSignedZeroInfNanPreserveFloat32`; needs PR #664's translator flag), `--bary-fallback`
+(read raw barycentrics from an interpolated input, for devices without `VK_KHR_fragment_shader_barycentric`),
+`--texel-offset-fallback` (fold `image_sample*_o` offsets into the coordinate, for devices without
+`VK_KHR_maintenance8`) and `--mesh-compute` (mesh shaders as compute, for devices without `VK_EXT_mesh_shader`).
+Each is documented in [docs/design.md](docs/design.md).
+
+The build records which llvm-mc command and version produced the disassembly. Changing either, or reusing a work
+folder that predates this record, reruns disassembly and translation while keeping the extracted shader inputs.
+
 The build records which translator sources produced the shaders. A change to those files reruns translation using the
 saved disassembly. Older work folders need one translation after upgrading to record this information.
 
@@ -134,22 +146,27 @@ cmake --build runtime/build/linux --parallel
 Pass the directory containing `index.json` and the translated SPIR-V files to `vk_pipeline_check`.
 
 `make_game.py` runs on Linux too. The `pipelines` stage uses the `vk_pipeline_check` built above
-(`runtime/build/linux`, or `runtime/build`). The `runtime` stage builds on Windows only, so on Linux it needs a
-Windows build of `runtime/`; without one it is left out of the default stages, and asking for it fails before any
-work starts.
+(`runtime/build/linux`, or `runtime/build`), and builds it there itself before any other work if it is missing.
 
 ### Running the loader on Linux
 
 The loader is a Windows program and runs under Wine or Proton; CI runs its tests under Wine on every change to
-`runtime/` (the `wine` job of the Runtime workflow). Give the `runtime` stage a folder with `gta6rt.exe` and
-`gta6rt_tls_host.dll`, such as the `runtime-windows` artifact of that workflow's `windows` job, unzipped:
+`runtime/` (the `wine` job of the Runtime workflow). On Linux the `runtime` stage cross-builds it into
+`runtime/build/windows` with clang-cl and lld-link (LLVM 19+; plain names, or all five LLVM tools with one version
+suffix such as `clang-cl-21`) against the MSVC CRT and Windows SDK that
+[xwin](https://github.com/Jake-Shadle/xwin) lays out, in `XWIN_DIR` or `~/.local/share/xwin-sdk`
+([docs/testing.md](docs/testing.md#the-windows-runtime-on-linux-under-wine-or-proton) has the one-time `xwin`
+command). Without them the stage is left out of the default stages, and asking for it lists what is missing before
+any work starts. A Windows build made elsewhere works too, such as the `runtime-windows` artifact of that workflow's
+`windows` job, unzipped:
 
 ```sh
 python3 -I make_game.py --runtime-build ~/Downloads/runtime-windows
 ```
 
-It copies both files into `--out` and writes `gta6rt.sh` next to them, which starts `gta6rt.exe` with `wine`, or
-with the Wine named by `WINE` (for Proton, its `files/bin/wine`). The same option skips the build on Windows.
+Either way it copies `gta6rt.exe` and `gta6rt_tls_host.dll` into `--out` and writes `gta6rt.sh` next to them, which
+starts `gta6rt.exe` with `wine`, or with the Wine named by `WINE` (for Proton, its `files/bin/wine`). The same option
+skips the build on Windows.
 
 ## How it works
 

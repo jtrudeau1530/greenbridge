@@ -78,7 +78,7 @@ def translate_tests(work, names):
             cmd.append(f"-mattr={mattr}")
         cmd.append("-show-encoding")
         # Feed the text on stdin: an LLVM_MC command that runs in WSL cannot open a Windows path argument.
-        r = subprocess.run(cmd, input=raw, capture_output=True, text=True)
+        r = mc_command.run(cmd, input=raw, capture_output=True, text=True)
         if r.returncode or "error:" in r.stderr:
             sys.exit(f"{n}.asm did not assemble:\n{r.stderr}")
         # rdna2spirv.py rejects assembler directives such as the "\t.text" llvm-mc prints first.
@@ -95,6 +95,8 @@ def translate_tests(work, names):
         cmd.append("--wave64-emulate")
     if os.environ.get("LEONIDA_BARY_FALLBACK") == "1":   # raw barycentrics without VK_KHR_fragment_shader_barycentric
         cmd.append("--bary-fallback")
+    if os.environ.get("LEONIDA_TEXOFF_FALLBACK") == "1":   # texel offsets without VK_KHR_maintenance8
+        cmd.append("--texel-offset-fallback")
     return subprocess.run(cmd).returncode
 
 

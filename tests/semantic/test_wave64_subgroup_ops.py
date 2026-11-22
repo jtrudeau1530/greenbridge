@@ -39,7 +39,7 @@ GPU_DUMPS = dict(check.CS_DUMPS + check.W64X_DUMPS + check.W64X_PARTIAL)
 DUMPS = ("cs_w64x_ballot", "cs_w64x_readfirstlane", "cs_w64x_load_ballot_load", "cs_w64x_partial",
          "cs_wave64_ballot", "cs_wm_bfm64", "cs_wm_half_cmp")
 HEAP_FILL = 0xEEEEEEEE
-VSHARP = [0, 0, 0xFFFFFFFF, 0]
+VSHARP = [0, 0, 0xFFFFFFFF, 0x31016FAC]
 
 # Two 32-wide subgroups: each half votes, counts and picks its first lane on its own.
 WAVE32_EXPECTED = {

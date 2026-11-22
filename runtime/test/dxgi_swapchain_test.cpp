@@ -526,6 +526,185 @@ int main() {
     if (sc->ResizeBuffers(2, 37, 19, DXGI_FORMAT_R32_UINT, 0) != DXGI_ERROR_UNSUPPORTED)
         return fail("ResizeBuffers should reject unsupported format DXGI_FORMAT_R32_UINT");
 
+    // Measured on host DXGI (RTX 5070 and WARP): DXGI_PRESENT_TEST returns S_OK without presenting, so the back
+    // buffer index and last present count stay; a sync interval above 4 is DXGI_ERROR_INVALID_CALL and presents nothing.
+    {
+        const UINT before = sc->GetCurrentBackBufferIndex();
+        UINT count_before = 0;
+        if (FAILED(sc->GetLastPresentCount(&count_before)) || count_before == 0)
+            return fail("GetLastPresentCount should be non-zero after earlier Presents");
+        if (sc->Present(0, DXGI_PRESENT_TEST) != S_OK || sc->GetCurrentBackBufferIndex() != before)
+            return fail("Present(0, DXGI_PRESENT_TEST) presented a frame");
+        UINT count_after_test = 0;
+        if (FAILED(sc->GetLastPresentCount(&count_after_test)) || count_after_test != count_before)
+            return fail("DXGI_PRESENT_TEST should not increment GetLastPresentCount");
+        if (sc->Present(5, 0) != DXGI_ERROR_INVALID_CALL || sc->GetCurrentBackBufferIndex() != before)
+            return fail("Present(5, 0) should be DXGI_ERROR_INVALID_CALL and present nothing");
+        if (sc->GetLastPresentCount(nullptr) != E_INVALIDARG)
+            return fail("GetLastPresentCount(nullptr) should return E_INVALIDARG");
+    }
+
+    // SwapChain::GetParent and SetMaximumFrameLatency/GetMaximumFrameLatency.
+    {
+        IDXGIFactory4* parent = nullptr;
+        if (FAILED(sc->GetParent(IID_PPV_ARGS(&parent))) || parent != factory)
+            return fail("SwapChain::GetParent did not return the parent factory");
+        parent->Release();
+        UINT lat = 0;
+        if (FAILED(sc->GetMaximumFrameLatency(&lat)) || lat != 2)
+            return fail("Default GetMaximumFrameLatency should be 2");
+        if (sc->SetMaximumFrameLatency(0) != E_INVALIDARG || sc->SetMaximumFrameLatency(17) != E_INVALIDARG)
+            return fail("SetMaximumFrameLatency should reject 0 and > 16 with E_INVALIDARG");
+        if (FAILED(sc->SetMaximumFrameLatency(3)) || FAILED(sc->GetMaximumFrameLatency(&lat)) || lat != 3)
+            return fail("SetMaximumFrameLatency(3) round-trip failed");
+    }
+
+    // IDXGIFactory4 adapter enumeration, IDXGIAdapter3 descriptors, EnumAdapterByLuid, and QueryVideoMemoryInfo.
+    {
+        IDXGIAdapter1* adapter1 = nullptr;
+        if (FAILED(factory->EnumAdapters1(0, &adapter1)) || !adapter1)
+            return fail("EnumAdapters1(0) failed");
+        IDXGIAdapter1* missing = nullptr;
+        if (factory->EnumAdapters1(1, &missing) != DXGI_ERROR_NOT_FOUND || missing != nullptr)
+            return fail("EnumAdapters1(1) should return DXGI_ERROR_NOT_FOUND");
+
+        IDXGIAdapter* adapter0 = nullptr;
+        if (FAILED(factory->EnumAdapters(0, &adapter0)) || !adapter0)
+            return fail("EnumAdapters(0) failed");
+        adapter0->Release();
+
+        IDXGIFactory4* adapter_parent = nullptr;
+        if (FAILED(adapter1->GetParent(IID_PPV_ARGS(&adapter_parent))) || adapter_parent != factory)
+            return fail("Adapter::GetParent did not return the parent factory");
+        adapter_parent->Release();
+
+        IDXGIAdapter3* adapter3 = nullptr;
+        if (FAILED(adapter1->QueryInterface(IID_PPV_ARGS(&adapter3))) || !adapter3)
+            return fail("QueryInterface(IDXGIAdapter3) failed");
+
+        DXGI_ADAPTER_DESC desc0{};
+        DXGI_ADAPTER_DESC1 desc1{};
+        DXGI_ADAPTER_DESC2 desc2{};
+        if (FAILED(adapter3->GetDesc(&desc0)) || FAILED(adapter3->GetDesc1(&desc1)) || FAILED(adapter3->GetDesc2(&desc2)))
+            return fail("Adapter GetDesc/GetDesc1/GetDesc2 failed");
+        if (desc1.Description[0] == L'\0' || desc1.VendorId != chosen.vendorID || desc1.DeviceId != chosen.deviceID)
+            return fail("Adapter desc did not match Vulkan physical device");
+        if (desc1.DedicatedVideoMemory + desc1.SharedSystemMemory == 0)
+            return fail("Adapter reported zero total memory");
+        if (const auto get_mem = reinterpret_cast<PFN_vkGetPhysicalDeviceMemoryProperties>(
+                gipa(instance, "vkGetPhysicalDeviceMemoryProperties"))) {
+            VkPhysicalDeviceMemoryProperties mem{};
+            get_mem(physical, &mem);
+            VkDeviceSize max_local = 0;
+            for (std::uint32_t i = 0; i < mem.memoryHeapCount; ++i) {
+                if ((mem.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) && mem.memoryHeaps[i].size > max_local)
+                    max_local = mem.memoryHeaps[i].size;
+            }
+            if (desc1.DedicatedVideoMemory != static_cast<SIZE_T>(max_local))
+                return fail("DedicatedVideoMemory should match the primary DEVICE_LOCAL heap (without double-counting BAR1)");
+        }
+        if (desc0.VendorId != desc1.VendorId || desc2.DeviceId != desc1.DeviceId)
+            return fail("Adapter desc mismatch between GetDesc/GetDesc1/GetDesc2");
+
+        // EnumAdapterByLuid with matching LUID succeeds; bogus LUID returns DXGI_ERROR_NOT_FOUND.
+        IDXGIAdapter3* by_luid = nullptr;
+        if (FAILED(factory->EnumAdapterByLuid(desc1.AdapterLuid, IID_PPV_ARGS(&by_luid))) || !by_luid)
+            return fail("EnumAdapterByLuid(matching) failed");
+        by_luid->Release();
+        LUID bogus = desc1.AdapterLuid;
+        bogus.LowPart ^= 0x5a5a5a5au;
+        bogus.HighPart ^= 0x13572468;
+        if (factory->EnumAdapterByLuid(bogus, IID_PPV_ARGS(&by_luid)) != DXGI_ERROR_NOT_FOUND || by_luid != nullptr)
+            return fail("EnumAdapterByLuid(bogus) should return DXGI_ERROR_NOT_FOUND");
+
+        // QueryVideoMemoryInfo + SetVideoMemoryReservation (shared across distinct handles for the same LUID).
+        IDXGIAdapter3* by_luid_b = nullptr;
+        if (FAILED(factory->EnumAdapterByLuid(desc1.AdapterLuid, IID_PPV_ARGS(&by_luid_b))) || !by_luid_b)
+            return fail("EnumAdapterByLuid(second handle) failed");
+        DXGI_QUERY_VIDEO_MEMORY_INFO local_info{};
+        if (FAILED(adapter3->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &local_info)) ||
+            local_info.Budget == 0)
+            return fail("QueryVideoMemoryInfo(LOCAL) failed or reported 0 budget");
+        if (FAILED(adapter3->SetVideoMemoryReservation(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, 64u * 1024u * 1024u)))
+            return fail("SetVideoMemoryReservation(LOCAL) failed");
+        if (FAILED(adapter3->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &local_info)) ||
+            local_info.CurrentReservation != 64u * 1024u * 1024u)
+            return fail("SetVideoMemoryReservation did not reflect on handle A");
+        DXGI_QUERY_VIDEO_MEMORY_INFO local_info_b{};
+        if (FAILED(by_luid_b->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &local_info_b)) ||
+            local_info_b.CurrentReservation != 64u * 1024u * 1024u)
+            return fail("SetVideoMemoryReservation(LOCAL) did not reflect across second IDXGIAdapter3 handle");
+
+        DXGI_QUERY_VIDEO_MEMORY_INFO nonlocal_info{};
+        if (FAILED(adapter3->SetVideoMemoryReservation(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, 32u * 1024u * 1024u)) ||
+            FAILED(by_luid_b->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &nonlocal_info)) ||
+            nonlocal_info.CurrentReservation != 32u * 1024u * 1024u)
+            return fail("SetVideoMemoryReservation(NON_LOCAL) did not reflect across second IDXGIAdapter3 handle");
+        // Restore reservations to 0 and verify both handles see 0.
+        if (FAILED(adapter3->SetVideoMemoryReservation(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, 0)) ||
+            FAILED(adapter3->SetVideoMemoryReservation(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, 0)) ||
+            FAILED(by_luid_b->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &local_info_b)) ||
+            local_info_b.CurrentReservation != 0)
+            return fail("Restoring SetVideoMemoryReservation to 0 failed");
+        by_luid_b->Release();
+
+        if (adapter3->QueryVideoMemoryInfo(1, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &local_info) != E_INVALIDARG ||
+            adapter3->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, nullptr) != E_INVALIDARG)
+            return fail("QueryVideoMemoryInfo invalid args should return E_INVALIDARG");
+
+        adapter3->Release();
+        adapter1->Release();
+    }
+
+    // Host DXGI refuses ResizeBuffers with DXGI_ERROR_INVALID_CALL while the app still holds a back buffer,
+    // and keeps the old buffers.
+    {
+        ID3D12Resource* held = nullptr;
+        if (FAILED(sc->GetBuffer(0, IID_PPV_ARGS(&held))) || !held) return fail("GetBuffer (held)");
+        const HRESULT hr = sc->ResizeBuffers(2, 64, 64, DXGI_FORMAT_UNKNOWN, 0);
+        DXGI_SWAP_CHAIN_DESC1 d{};
+        sc->GetDesc1(&d);
+        held->Release();
+        if (hr != DXGI_ERROR_INVALID_CALL || d.Width != 37 || d.Height != 19)
+            return fail("ResizeBuffers with a held back buffer should be DXGI_ERROR_INVALID_CALL and keep 37x19");
+    }
+
+    // Zero width or height means the window's client area, in ResizeBuffers (the usual WM_SIZE call) and at
+    // creation; host DXGI: ResizeBuffers(0, 0, 0) after resizing the window gives the new client size.
+    {
+        RECT wr{0, 0, 300, 200};
+        AdjustWindowRect(&wr, WS_OVERLAPPEDWINDOW, FALSE);
+        SetWindowPos(hwnd, nullptr, 0, 0, wr.right - wr.left, wr.bottom - wr.top, SWP_NOMOVE | SWP_NOZORDER);
+        RECT cr{};
+        GetClientRect(hwnd, &cr);
+        if (FAILED(sc->ResizeBuffers(0, 0, 0, DXGI_FORMAT_UNKNOWN, 0))) return fail("ResizeBuffers(0, 0, 0)");
+        DXGI_SWAP_CHAIN_DESC1 d{};
+        sc->GetDesc1(&d);
+        if (d.Width != UINT(cr.right) || d.Height != UINT(cr.bottom)) {
+            std::fprintf(stderr, "FAIL: ResizeBuffers(0, 0, 0) gave %ux%u, client area is %ldx%ld\n", d.Width, d.Height,
+                         cr.right, cr.bottom);
+            return 1;
+        }
+
+        HWND hwnd2 = create_test_window(200, 150);
+        if (!hwnd2) return fail("CreateWindowExW (second)");
+        GetClientRect(hwnd2, &cr);
+        DXGI_SWAP_CHAIN_DESC1 zd = scd;
+        zd.Width = 0;
+        zd.Height = 0;
+        IDXGISwapChain1* zsc = nullptr;
+        if (FAILED(factory->CreateSwapChainForHwnd(queue, hwnd2, &zd, nullptr, nullptr, &zsc)) || !zsc)
+            return fail("CreateSwapChainForHwnd 0x0");
+        zsc->GetDesc1(&d);
+        zsc->Release();
+        DestroyWindow(hwnd2);
+        if (d.Width != UINT(cr.right) || d.Height != UINT(cr.bottom)) {
+            std::fprintf(stderr, "FAIL: 0x0 swapchain is %ux%u, client area is %ldx%ld\n", d.Width, d.Height, cr.right,
+                         cr.bottom);
+            return 1;
+        }
+    }
+
     rtv_heap->Release();
     sc->Release();
     fence->Release();

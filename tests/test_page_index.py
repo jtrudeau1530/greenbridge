@@ -1,5 +1,7 @@
 """Synthetic tests for tools/page_index.py. No game files are read or needed."""
+import contextlib
 import csv
+import io
 import json
 import os
 import struct
@@ -8,9 +10,13 @@ import sys
 import tempfile
 import unittest
 import zlib
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOL = os.path.join(ROOT, "tools", "page_index.py")
+sys.path.insert(0, os.path.dirname(TOOL))
+import page_index
+
 BASE = 0x50000000
 
 
@@ -52,6 +58,18 @@ def run_tool(source, out, extra=()):
 
 
 class PageIndexTest(unittest.TestCase):
+    def test_cli_reports_output_write_errors(self):
+        with tempfile.TemporaryDirectory() as source:
+            for extension, writer in (("json", "write_json"), ("csv", "write_csv")):
+                with self.subTest(extension=extension):
+                    out = os.path.join(source, f"index.{extension}")
+                    stderr = io.StringIO()
+                    with (mock.patch.object(sys, "argv", [TOOL, source, out, "--quiet"]),
+                          mock.patch.object(page_index, writer, side_effect=OSError("disk full")),
+                          contextlib.redirect_stderr(stderr)):
+                        self.assertEqual(page_index.main(), 2)
+                    self.assertIn(f"{out}: disk full", stderr.getvalue())
+
     def test_simple_page_and_q28_raw(self):
         page = header(0x200, q28=0x180, q38=0x100, counts=(1, 0, 1, 0))
         page[0x60:0xA0] = b"\xaa" * 0x40

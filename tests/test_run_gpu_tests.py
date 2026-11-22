@@ -93,6 +93,40 @@ class TextureTestOnASmallPushConstantDevice(unittest.TestCase):
                 self.assertNotIn("no runnable", out)
 
 
+class BindlessTestOnASmallPushConstantDevice(unittest.TestCase):
+    """vk_bindless_test (ps_tex) exits 77 below its 144 push constant bytes (TEST-149): a SKIP with that reason."""
+
+    def run_ps_tex(self, rc, msg):
+        with tempfile.TemporaryDirectory() as tmp:
+            args = SimpleNamespace(filter="ps_tex.asm", build=tmp, llvm_mc="unused")   # not ps_texoff etc.
+
+            def run(cmd, env=None, gpu=True):
+                if Path(cmd[0]).stem == "vk_bindless_test":
+                    return rc, msg
+                (Path(tmp) / "spirv" / "ps_tex.spv").touch()   # rdna2spirv.py "translating" the shader
+                return 0, ""
+
+            output = io.StringIO()
+            with (patch.object(rgt, "assemble_to_s", side_effect=lambda _mc, _src, dst, _name: Path(dst).touch()),
+                  patch.object(rgt, "spirv_as"),
+                  patch.object(rgt, "run_cmd", side_effect=run),
+                  contextlib.redirect_stdout(output), contextlib.redirect_stderr(output)):
+                suite_rc = rgt.run_suite(args, tmp)
+            return suite_rc, output.getvalue()
+
+    def test_too_few_push_constant_bytes_skip(self):
+        rc, out = self.run_ps_tex(77, "device: X\nunsupported: need 144 push constant bytes, device has 128")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("SKIP (unsupported: need 144 push constant bytes, device has 128)", out)
+        self.assertIn("0/1 passed, 1 skipped", out)
+
+    def test_other_failures_still_fail(self):
+        rc, out = self.run_ps_tex(1, "device: X\nps_tex: 12 pixels differ")
+        self.assertEqual(rc, 1, out)
+        self.assertIn("0/1 passed", out)
+        self.assertNotIn("skipped", out)
+
+
 class FilterWithoutRunnableCases(unittest.TestCase):
     """A filter selecting only an input shader (cs_bench_mix) must not report 0/0 passed with exit 0."""
 
@@ -250,7 +284,14 @@ class Wave32LaneDumps(unittest.TestCase):
     def test_uses_check_py_rule(self):
         import check
         self.assertIs(rgt.narrow_subgroup_skip, check.narrow_subgroup_skip)
+        self.assertIs(rgt.wave32_lane_skip, check.wave32_lane_skip)
         self.assertIs(rgt.WAVE32_LANE_DUMPS, check.WAVE32_LANE_DUMPS)
+        self.assertIs(rgt.WAVE32_LANE_ENV, check.WAVE32_LANE_ENV)
+
+    def test_unpinned_rule(self):
+        self.assertEqual(rgt.wave32_lane_skip("device: X (subgroup 8..32)\ncompute subgroup size: 32 not available\n"),
+                         "SKIP (the device can't run this shader at 32 lanes on request)")
+        self.assertIsNone(rgt.wave32_lane_skip("device: X (subgroup 8..32)\ncompute subgroup size: 32\n"))
 
     def test_rule(self):
         self.assertEqual(rgt.narrow_subgroup_skip("device: llvmpipe (subgroup 8..8)\n"),

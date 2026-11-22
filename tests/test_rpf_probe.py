@@ -141,6 +141,14 @@ class MainTests(unittest.TestCase):
         self.assertIn("2 archives", out)
         self.assertIn("'RPF4': 2", out)
 
+    def test_equal_sized_archives_are_sorted_by_path(self):
+        self.write("z.rpf", archive_bytes())
+        self.write("a.rpf", archive_bytes())
+        with mock.patch.object(probe.os, "walk", return_value=[(self.game, [], ["z.rpf", "a.rpf"])]):
+            self.run_main()
+
+        self.assertEqual([os.path.basename(row["file"]) for row in self.rows()], ["a.rpf", "z.rpf"])
+
     def test_creates_the_output_directory(self):
         self.write("a.rpf", archive_bytes())
         self.run_main()

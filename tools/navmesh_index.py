@@ -22,6 +22,7 @@ Usage:
 """
 import argparse
 import csv
+import fnmatch
 import glob
 import json
 import mmap
@@ -232,6 +233,29 @@ def offset(text):
     return value
 
 
+def same_report_path(first, second):
+    if os.path.normcase(os.path.realpath(first)) == os.path.normcase(os.path.realpath(second)):
+        return True
+    try:
+        return os.path.samefile(first, second)
+    except OSError:
+        return False
+
+
+def is_scanned_input(path, input_path, pattern):
+    """True when a report path is one of the files the scan reads: writing it would destroy the input."""
+    if same_report_path(path, input_path):
+        return True
+    if not os.path.isdir(input_path) or not os.path.isfile(path):
+        return False
+    root, target = os.path.abspath(input_path), os.path.abspath(path)
+    if os.path.dirname(target) != root and not target.startswith(root + os.sep):
+        return False
+    pattern = pattern or "*.bin"
+    return (fnmatch.fnmatch(os.path.relpath(target, root), pattern)
+            or fnmatch.fnmatch(os.path.basename(target), pattern))
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("input", help="RPF9 archive, or a directory of carved .bin files")
@@ -246,6 +270,13 @@ def main() -> int:
         ap.error("--start and --limit apply to a single archive, not a directory")
     if not is_dir and a.pattern is not None:
         ap.error("--pattern applies to a directory, not an archive")
+    base = os.path.basename(os.path.normpath(a.input))
+    out_path = a.out or os.path.splitext(base)[0] + ".navmesh-index.json"
+    if a.csv and same_report_path(out_path, a.csv):
+        ap.error("--out and --csv must refer to different files")
+    for flag, path in (("--out", out_path), ("--csv", a.csv)):
+        if path and is_scanned_input(path, a.input, a.pattern):
+            ap.error(f"{flag} would overwrite the input {path}")
     below_normal()
 
     if is_dir:
@@ -261,8 +292,6 @@ def main() -> int:
         rows, summary = scan_archive(a.input, a.start, a.limit)
 
     add_distribution(summary, rows)
-    base = os.path.basename(os.path.normpath(a.input))
-    out_path = a.out or os.path.splitext(base)[0] + ".navmesh-index.json"
     written = write_outputs(rows, summary, out_path, a.csv)
     print(json.dumps(summary, indent=1))
     print(f"wrote {out_path}" + (f", {', '.join(written)}" if written else ""))

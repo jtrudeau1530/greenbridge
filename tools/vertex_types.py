@@ -1,5 +1,8 @@
 """Measure the component types of the vertex streams in `42 40 00 00` blocks (follow-up to ASSET-57).
 
+A stream can hold several blocks back to back, with their meshlet groups after the whole run in the same order
+(group i belongs to block i); every paired block is measured.
+
 docs/restofworld.md measures each tag's bytes per vertex on `42 40 00 00` blocks: 8 for 0x42, 4 for 0x21, 0x25,
 0x26, 0x27 and 0x28, 16 for 0x8c. This tool tests what those bytes are, using checks that need no textures and no
 other file: the vertex count and the triangle edges come from the meshlet group that follows the streams (validated
@@ -83,18 +86,61 @@ def vertex_count(slots, order):
     return span // 8
 
 
-def find_group(data, at, slots, order, n):
-    """The meshlet group after the last stream: end of the last stream, padded to 16 bytes, over zero words."""
-    last = order[-1]
-    end = at + slots[last][1] + stride(slots[last][0]) * n
-    pos = (end + 15) & ~15
+def skip_padding(data, pos):
+    """Round up to 16 bytes, then step over zero words."""
+    pos = (pos + 15) & ~15
     while pos + 4 <= len(data) and struct.unpack_from("<I", data, pos)[0] == 0:
         pos += 4
+    return pos
+
+
+def block_end(data, at, slots, order, n):
+    """End of a block: its last stream, sized by that tag's width, padded to 16 bytes, over zero words."""
+    last = order[-1]
+    return skip_padding(data, at + slots[last][1] + stride(slots[last][0]) * n)
+
+
+def find_group(data, at, slots, order, n):
+    """The meshlet group right after a block's last stream."""
+    pos = block_end(data, at, slots, order, n)
     try:
         group, _ = parse_group(data, pos)
     except PageError as exc:
         raise BlockError(f"no group: {exc}")
     return pos, group
+
+
+def block_run(data, at=0):
+    """The `42 40 00 00` blocks stored back to back from `at`, as (offset, slots, order, count), and the offset
+    after the last one. Each next header starts exactly at the previous block's end."""
+    run = []
+    while True:
+        slots, order, _ = parse_slots(data, at)
+        n = vertex_count(slots, order)
+        run.append((at, slots, order, n))
+        at = block_end(data, at, slots, order, n)
+        if at + 4 > len(data) or struct.unpack_from("<I", data, at)[0] != MAGIC:
+            return run, at
+
+
+def measure_stream(data, T, rng, errors):
+    """Measure every block of the run that starts a stream. The meshlet groups follow the whole run in the same
+    order: group i belongs to block i, and each pair must still pass the dense-coverage check."""
+    run, pos = block_run(data)
+    add(T, "run_blocks", len(run))
+    for i, (at, _, _, _) in enumerate(run):
+        try:
+            group, end = parse_group(data, pos)
+        except PageError as exc:
+            if i == 0:
+                raise BlockError(f"no group: {exc}")
+            add(errors, "no group in the stream for a later block of the run", len(run) - i)
+            return
+        try:
+            measure_block(data, at, T, rng, (pos, group))
+        except BlockError as exc:
+            add(errors, str(exc).split(":")[0])
+        pos = skip_padding(data, end)
 
 
 def group_edges(data, gat, group):
@@ -105,13 +151,14 @@ def group_edges(data, gat, group):
     ref_at = tri_at + 4 * group["triangles"]
     refs = struct.unpack_from(f"<{group['vertex_refs']}H", data, ref_at)
     tris = []
+    vbase = tbase = 0  # running sums: the record's u16 fields wrap past 65,535 (parse_group checks them mod 2^16)
     for m in range(meshlets):
-        w1 = struct.unpack_from("<I", data, rec_at + 16 * m + 4)[0]
-        vbase, tbase = w1 & 0xFFFF, w1 >> 16
         w0 = struct.unpack_from("<I", data, rec_at + 16 * m)[0]
-        tcount = ((w0 >> 7) & 0x7F) + 1
+        vcount, tcount = (w0 & 0x7F) + 1, ((w0 >> 7) & 0x7F) + 1
         for t in struct.unpack_from(f"<{tcount}I", data, tri_at + 4 * tbase):
             tris.append((refs[vbase + (t & 0x7F)], refs[vbase + ((t >> 7) & 0x7F)], refs[vbase + ((t >> 14) & 0x7F)]))
+        vbase += vcount
+        tbase += tcount
     return tris
 
 
@@ -219,10 +266,10 @@ def add(d, k, v=1):
     d[k] = d.get(k, 0) + v
 
 
-def measure_block(data, at, T, rng):
+def measure_block(data, at, T, rng, found=None):
     slots, order, flags = parse_slots(data, at)
     n = vertex_count(slots, order)
-    gat, group = find_group(data, at, slots, order, n)
+    gat, group = found or find_group(data, at, slots, order, n)
     if group["vertex_span"] != n or group["unique_refs"] != n:
         raise BlockError("group does not cover the block densely")
     tris = group_edges(data, gat, group)
@@ -423,7 +470,8 @@ def main(argv=None):
             print(f"error: {p} does not exist", file=sys.stderr)
             return 2
         if os.path.isdir(p):
-            for root, _, files in os.walk(p):
+            for root, directories, files in os.walk(p):
+                directories.sort()
                 archives += [os.path.join(root, f) for f in sorted(files) if f.lower().endswith(".rpf")]
         else:
             archives.append(p)
@@ -434,7 +482,7 @@ def main(argv=None):
         for _, _, data in iter_blocks(path, args.limit):
             T["streams"] += 1
             try:
-                measure_block(data, 0, T, rng)
+                measure_stream(data, T, rng, errors)
             except BlockError as exc:
                 add(errors, str(exc).split(":")[0])
             except (struct.error, IndexError):

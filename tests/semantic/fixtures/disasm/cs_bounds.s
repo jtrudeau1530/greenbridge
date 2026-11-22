@@ -3,7 +3,7 @@
 	s_mov_b32 s4, 0
 	s_mov_b32 s5, 0
 	s_mov_b32 s6, 16
-	s_mov_b32 s7, 0
+	s_mov_b32 s7, 0x31016fac
 	v_mov_b32 v1, 0x12345678
 	v_mov_b32 v2, 0
 	buffer_store_dword v1, v2, s[4:7], 0 offen

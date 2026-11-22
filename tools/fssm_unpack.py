@@ -32,6 +32,10 @@ import sys
 import zlib
 from collections import Counter
 
+# Defensive per-blob ceiling, not a maximum defined by the XBCH format.
+# 64 MiB matches the repository's existing per-resource cap in tools/world_index.py.
+MAX_FSSM_BYTES = 64 << 20
+
 
 def parts(d: bytes) -> dict:
     out = {}
@@ -75,8 +79,22 @@ def unpack(dxbc: bytes, payload: str = "last"):
         raise ValueError(f"payload must be 'first' or 'last', not {payload!r}")
     if not blob or blob[:4] != b"XBCH":
         return None, ents
+    stored = struct.unpack_from("<I", blob, 8)[0]
     unpacked = struct.unpack_from("<I", blob, 16)[0]
-    data = zlib.decompress(blob[24:])
+    if unpacked > MAX_FSSM_BYTES:
+        raise ValueError(f"XBCH declared size {unpacked} exceeds limit {MAX_FSSM_BYTES}")
+    compressed = blob[24:]
+    if stored != len(compressed):
+        raise ValueError(f"XBCH stored size {stored} does not match payload size {len(compressed)}")
+    decompressor = zlib.decompressobj()
+    # The extra byte detects a stream that expands past the declared size without inflating it all.
+    data = decompressor.decompress(compressed, unpacked + 1)
+    if len(data) > unpacked:
+        raise ValueError(f"decompressed XBCH exceeds declared size {unpacked}")
+    if not decompressor.eof:
+        raise ValueError("truncated XBCH zlib stream")
+    if decompressor.unused_data:
+        raise ValueError("trailing data after XBCH zlib stream")
     if len(data) != unpacked:
         raise ValueError(f"size mismatch {len(data)} != {unpacked}")
     if len(data) < 6:
@@ -99,17 +117,18 @@ def main(argv=None) -> int:
         print(f"ERROR: {src} {what}. Give the folder with the carved .dxbc files.", file=sys.stderr)
         return 2
     try:
-        names = sorted(os.listdir(src))
+        with os.scandir(src) as entries:
+            shaders = sorted((entry for entry in entries
+                              if entry.name.endswith(".dxbc") and entry.is_file()),
+                             key=lambda entry: entry.name)
     except OSError as e:
         print(f"ERROR: cannot list {src}: {e.strerror or e}", file=sys.stderr)
         return 2
     out = os.path.join(src, "fssm")
     os.makedirs(out, exist_ok=True)
     rows, problems = [], Counter()
-    for name in names:
-        if not name.endswith(".dxbc"):
-            continue
-        with open(os.path.join(src, name), "rb") as f:
+    for shader in shaders:
+        with open(shader.path, "rb") as f:
             d = f.read()
         try:
             fssm, ents = unpack(d, payload=a.payload)
@@ -119,7 +138,7 @@ def main(argv=None) -> int:
         if fssm is None:
             problems["no XBCH"] += 1
             continue
-        stem = name[:-5]
+        stem = shader.name[:-5]
         with open(os.path.join(out, stem + ".fssm"), "wb") as f:
             f.write(fssm)
         ends = [i for i in range(0, len(fssm) - 3, 4) if fssm[i:i + 4] == b"\x00\x00\x81\xbf"]

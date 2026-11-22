@@ -1,8 +1,14 @@
-// Headless Vulkan test for translated typed image stores (runtime/test/shaders/cs_imgstore.asm).
-// Usage: vk_store_test cs.spv
+// Headless Vulkan test for translated typed image stores and loads (runtime/test/shaders/cs_imgstore.asm and
+// cs_imgload.asm).
+// Usage: vk_store_test cs.spv [load]
 // The shader builds three T#s (word1 FORMAT = 56 rgba8 unorm, 20 r32 uint, 21 r32 sint) and stores to three 8x8
 // images. The translator picks the float / uint / sint view (set 0, bindings 8 / 9 / 10 for 2D) from the FORMAT
-// field, and the bindless index from the descriptor hash table (binding 2). Checks every texel.
+// field, and the bindless index from the descriptor hash table (binding 2). As in the runtime, each image has its
+// own index in the 2D arrays (1, 2, 3; index 0 is the fallback) and its view in its own format at that index of the
+// sampled array (binding 0), which typed image_load fetches from. Checks every texel.
+// "load" (cs_imgload.asm): the uint and sint images are filled before the dispatch, and the shader loads both
+// texels with image_load and stores their sum into the sint image. The device is made without
+// shaderStorageImageReadWithoutFormat, and a module that declares StorageImageReadWithoutFormat fails (SHADER-151).
 #include "vulkan_loader.h"
 #include "vk_device_pick.h"
 
@@ -80,11 +86,11 @@ int main(int argc, char** argv) {
     float prio = 1;
     VkDeviceQueueCreateInfo qci{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
     qci.queueFamilyIndex = qi; qci.queueCount = 1; qci.pQueuePriorities = &prio;
-    // The typed stores/loads need format-less storage image access. Some GPUs (e.g. Intel Gen9) lack the read side:
-    // report that and exit 77 (unsupported, as vk_compute_test does) instead of failing vkCreateDevice.
+    // The typed stores need format-less storage image writes: without them, report that and exit 77 (unsupported,
+    // as vk_compute_test does) instead of failing vkCreateDevice. Typed loads need no storage image feature.
     VkPhysicalDeviceFeatures have{};
     vkGetPhysicalDeviceFeatures(pd, &have);
-    if (!have.shaderStorageImageWriteWithoutFormat || !have.shaderInt64) {   // every mode; reads: load mode, below
+    if (!have.shaderStorageImageWriteWithoutFormat || !have.shaderInt64) {
         std::printf("unsupported: shaderStorageImageWriteWithoutFormat=%u shaderInt64=%u\n",
                     have.shaderStorageImageWriteWithoutFormat, have.shaderInt64);
         return 77;
@@ -95,15 +101,25 @@ int main(int argc, char** argv) {
     f12.shaderSampledImageArrayNonUniformIndexing = VK_TRUE;
     VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
     f2.features.shaderStorageImageWriteWithoutFormat = VK_TRUE;
-    // "load" mode (cs_imgload.asm): the sint image receives the uint texel read back with image_load.
+    // "load" mode (cs_imgload.asm): the sint image receives the sum of the two texels read back with image_load.
     const bool load_mode = argc > 2 && !std::strcmp(argv[2], "load");
+    std::ifstream f(argv[1], std::ios::binary);
+    std::vector<char> code((std::istreambuf_iterator<char>(f)), {});
+    if (code.size() < 20 || code.size() % 4) { std::fprintf(stderr, "%s: not a SPIR-V module\n", argv[1]); return 1; }
     if (load_mode) {
-        // Only image_load needs it, and some GPUs (Intel Gen9) lack it: report that instead of a failed vkCreateDevice.
-        if (!have.shaderStorageImageReadWithoutFormat) {
-            std::printf("unsupported: shaderStorageImageReadWithoutFormat\n");
-            return 77;
+        // Typed image_load fetches through the sampled arrays, so it must not need a feature Intel Xe-LP lacks
+        // (SHADER-151). shaderStorageImageReadWithoutFormat stays off; a module declaring it would be invalid here.
+        std::vector<uint32_t> words(code.size() / 4);
+        std::memcpy(words.data(), code.data(), code.size());
+        for (std::size_t i = 5; i < words.size() && (words[i] >> 16);) {
+            const uint32_t op = words[i] & 0xffff, count = words[i] >> 16;
+            // OpCapability (17) StorageImageReadWithoutFormat (55; spirv/unified1/spirv.h)
+            if (op == 17 && count == 2 && i + 1 < words.size() && words[i + 1] == 55) {
+                std::printf("FAILED: the module declares StorageImageReadWithoutFormat\n");
+                return 1;
+            }
+            i += count;
         }
-        f2.features.shaderStorageImageReadWithoutFormat = VK_TRUE;
     }
     f2.features.shaderInt64 = VK_TRUE;
     f2.pNext = &f12;
@@ -119,7 +135,8 @@ int main(int argc, char** argv) {
     LOADD(vkCreateDescriptorPool); LOADD(vkAllocateDescriptorSets); LOADD(vkUpdateDescriptorSets);
     LOADD(vkCreateCommandPool); LOADD(vkAllocateCommandBuffers); LOADD(vkBeginCommandBuffer);
     LOADD(vkCmdBindPipeline); LOADD(vkCmdBindDescriptorSets); LOADD(vkCmdPushConstants); LOADD(vkCmdDispatch);
-    LOADD(vkCmdPipelineBarrier); LOADD(vkCmdCopyImageToBuffer); LOADD(vkEndCommandBuffer); LOADD(vkQueueSubmit);
+    LOADD(vkCmdPipelineBarrier); LOADD(vkCmdCopyImageToBuffer); LOADD(vkCmdCopyBufferToImage);
+    LOADD(vkEndCommandBuffer); LOADD(vkQueueSubmit);
     LOADD(vkQueueWaitIdle);
     VkQueue q; vkGetDeviceQueue(dev, qi, 0, &q);
     VkPhysicalDeviceMemoryProperties mp; vkGetPhysicalDeviceMemoryProperties(pd, &mp);
@@ -151,7 +168,7 @@ int main(int argc, char** argv) {
     for (uint32_t k = 0; k < 3; k++) {
         uint32_t t[8] = {0x1000 * (k + 1), fmts[k] << 20};
         for (int j = 2; j < 8; j++) t[j] = 0x11 * (k + 1);
-        table_insert(table, t, 0);     // index 0 in its class's array
+        table_insert(table, t, k + 1);     // its index in the 2D arrays; 0 is the fallback, as in the runtime
     }
     VkBuffer tb; void* tbp;
     CHECK(make_buffer(table.size() * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &tb, &tbp));
@@ -163,7 +180,8 @@ int main(int argc, char** argv) {
         VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
         ii.imageType = VK_IMAGE_TYPE_2D; ii.format = vkf[k]; ii.extent = {W, W, 1}; ii.mipLevels = 1; ii.arrayLayers = 1;
         ii.samples = VK_SAMPLE_COUNT_1_BIT; ii.tiling = VK_IMAGE_TILING_OPTIMAL;
-        ii.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+        ii.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                   VK_IMAGE_USAGE_TRANSFER_DST_BIT;
         CHECK(vkCreateImage(dev, &ii, nullptr, &img[k]));
         VkMemoryRequirements mr; vkGetImageMemoryRequirements(dev, img[k], &mr);
         VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
@@ -178,19 +196,23 @@ int main(int argc, char** argv) {
     VkSamplerCreateInfo sci{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
     VkSampler sampler; CHECK(vkCreateSampler(dev, &sci, nullptr, &sampler));
     // Set 0: binding 0 = sampled images, 1 = samplers, 2 = hash table, 8/9/10 = float/uint/sint 2D storage image arrays.
+    // Four elements each: index 0 stands for the runtime's fallback, image k is at index k + 1. Binding 0 holds each
+    // image's view in its own format (typed image_load reads the uint and sint ones through integer aliases); every
+    // element of a storage array holds the image of its class, so all of them are valid descriptors.
+    constexpr uint32_t N = 4;
     VkDescriptorSetLayoutBinding b[6]{};
-    b[0] = {0, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+    b[0] = {0, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, N, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
     b[1] = {1, VK_DESCRIPTOR_TYPE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
     b[2] = {2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
-    for (int k = 0; k < 3; k++) b[3 + k] = {uint32_t(8 + k), VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+    for (int k = 0; k < 3; k++) b[3 + k] = {uint32_t(8 + k), VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, N, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
     VkDescriptorSetLayoutCreateInfo dli{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
     dli.bindingCount = 6; dli.pBindings = b;
     VkDescriptorSetLayout dsl; CHECK(vkCreateDescriptorSetLayout(dev, &dli, nullptr, &dsl));
     VkDescriptorPoolSize ps[4] = {
-        {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1},
+        {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, N},
         {VK_DESCRIPTOR_TYPE_SAMPLER, 1},
         {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1},
-        {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 3},
+        {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 3 * N},
     };
     VkDescriptorPoolCreateInfo dpi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     dpi.maxSets = 1; dpi.poolSizeCount = 4; dpi.pPoolSizes = ps;
@@ -199,22 +221,25 @@ int main(int argc, char** argv) {
     dai.descriptorPool = dp; dai.descriptorSetCount = 1; dai.pSetLayouts = &dsl;
     VkDescriptorSet ds; CHECK(vkAllocateDescriptorSets(dev, &dai, &ds));
     VkDescriptorBufferInfo tbi{tb, 0, VK_WHOLE_SIZE};
-    VkDescriptorImageInfo sii{VK_NULL_HANDLE, view[0], VK_IMAGE_LAYOUT_GENERAL};
+    VkDescriptorImageInfo sii[N] = {{VK_NULL_HANDLE, view[0], VK_IMAGE_LAYOUT_GENERAL},
+                                    {VK_NULL_HANDLE, view[0], VK_IMAGE_LAYOUT_GENERAL},
+                                    {VK_NULL_HANDLE, view[1], VK_IMAGE_LAYOUT_GENERAL},
+                                    {VK_NULL_HANDLE, view[2], VK_IMAGE_LAYOUT_GENERAL}};
     VkDescriptorImageInfo smpi{sampler, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED};
-    VkDescriptorImageInfo dii[3];
+    VkDescriptorImageInfo dii[3][N];
     VkWriteDescriptorSet wr[6]{};
     for (auto& w : wr) { w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; w.dstSet = ds; w.descriptorCount = 1; }
-    wr[0].dstBinding = 0; wr[0].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE; wr[0].pImageInfo = &sii;
+    wr[0].dstBinding = 0; wr[0].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE; wr[0].pImageInfo = sii;
+    wr[0].descriptorCount = N;
     wr[1].dstBinding = 1; wr[1].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER; wr[1].pImageInfo = &smpi;
     wr[2].dstBinding = 2; wr[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; wr[2].pBufferInfo = &tbi;
     for (int k = 0; k < 3; k++) {
-        dii[k] = {VK_NULL_HANDLE, view[k], VK_IMAGE_LAYOUT_GENERAL};
-        wr[3 + k].dstBinding = 8 + k; wr[3 + k].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; wr[3 + k].pImageInfo = &dii[k];
+        for (uint32_t e = 0; e < N; e++) dii[k][e] = {VK_NULL_HANDLE, view[k], VK_IMAGE_LAYOUT_GENERAL};
+        wr[3 + k].dstBinding = 8 + k; wr[3 + k].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        wr[3 + k].pImageInfo = dii[k]; wr[3 + k].descriptorCount = N;
     }
     vkUpdateDescriptorSets(dev, 6, wr, 0, nullptr);
 
-    std::ifstream f(argv[1], std::ios::binary);
-    std::vector<char> code((std::istreambuf_iterator<char>(f)), {});
     VkShaderModuleCreateInfo smi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
     smi.codeSize = code.size(); smi.pCode = reinterpret_cast<const uint32_t*>(code.data());
     VkShaderModule sm; CHECK(vkCreateShaderModule(dev, &smi, nullptr, &sm));
@@ -230,6 +255,16 @@ int main(int argc, char** argv) {
 
     VkBuffer rb[3]; void* rbp[3];
     for (int k = 0; k < 3; k++) CHECK(make_buffer(W * W * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT, &rb[k], &rbp[k]));
+    // Load mode: what the uint and sint images hold before the dispatch, texel (x, y) at i = 8y + x.
+    VkBuffer fill[2]{}; void* fillp[2]{};
+    if (load_mode) {
+        for (int j = 0; j < 2; j++)
+            CHECK(make_buffer(W * W * 4, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, &fill[j], &fillp[j]));
+        for (uint32_t i = 0; i < W * W; i++) {
+            static_cast<uint32_t*>(fillp[0])[i] = 100 + i;
+            static_cast<int32_t*>(fillp[1])[i] = -2 * int32_t(i);
+        }
+    }
     VkCommandPoolCreateInfo cpci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO}; cpci.queueFamilyIndex = qi;
     VkCommandPool pool; CHECK(vkCreateCommandPool(dev, &cpci, nullptr, &pool));
     VkCommandBufferAllocateInfo cai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
@@ -244,8 +279,25 @@ int main(int argc, char** argv) {
         ib[k].dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
         ib[k].srcQueueFamilyIndex = ib[k].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         ib[k].subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        if (load_mode && k > 0) {   // filled by a copy first
+            ib[k].newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL; ib[k].dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        }
     }
-    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 3, ib);
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0,
+                         nullptr, 3, ib);
+    if (load_mode) {
+        for (int k = 1; k < 3; k++) {
+            VkBufferImageCopy bic{};
+            bic.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}; bic.imageExtent = {W, W, 1};
+            vkCmdCopyBufferToImage(cmd, fill[k - 1], img[k], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bic);
+            ib[k].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL; ib[k].newLayout = VK_IMAGE_LAYOUT_GENERAL;
+            ib[k].srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            ib[k].dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+        }
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0,
+                             nullptr, 0, nullptr, 2, ib + 1);
+    }
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pl, 0, 1, &ds, 0, nullptr);
     uint32_t pc[36] = {};
@@ -274,7 +326,8 @@ int main(int argc, char** argv) {
             int er = int(std::lround(x / 7.0 * 255)), eg = int(std::lround(y / 7.0 * 255));
             if (std::abs(c[0] - er) > 1 || std::abs(c[1] - eg) > 1 || std::abs(c[2] - 128) > 1 || c[3] != 255) bad[0]++;
             if (static_cast<const uint32_t*>(rbp[1])[i] != 100 + 8 * y + x) bad[1]++;
-            const int32_t want_s = load_mode ? int32_t(100 + 8 * y + x) : -int32_t(8 * y + x);
+            // load: the uint texel (100 + 8y + x) plus the sint one (-2 (8y + x)), both read with image_load
+            const int32_t want_s = load_mode ? 100 - int32_t(8 * y + x) : -int32_t(8 * y + x);
             if (static_cast<const int32_t*>(rbp[2])[i] != want_s) bad[2]++;
         }
     const uint8_t* c = static_cast<const uint8_t*>(rbp[0]) + 4 * (3 * W + 5);

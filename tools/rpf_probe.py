@@ -61,7 +61,7 @@ def main() -> int:
         reason = error.strerror or str(error)
         print(f"ERROR: {path}: {reason}", file=sys.stderr)
         return 2
-    rows.sort(key=lambda r: -r["size"])
+    rows.sort(key=lambda r: (-r["size"], r["file"]))
     try:
         out_dir = os.path.dirname(os.path.abspath(a.out))
         os.makedirs(out_dir, exist_ok=True)
