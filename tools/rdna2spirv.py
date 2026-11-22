@@ -175,6 +175,7 @@ class Gen:
         self.uses_wave_bits = False    # a whole lane mask gathered from the wave (OpGroupNonUniformBitwiseOr)
         self.uses_quad = False         # s_wqm on a lane mask (OpGroupNonUniformQuadSwap)
         self.lane_masks = {}           # id(instruction) -> registers holding a lane mask there (lane_masks.py)
+        self.ever_mask = set()         # SGPRs that held a lane mask anywhere in the shader (conservative)
         self.cur_masks = {}
         self.mask_writes = set()       # id(instruction) of the ones that write a lane mask to a VGPR
         self.write_all_lanes = False
@@ -2600,6 +2601,9 @@ class Gen:
         """Run the lane-mask analysis and give every VGPR lane a mask is fetched back from a slot of its own,
         after the real registers in the %sgpr array (the array grows by as many)."""
         self.lane_masks, self.mask_writes = lane_masks.analyse(*blocks)
+        # lane_masks merges a mask on one path with plain data on another by dropping the register,
+        # so "not in cur_masks" does not prove it is data on every path. Keep a conservative set.
+        self.ever_mask = {r for m in self.lane_masks.values() for r in m if isinstance(r, int)}
         slots = lane_masks.parked(blocks[0], self.lane_masks)
         self.parked = {slot: self.SGPRS + i for i, slot in enumerate(slots)}
 
@@ -2656,6 +2660,10 @@ class Gen:
         zero/-1 word is a zero-extended mask: selecting it as data would read this lane's bit.
         """
         return a["k"] == "sgpr" and any(a["r"] + i in self.cur_masks for i in range(a.get("n", 1)))
+
+    def any_ever_mask_word(self, a):
+        """Whether any dword of an SGPR pair held a lane mask on any path, even earlier in the shader."""
+        return a["k"] == "sgpr" and any(a["r"] + i in self.ever_mask for i in range(a.get("n", 1)))
 
     def wave_mask(self, a):
         """The whole wave's lane mask in operand `a` as real bits: (lanes 0-31, lanes 32-63). A register holds
@@ -5242,11 +5250,11 @@ class Gen:
             # S_CMOV_B64 : SOP1_64 under Uses = [SCC]). Plain 64-bit data only: a lane-mask pair holds one
             # lane's bit here, so selecting it as data would silently read a bool instead of the wave's mask
             # (issue #210). Those operands keep failing loudly.
-            if self.is_mask_op(a[1]) or self.any_mask_word(a[1]):
+            if self.is_mask_op(a[1]) or self.any_mask_word(a[1]) or self.any_ever_mask_word(a[1]):
                 raise Unsupported("s_cmov_b64 lane-mask source")
             if a[0]["k"] != "sgpr" or a[0].get("n") != 2:
                 raise Unsupported("s_cmov_b64 destination")
-            if self.holds_lane_mask(a[0]) or self.any_mask_word(a[0]):
+            if self.holds_lane_mask(a[0]) or self.any_mask_word(a[0]) or self.any_ever_mask_word(a[0]):
                 raise Unsupported("s_cmov_b64 lane-mask destination")
             (xlo, xhi) = self.src64_data(a[1], op)
             # Read both old dwords before any store, so D overlapping S0 stays exact.

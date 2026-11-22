@@ -222,6 +222,17 @@ class RejectionTests(unittest.TestCase):
                 with self.assertRaisesRegex(rdna2spirv.Unsupported, re.escape(self.MASK_DEST)):
                     translate_ps(full)
 
+    def test_ever_mask_pair_rejected_after_overwrite(self):
+        # A register that held a mask earlier, then plain data, is refused: at a
+        # CFG join lane_masks.py can drop the register (mask on one path, data on
+        # another), so "not a mask now" does not prove it is data on every path.
+        lines = ["v_cmp_ne_u32_e64 s[20:21], 0, v0",
+                 "s_mov_b64 s[20:21], 0", "s_mov_b64 s[2:3], 0",
+                 "s_cmov_b64 s[2:3], s[20:21]",
+                 "exp mrt0 v0, v0, v0, v0 done vm", "s_endpgm"]
+        with self.assertRaisesRegex(rdna2spirv.Unsupported, re.escape(self.MASK_SOURCE)):
+            translate_ps(lines)
+
     def test_invalid_destinations_rejected_with_message(self):
         for line in ("s_cmov_b64 exec, s[4:5]", "s_cmov_b64 vcc, s[4:5]",
                      "s_cmov_b64 m0, s[4:5]", "s_cmov_b64 s4, s[4:5]",
