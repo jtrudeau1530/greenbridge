@@ -448,6 +448,57 @@ class ScalarSALUInterpreter:
                 break
         return self.state
 
+
+@dataclass
+class SIMDWavefrontState:
+    """Architectural state for a 64-lane SIMD wavefront with shared scalar and per-lane vector registers."""
+    scalar: ScalarRegisterState = field(default_factory=ScalarRegisterState)
+    vgprs: list[list[int]] = field(default_factory=lambda: [[0] * 64 for _ in range(256)])
+
+    def read_vgpr(self, reg_idx: int, lane: int) -> int:
+        return self.vgprs[reg_idx][lane] & MASK32
+
+    def write_vgpr(self, reg_idx: int, lane: int, val: int) -> None:
+        self.vgprs[reg_idx][lane] = val & MASK32
+
+    def write_vgpr_active_lanes(self, reg_idx: int, lane_val: Union[int, list[int]]) -> None:
+        """Write to vector register only across active lanes indicated by scalar EXEC mask."""
+        exec_mask = self.scalar.exec & MASK64
+        for lane in range(64):
+            if (exec_mask & (1 << lane)) != 0:
+                val = lane_val[lane] if isinstance(lane_val, list) else lane_val
+                self.vgprs[reg_idx][lane] = val & MASK32
+
+
+class SIMDWavefrontInterpreter:
+    """Wavefront interpreter modeling SIMD multi-lane divergence and 64-bit EXEC masking."""
+
+    def __init__(self, wave_state: Optional[SIMDWavefrontState] = None):
+        self.wave = wave_state if wave_state is not None else SIMDWavefrontState()
+        self.scalar_interp = ScalarSALUInterpreter(self.wave.scalar)
+
+    def execute_vector_mov(self, dst_vgpr: int, src_val: Union[int, list[int]]) -> None:
+        """Execute vector move under current EXEC mask."""
+        self.wave.write_vgpr_active_lanes(dst_vgpr, src_val)
+
+    def execute_vector_add(self, dst_vgpr: int, src0_vgpr: int, src1_vgpr: int) -> None:
+        """Execute vector addition under current EXEC mask."""
+        exec_mask = self.wave.scalar.exec & MASK64
+        for lane in range(64):
+            if (exec_mask & (1 << lane)) != 0:
+                s0 = self.wave.read_vgpr(src0_vgpr, lane)
+                s1 = self.wave.read_vgpr(src1_vgpr, lane)
+                self.wave.write_vgpr(dst_vgpr, lane, (s0 + s1) & MASK32)
+
+    def execute_vector_cmp_eq(self, src0_vgpr: int, imm: int) -> int:
+        """Vector compare equal against immediate, producing a 64-bit mask in VCC."""
+        mask = 0
+        for lane in range(64):
+            if self.wave.read_vgpr(src0_vgpr, lane) == (imm & MASK32):
+                mask |= (1 << lane)
+        self.wave.scalar.vcc = mask & MASK64
+        return mask & MASK64
+
 MASK32: int = 0xFFFFFFFF
 MASK64: int = 0xFFFFFFFFFFFFFFFF
 SIGN_BIT64: int = 0x8000000000000000
@@ -835,6 +886,154 @@ class TestSaluAndSaveexecB64ScalarInterpreter(unittest.TestCase):
         interp = ScalarSALUInterpreter()
         state = interp.run(prog)
         self.assertEqual(state.read_sgpr32(10), 42)
+
+
+class TestSaluAndSaveexecB64SIMD(unittest.TestCase):
+    """Unit tests for SIMD multi-lane divergence and 32/64-bit EXEC masking."""
+
+    def test_simd_lane_divergence_masking(self) -> None:
+        """Verify vector writes execute strictly across active lanes governed by s_and_saveexec_b64."""
+        wave = SIMDWavefrontState()
+        interp = SIMDWavefrontInterpreter(wave)
+
+        # Initialize all 64 lanes of v0 to 100
+        interp.execute_vector_mov(dst_vgpr=0, src_val=100)
+        for lane in range(64):
+            self.assertEqual(wave.read_vgpr(0, lane), 100)
+
+        # Set vcc to even lanes (0x5555555555555555)
+        wave.scalar.vcc = EVEN_LANES_64
+
+        # Divergent branch setup: s_and_saveexec_b64 s[4:5], vcc
+        inst = Instruction(
+            Opcode.S_AND_SAVEEXEC_B64,
+            dst=Register(RegKind.SGPR, 4, size=64),
+            src0=Operand(reg=Register(RegKind.VCC, 0, size=64), size=64),
+        )
+        interp.scalar_interp.step(inst)
+
+        # Verify scalar state: saved EXEC has all 64 lanes, new EXEC has even lanes
+        self.assertEqual(wave.scalar.read_sgpr64(4), ALL_LANES_64)
+        self.assertEqual(wave.scalar.exec, EVEN_LANES_64)
+        self.assertEqual(wave.scalar.scc, 1)
+
+        # Execute vector write to v0 with value 200 under even-lane EXEC mask
+        interp.execute_vector_mov(dst_vgpr=0, src_val=200)
+
+        # Active (even) lanes must be updated to 200; inactive (odd) lanes must remain 100
+        for lane in range(64):
+            expected = 200 if (lane % 2 == 0) else 100
+            self.assertEqual(wave.read_vgpr(0, lane), expected, f"Mismatch at lane {lane}")
+
+    def test_simd_inactive_lanes_preservation(self) -> None:
+        """Verify inactive lanes preserve all VGPR data across repeated operations."""
+        wave = SIMDWavefrontState()
+        interp = SIMDWavefrontInterpreter(wave)
+
+        # Each lane has distinct initial value
+        for lane in range(64):
+            wave.write_vgpr(1, lane, 1000 + lane)
+
+        # Activate only lane 42
+        wave.scalar.vcc = 1 << 42
+        inst = Instruction(
+            Opcode.S_AND_SAVEEXEC_B64,
+            dst=Register(RegKind.SGPR, 8, size=64),
+            src0=Operand(reg=Register(RegKind.VCC, 0, size=64), size=64),
+        )
+        interp.scalar_interp.step(inst)
+
+        # Write 9999 to v1 under single-lane mask
+        interp.execute_vector_mov(dst_vgpr=1, src_val=9999)
+
+        for lane in range(64):
+            if lane == 42:
+                self.assertEqual(wave.read_vgpr(1, lane), 9999)
+            else:
+                self.assertEqual(wave.read_vgpr(1, lane), 1000 + lane)
+
+    def test_simd_nested_divergence_stack(self) -> None:
+        """Verify 2-level nested conditional divergence saving masks into SGPR pairs."""
+        wave = SIMDWavefrontState()
+        interp = SIMDWavefrontInterpreter(wave)
+
+        # Level 1: activate lower 32 lanes
+        # s_and_saveexec_b64 s[4:5], 0x00000000FFFFFFFF
+        inst1 = Instruction(
+            Opcode.S_AND_SAVEEXEC_B64,
+            dst=Register(RegKind.SGPR, 4, size=64),
+            src0=Operand(imm=LOW32_LANES_64, size=64),
+        )
+        interp.scalar_interp.step(inst1)
+        self.assertEqual(wave.scalar.read_sgpr64(4), ALL_LANES_64)
+        self.assertEqual(wave.scalar.exec, LOW32_LANES_64)
+
+        # Level 2 (nested): activate only even lanes within lower 32 lanes
+        # s_and_saveexec_b64 s[6:7], 0x5555555555555555
+        inst2 = Instruction(
+            Opcode.S_AND_SAVEEXEC_B64,
+            dst=Register(RegKind.SGPR, 6, size=64),
+            src0=Operand(imm=EVEN_LANES_64, size=64),
+        )
+        interp.scalar_interp.step(inst2)
+        self.assertEqual(wave.scalar.read_sgpr64(6), LOW32_LANES_64)
+        self.assertEqual(wave.scalar.exec, LOW32_LANES_64 & EVEN_LANES_64)
+
+        # Unwind Level 2: restore Level 1 mask
+        inst_restore1 = Instruction(
+            Opcode.S_MOV_B64,
+            dst=Register(RegKind.EXEC, 0, size=64),
+            src0=Operand(reg=Register(RegKind.SGPR, 6, size=64), size=64),
+        )
+        interp.scalar_interp.step(inst_restore1)
+        self.assertEqual(wave.scalar.exec, LOW32_LANES_64)
+
+        # Unwind Level 1: restore original all-lanes mask
+        inst_restore2 = Instruction(
+            Opcode.S_MOV_B64,
+            dst=Register(RegKind.EXEC, 0, size=64),
+            src0=Operand(reg=Register(RegKind.SGPR, 4, size=64), size=64),
+        )
+        interp.scalar_interp.step(inst_restore2)
+        self.assertEqual(wave.scalar.exec, ALL_LANES_64)
+
+    def test_simd_all_lanes_disabled_early_exit(self) -> None:
+        """Verify when no lanes match, s_and_saveexec_b64 sets EXEC=0 and SCC=0."""
+        wave = SIMDWavefrontState()
+        interp = SIMDWavefrontInterpreter(wave)
+
+        # Condition mask is 0
+        wave.scalar.vcc = 0
+        inst = Instruction(
+            Opcode.S_AND_SAVEEXEC_B64,
+            dst=Register(RegKind.SGPR, 0, size=64),
+            src0=Operand(reg=Register(RegKind.VCC, 0, size=64), size=64),
+        )
+        interp.scalar_interp.step(inst)
+
+        self.assertEqual(wave.scalar.exec, 0)
+        self.assertEqual(wave.scalar.scc, 0)
+        self.assertEqual(len(active_lanes_from_exec(wave.scalar.exec)), 0)
+
+    def test_simd_wave32_compatibility_masking(self) -> None:
+        """Verify behavior when running 32-lane wave workloads on 64-bit mask."""
+        wave = SIMDWavefrontState()
+        interp = SIMDWavefrontInterpreter(wave)
+
+        # Restrict initially to Wave32 lower half
+        wave.scalar.exec = LOW32_LANES_64
+
+        # AND with upper half produces 0
+        inst = Instruction(
+            Opcode.S_AND_SAVEEXEC_B64,
+            dst=Register(RegKind.SGPR, 0, size=64),
+            src0=Operand(imm=HIGH32_LANES_64, size=64),
+        )
+        interp.scalar_interp.step(inst)
+
+        self.assertEqual(wave.scalar.read_sgpr64(0), LOW32_LANES_64)
+        self.assertEqual(wave.scalar.exec, 0)
+        self.assertEqual(wave.scalar.scc, 0)
 
 
 if __name__ == "__main__":
