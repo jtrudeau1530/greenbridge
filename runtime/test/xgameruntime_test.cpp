@@ -293,6 +293,66 @@ void check_run_time_load() {
         check(reinterpret_cast<SetOptions>(slot(e, 5))(e, 0, 0) == S_OK, "slot 5 is XErrorSetOptions");
         release(e);
     }
+
+    const GUID networking_cls = {0x37e56907, 0x2f10, 0x41e8, {0xb7, 0x2f, 0x36, 0xed, 0xb1, 0x85, 0x33, 0x1a}};
+    void* n = get(networking_cls);
+    check(n != nullptr, "QueryApiImpl hands out XNetworkingImpl for its class id");
+    if (n) {
+        void* again = get(networking_cls);
+        check(again == n, "XNetworkingImpl is one process-wide object");
+        release(again);
+
+        // Slot 15: XNetworkingGetConnectivityHint
+        struct ConnectivityHint {
+            uint32_t level;
+            uint32_t cost;
+            uint32_t iana_type;
+            bool network_initialized;
+            bool approaching_limit;
+            bool over_limit;
+            bool roaming;
+        } hint{};
+        using GetHint = HRESULT(STDMETHODCALLTYPE*)(void*, ConnectivityHint*);
+        check(reinterpret_cast<GetHint>(slot(n, 15))(n, nullptr) == E_POINTER,
+              "slot 15 rejects null pointer with E_POINTER");
+        check(reinterpret_cast<GetHint>(slot(n, 15))(n, &hint) == S_OK && hint.network_initialized &&
+                  hint.level == 3 && hint.cost == 1,
+              "slot 15 is XNetworkingGetConnectivityHint reporting initialized network and internet access");
+
+        // Slot 14: XNetworkingVerifyServerCertificate
+        using VerifyCert = HRESULT(STDMETHODCALLTYPE*)(void*, void*, const void*);
+        check(reinterpret_cast<VerifyCert>(slot(n, 14))(n, nullptr, nullptr) == S_OK,
+              "slot 14 is XNetworkingVerifyServerCertificate returning S_OK offline");
+
+        // Slot 16 & 17: XNetworkingRegisterConnectivityHintChanged and Unregister
+        using RegisterHint = HRESULT(STDMETHODCALLTYPE*)(void*, XTaskQueueHandle, void*, void*, XTaskQueueRegistrationToken*);
+        using UnregisterHint = bool(STDMETHODCALLTYPE*)(void*, XTaskQueueRegistrationToken, bool);
+        XTaskQueueRegistrationToken tok1{0}, tok2{0};
+        check(reinterpret_cast<RegisterHint>(slot(n, 16))(n, nullptr, nullptr, nullptr, &tok1) == S_OK &&
+                  reinterpret_cast<RegisterHint>(slot(n, 16))(n, nullptr, nullptr, nullptr, &tok2) == S_OK &&
+                  tok1.token != tok2.token && tok1.token > 0,
+              "slot 16 registers connectivity hint callbacks and hands out tokens");
+        check(reinterpret_cast<UnregisterHint>(slot(n, 17))(n, tok1, false) == true &&
+                  reinterpret_cast<UnregisterHint>(slot(n, 17))(n, tok2, true) == true,
+              "slot 17 unregisters connectivity hint callbacks");
+
+        // Slots 11-13: Async security info query
+        using QuerySecAsync = HRESULT(STDMETHODCALLTYPE*)(void*, const wchar_t*, XAsyncBlock*);
+        using QuerySecSize = HRESULT(STDMETHODCALLTYPE*)(void*, XAsyncBlock*, size_t*);
+        using QuerySecResult = HRESULT(STDMETHODCALLTYPE*)(void*, XAsyncBlock*, size_t, size_t*, uint8_t*, void**);
+        check(reinterpret_cast<QuerySecAsync>(slot(n, 11))(n, L"https://example.com", nullptr) == S_OK,
+              "slot 11 is XNetworkingQuerySecurityInformationForUrlUtf16Async");
+        size_t sec_size = 42;
+        check(reinterpret_cast<QuerySecSize>(slot(n, 12))(n, nullptr, &sec_size) == S_OK && sec_size == 0,
+              "slot 12 is XNetworkingQuerySecurityInformationForUrlUtf16AsyncResultSize returning 0 bytes");
+        size_t used = 42;
+        void* sec_info = reinterpret_cast<void*>(1);
+        check(reinterpret_cast<QuerySecResult>(slot(n, 13))(n, nullptr, 0, &used, nullptr, &sec_info) == S_OK &&
+                  used == 0 && sec_info == nullptr,
+              "slot 13 is XNetworkingQuerySecurityInformationForUrlUtf16AsyncResult returning S_OK with null result");
+
+        release(n);
+    }
     check(uninit_api() == S_OK, "UninitializeApiImpl succeeds");
 
     HMODULE k32 = load_w(L"kernel32.dll");

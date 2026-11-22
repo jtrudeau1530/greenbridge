@@ -462,6 +462,15 @@ def main(argv=None) -> int:
         os.path.join(work, "first_light", "spirv", f"{picked[1]['name']}.spv"),
         os.path.join(out_dir, "ps.spv"),
     )
+    # For d3d12_first_light_test: the game's containers (the PSO finds each stage by the FSSM hash inside) and
+    # the translator's index entries, keyed vs/ps so the runtime's shader library reads vs.spv and ps.spv here.
+    for entry in picked:
+        shutil.copy(
+            os.path.join(work, "shaders", "dxbc", entry["file"]),
+            os.path.join(out_dir, f"{entry['stage']}.dxbc"),
+        )
+    with open(os.path.join(out_dir, "index.json"), "w", encoding="utf-8", newline="\n") as f:
+        json.dump({"vs": meta["vs"], "ps": meta["ps"]}, f, indent=1)
     vertices, indices = read_obj(a.obj) if a.obj else ([], [])
     obj_sha256 = None
     if a.obj:
@@ -503,7 +512,14 @@ def main(argv=None) -> int:
         "clear_pixel": clear,
         "uv_probes": probes,
         "clear": -1.0,
-        "files": {"vs": "vs.spv", "ps": "ps.spv", "mesh": "mesh.bin"},
+        "files": {
+            "vs": "vs.spv",
+            "ps": "ps.spv",
+            "mesh": "mesh.bin",
+            "vs_dxbc": "vs.dxbc",
+            "ps_dxbc": "ps.dxbc",
+            "index": "index.json",
+        },
     }
     with open(os.path.join(out_dir, "manifest.json"), "w", encoding="utf-8", newline="\n") as f:
         json.dump(manifest, f, indent=1)

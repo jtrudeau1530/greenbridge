@@ -422,11 +422,11 @@ void* find_loaded_bundled_module(const std::string& dll_lower) {
     return nullptr;
 }
 
-void* load_bundled_module(const std::string& dll_lower, bool& handled) {
+void* load_bundled_module(const std::string& dll_lower, uint32_t flags, bool& handled) {
     handled = false;
     for (const auto& entry : snapshot_bundled_loaders()) {
         bool loader_handled = false;
-        void* h = entry.ops->load_bundled(entry.ctx, dll_lower, loader_handled);
+        void* h = entry.ops->load_bundled(entry.ctx, dll_lower, flags, loader_handled);
         if (loader_handled) {
             handled = true;
             return h;

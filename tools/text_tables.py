@@ -111,7 +111,7 @@ def string_tables(buf: bytes):
                 continue
             start = blob + (struct.unpack_from("<Q", buf, at)[0] >> 20)
             end = buf.find(b"\0", start, blob + blob_bytes)
-            if blob <= start and end > start:
+            if blob <= start <= end:
                 out[h] = buf[start:end].decode("utf-8", "replace")
         if out:
             yield out
@@ -170,11 +170,14 @@ def _is_resource(data: bytes) -> bool:
 
 
 def _chains(rows, read):
-    """(offset, bytes) per logical blob: a stream plus the streams that continue a full 64 KiB one."""
+    """(offset, bytes) per logical blob: a stream plus the streams that continue a full one.
+
+    A stream is full when its size is a whole number of 64 KiB blocks: a resource's first stream is often 128 or
+    192 KiB (docs/page_directory.md), not only 64 KiB, and its descriptors then end in the stream that follows."""
     cur_off, parts, last = None, [], 0
     for row in rows:
         data = read(row)
-        continues = (cur_off is not None and last == BLOCK and not _is_resource(data)
+        continues = (cur_off is not None and last > 0 and last % BLOCK == 0 and not _is_resource(data)
                      and data[:4] != b"PSIN" and data[:4] != b"RBF0")
         if continues and sum(map(len, parts)) + len(data) <= MAX_RESOURCE_BYTES:
             parts.append(data)

@@ -36,6 +36,10 @@ import re
 import sys
 import tempfile
 
+# -I keeps the script directory off sys.path, so add it explicitly before importing the sibling module.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from report_paths import same_report_path  # noqa: E402
+
 MASK32 = 0xFFFFFFFF
 MASK64 = 0xFFFFFFFFFFFFFFFF
 
@@ -426,7 +430,8 @@ def load_rows(path: str) -> list[dict]:
 
 
 def resolve_maps(rows, dictionary: NameDictionary, *, include_derived: bool = False) -> dict:
-    names = {parse_u64(row.get("map_name", row.get("name"))) for row in rows}
+    map_rows = [row for row in rows if isinstance(row, dict) and row.get("kind") in (None, "map")]
+    names = {parse_u64(row.get("map_name", row.get("name"))) for row in map_rows}
     names.discard(None)
     stats = {
         "rows": 0, "name_present": 0, "name_resolved": 0, "name_verified": 0,
@@ -434,11 +439,7 @@ def resolve_maps(rows, dictionary: NameDictionary, *, include_derived: bool = Fa
         "parent_present": 0, "parent_resolved": 0, "parent_ambiguous": 0,
         "parent_unresolved": 0, "parent_links": 0, "parent_links_resolved": 0,
     }
-    for row in rows:
-        if not isinstance(row, dict):
-            continue
-        if row.get("kind") not in (None, "map"):
-            continue
+    for row in map_rows:
         stats["rows"] += 1
         name = parse_u64(row.get("map_name", row.get("name")))
         parent = parse_u64(row.get("parent"))
@@ -543,15 +544,6 @@ def _load_json(path: str) -> dict:
         return json.load(handle)
 
 
-def _same_report_path(first: str, second: str) -> bool:
-    if os.path.normcase(os.path.realpath(first)) == os.path.normcase(os.path.realpath(second)):
-        return True
-    try:
-        return os.path.samefile(first, second)
-    except OSError:
-        return False
-
-
 def _build(args) -> int:
     if not (args.manifest or args.scan or args.names or args.xml or args.rpf9_names):
         print("build: at least one --manifest/--scan/--names/--rpf9-names/--xml source is required",
@@ -571,7 +563,7 @@ def _build(args) -> int:
 def _resolve(args) -> int:
     if args.out:
         for path in (args.dict, *args.maps, *args.archetypes):
-            if _same_report_path(args.out, path):
+            if same_report_path(args.out, path):
                 raise ValueError(
                     f"resolve: --out {args.out} would overwrite input {path}")
     try:
