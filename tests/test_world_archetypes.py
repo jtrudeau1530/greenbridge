@@ -2,6 +2,7 @@
 
     python -I tests/test_world_archetypes.py
 """
+import contextlib
 import importlib.util
 import io
 import json
@@ -270,6 +271,29 @@ class CliTest(unittest.TestCase):
         with open(path, "wb") as f:
             f.write(rpf([defs, m]))
         self.check(self.run_cli(path))
+
+    def cli_error(self, argv):
+        err = io.StringIO()
+        with redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err), self.assertRaises(SystemExit) as cm:
+            WA.main(argv)
+        self.assertEqual(cm.exception.code, 2)
+        self.assertNotIn("Traceback", err.getvalue())
+        return err.getvalue()
+
+    def test_out_equal_to_the_input_is_refused_and_leaves_it_alone(self):
+        path = os.path.join(self.tmp.name, "carved.bin")
+        with open(path, "wb") as f:
+            f.write(b"\x00" * 3000)
+        self.assertIn("overwrite the input", self.cli_error([path, "--out", path]))
+        with open(path, "rb") as f:
+            self.assertEqual(f.read(), b"\x00" * 3000)
+
+    def test_out_under_a_regular_file_or_naming_a_folder_is_one_error(self):
+        path = os.path.join(self.tmp.name, "carved.bin")
+        with open(path, "wb") as f:
+            f.write(b"\x00" * 64)
+        self.assertIn("--out", self.cli_error([path, "--out", os.path.join(path, "sub", "r.json")]))
+        self.assertIn("folder", self.cli_error([path, "--out", self.tmp.name]))
 
     def test_missing_path_is_an_error(self):
         with redirect_stdout(io.StringIO()), self.assertRaises(SystemExit):
