@@ -937,5 +937,62 @@ class TestConditionCodesAndStatusFlagsRSQF16(unittest.TestCase):
         self.assertEqual(classify_f16(H_MIN_SUBNORMAL), 1 << 7)
 
 
+class TestIEEE754BoundaryExtremesRSQF16(unittest.TestCase):
+    """Unit tests verifying IEEE-754 boundary extremes, subnormals, and NaN handling."""
+
+    def test_subnormal_progression_gradual_underflow(self) -> None:
+        # Subnormals with even negative powers of 2 yield exact powers of 2
+        powers = [
+            (0x0001, H_4096, "2^-24 -> 4096.0"),
+            (0x0004, 0x6800, "2^-22 -> 2048.0"),
+            (0x0010, 0x6400, "2^-20 -> 1024.0"),
+            (0x0040, 0x6000, "2^-18 -> 512.0"),
+            (0x0100, 0x5C00, "2^-16 -> 256.0"),
+        ]
+        for sub_bits, expected_bits, desc in powers:
+            with self.subTest(msg=desc):
+                res = oracle_v_rsq_f16(sub_bits, ftz=False)
+                self.assertEqual(res, expected_bits)
+
+    def test_subnormal_sweep_ftz_mode(self) -> None:
+        # In FTZ mode, all subnormal inputs flush to 0.0 -> result is +inf
+        subnormals = [0x0001, 0x0002, 0x0004, 0x0010, 0x007F, 0x0100, 0x03FF]
+        for sub in subnormals:
+            with self.subTest(val=hex(sub)):
+                self.assertEqual(oracle_v_rsq_f16(sub, ftz=True), H_POS_INF)
+
+    def test_normal_boundaries_min_and_max(self) -> None:
+        # Smallest positive normal: 2^-14 -> rsq = 2^7 = 128.0 (0x5800)
+        res_min = oracle_v_rsq_f16(H_MIN_NORMAL)
+        self.assertEqual(res_min, 0x5800)
+
+        # Largest finite normal: 65504.0 -> rsq = 1/sqrt(65504) ~ 0.00390625 (0x1C00)
+        res_max = oracle_v_rsq_f16(H_MAX_NORMAL)
+        val_max = bits_to_f16(res_max)
+        self.assertTrue(math.isclose(val_max, 1.0 / math.sqrt(65504.0), rel_tol=1e-3))
+
+    def test_nan_payload_and_quietening(self) -> None:
+        # Signaling NaN quietened by setting quiet bit (bit 9 in binary16)
+        snan_payload = 0x7D55  # exp=0x1F, frac=0x155 (quiet bit 9 is 0)
+        self.assertTrue(is_snan_f16(snan_payload))
+        res = oracle_v_rsq_f16(snan_payload)
+        self.assertTrue(is_qnan_f16(res))
+        self.assertEqual(res & QNAN_BIT_16, QNAN_BIT_16)
+
+        # Quiet NaN payload preserved
+        qnan_payload = 0x7EAA
+        self.assertEqual(oracle_v_rsq_f16(qnan_payload), qnan_payload)
+
+    def test_strict_monotonicity_on_normals(self) -> None:
+        values = [0.0625, 0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0]
+        results = [bits_to_f16(oracle_v_rsq_f16(f16_to_bits(v))) for v in values]
+        for i in range(len(results) - 1):
+            self.assertGreaterEqual(
+                results[i],
+                results[i + 1],
+                f"Monotonicity violated: rsq({values[i]})={results[i]} < rsq({values[i+1]})={results[i+1]}",
+            )
+
+
 if __name__ == "__main__":
     unittest.main()
