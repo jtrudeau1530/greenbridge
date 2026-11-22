@@ -9,6 +9,29 @@ if(NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
 endif()
 
 if(WIN32)
+  # The d3d12_xs shim and its tests use version 1.2 root signatures (D3D12_ROOT_SIGNATURE_DESC2), which the Windows
+  # SDK declares from 10.0.26100 on. Stop here with the fix instead of failing halfway through the build.
+  include(CheckCXXSourceCompiles)
+  check_cxx_source_compiles([=[
+    #include <d3d12.h>
+    int main() { D3D12_VERSIONED_ROOT_SIGNATURE_DESC d{}; d.Version = D3D_ROOT_SIGNATURE_VERSION_1_2;
+                 return static_cast<int>(sizeof(d.Desc_1_2)); }
+  ]=] GTA6RT_SDK_HAS_ROOT_SIGNATURE_1_2)
+  if(NOT GTA6RT_SDK_HAS_ROOT_SIGNATURE_1_2)
+    if(CMAKE_VS_WINDOWS_TARGET_PLATFORM_VERSION)
+      set(_gta6rt_sdk "${CMAKE_VS_WINDOWS_TARGET_PLATFORM_VERSION}")
+    elseif(DEFINED ENV{WindowsSDKVersion})
+      string(REGEX REPLACE "[\\/]+$" "" _gta6rt_sdk "$ENV{WindowsSDKVersion}")
+    else()
+      set(_gta6rt_sdk "an older one")
+    endif()
+    message(FATAL_ERROR
+      "gta6rt needs the Windows SDK 10.0.26100 or newer (version 1.2 root signatures); "
+      "this build uses ${_gta6rt_sdk}. Install it with "
+      "`winget install Microsoft.WindowsSDK.10.0.26100` or the Visual Studio Installer, then delete the build "
+      "folder and configure again.")
+  endif()
+
   # Root-signature flag fix, shared by the d3d12_xs shim and its tests.
   add_library(gta6rt_d3d12_xs_rootsig STATIC
     shims/d3d12_xs_rootsig.cpp
