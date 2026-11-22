@@ -1347,9 +1347,13 @@ public:
                     state_.info.max_push_constants_size = props.limits.maxPushConstantsSize;
                     state_.info.push_constants_need_fallback = (state_.info.max_push_constants_size < 144);
                 }
+                // The counts D3D12 offers with no outputs are the target-independent-rasterization ones: 1, 4, 8
+                // and 16 (ForcedSampleCount is 0, 1, 4, 8 or 16; DirectX-Specs VulkanOn12.md "Sample-frequency MSAA
+                // with no render targets bound": a driver reports at least 0b11101). 2x is not one of them, though
+                // framebufferNoAttachmentsSampleCounts has it on every GPU here; reporting it would offer a count the
+                // PC runtime refuses (its hosts report 0x1d).
                 constexpr VkSampleCountFlags kD3D12SampleCounts =
-                    VK_SAMPLE_COUNT_1_BIT | VK_SAMPLE_COUNT_2_BIT | VK_SAMPLE_COUNT_4_BIT |
-                    VK_SAMPLE_COUNT_8_BIT | VK_SAMPLE_COUNT_16_BIT | VK_SAMPLE_COUNT_32_BIT;
+                    VK_SAMPLE_COUNT_1_BIT | VK_SAMPLE_COUNT_4_BIT | VK_SAMPLE_COUNT_8_BIT | VK_SAMPLE_COUNT_16_BIT;
                 state_.no_output_sample_counts =
                     static_cast<UINT>(props.limits.framebufferNoAttachmentsSampleCounts & kD3D12SampleCounts);
             }
