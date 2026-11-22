@@ -27,7 +27,7 @@ from build import CLIP_CASES, clip_container, shader_source
 from check import Skip, clip_test
 from compute_fixture import compute_header
 from check import (CMPX_CLASS_WORDS, TEST_PROGRAMS, TEXTURE_MIP_DEPENDENCIES, TEXTURE_MIP_TEST, Skip,
-                   mesh_v5_test, not_found_message, pick_build_dir, start_failure, texture_mip_test)
+                   mesh_v5_test, not_found_message, pick_build_dir, start_failure, texture_gradient_a16_test, texture_mip_test)
 from check import TEXOFF_ARGS, texoff_problem   # ps_texoff's expected words and arguments live in check.py
 
 
@@ -425,6 +425,7 @@ def check_clip_half(raw_path: str, want_b: float, want_a: float) -> tuple[bool, 
 
 # Shaders a selected test draws with, built even when the filter leaves them out (#192).
 DRAWN_WITH = {"ps_flat": "vs_ids.asm", "ps_texture_sample": "vs_ids.asm", "ps_cube_sample": "vs_ids.asm",
+              "ps_texture_grad_a16": "vs_ids.asm",
               "vs_clip": "ps_ops.asm"}
 
 
@@ -710,6 +711,9 @@ def run_suite(a, work: str) -> int:
             problem = texture_mip_test(a.build, spirv_dir)
             ok = None if isinstance(problem, Skip) else not problem
             results.append((name, ok, problem or "two passes, 4096 RGBA32F pixels each exact; wrong mip and UV rejected"))
+        elif name == "ps_texture_grad_a16":
+            problem = texture_gradient_a16_test(a.build, spirv_dir)
+            results.append((name, not problem, problem or "4096 RGBA pixels matched"))
         elif name in ("ps_texture_sample", "ps_cube_sample"):
             # Bindless texture tests: vk_texture_test finds vs_ids.spv and the shader in its working directory.
             tool = os.path.join(a.build, "vk_texture_test" + ext)

@@ -95,6 +95,31 @@ def test_depth_compare_sample_result_width(make_shader, d16):
     assert (bool(as_f16), bool(as_f32)) == (d16, not d16)
 
 
+def test_a16_sample_gradients_use_full_vgprs(make_shader):
+    path = os.path.join(ROOT, "runtime", "test", "shaders", "ps_texture_grad_a16.asm")
+    with open(path, encoding="utf-8") as fixture:
+        shader = make_shader(fixture.read(), "ps_texture_grad_a16")
+    spvasm = shader.translate()
+    sample = re.search(r"= OpImageSampleExplicitLod %v4float %\w+ %\w+ Grad (%\w+) (%\w+)$", spvasm, re.M)
+    assert sample, "the explicit-gradient sample is missing"
+    definitions = dict(re.findall(r"^\s*(%\w+) = (Op[^\n]+)", spvasm, re.M))
+
+    # Trace dPdx and dPdy back to the fixture's full 32-bit derivative words, in operand order.
+    for vector, registers in zip(sample.groups(), ((8, 9), (10, 11))):
+        assert definitions[vector].startswith("OpCompositeConstruct %v2float ")
+        components = definitions[vector].split()[2:]
+        assert len(components) == 2
+        for component, register in zip(components, registers):
+            cast, float_type, word = definitions[component].split()
+            assert (cast, float_type) == ("OpBitcast", "%float")
+            load, word_type, pointer = definitions[word].split()
+            assert (load, word_type) == ("OpLoad", "%uint")
+            *access, index = definitions[pointer].split()
+            assert access == ["OpAccessChain", "%_ptr_Function_uint", "%vgpr"]
+            assert definitions[index] == f"OpConstant %uint {register}"
+    shader.validate(spvasm)
+
+
 def test_unknown_stage_is_rejected(make_shader):
     shader = make_shader(program("v_mov_b32 v0, 1.0"), name="xx_test")
     with pytest.raises(rdna2spirv.Unsupported):
