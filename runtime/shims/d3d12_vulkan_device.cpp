@@ -3900,32 +3900,6 @@ public:
     // A shader-resource view of a texture is a T# in the slot (docs section 3.4): the shader loads those eight
     // dwords through its descriptor table and finds the image by them. A slot left as zeros is a null descriptor:
     // nothing is registered for it, so the shader gets the fallback image. Buffer views are not implemented.
-    enum class ShaderViewKind : uint32_t { Empty = 0, CBV = 1, SRV = 2, UAV = 3 };
-
-    struct ShaderView {
-        ShaderViewKind kind = ShaderViewKind::Empty;
-        uint32_t dimension = 0;
-        leonida::ResourceId resource_id = 0;
-        uint64_t gpu_va_or_offset = 0;
-        uint32_t size_or_mip_count = 0;
-        uint16_t first_mip = 0;
-        uint16_t format = 0;
-    };
-    static_assert(sizeof(ShaderView) <= kDescriptorSize);
-
-    void STDMETHODCALLTYPE CreateConstantBufferView(const D3D12_CONSTANT_BUFFER_VIEW_DESC* desc,
-                                                    D3D12_CPU_DESCRIPTOR_HANDLE destination) override {
-        d3d12_trace::record("ID3D12Device::CreateConstantBufferView");
-        if (!destination.ptr) return;
-        ShaderView view{};
-        if (desc) {
-            view.kind = ShaderViewKind::CBV;
-            view.gpu_va_or_offset = desc->BufferLocation;
-            view.size_or_mip_count = desc->SizeInBytes;
-        }
-        std::memcpy(reinterpret_cast<void*>(destination.ptr), &view, sizeof(view));
-    }
-
     void STDMETHODCALLTYPE CreateShaderResourceView(ID3D12Resource* resource,
                                                     const D3D12_SHADER_RESOURCE_VIEW_DESC* desc,
                                                     D3D12_CPU_DESCRIPTOR_HANDLE destination) override {
@@ -3938,19 +3912,7 @@ public:
             if (resource) stub("ID3D12Device::CreateShaderResourceView(resource from another device)");
             return;
         }
-        if (!r->image()) {
-            ShaderView view{};
-            view.kind = ShaderViewKind::SRV;
-            view.dimension = desc ? static_cast<uint32_t>(desc->ViewDimension) : D3D12_SRV_DIMENSION_BUFFER;
-            view.resource_id = r->id();
-            view.format = static_cast<uint16_t>(desc ? desc->Format : r->desc().Format);
-            if (desc && desc->ViewDimension == D3D12_SRV_DIMENSION_BUFFER) {
-                view.gpu_va_or_offset = desc->Buffer.FirstElement;
-                view.size_or_mip_count = desc->Buffer.NumElements;
-            }
-            std::memcpy(reinterpret_cast<void*>(destination.ptr), &view, sizeof(view));
-            return;
-        }
+        if (!r->image()) return stub("ID3D12Device::CreateShaderResourceView(buffer)");
         if (r->desc().Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) {
             log_once("shader-resource view denied by resource flags; format", int(r->desc().Format));
             return;
@@ -4042,20 +4004,7 @@ public:
             if (resource) stub("ID3D12Device::CreateUnorderedAccessView(resource from another device)");
             return;
         }
-        if (!r->image() || counter) {
-            if (counter) return stub("ID3D12Device::CreateUnorderedAccessView(counter)");
-            ShaderView view{};
-            view.kind = ShaderViewKind::UAV;
-            view.dimension = desc ? static_cast<uint32_t>(desc->ViewDimension) : D3D12_UAV_DIMENSION_BUFFER;
-            view.resource_id = r->id();
-            view.format = static_cast<uint16_t>(desc ? desc->Format : r->desc().Format);
-            if (desc && desc->ViewDimension == D3D12_UAV_DIMENSION_BUFFER) {
-                view.gpu_va_or_offset = desc->Buffer.FirstElement;
-                view.size_or_mip_count = desc->Buffer.NumElements;
-            }
-            std::memcpy(reinterpret_cast<void*>(destination.ptr), &view, sizeof(view));
-            return;
-        }
+        if (!r->image() || counter) return stub("ID3D12Device::CreateUnorderedAccessView(buffer)");
         if (!(r->desc().Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) {
             log_once("unordered-access view of a texture created without ALLOW_UNORDERED_ACCESS; flags",
                      int(r->desc().Flags));
