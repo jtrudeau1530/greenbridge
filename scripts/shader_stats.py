@@ -38,10 +38,17 @@ COLUMNS = [("orig", "orig", 5, ""), ("aco", "aco", 5, ""), ("growth", "growth", 
            ("spill_detail", "spills", 6, ""), ("waves", "waves", 5, "")]
 
 
-def original(path):
+def original(path: str) -> tuple[int, int]:
     """(instruction count, VGPRs used) of an original RDNA listing."""
     insns = shader_ir.parse_file(path)["insns"]
-    top = max((a["r"] + a.get("n", 1) for i in insns for a in i["args"] if a.get("k") == "vgpr"), default=0)
+    top = 0
+    for insn in insns:
+        for operand in insn["args"]:
+            kind = operand.get("k")
+            if kind == "vgpr":
+                top = max(top, operand["r"] + operand.get("n", 1))
+            elif kind == "vlist":
+                top = max(top, max(operand["r"]) + 1)
     return len(insns), top
 
 

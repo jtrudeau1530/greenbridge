@@ -63,6 +63,14 @@ class ShaderStats(unittest.TestCase):
         self.assertIn("ps: 1 shaders, code growth median 2.00x", r.stdout)
         self.assertIn("scratch in 1, spills in 1", r.stdout)
 
+    def test_original_vgpr_count_includes_non_contiguous_image_addresses(self) -> None:
+        listing = ("\timage_sample v[6:9], [v1, v31, v2], s[0:7], s[8:11] dmask:0xf\n"
+                   "\ts_endpgm\n")
+        result = self.run_stats(["ps_nsa,ps,VGPRs,24"], listings={"ps_nsa": listing})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.detail(result, "ps_nsa")[5:7], ["32", "24"])
+        self.assertIn("VGPRs median 24 vs original 32", result.stdout)
+
     def test_shaders_without_a_listing_are_left_out(self):
         r = self.run_stats(["ps_other,ps,Instructions,10"], details=False)
         self.assertNotEqual(r.returncode, 0)
