@@ -660,6 +660,37 @@ channel subsets (the RBF0 groups are `deformation`, `pose`, `identity`, `facial`
 measured. Still open in ASSET-20: the `0DRP` "2/3 packed clip streams" ([above](#packed-clip-streams)) and which
 model or skeleton each non-humanoid clip dictionary drives.
 
+### Can the fragment bone names identify a clip's model? (ASSET-158)
+
+Bone coverage alone identified **zero unique fragments** for the 8,393 dictionaries below the 90% humanoid
+threshold above. This comparison used the named fragment tables recovered from `packs.rpf` in Xbox 1.0.2.1.
+The threshold selects dictionaries for investigation; some may still animate humanoids.
+
+| Coverage of a dictionary's nonzero rotation and translation bones | Dictionaries |
+|---|---:|
+| At least one bone absent from the union of the recovered fragment tables | 7,817 |
+| Every bone in the union, but no individual table contains them all | 573 |
+| One or more individual tables contain every bone | 3 |
+
+Each of the last three dictionaries animates just one bone. Each matches **82 fragment pages** spanning
+**50 distinct bone sets**. Choosing the first matching page would assign a model arbitrarily.
+
+To reproduce the comparison:
+
+1. Walk all 144,364 streams returned by `anim_index.scan_rpf` for `packs.rpf`. In each inflated page, find
+   the first NUL-terminated `.#ft` suffix before the last NUL-terminated `skel` marker. Between them, hash
+   the NUL-terminated ASCII runs matching `[A-Za-z0-9_]+` with `anim_index.joaat32`.
+2. Read aligned little-endian `{u32 hash, u32 index}` pairs in the page prefix ending before the suffix.
+   Retain hashes in the name set whose index is at most the number of distinct name hashes. This recovers
+   596 hashes on the [known reference page](character_skeleton.md#the-skeleton-name-table). Across the archive,
+   2,849 pages yield a nonempty set, with 524 distinct sets. This check covers pages with that name and
+   hash layout; other skeleton layouts remain open.
+3. Group and parse the `anim.rpf` dictionaries with `anim_clips.group` and `anim_clips.parse_dictionary`.
+   Union the nonzero rotation and translation bone hashes across each dictionary's local packs. Keep
+   dictionaries for which fewer than nine tenths of those hashes occur on the reference page.
+4. Require **all** bones of a retained dictionary to occur on the **same** fragment page. Count matching
+   pages before deduplicating identical bone sets, so repeated fragments remain distinguishable.
+
 ## Readable, compressed and still opaque
 
 - **Readable:** all 273 name tables (2,298 paths), the `0DRP` version/page count, 1,371 type-hash headers,
