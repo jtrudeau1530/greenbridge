@@ -660,6 +660,22 @@ The compute path, end to end:
   - **Logic ops** come from `RenderTarget[0]`, as in D3D12, and apply to every target (Vulkan has one per
     pipeline; it skips float formats). **`DepthClipEnable = FALSE`** is depth clamping: D3D12 clamps output depth
     to the viewport's range anyway.
+  - **Conservative rasterization (Tier 1):** the standalone device enables `VK_EXT_conservative_rasterization`
+    when available; caller-owned devices must set `VulkanDeviceInfo::conservative_rasterization` only if they
+    enabled it. OPTIONS reports Tier 1 only with at least eight subpixel precision bits and a finite, nonnegative
+    primitive overestimation no greater than `0.5 - 1/512` pixels, leaving half a minimum grid step within the
+    Tier 1 uncertainty bound. `ConservativeRaster=ON` uses overestimate mode with zero extra overestimation,
+    including unbound-attachment variants. OFF keeps the ordinary pipeline. Missing support, unknown modes,
+    wireframe and non-triangle PSOs are refused; conservative TIR (`ForcedSampleCount != 0`) remains `E_NOTIMPL`.
+    Tier 2/3 and `SV_InnerCoverage` are not exposed. See [Microsoft's rules](https://learn.microsoft.com/en-us/windows/win32/direct3d12/conservative-rasterization)
+    and [Vulkan's properties](https://docs.vulkan.org/refpages/latest/refpages/source/VkPhysicalDeviceConservativeRasterizationPropertiesEXT.html).
+    `d3d12_conservative_raster_test` checks geometric required/forbidden coverage, subpixel/sliver and degenerate
+    triangles, culling, scissor, 1x/4x MSAA, variants, feature reporting and refusals. Uncertain edge pixels are
+    allowed to differ. On RX 5700 XT (Windows 32.0.21045.5002), 48 scenario pairs pass on Vulkan and native AMD;
+    24 single-sample pairs pass on WARP. WARP's 4x subpixel fixture covers outside the geometric bound; it remains
+    reproducible with `--warp-msaa4`, separately from CTest's 1x software comparison. Vulkan's 4x oracle remains
+    strict. The GPU test needs the current graphics path's 144-byte push-constant support; CPU capability checks
+    do not need a GPU. No game-pass usage is claimed by these synthetic tests.
   - **Formats:** dynamic rendering takes the RTV and DSV formats. A draw that leaves a slot unbound for which the
     PSO names a format (D3D12 allows it and discards those writes) uses a variant of the pipeline with that format
     undefined, built on first use and kept with the PSO. Bit i of the variant key is colour slot i, and bit 8 is
