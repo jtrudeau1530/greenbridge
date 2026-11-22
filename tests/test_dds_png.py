@@ -395,6 +395,20 @@ class HeaderTests(unittest.TestCase):
 
 
 class UncompressedTests(unittest.TestCase):
+    def test_dx10_typeless_byte_layouts(self):
+        payload = bytes((0x10, 0x20, 0x30, 0x40))
+        for dxgi, fmt, expected in (
+            (27, "RGBA8", (0x10, 0x20, 0x30, 0x40)),
+            (90, "BGRA8", (0x30, 0x20, 0x10, 0x40)),
+            (92, "BGRX8", (0x30, 0x20, 0x10, 0xFF)),
+        ):
+            with self.subTest(dxgi=dxgi):
+                data = dds_buffer(1, 1, payload, flags=DDPF_FOURCC, fourcc=b"DX10", dxgi=dxgi)
+                info = dds.parse_dds_header(data)
+                self.assertEqual(info["format"], fmt)
+                self.assertEqual(info["dxgi_format"], dxgi)
+                self.assertEqual(dds.decode_dds(data), (1, 1, bytes(expected)))
+
     def test_padded_rows_are_removed_before_channel_conversion(self):
         first_row = bytes((1, 2, 3, 4))
         second_row = bytes((5, 6, 7, 8))
