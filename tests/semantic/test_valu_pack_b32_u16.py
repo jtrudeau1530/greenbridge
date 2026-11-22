@@ -1048,6 +1048,126 @@ class TestValuPackB32U16IEEE754Boundaries(unittest.TestCase):
         self.assertAlmostEqual(f32_val, repacked_f32, places=6)
 
 
+# ==============================================================================
+# Negative Controls, Syntax Rejection, and Mutation Detection
+# ==============================================================================
+
+class TestValuPackB32U16NegativeControls(unittest.TestCase):
+    """Negative controls, syntax rejection, and mutation detection for v_pack_b32_u16."""
+
+    def test_syntax_rejection_valu_destination_must_be_vgpr(self) -> None:
+        dst_sgpr = Reg(0, RegType.SGPR)
+        src = VOP3Operand(Reg(1, RegType.VGPR))
+        with self.assertRaises(TypeError):
+            VPackB32U16Instruction(dst=dst_sgpr, src0=src, src1=src)
+
+    def test_syntax_rejection_invalid_lane_count(self) -> None:
+        with self.assertRaises(ValueError):
+            SIMDState(num_lanes=16)
+        with self.assertRaises(ValueError):
+            SIMDState(num_lanes=128)
+
+    def test_syntax_rejection_invalid_op_sel(self) -> None:
+        src = VOP3Operand(Reg(1, RegType.VGPR))
+        with self.assertRaises(ValueError):
+            VPackB32U16Instruction(dst=Reg(0, RegType.VGPR), src0=src, src1=src, op_sel=(2, 0))
+        with self.assertRaises(ValueError):
+            VPackB32U16Instruction(dst=Reg(0, RegType.VGPR), src0=src, src1=src, op_sel=(0, -1))
+
+    def test_negative_control_operand_order_reversal(self) -> None:
+        s0, s1 = 0x1111, 0x2222
+        correct = oracle_v_pack_b32_u16(s0, s1)
+        reversed_order = oracle_v_pack_b32_u16(s1, s0)
+        self.assertNotEqual(correct, reversed_order)
+
+    def test_negative_control_inverted_op_sel(self) -> None:
+        s0 = 0x12345678
+        s1 = 0x9ABCDEF0
+        correct = oracle_v_pack_b32_u16(s0, s1, op_sel=(0, 0))
+        inverted = oracle_v_pack_b32_u16(s0, s1, op_sel=(1, 1))
+        self.assertNotEqual(correct, inverted)
+
+    def test_negative_control_missing_high_half_shift(self) -> None:
+        s0, s1 = 0x1111, 0x2222
+        correct = oracle_v_pack_b32_u16(s0, s1)
+        # Bug: unshifted high half
+        buggy = (s0 & MASK16) | (s1 & MASK16)
+        self.assertNotEqual(correct, buggy)
+
+    def test_negative_control_off_by_one_shift(self) -> None:
+        s0, s1 = 0x1111, 0x2222
+        correct = oracle_v_pack_b32_u16(s0, s1)
+        shift_15 = (s0 & MASK16) | ((s1 & MASK16) << 15)
+        shift_17 = (s0 & MASK16) | (((s1 & MASK16) << 17) & MASK32)
+        self.assertNotEqual(correct, shift_15)
+        self.assertNotEqual(correct, shift_17)
+
+    def test_negative_control_missing_mask_truncation(self) -> None:
+        s0 = 0xDEAD1234
+        s1 = 0xBEEF5678
+        correct = oracle_v_pack_b32_u16(s0, s1)
+        # Bug: unmasked 32-bit values leaking into destination
+        unmasked = (s0 | (s1 << 16)) & MASK32
+        self.assertNotEqual(correct, unmasked)
+
+    def test_negative_control_clamp_wrap_discrepancy(self) -> None:
+        s0 = 70000
+        s1 = 0x1234
+        clamped = oracle_v_pack_b32_u16(s0, s1, clamp=True)
+        wrapped = oracle_v_pack_b32_u16(s0, s1, clamp=False)
+        self.assertNotEqual(clamped, wrapped)
+
+    def test_negative_control_signed_clamp_discrepancy(self) -> None:
+        s0 = -10
+        s1 = 0x1234
+        uclamped = oracle_v_pack_b32_u16(s0, s1, clamp=True, signed=False)
+        sclamped = oracle_v_pack_b32_u16(s0, s1, clamp=True, signed=True)
+        self.assertNotEqual(uclamped, sclamped)
+
+    def test_mutation_pack_addition_instead_of_or(self) -> None:
+        """Mutant: Replace bitwise OR with addition, which overflows on dirty bits."""
+        def mutant_pack(lo: int, hi: int) -> int:
+            return ((hi << 16) + lo) & MASK32
+
+        s0 = 0x8000
+        s1 = 0x8000
+        expected = pack_b32_u16(s0, s1)
+        mutant = mutant_pack(s0, s1)
+        self.assertEqual(expected, mutant)
+
+        # High bits leak or collide
+        dirty_lo = 0x18000
+        dirty_hi = 0x8000
+        self.assertNotEqual(pack_b32_u16(dirty_lo, dirty_hi), mutant_pack(dirty_lo, dirty_hi))
+
+    def test_mutation_ignore_op_sel(self) -> None:
+        """Mutant: Ignore op_sel and always extract low half."""
+        def mutant_oracle(s0: int, s1: int, op_sel: Tuple[int, int]) -> int:
+            # Bug: always extract low half
+            return pack_b32_u16(s0 & MASK16, s1 & MASK16)
+
+        s0 = 0x12345678
+        s1 = 0x9ABCDEF0
+        correct = oracle_v_pack_b32_u16(s0, s1, op_sel=(1, 1))
+        mutant = mutant_oracle(s0, s1, op_sel=(1, 1))
+        self.assertEqual(correct, 0x9ABC1234)
+        self.assertEqual(mutant, 0xDEF05678)
+        self.assertNotEqual(correct, mutant)
+
+    def test_mutation_clamp_wrong_threshold(self) -> None:
+        """Mutant: Clamp to signed 15-bit max (0x7FFF) instead of unsigned 16-bit max (0xFFFF)."""
+        def mutant_clamp_u16(val: int) -> int:
+            return min(val & MASK32, 0x7FFF)
+
+        val = 0x8000
+        correct = ref_clamp_u16(val)
+        mutant = mutant_clamp_u16(val)
+        self.assertEqual(correct, 0x8000)
+        self.assertEqual(mutant, 0x7FFF)
+        self.assertNotEqual(correct, mutant)
+
+
+
 
 
 
