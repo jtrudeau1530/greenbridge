@@ -142,5 +142,128 @@ class TestValuPackB32U16ModelAndOracle(unittest.TestCase):
         self.assertEqual(ref_extract_half(res, True), 0)
 
 
+# ==============================================================================
+# Symbolic AST Opcode Definitions and Typed Expressions
+# ==============================================================================
+
+class RegType(Enum):
+    VGPR = auto()
+    SGPR = auto()
+
+
+@dataclass(frozen=True)
+class Reg:
+    """Represents an architectural 32-bit register (VGPR or SGPR)."""
+    index: int
+    reg_type: RegType
+
+    def __post_init__(self) -> None:
+        if not (0 <= self.index <= 255):
+            raise ValueError(f"Register index {self.index} out of range [0, 255]")
+
+    @property
+    def name(self) -> str:
+        prefix = "v" if self.reg_type == RegType.VGPR else "s"
+        return f"{prefix}{self.index}"
+
+
+@dataclass(frozen=True)
+class Literal32:
+    """Represents a 32-bit literal integer constant."""
+    bits: int
+
+    @property
+    def name(self) -> str:
+        return f"0x{self.bits & MASK32:08X}"
+
+
+@dataclass(frozen=True)
+class VOP3Operand:
+    """Typed expression operand (Register or Literal32)."""
+    source: Union[Reg, Literal32]
+
+    def disassemble(self) -> str:
+        return self.source.name
+
+
+class Opcode(Enum):
+    V_PACK_B32_U16 = "v_pack_b32_u16"
+
+
+@dataclass(frozen=True)
+class VPackB32U16Instruction:
+    """Symbolic AST node representing a RDNA2 v_pack_b32_u16 instruction."""
+    dst: Reg
+    src0: VOP3Operand
+    src1: VOP3Operand
+    op_sel: Tuple[int, int] = (0, 0)
+    clamp: bool = False
+    signed: bool = False
+    opcode: Opcode = Opcode.V_PACK_B32_U16
+
+    def __post_init__(self) -> None:
+        if self.dst.reg_type != RegType.VGPR:
+            raise TypeError(f"Destination of VALU instruction must be VGPR, got {self.dst.reg_type}")
+        if self.op_sel[0] not in (0, 1) or self.op_sel[1] not in (0, 1):
+            raise ValueError(f"op_sel values must be 0 or 1, got {self.op_sel}")
+
+    def disassemble(self) -> str:
+        s = f"{self.opcode.value} {self.dst.name}, {self.src0.disassemble()}, {self.src1.disassemble()}"
+        if self.op_sel != (0, 0):
+            s += f" op_sel:[{self.op_sel[0]},{self.op_sel[1]}]"
+        if self.clamp:
+            s += " clamp"
+        return s
+
+
+class TestValuPackB32U16SymbolicAST(unittest.TestCase):
+    """Unit tests for symbolic AST opcode definitions and typed expressions."""
+
+    def test_register_creation_and_disassembly(self) -> None:
+        v0 = Reg(0, RegType.VGPR)
+        s5 = Reg(5, RegType.SGPR)
+        self.assertEqual(v0.name, "v0")
+        self.assertEqual(s5.name, "s5")
+
+    def test_register_bounds_validation(self) -> None:
+        with self.assertRaises(ValueError):
+            Reg(-1, RegType.VGPR)
+        with self.assertRaises(ValueError):
+            Reg(256, RegType.VGPR)
+
+    def test_literal_operand(self) -> None:
+        lit = Literal32(0x12345678)
+        self.assertEqual(lit.name, "0x12345678")
+
+    def test_instruction_disassembly(self) -> None:
+        dst = Reg(0, RegType.VGPR)
+        src0 = VOP3Operand(Reg(1, RegType.VGPR))
+        src1 = VOP3Operand(Reg(2, RegType.SGPR))
+
+        inst_default = VPackB32U16Instruction(dst=dst, src0=src0, src1=src1)
+        self.assertEqual(inst_default.disassemble(), "v_pack_b32_u16 v0, v1, s2")
+
+        inst_opsel = VPackB32U16Instruction(dst=dst, src0=src0, src1=src1, op_sel=(1, 0))
+        self.assertEqual(inst_opsel.disassemble(), "v_pack_b32_u16 v0, v1, s2 op_sel:[1,0]")
+
+        inst_clamp = VPackB32U16Instruction(dst=dst, src0=src0, src1=src1, clamp=True)
+        self.assertEqual(inst_clamp.disassemble(), "v_pack_b32_u16 v0, v1, s2 clamp")
+
+        inst_both = VPackB32U16Instruction(dst=dst, src0=src0, src1=src1, op_sel=(1, 1), clamp=True)
+        self.assertEqual(inst_both.disassemble(), "v_pack_b32_u16 v0, v1, s2 op_sel:[1,1] clamp")
+
+    def test_instruction_validation(self) -> None:
+        dst_sgpr = Reg(0, RegType.SGPR)
+        src = VOP3Operand(Reg(1, RegType.VGPR))
+        with self.assertRaises(TypeError):
+            VPackB32U16Instruction(dst=dst_sgpr, src0=src, src1=src)
+
+        with self.assertRaises(ValueError):
+            VPackB32U16Instruction(dst=Reg(0, RegType.VGPR), src0=src, src1=src, op_sel=(2, 0))
+        with self.assertRaises(ValueError):
+            VPackB32U16Instruction(dst=Reg(0, RegType.VGPR), src0=src, src1=src, op_sel=(0, -1))
+
+
+
 if __name__ == "__main__":
     unittest.main()
