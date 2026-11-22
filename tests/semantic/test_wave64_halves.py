@@ -981,5 +981,95 @@ class GeometryRing(unittest.TestCase):
                                     "ds_write2_b32 v14, v14, v14 offset0:0 offset1:1"]), ("C", ["lane-id"]))
 
 
+
+
+def _ps_xy(lane):
+    """8x8 2x2-quad pixel coordinates per lane: lane 4k+{0,1,2,3} is TL, TR, BL, BR."""
+    q, c = divmod(lane, 4)
+    return 2 * (q % 4) + (c & 1), 2 * (q // 4) + (c >> 1)
+
+
+_SWIZZLE_OFFSETS = {
+    "offset:0x801b": "offset:swizzle(QUAD_PERM,3,2,1,0)",
+    "offset:0x41f": "offset:swizzle(SWAP,1)",
+    "offset:0x401f": "offset:swizzle(SWAP,16)",
+    "offset:0x1c": "offset:swizzle(BROADCAST,4,0)",
+}
+
+
+def _load_ps_w64_lines(name):
+    asm_path = os.path.join(os.path.dirname(HERE), "..", "runtime", "test", "shaders", f"{name}.asm")
+    out = []
+    with open(asm_path, encoding="utf-8") as f:
+        for raw in f:
+            line = raw.strip()
+            if not line or line.startswith(";"):
+                continue
+            for hex_off, sym_off in _SWIZZLE_OFFSETS.items():
+                line = line.replace(hex_off, sym_off)
+            out.append(line)
+    return out
+
+
+def _run_ps_cut(asm, wave, push=None, memory=None):
+    words = []
+    for half in range(64 // wave):
+        base = half * wave
+        res = wi.run_wave(
+            asm,
+            wave=wave,
+            push_constants=push,
+            inputs={0: lambda lane, b=base: ((_ps_xy(b + lane)[0] + 0.5) / 64.0,
+                                             (_ps_xy(b + lane)[1] + 0.5) / 64.0, 0.0, 0.0)},
+            memory=memory,
+        )
+        for o in res["outputs"]:
+            mrt = o["%out_mrt0"]
+            words.append(tuple(v.bits if isinstance(v, wi.F) else v for v in mrt))
+    return words
+
+
+class PixelShaders(unittest.TestCase):
+    """TEST-722: run all 17 runtime/test/shaders/ps_w64_*.asm fixtures on spirv_wave_interp (wave 64 vs 2x32)."""
+
+    def test_ps_w64_fixtures(self):
+        sys.path.insert(0, os.path.join(HERE, "..", "..", "runtime", "test", "shaders"))
+        import w64_graphics as wg
+
+        ps_names = sorted(n for n in wg.FIXTURES if n.startswith("ps_w64_"))
+        self.assertEqual(len(ps_names), 17)
+        for name in ps_names:
+            with self.subTest(fixture=name):
+                ref_tier, ref_fn, env = wg.FIXTURES[name]
+                (tier, _, _), asm = meta_of(name, _load_ps_w64_lines(name))
+                self.assertEqual(tier, ref_tier)
+                push = [int(x, 0) for x in env["VKH_SGPRS"].split(",")] if "VKH_SGPRS" in env else None
+                mem64 = {0: 0} if "VKH_HEAP" in env else None
+                mem32 = {0: 0} if "VKH_HEAP" in env else None
+                w64 = _run_ps_cut(asm, 64, push=push, memory=mem64)
+                for lane in range(64):
+                    x, y = _ps_xy(lane)
+                    exp = ref_fn(y * 64 + x)
+                    for c in range(4):
+                        if exp[c] is not None:
+                            self.assertEqual(w64[lane][c], exp[c], f"{name} wave64 lane {lane} c{c}")
+                if name == "ps_w64_c_readlane":
+                    with self.assertRaises(wi.UnsupportedConstruct):
+                        _run_ps_cut(asm, 32, push=push)
+                    continue
+                w32 = _run_ps_cut(asm, 32, push=push, memory=mem32)
+                if tier in ("A", "B"):
+                    self.assertEqual(w32, w64)
+                else:
+                    self.assertNotEqual(w32, w64)
+                if "VKH_HEAP" in env:
+                    self.assertEqual(mem64[0], 16)
+                    self.assertEqual(mem32[0], 16)
+                    slots64 = {mem64[0x100 + 4 * k] for k in range(16)}
+                    slots32 = {mem32[0x100 + 4 * k] for k in range(16)}
+                    self.assertEqual(len(slots64), 16)
+                    self.assertEqual(slots64, slots32)
+
+
 if __name__ == "__main__":
     unittest.main()
