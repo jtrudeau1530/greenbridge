@@ -1385,5 +1385,114 @@ class TestConditionCodesAndStatusFlags(unittest.TestCase):
         self.assertEqual(b_u, 1)
 
 
+class TestIEEE754BoundaryExtremes(unittest.TestCase):
+    """Unit tests for IEEE 754 boundary extremes, subnormals, and NaN handling."""
+
+    def test_subnormal_conversion_suppression(self) -> None:
+        subnormals = [
+            0x0000_0000_0000_0001,  # min positive subnormal
+            0x000F_FFFF_FFFF_FFFF,  # max positive subnormal
+            0x8000_0000_0000_0001,  # min negative subnormal
+            0x800F_FFFF_FFFF_FFFF,  # max negative subnormal
+        ]
+        for sub in subnormals:
+            with self.subTest(sub=hex(sub)):
+                self.assertTrue(is_subnormal_f64(sub))
+                self.assertEqual(oracle_v_cvt_i32_f64(sub), 0)
+                self.assertEqual(oracle_v_cvt_u32_f64(sub), 0)
+
+    def test_signed_zero_invariance(self) -> None:
+        self.assertEqual(oracle_v_cvt_i32_f64(POS_ZERO_64), 0)
+        self.assertEqual(oracle_v_cvt_i32_f64(NEG_ZERO_64), 0)
+        self.assertEqual(oracle_v_cvt_u32_f64(POS_ZERO_64), 0)
+        self.assertEqual(oracle_v_cvt_u32_f64(NEG_ZERO_64), 0)
+
+        # With modifiers
+        self.assertEqual(oracle_v_cvt_i32_f64(NEG_ZERO_64, abs_mod=True), 0)
+        self.assertEqual(oracle_v_cvt_i32_f64(POS_ZERO_64, neg_mod=True), 0)
+        self.assertEqual(oracle_v_cvt_u32_f64(NEG_ZERO_64, abs_mod=True), 0)
+
+    def test_nan_payload_robustness(self) -> None:
+        nans = [
+            CANONICAL_QNAN_64,
+            0x7FF0_0000_0000_0001,  # signaling NaN
+            0x7FF8_DEAD_BEEF_CAFE,  # quiet NaN with payload
+            0xFFF8_1234_5678_9ABC,  # negative quiet NaN
+            0xFFF0_0000_0000_0002,  # negative signaling NaN
+        ]
+        for n in nans:
+            with self.subTest(nan=hex(n)):
+                self.assertTrue(is_nan_f64(n))
+                self.assertEqual(oracle_v_cvt_i32_f64(n), 0)
+                self.assertEqual(oracle_v_cvt_u32_f64(n), 0)
+                # Modifiers on NaN must still produce 0
+                self.assertEqual(oracle_v_cvt_i32_f64(n, abs_mod=True), 0)
+                self.assertEqual(oracle_v_cvt_i32_f64(n, neg_mod=True), 0)
+                self.assertEqual(oracle_v_cvt_u32_f64(n, abs_mod=True), 0)
+                self.assertEqual(oracle_v_cvt_u32_f64(n, neg_mod=True), 0)
+
+    def test_int32_and_uint32_exact_powers_of_two(self) -> None:
+        # 2^31 - 1 = 2147483647.0
+        p31_minus_1 = f64_to_bits(2147483647.0)
+        self.assertEqual(oracle_v_cvt_i32_f64(p31_minus_1), 2147483647)
+        self.assertEqual(oracle_v_cvt_u32_f64(p31_minus_1), 2147483647)
+
+        # 2^31 = 2147483648.0
+        p31 = f64_to_bits(2147483648.0)
+        self.assertEqual(oracle_v_cvt_i32_f64(p31), INT32_MAX)  # saturates in i32
+        self.assertEqual(oracle_v_cvt_u32_f64(p31), 0x8000_0000)  # exact in u32
+
+        # 2^32 - 1 = 4294967295.0
+        p32_minus_1 = f64_to_bits(4294967295.0)
+        self.assertEqual(oracle_v_cvt_i32_f64(p32_minus_1), INT32_MAX)  # saturates in i32
+        self.assertEqual(oracle_v_cvt_u32_f64(p32_minus_1), UINT32_MAX)  # exact in u32
+
+        # 2^32 = 4294967296.0
+        p32 = f64_to_bits(4294967296.0)
+        self.assertEqual(oracle_v_cvt_i32_f64(p32), INT32_MAX)
+        self.assertEqual(oracle_v_cvt_u32_f64(p32), UINT32_MAX)
+
+        # -2^31 = -2147483648.0
+        neg_p31 = f64_to_bits(-2147483648.0)
+        self.assertEqual(oracle_v_cvt_i32_f64(neg_p31), i32_to_u32(INT32_MIN))
+        self.assertEqual(oracle_v_cvt_u32_f64(neg_p31), 0)
+
+        # -2^31 - 1 = -2147483649.0
+        neg_p31_minus_1 = f64_to_bits(-2147483649.0)
+        self.assertEqual(oracle_v_cvt_i32_f64(neg_p31_minus_1), i32_to_u32(INT32_MIN))
+        self.assertEqual(oracle_v_cvt_u32_f64(neg_p31_minus_1), 0)
+
+    def test_fractional_truncation_near_boundaries(self) -> None:
+        self.assertEqual(oracle_v_cvt_i32_f64(f64_to_bits(2147483647.999999)), INT32_MAX)
+        self.assertEqual(oracle_v_cvt_i32_f64(f64_to_bits(-2147483648.999999)), i32_to_u32(INT32_MIN))
+        self.assertEqual(oracle_v_cvt_u32_f64(f64_to_bits(4294967295.999999)), UINT32_MAX)
+        self.assertEqual(oracle_v_cvt_i32_f64(f64_to_bits(0.999999)), 0)
+        self.assertEqual(oracle_v_cvt_i32_f64(f64_to_bits(-0.999999)), 0)
+        self.assertEqual(oracle_v_cvt_u32_f64(f64_to_bits(0.999999)), 0)
+        self.assertEqual(oracle_v_cvt_u32_f64(f64_to_bits(-0.999999)), 0)
+
+    def test_infinities_with_modifiers(self) -> None:
+        # +inf with neg modifier -> -inf
+        self.assertEqual(oracle_v_cvt_i32_f64(POS_INF_64, neg_mod=True), i32_to_u32(INT32_MIN))
+        self.assertEqual(oracle_v_cvt_u32_f64(POS_INF_64, neg_mod=True), 0)
+
+        # -inf with abs modifier -> +inf
+        self.assertEqual(oracle_v_cvt_i32_f64(NEG_INF_64, abs_mod=True), INT32_MAX)
+        self.assertEqual(oracle_v_cvt_u32_f64(NEG_INF_64, abs_mod=True), UINT32_MAX)
+
+    def test_f64_clamping_extremes(self) -> None:
+        # v_cvt_f64_i32 with clamp
+        self.assertEqual(oracle_v_cvt_f64_i32(i32_to_u32(INT32_MIN), clamp=True), POS_ZERO_64)
+        self.assertEqual(oracle_v_cvt_f64_i32(i32_to_u32(-1), clamp=True), POS_ZERO_64)
+        self.assertEqual(oracle_v_cvt_f64_i32(0, clamp=True), POS_ZERO_64)
+        self.assertEqual(oracle_v_cvt_f64_i32(1, clamp=True), POS_ONE_64)
+        self.assertEqual(oracle_v_cvt_f64_i32(INT32_MAX, clamp=True), POS_ONE_64)
+
+        # v_cvt_f64_u32 with clamp
+        self.assertEqual(oracle_v_cvt_f64_u32(0, clamp=True), POS_ZERO_64)
+        self.assertEqual(oracle_v_cvt_f64_u32(1, clamp=True), POS_ONE_64)
+        self.assertEqual(oracle_v_cvt_f64_u32(UINT32_MAX, clamp=True), POS_ONE_64)
+
+
 if __name__ == "__main__":
     unittest.main()
