@@ -209,7 +209,7 @@ def parse_obj(
     Groups primitives in order of appearance by (group_index, material_name),
     converts coordinates to glTF Y-up, flips V for top-left UV origin,
     deduplicates vertices per primitive, and synthesizes smooth area-weighted
-    normals when explicit normals are missing.
+    normals within the primitive and OBJ smoothing group when explicit normals are missing.
     """
     up = up_axis.lower()
     if up not in ("z", "y"):
@@ -242,6 +242,8 @@ def parse_obj(
     saw_g = False
     group_has_faces = False
     material_name = ""
+    smoothing_group: int | None = None
+    flat_face_id = 0
 
     # Preserve order of appearance for (group_index, material_name) primitives.
     builders: dict[tuple[int, str], dict] = {}
@@ -336,6 +338,15 @@ def parse_obj(
         elif cmd == "usemtl":
             material_name = line[len(cmd):].split("#", 1)[0].strip()
 
+        elif cmd == "s" and len(parts) > 1:
+            value = parts[1].split("#", 1)[0]
+            try:
+                group = 0 if value == "off" else int(value)
+            except ValueError:
+                continue
+            if group >= 0:
+                smoothing_group = group
+
         elif cmd == "f":
             if "#" in line:
                 parts = line.split("#", 1)[0].split()
@@ -414,7 +425,14 @@ def parse_obj(
                 }
                 builders[key] = builder
 
-            vert_map: dict[tuple[int, int | None, int | None], int] = builder["vert_map"]
+            normal_group = None
+            if smoothing_group is not None and any(vni is None for _, _, vni in corners):
+                normal_group = smoothing_group
+                if smoothing_group == 0:
+                    flat_face_id -= 1
+                    normal_group = flat_face_id
+
+            vert_map: dict[tuple[int, int | None, int | None, int | None], int] = builder["vert_map"]
             b_pos: list[tuple[float, float, float]] = builder["positions"]
             b_nrm: list[tuple[float, float, float] | None] = builder["normals"]
             b_uv: list[tuple[float, float] | None] = builder["uvs"]
@@ -422,10 +440,11 @@ def parse_obj(
 
             for tri in tris:
                 for corner in tri:
-                    local_idx = vert_map.get(corner)
+                    vertex_key = (*corner, normal_group)
+                    local_idx = vert_map.get(vertex_key)
                     if local_idx is None:
                         local_idx = len(b_pos)
-                        vert_map[corner] = local_idx
+                        vert_map[vertex_key] = local_idx
                         vi, vti, vni = corner
                         pos = raw_v[vi]
                         assert pos is not None
@@ -450,12 +469,12 @@ def parse_obj(
             continue
 
         if builder["has_missing_normal"]:
-            # UVs and explicit normals split render vertices, but generated normals
-            # share the first render vertex's accumulator for each OBJ position.
-            first_vertex: dict[int, int] = {}
+            # UVs and explicit normals split render vertices. Generated normals
+            # share an accumulator for each position within the same smoothing group.
+            first_vertex: dict[tuple[int, int | None], int] = {}
             normal_vertices = [
-                first_vertex.setdefault(corner[0], vertex)
-                for corner, vertex in builder["vert_map"].items()
+                first_vertex.setdefault((vi, normal_group), vertex)
+                for (vi, _, _, normal_group), vertex in builder["vert_map"].items()
             ]
             raw_normals = builder["normals"]
             index_iter = iter(indices)

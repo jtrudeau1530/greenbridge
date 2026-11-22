@@ -813,6 +813,22 @@ class TestObjParserAndBounds(unittest.TestCase):
         self.assertAlmostEqual(uvs[2][0], 0.0)
         self.assertAlmostEqual(uvs[2][1], 0.0)   # 1.0 - 1.0
 
+    def test_glb_generated_normals_split_at_explicit_obj_smoothing_boundaries(self) -> None:
+        vertices = ["v 0 0 0", "v 1 0 0", "v 0 1 0", "v 0 0 1"]
+        for directives in (("s off", "s off"), ("s 0", "s 0"), ("s 1", "s 2")):
+            with self.subTest(directives=directives):
+                obj = "\n".join([*vertices, directives[0], "f 1 2 3", directives[1], "f 2 1 4"])
+                prims = glb_writer.parse_obj(obj, is_path=False, up_axis="y")
+                data = glb_writer.build_glb(prims)
+                gltf = glb_writer.read_glb_summary(data)["json"]
+                mesh = gltf["meshes"][0]["primitives"][0]
+                accessor = gltf["accessors"][mesh["attributes"]["NORMAL"]]
+                view = gltf["bufferViews"][accessor["bufferView"]]
+                json_length = struct.unpack_from("<I", data, 12)[0]
+                start = 28 + json_length + view["byteOffset"]
+                normals = list(struct.iter_unpack("<3f", data[start:start + view["byteLength"]]))
+                self.assertEqual(normals, [(0.0, 0.0, 1.0)] * 3 + [(0.0, 1.0, 0.0)] * 3)
+
     def test_glb_preserves_finite_obj_normal_directions(self) -> None:
         obj = """\
 v 0 0 0
