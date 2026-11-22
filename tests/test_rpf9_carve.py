@@ -144,5 +144,40 @@ class CarveEdgeTest(unittest.TestCase):
                 self.assertEqual(json.load(f)["summary"]["span"], 0x40)
 
 
+
+def noisy(n, seed):
+    """Bytes zlib can't shrink, so a stream's stored size is about n."""
+    import hashlib
+    out = bytearray()
+    while len(out) < n:
+        out += hashlib.sha256(bytes([seed]) + len(out).to_bytes(4, "little")).digest()
+    return bytes(out[:n])
+
+
+class LimitWindowTest(unittest.TestCase):
+    def test_a_stream_crossing_the_limit_is_left_out(self):
+        """--limit ending inside a stream: the stream doesn't decode inside the window, so it isn't counted as
+        readable, and readable + zero + unread add up to the span (as story_index does since #712)."""
+        first = zlib.compress(noisy(4000, 1))
+        second = zlib.compress(noisy(4000, 2))
+        data = bytearray(0x40 + 0x100) + first + second
+        data[0:4] = b"9FPR"
+        struct.pack_into("<I", data, 4, 0x40)
+        limit = 0x100 + len(first) // 2
+        with tempfile.TemporaryDirectory() as tmp:
+            arc = os.path.join(tmp, "x.rpf")
+            out = os.path.join(tmp, "out")
+            with open(arc, "wb") as f:
+                f.write(data)
+            p = subprocess.run([sys.executable, "-I", TOOL, arc, out, "--index-only", "--limit", str(limit)],
+                               capture_output=True, text=True)
+            self.assertEqual(p.returncode, 0, p.stderr)
+            with open(os.path.join(out, "index.json"), encoding="utf-8") as f:
+                summary = json.load(f)["summary"]
+        self.assertEqual(summary["span"], limit)
+        self.assertEqual(summary["files"], 0)
+        self.assertEqual(summary["compressed_bytes"] + summary["zero_padding"] + summary["unread_bytes"],
+                         summary["span"])
+
 if __name__ == "__main__":
     unittest.main()

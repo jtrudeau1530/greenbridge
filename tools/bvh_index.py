@@ -195,7 +195,7 @@ def inflate_stream(m, s, size, max_inflate):
 
     try:
         while not d.eof and p < size:
-            chunk = m[p:p + (1 << 20)]
+            chunk = m[p:min(p + (1 << 20), size)]   # size is the scan window's end
             if not chunk:
                 break
             take(d.decompress(chunk))
@@ -218,7 +218,7 @@ def _count_stream(m, s, size):
     d = zlib.decompressobj()
     total, p = 0, s
     while not d.eof and p < size:
-        chunk = m[p:p + (1 << 20)]
+        chunk = m[p:min(p + (1 << 20), size)]
         if not chunk:
             break
         total += len(d.decompress(chunk))
@@ -254,7 +254,9 @@ def scan_rpf(path, start=None, limit=None, max_inflate=1 << 28):
                 if not mt:
                     break
                 s = mt.start()
-                got = inflate_stream(m, s, size, max_inflate)
+                # Bounded by the scan window (the archive without --limit): a stream that runs past it is left out,
+                # so readable + zero + unread add up to the span, as in story_index (#712).
+                got = inflate_stream(m, s, end, max_inflate)
                 if got is None:
                     pos = s + 1
                     continue

@@ -211,7 +211,7 @@ def scan_rpf(path, start=None, limit=None, max_inflate=MAX_INFLATE):
                 if m[s:s + 3] == b"KB2":
                     blen = (_u32(m, s + 4) or 0) + 8
                     w, h = _u32(m, s + 0x14), _u32(m, s + 0x18)
-                    if not (64 <= blen <= size - s and w and h and 16 <= w <= 8192 and 16 <= h <= 8192):
+                    if not (64 <= blen <= end - s and w and h and 16 <= w <= 8192 and 16 <= h <= 8192):
                         pos = s + 1
                         continue
                     z, u = _gap(m[last:s])
@@ -224,8 +224,8 @@ def scan_rpf(path, start=None, limit=None, max_inflate=MAX_INFLATE):
                 p, total, head = s, 0, b""
                 too_big = False
                 try:
-                    while not d.eof and p < size:
-                        block = m[p:p + (1 << 20)]
+                    while not d.eof and p < end:   # inside the --limit window, as in story_index (#712)
+                        block = m[p:min(p + (1 << 20), end)]
                         if not block:
                             break
                         p += len(block)
