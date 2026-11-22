@@ -1121,6 +1121,11 @@ def decoder_digest() -> str:
     if git and os.path.exists(os.path.join(sub, ".git")):
         r = subprocess.run([git, "-C", sub, "rev-parse", "HEAD"], capture_output=True, text=True)
         pin = r.stdout.strip() if r.returncode == 0 else ""
+        # An edit to a tracked submodule file that is not committed changes the decoder but not HEAD.
+        # shortcut: new untracked files in the submodule are not seen; hash them too if that comes up.
+        r = subprocess.run([git, "-C", sub, "diff", "HEAD"], capture_output=True)
+        if r.returncode == 0 and r.stdout:
+            pin += "+" + hashlib.sha256(r.stdout).hexdigest()
     folder = os.path.join(TOOLS, "rpf9dump")
     names = sorted(n for n in os.listdir(folder) if n.endswith((".cs", ".csproj", ".json")))
     return sources_digest(folder, names, pin)

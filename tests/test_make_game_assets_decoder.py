@@ -6,6 +6,8 @@ does when an export finishes.
     python -I tests/test_make_game_assets_decoder.py
 """
 import os
+import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -87,6 +89,32 @@ class AssetsDecoderTest(unittest.TestCase):
                     f.write(text)
                 make_game.decoder_digest.cache_clear()
                 with mock.patch.object(make_game, "TOOLS", tools):
+                    digests.append(make_game.decoder_digest())
+            make_game.decoder_digest.cache_clear()
+        self.assertNotEqual(*digests)
+
+    @unittest.skipUnless(shutil.which("git"), "needs git")
+    def test_the_digest_follows_an_uncommitted_submodule_edit(self):
+        with tempfile.TemporaryDirectory() as root:
+            sub = os.path.join(root, "third_party", "rpf9-explorer")
+            os.makedirs(sub)
+            src = os.path.join(sub, "Decoder.cs")
+
+            def git(*args):
+                subprocess.run(["git", "-C", sub, "-c", "user.name=t", "-c", "user.email=t@example.invalid",
+                                "-c", "commit.gpgsign=false", *args], check=True, capture_output=True)
+
+            with open(src, "w", newline="\n") as f:
+                f.write("a\n")
+            git("init", "-q")
+            git("add", "Decoder.cs")
+            git("commit", "-q", "-m", "x")
+            digests = []
+            for text in ("a\n", "b\n"):
+                with open(src, "w", newline="\n") as f:
+                    f.write(text)
+                make_game.decoder_digest.cache_clear()
+                with mock.patch.object(make_game, "ROOT", root):
                     digests.append(make_game.decoder_digest())
             make_game.decoder_digest.cache_clear()
         self.assertNotEqual(*digests)
