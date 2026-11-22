@@ -342,6 +342,60 @@ int main() {
                                 y * uint_placed.Footprint.RowPitch + x * 4,
                             texel(x, y).data(), 4);
 
+        constexpr DXGI_FORMAT byte_formats[] = {DXGI_FORMAT_A8_UNORM, DXGI_FORMAT_R8_UNORM};
+        D3D12_FEATURE_DATA_FORMAT_SUPPORT support{DXGI_FORMAT_A8_UNORM};
+        EXPECT(SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &support, sizeof(support))));
+        EXPECT((support.Support1 & D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE) != 0);
+        EXPECT((support.Support1 & D3D12_FORMAT_SUPPORT1_MIP) != 0);
+        EXPECT(!(support.Support1 & (D3D12_FORMAT_SUPPORT1_RENDER_TARGET | D3D12_FORMAT_SUPPORT1_BLENDABLE |
+                                     D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW)) && !support.Support2);
+        for (UINT count : {1u, 4u}) {
+            D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS levels{DXGI_FORMAT_A8_UNORM, count};
+            EXPECT(SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &levels,
+                                                         sizeof(levels))));
+            EXPECT(levels.NumQualityLevels == (count == 1 ? 1u : 0u));
+        }
+        for (auto flag : {D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL,
+                          D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS}) {
+            auto desc = texture_desc;
+            desc.Format = DXGI_FORMAT_A8_UNORM;
+            desc.Flags = flag;
+            EXPECT(FAILED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &desc,
+                                                          D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                          __uuidof(ID3D12Resource), nullptr)));
+            EXPECT(device->GetResourceAllocationInfo(0, 1, &desc).SizeInBytes == UINT64_MAX);
+        }
+        Ref<ID3D12Resource> byte_textures[2];
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT byte_placed[2]{}, a8_mip_placed{};
+        for (UINT f = 0; f < 2; ++f) {
+            auto desc = texture_desc;
+            desc.Format = byte_formats[f];
+            if (desc.Format == DXGI_FORMAT_A8_UNORM) {
+                desc.MipLevels = 2;
+                device->GetCopyableFootprints(&desc, 1, 1, 24576, &a8_mip_placed, nullptr, nullptr, nullptr);
+            }
+            EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &desc,
+                                                              D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                              IID_PPV_ARGS(&byte_textures[f].p))));
+            device->GetCopyableFootprints(&desc, 0, 1, 16384, &byte_placed[f], nullptr, nullptr, nullptr);
+            EXPECT(byte_placed[f].Footprint.Format == desc.Format);
+        }
+        EXPECT(byte_placed[0].Offset == byte_placed[1].Offset &&
+               byte_placed[0].Footprint.RowPitch == byte_placed[1].Footprint.RowPitch);
+        for (UINT y = 0; y < size; ++y) {
+            auto* row = static_cast<std::uint8_t*>(mapped) + byte_placed[0].Offset + y * byte_placed[0].Footprint.RowPitch;
+            for (UINT x = 0; x < size; ++x) row[x] = std::uint8_t(1 + 3 * (y * size + x));
+        }
+
+        constexpr UINT mip_size = size / 2;
+        EXPECT(a8_mip_placed.Offset == 24576 && a8_mip_placed.Footprint.Width == mip_size &&
+               a8_mip_placed.Footprint.Height == mip_size &&
+               a8_mip_placed.Footprint.RowPitch == D3D12_TEXTURE_DATA_PITCH_ALIGNMENT);
+        for (UINT y = 0; y < mip_size; ++y) {
+            auto* row = static_cast<std::uint8_t*>(mapped) + a8_mip_placed.Offset + y * a8_mip_placed.Footprint.RowPitch;
+            for (UINT x = 0; x < mip_size; ++x) row[x] = std::uint8_t(208 + y * mip_size + x);
+        }
+
         // Shader-visible heaps, start handles in the Xbox shape.
         const UINT step = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
         const UINT sampler_step = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER);
@@ -577,6 +631,37 @@ int main() {
                     }
         }
 
+        constexpr UINT a8_mip_slot = 4, byte_view_count = a8_mip_slot + 1;
+        D3D12_DESCRIPTOR_HEAP_DESC byte_heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, byte_view_count,
+                                                  D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+        Ref<ID3D12DescriptorHeap> byte_heap;
+        EXPECT(SUCCEEDED(device->CreateDescriptorHeap(&byte_heap_desc, IID_PPV_ARGS(&byte_heap.p))));
+        const auto byte_cpu = reinterpret_cast<XboxHeapHandleFn>(slot(byte_heap.p, 9))(byte_heap.p);
+        const UINT byte_step = device->GetDescriptorHandleIncrementSize(byte_heap_desc.Type);
+        EXPECT(byte_cpu && byte_step >= sizeof(g::ImageWords));
+        const auto byte_slot = [&](UINT i) { return D3D12_CPU_DESCRIPTOR_HANDLE{SIZE_T(byte_cpu + i * byte_step)}; };
+        const auto byte_bytes = [&](UINT i) { return reinterpret_cast<std::uint8_t*>(byte_slot(i).ptr); };
+        D3D12_SHADER_RESOURCE_VIEW_DESC byte_view{};
+        byte_view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        byte_view.Shader4ComponentMapping = D3D12_ENCODE_SHADER_4_COMPONENT_MAPPING(
+            D3D12_SHADER_COMPONENT_MAPPING_FROM_MEMORY_COMPONENT_3, D3D12_SHADER_COMPONENT_MAPPING_FROM_MEMORY_COMPONENT_0,
+            D3D12_SHADER_COMPONENT_MAPPING_FORCE_VALUE_1, D3D12_SHADER_COMPONENT_MAPPING_FORCE_VALUE_0);
+        byte_view.Texture2D.MipLevels = 1;
+        for (UINT f = 0; f < 2; ++f) {
+            byte_view.Format = byte_formats[1 - f];
+            std::memset(byte_bytes(2 * f), 0x77, byte_step);
+            device->CreateShaderResourceView(byte_textures[f].p, &byte_view, byte_slot(2 * f));
+            EXPECT(std::all_of(byte_bytes(2 * f), byte_bytes(2 * f) + byte_step,
+                               [](std::uint8_t byte) { return byte == 0; }));
+            device->CreateShaderResourceView(byte_textures[f].p, nullptr, byte_slot(2 * f));
+            byte_view.Format = byte_formats[f];
+            device->CreateShaderResourceView(byte_textures[f].p, &byte_view, byte_slot(2 * f + 1));
+        }
+        byte_view.Format = DXGI_FORMAT_A8_UNORM;
+        byte_view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        byte_view.Texture2D.MostDetailedMip = 1;
+        device->CreateShaderResourceView(byte_textures[0].p, &byte_view, byte_slot(a8_mip_slot));
+
         // D3D-75: plane 1 of a depth-stencil texture is its stencil. The T# is 8_UINT at the texture's own address,
         // with the eight bits read as G and R, B, A as 0, 0, 1 (D3D12's X24_TYPELESS_G8_UINT / X32_..._G8X24_UINT).
         // A stencil view of a colour texture, or one in another format, is a null descriptor.
@@ -712,6 +797,23 @@ int main() {
         EXPECT(SUCCEEDED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator.p))));
         EXPECT(SUCCEEDED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.p, nullptr,
                                                    IID_PPV_ARGS(&list.p))));
+        for (UINT f = 0; f < 2; ++f) {
+            D3D12_TEXTURE_COPY_LOCATION to{}, from{};
+            to.pResource = byte_textures[f].p;
+            to.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            from.pResource = upload.p;
+            from.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+            from.PlacedFootprint = byte_placed[f];
+            list->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
+            if (byte_formats[f] == DXGI_FORMAT_A8_UNORM) {
+                to.SubresourceIndex = 1;
+                from.PlacedFootprint = a8_mip_placed;
+                list->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
+            }
+            const auto ready = transition(to.pResource, D3D12_RESOURCE_STATE_COPY_DEST,
+                                          D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            list->ResourceBarrier(1, &ready);
+        }
         EXPECT(SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence.p))));
 
         // Upload, then the texture into a shader-resource state. Executing the list also brings set 0 up to date.
@@ -807,6 +909,27 @@ int main() {
             }
         std::printf("volume SRVs: %u of %u sampled RGBA texels differ\n", volume_errors, 2 * texels);
         EXPECT(volume_errors == 0);
+
+        SampleKeys byte_keys[byte_view_count]{};
+        for (UINT k = 0; k < byte_view_count; ++k) {
+            std::memcpy(byte_keys[k].tsharp, byte_bytes(k), sizeof(byte_keys[k].tsharp));
+            std::memcpy(byte_keys[k].ssharp, sampler_bytes, sizeof(byte_keys[k].ssharp));
+            byte_keys[k].first = k * texels;
+        }
+        std::array<std::uint8_t, byte_view_count * bytes> byte_results{};
+        EXPECT(sample_through_set(d, set0, set0_layout, byte_keys, byte_results.data()));
+        for (UINT i = 0; i < texels; ++i) {
+            const auto value = std::uint8_t(1 + 3 * i);
+            const std::uint8_t expected[4][4] = {{0, 0, 0, value}, {value, 0, 255, 0},
+                                                 {value, 0, 0, 255}, {255, value, 255, 0}};
+            for (UINT k = 0; k < 4; ++k)
+                EXPECT(std::memcmp(byte_results.data() + k * bytes + 4 * i, expected[k], 4) == 0);
+            const UINT mip_texel = (i / size / 2) * mip_size + (i % size) / 2;
+            const std::uint8_t mip_expected[] = {0, 0, 0, std::uint8_t(208 + mip_texel)};
+            EXPECT(std::memcmp(byte_results.data() + a8_mip_slot * bytes + 4 * i, mip_expected, 4) == 0);
+        }
+        std::printf("A8 mip 1: %u samples matched across %u texels\n", texels, mip_size * mip_size);
+        std::printf("A8 and R8 default and remapped views: %u texels matched each\n", texels);
 
         // The border samplers, one tile to the right: every texel is the border.
         SampleKeys border_keys[3] = {};
@@ -927,6 +1050,8 @@ int main() {
         upload.reset();
         volume.reset();
         uint_texture.reset();
+        for (auto& resource : byte_textures) resource.reset();
+        byte_heap.reset();
         view_heap.reset();
         sampler_heap.reset();
         list.reset();
