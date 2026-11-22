@@ -2,8 +2,10 @@
 
     python -I tests/test_world_index.py
 """
+import contextlib
 import csv
 import importlib.util
+import io
 import json
 import os
 import struct
@@ -170,6 +172,34 @@ class WorldIndexTest(unittest.TestCase):
         self.assertEqual(stats["streams"], 2)
         self.assertEqual(rows[0]["kind"], "map")
         self.assertEqual(rows[0]["entities"], 1)
+
+    def test_scan_window_options(self):
+        blob = make_resource()
+        path = os.path.join(self.dir, "sample.rpf")
+        with open(path, "wb") as f:
+            f.write(make_rpf_streams([blob]))
+        size = os.path.getsize(path)
+        out = os.path.join(self.dir, "out.json")
+        # A one-byte window at the data start: the scan ends one byte later.
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(WI.main([path, "--out", out, "--start", "64", "--limit", "1"]), 0)
+        with open(out, encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["summary"]["scan_end"], 0x41)
+        os.remove(out)
+        # --limit 0 used to read as "no limit" (the whole archive); negative values were used as given.
+        for args in (["--limit", "0"], ["--limit", "-16"], ["--start", "-1"]):
+            with self.subTest(args=args), self.assertRaises(SystemExit) as ctx, \
+                    contextlib.redirect_stderr(io.StringIO()):
+                WI.main([path, "--out", out, *args])
+            self.assertEqual(ctx.exception.code, 2)
+        # A start inside the RPF9 header or past the end is refused, and no report is written.
+        for start in ("16", str(size)):
+            with self.subTest(start=start):
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(WI.main([path, "--out", out, "--start", start]), 2)
+                self.assertIn("outside the data area", err.getvalue())
+        self.assertFalse(os.path.exists(out))
 
     def test_rpf_scan_survives_a_damaged_candidate_continuation(self):
         blob = make_resource()
