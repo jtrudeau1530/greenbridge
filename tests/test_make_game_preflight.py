@@ -431,6 +431,57 @@ class PreflightPrerequisiteTest(PreflightTestBase):
                 self.assert_fails(make_game.preflight, ["shaders"], tmp_work, wav=False,
                                   match="15 GB free on the drive of")
 
+    def test_preflight_charges_space_only_when_shaders_need_to_be_rebuilt(self):
+        cases = (
+            ("current translation", {}, {}, False, True),
+            ("matching emulation", {"spirv/wave64_emulate.txt": "on"}, {"emulate": True}, False, True),
+            ("auto keeps emulation", {"spirv/wave64_emulate.txt": "on"}, {"keep_emulated": True}, False, True),
+            ("missing disassembly marker", {"dxbc/disasm.done": None}, {}, False, False),
+            ("old disassembly marker", {"dxbc/disasm.done": "shader_disasm.py finished"}, {}, False, False),
+            ("changed LLVM", {"dxbc/disasm.done": "old llvm-mc"}, {}, False, False),
+            ("stale translator", {"spirv/translation_sources.sha256": "stale"}, {}, False, False),
+            ("old translation without fingerprint", {"spirv/translation_sources.sha256": None}, {}, False, False),
+            ("needs emulation", {}, {"emulate": True}, False, False),
+            ("explicit native mode", {"spirv/wave64_emulate.txt": "on"}, {}, False, False),
+            ("interrupted unpack", {"dxbc/fssm_index.json": None}, {}, False, False),
+            ("interrupted translation", {"spirv/index.json": None}, {}, False, False),
+            ("old disassembly layout", {}, {}, True, False),
+        )
+        fingerprint = make_game.translation_sources_digest()
+        usage = Usage(500 * 2**30, 485 * 2**30, 15 * 2**30)
+        for name, changed, settings, legacy_layout, reusable in cases:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as work:
+                files = {
+                    "dxbc/index.json": "{}",
+                    "dxbc/fssm_index.json": "{}",
+                    "dxbc/disasm.done": "test llvm-mc 21",
+                    "spirv/index.json": "{}",
+                    "spirv/translation_sources.sha256": fingerprint,
+                    "spirv/wave64_emulate.txt": "off",
+                    **changed,
+                }
+                shader_root = os.path.join(work, "shaders")
+                for name, content in files.items():
+                    if content is not None:
+                        path = os.path.join(shader_root, name)
+                        os.makedirs(os.path.dirname(path), exist_ok=True)
+                        with open(path, "w", encoding="utf-8") as handle:
+                            handle.write(content + "\n")
+                disasm_parts = ("disasm",) if legacy_layout else ("dxbc", "disasm")
+                os.makedirs(os.path.join(shader_root, *disasm_parts))
+                with mock.patch("sys.version_info", (3, 12, 0)), \
+                     mock.patch("make_game.llvm_mc_signature", return_value="test llvm-mc 21"), \
+                     mock.patch("make_game.tool_available", return_value=True), \
+                     mock.patch("shutil.which", return_value="/usr/bin/tool"), \
+                     mock.patch("shutil.disk_usage", return_value=usage), \
+                     mock.patch("sys.stdout", io.StringIO()):
+                    if reusable:
+                        make_game.preflight(["shaders"], work, **settings)
+                    else:
+                        self.assert_fails(make_game.preflight, ["shaders"], work,
+                                          match="about 30 GB is needed", **settings)
+
+
     def test_preflight_disk_space_stage_accumulation(self):
         with tempfile.TemporaryDirectory() as tmp_work:
             with mock.patch("sys.version_info", (3, 12, 0)), \
