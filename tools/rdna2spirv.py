@@ -5002,12 +5002,14 @@ class Gen:
             r = self.fma_f16_odd(*vals)     # one rounding, to f16 (SHADER-55); omod/clamp keep round-to-odd valid
             r = self.clamp_mods(r, mods)
             self.f16_out(a[0], r, dhi)  # GFX10: f16 ops keep the other half
-        elif op in ("v_add_nc_u16", "v_sub_nc_u16"):
-            # VOP3-only GFX10 names of the 16-bit add/sub (no carry): opsel-capable, so the high half is kept.
-            self._insn({**ins, "op": ("v_add_u16_e64" if op == "v_add_nc_u16" else "v_sub_u16_e64")})
+        elif op in ("v_add_nc_u16", "v_sub_nc_u16", "v_add_nc_i16", "v_sub_nc_i16"):
+            # VOP3-only GFX10 names of the 16-bit add/sub (no carry): opsel-capable, so the high half is kept. The
+            # i16 forms differ only under clamp (signed saturation); v_add_i16 / v_sub_i16 are internal names.
+            self._insn({**ins, "op": {"v_add_nc_u16": "v_add_u16_e64", "v_sub_nc_u16": "v_sub_u16_e64",
+                                      "v_add_nc_i16": "v_add_i16_e64", "v_sub_nc_i16": "v_sub_i16_e64"}[op]})
         elif op in ("v_lshrrev_b16", "v_lshlrev_b16", "v_ashrrev_i16", "v_add_u16", "v_sub_u16", "v_subrev_u16",
                     "v_mul_lo_u16", "v_max_u16", "v_min_u16", "v_max_i16", "v_min_i16", "v_and_b16", "v_or_b16",
-                    "v_xor_b16"):
+                    "v_xor_b16", "v_add_i16", "v_sub_i16"):
             # 16-bit integer ops on the low halves (op_sel picks high halves in the VOP3 form). Per Mesa ACO
             # (can_use_opsel): the opsel-capable VOP3 (_e64) forms are partial writes that keep the high half,
             # and the VOP2 (_e32) forms define the whole register (high half modelled as zero).
@@ -5043,6 +5045,14 @@ class Gen:
                     self.emit(f"{yi} = OpBitFieldSExtract %int {self.as_int(y)} {self.cu(0)} {self.cu(16)}")
                     self.emit(f"{ri} = OpShiftRightArithmetic %int {yi} {sh}")
                     self.emit(f"{r} = OpBitcast %uint {ri}")
+            elif op in ("v_add_i16", "v_sub_i16"):
+                # signed 16-bit add / sub (v_add_nc_i16 / v_sub_nc_i16): the exact sum of the sign-extended halves;
+                # its low 16 bits are the wrapped result, clamp below saturates it to [-32768, 32767]
+                xi, yi, ri = self.tmp(), self.tmp(), self.tmp()
+                self.emit(f"{xi} = OpBitFieldSExtract %int {self.as_int(x)} {self.cu(0)} {self.cu(16)}")
+                self.emit(f"{yi} = OpBitFieldSExtract %int {self.as_int(y)} {self.cu(0)} {self.cu(16)}")
+                self.emit(f"{ri} = {'OpIAdd' if op == 'v_add_i16' else 'OpISub'} %int {xi} {yi}")
+                self.emit(f"{r} = OpBitcast %uint {ri}")
             elif op in ("v_max_i16", "v_min_i16"):
                 xi, yi, ri = self.tmp(), self.tmp(), self.tmp()
                 self.emit(f"{xi} = OpBitFieldSExtract %int {self.as_int(x)} {self.cu(0)} {self.cu(16)}")
@@ -5062,12 +5072,17 @@ class Gen:
                 # VOP3 clamp saturates the unsigned add/sub to [0, 0xFFFF], as for the 32-bit ops (docs/design.md,
                 # "Integer clamp"). The operands are zero-extended, so a result past 0xFFFF is an overflow (add) or a
                 # borrow (sub). Other 16-bit ops: rejected rather than guessed.
-                if op not in ("v_add_u16", "v_sub_u16", "v_subrev_u16"):
+                if op in ("v_add_i16", "v_sub_i16"):
+                    sat = self.tmp()
+                    self.emit(f"{sat} = OpExtInst %uint %glsl SClamp {r} {self.cu(0xFFFF8000)} {self.cu(0x7FFF)}")
+                    r = sat
+                elif op not in ("v_add_u16", "v_sub_u16", "v_subrev_u16"):
                     raise Unsupported(op + " clamp")
-                ov, sat = self.tmp(), self.tmp()
-                self.emit(f"{ov} = OpUGreaterThan %bool {r} {self.cu(0xFFFF)}")
-                self.emit(f"{sat} = OpSelect %uint {ov} {self.cu(0 if 'sub' in op else 0xFFFF)} {r}")
-                r = sat
+                if op in ("v_add_u16", "v_sub_u16", "v_subrev_u16"):
+                    ov, sat = self.tmp(), self.tmp()
+                    self.emit(f"{ov} = OpUGreaterThan %bool {r} {self.cu(0xFFFF)}")
+                    self.emit(f"{sat} = OpSelect %uint {ov} {self.cu(0 if 'sub' in op else 0xFFFF)} {r}")
+                    r = sat
             lo = self.tmp()
             self.emit(f"{lo} = OpBitwiseAnd %uint {r} {self.cu(0xFFFF)}")
             if e64 and sb[2]:
