@@ -202,7 +202,7 @@ reads vertex slots. It sizes all 99,184 slot words of the archive's `63 30` and 
 | 0x26 | 6 | 4 | `63 30` 1, 12; `42 40` 1, 12, 13 | RGBA8 colour |
 | 0x28 | 8 | 4 | `42 40` 3, 4, 14, 15 | 2 × snorm16 UV × the +0x7C scale (rpf9-explorer) |
 | 0x21 | 1 | 4 | `42 40` 2 (13,119) | octahedral normal, 10 + 10 bits (below) |
-| 0x27 | 7 | 4 | `42 40` 2, 11, 18 | in slot 2 a 10:10:10 normal (below); slots 11 and 18 not decoded |
+| 0x27 | 7 | 4 | `42 40` 2, 11, 18 | 10:10:10 unit vector: the normal in slot 2, a tangent in slots 11 and 18 (below) |
 
 The slots used in `42 40` blocks are 0-4, 11-15 and 18; slot 15 occurs in 78 blocks and slot 18 in 770.
 `tools/meshlet_page.py` sizes slots with this rule (`tag_stride`), for the types above only, and reads the same
@@ -308,14 +308,20 @@ The other bits are not decoded:
   together with non-zero w3 bits 12-31.
 - **w0 bits 14-31** are not decoded either; bits 14-15 are clear in all 61,170 records of those streams.
 
+**Slots 11 and 18 are tangents.** Their type-7 words are unit vectors in the same 10:10:10 unorm, perpendicular to the vertex's stored normal. Bits 30-31 are always 3 or 0, which fits the bitangent sign +1 or −1. Over the minigame archive (`--normals`, counts only):
+- 7,520,441 tangent words, 7,435,001 (98.9%) of them within |dot| < 0.05 of perpendicular;
+- sign bits 6,457,714 × 3 and 1,062,727 × 0, and never 1 or 2.
+
+`core_restofworld.rpf` has no tangent slots.
+
 **The rules hold in a second archive.** `core_restofworld.rpf` with `--faces --centres --normals`:
 - all 151 mesh streams parse, with 502 `42 40` blocks, 488,265 positions (all finite, all within 300 m) and
   6,564 meshlets;
 - 69.4% of 699,618 shared edges have neighbouring faces within ~25°, and 0.37% are opposed;
 - 10,555 of 14,697 centre axes (71.8%) are in the same 1/16 m step, and 87.6% within one.
 
-Still open: the +0x5C word, meshlet record bits 14-31 of word 0 and the cone-like bits above, and the
-`42 40 00 00` attribute encodings.
+Still open: the +0x5C word, meshlet record bits 14-31 of word 0 and the cone-like bits above, the type-1 normal's
+bits 20-31, and what the `42 40` colour and UV slots hold beyond rpf9-explorer's reading.
 
 ### `story000_script.rpf`, full
 

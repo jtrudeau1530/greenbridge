@@ -48,7 +48,9 @@ Meshlet group (first u32 has bit 31 set):
     `docs/story.md` has the independent check over the minigame archive.
     slot 2  the vertex normal, in world order whatever the axis word: tag 0x21 (type 1) is octahedral, u = bits
         0-9 and v = bits 10-19 as unorm (x / 511.5 - 1), bits 20-31 not decoded; tag 0x27 (type 7) is x, y, z in
-        bits 0-9, 10-19, 20-29 as the same unorm. Other 4-byte streams are not decoded.
+        bits 0-9, 10-19, 20-29 as the same unorm.
+    slots 11 and 18  tag 0x27 (type 7): a tangent, x, y, z as in slot 2's type 7, perpendicular to the normal; bits
+        30-31 are 3 or 0, read here as the bitangent sign +1 or -1. Other 4-byte streams are not decoded.
 
 A page starts with a `63 30` block, a `42 40` block or a group (continuation pages). The walk stops, without an
 error, at a `42 40` block whose layout doesn't fit the rule above or at a group that continues past the end of
@@ -80,7 +82,7 @@ OTHER_HEADER_SIZE = 0x80
 # A slot tag byte is (stride / 4) << 5 | type, as rpf9-explorer's RageModelDecoder reads vertex slots. Types seen in
 # shared_minigame000.rpf: 1, 2, 3, 6, 7, 8; a tag of another type is not taken as a slot.
 SLOT_TYPES = {1: "octahedral normal, 10 + 10 bits unorm", 2: "2 x f32 or a packed position", 3: "3 x f32",
-              6: "RGBA8", 7: "3 x 10 bits unorm (the normal, in slot 2)",
+              6: "RGBA8", 7: "3 x 10 bits unorm (the normal in slot 2, a tangent in slots 11 and 18)",
               8: "2 x snorm16 UV, scaled by the 42 40 header's +0x7C"}
 
 
@@ -286,6 +288,35 @@ def normals_4240(data, block):
     return out
 
 
+def tangents_4240(data, block):
+    """Decode a `42 40` block's type-7 tangent slots (11 and 18). Returns {slot: [(x, y, z, sign), ...]}; sign is +1
+    for bits 30-31 = 3, -1 for 0, and 0 for anything else."""
+    out = {}
+    for slot, tag, off in block["slots"]:
+        if slot == 2 or tag & 15 != 7 or tag_stride(tag) != 4:
+            continue
+        at, n = block["offset"] + off, block["vertices"]
+        rows = []
+        for (w,) in struct.iter_unpack("<I", data[at:at + 4 * n]):
+            v = [_unorm10((w >> s) & 1023) for s in (0, 10, 20)]
+            length = math.sqrt(sum(c * c for c in v)) or 1.0
+            rows.append((v[0] / length, v[1] / length, v[2] / length, {3: 1, 0: -1}.get(w >> 30, 0)))
+        out[slot] = rows
+    return out
+
+
+def tangent_agreement(normals, tangents):
+    """Counts for tangents against the same vertex's stored normal: |dot| < 0.05 (perpendicular) and the sign bits."""
+    out = {"vertices": 0, "perpendicular": 0, "sign_plus": 0, "sign_minus": 0}
+    for rows in tangents.values():
+        for nrm, (x, y, z, sign) in zip(normals, rows):
+            out["vertices"] += 1
+            out["perpendicular"] += abs(nrm[0] * x + nrm[1] * y + nrm[2] * z) < 0.05
+            out["sign_plus"] += sign == 1
+            out["sign_minus"] += sign == -1
+    return out
+
+
 def normal_agreement(positions, normals, triangles):
     """For each vertex the triangles use, compare its stored normal with the sum of its faces' (area-weighted)
     normals. Counts vertices, dot > 0.99, dot > 0.9 and dot < 0."""
@@ -476,6 +507,11 @@ def summarise_page(data, name, faces=False, centres=False, normals=False):
         for b in others:
             for k, v in block4240_checks(data, b).items():
                 checks[k] = checks.get(k, 0) + v
+            if normals:
+                nrm = normals_4240(data, b)
+                if nrm is not None:
+                    for k, v in tangent_agreement(nrm, tangents_4240(data, b)).items():
+                        checks["tangents_4240_" + k] = checks.get("tangents_4240_" + k, 0) + v
         if faces or centres or normals:
             decoded = {}
             for g in groups:
@@ -725,7 +761,8 @@ def main(argv=None):
     ap.add_argument("--faces", action="store_true",
                     help="also count how often neighbouring faces of 42 40 geometry agree (slower)")
     ap.add_argument("--normals", action="store_true",
-                    help="also compare 42 40 slot-2 normals with their vertices' face normals (slower)")
+                    help="also compare 42 40 slot-2 normals with their vertices' face normals, and tangents with "
+                         "the normals (slower)")
     ap.add_argument("--centres", action="store_true",
                     help="also compare meshlet records' stored centres with their 42 40 vertices (slower)")
     ap.add_argument("--draw-system", help="inflated system segment paired with one graphics segment")

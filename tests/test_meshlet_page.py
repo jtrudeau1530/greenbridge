@@ -557,6 +557,28 @@ class Normals4240Tests(unittest.TestCase):
         with self.assertRaises(mp.PageError):
             mp.normal_agreement(flat, up[:4], tris)
 
+    def test_tangents(self):
+        tags = ((0, 0x42, 8), (2, 0x21, 4), (11, 0x27, 4), (18, 0x27, 4))
+        data = bytearray(page(other_block(3, tags=tags, packed=[(0, 0, 0)] * 3)))
+        blk = mp.parse_page(bytes(data))[0]
+        offs = dict((i, o) for i, _, o in blk["slots"])
+        x_axis = 1023 | 512 << 10 | 512 << 20          # tangent +x, normal +z: perpendicular
+        z_axis = 512 | 512 << 10 | 1023 << 20
+        for k, (nw, t11, t18) in enumerate([(self.UP, 3 << 30 | x_axis, x_axis), (self.UP, x_axis, 1 << 30 | x_axis),
+                                             (self.UP, 3 << 30 | z_axis, 3 << 30 | x_axis)]):
+            struct.pack_into("<I", data, blk["offset"] + offs[2] + 4 * k, nw)
+            struct.pack_into("<I", data, blk["offset"] + offs[11] + 4 * k, t11)
+            struct.pack_into("<I", data, blk["offset"] + offs[18] + 4 * k, t18)
+        tan = mp.tangents_4240(bytes(data), blk)
+        self.assertEqual(sorted(tan), [11, 18])
+        self.assertVector(tan[11][0][:3], (1, 0, 0))
+        self.assertEqual([r[3] for r in tan[11]], [1, -1, 1])
+        self.assertEqual([r[3] for r in tan[18]], [-1, 0, 1])
+        got = mp.tangent_agreement(mp.normals_4240(bytes(data), blk), tan)
+        self.assertEqual(got, {"vertices": 6, "perpendicular": 5, "sign_plus": 3, "sign_minus": 2})
+        checks = mp.summarise_page(bytes(data), "p", normals=True)["checks"]
+        self.assertEqual(checks["tangents_4240_perpendicular"], 5)
+
     def test_page_normals_and_cli(self):
         cols, rows = 4, 4
         packed = [(c * 4096, r * 4096, 5) for r in range(rows) for c in range(cols)]   # axis 2: a plane facing +z
