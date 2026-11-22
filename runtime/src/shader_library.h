@@ -460,10 +460,11 @@ inline std::span<const std::uint8_t> dxbc_part(std::span<const std::uint8_t> con
     };
     if (container.size() < 32 || std::memcmp(container.data(), "DXBC", 4) != 0) return {};
     const std::uint32_t parts = u32(28);
+    if (parts > (container.size() - 32) / 4) return {};
     for (std::uint32_t i = 0; i < parts; ++i) {
         const std::uint32_t at = u32(32 + 4 * std::size_t(i));
         if (std::size_t(at) + 8 > container.size()) return {};
-        const std::uint32_t size = u32(at + 4);
+        const std::uint32_t size = u32(std::size_t(at) + 4);
         if (std::size_t(at) + 8 + size > container.size()) return {};
         if (std::memcmp(container.data() + at, fourcc, 4) == 0) return container.subspan(at + 8, size);
     }
