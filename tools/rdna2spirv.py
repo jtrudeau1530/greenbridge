@@ -181,11 +181,13 @@ USER_SGPRS = 32
 # here.) ds_nop is the DS unit's no-operation (no address, data or result). v_clrexcp clears the exception bits of
 # TRAPSTS, which nothing translated reads (s_getreg_b32 is unsupported and there are no traps).
 # s_atc_probe / s_atc_probe_buffer probe (prefetch) an address in the address translation cache: no data comes back
-# and nothing is written (RDNA2 ISA, SMEM).
+# and nothing is written (RDNA2 ISA, SMEM). s_incperflevel / s_decperflevel step a performance counter and s_wakeup
+# pings the other waves of the threadgroup out of an s_sleep (itself a no-op here): neither touches a register,
+# memory, SCC, VCC or EXEC (RDNA2 ISA, SOPP).
 NOOPS = {"s_sleep", "v_nop", "v_pipeflush", "s_nop", "s_inst_prefetch", "s_endpgm", "s_setprio", "s_clause",
          "s_delay_alu", "s_waitcnt", "s_waitcnt_vscnt", "s_waitcnt_vmcnt", "s_waitcnt_expcnt", "s_waitcnt_lgkmcnt",
          "s_waitcnt_depctr", "s_icache_inv", "s_ttracedata", "s_ttracedata_imm", "s_code_end", "s_version",
-         "ds_nop", "v_clrexcp", "s_atc_probe", "s_atc_probe_buffer"}
+         "ds_nop", "v_clrexcp", "s_atc_probe", "s_atc_probe_buffer", "s_incperflevel", "s_decperflevel", "s_wakeup"}
 
 F2 = {"v_add_f32": "OpFAdd", "v_sub_f32": "OpFSub", "v_mul_f32": "OpFMul",
       "v_max_f32": "max", "v_min_f32": "min"}
