@@ -270,10 +270,10 @@ def _rgb565(c):
     return ((c >> 11) & 31) * 255.0 / 31, ((c >> 5) & 63) * 255.0 / 63, (c & 31) * 255.0 / 31
 
 
-def decode_bc1_block(data, at):
+def decode_bc1_block(data, at, four_color=False):
     c0, c1, idx = struct.unpack_from("<HHI", data, at)
     p0, p1 = _rgb565(c0), _rgb565(c1)
-    if c0 > c1:
+    if four_color or c0 > c1:
         pal = [p0, p1, tuple((2 * a + b) / 3 for a, b in zip(p0, p1)),
                tuple((a + 2 * b) / 3 for a, b in zip(p0, p1))]
     else:
@@ -302,7 +302,8 @@ def decode_pixels(fmt, data, blocks_w, blocks_h):
             if fmt in (71, 72):
                 blk = decode_bc1_block(data, (by * blocks_w + bx) * 8)
             elif fmt in (77, 78):
-                blk = decode_bc1_block(data, at + 8)
+                # BC3 colour uses four entries regardless of endpoint order.
+                blk = decode_bc1_block(data, at + 8, four_color=True)
             elif fmt in (80,):
                 blk = decode_bc4_block(data, (by * blocks_w + bx) * 8)
             elif fmt in (83,):
