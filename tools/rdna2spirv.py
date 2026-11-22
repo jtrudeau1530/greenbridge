@@ -6790,8 +6790,14 @@ class Gen:
             self.emit(f"{x_in_range} = OpULessThan %bool {x_mag} {self.cu(0x4F000000)}")  # |x| < 2^31
             self.emit(f"{x_neg} = OpINotEqual %bool {x_bits} {x_mag}")
             self.emit(f"{bound} = OpSelect %uint {x_neg} {self.cu(0x80000000)} {self.cu(0x7FFFFFFF)}")
-            # Guard before Floor/FSub/FToS: -2^31 (0xCF000000) takes `bound` = 0x80000000 directly.
-            self.emit(f"{safe_x_u} = OpSelect %uint {x_in_range} {x_bits} {self.cu(0)}")
+            # Guard before Floor/FSub/FToS: -2^31 (0xCF000000) takes `bound` = 0x80000000 directly. A denormal operand
+            # is a zero, as on RDNA2 with f32 denormals flushed (the MODE inferred for the game; gfx1036 gives
+            # flr(-1e-45) = 0, where Floor of the kept denormal gives -1).
+            x_exp, x_norm, keep_x = self.tmp(), self.tmp(), self.tmp()
+            self.emit(f"{x_exp} = OpBitwiseAnd %uint {x_bits} {self.cu(0x7F800000)}")
+            self.emit(f"{x_norm} = OpINotEqual %bool {x_exp} {self.cu(0)}")
+            self.emit(f"{keep_x} = OpLogicalAnd %bool {x_in_range} {x_norm}")
+            self.emit(f"{safe_x_u} = OpSelect %uint {keep_x} {x_bits} {self.cu(0)}")
             safe_x = self.tof(safe_x_u)
             self.emit(f"{fl} = OpExtInst %float %glsl Floor {safe_x}")
             if op == "v_cvt_rpi_i32_f32":
