@@ -73,7 +73,7 @@ int wmain(int argc, wchar_t** argv) {
             loader.initialise();  // TLS callbacks, then DllMain(DLL_PROCESS_ATTACH) for DLLs
             std::printf("%zu module(s) initialised\n", loader.modules().size());
         }
-        int unimplemented = 0;
+        int unimplemented = 0, unimplemented_hresult = 0;
         for (auto* m : loader.modules()) {
             std::map<rt::Binding, int> counts;
             for (auto& r : m->imports) counts[r.binding]++;
@@ -83,11 +83,18 @@ int wmain(int argc, wchar_t** argv) {
                         counts[rt::Binding::Unimplemented]);
             for (auto& r : m->imports)
                 if (r.binding == rt::Binding::Unimplemented || r.binding == rt::Binding::Shim) {
-                    std::printf("    %-13s %s!%s\n", binding_name(r.binding), r.dll.c_str(), r.name.c_str());
-                    unimplemented += r.binding == rt::Binding::Unimplemented;
+                    const bool missing = r.binding == rt::Binding::Unimplemented;
+                    const bool hresult =
+                        missing && rt::shims::classify_import(r.dll, r.name) == rt::shims::ReturnClass::HResult;
+                    std::printf("    %-13s %s!%s%s\n", binding_name(r.binding), r.dll.c_str(), r.name.c_str(),
+                                hresult ? "  [returns HRESULT]" : "");
+                    unimplemented += missing;
+                    unimplemented_hresult += hresult;
                 }
         }
         std::printf("%zu module(s) mapped, %d unimplemented import(s)\n", loader.modules().size(), unimplemented);
+        std::printf("unimplemented by return policy: hresult=%d other=%d\n", unimplemented_hresult,
+                    unimplemented - unimplemented_hresult);
         if (!run) return 0;
         if (!main_module.entry_rva) {
             std::fprintf(stderr, "error: %s has no entry point\n", main_module.name.c_str());

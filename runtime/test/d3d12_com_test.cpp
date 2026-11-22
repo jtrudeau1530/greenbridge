@@ -264,6 +264,7 @@ int main() {
         EXPECT(invalid_bundle_call([&](auto* b) { b->ClearRenderTargetView(rtv_handle, bundle_clear_color, 0, nullptr); }));
         EXPECT(invalid_bundle_call([&](auto* b) { b->ClearDepthStencilView(dsv_handle, D3D12_CLEAR_FLAG_DEPTH,
                                                                             0.5f, 0, 0, nullptr); }));
+        EXPECT(invalid_bundle_call([&](auto* b) { b->SetPredication(nullptr, 0, D3D12_PREDICATION_OP_EQUAL_ZERO); }));
         // D3D-26: DiscardResource and the atomic copies are not allowed in a bundle; WriteBufferImmediate is
         // ("Recording command lists and bundles", the bundle restrictions and the API restrictions table).
         EXPECT(invalid_bundle_call([&](auto* b) { b->DiscardResource(rt_resource, nullptr); }));

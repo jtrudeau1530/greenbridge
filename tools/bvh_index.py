@@ -19,6 +19,10 @@ Usage:
     python -I tools/bvh_index.py <archive.rpf> [--out index.json] [--csv index.csv]
                                  [--start N] [--limit BYTES] [--max-inflate BYTES]
     python -I tools/bvh_index.py <dir-with-rpf-or-bin> [--out index.json] [--csv index.csv]
+                                 [--max-inflate BYTES]
+
+--start and --limit apply to a single archive only; with a directory they are an error (exit 2).
+--max-inflate applies to every .rpf in the directory.
 
 Exit status is 0 even when nothing is found; the summary says how many streams were read.
 """
@@ -60,8 +64,9 @@ def below_normal():
 def decode_node_pointer(value):
     """Decode the low three type bits and the high 29-bit 64-byte node index."""
     typ = value & 7
+    invalid = value == INVALID_NODE
     return {"ptr": value, "index": value >> 3, "type": typ,
-            "name": NODE_TYPE_NAMES.get(typ, "invalid"), "invalid": value == INVALID_NODE}
+            "name": "invalid" if invalid else NODE_TYPE_NAMES[typ], "invalid": invalid}
 
 
 def parse_header(head):
@@ -95,6 +100,7 @@ def parse_header(head):
         "root_node_index": root_ptr["index"],
         "root_node_type": root_ptr["type"],
         "root_node_type_name": root_ptr["name"],
+        "root_node_invalid": root_ptr["invalid"],
         "offset_to_elements": struct.unpack_from("<I", head, 0x134)[0],
         "offset_to_parents": struct.unpack_from("<I", head, 0x138)[0],
         "compression_params": struct.unpack_from("<I", head, 0x13C)[0],
@@ -157,6 +163,7 @@ def classify(head, size, tail=None):
                           root_node_index=hdr["root_node_index"],
                           root_node_type=hdr["root_node_type"],
                           root_node_type_name=hdr["root_node_type_name"],
+                          root_node_invalid=hdr["root_node_invalid"],
                           offset_to_elements=hdr["offset_to_elements"],
                           offset_to_parents=hdr["offset_to_parents"],
                           compression_params=hdr["compression_params"],
@@ -292,13 +299,13 @@ def summarize(rows, source, span, zero, unread, elapsed):
             "elapsed_s": round(elapsed, 2)}
 
 
-def scan_dir(path):
+def scan_dir(path, max_inflate=1 << 28):
     rpfs = sorted(glob.glob(os.path.join(path, "**", "*.rpf"), recursive=True))
     rows, summaries = [], []
     if rpfs:
         for p in rpfs:
             try:
-                r, s = scan_rpf(p)
+                r, s = scan_rpf(p, max_inflate=max_inflate)
             except (OSError, ValueError) as e:   # one unreadable archive should not lose the others
                 print(f"{p}: skipped ({e})", file=sys.stderr)
                 continue
@@ -337,7 +344,8 @@ def write_outputs(rows, summaries, out, csv_path):
         cols = ["source", "offset", "stored", "size", "kind", "signature", "version", "node_count",
                 "node_bytes", "declared_bytes", "tail_offset", "flags", "crc32", "num_elements",
                 "offset_to_nodes", "offset_to_prim_remap", "root_node_ptr", "root_node_index",
-                "root_node_type", "root_node_type_name", "offset_to_elements", "offset_to_parents",
+                "root_node_type", "root_node_type_name", "root_node_invalid", "offset_to_elements",
+                "offset_to_parents",
                 "compression_params", "dehydrated", "chunked", "bounds_min", "bounds_max",
                 "hash", "off_a0", "hi16", "lo16", "desc_word", "fragment"]
         with open(csv_path, "w", newline="", encoding="utf-8") as f:
@@ -383,9 +391,11 @@ def main(argv=None):
     ap.add_argument("--max-inflate", type=byte_count, default=1 << 28,
                     help="keep at most this many bytes of one stream")
     a = ap.parse_args(argv)
+    if os.path.isdir(a.target) and (a.start is not None or a.limit is not None):
+        ap.error("--start and --limit apply to a single archive, not a directory")
     below_normal()
     if os.path.isdir(a.target):
-        rows, summaries = scan_dir(a.target)
+        rows, summaries = scan_dir(a.target, a.max_inflate)
     else:
         try:
             rows, summaries = scan_rpf(a.target, a.start, a.limit, a.max_inflate)

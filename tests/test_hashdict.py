@@ -158,6 +158,38 @@ class LookupCLITest(unittest.TestCase):
         ])
 
 
+class LookupBadInputTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.hashes_file = os.path.join(self.tmp.name, "hashes.json")
+        with open(self.hashes_file, "w", encoding="utf-8") as f:
+            json.dump({"88f08ef3": "apple"}, f)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def run_tool(self, *args):
+        return subprocess.run([sys.executable, "-I", TOOL, *args], capture_output=True, text=True)
+
+    def test_non_hex_value_is_a_usage_error_before_any_output(self):
+        p = self.run_tool("--lookup", self.hashes_file, "88f08ef3", "apple")
+        self.assertEqual(p.returncode, 2)
+        self.assertIn("'apple' is not a hexadecimal hash", p.stderr)
+        self.assertNotIn("Traceback", p.stderr)
+        self.assertEqual(p.stdout, "")          # nothing printed for the valid value before the bad one
+
+    def test_unreadable_dictionary_is_one_line(self):
+        bad = os.path.join(self.tmp.name, "bad.json")
+        with open(bad, "w", encoding="utf-8") as f:
+            f.write("{not json")
+        for path in (os.path.join(self.tmp.name, "missing.json"), bad):
+            with self.subTest(path=os.path.basename(path)):
+                p = self.run_tool("--lookup", path, "88f08ef3")
+                self.assertEqual(p.returncode, 2)
+                self.assertIn(path, p.stderr)
+                self.assertNotIn("Traceback", p.stderr)
+
+
 class CarveAndExtraCLITest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -256,15 +288,43 @@ class CarveAndExtraCLITest(unittest.TestCase):
         with open(self.out_json, encoding="utf-8") as f:
             self.assertEqual(json.load(f), {"12345678": "keep"})
 
+    def test_missing_or_file_carve_is_one_line(self):
+        with open(self.out_json, "w", encoding="utf-8") as f:
+            f.write('{"12345678": "keep"}')
+        for carve, what in ((os.path.join(self.dir, "no_such_carve"), "does not exist"),
+                            (self.extra_file, "is not a folder")):
+            with self.subTest(what=what):
+                p = self.run_tool(carve, "--out", self.out_json)
+                self.assertEqual(p.returncode, 2)
+                self.assertIn(carve, p.stderr)
+                self.assertIn(what, p.stderr)
+                self.assertNotIn("Traceback", p.stderr)
+                with open(self.out_json, encoding="utf-8") as f:
+                    self.assertEqual(json.load(f), {"12345678": "keep"})
+
+    def test_listed_blob_missing_from_disk_is_skipped_and_reported(self):
+        # The PSIN blob is listed in custom_pack/index.json but gone: the run keeps every other string.
+        os.remove(os.path.join(self.carve_dir, "custom_pack", f"{32:012x}.bin"))
+        p = self.run_tool(self.carve_dir, "--out", self.out_json)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertNotIn("Traceback", p.stderr)
+        self.assertIn("1 carved blobs", p.stderr)
+        self.assertIn(f"{32:012x}.bin", p.stderr)
+        with open(self.out_json, encoding="utf-8") as f:
+            d = json.load(f)
+        self.assertEqual(d.get(f"{hashdict.joaat('common_archive_asset'):08x}"), "common_archive_asset")
+        self.assertNotIn(f"{hashdict.joaat('pso_metadata_token'):08x}", d)
+
     def test_build_is_reproducible_with_collisions(self):
         with open(self.extra_file, "wb") as f:
             f.write(b"widget Widget str_85_83667 str_63346_847129")
 
+        flags = ["-P"] if sys.version_info >= (3, 11) else []
         results = []
         for seed in ("1", "2"):
             # Unlike -I, -P keeps PYTHONHASHSEED while leaving the script directory off sys.path.
             result = subprocess.run(
-                [sys.executable, "-P", TOOL, self.carve_dir, "--out", self.out_json, "--extra", self.extra_file],
+                [sys.executable, *flags, TOOL, self.carve_dir, "--out", self.out_json, "--extra", self.extra_file],
                 env=dict(os.environ, PYTHONHASHSEED=seed), capture_output=True, text=True,
             )
             self.assertEqual(result.returncode, 0, result.stderr)

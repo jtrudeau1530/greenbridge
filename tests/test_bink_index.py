@@ -9,8 +9,10 @@ import io
 import json
 import os
 import struct
+import subprocess
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -120,6 +122,23 @@ class TestScanAndWrite(unittest.TestCase):
             [(24000, 1001, 23.976, 5.005), (30000, 1001, 29.97, 4.004),
              (60000, 1001, 59.94, 2.002)],
         )
+
+    def test_probe_handles_failed_or_malformed_results(self):
+        rows, _ = bink.scan_target(self.dir)
+        valid_info = {"streams": [{"codec_type": "video", "codec_name": "bink2"}],
+                      "format": {"duration": "0.233"}}
+        for status, info, expected in (
+            (0, valid_info, ("yes", "bink2", "0.233")),
+            (1, valid_info, ("no", "", "")),
+            (0, [], ("no", "", "")),
+            (0, {"streams": [None]}, ("no", "", "")),
+            (0, {"streams": valid_info["streams"], "format": None}, ("no", "", "")),
+        ):
+            with self.subTest(status=status, info=info):
+                proc = subprocess.CompletedProcess(["ffprobe"], status, json.dumps(info))
+                with mock.patch.object(bink.subprocess, "run", return_value=proc):
+                    row = bink.probe_row(dict(rows[0]), "ffprobe")
+                self.assertEqual((row["decodes"], row["codec"], row["probe_duration_s"]), expected)
 
     def test_csv_and_json(self):
         rows, summary = bink.scan_target(self.dir)

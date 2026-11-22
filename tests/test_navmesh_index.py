@@ -4,6 +4,7 @@
 
 Everything is synthetic: a hand-built RPF9 header, zlib streams and a fake page. No game data is used.
 """
+import importlib.util
 import json
 import os
 import struct
@@ -11,12 +12,20 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 import zlib
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOL = os.path.join(ROOT, "tools", "navmesh_index.py")
 KEY = 0x8A2D3FF3DF663960
 FIELD68 = 141492
+
+
+def load_tool_module():
+    spec = importlib.util.spec_from_file_location("navmesh_index_under_test", TOOL)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def page(version=122, pages=3, key=KEY, field68=FIELD68):
@@ -126,6 +135,94 @@ class NavmeshIndexTest(unittest.TestCase):
             r = subprocess.run([sys.executable, "-I", TOOL, path, "--out", out, *extra],
                                cwd=ROOT, capture_output=True, text=True)
             self.assertEqual(r.returncode, 2, r.stderr)
+            self.assertFalse(os.path.exists(out))
+
+    def test_directory_refuses_start_and_limit(self):
+        folder = os.path.join(self.root, "carve")
+        os.makedirs(folder)
+        with open(os.path.join(folder, "page.bin"), "wb") as f:
+            f.write(page())
+        for extra in (("--start", "0"), ("--limit", "128"), ("--start", "0", "--limit", "128")):
+            out = os.path.join(self.root, "dir_bad.json")
+            r = subprocess.run([sys.executable, "-I", TOOL, folder, "--out", out, *extra],
+                               cwd=ROOT, capture_output=True, text=True)
+            self.assertEqual(r.returncode, 2, r.stderr)
+            self.assertIn("--start and --limit apply to a single archive, not a directory", r.stderr)
+            self.assertFalse(os.path.exists(out))
+
+    def test_archive_refuses_pattern(self):
+        rpf = os.path.join(self.root, "nav.rpf")
+        make_rpf(rpf)
+        for pat in ("*.bin", "*.dat"):
+            out = os.path.join(self.root, "rpf_bad.json")
+            r = subprocess.run([sys.executable, "-I", TOOL, rpf, "--out", out, "--pattern", pat],
+                               cwd=ROOT, capture_output=True, text=True)
+            self.assertEqual(r.returncode, 2, r.stderr)
+            self.assertIn("--pattern applies to a directory, not an archive", r.stderr)
+            self.assertFalse(os.path.exists(out))
+
+    def test_scan_archive_closes_mmap_on_success(self):
+        mod = load_tool_module()
+        rpf = os.path.join(self.root, "close_ok.rpf")
+        make_rpf(rpf)
+        real_mmap = mod.mmap.mmap
+        created = []
+
+        def tracking_mmap(*args, **kwargs):
+            m = real_mmap(*args, **kwargs)
+            created.append(m)
+            return m
+
+        try:
+            with mock.patch.object(mod.mmap, "mmap", side_effect=tracking_mmap):
+                rows, summary = mod.scan_archive(rpf)
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(summary["matched"], 1)
+            self.assertEqual(len(created), 1)
+            self.assertTrue(created[0].closed)
+            os.remove(rpf)
+            self.assertFalse(os.path.exists(rpf))
+        finally:
+            for m in created:
+                if not m.closed:
+                    m.close()
+
+    def test_scan_archive_closes_mmap_on_start_out_of_range(self):
+        mod = load_tool_module()
+        rpf = os.path.join(self.root, "close_err.rpf")
+        make_rpf(rpf)
+        size = os.path.getsize(rpf)
+        real_mmap = mod.mmap.mmap
+        created = []
+
+        def tracking_mmap(*args, **kwargs):
+            m = real_mmap(*args, **kwargs)
+            created.append(m)
+            return m
+
+        try:
+            with mock.patch.object(mod.mmap, "mmap", side_effect=tracking_mmap):
+                with self.assertRaises(SystemExit):
+                    mod.scan_archive(rpf, start=size)
+            self.assertEqual(len(created), 1)
+            self.assertTrue(created[0].closed)
+            os.remove(rpf)
+            self.assertFalse(os.path.exists(rpf))
+        finally:
+            for m in created:
+                if not m.closed:
+                    m.close()
+
+
+class MissingInputTest(unittest.TestCase):
+    def test_missing_input_is_a_message_not_a_traceback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "n.json")
+            p = subprocess.run([sys.executable, "-I", TOOL, os.path.join(tmp, "missing.rpf"), "--out", out],
+                               capture_output=True, text=True, timeout=60)
+            self.assertEqual(p.returncode, 1, p.stderr)
+            self.assertIn("missing.rpf", p.stderr)
+            self.assertNotIn("Traceback", p.stderr)
             self.assertFalse(os.path.exists(out))
 
 

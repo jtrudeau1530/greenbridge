@@ -210,5 +210,21 @@ int main() {
     CHECK(!open_parent.execute_bundle(open_parent));  // a list cannot execute itself
     CHECK(open_parent.commands().empty());
 
+    // SetPredication (D3D-18): the op must be one of the two D3D12 values and the offset 8-byte aligned; a null
+    // buffer turns it off whatever the other arguments are.
+    namespace pred = d3d12_predication;
+    CommandList predicated;
+    CHECK(predicated.set_predication({7, 0, pred::equal_zero}));
+    CHECK(predicated.set_predication({7, 16, pred::not_equal_zero}));
+    CHECK(!predicated.set_predication({7, 4, pred::equal_zero}));   // not 8-byte aligned
+    CHECK(!predicated.set_predication({7, 0, 2}));                  // no such op
+    CHECK(predicated.set_predication({0, 4, 2}));                   // off: offset and op ignored
+    CHECK(predicated.close());
+    CHECK(!predicated.set_predication({7, 0, pred::equal_zero}));  // closed
+    CHECK(predicated.commands().size() == 3);
+    CHECK(std::get<Predication>(predicated.commands()[0]).op == pred::equal_zero);
+    CHECK(std::get<Predication>(predicated.commands()[1]).offset == 16);
+    const auto& off = std::get<Predication>(predicated.commands()[2]);
+    CHECK(off.buffer == 0 && off.offset == 0 && off.op == 0);
     return 0;
 }

@@ -59,6 +59,26 @@ class GamedataIndexTest(unittest.TestCase):
         return subprocess.run([sys.executable, "-I", TOOL, target, *args], cwd=self.root,
                               capture_output=True, text=True, encoding="utf-8", errors="replace")
 
+    def test_bad_targets_are_one_line(self):
+        empty = os.path.join(self.root, "empty.rpf")
+        open(empty, "wb").close()
+        no_index = os.path.join(self.root, "no_index")
+        os.mkdir(no_index)
+        bad_index = os.path.join(self.root, "bad_index")
+        os.mkdir(bad_index)
+        with open(os.path.join(bad_index, "index.json"), "w", encoding="utf-8") as f:
+            f.write('{"summary": {}}')                     # no "files" list
+        cases = ((os.path.join(self.root, "missing.rpf"), "does not exist"), (empty, "empty.rpf"),
+                 (no_index, "index.json is missing"), (bad_index, "cannot read"))
+        for target, message in cases:
+            with self.subTest(target=os.path.basename(target)):
+                p = self.run_tool(target, "--json", os.path.join(self.root, "out.json"))
+                self.assertEqual(p.returncode, 2, p.stderr)
+                self.assertIn(message, p.stderr)
+                self.assertNotIn("Traceback", p.stderr)
+                self.assertEqual(p.stdout, "")
+        self.assertFalse(os.path.exists(os.path.join(self.root, "out.json")))
+
     def test_directory_groups_chunks_and_roots(self):
         self.add(b'<?xml version="1.0"?>\n<RootA><!-- synthetic fixture, longer than 64 bytes --><Item value="1"/></RootA>')
         second = b'<?xml version="1.0"?>\n<RootB>' + b"x" * (65536 - len(b'<?xml version="1.0"?>\n<RootB>'))
