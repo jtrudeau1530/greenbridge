@@ -10,6 +10,7 @@ from collections import namedtuple
 import io
 import json
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -540,18 +541,77 @@ class PreflightPrerequisiteTest(PreflightTestBase):
                                         match="about 330 GB is needed")
                 self.assertIn("250 GB free", err)
 
-    def test_preflight_low_space_points_at_run_only_stages(self):
-        with tempfile.TemporaryDirectory() as tmp_work:
-            with mock.patch("sys.version_info", (3, 12, 0)), \
-                 mock.patch("shutil.which", return_value="/usr/bin/tool"), \
-                 mock.patch("make_game.tool_available", return_value=True), \
-                 mock.patch("make_game.ensure_submodule", return_value=None), \
-                 mock.patch("os.path.isfile", return_value=True), \
-                 mock.patch("shutil.disk_usage", return_value=Usage(500 * 2**30, 250 * 2**30, 250 * 2**30)):
-                err = self.assert_fails(make_game.preflight, ["shaders", "assets"], tmp_work, wav=False,
-                                        match="assets stage is optional")
-                self.assertIn("--stages check,shaders,runtime", err)
-                self.assertIn("about 330 GB is needed", err)
+    def test_preflight_suggests_loader_only_when_dropping_assets_makes_it_fit(self):
+        gib = 1 << 30
+        loader_build = ["check", "shaders", "runtime"]
+        full_build = [*loader_build, "assets"]
+        cases = (
+            ("reusable shader outputs", full_build, 10 * gib, True, False, True),
+            ("asset export only", ["assets"], 250 * gib, False, False, False),
+            ("shader and asset exports only", ["shaders", "assets"], 250 * gib, False, False, False),
+            ("WAV export requested", full_build, 250 * gib, False, True, False),
+        )
+        with mock.patch.multiple(
+            make_game,
+            mc_command=mock.Mock(return_value=["llvm-mc"]),
+            dotnet_sdk_ok=mock.Mock(return_value=True),
+            ensure_submodule=mock.Mock(),
+            visual_cpp_tools_ok=mock.Mock(return_value=True),
+            cross_build_missing=mock.Mock(return_value=[]),
+            assets_exported=mock.Mock(return_value=False),
+        ), mock.patch("shutil.which", return_value="/usr/bin/tool"):
+            for name, stages, free, reusable, wav, expect_hint in cases:
+                usage = Usage(500 * gib, 500 * gib - free, free)
+                with self.subTest(name=name), tempfile.TemporaryDirectory() as work, \
+                     mock.patch("shutil.disk_usage", return_value=usage), \
+                     mock.patch.object(make_game, "shader_outputs_reusable", return_value=reusable):
+                    err = self.assert_fails(make_game.preflight, stages, work, wav=wav,
+                                            match="is needed")
+                    self.assertEqual("--stages check,shaders,runtime" in err, expect_hint)
+
+    def test_low_disk_cli_suggests_a_working_stage_selection(self):
+        gib = 1 << 30
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.multiple(
+            make_game,
+            below_normal=mock.DEFAULT,
+            check=mock.Mock(return_value={"expected_exe": "synthetic.exe"}),
+            mc_command=mock.Mock(return_value=["llvm-mc"]),
+            dotnet_sdk_ok=mock.Mock(return_value=True),
+            ensure_submodule=mock.DEFAULT,
+            visual_cpp_tools_ok=mock.Mock(return_value=True),
+            cross_build_missing=mock.Mock(return_value=[]),
+            cross_configure=mock.DEFAULT,
+            pipeline_check_exe=mock.Mock(return_value="vk_pipeline_check"),
+            assets_exported=mock.Mock(return_value=False),
+            shader_outputs_reusable=mock.Mock(return_value=False),
+            wave64_settings=mock.Mock(return_value=(False, False)),
+            runtime_gpu_per_vertex=mock.Mock(return_value=True),
+            log=mock.DEFAULT,
+            shaders=mock.DEFAULT,
+            assets=mock.DEFAULT,
+            runtime=mock.DEFAULT,
+            pipelines=mock.DEFAULT,
+        ) as stages, mock.patch("shutil.which", return_value="available-tool"), \
+                mock.patch("shutil.disk_usage") as disk:
+            argv = ["make_game.py", "--game", os.path.join(tmp, "input"), "--out", os.path.join(tmp, "out")]
+            with mock.patch.object(sys, "argv", argv):
+                disk.return_value = Usage(500 * gib, 470 * gib + 1, 30 * gib - 1)
+                error = self.assert_fails(make_game.main, match="about 330 GB is needed")
+                self.assertNotIn("--stages", error)
+
+                disk.return_value = Usage(500 * gib, 470 * gib, 30 * gib)
+                error = self.assert_fails(make_game.main, match="about 330 GB is needed")
+                suggestion = re.search(r"--stages ([a-z,]+)", error)
+                self.assertIsNotNone(suggestion, error)
+                for stage in ("shaders", "assets", "runtime", "pipelines"):
+                    stages[stage].assert_not_called()
+
+            with mock.patch.object(sys, "argv", [*argv, "--stages", suggestion.group(1)]):
+                self.assertEqual(make_game.main(), 0)
+            stages["shaders"].assert_called_once()
+            stages["runtime"].assert_called_once()
+            stages["assets"].assert_not_called()
+            stages["pipelines"].assert_not_called()
 
     def test_ensure_submodule_present_is_noop(self):
         with tempfile.TemporaryDirectory() as tmp:

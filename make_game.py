@@ -458,9 +458,10 @@ def preflight(stages: list, work: str, wav: bool = False, runtime_build: str | N
         need_gb -= need["shaders"]
     if free_gb < need_gb:
         hint = ""
-        if "assets" in stages and need.get("assets"):
-            hint = (" The assets stage is optional for running: use --stages check,shaders,runtime "
-                    "(about 30 GB; add pipelines if you need it).")
+        assets_gb = need.get("assets", 0)
+        loader_stages_selected = "shaders" in stages and "runtime" in stages
+        if loader_stages_selected and not wav and assets_gb and free_gb >= need_gb - assets_gb:
+            hint = " To prepare the loader without exporting assets, use --stages check,shaders,runtime."
         fail(f"{free_gb:.0f} GB free on the drive of {work}, about {need_gb} GB is needed. "
              "Free some space or choose another drive with --work." + hint)
     if os.name != "nt" and not runtime_build and any(s in WINDOWS_ONLY for s in stages):
