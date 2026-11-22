@@ -159,7 +159,7 @@ def parse_glb(data: bytes) -> dict:
     seen_bin = False
     for chunk_index, chunk in enumerate(chunks[1:], 1):
         if chunk["type"] == CHUNK_TYPE_JSON:
-            raise GlbError(f"duplicate JSON chunk at offset {chunk_index}")
+            raise GlbError(f"duplicate JSON chunk at chunk index {chunk_index}")
         if chunk["type"] != CHUNK_TYPE_BIN:
             continue  # extension chunks are allowed and ignored, per glTF 2.0 section 4.4
         if seen_bin:
