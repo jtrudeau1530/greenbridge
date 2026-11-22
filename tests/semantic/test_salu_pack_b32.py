@@ -312,3 +312,60 @@ class TestSaluPackB32PermutationsAndRouting(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestSaluPackB32BoundariesAliasingAndNegativeControls(unittest.TestCase):
+    """Tests boundary extremes (zeros, ones, sign bits), register aliasing, and negative controls."""
+
+    def test_boundary_extremes_zero_and_max(self):
+        extremes = [0x00000000, 0x0000FFFF, 0xFFFF0000, 0xFFFFFFFF, 0x80007FFF, 0x7FFF8000]
+        for s0 in extremes:
+            for s1 in extremes:
+                for op in PACK_OPS:
+                    expected = ref_pack(op, s0, s1)
+                    got, _ = run_pack_op(op, s0, s1)
+                    self.assertEqual(got, expected, f"Failed at extreme s0={s0:#x}, s1={s1:#x}, op={op}")
+
+    def test_register_aliasing_same_source_registers(self):
+        # S0 and S1 refer to the exact same scalar register
+        s0 = 0x12345678
+        for op in PACK_OPS:
+            expected = ref_pack(op, s0, s0)
+            lines = [
+                f"s_mov_b32 s2, {s0:#x}",
+                f"{op} s0, s2, s2",
+                "v_mov_b32 v0, s0",
+                "v_mov_b32 v1, 0",
+            ]
+            got, _ = run_assembly_lines(lines)
+            self.assertEqual(got, expected, f"Failed aliasing test on op={op}")
+
+    def test_register_aliasing_destination_equals_source(self):
+        # Destination register is the same as source register S0 or S1
+        lines = [
+            "s_mov_b32 s2, 0x12345678",
+            "s_mov_b32 s3, 0x9ABCDEF0",
+            "s_pack_ll_b32_b16 s2, s2, s3",  # D is S0 (s2)
+            "v_mov_b32 v0, s2",
+            "v_mov_b32 v1, 0",
+        ]
+        got, _ = run_assembly_lines(lines)
+        self.assertEqual(got, 0xDEF05678)
+
+        lines2 = [
+            "s_mov_b32 s2, 0x12345678",
+            "s_mov_b32 s3, 0x9ABCDEF0",
+            "s_pack_ll_b32_b16 s3, s2, s3",  # D is S1 (s3)
+            "v_mov_b32 v0, s3",
+            "v_mov_b32 v1, 0",
+        ]
+        got2, _ = run_assembly_lines(lines2)
+        self.assertEqual(got2, 0xDEF05678)
+
+    def test_negative_controls_invalid_instruction_or_malformed_encoding(self):
+        # Verify that malformed / unknown instruction mnemonics raise translation/assembly errors
+        bad_lines = [
+            "s_pack_hl_b32_b16 s0, s2, s3",
+        ]
+        with self.assertRaises(Exception):
+            run_assembly_lines(bad_lines)
