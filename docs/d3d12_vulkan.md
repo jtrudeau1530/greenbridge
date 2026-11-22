@@ -1636,11 +1636,34 @@ struct entry {               // 10 uints = 40 bytes
 | 100k | `host_visible` | 151.640 (6.59) | 129.732 (7.71) | 11548.004 (0.09) | 2336.777 (0.43) | 163852.450 (0.01; `4096x15`, n=9) |
 | 100k | `host_device_local` | 5.468 (182.87) | 4.764 (209.93) | 72.233 (13.84) | 99.000 (10.10) | 690.168 (1.45) |
 
-Three consequences for the runtime and table layout (open on AMD/Intel/Apple GPUs via `vk_descriptor_bench`):
+Three consequences for the runtime and table layout (Intel and Apple numbers remain open via `vk_descriptor_bench`; AMD RDNA3 follows):
 
 1. **In `DEVICE_LOCAL` VRAM, the hash probe itself is cheap at all three sizes:** wave-uniform full-table sweeps run at `5.4–6.1 us / 1M` (`3.0–3.7 us / 1M` net after subtracting the `baseline_uniform` key-read dispatch), and divergent lookups hit `25.7–37.7 us / 1M` (`17.2–28.9 us / 1M` net).
 2. **`BindlessSet::create()` currently allocates PCIe `HOST_VISIBLE | HOST_COHERENT` system memory (`runtime/src/vulkan_bindless.h`):** once working sets exceed cache at 10k–100k entries, `host_visible` slows down by **9.6x–28x** even on wave-uniform full sweeps, **202x–335x** on divergent T# hits (`59x–181x` on T#+S# pairs), and **666x–755x** on 8-probe misses. `host_device_local` (ReBAR `DEVICE_LOCAL | HOST_VISIBLE | HOST_COHERENT`) matches `device_local` across all 1k–10k cases and 100k uniform sweeps, and is 2.1x–3.2x slower than pure `device_local` on 100k divergent lookups (80 MiB, spilling L2) while staying 24x–237x faster than `host_visible`. Staging binding 2 to `DEVICE_LOCAL` (or preferring `DEVICE_LOCAL | HOST_VISIBLE` when small) avoids this cliff without touching the shader contract.
 3. **Power-of-two linear probing with an 8-probe hard limit inflates large tables:** `DescriptorTable` reaches only `15.3%` load at 10k (`2.50 MiB`) and `4.8%` load at 100k (`80.00 MiB`, `max_probes=5`) because any 9-probe collision forces a full 2x capacity double. Bounded-window displacement (for example Robin Hood / backshift within the existing 8-slot window) can raise load factor without changing translated shaders.
+
+**Measured (D3D-56, AMD RDNA3).** The same benchmark and 64-bit timestamps on an AMD Radeon RX 7900 XTX (discrete, `0x1002:0x744c`, subgroup 64, driver `AMD proprietary 26.10.1 (LLPC)`, Vulkan 1.4.359), Windows 11 build 26200, revision `2aed144`. Dispatches, iterations and reps match the NVIDIA run above, but the table geometry does not: capacity depends on insertion order, and at 100k this run settles at `524,288` slots (`20.00 MiB`, `19.07%` load, `max_probes=8`) instead of the RTX 5080's `2,097,152` (`80.00 MiB`, `4.8%`, `5`). Compare rows within this table, not across the two vendors.
+
+| Entries (cap / load / bytes / mean probes) | Placement | `uniform_tsharp_hit` (us/1M, Glk/s) | `uniform_pair_ts` (us/1M, Glk/s) | `divergent_tsharp_hit` (us/1M, Glk/s) | `divergent_pair_ts` (us/1M, Glk/s) | `divergent_miss` (us/1M, Glk/s) |
+|---|---|---|---|---|---|---|
+| 1k (4,096 / 24.4% / 160 KiB / 1.316) | `device_local` | 6.220 (160.76) | 5.705 (175.27) | 15.285 (65.42) | 14.051 (71.17) | 50.461 (19.82) |
+| 1k | `host_visible` | 9.508 (105.17) | 5.783 (172.93) | 15.869 (63.02) | 13.465 (74.27) | 51.978 (19.24) |
+| 1k | `host_device_local` | 8.783 (113.85) | 5.360 (186.58) | 15.380 (65.02) | 13.974 (71.56) | 49.765 (20.09) |
+| 10k (65,536 / 15.3% / 2.50 MiB / 1.310) | `device_local` | 5.152 (194.09) | 4.880 (204.90) | 27.998 (35.72) | 20.506 (48.77) | 146.217 (6.84) |
+| 10k | `host_visible` | 7.536 (132.69) | 6.236 (160.36) | 72.932 (13.71) | 54.183 (18.46) | 334.096 (2.99) |
+| 10k | `host_device_local` | 5.066 (197.38) | 4.841 (206.57) | 28.322 (35.31) | 20.641 (48.45) | 144.532 (6.92) |
+| 100k (524,288 / 19.1% / 20.00 MiB / 1.416) | `device_local` | 7.618 (131.28) | 6.005 (166.54) | 53.558 (18.67) | 54.927 (18.21) | 290.279 (3.45) |
+| 100k | `host_visible` | 47.905 (20.87) | 29.887 (33.46) | 3492.770 (0.29) | 2240.356 (0.45) | 32108.853 (0.03) |
+| 100k | `host_device_local` | 7.660 (130.54) | 6.040 (165.55) | 53.983 (18.52) | 54.804 (18.25) | 292.561 (3.42) |
+
+On this GPU:
+
+1. **`device_local` is stable and cheap at every size.** Wave-uniform sweeps run `4.9–6.2 us / 1M`, divergent lookups `14.1–54.9 us / 1M`, and the 8-probe miss `50.5–290.3 us / 1M`. Repeating the 10k measurement keeps `divergent_miss` at `141–143 us / 1M` net, so this column is not noise.
+2. **`host_visible` falls off a cliff at 100k, and is unreliable below it.** At 100k it is `5.0x–6.3x` slower than `device_local` on wave-uniform sweeps, `41x–65x` on divergent hits and pairs, and `111x` on 8-probe misses. At 10k the same rows varied by up to 6x between runs (`divergent_miss` net `147–845 us / 1M` over five runs), so the 10k host row above is one representative run; the uniform rows moved much less (`6.1–8.7 us / 1M`). The conclusion does not change: `device_local` is stable, `host_visible` is not.
+3. **`host_device_local` (ReBAR) is a safe fallback on AMD.** It is within 1% of `device_local` at 10k and 100k and within 3% at 1k, except `uniform_tsharp_hit` at 1k (`8.78` vs `6.22 us / 1M`). The `DEVICE_LOCAL | HOST_VISIBLE` allocation succeeds and runs here; it is not guaranteed on every Windows driver.
+4. **The 100k cost is table geometry, not the vendor.** This run's `524,288`-slot table (19.07% load, `max_probes=8`) probes more often than the RTX 5080's `2,097,152`-slot one (4.8%, `max_probes=5`), which is why its 100k `divergent_miss` (`290 us / 1M`) is higher than the NVIDIA `217 us / 1M` even though the 1k–10k numbers are close. That is another argument for the bounded-window displacement in item 3 above.
+
+Raw CSV rows: [D3D-56 report](https://github.com/ItsNotRexed/Leonida/issues/313#issuecomment-7074181793), addendum with the repeatability runs: [same issue](https://github.com/ItsNotRexed/Leonida/issues/313#issuecomment-7074220711).
 
 ### 5.2 Per-stage code base
 
@@ -1880,7 +1903,7 @@ Xodus is LGPL-2.1 and is cited only for its coverage number, not as a code sourc
 - **The arena.** A single BDA arena is required by the shader contract for buffers, descriptor tables and code; the
   game's buffer working set may exceed `maxBufferSize` or PC VRAM. Host-visible arenas are slow; device-local
   arenas need staging and careful upload/readback handling. This is the main performance risk.
-- **Hash-table cost.** Every image/sampler access hashes a T#/S# and probes a storage buffer. **Measured (D3D-56, section 5.1)** on an RTX 5080 (driver 616.56): in `DEVICE_LOCAL` VRAM the lookup itself stays fast up to 100k entries (`3.0–3.7 us/1M` net wave-uniform full sweeps, `17.2–28.9 us/1M` net divergent hits), whereas `HOST_VISIBLE | HOST_COHERENT` system memory drops 9.6x–28x on uniform full sweeps and 59x–755x on divergent lookups at 10k–100k entries, and linear probing's 8-probe limit doubles a 100k table to `80.00 MiB` (`4.8%` load). **The runtime now keeps that table in `DEVICE_LOCAL` memory** and uploads only the slots that changed, from a mapped staging copy, with the copy and its barrier in the command buffer that will read it (D3D-76; 46.2x on a divergent miss at 100k on an RTX 2060 SUPER). Improving slot placement within the 8-probe window is the open optimisation (SHADER-100); AMD/Intel/Apple numbers remain open via `vk_descriptor_bench`.
+- **Hash-table cost.** Every image/sampler access hashes a T#/S# and probes a storage buffer. **Measured (D3D-56, section 5.1)** on an RTX 5080 (driver 616.56): in `DEVICE_LOCAL` VRAM the lookup itself stays fast up to 100k entries (`3.0–3.7 us/1M` net wave-uniform full sweeps, `17.2–28.9 us/1M` net divergent hits), whereas `HOST_VISIBLE | HOST_COHERENT` system memory drops 9.6x–28x on uniform full sweeps and 59x–755x on divergent lookups at 10k–100k entries, and linear probing's 8-probe limit doubles a 100k table to `80.00 MiB` (`4.8%` load). **The runtime now keeps that table in `DEVICE_LOCAL` memory** and uploads only the slots that changed, from a mapped staging copy, with the copy and its barrier in the command buffer that will read it (D3D-76; 46.2x on a divergent miss at 100k on an RTX 2060 SUPER). Improving slot placement within the 8-probe window is the open optimisation (SHADER-100); Intel and Apple numbers remain open via `vk_descriptor_bench`; AMD RDNA3 is measured in section 5.1.
 - **Wave64.** On NVIDIA, wave64 shaders use the translator's 32-wide approximation; cross-half ops are approximate.
   AMD GPUs with 64-wide subgroups are exact. This is a known fidelity gap, not specific to the layer.
 - **Xbox tiling/DCC.** Slot 76 and layout `0x101` are known, but the tiled data layout, detile path and DCC remain
