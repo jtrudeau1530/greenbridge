@@ -466,6 +466,26 @@ void check_run_time_load() {
         DeleteFileA((game + "\\MicrosoftGame.Config").c_str());
         RemoveDirectoryA(game.c_str());
         SetEnvironmentVariableA("LEONIDA_GAME_DIR", nullptr);
+        {
+            // A game folder outside every ANSI code page (U+16A0, a runic letter) reaches MicrosoftGame.Config intact.
+            wchar_t wtmp[MAX_PATH] = {};
+            GetTempPathW(MAX_PATH, wtmp);
+            const std::wstring wide = std::wstring(wtmp) + L"leonida_xpackage_\u16a0ocale";
+            CreateDirectoryW(wide.c_str(), nullptr);
+            SetEnvironmentVariableW(L"LEONIDA_GAME_DIR", wide.c_str());
+            const std::wstring wconfig = wide + L"\\MicrosoftGame.Config";
+            if (FILE* f = _wfopen(wconfig.c_str(), L"wb")) {
+                std::fputs("<Game><Resources><Resource Language=\"qq-QQ\"/></Resources></Game>", f);
+                std::fclose(f);
+            }
+            char wlocale[32] = {};
+            check(reinterpret_cast<Locale>(slot(pk, 11))(pk, sizeof(wlocale), wlocale) == S_OK &&
+                      std::strcmp(wlocale, "qq-QQ") == 0,
+                  "slot 11 reads MicrosoftGame.Config from a game folder named outside the ANSI code page");
+            DeleteFileW(wconfig.c_str());
+            RemoveDirectoryW(wide.c_str());
+            SetEnvironmentVariableW(L"LEONIDA_GAME_DIR", nullptr);
+        }
         // Slots 23-26 are the named exports' content-package mounts: XPackageMount, the path size and path of the
         // handle, and closing it. XPackageMountHandle is one u64, passed by value.
         using Mount = HRESULT(STDMETHODCALLTYPE*)(void*, const char*, uint64_t*);

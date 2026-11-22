@@ -731,11 +731,12 @@ bool STDMETHODCALLTYPE pkg_is_packaged(void*) { return XPackageIsPackagedProcess
 // the game folder (LEONIDA_GAME_DIR, else --game-dir). Empty when there is no config or it declares none.
 std::vector<std::string> package_locales() {
     std::vector<std::string> out;
-    char env[MAX_PATH] = {};
-    const DWORD n = GetEnvironmentVariableA("LEONIDA_GAME_DIR", env, sizeof(env));
-    const std::filesystem::path dir = (n > 0 && n < sizeof(env)) ? std::filesystem::path(env) : rt::fs::game_dir();
+    // Wide on purpose: a game folder outside the ANSI code page (e.g. C:\Users\Łukasz) must reach the file intact.
+    wchar_t env[MAX_PATH] = {};
+    const DWORD n = GetEnvironmentVariableW(L"LEONIDA_GAME_DIR", env, MAX_PATH);
+    const std::filesystem::path dir = (n > 0 && n < MAX_PATH) ? std::filesystem::path(env) : rt::fs::game_dir();
     if (dir.empty()) return out;
-    std::ifstream f(dir / "MicrosoftGame.Config", std::ios::binary);
+    std::ifstream f(dir / L"MicrosoftGame.Config", std::ios::binary);
     if (!f) return out;
     const std::string xml{std::istreambuf_iterator<char>(f), {}};
     for (size_t at = 0; (at = xml.find("<Resource", at)) != std::string::npos; ++at) {
