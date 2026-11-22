@@ -2399,6 +2399,24 @@ class Gen:
             self.emit(f"{m} = OpBitwiseAnd %uint {x} {y}")
             self.emit(f"{r} = OpBitwiseOr %uint {m} {z}")
             self.dst(a[0], r)
+        elif op == "s_brev_b64":
+            # D = the 64 bits of S0 in reverse order: D.lo = reverse(S0.hi), D.hi = reverse(S0.lo). SCC is not
+            # written. The pair is 64-bit data (as for s_lshl_b64); a lane-mask source stays Unsupported (#210).
+            d, x = a[0], a[1]
+            if d["k"] != "sgpr" or d.get("n") != 2 or self.holds_lane_mask(x):
+                raise Unsupported(op + " operands")
+            if x["k"] == "sgpr" and x.get("n") == 2:
+                lo, hi = self.load_reg("sgpr", x["r"]), self.load_reg("sgpr", x["r"] + 1)
+            elif x["k"] == "imm":
+                v = x["v"] & 0xFFFFFFFFFFFFFFFF          # 64-bit inline/literal constant: sign-extended
+                lo, hi = self.cu(v & 0xFFFFFFFF), self.cu(v >> 32)
+            else:
+                raise Unsupported(op + " source")
+            rlo, rhi = self.tmp(), self.tmp()
+            self.emit(f"{rlo} = OpBitReverse %uint {hi}")
+            self.emit(f"{rhi} = OpBitReverse %uint {lo}")
+            self.store_reg("sgpr", d["r"], rlo)
+            self.store_reg("sgpr", d["r"] + 1, rhi)
         elif op == "s_brev_b32":
             x = self.src_u(a[1])
             r = self.tmp()
