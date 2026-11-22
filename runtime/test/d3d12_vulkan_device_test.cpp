@@ -4461,6 +4461,54 @@ int main() {
             report("reserved buffer", 0, down + tiled_bytes_down, up + tiled_bytes_up, 256);
         }
 
+        // Several lists in one ExecuteCommandLists, then fewer. The queue keeps its prepared storage between
+        // executions, so the second must replay only the list it is given. B clears blue and A red: {B, A} leaves
+        // red, then {B} alone must leave blue (a stale A replayed after it would leave red).
+        {
+            Ref<ID3D12CommandAllocator> allocator_a, allocator_b;
+            Ref<ID3D12GraphicsCommandList> list_a, list_b;
+            Ref<ID3D12Resource> target;
+            EXPECT(SUCCEEDED(create(default_heap,
+                                    texture_desc(size, size, DXGI_FORMAT_R8G8B8A8_UNORM,
+                                                 D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET),
+                                    D3D12_RESOURCE_STATE_RENDER_TARGET, target)));
+            device->CreateRenderTargetView(target.p, nullptr, rtv1);  // the lists that used this slot have run
+            for (auto [a, l, colour] : {std::tuple{&allocator_a, &list_a, red}, std::tuple{&allocator_b, &list_b, blue}}) {
+                EXPECT(SUCCEEDED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&a->p))));
+                EXPECT(SUCCEEDED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, a->p, nullptr,
+                                                           IID_PPV_ARGS(&l->p))));
+                (*l)->ClearRenderTargetView(rtv1, colour, 0, nullptr);
+                EXPECT((*l)->Close() == S_OK);
+            }
+            ID3D12CommandList* b_then_a[] = {list_b.p, list_a.p};
+            queue->ExecuteCommandLists(2, b_then_a);
+            EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
+            ID3D12CommandList* b_only[] = {list_b.p};
+            queue->ExecuteCommandLists(1, b_only);
+            EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
+
+            UINT64 target_cursor = 0;
+            const auto target_place = place(device.p, target.p, 0, target_cursor);
+            std::memset(down, 0xcd, 65536);
+            EXPECT(SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.p, nullptr)));
+            barrier = transition(target.p, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            list->ResourceBarrier(1, &barrier);
+            {
+                const auto dst = footprint(readback.p, target_place);
+                const auto src = subresource(target.p, 0);
+                list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+            }
+            EXPECT(list->Close() == S_OK);
+            queue->ExecuteCommandLists(1, lists);
+            EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
+            EXPECT(submit_and_wait());
+            const std::uint8_t blue_texel[4] = {0, 0, 255, 255};
+            for (UINT row = 0; row < size; ++row)
+                for (UINT col = 0; col < size; ++col)
+                    report("second ExecuteCommandLists, fewer lists", row * size + col,
+                           down + target_place.Offset + row * target_place.Footprint.RowPitch + col * 4, blue_texel, 4);
+        }
+
         // Queries (docs/d3d12_vulkan.md section 4.6). The layer has no draws yet, so occlusion and pipeline
         // statistics count nothing and read zero; what is checked is that every query is reset and run, that
         // results land as UINT64s at the offsets asked for (over a 0xcd fill), that timestamps advance at the
