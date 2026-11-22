@@ -133,6 +133,9 @@ CVT_F32_SAT_CASES = (
     (0x7F800001, 0, 0), (0xFFC00000, 0, 0))
 # Cross-half wave64 tests (x = cross-half): exact results need 64 lanes, or an emulation of them on narrower subgroups.
 W64_EMULATED = os.environ.get("LEONIDA_W64_EMULATE") == "1"
+# LEONIDA_BARY_FALLBACK=1 (set for build.py too): a pixel shader that reads raw barycentrics was translated with
+# --bary-fallback and is drawn through its pass-through geometry shader, <name>.bary_gs.spv.
+BARY_FALLBACK = os.environ.get("LEONIDA_BARY_FALLBACK") == "1"
 W64X_DUMPS = [("cs_w64x_readlane", [121, 121, 16, 97, 16, 100, 100, 121]),
               ("cs_w64x_writelane", [4660, 77, 99, 2748, 0, 0, 4660, 99]),
               ("cs_w64x_readfirstlane", [140, 140, 163, 132, 100, 105, 133, 48]),
@@ -510,6 +513,9 @@ def pixels(tools, spirv, name, fmt):
     env = dict(os.environ, VKH_SUBGROUP_SIZE=str(sg)) if sg else None
     if name in PIXEL_ENV:
         env = dict(env or os.environ, **PIXEL_ENV[name])
+    gs = os.path.join(spirv, name + ".bary_gs.spv")
+    if BARY_FALLBACK and os.path.isfile(gs):
+        env = dict(env or os.environ, VKH_GS=gs, VKH_GS_HELPER="1")
     with tempfile.TemporaryDirectory(prefix="leonida-pixels-") as tmp:
         raw = Path(tmp) / "pixels.raw"
         code, out = run(os.path.join(tools, "vk_harness" + EXE), os.path.join(spirv, "vs_ids.spv"),
