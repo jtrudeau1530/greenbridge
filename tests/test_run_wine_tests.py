@@ -256,11 +256,33 @@ class MainTest(unittest.TestCase):
         return code, out.getvalue(), err.getvalue()
 
     def test_a_bad_timeout_is_refused_by_argparse(self):
-        for text in ("0", "-1", "abc"):
+        for text in ("0", "-1", "abc", "nan", "inf", "-inf"):
             with self.subTest(text=text):
                 with self.assertRaises(argparse.ArgumentTypeError):
                     rwt.positive_seconds(text)
         self.assertEqual(rwt.positive_seconds("0.5"), 0.5)
+
+    def test_a_nonfinite_timeout_is_a_usage_error(self):
+        for text in ("nan", "inf", "-inf"):
+            with self.subTest(text=text):
+                with self.assertRaises(SystemExit) as ctx:
+                    self.run_main([ctest_entry("ok", self.command("ok.py"))], "--timeout", text)
+                self.assertEqual(ctx.exception.code, 2)
+
+    def test_a_blank_wine_is_a_usage_error(self):
+        with self.assertRaises(SystemExit) as ctx:
+            self.run_main([ctest_entry("ok", self.command("ok.py"))], "--wine", "")
+        self.assertEqual(ctx.exception.code, 2)
+
+    def test_an_unclosed_quote_in_wine_is_a_usage_error(self):
+        with self.assertRaises(SystemExit) as ctx:
+            self.run_main([ctest_entry("ok", self.command("ok.py"))], "--wine", "wine 'unclosed")
+        self.assertEqual(ctx.exception.code, 2)
+
+    def test_wine_quoting_is_still_split(self):
+        self.assertEqual(rwt.wine_command("prog 'two words'"), ["prog", "two words"])
+        with self.assertRaises(argparse.ArgumentTypeError):
+            rwt.wine_command("   ")
 
 
 if __name__ == "__main__":
