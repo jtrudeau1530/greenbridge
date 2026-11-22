@@ -90,8 +90,9 @@ enough for the bundled middleware's `d3d12_xs` calls, not for the game. The laye
   `d3d12.dll` must be shimmed, not resolved from System32. Host DXGI would hand the game a desktop adapter and
   swapchain that cannot see our Vulkan device, and host D3D12 would create a second, unrelated device. This is an
   integration requirement, not an optimisation.
-- **Trace first.** Each method wrapper records its name and arguments at a low rate (first call, then every N),
-  with a `--trace-d3d12` switch. The trace must not quote game data; API names and counts only.
+- **Trace first.** `gta6rt --trace-d3d12` emits numbered records for device entry points, Vulkan device operations,
+  command-list recording and queue submission. Records contain fixed API names and outcomes only. See
+  [the runtime guide](../runtime/README.md#first-boot-d3d12-trace) for collecting a trace.
 
 **Measured, not assumed:** the Xbox device ABI is not uniformly the desktop order. Slots 1/15/18/19/27/38 matched
 in the prior art, while slots 62 and 76 and the heap start-handle return convention did not. Treat every slot as

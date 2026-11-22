@@ -8,6 +8,7 @@
 
 #include "d3d12_stubs.h"  // generated
 #include "d3d12_com_object.h"
+#include "d3d12_trace.h"
 #include "d3d12_xs_device.h"
 #include "../src/gfx10_descriptors.h"
 #include "../src/vulkan_bindless.h"
@@ -1110,53 +1111,59 @@ public:
 
     HRESULT STDMETHODCALLTYPE CreateCommandQueue(const D3D12_COMMAND_QUEUE_DESC* desc, REFIID riid,
                                                  void** out) override {
-        if (!desc) return E_INVALIDARG;
+        constexpr auto method = "ID3D12Device::CreateCommandQueue";
+        if (!desc) return d3d12_trace::result(method, E_INVALIDARG);
         // Copy and compute queues share the one graphics VkQueue for now (section 8.2, question 12).
         if (desc->Type != D3D12_COMMAND_LIST_TYPE_DIRECT) log_once("command queue type on the direct VkQueue:", desc->Type);
-        return create_command_queue(*state_.context, state_.info.queue, state_.info.queue_family, *desc, riid, out,
-                                    identity());
+        return d3d12_trace::result(method, create_command_queue(*state_.context, state_.info.queue, state_.info.queue_family, *desc, riid, out,
+                                    identity()));
     }
 
     HRESULT STDMETHODCALLTYPE CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE type, REFIID riid, void** out) override {
-        return create_command_allocator(type, riid, out, identity());
+        constexpr auto method = "ID3D12Device::CreateCommandAllocator";
+        return d3d12_trace::result(method, create_command_allocator(type, riid, out, identity()));
     }
 
     HRESULT STDMETHODCALLTYPE CreateCommandList(UINT, D3D12_COMMAND_LIST_TYPE type, ID3D12CommandAllocator* allocator,
                                                 ID3D12PipelineState* state, REFIID riid, void** out) override {
+        constexpr auto method = "ID3D12Device::CreateCommandList";
         if (state) stub("ID3D12Device::CreateCommandList(initial pipeline state)");
-        return create_command_list(type, allocator, riid, out, identity());
+        return d3d12_trace::result(method, create_command_list(type, allocator, riid, out, identity()));
     }
 
     // Device4: a list created closed, without an allocator.
     HRESULT STDMETHODCALLTYPE CreateCommandList1(UINT, D3D12_COMMAND_LIST_TYPE type, D3D12_COMMAND_LIST_FLAGS,
                                                  REFIID riid, void** out) override {
-        if (!out) return E_POINTER;
+        constexpr auto method = "ID3D12Device4::CreateCommandList1";
+        if (!out) return d3d12_trace::result(method, E_POINTER);
         *out = nullptr;
         ID3D12CommandAllocator* allocator = nullptr;
         HRESULT hr = create_command_allocator(type, IID_PPV_ARGS(&allocator), identity());
-        if (FAILED(hr)) return hr;
+        if (FAILED(hr)) return d3d12_trace::result(method, hr);
         ID3D12GraphicsCommandList* list = nullptr;
         hr = create_command_list(type, allocator, IID_PPV_ARGS(&list), identity());
         allocator->Release();
-        if (FAILED(hr)) return hr;
+        if (FAILED(hr)) return d3d12_trace::result(method, hr);
         list->Close();
         hr = list->QueryInterface(riid, out);
         list->Release();
-        return hr;
+        return d3d12_trace::result(method, hr);
     }
 
     HRESULT STDMETHODCALLTYPE CreateFence(UINT64 initial, D3D12_FENCE_FLAGS flags, REFIID riid, void** out) override {
-        return create_fence(*state_.context, initial, flags, riid, out, identity());
+        constexpr auto method = "ID3D12Device::CreateFence";
+        return d3d12_trace::result(method, create_fence(*state_.context, initial, flags, riid, out, identity()));
     }
 
     HRESULT STDMETHODCALLTYPE CreateDescriptorHeap(const D3D12_DESCRIPTOR_HEAP_DESC* desc, REFIID riid,
                                                    void** out) override {
-        if (!out) return E_POINTER;
+        constexpr auto method = "ID3D12Device::CreateDescriptorHeap";
+        if (!out) return d3d12_trace::result(method, E_POINTER);
         *out = nullptr;
-        if (!desc || !desc->NumDescriptors) return E_INVALIDARG;
+        if (!desc || !desc->NumDescriptors) return d3d12_trace::result(method, E_INVALIDARG);
         auto* heap = new DescriptorHeap(*desc);
         heap->attach_device(identity());
-        return hand_out(heap, riid, out);
+        return d3d12_trace::result(method, hand_out(heap, riid, out));
     }
 
     UINT STDMETHODCALLTYPE GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE) override {
@@ -1165,6 +1172,7 @@ public:
 
     void STDMETHODCALLTYPE CreateRenderTargetView(ID3D12Resource* resource, const D3D12_RENDER_TARGET_VIEW_DESC* desc,
                                                   D3D12_CPU_DESCRIPTOR_HANDLE destination) override {
+        d3d12_trace::record("ID3D12Device::CreateRenderTargetView");
         if (!destination.ptr) return;
         leonida::TargetView view{};
         if (const Resource* r = Resource::from<Resource>(resource)) {
@@ -1220,6 +1228,7 @@ public:
 
     void STDMETHODCALLTYPE CreateDepthStencilView(ID3D12Resource* resource, const D3D12_DEPTH_STENCIL_VIEW_DESC* desc,
                                                   D3D12_CPU_DESCRIPTOR_HANDLE destination) override {
+        d3d12_trace::record("ID3D12Device::CreateDepthStencilView");
         if (!destination.ptr) return;
         leonida::TargetView view{};
         if (const Resource* r = Resource::from<Resource>(resource)) {
@@ -1280,6 +1289,7 @@ public:
     void STDMETHODCALLTYPE CreateShaderResourceView(ID3D12Resource* resource,
                                                     const D3D12_SHADER_RESOURCE_VIEW_DESC* desc,
                                                     D3D12_CPU_DESCRIPTOR_HANDLE destination) override {
+        d3d12_trace::record("ID3D12Device::CreateShaderResourceView");
         if (!destination.ptr) return;
         std::memset(reinterpret_cast<void*>(destination.ptr), 0, kDescriptorSize);
         const Resource* r = Resource::from<Resource>(resource);
@@ -1338,6 +1348,7 @@ public:
     void STDMETHODCALLTYPE CreateUnorderedAccessView(ID3D12Resource* resource, ID3D12Resource* counter,
                                                      const D3D12_UNORDERED_ACCESS_VIEW_DESC* desc,
                                                      D3D12_CPU_DESCRIPTOR_HANDLE destination) override {
+        d3d12_trace::record("ID3D12Device::CreateUnorderedAccessView");
         if (!destination.ptr) return;
         std::memset(reinterpret_cast<void*>(destination.ptr), 0, kDescriptorSize);
         const Resource* r = Resource::from<Resource>(resource);
@@ -1381,6 +1392,7 @@ public:
     // A sampler is an S# in the first 16 bytes of the slot; the shader finds the sampler by those four dwords.
     void STDMETHODCALLTYPE CreateSampler(const D3D12_SAMPLER_DESC* desc,
                                          D3D12_CPU_DESCRIPTOR_HANDLE destination) override {
+        d3d12_trace::record("ID3D12Device::CreateSampler");
         if (!destination.ptr) return;
         std::memset(reinterpret_cast<void*>(destination.ptr), 0, kDescriptorSize);
         if (!desc) return;
@@ -1394,6 +1406,7 @@ public:
     // on WARP: docs/d3d12_vulkan.md section 3.2.
     void STDMETHODCALLTYPE CreateSampler2(const D3D12_SAMPLER_DESC2* desc,
                                           D3D12_CPU_DESCRIPTOR_HANDLE destination) override {
+        d3d12_trace::record("ID3D12Device11::CreateSampler2");
         if (!destination.ptr || !desc) return;
         const char* refusal = sampler2_refusal(*desc);
         if (refusal) {
@@ -1449,8 +1462,9 @@ public:
     HRESULT STDMETHODCALLTYPE CreateCommittedResource(const D3D12_HEAP_PROPERTIES* heap, D3D12_HEAP_FLAGS heap_flags,
                                                       const D3D12_RESOURCE_DESC* desc, D3D12_RESOURCE_STATES,
                                                       const D3D12_CLEAR_VALUE*, REFIID riid, void** out) override {
+        constexpr auto method = "ID3D12Device::CreateCommittedResource";
         if (out) *out = nullptr;
-        if (!heap || !desc) return E_INVALIDARG;
+        if (!heap || !desc) return d3d12_trace::result(method, E_INVALIDARG);
         auto* resource = new Resource(state_, *desc, *heap, heap_flags);
         resource->attach_device(identity());
         HRESULT hr = E_NOTIMPL;
@@ -1482,13 +1496,13 @@ public:
         }
         if (FAILED(hr)) {
             resource->Release();
-            return hr;
+            return d3d12_trace::result(method, hr);
         }
         if (!out) {  // a capability check: D3D12 allows a null output
             resource->Release();
-            return S_FALSE;
+            return d3d12_trace::result(method, S_FALSE);
         }
-        return hand_out(resource, riid, out);
+        return d3d12_trace::result(method, hand_out(resource, riid, out));
     }
 
     // Reserved (tiled) resources, for the first boot (docs/d3d12_vulkan.md section 4.2): the whole resource is
@@ -1501,7 +1515,8 @@ public:
     // uses it for reserved resources too is an assumption.
     HRESULT STDMETHODCALLTYPE CreateReservedResource(const D3D12_RESOURCE_DESC* desc, D3D12_RESOURCE_STATES,
                                                      const D3D12_CLEAR_VALUE*, REFIID riid, void** out) override {
-        return create_reserved(desc, riid, out);
+        constexpr auto method = "ID3D12Device::CreateReservedResource";
+        return d3d12_trace::result(method, create_reserved(desc, riid, out));
     }
 
     // Device4. Protected sessions are not supported.
@@ -1713,41 +1728,42 @@ public:
     }
 
     HRESULT STDMETHODCALLTYPE CheckFeatureSupport(D3D12_FEATURE feature, void* data, UINT size) override {
+        constexpr auto method = "ID3D12Device::CheckFeatureSupport";
         log_once("CheckFeatureSupport feature", feature);
-        if (!data) return E_INVALIDARG;
+        if (!data) return d3d12_trace::result(method, E_INVALIDARG);
         constexpr VkSampleCountFlags d3d12_multisample_sample_counts =
             VK_SAMPLE_COUNT_2_BIT | VK_SAMPLE_COUNT_4_BIT | VK_SAMPLE_COUNT_8_BIT |
             VK_SAMPLE_COUNT_16_BIT | VK_SAMPLE_COUNT_32_BIT;
         switch (feature) {
         case D3D12_FEATURE_FEATURE_LEVELS: {
-            if (size != sizeof(D3D12_FEATURE_DATA_FEATURE_LEVELS)) return E_INVALIDARG;
+            if (size != sizeof(D3D12_FEATURE_DATA_FEATURE_LEVELS)) return d3d12_trace::result(method, E_INVALIDARG);
             auto* levels = static_cast<D3D12_FEATURE_DATA_FEATURE_LEVELS*>(data);
             D3D_FEATURE_LEVEL best = D3D_FEATURE_LEVEL(0);
             for (UINT i = 0; i < levels->NumFeatureLevels; ++i)
                 if (levels->pFeatureLevelsRequested[i] <= D3D_FEATURE_LEVEL_12_1)
                     best = std::max(best, levels->pFeatureLevelsRequested[i]);
-            if (!best) return DXGI_ERROR_UNSUPPORTED;
+            if (!best) return d3d12_trace::result(method, DXGI_ERROR_UNSUPPORTED);
             levels->MaxSupportedFeatureLevel = best;
-            return S_OK;
+            return d3d12_trace::result(method, S_OK);
         }
         case D3D12_FEATURE_ARCHITECTURE:
         case D3D12_FEATURE_ARCHITECTURE1: {
             const bool v1 = feature == D3D12_FEATURE_ARCHITECTURE1;
             if (size != (v1 ? sizeof(D3D12_FEATURE_DATA_ARCHITECTURE1) : sizeof(D3D12_FEATURE_DATA_ARCHITECTURE)))
-                return E_INVALIDARG;
+                return d3d12_trace::result(method, E_INVALIDARG);
             auto* arch = static_cast<D3D12_FEATURE_DATA_ARCHITECTURE1*>(data);
             const UINT node = arch->NodeIndex;
-            if (node != 0) return E_INVALIDARG;
+            if (node != 0) return d3d12_trace::result(method, E_INVALIDARG);
             // A discrete desktop GPU: not tile-based, no UMA. The console is UMA (question 11); the layer keeps
             // upload heaps host-visible, so the game's upload path still works.
             arch->TileBasedRenderer = FALSE;
             arch->UMA = FALSE;
             arch->CacheCoherentUMA = FALSE;
             if (v1) arch->IsolatedMMU = TRUE;
-            return S_OK;
+            return d3d12_trace::result(method, S_OK);
         }
         case D3D12_FEATURE_D3D12_OPTIONS: {
-            if (size != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS)) return E_INVALIDARG;
+            if (size != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS)) return d3d12_trace::result(method, E_INVALIDARG);
             auto* opts = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS*>(data);
             *opts = {};
             opts->DoublePrecisionFloatShaderOps = TRUE;
@@ -1765,27 +1781,27 @@ public:
             opts->CrossAdapterRowMajorTextureSupported = FALSE;
             opts->VPAndRTArrayIndexFromAnyShaderFeedingRasterizerSupportedWithoutGSEmulation = TRUE;
             opts->ResourceHeapTier = D3D12_RESOURCE_HEAP_TIER_1;
-            return S_OK;
+            return d3d12_trace::result(method, S_OK);
         }
         case D3D12_FEATURE_D3D12_OPTIONS17: {
             // Non-normalized samplers are core Vulkan (unnormalizedCoordinates), with the restrictions
             // CreateSampler2 checks. No manual write tracking, as the RTX 4090 answers too.
-            if (size != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS17)) return E_INVALIDARG;
+            if (size != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS17)) return d3d12_trace::result(method, E_INVALIDARG);
             auto* opts = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS17*>(data);
             *opts = {};
             opts->NonNormalizedCoordinateSamplersSupported = TRUE;
-            return S_OK;
+            return d3d12_trace::result(method, S_OK);
         }
         case D3D12_FEATURE_GPU_VIRTUAL_ADDRESS_SUPPORT: {
-            if (size != sizeof(D3D12_FEATURE_DATA_GPU_VIRTUAL_ADDRESS_SUPPORT)) return E_INVALIDARG;
+            if (size != sizeof(D3D12_FEATURE_DATA_GPU_VIRTUAL_ADDRESS_SUPPORT)) return d3d12_trace::result(method, E_INVALIDARG);
             auto* va = static_cast<D3D12_FEATURE_DATA_GPU_VIRTUAL_ADDRESS_SUPPORT*>(data);
             // The console and PC BDA support 48-bit GPU virtual addresses (section 4.1).
             va->MaxGPUVirtualAddressBitsPerResource = 40;
             va->MaxGPUVirtualAddressBitsPerProcess = 48;
-            return S_OK;
+            return d3d12_trace::result(method, S_OK);
         }
         case D3D12_FEATURE_FORMAT_SUPPORT: {
-            if (size != sizeof(D3D12_FEATURE_DATA_FORMAT_SUPPORT)) return E_INVALIDARG;
+            if (size != sizeof(D3D12_FEATURE_DATA_FORMAT_SUPPORT)) return d3d12_trace::result(method, E_INVALIDARG);
             auto* fs = static_cast<D3D12_FEATURE_DATA_FORMAT_SUPPORT*>(data);
             fs->Support1 = D3D12_FORMAT_SUPPORT1_NONE;
             fs->Support2 = D3D12_FORMAT_SUPPORT2_NONE;
@@ -1793,7 +1809,7 @@ public:
             const Format depth_fmt = vulkan_format(fs->Format, true);
             const VkFormat vk_fmt = fmt.format != VK_FORMAT_UNDEFINED ? fmt.format : depth_fmt.format;
             if (vk_fmt == VK_FORMAT_UNDEFINED || !state_.format_properties) {
-                return DXGI_ERROR_UNSUPPORTED;
+                return d3d12_trace::result(method, DXGI_ERROR_UNSUPPORTED);
             }
             VkFormatProperties props{};
             state_.format_properties(state_.info.physical, vk_fmt, &props);
@@ -1852,16 +1868,16 @@ public:
             }
             fs->Support1 = s1;
             fs->Support2 = s2;
-            return S_OK;
+            return d3d12_trace::result(method, S_OK);
         }
         case D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS: {
-            if (size != sizeof(D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS)) return E_INVALIDARG;
+            if (size != sizeof(D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS)) return d3d12_trace::result(method, E_INVALIDARG);
             auto* levels = static_cast<D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS*>(data);
             levels->NumQualityLevels = 0;
             if (levels->Flags != D3D12_MULTISAMPLE_QUALITY_LEVELS_FLAG_NONE ||
                 levels->SampleCount == 0 || levels->SampleCount > D3D12_MAX_MULTISAMPLE_SAMPLE_COUNT ||
                 (levels->SampleCount & (levels->SampleCount - 1)) != 0)
-                return E_INVALIDARG;
+                return d3d12_trace::result(method, E_INVALIDARG);
             Format format = vulkan_format(levels->Format, false);
             if (format.aspects & VK_IMAGE_ASPECT_DEPTH_BIT) {
                 D3D12_RESOURCE_DESC depth_desc{};
@@ -1870,7 +1886,7 @@ public:
                 format = state_.texture_format(depth_desc);  // includes the D24-to-D32 fallback used by creation
             }
             if (format.format == VK_FORMAT_UNDEFINED || !state_.image_format_properties)
-                return DXGI_ERROR_UNSUPPORTED;
+                return d3d12_trace::result(method, DXGI_ERROR_UNSUPPORTED);
 
             // Vulkan exposes one standard sample pattern per supported count, so each supported count maps to
             // one D3D12 quality level (quality index 0). Query the matching colour or depth/stencil attachment
@@ -1882,7 +1898,7 @@ public:
             else if (format.aspects & VK_IMAGE_ASPECT_DEPTH_BIT)
                 usage |= VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
             else
-                return DXGI_ERROR_UNSUPPORTED;
+                return d3d12_trace::result(method, DXGI_ERROR_UNSUPPORTED);
             const VkImageCreateFlags flags = format.typeless ? VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT : 0;
             VkImageFormatProperties image_properties{};
             const VkResult result = state_.image_format_properties(state_.info.physical, format.format,
@@ -1891,11 +1907,11 @@ public:
             const VkSampleCountFlagBits samples = VkSampleCountFlagBits(levels->SampleCount);
             if (result == VK_SUCCESS && (image_properties.sampleCounts & samples))
                 levels->NumQualityLevels = 1;
-            return S_OK;
+            return d3d12_trace::result(method, S_OK);
         }
         default:
             // Not answered yet. The log above lists every query; answers are added as the trace asks for them.
-            return E_INVALIDARG;
+            return d3d12_trace::result(method, E_INVALIDARG);
         }
     }
 
