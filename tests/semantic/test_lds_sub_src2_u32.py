@@ -289,6 +289,85 @@ def calc_sub_borrow(val_a: int, val_b: int) -> int:
     return 1 if u32(val_a) < u32(val_b) else 0
 
 
+class TestIEEE754BitPatternHandling(unittest.TestCase):
+    """Unit tests for IEEE 754 bit-pattern preservation and untyped raw dword arithmetic."""
+
+    def setUp(self) -> None:
+        self.interp = ScalarInterpreter()
+        self.state = ScalarMachineState(lds_dwords=256)
+
+    def test_signed_zero_bit_patterns(self) -> None:
+        # +0.0 (0x00000000) - -0.0 (0x80000000) = 0x80000000 (-0.0)
+        self.state.set_vgpr(0, 0)
+        self.state.set_lds(0, POS_ZERO_F32)
+        self.state.set_lds(1, NEG_ZERO_F32)
+
+        instr = DSSrc2Instruction(
+            opcode=DSOpcode.DS_SUB_SRC2_U32,
+            addr=LDSAddressExpression(base_reg=RegisterOperand(0), offset0=0, offset1=1),
+        )
+        self.interp.execute(instr, self.state)
+        self.assertEqual(self.state.get_lds(0), NEG_ZERO_F32)
+
+        # -0.0 - -0.0 = 0x00000000 (+0.0)
+        self.state.set_lds(0, NEG_ZERO_F32)
+        self.interp.execute(instr, self.state)
+        self.assertEqual(self.state.get_lds(0), POS_ZERO_F32)
+
+    def test_infinity_bit_patterns(self) -> None:
+        # +inf (0x7F800000) - +inf = 0
+        self.state.set_vgpr(0, 0)
+        self.state.set_lds(0, POS_INF_F32)
+        self.state.set_lds(1, POS_INF_F32)
+
+        instr = DSSrc2Instruction(
+            opcode=DSOpcode.DS_SUB_SRC2_U32,
+            addr=LDSAddressExpression(base_reg=RegisterOperand(0), offset0=0, offset1=1),
+        )
+        self.interp.execute(instr, self.state)
+        self.assertEqual(self.state.get_lds(0), 0)
+
+        # +inf (0x7F800000) - -inf (0xFF800000) = 0x80000000 mod 2^32
+        self.state.set_lds(0, POS_INF_F32)
+        self.state.set_lds(1, NEG_INF_F32)
+        self.interp.execute(instr, self.state)
+        self.assertEqual(self.state.get_lds(0), 0x80000000)
+
+    def test_nan_bit_patterns_unaltered_raw_arithmetic(self) -> None:
+        # qNaN (0x7FC00000) - sNaN (0x7F800001) = 0x003FFFFF
+        # Pure bitwise integer subtraction without quietening or exception trapping
+        self.state.set_vgpr(0, 0)
+        self.state.set_lds(0, QNAN_F32)
+        self.state.set_lds(1, SNAN_F32)
+
+        instr = DSSrc2Instruction(
+            opcode=DSOpcode.DS_SUB_SRC2_U32,
+            addr=LDSAddressExpression(base_reg=RegisterOperand(0), offset0=0, offset1=1),
+        )
+        self.interp.execute(instr, self.state)
+        expected = u32(QNAN_F32 - SNAN_F32)
+        self.assertEqual(self.state.get_lds(0), expected)
+
+    def test_subnormal_no_ftz_integer_subtraction(self) -> None:
+        # Subnormal float bit patterns do not flush to zero in integer memory ops
+        self.state.set_vgpr(0, 0)
+        self.state.set_lds(0, MIN_SUBNORMAL_F32)
+        self.state.set_lds(1, 1)
+
+        instr = DSSrc2Instruction(
+            opcode=DSOpcode.DS_SUB_SRC2_U32,
+            addr=LDSAddressExpression(base_reg=RegisterOperand(0), offset0=0, offset1=1),
+        )
+        self.interp.execute(instr, self.state)
+        self.assertEqual(self.state.get_lds(0), 0)
+
+        # 0 - MIN_SUBNORMAL_F32 = 0xFFFFFFFF
+        self.state.set_lds(0, 0)
+        self.state.set_lds(1, MIN_SUBNORMAL_F32)
+        self.interp.execute(instr, self.state)
+        self.assertEqual(self.state.get_lds(0), MASK32)
+
+
 class TestConditionCodesAndBorrow(unittest.TestCase):
     """Unit tests for condition codes, VCC preservation, and carry/borrow logic."""
 
