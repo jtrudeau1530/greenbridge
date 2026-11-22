@@ -3,7 +3,9 @@
     python -I tests/test_imhex_patterns.py
 
 Every byte here is built by the test: no game file, name or path is used. The RBF0 inputs are first checked with
-tools/rbf0_index.py, the repository's own parser. When ImHex is installed, each pattern then runs on the same bytes
+tools/rbf0_index.py and the PSIN inputs with tools/psin_index.py and tools/psin_data.py, the repository's own
+parsers (the PSIN schema reuses the invented names of tests/test_psin_index.py). When ImHex is installed, each pattern
+then runs on the same bytes
 through ImHex's pattern-language CLI (`imhex --pl format ... -f json`) and the decoded fields are compared with the
 parser's result. ImHex is found through LEONIDA_IMHEX, then PATH, then its default Windows install folder; without it
 the ImHex half is skipped and the rest still runs.
@@ -20,8 +22,12 @@ import unittest
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PATTERNS = os.path.join(ROOT, "tools", "imhex")
 sys.path.insert(0, os.path.join(ROOT, "tools"))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import psin_data  # noqa: E402
+import psin_index  # noqa: E402
 import rbf0_index  # noqa: E402
+from test_psin_index import SCHEMA as PSIN_SCHEMA, joaat, make_lenm, make_lsch, make_section  # noqa: E402
 
 
 def find_imhex():
@@ -69,6 +75,27 @@ def rpf9_archive(data_offset=0x100, size=0x140):
     return head + toc + body
 
 
+PSIN_BLOCKS = [(PSIN_SCHEMA[0][0], bytes(range(0x20))), (0x10, b"probe\x00"), (0x16, struct.pack("<3Q", 1, 2, 3))]
+PSIN_ENUMS = [(joaat("ProbeEnum"), 0x33333333, [(0, joaat("PROBE_A")), (-1, joaat("PROBE_B"))])]
+LSNS_BLOCKS = [(0x101, 32), (0x207, 16)]
+
+
+def psin_container(lsns=True):
+    """A complete container (docs/psin.md): block table, blocks, LSCH, LENM, LSNS, LGID, LRSC (root 1), CHKS."""
+    rows = b"".join(struct.pack("<II", t, len(d)) + b"\xaa" * 8 for t, d in PSIN_BLOCKS) + b"\x70" * 8
+    data = b"".join(d + bytes(-len(d) % 16) for _t, d in PSIN_BLOCKS)
+    first = 8 + len(rows) + len(data)
+    lsns_payload = struct.pack("<I", len(LSNS_BLOCKS)) + b"".join(struct.pack("<II", k, n) for k, n in LSNS_BLOCKS)
+    lsns_payload += bytes((i * 29) & 0xFF for i in range(sum(n for _k, n in LSNS_BLOCKS)))
+    lrsc = b"0DRP" + struct.pack("<I", 122) + bytes(8) + struct.pack("<I", 1) + bytes(12)
+    sections = make_section("LSCH", make_lsch(PSIN_SCHEMA)) + make_section("LENM", make_lenm(PSIN_ENUMS))
+    if lsns:
+        sections += make_section("LSNS", lsns_payload)
+    sections += make_section("LGID") + make_section("LRSC", lrsc)
+    sections += make_section("CHKS", struct.pack(">I", first + len(sections) + 16) + b"\x12\x34\x56\x78")
+    return b"PSIN" + struct.pack(">I", first) + rows + data + sections
+
+
 def pragma_magic(pattern):
     """The bytes of `#pragma magic [ .. ] @ 0x00` in a pattern file."""
     with open(os.path.join(PATTERNS, pattern), encoding="utf-8") as f:
@@ -92,9 +119,20 @@ class InputsAndMagic(unittest.TestCase):
             self.assertEqual(r["elements"], 2)
             self.assertEqual(r["descriptors"], 7)
 
+    def test_synthetic_psin_parses(self):
+        blob = psin_container()
+        r = psin_index.parse(blob, schema=True)
+        self.assertTrue(r["complete"], r["error"])
+        self.assertEqual(r["schema"]["reason"], "")
+        self.assertEqual(r["lsns_blocks"], len(LSNS_BLOCKS))
+        blocks, exact = psin_data.block_table(blob, r["first_section"])
+        self.assertTrue(exact)
+        self.assertEqual([(t, n) for t, _at, n in blocks], [(t, len(d)) for t, d in PSIN_BLOCKS])
+
     def test_pattern_magics(self):
         self.assertEqual(pragma_magic("rbf0.hexpat"), rbf0_index.MAGIC)
         self.assertEqual(pragma_magic("rpf9.hexpat"), b"9FPR")  # RPF9 stored little-endian (docs/rpf.md)
+        self.assertEqual(pragma_magic("psin.hexpat"), psin_index.MAGIC)
 
 
 @unittest.skipUnless(IMHEX, "ImHex is not installed (set LEONIDA_IMHEX to imhex.exe)")
@@ -159,6 +197,54 @@ class PatternsInImHex(unittest.TestCase):
         self.assertEqual(got["header"]["data_offset"], 0x100)
         self.assertEqual((got["header"]["u32_08"], got["header"]["u32_0c"]), (0x11, 0x22))
         self.assertEqual(len(got["header_rest_and_toc"]), 0x100 - 0x10)
+
+    def test_psin_matches_psin_index_and_psin_data(self):
+        blob = psin_container()
+        ref = psin_index.parse(blob, schema=True)
+        table, _exact = psin_data.block_table(blob, ref["first_section"])
+        got, log = self.run_pattern("psin.hexpat", blob)
+        self.assertIsNotNone(got, log)
+        self.assertEqual(got["header"]["first_section"], ref["first_section"])
+
+        # Block table: rows, the "pppppppp" end, and each block's data where psin_data places it.
+        self.assertEqual([(r["type"], r["size"]) for r in got["rows"]], [(t, n) for t, _at, n in table])
+        self.assertEqual(got["table_end"], "pppppppp")
+        self.assertEqual([bytes(b["data"]) for b in got["blocks"]], [blob[at:at + n] for _t, at, n in table])
+
+        sections = {s["tag"]: s for s in got["sections"]}
+        self.assertEqual([(s["tag"], s["size"]) for s in got["sections"]],
+                         [(s["tag"], s["size"]) for s in ref["sections"]])
+        schema = ref["schema"]
+        self.assertEqual([s["name_hash"] for s in sections["LSCH"]["structs"]],
+                         [int(s["hash"], 16) for s in schema["structs"]])
+        self.assertEqual([(m["name_hash"], m["offset"], m["type"], m["index"], m["ref_hash"])
+                          for m in sections["LSCH"]["members"]],
+                         [(int(m["hash"], 16), m["offset"], m["type"], m["index"], int(m["ref"], 16))
+                          for s in schema["structs"] for m in s["members"]])
+        self.assertEqual([e["value_count"] for e in sections["LENM"]["enums"]],
+                         [len(e["values"]) for e in schema["enums"]])
+        self.assertEqual([v["value"] for v in sections["LENM"]["values"]],
+                         [v["value"] for e in schema["enums"] for v in e["values"]])
+        lsns = next(s for s in ref["sections"] if s["tag"] == "LSNS")
+        self.assertEqual([(d["kind"], d["bytes"]) for d in sections["LSNS"]["descs"]],
+                         [(int(b["kind"], 16), b["bytes"]) for b in lsns["blocks"]])
+        self.assertEqual([len(b["records"]) for b in sections["LSNS"]["lsns_blocks"]], [n // 16 for _k, n in LSNS_BLOCKS])
+        self.assertEqual(sections["LRSC"]["rsc_version"], ref["rsc_version"])
+        self.assertEqual(sections["LRSC"]["root_block"], 1)
+        self.assertEqual(sections["CHKS"]["checksum_size"], ref["checksum_size"])
+
+    def test_psin_truncated_keeps_the_whole_sections(self):
+        blob = psin_container(lsns=False)
+        first = struct.unpack_from(">I", blob, 4)[0]
+        lsch_size = struct.unpack_from(">I", blob, first + 4)[0]
+        cut = blob[:first + lsch_size + 20]                       # inside LENM
+        self.assertFalse(psin_index.parse(cut)["complete"])
+        got, log = self.run_pattern("psin.hexpat", cut)
+        self.assertIsNotNone(got, log)
+        tags = [s["tag"] for s in got["sections"]]
+        self.assertEqual(tags, ["LSCH", "LENM"])
+        self.assertIn("structs", got["sections"][0])
+        self.assertEqual(len(got["sections"][1]["truncated"]), 12)  # what is left after LENM's 8-byte header
 
     def test_rpf9_rejects_a_data_offset_past_the_end(self):
         got, log = self.run_pattern("rpf9.hexpat", rpf9_archive(data_offset=0x100, size=0x140)[:0x20])
