@@ -328,6 +328,210 @@ class ScalarBufferInterpreter:
             self.write_reg_u32(RegKind.VGPR, inst.vdata.index, ret_val)
 
 
+class SIMDBufferInterpreter:
+    """SIMD multi-lane interpreter supporting Wave32 and Wave64 with EXEC masking."""
+
+    def __init__(self, num_lanes: int = 64, mem_size: int = 65536) -> None:
+        if num_lanes not in (32, 64):
+            raise ValueError(f"Unsupported lane count: {num_lanes} (must be 32 or 64)")
+        self.num_lanes = num_lanes
+        self.exec_mask: int = (1 << num_lanes) - 1
+        self.vgprs: list[list[int]] = [[0] * 256 for _ in range(num_lanes)]
+        self.sgprs: list[int] = [0] * 106
+        self.mem: BufferMemory = BufferMemory(mem_size)
+        self.vcc: int = 0
+
+    def read_lane_vgpr(self, lane: int, idx: int) -> int:
+        return self.vgprs[lane][idx] & MASK32
+
+    def write_lane_vgpr(self, lane: int, idx: int, val: int) -> None:
+        self.vgprs[lane][idx] = val & MASK32
+
+    def read_sgpr(self, idx: int) -> int:
+        return self.sgprs[idx] & MASK32
+
+    def write_sgpr(self, idx: int, val: int) -> None:
+        self.sgprs[idx] = val & MASK32
+
+    def set_buffer_descriptor(self, sgpr_base: int, desc: BufferResourceDescriptor) -> None:
+        d0, d1, d2, d3 = desc.to_dwords()
+        self.write_sgpr(sgpr_base + 0, d0)
+        self.write_sgpr(sgpr_base + 1, d1)
+        self.write_sgpr(sgpr_base + 2, d2)
+        self.write_sgpr(sgpr_base + 3, d3)
+
+    def get_buffer_descriptor(self, sgpr_base: int) -> BufferResourceDescriptor:
+        d0 = self.read_sgpr(sgpr_base + 0)
+        d1 = self.read_sgpr(sgpr_base + 1)
+        d2 = self.read_sgpr(sgpr_base + 2)
+        d3 = self.read_sgpr(sgpr_base + 3)
+        return BufferResourceDescriptor.from_dwords(d0, d1, d2, d3)
+
+    def step(self, inst: Instruction) -> None:
+        if inst.opcode != Opcode.BUFFER_ATOMIC_SMIN:
+            raise NotImplementedError(f"Unsupported opcode: {inst.opcode}")
+
+        soffset_val = (
+            self.read_sgpr(inst.soffset.index)
+            if isinstance(inst.soffset, Register)
+            else (inst.soffset & MASK32)
+        )
+        desc = self.get_buffer_descriptor(inst.srsrc.index)
+
+        # Execute across active lanes
+        for lane in range(self.num_lanes):
+            if not ((self.exec_mask >> lane) & 1):
+                continue
+
+            vdata_val = self.read_lane_vgpr(lane, inst.vdata.index)
+            vaddr_val = self.read_lane_vgpr(lane, inst.vaddr.index)
+
+            ret_val, _ = ref_buffer_atomic_smin(
+                mem=self.mem,
+                desc=desc,
+                soffset=soffset_val,
+                vaddr=vaddr_val,
+                cmp_val=vdata_val,
+                inst_offset=inst.mods.offset,
+                glc=inst.mods.glc,
+                offen=inst.mods.offen,
+            )
+
+            if inst.mods.glc:
+                self.write_lane_vgpr(lane, inst.vdata.index, ret_val)
+
+
+class TestBufferAtomicSminSIMD(unittest.TestCase):
+    """Unit tests for SIMD multi-lane divergence and 32/64-bit EXEC masking."""
+
+    def test_wave32_full_exec(self) -> None:
+        sim = SIMDBufferInterpreter(num_lanes=32, mem_size=4096)
+        desc = BufferResourceDescriptor(base_address=0, stride=0, num_records=2048)
+        sim.set_buffer_descriptor(4, desc)
+
+        for lane in range(32):
+            sim.write_lane_vgpr(lane, 0, u32(lane - 16))  # signed values in [-16, 15]
+            sim.write_lane_vgpr(lane, 1, lane * 4)        # address
+            sim.mem.write_u32(lane * 4, 0)                # memory initialized to 0
+
+        inst = Instruction(
+            opcode=Opcode.BUFFER_ATOMIC_SMIN,
+            vdata=Register(RegKind.VGPR, 0),
+            vaddr=Register(RegKind.VGPR, 1),
+            srsrc=Register(RegKind.SGPR, 4, count=4),
+            soffset=0,
+            mods=BufferAtomicModifiers(glc=False),
+        )
+        sim.step(inst)
+
+        for lane in range(32):
+            val = s32(lane - 16)
+            expected = min(0, val)
+            self.assertEqual(s32(sim.mem.read_u32(lane * 4)), expected)
+
+    def test_wave32_divergent_masking(self) -> None:
+        sim = SIMDBufferInterpreter(num_lanes=32, mem_size=4096)
+        desc = BufferResourceDescriptor(base_address=0, stride=0, num_records=2048)
+        sim.set_buffer_descriptor(4, desc)
+        sim.exec_mask = 0x55555555  # Even lanes active
+
+        for lane in range(32):
+            sim.write_lane_vgpr(lane, 0, u32(-50))
+            sim.write_lane_vgpr(lane, 1, lane * 4)
+            sim.mem.write_u32(lane * 4, 100)
+
+        inst = Instruction(
+            opcode=Opcode.BUFFER_ATOMIC_SMIN,
+            vdata=Register(RegKind.VGPR, 0),
+            vaddr=Register(RegKind.VGPR, 1),
+            srsrc=Register(RegKind.SGPR, 4, count=4),
+            soffset=0,
+            mods=BufferAtomicModifiers(glc=False),
+        )
+        sim.step(inst)
+
+        for lane in range(32):
+            if lane % 2 == 0:
+                self.assertEqual(s32(sim.mem.read_u32(lane * 4)), -50)
+            else:
+                self.assertEqual(s32(sim.mem.read_u32(lane * 4)), 100)
+
+    def test_wave64_full_exec(self) -> None:
+        sim = SIMDBufferInterpreter(num_lanes=64, mem_size=4096)
+        desc = BufferResourceDescriptor(base_address=0, stride=0, num_records=2048)
+        sim.set_buffer_descriptor(4, desc)
+
+        for lane in range(64):
+            sim.write_lane_vgpr(lane, 0, u32(10))
+            sim.write_lane_vgpr(lane, 1, lane * 4)
+            sim.mem.write_u32(lane * 4, 50)
+
+        inst = Instruction(
+            opcode=Opcode.BUFFER_ATOMIC_SMIN,
+            vdata=Register(RegKind.VGPR, 0),
+            vaddr=Register(RegKind.VGPR, 1),
+            srsrc=Register(RegKind.SGPR, 4, count=4),
+            soffset=0,
+            mods=BufferAtomicModifiers(glc=False),
+        )
+        sim.step(inst)
+
+        for lane in range(64):
+            self.assertEqual(sim.mem.read_u32(lane * 4), 10)
+
+    def test_wave64_divergent_masking(self) -> None:
+        sim = SIMDBufferInterpreter(num_lanes=64, mem_size=4096)
+        desc = BufferResourceDescriptor(base_address=0, stride=0, num_records=2048)
+        sim.set_buffer_descriptor(4, desc)
+        sim.exec_mask = 0x00000000FFFFFFFF  # Low 32 lanes active
+
+        for lane in range(64):
+            sim.write_lane_vgpr(lane, 0, u32(-10))
+            sim.write_lane_vgpr(lane, 1, lane * 4)
+            sim.mem.write_u32(lane * 4, 0)
+
+        inst = Instruction(
+            opcode=Opcode.BUFFER_ATOMIC_SMIN,
+            vdata=Register(RegKind.VGPR, 0),
+            vaddr=Register(RegKind.VGPR, 1),
+            srsrc=Register(RegKind.SGPR, 4, count=4),
+            soffset=0,
+            mods=BufferAtomicModifiers(glc=False),
+        )
+        sim.step(inst)
+
+        for lane in range(64):
+            if lane < 32:
+                self.assertEqual(s32(sim.mem.read_u32(lane * 4)), -10)
+            else:
+                self.assertEqual(s32(sim.mem.read_u32(lane * 4)), 0)
+
+    def test_exec_mask_zero_no_modification(self) -> None:
+        sim = SIMDBufferInterpreter(num_lanes=64, mem_size=4096)
+        desc = BufferResourceDescriptor(base_address=0, stride=0, num_records=2048)
+        sim.set_buffer_descriptor(4, desc)
+        sim.exec_mask = 0
+
+        for lane in range(64):
+            sim.write_lane_vgpr(lane, 0, u32(-100))
+            sim.write_lane_vgpr(lane, 1, lane * 4)
+            sim.mem.write_u32(lane * 4, 42)
+
+        inst = Instruction(
+            opcode=Opcode.BUFFER_ATOMIC_SMIN,
+            vdata=Register(RegKind.VGPR, 0),
+            vaddr=Register(RegKind.VGPR, 1),
+            srsrc=Register(RegKind.SGPR, 4, count=4),
+            soffset=0,
+            mods=BufferAtomicModifiers(glc=True),
+        )
+        sim.step(inst)
+
+        for lane in range(64):
+            self.assertEqual(sim.mem.read_u32(lane * 4), 42)
+            self.assertEqual(s32(sim.read_lane_vgpr(lane, 0)), -100)
+
+
 class TestBufferAtomicSminScalarInterpreter(unittest.TestCase):
     """Unit tests for the deterministic scalar instruction interpreter."""
 
