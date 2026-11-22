@@ -603,6 +603,12 @@ struct GraphicsPipeline {
     VkFormat depth_format = VK_FORMAT_UNDEFINED;
     VkImageAspectFlags depth_aspects = 0;
     std::uint32_t vertex_slots = 0;       // bit per input slot the input layout uses
+    std::uint32_t zero_step_slots = 0;    // per-instance slots with InstanceDataStepRate 0: stride 0 at draw time
+    // The same pipeline with some attachment formats VK_FORMAT_UNDEFINED, for a draw that leaves those slots
+    // unbound (D3D12 allows it; dynamic rendering needs the formats to agree). Bit i: colour slot i, bit 8: depth
+    // and stencil. Null when it cannot be built.
+    static constexpr std::uint32_t unbound_depth = 1u << 8;
+    std::function<VkPipeline(std::uint32_t unbound)> variant;
 };
 
 // The 144-byte push-constant block every translated shader declares: s0..s31, heap base, code base.
@@ -629,8 +635,6 @@ struct ReplayFunctions {
     PFN_vkCmdResolveImage resolve_image = nullptr;              // resolves
     PFN_vkCmdFillBuffer fill_buffer = nullptr;                  // unordered-access buffer clears, with copy_buffer
     PFN_vkCmdUpdateBuffer update_buffer = nullptr;              // WriteBufferImmediate, unordered-access clears
-    // The buffer and offset holding [va, va + size), from ResourceBinding::va; WriteBufferImmediate.
-    std::function<bool(std::uint64_t va, std::uint64_t size, VkBuffer&, VkDeviceSize&)> buffer_at;
     // VK_EXT_conditional_rendering: SetPredication. The predicate buffer must have been created with
     // VK_BUFFER_USAGE_CONDITIONAL_RENDERING_BIT_EXT.
     PFN_vkCmdBeginConditionalRenderingEXT begin_conditional_rendering = nullptr;
@@ -654,8 +658,14 @@ struct ReplayFunctions {
     PFN_vkCmdDraw draw = nullptr;
     PFN_vkCmdDrawIndexed draw_indexed = nullptr;
     std::function<const GraphicsPipeline*(std::uintptr_t)> graphics_pipeline;
-    // The buffer and offset a console VA range lies in (vertex and index buffer views), false when none does.
-    std::function<bool(std::uint64_t va, std::uint64_t size, VkBuffer&, VkDeviceSize&)> buffer_at;
+    // The buffer and offset a console VA range starts in (from ResourceBinding::va), false when none does. `size` is
+    // cut to what the buffer holds from there: vertex and index views use what fits, WriteBufferImmediate needs all
+    // of it.
+    std::function<bool(std::uint64_t va, std::uint64_t& size, VkBuffer&, VkDeviceSize&)> buffer_at;
+    // Zeroed memory that unbound vertex-buffer slots and an unbound index buffer read (D3D12 reads zeros there).
+    VkBuffer zero_buffer = VK_NULL_HANDLE;
+    VkDeviceSize zero_offset = 0;
+    VkDeviceSize zero_size = 0;
     std::uint64_t heap_base = 0;  // device address of the GPU address arena (push-constant dwords 32-33)
     // Returns a 2D-array view of the range (caller-owned, alive until execution completes); rectangle clears.
     std::function<VkImageView(const ResourceBinding&, const VkImageSubresourceRange&)> image_view;
@@ -715,6 +725,7 @@ struct Prepared {
     VkDeviceSize index_offset = 0;
     VkIndexType index_type = VK_INDEX_TYPE_UINT16;
     VkExtent2D area{};
+    std::uint32_t layers = 1;  // the fewest layers any bound attachment view has
 };
 
 // ClearRenderTargetView takes FLOATs even for integer RTVs. Windows D3D12 (WARP and AMD) clamps to the
@@ -1238,9 +1249,11 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
     if (!pipeline || !pipeline->pipeline) return ReplayResult::unresolved_resource;
     p.graphics = *pipeline;
     p.area = {UINT32_MAX, UINT32_MAX};
-    const auto shrink = [&](const ResourceBinding& b, std::uint32_t mip) {
-        const VkExtent2D e = mip_extent(b, mip);
+    std::uint32_t layers = UINT32_MAX;
+    const auto shrink = [&](const ResourceBinding& b, const TargetView& view, const VkImageSubresourceRange& range) {
+        const VkExtent2D e = mip_extent(b, view.mip);
         p.area = {std::min(p.area.width, e.width), std::min(p.area.height, e.height)};
+        layers = std::min(layers, range.layerCount);
     };
 
     p.colors.assign(pipeline->color_formats.size(), {});
@@ -1258,7 +1271,7 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
         if (pipeline->color_formats[slot] != VK_FORMAT_UNDEFINED) viewed.format = pipeline->color_formats[slot];
         a.view = vk.image_view(viewed, a.range);
         if (!a.view) return ReplayResult::unsupported;
-        shrink(a.binding, target.mip);
+        shrink(a.binding, target, a.range);
     }
     if (draw.depth.resource && pipeline->depth_format != VK_FORMAT_UNDEFINED) {
         const ResourceBinding* binding = resolve(draw.depth.resource);
@@ -1272,35 +1285,62 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
         viewed.format = pipeline->depth_format;
         a.view = vk.image_view(viewed, a.range);
         if (!a.view) return ReplayResult::unsupported;
-        shrink(a.binding, draw.depth.mip);
+        shrink(a.binding, draw.depth, a.range);
     }
     if (p.area.width == UINT32_MAX) {  // no attachment: the viewport bounds the rendering
         p.area = {std::uint32_t(std::max(0.0f, draw.viewport.x + draw.viewport.width)),
                   std::uint32_t(std::max(0.0f, draw.viewport.y + draw.viewport.height))};
     }
+    p.layers = layers == UINT32_MAX ? 1 : std::max(1u, layers);
 
+    // Slots the pipeline has a format for but the draw leaves unbound take a variant whose format there is
+    // VK_FORMAT_UNDEFINED: D3D12 discards those writes, Vulkan wants the formats to match the attachments.
+    std::uint32_t unbound = 0;
+    for (std::size_t slot = 0; slot < p.colors.size(); ++slot)
+        if (pipeline->color_formats[slot] != VK_FORMAT_UNDEFINED && !p.colors[slot].id) unbound |= 1u << slot;
+    if (pipeline->depth_format != VK_FORMAT_UNDEFINED && !p.depth.id) unbound |= GraphicsPipeline::unbound_depth;
+    if (unbound) {
+        p.graphics.pipeline = pipeline->variant ? pipeline->variant(unbound) : VK_NULL_HANDLE;
+        if (!p.graphics.pipeline) return ReplayResult::unsupported;
+    }
+
+    // An unbound vertex-buffer slot reads zeros, as in D3D12: the zero page with stride 0. Per-instance slots with
+    // step rate 0 also take stride 0, so every instance reads element 0.
     for (std::uint32_t slot = 0; slot < 32; ++slot) {
         if (!(pipeline->vertex_slots & (1u << slot))) continue;
-        if (slot >= draw.vertex_buffers.size() || !draw.vertex_buffers[slot].va) return ReplayResult::unresolved_resource;
-        const VertexBufferView& view = draw.vertex_buffers[slot];
-        VkBuffer buffer = VK_NULL_HANDLE;
-        VkDeviceSize offset = 0;
-        if (!vk.buffer_at(view.va, view.size, buffer, offset)) return ReplayResult::unresolved_resource;
         p.vertex_buffers.resize(slot + 1, VK_NULL_HANDLE);
         p.vertex_offsets.resize(slot + 1, 0);
         p.vertex_sizes.resize(slot + 1, VK_WHOLE_SIZE);
         p.vertex_strides.resize(slot + 1, 0);
-        p.vertex_buffers[slot] = buffer;
-        p.vertex_offsets[slot] = offset;
-        p.vertex_sizes[slot] = view.size;
-        p.vertex_strides[slot] = view.stride;
+        const bool bound = slot < draw.vertex_buffers.size() && draw.vertex_buffers[slot].va;
+        if (!bound) {
+            if (!vk.zero_buffer) return ReplayResult::unresolved_resource;
+            p.vertex_buffers[slot] = vk.zero_buffer;
+            p.vertex_offsets[slot] = vk.zero_offset;
+            p.vertex_sizes[slot] = vk.zero_size;
+            p.vertex_strides[slot] = 0;
+            continue;
+        }
+        const VertexBufferView& view = draw.vertex_buffers[slot];
+        std::uint64_t size = view.size;
+        if (!vk.buffer_at(view.va, size, p.vertex_buffers[slot], p.vertex_offsets[slot]))
+            return ReplayResult::unresolved_resource;
+        p.vertex_sizes[slot] = size;
+        p.vertex_strides[slot] = (pipeline->zero_step_slots & (1u << slot)) ? 0 : view.stride;
     }
     if (draw.indexed) {
-        if (!draw.index.va || !vk.buffer_at(draw.index.va, draw.index.size, p.index_buffer, p.index_offset))
-            return ReplayResult::unresolved_resource;
         if (draw.index.format == 57) p.index_type = VK_INDEX_TYPE_UINT16;
         else if (draw.index.format == 42) p.index_type = VK_INDEX_TYPE_UINT32;
-        else return ReplayResult::unsupported;
+        else if (draw.index.va) return ReplayResult::unsupported;
+        if (!draw.index.va) {  // no index buffer: every index reads 0
+            if (!vk.zero_buffer) return ReplayResult::unresolved_resource;
+            p.index_buffer = vk.zero_buffer;
+            p.index_offset = vk.zero_offset;
+        } else {
+            std::uint64_t size = draw.index.size;
+            if (!vk.buffer_at(draw.index.va, size, p.index_buffer, p.index_offset))
+                return ReplayResult::unresolved_resource;
+        }
     }
     return ReplayResult::success;
 }
@@ -1560,7 +1600,9 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             }
         } else if (const auto* write = std::get_if<WriteImmediate>(&command)) {
             if (!vk.update_buffer || !vk.buffer_at) return ReplayResult::unsupported;
-            if (!vk.buffer_at(write->address, 4, p.write_buffer, p.write_offset)) return ReplayResult::unresolved_resource;
+            std::uint64_t bytes = 4;
+            if (!vk.buffer_at(write->address, bytes, p.write_buffer, p.write_offset) || bytes < 4)
+                return ReplayResult::unresolved_resource;
             if (p.write_offset % 4) return ReplayResult::invalid_copy;
         } else if (const auto* atomic = std::get_if<AtomicCopyBuffer>(&command)) {
             if (!vk.copy_buffer) return ReplayResult::unsupported;
@@ -2017,7 +2059,7 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             }
             VkRenderingInfo rendering{VK_STRUCTURE_TYPE_RENDERING_INFO};
             rendering.renderArea = {{0, 0}, p.area};
-            rendering.layerCount = 1;
+            rendering.layerCount = p.layers;  // array views: SV_RenderTargetArrayIndex picks the layer
             rendering.colorAttachmentCount = std::uint32_t(colors.size());
             rendering.pColorAttachments = colors.data();
             if (p.depth.id && (p.graphics.depth_aspects & VK_IMAGE_ASPECT_DEPTH_BIT)) rendering.pDepthAttachment = &depth;

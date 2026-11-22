@@ -115,10 +115,44 @@ int main() {
         pso_desc.NumRenderTargets = 1;
         pso_desc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
         pso_desc.SampleDesc.Count = 1;
-        Ref<ID3D12PipelineState> pso, unfed;
+        Ref<ID3D12PipelineState> pso, unfed, mrt, instanced, refused;
         EXPECT(SUCCEEDED(device->CreateGraphicsPipelineState(&pso_desc, IID_PPV_ARGS(&pso.p))));
         pso_desc.InputLayout = {elements, 1};  // COLOR missing: D3D12 rejects a layout that leaves an input unfed
         EXPECT(device->CreateGraphicsPipelineState(&pso_desc, IID_PPV_ARGS(&unfed.p)) == E_INVALIDARG && !unfed.p);
+        pso_desc.InputLayout = {elements, 2};
+
+        // Two render-target formats and a depth format, of which draws bind only RTV 0: a variant with the other
+        // formats undefined is used at draw time.
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC mrt_desc = pso_desc;
+        mrt_desc.NumRenderTargets = 2;
+        mrt_desc.RTVFormats[1] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        mrt_desc.DSVFormat = DXGI_FORMAT_D32_FLOAT;
+        EXPECT(SUCCEEDED(device->CreateGraphicsPipelineState(&mrt_desc, IID_PPV_ARGS(&mrt.p))));
+
+        // COLOR per instance from slot 1 with step rate 0: every instance reads element 0.
+        const D3D12_INPUT_ELEMENT_DESC instance_elements[2] = {
+            {"POSITION", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+            {"COLOR", 0, DXGI_FORMAT_R8G8B8A8_UNORM, 1, 0, D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA, 0}};
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC instance_desc = pso_desc;
+        instance_desc.InputLayout = {instance_elements, 2};
+        EXPECT(SUCCEEDED(device->CreateGraphicsPipelineState(&instance_desc, IID_PPV_ARGS(&instanced.p))));
+
+        // State that needs a Vulkan feature this test device does not enable is refused, not passed to the driver.
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC needs_feature = pso_desc;
+        needs_feature.RasterizerState.FillMode = D3D12_FILL_MODE_WIREFRAME;  // fillModeNonSolid
+        EXPECT(device->CreateGraphicsPipelineState(&needs_feature, IID_PPV_ARGS(&refused.p)) == E_NOTIMPL && !refused.p);
+        needs_feature = mrt_desc;
+        needs_feature.DSVFormat = DXGI_FORMAT_UNKNOWN;
+        needs_feature.BlendState.IndependentBlendEnable = TRUE;  // independentBlend: the two targets differ
+        needs_feature.BlendState.RenderTarget[1].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_RED;
+        EXPECT(device->CreateGraphicsPipelineState(&needs_feature, IID_PPV_ARGS(&refused.p)) == E_NOTIMPL && !refused.p);
+        needs_feature = pso_desc;
+        needs_feature.RasterizerState.DepthBias = 4;
+        needs_feature.RasterizerState.DepthBiasClamp = 0.5f;  // depthBiasClamp
+        EXPECT(device->CreateGraphicsPipelineState(&needs_feature, IID_PPV_ARGS(&refused.p)) == E_NOTIMPL && !refused.p);
+        needs_feature = pso_desc;
+        needs_feature.NumRenderTargets = 9;
+        EXPECT(device->CreateGraphicsPipelineState(&needs_feature, IID_PPV_ARGS(&refused.p)) == E_INVALIDARG && !refused.p);
 
         // Geometry: a quad in the top-left quadrant (front-facing, clockwise in D3D screen space) and a triangle in
         // the bottom-left one wound the other way (back-facing).
@@ -144,6 +178,26 @@ int main() {
         EXPECT(SUCCEEDED(device->CreateCommittedResource(&readback_heap, D3D12_HEAP_FLAG_NONE, &readback_desc,
                                                          D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
                                                          IID_PPV_ARGS(&readback.p))));
+
+        // Buffers D3D12 refuses: no bytes, or a size that wraps when aligned. One the arena cannot hold, and a
+        // shader-visible heap it cannot hold (512 MiB of descriptors in the 256 MiB default), run out of memory.
+        {
+            Ref<ID3D12Resource> bad;
+            for (const UINT64 width : {UINT64(0), ~UINT64(0) - 65535}) {
+                const auto bad_desc = buffer_desc(width);
+                EXPECT(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &bad_desc,
+                                                       D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                       IID_PPV_ARGS(&bad.p)) == E_INVALIDARG && !bad.p);
+            }
+            const auto huge = buffer_desc(UINT64(1) << 40);
+            EXPECT(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &huge,
+                                                   D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                   IID_PPV_ARGS(&bad.p)) == E_OUTOFMEMORY && !bad.p);
+            const D3D12_DESCRIPTOR_HEAP_DESC too_many{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1u << 24,
+                                                      D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+            Ref<ID3D12DescriptorHeap> big_heap;
+            EXPECT(device->CreateDescriptorHeap(&too_many, IID_PPV_ARGS(&big_heap.p)) == E_OUTOFMEMORY && !big_heap.p);
+        }
         D3D12_RESOURCE_DESC rt_desc{};
         rt_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
         rt_desc.Width = rt_desc.Height = size;
@@ -162,6 +216,8 @@ int main() {
         std::memcpy(up + 256, indices, sizeof(indices));
         std::memcpy(up + 512, tints[0], sizeof(tints[0]));
         std::memcpy(up + 768, tints[1], sizeof(tints[1]));
+        const std::uint8_t instance_colors[2][4] = {{255, 255, 0, 255}, {255, 0, 255, 255}};  // yellow, magenta
+        std::memcpy(up + 1024, instance_colors, sizeof(instance_colors));
         const D3D12_GPU_VIRTUAL_ADDRESS upload_va = upload->GetGPUVirtualAddress();
 
         const D3D12_DESCRIPTOR_HEAP_DESC heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
@@ -204,19 +260,40 @@ int main() {
         list->RSSetScissorRects(1, &scissor);
         list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
 
-        // Draw 1: no offset, red tint -> top-left quadrant red.
+        // Draw 1: no offset, red tint -> top-left quadrant red. The two-target PSO with a depth format, with only
+        // RTV 0 and no DSV bound: it runs as a variant, validation-clean.
         const float origin[2] = {0, 0}, down_right[2] = {1, -1};
+        list->SetPipelineState(mrt.p);
         list->SetGraphicsRoot32BitConstants(0, 2, origin, 0);
         list->SetGraphicsRootConstantBufferView(1, upload_va + 512);
         list->DrawIndexedInstanced(6, 1, 0, 0, 0);
-        // Draw 2: offset (1, -1), green tint -> bottom-right quadrant green.
+        // Draw 2: offset (1, -1), green tint -> bottom-right quadrant green. The root signature is set again after
+        // the arguments; it is the same one, so they stay bound (else the quad would land top-left, untinted).
+        list->SetPipelineState(pso.p);
         list->SetGraphicsRoot32BitConstants(0, 2, down_right, 0);
         list->SetGraphicsRootConstantBufferView(1, upload_va + 768);
+        list->SetGraphicsRootSignature(root.p);
         list->DrawIndexedInstanced(6, 1, 0, 0, 0);
         // Draw 3: the back-facing triangle in the bottom-left quadrant; culled, so that quadrant stays blue.
         list->SetGraphicsRoot32BitConstants(0, 2, origin, 0);
         list->SetGraphicsRootConstantBufferView(1, upload_va + 512);
         list->DrawInstanced(3, 1, 4, 0);
+
+        // Draws 4 and 5 through a viewport on the top-right quadrant, so each quad covers a 16x16 corner of it.
+        const D3D12_VIEWPORT top_right{float(size / 2), 0, float(size / 2), float(size / 2), 0, 1};
+        list->RSSetViewports(1, &top_right);
+        list->SetPipelineState(instanced.p);
+        // Draw 4: two instances, COLOR per instance with step rate 0, so both read yellow (red with the red tint);
+        // a step rate of 1 would draw magenta over it.
+        const D3D12_VERTEX_BUFFER_VIEW colors_view{upload_va + 1024, sizeof(instance_colors), 4};
+        list->IASetVertexBuffers(1, 1, &colors_view);
+        list->SetGraphicsRoot32BitConstants(0, 2, origin, 0);
+        list->DrawIndexedInstanced(6, 2, 0, 0, 0);
+        // Draw 5: slot 1 unbound. D3D12 reads zeros there, so COLOR is 0 and the corner is black, and the
+        // submission must not fail.
+        list->IASetVertexBuffers(1, 1, nullptr);
+        list->SetGraphicsRoot32BitConstants(0, 2, down_right, 0);
+        list->DrawIndexedInstanced(6, 1, 0, 0, 0);
 
         D3D12_RESOURCE_BARRIER to_copy = transition(target.p, D3D12_RESOURCE_STATE_RENDER_TARGET,
                                                     D3D12_RESOURCE_STATE_COPY_SOURCE);
@@ -239,13 +316,32 @@ int main() {
         EXPECT(SUCCEEDED(readback->Map(0, nullptr, &mapped)));
         std::memcpy(pixels.data(), mapped, pixels.size());
 
+        // A draw with no viewport (never set, or unbound with a count of 0) rasterizes nothing in D3D12. It is not
+        // recorded, so the list closes and executes cleanly (Vulkan forbids a 0x0 viewport).
+        EXPECT(SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.p, pso.p)));
+        list->SetGraphicsRootSignature(root.p);
+        list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        list->DrawInstanced(3, 1, 0, 0);
+        list->RSSetViewports(1, &viewport);
+        list->RSSetViewports(0, nullptr);
+        list->DrawInstanced(3, 1, 0, 0);
+        EXPECT(list->Close() == S_OK);
+        queue->ExecuteCommandLists(1, lists);
+        EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
+        EXPECT(SUCCEEDED(queue->Signal(fence.p, 2)) && SUCCEEDED(fence->SetEventOnCompletion(2, nullptr)));
+
         // A draw without a topology is invalid; Close reports it.
         EXPECT(SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.p, pso.p)));
         list->SetGraphicsRootSignature(root.p);
         list->DrawInstanced(3, 1, 0, 0);
         EXPECT(list->Close() == E_INVALIDARG);
+        // So is binding more than eight render targets.
+        EXPECT(SUCCEEDED(list->Reset(allocator.p, pso.p)));
+        list->OMSetRenderTargets(9, &rtv, TRUE, nullptr);
+        EXPECT(list->Close() == E_INVALIDARG);
 
         for (auto* r : {&vertex_buffer, &upload, &readback, &target}) r->reset();
+        for (auto* p : {&mrt, &instanced, &refused, &unfed}) p->reset();
         pso.reset();
         root.reset();
         rtv_heap.reset();
@@ -261,9 +357,14 @@ int main() {
     for (UINT row = 0; row < size; ++row) {
         for (UINT col = 0; col < size; ++col) {
             const bool top = row < size / 2, left = col < size / 2;
-            const std::array<std::uint8_t, 4> want = top && left     ? std::array<std::uint8_t, 4>{255, 0, 0, 255}
-                                                     : !top && !left ? std::array<std::uint8_t, 4>{0, 255, 0, 255}
-                                                                     : std::array<std::uint8_t, 4>{0, 0, 255, 255};
+            // In the top-right quadrant: draw 4's red corner (top-left of it) and draw 5's black one (bottom-right).
+            const bool corner4 = row < size / 4 && col >= size / 2 && col < size * 3 / 4;
+            const bool corner5 = top && row >= size / 4 && col >= size * 3 / 4;
+            using Pixel = std::array<std::uint8_t, 4>;
+            const Pixel want = (top && left) || corner4 ? Pixel{255, 0, 0, 255}
+                               : corner5                ? Pixel{0, 0, 0, 255}
+                               : !top && !left          ? Pixel{0, 255, 0, 255}
+                                                        : Pixel{0, 0, 255, 255};
             const std::uint8_t* got = pixels.data() + row * 256 + col * 4;
             if (std::equal(want.begin(), want.end(), got)) continue;
             if (mismatches++ < 6)
@@ -276,8 +377,9 @@ int main() {
         std::fprintf(stderr, "%u validation errors\n", d.validation_errors());
         return 1;
     }
-    std::printf("M1: two indexed draws and a culled triangle matched all %u pixels: input layout by semantic, root "
-                "constants and a root CBV per draw, vertex buffer in the arena, index buffer in an upload heap\n",
+    std::printf("M1: five draws and a culled triangle matched all %u pixels: input layout by semantic, root "
+                "constants and a root CBV per draw, vertex buffer in the arena, index buffer in an upload heap, an "
+                "unbound target and DSV, a rebound root signature, step rate 0 and an unbound vertex slot\n",
                 size * size);
     return 0;
 }

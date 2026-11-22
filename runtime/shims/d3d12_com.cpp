@@ -206,8 +206,13 @@ public:
                       : leonida::IndexBufferView{};
     }
 
+    // A count of 0 unbinds the viewports; draws then rasterize nothing (record_draw).
     void STDMETHODCALLTYPE RSSetViewports(UINT count, const D3D12_VIEWPORT* viewports) override {
-        if (!count || !viewports) return;
+        if (!count) {
+            viewport_ = {};
+            return;
+        }
+        if (!viewports || count > D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE) return check(false);
         if (count > 1) stub("ID3D12GraphicsCommandList::RSSetViewports (more than one viewport; the first is used)");
         const D3D12_VIEWPORT& v = viewports[0];
         viewport_ = {v.TopLeftX, v.TopLeftY, v.Width, v.Height, v.MinDepth, v.MaxDepth};
@@ -222,6 +227,7 @@ public:
     // D3D12 reads render-target and depth descriptors here, so their views are copied now.
     void STDMETHODCALLTYPE OMSetRenderTargets(UINT count, const D3D12_CPU_DESCRIPTOR_HANDLE* targets, BOOL single_range,
                                               const D3D12_CPU_DESCRIPTOR_HANDLE* depth) override {
+        if (count > D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT) return check(false);
         render_targets_.assign(count, {});
         for (UINT i = 0; i < count && targets; ++i) {
             const SIZE_T handle = single_range ? targets[0].ptr + SIZE_T(i) * descriptor_size : targets[i].ptr;
@@ -557,9 +563,13 @@ private:
         std::array<std::uint32_t, rt::rootsig::kMaxUserSgprs> data{};
     };
 
-    // D3D12 leaves root arguments undefined after a root-signature change; they start at zero here.
+    // D3D12 leaves root arguments undefined after a root-signature change; they start at zero here. Setting the
+    // signature that is already bound changes nothing: "existing root signature bindings do not become stale"
+    // (D3D12, "Using a Root Signature"), and engines rebind routinely.
     void bind_root(RootState& state, ID3D12RootSignature* signature) {
-        state.layout = root_signature_layout(signature);
+        const RootArgumentLayout* layout = root_signature_layout(signature);
+        if (layout && layout == state.layout) return;
+        state.layout = layout;
         state.data = {};
         if (signature && !state.layout) stub("ID3D12GraphicsCommandList::Set*RootSignature(foreign root signature)");
     }
@@ -641,6 +651,9 @@ private:
     // A draw needs a graphics pipeline, a graphics root signature and a topology.
     void record_draw(bool indexed, UINT count, UINT instances, UINT first, INT base_vertex, UINT first_instance) {
         if (!graphics_pipeline_ || !graphics_.layout || !topology_) return check(false);
+        // No viewport (never set, or unbound with RSSetViewports(0)) or an empty one: D3D12 rasterizes nothing,
+        // and Vulkan forbids a 0x0 viewport, so the draw is not recorded.
+        if (!(viewport_.width > 0) || !(viewport_.height > 0)) return;
         leonida::Draw draw{graphics_pipeline_, graphics_.data, render_targets_, depth_,
                            {vertex_buffers_.begin(), vertex_buffers_.end()}, index_, topology_, viewport_, scissor_,
                            blend_factor_, front_stencil_ref_, back_stencil_ref_, indexed, count, instances, first,

@@ -65,7 +65,15 @@ struct VulkanDeviceFunctions {
                vkCmdCopyImageToBuffer && vkCmdCopyImage && vkCmdResolveImage && vkCmdFillBuffer &&
                vkCmdUpdateBuffer && vkCmdBindPipeline && vkCmdPushConstants && vkCmdDispatch &&
                vkCreateShaderModule && vkDestroyShaderModule && vkCreatePipelineLayout &&
-               vkDestroyPipelineLayout && vkCreateComputePipelines && vkDestroyPipeline;
+               vkDestroyPipelineLayout && vkCreateComputePipelines && vkDestroyPipeline &&
+               vkGetBufferDeviceAddress && vkCmdBindIndexBuffer && vkCmdSetViewport && vkCmdSetScissor &&
+               vkCmdSetStencilReference && vkCmdSetBlendConstants && vkCmdDraw && vkCmdDrawIndexed &&
+               vkCreateGraphicsPipelines;
+    }
+
+    // Graphics pipelines also need these Vulkan 1.3 entry points (dynamic rendering, extended dynamic state).
+    bool graphics_complete() const {
+        return vkCmdBeginRendering && vkCmdEndRendering && vkCmdBindVertexBuffers2 && vkCmdSetPrimitiveTopology;
     }
 };
 
@@ -91,17 +99,6 @@ public:
         replay_.resolve_image = vk.vkCmdResolveImage;
         replay_.fill_buffer = vk.vkCmdFillBuffer;
         replay_.update_buffer = vk.vkCmdUpdateBuffer;
-        // Called with mutex_ held. A linear search: fine for the first frames, an interval map when it shows.
-        replay_.buffer_at = [this](std::uint64_t va, std::uint64_t size, VkBuffer& buffer, VkDeviceSize& offset) {
-            for (const auto& [id, b] : resources_) {
-                if (b.image || !b.buffer || !b.va || va < b.va || va - b.va >= b.size || size > b.size - (va - b.va))
-                    continue;
-                buffer = b.buffer;
-                offset = b.buffer_offset + (va - b.va);
-                return true;
-            }
-            return false;
-        };
         if (conditional_rendering) {  // a driver may hand out these pointers even when the extension is off
             replay_.begin_conditional_rendering = vk.vkCmdBeginConditionalRenderingEXT;
             replay_.end_conditional_rendering = vk.vkCmdEndConditionalRenderingEXT;
@@ -132,11 +129,14 @@ public:
             return it == graphics_pipelines_.end() ? nullptr : &it->second;
         };
         // Called with mutex_ held. A linear search: fine for the first frames, an interval map when it shows.
-        replay_.buffer_at = [this](std::uint64_t va, std::uint64_t size, VkBuffer& buffer, VkDeviceSize& offset) {
+        // A range that runs past its buffer is cut at the buffer's end (`size` is updated): D3D12 reads past a view's
+        // buffer as out of bounds, which is no reason to drop the submission.
+        replay_.buffer_at = [this](std::uint64_t va, std::uint64_t& size, VkBuffer& buffer, VkDeviceSize& offset) {
             for (const auto& [id, b] : resources_) {
-                if (b.image || !b.buffer || va < b.va || va - b.va >= b.size || size > b.size - (va - b.va)) continue;
+                if (b.image || !b.buffer || !b.va || va < b.va || va - b.va >= b.size) continue;
                 buffer = b.buffer;
                 offset = b.buffer_offset + (va - b.va);
+                size = std::min<std::uint64_t>(size, b.size - (va - b.va));
                 return true;
             }
             return false;
@@ -209,6 +209,14 @@ public:
     void set_heap_base(std::uint64_t heap_base) {
         std::lock_guard lock(mutex_);
         replay_.heap_base = heap_base;
+    }
+
+    // Zeroed memory for unbound vertex and index buffers to read (ReplayFunctions::zero_buffer).
+    void set_zero_page(VkBuffer buffer, VkDeviceSize offset, VkDeviceSize size) {
+        std::lock_guard lock(mutex_);
+        replay_.zero_buffer = buffer;
+        replay_.zero_offset = offset;
+        replay_.zero_size = size;
     }
     std::uint64_t heap_base() {
         std::lock_guard lock(mutex_);

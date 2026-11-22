@@ -22,6 +22,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <climits>
 #include <cstdlib>
 #include <iterator>
 #include <map>
@@ -39,6 +40,9 @@ namespace {
 // Every descriptor slot is this many bytes; an RTV or DSV slot holds a leonida::TargetView. The console's own
 // increments are open question 4 in docs/d3d12_vulkan.md; the application reads them from the device, as it must.
 constexpr UINT kDescriptorSize = descriptor_size;
+// The first 64 KiB of the GPU address arena are never handed out: VA 0 stays invalid, and the page is kept zero
+// for unbound vertex and index buffers to read (D3D12 reads zeros there).
+constexpr VkDeviceSize kArenaReserved = 64 * 1024;
 static_assert(sizeof(leonida::TargetView) <= kDescriptorSize);
 
 // The shader model and root signature version this layer can honour. Nothing in the runtime compiles DXIL: the
@@ -250,12 +254,15 @@ struct DeviceState {
         std::map<VkDeviceSize, VkDeviceSize> free;  // offset -> size
     } arena;
 
+    // A zero-size range is refused: it would share its offset with the next range, and its release would collide
+    // with that range's free entry. The fit test cannot wrap: free blocks lie inside the arena (below 4 GiB).
     bool arena_allocate(VkDeviceSize bytes, VkDeviceSize alignment, VkDeviceSize& out) {
+        if (!bytes || bytes > arena.size) return false;
         std::lock_guard lock(arena.mutex);
         for (auto it = arena.free.begin(); it != arena.free.end(); ++it) {
             const VkDeviceSize start = (it->first + alignment - 1) / alignment * alignment;
             const VkDeviceSize end = it->first + it->second;
-            if (start + bytes > end) continue;
+            if (start >= end || bytes > end - start) continue;
             const VkDeviceSize block = it->first;
             arena.free.erase(it);
             if (start > block) arena.free[block] = start - block;
@@ -267,6 +274,7 @@ struct DeviceState {
     }
 
     void arena_release(VkDeviceSize offset, VkDeviceSize bytes) {
+        if (!bytes) return;
         std::lock_guard lock(arena.mutex);
         auto it = arena.free.emplace(offset, bytes).first;
         if (auto next = std::next(it); next != arena.free.end() && it->first + it->second == next->first) {
@@ -599,10 +607,16 @@ public:
     // A shader-visible heap lives in the GPU address arena: its CPU handles point at the arena's host mapping and
     // its GPU handle is the console VA, so the bytes the game or Create*View writes are what shaders load. Other
     // heaps (RTV, DSV, non-visible staging heaps) stay in host memory.
+    // A shader-visible heap that the arena cannot hold is not created (ok() is false, E_OUTOFMEMORY), as a
+    // default-heap buffer is not: in host memory its GPU handle would be 0, and every table would read VA 0.
     DescriptorHeap(DeviceState& device, const D3D12_DESCRIPTOR_HEAP_DESC& desc) : device_(device), desc_(desc) {
         const VkDeviceSize bytes = VkDeviceSize(desc.NumDescriptors) * kDescriptorSize;
-        if ((desc.Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) && device.arena.mapped &&
-            device.arena_allocate(bytes, 256, arena_offset_)) {
+        if ((desc.Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) && device.arena.mapped) {
+            if (!device.arena_allocate(bytes, 256, arena_offset_)) {
+                log_once("GPU address arena full (raise LEONIDA_ARENA_MB); shader-visible heap size in KiB:",
+                         int(std::min<VkDeviceSize>(bytes / 1024, INT_MAX)));
+                return;
+            }
             in_arena_ = true;
             cpu_ = device.arena.mapped + arena_offset_;
             std::memset(cpu_, 0, std::size_t(bytes));
@@ -615,6 +629,8 @@ public:
     ~DescriptorHeap() override {
         if (in_arena_) device_.arena_release(arena_offset_, VkDeviceSize(desc_.NumDescriptors) * kDescriptorSize);
     }
+
+    bool ok() const { return cpu_ != nullptr; }
 
     D3D12_DESCRIPTOR_HEAP_DESC STDMETHODCALLTYPE GetDesc() override { return desc_; }
     D3D12_CPU_DESCRIPTOR_HANDLE STDMETHODCALLTYPE GetCPUDescriptorHandleForHeapStart() override {
@@ -669,6 +685,8 @@ public:
     // VA is their device address minus heap_base, so a shader's heap_base + VA still lands on them (section 3.3).
     HRESULT create_buffer() {
         auto& vk = device_.context->vk;
+        // A buffer has at least one byte, and its size must survive alignment to 64 KiB without wrapping.
+        if (!desc_.Width || desc_.Width > ~UINT64(0) - D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT) return E_INVALIDARG;
         const bool host = cpu_visible();
         leonida::ResourceBinding binding{};  // a buffer: no image
         binding.size = desc_.Width;
@@ -1195,6 +1213,19 @@ bool equal_semantic(const std::string& a, const char* b) {
     return true;
 }
 
+// Whether the input layout has an element for every ordinary (non-system-value) input of the vertex shader.
+bool layout_feeds(const leonida::ShaderEntry& vs, const D3D12_INPUT_LAYOUT_DESC& layout) {
+    for (const auto& input : vs.input_signature) {
+        if (input.system_value) continue;
+        bool fed = false;
+        for (UINT i = 0; i < layout.NumElements && !fed; ++i)
+            fed = layout.pInputElementDescs[i].SemanticIndex == input.semantic_index &&
+                  equal_semantic(input.semantic, layout.pInputElementDescs[i].SemanticName);
+        if (!fed) return false;
+    }
+    return true;
+}
+
 class RootSignature final
     : public Child<RootSignature, ID3D12RootSignatureStubs, ID3D12Object, ID3D12DeviceChild, ID3D12RootSignature> {
 public:
@@ -1225,6 +1256,7 @@ public:
         if (pipeline_.layout) vk.vkDestroyPipelineLayout(dev, pipeline_.layout, nullptr);
         if (module_) vk.vkDestroyShaderModule(dev, module_, nullptr);
         if (graphics_.pipeline) vk.vkDestroyPipeline(dev, graphics_.pipeline, nullptr);
+        for (const auto& [unbound, built] : variants_) vk.vkDestroyPipeline(dev, built, nullptr);
         if (graphics_.layout) vk.vkDestroyPipelineLayout(dev, graphics_.layout, nullptr);
         for (VkShaderModule module : modules_) vk.vkDestroyShaderModule(dev, module, nullptr);
         if (code_bytes_) device_.arena_release(code_base_, code_bytes_);
@@ -1261,6 +1293,11 @@ public:
             return E_NOTIMPL;
         }
         if (!push_constants_fit()) return E_NOTIMPL;
+        if (!vk.graphics_complete()) {
+            log_once("graphics pipelines need Vulkan 1.3 dynamic rendering and extended dynamic state; stage", 1);
+            return E_NOTIMPL;
+        }
+        if (desc.NumRenderTargets > D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT) return E_INVALIDARG;
         if (desc.HS.BytecodeLength || desc.DS.BytecodeLength || desc.GS.BytecodeLength || desc.StreamOutput.NumEntries) {
             log_once("graphics pipeline stage not supported yet (hull/domain/geometry/stream output):", 0);
             return E_NOTIMPL;
@@ -1291,7 +1328,16 @@ public:
                 return E_INVALIDARG;
             }
             const std::string hash = leonida::sha256_hex(stage.fssm);
-            stage.entry = library->find(stage.name, hash);
+            // Containers with the same program can differ in their input signature; for the VS, take the first
+            // whose inputs this input layout feeds (else the first, which the layout check below reports).
+            const auto candidates = library->candidates(stage.name, hash);
+            stage.entry = candidates.empty() ? nullptr : candidates.front();
+            if (stage.bit == VK_SHADER_STAGE_VERTEX_BIT)
+                for (const leonida::ShaderEntry* candidate : candidates)
+                    if (layout_feeds(*candidate, desc.InputLayout)) {
+                        stage.entry = candidate;
+                        break;
+                    }
             if (!stage.entry) {
                 std::fprintf(stderr, "[rt] d3d12: no translated %s for FSSM sha256 %s\n", stage.name, hash.c_str());
                 return E_INVALIDARG;
@@ -1348,6 +1394,8 @@ public:
             if (!input) continue;  // the shader does not read this element
             attributes.push_back({input->register_index, element.InputSlot, format, offset});
             const bool instance = element.InputSlotClass == D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA;
+            // Step rate 0: every instance reads element 0, which a stride of 0 gives (set at each draw).
+            if (instance && element.InstanceDataStepRate == 0) graphics_.zero_step_slots |= 1u << element.InputSlot;
             if (instance && element.InstanceDataStepRate > 1)
                 log_once("instance step rates above 1 are not modelled; rate", int(element.InstanceDataStepRate));
             if (!(graphics_.vertex_slots & (1u << element.InputSlot))) {
@@ -1366,12 +1414,6 @@ public:
                 return E_INVALIDARG;
             }
         }
-        VkPipelineVertexInputStateCreateInfo vertex_input{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
-        vertex_input.vertexBindingDescriptionCount = std::uint32_t(bindings.size());
-        vertex_input.pVertexBindingDescriptions = bindings.data();
-        vertex_input.vertexAttributeDescriptionCount = std::uint32_t(attributes.size());
-        vertex_input.pVertexAttributeDescriptions = attributes.data();
-
         VkPipelineInputAssemblyStateCreateInfo assembly{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
         switch (desc.PrimitiveTopologyType) {
         case D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT: assembly.topology = VK_PRIMITIVE_TOPOLOGY_POINT_LIST; break;
@@ -1383,10 +1425,6 @@ public:
         }
         if (desc.IBStripCutValue != D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_DISABLED)
             log_once("index-buffer strip cuts (primitive restart) are not modelled; value", desc.IBStripCutValue);
-
-        VkPipelineViewportStateCreateInfo viewport{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
-        viewport.viewportCount = 1;
-        viewport.scissorCount = 1;
 
         const D3D12_RASTERIZER_DESC& r = desc.RasterizerState;
         VkPipelineRasterizationStateCreateInfo raster{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
@@ -1436,6 +1474,33 @@ public:
         blend.attachmentCount = std::uint32_t(blends.size());
         blend.pAttachments = blends.data();
 
+        // State that needs a Vulkan feature the device did not enable (VulkanDeviceInfo::features) is refused, rather
+        // than handed to the driver against the spec.
+        const VkPhysicalDeviceFeatures& features = device_.info.features;
+        const auto refuse = [&](const char* what, int value) {
+            log_once(what, value);
+            return E_NOTIMPL;
+        };
+        if (raster.polygonMode != VK_POLYGON_MODE_FILL && !features.fillModeNonSolid)
+            return refuse("wireframe fill needs fillModeNonSolid, which the device lacks; fill mode", r.FillMode);
+        if (raster.depthBiasEnable && raster.depthBiasClamp != 0.0f && !features.depthBiasClamp)
+            return refuse("a depth-bias clamp needs depthBiasClamp, which the device lacks; clamp x1000",
+                          int(raster.depthBiasClamp * 1000));
+        for (std::size_t i = 1; i < blends.size(); ++i)
+            if (std::memcmp(&blends[i], &blends[0], sizeof(blends[0])) != 0 && !features.independentBlend)
+                return refuse("per-render-target blend state needs independentBlend, which the device lacks; target",
+                              int(i));
+        const auto src1 = [](VkBlendFactor f) {
+            return f == VK_BLEND_FACTOR_SRC1_COLOR || f == VK_BLEND_FACTOR_ONE_MINUS_SRC1_COLOR ||
+                   f == VK_BLEND_FACTOR_SRC1_ALPHA || f == VK_BLEND_FACTOR_ONE_MINUS_SRC1_ALPHA;
+        };
+        for (const auto& b : blends)
+            if (b.blendEnable && !features.dualSrcBlend &&
+                (src1(b.srcColorBlendFactor) || src1(b.dstColorBlendFactor) || src1(b.srcAlphaBlendFactor) ||
+                 src1(b.dstAlphaBlendFactor)))
+                return refuse("SRC1 blend factors need dualSrcBlend, which the device lacks; factor",
+                              int(b.srcColorBlendFactor));
+
         graphics_.color_formats.assign(desc.NumRenderTargets, VK_FORMAT_UNDEFINED);
         for (UINT i = 0; i < desc.NumRenderTargets; ++i) {
             if (desc.RTVFormats[i] == DXGI_FORMAT_UNKNOWN) continue;
@@ -1452,20 +1517,6 @@ public:
             graphics_.depth_format = f.format;
             graphics_.depth_aspects = f.aspects;
         }
-        VkPipelineRenderingCreateInfo rendering{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
-        rendering.colorAttachmentCount = std::uint32_t(graphics_.color_formats.size());
-        rendering.pColorAttachmentFormats = graphics_.color_formats.data();
-        if (graphics_.depth_aspects & VK_IMAGE_ASPECT_DEPTH_BIT) rendering.depthAttachmentFormat = graphics_.depth_format;
-        if (graphics_.depth_aspects & VK_IMAGE_ASPECT_STENCIL_BIT) rendering.stencilAttachmentFormat = graphics_.depth_format;
-
-        static constexpr VkDynamicState dynamic_states[] = {
-            VK_DYNAMIC_STATE_VIEWPORT,          VK_DYNAMIC_STATE_SCISSOR,
-            VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY, VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE,
-            VK_DYNAMIC_STATE_STENCIL_REFERENCE, VK_DYNAMIC_STATE_BLEND_CONSTANTS};
-        VkPipelineDynamicStateCreateInfo dynamic{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
-        dynamic.dynamicStateCount = std::uint32_t(std::size(dynamic_states));
-        dynamic.pDynamicStates = dynamic_states;
-
         // Every stage this path accepts reads the user SGPRs, so the range covers the whole stage table, not only the
         // stages present. A stage added to the table (geometry, mesh) is covered without touching this.
         for (const Stage& stage : stages) graphics_.push_stages |= stage.bit;
@@ -1475,20 +1526,20 @@ public:
         layout_info.pPushConstantRanges = &push;
         if (vk.vkCreatePipelineLayout(dev, &layout_info, nullptr, &graphics_.layout) != VK_SUCCESS) return E_FAIL;
 
-        VkGraphicsPipelineCreateInfo info{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, &rendering};
-        info.stageCount = std::uint32_t(stage_infos.size());
-        info.pStages = stage_infos.data();
-        info.pVertexInputState = &vertex_input;
-        info.pInputAssemblyState = &assembly;
-        info.pViewportState = &viewport;
-        info.pRasterizationState = &raster;
-        info.pMultisampleState = &multisample;
-        info.pDepthStencilState = &depth;
-        info.pColorBlendState = &blend;
-        info.pDynamicState = &dynamic;
-        info.layout = graphics_.layout;
-        if (vk.vkCreateGraphicsPipelines(dev, VK_NULL_HANDLE, 1, &info, nullptr, &graphics_.pipeline) != VK_SUCCESS)
-            return E_FAIL;
+        // Kept for variants: a draw that leaves a slot unbound needs this pipeline with that format undefined.
+        recipe_.stages = std::move(stage_infos);
+        recipe_.attributes = std::move(attributes);
+        recipe_.bindings = std::move(bindings);
+        recipe_.assembly = assembly;
+        recipe_.raster = raster;
+        recipe_.multisample = multisample;
+        recipe_.sample_mask = sample_mask;
+        recipe_.depth = depth;
+        recipe_.blends = std::move(blends);
+        recipe_.blend = blend;
+        graphics_.pipeline = build(0);
+        if (!graphics_.pipeline) return E_FAIL;
+        graphics_.variant = [this](std::uint32_t unbound) { return variant(unbound); };
 
         if (code_stage) {
             VkDeviceSize offset = 0;
@@ -1572,9 +1623,94 @@ public:
     }
 
 private:
+    // What a graphics pipeline is made from, so variants can be built at draw time.
+    struct Recipe {
+        std::vector<VkPipelineShaderStageCreateInfo> stages;
+        std::vector<VkVertexInputAttributeDescription> attributes;
+        std::vector<VkVertexInputBindingDescription> bindings;
+        VkPipelineInputAssemblyStateCreateInfo assembly{};
+        VkPipelineRasterizationStateCreateInfo raster{};
+        VkPipelineMultisampleStateCreateInfo multisample{};
+        VkSampleMask sample_mask = ~0u;
+        VkPipelineDepthStencilStateCreateInfo depth{};
+        std::vector<VkPipelineColorBlendAttachmentState> blends;
+        VkPipelineColorBlendStateCreateInfo blend{};
+    };
+
+    // The graphics pipeline with the formats of the `unbound` slots (leonida::GraphicsPipeline::variant) undefined.
+    VkPipeline build(std::uint32_t unbound) const {
+        static constexpr VkDynamicState dynamic_states[] = {
+            VK_DYNAMIC_STATE_VIEWPORT,          VK_DYNAMIC_STATE_SCISSOR,
+            VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY, VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE,
+            VK_DYNAMIC_STATE_STENCIL_REFERENCE, VK_DYNAMIC_STATE_BLEND_CONSTANTS};
+        const Recipe& r = recipe_;
+        std::vector<VkFormat> colors = graphics_.color_formats;
+        for (std::size_t slot = 0; slot < colors.size(); ++slot)
+            if (unbound & (1u << slot)) colors[slot] = VK_FORMAT_UNDEFINED;
+        const bool depth_bound = !(unbound & leonida::GraphicsPipeline::unbound_depth);
+        VkPipelineRenderingCreateInfo rendering{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
+        rendering.colorAttachmentCount = std::uint32_t(colors.size());
+        rendering.pColorAttachmentFormats = colors.data();
+        if (depth_bound && (graphics_.depth_aspects & VK_IMAGE_ASPECT_DEPTH_BIT))
+            rendering.depthAttachmentFormat = graphics_.depth_format;
+        if (depth_bound && (graphics_.depth_aspects & VK_IMAGE_ASPECT_STENCIL_BIT))
+            rendering.stencilAttachmentFormat = graphics_.depth_format;
+
+        VkPipelineVertexInputStateCreateInfo vertex_input{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+        vertex_input.vertexBindingDescriptionCount = std::uint32_t(r.bindings.size());
+        vertex_input.pVertexBindingDescriptions = r.bindings.data();
+        vertex_input.vertexAttributeDescriptionCount = std::uint32_t(r.attributes.size());
+        vertex_input.pVertexAttributeDescriptions = r.attributes.data();
+        VkPipelineViewportStateCreateInfo viewport{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+        viewport.viewportCount = 1;
+        viewport.scissorCount = 1;
+        VkPipelineMultisampleStateCreateInfo multisample = r.multisample;
+        multisample.pSampleMask = &r.sample_mask;
+        VkPipelineColorBlendStateCreateInfo blend = r.blend;
+        blend.attachmentCount = std::uint32_t(r.blends.size());
+        blend.pAttachments = r.blends.data();
+        VkPipelineDynamicStateCreateInfo dynamic{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+        dynamic.dynamicStateCount = std::uint32_t(std::size(dynamic_states));
+        dynamic.pDynamicStates = dynamic_states;
+
+        VkGraphicsPipelineCreateInfo info{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, &rendering};
+        info.stageCount = std::uint32_t(r.stages.size());
+        info.pStages = r.stages.data();
+        info.pVertexInputState = &vertex_input;
+        info.pInputAssemblyState = &r.assembly;
+        info.pViewportState = &viewport;
+        info.pRasterizationState = &r.raster;
+        info.pMultisampleState = &multisample;
+        info.pDepthStencilState = &r.depth;
+        info.pColorBlendState = &blend;
+        info.pDynamicState = &dynamic;
+        info.layout = graphics_.layout;
+        VkPipeline pipeline = VK_NULL_HANDLE;
+        if (device_.context->vk.vkCreateGraphicsPipelines(device_.info.device, VK_NULL_HANDLE, 1, &info, nullptr,
+                                                          &pipeline) != VK_SUCCESS)
+            return VK_NULL_HANDLE;
+        return pipeline;
+    }
+
+    // Built on first use and kept until the PSO is released (replay may call this from any queue).
+    VkPipeline variant(std::uint32_t unbound) {
+        std::lock_guard lock(variants_mutex_);
+        if (const auto it = variants_.find(unbound); it != variants_.end()) return it->second;
+        const VkPipeline pipeline = build(unbound);
+        if (!pipeline) {
+            log_once("a pipeline variant for unbound attachment slots could not be built; slots", int(unbound));
+            return VK_NULL_HANDLE;
+        }
+        variants_.emplace(unbound, pipeline);
+        return pipeline;
+    }
+
     DeviceState& device_;
     leonida::ComputePipeline pipeline_;
     leonida::GraphicsPipeline graphics_;
+    Recipe recipe_;
+    std::mutex variants_mutex_;
+    std::map<std::uint32_t, VkPipeline> variants_;
     VkShaderModule module_ = VK_NULL_HANDLE;
     std::vector<VkShaderModule> modules_;
     VkDeviceSize code_base_ = 0;
@@ -1958,7 +2094,10 @@ public:
                      VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
                      VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
                      VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
-        if (vk.vkCreateBuffer(state_.info.device, &info, nullptr, &arena.buffer) != VK_SUCCESS) return false;
+        if (vk.vkCreateBuffer(state_.info.device, &info, nullptr, &arena.buffer) != VK_SUCCESS) {
+            arena.buffer = VK_NULL_HANDLE;
+            return false;
+        }
         VkMemoryRequirements requirements{};
         vk.vkGetBufferMemoryRequirements(state_.info.device, arena.buffer, &requirements);
         arena.memory = state_.allocate(requirements,
@@ -1966,15 +2105,24 @@ public:
                                        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, nullptr, true);
         void* mapped = nullptr;
         if (!arena.memory || vk.vkBindBufferMemory(state_.info.device, arena.buffer, arena.memory, 0) != VK_SUCCESS ||
-            vk.vkMapMemory(state_.info.device, arena.memory, 0, VK_WHOLE_SIZE, 0, &mapped) != VK_SUCCESS)
+            vk.vkMapMemory(state_.info.device, arena.memory, 0, VK_WHOLE_SIZE, 0, &mapped) != VK_SUCCESS) {
+            // Without an arena every buffer keeps its own memory; a leftover handle would make them addressable
+            // with heap base 0, so their VAs would be raw device addresses above 4 GiB.
+            vk.vkDestroyBuffer(state_.info.device, arena.buffer, nullptr);
+            if (arena.memory) vk.vkFreeMemory(state_.info.device, arena.memory, nullptr);
+            arena.buffer = VK_NULL_HANDLE;
+            arena.memory = VK_NULL_HANDLE;
             return false;
+        }
         arena.mapped = static_cast<std::uint8_t*>(mapped);
+        std::memset(arena.mapped, 0, kArenaReserved);  // the zero page unbound vertex and index buffers read
         VkBufferDeviceAddressInfo address{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
         address.buffer = arena.buffer;
         arena.address = vk.vkGetBufferDeviceAddress(state_.info.device, &address);
         arena.size = info.size;
-        arena.free[64 * 1024] = arena.size - 64 * 1024;
+        arena.free[kArenaReserved] = arena.size - kArenaReserved;
         state_.context->set_heap_base(arena.address);
+        state_.context->set_zero_page(arena.buffer, 0, kArenaReserved);
         return true;
     }
 
@@ -2126,6 +2274,10 @@ public:
         if (!desc || !desc->NumDescriptors) return d3d12_trace::result(method, E_INVALIDARG);
         auto* heap = new DescriptorHeap(state_, *desc);
         heap->attach_device(identity());
+        if (!heap->ok()) {
+            heap->Release();
+            return d3d12_trace::result(method, E_OUTOFMEMORY);
+        }
         return d3d12_trace::result(method, hand_out(heap, riid, out));
     }
 
@@ -3792,6 +3944,13 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
         std::fprintf(stderr, "[rt] d3d12: no VK_EXT_host_image_copy; CPU texture copies use a staging submit\n");
     }
 
+    // What graphics PSOs may ask for: different blend state per render target, wireframe, a depth-bias clamp and
+    // SRC1 blend factors. Enabled where the GPU has them; a PSO that needs a missing one is refused.
+    enable.independentBlend = chosen_features.independentBlend;
+    enable.fillModeNonSolid = chosen_features.fillModeNonSolid;
+    enable.depthBiasClamp = chosen_features.depthBiasClamp;
+    enable.dualSrcBlend = chosen_features.dualSrcBlend;
+    info.features = enable;
     VkDeviceCreateInfo device_info{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &enable12};
     device_info.queueCreateInfoCount = 1;
     device_info.pQueueCreateInfos = &queue_info;

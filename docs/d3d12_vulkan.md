@@ -429,6 +429,12 @@ The compute path, end to end:
   It extracts the FSSM program from the DXBC container (DXIL → XDAT entry 0x0D → XBCH → zlib) and looks up its
   SHA-256 as `fssm_sha256` in `spirv/index.json`. Its own inflate, SHA-256 and JSON reader keep it free of
   dependencies (`shader_library_test`).
+  - A container with two different 0x0D payloads (195 of 26,503) is read at the last one, as
+    `tools/fssm_unpack.py` does by default and so as `fssm_sha256` was computed.
+  - Index entries that share a program are all kept: the VS whose input signature the PSO's input layout feeds
+    is chosen.
+  - A malformed index (bad numbers or `\u` escapes) is refused with an error instead of throwing into the shim,
+    and an integer field outside 0..2^32−1 reads as 0.
 - Root signatures use the model already on `main` (`runtime/src/root_signature.h`, `rt::rootsig`): `parse_rts0`
   reads the serialized blob and `pack()` lays out the 32 user-data dwords by the section 3.5 default mapping,
   refusing anything that would spill.
@@ -445,8 +451,8 @@ The compute path, end to end:
   **`CreateComputePipelineState`** (PC slot 11, Xbox slot 62 through the proxy) finds the shader by its FSSM
   hash, builds a pipeline with the 144-byte push-constant range and registers it for replay. Shaders that declare
   set-0 bindings are refused with a log until the bindless set exists (M2).
-- **Command list**: `Set{Compute,Graphics}RootSignature` (which clears the arguments, as D3D12 leaves them
-  undefined), `SetPipelineState`, the 32-bit constant, root view and descriptor-table setters, `SetDescriptorHeaps`
+- **Command list**: `Set{Compute,Graphics}RootSignature` (a different signature clears the arguments, as D3D12
+  leaves them undefined; setting the bound one again keeps them, as D3D12 does), `SetPipelineState`, the 32-bit constant, root view and descriptor-table setters, `SetDescriptorHeaps`
   and `ClearState`. A wrong parameter type or out-of-range constants makes `Close` return `E_INVALIDARG`.
   `Dispatch` records the block as it is at that moment. Replay binds the pipeline, pushes s0..s31, the heap base
   and the code base, and dispatches.
@@ -456,9 +462,17 @@ The compute path, end to end:
     unfed is refused, as D3D12 refuses it.
   - **Fixed-function state:** rasterizer, blend and depth-stencil state map one to one. Viewport, scissor,
     topology, vertex strides, stencil references and the blend factor are dynamic.
-  - **Formats:** dynamic rendering takes the RTV and DSV formats.
+  - **Formats:** dynamic rendering takes the RTV and DSV formats. A draw that leaves a slot unbound for which the
+    PSO names a format (D3D12 allows it and discards those writes) uses a variant of the pipeline with that format
+    undefined, built on first use and kept with the PSO. Bit i of the variant key is colour slot i, and bit 8 is
+    depth/stencil.
+  - **Instance step rate 0:** every instance reads element 0, done with a stride of 0 for that slot at draw time.
+  - **Features:** independent blend state, wireframe fill, a depth-bias clamp and SRC1 blend factors need
+    `independentBlend`, `fillModeNonSolid`, `depthBiasClamp` and `dualSrcBlend`. The standalone device enables
+    those the GPU has and reports them in `VulkanDeviceInfo::features`. A PSO that needs a missing one is refused
+    with a log.
   - **Refused with a log:** hull, domain and geometry stages, stream output, MSAA, set-0 bindings, and two stages
-    that both read their code base (question 14, section 5.2).
+    that both read their code base (question 14, section 5.2). More than eight render targets is `E_INVALIDARG`.
   - **Push constants:** both PSO paths declare the 144-byte block as one range. Its stage flags are the whole
     stage table the graphics path accepts, and the replay pushes with the same flags. A device whose
     `maxPushConstantsSize` is below 144 (#224's `push_constants_need_fallback`) has every PSO refused, with the
@@ -466,12 +480,25 @@ The compute path, end to end:
 
   The command list keeps the input-assembler, viewport, scissor, render-target (read at `OMSetRenderTargets`, as
   D3D12 does), blend-factor and stencil-reference state, including CommandList8's front/back references. Each
-  `DrawInstanced` / `DrawIndexedInstanced` records a copy of that state.
+  `DrawInstanced` / `DrawIndexedInstanced` records a copy of that state. A draw with no viewport (never set, or
+  unbound with `RSSetViewports(0, …)`) or an empty one rasterizes nothing in D3D12. Such a draw is not recorded,
+  since Vulkan forbids a 0×0 viewport.
 
-  At replay, vertex and index views resolve to buffers by VA (arena or upload). Attachments move to attachment
-  layouts through the tracker, and the draw runs in a dynamic-rendering scope. The viewport is flipped (negative
-  height), because translated vertex shaders write D3D clip coordinates; front-face winding then matches
-  D3D12's. Only the first viewport and scissor are used, and primitive restart is not modelled yet.
+  At replay:
+  - **Buffers:** vertex and index views resolve to buffers by VA (arena or upload). A view that runs past its
+    buffer is cut at the buffer's end. An unbound vertex slot, or an indexed draw with no index buffer, reads the
+    arena's reserved first 64 KiB, which is kept zero (stride 0), so it gets the zeros D3D12 gives.
+  - **Attachments:** they move to attachment layouts through the tracker, and the draw runs in a
+    dynamic-rendering scope. Its layer count is the smallest layer count of the bound views.
+  - **Viewport:** it is flipped (negative height), because translated vertex shaders write D3D clip coordinates;
+    front-face winding then matches D3D12's.
+  - Only the first viewport and scissor are used, and primitive restart is not modelled yet.
+
+  **Resources and heaps:**
+  - A buffer of 0 bytes, or one whose size wraps when aligned, is `E_INVALIDARG`. One the arena cannot hold is
+    `E_OUTOFMEMORY`, and so is a shader-visible descriptor heap the arena cannot hold (in host memory its GPU
+    handle would be 0).
+  - If the arena cannot be created, its buffer is released, so other buffers keep their own memory and get no VA.
 
 Known gaps: set 0 in pipelines (the device keeps the bindless set, but no pipeline declares or binds it yet) and
 therefore every translated shader that declares bindings; tessellation, geometry and mesh pipelines,
@@ -481,9 +508,10 @@ calls), HDR and fullscreen; buffer and constant-buffer views (UAV clears read th
 not wait on view creation), typeless volume RTVs, placed
 resources, depth-stencil resolves and 1D textures;
 default-heap buffers are not zero-filled yet; a fence cannot be signalled to a lower value (Vulkan timelines only
-increase; such a signal is reported and dropped); the GCL8
-front/back stencil references are recorded but not applied, because there is no pipeline or draw path for them to
-affect.
+increase; such a signal is reported and dropped); instance step rates above 1 (they need vertex attribute
+divisors); read-only DSVs (the depth image always moves to `DEPTH_STENCIL_ATTACHMENT_OPTIMAL`, which matters once
+depth SRVs are sampled next to a read-only DSV, M2); the index buffer is bound without its view's size
+(`vkCmdBindIndexBuffer2`, Vulkan 1.4, takes one).
 
 Build `runtime/` (Vulkan SDK and Python 3 on `PATH`) and run `ctest --test-dir <build> --output-on-failure` for the
 CPU tests:
@@ -624,9 +652,21 @@ and any validation error fails them.
     the opposite register order, so a match by position would fail.
   - **Buffers:** the vertex buffer is copied into the arena, and the index buffer is read from an upload heap.
   - **Draws:** two indexed draws with different root constants and root CBVs, then a back-facing triangle that must
-    be culled.
+    be culled. Each of these also checks a fix:
+    - the first draw uses a PSO with a second RT format and a DSV format, with neither bound (a variant);
+    - before the second draw, the same root signature is set again after the arguments, which must keep them;
+    - two more draws, through a viewport on the top-right quadrant, read COLOR per instance with step rate 0 (two
+      instances that must both read element 0) and from an unbound slot (zeros).
+  - **Refusals:**
+    - PSOs that need wireframe fill, independent blend or a depth-bias clamp are refused on this device, which
+      enables none of them;
+    - nine render targets is refused, at PSO creation and at `OMSetRenderTargets`;
+    - 0-byte and wrapping buffer sizes are refused, and a buffer or shader-visible heap larger than the arena runs
+      out of memory;
+    - a draw with no viewport executes cleanly and draws nothing.
   - **Check:** all 4096 pixels of the read-back target are compared. Where the red and green quadrants land also
-    checks the viewport flip and the winding.
+    checks the viewport flip and the winding. With each of the rebind, step-rate and variant fixes undone, the test
+    fails (wrong pixels, or `dynamicRenderingUnusedAttachments-08912`).
 
   The shaders are GLSL written to the translator's contract (`test/glsl/vs_draw.vert`, `ps_draw.frag`).
 - `d3d12_present_test`: milestone M0. It opens a window and presents 60 frames, each one: reset the list, move
