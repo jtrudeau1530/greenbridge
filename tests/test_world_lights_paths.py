@@ -372,6 +372,19 @@ class ScanTest(unittest.TestCase):
         two = T.summarize(T.scan(self.rpf, jobs=2))
         self.assertEqual(one, two)
 
+    def test_cli_rejects_negative_start_before_scanning(self):
+        for start in ("-1", "-0x10"):
+            with self.subTest(start=start):
+                out = os.path.join(self.tmp.name, "summary.json")
+                err = io.StringIO()
+                with mock.patch.object(T, "scan", side_effect=AssertionError("unexpected scan")) as scan, \
+                        contextlib.redirect_stderr(err):
+                    rc = T.main([self.rpf, f"--start={start}", "--out", out])
+                scan.assert_not_called()
+                self.assertEqual(rc, 2)
+                self.assertIn("--start must be non-negative", err.getvalue())
+                self.assertFalse(os.path.exists(out))
+
     def test_cli_rejects_shared_report_destination(self):
         out = os.path.join(self.tmp.name, "lights.json")
         alias = os.path.join(self.tmp.name, ".", "lights.json")
@@ -415,7 +428,7 @@ class ScanTest(unittest.TestCase):
         limited = os.path.join(self.tmp.name, "limited.json")
         limited_lights = os.path.join(self.tmp.name, "limited.jsonl")
         with contextlib.redirect_stdout(io.StringIO()):
-            self.assertEqual(T.main([self.rpf, "--limit", "0x1000", "--out", limited,
+            self.assertEqual(T.main([self.rpf, "--start", "0", "--limit", "0x1000", "--out", limited,
                                      "--entities", self.entities, "--lights-out", limited_lights]), 0)
         with open(limited, encoding="utf-8") as f:
             self.assertEqual(json.load(f), summary)
