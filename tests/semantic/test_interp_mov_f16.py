@@ -517,5 +517,190 @@ class TestInterpMovF16ScalarInterpreter(unittest.TestCase):
         self.assertEqual(r1, r2)
 
 
+class SIMDWavefront:
+    """Architectural model of a SIMD wavefront (Wave32 or Wave64) executing v_interp_mov_f16."""
+
+    def __init__(self, wave_size: int = 64, attr_buf: AttributeBuffer | None = None) -> None:
+        if wave_size not in (32, 64):
+            raise ValueError(f"Wave size must be 32 or 64, got {wave_size}")
+        self.wave_size = wave_size
+        self._exec_mask = (1 << wave_size) - 1
+        self.vgprs = [[0] * 256 for _ in range(wave_size)]
+        self.attr_buf = attr_buf if attr_buf is not None else AttributeBuffer()
+
+    @property
+    def exec_mask(self) -> int:
+        return self._exec_mask
+
+    @exec_mask.setter
+    def exec_mask(self, val: int) -> None:
+        mask_limit = (1 << self.wave_size) - 1
+        self._exec_mask = val & mask_limit
+
+    @property
+    def exec_lo(self) -> int:
+        return self._exec_mask & MASK32
+
+    @exec_lo.setter
+    def exec_lo(self, val: int) -> None:
+        self._exec_mask = (self._exec_mask & ~MASK32) | (val & MASK32)
+
+    @property
+    def exec_hi(self) -> int:
+        return (self._exec_mask >> 32) & MASK32
+
+    @exec_hi.setter
+    def exec_hi(self, val: int) -> None:
+        if self.wave_size == 32:
+            raise ValueError("Cannot set exec_hi on Wave32")
+        self._exec_mask = (self._exec_mask & MASK32) | ((val & MASK32) << 32)
+
+    def execute(self, inst: ASTInstruction) -> None:
+        inst.validate()
+        attr_word = self.attr_buf.read_param_channel(
+            inst.param.index,
+            inst.attr.attr_index,
+            inst.attr.channel.value,
+        )
+        for lane in range(self.wave_size):
+            if (self._exec_mask >> lane) & 1:
+                old_val = self.vgprs[lane][inst.dst.vgpr_index]
+                new_val = ref_interp_mov_f16(
+                    attr_word,
+                    high_src=inst.high_src,
+                    high_dst=inst.dst.high,
+                    old_dst_u32=old_val,
+                    clamp=inst.clamp,
+                )
+                self.vgprs[lane][inst.dst.vgpr_index] = new_val
+
+
+class TestInterpMovF16SIMDMultiLane(unittest.TestCase):
+    """Test suite for SIMD multi-lane divergence and 32/64-bit EXEC masking."""
+
+    CANARY_OLD = 0xBEEFCAFE
+
+    def test_wave32_full_exec(self):
+        buf = AttributeBuffer()
+        buf.write_param_channel(0, 1, Channel.X.value, pack_f16_pair(H_ONE, H_TWO))
+        wave = SIMDWavefront(wave_size=32, attr_buf=buf)
+
+        inst = ASTInstruction(
+            opcode=Opcode.V_INTERP_MOV_F16,
+            dst=ASTOperand(0, high=False),
+            param=ParamType.P0,
+            attr=AttributeRef(1, Channel.X),
+            high_src=False,
+        )
+        wave.execute(inst)
+
+        for lane in range(32):
+            self.assertEqual(wave.vgprs[lane][0], H_ONE)
+
+    def test_wave64_divergence_exec_masking(self):
+        buf = AttributeBuffer()
+        buf.write_param_channel(0, 3, Channel.Y.value, pack_f16_pair(H_HALF, H_ONE))
+        wave = SIMDWavefront(wave_size=64, attr_buf=buf)
+
+        # Alternating even/odd lanes
+        wave.exec_lo = 0x55555555
+        wave.exec_hi = 0xAAAAAAAA
+
+        for lane in range(64):
+            wave.vgprs[lane][4] = self.CANARY_OLD
+
+        inst = ASTInstruction(
+            opcode=Opcode.V_INTERP_MOV_F16,
+            dst=ASTOperand(4, high=False),
+            param=ParamType.P0,
+            attr=AttributeRef(3, Channel.Y),
+            high_src=True,   # H_ONE (0x3C00)
+        )
+        wave.execute(inst)
+
+        for lane in range(64):
+            is_active = bool((wave.exec_mask >> lane) & 1)
+            if is_active:
+                # low half becomes H_ONE, high half retains CANARY's high half (0xBEEF)
+                expected = (self.CANARY_OLD & 0xFFFF0000) | H_ONE
+                self.assertEqual(wave.vgprs[lane][4], expected)
+            else:
+                self.assertEqual(wave.vgprs[lane][4], self.CANARY_OLD)
+
+    def test_wave64_halves_masking(self):
+        buf = AttributeBuffer()
+        buf.write_param_channel(0, 0, Channel.X.value, 0x11112222)
+        wave = SIMDWavefront(wave_size=64, attr_buf=buf)
+
+        # Lower 32 lanes active, upper 32 inactive
+        wave.exec_lo = 0xFFFFFFFF
+        wave.exec_hi = 0x00000000
+
+        for lane in range(64):
+            wave.vgprs[lane][1] = self.CANARY_OLD
+
+        inst = ASTInstruction(
+            opcode=Opcode.V_INTERP_MOV_F16,
+            dst=ASTOperand(1, high=True),
+            param=ParamType.P0,
+            attr=AttributeRef(0, Channel.X),
+            high_src=False,
+        )
+        wave.execute(inst)
+
+        for lane in range(32):
+            expected = (0x2222 << 16) | (self.CANARY_OLD & 0xFFFF)
+            self.assertEqual(wave.vgprs[lane][1], expected)
+
+        for lane in range(32, 64):
+            self.assertEqual(wave.vgprs[lane][1], self.CANARY_OLD)
+
+    def test_single_active_lane(self):
+        buf = AttributeBuffer()
+        buf.write_param_channel(0, 0, Channel.X.value, pack_f16_pair(H_ONE, H_TWO))
+        wave = SIMDWavefront(wave_size=64, attr_buf=buf)
+        wave.exec_mask = 1 << 42  # only lane 42 active
+
+        for lane in range(64):
+            wave.vgprs[lane][0] = self.CANARY_OLD
+
+        inst = ASTInstruction(
+            opcode=Opcode.V_INTERP_MOV_F16,
+            dst=ASTOperand(0, high=False),
+            param=ParamType.P0,
+            attr=AttributeRef(0, Channel.X),
+            high_src=False,
+        )
+        wave.execute(inst)
+
+        for lane in range(64):
+            if lane == 42:
+                expected = (self.CANARY_OLD & 0xFFFF0000) | H_ONE
+                self.assertEqual(wave.vgprs[lane][0], expected)
+            else:
+                self.assertEqual(wave.vgprs[lane][0], self.CANARY_OLD)
+
+    def test_zero_exec_preserves_all_lanes(self):
+        buf = AttributeBuffer()
+        buf.write_param_channel(0, 0, Channel.X.value, 0x12345678)
+        wave = SIMDWavefront(wave_size=64, attr_buf=buf)
+        wave.exec_mask = 0
+
+        for lane in range(64):
+            wave.vgprs[lane][0] = self.CANARY_OLD
+
+        inst = ASTInstruction(
+            opcode=Opcode.V_INTERP_MOV_F16,
+            dst=ASTOperand(0, high=False),
+            param=ParamType.P0,
+            attr=AttributeRef(0, Channel.X),
+            high_src=False,
+        )
+        wave.execute(inst)
+
+        for lane in range(64):
+            self.assertEqual(wave.vgprs[lane][0], self.CANARY_OLD)
+
+
 if __name__ == "__main__":
     unittest.main()
