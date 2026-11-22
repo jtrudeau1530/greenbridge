@@ -927,7 +927,14 @@ bool image_descriptor(const Resource& resource, const TextureView& view, leonida
         return false;
     }
     VkFormat named = resource.format();
-    if (view.format != DXGI_FORMAT_UNKNOWN && !stencil) named = vulkan_format(view.format, false).format;
+    // The depth plane of a depth-stencil texture, as R24_UNORM_X8_TYPELESS (D24S8) or R32_FLOAT_X8X24_TYPELESS
+    // (D32S8): the texture's own depth format, whose T# code is the console's depth format (8_24_UNORM or
+    // X24_8_32_FLOAT) with the depth in R; bind_image views the depth aspect for it.
+    const bool depth_plane = (view.format == DXGI_FORMAT_R24_UNORM_X8_TYPELESS ||
+                              view.format == DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS) &&
+                             (resource.aspects() & VK_IMAGE_ASPECT_DEPTH_BIT);
+    if (view.format != DXGI_FORMAT_UNKNOWN && !stencil && !depth_plane)
+        named = vulkan_format(view.format, false).format;
     const std::uint32_t code = stencil ? g::stencil_format : g::format_from_vulkan(named);
     const VkFormat view_format = stencil ? resource.format()
                                  : code  ? g::vulkan_view_format(resource.format(), code)
