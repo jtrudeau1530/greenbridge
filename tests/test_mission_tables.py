@@ -306,6 +306,16 @@ class TestBrokenInput(unittest.TestCase):
         self.assertEqual(result["entity_list"][0]["archetype"], 0xABCDEF01)
         self.assertIn(0x22222222, {state["key"] for state in result["states"]})
 
+    def test_rejected_lone_record_does_not_skip_adjacent_table(self):
+        # 24-byte prefix + valid 2-record chunk at +0x18: bytes 0x00..0x1F decode as a rejected lone
+        # false positive, so advancing by 32 bytes instead of 4 used to jump past +0x18 and drop the table.
+        prefix = struct.pack("<6I", 0x12345678, 0, 0, 0, 0x99990001, 0)
+        rec0 = struct.pack("<8I", 0x00010001, 0, 1, 0, (0x0000 << 16) | 3, 0, (1 << 16) | 1, 0)
+        rec1 = struct.pack("<8I", 0x11223344, 0, 1, 0, (0x0080 << 16) | 3, 0, (1 << 16) | 1, 0)
+        result = M.parse_blob(prefix + rec0 + rec1, "after_false_positive.bin")
+        self.assertEqual(result["chunks"], 1)
+        self.assertEqual(result["records"], 2)
+
 
 class TestCli(unittest.TestCase):
     def test_directory_is_sorted_and_json_is_machine_readable(self):
