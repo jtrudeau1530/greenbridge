@@ -616,6 +616,47 @@ Over 5,000 programs the reference and translator match bit for bit; breaking the
 A mutation check (inst offset dropped, V# stride narrowed, the SMEM pointer's high word dropped) makes
 76, 45 and 42 of 150 programs fail, so the runner does catch address errors.
 
+### Sum-of-absolute-differences family (`tools/sad_diff.py`)
+
+The subset interpreter `cpu_ref.py` has no SAD ops, so the family gets its own runner, like the memory
+instructions above. The family is seven opcodes — `v_sad_u8`, `v_sad_hi_u8`, `v_sad_u16`, `v_sad_u32`,
+`v_msad_u8` and the packed quad forms `v_qsad_pk_u16_u8`, `v_mqsad_pk_u16_u8`. `tools/sad_diff.py`
+carries a small reference written from the ISA pseudocode recorded in `docs/design.md`'s contract rows
+(the "Sum of absolute differences" row hardware-verified on gfx1035 through SHADER-137's `int_hw_probe`
+run; the `v_qsad` row bit-exact on an RTX 3060 in #623) and compares it with the translation run in
+`spirv_mini_interp`, the four exported mrt0 words, bit for bit (everything here is integer, so a
+mismatch can never be a rounding convention).
+
+Programs are straight-line: seeds in v8..v15 and s4..s7, then family ops whose destinations stay inside
+v8..v11 (the quad ops write pairs inside that), then `exp mrt0 v8, v9, v10, v11`, so every result is
+observed and later ops chain on earlier ones. Every operand position takes every source kind the
+encoding allows: VGPR, SGPR, a hex literal, an inline constant and `null` for the 32-bit sources; the
+quad ops' 64-bit S0/S2 take VGPR/SGPR pairs, a hex literal (zero high word) or an inline constant
+(sign-extended) — the 64-bit constant rule of the contract table, pinned both ways: a hex literal reads
+the same as the register pair holding its word and a zero high word, while a negative inline constant
+sign-extends, so the two constant forms differ in the high word.
+
+Two modes run one after the other: a sweep over the whole source-kind space (every (S0, S1, S2) kind
+combination, 125 per plain op, 80 per quad op, 785 programs) with values drawn from byte/half edge
+words, and random seeded programs that widen the value coverage over the same kind space. Not
+generated, on purpose: `clamp` (the contract rows say the translator rejects it; pinned as expected
+rejections in `--self-test`), `op_sel`/`neg`/`abs` (the ISA does not define them for these opcodes),
+`v_mqsad_u32_u8` (open PRs #1926/#2163 are on that op) and `null` as a 64-bit quad source (PR #2650's
+subject).
+
+```powershell
+python -I tools/sad_diff.py --programs 2000 --seed 7
+python -I tools/sad_diff.py --self-test
+python -I tests/test_sad_diff.py
+```
+
+Across seeds 1, 2, 3, 7, 11 and 12 (the last pair with `--max-ops 12`) 12,810 programs match bit for
+bit, zero mismatches and zero skips; the seed-7 headline run alone is 785 + 2,000 programs with about
+1,050 to 1,175 cases per op. Two mutations of the translator's SAD rule — the per-byte `UMax`/`UMin`
+pair replaced by a wrapped subtraction, and the `v_sad_hi_u8` shift dropped — make 36 and 17 of 60
+programs fail (`--programs 60 --seed 2 --max-ops 5 --no-sweep`), so the runner does catch arithmetic
+errors.
+
 ### Images on the GPU (`tools/image_fuzz.py`)
 
 `tools/image_fuzz.py` starts on the image path, where the T# format, the view type and the binding layout
