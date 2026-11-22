@@ -1553,8 +1553,11 @@ class Gen:
             packed.append(bw)
         words = packed
         if fixed_fmt is not None:
-            # tbuffer: the format is in the instruction, so only that one is decoded.
-            comps = self.decode_format(words, fixed_fmt, fixed=True) if fixed_fmt in self.FORMATS else [self.cu(0)] * 4
+            # MTBUF takes both the format and its identity selectors from the instruction:
+            # X000, XY00, XYZ0 or XYZW. The V# selectors apply only to MUBUF.
+            comps = self.decode_format(words, fixed_fmt, fixed=True)
+            widths = self.FORMATS[fixed_fmt][2]
+            d3 = self.cu(sum((4 + c) << (3 * c) for c in range(len(widths))))
         else:
             comps = self.format_decode_call(fmt, words)
         # DST_SEL swizzle: 0 -> 0, 1 -> 1.0 (float/norm) or integer 1 (UINT/SINT; SHADER-86), 4..7 -> X..W.
@@ -1955,6 +1958,15 @@ class Gen:
                 self.emit(f"{nan} = OpIsNan %bool {float_value}")
                 self.emit(f"{value} = OpSelect %uint {nan} {self.cu(0)} {component}")
                 normalized.append(value)
+            # The runtime names B8G8R8A8 and A2R10G10B10 UNORM with V# selectors Z,Y,X,W.
+            # Pad the input first: even store_format_x must put its red value in the third field.
+            unorm_rgba = normalized + [self.cu(0)] * (4 - n)
+            selectors, bgra, red, blue = (self.tmp() for _ in range(4))
+            self.emit(f"{selectors} = OpBitwiseAnd %uint {d3} {self.cu(0xfff)}")
+            self.emit(f"{bgra} = OpIEqual %bool {selectors} {self.cu(0xf2e)}")
+            self.emit(f"{red} = OpSelect %uint {bgra} {unorm_rgba[2]} {unorm_rgba[0]}")
+            self.emit(f"{blue} = OpSelect %uint {bgra} {unorm_rgba[0]} {unorm_rgba[2]}")
+            unorm_view = [red, unorm_rgba[1], blue, unorm_rgba[3]]
             for code, (size, kind, widths) in self.FORMATS.items():
                 e = self.tmp()
                 self.emit(f"{e} = OpIEqual %bool {fmt} {self.cu(code)}")
@@ -1965,6 +1977,8 @@ class Gen:
                 ncomp = min(len(widths), n)
                 source = normalized if kind in ("unorm", "snorm") else fc
                 fcs = source[:ncomp] + [self.cu(0)] * (len(widths) - ncomp)
+                if code in (50, 56):
+                    fcs = unorm_view
                 ics = ic[:ncomp] + [self.cu(0)] * (len(widths) - ncomp)
                 words = self.encode_format(fcs + [self.cu(0)] * 4, ics + [self.cu(0)] * 4, code)
                 if size >= 4:
@@ -5433,6 +5447,61 @@ class Gen:
                 if F1[op] == "Fract":
                     r = self.fract_below_one(r)
             self.dst(a[0], self.tou(self.clamp_mods(r, mods)))
+        elif op in ("v_frexp_mant_f32", "v_frexp_exp_i32_f32", "v_ldexp_f32"):
+            # Bit-exact on the binary32 word (no float arithmetic). A normal input has biased exponent 1..254;
+            # zero and denormals are read as zero (the f32 denormal mode is not modelled, as for the other float ops)
+            # and infinities and NaNs (exponent 255) pass through: frexp_mant and ldexp return S0 unchanged,
+            # frexp_exp returns 0 (RDNA2 ISA, V_FREXP_MANT_F32 / V_FREXP_EXP_I32_F32 / V_LDEXP_F32).
+            x = self.src_u(a[1])
+            e, em1, isnorm, isden, sgn, r = (self.tmp() for _ in range(6))
+            self.emit(f"{e} = OpBitFieldUExtract %uint {x} {self.cu(23)} {self.cu(8)}")
+            self.emit(f"{em1} = OpISub %uint {e} {self.cu(1)}")
+            self.emit(f"{isnorm} = OpULessThan %bool {em1} {self.cu(254)}")          # exponent field 1..254
+            self.emit(f"{isden} = OpIEqual %bool {e} {self.cu(0)}")
+            self.emit(f"{sgn} = OpBitwiseAnd %uint {x} {self.cu(0x80000000)}")
+            other = self.tmp()
+            self.emit(f"{other} = OpSelect %uint {isden} {sgn} {x}")                  # zero/denormal -> +-0, inf/NaN -> S0
+            if op == "v_frexp_exp_i32_f32":
+                # x = mant * 2^exp with mant in [0.5, 1): exp = biased exponent - 126.
+                ex = self.tmp()
+                self.emit(f"{ex} = OpISub %uint {e} {self.cu(126)}")
+                self.emit(f"{r} = OpSelect %uint {isnorm} {ex} {self.cu(0)}")
+                self.dst(a[0], r)
+            elif op == "v_frexp_mant_f32":
+                keep, m = self.tmp(), self.tmp()
+                self.emit(f"{keep} = OpBitwiseAnd %uint {x} {self.cu(0x807FFFFF)}")
+                self.emit(f"{m} = OpBitwiseOr %uint {keep} {self.cu(0x3F000000)}")   # biased exponent 126
+                self.emit(f"{r} = OpSelect %uint {isnorm} {m} {other}")
+                self.dst(a[0], self.tou(self.clamp_mods(self.tof(r), mods)))
+            else:
+                # D = S0 * 2^S1 with S1 a signed integer. The exponent is added in 32 bits after clamping S1 to
+                # [-512, 512] (enough to overflow or underflow any binary32), then the result saturates: above
+                # 254 it is +-inf, at 0 or below it is +-0 (no denormal results).
+                n = self.src_u(a[2])
+                nb, small, neg, lim, nc, e2, e2m1, valid, pos, over = (self.tmp() for _ in range(10))
+                self.emit(f"{nb} = OpIAdd %uint {n} {self.cu(512)}")
+                self.emit(f"{small} = OpULessThan %bool {nb} {self.cu(1025)}")        # -512 <= n <= 512
+                self.emit(f"{neg} = OpBitFieldUExtract %uint {n} {self.cu(31)} {self.cu(1)}")
+                negb = self.tmp_bool_nz(neg)
+                self.emit(f"{lim} = OpSelect %uint {negb} {self.cu(0xFFFFFE00)} {self.cu(512)}")
+                self.emit(f"{nc} = OpSelect %uint {small} {n} {lim}")
+                self.emit(f"{e2} = OpIAdd %uint {e} {nc}")
+                self.emit(f"{e2m1} = OpISub %uint {e2} {self.cu(1)}")
+                self.emit(f"{valid} = OpULessThan %bool {e2m1} {self.cu(254)}")      # new exponent field 1..254
+                self.emit(f"{pos} = OpBitFieldUExtract %uint {e2} {self.cu(31)} {self.cu(1)}")
+                posb = self.tmp()
+                self.emit(f"{posb} = OpIEqual %bool {pos} {self.cu(0)}")
+                self.emit(f"{over} = OpLogicalAnd %bool {posb} {self.tmp_bool_nz(e2)}")
+                sh, keep, norm, inf, ov = (self.tmp() for _ in range(5))
+                self.emit(f"{sh} = OpShiftLeftLogical %uint {e2} {self.cu(23)}")
+                self.emit(f"{keep} = OpBitwiseAnd %uint {x} {self.cu(0x807FFFFF)}")
+                self.emit(f"{norm} = OpBitwiseOr %uint {keep} {sh}")
+                self.emit(f"{inf} = OpBitwiseOr %uint {sgn} {self.cu(0x7F800000)}")
+                self.emit(f"{ov} = OpSelect %uint {over} {inf} {sgn}")
+                scaled = self.tmp()
+                self.emit(f"{scaled} = OpSelect %uint {valid} {norm} {ov}")
+                self.emit(f"{r} = OpSelect %uint {isnorm} {scaled} {other}")
+                self.dst(a[0], self.tou(self.clamp_mods(self.tof(r), mods)))
         elif op in ("v_cvt_f32_u32", "v_cvt_f32_i32"):
             x = self.src_u(a[1])
             r = self.tmp()
@@ -6431,15 +6500,24 @@ class Gen:
             # integer views. shortcut: integers are truncated; AMD may saturate them (Mesa nir
             # integer_dest_saturates, unverified), so values past 16 bits may differ; clamp once a GPU shows it.
             for i in range(0, len(xs), 2):
-                pair = xs[i:i + 2] + [self.cu(0)] * (2 - len(xs[i:i + 2]))
+                dest = {"k": "vgpr", "r": vdata["r"] + i // 2, "n": 1}
+                if i + 1 == len(xs):
+                    # Odd component count (1 or 3): preserve the trailing VGPR's unused high half (gfx1036).
+                    if f16:
+                        lo = self.f16_bits(self.tof(xs[i]))
+                    else:
+                        lo = self.tmp()
+                        self.emit(f"{lo} = OpBitwiseAnd %uint {xs[i]} {self.cu(0xFFFF)}")
+                    self.write_lo16(dest, lo)
+                    continue
                 if f16:
-                    w = self.pack_f16_pair_int(self.tof(pair[0]), self.tof(pair[1]))
+                    w = self.pack_f16_pair_int(self.tof(xs[i]), self.tof(xs[i + 1]))
                 else:
                     lo, hi, w = self.tmp(), self.tmp(), self.tmp()
-                    self.emit(f"{lo} = OpBitwiseAnd %uint {pair[0]} {self.cu(0xFFFF)}")
-                    self.emit(f"{hi} = OpShiftLeftLogical %uint {pair[1]} {self.cu(16)}")
+                    self.emit(f"{lo} = OpBitwiseAnd %uint {xs[i]} {self.cu(0xFFFF)}")
+                    self.emit(f"{hi} = OpShiftLeftLogical %uint {xs[i + 1]} {self.cu(16)}")
                     self.emit(f"{w} = OpBitwiseOr %uint {lo} {hi}")
-                self.dst({"k": "vgpr", "r": vdata["r"] + i // 2, "n": 1}, w)
+                self.dst(dest, w)
 
         def read_integer(cls, ty):
             ip, im, b = self.tmp(), self.tmp(), self.tmp()
@@ -7880,18 +7958,17 @@ def assemble(gen):
                   "%_ptr_Function_bool_ms = OpTypePointer Function %bool",
                   "%null_v4_ms = OpConstantNull %v4float"]
         if ms and (gen.uses_clip or gen.uses_cull):     # staging arrays; the Output block only without msc
-            types += ["%_ptr_Function_float = OpTypePointer Function %float"]
+            types += ["%_ptr_Function_float = OpTypePointer Function %float",
+                      "%_ptr_Out_float_ms = OpTypePointer Output %float"]
             blk_fields = ["%v4float"]
             if gen.uses_clip:
                 types += [f"%ms_arr_clip = OpTypeArray %float {gen.cu(gen.clip_count)}",
                           "%_ptr_Fn_ms_clip = OpTypePointer Function %ms_arr_clip",
-                          "%_ptr_Out_ms_clip = OpTypePointer Output %ms_arr_clip",
                           "%null_ms_clip = OpConstantNull %ms_arr_clip"]
                 blk_fields.append("%ms_arr_clip")
             if gen.uses_cull:
                 types += [f"%ms_arr_cull_d = OpTypeArray %float {gen.cu(gen.cull_count)}",
                           "%_ptr_Fn_ms_cull_d = OpTypePointer Function %ms_arr_cull_d",
-                          "%_ptr_Out_ms_cull_d = OpTypePointer Output %ms_arr_cull_d",
                           "%null_ms_cull_d = OpConstantNull %ms_arr_cull_d"]
                 blk_fields.append("%ms_arr_cull_d")
             types += [f"%ms_vtx_blk = OpTypeStruct {' '.join(blk_fields)}",
@@ -8218,14 +8295,21 @@ def assemble(gen):
              ("%mpp = OpAccessChain %_ptr_Out_v4_ms %ms_out_vtx %mli %c0" if ms_blk else
               "%mpp = OpAccessChain %_ptr_Out_v4_ms %ms_out_pos %mli"),
              "OpStore %mpp %mpv"]
+        # Clip and cull distances are copied one float at a time, not as a whole array: SPIRV-Cross (1.4.363.0)
+        # turns a whole-array store into a mesh output into a plain C array assignment, which Metal rejects
+        # ("array type 'threadgroup float[1]' is not assignable"; SHADER-155). Same result on Vulkan.
         if gen.uses_clip:
-            L += ["%mcv = OpLoad %ms_arr_clip %ms_clip",
-                  f"%mcvp = OpAccessChain %_ptr_Out_ms_clip %ms_out_vtx %mli {c(ms_clip_member)}",
-                  "OpStore %mcvp %mcv"]
+            for i in range(gen.clip_count):
+                L += [f"%mcs{i} = OpAccessChain %_ptr_Function_float %ms_clip {c(i)}",
+                      f"%mcv{i} = OpLoad %float %mcs{i}",
+                      f"%mcvp{i} = OpAccessChain %_ptr_Out_float_ms %ms_out_vtx %mli {c(ms_clip_member)} {c(i)}",
+                      f"OpStore %mcvp{i} %mcv{i}"]
         if gen.uses_cull:
-            L += ["%mkv = OpLoad %ms_arr_cull_d %ms_cull_dist",
-                  f"%mkvp = OpAccessChain %_ptr_Out_ms_cull_d %ms_out_vtx %mli {c(ms_cull_member)}",
-                  "OpStore %mkvp %mkv"]
+            for i in range(gen.cull_count):
+                L += [f"%mks{i} = OpAccessChain %_ptr_Function_float %ms_cull_dist {c(i)}",
+                      f"%mkv{i} = OpLoad %float %mks{i}",
+                      f"%mkvp{i} = OpAccessChain %_ptr_Out_float_ms %ms_out_vtx %mli {c(ms_cull_member)} {c(i)}",
+                      f"OpStore %mkvp{i} %mkv{i}"]
         for n in sorted(gen.ms_params):
             L += [f"%mq{n} = OpLoad %v4float %ms_param{n}",
                   f"%mqp{n} = OpAccessChain %_ptr_Out_v4_ms %ms_out_param{n} %mli", f"OpStore %mqp{n} %mq{n}"]
@@ -9529,7 +9613,13 @@ def main():
         write_index(os.path.join(a.out, "index.json"), merged)
         print(f"merged {len(merged)} entries")
         return 0
-    files = [a.src] if a.src.endswith(".s") else sorted(os.path.join(a.src, f) for f in os.listdir(a.src) if f.endswith(".s"))
+    if os.path.isfile(a.src) and a.src.endswith(".s"):
+        files = [a.src]
+    elif os.path.isdir(a.src):
+        with os.scandir(a.src) as entries:
+            files = sorted(e.path for e in entries if e.name.endswith(".s") and e.is_file())
+    else:
+        ap.error(f"{a.src} is not a .s file or a folder of .s files")
     files = files[: a.limit] if a.limit is not None else files
     shard = None
     if a.shard:

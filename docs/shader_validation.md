@@ -338,9 +338,88 @@ First results on an RX 6700 XT (RADV, Mesa 26.3.1), native wave64/wave32 and wit
   under a masked wave32 `ds_bpermute`, and with #253's translator all 480 programs (seeds 1 to 3,
   native and emulated) match.
 - **Everything else matches.** With `--no-exec bpermute`, 1,040 programs match (seeds 1 to 8).
-- **Not covered.** The fuzzer does not generate `ds_permute_b32` yet (FUZZ-10); the translator supports it since
-  SHADER-90. The 8-bit d16 reads (`ds_read_u8_d16[_hi]`, `ds_read_i8_d16[_hi]`) are translated since SHADER-85
-  (`cs_w32_lds_u8_d16`) and the fuzzer generates them.
+- **Not in the default mix.** `ds_permute_b32` is generated with `--permute` (below). The 8-bit d16 reads
+  (`ds_read_u8_d16[_hi]`, `ds_read_i8_d16[_hi]`) are translated since SHADER-85 (`cs_w32_lds_u8_d16`) and the
+  fuzzer generates them.
+
+#### Hardware oracle for the LDS programs (`--oracle hw`)
+
+`--oracle hw` runs each program natively on an AMD GPU through `tools/hw_oracle/` (setup: "Hardware oracle" under
+FUZZ-4) and compares every stored word, 16 result registers per thread and all 1,024 LDS dwords, with the model;
+`--oracle translator,hw` does both and prints what the translator did with each program the hardware disagrees
+with. It tests the **model**, not the translator. Without the tools it prints `hardware oracle unavailable: ...` and
+exits 77.
+
+```
+python -I tools/lds_fuzz.py --oracle hw --programs 2000 --seed 1
+python -I tools/lds_fuzz.py --oracle hw --extended --programs 2000 --seed 1 --negative-control
+python -I tools/lds_fuzz.py --oracle hw --programs 50 --seed 1 --wave 32 --only 1,18,20,24 --minimize
+```
+
+- **What runs.** The program's real group size (`--threads 32|64|128|256|mix`: one partial wave, one wave, or several
+  waves joined by `s_barrier`), wave32 and native wave64 (`.amdhsa_wavefront_size32 0`), its EXEC masks (the entry
+  EXEC is saved in `s10` and restored, so a partial wave keeps its missing lanes off), and the LDS size in the
+  kernel descriptor and metadata (`.amdhsa_group_segment_fixed_size`; without it the group gets no LDS). Results go
+  out with `global_store_b32` through the output pointer.
+- **GFX11 spellings** (`hw_oracle/asm.py`, checked by assembling every mnemonic with AMD clang for gfx1030 and
+  gfx1150): `ds_read_*` is `ds_load_*`, `ds_write_*` is `ds_store_*`, `ds_read2[st64]_b32` is
+  `ds_load_2addr[_stride64]_b32`, `ds_write2[st64]_b32` is `ds_store_2addr[_stride64]_b32`, `ds_wrxchg_rtn_b32` is
+  `ds_storexchg_rtn_b32`. The assembler still takes the old names on gfx1150 except `ds_cmpst_rtn_b32`.
+  **`ds_cmpstore_rtn_b32` takes the value to store before the compare value**, the reverse of GFX10's
+  `ds_cmpst_rtn_b32 vdst, vaddr, cmp, store`; llvm-mc encodes both spellings of the same text identically, so only
+  the operand order says which. Unswapped, every program with a `cmpst` failed on gfx1150 (each minimized to that one
+  op); swapped, none does. This is measured on GFX11 only: on gfx12xx the programs with a `cmpst` are skipped with
+  that reason. The model keeps the GFX10 order. Nothing else the generator emits is missing on GFX11, so no other
+  program is skipped for its semantics; an assembler rejection is counted as `rejected`, never as a pass.
+- **Wider op mix**, opt-in so that a seed keeps its programs: `--permute` (`ds_permute_b32`), `--swizzle-exec`
+  (`ds_swizzle_b32` under EXEC masks), `--threads`, `--extended` (all three). `ds_permute_b32` and a masked
+  `ds_swizzle_b32` carry a hypothesis (the model's reading of the ISA text); on the hardware a failing one is a
+  mismatch like any other and counted in `hyp_only`, on the translator it is reported apart as `HYPOTHESIS MISMATCH`.
+  The swizzle hypothesis was falsified at first ("an active lane reads its source lane's register whether or not
+  that lane is on"): gfx1150 returns 0 when the source lane is off in EXEC, as `ds_bpermute` does. The model now
+  says that.
+- **Negative controls.** `--perturb NAME` judges the hardware against a deliberately wrong model (mismatches must
+  appear); `--negative-control` re-judges the words of the run with all 15 (`max_i32` unsigned, `min_u32` signed,
+  swapped `cmpst`, zero-extended `i8`/`i16`, d16 reads clearing the other half, `b16_d16_hi` shift, swapped
+  `write2`, `st64` unit, bpermute reading off lanes or crossing the wave64 halves, reversed quad permute, swapped
+  swizzle or/xor, permute writing no zero) and exits 1 if one goes unnoticed. `--minimize` drops ops while a
+  program still differs, `--keep DIR` writes the native kernel of each mismatch, `--only I,J` runs chosen indices.
+
+Results on a Radeon 880M (gfx1150, RDNA3.5, driver 26.11.2, AMD clang 23.0.0git), `--oracle hw`:
+
+| Programs | Count (wave32 + wave64) | Mismatches |
+| --- | --- | --- |
+| default mix, seeds 1, 2, 3, 11, 21, 31, 41, 100, 200, 2,000 each | 36,000 | 0 |
+| `--extended`, seeds 1, 2, 3, 11, 21, 31, 2,000 each (permute, masked swizzle, groups of 32 to 256) | 24,000 | 0 |
+| seed 1, `--only` the twelve wave32 programs SHADER-105 names (1 18 20 23 24 26 29 30 32 33 34 38) | 12 | 0 |
+
+Negative control (1,000 extended programs): each of the 15 wrong models mismatches on 126 to 547 programs, none goes
+unnoticed. gfx1150 is RDNA3.5,
+not RDNA2: the match supports the model, and RDNA2 itself rests on the ISA text and the translator results on RDNA2
+cards.
+
+With `--oracle translator,hw` on the same Radeon 880M (Vulkan, subgroup 64), seed 1, 100 programs per run: the
+default mix matches the model on the translator, native and emulated (200/200 each). With `--extended` the
+translator differs from the hardware in 22 of 177 programs (native and emulated alike), all in a `ds_swizzle_b32`
+under an EXEC mask whose source lane is off: the translator hands the active lane the source lane's register, the
+hardware gives 0 (the swizzle hypothesis above). So the translator differs from gfx1150 for a masked
+`ds_swizzle_b32` with an off source lane; RDNA2 is unverified. Not fixed here. Partial-wave programs (`--threads` 32
+in wave64) are skipped for the translator, which cannot launch them. NVIDIA was not run.
+
+**Other backends.** The Linux libdrm launcher of #1265 (`tools/hw_oracle/drm.py`) does not run these programs yet:
+it refuses a kernel with LDS and caps the output at 4096 words, and `lds_fuzz` turns that refusal into exit 77
+("unavailable"). RDNA2 results need LDS and a larger word count in that backend first. The numbers above are gfx1150
+only.
+
+**Overlap with #789.** #789 adds `ds_permute_b32` to the default op mix of `lds_fuzz.py`; here it is opt-in
+(`--permute`) so that existing seeds keep their programs. Whichever lands second reconciles the two.
+
+**SHADER-105** (Intel `lds_fuzz` mismatches in DS atomics `max_i32`/`max_u32`, `ds_cmpst`, small reads, and
+registers that kept their initial value): the model matches gfx1150 for every one of those families, under EXEC
+masks, in wave32 and wave64, and in multi-wave groups. The Intel mismatches went away with #820's constant-EXEC fix
+(50/50 native and 100/100 emulated for seeds 1 to 3). `ds_bpermute` (SHADER-31, #253) matches the model on gfx1150
+too, including "an off source lane reads 0" in both wave sizes.
+
 ### Memory instructions (`tools/mem_diff.py`, FUZZ-5)
 
 `cpu_ref.py` has no memory model, so memory instructions get their own runner. `tools/mem_diff.py`

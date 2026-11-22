@@ -16,7 +16,14 @@
 #include "../src/gfx10_descriptors.h"
 #include "../src/vulkan_backend.h"
 
+#include <functional>
+#include <memory>
 #include <span>
+#include <vector>
+
+namespace leonida {
+class VulkanPresenter;
+}
 
 namespace rt::d3d12 {
 
@@ -90,6 +97,7 @@ struct VulkanDeviceInfo {
     // are only zero or non-zero; without pipelineStatisticsQuery, pipeline-statistics query heaps are refused.
     bool occlusion_query_precise = false;
     bool pipeline_statistics_query = false;
+    bool presentation = false;  // VK_KHR_surface + VK_KHR_win32_surface on the instance, VK_KHR_swapchain on the device
     // VK_EXT_image_view_min_lod and its minLod feature are enabled on the logical device.
     bool image_view_min_lod = false;
     // The instance enabled VK_EXT_debug_utils: SetMarker/BeginEvent/EndEvent become debug labels. Otherwise they
@@ -167,6 +175,37 @@ bool queue_uses_calibrated_timestamps(ID3D12CommandQueue* queue);
 // Creates a Vulkan-backed IDXGIFactory4 bound to `device`'s VulkanContext, instance, physical device, and queue.
 // Its CreateSwapChainForHwnd registers swapchain backbuffers directly with the device's VulkanContext.
 HRESULT create_dxgi_factory(ID3D12Device* device, REFIID riid, void** out);
+
+// Puts back buffers of a device from create_vulkan_device* into a window (leonida::VulkanPresenter), for the
+// presentation front end the game uses (DXGI or PresentX, still open). Holds a reference to the device.
+class WindowPresenter {
+public:
+    WindowPresenter(IUnknown* device, std::unique_ptr<leonida::VulkanPresenter> presenter);
+    ~WindowPresenter();
+    WindowPresenter(const WindowPresenter&) = delete;
+    WindowPresenter& operator=(const WindowPresenter&) = delete;
+
+    // `back_buffer` is a colour texture in D3D12's PRESENT state. sync_interval 0 presents without vsync.
+    // S_OK also covers a skipped present while the window is minimised.
+    // `src_rect` (when not null) limits the blit to that part of the texture, which is stretched to the window.
+    HRESULT present(ID3D12Resource* back_buffer, UINT sync_interval, const D3D12_RECT* src_rect = nullptr);
+    // A black frame, nothing read (PresentX with no planes).
+    HRESULT present_blank(UINT sync_interval);
+    // Screenshot support for tests: every presented frame is also copied to host memory (call before presenting).
+    bool enable_capture();
+    // See VulkanPresenter::set_abort: polled while a present waits for a swapchain image.
+    void set_abort(std::function<bool()> abort);
+    bool read_back(std::vector<std::uint8_t>& pixels, VkExtent2D* extent, VkFormat* format);
+    VkExtent2D extent() const;
+    std::uint64_t presented() const;
+
+private:
+    IUnknown* device_;
+    std::unique_ptr<leonida::VulkanPresenter> presenter_;
+};
+
+// Null when `device` is not a Vulkan device created with presentation, or the window cannot be presented to.
+std::unique_ptr<WindowPresenter> create_window_presenter(ID3D12Device* device, HWND window);
 
 // ExecuteCommandLists returns void; this is what the last call on the queue did.
 leonida::ReplayResult last_execute_result(ID3D12CommandQueue* queue);

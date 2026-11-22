@@ -470,6 +470,46 @@ Xbox slots differ, a generic forward-to-PC thunk calls the wrong method. The cur
 (`runtime/shims/d3d12_xs_device.h:1-18`) forwards every unshadowed slot in PC order and logs
 first calls; a wrong slot would therefore be visible as a misnamed call, not a silent success.
 
+Queues and fences are wrapped the same way.
+
+- **What is wrapped.** Device slots 8 (`CreateCommandQueue`), 75 (`CreateCommandQueue1`), 36
+  (`CreateFence`) and 32 (`OpenSharedHandle`, when it opens a fence) return queue and fence proxies. Each
+  proxy forwards the public chain in PC order: 19 queue slots, and 11 or 12 fence slots, in SDK 10.0.26100.
+- **Logging.** Each slot logs its first call. `--trace-d3d12` records every call except `AddRef`/`Release`,
+  as `XboxID3D12CommandQueue::Signal called` or `XboxID3D12Fence::Slot40 unsupported` (the README's trace
+  grammar); on the Vulkan device the layer's own record of the same call follows it. An interface the real
+  object implements but the proxy does not model is logged once and refused.
+- **The refused tail.** A slot past the public chain, up to the end of the proxy's own table (128 queue and
+  64 fence slots, every one a thunk), logs its first four argument words once and returns `E_NOTIMPL`.
+- **The guard region.** Each table sits at the end of the first page of a 64 KiB reservation, and the rest
+  of that reservation is never committed. A slot past the table therefore faults on the vtable read itself,
+  inside the reservation, and a vectored handler logs the slot before the fault goes on. A vtable read that
+  lands beyond the reservation is not caught.
+- **Unwrapping.** Wherever a device or queue method hands a heap, queue or fence object to the real
+  runtime, the proxy passes the real object instead: queue `Signal`/`Wait` (14/15), and device `CreateSharedHandle` (31), `MakeResident`
+  and `Evict` (34/35), `SetEventOnMultipleFenceCompletion` (45), `SetResidencyPriority` (46) and
+  `EnqueueMakeResident` (50).
+- **QueryInterface.** It answers only the modelled interfaces, so no real object reaches the title.
+- **What is not covered.** Command lists are not wrapped yet: `ExecuteCommandLists` passes the lists through,
+  and a heap proxy given to a list's `SetDescriptorHeaps` reaches the real list unchanged. The command-list
+  proxy of §3.5a adds the unwrap at both places.
+
+Which of this is measured: the slot numbers and signatures are the SDK's (public). That the console
+keeps the public queue and fence slots, and device slots 8/32/36/75, is an assumption the package cannot
+test, as above. The proxies make a wrong assumption visible in the log; they do not prove it right.
+`queue_proxy_test` checks all of this with no game files, on the host runtime (WARP and a hardware
+adapter) and on the Vulkan device; `OpenSharedHandle` of a shared fence only on the host runtime, since the
+Vulkan device does not share fences (the test prints "not checked" there). Each error case runs in its own
+process and is compared with the real object's HRESULT. The test also includes a console-style client: it makes a heap through slot 14 (handle in
+RAX) and buffers through slot 76 (layout word 0x1). It then copies through the queue proxy, finishes through
+the fence proxy, reads the data back, and makes residency calls that carry the heap, queue and fence proxies.
+`device_proxy_test` gets its queue and fence through the registered `D3D12XboxCreateDevice` shim.
+
+The package-gated `bvh_builder_test` and `fsr_dispatch_test` stay at `SKIP (no package)` without
+`LEONIDA_GAME_DIR`, and they would not cover these paths if they ran. Neither creates a queue or a fence:
+the BVH builder's constructor calls device slots only, and `fsr_dispatch_test` records into a logging list it
+never executes. Neither DLL calls the device slots the proxies change (§3.5, §3.5a).
+
 The same caveat applies to **return conventions**: the public AMD64 COM convention (HRESULT in
 EAX, `void` methods, out-parameters through pointers, `GetDesc` returning a 16-byte struct by
 value) is what the runtime implements. No Xbox-specific convention on a queue, list, fence or
@@ -532,7 +572,9 @@ than invent slots.
    device slots 8/9/12/36, then queue slots 10/14/15, fence slots 8/9/10, and every slot beyond
    the public chain. The first `PresentX` call and the queue vtable tail are the only way to
    recover the present surface; a DXGI import would make the DXGI path the first
-   implementation instead ([d3d12_vulkan.md §8.2 Q6](d3d12_vulkan.md)).
+   implementation instead ([d3d12_vulkan.md §8.2 Q6](d3d12_vulkan.md)). The counters exist: device,
+   queue and fence proxies count every slot, and the queue and fence tails are logged with their
+   first argument words (§5.2).
 
 Do not fill the unknown slots with guesses. A wrong slot is worse than a clean refusal; the
 existing device proxy already follows that rule (`runtime/shims/d3d12_xs_device.h:16-18`).

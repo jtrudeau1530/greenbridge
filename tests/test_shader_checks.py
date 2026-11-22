@@ -15,6 +15,7 @@ import check
 
 
 GOOD_FMT = struct.pack("<64I", *check.FMT_1010102_WORDS, *[0xEEEEEEEE] * 48)
+GOOD_XY_XYZ = struct.pack("<192I", *check.FMT_XY_XYZ_WORDS, *[0xEEEEEEEE] * 108)
 FULL_WAVE = ((0, "compute subgroup size: 64\n0 mismatches\n"),
              (0, "compute subgroup size: 64\nout[0..7] = 32 16 24 40 8 48 4008636142 4008636142\n"))
 
@@ -26,10 +27,10 @@ PARTIAL = {n for n, _ in check.W64X_PARTIAL}
 WAVE32_WORDS = {n: w for n, w in check.CS_DUMPS if n in check.WAVE32_DUMPS and n not in ("cs_store", "cs_smem_soffset_imm")}
 
 
-# every test check.py runs: compute, cs_wavemask, cs_fmt_1010102, the dumps (#73, #152 cross-half, partial), the three
+# every test check.py runs: compute, cs_wavemask, cs_fmt_1010102, cs_fmt_xy_xyz, the dumps (#73, #152 cross-half, partial), the three
 # vk_store_test checks (cs_imgstore, cs_imgload, cs_imgload_d16), pixel tests, the two-mip draws, the gradient samples and three mesh fixtures (skipped here: build.py
 # does not build mesh shaders)
-TOTAL = (len(check.COMPUTE) + 2 + len(check.CS_DUMPS) + len(check.W64X_DUMPS) + len(check.W64X_PARTIAL) + 3
+TOTAL = (len(check.COMPUTE) + 3 + len(check.CS_DUMPS) + len(check.W64X_DUMPS) + len(check.W64X_PARTIAL) + 3
          + len(check.PIXEL_TESTS) + len(check.CLIP_TESTS) + len(check.BOUNDS) + len(check.GLOBAL_OFFSET)
          + len(check.MIP_TEST_PASSES) + len(check.GRADIENT_TESTS)
          + 9)  # three mesh fixtures, ps_tex, cs_cmpx_class_f32, cs_user_sgprs, cs_cvt_f32_sat, cs_fma_fused and ps_gather_wrap
@@ -54,6 +55,10 @@ class Wave64Checks(unittest.TestCase):
                 if fmt[1] is not None:
                     dump.write_bytes(fmt[1])
                 return fmt[0], "out[0..7] = 0 0 0 0 0 0 0 0\n"   # stdout is not the oracle
+            if name == "cs_fmt_xy_xyz":
+                self.assertEqual((args, env["VKC_OUT_WORDS"]), (("1", "dump"), "192"))
+                Path(env["VKC_DUMP"]).write_bytes(GOOD_XY_XYZ)
+                return 0, "out[0..7] = 0 0 0 0 0 0 0 0\n"
             if name == "cs_user_sgprs":
                 # The seeded words come back only if check.py passed them in VKC_SGPRS.
                 seeded = (env or {}).get("VKC_SGPRS") == check.USER_SGPRS_ENV["VKC_SGPRS"]

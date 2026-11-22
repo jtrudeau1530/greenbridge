@@ -119,16 +119,66 @@ The array is `local bone count × u32`, sorted ascending. Each hash is matched a
 Unresolved hashes are genuinely absent from the ambient table; they should be emitted as
 `bone_0x...` fallbacks, never given invented names.
 
-The vertex skin streams are in the FVF semantic table:
+## Vertex skin streams (ASSET-12)
 
-- Head/legacy head: semantic 20 is four packed `(u16 bone, u16 weight)` pairs; semantic 21 is
-  a second index stream.
-- Body/hands/feet/eyes/undies/jacket/tee: semantic 20 is four `u8` bone indices, semantic 21
-  is four `u8` weights. A zero-weight row falls back to the first valid index.
-- Brabikini: semantic 20 is 16 bytes that do not form `(bone, weight)` pairs and semantic 21
-  has four `u32` indices with no weight bytes. Exported static; a rigid binding would be an
-  invention.
-- Eyecap: no semantic-20 weight stream and no valid palette. Exported static.
+Measured with `tools/skin_streams.py` over every drawable resource that carves out of `packs.rpf`,
+`data.rpf` and `levels.rpf` of the 1.0.2.1 package: the tool walks the same drawable → LOD →
+`grmModel` → geometry chain as the readers above, joins each resource's pages (system pages first,
+then graphics pages, one zlib stream per page) and reads the FVF semantic table, whose per-semantic
+entries are a `u32` stream offset at `fvf + 4*i`, a `u8` element size at `fvf + 0xD0 + i` and a
+`u8` format at `fvf + 0x104 + i` (vertex count = `u32` at `fvf + 0x138` >> 10). A size-0 slot is
+a placeholder with no stream. The candidate scan only starts a resource at a 4096-aligned offset
+with 16 preceding zero bytes — rpf9-explorer's recovery convention — and does not recurse into
+nested archives, so the counts are a floor for the package.
+
+| Layout | Weights (semantic 16/17) | Indices (semantic 20/21) | Meshes | Vertices |
+|---|---|---|---:|---:|
+| 4 influences, 8-bit | 16: `R8G8B8A8_UNORM` | 20: `R8G8B8A8_UINT` | 38,721 | 40,631,019 |
+| 8 influences, 8-bit | 16, 17: `R8G8B8A8_UNORM` | 20, 21: `R8G8B8A8_UINT` | 23,860 | 47,611,935 |
+| 4 influences, packed | 16: `R8G8B8A8_UNORM` | 20: `R32G32B32A32_UINT` | 18,247 | 39,468,907 |
+| 8 influences, packed | 16, 17: `R8G8B8A8_UNORM` | 20, 21: `R32G32B32A32_UINT` | 16,111 | 9,512,230 |
+| rigid, 8-bit | none | 20: `R8_UINT` | 5,364 | 3,606,677 |
+| rigid, 16-bit | none | 20: `R16_UINT` | — | — |
+
+Total: 102,303 skin meshes / 140,830,768 vertices. The meshes split by archive: `packs.rpf`
+45,854 meshes / 60,142,591 vertices, `data.rpf` 3,222 / 3,854,484 (all 4-influence 8-bit),
+`levels.rpf` 53,227 / 76,833,693. No 16-bit index form appears in the top-level streams of these
+three archives; the 16-bit forms were measured (over nested-archive recovery) in the independent
+measurement linked below. The format names are the DXGI equivalents of the measured format bytes —
+28 for the weight slots, 30 for the 8-bit index slots, 3 for the packed index slots, 62 for the
+rigid 8-bit index slot — anchored on the decoded bytes, not on a name table: the 1.0.2.1 FVF
+format byte is not desktop DXGI numbering (desktop `R32G32B32A32_UINT` is 3 but desktop
+`R8G8B8A8_UNORM` is 24, and here it is 28; `R16_UINT` is 56 in desktop DXGI and 57 here, as
+breadbbbb/rpf9-explorer#10 reads it).
+
+Rules the bytes support, validated per mesh against the model's own bone count (`grmModel + 0x14`)
+on a deterministic sample (96 meshes per layout per archive; the census itself covers every mesh):
+
+- **The index is into the model's own bone list.** Every component with a non-zero weight has an
+  index below the local bone count — zero violations in every sampled mesh; a zero-weight
+  component may carry any index, so the check masks by weight.
+- **The weights are the UNORM bytes and sum to 255** over all present weight slots. Every sampled
+  vertex of every layout in `data.rpf` and `levels.rpf`, and of the 8-influence and 8-bit
+  4-influence layouts in `packs.rpf`, sums to exactly 255. The packed 4-influence meshes in
+  `packs.rpf` round: of 50,648 sampled vertices, 31,884 sum to exactly 255, 11,604 to 247–254,
+  and 7,160 fall below 247 (as low as 164).
+- **Packed `R32G32B32A32_UINT`: the bone index is bits 0–11 of each u32.** Bits 9–11 were never
+  set in the sampled meshes; bit 8 appears only where the model has more than 256 bones. Bits
+  12–31 hold a separate, dense, unidentified field (smooth per-vertex values in the high bits —
+  not a weight: the weights are already complete in 16/17).
+- **Rigid meshes carry one index per vertex and no weight slot.**
+- The vertex buffer head carries one native buffer descriptor word per used semantic; every skin
+  slot's stream offset (bits 7–28 of the word) matched its descriptor. The word's size code
+  (bits 3–6) equals the element bytes for the 4- and 8-byte slots, reads 1 for the 16-byte packed
+  index slot and 0 for the 1-byte rigid slot, so only the offset is checked.
+
+This corrects the earlier reading of this section (semantic 20 as packed `(u16 bone, u16 weight)`
+pairs, semantic 21 as weights): semantic 21 is always index-typed, and the weights are the UNORM
+bytes of semantics 16/17. The earlier "16 bytes that do not form `(bone, weight)` pairs" note was
+the packed index layout above. [An independent measurement of the same layouts, over rpf9-explorer
+recovery with the bone-palette pull requests applied, was posted in
+#634](https://github.com/ItsNotRexed/Leonida/issues/634#issuecomment-7074504326); the counts there
+are higher because that recovery also walks nested archives.
 
 ## Texture parameter split
 
@@ -181,8 +231,8 @@ actor assembled from existing components, not a unique `mandy` resource.
 
 ## Reproduction
 
-The measurement tools were local and are not part of this repository. A reader can reproduce
-the numbers with a standard zlib/RPF9 reader:
+Steps 1-4 were measured with local tools that are not part of this repository; a reader can
+reproduce them with a standard zlib/RPF9 reader:
 
 1. Inflate the `.#ft` stream at `0x45449F70`; parse the 4,095-slot hash table and the
    NUL-separated names; verify `joaat32` lowercased.
@@ -190,5 +240,8 @@ the numbers with a standard zlib/RPF9 reader:
    `0x150 + 0x50*i`; read `u16 parent` at +0x06.
 3. For a character `#dr` system page, read `grmModel+0x20`, then the `u32` bone hashes.
 4. Map each hash through step 1; unresolved hashes are hash-only fallbacks.
+5. Run `python -I tools/skin_streams.py <your copy's packs.rpf> [...] --json out.json` for the
+   skin-stream census and validation; `python -I tests/test_skin_streams.py` runs the same walk
+   and the same checks on synthetic resources built by the test.
 
 No archive, model, texture or audio file is stored in the repository or in any test fixture.

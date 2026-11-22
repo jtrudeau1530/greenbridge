@@ -30,6 +30,7 @@ struct SwapchainFunctions {
     PFN_vkGetPhysicalDeviceSurfaceSupportKHR surface_support = nullptr;
     PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR surface_caps = nullptr;
     PFN_vkGetPhysicalDeviceSurfaceFormatsKHR surface_formats = nullptr;
+    PFN_vkGetPhysicalDeviceSurfacePresentModesKHR surface_present_modes = nullptr;
     PFN_vkCreateSwapchainKHR create_swapchain = nullptr;
     PFN_vkDestroySwapchainKHR destroy_swapchain = nullptr;
     PFN_vkGetSwapchainImagesKHR get_images = nullptr;
@@ -65,6 +66,7 @@ struct SwapchainFunctions {
         LOAD_I(surface_support, vkGetPhysicalDeviceSurfaceSupportKHR);
         LOAD_I(surface_caps, vkGetPhysicalDeviceSurfaceCapabilitiesKHR);
         LOAD_I(surface_formats, vkGetPhysicalDeviceSurfaceFormatsKHR);
+        LOAD_I(surface_present_modes, vkGetPhysicalDeviceSurfacePresentModesKHR);
         LOAD_I(mem_props, vkGetPhysicalDeviceMemoryProperties);
         LOAD_D(create_swapchain, vkCreateSwapchainKHR);
         LOAD_D(destroy_swapchain, vkDestroySwapchainKHR);
@@ -139,7 +141,8 @@ public:
     VulkanSwapchain& operator=(const VulkanSwapchain&) = delete;
 
     bool create(HWND hwnd, std::uint32_t width, std::uint32_t height,
-                VkFormat preferred_format = VK_FORMAT_B8G8R8A8_UNORM, std::uint32_t buffer_count = 2) {
+                VkFormat preferred_format = VK_FORMAT_B8G8R8A8_UNORM, std::uint32_t buffer_count = 2,
+                bool allow_tearing = false) {
         if (!loaded_ || !acquire_fence_ || !hwnd) return false;
         if (!surface_) {
             VkWin32SurfaceCreateInfoKHR sci{VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR};
@@ -150,16 +153,18 @@ public:
             if (fn_.surface_support(physical_, queue_family_, surface_, &supported) != VK_SUCCESS || !supported)
                 return false;
         }
+        allow_tearing_ = allow_tearing;
         return rebuild(width, height, preferred_format, buffer_count);
     }
 
     bool resize(std::uint32_t width, std::uint32_t height, VkFormat preferred_format = VK_FORMAT_UNDEFINED,
-                std::uint32_t buffer_count = 0) {
+                std::uint32_t buffer_count = 0, bool allow_tearing = false) {
         if (!loaded_ || !surface_) return false;
         {
             std::lock_guard lock(submit_mutex_);
             fn_.device_wait_idle(device_);
         }
+        allow_tearing_ = allow_tearing;
         const VkFormat fmt = (preferred_format != VK_FORMAT_UNDEFINED) ? preferred_format : format_;
         const std::uint32_t count = buffer_count ? buffer_count : static_cast<std::uint32_t>(images_.size());
         return rebuild(width, height, fmt, count ? count : 2u);
@@ -173,6 +178,15 @@ public:
         if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR) return false;
         if (fn_.wait_for_fences(device_, 1, &acquire_fence_, VK_TRUE, timeout_ns) != VK_SUCCESS) return false;
         current_index_ = out_index;
+        // D3D12 swapchain backbuffers begin in D3D12_RESOURCE_STATE_PRESENT; transition each newly acquired
+        // native swapchain image once from UNDEFINED -> PRESENT_SRC_KHR so presenting an untouched backbuffer
+        // or transitioning from PRESENT matches the tracked layout.
+        if (offscreen_images_.empty() && out_index < image_initialized_.size() && !image_initialized_[out_index]) {
+            if (!transition_image_layout(images_[out_index], VK_IMAGE_LAYOUT_UNDEFINED,
+                                         VK_IMAGE_LAYOUT_PRESENT_SRC_KHR))
+                return false;
+            image_initialized_[out_index] = true;
+        }
         return true;
     }
 
@@ -194,6 +208,8 @@ public:
     std::uint32_t current_back_buffer_index() const { return current_index_; }
     VkFormat format() const { return format_; }
     VkExtent2D extent() const { return extent_; }
+    bool is_offscreen() const { return !offscreen_images_.empty(); }
+    VkPresentModeKHR present_mode() const { return present_mode_; }
     VkImage image(std::uint32_t i) const {
         if (i >= images_.size()) return VK_NULL_HANDLE;
         return !offscreen_images_.empty() ? offscreen_images_[i] : images_[i];
@@ -215,6 +231,35 @@ public:
     }
 
 private:
+    bool transition_image_layout(VkImage img, VkImageLayout old_layout, VkImageLayout new_layout) {
+        if (!blit_cmd_ || !blit_fence_ || !img) return false;
+        std::lock_guard lock(submit_mutex_);
+        if (fn_.reset_fences(device_, 1, &blit_fence_) != VK_SUCCESS ||
+            fn_.reset_cmd_buf(blit_cmd_, 0) != VK_SUCCESS)
+            return false;
+        VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+        bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        if (fn_.begin_cmd_buf(blit_cmd_, &bi) != VK_SUCCESS) return false;
+        VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        barrier.srcAccessMask = 0;
+        barrier.dstAccessMask =
+            (new_layout == VK_IMAGE_LAYOUT_PRESENT_SRC_KHR) ? 0 : (VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
+        barrier.oldLayout = old_layout;
+        barrier.newLayout = new_layout;
+        barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.image = img;
+        barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        fn_.cmd_barrier(blit_cmd_, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0,
+                        nullptr, 0, nullptr, 1, &barrier);
+        if (fn_.end_cmd_buf(blit_cmd_) != VK_SUCCESS) return false;
+        VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+        si.commandBufferCount = 1;
+        si.pCommandBuffers = &blit_cmd_;
+        return fn_.queue_submit(queue_, 1, &si, blit_fence_) == VK_SUCCESS &&
+               fn_.wait_for_fences(device_, 1, &blit_fence_, VK_TRUE, UINT64_MAX) == VK_SUCCESS;
+    }
+
     void destroy_offscreen() {
         for (VkImage img : offscreen_images_)
             if (img) fn_.destroy_image(device_, img, nullptr);
@@ -291,6 +336,48 @@ private:
             }
             offscreen_images_.push_back(img);
             offscreen_memory_.push_back(mem);
+        }
+        // Transition newly created offscreen backbuffers to GENERAL so presenting an untouched buffer
+        // never violates blit_to_swapchain's GENERAL -> TRANSFER_SRC_OPTIMAL transition.
+        if (blit_cmd_ && blit_fence_ && !offscreen_images_.empty()) {
+            std::lock_guard lock(submit_mutex_);
+            if (fn_.reset_fences(device_, 1, &blit_fence_) != VK_SUCCESS ||
+                fn_.reset_cmd_buf(blit_cmd_, 0) != VK_SUCCESS) {
+                destroy_offscreen();
+                return false;
+            }
+            VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+            bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+            if (fn_.begin_cmd_buf(blit_cmd_, &bi) != VK_SUCCESS) {
+                destroy_offscreen();
+                return false;
+            }
+            std::vector<VkImageMemoryBarrier> barriers(offscreen_images_.size());
+            for (std::size_t i = 0; i < offscreen_images_.size(); ++i) {
+                barriers[i].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+                barriers[i].srcAccessMask = 0;
+                barriers[i].dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+                barriers[i].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+                barriers[i].newLayout = VK_IMAGE_LAYOUT_GENERAL;
+                barriers[i].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                barriers[i].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                barriers[i].image = offscreen_images_[i];
+                barriers[i].subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            }
+            fn_.cmd_barrier(blit_cmd_, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0,
+                            nullptr, 0, nullptr, static_cast<std::uint32_t>(barriers.size()), barriers.data());
+            if (fn_.end_cmd_buf(blit_cmd_) != VK_SUCCESS) {
+                destroy_offscreen();
+                return false;
+            }
+            VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+            si.commandBufferCount = 1;
+            si.pCommandBuffers = &blit_cmd_;
+            if (fn_.queue_submit(queue_, 1, &si, blit_fence_) != VK_SUCCESS ||
+                fn_.wait_for_fences(device_, 1, &blit_fence_, VK_TRUE, UINT64_MAX) != VK_SUCCESS) {
+                destroy_offscreen();
+                return false;
+            }
         }
         return true;
     }
@@ -398,6 +485,24 @@ private:
         std::uint32_t count = std::max(buffer_count, caps.minImageCount);
         if (caps.maxImageCount > 0) count = std::min(count, caps.maxImageCount);
 
+        VkPresentModeKHR chosen_present_mode = VK_PRESENT_MODE_FIFO_KHR;
+        if (allow_tearing_ && fn_.surface_present_modes) {
+            std::uint32_t mode_count = 0;
+            if (fn_.surface_present_modes(physical_, surface_, &mode_count, nullptr) == VK_SUCCESS && mode_count > 0) {
+                std::vector<VkPresentModeKHR> modes(mode_count);
+                if (fn_.surface_present_modes(physical_, surface_, &mode_count, modes.data()) == VK_SUCCESS) {
+                    bool has_immediate = false;
+                    bool has_mailbox = false;
+                    for (VkPresentModeKHR m : modes) {
+                        if (m == VK_PRESENT_MODE_IMMEDIATE_KHR) has_immediate = true;
+                        if (m == VK_PRESENT_MODE_MAILBOX_KHR) has_mailbox = true;
+                    }
+                    if (has_immediate) chosen_present_mode = VK_PRESENT_MODE_IMMEDIATE_KHR;
+                    else if (has_mailbox) chosen_present_mode = VK_PRESENT_MODE_MAILBOX_KHR;
+                }
+            }
+        }
+
         VkSwapchainCreateInfoKHR ci{VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR};
         ci.surface = surface_;
         ci.minImageCount = count;
@@ -411,7 +516,7 @@ private:
         ci.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
         ci.preTransform = caps.currentTransform;
         ci.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
-        ci.presentMode = VK_PRESENT_MODE_FIFO_KHR;
+        ci.presentMode = chosen_present_mode;
         ci.clipped = VK_TRUE;
         ci.oldSwapchain = swapchain_;
 
@@ -420,6 +525,7 @@ private:
         if (swapchain_) fn_.destroy_swapchain(device_, swapchain_, nullptr);
         destroy_offscreen();
         swapchain_ = next;
+        present_mode_ = chosen_present_mode;
         format_ = (preferred_format != VK_FORMAT_UNDEFINED) ? preferred_format : chosen.format;
         surface_extent_ = ext;
         extent_ = (width > 0 && height > 0) ? VkExtent2D{width, height} : ext;
@@ -428,6 +534,7 @@ private:
         fn_.get_images(device_, swapchain_, &img_count, nullptr);
         images_.resize(img_count);
         fn_.get_images(device_, swapchain_, &img_count, images_.data());
+        image_initialized_.assign(img_count, false);
         if (extent_.width != surface_extent_.width || extent_.height != surface_extent_.height ||
             format_ != chosen.format) {
             if (!create_offscreen_backbuffers(img_count)) return false;
@@ -451,9 +558,12 @@ private:
     VkCommandPool blit_pool_ = VK_NULL_HANDLE;
     VkCommandBuffer blit_cmd_ = VK_NULL_HANDLE;
     VkFormat format_ = VK_FORMAT_UNDEFINED;
+    VkPresentModeKHR present_mode_ = VK_PRESENT_MODE_FIFO_KHR;
+    bool allow_tearing_ = false;
     VkExtent2D surface_extent_{0, 0};
     VkExtent2D extent_{0, 0};
     std::vector<VkImage> images_;
+    std::vector<bool> image_initialized_;
     std::vector<VkImage> offscreen_images_;
     std::vector<VkDeviceMemory> offscreen_memory_;
     std::uint32_t current_index_ = 0;

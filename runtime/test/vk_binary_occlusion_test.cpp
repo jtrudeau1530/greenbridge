@@ -170,7 +170,8 @@ int run(vktest::Device& d, const char* vertex, const char* fragment) {
     constexpr ResourceId destination_id = 3, predicate_id = 4, misaligned_id = 5;
     constexpr VkDeviceSize binding_offset = 24, range_offset = 16, result_size = sizeof(std::uint64_t);
     constexpr VkDeviceSize ordinary_offset = range_offset + (last_gap + 2) * result_size;
-    constexpr VkDeviceSize rerun_offset = ordinary_offset + 2 * result_size;
+    constexpr VkDeviceSize ordinary_zero_offset = ordinary_offset + 2 * result_size;
+    constexpr VkDeviceSize rerun_offset = ordinary_zero_offset + 2 * result_size;
     constexpr VkDeviceSize bytes = binding_offset + rerun_offset + 6 * result_size;
     void* mapped = nullptr;
     const VkBuffer dst = d.buffer(bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT, &mapped);
@@ -209,6 +210,8 @@ int run(vktest::Device& d, const char* vertex, const char* fragment) {
                                    range_offset}));
     EXPECT(binary.resolve_queries({query_id, d3d12_query::occlusion, ordinary_index, 1, destination_id,
                                    ordinary_offset}));
+    // An ordinary un-ended query zeroed via vkCmdFillBuffer must also run unconditionally under a false predicate.
+    EXPECT(binary.resolve_queries({query_id, d3d12_query::occlusion, 0, 1, destination_id, ordinary_zero_offset}));
     EXPECT(copy_control.record(binary));
     EXPECT(binary.close());
     CommandList rerun;
@@ -235,6 +238,8 @@ int run(vktest::Device& d, const char* vertex, const char* fragment) {
             expected = index >= first_visible && index < last_gap ? 1 : 0;
         } else if (offset == binding_offset + ordinary_offset) {
             expected = raw;
+        } else if (offset == binding_offset + ordinary_zero_offset) {
+            expected = 0;
         } else if (offset >= rerun_begin && offset < rerun_begin + 3 * result_size) {
             expected = 1;
         }
