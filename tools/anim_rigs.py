@@ -35,6 +35,8 @@ def block_tables(s, at):
     bytes between them. Returns (version, length, [(kind, count)])."""
     if s.d[at:at + 3] != MAGIC:
         raise anim_clips.DecodeError(f"no RIG block at 0x{at:x}")
+    if at + 8 > len(s.d):
+        raise anim_clips.DecodeError(f"truncated RIG block at 0x{at:x}")
     version, length = s.d[at + 3], s.u32(at + 4)
     end = min(len(s.d), at + 8 + length)
     o, tables = at + 8, []

@@ -118,6 +118,25 @@ class RigDictionaryTest(unittest.TestCase):
         self.assertEqual(summary["counts"]["rig_dictionaries_unparsed"], 1)
         self.assertIn("no RIG block", dicts[0]["error"])
 
+    def test_truncated_rig_header_is_reported_not_raised(self):
+        p = Page()
+        pm = p.alloc(bytes(16))
+        p.b[pm + 8], p.b[pm + 9] = 1, 0
+        p.ptr(8, pm)
+        p.string(0x38, "src@trunc")
+        struct.pack_into("<I", p.b, 0x68, joaat32("src@trunc"))
+        p.b[0x70:0x74] = MAGIC_V(2)
+        value = p.alloc(bytes(0x90))
+        p.atmap(0x48, [(joaat32("anim/rig/b"), value)])
+        at = len(p.b)
+        p.b += b"RIG"  # ends immediately after b"RIG", before the version byte
+        p.ptr(value + 0x20, at)
+        rpf = os.path.join(self.tmp.name, "trunc.rpf")
+        write_rpf(rpf, [bytes(p.b)])
+        dicts, summary = anim_rigs.scan(rpf)
+        self.assertEqual(summary["counts"]["rig_dictionaries_unparsed"], 1)
+        self.assertIn("truncated RIG block", dicts[0]["error"])
+
     def test_cli_writes_counts_only(self):
         out = os.path.join(self.tmp.name, "out.json")
         r = subprocess.run([sys.executable, "-I", TOOL, self.rpf, out, "--rigs", self.rigs],
