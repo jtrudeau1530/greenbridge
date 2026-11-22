@@ -754,7 +754,7 @@ def _bc6h_blocks(lanes, nblocks, provisional, *, history=None):
     """
     if len(lanes[0]) != 2 * nblocks:
         raise BcpackError("BC6H lane length does not match the block count")
-    eh_table, ih_table, eclass, iclass = _bptc.load_bc6h(history)
+    eh_table, ih_table, eclass, iclass, ep_cb, ix_cb = _bptc.load_bc6h(history, with_confirmed_bits=True)
     anchor2 = _bptc.BC7_ANCHOR2
     out = bytearray(nblocks * 16)
     st_e = [None] * nblocks
@@ -763,6 +763,8 @@ def _bc6h_blocks(lanes, nblocks, provisional, *, history=None):
     iroot = [-1] * nblocks
     ends = {}
     idxs = {}
+    weak_e = set()
+    weak_i = set()
     violations = 0
     l0, l1, l15 = lanes[0], lanes[1], lanes[15]
     deint0, deint1 = _DEINT
@@ -788,6 +790,14 @@ def _bc6h_blocks(lanes, nblocks, provisional, *, history=None):
             entry = 256 + i - de
             eref = eh_table[entry]
             eroot[i] = entry
+            # Only direct initial-history reads consume the calibrated bits.
+            # Later blocks read the reconstructed state, whose truncation and
+            # zero padding are determined by this block's mode and deltas.
+            for c in range(3):
+                dc = deltas[c]
+                need = (base, dc, dc, dc) if reg == 2 else (base, dc, 0, 0)
+                if any(ep_cb[entry][c][q] < n for q, n in enumerate(need)):
+                    weak_e.add(entry)
         if eroot[i] >= 0:
             r = eroot[i]
             ends[r] = ends.get(r, 0) + 1
@@ -801,6 +811,8 @@ def _bc6h_blocks(lanes, nblocks, provisional, *, history=None):
             entry = 256 + i - di
             iref = ih_table[entry]
             iroot[i] = entry
+            if any(b < (3 if reg == 2 else 4) for b in ix_cb[entry]):
+                weak_i.add(entry)
         if iroot[i] >= 0:
             r = iroot[i]
             idxs[r] = idxs.get(r, 0) + 1
@@ -877,8 +889,8 @@ def _bc6h_blocks(lanes, nblocks, provisional, *, history=None):
         out[16 * i:16 * i + 16] = acc.to_bytes(16, "little")
 
     if provisional is None:
-        unconf_e = [k for k in ends if eclass[k] != 3]
-        unconf_i = [k for k in idxs if iclass[k] != 3]
+        unconf_e = [k for k in ends if eclass[k] != 3 or k in weak_e]
+        unconf_i = [k for k in idxs if iclass[k] != 3 or k in weak_i]
         if unconf_e or unconf_i:
             k = unconf_e[0] if unconf_e else unconf_i[0]
             kind = "endpoint" if unconf_e else "index"
@@ -913,6 +925,10 @@ def _bc6h_blocks(lanes, nblocks, provisional, *, history=None):
         provisional.add(f"BC6H unknown history {', '.join(missing)} ({lost} blocks)")
     if violations:
         provisional.add(f"BC6H anchor index inconsistent in {violations} pixels")
+    for kind, entries, cls in (("endpoint", weak_e, eclass), ("index", weak_i, iclass)):
+        for k in sorted(entries):
+            if cls[k] == 3:
+                provisional.add(f"BC6H {kind} history {k} (unconfirmed bits)")
     for name, entries, cls in (("endpoint", ends, eclass), ("index", idxs, iclass)):
         fitted = sorted(k for k in entries if cls[k] == 1)
         rough = sorted(k for k in entries if cls[k] == 2)

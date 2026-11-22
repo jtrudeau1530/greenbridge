@@ -885,7 +885,15 @@ generated JSON file or directory (`bc6h.json` / `bc7.json`, e.g. from
 - **BC6H JSON schema (`bc6h.json` or `"bc6h"` key):** `endpointHistory` (256-list or
   index-keyed dict of `3×4` ints), `indexHistory` (16 ints), `endpointClass` and
   `indexClass` (`0` = unknown, `1` = fitted/provisional, `2` = last-resort, `3` =
-  confirmed).
+  reference-confirmed at the recorded precision). Optional `endpointConfirmedBits`
+  (`3×4` leading-bit counts, bounded by `16,10,6,6` per channel) and
+  `indexConfirmedBits` (16 leading-bit counts, each `0..4`) use the same 256-list
+  or index-keyed dict forms. Strict decoding requires class 3 and enough confirmed
+  bits for every field the mode reads; provisional decoding labels insufficient
+  precision. Omitted rows in an explicit depth table confirm no bits. Without a
+  depth table, legacy class-3 entries retain full precision. Regenerate older
+  calibration outputs to record their actual precision: exact references confirm
+  only the bits their modes observe, including three-bit versus four-bit indices.
 - **BC7 JSON schema (`bc7.json` or `"bc7"` key):** `historyEndpoints`,
   `historyEndpointBits`, `historyEndpointConfirmedBits` (24 ints or `[3][2][4]`),
   `historyIndices`, `historyIndexBits`, `historyIndexConfirmedBits` (32 ints or `[2][16]`),
