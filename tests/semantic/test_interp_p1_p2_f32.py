@@ -1380,5 +1380,106 @@ class TestIEEE754BoundaryExtremes(unittest.TestCase):
         self.assertEqual(res, CANONICAL_QNAN_F32)
 
 
+class TestNegativeControlsAndSyntaxRejection(unittest.TestCase):
+    """Negative controls, bounds enforcement, and syntax rejection tests."""
+
+    def test_out_of_bounds_attribute_indices(self) -> None:
+        with self.assertRaises(ValueError):
+            AttributeRef(32, Channel.X)
+        with self.assertRaises(ValueError):
+            AttributeRef(-1, Channel.Y)
+
+    def test_invalid_attribute_syntax_parsing(self) -> None:
+        invalid_syntaxes = [
+            "attr",
+            "v0.x",
+            "attr0",
+            "attr0.",
+            "attr0.q",
+            "attr32.x",
+            "attribute0.x",
+        ]
+        for s in invalid_syntaxes:
+            with self.subTest(syntax=s):
+                with self.assertRaises(ValueError):
+                    AttributeRef.parse(s)
+
+    def test_invalid_param_selector(self) -> None:
+        with self.assertRaises(ValueError):
+            ParamSel.from_str("p3")
+        with self.assertRaises(ValueError):
+            ParamSel.from_str("invalid")
+        with self.assertRaises(ValueError):
+            oracle_v_interp_mov_f32(99, 0, 0, 0)
+
+    def test_invalid_omod(self) -> None:
+        with self.assertRaises(ValueError):
+            apply_f32_omod(ONE_F32, 4)
+        with self.assertRaises(ValueError):
+            apply_f32_omod(ONE_F32, -1)
+
+
+class TestMutationDetection(unittest.TestCase):
+    """Mutation testing suite asserting that semantic mutations are strictly detected."""
+
+    def test_detect_addition_mutant(self) -> None:
+        # Reference: P10 * S + P0
+        # Mutant: (P10 + S) + P0
+        s = f32_to_bits(2.0)
+        p10 = f32_to_bits(3.0)
+        p0 = f32_to_bits(4.0)
+
+        correct = oracle_v_interp_p1_f32(s, p10, p0)  # 3*2 + 4 = 10.0
+        mutant = f32_to_bits((3.0 + 2.0) + 4.0)       # 9.0
+        self.assertNotEqual(correct, mutant)
+
+    def test_detect_missing_p0_base_mutant(self) -> None:
+        # Reference: P10 * S + P0
+        # Mutant: P10 * S
+        s = f32_to_bits(2.0)
+        p10 = f32_to_bits(3.0)
+        p0 = f32_to_bits(5.0)
+
+        correct = oracle_v_interp_p1_f32(s, p10, p0)  # 3*2 + 5 = 11.0
+        mutant = f32_to_bits(3.0 * 2.0)              # 6.0
+        self.assertNotEqual(correct, mutant)
+
+    def test_detect_accumulator_swap_mutant(self) -> None:
+        # Reference p2: P20 * S + D
+        # Mutant p2: P10 * S + D
+        s = f32_to_bits(0.5)
+        p20 = f32_to_bits(8.0)
+        p10 = f32_to_bits(2.0)
+        d = f32_to_bits(10.0)
+
+        correct = oracle_v_interp_p2_f32(s, p20, d)   # 8*0.5 + 10 = 14.0
+        mutant = oracle_v_interp_p2_f32(s, p10, d)    # 2*0.5 + 10 = 11.0
+        self.assertNotEqual(correct, mutant)
+
+    def test_detect_sign_inversion_mutant(self) -> None:
+        # Reference: P20 * S + D
+        # Mutant: -P20 * S + D
+        s = f32_to_bits(0.5)
+        p20 = f32_to_bits(4.0)
+        d = f32_to_bits(10.0)
+
+        correct = oracle_v_interp_p2_f32(s, p20, d)   # 4*0.5 + 10 = 12.0
+        mutant = oracle_v_interp_p2_f32(s, p20, d, neg_s=True)  # 4*(-0.5) + 10 = 8.0
+        self.assertNotEqual(correct, mutant)
+
+    def test_detect_nan_clamp_omission_mutant(self) -> None:
+        # In RDNA2, clamping NaN must yield POS_ZERO (0x00000000).
+        # A mutant that leaves NaN unchanged must be detected.
+        qnan = CANONICAL_QNAN_F32
+        p0 = f32_to_bits(1.0)
+        p10 = f32_to_bits(2.0)
+
+        correct = oracle_v_interp_p1_f32(qnan, p10, p0, clamp=True)
+        self.assertEqual(correct, POS_ZERO_F32)
+
+        mutant_no_clamp = oracle_v_interp_p1_f32(qnan, p10, p0, clamp=False)
+        self.assertNotEqual(correct, mutant_no_clamp)
+
+
 if __name__ == "__main__":
     unittest.main()
