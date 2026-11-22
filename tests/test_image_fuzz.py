@@ -79,6 +79,38 @@ def test_tsharp_word1_carries_the_format_and_the_size():
         assert tsharp[2] == 7 | (15 << 16)
 
 
+def test_compare_distinguishes_signed_zero():
+    """Vonsek's case: +0 where -0 is expected must be a mismatch, with the pixel's coordinates."""
+    width = height = 8
+    texels = b"".join(struct.pack("<4f", -0.0, 0.25, 0.5, 1.0) for _ in range(width * height))
+    expected = imf.oracle("R32G32B32A32_SFLOAT", texels, width, height)
+    got = []
+    for y in range(imf.DRAW):
+        for x in range(imf.DRAW):
+            tx, ty = imf.texel_of_pixel(x, y, width, height)
+            got.extend(expected[ty * width + tx])
+    assert imf.compare("R32G32B32A32_SFLOAT", texels, width, height, got) == []
+    got[(7 * imf.DRAW + 5) * 4] = 0.0  # the same texel, red +0 instead of -0
+    problems = imf.compare("R32G32B32A32_SFLOAT", texels, width, height, got)
+    assert [(p[0], p[1]) for p in problems] == [(5, 7)]
+
+
+def test_compare_treats_any_nan_as_equal():
+    """The bit comparison keeps the old policy: NaN payloads are not modelled."""
+    width = height = 8
+    texels = b"".join(struct.pack("<4f", float("nan"), 1.0, 2.0, 3.0) for _ in range(width * height))
+    expected = imf.oracle("R32G32B32A32_SFLOAT", texels, width, height)
+    other_nan = struct.unpack("<f", struct.pack("<I", 0x7FC00001))[0]
+    got = []
+    for y in range(imf.DRAW):
+        for x in range(imf.DRAW):
+            tx, ty = imf.texel_of_pixel(x, y, width, height)
+            value = list(expected[ty * width + tx])
+            value[0] = other_nan
+            got.extend(value)
+    assert imf.compare("R32G32B32A32_SFLOAT", texels, width, height, got) == []
+
+
 def test_self_test_runs():
     r = subprocess.run([sys.executable, "-I", os.path.join(ROOT, "tools", "image_fuzz.py"), "--self-test"],
                        capture_output=True, text=True)

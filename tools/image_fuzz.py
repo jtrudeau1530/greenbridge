@@ -158,6 +158,22 @@ def read_rgba(path: str) -> list:
     return list(struct.unpack(f"<{DRAW * DRAW * 4}f", data))
 
 
+def same_component(a: float, b: float) -> bool:
+    """Bit equality of two f32 values, except that any NaN matches any NaN.
+
+    Ordinary float equality would hide a wrong binding that returns -0 where +0 is expected (and the reverse):
+    +0.0 == -0.0 is true in Python, but the 32-bit words differ and a texture fetch must preserve the sign.
+    """
+    packed_a, packed_b = struct.pack("<f", a), struct.pack("<f", b)
+    if packed_a == packed_b:
+        return True
+    bits_a = struct.unpack("<I", packed_a)[0]
+    bits_b = struct.unpack("<I", packed_b)[0]
+    nan_a = (bits_a & 0x7F800000) == 0x7F800000 and bits_a & 0x007FFFFF
+    nan_b = (bits_b & 0x7F800000) == 0x7F800000 and bits_b & 0x007FFFFF
+    return bool(nan_a and nan_b)
+
+
 def compare(fmt_name, texels, width, height, got) -> list:
     expected = oracle(fmt_name, texels, width, height)
     problems = []
@@ -167,7 +183,7 @@ def compare(fmt_name, texels, width, height, got) -> list:
             want = expected[ty * width + tx]
             base = (y * DRAW + x) * 4
             have = got[base:base + 4]
-            if all(have[c] == want[c] or (have[c] != have[c] and want[c] != want[c]) for c in range(4)):
+            if all(same_component(have[c], want[c]) for c in range(4)):
                 continue
             problems.append((x, y, want, have))
             if len(problems) >= 6:
