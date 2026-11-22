@@ -305,6 +305,19 @@ class TestManifestVerifier(unittest.TestCase):
         with self.assertRaises(mv.ManifestError):
             mv.load_manifest(invalid_entries)
 
+    def test_cli_rejects_malformed_sha256_digests(self) -> None:
+        for digest in ("a" * 63, "a" * 65, "g" * 64):
+            for entry in (digest, {"size": len(self.payloads["alpha.bin"]), "sha256": digest}):
+                with self.subTest(digest=digest, entry=entry):
+                    with open(self.manifest_path, "w", encoding="utf-8", newline="\n") as f:
+                        json.dump({"files": {"alpha.bin": entry}}, f)
+                    result = self.run_cli(self.game_dir, "--manifest", self.manifest_path, "--json")
+                    self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                    self.assertEqual(result.stdout, "")
+                    self.assertIn(self.manifest_path, result.stderr)
+                    self.assertIn("alpha.bin", result.stderr)
+                    self.assertIn("64 hexadecimal characters", result.stderr)
+
     def test_verify_target_dir_missing(self) -> None:
         with self.assertRaises(mv.ManifestError):
             mv.verify_manifest(os.path.join(self.root, "missing_dir"), self.manifest_path)
