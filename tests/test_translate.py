@@ -977,6 +977,26 @@ def test_irreducible_cfg_node_splitting(pattern, make_shader, monkeypatch):
     assert "OpSwitch" not in spv_struct
 
 
+def test_deep_structured_nesting_uses_the_dispatch_loop(make_shader, monkeypatch):
+    """SHADER-299: a tree nested deeper than MAX_STRUCTURED_DEPTH is emitted in the flat dispatch-loop form, which
+    validates at the same depth in a fraction of the time; raising the bound brings the structured form back."""
+    n = rdna2spirv.MAX_STRUCTURED_DEPTH + 8
+    body = "".join(f"s_cmp_eq_u32 s0, {i}\ns_cbranch_scc0 {3 + 2 * (n - i - 1)}\n" for i in range(n))
+    shader = make_shader(body + "v_mov_b32 v8, s0\nexp mrt0 v8, v8, v8, v8 done vm\ns_endpgm\n",
+                         name="ps_nesting_bound")
+    asm = shader.translate()
+    shader.validate(asm)
+    gen = rdna2spirv.translate.last_gen
+    assert gen.nesting > rdna2spirv.MAX_STRUCTURED_DEPTH
+    assert gen.control_flow == "dispatch loop" and "OpSwitch %pcv" in asm
+
+    monkeypatch.setattr(rdna2spirv, "MAX_STRUCTURED_DEPTH", gen.nesting)
+    structured = shader.translate()
+    shader.validate(structured)
+    assert rdna2spirv.translate.last_gen.control_flow == "structured"
+    assert "OpSwitch" not in structured
+
+
 MASK_REUSE_HEAD = "; mattr: +wavefrontsize64,-wavefrontsize32\nv_mbcnt_lo_u32_b32 v1, -1, 0\nv_mbcnt_hi_u32_b32 v1, -1, v1\n"
 
 
