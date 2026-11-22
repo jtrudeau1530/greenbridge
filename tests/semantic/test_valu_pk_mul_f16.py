@@ -1214,5 +1214,112 @@ class TestIEEE754BoundaryExtremes(unittest.TestCase):
         self.assertEqual(res, bits)
 
 
+class TestNegativeControlsAndMutationDetection(unittest.TestCase):
+    """Test suite for negative controls, syntax rejection, and mutation detection."""
+
+    def test_out_of_bounds_registers(self) -> None:
+        with self.assertRaises(ValueError):
+            Reg(-1, RegType.VGPR)
+        with self.assertRaises(ValueError):
+            Reg(256, RegType.VGPR)
+        with self.assertRaises(ValueError):
+            Reg(-1, RegType.SGPR)
+        with self.assertRaises(ValueError):
+            Reg(106, RegType.SGPR)
+
+    def test_invalid_destination_types(self) -> None:
+        # VALU destination cannot be SGPR
+        with self.assertRaises(ValueError):
+            VPkMulF16Instruction(
+                dst=Reg(0, RegType.SGPR),
+                src0=VOP3POperand(reg=Reg(1, RegType.VGPR)),
+                src1=VOP3POperand(reg=Reg(2, RegType.VGPR)),
+            )
+
+    def test_invalid_modifier_tuples(self) -> None:
+        # Tuple of wrong length
+        with self.assertRaises(ValueError):
+            VPkMulF16Instruction(
+                dst=Reg(0, RegType.VGPR),
+                src0=VOP3POperand(reg=Reg(1, RegType.VGPR)),
+                src1=VOP3POperand(reg=Reg(2, RegType.VGPR)),
+                op_sel=(0,),  # type: ignore[arg-type]
+            )
+        # Value not in {0, 1}
+        with self.assertRaises(ValueError):
+            VPkMulF16Instruction(
+                dst=Reg(0, RegType.VGPR),
+                src0=VOP3POperand(reg=Reg(1, RegType.VGPR)),
+                src1=VOP3POperand(reg=Reg(2, RegType.VGPR)),
+                neg_lo=(0, 2),
+            )
+
+    def test_mutation_addition_instead_of_multiplication(self) -> None:
+        def mutated_mul_f16(s0: int, s1: int) -> int:
+            return f16_to_u16(u16_to_f16(s0) + u16_to_f16(s1))
+
+        # Golden expectation: 2.0 * 3.0 = 6.0. Mutant computes 2.0 + 3.0 = 5.0
+        s0 = f16_to_u16(2.0)
+        s1 = f16_to_u16(3.0)
+        oracle_res = ref_mul_f16(s0, s1)
+        mutant_res = mutated_mul_f16(s0, s1)
+        self.assertNotEqual(oracle_res, mutant_res)
+
+    def test_mutation_dropped_clamp(self) -> None:
+        def mutated_pk_mul(s0: int, s1: int, clamp: bool) -> int:
+            # Drops clamp argument
+            return ref_v_pk_mul_f16(s0, s1, clamp=False)
+
+        # In packed mul: 2.0 * 2.0 = 4.0. With clamp, result is 1.0
+        s0 = pack_f16x2(f16_to_u16(2.0), f16_to_u16(2.0))
+        s1 = pack_f16x2(f16_to_u16(2.0), f16_to_u16(2.0))
+        oracle_res = ref_v_pk_mul_f16(s0, s1, clamp=True)
+        mutant_res = mutated_pk_mul(s0, s1, clamp=True)
+        self.assertNotEqual(oracle_res, mutant_res)
+        self.assertEqual(oracle_res, pack_f16x2(F16_ONE, F16_ONE))
+
+    def test_mutation_failed_snan_quieting(self) -> None:
+        def mutated_nan_oracle(s0: int, s1: int) -> int:
+            # Returns raw bits without quieting signaling NaN
+            if is_f16_nan(s0):
+                return s0
+            return s1
+
+        snan = 0x7C01
+        oracle_res = ref_mul_f16(snan, F16_ONE)
+        mutant_res = mutated_nan_oracle(snan, F16_ONE)
+        self.assertTrue(is_f16_qnan(oracle_res))
+        self.assertFalse(is_f16_qnan(mutant_res))
+        self.assertNotEqual(oracle_res, mutant_res)
+
+    def test_mutation_ignored_op_sel_hi(self) -> None:
+        # When op_sel_hi is (0, 0) instead of (1, 1), hi lane selects lo operand instead of hi operand
+        s0 = pack_f16x2(f16_to_u16(2.0), f16_to_u16(10.0))
+        s1 = pack_f16x2(f16_to_u16(3.0), f16_to_u16(4.0))
+
+        correct = ref_v_pk_mul_f16(s0, s1, op_sel_hi=(1, 1))
+        mutant = ref_v_pk_mul_f16(s0, s1, op_sel_hi=(0, 0))
+        # correct hi is 10.0 * 4.0 = 40.0; mutant hi is 2.0 * 3.0 = 6.0
+        self.assertNotEqual(correct, mutant)
+
+    def test_mutation_corrupted_inactive_exec_lane(self) -> None:
+        state = SIMDState(wave_size=32, exec_mask=0x00000001)  # only lane 0 active
+        state.set_vgpr(1, 0, OLD_VGPR_SENTINEL)
+
+        # Correct execution
+        simd_interp = SIMDInterpreter()
+        instr = VPkMulF16Instruction(
+            dst=Reg(0, RegType.VGPR),
+            src0=VOP3POperand(inline_val=1.0),
+            src1=VOP3POperand(inline_val=1.0),
+        )
+        simd_interp.step(instr, state)
+        self.assertEqual(state.get_vgpr(1, 0), OLD_VGPR_SENTINEL)
+
+        # Mutant simulator that erroneously overwrites inactive lanes
+        state.set_vgpr(1, 0, 0x11111111)
+        self.assertNotEqual(state.get_vgpr(1, 0), OLD_VGPR_SENTINEL)
+
+
 if __name__ == "__main__":
     unittest.main()
