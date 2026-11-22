@@ -1601,6 +1601,44 @@ Hardware validation was executed via `tools/hw_oracle` and `tools/salu_diff.py` 
 - **Constant operands under `op_sel` / `op_sel_hi`:** Integer constants under VOP3P are uniformly treated as 32-bit dwords `C`. When `op_sel[i] == 0`, bits `[15:0]` are selected; when `op_sel[i] == 1`, bits `[31:16]` are selected. Positive inline constants zero-extend (`5` → `0x00000005`: lo=`0x0005`, hi=`0x0000`; `64` → `0x00000040`: lo=`0x0040`, hi=`0x0000`). Negative inline constants sign-extend (`-1` → `0xFFFFFFFF`: lo=`0xFFFF`, hi=`0xFFFF`; `-16` → `0xFFFFFFF0`: lo=`0xFFF0`, hi=`0xFFFF`). 32-bit literals preserve their full dword (`0x12345678`: lo=`0x5678`, hi=`0x1234`; `0x80017fff`: lo=`0x7fff`, hi=`0x8001`). Float inline tokens (`0.5`, `1.0`, `-2.0`, `4.0`) assemble as their 32-bit IEEE 754 bit patterns (`1.0` → `0x3f800000`: lo=`0x0000`, hi=`0x3f80`).
 - **`clamp` saturation:** Unsigned add/mad saturate to `0xFFFF`; unsigned sub saturates underflow to `0x0000`; signed add/sub/mad saturate to `[-32768, 32767]`.
 - **Silicon vs Translator parity:** 380 of 380 kernels match bit-for-bit between native hardware and `tools/rdna2spirv.py` lowered to SPIR-V (0 mismatches, 0 wave32/wave64 differences).
+### Pixel-shader ISA on the hardware (`tools/ps_oracle.py`, EGEN-TOOL-PS-ORACLE)
+
+`tools/hw_oracle` only launches compute kernels, so what only a pixel shader has (`v_interp_*` and the parameter
+words the SPI writes into LDS, the barycentric VGPRs, exports and their formats, helper lanes) could not be
+measured there. `tools/ps_oracle.py` runs hand-written RDNA2 pixel-shader ISA in a real draw on an AMD GPU, through
+Vulkan's `VK_KHR_pipeline_binary`:
+
+1. `vk_harness` builds a pipeline from a template vertex + pixel shader and writes its binary (`VKH_BINARY_OUT`).
+   On the AMD Windows driver that is one PAL ELF: `.text` with `_amdgpu_gs_main` (the vertex stage) and
+   `_amdgpu_ps_main`, and a `.note` with the PAL metadata in msgpack, from which the driver programs the register
+   counts and the SPI setup (`spi_ps_input_ena/addr`, `spi_ps_input_cntl` per parameter, `spi_shader_col_format`).
+2. The code under test is assembled with AMD clang (`LEONIDA_AMD_CLANG`, as for hw_oracle) and replaces
+   `_amdgpu_ps_main`; `.text` grows if needed and the pixel stage's VGPR/SGPR counts are raised to the registers
+   the code names. `--set PATH=JSON` changes a metadata entry as well, e.g.
+   `.graphics_registers/.spi_ps_input_cntl/0/.fp16_interp_mode=true`.
+3. `vk_harness` builds the pipeline from the patched binary (`VKH_BINARY_IN`), draws one full-screen triangle into
+   an RGBA32F target and reads every pixel's four mrt0 dwords back bit for bit.
+
+The template sets what the code finds when it starts, so `--show-template` prints the template's own ISA and SPI
+metadata to copy the conventions from. With the built-in `interp2` template on gfx1036 the pixel stage is wave64,
+the perspective I/J barycentrics are in v0/v1, M0 comes from s2 (`s_mov_b32 m0, s2`), and parameters 0 and 1 are
+the vertex shader's locations 0 = (u, v, 0, 1) and 1 = (u, v, 0, 0), u and v going 0..2 across the screen.
+
+```powershell
+$env:LEONIDA_VK_DEVICE = "radeon"
+python -I tools/ps_oracle.py --build <runtime build> --template interp2 --show-template
+python -I tools/ps_oracle.py --build <runtime build> --template interp2 --asm body.s --size 4 1 [--json out.json]
+```
+
+Checked on an AMD Radeon iGPU (gfx1036, Windows driver 26.10.1): the driver accepts a patched binary (there is no
+check over the code), the patched code runs as the pixel shader, and `v_interp_p1/p2_f32` of `attr0.x` at the four
+pixel centres of a 4 x 1 target gives u = 0.125, 0.375, 0.625, 0.875, with `v_interp_mov_f32` reading the
+parameter words P0 = 0 and P10 = 2.0 (`tests/test_ps_oracle.py`, which runs it on hardware when
+`LEONIDA_PS_ORACLE_BUILD` names a runtime build). On other drivers the binary is not a single PAL ELF (the NVIDIA
+driver returns two blobs) and the tool exits 77. Limits: one draw of one triangle, mrt0 as RGBA32F only; the vertex
+stage is the template's, compiled by the driver; the SPI behaviour comes from the driver's metadata, so a `--set`
+the hardware does not support is not refused here.
+
 
 ## Coverage plan and cost
 
