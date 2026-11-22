@@ -11,7 +11,7 @@ PackResult pack(const RootSignature& sig) {
         out.error = "root signature has more than 64 root parameters";
         return out;
     }
-    uint32_t cost = 0;
+    uint64_t cost = 0;  // 64-bit: a parameter of 0xFFFFFFFF constants must not wrap past the limits
     for (const RootParameter& p : sig.params) {
         if (p.type == ParamType::Constants && p.num_values == 0) {
             out.error = "root constant parameter needs at least 1 dword";
@@ -25,7 +25,7 @@ PackResult pack(const RootSignature& sig) {
             out.error = "root signature exceeds the 64-dword D3D12 cost limit";
             return out;
         }
-        if (out.dword_count + dwords > kMaxUserSgprs) {
+        if (uint64_t(out.dword_count) + dwords > kMaxUserSgprs) {
             // Spill layout is unknown (see __XB_GetRootSignatureSpillPointer):
             // refuse loudly instead of silently truncating every draw.
             out.error = "root signature needs more than 32 user SGPRs (spill unsupported)";
@@ -39,7 +39,7 @@ PackResult pack(const RootSignature& sig) {
             ++out.dword_count;
         }
     }
-    out.d3d12_cost = cost;
+    out.d3d12_cost = static_cast<uint32_t>(cost);  // <= kMaxD3d12Cost here
     out.ok = true;
     return out;
 }
