@@ -556,8 +556,8 @@ def _resource_pointer(system, at, base, segment, size):
     return address
 
 
-def drawable_geometries(system, drawable):
-    """Read the primary LOD geometry list at a caller-identified drawable."""
+def drawable_geometries(system, drawable, lod_index=0):
+    """Read one LOD geometry list at a caller-identified drawable."""
     def pointer(at, size):
         return _resource_pointer(system, at, 0x50000000, system, size)
 
@@ -569,7 +569,9 @@ def drawable_geometries(system, drawable):
 
     if not 0 <= drawable <= len(system) - 176:
         raise PageError("drawable outside the system segment")
-    lod = pointer(drawable + 80, 16)
+    if lod_index not in range(4):
+        raise PageError("drawable LOD index must be between 0 and 3")
+    lod = pointer(drawable + 80 + 8 * lod_index, 16)
     models = count(lod + 8)
     table = pointer(lod, 8 * models)
     for i in range(models):
@@ -661,8 +663,11 @@ def main(argv=None):
     select.add_argument("--geometry-offset", action="append", type=lambda s: int(s, 0),
                         help="known geometry record offset in the system segment (repeatable)")
     select.add_argument("--drawable-offset", type=lambda s: int(s, 0),
-                        help="walk primary LOD geometry records from this system-segment drawable")
+                        help="walk geometry records from this system-segment drawable")
+    ap.add_argument("--lod", type=int, choices=range(4), help="drawable LOD index (default: 0)")
     args = ap.parse_args(argv)
+    if args.lod is not None and args.drawable_offset is None:
+        ap.error("--lod requires --drawable-offset")
     if args.json:
         if os.path.isdir(args.json):
             print(f"error: --json {args.json} is a directory", file=sys.stderr)
@@ -683,7 +688,7 @@ def main(argv=None):
             with open(args.inputs[0], "rb") as source:
                 graphics = source.read()
             rows = []
-            offsets = args.geometry_offset or drawable_geometries(system, args.drawable_offset)
+            offsets = args.geometry_offset or drawable_geometries(system, args.drawable_offset, args.lod or 0)
             try:
                 for offset in offsets:
                     try:

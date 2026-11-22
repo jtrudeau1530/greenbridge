@@ -143,17 +143,38 @@ class DrawBindingTests(unittest.TestCase):
         struct.pack_into("<Q", self.system, 280, 0x60000000 + 640)
         self.assertEqual(mp.draw_binding(self.system, graphics, 0)["meshlet_group"], 640)
 
-    def test_primary_lod_traversal(self):
+    def add_drawable(self, lod_index):
         self.system.extend(bytes(304))
-        for at, target in ((784, 880), (880, 896), (896, 912), (920, 976), (976, 0)):
+        lod_field = 784 + 8 * lod_index
+        for at, target in ((lod_field, 880), (880, 896), (896, 912), (920, 976), (976, 0)):
             struct.pack_into("<Q", self.system, at, 0x50000000 + target)
         for at in (888, 928):
             struct.pack_into("<HH", self.system, at, 1, 1)
         struct.pack_into("<H", self.system, 966, 1)
+
+    def test_primary_lod_traversal(self):
+        self.add_drawable(0)
         self.assertEqual(list(mp.drawable_geometries(self.system, 704)), [0])
         self.system[966] = 2
         with self.assertRaises(mp.PageError):
             list(mp.drawable_geometries(self.system, 704))
+
+    def test_cli_selects_a_nonprimary_lod_from_the_drawable(self):
+        self.add_drawable(1)
+        with tempfile.TemporaryDirectory() as folder:
+            system = os.path.join(folder, "system")
+            graphics = os.path.join(folder, "graphics")
+            for path, data in ((system, self.system), (graphics, self.graphics)):
+                with open(path, "wb") as out:
+                    out.write(data)
+            cmd = [sys.executable, "-I", TOOL, graphics, "--draw-system", system, "--drawable-offset", "704"]
+            primary = subprocess.run(cmd, capture_output=True, text=True)
+            self.assertEqual(primary.returncode, 1)
+            self.assertIn("unresolved", json.loads(primary.stdout)["bindings"][0])
+            secondary = subprocess.run([*cmd, "--lod", "1"], capture_output=True, text=True)
+            self.assertEqual(secondary.returncode, 0, secondary.stderr)
+            self.assertEqual(json.loads(secondary.stdout)["bindings"],
+                             [{"geometry": 0, "vertex_block": 384, "meshlet_group": 256, "vertices": 8}])
 
     def test_inconsistent_bindings(self):
         for offset, fmt, value in ((64, "Q", 0x50010000), (248, "H", 2),
