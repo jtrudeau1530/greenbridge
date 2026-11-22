@@ -199,8 +199,12 @@ def _finite_matrix(m) -> bool:
 
 # ------------------------------------------------------------------------ files
 def _load_json(path: str) -> dict:
-    with open(path, encoding="utf-8") as handle:
-        value = json.load(handle)
+    # An interrupted export leaves an empty or cut-off model.json: report it like any other bad input (BUILD-1031).
+    try:
+        with open(path, encoding="utf-8") as handle:
+            value = json.load(handle)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise SkinError(f"{path}: invalid JSON: {exc}") from exc
     if not isinstance(value, dict):
         raise SkinError(f"{path}: model.json root is not an object")
     return value

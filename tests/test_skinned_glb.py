@@ -588,6 +588,67 @@ class SkinnedGlbTest(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("error:", result.stderr)
 
+    # BUILD-1031: an interrupted export leaves an empty, cut-off or non-UTF-8 model.json.
+    BAD_JSON = {
+        "empty": b"",
+        "truncated": b'{"a":',
+        "not_utf8": b'{"name": "\xff\xfe"}',
+    }
+
+    def _run_cli(self, skeleton, component):
+        return subprocess.run(
+            [sys.executable, "-I", os.path.join(ROOT, "tools", "skinned_glb.py"),
+             os.path.join(self.root, "out.glb"), "--skeleton", skeleton, "--component", component],
+            capture_output=True, text=True, check=False,
+        )
+
+    def _assert_one_line_error(self, result, path):
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+        lines = result.stderr.strip().splitlines()
+        self.assertEqual(len(lines), 1, result.stderr)
+        self.assertTrue(lines[0].startswith("error: "), result.stderr)
+        self.assertIn(path, lines[0])
+        self.assertIn("invalid JSON", lines[0])
+
+    def test_bad_model_json_is_a_skin_error(self):
+        for name, data in self.BAD_JSON.items():
+            with self.subTest(name):
+                path = os.path.join(self.root, name + ".json")
+                with open(path, "wb") as handle:
+                    handle.write(data)
+                with self.assertRaises(skinned_glb.SkinError) as caught:
+                    skinned_glb._load_json(path)
+                self.assertIn(path, str(caught.exception))
+
+    def _case_root(self, name):
+        """A fresh folder per case: the fixture builders make fixed subfolder names."""
+        root = os.path.join(self.root, name)
+        os.makedirs(root)
+        return root
+
+    def test_cli_bad_skeleton_json_is_one_error_line(self):
+        for name, data in self.BAD_JSON.items():
+            with self.subTest(name):
+                root = self._case_root("skeleton_" + name)
+                component = _component(root)
+                skeleton = _skeleton_dir(root)
+                path = os.path.join(skeleton, "model.json")
+                with open(path, "wb") as handle:
+                    handle.write(data)
+                self._assert_one_line_error(self._run_cli(skeleton, component), path)
+
+    def test_cli_bad_component_json_is_one_error_line(self):
+        for name, data in self.BAD_JSON.items():
+            with self.subTest(name):
+                root = self._case_root("component_" + name)
+                skeleton = _skeleton_dir(root)
+                component = _component(root)
+                path = os.path.join(component, "model.json")
+                with open(path, "wb") as handle:
+                    handle.write(data)
+                self._assert_one_line_error(self._run_cli(skeleton, component), path)
+
 
 if __name__ == "__main__":
     unittest.main()
