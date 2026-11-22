@@ -51,20 +51,36 @@ using AsyncCompleteFn = void(__stdcall*)(XAsyncBlock*, HRESULT, size_t);
 using AsyncResultSizeFn = HRESULT(__stdcall*)(XAsyncBlock*, size_t*);
 using AsyncResultFn = HRESULT(__stdcall*)(XAsyncBlock*, const void*, size_t, void*, size_t*);
 
+struct XVersion {
+    union {
+        struct {
+            uint16_t major;
+            uint16_t minor;
+            uint16_t build;
+            uint16_t revision;
+        };
+        uint64_t Value;
+    };
+};
+static_assert(sizeof(XVersion) == 8, "XVersion must be 8 bytes per GDK spec");
+
 struct XSystemAnalyticsInfo {
-    char osVersion[128];
-    char hostingOsVersion[128];
+    XVersion osVersion;
+    XVersion hostingOsVersion;
     char family[64];
     char form[64];
 };
+static_assert(sizeof(XSystemAnalyticsInfo) == 144, "XSystemAnalyticsInfo must be 144 bytes per GDK spec");
 
-using AnalyticsInfoFn = HRESULT(__stdcall*)(XSystemAnalyticsInfo*);
-using PackagePathFn = HRESULT(__stdcall*)(size_t, char*);
+using AnalyticsInfoFn = XSystemAnalyticsInfo(__stdcall*)();
+using PackageIdentifierFn = HRESULT(__stdcall*)(size_t, char*);
+using PackageMountPathFn = HRESULT(__stdcall*)(void*, size_t, char*);
 using PackagedProcessFn = bool(__stdcall*)();
 
 const char* const kNames[] = {
     "XGameRuntimeInitialize", "XGameRuntimeUninitialize", "XSystemGetDeviceType", "XSystemGetConsoleId",
-    "XSystemGetAnalyticsInfo", "XPackageGetCurrentProcessPackagePath", "XPackageIsPackagedProcess",
+    "XSystemGetAnalyticsInfo", "XPackageGetCurrentProcessPackageIdentifier", "XPackageGetMountPath",
+    "XPackageIsPackagedProcess",
     "XTaskQueueCreate", "XTaskQueueCreateComposite", "XTaskQueueGetPort", "XTaskQueueDuplicateHandle",
     "XTaskQueueCloseHandle", "XTaskQueueTerminate", "XTaskQueueDispatch", "XTaskQueueSubmitCallback",
     "XTaskQueueSubmitDelayedCallback", "XTaskQueueRegisterWaiter", "XTaskQueueUnregisterWaiter",
@@ -242,23 +258,44 @@ int main() {
           "XSystemGetConsoleId fills 39 bytes (38 characters and the terminator)");
 
     auto analytics_info = get<AnalyticsInfoFn>("XSystemGetAnalyticsInfo");
-    check(analytics_info(nullptr) == E_INVALIDARG, "XSystemGetAnalyticsInfo rejects null pointer");
-    XSystemAnalyticsInfo info{};
-    check(analytics_info(&info) == S_OK && std::strcmp(info.family, "Xbox") == 0 &&
-              std::strcmp(info.osVersion, "10.0.22000.0") == 0 && std::strcmp(info.form, "Anaconda") == 0,
-          "XSystemGetAnalyticsInfo populates Xbox Anaconda analytics info");
+    XSystemAnalyticsInfo info = analytics_info();
+    check(info.osVersion.major == 10 && info.osVersion.minor == 0 && info.osVersion.build == 22000 &&
+              info.osVersion.revision == 0,
+          "XSystemGetAnalyticsInfo returns osVersion 10.0.22000.0");
+    check(info.hostingOsVersion.major == 10 && info.hostingOsVersion.minor == 0 &&
+              info.hostingOsVersion.build == 22000 && info.hostingOsVersion.revision == 0,
+          "XSystemGetAnalyticsInfo returns hostingOsVersion 10.0.22000.0");
+    check(std::strcmp(info.family, "Xbox") == 0, "XSystemGetAnalyticsInfo returns family 'Xbox'");
+    check(std::strcmp(info.form, "Xbox Series X") == 0, "XSystemGetAnalyticsInfo returns form 'Xbox Series X'");
 
-    auto package_path = get<PackagePathFn>("XPackageGetCurrentProcessPackagePath");
-    check(package_path(0, nullptr) == E_INVALIDARG, "XPackageGetCurrentProcessPackagePath rejects null pointer and size 0");
-    char pkg_path[MAX_PATH] = {};
-    check(package_path(0, pkg_path) == E_INVALIDARG, "XPackageGetCurrentProcessPackagePath rejects size 0 with buffer");
-    check(package_path(10, nullptr) == E_INVALIDARG, "XPackageGetCurrentProcessPackagePath rejects null pointer with size");
+    auto package_id = get<PackageIdentifierFn>("XPackageGetCurrentProcessPackageIdentifier");
+    check(package_id(0, nullptr) == E_INVALIDARG, "XPackageGetCurrentProcessPackageIdentifier rejects null buffer and size 0");
+    char pkg_id[64] = {};
+    check(package_id(0, pkg_id) == E_INVALIDARG, "XPackageGetCurrentProcessPackageIdentifier rejects size 0 with buffer");
+    check(package_id(10, nullptr) == E_INVALIDARG, "XPackageGetCurrentProcessPackageIdentifier rejects null pointer with size");
+    check(package_id(16, pkg_id) == HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER),
+          "XPackageGetCurrentProcessPackageIdentifier rejects insufficient buffer");
+    check(package_id(sizeof(pkg_id), pkg_id) == S_OK && std::strlen(pkg_id) == 32,
+          "XPackageGetCurrentProcessPackageIdentifier fills 33-byte package identifier");
+
+    SetEnvironmentVariableA("LEONIDA_PACKAGE_ID", "CustomTestPackageId_123456789012");
+    check(package_id(sizeof(pkg_id), pkg_id) == S_OK &&
+              std::strcmp(pkg_id, "CustomTestPackageId_123456789012") == 0,
+          "XPackageGetCurrentProcessPackageIdentifier respects LEONIDA_PACKAGE_ID override");
+    SetEnvironmentVariableA("LEONIDA_PACKAGE_ID", nullptr);
+
+    auto mount_path = get<PackageMountPathFn>("XPackageGetMountPath");
+    check(mount_path(nullptr, 0, nullptr) == E_INVALIDARG, "XPackageGetMountPath rejects null buffer and size 0");
+    char mnt_path[MAX_PATH] = {};
+    check(mount_path(nullptr, 0, mnt_path) == E_INVALIDARG, "XPackageGetMountPath rejects size 0 with buffer");
+    check(mount_path(nullptr, 10, nullptr) == E_INVALIDARG, "XPackageGetMountPath rejects null pointer with size");
 
     SetEnvironmentVariableA("LEONIDA_GAME_DIR", "C:\\LeonidaGameDir");
-    check(package_path(5, pkg_path) == HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER),
-          "XPackageGetCurrentProcessPackagePath rejects insufficient buffer");
-    check(package_path(sizeof(pkg_path), pkg_path) == S_OK && std::strcmp(pkg_path, "C:\\LeonidaGameDir") == 0,
-          "XPackageGetCurrentProcessPackagePath returns configured game directory");
+    check(mount_path(nullptr, 5, mnt_path) == HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER),
+          "XPackageGetMountPath rejects insufficient buffer");
+    check(mount_path(nullptr, sizeof(mnt_path), mnt_path) == S_OK &&
+              std::strcmp(mnt_path, "C:\\LeonidaGameDir") == 0,
+          "XPackageGetMountPath returns configured game directory");
     SetEnvironmentVariableA("LEONIDA_GAME_DIR", nullptr);
 
     auto is_packaged = get<PackagedProcessFn>("XPackageIsPackagedProcess");
