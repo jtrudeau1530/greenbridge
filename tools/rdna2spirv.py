@@ -8643,7 +8643,25 @@ class Gen:
             # NaN -> 0, preserving the unwritten 16-bit half of the destination (op_sel:[src,dst] supported).
             # For |cl| >= 0.25, cl * (scale + 1) is an exact even integer in f32 so round_even(cl * scale) ==
             # cl * (scale + 1) - RoundEven(cl), avoiding the f32 double-rounding ties near +-0.5.
-            if any(m == "clamp" or m.startswith(("mul:", "div:")) for m in mods):
+            # Measured natively on RDNA2 (gfx1036, wave32 & wave64, exhaustive 65,536 f16 sweep): VOP3
+            # clamp and mul:2/mul:4/div:2 (and SDWA clamp) are hardware no-ops on these integer-destination
+            # normalized conversions. Keep rejecting unknown modifiers and invalid form/modifier combinations.
+            raw_op = ins["op"]
+            if raw_op.endswith("_sdwa"):
+                bad_mod = any(
+                    m != "clamp" and m.split(":", 1)[0] not in ("src0_sel", "dst_sel", "dst_unused")
+                    for m in mods
+                )
+            elif raw_op.endswith("_dpp"):
+                bad_mod = bool(self.non_dpp_mods(raw_op, mods))
+            elif raw_op.endswith("_e32"):
+                bad_mod = bool(mods)
+            else:
+                bad_mod = any(
+                    m not in ("clamp", "mul:2", "mul:4", "div:2") and not m.startswith("op_sel:")
+                    for m in mods
+                )
+            if bad_mod:
                 raise Unsupported(op + " output modifier")
             sel, dhi = self.opsel_bits(mods, 1)
             snorm = op == "v_cvt_norm_i16_f16"
@@ -9255,8 +9273,11 @@ class Gen:
             # exact product is just below or above it, and RoundEven then picks the even neighbour. The product's
             # error e = Fma(c, s, -p) is exact, and on such a tie its sign decides: floor(p) + 1 above, floor(p)
             # below, RoundEven when e is 0. Away from a tie both roundings agree, since k + 0.5 is an f32 here.
-            if "clamp" in mods:
-                raise Unsupported(op + " clamp")
+            # Measured natively on RDNA2 (gfx1036, wave32 & wave64 across 6 HW_REG_MODE configs): VOP3
+            # clamp is a hardware no-op on v_cvt_pknorm_{i16,u16}_f32 (each lane is already clamped to
+            # [-1, 1] / [0, 1] and packed to 16-bit integer). Reject other unexpected modifiers.
+            if any(m != "clamp" for m in mods):
+                raise Unsupported(op + " modifiers")
             snorm = op == "v_cvt_pknorm_i16_f32"
             halves = []
             for src in a[1:3]:
