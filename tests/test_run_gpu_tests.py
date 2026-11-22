@@ -3,6 +3,7 @@ import contextlib
 import io
 import os
 from pathlib import Path
+import struct
 import sys
 import tempfile
 from types import SimpleNamespace
@@ -60,6 +61,40 @@ class PackedFormatFixture(unittest.TestCase):
             check_fmt.assert_called_once()
             self.assertIn(problem, output.getvalue())
             self.assertIn("0/1 passed", output.getvalue())
+
+
+class FrameReadbackTest(unittest.TestCase):
+    def test_only_a_frame_written_by_this_run_can_pass(self):
+        name = "ps_ops"
+        pixels = struct.pack("<4I", 0x48804300, 5, 7, 0xBFFFFFFC) * 4096
+        for existing, writes_frame, expected in ((True, False, 1), (False, False, 1), (True, True, 0)):
+            with self.subTest(existing=existing, writes_frame=writes_frame), tempfile.TemporaryDirectory() as tmp:
+                raw = Path(tmp, "raw", f"{name}.raw")
+                if existing:
+                    raw.parent.mkdir()
+                    raw.write_bytes(pixels)
+                args = SimpleNamespace(filter="ps_ops.asm", build=tmp, llvm_mc="unused")
+
+                def launch(cmd, **kwargs):
+                    if cmd[:3] == [sys.executable, "-I", rgt.TRANSLATOR]:
+                        (Path(tmp) / "spirv" / f"{name}.spv").touch()
+                    elif writes_frame:
+                        raw.write_bytes(pixels)
+                    return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+                output = io.StringIO()
+                with (patch.object(rgt, "assemble_to_s", side_effect=lambda _mc, _src, dst, _name: Path(dst).touch()),
+                      patch.object(rgt, "spirv_as"),
+                      patch.object(rgt, "bary_fallback", return_value=False),
+                      patch.object(rgt, "f16_interp_fallback", return_value=False),
+                      patch.object(rgt.subprocess, "run", side_effect=launch),
+                      contextlib.redirect_stdout(output)):
+                    self.assertEqual(rgt.run_suite(args, tmp), expected, output.getvalue())
+                if expected:
+                    self.assertIn("missing readback", output.getvalue())
+                    self.assertFalse(raw.exists())
+                else:
+                    self.assertEqual(raw.read_bytes(), pixels)
 
 
 class TextureTestOnASmallPushConstantDevice(unittest.TestCase):
