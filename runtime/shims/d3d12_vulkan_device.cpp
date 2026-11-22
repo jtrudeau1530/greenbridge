@@ -53,6 +53,8 @@ struct Format {
     VkFormat format = VK_FORMAT_UNDEFINED;
     VkImageAspectFlags aspects = 0;
     bool typeless = false;  // created with MUTABLE_FORMAT so typed views can reinterpret it
+    bool d24_as_float = false;  // D24_UNORM_S8_UINT stored as D32_SFLOAT_S8_UINT (no D24 on the GPU)
+    bool d24 = false;           // a D24_UNORM_S8_UINT family format, native or stored as D32
 };
 
 // DXGI -> Vulkan for the formats render targets, depth buffers and common textures use. Typeless depth families
@@ -317,9 +319,11 @@ struct DeviceState {
                             D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))))
             return {};
         Format format = texture_storage_format(desc.Format, desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL);
+        format.d24 = format.format == VK_FORMAT_D24_UNORM_S8_UINT;  // native or not: clears are quantised
         if (format.format == VK_FORMAT_D24_UNORM_S8_UINT && !depth_usable(format.format)) {
             log_once("D24_UNORM_S8_UINT unavailable, using D32_SFLOAT_S8_UINT; format", desc.Format);
             format.format = VK_FORMAT_D32_SFLOAT_S8_UINT;
+            format.d24_as_float = true;
         }
         return format;
     }
@@ -686,7 +690,8 @@ public:
             texture_create_info(desc_, format, device_.color_attachment_usable(format.format));
         const std::uint32_t samples = info.samples;
         // Textures the CPU reads and writes (WriteToSubresource/ReadFromSubresource) copy on the host when they can.
-        host_transfer_ = cpu_visible() && samples == 1 && device_.host_transfer_format(format.format);
+        // (A D24 texture stored as D32 goes through the staged copy: the host copy would not convert.)
+        host_transfer_ = cpu_visible() && samples == 1 && !format.d24_as_float && device_.host_transfer_format(format.format);
         if (host_transfer_) info.usage |= VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT;
         HRESULT support = device_.check_image_support(info);
         if (support == E_INVALIDARG && host_transfer_) {
@@ -705,6 +710,8 @@ public:
         leonida::ResourceBinding binding{};
         binding.image = image_;
         binding.rgba8_typeless = desc_.Format == DXGI_FORMAT_R8G8B8A8_TYPELESS;
+        binding.depth24_as_float = format.d24_as_float;
+        binding.depth24 = format.d24;
         binding.format = format.format;
         binding.aspects = format.aspects;
         binding.width = std::uint32_t(desc_.Width);
@@ -957,7 +964,7 @@ private:
         staging.size = pitch * r.rows * r.slices;
         VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
         info.size = staging.size;
-        info.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        info.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;  // storage: D24 depth conversion
         if (vk.vkCreateBuffer(dev, &info, nullptr, &staging.buffer) != VK_SUCCESS) return E_OUTOFMEMORY;
         VkDeviceMemory memory = VK_NULL_HANDLE;
         void* mapped = nullptr;
@@ -1351,6 +1358,19 @@ public:
                                                                   info.separate_depth_stencil_layouts,
                                                                   info.conditional_rendering);
         if (info.host_image_copy) load_host_image_copy(get_device);
+        // The copies of a D24 texture stored as D32 convert on the GPU (vulkan_depth24.h).
+        std::uint64_t max_storage_range = 1u << 27;  // the least Vulkan allows, if the limit cannot be read
+        if (info.physical && info.get_instance_proc) {
+            if (const auto get_props = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(
+                    info.get_instance_proc(info.instance, "vkGetPhysicalDeviceProperties"))) {
+                VkPhysicalDeviceProperties props{};
+                get_props(info.physical, &props);
+                max_storage_range = props.limits.maxStorageBufferRange;
+            }
+        }
+        state_.context->enable_depth24(get_device, [this](const VkMemoryRequirements& requirements) {
+            return state_.allocate(requirements, 0, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        }, max_storage_range);
         if (info.bindless && state_.context->loaded() && !create_bindless(get_device))
             std::fprintf(stderr, "[rt] d3d12: the bindless set 0 could not be created\n");
         query_luid_and_clock(get_device);

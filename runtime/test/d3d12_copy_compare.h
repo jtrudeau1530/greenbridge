@@ -130,7 +130,6 @@ struct TexCase {
     bool floaty;  // bytes stay small so floats are finite
     bool ds;      // depth-stencil: whole-subresource copies only
     bool bc;
-    bool emulated = false;  // the layer stores the format as another one (D24 as D32S8): only bit-preserving copies
 };
 
 // One device with a direct queue, an allocator, a list and a fence.
@@ -586,7 +585,7 @@ inline int compare(const char* name, const Outcome& ours, const Outcome& host) {
 }
 
 // Runs every case; returns the number of cases that differ, or -1 with no host device.
-inline int compare_copies(ID3D12Device* ours, bool bc_supported, bool d24_native) {
+inline int compare_copies(ID3D12Device* ours, bool bc_supported) {
     Ptr<ID3D12Device> host;
     std::string adapter;
     if (!create_host(host, adapter)) return -1;
@@ -623,10 +622,8 @@ inline int compare_copies(ID3D12Device* ours, bool bc_supported, bool d24_native
     depth("D16_UNORM", DXGI_FORMAT_D16_UNORM, false);
     depth("D32_FLOAT", DXGI_FORMAT_D32_FLOAT, true);
     depth("D24_UNORM_S8_UINT", DXGI_FORMAT_D24_UNORM_S8_UINT, false);
-    // Without a native D24 the layer stores D32_SFLOAT_S8_UINT and an upload or readback does not convert the 24-bit
-    // texels (docs/d3d12_vulkan.md, known gaps): only the copies that keep the bits are checked, on the layer alone.
-    cases.back().emulated = !d24_native;
-    cases.back().floaty = !d24_native;  // the layer's D32 holds floats: keep them normal and finite
+    // Without a native D24 the layer stores D32_SFLOAT_S8_UINT and converts the depth plane of an upload and a readback
+    // (depth24.h); the random 24-bit values here must come back exactly, as on the host.
     depth("D32_FLOAT_S8X24_UINT", DXGI_FORMAT_D32_FLOAT_S8X24_UINT, true);
     if (bc_supported) {
         const auto bc = [&](const char* name, DXGI_FORMAT f) {
@@ -666,49 +663,7 @@ inline int compare_copies(ID3D12Device* ours, bool bc_supported, bool d24_native
         bad += r;
         if (!r) std::printf("copy case %s: matches the host (%zu regions)\n", name, b.regions.size());
     };
-    // An emulated format: the readbacks of a CopyResource, a box copy and a copy into another slice must equal the
-    // readback of the source (bits kept), on the layer alone.
-    const auto bit_preserving = [&](const TexCase& tc) {
-        ++total;
-        Outcome a;
-        Run run;
-        if (!run.init(ours, true)) {
-            std::fprintf(stderr, "copy case %s: could not create the queue and list\n", tc.name);
-            ++bad;
-            return;
-        }
-        run_texture(run, host.p, tc, a);
-        if (!a.error.empty()) {
-            std::fprintf(stderr, "copy case %s: layer run failed: %s\n", tc.name, a.error.c_str());
-            ++bad;
-            return;
-        }
-        const size_t n = a.regions.size() / 6, layers = tc.depth_or_layers;
-        const auto same = [&](const Region& x, const Region& y) {
-            for (size_t row = 0; row < x.rows; ++row)
-                if (std::memcmp(&a.bytes[x.offset + row * x.pitch], &a.bytes[y.offset + row * y.pitch], x.row_bytes))
-                    return false;
-            return true;
-        };
-        int wrong = 0;
-        for (size_t i = 0; i < n; ++i) {
-            const size_t mip = i % tc.mips, slice = (i / tc.mips) % layers, plane = i / (tc.mips * layers);
-            const size_t other = mip + ((slice + 1) % layers) * tc.mips + plane * tc.mips * layers;
-            const Region& source = a.regions[4 * n + i];
-            if (!same(a.regions[i], source) || !same(a.regions[n + i], source) || !same(a.regions[2 * n + other], source)) {
-                if (wrong++ < 3)
-                    std::fprintf(stderr, "copy case %s: sub %zu: a copy did not keep the source's bits\n", tc.name, i);
-            }
-        }
-        bad += wrong ? 1 : 0;
-        if (!wrong)
-            std::printf("copy case %s: emulated format, CopyResource and box copies keep the source's bits "
-                        "(upload and readback are not compared)\n", tc.name);
-    };
-    for (const TexCase& tc : cases) {
-        if (tc.emulated) bit_preserving(tc);
-        else both(tc.name, [&](Run& r, Outcome& o) { run_texture(r, host.p, tc, o); });
-    }
+    for (const TexCase& tc : cases) both(tc.name, [&](Run& r, Outcome& o) { run_texture(r, host.p, tc, o); });
     both("buffers", [&](Run& r, Outcome& o) { run_buffers(r, o); });
 
     // Different mips of one texture. Both sides must refuse what does not fit; what the host copies the layer must
