@@ -30,9 +30,10 @@ Background & Specification Rules:
         - `ds_and_b64 vaddr, v[data_lo:data_hi] [offset:N]`:
             Non-returning form:
               eff_byte = (vaddr + offset) & 0xFFFFFFFF
-              dword_idx = (eff_byte >> 2) & (lds_dwords - 1)
-              LDS[dword_idx]   &= vdata_lo
-              LDS[dword_idx+1] &= vdata_hi
+              dword_idx0 = (eff_byte >> 2) & (lds_dwords - 1)
+              dword_idx1 = (dword_idx0 + 1) & (lds_dwords - 1)
+              LDS[dword_idx0] &= vdata_lo
+              LDS[dword_idx1] &= vdata_hi
         - `ds_and_rtn_b64 v[dst_lo:dst_hi], vaddr, v[data_lo:data_hi] [offset:N]`:
             Returning form: returns pre-atomic 64-bit value in VGPR pair v[dst_lo:dst_hi].
     - Active lane masking:
@@ -54,8 +55,11 @@ from __future__ import annotations
 
 import os
 import re
+import struct
 import sys
+import tempfile
 import unittest
+import warnings
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(os.path.dirname(HERE))
@@ -147,6 +151,28 @@ def calc_lds_dual_offsets(
     dword_idx0 = (eff_byte0 >> 2) & (lds_dwords - 1)
     dword_idx1 = (eff_byte1 >> 2) & (lds_dwords - 1)
     return (eff_byte0, dword_idx0), (eff_byte1, dword_idx1)
+
+
+def translate_cs_listing(body: list[str]) -> str:
+    """Translates a compute shader listing using rdna2spirv without external files."""
+    with tempfile.TemporaryDirectory() as tmp:
+        os.mkdir(os.path.join(tmp, "disasm"))
+        os.mkdir(os.path.join(tmp, "fssm"))
+        name = "cs_lds_and"
+        with open(os.path.join(tmp, "disasm", name + ".s"), "w", encoding="utf-8") as f:
+            f.write(f"; {name}\n" + "".join(f"\t{ln}\n" for ln in body) + "\ts_endpgm\n")
+        stub_dxbc = b"DXBC" + bytes(24) + struct.pack("<I", 0) + bytes(4)
+        with open(os.path.join(tmp, name + ".dxbc"), "wb") as f:
+            f.write(stub_dxbc)
+        # FSSM header with 4 KiB LDS (0x40088 in RSRC2 at 0x138)
+        fssm = bytearray(0x148)
+        struct.pack_into("<4I", fssm, 0x138, 0x40088, 32, 1, 1)
+        with open(os.path.join(tmp, "fssm", name + ".fssm"), "wb") as f:
+            f.write(fssm)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", ResourceWarning)
+            spv = rdna2spirv.translate(os.path.join(tmp, "disasm", name + ".s"))
+        return spv
 
 
 class LdsSemanticInterpreter:
@@ -1133,6 +1159,637 @@ OpFunctionEnd
         final_lds, lane_outs = interp.run(seed_lds={3: 0xFFFFFFFF})
         self.assertEqual(lane_outs[0]["%out"], 0xFFFFFFFF)
         self.assertEqual(final_lds[3], 0xAAAAAAAA)
+
+
+class TestLdsSemanticInterpreterB64(unittest.TestCase):
+    """Verifies 64-bit LDS atomic AND execution in multi-lane SIMD interpreter."""
+
+    def setUp(self):
+        self.interp = LdsSemanticInterpreter(lds_dwords=256, num_vgprs=64, num_lanes=32)
+
+    def test_ds_and_b64_non_returning_mutates_both_dwords(self):
+        self.interp.set_lds_dword(10, 0x12345678)
+        self.interp.set_lds_dword(11, 0x9ABCDEF0)
+        self.interp.set_vgpr(0, 40)           # byte 40 -> dword 10
+        self.interp.set_vgpr(2, 0x000000FF)   # data lo
+        self.interp.set_vgpr(3, 0x00FF0000)   # data hi
+        self.interp.set_vgpr(4, 0xDEADBEEF)   # dummy
+
+        res = self.interp.ds_and_b64(vaddr_reg=0, vdata_lo_reg=2, offset=0, lane=0)
+        self.assertEqual(res, (10, 11))
+        self.assertEqual(self.interp.get_lds_dword(10), 0x12345678 & 0x000000FF)
+        self.assertEqual(self.interp.get_lds_dword(11), 0x9ABCDEF0 & 0x00FF0000)
+        self.assertEqual(self.interp.get_vgpr(0), 40)
+        self.assertEqual(self.interp.get_vgpr(2), 0x000000FF)
+        self.assertEqual(self.interp.get_vgpr(3), 0x00FF0000)
+        self.assertEqual(self.interp.get_vgpr(4), 0xDEADBEEF)
+
+    def test_ds_and_rtn_b64_returns_prior_64bit_value(self):
+        init_val = 0xCAFEBABE_DEADBEEF
+        mask_val = 0x0F0F0F0F_F0F0F0F0
+        self.interp.set_lds_u64(12, init_val)
+        self.interp.set_vgpr(0, 48)           # byte 48 -> dword 12
+        self.interp.set_vgpr_u64(2, mask_val)
+        self.interp.set_vgpr_u64(4, 0)        # vdst in v[4:5]
+
+        res = self.interp.ds_and_rtn_b64(vdst_lo_reg=4, vaddr_reg=0, vdata_lo_reg=2, offset=0, lane=0)
+        self.assertEqual(res, (12, init_val))
+        self.assertEqual(self.interp.get_vgpr_u64(4), init_val)
+        self.assertEqual(self.interp.get_lds_u64(12), init_val & mask_val)
+
+    def test_ds_and_rtn_b64_with_offset(self):
+        init_val = 0x11112222_33334444
+        mask_val = 0x55555555_AAAAAAAA
+        # vaddr = 32 (dword 8), offset = 24 bytes (6 dwords) -> target is dword 14
+        self.interp.set_lds_u64(14, init_val)
+        self.interp.set_vgpr(0, 32)
+        self.interp.set_vgpr_u64(2, mask_val)
+        self.interp.set_vgpr_u64(6, 0)
+
+        res = self.interp.ds_and_rtn_b64(vdst_lo_reg=6, vaddr_reg=0, vdata_lo_reg=2, offset=24, lane=0)
+        self.assertEqual(res, (14, init_val))
+        self.assertEqual(self.interp.get_vgpr_u64(6), init_val)
+        self.assertEqual(self.interp.get_lds_u64(14), init_val & mask_val)
+
+    def test_ds_and_rtn_b64_sequential_filter_chain(self):
+        init_val = 0xFFFFFFFF_FFFFFFFF
+        mask1 = 0xF0F0F0F0_0F0F0F0F
+        mask2 = 0x33333333_CCCCCCCC
+        self.interp.set_lds_u64(20, init_val)
+        self.interp.set_vgpr(0, 80)
+        self.interp.set_vgpr_u64(2, mask1)
+
+        res1 = self.interp.ds_and_rtn_b64(vdst_lo_reg=4, vaddr_reg=0, vdata_lo_reg=2, offset=0, lane=0)
+        self.assertEqual(res1, (20, init_val))
+        self.assertEqual(self.interp.get_vgpr_u64(4), init_val)
+        self.assertEqual(self.interp.get_lds_u64(20), init_val & mask1)
+
+        self.interp.set_vgpr_u64(2, mask2)
+        res2 = self.interp.ds_and_rtn_b64(vdst_lo_reg=6, vaddr_reg=0, vdata_lo_reg=2, offset=0, lane=0)
+        self.assertEqual(res2, (20, init_val & mask1))
+        self.assertEqual(self.interp.get_vgpr_u64(6), init_val & mask1)
+        self.assertEqual(self.interp.get_lds_u64(20), init_val & mask1 & mask2)
+
+    def test_ds_and_rtn_b64_vdst_aliasing_vdata(self):
+        init_val = 0x88887777_66665555
+        data_val = 0x11112222_33334444
+        self.interp.set_lds_u64(16, init_val)
+        self.interp.set_vgpr(0, 64)
+        self.interp.set_vgpr_u64(2, data_val)
+
+        # vdst is v[2:3], which aliases vdata in v[2:3]
+        res = self.interp.ds_and_rtn_b64(vdst_lo_reg=2, vaddr_reg=0, vdata_lo_reg=2, lane=0)
+        self.assertEqual(res, (16, init_val))
+        self.assertEqual(self.interp.get_lds_u64(16), init_val & data_val)
+        self.assertEqual(self.interp.get_vgpr_u64(2), init_val)
+
+    def test_ds_and_rtn_b64_vdst_aliasing_vaddr(self):
+        init_val = 0xAAAABBBB_CCCCDDDD
+        data_val = 0x0000FFFF_0000FFFF
+        self.interp.set_lds_u64(18, init_val)
+        self.interp.set_vgpr(0, 72)
+        self.interp.set_vgpr_u64(2, data_val)
+
+        # vdst is v[0:1], aliasing vaddr in v0
+        res = self.interp.ds_and_rtn_b64(vdst_lo_reg=0, vaddr_reg=0, vdata_lo_reg=2, lane=0)
+        self.assertEqual(res, (18, init_val))
+        self.assertEqual(self.interp.get_lds_u64(18), init_val & data_val)
+        self.assertEqual(self.interp.get_vgpr_u64(0), init_val)
+
+    def test_ds_and_b64_inactive_lane_under_exec_mask(self):
+        self.interp.set_lds_u64(4, 0x12345678_9ABCDEF0)
+        self.interp.set_vgpr(0, 16, lane=2)
+        self.interp.set_vgpr_u64(2, 0, lane=2)
+        self.interp.set_vgpr_u64(4, 0xFEEDFACE_CAFEBABE, lane=2)
+        self.interp.set_lane_active(2, False)
+
+        res = self.interp.ds_and_rtn_b64(vdst_lo_reg=4, vaddr_reg=0, vdata_lo_reg=2, lane=2)
+        self.assertIsNone(res)
+        self.assertEqual(self.interp.get_vgpr_u64(4, lane=2), 0xFEEDFACE_CAFEBABE)
+        self.assertEqual(self.interp.get_lds_u64(4), 0x12345678_9ABCDEF0)
+
+    def test_ds_and_rtn_b64_simd_wave_divergent(self):
+        # 32 lanes, each lane targeting its own 64-bit element
+        for lane in range(32):
+            val = (0x1000_0000_0000 + lane * 0x1_0000_0001) & MASK64
+            self.interp.set_lds_u64(lane * 2, val)
+            self.interp.set_vgpr(0, lane * 8, lane=lane)
+            self.interp.set_vgpr_u64(2, 0x00FF00FF_00FF00FF, lane=lane)
+            self.interp.set_vgpr_u64(4, 0, lane=lane)
+
+        for lane in range(32):
+            self.interp.ds_and_rtn_b64(vdst_lo_reg=4, vaddr_reg=0, vdata_lo_reg=2, offset=0, lane=lane)
+
+        for lane in range(32):
+            orig_val = (0x1000_0000_0000 + lane * 0x1_0000_0001) & MASK64
+            self.assertEqual(self.interp.get_vgpr_u64(4, lane=lane), orig_val)
+            self.assertEqual(self.interp.get_lds_u64(lane * 2), orig_val & 0x00FF00FF_00FF00FF)
+
+    def test_ds_and_rtn_b64_simd_wave_convergent_shared_word(self):
+        # 32 lanes all targeting dword 30 (64-bit), each clearing bit lane and bit lane + 32
+        self.interp.set_lds_u64(30, MASK64)
+        for lane in range(32):
+            self.interp.set_vgpr(0, 120, lane=lane)  # byte 120 -> dword 30
+            mask_64 = ~((1 << lane) | (1 << (lane + 32))) & MASK64
+            self.interp.set_vgpr_u64(2, mask_64, lane=lane)
+            self.interp.set_vgpr_u64(4, 0, lane=lane)
+
+        for lane in range(32):
+            self.interp.ds_and_rtn_b64(vdst_lo_reg=4, vaddr_reg=0, vdata_lo_reg=2, offset=0, lane=lane)
+
+        self.assertEqual(self.interp.get_lds_u64(30), 0)
+
+    def test_assembly_parser_dispatch_b64(self):
+        self.interp.set_lds_u64(8, 0xFFFFFFFF_FFFFFFFF)
+        self.interp.set_vgpr(0, 32)
+        self.interp.set_vgpr_u64(2, 0x55555555_AAAAAAAA)
+
+        self.interp.parse_and_execute("ds_and_b64 v0, v[2:3] offset:0")
+        self.assertEqual(self.interp.get_lds_u64(8), 0x55555555_AAAAAAAA)
+
+        self.interp.set_vgpr_u64(4, 0)
+        self.interp.parse_and_execute("ds_and_rtn_b64 v[4:5], v0, v[2:3] offset:0")
+        self.assertEqual(self.interp.get_vgpr_u64(4), 0x55555555_AAAAAAAA)
+        self.assertEqual(self.interp.get_lds_u64(8), 0x55555555_AAAAAAAA)
+
+        # Test ds_write_b64 and ds_read_b64 through parser
+        self.interp.set_vgpr_u64(6, 0xCAFEBABE_12345678)
+        self.interp.parse_and_execute("ds_write_b64 v0, v[6:7] offset:8")
+        self.assertEqual(self.interp.get_lds_u64(10), 0xCAFEBABE_12345678)
+
+        self.interp.set_vgpr_u64(8, 0)
+        self.interp.parse_and_execute("ds_read_b64 v[8:9], v0 offset:8")
+        self.assertEqual(self.interp.get_vgpr_u64(8), 0xCAFEBABE_12345678)
+
+    def test_run_simd_wave_b64_with_exec_mask(self):
+        # Lanes 0..3 active (0x0F), lanes 4..7 inactive
+        self.interp.set_exec_mask(0x0F)
+        for lane in range(8):
+            self.interp.set_lds_u64(lane * 2, MASK64)
+            self.interp.set_vgpr(0, lane * 8, lane=lane)
+            self.interp.set_vgpr_u64(2, 0xFFFFFFFF_00000000, lane=lane)
+            self.interp.set_vgpr_u64(4, 0x55555555_55555555, lane=lane)
+
+        results = self.interp.run_simd_wave("ds_and_rtn_b64 v[4:5], v0, v[2:3]")
+        for lane in range(4):
+            self.assertIsNotNone(results[lane])
+            self.assertEqual(self.interp.get_vgpr_u64(4, lane=lane), MASK64)
+            self.assertEqual(self.interp.get_lds_u64(lane * 2), 0xFFFFFFFF_00000000)
+        for lane in range(4, 8):
+            self.assertIsNone(results[lane])
+            self.assertEqual(self.interp.get_vgpr_u64(4, lane=lane), 0x55555555_55555555)
+            self.assertEqual(self.interp.get_lds_u64(lane * 2), MASK64)
+
+
+class Test64BitAlignmentBoundariesAndWrapping(unittest.TestCase):
+    """Verifies 64-bit alignment boundaries, dual-dword spans, and power-of-two wrapping."""
+
+    def test_aligned_8byte_addressing(self):
+        interp = LdsSemanticInterpreter(lds_dwords=128, num_vgprs=16, num_lanes=1)
+        for dword_base in (0, 2, 4, 16, 64, 126):
+            byte_addr = dword_base * 4
+            self.assertEqual(byte_addr % 8, 0)
+            interp.set_lds_u64(dword_base, 0xAAAAAAAA_55555555)
+            interp.set_vgpr(0, byte_addr)
+            interp.set_vgpr_u64(2, 0xFFFFFFFF_00000000)
+            res = interp.ds_and_rtn_b64(vdst_lo_reg=4, vaddr_reg=0, vdata_lo_reg=2, lane=0)
+            self.assertEqual(res, (dword_base, 0xAAAAAAAA_55555555))
+            self.assertEqual(interp.get_lds_u64(dword_base), 0xAAAAAAAA_00000000)
+
+    def test_unaligned_4byte_dword_boundary(self):
+        interp = LdsSemanticInterpreter(lds_dwords=128, num_vgprs=16, num_lanes=1)
+        # Byte address 20 -> dword 5 (odd dword index, not 8-byte aligned)
+        # 64-bit element spans dword 5 and dword 6
+        interp.set_lds_dword(5, 0x12345678)
+        interp.set_lds_dword(6, 0x9ABCDEF0)
+        interp.set_vgpr(0, 20)
+        interp.set_vgpr(2, 0x000000FF)
+        interp.set_vgpr(3, 0x00FF0000)
+        res = interp.ds_and_rtn_b64(vdst_lo_reg=4, vaddr_reg=0, vdata_lo_reg=2, lane=0)
+        self.assertEqual(res, (5, combine_u32_to_u64(0x12345678, 0x9ABCDEF0)))
+        self.assertEqual(interp.get_lds_dword(5), 0x12345678 & 0x000000FF)
+        self.assertEqual(interp.get_lds_dword(6), 0x9ABCDEF0 & 0x00FF0000)
+
+    def test_unaligned_byte_offset_truncation(self):
+        interp = LdsSemanticInterpreter(lds_dwords=64, num_vgprs=16, num_lanes=1)
+        # Byte offsets 16, 17, 18, 19 all truncate to dword 4 (and 5)
+        for byte_off in (16, 17, 18, 19):
+            interp.set_lds_dword(4, 0xFFFFFFFF)
+            interp.set_lds_dword(5, 0xFFFFFFFF)
+            interp.set_vgpr(0, byte_off)
+            interp.set_vgpr(2, 0xF0F0F0F0)
+            interp.set_vgpr(3, 0x0F0F0F0F)
+            res = interp.ds_and_b64(vaddr_reg=0, vdata_lo_reg=2, lane=0)
+            self.assertEqual(res, (4, 5))
+            self.assertEqual(interp.get_lds_dword(4), 0xF0F0F0F0)
+            self.assertEqual(interp.get_lds_dword(5), 0x0F0F0F0F)
+
+    def test_64bit_boundary_crossing_wrap(self):
+        interp = LdsSemanticInterpreter(lds_dwords=64, num_vgprs=16, num_lanes=1)
+        # LDS has 64 dwords (indices 0..63).
+        # A 64-bit element at dword 63 spans dword 63 and dword (63+1)%64 = 0.
+        interp.set_lds_dword(63, 0xFFFFFFFF)
+        interp.set_lds_dword(0, 0xFFFFFFFF)
+        interp.set_vgpr(0, 63 * 4)  # byte address 252 -> dword 63
+        interp.set_vgpr(2, 0xF0F0F0F0)
+        interp.set_vgpr(3, 0x0F0F0F0F)
+        interp.set_vgpr_u64(4, 0)
+
+        res = interp.ds_and_rtn_b64(vdst_lo_reg=4, vaddr_reg=0, vdata_lo_reg=2, offset=0, lane=0)
+        self.assertEqual(res, (63, combine_u32_to_u64(0xFFFFFFFF, 0xFFFFFFFF)))
+        self.assertEqual(interp.get_vgpr(4), 0xFFFFFFFF)
+        self.assertEqual(interp.get_vgpr(5), 0xFFFFFFFF)
+        self.assertEqual(interp.get_lds_dword(63), 0xF0F0F0F0)
+        self.assertEqual(interp.get_lds_dword(0), 0x0F0F0F0F)
+
+    def test_large_offset_overflow_wrap(self):
+        interp = LdsSemanticInterpreter(lds_dwords=128, num_vgprs=16, num_lanes=1)
+        # 32-bit unsigned wrapping: 0xFFFFFFFC + 8 = 0x00000004 -> dword 1
+        interp.set_lds_dword(1, 0xFFFFFFFF)
+        interp.set_lds_dword(2, 0xFFFFFFFF)
+        interp.set_vgpr(0, 0xFFFFFFFC)
+        interp.set_vgpr(2, 0x000000FF)
+        interp.set_vgpr(3, 0x00FF0000)
+
+        interp.ds_and_b64(vaddr_reg=0, vdata_lo_reg=2, offset=8, lane=0)
+        self.assertEqual(interp.get_lds_dword(1), 0x000000FF)
+        self.assertEqual(interp.get_lds_dword(2), 0x00FF0000)
+
+    def test_calc_dual_offsets_st64_math(self):
+        (eff0, idx0), (eff1, idx1) = calc_lds_dual_offsets(0x100, 4, 8, lds_dwords=512, st64=False)
+        self.assertEqual(eff0, 0x100 + 16)
+        self.assertEqual(idx0, (0x100 + 16) >> 2)
+        self.assertEqual(eff1, 0x100 + 32)
+        self.assertEqual(idx1, (0x100 + 32) >> 2)
+
+        (eff0_st, idx0_st), (eff1_st, idx1_st) = calc_lds_dual_offsets(0x100, 1, 2, lds_dwords=512, st64=True)
+        self.assertEqual(eff0_st, 0x100 + 256)
+        self.assertEqual(idx0_st, (0x100 + 256) >> 2)
+        self.assertEqual(eff1_st, 0x100 + 512)
+        self.assertEqual(idx1_st, (0x100 + 512) >> 2)
+
+    def test_dual_offset_wrapping_power_of_two(self):
+        lds_dwords = 32  # 128 bytes total
+        (eff0, idx0), (eff1, idx1) = calc_lds_dual_offsets(0, 32, 33, lds_dwords=lds_dwords, st64=False)
+        self.assertEqual(idx0, 0)
+        self.assertEqual(idx1, 1)
+
+
+class TestReturnValueRetention(unittest.TestCase):
+    """Verifies that non-returning forms do not modify destination registers and returning forms retain old values."""
+
+    def test_non_returning_forms_preserve_vdst_sentinel(self):
+        interp = LdsSemanticInterpreter(lds_dwords=64, num_vgprs=16, num_lanes=1)
+        interp.set_lds_dword(0, 0xFFFFFFFF)
+        interp.set_lds_dword(1, 0xFFFFFFFF)
+        interp.set_vgpr(0, 0)
+        interp.set_vgpr(1, 0x12345678)
+        interp.set_vgpr(2, 0x9ABCDEF0)
+        interp.set_vgpr(10, 0xDEADBEEF)
+        interp.set_vgpr(11, 0xCAFEBABE)
+
+        interp.ds_and_b32(vaddr_reg=0, vdata_reg=1, lane=0)
+        self.assertEqual(interp.get_vgpr(10), 0xDEADBEEF)
+
+        interp.ds_and_b64(vaddr_reg=0, vdata_lo_reg=1, lane=0)
+        self.assertEqual(interp.get_vgpr(10), 0xDEADBEEF)
+        self.assertEqual(interp.get_vgpr(11), 0xCAFEBABE)
+
+    def test_returning_forms_capture_exact_old_values(self):
+        interp = LdsSemanticInterpreter(lds_dwords=64, num_vgprs=16, num_lanes=1)
+        interp.set_lds_dword(5, 0x5555AAAA)
+        interp.set_vgpr(0, 20)
+        interp.set_vgpr(1, 0x0F0F0F0F)
+        interp.set_vgpr(5, 0)
+
+        res = interp.ds_and_rtn_b32(vdst_reg=5, vaddr_reg=0, vdata_reg=1, lane=0)
+        self.assertEqual(res, (5, 0x5555AAAA))
+        self.assertEqual(interp.get_vgpr(5), 0x5555AAAA)
+        self.assertEqual(interp.get_lds_dword(5), 0x5555AAAA & 0x0F0F0F0F)
+
+    def test_sequential_and_return_chain(self):
+        interp = LdsSemanticInterpreter(lds_dwords=64, num_vgprs=16, num_lanes=1)
+        interp.set_lds_dword(2, 0xFFFFFFFF)
+        interp.set_vgpr(0, 8)
+
+        # Step 1: mask 0xF0F0F0F0 -> returns 0xFFFFFFFF, memory becomes 0xF0F0F0F0
+        interp.set_vgpr(1, 0xF0F0F0F0)
+        res1 = interp.ds_and_rtn_b32(vdst_reg=3, vaddr_reg=0, vdata_reg=1, lane=0)
+        self.assertEqual(res1, (2, 0xFFFFFFFF))
+        self.assertEqual(interp.get_vgpr(3), 0xFFFFFFFF)
+        self.assertEqual(interp.get_lds_dword(2), 0xF0F0F0F0)
+
+        # Step 2: mask 0x33333333 -> returns 0xF0F0F0F0, memory becomes 0x30303030
+        interp.set_vgpr(1, 0x33333333)
+        res2 = interp.ds_and_rtn_b32(vdst_reg=4, vaddr_reg=0, vdata_reg=1, lane=0)
+        self.assertEqual(res2, (2, 0xF0F0F0F0))
+        self.assertEqual(interp.get_vgpr(4), 0xF0F0F0F0)
+        self.assertEqual(interp.get_lds_dword(2), 0x30303030)
+
+        # Step 3: mask 0x0F0F0F0F -> returns 0x30303030, memory becomes 0x00000000
+        interp.set_vgpr(1, 0x0F0F0F0F)
+        res3 = interp.ds_and_rtn_b32(vdst_reg=5, vaddr_reg=0, vdata_reg=1, lane=0)
+        self.assertEqual(res3, (2, 0x30303030))
+        self.assertEqual(interp.get_vgpr(5), 0x30303030)
+        self.assertEqual(interp.get_lds_dword(2), 0x00000000)
+
+
+class TestTranslatorIntegration(unittest.TestCase):
+    """Verifies that tools/rdna2spirv.py emits conforming SPIR-V for ds_and_b32, ds_and_rtn_b32, and b64 forms."""
+
+    def _make_mock_gen(self, stage: str = "cs"):
+        class MockGen:
+            def __init__(self):
+                self.stage = stage
+                self.uses_lds = False
+                self.lds_dwords = 256
+                self.wave64 = True
+                self._tmp = 0
+                self.emitted: list[str] = []
+                self.stored_dsts: list[tuple[dict, str]] = []
+
+            def tmp(self):
+                self._tmp += 1
+                return f"%t{self._tmp}"
+
+            def cu(self, v):
+                return f"%c{v}"
+
+            def active_b(self):
+                return "%exec_active"
+
+            def src_u(self, arg):
+                return f"%v_{arg['r']}"
+
+            def dst(self, d, v):
+                self.stored_dsts.append((d, v))
+
+            def emit(self, line):
+                self.emitted.append(line)
+
+            def load_reg(self, kind, r):
+                return f"%v_{r}"
+
+            LDS_ATOMICS = rdna2spirv.Gen.LDS_ATOMICS
+            mod_int = staticmethod(rdna2spirv.Gen.mod_int)
+            lds_ptr = rdna2spirv.Gen.lds_ptr
+            lds_op = rdna2spirv.Gen.lds_op
+
+        return MockGen()
+
+    def test_lds_atomics_table_contains_ds_and(self):
+        self.assertIn("ds_and_b32", rdna2spirv.Gen.LDS_ATOMICS)
+        self.assertEqual(rdna2spirv.Gen.LDS_ATOMICS["ds_and_b32"], "OpAtomicAnd")
+
+    def test_ds_and_b32_non_returning_emission(self):
+        gen = self._make_mock_gen(stage="cs")
+        gen.lds_op("ds_and_b32", [{"r": 0}, {"r": 1}], ["offset:8"])
+        self.assertTrue(gen.uses_lds)
+        emitted_str = "\n".join(gen.emitted)
+
+        self.assertIn("OpBranchConditional %exec_active", emitted_str)
+        self.assertIn("OpIAdd %uint %v_0 %c8", emitted_str)
+        self.assertIn("OpShiftRightLogical %uint", emitted_str)
+        self.assertIn("OpBitwiseAnd %uint", emitted_str)
+        self.assertIn("OpAccessChain %_ptr_WG_uint %lds", emitted_str)
+        self.assertIn("OpAtomicAnd %uint", emitted_str)
+        self.assertIn("%c2 %c0 %v_1", emitted_str)
+        self.assertEqual(len(gen.stored_dsts), 0)
+
+    def test_ds_and_rtn_b32_returning_emission(self):
+        gen = self._make_mock_gen(stage="cs")
+        gen.lds_op("ds_and_rtn_b32", [{"r": 5}, {"r": 0}, {"r": 1}], ["offset:12"])
+        self.assertTrue(gen.uses_lds)
+        emitted_str = "\n".join(gen.emitted)
+
+        self.assertIn("OpAtomicAnd %uint", emitted_str)
+        self.assertIn("%c2 %c0 %v_1", emitted_str)
+        self.assertEqual(len(gen.stored_dsts), 1)
+        dest_reg, val_id = gen.stored_dsts[0]
+        self.assertEqual(dest_reg["r"], 5)
+        self.assertTrue(val_id.startswith("%t"))
+
+    def test_ds_and_b64_emission(self):
+        gen = self._make_mock_gen(stage="cs")
+        gen.lds_op("ds_and_b64", [{"r": 0}, {"r": 2, "n": 2, "k": "vgpr"}], ["offset:16"])
+        self.assertTrue(gen.uses_lds)
+        emitted_str = "\n".join(gen.emitted)
+
+        # Emits two 32-bit OpAtomicAnd instructions
+        atomic_lines = [ln for ln in gen.emitted if "OpAtomicAnd" in ln]
+        self.assertEqual(len(atomic_lines), 2)
+        self.assertEqual(len(gen.stored_dsts), 0)
+
+    def test_ds_and_rtn_b64_emission(self):
+        gen = self._make_mock_gen(stage="cs")
+        gen.lds_op(
+            "ds_and_rtn_b64",
+            [{"r": 6, "n": 2, "k": "vgpr"}, {"r": 0}, {"r": 2, "n": 2, "k": "vgpr"}],
+            ["offset:0"],
+        )
+        self.assertTrue(gen.uses_lds)
+        atomic_lines = [ln for ln in gen.emitted if "OpAtomicAnd" in ln]
+        self.assertEqual(len(atomic_lines), 2)
+        # Stores two registers: v6 and v7
+        self.assertEqual(len(gen.stored_dsts), 2)
+        self.assertEqual(gen.stored_dsts[0][0]["r"], 6)
+        self.assertEqual(gen.stored_dsts[1][0]["r"], 7)
+
+
+class TestSpirvAtomicAndB64Emission(unittest.TestCase):
+    """Verifies that 64-bit LDS atomic AND translates to conforming SPIR-V and executes correctly."""
+
+    def test_rdna2spirv_translate_b64_emission(self):
+        spv = translate_cs_listing([
+            "ds_and_b64 v0, v[2:3]",
+            "ds_and_rtn_b64 v[4:5], v0, v[2:3] offset:16",
+        ])
+        lines = [ln.strip() for ln in spv.splitlines() if "OpAtomicAnd" in ln]
+        self.assertEqual(len(lines), 4)
+        for ln in lines:
+            self.assertIn("OpAtomicAnd", ln)
+            self.assertIn("%uint", ln)
+            self.assertIn("%c2", ln)
+            self.assertIn("%c0", ln)
+
+    def test_spirv_sequential_atomics_emulating_b64(self):
+        spvasm = """
+OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main" %out_lo %out_hi
+OpExecutionMode %main LocalSize 1 1 1
+%uint = OpTypeInt 32 0
+%c64 = OpConstant %uint 64
+%c2 = OpConstant %uint 2
+%c0 = OpConstant %uint 0
+%c10 = OpConstant %uint 10
+%c11 = OpConstant %uint 11
+%c_mask_lo = OpConstant %uint 3735928559
+%c_mask_hi = OpConstant %uint 3405691582
+%lds_arr = OpTypeArray %uint %c64
+%_ptr_WG_lds = OpTypePointer Workgroup %lds_arr
+%_ptr_WG_uint = OpTypePointer Workgroup %uint
+%_ptr_Out_uint = OpTypePointer Output %uint
+%lds = OpVariable %_ptr_WG_lds Workgroup
+%out_lo = OpVariable %_ptr_Out_uint Output
+%out_hi = OpVariable %_ptr_Out_uint Output
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%ptr_lo = OpAccessChain %_ptr_WG_uint %lds %c10
+%ptr_hi = OpAccessChain %_ptr_WG_uint %lds %c11
+%old_lo = OpAtomicAnd %uint %ptr_lo %c2 %c0 %c_mask_lo
+%old_hi = OpAtomicAnd %uint %ptr_hi %c2 %c0 %c_mask_hi
+OpStore %out_lo %old_lo
+OpStore %out_hi %old_hi
+OpReturn
+OpFunctionEnd
+"""
+        interp = LdsAtomicSpirvInterp(spvasm)
+        init_lo = 0xFFFFFFFF
+        init_hi = 0xFFFFFFFF
+        final_lds, lane_outputs = interp.run(seed_lds={10: init_lo, 11: init_hi})
+        self.assertEqual(lane_outputs[0]["%out_lo"], init_lo)
+        self.assertEqual(lane_outputs[0]["%out_hi"], init_hi)
+        self.assertEqual(final_lds[10], 3735928559)
+        self.assertEqual(final_lds[11], 3405691582)
+
+
+class TestNegativeControlsAndBounds(unittest.TestCase):
+    """Verifies that invalid operands, unmodelled opcodes, bad stages, and bound violations fail safely."""
+
+    def test_rdna2spirv_invalid_operand_shape_rejected(self):
+        with self.assertRaises(rdna2spirv.Unsupported):
+            translate_cs_listing(["ds_and_b64 v0, v1"])
+
+    def test_rdna2spirv_invalid_rtn_destination_shape_rejected(self):
+        with self.assertRaises(rdna2spirv.Unsupported):
+            translate_cs_listing(["ds_and_rtn_b64 v4, v0, v[2:3]"])
+
+    def test_rdna2spirv_non_compute_stage_rejected(self):
+        class MockPixelGen:
+            def __init__(self):
+                self.stage = "ps"
+                self.uses_lds = False
+
+            lds_op = rdna2spirv.Gen.lds_op
+
+        gen = MockPixelGen()
+        with self.assertRaises(rdna2spirv.Unsupported):
+            gen.lds_op("ds_and_b32", [{"r": 0}, {"r": 1}], [])
+        with self.assertRaises(rdna2spirv.Unsupported):
+            gen.lds_op("ds_and_b64", [{"r": 0}, {"r": 1, "n": 2, "k": "vgpr"}], [])
+
+    def test_spirv_unsupported_storage_class(self):
+        spvasm = """
+OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+%uint = OpTypeInt 32 0
+%_ptr_UC = OpTypePointer UniformConstant %uint
+%u = OpVariable %_ptr_UC UniformConstant
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%main = OpFunction %void None %fn
+%entry = OpLabel
+OpReturn
+OpFunctionEnd
+"""
+        with self.assertRaises(UnsupportedConstruct):
+            LdsAtomicSpirvInterp(spvasm)
+
+    def test_spirv_unsupported_opcode_in_body(self):
+        spvasm = """
+OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+%uint = OpTypeInt 32 0
+%c10 = OpConstant %uint 10
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%bad = OpSDiv %uint %c10 %c10
+OpReturn
+OpFunctionEnd
+"""
+        interp = LdsAtomicSpirvInterp(spvasm)
+        with self.assertRaises(UnsupportedConstruct):
+            interp.run()
+
+    def test_spirv_invalid_workgroup_local_sizes(self):
+        for bad_dims in [(0, 1, 1), (1025, 1, 1), (33, 32, 1)]:
+            with self.subTest(dims=bad_dims):
+                spvasm = f"""
+OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize {bad_dims[0]} {bad_dims[1]} {bad_dims[2]}
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%main = OpFunction %void None %fn
+%entry = OpLabel
+OpReturn
+OpFunctionEnd
+"""
+                with self.assertRaises(WorkgroupBoundsError):
+                    LdsAtomicSpirvInterp(spvasm)
+
+    def test_spirv_atomic_on_non_lds_pointer(self):
+        spvasm = """
+OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+%uint = OpTypeInt 32 0
+%_ptr_fn_uint = OpTypePointer Function %uint
+%c2 = OpConstant %uint 2
+%c0 = OpConstant %uint 0
+%c5 = OpConstant %uint 5
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%local_v = OpVariable %_ptr_fn_uint Function
+%bad = OpAtomicAnd %uint %local_v %c2 %c0 %c5
+OpReturn
+OpFunctionEnd
+"""
+        interp = LdsAtomicSpirvInterp(spvasm)
+        with self.assertRaises(UnsupportedConstruct):
+            interp.run()
+
+    def test_spirv_lds_access_out_of_bounds_rejected(self):
+        spvasm = """
+OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+%uint = OpTypeInt 32 0
+%c8 = OpConstant %uint 8
+%c2 = OpConstant %uint 2
+%c0 = OpConstant %uint 0
+%c20 = OpConstant %uint 20
+%c5 = OpConstant %uint 5
+%lds_arr = OpTypeArray %uint %c8
+%_ptr_WG_lds = OpTypePointer Workgroup %lds_arr
+%_ptr_WG_uint = OpTypePointer Workgroup %uint
+%lds = OpVariable %_ptr_WG_lds Workgroup
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%ptr = OpAccessChain %_ptr_WG_uint %lds %c20
+%bad = OpAtomicAnd %uint %ptr %c2 %c0 %c5
+OpReturn
+OpFunctionEnd
+"""
+        interp = LdsAtomicSpirvInterp(spvasm)
+        with self.assertRaises(WorkgroupBoundsError):
+            interp.run()
 
 
 if __name__ == "__main__":
