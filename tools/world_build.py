@@ -447,13 +447,13 @@ def _pack_model_job(job: tuple) -> tuple[int, dict | None]:
     }
 
 
-_PNG_CACHE: dict[tuple[str, int], bytes | None] = {}
+_PNG_CACHE: dict[tuple[str, str, int], bytes | None] = {}
 _PNG_CACHE_BUDGET = 256 * 1024 * 1024
 
 
-def _png_for(dds_path: str, max_tex_size: int) -> bytes | None:
-    """Decode a DDS to PNG once per worker, keeping at most about 256 MB of PNGs (oldest dropped first)."""
-    key = (os.path.normcase(os.path.abspath(dds_path)), max_tex_size)
+def _png_for(staging_dir: str, dds_path: str, max_tex_size: int) -> bytes | None:
+    """Decode once per worker per build, keeping at most about 256 MB of PNGs (oldest dropped first)."""
+    key = (staging_dir, os.path.normcase(os.path.abspath(dds_path)), max_tex_size)
     if key in _PNG_CACHE:
         return _PNG_CACHE[key]
     dds_mod = _get_dds_png()
@@ -491,7 +491,7 @@ def _build_chunk_job(job: tuple) -> tuple[dict, int, int, int]:
         keys = sorted({p["material"] for m in meshes for p in m["primitives"] if p["material"]})
         for key in keys:
             dds = mat_to_dds.get(key)
-            png = _png_for(dds, max_tex_size) if dds else None
+            png = _png_for(staging_dir, dds, max_tex_size) if dds else None
             if png is None:
                 skipped += 1
                 continue
