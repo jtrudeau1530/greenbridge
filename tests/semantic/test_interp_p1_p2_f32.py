@@ -89,7 +89,7 @@ def apply_f32_modifiers(bits: int, abs_mod: bool = False, neg_mod: bool = False)
 
 def apply_f32_clamp(val_bits: int) -> int:
     """Apply RDNA2 clamp [0.0, 1.0] modifier; NaNs clamp to +0.0."""
-    if is_nan_f32(val_bits):
+    if is_nan_f32(val_bits) or val_bits == NEG_ZERO_F32:
         return POS_ZERO_F32
     val = bits_to_f32(val_bits)
     if val < 0.0:
@@ -1282,6 +1282,102 @@ class TestConditionCodesAndStatusFlags(unittest.TestCase):
         # 1.0 + 0.25 -> mantissas sum is 1.25 < 2.0 -> carry out = 0
         _, carry0 = compute_f32_mantissa_carry(f32_to_bits(1.0), f32_to_bits(0.25))
         self.assertEqual(carry0, 0)
+
+
+class TestIEEE754BoundaryExtremes(unittest.TestCase):
+    """Test suite for IEEE 754 boundary extremes, subnormals, and NaN handling."""
+
+    def test_nan_clamping_to_positive_zero(self) -> None:
+        # In RDNA2, when clamp modifier is active, any NaN result must clamp to +0.0
+        qnan = CANONICAL_QNAN_F32
+        p0 = f32_to_bits(1.0)
+        p10 = f32_to_bits(2.0)
+
+        # NaN coordinate without clamp produces NaN
+        res_no_clamp = oracle_v_interp_p1_f32(qnan, p10, p0, clamp=False)
+        self.assertTrue(is_nan_f32(res_no_clamp))
+
+        # NaN coordinate WITH clamp produces exact POS_ZERO (+0.0)
+        res_clamped = oracle_v_interp_p1_f32(qnan, p10, p0, clamp=True)
+        self.assertEqual(res_clamped, POS_ZERO_F32)
+
+        # NaN in p2 with clamp produces exact POS_ZERO
+        res_p2_clamped = oracle_v_interp_p2_f32(qnan, p10, p0, clamp=True)
+        self.assertEqual(res_p2_clamped, POS_ZERO_F32)
+
+        # NaN in mov with clamp produces POS_ZERO
+        res_mov_clamped = oracle_v_interp_mov_f32(0, qnan, p10, p0, clamp=True)
+        self.assertEqual(res_mov_clamped, POS_ZERO_F32)
+
+    def test_infinity_clamping(self) -> None:
+        # +inf clamped produces 1.0
+        # -inf clamped produces +0.0
+        p0 = f32_to_bits(0.0)
+        p10 = f32_to_bits(1.0)
+
+        res_pos_inf = oracle_v_interp_p1_f32(POS_INF_F32, p10, p0, clamp=True)
+        self.assertEqual(res_pos_inf, ONE_F32)
+
+        res_neg_inf = oracle_v_interp_p1_f32(NEG_INF_F32, p10, p0, clamp=True)
+        self.assertEqual(res_neg_inf, POS_ZERO_F32)
+
+    def test_signed_zero_rules(self) -> None:
+        # -0.0 * 2.0 + (-0.0) -> -0.0
+        p0_neg = NEG_ZERO_F32
+        p10 = f32_to_bits(2.0)
+        s_neg_zero = NEG_ZERO_F32
+
+        res = oracle_v_interp_p1_f32(s_neg_zero, p10, p0_neg)
+        self.assertEqual(res, NEG_ZERO_F32)
+
+        # -0.0 + (+0.0) -> +0.0 per IEEE 754 RNE
+        res_pos = oracle_v_interp_p1_f32(s_neg_zero, p10, POS_ZERO_F32)
+        self.assertEqual(res_pos, POS_ZERO_F32)
+
+        # Clamping -0.0 produces +0.0
+        res_clamp = oracle_v_interp_p1_f32(s_neg_zero, p10, p0_neg, clamp=True)
+        self.assertEqual(res_clamp, POS_ZERO_F32)
+
+    def test_subnormal_precision(self) -> None:
+        # Smallest subnormal: 0x00000001 = 2**-149
+        subnorm = 0x0000_0001
+        s = f32_to_bits(2.0)
+        p0 = POS_ZERO_F32
+
+        # 2.0 * 2**-149 = 2**-148 (0x00000002)
+        res = oracle_v_interp_p1_f32(s, subnorm, p0)
+        self.assertEqual(res, 0x0000_0002)
+
+    def test_signaling_nan_handling(self) -> None:
+        # Signaling NaN: exponent all 1s, non-zero fraction with MSB fraction = 0
+        snan = 0x7F80_0001
+        p0 = f32_to_bits(1.0)
+        p10 = f32_to_bits(2.0)
+
+        res = oracle_v_interp_p1_f32(snan, p10, p0)
+        self.assertTrue(is_nan_f32(res))
+
+    def test_flt_max_overflow(self) -> None:
+        flt_max = 0x7F7F_FFFF  # ~3.4028235e+38
+        s = f32_to_bits(2.0)
+        p0 = POS_ZERO_F32
+
+        # Overflows to +inf
+        res_unclamped = oracle_v_interp_p1_f32(s, flt_max, p0)
+        self.assertEqual(res_unclamped, POS_INF_F32)
+
+        # Clamped overflows saturate to 1.0
+        res_clamped = oracle_v_interp_p1_f32(s, flt_max, p0, clamp=True)
+        self.assertEqual(res_clamped, ONE_F32)
+
+    def test_invalid_operation_nan_generation(self) -> None:
+        # 0.0 * inf is invalid, resulting in canonical NaN
+        s_zero = POS_ZERO_F32
+        p_inf = POS_INF_F32
+        a_zero = POS_ZERO_F32
+
+        res = oracle_v_interp_p1_f32(s_zero, p_inf, a_zero)
+        self.assertEqual(res, CANONICAL_QNAN_F32)
 
 
 if __name__ == "__main__":
