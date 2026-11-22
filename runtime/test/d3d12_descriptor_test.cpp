@@ -547,11 +547,14 @@ int main() {
             {D3D12_SRV_DIMENSION_TEXTURECUBE, 0, 6, 1}, {D3D12_SRV_DIMENSION_TEXTURECUBE, 0, 6, 2},
             {D3D12_SRV_DIMENSION_TEXTURECUBEARRAY, 6, 12, 1}, {D3D12_SRV_DIMENSION_TEXTURECUBEARRAY, 6, 12, 2},
         };
+        constexpr UINT lod_view_count = std::size(lod_views);
+        constexpr UINT array_clamp_count = std::size(array_clamps);
+        constexpr UINT cube_lod_count = std::size(cube_lods);
         // Keep multisample views after the preceding volume and minimum-LOD views.
         enum : UINT {
-            array_lod_slot = first_lod_slot + std::size(lod_views),
-            cube_lod_slot = array_lod_slot + std::size(array_clamps),
-            ms_slot = cube_lod_slot + std::size(cube_lods), ms_array_slot, ms_slice_slot, ms_first_layer_slot,
+            array_lod_slot = first_lod_slot + lod_view_count,
+            cube_lod_slot = array_lod_slot + array_clamp_count,
+            ms_slot = cube_lod_slot + cube_lod_count, ms_array_slot, ms_slice_slot, ms_first_layer_slot,
             ms_uint_slot, ms_uint_array_slot, ms_sint_slot, ms_sint_array_slot, view_slot_count
         };
         D3D12_DESCRIPTOR_HEAP_DESC heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, view_slot_count,
