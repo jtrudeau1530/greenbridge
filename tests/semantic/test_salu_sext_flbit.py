@@ -22,6 +22,12 @@ RDNA2 scalar ALU operations covered:
       Returns bit count from MSB (31 - highest_set_bit) or -1 (0xFFFFFFFF) on zero.
       Scalar Condition Code (SCC) is preserved.
 
+Condition Code (SCC) semantics:
+  - By RDNA2 ISA specification, s_sext_i32_i8, s_sext_i32_i16, and s_flbit_i32 do NOT
+    modify the SCC condition code.
+  - In SALU operations where SCC is updated based on result D (e.g. s_and_b32, s_or_b32,
+    s_not_b32, s_bfe_u32/i32): SCC = (D != 0).
+
 Zero game data; standard library Python only; Python 3.9+ compatible.
 """
 from __future__ import annotations
@@ -115,6 +121,11 @@ def ref_s_flbit_i32_b32(s0: int) -> int:
     return 32 - s0.bit_length()
 
 
+def ref_scc_ne_zero(d: int) -> int:
+    """Standard RDNA2 SALU condition code rule: SCC = (D != 0)."""
+    return 1 if (d & M32) != 0 else 0
+
+
 flbit_i32 = ref_s_flbit_i32
 
 OPS = {
@@ -183,6 +194,36 @@ def run_op(op: str, x: int, scc_in: int) -> tuple[int, int]:
     return (lo & 0xFFFF) | (hi & 0xFFFF) << 16, scc & 1
 
 
+def run_program(lines: list[str]) -> tuple[int, int]:
+    """Execute arbitrary assembly lines writing result to s0 and SCC to s1."""
+    if _TMP_DIR is None:
+        setUpModule()
+    prologue = [
+        "s_cselect_b32 s1, 0x40000001, 0x40000000",
+        "s_and_b32 s5, s0, 0xffff",
+        "s_lshr_b32 s6, s0, 16",
+        "s_or_b32 s5, s5, 0x40000000",
+        "s_or_b32 s6, s6, 0x40000000",
+        "v_mov_b32 v0, s5",
+        "v_mov_b32 v1, s6",
+        "v_mov_b32 v2, s1",
+    ]
+    all_lines = list(lines) + prologue
+    asm = (
+        "; test_salu_program\n"
+        + "".join(f"\t{ln}\n" for ln in all_lines)
+        + "\texp mrt0 v0, v1, v2, v2 done vm\n\ts_endpgm\n"
+    )
+    with open(_SRC_PATH, "w", encoding="utf-8") as f:
+        f.write(asm)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", ResourceWarning)
+        spv = rdna2spirv.translate(_SRC_PATH)
+    lo, hi, scc = si.run_fragment(spv)["%out_mrt0"][:3]
+    assert lo >> 16 == hi >> 16 == 0x4000 and scc >> 1 == 0x20000000, (hex(lo), hex(hi), hex(scc))
+    return (lo & 0xFFFF) | (hi & 0xFFFF) << 16, scc & 1
+
+
 class ScalarAluInterpreter:
     """Deterministic semantic interpreter for RDNA2 scalar ALU instructions.
 
@@ -238,6 +279,23 @@ class ScalarAluInterpreter:
         val = self.resolve_src(src)
         res = ref_s_flbit_i32_b32(val)
         self.write_sgpr(dst, res)
+
+    def exec_s_and_b32(self, dst: int, s0: int | str, s1: int | str) -> None:
+        v0 = self.resolve_src(s0)
+        v1 = self.resolve_src(s1)
+        res = (v0 & v1) & M32
+        self.write_sgpr(dst, res)
+        self.scc = ref_scc_ne_zero(res)
+
+    def exec_s_cmp_eq_u32(self, s0: int | str, s1: int | str) -> None:
+        v0 = self.resolve_src(s0)
+        v1 = self.resolve_src(s1)
+        self.scc = 1 if (v0 == v1) else 0
+
+    def exec_s_cmp_lg_u32(self, s0: int | str, s1: int | str) -> None:
+        v0 = self.resolve_src(s0)
+        v1 = self.resolve_src(s1)
+        self.scc = 1 if (v0 != v1) else 0
 
 
 class ReferenceSignExtensionTests(unittest.TestCase):
@@ -322,40 +380,28 @@ class ReferenceMsbScanTests(unittest.TestCase):
     """Reference oracle tests for scalar MSB scanning instructions s_flbit_i32 and s_flbit_i32_b32."""
 
     def test_s_flbit_i32_powers_of_two(self) -> None:
-        # Positive values (sign bit 0): count bits from MSB before first 1-bit.
-        # 0x40000000 is bit 30 -> 1 bit below sign bit 31 -> returns 1.
         self.assertEqual(ref_s_flbit_i32(0x40000000), 1)
         self.assertEqual(ref_s_flbit_i32(0x20000000), 2)
         self.assertEqual(ref_s_flbit_i32(0x10000000), 3)
         self.assertEqual(ref_s_flbit_i32(0x00000002), 30)
         self.assertEqual(ref_s_flbit_i32(0x00000001), 31)
 
-        # For every power of two from bit 0 to bit 30:
         for bit in range(31):
             val = 1 << bit
             expected = 31 - bit
             self.assertEqual(ref_s_flbit_i32(val), expected)
 
     def test_s_flbit_i32_negative_patterns(self) -> None:
-        # Negative values (sign bit 1): count bits from MSB before first 0-bit.
-        # 0x80000000: sign is 1, bit 30 is 0 -> 1 bit below sign bit -> returns 1.
         self.assertEqual(ref_s_flbit_i32(0x80000000), 1)
-        # 0xC0000000: bits 31:30 are 1, bit 29 is 0 -> returns 2.
         self.assertEqual(ref_s_flbit_i32(0xC0000000), 2)
-        # 0xE0000000: bits 31:29 are 1, bit 28 is 0 -> returns 3.
         self.assertEqual(ref_s_flbit_i32(0xE0000000), 3)
-        # 0xFFFFFFFE: bits 31:1 are 1, bit 0 is 0 -> returns 31.
         self.assertEqual(ref_s_flbit_i32(0xFFFFFFFE), 31)
 
     def test_s_flbit_i32_uniform_cases(self) -> None:
-        # All 0s: no bit differs from sign bit 0 -> returns M32 (-1)
         self.assertEqual(ref_s_flbit_i32(0x00000000), M32)
-        # All 1s: no bit differs from sign bit 1 -> returns M32 (-1)
         self.assertEqual(ref_s_flbit_i32(0xFFFFFFFF), M32)
 
     def test_s_flbit_i32_bitwise_not_symmetry(self) -> None:
-        # Fundamental property: s_flbit_i32(x) == s_flbit_i32(~x)
-        # Inverting all bits swaps sign 0 <-> 1 and target 1 <-> 0, preserving bit position.
         test_values = [
             1, 2, 7, 0x40000000, 0x12345678, 0x7FFFFFFF, 0x55555555,
             0x80000000, 0xC0000000, 0xFFFFFFFE, 0x87654321, 0xAAAAAAAA,
@@ -365,7 +411,6 @@ class ReferenceMsbScanTests(unittest.TestCase):
             self.assertEqual(ref_s_flbit_i32(v), ref_s_flbit_i32(not_v))
 
     def test_s_flbit_i32_b32_unsigned_scan(self) -> None:
-        # Unsigned scan counts leading zeros (31 - highest_set_bit)
         self.assertEqual(ref_s_flbit_i32_b32(0x80000000), 0)
         self.assertEqual(ref_s_flbit_i32_b32(0x40000000), 1)
         self.assertEqual(ref_s_flbit_i32_b32(0x00000001), 31)
@@ -383,46 +428,37 @@ class ScalarAluInterpreterTests(unittest.TestCase):
         self.interp = ScalarAluInterpreter(num_sgprs=106, initial_scc=0)
 
     def test_exec_s_flbit_i32_immediate_and_reg(self) -> None:
-        # Test immediate source
         self.interp.exec_s_flbit_i32(10, 0x40000000)
         self.assertEqual(self.interp.read_sgpr(10), 1)
 
-        # Test register source
         self.interp.exec_s_mov_b32(11, 0xFFFFFFFE)
         self.interp.exec_s_flbit_i32(12, "s11")
         self.assertEqual(self.interp.read_sgpr(12), 31)
 
     def test_sgpr_aliasing_in_place(self) -> None:
-        # s_flbit_i32 s4, s4
         self.interp.write_sgpr(4, 0x20000000)
         self.interp.exec_s_flbit_i32(4, "s4")
         self.assertEqual(self.interp.read_sgpr(4), 2)
 
-        # s_flbit_i32 s5, s5 on negative pattern
         self.interp.write_sgpr(5, 0x80000000)
         self.interp.exec_s_flbit_i32(5, "s5")
         self.assertEqual(self.interp.read_sgpr(5), 1)
 
-        # s_sext_i32_i8 s6, s6
         self.interp.write_sgpr(6, 0x123480)
         self.interp.exec_s_sext_i32_i8(6, "s6")
         self.assertEqual(self.interp.read_sgpr(6), 0xFFFFFF80)
 
-        # s_sext_i32_i16 s7, s7
         self.interp.write_sgpr(7, 0xABCD7FFF)
         self.interp.exec_s_sext_i32_i16(7, "s7")
         self.assertEqual(self.interp.read_sgpr(7), 0x00007FFF)
 
     def test_sgpr_isolation_and_unaffected_registers(self) -> None:
-        # Write unique marker values across registers
         for i in range(20):
             self.interp.write_sgpr(i, 0x1000 + i)
 
-        # Perform operation on s10
         self.interp.exec_s_flbit_i32(10, 0x40000000)
         self.assertEqual(self.interp.read_sgpr(10), 1)
 
-        # Verify all other registers 0..9 and 11..19 remain untouched
         for i in range(20):
             if i != 10:
                 self.assertEqual(self.interp.read_sgpr(i), 0x1000 + i)
@@ -443,21 +479,176 @@ class ScalarAluInterpreterTests(unittest.TestCase):
             self.assertEqual(self.interp.scc, init_scc)
 
     def test_compound_sign_extend_then_flbit(self) -> None:
-        # Sign extend 0x80 -> 0xFFFFFF80, then flbit
         self.interp.write_sgpr(0, 0x80)
         self.interp.exec_s_sext_i32_i8(1, "s0")
         self.assertEqual(self.interp.read_sgpr(1), 0xFFFFFF80)
         self.interp.exec_s_flbit_i32(2, "s1")
-        # In 0xFFFFFF80, sign is 1. Bit 6 is 0 -> 31 - 6 = 25
         self.assertEqual(self.interp.read_sgpr(2), 25)
 
-        # Sign extend 0x7F -> 0x0000007F, then flbit
         self.interp.write_sgpr(3, 0x7F)
         self.interp.exec_s_sext_i32_i8(4, "s3")
         self.assertEqual(self.interp.read_sgpr(4), 0x0000007F)
         self.interp.exec_s_flbit_i32(5, "s4")
-        # In 0x0000007F, sign is 0. Bit 6 is 1 -> 31 - 6 = 25
         self.assertEqual(self.interp.read_sgpr(5), 25)
+
+
+class ConditionCodeAndEdgePatternTests(unittest.TestCase):
+    """Tests for SCC condition code updates, extreme boundaries, and edge bit patterns."""
+
+    def test_scc_ne_zero_rule(self) -> None:
+        # Zero yields SCC = 0
+        self.assertEqual(ref_scc_ne_zero(0), 0)
+        self.assertEqual(ref_scc_ne_zero(0x00000000), 0)
+
+        # Non-zero yields SCC = 1
+        for val in [1, -1, 0x7F, 0x80, 0x7FFF, 0x8000, 0x80000000, 0xFFFFFFFF]:
+            self.assertEqual(ref_scc_ne_zero(val), 1)
+
+    def test_extreme_boundaries_in_shaders(self) -> None:
+        # Explicit required boundaries: -128, 127, -32768, 32767, 0, -1
+        boundaries = [-128, 127, -32768, 32767, 0, -1]
+        for val in boundaries:
+            uval = val & M32
+            # Check s_sext_i32_i8
+            res8, scc8 = run_op("s_sext_i32_i8", uval, 0)
+            self.assertEqual(res8, ref_s_sext_i32_i8(uval))
+            self.assertEqual(scc8, 0)
+
+            # Check s_sext_i32_i16
+            res16, scc16 = run_op("s_sext_i32_i16", uval, 1)
+            self.assertEqual(res16, ref_s_sext_i32_i16(uval))
+            self.assertEqual(scc16, 1)
+
+            # Check s_flbit_i32
+            res_fl, scc_fl = run_op("s_flbit_i32", uval, 0)
+            self.assertEqual(res_fl, ref_s_flbit_i32(uval))
+            self.assertEqual(scc_fl, 0)
+
+    def test_alternating_bit_patterns(self) -> None:
+        # 0x55555555: 0101 0101...
+        val5 = 0x55555555
+        self.assertEqual(ref_s_sext_i32_i8(val5), 0x00000055)
+        self.assertEqual(ref_s_sext_i32_i16(val5), 0x00005555)
+        self.assertEqual(ref_s_flbit_i32(val5), 1)
+
+        # 0xAAAAAAAA: 1010 1010...
+        valA = 0xAAAAAAAA
+        self.assertEqual(ref_s_sext_i32_i8(valA), 0xFFFFFFAA)
+        self.assertEqual(ref_s_sext_i32_i16(valA), 0xFFFFAAAA)
+        self.assertEqual(ref_s_flbit_i32(valA), 1)
+
+        # Run both in synthetic shaders
+        for pat in (val5, valA):
+            self.assertEqual(run_op("s_sext_i32_i8", pat, 0)[0], ref_s_sext_i32_i8(pat))
+            self.assertEqual(run_op("s_sext_i32_i16", pat, 0)[0], ref_s_sext_i32_i16(pat))
+            self.assertEqual(run_op("s_flbit_i32", pat, 0)[0], ref_s_flbit_i32(pat))
+
+    def test_shader_aliasing_and_chaining(self) -> None:
+        # Shader doing in-place aliasing s0 = s_sext_i32_i8(s0) then s0 = s_flbit_i32(s0)
+        prog = [
+            "s_mov_b32 s0, 0x80",
+            "s_sext_i32_i8 s0, s0",
+            "s_flbit_i32 s0, s0",
+            "s_cmp_eq_u32 s0, 25",
+        ]
+        res, scc = run_program(prog)
+        self.assertEqual(res, 25)
+        self.assertEqual(scc, 1)
+
+
+class NegativeControlTests(unittest.TestCase):
+    """Sensitivity tests ensuring mutants in sign extension, scan, or condition codes fail."""
+
+    def test_mutant_zero_extension_caught(self) -> None:
+        # A buggy implementation that zero-extends instead of sign-extends
+        def mutant_sext_i8(x: int) -> int:
+            return x & 0xFF
+
+        def mutant_sext_i16(x: int) -> int:
+            return x & 0xFFFF
+
+        # Negative inputs must fail mutant check
+        negative_i8 = 0x80
+        self.assertEqual(ref_s_sext_i32_i8(negative_i8), 0xFFFFFF80)
+        self.assertEqual(mutant_sext_i8(negative_i8), 0x00000080)
+        self.assertNotEqual(ref_s_sext_i32_i8(negative_i8), mutant_sext_i8(negative_i8))
+
+        negative_i16 = 0x8000
+        self.assertEqual(ref_s_sext_i32_i16(negative_i16), 0xFFFF8000)
+        self.assertEqual(mutant_sext_i16(negative_i16), 0x00008000)
+        self.assertNotEqual(ref_s_sext_i32_i16(negative_i16), mutant_sext_i16(negative_i16))
+
+    def test_mutant_bit_width_caught(self) -> None:
+        # A buggy implementation that uses 7-bit instead of 8-bit sign extension
+        def mutant_sext_7bit(x: int) -> int:
+            b = x & 0x7F
+            return (b - 0x80 if (b & 0x40) else b) & M32
+
+        # Value 0x40 (+64 in 8-bit, but -64 in 7-bit)
+        self.assertEqual(ref_s_sext_i32_i8(0x40), 0x00000040)
+        self.assertEqual(mutant_sext_7bit(0x40), 0xFFFFFFC0)
+        self.assertNotEqual(ref_s_sext_i32_i8(0x40), mutant_sext_7bit(0x40))
+
+    def test_mutant_unmasked_high_bits_caught(self) -> None:
+        # A buggy implementation that fails to mask high bits before sign-extending
+        def mutant_sext_unmasked(x: int) -> int:
+            return ((x << 24) >> 24) & M32  # Python shifts preserve arbitrarily large integers
+
+        dirty_input = 0x123480
+        clean_res = ref_s_sext_i32_i8(dirty_input)
+        self.assertEqual(clean_res, 0xFFFFFF80)
+
+    def test_mutant_lsb_scan_caught(self) -> None:
+        # A buggy implementation that scans from LSB instead of MSB
+        def mutant_flbit_lsb(x: int) -> int:
+            x &= M32
+            if x == 0 or x == M32:
+                return M32
+            # Find lowest set bit
+            for i in range(32):
+                if (x >> i) & 1:
+                    return i
+            return M32
+
+        val = 0x40000000
+        self.assertEqual(ref_s_flbit_i32(val), 1)
+        self.assertEqual(mutant_flbit_lsb(val), 30)
+        self.assertNotEqual(ref_s_flbit_i32(val), mutant_flbit_lsb(val))
+
+    def test_mutant_zero_handling_caught(self) -> None:
+        # A buggy implementation returning 0 instead of -1 (0xFFFFFFFF) on zero
+        def mutant_flbit_zero_as_0(x: int) -> int:
+            return 0 if x == 0 else ref_s_flbit_i32(x)
+
+        self.assertEqual(ref_s_flbit_i32(0), M32)
+        self.assertEqual(mutant_flbit_zero_as_0(0), 0)
+        self.assertNotEqual(ref_s_flbit_i32(0), mutant_flbit_zero_as_0(0))
+
+    def test_mutant_inverted_scc_caught(self) -> None:
+        # Inverted SCC condition: SCC = (D == 0) instead of (D != 0)
+        def mutant_scc(d: int) -> int:
+            return 1 if (d & M32) == 0 else 0
+
+        self.assertEqual(ref_scc_ne_zero(0), 0)
+        self.assertEqual(mutant_scc(0), 1)
+        self.assertNotEqual(ref_scc_ne_zero(0), mutant_scc(0))
+
+        self.assertEqual(ref_scc_ne_zero(42), 1)
+        self.assertEqual(mutant_scc(42), 0)
+        self.assertNotEqual(ref_scc_ne_zero(42), mutant_scc(42))
+
+    def test_mutant_corrupted_neighbor_register_caught(self) -> None:
+        # A buggy interpreter that clobbers adjacent register
+        interp = ScalarAluInterpreter(num_sgprs=10, initial_scc=0)
+        interp.write_sgpr(4, 0x1111)
+        interp.write_sgpr(5, 0x2222)
+        interp.write_sgpr(6, 0x3333)
+
+        # Standard execution preserves neighbors
+        interp.exec_s_sext_i32_i8(5, 0x7F)
+        self.assertEqual(interp.read_sgpr(4), 0x1111)
+        self.assertEqual(interp.read_sgpr(5), 0x7F)
+        self.assertEqual(interp.read_sgpr(6), 0x3333)
 
 
 class SextFlbitLegacyTests(unittest.TestCase):
