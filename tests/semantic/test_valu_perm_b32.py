@@ -336,5 +336,271 @@ class TestPermB32ReferenceOracle(unittest.TestCase):
         self.assertEqual(sw.raw, 0x04030201)
 
 
+# ==============================================================================
+# Symbolic AST and Typed Expressions
+# ==============================================================================
+
+class Opcode(Enum):
+    V_PERM_B32 = "v_perm_b32"
+
+
+class OperandKind(Enum):
+    VGPR = auto()
+    SGPR = auto()
+    INLINE_CONST = auto()
+    LITERAL_CONST = auto()
+
+
+class TypeKind(Enum):
+    RAW32 = "b32"
+    UINT32 = "u32"
+    INT32 = "i32"
+    BYTE_LANE = "u8"
+
+
+@dataclass
+class ASTOperand:
+    """Represents an operand in an RDNA2 instruction AST."""
+    name: str
+    kind: OperandKind
+    type_kind: TypeKind = TypeKind.RAW32
+    reg_index: Optional[int] = None
+    constant_value: Optional[int] = None
+
+    @classmethod
+    def vgpr(cls, idx: int, type_kind: TypeKind = TypeKind.RAW32) -> ASTOperand:
+        return cls(name=f"v{idx}", kind=OperandKind.VGPR, type_kind=type_kind, reg_index=idx)
+
+    @classmethod
+    def sgpr(cls, idx: int, type_kind: TypeKind = TypeKind.RAW32) -> ASTOperand:
+        return cls(name=f"s{idx}", kind=OperandKind.SGPR, type_kind=type_kind, reg_index=idx)
+
+    @classmethod
+    def inline_const(cls, val: int, type_kind: TypeKind = TypeKind.RAW32) -> ASTOperand:
+        return cls(name=str(val), kind=OperandKind.INLINE_CONST, type_kind=type_kind, constant_value=val)
+
+    @classmethod
+    def literal(cls, val: int, type_kind: TypeKind = TypeKind.RAW32) -> ASTOperand:
+        return cls(name=f"0x{val & MASK32:08X}", kind=OperandKind.LITERAL_CONST, type_kind=type_kind, constant_value=val & MASK32)
+
+    def to_asm(self) -> str:
+        return self.name
+
+    @property
+    def is_vgpr(self) -> bool:
+        return self.kind == OperandKind.VGPR
+
+    @property
+    def is_sgpr(self) -> bool:
+        return self.kind == OperandKind.SGPR
+
+    @property
+    def is_constant(self) -> bool:
+        return self.kind in (OperandKind.INLINE_CONST, OperandKind.LITERAL_CONST)
+
+
+@dataclass
+class ASTInstruction:
+    """Represents a VOP3 instruction in the symbolic AST."""
+    opcode: Opcode
+    dst: ASTOperand
+    src0: ASTOperand
+    src1: ASTOperand
+    src2: ASTOperand
+
+    def to_asm(self) -> str:
+        return f"{self.opcode.value} {self.dst.to_asm()}, {self.src0.to_asm()}, {self.src1.to_asm()}, {self.src2.to_asm()}"
+
+    def validate(self) -> None:
+        if not self.dst.is_vgpr:
+            raise ValueError(f"Destination must be a VGPR, got {self.dst}")
+        # At most one literal constant per VOP3 instruction in RDNA2
+        literal_count = sum(1 for src in (self.src0, self.src1, self.src2) if src.kind == OperandKind.LITERAL_CONST)
+        if literal_count > 1:
+            raise ValueError(f"RDNA2 VOP3 allows at most one literal constant, got {literal_count}")
+
+
+class TypedExpr:
+    """Base class for symbolic typed expressions."""
+    def __init__(self, type_kind: TypeKind = TypeKind.RAW32) -> None:
+        self.type_kind = type_kind
+
+    def eval(self, ctx: dict[str, int]) -> int:
+        raise NotImplementedError
+
+
+class VariableExpr(TypedExpr):
+    """Represents a variable or register reference in an expression tree."""
+    def __init__(self, name: str, type_kind: TypeKind = TypeKind.RAW32) -> None:
+        super().__init__(type_kind)
+        self.name = name
+
+    def eval(self, ctx: dict[str, int]) -> int:
+        if self.name not in ctx:
+            raise KeyError(f"Variable '{self.name}' not found in evaluation context")
+        return ctx[self.name] & MASK32
+
+    def __repr__(self) -> str:
+        return f"Var({self.name}:{self.type_kind.value})"
+
+
+class ConstantExpr(TypedExpr):
+    """Represents a constant value in an expression tree."""
+    def __init__(self, value: int, type_kind: TypeKind = TypeKind.RAW32) -> None:
+        super().__init__(type_kind)
+        self.value = value & MASK32
+
+    def eval(self, ctx: dict[str, int]) -> int:
+        return self.value
+
+    def __repr__(self) -> str:
+        return f"Const(0x{self.value:08X}:{self.type_kind.value})"
+
+
+class ExtractByteExpr(TypedExpr):
+    """Extracts a specific byte (0..3) from a 32-bit expression."""
+    def __init__(self, source: TypedExpr, byte_idx: int) -> None:
+        super().__init__(TypeKind.BYTE_LANE)
+        self.source = source
+        self.byte_idx = byte_idx
+
+    def eval(self, ctx: dict[str, int]) -> int:
+        val = self.source.eval(ctx)
+        return extract_byte(val, self.byte_idx)
+
+    def __repr__(self) -> str:
+        return f"ExtractByte({self.source}, {self.byte_idx})"
+
+
+class PermuteByteExpr(TypedExpr):
+    """Permutes a single byte from src0 and src1 using a selector byte expression."""
+    def __init__(self, src0: TypedExpr, src1: TypedExpr, sel_byte: TypedExpr) -> None:
+        super().__init__(TypeKind.BYTE_LANE)
+        self.src0 = src0
+        self.src1 = src1
+        self.sel_byte = sel_byte
+
+    def eval(self, ctx: dict[str, int]) -> int:
+        s0 = self.src0.eval(ctx)
+        s1 = self.src1.eval(ctx)
+        sel = self.sel_byte.eval(ctx) & BYTE_MASK
+        return permute_single_byte(s0, s1, sel)
+
+    def __repr__(self) -> str:
+        return f"PermuteByte(src0={self.src0}, src1={self.src1}, sel={self.sel_byte})"
+
+
+class PermB32Expr(TypedExpr):
+    """Symbolic expression tree representing a full v_perm_b32 operation."""
+    def __init__(self, src0: TypedExpr, src1: TypedExpr, sel: TypedExpr, type_kind: TypeKind = TypeKind.RAW32) -> None:
+        super().__init__(type_kind)
+        self.src0 = src0
+        self.src1 = src1
+        self.sel = sel
+        self.byte_exprs = [
+            PermuteByteExpr(src0, src1, ExtractByteExpr(sel, i))
+            for i in range(4)
+        ]
+
+    def eval(self, ctx: dict[str, int]) -> int:
+        b0 = self.byte_exprs[0].eval(ctx)
+        b1 = self.byte_exprs[1].eval(ctx)
+        b2 = self.byte_exprs[2].eval(ctx)
+        b3 = self.byte_exprs[3].eval(ctx)
+        return pack_bytes(b0, b1, b2, b3)
+
+    def __repr__(self) -> str:
+        return f"v_perm_b32({self.src0}, {self.src1}, {self.sel})"
+
+
+# ==============================================================================
+# Unit Tests: Symbolic AST and Typed Expressions
+# ==============================================================================
+
+class TestPermB32SymbolicAST(unittest.TestCase):
+    """Test suite for symbolic AST opcode definitions and typed expressions."""
+
+    def test_ast_instruction_assembly_formatting(self):
+        instr1 = ASTInstruction(
+            opcode=Opcode.V_PERM_B32,
+            dst=ASTOperand.vgpr(0),
+            src0=ASTOperand.vgpr(1),
+            src1=ASTOperand.vgpr(2),
+            src2=ASTOperand.vgpr(3),
+        )
+        self.assertEqual(instr1.to_asm(), "v_perm_b32 v0, v1, v2, v3")
+
+        instr2 = ASTInstruction(
+            opcode=Opcode.V_PERM_B32,
+            dst=ASTOperand.vgpr(5),
+            src0=ASTOperand.sgpr(0),
+            src1=ASTOperand.vgpr(1),
+            src2=ASTOperand.literal(0x03020100),
+        )
+        self.assertEqual(instr2.to_asm(), "v_perm_b32 v5, s0, v1, 0x03020100")
+
+    def test_ast_instruction_validation(self):
+        # Valid instruction with 1 literal
+        instr_valid = ASTInstruction(
+            opcode=Opcode.V_PERM_B32,
+            dst=ASTOperand.vgpr(0),
+            src0=ASTOperand.literal(0x12345678),
+            src1=ASTOperand.vgpr(1),
+            src2=ASTOperand.sgpr(2),
+        )
+        instr_valid.validate()  # should not raise
+
+        # Invalid destination (SGPR not allowed as VALU destination)
+        instr_invalid_dst = ASTInstruction(
+            opcode=Opcode.V_PERM_B32,
+            dst=ASTOperand.sgpr(0),
+            src0=ASTOperand.vgpr(1),
+            src1=ASTOperand.vgpr(2),
+            src2=ASTOperand.vgpr(3),
+        )
+        with self.assertRaises(ValueError):
+            instr_invalid_dst.validate()
+
+        # Invalid: more than 1 literal constant
+        instr_multi_literal = ASTInstruction(
+            opcode=Opcode.V_PERM_B32,
+            dst=ASTOperand.vgpr(0),
+            src0=ASTOperand.literal(0x11111111),
+            src1=ASTOperand.literal(0x22222222),
+            src2=ASTOperand.vgpr(3),
+        )
+        with self.assertRaises(ValueError):
+            instr_multi_literal.validate()
+
+    def test_typed_expression_evaluation(self):
+        v0 = VariableExpr("v0")
+        v1 = VariableExpr("v1")
+        sel_const = ConstantExpr(0x07060504)  # Identity for src0
+        perm_expr = PermB32Expr(v0, v1, sel_const)
+
+        ctx = {"v0": 0xDEADBEEF, "v1": 0xCAFEBABE}
+        result = perm_expr.eval(ctx)
+        self.assertEqual(result, 0xDEADBEEF)
+
+    def test_symbolic_byte_slicing_and_reassembly(self):
+        v0 = VariableExpr("v0")
+        b1_expr = ExtractByteExpr(v0, 1)
+        ctx = {"v0": 0x12345678}
+        self.assertEqual(b1_expr.eval(ctx), 0x56)
+
+        v1 = VariableExpr("v1")
+        # Selector picks byte 0 from v1 (which is index 0)
+        sel_expr = ConstantExpr(0)
+        p_byte = PermuteByteExpr(v0, v1, sel_expr)
+        ctx2 = {"v0": 0x12345678, "v1": 0x9ABCDEF0}
+        self.assertEqual(p_byte.eval(ctx2), 0xF0)
+
+    def test_expression_type_checking(self):
+        c = ConstantExpr(0x12345678, TypeKind.UINT32)
+        self.assertEqual(c.type_kind, TypeKind.UINT32)
+        v = VariableExpr("x", TypeKind.INT32)
+        self.assertEqual(v.type_kind, TypeKind.INT32)
+
+
 if __name__ == "__main__":
     unittest.main()
