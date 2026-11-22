@@ -689,6 +689,51 @@ int compare_allocation_info(ID3D12Device* ours) {
         {"16x16 R8G8_TYPELESS", texture_desc(16, 16, DXGI_FORMAT_R8G8_TYPELESS, none, 1), 16 * 16 * 2},
         {"16x16 R8G8_UINT", texture_desc(16, 16, DXGI_FORMAT_R8G8_UINT, none, 1), 16 * 16 * 2},
         {"16x16 R8G8_SINT", texture_desc(16, 16, DXGI_FORMAT_R8G8_SINT, none, 1), 16 * 16 * 2},
+        // Tiled (64KB_UNDEFINED_SWIZZLE) textures: 64 KiB alignment and tile-multiple size; 1D, buffers, 4 KiB
+        // alignment, untileable 96-bit and two-plane depth-stencil formats are invalid.
+        {"tiled 2D 256x256", [&] {
+             D3D12_RESOURCE_DESC d = texture_desc(256, 256, rgba8, none, 1);
+             d.Layout = D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE;
+             return d;
+         }(), 256 * 256 * 4},
+        {"tiled 2D D32F 256x256", [&] {
+             D3D12_RESOURCE_DESC d = texture_desc(256, 256, DXGI_FORMAT_D32_FLOAT,
+                                                  D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL, 1);
+             d.Layout = D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE;
+             return d;
+         }(), 256 * 256 * 4},
+        {"tiled 3D 64x64x64", [&] {
+             D3D12_RESOURCE_DESC d = small_volume(64, 64, 64, rgba8);
+             d.Alignment = 0;
+             d.Layout = D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE;
+             return d;
+         }(), 64 * 64 * 64 * 4},
+        {"tiled buffer (invalid)", [&] {
+             D3D12_RESOURCE_DESC d = buffer_desc(4096);
+             d.Layout = D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE;
+             return d;
+         }(), 0},
+        {"tiled 1D (invalid)", [&] {
+             D3D12_RESOURCE_DESC d = line_desc(256, 1, 1, rgba8);
+             d.Layout = D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE;
+             return d;
+         }(), 0},
+        {"tiled 2D 4K alignment (invalid)", [&] {
+             D3D12_RESOURCE_DESC d = with(texture_desc(16, 16, rgba8, none, 1), k4);
+             d.Layout = D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE;
+             return d;
+         }(), 0},
+        {"tiled 2D RGB32F (invalid)", [&] {
+             D3D12_RESOURCE_DESC d = texture_desc(64, 64, DXGI_FORMAT_R32G32B32_FLOAT, none, 1);
+             d.Layout = D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE;
+             return d;
+         }(), 0},
+        {"tiled 2D D24S8 (invalid)", [&] {
+             D3D12_RESOURCE_DESC d = texture_desc(64, 64, DXGI_FORMAT_D24_UNORM_S8_UINT,
+                                                  D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL, 1);
+             d.Layout = D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE;
+             return d;
+         }(), 0},
     };
     int mismatches = 0;
     const auto mismatch = [&](const char* name, const D3D12_RESOURCE_ALLOCATION_INFO& a,
@@ -3534,16 +3579,16 @@ int main() {
         EXPECT(placed_va && placed_va % D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT == 0);
         EXPECT(placed_b->GetGPUVirtualAddress() == placed_va + 65536);
         EXPECT(placed_image->GetGPUVirtualAddress() == 0);  // only buffers are addressable, as in D3D12
-        // Off the 64 KiB grid, past the heap end, and tiled: refused, not placed somewhere wrong.
+        // Off the 64 KiB grid, past the heap end, and non-ROW_MAJOR buffers: E_INVALIDARG, not placed somewhere wrong.
         EXPECT(standalone->CreatePlacedResource(placed_heap.p, 512, &placed_buffer, D3D12_RESOURCE_STATE_COMMON,
                                                 nullptr, IID_PPV_ARGS(&refused.p)) == E_INVALIDARG);
         EXPECT(standalone->CreatePlacedResource(placed_heap.p, 256 * 1024, &placed_buffer,
                                                 D3D12_RESOURCE_STATE_COMMON, nullptr,
                                                 IID_PPV_ARGS(&refused.p)) == E_INVALIDARG);
-        D3D12_RESOURCE_DESC tiled = buffer_desc(4096);
-        tiled.Layout = D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE;
-        EXPECT(standalone->CreatePlacedResource(placed_heap.p, 0, &tiled, D3D12_RESOURCE_STATE_COMMON, nullptr,
-                                                IID_PPV_ARGS(&refused.p)) == E_NOTIMPL);
+        D3D12_RESOURCE_DESC tiled_buf = buffer_desc(4096);
+        tiled_buf.Layout = D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE;
+        EXPECT(standalone->CreatePlacedResource(placed_heap.p, 0, &tiled_buf, D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                IID_PPV_ARGS(&refused.p)) == E_INVALIDARG);
         EXPECT(!refused.p);
         // A placed buffer reads as zeroed through the copy path, at its console VA.
         D3D12_HEAP_PROPERTIES readback_props{};
@@ -3578,6 +3623,189 @@ int main() {
         EXPECT(SUCCEEDED(standalone->CreatePlacedResource(again.p, 0, &placed_buffer, D3D12_RESOURCE_STATE_GENERIC_READ,
                                                           nullptr, IID_PPV_ARGS(&placed_a.p))));
         EXPECT(placed_a->GetGPUVirtualAddress() == placed_va);
+
+        // D3D-191: tiled placed resources (D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE and Xbox 0x101).
+        D3D12_HEAP_DESC tiled_heap_desc{};
+        tiled_heap_desc.Properties.Type = D3D12_HEAP_TYPE_DEFAULT;
+        tiled_heap_desc.SizeInBytes = 2 * 1024 * 1024;
+        tiled_heap_desc.Alignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
+        Ref<ID3D12Heap> tiled_heap, upload_placed_heap;
+        EXPECT(SUCCEEDED(standalone->CreateHeap(&tiled_heap_desc, IID_PPV_ARGS(&tiled_heap.p))));
+        D3D12_HEAP_DESC upload_heap_desc = tiled_heap_desc;
+        upload_heap_desc.Properties.Type = D3D12_HEAP_TYPE_UPLOAD;
+        EXPECT(SUCCEEDED(standalone->CreateHeap(&upload_heap_desc, IID_PPV_ARGS(&upload_placed_heap.p))));
+
+        auto tiled_2d = [&](UINT w, UINT h, DXGI_FORMAT fmt, UINT16 mips, D3D12_RESOURCE_FLAGS flags,
+                            UINT64 align = 0) {
+            D3D12_RESOURCE_DESC d = texture_desc(w, h, fmt, flags, mips);
+            d.Alignment = align;
+            d.Layout = D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE;
+            return d;
+        };
+        const D3D12_RESOURCE_DESC tiled_rt_desc =
+            tiled_2d(256, 256, DXGI_FORMAT_R8G8B8A8_UNORM, 0, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+        const D3D12_RESOURCE_DESC tiled_bc_desc =
+            tiled_2d(256, 256, DXGI_FORMAT_BC1_UNORM, 0, D3D12_RESOURCE_FLAG_NONE);
+        const D3D12_RESOURCE_DESC tiled_ds_desc =
+            tiled_2d(256, 256, DXGI_FORMAT_D32_FLOAT, 1, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL);
+        D3D12_RESOURCE_DESC tiled_3d_desc =
+            tiled_2d(64, 64, DXGI_FORMAT_R8G8B8A8_UNORM, 0, D3D12_RESOURCE_FLAG_NONE);
+        tiled_3d_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+        tiled_3d_desc.DepthOrArraySize = 32;
+        D3D12_RESOURCE_DESC xbox_tiled_desc =
+            tiled_2d(256, 256, DXGI_FORMAT_R8G8B8A8_UNORM, 1, D3D12_RESOURCE_FLAG_NONE);
+        xbox_tiled_desc.Layout = static_cast<D3D12_TEXTURE_LAYOUT>(0x101);
+
+        Ref<ID3D12Resource> tiled_rt, tiled_bc, tiled_ds, tiled_3d, xbox_tiled;
+        EXPECT(SUCCEEDED(standalone->CreatePlacedResource(tiled_heap.p, 0, &tiled_rt_desc, D3D12_RESOURCE_STATE_COMMON,
+                                                          nullptr, IID_PPV_ARGS(&tiled_rt.p))));
+        EXPECT(SUCCEEDED(standalone->CreatePlacedResource(tiled_heap.p, 512 * 1024, &tiled_bc_desc,
+                                                          D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                          IID_PPV_ARGS(&tiled_bc.p))));
+        EXPECT(SUCCEEDED(standalone->CreatePlacedResource(tiled_heap.p, 640 * 1024, &tiled_ds_desc,
+                                                          D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                          IID_PPV_ARGS(&tiled_ds.p))));
+        EXPECT(SUCCEEDED(standalone->CreatePlacedResource(tiled_heap.p, 1024 * 1024, &tiled_3d_desc,
+                                                          D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                          IID_PPV_ARGS(&tiled_3d.p))));
+        EXPECT(SUCCEEDED(standalone->CreatePlacedResource(tiled_heap.p, 0, &xbox_tiled_desc, D3D12_RESOURCE_STATE_COMMON,
+                                                          nullptr, IID_PPV_ARGS(&xbox_tiled.p))));
+
+        for (ID3D12Resource* r : {tiled_rt.p, tiled_bc.p, tiled_ds.p, tiled_3d.p}) {
+            const D3D12_RESOURCE_DESC got = r->GetDesc();
+            EXPECT(r->GetGPUVirtualAddress() == 0);
+            EXPECT(got.Layout == D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE);
+            EXPECT(got.Alignment == D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT);
+            EXPECT(got.MipLevels > 0);
+            D3D12_HEAP_PROPERTIES got_hp{};
+            D3D12_HEAP_FLAGS got_hf = D3D12_HEAP_FLAG_NONE;
+            EXPECT(SUCCEEDED(r->GetHeapProperties(&got_hp, &got_hf)));
+            EXPECT(got_hp.Type == D3D12_HEAP_TYPE_DEFAULT);
+            const D3D12_RESOURCE_ALLOCATION_INFO ai = standalone->GetResourceAllocationInfo(0, 1, &got);
+            UINT tiles = 0;
+            D3D12_TILE_SHAPE shape{};
+            standalone->GetResourceTiling(r, &tiles, nullptr, &shape, nullptr, 0, nullptr);
+            EXPECT(tiles > 0 && shape.WidthInTexels > 0 && ai.Alignment == D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT);
+            EXPECT(ai.SizeInBytes == UINT64(tiles) * D3D12_TILED_RESOURCE_TILE_SIZE_IN_BYTES);
+        }
+        EXPECT(static_cast<UINT>(xbox_tiled->GetDesc().Layout) == 0x101);
+        UINT xbox_tiles = 0;
+        standalone->GetResourceTiling(xbox_tiled.p, &xbox_tiles, nullptr, nullptr, nullptr, 0, nullptr);
+        EXPECT(xbox_tiles == 4);
+
+        // Refusals matching host D3D12: 1D, 4 KiB alignment, 96-bit, two-plane DS, upload heap, past-end placement.
+        D3D12_RESOURCE_DESC bad_1d = line_desc(256, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM);
+        bad_1d.Layout = D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE;
+        const D3D12_RESOURCE_DESC bad_cases[] = {
+            bad_1d,
+            tiled_2d(16, 16, DXGI_FORMAT_R8G8B8A8_UNORM, 1, D3D12_RESOURCE_FLAG_NONE,
+                     D3D12_SMALL_RESOURCE_PLACEMENT_ALIGNMENT),
+            tiled_2d(64, 64, DXGI_FORMAT_R32G32B32_FLOAT, 1, D3D12_RESOURCE_FLAG_NONE),
+            tiled_2d(64, 64, DXGI_FORMAT_D24_UNORM_S8_UINT, 1, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL),
+            tiled_2d(64, 64, DXGI_FORMAT_D32_FLOAT_S8X24_UINT, 1, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL),
+        };
+        for (const D3D12_RESOURCE_DESC& bad : bad_cases) {
+            Ref<ID3D12Resource> fail;
+            EXPECT(standalone->CreatePlacedResource(tiled_heap.p, 0, &bad, D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                    IID_PPV_ARGS(&fail.p)) == E_INVALIDARG);
+            EXPECT(!fail.p);
+        }
+        {
+            Ref<ID3D12Resource> fail;
+            EXPECT(standalone->CreatePlacedResource(upload_placed_heap.p, 0, &tiled_rt_desc,
+                                                    D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                    IID_PPV_ARGS(&fail.p)) == E_INVALIDARG);
+            const D3D12_RESOURCE_ALLOCATION_INFO rt_alloc = standalone->GetResourceAllocationInfo(0, 1, &tiled_rt_desc);
+            EXPECT(standalone->CreatePlacedResource(tiled_heap.p,
+                                                    tiled_heap_desc.SizeInBytes - rt_alloc.SizeInBytes + 65536,
+                                                    &tiled_rt_desc, D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                    IID_PPV_ARGS(&fail.p)) == E_INVALIDARG);
+            EXPECT(!fail.p);
+        }
+
+        // Clear and read back a placed tiled RTV to verify GPU execution.
+        D3D12_DESCRIPTOR_HEAP_DESC tiled_rtv_desc{};
+        tiled_rtv_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+        tiled_rtv_desc.NumDescriptors = 1;
+        Ref<ID3D12DescriptorHeap> tiled_rtv_heap;
+        EXPECT(SUCCEEDED(standalone->CreateDescriptorHeap(&tiled_rtv_desc, IID_PPV_ARGS(&tiled_rtv_heap.p))));
+        standalone->CreateRenderTargetView(tiled_rt.p, nullptr, tiled_rtv_heap->GetCPUDescriptorHandleForHeapStart());
+        D3D12_HEAP_PROPERTIES rb_props{D3D12_HEAP_TYPE_READBACK};
+        const D3D12_RESOURCE_DESC rb_desc = buffer_desc(256);
+        Ref<ID3D12Resource> tiled_rb;
+        EXPECT(SUCCEEDED(standalone->CreateCommittedResource(&rb_props, D3D12_HEAP_FLAG_NONE, &rb_desc,
+                                                             D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                             IID_PPV_ARGS(&tiled_rb.p))));
+        Ref<ID3D12CommandAllocator> tiled_alloc;
+        Ref<ID3D12GraphicsCommandList> tiled_list;
+        EXPECT(SUCCEEDED(standalone->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                                            IID_PPV_ARGS(&tiled_alloc.p))));
+        EXPECT(SUCCEEDED(standalone->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, tiled_alloc.p, nullptr,
+                                                       IID_PPV_ARGS(&tiled_list.p))));
+        const FLOAT tiled_color[4] = {64.0f / 255.0f, 128.0f / 255.0f, 191.0f / 255.0f, 1.0f};
+        D3D12_RESOURCE_BARRIER b = transition(tiled_rt.p, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        tiled_list->ResourceBarrier(1, &b);
+        tiled_list->ClearRenderTargetView(tiled_rtv_heap->GetCPUDescriptorHandleForHeapStart(), tiled_color, 0, nullptr);
+        b = transition(tiled_rt.p, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        tiled_list->ResourceBarrier(1, &b);
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp{};
+        fp.Footprint = {DXGI_FORMAT_R8G8B8A8_UNORM, 1, 1, 1, D3D12_TEXTURE_DATA_PITCH_ALIGNMENT};
+        const D3D12_TEXTURE_COPY_LOCATION copy_dst = footprint(tiled_rb.p, fp);
+        const D3D12_TEXTURE_COPY_LOCATION copy_src = subresource(tiled_rt.p, 0);
+        D3D12_BOX box{0, 0, 0, 1, 1, 1};
+        tiled_list->CopyTextureRegion(&copy_dst, 0, 0, 0, &copy_src, &box);
+        EXPECT(SUCCEEDED(tiled_list->Close()));
+        ID3D12CommandList* tiled_lists[] = {tiled_list.p};
+        queue->ExecuteCommandLists(1, tiled_lists);
+        EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
+        EXPECT(SUCCEEDED(queue->Signal(fence.p, 7)) && SUCCEEDED(fence->SetEventOnCompletion(7, nullptr)));
+        void* tiled_bytes = nullptr;
+        EXPECT(SUCCEEDED(tiled_rb->Map(0, nullptr, &tiled_bytes)));
+        const std::uint8_t want_rgba[4] = {64, 128, 191, 255};
+        report("tiled placed RTV", 0, static_cast<std::uint8_t*>(tiled_bytes), want_rgba, 4);
+        EXPECT(std::memcmp(tiled_bytes, want_rgba, 4) == 0);
+        tiled_rb->Unmap(0, nullptr);
+
+        // Compare placed 64KB_UNDEFINED_SWIZZLE acceptance, layout, alignment, heap props and tile shape with host.
+        Ref<ID3D12Device> host_dev;
+        if (create_host_device(host_dev)) {
+            D3D12_FEATURE_DATA_D3D12_OPTIONS host_opts{};
+            if (SUCCEEDED(host_dev->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &host_opts, sizeof(host_opts))) &&
+                host_opts.TiledResourcesTier != D3D12_TILED_RESOURCES_TIER_NOT_SUPPORTED) {
+                Ref<ID3D12Heap> host_heap;
+                if (SUCCEEDED(host_dev->CreateHeap(&tiled_heap_desc, IID_PPV_ARGS(&host_heap.p)))) {
+                    const D3D12_RESOURCE_DESC host_cases[] = {
+                        tiled_2d(256, 256, DXGI_FORMAT_R8G8B8A8_UNORM, 1, D3D12_RESOURCE_FLAG_NONE),
+                        tiled_2d(256, 256, DXGI_FORMAT_D32_FLOAT, 1, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL),
+                        tiled_3d_desc,
+                    };
+                    for (int idx = 0; idx < int(std::size(host_cases)); ++idx) {
+                        const D3D12_RESOURCE_DESC& d = host_cases[idx];
+                        if (d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D &&
+                            host_opts.TiledResourcesTier < D3D12_TILED_RESOURCES_TIER_3)
+                            continue;
+                        Ref<ID3D12Resource> our_r, host_r;
+                        const HRESULT our_hr = standalone->CreatePlacedResource(
+                            tiled_heap.p, 0, &d, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&our_r.p));
+                        const HRESULT host_hr = host_dev->CreatePlacedResource(
+                            host_heap.p, 0, &d, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&host_r.p));
+                        if (FAILED(host_hr)) continue;
+                        EXPECT(SUCCEEDED(our_hr));
+                        EXPECT(our_r->GetDesc().Layout == host_r->GetDesc().Layout);
+                        EXPECT(our_r->GetDesc().Alignment == host_r->GetDesc().Alignment);
+                        D3D12_HEAP_PROPERTIES ohp{}, hhp{};
+                        EXPECT(SUCCEEDED(our_r->GetHeapProperties(&ohp, nullptr)) &&
+                               SUCCEEDED(host_r->GetHeapProperties(&hhp, nullptr)));
+                        EXPECT(ohp.Type == hhp.Type);
+                        D3D12_TILE_SHAPE os{}, hs{};
+                        standalone->GetResourceTiling(our_r.p, nullptr, nullptr, &os, nullptr, 0, nullptr);
+                        host_dev->GetResourceTiling(host_r.p, nullptr, nullptr, &hs, nullptr, 0, nullptr);
+                        EXPECT(os.WidthInTexels == hs.WidthInTexels && os.HeightInTexels == hs.HeightInTexels &&
+                               os.DepthInTexels == hs.DepthInTexels);
+                    }
+                }
+            }
+        }
     }
 
     // D3D-90, the placed half of castable formats: CreatePlacedResource2 takes NumCastableFormats exactly as
