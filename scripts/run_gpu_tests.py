@@ -26,7 +26,8 @@ sys.path.insert(0, SHADER_DIR)
 from build import CLIP_CASES, clip_container, shader_source
 from check import Skip, clip_test
 from compute_fixture import compute_header
-from check import CMPX_CLASS_WORDS, TEST_PROGRAMS, Skip, mesh_v5_test, not_found_message, pick_build_dir, start_failure
+from check import (CMPX_CLASS_WORDS, TEST_PROGRAMS, TEXTURE_MIP_DEPENDENCIES, TEXTURE_MIP_TEST, Skip,
+                   mesh_v5_test, not_found_message, pick_build_dir, start_failure, texture_mip_test)
 from check import TEXOFF_ARGS, texoff_problem   # ps_texoff's expected words and arguments live in check.py
 
 
@@ -423,6 +424,10 @@ def with_draw_shaders(asm_files: list[str]) -> list[str]:
         extra = DRAWN_WITH.get(shader_source(os.path.splitext(f)[0]))
         if extra and extra not in build:
             build.append(extra)
+    if TEXTURE_MIP_TEST + ".asm" in asm_files:
+        for name in TEXTURE_MIP_DEPENDENCIES:
+            if name + ".asm" not in build:
+                build.append(name + ".asm")
     return build
 
 
@@ -689,6 +694,10 @@ def run_suite(a, work: str) -> int:
         elif name == "cs_imgload":
             rc, msg = run_cmd([vk_store, spv, "load"])
             results.append((name, rc == 0, msg.splitlines()[-1] if msg else ""))
+        elif name == TEXTURE_MIP_TEST:
+            problem = texture_mip_test(a.build, spirv_dir)
+            ok = None if isinstance(problem, Skip) else not problem
+            results.append((name, ok, problem or "two passes, 4096 RGBA32F pixels each exact; wrong mip and UV rejected"))
         elif name in ("ps_texture_sample", "ps_cube_sample"):
             # Bindless texture tests: vk_texture_test finds vs_ids.spv and the shader in its working directory.
             tool = os.path.join(a.build, "vk_texture_test" + ext)

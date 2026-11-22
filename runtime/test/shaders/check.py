@@ -2,7 +2,7 @@
 
     python -I runtime/test/shaders/check.py <out dir of build.py> [dir with the test programs]
 
-The test programs are vk_compute_test, vk_store_test, vk_harness and vk_bindless_test (runtime/build by default). With
+The test programs are vk_compute_test, vk_store_test, vk_harness, vk_texture_test and vk_bindless_test (runtime/build by default). With
 the Visual Studio generator they are in runtime/build/RelWithDebInfo, Release and so on: that subfolder is found by
 itself (the newest complete one if there are several) and its name is printed.
 Each line is one shader: ok, or what came back instead. The wave32 test ps_bitmask_perm is only judged on lanes
@@ -142,6 +142,8 @@ PIXEL_TESTS = sorted((*PIXEL_BITS, "ps_bary", "ps_flat", "ps_bitmask_perm", "ps_
 TEXOFF_ARGS = ("2", "92", "0", "0", "0")              # ps_texoff: T# pointer in s2, then the shader's literal S#
 PIXEL_TESTS = sorted((*PIXEL_BITS, "ps_bary", "ps_flat", "ps_bitmask_perm", "ps_uniform_branch"))
 PIXEL_TESTS = sorted((*PIXEL_BITS, "ps_bary", "ps_flat", "ps_bitmask_perm", "ps_uniform_branch", "ps_wqm", "ps_scc_mask32"))
+TEXTURE_MIP_TEST = "ps_texture_mip0"
+TEXTURE_MIP_DEPENDENCIES = ("vs_ids", "ps_texture_sample")
 
 
 # Windows error codes for a program the system refuses to start, and who refused it.
@@ -386,6 +388,52 @@ def texoff_test(tools, spirv, name):
         return texoff_problem(raw.read_bytes(), out)[0]
 
 
+def texture_mip_mismatch(data: bytes, mip: int, *, transpose_uv: bool = False) -> str:
+    width = 64
+    if len(data) != width**2 * 16:
+        return f"expected {width**2} RGBA32F pixels, got {len(data)} bytes"
+    one = 0x3f800000
+    quadrants = ((one, 0, 0, one), (0, one, 0, one),
+                 (0, 0, one, one), (one, one, 0, 0))
+    for i, actual in enumerate(struct.iter_unpack("<4I", data)):
+        y, x = divmod(i, width)
+        # The normalized UV at each pixel center lies within the same quadrant of mip 0.
+        u, v = (y, x) if transpose_uv else (x, y)
+        expected = (0, one, one, one) if mip == 1 else quadrants[2 * (v >= width // 2) + (u >= width // 2)]
+        if actual != expected:
+            return f"({x},{y}): RGBA32F bits {actual} != {expected}"
+    return ""
+
+
+def texture_mip_test(tools: str, spirv: str) -> str:
+    tool = Path(tools) / ("vk_texture_test" + EXE)
+    if not tool.is_file():
+        return f"missing {tool}"
+    shaders = Path(spirv)
+    vertex = shaders / "vs_ids.spv"
+    with tempfile.TemporaryDirectory(prefix="leonida-mip-") as tmp:
+        for mip, name in enumerate((TEXTURE_MIP_TEST, "ps_texture_sample")):
+            fragment = shaders / (name + ".spv")
+            for shader in (vertex, fragment):
+                if not shader.is_file():
+                    return f"missing {shader}"
+            raw = Path(tmp) / f"mip{mip}.raw"
+            code, output = run(tool, vertex, fragment, raw, "0", "92", "c00000", "14500000", "0", "--two-mip")
+            if code == UNSUPPORTED:
+                return Skip(f"SKIP (texture mip test: {output.strip() or 'unsupported device'})")
+            if code or not raw.is_file():
+                return f"{name}: {failure(code, output, 4)}"
+            data = raw.read_bytes()
+            mismatch = texture_mip_mismatch(data, mip)
+            if mismatch:
+                return f"{name}: {mismatch}"
+            if not texture_mip_mismatch(data, 1 - mip).startswith("(0,0):"):
+                return f"{name}: wrong mip control missed the expected first pixel"
+            if mip == 0 and not texture_mip_mismatch(data, mip, transpose_uv=True).startswith("(32,0):"):
+                return f"{name}: transposed UV control missed the expected first pixel"
+    return ""
+
+
 def pixel_test(tools, spirv, name):
     path = os.path.join(spirv, name + ".spv")
     if not os.path.isfile(path):
@@ -510,6 +558,7 @@ def main():
     for name in PIXEL_TESTS:
         results.append((name, pixel_test(tools, spirv, name)))
     results.append(("ps_tex", bindless_test(tools, spirv)))
+    results.append((TEXTURE_MIP_TEST, texture_mip_test(tools, spirv)))
     for name, problem in results:
         if problem is None:
             problem = "SKIP (full 64-wide compute subgroups unavailable)"
