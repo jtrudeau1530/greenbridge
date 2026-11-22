@@ -1249,5 +1249,88 @@ class TestConditionCodesAndStatusFlags(unittest.TestCase):
         self.assertEqual(mask_u, 0b1000)
 
 
+# ==============================================================================
+# IEEE 754 Boundary Extremes, Subnormals, and NaN Handling for v_trig_f64
+# ==============================================================================
+
+class TestIEEE754BoundaryExtremes(unittest.TestCase):
+    """Test suite for IEEE-754 boundary extremes, subnormals, and NaN handling."""
+
+    def test_nan_snan_quieting(self) -> None:
+        # Positive signaling NaN
+        snan_pos = 0x7FF0000000000001
+        self.assertTrue(is_f64_snan(snan_pos))
+        res_pos = ref_trig_f64(snan_pos, mode=TrigMode.SIN)
+        self.assertTrue(is_f64_qnan(res_pos))
+
+        # Negative signaling NaN
+        snan_neg = 0xFFF0000000000001
+        self.assertTrue(is_f64_snan(snan_neg))
+        res_neg = ref_trig_f64(snan_neg, mode=TrigMode.COS)
+        self.assertTrue(is_f64_qnan(res_neg))
+
+    def test_qnan_propagation(self) -> None:
+        qnan_custom = 0x7FF8000000001234
+        self.assertTrue(is_f64_qnan(qnan_custom))
+        res_sin = ref_trig_f64(qnan_custom, mode=TrigMode.SIN)
+        self.assertTrue(is_f64_qnan(res_sin))
+        res_cos = ref_trig_f64(qnan_custom, mode=TrigMode.COS)
+        self.assertTrue(is_f64_qnan(res_cos))
+
+    def test_infinities_return_canonical_qnan(self) -> None:
+        self.assertEqual(ref_trig_f64(F64_POS_INF, mode=TrigMode.SIN), F64_CANONICAL_QNAN)
+        self.assertEqual(ref_trig_f64(F64_NEG_INF, mode=TrigMode.SIN), F64_CANONICAL_QNAN)
+        self.assertEqual(ref_trig_f64(F64_POS_INF, mode=TrigMode.COS), F64_CANONICAL_QNAN)
+        self.assertEqual(ref_trig_f64(F64_NEG_INF, mode=TrigMode.COS), F64_CANONICAL_QNAN)
+
+    def test_signed_zeros_preservation(self) -> None:
+        # sin(+0.0) = +0.0, sin(-0.0) = -0.0
+        self.assertEqual(ref_trig_f64(F64_POS_ZERO, mode=TrigMode.SIN), F64_POS_ZERO)
+        self.assertEqual(ref_trig_f64(F64_NEG_ZERO, mode=TrigMode.SIN), F64_NEG_ZERO)
+        # cos(+0.0) = 1.0, cos(-0.0) = 1.0
+        self.assertEqual(ref_trig_f64(F64_POS_ZERO, mode=TrigMode.COS), F64_ONE)
+        self.assertEqual(ref_trig_f64(F64_NEG_ZERO, mode=TrigMode.COS), F64_ONE)
+
+    def test_subnormal_inputs(self) -> None:
+        # Smallest subnormal
+        sub_min = F64_MIN_SUBNORMAL
+        self.assertTrue(is_f64_subnormal(sub_min))
+        res_min = ref_trig_f64(sub_min, mode=TrigMode.SIN)
+        # In IEEE mode, not flushed to zero: sin(2*pi*x) > 0
+        self.assertFalse(is_f64_zero(res_min))
+        self.assertEqual(f64_sign(res_min), 0)
+
+        # Negative subnormal
+        neg_sub_min = F64_MIN_SUBNORMAL | F64_SIGN_MASK
+        res_neg = ref_trig_f64(neg_sub_min, mode=TrigMode.SIN)
+        self.assertFalse(is_f64_zero(res_neg))
+        self.assertEqual(f64_sign(res_neg), 1)
+
+        # Largest subnormal: cos(subnormal) == 1.0
+        sub_max = F64_MAX_SUBNORMAL
+        res_cos = ref_trig_f64(sub_max, mode=TrigMode.COS)
+        self.assertEqual(res_cos, F64_ONE)
+
+    def test_normal_boundary_extremes(self) -> None:
+        # Smallest normal float: 2^-1022
+        min_norm = F64_MIN_NORMAL
+        self.assertTrue(is_f64_normal(min_norm))
+        res_sin = ref_trig_f64(min_norm, mode=TrigMode.SIN)
+        self.assertFalse(is_f64_zero(res_sin))
+        self.assertFalse(is_f64_nan(res_sin))
+
+        # Numbers >= 2^53 are exact integers with zero fractional part
+        int_power = f64_to_u64(2.0**53 + 4.0)
+        self.assertEqual(ref_trig_f64(int_power, mode=TrigMode.SIN), F64_POS_ZERO)
+        self.assertEqual(ref_trig_f64(int_power, mode=TrigMode.COS), F64_ONE)
+
+        # Largest normal float: 1.7976931348623157e+308
+        max_norm = F64_MAX_NORMAL
+        self.assertTrue(is_f64_normal(max_norm))
+        res_max = ref_trig_f64(max_norm, mode=TrigMode.SIN)
+        # As max_norm is an integer with zero fractional turn, sin is zero
+        self.assertEqual(res_max, F64_POS_ZERO)
+
+
 if __name__ == "__main__":
     unittest.main()
