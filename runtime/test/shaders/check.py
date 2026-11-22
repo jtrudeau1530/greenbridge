@@ -73,6 +73,7 @@ def not_found_message(build, missing):
 
 COMPUTE = [("cs_lds", "4", "mirror64"), ("cs_exec64", "1", "exec64"), ("cs_bvh", "1", "bvh"),
            ("cs_workgroup_yz", "2x3x4", "workgroup_yz")]
+COMPUTE += [("cs_bvh32", "1", "bvh")]   # TEST-184: image_bvh_intersect_ray, the 32-bit node pointer; same scene and words
 CS_STORE = [0x400080ff, 0xe00003ff, 0x3c004000, 0xeeeeeeee, 0x40003c00, 0xbc003800]
 CS_SMEM = [0x5eed0024, 0x5eed0028, 0x5eed002c, 0x5eed0030, 0x5eed0010, 0x5eed0014, 0x5eed0018, 0x5eed001c]
 WAVE32_DUMPS = ("cs_store", "cs_smem_soffset_imm", "cs_wqm_w32", "cs_w32_lane_wrap", "cs_movrelsd_2", "cs_w32_permute",
@@ -242,6 +243,37 @@ MIP_TEST_PASSES = {
     TEXTURE_MIP_TEST: ((TEXTURE_MIP_TEST, "c00000"), ("ps_texture_sample", "c00000")),
     GATHER_LOD_TEST: ((GATHER_LOD_TEST, "40000"), (GATHER_LOD_TEST, "1000c0")),
 }
+
+# TEST-184: vk_store_test "words" fills the r32 uint image with 100 + i, the r32 sint image with -2i (texel
+# i = 8y + x) and the r32 uint volume with 200 + i (texel i = 16z + 4y + x), and prints the three after the dispatch.
+# Per fixture: the words it changes, {word index: value}, in the uint image, the sint image and the volume, as
+# derived in the .asm header. Every other word must still hold its fill.
+STORE_IMAGES = ("uint", "sint", "volume")
+STORE_FILL = (lambda i: 100 + i, lambda i: -2 * i & 0xFFFFFFFF, lambda i: 200 + i)
+STORE_WORDS = {
+    # 2D image atomics: the texel afterwards (uint image) and the data register afterwards (sint image) of cases
+    # 0..15, then the texel 64 threads each added 1 to
+    "cs_imgatomic": (dict(enumerate([0x54, 0xFFFFFF9D, 0x06, 0xF067, 0x97, 0xFFFFFFF0, 0x6A, 0x6B,
+                                     0xC8, 0x6D, 0x05, 0xFFFFFFF0, 0x70, 0xC0FFEE, 0x72, 0x7A, 0xB4])),
+                     dict(enumerate([*range(100, 115), 7])), {}),
+    # 3D image atomics: the data register afterwards (sint image) and the six texels afterwards (volume)
+    "cs_imgatomic3d": ({}, dict(enumerate([0x101, 0xDB, 0xF4, 0xCE, 0xE6, 0xFF])),
+                       {57: 0x111, 19: 3, 44: 0xF4, 6: 0xD00D, 30: 0xE6, 39: 0x10}),
+    # image_get_resinfo on a 16x4 image with five levels: (width, height, depth, levels) of levels 0, 1 and 3, then
+    # width and height of level 2 and an untouched register, height and levels of level 1, the levels alone
+    "cs_resinfo": ({**dict(enumerate([16, 4, 1, 5, 8, 2, 1, 5, 2, 1, 1, 5, 4, 1, 0xABCD])), 16: 2, 17: 5, 18: 5},
+                   {}, {}),
+}
+# TEST-184: image_get_lod on vk_texture_test's textures. Per fixture, its draws: S# word 1 (MIN_LOD [11:0], MAX_LOD
+# [23:12], 4.8 fixed point), whether the two-mip texture is drawn, and mrt0, as derived in the .asm header:
+# ps_get_lod = (clamped LOD, calculated LOD, calculated LOD at 4u, clamped LOD at 4u) on the two-mip texture,
+# ps_get_lod_array = (clamped, calculated LOD at 32u, clamped, calculated LOD) on the one-level 2D array.
+# A device may keep as few as four fraction bits of LOD (Vulkan's smallest mipmapPrecisionBits), hence the tolerance.
+GET_LOD_TESTS = {
+    "ps_get_lod": (("c00000", True, (1.0, 1.0, 3.0, 1.0)), ("40000", True, (0.0, 1.0, 3.0, 0.0))),
+    "ps_get_lod_array": (("c00000", False, (0.0, 2.0, 0.0, -3.0)),),
+}
+GET_LOD_TOLERANCE = 1 / 16
 
 
 # Windows error codes for a program the system refuses to start, and who refused it.
@@ -705,6 +737,74 @@ def texoff_test(tools, spirv, name):
         return texoff_problem(raw.read_bytes(), out)[0]
 
 
+def store_words(name):
+    """The 64 words STORE_WORDS[name] expects in each of STORE_IMAGES: its changes over the tool's fill."""
+    return tuple([changed.get(i, fill(i)) for i in range(64)] for changed, fill in zip(STORE_WORDS[name], STORE_FILL))
+
+
+def store_words_problem(output, name):
+    """Judge what vk_store_test printed in "words" mode: "" when every image holds store_words(name)."""
+    for image, want in zip(STORE_IMAGES, store_words(name)):
+        m = re.search(rf"^{image} words:((?: 0x[0-9a-f]{{8}}){{64}})$", output, re.MULTILINE)
+        if not m:
+            return f"vk_store_test printed no {image} words"
+        got = [int(word, 16) for word in m.group(1).split()]
+        bad = [i for i in range(64) if got[i] != want[i]]
+        if bad:
+            i = bad[0]
+            return (f"{len(bad)} of 64 {image} words differ; first word {i}: got {got[i]:#010x}, "
+                    f"expected {want[i]:#010x}")
+    return ""
+
+
+def store_words_test(tools, spirv, name):
+    """A STORE_WORDS fixture through vk_store_test's "words" mode (it binds the images and prints them)."""
+    shader = os.path.join(spirv, name + ".spv")
+    if not os.path.isfile(shader):
+        return f"missing {name}.spv"
+    code, out = run(os.path.join(tools, "vk_store_test" + EXE), shader, "words")
+    if code == UNSUPPORTED:   # vk_store_test: the device lacks a feature its images need
+        m = re.search(r"unsupported: .*", out)
+        return Skip(f"SKIP ({m.group(0) if m else 'unsupported device'})")
+    return store_words_problem(out, name) if code == 0 else failure(code, out, 3)
+
+
+def get_lod_problem(data, want):
+    """Judge one image_get_lod frame: "" when all 4096 RGBA32F pixels are within GET_LOD_TOLERANCE of `want`."""
+    if len(data) != 64 * 64 * 16:
+        return f"expected 4096 RGBA32F pixels, got {len(data)} bytes"
+    bad, first = 0, ""
+    for i, pixel in enumerate(struct.iter_unpack("<4f", data)):
+        if not all(abs(got - expected) <= GET_LOD_TOLERANCE for got, expected in zip(pixel, want)):   # a NaN too
+            if not bad:
+                first = f"first at ({i % 64},{i // 64}): got {pixel}"
+            bad += 1
+    return f"{bad} of 4096 pixels differ from {want}; {first}" if bad else ""
+
+
+def get_lod_test(tools, spirv, name):
+    """A GET_LOD_TESTS fixture on vk_texture_test (it binds the textures and the sampler), once per draw."""
+    tool = os.path.join(tools, "vk_texture_test" + EXE)
+    shaders = [os.path.join(spirv, shader + ".spv") for shader in ("vs_ids", name)]
+    for path in (tool, *shaders):
+        if not os.path.isfile(path):
+            return f"missing {os.path.basename(path)}"
+    with tempfile.TemporaryDirectory(prefix="leonida-lod-") as tmp:
+        for limits, two_mip, want in GET_LOD_TESTS[name]:
+            raw = Path(tmp) / f"lod_{limits}.raw"
+            code, out = run(tool, *shaders, raw, "0", "92", limits, "14500000", "0",
+                            *(["--two-mip"] if two_mip else []))
+            if code == UNSUPPORTED:   # vk_texture_test: e.g. fewer push constant bytes than the texture tests need
+                m = re.search(r"unsupported: .*", out)
+                return Skip(f"SKIP ({m.group(0) if m else 'unsupported device'})")
+            if code or not raw.is_file():
+                return f"S# word 1 {limits}: {failure(code, out, 3)}"
+            problem = get_lod_problem(raw.read_bytes(), want)
+            if problem:
+                return f"S# word 1 {limits}: {problem}"
+    return ""
+
+
 def texture_mip_mismatch(data: bytes, mip: int, *, transpose_uv: bool = False) -> str:
     width = 64
     if len(data) != width**2 * 16:
@@ -899,6 +999,10 @@ def main():
             continue
         bad = re.findall(r"(\d+) bad", out)
         results.append((name, "" if code == 0 and len(bad) == 3 and set(bad) == {"0"} else failure(code, out, 3)))
+    for name in STORE_WORDS:   # TEST-184: image atomics and image_get_resinfo
+        results.append((name, store_words_test(tools, spirv, name)))
+    for name in GET_LOD_TESTS:   # TEST-184: image_get_lod, 2D and 2D array
+        results.append((name, get_lod_test(tools, spirv, name)))
     for name in CLIP_TESTS:
         results.append((name, clip_test(tools, spirv, name)))
     for name in PIXEL_TESTS:

@@ -37,6 +37,7 @@ from check import MESH_COMPUTE, mesh_env   # LEONIDA_MESH_COMPUTE=1: mesh shader
 from check import (WAVE32_LANE_DUMPS, WAVE32_LANE_ENV, bitmask_perm_narrow_skip, narrow_subgroup_skip,
                    wave32_lane_skip)   # as in check.py
 from check import PIXEL_VERTEX, interp_f16_high_problem   # ps_interp_f16_high's producers and check
+from check import GET_LOD_TESTS, STORE_WORDS, get_lod_test, store_words_problem   # TEST-184: image atomics and queries
 
 
 def make_dxbc(chunks: list[tuple[bytes, bytes]]) -> bytes:
@@ -494,6 +495,7 @@ DRAWN_WITH = {GATHER_LOD_TEST: "vs_ids.asm", "ps_flat": "vs_ids.asm", "ps_textur
               **{name: "vs_ids.asm" for name in GRADIENT_TESTS}, "vs_clip": "ps_ops.asm",
               "ps_interp_f16_high": "vs_f16_pack.asm", "ms_f16_pack": "ps_interp_f16_high.asm",
               "ps_interp_f32_mods": "vs_interp_consts.asm", "ps_interp_mov_mods": "vs_interp_consts.asm"}
+DRAWN_WITH.update({name: "vs_ids.asm" for name in GET_LOD_TESTS})
 
 
 def with_draw_shaders(asm_files: list[str]) -> list[str]:
@@ -697,9 +699,27 @@ def run_suite(a, work: str) -> int:
         elif name == "cs_exec64":
             rc, msg = run_cmd([vk_compute, spv, "1", "exec64"], env=cs_env)
             results.append((name, rc == 0, msg.splitlines()[-1] if msg else ""))
-        elif name == "cs_bvh":
+        elif name in ("cs_bvh", "cs_bvh32"):   # the 64-bit and the 32-bit node pointer: one scene, the same words
             rc, msg = run_cmd([vk_compute, spv, "1", "bvh"], env=cs_env)
             results.append((name, rc == 0, msg.splitlines()[-1] if msg else ""))
+        elif name in STORE_WORDS:
+            # TEST-184: image atomics (cs_imgatomic, cs_imgatomic3d) and image_get_resinfo (cs_resinfo). vk_store_test
+            # binds the images and prints the r32 ones after the dispatch; the expected words are check.py's.
+            rc, msg = run_cmd([vk_store, spv, "words"])
+            if rc == UNSUPPORTED:
+                results.append((name, None, unsupported_skip(msg)))
+            elif rc != 0:
+                results.append((name, False, msg))
+            else:
+                problem = store_words_problem(msg, name)
+                results.append((name, not problem, problem or "all 64 words of the uint image, the sint image and "
+                                "the volume exact"))
+        elif name in GET_LOD_TESTS:
+            # TEST-184: image_get_lod on vk_texture_test's two-mip texture (two sampler LOD ranges) and on its 2D array.
+            problem = get_lod_test(a.build, spirv_dir, name)
+            ok = None if isinstance(problem, Skip) else not problem
+            results.append((name, ok, problem or f"4096 pixels in each of {len(GET_LOD_TESTS[name])} draw(s): the "
+                            "clamped and the calculated LOD within 1/16"))
         elif name in ("cs_bounds", "cs_smem_bounds", "cs_smem_stride_align", "cs_smem_sload_neg", "cs_buf_tail", "cs_oob_select", "cs_oob_tail",
                       "cs_cmpx_class_f32"):
             # num_records bounds check (cs_bounds.asm): the out-of-bounds store is dropped and the out-of-bounds
