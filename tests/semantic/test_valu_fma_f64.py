@@ -1057,5 +1057,145 @@ class TestFmaF64SIMDMultiLane(unittest.TestCase):
             self.assertEqual(wave.get_lane_vgpr_pair_u64(lane, 0), self.CANARY_OLD)
 
 
+class TestFmaF64RegisterAliasing(unittest.TestCase):
+    """Test suite for register aliasing and in-place operand preservation."""
+
+    def test_accumulator_aliasing_dst_equals_src2(self):
+        # Accumulator in-place: v[0:1] = v[2:3] * v[4:5] + v[0:1]
+        rf = ScalarRegisterFile()
+        interp = FmaF64ScalarInterpreter(rf)
+
+        rf.write_vgpr_pair_f64(0, 10.0)  # accumulator initial value
+        rf.write_vgpr_pair_f64(2, 2.0)
+        rf.write_vgpr_pair_f64(4, 3.0)
+
+        inst = ASTInstruction(
+            opcode=Opcode.V_FMA_F64,
+            dst=ASTOperand.vgpr(0),
+            src0=ASTOperand.vgpr(2),
+            src1=ASTOperand.vgpr(4),
+            src2=ASTOperand.vgpr(0),
+        )
+
+        # Iteration 1: 10.0 + 6.0 = 16.0
+        interp.execute(inst)
+        self.assertEqual(rf.read_vgpr_pair_f64(0), 16.0)
+
+        # Iteration 2: 16.0 + 6.0 = 22.0
+        interp.execute(inst)
+        self.assertEqual(rf.read_vgpr_pair_f64(0), 22.0)
+
+        # Iteration 3: 22.0 + 6.0 = 28.0
+        interp.execute(inst)
+        self.assertEqual(rf.read_vgpr_pair_f64(0), 28.0)
+
+    def test_multiplicand_aliasing_dst_equals_src0(self):
+        # v[0:1] = v[0:1] * v[2:3] + v[4:5]
+        rf = ScalarRegisterFile()
+        interp = FmaF64ScalarInterpreter(rf)
+
+        rf.write_vgpr_pair_f64(0, 5.0)
+        rf.write_vgpr_pair_f64(2, 2.0)
+        rf.write_vgpr_pair_f64(4, 3.0)
+
+        inst = ASTInstruction(
+            opcode=Opcode.V_FMA_F64,
+            dst=ASTOperand.vgpr(0),
+            src0=ASTOperand.vgpr(0),
+            src1=ASTOperand.vgpr(2),
+            src2=ASTOperand.vgpr(4),
+        )
+        interp.execute(inst)
+        self.assertEqual(rf.read_vgpr_pair_f64(0), 13.0)
+
+    def test_multiplier_aliasing_dst_equals_src1(self):
+        # v[0:1] = v[2:3] * v[0:1] + v[4:5]
+        rf = ScalarRegisterFile()
+        interp = FmaF64ScalarInterpreter(rf)
+
+        rf.write_vgpr_pair_f64(0, 3.0)
+        rf.write_vgpr_pair_f64(2, 4.0)
+        rf.write_vgpr_pair_f64(4, -5.0)
+
+        inst = ASTInstruction(
+            opcode=Opcode.V_FMA_F64,
+            dst=ASTOperand.vgpr(0),
+            src0=ASTOperand.vgpr(2),
+            src1=ASTOperand.vgpr(0),
+            src2=ASTOperand.vgpr(4),
+        )
+        interp.execute(inst)
+        self.assertEqual(rf.read_vgpr_pair_f64(0), 7.0)
+
+    def test_self_fma_dst_equals_all_sources(self):
+        # v[0:1] = v[0:1] * v[0:1] + v[0:1] -> x^2 + x
+        rf = ScalarRegisterFile()
+        interp = FmaF64ScalarInterpreter(rf)
+
+        rf.write_vgpr_pair_f64(0, 3.0)
+
+        inst = ASTInstruction(
+            opcode=Opcode.V_FMA_F64,
+            dst=ASTOperand.vgpr(0),
+            src0=ASTOperand.vgpr(0),
+            src1=ASTOperand.vgpr(0),
+            src2=ASTOperand.vgpr(0),
+        )
+        interp.execute(inst)
+        self.assertEqual(rf.read_vgpr_pair_f64(0), 12.0)
+
+    def test_partial_dword_misaligned_aliasing(self):
+        # Misaligned overlap: dst is v[1:2], reading src0 from v[0:1]
+        # v0 and v1 encode 2.0 (f64: lo=0, hi=0x40000000)
+        rf = ScalarRegisterFile()
+        interp = FmaF64ScalarInterpreter(rf)
+
+        rf.write_vgpr_pair_f64(0, 2.0)   # v0=0, v1=0x40000000
+        rf.write_vgpr_pair_f64(4, 5.0)   # src1
+        rf.write_vgpr_pair_f64(6, 1.0)   # src2
+
+        inst = ASTInstruction(
+            opcode=Opcode.V_FMA_F64,
+            dst=ASTOperand.vgpr(1),       # dst writes v1 and v2
+            src0=ASTOperand.vgpr(0),      # src0 reads v0 and v1
+            src1=ASTOperand.vgpr(4),
+            src2=ASTOperand.vgpr(6),
+        )
+        interp.execute(inst)
+        # Result = 2.0 * 5.0 + 1.0 = 11.0, committed to v[1:2]
+        self.assertEqual(rf.read_vgpr_pair_f64(1), 11.0)
+        # v0 remains untouched
+        self.assertEqual(rf.read_vgpr(0), 0)
+
+    def test_simd_multi_lane_aliased_accumulation(self):
+        # Multi-lane wave with dst == src2 accumulation under active/inactive EXEC
+        wave = SIMDWaveState(wave_size=64)
+        wave.exec_lo = 0xFF00FF00
+        wave.exec_hi = 0x00FF00FF
+
+        initial_acc = 100.0
+        for lane in range(64):
+            wave.set_lane_vgpr_pair_f64(lane, 0, initial_acc)
+            wave.set_lane_vgpr_pair_f64(lane, 2, float(lane))
+            wave.set_lane_vgpr_pair_f64(lane, 4, 2.0)
+
+        inst = ASTInstruction(
+            opcode=Opcode.V_FMA_F64,
+            dst=ASTOperand.vgpr(0),
+            src0=ASTOperand.vgpr(2),
+            src1=ASTOperand.vgpr(4),
+            src2=ASTOperand.vgpr(0),
+        )
+        wave.execute(inst)
+
+        for lane in range(64):
+            is_active = bool((wave.exec_mask >> lane) & 1)
+            if is_active:
+                expected = float(lane * 2) + initial_acc
+                self.assertEqual(wave.get_lane_vgpr_pair_f64(lane, 0), expected)
+            else:
+                self.assertEqual(wave.get_lane_vgpr_pair_f64(lane, 0), initial_acc)
+
+
 if __name__ == "__main__":
     unittest.main()
