@@ -64,3 +64,7 @@ method, scope and caveats. No game data is included.
 | [shader_validation.md](shader_validation.md) | Differential CPU/GPU validation design and the current CPU interpreter prototype. |
 | [buffer_bounds.md](buffer_bounds.md) | V# `OOB_SELECT` bounds measured natively: RDNA2 (gfx1036) follows Mesa's GFX11 column (729/732 cases), not GFX10; raw mode also counts `soffset`. |
 | [fssm_crosscheck.md](fssm_crosscheck.md) | FSSM/RDNA2 facts cross-checked against SCARAB; code starts at `code_off + 0x28`. |
+
+## Other languages
+
+Community quickstarts (stable onboarding text only; English docs remain authoritative): [i18n/README.md](i18n/README.md) (`pt-BR`).
