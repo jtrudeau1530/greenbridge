@@ -855,8 +855,146 @@ class TestSIMDMultiLaneDivergence(unittest.TestCase):
         self.assertTrue(wave64.is_lane_active(63))
 
 
+
+# ==============================================================================
+# Phase 5: Register Aliasing and In-Place Operand Preservation
+# ==============================================================================
+
+class TestRegisterAliasing(unittest.TestCase):
+    """Verifies architectural register aliasing, latching, and unwritten register preservation."""
+
+    def test_dst_equals_src_aliasing(self) -> None:
+        """When dst == src (e.g. s_or_saveexec_b64 s[4:5], s[4:5]):
+        
+        Hardware semantics:
+          - src operand value is read (val_src)
+          - old EXEC is latched (old_exec)
+          - new EXEC = val_src | old_exec
+          - dst receives old_exec
+        """
+        state = ScalarMachineState(exec_mask=0x1111_2222_3333_4444)
+        interp = ScalarInterpreter(state)
+
+        # Set s[4:5] to 0x5555_6666_7777_8888
+        reg_s4 = RegPair64(4, RegType.SGPR)
+        state.write_reg_pair(reg_s4, 0x5555_6666_7777_8888)
+
+        # Execute aliased instruction
+        inst = SOrSaveExecB64Instruction(
+            dst=reg_s4,
+            src=SaluOperand(reg_s4),
+        )
+        saved, new_exec, scc = interp.step(inst)
+
+        # Saved sdst must be old EXEC
+        self.assertEqual(saved, 0x1111_2222_3333_4444)
+        self.assertEqual(state.read_reg_pair(reg_s4), 0x1111_2222_3333_4444)
+
+        # New EXEC must be val_src | old_exec
+        expected_exec = 0x5555_6666_7777_8888 | 0x1111_2222_3333_4444
+        self.assertEqual(new_exec, expected_exec)
+        self.assertEqual(state.exec_mask, expected_exec)
+        self.assertEqual(scc, 1)
+
+    def test_dst_is_exec_aliasing(self) -> None:
+        """When dst is EXEC (s_or_saveexec_b64 exec, s[2:3]):
+        
+        Hardware semantics:
+          - SDEST is EXEC, but EXEC is subsequently updated with src | EXEC.
+          - Final EXEC is src | old_exec.
+        """
+        state = ScalarMachineState(exec_mask=0x0000_FFFF_0000_FFFF)
+        interp = ScalarInterpreter(state)
+
+        reg_s2 = RegPair64(2, RegType.SGPR)
+        state.write_reg_pair(reg_s2, 0xFFFF_0000_FFFF_0000)
+
+        reg_exec = RegPair64(126, RegType.EXEC, custom_name="exec")
+        inst = SOrSaveExecB64Instruction(
+            dst=reg_exec,
+            src=SaluOperand(reg_s2),
+        )
+        saved, new_exec, scc = interp.step(inst)
+
+        self.assertEqual(saved, 0x0000_FFFF_0000_FFFF)
+        self.assertEqual(new_exec, ALL_LANES_ACTIVE_64)
+        self.assertEqual(state.exec_mask, ALL_LANES_ACTIVE_64)
+        self.assertEqual(scc, 1)
+
+    def test_src_is_exec_aliasing(self) -> None:
+        """When src is EXEC (s_or_saveexec_b64 s[6:7], exec):
+        
+        Hardware semantics:
+          - SDEST receives old EXEC
+          - New EXEC = EXEC | EXEC = EXEC
+          - EXEC remains unchanged, SCC = (EXEC != 0)
+        """
+        initial_exec = 0x1234_5678_9ABC_DEF0
+        state = ScalarMachineState(exec_mask=initial_exec)
+        interp = ScalarInterpreter(state)
+
+        reg_s6 = RegPair64(6, RegType.SGPR)
+        reg_exec = RegPair64(126, RegType.EXEC, custom_name="exec")
+
+        inst = SOrSaveExecB64Instruction(
+            dst=reg_s6,
+            src=SaluOperand(reg_exec),
+        )
+        saved, new_exec, scc = interp.step(inst)
+
+        self.assertEqual(saved, initial_exec)
+        self.assertEqual(new_exec, initial_exec)
+        self.assertEqual(state.read_reg_pair(reg_s6), initial_exec)
+        self.assertEqual(state.exec_mask, initial_exec)
+        self.assertEqual(scc, 1)
+
+    def test_dst_and_src_both_exec_aliasing(self) -> None:
+        """When dst and src are both EXEC (s_or_saveexec_b64 exec, exec):"""
+        initial_exec = 0xAAAA_5555_AAAA_5555
+        state = ScalarMachineState(exec_mask=initial_exec)
+        interp = ScalarInterpreter(state)
+
+        reg_exec = RegPair64(126, RegType.EXEC, custom_name="exec")
+        inst = SOrSaveExecB64Instruction(
+            dst=reg_exec,
+            src=SaluOperand(reg_exec),
+        )
+        saved, new_exec, scc = interp.step(inst)
+
+        self.assertEqual(saved, initial_exec)
+        self.assertEqual(new_exec, initial_exec)
+        self.assertEqual(state.exec_mask, initial_exec)
+        self.assertEqual(scc, 1)
+
+    def test_unwritten_registers_preserved(self) -> None:
+        """Verify that registers not targeted by dst remain completely unchanged."""
+        state = ScalarMachineState()
+        rng = random.Random(0xDEAD_CAFE)
+
+        # Populate all 106 SGPRs with random values
+        for i in range(106):
+            state.sgprs[i] = rng.getrandbits(32)
+
+        snapshot_sgprs = list(state.sgprs)
+        target_pair = RegPair64(20, RegType.SGPR)
+
+        interp = ScalarInterpreter(state)
+        inst = SOrSaveExecB64Instruction(
+            dst=target_pair,
+            src=SaluOperand(Literal64.from_int(0x1234)),
+        )
+        interp.step(inst)
+
+        # Check that only s20 and s21 changed; all other 104 SGPRs must be bit-for-bit identical
+        for i in range(106):
+            if i in (20, 21):
+                continue
+            self.assertEqual(state.sgprs[i], snapshot_sgprs[i], f"SGPR s{i} was unexpectedly modified")
+
+
 if __name__ == "__main__":
     unittest.main()
+
 
 
 
