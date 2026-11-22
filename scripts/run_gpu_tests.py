@@ -35,6 +35,7 @@ from check import TEXOFF_FALLBACK, texoff_env   # LEONIDA_TEXOFF_FALLBACK=1: tex
 from check import gpu_test_timeout, timed_out   # per-program time limit (LEONIDA_GPU_TEST_TIMEOUT)
 from check import MESH_COMPUTE, mesh_env   # LEONIDA_MESH_COMPUTE=1: mesh shaders as compute + a generated VS
 from check import WAVE32_LANE_DUMPS, WAVE32_LANE_ENV, narrow_subgroup_skip, wave32_lane_skip   # as in check.py
+from check import PIXEL_VERTEX, interp_f16_high_problem   # ps_interp_f16_high's producers and check
 
 
 def make_dxbc(chunks: list[tuple[bytes, bytes]]) -> bytes:
@@ -464,7 +465,8 @@ def check_clip_half(raw_path: str, want_b: float, want_a: float) -> tuple[bool, 
 DRAWN_WITH = {GATHER_LOD_TEST: "vs_ids.asm", "ps_flat": "vs_ids.asm", "ps_texture_sample": "vs_ids.asm", "ps_cube_sample": "vs_ids.asm",
               "ps_texture_sample_d16": "vs_ids.asm", "ps_sample_c_lz": "vs_ids.asm", "ps_sample_c_lz_a16": "vs_ids.asm",
               "ps_gather_wrap": "vs_ids.asm",
-              **{name: "vs_ids.asm" for name in GRADIENT_TESTS}, "vs_clip": "ps_ops.asm"}
+              **{name: "vs_ids.asm" for name in GRADIENT_TESTS}, "vs_clip": "ps_ops.asm",
+              "ps_interp_f16_high": "vs_f16_pack.asm", "ms_f16_pack": "ps_interp_f16_high.asm"}
 
 
 def with_draw_shaders(asm_files: list[str]) -> list[str]:
@@ -573,7 +575,7 @@ def run_suite(a, work: str) -> int:
                 (b"ISG1", make_sig_chunk([(1, 3, 0, 0xF, 0xF), (0, 3, 1, 0xF, 0xF)])),
                 (b"OSG1", make_sig_chunk([(1, 3, 0, 0xF, 0xF), (0, 3, 1, 0xF, 0xF)])),
             ])
-        elif name in ("ms_tri", "ms_w64x_ballot", "ms_wave_info_s3"):
+        elif name in ("ms_tri", "ms_w64x_ballot", "ms_wave_info_s3", "ms_f16_pack"):
             dxbc = make_dxbc([(b"PSV0", make_ms_psv0(128, 64, 64, 2))])
         elif name == "ms_v5_workgroup":
             dxbc = make_dxbc([(b"PSV0", make_ms_psv0(32, 3, 1, group_shared=128))])
@@ -904,6 +906,11 @@ def run_suite(a, work: str) -> int:
         elif name.startswith("ps_"):
             raw = os.path.join(raw_dir, f"{name}.raw")
             vs = os.path.join(spirv_dir, "vs_ids.spv") if name == "ps_flat" else vs_tri   # check.py draws ps_flat with vs_ids
+            if name in PIXEL_VERTEX:
+                if bary_fallback():   # no PerVertexKHR inputs under --bary-fallback (docs/design.md)
+                    results.append((name, None, "SKIP (per-vertex f16 interpolants need barycentrics)"))
+                    continue
+                vs = os.path.join(spirv_dir, PIXEL_VERTEX[name] + ".spv")
             env = dict(gfx_env or os.environ, **PIXEL_ENV[name]) if name in PIXEL_ENV else gfx_env
             bary_gs = os.path.join(spirv_dir, f"{name}.bary_gs.spv")
             if bary_fallback() and os.path.isfile(bary_gs):   # --bary-fallback PS: barycentrics from this GS
@@ -963,6 +970,9 @@ def run_suite(a, work: str) -> int:
                 ok, detail = check_wqm(raw)
             elif name == "ps_flat":
                 ok, detail = check_flat(raw)
+            elif name == "ps_interp_f16_high":
+                problem = interp_f16_high_problem(list(struct.iter_unpack("<4I", open(raw, "rb").read())))
+                ok, detail = not problem, problem or "f16 low/high halves and f32 control within 2e-3"
             else:
                 ok, detail = False, "no checker defined"
             results.append((name, ok, detail))
@@ -1002,6 +1012,21 @@ def run_suite(a, work: str) -> int:
             else:
                 ok, detail = check_grad(raw, 0.5, 1.0)
                 results.append((name, ok, detail))
+        elif name == "ms_f16_pack":   # mesh producer of packed f16 params, drawn with ps_interp_f16_high
+            raw = os.path.join(raw_dir, f"{name}.raw")
+            env = dict(gfx_env or os.environ, VKH_MESH="1")
+            fs = os.path.join(spirv_dir, "ps_interp_f16_high.spv")
+            if bary_fallback():
+                results.append((name, None, "SKIP (per-vertex f16 interpolants need barycentrics)"))
+                continue
+            rc, msg = run_cmd([vk_harness, spv, fs, raw], env=env)
+            if rc == UNSUPPORTED:
+                results.append((name, None, unsupported_skip(msg)))
+            elif rc != 0:
+                results.append((name, False, msg))
+            else:
+                problem = interp_f16_high_problem(list(struct.iter_unpack("<4I", open(raw, "rb").read())))
+                results.append((name, not problem, problem or "f16 low/high halves and f32 control within 2e-3"))
         elif name == "ms_clip":
             raw = os.path.join(raw_dir, f"{name}.raw")
             env = mesh_env(spirv_dir, name, gfx_env)
