@@ -165,6 +165,9 @@ PIXEL_BITS = {"ps_legacy_mul": (0, 0, 0, 0x40c00000),
 # Pixel shaders that read memory: vk_harness puts this V# in s[0:3] and seeds the heap it points at, as
 # tests/semantic/test_value_semantics.py does for the interpreter.
 PIXEL_ENV = {"ps_vcc_x2": {"VKH_SGPRS": "0x1000,0,16,0", "VKH_HEAP": "0x1000=0x11223344,0x1004=0x55667788"}}
+# ps_gather_wrap.asm (SHADER-36): image_gather4_l_o under each S# address mode, run by vk_texture_test (the 8x8 gradient
+# texture); the expected channels are derived in the .asm header.
+GATHER_WRAP = (5090733.0, 14942181.0, 258623.0, 9702309.0)
 CLIP_TESTS = ("vs_clip", "vs_clip_param4", "vs_clip_undeclared")
 # One definition: a later assignment used to drop ps_texoff (and any entry added by an earlier assignment) from
 # the standalone run. Keep every pixel fixture in this tuple.
@@ -439,6 +442,22 @@ def pixels(tools, spirv, name, fmt):
     return list(struct.iter_unpack(fmt, data)), out
 
 
+def gather_wrap_test(tools, spirv):
+    """ps_gather_wrap through vk_texture_test: every one of the 64x64 pixels must hold GATHER_WRAP."""
+    shader = os.path.join(spirv, "ps_gather_wrap.spv")
+    if not os.path.isfile(shader):
+        return "missing ps_gather_wrap.spv"
+    with tempfile.TemporaryDirectory(prefix="leonida-gather-") as tmp:
+        raw = Path(tmp) / "gather.raw"
+        code, out = run(os.path.join(tools, "vk_texture_test" + EXE), os.path.join(spirv, "vs_ids.spv"), shader, raw,
+                        "0", "92", "c00000", "14500000", "0")
+        data = raw.read_bytes() if code == 0 and raw.is_file() else b""
+    if len(data) != 64 * 64 * 16:
+        return failure(code, out, 3)
+    wrong = sum(p != GATHER_WRAP for p in struct.iter_unpack("<4f", data))
+    return "" if not wrong else f"{wrong} of 4096 pixels differ from {GATHER_WRAP}"
+
+
 def texoff_words(px, py):
     """ps_texoff's mrt0 words at pixel (px, py), from the rule in docs/design.md (derivation in ps_texoff.asm)."""
     bx, by = px >> 3, py >> 3                          # per-pixel offset (bx - 4, by - 4) from texel (4, 4)
@@ -652,6 +671,7 @@ def main():
         results.append((name, clip_test(tools, spirv, name)))
     for name in PIXEL_TESTS:
         results.append((name, pixel_test(tools, spirv, name)))
+    results.append(("ps_gather_wrap", gather_wrap_test(tools, spirv)))
     results.append(("ps_tex", bindless_test(tools, spirv)))
     results.append((TEXTURE_MIP_TEST, texture_mip_test(tools, spirv)))
     for name in GRADIENT_TESTS:

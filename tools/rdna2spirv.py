@@ -152,6 +152,7 @@ class Gen:
         self.blocks = []      # per basic block: list of SPIR-V lines (dispatch-loop form), empty = straight-line
         self.succ = []        # per basic block: the blocks it can go to next (none = the program ends there)
         self.desc_fn = None   # lines of the descriptor-lookup function, once an instruction needs it
+        self.sgpr_imm = {}    # SGPR -> literal an s_mov_b32 put there earlier in this basic block (see gather_addr_modes)
         self.desc_cache = {}  # (first SGPR, dwords) -> id of the %desc_lookup_fn result in the current basic block
         self._scan = (None, 0, [])   # (body list, lines already seen, open merge labels): see desc_cache_ok
         self.block_label = "%entry"   # label of the SPIR-V block the current instruction starts in
@@ -186,6 +187,7 @@ class Gen:
 
     def store_reg(self, kind, r, val):
         if kind == "sgpr":
+            self.sgpr_imm.pop(r, None)
             self.x_tok[("sgpr", r)] = val
             if self.desc_cache:          # every write to the %sgpr array comes through here (see desc_lookup_sgpr)
                 self.desc_cache = {k: v for k, v in self.desc_cache.items() if not (k[0] <= r < k[0] + k[1])}
@@ -1742,6 +1744,7 @@ class Gen:
         self.emit(f"OpStore %pc {self.cu(seg)}")
         self.x_marks.append((len(self.body), seg))
         self.desc_cache.clear()
+        self.sgpr_imm.clear()
         self.block_label = f"%blk{seg}"
         self.x_dirty = set()
 
@@ -2433,6 +2436,8 @@ class Gen:
                                  const)
         elif op == "v_mov_b32" or op == "s_mov_b32":
             self.dst(a[0], self.src_u(a[1]))
+            if op == "s_mov_b32" and a[0]["k"] == "sgpr" and a[1]["k"] == "imm" and self.desc_cache_ok():
+                self.sgpr_imm[a[0]["r"]] = a[1]["v"] & 0xFFFFFFFF      # a literal S# word, see gather_addr_modes
         elif op == "s_mov_b64":
             self.mov64(a[0], a[1])
         elif op in ("v_max3_f32", "v_min3_f32"):
@@ -4738,6 +4743,78 @@ class Gen:
         self._scan = (body, len(body), open_)
         return not open_
 
+    # SQ_IMG_SAMP_WORD0 address modes (Mesa src/amd/registers/gfx10-rsrc.json: CLAMP_X = bits [2:0], CLAMP_Y = [5:3];
+    # values: SQ_TEX_* in Mesa's gfx6.json, as RADV's radv_tex_wrap maps VkSamplerAddressMode onto them): 0 wrap, 1 mirror, 2 clamp last texel, 3 mirror once last texel,
+    # 4 clamp half border, 5 mirror once half border, 6 clamp border, 7 mirror once border.
+    def gather_addr_modes(self, s_op):
+        """(x, y) address modes of an S# for the gather emulation, each either a Python int (the S# word 0 is a
+        literal an s_mov_b32 wrote earlier in this basic block) or the id of a uint computed from the S# at run time.
+
+        A literal S# whose mode needs a border colour (4..7), or that sets FORCE_UNNORMALIZED, is Unsupported: the
+        four fetches can't reproduce it. A run-time S# can't be judged at translation time, so modes 4..7 are
+        treated as clamp-to-edge there, and FORCE_UNNORMALIZED (bit 15) is not applied (the two remaining
+        approximations)."""
+        if s_op["k"] != "sgpr" or s_op.get("n", 1) < 4:
+            raise Unsupported("descriptor operand")
+        lit = self.sgpr_imm.get(s_op["r"])
+        if lit is not None:
+            if lit & 0x8000:
+                raise Unsupported("image_gather4_l with FORCE_UNNORMALIZED")
+            m = (lit & 7, lit >> 3 & 7)
+            if max(m) > 3:
+                raise Unsupported(f"image_gather4_l address mode {max(m)} (border)")
+            return m
+        w0 = self.load_reg("sgpr", s_op["r"])
+        out = []
+        for k in range(2):
+            m = self.tmp()
+            self.emit(f"{m} = OpBitFieldUExtract %uint {w0} {self.cu(3 * k)} {self.cu(3)}")
+            out.append(m)
+        return tuple(out)
+
+    def gather_addr(self, c, n, mode):
+        """Texel coordinate c (int id) after the address mode (int, or a uint id) for an axis of n texels (int id):
+        wrap: c mod n; mirror: c mod 2n, reflected in the upper half; mirror once: the negative side reflected
+        (-1 - c), then clamped; otherwise (clamp, and border modes at run time) clamped to [0, n-1]. As in the
+        Vulkan address-mode definitions (and RADV's radv_tex_wrap mapping of them onto SQ_TEX_*). A literal mode
+        emits only the code it needs; a run-time one emits all four and selects."""
+        zero, one = self.as_int(self.cu(0)), self.as_int(self.cu(1))
+        static = isinstance(mode, int)
+        want = {mode if mode <= 3 else 2} if static else {0, 1, 2, 3}
+        nm1 = self.tmp()
+        self.emit(f"{nm1} = OpISub %int {n} {one}")
+        res = {}
+        if 2 in want:
+            res[2] = self.tmp()
+            self.emit(f"{res[2]} = OpExtInst %int %glsl SClamp {c} {zero} {nm1}")
+        if 0 in want:
+            res[0] = self.tmp()
+            self.emit(f"{res[0]} = OpSMod %int {c} {n}")
+        if 1 in want:
+            n2, p, hi, rf, lt, res[1] = (self.tmp() for _ in range(6))
+            self.emit(f"{n2} = OpIAdd %int {n} {n}")
+            self.emit(f"{p} = OpSMod %int {c} {n2}")
+            self.emit(f"{hi} = OpISub %int {n2} {one}")
+            self.emit(f"{rf} = OpISub %int {hi} {p}")
+            self.emit(f"{lt} = OpSLessThan %bool {p} {n}")
+            self.emit(f"{res[1]} = OpSelect %int {lt} {p} {rf}")
+        if 3 in want:
+            neg, refl, ge, mo, res[3] = (self.tmp() for _ in range(5))
+            self.emit(f"{neg} = OpISub %int {zero} {c}")
+            self.emit(f"{refl} = OpISub %int {neg} {one}")
+            self.emit(f"{ge} = OpSGreaterThanEqual %bool {c} {zero}")
+            self.emit(f"{mo} = OpSelect %int {ge} {c} {refl}")
+            self.emit(f"{res[3]} = OpExtInst %int %glsl SClamp {mo} {zero} {nm1}")
+        if static:
+            return res[mode if mode <= 3 else 2]
+        r = res[2]
+        for val in (3, 1, 0):
+            eq, nr = self.tmp(), self.tmp()
+            self.emit(f"{eq} = OpIEqual %bool {mode} {self.cu(val)}")
+            self.emit(f"{nr} = OpSelect %int {eq} {res[val]} {r}")
+            r = nr
+        return r
+
     def desc_lookup_sgpr(self, a, n):
         """desc_lookup for an SGPR descriptor range (n=8: T#, n=4: S#), cached for the rest of the basic block.
 
@@ -4893,13 +4970,14 @@ class Gen:
             if op == "image_gather4_l":
                 # Gather at an explicit LOD: Vulkan gathers have no Lod operand without an AMD extension, so fetch
                 # the 2x2 footprint at mip round(lod) (clamped to the mip range) in gather order
-                # (u0,v1) (u1,v1) (u1,v0) (u0,v0). Coordinates are clamped to the edge: the sampler's wrap/mirror
-                # addressing is not reproduced at the image border.
+                # (u0,v1) (u1,v1) (u1,v0) (u0,v0). Each texel coordinate goes through the S#'s own address mode
+                # (CLAMP_X/CLAMP_Y, see gather_addr_modes / gather_addr).
                 if bin(dmask).count("1") != 1 or ncoord != 2 or len(f) < 3 or d16:
                     raise Unsupported("image_gather4_l form")
+                modes = self.gather_addr_modes(a[3])
                 self.uses_query = True
                 ch = dmask.bit_length() - 1
-                lv, lvm, rl, mi, mc, mz, sz, uvf, szf, st, half, flo, i0, one2, i1, smax = (self.tmp() for _ in range(16))
+                lv, lvm, rl, mi, mc, mz, sz, uvf, szf, st, half, flo, i0, one2, i1 = (self.tmp() for _ in range(15))
                 self.emit(f"{lv} = OpImageQueryLevels %int {img}")
                 self.emit(f"{lvm} = OpISub %int {lv} {self.as_int(self.cu(1))}")
                 self.emit(f"{rl} = OpExtInst %float %glsl RoundEven {f[2]}")
@@ -4922,21 +5000,21 @@ class Gen:
                 c1 = self.as_int(self.cu(1))
                 self.emit(f"{one2} = OpCompositeConstruct %v2int {c1} {c1}")
                 self.emit(f"{i1} = OpIAdd %v2int {i0} {one2}")
-                self.emit(f"{smax} = OpISub %v2int {sz} {one2}")
                 x0, y0, x1, y1 = (self.tmp() for _ in range(4))
                 self.emit(f"{x0} = OpCompositeExtract %int {i0} 0")
                 self.emit(f"{y0} = OpCompositeExtract %int {i0} 1")
                 self.emit(f"{x1} = OpCompositeExtract %int {i1} 0")
                 self.emit(f"{y1} = OpCompositeExtract %int {i1} 1")
-                zero2 = self.tmp()
-                c0 = self.as_int(self.cu(0))
-                self.emit(f"{zero2} = OpCompositeConstruct %v2int {c0} {c0}")
+                szx, szy = self.tmp(), self.tmp()
+                self.emit(f"{szx} = OpCompositeExtract %int {sz} 0")
+                self.emit(f"{szy} = OpCompositeExtract %int {sz} 1")
+                ax = [self.gather_addr(c, szx, modes[0]) for c in (x0, x1)]
+                ay = [self.gather_addr(c, szy, modes[1]) for c in (y0, y1)]
                 comps = []
-                for xx, yy in ((x0, y1), (x1, y1), (x1, y0), (x0, y0)):
-                    cc, cl, tx, comp = self.tmp(), self.tmp(), self.tmp(), self.tmp()
+                for xx, yy in ((ax[0], ay[1]), (ax[1], ay[1]), (ax[1], ay[0]), (ax[0], ay[0])):
+                    cc, tx, comp = self.tmp(), self.tmp(), self.tmp()
                     self.emit(f"{cc} = OpCompositeConstruct %v2int {xx} {yy}")
-                    self.emit(f"{cl} = OpExtInst %v2int %glsl SClamp {cc} {zero2} {smax}")
-                    self.emit(f"{tx} = OpImageFetch %v4float {img} {cl} Lod {mc}")
+                    self.emit(f"{tx} = OpImageFetch %v4float {img} {cc} Lod {mc}")
                     self.emit(f"{comp} = OpCompositeExtract %float {tx} {ch}")
                     comps.append(comp)
                 for i, comp in enumerate(comps):
@@ -7301,6 +7379,7 @@ def translate(path):
         g.x_tok, g.x_mcache = {}, {}     # a register's value is only known from where this block wrote it
         g.x_gen += 1
         g.desc_cache.clear()            # a cached lookup is only good inside the block that made it
+        g.sgpr_imm.clear()
         term = None
         for ins in blk:
             op = base_op(ins["op"])
