@@ -197,6 +197,70 @@ class RunTestTest(unittest.TestCase):
                          os.path.normcase(os.path.realpath(self.artifact / "sub")))
 
 
+@unittest.skipIf(os.name == "nt", "the runner and its dosdevices links are for Linux and macOS")
+class DriveMapTest(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        base = Path(self._tmp.name)
+        self.root = base / "checkout"
+        (self.root / "runtime" / "build" / "generated").mkdir(parents=True)
+        (self.root / "runtime" / "build" / "generated" / "cs.spv").write_text("spirv", encoding="utf-8")
+        self.prefix = base / "prefix"
+        (self.prefix / "dosdevices").mkdir(parents=True)
+        self.link = self.prefix / "dosdevices" / "d:"
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_the_drive_leads_to_the_checkout_and_is_removed_afterwards(self):
+        with rwt.DriveMap("D:/a/Leonida/Leonida", str(self.root), str(self.prefix)) as drive:
+            seen = self.link / "a" / "Leonida" / "Leonida" / "runtime" / "build" / "generated" / "cs.spv"
+            self.assertEqual(seen.read_text(encoding="utf-8"), "spirv")
+            self.assertIn("drive d: maps", drive.note)
+            scratch = drive.scratch
+        self.assertFalse(os.path.lexists(self.link))
+        self.assertFalse(os.path.exists(scratch))
+        self.assertTrue((self.root / "runtime" / "build" / "generated" / "cs.spv").is_file())   # links only
+
+    def test_backslashes_and_a_lower_case_drive_are_accepted(self):
+        with rwt.DriveMap("d:\\work\\leonida\\", str(self.root), str(self.prefix)):
+            self.assertTrue((self.link / "work" / "leonida" / "runtime" / "build").is_dir())
+
+    def test_a_drive_the_prefix_already_has_is_left_alone(self):
+        other = self.prefix / "elsewhere"
+        other.mkdir()
+        os.symlink(other, self.link)
+        with rwt.DriveMap("D:/a/Leonida/Leonida", str(self.root), str(self.prefix)) as drive:
+            self.assertIn("already set", drive.note)
+        self.assertEqual(os.readlink(self.link), str(other))
+
+    def test_no_prefix_or_no_drive_letter_maps_nothing(self):
+        with rwt.DriveMap("D:/a/b", str(self.root), str(self.prefix / "absent")) as drive:
+            self.assertIn("no Wine prefix", drive.note)
+        with rwt.DriveMap("/home/runner/work", str(self.root), str(self.prefix)) as drive:
+            self.assertIn("no drive letter", drive.note)
+        self.assertFalse(os.path.lexists(self.link))
+
+    def test_main_maps_the_drive_while_the_tests_run(self):
+        # The "Wine" here is the Python interpreter, so the program reads the drive through its dosdevices link, which
+        # is where Wine resolves D:/win/root/... too.
+        probe = self.root / "probe.py"
+        target = self.link / "win" / "root" / "runtime" / "build" / "generated" / "cs.spv"
+        probe.write_text(f"import sys\nsys.exit(0 if open({str(target)!r}).read() == 'spirv' else 1)\n", encoding="utf-8")
+        listing = self.root / "ctest.json"
+        listing.write_text(json.dumps({"tests": [ctest_entry("compiled_in_path", [WINDOWS_ROOT + "/probe.py"])]}),
+                           encoding="utf-8")
+        argv = ["run_wine_tests.py", "--tests", str(listing), "--windows-root", WINDOWS_ROOT,
+                "--root", str(self.root), "--wine", sys.executable.replace(os.sep, "/")]
+        out = io.StringIO()
+        with mock.patch.dict(os.environ, {"WINEPREFIX": str(self.prefix)}), mock.patch.object(sys, "argv", argv), \
+                contextlib.redirect_stdout(out):
+            code = rwt.main()
+        self.assertEqual(code, 0, out.getvalue())
+        self.assertIn("[PASS] compiled_in_path", out.getvalue())
+        self.assertFalse(os.path.lexists(self.link))
+
+
 class MainTest(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -205,6 +269,10 @@ class MainTest(unittest.TestCase):
         self.artifact.mkdir()
         for name, code in (("ok.py", 0), ("bad.py", 1)):
             (self.artifact / name).write_text(f"import sys\nsys.exit({code})\n", encoding="utf-8")
+        # main() maps the checkout's drive into $WINEPREFIX: keep it away from a real prefix (~/.wine).
+        env = mock.patch.dict(os.environ, {"WINEPREFIX": str(self.root / "no-prefix")})
+        env.start()
+        self.addCleanup(env.stop)
 
     def tearDown(self):
         self._tmp.cleanup()

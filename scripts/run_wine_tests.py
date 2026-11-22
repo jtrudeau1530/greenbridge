@@ -8,6 +8,10 @@ Usage:
 made in (forward slashes, as `cygpath -m` prints it). Paths under it are mapped to --root, the Linux checkout (default:
 this repository), which must hold the Windows build's runtime/build folder at the same place.
 
+Some tests open files through absolute paths compiled into them (the GLSL test shaders, LEONIDA_TEST_*_SPV under
+runtime/build/generated). For those, the drive of --windows-root is pointed at --root in the Wine prefix for the run
+($WINEPREFIX, else ~/.wine), unless that drive is already in use there.
+
 Every test is run and reported. The exit code is 1 if a test named by --require fails or is missing, else 0: the
 others show what does and doesn't work under Wine yet without failing the job.
 """
@@ -17,8 +21,10 @@ import math
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -44,6 +50,51 @@ def map_path(arg: str, windows_root: str, root: str) -> str | None:
     if a.lower().startswith(w.lower() + "/"):
         return os.path.join(root, *a[len(w) + 1:].split("/"))
     return None
+
+
+class DriveMap:
+    """Points the drive of the Windows checkout at the Linux one inside the Wine prefix, for the run.
+
+    A test that opens D:/a/Leonida/Leonida/runtime/build/generated/x.spv (a path compiled into it) then reads
+    <root>/runtime/build/generated/x.spv. The drive is a dosdevices link to a scratch folder holding a/Leonida/Leonida
+    as a link to the root; both are removed afterwards. A drive the prefix already has (c:, z:, or one set up by
+    hand) is left alone, and so is a root without a drive letter.
+    """
+
+    def __init__(self, windows_root: str, root: str, prefix: str):
+        self.windows_root, self.root, self.prefix = norm(windows_root), os.path.abspath(root), prefix
+        self.link = self.scratch = None
+        self.note = ""
+
+    def __enter__(self):
+        m = re.fullmatch(r"([A-Za-z]):/(.+)", self.windows_root)
+        if not m:
+            self.note = f"{self.windows_root} has no drive letter: no drive mapped"
+            return self
+        drive, rest = m.group(1).lower(), [p for p in m.group(2).split("/") if p]
+        dosdevices = os.path.join(self.prefix, "dosdevices")
+        link = os.path.join(dosdevices, drive + ":")
+        if not os.path.isdir(dosdevices):
+            self.note = f"no Wine prefix at {self.prefix}: drive {drive}: not mapped"
+            return self
+        if os.path.lexists(link):
+            self.note = f"drive {drive}: is already set in {dosdevices}: left as it is"
+            return self
+        self.scratch = tempfile.mkdtemp(prefix="wine-drive-")
+        parent = os.path.join(self.scratch, *rest[:-1])
+        os.makedirs(parent, exist_ok=True)
+        os.symlink(self.root, os.path.join(parent, rest[-1]))
+        os.symlink(self.scratch, link)
+        self.link = link
+        self.note = f"drive {drive}: maps {self.windows_root} to {self.root} for this run"
+        return self
+
+    def __exit__(self, *exc):
+        if self.link and os.path.islink(self.link):
+            os.unlink(self.link)
+        if self.scratch:
+            shutil.rmtree(self.scratch, ignore_errors=True)   # removes the links, never what they point to
+        return False
 
 
 def wine_path(path: str) -> str:
@@ -170,14 +221,17 @@ def main() -> int:
         return 2
     wine = args.wine
     results = {}
-    for test in tests:
-        name = test.get("name", "?")
-        status, detail = run_test(test, args, wine)
-        results[name] = status
-        print(f"[{status.upper()}] {name}", flush=True)
-        if status != "pass":
-            for line in detail.rstrip().splitlines()[-40:]:
-                print(f"    {line}")
+    prefix = os.environ.get("WINEPREFIX") or os.path.join(os.path.expanduser("~"), ".wine")
+    with DriveMap(args.windows_root, args.root, prefix) as drive:
+        print(drive.note, flush=True)
+        for test in tests:
+            name = test.get("name", "?")
+            status, detail = run_test(test, args, wine)
+            results[name] = status
+            print(f"[{status.upper()}] {name}", flush=True)
+            if status != "pass":
+                for line in detail.rstrip().splitlines()[-40:]:
+                    print(f"    {line}")
 
     missing = [n for n in args.require if n not in results]
     failed_required = [n for n in args.require if results.get(n) != "pass"]
