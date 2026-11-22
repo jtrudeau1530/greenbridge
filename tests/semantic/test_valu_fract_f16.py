@@ -350,6 +350,76 @@ class VFractF16Instruction:
 
 
 # ==============================================================================
+# Deterministic Scalar Instruction Interpreter
+# ==============================================================================
+
+@dataclass
+class ScalarMachineState:
+    """Architectural register file for a single wavefront lane."""
+    vgprs: List[int] = field(default_factory=lambda: [0] * 256)
+    sgprs: List[int] = field(default_factory=lambda: [0] * 256)
+
+    def get_vgpr16(self, index: int, half: RegHalf) -> int:
+        dword = self.vgprs[index] & 0xFFFF_FFFF
+        return ((dword >> 16) & 0xFFFF) if half == RegHalf.HI else (dword & 0xFFFF)
+
+    def set_vgpr16(self, index: int, half: RegHalf, bits: int) -> None:
+        dword = self.vgprs[index] & 0xFFFF_FFFF
+        bits16 = bits & 0xFFFF
+        if half == RegHalf.HI:
+            self.vgprs[index] = (dword & 0x0000_FFFF) | (bits16 << 16)
+        else:
+            self.vgprs[index] = (dword & 0xFFFF_0000) | bits16
+
+    def get_sgpr16(self, index: int, half: RegHalf) -> int:
+        dword = self.sgprs[index] & 0xFFFF_FFFF
+        return ((dword >> 16) & 0xFFFF) if half == RegHalf.HI else (dword & 0xFFFF)
+
+    def set_sgpr16(self, index: int, half: RegHalf, bits: int) -> None:
+        dword = self.sgprs[index] & 0xFFFF_FFFF
+        bits16 = bits & 0xFFFF
+        if half == RegHalf.HI:
+            self.sgprs[index] = (dword & 0x0000_FFFF) | (bits16 << 16)
+        else:
+            self.sgprs[index] = (dword & 0xFFFF_0000) | bits16
+
+
+class ScalarInterpreter:
+    """Deterministic scalar instruction interpreter for v_fract_f16."""
+
+    def resolve_operand(self, op: VOP1Operand, state: ScalarMachineState) -> int:
+        if isinstance(op.source, Reg16):
+            if op.source.reg_type == RegType.VGPR:
+                return state.get_vgpr16(op.source.index, op.source.half)
+            elif op.source.reg_type == RegType.SGPR:
+                return state.get_sgpr16(op.source.index, op.source.half)
+            else:
+                raise ValueError(f"Unknown register type: {op.source.reg_type}")
+        elif isinstance(op.source, Literal16):
+            return op.source.bits
+        else:
+            raise TypeError(f"Unsupported operand source type: {type(op.source)}")
+
+    def step(self, instr: VFractF16Instruction, state: ScalarMachineState) -> int:
+        # Atomic read phase
+        s_raw = self.resolve_operand(instr.src, state)
+
+        # Computation phase
+        result_bits = oracle_v_fract_f16(
+            src_bits=s_raw,
+            abs_mod=instr.src.abs_mod,
+            neg_mod=instr.src.neg_mod,
+            clamp=instr.clamp,
+            mul=instr.mul,
+            div=instr.div,
+        )
+
+        # Write-back phase (preserving untouched half of destination dword)
+        state.set_vgpr16(instr.dst.index, instr.dst.half, result_bits)
+        return result_bits
+
+
+# ==============================================================================
 # Unit Tests
 # ==============================================================================
 
@@ -533,6 +603,83 @@ class TestSymbolicAST(unittest.TestCase):
                 src=VOP1Operand(Reg16(1, RegType.VGPR, RegHalf.LO)),
                 mul=3,
             )
+
+
+class TestScalarInterpreter(unittest.TestCase):
+    """Unit tests for the deterministic scalar instruction interpreter."""
+
+    def setUp(self) -> None:
+        self.interp = ScalarInterpreter()
+        self.state = ScalarMachineState()
+
+    def test_scalar_vgpr_low_and_high_half(self) -> None:
+        # v1 has low half = -1.75, high half = 0.75
+        self.state.vgprs[1] = (H_0P75 << 16) | H_NEG_1P75
+
+        # v0 starts with background pattern 0xDEADBEEF
+        self.state.vgprs[0] = 0xDEAD_BEEF
+
+        # Step 1: Read v1.l (-1.75 -> 0.25) and write to v0.l
+        instr1 = VFractF16Instruction(
+            dst=Reg16(0, RegType.VGPR, RegHalf.LO),
+            src=VOP1Operand(Reg16(1, RegType.VGPR, RegHalf.LO)),
+        )
+        res1 = self.interp.step(instr1, self.state)
+        self.assertEqual(res1, H_0P25)
+        # v0.l is H_0P25, v0.h should be unchanged (0xDEAD)
+        self.assertEqual(self.state.vgprs[0], (0xDEAD << 16) | H_0P25)
+
+        # Step 2: Read v1.h (0.75 -> 0.75) and write to v0.h
+        instr2 = VFractF16Instruction(
+            dst=Reg16(0, RegType.VGPR, RegHalf.HI),
+            src=VOP1Operand(Reg16(1, RegType.VGPR, RegHalf.HI)),
+        )
+        res2 = self.interp.step(instr2, self.state)
+        self.assertEqual(res2, H_0P75)
+        self.assertEqual(self.state.vgprs[0], (H_0P75 << 16) | H_0P25)
+
+    def test_scalar_sgpr_operand(self) -> None:
+        self.state.set_sgpr16(4, RegHalf.LO, H_NEG_0P25)
+        instr = VFractF16Instruction(
+            dst=Reg16(2, RegType.VGPR, RegHalf.LO),
+            src=VOP1Operand(Reg16(4, RegType.SGPR, RegHalf.LO)),
+        )
+        res = self.interp.step(instr, self.state)
+        self.assertEqual(res, H_0P75)
+        self.assertEqual(self.state.get_vgpr16(2, RegHalf.LO), H_0P75)
+
+    def test_scalar_literal_operand(self) -> None:
+        instr = VFractF16Instruction(
+            dst=Reg16(5, RegType.VGPR, RegHalf.LO),
+            src=VOP1Operand(Literal16.from_float(1.5)),
+        )
+        res = self.interp.step(instr, self.state)
+        self.assertEqual(res, H_0P5)
+        self.assertEqual(self.state.get_vgpr16(5, RegHalf.LO), H_0P5)
+
+    def test_scalar_modifiers_abs_neg_clamp_mul_div(self) -> None:
+        self.state.set_vgpr16(10, RegHalf.LO, H_0P75)
+        # -|0.75| = -0.75 -> fract(-0.75) = 0.25 -> mul:2 -> 0.5
+        instr = VFractF16Instruction(
+            dst=Reg16(11, RegType.VGPR, RegHalf.LO),
+            src=VOP1Operand(Reg16(10, RegType.VGPR, RegHalf.LO), abs_mod=True, neg_mod=True),
+            mul=2,
+        )
+        res = self.interp.step(instr, self.state)
+        self.assertEqual(res, H_0P5)
+        self.assertEqual(self.state.get_vgpr16(11, RegHalf.LO), H_0P5)
+
+    def test_scalar_determinism(self) -> None:
+        runs = []
+        for _ in range(50):
+            st = ScalarMachineState()
+            st.set_vgpr16(1, RegHalf.LO, 0x3C10)  # ~1.015625
+            instr = VFractF16Instruction(
+                dst=Reg16(2, RegType.VGPR, RegHalf.LO),
+                src=VOP1Operand(Reg16(1, RegType.VGPR, RegHalf.LO)),
+            )
+            runs.append(self.interp.step(instr, st))
+        self.assertTrue(all(r == runs[0] for r in runs))
 
 
 if __name__ == "__main__":
