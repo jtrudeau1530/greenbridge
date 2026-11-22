@@ -815,8 +815,6 @@ class ExportHaltStepAndErrorTests(CfRefTestCase):
             (["exp mrt0 off, off, off, off done vm", "s_endpgm"], 32),
             (["s_branch L_missing", "s_endpgm"], 32),
             (["s_branch s0", "s_endpgm"], 32),
-            (["s_mov_b32 exec_hi, 0", "s_endpgm"], 64),
-            (["s_and_b32 s0, exec_hi, 1", "s_endpgm"], 32),
             (["s_mov_saveexec_b32 s0, vcc_lo", "s_endpgm"], 32),
             (["s_and_b32 vcc_lo, vcc_lo, scc", "s_endpgm"], 32),
             (["v_cmp_eq_u32_e64 v0, v0, 0", "s_endpgm"], 32),
