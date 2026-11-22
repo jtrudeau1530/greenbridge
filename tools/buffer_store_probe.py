@@ -325,7 +325,7 @@ def main():
               f"2-comp {two['formats_ok']}/{two['formats_total']} formats, "
               f"{two['triples_ok']}/{two['triples_total']} DST_SEL triples")
     if args.json_out:
-        with open(args.json_out, "w", encoding="utf-8") as f:
+        with open(args.json_out, "w", encoding="utf-8", newline="\n") as f:
             json.dump(out, f, indent=2)
     return 1 if mismatches else 0
 
