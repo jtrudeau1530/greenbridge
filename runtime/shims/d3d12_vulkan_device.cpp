@@ -1810,6 +1810,13 @@ public:
             opts->ResourceHeapTier = D3D12_RESOURCE_HEAP_TIER_1;
             return S_OK;
         }
+        case D3D12_FEATURE_D3D12_OPTIONS8: {
+            if (size != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS8)) return E_INVALIDARG;
+            // Vulkan BC image extents are in texels; only the transfer footprints round up to blocks.
+            auto* opts = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS8*>(data);
+            opts->UnalignedBlockTexturesSupported = state_.info.texture_compression_bc;
+            return S_OK;
+        }
         case D3D12_FEATURE_D3D12_OPTIONS17: {
             // Non-normalized samplers are core Vulkan (unnormalizedCoordinates), with the restrictions
             // CreateSampler2 checks. No manual write tracking, as the RTX 4090 answers too.
@@ -2391,6 +2398,7 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     queue_info.queueCount = 1;
     queue_info.pQueuePriorities = &priority;
     VkPhysicalDeviceFeatures enable{};
+    info.texture_compression_bc = chosen_bc;
     enable.textureCompressionBC = chosen_bc ? VK_TRUE : VK_FALSE;  // the game's textures are BC1-7
     enable.shaderSampledImageArrayDynamicIndexing = info.bindless;
     enable.shaderStorageImageArrayDynamicIndexing = info.bindless;

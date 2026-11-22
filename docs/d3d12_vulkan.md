@@ -239,7 +239,8 @@ What is implemented (all of it testable without the game):
     targets or depth-stencils, in the sample counts the GPU has for the format);
   - packed `R9G9B9E5_SHAREDEXP` textures map to `VK_FORMAT_E5B9G9R9_UFLOAT_PACK32` for uploads and sampled views;
   - `CheckFeatureSupport` for feature levels (up to 12_1), architecture, D3D12 options, GPU virtual-address
-    support, format support and multisample quality levels. Other queries are logged and refused until the trace
+    support, format support and multisample quality levels. `D3D12_OPTIONS8` reports unaligned block textures
+    when the Vulkan logical device enables BC texture compression. Other queries are logged and refused until the trace
     shows what the game asks (question 11);
   - reserved resources and `GetResourceTiling` (section 4.2);
   - `GetCopyableFootprints` for buffers, 2D textures and volumes, including BC1–7 and the two-plane depth-stencil formats.

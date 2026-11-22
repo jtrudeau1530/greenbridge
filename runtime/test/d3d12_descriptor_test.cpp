@@ -204,6 +204,7 @@ int main() {
         info.device = d.device;
         info.queue = d.queue;
         info.queue_family = d.family;
+        info.texture_compression_bc = d.bc;
         info.bindless = d.bindless;
         info.bindless_partially_bound = d.partially_bound;
         ID3D12Device* inner = nullptr;
@@ -212,6 +213,15 @@ int main() {
         EXPECT(SUCCEEDED(rt::d3d12_xs::create_device_proxy(inner, __uuidof(ID3D12Device),
                                                            reinterpret_cast<void**>(&device.p))));
         rt::d3d12::set_device_outer(inner, device.p);  // the proxy now owns `inner`
+
+        D3D12_FEATURE_DATA_D3D12_OPTIONS8 options8{};
+        EXPECT(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS8, &options8, sizeof(options8)) == S_OK);
+        EXPECT(options8.UnalignedBlockTexturesSupported == (d.bc ? TRUE : FALSE));
+        for (UINT query_size : {0u, UINT(sizeof(options8) - 1), UINT(sizeof(options8) + 1)}) {
+            D3D12_FEATURE_DATA_D3D12_OPTIONS8 output[] = {{83}, {42}};
+            EXPECT(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS8, output, query_size) == E_INVALIDARG);
+            EXPECT(output[0].UnalignedBlockTexturesSupported == 83 && output[1].UnalignedBlockTexturesSupported == 42);
+        }
 
         // --- Copies. Two host-side heaps; slot i of the source holds 32 bytes of (0x10 * (i + 1) + byte index).
         {
@@ -533,6 +543,28 @@ int main() {
                 std::memcpy(row + x * 4, &packed_values[(x + y) % 4], 4);
         }
 
+        // OPTIONS8 applies to the top-level mip. The four BC1 blocks cover 4x4, 3x4, 4x1 and 3x1 texels.
+        constexpr UINT bc_width = 7, bc_height = 5;
+        Ref<ID3D12Resource> bc;
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT bc_placed{};
+        if (options8.UnalignedBlockTexturesSupported) {
+            auto bc_desc = texture_desc;
+            bc_desc.Width = bc_width;
+            bc_desc.Height = bc_height;
+            bc_desc.Format = DXGI_FORMAT_BC1_UNORM;
+            EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &bc_desc,
+                                                             D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                             IID_PPV_ARGS(&bc.p))));
+            device->CreateShaderResourceView(bc.p, nullptr, view_slot(null_slot));
+            device->GetCopyableFootprints(&bc_desc, 0, 1, 8192, &bc_placed, nullptr, nullptr, nullptr);
+            EXPECT(bc_placed.Offset == 8192 && bc_placed.Footprint.RowPitch == D3D12_TEXTURE_DATA_PITCH_ALIGNMENT);
+            // Endpoint 0 is RGB565 red, green, blue or white. Every two-bit selector picks that endpoint.
+            constexpr std::uint64_t blocks[2][2] = {{0xf800, 0x07e0}, {0x001f, 0xffff}};
+            for (UINT row = 0; row < 2; ++row)
+                std::memcpy(static_cast<std::uint8_t*>(mapped) + bc_placed.Offset + row * bc_placed.Footprint.RowPitch,
+                            blocks[row], sizeof(blocks[row]));
+        }
+
         D3D12_COMMAND_QUEUE_DESC queue_desc{};
         Ref<ID3D12CommandQueue> queue;
         Ref<ID3D12CommandAllocator> allocator;
@@ -558,6 +590,14 @@ int main() {
         to_texture.pResource = packed.p;
         from_upload.PlacedFootprint = packed_placed;
         list->CopyTextureRegion(&to_texture, 0, 0, 0, &from_upload, nullptr);
+        if (bc.p) {
+            to_texture.pResource = bc.p;
+            from_upload.PlacedFootprint = bc_placed;
+            list->CopyTextureRegion(&to_texture, 0, 0, 0, &from_upload, nullptr);
+            const auto barrier =
+                transition(bc.p, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            list->ResourceBarrier(1, &barrier);
+        }
         const D3D12_RESOURCE_BARRIER sampled[] = {
             transition(texture.p, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
             transition(packed.p, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
@@ -585,6 +625,23 @@ int main() {
         }
         EXPECT(sample_through_set(d, set0, set0_layout, keys, results.data()));
         sampled_through_set = true;
+        if (bc.p) {
+            SampleKeys bc_key = keys[0];
+            std::memcpy(bc_key.tsharp, view_bytes(null_slot), sizeof(bc_key.tsharp));
+            std::array<std::uint8_t, bytes> samples{};
+            EXPECT(sample_through_set(d, set0, set0_layout, {&bc_key, 1}, samples.data()));
+            constexpr std::uint8_t colors[2][2][4] = {{{255, 0, 0, 255}, {0, 255, 0, 255}},
+                                                      {{0, 0, 255, 255}, {255, 255, 255, 255}}};
+            for (UINT y = 0; y < size; ++y) {
+                for (UINT x = 0; x < size; ++x) {
+                    // cs_sample.comp samples at the centres of an 8x8 grid with nearest filtering.
+                    const UINT tex_x = (2 * x + 1) * bc_width / (2 * size);
+                    const UINT tex_y = (2 * y + 1) * bc_height / (2 * size);
+                    EXPECT(std::memcmp(samples.data() + 4 * (y * size + x), colors[tex_y / 4][tex_x / 4], 4) == 0);
+                }
+            }
+            std::printf("OPTIONS8: 64 point samples of a 7x5 BC1 top mip matched\n");
+        }
 
         // The border samplers, one tile to the right: every texel is the border.
         SampleKeys border_keys[3] = {};
@@ -601,6 +658,7 @@ int main() {
 
         // A destroyed texture takes its views out of the set: the next ExecuteCommandLists writes that, and nothing
         // may still name the destroyed image views (the validation layer reports a set that does).
+        bc.reset();
         packed.reset();
         texture.reset();
         EXPECT(SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.p, nullptr)));

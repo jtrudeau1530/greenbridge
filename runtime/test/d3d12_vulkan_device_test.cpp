@@ -952,6 +952,7 @@ int main() {
         info.device = d.device;
         info.queue = d.queue;
         info.queue_family = d.family;
+        info.texture_compression_bc = d.bc;
         ID3D12Device* inner = nullptr;
         EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&inner))));
         Ref<ID3D12Device> device;
@@ -1043,6 +1044,7 @@ int main() {
         // Simulated fallback path when maxPushConstantsSize < 144 bytes:
         {
             rt::d3d12::VulkanDeviceInfo fallback_info = info;
+            fallback_info.texture_compression_bc = false;
             fallback_info.max_push_constants_size = 128;
             fallback_info.push_constants_need_fallback = true;
             ID3D12Device* fallback_inner = nullptr;
@@ -1051,6 +1053,10 @@ int main() {
             EXPECT(SUCCEEDED(rt::d3d12_xs::create_device_proxy(fallback_inner, __uuidof(ID3D12Device),
                                                                reinterpret_cast<void**>(&fallback_device.p))));
             rt::d3d12::set_device_outer(fallback_inner, fallback_device.p);
+            D3D12_FEATURE_DATA_D3D12_OPTIONS8 options8{TRUE};
+            EXPECT(fallback_device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS8, &options8,
+                                                        sizeof(options8)) == S_OK);
+            EXPECT(options8.UnalignedBlockTexturesSupported == FALSE);
             EXPECT(rt::d3d12::device_max_push_constants_size(fallback_device.p) == 128);
             EXPECT(rt::d3d12::device_push_constants_need_fallback(fallback_device.p));
         }
