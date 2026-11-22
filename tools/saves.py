@@ -379,6 +379,11 @@ def save_slot(folder):
 
 
 def import_saves(args):
+    flags = {'--out', '--map', '--with-packed', '--force', '--dry-run'}
+    for option, following in zip(args, args[1:]):
+        if option in ('--out', '--map') and following in flags:
+            raise ValueError(f'import: {option} needs a value before {following}')
+
     import hashlib
     out, maps, with_packed, force, dry = None, {}, False, False, False
     folders = []
