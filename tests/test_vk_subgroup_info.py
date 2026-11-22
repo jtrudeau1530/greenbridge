@@ -49,6 +49,7 @@ class FakeDevice:
 
     name: str | bytes = "Synthetic GPU"
     api_version: int = vk_info.VK_API_VERSION_1_3
+    extension_names: tuple[bytes, ...] = ()
     device_type: int = vk_info.VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU
     dynamic_rendering: bool = True
     synchronization2: bool = True
@@ -95,6 +96,7 @@ class FakeVulkan:
         self.queue_calls = []
         self.vkCreateInstance = _VkProc(self._create_instance)
         self.vkEnumeratePhysicalDevices = _VkProc(self._enumerate_physical_devices)
+        self.vkEnumerateDeviceExtensionProperties = _VkProc(self._enumerate_device_extension_properties)
         self.vkGetPhysicalDeviceProperties2 = _VkProc(self._get_physical_device_properties2)
         self.vkGetPhysicalDeviceFeatures2 = _VkProc(self._get_physical_device_features2)
         self.vkGetPhysicalDeviceQueueFamilyProperties = _VkProc(self._get_queue_family_properties)
@@ -153,6 +155,23 @@ class FakeVulkan:
                 arr[i] = self._device_handles[i]
         count_ptr.value = written
         return vk_info.VK_INCOMPLETE if cap < len(self._device_handles) else 0
+
+    def _enumerate_device_extension_properties(self, physical: ctypes.c_void_p, layer: None,
+                                               p_count: object, p_entries: object) -> int:
+        assert layer is None
+        names = self._devices[_ptr(physical)].extension_names
+        count = ctypes.c_uint32.from_address(_ptr(p_count))
+        addr = _ptr(p_entries)
+        if addr is None:
+            count.value = len(names)
+            return 0
+        written = min(count.value, len(names))
+        for i, name in enumerate(names[:written]):
+            entry = addr + i * 260
+            ctypes.memmove(entry, name + b"\0", len(name) + 1)
+            ctypes.c_uint32.from_address(entry + 256).value = 1
+        count.value = written
+        return vk_info.VK_INCOMPLETE if written < len(names) else 0
 
     def _get_physical_device_properties2(self, phys_dev, p_props):
         handle = _ptr(phys_dev)
@@ -225,14 +244,23 @@ class FakeVulkan:
                 ctypes.c_uint32.from_address(
                     node_addr + vk_info.F13_DYNAMIC_RENDERING
                 ).value = int(dev.dynamic_rendering)
+            elif stype == 1000044003:  # VkPhysicalDeviceDynamicRenderingFeaturesKHR
+                ctypes.c_uint32.from_address(node_addr + 16).value = int(dev.dynamic_rendering)
+            elif stype == 1000314007:  # VkPhysicalDeviceSynchronization2FeaturesKHR
+                ctypes.c_uint32.from_address(node_addr + 16).value = int(dev.synchronization2)
             elif stype == vk_info.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_BARYCENTRIC_FEATURES_KHR:
                 ctypes.c_uint32.from_address(node_addr + 16).value = int(dev.fragment_shader_barycentric)
         expected = {
+            vk_info.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
             vk_info.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
-            vk_info.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
+            vk_info.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_BARYCENTRIC_FEATURES_KHR,
         }
-        if not expected.issubset(seen_types):
-            raise AssertionError(f"missing Vulkan 1.2/1.3 feature structs in pNext chain: {seen_types!r}")
+        if dev.api_version >= vk_info.VK_API_VERSION_1_3:
+            expected.add(vk_info.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES)
+        else:
+            expected.update((1000044003, 1000314007))
+        if expected != seen_types:
+            raise AssertionError(f"unexpected feature structs in pNext chain: {seen_types!r}")
 
     def _get_queue_family_properties(self, phys_dev, p_count, p_props):
         handle = _ptr(phys_dev)
@@ -589,6 +617,26 @@ class QueryTest(unittest.TestCase):
                 res, vk_with_fallback = self._run_query(bad_dev, fallback)
                 self.assertEqual(res["device"], "Fallback OK")
                 self.assertEqual(vk_with_fallback.destroyed_instances, [FakeVulkan.INSTANCE_HANDLE])
+
+    def test_vulkan_1_2_khr_features_match_the_runtime_device_choice(self) -> None:
+        extensions = (b"VK_KHR_dynamic_rendering", b"VK_KHR_synchronization2")
+        fallback = FakeDevice(name="Vulkan 1.3 integrated GPU", device_type=1)
+        for names, dynamic, sync in (
+            (extensions, True, True),
+            (extensions[:1], True, True),
+            (extensions[1:], True, True),
+            (extensions, False, True),
+            (extensions, True, False),
+        ):
+            with self.subTest(names=names, dynamic=dynamic, sync=sync):
+                candidate = FakeDevice(name="Vulkan 1.2 discrete GPU", api_version=(1 << 22) | (2 << 12),
+                                       extension_names=names, dynamic_rendering=dynamic, synchronization2=sync)
+                result, _ = self._run_query(fallback, candidate)
+                suitable = names == extensions and dynamic and sync
+                self.assertEqual(result["device"], candidate.name if suitable else fallback.name)
+                if suitable:
+                    self.assertFalse(result["subgroup_size_control"])
+                    self.assertFalse(result["native64"])
 
     def test_accepts_graphics_bit_on_non_zero_queue_family(self):
         dev = FakeDevice(
