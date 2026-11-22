@@ -310,8 +310,13 @@ class Gen:
         self.dst(d, v)
 
     def f16_roundtrip(self, f):
-        """f32 -> f16 -> f32 (round to nearest), modelling a 32-bit v_interp read of a 16-bit interpolant
-        (FSSM pixel-input table flag bit 4 marks the position; see the PS input path in translate).
+        """f32 -> f16 -> f32 (round to nearest; f16 denormals flushed to signed zero), modelling a 32-bit
+        v_interp read of a 16-bit interpolant (FSSM pixel-input table flag bit 4 marks the position; see
+        the PS input path in translate).
+
+        OpQuantizeToF16 returns +0 or -0 when the magnitude is too small for a normal f16, and the spec
+        pins no rounding mode (round-to-nearest is measured on hardware, not guaranteed). Do not reuse
+        this helper where f16 denormals or a specific rounding mode matter.
 
         Single OpQuantizeToF16 instruction on purpose: a PackHalf2x16/UnpackHalf2x16 round-trip is
         observably folded to a no-op by at least one Vulkan driver (RTX 5080, validated), while a lone
