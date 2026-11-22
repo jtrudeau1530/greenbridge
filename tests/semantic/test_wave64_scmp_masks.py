@@ -290,6 +290,44 @@ class Wave64U64MaskCompareTests(unittest.TestCase):
                 self.assertEqual([mem[4 * k] for k in range(5)], want)
 
 
+class PartialWaveAllOnesTests(unittest.TestCase):
+    """A group smaller than the wave: lanes that were never launched have 0 bits in VCC and EXEC but take no part
+    in a subgroup vote, so `s_cmp` of a mask against -1 must compare the mask word (GPU: cs_*_partial_scmp.asm)."""
+
+    def _run(self, name, prologue, cases, threads, wave):
+        asm = prologue + "v_cmp_eq_u32_e32 {}, v1, v1\n".format("vcc" if wave == 64 else "vcc_lo")
+        for k, (cmp_op, _) in enumerate(cases):
+            asm += cmp_op + "\n" + emit_store_scc(k)
+        spv = translate_cs(name, asm + "s_endpgm\n", threads=threads)
+        mem = si.run_workgroup(
+            spv, threads, wave,
+            inputs_for=lambda i: {"%wg_id": (0, 0, 0), "%local_id": (i, 0, 0), "%sg_lane": i},
+            push_constants=VSHARP + [0] * 28, memory={},
+        )
+        self.assertEqual([mem[4 * k] for k in range(len(cases))], [want for _, want in cases])
+
+    def test_wave64_40_threads(self):
+        # vcc = exec = 0x000000ff_ffffffff
+        self._run("cs_w64_partial_ones", "v_mbcnt_lo_u32_b32 v1, -1, 0\nv_mbcnt_hi_u32_b32 v1, -1, v1\n", [
+            ("s_cmp_eq_u32 vcc_hi, -1", 0),
+            ("s_cmp_lg_u32 vcc_hi, -1", 1),
+            ("s_cmp_eq_u32 vcc_lo, -1", 1),
+            ("s_cmp_eq_u64 vcc, -1", 0),
+            ("s_cmp_lg_u64 vcc, -1", 1),
+            ("s_cmp_eq_u64 exec, -1", 0),
+            ("s_cmp_lg_u64 vcc, 0", 1),
+        ], threads=40, wave=64)
+
+    def test_wave32_20_threads(self):
+        # vcc_lo = exec_lo = 0x000fffff
+        self._run("cs_w32_partial_ones", "v_mbcnt_lo_u32_b32 v1, -1, 0\n", [
+            ("s_cmp_eq_u32 vcc_lo, -1", 0),
+            ("s_cmp_lg_u32 vcc_lo, -1", 1),
+            ("s_cmp_eq_u32 exec_lo, -1", 0),
+            ("s_cmp_lg_u32 vcc_lo, 0", 1),
+        ], threads=20, wave=32)
+
+
 class FastPathPreservationTests(unittest.TestCase):
     def test_same_half_and_zero_imm_keep_vote_fast_path(self):
         asm = (
