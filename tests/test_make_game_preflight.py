@@ -565,13 +565,45 @@ class GameDiscoveryTest(unittest.TestCase):
             with open(os.path.join(folder, name), "wb") as file:
                 file.truncate(info["size"])
 
-    def discover(self):
-        roots = (self.home, self.desktop, self.downloads)
+    def discover(self, known=()):
+        """find_dumps() over the synthetic home folder only; `known` is what the shell reports for Downloads,
+        Desktop and Documents."""
+        roots = (self.home, self.desktop, self.downloads, *known)
         isdir = os.path.isdir
         with mock.patch("os.path.expanduser", return_value=self.home), \
              mock.patch("os.path.isdir", side_effect=lambda path: path in roots and isdir(path)), \
+             mock.patch.object(make_game, "known_folders", return_value=list(known)), \
              mock.patch.object(make_game, "versions", return_value=[self.version]):
             return make_game.find_dumps()
+
+    def test_find_searches_known_folders_moved_into_onedrive(self):
+        # OneDrive's Known Folder Move: Explorer's Desktop and Documents are ~\OneDrive\Desktop and
+        # ~\OneDrive\Documents, two levels below the home folder, so the home root alone never reaches inside them.
+        desktop = os.path.join(self.home, "OneDrive", "Desktop")
+        documents = os.path.join(self.home, "OneDrive", "Documents")
+        on_desktop = os.path.join(desktop, "GTA VI")
+        in_documents = os.path.join(documents, "Games", "GTA VI")
+        self.write_probes(on_desktop)
+        self.write_probes(in_documents)
+
+        self.assertEqual(self.discover(), [])
+        self.assertEqual(self.discover(known=(desktop, documents)),
+                         [(on_desktop, self.version), (in_documents, self.version)])
+
+    def test_find_reports_a_copy_once_when_known_folders_are_not_moved(self):
+        package = os.path.join(self.desktop, "Package")
+        self.write_probes(package)
+        self.assertEqual(self.discover(known=(self.downloads, self.desktop)), [(package, self.version)])
+
+    def test_known_folders_from_the_shell(self):
+        folders = make_game.known_folders()
+        if os.name != "nt":
+            self.assertEqual(folders, [])
+            return
+        self.assertEqual(len(folders), len(make_game.KNOWN_FOLDERS))
+        for folder in folders:
+            self.assertTrue(os.path.isabs(folder), folder)
+        self.assertEqual(make_game.known_folders(), folders)   # the shell's buffers are freed, calls repeat cleanly
 
     def test_find_searches_below_rejected_folder_with_config(self):
         outer = os.path.join(self.desktop, "Backup")

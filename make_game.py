@@ -9,10 +9,11 @@ r"""Build the PC port from your own copy of the game.
     python -I make_game.py --stages shaders,assets              # only some stages
 
 The game folder is your own Xbox Series package, version 1.0.2.1, with its files already readable on disk
-(see game/xbox-1.0.2.1.json for the file list). It is found automatically in Downloads, Desktop, Documents,
-Games, your home folder and the top of each drive (two folder levels down). This script never decrypts or
-works around anything: it reads plain files and writes everything it makes under --out. The only thing it
-downloads is the third_party/rpf9-explorer submodule, when it is missing. Never share what it makes.
+(see game/xbox-1.0.2.1.json for the file list). It is found automatically in Downloads, Desktop, Documents
+(also where Windows keeps them, such as in OneDrive), Games, your home folder and the top of each drive (two
+folder levels down). This script never decrypts or works around anything: it reads plain files and writes
+everything it makes under --out. The only thing it downloads is the third_party/rpf9-explorer submodule, when
+it is missing. Never share what it makes.
 
 Stages, in order (each skips work that is already done, so a stopped build continues where it left off):
     check     file names and sizes against game/<version>.json (add --full-check for SHA-256, slow)
@@ -186,11 +187,49 @@ def load_version(game: str) -> dict:
          + "\n".join(reports or ["  No version manifests found."]))
 
 
+# Windows known-folder IDs (KnownFolders.h): Downloads, Desktop, Documents. OneDrive's Known Folder Move puts
+# Desktop and Documents in ~\OneDrive, and each can be moved anywhere from its Properties > Location tab, so the
+# folders Explorer shows aren't always the ones under the home folder.
+KNOWN_FOLDERS = ("{374DE290-123F-4565-9164-39C4925E467B}", "{B4BFCC3A-DB2C-424C-B029-7FE99A87C641}",
+                 "{FDD39AD0-238F-46AF-ADB4-6C85480369C7}")
+
+
+def known_folders() -> list:
+    """Windows: where Downloads, Desktop and Documents really are (SHGetKnownFolderPath). Empty elsewhere, and
+    without the ones the shell can't report."""
+    if os.name != "nt":
+        return []
+    import ctypes
+    import uuid
+    from ctypes import wintypes
+    try:
+        shell32, ole32 = ctypes.WinDLL("shell32"), ctypes.WinDLL("ole32")
+    except OSError:
+        return []
+    get = shell32.SHGetKnownFolderPath
+    get.argtypes = [ctypes.c_char_p, wintypes.DWORD, wintypes.HANDLE, ctypes.POINTER(ctypes.c_void_p)]
+    get.restype = ctypes.c_long
+    free = ole32.CoTaskMemFree
+    free.argtypes = [ctypes.c_void_p]
+    free.restype = None
+    found = []
+    for folder in KNOWN_FOLDERS:
+        path = ctypes.c_void_p()
+        result = get(uuid.UUID(folder).bytes_le, 0, None, ctypes.byref(path))
+        try:
+            if result == 0 and path.value:
+                found.append(ctypes.wstring_at(path.value))
+        finally:
+            free(path)   # the shell's buffer is freed whether or not the call succeeded
+    return found
+
+
 def find_dumps() -> list:
-    """Folders on this PC that hold a supported version: Downloads, Desktop, Documents, the home folder and the
-    top of each drive, up to two folder levels down. Only folder names and a few file sizes are read."""
+    """Folders on this PC that hold a supported version: Downloads, Desktop, Documents (under the home folder and
+    where Windows really keeps them), the home folder and the top of each drive, up to two folder levels down.
+    Only folder names and a few file sizes are read."""
     home = os.path.expanduser("~")
-    roots = [os.path.join(home, d) for d in ("Downloads", "Desktop", "Documents", "Games")] + [home]
+    roots = [os.path.join(home, d) for d in ("Downloads", "Desktop", "Documents", "Games")] + known_folders() + [home]
     if os.name == "nt":
         import string
         roots += [f"{d}:\\" for d in string.ascii_uppercase if os.path.isdir(f"{d}:\\")]
