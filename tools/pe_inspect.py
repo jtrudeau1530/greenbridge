@@ -215,7 +215,14 @@ def _exports(img: PeImage) -> list[str]:
         names.append(symbol if symbol is not None else "?")
         named.add(struct.unpack_from("<H", img.data, ord_at)[0])
     for i in range(min(functions, MAX_ENTRIES)):
-        if i not in named:
+        if i in named:
+            continue
+        # A zero RVA in AddressOfFunctions marks an unused ordinal slot, not an export. A forwarder (an RVA inside the
+        # export directory) is a real export. A slot the file does not hold is skipped like any other unreadable entry.
+        slot = img.offset(addr_functions + i * 4)
+        if slot is None or slot + 4 > len(img.data):
+            continue
+        if struct.unpack_from("<I", img.data, slot)[0]:
             names.append(f"#{base + i}")
     return names
 

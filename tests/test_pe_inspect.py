@@ -149,6 +149,33 @@ def build_image(is64: bool = True, with_directories: bool = True) -> bytes:
     return bytes(buf)
 
 
+EXPORT_FUNCS = 0x1F00  # AddressOfFunctions for the rebuilt export tables below: last in the section, so a cut can reach it
+FORWARDER = 0x1790     # inside the export directory once its size is widened: a forwarder string lives here
+
+
+def with_exports(slots: list[int], names: dict[int, str], base: int = 10, is64: bool = True) -> bytes:
+    """build_image() with its export directory replaced: `slots` is AddressOfFunctions, `names` maps an index into
+    it to the export name that points at it."""
+    buf = bytearray(build_image(is64=is64))
+    img = pe_inspect.PeImage(bytes(buf))
+    dir_entry = (0x58 + (112 if is64 else 96)) + pe_inspect.DIR_EXPORT * 8
+    struct.pack_into("<II", buf, dir_entry, 0x1700, 0x100)
+    ordered = sorted(names.items(), key=lambda kv: kv[1])
+    place(buf, 0x1700, struct.pack("<IIHHIIIIIII", 0, 0, 0, 0, 0x1780, base, len(slots), len(ordered),
+                                   EXPORT_FUNCS, 0x1C00, 0x1C80))
+    place(buf, 0x1780, b"sample.dll\0")
+    place(buf, FORWARDER, b"other.Target\0")
+    place(buf, EXPORT_FUNCS, struct.pack(f"<{len(slots)}I", *slots))
+    text = 0x1D00
+    for n, (index, name) in enumerate(ordered):
+        place(buf, 0x1C00 + 4 * n, struct.pack("<I", text))
+        place(buf, 0x1C80 + 2 * n, struct.pack("<H", index))
+        place(buf, text, name.encode() + b"\0")
+        text += len(name) + 1
+    assert img.offset(EXPORT_FUNCS) is not None
+    return bytes(buf)
+
+
 class PeInspectTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -207,6 +234,39 @@ class PeInspectTest(unittest.TestCase):
         for report in (self.report, self.report32):
             self.assertEqual(report["export_count"], 3)
             self.assertEqual(set(report["exports"]), {"ExportedA", "ExportedB", "#6"})
+
+    def exports_of(self, data: bytes) -> list[str]:
+        return pe_inspect._exports(pe_inspect.PeImage(data))
+
+    def test_unused_ordinal_slot_is_not_an_export(self):
+        for is64 in (True, False):
+            data = with_exports([0x1000, 0, 0x1010], {0: "Alpha"}, is64=is64)
+            self.assertEqual(self.exports_of(data), ["Alpha", "#12"])
+            path = os.path.join(self.dir, "gap.dll")
+            with open(path, "wb") as f:
+                f.write(data)
+            report = pe_inspect.inspect(path, None)
+            self.assertEqual(report["exports"], ["Alpha", "#12"])
+            self.assertEqual(report["export_count"], 2)
+
+    def test_unused_slots_in_a_table_without_names(self):
+        data = with_exports([0, 0x1000, 0, 0x1010, 0], {})
+        self.assertEqual(self.exports_of(data), ["#11", "#13"])
+
+    def test_unnamed_forwarder_is_still_an_export(self):
+        data = with_exports([0x1000, FORWARDER, 0], {0: "Alpha"})
+        self.assertEqual(self.exports_of(data), ["Alpha", "#11"])
+
+    def test_function_table_cut_by_end_of_file_lists_the_readable_slots(self):
+        data = with_exports([0x1000, 0, 0x1010, 0x1020], {})
+        at = pe_inspect.PeImage(data).offset(EXPORT_FUNCS)
+        for keep, expected in ((8, ["#10"]), (10, ["#10"]), (12, ["#10", "#12"]), (0, [])):
+            with self.subTest(bytes_kept=keep):
+                self.assertEqual(self.exports_of(data[:at + keep]), expected)
+
+    def test_table_without_gaps_is_listed_as_before(self):
+        data = with_exports([0x1000, 0x1008, 0x1010, 0x1018], {1: "Beta", 3: "Delta"}, base=1)
+        self.assertEqual(self.exports_of(data), ["Beta", "Delta", "#1", "#3"])
 
     def test_pdata_and_tls_counts(self):
         for report in (self.report, self.report32):
