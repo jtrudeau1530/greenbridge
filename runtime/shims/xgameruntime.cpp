@@ -302,16 +302,11 @@ uint64_t __stdcall XSystemGetAppMemoryUsage() {
 }
 
 // XVersion: 4-part version structure from GDK XGameRuntimeTypes.h (8 bytes)
-struct XVersion {
-    union {
-        struct {
-            uint16_t major;
-            uint16_t minor;
-            uint16_t build;
-            uint16_t revision;
-        };
-        uint64_t Value;
-    };
+struct alignas(8) XVersion {
+    uint16_t major;
+    uint16_t minor;
+    uint16_t build;
+    uint16_t revision;
 };
 static_assert(sizeof(XVersion) == 8, "XVersion must be 8 bytes");
 
@@ -324,25 +319,34 @@ struct XSystemAnalyticsInfo {
 };
 static_assert(sizeof(XSystemAnalyticsInfo) == 144, "XSystemAnalyticsInfo must be 144 bytes");
 
+static void copy_string_padded(char* dst, size_t dst_cap, const char* src) {
+    if (!dst || dst_cap == 0) return;
+    std::memset(dst, 0, dst_cap);
+    if (!src) return;
+    const size_t len = std::strlen(src);
+    const size_t copy_len = len < dst_cap - 1 ? len : dst_cap - 1;
+    std::memcpy(dst, src, copy_len);
+}
+
 // XSystemAnalyticsInfo XSystemGetAnalyticsInfo()
 // Returned by value per Microsoft GDK specification.
 XSystemAnalyticsInfo __stdcall XSystemGetAnalyticsInfo() {
     XSystemAnalyticsInfo info{};
     info.osVersion = {10, 0, 22000, 0};
     info.hostingOsVersion = {10, 0, 22000, 0};
-    std::strncpy(info.family, "Xbox", sizeof(info.family) - 1);
+    copy_string_padded(info.family, sizeof(info.family), "Xbox");
 
     const uint32_t dt = XSystemGetDeviceType();
     if (dt == static_cast<uint32_t>(XSystemDeviceType::XboxScarlettLockhart)) {
-        std::strncpy(info.form, "Xbox Series S", sizeof(info.form) - 1);
+        copy_string_padded(info.form, sizeof(info.form), "Xbox Series S");
     } else {
-        std::strncpy(info.form, "Xbox Series X", sizeof(info.form) - 1);
+        copy_string_padded(info.form, sizeof(info.form), "Xbox Series X");
     }
 
     char form_override[64];
     const DWORD n = GetEnvironmentVariableA("LEONIDA_ANALYTICS_FORM", form_override, sizeof(form_override));
     if (n > 0 && n < sizeof(form_override)) {
-        std::strncpy(info.form, form_override, sizeof(info.form) - 1);
+        copy_string_padded(info.form, sizeof(info.form), form_override);
     }
     return info;
 }

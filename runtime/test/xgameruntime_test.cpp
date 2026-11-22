@@ -51,16 +51,11 @@ using AsyncCompleteFn = void(__stdcall*)(XAsyncBlock*, HRESULT, size_t);
 using AsyncResultSizeFn = HRESULT(__stdcall*)(XAsyncBlock*, size_t*);
 using AsyncResultFn = HRESULT(__stdcall*)(XAsyncBlock*, const void*, size_t, void*, size_t*);
 
-struct XVersion {
-    union {
-        struct {
-            uint16_t major;
-            uint16_t minor;
-            uint16_t build;
-            uint16_t revision;
-        };
-        uint64_t Value;
-    };
+struct alignas(8) XVersion {
+    uint16_t major;
+    uint16_t minor;
+    uint16_t build;
+    uint16_t revision;
 };
 static_assert(sizeof(XVersion) == 8, "XVersion must be 8 bytes per GDK spec");
 
