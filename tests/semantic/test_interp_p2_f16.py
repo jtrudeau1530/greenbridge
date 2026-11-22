@@ -1225,5 +1225,113 @@ class TestIEEE754BoundaryExtremes(unittest.TestCase):
         self.assertEqual(unpack_f16_pair(r_over_clamped)[0], H_ONE)
 
 
+# ==============================================================================
+# Negative Controls, Syntax Rejection, and Mutation Detection for v_interp_p2_f16
+# ==============================================================================
+
+# Architectural Mutants
+def mutant_p2_addition(j: float, p20_word: int, p1_accum: float, **kwargs) -> int:
+    """Mutant 1: Computes (j + p20) + p1_accum instead of j * p20 + p1_accum."""
+    p20 = u16_to_f16(unpack_f16_pair(p20_word)[0])
+    return f16_to_u16((j + p20) + p1_accum)
+
+def mutant_p2_ignore_clamp(j: float, p20_word: int, p1_accum: float, **kwargs) -> int:
+    """Mutant 2: Ignores clamp modifier."""
+    return ref_interp_p2_f16(j, p20_word, p1_accum, clamp=False)
+
+def mutant_p2_clobber_untouched_half(j: float, p20_word: int, p1_accum: float, *, old_vdst_u32: int = 0, **kwargs) -> int:
+    """Mutant 3: Zeroes out high half instead of preserving it (pre-SHADER-430 bug)."""
+    res = ref_interp_p2_f16(j, p20_word, p1_accum, old_vdst_u32=old_vdst_u32, **kwargs)
+    return res & 0x0000FFFF
+
+def mutant_p2_ignore_high_source(j: float, p20_word: int, p1_accum: float, *, high_src: bool = False, **kwargs) -> int:
+    """Mutant 4: Always reads low half of attribute word even if high_src is requested."""
+    return ref_interp_p2_f16(j, p20_word, p1_accum, high_src=False, **kwargs)
+
+def mutant_p2_clamp_nan_to_nan(j: float, p20_word: int, p1_accum: float, *, clamp: bool = False, **kwargs) -> int:
+    """Mutant 5: Leaves NaN untouched under clamp instead of mapping to +0.0."""
+    res = ref_interp_p2_f16(j, p20_word, p1_accum, clamp=False, **kwargs)
+    if clamp and not is_nan_f16(unpack_f16_pair(res)[0]):
+        return ref_interp_p2_f16(j, p20_word, p1_accum, clamp=True, **kwargs)
+    return res
+
+
+class TestNegativeControlsAndSyntaxRejection(unittest.TestCase):
+    """Test suite for negative controls, syntax rejection, and mutation detection."""
+
+    def test_syntax_rejection_invalid_opcode(self):
+        for bad_op in ("v_interp_p1_f16", "v_interp_p2_f32", "v_mul_f16", "invalid_op"):
+            with self.assertRaises(ValueError):
+                parse_asm_line(f"{bad_op} v0, v1, attr0.x")
+
+    def test_syntax_rejection_bad_registers(self):
+        # Destination must be a VGPR
+        with self.assertRaises(ValueError):
+            parse_asm_line("v_interp_p2_f16 s0, v1, attr0.x")
+        # Source j must be a VGPR
+        with self.assertRaises(ValueError):
+            parse_asm_line("v_interp_p2_f16 v0, s1, attr0.x")
+        # Invalid channel or syntax
+        with self.assertRaises(ValueError):
+            parse_asm_line("v_interp_p2_f16 v0, v1, attr0.q")
+        with self.assertRaises(ValueError):
+            parse_asm_line("v_interp_p2_f16 v0, v1, notanattr")
+
+    def test_syntax_rejection_destination_modifiers(self):
+        # Neg or abs on dst is illegal
+        with self.assertRaises(ValueError):
+            bad_inst = ASTInstruction(
+                opcode=Opcode.V_INTERP_P2_F16,
+                dst=ASTOperand(0, abs_mod=True),
+                src_j=ASTOperand(1),
+                attr=AttributeRef(0, Channel.X),
+            )
+            bad_inst.validate()
+
+    def test_syntax_rejection_unknown_modifier(self):
+        with self.assertRaises(ValueError):
+            parse_asm_line("v_interp_p2_f16 v0, v1, attr0.x unknownmod")
+
+    def test_negative_control_arithmetic_sabotage(self):
+        # Normal reference: 0.5 * 4.0 + 1.0 = 3.0 (0x4200)
+        p20_word = pack_f16_pair(f16_to_u16(4.0), 0)
+        good = ref_interp_p2_f16(0.5, p20_word, 1.0)
+        bad = mutant_p2_addition(0.5, p20_word, 1.0)
+        self.assertNotEqual(unpack_f16_pair(good)[0], bad)
+
+    def test_mutation_detection_all_mutants_caught(self):
+        p20_pair = pack_f16_pair(f16_to_u16(2.0), f16_to_u16(8.0))
+        old_canary = 0xDEADBEEF
+
+        # Mutant 1: addition instead of multiplication
+        m1_good = ref_interp_p2_f16(0.5, p20_pair, 1.0)
+        m1_bad = mutant_p2_addition(0.5, p20_pair, 1.0)
+        self.assertNotEqual(unpack_f16_pair(m1_good)[0], m1_bad)
+
+        # Mutant 2: ignore clamp
+        m2_good = ref_interp_p2_f16(2.0, p20_pair, 1.0, clamp=True)
+        m2_bad = mutant_p2_ignore_clamp(2.0, p20_pair, 1.0, clamp=True)
+        self.assertNotEqual(m2_good, m2_bad)
+
+        # Mutant 3: clobber untouched high half (0xDEAD)
+        m3_good = ref_interp_p2_f16(0.0, p20_pair, 1.0, old_vdst_u32=old_canary)
+        m3_bad = mutant_p2_clobber_untouched_half(0.0, p20_pair, 1.0, old_vdst_u32=old_canary)
+        self.assertEqual((m3_good >> 16) & 0xFFFF, 0xDEAD)
+        self.assertEqual((m3_bad >> 16) & 0xFFFF, 0x0000)
+        self.assertNotEqual(m3_good, m3_bad)
+
+        # Mutant 4: ignore high source selection
+        m4_good = ref_interp_p2_f16(1.0, p20_pair, 0.0, high_src=True)
+        m4_bad = mutant_p2_ignore_high_source(1.0, p20_pair, 0.0, high_src=True)
+        self.assertNotEqual(m4_good, m4_bad)
+
+        # Mutant 5: clamp NaN to NaN instead of +0.0
+        m5_good = ref_interp_p2_f16(0.0, pack_f16_pair(H_POS_INF, 0), 0.0, clamp=True)
+        m5_bad = mutant_p2_clamp_nan_to_nan(0.0, pack_f16_pair(H_POS_INF, 0), 0.0, clamp=True)
+        self.assertEqual(unpack_f16_pair(m5_good)[0], H_POS_ZERO)
+        self.assertTrue(is_nan_f16(unpack_f16_pair(m5_bad)[0]))
+        self.assertNotEqual(m5_good, m5_bad)
+
+
 if __name__ == "__main__":
     unittest.main()
