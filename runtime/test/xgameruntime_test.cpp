@@ -78,14 +78,16 @@ struct XPackageMountHandle {
 
 using AnalyticsInfoFn = XSystemAnalyticsInfo(__stdcall*)();
 using PackageIdentifierFn = HRESULT(__stdcall*)(size_t, char*);
+using PackageMountFn = HRESULT(__stdcall*)(const char*, XPackageMountHandle*);
+using PackageCloseMountHandleFn = void(__stdcall*)(XPackageMountHandle);
 using PackageMountPathSizeFn = HRESULT(__stdcall*)(XPackageMountHandle, size_t*);
 using PackageMountPathFn = HRESULT(__stdcall*)(XPackageMountHandle, size_t, char*);
 using PackagedProcessFn = bool(__stdcall*)();
 
 const char* const kNames[] = {
     "XGameRuntimeInitialize", "XGameRuntimeUninitialize", "XSystemGetDeviceType", "XSystemGetConsoleId",
-    "XSystemGetAnalyticsInfo", "XPackageGetCurrentProcessPackageIdentifier", "XPackageGetMountPathSize",
-    "XPackageGetMountPath",
+    "XSystemGetAnalyticsInfo", "XPackageGetCurrentProcessPackageIdentifier", "XPackageMount",
+    "XPackageCloseMountHandle", "XPackageGetMountPathSize", "XPackageGetMountPath",
     "XPackageIsPackagedProcess",
     "XTaskQueueCreate", "XTaskQueueCreateComposite", "XTaskQueueGetPort", "XTaskQueueDuplicateHandle",
     "XTaskQueueCloseHandle", "XTaskQueueTerminate", "XTaskQueueDispatch", "XTaskQueueSubmitCallback",
@@ -373,34 +375,54 @@ int main() {
           "XPackageGetCurrentProcessPackageIdentifier respects LEONIDA_PACKAGE_ID override");
     SetEnvironmentVariableA("LEONIDA_PACKAGE_ID", nullptr);
 
+    auto mount_pkg = get<PackageMountFn>("XPackageMount");
+    auto close_mount = get<PackageCloseMountHandleFn>("XPackageCloseMountHandle");
     auto mount_path_size = get<PackageMountPathSizeFn>("XPackageGetMountPathSize");
     auto mount_path = get<PackageMountPathFn>("XPackageGetMountPath");
 
     const XPackageMountHandle kInvalidMount{0};
-    const XPackageMountHandle kValidMount{1};
+    const XPackageMountHandle kStaleMount{999};
+
+    XPackageMountHandle test_out{0};
+    check(mount_pkg(nullptr, nullptr) == E_INVALIDARG, "XPackageMount rejects null identifier and null out pointer");
+    check(mount_pkg(pkg_id, nullptr) == E_INVALIDARG, "XPackageMount rejects null out pointer with identifier");
+    check(mount_pkg(nullptr, &test_out) == E_INVALIDARG, "XPackageMount rejects null identifier with out pointer");
 
     size_t req_size = 0;
     check(mount_path_size(kInvalidMount, &req_size) == E_INVALIDARG,
           "XPackageGetMountPathSize rejects invalid mount handle 0");
-    check(mount_path_size(kValidMount, nullptr) == E_INVALIDARG,
-          "XPackageGetMountPathSize rejects null size pointer");
+    check(mount_path_size(kStaleMount, &req_size) == HRESULT_FROM_WIN32(ERROR_NOT_FOUND),
+          "XPackageGetMountPathSize rejects unknown mount handle");
 
+    char mnt_path[MAX_PATH] = {};
     check(mount_path(kInvalidMount, 0, nullptr) == E_INVALIDARG,
           "XPackageGetMountPath rejects invalid mount handle 0");
-    char mnt_path[MAX_PATH] = {};
-    check(mount_path(kValidMount, 0, mnt_path) == E_INVALIDARG,
-          "XPackageGetMountPath rejects size 0 with buffer");
-    check(mount_path(kValidMount, 10, nullptr) == E_INVALIDARG,
-          "XPackageGetMountPath rejects null pointer with size");
+    check(mount_path(kStaleMount, sizeof(mnt_path), mnt_path) == HRESULT_FROM_WIN32(ERROR_NOT_FOUND),
+          "XPackageGetMountPath rejects unknown mount handle");
 
     SetEnvironmentVariableA("LEONIDA_GAME_DIR", "C:\\LeonidaGameDir");
-    check(mount_path_size(kValidMount, &req_size) == S_OK && req_size == std::strlen("C:\\LeonidaGameDir") + 1,
-          "XPackageGetMountPathSize returns required buffer size including null terminator");
-    check(mount_path(kValidMount, 5, mnt_path) == HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER),
+    XPackageMountHandle active_mount{0};
+    check(mount_pkg(pkg_id, &active_mount) == S_OK && active_mount.handle != 0,
+          "XPackageMount creates a registered mount handle for package identifier");
+    check(mount_path_size(active_mount, nullptr) == E_INVALIDARG,
+          "XPackageGetMountPathSize rejects null size pointer");
+    check(mount_path_size(active_mount, &req_size) == S_OK && req_size == std::strlen("C:\\LeonidaGameDir") + 1,
+          "XPackageGetMountPathSize returns required buffer size including null terminator for mounted handle");
+    check(mount_path(active_mount, 0, mnt_path) == E_INVALIDARG,
+          "XPackageGetMountPath rejects size 0 with buffer");
+    check(mount_path(active_mount, 10, nullptr) == E_INVALIDARG,
+          "XPackageGetMountPath rejects null pointer with size");
+    check(mount_path(active_mount, 5, mnt_path) == HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER),
           "XPackageGetMountPath rejects insufficient buffer");
-    check(mount_path(kValidMount, sizeof(mnt_path), mnt_path) == S_OK &&
+    check(mount_path(active_mount, sizeof(mnt_path), mnt_path) == S_OK &&
               std::strcmp(mnt_path, "C:\\LeonidaGameDir") == 0,
-          "XPackageGetMountPath returns configured game directory");
+          "XPackageGetMountPath returns configured game directory for mounted handle");
+
+    close_mount(active_mount);
+    check(mount_path_size(active_mount, &req_size) == HRESULT_FROM_WIN32(ERROR_NOT_FOUND),
+          "XPackageGetMountPathSize rejects closed/stale mount handle");
+    check(mount_path(active_mount, sizeof(mnt_path), mnt_path) == HRESULT_FROM_WIN32(ERROR_NOT_FOUND),
+          "XPackageGetMountPath rejects closed/stale mount handle");
     SetEnvironmentVariableA("LEONIDA_GAME_DIR", nullptr);
 
     auto is_packaged = get<PackagedProcessFn>("XPackageIsPackagedProcess");

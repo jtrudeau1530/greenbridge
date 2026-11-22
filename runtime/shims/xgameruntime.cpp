@@ -17,6 +17,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <iterator>
+#include <mutex>
+#include <string>
+#include <unordered_map>
 
 #include <XAsync.h>
 #include <XAsyncProvider.h>
@@ -371,6 +374,10 @@ struct XPackageMountHandle {
     uint64_t handle;
 };
 
+static std::mutex s_mount_mutex;
+static std::atomic<uint64_t> s_next_mount_id{1};
+static std::unordered_map<uint64_t, std::string> s_active_mounts;
+
 static HRESULT resolve_mount_path(char* out, size_t out_cap) {
     const DWORD n = GetEnvironmentVariableA("LEONIDA_GAME_DIR", out, static_cast<DWORD>(out_cap));
     if (n == 0 || n >= out_cap) {
@@ -391,32 +398,65 @@ static HRESULT resolve_mount_path(char* out, size_t out_cap) {
     return S_OK;
 }
 
+// HRESULT XPackageMount(const char* packageIdentifier, XPackageMountHandle* mount)
+// Mounts a package installation given its identifier and yields a valid mount handle.
+HRESULT __stdcall XPackageMount(const char* packageIdentifier, XPackageMountHandle* mount) {
+    if (!packageIdentifier || !mount) return E_INVALIDARG;
+    mount->handle = 0;
+
+    char buf[MAX_PATH] = {};
+    const HRESULT hr = resolve_mount_path(buf, sizeof(buf));
+    if (FAILED(hr)) return hr;
+
+    const uint64_t id = s_next_mount_id.fetch_add(1);
+    {
+        std::lock_guard lock(s_mount_mutex);
+        s_active_mounts[id] = buf;
+    }
+    mount->handle = id;
+    return S_OK;
+}
+
+// void XPackageCloseMountHandle(XPackageMountHandle mount)
+// Closes a previously mounted package handle.
+void __stdcall XPackageCloseMountHandle(XPackageMountHandle mount) {
+    if (mount.handle == 0) return;
+    std::lock_guard lock(s_mount_mutex);
+    s_active_mounts.erase(mount.handle);
+}
+
 // HRESULT XPackageGetMountPathSize(XPackageMountHandle mount, size_t* pathSize).
 // Retrieves the size of the buffer needed to store the mounted package path, including the null terminator.
 HRESULT __stdcall XPackageGetMountPathSize(XPackageMountHandle mount, size_t* pathSize) {
     if (mount.handle == 0 || !pathSize) return E_INVALIDARG;
 
-    char buf[MAX_PATH] = {};
-    const HRESULT hr = resolve_mount_path(buf, sizeof(buf));
-    if (FAILED(hr)) return hr;
+    std::string path;
+    {
+        std::lock_guard lock(s_mount_mutex);
+        auto it = s_active_mounts.find(mount.handle);
+        if (it == s_active_mounts.end()) return HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
+        path = it->second;
+    }
 
-    *pathSize = std::strlen(buf) + 1;
+    *pathSize = path.size() + 1;
     return S_OK;
 }
 
 // HRESULT XPackageGetMountPath(XPackageMountHandle mount, size_t pathSize, char* path).
 // Retrieves the installed filesystem path for the mounted package.
-// Reads LEONIDA_GAME_DIR when set, otherwise falls back to the current module's directory.
 HRESULT __stdcall XPackageGetMountPath(XPackageMountHandle mount, size_t pathSize, char* path) {
     if (mount.handle == 0 || !path || pathSize == 0) return E_INVALIDARG;
 
-    char buf[MAX_PATH] = {};
-    const HRESULT hr = resolve_mount_path(buf, sizeof(buf));
-    if (FAILED(hr)) return hr;
+    std::string mount_path;
+    {
+        std::lock_guard lock(s_mount_mutex);
+        auto it = s_active_mounts.find(mount.handle);
+        if (it == s_active_mounts.end()) return HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
+        mount_path = it->second;
+    }
 
-    const size_t len = std::strlen(buf);
-    if (pathSize < len + 1) return HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
-    std::memcpy(path, buf, len + 1);
+    if (pathSize < mount_path.size() + 1) return HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
+    std::memcpy(path, mount_path.c_str(), mount_path.size() + 1);
     return S_OK;
 }
 
@@ -450,6 +490,8 @@ SHIM_TABLE(xgameruntime,
     XGR(XSystemGetAppMemoryUsage),
     XGR(XSystemGetAnalyticsInfo),
     XGR(XPackageGetCurrentProcessPackageIdentifier),
+    XGR(XPackageMount),
+    XGR(XPackageCloseMountHandle),
     XGR(XPackageGetMountPathSize),
     XGR(XPackageGetMountPath),
     XGR(XPackageIsPackagedProcess),
