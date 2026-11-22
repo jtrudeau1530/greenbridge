@@ -1580,15 +1580,23 @@ inline ReplayResult prepare_texture_copy(const CopyTexture& copy, Prepared& p) {
                 return ReplayResult::invalid_copy;
             const std::uint32_t w = std::min(padded(box.right - box.left), from.width - box.left);
             const std::uint32_t h = std::min(padded(box.bottom - box.top), from.height - box.top);
-            // shortcut: into a BC mip whose edge block is partial, Vulkan's extent cannot reach the padded edge; such
-            // a copy is refused until it is staged through a buffer.
-            if (dst_block > 1 && (copy.x + w * dst_block > to.width || copy.y + h * dst_block > to.height))
-                return ReplayResult::invalid_copy;
-            p.image_copies.push_back({{src.aspectMask, src.baseMipLevel, src.baseArrayLayer, 1},
-                                      {std::int32_t(box.left), std::int32_t(box.top), std::int32_t(box.front)},
-                                      {dst.aspectMask, dst.baseMipLevel, dst.baseArrayLayer, 1},
-                                      {std::int32_t(copy.x), std::int32_t(copy.y), std::int32_t(copy.z)},
-                                      {w, h, box.back - box.front}});
+            const VkImageCopy region{{src.aspectMask, src.baseMipLevel, src.baseArrayLayer, 1},
+                                     {std::int32_t(box.left), std::int32_t(box.top), std::int32_t(box.front)},
+                                     {dst.aspectMask, dst.baseMipLevel, dst.baseArrayLayer, 1},
+                                     {std::int32_t(copy.x), std::int32_t(copy.y), std::int32_t(copy.z)},
+                                     {w, h, box.back - box.front}};
+            const std::uint32_t dst_w = w * dst_block, dst_h = h * dst_block;
+            if (dst_block > 1 && (copy.x + dst_w > to.width || copy.y + dst_h > to.height)) {
+                // Each uncompressed texel supplies a whole BC block. Keep the same scratch row and slice strides
+                // in bytes on both sides, with a destination extent clipped to the actual mip.
+                const VkBufferImageCopy read{0, w, h, region.srcSubresource, region.srcOffset, region.extent};
+                const VkBufferImageCopy write{0, dst_w, dst_h, region.dstSubresource, region.dstOffset,
+                    {std::min(dst_w, to.width - copy.x), std::min(dst_h, to.height - copy.y), region.extent.depth}};
+                p.staged_reads.push_back(read);
+                p.staged_writes.push_back(write);
+            } else {
+                p.image_copies.push_back(region);
+            }
             p.range = dst;
             p.source_range = src;
             return ReplayResult::success;
