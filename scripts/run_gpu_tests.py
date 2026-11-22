@@ -754,6 +754,16 @@ def run_suite(a, work: str) -> int:
                 "ps_vcc_x2": (0x11223344, 0x55667788, 0, 0),
                 "ps_scc_minmax": (0x00030205, 0x00030207, 0x00030209, 0x00030203),
                 "ps_fma_literal": (0x41B80000, 0x41800000, 0x40E00000, 0x41A40000),
+                # f16 op_sel / partial writes / inline constants: RDNA2 hardware words (see the .asm headers)
+                "ps_f16_med3_opsel": (0xAAAA4100, 0xAAAA4200, 0xAAAA3E00, 0x40005555),
+                "ps_f16_med3_mods": (0x41005555, 0x3C005555, 0x41003800, 0xAAAABA00),
+                "ps_f16_vop2": (0xAAAA4000, 0xAAAAC000, 0xAAAA3A00, 0x42003F00),
+                "ps_f16_vop2b": (0xAAAA3E00, 0xAAAAB800, 0xAAAA3C00, 0x42003400),
+                "ps_f16_vop1": (0xAAAA4000, 0xAAAABC00, 0xAAAAC000, 0xAAAA8000),
+                "ps_f16_vop1b": (0xAAAA3400, 0xAAAA4000, 0xAAAAB400, 0xAAAA3800),
+                "ps_f16_const": (0xAAAA3D00, 0x38005555, 0xAAAA3800, 0x3F000000),
+                "ps_f16_const2": (0x42003D00, 0x3D004200, 0xAAAABC00, 3),
+                "ps_f16_pack": (0x34003C00, 0x38003400, 0x34000000, 0x44004200),
             }
             if name in const_wants:
                 ok, detail = check_pixel_const(raw, const_wants[name])
