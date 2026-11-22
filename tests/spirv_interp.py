@@ -20,12 +20,30 @@ def f32(x):
         return math.copysign(math.inf, x)
 
 
+class _F32(float):
+    """A binary32 value made from a bit pattern (OpBitcast) that keeps that exact pattern.
+
+    struct's binary32 -> double conversion quiets a signalling NaN (sets bit 22, issue #509), so the float alone
+    cannot give the word back. Copies, selects, composites, loads and stores pass the value on unchanged and keep
+    `bits`; arithmetic on it returns a plain float, which drops them (SPIR-V leaves the bits of a NaN result
+    open). The same fix as spirv_mini_interp (#533)."""
+
+    __slots__ = ("bits",)
+
+    def __new__(cls, bits):
+        self = super().__new__(cls, struct.unpack("<f", struct.pack("<I", bits))[0])
+        self.bits = bits
+        return self
+
+
 def f2u(x):
+    if isinstance(x, _F32):
+        return x.bits
     return struct.unpack("<I", struct.pack("<f", x))[0]
 
 
 def u2f(u):
-    return struct.unpack("<f", struct.pack("<I", u & M32))[0]
+    return _F32(u & M32)
 
 
 def s32(u):
