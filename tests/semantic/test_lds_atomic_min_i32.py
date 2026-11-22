@@ -29,6 +29,13 @@ Background & Specification Rules:
         Byte addresses are converted to dwords by right shifting by 2, dropping unaligned
         low bits [1:0]. The dword index is masked with (lds_dwords - 1), wrapping out-of-bounds
         offsets within the allocated power-of-two LDS allocation.
+    - 32-Bank Architecture & Address Clashes:
+        LDS is organized into 32 banks (1 dword wide each, bank = (dword_idx) & 31).
+        When multiple lanes access different dwords on the same bank, a bank conflict occurs
+        and accesses are serialized across cycles.
+        When multiple lanes access the exact same dword (address clash), the atomic operations
+        are serialized in hardware. Because min_i32 is commutative and associative,
+        arbitrary lane arbitration orders strictly converge to the identical global minimum.
   * SPIR-V Representation:
     - LDS is declared as an array in the Workgroup storage class:
         %lds_arr = OpTypeArray %uint <lds_dwords>
@@ -129,6 +136,7 @@ class LdsAtomicMinI32Interp:
         self.lds_var: str | None = None
         self.lds_size: int = 0
         self.body: list[tuple[str | None, str, list[str], str]] = []
+        self.label_indices: dict[str, int] = {}
         self._parse()
 
     def _parse(self) -> None:
@@ -193,12 +201,17 @@ class LdsAtomicMinI32Interp:
             else:
                 raise UnsupportedConstruct(f"Header opcode {op}")
 
+        for idx, (res, op, a, line) in enumerate(self.body):
+            if op == "OpLabel" and res:
+                self.label_indices[res] = idx
+
     def run(
         self,
         num_invocations: int | None = None,
         seed_lds: dict[int, int] | None = None,
-        lane_inputs: list[dict[str, int]] | None = None,
+        lane_inputs: list[dict[str, int | bool]] | None = None,
         lane_order: list[int] | None = None,
+        exec_mask: int | None = None,
     ) -> tuple[list[int], list[dict[str, int]]]:
         """Executes the workgroup and returns (final_lds, outputs_per_lane)."""
         lx, ly, lz = self.local_size
@@ -217,13 +230,15 @@ class LdsAtomicMinI32Interp:
         for lidx in order:
             if lidx >= count:
                 continue
-            inputs = lane_inputs[lidx] if lane_inputs and lidx < len(lane_inputs) else {}
+            inputs = dict(lane_inputs[lidx]) if lane_inputs and lidx < len(lane_inputs) else {}
+            if exec_mask is not None:
+                inputs["%exec_active"] = bool((exec_mask >> lidx) & 1)
             out = self._run_lane(lidx, lds, inputs)
             lane_outputs[lidx] = out
 
         return list(lds), lane_outputs
 
-    def _run_lane(self, lidx: int, lds: list[int], inputs: dict[str, int]) -> dict[str, int]:
+    def _run_lane(self, lidx: int, lds: list[int], inputs: dict[str, int | bool]) -> dict[str, int]:
         values: dict[str, int | bool] = dict(self.constants)
         values.update(inputs)
         var_box: dict[str, list[int]] = {}
@@ -247,10 +262,28 @@ class LdsAtomicMinI32Interp:
                 return values[x]
             raise UnsupportedConstruct(f"Undefined identifier {x}")
 
-        for res, op, a, _ in self.body:
-            if op in _IGNORED:
+        pc = 0
+        total_insns = len(self.body)
+        while pc < total_insns:
+            res, op, a, _ = self.body[pc]
+            pc += 1
+
+            if op in _IGNORED or op == "OpLabel":
                 continue
-            if op in ("OpBranch", "OpBranchConditional"):
+            if op == "OpReturn":
+                break
+            if op == "OpBranch":
+                target = a[0]
+                if target not in self.label_indices:
+                    raise UnsupportedConstruct(f"Unknown branch label {target}")
+                pc = self.label_indices[target]
+                continue
+            if op == "OpBranchConditional":
+                cond = bool(val(a[0]))
+                target = a[1] if cond else a[2]
+                if target not in self.label_indices:
+                    raise UnsupportedConstruct(f"Unknown branch target {target}")
+                pc = self.label_indices[target]
                 continue
             if op == "OpVariable":
                 cls, _ = self.ptr_types[a[0]]
@@ -591,6 +624,356 @@ OpFunctionEnd
         final_lds, _ = interp.run(seed_lds={6: 100})
         # (16 + 8) >> 2 = 6, min(100, -1) = -1 (0xFFFFFFFF)
         self.assertEqual(final_lds[6], 0xFFFFFFFF)
+
+
+class TestLdsBankConflictsAndAddressClash(unittest.TestCase):
+    """Verifies SIMD multi-lane bank conflicts, shared address clashes, and reduction invariance."""
+
+    def test_bank_index_mapping(self):
+        # 32 banks, each 4 bytes (1 dword)
+        for i in range(32):
+            byte_addr = i * 4
+            self.assertEqual(reference_lds_bank(byte_addr), i)
+
+        # Dwords 32..63 wrap to banks 0..31
+        for i in range(32):
+            byte_addr = (32 + i) * 4
+            self.assertEqual(reference_lds_bank(byte_addr), i)
+
+        # Stride-32 clash: byte addresses i * 128 (dwords i * 32) all hit bank 0
+        for i in range(32):
+            byte_addr = i * 32 * 4
+            self.assertEqual(reference_lds_bank(byte_addr), 0)
+
+        # Stride-16: byte addresses i * 64 (dwords i * 16) hit banks 0 and 16
+        for i in range(32):
+            bank = reference_lds_bank(i * 16 * 4)
+            self.assertIn(bank, (0, 16))
+
+    def test_simd32_shared_address_clash_reduction(self):
+        # All 32 lanes in a wave atomically reduce into the EXACT same LDS slot (index 7).
+        # Initial value in LDS[7] is +500.
+        # Lane i supplies 200 - i * 20 (ranging from +200 down to -420).
+        # Expected minimum = -420 (0xFFFFFE5C).
+        spvasm = """
+OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 32 1 1
+%uint = OpTypeInt 32 0
+%c64 = OpConstant %uint 64
+%c2 = OpConstant %uint 2
+%c0 = OpConstant %uint 0
+%c7_slot = OpConstant %uint 7
+%lds_arr = OpTypeArray %uint %c64
+%_ptr_WG_lds = OpTypePointer Workgroup %lds_arr
+%_ptr_WG_uint = OpTypePointer Workgroup %uint
+%lds = OpVariable %_ptr_WG_lds Workgroup
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%ptr = OpAccessChain %_ptr_WG_uint %lds %c7_slot
+%dummy = OpAtomicSMin %uint %ptr %c2 %c0 %lane_val
+OpReturn
+OpFunctionEnd
+"""
+        interp = LdsAtomicMinI32Interp(spvasm)
+        lane_inputs = []
+        expected_min = 500
+        for lidx in range(32):
+            val_s = 200 - lidx * 20
+            expected_min = min(expected_min, val_s)
+            lane_inputs.append({"%lane_val": to_unsigned_u32(val_s)})
+
+        final_lds, _ = interp.run(num_invocations=32, seed_lds={7: 500}, lane_inputs=lane_inputs)
+        self.assertEqual(final_lds[7], to_unsigned_u32(expected_min))
+        self.assertEqual(to_signed_i32(final_lds[7]), -420)
+
+    def test_simd32_bank_conflict_stride32(self):
+        # 32 lanes each access distinct dwords that map to the SAME bank (bank 0):
+        # dword indices: i * 32 for i in 0..31 (dwords 0, 32, 64, ..., 992).
+        # In hardware, this causes a 32-way serialized bank conflict.
+        # Each lane performs ds_min_i32 independently on its own dword.
+        spvasm = """
+OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 32 1 1
+%uint = OpTypeInt 32 0
+%c1024 = OpConstant %uint 1024
+%c2 = OpConstant %uint 2
+%c0 = OpConstant %uint 0
+%lds_arr = OpTypeArray %uint %c1024
+%_ptr_WG_lds = OpTypePointer Workgroup %lds_arr
+%_ptr_WG_uint = OpTypePointer Workgroup %uint
+%lds = OpVariable %_ptr_WG_lds Workgroup
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%ptr = OpAccessChain %_ptr_WG_uint %lds %lane_slot
+%dummy = OpAtomicSMin %uint %ptr %c2 %c0 %lane_val
+OpReturn
+OpFunctionEnd
+"""
+        interp = LdsAtomicMinI32Interp(spvasm)
+        seed_lds = {}
+        lane_inputs = []
+        expected_results = {}
+
+        for lidx in range(32):
+            slot = lidx * 32
+            init_s = 1000 + lidx
+            seed_lds[slot] = to_unsigned_u32(init_s)
+            val_s = 50 - lidx * 100  # for lane 0: 50; for lane 1: -50; for lane 31: -3050
+            lane_inputs.append({
+                "%lane_slot": slot,
+                "%lane_val": to_unsigned_u32(val_s)
+            })
+            expected_results[slot] = min(init_s, val_s)
+
+        final_lds, _ = interp.run(num_invocations=32, seed_lds=seed_lds, lane_inputs=lane_inputs)
+        for slot, exp_val in expected_results.items():
+            self.assertEqual(to_signed_i32(final_lds[slot]), exp_val)
+
+    def test_simd32_two_way_bank_conflict_stride16(self):
+        # 32 lanes access addresses with stride 16 dwords ((i * 16) % 64),
+        # causing 2-way bank conflicts on banks 0 and 16.
+        spvasm = """
+OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 32 1 1
+%uint = OpTypeInt 32 0
+%c64 = OpConstant %uint 64
+%c2 = OpConstant %uint 2
+%c0 = OpConstant %uint 0
+%lds_arr = OpTypeArray %uint %c64
+%_ptr_WG_lds = OpTypePointer Workgroup %lds_arr
+%_ptr_WG_uint = OpTypePointer Workgroup %uint
+%lds = OpVariable %_ptr_WG_lds Workgroup
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%ptr = OpAccessChain %_ptr_WG_uint %lds %lane_slot
+%dummy = OpAtomicSMin %uint %ptr %c2 %c0 %lane_val
+OpReturn
+OpFunctionEnd
+"""
+        interp = LdsAtomicMinI32Interp(spvasm)
+        seed_lds = {0: 500, 16: 500, 32: 500, 48: 500}
+        lane_inputs = []
+        expected = dict(seed_lds)
+
+        for lidx in range(32):
+            slot = (lidx * 16) % 64
+            val_s = 100 - lidx * 25
+            expected[slot] = min(expected[slot], val_s)
+            lane_inputs.append({
+                "%lane_slot": slot,
+                "%lane_val": to_unsigned_u32(val_s)
+            })
+
+        final_lds, _ = interp.run(num_invocations=32, seed_lds=seed_lds, lane_inputs=lane_inputs)
+        for slot in (0, 16, 32, 48):
+            self.assertEqual(to_signed_i32(final_lds[slot]), expected[slot])
+
+    def test_address_clash_lane_permutation_invariance(self):
+        # 16 lanes clash on LDS[4] with mixed positive, negative, and extreme integers.
+        # Tests that ANY lane execution order yields the exact same signed minimum.
+        spvasm = """
+OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 16 1 1
+%uint = OpTypeInt 32 0
+%c32 = OpConstant %uint 32
+%c2 = OpConstant %uint 2
+%c0 = OpConstant %uint 0
+%c4_slot = OpConstant %uint 4
+%lds_arr = OpTypeArray %uint %c32
+%_ptr_WG_lds = OpTypePointer Workgroup %lds_arr
+%_ptr_WG_uint = OpTypePointer Workgroup %uint
+%lds = OpVariable %_ptr_WG_lds Workgroup
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%ptr = OpAccessChain %_ptr_WG_uint %lds %c4_slot
+%dummy = OpAtomicSMin %uint %ptr %c2 %c0 %lane_val
+OpReturn
+OpFunctionEnd
+"""
+        interp = LdsAtomicMinI32Interp(spvasm)
+        raw_vals = [50, -12, 85, -999, 0, -4, 300, -999, 12, -500, -1, 40, -800, -2, -999, 15]
+        lane_inputs = [{"%lane_val": to_unsigned_u32(v)} for v in raw_vals]
+        global_min_s = min([100] + raw_vals)
+        self.assertEqual(global_min_s, -999)
+        expected_u = to_unsigned_u32(-999)
+
+        orders = [
+            list(range(16)),  # Forward
+            list(range(15, -1, -1)),  # Reverse
+            [0, 2, 4, 6, 8, 10, 12, 14, 1, 3, 5, 7, 9, 11, 13, 15],  # Even-first
+            [1, 3, 5, 7, 9, 11, 13, 15, 0, 2, 4, 6, 8, 10, 12, 14],  # Odd-first
+            [7, 2, 11, 0, 15, 3, 8, 1, 14, 4, 10, 6, 13, 5, 12, 9],  # Arbitrary permutation
+        ]
+
+        for order in orders:
+            with self.subTest(order=order[:4]):
+                final_lds, _ = interp.run(
+                    num_invocations=16,
+                    seed_lds={4: 100},
+                    lane_inputs=lane_inputs,
+                    lane_order=order,
+                )
+                self.assertEqual(final_lds[4], expected_u)
+
+    def test_workgroup_wave64_two_bucket_clash(self):
+        # 64-lane workgroup (Wave64):
+        # Even lanes clash on LDS[0], odd lanes clash on LDS[1].
+        spvasm = """
+OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 64 1 1
+%uint = OpTypeInt 32 0
+%c16 = OpConstant %uint 16
+%c2 = OpConstant %uint 2
+%c0 = OpConstant %uint 0
+%lds_arr = OpTypeArray %uint %c16
+%_ptr_WG_lds = OpTypePointer Workgroup %lds_arr
+%_ptr_WG_uint = OpTypePointer Workgroup %uint
+%lds = OpVariable %_ptr_WG_lds Workgroup
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%ptr = OpAccessChain %_ptr_WG_uint %lds %bucket
+%dummy = OpAtomicSMin %uint %ptr %c2 %c0 %lane_val
+OpReturn
+OpFunctionEnd
+"""
+        interp = LdsAtomicMinI32Interp(spvasm)
+        even_min_s = 1000
+        odd_min_s = 2000
+        lane_inputs = []
+
+        for lidx in range(64):
+            bucket = lidx % 2
+            if bucket == 0:
+                val_s = 100 - lidx * 15
+                even_min_s = min(even_min_s, val_s)
+            else:
+                val_s = 200 - lidx * 25
+                odd_min_s = min(odd_min_s, val_s)
+            lane_inputs.append({
+                "%bucket": bucket,
+                "%lane_val": to_unsigned_u32(val_s)
+            })
+
+        final_lds, _ = interp.run(
+            num_invocations=64,
+            seed_lds={0: 1000, 1: 2000},
+            lane_inputs=lane_inputs
+        )
+        self.assertEqual(to_signed_i32(final_lds[0]), even_min_s)
+        self.assertEqual(to_signed_i32(final_lds[1]), odd_min_s)
+
+    def test_multi_bank_conflict_free_parallel_minimum(self):
+        # 32 lanes target 32 consecutive dwords (0..31, one per bank, zero bank conflicts).
+        spvasm = """
+OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 32 1 1
+%uint = OpTypeInt 32 0
+%c32 = OpConstant %uint 32
+%c2 = OpConstant %uint 2
+%c0 = OpConstant %uint 0
+%lds_arr = OpTypeArray %uint %c32
+%_ptr_WG_lds = OpTypePointer Workgroup %lds_arr
+%_ptr_WG_uint = OpTypePointer Workgroup %uint
+%lds = OpVariable %_ptr_WG_lds Workgroup
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%ptr = OpAccessChain %_ptr_WG_uint %lds %lane_id
+%dummy = OpAtomicSMin %uint %ptr %c2 %c0 %lane_val
+OpReturn
+OpFunctionEnd
+"""
+        interp = LdsAtomicMinI32Interp(spvasm)
+        seed_lds = {}
+        lane_inputs = []
+        expected = {}
+
+        for lidx in range(32):
+            seed_s = 100 - lidx * 10
+            seed_lds[lidx] = to_unsigned_u32(seed_s)
+            val_s = -50 - lidx * 5
+            lane_inputs.append({
+                "%lane_id": lidx,
+                "%lane_val": to_unsigned_u32(val_s)
+            })
+            expected[lidx] = min(seed_s, val_s)
+
+        final_lds, _ = interp.run(num_invocations=32, seed_lds=seed_lds, lane_inputs=lane_inputs)
+        for lidx in range(32):
+            self.assertEqual(to_signed_i32(final_lds[lidx]), expected[lidx])
+
+    def test_simd_active_lane_masking(self):
+        # 8 lanes, but exec_mask is 0b00100101 (only lanes 0, 2, 5 active).
+        # Inactive lanes must not modify LDS.
+        spvasm = """
+OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 8 1 1
+%uint = OpTypeInt 32 0
+%bool = OpTypeBool
+%c16 = OpConstant %uint 16
+%c2 = OpConstant %uint 2
+%c0 = OpConstant %uint 0
+%c0_slot = OpConstant %uint 0
+%lds_arr = OpTypeArray %uint %c16
+%_ptr_WG_lds = OpTypePointer Workgroup %lds_arr
+%_ptr_WG_uint = OpTypePointer Workgroup %uint
+%lds = OpVariable %_ptr_WG_lds Workgroup
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%main = OpFunction %void None %fn
+%entry = OpLabel
+OpSelectionMerge %merge None
+OpBranchConditional %exec_active %do_atomic %merge
+%do_atomic = OpLabel
+%ptr = OpAccessChain %_ptr_WG_uint %lds %c0_slot
+%dummy = OpAtomicSMin %uint %ptr %c2 %c0 %lane_val
+OpBranch %merge
+%merge = OpLabel
+OpReturn
+OpFunctionEnd
+"""
+        interp = LdsAtomicMinI32Interp(spvasm)
+        # Inactive lane 7 tries to set -999999, but is masked off.
+        # Active lanes:
+        # Lane 0 passes -10
+        # Lane 2 passes -50
+        # Lane 5 passes -30
+        lane_vals = [-10, -999999, -50, -999999, -999999, -30, -999999, -999999]
+        lane_inputs = [{"%lane_val": to_unsigned_u32(v)} for v in lane_vals]
+
+        final_lds, _ = interp.run(
+            num_invocations=8,
+            seed_lds={0: 100},
+            lane_inputs=lane_inputs,
+            exec_mask=0b00100101
+        )
+        # Active lanes: 0 (-10), 2 (-50), 5 (-30). Initial: 100. Min = -50.
+        self.assertEqual(to_signed_i32(final_lds[0]), -50)
 
 
 class TestTranslatorSignedMinIntegration(unittest.TestCase):
