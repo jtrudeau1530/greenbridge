@@ -936,5 +936,87 @@ class TestIEEE754BoundaryExtremes(unittest.TestCase):
         self.assertEqual(res, expected)
 
 
+class TestNegativeControlsAndMutationDetection(unittest.TestCase):
+    """Unit tests for negative controls, syntax rejection, and mutation detection."""
+
+    def test_syntax_rejection_invalid_register_indices(self) -> None:
+        with self.assertRaises(ValueError):
+            Reg32(256, RegType.VGPR)
+        with self.assertRaises(ValueError):
+            Reg32(-1, RegType.VGPR)
+        with self.assertRaises(ValueError):
+            Reg32(300, RegType.SGPR)
+
+    def test_syntax_rejection_invalid_destination(self) -> None:
+        with self.assertRaises(TypeError):
+            VSqrtF32Instruction(
+                dst=Reg32(0, RegType.SGPR),
+                src=VOP3Operand(Reg32(2, RegType.VGPR)),
+            )
+
+    def test_syntax_rejection_invalid_lane_count(self) -> None:
+        with self.assertRaises(ValueError):
+            SIMDState(num_lanes=16)
+        with self.assertRaises(ValueError):
+            SIMDState(num_lanes=48)
+        with self.assertRaises(ValueError):
+            SIMDState(num_lanes=128)
+
+    def test_negative_control_divergence(self) -> None:
+        s = f32_to_bits(16.0)
+        res = oracle_v_sqrt_f32(s)
+        self.assertNotEqual(res, f32_to_bits(5.0))
+        self.assertNotEqual(res, f32_to_bits(16.0))
+
+    def test_mutation_detection_identity_mutant(self) -> None:
+        def mutant_oracle(src: int) -> int:
+            return src
+
+        s = f32_to_bits(16.0)
+        golden = oracle_v_sqrt_f32(s)
+        mutant = mutant_oracle(s)
+        self.assertNotEqual(golden, mutant)
+
+    def test_mutation_detection_snan_unquieted(self) -> None:
+        def mutant_oracle(src: int) -> int:
+            return src
+
+        snan = 0x7F80_0001
+        golden = oracle_v_sqrt_f32(snan)
+        mutant = mutant_oracle(snan)
+        self.assertTrue(is_qnan(golden))
+        self.assertFalse(is_qnan(mutant))
+
+    def test_mutation_detection_neg_zero_to_pos_zero(self) -> None:
+        def mutant_oracle(src: int) -> int:
+            return POS_ZERO if is_zero(src) else oracle_v_sqrt_f32(src)
+
+        golden = oracle_v_sqrt_f32(NEG_ZERO)
+        mutant = mutant_oracle(NEG_ZERO)
+        self.assertEqual(golden, NEG_ZERO)
+        self.assertNotEqual(golden, mutant)
+
+    def test_mutation_detection_unclamped_mutant(self) -> None:
+        def mutant_oracle(src: int, clamp: bool = False) -> int:
+            return oracle_v_sqrt_f32(src, clamp=False)
+
+        s = f32_to_bits(4.0)
+        golden = oracle_v_sqrt_f32(s, clamp=True)
+        mutant = mutant_oracle(s, clamp=True)
+        self.assertEqual(golden, ONE_F32)
+        self.assertNotEqual(golden, mutant)
+
+    def test_mutation_detection_ignoring_abs_modifier(self) -> None:
+        def mutant_oracle(src: int, abs_mod: bool = False) -> int:
+            return oracle_v_sqrt_f32(src, abs_mod=False)
+
+        val = f32_to_bits(-9.0)
+        golden = oracle_v_sqrt_f32(val, abs_mod=True)
+        mutant = mutant_oracle(val, abs_mod=True)
+        self.assertEqual(bits_to_f32(golden), 3.0)
+        self.assertEqual(mutant, CANONICAL_QNAN)
+        self.assertNotEqual(golden, mutant)
+
+
 if __name__ == "__main__":
     unittest.main()
