@@ -199,7 +199,7 @@ def test_shapes():
 def test_deep_sequential_chains_stay_flat_and_iterative():
     """Long chains of sequential if/else diamonds, sequential loops, and early-exit chains must structure without
     hitting Python's recursion limit and keep bounded OpSelectionMerge nesting depth."""
-    # 1. 2,000 sequential if/else diamonds (6,001 blocks): previously nested 4,000 levels deep and raised RecursionError.
+    # 1. 2,000 sequential if/else diamonds (6,001 blocks): previously nested 2,000 levels deep and raised RecursionError.
     n_diamonds = 2000
     diamonds = []
     for k in range(n_diamonds):
