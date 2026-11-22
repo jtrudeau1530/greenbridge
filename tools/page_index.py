@@ -21,6 +21,8 @@ tables are reported by offset only; their internal layout is not decoded here.
 Usage:
     python -I page_index.py <archive.rpf> <out.json|out.csv> [--start N] [--limit BYTES] [--quiet]
     python -I page_index.py <carved-dir> <out.json|out.csv> [--quiet]
+
+--start and --limit apply to a single archive only; with a directory they are an error (exit 2).
 """
 import argparse
 import csv
@@ -372,6 +374,8 @@ def main():
     ap.add_argument("--limit", type=byte_count, help="stop after this many bytes")
     ap.add_argument("--quiet", action="store_true")
     a = ap.parse_args()
+    if os.path.isdir(a.source) and (a.start is not None or a.limit is not None):
+        ap.error("--start and --limit apply to a single archive, not a directory")
     ext = os.path.splitext(a.out)[1].lower()
     if ext not in (".json", ".csv"):   # checked before the scan, which can take minutes on a large archive
         ap.error("output must end in .json or .csv")

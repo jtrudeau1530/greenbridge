@@ -117,7 +117,17 @@ static_assert(leonida::d3d12_layout::compute_queue_unordered_access == std::uint
 static_assert(leonida::d3d12_layout::compute_queue_shader_resource == std::uint32_t(D3D12_BARRIER_LAYOUT_COMPUTE_QUEUE_SHADER_RESOURCE));
 static_assert(leonida::d3d12_layout::compute_queue_copy_source == std::uint32_t(D3D12_BARRIER_LAYOUT_COMPUTE_QUEUE_COPY_SOURCE));
 static_assert(leonida::d3d12_layout::compute_queue_copy_dest == std::uint32_t(D3D12_BARRIER_LAYOUT_COMPUTE_QUEUE_COPY_DEST));
-static_assert(leonida::d3d12_layout::video_queue_common == std::uint32_t(D3D12_BARRIER_LAYOUT_VIDEO_QUEUE_COMMON));
+
+template <typename SdkLayout>
+constexpr bool video_queue_common_matches_sdk() {
+    if constexpr (requires { SdkLayout::D3D12_BARRIER_LAYOUT_VIDEO_QUEUE_COMMON; }) {
+        return leonida::d3d12_layout::video_queue_common ==
+               std::uint32_t(SdkLayout::D3D12_BARRIER_LAYOUT_VIDEO_QUEUE_COMMON);
+    }
+    // SDK 10.0.28000.0 omits this legacy enumerator. Its value is 30 in older headers.
+    return leonida::d3d12_layout::video_queue_common == 30;
+}
+static_assert(video_queue_common_matches_sdk<D3D12_BARRIER_LAYOUT>());
 #endif
 
 #include <cstdio>

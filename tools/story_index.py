@@ -13,6 +13,8 @@ is reported as `raw:<hex>` instead of being guessed.
 Usage:
     python -I story_index.py <archive.rpf> <out.csv|out.json> [--start N] [--limit BYTES] [--quiet]
     python -I story_index.py <carved-dir> <out.csv|out.json> [--quiet]
+
+--start and --limit apply to a single archive only; with a directory they are an error (exit 2).
 """
 import argparse
 import csv
@@ -309,6 +311,8 @@ def main():
     ap.add_argument("--limit", type=byte_count, help="number of bytes to scan")
     ap.add_argument("--quiet", action="store_true")
     a = ap.parse_args()
+    if os.path.isdir(a.source) and (a.start is not None or a.limit is not None):
+        ap.error("--start and --limit apply to a single archive, not a directory")
     if os.path.isdir(a.source):
         rows, summary = scan_dir(a.source)
     else:
