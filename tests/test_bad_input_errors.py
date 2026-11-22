@@ -51,12 +51,20 @@ class BadInputTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             arc = os.path.join(tmp, "empty-data.rpf")
             data = bytearray(0x40)
-            data[0:4] = b"RPF9"
+            data[0:4] = b"9FPR"
             struct.pack_into("<I", data, 4, 0x40)
             with open(arc, "wb") as f:
                 f.write(data)
             p = run("rpf9_carve.py", arc, os.path.join(tmp, "out"), "--start", "64")
             self.assert_error(p, "outside the file")
+
+    def test_carve_and_gamedata_index_reject_a_non_rpf9_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            arc = os.path.join(tmp, "notrpf.rpf")
+            with open(arc, "wb") as f:
+                f.write(b"MZ" + bytes(0x100))
+            self.assert_error(run("rpf9_carve.py", arc, os.path.join(tmp, "out")), "not an RPF9 archive")
+            self.assert_error(run("gamedata_index.py", arc), "not an RPF9 archive")
 
     def test_audio_config_with_no_records(self):
         with tempfile.TemporaryDirectory() as tmp:

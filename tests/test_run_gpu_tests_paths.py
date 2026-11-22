@@ -1,10 +1,12 @@
 """run_gpu_tests.py: a filtered run still builds the vertex shader a selected test draws with, and relative --build
 /--work paths keep working for test programs that run in another working directory (vk_texture_test)."""
+import io
 import os
 from pathlib import Path
 import sys
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -44,6 +46,22 @@ class DrawShaders(unittest.TestCase):
             source = "vs_clip" if name in run_gpu_tests.CLIP_CASES else name
             self.assertTrue((shaders / f"{source}.asm").is_file(), name)
             self.assertTrue((shaders / extra).is_file(), extra)
+
+
+class FilterSelection(unittest.TestCase):
+    def test_unmatched_filter_fails_before_running_shader_tools(self):
+        args = SimpleNamespace(filter="no_matching_shader", build="unused")
+        err = io.StringIO()
+        with tempfile.TemporaryDirectory() as tmp, \
+                patch("sys.stderr", err), \
+                patch.object(run_gpu_tests, "run_cmd", return_value=(0, "")) as run, \
+                patch.object(run_gpu_tests, "spirv_as") as assemble:
+            work = Path(tmp) / "work"
+            self.assertEqual(run_gpu_tests.run_suite(args, str(work)), 2)
+            self.assertIn(args.filter, err.getvalue())
+            run.assert_not_called()
+            assemble.assert_not_called()
+            self.assertFalse(work.exists())
 
 
 class RelativePaths(unittest.TestCase):

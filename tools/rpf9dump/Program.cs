@@ -121,7 +121,7 @@ else if (mode is "models" or "textures")
             var sys = data.AsSpan(0, split); var gfx = data.AsSpan(split);
             if (mode == "models")
             {
-                var m = RageModelDecoder.Decode(sys, gfx);
+                var m = RageModelDecoder.Decode(sys, gfx, e.ResourceDrawableOffset);
                 if (m == null)
                 {
                     var reason = ModelDecodeFailure.Explain(sys, gfx.Length);
@@ -144,7 +144,7 @@ else if (mode is "models" or "textures")
                         try { Util.WriteAllBytes(p, Util.BgraDds(RageTextureDecoder.DecodeEmbeddedTexturePixels(sys, gfx, dOff, t.Index))); embedded++; } catch { }
                     }
                 }
-                Row(new { e.Offset, File = stem + ".obj", m.Name, Meshes = m.Meshes.Count, Verts = m.Meshes.Sum(x => x.Positions.Count), Tris = m.Meshes.Sum(x => x.Indices.Count) / 3, m.IsFragment, m.HasBoneBindings,
+                Row(new { e.Offset, Drawable = e.ResourceDrawableOffset, File = stem + ".obj", m.Name, Meshes = m.Meshes.Count, Verts = m.Meshes.Sum(x => x.Positions.Count), Tris = m.Meshes.Sum(x => x.Indices.Count) / 3, m.IsFragment, m.HasBoneBindings,
                     Min = new[] { m.BoundsMin.X, m.BoundsMin.Y, m.BoundsMin.Z }, Max = new[] { m.BoundsMax.X, m.BoundsMax.Y, m.BoundsMax.Z },
                     MeshShaders = m.Meshes.Select(x => x.ShaderIndex).ToArray(),
                     Embedded = m.EmbeddedTextures?.Select(t => new { t.Index, t.Name, t.Width, t.Height, t.Format, Hash = t.NameHash.ToString("X8"), Key = t.AssetKey?.ToString("X16") }).ToArray(),

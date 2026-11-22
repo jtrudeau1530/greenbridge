@@ -139,7 +139,7 @@ class Wave32LaneDumps(unittest.TestCase):
     def test_uses_check_py_rule(self):
         import check
         self.assertIs(rgt.narrow_subgroup_skip, check.narrow_subgroup_skip)
-        self.assertEqual(rgt.WAVE32_LANE_DUMPS, ("cs_wqm_w32", "cs_w32_lane_wrap", "cs_bpermute32"))
+        self.assertIs(rgt.WAVE32_LANE_DUMPS, check.WAVE32_LANE_DUMPS)
 
     def test_rule(self):
         self.assertEqual(rgt.narrow_subgroup_skip("device: llvmpipe (subgroup 8..8)\n"),
