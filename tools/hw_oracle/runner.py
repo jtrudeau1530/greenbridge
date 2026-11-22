@@ -1,5 +1,9 @@
 """Find the tools, build the launcher, assemble kernels and run them on the GPU. Standard library only.
 
+Two launchers: on Windows the HIP runtime that ships in the AMD driver (hw_oracle.c, this file), on Linux raw
+dispatches through the kernel driver (hw_oracle_drm.c, drm.py, which also lists its own variables). open_oracle()
+picks the one for the platform.
+
 Tools are located through environment variables first, then by looking in the usual places:
     LEONIDA_AMD_CLANG   AMD clang (its folder must also hold ld.lld); default: amdclang / clang on PATH that lists
                         the amdgcn target, %HIP_PATH% / %ROCM_PATH%, a .venv holding the `rocm-sdk-core` wheel
@@ -302,15 +306,28 @@ class Oracle:
 
 
 def open_oracle(**kw):
-    """An Oracle, or raise Unavailable."""
+    """An Oracle for this platform, or raise Unavailable."""
+    if sys.platform.startswith("linux"):
+        try:
+            from . import drm
+        except ImportError:   # run as a script
+            import drm
+        return drm.DrmOracle(**kw)
     return Oracle(**kw)
 
 
-if __name__ == "__main__":
+def main():
     try:
-        o = Oracle()
+        o = open_oracle()
     except Unavailable as e:
         print(f"hardware oracle unavailable: {e}")
-        sys.exit(77)
+        return 77
     print(f"hardware oracle ready: {o.device}; clang {o.clang}")
     o.close()
+    return 0
+
+
+if __name__ == "__main__":
+    # Through the importable module: drm.py imports runner, and both must share one Unavailable and one Oracle.
+    import runner as _runner
+    sys.exit(_runner.main())
