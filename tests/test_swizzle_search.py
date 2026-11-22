@@ -365,6 +365,7 @@ class TestSwizzleSearchPermutationMatching(unittest.TestCase):
 
 
 class TestSwizzleSearchCliAndRender(unittest.TestCase):
+    @unittest.skipUnless(HAVE_NUMPY, "numpy required")   # the tool imports numpy before it parses arguments
     def test_preview_with_no_fitting_layout_reports_the_problem(self):
         """CLI with tiny blob and --out must exit 1, report 'no layout', and not create file."""
         with tempfile.TemporaryDirectory() as td:
@@ -439,6 +440,8 @@ class TestSwizzleSearchCliAndRender(unittest.TestCase):
 
 def test_preview_with_no_fitting_layout_reports_the_problem(tmp_path=None):
     """Module-level compatibility wrapper for pytest with tmp_path fixture."""
+    if not HAVE_NUMPY:
+        raise unittest.SkipTest("numpy required")
     td = None
     if tmp_path is None:
         td = tempfile.TemporaryDirectory()

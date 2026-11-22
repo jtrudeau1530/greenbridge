@@ -140,9 +140,12 @@ def run(spvasm):
             if any(math.isnan(x) or math.isinf(x) for x in a):
                 return f32(a[0] * a[1] + a[2])
             return f32(float(Fraction(a[0]) * Fraction(a[1]) + Fraction(a[2])))
-        simple = {"FMin": min, "FMax": max, "FAbs": abs, "Floor": math.floor, "Ceil": math.ceil, "Trunc": math.trunc,
+        rounding = {"Floor": math.floor, "Ceil": math.ceil, "Trunc": math.trunc, "RoundEven": round}
+        if fn in rounding:      # a zero result keeps the sign of the operand (IEEE 754; RDNA2 and Vulkan GPUs do)
+            return a[0] if math.isnan(a[0]) or math.isinf(a[0]) else math.copysign(float(rounding[fn](a[0])), a[0])
+        simple = {"FMin": min, "FMax": max, "FAbs": abs, "Sin": math.sin, "Cos": math.cos,
                   "Sqrt": math.sqrt, "InverseSqrt": lambda x: 1 / math.sqrt(x), "Exp2": lambda x: 2.0 ** x,
-                  "Log2": math.log2, "RoundEven": lambda x: float(round(x))}
+                  "Log2": math.log2}
         if fn in simple:
             return f32(float(simple[fn](*a)))
         if fn == "Fract":
@@ -183,7 +186,11 @@ def run(spvasm):
         elif op == "OpSelect":
             val[res] = get(args[2]) if get(args[1]) else get(args[3])
         elif op in ARITH:
-            val[res] = ARITH[op](get(args[1]), get(args[2]))
+            x, y = get(args[1]), get(args[2])
+            if isinstance(x, tuple) and isinstance(y, tuple):     # vector operands: component by component
+                val[res] = tuple(ARITH[op](p, q) for p, q in zip(x, y))
+            else:
+                val[res] = ARITH[op](x, y)
         elif op == "OpNot":
             val[res] = ~get(args[1]) & M32
         elif op == "OpLogicalNot":
