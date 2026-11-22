@@ -136,7 +136,7 @@ int check_multiple_fences(ID3D12Device* device, ID3D12CommandQueue* queue) {
         signaller.join();
         EXPECT(reached && a->GetCompletedValue() == 3);
     }
-    // A fence released while an event waits on it: nothing fires and nothing crashes.
+    // A fence released while an event waits on it sets the event, as on the host PC runtime.
     {
         Ref<ID3D12Fence> c;
         EXPECT(SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&c.p))));
@@ -145,7 +145,7 @@ int check_multiple_fences(ID3D12Device* device, ID3D12CommandQueue* queue) {
         Event event;
         EXPECT(SUCCEEDED(device1->SetEventOnMultipleFenceCompletion(one, values, 1, ALL, event.h)));
         c.reset();
-        EXPECT(!event.set_within(30));
+        EXPECT(event.set_within(2000));
     }
     // Bad arguments.
     {
@@ -155,9 +155,9 @@ int check_multiple_fences(ID3D12Device* device, ID3D12CommandQueue* queue) {
                                                            nullptr) == E_INVALIDARG);
         EXPECT(device1->SetEventOnMultipleFenceCompletion(with_null, values, 2, ALL, nullptr) == E_INVALIDARG);
         EXPECT(device1->SetEventOnMultipleFenceCompletion(nullptr, values, 2, ALL, nullptr) == E_INVALIDARG);
-        Event event;
-        EXPECT(SUCCEEDED(device1->SetEventOnMultipleFenceCompletion(nullptr, nullptr, 0, ALL, event.h)));
-        EXPECT(event.set_within(0));
+        Event event;  // no fences: refused and the event left alone, as on the host PC runtime
+        EXPECT(device1->SetEventOnMultipleFenceCompletion(nullptr, nullptr, 0, ALL, event.h) == E_INVALIDARG);
+        EXPECT(!event.set_within(0));
     }
     return 0;
 }

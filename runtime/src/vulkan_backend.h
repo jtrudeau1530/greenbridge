@@ -408,7 +408,7 @@ private:
 
 // Centralized single-thread fence dispatcher using Vulkan 1.2 vkWaitSemaphores(VK_SEMAPHORE_WAIT_ANY_BIT).
 // Eliminates per-fence OS threads and 10ms polling: a synthetic timeline semaphore (wakeup_sem_) at index 0
-// wakes vkWaitSemaphores immediately whenever a new wait, cancellation, or shutdown arrives while waiting_ == true.
+// wakes vkWaitSemaphores immediately whenever a new wait, a released fence, or shutdown arrives while waiting_ == true.
 class FenceWaitDispatcher {
 public:
     struct Entry {
@@ -480,12 +480,17 @@ public:
         cv_.notify_one();
     }
 
-    // Removes pending waits for `sem` and blocks until any in-flight vkWaitSemaphores releases `sem`
-    // before the caller destroys the VkSemaphore.
+    // Completes the pending waits for `sem` (a released D3D12 fence counts as reached, as on the PC runtime) and
+    // blocks until any in-flight vkWaitSemaphores releases `sem` before the caller destroys the VkSemaphore.
     void cancel(VkSemaphore sem) {
         if (!sem) return;
         std::unique_lock lock(mutex_);
-        std::erase_if(pending_, [sem](const Entry& e) { return e.semaphore == sem; });
+        std::erase_if(pending_, [this, sem](const Entry& e) {
+            if (e.semaphore != sem) return false;
+            if (e.callback) e.callback();
+            else if (signal_event_ && e.event_handle) signal_event_(e.event_handle);
+            return true;
+        });
         if (!thread_.joinable()) return;
         if (waiting_) {
             const std::uint64_t target_epoch = epoch_ + 1;
