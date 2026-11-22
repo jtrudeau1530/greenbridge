@@ -785,6 +785,56 @@ public:
     UINT STDMETHODCALLTYPE GetNodeCount() override { return 1; }
     HRESULT STDMETHODCALLTYPE GetDeviceRemovedReason() override { return S_OK; }
 
+    // Residency and power (D3D-33, docs/d3d12_vulkan.md section 4.1). Vulkan has no residency API: memory from
+    // vkAllocateMemory stays usable by the device until vkFreeMemory, and paging under pressure is the kernel
+    // driver's job (WDDM on Windows), invisible to the application. So every pageable object of this device is
+    // always resident, MakeResident has nothing to do and Evict, which D3D12 documents as a hint the runtime may
+    // defer, can be dropped. Only the arguments are checked; the objects themselves are not touched.
+    HRESULT STDMETHODCALLTYPE MakeResident(UINT count, ID3D12Pageable* const* objects) override {
+        return count && !objects ? E_INVALIDARG : S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE Evict(UINT count, ID3D12Pageable* const* objects) override {
+        return count && !objects ? E_INVALIDARG : S_OK;
+    }
+
+    // Device1: priorities only order what the OS evicts first under memory pressure. VK_EXT_pageable_device_local_memory
+    // could pass them on, but it is optional and changes no result, so they are accepted and dropped. Any UINT is a
+    // valid priority (the D3D12_RESIDENCY_PRIORITY values are named points, the low 24 bits a refinement).
+    HRESULT STDMETHODCALLTYPE SetResidencyPriority(UINT count, ID3D12Pageable* const* objects,
+                                                   const D3D12_RESIDENCY_PRIORITY* priorities) override {
+        return count && (!objects || !priorities) ? E_INVALIDARG : S_OK;
+    }
+
+    // Device3: the asynchronous MakeResident. The objects are already resident, so the work is complete at once
+    // and the fence is signalled from the CPU now. The caller's queue Wait on it must not hang, which is why the
+    // signal is kept although the residency part is a no-op. DENY_OVERBUDGET cannot fail: nothing is paged in.
+    HRESULT STDMETHODCALLTYPE EnqueueMakeResident(D3D12_RESIDENCY_FLAGS flags, UINT count,
+                                                  ID3D12Pageable* const* objects, ID3D12Fence* fence,
+                                                  UINT64 value) override {
+        if (!fence || (count && !objects) || (flags & ~D3D12_RESIDENCY_FLAG_DENY_OVERBUDGET)) return E_INVALIDARG;
+        return fence->Signal(value);
+    }
+
+    // Stable power state pins GPU clocks for profiling, a developer-mode feature on Windows. Vulkan has no clock
+    // control (vendor tools do it outside the API), and the game's frame does not depend on the clocks, so the
+    // request is accepted. Success is what D3D12 returns on a machine where the call is allowed.
+    HRESULT STDMETHODCALLTYPE SetStablePowerState(BOOL) override { return S_OK; }
+
+    // Device6: lets the driver run background shader recompilation and profiling-guided optimisation. Vulkan
+    // drivers do that, if at all, without an API to steer it, so there is nothing to start or stop. The completion
+    // event is set at once, since no measurement is running, and no further measurements are wanted.
+    HRESULT STDMETHODCALLTYPE SetBackgroundProcessingMode(D3D12_BACKGROUND_PROCESSING_MODE mode,
+                                                          D3D12_MEASUREMENTS_ACTION action, HANDLE event,
+                                                          BOOL* further_measurements) override {
+        if (unsigned(mode) > unsigned(D3D12_BACKGROUND_PROCESSING_MODE_DISABLE_PROFILING_BY_SYSTEM) ||
+            unsigned(action) > unsigned(D3D12_MEASUREMENTS_ACTION_DISCARD_PREVIOUS))
+            return E_INVALIDARG;
+        if (further_measurements) *further_measurements = FALSE;
+        if (event) SetEvent(event);
+        return S_OK;
+    }
+
     HRESULT STDMETHODCALLTYPE CreateCommandQueue(const D3D12_COMMAND_QUEUE_DESC* desc, REFIID riid,
                                                  void** out) override {
         if (!desc) return E_INVALIDARG;

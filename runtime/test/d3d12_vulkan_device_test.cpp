@@ -546,6 +546,69 @@ int main() {
             Ref<ID3D12Device> parent;
             EXPECT(SUCCEEDED(queue->GetDevice(IID_PPV_ARGS(&parent.p))) && parent.p == device.p);
         }
+        // Residency and power (D3D-33): no-ops on Vulkan that still check their arguments, through the proxy's
+        // forwarded slots. EnqueueMakeResident must signal its fence, or a queue waiting on it would hang.
+        {
+            Ref<ID3D12Fence> residency;
+            EXPECT(SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&residency.p))));
+            ID3D12Pageable* const pageables[] = {fence.p, allocator.p};
+            EXPECT(device->MakeResident(2, pageables) == S_OK);
+            EXPECT(device->MakeResident(0, nullptr) == S_OK);
+            EXPECT(device->MakeResident(1, nullptr) == E_INVALIDARG);
+            EXPECT(device->Evict(2, pageables) == S_OK);
+            EXPECT(device->Evict(0, nullptr) == S_OK);
+            EXPECT(device->Evict(1, nullptr) == E_INVALIDARG);
+            EXPECT(device->SetStablePowerState(TRUE) == S_OK);
+            EXPECT(device->SetStablePowerState(FALSE) == S_OK);
+
+            Ref<ID3D12Device1> device1;
+            EXPECT(SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&device1.p))));
+            const D3D12_RESIDENCY_PRIORITY priorities[] = {D3D12_RESIDENCY_PRIORITY_MAXIMUM,
+                                                           D3D12_RESIDENCY_PRIORITY(D3D12_RESIDENCY_PRIORITY_LOW + 5)};
+            EXPECT(device1->SetResidencyPriority(2, pageables, priorities) == S_OK);
+            EXPECT(device1->SetResidencyPriority(0, nullptr, nullptr) == S_OK);
+            EXPECT(device1->SetResidencyPriority(1, pageables, nullptr) == E_INVALIDARG);
+            EXPECT(device1->SetResidencyPriority(1, nullptr, priorities) == E_INVALIDARG);
+
+            Ref<ID3D12Device3> device3;
+            EXPECT(SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&device3.p))));
+            EXPECT(device3->EnqueueMakeResident(D3D12_RESIDENCY_FLAG_NONE, 2, pageables, residency.p, 7) == S_OK);
+            EXPECT(residency->GetCompletedValue() == 7);
+            EXPECT(device3->EnqueueMakeResident(D3D12_RESIDENCY_FLAG_DENY_OVERBUDGET, 0, nullptr, residency.p, 9) ==
+                   S_OK);
+            EXPECT(residency->GetCompletedValue() == 9);
+            // Refused calls leave the fence alone.
+            EXPECT(device3->EnqueueMakeResident(D3D12_RESIDENCY_FLAG_NONE, 1, pageables, nullptr, 11) == E_INVALIDARG);
+            EXPECT(device3->EnqueueMakeResident(D3D12_RESIDENCY_FLAG_NONE, 1, nullptr, residency.p, 11) ==
+                   E_INVALIDARG);
+            EXPECT(device3->EnqueueMakeResident(D3D12_RESIDENCY_FLAGS(0x2), 1, pageables, residency.p, 11) ==
+                   E_INVALIDARG);
+            EXPECT(residency->GetCompletedValue() == 9);
+            // The GPU sees the signal: a queue waits on it, then signals past it.
+            EXPECT(SUCCEEDED(queue->Wait(residency.p, 9)));
+            EXPECT(SUCCEEDED(queue->Signal(residency.p, 10)));
+            EXPECT(SUCCEEDED(residency->SetEventOnCompletion(10, nullptr)) && residency->GetCompletedValue() == 10);
+
+            Ref<ID3D12Device6> device6;
+            EXPECT(SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&device6.p))));
+            const HANDLE done = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+            EXPECT(done);
+            BOOL further = TRUE;
+            const HRESULT background = device6->SetBackgroundProcessingMode(
+                D3D12_BACKGROUND_PROCESSING_MODE_DISABLE_BACKGROUND_WORK, D3D12_MEASUREMENTS_ACTION_COMMIT_RESULTS,
+                done, &further);
+            const DWORD signalled = WaitForSingleObject(done, 0);
+            CloseHandle(done);
+            EXPECT(background == S_OK && signalled == WAIT_OBJECT_0 && further == FALSE);
+            EXPECT(device6->SetBackgroundProcessingMode(D3D12_BACKGROUND_PROCESSING_MODE_ALLOWED,
+                                                        D3D12_MEASUREMENTS_ACTION_KEEP_ALL, nullptr, nullptr) == S_OK);
+            EXPECT(device6->SetBackgroundProcessingMode(D3D12_BACKGROUND_PROCESSING_MODE(4),
+                                                        D3D12_MEASUREMENTS_ACTION_KEEP_ALL, nullptr, nullptr) ==
+                   E_INVALIDARG);
+            EXPECT(device6->SetBackgroundProcessingMode(D3D12_BACKGROUND_PROCESSING_MODE_ALLOWED,
+                                                        D3D12_MEASUREMENTS_ACTION(4), nullptr, nullptr) ==
+                   E_INVALIDARG);
+        }
         {
             Ref<ID3D12Device4> device4;
             Ref<ID3D12GraphicsCommandList> closed;

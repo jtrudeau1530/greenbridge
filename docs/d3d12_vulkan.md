@@ -675,6 +675,22 @@ The trace will enumerate them.
   on the PC runtime, so none here either. Texture sizes are the driver's on both runtimes, so only buffer sizes,
   alignments and invalid descriptions are compared with the host. One known difference: a mip count beyond the
   full chain is invalid here (Vulkan can't create it), while the PC runtime still answers with a size.
+- Residency and power (D3D-33) are no-ops that still check their arguments (`d3d12_vulkan_device.cpp`, tested in
+  `d3d12_vulkan_device_test`). Vulkan has no residency API: memory from `vkAllocateMemory` stays usable until
+  `vkFreeMemory`, and paging under pressure is the kernel driver's job, so every pageable object is always resident.
+  - `MakeResident` and `Evict` return `S_OK`, or `E_INVALIDARG` for a nonzero count with a null array. D3D12
+    documents `Evict` as a hint the runtime may defer, so dropping it is allowed.
+  - `SetResidencyPriority` (Device1): `S_OK`, or `E_INVALIDARG` for a nonzero count with a null object or priority
+    array. Priorities only order what the OS evicts first; any `UINT` is a valid priority.
+  - `EnqueueMakeResident` (Device3) signals its fence from the CPU with the given value before returning, since
+    the work is already complete. A queue `Wait` on that fence must not hang, which is why the signal stays.
+    `E_INVALIDARG` for a null fence, a nonzero count with a null array, or flags other than `NONE` and
+    `DENY_OVERBUDGET`; a refused call does not signal.
+  - `SetStablePowerState` returns `S_OK`: Vulkan has no clock control, and the result of a frame does not depend
+    on the clocks.
+  - `SetBackgroundProcessingMode` (Device6): no Vulkan API steers driver background work, so nothing runs. The
+    completion event is set at once and `*pbFurtherMeasurementsDesired` is `FALSE`. A mode or action outside the
+    SDK's enum is `E_INVALIDARG`.
 
 ### 4.2 Resources, heaps, placed and reserved
 
