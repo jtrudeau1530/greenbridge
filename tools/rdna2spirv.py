@@ -3400,6 +3400,57 @@ class Gen:
             self.emit(f"{r} = OpExtInst %float %glsl FClamp {vals[2]} {lo_} {hi_}")
             r = self.clamp_mods(r, mods)
             self.f16_out(a[0], r, dhi)    # opsel-capable VOP3: keeps the other half (Mesa ACO can_use_opsel)
+        elif op in ("v_qsad_pk_u16_u8", "v_mqsad_pk_u16_u8"):
+            # Four byte-SADs packed as u16 (RDNA ISA pseudocode): for k = 0..3, D.u16[k] = (S2.u16[k] + SAD of the
+            # 32-bit window S0[8k+31 : 8k] of the 64-bit S0 against S1) & 0xFFFF. The m form is masked: a byte where
+            # S1's byte is 0 is skipped (as v_msad_u8). clamp is not modelled: rejected rather than guessed.
+            if a[0].get("n") != 2 or "clamp" in mods:
+                raise Unsupported(op + " operands")
+
+            def pair(sv):
+                if sv["k"] in ("vgpr", "sgpr") and sv.get("n") == 2:
+                    return self.load_reg(sv["k"], sv["r"]), self.load_reg(sv["k"], sv["r"] + 1)
+                if sv["k"] == "imm":
+                    v = sv["v"] & 0xFFFFFFFFFFFFFFFF          # 64-bit inline/literal constant: sign-extended
+                    return self.cu(v & 0xFFFFFFFF), self.cu(v >> 32)
+                raise Unsupported(op + " operands")
+            (x_lo, x_hi), y, (c_lo, c_hi) = pair(a[1]), self.src_u(a[2]), pair(a[3])
+            words = []
+            for k in range(4):
+                if k == 0:
+                    win = x_lo
+                else:
+                    t1, t2, win = self.tmp(), self.tmp(), self.tmp()
+                    self.emit(f"{t1} = OpShiftRightLogical %uint {x_lo} {self.cu(8 * k)}")
+                    self.emit(f"{t2} = OpShiftLeftLogical %uint {x_hi} {self.cu(32 - 8 * k)}")
+                    self.emit(f"{win} = OpBitwiseOr %uint {t1} {t2}")
+                acc_w = c_lo if k < 2 else c_hi
+                total = self.tmp()
+                self.emit(f"{total} = OpBitFieldUExtract %uint {acc_w} {self.cu(16 * (k % 2))} {self.cu(16)}")
+                for off in (0, 8, 16, 24):
+                    xb, yb, hi_, lo_, d, t = (self.tmp() for _ in range(6))
+                    self.emit(f"{xb} = OpBitFieldUExtract %uint {win} {self.cu(off)} {self.cu(8)}")
+                    self.emit(f"{yb} = OpBitFieldUExtract %uint {y} {self.cu(off)} {self.cu(8)}")
+                    self.emit(f"{hi_} = OpExtInst %uint %glsl UMax {xb} {yb}")
+                    self.emit(f"{lo_} = OpExtInst %uint %glsl UMin {xb} {yb}")
+                    self.emit(f"{d} = OpISub %uint {hi_} {lo_}")
+                    if op == "v_mqsad_pk_u16_u8":
+                        md = self.tmp()
+                        self.emit(f"{md} = OpSelect %uint {self.tmp_bool_nz(yb)} {d} {self.cu(0)}")
+                        d = md
+                    self.emit(f"{t} = OpIAdd %uint {total} {d}")
+                    total = t
+                w = self.tmp()
+                self.emit(f"{w} = OpBitwiseAnd %uint {total} {self.cu(0xFFFF)}")
+                words.append(w)
+            out = []
+            for lo16, hi16 in ((words[0], words[1]), (words[2], words[3])):
+                sh, o = self.tmp(), self.tmp()
+                self.emit(f"{sh} = OpShiftLeftLogical %uint {hi16} {self.cu(16)}")
+                self.emit(f"{o} = OpBitwiseOr %uint {lo16} {sh}")
+                out.append(o)
+            self.dst({"k": "vgpr", "r": a[0]["r"], "n": 1}, out[0])
+            self.dst({"k": "vgpr", "r": a[0]["r"] + 1, "n": 1}, out[1])
         elif op in ("v_sad_u8", "v_sad_hi_u8", "v_sad_u16", "v_sad_u32", "v_msad_u8"):
             # Sums of absolute differences (RDNA ISA pseudocode), all unsigned and wrapping at 32 bits:
             #   v_sad_u8:    S2 + sum over the 4 bytes of |S0.b - S1.b|
