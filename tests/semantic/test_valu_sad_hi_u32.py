@@ -144,6 +144,59 @@ class VSadHiU32Instruction:
         return f"v_sad_hi_u32 {self.dst.disassemble()}, {self.src0.disassemble()}, {self.src1.disassemble()}, {self.src2.disassemble()}"
 
 
+# ==============================================================================
+# Deterministic Scalar Instruction Interpreter
+# ==============================================================================
+
+class ScalarRegisterFile:
+    """Architectural register file for a single execution thread."""
+
+    def __init__(self) -> None:
+        self.vgprs: List[int] = [0] * 256
+        self.sgprs: List[int] = [0] * 106
+
+    def read(self, op: Operand) -> int:
+        """Read operand value as unsigned 32-bit dword."""
+        if op.reg_type == RegType.LITERAL:
+            assert op.literal_value is not None
+            return op.literal_value & MASK32
+        if op.reg_type == RegType.VGPR:
+            return self.vgprs[op.index] & MASK32
+        if op.reg_type == RegType.SGPR:
+            return self.sgprs[op.index] & MASK32
+        raise ValueError(f"Unknown operand type: {op.reg_type}")
+
+    def write(self, op: Operand, value: int) -> None:
+        """Write 32-bit dword to register operand (VGPR or SGPR)."""
+        if op.reg_type == RegType.VGPR:
+            self.vgprs[op.index] = u32(value)
+        elif op.reg_type == RegType.SGPR:
+            self.sgprs[op.index] = u32(value)
+        else:
+            raise TypeError("Cannot write to literal operand")
+
+
+class ScalarVALUInterpreter:
+    """Deterministic instruction interpreter for v_sad_hi_u32 on a scalar register file."""
+
+    def __init__(self, regs: ScalarRegisterFile | None = None) -> None:
+        self.regs: ScalarRegisterFile = regs if regs is not None else ScalarRegisterFile()
+
+    def step(self, instr: VSadHiU32Instruction) -> int:
+        # Atomic read phase
+        s0 = self.regs.read(instr.src0)
+        s1 = self.regs.read(instr.src1)
+        s2 = self.regs.read(instr.src2)
+
+        # Computation phase
+        result = ref_sad_hi_u32(s0, s1, s2)
+
+        # Write-back phase
+        self.regs.write(instr.dst, result)
+        return result
+
+
+
 
 # ==============================================================================
 # Unit Tests: Model and Reference Oracle
@@ -285,6 +338,88 @@ class TestValuSadHiU32SymbolicAST(unittest.TestCase):
                 src1=Operand.vgpr(2),
                 src2=Operand.literal(0),
             )
+
+
+class TestValuSadHiU32ScalarInterpreter(unittest.TestCase):
+    """Unit tests for deterministic scalar instruction interpreter."""
+
+    def setUp(self) -> None:
+        self.regs = ScalarRegisterFile()
+        self.interp = ScalarVALUInterpreter(self.regs)
+
+    def test_scalar_register_file_read_write(self) -> None:
+        self.regs.write(Operand.vgpr(5), 0x12345678)
+        self.assertEqual(self.regs.read(Operand.vgpr(5)), 0x12345678)
+
+        self.regs.write(Operand.sgpr(2), 0x9ABCDEF0)
+        self.assertEqual(self.regs.read(Operand.sgpr(2)), 0x9ABCDEF0)
+
+        # 32-bit truncation
+        self.regs.write(Operand.vgpr(0), 0x1_FFFF_FFFF)
+        self.assertEqual(self.regs.read(Operand.vgpr(0)), 0xFFFF_FFFF)
+
+        # Literal read
+        self.assertEqual(self.regs.read(Operand.literal(42)), 42)
+
+    def test_scalar_execution_all_vgprs(self) -> None:
+        # |0xFFFFFFFF - 0| + 1 = 0x100000000 -> hi = 1
+        self.regs.write(Operand.vgpr(1), 0xFFFF_FFFF)
+        self.regs.write(Operand.vgpr(2), 0x0000_0000)
+        self.regs.write(Operand.vgpr(3), 0x0000_0001)
+
+        instr = VSadHiU32Instruction(
+            dst=Operand.vgpr(0),
+            src0=Operand.vgpr(1),
+            src1=Operand.vgpr(2),
+            src2=Operand.vgpr(3),
+        )
+
+        res = self.interp.step(instr)
+        self.assertEqual(res, 1)
+        self.assertEqual(self.regs.read(Operand.vgpr(0)), 1)
+
+    def test_scalar_execution_sgpr_and_literal(self) -> None:
+        # |0x80000000 - 0| + 0x80000000 = 0x100000000 -> hi = 1
+        self.regs.write(Operand.vgpr(1), 0x8000_0000)
+        self.regs.write(Operand.sgpr(4), 0x0000_0000)
+
+        instr = VSadHiU32Instruction(
+            dst=Operand.vgpr(0),
+            src0=Operand.vgpr(1),
+            src1=Operand.sgpr(4),
+            src2=Operand.literal(0x8000_0000),
+        )
+
+        res = self.interp.step(instr)
+        self.assertEqual(res, 1)
+        self.assertEqual(self.regs.read(Operand.vgpr(0)), 1)
+
+    def test_scalar_sequential_program(self) -> None:
+        # Step 1: hi carry = 1
+        self.regs.write(Operand.vgpr(1), 0xFFFF_FFFF)
+        self.regs.write(Operand.vgpr(2), 0x0000_0000)
+        self.regs.write(Operand.vgpr(3), 0x0000_0001)
+
+        instr1 = VSadHiU32Instruction(
+            dst=Operand.vgpr(0),
+            src0=Operand.vgpr(1),
+            src1=Operand.vgpr(2),
+            src2=Operand.vgpr(3),
+        )
+        res1 = self.interp.step(instr1)
+        self.assertEqual(res1, 1)
+
+        # Step 2: Use v0 (value 1) in next sad_hi:
+        # |1 - 1| + 0xFFFFFFFF = 0xFFFFFFFF -> hi = 0
+        instr2 = VSadHiU32Instruction(
+            dst=Operand.vgpr(4),
+            src0=Operand.vgpr(0),
+            src1=Operand.literal(1),
+            src2=Operand.literal(0xFFFF_FFFF),
+        )
+        res2 = self.interp.step(instr2)
+        self.assertEqual(res2, 0)
+        self.assertEqual(self.regs.read(Operand.vgpr(4)), 0)
 
 
 if __name__ == "__main__":
