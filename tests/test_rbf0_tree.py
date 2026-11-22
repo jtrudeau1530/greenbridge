@@ -406,6 +406,19 @@ class OutputTest(unittest.TestCase):
         self.assertIn("depth", result.stderr)
         self.assertCountEqual(os.listdir(self.root), ["deep.bin", "tree.json"])
 
+    @unittest.skipIf(os.name == "nt", "POSIX permission bits")
+    def test_report_keeps_the_usual_permission_bits(self):
+        out = os.path.join(self.root, "tree.json")
+        old = os.umask(0o022)
+        try:
+            rbf0_tree.write_json(out, [], {"resources": 0})
+            self.assertEqual(os.stat(out).st_mode & 0o777, 0o644)
+            os.chmod(out, 0o640)
+            rbf0_tree.write_json(out, [], {"resources": 0})
+            self.assertEqual(os.stat(out).st_mode & 0o777, 0o640)
+        finally:
+            os.umask(old)
+
     def test_root_filter_and_limit(self):
         with open(os.path.join(self.root, "00000000.bin"), "wb") as f:
             f.write(wide_blob())
