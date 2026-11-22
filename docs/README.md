@@ -53,7 +53,7 @@ method, scope and caveats. No game data is included.
 | [d3d12_xs_surface.md](d3d12_xs_surface.md) | The 116-slot `d3d12_xs.dll` export surface; 83/83 standard GUIDs match the PC SDK. |
 | [d3d12_command_objects.md](d3d12_command_objects.md) | Measured command queue/list/fence/`PresentX` surface; verified vs prior art vs open. |
 | [runtime_imports.md](runtime_imports.md) | The 16 shipped modules' measured imports and shim/host/unimplemented split. |
-| [saves.md](saves.md) | Save containers: `JSAV` (index + JSON story save, byte-exact rebuild), `ASAV` header, `SLAYER1` packed copy (not decoded); `tools/saves.py` and import into the offline `XGameSave` folder. |
+| [saves.md](saves.md) | Save containers: `JSAV` (index + JSON story save, byte-exact rebuild), `ASAV` header, `SLAYER1` packed copy (not decoded); `tools/saves.py` and import into the offline `XGameSave` folder; key hashes are case-sensitive joaat (`tools/save_keys.py`). |
 | [pipeline_check.md](pipeline_check.md) | Driver-level corpus check: 10/12 shards, 22,092 modules, 2,217 compute pipelines, 0 failures. |
 | [shader_validation.md](shader_validation.md) | Differential CPU/GPU validation design and the current CPU interpreter prototype. |
 | [fssm_crosscheck.md](fssm_crosscheck.md) | FSSM/RDNA2 facts cross-checked against SCARAB; code starts at `code_off + 0x28`. |
