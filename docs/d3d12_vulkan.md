@@ -1623,7 +1623,9 @@ The trace will enumerate them.
   matching resource flag, `COPY_DEST`, `RESOLVE_DEST`) or in a mix of read states (`DEPTH_READ` only with
   `ALLOW_DEPTH_STENCIL`, the shader-resource states not with `DENY_SHADER_RESOURCE`), never with a buffer-only or
   undefined state bit, while a buffer takes any bits except `RAYTRACING_ACCELERATION_STRUCTURE` without UAV access
-  (RTX 3060 / 610.88; the same rule applies to placed and reserved resources); `ALLOW_DEPTH_STENCIL` is accepted for every
+  (RTX 3060 / 610.88; the same rule applies to placed and reserved resources), or at all where the host reports no
+  ray tracing (an integrated Radeon without DXR, @aguedou-34 on #2462): the layer refuses it on a device with
+  neither KHR acceleration structures nor the XDXR builds; `ALLOW_DEPTH_STENCIL` is accepted for every
   format of the R32, R16, R24G8 and R32G8X24 families and nothing else; a clear value needs a render target or depth
   buffer and a format of the resource's family; descriptor heaps may have zero descriptors; non-monitored fences are
   refused; a null output is `S_FALSE` (a capability check) except for `CreateCommandQueue`, which answers

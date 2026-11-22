@@ -1165,14 +1165,20 @@ const char* heap_desc_refusal(const D3D12_HEAP_DESC& desc) {
 // cross-adapter sharing.
 // The initial state a committed, placed or reserved resource may start in, as the host runtime answers it
 // (d3d12_vulkan_device_test's compare_placed_reserved and its "committed: ... state" cases, RTX 3060 / 610.88).
-// A buffer takes any bits, unknown ones too, except RAYTRACING_ACCELERATION_STRUCTURE without UAV access. A texture
+// A buffer takes any bits, unknown ones too, except RAYTRACING_ACCELERATION_STRUCTURE without UAV access, or at all
+// on a device without acceleration structures (the host refuses it where OPTIONS5 reports no ray tracing: an
+// integrated Radeon, measured by @aguedou-34 on #2462; here, a device with neither the KHR acceleration structures
+// nor the XDXR builds). A texture
 // takes exactly GENERIC_READ, or one write state alone (RENDER_TARGET, UNORDERED_ACCESS and DEPTH_WRITE need the
 // matching resource flag), or any mix of read states (DEPTH_READ needs ALLOW_DEPTH_STENCIL; the shader-resource
 // states are refused with DENY_SHADER_RESOURCE). The buffer-only bits (vertex/constant, index, indirect, stream
 // output, acceleration structure) and undefined bits are refused on a texture, also inside a mix.
-const char* initial_state_refusal(bool buffer, UINT flags, D3D12_RESOURCE_STATES state) {
+const char* initial_state_refusal(bool buffer, UINT flags, D3D12_RESOURCE_STATES state,
+                                  bool acceleration_structures) {
     const UINT s = UINT(state);
     if (buffer) {
+        if ((s & D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE) && !acceleration_structures)
+            return "acceleration-structure state on a device without acceleration structures";
         if ((s & D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE) &&
             !(flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))
             return "acceleration-structure state on a buffer without UAV access";
@@ -1209,7 +1215,7 @@ const char* initial_state_refusal(bool buffer, UINT flags, D3D12_RESOURCE_STATES
 
 const char* committed_resource_refusal(const D3D12_HEAP_PROPERTIES& heap, D3D12_HEAP_FLAGS heap_flags,
                                        const D3D12_RESOURCE_DESC& desc, D3D12_RESOURCE_STATES state,
-                                       const D3D12_CLEAR_VALUE* clear) {
+                                       const D3D12_CLEAR_VALUE* clear, bool acceleration_structures) {
     if (const char* why = heap_properties_refusal(heap)) return why;
     // The DENY flags of a committed resource's heap are the runtime's to choose; most other bits are refused too.
     constexpr UINT committed_heap_flags = D3D12_HEAP_FLAG_SHARED | D3D12_HEAP_FLAG_ALLOW_DISPLAY |
@@ -1236,7 +1242,7 @@ const char* committed_resource_refusal(const D3D12_HEAP_PROPERTIES& heap, D3D12_
     if (heap.Type == D3D12_HEAP_TYPE_READBACK && (uav || (UINT(state) & ~UINT(D3D12_RESOURCE_STATE_COPY_DEST))))
         return "readback heap state or UAV";
 
-    if (const char* why = initial_state_refusal(buffer, flags, state)) return why;
+    if (const char* why = initial_state_refusal(buffer, flags, state, acceleration_structures)) return why;
 
     if (buffer) {
         if (!desc.Width || desc.Height != 1 || desc.DepthOrArraySize != 1 || desc.MipLevels != 1 ||
@@ -3611,6 +3617,10 @@ public:
 
     bool ok() const { return state_.context && state_.context->loaded(); }
     const VulkanDeviceInfo& info() const { return state_.info; }
+    // Acceleration-structure resources work: KHR builds, or the XDXR records (which need the GPU address arena).
+    bool acceleration_structures() const {
+        return state_.info.ray_tracing || (state_.info.xdxr_acceleration_structures && state_.info.buffer_device_address);
+    }
     bool upload_in_vram() const { return state_.upload_in_vram; }
     leonida::VulkanContext& context() { return *state_.context; }
     const leonida::BindlessSet* bindless() const { return state_.bindless.get(); }
@@ -4625,7 +4635,8 @@ public:
         if (!heap || !desc) return d3d12_trace::result(method, E_INVALIDARG);
         // The host runtime's argument checks (D3D-49). A refusal is logged once per reason and dimension, since a
         // game that trips one (for example with an Xbox-only flag through slot 76) gets no resource.
-        if (const char* why = committed_resource_refusal(*heap, heap_flags, *desc, state, clear)) {
+        if (const char* why = committed_resource_refusal(*heap, heap_flags, *desc, state, clear,
+                                                         acceleration_structures())) {
             log_once((std::string("CreateCommittedResource refused (") + why + "), dimension").c_str(),
                      desc->Dimension);
             return d3d12_trace::result(method, E_INVALIDARG);
@@ -4861,7 +4872,8 @@ public:
         // an upload or readback heap (COPY_DEST in an upload heap, GENERIC_READ in a readback heap), where a
         // committed buffer must start in GENERIC_READ or COPY_DEST. UAV access is refused there all the same.
         const D3D12_HEAP_PROPERTIES default_heap{D3D12_HEAP_TYPE_DEFAULT};
-        const char* why = committed_resource_refusal(default_heap, D3D12_HEAP_FLAG_NONE, *desc, state, clear);
+        const char* why = committed_resource_refusal(default_heap, D3D12_HEAP_FLAG_NONE, *desc, state, clear,
+                                                     acceleration_structures());
         const D3D12_HEAP_TYPE heap_type = heap->properties().Type;
         if (!why && (heap_type == D3D12_HEAP_TYPE_UPLOAD || heap_type == D3D12_HEAP_TYPE_READBACK) &&
             (desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))
@@ -6013,7 +6025,8 @@ private:
             }
             backing.MipLevels = desc->MipLevels;
         }
-        if (const char* why = committed_resource_refusal(heap, D3D12_HEAP_FLAG_NONE, backing, state, clear)) {
+        if (const char* why = committed_resource_refusal(heap, D3D12_HEAP_FLAG_NONE, backing, state, clear,
+                                                         acceleration_structures())) {
             log_once((std::string("CreateReservedResource refused (") + why + "), dimension").c_str(),
                      desc->Dimension);
             return E_INVALIDARG;
