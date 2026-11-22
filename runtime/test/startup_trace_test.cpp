@@ -17,6 +17,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -50,6 +51,7 @@ constexpr uint32_t kCallRetOffset = 10;             // sub rsp,0x28 (4) + call [
 constexpr uint32_t kFaultRva = kTextRva + 0x220;
 constexpr const char* kImageName = "trace_image.bin";
 constexpr const char* kDebugText = "leonida trace probe \"quoted\"";
+constexpr const char* kAnsiText = "caf\xe9 probe";  // 0xE9: 'é' in code page 1252, never valid alone in UTF-8
 
 uint32_t caller_rva(int i) { return kCallerBase + 0x10u * static_cast<uint32_t>(i); }
 uint32_t return_rva(int i) { return caller_rva(i) + kCallRetOffset; }
@@ -165,6 +167,39 @@ void test_disabled_is_silent() {
     check(rt::startup_trace::quote("a\"b\\c\n\x01") == "\"a\\\"b\\\\c\\n\\u0001\"", "JSON string escaping");
 }
 
+// --trace runs before the loader reads anything, so it must never replace an existing file (an input such as the
+// image itself could be named by mistake): open() refuses it with EEXIST and leaves its bytes as they were.
+void test_existing_file_is_kept(const fs::path& dir) {
+    const std::vector<uint8_t> bytes = {'M', 'Z', 0x90, 0x00, 'k', 'e', 'e', 'p'};
+    const fs::path existing = write_file(dir / "existing_input.bin", bytes);
+    int error = 0;
+    check(!rt::startup_trace::open(existing.c_str(), &error), "open() refuses a file that already exists");
+    check(error == EEXIST, "the refusal reports EEXIST");
+    check(!rt::startup_trace::enabled(), "the trace stays off after a refused open()");
+    std::ifstream in(existing, std::ios::binary);
+    const std::vector<uint8_t> after((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    check(after == bytes, "the existing file's bytes survive");
+}
+
+// What a strict reader expects for OutputDebugStringA text: the ANSI code page converted to UTF-8.
+std::string ansi_as_utf8(const char* a) {
+    const int len = static_cast<int>(std::strlen(a));
+    const int chars = MultiByteToWideChar(CP_ACP, 0, a, len, nullptr, 0);
+    std::wstring w(static_cast<size_t>(chars), L'\0');
+    MultiByteToWideChar(CP_ACP, 0, a, len, w.data(), chars);
+    const int bytes = WideCharToMultiByte(CP_UTF8, 0, w.data(), chars, nullptr, 0, nullptr, nullptr);
+    std::string s(static_cast<size_t>(bytes), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, w.data(), chars, s.data(), bytes, nullptr, nullptr);
+    return s;
+}
+
+bool valid_utf8(const fs::path& p) {
+    std::ifstream in(p, std::ios::binary);
+    const std::string all((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    return all.empty() ||
+           MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, all.data(), static_cast<int>(all.size()), nullptr, 0) > 0;
+}
+
 void test_trace(const fs::path& dir) {
     const fs::path image = write_file(dir / kImageName, make_image());
     const fs::path trace = dir / "trace.jsonl";
@@ -175,6 +210,7 @@ void test_trace(const fs::path& dir) {
         reinterpret_cast<VoidFn>(m.base + caller_rva(0))(nullptr);  // unimplemented import
         reinterpret_cast<VoidFn>(m.base + caller_rva(0))(nullptr);  // second call: no second event
         reinterpret_cast<VoidFn>(m.base + caller_rva(1))(kDebugText);
+        reinterpret_cast<VoidFn>(m.base + caller_rva(1))(kAnsiText);
         check(call_faulting(m.base + kFaultRva), "the access violation reached the test's handler");
         rt::startup_trace::event("exit", "\"code\":0");
     }
@@ -200,6 +236,11 @@ void test_trace(const fs::path& dir) {
 
     const std::string* d = find_line(lines, "debug_string");
     check(has(d, "\"text\":\"leonida trace probe \\\"quoted\\\"\""), "debug_string carries the escaped text");
+    const std::string ansi = "\"text\":\"" + ansi_as_utf8(kAnsiText) + "\"";
+    bool ansi_found = false;
+    for (auto& l : lines) ansi_found |= l.find("\"kind\":\"debug_string\"") != std::string::npos && l.find(ansi) != std::string::npos;
+    check(ansi_found, "an ANSI debug string with a byte above 0x7f is written as UTF-8");
+    check(valid_utf8(trace), "the whole trace is valid UTF-8");
 
     const std::string* e = find_line(lines, "exception");
     check(has(e, "\"code\":\"0xc0000005\""), "exception code");
@@ -216,6 +257,7 @@ int wmain() {
     try {
         const fs::path dir = test_dir();
         test_disabled_is_silent();
+        test_existing_file_is_kept(dir);
         test_trace(dir);
         std::error_code ec;
         fs::remove_all(dir, ec);

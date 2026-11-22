@@ -275,7 +275,10 @@ Share only the lines prefixed with `[d3d12-trace]`. Other runtime diagnostics ar
 ### Startup trace: `--trace FILE`
 
 `--trace FILE` (with `--dry-run`, `--init` or `--run`, before the `--` separator) writes one JSON object per line
-to FILE, flushed per event so the file survives a crash ([shims/startup_trace.h](shims/startup_trace.h)):
+to FILE, flushed per event so the file survives a crash ([shims/startup_trace.h](shims/startup_trace.h)). FILE must
+not exist yet: the trace is created before the loader reads anything, so gta6rt refuses an existing path (exit code 2)
+rather than risk truncating an input such as the image. The file is UTF-8; `OutputDebugStringA` text is converted
+from the ANSI code page.
 
 | `kind` | When | Fields |
 |---|---|---|

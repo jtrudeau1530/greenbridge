@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <cwchar>
 #include <map>
 #include <mutex>
 #include <set>
@@ -331,13 +332,19 @@ std::string module_offset(uint64_t address) {
             }
     }
     HMODULE host = nullptr;
-    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                           reinterpret_cast<LPCSTR>(address), &host) && host) {
-        char path[MAX_PATH] = {};
-        GetModuleFileNameA(host, path, MAX_PATH);
-        const char* slash = std::strrchr(path, '\\');
+    if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           reinterpret_cast<LPCWSTR>(address), &host) && host) {
+        // Wide, then UTF-8: the ANSI form would put code-page bytes into the trace's JSON lines.
+        wchar_t path[MAX_PATH] = {};
+        const DWORD len = GetModuleFileNameW(host, path, MAX_PATH);
+        const wchar_t* slash = std::wcsrchr(path, L'\\');
+        const wchar_t* file = slash ? slash + 1 : path;
+        const int wlen = len ? static_cast<int>(path + len - file) : 0;
+        const int bytes = wlen > 0 ? WideCharToMultiByte(CP_UTF8, 0, file, wlen, nullptr, 0, nullptr, nullptr) : 0;
+        std::string name(bytes > 0 ? bytes : 0, '\0');
+        if (bytes > 0) WideCharToMultiByte(CP_UTF8, 0, file, wlen, name.data(), bytes, nullptr, nullptr);
         std::snprintf(b, sizeof b, "+0x%llx", static_cast<unsigned long long>(address - reinterpret_cast<uint64_t>(host)));
-        return std::string("host:") + (slash ? slash + 1 : path) + b;
+        return "host:" + name + b;
     }
     std::snprintf(b, sizeof b, "0x%llx", static_cast<unsigned long long>(address));
     return b;

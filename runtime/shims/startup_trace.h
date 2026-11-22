@@ -22,6 +22,7 @@
 #include <windows.h>
 
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -121,20 +122,33 @@ inline std::string stack_from(const CONTEXT& start_context) {
     return out + "]";
 }
 
+inline std::string utf8_from_wide(const wchar_t* w, int len) {
+    const int bytes = len > 0 ? WideCharToMultiByte(CP_UTF8, 0, w, len, nullptr, 0, nullptr, nullptr) : 0;
+    std::string s(bytes > 0 ? bytes : 0, '\0');
+    if (bytes > 0) WideCharToMultiByte(CP_UTF8, 0, w, len, s.data(), bytes, nullptr, nullptr);
+    return s;
+}
+
+// OutputDebugStringA text is in the ANSI code page, not UTF-8: convert it, or a byte such as 0xE9 would land in the
+// file as is and break the JSON lines for a strict UTF-8 reader.
+inline std::string utf8_from_ansi(const char* a, int len) {
+    const int chars = len > 0 ? MultiByteToWideChar(CP_ACP, 0, a, len, nullptr, 0) : 0;
+    if (chars <= 0) return {};
+    std::wstring w(static_cast<size_t>(chars), L'\0');
+    MultiByteToWideChar(CP_ACP, 0, a, len, w.data(), chars);
+    return utf8_from_wide(w.data(), chars);
+}
+
 inline std::string debug_text(const EXCEPTION_RECORD& r) {
     // Parameters: [0] length in characters including the terminator, [1] the string.
     if (r.NumberParameters < 2 || !r.ExceptionInformation[1]) return {};
     const size_t n = static_cast<size_t>(r.ExceptionInformation[0]);
     if (r.ExceptionCode == kDbgPrintWide) {
         const auto* w = reinterpret_cast<const wchar_t*>(r.ExceptionInformation[1]);
-        const int len = static_cast<int>(n ? n - 1 : wcslen(w));
-        const int bytes = WideCharToMultiByte(CP_UTF8, 0, w, len, nullptr, 0, nullptr, nullptr);
-        std::string s(bytes > 0 ? bytes : 0, '\0');
-        if (bytes > 0) WideCharToMultiByte(CP_UTF8, 0, w, len, s.data(), bytes, nullptr, nullptr);
-        return s;
+        return utf8_from_wide(w, static_cast<int>(n ? n - 1 : wcslen(w)));
     }
     const auto* a = reinterpret_cast<const char*>(r.ExceptionInformation[1]);
-    return std::string(a, n ? n - 1 : strlen(a));
+    return utf8_from_ansi(a, static_cast<int>(n ? n - 1 : strlen(a)));
 }
 
 inline LONG CALLBACK handler(EXCEPTION_POINTERS* info) {
@@ -166,13 +180,17 @@ inline LONG CALLBACK handler(EXCEPTION_POINTERS* info) {
 }
 }  // namespace detail
 
-// Opens (truncates) the trace file and installs the exception handler. Returns false if the file cannot be opened.
-inline bool open(const wchar_t* path) {
+// Creates the trace file and installs the exception handler. The file must not exist yet ("x" mode): the trace is
+// opened before the loader reads anything, so overwriting would let `--trace` destroy an input, such as the image
+// itself. Returns false if the file exists or cannot be created; `error`, when given, receives the errno.
+inline bool open(const wchar_t* path, int* error = nullptr) {
     {
         const std::lock_guard lock(detail::mutex);
         if (detail::file) return true;
-        if (_wfopen_s(&detail::file, path, L"wb") != 0 || !detail::file) {
+        const errno_t e = _wfopen_s(&detail::file, path, L"wxb");
+        if (e != 0 || !detail::file) {
             detail::file = nullptr;
+            if (error) *error = e ? e : EINVAL;
             return false;
         }
         detail::start = std::chrono::steady_clock::now();

@@ -85,8 +85,9 @@ int wmain(int argc, wchar_t** argv) {
     if (overlay_dir.empty()) overlay_dir = game_dir / "overlay";
     rt::fs::configure(game_dir, overlay_dir);
     rt::d3d12_trace::set_enabled(trace_d3d12);
-    if (!trace_file.empty() && !rt::startup_trace::open(trace_file.c_str())) {
-        std::fprintf(stderr, "error: cannot open the trace file\n");
+    if (int trace_error = 0; !trace_file.empty() && !rt::startup_trace::open(trace_file.c_str(), &trace_error)) {
+        std::fprintf(stderr, trace_error == EEXIST ? "error: the trace file already exists; --trace only creates a new file\n"
+                                                   : "error: cannot create the trace file\n");
         return 2;
     }
 
