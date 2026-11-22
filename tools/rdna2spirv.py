@@ -931,15 +931,20 @@ class Gen:
             return
         if d["k"] != "sgpr" or d.get("n") != 2:
             raise Unsupported("s_mov_b64 destination")
+        lit_lo = lit_hi = None
         if s["k"] == "special" and s["t"] == "exec":
             lo = hi = self.exec_value()
         elif s["k"] == "sgpr" and s.get("n") == 2:
+            lit_lo = self.sgpr_imm.get(s["r"])
+            lit_hi = self.sgpr_imm.get(s["r"] + 1)
             lo, hi = self.load_reg("sgpr", s["r"]), self.load_reg("sgpr", s["r"] + 1)
         elif s["k"] == "imm":
             v = s["v"] & 0xFFFFFFFFFFFFFFFF
             if s["v"] < 0:
                 v = s["v"] & 0xFFFFFFFFFFFFFFFF
-            lo, hi = self.cu(v & 0xFFFFFFFF), self.cu(v >> 32)
+            lit_lo = v & 0xFFFFFFFF
+            lit_hi = (v >> 32) & 0xFFFFFFFF
+            lo, hi = self.cu(lit_lo), self.cu(lit_hi)
         elif s["k"] == "special" and s["t"] == "vcc":
             lo = hi = self.tmp()            # this lane's bit in both halves, as for EXEC
             self.emit(f"{lo} = OpLoad %uint %vcc")
@@ -947,6 +952,11 @@ class Gen:
             raise Unsupported("s_mov_b64 source")
         self.store_reg("sgpr", d["r"], lo)
         self.store_reg("sgpr", d["r"] + 1, hi)
+        if self.desc_cache_ok():
+            if lit_lo is not None:
+                self.sgpr_imm[d["r"]] = lit_lo
+            if lit_hi is not None:
+                self.sgpr_imm[d["r"] + 1] = lit_hi
 
     def compare(self, op, a, scalar, exec_only=False, mods=()):
         """v_cmp_* / s_cmp_*: lane result into VCC/SGPR mask (vector), SCC (scalar), or EXEC (v_cmpx)."""
@@ -3830,9 +3840,15 @@ class Gen:
             self.exec_half_write(0 if a[0]["t"] == "exec_lo" else 1, None if const is not None else self.src_u(src),
                                  const)
         elif op == "v_mov_b32" or op == "s_mov_b32":
+            lit_val = None
+            if op == "s_mov_b32" and a[0]["k"] == "sgpr" and self.desc_cache_ok():
+                if a[1]["k"] == "imm":
+                    lit_val = a[1]["v"] & 0xFFFFFFFF      # a literal S# word, see gather_addr_modes
+                elif a[1]["k"] == "sgpr":
+                    lit_val = self.sgpr_imm.get(a[1]["r"])
             self.dst(a[0], self.src_u(a[1]))
-            if op == "s_mov_b32" and a[0]["k"] == "sgpr" and a[1]["k"] == "imm" and self.desc_cache_ok():
-                self.sgpr_imm[a[0]["r"]] = a[1]["v"] & 0xFFFFFFFF      # a literal S# word, see gather_addr_modes
+            if lit_val is not None:
+                self.sgpr_imm[a[0]["r"]] = lit_val
         elif op == "s_mov_b64":
             self.mov64(a[0], a[1])
         elif op in ("v_max3_f32", "v_min3_f32"):
@@ -5919,7 +5935,10 @@ class Gen:
             self.dst(a[0], self.tou(f))
         elif op == "s_movk_i32":
             v = a[1]["v"] & 0xFFFF
-            self.dst(a[0], self.cu(v - 0x10000 if v & 0x8000 else v))
+            val = (v - 0x10000 if v & 0x8000 else v) & 0xFFFFFFFF
+            self.dst(a[0], self.cu(val))
+            if a[0]["k"] == "sgpr" and self.desc_cache_ok():
+                self.sgpr_imm[a[0]["r"]] = val
         elif op in ("s_cmov_b32", "s_cmovk_i32"):
             # D = SCC ? S0 : D (s_cmovk_i32: S0 is the 16-bit immediate, sign-extended). SCC is read, not written.
             if a[0]["k"] != "sgpr":
