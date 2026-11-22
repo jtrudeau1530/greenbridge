@@ -275,6 +275,92 @@ def ref_simd_mul_f16(
     return result
 
 
+@dataclass
+class StatusFlags:
+    """Architectural floating-point status flags and condition codes."""
+    invalid: bool = False
+    overflow: bool = False
+    underflow: bool = False
+    inexact: bool = False
+    zero: bool = False
+    negative: bool = False
+    denormal: bool = False
+    infinite: bool = False
+    nan: bool = False
+
+
+def compute_f16_mantissa_product_carry(s0_bits: int, s1_bits: int) -> Tuple[int, int]:
+    """Compute product of normalized significands and carry-out bit.
+
+    In IEEE 754 binary16, normal numbers have an implicit leading 1:
+      significand = 1024 + mantissa (in range [1024, 2047]).
+    Significand product is in range [1024^2, 2047^2] = [2^20, ~4 * 2^20).
+    Carry out is 1 if product >= 2^21, which requires right-shift normalization.
+    """
+    _, exp0, mant0 = split_f16(s0_bits)
+    _, exp1, mant1 = split_f16(s1_bits)
+
+    sig0 = (1024 | mant0) if exp0 > 0 else mant0
+    sig1 = (1024 | mant1) if exp1 > 0 else mant1
+
+    raw_prod = sig0 * sig1
+    carry = 1 if raw_prod >= (1 << 21) else 0
+    return raw_prod, carry
+
+
+def evaluate_v_mul_f16_flags(s0_bits: int, s1_bits: int, res_bits: int) -> StatusFlags:
+    """Evaluate condition codes and IEEE 754 exception flags for v_mul_f16."""
+    flags = StatusFlags()
+
+    s0 = s0_bits & MASK16
+    s1 = s1_bits & MASK16
+    res = res_bits & MASK16
+
+    # Signaling NaN or Invalid Operation (0 * inf)
+    if is_snan_f16(s0) or is_snan_f16(s1):
+        flags.invalid = True
+    elif (is_zero_f16(s0) and is_inf_f16(s1)) or (is_inf_f16(s0) and is_zero_f16(s1)):
+        flags.invalid = True
+
+    # NaN result
+    if is_nan_f16(res):
+        flags.nan = True
+        return flags
+
+    # Infinite result
+    if is_inf_f16(res):
+        flags.infinite = True
+        if not (is_inf_f16(s0) or is_inf_f16(s1)):
+            flags.overflow = True
+            flags.inexact = True
+
+    # Zero result
+    if is_zero_f16(res):
+        flags.zero = True
+        if not (is_zero_f16(s0) or is_zero_f16(s1)):
+            flags.underflow = True
+            flags.inexact = True
+
+    # Sign flag
+    if (res >> 15) & 1:
+        flags.negative = True
+
+    # Denormal operand or result
+    if is_subnormal_f16(s0) or is_subnormal_f16(s1) or is_subnormal_f16(res):
+        flags.denormal = True
+        if is_subnormal_f16(res) and not (is_subnormal_f16(s0) or is_subnormal_f16(s1)):
+            flags.underflow = True
+            flags.inexact = True
+
+    # Check for inexact rounding on finite numbers
+    if not (flags.invalid or flags.overflow or is_zero_f16(res) or is_inf_f16(res)):
+        exact_bits = ref_mul_f16_rational(s0, s1)
+        if exact_bits != res:
+            flags.inexact = True
+
+    return flags
+
+
 class RegisterFile:
     """Architectural register model supporting 32-bit VGPR/SGPR storage and 16-bit halfword access."""
 
@@ -871,6 +957,91 @@ class TestRegisterAliasing(unittest.TestCase):
             interp.execute_asm("v_mul_f16 v0.l, v0.l, 2.0")
 
         self.assertEqual(bits_to_f16(interp.reg_file.get_vgpr_half(0, hi=False)), 32.0)
+
+
+class TestConditionCodesAndStatusFlags(unittest.TestCase):
+    """Unit tests for condition codes, IEEE 754 status flags, and mantissa product carry."""
+
+    def test_exact_finite_flags(self) -> None:
+        s0 = f16_to_bits(2.0)
+        s1 = f16_to_bits(3.0)
+        res = ref_mul_f16(s0, s1)
+        flags = evaluate_v_mul_f16_flags(s0, s1, res)
+        self.assertFalse(flags.invalid)
+        self.assertFalse(flags.overflow)
+        self.assertFalse(flags.underflow)
+        self.assertFalse(flags.inexact)
+        self.assertFalse(flags.zero)
+        self.assertFalse(flags.negative)
+        self.assertFalse(flags.denormal)
+        self.assertFalse(flags.infinite)
+        self.assertFalse(flags.nan)
+
+    def test_overflow_and_infinite_flags(self) -> None:
+        s0 = MAX_FINITE_F16
+        s1 = POS_TWO_F16
+        res = ref_mul_f16(s0, s1)
+        self.assertEqual(res, POS_INF_F16)
+        flags = evaluate_v_mul_f16_flags(s0, s1, res)
+        self.assertTrue(flags.overflow)
+        self.assertTrue(flags.infinite)
+        self.assertTrue(flags.inexact)
+        self.assertFalse(flags.invalid)
+
+    def test_underflow_and_denormal_flags(self) -> None:
+        # Smallest normal * 0.5 -> subnormal
+        s0 = MIN_NORMAL_F16
+        s1 = POS_HALF_F16
+        res = ref_mul_f16(s0, s1)
+        self.assertTrue(is_subnormal_f16(res))
+        flags = evaluate_v_mul_f16_flags(s0, s1, res)
+        self.assertTrue(flags.denormal)
+        self.assertTrue(flags.underflow)
+        self.assertFalse(flags.overflow)
+
+    def test_invalid_operation_flags(self) -> None:
+        # 0 * inf is invalid operation
+        res = ref_mul_f16(POS_ZERO_F16, POS_INF_F16)
+        flags = evaluate_v_mul_f16_flags(POS_ZERO_F16, POS_INF_F16, res)
+        self.assertTrue(flags.invalid)
+        self.assertTrue(flags.nan)
+
+        # Signaling NaN triggers invalid operation flag
+        res_snan = ref_mul_f16(SNAN_F16, POS_TWO_F16)
+        flags_snan = evaluate_v_mul_f16_flags(SNAN_F16, POS_TWO_F16, res_snan)
+        self.assertTrue(flags_snan.invalid)
+        self.assertTrue(flags_snan.nan)
+
+    def test_zero_and_negative_flags(self) -> None:
+        # +0.0 * +2.0 = +0.0
+        res_pz = ref_mul_f16(POS_ZERO_F16, POS_TWO_F16)
+        flags_pz = evaluate_v_mul_f16_flags(POS_ZERO_F16, POS_TWO_F16, res_pz)
+        self.assertTrue(flags_pz.zero)
+        self.assertFalse(flags_pz.negative)
+
+        # -0.0 * +2.0 = -0.0
+        res_nz = ref_mul_f16(NEG_ZERO_F16, POS_TWO_F16)
+        flags_nz = evaluate_v_mul_f16_flags(NEG_ZERO_F16, POS_TWO_F16, res_nz)
+        self.assertTrue(flags_nz.zero)
+        self.assertTrue(flags_nz.negative)
+
+        # -3.0 * +2.0 = -6.0
+        s0 = f16_to_bits(-3.0)
+        s1 = f16_to_bits(2.0)
+        res_neg = ref_mul_f16(s0, s1)
+        flags_neg = evaluate_v_mul_f16_flags(s0, s1, res_neg)
+        self.assertFalse(flags_neg.zero)
+        self.assertTrue(flags_neg.negative)
+
+    def test_mantissa_product_carry(self) -> None:
+        # 1.0 * 1.0: mantissas are 1024 * 1024 = 2^20 -> carry = 0
+        _, carry0 = compute_f16_mantissa_product_carry(POS_ONE_F16, POS_ONE_F16)
+        self.assertEqual(carry0, 0)
+
+        # 1.5 * 1.5: significands are 1536 * 1536 = 2359296 >= 2^21 (2097152) -> carry = 1
+        f_1p5 = f16_to_bits(1.5)
+        _, carry1 = compute_f16_mantissa_product_carry(f_1p5, f_1p5)
+        self.assertEqual(carry1, 1)
 
 
 if __name__ == "__main__":
