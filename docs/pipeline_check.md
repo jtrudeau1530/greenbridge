@@ -6,6 +6,10 @@ constant contract. It is a driver-level check: it proves the modules and pipelin
 the Vulkan implementation, not that the shader results are correct. Value-level checks are in
 `docs/shader_validation.md`.
 
+The checker exits nonzero if a module fails to load, a pipeline fails to compile, or the requested final
+cache save fails. It still finishes checking the other entries and attempts the final save so the next run
+can reuse successful pipelines. Entries reported as skipped do not count as failures.
+
 ## Corpus
 
 The translated corpus is 26,503 entries: 2,236 vertex, 12,101 pixel, 2,689 compute, 9,282 mesh and
