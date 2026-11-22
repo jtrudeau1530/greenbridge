@@ -600,8 +600,9 @@ def _staged_entity_report(path):
         yield None
         return
 
-    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-    destination = os.path.realpath(path)
+    destination = _resolve_report_path(path)
+    parent = os.path.dirname(destination)
+    os.makedirs(parent, exist_ok=True)
     try:
         mode = os.stat(destination).st_mode
     except FileNotFoundError:
@@ -609,13 +610,21 @@ def _staged_entity_report(path):
     if mode is not None and not stat.S_ISREG(mode):
         raise OSError(f"placement report destination is not a regular file: {path}")
 
-    with tempfile.TemporaryDirectory(dir=os.path.dirname(destination), prefix=".world-index-") as directory:
-        staged = os.path.join(directory, "entities.jsonl")
+    # mkdtemp may normalize the returned parent on Windows. Keep the spelling used to create it.
+    directory = os.path.join(parent, os.path.basename(tempfile.mkdtemp(dir=parent, prefix=".world-index-")))
+    staged = os.path.join(directory, "entities.jsonl")
+    try:
         with open(staged, "w", encoding="utf-8", newline="\n") as handle:
             yield EntityRows(handle)
         if mode is not None:
             os.chmod(staged, mode & 0o777)
         os.replace(staged, destination)
+    finally:
+        if os.path.exists(staged):
+            if os.name == "nt":
+                os.chmod(staged, stat.S_IWRITE)
+            os.unlink(staged)
+        os.rmdir(directory)
 
 
 def main(argv=None):
