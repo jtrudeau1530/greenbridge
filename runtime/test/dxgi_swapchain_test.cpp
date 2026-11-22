@@ -458,6 +458,9 @@ int main() {
 
     // Frame 2: ResizeBuffers to explicit 37x19 on the unchanged 128x128 HWND, clear to green, read back all 703 pixels, Present.
     if (FAILED(sc->ResizeBuffers(2, 37, 19, DXGI_FORMAT_UNKNOWN, 0))) return fail("ResizeBuffers");
+    DXGI_SWAP_CHAIN_DESC1 preserved_format{};
+    if (FAILED(sc->GetDesc1(&preserved_format)) || preserved_format.Format != scd.Format)
+        return fail("ResizeBuffers with DXGI_FORMAT_UNKNOWN changed the format");
     const float green[4] = {0.0f, 1.0f, 0.0f, 1.0f};
     if (run_clear_readback_present(37, 19, green, 0, 255, 0) != 0) return 1;
 
@@ -618,9 +621,28 @@ int main() {
             return fail("GetRotation(nullptr) should return E_INVALIDARG");
     }
 
-    // Unsupported swapchain format must fail explicitly instead of silently downgrading to BGRA8.
-    if (sc->ResizeBuffers(2, 37, 19, DXGI_FORMAT_R32_UINT, 0) != DXGI_ERROR_UNSUPPORTED)
-        return fail("ResizeBuffers should reject unsupported format DXGI_FORMAT_R32_UINT");
+    constexpr DXGI_FORMAT invalid_formats[] = {
+        DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, DXGI_FORMAT_B8G8R8A8_UNORM_SRGB,
+        DXGI_FORMAT_R8G8B8A8_TYPELESS, DXGI_FORMAT_R32_UINT,
+    };
+    {
+        DXGI_SWAP_CHAIN_DESC1 before{}, after{};
+        if (FAILED(sc->GetDesc1(&before))) return fail("GetDesc1 before invalid formats");
+        const UINT node_masks[2] = {1, 1};
+        IUnknown* const present_queues[2] = {queue, queue};
+        for (DXGI_FORMAT format : invalid_formats) {
+            if (sc->ResizeBuffers(2, 64, 64, format, 0) != E_INVALIDARG ||
+                sc->ResizeBuffers1(2, 64, 64, format, 0, node_masks, present_queues) != E_INVALIDARG)
+                return fail("ResizeBuffers and ResizeBuffers1 should reject invalid flip-model formats");
+        }
+        if (FAILED(sc->GetDesc1(&after)) || after.Format != before.Format || after.BufferCount != before.BufferCount ||
+            after.Width != before.Width || after.Height != before.Height)
+            return fail("Invalid format changed the existing swapchain");
+        ID3D12Resource* buffer = nullptr;
+        if (FAILED(sc->GetBuffer(sc->GetCurrentBackBufferIndex(), IID_PPV_ARGS(&buffer))) || !buffer)
+            return fail("GetBuffer after invalid swapchain formats");
+        buffer->Release();
+    }
 
     // Measured on host DXGI (RTX 5070 and WARP): DXGI_PRESENT_TEST returns S_OK without presenting, so the back
     // buffer index and last present count stay; a sync interval above 4 is DXGI_ERROR_INVALID_CALL and presents nothing.
@@ -798,6 +820,21 @@ int main() {
         HWND hwnd2 = create_test_window(200, 150);
         if (!hwnd2) return fail("CreateWindowExW (second)");
         GetClientRect(hwnd2, &cr);
+        const auto rejects_creation_format = [&](DXGI_FORMAT format) {
+            DXGI_SWAP_CHAIN_DESC1 invalid = scd;
+            invalid.Format = format;
+            IDXGISwapChain1* rejected = nullptr;
+            const HRESULT hr = factory->CreateSwapChainForHwnd(queue, hwnd2, &invalid, nullptr, nullptr, &rejected);
+            if (rejected) {
+                rejected->Release();
+                return false;
+            }
+            return hr == DXGI_ERROR_INVALID_CALL;
+        };
+        if (!rejects_creation_format(DXGI_FORMAT_UNKNOWN))
+            return fail("CreateSwapChainForHwnd accepted DXGI_FORMAT_UNKNOWN");
+        for (DXGI_FORMAT format : invalid_formats)
+            if (!rejects_creation_format(format)) return fail("CreateSwapChainForHwnd invalid flip-model format");
         DXGI_SWAP_CHAIN_DESC1 zd = scd;
         zd.Width = 0;
         zd.Height = 0;
