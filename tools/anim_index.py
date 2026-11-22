@@ -65,7 +65,7 @@ def _printable(data):
     if not data:
         return False
     sample = data[:512]
-    good = sum(1 for b in sample if 9 <= b < 127 or b in (10, 13))
+    good = sum(1 for b in sample if 32 <= b < 127 or b in (9, 10, 13))
     return len(sample) >= 64 and good / len(sample) > 0.9
 
 
