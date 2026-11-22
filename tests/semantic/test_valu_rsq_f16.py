@@ -39,7 +39,9 @@ from __future__ import annotations
 import math
 import struct
 import unittest
-from typing import Optional, Tuple
+from dataclasses import dataclass, field
+from enum import Enum, auto
+from typing import Dict, List, Optional, Tuple, Union
 
 # IEEE-754 binary16 (half-precision) architectural constants
 SIGN_MASK_16: int = 0x8000
@@ -208,6 +210,130 @@ def oracle_v_rsq_f16(
     return f16_to_bits(res_float)
 
 
+# ---------------------------------------------------------------------------
+# Symbolic AST Opcode Definitions and Typed Expressions
+# ---------------------------------------------------------------------------
+
+class OperandType(Enum):
+    VGPR = auto()
+    SGPR = auto()
+    INLINE_CONST = auto()
+    LITERAL_CONST = auto()
+
+
+class HalfwordSelect(Enum):
+    LOW_16 = auto()
+    HIGH_16 = auto()
+
+
+@dataclass(frozen=True)
+class ASTOperand:
+    op_type: OperandType
+    reg_index: int = 0
+    half: HalfwordSelect = HalfwordSelect.LOW_16
+    abs_mod: bool = False
+    neg_mod: bool = False
+    literal_val: Optional[int] = None
+
+    def validate(self) -> None:
+        if self.op_type == OperandType.VGPR:
+            if not (0 <= self.reg_index <= 255):
+                raise ValueError(f"VGPR index out of range: v{self.reg_index}")
+        elif self.op_type == OperandType.SGPR:
+            if not (0 <= self.reg_index <= 105):
+                raise ValueError(f"SGPR index out of range: s{self.reg_index}")
+        elif self.op_type == OperandType.LITERAL_CONST:
+            if self.literal_val is None or not (0 <= self.literal_val <= 0xFFFF):
+                raise ValueError(f"Invalid literal constant: {self.literal_val}")
+
+    def to_assembly(self) -> str:
+        half_suffix = ".l" if self.half == HalfwordSelect.LOW_16 else ".h"
+        if self.op_type == OperandType.VGPR:
+            base = f"v{self.reg_index}{half_suffix}"
+        elif self.op_type == OperandType.SGPR:
+            base = f"s{self.reg_index}{half_suffix}"
+        elif self.op_type == OperandType.INLINE_CONST:
+            base = f"{bits_to_f16(self.literal_val or 0):.2f}"
+        else:
+            base = f"{self.literal_val:#06x}"
+
+        if self.abs_mod:
+            base = f"|{base}|"
+        if self.neg_mod:
+            base = f"-{base}"
+        return base
+
+
+@dataclass(frozen=True)
+class ASTRsqF16:
+    dst: ASTOperand
+    src0: ASTOperand
+    clamp: bool = False
+    omod: str = "none"
+    ftz: bool = False
+
+    def validate(self) -> None:
+        self.dst.validate()
+        self.src0.validate()
+        if self.dst.op_type != OperandType.VGPR:
+            raise TypeError("Destination operand for v_rsq_f16 must be a VGPR")
+        if self.omod not in ("none", "mul:2", "mul:4", "div:2"):
+            raise ValueError(f"Invalid omod modifier: {self.omod}")
+
+    def to_assembly(self) -> str:
+        parts = ["v_rsq_f16", f"{self.dst.to_assembly()},", self.src0.to_assembly()]
+        if self.clamp:
+            parts.append("clamp")
+        if self.omod != "none":
+            parts.append(self.omod)
+        return " ".join(parts)
+
+    def evaluate_symbolic(self, env: Dict[str, int]) -> int:
+        self.validate()
+        if self.src0.op_type == OperandType.VGPR:
+            var_name = f"v{self.src0.reg_index}{'.l' if self.src0.half == HalfwordSelect.LOW_16 else '.h'}"
+            src_val = env.get(var_name, 0)
+        elif self.src0.op_type == OperandType.SGPR:
+            var_name = f"s{self.src0.reg_index}{'.l' if self.src0.half == HalfwordSelect.LOW_16 else '.h'}"
+            src_val = env.get(var_name, 0)
+        elif self.src0.literal_val is not None:
+            src_val = self.src0.literal_val
+        else:
+            src_val = 0
+
+        return oracle_v_rsq_f16(
+            src_val,
+            abs_mod=self.src0.abs_mod,
+            neg_mod=self.src0.neg_mod,
+            clamp=self.clamp,
+            omod=self.omod,
+            ftz=self.ftz,
+        )
+
+
+@dataclass(frozen=True)
+class SymbolicExpr:
+    op: str
+    args: Tuple[Union[SymbolicExpr, str, float, int], ...]
+
+    def simplify(self) -> SymbolicExpr:
+        if self.op == "abs":
+            arg = self.args[0]
+            if isinstance(arg, SymbolicExpr):
+                if arg.op == "abs":
+                    return arg.simplify()
+                if arg.op == "neg":
+                    return SymbolicExpr("abs", (arg.args[0],)).simplify()
+        elif self.op == "neg":
+            arg = self.args[0]
+            if isinstance(arg, SymbolicExpr) and arg.op == "neg":
+                inner = arg.args[0]
+                if isinstance(inner, SymbolicExpr):
+                    return inner.simplify()
+                return inner  # type: ignore
+        return self
+
+
 class TestReferenceOracleRSQF16(unittest.TestCase):
     """Unit tests verifying the mathematical reference oracle for v_rsq_f16."""
 
@@ -273,6 +399,57 @@ class TestReferenceOracleRSQF16(unittest.TestCase):
         self.assertEqual(oracle_v_rsq_f16(H_MIN_SUBNORMAL, ftz=False), H_4096)
         # Under FTZ, flushes to 0.0 -> +inf
         self.assertEqual(oracle_v_rsq_f16(H_MIN_SUBNORMAL, ftz=True), H_POS_INF)
+
+
+class TestSymbolicASTRsqF16(unittest.TestCase):
+    """Unit tests verifying symbolic AST opcode representation and expressions."""
+
+    def test_ast_construction_and_formatting(self) -> None:
+        dst = ASTOperand(op_type=OperandType.VGPR, reg_index=0, half=HalfwordSelect.LOW_16)
+        src = ASTOperand(
+            op_type=OperandType.VGPR,
+            reg_index=1,
+            half=HalfwordSelect.HIGH_16,
+            abs_mod=True,
+        )
+        instr = ASTRsqF16(dst=dst, src0=src, clamp=True)
+        self.assertEqual(instr.to_assembly(), "v_rsq_f16 v0.l, |v1.h| clamp")
+
+    def test_ast_validation_rejects_invalid_dst(self) -> None:
+        dst_sgpr = ASTOperand(op_type=OperandType.SGPR, reg_index=0)
+        src = ASTOperand(op_type=OperandType.VGPR, reg_index=1)
+        instr = ASTRsqF16(dst=dst_sgpr, src0=src)
+        with self.assertRaises(TypeError):
+            instr.validate()
+
+    def test_ast_validation_rejects_out_of_range_vgpr(self) -> None:
+        dst_oob = ASTOperand(op_type=OperandType.VGPR, reg_index=300)
+        src = ASTOperand(op_type=OperandType.VGPR, reg_index=1)
+        instr = ASTRsqF16(dst=dst_oob, src0=src)
+        with self.assertRaises(ValueError):
+            instr.validate()
+
+    def test_symbolic_evaluation_with_env(self) -> None:
+        dst = ASTOperand(op_type=OperandType.VGPR, reg_index=5, half=HalfwordSelect.LOW_16)
+        src = ASTOperand(op_type=OperandType.VGPR, reg_index=6, half=HalfwordSelect.HIGH_16)
+        instr = ASTRsqF16(dst=dst, src0=src, clamp=False)
+
+        env = {"v6.h": H_FOUR}
+        res = instr.evaluate_symbolic(env)
+        self.assertEqual(res, H_HALF)
+
+    def test_symbolic_expression_simplification(self) -> None:
+        # abs(abs(x)) -> abs(x)
+        e1 = SymbolicExpr("abs", (SymbolicExpr("abs", ("x",)),))
+        self.assertEqual(e1.simplify(), SymbolicExpr("abs", ("x",)))
+
+        # abs(neg(x)) -> abs(x)
+        e2 = SymbolicExpr("abs", (SymbolicExpr("neg", ("y",)),))
+        self.assertEqual(e2.simplify(), SymbolicExpr("abs", ("y",)))
+
+        # neg(neg(z)) -> z
+        e3 = SymbolicExpr("neg", (SymbolicExpr("neg", ("z",)),))
+        self.assertEqual(e3.simplify(), "z")
 
 
 if __name__ == "__main__":
