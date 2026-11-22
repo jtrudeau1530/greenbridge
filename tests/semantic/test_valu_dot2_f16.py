@@ -1595,5 +1595,101 @@ class TestIEEE754BoundariesAndNaN(unittest.TestCase):
         self.assertEqual(res_neg, POS_ZERO)
 
 
+class TestNegativeControlsAndMutationDetection(unittest.TestCase):
+    """Negative controls, syntax rejection, and mutation detection tests."""
+
+    def test_invalid_register_indices_out_of_range(self) -> None:
+        with self.assertRaises(ValueError):
+            Reg(-1, RegType.VGPR)
+        with self.assertRaises(ValueError):
+            Reg(256, RegType.VGPR)
+        with self.assertRaises(ValueError):
+            Reg(999, RegType.SGPR)
+
+    def test_invalid_destination_type_sgpr_rejected(self) -> None:
+        with self.assertRaises(TypeError):
+            VDot2F16Instruction(
+                dst=Reg(0, RegType.SGPR),
+                src0=VOP3Operand(Reg(1, RegType.VGPR)),
+                src1=VOP3Operand(Reg(2, RegType.VGPR)),
+            )
+
+    def test_mutation_fmul_tampered_to_fadd(self) -> None:
+        """Sabotaged implementation using addition instead of multiplication is detected."""
+        s0 = pack_f16x2(TWO_F16, THREE_F16)
+        s1 = pack_f16x2(FOUR_F16, TWO_F16)
+        # Expected: 2*4 + 3*2 = 8 + 6 = 14.0
+        golden = oracle_v_dot2_f16(s0, s1)
+        self.assertEqual(bits_to_f16(golden), 14.0)
+
+        # Mutant: (2+4) + (3+2) = 6 + 5 = 11.0
+        mutant_val = add_f16(add_f16(TWO_F16, FOUR_F16), add_f16(THREE_F16, TWO_F16))
+        self.assertNotEqual(golden, mutant_val)
+
+    def test_mutation_fadd_tampered_to_fsub(self) -> None:
+        """Sabotaged implementation using subtraction instead of addition is detected."""
+        s0 = pack_f16x2(THREE_F16, TWO_F16)
+        s1 = pack_f16x2(TWO_F16, ONE_F16)
+        # Expected: 3*2 + 2*1 = 6 + 2 = 8.0
+        golden = oracle_v_dot2_f16(s0, s1)
+        self.assertEqual(bits_to_f16(golden), 8.0)
+
+        # Mutant: 3*2 - 2*1 = 6 - 2 = 4.0
+        p0 = mul_f16(THREE_F16, TWO_F16)
+        p1 = mul_f16(TWO_F16, ONE_F16)
+        mutant_val = add_f16(p0, apply_f16_modifiers(p1, False, True))
+        self.assertNotEqual(golden, mutant_val)
+
+    def test_mutation_accumulator_drop_detected(self) -> None:
+        """Sabotaged implementation dropping the accumulator is caught by oracle."""
+        s0 = pack_f16x2(ONE_F16, ONE_F16)
+        s1 = pack_f16x2(ONE_F16, ONE_F16)
+        acc = FIVE_F16
+        # Expected: 1*1 + 1*1 + 5 = 7.0
+        golden = oracle_v_dot2acc_f16(s0, s1, acc)
+        self.assertEqual(bits_to_f16(golden), 7.0)
+
+        # Mutant: 1*1 + 1*1 = 2.0 (accumulator omitted)
+        mutant_val = oracle_v_dot2_f16(s0, s1)
+        self.assertNotEqual(golden, mutant_val)
+
+    def test_mutation_clamp_removal_detected(self) -> None:
+        """Sabotaged implementation removing clamp is caught on saturated outputs."""
+        s0 = pack_f16x2(TWO_F16, TWO_F16)
+        s1 = pack_f16x2(TWO_F16, TWO_F16)
+        # Expected clamped: 2*2 + 2*2 = 8.0 clamped -> 1.0
+        golden = oracle_v_dot2_f16(s0, s1, clamp=True)
+        self.assertEqual(golden, ONE_F16)
+
+        # Mutant: unclamped 8.0
+        mutant_unclamped = oracle_v_dot2_f16(s0, s1, clamp=False)
+        self.assertNotEqual(golden, mutant_unclamped)
+
+    def test_mutation_op_sel_misrouting_detected(self) -> None:
+        """Sabotaged implementation reading wrong halfword is caught."""
+        # s0: lo=1.0, hi=4.0; s1: lo=2.0, hi=3.0
+        s0 = pack_f16x2(ONE_F16, FOUR_F16)
+        s1 = pack_f16x2(TWO_F16, THREE_F16)
+        # Normal op_sel (0,0), (1,1): 1*2 + 4*3 = 14.0
+        golden = oracle_v_dot2_f16(s0, s1)
+        self.assertEqual(bits_to_f16(golden), 14.0)
+
+        # Mutant: swapped to lo*lo + lo*hi: 1*2 + 1*3 = 5.0
+        mutant_misrouted = oracle_v_dot2_f16(s0, s1, op_sel=(0, 0), op_sel_hi=(0, 1))
+        self.assertNotEqual(golden, mutant_misrouted)
+
+    def test_mutation_neg_lo_inversion_detected(self) -> None:
+        """Sabotaged implementation ignoring negation modifier is caught."""
+        s0 = pack_f16x2(TWO_F16, THREE_F16)
+        s1 = pack_f16x2(TWO_F16, ONE_F16)
+        # neg on s0 lo: (-2)*2 + 3*1 = -4 + 3 = -1.0
+        golden = oracle_v_dot2_f16(s0, s1, neg0=(True, False))
+        self.assertEqual(bits_to_f16(golden), -1.0)
+
+        # Mutant: negation ignored -> 2*2 + 3*1 = 7.0
+        mutant_ignored_neg = oracle_v_dot2_f16(s0, s1, neg0=(False, False))
+        self.assertNotEqual(golden, mutant_ignored_neg)
+
+
 if __name__ == "__main__":
     unittest.main()
