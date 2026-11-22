@@ -3912,6 +3912,15 @@ class Gen:
             self.emit(f"{sh} = OpShiftLeftLogical %uint {hi} {self.cu(16)}")
             self.emit(f"{r} = OpBitwiseOr %uint {lo} {sh}")
             self.dst(a[0], r)
+        elif op == "v_cvt_off_f32_i4":
+            # RDNA ISA: D = CVT_OFF_TABLE[S0[3:0]], i.e. the 4-bit signed value / 16 (-0.5 .. 0.4375), exact in f32.
+            # Output modifiers (mul/div, clamp) apply to the result.
+            x = self.src_u(a[1])
+            i4, fi, r = self.tmp(), self.tmp(), self.tmp()
+            self.emit(f"{i4} = OpBitFieldSExtract %uint {x} {self.cu(0)} {self.cu(4)}")
+            self.emit(f"{fi} = OpConvertSToF %float {self.as_int(i4)}")
+            self.emit(f"{r} = OpFMul %float {fi} {self.fconst(0.0625)}")
+            self.dst(a[0], self.tou(self.clamp_mods(r, mods)))
         elif op == "v_rcp_iflag_f32":
             x = self.src_f(a[1])
             r = self.tmp()
