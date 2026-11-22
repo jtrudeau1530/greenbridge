@@ -1032,6 +1032,33 @@ int main() {
                    E_NOINTERFACE);
         }
         EXPECT(device->GetNodeCount() == 1);
+
+        // BC1 can be sampled, but it cannot be an attachment or a storage image.
+        if (d.bc) {
+            const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
+            Ref<ID3D12Device> host;
+            create_host_device(host);
+            for (const auto flags : {D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+                                     D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS}) {
+                const auto desc = texture_desc(8, 8, DXGI_FORMAT_BC1_UNORM, flags);
+                Ref<ID3D12Resource> image;
+                const auto create = [&](ID3D12Device* dev, Ref<ID3D12Resource>& out) {
+                    return dev->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON,
+                                                        nullptr, IID_PPV_ARGS(&out.p));
+                };
+                const HRESULT hr = create(device.p, image);
+                const bool supported = flags == D3D12_RESOURCE_FLAG_NONE;
+                EXPECT(hr == (supported ? S_OK : E_INVALIDARG));
+                EXPECT((image.p != nullptr) == supported);
+                if (host.p) {
+                    Ref<ID3D12Resource> native;
+                    EXPECT(create(host.p, native) == hr);
+                    EXPECT((native.p != nullptr) == supported);
+                }
+                const auto allocation = device->GetResourceAllocationInfo(0, 1, &desc);
+                EXPECT((allocation.SizeInBytes != UINT64_MAX) == supported);
+            }
+        }
         const D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_12_1, D3D_FEATURE_LEVEL_12_2};
         D3D12_FEATURE_DATA_FEATURE_LEVELS feature_levels{3, levels, D3D_FEATURE_LEVEL(0)};
         EXPECT(SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_FEATURE_LEVELS, &feature_levels,
