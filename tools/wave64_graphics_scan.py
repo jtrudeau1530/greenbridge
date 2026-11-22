@@ -22,11 +22,9 @@ static scan does not decide:
   `branch_condition` paths. Mask *arithmetic* (`s_and_saveexec_b64` and friends) is per-lane and exact; only
   the branch taken from it splits.
 
-Wave64 classification is the translator's own rule applied to parsed instructions (rdna2spirv.py, `g.wave64`:
-`WAVE64_RE` over op and operand text, or any `_b64` op with an exec/vcc operand), plus mesh unconditionally,
-and stages come from its `stage_of` (the carve index, not the file name) — so the scan classifies exactly what
-the translator classifies. Opcodes are counted from parsed instructions only, never from comments or operand
-text.
+Wave64 classification reads the adjacent FSSM wave-size flag, as the translator does. Without a usable
+header it falls back to mesh shader defaults and instruction markers. Stages come from the translator's
+stage lookup. Opcodes are counted from parsed instructions only, never from comments or operand text.
 
 Quad ops and `ds_swizzle`/`ds_bpermute` are left out on purpose: quads never cross the 32/32 half and the
 translator models the permute ops per 32-lane half, matching hardware.
@@ -41,6 +39,7 @@ import sys
 from collections import Counter
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import fssm_header  # noqa: E402
 import rdna2spirv  # noqa: E402  (same directory; WAVE64_RE, stage_of, base_op)
 from shader_ir import parse_file  # noqa: E402
 
@@ -63,8 +62,7 @@ GRAPHICS = ("vs", "ps", "gs")
 
 
 def wave64_rule(stage, insns):
-    """The translator's g.wave64, verbatim: a WAVE64_RE marker in op or operand text, or any _b64 op with an
-    exec/vcc operand; mesh shaders are wave64 regardless (rdna2spirv.py)."""
+    """The translator's fallback when a shader has no FSSM wave-size flag."""
     if stage == "ms":
         return True
     return any(rdna2spirv.WAVE64_RE.search(" ".join([i["op"]] + [x.get("t", "") for x in i["args"]])) or
@@ -121,7 +119,13 @@ def scan_directory(disasm):
     for path in paths:
         info = parse_file(path)
         stage = rdna2spirv.stage_of(info["name"], path)
-        wave64 = wave64_rule(stage, info["insns"])
+        fssm_path = rdna2spirv.native_paths(path, info["name"])[0]
+        try:
+            with open(fssm_path, "rb") as f:
+                wave_size = fssm_header.wave_size(f.read(fssm_header.WAVE_FLAGS_OFFSET + 4))
+        except OSError:
+            wave_size = None
+        wave64 = wave_size == 64 if wave_size is not None else wave64_rule(stage, info["insns"])
         if stage in per_stage:
             bucket = per_stage[stage]
             bucket["shaders"] += 1
