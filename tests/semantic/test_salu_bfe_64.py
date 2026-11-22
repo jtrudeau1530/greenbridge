@@ -339,6 +339,281 @@ class ReferenceOracleTests(unittest.TestCase):
         self.assertEqual(interp.scc, 1)
 
 
+class SgprPairAliasingTests(unittest.TestCase):
+    """Validation of full and overlapping SGPR pair aliasing for 64-bit scalar BFE."""
+
+    def setUp(self) -> None:
+        self.interp = ScalarAlu64Interpreter()
+
+    def test_interp_exact_destination_aliasing(self) -> None:
+        # Dest is exact same register pair as source (s[0:1] = s_bfe_u64 s[0:1], ctl)
+        self.interp.set_pair(0, 0x12345678_9ABCDEF0)
+        ctl_val = pack_bfe64_ctl(16, 32)
+        res, scc = self.interp.step("s_bfe_u64", "s[0:1]", "s[0:1]", ctl_val)
+        expected = (0x12345678_9ABCDEF0 >> 16) & 0xFFFFFFFF
+        self.assertEqual(res, expected)
+        self.assertEqual(self.interp.get_pair(0), expected)
+        self.assertEqual(scc, 1)
+
+    def test_interp_overlapping_pair_dest_high(self) -> None:
+        # Source is s[0:1], destination is s[1:2] (overlapping at s1)
+        self.interp.set_pair(0, 0x01234567_89ABCDEF)
+        self.interp.set_sgpr(2, 0xDEADBEEF)  # guard
+        ctl_val = pack_bfe64_ctl(32, 32)
+        res, scc = self.interp.step("s_bfe_u64", "s[1:2]", "s[0:1]", ctl_val)
+        self.assertEqual(res, 0x01234567)
+        # s0 must be untouched by write to s[1:2]
+        self.assertEqual(self.interp.get_sgpr(0), 0x89ABCDEF)
+        # s1 gets low dword of result
+        self.assertEqual(self.interp.get_sgpr(1), 0x01234567)
+        # s2 gets high dword of result
+        self.assertEqual(self.interp.get_sgpr(2), 0)
+        self.assertEqual(scc, 1)
+
+    def test_interp_overlapping_pair_dest_low(self) -> None:
+        # Source is s[1:2], destination is s[0:1] (overlapping at s1)
+        self.interp.set_sgpr(0, 0xCAFEBABE)  # guard
+        self.interp.set_pair(1, 0x5555AAAA_3333CCCC)
+        ctl_val = pack_bfe64_ctl(16, 32)
+        expected, expected_scc = ref_s_bfe_u64(0x5555AAAA_3333CCCC, ctl_val)
+        res, scc = self.interp.step("s_bfe_u64", "s[0:1]", "s[1:2]", ctl_val)
+        self.assertEqual(res, expected)
+        self.assertEqual(self.interp.get_pair(0), expected)
+        # s2 is untouched by write to s[0:1]
+        self.assertEqual(self.interp.get_sgpr(2), 0x5555AAAA)
+        self.assertEqual(scc, expected_scc)
+
+    def test_interp_ctl_register_aliased_with_source(self) -> None:
+        # Control word operand is s1 (the high dword of source pair s[0:1])
+        ctl_val = pack_bfe64_ctl(8, 16)
+        self.interp.set_sgpr(0, 0x12345678)
+        self.interp.set_sgpr(1, ctl_val)
+        res, scc = self.interp.step("s_bfe_u64", "s[2:3]", "s[0:1]", "s1")
+        # Source value is (ctl_val << 32) | 0x12345678
+        src = (ctl_val << 32) | 0x12345678
+        expected, exp_scc = ref_s_bfe_u64(src, ctl_val)
+        self.assertEqual(res, expected)
+        self.assertEqual(self.interp.get_pair(2), expected)
+        self.assertEqual(scc, exp_scc)
+
+    def test_interp_adjacent_sgprs_preserved(self) -> None:
+        # Ensure modifying s[4:5] does not corrupt s3 or s6
+        self.interp.set_sgpr(3, 0x33333333)
+        self.interp.set_sgpr(6, 0x66666666)
+        self.interp.set_pair(0, 0xAAAAAAAAAAAAAAAA)
+        self.interp.step("s_bfe_u64", "s[4:5]", "s[0:1]", pack_bfe64_ctl(0, 32))
+        self.assertEqual(self.interp.get_sgpr(3), 0x33333333)
+        self.assertEqual(self.interp.get_sgpr(6), 0x66666666)
+
+    def test_shader_exact_destination_aliasing(self) -> None:
+        c = pack_bfe64_ctl(16, 32)
+        val = 0x12345678_9ABCDEF0
+        expected = ref("s_bfe_u64", val, c)
+        lines = [
+            f"s_mov_b32 s0, {val & MASK32:#x}",
+            f"s_mov_b32 s1, {(val >> 32) & MASK32:#x}",
+            f"s_mov_b32 s4, {c:#x}",
+            "s_bfe_u64 s[0:1], s[0:1], s4",
+        ]
+        got, scc = run_lines(lines)
+        self.assertEqual(got, expected)
+        self.assertEqual(scc, 1)
+
+    def test_shader_overlapping_pair_s01_s12(self) -> None:
+        c = pack_bfe64_ctl(32, 16)
+        lines = [
+            "s_mov_b32 s0, 0x12345678",
+            "s_mov_b32 s1, 0x9ABC",
+            f"s_mov_b32 s4, {c:#x}",
+            "s_bfe_u64 s[1:2], s[0:1], s4",
+        ]
+        got, scc = run_lines_dst(lines, dst_lo=1)
+        self.assertEqual(got, 0x9ABC)
+        self.assertEqual(scc, 1)
+
+
+class SccUpdateTests(unittest.TestCase):
+    """Validation of Condition Code (SCC) semantics for 64-bit scalar bitfield instructions."""
+
+    def setUp(self) -> None:
+        self.interp = ScalarAlu64Interpreter()
+
+    def test_scc_four_corners_matrix_u64(self) -> None:
+        # Four corners: (lo==0, hi==0), (lo!=0, hi==0), (lo==0, hi!=0), (lo!=0, hi!=0)
+        cases = [
+            # (src, ctl, expected_scc, description)
+            (0, pack_bfe64_ctl(0, 32), 0, "lo=0, hi=0 -> scc=0"),
+            (0x12345678, pack_bfe64_ctl(0, 32), 1, "lo!=0, hi=0 -> scc=1"),
+            (0x12345678_00000000, pack_bfe64_ctl(32, 32), 1, "lo=0, hi!=0 extracted to lo -> scc=1"),
+            (0x00000001_00000000, pack_bfe64_ctl(0, 64), 1, "hi!=0 alone in 64-bit pair -> scc=1"),
+            (0x12345678_87654321, pack_bfe64_ctl(0, 64), 1, "lo!=0, hi!=0 -> scc=1"),
+        ]
+        for src, ctl_val, want_scc, desc in cases:
+            with self.subTest(desc=desc):
+                res, scc = self.interp.step("s_bfe_u64", "s[0:1]", src, ctl_val)
+                self.assertEqual(scc, want_scc)
+                lines = [
+                    f"s_mov_b32 s2, {src & MASK32:#x}",
+                    f"s_mov_b32 s3, {(src >> 32) & MASK32:#x}",
+                    f"s_mov_b32 s4, {ctl_val:#x}",
+                    "s_bfe_u64 s[0:1], s[2:3], s4",
+                ]
+                _, shader_scc = run_lines(lines)
+                self.assertEqual(shader_scc, want_scc)
+
+    def test_scc_four_corners_matrix_i64(self) -> None:
+        cases = [
+            (0, pack_bfe64_ctl(0, 16), 0, "zero -> scc=0"),
+            (0x0005, pack_bfe64_ctl(0, 4), 1, "positive in lo -> scc=1"),
+            (0x0008, pack_bfe64_ctl(0, 4), 1, "negative in lo sign extends into hi -> scc=1"),
+            (0x00000001_00000000, pack_bfe64_ctl(0, 64), 1, "positive in hi alone -> scc=1"),
+        ]
+        for src, ctl_val, want_scc, desc in cases:
+            with self.subTest(desc=desc):
+                res, scc = self.interp.step("s_bfe_i64", "s[0:1]", src, ctl_val)
+                self.assertEqual(scc, want_scc)
+                lines = [
+                    f"s_mov_b32 s2, {src & MASK32:#x}",
+                    f"s_mov_b32 s3, {(src >> 32) & MASK32:#x}",
+                    f"s_mov_b32 s4, {ctl_val:#x}",
+                    "s_bfe_i64 s[0:1], s[2:3], s4",
+                ]
+                _, shader_scc = run_lines(lines)
+                self.assertEqual(shader_scc, want_scc)
+
+    def test_scc_cleared_on_zero_result(self) -> None:
+        lines = [
+            "s_mov_b32 s5, 1",
+            "s_cmp_eq_u32 s5, 1",  # sets SCC = 1
+            "s_mov_b32 s2, 0",
+            "s_mov_b32 s3, 0",
+            f"s_mov_b32 s4, {pack_bfe64_ctl(0, 16):#x}",
+            "s_bfe_u64 s[0:1], s[2:3], s4",
+        ]
+        got, scc = run_lines(lines)
+        self.assertEqual(got, 0)
+        self.assertEqual(scc, 0)
+
+    def test_scc_set_on_nonzero_result(self) -> None:
+        lines = [
+            "s_mov_b32 s5, 0",
+            "s_cmp_eq_u32 s5, 1",  # clears SCC = 0
+            "s_mov_b32 s2, 0x42",
+            "s_mov_b32 s3, 0",
+            f"s_mov_b32 s4, {pack_bfe64_ctl(0, 8):#x}",
+            "s_bfe_u64 s[0:1], s[2:3], s4",
+        ]
+        got, scc = run_lines(lines)
+        self.assertEqual(got, 0x42)
+        self.assertEqual(scc, 1)
+
+    def test_scc_transitions_sequence(self) -> None:
+        self.interp.scc = 0
+        ctl_extract = pack_bfe64_ctl(0, 8)
+        ctl_zero = pack_bfe64_ctl(0, 0)
+
+        # Step 1: non-zero -> scc=1
+        self.interp.step("s_bfe_u64", "s[0:1]", 0xFF, ctl_extract)
+        self.assertEqual(self.interp.scc, 1)
+
+        # Step 2: zero width -> scc=0
+        self.interp.step("s_bfe_u64", "s[0:1]", 0xFF, ctl_zero)
+        self.assertEqual(self.interp.scc, 0)
+
+        # Step 3: non-zero signed -> scc=1
+        self.interp.step("s_bfe_i64", "s[0:1]", 0x80, ctl_extract)
+        self.assertEqual(self.interp.scc, 1)
+
+        # Step 4: zero data -> scc=0
+        self.interp.step("s_bfe_i64", "s[0:1]", 0, ctl_extract)
+        self.assertEqual(self.interp.scc, 0)
+
+
+class MultiWordBitfieldTests(unittest.TestCase):
+    """Validation of multi-word extracts crossing and straddling 32-bit dword boundaries."""
+
+    def setUp(self) -> None:
+        self.interp = ScalarAlu64Interpreter()
+
+    def test_dword_straddle_u64_various_widths(self) -> None:
+        cases = [
+            ((1 << 32) | (1 << 31), 31, 2, 3),
+            ((1 << 32), 31, 2, 2),
+            ((1 << 31), 31, 2, 1),
+            ((0x5 << 32) | (0xA << 28), 28, 8, 0x5A),
+            ((0x12 << 32) | (0x34 << 24), 24, 16, 0x1234),
+            ((0xDEAD << 32) | (0xBEEF << 16), 16, 32, 0xDEADBEEF),
+            ((0x2ABCD << 32) | (0x3 << 30), 30, 20, (0x2ABCD << 2) | 3),
+        ]
+        for src, off, wid, want in cases:
+            with self.subTest(off=off, wid=wid):
+                ctl_val = pack_bfe64_ctl(off, wid)
+                res, scc = self.interp.step("s_bfe_u64", "s[0:1]", src, ctl_val)
+                self.assertEqual(res, want)
+                self.assertEqual(scc, 1 if want != 0 else 0)
+
+                lines = [
+                    f"s_mov_b32 s2, {src & MASK32:#x}",
+                    f"s_mov_b32 s3, {(src >> 32) & MASK32:#x}",
+                    f"s_mov_b32 s4, {ctl_val:#x}",
+                    "s_bfe_u64 s[0:1], s[2:3], s4",
+                ]
+                got, sh_scc = run_lines(lines)
+                self.assertEqual(got, want)
+                self.assertEqual(sh_scc, 1 if want != 0 else 0)
+
+    def test_dword_straddle_i64_sign_extension(self) -> None:
+        ctl_val = pack_bfe64_ctl(28, 8)
+
+        # Positive case: field value is 0x7F (msb 0) -> positive 0x7F
+        src_pos = (0x7 << 32) | (0xF << 28)
+        res_pos, scc_pos = self.interp.step("s_bfe_i64", "s[0:1]", src_pos, ctl_val)
+        self.assertEqual(res_pos, 0x7F)
+        self.assertEqual(scc_pos, 1)
+
+        # Negative case: field value is 0x80 (msb 1) -> negative -128
+        src_neg = (0x8 << 32) | (0x0 << 28)
+        res_neg, scc_neg = self.interp.step("s_bfe_i64", "s[0:1]", src_neg, ctl_val)
+        self.assertEqual(res_neg, (-128) & MASK64)
+        self.assertEqual(scc_neg, 1)
+
+    def test_lo_dword_sign_extension_into_hi_dword(self) -> None:
+        ctl_val = pack_bfe64_ctl(0, 16)
+        src = 0x8000
+        res, scc = self.interp.step("s_bfe_i64", "s[0:1]", src, ctl_val)
+        want = (-32768) & MASK64
+        self.assertEqual(res, want)
+        self.assertEqual(scc, 1)
+        self.assertEqual(self.interp.get_sgpr(1), 0xFFFFFFFF)
+        self.assertEqual(self.interp.get_sgpr(0), 0xFFFF8000)
+
+        lines = [
+            f"s_mov_b32 s2, {src:#x}",
+            "s_mov_b32 s3, 0",
+            f"s_mov_b32 s4, {ctl_val:#x}",
+            "s_bfe_i64 s[0:1], s[2:3], s4",
+        ]
+        got, sh_scc = run_lines(lines)
+        self.assertEqual(got, want)
+        self.assertEqual(sh_scc, 1)
+
+    def test_hi_dword_extraction_shifted_to_lo(self) -> None:
+        ctl_val = pack_bfe64_ctl(32, 16)
+        src = 0x00001234_00000000
+        res, scc = self.interp.step("s_bfe_u64", "s[0:1]", src, ctl_val)
+        self.assertEqual(res, 0x1234)
+        self.assertEqual(scc, 1)
+        self.assertEqual(self.interp.get_sgpr(0), 0x1234)
+        self.assertEqual(self.interp.get_sgpr(1), 0)
+
+    def test_full_64bit_span(self) -> None:
+        ctl_val = pack_bfe64_ctl(0, 64)
+        src = 0xCAFEBABE_DEADBEEF
+        res, scc = self.interp.step("s_bfe_u64", "s[0:1]", src, ctl_val)
+        self.assertEqual(res, src)
+        self.assertEqual(scc, 1)
+
+
 VALUES = [0, M64, 1 << 63, 0x0123456789ABCDEF, 0xFEDCBA9876543210, 0x8000000080000000, 0x00000000FFFFFFFF]
 CONTROLS = [ctl(0, 0), ctl(0, 1), ctl(0, 64), ctl(0, 127), ctl(1, 63), ctl(31, 2), ctl(32, 32), ctl(33, 31),
             ctl(60, 8), ctl(63, 1), ctl(63, 64), ctl(4, 40), 0xFFC0FFFF, 0x00100020]
@@ -364,12 +639,13 @@ def tearDownModule():
         _TMP_DIR = None
 
 
-def run_lines(lines) -> tuple:
-    """Run the lines, return (s[0:1] as one 64-bit value, SCC)."""
+def run_lines_dst(lines, dst_lo: int = 0) -> tuple:
+    """Run the lines, return (s[dst_lo:dst_lo+1] as one 64-bit value, SCC)."""
     if _TMP_DIR is None:
         setUpModule()
     tail = ["s_cselect_b32 s20, 0x40000001, 0x40000000"]
-    for i, (r, sh) in enumerate(((0, 0), (0, 16), (1, 0), (1, 16))):
+    for i, (r_offset, sh) in enumerate(((0, 0), (0, 16), (1, 0), (1, 16))):
+        r = dst_lo + r_offset
         tail += [f"s_lshr_b32 s{10 + i}, s{r}, {sh}", f"s_and_b32 s{10 + i}, s{10 + i}, 0xffff",
                  f"s_or_b32 s{10 + i}, s{10 + i}, 0x40000000", f"v_mov_b32 v{i}, s{10 + i}"]
     tail.append("v_mov_b32 v4, s20")
@@ -384,6 +660,11 @@ def run_lines(lines) -> tuple:
     w, scc = out["%out_mrt0"], out["%out_mrt1"][0]
     assert all(x >> 16 == 0x4000 for x in w) and scc >> 1 == 0x20000000, ([hex(x) for x in w], hex(scc))
     return sum((x & 0xFFFF) << (16 * i) for i, x in enumerate(w)), scc & 1
+
+
+def run_lines(lines) -> tuple:
+    """Run the lines, return (s[0:1] as one 64-bit value, SCC)."""
+    return run_lines_dst(lines, dst_lo=0)
 
 
 def run_op(op: str, x: int, c: int, scc_in: int = 0) -> tuple:
