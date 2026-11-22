@@ -122,6 +122,88 @@ class LDSMemory:
         return old_val, new_mem
 
 
+# ==============================================================================
+# Symbolic AST Opcode Definitions and Typed Expressions
+# ==============================================================================
+
+class DSOpcode(Enum):
+    """Data Share (DS) atomic opcodes."""
+    DS_ADD_RTN_U32 = "ds_add_rtn_u32"
+
+
+class RegType(Enum):
+    """Register file classes."""
+    VGPR = "v"
+    SGPR = "s"
+
+
+@dataclass(frozen=True)
+class RegisterOperand:
+    """Typed symbolic register operand representation."""
+    index: int
+    reg_type: RegType = RegType.VGPR
+
+    def __post_init__(self) -> None:
+        max_limit = DEFAULT_NUM_VGPRS if self.reg_type == RegType.VGPR else DEFAULT_NUM_SGPRS
+        if not (0 <= self.index < max_limit):
+            raise ValueError(
+                f"Register index out of bounds: {self.reg_type.value}[{self.index}] "
+                f"(expected 0 <= index < {max_limit})"
+            )
+
+    @property
+    def name(self) -> str:
+        return f"{self.reg_type.value}[{self.index}]"
+
+    def __str__(self) -> str:
+        return self.name
+
+
+@dataclass(frozen=True)
+class Immediate:
+    """32-bit immediate constant operand."""
+    val: int
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "val", u32(self.val))
+
+    def __str__(self) -> str:
+        return f"0x{self.val:X}"
+
+
+Operand = Union[RegisterOperand, Immediate]
+
+
+@dataclass(frozen=True)
+class DSAddRtnInstruction:
+    """Symbolic AST node for ds_add_rtn_u32 instruction."""
+    vdst: RegisterOperand
+    vaddr: RegisterOperand
+    vdata0: Operand
+    offset: int = 0
+    gds: bool = False
+    opcode: DSOpcode = DSOpcode.DS_ADD_RTN_U32
+
+    def __post_init__(self) -> None:
+        if self.vdst.reg_type != RegType.VGPR:
+            raise ValueError(f"vdst must be a VGPR, got {self.vdst.reg_type}")
+        if self.vaddr.reg_type != RegType.VGPR:
+            raise ValueError(f"vaddr must be a VGPR, got {self.vaddr.reg_type}")
+        if not (0 <= self.offset <= OFFSET16_MASK):
+            raise ValueError(
+                f"offset out of bounds: {self.offset} (expected 0 <= offset <= {OFFSET16_MASK})"
+            )
+
+    def disassemble(self) -> str:
+        """Emit canonical AMD assembly string."""
+        parts = [self.opcode.value, str(self.vdst), str(self.vaddr), str(self.vdata0)]
+        if self.offset != 0:
+            parts.append(f"offset:{self.offset}")
+        if self.gds:
+            parts.append("gds")
+        return f"{parts[0]} {', '.join(parts[1:])}"
+
+
 class TestReferenceOracleAndArchitecturalModel(unittest.TestCase):
     """Phase 1: Unit tests for reference mathematical oracle and architectural model."""
 
@@ -182,6 +264,73 @@ class TestReferenceOracleAndArchitecturalModel(unittest.TestCase):
         self.assertEqual(old2, 623)
         self.assertEqual(new_val2, 723)
         self.assertEqual(lds.read_dword(vaddr), 723)
+
+
+class TestSymbolicAST(unittest.TestCase):
+    """Phase 2: Unit tests for symbolic AST opcode definitions and typed expressions."""
+
+    def test_valid_ast_construction(self) -> None:
+        vdst = RegisterOperand(0, RegType.VGPR)
+        vaddr = RegisterOperand(1, RegType.VGPR)
+        vdata0 = RegisterOperand(2, RegType.VGPR)
+        instr = DSAddRtnInstruction(vdst=vdst, vaddr=vaddr, vdata0=vdata0, offset=16)
+
+        self.assertEqual(instr.opcode, DSOpcode.DS_ADD_RTN_U32)
+        self.assertEqual(instr.vdst.index, 0)
+        self.assertEqual(instr.vaddr.index, 1)
+        self.assertEqual(instr.offset, 16)
+        self.assertFalse(instr.gds)
+
+    def test_ast_with_immediate_operand(self) -> None:
+        vdst = RegisterOperand(5, RegType.VGPR)
+        vaddr = RegisterOperand(6, RegType.VGPR)
+        imm = Immediate(0x100)
+        instr = DSAddRtnInstruction(vdst=vdst, vaddr=vaddr, vdata0=imm, offset=0)
+
+        self.assertEqual(instr.vdata0, Immediate(0x100))
+
+    def test_disassembly_formatting(self) -> None:
+        vdst = RegisterOperand(0, RegType.VGPR)
+        vaddr = RegisterOperand(1, RegType.VGPR)
+        vdata0 = RegisterOperand(2, RegType.VGPR)
+
+        instr_no_offset = DSAddRtnInstruction(vdst=vdst, vaddr=vaddr, vdata0=vdata0, offset=0)
+        self.assertEqual(
+            instr_no_offset.disassemble(),
+            "ds_add_rtn_u32 v[0], v[1], v[2]",
+        )
+
+        instr_with_offset = DSAddRtnInstruction(vdst=vdst, vaddr=vaddr, vdata0=vdata0, offset=32)
+        self.assertEqual(
+            instr_with_offset.disassemble(),
+            "ds_add_rtn_u32 v[0], v[1], v[2], offset:32",
+        )
+
+        instr_gds = DSAddRtnInstruction(vdst=vdst, vaddr=vaddr, vdata0=vdata0, offset=4, gds=True)
+        self.assertEqual(
+            instr_gds.disassemble(),
+            "ds_add_rtn_u32 v[0], v[1], v[2], offset:4, gds",
+        )
+
+    def test_ast_validation_errors(self) -> None:
+        v0 = RegisterOperand(0, RegType.VGPR)
+        s0 = RegisterOperand(0, RegType.SGPR)
+
+        # vdst cannot be SGPR
+        with self.assertRaises(ValueError):
+            DSAddRtnInstruction(vdst=s0, vaddr=v0, vdata0=v0)
+
+        # vaddr cannot be SGPR
+        with self.assertRaises(ValueError):
+            DSAddRtnInstruction(vdst=v0, vaddr=s0, vdata0=v0)
+
+        # Negative offset
+        with self.assertRaises(ValueError):
+            DSAddRtnInstruction(vdst=v0, vaddr=v0, vdata0=v0, offset=-1)
+
+        # Offset exceeding 16 bits
+        with self.assertRaises(ValueError):
+            DSAddRtnInstruction(vdst=v0, vaddr=v0, vdata0=v0, offset=65536)
 
 
 if __name__ == "__main__":
