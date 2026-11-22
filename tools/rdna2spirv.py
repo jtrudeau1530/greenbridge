@@ -6475,15 +6475,24 @@ class Gen:
             # integer views. shortcut: integers are truncated; AMD may saturate them (Mesa nir
             # integer_dest_saturates, unverified), so values past 16 bits may differ; clamp once a GPU shows it.
             for i in range(0, len(xs), 2):
-                pair = xs[i:i + 2] + [self.cu(0)] * (2 - len(xs[i:i + 2]))
+                dest = {"k": "vgpr", "r": vdata["r"] + i // 2, "n": 1}
+                if i + 1 == len(xs):
+                    # Odd component count (1 or 3): preserve the trailing VGPR's unused high half (gfx1036).
+                    if f16:
+                        lo = self.f16_bits(self.tof(xs[i]))
+                    else:
+                        lo = self.tmp()
+                        self.emit(f"{lo} = OpBitwiseAnd %uint {xs[i]} {self.cu(0xFFFF)}")
+                    self.write_lo16(dest, lo)
+                    continue
                 if f16:
-                    w = self.pack_f16_pair_int(self.tof(pair[0]), self.tof(pair[1]))
+                    w = self.pack_f16_pair_int(self.tof(xs[i]), self.tof(xs[i + 1]))
                 else:
                     lo, hi, w = self.tmp(), self.tmp(), self.tmp()
-                    self.emit(f"{lo} = OpBitwiseAnd %uint {pair[0]} {self.cu(0xFFFF)}")
-                    self.emit(f"{hi} = OpShiftLeftLogical %uint {pair[1]} {self.cu(16)}")
+                    self.emit(f"{lo} = OpBitwiseAnd %uint {xs[i]} {self.cu(0xFFFF)}")
+                    self.emit(f"{hi} = OpShiftLeftLogical %uint {xs[i + 1]} {self.cu(16)}")
                     self.emit(f"{w} = OpBitwiseOr %uint {lo} {hi}")
-                self.dst({"k": "vgpr", "r": vdata["r"] + i // 2, "n": 1}, w)
+                self.dst(dest, w)
 
         def read_integer(cls, ty):
             ip, im, b = self.tmp(), self.tmp(), self.tmp()
