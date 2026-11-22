@@ -1387,8 +1387,187 @@ class TestRegisterAliasing(unittest.TestCase):
                 self.assertEqual(wave.get_lane_vgpr_f32(l, 0), float(l + 1))
 
 
+@dataclass
+class StatusFlags:
+    """IEEE 754 exception flags and architectural condition codes."""
+    invalid: bool = False
+    overflow: bool = False
+    underflow: bool = False
+    inexact: bool = False
+    is_negative: bool = False
+    is_zero: bool = False
+    is_inf: bool = False
+    is_nan: bool = False
+    is_subnormal: bool = False
+    scaled: bool = False
+
+
+def compute_div_scale_status_flags_f32_u32(u0: int, u1: int, u2: int, **kwargs) -> tuple[int, int, StatusFlags]:
+    invalid = is_f32_snan(u0) or is_f32_snan(u1) or is_f32_snan(u2)
+    res_u32, vcc = ref_div_scale_f32_u32(u0, u1, u2, **kwargs)
+
+    is_neg = (res_u32 & F32_NEG_ZERO) != 0
+    is_zero = ((res_u32 & 0x7FFFFFFF) == 0)
+    is_nan = is_f32_nan(res_u32)
+    is_inf = ((res_u32 & 0x7FFFFFFF) == 0x7F800000)
+    exp = (res_u32 >> 23) & 0xFF
+    mant = res_u32 & 0x007FFFFF
+    is_subnormal = (exp == 0 and mant != 0)
+
+    res_f = u32_to_f32(res_u32)
+    s0_f = u32_to_f32(u0)
+    overflow = is_inf and math.isfinite(s0_f)
+    underflow = is_subnormal or (is_zero and not ((u0 & 0x7FFFFFFF) == 0))
+    inexact = overflow or underflow
+
+    flags = StatusFlags(
+        invalid=invalid,
+        overflow=overflow,
+        underflow=underflow,
+        inexact=inexact,
+        is_negative=is_neg,
+        is_zero=is_zero,
+        is_inf=is_inf,
+        is_nan=is_nan,
+        is_subnormal=is_subnormal,
+        scaled=(vcc == 1),
+    )
+    return res_u32, vcc, flags
+
+
+def compute_div_scale_status_flags_f32(s0: float, s1: float, s2: float, **kwargs) -> tuple[float, int, StatusFlags]:
+    u0 = f32_to_u32(s0)
+    u1 = f32_to_u32(s1)
+    u2 = f32_to_u32(s2)
+    res_u32, vcc, flags = compute_div_scale_status_flags_f32_u32(u0, u1, u2, **kwargs)
+    return u32_to_f32(res_u32), vcc, flags
+
+
+def compute_div_scale_status_flags_f64_u64(u0: int, u1: int, u2: int, **kwargs) -> tuple[int, int, StatusFlags]:
+    invalid = is_f64_snan(u0) or is_f64_snan(u1) or is_f64_snan(u2)
+    res_u64, vcc = ref_div_scale_f64_u64(u0, u1, u2, **kwargs)
+
+    is_neg = (res_u64 & F64_NEG_ZERO) != 0
+    is_zero = ((res_u64 & 0x7FFFFFFFFFFFFFFF) == 0)
+    is_nan = is_f64_nan(res_u64)
+    is_inf = ((res_u64 & 0x7FFFFFFFFFFFFFFF) == 0x7FF0000000000000)
+    exp = (res_u64 >> 52) & 0x7FF
+    mant = res_u64 & 0x000FFFFFFFFFFFFF
+    is_subnormal = (exp == 0 and mant != 0)
+
+    res_f = u64_to_f64(res_u64)
+    s0_f = u64_to_f64(u0)
+    overflow = is_inf and math.isfinite(s0_f)
+    underflow = is_subnormal or (is_zero and not ((u0 & 0x7FFFFFFFFFFFFFFF) == 0))
+    inexact = overflow or underflow
+
+    flags = StatusFlags(
+        invalid=invalid,
+        overflow=overflow,
+        underflow=underflow,
+        inexact=inexact,
+        is_negative=is_neg,
+        is_zero=is_zero,
+        is_inf=is_inf,
+        is_nan=is_nan,
+        is_subnormal=is_subnormal,
+        scaled=(vcc == 1),
+    )
+    return res_u64, vcc, flags
+
+
+def compute_div_scale_status_flags_f64(s0: float, s1: float, s2: float, **kwargs) -> tuple[float, int, StatusFlags]:
+    u0 = f64_to_u64(s0)
+    u1 = f64_to_u64(s1)
+    u2 = f64_to_u64(s2)
+    res_u64, vcc, flags = compute_div_scale_status_flags_f64_u64(u0, u1, u2, **kwargs)
+    return u64_to_f64(res_u64), vcc, flags
+
+
+def evaluate_vcc_predicate(wave: SIMDWaveState, reg_idx: int, predicate: str, *, is_f64: bool = False) -> int:
+    """Generate 64-bit VCC mask evaluating condition on reg_idx across all active lanes."""
+    vcc = 0
+    for lane in range(wave.wave_size):
+        if (wave.exec_mask >> lane) & 1:
+            val = wave.get_lane_vgpr_pair_f64(lane, reg_idx) if is_f64 else wave.get_lane_vgpr_f32(lane, reg_idx)
+            cond = False
+            if predicate == "eq_zero":
+                cond = (val == 0.0)
+            elif predicate == "ge_zero":
+                cond = not math.isnan(val) and val >= 0.0
+            elif predicate == "lt_zero":
+                cond = not math.isnan(val) and val < 0.0
+            elif predicate == "is_nan":
+                cond = math.isnan(val)
+            elif predicate == "is_finite":
+                cond = math.isfinite(val)
+            else:
+                raise ValueError(f"Unknown predicate: {predicate}")
+
+            if cond:
+                vcc |= (1 << lane)
+    return vcc
+
+
+class TestDivScaleStatusFlagsAndConditionCodes(unittest.TestCase):
+    """Test suite for IEEE 754 status flags, condition codes, and VCC carry/predicate generation."""
+
+    def test_f32_status_flags_normal(self):
+        res, vcc, flags = compute_div_scale_status_flags_f32(2.0, 2.0, 10.0)
+        self.assertEqual(res, 2.0)
+        self.assertEqual(vcc, 0)
+        self.assertFalse(flags.invalid)
+        self.assertFalse(flags.overflow)
+        self.assertFalse(flags.underflow)
+        self.assertFalse(flags.inexact)
+        self.assertFalse(flags.is_negative)
+        self.assertFalse(flags.is_zero)
+        self.assertFalse(flags.scaled)
+
+    def test_f32_status_flags_scaled(self):
+        small = 2.0 ** -100
+        res, vcc, flags = compute_div_scale_status_flags_f32(small, small, 1.0)
+        self.assertEqual(vcc, 1)
+        self.assertTrue(flags.scaled)
+        self.assertFalse(flags.invalid)
+
+    def test_f32_status_flags_snan_invalid(self):
+        res_u32, vcc, flags = compute_div_scale_status_flags_f32_u32(F32_SNAN, F32_ONE, F32_TWO)
+        self.assertTrue(is_f32_nan(res_u32))
+        self.assertTrue(flags.invalid)
+        self.assertTrue(flags.is_nan)
+
+    def test_f64_status_flags_snan_invalid(self):
+        res_u64, vcc, flags = compute_div_scale_status_flags_f64_u64(F64_SNAN, F64_ONE, F64_TWO)
+        self.assertTrue(is_f64_nan(res_u64))
+        self.assertTrue(flags.invalid)
+        self.assertTrue(flags.is_nan)
+
+    def test_vcc_predicate_mask_generation(self):
+        wave = SIMDWaveState(wave_size=64)
+        # EXEC active for lanes 0..31
+        wave.exec_mask = 0x00000000FFFFFFFF
+
+        for lane in range(64):
+            val = 5.0 if (lane % 2 == 0) else -5.0
+            wave.set_lane_vgpr_f32(lane, 0, val)
+
+        # ge_zero: even lanes in 0..31 -> 0x55555555
+        vcc_ge = evaluate_vcc_predicate(wave, 0, "ge_zero", is_f64=False)
+        self.assertEqual(vcc_ge, 0x55555555)
+
+        # lt_zero: odd lanes in 0..31 -> 0xAAAAAAAA
+        vcc_lt = evaluate_vcc_predicate(wave, 0, "lt_zero", is_f64=False)
+        self.assertEqual(vcc_lt, 0xAAAAAAAA)
+
+        # Inactive upper lanes 32..63 contribute 0
+        self.assertEqual(vcc_ge >> 32, 0)
+        self.assertEqual(vcc_lt >> 32, 0)
+
+
 if __name__ == "__main__":
     unittest.main()
+
 
 
 
