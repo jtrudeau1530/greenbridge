@@ -20,6 +20,16 @@ sys.path.insert(0, os.path.join(ROOT, "tools"))
 import image_fuzz as imf  # noqa: E402
 
 
+def test_empty_format_selection_is_a_usage_error(tmp_path):
+    work = tmp_path / "work"
+    result = subprocess.run([sys.executable, "-I", imf.__file__, "--formats", " , ", "--work", str(work)],
+                            capture_output=True, text=True, timeout=60)
+    assert result.returncode == 2, result.stderr
+    assert "--formats must select at least one format" in result.stderr
+    assert "Traceback" not in result.stderr
+    assert not work.exists()
+
+
 def test_format_codes_match_the_translator_table():
     with open(os.path.join(imf.TOOLS, "gfx10_formats.json"), encoding="utf-8") as f:
         by_name = {name: int(code) for code, name in json.load(f).items()}
