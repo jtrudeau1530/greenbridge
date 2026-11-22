@@ -116,8 +116,9 @@ inline VulkanAccess vulkan_access(std::uint32_t states, bool presentable, bool c
     constexpr VkPipelineStageFlags fragment_tests =
         VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
     static constexpr Bit bits[] = {
+        // A root CBV can be loaded through a shader buffer device address.
         {s::vertex_and_constant_buffer, VK_IMAGE_LAYOUT_GENERAL,
-         VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_UNIFORM_READ_BIT,
+         VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_UNIFORM_READ_BIT | VK_ACCESS_SHADER_READ_BIT,
          VK_PIPELINE_STAGE_VERTEX_INPUT_BIT | shader_stages},
         {s::index_buffer, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_INDEX_READ_BIT, VK_PIPELINE_STAGE_VERTEX_INPUT_BIT},
         {s::render_target, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
@@ -230,7 +231,7 @@ inline VkAccessFlags2 vulkan_barrier_access(std::uint32_t access) {
     };
     static constexpr Bit bits[] = {
         {a::vertex_buffer, VK_ACCESS_2_VERTEX_ATTRIBUTE_READ_BIT},
-        {a::constant_buffer, VK_ACCESS_2_UNIFORM_READ_BIT},
+        {a::constant_buffer, VK_ACCESS_2_UNIFORM_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT},
         {a::index_buffer, VK_ACCESS_2_INDEX_READ_BIT},
         {a::render_target, VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT},
         {a::unordered_access, VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT},
@@ -259,7 +260,7 @@ inline VkAccessFlags2 vulkan_barrier_access(std::uint32_t access) {
     return out;
 }
 
-// For one VkAccessFlagBits2 that vulkan_barrier_access produces: the stages Vulkan lets perform it (the "supported
+// For accesses that vulkan_barrier_access produces: the stages Vulkan lets perform them (the "supported
 // access types" table of the synchronization2 chapter, with the meta stages that contain them), and the narrowest
 // stage to add when a barrier's stages have none of those. MEMORY_READ/WRITE are valid in every stage.
 struct AccessStages {
@@ -288,7 +289,7 @@ inline constexpr AccessStages access_stages[] = {
          VK_PIPELINE_STAGE_2_ALL_GRAPHICS_BIT | VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
      VK_PIPELINE_STAGE_2_VERTEX_ATTRIBUTE_INPUT_BIT},
     // Shader accesses: D3D12 does not say which shader stage, so every one that can run (all shading).
-    {VK_ACCESS_2_UNIFORM_READ_BIT, shader_stages2,
+    {VK_ACCESS_2_UNIFORM_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT, shader_stages2,
      VK_PIPELINE_STAGE_2_PRE_RASTERIZATION_SHADERS_BIT | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
          VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT},
     {VK_ACCESS_2_SHADER_READ_BIT, shader_stages2,
