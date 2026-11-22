@@ -12,6 +12,11 @@ can reuse successful pipelines. Entries reported as skipped do not count as fail
 It also exits 2, before loading Vulkan, if `index.json` is missing, unreadable, empty or malformed, so a wrong
 directory can't pass as an empty corpus. A valid `{}` is an intentionally empty index.
 
+For a compute entry with `lds_bytes` in the index, the checker compares the reported workgroup memory
+with the selected GPU's `maxComputeSharedMemorySize`. An entry above the limit counts as a module
+failure before Vulkan receives the shader. Older indexes without this field still use the normal
+driver check.
+
 ## Check user-defined interfaces between stages
 
 `tools/shader_link_check.py` compares the binary SPIR-V declarations of the shaders you plan to put in the

@@ -32,3 +32,13 @@ execute_process(COMMAND ${RUNNER} "${TOOL}" "${TEST_DIR}"
 if(NOT code STREQUAL "2" OR NOT log MATCHES "index.json: ")
   message(FATAL_ERROR "Expected valid arguments to reach the malformed index, got ${code}\n${log}")
 endif()
+
+# A malformed byte count must not reach Vulkan or wrap to an in-range value.
+foreach(bytes -1 1.5 4294967296)
+  file(WRITE "${TEST_DIR}/index.json" "{\"example\":{\"stage\":\"cs\",\"lds_bytes\":${bytes}}}\n")
+  execute_process(COMMAND ${RUNNER} "${TOOL}" "${TEST_DIR}"
+                  RESULT_VARIABLE code OUTPUT_VARIABLE log ERROR_VARIABLE log TIMEOUT 5)
+  if(NOT code STREQUAL "2" OR NOT log MATCHES "malformed JSON")
+    message(FATAL_ERROR "lds_bytes=${bytes}: expected a malformed index, got ${code}\n${log}")
+  endif()
+endforeach()
