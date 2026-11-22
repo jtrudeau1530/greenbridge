@@ -1087,10 +1087,25 @@ inline VkImageLayout copy_layout(const ReplayFunctions& vk, VkCommandBuffer comm
     const VkImageLayout target = image_layout(resource, wanted);
     auto pieces = current(tracker, id, range, target);
     initialize(vk, command_buffer, resource, id, pieces, target, tracker);
-    if (pieces.size() == 1 && (pieces[0].layout == target || pieces[0].layout == VK_IMAGE_LAYOUT_GENERAL))
+    // D3D12 orders back-to-back copies and resolves on a resource that stays in COPY_DEST or COPY_SOURCE without a
+    // barrier from the application; Vulkan does not. A piece already in the transfer layout gets no layout
+    // transition, so an earlier transfer write to it is ordered here instead (write-after-write and read-after-write,
+    // which synchronization validation reports otherwise).
+    const auto after_transfer_writes = [&] {
+        memory_barrier(vk, command_buffer, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, access,
+                       VK_PIPELINE_STAGE_TRANSFER_BIT);
+    };
+    if (pieces.size() == 1 && (pieces[0].layout == target || pieces[0].layout == VK_IMAGE_LAYOUT_GENERAL)) {
+        after_transfer_writes();
         return pieces[0].layout;
+    }
+    bool ordered = false;
     for (const auto& piece : pieces) {
-        if (piece.layout == target) continue;
+        if (piece.layout == target) {
+            if (!ordered) after_transfer_writes();
+            ordered = true;
+            continue;
+        }
         image_barrier(vk, command_buffer, resource, piece.range, piece.layout, target,
                       VK_ACCESS_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, access,
                       VK_PIPELINE_STAGE_TRANSFER_BIT);
