@@ -96,7 +96,7 @@ def retag(data: bytes, packet: bytes) -> bytes:
 def load_names(path, source=None):
     """{bank label: {29-bit stream id: name}} from awc_names.py CSV."""
     out = collections.defaultdict(dict)
-    with open(path, encoding="utf-8", newline="") as fh:
+    with open(path, encoding="utf-8-sig", newline="") as fh:
         for row in csv.DictReader(fh):
             if source and row.get("source") != source:
                 continue
@@ -106,7 +106,7 @@ def load_names(path, source=None):
 
 def load_dialogue(path):
     """{wave: row} from text_tables.py dialogue CSV, and the language codes in column order."""
-    with open(path, encoding="utf-8", newline="") as fh:
+    with open(path, encoding="utf-8-sig", newline="") as fh:
         reader = csv.DictReader(fh)
         langs = [f[5:] for f in reader.fieldnames or [] if f.startswith("text_")]
         return {row["wave"].lower(): row for row in reader}, langs
