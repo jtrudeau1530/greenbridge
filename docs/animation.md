@@ -717,6 +717,10 @@ the archetypes reference; the per-bone mapping onto each model's skeleton still 
    system pages as needed to parse the dictionary. Require a nonempty clip map and a name at `+0x38`
    whose lowercase joaat equals the stored hash. This confirms 159 of the 161 referenced hashes.
    A direct hash comparison against the 52,752 bone-bearing dictionaries in `anim.rpf` found zero matches.
+   Applying the same root and clip-map checks to the other 21 RPF archives (85,152,072,416 bytes)
+   yielded no additional matches. The two unresolved references appear in 43 and 64 archetype records,
+   covering two and 16 distinct asset names respectively. This search covers readable dictionary roots
+   at aligned zlib stream starts. Other storage layouts remain possible.
 3. Deduplicate the resulting `(assetName, clipDictionary)` pairs. Of the 159 confirmed dictionaries,
    55 are referenced by one distinct asset name each. The remaining 104 are shared. Across their local
    animation packs, 63 dictionaries have nonzero rotation or translation bone hashes and 96 have none.
