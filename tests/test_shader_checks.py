@@ -598,7 +598,7 @@ class StoreWordsChecks(unittest.TestCase):
                          {57: 257 + 16, 19: 3, 6: 0xD00D, 39: 239 ^ 0xFF})
         self.assertEqual((volume[44], volume[30]), (244, 230))      # smax with -16 and the missed cmpswap keep theirs
         uint, sint, volume = check.store_words("cs_resinfo")
-        self.assertEqual(uint[:19], [16, 4, 1, 5, 8, 2, 1, 5, 2, 1, 1, 5, 4, 1, 0xABCD, 115, 2, 5, 5])
+        self.assertEqual(uint[:24], [16, 4, 0, 5, 8, 2, 0, 5, 2, 1, 0, 5, 4, 1, 0xABCD, 115, 2, 5, 5, 119, 0, 0, 0, 5])
         self.assertEqual((sint, volume), ([-2 * i & 0xFFFFFFFF for i in range(64)], [200 + i for i in range(64)]))
 
     def test_expected_words_pass_and_any_other_word_fails(self):
