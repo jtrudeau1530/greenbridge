@@ -772,6 +772,33 @@ int main() {
         device->CreateShaderResourceView(volume.p, &volume_view, view_slot(volume_mip));
         EXPECT(image_at(volume_mip, vol) && vol.type == g::ImageType::image_3d);
         EXPECT(vol.first_mip == 1 && vol.mip_count == 1 && vol.depth == 4 && vol.resource_mips == 2);
+        auto typeless_desc = volume_desc;
+        typeless_desc.Format = DXGI_FORMAT_R8G8B8A8_TYPELESS;
+        Ref<ID3D12Resource> typeless_volume;
+        EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &typeless_desc,
+                                                         D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                         IID_PPV_ARGS(&typeless_volume.p))));
+        const D3D12_DESCRIPTOR_HEAP_DESC typeless_heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 2,
+                                                           D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+        Ref<ID3D12DescriptorHeap> typeless_heap;
+        EXPECT(SUCCEEDED(device->CreateDescriptorHeap(&typeless_heap_desc, IID_PPV_ARGS(&typeless_heap.p))));
+        const auto linear_cpu = reinterpret_cast<XboxHeapHandleFn>(slot(typeless_heap.p, 9))(typeless_heap.p);
+        const D3D12_CPU_DESCRIPTOR_HANDLE linear_slot{SIZE_T(linear_cpu)}, srgb_slot{SIZE_T(linear_cpu + step)};
+        auto typed_view = volume_view;
+        device->CreateShaderResourceView(typeless_volume.p, &typed_view, linear_slot);
+        typed_view.Format = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+        device->CreateShaderResourceView(typeless_volume.p, &typed_view, srgb_slot);
+        device->CopyDescriptorsSimple(1, view_slot(null_slot), view_slot(volume_mip),
+                                      D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        device->CreateShaderResourceView(typeless_volume.p, nullptr, view_slot(null_slot));
+        EXPECT(null_at(null_slot));
+        for (const auto invalid : {DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_R8G8B8A8_TYPELESS, DXGI_FORMAT_B8G8R8A8_UNORM}) {
+            typed_view.Format = invalid;
+            device->CopyDescriptorsSimple(1, view_slot(null_slot), view_slot(volume_mip),
+                                          D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+            device->CreateShaderResourceView(typeless_volume.p, &typed_view, view_slot(null_slot));
+            EXPECT(null_at(null_slot));
+        }
         // D3D12 requires DENY_SHADER_RESOURCE to accompany ALLOW_DEPTH_STENCIL. If the layer accepts
         // this transfer-only volume at creation, requesting an SRV must still clear the destination.
         D3D12_RESOURCE_DESC denied_desc = volume_desc;
@@ -1059,7 +1086,12 @@ int main() {
             from_upload.PlacedFootprint = volume_placed[mip];
             list->CopyTextureRegion(&to_texture, 0, 0, 0, &from_upload, nullptr);
         }
+        to_texture.pResource = typeless_volume.p;
+        to_texture.SubresourceIndex = 1;
+        from_upload.PlacedFootprint = volume_placed[1];
+        list->CopyTextureRegion(&to_texture, 0, 0, 0, &from_upload, nullptr);
         const D3D12_RESOURCE_BARRIER sampled[] = {
+            transition(typeless_volume.p, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
             transition(texture.p, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
             transition(packed.p, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
             transition(uint_texture.p, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
@@ -1194,24 +1226,41 @@ int main() {
             }
         }
 
-        SampleKeys volumes[2]{};
-        std::array<std::uint8_t, 2 * bytes> volume_pixels{};
-        for (UINT mip = 0; mip < 2; ++mip) {
-            std::memcpy(volumes[mip].tsharp, view_bytes(mip ? volume_mip : volume_all), sizeof(volumes[mip].tsharp));
-            std::memcpy(volumes[mip].ssharp, sampler_bytes, sizeof(volumes[mip].ssharp));
-            volumes[mip].first = mip * texels;
+        const D3D12_CPU_DESCRIPTOR_HANDLE volume_slots[] = {view_slot(volume_all), view_slot(volume_mip),
+                                                            linear_slot, srgb_slot};
+        SampleKeys volumes[std::size(volume_slots)]{};
+        std::array<std::uint8_t, std::size(volume_slots) * bytes> volume_pixels{};
+        for (UINT view = 0; view < std::size(volume_slots); ++view) {
+            std::memcpy(volumes[view].tsharp, reinterpret_cast<const void*>(volume_slots[view].ptr),
+                        sizeof(volumes[view].tsharp));
+            std::memcpy(volumes[view].ssharp, sampler_bytes, sizeof(volumes[view].ssharp));
+            volumes[view].first = view * texels;
         }
         EXPECT(sample_through_set(d, set0, set0_layout, volumes, volume_pixels.data()));
         unsigned volume_errors = 0;
-        for (UINT mip = 0; mip < 2; ++mip)
+        for (UINT view = 0; view < std::size(volume_slots); ++view)
             for (UINT i = 0; i < texels; ++i) {
+                const bool mip = volume_slots[view].ptr != view_slot(volume_all).ptr;
                 const UINT x = i % 4, y = (i / 4) % 4, z = i / 16;
-                const std::uint8_t expected[]{
+                std::uint8_t expected[]{
                     std::uint8_t((mip ? x : 2 * x + 1) * 19), std::uint8_t((mip ? y : 2 * y + 1) * 23),
                     std::uint8_t((mip ? z / 2 : z) * 53), std::uint8_t(mip ? 101 : 237)};
-                if (std::memcmp(&volume_pixels[(mip * texels + i) * 4], expected, 4)) ++volume_errors;
+                const bool srgb = volume_slots[view].ptr == srgb_slot.ptr;
+                if (srgb) {
+                    // The inverse sRGB transfer function, rounded to bytes, for the uploaded mip-1 RGB values.
+                    constexpr std::uint8_t red[] = {0, 2, 5, 10}, green[] = {0, 2, 7, 15}, blue[] = {0, 9};
+                    expected[0] = red[x];
+                    expected[1] = green[y];
+                    expected[2] = blue[z / 2];
+                }
+                const auto* sample = &volume_pixels[(view * texels + i) * 4];
+                // Allow a byte of sRGB conversion rounding. UNORM and alpha are exact.
+                bool differs = sample[3] != expected[3];
+                for (UINT c = 0; c < 3; ++c)
+                    differs |= std::abs(int(sample[c]) - expected[c]) > (srgb ? 1 : 0);
+                if (differs) ++volume_errors;
             }
-        std::printf("volume SRVs: %u of %u sampled RGBA texels differ\n", volume_errors, 2 * texels);
+        std::printf("volume SRVs: %u of %zu sampled RGBA texels differ\n", volume_errors, std::size(volume_slots) * texels);
         EXPECT(volume_errors == 0);
 
         SampleKeys byte_keys[byte_view_count]{};
@@ -1416,6 +1465,8 @@ int main() {
 
         upload.reset();
         volume.reset();
+        typeless_volume.reset();
+        typeless_heap.reset();
         uint_texture.reset();
         for (auto& resource : byte_textures) resource.reset();
         byte_heap.reset();
