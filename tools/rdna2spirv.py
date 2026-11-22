@@ -8553,25 +8553,26 @@ def pos_export_layout(osg1, insns):
     return pos_map, misc_svs, clip_n, cull_n
 
 
-def check_interpolation_modes(modes, insns):
-    """Refuse a PS whose FSSM input modes (tools/fssm_header.py, flags bits 0-1) are not the two this
-    translator models.  v_interp_mov_f32 reads a flat input (mode 1, declared Flat); v_interp_p1/p2 and
-    the f16 forms read a perspective-centre input (mode 2: the v0/v1 pair, BaryCoordKHR, attribute
-    inputs without NoPerspective/Centroid/Sample).  In the corpus every read position agrees (12,101 of
-    12,101 PS) and modes 0 and 3 never occur; a disagreement would mean another interpolation (centroid,
-    sample, linear) or a different table, so it is rejected rather than read as perspective-centre.
-    Positions past the table are not checked (the 10 kind-7 tables undercount)."""
+def check_read_methods(methods, insns):
+    """Refuse a PS whose FSSM read methods (tools/fssm_header.py, flags bits 0-1) disagree with its code.
+
+    Bit 0 says the code reads the input through v_interp_mov_f32 (declared Flat here), bit 1 through
+    v_interp_p1/p2 or the f16 forms (a plain input: perspective, pixel centre, BaryCoordKHR for raw
+    i/j). In the corpus each read position agrees (12,101 of 12,101 PS) and neither-or-both never
+    occurs. A disagreement means a table this translator does not understand, so it is rejected
+    instead of being read as perspective-centre. That every interpolated input is perspective-centre
+    comes from PSV0 (docs/design.md "PS interpolation modes", #1256), not from these bits. Positions
+    past the table are not checked (the 10 kind-7 tables undercount)."""
     for ins in insns:
         op = base_op(ins["op"])
         if not op.startswith("v_interp_"):
             continue
         attr = next((x for x in ins["args"] if x["k"] == "attr"), None)
-        if attr is None or attr["a"] >= len(modes):
+        if attr is None or attr["a"] >= len(methods):
             continue
-        want = fssm_header.MODE_FLAT if op == "v_interp_mov_f32" else fssm_header.MODE_LINEAR
-        if modes[attr["a"]] != want:
-            raise Unsupported(f"PS input {attr['a']} interpolation mode {modes[attr['a']]} read by {op}")
-
+        want = fssm_header.READ_MOV if op == "v_interp_mov_f32" else fssm_header.READ_INTERP
+        if methods[attr["a"]] != want:
+            raise Unsupported(f"PS input {attr['a']} read method {methods[attr['a']]} read by {op}")
 
 def mesh_psv(path, name):
     """PSV0 runtime info of a mesh shader: MSInfo (GroupSharedBytesUsed, GroupSharedViewIDDependentBytes,
@@ -8785,12 +8786,13 @@ def translate(path):
                                    info["name"] + ".fssm"), "rb") as f:
                 blob = f.read()
             count, fp16 = fssm_header.interpolants(blob)
-            modes = fssm_header.interpolation_modes(blob)
+            methods = fssm_header.read_methods(blob)
         except OSError:
-            count, fp16, modes = 0, 0, []
-        check_interpolation_modes(modes, insns)
+            count, fp16, methods = 0, 0, []
+        check_read_methods(methods, insns)
         if count:
             g.pixel_interpolants = (count, fp16)
+            g.pixel_flat = [n for n, m in enumerate(methods) if m == fssm_header.READ_MOV]
             for n in range(count):
                 g.inputs.setdefault(f"%in_attr{n}", n)
     if stage in ("vs", "ms"):
@@ -9368,6 +9370,8 @@ def shader_meta(g, asm, src_path=None, fssm_path=None):
         count, fp16 = g.pixel_interpolants
         m["ps_interpolants"] = count
         m["ps_fp16_interpolants"] = [n for n in range(count) if (fp16 >> n) & 1]
+        # Table positions whose read method is v_interp_mov (flags bit 0): the inputs declared Flat.
+        m["ps_flat_interpolants"] = getattr(g, "pixel_flat", [])
     outs = sorted(int("".join(ch for ch in t if ch.isdigit()) or 0) for t in g.outputs.values() if not t.startswith("pos"))
     if outs:
         m["outputs"] = outs
