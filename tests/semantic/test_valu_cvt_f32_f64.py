@@ -40,6 +40,8 @@ Python 3.9+ compatible (from __future__ import annotations).
 """
 from __future__ import annotations
 
+import dataclasses
+import enum
 import math
 import struct
 import unittest
@@ -410,6 +412,304 @@ class TestValuCvtF32F64Oracle(unittest.TestCase):
         self.assertEqual(lo, 0x00000000)
         self.assertEqual(hi, 0x3FF00000)
         self.assertEqual(join_dwords(lo, hi), POS_ONE_F64)
+
+
+# ---------------------------------------------------------------------------
+# Symbolic AST Opcode Definitions and Typed Expressions
+# ---------------------------------------------------------------------------
+
+class RegKind(enum.Enum):
+    """Register file domain."""
+    VGPR = "v"
+    SGPR = "s"
+
+
+@dataclasses.dataclass(frozen=True)
+class Register:
+    """Symbolic register operand representing a 32-bit register or 64-bit pair."""
+    kind: RegKind
+    index: int
+    count: int = 1
+
+    def __post_init__(self) -> None:
+        if self.index < 0 or self.index >= 256:
+            raise ValueError(f"Register index out of range [0, 255]: {self.index}")
+        if self.count not in (1, 2):
+            raise ValueError(f"Unsupported register count (must be 1 or 2): {self.count}")
+        if self.count == 2 and self.index + 1 >= 256:
+            raise ValueError(f"64-bit register pair exceeds register file boundary: {self.index}")
+
+    @property
+    def is_vgpr(self) -> bool:
+        return self.kind == RegKind.VGPR
+
+    @property
+    def is_sgpr(self) -> bool:
+        return self.kind == RegKind.SGPR
+
+    def format_asm(self) -> str:
+        if self.count == 2:
+            return f"{self.kind.value}[{self.index}:{self.index + 1}]"
+        return f"{self.kind.value}{self.index}"
+
+
+@dataclasses.dataclass(frozen=True)
+class Immediate:
+    """Symbolic 32-bit or 64-bit immediate operand."""
+    bits: int
+    is_64bit: bool = False
+
+    def __init__(self, val: int | float, is_64bit: bool = False) -> None:
+        if isinstance(val, float):
+            b = f64_to_bits(val) if is_64bit else f32_to_bits(val)
+        else:
+            b = (val & MASK64) if is_64bit else (val & MASK32)
+        object.__setattr__(self, "bits", b)
+        object.__setattr__(self, "is_64bit", is_64bit)
+
+    @property
+    def as_float(self) -> float:
+        return bits_to_f64(self.bits) if self.is_64bit else bits_to_f32(self.bits)
+
+    def format_asm(self) -> str:
+        if self.is_64bit:
+            return f"{self.bits:#018x}"
+        return f"{self.bits:#010x}"
+
+
+@dataclasses.dataclass(frozen=True)
+class OperandModifiers:
+    """Input modifiers for VALU floating-point instructions (abs and neg)."""
+    neg: bool = False
+    abs_val: bool = False
+
+    def apply(self, bits: int, is_64bit: bool) -> int:
+        if is_64bit:
+            return apply_f64_modifiers(bits, neg=self.neg, abs_val=self.abs_val)
+        return apply_f32_modifiers(bits, neg=self.neg, abs_val=self.abs_val)
+
+    def format_asm(self, base_str: str) -> str:
+        res = base_str
+        if self.abs_val:
+            res = f"|{res}|"
+        if self.neg:
+            res = f"-{res}"
+        return res
+
+
+@dataclasses.dataclass(frozen=True)
+class InstructionModifiers:
+    """Output modifiers for VALU instructions (clamp)."""
+    clamp: bool = False
+
+    def apply_f32(self, bits: int) -> int:
+        return apply_f32_clamp(bits) if self.clamp else (bits & MASK32)
+
+    def apply_f64(self, bits: int) -> int:
+        return apply_f64_clamp(bits) if self.clamp else (bits & MASK64)
+
+    def format_asm(self) -> str:
+        return " clamp" if self.clamp else ""
+
+
+class Opcode(enum.Enum):
+    """VALU floating-point conversion opcodes."""
+    V_CVT_F32_F64 = "v_cvt_f32_f64"
+    V_CVT_F64_F32 = "v_cvt_f64_f32"
+
+
+class Encoding(enum.Enum):
+    """Instruction encoding format."""
+    VOP1 = "e32"
+    VOP3 = "e64"
+
+
+@dataclasses.dataclass(frozen=True)
+class Instruction:
+    """Symbolic AST node representing a floating-point conversion VALU instruction."""
+    opcode: Opcode
+    dst: Register
+    src0: Register | Immediate
+    src0_mods: OperandModifiers = dataclasses.field(default_factory=OperandModifiers)
+    inst_mods: InstructionModifiers = dataclasses.field(default_factory=InstructionModifiers)
+    encoding: Encoding = Encoding.VOP3
+
+    def __post_init__(self) -> None:
+        if not self.dst.is_vgpr:
+            raise ValueError(f"VALU instruction destination must be a VGPR: {self.dst}")
+
+        if self.opcode == Opcode.V_CVT_F32_F64:
+            if self.dst.count != 1:
+                raise ValueError(f"v_cvt_f32_f64 destination must be 32-bit single VGPR (count=1): {self.dst}")
+            if isinstance(self.src0, Register) and self.src0.count != 2:
+                raise ValueError(f"v_cvt_f32_f64 source register must be 64-bit pair (count=2): {self.src0}")
+        elif self.opcode == Opcode.V_CVT_F64_F32:
+            if self.dst.count != 2:
+                raise ValueError(f"v_cvt_f64_f32 destination must be 64-bit pair VGPR (count=2): {self.dst}")
+            if isinstance(self.src0, Register) and self.src0.count != 1:
+                raise ValueError(f"v_cvt_f64_f32 source register must be 32-bit single register (count=1): {self.src0}")
+
+        has_mods = self.src0_mods.neg or self.src0_mods.abs_val or self.inst_mods.clamp
+        if self.encoding == Encoding.VOP1 and has_mods:
+            raise ValueError("VOP1 (e32) encoding does not support input modifiers or clamp (requires VOP3/e64)")
+
+    def to_assembly(self) -> str:
+        s0_str = self.src0.format_asm()
+        s0_fmt = self.src0_mods.format_asm(s0_str)
+        dst_str = self.dst.format_asm()
+        clamp_str = self.inst_mods.format_asm()
+        enc_suffix = f"_{self.encoding.value}" if self.encoding == Encoding.VOP1 else ""
+        return f"{self.opcode.value}{enc_suffix} {dst_str}, {s0_fmt}{clamp_str}"
+
+
+@dataclasses.dataclass
+class Program:
+    """Symbolic sequence of VALU instructions."""
+    instructions: list[Instruction] = dataclasses.field(default_factory=list)
+
+    def append(self, inst: Instruction) -> None:
+        self.instructions.append(inst)
+
+    def to_assembly(self) -> str:
+        return "\n".join(inst.to_assembly() for inst in self.instructions)
+
+
+class TestValuCvtF32F64AST(unittest.TestCase):
+    """Unit tests for symbolic AST opcode definitions and typed expressions."""
+
+    def test_register_formatting(self) -> None:
+        v0 = Register(RegKind.VGPR, 0, count=1)
+        v_pair = Register(RegKind.VGPR, 2, count=2)
+        s_single = Register(RegKind.SGPR, 4, count=1)
+        s_pair = Register(RegKind.SGPR, 6, count=2)
+
+        self.assertEqual(v0.format_asm(), "v0")
+        self.assertEqual(v_pair.format_asm(), "v[2:3]")
+        self.assertEqual(s_single.format_asm(), "s4")
+        self.assertEqual(s_pair.format_asm(), "s[6:7]")
+
+    def test_immediate_formatting(self) -> None:
+        imm32 = Immediate(1.0, is_64bit=False)
+        imm64 = Immediate(1.0, is_64bit=True)
+        self.assertEqual(imm32.format_asm(), f"{POS_ONE_F32:#010x}")
+        self.assertEqual(imm64.format_asm(), f"{POS_ONE_F64:#018x}")
+
+    def test_operand_modifiers_formatting(self) -> None:
+        mods_abs = OperandModifiers(abs_val=True)
+        mods_neg = OperandModifiers(neg=True)
+        mods_both = OperandModifiers(neg=True, abs_val=True)
+
+        self.assertEqual(mods_abs.format_asm("v[2:3]"), "|v[2:3]|")
+        self.assertEqual(mods_neg.format_asm("v[2:3]"), "-v[2:3]")
+        self.assertEqual(mods_both.format_asm("v[2:3]"), "-|v[2:3]|")
+
+    def test_instruction_formatting(self) -> None:
+        # v_cvt_f32_f64 VOP3
+        inst1 = Instruction(
+            opcode=Opcode.V_CVT_F32_F64,
+            dst=Register(RegKind.VGPR, 0, count=1),
+            src0=Register(RegKind.VGPR, 2, count=2),
+            src0_mods=OperandModifiers(neg=True, abs_val=True),
+            inst_mods=InstructionModifiers(clamp=True),
+        )
+        self.assertEqual(inst1.to_assembly(), "v_cvt_f32_f64 v0, -|v[2:3]| clamp")
+
+        # v_cvt_f32_f64 VOP1
+        inst1_e32 = Instruction(
+            opcode=Opcode.V_CVT_F32_F64,
+            dst=Register(RegKind.VGPR, 0, count=1),
+            src0=Register(RegKind.VGPR, 2, count=2),
+            encoding=Encoding.VOP1,
+        )
+        self.assertEqual(inst1_e32.to_assembly(), "v_cvt_f32_f64_e32 v0, v[2:3]")
+
+        # v_cvt_f64_f32 VOP3
+        inst2 = Instruction(
+            opcode=Opcode.V_CVT_F64_F32,
+            dst=Register(RegKind.VGPR, 0, count=2),
+            src0=Register(RegKind.VGPR, 2, count=1),
+            inst_mods=InstructionModifiers(clamp=True),
+        )
+        self.assertEqual(inst2.to_assembly(), "v_cvt_f64_f32 v[0:1], v2 clamp")
+
+        # v_cvt_f64_f32 VOP1
+        inst2_e32 = Instruction(
+            opcode=Opcode.V_CVT_F64_F32,
+            dst=Register(RegKind.VGPR, 0, count=2),
+            src0=Register(RegKind.VGPR, 2, count=1),
+            encoding=Encoding.VOP1,
+        )
+        self.assertEqual(inst2_e32.to_assembly(), "v_cvt_f64_f32_e32 v[0:1], v2")
+
+    def test_instruction_validation(self) -> None:
+        # Destination must be VGPR
+        with self.assertRaises(ValueError):
+            Instruction(
+                opcode=Opcode.V_CVT_F32_F64,
+                dst=Register(RegKind.SGPR, 0, count=1),
+                src0=Register(RegKind.VGPR, 2, count=2),
+            )
+
+        # v_cvt_f32_f64 dst must be count=1
+        with self.assertRaises(ValueError):
+            Instruction(
+                opcode=Opcode.V_CVT_F32_F64,
+                dst=Register(RegKind.VGPR, 0, count=2),
+                src0=Register(RegKind.VGPR, 2, count=2),
+            )
+
+        # v_cvt_f32_f64 src0 must be count=2
+        with self.assertRaises(ValueError):
+            Instruction(
+                opcode=Opcode.V_CVT_F32_F64,
+                dst=Register(RegKind.VGPR, 0, count=1),
+                src0=Register(RegKind.VGPR, 2, count=1),
+            )
+
+        # v_cvt_f64_f32 dst must be count=2
+        with self.assertRaises(ValueError):
+            Instruction(
+                opcode=Opcode.V_CVT_F64_F32,
+                dst=Register(RegKind.VGPR, 0, count=1),
+                src0=Register(RegKind.VGPR, 2, count=1),
+            )
+
+        # v_cvt_f64_f32 src0 must be count=1
+        with self.assertRaises(ValueError):
+            Instruction(
+                opcode=Opcode.V_CVT_F64_F32,
+                dst=Register(RegKind.VGPR, 0, count=2),
+                src0=Register(RegKind.VGPR, 2, count=2),
+            )
+
+        # VOP1 rejects modifiers
+        with self.assertRaises(ValueError):
+            Instruction(
+                opcode=Opcode.V_CVT_F32_F64,
+                dst=Register(RegKind.VGPR, 0, count=1),
+                src0=Register(RegKind.VGPR, 2, count=2),
+                src0_mods=OperandModifiers(neg=True),
+                encoding=Encoding.VOP1,
+            )
+
+    def test_program_assembly(self) -> None:
+        prog = Program()
+        prog.append(Instruction(
+            opcode=Opcode.V_CVT_F32_F64,
+            dst=Register(RegKind.VGPR, 0, count=1),
+            src0=Register(RegKind.VGPR, 2, count=2),
+        ))
+        prog.append(Instruction(
+            opcode=Opcode.V_CVT_F64_F32,
+            dst=Register(RegKind.VGPR, 4, count=2),
+            src0=Register(RegKind.VGPR, 0, count=1),
+            inst_mods=InstructionModifiers(clamp=True),
+        ))
+        expected = (
+            "v_cvt_f32_f64 v0, v[2:3]\n"
+            "v_cvt_f64_f32 v[4:5], v0 clamp"
+        )
+        self.assertEqual(prog.to_assembly(), expected)
 
 
 if __name__ == "__main__":
