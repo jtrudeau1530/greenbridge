@@ -17,6 +17,7 @@
 #include "vulkan_depth24.h"
 #include "vulkan_scratch.h"
 #include "vulkan_replay.h"
+#include "resource_tiling.h"
 #include "xdxr_build.h"
 
 #include <algorithm>
@@ -25,6 +26,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <functional>
 #include <map>
 #include <memory>
@@ -78,7 +80,7 @@ struct VulkanDeviceFunctions {
     X(vkCmdBindVertexBuffers2) X(vkCmdBindIndexBuffer) X(vkCmdSetViewport) X(vkCmdSetScissor)                  \
     X(vkCmdSetPrimitiveTopology) X(vkCmdSetPrimitiveRestartEnable) X(vkCmdSetStencilReference)                          \
     X(vkCmdSetBlendConstants) X(vkCmdDraw)                                                                              \
-    X(vkCmdDrawIndexed) X(vkCreateGraphicsPipelines)
+    X(vkCmdDrawIndexed) X(vkCreateGraphicsPipelines) X(vkQueueBindSparse)
 #define LEONIDA_VK_MEMBER(name) PFN_##name name = nullptr;
     LEONIDA_VK_DEVICE_FUNCTIONS(LEONIDA_VK_MEMBER)
 #undef LEONIDA_VK_MEMBER
@@ -644,6 +646,47 @@ private:
     std::thread thread_;
 };
 
+// A range of a D3D12 heap allocation. Mappings and in-flight unbinds keep the arena range alive.
+struct TileHeapAllocation {
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    VkDeviceSize offset = 0;
+    VkDeviceSize size = 0;
+    std::uint32_t memory_type = 0;
+};
+
+struct BufferTile {
+    std::shared_ptr<const TileHeapAllocation> heap;
+    VkDeviceSize offset = 0;
+    bool operator==(const BufferTile&) const = default;
+};
+
+struct SparseBuffer {
+    SparseBuffer(VkDevice device, PFN_vkDestroyBuffer destroy) : device(device), destroy(destroy) {}
+    SparseBuffer(const SparseBuffer&) = delete;
+    SparseBuffer& operator=(const SparseBuffer&) = delete;
+    ~SparseBuffer() { if (buffer) destroy(device, buffer, nullptr); }
+
+    VkDevice device;
+    PFN_vkDestroyBuffer destroy;
+    VkBuffer buffer = VK_NULL_HANDLE;
+    std::uint64_t tile_count = 0;
+    std::uint32_t memory_types = 0;
+    std::map<std::uint64_t, BufferTile> mapped;
+};
+
+struct BufferTileRegion {
+    std::uint64_t first = 0;
+    std::uint64_t count = 0;
+};
+
+enum class TileRangeMode { sequential, unmap, skip, reuse };
+
+struct BufferTileRange {
+    TileRangeMode mode;
+    std::uint64_t first;
+    std::uint64_t count;
+};
+
 // Per device: what the queues share. Resources are registered by their stable ID (the COM resource pointer).
 #ifdef _MSC_VER
 #pragma warning(push)
@@ -837,6 +880,12 @@ public:
         storage_pending_.insert(id);
     }
 
+    void add_sparse_buffer(ResourceId id, const ResourceBinding& binding, std::shared_ptr<SparseBuffer> buffer) {
+        std::unique_lock lock(resource_mutex_);
+        resources_[id] = binding;
+        sparse_buffers_.emplace(id, std::move(buffer));
+    }
+
     void remove_resource(ResourceId id) {
         VkImage img = VK_NULL_HANDLE;
         {
@@ -845,6 +894,7 @@ public:
             if (it == resources_.end()) return;
             img = it->second.image;
             resources_.erase(it);
+            sparse_buffers_.erase(id);
         }
         if (img) {
             std::lock_guard vlock(views_mutex_);
@@ -1138,6 +1188,7 @@ private:
     DeferredDeletionQueue deletion_queue_;
     std::unique_ptr<FenceWaitDispatcher> fence_dispatcher_;
     std::unordered_map<ResourceId, ResourceBinding> resources_;
+    std::unordered_map<ResourceId, std::shared_ptr<SparseBuffer>> sparse_buffers_;
     std::unordered_map<std::uintptr_t, ComputePipeline> pipelines_;
     std::unordered_map<std::uintptr_t, GraphicsPipeline> graphics_pipelines_;
     std::unordered_map<std::uint64_t, VkAccelerationStructureKHR> acceleration_structures_;
@@ -1275,6 +1326,68 @@ public:
     VulkanQueue& operator=(const VulkanQueue&) = delete;
 
     bool ok() const { return ok_; }
+
+    template<typename GetHeap>
+    bool update_tiles(ResourceId id, std::span<const BufferTileRegion> regions,
+                      std::span<const BufferTileRange> ranges, GetHeap&& get_heap) {
+        std::unique_lock lock(context_.resource_mutex_);
+        const auto it = context_.sparse_buffers_.find(id);
+        if (it == context_.sparse_buffers_.end()) return false;
+        const auto& buffer = it->second;
+        for (const auto& region : regions)
+            if (!valid_tiles(*buffer, region)) return false;
+        const auto heap = get_heap();
+
+        std::map<std::uint64_t, BufferTile> changes;
+        std::size_t region_index = 0;
+        std::uint64_t consumed = 0;
+        for (const auto& range : ranges) {
+            const bool backed = range.mode == TileRangeMode::sequential || range.mode == TileRangeMode::reuse;
+            const std::uint64_t heap_count = heap ? heap->size / tile_size_in_bytes : 0;
+            const std::uint64_t required = range.mode == TileRangeMode::reuse ? 1 : range.count;
+            if (backed && (!heap || range.first > heap_count || required > heap_count - range.first)) return false;
+            for (std::uint64_t i = 0; i < range.count;) {
+                if (region_index == regions.size()) return false;
+                const auto& region = regions[region_index];
+                const auto count = std::min(range.count - i, region.count - consumed);
+                const auto first = region.first + consumed;
+                if (range.mode == TileRangeMode::unmap) {
+                    const auto end = first + count;
+                    for (auto old = buffer->mapped.lower_bound(first); old != buffer->mapped.end() && old->first < end; ++old)
+                        changes[old->first] = {};
+                    for (auto change = changes.lower_bound(first); change != changes.end() && change->first < end; ++change)
+                        change->second = {};
+                } else if (backed) {
+                    for (std::uint64_t j = 0; j < count; ++j) {
+                        const auto page = range.first + (range.mode == TileRangeMode::sequential ? i + j : 0);
+                        changes[first + j] = {heap, heap->offset + page * tile_size_in_bytes};
+                    }
+                }
+                i += count;
+                consumed += count;
+                if (consumed == region.count) {
+                    ++region_index;
+                    consumed = 0;
+                }
+            }
+        }
+        return region_index == regions.size() && bind_tiles(buffer, changes);
+    }
+
+    bool copy_tile_mappings(ResourceId dst, std::uint64_t dst_first, ResourceId src, BufferTileRegion src_region) {
+        std::unique_lock lock(context_.resource_mutex_);
+        const auto source = context_.sparse_buffers_.find(src), target = context_.sparse_buffers_.find(dst);
+        if (source == context_.sparse_buffers_.end() || target == context_.sparse_buffers_.end() ||
+            !valid_tiles(*source->second, src_region) ||
+            !valid_tiles(*target->second, {dst_first, src_region.count})) return false;
+        // Read the complete source mapping before changing any destination slot, including copies within one buffer.
+        std::map<std::uint64_t, BufferTile> changes;
+        for (std::uint64_t i = 0; i < src_region.count; ++i) {
+            const auto page = source->second->mapped.find(src_region.first + i);
+            changes.emplace(dst_first + i, page == source->second->mapped.end() ? BufferTile{} : page->second);
+        }
+        return bind_tiles(target->second, changes);
+    }
 
     // ExecuteCommandLists: every list is checked before any is written, so a failure submits nothing and leaves
     // the layout tracker as it was. Pending Wait()s are attached to this submission.
@@ -1614,11 +1727,107 @@ private:
         std::unique_ptr<PredicateReducer::Batch> predicate; // retained until this slot completes
     };
 
+    struct PendingBindings {
+        std::uint64_t ticket = 0;
+        // Vulkan needs the buffer until the bind completes and the previous allocation until it is unmapped.
+        std::vector<std::shared_ptr<const TileHeapAllocation>> old_heaps;
+        std::shared_ptr<SparseBuffer> buffer;
+    };
+
+    static bool valid_tiles(const SparseBuffer& buffer, BufferTileRegion region) {
+        return region.count && region.first < buffer.tile_count && region.count <= buffer.tile_count - region.first;
+    }
+
+    bool bind_tiles(const std::shared_ptr<SparseBuffer>& buffer,
+                    std::map<std::uint64_t, BufferTile>& changes) {
+        auto& vk = context_.vk;
+        if (!vk.vkQueueBindSparse || context_.is_device_lost()) return false;
+        const auto ticket = submitted_ + 1;
+        PendingBindings pending{ticket, {}, buffer};
+        std::vector<VkSparseMemoryBind> binds;
+        for (const auto& [index, page] : changes) {
+            const auto old = buffer->mapped.find(index);
+            if (old != buffer->mapped.end()) {
+                if (old->second == page) continue;
+                pending.old_heaps.push_back(old->second.heap);
+            } else if (!page.heap) {
+                continue;
+            }
+            if (page.heap && !(buffer->memory_types & (1u << page.heap->memory_type))) return false;
+            const VkDeviceMemory memory = page.heap ? page.heap->memory : VK_NULL_HANDLE;
+            const VkDeviceSize resource_offset = index * tile_size_in_bytes;
+            if (!binds.empty()) {
+                auto& previous = binds.back();
+                if (previous.resourceOffset + previous.size == resource_offset && previous.memory == memory &&
+                    (!memory || previous.memoryOffset + previous.size == page.offset)) {
+                    previous.size += tile_size_in_bytes;
+                    continue;
+                }
+            }
+            binds.push_back({resource_offset, tile_size_in_bytes, memory, page.offset, 0});
+        }
+        if (binds.empty()) return true;
+        collect_bindings(completed());
+        auto semaphores = waits_;
+        auto values = wait_values_;
+        // Sparse binds are not ordered against work on the same Vulkan queue by submission order alone.
+        if (submitted_) {
+            semaphores.push_back(progress_);
+            values.push_back(submitted_);
+        }
+        VkTimelineSemaphoreSubmitInfo tickets{VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
+        tickets.waitSemaphoreValueCount = std::uint32_t(values.size());
+        tickets.pWaitSemaphoreValues = values.data();
+        tickets.signalSemaphoreValueCount = 1;
+        tickets.pSignalSemaphoreValues = &ticket;
+        const VkSparseBufferMemoryBindInfo buffer_bind{buffer->buffer, std::uint32_t(binds.size()), binds.data()};
+        VkBindSparseInfo info{VK_STRUCTURE_TYPE_BIND_SPARSE_INFO, &tickets};
+        info.waitSemaphoreCount = std::uint32_t(semaphores.size());
+        info.pWaitSemaphores = semaphores.data();
+        info.bufferBindCount = 1;
+        info.pBufferBinds = &buffer_bind;
+        info.signalSemaphoreCount = 1;
+        info.pSignalSemaphores = &progress_;
+        pending_bindings_.push_back(std::move(pending));
+        {
+            std::lock_guard lock(context_.submit_mutex());
+            const auto result = vk.vkQueueBindSparse(queue_, 1, &info, VK_NULL_HANDLE);
+            if (result != VK_SUCCESS) {
+                if (result == VK_ERROR_DEVICE_LOST) context_.mark_device_lost();
+                pending_bindings_.pop_back();
+                return false;
+            }
+            context_.record_submit_locked(progress_, ticket);
+        }
+        submitted_ = last_sparse_ = ticket;
+        waits_.clear();
+        wait_values_.clear();
+        for (auto it = changes.begin(); it != changes.end();) {
+            buffer->mapped.erase(it->first);
+            if (it->second.heap) ++it;
+            else it = changes.erase(it);
+        }
+        buffer->mapped.merge(changes);
+        return true;
+    }
+
+    std::uint64_t completed() const {
+        std::uint64_t done = 0;
+        context_.vk.vkGetSemaphoreCounterValue(context_.device(), progress_, &done);
+        return done;
+    }
+
+    void collect_bindings(std::uint64_t done) {
+        while (!pending_bindings_.empty() && pending_bindings_.front().ticket <= done)
+            pending_bindings_.pop_front();
+        if (last_sparse_ <= done) last_sparse_ = 0;
+    }
+
     CommandSlot* acquire() {
         if (context_.is_device_lost()) return nullptr;
         context_.drain_deleted_resources(context_.completed_retire_ticket());
-        std::uint64_t done = 0;
-        context_.vk.vkGetSemaphoreCounterValue(context_.device(), progress_, &done);
+        const auto done = completed();
+        collect_bindings(done);
         CommandSlot* reuse = nullptr;
         for (auto& slot : buffers_) {
             if (slot.ticket > done) continue;
@@ -1645,8 +1854,21 @@ private:
 
     bool submit(VkCommandBuffer command_buffer, VkSemaphore fence, std::uint64_t value) {
         if (context_.is_device_lost()) return false;
-        const std::uint64_t ticket = ++submitted_;
-        const std::vector<VkPipelineStageFlags> stages(waits_.size(), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+        const std::uint64_t ticket = submitted_ + 1;
+        if (last_sparse_) collect_bindings(completed());
+        std::span<const VkSemaphore> semaphores = waits_;
+        std::span<const std::uint64_t> values = wait_values_;
+        std::vector<VkSemaphore> sparse_waits;
+        std::vector<std::uint64_t> sparse_values;
+        if (last_sparse_) {
+            sparse_waits = waits_;
+            sparse_values = wait_values_;
+            sparse_waits.push_back(progress_);
+            sparse_values.push_back(last_sparse_);
+            semaphores = sparse_waits;
+            values = sparse_values;
+        }
+        const std::vector<VkPipelineStageFlags> stages(semaphores.size(), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
         VkResult res = VK_SUCCESS;
         {
             std::lock_guard lock(context_.submit_mutex());
@@ -1659,13 +1881,13 @@ private:
                 ++signal_count;
             }
             VkTimelineSemaphoreSubmitInfo timeline{VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
-            timeline.waitSemaphoreValueCount = std::uint32_t(wait_values_.size());
-            timeline.pWaitSemaphoreValues = wait_values_.data();
+            timeline.waitSemaphoreValueCount = std::uint32_t(values.size());
+            timeline.pWaitSemaphoreValues = values.data();
             timeline.signalSemaphoreValueCount = signal_count;
             timeline.pSignalSemaphoreValues = signal_values;
             VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO, &timeline};
-            submit.waitSemaphoreCount = std::uint32_t(waits_.size());
-            submit.pWaitSemaphores = waits_.data();
+            submit.waitSemaphoreCount = std::uint32_t(semaphores.size());
+            submit.pWaitSemaphores = semaphores.data();
             submit.pWaitDstStageMask = stages.data();
             submit.commandBufferCount = command_buffer ? 1 : 0;
             submit.pCommandBuffers = &command_buffer;
@@ -1682,6 +1904,7 @@ private:
         }
         const bool ok = (res == VK_SUCCESS);
         if (ok) {
+            submitted_ = ticket;
             waits_.clear();
             wait_values_.clear();
             for (auto& slot : buffers_)
@@ -1700,6 +1923,8 @@ private:
     std::vector<CommandSlot> buffers_;
     std::unique_ptr<OcclusionResolve> occlusion_resolve_;
     std::uint64_t storage_init_seen_ = 0;  // the storage_init_version_ this queue has waited for
+    std::uint64_t last_sparse_ = 0;
+    std::deque<PendingBindings> pending_bindings_;
     std::vector<VkSemaphore> waits_;
     std::vector<std::uint64_t> wait_values_;
     // execute's working storage. Per queue like buffers_: one execute at a time on a queue, as acquire() and

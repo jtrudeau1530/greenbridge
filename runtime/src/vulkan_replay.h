@@ -1,5 +1,7 @@
 #pragma once
 
+#include "resource_tiling.h"
+
 // Replays a closed CommandList (command_list.h) into a Vulkan command buffer.
 //
 // Layouts. With a LayoutTracker, every image's current Vulkan layout is known per subresource, and barriers and
@@ -86,6 +88,7 @@ struct ResourceBinding {
     bool rgb96 = false;
     bool color_attachment = false;     // has COLOR_ATTACHMENT usage: unordered-access rectangle clears need it
     bool host_readable = false;        // D3D12_HEAP_TYPE_READBACK (or CUSTOM write-back): needs host-read flush
+    bool sparse_buffer = false;
 };
 
 struct VulkanAccess {
@@ -2196,9 +2199,14 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             p.source = *source;
             ReplayResult result = ReplayResult::success;
             if (const auto* buffer_copy = std::get_if<CopyBuffer>(&command)) {
+                const auto size = [&](const ResourceBinding& binding, ResourceId id) {
+                    if (buffer_copy->tiled_resource != id) return binding.size;
+                    if (!binding.sparse_buffer) return VkDeviceSize(0);
+                    return (binding.size + tile_size_in_bytes - 1) / tile_size_in_bytes * tile_size_in_bytes;
+                };
                 if (!p.binding.buffer || !p.source.buffer ||
-                    !detail::within(buffer_copy->dst_offset, buffer_copy->size, p.binding.size) ||
-                    !detail::within(buffer_copy->src_offset, buffer_copy->size, p.source.size))
+                    !detail::within(buffer_copy->dst_offset, buffer_copy->size, size(p.binding, dst_id)) ||
+                    !detail::within(buffer_copy->src_offset, buffer_copy->size, size(p.source, src_id)))
                     return ReplayResult::invalid_copy;
                 if (buffer_copy->src_offset > UINT64_MAX - p.source.buffer_offset ||
                     buffer_copy->dst_offset > UINT64_MAX - p.binding.buffer_offset) return ReplayResult::invalid_copy;
