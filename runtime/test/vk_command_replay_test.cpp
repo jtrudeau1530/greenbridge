@@ -623,8 +623,17 @@ int part_e(vktest::Device& d) {
         l.set_predication({0, 0, 0});
         l.copy_buffer({predicate_id, 16, predicate_id, 0, 8});                  // after it: counted 0
     };
-    EXPECT(prepared_with(copies, vk, scratch) == ReplayResult::success);
-    EXPECT(scratch.unpredicated_copies == 1);
+    EXPECT(prepared_with(copies, vk, scratch) == ReplayResult::unsupported);
+    ReplayFunctions copy_functions = vk;
+    // Preparation-only routing test; no fake descriptor set is ever submitted.
+    copy_functions.prepare_predicated_copy = [](VkBuffer, VkBuffer, VkDeviceSize, VkDeviceSize, VkDeviceSize bytes,
+                                                std::vector<PredicatedCopyDispatch>& out) {
+        out.push_back({VK_NULL_HANDLE, 0, 0, static_cast<std::uint32_t>(bytes)});
+        return true;
+    };
+    copy_functions.emit_predicated_copy = [](VkCommandBuffer, const std::vector<PredicatedCopyDispatch>&) {};
+    EXPECT(prepared_with(copies, copy_functions, scratch) == ReplayResult::success);
+    EXPECT(scratch.unpredicated_copies == 0);
 
     const Rect corner{0, 0, 2, 2};
     CommandList list;

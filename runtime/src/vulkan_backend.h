@@ -688,6 +688,11 @@ public:
         predicate_family_ = family;
         predicate_reducer_ = std::make_unique<PredicateReducer>(get, device_, memory, max_range);
     }
+    // Configure before queue creation, only when storageBuffer8BitAccess is enabled on the device.
+    void configure_predicated_copy(PFN_vkGetDeviceProcAddr get, const VkPhysicalDeviceLimits& limits) {
+        std::unique_lock lock(resource_mutex_);
+        predicated_copier_ = std::make_unique<PredicatedBufferCopier>(get, device_, limits);
+    }
     VkDevice device() const { return device_; }
 
     // Debug markers become labels from here on; call before any queue or list uses the context. Incomplete sets
@@ -938,6 +943,7 @@ private:
     VkPhysicalDeviceMemoryProperties occlusion_resolve_memory_{};
     ReplayFunctions replay_;
     std::unique_ptr<PredicateReducer> predicate_reducer_;
+    std::unique_ptr<PredicatedBufferCopier> predicated_copier_;
     std::uint32_t predicate_family_ = UINT32_MAX;
     DebugLabelFunctions labels_;
 };
@@ -1071,6 +1077,7 @@ public:
             for (const auto& command : list->commands())
                 if (const auto* p = std::get_if<Predication>(&command); p && p->buffer) ++captures;
         std::unique_ptr<PredicateReducer::Batch> batch;
+        std::unique_ptr<PredicatedBufferCopier::Batch> copy_batch;
         if (captures) {
             if (kind_ == QueueKind::copy || !context_.predicate_reducer_ || family_ != context_.predicate_family_)
                 return ReplayResult::unsupported;
@@ -1085,6 +1092,17 @@ public:
             replay.capture_predicate = [&](VkCommandBuffer cb, const PredicateCapture& p) {
                 context_.predicate_reducer_->capture(cb, p);
             };
+            if (context_.predicated_copier_) {
+                copy_batch = context_.predicated_copier_->batch();
+                replay.prepare_predicated_copy = [&](VkBuffer source, VkBuffer destination, VkDeviceSize src,
+                                                     VkDeviceSize dst, VkDeviceSize size,
+                                                     std::vector<PredicatedCopyDispatch>& out) {
+                    return copy_batch->prepare(source, destination, src, dst, size, out);
+                };
+                replay.emit_predicated_copy = [&](VkCommandBuffer cb, const std::vector<PredicatedCopyDispatch>& jobs) {
+                    context_.predicated_copier_->emit(cb, jobs);
+                };
+            }
         }
         const auto& occlusion_memory = context_.occlusion_resolve_memory_;
         const bool can_resolve_occlusion = occlusion_memory.memoryTypeCount != 0;
@@ -1204,6 +1222,7 @@ public:
         if (submitted) {
             context_.tracker_ = std::move(next_tracker);
             slot->predicate = std::move(batch);
+            slot->predicated_copy = std::move(copy_batch);
             queries.commit();
             slot->segments = std::move(queries.retained);
         } else {
@@ -1255,6 +1274,7 @@ private:
         VkCommandBuffer buffer;
         std::uint64_t ticket;
         std::vector<std::shared_ptr<const OcclusionSegmentPool>> segments;
+        std::unique_ptr<PredicatedBufferCopier::Batch> predicated_copy;
         std::unique_ptr<PredicateReducer::Batch> predicate; // retained until this slot completes
     };
 
@@ -1272,6 +1292,7 @@ private:
         if (reuse) {
             if (context_.vk.vkResetCommandBuffer(reuse->buffer, 0) != VK_SUCCESS) return nullptr;
             reuse->predicate.reset();
+            reuse->predicated_copy.reset();
             reuse->ticket = UINT64_MAX;  // in use until submitted
             return reuse;
         }

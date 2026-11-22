@@ -1493,8 +1493,10 @@ public:
                 families(info.physical, &count, nullptr);
                 std::vector<VkQueueFamilyProperties> queues(count);
                 families(info.physical, &count, queues.data());
-                if (info.queue_family < count && (queues[info.queue_family].queueFlags & VK_QUEUE_COMPUTE_BIT))
+                if (info.queue_family < count && (queues[info.queue_family].queueFlags & VK_QUEUE_COMPUTE_BIT)) {
                     state_.context->configure_predication(get_device, state_.memory, limits.limits.maxStorageBufferRange, info.queue_family);
+                    if (info.storage_buffer_8bit) state_.context->configure_predicated_copy(get_device, limits.limits);
+                }
             }
         }
         if (info.host_image_copy) load_host_image_copy(get_device);
@@ -3694,6 +3696,8 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     enable12.separateDepthStencilLayouts = VK_TRUE;
     info.buffer_device_address = chosen12.bufferDeviceAddress == VK_TRUE;
     enable12.bufferDeviceAddress = info.buffer_device_address ? VK_TRUE : VK_FALSE;
+    info.storage_buffer_8bit = chosen12.storageBuffer8BitAccess == VK_TRUE;
+    enable12.storageBuffer8BitAccess = info.storage_buffer_8bit;
     // Where the GPU has them: what the bindless set 0 needs (VulkanDeviceInfo::bindless), and the sampler features
     // D3D12 samplers can ask for.
     info.bindless = chosen12.runtimeDescriptorArray && chosen_features.shaderSampledImageArrayDynamicIndexing &&
