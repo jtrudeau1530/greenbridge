@@ -456,5 +456,167 @@ class TestSaluNandSaveexecB64SymbolicAST(unittest.TestCase):
         self.assertIn("s_nand_saveexec_b64", repr(ast1))
 
 
+# --- Deterministic Scalar Instruction Interpreter ---
+
+class ScalarSaluInterpreter:
+    """Deterministic architectural interpreter for RDNA2 SALU instructions."""
+
+    def __init__(self, num_sgprs: int = 106) -> None:
+        self.num_sgprs = num_sgprs
+        self.sgprs = [0] * num_sgprs
+        self.exec: int = MASK64
+        self.scc: int = 0
+        self.cycle_count: int = 0
+
+    def get_sgpr_u32(self, idx: int) -> int:
+        if not (0 <= idx < self.num_sgprs):
+            raise IndexError(f"SGPR index out of range: s{idx}")
+        return self.sgprs[idx] & MASK32
+
+    def set_sgpr_u32(self, idx: int, val: int) -> None:
+        if not (0 <= idx < self.num_sgprs):
+            raise IndexError(f"SGPR index out of range: s{idx}")
+        self.sgprs[idx] = val & MASK32
+
+    def get_sgpr_u64(self, idx: int) -> int:
+        if not (0 <= idx <= self.num_sgprs - 2):
+            raise IndexError(f"SGPR pair index out of range: s[{idx}:{idx+1}]")
+        lo = self.get_sgpr_u32(idx)
+        hi = self.get_sgpr_u32(idx + 1)
+        return join_dwords(lo, hi)
+
+    def set_sgpr_u64(self, idx: int, val: int) -> None:
+        if not (0 <= idx <= self.num_sgprs - 2):
+            raise IndexError(f"SGPR pair index out of range: s[{idx}:{idx+1}]")
+        lo, hi = split_dwords(val)
+        self.set_sgpr_u32(idx, lo)
+        self.set_sgpr_u32(idx + 1, hi)
+
+    def resolve_src0(self, op: Operand) -> int:
+        if op.kind == OperandKind.SGPR_PAIR:
+            assert op.reg_index is not None
+            return self.get_sgpr_u64(op.reg_index)
+        elif op.kind == OperandKind.LITERAL_U64:
+            assert op.literal_val is not None
+            return op.literal_val & MASK64
+        elif op.kind == OperandKind.INLINE_CONST:
+            assert op.literal_val is not None
+            return op.literal_val & MASK64
+        elif op.kind == OperandKind.SPECIAL_REG:
+            if op.name == "exec":
+                return self.exec & MASK64
+            elif op.name == "vcc":
+                return self.get_sgpr_u64(104) if self.num_sgprs >= 106 else 0
+            else:
+                raise ValueError(f"Unknown special register: {op.name}")
+        else:
+            raise TypeError(f"Cannot resolve operand of kind {op.kind}")
+
+    def execute(self, ast: InstructionAST) -> None:
+        """Deterministically execute one instruction AST."""
+        ast.validate()
+        if ast.opcode == "s_nand_saveexec_b64":
+            src0_val = self.resolve_src0(ast.src0)
+            saved_exec = self.exec & MASK64
+            new_exec = ref_nand_b64(src0_val, saved_exec)
+            scc_val = ref_scc(new_exec)
+
+            # Destination write occurs
+            assert ast.dst.reg_index is not None
+            self.set_sgpr_u64(ast.dst.reg_index, saved_exec)
+
+            # State registers updated
+            self.exec = new_exec
+            self.scc = scc_val
+            self.cycle_count += 1
+        else:
+            raise NotImplementedError(f"Interpreter does not implement opcode {ast.opcode}")
+
+    def execute_asm(self, asm_str: str) -> None:
+        ast = parse_sop1_nand_saveexec_b64(asm_str)
+        self.execute(ast)
+
+
+class TestSaluNandSaveexecB64ScalarInterpreter(unittest.TestCase):
+    """Test suite for deterministic scalar instruction interpreter."""
+
+    def test_interp_basic_execution(self):
+        interp = ScalarSaluInterpreter()
+        interp.exec = 0xFFFFFFFF00000000
+        interp.set_sgpr_u64(2, 0x123456789ABCDEF0)
+
+        interp.execute_asm("s_nand_saveexec_b64 s[0:1], s[2:3]")
+        # SDST receives old EXEC
+        self.assertEqual(interp.get_sgpr_u64(0), 0xFFFFFFFF00000000)
+        # EXEC = ~(s[2:3] & old_exec) = ~(0x1234567800000000) = 0xEDCBA987FFFFFFFF
+        expected = (~(0x1234567800000000)) & MASK64
+        self.assertEqual(interp.exec, expected)
+        self.assertEqual(interp.scc, 1)
+
+    def test_interp_with_literal_constant(self):
+        interp = ScalarSaluInterpreter()
+        interp.exec = 0xAAAAAAAAAAAAAAAA
+        interp.execute_asm("s_nand_saveexec_b64 s[4:5], 0x5555555555555555")
+        self.assertEqual(interp.get_sgpr_u64(4), 0xAAAAAAAAAAAAAAAA)
+        # ~(0x5555... & 0xAAAA...) = ~(0) = MASK64
+        self.assertEqual(interp.exec, MASK64)
+        self.assertEqual(interp.scc, 1)
+
+    def test_interp_with_inline_constant(self):
+        interp = ScalarSaluInterpreter()
+        interp.exec = MASK64
+        interp.execute_asm("s_nand_saveexec_b64 s[6:7], -1")
+        self.assertEqual(interp.get_sgpr_u64(6), MASK64)
+        # ~(-1 & -1) = ~(-1) = 0
+        self.assertEqual(interp.exec, 0)
+        self.assertEqual(interp.scc, 0)
+
+    def test_interp_with_special_reg_exec(self):
+        interp = ScalarSaluInterpreter()
+        interp.exec = 0x123456789ABCDEF0
+        interp.execute_asm("s_nand_saveexec_b64 s[8:9], exec")
+        # SDST receives old EXEC
+        self.assertEqual(interp.get_sgpr_u64(8), 0x123456789ABCDEF0)
+        # EXEC = ~(old_exec & old_exec) = ~old_exec
+        expected = (~0x123456789ABCDEF0) & MASK64
+        self.assertEqual(interp.exec, expected)
+        self.assertEqual(interp.scc, 1)
+
+    def test_interp_sequential_state_flow(self):
+        interp = ScalarSaluInterpreter()
+        interp.exec = 0xF0F0F0F0F0F0F0F0
+        interp.set_sgpr_u64(0, 0x0F0F0F0F0F0F0F0F)
+        interp.set_sgpr_u64(2, 0x00FF00FF00FF00FF)
+
+        # Step 1: nand_saveexec with s[0:1]
+        interp.execute_asm("s_nand_saveexec_b64 s[4:5], s[0:1]")
+        self.assertEqual(interp.get_sgpr_u64(4), 0xF0F0F0F0F0F0F0F0)
+        # ~(0x0F0F... & 0xF0F0...) = ~(0) = MASK64
+        self.assertEqual(interp.exec, MASK64)
+
+        # Step 2: nand_saveexec with s[2:3]
+        interp.execute_asm("s_nand_saveexec_b64 s[6:7], s[2:3]")
+        self.assertEqual(interp.get_sgpr_u64(6), MASK64)
+        # ~(0x00FF00FF00FF00FF & MASK64) = ~0x00FF00FF00FF00FF = 0xFF00FF00FF00FF00
+        self.assertEqual(interp.exec, 0xFF00FF00FF00FF00)
+        self.assertEqual(interp.scc, 1)
+
+    def test_interp_unmodified_registers_preserved(self):
+        interp = ScalarSaluInterpreter()
+        for i in range(interp.num_sgprs):
+            interp.set_sgpr_u32(i, 0xDEAD0000 | i)
+
+        interp.exec = 0xCAFEBABEDEADBEEF
+        interp.execute_asm("s_nand_saveexec_b64 s[10:11], 0")
+
+        # Destination s[10:11] updated
+        self.assertEqual(interp.get_sgpr_u64(10), 0xCAFEBABEDEADBEEF)
+
+        # All other SGPRs must remain unchanged
+        for i in range(interp.num_sgprs):
+            if i not in (10, 11):
+                self.assertEqual(interp.get_sgpr_u32(i), 0xDEAD0000 | i)
+
+
 if __name__ == "__main__":
     unittest.main()
