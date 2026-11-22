@@ -757,5 +757,101 @@ class TestSIMDMultiLaneDivergenceAndExecMasking(unittest.TestCase):
             self.assertEqual(state.get_vgpr(lane, 0), OLD_VGPR_SENTINEL)
 
 
+class TestRegisterAliasingAndInPlacePreservation(unittest.TestCase):
+    """Test suite for register aliasing and in-place operand preservation."""
+
+    def setUp(self) -> None:
+        self.interp = ScalarInterpreter()
+        self.simd_interp = SIMDInterpreter()
+
+    def test_dst_aliases_src0(self) -> None:
+        # v0 = v0 * v1
+        state = ScalarState()
+        state.set_vgpr(0, pack_f16x2(f16_to_u16(2.0), f16_to_u16(3.0)))
+        state.set_vgpr(1, pack_f16x2(f16_to_u16(4.0), f16_to_u16(5.0)))
+
+        instr = VPkMulF16Instruction(
+            dst=Reg(0, RegType.VGPR),
+            src0=VOP3POperand(reg=Reg(0, RegType.VGPR)),
+            src1=VOP3POperand(reg=Reg(1, RegType.VGPR)),
+        )
+        res = self.interp.step(instr, state)
+        res_lo, res_hi = unpack_f16x2(res)
+        self.assertAlmostEqual(u16_to_f16(res_lo), 8.0)
+        self.assertAlmostEqual(u16_to_f16(res_hi), 15.0)
+        self.assertEqual(state.get_vgpr(0), res)
+
+    def test_dst_aliases_src1(self) -> None:
+        # v0 = v1 * v0
+        state = ScalarState()
+        state.set_vgpr(0, pack_f16x2(f16_to_u16(2.0), f16_to_u16(3.0)))
+        state.set_vgpr(1, pack_f16x2(f16_to_u16(4.0), f16_to_u16(5.0)))
+
+        instr = VPkMulF16Instruction(
+            dst=Reg(0, RegType.VGPR),
+            src0=VOP3POperand(reg=Reg(1, RegType.VGPR)),
+            src1=VOP3POperand(reg=Reg(0, RegType.VGPR)),
+        )
+        res = self.interp.step(instr, state)
+        res_lo, res_hi = unpack_f16x2(res)
+        self.assertAlmostEqual(u16_to_f16(res_lo), 8.0)
+        self.assertAlmostEqual(u16_to_f16(res_hi), 15.0)
+        self.assertEqual(state.get_vgpr(0), res)
+
+    def test_dst_aliases_both_src0_and_src1_squaring(self) -> None:
+        # v0 = v0 * v0 (in-place squaring)
+        state = ScalarState()
+        state.set_vgpr(0, pack_f16x2(f16_to_u16(3.0), f16_to_u16(-4.0)))
+
+        instr = VPkMulF16Instruction(
+            dst=Reg(0, RegType.VGPR),
+            src0=VOP3POperand(reg=Reg(0, RegType.VGPR)),
+            src1=VOP3POperand(reg=Reg(0, RegType.VGPR)),
+        )
+        res = self.interp.step(instr, state)
+        res_lo, res_hi = unpack_f16x2(res)
+        self.assertAlmostEqual(u16_to_f16(res_lo), 9.0)
+        self.assertAlmostEqual(u16_to_f16(res_hi), 16.0)
+        self.assertEqual(state.get_vgpr(0), res)
+
+    def test_cross_half_aliasing_inplace(self) -> None:
+        # v0 = v0 * v0 op_sel:[1,0] op_sel_hi:[0,1]
+        # v0 starts as [2.0, 5.0]
+        # lo uses (v0.hi, v0.lo) -> 5.0 * 2.0 = 10.0
+        # hi uses (v0.lo, v0.hi) -> 2.0 * 5.0 = 10.0
+        state = ScalarState()
+        state.set_vgpr(0, pack_f16x2(f16_to_u16(2.0), f16_to_u16(5.0)))
+
+        instr = VPkMulF16Instruction(
+            dst=Reg(0, RegType.VGPR),
+            src0=VOP3POperand(reg=Reg(0, RegType.VGPR)),
+            src1=VOP3POperand(reg=Reg(0, RegType.VGPR)),
+            op_sel=(1, 0),
+            op_sel_hi=(0, 1),
+        )
+        res = self.interp.step(instr, state)
+        res_lo, res_hi = unpack_f16x2(res)
+        self.assertAlmostEqual(u16_to_f16(res_lo), 10.0)
+        self.assertAlmostEqual(u16_to_f16(res_hi), 10.0)
+
+    def test_simd_multi_lane_inplace_aliasing(self) -> None:
+        state = SIMDState(wave_size=32, exec_mask=0xFFFFFFFF)
+        for lane in range(32):
+            state.set_vgpr(lane, 0, pack_f16x2(f16_to_u16(float(lane)), f16_to_u16(2.0)))
+
+        instr = VPkMulF16Instruction(
+            dst=Reg(0, RegType.VGPR),
+            src0=VOP3POperand(reg=Reg(0, RegType.VGPR)),
+            src1=VOP3POperand(reg=Reg(0, RegType.VGPR)),
+        )
+        self.simd_interp.step(instr, state)
+
+        for lane in range(32):
+            res = state.get_vgpr(lane, 0)
+            res_lo, res_hi = unpack_f16x2(res)
+            self.assertAlmostEqual(u16_to_f16(res_lo), float(lane) ** 2)
+            self.assertAlmostEqual(u16_to_f16(res_hi), 4.0)
+
+
 if __name__ == "__main__":
     unittest.main()
