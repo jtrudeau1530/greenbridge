@@ -109,12 +109,15 @@ component table.
 The character export requested 215 texture keys and matched **184**. The only sRGB albedo slot is
 `0xC8E8C282` (`diffusetex`); `0xC6F46E79` is `speculartex` (specular/gloss pack), `0x1E77BF4C` is
 `bumptex` (the tangent-space normal), `0x739E3D0D` is `speculartex2` (packed ORM), and
-`0x8ADB8480` is `materialid` (an ID/palette map, declared but unbound on the jacket). The garment
+`0x8ADB8480` is `materialid` (an ID/palette map). The jacket's and the crop tee's material rows
+reference one (`0x6CD70ED1054EF726`, `0xF0722B975F329141`, both `BC4_UNORM` textures in the
+`ttdb_peds` pools); the bikini top's and the undies' rows have no such slot. Whether a shader
+samples it is not measured. The garment
 shaders (`d5ed50f4`, `ea8d09d0`, `39ddb9ca`) do not declare a `0xC8E8C282` slot at all: none of
 their 7,948 material rows in the export has one. The jacket and the crop tee are on them, so they
 have no albedo. A part without one keeps a flat colour; it must not
 be painted with `speculartex` or an ORM map. The garments' `_COLOR0` vertex data is baked shading
-(alpha 255 on every vertex), not a tint; `materialid` is unbound on all four, and the shader
+(alpha 255 on every vertex), not a tint, and the shader
 declares no tint or palette slot. No authored base colour exists to recover for those two.
 
 The bikini top and the undies are not on the garment shaders, and they do have an albedo. All
