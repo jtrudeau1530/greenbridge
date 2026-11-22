@@ -44,6 +44,25 @@ validator rejects it (the scan reports both counts).
   holds tag `0x07` (a second `DXIL` program header) and tag `0x12` (a 16-byte hash). The `STAT` chunk holds a
   second, different bitcode blob, not the same one.
 
+### `STAT` and the `0x07` program header
+
+Measured over all 52 builder containers in one local 1.0.2.1 package; no shader data is included here. The
+bitcode spans below use the `DxilProgramHeader`/`DxilBitcodeHeader` offsets and sizes defined by
+[DirectXShaderCompiler](https://github.com/microsoft/DirectXShaderCompiler/blob/main/include/dxc/DxilContainer/DxilContainer.h).
+All spans fit inside their enclosing parts, and all 104 `STAT` and outer `DXIL` bitcode modules were accepted by
+`llvm-dis` 21.1.8. The header's size-in-dwords equals its enclosing part or record length in every case.
+
+* **`STAT`:** 52/52 contain a `DXIL` program header and a bitcode module distinct from the outer `DXIL` bitcode.
+  All have `dx.entryPoints` and `dx.resources` metadata, and none defines a function in the `llvm-dis` output;
+  the outer modules define functions. DirectXShaderCompiler calls this the shader-statistics part and uses a valid
+  `STAT` module for reflection (see its
+  [container reflection implementation](https://github.com/microsoft/DirectXShaderCompiler/blob/main/lib/HLSL/DxilContainerReflection.cpp)).
+  The metadata-only shape is consistent with that role; the builder's actual consumption of `STAT` is not measured.
+* **XDAT tag `0x07`:** 52/52 contain a `DXIL` program header whose declared bitcode is byte-identical to that of
+  the outer `DXIL` part. None contains the `NOBC` marker. The whole `0x07` record is not the same as the whole
+  outer part, which also contains `XDAT`. This differs from the `NOBC` form documented for the game's shader
+  corpus in [fssm_crosscheck.md](fssm_crosscheck.md); it does not change that separate measurement.
+
 The bitcode is what a PC D3D12 compiler consumes; the runtime path is the `XBCH` record. The constructor passes
 the **whole container** to the compute-PSO call: at `0x180021330` it loads `DAT_180025700` with size `0x1134`
 (4,404 bytes, the size of container 0, `CopyAndCompactBVH`) and calls `FUN_18000c470`, whose vtable call at
@@ -165,8 +184,8 @@ python -I tools/rdna2spirv.py <work>/embedded/dxbc/disasm --out <work>/embedded/
   `Box16Rehydration` needs `buffer_store_short`.
 * **What is still open.** None of the 52 has been executed on a GPU; translation and `spirv-val` do not prove the
   output. Which of them the game actually creates is a call-site question (RT-5). The module-to-pipeline order
-  above comes from `ILDN`, not from a runtime trace. The `STAT` bitcode and the `0x07 NOBC` record are not
-  explained.
+  above comes from `ILDN`, not from a runtime trace. The `STAT` metadata-only shape is consistent with reflection,
+  but whether the builder consumes it has not been measured.
 
 ## 6. Tool and tests
 
