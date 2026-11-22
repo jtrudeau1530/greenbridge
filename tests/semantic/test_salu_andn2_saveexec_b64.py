@@ -799,5 +799,90 @@ class TestSaluAndn2SaveexecB64SIMDMultiLane(unittest.TestCase):
         self.assertFalse(engine.is_lane_active(32))
 
 
+# --- Register Aliasing and In-Place Operand Preservation ---
+
+class TestSaluAndn2SaveexecB64RegisterAliasing(unittest.TestCase):
+    """Test suite for register aliasing and in-place operand preservation."""
+
+    def test_in_place_dst_src0_aliasing_read_before_write(self):
+        """Verify sdst == ssrc0: SSRC0 must be read BEFORE SDST is overwritten.
+        
+        Instruction: s_andn2_saveexec_b64 s[0:1], s[0:1]
+        Let S0 = 0xAAAAAAAAAAAAAAAA, EXEC = 0x5555555555555555.
+        Hardware behavior:
+            saved_exec = EXEC = 0x5555555555555555
+            new_exec = S0 & ~saved_exec = 0xAAAA... & ~0x5555... = 0xAAAAAAAAAAAAAAAA
+            s[0:1] = saved_exec = 0x5555555555555555
+            EXEC = new_exec = 0xAAAAAAAAAAAAAAAA
+        If SDST was written before SSRC0 was read:
+            new_exec would compute saved_exec & ~saved_exec = 0 (BUG!).
+        """
+        interp = ScalarSaluInterpreter()
+        s0_val = 0xAAAAAAAAAAAAAAAA
+        exec_val = 0x5555555555555555
+        interp.set_sgpr_u64(0, s0_val)
+        interp.exec = exec_val
+
+        interp.execute_asm("s_andn2_saveexec_b64 s[0:1], s[0:1]")
+
+        # Destination receives the OLD EXEC
+        self.assertEqual(interp.get_sgpr_u64(0), exec_val)
+        # EXEC receives (S0 & ~EXEC) using the OLD S0
+        self.assertEqual(interp.exec, s0_val)
+        self.assertEqual(interp.scc, 1)
+
+    def test_in_place_aliasing_with_complement(self):
+        """Verify in-place aliasing when S0 is identical to EXEC.
+        
+        S0 = 0x123456789ABCDEF0, EXEC = 0x123456789ABCDEF0.
+        new_exec = S0 & ~EXEC = 0.
+        s[2:3] gets 0x123456789ABCDEF0.
+        EXEC gets 0.
+        SCC gets 0.
+        """
+        interp = ScalarSaluInterpreter()
+        val = 0x123456789ABCDEF0
+        interp.set_sgpr_u64(2, val)
+        interp.exec = val
+
+        interp.execute_asm("s_andn2_saveexec_b64 s[2:3], s[2:3]")
+        self.assertEqual(interp.get_sgpr_u64(2), val)
+        self.assertEqual(interp.exec, 0)
+        self.assertEqual(interp.scc, 0)
+
+    def test_chained_saveexec_register_reuse(self):
+        """Verify re-use of saved EXEC in multi-level nested control flow."""
+        interp = ScalarSaluInterpreter()
+        initial_exec = 0xFFFFFFFFFFFFFFFF
+        interp.exec = initial_exec
+
+        # First level branching: s[0:1] saves initial_exec
+        interp.set_sgpr_u64(4, 0x00000000FFFFFFFF)
+        interp.execute_asm("s_andn2_saveexec_b64 s[0:1], s[4:5]")
+        # s[0:1] = 0xFFFFFFFFFFFFFFFF
+        # EXEC = 0x00000000FFFFFFFF & ~0xFFFFFFFFFFFFFFFF = 0
+        self.assertEqual(interp.get_sgpr_u64(0), initial_exec)
+        self.assertEqual(interp.exec, 0)
+
+        # Second level branching: invert using the saved EXEC from s[0:1]
+        interp.execute_asm("s_andn2_saveexec_b64 s[2:3], s[0:1]")
+        # s[2:3] = 0 (the old EXEC)
+        # EXEC = s[0:1] & ~0 = 0xFFFFFFFFFFFFFFFF & ~0 = 0xFFFFFFFFFFFFFFFF
+        self.assertEqual(interp.get_sgpr_u64(2), 0)
+        self.assertEqual(interp.exec, initial_exec)
+        self.assertEqual(interp.scc, 1)
+
+    def test_high_register_indices_aliasing(self):
+        """Verify aliasing at the upper boundary of SGPR file (s[104:105])."""
+        interp = ScalarSaluInterpreter()
+        interp.set_sgpr_u64(104, 0xCAFEBABE00000000)
+        interp.exec = 0x00000000DEADBEEF
+
+        interp.execute_asm("s_andn2_saveexec_b64 s[104:105], s[104:105]")
+        self.assertEqual(interp.get_sgpr_u64(104), 0x00000000DEADBEEF)
+        self.assertEqual(interp.exec, 0xCAFEBABE00000000)
+        self.assertEqual(interp.scc, 1)
+
+
 if __name__ == "__main__":
     unittest.main()
