@@ -8,6 +8,34 @@ it.
 Measured on the local package's disassembly (`work/shaders/dxbc/disasm`) at `16282101`. Offsets, bit positions and
 counts only; no shader text.
 
+## Bloom and exposure
+
+Reported by @Silliana in [#3235](https://github.com/ItsNotRexed/Leonida/issues/3235). The observations below were
+checked against the local disassembly. Offsets are bytes into the constant buffer read by the named shader.
+
+### A black bloom chain (`PS_DownSampleBloomFilterKaris`)
+
+- Check the RGB tint at `+0x00`, `+0x04` and `+0x08` first. The shader multiplies the filtered colour by these
+  values before export. An all-zero tint makes bloom black even with a valid source. The fourth value at `+0x0C`
+  feeds the exported alpha.
+- The sample loop has a limit of 13. The scale at `+0x1C` feeds the luminance-dependent reciprocal weights.
+  Setting it to zero removes that dependence for finite inputs. The spatial filter and output tint still apply.
+
+### Flat, wrong or slowly changing exposure (`PS_CalculateExposure`)
+
+- The mode dword at `+0x410` selects the exposure calculation. A nonzero value takes the path that computes
+  logarithmic exposure from the measured luminance. Check this before diagnosing the automatic exposure path.
+- On the compensation path, a nonzero dword at `+0x40C` selects the fixed value at `+0x408`. Zero selects a
+  sample from a 1D compensation curve. Check that the curve is bound when using the texture path.
+- The report also describes adaptation from the previous frame's exposure. For a single-frame comparison, account
+  for the initial exposure and adaptation threshold. This first-frame guidance comes from the issue report.
+
+### Luminance downsample and bloom upsample
+
+`PS_LuminanceSourceDownsample` has five sampling sites and `PS_UpSampleBloomFilterBlend` has nine. Check the
+source resolution, sampling and reduction before comparing the luminance pyramid with a whole-frame average.
+When inspecting the upsample in isolation, check in the pipeline state how its output blends with the previous level.
+
 ## Studio-shot lighting (`PS_STUDIOSHOT_PBR_MATERIAL_STANDARD_LIGHTING`)
 
 Reported by @Silliana in [#1892](https://github.com/ItsNotRexed/Leonida/issues/1892). The corpus has one program
