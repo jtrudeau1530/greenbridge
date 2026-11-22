@@ -56,7 +56,7 @@ entries are dictionary children.
 | `data.rpf` | 2,402 | **2,581** | 268 | 2,313 |
 | `pack/shared_minigame000/...` | 1,070 | **1,288** | 317 | 971 |
 | `pack/core_restofworld/...` | 1,024 | **885** | 797 | 88 |
-| `pack/story000/story000.rpf` | 4,195 | **7,460** | 4,156 | 3,304 |
+| `pack/story000/story000.rpf` | 4,195 | **7,460** | 4,156 | 3,305 |
 | `packs.rpf` | 23,838 | **24,034** | 23,720 | 314 |
 | `levels.rpf` | 206,981 | **314,000** | 130,225 | 183,801 |
 | `story000_restofworld` | 1 | **3** | 3 | 0 |
