@@ -334,6 +334,12 @@ that starts from a known pattern. It runs 4 to 12 random `ds_*` instructions, ea
 - **Reports.** A mismatch names the thread, the register or LDS word, and the op that last wrote it.
   `--no-exec KIND` drops one op kind's masks without changing the rest of the program, to separate
   a known finding from new ones.
+- **Subgroup size.** Wave32 programs, and wave64 ones built with `--emulate`, ask `vk_compute_test` for
+  32-lane subgroups (`VKC_SUBGROUP_SIZE=32`). Where the device can't pin that size, `vk_compute_test`
+  prints `compute subgroup size: 32 not available` and runs at the driver's choice, and the wave32
+  program is a skip, not a mismatch: its words come from another wave size. Mesa llvmpipe (8 lanes)
+  is such a device. Emulated wave64 uses no subgroup operations, so it is still compared there.
+  `valu_fuzz.py` and `crosslane_fuzz.py` follow the same rule.
 
 First results on an RX 6700 XT (RADV, Mesa 26.3.1), native wave64/wave32 and with
 `--wave64-emulate` at subgroup 32:
