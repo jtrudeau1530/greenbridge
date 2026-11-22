@@ -12,6 +12,9 @@ test_interp_f16.py (clamp), test_interp_f16_high.py (p1ll low/high), or test_f16
 - I-source guards (interp_pair_src) for v_interp_p1lv_f16 and v_interp_p1ll_f16, plus Unsupported("<op> form")
   rejection on non-PS stages (vs_, cs_) and missing `attr` operands for all three *_f16 opcodes.
 """
+from __future__ import annotations
+
+import math
 import os
 import re
 import struct
@@ -47,6 +50,110 @@ def f16_bits(val):
 
 def f32_bits(val):
     return struct.unpack("<I", struct.pack("<f", float(val)))[0]
+
+
+def f16_round(val: float) -> float:
+    """Round a float to binary16 precision."""
+    try:
+        return struct.unpack("<e", struct.pack("<e", float(val)))[0]
+    except OverflowError:
+        return float("inf") if val > 0 else float("-inf")
+
+
+def f16_to_bits(val: float) -> int:
+    """Return uint16 bits of half-precision float."""
+    try:
+        return struct.unpack("<H", struct.pack("<e", float(val)))[0]
+    except OverflowError:
+        return 0x7C00 if val > 0 else 0xFC00
+
+
+def bits_to_f16(bits: int) -> float:
+    """Convert uint16 bits to float."""
+    return struct.unpack("<e", struct.pack("<H", bits & 0xFFFF))[0]
+
+
+def f32_round(val: float) -> float:
+    """Round a float to binary32 precision."""
+    try:
+        return struct.unpack("<f", struct.pack("<f", float(val)))[0]
+    except OverflowError:
+        return float("inf") if val > 0 else float("-inf")
+
+
+def f32_to_bits(val: float) -> int:
+    """Return uint32 bits of single-precision float."""
+    try:
+        return struct.unpack("<I", struct.pack("<f", float(val)))[0]
+    except OverflowError:
+        return 0x7F800000 if val > 0 else 0xFF800000
+
+
+def bits_to_f32(bits: int) -> float:
+    """Convert uint32 bits to float."""
+    return struct.unpack("<f", struct.pack("<I", bits & 0xFFFFFFFF))[0]
+
+
+def unpack_f16_halves(word: int) -> tuple[float, float]:
+    """Unpack low and high f16 halves from a 32-bit packed word."""
+    lo = bits_to_f16(word & 0xFFFF)
+    hi = bits_to_f16((word >> 16) & 0xFFFF)
+    return lo, hi
+
+
+def compute_perspective_barycentrics(l0: float, l1: float, l2: float,
+                                     w0: float, w1: float, w2: float) -> tuple[float, float]:
+    """Compute perspective-corrected barycentric coordinates (i_persp, j_persp)."""
+    inv_w0 = 1.0 / w0
+    inv_w1 = 1.0 / w1
+    inv_w2 = 1.0 / w2
+    inv_w_total = l0 * inv_w0 + l1 * inv_w1 + l2 * inv_w2
+    i_persp = (l1 * inv_w1) / inv_w_total
+    j_persp = (l2 * inv_w2) / inv_w_total
+    return f32_round(i_persp), f32_round(j_persp)
+
+
+def v_interp_p1lv_f16_ref(i_coord: float, p0: float, p1: float) -> float:
+    """Reference oracle for v_interp_p1lv_f16: D = P0 + i * (P1 - P0) in f32 intermediate precision."""
+    d1 = f32_round(p1 - p0)
+    m1 = f32_round(d1 * i_coord)
+    return f32_round(p0 + m1)
+
+
+def v_interp_p2_f16_ref(j_coord: float, p0: float, p2: float,
+                        p1_accum: float, clamp: bool = False) -> int:
+    """Reference oracle for v_interp_p2_f16: D = p1_accum + j * (P2 - P0), optional clamp, narrowed to f16 bits."""
+    d2 = f32_round(p2 - p0)
+    m2 = f32_round(d2 * j_coord)
+    res_f32 = f32_round(p1_accum + m2)
+    if clamp:
+        res_f32 = max(0.0, min(1.0, res_f32))
+    return f16_to_bits(res_f32)
+
+
+def v_interp_p1lv_eval_ref(i_coord: float, j_coord: float,
+                           p0: float, p1: float, p2: float,
+                           clamp: bool = False) -> tuple[float, int]:
+    """Evaluate paired v_interp_p1lv_f16 and v_interp_p2_f16: returns (f32_intermediate, f16_bits)."""
+    p1_accum = v_interp_p1lv_f16_ref(i_coord, p0, p1)
+    p2_res = v_interp_p2_f16_ref(j_coord, p0, p2, p1_accum, clamp=clamp)
+    return p1_accum, p2_res
+
+
+def analytical_perspective_interp_f16(p0: float, p1: float, p2: float,
+                                      l0: float, l1: float, l2: float,
+                                      w0: float, w1: float, w2: float,
+                                      clamp: bool = False) -> int:
+    """Analytical perspective interpolation ground truth narrowed to f16 bits."""
+    inv_w0 = 1.0 / w0
+    inv_w1 = 1.0 / w1
+    inv_w2 = 1.0 / w2
+    inv_w_total = l0 * inv_w0 + l1 * inv_w1 + l2 * inv_w2
+    numer = l0 * p0 * inv_w0 + l1 * p1 * inv_w1 + l2 * p2 * inv_w2
+    val = numer / inv_w_total
+    if clamp:
+        val = max(0.0, min(1.0, val))
+    return f16_to_bits(val)
 
 
 def lerp(values, bary=BARY):
@@ -464,6 +571,92 @@ class InterpF16GuardsAndRejectionsTests(unittest.TestCase):
                                          [insn, "exp mrt0 v2, v2, v2, v2 done vm", "s_endpgm"],
                                          dxbc=PS_ATTR01_DXBC)
                 self.assertIn(f"{op} form", str(cm.exception))
+
+
+class InterpP1lvF16ReferenceOracleTests(unittest.TestCase):
+    """Mathematical reference oracle tests for half-precision perspective interpolation."""
+
+    def test_vertex_boundary_conditions(self):
+        p0, p1, p2 = 2.0, 6.0, 14.0
+        p1_acc, p2_bits = v_interp_p1lv_eval_ref(0.0, 0.0, p0, p1, p2)
+        self.assertEqual(p1_acc, 2.0)
+        self.assertEqual(p2_bits, f16_to_bits(2.0))
+
+        p1_acc, p2_bits = v_interp_p1lv_eval_ref(1.0, 0.0, p0, p1, p2)
+        self.assertEqual(p1_acc, 6.0)
+        self.assertEqual(p2_bits, f16_to_bits(6.0))
+
+        p1_acc, p2_bits = v_interp_p1lv_eval_ref(0.0, 1.0, p0, p1, p2)
+        self.assertEqual(p1_acc, 2.0)
+        self.assertEqual(p2_bits, f16_to_bits(14.0))
+
+    def test_edge_midpoints_and_centroid(self):
+        p0, p1, p2 = 4.0, 8.0, 16.0
+        _, res_01 = v_interp_p1lv_eval_ref(0.5, 0.0, p0, p1, p2)
+        self.assertEqual(res_01, f16_to_bits(6.0))
+
+        _, res_02 = v_interp_p1lv_eval_ref(0.0, 0.5, p0, p1, p2)
+        self.assertEqual(res_02, f16_to_bits(10.0))
+
+        _, res_12 = v_interp_p1lv_eval_ref(0.5, 0.5, p0, p1, p2)
+        self.assertEqual(res_12, f16_to_bits(12.0))
+
+        third = f32_round(1.0 / 3.0)
+        _, res_c = v_interp_p1lv_eval_ref(third, third, p0, p1, p2)
+        expected_c = (4.0 + 8.0 + 16.0) / 3.0
+        self.assertAlmostEqual(bits_to_f16(res_c), expected_c, delta=0.01)
+
+    def test_perspective_parameter_calculation_equal_vs_varying_depth(self):
+        p0, p1, p2 = 10.0, 50.0, 100.0
+        i_eq, j_eq = compute_perspective_barycentrics(0.2, 0.5, 0.3, 4.0, 4.0, 4.0)
+        self.assertAlmostEqual(i_eq, 0.5, places=5)
+        self.assertAlmostEqual(j_eq, 0.3, places=5)
+        _, res_eq = v_interp_p1lv_eval_ref(i_eq, j_eq, p0, p1, p2)
+        self.assertEqual(res_eq, analytical_perspective_interp_f16(p0, p1, p2, 0.2, 0.5, 0.3, 4.0, 4.0, 4.0))
+
+        cases = [
+            (0.333333, 0.333333, 0.333334, 1.0, 2.0, 4.0, 1.0, 5.0, 10.0),
+            (0.1, 0.7, 0.2, 0.5, 5.0, 2.5, 0.0, 1.0, 0.5),
+            (0.6, 0.2, 0.2, 10.0, 1.0, 5.0, -10.0, 20.0, 50.0),
+        ]
+        for l0, l1, l2, w0, w1, w2, a0, a1, a2 in cases:
+            with self.subTest(w=(w0, w1, w2), a=(a0, a1, a2)):
+                i_p, j_p = compute_perspective_barycentrics(l0, l1, l2, w0, w1, w2)
+                _, got_bits = v_interp_p1lv_eval_ref(i_p, j_p, a0, a1, a2)
+                want_bits = analytical_perspective_interp_f16(a0, a1, a2, l0, l1, l2, w0, w1, w2)
+                self.assertAlmostEqual(bits_to_f16(got_bits), bits_to_f16(want_bits), delta=0.05)
+
+    def test_standalone_p1lv_f32_precision(self):
+        p0 = 1.0009765625
+        p1 = 1.001953125
+        i_c = 0.3333333432674408
+        p1_accum = v_interp_p1lv_f16_ref(i_c, p0, p1)
+        self.assertNotEqual(p1_accum, f16_round(p1_accum))
+
+    def test_unpack_f16_halves_and_pack(self):
+        lo_in, hi_in = 1.75, -9.5
+        packed = pack_f16(lo_in, hi_in)
+        lo_out, hi_out = unpack_f16_halves(packed)
+        self.assertEqual(lo_out, lo_in)
+        self.assertEqual(hi_out, hi_in)
+
+    def test_vop3_clamp_oracle(self):
+        _, clamped_neg = v_interp_p1lv_eval_ref(0.25, 0.5, -2.0, -4.0, 1.0, clamp=True)
+        self.assertEqual(clamped_neg, 0x0000)
+
+        _, clamped_high = v_interp_p1lv_eval_ref(0.25, 0.5, 2.0, 4.0, 3.0, clamp=True)
+        self.assertEqual(clamped_high, 0x3C00)
+
+        _, unclamped = v_interp_p1lv_eval_ref(0.25, 0.5, 0.0, 0.5, 1.0, clamp=False)
+        _, clamped_mid = v_interp_p1lv_eval_ref(0.25, 0.5, 0.0, 0.5, 1.0, clamp=True)
+        self.assertEqual(unclamped, clamped_mid)
+
+    def test_nearest_even_tie_rounding_oracle(self):
+        tie_even = 1.0 + 2.0**-11
+        self.assertEqual(f16_to_bits(tie_even), 0x3C00)
+
+        tie_odd = 1.0 + 2.0**-10 + 2.0**-11
+        self.assertEqual(f16_to_bits(tie_odd), 0x3C02)
 
 
 if __name__ == "__main__":
