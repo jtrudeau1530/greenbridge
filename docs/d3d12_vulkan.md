@@ -3,11 +3,19 @@
 **Status: in progress. A Vulkan-backed `ID3D12Device` (queues, allocators, command lists, fences, descriptor heaps,
 render-target and depth views, texture views and samplers, committed and reserved buffers, 2D textures and 3D texture transfers and color clears, and query heaps)
 runs behind the Xbox-ABI device proxy, and a presenter puts back buffers in a window (section 3.2). The M0
-milestone passes in a synthetic test (section 6). `D3D12XboxCreateDevice` uses it when `LEONIDA_D3D12=vulkan` is
-set and the host PC device otherwise. Buffer views, root signatures, PSOs, draws and the game's own present
-entry point (DXGI or PresentX) are not implemented.** This is the plan for replacing the console's
-`d3d12_xs.dll` with an implementation that records D3D12 commands and replays them on Vulkan, while producing
-exactly the shader-visible contract that `tools/rdna2spirv.py` already emits against (see
+milestone passes in a synthetic test (section 6), M1 with stand-in shaders in `d3d12_draw_test`, M1.5 with
+hand-written RDNA2 run through the translator in `d3d12_translated_draw_test`, and the synthetic part of M2
+(descriptor heaps, SRVs, a sampler and a translated textured-quad draw, 4,096 exact pixels) in
+`d3d12_m2_textured_test`. `D3D12XboxCreateDevice` uses it when `LEONIDA_D3D12=vulkan` is
+set and the host PC device otherwise. Root signatures (packed into the 32 user-data dwords), graphics and compute
+PSOs, draws, dispatches, `ExecuteIndirect`, and presentation through `PresentX` or a DXGI swapchain are implemented
+and have GPU tests; which present path the game uses is still open (question 6). Shader-resource views of buffers,
+pipeline-state streams (`CreatePipelineState`), tessellation and stream-output pipelines are not implemented, and
+mesh shaders are reported as not supported (stream PSOs and mesh shaders: D3D-29, #1712). The device reports
+`RaytracingTier` as `NOT_SUPPORTED`, yet `BuildRaytracingAccelerationStructure` builds XDXR BVH4 structures on the
+GPU (section 4.8).** This is the plan for
+replacing the console's `d3d12_xs.dll` with an implementation that records D3D12 commands and replays them on
+Vulkan, while producing exactly the shader-visible contract that `tools/rdna2spirv.py` already emits against (see
 [design.md](design.md#translator-status-and-runtime-contract)).
 
 The document is deliberately conservative about what is known. Every claim is marked:
@@ -468,11 +476,11 @@ What is implemented (all of it testable without the game):
   BC1–7 textures need `textureCompressionBC`, which the device enables when the GPU has it, as it does
   `occlusionQueryPrecise` and `pipelineStatisticsQuery` for the query heaps.
 - **Presentation** (`leonida::VulkanPresenter` in `runtime/src/vulkan_present.h`, which
-  `rt::d3d12::create_window_presenter` makes for a device and a window). This is the part every
-  present front end needs; DXGI or `PresentX` is still open (question 6). It takes a back buffer, an ordinary
-  texture in the D3D12 `PRESENT` state, and blits it to an acquired `VkSwapchainKHR` image, scaling when the window
-  size differs. The blit goes on the same `VkQueue` after the application's work, so the frame contains everything
-  submitted before the present. Details:
+  `rt::d3d12::create_window_presenter` makes for a device and a window). This is the part the
+  `PresentX` front end uses; which of DXGI or `PresentX` the game uses is still open (question 6). It takes a back
+  buffer, an ordinary texture in the D3D12 `PRESENT` state, and blits it to an acquired `VkSwapchainKHR` image,
+  scaling when the window size differs. The blit goes on the same `VkQueue` after the application's work, so the
+  frame contains everything submitted before the present. Details:
   - two frames in flight, and a present semaphore per swapchain image;
   - FIFO when vsync is asked for, otherwise MAILBOX or IMMEDIATE; with `VK_KHR/EXT_swapchain_maintenance1` the FIFO
     swapchain can also present one frame in IMMEDIATE or FIFO_RELAXED (`present(..., tear)`, section 4.5);
@@ -1631,8 +1639,9 @@ have; add the content hash to the index.
 
 Pipeline creation:
 
-- `D3D12_GRAPHICS_PIPELINE_STATE_DESC` and the `D3D12_PIPELINE_STATE_STREAM_DESC` subobjects are both supported.
-  Parse the stream subobjects in order; unknown types are a hard error with the type number logged.
+- `D3D12_GRAPHICS_PIPELINE_STATE_DESC` is supported today (`CreateGraphicsPipelineState`), as is the compute desc. The
+  `D3D12_PIPELINE_STATE_STREAM_DESC` subobjects (`CreatePipelineState`) are not implemented yet. The plan: parse the
+  stream subobjects in order; unknown types are a hard error with the type number logged.
 - Build `VkPipelineShaderStageCreateInfo` from the translated module and the index entry. Mesh shaders use
   `VK_EXT_mesh_shader` (`AS`/`MS` subobjects → task/mesh stages); geometry uses the geometry stage; compute uses a
   compute pipeline.
@@ -2281,10 +2290,13 @@ That import must be shimmed. The shim provides:
   toggles borderless/fullscreen; `GetFrameStatistics` is a stub.
 - `DXGI_PRESENT_TEST`/`DO_NOT_WAIT` map to a no-op/`VK_NOT_READY` path.
 
-**What exists.** The back end of this path is `leonida::VulkanPresenter` (section 3.2): surface, swapchain,
-blit, present, resize. A DXGI shim's `Present` and a `PresentX` implementation would both end in its `present()`.
-`GetBuffer(i)` therefore does not need to wrap swapchain images: the buffers can be ordinary committed textures,
-blitted at present time, which also frees the game's buffer count and format from the surface's.
+**What exists.** The DXGI shim's `Present` (`runtime/shims/dxgi_com.cpp`) has its own surface, swapchain and
+blit (`leonida::VulkanSwapchain`, `runtime/shims/dxgi_swapchain.h`); `PresentX` (`runtime/shims/xbox_present.cpp`)
+is implemented over `leonida::VulkanPresenter` (section 3.2) instead. `PresentX` takes ordinary committed
+textures and blits them at present time, which frees the game's buffer count and format from the surface's. The
+DXGI shim's `GetBuffer(i)` returns the swapchain images themselves, and switches to offscreen images blitted at
+present only when the requested size or format differs from the surface's (`runtime/shims/dxgi_swapchain.h`); its
+buffer count is the swapchain's image count.
 
 **PresentX and frame events (GDKX).** Public Microsoft samples present on Xbox without a DXGI swapchain. Facts
 below come from MIT/zlib-licensed code and docs, read directly; none is from the game or the SDK. Sources:
