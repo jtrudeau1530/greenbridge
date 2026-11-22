@@ -29,15 +29,15 @@ class CvtF16Int16OutputMods(unittest.TestCase):
             "v_cvt_f16_u16 v1, v1 clamp",
             "v_mov_b32 v2, 0xcafeffff",
             "v_cvt_f16_i16 v2, v2 clamp",
-            "v_mov_b32 v3, 0x00030000",
-            "v_cvt_f16_i16 v3, v3 op_sel:[1,0] clamp",
+            "v_mov_b32 v3, 0x0003abcd",
+            "v_cvt_f16_i16_sdwa v3, v3 clamp dst_sel:WORD_0 dst_unused:UNUSED_PRESERVE src0_sel:WORD_1",
             "exp mrt0 v0, v1, v2, v3 done vm",
             "s_endpgm",
         ])
         self.assertEqual(words[0], 0xDEAD3C00)  # 5 -> clamped to 1.0 (0x3c00), high half kept
         self.assertEqual(words[1], 0xBEEF0000)  # 0 -> 0.0
         self.assertEqual(words[2], 0xCAFE0000)  # -1 -> clamped to +0.0
-        self.assertEqual(words[3], 0x00033C00)  # op_sel:[1,0] reads high half (3) -> clamped to 1.0
+        self.assertEqual(words[3], 0x00033C00)  # SDWA src0_sel:WORD_1 (3) -> clamped to 1.0 in WORD_0, WORD_1 kept
 
     def test_vop3_omod_scaling_and_clamp(self):
         words = run_ps([
