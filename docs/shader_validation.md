@@ -255,6 +255,40 @@ RDNA4 (Radeon RX 9070, gfx1201, driver 26.11.2, `rocm-sdk-core` 10.0.0 clang): 1
 500, 2000 each, and seed 500 with `--bfe-any`) gave 0 mismatches, so gfx1201 follows the same `s_bfe` rule. With
 `--oracle translator,hw`, 200 of 200 programs matched (seed 1).
 
+#### RDNA2 integer rows (`tools/int_hw_probe.py`, SHADER-137)
+
+`tools/int_hw_probe.py` runs 87 hand-written cases across 19 integer groups (both wave32 and wave64) natively on
+an AMD GPU through `tools/hw_oracle` and compares every output word against `tools/rdna2spirv.py` +
+`tests/semantic/spirv_mini_interp.py` (with scalar ops run twice, SCC preset to 0 and 1, so SCC written vs kept is
+observed directly).
+
+Measured on an **AMD Radeon 680M (gfx1035, RDNA2)**, Windows 11 (`10.0.26300`), AMD driver `26.5.1`
+(`32.0.21043.7012`, `amdhip64_6.dll`), conda-forge `clang 22.1.8` + `lld 23.1.6` (`--oracle both --wave both`):
+**87 cases: 82 bit-exact matches, 5 known live translator divergences, 0 unexpected mismatches, 0 wave32/wave64
+differences** (plus `tools/salu_diff.py --oracle hw,translator --bfe-any --programs 500 --seed 1`: 500/500 match).
+
+- **Matched RDNA2 silicon in both wave32 and wave64 (82/87):** `s_absdiff_i32`, `s_mul_hi_i32/u32`, `s_lshl1..4_add_u32`
+  (64-bit shift-out and add carry into SCC), `s_sext_i32_i8/i16`, `s_flbit_i32`, `s_cmov_b32`, `s_cmovk_i32`,
+  `s_pack_ll/lh/hh_b32_b16`, `s_bfe_u32/i32` past bit 31, `s_brev_b64`, `s_bfe_u64/i64`, `s_bitset0/1_b64`,
+  `s_flbit_i32_b64/i64`, `s_quadmask_b32/b64`, `s_bitreplicate_b64_b32`, all nine 64-bit scalar bitwise ops on scalar
+  data, `s_movrels_b32/b64`, `v_add/sub/subrev_nc_u32` / `v_add/sub_nc_i32` / `v_add/sub_nc_u16` with `clamp` and
+  `op_sel`, `v_mad_u64_u32` / `v_mad_i64_i32` (`sdst` bit 64 sign of exact 65-bit sum and inactive-EXEC masking),
+  `v_sad_u8`/`hi_u8`/`u16`/`u32`, `v_msad_u8`, `v_lerp_u8`, `v_qsad_pk_u16_u8`, `v_mqsad_pk_u16_u8`, `v_mqsad_u32_u8`,
+  `v_mul_hi_u32_u24`/`i32_i24`, `v_lshrrev_b64`/`v_ashrrev_i64`, `v_mad_u16`/`i16` (`clamp`, `op_sel`, untouched half
+  kept), `v_cvt_f16_u16/i16` and `v_cvt_u16/i16_f16` (`_e64` keeps high half; NaN → 0, ±inf saturates; note GFX10
+  does not accept `op_sel` on these opcodes), `v_cvt_i32_f32` (control: all ±qNaN/±sNaN → 0), and
+  `v_cvt_pknorm_i16/u16_f32` (±qNaN → 0, ±inf saturation, RNE ties at ±0.5).
+- **Live translator divergences confirmed on gfx1035 (5/87, pinned in `KNOWN_DIVERGENCES`):**
+  1. **`v_add_co_u32`, `v_sub_co_u32`, `v_subrev_co_u32`, `v_add_co_ci_u32`, `v_sub_co_ci_u32`, `v_subrev_co_ci_u32`
+     with `clamp`:** hardware saturates `D` (`0xffffffff` on carry, `0x00000000` on borrow) while still reporting the
+     real carry/borrow (`1`) in `sdst`; the translator currently ignores `clamp` on these ops.
+  2. **`v_cvt_rpi_i32_f32` precision:** hardware computes exact `floor(x + 0.5)` without binary32 rounding of `x + 0.5`
+     (`0x3effffff` → `0`, `0x4b000001` → `0x00800001`, `0x4b7fffff` → `0x00ffffff`), whereas the translator rounds
+     `x + 0.5` in f32 first (`1`, `0x00800002`, `0x01000000`).
+  3. **`v_cvt_flr_i32_f32` / `v_cvt_rpi_i32_f32` on NaN:** hardware saturates by the NaN's sign bit (`0x7fc00000` →
+     `0x7fffffff`, `0xffc00000` → `0x80000000`), whereas `v_cvt_i32_f32` gives `0` for every NaN; the translator gives
+     `0` for both `flr` and `rpi`.
+
 Two assembler facts matter when writing edge cases:
 
 - An integer token in a float-operand position uses AMD's inline-constant encoding for values 0..64
