@@ -18,11 +18,6 @@ sys.path.insert(0, os.path.join(ROOT, "tools"))
 import pe_shader_containers as psc  # noqa: E402
 
 
-def chunk(fourcc: bytes, payload: bytes, offset: int) -> bytes:
-    body = fourcc + struct.pack("<I", len(payload)) + payload
-    return body + bytes((-len(body)) % 4)
-
-
 def container(parts) -> bytes:
     """Assemble a DXBC container from (fourcc, payload) pairs."""
     header = 32 + 4 * len(parts)
