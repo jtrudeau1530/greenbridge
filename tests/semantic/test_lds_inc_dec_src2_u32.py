@@ -38,6 +38,7 @@ import sys
 import unittest
 
 MASK32 = 0xFFFFFFFF
+MASK64 = 0xFFFFFFFFFFFFFFFF
 DEFAULT_LDS_DWORDS = 16384  # 64 KiB default capacity in dwords (16384 * 4 bytes)
 DEFAULT_NUM_LANES = 64     # Wave64 default width
 DEFAULT_NUM_VGPRS = 256    # Standard GFX10 vector register file size
@@ -259,7 +260,71 @@ class ScalarInterpreter:
 
         # In-place atomic update to LDS location A
         state.lds.write_dword(idx_a, new_a)
-        # Note: Vector register file is NOT modified (non-returning instruction)
+
+
+# ==============================================================================
+# SIMD Multi-Lane State and Divergence Interpreter
+# ==============================================================================
+
+class SIMDState:
+    """SIMD vector machine state with multi-lane VGPR files and shared LDS."""
+
+    def __init__(
+        self,
+        num_lanes: int = DEFAULT_NUM_LANES,
+        exec_mask: int = MASK64,
+        lds_dwords: int = DEFAULT_LDS_DWORDS,
+    ) -> None:
+        if num_lanes not in (32, 64):
+            raise ValueError(f"num_lanes must be 32 or 64, got {num_lanes}")
+        self.num_lanes = num_lanes
+        self.exec_mask = (exec_mask & MASK32) if num_lanes == 32 else (exec_mask & MASK64)
+        self.vgprs = [[0] * DEFAULT_NUM_VGPRS for _ in range(num_lanes)]
+        self.lds = LDSMemory(lds_dwords)
+
+    def is_lane_active(self, lane: int) -> bool:
+        if 0 <= lane < self.num_lanes:
+            return bool((self.exec_mask >> lane) & 1)
+        return False
+
+    def get_lane_vgpr(self, lane: int, reg: int) -> int:
+        return self.vgprs[lane][reg]
+
+    def set_lane_vgpr(self, lane: int, reg: int, val: int) -> None:
+        self.vgprs[lane][reg] = u32(val)
+
+
+class SIMDInterpreter:
+    """SIMD multi-lane execution interpreter handling divergence and EXEC masking."""
+
+    def execute(self, instr: DSSrc2Instruction, state: SIMDState) -> None:
+        for lane in range(state.num_lanes):
+            if not state.is_lane_active(lane):
+                continue
+
+            base_addr = state.get_lane_vgpr(lane, instr.addr.base_reg.index)
+            _, _, idx_a, idx_b = calc_lds_src2_addresses(
+                vaddr=base_addr,
+                offset0=instr.addr.offset0,
+                offset1=instr.addr.offset1,
+                lds_dwords=state.lds.size_dwords,
+            )
+
+            val_a = state.lds.read_dword(idx_a)
+            val_b = state.lds.read_dword(idx_b)
+
+            if instr.opcode == DSOpcode.DS_INC_SRC2_U32:
+                new_a = ref_ds_inc_src2_u32(val_a, val_b)
+            elif instr.opcode == DSOpcode.DS_DEC_SRC2_U32:
+                new_a = ref_ds_dec_src2_u32(val_a, val_b)
+            elif instr.opcode == DSOpcode.DS_ADD_SRC2_U32:
+                new_a = ref_ds_add_src2_u32(val_a, val_b)
+            elif instr.opcode == DSOpcode.DS_SUB_SRC2_U32:
+                new_a = ref_ds_sub_src2_u32(val_a, val_b)
+            else:
+                raise NotImplementedError(f"Unsupported opcode: {instr.opcode}")
+
+            state.lds.write_dword(idx_a, new_a)
 
 
 class TestReferenceModelAndOracle(unittest.TestCase):
@@ -490,6 +555,131 @@ class TestScalarInterpreter(unittest.TestCase):
         self.interp.execute(instr, self.state)
         self.assertEqual(self.state.get_lds(0), u32(-10))
         self.assertEqual(self.state.get_lds(1), 50)
+
+
+class TestSIMDMultiLaneDivergence(unittest.TestCase):
+    """Unit tests for SIMD multi-lane divergence and 32/64-bit EXEC masking."""
+
+    def setUp(self) -> None:
+        self.interp = SIMDInterpreter()
+
+    def test_wave32_full_exec_independent_lanes(self) -> None:
+        state = SIMDState(num_lanes=32, exec_mask=0xFFFFFFFF, lds_dwords=1024)
+        v0 = RegisterOperand(0, RegType.VGPR)
+        instr = DSSrc2Instruction(
+            DSOpcode.DS_ADD_SRC2_U32,
+            LDSAddressExpression(v0, offset0=0, offset1=1),
+        )
+        # Setup each lane to point to distinct LDS dwords:
+        # Lane i uses base_addr = (i * 2) * 4 bytes
+        for lane in range(32):
+            state.set_lane_vgpr(lane, 0, (lane * 2) * 4)
+            state.lds.write_dword(lane * 2, 10)       # A
+            state.lds.write_dword(lane * 2 + 1, lane) # B
+
+        self.interp.execute(instr, state)
+
+        for lane in range(32):
+            self.assertEqual(state.lds.read_dword(lane * 2), 10 + lane)
+            self.assertEqual(state.lds.read_dword(lane * 2 + 1), lane)
+
+    def test_wave64_full_exec_independent_lanes(self) -> None:
+        state = SIMDState(num_lanes=64, exec_mask=MASK64, lds_dwords=1024)
+        v0 = RegisterOperand(0, RegType.VGPR)
+        instr = DSSrc2Instruction(
+            DSOpcode.DS_INC_SRC2_U32,
+            LDSAddressExpression(v0, offset0=0, offset1=1),
+        )
+        for lane in range(64):
+            state.set_lane_vgpr(lane, 0, (lane * 2) * 4)
+            state.lds.write_dword(lane * 2, 0)
+            state.lds.write_dword(lane * 2 + 1, 5)
+
+        self.interp.execute(instr, state)
+
+        for lane in range(64):
+            self.assertEqual(state.lds.read_dword(lane * 2), 1)
+
+    def test_sparse_exec_mask_even_lanes(self) -> None:
+        # Only even lanes active
+        exec_mask = 0x5555555555555555
+        state = SIMDState(num_lanes=64, exec_mask=exec_mask, lds_dwords=1024)
+        v0 = RegisterOperand(0, RegType.VGPR)
+        instr = DSSrc2Instruction(
+            DSOpcode.DS_ADD_SRC2_U32,
+            LDSAddressExpression(v0, offset0=0, offset1=1),
+        )
+        for lane in range(64):
+            state.set_lane_vgpr(lane, 0, (lane * 2) * 4)
+            state.lds.write_dword(lane * 2, 100)
+            state.lds.write_dword(lane * 2 + 1, 5)
+
+        self.interp.execute(instr, state)
+
+        for lane in range(64):
+            if lane % 2 == 0:
+                self.assertEqual(state.lds.read_dword(lane * 2), 105)
+            else:
+                self.assertEqual(state.lds.read_dword(lane * 2), 100)
+
+    def test_zero_exec_mask_no_op(self) -> None:
+        state = SIMDState(num_lanes=32, exec_mask=0, lds_dwords=1024)
+        v0 = RegisterOperand(0, RegType.VGPR)
+        instr = DSSrc2Instruction(
+            DSOpcode.DS_ADD_SRC2_U32,
+            LDSAddressExpression(v0, offset0=0, offset1=1),
+        )
+        for lane in range(32):
+            state.set_lane_vgpr(lane, 0, (lane * 2) * 4)
+            state.lds.write_dword(lane * 2, 50)
+            state.lds.write_dword(lane * 2 + 1, 5)
+
+        self.interp.execute(instr, state)
+
+        for lane in range(32):
+            self.assertEqual(state.lds.read_dword(lane * 2), 50)
+
+    def test_lane_divergence_same_address_atomic_accumulate(self) -> None:
+        # 8 active lanes all target same address A = 0, with B = 1 having value 3
+        exec_mask = 0xFF  # Lanes 0..7 active
+        state = SIMDState(num_lanes=32, exec_mask=exec_mask, lds_dwords=1024)
+        v0 = RegisterOperand(0, RegType.VGPR)
+        instr = DSSrc2Instruction(
+            DSOpcode.DS_ADD_SRC2_U32,
+            LDSAddressExpression(v0, offset0=0, offset1=1),
+        )
+        for lane in range(32):
+            state.set_lane_vgpr(lane, 0, 0)
+        state.lds.write_dword(0, 10)  # Initial A = 10
+        state.lds.write_dword(1, 3)   # Operand B = 3
+
+        self.interp.execute(instr, state)
+        # 8 lanes added 3 each -> 10 + 8 * 3 = 34
+        self.assertEqual(state.lds.read_dword(0), 34)
+
+    def test_lane_divergence_inc_wrap_cyclic(self) -> None:
+        # 6 active lanes target same address A = 0, threshold B = 2
+        # Starts at 0
+        # lane 0: 0 -> 1
+        # lane 1: 1 -> 2
+        # lane 2: 2 >= 2 -> 0
+        # lane 3: 0 -> 1
+        # lane 4: 1 -> 2
+        # lane 5: 2 >= 2 -> 0
+        exec_mask = 0x3F  # Lanes 0..5
+        state = SIMDState(num_lanes=32, exec_mask=exec_mask, lds_dwords=1024)
+        v0 = RegisterOperand(0, RegType.VGPR)
+        instr = DSSrc2Instruction(
+            DSOpcode.DS_INC_SRC2_U32,
+            LDSAddressExpression(v0, offset0=0, offset1=1),
+        )
+        for lane in range(32):
+            state.set_lane_vgpr(lane, 0, 0)
+        state.lds.write_dword(0, 0)
+        state.lds.write_dword(1, 2)
+
+        self.interp.execute(instr, state)
+        self.assertEqual(state.lds.read_dword(0), 0)
 
 
 if __name__ == "__main__":
