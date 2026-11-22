@@ -694,10 +694,26 @@ class Gen:
                    "eq": "OpIEqual", "ne": "OpINotEqual", "lg": "OpINotEqual"}
         else:
             raise Unsupported(op)
-        if cond not in ops:
-            raise Unsupported(op)
+        is_float = ty in ("f32", "f16")
         b, r = self.tmp(), self.tmp()
-        self.emit(f"{b} = {ops[cond]} %bool {x} {y}")
+        if cond in (("f", "tru", "o", "u") if is_float else ("f", "t")):
+            # Constant compares: f is always false, t / tru always true. o (ordered) is true when neither source
+            # is NaN, u (unordered) when either is.
+            if cond in ("o", "u"):
+                nx, ny, either = self.tmp(), self.tmp(), self.tmp()
+                self.emit(f"{nx} = OpIsNan %bool {x}")
+                self.emit(f"{ny} = OpIsNan %bool {y}")
+                self.emit(f"{either} = OpLogicalOr %bool {nx} {ny}")
+                if cond == "u":
+                    b = either
+                else:
+                    self.emit(f"{b} = OpLogicalNot %bool {either}")
+            else:
+                self.emit(f"{b} = OpCopyObject %bool {'%false' if cond == 'f' else '%true'}")
+        elif cond not in ops:
+            raise Unsupported(op)
+        else:
+            self.emit(f"{b} = {ops[cond]} %bool {x} {y}")
         mask_halves = [self.mask_half(s) for s in srcs if self.holds_lane_mask(s)]
         if scalar and mask_halves and ty in ("u32", "i32") and cond in ("eq", "ne", "lg"):
             half = mask_halves[0] if (self.wave64 and len(set(mask_halves)) == 1) else None
