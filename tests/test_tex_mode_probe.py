@@ -275,6 +275,24 @@ class TestArgumentValidation(unittest.TestCase):
                     tex_mode_probe.positive_int(bad)
                 self.assertIn("not a whole number", str(exc.exception))
 
+    def test_probe_refuses_invalid_indexes_before_loading_tables(self):
+        for contents, diagnostic in ((None, "cannot read texture index"), ("[", "cannot read texture index"),
+                                     ("{}", "texture index must contain a list")):
+            with self.subTest(contents=contents), tempfile.TemporaryDirectory() as directory:
+                index = os.path.join(directory, "index.json")
+                if contents is not None:
+                    with open(index, "w", encoding="utf-8", newline="\n") as f:
+                        f.write(contents)
+                stderr = io.StringIO()
+                with mock.patch.object(tex_mode_probe, "load") as load, \
+                        mock.patch.object(sys, "argv", ["tex_mode_probe.py", index, directory]), \
+                        mock.patch.object(sys, "stderr", stderr), self.assertRaises(SystemExit) as exc:
+                    tex_mode_probe.main()
+                load.assert_not_called()
+                self.assertEqual(exc.exception.code, 2)
+                self.assertIn(diagnostic, stderr.getvalue())
+                self.assertIn(index, stderr.getvalue())
+
     def test_probe_refuses_a_count_below_one_cli(self):
         for val in ["0", "-1", "x"]:
             with self.subTest(value=val):
