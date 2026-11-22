@@ -223,6 +223,10 @@ class NameDictionary:
             return False
         if any(ord(ch) < 0x20 for ch in name):
             return False
+        try:
+            name.encode("utf-8")
+        except UnicodeEncodeError:   # a lone surrogate (JSON \ud800 escape, XML &#xD800;) has no UTF-8 form to hash
+            return False
         table = self.derived if derived else self.names
         h = joaat(name)
         table.setdefault(h, set()).add(name)
