@@ -1105,7 +1105,20 @@ public:
         state_.context->set_bindless_prepare([this](VkCommandBuffer command_buffer) {
             std::lock_guard lock(state_.descriptor_mutex);
             if (!state_.bindless->fallbacks_ready()) state_.bindless->record_fallback_init(command_buffer);
-            return state_.bindless->flush();
+            if (state_.bindless->flush_needs_idle()) {
+                // Entries a running shader probes are about to change, or binding 2 is about to name a new buffer:
+                // wait until nothing that uses the set still runs, then free the generations that were retired.
+                {
+                    std::lock_guard submit(state_.context->submit_mutex());
+                    state_.context->vk.vkDeviceWaitIdle(state_.info.device);
+                }
+                state_.bindless->release_retired();
+            }
+            return state_.bindless->flush(command_buffer);
+        });
+        state_.context->set_bindless_commit([this](bool submitted) {
+            std::lock_guard lock(state_.descriptor_mutex);
+            if (state_.bindless) state_.bindless->table_upload_result(submitted);
         });
         return true;
     }
