@@ -393,8 +393,9 @@ class ExportBankTest(unittest.TestCase):
             self.assertEqual(last["serial"], 3)
 
     def test_stereo_plain_stream_length_is_per_channel(self):
-        # A stereo format tag stores interleaved samples. Three 960-frame stereo packets carry
-        # 2880 frames per channel; the declared 3840 is twice the real per-channel length.
+        # A stereo format tag stores interleaved samples: 3840 counts = 1920 frames per channel.
+        # Three 960-frame packets carry 2880 frames per channel, so the declared 1920 trims
+        # 960 frames of payload; the point is the halving, not a realistic stream length.
         packet = bytes([0x9C])          # CELT 20 ms, code 0, stereo bit: 960 frames per channel
         opus = bytearray(3 * 2048)
         for block in range(3):
@@ -414,8 +415,8 @@ class ExportBankTest(unittest.TestCase):
 
     def test_declared_samples_are_48khz_frames_not_scaled_by_rate(self):
         # Four 960-frame packets are 3840 frames; the tag declares 2880 real frames and a 32 kHz
-        # source rate. Scaling by 48000/32000 would make the length 4320, so the last granule
-        # would stay at 312 + 3840 and the padding would not be trimmed.
+        # source rate. Scaling by 48000/32000 would make the target 4320, above the payload, so
+        # the old code kept all 3840 packet frames (granule 3840, 3528 after the pre-skip).
         packet = bytes([0x08])          # SILK 20 ms, code 0: 960 frames
         opus = bytearray(4 * 2048)
         for block in range(4):
