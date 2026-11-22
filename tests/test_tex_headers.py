@@ -571,7 +571,23 @@ class TestDDSHeaderSynthesis(unittest.TestCase):
         info = tex_headers.parse_dds_header(hdr)
         self.assertTrue(info["caps2"] & tex_headers.DDSCAPS2_CUBEMAP_ALLFACES)
         self.assertEqual(info["misc_flags"], tex_headers.D3D10_RESOURCE_MISC_TEXTURECUBE)
-        self.assertEqual(info["array_size"], 6)
+        self.assertEqual(info["array_size"], 1)
+
+    def test_dds_cubemap_array_size_matches_payload(self):
+        # DDS_HEADER_DXT10.arraySize counts cubes, each containing six faces:
+        # https://learn.microsoft.com/en-us/windows/win32/direct3ddds/dds-header-dxt10
+        # Check the serialized field directly, independently of our header parser.
+        for cubes in (1, 2, 6):
+            with self.subTest(cubes=cubes):
+                # One RGBA texel per face, with distinct values for every face.
+                payload = b"".join(bytes((face, 0, 0, 255)) for face in range(cubes * 6))
+                dds = tex_headers.dds_bytes(1, 1, fmt=28, payload=payload,
+                                            is_cube=True, array_size=cubes)
+                fmt, dimension, misc, array_size, _ = struct.unpack_from("<IIIII", dds, 128)
+                self.assertEqual((fmt, dimension, misc), (28, 3, 4))
+                self.assertEqual(array_size, cubes)
+                self.assertEqual(len(dds) - 148, array_size * 6 * 4)
+                self.assertEqual(dds[148:], payload)
 
     def test_dds_header_2d_array(self):
         hdr = tex_headers.dds_header(256, 256, depth=1, mips=1, fmt=83, is_cube=False, array_size=5)

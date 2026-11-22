@@ -4,11 +4,17 @@ Usage:
     python -I shader_profile.py <disasm dir> [--out profile.json] [--per-shader]
 
 Counts each mnemonic (number of shaders using it and total occurrences), groups them by encoding family,
-classifies instructions (ALU vs memory vs branch), computes operation ratios, tracks register footprints,
-and lists the dwords LLVM couldn't decode (likely Xbox-specific instructions) with how many shaders contain them.
+classifies instructions (ALU vs memory vs branch), computes operation ratios, and summarises register pressure
+per stage (VGPR/SGPR counts from `profile_shader`; `--per-shader` also lists every shader).
 In the JSON report, ratios.alu_to_memory is null when the corpus has ALU instructions and no memory instructions.
-summarises register pressure per stage (VGPR/SGPR counts from `profile_shader`; `--per-shader` also lists
-every shader), and lists the dwords LLVM couldn't decode (likely Xbox-specific instructions) with how many shaders contain them.
+
+`undecoded` counts the llvm-mc 'invalid instruction encoding' warnings shader_disasm.py copies into each .s file.
+by_word lists the four bytes at each warning position, their total occurrences and how many shaders contain them.
+unresolved counts warnings whose position or echoed input gives no complete word. Results depend on LLVM's
+version, target and input range, which can include embedded data.
+
+The terminal prints warning totals. The JSON report includes the bytes, so keep reports from real shaders local
+(see CONTRIBUTING.md).
 """
 import argparse
 import json
@@ -190,6 +196,51 @@ def profile_shader(text: str) -> dict:
     }
 
 
+LLVM_MESSAGES = "; --- llvm-mc messages ---"    # the header shader_disasm.py writes above llvm-mc's stderr
+WARNING_LOCATION = re.compile(r"; <stdin>:[1-9][0-9]*:([1-9][0-9]*)")
+BYTE_ECHO = re.compile(r"; [ \t]*0x[0-9a-fA-F]{2}(?=[ \t]|$)")
+WORD = re.compile(r"[ \t]+".join([r"0x([0-9a-fA-F]{2})"] * 4) + r"(?!\S)")    # four complete 0xNN tokens
+
+
+def warning_words(text: str):
+    """Words LLVM warned about in one .s file's llvm-mc messages section, as (words, unresolved).
+
+    Each 'invalid instruction encoding' warning gives one word: the four complete 0xNN tokens starting exactly
+    at its one-based column of the source line LLVM echoes right after it, as e.g. 'ff ff ff d7'. A warning whose
+    position, echo or tokens don't give such a word counts as unresolved instead."""
+    if LLVM_MESSAGES not in text:    # clean shaders have no messages section
+        return [], 0
+    lines = text.splitlines()
+    try:
+        start = lines.index(LLVM_MESSAGES) + 1
+    except ValueError:
+        return [], 0
+    words, unresolved = [], 0
+    for index in range(start, len(lines)):
+        head = lines[index]
+        if not head.startswith("; <stdin>:"):
+            continue
+        location, _, message = head.partition(": ")
+        if message != "warning: invalid instruction encoding":
+            continue
+        echo = lines[index + 1] if index + 1 < len(lines) else ""
+        position = WARNING_LOCATION.fullmatch(location)
+        word = None
+        # A column longer than the echo length in decimal cannot be in range. Check before int() to
+        # keep even arbitrarily long malformed locations from aborting the scan.
+        if position and len(position[1]) <= len(str(len(echo))) and BYTE_ECHO.match(echo):
+            col = int(position[1])
+            # The producer added "; ". At a token start, echo[col] is the preceding whitespace and
+            # echo[col + 1] is the first byte's '0' (including the column-one case).
+            if col < len(echo) - 1 and echo[col] in " \t":
+                word = WORD.match(echo, col + 1)
+        if word:
+            words.append(" ".join(word.groups()).lower())
+        else:
+            unresolved += 1
+    return words, unresolved
+
+
 def register_summary(reg_stage) -> dict:
     """Per-stage VGPR/SGPR pressure from (vgpr_count, sgpr_count) pairs: max, mean and a VGPR histogram.
 
@@ -234,7 +285,8 @@ def main():
         print(f"ERROR: cannot list {a.src}: {e.strerror or e}", file=sys.stderr)
         return 2
     occ, users = Counter(), Counter()
-    invalid_users = Counter()
+    word_occ, word_users = Counter(), Counter()    # warned-at word -> warnings, shaders
+    unresolved = 0
     per_stage = defaultdict(Counter)
     reg_stage = defaultdict(list)    # stage -> [(vgpr_count, sgpr_count)]
     shaders = []
@@ -255,8 +307,10 @@ def main():
         occ.update(prof["mnemonics"])
         users.update(prof["mnemonics"].keys())
         per_stage[stage].update(prof["mnemonics"].keys())
-        for w in set(re.findall(r"<stdin>:\d+:\d+: warning: invalid instruction encoding\n; (0x[0-9a-f]{2}(?: 0x[0-9a-f]{2}){3})", text)):
-            invalid_users[w] += 1
+        words, bad = warning_words(text)
+        word_occ.update(words)
+        word_users.update(set(words))
+        unresolved += bad
     fam = defaultdict(lambda: [0, 0])
     for m, c in occ.items():
         fam[family(m)][0] += 1
@@ -270,7 +324,10 @@ def main():
            "categories": cats,
            "ratios": ratios,
            "by_mnemonic": [{"m": m, "shaders": users[m], "count": occ[m]} for m, _ in users.most_common()],
-           "registers": register_summary(reg_stage)}
+           "registers": register_summary(reg_stage),
+           "undecoded": {"warnings": sum(word_occ.values()) + unresolved, "unresolved": unresolved,
+                         "by_word": [{"word": w, "shaders": word_users[w], "count": word_occ[w]}
+                                     for w in sorted(word_occ, key=lambda w: (-word_occ[w], -word_users[w], w))]}}
     if a.per_shader:
         out["per_shader"] = sorted(shaders, key=lambda e: e["name"])
     try:
@@ -293,6 +350,8 @@ def main():
         print(f"  {st:2} registers: VGPR max {r['vgpr_max']} mean {r['vgpr_mean']}, "
               f"SGPR max {r['sgpr_max']} mean {r['sgpr_mean']} ({r['shaders']} shaders)")
     print("  most widespread:", ", ".join(f"{m} ({users[m]})" for m, _ in users.most_common(12)))
+    print(f"  undecoded: {out['undecoded']['warnings']} LLVM warnings, {len(word_occ)} distinct words, "
+          f"{unresolved} unresolved (words only in the JSON report)")
 
 
 if __name__ == "__main__":
