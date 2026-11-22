@@ -406,7 +406,7 @@ how the Beaufort number maps onto the 0..1 curve input (Beaufort / 12 is one cho
 
 ## Timecycle documents
 
-The two largest repeated roots are the timecycle tables: 27 `timecycle_keyframe_data` and 49
+Two of the three most repeated roots are the timecycle tables: 27 `timecycle_keyframe_data` and 49
 `timecycle_modifier_data` documents. All 76 parse. Counts below; no values, modifier names or region names.
 
 **Keyframe documents** (root attribute `version`, the same value in all 27):
