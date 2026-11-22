@@ -1060,6 +1060,21 @@ const char* heap_properties_refusal(const D3D12_HEAP_PROPERTIES& heap) {
     return nullptr;
 }
 
+// Why the host would refuse this CreateHeap/CreateHeap1 description, or null if these checks pass (D3D-238). A probe
+// on an RX 5700 and WARP refuses an alignment other than 0, 64 KiB and 4 MiB, the heap properties above (a type of 0,
+// a custom heap without a CPU page property), and a heap that denies buffers and both kinds of texture.
+const char* heap_desc_refusal(const D3D12_HEAP_DESC& desc) {
+    if (!desc.SizeInBytes) return "zero size";
+    if (desc.Alignment && desc.Alignment != D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT &&
+        desc.Alignment != D3D12_DEFAULT_MSAA_RESOURCE_PLACEMENT_ALIGNMENT)
+        return "alignment (0, 64 KiB or 4 MiB)";
+    if (const char* why = heap_properties_refusal(desc.Properties)) return why;
+    constexpr UINT deny_all = D3D12_HEAP_FLAG_DENY_BUFFERS | D3D12_HEAP_FLAG_DENY_RT_DS_TEXTURES |
+                              D3D12_HEAP_FLAG_DENY_NON_RT_DS_TEXTURES;
+    if ((UINT(desc.Flags) & deny_all) == deny_all) return "heap flags denying every resource kind";
+    return nullptr;
+}
+
 // Why the host would refuse this committed resource, or null if these checks pass. The flag and format tables were
 // measured on an RX 9070 XT, an integrated Radeon and WARP, which agree on all of them. Cross-adapter resources
 // (valid there only as a row-major texture on a SHARED | SHARED_CROSS_ADAPTER heap) are refused: this layer has no
@@ -4219,7 +4234,11 @@ public:
     // 64 KiB-aligned offset is simply that offset into the arena, and its console VA is the heap's place plus it.
     HRESULT STDMETHODCALLTYPE CreateHeap(const D3D12_HEAP_DESC* desc, REFIID riid, void** out) override {
         if (out) *out = nullptr;
-        if (!desc || !desc->SizeInBytes) return E_INVALIDARG;
+        if (!desc) return E_INVALIDARG;
+        if (const char* why = heap_desc_refusal(*desc)) {
+            log_once((std::string("CreateHeap refused (") + why + "), heap type").c_str(), int(desc->Properties.Type));
+            return E_INVALIDARG;
+        }
         if (!state_.arena.mapped) {
             log_once("heaps need the GPU address arena (bufferDeviceAddress); heap size in KiB:",
                      int(desc->SizeInBytes / 1024));
@@ -4237,6 +4256,18 @@ public:
             return S_FALSE;
         }
         return hand_out(heap, riid, out);
+    }
+
+    // Device4: CreateHeap with a protected session, which is refused as CreateCommittedResource1 refuses one. The host
+    // gives the same answers as CreateHeap for the D3D-238 descriptions.
+    HRESULT STDMETHODCALLTYPE CreateHeap1(const D3D12_HEAP_DESC* desc, ID3D12ProtectedResourceSession* session,
+                                          REFIID riid, void** out) override {
+        if (out) *out = nullptr;
+        if (session) {
+            log_once("protected resource session refused (not supported) by CreateHeap1", 1);
+            return E_INVALIDARG;
+        }
+        return CreateHeap(desc, riid, out);
     }
 
     HRESULT STDMETHODCALLTYPE CreatePlacedResource(ID3D12Heap* heap_interface, UINT64 heap_offset,
