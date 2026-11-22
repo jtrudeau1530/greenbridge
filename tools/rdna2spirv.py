@@ -5223,7 +5223,11 @@ class Gen:
                 self.emit(f"{lv} = OpImageQueryLevels %int {img}")
                 self.emit(f"{lvm} = OpISub %int {lv} {self.as_int(self.cu(1))}")
                 lod = self.clamp_gather_lod(f[2], a[3]["r"] + 1)
-                self.emit(f"{rl} = OpExtInst %float %glsl RoundEven {lod}")
+                # Native gather rounds the LOD to the nearest mip with ties up, not to even (SHADER-152: on
+                # Radeon Graphics 26.10.1, LOD 0.5 with bounds [0,1] selected mip 1, where RoundEven selected 0).
+                biased = self.tmp()
+                self.emit(f"{biased} = OpFAdd %float {lod} %fhalf_g")
+                self.emit(f"{rl} = OpExtInst %float %glsl Floor {biased}")
                 self.emit(f"{mi} = OpConvertFToS %int {rl}")
                 self.emit(f"{mz} = OpExtInst %int %glsl SMax {mi} {self.as_int(self.cu(0))}")
                 self.emit(f"{mc} = OpExtInst %int %glsl SMin {mz} {lvm}")
