@@ -334,7 +334,19 @@ def choose_game() -> str:
         print("  That folder isn't a supported version of the game. Try again.")
 
 
+def icloud_documents() -> bool:
+    """macOS: whether iCloud Drive holds Desktop & Documents. With that sync on, ~/Documents lives in iCloud Drive,
+    which uploads what goes in it and may evict files from the disk ("Optimize Mac Storage"). The folder can stay in
+    iCloud Drive after the sync is turned off; leaving Documents alone then costs nothing."""
+    return sys.platform == "darwin" and os.path.isdir(
+        os.path.join(os.path.expanduser("~"), "Library", "Mobile Documents", "com~apple~CloudDocs", "Documents"))
+
+
 def default_out() -> str:
+    """Documents/Leonida, except on a Mac whose Documents iCloud syncs: the port and its work folder (hundreds of
+    GB made from the game) must stay on this computer, so they go to ~/Leonida there."""
+    if icloud_documents():
+        return os.path.join(os.path.expanduser("~"), "Leonida")
     return os.path.join(os.path.expanduser("~"), "Documents", "Leonida")
 
 
@@ -1235,7 +1247,8 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="Build the PC port from your own copy of the game.")
     ap.add_argument("--game", help="your package folder (found automatically if left out)")
     ap.add_argument("--pick", action="store_true", help="choose your package folder in a folder dialog")
-    ap.add_argument("--out", help="folder for the finished port (default Documents/Leonida)")
+    ap.add_argument("--out", help="folder for the finished port (default Documents/Leonida; ~/Leonida on a Mac "
+                                  "whose Documents iCloud syncs)")
     ap.add_argument("--work", help="folder for intermediate files (hundreds of GB; default <out>/work)")
     ap.add_argument("--stages", help="comma list from: " + ",".join(STAGES))
     ap.add_argument("--check", action="store_true", help="only check the game files")
@@ -1336,6 +1349,8 @@ def main() -> int:
     fallbacks = fallback_flags(a) if "shaders" in stages else ()
     preflight(stages, work, a.wav, runtime_build, emulate=emulate, keep_emulated=keep_emulated,
               fallbacks=fallbacks, jobs=a.jobs)
+    if not a.out and icloud_documents():
+        log("iCloud syncs Documents on this Mac: building into ~/Leonida instead, so the game's files stay off iCloud")
     log(f"building into {out} (work files in {work})")
     t0 = time.time()
     if "shaders" in stages:
