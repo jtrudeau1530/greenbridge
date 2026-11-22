@@ -4,6 +4,7 @@
 // implicit promotion from common, and enhanced barriers. Part C copies a volume (footprint, box and whole) and
 // resolves a multisampled target. Part D records every D3D12 sync/access pair as enhanced barriers, which the
 // validation layer must accept. Part E (where VK_EXT_conditional_rendering is available) checks SetPredication.
+// Part F (D3D-26) runs immediate buffer writes, atomic copies and discards.
 // Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation; any validation error fails the test.
 #include "vk_test_device.h"
 #include "../src/vulkan_replay.h"
@@ -648,12 +649,179 @@ int part_e(vktest::Device& d) {
     return 0;
 }
 
+// Part F (D3D-26): WriteBufferImmediate in its three modes, AtomicCopyBufferUINT/UINT64 and DiscardResource.
+// Buffers carry console VAs; one binding is a range inside another buffer, as resources in the GPU address arena
+// are. The writes and copies are ordered so that a missing barrier would let a copy read a stale or a later value.
+// A colour target is cleared, discarded and cleared again; a second one is only discarded in part.
+int part_f(vktest::Device& d) {
+    constexpr VkDeviceSize bytes = 256, c_offset = 128, c_size = 64;
+    constexpr std::uint64_t va_a = 0x10000, va_b = 0x20000, va_c = 0x30000;
+    constexpr std::uint32_t size = 8, texels = size * size;
+    constexpr VkBufferUsageFlags usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    void *a_mapped = nullptr, *b_mapped = nullptr, *image_mapped = nullptr;
+    const VkBuffer a = d.buffer(bytes, usage, &a_mapped);
+    const VkBuffer b = d.buffer(bytes, usage, &b_mapped);
+    const VkBuffer pixels = d.buffer(texels * 4 * 2, VK_BUFFER_USAGE_TRANSFER_DST_BIT, &image_mapped);
+    const VkImage rt = d.image(VK_FORMAT_R8G8B8A8_UNORM, size, size, 1, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
+    const VkImage kept = d.image(VK_FORMAT_R8G8B8A8_UNORM, size, size, 1, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
+    EXPECT(a && b && pixels && rt && kept);
+
+    const auto buffer_binding = [](VkBuffer buffer, VkDeviceSize offset, VkDeviceSize length, std::uint64_t va) {
+        ResourceBinding r{};
+        r.buffer = buffer;
+        r.buffer_offset = offset;
+        r.size = length;
+        r.va = va;
+        return r;
+    };
+    const auto image_binding = [&](VkImage image) {
+        ResourceBinding r{};
+        r.image = image;
+        r.format = VK_FORMAT_R8G8B8A8_UNORM;
+        r.width = r.height = size;
+        return r;
+    };
+    constexpr ResourceId a_id = 30, b_id = 31, c_id = 32, rt_id = 33, kept_id = 34;
+    const std::map<ResourceId, ResourceBinding> bindings{
+        {a_id, buffer_binding(a, 0, bytes, va_a)},
+        {b_id, buffer_binding(b, 0, c_offset, va_b)},         // the first half of b
+        {c_id, buffer_binding(b, c_offset, c_size, va_c)},    // a range at 128 in b
+        {rt_id, image_binding(rt)},
+        {kept_id, image_binding(kept)},
+    };
+    const auto resolve = [&](ResourceId id) -> const ResourceBinding* {
+        const auto it = bindings.find(id);
+        return it == bindings.end() ? nullptr : &it->second;
+    };
+    LayoutTracker tracker(true);
+    tracker.track(rt_id, bindings.at(rt_id), VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+    tracker.track(kept_id, bindings.at(kept_id), VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+
+    ReplayFunctions vk{};
+    vk.pipeline_barrier = d.fn<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier");
+    vk.clear_color_image = d.fn<PFN_vkCmdClearColorImage>("vkCmdClearColorImage");
+    vk.clear_depth_stencil_image = d.fn<PFN_vkCmdClearDepthStencilImage>("vkCmdClearDepthStencilImage");
+    vk.copy_buffer = d.fn<PFN_vkCmdCopyBuffer>("vkCmdCopyBuffer");
+    vk.copy_buffer_to_image = d.fn<PFN_vkCmdCopyBufferToImage>("vkCmdCopyBufferToImage");
+    vk.copy_image_to_buffer = d.fn<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer");
+    vk.copy_image = d.fn<PFN_vkCmdCopyImage>("vkCmdCopyImage");
+    vk.separate_depth_stencil_layouts = true;
+    const ReplayFunctions without_update = vk;
+    vk.update_buffer = d.fn<PFN_vkCmdUpdateBuffer>("vkCmdUpdateBuffer");
+    vk.buffer_at = [&](std::uint64_t va, std::uint64_t length, VkBuffer& buffer, VkDeviceSize& offset) {
+        for (const auto& [id, r] : bindings) {
+            if (r.image || !r.va || va < r.va || va - r.va >= r.size || length > r.size - (va - r.va)) continue;
+            buffer = r.buffer;
+            offset = r.buffer_offset + (va - r.va);
+            return true;
+        }
+        return false;
+    };
+
+    namespace m = write_immediate_mode;
+    CommandList list;
+    EXPECT(list.write_immediate({va_a, 0x11111111, m::normal}));
+    EXPECT(list.write_immediate({va_a + 4, 0x22222222, m::marker_in}));
+    EXPECT(list.write_immediate({va_c, 0x33333333, m::marker_out}));       // lands at b + 128
+    EXPECT(list.write_immediate({va_c + c_size - 4, 0x55555555, m::normal}));  // the last word of c
+    // The copies wait for the writes before them (RAW on a); the MARKER_OUT write after them waits for them (WAR).
+    EXPECT(list.atomic_copy({b_id, 0, a_id, 4, 4, {{a_id, 0, 0, 8}}}));
+    EXPECT(list.atomic_copy({b_id, 8, a_id, 0, 8, {{a_id, 0, 0, 8}, {c_id, 0, 0, 4}}}));
+    EXPECT(list.write_immediate({va_a, 0x44444444, m::marker_out}));
+    EXPECT(list.atomic_copy({b_id, 16, a_id, 0, 4, {{a_id, 0, 0, 4}}}));
+    EXPECT(list.atomic_copy({c_id, 8, b_id, 0, 4, {{b_id, 0, 0, 4}}}));    // into the range inside b
+    EXPECT(list.discard({a_id, 0, 0, false, true}));                      // a buffer: kept
+    // rt: red, discarded whole, then green over the whole view. kept: red, then a discard with rectangles.
+    EXPECT(list.clear_render_target({rt_id, 0, 0, 1}, {1, 0, 0, 1}));
+    EXPECT(list.discard({rt_id, 0, 0, false, true}));
+    EXPECT(list.clear_render_target({rt_id, 0, 0, 1}, {0, 1, 0, 1}));
+    EXPECT(list.transition({rt_id, 0, s::render_target, s::copy_source}));
+    EXPECT(list.clear_render_target({kept_id, 0, 0, 1}, {1, 0, 0, 1}));
+    EXPECT(list.discard({kept_id, 0, 1, true}));
+    EXPECT(list.transition({kept_id, 0, s::render_target, s::copy_source}));
+    EXPECT(list.close());
+
+    bool ok = d.run([&](VkCommandBuffer cb) {
+        d.initial_layout(cb, rt, VK_IMAGE_ASPECT_COLOR_BIT, 1, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+        d.initial_layout(cb, kept, VK_IMAGE_ASPECT_COLOR_BIT, 1, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+        CommandList bad;
+        const auto rejected = [&](auto&& record, ReplayResult expected, const ReplayFunctions& functions) {
+            if (!bad.closed()) bad.close();
+            bad.reset();
+            if (!record()) return false;
+            bad.close();
+            const ReplayResult got = replay(bad, cb, resolve, functions, &tracker);
+            if (got != expected) std::fprintf(stderr, "F rejected list: got %d, want %d\n", int(got), int(expected));
+            return got == expected;
+        };
+        const auto write = [&](std::uint64_t va) { return [&bad, va] { return bad.write_immediate({va, 1, 0}); }; };
+        const auto atomic = [&](AtomicCopyBuffer c) { return [&bad, c] { return bad.atomic_copy(c); }; };
+        const auto discard = [&](DiscardResource c) { return [&bad, c] { return bad.discard(c); }; };
+        constexpr auto unresolved = ReplayResult::unresolved_resource;
+        if (!rejected(write(va_c + c_size), unresolved, vk) ||          // one past c
+            !rejected(write(0x40000), unresolved, vk) ||                // no resource there
+            !rejected(write(va_a), ReplayResult::unsupported, without_update) ||
+            !rejected(atomic({b_id, c_offset, a_id, 0, 8, {{a_id, 0, 0, 8}}}), ReplayResult::invalid_copy, vk) ||  // past b
+            !rejected(atomic({b_id, 0, a_id, 0, 4, {{99, 0, 0, 4}}}), unresolved, vk) ||
+            !rejected(atomic({b_id, 0, a_id, 0, 4, {{a_id, 0, 0, bytes + 4}}}), ReplayResult::invalid_copy, vk) ||
+            !rejected(discard({rt_id, 1, 1, false}), ReplayResult::invalid_subresource, vk) ||
+            !rejected(discard({a_id, 1, 1, false}), ReplayResult::invalid_subresource, vk) ||
+            // An explicit count of UINT_MAX is a range, not the whole resource: it runs past rt and a.
+            !rejected(discard({rt_id, 0, all_subresources, false}), ReplayResult::invalid_subresource, vk) ||
+            !rejected(discard({a_id, 0, all_subresources, false}), ReplayResult::invalid_subresource, vk))
+            return false;
+        if (replay(list, cb, resolve, vk, &tracker) != ReplayResult::success) return false;
+        d.read_back(cb, rt, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT, size, size, 1, pixels, 0);
+        d.read_back(cb, kept, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT, size, size, 1, pixels,
+                    texels * 4);
+        VkMemoryBarrier host{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        host.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        host.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+        vk.pipeline_barrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &host, 0, nullptr, 0,
+                            nullptr);
+        return true;
+    });
+    EXPECT(ok);
+    EXPECT(tracker.layout(rt_id, 0) == VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    EXPECT(tracker.layout(kept_id, 0) == VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+
+    const auto word = [](const void* base, VkDeviceSize offset) {
+        std::uint32_t value;
+        std::memcpy(&value, static_cast<const std::uint8_t*>(base) + offset, 4);
+        return value;
+    };
+    constexpr std::uint32_t untouched = 0xcdcdcdcd;
+    std::map<VkDeviceSize, std::uint32_t> want_a{{0, 0x44444444}, {4, 0x22222222}};
+    std::map<VkDeviceSize, std::uint32_t> want_b{{0, 0x22222222},      {8, 0x11111111},
+                                                 {12, 0x22222222},     {16, 0x44444444},
+                                                 {c_offset, 0x33333333}, {c_offset + 8, 0x22222222},
+                                                 {c_offset + c_size - 4, 0x55555555}};
+    for (VkDeviceSize offset = 0; offset < bytes; offset += 4) {
+        for (const auto& [name, base, want] : {std::tuple{"F buffer a", a_mapped, &want_a},
+                                               std::tuple{"F buffer b", b_mapped, &want_b}}) {
+            const auto it = want->find(offset);
+            const std::uint32_t expected = it == want->end() ? untouched : it->second;
+            const std::uint32_t got = word(base, offset);
+            if (got != expected && g_mismatches++ < 8)
+                std::fprintf(stderr, "%s +%llu: got 0x%08x, want 0x%08x\n", name, (unsigned long long)offset, got,
+                             expected);
+        }
+    }
+    const auto* image_data = static_cast<const std::uint8_t*>(image_mapped);
+    for (std::uint32_t i = 0; i < texels; ++i) {
+        expect_rgba("F discarded then cleared", image_data, i, green);
+        expect_rgba("F partly discarded", image_data + texels * 4, i, red);
+    }
+    std::printf("F: immediate writes in three modes, UINT and UINT64 atomic copies, buffer and texture discards\n");
+    return 0;
+}
+
 } // namespace
 
 int main() {
     vktest::Device device;
     EXPECT(device.create());
-    if (part_a(device) || part_b(device) || part_c(device) || part_d(device) || part_e(device)) return 1;
+    if (part_a(device) || part_b(device) || part_c(device) || part_d(device) || part_e(device) || part_f(device)) return 1;
     if (g_mismatches) return 1;
     if (device.validation_errors()) {
         std::fprintf(stderr, "%u validation errors\n", device.validation_errors());
