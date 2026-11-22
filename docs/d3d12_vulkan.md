@@ -1893,6 +1893,12 @@ The trace will enumerate them.
     `StandardSwizzle64KBSupported` as FALSE), and `GetHeapProperties` on a reserved resource is `E_INVALIDARG`.
     The description, initial-state and clear-value rules are a committed resource's on a default heap, and a null
     output is `E_UNEXPECTED` after them (`compare_placed_reserved`, RTX 3060 / 610.88).
+    `GetHeapProperties` answers as the host runtime's (`d3d12_heap_properties_test`: 561 values for committed
+    resources in every heap type, custom ones and SHARED / ALLOW_DISPLAY / CREATE_NOT_ZEROED / CREATE_NOT_RESIDENT
+    included, placed resources in heaps of each kind, reserved ones, and null arguments; RTX 3060, driver 610.88).
+    A committed resource's flags are the caller's without the two creation-only bits, plus the DENY bits of the
+    resource classes it isn't; a placed resource reports its heap's flags as they are, so one in an `ALLOW_ALL`
+    heap reads back 0.
     `CheckFeatureSupport` still reports `TiledResourcesTier` as not supported, so a game that checks it creates
     committed resources instead. Buffer mappings alone do not implement a full tiled-resources tier.
     The Xbox tiled layout word `0x101` is accepted as `64KB_UNDEFINED_SWIZZLE` (**Assumption**:
