@@ -343,6 +343,75 @@ class RttiScanCoreTest(unittest.TestCase):
         self.assertFalse(cls_info["multiple"])
         self.assertFalse(cls_info["virtual"])
 
+    def test_null_or_header_chd_does_not_read_dos_header_as_hierarchy(self):
+        rdata = bytearray(0x1000)
+        rdata[0x000:0x010] = b"\x00" * 16
+        rdata[0x010:0x028] = b".?AVNullChd@@\x00\x00\x00"
+        # COL at 0x2040 with chd=0 (null RVA)
+        rdata[0x040:0x058] = struct.pack("<6I", 1, 0, 0, 0x2000, 0, 0x2040)
+
+        pe = bytearray(make_synthetic_pe(text_bytes=b"\xc3" * 0x10, rdata_bytes=bytes(rdata)))
+        # Populate standard non-zero DOS header fields at offset 4..16 (sig!=0, attrs=3, nbase=4, rarr=0x2080)
+        struct.pack_into("<3I", pe, 4, 3, 4, 0x2080)
+        # Put a fake BCD array at 0x2080..0x2090 pointing to TD 0x2000 so a bogus read at RVA 0 would find bases
+        struct.pack_into("<4I", pe, 0x400 + 0x1000 + 0x080, 0x2090, 0x2090, 0x2090, 0x2090)
+        struct.pack_into("<I", pe, 0x400 + 0x1000 + 0x090, 0x2000)
+
+        got = rtti_scan.scan_pe64_rtti(bytes(pe))
+        self.assertEqual(len(got["classes"]), 1)
+        cls_info = got["classes"][0]
+        self.assertFalse(cls_info["multiple"])
+        self.assertFalse(cls_info["virtual"])
+        self.assertEqual(cls_info["bases"], [])
+
+    def test_later_col_recovers_hierarchy_after_earlier_col_with_bad_chd(self):
+        rdata = bytearray(0x1000)
+        # Base TD at 0x2000, Derived TD at 0x2040
+        rdata[0x010:0x020] = b".?AVBase@@\x00\x00\x00\x00\x00\x00"
+        rdata[0x050:0x060] = b".?AVDerived@@\x00\x00\x00"
+        # BCDs at 0x2080 (Derived) and 0x20A0 (Base)
+        rdata[0x080:0x09C] = struct.pack("<IIiiiII", 0x2040, 1, 0, 0, 0, 0, 0)
+        rdata[0x0A0:0x0BC] = struct.pack("<IIiiiII", 0x2000, 0, 0, 0, 0, 0, 0)
+        # BaseClassArray at 0x20C0, valid CHD at 0x20D0 (attrs=1 multiple, nbase=2)
+        rdata[0x0C0:0x0C8] = struct.pack("<2I", 0x2080, 0x20A0)
+        rdata[0x0D0:0x0E0] = struct.pack("<4I", 0, 1, 2, 0x20C0)
+        # First COL at 0x20E0 has out-of-bounds CHD (0x99000); second COL at 0x2100 has valid CHD (0x20D0)
+        rdata[0x0E0:0x0F8] = struct.pack("<6I", 1, 0, 0, 0x2040, 0x99000, 0x20E0)
+        rdata[0x100:0x118] = struct.pack("<6I", 1, 8, 0, 0x2040, 0x20D0, 0x2100)
+
+        pe_bytes = make_synthetic_pe(text_bytes=b"\xc3" * 0x10, rdata_bytes=bytes(rdata))
+        got = rtti_scan.scan_pe64_rtti(pe_bytes)
+        by_name = {c["name"]: c for c in got["classes"]}
+        self.assertTrue(by_name["Derived"]["multiple"])
+        self.assertEqual(by_name["Derived"]["bases"], ["Base"])
+
+    def test_unaligned_section_start_does_not_scan_before_section_for_vtables(self):
+        rdata = bytearray(0x1000)
+        rdata[0x010:0x020] = b".?AVAligned@@\x00\x00\x00"
+        # Valid COL at 0x2040
+        rdata[0x040:0x058] = struct.pack("<6I", 1, 0, 0, 0x2000, 0, 0x2040)
+        # Put a COL pointer at RVA 0x2100 and a code pointer at 0x2108, then shift .rdata's VirtualAddress
+        # to 0x2104 (with RawPtr shifted +0x104) so RVA 0x2100 lies 4 bytes BEFORE .rdata starts.
+        rdata[0x100:0x110] = struct.pack("<2Q", self.image_base + 0x2040, self.image_base + 0x1000)
+        pe = bytearray(make_synthetic_pe(text_bytes=b"\xc3" * 0x10, rdata_bytes=bytes(rdata)))
+        # Keep the COL pointer at RVA 0x2100 in the image (inside .text's tail if .text is extended to 0x1104),
+        # or place a third non-exec section starting at unaligned RVA 0x2104 where RVA 0x2100 is outside it.
+        sec2_off = 0x80 + 24 + 240 + 40
+        # Shrink .rdata VirtualSize to 0x100 (covers 0x2000..0x2100, excluding 0x2100) and add a 3rd section at 0x2104
+        struct.pack_into("<I", pe, sec2_off + 8, 0x100)
+        struct.pack_into("<H", pe, 0x80 + 6, 3)  # num_sections = 3
+        sec3 = struct.pack(
+            "<8sIIIIIIHHI",
+            b".data\x00\x00\x00", 0x100, 0x2104, 0x100, 0x400 + 0x1000 + 0x104,
+            0, 0, 0, 0, 0x40000040,
+        )
+        pe[sec2_off + 40 : sec2_off + 80] = sec3
+        # Also write the stale COL pointer into the end of .rdata raw bytes at RVA 0x2100 by letting .rdata raw_size
+        # cover 0x2100 while its virtual_size stops at 0x2100, and .data starts at 0x2104.
+        got = rtti_scan.scan_pe64_rtti(bytes(pe))
+        self.assertEqual(got["vtables"], [])
+
+
     def test_default_output_filename(self):
         rdata = bytearray(0x1000)
         rdata[0:16] = b"\x00" * 16
