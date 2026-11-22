@@ -16,7 +16,10 @@ Standard library only: Python 3.9+ compatible, zero game data, zero external dep
 """
 from __future__ import annotations
 
+from dataclasses import dataclass
+import enum
 import math
+import re
 import struct
 import unittest
 from fractions import Fraction
@@ -277,6 +280,145 @@ class RegisterFile:
         return ((dword >> 16) if hi else dword) & MASK16
 
 
+class DataType(enum.Enum):
+    """Data types supported by the symbolic VALU AST."""
+    F16 = "f16"
+    F32 = "f32"
+    I32 = "i32"
+    U32 = "u32"
+
+
+class OperandKind(enum.Enum):
+    """Operand categories for RDNA2 VALU instructions."""
+    VGPR = "vgpr"
+    SGPR = "sgpr"
+    LITERAL = "literal"
+    INLINE_FLOAT = "inline_float"
+
+
+@dataclass
+class ASTOperand:
+    """Symbolic typed operand with modifier attributes."""
+    kind: OperandKind
+    reg_index: int = 0
+    hi: bool = False
+    abs_mod: bool = False
+    neg_mod: bool = False
+    literal_val: int = 0
+    data_type: DataType = DataType.F16
+
+    def to_asm(self) -> str:
+        if self.kind == OperandKind.VGPR:
+            base = f"v{self.reg_index}" + (".h" if self.hi else ".l")
+        elif self.kind == OperandKind.SGPR:
+            base = f"s{self.reg_index}" + (".h" if self.hi else ".l")
+        elif self.kind == OperandKind.INLINE_FLOAT:
+            base = f"{bits_to_f16(self.literal_val)}"
+        elif self.kind == OperandKind.LITERAL:
+            base = f"0x{self.literal_val:04X}"
+        else:
+            base = "?"
+
+        if self.abs_mod:
+            base = f"|{base}|"
+        if self.neg_mod:
+            base = f"-{base}"
+        return base
+
+
+@dataclass
+class ASTInstruction:
+    """Symbolic AST node for v_mul_f16 instruction with typed validation."""
+    opcode: str
+    dst: ASTOperand
+    src0: ASTOperand
+    src1: ASTOperand
+    clamp: bool = False
+    omod: str = "none"
+
+    def validate(self) -> None:
+        if self.opcode != "v_mul_f16":
+            raise ValueError(f"Unsupported opcode: {self.opcode}")
+        if self.dst.kind != OperandKind.VGPR:
+            raise TypeError("Destination must be a VGPR")
+        if self.dst.abs_mod or self.dst.neg_mod:
+            raise ValueError("Destination cannot have input modifiers (abs/neg)")
+        if self.omod not in ("none", "mul:2", "mul:4", "div:2"):
+            raise ValueError(f"Invalid omod specifier: {self.omod}")
+
+    def to_asm(self) -> str:
+        parts = [f"{self.opcode} {self.dst.to_asm()}, {self.src0.to_asm()}, {self.src1.to_asm()}"]
+        if self.clamp:
+            parts.append("clamp")
+        if self.omod != "none":
+            parts.append(self.omod)
+        return " ".join(parts)
+
+
+def parse_v_mul_f16_asm(asm_line: str) -> ASTInstruction:
+    """Parse a single assembly instruction line into an ASTInstruction node."""
+    line = asm_line.strip()
+    match = re.match(r"^v_mul_f16\s+([^,]+),\s*([^,]+),\s*(\S+)(.*)$", line)
+    if not match:
+        raise ValueError(f"Cannot parse v_mul_f16 assembly: {asm_line}")
+
+    dst_str, src0_str, src1_str, trailing = match.groups()
+    clamp = "clamp" in trailing
+    omod = "none"
+    for candidate in ("mul:2", "mul:4", "div:2"):
+        if candidate in trailing:
+            omod = candidate
+
+    def parse_operand(op_str: str) -> ASTOperand:
+        s = op_str.strip()
+        neg_mod = False
+        abs_mod = False
+
+        if s.startswith("-"):
+            neg_mod = True
+            s = s[1:].strip()
+
+        if s.startswith("|") and s.endswith("|"):
+            abs_mod = True
+            s = s[1:-1].strip()
+
+        # Check VGPR or SGPR
+        vgpr_match = re.match(r"^v(\d+)(\.([lh]))?$", s)
+        if vgpr_match:
+            idx = int(vgpr_match.group(1))
+            hi = vgpr_match.group(3) == "h"
+            return ASTOperand(kind=OperandKind.VGPR, reg_index=idx, hi=hi, abs_mod=abs_mod, neg_mod=neg_mod)
+
+        sgpr_match = re.match(r"^s(\d+)(\.([lh]))?$", s)
+        if sgpr_match:
+            idx = int(sgpr_match.group(1))
+            hi = sgpr_match.group(3) == "h"
+            return ASTOperand(kind=OperandKind.SGPR, reg_index=idx, hi=hi, abs_mod=abs_mod, neg_mod=neg_mod)
+
+        # Hex literal
+        if s.startswith("0x") or s.startswith("0X"):
+            val = int(s, 16)
+            return ASTOperand(kind=OperandKind.LITERAL, literal_val=val, abs_mod=abs_mod, neg_mod=neg_mod)
+
+        # Float constant
+        try:
+            val_f = float(s)
+            val_bits = f16_to_bits(val_f)
+            return ASTOperand(kind=OperandKind.INLINE_FLOAT, literal_val=val_bits, abs_mod=abs_mod, neg_mod=neg_mod)
+        except ValueError:
+            pass
+
+        raise ValueError(f"Unrecognized operand format: {op_str}")
+
+    dst_op = parse_operand(dst_str)
+    src0_op = parse_operand(src0_str)
+    src1_op = parse_operand(src1_str)
+
+    ast = ASTInstruction(opcode="v_mul_f16", dst=dst_op, src0=src0_op, src1=src1_op, clamp=clamp, omod=omod)
+    ast.validate()
+    return ast
+
+
 class TestValuMulF16Oracle(unittest.TestCase):
     """Unit tests for the reference mathematical oracle and architectural model."""
 
@@ -364,6 +506,84 @@ class TestValuMulF16Oracle(unittest.TestCase):
 
         rf.set_vgpr_half(0, hi=True, val=0xCAFE)
         self.assertEqual(rf.get_vgpr(0), 0xCAFEBEEF)
+
+
+class TestSymbolicAST(unittest.TestCase):
+    """Unit tests for AST opcode definitions, type checking, and expression serialization."""
+
+    def test_ast_to_asm_roundtrip(self) -> None:
+        inst = ASTInstruction(
+            opcode="v_mul_f16",
+            dst=ASTOperand(OperandKind.VGPR, reg_index=0, hi=False),
+            src0=ASTOperand(OperandKind.VGPR, reg_index=1, hi=True, neg_mod=True),
+            src1=ASTOperand(OperandKind.SGPR, reg_index=2, hi=False, abs_mod=True),
+            clamp=True,
+            omod="mul:2",
+        )
+        asm_str = inst.to_asm()
+        self.assertEqual(asm_str, "v_mul_f16 v0.l, -v1.h, |s2.l| clamp mul:2")
+
+        parsed = parse_v_mul_f16_asm(asm_str)
+        self.assertEqual(parsed.dst.reg_index, 0)
+        self.assertFalse(parsed.dst.hi)
+        self.assertEqual(parsed.src0.reg_index, 1)
+        self.assertTrue(parsed.src0.hi)
+        self.assertTrue(parsed.src0.neg_mod)
+        self.assertEqual(parsed.src1.reg_index, 2)
+        self.assertFalse(parsed.src1.hi)
+        self.assertTrue(parsed.src1.abs_mod)
+        self.assertTrue(parsed.clamp)
+        self.assertEqual(parsed.omod, "mul:2")
+
+    def test_parser_modifiers_and_literals(self) -> None:
+        inst = parse_v_mul_f16_asm("v_mul_f16 v2.h, 0x3C00, 2.0 div:2")
+        self.assertEqual(inst.dst.reg_index, 2)
+        self.assertTrue(inst.dst.hi)
+        self.assertEqual(inst.src0.literal_val, 0x3C00)
+        self.assertEqual(inst.src1.literal_val, POS_TWO_F16)
+        self.assertEqual(inst.omod, "div:2")
+
+    def test_ast_validation_errors(self) -> None:
+        # Invalid opcode
+        with self.assertRaises(ValueError):
+            bad = ASTInstruction(
+                opcode="v_add_f16",
+                dst=ASTOperand(OperandKind.VGPR, 0),
+                src0=ASTOperand(OperandKind.VGPR, 1),
+                src1=ASTOperand(OperandKind.VGPR, 2),
+            )
+            bad.validate()
+
+        # Non-VGPR destination
+        with self.assertRaises(TypeError):
+            bad_dst = ASTInstruction(
+                opcode="v_mul_f16",
+                dst=ASTOperand(OperandKind.SGPR, 0),
+                src0=ASTOperand(OperandKind.VGPR, 1),
+                src1=ASTOperand(OperandKind.VGPR, 2),
+            )
+            bad_dst.validate()
+
+        # Destination with input modifiers
+        with self.assertRaises(ValueError):
+            bad_mod = ASTInstruction(
+                opcode="v_mul_f16",
+                dst=ASTOperand(OperandKind.VGPR, 0, neg_mod=True),
+                src0=ASTOperand(OperandKind.VGPR, 1),
+                src1=ASTOperand(OperandKind.VGPR, 2),
+            )
+            bad_mod.validate()
+
+        # Invalid omod
+        with self.assertRaises(ValueError):
+            bad_omod = ASTInstruction(
+                opcode="v_mul_f16",
+                dst=ASTOperand(OperandKind.VGPR, 0),
+                src0=ASTOperand(OperandKind.VGPR, 1),
+                src1=ASTOperand(OperandKind.VGPR, 2),
+                omod="bad_omod",
+            )
+            bad_omod.validate()
 
 
 if __name__ == "__main__":
