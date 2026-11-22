@@ -3837,14 +3837,17 @@ class Gen:
 
     def med3_f(self, vals, srcs, sel=None):
         """v_med3_f32 / v_med3_f16 on the f32 values ``vals`` of operands ``srcs`` (``sel``: the f16 half each one
-        reads). Without NaN: the median, FClamp(z, NMin(x, y), NMax(x, y)). With a NaN operand the hardware returns
-        min3(x, y, z) with the NaN-ignoring min (docs/design.md). An inline or literal constant that is not a NaN
-        gets no OpIsNan; with no operand left to check there is no select."""
+        reads). Without NaN: the median, NMin(NMax(z, NMin(x, y)), NMax(x, y)) — using NMax/NMin rather than FClamp
+        so evaluating the median before the NaN select is never GLSL.std.450 undefined when z is NaN or both x and y
+        are NaN. With any NaN operand the hardware returns min3(x, y, z) with the NaN-ignoring min (docs/design.md).
+        An inline or literal constant that is not a NaN gets no OpIsNan; with no operand left to check there is no
+        select."""
         x, y, z = vals
-        lo, hi, m = self.tmp(), self.tmp(), self.tmp()
+        lo, hi, m1, m = self.tmp(), self.tmp(), self.tmp(), self.tmp()
         self.emit(f"{lo} = OpExtInst %float %glsl NMin {x} {y}")
         self.emit(f"{hi} = OpExtInst %float %glsl NMax {x} {y}")
-        self.emit(f"{m} = OpExtInst %float %glsl FClamp {z} {lo} {hi}")
+        self.emit(f"{m1} = OpExtInst %float %glsl NMax {z} {lo}")
+        self.emit(f"{m} = OpExtInst %float %glsl NMin {m1} {hi}")
         checks = []
         for i, (v, s) in enumerate(zip(vals, srcs)):
             bits = None
