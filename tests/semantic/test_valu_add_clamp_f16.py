@@ -3,8 +3,8 @@ from __future__ import annotations
 import math
 import struct
 import unittest
-from typing import Optional, Tuple, Union
-from dataclasses import dataclass
+from typing import List, Optional, Tuple, Union
+from dataclasses import dataclass, field
 from enum import Enum, auto
 
 # IEEE 754 binary16 (half precision) architectural constants
@@ -255,6 +255,61 @@ class VAddClampF16Instruction:
 
 
 # ==============================================================================
+# Deterministic Scalar Instruction Interpreter
+# ==============================================================================
+
+@dataclass
+class ScalarMachineState:
+    """Architectural register file for a single wavefront lane."""
+    vgprs: List[int] = field(default_factory=lambda: [0] * 256)
+    sgprs: List[int] = field(default_factory=lambda: [0] * 256)
+
+    def get_reg16(self, reg: Reg16) -> int:
+        file = self.vgprs if reg.reg_type == RegType.VGPR else self.sgprs
+        word = file[reg.index]
+        return (word >> 16) & 0xFFFF if reg.is_hi else word & 0xFFFF
+
+    def set_reg16(self, reg: Reg16, val16: int) -> None:
+        file = self.vgprs if reg.reg_type == RegType.VGPR else self.sgprs
+        old = file[reg.index]
+        if reg.is_hi:
+            file[reg.index] = (old & 0x0000FFFF) | ((val16 & 0xFFFF) << 16)
+        else:
+            file[reg.index] = (old & 0xFFFF0000) | (val16 & 0xFFFF)
+
+
+class ScalarInterpreter:
+    """Deterministic scalar instruction interpreter for v_add_clamp_f16."""
+
+    def resolve_operand(self, op: VOP3Operand16, state: ScalarMachineState) -> int:
+        if isinstance(op.source, Reg16):
+            return state.get_reg16(op.source)
+        elif isinstance(op.source, Literal16):
+            return op.source.bits
+        else:
+            raise TypeError(f"Unsupported operand source type: {type(op.source)}")
+
+    def step(self, instr: VAddClampF16Instruction, state: ScalarMachineState) -> int:
+        # Atomic read phase
+        s0_raw = self.resolve_operand(instr.src0, state)
+        s1_raw = self.resolve_operand(instr.src1, state)
+
+        # Computation phase
+        result_bits = oracle_v_add_clamp_f16(
+            src0_bits=s0_raw,
+            src1_bits=s1_raw,
+            abs0=instr.src0.abs_mod,
+            neg0=instr.src0.neg_mod,
+            abs1=instr.src1.abs_mod,
+            neg1=instr.src1.neg_mod,
+        )
+
+        # Write-back phase
+        state.set_reg16(instr.dst, result_bits)
+        return result_bits
+
+
+# ==============================================================================
 # Unit Tests
 # ==============================================================================
 
@@ -417,6 +472,91 @@ class TestSymbolicAST(unittest.TestCase):
             VOP3Operand16(Literal16.from_float(0.0)),
         )
         self.assertEqual(i1, i2)
+
+
+class TestScalarInterpreter(unittest.TestCase):
+    """Unit tests for the deterministic scalar interpreter."""
+
+    def setUp(self) -> None:
+        self.interp = ScalarInterpreter()
+        self.state = ScalarMachineState()
+
+    def test_scalar_vgpr_vgpr_clamped_addition(self) -> None:
+        # 0.25 + 0.5 = 0.75
+        self.state.set_reg16(Reg16(2, RegType.VGPR, SubWord.LO), f16_to_bits(0.25))
+        self.state.set_reg16(Reg16(4, RegType.VGPR, SubWord.LO), f16_to_bits(0.5))
+        instr = VAddClampF16Instruction(
+            dst=Reg16(0, RegType.VGPR, SubWord.LO),
+            src0=VOP3Operand16(Reg16(2, RegType.VGPR, SubWord.LO)),
+            src1=VOP3Operand16(Reg16(4, RegType.VGPR, SubWord.LO)),
+        )
+        res_bits = self.interp.step(instr, self.state)
+        self.assertEqual(bits_to_f16(res_bits), 0.75)
+        self.assertEqual(self.state.get_reg16(Reg16(0, RegType.VGPR, SubWord.LO)), res_bits)
+
+    def test_scalar_vgpr_sgpr_overflow_clamp(self) -> None:
+        # 0.75 + 0.5 = 1.25 -> clamped to 1.0
+        self.state.set_reg16(Reg16(0, RegType.VGPR, SubWord.LO), f16_to_bits(0.75))
+        self.state.set_reg16(Reg16(8, RegType.SGPR, SubWord.LO), f16_to_bits(0.5))
+        instr = VAddClampF16Instruction(
+            dst=Reg16(4, RegType.VGPR, SubWord.HI),
+            src0=VOP3Operand16(Reg16(0, RegType.VGPR, SubWord.LO)),
+            src1=VOP3Operand16(Reg16(8, RegType.SGPR, SubWord.LO)),
+        )
+        res_bits = self.interp.step(instr, self.state)
+        self.assertEqual(res_bits, ONE_F16)
+        self.assertEqual(self.state.get_reg16(Reg16(4, RegType.VGPR, SubWord.HI)), ONE_F16)
+
+    def test_scalar_vgpr_literal_negative_clamp(self) -> None:
+        # 0.2 + (-0.5) = -0.3 -> clamped to +0.0
+        self.state.set_reg16(Reg16(6, RegType.VGPR, SubWord.LO), f16_to_bits(0.2))
+        instr = VAddClampF16Instruction(
+            dst=Reg16(6, RegType.VGPR, SubWord.LO),
+            src0=VOP3Operand16(Reg16(6, RegType.VGPR, SubWord.LO)),
+            src1=VOP3Operand16(Literal16.from_float(-0.5)),
+        )
+        res_bits = self.interp.step(instr, self.state)
+        self.assertEqual(res_bits, POS_ZERO)
+        self.assertEqual(self.state.get_reg16(Reg16(6, RegType.VGPR, SubWord.LO)), POS_ZERO)
+
+    def test_scalar_with_modifiers(self) -> None:
+        self.state.set_reg16(Reg16(0, RegType.VGPR, SubWord.LO), f16_to_bits(-0.8))
+        self.state.set_reg16(Reg16(2, RegType.VGPR, SubWord.LO), f16_to_bits(0.3))
+        # -|-0.8| + 0.3 = -0.8 + 0.3 = -0.5 -> clamped to +0.0
+        instr = VAddClampF16Instruction(
+            dst=Reg16(4, RegType.VGPR, SubWord.LO),
+            src0=VOP3Operand16(Reg16(0, RegType.VGPR, SubWord.LO), abs_mod=True, neg_mod=True),
+            src1=VOP3Operand16(Reg16(2, RegType.VGPR, SubWord.LO)),
+        )
+        res_bits = self.interp.step(instr, self.state)
+        self.assertEqual(res_bits, POS_ZERO)
+
+    def test_scalar_subword_preservation(self) -> None:
+        # Prepopulate v1 with distinct lo and hi half words
+        self.state.vgprs[1] = pack_f16_pair(0x1111, 0x2222)
+        instr_lo = VAddClampF16Instruction(
+            dst=Reg16(1, RegType.VGPR, SubWord.LO),
+            src0=VOP3Operand16(Literal16.from_float(0.25)),
+            src1=VOP3Operand16(Literal16.from_float(0.25)),
+        )
+        self.interp.step(instr_lo, self.state)
+        # Low half updated to 0.5 (0x3800), high half preserved (0x2222)
+        self.assertEqual(self.state.get_reg16(Reg16(1, RegType.VGPR, SubWord.LO)), 0x3800)
+        self.assertEqual(self.state.get_reg16(Reg16(1, RegType.VGPR, SubWord.HI)), 0x2222)
+
+    def test_scalar_determinism(self) -> None:
+        runs = []
+        for _ in range(50):
+            st = ScalarMachineState()
+            st.set_reg16(Reg16(0, RegType.VGPR, SubWord.LO), f16_to_bits(0.4))
+            st.set_reg16(Reg16(2, RegType.VGPR, SubWord.LO), f16_to_bits(0.3))
+            instr = VAddClampF16Instruction(
+                dst=Reg16(4, RegType.VGPR, SubWord.LO),
+                src0=VOP3Operand16(Reg16(0, RegType.VGPR, SubWord.LO)),
+                src1=VOP3Operand16(Reg16(2, RegType.VGPR, SubWord.LO)),
+            )
+            runs.append(self.interp.step(instr, st))
+        self.assertTrue(all(r == runs[0] for r in runs))
 
 
 if __name__ == "__main__":
