@@ -923,5 +923,63 @@ class TestInterpMovF16StatusFlagsAndConditionCodes(unittest.TestCase):
         self.assertEqual(vcc_lt >> 32, 0)
 
 
+class TestInterpMovF16IEEE754Boundaries(unittest.TestCase):
+    """Test suite for IEEE 754 boundary extremes, subnormals, and NaN handling."""
+
+    def test_subnormal_preservation(self):
+        # Subnormals must be copied bit-for-bit without flush-to-zero
+        subnormals = [H_SUB_MIN, 0x0002, 0x0100, H_SUB_MAX, H_SUB_MIN | H_NEG_ZERO]
+        for sub in subnormals:
+            attr_word = pack_f16_pair(sub, 0)
+            res = ref_interp_mov_f16(attr_word, high_src=False, high_dst=False, old_dst_u32=0)
+            self.assertEqual(res & MASK16, sub)
+
+    def test_signed_zeros_bitwise_identity(self):
+        # +0.0
+        res_pos = ref_interp_mov_f16(pack_f16_pair(H_POS_ZERO, 0), high_src=False, high_dst=False)
+        self.assertEqual(res_pos & MASK16, H_POS_ZERO)
+
+        # -0.0
+        res_neg = ref_interp_mov_f16(pack_f16_pair(H_NEG_ZERO, 0), high_src=False, high_dst=False)
+        self.assertEqual(res_neg & MASK16, H_NEG_ZERO)
+
+    def test_infinities_preservation_and_clamping(self):
+        # +inf (0x7C00)
+        res_inf = ref_interp_mov_f16(pack_f16_pair(H_POS_INF, 0), high_src=False, high_dst=False, clamp=False)
+        self.assertEqual(res_inf & MASK16, H_POS_INF)
+
+        # -inf (0xFC00)
+        res_ninf = ref_interp_mov_f16(pack_f16_pair(H_NEG_INF, 0), high_src=False, high_dst=False, clamp=False)
+        self.assertEqual(res_ninf & MASK16, H_NEG_INF)
+
+        # Clamped +inf saturates to 1.0 (0x3C00)
+        res_clamp_inf = ref_interp_mov_f16(pack_f16_pair(H_POS_INF, 0), high_src=False, high_dst=False, clamp=True)
+        self.assertEqual(res_clamp_inf & MASK16, H_ONE)
+
+        # Clamped -inf saturates to +0.0 (0x0000)
+        res_clamp_ninf = ref_interp_mov_f16(pack_f16_pair(H_NEG_INF, 0), high_src=False, high_dst=False, clamp=True)
+        self.assertEqual(res_clamp_ninf & MASK16, H_POS_ZERO)
+
+    def test_nan_payload_preservation_and_clamp_mapping(self):
+        # Diverse NaN payloads (both positive and negative)
+        nan_samples = [H_QNAN, 0x7E01, 0x7FFF, H_SNAN, 0xFE00, 0xFC01]
+        for nan_u16 in nan_samples:
+            # Unclamped move preserves exact NaN bit pattern
+            res_nan = ref_interp_mov_f16(pack_f16_pair(nan_u16, 0), high_src=False, high_dst=False, clamp=False)
+            self.assertEqual(res_nan & MASK16, nan_u16)
+
+            # Clamped move maps all NaNs to +0.0 (0x0000)
+            res_clamped = ref_interp_mov_f16(pack_f16_pair(nan_u16, 0), high_src=False, high_dst=False, clamp=True)
+            self.assertEqual(res_clamped & MASK16, H_POS_ZERO)
+
+    def test_maximum_finite_normal_and_saturation(self):
+        res_max = ref_interp_mov_f16(pack_f16_pair(H_MAX_NORMAL, 0), high_src=False, high_dst=False, clamp=False)
+        self.assertEqual(res_max & MASK16, H_MAX_NORMAL)
+
+        # Clamped 65504.0 saturates to 1.0
+        res_max_clamped = ref_interp_mov_f16(pack_f16_pair(H_MAX_NORMAL, 0), high_src=False, high_dst=False, clamp=True)
+        self.assertEqual(res_max_clamped & MASK16, H_ONE)
+
+
 if __name__ == "__main__":
     unittest.main()
