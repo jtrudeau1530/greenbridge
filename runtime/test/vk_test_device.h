@@ -426,7 +426,7 @@ public:
         return image;
     }
 
-    // A host-visible, coherent buffer, mapped.
+    // A host-visible, coherent buffer, mapped; with `mapped` null, a device-local one the host can't see.
     VkBuffer buffer(VkDeviceSize size, VkBufferUsageFlags usage, void** mapped) {
         VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
         info.size = size;
@@ -436,11 +436,13 @@ public:
             return VK_NULL_HANDLE;
         VkMemoryRequirements requirements{};
         fn<PFN_vkGetBufferMemoryRequirements>("vkGetBufferMemoryRequirements")(device, buffer, &requirements);
-        const VkDeviceMemory memory =
-            allocate(requirements, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        const VkDeviceMemory memory = allocate(requirements, mapped ? VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                                                          VK_MEMORY_PROPERTY_HOST_COHERENT_BIT
+                                                                    : VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
         buffers_.push_back({buffer, memory});
         if (!memory || fn<PFN_vkBindBufferMemory>("vkBindBufferMemory")(device, buffer, memory, 0) != VK_SUCCESS)
             return VK_NULL_HANDLE;
+        if (!mapped) return buffer;
         if (fn<PFN_vkMapMemory>("vkMapMemory")(device, memory, 0, size, 0, mapped) != VK_SUCCESS) return VK_NULL_HANDLE;
         std::memset(*mapped, 0xcd, size_t(size));
         return buffer;

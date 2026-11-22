@@ -8,10 +8,13 @@
 // R32 indices with R32G32 vertices; a geometry transform; two geometries with an inactive (NaN) triangle; no
 // triangles; and a TLAS of four instances (rotated and scaled, one with mask 0, one with no BLAS).
 // Exit 77 when there is no Vulkan device with bufferDeviceAddress.
+// `vk_xdxr_build_test <out dir> <triangles>` instead times BLAS builds of that many random triangles (wall clock of
+// one submission each, after one warm-up; result and scratch in device-local memory) and writes nothing.
 #include "vk_test_device.h"
 #include "../src/xdxr_build.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -37,9 +40,9 @@ struct Buffer {
     std::uint64_t address = 0;
 };
 
-Buffer make(vktest::Device& gpu, std::size_t bytes) {
+Buffer make(vktest::Device& gpu, std::size_t bytes, bool device_local = false) {
     Buffer b;
-    b.buffer = gpu.buffer(bytes ? bytes : 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &b.map);
+    b.buffer = gpu.buffer(bytes ? bytes : 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, device_local ? nullptr : &b.map);
     if (b.buffer) b.address = gpu.device_address(b.buffer);
     return b;
 }
@@ -193,6 +196,38 @@ int main(int argc, char** argv) {
     if (status != vktest::DeviceStatus::ready) return 1;
     XdxrBuilder builder(gpu.device_proc, gpu.device);
     EXPECT(builder.loaded());
+
+    if (argc > 2) {                                   // timing only
+        const std::uint32_t n = std::uint32_t(std::strtoul(argv[2], nullptr, 10));
+        EXPECT(n > 0);
+        std::mt19937 trng(3);
+        std::uniform_real_distribution<float> u(-100.0f, 100.0f), j(-0.5f, 0.5f);
+        Buffer v = make(gpu, std::size_t(n) * 36);
+        EXPECT(v.buffer);
+        auto* f = static_cast<float*>(v.map);
+        for (std::uint32_t t = 0; t < n; ++t) {
+            const float c[3] = {u(trng), u(trng), u(trng)};
+            for (int k = 0; k < 9; ++k) f[9 * t + k] = c[k % 3] + j(trng);
+        }
+        XdxrTriangles d;
+        d.vertices = v.address;
+        d.triangle_count = n;
+        XdxrLayout layout;
+        EXPECT(layout.compute(n, false));
+        // in VRAM, where the layer keeps acceleration structures (host-visible memory on a discrete GPU is PCIe)
+        Buffer dst = make(gpu, layout.size, true), scratch = make(gpu, std::size_t(layout.scratch), true);
+        EXPECT(dst.buffer && scratch.buffer);
+        double best = 1e30;
+        for (int rep = 0; rep < 4; ++rep) {
+            const auto t0 = std::chrono::steady_clock::now();
+            EXPECT(gpu.run([&](VkCommandBuffer cb) { return builder.record_blas(cb, layout, {d}, dst.address, scratch.address); }));
+            const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            if (rep) best = std::min(best, ms);
+        }
+        std::printf("%u triangles: %.2f ms (best of 3), result %u bytes, scratch %llu bytes, sort size %u\n", n, best,
+                    layout.size, static_cast<unsigned long long>(layout.scratch), layout.sort_size);
+        return 0;
+    }
 
     std::mt19937 rng(7);
     std::uniform_real_distribution<float> spread(-4.0f, 4.0f), jitter(-0.6f, 0.6f);
