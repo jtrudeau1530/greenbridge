@@ -650,5 +650,99 @@ class TestBufferAtomicUminSIMD(unittest.TestCase):
                 self.assertEqual(sim.read_lane_reg_u32(i, RegKind.VGPR, 0), 10)
 
 
+# ==============================================================================
+# Register Aliasing and In-Place Operand Preservation for buffer_atomic_umin
+# ==============================================================================
+
+class TestBufferAtomicUminRegisterAliasing(unittest.TestCase):
+    """Test suite for register aliasing and in-place operand preservation."""
+
+    def test_vdata_equals_vaddr_aliasing(self) -> None:
+        interp = ScalarBufferInterpreter(mem_size=4096)
+        desc = BufferResourceDescriptor(base_address=0, stride=0, num_records=1024)
+        interp.set_buffer_descriptor(0, desc)
+
+        # Let address = 16, memory has 50
+        interp.mem.write_u32(16, 50)
+        # Both vdata and vaddr point to v0. Initially v0 = 16.
+        # This means compare value is 16, and address is 16!
+        interp.write_reg_u32(RegKind.VGPR, 0, 16)
+
+        inst = Instruction(
+            opcode=Opcode.BUFFER_ATOMIC_UMIN,
+            vdata=Register(RegKind.VGPR, 0),
+            vaddr=Register(RegKind.VGPR, 0),
+            srsrc=Register(RegKind.SGPR, 0, count=4),
+            soffset=0,
+            mods=BufferAtomicModifiers(glc=True, offen=True),
+        )
+        ret, ok = interp.step(inst)
+        self.assertTrue(ok)
+        # Memory had 50, compared with 16 -> min is 16
+        self.assertEqual(interp.mem.read_u32(16), 16)
+        # vdata was overwritten with old_val = 50
+        self.assertEqual(ret, 50)
+        self.assertEqual(interp.read_reg_u32(RegKind.VGPR, 0), 50)
+
+    def test_simd_aliasing_under_divergent_mask(self) -> None:
+        sim = SIMDBufferWavefrontInterpreter(wave_size=32, mem_size=4096)
+        desc = BufferResourceDescriptor(base_address=0, stride=0, num_records=2048)
+        sim.set_buffer_descriptor(0, desc)
+
+        sim.set_exec_mask(0x0000FFFF)  # first 16 lanes active
+
+        for i in range(32):
+            addr = i * 4
+            sim.mem.write_u32(addr, 100)
+            sim.write_lane_reg_u32(i, RegKind.VGPR, 0, addr)
+
+        # vdata == vaddr == v0
+        inst = Instruction(
+            opcode=Opcode.BUFFER_ATOMIC_UMIN,
+            vdata=Register(RegKind.VGPR, 0),
+            vaddr=Register(RegKind.VGPR, 0),
+            srsrc=Register(RegKind.SGPR, 0, count=4),
+            soffset=0,
+            mods=BufferAtomicModifiers(glc=True, offen=True),
+        )
+        sim.step(inst)
+
+        for i in range(32):
+            addr = i * 4
+            if i < 16:
+                # Active: memory holds min(100, addr) = addr
+                self.assertEqual(sim.mem.read_u32(addr), addr)
+                # v0 gets old memory value 100
+                self.assertEqual(sim.read_lane_reg_u32(i, RegKind.VGPR, 0), 100)
+            else:
+                # Inactive: memory untouched (100), register untouched (addr)
+                self.assertEqual(sim.mem.read_u32(addr), 100)
+                self.assertEqual(sim.read_lane_reg_u32(i, RegKind.VGPR, 0), addr)
+
+    def test_successive_inplace_chain(self) -> None:
+        interp = ScalarBufferInterpreter(mem_size=4096)
+        desc = BufferResourceDescriptor(base_address=0, stride=0, num_records=1024)
+        interp.set_buffer_descriptor(0, desc)
+
+        # Monotonically decreasing unsigned sequence: 1000 -> 500 -> 250 -> 100 -> 10
+        interp.mem.write_u32(0, 1000)
+        steps = [500, 750, 250, 300, 100, 150, 10]
+
+        for s in steps:
+            interp.write_reg_u32(RegKind.VGPR, 0, s)
+            inst = Instruction(
+                opcode=Opcode.BUFFER_ATOMIC_UMIN,
+                vdata=Register(RegKind.VGPR, 0),
+                vaddr=Register(RegKind.VGPR, 1),
+                srsrc=Register(RegKind.SGPR, 0, count=4),
+                soffset=0,
+                mods=BufferAtomicModifiers(glc=False, offen=True),
+            )
+            interp.step(inst)
+
+        # Final minimum must be 10
+        self.assertEqual(interp.mem.read_u32(0), 10)
+
+
 if __name__ == "__main__":
     unittest.main()
