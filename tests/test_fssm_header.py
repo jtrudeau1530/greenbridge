@@ -199,6 +199,24 @@ class CliTest(unittest.TestCase):
         self.assertEqual(doc["tally"]["ps_with_table"], 1)
         self.assertEqual(doc["tally"]["entries"], 2)
 
+    def test_table_only_entry_counts_exclude_blobs_without_a_table(self):
+        os.remove(os.path.join(self.dir, "index.json"))
+        p = subprocess.run([sys.executable, "-I", TOOL, self.fssm_dir, "--json"],
+                           capture_output=True, text=True)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        tally = json.loads(p.stdout)["tally"]
+        self.assertEqual(tally["stage_source"], "table-only")
+        self.assertEqual(tally["ps_with_table"], 1)
+        self.assertEqual(tally["entries"], 2)
+        self.assertEqual(tally["entry_counts"], {"2": 1})
+        self.assertEqual(sum(tally["entry_counts"].values()), tally["ps_with_table"])
+
+    def test_table_only_tally_with_only_non_ps_blobs_has_an_empty_histogram(self):
+        rows = [{"stage": None, "directory_ok": True, "entries": 0, "fp16_mask": 0, "inputs": []}]
+        tally = fssm_header.tally(rows, False)
+        self.assertEqual(tally["entry_counts"], {})
+        self.assertEqual(tally["entries"], 0)
+
     def test_local_stage_index_works_with_an_unrelated_parent_index(self):
         with open(os.path.join(self.dir, "index.json"), "w", encoding="utf-8") as f:
             json.dump({"unrelated": []}, f)
