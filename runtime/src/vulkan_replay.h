@@ -1696,7 +1696,7 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                     job.to_float = upload;
                     job.app = buffer.buffer;
                     job.app_offset = region.bufferOffset;
-                    job.app_size = buffer.size;
+                    job.app_size = buffer.buffer_offset + buffer.size;
                     job.width = region.imageExtent.width;
                     job.height = region.imageExtent.height;
                     job.slices = region.imageExtent.depth;
