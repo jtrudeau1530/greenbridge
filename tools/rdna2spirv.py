@@ -2769,6 +2769,41 @@ class Gen:
             r = self.tmp()
             self.emit(f"{r} = OpISub %uint {y} {x}")
             self.dst(a[0], r)
+        elif op in ("s_flbit_i32_b64", "s_flbit_i32_i64"):
+            # Leading-bit count of a 64-bit value, from bit 63 down: b64 counts the zeros before the first 1; i64
+            # counts the bits before the first one that differs from the sign bit (b64 of ~S0 when S0 < 0). -1 when
+            # there is none (0, and for i64 also -1). SCC is not written. The pair is 64-bit data (as for
+            # s_lshl_b64); a lane-mask source stays Unsupported (#210).
+            x = a[1]
+            if self.holds_lane_mask(x):
+                raise Unsupported(op + " of a lane mask")
+            if x["k"] == "sgpr" and x.get("n") == 2:
+                lo, hi = self.load_reg("sgpr", x["r"]), self.load_reg("sgpr", x["r"] + 1)
+            elif x["k"] == "imm":
+                v = x["v"] & 0xFFFFFFFFFFFFFFFF
+                lo, hi = self.cu(v & 0xFFFFFFFF), self.cu(v >> 32)
+            else:
+                raise Unsupported(op + " source")
+            if op == "s_flbit_i32_i64":
+                neg, nlo, nhi, slo, shi = (self.tmp() for _ in range(5))
+                self.emit(f"{neg} = OpSLessThan %bool {self.as_int(hi)} {self.as_int(self.cu(0))}")
+                self.emit(f"{nlo} = OpNot %uint {lo}")
+                self.emit(f"{nhi} = OpNot %uint {hi}")
+                self.emit(f"{slo} = OpSelect %uint {neg} {nlo} {lo}")
+                self.emit(f"{shi} = OpSelect %uint {neg} {nhi} {hi}")
+                lo, hi = slo, shi
+            mh, ml, mhu, mlu, ch, cl, hz, lz, r0, r = (self.tmp() for _ in range(10))
+            self.emit(f"{mh} = OpExtInst %int %glsl FindUMsb {hi}")
+            self.emit(f"{ml} = OpExtInst %int %glsl FindUMsb {lo}")
+            self.emit(f"{mhu} = OpBitcast %uint {mh}")
+            self.emit(f"{mlu} = OpBitcast %uint {ml}")
+            self.emit(f"{ch} = OpISub %uint {self.cu(31)} {mhu}")          # zeros above the top 1 of the high half
+            self.emit(f"{cl} = OpISub %uint {self.cu(63)} {mlu}")          # 32 + zeros above the top 1 of the low half
+            self.emit(f"{hz} = OpIEqual %bool {hi} {self.cu(0)}")
+            self.emit(f"{lz} = OpIEqual %bool {lo} {self.cu(0)}")
+            self.emit(f"{r0} = OpSelect %uint {lz} {self.cu(0xFFFFFFFF)} {cl}")
+            self.emit(f"{r} = OpSelect %uint {hz} {r0} {ch}")
+            self.dst(a[0], r)
         elif op in ("s_ff1_i32_b64", "s_ff1_i32_b32", "s_ff0_i32_b64", "s_ff0_i32_b32"):
             # Lowest set (ff1) or zero (ff0) bit of a mask, -1 if none. For a lane mask that is the wave's first lane.
             if self.holds_lane_mask(a[1]):
