@@ -239,6 +239,40 @@ class TestCli(unittest.TestCase):
         with contextlib.redirect_stderr(io.StringIO()):
             self.assertEqual(T.main(["/nonexistent"]), 2)
 
+    def test_missing_parent_and_hardlinked_outputs_rejected_upfront(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = write(os.path.join(tmp, "en.bin"), make_resource(EN))
+            missing_parent = os.path.join(tmp, "no_such_dir", "out.csv")
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err), self.assertRaises(SystemExit) as cm:
+                T.main([src, "--tables", missing_parent])
+            self.assertEqual(cm.exception.code, 2)
+            self.assertIn("parent directory does not exist", err.getvalue())
+
+            first = write(os.path.join(tmp, "first.csv"), b"old\n")
+            alias = os.path.join(tmp, "alias.csv")
+            try:
+                os.link(first, alias)
+            except OSError:
+                self.skipTest("hard links unavailable")
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err), self.assertRaises(SystemExit) as cm:
+                T.main([src, "--dialogue", first, "--tables", alias])
+            self.assertEqual(cm.exception.code, 2)
+            self.assertIn("distinct", err.getvalue())
+
+    def test_invalid_json_labels_is_clean_error_not_traceback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = write(os.path.join(tmp, "en.bin"), make_resource(EN))
+            bad_labels = os.path.join(tmp, "bad.json")
+            with open(bad_labels, "w", encoding="utf-8") as fh:
+                fh.write("{not valid json")
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                rc = T.main([src, "--labels", bad_labels])
+            self.assertEqual(rc, 2)
+            self.assertIn("cannot read input", err.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()
