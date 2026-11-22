@@ -52,6 +52,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.join(ROOT, "runtime", "test", "shaders"))
+import mc_command  # noqa: E402
 
 M32 = 0xFFFFFFFF
 M64 = (1 << 64) - 1
@@ -726,7 +727,6 @@ def make_program(seed, wave, n_ops, **kw):
 # ---- running on the GPU ---------------------------------------------------------------------------------
 def assemble(mc, prog, src, disasm, fssm):
     import compute_fixture
-    import mc_command
     mattr = "+wavefrontsize64,-wavefrontsize32" if prog.wave == 64 else "+wavefrontsize32,-wavefrontsize64"
     cmd = mc + ["-triple=amdgcn--amdpal", "-mcpu=gfx1013", f"-mattr={mattr}", "-show-encoding"]
     if "@" in src:
@@ -751,7 +751,6 @@ def resolve_branches(cmd, prog, src):
     lines = src.splitlines()
     insns = [i for i, ln in enumerate(lines) if ln.strip() and not ln.strip().startswith(";")]
     first = "\n".join(re.sub(r"@\d+$", "0", ln) for ln in lines) + "\n"
-    import mc_command
     r = mc_command.run(cmd, input=first, capture_output=True, text=True)
     if r.returncode or "error:" in r.stderr:
         raise RuntimeError(f"{prog.name} did not assemble:\n{r.stderr}\n{first}")

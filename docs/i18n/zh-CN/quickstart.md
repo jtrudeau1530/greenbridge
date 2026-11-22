@@ -2,7 +2,7 @@
 
 > [!NOTE]
 > 英文文档（[`README.md`](../../../README.md)、[`CONTRIBUTING.md`](../../../CONTRIBUTING.md) 和
-> [`docs/README.md`](../../README.md)）是**权威版本**。本文只汇总稳定的安装与构建说明（与 commit `0d61c357` 同步）。
+> [`docs/README.md`](../../README.md)）是**权威版本**。本文只汇总稳定的安装与构建说明（与 commit `e7584c5` 同步）。
 > 项目每日进展请查看 [`README.md`](../../../README.md)。
 
 ## Leonida 是什么
@@ -67,9 +67,15 @@ python -I make_game.py --wave64-emulate auto              # auto（默认）、o
 - **`--wave64-emulate`**：在 32 lane 子组的 GPU（NVIDIA、Intel）上模拟 compute/mesh 的 wave64。
   默认 `auto` 会询问 `vulkaninfo`，需要时自动启用。
 - **`--work`**：建议指向至少有 350 GB 空闲的磁盘；`shaders` 阶段最慢，默认使用一半 CPU 线程（`--jobs` 可调）。
-- **Linux 与 Wine/Proton**：`make_game.py` 也能在 Linux 上运行。非 Windows 的 `runtime` 阶段需要传入
-  `--runtime-build <目录>`（含 Windows 构建的 `gta6rt.exe` 和 `gta6rt_tls_host.dll`），脚本会生成
-  `gta6rt.sh`，用 `wine`（或 `WINE` 指定的 Proton）启动。
+- **Linux 与 Wine/Proton**：`make_game.py` 也能在 Linux 上运行。`runtime` 阶段会在 Linux 上用 clang-cl 和
+  lld-link（LLVM 19+）把 loader 交叉编译到 `runtime/build/windows`，依赖 `XWIN_DIR` 或
+  `~/.local/share/xwin-sdk` 里的 MSVC CRT 和 Windows SDK
+  （[docs/testing.md](../../testing.md#the-windows-runtime-on-linux-under-wine-or-proton) 有一次性 `xwin` 命令）；
+  缺少这些时该阶段不参与默认 stages，显式请求会先列出缺什么。
+  也可以使用别处构建好的 Windows 版本，例如 Runtime workflow 的 `runtime-windows` artifact：
+  `python3 -I make_game.py --runtime-build ~/Downloads/runtime-windows`。
+  两种方式都会把 `gta6rt.exe` 和 `gta6rt_tls_host.dll` 复制到 `--out`，并在旁边生成 `gta6rt.sh`，
+  用 `wine`（或 `WINE` 指定的 Proton）启动。
 
 ## 常见问题
 

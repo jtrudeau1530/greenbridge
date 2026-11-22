@@ -1,3 +1,4 @@
+#include "predicated_copy_controls.h"
 // Seed an occlusion heap with independent Vulkan draws, then resolve it through the D3D12 replay queue.
 // This exercises the real GPU query copy and normalization without needing D3D12 draw commands.
 #include "vk_test_device.h"
@@ -157,6 +158,8 @@ int run(vktest::Device& d, const char* vertex, const char* fragment) {
     VkPhysicalDeviceProperties properties{};
     d.instance_fn<PFN_vkGetPhysicalDeviceProperties>("vkGetPhysicalDeviceProperties")(d.physical, &properties);
     context.configure_predication(d.device_proc, memory, properties.limits.maxStorageBufferRange, d.family);
+    PredicatedCopyControl copy_control;
+    EXPECT(copy_control.create(d, context, properties.limits));
     VulkanQueue queue(context, d.queue, d.family);
     EXPECT(queue.ok());
     constexpr QueryHeapId query_id = 1, stats_id = 2;
@@ -206,6 +209,7 @@ int run(vktest::Device& d, const char* vertex, const char* fragment) {
                                    range_offset}));
     EXPECT(binary.resolve_queries({query_id, d3d12_query::occlusion, ordinary_index, 1, destination_id,
                                    ordinary_offset}));
+    EXPECT(copy_control.record(binary));
     EXPECT(binary.close());
     CommandList rerun;
     EXPECT(rerun.resolve_queries({query_id, d3d12_query::binary_occlusion, first_visible + 1, 3, destination_id,
@@ -256,6 +260,7 @@ int run(vktest::Device& d, const char* vertex, const char* fragment) {
     }
     std::printf("binary occlusion: %u visible, 3 zero, 3 repeated; ordinary result %llu; offsets and sentinels exact\n",
                 visible_count, static_cast<unsigned long long>(raw));
+    EXPECT(copy_control.check());
     return 0;
 }
 

@@ -253,6 +253,7 @@ int main() {
         info.queue = vk.queue;
         info.queue_family = vk.family;
         info.conditional_rendering = vk.conditional_rendering;
+        info.storage_buffer_8bit = vk.storage_buffer_8bit;
         if (FAILED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&ours.p)))) return 1;
         Ref<IDXGIFactory4> factory;
         Ref<IDXGIAdapter> warp;
@@ -367,7 +368,7 @@ int main() {
                                         if (!predicate.first && inverted) continue;
                                         ClearOptions options{automatic, predicate.first, predicate.second, inverted ? D3D12_PREDICATION_OP_NOT_EQUAL_ZERO
                                                                                          : D3D12_PREDICATION_OP_EQUAL_ZERO};
-                                        options.overwrite_predicate = automatic && predicate.first &&
+                                        options.overwrite_predicate = vk.storage_buffer_8bit && automatic && predicate.first &&
                                             (inverted ? predicate.second == 0 : predicate.second != 0);
                                         const UINT first = array ? 1 : 0, layers = array ? 2 : 1;
                                         std::vector<unsigned char> actual, expected;

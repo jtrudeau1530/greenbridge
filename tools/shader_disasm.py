@@ -98,7 +98,8 @@ def code_range(b: bytes):
 
 
 def one(path, out, mcpu):
-    b = open(path, "rb").read()
+    with open(path, "rb") as f:
+        b = f.read()
     start, end, how = code_range(b)
     if end is None:
         return "no s_endpgm"
