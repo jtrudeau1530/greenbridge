@@ -140,8 +140,12 @@ carved samples:
 - a plain NUL-terminated bone list (896-byte stream), and
 - a front-coded table (2,064 bytes) whose entries are length-prefixed name fragments plus parent indices.
 
-The `SKEL_<region>_<part>` shape is the conventional RAGE bone naming. The model manifest available here does
-not expose bone names, so that match is not measured; the animation pages carry no model name next to the bones.
+The `SKEL_<region>_<part>` shape is the conventional RAGE bone naming. Measured across all `SKEL_*` streams in
+`anim.rpf` (`177` streams, `118` distinct `SKEL_*` tokens) against the decoded skeleton name tables in
+`packs.rpf` (`2,866` `SKEL_`-bearing streams, `691` distinct `SKEL_*` tokens) using `tools/anim_skeleton_match.py`:
+`117` of `118` (`99.2%`) match by exact case and all `118` of `118` (`100%`) match case-insensitively (and by
+lowercased `joaat32`, since `SKEL_HEAD` corresponds to `SKEL_Head`); `166` of `177` streams match all of their
+tokens by exact case. The animation pages still carry no model name next to the bones.
 
 ### Type-hash containers
 
