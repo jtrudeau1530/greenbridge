@@ -1956,6 +1956,79 @@ int main() {
             EXPECT(SUCCEEDED(queue->Signal(ms_fence.p, 2)) && SUCCEEDED(ms_fence->SetEventOnCompletion(2, nullptr)));
         }
 
+        // A render-target view of a slice range of a 4x multisampled colour array (D3D12_RTV_DIMENSION_TEXTURE2DMSARRAY):
+        // all four slices are cleared red through a whole-array view, then slices 1-2 green through a two-slice view.
+        // Every slice is resolved and read back, so only slices 1 and 2 may be green. A range past the last slice is
+        // refused when the list runs.
+        {
+            Ref<ID3D12Resource> ms_colour, ms_resolved;
+            Ref<ID3D12Fence> ms_fence;
+            constexpr UINT16 slices = 4;
+            D3D12_RESOURCE_DESC ms_desc = texture_desc(size, size, DXGI_FORMAT_R8G8B8A8_UNORM,
+                                                       D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, 1, slices);
+            ms_desc.SampleDesc.Count = 4;
+            EXPECT(SUCCEEDED(create(default_heap, ms_desc, D3D12_RESOURCE_STATE_RENDER_TARGET, ms_colour)));
+            EXPECT(SUCCEEDED(create(default_heap,
+                                    texture_desc(size, size, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE, 1,
+                                                 slices),
+                                    D3D12_RESOURCE_STATE_RESOLVE_DEST, ms_resolved)));
+            EXPECT(SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&ms_fence.p))));
+            D3D12_RENDER_TARGET_VIEW_DESC ms_view{};
+            ms_view.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+            ms_view.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2DMSARRAY;
+            ms_view.Texture2DMSArray.FirstArraySlice = 0;
+            ms_view.Texture2DMSArray.ArraySize = slices;
+            device->CreateRenderTargetView(ms_colour.p, &ms_view, rtv0);  // the lists that used these slots have run
+            ms_view.Texture2DMSArray.FirstArraySlice = 1;
+            ms_view.Texture2DMSArray.ArraySize = 2;
+            device->CreateRenderTargetView(ms_colour.p, &ms_view, rtv1);
+            leonida::TargetView captured{};
+            std::memcpy(&captured, reinterpret_cast<const void*>(rtv1.ptr), sizeof(captured));
+            EXPECT(captured.resource && captured.mip == 0 && captured.first_layer == 1 && captured.layer_count == 2);
+
+            cursor = 0;
+            D3D12_PLACED_SUBRESOURCE_FOOTPRINT slice_place[slices];
+            for (UINT s = 0; s < slices; ++s) slice_place[s] = place(device.p, ms_resolved.p, s, cursor);
+            std::memset(down, 0xcd, 65536);
+            EXPECT(SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.p, nullptr)));
+            const FLOAT slice_red[4] = {1, 0, 0, 1}, slice_green[4] = {0, 1, 0, 1};
+            list->ClearRenderTargetView(rtv0, slice_red, 0, nullptr);
+            list->ClearRenderTargetView(rtv1, slice_green, 0, nullptr);
+            barrier = transition(ms_colour.p, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_RESOLVE_SOURCE);
+            list->ResourceBarrier(1, &barrier);
+            for (UINT s = 0; s < slices; ++s)
+                list->ResolveSubresource(ms_resolved.p, s, ms_colour.p, s, DXGI_FORMAT_R8G8B8A8_UNORM);
+            barrier = transition(ms_resolved.p, D3D12_RESOURCE_STATE_RESOLVE_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            list->ResourceBarrier(1, &barrier);
+            for (UINT s = 0; s < slices; ++s) {
+                const auto dst = footprint(readback.p, slice_place[s]);
+                const auto src = subresource(ms_resolved.p, s);
+                list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+            }
+            EXPECT(list->Close() == S_OK);
+            queue->ExecuteCommandLists(1, lists);
+            EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
+            EXPECT(SUCCEEDED(queue->Signal(ms_fence.p, 1)) && SUCCEEDED(ms_fence->SetEventOnCompletion(1, nullptr)));
+            const std::uint8_t red_texel[4] = {255, 0, 0, 255}, green_texel[4] = {0, 255, 0, 255};
+            for (UINT s = 0; s < slices; ++s)
+                for (UINT row = 0; row < size; ++row)
+                    for (UINT col = 0; col < size; ++col)
+                        report("multisample array slice texel", (s * size + row) * size + col,
+                               down + slice_place[s].Offset + row * slice_place[s].Footprint.RowPitch + col * 4,
+                               s == 1 || s == 2 ? green_texel : red_texel, 4);
+
+            ms_view.Texture2DMSArray.FirstArraySlice = 3;  // slices 3 and 4 of a 4-slice texture
+            device->CreateRenderTargetView(ms_colour.p, &ms_view, rtv1);
+            EXPECT(SUCCEEDED(list->Reset(allocator.p, nullptr)));
+            barrier = transition(ms_colour.p, D3D12_RESOURCE_STATE_RESOLVE_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+            list->ResourceBarrier(1, &barrier);
+            list->ClearRenderTargetView(rtv1, slice_green, 0, nullptr);
+            EXPECT(list->Close() == S_OK);
+            queue->ExecuteCommandLists(1, lists);
+            EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::invalid_subresource);
+            EXPECT(SUCCEEDED(queue->Signal(ms_fence.p, 2)) && SUCCEEDED(ms_fence->SetEventOnCompletion(2, nullptr)));
+        }
+
         // Reserved resources (docs/d3d12_vulkan.md section 4.2): fully backed at creation, so they copy like
         // committed ones and their first use reads zero; D3D12's description rules hold; tile-mapping calls are
         // accepted and change nothing.
