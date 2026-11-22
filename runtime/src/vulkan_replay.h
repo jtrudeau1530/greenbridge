@@ -697,6 +697,7 @@ struct GraphicsPipeline {
     VkImageAspectFlags depth_aspects = 0;
     std::uint32_t vertex_slots = 0;       // bit per input slot the input layout uses
     std::uint32_t zero_step_slots = 0;    // per-instance slots with InstanceDataStepRate 0: stride 0 at draw time
+    std::uint32_t strip_cut = 0;          // D3D12_INDEX_BUFFER_STRIP_CUT_VALUE (0: off, 1: 0xFFFF, 2: 0xFFFFFFFF)
     // The same pipeline with some attachment formats VK_FORMAT_UNDEFINED, for a draw that leaves those slots
     // unbound (D3D12 allows it; dynamic rendering needs the formats to agree). Bit i: colour slot i, bit 8: depth
     // and stencil. Null when it cannot be built.
@@ -749,6 +750,7 @@ struct ReplayFunctions {
     PFN_vkCmdSetViewport set_viewport = nullptr;
     PFN_vkCmdSetScissor set_scissor = nullptr;
     PFN_vkCmdSetPrimitiveTopology set_primitive_topology = nullptr;
+    PFN_vkCmdSetPrimitiveRestartEnable set_primitive_restart_enable = nullptr;
     PFN_vkCmdSetStencilReference set_stencil_reference = nullptr;
     PFN_vkCmdSetBlendConstants set_blend_constants = nullptr;
     PFN_vkCmdDraw draw = nullptr;
@@ -1513,7 +1515,8 @@ template<typename Resolve>
 ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunctions& vk, Prepared& p) {
     if (!vk.graphics_pipeline || !vk.buffer_at || !vk.image_view || !vk.begin_rendering || !vk.end_rendering ||
         !vk.bind_vertex_buffers2 || !vk.bind_index_buffer || !vk.set_viewport || !vk.set_scissor ||
-        !vk.set_primitive_topology || !vk.set_stencil_reference || !vk.set_blend_constants || !vk.draw ||
+        !vk.set_primitive_topology || !vk.set_primitive_restart_enable || !vk.set_stencil_reference ||
+        !vk.set_blend_constants || !vk.draw ||
         !vk.draw_indexed || !vk.bind_pipeline || !vk.push_constants)
         return ReplayResult::unsupported;
     const GraphicsPipeline* pipeline = vk.graphics_pipeline(draw.pipeline);
@@ -1615,6 +1618,12 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
         }
     }
     return ReplayResult::success;
+}
+
+inline bool strip_topology(VkPrimitiveTopology topology) {
+    return topology == VK_PRIMITIVE_TOPOLOGY_LINE_STRIP || topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP ||
+           topology == VK_PRIMITIVE_TOPOLOGY_LINE_STRIP_WITH_ADJACENCY ||
+           topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP_WITH_ADJACENCY;
 }
 
 // D3D_PRIMITIVE_TOPOLOGY -> VkPrimitiveTopology (patch lists are not modelled).
@@ -3057,7 +3066,12 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                                    {std::uint32_t(std::max(0, s.right - std::max(0, s.left))),
                                     std::uint32_t(std::max(0, s.bottom - std::max(0, s.top)))}};
             vk.set_scissor(command_buffer, 0, 1, &scissor);
-            vk.set_primitive_topology(command_buffer, detail::vulkan_topology(draw->topology));
+            const VkPrimitiveTopology topology = detail::vulkan_topology(draw->topology);
+            vk.set_primitive_topology(command_buffer, topology);
+            const bool restart = draw->indexed && detail::strip_topology(topology) &&
+                                 ((p.graphics.strip_cut == 1 && p.index_type == VK_INDEX_TYPE_UINT16) ||
+                                  (p.graphics.strip_cut == 2 && p.index_type == VK_INDEX_TYPE_UINT32));
+            vk.set_primitive_restart_enable(command_buffer, restart ? VK_TRUE : VK_FALSE);
             vk.set_stencil_reference(command_buffer, VK_STENCIL_FACE_FRONT_BIT, draw->stencil_front);
             vk.set_stencil_reference(command_buffer, VK_STENCIL_FACE_BACK_BIT, draw->stencil_back);
             vk.set_blend_constants(command_buffer, draw->blend_factor.data());

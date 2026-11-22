@@ -76,6 +76,7 @@ int main() {
 
     constexpr UINT size = 64;
     std::vector<std::uint8_t> pixels(size * 256), second_pixels(size * 256);
+    std::vector<std::uint8_t> strip16_pixels(size * 256), strip32_pixels(size * 256), strip_nocut_pixels(size * 256);
     const bool logic_op = d.enabled.logicOp == VK_TRUE;
     {
         rt::d3d12::VulkanDeviceInfo info{};
@@ -381,6 +382,74 @@ int main() {
         EXPECT(SUCCEEDED(queue->Signal(fence.p, 2)) && SUCCEEDED(fence->SetEventOnCompletion(2, nullptr)));
         std::memcpy(second_pixels.data(), mapped, second_pixels.size());
 
+        // Third pass: indexed triangle-strip cuts (0xFFFF for UINT16, 0xFFFFFFFF for UINT32) and negative control
+        // without a cut. Two disjoint quads (top-left and bottom-right); without the cut, bridge triangle (2, 3, 4)
+        // crosses the bottom-left quadrant from (-1, 0) through (0, 0) to (1, -1).
+        {
+            const Vertex strip_verts[8] = {
+                {-1, 1, 255, 0, 0, 255}, {0, 1, 255, 0, 0, 255}, {-1, 0, 255, 0, 0, 255}, {0, 0, 255, 0, 0, 255},
+                {1, -1, 255, 0, 0, 255}, {0, -1, 255, 0, 0, 255}, {1, 0, 255, 0, 0, 255}, {0, 0, 255, 0, 0, 255},
+            };
+            const std::uint16_t strip_idx16[9] = {0, 1, 2, 3, 0xFFFFu, 4, 5, 6, 7};
+            const std::uint32_t strip_idx32[9] = {0, 1, 2, 3, 0xFFFFFFFFu, 4, 5, 6, 7};
+            const std::uint16_t strip_nocut[8] = {0, 1, 2, 3, 4, 5, 6, 7};
+            void* up_ptr = nullptr;
+            EXPECT(SUCCEEDED(upload->Map(0, nullptr, &up_ptr)));
+            std::memcpy(static_cast<std::uint8_t*>(up_ptr) + 1024, strip_verts, sizeof(strip_verts));
+            std::memcpy(static_cast<std::uint8_t*>(up_ptr) + 1280, strip_idx16, sizeof(strip_idx16));
+            std::memcpy(static_cast<std::uint8_t*>(up_ptr) + 1536, strip_idx32, sizeof(strip_idx32));
+            std::memcpy(static_cast<std::uint8_t*>(up_ptr) + 1792, strip_nocut, sizeof(strip_nocut));
+            upload->Unmap(0, nullptr);
+
+            auto strip_desc = pso_desc;
+            strip_desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+            Ref<ID3D12PipelineState> strip16_pso, strip32_pso, strip_off_pso;
+            strip_desc.IBStripCutValue = D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFF;
+            EXPECT(SUCCEEDED(device->CreateGraphicsPipelineState(&strip_desc, IID_PPV_ARGS(&strip16_pso.p))));
+            strip_desc.IBStripCutValue = D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFFFFFF;
+            EXPECT(SUCCEEDED(device->CreateGraphicsPipelineState(&strip_desc, IID_PPV_ARGS(&strip32_pso.p))));
+            strip_desc.IBStripCutValue = D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_DISABLED;
+            EXPECT(SUCCEEDED(device->CreateGraphicsPipelineState(&strip_desc, IID_PPV_ARGS(&strip_off_pso.p))));
+
+            const D3D12_VERTEX_BUFFER_VIEW strip_vbv{upload_va + 1024, sizeof(strip_verts), sizeof(Vertex)};
+            struct StripPass {
+                ID3D12PipelineState* pso;
+                D3D12_INDEX_BUFFER_VIEW ibv;
+                UINT index_count;
+                std::vector<std::uint8_t>* out;
+            };
+            const StripPass strip_passes[] = {
+                {strip16_pso.p, {upload_va + 1280, sizeof(strip_idx16), DXGI_FORMAT_R16_UINT}, 9, &strip16_pixels},
+                {strip32_pso.p, {upload_va + 1536, sizeof(strip_idx32), DXGI_FORMAT_R32_UINT}, 9, &strip32_pixels},
+                {strip_off_pso.p, {upload_va + 1792, sizeof(strip_nocut), DXGI_FORMAT_R16_UINT}, 8, &strip_nocut_pixels},
+            };
+            UINT64 strip_fence = 10;
+            for (const auto& sp : strip_passes) {
+                EXPECT(SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.p, sp.pso)));
+                list->ResourceBarrier(1, &to_target);
+                list->ClearRenderTargetView(rtv, blue, 0, nullptr);
+                list->SetGraphicsRootSignature(root.p);
+                list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+                list->IASetVertexBuffers(0, 1, &strip_vbv);
+                list->IASetIndexBuffer(&sp.ibv);
+                list->RSSetViewports(1, &viewport);
+                list->RSSetScissorRects(1, &scissor);
+                list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+                list->SetGraphicsRoot32BitConstants(0, 2, origin, 0);
+                list->SetGraphicsRootConstantBufferView(1, upload_va + 512);
+                list->DrawIndexedInstanced(sp.index_count, 1, 0, 0, 0);
+                list->ResourceBarrier(1, &to_copy);
+                list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+                EXPECT(list->Close() == S_OK);
+                queue->ExecuteCommandLists(1, lists);
+                EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
+                ++strip_fence;
+                EXPECT(SUCCEEDED(queue->Signal(fence.p, strip_fence)) &&
+                       SUCCEEDED(fence->SetEventOnCompletion(strip_fence, nullptr)));
+                std::memcpy(sp.out->data(), mapped, sp.out->size());
+            }
+        }
+
         // A draw with no viewport (never set, or unbound with a count of 0) rasterizes nothing in D3D12. It is not
         // recorded, so the list closes and executes cleanly (Vulkan forbids a 0x0 viewport).
         EXPECT(SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.p, pso.p)));
@@ -393,7 +462,7 @@ int main() {
         EXPECT(list->Close() == S_OK);
         queue->ExecuteCommandLists(1, lists);
         EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
-        EXPECT(SUCCEEDED(queue->Signal(fence.p, 3)) && SUCCEEDED(fence->SetEventOnCompletion(3, nullptr)));
+        EXPECT(SUCCEEDED(queue->Signal(fence.p, 20)) && SUCCEEDED(fence->SetEventOnCompletion(20, nullptr)));
 
         // A draw without a topology is invalid; Close reports it.
         EXPECT(SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.p, pso.p)));
@@ -454,6 +523,31 @@ int main() {
         }
     }
     EXPECT(!mismatches);
+    // Strip-cut passes: 0xFFFF (UINT16) and 0xFFFFFFFF (UINT32) must produce only the top-left and bottom-right quads
+    // (pure blue in top-right and bottom-left). Negative control without cut must paint bridge pixels in bottom-left.
+    UINT nocut_bl_red = 0;
+    for (UINT row = 0; row < size; ++row) {
+        for (UINT col = 0; col < size; ++col) {
+            const bool top = row < size / 2, left = col < size / 2;
+            using Pixel = std::array<std::uint8_t, 4>;
+            const Pixel want = (top && left) || (!top && !left) ? Pixel{255, 0, 0, 255} : Pixel{0, 0, 255, 255};
+            for (const auto& buf : {strip16_pixels, strip32_pixels}) {
+                const std::uint8_t* got = buf.data() + row * 256 + col * 4;
+                if (!std::equal(want.begin(), want.end(), got) && mismatches++ < 6)
+                    std::fprintf(stderr, "strip-cut pixel (%u, %u): got %u,%u,%u,%u want %u,%u,%u,%u\n", col, row,
+                                 got[0], got[1], got[2], got[3], want[0], want[1], want[2], want[3]);
+            }
+            if (!top && left) {
+                const std::uint8_t* got = strip_nocut_pixels.data() + row * 256 + col * 4;
+                if (got[0] == 255 && got[2] == 0) ++nocut_bl_red;
+            }
+        }
+    }
+    EXPECT(!mismatches);
+    EXPECT(nocut_bl_red > 0);
+    std::printf("strip cut (0xFFFF & 0xFFFFFFFF): 4096/4096 pixels matched each (no-cut negative control painted %u "
+                "bridge pixels in bottom-left)\n",
+                nocut_bl_red);
     if (d.validation_errors()) {
         std::fprintf(stderr, "%u validation errors\n", d.validation_errors());
         return 1;
