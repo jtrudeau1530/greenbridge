@@ -130,6 +130,12 @@ def ref_abs32(x: int) -> int:
     return u32(-s if s < 0 else s)
 
 
+def ref_absdiff32(x: int, y: int) -> int:
+    """Reference oracle for 32-bit signed absolute difference: |x - y|."""
+    diff = (u32(x) - u32(y)) & MASK32
+    return ref_abs32(diff)
+
+
 # Alias for backwards compatibility
 ref_abs = ref_abs32
 
@@ -260,6 +266,347 @@ class VectorBitrevOracleTests(unittest.TestCase):
             with self.subTest(src=hex(src)):
                 self.assertEqual(ref_brev32(src), expected)
                 self.assertEqual(ref_brev32(expected), src)
+
+
+class VectorAluInterpreter:
+    """Deterministic SIMD wave interpreter modeling vector and scalar ALU with execution masking.
+
+    Supports Wave32 (32 lanes) and Wave64 (64 lanes).
+    Models:
+      - EXEC mask: per-lane active bit controlling vector instruction side-effects.
+      - Inactive lanes strictly retain their previous VGPR contents.
+      - SGPRs: uniform scalar registers shared across all lanes in the wave.
+      - SCC: scalar condition code flag (updated by scalar ops like s_abs_i32).
+      - VGPRs: independent per-lane vector registers.
+    """
+
+    def __init__(self, wave_size: int = 32, initial_exec: int = 0xFFFFFFFF) -> None:
+        assert wave_size in (32, 64)
+        self.wave_size = wave_size
+        self.mask_all = (1 << wave_size) - 1
+        self.exec_mask = initial_exec & self.mask_all
+        self.sgprs = [0] * 128
+        self.scc = 0
+        self.vgprs = [[0] * 256 for _ in range(wave_size)]
+
+    def is_lane_active(self, lane: int) -> bool:
+        return bool((self.exec_mask >> lane) & 1)
+
+    def set_exec(self, mask: int) -> None:
+        self.exec_mask = mask & self.mask_all
+
+    def resolve_src(self, lane: int, opnd: int | str) -> int:
+        if isinstance(opnd, int):
+            return opnd & MASK32
+        if isinstance(opnd, str):
+            if opnd.startswith("v"):
+                reg = int(opnd[1:])
+                return self.vgprs[lane][reg] & MASK32
+            if opnd.startswith("s"):
+                reg = int(opnd[1:])
+                return self.sgprs[reg] & MASK32
+            try:
+                return int(opnd, 0) & MASK32
+            except ValueError:
+                pass
+        raise ValueError(f"Unknown operand: {opnd}")
+
+    def execute_instruction(self, op: str, *args) -> None:
+        if op == "v_mov_b32":
+            dst, src = args
+            dst_reg = int(dst[1:]) if isinstance(dst, str) else dst
+            for lane in range(self.wave_size):
+                if self.is_lane_active(lane):
+                    self.vgprs[lane][dst_reg] = self.resolve_src(lane, src)
+
+        elif op in ("v_bfrev_b32", "v_bfrev_b32_e32"):
+            dst, src = args
+            dst_reg = int(dst[1:]) if isinstance(dst, str) else dst
+            for lane in range(self.wave_size):
+                if self.is_lane_active(lane):
+                    val = self.resolve_src(lane, src)
+                    self.vgprs[lane][dst_reg] = ref_brev32(val)
+
+        elif op in ("v_abs_i32", "v_abs_i32_e32"):
+            dst, src = args
+            dst_reg = int(dst[1:]) if isinstance(dst, str) else dst
+            for lane in range(self.wave_size):
+                if self.is_lane_active(lane):
+                    val = self.resolve_src(lane, src)
+                    self.vgprs[lane][dst_reg] = ref_abs32(val)
+
+        elif op in ("v_absdiff_i32", "v_absdiff_i32_e32"):
+            dst, src0, src1 = args
+            dst_reg = int(dst[1:]) if isinstance(dst, str) else dst
+            for lane in range(self.wave_size):
+                if self.is_lane_active(lane):
+                    v0 = self.resolve_src(lane, src0)
+                    v1 = self.resolve_src(lane, src1)
+                    self.vgprs[lane][dst_reg] = ref_absdiff32(v0, v1)
+
+        elif op == "s_mov_b32":
+            dst, src = args
+            dst_reg = int(dst[1:]) if isinstance(dst, str) else dst
+            self.sgprs[dst_reg] = self.resolve_src(0, src)
+
+        elif op == "s_abs_i32":
+            dst, src = args
+            dst_reg = int(dst[1:]) if isinstance(dst, str) else dst
+            res = ref_abs32(self.resolve_src(0, src))
+            self.sgprs[dst_reg] = res
+            self.scc = 1 if res != 0 else 0
+
+        elif op == "s_absdiff_i32":
+            dst, src0, src1 = args
+            dst_reg = int(dst[1:]) if isinstance(dst, str) else dst
+            res = ref_absdiff32(self.resolve_src(0, src0), self.resolve_src(0, src1))
+            self.sgprs[dst_reg] = res
+            self.scc = 1 if res != 0 else 0
+
+        elif op == "s_brev_b32":
+            dst, src = args
+            dst_reg = int(dst[1:]) if isinstance(dst, str) else dst
+            res = ref_brev32(self.resolve_src(0, src))
+            self.sgprs[dst_reg] = res
+
+        elif op in ("s_and_saveexec_b32", "s_and_saveexec_b64"):
+            dst, mask = args
+            dst_reg = int(dst[1:]) if isinstance(dst, str) else dst
+            mask_val = mask if isinstance(mask, int) else self.resolve_src(0, mask)
+            self.sgprs[dst_reg] = self.exec_mask & MASK32
+            if self.wave_size == 64 and op.endswith("64"):
+                self.sgprs[dst_reg + 1] = (self.exec_mask >> 32) & MASK32
+            self.exec_mask = (self.exec_mask & mask_val) & self.mask_all
+
+        elif op in ("s_or_exec_b32", "s_or_exec_b64"):
+            mask = args[0]
+            mask_val = mask if isinstance(mask, int) else self.resolve_src(0, mask)
+            self.exec_mask = (self.exec_mask | mask_val) & self.mask_all
+        else:
+            raise NotImplementedError(f"Unsupported op: {op}")
+
+
+class VectorAbsPropertiesTests(unittest.TestCase):
+    """Algebraic verification of signed 32-bit absolute value and difference semantics."""
+
+    def test_non_negative_identity(self):
+        """For non-negative signed integers, abs(x) == x."""
+        non_negatives = [0, 1, 2, 42, 1000, 0x12345678, 0x7FFFFFFE, 0x7FFFFFFF]
+        for x in non_negatives:
+            with self.subTest(x=hex(x)):
+                self.assertEqual(ref_abs32(x), x)
+
+    def test_strictly_negative_inversion(self):
+        """For strictly negative integers (excluding INT_MIN), abs(x) == -x."""
+        negatives = [-1, -2, -42, -1000, -0x12345678, -0x7FFFFFFF]
+        for s in negatives:
+            u = u32(s)
+            with self.subTest(s=s, u=hex(u)):
+                self.assertEqual(ref_abs32(u), abs(s))
+
+    def test_two_complement_overflow_int_min(self):
+        """Two's-complement overflow: |-2147483648| wraps to -2147483648 (0x80000000)."""
+        int_min = 0x80000000
+        self.assertEqual(ref_abs32(int_min), int_min)
+        self.assertEqual(s32(ref_abs32(int_min)), -2147483648)
+
+    def test_abs_idempotency(self):
+        """Absolute value is idempotent: abs(abs(x)) == abs(x)."""
+        for x in CANONICAL_VALUES:
+            with self.subTest(x=hex(x)):
+                a1 = ref_abs32(x)
+                a2 = ref_abs32(a1)
+                self.assertEqual(a1, a2)
+
+    def test_absdiff_symmetry(self):
+        """Absolute difference is symmetric: |x - y| == |y - x| in 32-bit modular arithmetic."""
+        test_pairs = [
+            (0, 0),
+            (0, 1),
+            (1, 0),
+            (10, 42),
+            (42, 10),
+            (0xFFFFFFFF, 1),
+            (1, 0xFFFFFFFF),
+            (0x7FFFFFFF, 0x80000000),
+            (0x80000000, 0x7FFFFFFF),
+            (0x12345678, 0x87654321),
+            (0x55555555, 0xAAAAAAAA),
+        ]
+        for x, y in test_pairs:
+            with self.subTest(x=hex(x), y=hex(y)):
+                self.assertEqual(ref_absdiff32(x, y), ref_absdiff32(y, x))
+
+    def test_absdiff_zero_identity(self):
+        """|x - x| == 0 for all 32-bit values."""
+        for x in CANONICAL_VALUES:
+            with self.subTest(x=hex(x)):
+                self.assertEqual(ref_absdiff32(x, x), 0)
+
+    def test_absdiff_with_zero(self):
+        """|x - 0| == |x| and |0 - x| == |x|."""
+        for x in CANONICAL_VALUES:
+            with self.subTest(x=hex(x)):
+                want = ref_abs32(x)
+                self.assertEqual(ref_absdiff32(x, 0), want)
+                self.assertEqual(ref_absdiff32(0, x), want)
+
+    def test_absdiff_overflow_wrap(self):
+        """Difference wraps before absolute value: 0x7FFFFFFF - 0x80000000 = -1 -> abs is 1."""
+        self.assertEqual(ref_absdiff32(0x7FFFFFFF, 0x80000000), 1)
+        self.assertEqual(ref_absdiff32(0x80000000, 0x7FFFFFFF), 1)
+
+
+class SimdMultiLaneDivergenceTests(unittest.TestCase):
+    """Multi-lane SIMD divergence verification under diverse EXEC execution masks."""
+
+    def test_full_exec_all_lanes_updated(self):
+        """Wave32 with EXEC=0xFFFFFFFF updates all 32 lanes."""
+        interp = VectorAluInterpreter(wave_size=32, initial_exec=0xFFFFFFFF)
+        sentinel = 0xDEADBEEF
+        for lane in range(32):
+            interp.vgprs[lane][0] = sentinel
+            interp.vgprs[lane][1] = u32(-(lane + 1))
+
+        interp.execute_instruction("v_abs_i32", "v0", "v1")
+
+        for lane in range(32):
+            expected = lane + 1
+            self.assertEqual(interp.vgprs[lane][0], expected, f"Lane {lane} failed")
+
+    def test_zero_exec_preserves_all_vgprs(self):
+        """Wave32 with EXEC=0x00000000 preserves all destination VGPRs across the wave."""
+        interp = VectorAluInterpreter(wave_size=32, initial_exec=0x00000000)
+        sentinel = 0xDEADBEEF
+        for lane in range(32):
+            interp.vgprs[lane][0] = sentinel
+            interp.vgprs[lane][1] = u32(-(lane + 1))
+
+        interp.execute_instruction("v_abs_i32", "v0", "v1")
+
+        for lane in range(32):
+            self.assertEqual(interp.vgprs[lane][0], sentinel, f"Lane {lane} was incorrectly overwritten")
+
+    def test_checkerboard_divergence_v_abs(self):
+        """Wave32 with EXEC=0x55555555 updates even lanes and preserves odd lanes."""
+        interp = VectorAluInterpreter(wave_size=32, initial_exec=0x55555555)
+        sentinel = 0xBAADF00D
+        for lane in range(32):
+            interp.vgprs[lane][0] = sentinel
+            interp.vgprs[lane][1] = u32(-((lane + 1) * 10))
+
+        interp.execute_instruction("v_abs_i32", "v0", "v1")
+
+        for lane in range(32):
+            if lane % 2 == 0:
+                self.assertEqual(interp.vgprs[lane][0], (lane + 1) * 10)
+            else:
+                self.assertEqual(interp.vgprs[lane][0], sentinel)
+
+    def test_checkerboard_divergence_v_bfrev(self):
+        """Wave32 with EXEC=0xAAAAAAAA updates odd lanes and preserves even lanes with bit-reversal."""
+        interp = VectorAluInterpreter(wave_size=32, initial_exec=0xAAAAAAAA)
+        sentinel = 0xCAFEBABE
+        for lane in range(32):
+            interp.vgprs[lane][0] = sentinel
+            interp.vgprs[lane][1] = 1 << lane
+
+        interp.execute_instruction("v_bfrev_b32", "v0", "v1")
+
+        for lane in range(32):
+            if lane % 2 == 1:
+                self.assertEqual(interp.vgprs[lane][0], 1 << (31 - lane))
+            else:
+                self.assertEqual(interp.vgprs[lane][0], sentinel)
+
+    def test_single_lane_active_boundaries(self):
+        """Test isolated active lane at boundaries (lane 0, lane 15, lane 31)."""
+        boundary_lanes = [0, 15, 31]
+        for active_lane in boundary_lanes:
+            with self.subTest(active_lane=active_lane):
+                exec_mask = 1 << active_lane
+                interp = VectorAluInterpreter(wave_size=32, initial_exec=exec_mask)
+                sentinel = 0x11223344
+                for lane in range(32):
+                    interp.vgprs[lane][0] = sentinel
+                    interp.vgprs[lane][1] = 0x80000000 if lane == 0 else u32(-(lane * 100))
+
+                interp.execute_instruction("v_abs_i32", "v0", "v1")
+
+                for lane in range(32):
+                    if lane == active_lane:
+                        expected = ref_abs32(interp.vgprs[lane][1])
+                        self.assertEqual(interp.vgprs[lane][0], expected)
+                    else:
+                        self.assertEqual(interp.vgprs[lane][0], sentinel)
+
+    def test_wave64_divergence_halves(self):
+        """Wave64 with low half active (EXEC=0x00000000FFFFFFFF) updates lanes 0..31, preserves 32..63."""
+        interp = VectorAluInterpreter(wave_size=64, initial_exec=0x00000000FFFFFFFF)
+        sentinel = 0x55AA55AA
+        for lane in range(64):
+            interp.vgprs[lane][0] = sentinel
+            interp.vgprs[lane][1] = u32(-(lane + 1))
+
+        interp.execute_instruction("v_abs_i32", "v0", "v1")
+
+        for lane in range(64):
+            if lane < 32:
+                self.assertEqual(interp.vgprs[lane][0], lane + 1)
+            else:
+                self.assertEqual(interp.vgprs[lane][0], sentinel)
+
+    def test_vector_absdiff_simd_multi_lane(self):
+        """v_absdiff_i32 across SIMD lanes with pairwise vector operands."""
+        interp = VectorAluInterpreter(wave_size=32, initial_exec=0x0000FFFF)
+        sentinel = 0x01020304
+        for lane in range(32):
+            interp.vgprs[lane][0] = sentinel
+            interp.vgprs[lane][1] = 50 + lane
+            interp.vgprs[lane][2] = 100
+
+        interp.execute_instruction("v_absdiff_i32", "v0", "v1", "v2")
+
+        for lane in range(32):
+            if lane < 16:
+                expected = ref_absdiff32(50 + lane, 100)
+                self.assertEqual(interp.vgprs[lane][0], expected)
+            else:
+                self.assertEqual(interp.vgprs[lane][0], sentinel)
+
+    def test_saveexec_restore_simd_branch_pattern(self):
+        """Simulates divergent branch pattern using s_and_saveexec and s_or_exec."""
+        interp = VectorAluInterpreter(wave_size=32, initial_exec=0xFFFFFFFF)
+        # Initialize lanes: even lanes get negative, odd lanes get positive
+        for lane in range(32):
+            interp.vgprs[lane][0] = 0
+            interp.vgprs[lane][1] = u32(-(lane + 1)) if (lane % 2 == 0) else (lane + 1)
+
+        # Step 1: Branch taken by even lanes only (EXEC & 0x55555555)
+        # s_and_saveexec_b32 s2, 0x55555555 -> saves 0xFFFFFFFF to s2, sets EXEC=0x55555555
+        interp.execute_instruction("s_and_saveexec_b32", "s2", 0x55555555)
+        self.assertEqual(interp.sgprs[2], 0xFFFFFFFF)
+        self.assertEqual(interp.exec_mask, 0x55555555)
+
+        # In then-block: v_abs_i32 v0, v1 (only even lanes update)
+        interp.execute_instruction("v_abs_i32", "v0", "v1")
+
+        # Step 2: Invert mask for else-block: EXEC = (saved ~EXEC) & saved
+        # s_or_exec_b32 restores saved or complements
+        interp.set_exec((~0x55555555) & 0xFFFFFFFF)
+        # In else-block: v_bfrev_b32 v0, v1 (only odd lanes update)
+        interp.execute_instruction("v_bfrev_b32", "v0", "v1")
+
+        # Step 3: Reconverge
+        interp.execute_instruction("s_mov_b32", "s0", "s2")
+        interp.set_exec(interp.sgprs[0])
+        self.assertEqual(interp.exec_mask, 0xFFFFFFFF)
+
+        for lane in range(32):
+            if lane % 2 == 0:
+                self.assertEqual(interp.vgprs[lane][0], lane + 1)
+            else:
+                self.assertEqual(interp.vgprs[lane][0], ref_brev32(lane + 1))
 
 
 class BitReverseTests(unittest.TestCase):
