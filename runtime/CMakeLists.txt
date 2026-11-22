@@ -100,7 +100,10 @@ if(WIN32)
   target_compile_definitions(gta6rt PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
   target_compile_options(gta6rt PRIVATE /W4 /permissive- /utf-8)
   # Static shim tables register themselves at startup; keep the linker from dropping their objects.
-  target_link_options(gta6rt PRIVATE /OPT:NOREF)
+  # GTA6RT_HOST_BASE keeps the loader's own image off the default x64 EXE base (0x140000000), where a mapped EXE
+  # without relocations wants to go. Windows moves the EXE with ASLR anyway; Wine loads it at its preferred base.
+  set(GTA6RT_HOST_BASE /BASE:0x10000000000)
+  target_link_options(gta6rt PRIVATE /OPT:NOREF ${GTA6RT_HOST_BASE})
   target_link_libraries(gta6rt PRIVATE gta6rt_d3d12_xs_rootsig gta6rt_xtaskqueue psapi)
 
   # Root-signature forwarding test: needs a real PC d3d12.lib to serialize the synthetic descriptors.
@@ -202,7 +205,7 @@ if(BUILD_TESTING)
     )
     target_compile_definitions(loader_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
     target_compile_options(loader_test PRIVATE /W4 /permissive- /utf-8)
-    target_link_options(loader_test PRIVATE /OPT:NOREF)
+    target_link_options(loader_test PRIVATE /OPT:NOREF ${GTA6RT_HOST_BASE})
     add_dependencies(loader_test gta6rt_tls_host)
     add_test(NAME loader COMMAND loader_test)
     # PE loader tests use two locally built fixtures: a DLL with exports, imports and relocations, and an EXE that
