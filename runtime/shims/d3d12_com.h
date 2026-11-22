@@ -127,6 +127,10 @@ VkDescriptorSetLayout bindless_set_layout(ID3D12Device* device);
 // (or `queue` is not one of this module's queues). For tests.
 bool queue_uses_calibrated_timestamps(ID3D12CommandQueue* queue);
 
+// Creates a Vulkan-backed IDXGIFactory4 bound to `device`'s VulkanContext, instance, physical device, and queue.
+// Its CreateSwapChainForHwnd registers swapchain backbuffers directly with the device's VulkanContext.
+HRESULT create_dxgi_factory(ID3D12Device* device, REFIID riid, void** out);
+
 // ExecuteCommandLists returns void; this is what the last call on the queue did.
 leonida::ReplayResult last_execute_result(ID3D12CommandQueue* queue);
 
