@@ -371,8 +371,9 @@ What is implemented (all of it testable without the game):
     `D3D12_SAMPLER_FLAG_NON_NORMALIZED_COORDINATES` sets `FORCE_UNNORMALIZED` (word 0, bit 15) and changes nothing
     else; `vulkan_sampler` makes it `unnormalizedCoordinates`. The layer answers `D3D12_OPTIONS17` with
     `NonNormalizedCoordinateSamplersSupported` (core Vulkan, with the same restrictions) and no
-    `ManualWriteTrackingResourceSupported`. That is what the RTX 4090 and WARP report, so what the PC runtime does
-    when the feature is unreported was not measured here.
+    `ManualWriteTrackingResourceSupported`. That is what the RTX 4090 and WARP report. The runtime on a Radeon 680M
+    (D3D12 driver 31.0.14084.6002) reports no non-normalized samplers, and leaves every non-normalized description
+    unwritten, including those the table below says are written.
 
     A description the PC runtime refuses leaves the slot as it was. The runtime itself does this, without the
     debug layer, on the RTX 4090 (driver 621.14) and on WARP; the debug layer's message names the rule.
@@ -656,7 +657,8 @@ and any validation error fails them.
   - 3 non-normalized samplers, which must be `CreateSampler`'s S# with `FORCE_UNNORMALIZED` set;
   - the `D3D12_OPTIONS17` answer;
   - the 22 written-or-refused cases behind the table in section 3.2, compared with the host's PC runtime when
-    there is one.
+    there is one. A host that reports no non-normalized samplers is compared only on the 3 cases without the
+    flag. The other 19 are then checked against their recorded answers only.
 - `d3d12_descriptor_test`: descriptors through the proxy.
   - Copies, checked on the slots' bytes: one run, range lists of different shapes on each side, null size
     arrays, and a destination longer than its source.
