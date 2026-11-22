@@ -3015,7 +3015,26 @@ class Gen:
         off = self.mod_int(mods, "offset", 0)
         sc, sem = self.cu(2), self.cu(0)
         sizes = {"b32": 1, "b64": 2, "b96": 3, "b128": 4}
-        if op in ("ds_read_b32", "ds_read_b64", "ds_read_b96", "ds_read_b128"):
+        if op in ("ds_read_addtid_b32", "ds_write_addtid_b32"):
+            if "gds" in mods or not 0 <= off <= 0xFFFF:
+                raise Unsupported(op + " addressing")
+            if len(a) != 1 or a[0]["k"] != "vgpr" or a[0].get("n", 1) != 1:
+                raise Unsupported(op + " operand")
+            # RDNA2 ISA: LDS_BASE + offset + M0[15:0] + 4 * lane within the wave.
+            # The Workgroup array makes LDS_BASE implicit.
+            m0, base, lane_bytes, addr = (self.tmp() for _ in range(4))
+            self.emit(f"{m0} = OpLoad %uint %m0")
+            self.emit(f"{base} = OpBitwiseAnd %uint {m0} {self.cu(0xFFFF)}")
+            self.emit(f"{lane_bytes} = OpShiftLeftLogical %uint {self.wave_lane()} {self.cu(2)}")
+            self.emit(f"{addr} = OpIAdd %uint {base} {lane_bytes}")
+            ptr = self.lds_ptr(addr, off)
+            if op == "ds_read_addtid_b32":
+                value = self.tmp()
+                self.emit(f"{value} = OpLoad %uint {ptr}")
+                self.dst(a[0], value)
+            else:
+                self.emit(f"OpStore {ptr} {self.src_u(a[0])}")
+        elif op in ("ds_read_b32", "ds_read_b64", "ds_read_b96", "ds_read_b128"):
             addr = self.src_u(a[1])
             for k in range(sizes[op.rsplit("_", 1)[1]]):
                 v = self.tmp()
