@@ -12,7 +12,7 @@ Depends on: <!-- #N for every pull request this one builds on (AGENTS.md); delet
 <!-- What you ran and on which GPU and driver (CONTRIBUTING.md). For the shader translator: how many shaders
      translate and pass spirv-val, before and after. -->
 
-AI-assisted: <!-- yes, and with which tool, or no (AGENTS.md asks a coding agent to say so) -->
+AI-assisted: <!-- yes or no (AGENTS.md asks a coding agent to say so) -->
 
 ### Checklist
 
