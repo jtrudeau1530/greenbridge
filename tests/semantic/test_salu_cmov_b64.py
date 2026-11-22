@@ -332,5 +332,140 @@ class ScalarCselectB64OracleTests(unittest.TestCase):
                 self.assertEqual(words[1], (want >> 32) & MASK32)
 
 
+class ScalarCselectB64RoutingTests(unittest.TestCase):
+    def test_scc_generation_and_dependency(self):
+        # Verify SCC dependency when SCC is produced by different compare and arithmetic instructions.
+        a64 = 0x11111111_22222222
+        b64 = 0x33333333_44444444
+        cases = [
+            ("s_cmp_eq_u32 7, 7", 1),
+            ("s_cmp_eq_u32 7, 8", 0),
+            ("s_cmp_lg_u32 10, 20", 1),
+            ("s_cmp_lg_u32 10, 10", 0),
+            ("s_cmp_gt_i32 5, -1", 1),
+            ("s_cmp_gt_i32 -5, 1", 0),
+            ("s_cmp_lt_u32 1, 100", 1),
+            ("s_cmp_lt_u32 100, 1", 0),
+            ("s_add_u32 s10, 0xFFFFFFFF, 1", 1),
+            ("s_add_u32 s10, 10, 20", 0),
+        ]
+        for scc_inst, expected_scc in cases:
+            with self.subTest(inst=scc_inst, expected_scc=expected_scc):
+                want = ref_cselect_b64(a64, b64, expected_scc)
+                words = run_ps(
+                    load_pair_lines(4, a64)
+                    + load_pair_lines(6, b64)
+                    + [scc_inst, "s_cselect_b64 s[2:3], s[4:5], s[6:7]"]
+                    + export_pair_lines(2)
+                    + ["v_mov_b32 v2, 0", "v_mov_b32 v3, 0"]
+                )
+                self.assertEqual(words[:2], [want & MASK32, (want >> 32) & MASK32])
+
+    def test_scc_preservation_and_chaining(self):
+        # s_cselect_b64 must not modify SCC. Verify by chaining multiple s_cselect_b64 ops
+        # followed by s_addc_u32 and s_cselect_b32 which consume SCC.
+        p1_a, p1_b = 0x01020304_05060708, 0x11121314_15161718
+        p2_a, p2_b = 0x21222324_25262728, 0x31323334_35363738
+        for scc in (0, 1):
+            with self.subTest(scc=scc):
+                want1 = ref_cselect_b64(p1_a, p1_b, scc)
+                want2 = ref_cselect_b64(p2_a, p2_b, scc)
+                words = run_ps(
+                    load_pair_lines(4, p1_a)
+                    + load_pair_lines(6, p1_b)
+                    + load_pair_lines(8, p2_a)
+                    + load_pair_lines(10, p2_b)
+                    + [
+                        scc_line(scc),
+                        "s_cselect_b64 s[2:3], s[4:5], s[6:7]",
+                        "s_cselect_b64 s[12:13], s[8:9], s[10:11]",
+                        "s_cselect_b32 s15, 1, 0",
+                        "s_addc_u32 s14, 100, 200",
+                        "v_mov_b32 v0, s2",
+                        "v_mov_b32 v1, s12",
+                        "v_mov_b32 v2, s14",
+                        "v_mov_b32 v3, s15",
+                    ]
+                )
+                self.assertEqual(words[0], want1 & MASK32)
+                self.assertEqual(words[1], want2 & MASK32)
+                self.assertEqual(words[2], 300 + scc)
+                self.assertEqual(words[3], scc)
+
+    def test_sgpr_pair_routing_layouts(self):
+        # Test routing between diverse register allocations and non-sequential pair positions.
+        a64 = 0xCAFEFEED_12345678
+        b64 = 0xDEADBEEF_87654321
+        routings = [
+            (2, 4, 6),
+            (8, 12, 16),
+            (20, 24, 28),
+            (14, 6, 22),
+            (28, 2, 10),
+            (4, 18, 8),
+        ]
+        for dst, s0, s1 in routings:
+            for scc in (0, 1):
+                with self.subTest(dst=dst, s0=s0, s1=s1, scc=scc):
+                    want = ref_cselect_b64(a64, b64, scc)
+                    words = run_ps(
+                        load_pair_lines(s0, a64)
+                        + load_pair_lines(s1, b64)
+                        + [scc_line(scc), f"s_cselect_b64 s[{dst}:{dst + 1}], s[{s0}:{s0 + 1}], s[{s1}:{s1 + 1}]"]
+                        + export_pair_lines(dst)
+                        + ["v_mov_b32 v2, 0", "v_mov_b32 v3, 0"]
+                    )
+                    self.assertEqual(words[:2], [want & MASK32, (want >> 32) & MASK32])
+
+    def test_sgpr_pair_and_immediate_mixed_routing(self):
+        # Test routing when one operand is an SGPR pair and the other is an immediate constant.
+        val64 = 0x01234567_89ABCDEF
+        immediates = [
+            ("0", 0),
+            ("-1", MASK64),
+            ("42", 42),
+            ("0x12345678", 0x12345678),
+            ("-2", MASK64 - 1),
+        ]
+        for imm_asm, imm_val in immediates:
+            for sgpr_first in (True, False):
+                for scc in (0, 1):
+                    s0_asm, s1_asm = ("s[4:5]", imm_asm) if sgpr_first else (imm_asm, "s[4:5]")
+                    s0_val, s1_val = (val64, imm_val) if sgpr_first else (imm_val, val64)
+                    with self.subTest(s0=s0_asm, s1=s1_asm, scc=scc):
+                        want = ref_cselect_b64(s0_val, s1_val, scc)
+                        words = run_ps(
+                            load_pair_lines(4, val64)
+                            + [scc_line(scc), f"s_cselect_b64 s[2:3], {s0_asm}, {s1_asm}"]
+                            + export_pair_lines(2)
+                            + ["v_mov_b32 v2, 0", "v_mov_b32 v3, 0"]
+                        )
+                        self.assertEqual(words[:2], [want & MASK32, (want >> 32) & MASK32])
+
+    def test_bidirectional_operand_swap_routing(self):
+        # Swapping operand positions between two register pairs routes opposing values.
+        pair_a = 0xAAAA0000_11112222
+        pair_b = 0xBBBB0000_33334444
+        for scc in (0, 1):
+            with self.subTest(scc=scc):
+                want_fwd = ref_cselect_b64(pair_a, pair_b, scc)
+                want_rev = ref_cselect_b64(pair_b, pair_a, scc)
+                words = run_ps(
+                    load_pair_lines(4, pair_a)
+                    + load_pair_lines(6, pair_b)
+                    + [
+                        scc_line(scc),
+                        "s_cselect_b64 s[2:3], s[4:5], s[6:7]",
+                        "s_cselect_b64 s[8:9], s[6:7], s[4:5]",
+                        "v_mov_b32 v0, s2",
+                        "v_mov_b32 v1, s3",
+                        "v_mov_b32 v2, s8",
+                        "v_mov_b32 v3, s9",
+                    ]
+                )
+                self.assertEqual(words[:2], [want_fwd & MASK32, (want_fwd >> 32) & MASK32])
+                self.assertEqual(words[2:], [want_rev & MASK32, (want_rev >> 32) & MASK32])
+
+
 if __name__ == "__main__":
     unittest.main()
