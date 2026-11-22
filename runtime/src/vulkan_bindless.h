@@ -213,7 +213,8 @@ public:
     bool insert_key(const DescriptorKey& key, std::uint32_t index) {
         const auto result = table_.insert_or_update(key.data(), index);
         table_dirty_ |= result != DescriptorTable::InsertResult::unchanged;
-        existing_entries_changed_ |= result == DescriptorTable::InsertResult::replaced;
+        existing_entries_changed_ |= result == DescriptorTable::InsertResult::replaced ||
+                                     result == DescriptorTable::InsertResult::added_with_relocation;
         return true;
     }
     // Erasing compacts the key's probe cluster, so other keys' entries may change slots.

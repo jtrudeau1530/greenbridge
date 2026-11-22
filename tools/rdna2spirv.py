@@ -2392,7 +2392,7 @@ class Gen:
         elif op == "s_mulk_i32":
             v = a[1]["v"] & 0xFFFF
             k = v - 0x10000 if v & 0x8000 else v
-            x = self.load_reg("sgpr", a[0]["r"])
+            x = self.src_u(a[0])
             r = self.tmp()
             self.emit(f"{r} = OpIMul %uint {x} {self.cu(k)}")
             self.dst(a[0], r)
@@ -3002,7 +3002,7 @@ class Gen:
             m, sh, old, r = (self.tmp() for _ in range(4))
             self.emit(f"{m} = OpBitwiseAnd %uint {b} {self.cu(31)}")
             self.emit(f"{sh} = OpShiftLeftLogical %uint {self.cu(1)} {m}")
-            self.emit(f"{old} = OpCopyObject %uint {self.load_reg('sgpr', a[0]['r'])}")
+            self.emit(f"{old} = OpCopyObject %uint {self.src_u(a[0])}")
             self.emit(f"{r} = OpBitwiseOr %uint {old} {sh}")
             self.dst(a[0], r)
         elif op in ("v_mul_hi_u32_u24", "v_mul_hi_i32_i24"):
@@ -3283,7 +3283,7 @@ class Gen:
             self.emit(f"{m} = OpBitwiseAnd %uint {b} {self.cu(31)}")
             self.emit(f"{sh} = OpShiftLeftLogical %uint {self.cu(1)} {m}")
             self.emit(f"{n} = OpNot %uint {sh}")
-            self.emit(f"{r} = OpBitwiseAnd %uint {self.load_reg('sgpr', a[0]['r'])} {n}")
+            self.emit(f"{r} = OpBitwiseAnd %uint {self.src_u(a[0])} {n}")
             self.dst(a[0], r)
         elif op in ("s_min_i32", "s_max_i32"):
             x, y = self.src_u(a[1]), self.src_u(a[2])
@@ -3952,12 +3952,40 @@ class Gen:
             self.mask_dst(a[0], r)
             self.scc_from_mask(r)
         elif op == "s_cselect_b64":
-            x, y = self.mask_src(a[1]), self.mask_src(a[2])
-            c, b, r = self.tmp(), self.tmp(), self.tmp()
-            self.emit(f"{c} = OpLoad %uint %scc")
-            self.emit(f"{b} = OpINotEqual %bool {c} {self.cu(0)}")
-            self.emit(f"{r} = OpSelect %uint {b} {x} {y}")
-            self.mask_dst(a[0], r)
+            def is_mask_op(x):
+                return self.holds_lane_mask(x) or (
+                    x["k"] == "special" and x.get("t", "").startswith(("exec", "vcc"))
+                )
+            if (a[0]["k"] == "special" and a[0].get("t", "").startswith(("exec", "vcc"))) or \
+                    is_mask_op(a[1]) or is_mask_op(a[2]):
+                x, y = self.mask_src(a[1]), self.mask_src(a[2])
+                c, b, r = self.tmp(), self.tmp(), self.tmp()
+                self.emit(f"{c} = OpLoad %uint %scc")
+                self.emit(f"{b} = OpINotEqual %bool {c} {self.cu(0)}")
+                self.emit(f"{r} = OpSelect %uint {b} {x} {y}")
+                self.mask_dst(a[0], r)
+            else:
+                if a[0]["k"] != "sgpr" or a[0].get("n") != 2:
+                    raise Unsupported("s_cselect_b64 destination")
+                def src64(s):
+                    if s["k"] == "sgpr" and s.get("n") == 2:
+                        return self.load_reg("sgpr", s["r"]), self.load_reg("sgpr", s["r"] + 1)
+                    if s["k"] == "imm":
+                        v = s["v"] & 0xFFFFFFFFFFFFFFFF
+                        return self.cu(v & 0xFFFFFFFF), self.cu(v >> 32)
+                    if s["k"] == "special" and s.get("t") == "null":
+                        return self.cu(0), self.cu(0)
+                    raise Unsupported("s_cselect_b64 source")
+                # Load all source dwords before storing to a[0] so destination aliasing stays exact;
+                # lane_masks.py already clears a[0]'s mask state when either source is non-mask.
+                (lo1, hi1), (lo2, hi2) = src64(a[1]), src64(a[2])
+                c, b, rlo, rhi = self.tmp(), self.tmp(), self.tmp(), self.tmp()
+                self.emit(f"{c} = OpLoad %uint %scc")
+                self.emit(f"{b} = OpINotEqual %bool {c} {self.cu(0)}")
+                self.emit(f"{rlo} = OpSelect %uint {b} {lo1} {lo2}")
+                self.emit(f"{rhi} = OpSelect %uint {b} {hi1} {hi2}")
+                self.store_reg("sgpr", a[0]["r"], rlo)
+                self.store_reg("sgpr", a[0]["r"] + 1, rhi)
         elif op in ("v_interp_p1ll_f16", "v_interp_p1lv_f16", "v_interp_p2_f16"):
             attr = next((x for x in a if x["k"] == "attr"), None)
             if attr is None or self.stage != "ps":

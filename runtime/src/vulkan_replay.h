@@ -408,6 +408,7 @@ inline BlockFormat block_format(VkFormat format, VkImageAspectFlags aspect) {
     case VK_FORMAT_R8G8_SINT:
     case VK_FORMAT_R16_SFLOAT:
     case VK_FORMAT_R16_UNORM:
+    case VK_FORMAT_A4R4G4B4_UNORM_PACK16:
     case VK_FORMAT_D16_UNORM: return {2, 1};
     case VK_FORMAT_R8_UNORM: return {1, 1};
     case VK_FORMAT_BC1_RGBA_UNORM_BLOCK:

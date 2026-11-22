@@ -5,7 +5,7 @@ the corpus is correct. The CPU differential oracle in `tools/shader_diff.py` is 
 tested (`tests/test_shader_diff.py`): it compares the ISA model in `tools/cpu_ref.py` against
 translated SPIR-V run in `tests/semantic/spirv_mini_interp.py` over seeded straight-line programs.
 Run it with `python -I tools/shader_diff.py --programs 200 --seed 7` (`--self-test` checks the
-harness itself). The GPU-side runner described below is still future work.
+harness itself). The GPU-side runners are described below: `tools/valu_fuzz.py` (16-bit and memory ops), `tools/lds_fuzz.py`, `tools/crosslane_fuzz.py` and `tools/cf_diff.py`.
 
 ## Why `spirv-val` is not enough
 
@@ -311,11 +311,13 @@ every scalar. `vk_compute_test` reads them back with `VKC_OUT_WORDS` / `VKC_DUMP
   EXEC constants only enable lanes that exist. Every mask register is zero-initialised, as compiled code does,
   so a branch that skips the `v_cmp` writing a mask leaves a defined mask after the join.
 - **Hypotheses are reported apart.** `v_permlane16/x16` with op_sel FI = 0 reading a lane that is off in
-  EXEC is modelled as the DPP "invalid source" case (vD kept). That is now measured on RDNA2 and RDNA3.5 (@aslan2142,
-  #374): FI = 1 returns the source lane's value, FI = 0 leaves the destination unwritten and FI = 0 with BOUND_CTRL
-  gives 0; #580 (SHADER-74) makes the translator do that. Where the translator still always reads the lane, a
-  program that hits the case counts as `hyp_only`, not as a mismatch. `--permlane-fetch-inactive` models FI = 1
-  instead.
+  EXEC is modelled as the DPP "invalid source" case (vD kept). That is now measured, with the same result on both:
+  @aslan2142 on RDNA2 and @AlxcBTW on RDNA3.5 (#374). FI = 1 returns the source lane's value, FI = 0 leaves the
+  destination unwritten and FI = 0 with BOUND_CTRL gives 0; #580 (SHADER-74) makes the translator do that. The
+  fuzzer has not caught up: its docstring (`tools/crosslane_fuzz.py`) still calls the case unmeasured and
+  `op_permlane` still tags it `hyp`, so a program that hits it is filed as `hyp_only`, not as a mismatch, whatever
+  the translator does. The model (vD kept) already matches the measurement; dropping the tag is a follow-up.
+  `--permlane-fetch-inactive` models FI = 1 instead.
 - **Modes.** Wave32 runs natively. Wave64 runs with `--wave64-emulate`; `--w64-native` adds the plain build,
   which on a 32-wide subgroup is the documented cross-half approximation and is expected to mismatch.
 - **Reports.** The thread, wave, lane and register of the first differences. `--minimize` drops ops while the
@@ -331,31 +333,6 @@ First results on an RTX 4090 (subgroup 32, driver 621.14):
   DPP16 ignored `fi:1`. Each was confirmed with a hand-written program.
 - **Everything else matches.** On `main`, 1,000 programs (`--seed 8 --ops 28 --no-maskdata --no-w32-hi-lanes`, 500 wave32 native and 500 wave64 emulated) give 0 mismatches. 297 of them are `hyp_only` (permlane with FI = 0 and an inactive source), and with `--permlane-fetch-inactive` all 1,000 match. Native wave64 on the 32-wide card mismatches as documented: `s_bcnt1` of EXEC counts one half, and a `v_readlane` from the other half wraps.
 - **Closed question (#374):** what hardware does for permlane with FI = 0 was measured on RDNA2 and RDNA3.5 (see above).
-
-### 16-bit and memory ops on the GPU (`tools/valu_fuzz.py`, FUZZ-2, FUZZ-5)
-
-`tools/valu_fuzz.py --family f16|mem` uses the same runner shape as `lds_fuzz.py`. It generates seeded
-64-thread compute programs, translates them, runs them with `vk_compute_test`'s `VKC_DUMP`, and compares every
-thread's 16 result VGPRs (plus the scratch memory for `mem`) bit for bit with a model of the instructions written in
-the same file. The model doesn't import the translator. `tests/test_valu_fuzz.py` checks the models on the CPU:
-the f16/f32 rounding against Python's IEEE packers, signed zeros, the partial-write rules and out-of-range
-buffer accesses. If llvm-mc is present, it also checks that every family's
-programs assemble for gfx1013.
-
-- **`f16`**: f16 add/sub/mul/min/max/fma/fmac/med3, `v_cvt_f16_f32`/`v_cvt_f32_f16`/`v_cvt_pkrtz_f16_f32`,
-  `v_pk_*` (f16 and shifts) with `op_sel`/`op_sel_hi`, 16-bit integer ops and `v_pack_b32_f16`. It only uses
-  encodings `llvm-mc -mcpu=gfx1013` accepts: on GFX10 the VOP3 forms of the f16 VOP2 ops take no `op_sel`, and the
-  16-bit integer ops exist only as `op_sel` VOP3. Which form keeps the other half follows the 16-bit row of
-  `docs/design.md`. Results whose exact value is NaN, infinite or denormal, denormal inputs, and min/max of +0
-  against -0 are marked uncertain and not compared.
-- **`mem`**: raw (`offen` + `soffset` + offset) and structured (`idxen`) `buffer_load/store_dword` to `dwordx4`
-  through V#s built in SGPRs, with a random `num_records` so some threads are out of range (loads read 0, stores
-  are dropped). Each thread uses only its own 64-byte slot. Accesses are wholly in or out of range, because
-  multi-dword accesses straddling `num_records` are the known gap in "Buffer bounds checking". Byte/short buffer
-  loads and scalar loads aren't generated: the translator rejects the former, and SHADER-41 covers the latter.
-
-`--skip-op OP` (an op name) sets a known finding aside without changing the rest of the program.
-`--show SEED:INDEX:WAVE` prints a program and its model.
 
 ## Coverage plan and cost
 

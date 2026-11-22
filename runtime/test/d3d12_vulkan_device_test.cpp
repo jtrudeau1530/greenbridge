@@ -16,6 +16,7 @@
 #include <array>
 #include <cstdint>
 #include <cstring>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -535,9 +536,10 @@ D3D12_RESOURCE_DESC reserved_desc(D3D12_RESOURCE_DIMENSION dimension, UINT64 wid
 }
 
 // GetResourceTiling against the PC runtime, for the same reserved resources. What D3D12 defines must match: the
-// tile shape, the standard and packed mip counts, every standard mip's tile counts and its start within its array
-// slice, the start of slice 0's packed tiles, and the number of standard tiles. How many tiles the packed mips
-// take is the driver's choice (src/resource_tiling.h), and with it the slice size and the total. A layout the host
+// tile shape, every standard mip's tile counts and its start within its array slice, and that no mip filling a
+// whole tile is packed. Which smaller mips are packed (D3D11.3 spec 5.9.2.8.5: "may or may not be packed,
+// depending on the IHV") and how many tiles they take is the driver's choice (src/resource_tiling.h), and with it
+// the slice size and the total: compared only against a host that splits at the same mip. A layout the host
 // refuses is skipped (drivers differ in what they accept); one the host accepts and ours refuses is a mismatch.
 // Returns the number of mismatches, or -1 without a host D3D12 device with tiled resources or with every layout
 // skipped.
@@ -609,31 +611,62 @@ int compare_tiling(ID3D12Device* ours) {
         if (x.shape.WidthInTexels != y.shape.WidthInTexels) report(index, "tile width", x.shape.WidthInTexels, y.shape.WidthInTexels);
         if (x.shape.HeightInTexels != y.shape.HeightInTexels) report(index, "tile height", x.shape.HeightInTexels, y.shape.HeightInTexels);
         if (x.shape.DepthInTexels != y.shape.DepthInTexels) report(index, "tile depth", x.shape.DepthInTexels, y.shape.DepthInTexels);
-        if (x.packed.NumStandardMips != y.packed.NumStandardMips) report(index, "standard mips", x.packed.NumStandardMips, y.packed.NumStandardMips);
-        if (x.packed.NumPackedMips != y.packed.NumPackedMips) report(index, "packed mips", x.packed.NumPackedMips, y.packed.NumPackedMips);
-        if (x.packed.StartTileIndexInOverallResource != y.packed.StartTileIndexInOverallResource)
-            report(index, "packed start", x.packed.StartTileIndexInOverallResource, y.packed.StartTileIndexInOverallResource);
         if (x.count != y.count) {
             report(index, "subresource count", x.count, y.count);
             continue;
         }
+        // Which small mips are packed is the driver's choice (D3D11.3 functional spec 5.9.2.8.5, D3D12_PACKED_MIP_INFO):
+        // only a mip that fills at least one standard tile in every dimension must stay standard; a coarser mip with
+        // any dimension below the tile "may or may not be packed, depending on the IHV", and once a mip is packed all
+        // coarser ones are. Hosts differ: an RTX 5070 packs from the first mip below the tile (like ours), a Radeon
+        // 880M keeps one or two more standard, WARP packs nothing. So the layer must keep every mip that fills a
+        // tile standard and be self-consistent; the host's boundary is informational, and tile counts are compared
+        // only for mips both treat as standard (and the packed totals only when both split at the same mip).
         const UINT layers = desc.Dimension == T2 ? desc.DepthOrArraySize : 1;
         const UINT mips = x.count / layers;
         const UINT slice_x = x.total / layers, slice_y = y.total / layers;
-        if (slice_x - x.packed.NumTilesForPackedMips != slice_y - y.packed.NumTilesForPackedMips)
-            report(index, "standard tiles per slice", slice_x - x.packed.NumTilesForPackedMips,
-                   slice_y - y.packed.NumTilesForPackedMips);
-        if (y.packed.NumPackedMips && !x.packed.NumTilesForPackedMips) report(index, "packed tiles", 0, y.packed.NumTilesForPackedMips);
+        UINT shared = 0;
+        if (desc.Dimension != B) {
+            UINT required = 0;  // leading mips that fill a whole tile in every dimension
+            for (UINT m = 0; m < mips; ++m) {
+                const UINT64 w = std::max<UINT64>(1, desc.Width >> m);
+                const UINT h = std::max<UINT>(1, desc.Height >> m);
+                const UINT d = desc.Dimension == T3 ? std::max<UINT>(1, desc.DepthOrArraySize >> m) : 1;
+                if (w < x.shape.WidthInTexels || h < x.shape.HeightInTexels || d < x.shape.DepthInTexels) break;
+                ++required;
+            }
+            if (x.packed.NumStandardMips < required || x.packed.NumStandardMips + x.packed.NumPackedMips != int(mips))
+                report(index, "standard mips (a mip filling a tile must not be packed)", x.packed.NumStandardMips, required);
+            if (y.packed.NumStandardMips < required)
+                report(index, "host standard mips below the D3D12 minimum", y.packed.NumStandardMips, required);
+            if (bool(x.packed.NumPackedMips) != bool(x.packed.NumTilesForPackedMips))
+                report(index, "packed tiles", x.packed.NumPackedMips, x.packed.NumTilesForPackedMips);
+            if (x.packed.NumStandardMips != y.packed.NumStandardMips)
+                std::printf("GetResourceTiling case %d: standard mips ours %u, host %u (driver's choice, not compared)\n",
+                            index, x.packed.NumStandardMips, y.packed.NumStandardMips);
+            shared = std::min(x.packed.NumStandardMips, y.packed.NumStandardMips);
+            if (x.packed.NumStandardMips == y.packed.NumStandardMips) {
+                if (x.packed.NumPackedMips != y.packed.NumPackedMips) report(index, "packed mips", x.packed.NumPackedMips, y.packed.NumPackedMips);
+                if (x.packed.StartTileIndexInOverallResource != y.packed.StartTileIndexInOverallResource)
+                    report(index, "packed start", x.packed.StartTileIndexInOverallResource, y.packed.StartTileIndexInOverallResource);
+                if (slice_x - x.packed.NumTilesForPackedMips != slice_y - y.packed.NumTilesForPackedMips)
+                    report(index, "standard tiles per slice", slice_x - x.packed.NumTilesForPackedMips,
+                           slice_y - y.packed.NumTilesForPackedMips);
+            }
+        } else if (x.total != y.total) {
+            report(index, "buffer tiles", x.total, y.total);
+        }
         for (UINT i = 0; i < x.count; ++i) {
             const auto &s = x.subresources[i], &t = y.subresources[i];
             const UINT layer = i / mips;
-            if (desc.Dimension != B && i % mips >= y.packed.NumStandardMips) {
+            if (desc.Dimension != B && i % mips >= x.packed.NumStandardMips) {
                 // Packed: no tiles of its own. (On slices after the first the PC runtime writes a tile index here,
                 // not the D3D12_PACKED_TILE its documentation gives; ours follows the documentation.)
                 if (s.WidthInTiles || s.HeightInTiles || s.DepthInTiles || s.StartTileIndexInOverallResource != D3D12_PACKED_TILE)
                     report(index, "packed subresource", i, 0);
                 continue;
             }
+            if (desc.Dimension != B && i % mips >= shared) continue;  // standard in ours only: the host packs it
             if (s.WidthInTiles != t.WidthInTiles || s.HeightInTiles != t.HeightInTiles || s.DepthInTiles != t.DepthInTiles ||
                 s.StartTileIndexInOverallResource - layer * slice_x != t.StartTileIndexInOverallResource - layer * slice_y)
                 report(index, "standard subresource", i, 0);
@@ -643,13 +676,15 @@ int compare_tiling(ID3D12Device* ours) {
 }
 
 
-enum class ResolveScenario { full, rectangle, null_rectangle };
+// whole_rectangle is a rectangle over the whole source: by the documentation the same as a null rectangle.
+enum class ResolveScenario { full, rectangle, null_rectangle, whole_rectangle };
 
 const char* resolve_scenario_name(ResolveScenario scenario) {
     switch (scenario) {
     case ResolveScenario::full: return "ResolveSubresource";
     case ResolveScenario::rectangle: return "ResolveSubresourceRegion(rect)";
     case ResolveScenario::null_rectangle: return "ResolveSubresourceRegion(null rect)";
+    case ResolveScenario::whole_rectangle: return "ResolveSubresourceRegion(whole-source rect)";
     }
     return "unknown";
 }
@@ -759,8 +794,9 @@ bool capture_resolve(ID3D12Device* device, DXGI_FORMAT format, UINT samples, Res
         list->ResolveSubresource(dst.p, 0, src.p, 0, format);
     } else {
         D3D12_RECT rectangle{2, 1, 6, 5};
+        if (scenario == ResolveScenario::whole_rectangle) rectangle = full_source;
         list7->ResolveSubresourceRegion(dst.p, 0, 3, 2, src.p, 0,
-                                        scenario == ResolveScenario::rectangle ? &rectangle : nullptr,
+                                        scenario == ResolveScenario::null_rectangle ? nullptr : &rectangle,
                                         format, D3D12_RESOLVE_MODE_AVERAGE);
     }
     const auto to_copy = transition(dst.p, D3D12_RESOURCE_STATE_RESOLVE_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
@@ -792,7 +828,9 @@ bool capture_resolve(ID3D12Device* device, DXGI_FORMAT format, UINT samples, Res
 
 // Compare D3D12 multisample quality queries for depth/stencil formats with the host runtime. The Vulkan
 // backend has one standard sample pattern, so every supported count reports one quality level (index 0).
-int compare_depth_multisample_quality_levels(ID3D12Device* ours) {
+// A count the Vulkan GPU cannot do for depth and stencil attachments (depth_sample_counts, from its limits) is not
+// something the layer can offer: a software host such as WARP advertises 16x, an RTX or Radeon does not.
+int compare_depth_multisample_quality_levels(ID3D12Device* ours, VkSampleCountFlags depth_sample_counts) {
     Ref<ID3D12Device> host;
     if (!create_host_device(host)) return -1;
 
@@ -813,7 +851,7 @@ int compare_depth_multisample_quality_levels(ID3D12Device* ours) {
             D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS our_levels = host_levels;
             const HRESULT host_hr = host->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS,
                                                                &host_levels, sizeof(host_levels));
-            if (FAILED(host_hr) || host_levels.NumQualityLevels == 0) {
+            if (FAILED(host_hr) || host_levels.NumQualityLevels == 0 || !(depth_sample_counts & samples)) {
                 ++skipped;
                 continue;
             }
@@ -838,7 +876,7 @@ int compare_depth_multisample_quality_levels(ID3D12Device* ours) {
 // Compare the Vulkan-backed resolve output byte-for-byte with the host runtime for every common supported format,
 // sample count and region form. A host-unsupported combination is a deliberate skip; a mismatch in advertised
 // support or in the resulting pixels is a failure.
-int compare_resolves(ID3D12Device* ours) {
+int compare_resolves(ID3D12Device* ours, VkSampleCountFlags color_sample_counts) {
     Ref<ID3D12Device> host;
     if (!create_host_device(host)) return -1;
 
@@ -854,7 +892,8 @@ int compare_resolves(ID3D12Device* ours) {
         UINT(D3D12_FORMAT_SUPPORT1_RENDER_TARGET) | UINT(D3D12_FORMAT_SUPPORT1_MULTISAMPLE_RENDERTARGET) |
         UINT(D3D12_FORMAT_SUPPORT1_MULTISAMPLE_RESOLVE);
     constexpr ResolveScenario scenarios[] = {
-        ResolveScenario::full, ResolveScenario::rectangle, ResolveScenario::null_rectangle};
+        ResolveScenario::full, ResolveScenario::rectangle, ResolveScenario::null_rectangle,
+        ResolveScenario::whole_rectangle};
     int mismatches = 0;
     unsigned compared = 0, matched = 0, skipped = 0;
 
@@ -885,7 +924,8 @@ int compare_resolves(ID3D12Device* ours) {
                                                                &host_levels, sizeof(host_levels));
             const HRESULT our_hr = ours->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS,
                                                               &our_levels, sizeof(our_levels));
-            if (FAILED(host_hr) || host_levels.NumQualityLevels == 0) {
+            // Not a count the Vulkan GPU can do for colour attachments (a software host like WARP offers 16x).
+            if (FAILED(host_hr) || host_levels.NumQualityLevels == 0 || !(color_sample_counts & samples)) {
                 ++skipped;
                 continue;
             }
@@ -904,6 +944,22 @@ int compare_resolves(ID3D12Device* ours) {
                     continue;
                 }
                 ++compared;
+                if (host_pixels != our_pixels && scenario == ResolveScenario::null_rectangle) {
+                    // A null rectangle is the whole source (ID3D12GraphicsCommandList1::ResolveSubresourceRegion).
+                    // Some hosts do not honour that (the Radeon 880M on driver 26.11.2 and WARP resolve to the
+                    // destination's origin and leave the rest unwritten; an RTX 5070 follows the documentation), so
+                    // where the host disagrees with its own whole-source rectangle, the layer is held to the
+                    // documented result: that rectangle's.
+                    std::vector<std::uint8_t> host_whole;
+                    if (capture_resolve(host.p, format, samples, ResolveScenario::whole_rectangle, host_whole) &&
+                        host_whole != host_pixels && host_whole == our_pixels) {
+                        std::printf("resolve format %d samples %u: the host's null-rectangle resolve differs from "
+                                    "its whole-source rectangle (host quirk); ours follows the documentation\n",
+                                    int(format), samples);
+                        ++matched;
+                        continue;
+                    }
+                }
                 if (host_pixels != our_pixels) {
                     std::fprintf(stderr, "resolve mismatch: format %d samples %u %s (host %zu bytes, Vulkan %zu)\n",
                                  int(format), samples, resolve_scenario_name(scenario),
@@ -929,8 +985,16 @@ int compare_resolves(ID3D12Device* ours) {
 
 int main() {
     vktest::Device d;
-    EXPECT(d.create());
+    if (!d.create()) return 77;   // no Vulkan GPU: CTest treats 77 as skipped
     EXPECT(d.depth_format_usable(VK_FORMAT_D32_SFLOAT_S8_UINT));
+    VkSampleCountFlags depth_sample_counts = 0, color_sample_counts = 0;
+    {
+        VkPhysicalDeviceProperties properties{};
+        d.instance_fn<PFN_vkGetPhysicalDeviceProperties>("vkGetPhysicalDeviceProperties")(d.physical, &properties);
+        depth_sample_counts =
+            properties.limits.framebufferDepthSampleCounts & properties.limits.framebufferStencilSampleCounts;
+        color_sample_counts = properties.limits.framebufferColorSampleCounts;
+    }
     constexpr UINT size = 8, small_size = 4;
     unsigned mismatches = 0;
     const auto report = [&](const char* what, UINT index, const std::uint8_t* got, const std::uint8_t* want, size_t n) {
@@ -1078,12 +1142,12 @@ int main() {
                         "skipped\n");
         EXPECT(tiling_mismatches <= 0);
 
-        const int depth_quality_mismatches = compare_depth_multisample_quality_levels(device.p);
+        const int depth_quality_mismatches = compare_depth_multisample_quality_levels(device.p, depth_sample_counts);
         if (depth_quality_mismatches < 0)
             std::printf("Depth/stencil MSAA quality queries: no host D3D12 device to compare with, skipped\n");
         EXPECT(depth_quality_mismatches <= 0);
 
-        const int resolve_mismatches = compare_resolves(device.p);
+        const int resolve_mismatches = compare_resolves(device.p, color_sample_counts);
         if (resolve_mismatches < 0)
             std::printf("Resolve comparison: no host D3D12 device to compare with, skipped\n");
         EXPECT(resolve_mismatches <= 0);
@@ -1644,6 +1708,44 @@ int main() {
             EXPECT(list->Close() == S_OK);
             queue->ExecuteCommandLists(1, lists);
             EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::invalid_copy);
+        }
+
+        // A depth-stencil view of a slice range of a 4x multisampled depth array (D3D12_DSV_DIMENSION_TEXTURE2DMSARRAY):
+        // the view captures the range, a clear through it replays, and a range past the last slice is refused when
+        // the list runs. D3D12 can't copy a multisampled texture to a buffer, so the clear itself isn't read back.
+        {
+            Ref<ID3D12Resource> ms_depth;
+            Ref<ID3D12Fence> ms_fence;
+            D3D12_RESOURCE_DESC ms_desc =
+                texture_desc(size, size, DXGI_FORMAT_D32_FLOAT, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL, 1, 4);
+            ms_desc.SampleDesc.Count = 4;
+            EXPECT(SUCCEEDED(create(default_heap, ms_desc, D3D12_RESOURCE_STATE_DEPTH_WRITE, ms_depth)));
+            EXPECT(SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&ms_fence.p))));
+            D3D12_DEPTH_STENCIL_VIEW_DESC ms_view{};
+            ms_view.Format = DXGI_FORMAT_D32_FLOAT;
+            ms_view.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2DMSARRAY;
+            ms_view.Texture2DMSArray.FirstArraySlice = 1;
+            ms_view.Texture2DMSArray.ArraySize = 2;
+            device->CreateDepthStencilView(ms_depth.p, &ms_view, dsv0);  // the lists that used this slot have run
+            leonida::TargetView captured{};
+            std::memcpy(&captured, reinterpret_cast<const void*>(dsv0.ptr), sizeof(captured));
+            EXPECT(captured.resource && captured.mip == 0 && captured.first_layer == 1 && captured.layer_count == 2);
+
+            EXPECT(SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.p, nullptr)));
+            list->ClearDepthStencilView(dsv0, D3D12_CLEAR_FLAG_DEPTH, 0.5f, 0, 0, nullptr);
+            EXPECT(list->Close() == S_OK);
+            queue->ExecuteCommandLists(1, lists);
+            EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
+            EXPECT(SUCCEEDED(queue->Signal(ms_fence.p, 1)) && SUCCEEDED(ms_fence->SetEventOnCompletion(1, nullptr)));
+
+            ms_view.Texture2DMSArray.FirstArraySlice = 3;  // slices 3 and 4 of a 4-slice texture
+            device->CreateDepthStencilView(ms_depth.p, &ms_view, dsv0);
+            EXPECT(SUCCEEDED(list->Reset(allocator.p, nullptr)));
+            list->ClearDepthStencilView(dsv0, D3D12_CLEAR_FLAG_DEPTH, 0.5f, 0, 0, nullptr);
+            EXPECT(list->Close() == S_OK);
+            queue->ExecuteCommandLists(1, lists);
+            EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::invalid_subresource);
+            EXPECT(SUCCEEDED(queue->Signal(ms_fence.p, 2)) && SUCCEEDED(ms_fence->SetEventOnCompletion(2, nullptr)));
         }
 
         // Reserved resources (docs/d3d12_vulkan.md section 4.2): fully backed at creation, so they copy like
