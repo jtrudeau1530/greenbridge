@@ -182,6 +182,32 @@ class ManifestCreateVerifyTest(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertIn("OK", out.getvalue())
 
+    def test_verify_rejects_resize_between_size_check_and_hashing(self) -> None:
+        rel = "alpha.bin"
+        path = os.path.join(self.pkg, rel)
+        original = self.files[rel]
+        grown = original + b" appended after the size check"
+        os.makedirs(os.path.dirname(self.out_manifest), exist_ok=True)
+        with open(self.out_manifest, "w", encoding="utf-8") as f:
+            json.dump({"files": {rel: {"size": len(original), "sha256": hashlib.sha256(grown).hexdigest()}}}, f)
+
+        getsize = os.path.getsize
+
+        def getsize_then_grow(name: str) -> int:
+            size = getsize(name)
+            if name == path:
+                with open(path, "ab") as f:
+                    f.write(grown[len(original):])
+            return size
+
+        for jobs in (1, 4):
+            with self.subTest(jobs=jobs), contextlib.redirect_stdout(io.StringIO()):
+                with open(path, "wb") as f:
+                    f.write(original)
+                with patch.object(os.path, "getsize", side_effect=getsize_then_grow):
+                    with self.assertRaisesRegex(manifest.ManifestError, r"alpha\.bin.*size changed before hashing"):
+                        manifest.verify(self.pkg, self.out_manifest, jobs=jobs)
+
     def test_verify_detects_missing_file(self):
         with contextlib.redirect_stdout(io.StringIO()):
             manifest.create(self.pkg, self.out_manifest, jobs=1)
