@@ -139,7 +139,7 @@ class Gen:
         self.uses_tex_3d = False
         self.uses_v4uint = False
         self.uses_store_views = set()  # image_store dims used (index into STORE_DIMS)
-        self.uses_int_gather = False    # 2D typed sampled-image types for image_gather4_lz(_o)
+        self.uses_int_sampler = False    # 2D typed sampled-image types for sampling and gathering
         self.uses_int_fetch = set()    # typed image_load dims (index into STORE_DIMS): uint/sint sampled aliases
         self.writes_depth = False
         self.uses_smul = False
@@ -6195,7 +6195,15 @@ class Gen:
             sp, smp, si = self.tmp(), self.tmp(), self.tmp()
             self.emit(f"{sp} = OpAccessChain %_ptr_UC_smp %samplers {smp_idx}")
             self.emit(f"{smp} = OpLoad %smp {sp}")
-            if op not in ("image_gather4_lz", "image_gather4_lz_o", "image_gather4_l", "image_gather4_l_o"):
+            typed_lz = op == "image_sample_lz" and dim == "dim:SQ_RSRC_IMG_2D"
+
+            def sampled_image(image, cls):
+                sampled = self.tmp()
+                sampler_type = f"itxsamp{cls}_0" if cls else stype
+                self.emit(f"{sampled} = OpSampledImage %{sampler_type} {image} {smp}")
+                return sampled
+
+            if not typed_lz and op not in ("image_gather4_lz", "image_gather4_lz_o", "image_gather4_l", "image_gather4_l_o"):
                 self.emit(f"{si} = OpSampledImage %{stype} {img} {smp}")
             f = [self.tof(c) for c in coords]
             goff = None
@@ -6300,15 +6308,13 @@ class Gen:
                 offset = f" Offset {goff}" if goff is not None else ""
 
                 def gather(image, cls, ty):
-                    sampled = self.tmp()
-                    sampler_type = f"itxsamp{cls}_0" if cls else stype
-                    self.emit(f"{sampled} = OpSampledImage %{sampler_type} {image} {smp}")
+                    sampled = sampled_image(image, cls)
                     res = self.tmp()
                     self.emit(f"{res} = OpImageGather {ty} {sampled} {uv} {component}{offset}")
                     return res
 
                 if dim == "dim:SQ_RSRC_IMG_2D":
-                    self.uses_int_gather = True
+                    self.uses_int_sampler = True
                     # dmask selects one texture channel; all four taps are written.
                     self.image_read_typed(dim, self.load_reg("sgpr", a[2]["r"] + 1), img, img_idx,
                                           0xf, vdata, d16, gather)
@@ -6388,6 +6394,17 @@ class Gen:
             else:
                 uv = self.tmp()
                 self.emit(f"{uv} = OpCompositeConstruct %v2float {f[0]} {f[1]}")
+            if typed_lz:
+                def sample(image, cls, ty):
+                    sampled = sampled_image(image, cls)
+                    result = self.tmp()
+                    self.emit(f"{result} = OpImageSampleExplicitLod {ty} {sampled} {uv} Lod %f0")
+                    return result
+
+                self.uses_int_sampler = True
+                self.image_read_typed(dim, self.load_reg("sgpr", a[2]["r"] + 1), img, img_idx,
+                                      dmask, vdata, d16, sample)
+                return
             res = self.tmp()
             if off is not None and kind not in ("", "_lz", "_l", "_b", "_c_lz"):
                 raise Unsupported(op)
@@ -7957,7 +7974,7 @@ def assemble(gen):
                           f"%rt_itx{cls}_{di} = OpTypeRuntimeArray %itximg{cls}_{di}",
                           f"%_ptr_UC_rt_itx{cls}_{di} = OpTypePointer UniformConstant %rt_itx{cls}_{di}",
                           f"%_ptr_UC_itx{cls}_{di} = OpTypePointer UniformConstant %itximg{cls}_{di}"]
-                if gen.uses_int_gather and di == 0:
+                if gen.uses_int_sampler and di == 0:
                     types.append(f"%itxsamp{cls}_{di} = OpTypeSampledImage %itximg{cls}_{di}")
                 dec += [f"OpDecorate %itx{cls}_{di} DescriptorSet 0",
                         f"OpDecorate %itx{cls}_{di} Binding {Gen.SAMPLED_BINDINGS[di]}"]
