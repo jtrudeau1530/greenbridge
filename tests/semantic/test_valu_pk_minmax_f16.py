@@ -3,7 +3,9 @@ from __future__ import annotations
 import math
 import struct
 import unittest
-from typing import Tuple
+from dataclasses import dataclass, field
+from enum import Enum, auto
+from typing import List, Optional, Tuple, Union
 
 # ==============================================================================
 # IEEE 754 binary16 (Half-Precision) Architectural Constants
@@ -452,6 +454,214 @@ class TestF16ModelAndOracle(unittest.TestCase):
         pk_max = oracle_pk_max_f16(s0, s1)
         exp_max = pack_pk_f16(POS_ONE, POS_TWO)
         self.assertEqual(pk_max, exp_max)
+
+
+# ==============================================================================
+# Symbolic AST Opcode Definitions and Typed Expressions
+# ==============================================================================
+
+class RegKind(Enum):
+    VGPR = auto()
+    SGPR = auto()
+
+
+@dataclass(frozen=True)
+class Reg:
+    """Represents a 32-bit architectural register (VGPR or SGPR)."""
+    index: int
+    kind: RegKind = RegKind.VGPR
+
+    def __post_init__(self) -> None:
+        if self.kind == RegKind.VGPR:
+            if not (0 <= self.index <= 255):
+                raise ValueError(f"VGPR index {self.index} out of range [0, 255]")
+        elif self.kind == RegKind.SGPR:
+            if not (0 <= self.index <= 105):
+                raise ValueError(f"SGPR index {self.index} out of range [0, 105]")
+        else:
+            raise TypeError(f"Unknown RegKind: {self.kind}")
+
+    @property
+    def name(self) -> str:
+        prefix = "v" if self.kind == RegKind.VGPR else "s"
+        return f"{prefix}{self.index}"
+
+
+@dataclass(frozen=True)
+class Literal32:
+    """Represents a 32-bit packed literal or inline constant."""
+    bits: int
+
+    def __post_init__(self) -> None:
+        if not (0 <= self.bits <= 0xFFFF_FFFF):
+            raise ValueError(f"Literal32 bits {self.bits:#x} out of range [0, 0xFFFFFFFF]")
+
+    @property
+    def lo_bits(self) -> int:
+        return self.bits & MASK16
+
+    @property
+    def hi_bits(self) -> int:
+        return (self.bits >> 16) & MASK16
+
+    @property
+    def name(self) -> str:
+        return f"{self.bits:#010x}"
+
+
+class Opcode(Enum):
+    V_PK_MIN_F16 = "v_pk_min_f16"
+    V_PK_MAX_F16 = "v_pk_max_f16"
+
+
+@dataclass(frozen=True)
+class VOP3POperand:
+    """VOP3P packed operand with per-half input modifiers and op_sel."""
+    source: Union[Reg, Literal32]
+    neg_lo: bool = False
+    neg_hi: bool = False
+    abs_lo: bool = False
+    abs_hi: bool = False
+    op_sel: Tuple[int, int] = (0, 1)  # (lo_select, hi_select), where 0=lo, 1=hi
+
+    def __post_init__(self) -> None:
+        if self.op_sel not in ((0, 0), (0, 1), (1, 0), (1, 1)):
+            raise ValueError(f"Invalid op_sel {self.op_sel}, elements must be 0 or 1")
+
+    def disassemble(self) -> str:
+        s = self.source.name
+        mods = []
+        if self.abs_lo and self.abs_hi:
+            s = f"|{s}|"
+        elif self.abs_lo:
+            mods.append("abs_lo")
+        elif self.abs_hi:
+            mods.append("abs_hi")
+
+        if self.neg_lo and self.neg_hi:
+            s = f"-{s}"
+        elif self.neg_lo:
+            mods.append("neg_lo")
+        elif self.neg_hi:
+            mods.append("neg_hi")
+
+        if self.op_sel != (0, 1):
+            mods.append(f"op_sel:[{self.op_sel[0]},{self.op_sel[1]}]")
+
+        if mods:
+            return f"{s} ({' '.join(mods)})"
+        return s
+
+
+@dataclass(frozen=True)
+class VPkMinMaxF16Instruction:
+    """Symbolic AST node for RDNA2 v_pk_min_f16 and v_pk_max_f16 instructions."""
+    opcode: Opcode
+    dst: Reg
+    src0: VOP3POperand
+    src1: VOP3POperand
+    clamp: bool = False
+
+    def __post_init__(self) -> None:
+        if self.dst.kind != RegKind.VGPR:
+            raise TypeError(f"Destination of VALU packed instruction must be VGPR, got {self.dst.kind}")
+
+    def disassemble(self) -> str:
+        s = f"{self.opcode.value} {self.dst.name}, {self.src0.disassemble()}, {self.src1.disassemble()}"
+        if self.clamp:
+            s += " clamp"
+        return s
+
+
+class TestSymbolicAST(unittest.TestCase):
+    """Unit tests for symbolic AST opcode definitions and typed expressions."""
+
+    def test_reg_validation_and_naming(self) -> None:
+        v0 = Reg(0, RegKind.VGPR)
+        self.assertEqual(v0.name, "v0")
+        v255 = Reg(255, RegKind.VGPR)
+        self.assertEqual(v255.name, "v255")
+
+        s0 = Reg(0, RegKind.SGPR)
+        self.assertEqual(s0.name, "s0")
+        s105 = Reg(105, RegKind.SGPR)
+        self.assertEqual(s105.name, "s105")
+
+        with self.assertRaises(ValueError):
+            Reg(256, RegKind.VGPR)
+        with self.assertRaises(ValueError):
+            Reg(-1, RegKind.VGPR)
+        with self.assertRaises(ValueError):
+            Reg(106, RegKind.SGPR)
+
+    def test_literal32_representation(self) -> None:
+        lit = Literal32(0x3C004000)
+        self.assertEqual(lit.lo_bits, 0x4000)
+        self.assertEqual(lit.hi_bits, 0x3C00)
+        self.assertEqual(lit.name, "0x3c004000")
+
+        with self.assertRaises(ValueError):
+            Literal32(0x1_0000_0000)
+        with self.assertRaises(ValueError):
+            Literal32(-1)
+
+    def test_operand_disassembly_modifiers(self) -> None:
+        v1 = Reg(1, RegKind.VGPR)
+        op_plain = VOP3POperand(v1)
+        self.assertEqual(op_plain.disassemble(), "v1")
+
+        op_both_abs = VOP3POperand(v1, abs_lo=True, abs_hi=True)
+        self.assertEqual(op_both_abs.disassemble(), "|v1|")
+
+        op_both_neg = VOP3POperand(v1, neg_lo=True, neg_hi=True)
+        self.assertEqual(op_both_neg.disassemble(), "-v1")
+
+        op_custom = VOP3POperand(v1, neg_lo=True, op_sel=(1, 0))
+        self.assertIn("neg_lo", op_custom.disassemble())
+        self.assertIn("op_sel:[1,0]", op_custom.disassemble())
+
+        with self.assertRaises(ValueError):
+            VOP3POperand(v1, op_sel=(0, 2))
+
+    def test_instruction_construction_and_validation(self) -> None:
+        dst = Reg(0, RegKind.VGPR)
+        src0 = VOP3POperand(Reg(1, RegKind.VGPR))
+        src1 = VOP3POperand(Reg(2, RegKind.SGPR))
+
+        inst_min = VPkMinMaxF16Instruction(
+            opcode=Opcode.V_PK_MIN_F16,
+            dst=dst,
+            src0=src0,
+            src1=src1,
+            clamp=False,
+        )
+        self.assertEqual(inst_min.disassemble(), "v_pk_min_f16 v0, v1, s2")
+
+        inst_max_clamp = VPkMinMaxF16Instruction(
+            opcode=Opcode.V_PK_MAX_F16,
+            dst=dst,
+            src0=src0,
+            src1=src1,
+            clamp=True,
+        )
+        self.assertEqual(inst_max_clamp.disassemble(), "v_pk_max_f16 v0, v1, s2 clamp")
+
+        # Destination must be VGPR
+        with self.assertRaises(TypeError):
+            VPkMinMaxF16Instruction(
+                opcode=Opcode.V_PK_MIN_F16,
+                dst=Reg(0, RegKind.SGPR),
+                src0=src0,
+                src1=src1,
+            )
+
+    def test_structural_equality(self) -> None:
+        dst = Reg(4, RegKind.VGPR)
+        src0 = VOP3POperand(Reg(5, RegKind.VGPR))
+        src1 = VOP3POperand(Literal32(0x3C003C00))
+        i1 = VPkMinMaxF16Instruction(Opcode.V_PK_MIN_F16, dst, src0, src1, clamp=True)
+        i2 = VPkMinMaxF16Instruction(Opcode.V_PK_MIN_F16, dst, src0, src1, clamp=True)
+        self.assertEqual(i1, i2)
 
 
 if __name__ == "__main__":
