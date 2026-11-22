@@ -5682,7 +5682,15 @@ std::unique_ptr<WindowPresenter> create_window_presenter(ID3D12Device* device, H
     auto presenter = std::make_unique<leonida::VulkanPresenter>(*d->state().context, info.get_instance_proc,
                                                                 info.instance, info.physical, info.queue,
                                                                 info.queue_family, surface,  // owns the surface
-                                                                info.swapchain_maintenance1 && tear_allowed);
+                                                                info.swapchain_maintenance1 && tear_allowed,
+                                                                [window]() -> VkExtent2D {
+                                                                    RECT r{};
+                                                                    if (GetClientRect(window, &r)) {
+                                                                        return {static_cast<uint32_t>(r.right - r.left),
+                                                                                static_cast<uint32_t>(r.bottom - r.top)};
+                                                                    }
+                                                                    return {0, 0};
+                                                                });
     if (!presenter->ok()) {
         std::fprintf(stderr, "[rt] d3d12: cannot present to this window from the device's queue family\n");
         return nullptr;
