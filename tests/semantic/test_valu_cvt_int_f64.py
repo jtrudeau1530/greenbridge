@@ -1037,5 +1037,122 @@ class TestSIMDMultiLaneDivergence(unittest.TestCase):
             self.assertEqual(state.read_lane_reg(lane, RegKind.VGPR, 0, count=1), 777)
 
 
+class TestRegisterAliasing(unittest.TestCase):
+    """Unit tests for register aliasing and in-place operand preservation."""
+
+    def setUp(self) -> None:
+        self.scalar_interp = ScalarInterpreter()
+        self.simd_interp = SIMDInterpreter()
+
+    def test_dst_pair_alias_src_low_word(self) -> None:
+        # dst = v[0:1], src = v0 (dst.lo aliases src)
+        state = ScalarMachineState()
+        state.write_reg(RegKind.VGPR, 0, 1, i32_to_u32(-999))
+        state.write_reg(RegKind.VGPR, 1, 1, 0xAAAA_BBBB)  # previous high word
+
+        inst = VCvtInstruction(
+            opcode=Opcode.V_CVT_F64_I32,
+            dst=Register(RegKind.VGPR, 0, count=2),
+            src0=VOP1Operand(Register(RegKind.VGPR, 0, count=1)),
+        )
+        res = self.scalar_interp.step(inst, state)
+        self.assertEqual(res, f64_to_bits(-999.0))
+        self.assertEqual(state.read_reg(RegKind.VGPR, 0, count=2), f64_to_bits(-999.0))
+
+    def test_dst_pair_alias_src_high_word(self) -> None:
+        # dst = v[0:1], src = v1 (dst.hi aliases src)
+        state = ScalarMachineState()
+        state.write_reg(RegKind.VGPR, 0, 1, 0x1234_5678)
+        state.write_reg(RegKind.VGPR, 1, 1, 12345)
+
+        inst = VCvtInstruction(
+            opcode=Opcode.V_CVT_F64_U32,
+            dst=Register(RegKind.VGPR, 0, count=2),
+            src0=VOP1Operand(Register(RegKind.VGPR, 1, count=1)),
+        )
+        res = self.scalar_interp.step(inst, state)
+        self.assertEqual(res, f64_to_bits(12345.0))
+        self.assertEqual(state.read_reg(RegKind.VGPR, 0, count=2), f64_to_bits(12345.0))
+
+    def test_dst_alias_src_pair_low_word(self) -> None:
+        # dst = v0 (32-bit), src = v[0:1] (64-bit float).
+        # v0 gets converted integer, v1 must remain strictly untouched!
+        state = ScalarMachineState()
+        original_float = 54321.875
+        float_bits = f64_to_bits(original_float)
+        lo_orig, hi_orig = f64_bits_to_words(float_bits)
+
+        state.write_reg(RegKind.VGPR, 0, 2, float_bits)
+        self.assertEqual(state.vgprs[0], lo_orig)
+        self.assertEqual(state.vgprs[1], hi_orig)
+
+        inst = VCvtInstruction(
+            opcode=Opcode.V_CVT_I32_F64,
+            dst=Register(RegKind.VGPR, 0, count=1),
+            src0=VOP1Operand(Register(RegKind.VGPR, 0, count=2)),
+        )
+        res = self.scalar_interp.step(inst, state)
+        self.assertEqual(res, 54321)
+        self.assertEqual(state.read_reg(RegKind.VGPR, 0, count=1), 54321)
+        # v1 must remain identical to hi_orig
+        self.assertEqual(state.vgprs[1], hi_orig)
+
+    def test_dst_alias_src_pair_high_word(self) -> None:
+        # dst = v1 (32-bit), src = v[0:1] (64-bit float).
+        # v1 gets converted integer, v0 must remain strictly untouched!
+        state = ScalarMachineState()
+        original_float = -888.25
+        float_bits = f64_to_bits(original_float)
+        lo_orig, hi_orig = f64_bits_to_words(float_bits)
+
+        state.write_reg(RegKind.VGPR, 0, 2, float_bits)
+        inst = VCvtInstruction(
+            opcode=Opcode.V_CVT_I32_F64,
+            dst=Register(RegKind.VGPR, 1, count=1),
+            src0=VOP1Operand(Register(RegKind.VGPR, 0, count=2)),
+        )
+        res = self.scalar_interp.step(inst, state)
+        self.assertEqual(res, i32_to_u32(-888))
+        self.assertEqual(state.read_reg(RegKind.VGPR, 1, count=1), i32_to_u32(-888))
+        # v0 must remain identical to lo_orig
+        self.assertEqual(state.vgprs[0], lo_orig)
+
+    def test_adjacent_register_preservation(self) -> None:
+        # dst = v2, src = v[3:4]. v1 and v5 must remain untouched.
+        state = ScalarMachineState()
+        state.write_reg(RegKind.VGPR, 1, 1, 0x1111_1111)
+        state.write_reg(RegKind.VGPR, 2, 1, 0x2222_2222)
+        state.write_reg(RegKind.VGPR, 3, 2, f64_to_bits(99.0))
+        state.write_reg(RegKind.VGPR, 5, 1, 0x5555_5555)
+
+        inst = VCvtInstruction(
+            opcode=Opcode.V_CVT_U32_F64,
+            dst=Register(RegKind.VGPR, 2, count=1),
+            src0=VOP1Operand(Register(RegKind.VGPR, 3, count=2)),
+        )
+        self.scalar_interp.step(inst, state)
+        self.assertEqual(state.read_reg(RegKind.VGPR, 2, count=1), 99)
+        self.assertEqual(state.read_reg(RegKind.VGPR, 1, count=1), 0x1111_1111)
+        self.assertEqual(state.read_reg(RegKind.VGPR, 5, count=1), 0x5555_5555)
+
+    def test_simd_multi_lane_aliasing(self) -> None:
+        state = SIMDState(num_lanes=32, exec_mask=0xFFFF_FFFF)
+        for lane in range(32):
+            val = float(lane * 10) + 0.75
+            state.write_lane_reg(lane, RegKind.VGPR, 0, 2, f64_to_bits(val))
+
+        inst = VCvtInstruction(
+            opcode=Opcode.V_CVT_I32_F64,
+            dst=Register(RegKind.VGPR, 0, count=1),
+            src0=VOP1Operand(Register(RegKind.VGPR, 0, count=2)),
+        )
+        self.simd_interp.step(inst, state)
+        for lane in range(32):
+            self.assertEqual(state.read_lane_reg(lane, RegKind.VGPR, 0, count=1), lane * 10)
+            # High word of original double in v1 remains untouched
+            orig_hi = f64_bits_to_words(f64_to_bits(float(lane * 10) + 0.75))[1]
+            self.assertEqual(state.vgprs[lane][1], orig_hi)
+
+
 if __name__ == "__main__":
     unittest.main()
