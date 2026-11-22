@@ -512,7 +512,8 @@ Checks:
 
 The pin's 41.3% is a model-recovery gap, not a naming gap: almost every archetype name resolves (99.85%, see
 *What is readable* above), but only recovered models can be placed. The archetypes that #8/#10 add are `.#ft`
-fragments, whose headers the pinned `LooksLikeFragment` rejects (breadbbbb/rpf9-explorer#8).
+fragments. The pinned `LooksLikeFragment` now accepts the null optional pointers covered by
+`breadbbbb/rpf9-explorer#8`, so that header filter no longer explains the remaining model-recovery gap.
 
 **Not verified or limited:**
 - Nothing here was looked at in a browser. The checks above are structural and numeric.
