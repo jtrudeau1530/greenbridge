@@ -2197,6 +2197,22 @@ class Gen:
             self.emit(f"{old} = {self.LDS_ATOMICS[name]} %uint {p} {sc} {sem} {self.src_u(dat)}")
             if d is not None:
                 self.dst(d, old)
+        elif op in ("ds_wrxchg2_rtn_b32", "ds_wrxchg2st64_rtn_b32"):
+            # Two atomic exchanges, at ADDR + offset0 * unit and ADDR + offset1 * unit (unit 4 bytes, x64 for st64),
+            # as ds_write2_b32 addresses them: M[A0] = DATA, M[A1] = DATA2; vdst = {old M[A0], old M[A1]}.
+            d = a[0]
+            if d["k"] != "vgpr" or d.get("n") != 2:
+                raise Unsupported(op + " destination")
+            unit = 4 * (64 if "st64" in op else 1)
+            addr = self.src_u(a[1])
+            olds = []
+            for k, name in enumerate(("offset0", "offset1")):
+                p = self.lds_ptr(addr, self.mod_int(mods, name, 0) * unit)
+                old = self.tmp()
+                self.emit(f"{old} = OpAtomicExchange %uint {p} {sc} {sem} {self.src_u(a[2 + k])}")
+                olds.append(old)
+            for k, old in enumerate(olds):           # both exchanges before the first write (vdst may alias)
+                self.dst({"k": "vgpr", "r": d["r"] + k, "n": 1}, old)
         elif op in ("ds_cmpst_rtn_b32", "ds_cmpst_b32"):
             # tmp = M[A]; M[A] = (tmp == DATA) ? DATA2 : tmp; the _rtn_ form returns tmp, ds_cmpst_b32 drops it.
             d, ad, cmp_, src = (a[0], a[1], a[2], a[3]) if rtn else (None, a[0], a[1], a[2])
