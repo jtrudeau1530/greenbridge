@@ -406,6 +406,55 @@ class TestValuAlignbyteB32AST(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# Condition Codes, Status Flags, and Carry/Borrow Isolation
+# ---------------------------------------------------------------------------
+
+@dataclasses.dataclass(frozen=True)
+class ConditionCodes:
+    """Architectural condition codes for 32-bit VALU operations."""
+    zero: bool
+    sign: bool
+    byte0_zero: bool
+    byte1_zero: bool
+    byte2_zero: bool
+    byte3_zero: bool
+    parity: bool
+
+
+@dataclasses.dataclass(frozen=True)
+class VALUStatusFlags:
+    """Status flags and carry/borrow tracking for VALU instructions."""
+    vcc_modified: bool = False
+    overflow: bool = False
+    carry: bool = False
+
+
+def compute_alignbyte_condition_codes(result: int) -> ConditionCodes:
+    """Computes condition codes evaluating attributes of the 32-bit alignbyte result."""
+    res = result & MASK32
+    b0 = res & 0xFF
+    b1 = (res >> 8) & 0xFF
+    b2 = (res >> 16) & 0xFF
+    b3 = (res >> 24) & 0xFF
+    # Parity of low byte (True if even number of set bits)
+    parity = (bin(b0).count("1") % 2) == 0
+    return ConditionCodes(
+        zero=(res == 0),
+        sign=bool(res & SIGN_BIT32),
+        byte0_zero=(b0 == 0),
+        byte1_zero=(b1 == 0),
+        byte2_zero=(b2 == 0),
+        byte3_zero=(b3 == 0),
+        parity=parity,
+    )
+
+
+def compute_alignbyte_status_flags() -> VALUStatusFlags:
+    """In RDNA2 ISA, VALU alignbyte is a purely logical funnel shift and never affects VCC."""
+    return VALUStatusFlags(vcc_modified=False, overflow=False, carry=False)
+
+
+# ---------------------------------------------------------------------------
 # Deterministic Scalar Instruction Interpreter
 # ---------------------------------------------------------------------------
 
@@ -416,6 +465,8 @@ class ScalarVALUInterpreter:
         self.vgprs: list[int] = [0] * 256
         self.sgprs: list[int] = [0] * 106
         self.vcc: int = 0
+        self.last_condition_codes: ConditionCodes | None = None
+        self.last_status_flags: VALUStatusFlags | None = None
         self.trace: list[str] = []
 
     def read_reg_u32(self, kind: RegKind, idx: int) -> int:
@@ -458,6 +509,8 @@ class ScalarVALUInterpreter:
             raise NotImplementedError(f"Unsupported opcode in scalar interpreter: {inst.opcode}")
 
         self.write_reg_u32(inst.dst.kind, inst.dst.index, res)
+        self.last_condition_codes = compute_alignbyte_condition_codes(res)
+        self.last_status_flags = compute_alignbyte_status_flags()
         self.trace.append(f"{inst.to_assembly()} => {res:#010x}")
         return res
 
@@ -917,6 +970,112 @@ class TestValuAlignbyteB32RegisterAliasing(unittest.TestCase):
                 self.assertIsNone(results[lane])
                 # Inactive lanes retain original v0
                 self.assertEqual(simd.read_lane_reg_u32(lane, RegKind.VGPR, 0), 0x88776655)
+
+
+class TestValuAlignbyteB32ConditionCodes(unittest.TestCase):
+    """Unit tests for condition codes, status flags, and carry/borrow isolation."""
+
+    def test_condition_codes_zero_flag(self) -> None:
+        interp = ScalarVALUInterpreter()
+        inst_zero = Instruction(
+            opcode=Opcode.V_ALIGNBYTE_B32,
+            dst=Register(RegKind.VGPR, 0),
+            src0=Immediate(0),
+            src1=Immediate(0),
+            src2=Immediate(0),
+        )
+        res = interp.step(inst_zero)
+        self.assertEqual(res, 0)
+        cc = interp.last_condition_codes
+        self.assertIsNotNone(cc)
+        assert cc is not None
+        self.assertTrue(cc.zero)
+        self.assertFalse(cc.sign)
+        self.assertTrue(cc.byte0_zero)
+        self.assertTrue(cc.byte1_zero)
+        self.assertTrue(cc.byte2_zero)
+        self.assertTrue(cc.byte3_zero)
+        self.assertTrue(cc.parity)  # 0 has 0 bits set, even parity
+
+    def test_condition_codes_sign_flag(self) -> None:
+        interp = ScalarVALUInterpreter()
+        # High bit set: e.g. 0x80000000
+        inst_sign = Instruction(
+            opcode=Opcode.V_ALIGNBYTE_B32,
+            dst=Register(RegKind.VGPR, 0),
+            src0=Immediate(0x80000000),
+            src1=Immediate(0x00000000),
+            src2=Immediate(3),  # shift 3 bytes -> byte 4 (low byte of src0) moves to high byte
+        )
+        res = interp.step(inst_sign)
+        # Low byte of src0 is 0x00, so that wouldn't have bit 31 set.
+        # To get bit 31 set, we need byte 3 of result to have bit 7 set (0x80).
+        # Let's use S1=0x80000000 and shift 0
+        inst_sign2 = Instruction(
+            opcode=Opcode.V_ALIGNBYTE_B32,
+            dst=Register(RegKind.VGPR, 0),
+            src0=Immediate(0),
+            src1=Immediate(0x80000000),
+            src2=Immediate(0),
+        )
+        res2 = interp.step(inst_sign2)
+        self.assertEqual(res2, 0x80000000)
+        cc = interp.last_condition_codes
+        self.assertIsNotNone(cc)
+        assert cc is not None
+        self.assertFalse(cc.zero)
+        self.assertTrue(cc.sign)
+        self.assertTrue(cc.byte0_zero)
+        self.assertFalse(cc.byte3_zero)
+
+    def test_condition_codes_per_byte_zeros(self) -> None:
+        # Pattern 0x00FF00AA: byte 0 = 0xAA (non-zero), byte 1 = 0x00 (zero),
+        # byte 2 = 0xFF (non-zero), byte 3 = 0x00 (zero)
+        cc = compute_alignbyte_condition_codes(0x00FF00AA)
+        self.assertFalse(cc.zero)
+        self.assertFalse(cc.sign)
+        self.assertFalse(cc.byte0_zero)
+        self.assertTrue(cc.byte1_zero)
+        self.assertFalse(cc.byte2_zero)
+        self.assertTrue(cc.byte3_zero)
+
+    def test_condition_codes_parity(self) -> None:
+        # 0x01 has 1 set bit (odd parity -> parity=False)
+        cc_odd = compute_alignbyte_condition_codes(0x01)
+        self.assertFalse(cc_odd.parity)
+
+        # 0x03 has 2 set bits (even parity -> parity=True)
+        cc_even = compute_alignbyte_condition_codes(0x03)
+        self.assertTrue(cc_even.parity)
+
+    def test_carry_borrow_vcc_isolation(self) -> None:
+        interp = ScalarVALUInterpreter()
+        canary_vcc = 0xFEEDFACECAFEBEEF
+        interp.vcc = canary_vcc
+
+        inst = Instruction(
+            opcode=Opcode.V_ALIGNBYTE_B32,
+            dst=Register(RegKind.VGPR, 0),
+            src0=Immediate(0xFFFFFFFF),
+            src1=Immediate(0xFFFFFFFF),
+            src2=Immediate(1),
+        )
+        interp.step(inst)
+        # VCC is never modified or polluted by alignbyte
+        self.assertEqual(interp.vcc, canary_vcc)
+
+        flags = interp.last_status_flags
+        self.assertIsNotNone(flags)
+        assert flags is not None
+        self.assertFalse(flags.vcc_modified)
+        self.assertFalse(flags.overflow)
+        self.assertFalse(flags.carry)
+
+        # SIMD wavefront test: VCC invariant across wave
+        simd = SIMDWavefrontInterpreter(wave_size=64)
+        simd.vcc = canary_vcc
+        simd.step(inst)
+        self.assertEqual(simd.vcc, canary_vcc)
 
 
 if __name__ == "__main__":
