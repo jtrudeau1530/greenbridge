@@ -15,6 +15,25 @@ are offset-based (`recovered/...`), not the original paths.
   `story000.rpf` and `shared_minigame000.rpf` is non-zlib. Unread bytes are recorded as ranges (the `unread`
   list in `rpf9_carve.py`'s `index.json`), never guessed.
 
+## Stream roles
+
+In the measured carve indexes, a resource's system prefix can be separated from its graphics pages without
+decoding the resource: the prefix ends at the first stream whose inflated size is a multiple of `0x10000`, plus at
+most one following non-multiple stream (a spill reached by a `0x5…` pointer). This reproduces the first
+`42 40 00 00` graphics page on all 36,911 resources with one in `packs.rpf` and the 20–21, 40–41 and 70–70.8 GiB
+`levels.rpf` windows, and on all 2,478 two-stream `0DRP` navmesh pages. It is a boundary, not a page test: only
+17,994 of the 40,038 graphics pages measured (44.9%) are multiples of `0x10000`, so the stream at the boundary is
+often the last system page. `42 40 00 00` stays the direct graphics-page marker.
+
+An inflated size of exactly `0x800000` is a chunk head, not a continuation. All 43 in `core_bvh4.rpf` follow a
+208–544-byte header stream and are followed by a separate continuation stream; the eight in the other measured
+indexes are resource or graphics pages. [bvh.md](bvh.md) records the same 8 MiB-first relationship from the payload
+side.
+
+The boundary rule is independently read by meetox80/6stars. No 6stars code, prose or table was used; the
+repository has **no licence** (all rights reserved), and every count above was re-measured from this package. See
+[related_projects.md](related_projects.md).
+
 ## Carving
 
 ```powershell
