@@ -6,10 +6,13 @@ offset `0x129B000` (19,509,248). On the package measured here the config is 837 
 contents. It holds the game's music/radio record table, the station record blocks and the mixer
 configuration.
 
-Carve the config without touching the AWC banks:
+Carve the config without touching the AWC banks. `--until-adat` ends the scan at the first raw AWC bank
+(an `ADAT` whose header parses as a bank, not the four bytes alone, which also occur in `METADATA`), so the
+boundary isn't specific to one build; the summary in `<out>/index.json` records it as `first_adat_bank`
+(`0x129B000` on the package measured here, the same window as `--limit 0x129B000`):
 
 ```powershell
-python -I tools/rpf9_carve.py audio.rpf <out> --limit 0x129B000
+python -I tools/rpf9_carve.py audio.rpf <out> --until-adat
 python -I tools/audio_config.py <out> --join --json
 ```
 
@@ -94,7 +97,7 @@ files; nothing from them is committed.
   duration and the contiguous station ranges are the only built-in signals.
 - Hash A is unresolved, and hash B resolves only through a supplied name pool or an AWC manifest.
 - The first ~19.5 MiB bound is specific to this package. A different build can put the AWC start at
-  another offset; use the first AWC bank (`ADAT`) as the boundary.
+  another offset; `rpf9_carve.py --until-adat` finds it (the first AWC bank whose header parses).
 - No start offsets, no play order and no playlists are stored here. The config's station content
   lists reference records, but the mix order is assembled at runtime.
 - A marker is reported only when at least 20 bytes follow it in the scanned input, as before.

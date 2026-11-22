@@ -5,7 +5,12 @@ every stream that decodes cleanly to the end, and writes each one as <offset>.bi
 ranges it couldn't read, so coverage is measurable.
 
 Usage:
-    python -I rpf9_carve.py <archive.rpf> <out_dir> [--start N] [--limit BYTES] [--index-only]
+    python -I rpf9_carve.py <archive.rpf> <out_dir> [--start N] [--limit BYTES] [--until-adat] [--index-only]
+
+--until-adat ends the scan at the first raw AWC bank (a little-endian `ADAT` whose header parses as one,
+rsc8_audio.parse_adat_header_bytes), so the zlib-compressed audio config at the start of audio.rpf is carved without
+touching the banks and without a build-specific --limit (docs/audio_config.md). The bytes `ADAT` alone are not
+enough: they also occur inside `METADATA` and in compressed data. index.json's summary records the boundary.
 """
 import argparse
 import json
@@ -16,6 +21,9 @@ import struct
 import sys
 import time
 import zlib
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from rsc8_audio import parse_adat_header_bytes  # noqa: E402
 
 # zlib stream start, or a Bink 2 video ('KB2' + revision letter, then u32 size-8).
 # RPF9 magic as it sits on disk: the tag "RPF9" stored little-endian (docs/rpf.md, docs/bvh.md).
@@ -52,12 +60,32 @@ def byte_count(text):
     return value
 
 
+ADAT_HEADER_READ = 1 << 20   # enough for every bank header the parser accepts in practice; it rejects longer ones
+
+
+def first_adat_bank(m, start, end):
+    """Offset of the first raw AWC bank in m[start:end] whose header parses (not just the four bytes), or None."""
+    size = len(m)
+    pos = start
+    while pos < end:
+        at = m.find(b"ADAT", pos, end)
+        if at < 0:
+            return None
+        if parse_adat_header_bytes(m[at:min(size, at + ADAT_HEADER_READ)], at, size) is not None:
+            return at
+        pos = at + 1
+    return None
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("archive")
     ap.add_argument("out")
     ap.add_argument("--start", type=offset)
     ap.add_argument("--limit", type=byte_count)
+    ap.add_argument("--until-adat", action="store_true",
+                    help="end the scan at the first raw AWC (ADAT) bank, e.g. the audio config at the start of "
+                         "audio.rpf")
     ap.add_argument("--index-only", action="store_true")
     a = ap.parse_args()
     below_normal()
@@ -86,6 +114,14 @@ def main() -> int:
         m = mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ)
         pos = base
         end = min(size, pos + a.limit) if a.limit else size
+        boundary = None
+        if a.until_adat:
+            boundary = first_adat_bank(m, pos, end)
+            if boundary is None:
+                print(f"--until-adat: no AWC bank between {pos:#x} and {end:#x}; scanning all of it", flush=True)
+            else:
+                end = boundary
+                print(f"--until-adat: first AWC bank at {boundary:#x}; scanning {pos:#x}..{boundary:#x}", flush=True)
         rows, last, unread, zero = [], pos, 0, 0
         t0 = time.time()
         while pos < end:
@@ -162,6 +198,8 @@ def main() -> int:
                "bink2_files": sum(1 for r in rows if r.get("type") == "bink2"),
                "zero_padding": zero, "unread_bytes": unread,
                "span": span}
+    if a.until_adat:
+        summary["first_adat_bank"] = boundary   # None: no bank in the window, the whole window was scanned
     with open(os.path.join(a.out, "index.json"), "w", encoding="utf-8", newline="\n") as f:
         json.dump({"summary": summary, "files": rows}, f)
     print(json.dumps(summary, indent=1))
