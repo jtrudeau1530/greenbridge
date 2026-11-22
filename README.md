@@ -58,6 +58,19 @@ work on booting can start as soon as one is available to a developer.
 | Ray tracing (BVH) | ⚠️ In progress. `BuildRaytracingAccelerationStructure` builds BLASes and TLASes on the GPU in the console's XDXR BVH4 layout, which the translated shaders walk themselves (`image_bvh_intersect_ray`, TRI0/TRI1 leaves); `LEONIDA_RT_AS=khr` uses Vulkan's own acceleration structures instead. The build descriptions are recovered from the package's `XboxBvhBuilder.dll` ([notes](docs/xdxr.md)). The game's `*_bvh4.rpf` packs are measured: offline-built, dehydrated BLASes that rehydrate through that DLL with their geometry from the drawables in `levels.rpf` ([notes](docs/bvh.md)). Not done in the builder: TRI1 pairing, BOX16 nodes, serialization. Open: whether the game rehydrates the packs or rebuilds them, and the XDXR-vs-KHR default ([#313](https://github.com/ItsNotRexed/Leonida/issues/313)) |
 
 
+## Platforms
+
+Nothing is playable on any platform yet (see *Project status*). What runs where today:
+
+| Platform | Today |
+|---|---|
+| Windows | Everything: `make_game.py`, the tools, and the runtime (`gta6rt` and the D3D12 → Vulkan layer) with its tests. |
+| Linux | The translator, the asset tools and the Vulkan GPU test tools build and run natively (tested on RADV and NVIDIA). The runtime is Windows code: it cross-compiles with clang-cl and xwin, and its tests run under Wine or Proton (*The Windows runtime on Linux, under Wine or Proton* below). The game is meant to run the same way, under Wine or Proton with the D3D12 layer on native Vulkan (#217). |
+| macOS (Apple Silicon) | The Python tools and the Vulkan test tools run, on MoltenVK (Homebrew) or KosmicKrisp. Known gaps: no geometry stage and no `VK_EXT_mesh_shader` (those tests are skipped), 32-wide subgroups (wave64 shaders run emulated), and MoltenVK's float handling (`PerVertexKHR`, NaN compares, -0, the cost of `NoContraction`); [docs/testing.md](docs/testing.md) lists each (#2947). |
+| AMD RDNA1 (RX 5000) | A supported target: close to the console's RDNA2, and its 64-wide subgroups run the wave64 shaders natively. RX 5700 XT results pass the GPU test suite (#146); on RADV, pixel shaders without fragment barycentrics have a known difference (*Known problems* in [docs/testing.md](docs/testing.md)) (#330). |
+
+GPU results from every platform are collected in #166; how to run the tests is in [docs/testing.md](docs/testing.md).
+
 ## How to build
 
 The port isn't downloaded ready-made. It's built on your PC from your own copy.
