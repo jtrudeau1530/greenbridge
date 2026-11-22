@@ -256,12 +256,8 @@ What is implemented (all of it testable without the game):
     `OPTIONS2`–`5`, `7`–`9`, `11`, `13`–`21`), GPU virtual-address support, format support, format plane counts,
     multisample quality levels, shader model and root signature version.
     `D3D12_OPTIONS8` reports unaligned block textures when the Vulkan logical device enables BC texture compression.
-    Other queries are logged and refused until the trace shows what the game asks (question 11);
-  - `CheckFeatureSupport` for feature levels (up to 12_1), architecture, D3D12 options (`OPTIONS` and `OPTIONS2`–`5`, `7`, `9`, `11`, `13`–`21`), GPU virtual-address
-    support, format support and multisample quality levels. Other queries (including `OPTIONS1`/`6`/`8`/`10`/`12`, `FORMAT_INFO`, `SHADER_MODEL`, and `ROOT_SIGNATURE` left to sibling PRs) are logged and refused until the trace
-    shows what the game asks (question 11);
-    support, format support, multisample quality levels, shader model and root signature version. Other queries are
-    logged and refused until the trace shows what the game asks (question 11);
+    Other queries, including `OPTIONS1`, `6`, `10` and `12`, are logged and refused until the trace shows what
+    the game asks (question 11);
   - Single-sampled `A8_UNORM` 2D textures use one byte per texel in `VK_FORMAT_R8_UNORM`. Their SRVs expose
     (0, 0, 0, A) before applying the caller's component mapping. Format support includes `MIP` when the Vulkan
     image supports multiple levels. Render-target, depth-stencil and UAV creation are unsupported for this format.
