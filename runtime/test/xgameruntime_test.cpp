@@ -226,7 +226,8 @@ void check_run_time_load() {
     auto query = reinterpret_cast<Query>(get_proc(rt_mod, "QueryApiImpl"));
     auto uninit_api = reinterpret_cast<Uninit>(get_proc(rt_mod, "UninitializeApiImpl"));
     check(init_ex2(0x2410, 0x0, 0x02, &options) == S_OK, "InitializeApiImplEx2 succeeds offline");
-    const GUID some_class = {0x973a344e, 0x24bf, 0x4d0f, {0x84, 0x57, 0x56, 0xc5, 0x34, 0x89, 0x2b, 0x29}};
+    // XGameSaveImpl (xgameruntime include/xgamesave.idl), not served yet.
+    const GUID some_class = {0x704c3f58, 0xe629, 0x4cc2, {0xb1, 0x97, 0x30, 0x51, 0x1b, 0x99, 0x6f, 0xe2}};
     void* out = reinterpret_cast<void*>(1);
     check(query(&some_class, some_class, &out) == static_cast<HRESULT>(0x80070032) && out == nullptr,
           "QueryApiImpl refuses a class it doesn't provide yet (HRESULT 0x80070032) and clears the out pointer");
@@ -557,6 +558,62 @@ void check_run_time_load() {
         }
         check(all, "IXPackageImpl3 answers for IXPackageImpl and IXPackageImpl2 too");
         release(pk);
+    }
+    {
+        // XGameImpl (IXGameImpl3 : IXGameImpl2 : IXGameImpl, xgameruntime include/xgame.idl); IXGameImpl's id is the
+        // class id. Slots: 3 XGameGetXboxTitleId, 4 XLaunchNewGame (void), 5 XLaunchRestartOnCrash.
+        const GUID game_cls = {0x973a344e, 0x24bf, 0x4d0f, {0x84, 0x57, 0x56, 0xc5, 0x34, 0x89, 0x2b, 0x29}};
+        const GUID game2 = {0x50849859, 0x0ad8, 0x4f81, {0x80, 0xe4, 0x5b, 0xc7, 0x86, 0x26, 0xf8, 0x52}};
+        const GUID game3 = {0x2549f142, 0x6419, 0x4a06, {0x97, 0xb5, 0x93, 0x1a, 0xab, 0x7c, 0x2f, 0x34}};
+        void* g = get(game_cls);
+        check(g != nullptr, "QueryApiImpl hands out XGameImpl for its class id");
+        bool every = g != nullptr;
+        for (const GUID& iid : {game2, game3}) {
+            void* same = nullptr;
+            every = every && query(&game_cls, iid, &same) == S_OK && same == g;
+            if (same) release(same);
+        }
+        check(every, "XGameImpl answers for IXGameImpl2's and IXGameImpl3's ids, the same object");
+        if (g) {
+            using TitleId = HRESULT(STDMETHODCALLTYPE*)(void*, uint32_t*);
+            using LaunchNew = void(STDMETHODCALLTYPE*)(void*, const char*, const char*, void*);
+            using Restart = HRESULT(STDMETHODCALLTYPE*)(void*, const char*, uint32_t);
+            char tmp[MAX_PATH] = {};
+            GetTempPathA(sizeof(tmp), tmp);
+            const std::string game = std::string(tmp) + "leonida_xgame_title_test";
+            CreateDirectoryA(game.c_str(), nullptr);
+            SetEnvironmentVariableA("LEONIDA_GAME_DIR", game.c_str());
+            const std::string config = game + "\\MicrosoftGame.Config";
+            auto write_config = [&](const char* text) {
+                if (FILE* f = std::fopen(config.c_str(), "wb")) {
+                    std::fputs(text, f);
+                    std::fclose(f);
+                }
+            };
+            uint32_t id = 0x5a5a5a5a;
+            DeleteFileA(config.c_str());
+            check(reinterpret_cast<TitleId>(slot(g, 3))(g, &id) == E_FAIL && id == 0x5a5a5a5a,
+                  "slot 3 (XGameGetXboxTitleId) without a config: E_FAIL, nothing written");
+            write_config("<Game configVersion=\"1\">\n  <TitleId> 1a2B3c4D </TitleId>\n</Game>\n");
+            check(reinterpret_cast<TitleId>(slot(g, 3))(g, &id) == S_OK && id == 0x1A2B3C4Du,
+                  "slot 3 gives the config's <TitleId> (hex, either case, whitespace allowed)");
+            check(reinterpret_cast<TitleId>(slot(g, 3))(g, nullptr) == E_INVALIDARG,
+                  "slot 3 with a null pointer is E_INVALIDARG");
+            write_config("<Game><TitleId>not-hex</TitleId></Game>");
+            id = 0x5a5a5a5a;
+            check(reinterpret_cast<TitleId>(slot(g, 3))(g, &id) == E_FAIL && id == 0x5a5a5a5a,
+                  "slot 3 refuses a <TitleId> that is not hex");
+            write_config("<Game><TitleId>123456789</TitleId></Game>");
+            check(reinterpret_cast<TitleId>(slot(g, 3))(g, &id) == E_FAIL, "slot 3 refuses more than 8 hex digits");
+            DeleteFileA(config.c_str());
+            RemoveDirectoryA(game.c_str());
+            SetEnvironmentVariableA("LEONIDA_GAME_DIR", nullptr);
+            reinterpret_cast<LaunchNew>(slot(g, 4))(g, "other.exe", "", nullptr);
+            check(true, "slot 4 (void XLaunchNewGame) returns offline");
+            check(reinterpret_cast<Restart>(slot(g, 5))(g, "--restarted", 0) == S_OK,
+                  "slot 5 (XLaunchRestartOnCrash) succeeds offline");
+            release(g);
+        }
     }
     check(uninit_api() == S_OK, "UninitializeApiImpl succeeds");
 
