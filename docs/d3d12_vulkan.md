@@ -178,8 +178,16 @@ What is implemented (all of it testable without the game):
   24-bit word makes the round trip unchanged (checked on all 16777216 by `depth24_convert_test`). Texture to
   texture copies move the floats as they are. `ClearDepthStencilView` stores the float of the quantised value,
   so the texture reads back as D3D's quantisation of the clear value. The scratch buffers and descriptors live
-  until the submission that used them completes. NVIDIA's D3D12 driver breaks some of those ties the other way
-  (and so does its native D24 in Vulkan); the layer follows WARP and AMD there. Not covered: a depth test or
+  until the submission that used them completes. A copy larger than the device's `maxStorageBufferRange` (128 MiB at
+  least) is split into several dispatches, by slices or by rows of one slice. The dispatch runs even under a
+  `SetPredication` that would skip copies: the layer runs copies unpredicated (section 4.7) and the conversion
+  must go with them, so conditional rendering is ended around it. The D3D11.3 functional spec (3.2.3.6, FLOAT to
+  UNORM) says: NaN is 0, the value is clamped to 0..1, multiplied by 2^n - 1 in float, 0.5 is added and the
+  fraction dropped, with a tolerance of 0.6 ULP on the integer side; read literally a tie rounds up, and 3.2.2
+  lists this conversion as an exception to round-to-nearest-even without fixing ties. WARP and AMD's D3D12 driver
+  were measured to round the float product to nearest even (2.5 gives 2, 0.5 gives 0), which the tolerance
+  allows; NVIDIA's D3D12 driver breaks some of those ties the other way (and so does its native D24 in Vulkan);
+  the layer follows WARP and AMD there, a measurement and not a rule of the spec. Not covered: a depth test or
   a depth write by the rasteriser works on D32 and may differ from D24 by up to the 24-bit step, and a depth
   texture sampled in a shader sees the float; only copies, clears and readbacks are bit-exact.
   `ResolveSubresource` becomes `vkCmdResolveImage` in the same layouts as a copy: a multisampled colour
@@ -438,9 +446,19 @@ and any validation error fails them.
     (steps, half steps and the floats around them, powers of two, random) as a whole-view clear of a 4x4 texture
     (the first 160) and as one rectangle clear per value of a wide texture, with a stencil value, and compares both
     planes read back. The layer matches WARP and the Radeon host exactly; NVIDIA's host (and the RTX 5070's native
-    D24 through the layer) rounds some ties the other way and agrees with itself only. `depth24_convert_test`
-    runs the compute pass on the GPU for all 16777216 words (to float, and back), 16777216 float bit patterns
-    against `depth24_quantize`, and a pitched copy at an offset.
+    D24 through the layer) rounds some ties the other way and agrees with itself only. It also clears an
+    `R24G8_TYPELESS` texture through a typed D24 DSV (200 values, compared with the host), and reports whether
+    shader-resource views of both planes (`R24_UNORM_X8_TYPELESS`, `X24_TYPELESS_G8_UINT`) write a descriptor. They do
+    not: the layer has no T# format for the depth view (no Vulkan mapping for `R24_UNORM_X8_TYPELESS`) and refuses
+    views of the stencil plane, with any depth format, so such an SRV is an empty slot. That is a known gap, not
+    fixed here; an SRV read is not compared in any case (no shader runs in these tests and the host's descriptor is
+    opaque). It also runs an upload and readback under a `SetPredication` that skips copies, which the
+    layer must still convert and which is compared with the host's unpredicated run. `depth24_convert_test` runs the
+    compute pass on the GPU for all 16777216 words (to float, and back), 16777216 float bit patterns against
+    `depth24_quantize` (with a 1 MiB range so the copy splits into 65 dispatches), and a pitched copy at an offset
+    split by a 1 KiB range. It tests the pass, which needs no D24 absence, on whatever device
+    `VK_LOADER_DRIVERS_SELECT` picks; the layer's own D24 path (the D3D12 tests above) is used only on a GPU without
+    D24 depth-attachment support, so run those with the AMD driver selected (the Radeon 880M, RADV).
 - `d3d12_method_variants_test`: each variant against the method it wraps, on the device directly (the proxy's
   slot 76 is the Xbox texture method, not `CreateCommittedResource3`). It runs 12 creation cases (buffers on the
   three heap types, textures, a volume, a multisampled target, and three shapes the base refuses) through every

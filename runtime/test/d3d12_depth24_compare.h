@@ -37,7 +37,8 @@ inline std::vector<float> depth24_clear_values() {
 
 // One scenario on one device: every value cleared into a 4x4 texture (a whole-view clear) and into a column of a wide
 // one (a rectangle clear), the planes of both read back. out.bytes holds them, regions say where.
-inline void run_depth24_clears(Run& run, ID3D12Device* host, const std::vector<float>& values, Outcome& out) {
+inline void run_depth24_clears(Run& run, ID3D12Device* host, const std::vector<float>& values, Outcome& out,
+                               DXGI_FORMAT format = DXGI_FORMAT_D24_UNORM_S8_UINT) {
     const UINT count = UINT(values.size());
     const UINT whole = std::min<UINT>(count, 160);  // whole-view clears, one texture each; the wide one takes all
     D3D12_RESOURCE_DESC tiny{};
@@ -46,7 +47,7 @@ inline void run_depth24_clears(Run& run, ID3D12Device* host, const std::vector<f
     tiny.Height = 4;
     tiny.DepthOrArraySize = 1;
     tiny.MipLevels = 1;
-    tiny.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
+    tiny.Format = format;
     tiny.SampleDesc.Count = 1;
     tiny.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
     D3D12_RESOURCE_DESC wide = tiny;
@@ -106,6 +107,41 @@ inline void run_depth24_clears(Run& run, ID3D12Device* host, const std::vector<f
     }
     run.device->CreateDepthStencilView(wide_tex.p, &dsv, handle(whole));
 
+    // Shader-resource views of a typeless D24 texture: R24_UNORM_X8 reads the depth plane, X24_TYPELESS_G8_UINT the
+    // stencil plane. The layer writes a descriptor into the slot (the host's is opaque and no shader runs here), so
+    // all that can be reported is whether it wrote one.
+    if (run.ours && format == DXGI_FORMAT_R24G8_TYPELESS) {
+        Ptr<ID3D12DescriptorHeap> srv_heap;
+        const D3D12_DESCRIPTOR_HEAP_DESC srv_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 2, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+        if (FAILED(run.device->CreateDescriptorHeap(&srv_desc, IID_PPV_ARGS(&srv_heap.p)))) {
+            out.error = "SRV heap creation failed";
+            return;
+        }
+        using XboxHandle = std::uint64_t(WINAPI*)(void*);
+        const SIZE_T base = SIZE_T(reinterpret_cast<XboxHandle>((*reinterpret_cast<void***>(srv_heap.p))[9])(srv_heap.p));
+        const UINT srv_step = run.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        const DXGI_FORMAT srv_formats[2] = {DXGI_FORMAT_R24_UNORM_X8_TYPELESS, DXGI_FORMAT_X24_TYPELESS_G8_UINT};
+        for (UINT plane = 0; plane < 2; ++plane) {
+            D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+            srv.Format = srv_formats[plane];
+            srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+            srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            srv.Texture2D.MipLevels = 1;
+            srv.Texture2D.PlaneSlice = plane;
+            const D3D12_CPU_DESCRIPTOR_HANDLE slot{base + size_t(plane) * srv_step};
+            run.device->CreateShaderResourceView(tex[0].p, &srv, slot);
+            const auto* words = reinterpret_cast<const std::uint32_t*>(slot.ptr);
+            bool empty = true;
+            for (int i = 0; i < 8; ++i) empty = empty && words[i] == 0;
+            // Known gap, not a failure: the layer has no T# format for these two views of a typeless depth texture
+            // (image_descriptor: R24_UNORM_X8_TYPELESS has no Vulkan mapping, and views of the stencil plane are
+            // refused), so the slot stays empty. Printed so that a change shows up.
+            std::printf("depth24 typeless: the shader-resource view of %s %s\n",
+                        plane ? "X24_TYPELESS_G8_UINT" : "R24_UNORM_X8_TYPELESS",
+                        empty ? "is not supported by the layer (empty descriptor, known gap)" : "wrote a descriptor");
+        }
+    }
+
     // Whole-view clears, one per texture; the wide texture first gets a stencil-only clear, then a column per value.
     for (UINT k = 0; k < whole; ++k)
         run.list->ClearDepthStencilView(handle(k), D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, values[k],
@@ -140,6 +176,67 @@ inline void run_depth24_clears(Run& run, ID3D12Device* host, const std::vector<f
     rb->Unmap(0, nullptr);
 }
 
+// An upload of random 24-bit words and stencil bytes into a D24 texture and a readback of both planes, optionally with
+// a predicate that skips the copies (a zero word, EQUAL_ZERO). D3D12 would skip them; the layer runs copies
+// unpredicated (docs section 4.7), and the conversion around its D24 copies must run too, so the layer's
+// predicated run must read back what the host's unpredicated run does.
+inline void run_depth24_predicated(Run& run, ID3D12Device* host, bool predicated, Outcome& out) {
+    D3D12_RESOURCE_DESC desc{};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    desc.Width = 20;
+    desc.Height = 12;
+    desc.DepthOrArraySize = 1;
+    desc.MipLevels = 1;
+    desc.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
+    desc.SampleDesc.Count = 1;
+    desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT foot[2];
+    UINT rows[2];
+    UINT64 row_bytes[2], total = 0;
+    host->GetCopyableFootprints(&desc, 0, 2, 0, foot, rows, row_bytes, &total);
+    const UINT64 stride = (total + 511) / 512 * 512;
+    Ptr<ID3D12Resource> up, rb, tex, predicate;
+    if (!run.buffer(D3D12_HEAP_TYPE_UPLOAD, stride, D3D12_RESOURCE_STATE_GENERIC_READ, up) ||
+        !run.buffer(D3D12_HEAP_TYPE_READBACK, stride, D3D12_RESOURCE_STATE_COPY_DEST, rb) ||
+        !run.buffer(D3D12_HEAP_TYPE_UPLOAD, 256, D3D12_RESOURCE_STATE_GENERIC_READ, predicate) ||
+        !run.texture(desc, D3D12_RESOURCE_STATE_COPY_DEST, tex)) {
+        out.error = "resource creation failed";
+        return;
+    }
+    std::uint8_t *upm = nullptr, *rbm = nullptr, *pm = nullptr;
+    if (FAILED(up->Map(0, nullptr, reinterpret_cast<void**>(&upm))) || FAILED(rb->Map(0, nullptr, reinterpret_cast<void**>(&rbm))) ||
+        FAILED(predicate->Map(0, nullptr, reinterpret_cast<void**>(&pm)))) {
+        out.error = "Map failed";
+        return;
+    }
+    std::memset(pm, 0, 256);
+    std::memset(upm, 0, size_t(stride));
+    std::memset(rbm, 0xcd, size_t(stride));
+    for (UINT plane = 0; plane < 2; ++plane)
+        for (UINT row = 0; row < rows[plane]; ++row)
+            for (UINT64 col = 0; col < row_bytes[plane]; ++col) {
+                const bool x8 = plane == 0 && col % 4 == 3;
+                upm[size_t(foot[plane].Offset) + row * foot[plane].Footprint.RowPitch + size_t(col)] =
+                    x8 ? 0 : fill_byte(77u + plane, row * 131 + size_t(col), false);
+            }
+    if (predicated) run.list->SetPredication(predicate.p, 0, D3D12_PREDICATION_OP_EQUAL_ZERO);
+    for (UINT plane = 0; plane < 2; ++plane) {
+        const auto dst = sub_loc(tex.p, plane), src = foot_loc(up.p, foot[plane]);
+        run.list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+    }
+    run.barrier(tex.p, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    for (UINT plane = 0; plane < 2; ++plane) {
+        const auto dst = foot_loc(rb.p, foot[plane]), src = sub_loc(tex.p, plane);
+        run.list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+        out.regions.push_back({plane ? "stencil plane" : "depth plane", size_t(foot[plane].Offset),
+                               foot[plane].Footprint.RowPitch, size_t(row_bytes[plane]), rows[plane], 1, plane == 0});
+    }
+    if (predicated) run.list->SetPredication(nullptr, 0, D3D12_PREDICATION_OP_EQUAL_ZERO);
+    out.error = run.submit();
+    out.bytes.assign(rbm, rbm + size_t(stride));
+    rb->Unmap(0, nullptr);
+}
+
 // Returns the number of differences, or -1 with no host device.
 inline int compare_depth24(ID3D12Device* ours) {
     Ptr<ID3D12Device> host;
@@ -154,9 +251,36 @@ inline int compare_depth24(ID3D12Device* ours) {
     }
     run_depth24_clears(ours_run, host.p, values, a);
     run_depth24_clears(host_run, host.p, values, b);
-    const int r = compare("D24 clears", a, b);
+    int r = compare("D24 clears", a, b);
     if (!r) std::printf("depth24 clears: %zu values, whole-view and rectangle clears match the host (%zu regions)\n",
                         values.size(), b.regions.size());
+
+    // R24G8_TYPELESS resource with a typed D24 DSV (and, on the layer, shader-resource views of both planes).
+    const std::vector<float> few(values.begin(), values.begin() + 200);
+    Outcome ta, tb;
+    Run ours_typeless, host_typeless;
+    if (!ours_typeless.init(ours, true) || !host_typeless.init(host.p, false)) return r + 1;
+    run_depth24_clears(ours_typeless, host.p, few, ta, DXGI_FORMAT_R24G8_TYPELESS);
+    run_depth24_clears(host_typeless, host.p, few, tb, DXGI_FORMAT_R24G8_TYPELESS);
+    const int typeless = compare("R24G8_TYPELESS clears", ta, tb);
+    if (!typeless) std::printf("depth24 typeless: R24G8_TYPELESS with a D24 DSV, %zu values, match the host\n", few.size());
+    r += typeless;
+
+    // Copies under a predicate that would skip them (the layer does not predicate copies; the host run does not set one).
+    Outcome pa, pb, plain;
+    Run ours_predicated, ours_plain, host_run2;
+    if (!ours_predicated.init(ours, true) || !ours_plain.init(ours, true) || !host_run2.init(host.p, false)) return r + 1;
+    run_depth24_predicated(host_run2, host.p, false, pb);
+    run_depth24_predicated(ours_plain, host.p, false, plain);
+    r += compare("D24 copies", plain, pb);
+    run_depth24_predicated(ours_predicated, host.p, true, pa);
+    if (!pa.error.empty() && pa.error.find("ReplayResult") != std::string::npos) {
+        std::printf("depth24 predicated copies: the device has no conditional rendering, skipped (%s)\n", pa.error.c_str());
+    } else {
+        const int predicated = compare("D24 copies under a false predicate", pa, pb);
+        if (!predicated) std::printf("depth24 predicated copies: upload and readback under a skipping predicate match the host's unpredicated run\n");
+        r += predicated;
+    }
     return r;
 }
 

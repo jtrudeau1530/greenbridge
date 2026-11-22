@@ -144,14 +144,15 @@ public:
 
     // D24_UNORM_S8_UINT stored as D32: copies of its depth plane run a compute pass (vulkan_depth24.h). `allocate`
     // gives the scratch buffers device-local memory. Without this such a copy is refused as unsupported.
-    void enable_depth24(PFN_vkGetDeviceProcAddr get, Depth24Converter::Allocate allocate) {
+    void enable_depth24(PFN_vkGetDeviceProcAddr get, Depth24Converter::Allocate allocate,
+                       std::uint64_t max_storage_range = 1u << 27) {
         std::lock_guard lock(mutex_);
-        depth24_ = std::make_unique<Depth24Converter>(get, device_, std::move(allocate));
+        depth24_ = std::make_unique<Depth24Converter>(get, device_, std::move(allocate), max_storage_range);
         if (!depth24_->loaded()) {
             depth24_.reset();
             return;
         }
-        replay_.depth24_prepare = [this](Depth24Job& job) { return depth24_->prepare(job); };
+        replay_.depth24_prepare = [this](Depth24Job& job, std::vector<Depth24Job>& parts) { return depth24_->prepare(job, parts); };
         replay_.depth24_run = [this](VkCommandBuffer command_buffer, const Depth24Job& job) {
             depth24_->run(command_buffer, job);
         };

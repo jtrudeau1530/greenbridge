@@ -591,7 +591,7 @@ struct ReplayFunctions {
     std::function<VkImageView(const ResourceBinding&, const VkImageSubresourceRange&)> image_view;
     // Footprint copies of a depth24_as_float texture (depth24.h): `depth24_prepare` makes the scratch and descriptors
     // for a job while the list is checked, `depth24_run` records its dispatch. Without them such a copy is unsupported.
-    std::function<bool(Depth24Job&)> depth24_prepare;
+    std::function<bool(Depth24Job&, std::vector<Depth24Job>&)> depth24_prepare;  // whole copy in, dispatches out
     std::function<void(VkCommandBuffer, const Depth24Job&)> depth24_run;
     bool separate_depth_stencil_layouts = false;  // must match the LayoutTracker, if one is used
 };
@@ -623,7 +623,8 @@ struct Prepared {
     std::vector<VkImageCopy> image_copies;
     VkImageResolve resolve{};  // resolves
     bool has_depth24 = false;  // a depth plane copy of a depth24_as_float texture: convert through depth24
-    Depth24Job depth24;
+    Depth24Job depth24;                    // the whole copy: where its scratch floats are
+    std::vector<Depth24Job> depth24_parts;  // the dispatches that convert it
 };
 
 // ClearRenderTargetView takes FLOATs even for integer RTVs. For the UINT formats currently exposed by
@@ -1173,7 +1174,7 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                     job.slices = region.imageExtent.depth;
                     job.app_row_words = region.bufferRowLength ? region.bufferRowLength : job.width;
                     job.app_slice_words = job.app_row_words * (region.bufferImageHeight ? region.bufferImageHeight : job.height);
-                    if (!vk.depth24_prepare || !vk.depth24_run || !vk.depth24_prepare(job)) return ReplayResult::unsupported;
+                    if (!vk.depth24_prepare || !vk.depth24_run || !vk.depth24_prepare(job, p.depth24_parts)) return ReplayResult::unsupported;
                     p.has_depth24 = true;
                 }
             } else {
@@ -1209,6 +1210,14 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
     const bool separate = vk.separate_depth_stencil_layouts;
     const VulkanAccess transfer_dst = vulkan_access(d3d12_state::copy_dest, false);
     bool conditional_rendering = false;  // inside vkCmdBeginConditionalRenderingEXT
+    VkConditionalRenderingBeginInfoEXT predicate{VK_STRUCTURE_TYPE_CONDITIONAL_RENDERING_BEGIN_INFO_EXT};
+    // A dispatch honours conditional rendering and a copy does not (the layer runs copies unpredicated), so the
+    // conversion around a copy must run whatever the predicate says: end it for the dispatch and begin it again.
+    const auto run_depth24 = [&](const Depth24Job& job) {
+        if (conditional_rendering) vk.end_conditional_rendering(command_buffer);
+        vk.depth24_run(command_buffer, job);
+        if (conditional_rendering) vk.begin_conditional_rendering(command_buffer, &predicate);
+    };
 
     for (std::size_t i = 0; i < commands.size(); ++i) {
         const auto& command = commands[i];
@@ -1218,14 +1227,13 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             if (conditional_rendering) vk.end_conditional_rendering(command_buffer);
             conditional_rendering = predication->buffer != 0;
             if (conditional_rendering) {
-                VkConditionalRenderingBeginInfoEXT begin{VK_STRUCTURE_TYPE_CONDITIONAL_RENDERING_BEGIN_INFO_EXT};
-                begin.buffer = p.binding.buffer;
-                begin.offset = predication->offset;
+                predicate.buffer = p.binding.buffer;
+                predicate.offset = predication->offset;
                 // Vulkan discards the commands when the word is 0, which is EQUAL_ZERO; INVERTED gives NOT_EQUAL_ZERO.
-                begin.flags = predication->op == d3d12_predication::not_equal_zero
-                                  ? VK_CONDITIONAL_RENDERING_INVERTED_BIT_EXT
-                                  : 0;
-                vk.begin_conditional_rendering(command_buffer, &begin);
+                predicate.flags = predication->op == d3d12_predication::not_equal_zero
+                                      ? VK_CONDITIONAL_RENDERING_INVERTED_BIT_EXT
+                                      : 0;
+                vk.begin_conditional_rendering(command_buffer, &predicate);
             }
             continue;
         }
@@ -1414,7 +1422,7 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                     detail::memory_barrier(vk, command_buffer, VK_ACCESS_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
                                            VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
                                            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
-                    vk.depth24_run(command_buffer, p.depth24);
+                    for (const auto& part : p.depth24_parts) run_depth24(part);
                     detail::memory_barrier(vk, command_buffer, VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                                            VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
                     converted = p.buffer_image_copies;
@@ -1446,7 +1454,7 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                     detail::memory_barrier(vk, command_buffer, VK_ACCESS_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
                                            VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
                                            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
-                    vk.depth24_run(command_buffer, p.depth24);
+                    for (const auto& part : p.depth24_parts) run_depth24(part);
                     detail::memory_barrier(vk, command_buffer, VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                                            VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
                                            VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);

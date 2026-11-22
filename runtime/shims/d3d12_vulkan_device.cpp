@@ -1019,9 +1019,18 @@ public:
                                                                   info.conditional_rendering);
         if (info.host_image_copy) load_host_image_copy(get_device);
         // The copies of a D24 texture stored as D32 convert on the GPU (vulkan_depth24.h).
+        std::uint64_t max_storage_range = 1u << 27;  // the least Vulkan allows, if the limit cannot be read
+        if (info.physical && info.get_instance_proc) {
+            if (const auto get_props = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(
+                    info.get_instance_proc(info.instance, "vkGetPhysicalDeviceProperties"))) {
+                VkPhysicalDeviceProperties props{};
+                get_props(info.physical, &props);
+                max_storage_range = props.limits.maxStorageBufferRange;
+            }
+        }
         state_.context->enable_depth24(get_device, [this](const VkMemoryRequirements& requirements) {
             return state_.allocate(requirements, 0, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-        });
+        }, max_storage_range);
         if (info.bindless && state_.context->loaded() && !create_bindless(get_device))
             std::fprintf(stderr, "[rt] d3d12: the bindless set 0 could not be created\n");
     }

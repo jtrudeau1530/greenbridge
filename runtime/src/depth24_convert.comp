@@ -20,7 +20,7 @@ layout(push_constant) uniform Push {
     uint app_base;   // first word of the region in `app`, within the bound window
     uint app_row;    // words between rows and between slices of the app buffer
     uint app_slice;
-    uint unused;
+    uint scratch_base;  // first word of the region in `scratch`, within the bound window
 } pc;
 
 // d / (2^24 - 1) as a float. With m the 24-bit mantissa of d (d = m * 2^(e-23)) the quotient is
@@ -46,7 +46,7 @@ void main() {
     uvec3 g = gl_GlobalInvocationID;
     if (g.x >= pc.width || g.y >= pc.height || g.z >= pc.slices) return;
     uint a = pc.app_base + g.z * pc.app_slice + g.y * pc.app_row + g.x;
-    uint s = (g.z * pc.height + g.y) * pc.width + g.x;
+    uint s = pc.scratch_base + (g.z * pc.height + g.y) * pc.width + g.x;
     if (pc.to_float != 0u) scratch[s] = floatBitsToUint(depth24_to_float(app[a] & 0xffffffu));
     else app[a] = depth24_from_float(uintBitsToFloat(scratch[s]));
 }

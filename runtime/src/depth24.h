@@ -16,8 +16,17 @@ namespace leonida {
 
 inline constexpr std::uint32_t depth24_max = 0xffffff;
 
-// The conversion of a float to a 24-bit UNORM as WARP and AMD's D3D12 drivers do it (measured against both, 159
-// clear values and ties included, in d3d12_depth24_compare.h): NaN and values below 0 give 0, 1 and above the
+// What the D3D11.3 functional spec says (3.2.3.6, FLOAT -> UNORM, which D3D12 inherits): NaN is 0; above 1.0f, INF
+// included, is 1.0f and below 0.0f is 0.0f; then c = c * (2^n - 1) "in float", c = c + 0.5f, and the fraction is
+// dropped; the conversion has a tolerance of 0.6 ULP on the integer side ("exact (1/2 ULP) conversion precision is
+// acknowledged to be too expensive") and must be non-decreasing with every output attainable. Read literally, a tie
+// goes up (2.5 -> 3). The spec's general rule (3.2.2) names round-to-nearest for FLOAT -> UNORM as an exception to
+// round-to-nearest-even, so the spec does not fix ties. What WARP and AMD's D3D12 driver do was measured: they
+// round the float product to nearest even (2.5 -> 2, 0.5 -> 0), which the tolerance allows; NVIDIA's differ at
+// ties. That is a measurement of those two implementations, not a rule of the spec.
+//
+// The conversion of a float to a 24-bit UNORM as WARP and AMD's D3D12 drivers do it (measured against both, 5215
+// clear values, ties and their neighbours included, in d3d12_depth24_compare.h): NaN and values below 0 give 0, 1 and above the
 // maximum, anything in between multiplies by 2^24 - 1 in float (a rounded product, so a value a hair over a tie can
 // land on it) and then rounds to nearest, ties to even (std::nearbyint's default mode). NVIDIA's D3D12 driver breaks
 // some of those ties the other way, and its Vulkan driver, which has a native D24, agrees with it; a texture the
@@ -54,6 +63,7 @@ struct Depth24Job {
     VkDeviceSize scratch_offset = 0;
     VkDescriptorSet set = VK_NULL_HANDLE;
     std::uint32_t app_base_words = 0;   // the region's first word in the descriptor's window
+    std::uint32_t scratch_base_words = 0;  // and the scratch's
 };
 
 }  // namespace leonida

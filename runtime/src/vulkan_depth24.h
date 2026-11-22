@@ -25,8 +25,9 @@ public:
     // A device-local allocation for the scratch buffers; null on failure.
     using Allocate = std::function<VkDeviceMemory(const VkMemoryRequirements&)>;
 
-    Depth24Converter(PFN_vkGetDeviceProcAddr get, VkDevice device, Allocate allocate)
-        : device_(device), allocate_(std::move(allocate)) {
+    // `max_range`: the device's maxStorageBufferRange; a copy is split into dispatches that stay inside it.
+    Depth24Converter(PFN_vkGetDeviceProcAddr get, VkDevice device, Allocate allocate, std::uint64_t max_range = 1u << 27)
+        : device_(device), allocate_(std::move(allocate)), max_range_(max_range) {
         loaded_ = vk_.load(get, device);
     }
 
@@ -46,47 +47,64 @@ public:
 
     bool loaded() const { return loaded_; }
 
-    // Everything the next submission needs for this job: the pipeline (once), a scratch region (unless the job brings
-    // its own scratch buffer, as a test does) and a descriptor set over the application's buffer and the scratch.
-    bool prepare(Depth24Job& job) {
-        constexpr std::uint64_t window_alignment = 256;  // the largest minStorageBufferOffsetAlignment Vulkan allows
-        constexpr std::uint64_t maximum_range = 1u << 27;  // maxStorageBufferRange is at least this
-        if (!loaded_ || !make_pipeline() || !job.app || !job.width || !job.height || !job.slices || job.app_offset % 4 ||
-            job.app_row_words < job.width || job.app_slice_words < std::uint64_t(job.app_row_words) * (job.height - 1) + job.width)
+    // Everything the next submission needs for a copy: the pipeline (once), a tightly packed scratch region for the
+    // whole copy (unless `whole` brings its own scratch buffer, as a test does; its scratch_offset is then the region's
+    // start) and the dispatches, `parts`, each with a descriptor set over windows of the application's buffer and the
+    // scratch. A part covers as many slices as fit one storage buffer range, or rows of one slice when a slice alone is
+    // larger, so no copy is too big for the device. `whole.scratch` and `whole.scratch_offset` tell the copy where
+    // the floats are.
+    bool prepare(Depth24Job& whole, std::vector<Depth24Job>& parts) {
+        if (!loaded_ || !make_pipeline() || !whole.app || !whole.width || !whole.height || !whole.slices ||
+            whole.app_offset % 4 || whole.app_row_words < whole.width ||
+            whole.app_slice_words < std::uint64_t(whole.app_row_words) * (whole.height - 1) + whole.width)
             return false;
-        const std::uint64_t span_words = std::uint64_t(job.slices - 1) * job.app_slice_words +
-                                         std::uint64_t(job.height - 1) * job.app_row_words + job.width;
-        const std::uint64_t window = job.app_offset / window_alignment * window_alignment;
-        const std::uint64_t range = job.app_offset - window + span_words * 4;
-        if (window + range > job.app_size || range > maximum_range) return false;
-        job.app_base_words = std::uint32_t((job.app_offset - window) / 4);
+        const std::uint64_t w = whole.width, h = whole.height, s = whole.slices;
+        const std::uint64_t span_words = (s - 1) * whole.app_slice_words + (h - 1) * whole.app_row_words + w;
+        if (whole.app_offset + span_words * 4 > whole.app_size) return false;
+        if (!whole.scratch && !scratch(w * h * s * 4, whole.scratch, whole.scratch_offset)) return false;
 
-        const std::uint64_t scratch_bytes = std::uint64_t(job.width) * job.height * job.slices * 4;
-        if (!job.scratch) {
-            if (!scratch(scratch_bytes, job.scratch, job.scratch_offset)) return false;
+        // A window starts at a multiple of 256 (the largest minStorageBufferOffsetAlignment), which costs up to 252 bytes.
+        constexpr std::uint64_t slack = 256;
+        const std::uint64_t limit = max_range_;
+        const auto app_bytes = [&](std::uint64_t slices, std::uint64_t rows) {
+            return ((slices - 1) * whole.app_slice_words + (rows - 1) * whole.app_row_words + w) * 4 + slack;
+        };
+        const auto scratch_bytes = [&](std::uint64_t slices, std::uint64_t rows) { return slices * rows * w * 4 + slack; };
+        std::uint64_t slices_per_part = 0;  // 0: a slice alone is too big
+        while (slices_per_part < s && app_bytes(slices_per_part + 1, h) <= limit && scratch_bytes(slices_per_part + 1, h) <= limit)
+            ++slices_per_part;
+        std::uint64_t rows_per_part = h;
+        if (!slices_per_part) {
+            rows_per_part = 0;
+            while (rows_per_part < h && app_bytes(1, rows_per_part + 1) <= limit && scratch_bytes(1, rows_per_part + 1) <= limit)
+                ++rows_per_part;
+            if (!rows_per_part) return false;
         }
-        job.set = allocate_set();
-        if (!job.set) return false;
-        const VkDescriptorBufferInfo buffers[2] = {{job.app, window, range}, {job.scratch, job.scratch_offset, scratch_bytes}};
-        VkWriteDescriptorSet writes[2]{};
-        for (std::uint32_t i = 0; i < 2; ++i) {
-            writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-            writes[i].dstSet = job.set;
-            writes[i].dstBinding = i;
-            writes[i].descriptorCount = 1;
-            writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-            writes[i].pBufferInfo = &buffers[i];
+        parts.clear();
+        for (std::uint64_t z = 0; z < s;) {
+            const std::uint64_t n = slices_per_part ? std::min(slices_per_part, s - z) : 1;
+            for (std::uint64_t y = 0; y < h; y += rows_per_part) {
+                const std::uint64_t rows = std::min(rows_per_part, h - y);
+                Depth24Job part = whole;
+                part.slices = std::uint32_t(n);
+                part.height = std::uint32_t(rows);
+                part.app_offset = whole.app_offset + (z * whole.app_slice_words + y * whole.app_row_words) * 4;
+                part.scratch_offset = whole.scratch_offset + ((z * h + y) * w) * 4;
+                if (!make_part(part, whole.app_size)) return false;
+                parts.push_back(part);
+            }
+            z += n;
         }
-        vk_.vkUpdateDescriptorSets(device_, 2, writes, 0, nullptr);
         return true;
     }
+
 
     // Records the dispatch. The caller records the barriers around it.
     void run(VkCommandBuffer command_buffer, const Depth24Job& job) const {
         struct Push {
-            std::uint32_t width, height, slices, to_float, app_base, app_row, app_slice, unused;
+            std::uint32_t width, height, slices, to_float, app_base, app_row, app_slice, scratch_base;
         } push{job.width, job.height, job.slices, job.to_float ? 1u : 0u, job.app_base_words, job.app_row_words,
-               job.app_slice_words, 0};
+               job.app_slice_words, job.scratch_base_words};
         vk_.vkCmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_);
         vk_.vkCmdBindDescriptorSets(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_layout_, 0, 1, &job.set, 0,
                                     nullptr);
@@ -206,7 +224,43 @@ private:
             ok = vk_.vkCreateComputePipelines(device_, VK_NULL_HANDLE, 1, &info, nullptr, &pipeline_) == VK_SUCCESS;
         }
         if (module) vk_.vkDestroyShaderModule(device_, module, nullptr);
+        if (!ok) {  // leave nothing half made; the next call tries again
+            if (pipeline_layout_) vk_.vkDestroyPipelineLayout(device_, pipeline_layout_, nullptr);
+            if (set_layout_) vk_.vkDestroyDescriptorSetLayout(device_, set_layout_, nullptr);
+            pipeline_layout_ = VK_NULL_HANDLE;
+            set_layout_ = VK_NULL_HANDLE;
+        }
         return ok;
+    }
+
+    // The descriptor set of one dispatch: windows of the application's buffer and of the scratch, each starting at
+    // a multiple of 256 bytes, with the part's first word given to the shader as a base.
+    bool make_part(Depth24Job& part, std::uint64_t app_size) {
+        constexpr std::uint64_t alignment = 256;
+        const std::uint64_t span = ((std::uint64_t(part.slices) - 1) * part.app_slice_words +
+                                    (std::uint64_t(part.height) - 1) * part.app_row_words + part.width) * 4;
+        const std::uint64_t window = part.app_offset / alignment * alignment;
+        const std::uint64_t range = part.app_offset - window + span;
+        const std::uint64_t tight = std::uint64_t(part.width) * part.height * part.slices * 4;
+        const std::uint64_t scratch_window = part.scratch_offset / alignment * alignment;
+        const std::uint64_t scratch_range = part.scratch_offset - scratch_window + tight;
+        if (window + range > app_size) return false;
+        part.app_base_words = std::uint32_t((part.app_offset - window) / 4);
+        part.scratch_base_words = std::uint32_t((part.scratch_offset - scratch_window) / 4);
+        part.set = allocate_set();
+        if (!part.set) return false;
+        const VkDescriptorBufferInfo buffers[2] = {{part.app, window, range}, {part.scratch, scratch_window, scratch_range}};
+        VkWriteDescriptorSet writes[2]{};
+        for (std::uint32_t i = 0; i < 2; ++i) {
+            writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[i].dstSet = part.set;
+            writes[i].dstBinding = i;
+            writes[i].descriptorCount = 1;
+            writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            writes[i].pBufferInfo = &buffers[i];
+        }
+        vk_.vkUpdateDescriptorSets(device_, 2, writes, 0, nullptr);
+        return true;
     }
 
     VkDescriptorSet allocate_set() {
@@ -290,6 +344,7 @@ private:
 
     VkDevice device_;
     Allocate allocate_;
+    std::uint64_t max_range_;
     Functions vk_;
     bool loaded_ = false;
     VkDescriptorSetLayout set_layout_ = VK_NULL_HANDLE;

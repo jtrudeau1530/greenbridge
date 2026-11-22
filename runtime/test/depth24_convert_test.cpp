@@ -8,6 +8,8 @@
 //      depth24_quantize;
 //   4. a pitched copy (row and slice strides larger than the extent, an offset into the buffer): only the texels of
 //      the region change, to the right values.
+// The pass is tested on the device the Vulkan loader picks (VK_LOADER_DRIVERS_SELECT='*amd*' or '*nv*'); it needs no
+// GPU without D24. Steps 3 and 4 use converters with a 1 MiB and a 1 KiB storage range, so copies split into dispatches.
 // Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation; any validation error fails the test.
 #include "vk_test_device.h"
 #include "../src/vulkan_depth24.h"
@@ -50,6 +52,10 @@ int main() {
     // The converter allocates nothing here (every job brings its scratch buffer), but the callback must exist.
     Depth24Converter converter(gpu.device_proc, gpu.device, [](const VkMemoryRequirements&) { return VK_NULL_HANDLE; });
     EXPECT(converter.loaded());
+    // The same pass with a 1 MiB storage range: a copy must split into slices or rows that each fit it.
+    Depth24Converter small(gpu.device_proc, gpu.device, [](const VkMemoryRequirements&) { return VK_NULL_HANDLE; }, 1u << 20);
+    Depth24Converter tiny(gpu.device_proc, gpu.device, [](const VkMemoryRequirements&) { return VK_NULL_HANDLE; }, 1024);
+    std::size_t last_parts = 0;
 
     constexpr VkBufferUsageFlags usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
                                          VK_BUFFER_USAGE_TRANSFER_DST_BIT;
@@ -59,7 +65,7 @@ int main() {
     EXPECT(app && scratch && app_words && scratch_words);
 
     const auto convert = [&](bool to_float, std::uint32_t width, std::uint32_t height, std::uint32_t slices,
-                             std::uint32_t row_words, std::uint32_t slice_words, std::uint64_t offset) {
+                             std::uint32_t row_words, std::uint32_t slice_words, std::uint64_t offset, int limited = 0) {
         Depth24Job job;
         job.to_float = to_float;
         job.app = app;
@@ -71,9 +77,11 @@ int main() {
         job.app_row_words = row_words;
         job.app_slice_words = slice_words;
         job.scratch = scratch;
-        if (!converter.prepare(job)) return false;
+        std::vector<Depth24Job> parts;
+        if (!(limited == 2 ? tiny : limited ? small : converter).prepare(job, parts)) return false;
+        last_parts = parts.size();
         return gpu.run([&](VkCommandBuffer command_buffer) {
-            converter.run(command_buffer, job);
+            for (const auto& part : parts) converter.run(command_buffer, part);
             VkMemoryBarrier host{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
             host.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
             host.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
@@ -130,7 +138,8 @@ int main() {
         }
         std::memset(app_words, 0xcd, std::size_t(words) * 4);
         std::vector<std::uint32_t> input(scratch_words, scratch_words + words);
-        EXPECT(convert(false, 4096, 4096, 1, 4096, 4096u * 4096u, 0));
+        EXPECT(convert(false, 4096, 4096, 1, 4096, 4096u * 4096u, 0, 1));
+        EXPECT(last_parts > 32);
         wrong = 0;
         for (std::uint32_t i = 0; i < words; ++i) {
             const std::uint32_t want = depth24_quantize(as_float(input[i]));
@@ -151,7 +160,8 @@ int main() {
             for (std::uint32_t y = 0; y < h; ++y)
                 for (std::uint32_t x = 0; x < w; ++x)
                     scratch_words[(z * h + y) * w + x] = as_bits(depth24_to_float((z * 1000 + y * 100 + x) * 5000u + 1));
-        EXPECT(convert(false, w, h, s, row, slice, offset));
+        EXPECT(convert(false, w, h, s, row, slice, offset, 2));
+        EXPECT(last_parts == 6);  // 1 KiB holds three rows of a slice: two parts a slice, three slices
         for (std::uint32_t i = 0; i < 4096; ++i) {
             const std::uint32_t rel = i - std::uint32_t(offset / 4);
             const bool inside = i >= offset / 4 && rel / slice < s && (rel % slice) / row < h && (rel % slice) % row < w;
@@ -164,7 +174,7 @@ int main() {
         }
         // And upload from the same layout: the words come out in the scratch, tightly packed.
         std::memset(scratch_words, 0xcd, 4096 * 4);
-        EXPECT(convert(true, w, h, s, row, slice, offset));
+        EXPECT(convert(true, w, h, s, row, slice, offset, 2));
         for (std::uint32_t z = 0; z < s; ++z)
             for (std::uint32_t y = 0; y < h; ++y)
                 for (std::uint32_t x = 0; x < w; ++x) {
