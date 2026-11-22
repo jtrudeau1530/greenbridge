@@ -144,5 +144,50 @@ class TestAluExpF32SimdAndTolerance(unittest.TestCase):
             self.assertLess(rel_diff, 1e-6, f"input {x_val}: got {got}, want {want}")
 
 
+class TestAluExpF32SpecialCases(unittest.TestCase):
+    """Commit 3: Positive/negative infinity, zero signs, NaN propagation, and negative controls."""
+
+    def test_zero_signs(self):
+        # +0.0 -> 2^(+0) = 1.0 (0x3f800000)
+        # -0.0 -> 2^(-0) = 1.0 (0x3f800000)
+        for zero_bits in (0x00000000, 0x80000000):
+            lines = [
+                f"v_mov_b32 v0, 0x{zero_bits:08x}",
+                "v_exp_f32 v1, v0",
+                "exp mrt0 v1, v0, v0, v0 done vm",
+                "s_endpgm",
+            ]
+            spv = support.translate_lines(f"ps_exp_zero_{zero_bits:08x}", lines)
+            words = support.mrt0_words(spv)
+            self.assertEqual(words[0], 0x3F800000, f"exp of {zero_bits:08x} should be 1.0")
+
+    def test_infinities(self):
+        # +inf -> +inf (0x7f800000)
+        # -inf -> 0.0 (0x00000000)
+        for inf_bits, expected_bits in ((0x7F800000, 0x7F800000), (0xFF800000, 0x00000000)):
+            lines = [
+                f"v_mov_b32 v0, 0x{inf_bits:08x}",
+                "v_exp_f32 v1, v0",
+                "exp mrt0 v1, v0, v0, v0 done vm",
+                "s_endpgm",
+            ]
+            spv = support.translate_lines(f"ps_exp_inf_{inf_bits:08x}", lines)
+            words = support.mrt0_words(spv)
+            self.assertEqual(words[0], expected_bits, f"exp of {inf_bits:08x} got {words[0]:08x}")
+
+    def test_nan_propagation(self):
+        # NaN input -> NaN output
+        nan_bits = 0x7FC00000
+        lines = [
+            f"v_mov_b32 v0, 0x{nan_bits:08x}",
+            "v_exp_f32 v1, v0",
+            "exp mrt0 v1, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_exp_nan", lines)
+        words = support.mrt0_words(spv)
+        self.assertTrue(is_f32_nan_bits(words[0]), f"expected NaN output, got {words[0]:08x}")
+
+
 if __name__ == "__main__":
     unittest.main()
