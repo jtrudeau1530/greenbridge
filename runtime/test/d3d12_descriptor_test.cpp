@@ -416,7 +416,7 @@ int main() {
         EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &sampled_desc,
                                                          D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
                                                          IID_PPV_ARGS(&texture.p))));
-        const auto upload_desc = buffer_desc(65536, D3D12_RESOURCE_FLAG_NONE);
+        const auto upload_desc = buffer_desc(131072, D3D12_RESOURCE_FLAG_NONE);
         EXPECT(SUCCEEDED(device->CreateCommittedResource(&upload_heap, D3D12_HEAP_FLAG_NONE, &upload_desc,
                                                          D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
                                                          IID_PPV_ARGS(&upload.p))));
@@ -506,15 +506,16 @@ int main() {
             for (UINT x = 0; x < mip_size; ++x) row[x] = std::uint8_t(208 + y * mip_size + x);
         }
 
-        // Three layers with three distinct mip colours each. The test views start at layer 1 and mip 1.
+        // Three cubes with distinct colours for each face and mip. The 2D array views use layers 1 and 2.
         auto array_desc = sampled_desc;
         array_desc.Width = array_desc.Height = 4;
-        array_desc.DepthOrArraySize = 3;
+        constexpr UINT face_count = 18;
+        array_desc.DepthOrArraySize = face_count;
         Ref<ID3D12Resource> array_texture;
         EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &array_desc,
                                                          D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
                                                          IID_PPV_ARGS(&array_texture.p))));
-        D3D12_PLACED_SUBRESOURCE_FOOTPRINT array_levels[9]{};
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT array_levels[face_count * 3]{};
         device->GetCopyableFootprints(&array_desc, 0, UINT(std::size(array_levels)), 49152, array_levels,
                                       nullptr, nullptr, nullptr);
         const auto array_color = [](UINT layer, UINT mip) {
@@ -541,10 +542,16 @@ int main() {
         };
         constexpr UINT first_lod_slot = 10;
         constexpr float array_clamps[] = {1.0f, 1.75f, 2.0f, 2.25f};
+        struct CubeLodView { D3D12_SRV_DIMENSION dimension; UINT first_face, faces, minimum_mip; };
+        constexpr CubeLodView cube_lods[] = {
+            {D3D12_SRV_DIMENSION_TEXTURECUBE, 0, 6, 1}, {D3D12_SRV_DIMENSION_TEXTURECUBE, 0, 6, 2},
+            {D3D12_SRV_DIMENSION_TEXTURECUBEARRAY, 6, 12, 1}, {D3D12_SRV_DIMENSION_TEXTURECUBEARRAY, 6, 12, 2},
+        };
         // Keep multisample views after the preceding volume and minimum-LOD views.
         enum : UINT {
             array_lod_slot = first_lod_slot + std::size(lod_views),
-            ms_slot = array_lod_slot + std::size(array_clamps), ms_array_slot, ms_slice_slot, ms_first_layer_slot,
+            cube_lod_slot = array_lod_slot + std::size(array_clamps),
+            ms_slot = cube_lod_slot + std::size(cube_lods), ms_array_slot, ms_slice_slot, ms_first_layer_slot,
             ms_uint_slot, ms_uint_array_slot, ms_sint_slot, ms_sint_array_slot, view_slot_count
         };
         D3D12_DESCRIPTOR_HEAP_DESC heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, view_slot_count,
@@ -565,6 +572,19 @@ int main() {
             srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
             srv.Texture2DArray = {1, 2, 1, 2, 0, array_clamps[i]};
             device->CreateShaderResourceView(array_texture.p, &srv, view_slot(array_lod_slot + i));
+        }
+
+        for (UINT i = 0; i < std::size(cube_lods); ++i) {
+            const auto& cube_lod = cube_lods[i];
+            D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+            srv.Format = array_desc.Format;
+            srv.ViewDimension = cube_lod.dimension;
+            srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            if (cube_lod.dimension == D3D12_SRV_DIMENSION_TEXTURECUBE)
+                srv.TextureCube = {1, 2, float(cube_lod.minimum_mip)};
+            else
+                srv.TextureCubeArray = {1, 2, cube_lod.first_face, cube_lod.faces / 6, float(cube_lod.minimum_mip)};
+            device->CreateShaderResourceView(array_texture.p, &srv, view_slot(cube_lod_slot + i));
         }
 
         for (UINT i = 0; i < std::size(lod_views); ++i) {
@@ -1311,6 +1331,35 @@ int main() {
         lod_mismatches += array_mismatches;
         std::printf("array minimum LOD: %u/%u samples matched across two layers and four views\n",
                     UINT(array_pixels.size() / 4) - array_mismatches, UINT(array_pixels.size() / 4));
+
+        SampleKeys cube_keys[std::size(cube_lods)]{};
+        std::array<std::uint8_t, std::size(cube_lods) * bytes> cube_pixels{};
+        for (UINT i = 0; i < std::size(cube_lods); ++i) {
+            cube_keys[i] = keys[0];
+            std::memcpy(cube_keys[i].tsharp, view_bytes(cube_lod_slot + i), sizeof(cube_keys[i].tsharp));
+            cube_keys[i].layer = cube_lods[i].faces;
+            cube_keys[i].first = i * texels;
+        }
+        EXPECT(sample_through_set(d, set0, set0_layout, cube_keys, cube_pixels.data()));
+        UINT cube_errors = 0;
+        for (UINT view = 0; view < std::size(cube_lods); ++view) {
+            const auto& v = cube_lods[view];
+            UINT errors = 0;
+            for (UINT i = 0; i < texels; ++i) {
+                const UINT face = v.first_face + i % v.faces;
+                const auto want = v.minimum_mip == 1 || d.image_view_min_lod
+                    ? array_color(face, v.minimum_mip) : std::array<std::uint8_t, 4>{};
+                const auto* sample = cube_pixels.data() + (view * texels + i) * 4;
+                if (std::memcmp(sample, want.data(), 4) && errors++ == 0)
+                    std::fprintf(stderr, "cube view %u, face %u, min mip %u: got %u,%u,%u,%u; expected %u,%u,%u,%u\n",
+                                 view, face, v.minimum_mip, sample[0], sample[1], sample[2], sample[3],
+                                 want[0], want[1], want[2], want[3]);
+            }
+            cube_errors += errors;
+        }
+        lod_mismatches += cube_errors;
+        std::printf("cube minimum LOD: %u/%u samples matched across cube and cube-array views\n",
+                    UINT(cube_pixels.size() / 4) - cube_errors, UINT(cube_pixels.size() / 4));
 
         const D3D12_CPU_DESCRIPTOR_HANDLE volume_slots[] = {view_slot(volume_all), view_slot(volume_mip),
                                                             linear_slot, srgb_slot};
