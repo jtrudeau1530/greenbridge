@@ -1594,7 +1594,7 @@ class Gen:
                 self.dst({"k": "vgpr", "r": vd["r"] + c, "n": 1}, rb)
         if d16:
             # d16: two 16-bit results per register (x | y << 16, z | w << 16): f16 for float/normalized formats,
-            # the low 16 bits for integer formats (FORMATS kinds u32/uint).
+            # saturating unsigned conversion for integer formats (FORMATS kinds u32/uint).
             is_int = "%false"
             for code_v, (_, kind, _) in self.FORMATS.items():
                 if kind in ("u32", "uint"):
@@ -1605,8 +1605,8 @@ class Gen:
             for i in range(0, len(outs), 2):
                 dest = {"k": "vgpr", "r": vd["r"] + i // 2, "n": 1}
                 lo = outs[i]
-                il, r = self.tmp(), self.tmp()
-                self.emit(f"{il} = OpBitwiseAnd %uint {lo} {self.cu(0xFFFF)}")
+                il = self.saturate_int16(lo, signed=False)
+                r = self.tmp()
                 if i + 1 == len(outs):
                     # For d16_x and d16_xyz the unaddressed high half keeps its previous bits.
                     fl = self.f16_bits(self.tof(lo))
@@ -1616,7 +1616,8 @@ class Gen:
                 hi = outs[i + 1]
                 ph = self.pack_f16_pair_int(self.tof(lo), self.tof(hi))
                 ih, pi = self.tmp(), self.tmp()
-                self.emit(f"{ih} = OpShiftLeftLogical %uint {hi} {self.cu(16)}")
+                high_half = self.saturate_int16(hi, signed=False)
+                self.emit(f"{ih} = OpShiftLeftLogical %uint {high_half} {self.cu(16)}")
                 self.emit(f"{pi} = OpBitwiseOr %uint {il} {ih}")
                 self.emit(f"{r} = OpSelect %uint {is_int} {pi} {ph}")
                 self.dst(dest, r)
