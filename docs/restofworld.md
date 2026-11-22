@@ -408,9 +408,51 @@ bindings are reported as unresolved.
 python -I tools/meshlet_page.py <graphics-segment> --draw-system <system-segment> --drawable-offset <offset>
 ```
 
+**Component types (full corpus).** `tools/vertex_types.py` (at `1aef69e`, with the running-sum fix to
+`group_edges`) was run over the seven archives that hold target blocks: `data`, `packs`, `levels`, `story000`,
+`core_restofworld`, `shared_minigame000` and `story000_restofworld`. It measures a block only when the
+following meshlet group covers it densely, so it uses **60,442 blocks** (138,929,728 vertices,
+282,704,362 triangle edges) out of the 309,007 target streams; the rest are skipped as "no group" (225,795)
+or "not dense" (22,769), plus one single-stream block. The run before that fix gave the same block and vertex counts and 3,300 fewer
+edges, so none of the conclusions below depend on it.
+
+| Measure | Result |
+|---|---|
+| `+0x5C` flags word | `0x200` in all 60,442 |
+| `+0x7C` float | 4.0 in all 60,442 |
+| `+0x6C` axis word | 2: 30,017, 1: 16,718, 0: 13,707 |
+| Position header (bias, scale) finite, scale >= 0 | 60,442 / 60,442 |
+| Every triangle edge no longer than the block extent | 48,150 / 60,442 |
+
+Slot usage (block counts): slot 0 tag `0x42` in all 60,442; slot 2 `0x21` in 57,925; slot 1 `0x26` in
+57,873; slot 3 `0x28` in 49,294 and slot 4 `0x28` in 29,379; then slot 12 `0x26` (25,239), slot 6 `0x26`
+(24,876), slot 8 `0x25` (21,519), slot 13 `0x26` (17,928), slot 11 `0x27` (11,120) and 21 rarer slot/tag
+pairs, including `0x84` and `0x4b` in slot 17 (5,452 and 3,714).
+
+**Tag `0x28` is two signed 16-bit values.** Over the triangle edges of the slot 3 stream, a difference of more
+than 0x8000 between neighbouring vertices occurs 1,597,530 times when the values are read as unsigned and
+18,791 times when they are read as signed (85 times fewer); slot 4 gives 1,680,055 against 5,570. Read as
+half floats, 1,391,311 slot 3 values are NaN or infinite. So the stream is a pair of `int16`s, continuous across
+the surface, which fits the `x / 32767 * f32@0x7C` texture-coordinate reading.
+
+**Tag `0x26` (slot 1) is four bytes with an alpha-like byte 3.** Byte 3 is 255 on 62.4% of the 137.9 million
+vertices and 0 on 17.2%; each of bytes 0-2 is constant within a block in 36,544 to 38,854 blocks. The bytes
+change smoothly over edges (block-weighted median edge/random difference ratio 0.18 to 0.27), as a colour or
+blend weight would. As a packed normal it scores no better than random directions (below).
+
+**Tag `0x21` (slot 2) is still unsolved.** For each block the tool reads 256 sampled triangles and counts the
+vertices whose decoded vector is within `|cos| > 0.8` of the face normal; random directions score 0.2. Of the
+19 candidate decodings (snorm8/unorm8 xyz, snorm10/unorm10 10:10:10, six octahedral 8- and 16-bit variants,
+and each column of a quaternion tangent frame in three packings), the best block-weighted medians are unorm10 xyz at 0.479
+(per archive 0.318 to 0.667) and octahedral unorm8 bytes 0-1 at 0.331. Every other candidate is between 0.13
+and 0.31. Only 12.1% of vertices are unit length as snorm10 and 7.7% as snorm8. The stream is smooth over
+edges (block-weighted medians 0.46 to 0.71 for bytes 0-2), so it varies with the surface, but none of these
+encodings is a plain per-vertex normal.
+
 Opaque: the encrypted RPF9 tables of contents, the Bink 2 bodies, the `LSNS` payloads, the bodies of the
 `RSC8` headers, the nested RPF9 payloads, and the whole `appdata0` data area. Across the 971
-core graphics blocks, component types and final-slot widths remain unresolved. The stride check
+core graphics blocks, final-slot widths remain unresolved, and of the component types only `0x21`
+(see above). The stride check
 also leaves 436 blocks unclassified, including 18 with a validated following meshlet group.
 "Unread" in the tables above is not a claim that those bytes are empty: in
 `story000_restofworld` the 9.33 MB unread gap contains nine `RSC8` headers and nested RPF9 headers, and

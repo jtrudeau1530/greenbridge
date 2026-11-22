@@ -59,6 +59,7 @@ int check_calibration(ID3D12CommandQueue* queue, double gpu_frequency, const cha
     const UINT64 before1 = qpc();
     EXPECT(SUCCEEDED(queue->GetClockCalibration(&gpu1, &cpu1)));
     const UINT64 after1 = qpc();
+    EXPECT(before1 <= cpu1 && cpu1 <= after1);
     EXPECT(gpu1 > gpu0 && cpu1 > cpu0);
     const double gpu_s = double(gpu1 - gpu0) / gpu_frequency, cpu_s = double(cpu1 - cpu0) / double(qpf.QuadPart);
     std::printf("%s: GPU %.6f s, CPU %.6f s between two calibrations (%.1f us apart)\n", path, gpu_s, cpu_s,

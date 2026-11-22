@@ -2,6 +2,7 @@
 import ast
 import contextlib
 import io
+import json
 import struct
 from pathlib import Path
 import sys
@@ -472,6 +473,33 @@ class Wave32LaneDumps(unittest.TestCase):
         with patch.object(check, "run", return_value=(0, self.words("cs_store"))) as run:
             check.compute_test("tools", "spirv", "cs_store", "1", "dump", expected_words=check.CS_STORE)
         self.assertNotIn("env", run.call_args.kwargs)
+
+    def test_recorded_wave_size_is_requested(self):
+        # cs_barrier_loop is wave32 but not a lane dump: left to the default it ran 64-wide on an RX 9070 (32..64),
+        # two waves instead of four, and failed in check.py while run_gpu_tests.py (which reads index.json) passed.
+        with tempfile.TemporaryDirectory() as tmp:
+            Path(tmp, "index.json").write_text(json.dumps({"cs_barrier_loop": {"subgroup_size": 32},
+                                                           "cs_store": {}}), encoding="utf-8")
+            with patch.object(check, "run", return_value=(0, "out[0..7] = 128 96 64 32 128 96 64 0\n")) as run:
+                self.assertEqual(check.compute_test("tools", tmp, "cs_barrier_loop", "1", "dump",
+                                                    expected_words=[128, 96, 64, 32, 128, 96, 64]), "")
+            self.assertEqual(run.call_args.kwargs["env"]["VKC_SUBGROUP_SIZE"], "32")
+            with patch.object(check, "run", return_value=(0, self.words("cs_store"))) as run:
+                check.compute_test("tools", tmp, "cs_store", "1", "dump", expected_words=check.CS_STORE)
+            self.assertNotIn("env", run.call_args.kwargs)                 # nothing recorded: the default size
+            with patch.object(check, "run", return_value=(0, "out[0..7] = 0 0 0 0 0 0 0 0\n")) as run:
+                check.compute_test("tools", tmp, "cs_barrier_loop", "1", "dump", expected_words=[1],
+                                   env={"VKC_SUBGROUP_SIZE": "64"})
+            self.assertEqual(run.call_args.kwargs["env"]["VKC_SUBGROUP_SIZE"], "64")   # a caller's choice wins
+
+    def test_recorded_wave_size_that_cannot_be_pinned_is_a_skip(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            Path(tmp, "index.json").write_text(json.dumps({"cs_barrier_loop": {"subgroup_size": 32}}),
+                                               encoding="utf-8")
+            out = "compute subgroup size: 32 not available\nout[0..7] = 0 0 0 0 0 0 0 0\n"
+            with patch.object(check, "run", return_value=(0, out)):
+                problem = check.compute_test("tools", tmp, "cs_barrier_loop", "1", "dump", expected_words=[128])
+        self.assertIsInstance(problem, check.Skip)
 
     def test_skipped_when_32_lanes_cannot_be_pinned(self):
         for name in check.WAVE32_LANE_DUMPS:

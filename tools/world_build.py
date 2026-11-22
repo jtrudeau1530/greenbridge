@@ -59,12 +59,24 @@ def _get_world_names():
     return world_names
 
 
+def _placement_scale(value) -> float:
+    """Optional scales that cannot be represented as finite floats use the existing unit default."""
+    if not isinstance(value, (int, float)):
+        return 1.0
+    try:
+        scale = float(value)
+    except OverflowError:
+        return 1.0
+    return scale if math.isfinite(scale) else 1.0
+
+
 def load_placements(path: str, lod_levels=DEFAULT_LOD_LEVELS, region=None) -> tuple[list[dict], dict]:
     """Read ``world_index.py --entities-out`` rows. Returns (selected rows, counts).
 
     A row is kept when its lod_level is in lod_levels and, with region = (minx, miny, maxx, maxy) in RAGE
     world metres, its position lies inside it. Rows without a finite position, rotation or archetype are
-    counted as malformed and skipped.
+    counted as malformed and skipped, as are unhashable LOD values. Optional scales that are missing,
+    non-numeric or not representable as finite floats default to 1.0.
     """
     levels = set(lod_levels)
     counts = {"rows": 0, "malformed": 0, "other_lod_level": 0, "outside_region": 0, "selected": 0}
@@ -80,13 +92,14 @@ def load_placements(path: str, lod_levels=DEFAULT_LOD_LEVELS, region=None) -> tu
                 arch = int(str(row["archetype"]), 16)
                 pos = [float(v) for v in row["position"]]
                 rot = [float(v) for v in row["rotation"]]
-            except (ValueError, KeyError, TypeError):
+                selected_lod = row.get("lod_level") in levels
+            except (ValueError, KeyError, TypeError, OverflowError):
                 counts["malformed"] += 1
                 continue
             if len(pos) != 3 or len(rot) != 4 or not all(math.isfinite(v) for v in pos + rot):
                 counts["malformed"] += 1
                 continue
-            if row.get("lod_level") not in levels:
+            if not selected_lod:
                 counts["other_lod_level"] += 1
                 continue
             if region is not None and not (region[0] <= pos[0] <= region[2] and region[1] <= pos[1] <= region[3]):
@@ -95,8 +108,8 @@ def load_placements(path: str, lod_levels=DEFAULT_LOD_LEVELS, region=None) -> tu
             sxy, sz = row.get("scale_xy"), row.get("scale_z")
             row["_arch"] = arch & 0xFFFFFFFF
             row["_pos"], row["_rot"] = pos, rot
-            row["_sxy"] = float(sxy) if isinstance(sxy, (int, float)) and math.isfinite(sxy) else 1.0
-            row["_sz"] = float(sz) if isinstance(sz, (int, float)) and math.isfinite(sz) else 1.0
+            row["_sxy"] = _placement_scale(sxy)
+            row["_sz"] = _placement_scale(sz)
             rows.append(row)
             counts["selected"] += 1
     return rows, counts

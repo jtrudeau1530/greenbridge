@@ -1552,11 +1552,37 @@ Not implemented yet:
     before each dispatch. Copies and compute dispatches cannot execute inside dynamic rendering, so render-pass
     integration must place the capture outside the rendering scope while preserving capture at `SetPredication`.
     These are requirements for those future integrations, not compute-dispatch or render-pass support added here.
+  `CopyBufferRegion` under a predicate instead uses a byte-granular compute dispatch inside the captured
+  conditional scope; both operations, unaligned offsets and lengths, and the full 64-bit predicate are covered.
+  Zero-byte copies are no-ops, as checked against native WARP. Unpredicated copies retain `vkCmdCopyBuffer`.
+  The compute helper requires enabled Vulkan 1.2 `storageBuffer8BitAccess` (not `shaderInt8`) and a compute queue;
+  without it, preparation rejects the predicated buffer copy rather than executing it unconditionally.
+  Descriptor windows respect storage-buffer alignment/range and dispatch limits, including arena offsets.
+  Copy descriptors are owned by command-buffer slots until the submission timeline completes. Memory dependencies order prior writes,
+  subsequent reads and successive windows. Direct and compute queues support the helper; copy queues reject
+  active predication. Preparation is serialized under the tracker lock, preserving resource -> tracker -> submit
+  lock order and the copy-then-commit tracker. Readback writes accumulate COMPUTE_SHADER for the helper and COPY
+  for ordinary copies; mixed lists accumulate both before main's queue-specific host-stage filtering.
+  This helper also binds compute pipeline/set 0/push constants, so the
+  application-state restoration requirement above applies. A predicated copy inside an active pipeline-statistics
+  query is rejected to avoid counting internal compute work.
+  Synthetic checks: `predicated_copy_test` covers preparation and rejection paths without a GPU;
+  `d3d12_predicated_copy_test` compares 180 byte-exact cases against WARP and an independent literal oracle,
+  plus 16 query-to-copy cases: real empty ordinary/binary occlusion queries resolve zero into a default-heap
+  predicate at offsets 0/16, both predicate operations govern copies, and executing overwrite copies replace zero
+  with a high-word-only value. Four paired controls verify that recapturing the same address changes exactly one
+  13-byte destination region; without recapture, later copies keep using the captured zero. Predicate-buffer guards
+  and all untouched destination bytes are checked too. These query cases do not cover nonzero visible-draw counts;
+  `vk_predicated_copy_test` forces small windows and dispatches, arena prefixes, dependent copies, offset rebinding,
+  reset, 32 gated plus 32 reused submissions, failed-submit cleanup and host stages on all three queue kinds.
+  Binary and overlapping occlusion fixtures also verify that query results resolve under a false predicate while
+  a dedicated copy destination remains unchanged; disabling predication copies into a separate region.
+  The embedded shader is generated from `predicated_copy.comp`
+  with glslang 16.6.0 (`-V --target-env vulkan1.2 -Os`) and validated for Vulkan 1.2.
+
   Open:
-  - Copies and resolves. D3D12 predicates `CopyBufferRegion`, `CopyTextureRegion`, `CopyResource` and
-    `ResolveSubresource`; Vulkan's conditional rendering does not cover transfer commands, so they run
-    unconditionally. `PreparedList::unpredicated_copies` counts them. A fix replays a predicated copy as a compute
-    dispatch, which conditional rendering does cover.
+  - Texture copies, `CopyResource` and resolves. Vulkan's conditional rendering does not cover transfer
+    commands, so these still run unconditionally and `PreparedList::unpredicated_copies` counts them.
 
   - Draws, dispatches and `ExecuteIndirect` are covered by conditional rendering as soon as they are replayed
     (D3D-3, D3D-4, D3D-17); `ClearUnorderedAccessView*` and `ResolveSubresource` need the same check when added.
