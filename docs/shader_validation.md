@@ -336,7 +336,8 @@ python -m pytest tests/test_image_fuzz.py
 ```
 
 Covered: 2D `image_load`, `R8G8B8A8_UNORM`, `R16G16B16A16_SFLOAT`, `R32G32B32A32_SFLOAT`, `R32_SFLOAT`,
-and `R8G8B8A8_UINT`/`SINT` storage images. The shader converts the loaded 8-bit integer values to float for
+and `R8G8B8A8_UINT`/`SINT`, all as sampled images, as the runtime binds a read-only texture (integer formats are
+read through the translator's uint/sint aliases of the sampled array). The shader converts the loaded 8-bit integer values to float for
 readback; every such value is exactly representable, including signed negatives. Wider integers are not covered.
 Texture sizes divide the 64x64 draw (8/16/32/64), so every texel is read at least once. The nonzero masks cycle from
 `0xf` through `0x1`–`0xe`; 90 programs cover all 15 masks for each of the six default formats. Selected channels
@@ -345,10 +346,11 @@ The packing model follows the image VGPR usage description in AMD's
 [RDNA 1.0 ISA guide](https://www.amd.com/content/dam/amd/en/documents/radeon-tech-docs/instruction-set-architectures/rdna-shader-instruction-set-architecture.pdf);
 the Vulkan test compares translated shaders on the host GPU, not native RDNA2 execution.
 
-Devices: the harness needs `fragmentStoresAndAtomics` and both without-format storage-image features, because the
-translated `image_load` declares the uint/sint storage path even when the case reads a float format (the choice is
-made from the T# FORMAT at run time). An Intel UHD 770 (Xe-LP) lacks `shaderStorageImageReadWithoutFormat` and
-skips every case; the harness names the missing feature. Not covered yet: wider UINT/SINT formats, mips, 1D/2D-array/3D/cube,
+Devices: the harness needs `fragmentStoresAndAtomics`, and no without-format storage-image feature: a translated
+`image_load` fetches every format from the sampled arrays, UINT/SINT ones through integer aliases (SHADER-151, the
+"Typed image loads" row of `docs/design.md`). Until then it declared the uint/sint storage path even when the case
+read a float format, so an Intel UHD 770 (Xe-LP), which lacks `shaderStorageImageReadWithoutFormat`, skipped every
+case. Not covered yet: wider UINT/SINT formats, mips, 1D/2D-array/3D/cube,
 `image_sample`/`gather` with filters and borders, and texel offsets with `VK_KHR_maintenance8`.
 
 ### 16-bit and memory ops on the GPU (`tools/valu_fuzz.py`, FUZZ-2, FUZZ-5)

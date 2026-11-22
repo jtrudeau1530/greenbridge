@@ -9,7 +9,8 @@ What this covers today: 2D `image_load`, nonzero `dmask` values, `R8G8B8A8_UNORM
 `R32G32B32A32_SFLOAT` and `R32_SFLOAT`, at sizes that divide the 64x64 draw (8/16/32/64), every texel read
 at least once.
 
-Integer coverage uses 8-bit UINT/SINT storage views and converts loaded integers to exactly representable floats.
+Integer coverage uses 8-bit UINT/SINT sampled images (the translator reads them through uint/sint aliases of the
+sampled array) and converts loaded integers to exactly representable floats.
 Not covered yet: wider integer formats, mips, 1D/2D-array/3D/cube, `image_sample`/`gather` with filters and borders, and texel
 offsets with `VK_KHR_maintenance8`.
 
