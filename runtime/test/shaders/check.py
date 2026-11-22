@@ -210,7 +210,9 @@ CLIP_TESTS = ("vs_clip", "vs_clip_param4", "vs_clip_undeclared")
 # One definition: a later assignment used to drop ps_texoff (and any entry added by an earlier assignment) from
 # the standalone run. Keep every pixel fixture in this tuple.
 PIXEL_TESTS = sorted((*PIXEL_BITS, "ps_bary", "ps_flat", "ps_bitmask_perm", "ps_texoff", "ps_texoff_implicit",
-                      "ps_uniform_branch", "ps_wqm", "ps_scc_mask32"))
+                      "ps_uniform_branch", "ps_wqm", "ps_scc_mask32", "ps_interp_f16_high"))
+# Pixel fixtures drawn with another vertex shader than vs_ids.
+PIXEL_VERTEX = {"ps_interp_f16_high": "vs_f16_pack"}
 TEXOFF_ARGS = ("2", "92", "0", "0", "0")              # ps_texoff: T# pointer in s2, then the shader's literal S#
 TEXTURE_MIP_TEST = "ps_texture_mip0"
 GATHER_LOD_TEST = "ps_gather_sampler_lod"
@@ -327,6 +329,31 @@ def check_mesh_v5(data):
     return f"{len(errors)}/24 mismatches; first {errors[0]}" if errors else ""
 
 
+# LEONIDA_MESH_COMPUTE=1 (for run_gpu_tests.py, which builds the mesh fixtures): the mesh shaders were translated
+# with rdna2spirv.py --mesh-compute, and vk_harness dispatches each as compute and draws its slots with the vertex
+# shader tools/mesh_compute_vs.py wrote (<name>.mesh_vs.spv), so they run without VK_EXT_mesh_shader.
+MESH_COMPUTE = os.environ.get("LEONIDA_MESH_COMPUTE") == "1"
+
+
+def mesh_env(spirv, name, base=None):
+    """vk_harness environment for mesh shader `name`: VKH_MESH=1, or under LEONIDA_MESH_COMPUTE=1 the
+    --mesh-compute variables (vertex shader, slot bytes and primitive count from index.json's mesh_compute)."""
+    env = dict(base if base is not None else os.environ)
+    if MESH_COMPUTE:
+        vs = Path(spirv) / f"{name}.mesh_vs.spv"
+        try:
+            with open(Path(spirv) / "index.json", encoding="utf-8") as f:
+                lay = json.load(f).get(name, {}).get("mesh_compute")
+        except (OSError, ValueError):
+            lay = None
+        if lay and vs.is_file():
+            env.update(VKH_MESH_COMPUTE=str(vs), VKH_MESH_SLOT=str(lay["slot_bytes"]),
+                       VKH_MESH_PRIMS=str(lay["max_primitives"]))
+            return env
+    env["VKH_MESH"] = "1"
+    return env
+
+
 def mesh_v5_test(tools, spirv, raw):
     shader = Path(spirv) / "ms_v5_workgroup.spv"
     if not shader.is_file():
@@ -334,7 +361,8 @@ def mesh_v5_test(tools, spirv, raw):
     fs = Path(spirv) / "fs_passthru.spv"
     if not fs.is_file():
         return "missing fs_passthru.spv"
-    code, out = run(os.path.join(tools, "vk_harness" + EXE), shader, fs, raw, "--mesh-group-readback", "2", "3", "4")
+    code, out = run(os.path.join(tools, "vk_harness" + EXE), shader, fs, raw, "--mesh-group-readback", "2", "3", "4",
+                    env=mesh_env(spirv, "ms_v5_workgroup"))
     if code == UNSUPPORTED:
         return Skip("SKIP (mesh shading unavailable)")
     if code or not raw.is_file():
@@ -443,7 +471,7 @@ def mesh_w64x_test(tools, spirv, name):
     shader, fs = os.path.join(spirv, name + ".spv"), os.path.join(spirv, "fs_passthru.spv")
     if not (os.path.isfile(shader) and os.path.isfile(fs)):
         return Skip("SKIP (mesh shader: build it with scripts/run_gpu_tests.py, build.py does not)")
-    env = dict(os.environ, VKH_MESH="1")
+    env = mesh_env(spirv, name)
     if not W64_EMULATED:
         env["VKH_SUBGROUP_SIZE"] = "64"
     with tempfile.TemporaryDirectory(prefix="leonida-mesh-") as tmp:
@@ -534,7 +562,7 @@ def texture_gradient_a16_test(tools: str, spirv: str, name: str = "ps_texture_gr
     return f"{wrong} of 4096 pixels differ; {first}" if wrong else ""
 
 
-def pixels(tools, spirv, name, fmt):
+def pixels(tools, spirv, name, fmt, vertex="vs_ids"):
     # Draw at the shader's own wave size, as run_gpu_tests.py does (#146): a wave32 pixel shader run as wave64
     # (RADV's default on RDNA1) reads lanes it was never written for.
     sg = subgroup_size(spirv, name)
@@ -546,7 +574,7 @@ def pixels(tools, spirv, name, fmt):
         env = dict(env or os.environ, VKH_GS=gs, VKH_GS_HELPER="1")
     with tempfile.TemporaryDirectory(prefix="leonida-pixels-") as tmp:
         raw = Path(tmp) / "pixels.raw"
-        code, out = run(os.path.join(tools, "vk_harness" + EXE), os.path.join(spirv, "vs_ids.spv"),
+        code, out = run(os.path.join(tools, "vk_harness" + EXE), os.path.join(spirv, vertex + ".spv"),
                         os.path.join(spirv, name + ".spv"), raw, env=env)
         if code == UNSUPPORTED:   # vk_harness: the shader needs a device feature this GPU lacks
             return Skip(""), out
@@ -678,13 +706,29 @@ def texture_mip_test(tools: str, spirv: str, test: str = TEXTURE_MIP_TEST) -> st
     return ""
 
 
+def interp_f16_high_problem(px):
+    """ps_interp_f16_high (drawn with vs_f16_pack or ms_f16_pack): low halves of mrt0.xyz = f16 of u, v, u at the
+    pixel centre, read from both halves of packed channels, and mrt0.w = the f32 v. "" when every pixel is close."""
+    if len(px) != 64 * 64:
+        return f"{len(px)} pixels, expected 4096"
+    w = 64
+    half = lambda b: struct.unpack("<e", struct.pack("<H", b & 0xFFFF))[0]      # noqa: E731
+    f32 = lambda b: struct.unpack("<f", struct.pack("<I", b))[0]                 # noqa: E731
+    err = max(max(abs(half(a) - u), abs(half(b) - v), abs(half(c) - u), abs(f32(d) - v))
+              for i, (a, b, c, d) in enumerate(px) for u, v in [((i % w + 0.5) / w, (i // w + 0.5) / w)])
+    return "" if err < 2e-3 else f"f16 halves off by {err:.3g}"
+
+
 def pixel_test(tools, spirv, name):
     path = os.path.join(spirv, name + ".spv")
     if not os.path.isfile(path):
         return f"missing {name}.spv"
     if name in ("ps_texoff", "ps_texoff_implicit"):
         return texoff_test(tools, spirv, name)
-    px, out = pixels(tools, spirv, name, "<4f" if name == "ps_bary" else "<2I2f" if name in ("ps_flat", "ps_uniform_branch", "ps_scc_mask32") else "<4I")
+    if name == "ps_interp_f16_high" and BARY_FALLBACK:
+        return Skip("SKIP (per-vertex f16 interpolants need VK_KHR_fragment_shader_barycentric)")
+    fmt = "<4f" if name == "ps_bary" else "<2I2f" if name in ("ps_flat", "ps_uniform_branch", "ps_scc_mask32") else "<4I"
+    px, out = pixels(tools, spirv, name, fmt, PIXEL_VERTEX.get(name, "vs_ids"))
     if isinstance(px, Skip):   # exit 77: the device cannot run this shader (e.g. no barycentrics)
         m = re.search(r"unsupported: .*", out)
         return Skip(f"SKIP ({m.group(0) if m else 'unsupported device'})")
@@ -714,6 +758,8 @@ def pixel_test(tools, spirv, name):
         wrong = sum((a, b) != (0x101, 0x102) for a, b, _, _ in px)
         err = max(max(abs(u - (i % w + 0.5) / w), abs(v - (i // w + 0.5) / w)) for i, (_, _, u, v) in enumerate(px))
         return "" if not wrong and err < 1e-6 else f"{wrong} pixels without the first vertex's value, uv off by {err:.3g}"
+    if name == "ps_interp_f16_high":
+        return interp_f16_high_problem(px)
     if name == "ps_bitmask_perm":
         low = [p for p in px if p[0] < 32]
         wrong = sum(not (a == lane ^ 9 and b == ((lane & 5) | 16) ^ 1) for lane, a, b, _ in low)

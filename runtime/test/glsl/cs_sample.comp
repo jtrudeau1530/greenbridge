@@ -91,6 +91,10 @@ void main() {
         // A 4x4x4 grid, offset from nearest-sampling boundaries at both 8x8x4 and 4x4x2.
         const vec3 uvw = (vec3(i % 4, (i / 4) % 4, i / 16) + 0.625) / 4.0;
         result[pc.first + i] = packUnorm4x8(textureLod(sampler3D(volumes[image], samplers[smp]), uvw, 0.0));
+    } else if ((pc.tsharp[3] >> 28) == 11u) {
+        // A translated cube sample addresses the chosen face in binding 3, relative to the SRV.
+        const vec3 coord = vec3(0.5, 0.5, float(i % pc.layer));
+        result[pc.first + i] = packUnorm4x8(textureLod(sampler2DArray(layers[image], samplers[smp]), coord, 0.0));
     } else if ((pc.tsharp[3] >> 28) == 13u) {
         const vec3 coord = vec3(uv, float(i / 32u));  // read both layers of the array SRV
         result[pc.first + i] = packUnorm4x8(textureLod(sampler2DArray(layers[image], samplers[smp]), coord, 0.0));

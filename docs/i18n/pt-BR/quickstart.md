@@ -30,7 +30,17 @@ O projeto está em fase inicial: **o jogo ainda não dá boot**.
 - [Vulkan SDK](https://vulkan.lunarg.com/) (`spirv-as`, `spirv-val` e `vulkaninfo`).
 - [LLVM 21+](https://github.com/llvm/llvm-project/releases) com o **target AMDGPU** (`llvm-mc`):
   - O binário oficial do LLVM para Windows **não** inclui o target AMDGPU.
-  - No Windows, execute `scripts\build_llvm_mc.ps1` para compilar um `llvm-mc.exe` nativo com AMDGPU (requer `git` e as ferramentas C++ do Visual Studio) e definir `LLVM_MC`, **ou** instale `llvm-21` no WSL e defina `LLVM_MC="wsl -d Ubuntu -e /usr/lib/llvm-21/bin/llvm-mc"` (veja [`docs/design.md`](../../design.md#disassembling-shaders)).
+  - Para compilar um `llvm-mc.exe` nativo com AMDGPU, execute `.\scripts\build_llvm_mc.ps1` no PowerShell
+    a partir da raiz do repositório. O script requer `git` e as ferramentas C++ do Visual Studio, configura
+    `LLVM_MC` para o seu usuário e pede que você abra um novo terminal para carregar a variável.
+  - Se usar o WSL, instale `llvm-21` no Ubuntu e defina a variável na mesma sessão do PowerShell em que vai
+    executar `make_game.py`.
+
+    ```powershell
+    $env:LLVM_MC = 'wsl -d Ubuntu -e /usr/lib/llvm-21/bin/llvm-mc'
+    ```
+
+    Veja [`docs/design.md`](../../design.md#disassembling-shaders) para mais detalhes.
   - No Linux, basta ter `llvm-mc` no `PATH`.
 - **Visual Studio 2022** com *Desenvolvimento para desktop com C++* e **Windows SDK `10.0.26100` ou mais recente** (necessário para o estágio `runtime`, que usa root signatures 1.2).
 - [ffmpeg](https://ffmpeg.org/download.html) no `PATH` *(opcional: decodifica streams XMA2 e é exigido ao usar `--wav`)*.
@@ -76,5 +86,14 @@ Os estágios executam nesta ordem: `check` → `shaders` → `assets` → `runti
 
 ## Como contribuir e rodar os testes de GPU
 
-- Guia de testes em GPU (sem arquivos do jogo): [`docs/testing.md`](../../testing.md).
-- Regras de contribuição, política de zero dados do jogo e coordenação de tarefas: [`CONTRIBUTING.md`](../../../CONTRIBUTING.md).
+1. Consulte os PRs abertos e a [issue de coordenação][coord] para evitar trabalho duplicado. Reserve a
+   tarefa com `claiming: <ID>` ou com uma descrição de uma linha, se ainda não houver ID.
+2. Rode os testes relevantes com entradas sintéticas. Por exemplo, para testar o verificador de manifestos,
+   execute `python -I tests/test_manifest_verifier.py` na raiz do repositório.
+3. No PR, inclua o ID da tarefa, descreva o que testou e informe a GPU e o driver se rodou testes de GPU.
+   Indique se usou assistência de IA. Confira as regras em [`CONTRIBUTING.md`](../../../CONTRIBUTING.md).
+
+O [guia de testes em GPU](../../testing.md) mostra como executar os testes sem arquivos do jogo.
+Publique os resultados de GPU na [issue #166](https://github.com/ItsNotRexed/Leonida/issues/166).
+
+[coord]: https://github.com/ItsNotRexed/Leonida/issues?q=is%3Aissue%20is%3Aopen%20in%3Atitle%20%22Coordinating%20who%20works%20on%20what%22

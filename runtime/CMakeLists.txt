@@ -766,6 +766,13 @@ if(TARGET Vulkan::Headers)
     target_compile_options(d3d12_fence_timing_test PRIVATE /W4 /permissive- /utf-8)
     add_test(NAME d3d12_fence_timing COMMAND d3d12_fence_timing_test)
     set_tests_properties(d3d12_fence_timing PROPERTIES SKIP_RETURN_CODE 77)
+    # Fence events the host runtime sets or refuses (released fences, no fences), compared with the host devices.
+    add_executable(d3d12_fence_events_test test/d3d12_fence_events_test.cpp)
+    target_link_libraries(d3d12_fence_events_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
+    target_compile_definitions(d3d12_fence_events_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_fence_events_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME d3d12_fence_events COMMAND d3d12_fence_events_test)
+    set_tests_properties(d3d12_fence_events PROPERTIES SKIP_RETURN_CODE 77)
     # The countdown behind those event-backed waits, with no GPU: the full unsigned count, no wrap past zero.
     add_executable(d3d12_fence_waiter_test test/d3d12_fence_waiter_test.cpp)
     target_compile_definitions(d3d12_fence_waiter_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
@@ -864,6 +871,15 @@ if(TARGET Vulkan::Headers)
     target_compile_options(d3d12_copy_xfmt_test PRIVATE /W4 /permissive- /utf-8)
     add_test(NAME d3d12_copy_xfmt COMMAND d3d12_copy_xfmt_test)
     set_tests_properties(d3d12_copy_xfmt PROPERTIES SKIP_RETURN_CODE 77)
+
+    # Query heaps and query calls by list type (Close results, CreateQueryHeap node masks, timestamp heap kinds)
+    # against the host runtime and WARP; run explicitly on a Vulkan GPU.
+    add_executable(d3d12_query_rules_test test/d3d12_query_rules_test.cpp)
+    target_link_libraries(d3d12_query_rules_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
+    target_compile_definitions(d3d12_query_rules_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_query_rules_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME d3d12_query_rules COMMAND d3d12_query_rules_test)
+    set_tests_properties(d3d12_query_rules PROPERTIES SKIP_RETURN_CODE 77)
 
     # Vulkan-backed IDXGIFactory4 / IDXGISwapChain3 presentation over a Win32 HWND.
     add_executable(dxgi_swapchain_test test/dxgi_swapchain_test.cpp)

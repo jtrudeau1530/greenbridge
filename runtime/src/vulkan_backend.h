@@ -408,7 +408,7 @@ private:
 
 // Centralized single-thread fence dispatcher using Vulkan 1.2 vkWaitSemaphores(VK_SEMAPHORE_WAIT_ANY_BIT).
 // Eliminates per-fence OS threads and 10ms polling: a synthetic timeline semaphore (wakeup_sem_) at index 0
-// wakes vkWaitSemaphores immediately whenever a new wait, cancellation, or shutdown arrives while waiting_ == true.
+// wakes vkWaitSemaphores immediately whenever a new wait, a released fence, or shutdown arrives while waiting_ == true.
 class FenceWaitDispatcher {
 public:
     struct Entry {
@@ -480,12 +480,17 @@ public:
         cv_.notify_one();
     }
 
-    // Removes pending waits for `sem` and blocks until any in-flight vkWaitSemaphores releases `sem`
-    // before the caller destroys the VkSemaphore.
+    // Completes the pending waits for `sem` (a released D3D12 fence counts as reached, as on the PC runtime) and
+    // blocks until any in-flight vkWaitSemaphores releases `sem` before the caller destroys the VkSemaphore.
     void cancel(VkSemaphore sem) {
         if (!sem) return;
         std::unique_lock lock(mutex_);
-        std::erase_if(pending_, [sem](const Entry& e) { return e.semaphore == sem; });
+        std::erase_if(pending_, [this, sem](const Entry& e) {
+            if (e.semaphore != sem) return false;
+            if (e.callback) e.callback();
+            else if (signal_event_ && e.event_handle) signal_event_(e.event_handle);
+            return true;
+        });
         if (!thread_.joinable()) return;
         if (waiting_) {
             const std::uint64_t target_epoch = epoch_ + 1;
@@ -738,6 +743,12 @@ public:
     void remove_query_pool(QueryHeapId id) {
         std::unique_lock lock(resource_mutex_);
         query_pools_.erase(id);
+    }
+    // The heap's d3d12_query_heap type, or ~0u for a heap that is not registered.
+    std::uint32_t query_heap_type(QueryHeapId id) {
+        std::shared_lock lock(resource_mutex_);   // query_pools_ is guarded by resource_mutex_, like add/remove
+        const auto it = query_pools_.find(id);
+        return it == query_pools_.end() ? ~0u : it->second.heap_type;
     }
 
     // VkPhysicalDeviceLimits::timestampPeriod (nanoseconds per tick), or 0 when the queue writes no timestamps
