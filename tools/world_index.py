@@ -142,8 +142,10 @@ def _r4(values):
 def parse_resource(b, collect=None):
     """Return a row dict for a 0x7a resource, or None if the header/schema does not validate.
 
-    When ``collect`` is a list, one dict per CEntityDef is appended to it (local analysis only; the CLI does
-    not use this, so the JSON stays an aggregate index).
+    When ``collect`` is given (a list, or an object with ``append`` such as ``ArchetypeCounts``), one dict per
+    CEntityDef is appended to it. ``complete`` is False for an entity whose record is not entirely inside ``b``,
+    including every entity of a block whose start lies past the end of ``b``. The CLI uses it only for
+    ``--archetypes-out``, which writes aggregate counts.
     """
     if len(b) < 0x50 or b[0x10:0x14] != SIGNATURE or b[0x14] != VERSION:
         return None
@@ -198,7 +200,13 @@ def parse_resource(b, collect=None):
     positions = []
     lod_dists = []
     for name, size, off in blocks:
-        if name != ENTITY or off is None or entity_size == 0 or size % entity_size:
+        if name != ENTITY or entity_size == 0 or size % entity_size:
+            continue
+        if off is None:
+            # The block starts past the bytes read (e.g. beyond --max-inflate): report its entities as incomplete.
+            if collect is not None:
+                for _ in range(size // entity_size):
+                    collect.append({"complete": False, "archetype": None})
             continue
         for k in range(size // entity_size):
             o = off + k * entity_size
