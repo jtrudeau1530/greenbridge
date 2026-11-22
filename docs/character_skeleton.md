@@ -416,8 +416,26 @@ The entities linked to Mandy carry three different per-state archetype hashes
 (`0x18BB2550`, `0x73E83886`, `0x57DDFFC2`), which fits her outfit changing between states, not
 three models. None of those hashes resolves through the package name dictionary, any drawable
 or prop name pool, the `packs.rpf` PSOs, or a `0x7a` meta hash scan, so they are state/archetype
-ids, not model names. The archetype-to-component-set table is not in the readable archives;
-whether it is in the missing executable or an undecoded store is not established.
+ids, not model names. The archetype-to-component-set lookup remains unidentified.
+
+**Component variation (ASSET-279).** At `packs.rpf@0x11D1FF000`, the first 16 inflated 64 KiB
+pages cover the instance blocks and row schema and end inside LSNS. The 16-byte root has one
+array of 2,714 model rows, each 384 bytes. The row schema has no array or map, and both struct
+pointers (row offsets `+0x118` and `+0x178`) are null in every row. Across all rows, 906 share
+record 1219's 64-bit fragment field at `+0x10`; the 904 count above is for female rows.
+This layout provides no inline array or live struct pointer for either nine-entry table.
+
+At `data.rpf@0x1B076000`, the PSIN walker reached 25 structures across all seven blocks
+(756/756 instance bytes). One owner embeds both 12-byte settings at owner offsets `+0x0C`
+and `+0x18`. Each holds a `textureIndex` and two floats. Four separate root maps contain
+seven entries between them. The two settings are inline fields, and their subsystem is unknown.
+Two XML roots in `common.rpf` describe scale and body-shape profiles (`0x226000`) and entity
+components (`0x228000`). A byte comparison against the 1,576,148-byte character metadata prefix
+at `data.rpf@0x1AA5F000` found none of the settings candidate's nine distinct nonzero typed
+hashes at their original little-endian widths. That prefix did not validate as a complete PSIN.
+None of these checks establishes a variation selector. An external lookup keyed by a model-row
+field remains possible; confirming it requires tracing a component variation to both its
+drawable and its texture.
 
 `Mandy_FirstTingle`, `Mandy_ComingUp` and `Drug_Mandy_*` in `common.rpf` are MDMA drug effects,
 not the character. They are a red herring in any `mandy` name search.
