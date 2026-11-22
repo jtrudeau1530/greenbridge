@@ -9,11 +9,14 @@ Each case translates a synthetic pixel shader with tools/rdna2spirv.py, runs it 
 and compares D with a plain-Python reference. D leaves through exp as eight 16-bit halves ORed into 0x40000000, so no
 export channel is a NaN or denormal pattern that a float round trip could change.
 """
+from __future__ import annotations
+
 import os
 import random
 import struct
 import sys
 import tempfile
+from typing import Sequence
 import unittest
 import warnings
 
@@ -33,13 +36,36 @@ M64 = (1 << 64) - 1
 STUB_DXBC = b"DXBC" + bytes(24) + struct.pack("<I", 0) + bytes(4)
 
 
-def ref(x: int, y: int, accs) -> list:
+def ref_byte_window(s0: int, k: int) -> int:
+    """Extract 32-bit window W_k at byte offset k from 64-bit s0: bits [8*k+31 : 8*k]."""
+    return (s0 >> (8 * k)) & M32
+
+
+def ref_quad_byte_sad(win: int, s1: int, masked: bool = True) -> int:
+    """Compute sum of absolute differences across 4 bytes between win and s1."""
+    total = 0
+    for i in range(4):
+        b_win = (win >> (8 * i)) & 0xFF
+        b_s1 = (s1 >> (8 * i)) & 0xFF
+        if masked and b_s1 == 0:
+            continue
+        total += abs(b_win - b_s1)
+    return total
+
+
+def ref_mqsad_u32_u8(s0: int, s1: int, accs: Sequence[int]) -> list[int]:
+    """Reference implementation of RDNA2 v_mqsad_u32_u8."""
     out = []
     for k in range(4):
-        win = (x >> (8 * k)) & M32
-        s = sum(abs(((win >> (8 * i)) & 0xFF) - ((y >> (8 * i)) & 0xFF)) for i in range(4) if (y >> (8 * i)) & 0xFF)
-        out.append((accs[k] + s) & M32)
+        win = ref_byte_window(s0, k)
+        sad = ref_quad_byte_sad(win, s1, masked=True)
+        out.append(((accs[k] & M32) + sad) & M32)
     return out
+
+
+def ref(x: int, y: int, accs: Sequence[int]) -> list[int]:
+    """Compatibility alias for ref_mqsad_u32_u8."""
+    return ref_mqsad_u32_u8(x, y, accs)
 
 
 X64 = [0, M64, 0x0807060504030201, 0xFF00FF00FF00FF00, 0x0123456789ABCDEF]
@@ -93,6 +119,35 @@ def run_op(x: int, y: int, accs) -> list:
     return run_lines([f"v_mov_b32 v2, {x & M32:#x}", f"v_mov_b32 v3, {x >> 32:#x}", f"v_mov_b32 v1, {y:#x}"]
                      + [f"v_mov_b32 v{4 + k}, {accs[k]:#x}" for k in range(4)]
                      + ["v_mqsad_u32_u8 v[8:11], v[2:3], v1, v[4:7]"])
+
+
+class MqsadU32OracleTests(unittest.TestCase):
+    """Unit tests for reference oracle mathematical properties."""
+
+    def test_window_sliding_offsets(self):
+        s0 = 0x0807060504030201
+        self.assertEqual(ref_byte_window(s0, 0), 0x04030201)
+        self.assertEqual(ref_byte_window(s0, 1), 0x05040302)
+        self.assertEqual(ref_byte_window(s0, 2), 0x06050403)
+        self.assertEqual(ref_byte_window(s0, 3), 0x07060504)
+
+    def test_masked_vs_unmasked_quad_sad(self):
+        win = 0x10203040
+        s1_zeros = 0x00000000
+        self.assertEqual(ref_quad_byte_sad(win, s1_zeros, masked=True), 0)
+        self.assertEqual(ref_quad_byte_sad(win, s1_zeros, masked=False), 0x10 + 0x20 + 0x30 + 0x40)
+
+        s1_partial = 0x00200040
+        self.assertEqual(ref_quad_byte_sad(win, s1_partial, masked=True), 0)
+        self.assertEqual(ref_quad_byte_sad(win, s1_partial, masked=False), 0x10 + 0x30)
+
+    def test_accumulator_32bit_wraparound(self):
+        res = ref_mqsad_u32_u8(0x0000000000000000, 0xFFFFFFFF, [M32, M32 - 1, 0x80000000, 1])
+        # Each byte diff is 255, 4 bytes = 1020
+        self.assertEqual(res[0], (M32 + 1020) & M32)
+        self.assertEqual(res[1], (M32 - 1 + 1020) & M32)
+        self.assertEqual(res[2], (0x80000000 + 1020) & M32)
+        self.assertEqual(res[3], 1021)
 
 
 class MqsadU32Tests(unittest.TestCase):
