@@ -128,6 +128,7 @@ def run(spvasm):
         "OpSLessThanEqual": lambda a, b: a <= b, "OpSGreaterThanEqual": lambda a, b: a >= b,
         "OpULessThan": lambda a, b: a < b, "OpUGreaterThan": lambda a, b: a > b,
         "OpULessThanEqual": lambda a, b: a <= b, "OpUGreaterThanEqual": lambda a, b: a >= b,
+        "OpFUnordNotEqual": lambda a, b: a != b,          # true when either is NaN, as Python's != is
         "OpIEqual": lambda a, b: a == b, "OpINotEqual": lambda a, b: a != b,
     }
 

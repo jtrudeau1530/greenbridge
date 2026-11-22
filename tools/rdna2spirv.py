@@ -290,10 +290,140 @@ class Gen:
         self.emit(f"{f} = OpCompositeExtract %float {v2} {1 if hi else 0}")
         return self.modify_f(f, s)
 
+    def f16_bits(self, f, rtz=False):
+        """f32 ``f`` -> f16 bits in the low 16 bits of a %uint, computed with integer ops only (SHADER-56).
+
+        GLSL.std.450 PackHalf2x16 leaves the rounding mode to the implementation, and drivers fold a
+        PackHalf2x16 -> UnpackHalf2x16 round trip to a no-op (#513: NVIDIA under --wave64-emulate; #512: RTX
+        5080), so a following f16 op would see the unrounded f32. Integer ops can't be folded through.
+        ``rtz=False``: round to nearest even, |x| >= 65520 -> inf (v_cvt_f16_f32 and every f16 ALU result).
+        ``rtz=True``: round toward zero, finite values above the range -> +-65504 (v_cvt_pkrtz_f16_f32).
+        f16 denormals are produced (RDNA2's default FP16 denorm mode keeps them); f32 denormal inputs give +-0.
+        NaN -> quiet NaN with the top payload bits kept; +-inf -> +-inf."""
+        t = self.tmp
+        x, sgn, sg, a = t(), t(), t(), t()
+        self.emit(f"{x} = OpBitcast %uint {f}")
+        self.emit(f"{sgn} = OpShiftRightLogical %uint {x} {self.cu(16)}")
+        self.emit(f"{sg} = OpBitwiseAnd %uint {sgn} {self.cu(0x8000)}")
+        self.emit(f"{a} = OpBitwiseAnd %uint {x} {self.cu(0x7FFFFFFF)}")
+        # normal range: rebias the exponent (127 -> 15) and drop 13 mantissa bits
+        m, nh = t(), t()
+        self.emit(f"{m} = OpISub %uint {a} {self.cu(0x38000000)}")
+        if rtz:
+            self.emit(f"{nh} = OpShiftRightLogical %uint {m} {self.cu(13)}")
+        else:
+            lsb, bias, mb, = t(), t(), t()
+            self.emit(f"{lsb} = OpBitFieldUExtract %uint {m} {self.cu(13)} {self.cu(1)}")
+            self.emit(f"{bias} = OpIAdd %uint {lsb} {self.cu(0xFFF)}")
+            self.emit(f"{mb} = OpIAdd %uint {m} {bias}")
+            self.emit(f"{nh} = OpShiftRightLogical %uint {mb} {self.cu(13)}")
+        # subnormal range (2^-25 <= |x| < 2^-14): shift the full mantissa right by 126 - e (14..25)
+        e, man, sh, shc, sub = t(), t(), t(), t(), t()
+        self.emit(f"{e} = OpShiftRightLogical %uint {a} {self.cu(23)}")
+        self.emit(f"{man} = OpBitwiseOr %uint {self.cu(0x800000)} {self.emit_and(a, 0x7FFFFF)}")
+        self.emit(f"{sh} = OpISub %uint {self.cu(126)} {e}")
+        self.emit(f"{shc} = OpExtInst %uint %glsl UMin {sh} {self.cu(25)}")
+        self.emit(f"{sub} = OpShiftRightLogical %uint {man} {shc}")
+        if not rtz:
+            one, msk, rem, half, odd, gt, eq, tie, up, upu, sub2 = (t() for _ in range(11))
+            self.emit(f"{one} = OpShiftLeftLogical %uint {self.cu(1)} {shc}")
+            self.emit(f"{msk} = OpISub %uint {one} {self.cu(1)}")
+            self.emit(f"{rem} = OpBitwiseAnd %uint {man} {msk}")
+            self.emit(f"{half} = OpShiftRightLogical %uint {one} {self.cu(1)}")
+            self.emit(f"{odd} = OpBitwiseAnd %uint {sub} {self.cu(1)}")
+            self.emit(f"{gt} = OpUGreaterThan %bool {rem} {half}")
+            self.emit(f"{eq} = OpIEqual %bool {rem} {half}")
+            self.emit(f"{tie} = OpLogicalAnd %bool {eq} {self.emit_ne0(odd)}")
+            self.emit(f"{up} = OpLogicalOr %bool {gt} {tie}")
+            self.emit(f"{upu} = OpSelect %uint {up} {self.cu(1)} {self.cu(0)}")
+            self.emit(f"{sub2} = OpIAdd %uint {sub} {upu}")
+            sub = sub2
+        # pick the range
+        isn, issub, tiny, big, isinf, isnan = t(), t(), t(), t(), t(), t()
+        self.emit(f"{isn} = OpUGreaterThanEqual %bool {a} {self.cu(0x38800000)}")
+        self.emit(f"{tiny} = OpULessThan %bool {e} {self.cu(101)}")
+        r1, r2, r3, r4, r5, nanb, res = t(), t(), t(), t(), t(), t(), t()
+        self.emit(f"{r1} = OpSelect %uint {isn} {nh} {sub}")
+        self.emit(f"{r2} = OpSelect %uint {tiny} {self.cu(0)} {r1}")
+        if rtz:
+            self.emit(f"{big} = OpUGreaterThanEqual %bool {a} {self.cu(0x47800000)}")
+            self.emit(f"{r3} = OpSelect %uint {big} {self.cu(0x7BFF)} {r2}")
+        else:
+            self.emit(f"{big} = OpUGreaterThanEqual %bool {a} {self.cu(0x477FF000)}")
+            self.emit(f"{r3} = OpSelect %uint {big} {self.cu(0x7C00)} {r2}")
+        self.emit(f"{isinf} = OpIEqual %bool {a} {self.cu(0x7F800000)}")
+        self.emit(f"{r4} = OpSelect %uint {isinf} {self.cu(0x7C00)} {r3}")
+        pay = t()
+        self.emit(f"{pay} = OpShiftRightLogical %uint {a} {self.cu(13)}")
+        self.emit(f"{nanb} = OpBitwiseOr %uint {self.emit_and(pay, 0x3FF)} {self.cu(0x7E00)}")
+        self.emit(f"{isnan} = OpUGreaterThan %bool {a} {self.cu(0x7F800000)}")
+        self.emit(f"{r5} = OpSelect %uint {isnan} {nanb} {r4}")
+        self.emit(f"{res} = OpBitwiseOr %uint {r5} {sg}")
+        return res
+
+    def emit_and(self, v, k):
+        r = self.tmp()
+        self.emit(f"{r} = OpBitwiseAnd %uint {v} {self.cu(k)}")
+        return r
+
+    def emit_ne0(self, v):
+        r = self.tmp()
+        self.emit(f"{r} = OpINotEqual %bool {v} {self.cu(0)}")
+        return r
+
+    def fma_f16_odd(self, x, y, z):
+        """fma(x, y, z) for f16 inputs (widened to f32), rounded to f32 with round-to-odd (SHADER-55).
+
+        RDNA2's v_fma_f16 / v_fmac_f16 / v_pk_fma_f16 round once, to f16 (measured: 0 of 12,612 mismatches against a
+        correctly rounded f16 FMA on an RX 6700, #374). GLSL Fma rounds to f32 first, so narrowing it to f16 is a
+        double rounding that can be 1 ulp off. Here: x*y is exact in f32 (11-bit significands give 22 bits, and the
+        f16 range squared stays inside the f32 normal range), TwoSum splits p + z into the rounded sum s and its
+        exact error, and when the error is non-zero and s is even, s moves one f32 ulp towards the error. That makes
+        s the round-to-odd f32 value of the exact result, and round-to-odd at 24 bits then rounds correctly to any
+        format with at most 22 bits, so f16_bits gives the single-rounded f16. The FAdd/FMul carry NoContraction
+        (no_contraction), so the driver can't fuse or reorder TwoSum."""
+        t = self.tmp
+        pr, s_, bb, sb, da, db, err = (t() for _ in range(7))
+        self.emit(f"{pr} = OpFMul %float {x} {y}")
+        self.emit(f"{s_} = OpFAdd %float {pr} {z}")
+        self.emit(f"{bb} = OpFSub %float {s_} {pr}")
+        self.emit(f"{sb} = OpFSub %float {s_} {bb}")
+        self.emit(f"{da} = OpFSub %float {pr} {sb}")
+        self.emit(f"{db} = OpFSub %float {z} {bb}")
+        self.emit(f"{err} = OpFAdd %float {da} {db}")
+        sbits, ebits, lsb, even, nz, fin, need, same, xs, up, dn, adj, res, r = (t() for _ in range(14))
+        self.emit(f"{sbits} = OpBitcast %uint {s_}")
+        self.emit(f"{ebits} = OpBitcast %uint {err}")
+        self.emit(f"{lsb} = OpBitwiseAnd %uint {sbits} {self.cu(1)}")
+        self.emit(f"{even} = OpIEqual %bool {lsb} {self.cu(0)}")
+        self.emit(f"{nz} = OpFUnordNotEqual %bool {err} %f0")          # true for a NaN error too...
+        self.emit(f"{fin} = OpFOrdEqual %bool {err} {err}")            # ...so require a non-NaN error
+        self.emit(f"{need} = OpLogicalAnd %bool {even} {self.emit_land(nz, fin)}")
+        self.emit(f"{xs} = OpBitwiseXor %uint {sbits} {ebits}")
+        self.emit(f"{same} = OpULessThan %bool {xs} {self.cu(0x80000000)}")   # same sign: away from zero
+        self.emit(f"{up} = OpIAdd %uint {sbits} {self.cu(1)}")
+        self.emit(f"{dn} = OpISub %uint {sbits} {self.cu(1)}")
+        self.emit(f"{adj} = OpSelect %uint {same} {up} {dn}")
+        self.emit(f"{res} = OpSelect %uint {need} {adj} {sbits}")
+        self.emit(f"{r} = OpBitcast %float {res}")
+        return r
+
+    def emit_land(self, a, b):
+        r = self.tmp()
+        self.emit(f"{r} = OpLogicalAnd %bool {a} {b}")
+        return r
+
+    def f16_pack2(self, lo, hi):
+        """Two f32 values -> one %uint of two RTE f16 halves (lo | hi << 16), without PackHalf2x16."""
+        a, b, sh, r = self.f16_bits(lo), self.f16_bits(hi), self.tmp(), self.tmp()
+        self.emit(f"{sh} = OpShiftLeftLogical %uint {b} {self.cu(16)}")
+        self.emit(f"{r} = OpBitwiseOr %uint {a} {sh}")
+        return r
+
     def f16_out(self, d, r, hi=0):
-        """Narrow f32 ``r`` to f16 (round to nearest) and write it to the low half of ``d``, or to the high half when
+        """Narrow f32 ``r`` to f16 (round to nearest even, f16_bits) and write it to the low half of ``d``, or to the high half when
         ``hi`` (op_sel destination bit). Either way the other half is kept (see write_lo16)."""
-        lo = self.f32_to_f16_int(r)
+        lo = self.f16_bits(r)
         if not hi:
             self.write_lo16(d, lo)
             return
@@ -322,110 +452,12 @@ class Gen:
         self.emit(f"{r} = OpQuantizeToF16 %float {f}")
         return r
 
-    def f32_to_f16_int(self, f):
-        """Convert f32 to IEEE-754 binary16 (round-to-nearest-even, RTE) using only integer SPIR-V ops.
-
-        Workaround for an amdvlk64 pipeline-creation crash (0xC0000005) when GLSL.std.450 PackHalf2x16 on an
-        OpImageSampleExplicitLod result feeds a structured loop with OpGroupNonUniformAny. Preserves +-0,
-        f16 subnormals, +-Inf, and canonical quiet NaNs (sign | 0x7E00 | (mant >> 13)); all shift counts stay
-        in [14, 24]. Used only for d16 image_sample*/image_gather4* results."""
-        u = self.tou(f)
-        sh_s, sign, sh_e, exp, mant = (self.tmp() for _ in range(5))
-        self.emit(f"{sh_s} = OpShiftRightLogical %uint {u} {self.cu(16)}")
-        self.emit(f"{sign} = OpBitwiseAnd %uint {sh_s} {self.cu(0x8000)}")
-        self.emit(f"{sh_e} = OpShiftRightLogical %uint {u} {self.cu(23)}")
-        self.emit(f"{exp} = OpBitwiseAnd %uint {sh_e} {self.cu(0xFF)}")
-        self.emit(f"{mant} = OpBitwiseAnd %uint {u} {self.cu(0x7FFFFF)}")
-
-        # Special: exp == 255 -> Inf or quiet NaN.
-        is_spec, is_nan, m_hi, nan_p, nan_r, inf_r, spec_r = (self.tmp() for _ in range(7))
-        self.emit(f"{is_spec} = OpIEqual %bool {exp} {self.cu(255)}")
-        self.emit(f"{is_nan} = OpINotEqual %bool {mant} {self.cu(0)}")
-        self.emit(f"{m_hi} = OpShiftRightLogical %uint {mant} {self.cu(13)}")
-        self.emit(f"{nan_p} = OpBitwiseOr %uint {self.cu(0x7E00)} {m_hi}")
-        self.emit(f"{nan_r} = OpBitwiseOr %uint {sign} {nan_p}")
-        self.emit(f"{inf_r} = OpBitwiseOr %uint {sign} {self.cu(0x7C00)}")
-        self.emit(f"{spec_r} = OpSelect %uint {is_nan} {nan_r} {inf_r}")
-
-        # Normal: exp >= 113 -> RTE via +(0xFFF + lsb), overflow >= 0x7C00 clamps to Inf.
-        is_norm, n_exp, lsb, r_add, rounded, r_hi, n_sh, raw_n, e_gt, n_ge, ovf, n_mag, norm_r = (
-            self.tmp() for _ in range(13))
-        self.emit(f"{is_norm} = OpUGreaterThanEqual %bool {exp} {self.cu(113)}")
-        self.emit(f"{n_exp} = OpISub %uint {exp} {self.cu(112)}")
-        self.emit(f"{lsb} = OpBitwiseAnd %uint {m_hi} {self.cu(1)}")
-        self.emit(f"{r_add} = OpIAdd %uint {self.cu(0xFFF)} {lsb}")
-        self.emit(f"{rounded} = OpIAdd %uint {mant} {r_add}")
-        self.emit(f"{r_hi} = OpShiftRightLogical %uint {rounded} {self.cu(13)}")
-        self.emit(f"{n_sh} = OpShiftLeftLogical %uint {n_exp} {self.cu(10)}")
-        self.emit(f"{raw_n} = OpIAdd %uint {n_sh} {r_hi}")
-        self.emit(f"{e_gt} = OpUGreaterThan %bool {exp} {self.cu(142)}")
-        self.emit(f"{n_ge} = OpUGreaterThanEqual %bool {raw_n} {self.cu(0x7C00)}")
-        self.emit(f"{ovf} = OpLogicalOr %bool {e_gt} {n_ge}")
-        self.emit(f"{n_mag} = OpSelect %uint {ovf} {self.cu(0x7C00)} {raw_n}")
-        self.emit(f"{norm_r} = OpBitwiseOr %uint {sign} {n_mag}")
-
-        # Subnormal / underflow: 102 <= exp <= 112 (shift strictly in [14, 24] for all exp).
-        full_m, ge102, le112, in_sub, raw_s, s, q, sm1, hbit, sh1, rmask, rem = (self.tmp() for _ in range(12))
-        gt_h, eq_h, q_odd_u, q_odd, tie, rup, inc, smag, sub_m, sub_r, fin_r, res = (self.tmp() for _ in range(12))
-        self.emit(f"{full_m} = OpBitwiseOr %uint {mant} {self.cu(0x800000)}")
-        self.emit(f"{ge102} = OpUGreaterThanEqual %bool {exp} {self.cu(102)}")
-        self.emit(f"{le112} = OpULessThanEqual %bool {exp} {self.cu(112)}")
-        self.emit(f"{in_sub} = OpLogicalAnd %bool {ge102} {le112}")
-        self.emit(f"{raw_s} = OpISub %uint {self.cu(126)} {exp}")
-        self.emit(f"{s} = OpSelect %uint {in_sub} {raw_s} {self.cu(24)}")
-        self.emit(f"{q} = OpShiftRightLogical %uint {full_m} {s}")
-        self.emit(f"{sm1} = OpISub %uint {s} {self.cu(1)}")
-        self.emit(f"{hbit} = OpShiftLeftLogical %uint {self.cu(1)} {sm1}")
-        self.emit(f"{sh1} = OpShiftLeftLogical %uint {self.cu(1)} {s}")
-        self.emit(f"{rmask} = OpISub %uint {sh1} {self.cu(1)}")
-        self.emit(f"{rem} = OpBitwiseAnd %uint {full_m} {rmask}")
-        self.emit(f"{gt_h} = OpUGreaterThan %bool {rem} {hbit}")
-        self.emit(f"{eq_h} = OpIEqual %bool {rem} {hbit}")
-        self.emit(f"{q_odd_u} = OpBitwiseAnd %uint {q} {self.cu(1)}")
-        self.emit(f"{q_odd} = OpINotEqual %bool {q_odd_u} {self.cu(0)}")
-        self.emit(f"{tie} = OpLogicalAnd %bool {eq_h} {q_odd}")
-        self.emit(f"{rup} = OpLogicalOr %bool {gt_h} {tie}")
-        self.emit(f"{inc} = OpSelect %uint {rup} {self.cu(1)} {self.cu(0)}")
-        self.emit(f"{smag} = OpIAdd %uint {q} {inc}")
-        self.emit(f"{sub_m} = OpSelect %uint {in_sub} {smag} {self.cu(0)}")
-        self.emit(f"{sub_r} = OpBitwiseOr %uint {sign} {sub_m}")
-
-        self.emit(f"{fin_r} = OpSelect %uint {is_norm} {norm_r} {sub_r}")
-        self.emit(f"{res} = OpSelect %uint {is_spec} {spec_r} {fin_r}")
-        return res
-
-    def pack_f16_pair_int(self, f0, f1):
-        """Pack two f32 values into one u32 (lo f16 | hi f16 << 16) via pure integer SPIR-V ops."""
-        lo = self.f32_to_f16_int(f0)
-        hi = self.f32_to_f16_int(f1)
-        hi_s, out = self.tmp(), self.tmp()
-        self.emit(f"{hi_s} = OpShiftLeftLogical %uint {hi} {self.cu(16)}")
-        self.emit(f"{out} = OpBitwiseOr %uint {lo} {hi_s}")
-        return out
-
     def f16_rtz(self, f):
-        """f32 -> f16 bits (low 16) with round-toward-zero, as v_cvt_pkrtz does: pack to nearest, and if that
-        rounded away from zero (|half| > |x|), step one f16 ulp back toward zero. Inf/NaN inputs keep the nearest
-        result (inf/NaN). Finite values above the f16 range become +-65504, never inf."""
-        v2, p, lo, back2, back, ab, ax, gt, fin, nz, dec, r = (self.tmp() for _ in range(12))
-        self.emit(f"{v2} = OpCompositeConstruct %v2float {f} %f0")
-        self.emit(f"{p} = OpExtInst %uint %glsl PackHalf2x16 {v2}")
-        self.emit(f"{lo} = OpBitwiseAnd %uint {p} {self.cu(0xFFFF)}")
-        self.emit(f"{back2} = OpExtInst %v2float %glsl UnpackHalf2x16 {lo}")
-        self.emit(f"{back} = OpCompositeExtract %float {back2} 0")
-        self.emit(f"{ab} = OpExtInst %float %glsl FAbs {back}")
-        self.emit(f"{ax} = OpExtInst %float %glsl FAbs {f}")
-        self.emit(f"{gt} = OpFOrdGreaterThan %bool {ab} {ax}")       # false for NaN
-        isinf, isnan = self.tmp(), self.tmp()
-        self.emit(f"{isinf} = OpIsInf %bool {f}")
-        self.emit(f"{isnan} = OpIsNan %bool {f}")
-        special = self.tmp()
-        self.emit(f"{special} = OpLogicalOr %bool {isinf} {isnan}")
-        self.emit(f"{fin} = OpLogicalNot %bool {special}")
-        self.emit(f"{nz} = OpLogicalAnd %bool {gt} {fin}")
-        self.emit(f"{dec} = OpISub %uint {lo} {self.cu(1)}")          # magnitude bits - 1 = one ulp toward zero
-        self.emit(f"{r} = OpSelect %uint {nz} {dec} {lo}")
-        return r
+        """f32 -> f16 bits (low 16) with round-toward-zero, as v_cvt_pkrtz does. Finite values above the f16 range
+        become +-65504, never inf; inf/NaN stay inf/NaN. Integer-only (f16_bits): the earlier PackHalf2x16 ->
+        UnpackHalf2x16 -> compare version relied on the round trip not being folded, and on llvmpipe and NVIDIA
+        it was (FUZZ-2: v_cvt_pkrtz_f16_f32 gave the nearest value, one ulp above RTZ)."""
+        return self.f16_bits(f, rtz=True)
 
     def modify_f(self, f, a):
         return self.tof(self.modify(self.tou(f), a))
@@ -2183,11 +2215,7 @@ class Gen:
             # Low 16 bits get the f16; on GFX10 the high half is kept (partial write: Mesa ACO instr_is_16bit lists
             # v_cvt_f16_f32 as 16-bit for gfx_level >= GFX10).
             x = self.src_f(a[1])
-            v, p, r = self.tmp(), self.tmp(), self.tmp()
-            self.emit(f"{v} = OpCompositeConstruct %v2float {x} %f0")
-            self.emit(f"{p} = OpExtInst %uint %glsl PackHalf2x16 {v}")
-            self.emit(f"{r} = OpBitwiseAnd %uint {p} {self.cu(0xFFFF)}")
-            self.write_lo16(a[0], r)
+            self.write_lo16(a[0], self.f16_bits(x))
         elif op == "s_mulk_i32":
             v = a[1]["v"] & 0xFFFF
             k = v - 0x10000 if v & 0x8000 else v
@@ -2244,10 +2272,7 @@ class Gen:
             self.emit(f"{t} = OpFMul %float {f} {self.fconst(6.283185307179586)}")
             self.emit(f"{r} = OpExtInst %float %glsl {'Sin' if 'sin' in op else 'Cos'} {t}")
             r = self.clamp_mods(r, mods)
-            self.emit(f"{w2} = OpCompositeConstruct %v2float {r} %f0")
-            self.emit(f"{pk} = OpExtInst %uint %glsl PackHalf2x16 {w2}")
-            self.emit(f"{lo} = OpBitwiseAnd %uint {pk} {self.cu(0xFFFF)}")
-            self.write_lo16(a[0], lo)
+            self.write_lo16(a[0], self.f16_bits(r))
         elif op in ("v_pk_lshlrev_b16", "v_pk_lshrrev_b16", "v_pk_ashrrev_i16"):
             # Packed 16-bit shifts (VOP3P): result half h = src1 half (op_sel / op_sel_hi) shifted by src0 half & 15.
             def bits(name, default):
@@ -3001,8 +3026,7 @@ class Gen:
             # dst = fma(src0, src1, dst). The accumulator is dst itself: low half, or high half under op_sel's dst bit.
             sel, dhi = self.opsel_bits(mods, 3)
             vals = [self.f16_in(a[1], sel[0]), self.f16_in(a[2], sel[1]), self.f16_in(a[0], sel[2])]
-            r = self.tmp()
-            self.emit(f"{r} = OpExtInst %float %glsl Fma {vals[0]} {vals[1]} {vals[2]}")
+            r = self.fma_f16_odd(*vals)     # one rounding, to f16 (SHADER-55)
             self.f16_out(a[0], r, dhi)  # GFX10: f16 ops keep the other half
         elif op in ("v_add_nc_u16", "v_sub_nc_u16"):
             # VOP3-only GFX10 names of the 16-bit add/sub (no carry): opsel-capable, so the high half is kept.
@@ -3102,8 +3126,7 @@ class Gen:
         elif op == "v_fma_f16":
             sel, dhi = self.opsel_bits(mods, 3)     # op_sel:[src0,src1,src2,dst]
             vals = [self.f16_in(s, sel[i]) for i, s in enumerate(a[1:4])]
-            r = self.tmp()
-            self.emit(f"{r} = OpExtInst %float %glsl Fma {vals[0]} {vals[1]} {vals[2]}")
+            r = self.fma_f16_odd(*vals)     # one rounding, to f16 (SHADER-55); omod/clamp keep round-to-odd valid
             r = self.clamp_mods(r, mods)
             self.f16_out(a[0], r, dhi)  # GFX10: f16 ops keep the other half
         elif op in ("v_pk_add_f16", "v_pk_mul_f16", "v_pk_max_f16", "v_pk_min_f16", "v_pk_fma_f16"):
@@ -3136,7 +3159,14 @@ class Gen:
             vx, vy = srcs[:2]
             r = self.tmp()
             if op == "v_pk_fma_f16":
-                self.emit(f"{r} = OpExtInst %v2float %glsl Fma {vx} {vy} {srcs[2]}")
+                # one rounding per half, to f16 (SHADER-55)
+                comps = []
+                for k in (0, 1):
+                    ex = [self.tmp() for _ in range(3)]
+                    for e_, v_ in zip(ex, (vx, vy, srcs[2])):
+                        self.emit(f"{e_} = OpCompositeExtract %float {v_} {k}")
+                    comps.append(self.fma_f16_odd(*ex))
+                self.emit(f"{r} = OpCompositeConstruct %v2float {comps[0]} {comps[1]}")
             elif op in ("v_pk_add_f16", "v_pk_mul_f16"):
                 self.emit(f"{r} = {'OpFAdd' if 'add' in op else 'OpFMul'} %v2float {vx} {vy}")
             else:
@@ -3148,10 +3178,11 @@ class Gen:
                 self.emit(f"{o2} = OpCompositeConstruct %v2float %f1 %f1")
                 self.emit(f"{c} = OpExtInst %v2float %glsl FClamp {r} {z2} {o2}")
                 r = c
-            r0, r1 = self.tmp(), self.tmp()
-            self.emit(f"{r0} = OpCompositeExtract %float {r} 0")
-            self.emit(f"{r1} = OpCompositeExtract %float {r} 1")
-            p = self.pack_f16_pair_int(r0, r1)
+            p = self.tmp()
+            c0, c1 = self.tmp(), self.tmp()
+            self.emit(f"{c0} = OpCompositeExtract %float {r} 0")
+            self.emit(f"{c1} = OpCompositeExtract %float {r} 1")
+            self.emit(f"{p} = OpCopyObject %uint {self.f16_pack2(c0, c1)}")
             self.dst(a[0], p)
         elif op in ("v_movrels_b32", "v_movreld_b32", "v_movrelsd_b32", "v_movrelsd_2_b32"):
             # Relative VGPR indexing through M0: movrels reads VGPR[src + M0], movreld writes VGPR[dst + M0],
@@ -3758,11 +3789,7 @@ class Gen:
                 raise Unsupported(op + " form")
             f = self.attribute(attr["a"], attr["c"])
             if op == "v_interp_p2_f16":
-                v, p, r = self.tmp(), self.tmp(), self.tmp()
-                self.emit(f"{v} = OpCompositeConstruct %v2float {f} %f0")
-                self.emit(f"{p} = OpExtInst %uint %glsl PackHalf2x16 {v}")
-                self.emit(f"{r} = OpBitwiseAnd %uint {p} {self.cu(0xFFFF)}")
-                self.dst(a[0], r)
+                self.dst(a[0], self.f16_bits(f))
             else:   # p1ll/p1lv produce the f32 intermediate consumed by p2_f16
                 self.dst(a[0], self.tou(f))
         elif op.startswith("s_cmp_"):
@@ -3829,9 +3856,7 @@ class Gen:
             r, v, p, h16 = self.tmp(), self.tmp(), self.tmp(), self.tmp()
             self.emit(f"{r} = OpExtInst %float %glsl Fma {vals[0]} {vals[1]} {vals[2]}")
             r = self.clamp_mods(r, mods)
-            self.emit(f"{v} = OpCompositeConstruct %v2float {r} %f0")
-            self.emit(f"{p} = OpExtInst %uint %glsl PackHalf2x16 {v}")
-            self.emit(f"{h16} = OpBitwiseAnd %uint {p} {self.cu(0xFFFF)}")
+            self.emit(f"{h16} = OpCopyObject %uint {self.f16_bits(r)}")
             old = self.load_reg("vgpr", a[0]["r"])
             keep, newv = self.tmp(), self.tmp()
             if op == "v_fma_mixlo_f16":
