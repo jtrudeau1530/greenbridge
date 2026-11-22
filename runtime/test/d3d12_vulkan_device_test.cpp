@@ -80,6 +80,12 @@ D3D12_RESOURCE_DESC volume_desc(UINT16 mips) {
     return desc;
 }
 
+D3D12_RESOURCE_DESC line_desc(UINT width, UINT16 mips, UINT16 layers, DXGI_FORMAT format) {
+    auto desc = texture_desc(width, 1, format, D3D12_RESOURCE_FLAG_NONE, mips, layers);
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE1D;
+    return desc;
+}
+
 D3D12_TEXTURE_COPY_LOCATION subresource(ID3D12Resource* resource, UINT index) {
     D3D12_TEXTURE_COPY_LOCATION location{};
     location.pResource = resource;
@@ -431,6 +437,8 @@ int compare_footprints(ID3D12Device* ours) {
     };
     const Case cases[] = {
         {volume_desc(5), 5},
+        {line_desc(13, 4, 1, DXGI_FORMAT_R8G8B8A8_UNORM), 4},
+        {line_desc(5, 3, 2, DXGI_FORMAT_R8G8B8A8_UNORM), 6},
         {buffer_desc(300), 1},
         {texture_desc(8, 8, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE, 4, 2), 8},
         {texture_desc(13, 7, DXGI_FORMAT_R9G9B9E5_SHAREDEXP, D3D12_RESOURCE_FLAG_NONE, 4, 2), 8},
@@ -531,6 +539,10 @@ int compare_allocation_info(ID3D12Device* ours) {
     D3D12_RESOURCE_DESC big_volume = volume_desc(1);
     big_volume.Width = big_volume.Height = 32;
     big_volume.DepthOrArraySize = 8;
+    D3D12_RESOURCE_DESC bad_line = line_desc(8, 1, 1, rgba8);
+    bad_line.Height = 2;
+    D3D12_RESOURCE_DESC line_rt = line_desc(8, 1, 1, rgba8);
+    line_rt.Flags = rt;
     const Case cases[] = {
         {"buffer 300", buffer_desc(300), 0},
         {"buffer 64 KiB", buffer_desc(65536), 0},
@@ -548,6 +560,10 @@ int compare_allocation_info(ID3D12Device* ours) {
          64 * 64 * 4},
         {"8x8 array of 6", texture_desc(8, 8, rgba8, none, 4, 6), 8 * 8 * 4 * 6},
         {"32x32x8 volume", big_volume, 32 * 32 * 8 * 4},
+        {"1D 13 full chain", line_desc(13, 4, 1, rgba8), 13 * 4},
+        {"1D array 5x3", line_desc(5, 3, 2, rgba8), 5 * 4 * 2},
+        {"1D height 2", bad_line, 0},
+        {"1D render target", line_rt, 8 * 4},
         {"64x64 4x MSAA", with(texture_desc(64, 64, rgba8, rt), 0, 4), 64 * 64 * 4 * 4},
         {"64x64 32x MSAA", with(texture_desc(64, 64, rgba8, rt), 0, 32), 64 * 64 * 4 * 32},
         {"64x64 64x MSAA (invalid)", with(texture_desc(64, 64, rgba8, rt), 0, 64), 0},
@@ -2104,7 +2120,8 @@ int main() {
         EXPECT(create(default_heap, invalid_buffer_samples, D3D12_RESOURCE_STATE_COPY_DEST, refused_buffer) ==
                E_INVALIDARG && !refused_buffer.p);
 
-        Ref<ID3D12Resource> rt_resource, packed565, ds, untouched, upload, readback, volume;
+        Ref<ID3D12Resource> rt_resource, packed565, ds, untouched, upload, readback, volume, line, line_array,
+            line_refused;
         D3D12_RESOURCE_DESC xbox_rt =
             texture_desc(size, size, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
         xbox_rt.Layout = static_cast<D3D12_TEXTURE_LAYOUT>(0x101);
@@ -2126,6 +2143,21 @@ int main() {
         EXPECT(SUCCEEDED(create(readback_heap, buffer_desc(65536), D3D12_RESOURCE_STATE_COPY_DEST, readback)));
         EXPECT(SUCCEEDED(create(default_heap, volume_desc(0), D3D12_RESOURCE_STATE_COPY_DEST, volume)));
         EXPECT(volume->GetDesc().MipLevels == 5);
+        const auto line_shape = line_desc(size, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM);
+        const auto line_array_shape = line_desc(small_size, 1, 3, DXGI_FORMAT_R8G8B8A8_UNORM);
+        EXPECT(SUCCEEDED(create(default_heap, line_shape, D3D12_RESOURCE_STATE_COPY_DEST, line)));
+        EXPECT(SUCCEEDED(create(default_heap, line_array_shape, D3D12_RESOURCE_STATE_COPY_DEST, line_array)));
+        EXPECT(line->GetDesc().Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D && line->GetDesc().Height == 1);
+        EXPECT(line_array->GetDesc().DepthOrArraySize == 3);
+        EXPECT(rt::d3d12::vulkan_image(line.p) && rt::d3d12::vulkan_image(line_array.p));
+        auto refused_line = line_shape;
+        refused_line.Height = 2;
+        EXPECT(create(default_heap, refused_line, D3D12_RESOURCE_STATE_COMMON, line_refused) == E_INVALIDARG &&
+               !line_refused.p);
+        refused_line = line_shape;
+        refused_line.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+        EXPECT(create(default_heap, refused_line, D3D12_RESOURCE_STATE_COMMON, line_refused) == E_INVALIDARG &&
+               !line_refused.p);
         EXPECT(rt_resource->GetDesc().Width == size && rt_resource->GetDesc().Layout == D3D12_TEXTURE_LAYOUT_UNKNOWN);
         EXPECT(rt::d3d12::vulkan_image(rt_resource.p) && !rt::d3d12::vulkan_image(upload.p));
 
@@ -2735,6 +2767,60 @@ int main() {
             EXPECT(SUCCEEDED(queue->Signal(ms_fence.p, 2)) && SUCCEEDED(ms_fence->SetEventOnCompletion(2, nullptr)));
         }
 
+        // 1D textures and 1D arrays use the same footprint path; one array layer is enough to prove the image
+        // type and the array stride. This runs after the resolve fences so it can use a higher fence value.
+        {
+            cursor = 0;
+            const auto line_up = place(device.p, line.p, 0, cursor);
+            const auto line_array_up = place(device.p, line_array.p, 1, cursor);
+            EXPECT(line_up.Footprint.Width == size && line_up.Footprint.Height == 1 &&
+                   line_up.Footprint.Depth == 1 && line_up.Footprint.RowPitch == 256);
+            EXPECT(line_array_up.Footprint.Height == 1 && line_array_up.Footprint.Depth == 1);
+            for (UINT col = 0; col < size; ++col)
+                std::memcpy(up + line_up.Offset + col * 4, pattern(col, 0).data(), 4);
+            for (UINT col = 0; col < small_size; ++col)
+                std::memcpy(up + line_array_up.Offset + col * 4, pattern(col, 1).data(), 4);
+
+            cursor = 0;
+            const auto line_down = place(device.p, line.p, 0, cursor);
+            const auto line_array_down = place(device.p, line_array.p, 1, cursor);
+            std::memset(down, 0xcd, 65536);
+            EXPECT(SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.p, nullptr)));
+            {
+                const auto dst = subresource(line.p, 0);
+                const auto src = footprint(upload.p, line_up);
+                list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+            }
+            {
+                const auto dst = subresource(line_array.p, 1);
+                const auto src = footprint(upload.p, line_array_up);
+                list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+            }
+            barrier = transition(line.p, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            list->ResourceBarrier(1, &barrier);
+            barrier = transition(line_array.p, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            list->ResourceBarrier(1, &barrier);
+            {
+                const auto dst = footprint(readback.p, line_down);
+                const auto src = subresource(line.p, 0);
+                list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+            }
+            {
+                const auto dst = footprint(readback.p, line_array_down);
+                const auto src = subresource(line_array.p, 1);
+                list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+            }
+            EXPECT(list->Close() == S_OK);
+            queue->ExecuteCommandLists(1, lists);
+            EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
+            EXPECT(SUCCEEDED(queue->Signal(fence.p, 8)) && SUCCEEDED(fence->SetEventOnCompletion(8, nullptr)));
+            for (UINT col = 0; col < size; ++col)
+                report("1D texel", col, down + line_down.Offset + col * 4, pattern(col, 0).data(), 4);
+            for (UINT col = 0; col < small_size; ++col)
+                report("1D array texel", col, down + line_array_down.Offset + col * 4,
+                       pattern(col, 1).data(), 4);
+        }
+
         // Reserved resources (docs/d3d12_vulkan.md section 4.2): fully backed at creation, so they copy like
         // committed ones and their first use reads zero; D3D12's description rules hold; tile-mapping calls are
         // accepted and change nothing.
@@ -2980,7 +3066,8 @@ int main() {
         // Every child holds the proxy; once they are gone the proxy holds the only reference.
         upload->Unmap(0, nullptr);
         readback->Unmap(0, nullptr);
-        for (auto* r : {&rt_resource, &packed565, &ds, &untouched, &upload, &readback, &source, &whole, &part, &bc}) r->reset();
+        for (auto* r : {&rt_resource, &packed565, &ds, &untouched, &upload, &readback, &source, &whole, &part, &bc,
+                        &line, &line_array}) r->reset();
         list7.reset();
         list.reset();
         allocator.reset();
