@@ -377,13 +377,14 @@ def shaders(game: str, work: str, jobs: int, emulate: bool = False, keep_emulate
     unpacked = os.path.join(dxbc, "fssm_index.json")      # fssm_unpack.py, the same
     disassembled = os.path.join(dxbc, "disasm.done")      # written here once shader_disasm.py exits with 0
     translated = os.path.join(spirv, "index.json")        # rdna2spirv.py --merge, renamed into place
+    shard_plan = os.path.join(spirv, SHARD_PLAN)          # lets translate() keep finished shards; see there
     if not os.path.isfile(carved):
         log("shaders: carving shaders.rpf")
-        drop(unpacked, disassembled, translated)
+        drop(unpacked, disassembled, translated, shard_plan)
         py("shader_carve.py", src, dxbc)
     if not os.path.isfile(unpacked):
         log("shaders: unpacking native code")
-        drop(disassembled, translated)
+        drop(disassembled, translated, shard_plan)
         py("fssm_unpack.py", dxbc)
     # rdna2spirv.py finds index.json, the .dxbc files and fssm/ in the parent of the .s files' folder, so the
     # disassembly must sit inside the carve folder: next to it, every stage reads as "?" and is rejected.
@@ -402,7 +403,7 @@ def shaders(game: str, work: str, jobs: int, emulate: bool = False, keep_emulate
         need(os.environ.get("LLVM_MC", "llvm-mc"),
              "Install LLVM 21 or newer with the AMDGPU target, or set LLVM_MC to llvm-mc's path or whole command.")
         log("shaders: disassembling (gfx1013)")
-        drop(translated)
+        drop(translated, shard_plan)
         py("shader_disasm.py", os.path.join(dxbc, "fssm"), "--out", disasm, "--mcpu", "gfx1013", "--jobs", jobs)
         mark_done(disassembled)
     # The translation also depends on the translator's own files, so their digest is kept beside it. A folder without
@@ -548,20 +549,57 @@ def drop(*paths: str) -> None:
             os.remove(p)
 
 
+SHARD_PLAN = "shards.json"   # beside the index parts: the --jobs, mode and translator source that made them
+
+
+def translator_digest() -> str:
+    """SHA-256 over every file directly in tools/: rdna2spirv.py, the modules it imports and the data it reads
+    (gfx10_formats.json). Any change there counts, so parts made by other code are never merged with new ones."""
+    import hashlib
+    h = hashlib.sha256()
+    for name in sorted(os.listdir(TOOLS)):
+        path = os.path.join(TOOLS, name)
+        if os.path.isfile(path):
+            with open(path, "rb") as f:
+                h.update(name.encode("utf-8") + b"\0" + f.read() + b"\0")
+    return h.hexdigest()
+
+
 def translate(disasm: str, spirv: str, jobs: int, emulate: bool = False) -> None:
-    """rdna2spirv.py runs on one core: start one --shard per job side by side, then merge their index parts."""
+    """rdna2spirv.py runs on one core: start one --shard per job side by side, then merge their index parts.
+
+    A shard renames its index.part<i>.json into place last, so a part on disk is a finished shard. A run stopped
+    part-way, or during the merge, keeps those parts when it resumes with the same --jobs, wave64 mode and translator
+    source, and starts only the shards that have none. shaders() drops the plan whenever an earlier step reruns."""
     os.makedirs(spirv, exist_ok=True)
-    for f in os.listdir(spirv):  # parts from an earlier run with another --jobs would be merged in too
-        if f.startswith("index.part") and f.endswith(".json"):
-            os.remove(os.path.join(spirv, f))
+    plan_path = os.path.join(spirv, SHARD_PLAN)
+    plan = {"jobs": jobs, "wave64_emulate": bool(emulate), "translator": translator_digest()}
+    try:
+        with open(plan_path, encoding="utf-8") as f:
+            same = json.load(f) == plan
+    except (OSError, ValueError):
+        same = False
+    if not same:
+        # Parts from another --jobs would be merged in too, and parts from another mode or translator are wrong.
+        # They go before the new plan is written: a stop in between must not leave old parts under a new plan.
+        for f in os.listdir(spirv):
+            if f.startswith("index.part") and f.endswith(".json"):
+                os.remove(os.path.join(spirv, f))
+        with open(plan_path, "w", encoding="utf-8") as f:
+            json.dump(plan, f)
+    todo = [i for i in range(jobs) if not os.path.isfile(os.path.join(spirv, f"index.part{i}.json"))]
+    if len(todo) < jobs:
+        log(f"  keeping {jobs - len(todo)} of {jobs} shards finished by the run before")
     tool = os.path.join(TOOLS, "rdna2spirv.py")
     extra = ["--wave64-emulate"] if emulate else []
-    log(f"  rdna2spirv.py {disasm} --out {spirv} --shard 0..{jobs - 1}/{jobs}" + "".join(" " + e for e in extra))
+    if todo:
+        which = f"0..{jobs - 1}" if len(todo) == jobs else ",".join(str(i) for i in todo)
+        log(f"  rdna2spirv.py {disasm} --out {spirv} --shard {which}/{jobs}" + "".join(" " + e for e in extra))
     # --no-asm: keep only the .spv modules; the .spvasm text would add ~35 GB for the corpus
     procs = [subprocess.Popen([sys.executable, "-I", tool, disasm, "--out", spirv, "--shard", f"{i}/{jobs}", "--no-asm",
                                *extra])
-             for i in range(jobs)]
-    bad = [f"shard {i} exited with {r}" for i, r in enumerate(p.wait() for p in procs) if r != 0]
+             for i in todo]
+    bad = [f"shard {i} exited with {r}" for i, r in zip(todo, [p.wait() for p in procs]) if r != 0]
     if bad:
         fail("rdna2spirv.py: " + ", ".join(bad))
     py("rdna2spirv.py", disasm, "--out", spirv, "--merge")
