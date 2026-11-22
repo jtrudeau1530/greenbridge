@@ -15,6 +15,9 @@
 //                                draws an indexed mesh instead of the 3-vertex triangle. The file is u32
 //                                vertex_count, u32 index_count, vertex_count*stride bytes, index_count u32
 //                                indices; the layout lists location:float-components, one item per attribute.
+//   VKH_BINARY_OUT=<file>        writes the pipeline's VK_KHR_pipeline_binary data after building it
+//   VKH_BINARY_IN=<file>         builds the pipeline from such a file instead (tools/ps_oracle.py patches the pixel
+//                                shader in it); both exit 77 without VK_KHR_pipeline_binary
 //   VKH_SUBGROUP_SIZE=32|64      requires that subgroup size of the fragment shader (or of the compute or geometry
 //                                stage under test); stderr says "fragment subgroup size: N" when it took effect and
 //                                "... not available" when the device cannot require it (exit code stays 0).
@@ -30,6 +33,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <iterator>
 #include <utility>
 #include <vector>
 
@@ -349,6 +353,29 @@ int main(int argc, char** argv) {
         f12.pNext = chain;
         chain = &f12;
     }
+    // VKH_BINARY_OUT=<file> / VKH_BINARY_IN=<file>: VK_KHR_pipeline_binary. OUT writes the pipeline's binaries after
+    // it is built; IN builds the pipeline from such a file instead of compiling the shaders (tools/ps_oracle.py
+    // patches the pixel shader's code in it). File: u32 count, then per binary u32 key size, 32 key bytes, u64 data
+    // size, the data.
+    const char* bin_out = std::getenv("VKH_BINARY_OUT");
+    const char* bin_in = std::getenv("VKH_BINARY_IN");
+    VkPhysicalDevicePipelineBinaryFeaturesKHR pbf{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_BINARY_FEATURES_KHR};
+    VkPhysicalDeviceMaintenance5FeaturesKHR m5{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES_KHR};
+    if (bin_out || bin_in) {
+        VkPhysicalDeviceFeatures2 q{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+        VkPhysicalDevicePipelineBinaryFeaturesKHR pbq{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_BINARY_FEATURES_KHR};
+        q.pNext = &pbq;
+        vkGetPhysicalDeviceFeatures2(pd, &q);
+        if (!has(VK_KHR_PIPELINE_BINARY_EXTENSION_NAME) || !has(VK_KHR_MAINTENANCE_5_EXTENSION_NAME) ||
+            !pbq.pipelineBinaries) {
+            std::fprintf(stderr, "unsupported: no VK_KHR_pipeline_binary\n");
+            return 77;
+        }
+        enable.push_back(VK_KHR_PIPELINE_BINARY_EXTENSION_NAME);
+        enable.push_back(VK_KHR_MAINTENANCE_5_EXTENSION_NAME);
+        pbf.pipelineBinaries = VK_TRUE; pbf.pNext = chain; chain = &pbf;
+        m5.maintenance5 = VK_TRUE; m5.pNext = chain; chain = &m5;
+    }
     for (auto e : enable) std::fprintf(stderr, "enabled %s\n", e);
     VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
     dci.queueCreateInfoCount = 1; dci.pQueueCreateInfos = &qci;
@@ -554,7 +581,76 @@ int main(int argc, char** argv) {
         gpi.pDepthStencilState = &ds_state;
     }
     gpi.layout = pl; gpi.renderPass = rp;
+    VkPipelineCreateFlags2CreateInfoKHR capture{VK_STRUCTURE_TYPE_PIPELINE_CREATE_FLAGS_2_CREATE_INFO_KHR};
+    std::vector<VkPipelineBinaryKHR> in_bins;
+    VkPipelineBinaryInfoKHR bin_info{VK_STRUCTURE_TYPE_PIPELINE_BINARY_INFO_KHR};
+    if (bin_out) {
+        capture.flags = VK_PIPELINE_CREATE_2_CAPTURE_DATA_BIT_KHR;
+        gpi.pNext = &capture;
+    }
+    if (bin_in) {
+        auto vkCreatePipelineBinariesKHR = reinterpret_cast<PFN_vkCreatePipelineBinariesKHR>(
+            vkGetDeviceProcAddr(dev, "vkCreatePipelineBinariesKHR"));
+        std::ifstream f(bin_in, std::ios::binary);
+        std::vector<char> all((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+        size_t at = 0;
+        auto take = [&](void* p, size_t n) {
+            if (at + n > all.size()) { std::fprintf(stderr, "%s: truncated\n", bin_in); std::exit(2); }
+            std::memcpy(p, all.data() + at, n); at += n;
+        };
+        uint32_t count = 0; take(&count, 4);
+        std::vector<VkPipelineBinaryKeyKHR> keys(count, {VK_STRUCTURE_TYPE_PIPELINE_BINARY_KEY_KHR});
+        std::vector<VkPipelineBinaryDataKHR> datas(count);
+        std::vector<std::vector<char>> blobs(count);
+        for (uint32_t i = 0; i < count; i++) {
+            take(&keys[i].keySize, 4); take(keys[i].key, VK_MAX_PIPELINE_BINARY_KEY_SIZE_KHR);
+            uint64_t n = 0; take(&n, 8);
+            blobs[i].resize(size_t(n)); take(blobs[i].data(), size_t(n));
+            datas[i].dataSize = size_t(n); datas[i].pData = blobs[i].data();
+        }
+        VkPipelineBinaryKeysAndDataKHR kd{count, keys.data(), datas.data()};
+        VkPipelineBinaryCreateInfoKHR bci{VK_STRUCTURE_TYPE_PIPELINE_BINARY_CREATE_INFO_KHR};
+        bci.pKeysAndDataInfo = &kd;
+        in_bins.resize(count);
+        VkPipelineBinaryHandlesInfoKHR hi{VK_STRUCTURE_TYPE_PIPELINE_BINARY_HANDLES_INFO_KHR};
+        hi.pipelineBinaryCount = count; hi.pPipelineBinaries = in_bins.data();
+        CHECK(vkCreatePipelineBinariesKHR(dev, &bci, nullptr, &hi));
+        bin_info.binaryCount = count; bin_info.pPipelineBinaries = in_bins.data();
+        gpi.pNext = &bin_info;
+        std::fprintf(stderr, "pipeline from %u binaries in %s\n", count, bin_in);
+    }
     VkPipeline pipe; CHECK(vkCreateGraphicsPipelines(dev, VK_NULL_HANDLE, 1, &gpi, nullptr, &pipe));
+    if (bin_out) {
+        auto vkCreatePipelineBinariesKHR = reinterpret_cast<PFN_vkCreatePipelineBinariesKHR>(
+            vkGetDeviceProcAddr(dev, "vkCreatePipelineBinariesKHR"));
+        auto vkGetPipelineBinaryDataKHR = reinterpret_cast<PFN_vkGetPipelineBinaryDataKHR>(
+            vkGetDeviceProcAddr(dev, "vkGetPipelineBinaryDataKHR"));
+        VkPipelineBinaryCreateInfoKHR bci{VK_STRUCTURE_TYPE_PIPELINE_BINARY_CREATE_INFO_KHR};
+        bci.pipeline = pipe;
+        VkPipelineBinaryHandlesInfoKHR hi{VK_STRUCTURE_TYPE_PIPELINE_BINARY_HANDLES_INFO_KHR};
+        CHECK(vkCreatePipelineBinariesKHR(dev, &bci, nullptr, &hi));
+        std::vector<VkPipelineBinaryKHR> bins(hi.pipelineBinaryCount);
+        hi.pPipelineBinaries = bins.data();
+        CHECK(vkCreatePipelineBinariesKHR(dev, &bci, nullptr, &hi));
+        std::ofstream f(bin_out, std::ios::binary);
+        uint32_t count = uint32_t(bins.size());
+        f.write(reinterpret_cast<const char*>(&count), 4);
+        for (auto b : bins) {
+            VkPipelineBinaryDataInfoKHR di{VK_STRUCTURE_TYPE_PIPELINE_BINARY_DATA_INFO_KHR};
+            di.pipelineBinary = b;
+            VkPipelineBinaryKeyKHR key{VK_STRUCTURE_TYPE_PIPELINE_BINARY_KEY_KHR};
+            size_t n = 0;
+            CHECK(vkGetPipelineBinaryDataKHR(dev, &di, &key, &n, nullptr));
+            std::vector<char> data(n);
+            CHECK(vkGetPipelineBinaryDataKHR(dev, &di, &key, &n, data.data()));
+            uint64_t n64 = n;
+            f.write(reinterpret_cast<const char*>(&key.keySize), 4);
+            f.write(reinterpret_cast<const char*>(key.key), VK_MAX_PIPELINE_BINARY_KEY_SIZE_KHR);
+            f.write(reinterpret_cast<const char*>(&n64), 8);
+            f.write(data.data(), std::streamsize(n));
+        }
+        std::fprintf(stderr, "wrote %u pipeline binaries to %s\n", count, bin_out);
+    }
     VkPipeline cpipe = VK_NULL_HANDLE;
     if (mesh_compute) {
         VkComputePipelineCreateInfo cpi{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};

@@ -1418,6 +1418,44 @@ Hardware validation was executed via `tools/hw_oracle` and `tools/salu_diff.py` 
 - **24-bit products and 64-bit shifts (`v_mul_hi_*24`, `v_lshrrev_b64`, `v_ashrrev_i64`)**:
   - Verified across signed/unsigned products, edge signs, and 0..63 shift counts: **0 mismatches**.
 
+### Pixel-shader ISA on the hardware (`tools/ps_oracle.py`, EGEN-TOOL-PS-ORACLE)
+
+`tools/hw_oracle` only launches compute kernels, so what only a pixel shader has (`v_interp_*` and the parameter
+words the SPI writes into LDS, the barycentric VGPRs, exports and their formats, helper lanes) could not be
+measured there. `tools/ps_oracle.py` runs hand-written RDNA2 pixel-shader ISA in a real draw on an AMD GPU, through
+Vulkan's `VK_KHR_pipeline_binary`:
+
+1. `vk_harness` builds a pipeline from a template vertex + pixel shader and writes its binary (`VKH_BINARY_OUT`).
+   On the AMD Windows driver that is one PAL ELF: `.text` with `_amdgpu_gs_main` (the vertex stage) and
+   `_amdgpu_ps_main`, and a `.note` with the PAL metadata in msgpack, from which the driver programs the register
+   counts and the SPI setup (`spi_ps_input_ena/addr`, `spi_ps_input_cntl` per parameter, `spi_shader_col_format`).
+2. The code under test is assembled with AMD clang (`LEONIDA_AMD_CLANG`, as for hw_oracle) and replaces
+   `_amdgpu_ps_main`; `.text` grows if needed and the pixel stage's VGPR/SGPR counts are raised to the registers
+   the code names. `--set PATH=JSON` changes a metadata entry as well, e.g.
+   `.graphics_registers/.spi_ps_input_cntl/0/.fp16_interp_mode=true`.
+3. `vk_harness` builds the pipeline from the patched binary (`VKH_BINARY_IN`), draws one full-screen triangle into
+   an RGBA32F target and reads every pixel's four mrt0 dwords back bit for bit.
+
+The template sets what the code finds when it starts, so `--show-template` prints the template's own ISA and SPI
+metadata to copy the conventions from. With the built-in `interp2` template on gfx1036 the pixel stage is wave64,
+the perspective I/J barycentrics are in v0/v1, M0 comes from s2 (`s_mov_b32 m0, s2`), and parameters 0 and 1 are
+the vertex shader's locations 0 = (u, v, 0, 1) and 1 = (u, v, 0, 0), u and v going 0..2 across the screen.
+
+```powershell
+$env:LEONIDA_VK_DEVICE = "radeon"
+python -I tools/ps_oracle.py --build <runtime build> --template interp2 --show-template
+python -I tools/ps_oracle.py --build <runtime build> --template interp2 --asm body.s --size 4 1 [--json out.json]
+```
+
+Checked on an AMD Radeon iGPU (gfx1036, Windows driver 26.10.1): the driver accepts a patched binary (there is no
+check over the code), the patched code runs as the pixel shader, and `v_interp_p1/p2_f32` of `attr0.x` at the four
+pixel centres of a 4 x 1 target gives u = 0.125, 0.375, 0.625, 0.875, with `v_interp_mov_f32` reading the
+parameter words P0 = 0 and P10 = 2.0 (`tests/test_ps_oracle.py`, which runs it on hardware when
+`LEONIDA_PS_ORACLE_BUILD` names a runtime build). On other drivers the binary is not a single PAL ELF (the NVIDIA
+driver returns two blobs) and the tool exits 77. Limits: one draw of one triangle, mrt0 as RGBA32F only; the vertex
+stage is the template's, compiled by the driver; the SPI behaviour comes from the driver's metadata, so a `--set`
+the hardware does not support is not refused here.
+
 
 ## Coverage plan and cost
 
