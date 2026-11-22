@@ -1172,8 +1172,183 @@ class TestIEEE754BoundaryExtremes(unittest.TestCase):
             self.assertEqual(scc, 1)
 
 
+
+# ==============================================================================
+# Phase 8: Negative Controls, Syntax Rejection, and Mutation Detection
+# ==============================================================================
+
+def mutant_and_instead_of_or(exec_in: int, src_val: int) -> Tuple[int, int, int]:
+    """Mutant 1: Emits bitwise AND instead of OR."""
+    saved_sdst = u64(exec_in)
+    new_exec = u64(src_val & exec_in)
+    scc = 1 if new_exec != 0 else 0
+    return saved_sdst, new_exec, scc
+
+
+def mutant_xor_instead_of_or(exec_in: int, src_val: int) -> Tuple[int, int, int]:
+    """Mutant 2: Emits bitwise XOR instead of OR."""
+    saved_sdst = u64(exec_in)
+    new_exec = u64(src_val ^ exec_in)
+    scc = 1 if new_exec != 0 else 0
+    return saved_sdst, new_exec, scc
+
+
+def mutant_save_new_exec(exec_in: int, src_val: int) -> Tuple[int, int, int]:
+    """Mutant 3: Saves updated EXEC into SDEST instead of previous EXEC."""
+    new_exec = u64(src_val | exec_in)
+    saved_sdst = new_exec
+    scc = 1 if new_exec != 0 else 0
+    return saved_sdst, new_exec, scc
+
+
+def mutant_inverted_scc(exec_in: int, src_val: int) -> Tuple[int, int, int]:
+    """Mutant 4: Inverts SCC condition flag (sets 1 on zero, 0 on non-zero)."""
+    saved_sdst = u64(exec_in)
+    new_exec = u64(src_val | exec_in)
+    scc = 1 if new_exec == 0 else 0
+    return saved_sdst, new_exec, scc
+
+
+def mutant_scc_from_old_exec(exec_in: int, src_val: int) -> Tuple[int, int, int]:
+    """Mutant 5: Computes SCC from old EXEC instead of resulting EXEC."""
+    saved_sdst = u64(exec_in)
+    new_exec = u64(src_val | exec_in)
+    scc = 1 if saved_sdst != 0 else 0
+    return saved_sdst, new_exec, scc
+
+
+def mutant_truncate_32bit(exec_in: int, src_val: int) -> Tuple[int, int, int]:
+    """Mutant 6: Incorrectly truncates EXEC mask to 32 bits on Wave64."""
+    saved_sdst = u64(exec_in)
+    new_exec = u32(src_val | exec_in)
+    scc = 1 if new_exec != 0 else 0
+    return saved_sdst, new_exec, scc
+
+
+def mutant_src_negation(exec_in: int, src_val: int) -> Tuple[int, int, int]:
+    """Mutant 7: Confuses s_or with s_orn2 (ORs with inverted source)."""
+    saved_sdst = u64(exec_in)
+    new_exec = u64((~src_val & MASK64) | exec_in)
+    scc = 1 if new_exec != 0 else 0
+    return saved_sdst, new_exec, scc
+
+
+class TestNegativeControlsAndMutations(unittest.TestCase):
+    """Verifies syntax rejection of invalid assembly and catches subtle behavioral mutations."""
+
+    def test_rejection_of_invalid_mnemonics(self) -> None:
+        """Reject invalid mnemonics and opcodes."""
+        invalid_mnemonics = [
+            "s_or_saveexec_b32 s[0:1], s[2:3]",
+            "v_or_saveexec_b64 s[0:1], s[2:3]",
+            "s_and_saveexec_b64 s[0:1], s[2:3]",
+            "s_or_b64 s[0:1], s[2:3]",
+            "s_saveexec_b64 s[0:1], s[2:3]",
+        ]
+        for line in invalid_mnemonics:
+            with self.assertRaises(ValueError):
+                SOrSaveExecB64Instruction.parse(line)
+
+    def test_rejection_of_vgpr_and_odd_sgpr_operands(self) -> None:
+        """Reject VGPR destinations and unaligned odd SGPR base indices."""
+        invalid_registers = [
+            "s_or_saveexec_b64 v[0:1], s[2:3]",
+            "s_or_saveexec_b64 v0, s[2:3]",
+            "s_or_saveexec_b64 s[1:2], s[4:5]",
+            "s_or_saveexec_b64 s[3:4], s[4:5]",
+            "s_or_saveexec_b64 s[105:106], s[4:5]",
+        ]
+        for line in invalid_registers:
+            with self.assertRaises(ValueError):
+                SOrSaveExecB64Instruction.parse(line)
+
+    def test_rejection_of_truncated_and_excess_operands(self) -> None:
+        """Reject instruction lines with wrong operand counts or malformed delimiters."""
+        malformed = [
+            "s_or_saveexec_b64",
+            "s_or_saveexec_b64 s[0:1]",
+            "s_or_saveexec_b64 s[0:1], s[2:3], s[4:5]",
+            "s_or_saveexec_b64 s[0:1] s[2:3]",
+            "s_or_saveexec_b64 s[0:1],",
+        ]
+        for line in malformed:
+            with self.assertRaises(ValueError):
+                SOrSaveExecB64Instruction.parse(line)
+
+    def test_mutation_detection_and_instead_of_or(self) -> None:
+        """Mutant 1 (AND instead of OR) must be detected."""
+        exec_in = 0x0000_0000_FFFF_0000
+        src_val = 0x0000_0000_0000_FFFF
+        ref = oracle_s_or_saveexec_b64(exec_in, src_val)
+        mut = mutant_and_instead_of_or(exec_in, src_val)
+        self.assertNotEqual(ref, mut)
+        self.assertEqual(ref[1], 0x0000_0000_FFFF_FFFF)
+        self.assertEqual(mut[1], 0x0)
+
+    def test_mutation_detection_xor_instead_of_or(self) -> None:
+        """Mutant 2 (XOR instead of OR) must be detected on overlapping bits."""
+        exec_in = 0xFFFF_FFFF_FFFF_FFFF
+        src_val = 0xFFFF_FFFF_FFFF_FFFF
+        ref = oracle_s_or_saveexec_b64(exec_in, src_val)
+        mut = mutant_xor_instead_of_or(exec_in, src_val)
+        self.assertNotEqual(ref, mut)
+        self.assertEqual(ref[1], ALL_LANES_ACTIVE_64)
+        self.assertEqual(mut[1], 0x0)
+
+    def test_mutation_detection_save_new_exec(self) -> None:
+        """Mutant 3 (saving new EXEC instead of previous EXEC) must be detected."""
+        exec_in = 0x1
+        src_val = 0x2
+        ref = oracle_s_or_saveexec_b64(exec_in, src_val)
+        mut = mutant_save_new_exec(exec_in, src_val)
+        self.assertNotEqual(ref, mut)
+        self.assertEqual(ref[0], 0x1)  # Saved is old EXEC
+        self.assertEqual(mut[0], 0x3)  # Mutant saved new EXEC
+
+    def test_mutation_detection_inverted_scc(self) -> None:
+        """Mutant 4 (inverted SCC) must be detected."""
+        exec_in = 0x0
+        src_val = 0x1
+        ref = oracle_s_or_saveexec_b64(exec_in, src_val)
+        mut = mutant_inverted_scc(exec_in, src_val)
+        self.assertNotEqual(ref, mut)
+        self.assertEqual(ref[2], 1)
+        self.assertEqual(mut[2], 0)
+
+    def test_mutation_detection_scc_from_old_exec(self) -> None:
+        """Mutant 5 (computing SCC before the OR operation) must be detected."""
+        exec_in = 0x0  # Old exec is 0
+        src_val = 0x100  # New exec will be 0x100 != 0
+        ref = oracle_s_or_saveexec_b64(exec_in, src_val)
+        mut = mutant_scc_from_old_exec(exec_in, src_val)
+        self.assertNotEqual(ref, mut)
+        self.assertEqual(ref[2], 1)
+        self.assertEqual(mut[2], 0)
+
+    def test_mutation_detection_truncate_32bit(self) -> None:
+        """Mutant 6 (truncating mask to 32 bits) must be detected on upper 32 lanes."""
+        exec_in = 0x0
+        src_val = 0x8000_0000_0000_0000
+        ref = oracle_s_or_saveexec_b64(exec_in, src_val)
+        mut = mutant_truncate_32bit(exec_in, src_val)
+        self.assertNotEqual(ref, mut)
+        self.assertEqual(ref[1], 0x8000_0000_0000_0000)
+        self.assertEqual(mut[1], 0x0)
+
+    def test_mutation_detection_src_negation(self) -> None:
+        """Mutant 7 (confusing with s_orn2) must be detected."""
+        exec_in = 0x0
+        src_val = 0x0
+        ref = oracle_s_or_saveexec_b64(exec_in, src_val)
+        mut = mutant_src_negation(exec_in, src_val)
+        self.assertNotEqual(ref, mut)
+        self.assertEqual(ref[1], 0x0)
+        self.assertEqual(mut[1], ALL_LANES_ACTIVE_64)
+
+
 if __name__ == "__main__":
     unittest.main()
+
 
 
 
