@@ -56,8 +56,9 @@ Meshlet group (first u32 has bit 31 set):
         30-31 are 3 or 0, read here as the bitangent sign +1 or -1. Other 4-byte streams are not decoded.
 
 A page starts with a `63 30` block, a `42 40` block or a group (continuation pages). The walk stops, without an
-error, at a `42 40` block whose layout doesn't fit the rule above or at a group that continues past the end of
-the stream. Only counts and layout checks are written; no vertex, index or float value leaves this tool.
+error, at a `42 40` block whose layout doesn't fit the rule above, at a group that continues past the end of
+the stream, or where other data starts on a 256-byte boundary behind zero padding after the mesh chunks. Only
+counts and layout checks are written; no vertex, index or float value leaves this tool.
 
 Usage:
     python -I tools/meshlet_page.py <file|dir|archive.rpf> [...] [--json out.json] [--quiet]
@@ -419,7 +420,16 @@ def normal_agreement(positions, normals, triangles):
 
 
 def block4240_checks(data, block):
-    """Count-only plausibility checks for one `42 40` block's decoded positions."""
+    """Count-only plausibility checks for one `42 40` block's decoded positions. Every position is bias + scale * q
+    with q between 0 and 2^24 - 1 (2^16 - 1 for the third field), so when the header's box is finite and inside
+    300 m on every axis the counts follow from the header alone; only other blocks are decoded vertex by vertex."""
+    at, n = block["offset"], block["vertices"]
+    bias, scale = struct.unpack_from("<3f", data, at + 0x60), struct.unpack_from("<3f", data, at + 0x70)
+    slot0 = {i: tag for i, tag, _ in block["slots"]}.get(0)
+    if slot0 == 0x42 and _u32(data, at + 0x6C) <= 2:
+        ends = [(b, b + s * q) for b, s, q in zip(bias, scale, (0xFFFFFF, 0xFFFFFF, 0xFFFF))]
+        if all(math.isfinite(e) for pair in ends for e in pair) and all(abs(e) <= 300 for pair in ends for e in pair):
+            return {"positions_4240": n, "positions_4240_finite": n, "positions_4240_within_300m": n}
     pos = positions_4240(data, block)
     finite = [p for p in pos if all(math.isfinite(c) for c in p)]
     return {"positions_4240": len(pos), "positions_4240_finite": len(finite),
@@ -486,6 +496,13 @@ def is_mesh_page(data):
     return True
 
 
+def _other_data(data, pos, chunks):
+    """True where a page's mesh chunks end and other data begins: after at least one chunk, on a 256-byte boundary,
+    behind at least 16 zero bytes. story000.rpf has 256 KiB pages laid out that way (mesh chunks, zero padding, then
+    texture-like blocks); anything else that doesn't parse stays an error."""
+    return bool(chunks) and pos % 256 == 0 and pos >= 16 and not any(data[pos - 16:pos])
+
+
 def parse_page(data):
     """Walk a whole page. Returns a list of chunk records; raises PageError on anything unexpected."""
     if len(data) < 4 or not is_mesh_page(data):
@@ -516,10 +533,16 @@ def parse_page(data):
             try:
                 record, pos = parse_group(data, pos)
             except PageError as exc:
-                if "past the page end" not in str(exc):
+                if "past the page end" in str(exc):
+                    chunks.append({"kind": "stop", "offset": pos, "reason": "group continues past the stream"})
+                    break
+                if not _other_data(data, pos, chunks):
                     raise
-                chunks.append({"kind": "stop", "offset": pos, "reason": "group continues past the stream"})
+                chunks.append({"kind": "stop", "offset": pos, "reason": "non-mesh data after the chunks"})
                 break
+        elif _other_data(data, pos, chunks):
+            chunks.append({"kind": "stop", "offset": pos, "reason": "non-mesh data after the chunks"})
+            break
         else:
             raise PageError(f"unknown chunk at +0x{pos:x}")
         chunks.append(record)
@@ -703,6 +726,7 @@ def totals(pages):
            "block_4240_led_pages": sum(1 for p in pages if p.get("starts_with") == "block4240"),
            "stopped_at_4240_block": sum(1 for p in pages if p.get("stop") == "42 40 00 00 block"),
            "stopped_in_group": sum(1 for p in pages if p.get("stop") == "group continues past the stream"),
+           "stopped_at_other_data": sum(1 for p in pages if p.get("stop") == "non-mesh data after the chunks"),
            "bytes": sum(p["size"] for p in pages)}
     good = [p for p in pages if "error" not in p]
     for k in keys:

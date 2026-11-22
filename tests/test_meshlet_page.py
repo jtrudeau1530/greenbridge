@@ -349,6 +349,24 @@ class RejectTests(unittest.TestCase):
         summary = mp.summarise_page(data, "x")
         self.assertIn("unknown chunk", summary["error"])
 
+    def test_other_data_after_padding_stops(self):
+        # mesh chunks, zero padding to a 256-byte boundary, then other data (story000's 256 KiB mixed pages)
+        mesh = page(other_block(10), group([(10, 8)]))
+        tail = bytes(range(1, 65)) * 4
+        # unknown magic, and a group header whose meshlet offsets are not running sums
+        bad_group = struct.pack("<3I", 0x80000001, 1, 1) + struct.pack("<4I", 0, 5, 0, 0) + bytes(64)
+        for junk in (tail, bad_group):
+            data = mesh + b"\0" * (-len(mesh) % 256 or 256) + junk
+            summary = mp.summarise_page(data, "x")
+            self.assertNotIn("error", summary)
+            self.assertEqual((summary["sequence"], summary["stop"]), ("QG.", "non-mesh data after the chunks"))
+            self.assertEqual((summary["blocks_4240"], summary["groups"]), (1, 1))
+            self.assertEqual(mp.totals([summary])["stopped_at_other_data"], 1)
+        # with no zero padding in front, or off a 256-byte boundary, it stays an error
+        self.assertIn("error", mp.summarise_page(page(other_block(10)) + tail, "x"))
+        off = mesh + b"\0" * ((-len(mesh) % 256) + 16)
+        self.assertIn("error", mp.summarise_page(off + tail, "x"))
+
 
 def grid_group(cols, rows):
     """One meshlet over a cols x rows vertex grid (row-major), two consistently wound triangles per cell."""
@@ -384,6 +402,19 @@ class Positions4240Tests(unittest.TestCase):
         xyz = self.decode(2)
         self.assertEqual(self.decode(0), [(c, b, a) for a, b, c in xyz])
         self.assertEqual(self.decode(1), [(b, c, a) for a, b, c in xyz])
+
+    def test_checks_match_decoding(self):
+        # the header shortcut (box inside 300 m) and the vertex-by-vertex path give the decoded counts
+        for bias, scale in ((self.BIAS, self.SCALE), ((-250.0, 0.0, 0.0), (2.0 ** -14, 2.0 ** -20, 2.0 ** -10)),
+                            ((float("inf"), 0.0, 0.0), self.SCALE)):
+            data = page(other_block(4, packed=self.PACKED, bias=bias, scale=scale))
+            blk = mp.parse_page(data)[0]
+            pos = mp.positions_4240(data, blk)
+            finite = [p for p in pos if all(math.isfinite(c) for c in p)]
+            want = {"positions_4240": 4, "positions_4240_finite": len(finite),
+                    "positions_4240_within_300m": sum(1 for p in finite if all(abs(c) <= 300 for c in p))}
+            self.assertEqual(mp.block4240_checks(data, blk), want, bias)
+        self.assertEqual(want["positions_4240_finite"], 0)
 
     def test_bad_axis_and_tag_are_errors(self):
         data = page(other_block(4, axis=3))
