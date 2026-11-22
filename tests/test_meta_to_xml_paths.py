@@ -55,6 +55,7 @@ class MetaToXmlPathsTest(unittest.TestCase):
                     archive = carve / archive_name
                     archive.mkdir(parents=True)
                     (archive / "index.json").write_text(json.dumps({"files": [
+                        {"head": "5053494e", "off": 8},  # Indexed blob is missing.
                         {"head": "5053494e00", "off": 0},
                         {"head": "5053494e", "off": 16},
                     ]}), encoding="utf-8")
@@ -67,11 +68,13 @@ class MetaToXmlPathsTest(unittest.TestCase):
                         capture_output=True, text=True, timeout=30,
                     )
                     self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-                    self.assertIn("pso ok 1 failed 1; rbf ok 0 failed 0", result.stdout)
+                    self.assertIn("pso ok 1 failed 2; rbf ok 0 failed 0", result.stdout)
                     self.assertEqual((out / archive_name / "000000000000.pso.xml").read_text(),
                                      "<synthetic />")
-                    self.assertEqual((out / "failures.txt").read_text().splitlines(),
-                                     ["", f"{archive_name}\\000000000010 pso : synthetic parser failure"])
+                    failures = (out / "failures.txt").read_text().splitlines()
+                    self.assertEqual(len(failures), 3)
+                    self.assertTrue(failures[1].startswith(f"{archive_name}\\000000000008 pso : "), failures[1])
+                    self.assertEqual(failures[2], f"{archive_name}\\000000000010 pso : synthetic parser failure")
 
 
 if __name__ == "__main__":
