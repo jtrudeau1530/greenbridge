@@ -663,7 +663,7 @@ if(TARGET Vulkan::Headers)
     if(Python3_FOUND)
       add_test(NAME xdxr_build_check COMMAND "${Python3_EXECUTABLE}" -I
                "${CMAKE_CURRENT_SOURCE_DIR}/../tools/xdxr_bvh.py" check-build "${LEONIDA_XDXR_OUT}" --rays 1000)
-      set_tests_properties(xdxr_build_check PROPERTIES FIXTURES_REQUIRED xdxr_build_cases)
+      set_tests_properties(xdxr_build_check PROPERTIES FIXTURES_REQUIRED xdxr_build_cases SKIP_RETURN_CODE 77)
     endif()
   endif()
   if(NOT Vulkan_GLSLANG_VALIDATOR_EXECUTABLE)
@@ -784,6 +784,23 @@ if(TARGET Vulkan::Headers)
     target_compile_options(d3d12_queue_wait_test PRIVATE /W4 /permissive- /utf-8)
     add_test(NAME d3d12_queue_wait COMMAND d3d12_queue_wait_test)
     set_tests_properties(d3d12_queue_wait PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 20)
+
+    # XDXR acceleration structures through BuildRaytracingAccelerationStructure (docs/d3d12_vulkan.md 4.8): the
+    # device builds them, tools/xdxr_bvh.py checks them.
+    add_executable(d3d12_xdxr_rt_test test/d3d12_xdxr_rt_test.cpp)
+    target_link_libraries(d3d12_xdxr_rt_test PRIVATE gta6rt_d3d12_com)
+    target_compile_definitions(d3d12_xdxr_rt_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_xdxr_rt_test PRIVATE /W4 /permissive- /utf-8)
+    set(LEONIDA_D3D12_XDXR_OUT "${CMAKE_CURRENT_BINARY_DIR}/d3d12_xdxr_cases")
+    file(MAKE_DIRECTORY "${LEONIDA_D3D12_XDXR_OUT}")
+    add_test(NAME d3d12_xdxr_rt COMMAND d3d12_xdxr_rt_test "${LEONIDA_D3D12_XDXR_OUT}")
+    set_tests_properties(d3d12_xdxr_rt PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60 FIXTURES_SETUP d3d12_xdxr_cases)
+    find_package(Python3 COMPONENTS Interpreter QUIET)
+    if(Python3_FOUND)
+      add_test(NAME d3d12_xdxr_rt_check COMMAND "${Python3_EXECUTABLE}" -I
+               "${CMAKE_CURRENT_SOURCE_DIR}/../tools/xdxr_bvh.py" check-build "${LEONIDA_D3D12_XDXR_OUT}" --rays 1000)
+      set_tests_properties(d3d12_xdxr_rt_check PROPERTIES FIXTURES_REQUIRED d3d12_xdxr_cases SKIP_RETURN_CODE 77)
+    endif()
 
     # GCL8's QueryInterface and its one method need an allocator and a list, not a Vulkan device.
     add_executable(d3d12_gcl8_test test/d3d12_gcl8_test.cpp)

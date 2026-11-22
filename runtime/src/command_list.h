@@ -578,6 +578,7 @@ struct RtTriangleGeometry {
     std::uint32_t index_type = 0;     // 0=NONE, 1=UINT16, 2=UINT32
     std::uint64_t transform_va = 0;
     bool opaque = true;
+    std::uint32_t flags = 0;          // D3D12_RAYTRACING_GEOMETRY_FLAGS (bit 0 opaque, bit 1 no duplicate any-hit)
 };
 
 // BLAS or TLAS build command (VK_KHR_acceleration_structure).

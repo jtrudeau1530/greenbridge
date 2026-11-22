@@ -119,6 +119,11 @@ struct VulkanDeviceInfo {
     // Optional VK_KHR_acceleration_structure + VK_KHR_deferred_host_operations + VK_KHR_ray_query are enabled:
     // GetRaytracingAccelerationStructurePrebuildInfo and BuildRaytracingAccelerationStructure (BLAS + TLAS) work.
     bool ray_tracing = false;
+    // BuildRaytracingAccelerationStructure writes the console's XDXR BVH4 records into the destination buffer
+    // (src/xdxr_build.h), the layout the game's translated traversal shaders read, instead of building a
+    // VkAccelerationStructureKHR; needs buffer_device_address and the GPU address arena. The standalone device sets it
+    // unless LEONIDA_RT_AS=khr (docs/d3d12_vulkan.md 4.8); with it set, ray_tracing is not enabled.
+    bool xdxr_acceleration_structures = false;
     // The core features enabled on `device`. Graphics PSOs that need independentBlend, fillModeNonSolid,
     // depthBiasClamp or dualSrcBlend are refused unless it is set here.
     VkPhysicalDeviceFeatures features{};

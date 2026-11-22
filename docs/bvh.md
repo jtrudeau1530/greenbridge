@@ -352,6 +352,10 @@ no BLAS and one with a singular transform. An instance record holds its BLAS add
 so BLAS addresses must be below 2^40, as console GPU addresses are. Where device addresses are wider (llvmpipe's are
 host pointers), the builder takes a bias that is added to the addresses read from instance descs.
 
+The Vulkan layer uses it for `BuildRaytracingAccelerationStructure` unless `LEONIDA_RT_AS=khr`
+(`docs/d3d12_vulkan.md` §4.8); `d3d12_xdxr_rt_test <dir>` builds a BLAS and a TLAS through the D3D12 API and writes
+them the same way.
+
 `vk_xdxr_build_test <dir>` builds nine synthetic cases on the GPU and writes each structure with a description of its
 scene. `xdxr_bvh.py check-build <dir>` validates them and traces rays against brute force. `ctest` runs both as
 `xdxr_build` and `xdxr_build_check`.
