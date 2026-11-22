@@ -168,6 +168,8 @@ endif()
 
 include(CTest)
 if(BUILD_TESTING)
+  add_executable(pipeline_cache_file_test test/pipeline_cache_file_test.cpp)
+  add_test(NAME pipeline_cache_file COMMAND pipeline_cache_file_test)
   if(WIN32)
     # Loader tests. They build their own PE images, so they need neither the game nor any other input.
     add_executable(loader_test
@@ -519,6 +521,9 @@ if(TARGET Vulkan::Headers)
       target_compile_definitions(typeless_rtv_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     endif()
     add_test(NAME typeless_rtv COMMAND typeless_rtv_test)
+    add_executable(pipeline_cache_snapshot_test test/pipeline_cache_snapshot_test.cpp)
+    target_link_libraries(pipeline_cache_snapshot_test PRIVATE Vulkan::Headers)
+    add_test(NAME pipeline_cache_snapshot COMMAND pipeline_cache_snapshot_test)
     add_executable(clear_color_test test/clear_color_test.cpp)
     target_link_libraries(clear_color_test PRIVATE Vulkan::Headers)
     if(WIN32)
