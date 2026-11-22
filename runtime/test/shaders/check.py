@@ -270,7 +270,10 @@ PIXEL_ENV = {"ps_vcc_x2": {"VKH_SGPRS": "0x1000,0,16,0", "VKH_HEAP": "0x1000=0x1
                                "VKH_HEAP": "0x1000=0xaedbe6ff,0x1004=0x00008800,0x1008=0x7fc10001,0x100c=0xc0200000"}}
 # ps_gather_wrap.asm (SHADER-36): image_gather4_l_o under each S# address mode, run by vk_texture_test (the 8x8 gradient
 # texture); the expected channels are derived in the .asm header.
-GATHER_WRAP = (5090733.0, 14942181.0, 258623.0, 9702309.0)
+TEXTURE_CONSTANTS = {
+    "ps_gather_wrap": (5090733.0, 14942181.0, 258623.0, 9702309.0),
+    "ps_array_resinfo": (8.0, 8.0, 12.0, 1.0),  # binding 3, index 1: two 6-face cubes, one mip
+}
 CLIP_TESTS = ("vs_clip", "vs_clip_param4", "vs_clip_undeclared")
 # One definition: a later assignment used to drop ps_texoff (and any entry added by an earlier assignment) from
 # the standalone run. Keep every pixel fixture in this tuple.
@@ -769,11 +772,12 @@ def pixels(tools, spirv, name, fmt, vertex="vs_ids"):
     return list(struct.iter_unpack(fmt, data)), out
 
 
-def gather_wrap_test(tools, spirv):
-    """ps_gather_wrap through vk_texture_test: every one of the 64x64 pixels must hold GATHER_WRAP."""
-    shader = os.path.join(spirv, "ps_gather_wrap.spv")
+def texture_constant_test(tools, spirv, name):
+    """Compare every pixel returned through vk_texture_test with the fixture reference."""
+    expected = TEXTURE_CONSTANTS[name]
+    shader = os.path.join(spirv, name + ".spv")
     if not os.path.isfile(shader):
-        return "missing ps_gather_wrap.spv"
+        return f"missing {name}.spv"
     with tempfile.TemporaryDirectory(prefix="leonida-gather-") as tmp:
         raw = Path(tmp) / "gather.raw"
         code, out = run(os.path.join(tools, "vk_texture_test" + EXE), os.path.join(spirv, "vs_ids.spv"), shader, raw,
@@ -781,8 +785,8 @@ def gather_wrap_test(tools, spirv):
         data = raw.read_bytes() if code == 0 and raw.is_file() else b""
     if len(data) != 64 * 64 * 16:
         return failure(code, out, 3)
-    wrong = sum(p != GATHER_WRAP for p in struct.iter_unpack("<4f", data))
-    return "" if not wrong else f"{wrong} of 4096 pixels differ from {GATHER_WRAP}"
+    wrong = sum(p != expected for p in struct.iter_unpack("<4f", data))
+    return "" if not wrong else f"{wrong} of 4096 pixels differ from {expected}"
 
 
 def texoff_words(px, py):
@@ -1045,7 +1049,8 @@ def main():
         results.append((name, clip_test(tools, spirv, name)))
     for name in PIXEL_TESTS:
         results.append((name, pixel_test(tools, spirv, name)))
-    results.append(("ps_gather_wrap", gather_wrap_test(tools, spirv)))
+    for name in TEXTURE_CONSTANTS:
+        results.append((name, texture_constant_test(tools, spirv, name)))
     results.append(("ps_tex", bindless_test(tools, spirv)))
     results.append(("ps_ssharp", sampler_test(tools, spirv)))
     for name in MIP_TEST_PASSES:

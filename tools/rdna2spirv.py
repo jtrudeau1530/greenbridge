@@ -6947,8 +6947,9 @@ class Gen:
         self.emit(f"{L['end']} = OpLabel")
 
     def image_misc(self, op, a, mods):
-        """image_get_resinfo / image_load_mip on 2D sampled images, image_atomic_umin on 2D r32ui storage images."""
+        """Query sampled image dimensions, load mip texels and handle storage image operations."""
         dim = next((m for m in mods if m.startswith("dim:")), "dim:SQ_RSRC_IMG_2D")
+        array_query = op == "image_get_resinfo" and dim == "dim:SQ_RSRC_IMG_2D_ARRAY"
         is3d_atomic = dim == "dim:SQ_RSRC_IMG_3D" and (op in self.IMG_ATOMICS or op == "image_atomic_cmpswap")
         if op == "image_store":
             self.image_store(a, mods, dim)
@@ -6975,7 +6976,7 @@ class Gen:
                     self.dst({"k": "vgpr", "r": vdata["r"] + out, "n": 1}, self.tou(comp))
                     out += 1
             return
-        if ((dim != "dim:SQ_RSRC_IMG_2D" and not is3d_atomic) or "a16" in mods
+        if ((dim != "dim:SQ_RSRC_IMG_2D" and not (is3d_atomic or array_query)) or "a16" in mods
                 or ("d16" in mods and op != "image_load_mip")):
             raise Unsupported(op + " " + dim.split("SQ_RSRC_IMG_")[-1])
         vdata, addr = a[0], self.addr_regs(a[1])
@@ -7063,20 +7064,30 @@ class Gen:
                 self.dst({"k": "vgpr", "r": vdata["r"], "n": 1}, old)
             return
         ip, img = self.tmp(), self.tmp()
-        self.emit(f"{ip} = OpAccessChain %_ptr_UC_img %images {idx}")
-        self.emit(f"{img} = OpLoad %img2d {ip}")
+        if array_query:
+            self.uses_tex_array = True
+            self.emit(f"{ip} = OpAccessChain %_ptr_UC_imga %images_arr {idx}")
+            self.emit(f"{img} = OpLoad %img2da {ip}")
+        else:
+            self.emit(f"{ip} = OpAccessChain %_ptr_UC_img %images {idx}")
+            self.emit(f"{img} = OpLoad %img2d {ip}")
         dm = next((m for m in mods if m.startswith("dmask:")), "dmask:0x1")
         dmask = int(dm.split(":")[1], 0)
         self.uses_query = True
         if op == "image_get_resinfo":
             lod = self.as_int(self.load_reg("vgpr", addr[0]))
             sz, lv = self.tmp(), self.tmp()
-            self.emit(f"{sz} = OpImageQuerySizeLod %v2int {img} {lod}")
+            size_type = "%v3int" if array_query else "%v2int"
+            self.emit(f"{sz} = OpImageQuerySizeLod {size_type} {img} {lod}")
             self.emit(f"{lv} = OpImageQueryLevels %int {img}")
-            w, h = self.tmp(), self.tmp()
-            self.emit(f"{w} = OpCompositeExtract %int {sz} 0")
-            self.emit(f"{h} = OpCompositeExtract %int {sz} 1")
-            vals = [w, h, self.as_int(self.cu(1)), lv]          # x=width, y=height, z=depth(1), w=mip levels
+            vals = []
+            for axis in range(3 if array_query else 2):
+                extent = self.tmp()
+                self.emit(f"{extent} = OpCompositeExtract %int {sz} {axis}")
+                vals.append(extent)
+            if not array_query:
+                vals.append(self.as_int(self.cu(1)))
+            vals.append(lv)
             out = 0
             for c in range(4):
                 if dmask >> c & 1:

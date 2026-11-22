@@ -1116,6 +1116,22 @@ def test_repeated_tbuffer_loads_share_normalization(make_shader):
     assert spv.count("FindUMsb") == 2
 
 
+def test_array_resinfo_queries_width_height_layers_and_mip_count(make_shader):
+    shader = make_shader(
+        "v_mov_b32_e32 v1, 1\n"
+        "image_get_resinfo v[4:7], v1, s[8:15] dmask:0xf dim:SQ_RSRC_IMG_2D_ARRAY\n"
+        "s_waitcnt vmcnt(0)\nexp mrt0 v4, v5, v6, v7 done vm\ns_endpgm\n",
+        name="ps_array_resinfo",
+    )
+    asm = shader.translate()
+    shader.validate(asm)
+    assert "OpDecorate %images_arr Binding 3" in asm
+    size = re.search(r"(%\w+) = OpImageQuerySizeLod %v3int (%\w+) %\w+", asm)
+    assert size and f"OpImageQueryLevels %int {size[2]}" in asm
+    for axis in range(3):
+        assert f"OpCompositeExtract %int {size[1]} {axis}" in asm
+
+
 def test_image_sample_d16_avoids_packhalf2x16(make_shader):
     """d16 image_sample packs f32->f16 via integer ops (no PackHalf2x16) and pass spirv-val."""
     sample_asm = (
