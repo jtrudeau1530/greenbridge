@@ -79,6 +79,15 @@ void pump() {
     }
 }
 
+bool has_interactive_window_station() {
+    HWINSTA station = GetProcessWindowStation();
+    if (!station) return true;  // Unknown environment: let window creation report the real failure.
+    USEROBJECTFLAGS flags{};
+    DWORD bytes = 0;
+    if (!GetUserObjectInformationW(station, UOI_FLAGS, &flags, sizeof(flags), &bytes)) return true;
+    return (flags.dwFlags & WSF_VISIBLE) != 0;
+}
+
 void set_client_size(HWND window, int width, int height) {
     RECT rect{0, 0, width, height};
     AdjustWindowRect(&rect, WS_OVERLAPPEDWINDOW, FALSE);
@@ -170,17 +179,26 @@ void install(PFN_vkGetInstanceProcAddr instance_proc, VkInstance instance, VkDev
 
 int main() {
     vktest::Device d;
-    if (!d.create(true)) {  // no Vulkan loader, device or presentation extensions: nothing to test (ctest: skipped)
-        std::fprintf(stderr, "d3d12_present_test: no Vulkan device with presentation, skipped\n");
+    const auto device_status = d.initialize(true);
+    if (device_status == vktest::DeviceStatus::unavailable) {
+        std::fprintf(stderr, "SKIP: no usable Vulkan presentation device\n");
         return 77;
     }
+    EXPECT(device_status == vktest::DeviceStatus::ready);
 
     WNDCLASSW window_class{};
     window_class.lpfnWndProc = window_proc;
     window_class.hInstance = GetModuleHandleW(nullptr);
     window_class.lpszClassName = L"LeonidaPresentTest";
     window_class.hCursor = LoadCursorW(nullptr, reinterpret_cast<LPCWSTR>(IDC_ARROW));
-    EXPECT(RegisterClassW(&window_class));
+    if (!has_interactive_window_station()) {
+        std::fprintf(stderr, "SKIP: the process has no interactive window station\n");
+        return 77;
+    }
+    if (!RegisterClassW(&window_class)) {
+        std::fprintf(stderr, "FAIL: cannot register a window class (Win32 error %lu)\n", GetLastError());
+        return 1;
+    }
     constexpr int width = 320, height = 240;
     RECT frame_rect{0, 0, width, height};
     AdjustWindowRect(&frame_rect, WS_OVERLAPPEDWINDOW, FALSE);
@@ -188,7 +206,10 @@ int main() {
                                   WS_OVERLAPPEDWINDOW, 100, 100, frame_rect.right - frame_rect.left,
                                   frame_rect.bottom - frame_rect.top, nullptr, nullptr, window_class.hInstance,
                                   nullptr);
-    EXPECT(window);
+    if (!window) {
+        std::fprintf(stderr, "FAIL: cannot create the presentation window (Win32 error %lu)\n", GetLastError());
+        return 1;
+    }
     ShowWindow(window, SW_SHOWNORMAL);
     SetForegroundWindow(window);
     UpdateWindow(window);
