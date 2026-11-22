@@ -1,0 +1,291 @@
+from __future__ import annotations
+
+"""Semantic interpreter tests for RDNA2 64-bit vector arithmetic shift right (v_ashrrev_i64).
+
+RDNA2 ISA definition:
+  v_ashrrev_i64 dst, src0, src1
+  - dst: 64-bit VGPR pair v[d:d+1]
+  - src0: 32-bit shift count (VGPR, SGPR, or inline constant). Bits [5:0] define the shift amount.
+  - src1: 64-bit input operand (VGPR pair v[s:s+1], SGPR pair s[s:s+1], or inline constant).
+  - Operation: dst = (int64)src1 >> (src0 & 63), sign-extended with bit 63 copied into upper bits.
+"""
+
+import gc
+import os
+import random
+import struct
+import sys
+import tempfile
+import unittest
+import warnings
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(os.path.dirname(HERE))
+TOOLS_DIR = os.environ.get("LEONIDA_TOOLS_DIR") or os.path.join(ROOT, "tools")
+
+sys.dont_write_bytecode = True
+if TOOLS_DIR not in sys.path:
+    sys.path.insert(0, TOOLS_DIR)
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+
+import rdna2spirv  # noqa: E402
+import spirv_mini_interp as si  # noqa: E402
+
+MASK32 = 0xFFFFFFFF
+MASK64 = 0xFFFFFFFFFFFFFFFF
+SIGN32 = 0x80000000
+SIGN64 = 1 << 63
+STUB_DXBC = b"DXBC" + bytes(24) + struct.pack("<I", 0) + bytes(4)
+
+_TMP_DIR: tempfile.TemporaryDirectory | None = None
+_SRC_PATH: str | None = None
+
+
+def setUpModule() -> None:
+    global _TMP_DIR, _SRC_PATH
+    _TMP_DIR = tempfile.TemporaryDirectory()
+    disasm_dir = os.path.join(_TMP_DIR.name, "disasm")
+    os.mkdir(disasm_dir)
+    _SRC_PATH = os.path.join(disasm_dir, "ps_ashr_i64.s")
+    with open(os.path.join(_TMP_DIR.name, "ps_ashr_i64.dxbc"), "wb") as f:
+        f.write(STUB_DXBC)
+
+
+def tearDownModule() -> None:
+    global _TMP_DIR, _SRC_PATH
+    if _TMP_DIR is not None:
+        gc.collect()
+        try:
+            _TMP_DIR.cleanup()
+        except Exception:
+            pass
+        _TMP_DIR = None
+        _SRC_PATH = None
+
+
+def u32(x: int) -> int:
+    """Normalize integer to 32-bit unsigned."""
+    return x & MASK32
+
+
+def s32(x: int) -> int:
+    """Interpret 32-bit unsigned integer as signed two's complement."""
+    x &= MASK32
+    return x - (1 << 32) if (x & SIGN32) else x
+
+
+def u64(x: int) -> int:
+    """Normalize integer to 64-bit unsigned."""
+    return x & MASK64
+
+
+def s64(x: int) -> int:
+    """Interpret 64-bit unsigned integer as signed two's complement."""
+    x &= MASK64
+    return x - (1 << 64) if (x & SIGN64) else x
+
+
+def decompose_u64(val: int) -> tuple[int, int]:
+    """Decompose a 64-bit unsigned integer into (lo, hi) 32-bit dwords."""
+    val &= MASK64
+    return val & MASK32, (val >> 32) & MASK32
+
+
+def compose_u64(lo: int, hi: int) -> int:
+    """Compose two 32-bit dwords into a 64-bit unsigned integer."""
+    return ((hi & MASK32) << 32) | (lo & MASK32)
+
+
+def ref_ashr_i64(shift: int, val: int) -> int:
+    """Ideal reference oracle for v_ashrrev_i64: (int64)val >> (shift & 63)."""
+    sh = shift & 63
+    return (s64(val) >> sh) & MASK64
+
+
+def emulate_ashr_i64_dwords(shift: int, lo: int, hi: int) -> tuple[int, int]:
+    """Emulate 64-bit arithmetic shift right using 32-bit register pair datapath."""
+    sh = shift & 63
+    lo &= MASK32
+    hi &= MASK32
+
+    if sh == 0:
+        return lo, hi
+    if sh < 32:
+        res_lo = ((lo >> sh) | ((hi << (32 - sh)) & MASK32)) & MASK32
+        res_hi = (s32(hi) >> sh) & MASK32
+        return res_lo, res_hi
+    if sh == 32:
+        res_lo = hi
+        res_hi = MASK32 if (hi & SIGN32) else 0
+        return res_lo, res_hi
+
+    sh_hi = sh - 32
+    res_lo = (s32(hi) >> sh_hi) & MASK32
+    res_hi = MASK32 if (hi & SIGN32) else 0
+    return res_lo, res_hi
+
+
+EXPORT_HALVES = [
+    "v_and_b32 v5, 0xffff, v0",
+    "v_lshrrev_b32 v6, 16, v0",
+    "v_and_b32 v7, 0xffff, v1",
+    "v_lshrrev_b32 v8, 16, v1",
+    "v_or_b32 v5, 0x40000000, v5",
+    "v_or_b32 v6, 0x40000000, v6",
+    "v_or_b32 v7, 0x40000000, v7",
+    "v_or_b32 v8, 0x40000000, v8",
+]
+
+
+def run_lines(lines: list[str]) -> int:
+    """Run assembly lines, export v[0:1] in 16-bit halves, return as one 64-bit value."""
+    if _TMP_DIR is None:
+        setUpModule()
+    assert _SRC_PATH is not None
+
+    body = list(lines) + EXPORT_HALVES
+    asm = "; test_alu_ashr_i64\n" + "".join(f"\t{ln}\n" for ln in body) + "\texp mrt0 v5, v6, v7, v8 done vm\n\ts_endpgm\n"
+    with open(_SRC_PATH, "w", encoding="utf-8") as f:
+        f.write(asm)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", ResourceWarning)
+        spv = rdna2spirv.translate(_SRC_PATH)
+    words = si.run_fragment(spv)["%out_mrt0"]
+    assert all((x >> 16) == 0x4000 for x in words), [hex(x) for x in words]
+    return sum((x & 0xFFFF) << (16 * i) for i, x in enumerate(words))
+
+
+def run_ashr_op(shift: int, val: int, src_reg: str = "v[2:3]", dst_reg: str = "v[0:1]") -> int:
+    """Helper to load operands into registers, execute v_ashrrev_i64, and export result."""
+    lo, hi = decompose_u64(val)
+    lines = [
+        f"v_mov_b32 v4, {shift:#x}",
+        f"v_mov_b32 v2, {lo:#x}",
+        f"v_mov_b32 v3, {hi:#x}",
+        f"v_ashrrev_i64 {dst_reg}, v4, {src_reg}",
+    ]
+    if dst_reg != "v[0:1]":
+        parts = dst_reg.strip("v[]").split(":")
+        d0, d1 = int(parts[0]), int(parts[1])
+        lines.extend([
+            f"v_mov_b32 v0, v{d0}",
+            f"v_mov_b32 v1, v{d1}",
+        ])
+    return run_lines(lines)
+
+
+class TestRefOracle(unittest.TestCase):
+    """Unit tests validating reference oracle, 32-bit dword pair emulation, and basic shader execution."""
+
+    def test_u64_s64_conversions(self) -> None:
+        self.assertEqual(u64(0), 0)
+        self.assertEqual(s64(0), 0)
+        self.assertEqual(s64(1), 1)
+        self.assertEqual(s64(0x7FFFFFFFFFFFFFFF), (1 << 63) - 1)
+        self.assertEqual(s64(0x8000000000000000), -(1 << 63))
+        self.assertEqual(s64(MASK64), -1)
+
+    def test_decompose_compose_roundtrip(self) -> None:
+        values = [
+            0,
+            1,
+            MASK64,
+            SIGN64,
+            SIGN64 - 1,
+            0x123456789ABCDEF0,
+            0xFEDCBA9876543210,
+            0x00000000FFFFFFFF,
+            0xFFFFFFFF00000000,
+        ]
+        for val in values:
+            lo, hi = decompose_u64(val)
+            self.assertEqual(compose_u64(lo, hi), val)
+
+    def test_dword_emulation_matches_ref_oracle(self) -> None:
+        test_values = [
+            0,
+            1,
+            -1 & MASK64,
+            SIGN64,
+            SIGN64 - 1,
+            0x123456789ABCDEF0,
+            0xFEDCBA9876543210,
+            0x8000000000000001,
+            0x7FFFFFFFFFFFFFFF,
+            0xAAAAAAAA55555555,
+            0x55555555AAAAAAAA,
+        ]
+        for val in test_values:
+            lo, hi = decompose_u64(val)
+            for shift in range(64):
+                ref = ref_ashr_i64(shift, val)
+                elo, ehi = emulate_ashr_i64_dwords(shift, lo, hi)
+                got = compose_u64(elo, ehi)
+                self.assertEqual(got, ref, f"Mismatch at val={hex(val)}, shift={shift}")
+
+    def test_identity_shift_zero(self) -> None:
+        cases = [0, 1, MASK64, SIGN64, 0x0123456789ABCDEF, 0x8000000000000001]
+        for val in cases:
+            self.assertEqual(ref_ashr_i64(0, val), val)
+            self.assertEqual(ref_ashr_i64(64, val), val)
+
+    def test_basic_positive_values(self) -> None:
+        val = 0x4000000000000000
+        self.assertEqual(ref_ashr_i64(1, val), 0x2000000000000000)
+        self.assertEqual(ref_ashr_i64(2, val), 0x1000000000000000)
+        self.assertEqual(ref_ashr_i64(62, val), 1)
+        self.assertEqual(ref_ashr_i64(63, val), 0)
+
+    def test_basic_negative_values(self) -> None:
+        val = SIGN64
+        self.assertEqual(ref_ashr_i64(1, val), 0xC000000000000000)
+        self.assertEqual(ref_ashr_i64(2, val), 0xE000000000000000)
+        self.assertEqual(ref_ashr_i64(31, val), 0xFFFFFFFF00000000)
+        self.assertEqual(ref_ashr_i64(32, val), 0xFFFFFFFF80000000)
+        self.assertEqual(ref_ashr_i64(63, val), MASK64)
+
+    def test_shader_execution_basic(self) -> None:
+        val = 0x8000000000000000
+        got = run_ashr_op(1, val)
+        self.assertEqual(got, 0xC000000000000000)
+        got = run_ashr_op(32, val)
+        self.assertEqual(got, 0xFFFFFFFF80000000)
+
+    def test_shader_immediate_shift_operand(self) -> None:
+        val = 0x8000000000000000
+        lo, hi = decompose_u64(val)
+        lines = [
+            f"v_mov_b32 v2, {lo:#x}",
+            f"v_mov_b32 v3, {hi:#x}",
+            "v_ashrrev_i64 v[0:1], 4, v[2:3]",
+        ]
+        got = run_lines(lines)
+        self.assertEqual(got, ref_ashr_i64(4, val))
+
+    def test_shader_scalar_pair_operand(self) -> None:
+        val = 0x8000000000000000
+        lo, hi = decompose_u64(val)
+        lines = [
+            f"s_mov_b32 s2, {lo:#x}",
+            f"s_mov_b32 s3, {hi:#x}",
+            "v_ashrrev_i64 v[0:1], 8, s[2:3]",
+        ]
+        got = run_lines(lines)
+        self.assertEqual(got, ref_ashr_i64(8, val))
+
+    def test_shader_vector_pair_operand(self) -> None:
+        val = 0xFEDCBA9876543210
+        lo, hi = decompose_u64(val)
+        lines = [
+            f"v_mov_b32 v2, {lo:#x}",
+            f"v_mov_b32 v3, {hi:#x}",
+            "v_mov_b32 v4, 16",
+            "v_ashrrev_i64 v[0:1], v4, v[2:3]",
+        ]
+        got = run_lines(lines)
+        self.assertEqual(got, ref_ashr_i64(16, val))
+
+
+if __name__ == "__main__":
+    unittest.main()
