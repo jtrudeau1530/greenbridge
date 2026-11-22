@@ -21,6 +21,7 @@
 // and binds the device's set (rt::d3d12::bindless_set). Without glslangValidator the GPU readbacks are skipped.
 // No game data.
 // Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation.
+#include "shader_fixture_path.h"
 #include "vk_test_device.h"
 #include "../shims/d3d12_com.h"
 #include "../shims/d3d12_xs_device.h"
@@ -102,7 +103,7 @@ struct SampleKeys {
 };
 
 VkShaderModule load_shader(vktest::Device& d, const char* path) {
-    std::ifstream file(path, std::ios::binary | std::ios::ate);
+    std::ifstream file(vktest::shader_fixture_path(path), std::ios::binary | std::ios::ate);
     if (!file) return VK_NULL_HANDLE;
     std::vector<std::uint32_t> code(std::size_t(file.tellg()) / 4);
     file.seekg(0);
