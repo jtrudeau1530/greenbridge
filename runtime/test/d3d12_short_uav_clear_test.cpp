@@ -120,11 +120,21 @@ int main() {
         {DXGI_FORMAT_R16_UNORM, 2, true, {half, 0, 0, 0}, {0x00, 0x80}},
     };
     unsigned cases = 0;
-    const auto check = [&](const Format& format, UINT first, UINT count, const std::vector<D3D12_RECT>& rects) {
+    const auto check = [&](copycmp::Run& reference_run, const Format& format, UINT first, UINT count,
+                           const std::vector<D3D12_RECT>& rects) {
         std::vector<unsigned char> actual, reference;
         const auto literal = expected(format, first, count, rects);
-        if (!run(b, format, first, count, rects, reference) || reference != literal ||
-            !run(a, format, first, count, rects, actual) || actual != reference) {
+        const auto matches = [&](const char* backend, const std::vector<unsigned char>& bytes) {
+            if (bytes == literal) return true;
+            const auto mismatch = std::mismatch(bytes.begin(), bytes.end(), literal.begin());
+            const auto at = std::size_t(mismatch.first - bytes.begin());
+            std::fprintf(stderr, "%s byte %zu: got %02x, literal %02x\n", backend, at,
+                         unsigned(bytes[at]), unsigned(literal[at]));
+            return false;
+        };
+        if (!run(reference_run, format, first, count, rects, reference) ||
+            !matches(reference_run.device == host.p ? adapter.c_str() : "WARP control", reference) ||
+            !run(a, format, first, count, rects, actual) || !matches("Vulkan", actual)) {
             std::fprintf(stderr, "format %u first %u count %u rects %zu failed\n",
                          unsigned(format.format), first, count, rects.size());
             return false;
@@ -134,11 +144,34 @@ int main() {
     };
     for (const auto& format : formats) {
         for (UINT first = 0; first < 4; ++first)
-            for (UINT count = 1; count <= 8; ++count) if (!check(format, first, count, {})) return 1;
-        if (!check(format, 256 / format.bytes - 1, 1, {})) return 1;
-        if (!check(format, 1, 8, {{-3, 0, 1, 1}, {0, 0, 2, 1}, {3, 0, 4, 1}, {7, 0, 20, 1}, {0, 1, 8, 2}})) return 1;
-        if (!check(format, 1, 8, {{-3, 0, 0, 1}, {0, 1, 8, 2}, {8, 0, 10, 1}})) return 1;
+            for (UINT count = 1; count <= 8; ++count) if (!check(b, format, first, count, {})) return 1;
+        if (!check(b, format, 256 / format.bytes - 1, 1, {})) return 1;
+        // Portable comparisons stay on the buffer's one row. NVIDIA D3D12 was independently observed to
+        // ignore Y for an out-of-row rectangle where WARP/AMD leave the buffer untouched (#2960).
+        if (!check(b, format, 1, 8, {{-3, 0, 1, 1}, {0, 0, 2, 1}, {3, 0, 4, 1}, {7, 0, 20, 1}})) return 1;
+        if (!check(b, format, 1, 8, {{-3, 0, 0, 1}, {8, 0, 10, 1}})) return 1;
     }
-    std::printf("short buffer UAV clears: %u cases matched host and literal bytes, including untouched neighbours\n", cases);
+    const unsigned portable_cases = cases;
+    std::printf("short buffer UAV clears: %u portable cases matched host and literal bytes, including untouched neighbours\n",
+                portable_cases);
+
+    // Retain the original out-of-row coverage, explicitly against WARP even when the selected native reference
+    // is NVIDIA. This pins the existing replay policy without claiming a uniform native-driver result.
+    copycmp::Ptr<IDXGIFactory4> factory;
+    copycmp::Ptr<IDXGIAdapter> warp_adapter;
+    copycmp::Ptr<ID3D12Device> warp;
+    if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory.p))) ||
+        FAILED(factory->EnumWarpAdapter(IID_PPV_ARGS(&warp_adapter.p))) ||
+        FAILED(D3D12CreateDevice(warp_adapter.p, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&warp.p)))) return 1;
+    copycmp::Run warp_run;
+    if (!warp_run.init(warp.p, false)) return 1;
+    for (const auto& format : formats) {
+        if (!check(warp_run, format, 1, 8, {{0, 1, 8, 2}})) return 1;
+        if (!check(warp_run, format, 1, 8,
+                   {{-3, 0, 1, 1}, {0, 0, 2, 1}, {3, 0, 4, 1}, {7, 0, 20, 1}, {0, 1, 8, 2}})) return 1;
+        if (!check(warp_run, format, 1, 8, {{-3, 0, 0, 1}, {0, 1, 8, 2}, {8, 0, 10, 1}})) return 1;
+    }
+    std::printf("short buffer UAV clears: %u WARP-only out-of-row controls matched literal bytes; excluded from native comparisons\n",
+                cases - portable_cases);
     return vk.validation_errors() ? 1 : 0;
 }

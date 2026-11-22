@@ -272,6 +272,9 @@ What is implemented (all of it testable without the game):
     callers without `copy_scratch` still refuse these short ranges before emitting anything.
     `d3d12_short_uav_clear_test` compares Uint/Float whole-view and clipped/overlapping rectangle clears against
     WARP (CTest) or `LEONIDA_HOST_ADAPTER` (manual runs), checking the entire buffer against literal patterns.
+    Portable native comparisons keep rectangles on row 0. Out-of-row controls run separately against WARP:
+    NVIDIA D3D12 was observed to ignore Y where WARP and AMD preserve the buffer, so those controls do not assert
+    that native drivers behave uniformly. This test distinction does not change the replay policy.
   - Textures: the values become one element of the view's format, and that element is cleared into the image as
     the value that decodes it in the image's own format, so a typeless texture viewed as UINT gets exactly the bits
     asked for. Exact for every typed-UAV format except the SNORM pattern `0x80..` (Vulkan writes -1.0 as `0x81..`)
