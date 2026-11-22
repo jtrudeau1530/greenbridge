@@ -22,7 +22,11 @@ The shaders are two ordinary containers from `shaders.rpf`, carved and translate
 Both disassemble with no invalid word, translate, and pass `spirv-val`; `tools/shader_link_check.py check` reports
 the pair compatible. At 128×128 the draw covers **12,804 of 16,384 pixels (0.781)** and the centre pixel is
 `(0.498, 0.496, 0.0, 1.0)`: the model is the disc its geometry projects to, and the colour is its own UV map. The
-PPM the harness writes is a real image of the model; the test also checks that the centre is not the clear value.
+test derives the expected centre UV from the mesh on the CPU (`0.4978, 0.4965`), so the GPU pixel has to match
+the geometry, not just be non-clear; it also requires the `[0, 0]` corner to keep the clear value and bounds the
+coverage at 0.5–0.99, which an all-opaque image cannot pass. The `OracleTests` run those checks on synthetic
+images without a GPU or a package: the accepted fixture, an all-opaque image, a swapped UV and a short buffer.
+The PPM the harness writes is a real image of the model; it stays in the user's folder.
 
 ## 2. Why it matters
 

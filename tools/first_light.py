@@ -192,6 +192,47 @@ def write_mesh(path: str, vertices, indices) -> None:
         f.write(struct.pack(f"<{len(indices)}I", *indices))
 
 
+def pixel_ndc(px: int, py: int, width: int, height: int) -> tuple[float, float]:
+    """The NDC of a pixel centre under the harness's viewport (y grows down, like Vulkan)."""
+    return (px + 0.5) / width * 2.0 - 1.0, (py + 0.5) / height * 2.0 - 1.0
+
+
+def barycentric(px, py, ax, ay, bx, by, cx, cy):
+    """The three barycentric weights of (px, py) in the triangle, or None outside it (either winding)."""
+    det = (by - cy) * (ax - cx) + (cx - bx) * (ay - cy)
+    if abs(det) < 1e-12:
+        return None
+    w0 = ((by - cy) * (px - cx) + (cx - bx) * (py - cy)) / det
+    w1 = ((cy - ay) * (px - cx) + (ax - cx) * (py - cy)) / det
+    w2 = 1.0 - w0 - w1
+    if min(w0, w1, w2) < -1e-6 or max(w0, w1, w2) > 1.0 + 1e-6:
+        return None
+    return w0, w1, w2
+
+
+def uv_at(vertices, indices, px: int, py: int, width: int, height: int):
+    """The UV the last triangle covering this pixel centre writes (no depth test: the last primitive wins)."""
+    x, y = pixel_ndc(px, py, width, height)
+    found = None
+    for i in range(0, len(indices), 3):
+        a, b, c = (vertices[indices[i + k]] for k in range(3))
+        weights = barycentric(x, y, a[0], a[1], b[0], b[1], c[0], c[1])
+        if weights:
+            found = (
+                weights[0] * a[3] + weights[1] * b[3] + weights[2] * c[3],
+                weights[0] * a[4] + weights[1] * b[4] + weights[2] * c[4],
+            )
+    return found
+
+
+def clear_pixel(vertices, indices, width: int, height: int):
+    """A corner the mesh does not cover, which must keep the harness clear value."""
+    for px, py in ((0, 0), (width - 1, 0), (0, height - 1), (width - 1, height - 1)):
+        if uv_at(vertices, indices, px, py, width, height) is None:
+            return [px, py]
+    return None
+
+
 def find_harness(explicit: str | None) -> str:
     for candidate in (
         explicit,
@@ -337,6 +378,13 @@ def main(argv=None) -> int:
         if not a.no_fit:
             vertices = fit(vertices, a.width, a.height, True, not a.keep_z)
         write_mesh(os.path.join(out_dir, "mesh.bin"), vertices, indices)
+    centre_pixel = [a.width // 2, a.height // 2]
+    centre_uv = (
+        uv_at(vertices, indices, centre_pixel[0], centre_pixel[1], a.width, a.height)
+        if vertices
+        else None
+    )
+    clear = clear_pixel(vertices, indices, a.width, a.height) if vertices else None
     manifest = {
         "vs": {
             "name": picked[0]["name"],
@@ -354,6 +402,11 @@ def main(argv=None) -> int:
         "width": a.width,
         "height": a.height,
         "min_coverage": a.min_coverage,
+        "max_coverage": 0.99,
+        "centre_pixel": centre_pixel,
+        "centre_uv": list(centre_uv) if centre_uv else None,
+        "clear_pixel": clear,
+        "clear": -1.0,
         "files": {"vs": "vs.spv", "ps": "ps.spv", "mesh": "mesh.bin"},
     }
     with open(os.path.join(out_dir, "manifest.json"), "w", encoding="utf-8") as f:
