@@ -154,6 +154,31 @@ used as base colour, and materials without a resolvable match stay untextured cl
 option the exporter keeps its existing first-resolvable-reference behaviour, because these hash
 roles are measured only on the character corpus.
 
+## The Mandy search
+
+Mandy is a KeyLento persistent/cutscene character schedule, not a unique drawable. `common.rpf`
+contains the schedule entry `KeyLento/Perschars/Peds/Unique/Mandy` (pack
+`PSP_KeyLento_perschars_peds`) in the `CPedScheduleInfoManager` XML. A read-only search of the
+1.0.2.1 package found no `mandy`/`cs_mandy`/`ig_mandy`/`mp_mandy` drawable or fragment:
+
+| Container | Search | Mandy drawable |
+|---|---|---|
+| `packs.rpf` | 144,364 streams / 9.74 GB; 24,034 decoded models; 12,338 name records | none |
+| `data.rpf` | 28,509 streams / 1.41 GB | none (localization/UI text only) |
+| `common.rpf` | 954 streams / 50 MB | none (schedule and ped-appearance XML) |
+| `levels.rpf` | 2,051 page-aligned nested archives, every zlib stream's first 4 MiB | none (an iFruit billboard and a house photo prop are the only name hits) |
+| `story000.rpf` | 0-4 GiB and the 14 GiB region | none (animation clips `*_mandy.clip`, no drawable) |
+| `story000_script.rpf`, `script.rpf`, `shared_minigame000.rpf`, rest-of-world, `audio.rpf`, `anim.rpf`, `movies.rpf`, `textures.rpf`/peds TTPF | full raw scans | none |
+
+The name controls resolve `cs_kenton`, `u_f_o_rhonda`, `cs_monalisa` and `cs_lucia`; Mandy does
+not. The delivered `mandy/` preview export is therefore a clearly labelled `cs_monalisa` proxy,
+not a verified Mandy model.
+
+Caveats: `levels.rpf` was prefix-bounded at 4 MiB per inflated stream, raw RSC8 bodies and
+Bink/opaque regions were not decoded, and the encrypted RPF9 table of contents prevents a full
+path enumeration (27 top-level entries remain). The evidence supports a shared ped-appearance
+actor assembled from existing components, not a unique `mandy` resource.
+
 ## Reproduction
 
 The measurement tools were local and are not part of this repository. A reader can reproduce
