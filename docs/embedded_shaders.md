@@ -50,7 +50,13 @@ the **whole container** to the compute-PSO call: at `0x180021330` it loads `DAT_
 `+0x1f0` (slot 62) receives that pointer, its size and two zero words. `FUN_18001d400` adds two more PSOs,
 `XDXR PostBuildInfoQuery` (0x14a4 bytes) and `XDXR GetBVHCompactedSize`. `bvh_builder_test` measures **53** PSO
 creations during construction over the **52** containers ([d3d12_vulkan.md](d3d12_vulkan.md) A.2), so one
-container is created twice; which one is **Open**.
+container is created twice: **`GetBVHCompactedSize`** (RT-182). With `LEONIDA_BVH_RECORD62=1` the test prints each
+creation's container with its `ILDN` module name and the first bytes of its digest: creations 1 to 51 are 51
+distinct containers, `GetBVHCompactedSize` (5,284 bytes, 0x14a4) among them at 47; creation 52 is
+`CopyAndCompactBVH` (4,404 bytes, 0x1134); creation 53 is `GetBVHCompactedSize` again, with the same digest and
+size. So the 0x14a4-byte container `FUN_18001d400` passes for `XDXR PostBuildInfoQuery` is the
+`GetBVHCompactedSize` module, and the PSO for it is created twice. Measured on 1.0.2.1 with an RTX 5080 (driver
+621.01): all 53 creations return `S_OK`.
 
 ## 3. The 52 modules
 
