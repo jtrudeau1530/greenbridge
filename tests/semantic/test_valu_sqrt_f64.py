@@ -724,5 +724,69 @@ class TestSIMDMultiLaneDivergence(unittest.TestCase):
             self.assertEqual(bits_to_f64(state.get_vgpr64(lane, 2)), 100.0)
 
 
+class TestRegisterAliasing(unittest.TestCase):
+    """Unit tests for register aliasing and in-place operand preservation."""
+
+    def setUp(self) -> None:
+        self.scalar_interp = ScalarInterpreter()
+        self.simd_interp = SIMDInterpreter()
+
+    def test_dst_alias_src_inplace(self) -> None:
+        state = ScalarMachineState()
+        state.set_vgpr64(0, f64_to_bits(16.0))
+        state.set_vgpr64(2, f64_to_bits(999.0))
+        instr = VSqrtF64Instruction(
+            dst=RegPair(0, RegType.VGPR),
+            src=VOP3Operand(RegPair(0, RegType.VGPR)),
+        )
+        self.scalar_interp.step(instr, state)
+        self.assertEqual(bits_to_f64(state.get_vgpr64(0)), 4.0)
+        # Unrelated register untouched
+        self.assertEqual(bits_to_f64(state.get_vgpr64(2)), 999.0)
+
+    def test_inplace_iterative_convergence(self) -> None:
+        # Applying sqrt repeatedly converges towards 1.0
+        state = ScalarMachineState()
+        state.set_vgpr64(0, f64_to_bits(65536.0))
+        instr = VSqrtF64Instruction(
+            dst=RegPair(0, RegType.VGPR),
+            src=VOP3Operand(RegPair(0, RegType.VGPR)),
+        )
+        # 65536 -> 256 -> 16 -> 4 -> 2
+        for expected in [256.0, 16.0, 4.0, 2.0]:
+            self.scalar_interp.step(instr, state)
+            self.assertEqual(bits_to_f64(state.get_vgpr64(0)), expected)
+
+    def test_partial_overlap_misaligned_alias(self) -> None:
+        # Destination v[1:2] partially overlaps source v[0:1] (shares v[1])
+        state = ScalarMachineState()
+        bits_src = f64_to_bits(16.0)
+        state.set_vgpr64(0, bits_src)
+        lo0, hi0 = f64_bits_to_words(bits_src)
+
+        instr = VSqrtF64Instruction(
+            dst=RegPair(1, RegType.VGPR),
+            src=VOP3Operand(RegPair(0, RegType.VGPR)),
+        )
+        res_bits = self.scalar_interp.step(instr, state)
+        self.assertEqual(bits_to_f64(res_bits), 4.0)
+        self.assertEqual(state.get_vgpr64(1), res_bits)
+        # v[0] should remain unchanged lo0
+        self.assertEqual(state.vgprs[0], lo0)
+
+    def test_simd_multi_lane_aliasing(self) -> None:
+        state = SIMDState(num_lanes=32, exec_mask=0xFFFF_FFFF)
+        for lane in range(32):
+            state.set_vgpr64(lane, 0, f64_to_bits(float(lane * lane)))
+
+        instr = VSqrtF64Instruction(
+            dst=RegPair(0, RegType.VGPR),
+            src=VOP3Operand(RegPair(0, RegType.VGPR)),
+        )
+        self.simd_interp.step(instr, state)
+        for lane in range(32):
+            self.assertEqual(bits_to_f64(state.get_vgpr64(lane, 0)), float(lane))
+
+
 if __name__ == "__main__":
     unittest.main()
