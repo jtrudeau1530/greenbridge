@@ -14,6 +14,11 @@ VKC_HEAP_INIT). So every root descriptor points at a zeroed region past the tabl
 report says how many words each one changed. A run passes when it exits 0, the Khronos validation layer (when
 installed) reports no error, and a second run writes the same heap bytes.
 
+--checked also runs the programs whose effect reads straight off their code with inputs chosen for them, and compares
+every byte they write (CHECKED below). Each takes a count and writes that many 16- or 8-byte entries from thread
+index 0 up; 32 threads per group, so one group with a count of 20 also shows that entries past the count are left
+alone.
+
 The three rehydration programs (Box16Rehydration, Box32Rehydration, LeafRehydration) belong to TEST-376, which checks
 them against tools/bvh_rehydrate.py; --include-rehydration runs them too.
 
@@ -102,6 +107,92 @@ def smoke(spirv_dir, vkc, *, table_qword, heap_bytes, validation, timeout, inclu
     return results
 
 
+# ---- checked runs ----
+#
+# Root-table fields as each program reads them (offsets in the table at s[0:1]; addresses are 64-bit, counts and
+# values 32-bit), and what it writes. FILL marks the bytes a program must leave alone.
+DST, SRC = 0x2000, 0x6000          # regions past the 4 KiB table
+FILL = 0xAA
+COUNT = 20                          # within one 32-thread group
+
+
+def _u32(heap, at):
+    return struct.unpack_from("<I", heap, at)[0]
+
+
+def _table(fields):
+    table = bytearray(TABLE_QWORDS * 8)
+    for offset, size, value in fields:
+        struct.pack_into("<Q" if size == 8 else "<I", table, offset, value)
+    return bytes(table)
+
+
+def _expect_entries(heap, base, stride, count, entry):
+    """Problems with `count` entries of `stride` bytes at `base` (entry(i) gives the expected bytes) and the FILL after
+    them, up to one more group's worth of entries."""
+    problems = []
+    for i in range(count):
+        got = bytes(heap[base + i * stride: base + (i + 1) * stride])
+        if got != entry(i):
+            problems.append(f"entry {i}: {got.hex()} != {entry(i).hex()}")
+    tail = bytes(heap[base + count * stride: base + 32 * stride])
+    if tail != bytes([FILL]) * len(tail):
+        problems.append(f"bytes past entry {count - 1} changed")
+    return problems
+
+
+def _source_pattern(i):
+    return struct.pack("<4I", 0x10000 + 4 * i, 0x20000 + 4 * i, 0x30000 + 4 * i, 0x40000 + 4 * i)
+
+
+CHECKED = {
+    # zero COUNT 16-byte entries at the address in table+0x0 (count at +0x30)
+    "RadixReset": ([(0x0, 8, DST), (0x30, 4, COUNT)],
+                   lambda h: _expect_entries(h, DST, 16, COUNT, lambda i: bytes(16))),
+    # COUNT 8-byte entries (-FLT_MAX, +FLT_MAX), the empty k-DOP bounds, at table+0x0 (count at +0x1c)
+    "ResetKDOP": ([(0x0, 8, DST), (0x1c, 4, COUNT)],
+                  lambda h: _expect_entries(h, DST, 8, COUNT, lambda i: struct.pack("<2I", 0xFF7FFFFF, 0x7F7FFFFF))),
+    # entry i is base + 4i .. base + 4i + 3, at table+0x8 (count at +0x14, base at +0x18)
+    "ResetToIndexBuffer": ([(0x8, 8, DST), (0x14, 4, COUNT), (0x18, 4, 1000)],
+                           lambda h: _expect_entries(h, DST, 16, COUNT,
+                                                     lambda i: struct.pack("<4I", *(1000 + 4 * i + k for k in range(4))))),
+    # COUNT 16-byte entries copied from table+0x0 to table+0x8 (count at +0x14)
+    "CopyCounters": ([(0x0, 8, SRC), (0x8, 8, DST), (0x14, 4, COUNT)],
+                     lambda h: _expect_entries(h, DST, 16, COUNT, _source_pattern)),
+    # the value at +0x18, four times per 16-byte entry, at table+0x8 (count at +0x14)
+    "ResetCounterValues": ([(0x8, 8, DST), (0x14, 4, COUNT), (0x18, 4, 0xC0FFEE11)],
+                           lambda h: _expect_entries(h, DST, 16, COUNT, lambda i: struct.pack("<4I", *[0xC0FFEE11] * 4))),
+}
+
+
+def checked_heap(fields, heap_bytes):
+    """The table with `fields`, FILL everywhere past it, and the source pattern at SRC."""
+    heap = bytearray(_table(fields)) + bytearray([FILL]) * (heap_bytes - TABLE_QWORDS * 8)
+    for i in range(32):
+        heap[SRC + 16 * i: SRC + 16 * (i + 1)] = _source_pattern(i)
+    return bytes(heap)
+
+
+def run_checked(spirv_dir, vkc, *, heap_bytes, validation, timeout, runner=run_program):
+    """Each CHECKED program with its inputs; [{name, status, detail}] with status pass, mismatch or a run failure."""
+    results = []
+    with tempfile.TemporaryDirectory(prefix="bvh_gpu_checked_") as tmp:
+        tmp = Path(tmp)
+        for name, (fields, expect) in CHECKED.items():
+            spv = Path(spirv_dir) / (name + ".spv")
+            if not spv.is_file():
+                results.append({"name": name, "status": "missing", "detail": f"{spv.name} not translated"})
+                continue
+            init, dump = tmp / (name + ".in"), tmp / (name + ".out")
+            init.write_bytes(checked_heap(fields, heap_bytes))
+            status, detail = runner(vkc, spv, init, dump, heap_bytes // 4, validation, timeout)
+            if status == "ok":
+                problems = expect(dump.read_bytes()) if dump.is_file() else ["no heap dump"]
+                status, detail = ("pass", "") if not problems else ("mismatch", "; ".join(problems[:3]))
+            results.append({"name": name, "status": status, "detail": detail})
+    return results
+
+
 def translate(game_dir, work, max_shared_memory):
     """The pipeline docs/embedded_shaders.md documents, into work/dxbc and work/spirv. Returns the spirv folder."""
     dll = Path(game_dir) / "XboxBvhBuilder.dll"
@@ -146,6 +237,7 @@ def main(argv=None):
     ap.add_argument("--timeout", type=float, default=60.0, help="seconds per dispatch")
     ap.add_argument("--no-validation", action="store_true", help="don't enable VK_LAYER_KHRONOS_validation")
     ap.add_argument("--include-rehydration", action="store_true", help="also run the TEST-376 programs")
+    ap.add_argument("--checked", action="store_true", help="also run CHECKED's programs and compare their output")
     ap.add_argument("--json", help="write the per-program results here")
     a = ap.parse_args(argv)
     if a.heap_bytes % 4 or a.heap_bytes < TABLE_QWORDS * 8:
@@ -173,11 +265,18 @@ def main(argv=None):
                   r["words_changed"] > 0)
     print(f"{counts.get('pass', 0)} of {len(results)} pass; {working} changed heap words beyond running; "
           + ", ".join(f"{k} {v}" for k, v in sorted(counts.items()) if k != "pass"))
+    checked = []
+    if a.checked:
+        checked = run_checked(spirv, vkc, heap_bytes=a.heap_bytes, validation=not a.no_validation, timeout=a.timeout)
+        for r in checked:
+            print(f"checked {r['name']:20} {r['status']:10} {r['detail']}")
+        print(f"checked: {sum(r['status'] == 'pass' for r in checked)} of {len(checked)} write exactly what they should")
     if a.json:
         Path(a.json).write_text(json.dumps({"max_shared_memory": a.max_shared_memory, "table_qword": a.table_qword,
-                                            "heap_bytes": a.heap_bytes, "results": results}, indent=1),
-                                encoding="utf-8")
-    return 0 if counts.get("pass", 0) == len(results) else 1
+                                            "heap_bytes": a.heap_bytes, "results": results, "checked": checked},
+                                           indent=1), encoding="utf-8")
+    ok = counts.get("pass", 0) == len(results) and all(r["status"] == "pass" for r in checked)
+    return 0 if ok else 1
 
 
 if __name__ == "__main__":

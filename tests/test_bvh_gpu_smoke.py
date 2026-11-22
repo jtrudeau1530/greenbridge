@@ -90,6 +90,73 @@ class Smoke(unittest.TestCase):
         self.assertIn("LeafRehydration", [r["name"] for r in results])
 
 
+class Checked(unittest.TestCase):
+    """--checked: the inputs each program gets and how its output is judged."""
+
+    def test_heap_layout(self):
+        heap = smoke.checked_heap([(0x8, 8, smoke.DST), (0x14, 4, 7)], 1 << 16)
+        self.assertEqual(struct.unpack_from("<Q", heap, 0x8)[0], smoke.DST)
+        self.assertEqual(struct.unpack_from("<I", heap, 0x14)[0], 7)
+        self.assertEqual(heap[0x18:0x20], bytes(8), "the rest of the table is zero")
+        self.assertEqual(heap[smoke.DST:smoke.DST + 4], bytes([smoke.FILL]) * 4)
+        self.assertEqual(heap[smoke.SRC:smoke.SRC + 16], smoke._source_pattern(0))
+
+    def test_expect_entries(self):
+        heap = bytearray([smoke.FILL]) * 0x400
+        entry = lambda i: struct.pack("<I", i)
+        self.assertTrue(smoke._expect_entries(heap, 0, 4, 3, entry), "nothing written yet")
+        for i in range(3):
+            heap[4 * i:4 * i + 4] = entry(i)
+        self.assertEqual(smoke._expect_entries(heap, 0, 4, 3, entry), [])
+        heap[12] = 0
+        self.assertIn("bytes past entry 2 changed", smoke._expect_entries(heap, 0, 4, 3, entry))
+
+    def test_every_case_passes_with_the_output_it_describes(self):
+        """A fake runner that does what each case says the program does: all pass; one wrong word: mismatch."""
+        def ideal(spv, heap):
+            name = Path(spv).stem
+            fields = {off: val for off, _, val in smoke.CHECKED[name][0]}
+            n = smoke.COUNT
+            if name == "RadixReset":
+                for i in range(n):
+                    heap[fields[0] + 16 * i: fields[0] + 16 * (i + 1)] = bytes(16)
+            elif name == "ResetKDOP":
+                for i in range(n):
+                    struct.pack_into("<2I", heap, fields[0] + 8 * i, 0xFF7FFFFF, 0x7F7FFFFF)
+            elif name == "ResetToIndexBuffer":
+                for i in range(n):
+                    struct.pack_into("<4I", heap, fields[8] + 16 * i, *(fields[0x18] + 4 * i + k for k in range(4)))
+            elif name == "CopyCounters":
+                heap[fields[8]:fields[8] + 16 * n] = heap[fields[0]:fields[0] + 16 * n]
+            elif name == "ResetCounterValues":
+                for i in range(n):
+                    struct.pack_into("<4I", heap, fields[8] + 16 * i, *[fields[0x18]] * 4)
+
+        def runner_for(corrupt):
+            def run(vkc, spv, init, dump, heap_words, validation, timeout):
+                heap = bytearray(Path(init).read_bytes())
+                ideal(spv, heap)
+                if corrupt:
+                    heap[smoke.DST + 4] ^= 1
+                Path(dump).write_bytes(bytes(heap))
+                return "ok", ""
+            return run
+
+        with tempfile.TemporaryDirectory() as d:
+            for name in smoke.CHECKED:
+                (Path(d) / (name + ".spv")).write_bytes(b"\x03\x02\x23\x07")
+            good = smoke.run_checked(d, "vkc", heap_bytes=1 << 16, validation=False, timeout=5, runner=runner_for(False))
+            self.assertEqual({r["name"]: r["status"] for r in good}, {n: "pass" for n in smoke.CHECKED})
+            bad = smoke.run_checked(d, "vkc", heap_bytes=1 << 16, validation=False, timeout=5, runner=runner_for(True))
+            self.assertEqual({r["status"] for r in bad}, {"mismatch"})
+
+    def test_missing_program(self):
+        with tempfile.TemporaryDirectory() as d:
+            results = smoke.run_checked(d, "vkc", heap_bytes=1 << 16, validation=False, timeout=5,
+                                        runner=lambda *a: ("ok", ""))
+            self.assertEqual({r["status"] for r in results}, {"missing"})
+
+
 class Cli(unittest.TestCase):
     def test_missing_vk_compute_test(self):
         with tempfile.TemporaryDirectory() as d:
