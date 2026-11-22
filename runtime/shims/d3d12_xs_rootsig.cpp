@@ -30,6 +30,33 @@ bool copy_versioned_root_signature_desc_clear_xbox_flags(const D3D12_VERSIONED_R
     }
 }
 
+bool downgrade_root_signature_1_2_to_1_1(const D3D12_VERSIONED_ROOT_SIGNATURE_DESC& in,
+                                         std::vector<D3D12_STATIC_SAMPLER_DESC>& samplers,
+                                         D3D12_VERSIONED_ROOT_SIGNATURE_DESC& out) {
+    if (in.Version != D3D_ROOT_SIGNATURE_VERSION_1_2) return false;
+    const D3D12_ROOT_SIGNATURE_DESC2& desc = in.Desc_1_2;
+    if (desc.NumStaticSamplers != 0 && !desc.pStaticSamplers) return false;
+    for (UINT i = 0; i < desc.NumStaticSamplers; ++i)
+        if (desc.pStaticSamplers[i].Flags != D3D12_SAMPLER_FLAG_NONE) return false;
+
+    samplers.resize(desc.NumStaticSamplers);
+    for (UINT i = 0; i < desc.NumStaticSamplers; ++i) {
+        const D3D12_STATIC_SAMPLER_DESC1& s = desc.pStaticSamplers[i];
+        // D3D12_STATIC_SAMPLER_DESC is D3D12_STATIC_SAMPLER_DESC1 without the trailing Flags.
+        samplers[i] = {s.Filter, s.AddressU, s.AddressV, s.AddressW, s.MipLODBias, s.MaxAnisotropy,
+                       s.ComparisonFunc, s.BorderColor, s.MinLOD, s.MaxLOD, s.ShaderRegister, s.RegisterSpace,
+                       s.ShaderVisibility};
+    }
+    out = {};
+    out.Version = D3D_ROOT_SIGNATURE_VERSION_1_1;
+    out.Desc_1_1.NumParameters = desc.NumParameters;
+    out.Desc_1_1.pParameters = desc.pParameters;  // D3D12_ROOT_PARAMETER1 in both versions
+    out.Desc_1_1.NumStaticSamplers = desc.NumStaticSamplers;
+    out.Desc_1_1.pStaticSamplers = samplers.empty() ? nullptr : samplers.data();
+    out.Desc_1_1.Flags = desc.Flags;
+    return true;
+}
+
 void copy_root_signature_desc_clear_xbox_flags(const D3D12_ROOT_SIGNATURE_DESC& in, D3D12_ROOT_SIGNATURE_DESC& out) {
     out = in;
     out.Flags = clear_high_byte(in.Flags);

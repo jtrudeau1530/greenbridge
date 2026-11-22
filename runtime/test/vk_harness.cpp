@@ -172,14 +172,14 @@ int main(int argc, char** argv) {
     // (llvmpipe and other software devices), so the suite reports it as unsupported instead. 77 is the existing
     // "this device cannot run the test" code (runtime/test/shaders/check.py, scripts/run_gpu_tests.py).
     const std::vector<uint32_t> fs_code = read_spv(argv[2]);
-    bool needs_barycentric = false;
+    bool needs_barycentric = false, needs_float64 = false;
     for (std::size_t i = 5; i + 1 < fs_code.size();) {   // instructions follow the 5-word SPIR-V header
         const uint32_t words = fs_code[i] >> 16, op = fs_code[i] & 0xffffu;
         if (!words) break;
-        if (op == 17 && fs_code[i + 1] == 5284) {        // OpCapability FragmentBarycentricKHR
+        if (op == 17 && fs_code[i + 1] == 5284)          // OpCapability FragmentBarycentricKHR
             needs_barycentric = true;
-            break;
-        }
+        if (op == 17 && fs_code[i + 1] == 10)            // OpCapability Float64 (v_add_f64 and friends)
+            needs_float64 = true;
         i += words;
     }
     if (needs_barycentric && !has(VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME)) {
@@ -262,6 +262,13 @@ int main(int argc, char** argv) {
     feats.geometryShader = gs_path ? VK_TRUE : VK_FALSE;
     feats.shaderClipDistance = f2q.features.shaderClipDistance;
     feats.shaderCullDistance = f2q.features.shaderCullDistance;
+    if (needs_float64) {
+        if (!f2q.features.shaderFloat64) {
+            std::fprintf(stderr, "unsupported: %s uses Float64 and the device has no shaderFloat64\n", argv[2]);
+            return 77;
+        }
+        feats.shaderFloat64 = VK_TRUE;
+    }
     if (heap_env) {
         if (!f2q.features.shaderInt64) { std::fprintf(stderr, "unsupported: VKH_HEAP needs shaderInt64\n"); return 77; }
         feats.shaderInt64 = VK_TRUE;   // heap addresses are 64-bit

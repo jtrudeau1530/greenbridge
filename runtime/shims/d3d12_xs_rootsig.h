@@ -19,6 +19,17 @@ constexpr uint32_t kXboxRootSignatureFlagHighByte = 0xFF000000u;
 bool copy_versioned_root_signature_desc_clear_xbox_flags(const D3D12_VERSIONED_ROOT_SIGNATURE_DESC& in,
                                                          D3D12_VERSIONED_ROOT_SIGNATURE_DESC& out);
 
+// Windows 10's built-in d3d12.dll serializes root signatures up to version 1.1: it rejects every 1.2 description,
+// even an empty one, with E_INVALIDARG, and reports HighestVersion 1.1. Version 1.2 differs from 1.1 only in
+// D3D12_STATIC_SAMPLER_DESC1::Flags, so a 1.2 description whose static samplers all have Flags == 0 is the same
+// root signature written as 1.1. This rewrites it that way: `out` becomes a 1.1 description that shares `in`'s
+// parameters and points its samplers at `samplers` (resized here; keep it alive while `out` is used). Returns false,
+// with `out` and `samplers` untouched, when `in` is not version 1.2 or a static sampler has non-zero Flags (a UINT
+// border colour or non-normalized coordinates, which 1.1 can't express).
+bool downgrade_root_signature_1_2_to_1_1(const D3D12_VERSIONED_ROOT_SIGNATURE_DESC& in,
+                                         std::vector<D3D12_STATIC_SAMPLER_DESC>& samplers,
+                                         D3D12_VERSIONED_ROOT_SIGNATURE_DESC& out);
+
 // Legacy D3D12SerializeRootSignature descriptor (version 1.0): copies and clears the high flag byte.
 void copy_root_signature_desc_clear_xbox_flags(const D3D12_ROOT_SIGNATURE_DESC& in, D3D12_ROOT_SIGNATURE_DESC& out);
 
