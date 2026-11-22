@@ -335,5 +335,291 @@ class TestValuRcpF16ReferenceOracle(unittest.TestCase):
         self.assertEqual(ref_rcp_f16(MIN_SUBNORMAL_F16), POS_INF_F16)
 
 
+
+class DataType(Enum):
+    """Data types supported by RDNA2 VALU half-precision instructions."""
+    F16 = auto()
+    U16 = auto()
+    I16 = auto()
+    F32 = auto()
+    U32 = auto()
+    I32 = auto()
+
+
+class OperandKind(Enum):
+    """Classification of instruction operands."""
+    VGPR_HALF = auto()
+    VGPR_FULL = auto()
+    SGPR_HALF = auto()
+    SGPR_FULL = auto()
+    LITERAL_F16 = auto()
+    INLINE_CONST = auto()
+
+
+@dataclass
+class Operand:
+    """Typed operand representation in symbolic AST."""
+    kind: OperandKind
+    data_type: DataType
+    reg_index: int = 0
+    is_hi: bool = False
+    literal_val: int = 0
+    abs_mod: bool = False
+    neg_mod: bool = False
+
+    def validate(self) -> None:
+        if self.kind in (OperandKind.VGPR_HALF, OperandKind.VGPR_FULL):
+            if not (0 <= self.reg_index < 256):
+                raise ValueError(f"VGPR index {self.reg_index} out of valid range [0, 256)")
+        elif self.kind in (OperandKind.SGPR_HALF, OperandKind.SGPR_FULL):
+            if not (0 <= self.reg_index < 106):
+                raise ValueError(f"SGPR index {self.reg_index} out of valid range [0, 106)")
+        if (self.abs_mod or self.neg_mod) and self.data_type not in (DataType.F16, DataType.F32):
+            raise TypeError("Floating-point modifiers abs/neg can only be applied to float types")
+
+    def to_asm(self) -> str:
+        s = ""
+        suffix = ".h" if self.is_hi else ".l"
+        if self.kind == OperandKind.VGPR_HALF:
+            s = f"v{self.reg_index}{suffix}"
+        elif self.kind == OperandKind.VGPR_FULL:
+            s = f"v{self.reg_index}"
+        elif self.kind == OperandKind.SGPR_HALF:
+            s = f"s{self.reg_index}{suffix}"
+        elif self.kind == OperandKind.SGPR_FULL:
+            s = f"s{self.reg_index}"
+        elif self.kind == OperandKind.LITERAL_F16:
+            s = f"{self.literal_val:#06x}"
+        elif self.kind == OperandKind.INLINE_CONST:
+            s = f"{self.literal_val}"
+
+        if self.abs_mod:
+            s = f"|{s}|"
+        if self.neg_mod:
+            s = f"-{s}"
+        return s
+
+
+@dataclass
+class InstructionAST:
+    """Symbolic AST node for v_rcp_f16."""
+    opcode: str
+    dst: Operand
+    src0: Operand
+    clamp: bool = False
+    op_sel: tuple[int, int] = (0, 0)
+
+    def validate(self) -> None:
+        if self.opcode != "v_rcp_f16":
+            raise ValueError(f"Unsupported opcode '{self.opcode}', expected 'v_rcp_f16'")
+        if self.dst.kind not in (OperandKind.VGPR_HALF, OperandKind.VGPR_FULL):
+            raise TypeError("Destination must be a VGPR operand")
+        if self.dst.data_type != DataType.F16:
+            raise TypeError("Destination data type must be DataType.F16")
+        if self.dst.abs_mod or self.dst.neg_mod:
+            raise ValueError("Destination operand does not support input modifiers (abs/neg)")
+        if self.src0.data_type != DataType.F16:
+            raise TypeError("Source operand must be DataType.F16")
+        if self.op_sel[0] not in (0, 1) or self.op_sel[1] not in (0, 1):
+            raise ValueError(f"op_sel values must be 0 or 1, got {self.op_sel}")
+        self.dst.validate()
+        self.src0.validate()
+
+    def to_asm(self) -> str:
+        tokens = [f"{self.opcode} {self.dst.to_asm()}, {self.src0.to_asm()}"]
+        if self.clamp:
+            tokens.append("clamp")
+        if self.op_sel != (0, 0):
+            tokens.append(f"op_sel:[{self.op_sel[0]},{self.op_sel[1]}]")
+        return " ".join(tokens)
+
+
+def parse_vop_rcp_f16(asm_line: str) -> InstructionAST:
+    """Parse assembly string into an InstructionAST."""
+    line = asm_line.strip()
+    if ";" in line:
+        line = line.split(";", 1)[0].strip()
+    if "//" in line:
+        line = line.split("//", 1)[0].strip()
+    if not line:
+        raise ValueError("Empty assembly line")
+
+    parts = line.split(None, 1)
+    opcode = parts[0]
+    if opcode != "v_rcp_f16":
+        raise ValueError(f"Expected opcode 'v_rcp_f16', got '{opcode}'")
+    if len(parts) < 2:
+        raise ValueError(f"Incomplete instruction: {line}")
+
+    operands_text = parts[1]
+    clamp = False
+    op_sel = [0, 0]
+
+    m_opsel = re.search(r"op_sel:\[\s*([01])\s*,\s*([01])\s*\]", operands_text)
+    if m_opsel:
+        op_sel = [int(m_opsel.group(1)), int(m_opsel.group(2))]
+        operands_text = operands_text[:m_opsel.start()] + operands_text[m_opsel.end():]
+
+    tokens = [t.strip() for t in operands_text.split(",") if t.strip()]
+    if len(tokens) < 2:
+        raise ValueError(f"v_rcp_f16 requires destination and source operands: {line}")
+
+    dst_str = tokens[0]
+    src_rest = tokens[1].split()
+    src0_str = src_rest[0]
+
+    for modifier in src_rest[1:]:
+        if modifier.lower() == "clamp":
+            clamp = True
+        elif modifier.lower().startswith("op_sel"):
+            pass
+        else:
+            raise ValueError(f"Unrecognized modifier '{modifier}' in '{line}'")
+
+    m_dst = re.match(r"^v(\d+)(\.([lh]))?$", dst_str)
+    if not m_dst:
+        raise ValueError(f"Invalid VGPR destination operand '{dst_str}'")
+    d_reg = int(m_dst.group(1))
+    d_hi = False
+    if m_dst.group(3):
+        d_hi = (m_dst.group(3) == "h")
+        op_sel[0] = 1 if d_hi else 0
+    elif op_sel[0]:
+        d_hi = True
+    dst_op = Operand(
+        kind=OperandKind.VGPR_HALF if m_dst.group(3) else OperandKind.VGPR_FULL,
+        data_type=DataType.F16,
+        reg_index=d_reg,
+        is_hi=d_hi,
+    )
+
+    s0_str = src0_str.strip()
+    neg_s0 = False
+    abs_s0 = False
+    if s0_str.startswith("-"):
+        neg_s0 = True
+        s0_str = s0_str[1:].strip()
+    if s0_str.startswith("|") and s0_str.endswith("|"):
+        abs_s0 = True
+        s0_str = s0_str[1:-1].strip()
+
+    m_vsrc = re.match(r"^v(\d+)(\.([lh]))?$", s0_str)
+    m_ssrc = re.match(r"^s(\d+)(\.([lh]))?$", s0_str)
+
+    if m_vsrc:
+        s_reg = int(m_vsrc.group(1))
+        s_hi = (m_vsrc.group(3) == "h") if m_vsrc.group(3) else bool(op_sel[1])
+        if m_vsrc.group(3):
+            op_sel[1] = 1 if s_hi else 0
+        src0_op = Operand(
+            kind=OperandKind.VGPR_HALF if m_vsrc.group(3) else OperandKind.VGPR_FULL,
+            data_type=DataType.F16,
+            reg_index=s_reg,
+            is_hi=s_hi,
+            abs_mod=abs_s0,
+            neg_mod=neg_s0,
+        )
+    elif m_ssrc:
+        s_reg = int(m_ssrc.group(1))
+        s_hi = (m_ssrc.group(3) == "h") if m_ssrc.group(3) else bool(op_sel[1])
+        if m_ssrc.group(3):
+            op_sel[1] = 1 if s_hi else 0
+        src0_op = Operand(
+            kind=OperandKind.SGPR_HALF if m_ssrc.group(3) else OperandKind.SGPR_FULL,
+            data_type=DataType.F16,
+            reg_index=s_reg,
+            is_hi=s_hi,
+            abs_mod=abs_s0,
+            neg_mod=neg_s0,
+        )
+    else:
+        try:
+            if s0_str.startswith("0x") or s0_str.startswith("0X"):
+                lit_bits = int(s0_str, 16) & MASK16
+            else:
+                lit_bits = f16_to_bits(float(s0_str))
+            src0_op = Operand(
+                kind=OperandKind.LITERAL_F16,
+                data_type=DataType.F16,
+                literal_val=lit_bits,
+                abs_mod=abs_s0,
+                neg_mod=neg_s0,
+            )
+        except ValueError:
+            raise ValueError(f"Unrecognized src0 operand format: '{s0_str}'")
+
+    ast = InstructionAST(
+        opcode=opcode,
+        dst=dst_op,
+        src0=src0_op,
+        clamp=clamp,
+        op_sel=(op_sel[0], op_sel[1]),
+    )
+    ast.validate()
+    return ast
+
+
+class TestValuRcpF16AST(unittest.TestCase):
+    def test_ast_construction_and_validation(self):
+        dst = Operand(kind=OperandKind.VGPR_FULL, data_type=DataType.F16, reg_index=0)
+        src = Operand(kind=OperandKind.VGPR_FULL, data_type=DataType.F16, reg_index=1, abs_mod=True)
+        ast = InstructionAST(opcode="v_rcp_f16", dst=dst, src0=src, clamp=True)
+        ast.validate()
+        self.assertEqual(ast.opcode, "v_rcp_f16")
+        self.assertTrue(ast.clamp)
+
+    def test_parse_assembly_forms(self):
+        ast1 = parse_vop_rcp_f16("v_rcp_f16 v0, v1")
+        self.assertEqual(ast1.dst.reg_index, 0)
+        self.assertEqual(ast1.src0.reg_index, 1)
+        self.assertFalse(ast1.clamp)
+        self.assertEqual(ast1.op_sel, (0, 0))
+
+        ast2 = parse_vop_rcp_f16("v_rcp_f16 v2, -|v3| clamp")
+        self.assertEqual(ast2.dst.reg_index, 2)
+        self.assertEqual(ast2.src0.reg_index, 3)
+        self.assertTrue(ast2.src0.abs_mod)
+        self.assertTrue(ast2.src0.neg_mod)
+        self.assertTrue(ast2.clamp)
+
+        ast3 = parse_vop_rcp_f16("v_rcp_f16 v0, v1 op_sel:[1,0]")
+        self.assertEqual(ast3.op_sel, (1, 0))
+        self.assertTrue(ast3.dst.is_hi)
+
+        ast4 = parse_vop_rcp_f16("v_rcp_f16 v5.h, s2.l")
+        self.assertEqual(ast4.dst.reg_index, 5)
+        self.assertTrue(ast4.dst.is_hi)
+        self.assertEqual(ast4.src0.reg_index, 2)
+        self.assertFalse(ast4.src0.is_hi)
+        self.assertEqual(ast4.op_sel, (1, 0))
+
+        ast5 = parse_vop_rcp_f16("v_rcp_f16 v0, 2.0")
+        self.assertEqual(ast5.src0.kind, OperandKind.LITERAL_F16)
+        self.assertEqual(ast5.src0.literal_val, TWO_F16)
+
+    def test_invalid_ast_rejection(self):
+        # Invalid opcode
+        bad_dst = Operand(kind=OperandKind.VGPR_FULL, data_type=DataType.F16, reg_index=0)
+        bad_src = Operand(kind=OperandKind.VGPR_FULL, data_type=DataType.F16, reg_index=1)
+        with self.assertRaises(ValueError):
+            InstructionAST(opcode="v_add_f16", dst=bad_dst, src0=bad_src).validate()
+
+        # Destination with modifier
+        bad_dst_mod = Operand(kind=OperandKind.VGPR_FULL, data_type=DataType.F16, reg_index=0, neg_mod=True)
+        with self.assertRaises(ValueError):
+            InstructionAST(opcode="v_rcp_f16", dst=bad_dst_mod, src0=bad_src).validate()
+
+        # SGPR as destination
+        sgpr_dst = Operand(kind=OperandKind.SGPR_FULL, data_type=DataType.F16, reg_index=0)
+        with self.assertRaises(TypeError):
+            InstructionAST(opcode="v_rcp_f16", dst=sgpr_dst, src0=bad_src).validate()
+
+        # VGPR out of bounds
+        oob_dst = Operand(kind=OperandKind.VGPR_FULL, data_type=DataType.F16, reg_index=300)
+        with self.assertRaises(ValueError):
+            InstructionAST(opcode="v_rcp_f16", dst=oob_dst, src0=bad_src).validate()
+
+
 if __name__ == "__main__":
     unittest.main()
+
