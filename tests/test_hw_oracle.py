@@ -76,8 +76,10 @@ class Text(unittest.TestCase):
     def test_the_runner_reports_an_unavailable_mode_as_a_skip(self):
         o = object.__new__(runner.Oracle)      # no tools, no GPU
         o.arch, o.chunk = "gfx1201", 500
-        with self.assertRaisesRegex(runner.Unavailable, "ieee"):
-            o.run([asm.Kernel(["s_endpgm"], raw=True, mode={"ieee": 0})])
+        # The kernel is not assembled; it comes back as the reason (#1620), and the rest of the run goes on.
+        result, = o.run([asm.Kernel(["s_endpgm"], raw=True, mode={"ieee": 0})])
+        self.assertIsInstance(result, str)
+        self.assertIn("ieee", result)
 
     def test_metadata_is_required_and_lists_every_kernel(self):
         text, names, starts = asm.module_text([PROG, PROG, PROG], "gfx1150")
