@@ -381,6 +381,21 @@ class CountArgumentTest(unittest.TestCase):
             self.assertFalse(os.path.exists(out))
 
 
+    def test_cli_rejects_empty_selection_before_preparing_the_harness(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            spirv = os.path.join(tmp, "spirv")
+            os.mkdir(spirv)
+            with open(os.path.join(spirv, "index.json"), "w", encoding="utf-8", newline="\n") as f:
+                f.write("{}")
+            out = os.path.join(tmp, "out")
+            with patch.object(AB, "test_vertex_shader") as harness, \
+                    contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()) as err:
+                self.assertEqual(AB.main([tmp, tmp, out]), 1)
+            harness.assert_not_called()
+            self.assertIn("no shader candidates", err.getvalue())
+            self.assertFalse(os.path.exists(out))
+
+
 class ResultClassificationTest(unittest.TestCase):
     def test_translation_failure(self):
         self.assertEqual(AB.classify_result(False, [b"same"], [b"same"]), "a translation is invalid")
