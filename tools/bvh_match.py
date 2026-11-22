@@ -19,7 +19,12 @@ to that drawable, and every geometry is a candidate; the checks then decide.
 The instance transform is the 3x4 at +0x50 of the BLAS's 208-byte instance descriptor (docs/bvh.md §3.2). Without
 it, every leaf of a rotated structure falls outside the header bounds and a correct geometry is rejected.
 
-Standard library only. Reads the user's own package and writes nothing by default.
+The manifest is one window of an archive: `rpf9dump models <slice> <out>` exports every drawable it recovers from
+that slice, and a slice holds one region's. A BLAS whose drawable sits elsewhere in the archive therefore finds no
+candidate in it, which is not the same as a geometry that fails the checks; the tool says which case it is.
+
+Standard library only. Reads the user's own package and writes nothing by default. Exit status is 0 when a
+candidate is consistent, 1 when none is, and 2 on an input error.
 
 Usage:
     python -I tools/bvh_match.py <dehydrated.bin> <manifest.json> --descriptor <instance208.bin>
@@ -180,8 +185,12 @@ def build_geometry(group, transform=None):
 
 def score(src, candidate, groups, transform, header_offset=0):
     """Rehydrate the candidate's geometries and run bvh_geometry_check over them."""
-    geometries = [build_geometry(groups[mesh[0]], transform) for mesh in
-                  [candidate["kept"][k] for k in candidate["used"]]]
+    used = [candidate["kept"][k] for k in candidate["used"]]
+    for mesh in used:
+        if mesh[0] >= len(groups):
+            raise ValueError("the manifest lists %d geometries but its OBJ holds %d: re-export the window"
+                             % (max(m[0] for m in used) + 1, len(groups)))
+    geometries = [build_geometry(groups[mesh[0]], transform) for mesh in used]
     return C.check(src, geometries, header_offset)
 
 
@@ -217,7 +226,8 @@ def main(argv=None):
             manifest = json.load(f)
         items = manifest.get("Items") or []
         if not items:
-            raise ValueError("%s has no Items" % a.manifest)
+            raise ValueError("%s has no Items: the export found no model in its window, so there is nothing to match "
+                             "the BLAS against" % a.manifest)
         models_dir = a.models or os.path.dirname(os.path.abspath(a.manifest))
         transform = None
         if a.transform:
@@ -228,13 +238,19 @@ def main(argv=None):
         if not signature:
             raise ValueError("the BLAS has no leaves")
         candidates = match_candidates(items, signature, parse_shader_hashes(a.skip_shaders), a.embeddings, not a.unordered)
-    except (OSError, ValueError, KeyError, struct.error) as e:
+    except (OSError, ValueError, KeyError, IndexError, TypeError, struct.error) as e:
         print("error: %s" % e, file=sys.stderr)
         return 2
     if transform is None:
         print("no --descriptor or --transform: the geometry is checked without the instance transform", file=sys.stderr)
     print("triangles per geometry index: %s" % signature)
     print("%d candidates from %d models in the manifest" % (len(candidates), len(items)))
+    if not candidates:
+        # Distinguishing "the geometry is not in this export" from "the rule does not fit" saves the confusion of an
+        # empty run: a window holds one region's drawables, and a BLAS whose drawable lives elsewhere cannot match.
+        print("nothing to score: no model in this manifest has those triangle counts per geometry. Either the drawable "
+              "is outside the exported window (the manifest's Scan.Start/Scan.Length, when present, says which window "
+              "it is), or its geometry list does not follow the rule (docs/bvh.md §4a)")
     results, groups, errors = [], {}, 0
     for candidate in candidates:
         item = candidate["item"]
@@ -243,7 +259,7 @@ def main(argv=None):
             if path not in groups:
                 groups[path] = read_groups(path)
             report = score(src, candidate, groups[path], transform, a.header_offset)
-        except (OSError, ValueError, KeyError, struct.error) as e:
+        except (OSError, ValueError, KeyError, IndexError, TypeError, struct.error) as e:
             errors += 1
             print("   %s: %s" % (describe(candidate, a.names), e))
             continue

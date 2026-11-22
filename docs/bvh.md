@@ -335,9 +335,10 @@ counts contain that signature as an ordered subsequence, and checks the survivor
 `tools/bvh_geometry_check.py` from the model's exported OBJ and the 3x4 at `+0x50` of the instance descriptor. The
 geometries of the two shaders the BVH leaves out are filtered with `--skip-shaders`: those name hashes are game data,
 as §4a says, so the rule is off unless the user passes them. A geometry whose shader index the manifest cannot resolve
-keeps its place and the checks decide. Measured on the ten BLAS of the sample pack, against one 1 GiB window of
-`levels.rpf`: 1,228 models exported, 1 to 374 candidates from the signature per BLAS, and exactly one consistent
-candidate each.
+keeps its place and the checks decide. Measured on the ten BLAS of the sample pack, against the first 1 GiB window of
+`levels.rpf` cut at 3 GB (exported as a whole slice): 1,228 models, 1 to 374 candidates from the signature per BLAS,
+and exactly one consistent candidate each. A window holds one region's drawables, so a BLAS whose drawable is
+elsewhere in the archive finds no candidate in it at all, and the tool says so instead of reporting a rejection.
 
 `rpf9dump models` and `rpf9dump textures` take `--start`/`--length` to export a window of a file. A window need not be a
 valid archive - a slice of `levels.rpf` cut at an offset has no `9FPR` header - because both modes read every resource

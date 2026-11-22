@@ -92,6 +92,8 @@ class TestMatching(unittest.TestCase):
         self.assertEqual(status, 1, out)
         self.assertIn("0 candidates", out)
         self.assertIn("0 of 0 scored candidates are consistent", out)
+        # An empty run says why: the drawable is outside the exported window, or the rule does not fit.
+        self.assertIn("outside the exported window", out)
 
     def test_a_wrong_geometry_is_rejected(self):
         src, _, _ = build(LEAVES, bounds=BOUNDS)
@@ -145,6 +147,21 @@ class TestMatching(unittest.TestCase):
         status, _, err = self.guide(src, [row], {"a.obj": [group(2)]})
         self.assertEqual(status, 2)
         self.assertIn("MeshTris", err)
+
+    def test_a_manifest_that_lists_more_geometries_than_its_obj_holds_is_an_error_not_a_traceback(self):
+        src, _, _ = build(LEAVES, bounds=BOUNDS)
+        row = item(0x1000, "a.obj", [5, 2])          # the signature fits the second geometry only
+        row["MeshTris"] = [5, 2]
+        status, out, _ = self.guide(src, [row], {"a.obj": [group(5)]})   # ... but the OBJ has one group
+        self.assertEqual(status, 1, out)
+        self.assertIn("the manifest lists", out)
+        self.assertIn("scored candidates are consistent", out)
+
+    def test_a_manifest_with_no_models_says_what_is_wrong(self):
+        src, _, _ = build(LEAVES, bounds=BOUNDS)
+        status, _, err = self.guide(src, [], {"a.obj": [group(2)]})
+        self.assertEqual(status, 2)
+        self.assertIn("found no model in its window", err)
 
     def test_the_shader_rule_is_not_applied_without_every_hash(self):
         src, _, _ = build(LEAVES, bounds=BOUNDS)
