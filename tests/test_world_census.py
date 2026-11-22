@@ -15,6 +15,7 @@ import sys
 import tempfile
 import unittest
 import zlib
+from pathlib import Path
 from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -644,6 +645,76 @@ class MainTest(unittest.TestCase):
         self.assertEqual((s["maps"], s["entities"]), (4, 4))
         self.assertTrue(s["census_exact"])
         self.assertEqual(s["totals"]["meta_other"], 1)
+
+    def check_report_failure_and_retry(self, out, failure):
+        paths = [Path(out) / name for name in ("maps.json", "summary.json")]
+        before = [p.read_bytes() if p.exists() else None for p in paths]
+        args = (self.arc, "--out", out, "--jobs", "1", "--resume")
+        with failure:
+            code, _, err = self.run_main(*args)
+        self.assertEqual(code, 1, err)
+        for path, old_bytes in zip(paths, before):
+            self.assertEqual(path.read_bytes() if path.exists() else None, old_bytes, path.name)
+
+        code, stdout, err = self.run_main(*args)
+        self.assertEqual(code, 0, err)
+        self.assertIn("1 shards, 0 to scan", stdout)
+        maps, summary = (json.loads(path.read_bytes()) for path in paths)
+        self.assertEqual(len(maps["maps"]), 4)
+        self.assertEqual(maps["summary"], {k: summary[k] for k in maps["summary"]})
+
+    def test_failed_report_replace_restores_previous_files(self):
+        names = ("maps.json", "summary.json")
+        replace = os.replace
+        for failed in names:
+            for previous in (names, names[:1], names[1:], ()):
+                with self.subTest(failed=failed, previous=previous), tempfile.TemporaryDirectory() as out:
+                    for name in previous:
+                        (Path(out) / name).write_text(json.dumps({"previous": name}), encoding="utf-8")
+                    injected = False
+
+                    def fail_once(src, dst):
+                        nonlocal injected
+                        if not injected and Path(dst) == Path(out) / failed:
+                            injected = True
+                            raise PermissionError("report replacement failed")
+                        return replace(src, dst)
+
+                    self.check_report_failure_and_retry(out, mock.patch.object(os, "replace", fail_once))
+                    self.assertTrue(injected)
+
+    def test_failed_report_restore_keeps_recovery_copy(self):
+        out = Path(self.out)
+        out.mkdir()
+        maps, summary = out / "maps.json", out / "summary.json"
+        old_summary = b'{"previous": "summary"}'
+        old_maps = b'{"previous": "maps"}'
+        summary.write_bytes(old_summary)
+        maps.write_bytes(old_maps)
+        replace = os.replace
+
+        def fail_publish_and_restore(src, dst):
+            if Path(dst) == maps:
+                raise PermissionError("publish denied")
+            if Path(dst) == summary and Path(src).read_bytes() == old_summary:
+                raise PermissionError("restore denied")
+            return replace(src, dst)
+
+        with mock.patch.object(os, "replace", fail_publish_and_restore):
+            code, _, err = self.run_main(self.arc, "--out", self.out, "--jobs", "1")
+        self.assertEqual(code, 1)
+        self.assertIn("restore denied", err)
+        self.assertEqual(maps.read_bytes(), old_maps)
+        backups = [p for p in out.rglob("summary.json") if p != summary and p.read_bytes() == old_summary]
+        self.assertEqual(len(backups), 1)
+        self.assertIn(str(backups[0].parent), err)
+
+    @unittest.skipUnless(os.name == "nt", "Windows readers can deny replacement")
+    def test_report_held_open_preserves_both_files(self):
+        for held in ("maps.json", "summary.json"):
+            with self.subTest(held=held), tempfile.TemporaryDirectory() as out:
+                self.assertEqual(self.run_main(self.arc, "--out", out, "--jobs", "1", "--limit", "64")[0], 0)
+                self.check_report_failure_and_retry(out, open(Path(out) / held, "rb"))
 
     def test_limit_narrows_the_scan(self):
         code, _, _ = self.run_main(self.arc, "--out", self.out, "--jobs", "1", "--limit", "64")
