@@ -126,7 +126,7 @@ struct VulkanDeviceInfo {
     // present, which PresentX's ImmediateThresholdPercent uses.
     bool swapchain_maintenance1 = false;
     // VK_EXT_swapchain_colorspace is enabled on the instance (with `presentation`): the surface can list its HDR10
-    // (ST.2084) formats, which a PresentX plane in HDR10 uses. Without it HDR10 planes are clipped to SDR.
+    // (ST.2084) formats, which a PresentX plane in HDR10 uses. Without it HDR10 planes are tone mapped to SDR.
     bool swapchain_colorspace = false;
     // VK_EXT_image_view_min_lod and its minLod feature are enabled on the logical device.
     bool image_view_min_lod = false;
@@ -255,6 +255,9 @@ bool queue_uses_calibrated_timestamps(ID3D12CommandQueue* queue);
 // Its CreateSwapChainForHwnd registers swapchain backbuffers directly with the device's VulkanContext.
 HRESULT create_dxgi_factory(ID3D12Device* device, REFIID riid, void** out);
 
+// SDRWhiteLevel of DISPLAYCONFIG_SDR_WHITE_LEVEL (1000 = 80 nits) to nits.
+float sdr_white_nits_from_level(unsigned long level);
+
 // Puts back buffers of a device from create_vulkan_device* into a window (leonida::VulkanPresenter), for the
 // presentation front end the game uses (DXGI or PresentX, still open). Holds a reference to the device.
 class WindowPresenter {
@@ -280,6 +283,10 @@ public:
     bool hdr_active() const;
     void force_hdr_encoding(bool on);
     std::uint64_t composed_presents() const;  // presents that went through the compose pass
+    // Nits of SDR white the user set in Windows for the output the window is on (DISPLAYCONFIG_SDR_WHITE_LEVEL), or 0 when
+    // it cannot be read (no window, no display config, not Windows). Only meaningful while hdr_active().
+    float display_sdr_white_nits() const;
+    void set_window(HWND window) { window_ = window; }
     bool tear_supported() const;
     bool last_present_tore() const;
     std::uint64_t tear_presents() const;
@@ -293,6 +300,7 @@ public:
 
 private:
     IUnknown* device_;
+    HWND window_ = nullptr;
     std::unique_ptr<leonida::VulkanPresenter> presenter_;
 };
 
