@@ -258,8 +258,14 @@ def is_scanned_input(path, input_path, pattern):
             return False
         root = parent
     pattern = pattern or "*.bin"
-    return (fnmatch.fnmatch(os.path.relpath(target, root), pattern)
-            or fnmatch.fnmatch(os.path.basename(target), pattern))
+    if (fnmatch.fnmatch(os.path.relpath(target, root), pattern)
+            or fnmatch.fnmatch(os.path.basename(target), pattern)):
+        return True
+    # The spelling may not match while the file is still one the scan reads: fnmatch folds case only on Windows,
+    # so CARVE/PAGE.BIN on a case-insensitive macOS or Linux volume, or a hard link, slips past the pattern. Ask
+    # the scan's own glob whether any file it reads is this one.
+    return any(same_report_path(target, scanned)
+               for scanned in glob.iglob(os.path.join(input_path, "**", pattern), recursive=True))
 
 
 def main() -> int:
