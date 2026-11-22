@@ -1,11 +1,34 @@
 // Bulk exporter around rpf9-explorer's Core (github.com/breadbbbb/rpf9-explorer).
 // Local use only: writes OBJ/DDS/JSON from the user's own package. No keys, no TOC decryption.
 using System.Diagnostics;
+using System.Globalization;
 using System.Text.Json;
 using RpfPreview.Core;
 
-if (args.Length < 3) { Console.WriteLine("usage: rpf9dump ttpf|models|textures <source> <outdir>"); return 2; }
+if (args.Length < 3) { Console.WriteLine("usage: rpf9dump ttpf|models|textures <source> <outdir> [--start BYTES] [--length BYTES]"); return 2; }
 string mode = args[0], src = Path.GetFullPath(args[1]), outRoot = Path.GetFullPath(args[2]);
+// --start/--length scan one window of the file instead of the whole archive. A window is a raw slice of an
+// archive (`levels.rpf` cut at an offset), so it need not carry the file's header and it is not an
+// ArchiveDocument: models and textures then read every resource from its own compression blocks
+// (tools/rpf9dump/Segments.cs). A window is how a multi-GiB archive is exported a piece at a time.
+long scanStart = 0; long? scanLength = null;
+for (int i = 3; i < args.Length; i += 2)
+{
+    if (i + 1 >= args.Length || !long.TryParse(args[i + 1], NumberStyles.None, CultureInfo.InvariantCulture, out long bytes) || bytes < 0)
+    {
+        Console.WriteLine($"{args[i]} needs a non-negative byte count.");
+        return 2;
+    }
+    if (args[i] == "--start") scanStart = bytes;
+    else if (args[i] == "--length") scanLength = bytes;
+    else { Console.WriteLine($"Unknown option {args[i]}."); return 2; }
+}
+bool window = scanStart != 0 || scanLength is not null;
+if (window && mode is not ("models" or "textures"))
+{
+    Console.WriteLine("--start/--length apply to models and textures; other modes need a recognized archive.");
+    return 2;
+}
 var json = new JsonSerializerOptions { WriteIndented = true };
 var sw = Stopwatch.StartNew();
 string baseName = Path.GetFileNameWithoutExtension(src);
@@ -103,38 +126,76 @@ else if (mode == "xma")
 }
 else if (mode is "models" or "textures")
 {
-    byte[] header; using (var f = File.OpenRead(src)) { header = new byte[64]; f.ReadExactly(header); }
-    var cached = RecoveryIndexCache.Load(mode, src, length, header);
-    int? candidates = ScanCounts.Candidates(cached?.Coverage);
-    if (cached == null)
+    // Neither mode needs the archive document any more: the entries come from the index cache or from this run's
+    // scan, and every resource is read from its own compression blocks (tools/rpf9dump/Segments.cs). That is what
+    // lets a raw slice of an archive - a --start/--length window, or a file cut out of levels.rpf - be exported at
+    // all: a slice has no 9FPR header, so there is no document to open.
+    List<ArchiveEntry> list;
+    int? candidates;
+    if (window)
     {
-        long last = -1;
-        var prog = new Progress<long>(p => { long s = p / (4L << 30); if (s != last) { last = s; Console.WriteLine($"  scan {100.0 * p / length:0.0}%"); } });
-        var cands = mode == "models" ? Rpf9ModelRecovery.FindCandidateOffsets(src, progress: prog) : Rpf9TextureRecovery.FindCandidateOffsets(src, progress: prog);
-        Console.WriteLine($"  candidates {cands.Count:N0} ({sw.Elapsed.TotalSeconds:0}s)");
+        // A sub-range is never cached: the index cache is keyed by the file, not by the window inside it.
+        var cands = Scan(src, scanStart, scanLength);
+        candidates = cands.Count;
+        list = Recover(src, length, cands);
+        Console.WriteLine("  a window is scanned again on every run: no index cache is written");
+    }
+    else
+    {
+        byte[] header; using (var f = File.OpenRead(src)) { header = new byte[64]; f.ReadExactly(header); }
+        var cached = RecoveryIndexCache.Load(mode, src, length, header);
+        candidates = ScanCounts.Candidates(cached?.Coverage);
+        if (cached == null)
+        {
+            var cands = Scan(src, 0, null);
+            list = Recover(src, length, cands);
+            RecoveryIndexCache.Save(mode, src, list, ScanCounts.Coverage(cands.Count, list.Select(e => e.Offset).Distinct().Count()));
+            candidates = cands.Count;
+        }
+        else
+        {
+            string want = mode == "models" ? "Recovered model" : "Recovered texture dictionary";
+            list = cached.Entries.Where(e => e.Compression == want).ToList();
+        }
+    }
+    Console.WriteLine($"  {list.Count:N0} {mode} entries ({sw.Elapsed.TotalSeconds:0}s)");
+    // A drawable dictionary yields one entry per child, all with the candidate's offset: count resources by offset.
+    int recovered = list.Select(e => e.Offset).Distinct().Count();
+    if (candidates is int scannedCount && scannedCount > recovered)
+        Console.WriteLine($"  {scannedCount - recovered:N0} of {scannedCount:N0} scan candidates were not recovered (rejected before decoding)");
+
+    // Scan a range and recover every resource it holds. Both run on all cores; the result is put back in offset
+    // order, so it does not depend on which chunk finished first.
+    IReadOnlyList<long> Scan(string path, long start, long? span)
+    {
+        long total = Math.Max(1, span ?? (length - start)), last = -1;
+        var progress = new Progress<long>(p =>
+        {
+            long percent = 100 * (p - start) / total;
+            if (percent != last) { last = percent; Console.WriteLine($"  scan {percent}%"); }
+        });
+        var found = mode == "models"
+            ? Rpf9ModelRecovery.FindCandidateOffsets(path, start, span, progress)
+            : Rpf9TextureRecovery.FindCandidateOffsets(path, start, span, progress);
+        Console.WriteLine($"  candidates {found.Count:N0} ({sw.Elapsed.TotalSeconds:0}s)");
+        return found;
+    }
+
+    List<ArchiveEntry> Recover(string path, long fileLength, IReadOnlyList<long> offsets)
+    {
         // Indexes are reassigned in offset order below, so the chunks' scheduling does not show in the result.
-        var chunks = cands.Chunk(32).ToArray();
+        var chunks = offsets.Chunk(32).ToArray();
         var got = new IReadOnlyList<ArchiveEntry>[chunks.Length];
         int validated = 0, found = 0;
         Parallel.For(0, chunks.Length, par, i =>
         {
-            got[i] = mode == "models" ? Rpf9ModelRecovery.RecoverAtOffsets(src, length, chunks[i]) : Rpf9TextureRecovery.RecoverAtOffsets(src, length, chunks[i]);
+            got[i] = mode == "models" ? Rpf9ModelRecovery.RecoverAtOffsets(path, fileLength, chunks[i]) : Rpf9TextureRecovery.RecoverAtOffsets(path, fileLength, chunks[i]);
             Interlocked.Add(ref found, got[i].Count);
             int n = Interlocked.Add(ref validated, chunks[i].Length);
-            if (n / 6400 != (n - chunks[i].Length) / 6400) Console.WriteLine($"  validated {n:N0}/{cands.Count:N0} -> {Volatile.Read(ref found):N0} ({sw.Elapsed.TotalSeconds:0}s)");
+            if (n / 6400 != (n - chunks[i].Length) / 6400) Console.WriteLine($"  validated {n:N0}/{offsets.Count:N0} -> {Volatile.Read(ref found):N0} ({sw.Elapsed.TotalSeconds:0}s)");
         });
-        var entries = got.SelectMany(g => g).OrderBy(e => e.Offset).Select((e, k) => e with { Index = k }).ToList();
-        RecoveryIndexCache.Save(mode, src, entries, ScanCounts.Coverage(cands.Count, entries.Select(e => e.Offset).Distinct().Count()));
-        candidates = cands.Count;
+        return got.SelectMany(g => g).OrderBy(e => e.Offset).Select((e, k) => e with { Index = k }).ToList();
     }
-    var doc = ArchiveReader.Open(src);
-    string want = mode == "models" ? "Recovered model" : "Recovered texture dictionary";
-    var list = doc.Entries.Where(e => e.Compression == want).ToList();
-    Console.WriteLine($"  {list.Count:N0} {mode} entries ({sw.Elapsed.TotalSeconds:0}s)");
-    // A drawable dictionary yields one entry per child, all with the candidate's offset: count resources by offset.
-    int recovered = list.Select(e => e.Offset).Distinct().Count();
-    if (candidates is int c && c > recovered)
-        Console.WriteLine($"  {c - recovered:N0} of {c:N0} scan candidates were not recovered (rejected before decoding)");
     string sub = Path.Combine(outDir, mode); Directory.CreateDirectory(sub);
     // The manifest is streamed row by row: holding 150k rows (each capturing its decoded model through lazy
     // projections) ran out of memory on levels.rpf. Written to a .partial file and renamed when complete.
@@ -153,6 +214,12 @@ else if (mode is "models" or "textures")
     writer.WriteNumber("Recovered", recovered);
     if (candidates is int total) writer.WriteNumber("NotRecovered", total - recovered); else writer.WriteNull("NotRecovered");
     writer.WriteNumber("Entries", list.Count);
+    if (window)
+    {
+        // Which slice of the file this manifest covers, so a later run can name the same window.
+        writer.WriteNumber("Start", scanStart);
+        writer.WriteNumber("Length", scanLength ?? (length - scanStart));
+    }
     writer.WriteEndObject();
     writer.WriteStartArray("Items");
     void Row(object row) => JsonSerializer.Serialize(writer, row, json);
@@ -190,7 +257,7 @@ else if (mode is "models" or "textures")
         string stem = Util.Safe(Path.GetFileNameWithoutExtension(e.Name));
         try
         {
-            var data = ArchiveReader.ReadResourceData(doc, e);
+            var data = RecoveredResource.Read(src, e);
             int split = e.ResourceSystemBytes ?? checked((int)e.Segments![0].Size);
             var sys = data.AsSpan(0, split); var gfx = data.AsSpan(split);
             if (mode == "models")
@@ -212,7 +279,13 @@ else if (mode is "models" or "textures")
                 }
                 return new Result(new { e.Offset, Drawable = e.ResourceDrawableOffset, File = stem + ".obj", m.Name, Meshes = m.Meshes.Count, Verts = m.Meshes.Sum(x => x.Positions.Count), Tris = m.Meshes.Sum(x => x.Indices.Count) / 3, m.IsFragment, m.HasBoneBindings,
                     Min = new[] { m.BoundsMin.X, m.BoundsMin.Y, m.BoundsMin.Z }, Max = new[] { m.BoundsMax.X, m.BoundsMax.Y, m.BoundsMax.Z },
+                    // Per geometry, in the order of the OBJ's `o` groups: triangles, the model it belongs to in the
+                    // drawable's primary-LOD list and its position in that model (a dehydrated BLAS leaf's geometry
+                    // index counts the geometries whose shader it keeps, docs/bvh.md §4a).
                     MeshShaders = m.Meshes.Select(x => x.ShaderIndex).ToArray(),
+                    MeshTris = m.Meshes.Select(x => x.Indices.Count / 3).ToArray(),
+                    MeshModels = m.Meshes.Select(x => Util.MeshKey(x.Name).Model).ToArray(),
+                    MeshGeoms = m.Meshes.Select(x => Util.MeshKey(x.Name).Geometry).ToArray(),
                     Embedded = m.EmbeddedTextures?.Select(t => new { t.Index, t.Name, t.Width, t.Height, t.Format, Hash = t.NameHash.ToString("X8"), Key = t.AssetKey?.ToString("X16") }).ToArray(),
                     Materials = m.Materials?.Select(x => new { x.ShaderIndex, Shader = x.ShaderHash.ToString("X8"), Preset = x.PresetHash.ToString("X8"), x.RenderBucket,
                         Textures = x.Textures.Select(r => new { Param = r.ParameterHash.ToString("X8"), r.TextureIndex, Name = r.NameHash.ToString("X8"), Id64 = r.OpaqueId64.ToString("X16"), Tag = r.Tag.ToString("X8") }).ToArray() }).ToArray() },

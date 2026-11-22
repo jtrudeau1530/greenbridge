@@ -17,6 +17,7 @@
 #include "vulkan_depth24.h"
 #include "vulkan_scratch.h"
 #include "vulkan_replay.h"
+#include "queue_families.h"
 #include "resource_tiling.h"
 #include "xdxr_build.h"
 
@@ -80,7 +81,8 @@ struct VulkanDeviceFunctions {
     X(vkCmdBindVertexBuffers2) X(vkCmdBindIndexBuffer) X(vkCmdSetViewport) X(vkCmdSetScissor)                  \
     X(vkCmdSetPrimitiveTopology) X(vkCmdSetPrimitiveRestartEnable) X(vkCmdSetStencilReference)                          \
     X(vkCmdSetBlendConstants) X(vkCmdDraw)                                                                              \
-    X(vkCmdDrawIndexed) X(vkCreateGraphicsPipelines) X(vkQueueBindSparse)
+    X(vkCmdDrawIndexed) X(vkCreateGraphicsPipelines) X(vkQueueBindSparse)                                      \
+    X(vkCreateEvent) X(vkDestroyEvent) X(vkResetEvent) X(vkCmdSetEvent) X(vkCmdWaitEvents)
 #define LEONIDA_VK_MEMBER(name) PFN_##name name = nullptr;
     LEONIDA_VK_DEVICE_FUNCTIONS(LEONIDA_VK_MEMBER)
 #undef LEONIDA_VK_MEMBER
@@ -202,7 +204,11 @@ public:
         return vk_.vkCreatePipelineLayout(device_, &layout, nullptr, &layout_) == VK_SUCCESS;
     }
 
-    bool prepare(bool needs_sum, bool needs_binary, bool needs_statistics_sum = false) {
+    bool prepare(bool needs_sum, bool needs_binary, bool needs_statistics_sum = false,
+                 bool needs_sum_binary = false) {
+        // The composite (sum then normalize, D3D-252) uses both pipelines.
+        needs_sum = needs_sum || needs_sum_binary;
+        needs_binary = needs_binary || needs_sum_binary;
         return (!needs_sum || sum_pipeline_ || create_pipeline(occlusion_sum_spirv, sum_pipeline_)) &&
                (!needs_binary || binary_pipeline_ || create_pipeline(binary_occlusion_spirv, binary_pipeline_)) &&
                (!needs_statistics_sum || statistics_pipeline_ ||
@@ -247,6 +253,31 @@ public:
             count -= chunk;
             if (count) barrier(cb, compute, transfer, shader_access, VK_ACCESS_TRANSFER_WRITE_BIT);
         }
+        copy_result(cb, dst, offset, word_size);
+    }
+
+    // Sums `count` binary-occlusion segments into one value and normalizes that total in place to 0 or 1: the
+    // result of a binary query whose interval spans more than one physical segment (overlapping queries, D3D-252).
+    void sum_binary(VkCommandBuffer cb, VkQueryPool queries, std::uint32_t first, std::uint32_t count,
+                    VkBuffer dst, VkDeviceSize offset) const {
+        begin_scratch_write(cb);
+        vk_.vkCmdFillBuffer(cb, scratch_, 0, word_size, 0);
+        bind(cb, sum_pipeline_);
+        auto tail = first, left = count;
+        while (left) {
+            const auto chunk = std::min(left, sum_capacity);
+            vk_.vkCmdCopyQueryPoolResults(cb, queries, tail, chunk, scratch_, word_size, word_size,
+                                          VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+            barrier(cb, transfer | compute, compute, VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+                    shader_access);
+            dispatch(cb, chunk, 1);
+            tail += chunk;
+            left -= chunk;
+            if (left) barrier(cb, compute, transfer, shader_access, VK_ACCESS_TRANSFER_WRITE_BIT);
+        }
+        barrier(cb, compute, compute, VK_ACCESS_SHADER_WRITE_BIT, shader_access);
+        bind(cb, binary_pipeline_);
+        dispatch(cb, 1, 1);
         copy_result(cb, dst, offset, word_size);
     }
 
@@ -1002,6 +1033,10 @@ public:
     // (timestampValidBits 0). Set by the device before any queue uses it.
     double timestamp_period() const { return timestamp_period_; }
     void set_timestamp_period(double period) { timestamp_period_ = period; }
+    // True where a timestamp resolve must be ordered explicitly after the timestamps it copies (MoltenVK on Apple
+    // GPUs, docs/d3d12_vulkan.md section 4.6). Set by the device before any queue uses it.
+    bool order_timestamp_copies() const { return order_timestamp_copies_; }
+    void set_order_timestamp_copies(bool order) { order_timestamp_copies_ = order; }
 
     // The device address of the GPU address arena: console VAs are offsets from it (docs section 3.3).
     // execute() copies replay_ under a shared resource_mutex_, so writers hold it uniquely.
@@ -1016,6 +1051,12 @@ public:
         replay_.zero_buffer = buffer;
         replay_.zero_offset = offset;
         replay_.zero_size = size;
+    }
+
+    // Physical-device COLOR_ATTACHMENT format check for reinterpreted UAV clears.
+    void set_color_attachment_format(std::function<bool(VkFormat)> check) {
+        std::unique_lock lock(resource_mutex_);
+        replay_.color_attachment_format = std::move(check);
     }
     std::uint64_t heap_base() {
         std::shared_lock lock(resource_mutex_);
@@ -1109,6 +1150,8 @@ public:
     // `prepare` is called at the start of the command buffer of every ExecuteCommandLists, before the lists are
     // written: the device brings the bindless set 0 of the translated shaders up to date there (vulkan_bindless.h)
     // and records what the set needs first. When it fails, nothing of that call is executed.
+    void set_transfer_only_family(std::uint32_t family) { transfer_only_family_ = family; }
+
     void set_bindless_prepare(std::function<bool(VkCommandBuffer)> prepare) {
         std::unique_lock lock(resource_mutex_);
         bindless_prepare_ = std::move(prepare);
@@ -1238,10 +1281,10 @@ private:
         info.format = r.format;
         info.subresourceRange = range;
         // Attachment views need only color-attachment usage. Inheriting STORAGE usage from a mutable/extended
-        // resource (typeless RGBA8 sRGB views, or R32_UINT-backed R9G9B9E5 UAV images) would require unrelated usages.
+        // resource (typeless views such as RGBA8 sRGB, or R32_UINT-backed R9G9B9E5 UAV images) would require unrelated usages.
         VkImageViewUsageCreateInfo usage{VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO};
         usage.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
-        if (r.rgba8_typeless || (range.aspectMask == VK_IMAGE_ASPECT_COLOR_BIT && r.color_attachment))
+        if (r.typeless || (range.aspectMask == VK_IMAGE_ASPECT_COLOR_BIT && r.color_attachment))
             info.pNext = &usage;
         VkImageView view = VK_NULL_HANDLE;
         if (vk.vkCreateImageView(device_, &info, nullptr, &view) != VK_SUCCESS) return VK_NULL_HANDLE;
@@ -1283,11 +1326,13 @@ private:
     std::function<void(bool)> bindless_commit_;
     std::unordered_map<QueryHeapId, QueryPool> query_pools_;  // element pointers stay valid across inserts
     double timestamp_period_ = 0;
+    bool order_timestamp_copies_ = false;
     VkPhysicalDeviceMemoryProperties occlusion_resolve_memory_{};
     ReplayFunctions replay_;
     std::unique_ptr<PredicateReducer> predicate_reducer_;
     std::unique_ptr<PredicatedBufferCopier> predicated_copier_;
     std::uint32_t predicate_family_ = UINT32_MAX;
+    std::uint32_t transfer_only_family_ = UINT32_MAX;
     DebugLabelFunctions labels_;
 };
 #ifdef _MSC_VER
@@ -1395,6 +1440,8 @@ public:
         }
         if (pool_) vk.vkDestroyCommandPool(context_.device(), pool_, nullptr);
         if (progress_) vk.vkDestroySemaphore(context_.device(), progress_, nullptr);
+        for (auto& slot : buffers_) free_events_.insert(free_events_.end(), slot.events.begin(), slot.events.end());
+        for (VkEvent event : free_events_) vk.vkDestroyEvent(context_.device(), event, nullptr);
     }
 
     VulkanQueue(const VulkanQueue&) = delete;
@@ -1468,6 +1515,12 @@ public:
     // the layout tracker as it was. Pending Wait()s are attached to this submission.
     ReplayResult execute(std::span<const CommandList* const> lists) {
         if (context_.is_device_lost()) return ReplayResult::unsupported;
+        if (kind_ != QueueKind::direct)
+            for (const auto* list : lists)
+                for (const auto& command : list->commands())
+                    if (std::holds_alternative<ClearRenderTarget>(command) ||
+                        std::holds_alternative<ClearDepthStencil>(command))
+                        return ReplayResult::unsupported;
         VkCommandBuffer command_buffer = VK_NULL_HANDLE;
         std::function<void(bool)> bindless_commit;
         // Lock hierarchy: resource_mutex_ -> tracker_mutex_ -> submit_mutex_.
@@ -1494,12 +1547,16 @@ public:
                 if (active && scratch) scratch->retire(progress, 0);
             }
         } scratch_guard{context_.scratch_.get(), progress_, false};
-        bindless_commit = context_.bindless_commit_;
+        const bool transfer_only = family_ == context_.transfer_only_family_;
+        if (!transfer_only) bindless_commit = context_.bindless_commit_;
         // Kept between executions: prepare refills each list's entries in the storage the last execution left, where
         // making them fresh for every command was about half the layer's CPU cost per command (replay_cpu_bench).
         auto& prepared = prepared_;
         prepared.resize(lists.size());
         ReplayFunctions replay = context_.replay_;
+        replay.queue_stages = kind_ == QueueKind::copy      ? detail::queue_stages_copy
+                              : kind_ == QueueKind::compute ? detail::queue_stages_compute
+                                                            : 0;
         std::uint64_t captures = 0;
         for (const auto* list : lists)
             for (const auto& command : list->commands())
@@ -1543,7 +1600,7 @@ public:
                 return context_.scratch_->get(bytes, buffer, offset);
             };
         }
-        if (context_.depth24_) {
+        if (context_.depth24_ && !transfer_only) {
             replay.depth24_prepare = [this, &tracker_lock, &depth24_guard](Depth24Job& job,
                                                                            std::vector<Depth24Job>& parts) {
                 if (!tracker_lock.owns_lock()) tracker_lock.lock();
@@ -1568,6 +1625,10 @@ public:
             replay.sum_statistics = [this](VkCommandBuffer cb, VkQueryPool pool, std::uint32_t first,
                                            std::uint32_t count, VkBuffer dst, VkDeviceSize offset) {
                 occlusion_resolve_->sum_statistics(cb, pool, first, count, dst, offset);
+            };
+            replay.sum_binary_occlusion = [this](VkCommandBuffer cb, VkQueryPool pool, std::uint32_t first,
+                                                 std::uint32_t count, VkBuffer dst, VkDeviceSize offset) {
+                occlusion_resolve_->sum_binary(cb, pool, first, count, dst, offset);
             };
         }
         const auto resolve = [this](ResourceId id) { return context_.resolve(id); };
@@ -1615,19 +1676,38 @@ public:
             base += list.segment_count;
             statistics_base += list.statistics_segment_count;
         }
-        if (queries.needs_sum || queries.needs_binary || queries.needs_statistics_sum) {
+        if (queries.needs_sum || queries.needs_binary || queries.needs_statistics_sum || queries.needs_sum_binary) {
             if (!occlusion_resolve_) {
                 auto helper = std::make_unique<OcclusionResolve>(context_.vk, context_.device());
                 if (!helper->initialize(occlusion_memory)) return ReplayResult::unsupported;
                 occlusion_resolve_ = std::move(helper);
             }
-            if (!occlusion_resolve_->prepare(queries.needs_sum, queries.needs_binary, queries.needs_statistics_sum))
+            if (!occlusion_resolve_->prepare(queries.needs_sum, queries.needs_binary, queries.needs_statistics_sum,
+                                             queries.needs_sum_binary))
                 return ReplayResult::unsupported;
         }
 
         CommandSlot* slot = acquire();
         if (!slot) return ReplayResult::unsupported;
         command_buffer = slot->buffer;
+        // MoltenVK writes a timestamp at the end of a Metal encoder and resolves it with a blit that nothing orders
+        // after that write, so a copy in the same or the next command buffer reads the old value (docs section 4.6).
+        // An event set and waited for in this command buffer orders it after this submission's timestamps; a wait for
+        // this queue's previous submission orders it after earlier ones still running.
+        bool ordered_timestamps = false;
+        const auto& events = context_.vk;
+        if (context_.order_timestamp_copies() && events.vkCreateEvent && events.vkDestroyEvent && events.vkResetEvent &&
+            events.vkCmdSetEvent && events.vkCmdWaitEvents)
+            replay.order_timestamp_copy = [this, slot, &ordered_timestamps](VkCommandBuffer cb) {
+                const VkEvent event = take_event();
+                if (!event) return;
+                slot->events.push_back(event);
+                const auto& vk = context_.vk;
+                vk.vkCmdSetEvent(cb, event, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+                vk.vkCmdWaitEvents(cb, 1, &event, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                   VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, nullptr, 0, nullptr, 0, nullptr);
+                ordered_timestamps = true;
+            };
         const auto discard = [&] {
             if (context_.vk.vkResetCommandBuffer(command_buffer, 0) == VK_SUCCESS) slot->ticket = 0;
         };
@@ -1638,7 +1718,7 @@ public:
             return ReplayResult::unsupported;
         }
         if (!tracker_lock.owns_lock()) tracker_lock.lock();
-        if (context_.bindless_prepare_ && !context_.bindless_prepare_(command_buffer)) {
+        if (!transfer_only && context_.bindless_prepare_ && !context_.bindless_prepare_(command_buffer)) {
             const bool ended = context_.vk.vkEndCommandBuffer(command_buffer) == VK_SUCCESS;
             resource_lock.unlock();
             const bool submitted = ended && submit(command_buffer, VK_NULL_HANDLE, 0);
@@ -1724,6 +1804,11 @@ public:
         }
         const bool ended = context_.vk.vkEndCommandBuffer(command_buffer) == VK_SUCCESS;
         resource_lock.unlock();  // release resource_mutex_ before vkQueueSubmit while keeping tracker_lock held
+        const bool wait_previous = ordered_timestamps && submitted_;
+        if (wait_previous) {
+            waits_.push_back(progress_);
+            wait_values_.push_back(submitted_);
+        }
         const bool submitted = ended && submit(command_buffer, VK_NULL_HANDLE, 0);
         if (!submitted && !storage_images.empty()) {  // not initialized after all: try again with the next submission
             std::lock_guard lock(context_.storage_mutex_);
@@ -1735,6 +1820,10 @@ public:
             context_.storage_init_value_ = submitted_;
             ++context_.storage_init_version_;
             storage_init_seen_ = context_.storage_init_version_;
+        }
+        if (wait_previous && !submitted && !waits_.empty()) {  // a failed submit keeps the waits for the next one
+            waits_.pop_back();
+            wait_values_.pop_back();
         }
         if (submitted) {
             context_.tracker_ = std::move(next_tracker);
@@ -1798,6 +1887,7 @@ private:
         VkCommandBuffer buffer;
         std::uint64_t ticket;
         std::vector<std::shared_ptr<const OcclusionSegmentPool>> segments;
+        std::vector<VkEvent> events;  // order_timestamp_copy's, reset and reused once the slot completes
         std::unique_ptr<PredicatedBufferCopier::Batch> predicated_copy;
         std::unique_ptr<PredicateReducer::Batch> predicate; // retained until this slot completes
     };
@@ -1907,6 +1997,10 @@ private:
         for (auto& slot : buffers_) {
             if (slot.ticket > done) continue;
             slot.segments.clear();
+            for (VkEvent event : slot.events)
+                if (context_.vk.vkResetEvent(context_.device(), event) == VK_SUCCESS) free_events_.push_back(event);
+                else context_.vk.vkDestroyEvent(context_.device(), event, nullptr);
+            slot.events.clear();
             if (!reuse) reuse = &slot;
         }
         if (reuse) {
@@ -1925,6 +2019,20 @@ private:
             return nullptr;
         buffers_.push_back({command_buffer, UINT64_MAX});
         return &buffers_.back();
+    }
+
+    // An unsignaled event for order_timestamp_copy, or null. MoltenVK decides when the command buffer is submitted
+    // whether a set or wait does anything, from the event's state then, so each use gets an event of its own.
+    VkEvent take_event() {
+        if (!free_events_.empty()) {
+            const VkEvent event = free_events_.back();
+            free_events_.pop_back();
+            return event;
+        }
+        VkEventCreateInfo info{VK_STRUCTURE_TYPE_EVENT_CREATE_INFO};
+        VkEvent event = VK_NULL_HANDLE;
+        if (context_.vk.vkCreateEvent(context_.device(), &info, nullptr, &event) != VK_SUCCESS) return VK_NULL_HANDLE;
+        return event;
     }
 
     bool submit(VkCommandBuffer command_buffer, VkSemaphore fence, std::uint64_t value) {
@@ -1996,6 +2104,7 @@ private:
     VkSemaphore progress_ = VK_NULL_HANDLE;  // our own timeline: which command buffers are done
     std::uint64_t submitted_ = 0;
     std::vector<CommandSlot> buffers_;
+    std::vector<VkEvent> free_events_;  // unsignaled, for order_timestamp_copy
     std::unique_ptr<OcclusionResolve> occlusion_resolve_;
     std::uint64_t storage_init_seen_ = 0;  // the storage_init_version_ this queue has waited for
     std::uint64_t last_sparse_ = 0;

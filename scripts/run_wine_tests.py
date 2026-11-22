@@ -118,6 +118,9 @@ def regex_list(value: str | list[str]) -> list[str]:
 
 def run_test(test: dict, args, wine: list[str]) -> tuple[str, str]:
     """Returns (status, detail): status is pass, fail or skip."""
+    props = properties(test)
+    if truthy(props.get("DISABLED")):
+        return "skip", "disabled by CTest"
     command = test.get("command")
     if not command:
         return "fail", "no command (target not built?)"
@@ -131,14 +134,24 @@ def run_test(test: dict, args, wine: list[str]) -> tuple[str, str]:
     for a in command[1:]:
         mapped = map_path(a, args.windows_root, args.root)
         argv.append(wine_path(mapped) if mapped is not None else a)
-    props = properties(test)
     cwd = props.get("WORKING_DIRECTORY")
     cwd = map_path(cwd, args.windows_root, args.root) if cwd else os.path.dirname(exe)
     if not cwd or not os.path.isdir(cwd):
         cwd = os.path.dirname(exe)
+    assignments = props.get("ENVIRONMENT", [])
+    if not isinstance(assignments, list):
+        return "fail", "invalid CTest ENVIRONMENT: expected a list of NAME=value entries"
+    env = os.environ.copy()
+    for assignment in assignments:
+        if not isinstance(assignment, str):
+            return "fail", "invalid CTest ENVIRONMENT entry: expected NAME=value"
+        key, equals, value = assignment.partition("=")
+        if not key or not equals or "\0" in assignment:
+            return "fail", "invalid CTest ENVIRONMENT entry: expected NAME=value"
+        env[key] = value
     start = time.monotonic()
     try:
-        proc = subprocess.run(argv, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        proc = subprocess.run(argv, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                               timeout=args.timeout)
     except subprocess.TimeoutExpired as e:
         out = (e.stdout or b"").decode("utf-8", "replace")
@@ -202,10 +215,11 @@ def read_tests(path: str) -> list[dict] | None:
     except (OSError, ValueError) as e:
         print(f"ERROR: cannot read {path}: {e}", file=sys.stderr)
         return None
-    if not isinstance(doc, dict) or not isinstance(doc.get("tests", []), list):
+    tests = doc.get("tests") if isinstance(doc, dict) else None
+    if not isinstance(tests, list) or not all(isinstance(t, dict) for t in tests):
         print(f"ERROR: {path} is not the output of ctest --show-only=json-v1", file=sys.stderr)
         return None
-    return doc.get("tests", [])
+    return tests
 
 
 def main() -> int:

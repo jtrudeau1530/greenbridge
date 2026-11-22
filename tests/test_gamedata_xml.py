@@ -186,6 +186,23 @@ class GamedataXmlTest(unittest.TestCase):
         self.assertIn("1 malformed", p.stdout)
         self.assertIn("not-a-charset", p.stdout)
 
+    def test_comments_in_a_document_that_does_not_parse_are_counted(self):
+        # A truncated or tail-only document stops the parser at the error; its comments still count, and
+        # comment-like text in CDATA (closed or cut off) still doesn't.
+        cases = {"open.xml": (b"<a><!--x--><!--y-->", 2),
+                 "tail.xml": (b"</b><!--x--></a><!--y-->", 2),
+                 "cdata.xml": (b"<a><!--x--><![CDATA[<!--no-->]]><b><![CDATA[<!--cut", 1)}
+        for name, (body, want) in cases.items():
+            with self.subTest(name=name):
+                doc = self.write(name, body)
+                out = os.path.join(self.root, name + ".json")
+                p = self.run_tool(doc, "--json", out)
+                self.assertEqual(p.returncode, 0, p.stderr)
+                with open(out, encoding="utf-8") as f:
+                    row = json.load(f)["rows"][0]
+                self.assertFalse(row["well_formed"])
+                self.assertEqual(row["comments"], want)
+
     def test_comments_inside_cdata_are_not_counted(self):
         doc = self.write("comments.xml", b"<!-- real --><Root><![CDATA[<!-- text -->]]></Root><!-- real -->")
         out = os.path.join(self.root, "catalog.json")
@@ -243,6 +260,34 @@ class GamedataXmlTest(unittest.TestCase):
         self.assertTrue(tail["tail_only"])
         self.assertTrue(tail["truncated"])
         self.assertFalse(tail["malformed"])
+
+    def test_carve_catalog_marks_parsed_headerless_documents_complete(self) -> None:
+        carve = os.path.join(self.root, "headerless")
+        os.makedirs(carve)
+        rows = []
+        for off, data in ((0x1000, b"<Plain><Child/></Plain>"), (0x2000, b"<Empty/>")):
+            with open(os.path.join(carve, f"{off:012x}.bin"), "wb") as f:
+                f.write(data)
+            rows.append({"off": off, "stored": len(data), "size": len(data),
+                         "head": data[:16].hex(), "pre": ""})
+        with open(os.path.join(carve, "index.json"), "w", encoding="utf-8", newline="\n") as f:
+            json.dump({"files": rows}, f)
+
+        out = os.path.join(self.root, "headerless.json")
+        result = self.run_tool(carve, "--json", out, "--check")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        with open(out, encoding="utf-8") as f:
+            report = json.load(f)
+        self.assertEqual([row["root"] for row in report["rows"]], ["Plain", "Empty"])
+        for row in report["rows"]:
+            with self.subTest(root=row["root"]):
+                self.assertTrue(row["well_formed"])
+                self.assertTrue(row["complete"])
+                self.assertFalse(row["header"])
+                self.assertFalse(row["tail_only"])
+                self.assertFalse(row["fragment"])
+        self.assertEqual(report["summary"]["tail_only"], 0)
+        self.assertEqual(report["summary"]["fragments"], 0)
 
     def test_unwritable_csv_or_json_is_one_error_line(self):
         doc = self.write("alpha.xml", ALPHA)

@@ -27,11 +27,11 @@ def _u32(data, at):
     return struct.unpack_from("<I", data, at)[0]
 
 def is_mesh_page(data):
-    """Same as meshlet_page.py - checks if data starts with block or valid group."""
+    """Check whether data starts with either vertex block header or a meshlet group."""
     if len(data) < 16:
         return False
     word = struct.unpack_from("<I", data, 0)[0]
-    if word == BLOCK_MAGIC:
+    if word in (BLOCK_MAGIC, OTHER_BLOCK_MAGIC):
         return True
     if not word & 0x80000000:
         return False
@@ -297,6 +297,16 @@ def positive_int(text):
     return value
 
 
+def same_output_path(first, second):
+    """True when the two names are one file: the same path, or a link, junction or other spelling of it."""
+    if os.path.normcase(os.path.realpath(first)) == os.path.normcase(os.path.realpath(second)):
+        return True
+    try:
+        return os.path.samefile(first, second)
+    except OSError:
+        return False
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Analyze 42 40 00 00 vertex blocks in RPF9 archives")
     parser.add_argument("inputs", nargs="+", help="RPF9 archive paths")
@@ -304,7 +314,17 @@ def main() -> int:
     parser.add_argument("--limit", type=positive_int, help="Limit streams per archive")
     parser.add_argument("--verbose", "-v", action="store_true")
     args = parser.parse_args()
-    
+    # Checked before the scan: the report is written after every archive has been read, so a --json naming one of
+    # them replaced the archive with the report, and a folder only failed once the whole scan was done.
+    if args.json:
+        if os.path.isdir(args.json):
+            print(f"ERROR: --json {args.json} is a folder, not a file", file=sys.stderr)
+            return 2
+        for path in args.inputs:
+            if same_output_path(args.json, path):
+                print(f"ERROR: --json {args.json} would overwrite the input archive {path}", file=sys.stderr)
+                return 2
+
     all_stats, status = [], 0
     for path in args.inputs:
         if not os.path.exists(path):
@@ -350,10 +370,14 @@ def main() -> int:
             s_copy["slot_tag_counts"] = {str(k): v for k, v in s["slot_tag_counts"].items()}
             output.append(s_copy)
         parent = os.path.dirname(os.path.abspath(args.json))
-        if parent:      # every archive has been read by now; a missing folder used to lose the run
-            os.makedirs(parent, exist_ok=True)
-        with open(args.json, "w", encoding="utf-8", newline="\n") as f:
-            json.dump(output, f, indent=2)
+        try:
+            if parent:      # every archive has been read by now; a missing folder used to lose the run
+                os.makedirs(parent, exist_ok=True)
+            with open(args.json, "w", encoding="utf-8", newline="\n") as f:
+                json.dump(output, f, indent=2)
+        except OSError as e:
+            print(f"ERROR: cannot write {args.json}: {e.strerror or e}", file=sys.stderr)
+            return 2
     return status
 
 

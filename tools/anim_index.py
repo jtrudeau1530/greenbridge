@@ -5,8 +5,9 @@ zlib stream that inflates cleanly to its end, then classify the inflated bytes. 
 game data, and does not decode animation.
 
 Signatures are only the byte patterns measured in docs/animation.md. Anything else is reported as `raw:<hex>`
-instead of being guessed. A `0DRP` page is reported with its version and page count; `MoVE` with its version and
-size hint; `RBF0` with its first schema name; name tables with their first path and number of paths.
+instead of being guessed. A `0DRP` page is reported with its version and page count; the tagged auxiliary table that starts a
+`0DRP` second system page (historical label `clip-stream`) with its entry count, tags and payload end, and only
+when its directory and payloads fit in the stream; `MoVE` with its version and size hint; `RBF0` with its first schema name; name tables with their first path and number of paths.
 
 Usage:
     python -I anim_index.py <archive.rpf> <out.csv|out.json> [--start N] [--limit BYTES] [--quiet]
@@ -65,8 +66,34 @@ def _printable(data):
     if not data:
         return False
     sample = data[:512]
-    good = sum(1 for b in sample if 9 <= b < 127 or b in (10, 13))
+    good = sum(1 for b in sample if 32 <= b < 127 or b in (9, 10, 13))
     return len(sample) >= 64 and good / len(sample) > 0.9
+
+
+AUX_FIRST_TAG = 0x101
+AUX_COUNTS = (2, 3)
+
+
+def aux_table(data):
+    """The tagged auxiliary table at the start of a `0DRP` resource's second system page (docs/animation.md):
+    a u32 count (2 or 3), then `count` pairs {u32 tag, u32 payloadBytes}, then the payloads in order; the first
+    tag is 0x101. Bytes after the payloads are legitimate (schema tables follow them). Returns
+    ([(tag, size), ...], payload_end) when the directory and every payload fit in `data`, else None, so a
+    matching prefix on truncated or unrelated bytes keeps its generic classification. Needs the whole
+    inflated stream, not a head slice."""
+    count = _u32(data, 0)
+    if count not in AUX_COUNTS:
+        return None
+    directory_end = 4 + 8 * count
+    if len(data) < directory_end:
+        return None
+    entries = [struct.unpack_from("<II", data, 4 + 8 * i) for i in range(count)]
+    if entries[0][0] != AUX_FIRST_TAG:
+        return None
+    payload_end = directory_end + sum(size for _, size in entries)
+    if payload_end > len(data):
+        return None
+    return entries, payload_end
 
 
 def classify(data, offset, stored):
@@ -99,8 +126,13 @@ def classify(data, offset, stored):
           and 0 < (_u32(data, 8) or 0) <= 4096):
         record.update(signature="typehash", version=8, count=_u32(data, 8),
                       detail=f"type=0x{_u32(data, 0):08x}")
-    elif len(data) >= 8 and _u32(data, 0) in (2, 3) and data[4:8] == b"\x01\x01\x00\x00":
-        record.update(signature="clip-stream", version=_u32(data, 0), detail="24-byte header")
+    elif (table := aux_table(data)) is not None:
+        # Historical label kept so existing consumers group these pages as before; the count is the measured
+        # entry count, not a version.
+        entries, payload_end = table
+        record.update(signature="clip-stream", count=len(entries),
+                      detail=f"aux-table tags={','.join(f'0x{tag:x}' for tag, _ in entries)} "
+                             f"payload_end={payload_end}")
     elif data[:3] == b"KB2" and len(data) >= 0x20:
         record.update(signature="bink2", version=chr(data[3]), count=_u32(data, 8))
         record["detail"] = f"{_u32(data, 0x14)}x{_u32(data, 0x18)}"
@@ -292,7 +324,7 @@ def collect_skeletons_dir(path):
     out = []
     for name in sorted(os.listdir(path)):
         full = os.path.join(path, name)
-        if not os.path.isfile(full) or os.path.getsize(full) > 16384:
+        if not os.path.isfile(full) or name.lower().endswith((".json", ".csv")) or os.path.getsize(full) > 16384:
             continue
         with open(full, "rb") as f:
             data = f.read()
@@ -308,9 +340,9 @@ def collect_skeletons_dir(path):
 def collect_rbf0_dir(path):
     """The same continuation rule for a carved directory sorted by offset."""
     entries = []
-    for name in os.listdir(path):
+    for name in sorted(os.listdir(path)):
         full = os.path.join(path, name)
-        if not os.path.isfile(full):
+        if not os.path.isfile(full) or name.lower().endswith((".json", ".csv")):
             continue
         m = re.match(r"([0-9a-fA-F]{6,})", name)
         offset = int(m.group(1), 16) if m else len(entries)
@@ -532,8 +564,40 @@ def main():
     ap.add_argument("--rigs", metavar="PATH", help="write parsed RBF0 rig-set/rig and SKEL_ JSON here")
     ap.add_argument("--quiet", action="store_true")
     a = ap.parse_args()
-    if a.rigs and same_report_path(a.out, a.rigs):
-        ap.error("index and --rigs must use different paths")
+    if same_report_path(a.source, a.out):
+        ap.error("output must not overwrite the source")
+    if a.rigs:
+        if same_report_path(a.source, a.rigs):
+            ap.error("--rigs must not overwrite the source")
+        if same_report_path(a.out, a.rigs):
+            ap.error("index and --rigs must use different paths")
+    if os.path.isdir(a.out):
+        ap.error(f"{a.out} is a folder, not a .csv or .json file")
+    if a.rigs and os.path.isdir(a.rigs):
+        ap.error(f"{a.rigs} is a folder, not a JSON file")
+    if os.path.isdir(a.source):
+        manifest = os.path.join(a.source, "index.json")
+        for flag, path in (("output", a.out), ("--rigs", a.rigs)):
+            if not path:
+                continue
+            if os.path.isfile(manifest) and same_report_path(manifest, path):
+                ap.error(f"{flag} would overwrite the carve manifest: {path}")
+            if os.path.isfile(path):
+                for name in os.listdir(a.source):
+                    inp = os.path.join(a.source, name)
+                    if os.path.isfile(inp) and not name.lower().endswith((".json", ".csv")):
+                        if same_report_path(inp, path):
+                            ap.error(f"{flag} would overwrite an input file: {path}")
+    if os.path.splitext(a.out)[1].lower() not in (".json", ".csv"):
+        ap.error("output must end in .json or .csv")
+    if a.rigs and os.path.splitext(a.rigs)[1].lower() != ".json":
+        ap.error("--rigs must end in .json")
+    for flag, path in (("output", a.out), ("--rigs", a.rigs)):
+        if not path:
+            continue
+        folder = os.path.dirname(os.path.abspath(path))
+        if not os.path.isdir(folder):
+            sys.exit(f"{path}: cannot write: folder does not exist: {folder}")
     try:
         if os.path.isdir(a.source):
             if a.start is not None or a.limit is not None:

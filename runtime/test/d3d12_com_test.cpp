@@ -5,6 +5,7 @@
 #include "vk_test_device.h"
 #include "../shims/d3d12_com.h"
 #include "../shims/d3d12_trace.h"
+#include "../src/gfx10_descriptors.h"
 
 #include <array>
 #include <cstdint>
@@ -27,6 +28,11 @@ struct Ref {
 };
 
 }  // namespace
+
+static_assert(std::is_move_constructible_v<leonida::Draw>);
+static_assert(std::is_move_assignable_v<leonida::Draw>);
+static_assert(sizeof(leonida::Draw::render_targets) == sizeof(leonida::TargetView) * 8);
+static_assert(sizeof(leonida::Draw::vertex_buffers) == sizeof(leonida::VertexBufferView) * 32);
 
 int main(int argc, char** argv) {
     if (argc == 2 && std::strcmp(argv[1], "--trace-d3d12") == 0) rt::d3d12_trace::set_enabled(true);
@@ -97,7 +103,7 @@ int main(int argc, char** argv) {
         EXPECT(queue->GetDesc().Type == D3D12_COMMAND_LIST_TYPE_DIRECT);
         EXPECT(list->GetType() == D3D12_COMMAND_LIST_TYPE_DIRECT);
 
-        // ExecuteBundle: a closed bundle is inlined at the call site, and its recorded sticky state spills back.
+        // ExecuteBundle: a closed bundle's state calls play on the parent, so what the bundle set stays there.
         Ref<ID3D12GraphicsCommandList8> list8;
         EXPECT(SUCCEEDED(list->QueryInterface(IID_PPV_ARGS(&list8.p))));
         list8->OMSetFrontAndBackStencilRef(1, 2);
@@ -269,6 +275,18 @@ int main(int argc, char** argv) {
         EXPECT(invalid_bundle_call([&](auto* b) { b->ClearRenderTargetView(rtv_handle, bundle_clear_color, 0, nullptr); }));
         EXPECT(invalid_bundle_call([&](auto* b) { b->ClearDepthStencilView(dsv_handle, D3D12_CLEAR_FLAG_DEPTH,
                                                                             0.5f, 0, 0, nullptr); }));
+        // A valid texture UAV descriptor, which a direct list would accept: only the bundle refuses the clear.
+        const UINT uav_uint[4] = {};
+        const FLOAT uav_float[4] = {};
+        leonida::gfx10::Image uav_image{};
+        uav_image.format = leonida::gfx10::format_from_vulkan(VK_FORMAT_R8G8B8A8_UNORM);
+        uav_image.width = uav_image.height = 4;
+        const auto uav_words = leonida::gfx10::encode(uav_image);
+        const D3D12_CPU_DESCRIPTOR_HANDLE uav_view{reinterpret_cast<SIZE_T>(uav_words.data())};
+        EXPECT(invalid_bundle_call([&](auto* b) {
+            b->ClearUnorderedAccessViewUint({}, uav_view, rt_resource, uav_uint, 0, nullptr); }));
+        EXPECT(invalid_bundle_call([&](auto* b) {
+            b->ClearUnorderedAccessViewFloat({}, uav_view, rt_resource, uav_float, 0, nullptr); }));
         EXPECT(invalid_bundle_call([&](auto* b) { b->SetPredication(nullptr, 0, D3D12_PREDICATION_OP_EQUAL_ZERO); }));
         // D3D-26: DiscardResource and the atomic copies are not allowed in a bundle; WriteBufferImmediate is
         // ("Recording command lists and bundles", the bundle restrictions and the API restrictions table).

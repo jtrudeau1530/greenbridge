@@ -203,6 +203,32 @@ class TestClassify(unittest.TestCase):
         self.assertNotIn(21, mesh.slots)
 
 
+class TestResourceKindDictionary(unittest.TestCase):
+    """Dictionary headers follow the pinned rpf9-explorer's DrawableDictionaryCheckBytes.
+
+    Every byte here is built by the test; no package bytes are used.
+    """
+
+    @staticmethod
+    def dictionary(pages=0x50000000 + 0x100):
+        b = bytearray(192)
+        struct.pack_into("<Q", b, 8, pages)
+        struct.pack_into("<Q", b, 32, 0x50000000 + 0x200)
+        struct.pack_into("<Q", b, 48, 0x50000000 + 0x300)
+        for at in (40, 42, 56, 58):
+            struct.pack_into("<H", b, at, 2)
+        return bytes(b)
+
+    def test_null_page_pointer_is_not_a_dictionary(self):
+        self.assertIsNone(ss.resource_kind(self.dictionary(pages=0)))
+
+    def test_non_system_page_pointer_is_not_a_dictionary(self):
+        self.assertIsNone(ss.resource_kind(self.dictionary(pages=0x12345678)))
+
+    def test_system_page_pointer_is_a_dictionary(self):
+        self.assertEqual(ss.resource_kind(self.dictionary()), "dictionary")
+
+
 class TestValidate(unittest.TestCase):
     def test_weighted_8bit_clean(self):
         _s, gfx, mesh = weighted_mesh("weighted-8inf-8bit", vertices=16, bones=6)
@@ -308,6 +334,20 @@ class TestScanArchive(unittest.TestCase):
         self.assertEqual(v["components-out-of-range"], 0)
         self.assertEqual(v["descriptor-mismatch"], 0)
 
+    def test_scan_counts_weighted_16_bit_joint_values(self) -> None:
+        slots = {
+            0: (8, 16, 96, bytes(24)),
+            16: (4, 28, 128, bytes((255, 0, 0, 0)) * 3),
+            20: (8, 12, 144, struct.pack("<12H", 300, 700, 0, 0,
+                                        403, 700, 0, 0, 399, 700, 0, 0)),
+        }
+        system, gfx = build_resource(slots, vertices=3, bones=400)
+        stats = self.run_scan(system, gfx)
+        validated = stats["validated"]["weighted-4inf-16bit"]
+        self.assertEqual(validated["descriptor-mismatch"], 0)
+        self.assertEqual(validated["weighted-components"], 3)
+        self.assertEqual(validated["components-out-of-range"], 1)
+
     def test_unaligned_resource_is_not_a_candidate(self):
         system, gfx, _mesh = rigid_mesh()
         stats = self.run_scan(system, gfx, extra=zlib.compress(system, 9))
@@ -326,6 +366,59 @@ class TestScanArchive(unittest.TestCase):
         stats = self.run_scan(system, gfx)
         self.assertEqual(stats["layouts"].get("rigid-16bit", {"meshes": 0})["meshes"], 1)
         self.assertEqual(stats["validated"]["rigid-16bit"]["components-out-of-range"], 0)
+
+    def test_scan_finds_fragment_with_null_optional_pointers(self):
+        system, gfx, _mesh = weighted_mesh("weighted-8inf-8bit", vertices=12, bones=7)
+        b = bytearray(system)
+        for at in (16, 32, 40):
+            struct.pack_into("<Q", b, at, 0)
+        struct.pack_into("<Q", b, 24, 0x50000000)   # the embedded drawable is at offset 0
+        struct.pack_into("<Q", b, 168, 0x50000000 + 0x180)
+        for i, value in enumerate((1, 1, 1, 2)):
+            struct.pack_into("<H", b, 48 + 2 * i, value)
+        stats = self.run_scan(bytes(b), gfx)
+        self.assertEqual(stats["resources"], 1)
+        self.assertEqual(stats["layouts"]["weighted-8inf-8bit"]["meshes"], 1)
+
+
+class TestResourceKind(unittest.TestCase):
+    """Fragment headers follow the pinned rpf9-explorer decoder (breadbbbb/rpf9-explorer#8).
+
+    Every header byte here is built by the test; no package bytes are used.
+    """
+
+    @staticmethod
+    def fragment(fields=(1, 1, 1, 1), optional="all", drawable=True):
+        b = bytearray(192)
+        for at in (8, 24, 168):
+            if at != 24 or drawable:
+                struct.pack_into("<Q", b, at, 0x50000000 + 0x100)
+        if optional == "all":
+            for at in (16, 32, 40):
+                struct.pack_into("<Q", b, at, 0x50000000 + 0x200)
+        for i, value in enumerate(fields):
+            struct.pack_into("<H", b, 48 + 2 * i, value)
+        return bytes(b)
+
+    def test_null_optional_pointers_are_a_fragment(self):
+        self.assertEqual(ss.resource_kind(self.fragment(fields=(1, 1, 1, 2), optional="none")), "fragment")
+
+    def test_unequal_part_fields_are_a_fragment(self):
+        self.assertEqual(ss.resource_kind(self.fragment(fields=(1, 2, 3, 9))), "fragment")
+
+    def test_reversed_part_fields_are_rejected(self):
+        self.assertIsNone(ss.resource_kind(self.fragment(fields=(1, 1, 9, 3))))
+
+    def test_zero_first_part_count_is_rejected(self):
+        self.assertIsNone(ss.resource_kind(self.fragment(fields=(0, 0, 1, 1))))
+
+    def test_non_null_non_system_optional_pointer_is_rejected(self):
+        b = bytearray(self.fragment(optional="none"))
+        struct.pack_into("<Q", b, 32, 0x12345678)
+        self.assertIsNone(ss.resource_kind(bytes(b)))
+
+    def test_null_drawable_pointer_is_rejected(self):
+        self.assertIsNone(ss.resource_kind(self.fragment(drawable=False)))
 
 
 class TestFormatTable(unittest.TestCase):

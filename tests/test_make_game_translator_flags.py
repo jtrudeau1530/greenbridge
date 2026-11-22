@@ -101,7 +101,13 @@ class RecordedFlagsTest(unittest.TestCase):
     def touch(self, *parts):
         p = os.path.join(*parts)
         os.makedirs(os.path.dirname(p), exist_ok=True)
-        open(p, "w").close()
+        with open(p, "w", encoding="utf-8") as f:
+            if p == os.path.join(self.dxbc, "index.json"):
+                json.dump([{"file": "shader.dxbc"}], f)
+            elif p == os.path.join(self.dxbc, "fssm_index.json"):
+                json.dump([{"name": "shader"}], f)
+            elif p.endswith(".s"):
+                f.write("synthetic listing\n")
 
     def run_stage(self, fallbacks=()):
         ran = []
@@ -112,7 +118,7 @@ class RecordedFlagsTest(unittest.TestCase):
             elif tool == "fssm_unpack.py":
                 self.touch(self.dxbc, "fssm_index.json")
             elif tool == "shader_disasm.py":
-                os.makedirs(os.path.join(self.dxbc, "disasm"), exist_ok=True)
+                self.touch(self.dxbc, "disasm", "shader.s")
 
         def fake_translate(disasm, spirv, jobs, emulate=False, fallbacks=()):
             ran.append("translate")
@@ -148,9 +154,9 @@ class RecordedFlagsTest(unittest.TestCase):
 
 
 class MainWiringTest(unittest.TestCase):
-    """main() parses the four flags and hands the same tuple to preflight() and shaders()."""
+    """main() parses the fallback flags and hands the same tuple to preflight() and shaders()."""
 
-    def run_main(self, *extra_argv, per_vertex=None):
+    def run_main(self, *extra_argv, per_vertex=None, max_push_constants=None):
         argv = ["make_game.py", "--stages", "shaders", *extra_argv]
         with mock.patch.object(sys, "argv", argv), \
                 mock.patch("make_game.below_normal"), \
@@ -158,6 +164,7 @@ class MainWiringTest(unittest.TestCase):
                 mock.patch("make_game.check", return_value={"expected_exe": "game.exe"}), \
                 mock.patch("make_game.wave64_settings", return_value=(False, True)), \
                 mock.patch("make_game.runtime_gpu_per_vertex", return_value=per_vertex), \
+                mock.patch("make_game.runtime_gpu_max_push_constants", return_value=max_push_constants), \
                 mock.patch("make_game.preflight") as preflight, \
                 mock.patch("make_game.shaders") as shaders, \
                 mock.patch("make_game.log"):
@@ -180,6 +187,29 @@ class MainWiringTest(unittest.TestCase):
         self.assertEqual(self.run_main(per_vertex=False), (("--f16-interp-fallback",),) * 2)
         self.assertEqual(self.run_main(per_vertex=True), ((), ()))
         self.assertEqual(self.run_main("--f16-interp-fallback", per_vertex=True), (("--f16-interp-fallback",),) * 2)
+
+    def test_pc_tail_ubo_follows_the_device(self):
+        """On by itself where maxPushConstantsSize is below what the shaders need (144, or 152 with
+        --mesh-compute), not where it fits or can't be read; asked for explicitly, it is on everywhere."""
+        self.assertEqual(self.run_main(max_push_constants=128), (("--pc-tail-ubo",),) * 2)
+        self.assertEqual(self.run_main(max_push_constants=144), ((), ()))
+        self.assertEqual(self.run_main("--mesh-compute", max_push_constants=144),
+                         (("--mesh-compute", "--pc-tail-ubo"),) * 2)
+        self.assertEqual(self.run_main("--mesh-compute", max_push_constants=152), (("--mesh-compute",),) * 2)
+        self.assertEqual(self.run_main(max_push_constants=256), ((), ()))
+        self.assertEqual(self.run_main(max_push_constants=None), ((), ()))
+        self.assertEqual(self.run_main("--pc-tail-ubo", max_push_constants=256), (("--pc-tail-ubo",),) * 2)
+
+    def test_runtime_gpu_max_push_constants_parses_probe(self):
+        for raw, want in (({"max_push_constants_size": 128}, 128),
+                          ({"max_push_constants_size": 256}, 256),
+                          ({}, None),
+                          ({"max_push_constants_size": 0}, None),
+                          ({"max_push_constants_size": -1}, None),
+                          ({"max_push_constants_size": True}, None),
+                          ({"max_push_constants_size": "128"}, None)):
+            with self.subTest(raw=raw), mock.patch("make_game.runtime_gpu_info", return_value=raw):
+                self.assertEqual(make_game.runtime_gpu_max_push_constants(), want)
 
 
 if __name__ == "__main__":

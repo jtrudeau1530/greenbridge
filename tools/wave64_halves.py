@@ -197,6 +197,8 @@ class Analysis:
     def __init__(self, blocks, succ, masks, stage):
         self.blocks, self.succ, self.masks, self.stage = blocks, succ, masks or {}, stage
         self.n = len(blocks)
+        self.vgprs = sorted({r[1] for b in blocks for ins in b for x in ins["args"]
+                             for r in _regs(x) if isinstance(r, tuple) and r[0] == "v"})
         self.tok = {("e",): (None, None, True)}      # exec token -> (parent token, exec tag after, exec is the entry exec)
         self.stale = set()
         self.voted = {}                              # block -> mask register key the terminating branch votes on
@@ -217,6 +219,43 @@ class Analysis:
             if (id(ins), r) in self.stale:
                 t |= CTRL
         return t
+
+    LMOD_KEEP = ("v_mov_b32", "v_add_nc_u32", "v_add_u32", "v_sub_nc_u32", "v_subrev_nc_u32", "v_sub_u32",
+                 "v_subrev_u32", "v_xor_b32", "v_or_b32", "v_and_b32")
+
+    def lmod(self, st, ins, a):
+        """k when the operand is the same in the wave and in a half modulo 2**k: 32 for a partition-invariant value
+        (an immediate, an untainted register), the tag's k for a lane id, -1 for anything else."""
+        if a.get("k") in ("imm", "fimm"):
+            return 32
+        if self.is_mask(ins, a) or a.get("neg") or a.get("abs"):
+            return -1
+        regs = _regs(a)
+        if not regs or self.rd(st, ins, a):
+            if regs and self.rd(st, ins, a) == LANE and all(st["g"].get(r, ("",))[0] == "lmod" for r in regs):
+                return min(st["g"][r][1] for r in regs)
+            return -1
+        return 32
+
+    def lmod_result(self, st, ins, op, a):
+        """k of a VALU result whose only partition-dependent source is a lane id exact modulo 2**k: sums,
+        differences and bitwise ops with invariant values keep k, a left shift by an immediate c raises it to k + c."""
+        # SDWA selects, DPP, op_sel and integer clamp change the value: no tag
+        mods = ins.get("mods") or []
+        if ins["op"].endswith(("_sdwa", "_dpp")) or any(
+                m == "clamp" or m.startswith(("op_sel", "dst_unused")) or "_sel:" in m for m in mods):
+            return None
+        src = a[1:]
+        ks = [self.lmod(st, ins, x) for x in src]
+        if not src or min(ks) < 0:
+            return None
+        if op in self.LMOD_KEEP:
+            return min(ks)
+        if op == "v_lshlrev_b32" and len(src) == 2 and src[0].get("k") == "imm":
+            return min(32, ks[1] + (src[0]["v"] & 31))
+        if op in ("v_lshl_add_u32", "v_lshl_or_b32") and len(src) == 3 and src[1].get("k") == "imm":
+            return min(32, ks[0] + (src[1]["v"] & 31), ks[2])
+        return None
 
     def join(self, a, b, blk=0):
         t = dict(a["t"])
@@ -271,11 +310,33 @@ class Analysis:
                             st[key].pop(r, None)
                 return
         self.new_rank = self.new_base = None
+        op, a = base_op(ins["op"]), ins["args"]
         dests, srcs, _, uses = operands(ins)
         read = [r for x in srcs for r in _regs(x)] + [r for r in uses if r != "exec"]
+        if op == "v_movrels_b32" and len(a) > 1:
+            src_base = a[1]["r"] if a[1].get("k") == "vgpr" else 0
+            read.extend(("v", vr) for vr in self.vgprs if vr >= src_base)
+        dyn_v = op in ("v_movreld_b32", "v_movrelsd_b32", "v_movrelsd_2_b32", "v_swaprel_b32") and len(a) >= 2
+        if dyn_v:
+            dst_base = (min(a[0]["r"], a[1]["r"])
+                        if op == "v_swaprel_b32" and a[0].get("k") == "vgpr" and a[1].get("k") == "vgpr"
+                        else (a[0]["r"] if a[0].get("k") == "vgpr" else 0))
+            if op != "v_movreld_b32":
+                src_base = dst_base if op == "v_swaprel_b32" else (a[1]["r"] if a[1].get("k") == "vgpr" else 0)
+                read.extend(("v", vr) for vr in self.vgprs if vr >= src_base)
         rk = frozenset().union(*[st["r"].get(r, frozenset()) for r in read])
         bs = frozenset().union(*[st["b"].get(r, frozenset()) for r in read])
         self.transfer(n, i, ins, st, ev)
+        if dyn_v:
+            for vr in sorted(set(self.vgprs) | {dst_base}):
+                if vr < dst_base:
+                    continue
+                r = ("v", vr)
+                t = st["t"].get(r, 0)
+                for key, bit, inherited in (("r", RNK, rk), ("b", BASE, bs)):
+                    if t & bit and inherited:
+                        st[key][r] = st[key].get(r, frozenset()) | inherited
+            return
         for d in dests:
             for r in _regs(d):
                 if r == "exec":
@@ -357,6 +418,10 @@ class Analysis:
             addr, data = [], list(srcs)
             if op != "exp" and srcs:
                 data, addr = [srcs[0]], list(srcs[1:])
+            if self.stage == "gs" and op.startswith(("ds_write", "ds_store")):
+                # ds_write vaddr, vdata...: in a legacy GS the write is an output slot from its offset alone
+                # (rdna2spirv.gs_ds drops the VGPR address, the lane's GSVS area), so only the data is observable
+                data, addr = list(srcs[1:]), []
             dt = 0
             for x in data:
                 dt |= self.rd(st, ins, x) | (MASKD | X if self.is_mask(ins, x) and x.get("k") != "imm" else 0)
@@ -447,7 +512,17 @@ class Analysis:
             m, acc = a[1], a[2]
             tacc = self.rd(st, ins, acc)
             if m.get("k") == "imm" and m["v"] in (-1, 0xFFFFFFFF):
-                put(a[0], LANE | tacc)
+                # v_mbcnt_lo(-1, 0) then v_mbcnt_hi(-1, that) is the lane id: 0..63 in the wave, 0..31 in a half,
+                # so the two differ by a multiple of 32 (tag ("lmod", 5)); the low count alone does not (lanes 32..63
+                # count 32 in the wave)
+                if op == "v_mbcnt_lo_u32_b32" and acc.get("k") == "imm" and acc["v"] == 0:
+                    tag = ("lane_lo",)
+                elif op == "v_mbcnt_hi_u32_b32" and tacc == LANE and _regs(acc) and \
+                        st["g"].get(_regs(acc)[0]) == ("lane_lo",):
+                    tag = ("lmod", 5)
+                else:
+                    tag = None
+                put(a[0], LANE | tacc, tag)
             elif self.is_mask(ins, m):
                 if m.get("k") == "special" and m.get("t", "").startswith("exec"):
                     token = st["x"]
@@ -514,6 +589,12 @@ class Analysis:
                 or any(m.startswith("row_") or m.startswith("quad_perm") for m in mods):
             bad = any(m.startswith(DPP_BAD) for m in mods)
             put_t = t_src | (X if bad else 0)
+            # a wave64 ds_bpermute/ds_permute works on each half (ISA 10.4.4) and uses address bits 2..6 only, so a
+            # lane-id address that is the same modulo 128 in the wave and in a half reads/writes the same lane
+            if op in ("ds_bpermute_b32", "ds_permute_b32") and len(a) >= 3 and self.lmod(st, ins, a[1]) >= 7:
+                put_t = self.rd(st, ins, a[2])
+                for r in uses:
+                    put_t |= T.get(r, 0) | (CTRL if (id(ins), r) in self.stale else 0)
             for d in dests:
                 put(d, put_t)
             return
@@ -536,7 +617,9 @@ class Analysis:
                 zero = any(x.get("k") == "imm" and x["v"] == 0 for x in srcs)
                 if op in ("s_cmp_eq_u64", "s_cmp_lg_u64") and zero and not _half(m):
                     T["scc"] = X | (t_src & ELECT)
-                    st["g"]["scc"] = ("vote", _regs(m)[0] if _regs(m) else "exec")
+                    # cmp_eq: SCC = (mask == 0), the opposite sense of every other vote (SCC = mask != 0)
+                    st["g"]["scc"] = ("vote", _regs(m)[0] if _regs(m) else "exec") + \
+                        (("empty",) if op == "s_cmp_eq_u64" else ())
                     if t_src & ~ELECT & ~0:
                         bits_violation(t_src & ~ELECT)
                 else:
@@ -568,8 +651,9 @@ class Analysis:
                 elif r and r[0] in st["g"] and st["g"][r[0]][0] in ("mask", "elect", "wfmask"):
                     tag = st["g"][r[0]]
             put(dests[0], t_src, tag)
-            T["scc"] = X
-            st["g"]["scc"] = ("vote", _regs(dests[0])[0] if _regs(dests[0]) else "exec")
+            if not op.startswith(("s_mov", "s_cselect")):     # those leave SCC as it was: no vote on their dest
+                T["scc"] = X
+                st["g"]["scc"] = ("vote", _regs(dests[0])[0] if _regs(dests[0]) else "exec")
             return
 
         # --- register swap and dynamic indexing
@@ -641,6 +725,9 @@ class Analysis:
                     T[k] = T.get(k, 0) | X
             if wt:
                 bits_violation(wt)
+                for vr in self.vgprs:
+                    if vr >= dst_base:
+                        T[("v", vr)] = T.get(("v", vr), 0) | wt
                 T[("v", dst_base)] = T.get(("v", dst_base), 0) | wt
             return
 
@@ -668,6 +755,10 @@ class Analysis:
             if op in ("v_mov_b32", "v_mov_b32_e32") and len(srcs) == 1 and tj & CNT and _regs(srcs[0]):
                 ctok = self.cnt_token(st, _regs(srcs[0])[0])
                 tag = ("cnt", ctok) if ctok is not None else None
+            if tag is None and tj == LANE and len(dests) == 1:
+                k = self.lmod_result(st, ins, op, a)
+                if k is not None:
+                    tag = ("lmod", k)
             if st["xg"] and st["xg"][0] == "elect" and dests:
                 tj |= ELECT
                 tag = ("elect", st["xg"][1], ctok)
@@ -757,8 +848,9 @@ class Analysis:
                     and mg and mg[0] == "mask" and (op == "s_mov_b64" or self.ancestor(mg[1], old)):
                 st["x"] = mg[1]
                 st["xg"], st["f"] = self.tok.get(mg[1], (None, None, False))[1:]
-                T["scc"] = X
-                st["g"]["scc"] = ("vote", "exec")
+                if op == "s_or_b64":                            # s_mov_b64 leaves SCC as it was
+                    T["scc"] = X
+                    st["g"]["scc"] = ("vote", "exec")
                 return
             if op.startswith("v_cmpx"):
                 self.new_exec(site, old, st, True, mg, mt, violation, idiom)
@@ -822,7 +914,8 @@ class Analysis:
                 self.bad_branch(ev, ins, op, t)
                 return
             if g and g[0] == "vote":
-                self.vote(n, ins, op, g[1], op == "s_cbranch_scc1", ev)
+                # the vote is yes (some lane in the mask) when SCC = 1, or SCC = 0 for an "empty" test
+                self.vote(n, ins, op, g[1], (op == "s_cbranch_scc1") != (g[2:] == ("empty",)), ev)
             return
         reg = "vcc" if "vcc" in op else "exec"
         t = (T.get(reg, 0) | (CTRL if (id(ins), "vcc") in self.stale else 0)) if reg == "vcc" else 0
@@ -896,8 +989,7 @@ class Analysis:
             if op in ("s_waitcnt", "s_nop"):
                 continue
             a = ins["args"]
-            if op.startswith(("s_and_saveexec_b64", "s_andn2_saveexec_b64",
-                              "s_and_wrexec_b64", "s_andn2_wrexec_b64")) and len(a) == 2:
+            if op.startswith(("s_and_saveexec_b64", "s_and_wrexec_b64")) and len(a) == 2:
                 return (_regs(a[1]) or [None])[0] == reg
             if op in ("s_and_b64",) and len(a) == 3 and _regs(a[0]) == ["exec"]:
                 return reg in [(_regs(x) or [None])[0] for x in a[1:] if _regs(x) != ["exec"]]

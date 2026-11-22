@@ -304,7 +304,8 @@ def cube(op, x, y, z):
         return {"z": neg(x) if lt0(z) else x, "y": x, "x": z if lt0(x) else neg(z)}[major]
     if op == "v_cubetc_f32":
         return {"z": neg(y), "y": neg(z) if lt0(y) else z, "x": neg(y)}[major]
-    return mul(bits(2.0), {"z": z, "y": y, "x": x}[major])
+    m = {"z": z, "y": y, "x": x}[major]
+    return 0 if is_zero(m) else mul(bits(2.0), m)
 
 
 def cmp_class(x, mask):
@@ -824,15 +825,15 @@ HW_PRIMARY = "flush"
 
 
 # Ops whose omod does not depend on the f32 denormal mode: the transcendental unit and the cube ops flush or select
-# whatever MODE says, and gfx1150 applies their omod with denormals kept (measured, 'omod' table).
+# whatever MODE says, and gfx1150 and gfx1031 (RDNA2) apply their omod with denormals kept (measured, 'omod' table).
 OMOD_IGNORES_DENORM_MODE = ("v_rcp_f32", "v_rcp_iflag_f32", "v_rsq_f32", "v_sqrt_f32", "v_exp_f32", "v_log_f32",
                             "v_cubeid_f32", "v_cubesc_f32", "v_cubetc_f32", "v_cubema_f32")
 
 
 def omod_active(mode, op=None):
-    """Whether mul:2 / mul:4 / div:2 act in this mode (measured on gfx1150): never with MODE.IEEE = 1 (LLVM's
-    SIFoldOperands.cpp: "omod is ignored by hardware if IEEE bit is enabled" and, for f32, if output denormals are
-    enabled), and for the ALU ops only with f32 denormals flushed."""
+    """Whether mul:2 / mul:4 / div:2 act in this mode (measured on gfx1150 and gfx1031): never with MODE.IEEE = 1
+    (LLVM's SIFoldOperands.cpp: "omod is ignored by hardware if IEEE bit is enabled" and, for f32, if output denormals
+    are enabled), and for the ALU ops only with f32 denormals flushed."""
     m = HW_MODES[mode]
     return not m["ieee"] and (op in OMOD_IGNORES_DENORM_MODE or not m["denorm32"])
 
@@ -931,9 +932,10 @@ def hw_same(want, got, op=None):
 # that equals the deviation's words is filed under "known deviation", not "match"; anything else stays a mismatch.
 
 def dev_omod_neg_zero(case, want, mode=None):
-    """On gfx1150 VOP3 omod (mul:2, mul:4, div:2) turns a -0 result into +0 (RDNA2 unmeasured). LLVM notes that omod
-    mishandles signed zeros (SIFoldOperands.cpp) and D30209 describes -0 being forced to +0 before the modifier. Only
-    where the omod was active: not with MODE.IEEE = 1, not for ALU ops with f32 denormals kept (omod_active)."""
+    """VOP3 omod (mul:2, mul:4, div:2) turns a -0 result into +0, on gfx1150 and on RDNA2 (gfx1031, gfx1036). LLVM
+    notes that omod mishandles signed zeros (SIFoldOperands.cpp) and D30209 describes -0 being forced to +0 before the
+    modifier. Only where the omod was active: not with MODE.IEEE = 1, not for ALU ops with f32 denormals kept
+    (omod_active)."""
     if mode is None:
         mode = HW_PRIMARY
     if want[0] == 0x80000000 and any(m in OMOD for m in case.out_mods) and omod_active(mode, case.op):
@@ -1104,6 +1106,8 @@ def omod_label(case, got):
         return None
     if hw_same(with_, without, case.op) and with_[0] != 0x80000000:
         return None
+    if hw_same(with_, without, case.op) and hw_same(with_, got, case.op):
+        return "-0 result kept (applied or ignored, same word)"     # neither applied nor ignored is shown
     if hw_same(with_, got, case.op):
         return "applied"
     alt = dev_omod_neg_zero(case, with_)
@@ -1511,7 +1515,7 @@ def info_print(rep):
         for (mode, label), n in rep.omod.items():
             tab.setdefault(label, {})[mode] = n
         for label, by in sorted(tab.items()):
-            print(f"    {label:40s} " + "  ".join(f"{m}={by.get(m, 0)}" for m in modes))
+            print(f"    {label:47s} " + "  ".join(f"{m}={by.get(m, 0)}" for m in modes))
     if rep.nan:
         print("\n  NaN handling (programs without clamp or omod; same program counts in every mode, so a column that "
               "differs is a mode effect)")

@@ -607,7 +607,17 @@ class TestGlbWriterValidationAndErrors(unittest.TestCase):
 
 
 class TestReadGlbSummaryValidation(unittest.TestCase):
-    """Tests container validation in read_glb_summary on corrupt or malformed inputs."""
+    """Tests container framing and validation in read_glb_summary."""
+
+    @staticmethod
+    def _container(doc, *chunks):
+        json_bytes = json.dumps(doc).encode("utf-8")
+        json_bytes += b" " * ((-len(json_bytes)) % 4)
+        body = b"".join(
+            struct.pack("<I4s", len(payload), kind) + payload
+            for kind, payload in ((b"JSON", json_bytes), *chunks)
+        )
+        return struct.pack("<4sII", b"glTF", 2, 12 + len(body)) + body
 
     def test_non_bytes_input_rejected(self):
         with self.assertRaises(glb_writer.GlbError):
@@ -659,17 +669,36 @@ class TestReadGlbSummaryValidation(unittest.TestCase):
         with self.assertRaises(glb_writer.GlbError):
             glb_writer.read_glb_summary(raw)
 
-    def test_second_chunk_not_bin_rejected(self):
-        jb = b"{}  "
-        total = 12 + 8 + len(jb) + 8
-        raw = (
-            b"glTF"
-            + struct.pack("<II", 2, total)
-            + struct.pack("<II", len(jb), glb_writer.CHUNK_TYPE_JSON)
-            + jb
-            + struct.pack("<II", 0, 0x12345678)  # invalid chunk type
-        )
-        with self.assertRaises(glb_writer.GlbError):
+    def test_extension_chunk_is_ignored_with_or_without_bin(self):
+        for embedded in (False, True):
+            with self.subTest(embedded=embedded):
+                buffer = {"byteLength": 4}
+                chunks = [(b"BIN\0", b"\x00" * 4)] if embedded else []
+                if not embedded:
+                    buffer["uri"] = "sample.bin"
+                doc = {"asset": {"version": "2.0"}, "buffers": [buffer]}
+                raw = self._container(doc, *chunks, (b"EXT!", b"data"))
+                summary = glb_writer.read_glb_summary(raw)
+                self.assertEqual(summary["json"], doc)
+                self.assertEqual(summary["bin_bytes"], 4 if embedded else 0)
+
+    def test_known_chunk_order_and_cardinality(self):
+        doc = {"asset": {"version": "2.0"}}
+        binary, extension = (b"BIN\0", b"\x00" * 4), (b"EXT!", b"data")
+        for label, chunks, message in (
+            ("late BIN", (extension, binary), "BIN"),
+            ("duplicate BIN", (binary, binary), "BIN chunk must be second"),
+            ("duplicate JSON", (binary, (b"JSON", b"{}  ")), "duplicate GLB JSON chunk"),
+        ):
+            with self.subTest(label=label):
+                with self.assertRaisesRegex(glb_writer.GlbError, message):
+                    glb_writer.read_glb_summary(self._container(doc, *chunks))
+
+    def test_extension_chunk_cannot_overrun_container(self):
+        doc = {"asset": {"version": "2.0"}}
+        raw = bytearray(self._container(doc, (b"BIN\0", b"\x00" * 4), (b"EXT!", b"data")))
+        struct.pack_into("<I", raw, len(raw) - 12, 8)
+        with self.assertRaisesRegex(glb_writer.GlbError, "exceeds.*GLB"):
             glb_writer.read_glb_summary(raw)
 
     def test_buffer_view_exceeding_bin_rejected(self):
@@ -722,6 +751,21 @@ class TestWriteGlbFilesystem(unittest.TestCase):
 class TestObjParserAndBounds(unittest.TestCase):
     """Tests Wavefront OBJ parsing, coordinate transforms, UV flipping, and bounds."""
 
+    def test_utf8_bom_preserves_first_obj_record(self) -> None:
+        text = "v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n"
+        expected = glb_writer.parse_obj(text, is_path=False)
+        self.assertEqual(expected[0]["indices"], [0, 1, 2])
+
+        with tempfile.TemporaryDirectory() as folder:
+            source = os.path.join(folder, "triangle.obj")
+            with open(source, "w", encoding="utf-8-sig", newline="\n") as f:
+                f.write(text)
+            with self.subTest(source="file"):
+                self.assertEqual(glb_writer.parse_obj(source), expected)
+
+        with self.subTest(source="in-memory text"):
+            self.assertEqual(glb_writer.parse_obj("\ufeff" + text, is_path=False), expected)
+
     def test_parse_obj_zup_to_yup(self):
         # OBJ coordinate (1, 2, 3) in Z-up becomes (1, 3, -2) in glTF Y-up
         obj_text = "\n".join([
@@ -768,6 +812,31 @@ class TestObjParserAndBounds(unittest.TestCase):
         self.assertAlmostEqual(uvs[1][1], 0.8)   # 1.0 - 0.2
         self.assertAlmostEqual(uvs[2][0], 0.0)
         self.assertAlmostEqual(uvs[2][1], 0.0)   # 1.0 - 1.0
+
+    def test_glb_preserves_finite_obj_normal_directions(self) -> None:
+        obj = """\
+v 0 0 0
+v 1 0 0
+v 0 1 0
+vn 1e-200 0 0
+vn 1.7e308 0 1.7e308
+vn 5e-324 0 5e-324
+f 1//1 2//2 3//3
+"""
+        primitives = glb_writer.parse_obj(obj, is_path=False, up_axis="y")
+        data = glb_writer.build_glb(primitives)
+        gltf = glb_writer.read_glb_summary(data)["json"]
+        normal_idx = gltf["meshes"][0]["primitives"][0]["attributes"]["NORMAL"]
+        normals = gltf["accessors"][normal_idx]
+        view = gltf["bufferViews"][normals["bufferView"]]
+        json_len, = struct.unpack_from("<I", data, 12)
+        offset = 28 + json_len + view.get("byteOffset", 0) + normals.get("byteOffset", 0)
+        values = struct.unpack_from("<9f", data, offset)
+
+        h = math.sqrt(0.5)
+        for i, expected in enumerate((1.0, 0.0, 0.0, h, 0.0, h, h, 0.0, h)):
+            with self.subTest(component=i):
+                self.assertAlmostEqual(values[i], expected, places=7)
 
     def test_parse_obj_generated_normals_cross_uv_seams(self):
         # The second triangle has twice the area of the first and a different UV

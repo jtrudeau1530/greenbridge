@@ -22,6 +22,13 @@ or, for Latin scripts, from distinctive letters and common words, and is ``xx`` 
 Chinese ship two variants each; markers split them into ``es-ES``/``es-419`` and ``zh-Hant``/``zh-Hans`` (the plain
 code when a table has no marker).
 
+A table inside a nested RPF9 archive takes its archive's language instead of its own guess. Nested archives are
+``9FPR`` headers at 4 KiB-aligned offsets past 0, found in an ``.rpf`` source or in the archive that an
+``rpf9_carve.py`` directory's ``index.json`` names. An archive's language is the guess most of its tables share
+(``xx`` left out), when that guess covers more than half of them; otherwise each table keeps its own guess. In
+``data.rpf`` each of the 13 nested archives that hold string tables is one language (docs/text.md). The tables report
+keeps every table's own guess in ``guess`` and its nested archive's offset in ``archive``.
+
 Usage:
     python -I text_tables.py <source> [<source> ...] [--labels FILE ...]
                              [--dialogue dialogue.csv] [--tables tables.csv] [--strings strings.csv]
@@ -33,9 +40,11 @@ quote game text: they are local work products and must not be committed or attac
 synthetic resources.
 """
 import argparse
+import bisect
 import collections
 import csv
 import json
+import mmap
 import os
 import re
 import struct
@@ -49,6 +58,8 @@ from file_mode import published_mode  # noqa: E402
 from hashdict import joaat  # noqa: E402
 
 RESOURCE_MAGIC = b"0DRP"
+RPF9_MAGIC = b"9FPR"
+ARCHIVE_ALIGN = 0x1000
 BLOCK = 65536
 MAX_RESOURCE_BYTES = 256 << 20
 CONVERSATION_PAIR = re.compile(rb"([A-Z0-9_]{2,40}AU_[A-Z]{4})\x00([A-Za-z0-9_]{3,80})\x00")
@@ -111,7 +122,7 @@ def string_tables(buf: bytes):
                 continue
             start = blob + (struct.unpack_from("<Q", buf, at)[0] >> 20)
             end = buf.find(b"\0", start, blob + blob_bytes)
-            if blob <= start and end > start:
+            if blob <= start <= end:
                 out[h] = buf[start:end].decode("utf-8", "replace")
         if out:
             yield out
@@ -170,11 +181,14 @@ def _is_resource(data: bytes) -> bool:
 
 
 def _chains(rows, read):
-    """(offset, bytes) per logical blob: a stream plus the streams that continue a full 64 KiB one."""
+    """(offset, bytes) per logical blob: a stream plus the streams that continue a full one.
+
+    A stream is full when its size is a whole number of 64 KiB blocks: a resource's first stream is often 128 or
+    192 KiB (docs/page_directory.md), not only 64 KiB, and its descriptors then end in the stream that follows."""
     cur_off, parts, last = None, [], 0
     for row in rows:
         data = read(row)
-        continues = (cur_off is not None and last == BLOCK and not _is_resource(data)
+        continues = (cur_off is not None and last > 0 and last % BLOCK == 0 and not _is_resource(data)
                      and data[:4] != b"PSIN" and data[:4] != b"RBF0")
         if continues and sum(map(len, parts)) + len(data) <= MAX_RESOURCE_BYTES:
             parts.append(data)
@@ -214,6 +228,60 @@ def blobs(source: str):
                     yield path, 0, fh.read()
 
 
+def nested_archives(path: str) -> list:
+    """Offsets of the RPF9 archives nested in an archive file, in order.
+
+    A nested archive is a ``9FPR`` header at a 4 KiB-aligned offset past 0 whose data offset (u32 at +4) is at least
+    8 and stays inside the file. Only the header's first 8 bytes are read.
+    """
+    starts = []
+    with open(path, "rb") as fh:
+        size = os.fstat(fh.fileno()).st_size
+        if size < 8:
+            return starts
+        with mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ) as m:
+            p = m.find(RPF9_MAGIC, 1)
+            while p != -1:
+                if p % ARCHIVE_ALIGN == 0 and p + 8 <= size:
+                    data_off = struct.unpack_from("<I", m, p + 4)[0]
+                    if data_off >= 8 and p + data_off <= size:
+                        starts.append(p)
+                p = m.find(RPF9_MAGIC, p + 1)
+    return starts
+
+
+def archive_starts(source: str) -> list:
+    """Nested-archive offsets for a source whose blob offsets are archive offsets; [] when there is no archive."""
+    path = None
+    if os.path.isdir(source):
+        index = os.path.join(source, "index.json")
+        if os.path.isfile(index):
+            try:
+                with open(index, encoding="utf-8") as fh:
+                    named = (json.load(fh).get("summary") or {}).get("archive")
+            except (OSError, ValueError, AttributeError):
+                named = None
+            if isinstance(named, str):
+                for candidate in (named, os.path.join(source, named)):
+                    if os.path.isfile(candidate):
+                        path = candidate
+                        break
+    elif os.path.isfile(source) and source.lower().endswith(".rpf"):
+        path = source
+    if path is None:
+        return []
+    try:
+        return nested_archives(path)
+    except (OSError, ValueError):
+        return []
+
+
+def archive_of(starts: list, offset: int):
+    """The offset of the nested archive holding `offset`, or None before the first one."""
+    k = bisect.bisect_right(starts, offset) - 1
+    return starts[k] if k >= 0 else None
+
+
 def read_labels(path: str) -> dict:
     """{hash: label}: a hashdict.py JSON maps hashes already; a text file is hashed word by word."""
     with open(path, "rb") as fh:
@@ -234,10 +302,11 @@ def read_labels(path: str) -> dict:
 class Scan:
     def __init__(self):
         self.pairs = collections.defaultdict(list)          # key -> labels in order of appearance
-        self.texts = collections.defaultdict(dict)          # lang -> {hash: text}
-        self.tables = []                                    # (source, offset, lang, {hash: text})
+        self.found = []                                     # (source, offset, guess, archive, {hash: text})
+        self._resolved = None
 
-    def add(self, source, offset, data):
+    def add(self, source, offset, data, archive=None):
+        """Read one logical blob. `archive` identifies the nested archive it sits in (None: not in one)."""
         if b"AU_" in data:
             for key, label in CONVERSATION_PAIR.findall(data):
                 labels = self.pairs[key.decode()]
@@ -246,9 +315,44 @@ class Scan:
                     labels.append(label)
         if _is_resource(data) and b"\x01\x01\x00\x00" in data:
             for table in string_tables(data):
-                lang = language(table.values())
-                self.texts[lang].update(table)
-                self.tables.append((source, offset, lang, table))
+                self.found.append((source, offset, language(table.values()), archive, table))
+                self._resolved = None
+
+    def _resolve(self):
+        """Languages per table: the archive's majority guess when it has one, else the table's own guess."""
+        if self._resolved is None:
+            votes = collections.defaultdict(collections.Counter)
+            for _s, _o, guess, archive, _t in self.found:
+                if archive is not None and guess != UNKNOWN:
+                    votes[archive][guess] += 1
+            archive_lang = {}
+            for archive, counts in votes.items():
+                lang, n = counts.most_common(1)[0]
+                if 2 * n > sum(counts.values()):
+                    archive_lang[archive] = lang
+            texts = collections.defaultdict(dict)
+            tables = []
+            for source, offset, guess, archive, table in self.found:
+                lang = archive_lang.get(archive, guess)
+                texts[lang].update(table)
+                tables.append((source, offset, lang, table))
+            self._resolved = {"texts": texts, "tables": tables, "archive_lang": archive_lang}
+        return self._resolved
+
+    @property
+    def texts(self):
+        """{lang: {hash: text}}"""
+        return self._resolve()["texts"]
+
+    @property
+    def tables(self):
+        """[(source, offset, lang, {hash: text})] in reading order."""
+        return self._resolve()["tables"]
+
+    @property
+    def archive_lang(self):
+        """{archive: lang} for every nested archive whose tables agree on a language."""
+        return self._resolve()["archive_lang"]
 
     def languages(self):
         return sorted(self.texts, key=lambda k: (k != "en", k))
@@ -319,8 +423,10 @@ def main(argv=None) -> int:
     scan = Scan()
     try:
         for source in a.sources:
+            starts = archive_starts(source)
             for label, offset, data in blobs(source):
-                scan.add(label, offset, data)
+                nested = archive_of(starts, offset) if starts else None
+                scan.add(label, offset, data, None if nested is None else (source, nested))
         names = {}
         for path in a.labels:
             names.update(read_labels(path))
@@ -338,11 +444,12 @@ def main(argv=None) -> int:
         fields = ["wave", "key", "label", "speaker"] + [f"text_{x}" for x in langs]
         jobs.append((a.dialogue, fields, scan.dialogue_rows()))
     if a.tables:
-        jobs.append((a.tables, ["source", "offset", "lang", "group", "strings", "resolved"],
-                     ({"source": s, "offset": o, "lang": lang,
+        jobs.append((a.tables, ["source", "offset", "lang", "guess", "archive", "group", "strings", "resolved"],
+                     ({"source": s, "offset": o, "lang": lang, "guess": found[2],
+                       "archive": "" if found[3] is None else f"{found[3][1]:#x}",
                        "group": table_group(names[h] for h in t if h in names),
                        "strings": len(t), "resolved": sum(h in names for h in t)}
-                      for s, o, lang, t in scan.tables)))
+                      for (s, o, lang, t), found in zip(scan.tables, scan.found))))
     if a.strings:
         jobs.append((a.strings, ["source", "offset", "lang", "hash", "label", "text"],
                      ({"source": s, "offset": o, "lang": lang, "hash": f"{h:08x}", "label": names.get(h, ""),
@@ -408,6 +515,11 @@ def main(argv=None) -> int:
     print(f"{len(scan.tables)} string tables ({', '.join(f'{k} {per_lang[k]}' for k in langs)}); "
           f"{len(scan.pairs)} dialogue keys, {lines} lines; lines with text: "
           + ", ".join(f"{k} {with_text[k]}" for k in langs))
+    if scan.archive_lang:
+        by_archive = sum(found[3] in scan.archive_lang for found in scan.found)
+        changed = sum(lang != found[2] for (_s, _o, lang, _t), found in zip(scan.tables, scan.found))
+        print(f"language from the nested archive: {by_archive} tables in {len(scan.archive_lang)} archives; "
+              f"{changed} differ from their own guess")
     return 0
 
 

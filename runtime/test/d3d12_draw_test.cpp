@@ -12,6 +12,7 @@
 //     B8G8R8X8 has no alpha, so destination alpha reads 1 there, as on WARP and AMD's D3D12 driver.
 // The shaders are GLSL written to the translator's contract (test/glsl/vs_draw.vert, ps_draw.frag). No game data.
 // Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation.
+#include "shader_fixture_path.h"
 #include "vk_test_device.h"
 #include "d3d12_test_shaders.h"
 #include "../shims/d3d12_com.h"
@@ -69,11 +70,11 @@ int main() {
     const auto vs_int_container = shader_container(vs_int_program);
     const auto library = std::filesystem::temp_directory_path() / "leonida_draw_test";
     std::filesystem::create_directories(library);
-    std::filesystem::copy_file(LEONIDA_TEST_VS_SPV, library / "vs_draw.spv", std::filesystem::copy_options::overwrite_existing);
-    std::filesystem::copy_file(LEONIDA_TEST_PS_SPV, library / "ps_draw.spv", std::filesystem::copy_options::overwrite_existing);
-    std::filesystem::copy_file(LEONIDA_TEST_VS_FULLSCREEN_SPV, library / "vs_fullscreen.spv",
+    std::filesystem::copy_file(vktest::shader_fixture_path(LEONIDA_TEST_VS_SPV), library / "vs_draw.spv", std::filesystem::copy_options::overwrite_existing);
+    std::filesystem::copy_file(vktest::shader_fixture_path(LEONIDA_TEST_PS_SPV), library / "ps_draw.spv", std::filesystem::copy_options::overwrite_existing);
+    std::filesystem::copy_file(vktest::shader_fixture_path(LEONIDA_TEST_VS_FULLSCREEN_SPV), library / "vs_fullscreen.spv",
                                std::filesystem::copy_options::overwrite_existing);
-    std::filesystem::copy_file(LEONIDA_TEST_VS_INT_SPV, library / "vs_draw_int.spv",
+    std::filesystem::copy_file(vktest::shader_fixture_path(LEONIDA_TEST_VS_INT_SPV), library / "vs_draw_int.spv",
                                std::filesystem::copy_options::overwrite_existing);
     {
         std::ofstream index(library / "index.json", std::ios::binary);
@@ -201,6 +202,40 @@ int main() {
         D3D12_GRAPHICS_PIPELINE_STATE_DESC instance_desc = pso_desc;
         instance_desc.InputLayout = {instance_elements, 2};
         EXPECT(SUCCEEDED(device->CreateGraphicsPipelineState(&instance_desc, IID_PPV_ARGS(&instanced.p))));
+
+        // CachedPSO on a graphics description: what the PC runtime matches, measured on an RTX 3060
+        // (src/cached_pso.h). Flags is not part of it; every state below is.
+        {
+            Ref<ID3DBlob> blob;
+            EXPECT(pso->GetCachedBlob(&blob.p) == S_OK && blob.p && blob->GetBufferSize());
+            auto with_blob = [&](D3D12_GRAPHICS_PIPELINE_STATE_DESC d) {
+                d.CachedPSO = {blob->GetBufferPointer(), blob->GetBufferSize()};
+                Ref<ID3D12PipelineState> made;
+                const HRESULT hr = device->CreateGraphicsPipelineState(&d, IID_PPV_ARGS(&made.p));
+                return SUCCEEDED(hr) == (made.p != nullptr) ? hr : E_UNEXPECTED;
+            };
+            EXPECT(with_blob(pso_desc) == S_OK);
+            D3D12_GRAPHICS_PIPELINE_STATE_DESC changed = pso_desc;
+            changed.Flags = D3D12_PIPELINE_STATE_FLAG_TOOL_DEBUG;
+            EXPECT(with_blob(changed) == S_OK);
+            EXPECT(with_blob(mrt_desc) == E_INVALIDARG);
+            EXPECT(with_blob(instance_desc) == E_INVALIDARG);
+            changed = pso_desc;
+            changed.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+            EXPECT(with_blob(changed) == E_INVALIDARG);
+            changed = pso_desc;
+            changed.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_RED;
+            EXPECT(with_blob(changed) == E_INVALIDARG);
+            changed = pso_desc;
+            changed.SampleMask = 1;
+            EXPECT(with_blob(changed) == E_INVALIDARG);
+            changed = pso_desc;
+            changed.IBStripCutValue = D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFF;
+            EXPECT(with_blob(changed) == E_INVALIDARG);
+            changed = pso_desc;
+            changed.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+            EXPECT(with_blob(changed) == E_INVALIDARG);
+        }
 
         // State that needs a Vulkan feature this test device does not enable is refused, not passed to the driver.
         D3D12_GRAPHICS_PIPELINE_STATE_DESC needs_feature = pso_desc;

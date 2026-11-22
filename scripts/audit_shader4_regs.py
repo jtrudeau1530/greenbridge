@@ -171,8 +171,8 @@ def rbw_registers(insns):
             reads_imm_dst or "fmac" in op or "mac_" in op or op == "v_writelane_b32"
             or op == "v_swap_b32" or "_atomic_" in op
         )
-        # v_add_co_u32 / v_sub_co_u32 write both a[0] (VGPR) and a[1] (carry SGPR/vcc).
-        if not is_no_dest and op.startswith("v_") and "_co_" in op and "_ci_" not in op and len(args) >= 2:
+        # Carry-out forms write the VGPR and scalar mask first, even when they also take a carry-in source.
+        if not is_no_dest and op.startswith("v_") and "_co_" in op and len(args) >= 2:
             dsts = args[:2]
             srcs = args[2:]
         elif is_no_dest:
@@ -224,7 +224,8 @@ def audit(disasm_dir, fssm_dir=None, dxbc_dir=None, stages=("cs", "ms", "gs"), l
     dxbc_dir = dxbc_dir or parent
     stage_map = load_stage_map(disasm_dir)
 
-    files = sorted(f for f in os.listdir(disasm_dir) if f.endswith(".s"))
+    with os.scandir(disasm_dir) as it:
+        files = sorted(e.name for e in it if e.name.endswith(".s") and e.is_file())
     if limit is not None:
         files = files[:limit]
 
@@ -382,4 +383,8 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
+    try:  # a redirected stdout is strict ANSI code page under -I; write '?' for what it cannot encode
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
     sys.exit(main())

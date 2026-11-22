@@ -22,11 +22,14 @@ Dictionary sources:
                     ``<key>_<N>``: wave ``_01`` speaks the first label, ``_02`` the second, and so on.
 
 Bank sources (positional; each one is reported and thresholded on its own): ``.awc`` files, directories searched
-for ``.awc`` files, or an ``audio_manifest.json`` written by ``rpf9dump audio``.
+for ``.awc`` files, or an ``audio_manifest.json`` written by ``rpf9dump audio``. Sources with the same basename
+include their parent paths in report labels so they can be selected separately with ``opus_tags.py --source``.
 
 Usage:
     python -I awc_names.py <banks> [<banks> ...] (--words FILE | --conversations PATH) [...]
                            [--min-token N] [--out names.csv|.json]
+
+A JSON inventory from ``awc_manifest.py`` can also supply the bank names and stream IDs.
 
 Standard library only. The output names game files: it is a local work product and must not be committed or
 attached to an issue. The tests use synthetic banks and words.
@@ -89,6 +92,9 @@ def bank_ids(path: str) -> list:
         flags, n, _header_size = struct.unpack_from("<III", head, 4)
         skip = (4 if flags & 0x400000 else 0) + (n * 2 if flags & 0x10000 else 0) \
             + ((n + 1) * 4 if flags & 0x200000 else 0)
+        table_end = 16 + skip + 4 * n
+        if table_end > os.fstat(fh.fileno()).st_size:
+            raise ValueError(f"{path}: stream table extends past the end of the file")
         fh.seek(16 + skip)
         table = fh.read(4 * n)
     if len(table) < 4 * n:
@@ -97,10 +103,18 @@ def bank_ids(path: str) -> list:
 
 
 def load_banks(source: str) -> dict:
-    """{bank label: [stream ids]} from an .awc file, a directory of them, or an audio_manifest.json."""
+    """{bank label: [stream ids]} from AWC banks, a Python inventory, or an rpf9dump manifest."""
     if os.path.isfile(source) and source.lower().endswith(".json"):
         with open(source, encoding="utf-8") as fh:
             doc = json.load(fh)
+        if isinstance(doc, dict) and "bank_count" in doc and "streams" in doc:
+            grouped = collections.defaultdict(list)
+            for row in doc["streams"]:
+                bank = row["bank"]
+                # Match the export folder used by awc_opus, including nested bank paths.
+                label = os.path.splitext(bank)[0] if bank.lower().endswith(".awc") else bank
+                grouped[label].append(int(row["stream"], 16) & M29)
+            return dict(grouped)
         banks = doc.get("Banks", doc) if isinstance(doc, dict) else doc
         out = {}
         for bank in banks:
@@ -265,13 +279,28 @@ def name_source(dictionary: Dictionary, bases: list, index: Index) -> tuple:
     return real, stats
 
 
-def _label(source: str) -> str:
-    return os.path.basename(os.path.normpath(source)) or source
+def source_labels(sources):
+    """Keep basename labels where possible and qualify collisions relative to their shared parent."""
+    labels = {src: os.path.basename(os.path.normpath(src)) or src for src in sources}
+    groups = collections.defaultdict(list)
+    for src, label in labels.items():
+        groups[label].append(src)
+    for group in groups.values():
+        if len(group) < 2:
+            continue
+        paths = [os.path.abspath(src) for src in group]
+        try:
+            parent = os.path.commonpath([os.path.dirname(path) for path in paths])
+        except ValueError:  # Different Windows drives have no shared parent.
+            parent = None
+        for src, path in zip(group, paths):
+            labels[src] = (os.path.relpath(path, parent) if parent else path).replace(os.sep, "/")
+    return labels
 
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("banks", nargs="+", help="an .awc file, a directory of banks, or an audio_manifest.json")
+    ap.add_argument("banks", nargs="+", help="an .awc file, a bank directory, or JSON from awc_manifest.py or rpf9dump audio")
     ap.add_argument("--words", action="append", default=[], help="word list or hashdict.py JSON (repeatable)")
     ap.add_argument("--conversations", action="append", default=[],
                     help="file or directory with conversation key/label pairs (repeatable)")
@@ -299,6 +328,7 @@ def main(argv=None) -> int:
           f"{len(bases)} family bases", flush=True)
 
     rows, summary = [], {}
+    labels = source_labels(a.banks)
     for source in a.banks:
         try:
             banks = load_banks(source)
@@ -307,7 +337,7 @@ def main(argv=None) -> int:
             return 2
         index = Index(banks)
         found, stats = name_source(dictionary, bases, index)
-        label = _label(source)
+        label = labels[source]
         summary[label] = stats
         for (b, i), (name, rule, _k) in sorted(found.items()):
             rows.append({"source": label, "bank": index.labels[b], "stream_id": f"{i:08x}", "name": name,

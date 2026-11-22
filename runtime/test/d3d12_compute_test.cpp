@@ -8,11 +8,15 @@
 //     arguments they were recorded with, and the results copied to a readback buffer.
 // The shader (test/glsl/cs_user_data.comp) is written to the translator's push-constant and address contract.
 // No game data. Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation.
+#include "shader_fixture_path.h"
 #include "vk_test_device.h"
 #include "../shims/d3d12_com.h"
 #include "../src/gfx10_descriptors.h"
+#include "../src/cached_pso.h"
 #include "../src/shader_library.h"
 #include "../shims/d3d12_xs_device.h"
+
+#include <dxgi1_4.h>
 
 #include <cstdint>
 #include <cstring>
@@ -136,6 +140,116 @@ D3D12_RESOURCE_BARRIER transition(ID3D12Resource* resource, D3D12_RESOURCE_STATE
     return barrier;
 }
 
+// The CachedPSO cases both devices answer, in this order: the same description, another Flags, an equal root
+// signature object, a root signature with other content, a truncated blob, a blob of junk, its first, middle and last
+// byte changed, a pointer with size 0, a null pointer with a size.
+constexpr int cached_case_count = 11;
+
+template<class Device>
+std::vector<HRESULT> cached_pso_cases(Device* device, D3D12_COMPUTE_PIPELINE_STATE_DESC desc,
+                                      const std::vector<std::uint8_t>& root_blob,
+                                      const std::vector<std::uint8_t>& other_root_blob) {
+    std::vector<HRESULT> out;
+    auto create = [&](D3D12_COMPUTE_PIPELINE_STATE_DESC d, const void* p, SIZE_T n) {
+        d.CachedPSO = {p, n};
+        ID3D12PipelineState* made = nullptr;
+        HRESULT hr = device->CreateComputePipelineState(&d, IID_PPV_ARGS(&made));
+        if (SUCCEEDED(hr) != (made != nullptr)) hr = E_UNEXPECTED;  // a result and its object disagree
+        if (made) made->Release();
+        return hr;
+    };
+    ID3D12PipelineState* pso = nullptr;
+    if (FAILED(device->CreateComputePipelineState(&desc, IID_PPV_ARGS(&pso)))) return out;
+    ID3DBlob* blob = nullptr;
+    const HRESULT got = pso->GetCachedBlob(&blob);
+    const HRESULT got_null = pso->GetCachedBlob(nullptr);
+    pso->Release();
+    if (FAILED(got) || !blob || got_null != S_OK) {
+        if (blob) blob->Release();
+        return out;
+    }
+    const auto* p = static_cast<const std::uint8_t*>(blob->GetBufferPointer());
+    std::vector<std::uint8_t> bytes(p, p + blob->GetBufferSize());
+    blob->Release();
+    ID3D12RootSignature* same_root = nullptr;
+    ID3D12RootSignature* other_root = nullptr;
+    device->CreateRootSignature(0, root_blob.data(), root_blob.size(), IID_PPV_ARGS(&same_root));
+    device->CreateRootSignature(0, other_root_blob.data(), other_root_blob.size(), IID_PPV_ARGS(&other_root));
+    if (!same_root || !other_root) return out;
+
+    out.push_back(create(desc, bytes.data(), bytes.size()));
+    D3D12_COMPUTE_PIPELINE_STATE_DESC flags = desc;
+    flags.Flags = D3D12_PIPELINE_STATE_FLAG_TOOL_DEBUG;
+    out.push_back(create(flags, bytes.data(), bytes.size()));
+    D3D12_COMPUTE_PIPELINE_STATE_DESC same = desc;
+    same.pRootSignature = same_root;
+    out.push_back(create(same, bytes.data(), bytes.size()));
+    D3D12_COMPUTE_PIPELINE_STATE_DESC other = desc;
+    other.pRootSignature = other_root;
+    out.push_back(create(other, bytes.data(), bytes.size()));
+    out.push_back(create(desc, bytes.data(), bytes.size() / 2));
+    const std::vector<std::uint8_t> junk(bytes.size(), 0xab);
+    out.push_back(create(desc, junk.data(), junk.size()));
+    for (const std::size_t at : {std::size_t(0), bytes.size() / 2, bytes.size() - 1}) {
+        bytes[at] ^= 0xff;
+        out.push_back(create(desc, bytes.data(), bytes.size()));
+        bytes[at] ^= 0xff;
+    }
+    out.push_back(create(desc, bytes.data(), 0));
+    out.push_back(create(desc, nullptr, 16));
+    same_root->Release();
+    other_root->Release();
+    return out;
+}
+
+// The same cases on the PC runtime, with an empty compute shader from d3dcompiler_47: the default adapter, then WARP.
+// Empty when the host has no D3D12 device or no compiler (Wine), which the caller reports as a skip.
+std::vector<std::vector<HRESULT>> host_cached_pso_cases(const std::vector<std::uint8_t>& root_blob,
+                                                        const std::vector<std::uint8_t>& other_root_blob) {
+    using CompileFn = HRESULT(WINAPI*)(LPCVOID, SIZE_T, LPCSTR, const void*, void*, LPCSTR, LPCSTR, UINT, UINT,
+                                       ID3DBlob**, ID3DBlob**);
+    using CreateDeviceFn = decltype(&::D3D12CreateDevice);
+    std::vector<std::vector<HRESULT>> out;
+    const HMODULE compiler = LoadLibraryExA("d3dcompiler_47.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    const HMODULE d3d12 = LoadLibraryExA("d3d12.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    const HMODULE dxgi = LoadLibraryExA("dxgi.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    if (!compiler || !d3d12 || !dxgi) return out;
+    const auto compile = reinterpret_cast<CompileFn>(reinterpret_cast<void*>(GetProcAddress(compiler, "D3DCompile")));
+    const auto create_device =
+        reinterpret_cast<CreateDeviceFn>(reinterpret_cast<void*>(GetProcAddress(d3d12, "D3D12CreateDevice")));
+    using FactoryFn = HRESULT(WINAPI*)(REFIID, void**);
+    const auto create_factory =
+        reinterpret_cast<FactoryFn>(reinterpret_cast<void*>(GetProcAddress(dxgi, "CreateDXGIFactory1")));
+    if (!compile || !create_device || !create_factory) return out;
+    static const char source[] = "[numthreads(1, 1, 1)] void main() {}";
+    ID3DBlob* shader = nullptr;
+    if (FAILED(compile(source, sizeof(source) - 1, nullptr, nullptr, nullptr, "main", "cs_5_0", 0, 0, &shader,
+                       nullptr)) || !shader)
+        return out;
+    IDXGIFactory4* factory = nullptr;
+    if (SUCCEEDED(create_factory(IID_PPV_ARGS(&factory)))) {
+        IDXGIAdapter* warp = nullptr;
+        factory->EnumWarpAdapter(IID_PPV_ARGS(&warp));
+        for (IUnknown* adapter : {static_cast<IUnknown*>(nullptr), static_cast<IUnknown*>(warp)}) {
+            ID3D12Device* host = nullptr;
+            if (FAILED(create_device(adapter, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&host)))) continue;
+            ID3D12RootSignature* root = nullptr;
+            if (SUCCEEDED(host->CreateRootSignature(0, root_blob.data(), root_blob.size(), IID_PPV_ARGS(&root)))) {
+                D3D12_COMPUTE_PIPELINE_STATE_DESC desc{};
+                desc.pRootSignature = root;
+                desc.CS = {shader->GetBufferPointer(), shader->GetBufferSize()};
+                out.push_back(cached_pso_cases(host, desc, root_blob, other_root_blob));
+                root->Release();
+            }
+            host->Release();
+        }
+        if (warp) warp->Release();
+        factory->Release();
+    }
+    shader->Release();
+    return out;
+}
+
 }  // namespace
 
 int main() {
@@ -156,7 +270,7 @@ int main() {
     EXPECT(leonida::fssm_program(container) == fssm);
     const auto library = std::filesystem::temp_directory_path() / "leonida_compute_test";
     std::filesystem::create_directories(library);
-    std::filesystem::copy_file(LEONIDA_TEST_CS_SPV, library / "cs_user_data.spv",
+    std::filesystem::copy_file(vktest::shader_fixture_path(LEONIDA_TEST_CS_SPV), library / "cs_user_data.spv",
                                std::filesystem::copy_options::overwrite_existing);
     {
         std::ofstream index(library / "index.json", std::ios::binary);
@@ -258,6 +372,51 @@ int main() {
             device.p, &native_desc, nullptr, &out_null) == E_POINTER && !out_null);
         EXPECT(reinterpret_cast<XboxNativeComputePipelineFn>(slot(device.p, 67))(
             device.p, &native_desc, &pso_iid, nullptr) == E_POINTER);
+        // GetCachedBlob and CachedPSO answer as the PC runtime does (src/cached_pso.h).
+        {
+            D3D12_VERSIONED_ROOT_SIGNATURE_DESC other_desc = root_desc;
+            other_desc.Desc_1_0.NumParameters = 2;
+            const auto other_root_blob = serialize(other_desc);
+            EXPECT(!other_root_blob.empty());
+            const std::vector<HRESULT> layer = cached_pso_cases(device.p, pso_desc, root_blob, other_root_blob);
+            EXPECT(int(layer.size()) == cached_case_count);
+            const std::vector<HRESULT> expected = {S_OK,         S_OK,         S_OK,         E_INVALIDARG,
+                                                   E_INVALIDARG, E_INVALIDARG, E_INVALIDARG, E_INVALIDARG,
+                                                   E_INVALIDARG, E_INVALIDARG, S_OK};
+            EXPECT(layer == expected);
+            const auto hosts = host_cached_pso_cases(root_blob, other_root_blob);
+            if (hosts.empty()) std::printf("SKIP: no host D3D12 device or compiler for the CachedPSO comparison\n");
+            for (const auto& host : hosts) EXPECT(host == layer);
+            if (!hosts.empty()) std::printf("cached PSO: %zu host adapter(s) gave the same %d answers\n", hosts.size(), cached_case_count);
+
+            // Every byte of the blob counts, and the adapter and driver fields give the runtime's own errors.
+            Ref<ID3DBlob> blob;
+            EXPECT(pso->GetCachedBlob(&blob.p) == S_OK && blob.p);
+            const auto* p = static_cast<const std::uint8_t*>(blob->GetBufferPointer());
+            std::vector<std::uint8_t> bytes(p, p + blob->GetBufferSize());
+            auto attempt = [&](const std::vector<std::uint8_t>& b) {
+                D3D12_COMPUTE_PIPELINE_STATE_DESC d = pso_desc;
+                d.CachedPSO = {b.data(), b.size()};
+                Ref<ID3D12PipelineState> made;
+                return device->CreateComputePipelineState(&d, IID_PPV_ARGS(&made.p));
+            };
+            for (std::size_t at = 0; at < bytes.size(); ++at) {
+                auto changed = bytes;
+                changed[at] ^= 0x01;
+                EXPECT(attempt(changed) == E_INVALIDARG);
+            }
+            auto resealed = [](std::vector<std::uint8_t> b, std::size_t at) {
+                b[at] ^= 0x01;
+                const std::uint32_t sum = leonida::cached_pso::fnv1a(b.data(), b.size() - 4);
+                for (int i = 0; i < 4; ++i) b[b.size() - 4 + i] = std::uint8_t(sum >> (8 * i));
+                return b;
+            };
+            EXPECT(attempt(resealed(bytes, 8)) == D3D12_ERROR_ADAPTER_NOT_FOUND);   // vendor
+            EXPECT(attempt(resealed(bytes, 12)) == D3D12_ERROR_ADAPTER_NOT_FOUND);  // device
+            EXPECT(attempt(resealed(bytes, 16)) == D3D12_ERROR_DRIVER_VERSION_MISMATCH);
+            EXPECT(attempt(resealed(bytes, 20)) == D3D12_ERROR_DRIVER_VERSION_MISMATCH);  // pipelineCacheUUID
+            EXPECT(attempt(resealed(bytes, 4)) == E_INVALIDARG);  // version
+        }
 
         // A device whose maxPushConstantsSize is the Vulkan minimum (128 bytes) cannot hold the 144-byte block, so
         // its PSOs are refused instead of creating a pipeline layout the spec forbids (#224's fallback flag).

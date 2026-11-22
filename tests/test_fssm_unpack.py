@@ -124,6 +124,48 @@ class TestPartsParsing(unittest.TestCase):
         self.assertEqual(fssm_unpack.parts(container), {b"DXIL": b""})
 
 
+class TestDirectoryBounds(unittest.TestCase):
+    def test_dxbc_bounds(self):
+        blob = make_dxbc([(b"TEST", b"abc")])
+        table = 32
+        part = table + 4
+        for label, data in [
+            ("header", blob[:31]),
+            ("offset table", blob[:part - 1]),
+            ("part header", blob[:part + 7]),
+            ("part payload", blob[:-1]),
+        ]:
+            with self.subTest(label=label), self.assertRaisesRegex(ValueError, "DXBC"):
+                fssm_unpack.parts(data)
+
+        for offset in (table, len(blob) + 1):
+            data = bytearray(blob)
+            struct.pack_into("<I", data, table, offset)
+            with self.subTest(offset=offset), self.assertRaisesRegex(ValueError, "DXBC"):
+                fssm_unpack.parts(bytes(data))
+
+    def test_xdat_bounds(self):
+        prefix = b"prefix"
+        blob = make_xdat({7: b"abc"}, pre_padding=prefix)
+        x = len(prefix)
+        for label, data in [
+            ("header", blob[:x + 11]),
+            ("directory", blob[:x + 23]),
+            ("payload", blob[:-1]),
+        ]:
+            with self.subTest(label=label), self.assertRaisesRegex(ValueError, "XDAT"):
+                fssm_unpack.xdat_entries_all(data)
+
+        for offset, size in [(x + 12, 1), (len(blob) + 1, 0), (len(blob), 1)]:
+            data = bytearray(blob)
+            struct.pack_into("<II", data, x + 16, offset, size)
+            with self.subTest(offset=offset), self.assertRaisesRegex(ValueError, "XDAT"):
+                fssm_unpack.xdat_entries_all(bytes(data))
+
+    def test_empty_payload_at_end_of_dxil(self):
+        self.assertEqual(fssm_unpack.xdat_entries_all(make_xdat({7: b""})), [(7, b"")])
+
+
 class TestXdatEntries(unittest.TestCase):
     def test_missing_xdat_magic(self):
         dxil = b"arbitrary-dxil-bytes-without-magic"
@@ -463,6 +505,20 @@ class TestMainDirectoryProcessing(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
+    def test_carve_index_selects_current_containers(self):
+        shader = make_dxbc([(b"DXIL", make_xdat({0x0D: make_xbch(make_fssm())}))])
+        for name in ("current", "obsolete"):
+            with open(os.path.join(self.src, name + ".dxbc"), "wb") as f:
+                f.write(shader)
+        index = os.path.join(self.src, "index.json")
+        with open(index, "w", encoding="utf-8") as f:
+            json.dump([{"file": "current.dxbc"}], f)
+        result = subprocess.run([sys.executable, "-I", TOOL, self.src, "--carve-index", index],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(os.listdir(os.path.join(self.src, "fssm")), ["current.fssm"])
+        self.assertTrue(os.path.isfile(os.path.join(self.src, "obsolete.dxbc")))
+
     def test_main_rejects_invalid_fssm_magic(self):
         bad_payload = b"JUNK\x01\x01" + bytes(58)
         bad_dxbc = make_dxbc([(b"DXIL", make_xdat({0x0D: make_xbch(bad_payload)}))])
@@ -555,6 +611,28 @@ class TestMainDirectoryProcessing(unittest.TestCase):
         self.assertEqual(entry_b["version"], 0x0102)
         self.assertEqual(entry_b["endpgm"], [0x20, 0x60])
         self.assertEqual(entry_b["tags"], ["0xd"])
+
+    def test_index_publication_never_uses_fixed_tmp_sentinel(self):
+        """The old fixed fssm_index.json.tmp staging path could truncate an unrelated user file (or a
+        hardlink to one). Index publication must use private staging and leave any pre-existing
+        .tmp sentinel untouched."""
+        fssm_1 = make_fssm(version=0x0101, instructions=[(0x40, S_ENDPGM)])
+        with open(os.path.join(self.src, "shader_a.dxbc"), "wb") as f:
+            f.write(make_dxbc([(b"DXIL", make_xdat({0x0D: make_xbch(fssm_1)}))]))
+
+        sentinel = os.path.join(self.src, "fssm_index.json.tmp")
+        with open(sentinel, "w") as f:
+            f.write("keep-me")
+
+        res = subprocess.run([sys.executable, "-I", TOOL, self.src], capture_output=True, text=True)
+        self.assertEqual(res.returncode, 0, res.stderr)
+
+        with open(sentinel, encoding="utf-8") as f:
+            self.assertEqual(f.read(), "keep-me")
+        with open(os.path.join(self.src, "fssm_index.json"), encoding="utf-8") as f:
+            self.assertEqual([row["name"] for row in json.load(f)], ["shader_a"])
+        self.assertEqual(sorted(os.listdir(self.src)),
+                         ["fssm", "fssm_index.json", "fssm_index.json.tmp", "shader_a.dxbc"])
 
 
 if __name__ == "__main__":

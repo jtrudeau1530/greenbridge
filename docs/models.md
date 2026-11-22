@@ -259,7 +259,7 @@ failures, no duplicate model names, and 2.22 billion triangles (1.95 billion bef
 ## How the exporter works
 
 ```
-rpf9dump models <archive.rpf> <outdir>
+rpf9dump models <archive.rpf> <outdir> [--start BYTES] [--length BYTES]
 ```
 
 `FindCandidateOffsets` scans 4 MiB blocks for a page-aligned 16-byte zero prefix followed by a zlib
@@ -267,6 +267,15 @@ stream at page offset +16. It inflates the first 176 bytes and keeps the offset 
 a drawable or fragment header (`RageModelDecoder.LooksLikeResource`). `RecoverAtOffsets` follows
 the following zlib blocks, splits the inflated bytes into the system segment and the graphics
 segment, probes the extents, and calls `RageModelDecoder.Decode`.
+
+`--start`/`--length` scan one window of the file instead of the whole archive. Neither `models`
+nor `textures` needs the archive directory: the entry list comes from this run's scan or from the
+index cache, and every resource is read from its own compression blocks
+(`tools/rpf9dump/Segments.cs`). A window is therefore a raw slice - a copy of `levels.rpf` from an
+offset, which has no `9FPR` header - and the scan covers exactly the slice. A sub-range is never
+written to the index cache, which describes a whole file; the manifest records `Scan.Start` and
+`Scan.Length` for it. One measured 1 GiB slice of `levels.rpf`: 1,228 models scanned, recovered,
+decoded and exported in about 2 s (497 MB of OBJ and manifest).
 
 To locate a named drawable before decoding, `tools/rpf9_names.py` indexes the measured
 `name.#dr`/`#ft`/`#dd` spellings in bounded zlib prefixes without the encrypted TOC; see
@@ -277,6 +286,12 @@ For each returned entry, `tools/rpf9dump/Program.cs` reads the segments, splits 
 `<outdir>/<archive>/models/manifest.json` with `src`, `Count`, and `Items[]`. Each item records the
 offset, OBJ name, model name, mesh/vertex/triangle counts, fragment and bone-binding flags, bounds,
 per-mesh shader indices, embedded textures, and material texture references.
+
+Three arrays describe the geometries one by one, in the same order as the OBJ's `o` groups:
+`MeshTris` (triangles), `MeshModels` (the position of the model in the drawable's primary-LOD model
+list) and `MeshGeoms` (the position of the geometry in that model). That pair is the geometry index
+a dehydrated BLAS leaf stores ([bvh.md](bvh.md) §4a), which is what `tools/bvh_match.py` matches on;
+`MeshShaders` maps each geometry to its entry in `Materials`, and therefore to its shader name hash.
 
 The manifest has no failure, skip, or layout fields. `Program.cs` increments `fail` only when a
 model entry returned by the carver fails `RageModelDecoder.Decode`; `skip` is not used in models
@@ -438,8 +453,9 @@ World drawables do not carry the shared 597-name humanoid skeleton. Character `.
 store that name/hash table, and each character `#dr` model points at a local bone-hash array that
 maps into it. The measured name table, the following 597-record hierarchy/reference-TRS table,
 the model mapping and the texture-parameter split are in
-[character_skeleton.md](character_skeleton.md). No character bind matrices were recovered; that
-page records the reference-pose caveat rather than inventing a bind pose.
+[character_skeleton.md](character_skeleton.md). The character inverse bind matrices are at
+skeleton header `+0x30` and agree with the default bone transforms (see that page);
+`tools/anim_glb.py` exports a skinned part with them.
 
 The character-part inventory (Lucia's named records and decoded parts, the `player_story000_00`
 drawable set, slot-name counts and texture coverage) is in
@@ -470,6 +486,35 @@ Names are per model and a building holds glass, decal and opaque shaders alike, 
 in absolute terms; the enrichment against bucket 0 is the signal. For export: bucket 1 needs blending, 2 is
 a projected decal, 3 needs alpha testing, 6 is a water surface.
 
+## Material shader hashes and the carved programs
+
+`rpf9dump` also writes each material's shader hash (`manifest.json` → `Materials[].Shader`, u32 as 8 hex digits).
+It is the joaat (lower-cased) of the material's **effect** name. The carve index (`<work>/shaders/dxbc/index.json`)
+names compute programs `<effect>:<entry>_<8 hex>_Wrapped` after a one-byte length prefix (the `:` becomes `_` in
+file names), so the effect is recoverable from them. Measured on a 1.0.2.1 copy, `data.rpf` models and the full
+26,503-program carve:
+
+| | Count |
+|---|---:|
+| Materials (3,175 models) | 3,340 |
+| Distinct material shader hashes | 18 |
+| Compute programs named `<effect>:<entry>` | 2,689 (every CS), 564 effects |
+| Effects with `RaytracingResolve` CS programs | 341 (1,004 programs; 3 each for 324) |
+| Materials whose hash is the joaat of a carved effect name | 3,211 (96%), 8 of the 18 hashes |
+
+So a material leads to its effect and that effect's ray-tracing resolve programs. It does **not** lead to the
+draw (VS/PS/MS) programs from the package alone:
+
+- None of the 23,619 graphics programs (VS/PS/MS) carries an effect name; they are named `<stage>_<technique or entry>_<8 hex>`.
+- `shaders.rpf` stores programs grouped by kind, not by effect (the 1,004 `RaytracingResolve` programs sit next
+  to each other), so position doesn't group an effect's programs either.
+- The graphics programs' 8-hex suffix groups them (1,226 suffixes over 23,016 programs, the largest shared by
+  1,775) but is not the joaat of the program name, and only 1 of the 896 suffixes on the effect-named CS programs
+  appears on any graphics program.
+
+The effect → technique → VS/PS table is therefore not in the carved programs' names, order or suffixes; it is
+presumably in the executable (RT-5). Until then, a real model is drawn with a chosen pair ([first_light.md](first_light.md)).
+
 ## Vehicle distant-light recipes
 
 `common.rpf` has one `CVehicleDistantLightData` XML document (see [gamedata.md](gamedata.md)) that ties
@@ -497,6 +542,23 @@ vehicle models to far-away light recipes. Counts only; no model names.
 Not measured here (hypothesis): what the secondary tokens name (per-model parts or liveries would fit the
 model-name substrings), and where the light positions are generated at runtime (for example from the model's
 own light bones).
+
+## Skinned GLB export
+
+`tools/skinned_glb.py` writes a skinned GLB from decoded pack components and the shared ped
+skeleton:
+
+```
+python -I tools/skinned_glb.py out.glb --skeleton <dir> --component <dir> [--component ...]
+```
+
+It reads the 8-influence `JOINTS_0/1` and `WEIGHTS_0/1` streams from the graphics buffer, resolves
+the drawable's local joint palette through the drawable and ped tables, and emits `skins` and
+`inverseBindMatrices` with the ped bind pose. The measured stream offsets and joint mapping are
+in [character_skeleton.md](character_skeleton.md#skinned-glb-export). On the 1.0.2.1 package, the
+head (8,983 v) and biker jacket (9,818 v) produce one skin with 596 ped joints (703 with the
+jacket's `GM_U01_*` helpers); every weight sums to 255 and the rest-pose reconstruction error is
+6e-8 m. `python -I tests/test_skinned_glb.py` runs 10 synthetic tests and needs no game files.
 
 ## What to do next
 

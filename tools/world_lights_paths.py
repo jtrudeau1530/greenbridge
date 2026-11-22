@@ -37,16 +37,19 @@ import json
 import math
 import mmap
 import os
+import statistics
 import struct
 import sys
 import tempfile
 import zlib
+from collections.abc import Sequence
 from concurrent.futures import ProcessPoolExecutor
 
 _TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
 if _TOOLS_DIR not in sys.path:
     sys.path.insert(0, _TOOLS_DIR)
 
+from pool_workers import process_workers  # noqa: E402
 import world_census as WC  # noqa: E402
 import world_index as WI  # noqa: E402
 
@@ -266,14 +269,23 @@ def quat_rotate(q, v):
     return [v[0] + w * tx + (y * tz - z * ty), v[1] + w * ty + (z * tx - x * tz), v[2] + w * tz + (x * ty - y * tx)]
 
 
-def place(local, direction, position, rotation, scale_xy, scale_z):
+def place(
+    local: Sequence[float],
+    direction: Sequence[float] | None,
+    position: Sequence[float],
+    rotation: Sequence[float],
+    scale_xy: float | None,
+    scale_z: float | None,
+) -> tuple[list[float], list[float] | None]:
     """World position and direction of a model-space light under an entity's stored transform.
 
     The stored quaternion is the inverse of the entity rotation (docs/world.md), so it is conjugated here.
     """
     x, y, z, w = rotation
     q = (-x, -y, -z, w)
-    scaled = [local[0] * scale_xy, local[1] * scale_xy, local[2] * scale_z]
+    xy = 1.0 if scale_xy is None else scale_xy
+    z_scale = 1.0 if scale_z is None else scale_z
+    scaled = [local[0] * xy, local[1] * xy, local[2] * z_scale]
     p = quat_rotate(q, scaled)
     return [position[0] + p[0], position[1] + p[1], position[2] + p[2]], (quat_rotate(q, direction) if direction else None)
 
@@ -423,9 +435,9 @@ def graph_stats(nodes, links, junctions):
     if nodes:
         hist["bbox_min"] = [round(min(n["position"][k] for n in nodes), 1) for k in range(3)]
         hist["bbox_max"] = [round(max(n["position"][k] for n in nodes), 1) for k in range(3)]
-    lengths = sorted(l["length"] for l in links)
+    lengths = [l["length"] for l in links]
     if lengths:
-        hist["link_length_m"] = {"min": lengths[0], "median": lengths[len(lengths) // 2], "max": lengths[-1]}
+        hist["link_length_m"] = {"min": min(lengths), "median": statistics.median(lengths), "max": max(lengths)}
     s["street_named_nodes"] = sum(1 for n in nodes if n["street"])
     s["junction_nodes_resolved"] = sum(1 for j in junctions if j["node"] in by_key)
     s["junction_entrances"] = sum(len(j["entrances"]) for j in junctions)
@@ -437,10 +449,10 @@ def graph_stats(nodes, links, junctions):
     s["entrances_yield"] = sum(e["yield"] for j in junctions for e in j["entrances"])
     s["signalised_junctions"] = sum(1 for j in junctions if j["phases"])
     s["phases"] = sum(len(j["phases"]) for j in junctions)
-    durations = sorted(p["duration"] for j in junctions for p in j["phases"])
+    durations = [p["duration"] for j in junctions for p in j["phases"]]
     if durations:
-        hist["phase_duration_s"] = {"min": round(durations[0], 2), "median": round(durations[len(durations) // 2], 2),
-                                    "max": round(durations[-1], 2)}
+        hist["phase_duration_s"] = {"min": round(min(durations), 2), "median": round(statistics.median(durations), 2),
+                                    "max": round(max(durations), 2)}
     s["junction_nodes_flagged_junction"] = sum(1 for j in junctions if j["node"] in by_key
                                                and nodes[by_key[j["node"]]]["flags"] >> 4 & 1)
     s["nodes_flagged_junction"] = sum(1 for n in nodes if n["flags"] >> 4 & 1)
@@ -529,7 +541,7 @@ def inspect_resource(data, lights_out=False):
                     for L in lights:
                         local = [off[k] + L.get("position120", [0, 0, 0])[k] for k in range(3)]
                         p, d = place(local, L.get("direction"), t["position"], t["rotation"],
-                                     t["scaleXY"] or 1.0, t["scaleZ"] or 1.0)
+                                     t["scaleXY"], t["scaleZ"])
                         world.append(_light_row(p, d, L, "entity", t["archetypeName"]))
                 st["lights_entity_in_map_placed"] += len(lights)
         out["lights"] = st
@@ -641,7 +653,7 @@ def scan(path, jobs=1, start=None, limit=None, lights_out=False):
         for w in windows:
             merge(scan_window(w))
     else:
-        with ProcessPoolExecutor(jobs) as ex:
+        with ProcessPoolExecutor(process_workers(jobs)) as ex:
             for r in ex.map(scan_window, windows):
                 merge(r)
     return total
@@ -687,7 +699,7 @@ def summarize(total, entities=None, lights_out=None):
                         for L in ls:
                             local = [L["offset"][k] + L.get("position120", [0, 0, 0])[k] for k in range(3)]
                             p, d = place(local, L.get("direction"), e["position"], e["rotation"],
-                                         e.get("scale_xy") or 1.0, e.get("scale_z") or 1.0)
+                                         e.get("scale_xy"), e.get("scale_z"))
                             out.write(json.dumps(_light_row(p, d, L, "archetype", a),
                                                  separators=(",", ":")) + "\n")
     finally:
@@ -748,6 +760,9 @@ def main(argv=None):
     a = ap.parse_args(argv)
     if a.jobs < 1:
         print("ERROR: --jobs must be at least 1", file=sys.stderr)
+        return 2
+    if a.limit is not None and a.limit < 1:
+        print("ERROR: --limit must be at least 1", file=sys.stderr)
         return 2
     if not os.path.isfile(a.archive):
         print(f"ERROR: {a.archive}: no such file", file=sys.stderr)

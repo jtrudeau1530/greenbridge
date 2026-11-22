@@ -1,12 +1,14 @@
 """Pure standard-library DDS to PNG decoder and 2x box-filter downscaler.
 
 Supports legacy and DX10 DDS headers across uncompressed 32-bit formats
-(BGRA8, RGBA8, BGRX8, RGBX8, and arbitrary 32-bit RGB/RGBA bitmasks) and
+(BGRA8, RGBA8, BGRX8, RGBX8, R10G10B10A2_UNORM, and arbitrary 32-bit RGB/RGBA bitmasks) and
 block-compressed formats (BC1, BC2, BC3, BC4, BC5, BC7).
 
 BC7 covers all eight modes. DXGI 97/98/99 (typeless, UNORM, UNORM_SRGB) emit
 the stored RGBA8 values with no sRGB transfer, and the reserved mode (no mode
 bit in the first byte) decodes as transparent black. BC6H is not supported.
+DXT2, DXT4 and premultiplied DX10 images are converted to straight alpha for PNG; sRGB colors are
+unpremultiplied in linear light and returned in their sRGB encoding.
 
 Usage:
     python -I tools/dds_png.py <in.dds> <out.png> [--max-size N]
@@ -30,6 +32,7 @@ DDS_HEADER_SIZE = 128
 DDS_DX10_HEADER_SIZE = 148
 DDSD_PITCH = 0x8
 DDS_ALPHA_MODE_MASK = 0x7
+DDS_ALPHA_MODE_PREMULTIPLIED = 2
 DDS_ALPHA_MODE_OPAQUE = 3
 
 DDPF_ALPHAPIXELS = 0x1
@@ -40,7 +43,9 @@ PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 
 _FOURCC_MAP: dict[bytes, str] = {
     b"DXT1": "BC1",
+    b"DXT2": "BC2",
     b"DXT3": "BC2",
+    b"DXT4": "BC3",
     b"DXT5": "BC3",
     b"ATI1": "BC4",
     b"BC4U": "BC4",
@@ -51,11 +56,15 @@ _FOURCC_MAP: dict[bytes, str] = {
 }
 
 _DXGI_MAP: dict[int, str] = {
+    # Typeless byte formats use the same channel layout as their UNORM variants.
+    27: "RGBA8",
     28: "RGBA8",
     29: "RGBA8",
     87: "BGRA8",
+    90: "BGRA8",
     91: "BGRA8",
     88: "BGRX8",
+    92: "BGRX8",
     93: "BGRX8",
     70: "BC1",
     71: "BC1",
@@ -76,6 +85,12 @@ _DXGI_MAP: dict[int, str] = {
     98: "BC7",
     99: "BC7",
 }
+
+_SRGB_DXGI_FORMATS = frozenset((29, 72, 75, 78, 91, 93, 99))
+_SRGB_TO_LINEAR = tuple(
+    x / 12.92 if x <= 0.04045 else ((x + 0.055) / 1.055) ** 2.4
+    for x in (v / 255.0 for v in range(256))
+)
 
 _CANONICAL_MASKS: dict[tuple[int, int, int, int], str] = {
     (0x00FF0000, 0x0000FF00, 0x000000FF, 0xFF000000): "BGRA8",
@@ -162,7 +177,7 @@ def _validate_mask(mask: int) -> tuple[int, int]:
 
 def _parse_header_internal(
     data: bytes | bytearray | memoryview,
-) -> tuple[dict[str, int | str | None], tuple[int, int, int, int] | None]:
+) -> tuple[dict[str, int | str | None], tuple[int, int, int, int] | None, int]:
     if not isinstance(data, (bytes, bytearray, memoryview)):
         raise DdsError(f"Expected bytes-like object, got {type(data).__name__}")
     if len(data) < DDS_HEADER_SIZE:
@@ -182,6 +197,7 @@ def _parse_header_internal(
     )
 
     dxgi_format: int | None = None
+    alpha_mode = 0
     data_offset = DDS_HEADER_SIZE
     masks: tuple[int, int, int, int] | None = None
 
@@ -192,12 +208,19 @@ def _parse_header_internal(
                     f"Truncated DX10 DDS header: {len(data)} bytes (need at least {DDS_DX10_HEADER_SIZE})"
                 )
             dxgi_format = struct.unpack_from("<I", data, 128)[0]
-            fmt = _DXGI_MAP.get(dxgi_format)
+            if dxgi_format == 24:  # DXGI_FORMAT_R10G10B10A2_UNORM, R in the low bits.
+                fmt = "RGBA8"
+                masks = (0x000003FF, 0x000FFC00, 0x3FF00000, 0xC0000000)
+            else:
+                fmt = _DXGI_MAP.get(dxgi_format)
             if fmt is None:
                 raise DdsError(f"Unsupported DXGI format: {dxgi_format}")
             data_offset = DDS_DX10_HEADER_SIZE
+            alpha_mode = struct.unpack_from("<I", data, 144)[0] & DDS_ALPHA_MODE_MASK
         else:
             fmt = _FOURCC_MAP.get(fourcc)
+            if fourcc in (b"DXT2", b"DXT4"):
+                alpha_mode = DDS_ALPHA_MODE_PREMULTIPLIED
             if fmt is None:
                 raise DdsError(f"Unsupported DDS FourCC: {fourcc!r}")
     elif pf_flags & DDPF_RGB:
@@ -224,12 +247,12 @@ def _parse_header_internal(
         "mip_count": mip_count,
         "data_offset": data_offset,
     }
-    return info, masks
+    return info, masks, alpha_mode
 
 
 def parse_dds_header(data: bytes) -> dict:
     """Parse a legacy or DX10 DDS header and return format metadata."""
-    info, _ = _parse_header_internal(data)
+    info, _, _ = _parse_header_internal(data)
     return info
 
 
@@ -881,9 +904,28 @@ def _decode_bc7(data: bytes | bytearray | memoryview, offset: int, width: int, h
     return bytes(out)
 
 
+def _unpremultiply_rgba(rgba: bytes, srgb: bool) -> bytes:
+    """Straight RGBA8, rounding color channels to the nearest byte and keeping alpha unchanged."""
+    out = bytearray(rgba)
+    for p in range(0, len(out), 4):
+        alpha = rgba[p + 3]
+        if alpha == 0:
+            out[p:p + 3] = b"\x00\x00\x00"
+        elif alpha < 255:
+            for c in range(p, p + 3):
+                if srgb:
+                    linear = min(1.0, _SRGB_TO_LINEAR[rgba[c]] * 255.0 / alpha)
+                    encoded = (12.92 * linear if linear <= 0.0031308
+                               else 1.055 * linear ** (1.0 / 2.4) - 0.055)
+                    out[c] = min(255, int(encoded * 255.0 + 0.5))
+                else:
+                    out[c] = min(255, (rgba[c] * 255 + alpha // 2) // alpha)
+    return bytes(out)
+
+
 def decode_dds(data: bytes) -> tuple[int, int, bytes]:
-    """Decode mip 0 of a DDS buffer into top-down row-major RGBA8 bytes."""
-    info, masks = _parse_header_internal(data)
+    """Decode mip 0 into top-down row-major RGBA8 with straight alpha."""
+    info, masks, alpha_mode = _parse_header_internal(data)
     width = int(info["width"])  # type: ignore[arg-type]
     height = int(info["height"])  # type: ignore[arg-type]
     fmt = str(info["format"])
@@ -912,12 +954,12 @@ def decode_dds(data: bytes) -> tuple[int, int, bytes]:
     else:
         raise DdsError(f"Unsupported DDS format: {fmt}")
 
-    if offset == DDS_DX10_HEADER_SIZE:
-        misc_flags2 = struct.unpack_from("<I", data, 144)[0]
-        if misc_flags2 & DDS_ALPHA_MODE_MASK == DDS_ALPHA_MODE_OPAQUE:
-            opaque = bytearray(rgba)
-            opaque[3::4] = b"\xff" * (width * height)
-            rgba = bytes(opaque)
+    if alpha_mode == DDS_ALPHA_MODE_PREMULTIPLIED:
+        rgba = _unpremultiply_rgba(rgba, info["dxgi_format"] in _SRGB_DXGI_FORMATS)
+    elif alpha_mode == DDS_ALPHA_MODE_OPAQUE:
+        opaque = bytearray(rgba)
+        opaque[3::4] = b"\xff" * (width * height)
+        rgba = bytes(opaque)
 
     return width, height, rgba
 
@@ -943,18 +985,25 @@ def _resample_box(width: int, height: int, rgba: bytes, nw: int, nh: int) -> byt
     out = bytearray(nw * nh * 4)
     for y, rows in enumerate(y_spans):
         for x, cols in enumerate(x_spans):
-            samples = [(4 * (sy * width + sx), wx * wy) for sy, wy in rows for sx, wx in cols]
+            samples = []
+            for sy, wy in rows:
+                for sx, wx in cols:
+                    offset = 4 * (sy * width + sx)
+                    samples.append((offset, rgba[offset + 3] * wx * wy))
+            coverage = sum(weight for _, weight in samples)
             dst = 4 * (y * nw + x)
-            for channel in range(4):
-                total = sum(rgba[offset + channel] * weight for offset, weight in samples)
-                out[dst + channel] = (total + area // 2) // area
+            out[dst + 3] = (coverage + area // 2) // area
+            if coverage:
+                for channel in range(3):
+                    total = sum(rgba[offset + channel] * weight for offset, weight in samples)
+                    out[dst + channel] = (total + coverage // 2) // coverage
     return bytes(out)
 
 
 def _halve_rgba(width: int, height: int, rgba: bytes) -> tuple[int, int, bytes]:
     nw = max(1, width // 2)
     nh = max(1, height // 2)
-    if (width > 1 and width % 2) or (height > 1 and height % 2):
+    if (width > 1 and width % 2) or (height > 1 and height % 2) or rgba[3::4].count(255) != width * height:
         return nw, nh, _resample_box(width, height, rgba, nw, nh)
     row_bytes = width * 4
     out_row_bytes = nw * 4
@@ -993,7 +1042,7 @@ def _halve_rgba(width: int, height: int, rgba: bytes) -> tuple[int, int, bytes]:
 
 
 def downscale_rgba(width: int, height: int, rgba: bytes, max_size: int) -> tuple[int, int, bytes]:
-    """Repeatedly halve RGBA8 via a full-image box filter until max(w, h) <= max_size."""
+    """Halve straight-alpha RGBA8 with an alpha-weighted box filter until max(w, h) <= max_size."""
     if width <= 0 or height <= 0:
         raise DdsError(f"Invalid image dimensions: {width}x{height}")
     expected = width * height * 4

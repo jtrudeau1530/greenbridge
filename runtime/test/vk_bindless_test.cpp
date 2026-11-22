@@ -22,6 +22,7 @@
 #include "vulkan_loader.h"
 #include "vk_device_pick.h"
 #include "vk_shader_fma.h"
+#include "vk_pc_tail.h"
 #include "../src/vulkan_bindless.h"
 
 #include <algorithm>
@@ -192,7 +193,10 @@ int main(int argc, char** argv) {
     std::printf("device: %s%s\n", props.properties.deviceName, validation ? " (validation on)" : "");
     // The pipeline layout pushes the 144-byte translated user-data block. A device with fewer push constant bytes
     // (128 on Intel Arc and some AMD drivers) can't create it: a device limit, not a wrong result (TEST-149).
-    constexpr std::uint32_t push_bytes = 144;
+    // LEONIDA_PC_TAIL_UBO=1 (rdna2spirv.py --pc-tail-ubo): s0..s31 only, 128 bytes; the heap base, if a stage reads
+    // it, is in a uniform block at set 1 (vk_pc_tail.h).
+    const bool pc_tail = leonida::vk_test::pc_tail_requested();
+    const std::uint32_t push_bytes = pc_tail ? 128u : 144u;
     if (props.properties.limits.maxPushConstantsSize < push_bytes) {
         std::printf("unsupported: need %u push constant bytes, device has %u\n", push_bytes,
                     props.properties.limits.maxPushConstantsSize);
@@ -201,7 +205,8 @@ int main(int argc, char** argv) {
 
     // The features ps_tex's metadata names (bufferDeviceAddress, runtimeDescriptorArray, shaderInt64), dynamic
     // indexing of the image array, and whichever descriptor-indexing flags the set can use.
-    VkPhysicalDeviceVulkan12Features have12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
+    VkPhysicalDeviceVulkan11Features have11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES};
+    VkPhysicalDeviceVulkan12Features have12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &have11};
     VkPhysicalDeviceFeatures2 have{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &have12};
     vkGetPhysicalDeviceFeatures2(pd, &have);
     if (!have12.bufferDeviceAddress || !have12.runtimeDescriptorArray || !have.features.shaderInt64 ||
@@ -215,7 +220,10 @@ int main(int argc, char** argv) {
                                      have12.descriptorBindingStorageImageUpdateAfterBind &&
                                      have12.descriptorBindingStorageBufferUpdateAfterBind;
     device_flags.partially_bound = have12.descriptorBindingPartiallyBound == VK_TRUE;
-    VkPhysicalDeviceVulkan12Features enable12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
+    // Translated vertex shaders read BaseVertex / BaseInstance (DrawParameters) for the zero-based v0 / v3.
+    VkPhysicalDeviceVulkan11Features enable11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES};
+    enable11.shaderDrawParameters = have11.shaderDrawParameters;
+    VkPhysicalDeviceVulkan12Features enable12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &enable11};
     enable12.bufferDeviceAddress = VK_TRUE;
     enable12.runtimeDescriptorArray = VK_TRUE;
     enable12.descriptorIndexing = have12.descriptorIndexing;
@@ -419,17 +427,34 @@ int main(int argc, char** argv) {
     CHECK(make_buffer(VkDeviceSize(W) * H * 16, VK_BUFFER_USAGE_TRANSFER_DST_BIT, &readback, &readback_map));
 
     VkShaderModule vs, fs;
+    bool tail_block = false;
     for (int stage = 0; stage < 2; ++stage) {
         const auto code = read_spv(argv[1 + stage]);
         if (code.empty()) {
             std::fprintf(stderr, "cannot read %s\n", argv[1 + stage]);
             return 1;
         }
+        if (pc_tail && leonida::vk_test::spirv_declares_set(code.data(), code.size() * 4, leonida::vk_test::pc_tail_set))
+            tail_block = true;
         VkShaderModuleCreateInfo smi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
         smi.codeSize = code.size() * 4;
         smi.pCode = code.data();
         CHECK(vkCreateShaderModule(dev, &smi, nullptr, stage ? &fs : &vs));
     }
+    // One tail block for every variant below: each draw's tail is the same heap base.
+    leonida::vk_test::PcTail tail;
+    if (tail_block && !tail.create(vkGetDeviceProcAddr, dev, mp, props.properties.limits.minUniformBufferOffsetAlignment,
+                                   VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 1)) {
+        std::fprintf(stderr, "FAILED creating the --pc-tail-ubo block\n");
+        return 1;
+    }
+    auto bind_tail = [&](VkCommandBuffer cb, VkPipelineLayout layout, const std::uint32_t* block) {
+        if (!tail_block) return;
+        tail.write(0, block, 4);
+        const std::uint32_t offset = tail.offset(0);
+        vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, leonida::vk_test::pc_tail_set, 1, &tail.set,
+                                1, &offset);
+    };
     VkCommandPoolCreateInfo cpi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
     cpi.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
     cpi.queueFamilyIndex = qi;
@@ -566,6 +591,8 @@ int main(int argc, char** argv) {
         pli.pSetLayouts = &set_layout;
         pli.pushConstantRangeCount = 1;
         pli.pPushConstantRanges = &push;
+        const VkDescriptorSetLayout set_layouts[] = {set_layout, tail.set_layout};
+        if (tail_block) { pli.setLayoutCount = 2; pli.pSetLayouts = set_layouts; }
         VkPipelineLayout pipeline_layout;
         CHECK(vkCreatePipelineLayout(dev, &pli, nullptr, &pipeline_layout));
         VkPipelineShaderStageCreateInfo stages[2]{{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO},
@@ -632,7 +659,8 @@ int main(int argc, char** argv) {
             block[2] = table_va;  // s2:s3 = console VA of the descriptor table
             block[32] = std::uint32_t(heap_base);
             block[33] = std::uint32_t(heap_base >> 32);
-            vkCmdPushConstants(cmd, pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(block), block);
+            vkCmdPushConstants(cmd, pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, push_bytes, block);
+            bind_tail(cmd, pipeline_layout, block);
             vkCmdDraw(cmd, 3, 1, 0, 0);
             vkCmdEndRenderPass(cmd);
             VkBufferImageCopy rc{};
@@ -665,13 +693,16 @@ int main(int argc, char** argv) {
         for (std::uint32_t i = 1; i < set.image_capacity(ImageDimension::dim_1d); ++i)
             filled.push_back(set.add_image(ImageDimension::dim_1d, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_GENERAL));
         EXPECT(filled.front() == 1 && filled.back() == set.image_capacity(ImageDimension::dim_1d) - 1);
+        EXPECT(set.free_images(ImageDimension::dim_1d) == 0);
         EXPECT(set.add_image(ImageDimension::dim_1d, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_GENERAL) == 0);
         set.remove_image(ImageDimension::dim_1d, 7);
         EXPECT(set.add_image(ImageDimension::dim_1d, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_GENERAL) == 7);
         for (const std::uint32_t index : filled) set.remove_image(ImageDimension::dim_1d, index);
+        EXPECT(set.free_images(ImageDimension::dim_1d) == set.image_capacity(ImageDimension::dim_1d) - 1);
+        EXPECT(set.free_samplers() == set.sampler_capacity() - 1);
         const std::uint32_t decoy_sampler = set.add_sampler(nearest);
         const std::uint32_t sampler_index = set.add_sampler(nearest);
-        EXPECT(decoy_sampler == 1 && sampler_index == 2);
+        EXPECT(decoy_sampler == 1 && sampler_index == 2 && set.free_samplers() == set.sampler_capacity() - 3);
 
         if (atomic_mode) {
             // ps_imgatomic.asm: image_atomic_umax/umin/or on three 8x8 r32ui images and umax on a 4x4x4 one, from
@@ -777,7 +808,8 @@ int main(int argc, char** argv) {
             block[32] = std::uint32_t(heap_base);
             block[33] = std::uint32_t(heap_base >> 32);
             vkCmdPushConstants(cmd, pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
-                               sizeof(block), block);
+                               push_bytes, block);
+            bind_tail(cmd, pipeline_layout, block);
             vkCmdDraw(cmd, 3, 1, 0, 0);
             vkCmdEndRenderPass(cmd);
             VkMemoryBarrier after{VK_STRUCTURE_TYPE_MEMORY_BARRIER};

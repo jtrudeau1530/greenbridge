@@ -30,8 +30,17 @@ import os
 import re
 import struct
 import sys
+import tempfile
 import time
 import zlib
+from contextlib import suppress
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from file_mode import published_mode  # noqa: E402
+
+# -I keeps the script directory off sys.path, so add it explicitly before importing the sibling module.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from report_paths import same_report_path  # noqa: E402
 
 CHUNK = 1 << 20
 HEAD = 0x80
@@ -155,7 +164,9 @@ def scan_directory(root, pattern=None):
     pattern = pattern or "*.bin"
     rows, files, total_size = [], 0, 0
     t0 = time.time()
-    for path in sorted(glob.glob(os.path.join(root, "**", pattern), recursive=True)):
+    # Escape only the caller's root: a folder named "carve[1]" would otherwise be read as a character
+    # class by glob and match nothing. The pattern (and "**") stays as the caller's glob.
+    for path in sorted(glob.glob(os.path.join(glob.escape(os.fspath(root)), "**", pattern), recursive=True)):
         if not os.path.isfile(path):
             continue
         size = os.path.getsize(path)
@@ -196,17 +207,38 @@ def _make_parent(path):
         os.makedirs(parent, exist_ok=True)
 
 
+def _publish(dest, write, newline):
+    """Write a report next to `dest` and swap it in, so a run that fails or is interrupted while writing (a
+    serialization error, a full disk, Ctrl+C) leaves the previous report as it was instead of a truncated one.
+    The result keeps the previous report's permission bits, or gets the usual ones for a new file."""
+    _make_parent(dest)
+    directory = os.path.dirname(os.path.abspath(dest))
+    temp = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", newline=newline, dir=directory,
+                                         prefix=".navmesh_index-", suffix=".tmp", delete=False) as f:
+            temp = f.name
+            write(f)
+        os.chmod(temp, published_mode(dest))
+        os.replace(temp, dest)
+    except BaseException:
+        if temp is not None:
+            with suppress(OSError):
+                os.unlink(temp)
+        raise
+
+
 def write_outputs(rows, summary, out_path, csv_path):
-    _make_parent(out_path)
-    with open(out_path, "w", encoding="utf-8", newline="\n") as f:
-        json.dump({"summary": summary, "pages": rows}, f, indent=1)
+    _publish(out_path, lambda f: json.dump({"summary": summary, "pages": rows}, f, indent=1), "\n")
     written = []
     if csv_path:
-        _make_parent(csv_path)
-        with open(csv_path, "w", newline="", encoding="utf-8") as f:
+
+        def write_csv(f):
             w = csv.DictWriter(f, fieldnames=FIELDS, extrasaction="ignore", lineterminator="\n")
             w.writeheader()
             w.writerows(rows)
+
+        _publish(csv_path, write_csv, "")
         written.append(csv_path)
     return written
 
@@ -233,15 +265,6 @@ def offset(text):
     return value
 
 
-def same_report_path(first, second):
-    if os.path.normcase(os.path.realpath(first)) == os.path.normcase(os.path.realpath(second)):
-        return True
-    try:
-        return os.path.samefile(first, second)
-    except OSError:
-        return False
-
-
 def is_scanned_input(path, input_path, pattern):
     """True when a report path is one of the files the scan reads: writing it would destroy the input."""
     if same_report_path(path, input_path):
@@ -265,7 +288,8 @@ def is_scanned_input(path, input_path, pattern):
     # so CARVE/PAGE.BIN on a case-insensitive macOS or Linux volume, or a hard link, slips past the pattern. Ask
     # the scan's own glob whether any file it reads is this one.
     return any(same_report_path(target, scanned)
-               for scanned in glob.iglob(os.path.join(input_path, "**", pattern), recursive=True))
+               for scanned in glob.iglob(
+                   os.path.join(glob.escape(os.fspath(input_path)), "**", pattern), recursive=True))
 
 
 def main() -> int:

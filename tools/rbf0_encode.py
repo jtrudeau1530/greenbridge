@@ -61,7 +61,7 @@ class _Writer:
 
     def record(self, node, kind):
         index = node.get("descriptor")
-        if not isinstance(index, int) or not 0 <= index < 0xFD:
+        if not isinstance(index, int) or isinstance(index, bool) or not 0 <= index < 0xFD:
             raise EncodeError("descriptor", f"descriptor index {index!r} cannot be written")
         if index > self.emitted:
             raise EncodeError("descriptor", f"descriptor {index} is used before descriptor {self.emitted}")
@@ -87,7 +87,13 @@ class _Writer:
                 raise EncodeError("value", f"float spelling {special!r}")
         if not isinstance(value, (int, float)) or isinstance(value, bool):
             raise EncodeError("value", f"float value {value!r}")
-        return struct.pack("<d" if self.wide else "<f", float(value))
+        fval = float(value)
+        if math.isnan(fval):
+            raise EncodeError("nan", "a NaN float's bits are not in the tree")
+        try:
+            return struct.pack("<d" if self.wide else "<f", fval)
+        except OverflowError:
+            raise EncodeError("value", f"float value {value!r} overflows {'double' if self.wide else 'float32'}") from None
 
     def value(self, node):
         kind = node.get("type")
@@ -129,16 +135,19 @@ class _Writer:
     def text(self, node):
         if node.get("utf8_valid") is False:
             raise EncodeError("utf8", "a text record had invalid UTF-8")
-        raw = node.get("text", "").encode("utf-8") + (b"\x00" if node.get("nul_terminated") else b"")
-        if "length" in node and len(raw) != node["length"]:
-            raise EncodeError("length", f"text of {len(raw)} bytes, recorded {node['length']}")
+        text = node.get("text", "")
+        if not isinstance(text, str):
+            raise EncodeError("value", f"text value {text!r}")
+        raw = text.encode("utf-8") + (b"\x00" if node.get("nul_terminated") else b"")
+        if len(raw) > 0xFFFFFFFF or ("length" in node and len(raw) != node["length"]):
+            raise EncodeError("length", f"text of {len(raw)} bytes, recorded {node.get('length')}")
         self.out += b"\xfd\xff" + struct.pack("<I", len(raw)) + raw
 
     def element(self, node):
         if node.get("attribute_order_violation"):
             raise EncodeError("order", f"element {node.get('name')!r} has a value attribute after its content")
         attrs = node.get("attrs_declared", len(node.get("attributes", [])))
-        if not isinstance(attrs, int) or not 0 <= attrs <= 0xFFFF:
+        if not isinstance(attrs, int) or isinstance(attrs, bool) or not 0 <= attrs <= 0xFFFF:
             raise EncodeError("value", f"attribute count {attrs!r}")
         self.record(node, 0x00)
         self.out += struct.pack("<HHH", 0, 0, attrs)
@@ -159,12 +168,14 @@ class _Writer:
 
 def encode(doc):
     """The RBF0 bytes of one rbf0_tree document. Raises EncodeError when they would not be the original's."""
+    if not isinstance(doc, dict):
+        raise EncodeError("value", f"resource document {doc!r}")
     if doc.get("status") != "ok":
         raise EncodeError("status", f"the parse status is {doc.get('status')!r}")
     if doc.get("layout") not in ("wide-64", "narrow-32"):
         raise EncodeError("value", f"layout {doc.get('layout')!r}")
     tree = doc.get("tree")
-    if not tree or tree.get("kind") != "element":
+    if not isinstance(tree, dict) or tree.get("kind") != "element":
         raise EncodeError("status", "no root element")
     w = _Writer(doc)
     w.element(tree)
@@ -207,25 +218,40 @@ def check(source, limit=None):
 
 def write_all(report, out_dir):
     """Encode every resource of an rbf0_tree JSON report into out_dir. Returns (written, refused)."""
-    with open(report, encoding="utf-8") as f:
-        data = json.load(f)
-    if data.get("tool") != "rbf0_tree":
+    try:
+        with open(report, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError) as e:
+        raise SystemExit(f"{report}: cannot read report: {e}") from None
+    if not isinstance(data, dict) or data.get("tool") != "rbf0_tree":
         raise SystemExit(f"{report}: not an rbf0_tree.py JSON report")
-    if os.path.exists(out_dir) and (not os.path.isdir(out_dir) or os.listdir(out_dir)):
-        raise SystemExit(f"refusing to write into an existing non-empty path: {out_dir}")
-    os.makedirs(out_dir, exist_ok=True)
+    items = data.get("resources", [])
+    if not isinstance(items, list):
+        raise SystemExit(f"{report}: 'resources' must be a list")
+    try:
+        if os.path.exists(out_dir) and (not os.path.isdir(out_dir) or os.listdir(out_dir)):
+            raise SystemExit(f"refusing to write into an existing non-empty path: {out_dir}")
+        os.makedirs(out_dir, exist_ok=True)
+    except OSError as e:
+        raise SystemExit(f"{out_dir}: cannot prepare output directory: {e.strerror or e}") from None
     written, refused = 0, []
-    for i, doc in enumerate(data.get("resources", [])):
+    for i, doc in enumerate(items):
+        raw_offset = doc.get("offset", i) if isinstance(doc, dict) else i
         try:
             blob = encode(doc)
         except EncodeError as e:
-            refused.append((doc.get("offset", i), str(e)))
+            refused.append((raw_offset, str(e)))
             continue
-        name = f"{doc.get('offset', i):08x}.rbf"
+        file_offset = raw_offset if isinstance(raw_offset, int) and not isinstance(raw_offset, bool) and raw_offset >= 0 else i
+        name = f"{file_offset:08x}.rbf"
         if os.path.exists(os.path.join(out_dir, name)):
-            name = f"{doc.get('offset', i):08x}-{i:04d}.rbf"
-        with open(os.path.join(out_dir, name), "xb") as f:
-            f.write(blob)
+            name = f"{file_offset:08x}-{i:04d}.rbf"
+        target = os.path.join(out_dir, name)
+        try:
+            with open(target, "xb") as f:
+                f.write(blob)
+        except OSError as e:
+            raise SystemExit(f"{target}: cannot write: {e.strerror or e}") from None
         written += 1
     return written, refused
 

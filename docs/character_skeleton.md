@@ -81,22 +81,49 @@ SKEL_ROOT(0)
     SKEL_R_Clavicle(339) -> SKEL_R_UpperArm(340) -> SKEL_R_Forearm(341) -> SKEL_R_Hand(342) ...
 ```
 
-The reference TRS is **not the mesh bind pose**. Composing it places the spine branch on the
-opposite side of the pelvis from the legs, so an exporter must not use it directly as a glTF
-rest pose. Two honest options:
+**Correction: the table above reads each record 0x40 bytes late.** The skeleton header that a
+drawable points at with `+0x18` (the fragment's drawable for these humanoid fragments) gives the
+record array, and in it a record starts with its transform:
 
-1. Keep identity joint transforms and identity inverse-bind matrices; the authored mesh stays
-   in its bind pose.
-2. Apply the measured reference TRS and derive inverse-bind matrices as `inverse(world)`. The
-   mesh still renders in bind pose by construction, but the displayed skeleton is the measured
-   reference pose, not a verified game bind pose. A test on the composed pose measured a
-   maximum bind error of `2e-8`.
+| Header offset | Meaning |
+|---:|---|
+| `+0x28` | pointer to the 0x50-byte bone records |
+| `+0x30` | pointer to one 64-byte **inverse bind matrix** per bone |
+| `+0x40` | pointer to a `u16` parent index per bone (`0xFFFF` = root) |
+| `+0x6C`, `+0x6E` | `u16` bone count, twice |
 
-The true model bind/rest matrix array was not found in the model system or graphics pages.
+| Record offset | Type | Meaning |
+|---:|---|---|
+| `+0x00` | 4 × `f32` | default rotation quaternion `(x, y, z, w)`, local to the parent |
+| `+0x10` | 3 × `f32` | default translation, local to the parent |
+| `+0x1C` | `u32` | `joaat32` of the lowercased bone name |
+| `+0x20` | 3 × `f32` | default scale |
+| `+0x30` | pointer | bone name |
+| `+0x46` | `u16` | parent index (the same value as the parent array) |
+| `+0x48` | `u16` | the bone's own index |
+
+So the table above's `+0x06` parent and `+0x08` index are `+0x46`/`+0x48` of this layout, and its
+`+0x10`/`+0x20`/`+0x30` rotation, translation and scale are the **next** bone's. Measured on the
+graphics page at `0x4544F010`: the parent at `+0x06` of each table row equals `+0x46` of the
+record that starts 0x40 bytes earlier (597 of 597), that record's `+0x48` is its own index (596 of
+596 bones), and a row's `+0x10` rotation is the next record's `+0x00` (596 of 596). Read from the
+record start, the page's rotations and translations are those of the female skeleton below (596 of
+596). The shifted pairing is why composing the table put the spine on the wrong side of the pelvis.
+
+Read this way, the default pose is the bind pose: composing the default transforms down the
+hierarchy (`world = parent_world * local`) reproduces every stored inverse bind matrix. The
+largest difference between a joint's composed origin and the one its inverse bind matrix gives is
+5.1e-6 m on the 596-bone female skeleton (`ambient_femalebody_head.#ft`) and 3.3e-6 m on the
+560-bone male one (`ambient_malebody_head.#ft`). All 14,212 skeletons that read this way in
+`packs.rpf` (13,900 drawable-dictionary children and 312 fragments) agree within 1e-3. The
+matrices are row-vector (D3D) matrices; stored row by row they are glTF's column-major layout as
+is. `tools/anim_glb.py` exports them as the glTF skin's `inverseBindMatrices` and checks them.
 
 ## Model-side bone mapping
 
-Each character drawable's `grmModel` header points at a **bone-hash array**:
+Each character drawable's `grmModel` header points at a **bone-hash array** (at `+0x28`, as
+rpf9-explorer's `RageSkeleton.ReadModelPalette` reads it; an earlier version of this table said `+0x20`,
+which in 3,000 sampled part models is never a hash list that resolves):
 
 | `grmModel` offset | Meaning |
 |---:|---|
@@ -104,8 +131,7 @@ Each character drawable's `grmModel` header points at a **bone-hash array**:
 | `+0x10` | geometry count (also duplicated at +0x12 and +0x36) |
 | `+0x14` | local bone count |
 | `+0x18` | bounds pointer |
-| `+0x20` | **bone-hash array pointer** |
-| `+0x28` | flags/hash word |
+| `+0x28` | **bone-hash array pointer** |
 
 The array is `local bone count × u32`, sorted ascending. Each hash is matched against the
 597-entry `joaat32` table to obtain the global bone index. Measured coverage:
@@ -185,6 +211,116 @@ recovery with the bone-palette pull requests applied, was posted in
 #634](https://github.com/ItsNotRexed/Leonida/issues/634#issuecomment-7074504326); the counts there
 are higher because that recovery also walks nested archives.
 
+## Animated glTF export
+
+`tools/anim_glb.py` puts the three readers together: the skeleton above, the part meshes' skin
+streams, and the clip dictionaries of `anim.rpf` (`tools/anim_clips.py`, see
+[animation.md](animation.md#keyframe-decoding)). It writes one GLB with a glTF skin and one glTF
+animation per `.clip`:
+
+```powershell
+python -I tools/anim_glb.py <package>\packs.rpf <work>\walk.glb --skeleton <fragment offset> `
+    --part <part offset>[:<child>] --part ... `
+    --anim <package>\anim.rpf --dictionary <clip dictionary offset> [--clip <name> ...]
+python -I tools/anim_glb.py <package>\packs.rpf --coverage --skeleton <fragment offset> `
+    --anim <package>\anim.rpf --jobs 8 --report <work>\coverage.json
+```
+
+Offsets are zlib stream offsets (as `tools/skin_streams.py` and `rpf9dump` report them). The
+output is a standard glTF 2.0 file; Blender and the three.js editor play its animations. What
+it does and why:
+
+- **Joints** are the skeleton's bones with their default transforms as the rest pose, and the
+  stored inverse bind matrices. The export refuses a skeleton whose default transforms disagree
+  with them by 1e-3 or more.
+- **Part meshes** bind through their model's bone list: vertex bone index → `grmModel + 0x28` hash
+  → the skeleton bone with that `joaat32`. Weights are the UNORM bytes divided by their sum; up to
+  eight influences become `JOINTS_0/1` and `WEIGHTS_0/1`. three.js reads only the first set, and
+  eight matter here: on the arms part below, 3,746 of 5,821 vertices have more than four
+  influences, with up to 0.37 of the weight beyond the largest four. `--max-influences 4` keeps
+  the largest four, renormalised, for such viewers. A part with a *weighted* bone that is not in
+  the skeleton is refused with the missing hashes, never bound to a guessed bone.
+- **Clips:** `bonerotation`, `bonetranslation` and `bonescale` tracks drive the joint whose hash is
+  the track's bone hash. Bone hash 0 drives a `mover` node above the skeleton (root motion;
+  `--no-root-motion` leaves it out). Other track types are counted, not exported. A clip entry
+  plays its animation's `[start, end]` window at `rate`, so animation time `t` is clip time
+  `(t − start) / rate`. In 300 sampled dictionaries, `(end − start) / rate` equals the clip's
+  `+0x78` duration for all 4,471 entries.
+- The whole skeleton sits under one node that turns RAGE Z-up into glTF Y-up. Skinned mesh nodes
+  sit at the scene root, because glTF ignores a skinned mesh node's own transform.
+
+Measured on the 1.0.2.1 copy:
+
+| Check | Result |
+|---|---|
+| Skinned part drawables in `packs.rpf` (dictionary children with a bone list, no own skeleton) that read: positions, clustered triangles, skin streams | 9,571 of 9,571 (9,999 meshes: 9,091 8-bit, 908 packed indices) |
+| … whose weighted bones all bind to the female skeleton | 6,359 (6,322 also bind to the male one) |
+| … that use bones outside both skeletons (mostly clothing with its own cloth bones) | 3,212 |
+| Clip bone tracks (rotation, translation, scale; mover left out) whose bone hash is a joint of the female skeleton | 9,167,307 of 10,137,825 (90.4%), in 52,752 dictionaries |
+| … of the male skeleton | 9,164,859 (90.4%) |
+| Dictionaries with at least 90% of their bones in the female skeleton | 44,346 |
+| Clip rotation convention: joints whose default rotation is far from identity (rotation w below 0.9 in magnitude) and whose clip rotation is closer to the default than to its conjugate | 112 of 125, in four female locomotion and interaction dictionaries |
+
+Clip translations match the default bone lengths except on helper bones that are meant to move
+(`IK_*`, `PH_*` ground references and placements, `SKEL_ROOT`), so clip values are local
+transforms in the same convention as the skeleton's defaults.
+
+An export of a female head, arms and legs part with a locomotion walk dictionary (three clips)
+was checked in Node with three r160's `GLTFLoader` and `AnimationMixer`:
+
+- At rest, skinned vertices equal the stored ones turned to Y-up, within 4.1e-7.
+- Over nine samples of every clip, joint matrices are finite and bone lengths of joints without
+  translation tracks change by at most 3.9e-7.
+- The figure is 1.72 m tall. The feet alternate front and back by about ±0.65 m, four steps per
+  3.7 s clip, and the last frame equals the first.
+
+The same body with 40 randomly chosen female clip dictionaries (240 clips) exports without error.
+The Khronos glTF Validator reports no errors, warnings or infos on any of the 40 files, and the
+three.js checks above pass on all 240 clips.
+
+No textures are exported. A part binds to the one skeleton given, so clothing whose cloth bones
+are not in it does not bind (see the table).
+## Skinned GLB export
+
+`tools/skinned_glb.py` writes one skinned glTF 2.0 binary from a decoded ped skeleton
+`model.json` and one or more decoded drawable directories. It reads the drawable's palette
+(`grmModel + 0x20`), maps each palette hash through the drawable's own skeleton/string table
+and then the ped table, and reads the 8-influence streams from the graphics buffer. The
+section offsets are also in `drawable.buffers[vertex_buffer].mesh_blob.sections` as
+`[semantic, offset, format]`; the 23-word mesh-block header encodes
+`offset = (word >> 8) * 2`, `format = word & 0xFF`.
+
+| Component | Slot | Stream | Offset | Format | Bytes |
+|---|---|---:|---:|---:|---:|
+| head | 8 | `JOINTS_0`, 4 x u8 | 215,720 | `0x25` | 35,932 |
+| head | 9 | `JOINTS_1`, 4 x u8 | 251,652 | `0x25` | 35,932 |
+| head | 6 | `WEIGHTS_0`, 4 x u8 UNORM | 143,856 | `0x26` | 35,932 |
+| head | 7 | `WEIGHTS_1`, 4 x u8 UNORM | 179,788 | `0x26` | 35,932 |
+| jacket | 8 | `JOINTS_0` | 275,032 | `0x25` | 39,272 |
+| jacket | 9 | `JOINTS_1` | 314,304 | `0x25` | 39,272 |
+| jacket | 6 | `WEIGHTS_0` | 196,488 | `0x26` | 39,272 |
+| jacket | 7 | `WEIGHTS_1` | 235,760 | `0x26` | 39,272 |
+
+The output has one skin. Its joints are the full ped skeleton plus any drawable-local helper
+joints named by the palette; a palette hash that resolves nowhere is emitted as
+`bone_0x........`, never given an invented name. Every vertex keeps all eight influences as
+`JOINTS_0`/`JOINTS_1` and `WEIGHTS_0`/`WEIGHTS_1`. The source u8 weights sum to 255 and are
+normalised to 1.0. Bind and inverse-bind matrices use the same Z-up to Y-up conversion as
+positions, `(x, y, z) -> (x, z, -y)`.
+
+```bash
+python -I tools/skinned_glb.py out.glb \
+    --skeleton <ped>/model.json \
+    --component <head>/model.json \
+    --component <jacket>/model.json
+```
+
+The measured head/jacket export uses 596 ped joints plus 107 garment helper joints (703
+total). This is a static-export skip: only the components named on the command line are
+exported, and no body or other unrequested component is assembled. No game data or generated
+GLB is stored in the repository; `tests/test_skinned_glb.py` builds its own skeleton, skin
+buffer and GLB.
+
 ## Texture parameter split
 
 The character material blocks carry several 32-bit parameter hashes before each 64-bit asset
@@ -193,10 +329,10 @@ key. Across the measured character materials, the texture content separates clea
 | Parameter | Common formats | Measured role |
 |---|---|---|
 | `0xC8E8C282` | BC1/BC3/BC7 sRGB, some BC1/BC7 UNORM | **sRGB albedo** when present |
-| `0xC6F46E79` | BC7 UNORM, BC1 UNORM | tangent-space normal map |
-| `0x1E77BF4C` | BC5 UNORM, some BC1/BC7 | normal/detail normal |
-| `0x739E3D0D` | BC7 UNORM, some BC1 | ORM/mask |
-| `0x8ADB8480` | BC4 UNORM | mask |
+| `0xC6F46E79` | BC7 UNORM, BC1 UNORM | `speculartex`: specular/gloss (packed), not a normal map |
+| `0x1E77BF4C` | BC5 UNORM, some BC1/BC7 | `bumptex`: tangent-space normal/detail normal |
+| `0x739E3D0D` | BC7 UNORM, some BC1 | `speculartex2`: ORM/mask (packed) |
+| `0x8ADB8480` | BC4 UNORM | `materialid`: ID/palette map |
 
 This is a measured corpus split, not a claim that the hashes are globally unique semantics.
 The practical rule for exporters: use `0xC8E8C282` as albedo, and **do not fall back to the
@@ -256,10 +392,25 @@ The model binding is also decoded. `PERSCHARS_INFO` (`data.rpf@0x1AA5F000`, reco
 (`packs.rpf@0x11D1FF000`, record 1219) maps that link to `cs_mandy` (`0xD7C0CDFF`). `cs_mandy`
 is a live model id — a `story000.rpf` cutscene actor/voice table uses it — but there is **no
 named `cs_mandy` drawable**. Its 64-bit `ModelName` is `0x009B33B7D7C0CDFF`, and its `FragName`
-`0xC9888B65009B33B7` is byte-identical to `cs_lucia` and `cs_monalisa`: the shared female
-cutscene-ped fragment set. The realistic full-body in that family is `cs_lucia_legacypedcs`
+`0xC9888B65009B33B7` is the shared female cutscene base, carried by **904** female rows:
+`player_story000_00` (Lucia's model id `0xE472B687`), `cs_monalisa` (`0x9CB9BCC6`) and
+`cs_mandy` (`0xD7C0CDFF`), plus 901 others. No ped-model row carries `joaat("cs_lucia")`
+(`0x95F1E309`); that is a name prefix, not a model id. A second base
+`0x0A704516C676E805` is shared by `cs_shanese` (`0x3570D92E`) and 11 unnamed female rows, and
+8 female models have wholly model-specific fragments. None resolves to a name, and neither
+table contains an adult-token, `mp_f_*`, `nude`, `topless`, `stripper`, `prostitute`, `dancer`,
+`escort`, `hooker`, `swim`, `lingerie` or `club` female model. The realistic full-body in the
+shared base is `cs_lucia_legacypedcs`
 (874 v), so Mandy uses the same body as Lucia. Her nine-entry variation table has 18 u32 hashes;
-16 are unique to her, but none resolves to a shipped drawable or texture name.
+16 are unique to her. A deeper search — 373,484 shipped names / 725,869 normalised variants plus
+about 25 million generated strings — gives **0/18** exact matches. The sibling nine-entry table
+resolves 9 of 18 values to `joaat("outfit_01")` … `joaat("outfit_10")` (frequency corroborates
+it), so the table stores build-time design labels, not shipped asset names; the 18 component
+values are not recoverable by name enumeration. `common.rpf` contains one variation manager,
+`CPedVariationBodyTypeManager` (77,422 bytes, 67 keys). Its keys are literal model names;
+`joaat32` of all 67 keys gives 0 hits against the 18. The `3cba3fe6` float (0.942 / 0.971 for
+Lucia and Monalisa) is a body/height scale, not a name. There is no component/outfit-name
+manager in `common.rpf`; `outfit_NN` exists only as a hash in the packs table.
 
 The entities linked to Mandy carry three different per-state archetype hashes
 (`0x18BB2550`, `0x73E83886`, `0x57DDFFC2`), which fits her outfit changing between states, not
@@ -284,12 +435,16 @@ reproduce them with a standard zlib/RPF9 reader:
 
 1. Inflate the `.#ft` stream at `0x45449F70`; parse the 4,095-slot hash table and the
    NUL-separated names; verify `joaat32` lowercased.
-2. Inflate the following 131,072-byte graphics page at `0x4544F010`; parse 597 records at
-   `0x150 + 0x50*i`; read `u16 parent` at +0x06.
-3. For a character `#dr` system page, read `grmModel+0x20`, then the `u32` bone hashes.
+2. Inflate the following 131,072-byte graphics page at `0x4544F010`; parse the records at
+   `0x110 + 0x50*i`: rotation at +0x00, translation at +0x10, hash at +0x1C, parent at +0x46
+   (see the correction above). `tools/anim_glb.py` reads the same records through the
+   skeleton header at drawable `+0x18`.
+3. For a character `#dr` system page, read `grmModel+0x28`, then the `u32` bone hashes.
 4. Map each hash through step 1; unresolved hashes are hash-only fallbacks.
 5. Run `python -I tools/skin_streams.py <your copy's packs.rpf> [...] --json out.json` for the
    skin-stream census and validation; `python -I tests/test_skin_streams.py` runs the same walk
    and the same checks on synthetic resources built by the test.
+6. Run `python -I tools/anim_glb.py ... --coverage` (above) for the clip-track counts, and
+   `python -I tests/test_anim_glb.py` for the export on synthetic skeleton, part and clip data.
 
 No archive, model, texture or audio file is stored in the repository or in any test fixture.

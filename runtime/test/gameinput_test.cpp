@@ -130,8 +130,11 @@ void CALLBACK on_device(GameInputCallbackToken token, void*, IGameInputDevice* d
                         uint32_t previous) {
     g_device_events.push_back({device, current, previous, token});
 }
+DWORD g_reading_sleep_ms = 0;  // makes on_reading slow, for the Dispatch quota checks
+
 void CALLBACK on_reading(GameInputCallbackToken, void*, IGameInputReading* reading, bool) {
     if (reading) ++g_reading_events;
+    if (g_reading_sleep_ms) Sleep(g_reading_sleep_ms);
 }
 void CALLBACK on_guide(GameInputCallbackToken, void*, IGameInputDevice*, uint64_t, bool pressed) {
     g_guide_events.push_back(pressed);
@@ -393,6 +396,33 @@ void test_keyboard_pad_sticks(IGameInput* input, IGameInputDevice* kb) {
     }
     check(monotonic && polls < 100 && sticks_at_rest(st), "keyboard pad: right stick decays to 0 when the mouse stops");
 
+    // LEONIDA_MOUSE_SENSITIVITY scales the axis units per count: 2 doubles, 0.5 halves; out of range clamps.
+    auto settle = [&] {
+        for (int i = 0; i < 200 && !sticks_at_rest(pad_state(input, kb)); ++i) rt::gameinput::poll();
+    };
+    set_env("LEONIDA_MOUSE_SENSITIVITY", "2");
+    rt::gameinput::reload_config();
+    g_cursor_x += 10;
+    rt::gameinput::poll();
+    check(approx(pad_state(input, kb).rightThumbstickX, 20480 / 32767.0f), "keyboard pad: mouse sensitivity 2 doubles the stick");
+    settle();
+    set_env("LEONIDA_MOUSE_SENSITIVITY", "0.5");
+    rt::gameinput::reload_config();
+    g_cursor_x -= 10;
+    rt::gameinput::poll();
+    check(approx(pad_state(input, kb).rightThumbstickX, -5120 / 32767.0f), "keyboard pad: mouse sensitivity 0.5 halves the stick");
+    settle();
+    set_env("LEONIDA_MOUSE_SENSITIVITY", "100");
+    rt::gameinput::reload_config();
+    check(rt::gameinput::config().mouse_sensitivity == 10.0f, "keyboard pad: mouse sensitivity clamps to 10");
+    set_env("LEONIDA_MOUSE_SENSITIVITY", "0");
+    rt::gameinput::reload_config();
+    check(approx(rt::gameinput::config().mouse_sensitivity, 0.1f), "keyboard pad: mouse sensitivity clamps to 0.1");
+    set_env("LEONIDA_MOUSE_SENSITIVITY", nullptr);
+    rt::gameinput::reload_config();
+    check(rt::gameinput::config().mouse_sensitivity == 1.0f && rt::gameinput::config().ds_trigger_gain == 1.0f,
+          "keyboard pad: mouse sensitivity defaults to 1 and leaves the trigger gain alone");
+
     g_keys[VK_RBUTTON] = true;
     rt::gameinput::poll();
     st = pad_state(input, kb);
@@ -608,6 +638,20 @@ void test_aggregate_device(IGameInput* input) {
         IGameInputReading* r = nullptr;
         check(input->GetCurrentReading(GameInputKindGamepad, agg, &r) == GAMEINPUT_E_READING_NOT_FOUND && !r,
               "aggregate device returns READING_NOT_FOUND when no pads are connected");
+        check(input->GetCurrentReading(GameInputKindKeyboard, agg, &r) == GAMEINPUT_E_READING_NOT_FOUND && !r,
+              "aggregate device returns READING_NOT_FOUND for kind mismatch with no pads");
+
+        // Callback registration guards for aggregate device
+        GameInputCallbackToken reading_tok = 0xbeef;
+        check(input->RegisterReadingCallback(agg, GameInputKindGamepad, 0.0f, nullptr, on_reading, &reading_tok) == E_NOTIMPL &&
+                  reading_tok == kInvalidCallbackToken,
+              "RegisterReadingCallback rejects aggregate device with E_NOTIMPL and invalid token");
+
+        GameInputCallbackToken device_tok = 0xbeef;
+        check(input->RegisterDeviceCallback(agg, GameInputKindGamepad, GameInputDeviceConnected,
+                                            GameInputBlockingEnumeration, nullptr, on_device, &device_tok) == E_NOTIMPL &&
+                  device_tok == kInvalidCallbackToken,
+              "RegisterDeviceCallback rejects aggregate device with E_NOTIMPL and invalid token");
 
         // Attach a virtual pad and verify aggregate device yields readings from it
         Pad xbox;
@@ -623,6 +667,10 @@ void test_aggregate_device(IGameInput* input) {
             check(buttons_of(r) == GameInputGamepadA, "aggregate device reading reflects pad input state");
             r->Release();
         }
+
+        IGameInputReading* r_mismatch = nullptr;
+        check(input->GetCurrentReading(GameInputKindKeyboard, agg, &r_mismatch) == GAMEINPUT_E_READING_NOT_FOUND && !r_mismatch,
+              "aggregate device rejects kind mismatch even when pad is connected");
 
         SDL_SetJoystickVirtualButton(xbox.js, SDL_GAMEPAD_BUTTON_SOUTH, false);
         rt::gameinput::poll();
@@ -716,6 +764,324 @@ void test_twins(IGameInput* input) {
     for (Pad& p : pads) detach(p);
     rt::gameinput::poll();
     check(rt::gameinput::connected_count() == 0, "twins: removed at the end");
+}
+
+// ---- force feedback and haptic motors: a fake SDL haptic backend ----
+// SDL's virtual joysticks report no haptics, so the shim's haptic calls go through this table instead. It records what
+// the shim asked SDL to do and reports the capabilities a force-feedback wheel has.
+struct FakeHaptic {
+    uint32_t features = SDL_HAPTIC_CONSTANT | SDL_HAPTIC_SINE | SDL_HAPTIC_SQUARE | SDL_HAPTIC_TRIANGLE |
+                        SDL_HAPTIC_SAWTOOTHUP | SDL_HAPTIC_SAWTOOTHDOWN | SDL_HAPTIC_RAMP | SDL_HAPTIC_SPRING |
+                        SDL_HAPTIC_FRICTION | SDL_HAPTIC_DAMPER | SDL_HAPTIC_INERTIA;
+    int max_effects = 8;
+    int opens = 0, closes = 0, creates = 0, updates = 0, runs = 0, stops = 0, destroys = 0;
+    int gain_calls = 0, last_gain = -1;
+    uint32_t last_iterations = 0;
+    SDL_HapticEffect last{};
+};
+FakeHaptic g_fake;
+bool g_fake_open = false;  // pads attached while this is set are opened as haptic devices
+
+void* fake_open(void*) {
+    if (!g_fake_open) return nullptr;
+    ++g_fake.opens;
+    return &g_fake;
+}
+void fake_close(void*) { ++g_fake.closes; }
+uint32_t fake_features(void* h) { return static_cast<FakeHaptic*>(h)->features; }
+int fake_max_effects(void* h) { return static_cast<FakeHaptic*>(h)->max_effects; }
+int fake_create(void* h, const void* e) {
+    FakeHaptic* f = static_cast<FakeHaptic*>(h);
+    ++f->creates;
+    f->last = *static_cast<const SDL_HapticEffect*>(e);
+    return 1;
+}
+bool fake_update(void* h, int, const void* e) {
+    FakeHaptic* f = static_cast<FakeHaptic*>(h);
+    ++f->updates;
+    f->last = *static_cast<const SDL_HapticEffect*>(e);
+    return true;
+}
+bool fake_run(void* h, int, uint32_t iterations) {
+    FakeHaptic* f = static_cast<FakeHaptic*>(h);
+    ++f->runs;
+    f->last_iterations = iterations;
+    return true;
+}
+bool fake_stop(void* h, int) {
+    ++static_cast<FakeHaptic*>(h)->stops;
+    return true;
+}
+void fake_destroy(void* h, int) { ++static_cast<FakeHaptic*>(h)->destroys; }
+bool fake_gain(void* h, int gain) {
+    FakeHaptic* f = static_cast<FakeHaptic*>(h);
+    ++f->gain_calls;
+    f->last_gain = gain;
+    return true;
+}
+const rt::gameinput::HapticApi kFakeHaptic{fake_open,    fake_close, fake_features, fake_max_effects, fake_create,
+                                           fake_update,  fake_run,   fake_stop,     fake_destroy,    fake_gain};
+
+// The motors of one device, and the effect object its force-feedback motor hands out. Runs with no other pad.
+void test_force_feedback(IGameInput* input) {
+    rt::gameinput::set_haptic_source(&kFakeHaptic);
+    g_fake = {};
+    g_fake_open = true;
+    Pad wheel;
+    attach(wheel, "Leonida virtual wheel", 0x046D, 0xC24F, false);
+    const size_t before = g_device_events.size();
+    rt::gameinput::poll();
+    IGameInputDevice* dev = g_device_events.size() > before ? g_device_events.back().device : nullptr;
+    check(dev && rt::gameinput::connected_count() == 1 && g_fake.opens == 1,
+          "force feedback: the pad's joystick is opened as an SDL haptic device");
+    if (!dev) return;
+    dev->AddRef();
+    rt::gameinput::OutputState out{};
+    check(rt::gameinput::output_state(0, &out) && out.force_feedback, "force feedback: the output state says so");
+    IGameInputReading* r = current(input, dev);
+    check(r != nullptr, "force feedback: the pad still reads normally with a haptic device open");
+    if (r) r->Release();
+
+    const GameInputDeviceInfo* info = dev->GetDeviceInfo();
+    check(info->forceFeedbackMotorCount == 1 && info->forceFeedbackMotorInfo != nullptr,
+          "force feedback: the device reports one force-feedback motor");
+    const GameInputForceFeedbackMotorInfo* motor =
+        static_cast<const GameInputForceFeedbackMotorInfo*>(info->forceFeedbackMotorInfo);
+    check(motor->supportedAxes == GameInputFeedbackAxisLinearX && motor->location == GameInputLocationChassis &&
+              motor->maxSimultaneousEffects == 8,
+          "force feedback: motorInfo carries the axis, the location and the effect limit");
+    check(motor->isConstantEffectSupported && motor->isRampEffectSupported && motor->isSpringEffectSupported &&
+              motor->isSawtoothDownWaveEffectSupported,
+          "force feedback: the effect kinds come from SDL's feature bits");
+    check(info->hapticFeedbackMotorCount == 0, "force feedback: a wheel without trigger motors reports no haptics");
+    check(dev->IsForceFeedbackMotorPoweredOn(0) && !dev->IsForceFeedbackMotorPoweredOn(1),
+          "force feedback: motor 0 is powered on, and motor 1 does not exist");
+
+    IGameInputForceFeedbackEffect* effect = nullptr;
+    GameInputForceFeedbackParams params{};
+    params.kind = GameInputForceFeedbackConstant;
+    params.data.constant.magnitude.linearX = 0.5f;
+    check(dev->CreateForceFeedbackEffect(1, &params, reinterpret_cast<void**>(&effect)) == E_INVALIDARG && !effect,
+          "force feedback: motor 1 does not exist");
+    check(dev->CreateForceFeedbackEffect(0, &params, nullptr) == E_POINTER, "force feedback: a null effect is E_POINTER");
+    check(dev->CreateForceFeedbackEffect(0, nullptr, reinterpret_cast<void**>(&effect)) == E_INVALIDARG,
+          "force feedback: null parameters are E_INVALIDARG");
+    GameInputForceFeedbackParams unknown{};
+    unknown.kind = static_cast<GameInputForceFeedbackEffectKind>(11);
+    check(dev->CreateForceFeedbackEffect(0, &unknown, reinterpret_cast<void**>(&effect)) == E_INVALIDARG,
+          "force feedback: an effect kind outside the enum is E_INVALIDARG");
+    check(dev->CreateForceFeedbackEffect(0, &params, reinterpret_cast<void**>(&effect)) == S_OK && effect,
+          "force feedback: CreateForceFeedbackEffect");
+    if (!effect) {  // leave nothing behind for the next test
+        detach(wheel);
+        dev->Release();
+        rt::gameinput::poll();
+        rt::gameinput::set_haptic_source(nullptr);
+        return;
+    }
+    check(effect->GetMotorIndex() == 0 && approx(effect->GetGain(), 1.0f) && effect->GetState() == GameInputFeedbackRunning,
+          "force feedback: a new effect is on motor 0, at full gain, running");
+    IGameInputDevice* owner = nullptr;
+    effect->GetDevice(&owner);
+    check(owner == dev, "force feedback: the effect names its device");
+    if (owner) owner->Release();
+
+    // Nothing is asked of SDL before the poll thread runs: the title only wrote the parameters.
+    const int runs0 = g_fake.runs;
+    rt::gameinput::poll();
+    check(g_fake.creates == 1 && g_fake.runs == runs0 + 1, "force feedback: the poll thread creates and runs the effect");
+    check(g_fake.last.type == SDL_HAPTIC_CONSTANT && g_fake.last.constant.level == 16384,
+          "force feedback: a constant 0.5 becomes SDL_HAPTIC_CONSTANT level 16384");
+    check(g_fake.last.constant.length == 60000 && g_fake.last_iterations == 0,
+          "force feedback: no duration in GameInput is SDL's 60 s hold, run until stopped");
+    rt::gameinput::poll();
+    check(g_fake.runs == runs0 + 1, "force feedback: an unchanged effect is not re-sent every poll");
+
+    params.data.constant.magnitude.linearX = -1.0f;
+    check(effect->SetParams(&params), "force feedback: SetParams");
+    rt::gameinput::poll();
+    check(g_fake.updates == 1 && g_fake.runs == runs0 + 2 && g_fake.last.constant.level == -32767,
+          "force feedback: changed parameters update the SDL effect once");
+    GameInputForceFeedbackParams read{};
+    effect->GetParams(&read);
+    check(read.kind == GameInputForceFeedbackConstant && read.data.constant.magnitude.linearX == -1.0f,
+          "force feedback: GetParams returns what was set");
+
+    effect->SetGain(0.5f);
+    rt::gameinput::poll();
+    check(approx(effect->GetGain(), 0.5f) && g_fake.last.constant.level == -16384,
+          "force feedback: the effect's gain scales the SDL level");
+    // The device gain is SDL's, sent once when the pad is opened (100) and once per change.
+    check(g_fake.last_gain == 100 && g_fake.gain_calls == 1, "force feedback: the device gain starts at SDL's full 100");
+    dev->SetForceFeedbackMotorGain(0, 0.5f);
+    rt::gameinput::poll();
+    check(g_fake.last_gain == 50 && g_fake.gain_calls == 2,
+          "force feedback: SetForceFeedbackMotorGain sets SDL's device gain once");
+    dev->SetForceFeedbackMotorGain(0, 1.0f);
+    effect->SetGain(1.0f);
+    rt::gameinput::poll();
+    check(g_fake.last_gain == 100, "force feedback: the master gain follows the request");
+
+    // A wave with GameInput's envelope: 50 Hz for 90 degrees over 100 ms, played once.
+    GameInputForceFeedbackParams wave{};
+    wave.kind = GameInputForceFeedbackSineWave;
+    wave.data.sineWave.envelope.sustainDuration = 100'000;  // microseconds
+    wave.data.sineWave.envelope.sustainGain = 1.0f;
+    wave.data.sineWave.envelope.playCount = 1;
+    wave.data.sineWave.magnitude.linearX = 1.0f;
+    wave.data.sineWave.frequency = 50.0f;
+    wave.data.sineWave.phase = 90.0f;
+    check(effect->SetParams(&wave), "force feedback: SetParams for a sine wave");
+    rt::gameinput::poll();
+    check(g_fake.last.type == SDL_HAPTIC_SINE && g_fake.last.periodic.period == 20 &&
+              g_fake.last.periodic.magnitude == 32767 && g_fake.last.periodic.phase == 9000,
+          "force feedback: a 50 Hz sine with a 90 degree phase becomes SDL's period and hundredths of a degree");
+    check(g_fake.last.periodic.length == 100 && g_fake.last_iterations == 1,
+          "force feedback: the envelope's 100 ms is SDL's length and its playCount the iteration count");
+    Sleep(130);
+    rt::gameinput::poll();
+    check(effect->GetState() == GameInputFeedbackStopped && g_fake.stops >= 1,
+          "force feedback: an effect that ran its duration reports stopped");
+
+    // A condition effect: coefficients, saturations, dead zone and centre.
+    GameInputForceFeedbackParams spring{};
+    spring.kind = GameInputForceFeedbackSpring;
+    spring.data.spring.magnitude.linearX = 0.5f;
+    spring.data.spring.positiveCoefficient = 0.5f;
+    spring.data.spring.negativeCoefficient = 0.25f;
+    spring.data.spring.maxPositiveMagnitude = 1.0f;
+    spring.data.spring.maxNegativeMagnitude = 0.5f;
+    spring.data.spring.deadZone = 0.1f;
+    check(effect->SetParams(&spring), "force feedback: SetParams for a spring");
+    effect->SetState(GameInputFeedbackRunning);
+    rt::gameinput::poll();
+    check(g_fake.last.type == SDL_HAPTIC_SPRING && g_fake.last.condition.right_coeff[0] == 16384 &&
+              g_fake.last.condition.left_coeff[0] == -8192 && g_fake.last.condition.right_sat[0] == 65535 &&
+              g_fake.last.condition.left_sat[0] == 32768 && g_fake.last.condition.deadband[0] == 6554 &&
+              g_fake.last.condition.center[0] == 16384,
+          "force feedback: a spring maps its coefficients, saturations, dead zone and centre");
+
+    effect->SetState(GameInputFeedbackPaused);
+    const int stops0 = g_fake.stops;
+    rt::gameinput::poll();
+    check(g_fake.stops == stops0 + 1 && effect->GetState() == GameInputFeedbackPaused,
+          "force feedback: a paused effect is stopped in SDL");
+
+    // LEONIDA_RUMBLE=0 silences this path too: a running effect is stopped, and it runs again when the mute lifts.
+    effect->SetState(GameInputFeedbackRunning);
+    rt::gameinput::poll();
+    const int runs1 = g_fake.runs, stops1 = g_fake.stops;
+    check(g_fake.runs == runs1, "force feedback: the effect is running before the mute");
+    set_env("LEONIDA_RUMBLE", "0");
+    rt::gameinput::reload_config();
+    rt::gameinput::poll();
+    check(g_fake.runs == runs1 && g_fake.stops == stops1 + 1, "force feedback: LEONIDA_RUMBLE=0 stops the effect");
+    set_env("LEONIDA_RUMBLE", nullptr);
+    rt::gameinput::reload_config();
+    rt::gameinput::poll();
+    check(g_fake.runs == runs1 + 1, "force feedback: and it runs again once the mute is lifted");
+
+    check(effect->Release() == 0, "force feedback: the effect is freed once the title releases it");
+    rt::gameinput::poll();
+    check(g_fake.destroys == 1, "force feedback: its SDL effect is destroyed on the poll thread");
+
+    detach(wheel);
+    rt::gameinput::poll();
+    check(g_fake.closes == 1 && !dev->IsForceFeedbackMotorPoweredOn(0),
+          "force feedback: unplugging closes the haptic device");
+    dev->Release();
+
+    // A pad SDL opens no haptic device for keeps the old answer: no motor, and no effect.
+    g_fake_open = false;
+    Pad plain;
+    attach(plain, "Leonida virtual plain pad", 0x045E, 0x02FF, false);
+    const size_t plain_before = g_device_events.size();
+    rt::gameinput::poll();
+    IGameInputDevice* plaindev = g_device_events.size() > plain_before ? g_device_events.back().device : nullptr;
+    check(plaindev && plaindev->GetDeviceInfo()->forceFeedbackMotorCount == 0 &&
+              plaindev->GetDeviceInfo()->forceFeedbackMotorInfo == nullptr,
+          "force feedback: a pad without SDL haptics reports no motor");
+    if (plaindev) {
+        effect = nullptr;
+        check(plaindev->CreateForceFeedbackEffect(0, &params, reinterpret_cast<void**>(&effect)) == E_INVALIDARG && !effect,
+              "force feedback: so CreateForceFeedbackEffect is E_INVALIDARG");
+        check(!plaindev->IsForceFeedbackMotorPoweredOn(0), "force feedback: and no motor is powered on");
+    }
+    detach(plain);
+    rt::gameinput::poll();
+    rt::gameinput::set_haptic_source(nullptr);
+}
+
+// The trigger haptic motors of a pad that has them. Runs with no other pad.
+void test_haptic_motors(IGameInput* input) {
+    set_env("LEONIDA_DS_TRIGGERS", nullptr);
+    rt::gameinput::reload_config();
+    Pad xbox;
+    attach(xbox, "Leonida virtual Xbox pad", 0x045E, 0x0B12, true);
+    const size_t before = g_device_events.size();
+    rt::gameinput::poll();
+    IGameInputDevice* dev = g_device_events.size() > before ? g_device_events.back().device : nullptr;
+    check(dev && rt::gameinput::connected_count() == 1, "haptics: the pad with trigger motors is connected");
+    if (!dev) return;
+    dev->AddRef();
+    const GameInputDeviceInfo* info = dev->GetDeviceInfo();
+    check(info->hapticFeedbackMotorCount == 2 && info->hapticFeedbackMotorInfo != nullptr,
+          "haptics: the pad reports two haptic motors");
+    const GameInputHapticFeedbackMotorInfo* motors =
+        static_cast<const GameInputHapticFeedbackMotorInfo*>(info->hapticFeedbackMotorInfo);
+    check(motors[0].mappedRumbleMotors == GameInputRumbleLeftTrigger &&
+              motors[1].mappedRumbleMotors == GameInputRumbleRightTrigger && motors[0].waveformCount == 1 &&
+              motors[0].waveformInfo != nullptr && motors[0].waveformInfo->isIntensitySupported,
+          "haptics: they are the left and right trigger, one waveform each, an intensity");
+    check(sticks_at_rest(pad_state(input, dev)), "haptics: the pad still reads normally");
+
+    GameInputHapticFeedbackParams p{};
+    p.intensity = 0.5f;
+    p.duration = 100'000;  // microseconds
+    p.playCount = 1;
+    check(dev->SetHapticMotorState(2, &p) == E_INVALIDARG, "haptics: motor 2 does not exist");
+    GameInputHapticFeedbackParams other_wave = p;
+    other_wave.waveformIndex = 1;
+    check(dev->SetHapticMotorState(0, &other_wave) == E_INVALIDARG, "haptics: waveform 1 does not exist");
+    check(dev->SetHapticMotorState(0, &p) == S_OK, "haptics: SetHapticMotorState on the left trigger");
+    rt::gameinput::poll();
+    check(xbox.left == 32768 && xbox.right == 0, "haptics: the intensity reaches the trigger motor");
+    Sleep(130);
+    rt::gameinput::poll();
+    check(xbox.left == 0, "haptics: the request ends with its duration");
+
+    p.intensity = 1.0f;
+    p.playCount = 0;  // until changed
+    check(dev->SetHapticMotorState(1, &p) == S_OK, "haptics: playCount 0 plays until changed");
+    rt::gameinput::poll();
+    check(xbox.right == 65535 && xbox.left == 0, "haptics: the right trigger takes its own motor");
+    Sleep(130);
+    rt::gameinput::poll();
+    check(xbox.right == 65535, "haptics: and keeps playing past the duration");
+    check(dev->SetHapticMotorState(1, nullptr) == S_OK, "haptics: a null state stops the motor");
+    rt::gameinput::poll();
+    check(xbox.right == 0 && xbox.left == 0, "haptics: both triggers are silent again");
+
+    // SetRumbleState still works on the same pad, and the two share the trigger output.
+    GameInputRumbleParams rumble{0, 0, 0.25f, 0};
+    dev->SetRumbleState(&rumble);
+    rt::gameinput::poll();
+    check(xbox.left == 16384, "haptics: SetRumbleState still drives the trigger motor");
+    p.intensity = 1.0f;
+    p.playCount = 1;
+    p.duration = 0;  // no deadline at playCount 1 either: the level holds until it is set again
+    dev->SetHapticMotorState(0, &p);
+    rt::gameinput::poll();
+    check(xbox.left == 65535, "haptics: the stronger of the two wins on one trigger");
+    dev->SetRumbleState(nullptr);
+    dev->SetHapticMotorState(0, nullptr);
+    rt::gameinput::poll();
+    check(xbox.left == 0, "haptics: releasing both leaves the trigger silent");
+
+    detach(xbox);
+    rt::gameinput::poll();
+    check(rt::gameinput::connected_count() == 0, "haptics: detached");
+    dev->Release();
 }
 
 }  // namespace
@@ -979,6 +1345,32 @@ int main() {
     check(wait && WaitForSingleObject(wait, 0) == WAIT_OBJECT_0, "the wait handle is signalled");
     if (dispatcher) dispatcher->Dispatch(1000);
     check(g_reading_events > before_dispatch, "Dispatch runs them");
+
+    // The quota: Dispatch runs at least one queued event, takes no more once the quota has passed, and returns whether
+    // events remain (re-signalling the wait handle). Four button changes queue four reading events.
+    auto queue_changes = [&](int n) {
+        for (int i = 0; i < n; ++i) {
+            SDL_SetJoystickVirtualButton(xbox.js, SDL_GAMEPAD_BUTTON_NORTH, i % 2 == 1);  // NORTH is down now: up, down, up, down
+            rt::gameinput::poll();
+        }
+    };
+    if (dispatcher) {
+        while (dispatcher->Dispatch(UINT64_MAX)) {}
+        queue_changes(4);
+        int before_quota = g_reading_events;
+        if (wait) WaitForSingleObject(wait, 0);  // consume the signal from queueing
+        check(dispatcher->Dispatch(0) && g_reading_events == before_quota + 1, "Dispatch(0) runs exactly one event and reports more");
+        check(wait && WaitForSingleObject(wait, 0) == WAIT_OBJECT_0, "the wait handle is signalled again while events remain");
+        g_reading_sleep_ms = 5;
+        before_quota = g_reading_events;
+        check(dispatcher->Dispatch(1000) && g_reading_events == before_quota + 1,
+              "a 1 ms quota stops after a 5 ms callback and reports more");
+        g_reading_sleep_ms = 0;
+        before_quota = g_reading_events;
+        check(!dispatcher->Dispatch(1'000'000) && g_reading_events >= before_quota + 2,
+              "a large quota drains the queue and returns false");
+        check(!dispatcher->Dispatch(0), "Dispatch on an empty queue returns false");
+    }
     if (wait) CloseHandle(wait);
     if (dispatcher) dispatcher->Release();
 
@@ -1062,6 +1454,17 @@ int main() {
     check(input->GetPreviousReading(idle, GameInputKindGamepad, dev, nullptr) == E_POINTER &&
               input->GetPreviousReading(nullptr, GameInputKindGamepad, dev, &hit) == E_INVALIDARG && !hit,
           "history: a null output is E_POINTER, a null reference E_INVALIDARG");
+    // GetTemporalReading: E_NOTIMPL with a null reading, as GameInput v0 itself, for a timestamp in the history, one
+    // before it and the current time, with and without a device filter.
+    const uint64_t idle_us = idle->GetTimestamp();
+    bool temporal_notimpl = true;
+    for (const uint64_t at : {idle_us, idle_us - 1'000'000, input->GetCurrentTimestamp()})
+        for (IGameInputDevice* filter : {dev, static_cast<IGameInputDevice*>(nullptr)}) {
+            IGameInputReading* temporal = idle;  // a stale value the call must clear
+            temporal_notimpl &= input->GetTemporalReading(at, filter, &temporal) == E_NOTIMPL && !temporal;
+        }
+    check(temporal_notimpl && input->GetTemporalReading(idle_us, dev, nullptr) == E_POINTER,
+          "history: GetTemporalReading is E_NOTIMPL with a null reading, as in GameInput v0");
 
     // Two pads in one stream, one poll each: A on the Xbox pad, B on the DualSense, Y on the Xbox pad.
     IGameInputReading* start = current(input, dev);
@@ -1170,6 +1573,8 @@ int main() {
     test_keyboard_pad(input);
     test_motion(input);
     test_aggregate_device(input);
+    test_force_feedback(input);
+    test_haptic_motors(input);
     input->Release();
 
     std::printf("%d checks, %d failures\n", g_checks, g_failures);

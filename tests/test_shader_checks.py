@@ -3,6 +3,7 @@ import ast
 import contextlib
 import io
 import json
+import re
 import struct
 from pathlib import Path
 import sys
@@ -30,12 +31,12 @@ WAVE32_WORDS = {n: w for n, w in check.CS_DUMPS if n in check.WAVE32_DUMPS and n
 
 # All check.py cases, including the four vk_store_test shaders and the three mesh fixtures, and TEST-184's
 # vk_store_test "words" fixtures and image_get_lod draws.
-TOTAL = (len(check.COMPUTE) + 5 + len(check.CS_DUMPS) + len(check.W64X_DUMPS) + len(check.W64X_PARTIAL) + 4
+TOTAL = (len(check.COMPUTE) + 6 + len(check.CS_DUMPS) + len(check.W64X_DUMPS) + len(check.W64X_PARTIAL) + 4
          + len(check.PIXEL_TESTS) + len(check.CLIP_TESTS) + len(check.BOUNDS) + len(check.GLOBAL_OFFSET)
          + len(check.MIP_TEST_PASSES) + len(check.GRADIENT_TESTS)
          + len(check.STORE_WORDS) + len(check.GET_LOD_TESTS)
-         + len(check.TEXTURE_CONSTANTS) + 11)  # three mesh fixtures, ps_tex, ps_imgatomic, five compute fixtures and
-         # ps_ssharp
+         + len(check.TEXTURE_CONSTANTS) + 12)  # three mesh fixtures, ps_tex, ps_imgatomic, five compute fixtures,
+         # ps_ssharp and vs_base_ids
 CVT = {bits: [u, s] for bits, u, s in check.CVT_F32_SAT_CASES}
 
 
@@ -70,6 +71,10 @@ class Wave64Checks(unittest.TestCase):
             if name == "cs_fmt_sint32":
                 self.assertEqual((args, env["VKC_OUT_WORDS"]), (("1", "dump"), "64"))
                 Path(env["VKC_DUMP"]).write_bytes(struct.pack("<64I", *check.FMT_SINT32_WORDS))
+                return 0, ""
+            if name == "cs_fmt_int_narrow":
+                self.assertEqual((args, env["VKC_OUT_WORDS"]), (("1", "dump"), "136"))
+                Path(env["VKC_DUMP"]).write_bytes(struct.pack("<136I", *check.FMT_INT_NARROW_WORDS))
                 return 0, ""
             if name in ("cs_fmt_xy_xyz", "cs_tbuffer_store"):
                 self.assertEqual((args, env["VKC_OUT_WORDS"]), (("1", "dump"), "192"))
@@ -157,6 +162,7 @@ class Wave64Checks(unittest.TestCase):
                   patch.object(check, "bindless_test", return_value=""), patch.object(check, "W64_EMULATED", emulated),
                   patch.object(check, "texture_gradient_a16_test", return_value=""),
                   patch.object(check, "texture_constant_test", return_value=""),
+                  patch.object(check, "base_ids_test", return_value=""),
                   patch.object(check, "get_lod_test", return_value=""),
                   patch.object(check, "sampler_test", return_value=""),
                   contextlib.redirect_stdout(output)):
@@ -358,12 +364,31 @@ class PixelDeviceLimits(unittest.TestCase):
         self.assertIn("64-wide fragment subgroup", problem)
         self.assertIn("8..8", problem)
 
+    def test_wave64_pixel_shader_skips_where_the_harness_says_64_is_not_available(self):
+        # vk_harness.cpp's line for a size the device could not take; it must not read as "64 was required".
+        out = "device: fake (subgroup 32..32)\nfragment subgroup size: 64 not available\nok 64x64\n"
+        problem = self.run_pixel("ps_w64x_readlane", 0, out, data=self.readlane_pixels())
+        self.assertIsInstance(problem, check.Skip)
+        self.assertIn("64-wide fragment subgroup", problem)
+
     def test_wave64_pixel_shader_is_judged_when_64_was_required(self):
-        out = "device: fake (subgroup 32..64)\nfragment subgroup size: 64 required\nok 64x64\n"
+        # The line as vk_harness.cpp prints it when the size took effect: "fragment subgroup size: %u\n".
+        out = "device: fake (subgroup 32..64)\nfragment subgroup size: 64\nok 64x64\n"
         self.assertEqual(self.run_pixel("ps_w64x_readlane", 0, out, data=self.readlane_pixels()), "")
         problem = self.run_pixel("ps_w64x_readlane", 0, out, data=self.readlane_pixels((0, 0, 0, 0)))
         self.assertNotIsInstance(problem, check.Skip)
         self.assertIn("pixels differ", problem)
+
+    def test_wide_pixel_skip_reads_the_line_vk_harness_prints(self):
+        # Keeps the check and the harness in step: the format string is read from vk_harness.cpp, not written here.
+        harness = Path(__file__).resolve().parents[1] / "runtime" / "test" / "vk_harness.cpp"
+        source = harness.read_text(encoding="utf-8")
+        formats = re.findall(r'"(fragment subgroup size: %u[^"]*)\\n"', source)
+        self.assertEqual(sorted(formats), ["fragment subgroup size: %u", "fragment subgroup size: %u not available"])
+        taken, refused = (f.replace("%u", "64") + "\n" for f in sorted(formats))
+        self.assertIsNone(check.wide_pixel_skip("ps_w64x_readlane", "device: fake (subgroup 32..64)\n" + taken))
+        self.assertIsInstance(check.wide_pixel_skip("ps_w64x_readlane", "device: fake (subgroup 32..32)\n" + refused),
+                              check.Skip)
 
     def test_bitmask_perm_skips_when_variable_device_runs_narrow_fragment_subgroup(self):
         out = "device: Intel(R) HD Graphics 530 (subgroup 8..32)\nok 64x64\n"
@@ -464,6 +489,60 @@ class SeededPixelTests(unittest.TestCase):
         self.assertIn("needs bufferDeviceAddress", problem)
 
 
+class SignedZeroUnjudgedWords(unittest.TestCase):
+    """cs_signed_zero_nan's -0 products (words 0, 2 and 3) aren't judged on Apple GPUs, which return +0 for them with
+    or without SignedZeroInfNanPreserve (#1203), and its 0 * inf NaN check (word 5) isn't judged on Mesa llvmpipe,
+    which returns 0 there with or without it (#664). Their other words still are, and every other device judges all."""
+    APPLE_WORDS = [0, 0x80000000, 0, 0, 1, 1, 1, 0x7C00]   # what MoltenVK returned in #664
+    LLVMPIPE = "llvmpipe (LLVM 21.1.8, 256 bits)"
+    LLVMPIPE_WORDS = [0x80000000, 0x80000000, 0x80008000, 0x8000, 1, 0, 1, 0x7C00]   # what llvmpipe returned in #664
+
+    def compute(self, device, words, subgroup="32..32"):
+        out = f"device: {device} (subgroup {subgroup})\nout[0..7] = " + " ".join(map(str, words)) + "\n"
+        with patch.object(check, "run", return_value=(0, out)):
+            return check.compute_test("tools", "spirv", "cs_signed_zero_nan", "1", "dump",
+                                      expected_words=check.SIGNED_ZERO_NAN)
+
+    def test_apple_does_not_judge_the_minus_zero_products(self):
+        self.assertEqual(self.compute("Apple M1 Max", self.APPLE_WORDS), "")
+
+    def test_apple_still_judges_the_nan_checks(self):
+        words = list(self.APPLE_WORDS)
+        words[4] = 0   # an x != x NaN check folded to false, as without the execution mode
+        self.assertNotEqual(self.compute("Apple M1 Max", words), "")
+
+    def test_llvmpipe_does_not_judge_the_zero_times_inf_check(self):
+        self.assertEqual(self.compute(self.LLVMPIPE, self.LLVMPIPE_WORDS, "8..8"), "")
+
+    def test_llvmpipe_still_judges_the_other_words(self):
+        for i, wrong in ((4, 0), (6, 0), (0, 0), (7, 0)):   # a folded NaN check, a lost -0, a lost NaN conversion
+            words = list(self.LLVMPIPE_WORDS)
+            words[i] = wrong
+            self.assertNotEqual(self.compute(self.LLVMPIPE, words, "8..8"), "", i)
+
+    def test_other_devices_judge_every_word(self):
+        self.assertNotEqual(self.compute("AMD Radeon RX 9070 XT", self.APPLE_WORDS), "")
+        self.assertNotEqual(self.compute("AMD Radeon RX 9070 XT", self.LLVMPIPE_WORDS), "")
+        self.assertEqual(self.compute("AMD Radeon RX 9070 XT", check.SIGNED_ZERO_NAN), "")
+
+    def test_only_cs_signed_zero_nan_has_unjudged_words(self):
+        out = "device: Apple M1 Max (subgroup 32..32)\n"
+        self.assertEqual(check.judged_words("cs_store", out, check.CS_STORE), check.CS_STORE)
+
+    def test_run_gpu_tests_uses_the_same_rule(self):
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+        import run_gpu_tests
+        for device, words in (("Apple M1 Max (subgroup 32..32)", self.APPLE_WORDS),
+                              (self.LLVMPIPE + " (subgroup 8..8)", self.LLVMPIPE_WORDS)):
+            msg = f"device: {device}\nout[0..7] = " + " ".join(map(str, words)) + "\n"
+            want = check.judged_words("cs_signed_zero_nan", msg, check.SIGNED_ZERO_NAN)
+            ok, _ = run_gpu_tests.judge_cs_dump(0, msg, want, wave64=False, partial=False, emulated=False)
+            self.assertTrue(ok, device)
+            ok, _ = run_gpu_tests.judge_cs_dump(0, msg, check.SIGNED_ZERO_NAN, wave64=False, partial=False,
+                                                emulated=False)
+            self.assertFalse(ok, device)
+
+
 class TextureMipChecks(unittest.TestCase):
     def test_mip_draw_reports_unsupported_device_and_preserves_other_failures(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -520,7 +599,7 @@ class StoreWordsChecks(unittest.TestCase):
                          {57: 257 + 16, 19: 3, 6: 0xD00D, 39: 239 ^ 0xFF})
         self.assertEqual((volume[44], volume[30]), (244, 230))      # smax with -16 and the missed cmpswap keep theirs
         uint, sint, volume = check.store_words("cs_resinfo")
-        self.assertEqual(uint[:19], [16, 4, 1, 5, 8, 2, 1, 5, 2, 1, 1, 5, 4, 1, 0xABCD, 115, 2, 5, 5])
+        self.assertEqual(uint[:24], [16, 4, 0, 5, 8, 2, 0, 5, 2, 1, 0, 5, 4, 1, 0xABCD, 115, 2, 5, 5, 119, 0, 0, 0, 5])
         self.assertEqual((sint, volume), ([-2 * i & 0xFFFFFFFF for i in range(64)], [200 + i for i in range(64)]))
 
     def test_expected_words_pass_and_any_other_word_fails(self):
@@ -781,7 +860,6 @@ class Wave32LaneDumps(unittest.TestCase):
                 self.assertNotIsInstance(self.run_dump(name, 0, out + self.words(name, flip=True)), check.Skip)
 
 
-
 class SamplerMipChecks(unittest.TestCase):
     """The S#/T# oracle check.py judges vk_sampler_test with, against hand-worked levels."""
 
@@ -811,6 +889,16 @@ class SamplerMipChecks(unittest.TestCase):
             self.assertTrue(check.sampler_mismatch(bytes(bad), words, view).startswith("(63,63):"))
         self.assertIn("bytes", check.sampler_mismatch(good[:-16], words, view))
 
+    def test_nan_in_any_sampler_channel_fails(self) -> None:
+        words, view = check.ssharp_words(1), (0, 1)
+        good = self.image(0, 1)
+        self.assertEqual(check.sampler_mismatch(good, words, view), "")
+        for channel in range(4):
+            with self.subTest(channel=channel):
+                bad = bytearray(good)
+                struct.pack_into("<I", bad, len(good) - 16 + 4 * channel, 0x7FC00000)
+                self.assertTrue(check.sampler_mismatch(bytes(bad), words, view).startswith("(63,63):"))
+
     def test_a_wrong_level_or_swapped_uv_fails_where_predicted(self):
         words, view = check.ssharp_words(1), (0, 1)
         self.assertTrue(check.sampler_mismatch(self.image(1, 1), words, view).startswith("(0,0):"))
@@ -819,14 +907,39 @@ class SamplerMipChecks(unittest.TestCase):
                            for y in range(64) for x in range(64))
         self.assertTrue(check.sampler_mismatch(swapped, words, view).startswith("(32,0):"))
 
+
 if __name__ == "__main__":
     unittest.main()
+
+
+class TexelOffsetFormsChecks(unittest.TestCase):
+    """ps_texoff_forms (image_sample_o, image_sample_b_o, image_gather4_l_o): the judgement of a dump."""
+
+    @staticmethod
+    def dump(words):
+        return b"".join(struct.pack("<4I", *words(i % 64, i // 64)) for i in range(64 * 64))
+
+    def test_the_rule_passes_and_both_samples_are_judged(self):
+        good = self.dump(lambda px, py: check.texoff_words(px, py, "ps_texoff_forms"))
+        problem, covered = check.texoff_problem(good, "device: gpu\n", name="ps_texoff_forms")
+        self.assertEqual(problem, "")
+        self.assertIn("image_sample_b_o", covered)
+        self.assertEqual(check.texoff_words(20, 50, "ps_texoff_forms"), (0x62, 0x62, 0x1221, 0x5566))
+
+    def test_a_dropped_or_swapped_offset_fails(self):
+        for label, broken in (("dropped in .y", lambda px, py: (lambda w: (w[0], 0x44, w[2], w[3]))(
+                                  check.texoff_words(px, py, "ps_texoff_forms"))),
+                              ("swapped in .x", lambda px, py: (lambda w: ((py >> 3) | (px >> 3) << 4, *w[1:]))(
+                                  check.texoff_words(px, py, "ps_texoff_forms")))):
+            with self.subTest(label):
+                problem, _ = check.texoff_problem(self.dump(broken), "device: gpu\n", name="ps_texoff_forms")
+                self.assertIn("pixels differ", problem)
 
 
 class PixelTestRegistry(unittest.TestCase):
     def test_pixel_tests_include_every_pixel_fixture(self):
         # A repeated PIXEL_TESTS assignment silently dropped ps_texoff once; keep the registry explicit.
-        for name in ("ps_texoff", "ps_wqm", "ps_scc_mask32"):
+        for name in ("ps_texoff", "ps_texoff_forms", "ps_wqm", "ps_scc_mask32"):
             with self.subTest(name=name):
                 self.assertIn(name, check.PIXEL_TESTS)
         self.assertEqual(len(check.PIXEL_TESTS), len(set(check.PIXEL_TESTS)))

@@ -72,11 +72,15 @@ def _clean_zero(v: float) -> float:
 def _normalize3(nx: float, ny: float, nz: float) -> tuple[float, float, float]:
     if not (math.isfinite(nx) and math.isfinite(ny) and math.isfinite(nz)):
         return (0.0, 1.0, 0.0)
-    length = math.sqrt(nx * nx + ny * ny + nz * nz)
-    if length <= 0.0 or not math.isfinite(length):
+    length = math.hypot(nx, ny, nz)
+    if length == 0.0:
         return (0.0, 1.0, 0.0)
-    inv = 1.0 / length
-    return (_clean_zero(nx * inv), _clean_zero(ny * inv), _clean_zero(nz * inv))
+    if length < sys.float_info.min or not math.isfinite(length):
+        # Scaling first keeps an unrepresentable or subnormal length from changing the direction.
+        scale = max(abs(nx), abs(ny), abs(nz))
+        nx, ny, nz = nx / scale, ny / scale, nz / scale
+        length = math.hypot(nx, ny, nz)
+    return (_clean_zero(nx / length), _clean_zero(ny / length), _clean_zero(nz / length))
 
 
 def _compute_smooth_normals(
@@ -242,7 +246,7 @@ def parse_obj(
     # Preserve order of appearance for (group_index, material_name) primitives.
     builders: dict[tuple[int, str], dict] = {}
 
-    for raw_line in text.splitlines():
+    for raw_line in text.removeprefix("\ufeff").splitlines():
         line = raw_line.strip()
         if not line or line[0] == "#":
             continue
@@ -617,8 +621,9 @@ def pack_primitive(prim: dict) -> dict:
     """Packed little-endian glTF buffers for one primitive from ``parse_obj``.
 
     Returns ``positions``/``normals``/``uvs``/``indices`` as bytes (``uvs`` is b"" without UVs), the index
-    component type, the vertex and index counts, the POSITION ``min``/``max`` and the primitive's ``material``
-    key. The same packed primitive can be written into a GLB once and drawn by many instances.
+    component type, the vertex and index counts, the POSITION ``min``/``max``, and the primitive's
+    ``material`` key and optional ``material_index``. The same packed primitive can be written into
+    a GLB once and drawn by many instances.
     """
     positions = list(prim["positions"])
     indices = list(prim["indices"])
@@ -668,6 +673,7 @@ def pack_primitive(prim: dict) -> dict:
         "min": [_clean_zero(min(xs)), _clean_zero(min(ys)), _clean_zero(min(zs))],
         "max": [_clean_zero(max(xs)), _clean_zero(max(ys)), _clean_zero(max(zs))],
         "material": material if isinstance(material, (str, int)) and not isinstance(material, bool) else "",
+        "material_index": prim.get("material_index"),
     }
 
 
@@ -1072,7 +1078,7 @@ def instance_bounds(box_min, box_max, translation, rotation, scale) -> list[floa
 
 def build_instanced_glb(
     meshes: list[dict],
-    materials: dict[str, dict] | None = None,
+    materials: dict[str | int, dict] | None = None,
     *,
     mode: str = "gpu",
     generator: str = "Leonida glb_writer",
@@ -1084,9 +1090,9 @@ def build_instanced_glb(
     determinant (no mirroring scale); give mirrored instances their own mirrored mesh instead, so the winding is
     right in every loader. ``mode`` "gpu" writes one node per mesh with ``EXT_mesh_gpu_instancing`` (listed in
     extensionsUsed and extensionsRequired); "nodes" writes one plain glTF node per instance, which every loader
-    reads but which costs a draw call per instance. ``materials`` takes the spec keys documented on
-    ``build_glb``, looked up by each packed primitive's ``material``. Returns (GLB bytes, stats) where stats
-    counts rendered triangles (each mesh's triangles times its instances) and the bounds of every instance.
+    reads but which costs a draw call per instance. ``materials`` uses the same lookup and spec keys as
+    ``build_glb``. Returns (GLB bytes, stats), including rendered triangles (each mesh's triangles times its
+    instances) and the bounds of every instance.
     """
     if mode not in INSTANCING_MODES:
         raise GlbError(f"instancing mode must be one of {INSTANCING_MODES}, got {mode!r}")
@@ -1251,30 +1257,26 @@ def read_glb_summary(data: bytes) -> dict:
     if not isinstance(gltf, dict):
         raise GlbError("GLB JSON root must be a JSON object")
 
-    offset = 20 + json_len
+    after_json = 20 + json_len
+    offset = after_json
     bin_bytes = 0
-    if offset < total_length:
+    while offset < total_length:
         if offset + 8 > total_length:
-            raise GlbError("truncated BIN chunk header")
-        bin_len, bin_type = struct.unpack_from("<II", buf, offset)
-        if bin_type != CHUNK_TYPE_BIN:
-            raise GlbError(f"second GLB chunk must be BIN (0x{CHUNK_TYPE_BIN:08X}), got 0x{bin_type:08X}")
-        if bin_len % 4 != 0:
-            raise GlbError(f"BIN chunk length not 4-byte aligned: {bin_len}")
-        if offset + 8 + bin_len > total_length:
-            raise GlbError(f"BIN chunk length {bin_len} exceeds total length {total_length}")
-        bin_bytes = bin_len
-        offset += 8 + bin_len
-
-        while offset < total_length:
-            if offset + 8 > total_length:
-                raise GlbError("truncated trailing GLB chunk header")
-            chunk_len, _chunk_type = struct.unpack_from("<II", buf, offset)
-            if chunk_len % 4 != 0:
-                raise GlbError(f"trailing chunk length not 4-byte aligned: {chunk_len}")
-            if offset + 8 + chunk_len > total_length:
-                raise GlbError("trailing chunk exceeds GLB total length")
-            offset += 8 + chunk_len
+            raise GlbError("truncated GLB chunk header")
+        chunk_len, chunk_type = struct.unpack_from("<II", buf, offset)
+        if chunk_len % 4 != 0:
+            raise GlbError(f"GLB chunk length not 4-byte aligned: {chunk_len}")
+        chunk_end = offset + 8 + chunk_len
+        if chunk_end > total_length:
+            raise GlbError(f"GLB chunk length {chunk_len} exceeds GLB total length {total_length}")
+        if chunk_type == CHUNK_TYPE_JSON:
+            raise GlbError("duplicate GLB JSON chunk")
+        if chunk_type == CHUNK_TYPE_BIN:
+            if offset != after_json:
+                raise GlbError("GLB BIN chunk must be second")
+            bin_bytes = chunk_len
+        # Extension chunks are ignored after checking their framing.
+        offset = chunk_end
 
     buf0_limit = bin_bytes
     buffers = gltf.get("buffers")

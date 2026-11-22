@@ -12,6 +12,7 @@ Vertex block (header 0x60 bytes, first u32 is 0x00003063):
     slot 2  tag 0x63  12 bytes/vertex  float3 normal (absent in some blocks)
     slot 3  tag 0x42   8 bytes/vertex  float2
     slot 4  tag 0x42   8 bytes/vertex  float2 (absent in some blocks)
+    a slot past 4 (seen: slot 12, tag 0x26) takes its tag's stride (the tag rule below)
     The streams are stored in slot order 0, 2, 1, 3, 4. Only slot 0 is required. The vertex count is the span
     from slot 0 to the next stream in offset order, divided by 12; the block ends 8 * count bytes after its last
     slot.
@@ -23,16 +24,36 @@ Meshlet group (first u32 has bit 31 set):
     +12  K * 16-byte meshlet records:
          u32 w0: bits 0-6 = vertices - 1, bits 7-13 = triangles - 1, bits 14-31 not decoded
          u32 w1: low u16 = first vertex reference, high u16 = first triangle (running sums)
-         u32 w2, w3: not decoded (0x007FF7FF and 0x7FF in most records)
+         u32 w2, w3: bits 0-11 and 12-23 of w2 and bits 0-11 of w3 are the meshlet's centre in x, y and z as
+                     12-bit steps of 1/16 m around 2047, (field - 2047) / 16 (measured on `42 40` geometry; the
+                     default 0x007FF7FF / 0x7FF is the origin). w2 bits 24-31 (0 or 16) and w3 bits 12-31
+                     (non-zero when the meshlet's faces point roughly one way) are not decoded.
     then T u32 triangles: three 7-bit meshlet-local indices (bits 0-6, 7-13, 14-20), meshlet index in bits 21-31
     then V u16 vertex references into a vertex block
 
-A page starts with either kind: 45 streams start with a block (`63 30 00 00`) and others start with a group
-(continuation pages). The walk stops, without an error, at a `42 40 00 00` block (the same slot-word header with
-other vertex formats, not sized here) or at a group that continues past the end of the stream. Only counts and layout checks are written; no vertex, index or float value leaves this tool.
+`42 40 00 00` vertex block (header 0x80 bytes, first u32 is 0x00004042; ASSET-146):
+    +0x00..+0x58  23 slot words, encoded as above. Slot 0 is always tag 0x42 at offset 0x80.
+    +0x5C         u32, 0x200 (as in the `63 30` block)
+    +0x60         f32 x3 bias        +0x6C  u32 axis order, 0, 1 or 2
+    +0x70         f32 x3 scale       +0x7C  f32 UV scale for type-8 slots (4.0f in every block measured)
+    A slot tag byte is (stride / 4) << 5 | type (tag_stride, SLOT_TYPES): 0x42 = 8 bytes, 0x21, 0x26, 0x27 and
+    0x28 = 4 bytes, and 0x63 in the `63 30` block = 12 bytes. The vertex count is the span
+    from slot 0 to the next stream divided by 8; every stream is stride * count bytes and the block ends there.
+    Measured over every `42 40` block of `shared_minigame000.rpf`: 14,671 fit this exactly, and each one is
+    followed by a `42 40` block, a meshlet group, a `63 30` block or the end of the stream.
+    slot 0  tag 0x42  8 bytes/vertex  packed position, read as one u64 q:
+        a = bits 8-31 (24 bits), b = bits 32-47 << 8 | bits 0-7 (24 bits), c = bits 48-63 (16 bits)
+        (a, b, c) = bias + scale * (a, b, c); axis 0 stores (z, y, x), axis 1 (y, z, x), axis 2 (x, y, z)
+    This is the rule `third_party/rpf9-explorer/Core/RageModelDecoder.cs` uses for `(8, 16)` positions;
+    `docs/story.md` has the independent check over the minigame archive. The 4-byte attribute streams are not
+    decoded.
+
+A page starts with a `63 30` block, a `42 40` block or a group (continuation pages). The walk stops, without an
+error, at a `42 40` block whose layout doesn't fit the rule above or at a group that continues past the end of
+the stream. Only counts and layout checks are written; no vertex, index or float value leaves this tool.
 
 Usage:
-    python -I tools/meshlet_page.py <file|dir|archive.rpf> [...] [--json out.json] [--quiet]
+    python -I tools/meshlet_page.py <file|dir|archive.rpf> [...] [--json out.json] [--quiet] [--faces] [--centres]
     python -I tools/meshlet_page.py <graphics-segment> --draw-system <system-segment> --geometry-offset <offset> [--json out.json]
     python -I tools/meshlet_page.py <graphics-segment> --draw-system <system-segment> --drawable-offset <offset>
 """
@@ -52,6 +73,17 @@ HEADER_SIZE = 0x60
 SLOT_COUNT = 23
 SLOT_STRIDE = {0: 12, 1: 4, 2: 12, 3: 8, 4: 8}
 SLOT_TAG = {0: 0x63, 1: 0x26, 2: 0x63, 3: 0x42, 4: 0x42}
+OTHER_HEADER_SIZE = 0x80
+# A slot tag byte is (stride / 4) << 5 | type, as rpf9-explorer's RageModelDecoder reads vertex slots. Types seen in
+# shared_minigame000.rpf: 1, 2, 3, 6, 7, 8; a tag of another type is not taken as a slot.
+SLOT_TYPES = {1: "4-byte, not decoded", 2: "2 x f32 or a packed position", 3: "3 x f32", 6: "RGBA8",
+              7: "4-byte, not decoded", 8: "2 x snorm16 UV, scaled by the 42 40 header's +0x7C"}
+
+
+def tag_stride(tag):
+    """Bytes per vertex for a slot tag (bits 5-7 times 4), or None for a type not seen or a zero stride."""
+    stride = ((tag >> 5) & 7) * 4
+    return stride if stride and (tag & 15) in SLOT_TYPES else None
 ZHDR = re.compile(rb"\x78[\x01\x5e\x9c\xda]")
 
 
@@ -85,7 +117,7 @@ def parse_block(data, at):
         raise PageError(f"block at +0x{at:x}: slot {order[1]} offset is not 12 * count past slot 0")
     count = span // SLOT_STRIDE[0]
     for here, nxt in zip(order, order[1:]):
-        stride = SLOT_STRIDE.get(here)
+        stride = SLOT_STRIDE.get(here, tag_stride(slots[here][0]))   # a slot past 4: its tag's stride
         if stride is None or slots[nxt][1] - slots[here][1] != stride * count:
             raise PageError(f"block at +0x{at:x}: slot {here} size is not stride * count")
     last = order[-1]
@@ -98,6 +130,132 @@ def parse_block(data, at):
               "slots": [[i, slots[i][0], slots[i][1]] for i in sorted(slots)],
               "tags_expected": all(SLOT_TAG.get(i) == t for i, (t, _) in slots.items())}
     return record, end
+
+
+def parse_other_block(data, at):
+    """Size a `42 40 00 00` vertex block at `at` from its slot words. Returns (record, end offset); the record holds
+    counts and tags only."""
+    if at + OTHER_HEADER_SIZE > len(data):
+        raise PageError(f"42 40 block header truncated at +0x{at:x}")
+    words = struct.unpack_from("<32I", data, at)
+    if words[0] != OTHER_BLOCK_MAGIC:
+        raise PageError(f"no 42 40 block magic at +0x{at:x}")
+    slots = {i: (w & 0xFF, (w >> 8) * 2) for i, w in enumerate(words[:SLOT_COUNT]) if w}
+    if any(tag_stride(tag) is None for tag, _ in slots.values()):
+        raise PageError(f"42 40 block at +0x{at:x} has a slot tag with no known stride")
+    order = sorted(slots, key=lambda i: slots[i][1])
+    if len(order) < 2 or order[0] != 0 or slots[0][1] != OTHER_HEADER_SIZE:
+        raise PageError(f"42 40 block at +0x{at:x}: slot 0 is not at +0x80 or has no stream after it")
+    span = slots[order[1]][1] - OTHER_HEADER_SIZE
+    if span <= 0 or span % tag_stride(slots[0][0]):
+        raise PageError(f"42 40 block at +0x{at:x}: slot 0 span is not a whole number of vertices")
+    count = span // tag_stride(slots[0][0])
+    for here, nxt in zip(order, order[1:]):
+        if slots[nxt][1] - slots[here][1] != tag_stride(slots[here][0]) * count:
+            raise PageError(f"42 40 block at +0x{at:x}: slot {here} size is not stride * count")
+    last = order[-1]
+    end = at + slots[last][1] + tag_stride(slots[last][0]) * count
+    if end > len(data):
+        raise PageError(f"42 40 block at +0x{at:x} runs past the page end")
+    record = {"kind": "block4240", "offset": at, "vertices": count, "flags": words[23], "axis": words[27],
+              "slots": [[i, slots[i][0], slots[i][1]] for i in sorted(slots)]}
+    return record, end
+
+
+def positions_4240(data, block):
+    """Decode a `42 40` block's slot-0 positions (the packed 8-byte form; see the module docstring). Returns a list of
+    (x, y, z) floats. Raises PageError for an axis word other than 0, 1 or 2 or a slot 0 that isn't tag 0x42."""
+    at, n = block["offset"], block["vertices"]
+    slots = {i: (tag, off) for i, tag, off in block["slots"]}
+    if slots.get(0, (None,))[0] != 0x42:
+        raise PageError(f"42 40 block at +0x{at:x}: slot 0 is not a packed position (tag 0x42)")
+    bias = struct.unpack_from("<3f", data, at + 0x60)
+    axis = _u32(data, at + 0x6C)
+    scale = struct.unpack_from("<3f", data, at + 0x70)
+    if axis > 2:
+        raise PageError(f"42 40 block at +0x{at:x}: axis word {axis} is not 0, 1 or 2")
+    out = []
+    for (q,) in struct.iter_unpack("<Q", data[at + slots[0][1]:at + slots[0][1] + 8 * n]):
+        a = bias[0] + scale[0] * ((q >> 8) & 0xFFFFFF)
+        b = bias[1] + scale[1] * (((q >> 32) & 0xFFFF) << 8 | (q & 0xFF))
+        c = bias[2] + scale[2] * (q >> 48)
+        out.append((c, b, a) if axis == 0 else (b, c, a) if axis == 1 else (a, b, c))
+    return out
+
+
+def group_triangles(data, group):
+    """Yield each triangle of a parsed group as three vertex references (indices into its vertex block)."""
+    at, k = group["offset"], group["meshlets"]
+    rec_at, tri_at = at + 12, at + 12 + 16 * k
+    refs = struct.unpack_from(f"<{group['vertex_refs']}H", data, tri_at + 4 * group["triangles"])
+    for t in struct.unpack_from(f"<{group['triangles']}I", data, tri_at):
+        vbase = _u32(data, rec_at + 16 * (t >> 21) + 4) & 0xFFFF
+        yield refs[vbase + (t & 0x7F)], refs[vbase + ((t >> 7) & 0x7F)], refs[vbase + ((t >> 14) & 0x7F)]
+
+
+def face_agreement(positions, triangles):
+    """Count edges shared by exactly two triangles, and how many of those pairs have face normals within ~25 degrees
+    (dot > 0.9) or opposed (dot < -0.9). A wrong position decode scatters the normals; a right one leaves most
+    neighbours agreeing and almost none opposed."""
+    normals = []
+    for a, b, c in triangles:
+        if max(a, b, c) >= len(positions):
+            raise PageError("triangle references a vertex past its block")
+        p, q, r = positions[a], positions[b], positions[c]
+        u = (q[0] - p[0], q[1] - p[1], q[2] - p[2])
+        v = (r[0] - p[0], r[1] - p[1], r[2] - p[2])
+        n = (u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2], u[0] * v[1] - u[1] * v[0])
+        length = math.sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2])
+        normals.append((n[0] / length, n[1] / length, n[2] / length) if length and math.isfinite(length) else None)
+    faces = {}
+    for i, (a, b, c) in enumerate(triangles):
+        for e in ((a, b), (b, c), (c, a)):
+            faces.setdefault((min(e), max(e)), []).append(i)
+    out = {"shared_edges": 0, "agree": 0, "opposed": 0}
+    for pair in faces.values():
+        if len(pair) != 2 or normals[pair[0]] is None or normals[pair[1]] is None:
+            continue
+        d = sum(x * y for x, y in zip(normals[pair[0]], normals[pair[1]]))
+        out["shared_edges"] += 1
+        out["agree"] += d > 0.9
+        out["opposed"] += d < -0.9
+    return out
+
+
+def meshlet_centre(w2, w3):
+    """The centre stored in a meshlet record's words +8 and +12, in metres (see the module docstring)."""
+    return ((w2 & 0xFFF) - 2047) / 16, (((w2 >> 12) & 0xFFF) - 2047) / 16, ((w3 & 0xFFF) - 2047) / 16
+
+
+def centre_agreement(data, group, positions):
+    """Compare each meshlet's stored centre with the centre of its vertices' box. Counts axes whose difference
+    rounds to 0 or to at most one 1/16 m step."""
+    at, k = group["offset"], group["meshlets"]
+    rec_at = at + 12
+    refs_at = rec_at + 16 * k + 4 * group["triangles"]
+    refs = struct.unpack_from(f"<{group['vertex_refs']}H", data, refs_at)
+    out = {"meshlets": k, "default_words": 0, "axes": 3 * k, "axes_exact": 0, "axes_within_step": 0}
+    for m in range(k):
+        w0, w1, w2, w3 = struct.unpack_from("<4I", data, rec_at + 16 * m)
+        out["default_words"] += w2 == 0x007FF7FF and w3 == 0x7FF
+        vb, vc = w1 & 0xFFFF, (w0 & 0x7F) + 1
+        pts = [positions[r] for r in refs[vb:vb + vc] if r < len(positions)]
+        if len(pts) != vc:
+            raise PageError("meshlet references a vertex past its block")
+        stored = meshlet_centre(w2, w3)
+        for i in range(3):
+            step = round(((min(p[i] for p in pts) + max(p[i] for p in pts)) / 2 - stored[i]) * 16)
+            out["axes_exact"] += step == 0
+            out["axes_within_step"] += abs(step) <= 1
+    return out
+
+
+def block4240_checks(data, block):
+    """Count-only plausibility checks for one `42 40` block's decoded positions."""
+    pos = positions_4240(data, block)
+    finite = [p for p in pos if all(math.isfinite(c) for c in p)]
+    return {"positions_4240": len(pos), "positions_4240_finite": len(finite),
+            "positions_4240_within_300m": sum(1 for p in finite if all(abs(c) <= 300 for c in p))}
 
 
 def parse_group(data, at):
@@ -145,6 +303,12 @@ def is_mesh_page(data):
     word = struct.unpack_from("<I", data, 0)[0]
     if word == BLOCK_MAGIC:
         return True
+    if word == OTHER_BLOCK_MAGIC:
+        try:
+            parse_other_block(data, 0)
+        except PageError:
+            return False
+        return True
     if not word & 0x80000000:
         return False
     try:
@@ -174,9 +338,12 @@ def parse_page(data):
         if word == BLOCK_MAGIC:
             record, pos = parse_block(data, pos)
         elif word == OTHER_BLOCK_MAGIC:
-            # A `42 40 00 00` block: same slot-word header, other vertex formats; not sized here.
-            chunks.append({"kind": "stop", "offset": pos, "reason": "42 40 00 00 block"})
-            break
+            try:
+                record, pos = parse_other_block(data, pos)
+            except PageError:
+                # a `42 40 00 00` block whose layout doesn't fit the measured strides: stop instead of guessing
+                chunks.append({"kind": "stop", "offset": pos, "reason": "42 40 00 00 block"})
+                break
         elif word & 0x80000000:
             try:
                 record, pos = parse_group(data, pos)
@@ -224,21 +391,47 @@ def block_checks(data, block):
     return out
 
 
-def summarise_page(data, name):
+def summarise_page(data, name, faces=False, centres=False):
+    """Counts for one page. faces=True also runs face_agreement, and centres=True centre_agreement, on every group
+    whose vertex span matches a `42 40` block in the page (the nearest such block before it, else the first after
+    it)."""
     try:
         chunks = parse_page(data)
     except PageError as exc:
         return {"name": name, "size": len(data), "error": str(exc)}
     blocks = [c for c in chunks if c["kind"] == "block"]
+    others = [c for c in chunks if c["kind"] == "block4240"]
     groups = [c for c in chunks if c["kind"] == "group"]
     checks = {}
-    for b in blocks:
-        for k, v in block_checks(data, b).items():
-            checks[k] = checks.get(k, 0) + v
+    try:
+        for b in blocks:
+            for k, v in block_checks(data, b).items():
+                checks[k] = checks.get(k, 0) + v
+        for b in others:
+            for k, v in block4240_checks(data, b).items():
+                checks[k] = checks.get(k, 0) + v
+        if faces or centres:
+            decoded = {}
+            for g in groups:
+                same = [b for b in others if b["vertices"] == g["vertex_span"]]
+                if not same:
+                    continue
+                before = [b for b in same if b["offset"] < g["offset"]]
+                b = before[-1] if before else same[0]
+                if b["offset"] not in decoded:
+                    decoded[b["offset"]] = positions_4240(data, b)
+                if faces:
+                    for k, v in face_agreement(decoded[b["offset"]], list(group_triangles(data, g))).items():
+                        checks["faces_4240_" + k] = checks.get("faces_4240_" + k, 0) + v
+                if centres:
+                    for k, v in centre_agreement(data, g, decoded[b["offset"]]).items():
+                        checks["centres_4240_" + k] = checks.get("centres_4240_" + k, 0) + v
+    except PageError as exc:
+        return {"name": name, "size": len(data), "error": str(exc)}
     counts = {b["vertices"] for b in blocks}
     stop = [c for c in chunks if c["kind"] == "stop"]
     return {"name": name, "size": len(data), "starts_with": chunks[0]["kind"],
-            "sequence": "".join({"block": "B", "group": "G", "stop": "."}[c["kind"]] for c in chunks),
+            "sequence": "".join({"block": "B", "block4240": "Q", "group": "G", "stop": "."}[c["kind"]] for c in chunks),
             "stop": stop[0]["reason"] if stop else None,
             "blocks": len(blocks), "groups": len(groups),
             "blocks_with_colour": sum(1 for b in blocks if any(s[0] == 1 for s in b["slots"])),
@@ -251,6 +444,11 @@ def summarise_page(data, name):
             "vertex_refs": sum(g["vertex_refs"] for g in groups),
             "groups_dense": sum(1 for g in groups if g["unique_refs"] == g["vertex_span"]),
             "groups_matching_block_here": sum(1 for g in groups if g["vertex_span"] in counts),
+            "blocks_4240": len(others), "vertices_4240": sum(b["vertices"] for b in others),
+            "blocks_4240_flags": sorted({b["flags"] for b in others}),
+            "blocks_4240_axes": sorted({b["axis"] for b in others}),
+            "groups_matching_4240_block_here": sum(1 for g in groups
+                                                   if g["vertex_span"] in {b["vertices"] for b in others}),
             "group_spans": [g["vertex_span"] for g in groups],
             "block_counts": [b["vertices"] for b in blocks],
             "checks": checks}
@@ -301,7 +499,7 @@ def iter_inputs(paths):
                     full = os.path.join(root, f)
                     with open(full, "rb") as fh:
                         head = fh.read(4)
-                        if len(head) == 4 and (head == b"\x63\x30\x00\x00" or head[3] & 0x80):
+                        if len(head) == 4 and (head in (b"\x63\x30\x00\x00", b"\x42\x40\x00\x00") or head[3] & 0x80):
                             data = head + fh.read()
                             if is_mesh_page(data):
                                 yield os.path.relpath(full, path), data
@@ -314,10 +512,12 @@ def iter_inputs(paths):
 
 def totals(pages):
     keys = ("blocks", "groups", "blocks_with_colour", "blocks_with_uv1", "meshlets", "full_meshlets",
-            "triangles", "vertex_refs", "groups_dense", "groups_matching_block_here")
+            "triangles", "vertex_refs", "groups_dense", "groups_matching_block_here", "blocks_4240",
+            "vertices_4240", "groups_matching_4240_block_here")
     out = {"pages": len(pages), "pages_parsed": sum(1 for p in pages if "error" not in p),
            "block_led_pages": sum(1 for p in pages if p.get("starts_with") == "block"),
            "group_led_pages": sum(1 for p in pages if p.get("starts_with") == "group"),
+           "block_4240_led_pages": sum(1 for p in pages if p.get("starts_with") == "block4240"),
            "stopped_at_4240_block": sum(1 for p in pages if p.get("stop") == "42 40 00 00 block"),
            "stopped_in_group": sum(1 for p in pages if p.get("stop") == "group continues past the stream"),
            "bytes": sum(p["size"] for p in pages)}
@@ -331,13 +531,17 @@ def totals(pages):
             checks[k] = checks.get(k, 0) + v
     out["checks"] = checks
     out["block_flags"] = sorted({f for p in good for f in p["block_flags"]})
+    out["blocks_4240_flags"] = sorted({f for p in good for f in p.get("blocks_4240_flags", [])})
+    out["blocks_4240_axes"] = sorted({m for p in good for m in p.get("blocks_4240_axes", [])})
     # A group's vertex span that matches a block in the same page or a neighbouring page (input order).
     near = 0
-    for i, p in enumerate(good):
+    for i, p in enumerate(pages):
+        if "error" in p:
+            continue
         pool = set(p["block_counts"])
         for j in (i - 1, i + 1):
-            if 0 <= j < len(good):
-                pool |= set(good[j]["block_counts"])
+            if 0 <= j < len(pages) and "error" not in pages[j]:
+                pool.update(pages[j]["block_counts"])
         near += sum(1 for s in p["group_spans"] if s in pool)
     out["groups_matching_block_near"] = near
     return out
@@ -448,6 +652,10 @@ def main(argv=None):
     ap.add_argument("inputs", nargs="+", help="carved page files, folders of them, or .rpf archives")
     ap.add_argument("--json", help="write per-page records and totals here")
     ap.add_argument("--quiet", action="store_true")
+    ap.add_argument("--faces", action="store_true",
+                    help="also count how often neighbouring faces of 42 40 geometry agree (slower)")
+    ap.add_argument("--centres", action="store_true",
+                    help="also compare meshlet records' stored centres with their 42 40 vertices (slower)")
     ap.add_argument("--draw-system", help="inflated system segment paired with one graphics segment")
     select = ap.add_mutually_exclusive_group()
     select.add_argument("--geometry-offset", action="append", type=lambda s: int(s, 0),
@@ -502,7 +710,7 @@ def main(argv=None):
         if not os.path.exists(path):
             print(f"error: {path} does not exist", file=sys.stderr)
             return 2
-    pages = [summarise_page(data, name) for name, data in iter_inputs(args.inputs)]
+    pages = [summarise_page(data, name, args.faces, args.centres) for name, data in iter_inputs(args.inputs)]
     total = totals(pages)
     if not args.quiet:
         for p in pages:

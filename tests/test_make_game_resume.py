@@ -123,9 +123,10 @@ class EarlierStepDropsThePlanTest(unittest.TestCase):
             spirv = os.path.join(work, "shaders", "spirv")
             os.makedirs(dxbc)
             os.makedirs(spirv)
-            for name in ("index.json", "fssm_index.json"):          # carve and unpack finished
+            for name, entries in (("index.json", [{"file": "shader.dxbc"}]),
+                                  ("fssm_index.json", [{"name": "shader"}])):
                 with open(os.path.join(dxbc, name), "w", encoding="utf-8") as f:
-                    f.write("{}")
+                    json.dump(entries, f)
             plan = os.path.join(spirv, make_game.SHARD_PLAN)
             with open(plan, "w", encoding="utf-8") as f:
                 json.dump({"jobs": 2, "wave64_emulate": False, "translator": "d1"}, f)
@@ -133,7 +134,13 @@ class EarlierStepDropsThePlanTest(unittest.TestCase):
 
             def fake_translate(disasm, out, jobs, emulate=False, fallbacks=()):
                 seen["plan"] = os.path.exists(plan)
-            with mock.patch.object(make_game, "py"), mock.patch.object(make_game, "need"), \
+            def fake_disassemble(*args):
+                disasm = os.path.join(dxbc, "disasm")
+                os.makedirs(disasm)
+                with open(os.path.join(disasm, "shader.s"), "w", encoding="utf-8", newline="\n") as f:
+                    f.write("synthetic listing\n")
+
+            with mock.patch.object(make_game, "py", side_effect=fake_disassemble), mock.patch.object(make_game, "need"), \
                     mock.patch.object(make_game, "llvm_mc_signature", return_value="test llvm-mc 21"), \
                     mock.patch.object(make_game, "translate", side_effect=fake_translate), \
                     mock.patch.object(make_game, "log", lambda *a: None):

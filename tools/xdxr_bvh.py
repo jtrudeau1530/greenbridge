@@ -259,7 +259,7 @@ def _write_parents(buf, parents_off, elements_off, end, parent_of, root_ptr):
 
 def _write_header(buf, flags, end, n_elements, bounds, nodes_off, root, elements_off, parents_off):
     lo, hi = bounds
-    struct.pack_into("<4I6fIiIIII", buf, 0, flags, end // UNIT, 0, n_elements, *lo, *hi,
+    struct.pack_into("<4I6fIiIIII", buf, 0, flags, end // UNIT - 1, 0, n_elements, *lo, *hi,
                      nodes_off, 0, root, elements_off, parents_off, 0)
 
 
@@ -362,7 +362,8 @@ class Instance:
 
     def __init__(self, transform, blas_va, blas_root, blas_bounds, instance_id=0, mask=0xFF, contribution=0,
                  flags=0):
-        self.transform = [[float(x) for x in row] for row in transform]
+        # Derive the inverse and bounds from the float32 matrix stored in the instance record.
+        self.transform = [[f32(x) for x in row] for row in transform]
         self.blas_va = blas_va
         self.blas_root = blas_root
         self.blas_bounds = blas_bounds
@@ -642,7 +643,9 @@ def validate(data, expect_bottom=None):
     errs = []
     if len(data) < HEADER_SIZE:
         return ["buffer shorter than the 64-byte header"]
-    (flags, units, _crc, n_el, *rest) = struct.unpack_from("<4I6fIiIIII", data, 0)
+    # offsetToParents is read signed: a console structure keeps it negative (the entries of its low units, the leaves,
+    # fall before the header and are not stored), a runtime build keeps it at 0x40.
+    (flags, units, _crc, n_el, *rest) = struct.unpack_from("<4I6fIiIIiI", data, 0)
     bounds = rest[0:6]
     nodes_off, _remap, root, elements_off, parents_off, _cp = rest[6:]
     bottom = bool(flags & FLAG_BOTTOM_LEVEL)
@@ -651,8 +654,8 @@ def validate(data, expect_bottom=None):
     if flags & (FLAG_COMPRESSED | FLAG_DEHYDRATED):
         errs.append("compressed or dehydrated BVH: not a runtime tree (docs/bvh.md 3.1)")
         return errs
-    if units * UNIT != len(data):
-        errs.append(f"totalSizeIn64BNodes {units} does not cover the {len(data)}-byte buffer")
+    if (units + 1) * UNIT != len(data):   # the field does not count the 64-byte header (docs/bvh.md 3.1)
+        errs.append(f"totalSizeIn64BNodes {units} does not cover the {len(data)}-byte buffer (64 * (field + 1) bytes)")
     for name, off in (("offsetToNodes", nodes_off), ("offsetToElements", elements_off)):
         if off % UNIT or off > len(data):
             errs.append(f"{name} {off:#x} is unaligned or past the end")
@@ -676,11 +679,13 @@ def validate(data, expect_bottom=None):
         seen.add(p)
         if kind > TRI3 and parents_off:
             u = (off - elements_off) // UNIT
-            parent_entry = parents_off + 4 * u
-            if not HEADER_SIZE <= parent_entry <= len(data) - 4:
+            entry = parents_off + 4 * u
+            # Only the entries that lie between the header and offsetToElements are stored in the structure; the
+            # others (the low units) are not, so there is nothing to compare (docs/bvh.md 3.1).
+            if entry + 4 > len(data):
                 errs.append(f"parent table entry of {p:#x} is outside the buffer")
-            else:
-                stored = struct.unpack_from("<I", data, parent_entry)[0]
+            elif HEADER_SIZE <= entry and entry + 4 <= elements_off:
+                stored = struct.unpack_from("<I", data, entry)[0]
                 expected = INVALID if parent is None else parent
                 if stored != expected:
                     errs.append(f"parent table entry of {p:#x} is {stored:#x}, expected {expected:#x}")
@@ -724,6 +729,14 @@ def validate(data, expect_bottom=None):
 
 
 # ---- checking a GPU build (runtime/test/vk_xdxr_build_test.cpp) ----
+def _case_names(directory):
+    """Find cases using a literal directory and the usual JSON filename pattern."""
+    import glob
+    import os
+    pattern = os.path.join(glob.escape(os.fspath(directory)), "*.json")
+    return sorted(os.path.splitext(os.path.basename(path))[0] for path in glob.glob(pattern))
+
+
 def _load_case(directory, name):
     import json
     with open(f"{directory}/{name}.json", encoding="utf-8") as fh:
@@ -738,9 +751,7 @@ def _load_case(directory, name):
 
 def check_build(directory, rays=300, seed=1):
     """Validate every <case>.bin of a GPU build and trace rays against brute force. Returns a list of problems."""
-    import glob
-    import os
-    names = sorted(os.path.splitext(os.path.basename(p))[0] for p in glob.glob(f"{directory}/*.json"))
+    names = _case_names(directory)
     if not names:
         return [f"no cases in {directory}"]
     problems = []
@@ -867,8 +878,7 @@ def main(argv=None):
     if a.cmd == "check-build":
         if a.rays < 1:
             ap.error("--rays must be at least 1")
-        import glob
-        if not glob.glob(f"{a.dir}/*.json"):
+        if not _case_names(a.dir):
             print(f"no cases in {a.dir}: skipped (the build step skipped or did not run)")
             return 77                                   # ctest SKIP_RETURN_CODE
         problems = check_build(a.dir, a.rays)

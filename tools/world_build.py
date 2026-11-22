@@ -41,6 +41,7 @@ if _TOOLS_DIR not in sys.path:
     sys.path.insert(0, _TOOLS_DIR)
 
 from file_mode import published_mode  # noqa: E402
+from pool_workers import process_workers  # noqa: E402
 
 try:
     import dds_png
@@ -286,8 +287,9 @@ def lod_bands(child_lod: dict, lod_dist: dict, present) -> tuple[dict, dict]:
     """Camera distance band [start, end) per tier, from the selected entities' medians.
 
     A parent's childLodDist is the distance inside which its children are drawn instead of it, so a tier starts
-    at its own median childLodDist (HD at 0) and ends where the next coarser tier present starts; the coarsest
-    tier ends at its median lodDist. ORPHAN_HD has no parent and is drawn from 0 to its median lodDist. Returns
+    at its own median childLodDist (the finest starts at 0) and ends where the next coarser tier starts.
+    A missing childLodDist uses the previous finer tier's median lodDist. The coarsest tier ends at its
+    median lodDist. ORPHAN_HD has no parent and is drawn from 0 to its median lodDist. Returns
     (bands by tier name, the measured medians by tier name)."""
     measured = {}
     for lvl in present:
@@ -297,8 +299,14 @@ def lod_bands(child_lod: dict, lod_dist: dict, present) -> tuple[dict, dict]:
     chain = [lvl for lvl in LOD_CHAIN if lvl in present]
     starts = []
     for i, lvl in enumerate(chain):
-        start = 0.0 if i == 0 else (measured[LOD_TIER_NAMES[lvl]]["child_lod_dist_median"] or 0.0)
-        starts.append(max(start, starts[-1] if starts else 0.0))
+        if i == 0:
+            starts.append(0.0)
+            continue
+        start = measured[LOD_TIER_NAMES[lvl]]["child_lod_dist_median"]
+        if start is None:
+            previous_tier = LOD_TIER_NAMES[chain[i - 1]]
+            start = measured[previous_tier]["lod_dist_median"]
+        starts.append(max(start or 0.0, starts[-1]))
     for i, lvl in enumerate(chain):
         if i + 1 < len(chain):
             end = starts[i + 1]
@@ -439,13 +447,13 @@ def _pack_model_job(job: tuple) -> tuple[int, dict | None]:
     }
 
 
-_PNG_CACHE: dict[str, bytes | None] = {}
+_PNG_CACHE: dict[tuple[str, int], bytes | None] = {}
 _PNG_CACHE_BUDGET = 256 * 1024 * 1024
 
 
 def _png_for(dds_path: str, max_tex_size: int) -> bytes | None:
     """Decode a DDS to PNG once per worker, keeping at most about 256 MB of PNGs (oldest dropped first)."""
-    key = os.path.normcase(os.path.abspath(dds_path))
+    key = (os.path.normcase(os.path.abspath(dds_path)), max_tex_size)
     if key in _PNG_CACHE:
         return _PNG_CACHE[key]
     dds_mod = _get_dds_png()
@@ -514,6 +522,7 @@ def _run_jobs(fn, jobs, workers: int):
         return
     import collections
     from concurrent.futures import ProcessPoolExecutor
+    workers = process_workers(workers)
     window = 4 * workers
     with ProcessPoolExecutor(max_workers=workers) as pool:
         pending = collections.deque()
@@ -1184,7 +1193,7 @@ def _write_json_atomic(path: str, data: dict, replace=None) -> None:
     tmp_path = None
     try:
         with tempfile.NamedTemporaryFile(
-            mode="w", encoding="utf-8", dir=parent, prefix=".world-", suffix=".tmp", delete=False,
+            mode="w", encoding="utf-8", newline="\n", dir=parent, prefix=".world-", suffix=".tmp", delete=False,
         ) as f:
             tmp_path = f.name
             json.dump(data, f, indent=2, allow_nan=False)
@@ -1204,8 +1213,11 @@ def _write_json_atomic(path: str, data: dict, replace=None) -> None:
         raise
 
 
-# Cell coordinates are written as decimal integers, without leading zeros.
-_CHUNK_FILE_RE = re.compile(r"c_(?:0|-?[1-9][0-9]*)_(?:0|-?[1-9][0-9]*)\.glb(?:\.tmp)?")
+# Cell coordinates are written as decimal integers, without leading zeros; --lod-sets prefixes the tier name.
+_LOD_TIER_PATTERN = "|".join(re.escape(name) for name in LOD_TIER_NAMES.values())
+_CHUNK_FILE_RE = re.compile(
+    rf"c_(?:(?:{_LOD_TIER_PATTERN})_)?(?:0|-?[1-9][0-9]*)_(?:0|-?[1-9][0-9]*)\.glb(?:\.tmp)?"
+)
 
 
 def _prune_stale_chunks(chunks_dir: str, keep_filenames: set[str]) -> None:

@@ -79,6 +79,20 @@ class Analyze4240Test(unittest.TestCase):
         # Slot 1 sits at 0x60 and slot 0 at 0x80; slot 2 shares 0x80, so it adds no stride.
         self.assertEqual(stats["strides"], {(1, 1, 0, 0x42, 0x20): 1})
 
+    def test_stream_starting_with_4240_block_is_measured(self) -> None:
+        path = os.path.join(self.root, "direct-4240.rpf")
+        # Four 8-byte positions from 0x80, then four 4-byte colors from 0xA0.
+        slots = [0x4042, (0x50 << 8) | 0x26] + [0] * 22
+        page = block_4240(slots) + bytes(0xA0 - 0x60) + bytes((10, 20, 30, 255)) * 4
+        make_archive(path, page)
+
+        stats = A.process_archive(path)
+
+        self.assertEqual((stats["streams"], stats["blocks_4240"], stats["blocks_6330"]), (1, 1, 0))
+        self.assertEqual(stats["slot_tag_counts"], {(0, 0x42): 1, (1, 0x26): 1})
+        self.assertEqual(stats["strides"], {(0, 0x42, 1, 0x26, 32): 1})
+        self.assertEqual(stats["errors"], 0)
+
     def test_missing_input_is_one_error_line(self):
         missing = os.path.join(self.root, "missing.rpf")
         p = self.run_tool(missing)
@@ -118,6 +132,60 @@ class Analyze4240Test(unittest.TestCase):
             doc = json.load(f)
         self.assertEqual(len(doc), 1)
         self.assertEqual(doc[0]["errors"], 1)
+
+    def test_json_naming_an_input_archive_is_refused_and_the_archive_kept(self):
+        # Before: the archive was read, then replaced with the JSON report.
+        path = self.truncated_archive()
+        with open(path, "rb") as f:
+            before = f.read()
+        for spelling in (path, os.path.join(self.root, ".", os.path.basename(path))):
+            with self.subTest(json=spelling):
+                p = self.run_tool(path, "--json", spelling)
+                self.assertEqual(p.returncode, 2, p.stderr)
+                self.assertIn("would overwrite the input archive", p.stderr)
+                self.assertNotIn("Traceback", p.stderr)
+                self.assertNotIn("Processing", p.stdout, "refused before the scan")
+                with open(path, "rb") as f:
+                    self.assertEqual(f.read(), before)
+
+    def test_json_naming_a_later_input_is_refused(self):
+        first, second = self.truncated_archive(), os.path.join(self.root, "second.rpf")
+        make_archive(second, BLOCK_6330)
+        p = self.run_tool(first, second, "--json", second)
+        self.assertEqual(p.returncode, 2, p.stderr)
+        self.assertIn("second.rpf", p.stderr)
+        self.assertTrue(open(second, "rb").read().startswith(b"9FPR"))
+
+    def test_json_through_a_link_to_an_input_is_refused(self):
+        path = self.truncated_archive()
+        link = os.path.join(self.root, "link.json")
+        try:
+            os.link(path, link)              # a hard link: another name for the archive itself
+        except OSError as e:
+            self.skipTest(f"hard links unavailable: {e}")
+        p = self.run_tool(path, "--json", link)
+        self.assertEqual(p.returncode, 2, p.stderr)
+        self.assertIn("would overwrite the input archive", p.stderr)
+        self.assertTrue(open(path, "rb").read().startswith(b"9FPR"))
+
+    def test_json_folder_is_refused_before_the_scan(self):
+        path = self.truncated_archive()
+        p = self.run_tool(path, "--json", self.root)
+        self.assertEqual(p.returncode, 2, p.stderr)
+        self.assertIn("is a folder", p.stderr)
+        self.assertNotIn("Traceback", p.stderr)
+        self.assertNotIn("Processing", p.stdout)
+
+    def test_a_failed_json_write_is_one_error_line(self):
+        path = self.truncated_archive()
+        blocker = os.path.join(self.root, "plain-file")
+        with open(blocker, "w", encoding="utf-8") as f:
+            f.write("x")
+        out = os.path.join(blocker, "stats.json")     # its parent is a file, so the folder can't be made
+        p = self.run_tool(path, "--json", out)
+        self.assertEqual(p.returncode, 2, p.stderr)
+        self.assertIn("cannot write", p.stderr)
+        self.assertNotIn("Traceback", p.stderr)
 
     def bad_offset_archive(self):
         path = os.path.join(self.root, "bad-offset.rpf")

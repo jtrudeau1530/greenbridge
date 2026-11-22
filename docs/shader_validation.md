@@ -144,6 +144,22 @@ python -I tools/salu_diff.py --branches --programs 2000 --seed 1
 python -I tests/test_salu_diff.py
 ```
 
+The `_sdwa` VALU forms have one too, `tools/sdwa_diff.py`: a separate reference for 92 VOP1/VOP2/VOPC opcodes in an
+integer and an f16 family (source selects, `sext()`, `dst_sel` with `dst_unused` PAD/SEXT/PRESERVE, SGPR and
+inline-constant sources, `clamp`, f16 neg/abs), seeded one-lane programs that chain through v1..v7 and VCC, the same
+interpreter, shrinking and exit codes as `salu_diff.py`. Forms where the translator is known to differ
+(`KNOWN_DIVERGENCES` in its docstring, which also lists what is modelled and skipped) are left out unless `--known`.
+`--oracle hw` runs the programs on an RDNA1/RDNA2 GPU only (GFX11 has no SDWA); every rule of the reference was
+checked that way on an RDNA2 iGPU (gfx1036), including two that differ from the non-SDWA forms: a 16-bit result
+with `dst_sel:DWORD` zeroes the high half, and a float inline constant in an f16 op is narrowed by `src_sel` as the
+f16 value.
+
+```
+python -I tools/sdwa_diff.py --programs 2000 --seed 1
+python -I tools/sdwa_diff.py --oracle hw --programs 500 --seed 1
+python -I tests/test_sdwa_diff.py
+```
+
 ### Hardware oracle (optional)
 
 `--oracle hw` also runs the same programs natively on an AMD GPU and compares the hardware's three SGPRs and SCC
@@ -285,6 +301,32 @@ differences** (plus `tools/salu_diff.py --oracle hw,translator --bfe-any --progr
   saturating by its sign). All are fixed (#1831, #1856), so `KNOWN_DIVERGENCES` is empty and all 87 cases
   match.
 
+#### RDNA2 swizzled buffer addressing (`tools/buffer_swizzle_probe.py`, SHADER-343)
+
+`tools/buffer_swizzle_probe.py` runs 22 hand-written MUBUF/MTBUF buffer-swizzle cases across 8 groups (both wave32
+and wave64) natively on an AMD GPU through `tools/hw_oracle` and compares every output word against
+`tools/rdna2spirv.py` + `tests/semantic/spirv_mini_interp.py`.
+
+Measured on an **AMD Radeon(TM) Graphics (gfx1036, RDNA2)**, Windows AMD driver `32.0.21042.62`, ROCm clang
+(`--oracle both --wave both`): **22 cases: 22 bit-exact matches, 0 known divergences, 0 unexpected mismatches,
+0 unexpected wave32/wave64 diffs** (and the 64-thread `add_tid_wave_lane` case matches wave32 and wave64
+individually, confirming wave-lane wrap at 32 vs 64).
+
+Six silicon divergences from the earlier ISA-only implementation were found and fixed in `tools/rdna2spirv.py`:
+
+- `idxen = 1` ignores `ADD_TID_ENABLE` completely (both address and bounds, linear and swizzled).
+- `SWIZZLE_ENABLE = 1` with `idxen = 0` and `ADD_TID_ENABLE = 0` has no effect (linear address, mode 3 stays RAW).
+- Multi-dword raw accesses step by `+4 * IS` only in scratch-swizzle mode (`SWIZZLE_ENABLE = 1`, `idxen = 0`,
+  `ADD_TID_ENABLE = 1`), whereas indexed swizzle (`idxen = 1`) steps linearly by `+4` bytes even across `IS`
+  boundaries.
+- Scratch-swizzle mode suppresses typed formats > 4 bytes (MUBUF and MTBUF loads/stores) and 8-byte
+  `buffer_atomic_*_x2` even in `OOB_SELECT 2` (while formats <= 4 bytes succeed); indexed swizzle executes them
+  linearly.
+- `OOB_SELECT 3` with active swizzle and `stride != 0` checks `(index + soffset) >= num_records` or
+  `off + payload > stride`.
+- `uint32(voff + inst_offset)` wraps at 32 bits before bounds checking, whereas RAW mode 3
+  `uint64(off) + uint64(soffset)` does not wrap at 32 bits.
+
 Two assembler facts matter when writing edge cases:
 
 - An integer token in a float-operand position uses AMD's inline-constant encoding for values 0..64
@@ -315,6 +357,39 @@ land exactly on a binary32 midpoint, and a tiny third addend decides the roundin
 rational arithmetic for FMA; a test pins the result so the implementation cannot regress to the
 double-rounded answer.
 
+#### `v_interp` ALU ops (`tools/interp_hw_probe.py`, SHADER-430)
+
+`v_interp_*` also run in a compute wave: they read the attribute words from LDS at M0. On gfx1036 with M0 = 0,
+attribute N takes 12 dwords from byte 48·N; channel c's P0 and P10 words are dwords 2c and 2c+1, and its P20 word is
+dword 8+c (found by filling LDS with markers and reading them back with `v_interp_mov_f32`). So the tool writes
+random parameter words there itself, packed f16 pairs and plain f32 values, runs every interp op through
+`tools/hw_oracle` and checks each result against exact rational models. It also runs 30 hand-built f16 rounding ties
+that tell one rounding of `p2_f16` from two.
+
+Measured on the **Radeon iGPU of a Ryzen 7 9800X3D (gfx1036, RDNA2)**, AMD driver 32.0.13036.4, Windows 10 22H2,
+`rocm-sdk-core` clang, seeds 1–8 × 4 kernels × 32 lanes. Every model matched, under both `--denorm32 3` (MODE keeps
+f32 denormals) and `--denorm32 0` (MODE flushes them). That is 292,474 checks per mode plus the 30 ties.
+
+| Op | Result on gfx1036 |
+| --- | --- |
+| `v_interp_mov_f32 p0` | the raw P0 word |
+| `v_interp_p1_f32` | fma(P10, I, P0) with one rounding to f32. A product rounded first and then added differed in 723 of 4,096 f32 cases (seeds 1–4). A packed channel's words are read as raw f32 bits |
+| `v_interp_p2_f32` | fma(P20, J, p1), one rounding |
+| `v_interp_p1ll_f16` (`high`) | the chosen f16 halves widened exactly, then fma(h10, I, h0) with one rounding to **f32** |
+| `v_interp_p2_f16` (`high`) | fma(h20, J, p1ll) rounded **once, to f16** (all 30 ties gave the single-rounding result, none the f32-then-f16 one). The high 16 bits of vdst are **kept** |
+| f32 denormals | follow MODE: with `denorm_mode_32 = 0` a denormal P0, P10 or P20 word reads as 0 |
+
+The translator wrote `p2_f16` as a full-register result with a zero high half. It now keeps the high half
+(`tests/semantic/test_interp_f16_high.py`). This compute route does not reach the other half of SHADER-430: what the
+SPI writes into LDS for a real draw, in particular whether a packed channel's P10/P20 are f32 differences of the raw
+words or per-half f16 differences under `FP16_INTERP_MODE`. That needs a pixel-shader harness on AMD hardware. Not
+covered either: `v_interp_p1lv_f16`, and f16 inf/NaN halves.
+
+```powershell
+python -I tools/interp_hw_probe.py                     # exit 0: all match; 77: no hardware oracle here
+python -I tools/interp_hw_probe.py --denorm32 0 --seeds 1,2,3,4,5,6,7,8
+```
+
 ## Harness design
 
 `tools/shader_diff.py` owns the test table, the seed and the comparison, leaving
@@ -339,6 +414,26 @@ double-rounded answer.
 The existing `runtime/test` tools already expose the hard parts (device selection, push constants,
 descriptor setup, readback). The differential runner should call them rather than grow a second
 Vulkan stack.
+
+### Integer VALU across the whole wave (`tools/wint_diff.py`)
+
+The one-lane fuzzers cannot see which lanes an instruction writes or the lane masks it reads and makes.
+`tools/wint_diff.py` runs seeded integer VALU programs on every lane of a wave32 or wave64 wave (`--wave 32|64|both`)
+with EXEC rewritten between instructions: compares into SGPR masks and VCC (e64 and e32), `v_cmpx` into EXEC,
+`v_cndmask_b32` on those masks, the carry-out and carry-in forms (`v_add/sub/subrev_co_u32`, `_co_ci_u32`, e64
+and e32), `v_mad_u64_u32`/`v_mad_i64_i32` with a mask carry-out, 16-bit e64/VOP3 ops with `op_sel` writing one half,
+data moved into an SGPR mask, and a set of 32-bit ops. The reference is a per-lane ISA model in the tool; the
+translated side runs in `tests/semantic/spirv_wave_interp.py`. Shrinking, skips and exit codes are those of
+`salu_diff.py`. Forms the translator is known to get wrong (VCC holding data read as a mask, #2206 for wave32 and
+open for wave64; a mask read as VALU data, #293) are left out unless `--known`. `--oracle hw` runs each program as
+one wave on an AMD GPU and compares every lane; on an RDNA2 iGPU (gfx1036) 1,000 programs in both wave sizes,
+the known forms included, matched the reference.
+
+```
+python -I tools/wint_diff.py --programs 2000 --seed 1 --wave both
+python -I tools/wint_diff.py --oracle hw --programs 500 --seed 1 --wave both
+python -I tests/test_wint_diff.py
+```
 
 ### LDS and `ds_*` on the GPU (`tools/lds_fuzz.py`, FUZZ-6)
 
@@ -444,22 +539,34 @@ Results on a Radeon 880M (gfx1150, RDNA3.5, driver 26.11.2, AMD clang 23.0.0git)
 | seed 1, `--only` the twelve wave32 programs SHADER-105 names (1 18 20 23 24 26 29 30 32 33 34 38) | 12 | 0 |
 
 Negative control (1,000 extended programs): each of the 15 wrong models mismatches on 126 to 547 programs, none goes
-unnoticed. gfx1150 is RDNA3.5,
-not RDNA2: the match supports the model, and RDNA2 itself rests on the ISA text and the translator results on RDNA2
-cards.
+unnoticed. gfx1150 is RDNA3.5, not RDNA2; the RDNA2 runs follow.
+
+Results on the integrated Radeon of a Ryzen 7 9800X3D (gfx1036, RDNA2, AMD driver 32.0.13036.4, Windows HIP launcher,
+AMD clang 23.0.0git), `--oracle hw` on `main` `003e7812`:
+
+| Programs | Count (wave32 + wave64) | Mismatches |
+| --- | --- | --- |
+| default mix, seeds 1, 2, 3, 2,000 each | 12,000 | 0 |
+| `--extended`, seeds 1, 2, 3, 2,000 each (permute, masked swizzle, groups of 32 to 256) | 12,000 | 0 |
+
+`hyp_confirmed` (programs with a hypothesis op that matched) in the extended runs: 1158/1185, 1183/1177 and 1151/1189
+(wave32/wave64, seeds 1 to 3). So on RDNA2 too a masked `ds_swizzle_b32` whose source lane is off in EXEC reads 0,
+and `ds_permute_b32` follows the model. Negative control (extended, seed 1): each of the 15 wrong models mismatches,
+from 417 programs (`bpermute_inactive_reads`) to 1,123 (`write2_swapped`); none goes unnoticed.
 
 With `--oracle translator,hw` on the same Radeon 880M (Vulkan, subgroup 64), seed 1, 100 programs per run: the
 default mix matches the model on the translator, native and emulated (200/200 each). With `--extended` the
 translator differs from the hardware in 22 of 177 programs (native and emulated alike), all in a `ds_swizzle_b32`
 under an EXEC mask whose source lane is off: the translator hands the active lane the source lane's register, the
 hardware gives 0 (the swizzle hypothesis above). So the translator differs from gfx1150 for a masked
-`ds_swizzle_b32` with an off source lane; RDNA2 is unverified. Not fixed here. Partial-wave programs (`--threads` 32
+`ds_swizzle_b32` with an off source lane; the gfx1036 hardware runs above show RDNA2 gives 0 as well (SHADER-207). Not
+fixed here. Partial-wave programs (`--threads` 32
 in wave64) are skipped for the translator, which cannot launch them. NVIDIA was not run.
 
 **Other backends.** The Linux libdrm launcher of #1265 (`tools/hw_oracle/drm.py`) does not run these programs yet:
 it refuses a kernel with LDS and caps the output at 4096 words, and `lds_fuzz` turns that refusal into exit 77
-("unavailable"). RDNA2 results need LDS and a larger word count in that backend first. The numbers above are gfx1150
-only.
+("unavailable"). Linux RDNA2 results need LDS and a larger word count in that backend first; the gfx1036 numbers
+above come from the Windows HIP launcher.
 
 **Overlap with #789.** #789 adds `ds_permute_b32` to the default op mix of `lds_fuzz.py`; here it is opt-in
 (`--permute`) so that existing seeds keep their programs. Whichever lands second reconciles the two.
@@ -606,12 +713,43 @@ zero and denormal inputs (NaN payloads are compared as "any NaN", as in the tran
 longer `translator,hw` run was not done (the Vulkan side takes about half a minute per case on this machine).
 
 **RDNA3.5 is not RDNA2.** The gfx1150 T# and image unit are GFX11's; a match shows that the model is right for the
-texel fetch of these formats on that hardware, which is not the console's. The GFX10 words are built and assemble for
-gfx1030 (`tests/test_image_fuzz_hw.py`) but have not run on a GFX10 GPU. The Linux libdrm backend of #1265
+texel fetch of these formats on that hardware, which is not the console's. The GFX10 words have since run on RDNA2:
+
+Results on the integrated Radeon of a Ryzen 7 9800X3D (gfx1036, RDNA2, GFX10 T# layout, AMD driver 32.0.13036.4,
+Windows HIP launcher, AMD clang 23.0.0git), on `main` `003e7812`:
+
+| Run | Cases | Mismatches |
+| --- | --- | --- |
+| `--oracle hw`, seeds 1, 2, 3, 2,400 cases each (wave32 and wave64, all six formats, all 15 masks, 8 to 64 per side) | 7,200 | 0 |
+
+Negative control (`--oracle hw --programs 180 --seed 1 --negative-control`): the unperturbed model mismatches on 0 of
+180 cases; the seven wrong models are caught by the same counts as on gfx1150 (`unorm_256` 30, `swap_rb` 144,
+`sint_unsigned` 30, `alpha_zero` 16, `dmask_in_place` 132, `no_sentinels` 168, `transpose` 166), and a kernel built
+with the next format's `FORMAT` code is caught on every format (24 to 30 of 30 cases each). So the GFX10 T# words of
+`hw_oracle/tsharp.py` and the texel-fetch model hold on RDNA2 for these formats; `--oracle translator,hw` was not run
+there. The Linux libdrm backend of #1265
 (`tools/hw_oracle/drm.py`) was not tried: it copies only `.text` (the texture is in `.text`, so that works in
 principle, but it needs the loaded code to be 256-byte aligned, which the kernel checks and reports) and the LDS
-section above records a 4096-word output cap there, while a 64x64 case stores 16,384 words. Until that is measured
-on a GFX10 card, treat RDNA2 as unverified.
+section above records a 4096-word output cap there, while a 64x64 case stores 16,384 words. The RDNA2 results above
+are from the Windows HIP launcher only.
+
+### 32-bit integer VALU in every encoding (`tools/vint_diff.py`)
+
+`tools/shader_diff.py` checks the common integer opcodes with VGPR sources in their e32 form. `tools/vint_diff.py`
+adds the rest of the 32-bit integer VALU a compiler emits: the VOP1/VOP2 opcodes as e32 and e64, the VOP3-only ones
+(`v_add3_u32`, `v_lshl_add_u32`, `v_alignbit/alignbyte/perm_b32`, `v_min3/max3/med3`, the 24- and 16-bit
+multiplies with `op_sel`, `v_bcnt`, `v_bfm`, `v_ffbh/ffbl`, `v_cvt_pk_*16_*32`, ...) and VOPC e64 into a mask with
+`v_cndmask_b32_e64`, with VGPR, SGPR, integer and float inline-constant and literal sources in every position the
+encoding allows (one literal and two scalar values per VOP3). It runs one lane through
+`tests/semantic/spirv_mini_interp.py` against its own ISA model, with the shrinking, skips and exit codes of
+`salu_diff.py`; a compare's mask read as VALU data (#293) is left out unless `--known`. `--oracle hw` runs the same
+programs on an AMD GPU; on an RDNA2 iGPU (gfx1036) 1,500 programs, the known form included, matched the reference. A 32-bit literal in a 16-bit source of `v_mad_u32_u16`/`v_mad_i32_i16` does not assemble, so literals there have 16 bits (zero-extended, measured).
+
+```
+python -I tools/vint_diff.py --programs 2000 --seed 1
+python -I tools/vint_diff.py --oracle hw --programs 500 --seed 1
+python -I tests/test_vint_diff.py
+```
 
 ### 16-bit and memory ops on the GPU (`tools/valu_fuzz.py`, FUZZ-2, FUZZ-5)
 
@@ -687,17 +825,43 @@ vscnt wait plus `s_dcache_inv`; vector accesses only need `s_waitcnt vmcnt(0)`.
 - **Hardware, same protocol** (seeds 101 to 105 x 2,000 programs x wave32 and native wave64 per family): **`f16` 20,000 of 20,000 and `mem` 20,000 of 20,000 match, 0 mismatches, 0 assembler rejections.** On a gfx1030, ROCm 6.2's clang 19 rejected 3,768 of 4,000 `f16` programs (#1365); clang 23 rejects none.
 - **Negative controls**, in the order above: `f16` 992, 865, 826, 430, 280 and 879 caught; `mem` 514, 57, 354, 60, 37, 580, 214 and 89 caught. The unperturbed model gives 0 mismatches.
 - **`translator,hw` at seed 3** (100 programs, the same GPU through the AMD Vulkan driver): `mem` 200 of 200 match, `f16` 199 of 200. The one difference, `s3_22_w64`, is a driver mismatch of the #1506 kind. The hardware and `tests/semantic/spirv_mini_interp.py` both give the model's value for it, and the same emulated SPIR-V matches on NVIDIA.
-- **`v_pack_b32_f16` with signaling NaNs**, measured with hand-written raw kernels in both wave sizes and both IEEE modes. The inputs were five signaling-NaN halves, quiet NaNs, ±0, +inf and a denormal, in either half, with `op_sel` and with `neg`.
-  - IEEE mode 1, the assembler's default: a signaling-NaN half is quieted. Bit 9 is set and the sign and payload are kept, as on gfx1150.
-  - IEEE mode 0: the half is moved unchanged.
-  - `neg` flips the sign before any quieting (`0x7c01` gives `0xfe01` under mode 1 and `0xfc01` under mode 0).
-  - Every other input is moved unchanged.
-  - The translator moves the bits, which is exact under IEEE mode 0. Which mode the game's shaders run in is not recorded here.
+- **`v_pack_b32_f16` with modifiers (`neg`, `abs`, `-|x|`) and signaling NaNs**, measured with 1,088 hand-written raw kernels in both wave sizes (wave32 and wave64, 100% parity) and both IEEE modes on gfx1036 (driver 32.0.21045.29003). The inputs covered normal floats (±1.0), zeros (±0.0), infinities (±inf), subnormals (±min_sub), quiet NaNs, and signaling-NaN halves, in either half with `op_sel`.
+  - IEEE mode 1, the assembler's default: a signaling-NaN half is quieted (bit 9 set; sign bit cleared by `abs` and flipped by `neg`, e.g. `0xfc01` → `0x7e01` under `abs`, `0xfe01` under `-|x|`).
+  - IEEE mode 0: the half is moved as pure bit operations (`& 0x7FFF` for `abs`, `^ 0x8000` for `neg`, `(x & 0x7FFF) ^ 0x8000` for `-|x|`), with `sNaN` payload and quiet bit preserved untouched.
+  - Wave32 and wave64 produce identical results across all 1,088 kernels (0 differences).
+  - The translator implements the IEEE mode 0 bit moves, which is exact on hardware.
 
 *Findings.* The OOB_SELECT per-mode rules, the per-dword straddle rule and the `s_buffer_load` bound of design.md hold
 on gfx1150 (they were measured on RDNA2 and, for the vector part, on this GPU before; the `s_buffer_load` bound and the
 `idxen offen` and offset-only soffset forms are new on gfx1150). The one difference is `v_pack_b32_f16` quieting
 signaling NaNs (only signaling NaN halves are not judged; a quiet NaN is compared). The default translator path of `mem` ran on the Radeon 880M (`VK_LOADER_DRIVERS_SELECT=*amd*`, `vk_compute_test` built with g++ as in the lab script): `--family mem --programs 200 --seed 1` gave 400 of 400 programs (native wave64 and wave32) matching the model, 0 not translated, 0 harness errors, so the translator agrees with the model on the OOB_SELECT, straddle, `s_load` and `s_buffer_load` rules there. On the RTX 5070 `vk_compute_test` loses the device (-4) for this and for the unchanged generator of `main`, so use the AMD device.
+
+### Packed and 16-bit integer VALU (`tools/pk16_diff.py`)
+
+`valu_fuzz.py --family f16` runs the 16-bit shifts, `v_add/sub_nc_u16`, `v_mul_lo_u16` and the 16-bit min/max on
+the GPU with VGPR sources. `tools/pk16_diff.py` adds the packed integer ops (`v_pk_add/sub_u16/i16`,
+`v_pk_mul_lo_u16`, `v_pk_min/max_u16/i16`, `v_pk_mad_u16/i16` and the packed shifts) with `op_sel`, `op_sel_hi` and
+`clamp`, and the 16-bit VOP3 ops (`v_add/sub_nc_i16`, `v_min3/max3/med3_u16/i16`, `v_mad_u16/i16` next to the ones
+above) with `op_sel` on every source and on the destination half and `clamp`. Sources are VGPRs, SGPRs, integer and
+float inline constants and literals within the constant-bus limits. It runs one lane through
+`tests/semantic/spirv_mini_interp.py` against its own ISA model, with the shrinking, skips and exit codes of
+`salu_diff.py`. A constant whose high half a packed add/sub/mul/min/max/mad reads is left out unless `--known` (the
+translator rejects it; #2224 changes that).
+
+Measured on an RDNA2 iGPU (gfx1036) with `--oracle hw`: 2,300 programs, the `--known` forms included, match the
+model. A 16-bit VOP3 op keeps the other half of its destination. A constant source is its 32-bit value split like a
+register: `-16` is `0xfff0`/`0xffff`, `1.0` is `0x0000`/`0x3f80` (f32 bits, unlike the f16 ops), and a literal of a
+16-bit VOP3 op has 16 bits (`0xffff` with `op_sel` reads 0). The VOP2-named 16-bit ops (`v_mul_lo_u16`,
+`v_min/max_*16`, the shifts) only have a VOP3 encoding on GFX10, and the generator writes them with `_e64`, because
+without encoding bytes the translator reads a bare mnemonic as the VOP2 write that zeroes the high half. For the same
+reason, rules that depend on the encoding bytes, such as a literal's 12-byte VOP3 encoding (SHADER-208), are out of
+its reach.
+
+```
+python -I tools/pk16_diff.py --programs 3000 --seed 11 --max-ops 8
+python -I tools/pk16_diff.py --oracle hw --programs 500 --seed 1
+python -I tests/test_pk16_diff.py
+```
 
 ### Wave and cross-lane ops on the GPU (`tools/crosslane_fuzz.py`, FUZZ-7)
 
@@ -905,6 +1069,28 @@ denormals kept (461 each; like the other transcendental ops), and ignored with I
 under omod (35 each, none with IEEE on); a signalling NaN passes unchanged with IEEE off and is quieted with IEEE on
 (59); denormal operands read as zero and denormal results flush in every mode.
 
+A discrete RDNA2 part (SHADER-353): an RX 6700 XT (gfx1031; AMD Windows driver 26.11.2, Vulkan 1.4.315, Windows 11
+10.0.26200, `amdhip64_6.dll`, AMD clang 24.0.0git from rocm-sdk-core 10.2.0, MinGW gcc as the host compiler, main at
+4eb6155d with this change), `--oracle hw --programs 5000`, seeds 1 to 6: 39,101 programs, **28,856 match, 0 mismatch, 66 known
+deviation** (all `omod_neg_zero`), 4,056 skipped (the four GFX10.1-only mad opcodes), 3,201 denormal, 2,922 other. More
+programs than on gfx1036, probably because `v_rcp_iflag_f32` and its probes are in the table now. MODE read back as `0x1c0`, `0x1f0`, `0xc0` and
+`0x3c0`; `--negative-control` catches all six wrong models (5 to 23 mismatches). The omod table, summed over the six
+seeds (flush / keep / no_dx10 / ieee), answers what the gfx1150 row of `docs/design.md` left open for RDNA2:
+
+| omod, where it changes the result | flush | keep | no_dx10 | ieee |
+|---|---|---|---|---|
+| applied | 2,680 | 869 | 2,680 | 0 |
+| applied, but a -0 result becomes +0 | 66 | 22 | 66 | 0 |
+| ignored | 0 | 1,811 | 0 | 2,650 |
+| -0 result kept (applied or ignored, same word) | 0 | 44 | 0 | 65 |
+| other | 0 | 0 | 0 | 31 |
+
+With denormals kept, the 869 + 22 applied are all `v_rcp/rcp_iflag/rsq/sqrt/exp/log_f32` and the four cube ops
+(`OMOD_IGNORES_DENORM_MODE`), and the 1,811 ignored are all ALU ops. The 31 "other" with IEEE on are `v_min/max/min3/
+max3/med3_f32` programs with a signalling NaN source, where the IEEE-off min/max rules of #634 do not apply; the omod
+is not what differs there. Before SHADER-353, `omod_label` counted a -0 result that the omod cannot change as "applied",
+which put 65 "applied" in the ieee column although no unambiguous program applied it there.
+
 What the hardware answered where the model does not judge (gfx1150; the RDNA2 run above agrees where it is cited):
 
 - **No model error found.** The model was right wherever it had an answer, in 30,577 programs; the min/max/med3
@@ -935,6 +1121,34 @@ What the hardware answered where the model does not judge (gfx1150; the RDNA2 ru
   mode and op, never `0x7fc00000`. `v_cvt_f16_f32` and `v_cvt_pkrtz_f16_f32` turn a NaN into an f16 NaN with the top 10
   payload bits and the quiet bit set (not the canonical `0x7e00` the model writes; payload not judged, quietness is).
   `v_cvt_f32_f16` keeps the f16 payload shifted left by 13 and does not quiet it (the model agrees).
+
+### f32 misc ops and float compares (`tools/fmisc_diff.py`)
+
+`tools/f32_fuzz.py` generates the f32 arithmetic. `tools/fmisc_diff.py` covers the f32 ops it leaves out:
+`v_fract_f32`, `v_frexp_mant_f32`, `v_frexp_exp_i32_f32`, `v_ldexp_f32`, `v_cvt_u32_f32`, `v_cvt_i32_f32`,
+`v_cvt_off_f32_i4` and `v_fmamk_f32`. It also covers the 16 `v_cmp_*_f32` conditions (e32 into VCC, e64 into an SGPR
+mask or VCC) and `v_cmp_class_f32` e64, each read back with `v_cndmask_b32_e64`. Programs use VOP3 `neg`/`abs`,
+`mul:2`/`mul:4`/`div:2` and `clamp`, with VGPR, SGPR, inline-constant and literal sources within the constant-bus
+limits. It runs one lane through `tests/semantic/spirv_mini_interp.py` against its own exact-rational ISA model, with
+the shrinking, skips and exit codes of `salu_diff.py`. Any NaN matches any NaN. It does not judge denormal operands
+or results, a computed NaN read as an integer, the clamp of a NaN or an output modifier that gives a zero: those
+programs are counted as skips with the reason.
+
+`--oracle hw` runs the kernels under the MODE inferred for the game's shaders (IEEE off, f32 denormals flushed). With
+the assembler's compute default (IEEE on) the hardware ignores `omod`: `v_fract_f32_e64 v4, -v16 mul:2` with v16 = 0.5
+gives 0.5. On an RDNA2 iGPU (gfx1036), 1,800 programs gave 1,563 judged and 0 mismatches, so the model's rules hold
+there. Those rules cover the `0x3f7fffff` cap of `v_fract_f32`, `fract(-0) = +0`, `frexp` of ±inf/NaN/±0, `ldexp`
+overflow and underflow, saturating conversions, one rounding in `v_fmamk_f32`, unordered compares and the class bits.
+Modifiers do not change whether a signalling NaN is signalling: `v_cmp_class_f32` with `-v`, `|v|` or `-|v|` on
+`0x7f800001` still sets bit 0. The translator applies those modifiers with `OpFNegate`/`FAbs`, and in the
+interpreter that quiets the NaN. That form is left out unless `--known` (`class-snan-mods`, posted as a finding).
+`v_cmp_class_f32` without modifiers and `v_cvt_f32_ubyteN` are in `f32_fuzz.py`.
+
+```
+python -I tools/fmisc_diff.py --programs 3000 --seed 11 --max-ops 8
+python -I tools/fmisc_diff.py --oracle hw --programs 500 --seed 1
+python -I tests/test_fmisc_diff.py
+```
 
 
 ### f16 transcendentals on the hardware (`tools/f16_trans_sweep.py`, FUZZ-29)
@@ -1070,6 +1284,77 @@ Measured on an RX 6700 (gfx1031, AMD Windows driver 32.0.21045.29003, ROCm wheel
 each value is staged once, and that the kernels assemble for gfx1031. A fake oracle plays the GPU to check the exit
 codes. On a GFX10 GPU the test runs UNORM8 and checks the controls.
 
+### `image_get_resinfo` and `image_get_lod` (`tools/image_query_probe.py`, SHADER-388)
+
+`docs/design.md` ("Image atomics, size and LOD queries") took resinfo's depth word, the clamped LOD under a linear mip
+filter and the order of u and v in the LOD query from the T# fields and the spec. The probe runs both instructions
+natively on a GFX10 GPU through the hardware oracle. Neither reads memory, so a T# with no texture behind it is
+enough. Each case runs in wave32 and wave64.
+
+```
+python -I tools/image_query_probe.py --json query.json      # 614 results; exit 77 without the oracle or on non-GFX10
+python -I tools/image_query_probe.py --self-test             # the rules against values measured on gfx1036, no GPU
+```
+
+- **resinfo:** 2D and 2D-array T#s with WORD4 DEPTH 0, 5, the GFX10.3 pitch and 0x1FFF, BASE_LEVEL 0 to 2, levels
+  inside and past LAST_LEVEL.
+- **get_lod:** one 2x2 quad of lanes whose u steps across x and v across y. MIP_FILTER none, point and linear, with
+  MIN_LOD/MAX_LOD pairs including MIN above MAX and MIN above the last level, LOD_BIAS 0, 1 and -0.5, at LODs that
+  are exact in binary. Every lane of the quad must agree. A 64x4 image steps one axis at a time.
+
+Measured on the Radeon Graphics of a Ryzen 9 9950X3D (gfx1036, AMD Windows driver 32.0.21045.16010, ROCm wheel
+clang), every result matched the rules in the tool's docstring:
+
+- The 2D depth word is 0, never DEPTH + 1. A 2D array's layer count is minified as max(1, layers >> (BASE_LEVEL +
+  level)): 100 layers at level 3 gave 12.
+- Past the last level, width, height and depth are 0, while the level count stays.
+- Raw LOD = computed LOD + LOD_BIAS. The clamped LOD is the level that would be read: 0 with no mip filter, the
+  clamp rounded half up with point, the clamp itself with linear.
+
+`tests/test_image_query_probe.py` checks the rules against the measured values, the descriptor bits and the
+kernels. A fake oracle plays the GPU to check the comparison and the exit codes; with a 2D depth of 1 it fails. On
+a GFX10 GPU the test runs the whole probe.
+### d16 image loads of 32-bit integer texels (`tools/image_d16_probe.py`, SHADER-387)
+
+`docs/design.md` ("Typed image loads") saturates a 32-bit UINT or SINT texel to the 16-bit range of its signedness
+when a d16 `image_load` packs it (Mesa sets `integer_dest_saturates` for AMD). Native gfx1036 had shown that on 2D
+images; the probe measures it on every dimension the translator handles, through the hardware oracle on a GFX10 GPU.
+
+```
+python -I tools/image_d16_probe.py --json d16_image.json   # 16 kernels, one lane per texel; exit 77 without the oracle
+python -I tools/image_d16_probe.py --self-test             # the rules, T# words and kernels, no GPU
+```
+
+- **Cases.** `SQ_RSRC_IMG_1D`, `2D`, `2D_ARRAY` (3 layers) and `3D` (depth 3), each with 32_UINT and 32_SINT
+  (`dmask:0x1`) and 32_32_UINT and 32_32_SINT (`dmask:0x3`, both results in one VGPR), read with `image_load` and
+  `image_load_mip` at mip 0. The texture sits in the kernel's code after `s_endpgm`, linear, with 256-byte rows (64
+  R32 or 32 R32G32 texels), so the layout does not depend on how the T# states the pitch. The staged words start with the values that separate the rules (0x7fff, 0x8000, 0xffff, 0x10000,
+  0x7fffffff, 0x80000000, -32769, -32768 and their neighbours), then a fixed mixing sequence.
+- **Rules compared:** `trunc` (the low 16 bits), `sat_u` (min(w, 0xffff)) and `sat_s` (w clamped to
+  [-32768, 32767]). Every pair differs on some staged value. A one-channel result also reports its high half, which
+  starts as 0x5a5a.
+- **Controls.** The same texel read without d16 must return the staged word, for x and, on two-channel formats, y:
+  a wrong extent, layer or slice offset fails it (exit 2). On gfx1036, a T# with one layer fewer than a 2D
+  array's three, a 3D depth of 1, or a 1D width of 32 failed 246 of 384, 246 of 384 and 31 of 64 controls.
+  `image_load` and `image_load_mip` must agree (exit 1).
+
+Measured on the integrated GPU of a Ryzen 7 7800X3D (gfx1036, AMD Windows driver 32.0.21045.29003, ROCm wheel
+clang), wave32, every control read back:
+
+| Dimension | Texels per format (one / two channels) | UINT | SINT | High half (one channel) |
+| --- | --- | --- | --- | --- |
+| 1D | 64 / 32 | `sat_u` on all | `sat_s` on all | kept |
+| 2D | 128 / 64 | `sat_u` on all | `sat_s` on all | kept |
+| 2D-array | 384 / 192 | `sat_u` on all | `sat_s` on all | kept |
+| 3D | 384 / 192 | `sat_u` on all | `sat_s` on all | kept |
+
+`image_load` and `image_load_mip` gave the same words on every texel. No result followed `trunc` where it differs
+from saturation. The translator's `saturate_int16` follows this on every dimension; the translated 1D, 2D-array and
+3D d16 loads have not been run on a GPU yet.
+
+`tests/test_image_d16_probe.py` checks the rules, the T# fields and the kernels without a GPU, assembles them for
+gfx1036 when AMD clang is there, and checks the exit codes with a fake oracle. On a GFX10 GPU it runs the probe.
+
 ### `v_fma_mix*` f16 rounding in nearest mode (`tools/fma_mix_probe.py`)
 
 `docs/design.md` leaves one f16 question open. In round-to-nearest mode, does `v_fma_mixlo_f16` / `v_fma_mixhi_f16`
@@ -1150,7 +1435,7 @@ The `hw` side runs one lane per case in wave32 and wave64, under five MODEs:
 It reports the NaN halves that give 0, the words equal to the translator's, and the near-tie words equal to a single
 rounding of the exact product. Exit 0 means every hardware word equals the translator's, 1 means one differs, 77
 means the oracle is unavailable. `tests/test_pknorm_probe.py` checks four near-tie words against a derivation written
-out by hand, and checks that the translator side rounds twice there and gives 0 for a NaN half.
+out by hand, and checks that the translator side rounds once there (since SHADER-363) and gives 0 for a NaN half.
 
 Results (134 cases per run):
 
@@ -1164,8 +1449,10 @@ product once, to nearest even. Examples:
 - `0x38400180` (exact 1.5 - 1.4e-9) gives 1, where the translator gives 2;
 - `0x3c004101` (exact 256.5 + 1.5e-5) gives 257, where the translator gives 256.
 
-The translator is not changed here. It needs the exact product: the product's rounding error is exact through `Fma`
-(`Fma(x, s, -p)`), and only its sign matters on a tie.
+SHADER-363 fixes the translator. It keeps the f32 product p and its exact error `Fma(x, s, -p)`. When p lies exactly
+on k + 0.5, the error's sign gives floor(p) + 1 or floor(p), and a zero error keeps `RoundEven` (an exact tie). The
+probe then exits 0 on the same iGPU: all 134 words equal the translator's in all ten runs (wave32 and wave64, five
+MODEs), including the 28 near ties.
 
 ### f16 output modifiers, clamp and `v_fma_mix*` operands on RDNA2 (SHADER-135)
 
@@ -1229,6 +1516,45 @@ are not NaN, and for the f16 denormals. It differs in five ways, none fixed here
 5. **NaN payloads.** Where the hardware keeps the payload and, with IEEE 0, the signalling bit, the translator writes
    the canonical quiet NaN (`0x7fc00000`, `0x7e00`). For example, `v_fmac_f16` keeps `0x7c01`. This is the "not
    modelled yet" note of the f16 transcendentals row in `docs/design.md`, here for these ops too.
+
+### Integer operations and scalar ALU verification (`tools/salu_diff.py`, gfx1036 follow-up to #1746)
+
+As a follow-up to #1746 (SHADER-137), `tools/salu_diff.py` and `tests/test_salu_diff.py` were expanded to include 12 integer SALU operations (`s_absdiff_i32`, `s_mul_hi_i32`, `s_lshl1..4_add_u32`, `s_sext_i32_i8`, `s_sext_i32_i16`, `s_flbit_i32`, and `s_pack_ll/lh/hh_b32_b16`) and tested on native desktop RDNA2 silicon (`gfx1036`), complementing #1746's laptop `gfx1035` probe.
+
+Hardware validation was executed via `tools/hw_oracle` and `tools/salu_diff.py` on native AMD RDNA2 silicon:
+
+- **GPU**: AMD Radeon(TM) Graphics (`gfx1036`), AMD Windows driver `32.0.21045.29003`, Windows 11, `amdhip64_6.dll`, AMD clang 23.0.0git (`rocm-sdk-core 10.0.0`).
+- **Second-silicon verification of #1746 (`tools/int_hw_probe.py`)**:
+  - `python -I tools/int_hw_probe.py --oracle both --wave both`: **87 cases: 87 match, 0 known divergence, 0 unexpected mismatch, 0 wave32/64 diff** on native `gfx1036` (corroborating that the 5 divergences originally reported by #1746 are now fully resolved on `main`).
+- **SALU operations (`s_absdiff_i32`, `s_mul_hi_i32`, `s_lshl1..4_add_u32`)**:
+  - `python -I tools/salu_diff.py --ops s_absdiff_i32,s_mul_hi_i32,s_lshl1_add_u32,s_lshl2_add_u32,s_lshl3_add_u32,s_lshl4_add_u32 --programs 500 --oracle translator,hw`: **500 passed, 0 mismatches**.
+  - Confirmed SCC preserved across operations with prior SCC=0 and SCC=1.
+- **Sign-extension and pack (`s_sext_i32_i8`, `s_sext_i32_i16`, `s_flbit_i32`, `s_pack_ll/lh/hh_b32_b16`)**:
+  - `python -I tools/salu_diff.py --ops s_sext_i32_i8,s_sext_i32_i16,s_flbit_i32,s_pack_ll_b32_b16,s_pack_lh_b32_b16,s_pack_hh_b32_b16 --programs 500 --oracle translator,hw`: **500 passed, 0 mismatches**.
+  - `s_cmov_b32` verified on hardware under SCC=0 (destination preserved) and SCC=1 (destination loaded).
+- **VALU product-sum (`v_mad_u64_u32`, `v_mad_i64_i32`)**:
+  - 292 programs in wave32 across special and random 32/64-bit inputs: **292 passed, 0 mismatches**.
+  - 192 programs in wave64 across special inputs: **192 passed, 0 mismatches**.
+  - Carry-out and sign bits in sdst matched the 65-bit ISA reference bit-for-bit.
+- **Integer saturation (`clamp`)**:
+  - 567 programs tested across `v_add_nc_u32_e64`, `v_sub_nc_u32_e64`, `v_subrev_nc_u32_e64`, `v_add_nc_i32_e64`, `v_sub_nc_i32_e64`, `v_add_nc_u16_e64`, and `v_sub_nc_u16_e64`: **567 passed, 0 mismatches**.
+  - 16-bit clamp confirmed preserving the high 16 bits of the destination VGPR.
+- **EXEC lane masking**:
+  - Multi-threaded kernel under alternating lane masks (`0xAAAAAAAA`, `0x55555555`) confirmed that inactive lanes write 0 in sdst mask words for `v_add_co_u32` and `v_mad_u64_u32`.
+- **SAD family and lerp (`v_sad_u8`, `v_sad_hi_u8`, `v_sad_u16`, `v_sad_u32`, `v_msad_u8`, `v_mqsad_u32_u8`, `v_qsad_pk_u16_u8`, `v_mqsad_pk_u16_u8`, `v_lerp_u8`)**:
+  - Verified across edge byte patterns, 64-bit sliding windows, and zero masks: **0 mismatches** against ISA reference.
+- **24-bit products and 64-bit shifts (`v_mul_hi_*24`, `v_lshrrev_b64`, `v_ashrrev_i64`)**:
+  - Verified across signed/unsigned products, edge signs, and 0..63 shift counts: **0 mismatches**.
+
+### Packed 16-bit integer operations on RDNA2 (SHADER-302)
+
+*Measured on an RDNA2 iGPU (gfx1036), Windows 11, AMD Windows driver 32.0.21045.29003, HIP backend (`amdhip64_6.dll`), AMD clang 23.0.0git (`rocm-sdk-core 10.0.0`).*
+
+380 raw compute kernels covering all 11 packed 16-bit integer instructions (`v_pk_add_u16`, `v_pk_sub_u16`, `v_pk_add_i16`, `v_pk_sub_i16`, `v_pk_mul_lo_u16`, `v_pk_mad_u16`, `v_pk_mad_i16`, `v_pk_max_u16`, `v_pk_min_u16`, `v_pk_max_i16`, `v_pk_min_i16`), tested in both wave32 and wave64:
+
+- **Constant operands under `op_sel` / `op_sel_hi`:** Integer constants under VOP3P are uniformly treated as 32-bit dwords `C`. When `op_sel[i] == 0`, bits `[15:0]` are selected; when `op_sel[i] == 1`, bits `[31:16]` are selected. Positive inline constants zero-extend (`5` → `0x00000005`: lo=`0x0005`, hi=`0x0000`; `64` → `0x00000040`: lo=`0x0040`, hi=`0x0000`). Negative inline constants sign-extend (`-1` → `0xFFFFFFFF`: lo=`0xFFFF`, hi=`0xFFFF`; `-16` → `0xFFFFFFF0`: lo=`0xFFF0`, hi=`0xFFFF`). 32-bit literals preserve their full dword (`0x12345678`: lo=`0x5678`, hi=`0x1234`; `0x80017fff`: lo=`0x7fff`, hi=`0x8001`). Float inline tokens (`0.5`, `1.0`, `-2.0`, `4.0`) assemble as their 32-bit IEEE 754 bit patterns (`1.0` → `0x3f800000`: lo=`0x0000`, hi=`0x3f80`).
+- **`clamp` saturation:** Unsigned add/mad saturate to `0xFFFF`; unsigned sub saturates underflow to `0x0000`; signed add/sub/mad saturate to `[-32768, 32767]`.
+- **Silicon vs Translator parity:** 380 of 380 kernels match bit-for-bit between native hardware and `tools/rdna2spirv.py` lowered to SPIR-V (0 mismatches, 0 wave32/wave64 differences).
 
 ## Coverage plan and cost
 

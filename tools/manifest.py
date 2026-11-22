@@ -76,8 +76,8 @@ def _hash_file(path: str, *, expected_size: int | None = None) -> tuple[int, str
     return size, h.hexdigest()
 
 
-def sha256(path: str) -> str:
-    return _hash_file(path)[1]
+def sha256(path: str, *, expected_size: int | None = None) -> str:
+    return _hash_file(path, expected_size=expected_size)[1]
 
 
 def same_output_path(first: str, second: str) -> bool:
@@ -107,7 +107,12 @@ def walk(game_dir: str, *, exclude=None):
             if contains_manifest and os.path.normcase(name) == excluded_name:
                 continue
             p = os.path.join(root, name)
-            yield os.path.relpath(p, game_dir).replace("\\", "/"), p
+            rel = os.path.relpath(p, game_dir)
+            if os.sep != "/":
+                rel = rel.replace(os.sep, "/")
+            if os.altsep and os.altsep != "/":
+                rel = rel.replace(os.altsep, "/")
+            yield rel, p
 
 
 def create(game_dir: str, out: str, jobs: int = 1) -> int:
@@ -217,13 +222,16 @@ def verify(game_dir: str, manifest: str, jobs: int = 1) -> int:
         else:
             pending.append((rel, p, info["sha256"].lower()))
 
+    def hash_pending(rel: str, path: str) -> str:
+        return sha256(path, expected_size=want[rel]["size"])
+
     if jobs == 1:
         for rel, p, digest in pending:
-            if sha256(p) != digest:
+            if hash_pending(rel, p) != digest:
                 problems[rel] = "CHANGED"
     else:
         with ThreadPoolExecutor(max_workers=jobs) as pool:
-            futures = {pool.submit(sha256, p): (rel, digest) for rel, p, digest in pending}
+            futures = {pool.submit(hash_pending, rel, p): (rel, digest) for rel, p, digest in pending}
             for future in as_completed(futures):
                 rel, digest = futures[future]
                 if future.result() != digest:

@@ -128,6 +128,19 @@ class SourceDiscovery(unittest.TestCase):
             self.assertTrue((out / "ps_ok.spv").is_file())
             self.assertFalse((out / "nested.spv").exists())
 
+    def test_a_new_output_folder_with_missing_parents_still_works(self):
+        # The ancestor walk in the --out guard must not reject folders that simply don't exist yet.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            src = root / "disasm"
+            src.mkdir()
+            (src / "ps_ok.s").write_text("\ts_endpgm\n", encoding="utf-8")
+            (root / "ps_ok.dxbc").write_bytes(b"DXBC" + bytes(28))
+            out = root / "new" / "deep" / "spirv"
+            stdout = self.run_main(src, out)
+            self.assertIn("1 pass spirv-val", stdout)
+            self.assertTrue((out / "ps_ok.spv").is_file())
+
     def test_non_s_file_as_src_is_refused_with_usage_error(self):
         with tempfile.TemporaryDirectory() as tmp:
             src = os.path.join(tmp, "notes.txt")
@@ -158,6 +171,81 @@ class CommandLine(unittest.TestCase):
                     self.assertIn(message, p.stderr)
                     self.assertNotIn("Traceback", p.stderr)
                     self.assertFalse(os.path.exists(out))     # 9/8 used to write an empty index.part9.json
+
+
+class OutputFolderValidation(unittest.TestCase):
+    """--out must be a folder path: a file there is a usage error, never a traceback."""
+
+    def setUp(self):
+        self.tmp = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.src = self.tmp / "disasm"
+        self.src.mkdir()
+        (self.src / "ps_x.s").write_text("\ts_endpgm\n", encoding="utf-8")
+
+    def run_tool(self, out, *extra, timeout=None):
+        return subprocess.run([sys.executable, "-I", TOOL, str(self.src), "--out", os.fspath(out), *extra],
+                              capture_output=True, text=True, timeout=timeout)
+
+    def assert_usage_error(self, p, message):
+        self.assertEqual(p.returncode, 2, p.stderr)
+        self.assertNotIn("Traceback", p.stderr)
+        # argparse prints its usage and one error line; no exception text besides that line.
+        self.assertEqual(len([line for line in p.stderr.splitlines() if "error:" in line]), 1, p.stderr)
+        self.assertIn(message, p.stderr)
+
+    def test_a_file_at_out_is_refused_and_left_alone(self):
+        out = self.tmp / "out.txt"
+        out.write_text("keep", encoding="utf-8")
+        p = self.run_tool(out)
+        self.assert_usage_error(p, "is a file, not a folder")
+        self.assertEqual(out.read_text(encoding="utf-8"), "keep")
+
+    def test_an_out_under_a_file_is_refused_and_the_file_is_left_alone(self):
+        blocker = self.tmp / "blocker.txt"
+        blocker.write_text("keep", encoding="utf-8")
+        p = self.run_tool(blocker / "sub")
+        self.assert_usage_error(p, "cannot create")
+        self.assertEqual(blocker.read_text(encoding="utf-8"), "keep")
+        self.assertFalse((blocker / "sub").exists())
+
+    def test_a_file_at_out_is_refused_with_merge(self):
+        out = self.tmp / "out.txt"
+        out.write_text("keep", encoding="utf-8")
+        p = self.run_tool(out, "--merge")
+        self.assert_usage_error(p, "is a file, not a folder")
+        self.assertEqual(out.read_text(encoding="utf-8"), "keep")
+
+    def test_a_file_at_out_with_a_trailing_separator_is_refused(self):
+        out = self.tmp / "out.txt"
+        out.write_text("keep", encoding="utf-8")
+        p = self.run_tool(str(out) + os.sep)
+        self.assertEqual(p.returncode, 2, p.stderr)
+        self.assertNotIn("Traceback", p.stderr)
+        self.assertIn(str(out), p.stderr)
+        self.assertEqual(out.read_text(encoding="utf-8"), "keep")
+
+    def test_an_unmapped_drive_root_is_refused_without_hanging(self):
+        if os.name != "nt":
+            self.skipTest("unmapped drive roots are a Windows path case")
+        drive = next((f"{c}:\\" for c in "ZYXWVUTSRQPONMLKJIHGFEDCBA" if not os.path.exists(f"{c}:\\")), None)
+        if drive is None:
+            self.skipTest("every drive letter exists on this machine")
+        out = os.path.join(drive, "shaders")
+        p = self.run_tool(out, timeout=30)
+        # A root that does not exist used to make the ancestor walk spin forever.
+        self.assert_usage_error(p, "cannot create")
+
+    def test_a_symlink_to_a_file_at_out_is_refused(self):
+        target = self.tmp / "target.txt"
+        target.write_text("keep", encoding="utf-8")
+        link = self.tmp / "link-out"
+        try:
+            os.symlink(target, link)
+        except (OSError, NotImplementedError) as e:
+            self.skipTest(f"symlinks are not available here: {e}")
+        p = self.run_tool(link)
+        self.assert_usage_error(p, "is a file, not a folder")
+        self.assertEqual(target.read_text(encoding="utf-8"), "keep")
 
 
 class ValidatedOutput(unittest.TestCase):
@@ -280,8 +368,9 @@ class PopsInvocationInterlock(unittest.TestCase):
         gen.uses_pops = True
         gen.body = ["OpNoOp"]
         spv = rdna2spirv.assemble(gen)
-        self.assertIn("OpBeginInvocationInterlockEXT", spv)
-        self.assertIn("OpEndInvocationInterlockEXT", spv)
+        self.assertEqual(spv.count("OpBeginInvocationInterlockEXT"), 1)
+        self.assertEqual(spv.count("OpEndInvocationInterlockEXT"), 1)
+        self.assertLess(spv.index("OpBeginInvocationInterlockEXT"), spv.index("OpEndInvocationInterlockEXT"))
 
     def test_branching_pops_pixel_shader_emits_begin_and_end_interlock(self):
         gen = rdna2spirv.Gen("ps")
@@ -289,16 +378,17 @@ class PopsInvocationInterlock(unittest.TestCase):
         gen.blocks = [["OpNoOp"]]
         gen.succ = [[]]
         spv = rdna2spirv.assemble(gen)
-        self.assertIn("OpBeginInvocationInterlockEXT", spv)
-        self.assertIn("OpEndInvocationInterlockEXT", spv)
+        self.assertEqual(spv.count("OpBeginInvocationInterlockEXT"), 1)
+        self.assertEqual(spv.count("OpEndInvocationInterlockEXT"), 1)
+        self.assertLess(spv.index("OpBeginInvocationInterlockEXT"), spv.index("OpEndInvocationInterlockEXT"))
 
     def test_non_pops_pixel_shader_omits_interlock_ops(self):
         gen = rdna2spirv.Gen("ps")
         gen.uses_pops = False
         gen.body = ["OpNoOp"]
         spv = rdna2spirv.assemble(gen)
-        self.assertNotIn("OpBeginInvocationInterlockEXT", spv)
-        self.assertNotIn("OpEndInvocationInterlockEXT", spv)
+        self.assertEqual(spv.count("OpBeginInvocationInterlockEXT"), 0)
+        self.assertEqual(spv.count("OpEndInvocationInterlockEXT"), 0)
 
 
 if __name__ == "__main__":

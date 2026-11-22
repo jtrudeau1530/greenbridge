@@ -126,6 +126,55 @@ def test_unsupported_instruction_is_reported_not_guessed(make_shader):
         shader.translate()
 
 
+@pytest.mark.parametrize("a16", [False, True], ids=["a32", "a16"])
+@pytest.mark.parametrize("d16", [False, True], ids=["f32", "d16"])
+def test_explicit_mip_depth_compare(make_shader, a16, d16):
+    # Under A16 the reference is still f32; XY share v1 and LOD is the low half of v2.
+    if a16:
+        moves = "v_mov_b32 v1, 0x3a003400\nv_mov_b32 v2, 0x40003c00\n"
+        address, modifier = "v[0:2]", " a16"
+    else:
+        moves = "v_mov_b32 v1, 0.25\nv_mov_b32 v2, 0.75\nv_mov_b32 v3, 1.0\n"
+        address, modifier = "v[0:3]", ""
+    shader = make_shader("v_mov_b32 v0, 0.5\n" + moves +
+                         f"image_sample_c_l v4, {address}, s[0:7], s[8:11] dmask:0x1 dim:SQ_RSRC_IMG_2D" +
+                         modifier + (" d16" if d16 else "") + "\ns_waitcnt vmcnt(0)\nexp mrt0 v4, v4, v4, v4 done vm\ns_endpgm\n")
+    spv = shader.translate()
+    shader.validate(spv)
+    sample = re.search(r"(%\w+) = OpImageSampleDrefExplicitLod %float %\w+ %\w+ (%\w+) Lod (%\w+)", spv)
+    assert sample
+    defs = dict(re.findall(r"(%\w+) = (.+)", spv))
+
+    def float_source_register(value: str) -> list[str]:
+        load = defs[value].split()[-1]  # f32 bitcast
+        ptr = defs[load].split()[-1]    # raw VGPR word
+        return defs[ptr].split()[-2:]
+
+    result, ref, lod = sample.groups()
+    assert float_source_register(ref) == ["%vgpr", "%c0"]
+    if a16:
+        packed_word = defs[lod].split()[-1]
+        unpacked_half = defs[packed_word].split()[-1]
+        op, _, pair, half = defs[unpacked_half].split()
+        assert (op, half) == ("OpCompositeExtract", "0")
+        raw = defs[pair].split()[-1]
+        assert defs[defs[raw].split()[-1]].endswith("%vgpr %c2")
+    else:
+        assert float_source_register(lod) == ["%vgpr", "%c3"]
+    bits = next(name for name, code in defs.items() if code == f"OpBitcast %uint {result}")
+    assert any(code == f"OpShiftRightLogical %uint {bits} %c10" for code in defs.values()) == d16
+
+
+@pytest.mark.parametrize("sample", [
+    "v[4:5], v[0:3], s[0:7], s[8:11] dmask:0x3 dim:SQ_RSRC_IMG_2D",
+    "v4, v[0:4], s[0:7], s[8:11] dmask:0x1 dim:SQ_RSRC_IMG_3D",
+])
+def test_explicit_mip_depth_compare_unmodelled_forms(make_shader, sample):
+    shader = make_shader(f"image_sample_c_l {sample}\ns_endpgm\n")
+    with pytest.raises(rdna2spirv.Unsupported, match="scalar 2D depth comparison"):
+        shader.translate()
+
+
 @pytest.mark.parametrize("d16", [False, True], ids=["f32", "d16"])
 def test_depth_compare_sample_result_width(make_shader, d16):
     """image_sample_c_lz returns one value: f32 bits, or with d16 an f16 in the low half like every other d16 sample
@@ -162,6 +211,24 @@ def test_mrtz_depth_only_from_an_enabled_x(make_shader, export, depth):
     shader.validate(spvasm)
     assert ("BuiltIn FragDepth" in spvasm) == depth
     assert ("DepthReplacing" in spvasm) == depth
+
+
+@pytest.mark.parametrize("body", [
+    "",                                                              # straight line (SHADER-350)
+    "s_cmp_eq_u32 s20, 0\ns_cbranch_scc1 1\nv_mov_b32 v0, 1.0\n",      # branching control flow
+], ids=["straight-line", "branch"])
+def test_pops_interlock_begins_and_ends_once(make_shader, body):
+    """A PS that reads src_pops_exiting_wave_id runs in one fragment-shader interlock: one
+    OpBeginInvocationInterlockEXT, then one OpEndInvocationInterlockEXT (SPV_EXT_fragment_shader_interlock: each
+    exactly once, begin before end). Validated against spirv-val."""
+    shader = make_shader("v_mov_b32 v0, 0.5\ns_mov_b32 s20, src_pops_exiting_wave_id\n" + body +
+                         "exp mrt0 v0, v0, v0, v0 done vm\ns_endpgm\n", "ps_pops")
+    spvasm = shader.translate()
+    shader.validate(spvasm)
+    assert "PixelInterlockOrderedEXT" in spvasm
+    assert spvasm.count("OpBeginInvocationInterlockEXT") == 1
+    assert spvasm.count("OpEndInvocationInterlockEXT") == 1
+    assert spvasm.index("OpBeginInvocationInterlockEXT") < spvasm.index("OpEndInvocationInterlockEXT")
 
 def test_a16_sample_gradients_use_full_vgprs(make_shader):
     path = os.path.join(ROOT, "runtime", "test", "shaders", "ps_texture_grad_a16.asm")
@@ -684,6 +751,42 @@ def test_wqm_in_a_pixel_shader_uses_the_fragment_quad(make_shader):
     assert asm.count("OpGroupNonUniformQuadSwap") == 2 and "OpCapability GroupNonUniformQuad" in asm
 
 
+FLOAT_CONTROLS_CS = """\
+v_mov_b32_e32 v1, 0x80000000
+v_mul_f32_e32 v2, v1, v1
+v_lshlrev_b32_e32 v3, 2, v0
+buffer_store_dword v2, v3, s[0:3], 0 offen
+s_endpgm
+"""
+
+
+@pytest.mark.parametrize("stage", ["ps", "cs"])
+def test_float_controls_declared(stage, make_shader):
+    """Every module declares SignedZeroInfNanPreserve for 32-bit floats, so the driver keeps NaN, inf and -0 as
+    RDNA2 computes them (AMD folded x != x to false and turned -0 products into +0 without it; see
+    runtime/test/shaders/cs_signed_zero_nan.asm), and its index entry names the property the runtime checks."""
+    body = FLOAT_CONTROLS_CS if stage == "cs" else program("v_mul_f32 v1, v0, v0")
+    shader = make_shader(body, name=f"{stage}_float_controls")
+    spv = shader.translate()
+    shader.validate(spv)
+    assert "OpCapability SignedZeroInfNanPreserve" in spv
+    assert "OpExecutionMode %main SignedZeroInfNanPreserve 32" in spv
+    meta = rdna2spirv.shader_meta(rdna2spirv.translate.last_gen, spv)
+    assert meta["float_controls"] == ["shaderSignedZeroInfNanPreserveFloat32"]
+
+
+def test_no_float_controls_leaves_them_out(make_shader, monkeypatch):
+    """--no-float-controls (FLOAT_CONTROLS = False), for a driver without the property: no capability, no
+    execution mode, no index entry, and the module still validates."""
+    monkeypatch.setattr(rdna2spirv, "FLOAT_CONTROLS", False)
+    shader = make_shader(FLOAT_CONTROLS_CS, name="cs_no_float_controls")
+    spv = shader.translate()
+    shader.validate(spv)
+    assert "SignedZeroInfNanPreserve" not in spv
+    meta = rdna2spirv.shader_meta(rdna2spirv.translate.last_gen, spv)
+    assert "float_controls" not in meta
+
+
 EMULATE_SAMPLES = [p for p in SAMPLES if os.path.basename(p).startswith(("cs_", "ms_"))]
 
 
@@ -762,7 +865,8 @@ def _gather_l(s_word0, dynamic=False, s_word1=0):
         "s_mov_b32 s8, 0\ns_mov_b32 s9, 0\ns_mov_b32 s10, 0\ns_mov_b32 s11, 0\n"
         "s_mov_b32 s12, 0\ns_mov_b32 s13, 0\ns_mov_b32 s14, 0\ns_mov_b32 s15, 0\n"
         f"s_mov_b32 s16, {s_word0}\ns_mov_b32 s17, {s_word1}\ns_mov_b32 s18, 0\ns_mov_b32 s19, 0\n"
-        + ("s_add_u32 s16, s16, 0\n" if dynamic else "")
+        # A loaded word, not s16 + 0: SHADER-315 folds scalar ALU on constants, which made the sampler a literal.
+        + ("s_load_dword s16, s[0:1], 0x0\ns_waitcnt lgkmcnt(0)\n" if dynamic else "")
         + "v_mov_b32 v10, 0.5\nv_mov_b32 v11, 0.5\nv_mov_b32 v12, 0\n"
         "image_gather4_l v[0:3], v[10:12], s[8:15], s[16:19] dmask:0x1 dim:SQ_RSRC_IMG_2D")
 
@@ -781,12 +885,15 @@ def _gather_address_bit_offsets(text: str) -> list[int]:
 @pytest.mark.parametrize("my", range(4))
 def test_gather4_l_literal_sampler_emits_only_the_code_its_modes_need(mx, my, make_shader):
     """CLAMP_X = bits [2:0], CLAMP_Y = [5:3]; 0 wrap, 1 mirror, 2 clamp, 3 mirror once. Each axis maps its two
-    texel coordinates: wrap = 1 OpSMod, mirror = 1 OpSMod + 1 OpSLessThan, mirror once = 1 OpSGreaterThanEqual."""
+    texel coordinates: wrap = 1 OpSRem + 1 OpSLessThan (the modulo's fix-up), mirror = the same + 1 OpSLessThan
+    (the reflection), mirror once = 1 OpSGreaterThanEqual. No OpSMod: AMD's Windows driver gave it the dividend's
+    sign for a negative coordinate (Gen.gather_addr)."""
     shader = make_shader(_gather_l(mx | my << 3))
     text = shader.translate()
     shader.validate(text)
-    assert _count(text, "OpSMod") == 2 * (mx in (0, 1)) + 2 * (my in (0, 1))
-    assert _count(text, "OpSLessThan") == 2 * (mx == 1) + 2 * (my == 1)
+    assert _count(text, "OpSMod") == 0
+    assert _count(text, "OpSRem") == 2 * (mx in (0, 1)) + 2 * (my in (0, 1))
+    assert _count(text, "OpSLessThan") == 2 * (mx in (0, 1)) + 2 * (mx == 1) + 2 * (my in (0, 1)) + 2 * (my == 1)
     assert _count(text, "OpSGreaterThanEqual") == 2 * (mx == 3) + 2 * (my == 3)
     assert _gather_address_bit_offsets(text) == []      # the sampler modes are literals
 
@@ -832,8 +939,11 @@ def test_gather4_l_run_time_sampler_selects_the_mode_from_the_sgpr(make_shader):
     text = shader.translate()
     shader.validate(text)
     assert _gather_address_bit_offsets(text) == [0, 3]      # CLAMP_X and CLAMP_Y
-    # OpSLessThan: 4 for mirror, 8 for the border-mode range tests (SHADER-348: two per texel coordinate)
-    assert _count(text, "OpSMod") == 8 and _count(text, "OpSLessThan") == 12 and _count(text, "OpSGreaterThanEqual") == 4
+    # Four coordinates, each through all four modes: wrap and mirror an OpSRem and a fix-up OpSLessThan each (8),
+    # mirror one more OpSLessThan (4), SHADER-348 border-mode range tests two OpSLessThan each (8), mirror once an
+    # OpSGreaterThanEqual (4).
+    assert _count(text, "OpSMod") == 0 and _count(text, "OpSRem") == 8
+    assert _count(text, "OpSLessThan") == 20 and _count(text, "OpSGreaterThanEqual") == 4
 
 
 @pytest.mark.parametrize("word0", [4, 0x28, 0x8000])
@@ -849,7 +959,8 @@ def _gather_l_border(word0, word3, dynamic=False, dmask=1):
         "s_mov_b32 s8, 0\ns_mov_b32 s9, 0\ns_mov_b32 s10, 0\ns_mov_b32 s11, 0\n"
         "s_mov_b32 s12, 0\ns_mov_b32 s13, 0\ns_mov_b32 s14, 0\ns_mov_b32 s15, 0\n"
         f"s_mov_b32 s16, {word0}\ns_mov_b32 s17, 0\ns_mov_b32 s18, 0\ns_mov_b32 s19, {word3}\n"
-        + ("s_add_u32 s16, s16, 0\ns_add_u32 s19, s19, 0\n" if dynamic else "")
+        + ("s_load_dword s16, s[0:1], 0x0\ns_load_dword s19, s[0:1], 0x4\ns_waitcnt lgkmcnt(0)\n"
+           if dynamic else "")
         + "v_mov_b32 v10, 0.5\nv_mov_b32 v11, 0.5\nv_mov_b32 v12, 0\n"
         f"image_gather4_l v[0:3], v[10:12], s[8:15], s[16:19] dmask:{dmask:#x} dim:SQ_RSRC_IMG_2D")
 
@@ -1205,6 +1316,79 @@ def test_array_resinfo_queries_width_height_layers_and_mip_count(make_shader):
         assert f"OpCompositeExtract %int {size[1]} {axis}" in asm
 
 
+class _ResinfoStub:
+    """Just enough of the generator for Gen.resinfo_words; the lines are evaluated by _eval_resinfo."""
+    def __init__(self):
+        self.n, self.lines = 0, []
+
+    def tmp(self):
+        self.n += 1
+        return f"%t{self.n}"
+
+    def cu(self, v):
+        return f"%c{v & 0xFFFFFFFF:x}"
+
+    def emit(self, s):
+        self.lines.append(s)
+
+    def as_int(self, u):
+        i = self.tmp()
+        self.emit(f"{i} = OpBitcast %int {u}")
+        return i
+
+
+def _eval_resinfo(lines, view, level, word3):
+    """view: (width, height, layers, levels) of the Vulkan view, which starts at the T#'s BASE_LEVEL. Values are
+    Python ints (uint words); OpImageQuerySizeLod refuses a level the view doesn't have, as Vulkan leaves it undefined."""
+    width, height, layers, levels = view
+    env = {"%img": None, "%level": level, "%word3": word3}
+
+    def val(x):
+        return int(x[2:], 16) if x.startswith("%c") else env[x]
+    for line in lines:
+        dst, _, op, _type, *args = line.split()
+        if op == "OpImageQueryLevels":
+            env[dst] = levels
+        elif op == "OpImageQuerySizeLod":
+            lod = val(args[1])
+            assert 0 <= lod < levels, f"OpImageQuerySizeLod at level {lod} of a {levels}-level view"
+            env[dst] = (max(1, width >> lod), max(1, height >> lod), layers)
+        elif op == "OpCompositeExtract":
+            env[dst] = env[args[0]][int(args[1])]
+        elif op == "OpExtInst":
+            assert args[1] == "UMax"
+            env[dst] = max(val(args[2]), val(args[3]))
+        elif op == "OpBitFieldUExtract":
+            env[dst] = (val(args[0]) >> val(args[1])) & ((1 << val(args[2])) - 1)
+        else:
+            a = [val(x) for x in args]
+            env[dst] = {"OpBitcast": lambda: a[0], "OpULessThan": lambda: a[0] < a[1],
+                        "OpSelect": lambda: a[1] if a[0] else a[2], "OpIAdd": lambda: (a[0] + a[1]) & 0xFFFFFFFF,
+                        "OpShiftRightLogical": lambda: a[0] >> a[1] if a[1] < 32 else 0}[op]()
+    return env
+
+
+@pytest.mark.parametrize("array", [False, True])
+def test_resinfo_words_follow_rdna2(array):
+    """SHADER-388 (tools/image_query_probe.py on gfx1036): a 2D depth word is 0; a 2D array's layer count is
+    minified from BASE_LEVEL; past the last level width, height and depth are 0 and the level count stays; a level
+    with bit 31 set is past the last level too (the address VGPR is unsigned)."""
+    cases = {  # (T# full size w, h, layers, BASE_LEVEL, LAST_LEVEL, level) -> words, as measured
+        (16, 4, 1, 0, 4, 0): [16, 4, 0, 5], (16, 4, 1, 0, 4, 3): [2, 1, 0, 5], (16, 4, 1, 0, 4, 5): [0, 0, 0, 5],
+        (16, 4, 1, 1, 4, 0): [8, 2, 0, 4], (16, 4, 1, 0, 4, 0x80000000): [0, 0, 0, 5],
+    } if not array else {
+        (256, 256, 6, 0, 8, 1): [128, 128, 3, 9], (256, 256, 7, 0, 8, 2): [64, 64, 1, 9],
+        (256, 256, 100, 1, 8, 3): [16, 16, 6, 8], (256, 256, 100, 0, 8, 0): [256, 256, 100, 9],
+        (16, 4, 6, 0, 2, 3): [0, 0, 0, 3], (16, 4, 6, 0, 2, 9): [0, 0, 0, 3],
+    }
+    for (w, h, layers, base, last, level), want in cases.items():
+        stub = _ResinfoStub()
+        ids = rdna2spirv.Gen.resinfo_words(stub, "%img", "%level", array, "%word3")
+        view = (max(1, w >> base), max(1, h >> base), layers, last - base + 1)
+        env = _eval_resinfo(stub.lines, view, level, base << 12 | last << 16 | (10 if array else 9) << 28)
+        assert [env[i] & 0xFFFFFFFF for i in ids] == want, (w, h, layers, base, last, level)
+
+
 def test_image_sample_d16_avoids_packhalf2x16(make_shader):
     """d16 image_sample packs f32->f16 via integer ops (no PackHalf2x16) and pass spirv-val."""
     sample_asm = (
@@ -1322,24 +1506,25 @@ def test_fma_mix_f16_rte_edge_cases_and_half_preservation(
 
 
 @pytest.mark.parametrize("suffix,fmt_code,expected_word", [
-    ("xy", 29, 0x3C023C00),  # format 29 = (4, "f16", (16, 16)): lo=0x3c00, hi=0x3c02
+    ("xy", 29, 0x3C013C00),  # format 29 = (4, "f16", (16, 16)): lo=0x3c00, hi=0x3c01 (toward zero, SHADER-358)
     ("x", 13, 0x00003C00),   # format 13 = (2, "f16", (16,)): lo=0x3c00
 ])
 def test_encode_format_f16_uses_f16_bits_rte(suffix, fmt_code, expected_word, make_shader):
-    """buffer_store_format_{x,xy} with f16 V# formats uses f16_bits RTE (no PackHalf2x16),
-    validates with spirv-val, and stores exact tie-to-even f16 bits."""
+    """buffer_store_format_{x,xy} with f16 V# formats packs without PackHalf2x16, validates with spirv-val, and
+    stores the f16 bits RDNA2 does: rounded toward zero, as measured in SHADER-358 (was tie-to-even before it)."""
     si = _load_mini_interp()
     base = 0x1000
     vdata = "v2" if suffix == "x" else "v[2:3]"
+    sel = 0x22C if suffix == "xy" else 0x204  # XY01 for 2-comp, X001 for 1-comp (RDNA2 store COMP_SWAP)
     ps = (
         "; buffer_store_format_f16_rte\n"
         f"s_mov_b32 s0, {base:#x}\n"
         "s_mov_b32 s1, 0\n"
         "s_mov_b32 s2, 0x100\n"
-        f"s_mov_b32 s3, {fmt_code << 12 | 0x30000000:#x}\n"
+        f"s_mov_b32 s3, {fmt_code << 12 | 0x30000000 | sel:#x}\n"
         "v_mov_b32 v1, 0\n"
         "v_mov_b32 v2, 0x3f801000\n"  # 1.0 + 2^-11 -> 0x3c00 (tie to even)
-        "v_mov_b32 v3, 0x3f803000\n"  # 1.0 + 3*2^-11 -> 0x3c02 (tie to even)
+        "v_mov_b32 v3, 0x3f803000\n"  # 1.0 + 3*2^-11 -> 0x3c01 (toward zero)
         f"buffer_store_format_{suffix} {vdata}, v1, s[0:3], 0 offen\n"
         "s_waitcnt vmcnt(0)\n"
         "exp mrt0 v2, v3, v2, v3 done vm\n"
@@ -1412,9 +1597,12 @@ def test_int32_buffer_formats_load_and_store_raw_bits(n, uint_fmt, sint_fmt, mak
         out = si.run_fragment(spv, memory=memory)["%out_mrt0"]
         assert list(out) == [words[c % n] for c in range(4)], fmt
 
+        store_sel = 0x22C if n == 2 else 0xFAC  # XY01 for 2-comp RG (XYZW selects (x, w) on RDNA2 MUBUF stores)
+        store_desc = (f"s_mov_b32 s0, 0x1000\ns_mov_b32 s1, 0\ns_mov_b32 s2, {4 * n}\n"
+                      f"s_mov_b32 s3, {0x31000000 | store_sel | fmt << 12:#x}\n")
         setup = "".join(f"v_mov_b32 v{4 + i}, {w:#x}\n" for i, w in enumerate(words))
         regs = "v4" if n == 1 else f"v[4:{3 + n}]"
-        store = desc + setup + f"buffer_store_format_{'xyzw'[:n]} {regs}, off, s[0:3], 0\ns_endpgm\n"
+        store = store_desc + setup + f"buffer_store_format_{'xyzw'[:n]} {regs}, off, s[0:3], 0\ns_endpgm\n"
         shader = make_shader(store, name=f"ps_int32_store_{fmt}")
         spv = shader.translate()
         shader.validate(spv)

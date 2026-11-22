@@ -226,6 +226,26 @@ def test_every_tileable_format_exports_exact_top_mip_and_header(eq, tmp_path, fm
     assert dds[148:] == top.tobytes()
 
 
+@pytest.mark.parametrize("pillow_failure", ["missing", "unreadable DDS"])
+def test_mip_scoring_uses_raw_elements_when_pillow_cannot_decode(eq, tmp_path, monkeypatch, pillow_failure) -> None:
+    if pillow_failure == "missing":
+        monkeypatch.setitem(sys.modules, "PIL", None)
+    else:
+        image = pytest.importorskip("PIL.Image")
+
+        def cannot_open(*args: object, **kwargs: object) -> None:
+            raise OSError("synthetic Pillow DDS decode failure")
+
+        monkeypatch.setattr(image, "open", cannot_open)
+
+    carve, expected = build_case(eq, tmp_path, 28, top_first=False)
+    out = tmp_path / "out"
+    row = texture(28, "R8G8B8A8_UNORM", 64, 64, mips=2)
+
+    assert T.export_one(row, carve, str(out), {}) == "ok:last"
+    assert (out / "x.rpf" / row["export"]["file"]).read_bytes()[148:] == expected
+
+
 def test_gpu_chain_parts_are_read_in_order(eq, tmp_path):
     carve, expected = build_case(eq, tmp_path, 10, top_first=True)
     with open(os.path.join(carve, "x.rpf", f"{0x1000:012x}.bin"), "rb") as f:
@@ -400,6 +420,21 @@ def test_png_is_written_beside_the_dds_with_the_texels(eq, tmp_path, monkeypatch
     log = json.loads((out / "export_log.json").read_text(encoding="utf-8"))
     assert log[0]["export"]["png"] == "written"
     assert text.splitlines() == ["1 textures: {'ok:first': 1} -> " + str(out), "png: {'written': 1}"]
+
+
+def test_packed_r10g10b10a2_writes_a_png(eq, tmp_path, monkeypatch, capsys):
+    eq(4)
+    packed = struct.pack("<II", 1023 | (3 << 30), (1023 << 20) | (1 << 30))
+    carve = str(tmp_path / "carve")
+    write_blob(carve, "x.rpf", 0x1000, packed + bytes(4096 - len(packed)))
+    t = texture(24, "R10G10B10A2_UNORM", 2, 1, mips=1)
+    out, code, _ = png_main(tmp_path, monkeypatch, capsys, [t], carve, "--png")
+    assert code is None
+    stem = out / "x.rpf" / f"{0xABC:012x}_3_2x1_R10G10B10A2_UNORM"
+    assert stem.with_suffix(".dds").read_bytes()[148:] == packed
+    log = json.loads((out / "export_log.json").read_text(encoding="utf-8"))
+    assert log[0]["export"]["png"] == "written"
+    assert read_png(stem.with_suffix(".png")) == (2, 1, bytes((255, 0, 0, 255, 0, 0, 255, 85)))
 
 
 def test_undecodable_format_keeps_the_dds_and_counts_unsupported(eq, tmp_path, monkeypatch, capsys):

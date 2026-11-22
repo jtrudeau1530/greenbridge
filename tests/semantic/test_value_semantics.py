@@ -38,6 +38,10 @@ ISA semantics used (AMD RDNA2 ISA reference, VALU/VOP3/VOP3P chapters):
   v_mad_u32_u16 /       D = S0.lo * S1.lo + S2 mod 2^32, the halves zero- (u16) or sign-extended (i16); op_sel bit
   v_mad_i32_i16           0/1 reads the high half of S0/S1. D is a whole dword (nothing of the old value is kept).
   v_subrev_f16          D.lo = S1.lo - S0.lo; the high half of D is kept in the VOP2 and the VOP3 form.
+  16-bit SDWA ops       with dst_sel:DWORD the 16-bit result is written zero-extended: the high half of D is
+    (v_add/mul_f16,       cleared whatever dst_unused says (measured on gfx1036, ps_sdwa_dword_hi.asm).
+    v_cvt_u16_f16,
+    v_cvt_f16_u16)
   s_*_saveexec_b32/b64, a constant used as a lane mask gives lane L its bit L: of the 32-bit value for a b32 op,
   s_andn2_wrexec_*,       of the 64-bit value for a b64 op (inline constants sign-extended, literals with a zero
   s_mov/s_not/s_and_b64   high word). cs_w32_mask_imm / cs_w64_mask_imm run every lane of a wave (LaneMaskConstants).
@@ -68,6 +72,7 @@ EXPECTED_OPS8 = [0x80000000, 0xBFFFFFFF, 0x000F100E, 0x0F0F0F1F]
 EXPECTED_VCC_X2 = [0x11223344, 0x55667788, 0x00000000, 0x00000000]
 EXPECTED_F16_VOP2 = [0xAAAA4000, 0xAAAAC000, 0xAAAA3A00, 0x42003F00]        # hardware-measured
 EXPECTED_CVT_F16_OUT_MODS = [0xAAAA3C00, 0xAAAA3E00, 0x7C000000, 0x3C000000]
+EXPECTED_SDWA_DWORD_HI = [0x00004000, 0x00000003, 0x00004700, 0x0000C000]   # hardware-measured (gfx1036)
 EXPECTED_FLAT = [0x00000101, 0x00000102, 0x3F000000, 0x3E800000]
 EXPECTED_SCC_MINMAX = [0x00030205, 0x00030207, 0x00030209, 0x00030203]
 EXPECTED_FMA_LITERAL = [0x41B80000, 0x41800000, 0x40E00000, 0x41A40000]
@@ -79,6 +84,8 @@ EXPECTED_FMT_1010102 = {0x00: 0x00000000, 0x04: 0x3F800000, 0x08: 0x00000000, 0x
 EXPECTED_SFF_IMM = [0x00000002, 0x00000001, 0x00000014, 0x00000010]
 EXPECTED_VALU16_MAD = [0x00000002, 0x00030002, 0x00008000, 0x00000004]
 EXPECTED_VALU16_SUBREV = [0xAAAABC00, 0xAAAAC000, 0xAAAA3C00, 0x42003800]
+# ps_sdwa_f16_const, measured on gfx1036 (the .asm header): f16 inline constant, then src_sel
+EXPECTED_SDWA_F16_CONST = [0xAAAA3800, 0xAAAA1C00, 0xAAAA3E00, 0xAAAA73F0]
 
 
 def _f32_bits(x):
@@ -308,10 +315,30 @@ def reference_valu16_mad():
             _mad_32_16(True, v5, v6, 5, sel=(1, 1))]
 
 
+def reference_sdwa_dword_hi():
+    # Low/high halves of the sources: v2.lo 1.0, v4.lo 3.0, v4.hi -2.0, v6.hi 7. Each result is the 16-bit value
+    # alone; nothing of the destinations' 0xdeadbeef is left.
+    one, three, m_two = _unhalf(0x3C00), _unhalf(0x4200), _unhalf(0xC000)
+    return [_half(one + one), int(three) & 0xFFFF, _half(7.0), _half(one * m_two)]
+
+
 def reference_valu16_subrev():
     a, b, d = _unhalf(0x3E00), _unhalf(0x3800), _unhalf(0x3C00)        # low halves: v0 1.5, v1 0.5, v5 1.0
     return [0xAAAA0000 | _half(b - a), 0xAAAA0000 | _half(-b - a), 0xAAAA0000 | _half(min(1.0, b + a)),
             0x42000000 | _half(a - d)]
+
+
+def reference_sdwa_f16_const():
+    # An f16 float inline constant is its f16 bits over a zero high half; an integer op reads 1.0 as its f32 bits.
+    # src_sel then picks a zero-extended field of those 32 bits, like a register's.
+    def sel(word, off, width):
+        return (word >> off) & ((1 << width) - 1)
+    v1, s8 = 0x64003800, 0x3C000000
+    x = _unhalf(sel(_half(1.0), 16, 16)) + _unhalf(sel(v1, 0, 16))          # +0.0 + 0.5
+    y = _unhalf(sel(_half(2.0), 8, 8)) * _unhalf(sel(v1, 16, 16))           # 2^-18 * 1024.0
+    z = _unhalf(sel(s8, 16, 16)) + _unhalf(sel(v1, 0, 16))                  # 1.0 + 0.5
+    w = float(sel(struct.unpack("<I", struct.pack("<f", 1.0))[0], 16, 16))  # u16 0x3f80 -> f16
+    return [0xAAAA0000 | _half(v) for v in (x, y, z, w)]
 
 
 def _isg1_dxbc(elements):
@@ -356,6 +383,7 @@ class OracleTests(unittest.TestCase):
         self.assertEqual(reference_vcc_x2(), EXPECTED_VCC_X2)
         self.assertEqual(reference_f16_vop2(), EXPECTED_F16_VOP2)
         self.assertEqual(reference_cvt_f16_out_mods(), EXPECTED_CVT_F16_OUT_MODS)
+        self.assertEqual(reference_sdwa_dword_hi(), EXPECTED_SDWA_DWORD_HI)
         self.assertEqual(reference_flat(), EXPECTED_FLAT)
         self.assertEqual(reference_scc_minmax(), EXPECTED_SCC_MINMAX)
         self.assertEqual(reference_fma_literal(), EXPECTED_FMA_LITERAL)
@@ -364,6 +392,7 @@ class OracleTests(unittest.TestCase):
         self.assertEqual(reference_sff_imm(), EXPECTED_SFF_IMM)
         self.assertEqual(reference_valu16_mad(), EXPECTED_VALU16_MAD)
         self.assertEqual(reference_valu16_subrev(), EXPECTED_VALU16_SUBREV)
+        self.assertEqual(reference_sdwa_f16_const(), EXPECTED_SDWA_F16_CONST)
 
 
 class TranslatorValueSemantics(unittest.TestCase):
@@ -420,6 +449,11 @@ class TranslatorValueSemantics(unittest.TestCase):
         # clamp, mul:4, and the RX 6800's order: 65520 div:2 is inf, 2^-15 mul:2 and -0 mul:2 are +0, 2.0 mul:2 clamp 1.0
         self.check("ps_outmods_f16", EXPECTED_CVT_F16_OUT_MODS)
 
+    def test_sdwa_16bit_result_dst_sel_dword_zeroes_high_half(self):
+        # v_add_f16 / v_cvt_u16_f16 / v_cvt_f16_u16 / v_mul_f16 SDWA into 0xdeadbeef with dst_sel:DWORD and
+        # dst_unused PRESERVE, PAD, PRESERVE, SEXT: the high half is zero in each, unlike the plain VOP1/VOP2 forms.
+        self.check("ps_sdwa_dword_hi", EXPECTED_SDWA_DWORD_HI)
+
     def test_mad_u32_u16_i32_i16_wrap_and_sign_extend(self):
         # The u16 product plus S2 wraps at 32 bits; i16 sign-extends both halves (also the op_sel-selected high
         # halves); the destination dword is replaced, its 0xaaaa5555 is not kept.
@@ -429,6 +463,11 @@ class TranslatorValueSemantics(unittest.TestCase):
         # S1 - S0 in the _e32 and _e64 forms (neg, clamp), low half out, the destination's high half kept, also
         # when the destination is a source.
         self.check("ps_valu16_subrev", EXPECTED_VALU16_SUBREV)
+
+    def test_sdwa_src_sel_narrows_an_f16_inline_constant(self):
+        # 1.0 in v_add_f16_sdwa is 0x00003c00, so src0_sel:WORD_1 reads +0.0 and BYTE_1 of 2.0 is the denormal
+        # 0x0040; an SGPR source and v_cvt_f16_u16 reading the f32 bits of 1.0 are narrowed the same way.
+        self.check("ps_sdwa_f16_const", EXPECTED_SDWA_F16_CONST)
 
     def test_s_buffer_load_dwordx2_into_vcc(self):
         # The V# in s[0:3] points at 0x1000; the two dwords must come back in vcc_lo and vcc_hi, not be lost.
@@ -474,6 +513,23 @@ class TranslatorValueSemantics(unittest.TestCase):
         for address, want in EXPECTED_FMT_1010102.items():
             with self.subTest(address=address):
                 self.assertEqual(f"{memory.get(address, 0):#010x}", f"{want:#010x}")
+
+    def test_narrow_integer_typed_buffers(self):
+        # cs_fmt_int_narrow.asm in the interpreter against the words check.py expects from the GPU, which are the
+        # same program's output on gfx1036 run natively: a 136-word heap filled with 0xee as vk_compute_test's.
+        sys.path.insert(0, os.path.join(support.ROOT, "runtime", "test", "shaders"))
+        try:
+            import check
+        finally:
+            sys.path.pop(0)
+        spv = support.translate_fixture("cs_fmt_int_narrow", fssm=CS_BOUNDS_FSSM)
+        memory = {4 * i: 0xEEEEEEEE for i in range(len(check.FMT_INT_NARROW_WORDS))}
+        support.run_fragment(
+            spv, inputs={"%wg_id": (0, 0, 0), "%local_id": (0, 0, 0)},
+            push_constants=[0, 0, 0xFFFFFFFF, 0x31016FAC] + [0] * 28, memory=memory)
+        for i, word in enumerate(check.FMT_INT_NARROW_WORDS):
+            with self.subTest(word=i):
+                self.assertEqual(memory[4 * i], word)
 
     def test_signed_typed_buffers(self):
         spv = support.translate_fixture("cs_fmt_sint32", fssm=CS_BOUNDS_FSSM)

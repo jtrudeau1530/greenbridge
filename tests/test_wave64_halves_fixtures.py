@@ -5,11 +5,15 @@ The fixtures (runtime/test/shaders/{ps,vs}_w64_{a,b,c}_*.asm) are the GPU tests 
 was drawn on an AMD Radeon 880M with the fragment subgroup size required to 64 and to 32, each vertex fixture (TEST-251)
 on an RX 9070 XT and a Ryzen 9800X3D iGPU (RADV) with the VS stage at wave64 and at wave32 (RADV_PERFTEST=gewave32).
 Tier A and B fixtures gave identical words (and the words their header derives), tier C fixtures differed, so this
-test pins the translator's detector to what the hardware showed. Needs llvm-mc with the AMDGPU target and spirv-as / spirv-val, like the other tests that build
-shaders; the pure-Python parts run without them.
+test pins the translator's detector to what the hardware showed. The permute fixtures (TEST-319: ps_w64_a_permlane,
+_a_swizzle, _a_bpermute) gave the words their header derives on an RTX 5070 (32 only), and every fixture's
+RTX 5070 run matched (tiers A, B) or differed from (tier C) a 64-lane RX 580 (GCN, RADV) reference.
+Needs llvm-mc with the AMDGPU target and spirv-as / spirv-val, like the other tests that build shaders; the
+pure-Python parts run without them.
 """
 import json
 import os
+import struct
 import subprocess
 import sys
 
@@ -28,6 +32,9 @@ from conftest import LLVM_MC, requires_tools  # noqa: E402
 EXPECT = {
     "ps_w64_a_skip": ("A", [], []),
     "ps_w64_a_one_lane": ("A", [], []),
+    "ps_w64_a_permlane": ("A", [], []),
+    "ps_w64_a_swizzle": ("A", [], []),
+    "ps_w64_a_bpermute": ("A", [], []),
     "ps_w64_b_waterfall": ("B", [], ["waterfall"]),
     "ps_w64_b_readfirstlane": ("B", [], ["readfirstlane-uniform"]),
     "ps_w64_b_readlane_uniform": ("B", [], ["readlane-uniform"]),
@@ -47,14 +54,34 @@ EXPECT = {
     "vs_w64_c_bcnt_export": ("C", ["lane-count"], None),
     "vs_w64_c_readlane": ("C", ["cross-lane"], None),
     "vs_w64_c_lane_id": ("C", ["lane-id"], None),
+    "gs_w64_a_ring": ("A", [], []),
+    "gs_w64_c_lane_id": ("C", ["lane-id"], None),
 }
 
 
 def test_every_fixture_has_a_tier_and_a_gpu_check():
-    asm = {f[:-4] for f in os.listdir(SHADERS) if f.startswith(("ps_w64_", "vs_w64_")) and f.endswith(".asm")}
+    asm = {f[:-4] for f in os.listdir(SHADERS) if f.startswith(("ps_w64_", "vs_w64_", "gs_w64_")) and f.endswith(".asm")}
     assert asm == set(EXPECT) == set(w64_graphics.FIXTURES)
     for name, (tier, _, _) in EXPECT.items():
         assert w64_graphics.FIXTURES[name][0] == tier
+
+
+def test_tier_c_reference_rejects_changes_to_invariant_words(tmp_path, monkeypatch):
+    name = "ps_w64_c_lane_id"
+    (tmp_path / (name + ".spv")).touch()
+    expected = w64_graphics.FIXTURES[name][1](0)
+    reference = tuple(0 if value is None else value for value in expected)
+    (tmp_path / (name + ".ref64.raw")).write_bytes(struct.pack("<4I", *reference))
+    monkeypatch.setenv("W64G_REF", str(tmp_path))
+    monkeypatch.delenv("W64G_SAVE_REF", raising=False)
+
+    words = [tuple(value + (expected[i] is None) for i, value in enumerate(reference))]
+    monkeypatch.setattr(w64_graphics, "draw", lambda _tools, _spirv, _name, size, _tmp: (words, None, size == 32))
+    assert w64_graphics.check(None, tmp_path, name) == ""
+
+    stable = next(i for i, value in enumerate(expected) if value is not None)
+    words[0] = tuple(value + (i == stable) for i, value in enumerate(words[0]))
+    assert "must not depend on the partition" in w64_graphics.check(None, tmp_path, name)
 
 
 @requires_tools
@@ -144,5 +171,5 @@ def test_vs_probe_and_radv_perftest(monkeypatch):
     monkeypatch.setenv("RADV_PERFTEST", "gewave32,nggc")
     assert w64_graphics._radv_perftest(64) == "nggc"                # the user's other flags stay, gewave32 goes
     assert w64_graphics._radv_perftest(32) == "nggc,gewave32"
-    assert w64_graphics.FIXTURES[w64_graphics.VS_PROBE][0] == "C"
+    assert all(w64_graphics.FIXTURES[p][0] == "C" and p.startswith(s) for s, p in w64_graphics.PROBES.items())
     assert w64_graphics.VS_RECORDS * 4 >= 0x100 + 4 * w64_graphics.VS_VERTICES   # the atomic's slots end below the records

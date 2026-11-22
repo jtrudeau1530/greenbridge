@@ -17,6 +17,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <iterator>
+#include <mutex>
+#include <string>
+#include <unordered_map>
 
 #include <XAsync.h>
 #include <XAsyncProvider.h>
@@ -36,9 +39,10 @@ std::atomic<int> g_runtime_refs{0};
 // "xgameruntime.dll" and GetProcAddress these five names (measured in the package's libHttpClient.GDK.dll and
 // XCurl.dll, docs/runtime_imports.md). Signatures, the options struct and the error for an unknown class follow
 // xodus-gaming/xgameruntime-docs (GPL-3.0; facts only, nothing copied): InitializeApiImplEx2 is the one
-// XGameRuntimeInitialize[WithOptions] calls, and QueryApiImpl hands out the runtime's COM classes. XThreadingImpl and
-// XErrorImpl are served (their layouts are measured, below); for any other class QueryApiImpl logs the class and
-// interface id and refuses it, so the first boot with the executable lists the interfaces to implement next.
+// XGameRuntimeInitialize[WithOptions] calls, and QueryApiImpl hands out the runtime's COM classes. XThreadingImpl,
+// XErrorImpl and XNetworkingImpl are served (their layouts are measured, below); for any other class QueryApiImpl
+// logs the class and interface id and refuses it, so the first boot with the executable lists the interfaces to
+// implement next.
 
 struct ApiImplOptions {    // InitializeApiImplEx2's fourth argument
     uint32_t unknown;      // documented as always 1
@@ -116,14 +120,18 @@ constexpr GUID kIUnknown = {0x00000000, 0x0000, 0x0000, {0xc0, 0x00, 0x00, 0x00,
 // The runtime's objects are process-wide singletons: AddRef/Release count but never free.
 struct RuntimeObject {
     const void* const* vtable;
-    const GUID* class_id;
+    const GUID* class_id;               // the coclass id
+    const GUID* const* interface_ids;   // every interface the vtable serves, base first, null-terminated: a derived
+                                        // interface answers for each one it inherits (IXSystemImpl5 : ... : IXSystemImpl)
     std::atomic<long> refs{1};
 };
 
 HRESULT STDMETHODCALLTYPE object_query_interface(void* self, REFIID iid, void** out) {
     if (!out) return E_POINTER;
     auto* o = static_cast<RuntimeObject*>(self);
-    if (iid == kIUnknown || iid == *o->class_id) {
+    bool known = iid == kIUnknown || iid == *o->class_id;
+    for (const GUID* const* i = o->interface_ids; !known && i && *i; ++i) known = iid == **i;
+    if (known) {
         o->refs.fetch_add(1);
         *out = self;
         return S_OK;
@@ -199,18 +207,21 @@ using XErrorCallback = bool(CALLBACK*)(HRESULT hr, const char* message, void* co
 std::atomic<XErrorCallback> g_error_callback{nullptr};
 std::atomic<void*> g_error_context{nullptr};
 
-void STDMETHODCALLTYPE error_report(void*, HRESULT hr, const char* message) {
+// HRESULT XErrorReport(HRESULT, const char*) (xgameruntime-docs' XErrorReport.md): S_OK once reported.
+HRESULT STDMETHODCALLTYPE error_report(void*, HRESULT hr, const char* message) {
     static std::atomic<int> s_logged{0};
     if (s_logged.fetch_add(1) < 64)
         std::fprintf(stderr, "[rt] xgameruntime: XErrorReport(0x%08lx, %s)\n", static_cast<unsigned long>(hr),
                      message ? message : "(null)");
     if (XErrorCallback cb = g_error_callback.load()) cb(hr, message, g_error_context.load());
+    return S_OK;
 }
 void STDMETHODCALLTYPE error_set_callback(void*, XErrorCallback callback, void* context) {
     g_error_context = context;
     g_error_callback = callback;
 }
-HRESULT STDMETHODCALLTYPE error_set_options(void*, uint32_t, uint32_t) { return S_OK; }
+// void XErrorSetOptions(XErrorOptions, XErrorOptions), as Microsoft documents it: nothing to configure offline.
+void STDMETHODCALLTYPE error_set_options(void*, uint32_t, uint32_t) {}
 
 const void* const kErrorVtable[] = {
     reinterpret_cast<const void*>(&object_query_interface), reinterpret_cast<const void*>(&object_add_ref),
@@ -220,13 +231,120 @@ const void* const kErrorVtable[] = {
     reinterpret_cast<const void*>(&error_set_options),   // 5
 };
 
-RuntimeObject g_threading{kThreadingVtable, &kThreadingClass};
-RuntimeObject g_error{kErrorVtable, &kErrorClass};
+// ---- XNetworkingImpl (IXNetworkingImpl, IXNetworkingImpl2), offline ----
+//
+// XCurl.dll asks for the class with IXNetworkingImpl2's interface id and calls slots 11-17 (docs/runtime_imports.md,
+// "Class layouts, measured"): the UTF-16 security-information query for a URL, the server certificate check, the
+// connectivity hint and its change registration. Signatures follow Microsoft's public XNetworking documentation.
+// Offline there is no network: the hint says so (initialized, no connectivity), every query that would need the
+// network fails with kNoNetwork (asynchronously, through XAsync, for the *Async calls), change registrations hand
+// out tokens whose callbacks never fire, and the IXNetworkingImpl2 additions are E_NOTIMPL.
+
+constexpr GUID kNetworkingClass = {0x37e56907, 0x2f10, 0x41e8, {0xb7, 0x2f, 0x36, 0xed, 0xb1, 0x85, 0x33, 0x1a}};
+constexpr GUID kNetworking2 = {0xbf2346b2, 0x39af, 0x4658, {0xb5, 0xea, 0x44, 0x71, 0x3c, 0x7e, 0x83, 0xb3}};
+constexpr HRESULT kNoNetwork = HRESULT_FROM_WIN32(ERROR_NETWORK_UNREACHABLE);
+
+// XNetworkingConnectivityHint: level, cost, IANA interface type (u32 each), then four bools.
+struct ConnectivityHint {
+    uint32_t connectivity_level;   // XNetworkingConnectivityLevelHint: Unknown 0, None 1, LocalAccess 2, Internet 3
+    uint32_t connectivity_cost;    // XNetworkingConnectivityCostHint: Unknown 0, Unrestricted 1, Fixed 2, Variable 3
+    uint32_t iana_interface_type;
+    bool network_initialized;
+    bool approaching_data_limit;
+    bool over_data_limit;
+    bool roaming;
+};
+static_assert(sizeof(ConnectivityHint) == 16, "XNetworkingConnectivityHint is 16 bytes");
+
+HRESULT STDMETHODCALLTYPE net_query_port(void*, uint16_t* port) {
+    if (!port) return E_POINTER;
+    *port = 0;
+    return kNoNetwork;
+}
+// Completes `async` with kNoNetwork on its queue, as the GDK does for a query that fails.
+HRESULT start_failed_async(XAsyncBlock* async) {
+    if (!async) return E_POINTER;
+    return XAsyncRun(async, [](XAsyncBlock*) -> HRESULT { return kNoNetwork; });
+}
+HRESULT STDMETHODCALLTYPE net_query_port_async(void*, XAsyncBlock* async) { return start_failed_async(async); }
+HRESULT STDMETHODCALLTYPE net_query_port_result(void*, XAsyncBlock* async, uint16_t* port) {
+    if (!async || !port) return E_POINTER;
+    *port = 0;
+    return XAsyncGetStatus(async, false);
+}
+std::atomic<uint64_t> g_net_tokens{0};
+HRESULT STDMETHODCALLTYPE net_register(void*, XTaskQueueHandle, void*, void*, XTaskQueueRegistrationToken* token) {
+    if (!token) return E_POINTER;
+    token->token = g_net_tokens.fetch_add(1) + 1;  // never fires offline: nothing changes
+    return S_OK;
+}
+bool STDMETHODCALLTYPE net_unregister(void*, XTaskQueueRegistrationToken, bool) { return true; }
+HRESULT STDMETHODCALLTYPE net_security_async(void*, const void* url, XAsyncBlock* async) {
+    if (!url) return E_INVALIDARG;
+    return start_failed_async(async);
+}
+HRESULT STDMETHODCALLTYPE net_security_result_size(void*, XAsyncBlock* async, size_t* size) {
+    if (!async || !size) return E_POINTER;
+    *size = 0;
+    return XAsyncGetStatus(async, false);
+}
+// XNetworkingQuerySecurityInformationForUrl[Utf16]AsyncResult(XAsyncBlock*, size_t bufferByteCount,
+// size_t* bufferByteCountUsed, uint8_t* buffer, XNetworkingSecurityInformation** securityInformation), in the order
+// of Microsoft's reference pages. The buffer itself is never written: there is no result to copy offline.
+HRESULT STDMETHODCALLTYPE net_security_result(void*, XAsyncBlock* async, size_t, size_t* used, uint8_t*, void** info) {
+    if (!async) return E_POINTER;
+    if (used) *used = 0;
+    if (info) *info = nullptr;
+    return XAsyncGetStatus(async, false);
+}
+HRESULT STDMETHODCALLTYPE net_verify_certificate(void*, void*, const void*) { return kNoNetwork; }
+HRESULT STDMETHODCALLTYPE net_connectivity_hint(void*, ConnectivityHint* hint) {
+    if (!hint) return E_POINTER;
+    *hint = {};
+    hint->connectivity_level = 1;   // None: the stack is up, nothing is reachable
+    hint->network_initialized = true;
+    return S_OK;
+}
+HRESULT STDMETHODCALLTYPE net_not_implemented(void*) { return E_NOTIMPL; }
+
+#define NM(fn) reinterpret_cast<const void*>(&fn)
+const void* const kNetworkingVtable[] = {
+    NM(object_query_interface), NM(object_add_ref), NM(object_release),
+    NM(net_query_port),            // 3  XNetworkingQueryPreferredLocalUdpMultiplayerPort
+    NM(net_query_port_async),      // 4  ...Async
+    NM(net_query_port_result),     // 5  ...AsyncResult
+    NM(net_register),              // 6  XNetworkingRegisterPreferredLocalUdpMultiplayerPortChanged
+    NM(net_unregister),            // 7  XNetworkingUnregisterPreferredLocalUdpMultiplayerPortChanged
+    NM(net_security_async),        // 8  XNetworkingQuerySecurityInformationForUrlAsync
+    NM(net_security_result_size),  // 9  ...AsyncResultSize
+    NM(net_security_result),       // 10 ...AsyncResult
+    NM(net_security_async),        // 11 XNetworkingQuerySecurityInformationForUrlUtf16Async (XCurl)
+    NM(net_security_result_size),  // 12 ...Utf16AsyncResultSize (XCurl)
+    NM(net_security_result),       // 13 ...Utf16AsyncResult (XCurl)
+    NM(net_verify_certificate),    // 14 XNetworkingVerifyServerCertificate (XCurl)
+    NM(net_connectivity_hint),     // 15 XNetworkingGetConnectivityHint (XCurl)
+    NM(net_register),              // 16 XNetworkingRegisterConnectivityHintChanged (XCurl)
+    NM(net_unregister),            // 17 XNetworkingUnregisterConnectivityHintChanged (XCurl)
+    NM(net_not_implemented),       // 18 XNetworkingQueryConfigurationSetting (IXNetworkingImpl2)
+    NM(net_not_implemented),       // 19 XNetworkingSetConfigurationSetting
+    NM(net_not_implemented),       // 20 XNetworkingQueryStatistics
+};
+#undef NM
+static_assert(std::size(kNetworkingVtable) == 21, "IUnknown + IXNetworkingImpl's 15 + IXNetworkingImpl2's 3");
+
+// The ids xgameruntime-docs and the xgameruntime IDL give: XThreadingImpl's and XErrorImpl's class id is also their
+// one interface's; IXNetworkingImpl's id is the class id, and IXNetworkingImpl2 derives from it.
+const GUID* const kNetworkingIids[] = {&kNetworking2, nullptr};
+RuntimeObject g_threading{kThreadingVtable, &kThreadingClass, nullptr};
+RuntimeObject g_error{kErrorVtable, &kErrorClass, nullptr};
+RuntimeObject g_networking{kNetworkingVtable, &kNetworkingClass, kNetworkingIids};
+
+RuntimeObject& system_object();  // XSystemImpl, defined after the XSystem functions it serves
 
 HRESULT WINAPI QueryApiImpl(const GUID* class_id, REFIID interface_id, void** out) {
     if (out) *out = nullptr;
     if (class_id && out) {
-        for (RuntimeObject* o : {&g_threading, &g_error})
+        for (RuntimeObject* o : {&g_threading, &g_error, &g_networking, &system_object()})
             if (*class_id == *o->class_id) return object_query_interface(o, interface_id, out);
     }
     char cls[40], iid[40];
@@ -236,6 +354,19 @@ HRESULT WINAPI QueryApiImpl(const GUID* class_id, REFIID interface_id, void** ou
     if (s_logged.fetch_add(1) < 256)   // one line per request, bounded
         std::fprintf(stderr, "[rt] xgameruntime: QueryApiImpl(class %s, interface %s): not provided yet\n", cls, iid);
     return kClassNotProvided;
+}
+
+// gameplatformservices.dll: XCurl.dll's other way into the runtime (docs/runtime_imports.md). It reads
+// HKLM\Microsoft\GamingServices ServiceRetryTimeout, LoadLibraryExW's this module from System32, calls
+// GetApiVersionImpl through the CFG dispatch with two pointers to 64-bit locals (the result unread), compares them
+// with the pair it saw last and keeps them, and then GetProcAddress'es QueryApiImpl. Served by the shims, so that call
+// never reaches a PC's Gaming Services runtime (which would bypass these offline classes, and could go online) and
+// never fails because the PC has none. The two values only have to be stable: the offline runtime has one version.
+constexpr uint64_t kOfflineApiVersion = 1;
+HRESULT WINAPI GetApiVersionImpl(uint64_t* first, uint64_t* second) {
+    if (first) *first = kOfflineApiVersion;
+    if (second) *second = kOfflineApiVersion;
+    return S_OK;
 }
 
 // HRESULT XGameRuntimeInitialize(). Reference counted, as in the GDK: each call needs an XGameRuntimeUninitialize.
@@ -298,17 +429,83 @@ uint64_t __stdcall XSystemGetAppMemoryUsage() {
     return 0;
 }
 
+// ---- XSystemImpl (asked for as IXSystemImpl5), offline ----
+//
+// libHttpClient.GDK.dll asks QueryApiImpl for XSystemImpl with IXSystemImpl5's id and calls slots 3-8, each with the
+// argument shape of the function at that position of xgameruntime-docs' IXSystemImpl / IXSystemImpl3 /
+// IXSystemImpl4 lists (IXSystemImpl2 and 5 add nothing known): three (size, buffer, used) id queries, then
+// XSystemHandleTrack (two pointers), XSystemIsHandleValid (a handle) and XSystemAllowFullDownloadBandwidth (a bool).
+// docs/runtime_imports.md has the measurement.
+
+constexpr GUID kSystemClass = {0xe349bd1a, 0xfc20, 0x4e40, {0xb9, 0x9c, 0x41, 0x78, 0xcc, 0x6b, 0x40, 0x9f}};
+// IXSystemImpl's id is the class id; IXSystemImpl5 : IXSystemImpl4 : IXSystemImpl3 : IXSystemImpl2 : IXSystemImpl
+// (xgameruntime's include/xsystem.idl). One vtable serves all five.
+constexpr GUID kSystem2 = {0x6fd71f09, 0x7513, 0x49f0, {0x89, 0xbc, 0xbf, 0xaf, 0x5d, 0xf6, 0xf8, 0x52}};
+constexpr GUID kSystem3 = {0x67ce4bfc, 0xb1d1, 0x4ac7, {0xbc, 0x3a, 0xcb, 0x92, 0x19, 0xa9, 0x7a, 0x85}};
+constexpr GUID kSystem4 = {0xdadc2895, 0x34b0, 0x4ef5, {0xa8, 0x3e, 0x45, 0x11, 0x4d, 0x62, 0x9b, 0x80}};
+constexpr GUID kSystem5 = {0x1861cf2e, 0xe18b, 0x4834, {0xa9, 0xf5, 0xb4, 0xa4, 0xe6, 0xef, 0xb4, 0xcf}};
+const GUID* const kSystemIids[] = {&kSystem2, &kSystem3, &kSystem4, &kSystem5, nullptr};
+
+// A fixed string into a (size, buffer, used) out parameter, as the XSystem id queries take one. `minimum` is the
+// buffer size the API requires (its *Bytes constant), which can be larger than the string.
+HRESULT copy_id(const char* id, size_t bytes, size_t minimum, size_t size, char* out, size_t* used) {
+    if (!out) return E_INVALIDARG;
+    if (size < minimum || size < bytes) return HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
+    std::memcpy(out, id, bytes);
+    if (used) *used = bytes;
+    return S_OK;
+}
+
+// XSystemXboxLiveSandboxIdMaxBytes is 16, and Microsoft's contract asks for a buffer at least that large (smaller
+// ones get ERROR_INSUFFICIENT_BUFFER, whatever the id's length); an offline title runs in the retail sandbox.
+constexpr size_t kSandboxIdMaxBytes = 16;
+constexpr char kSandboxId[] = "RETAIL";
+static_assert(sizeof(kSandboxId) <= kSandboxIdMaxBytes, "fits XSystemXboxLiveSandboxIdMaxBytes");
+// XSystemAppSpecificDeviceIdBytes is 45 (including the terminator): a fixed placeholder of that length, like the
+// console id.
+constexpr char kAppDeviceId[] = "00000000000000000000000000000000000000000000";
+static_assert(sizeof(kAppDeviceId) == 45, "fills XSystemAppSpecificDeviceIdBytes");
+
+HRESULT STDMETHODCALLTYPE sys_console_id(void*, size_t size, char* out, size_t* used) {
+    return XSystemGetConsoleId(size, out, used);
+}
+HRESULT STDMETHODCALLTYPE sys_sandbox_id(void*, size_t size, char* out, size_t* used) {
+    return copy_id(kSandboxId, sizeof(kSandboxId), kSandboxIdMaxBytes, size, out, used);
+}
+HRESULT STDMETHODCALLTYPE sys_app_device_id(void*, size_t size, char* out, size_t* used) {
+    return copy_id(kAppDeviceId, sizeof(kAppDeviceId), sizeof(kAppDeviceId), size, out, used);
+}
+// XSystemHandleTrack(callback, context): the GDK reports handle creation and destruction to it. Offline nothing is
+// tracked, so the callback is accepted and never called.
+HRESULT STDMETHODCALLTYPE sys_handle_track(void*, void*, void*) { return S_OK; }
+// bool XSystemIsHandleValid(XSystemHandle) and void XSystemAllowFullDownloadBandwidth(bool), as Microsoft documents
+// them: a bool, not an HRESULT (S_OK would read as false).
+bool STDMETHODCALLTYPE sys_is_handle_valid(void*, void* handle) { return handle != nullptr; }
+void STDMETHODCALLTYPE sys_allow_full_download_bandwidth(void*, bool) {}
+
+const void* const kSystemVtable[] = {
+    reinterpret_cast<const void*>(&object_query_interface), reinterpret_cast<const void*>(&object_add_ref),
+    reinterpret_cast<const void*>(&object_release),
+    reinterpret_cast<const void*>(&sys_console_id),                     // 3 XSystemGetConsoleId
+    reinterpret_cast<const void*>(&sys_sandbox_id),                     // 4 XSystemGetXboxLiveSandboxId
+    reinterpret_cast<const void*>(&sys_app_device_id),                  // 5 XSystemGetAppSpecificDeviceId
+    reinterpret_cast<const void*>(&sys_handle_track),                   // 6 XSystemHandleTrack (IXSystemImpl3)
+    reinterpret_cast<const void*>(&sys_is_handle_valid),                // 7 XSystemIsHandleValid
+    reinterpret_cast<const void*>(&sys_allow_full_download_bandwidth),  // 8 XSystemAllowFullDownloadBandwidth (4)
+};
+static_assert(std::size(kSystemVtable) == 9, "IUnknown + the six methods IXSystemImpl5 is known to have");
+
+RuntimeObject& system_object() {
+    static RuntimeObject object{kSystemVtable, &kSystemClass, kSystemIids};
+    return object;
+}
+
 // XVersion: 4-part version structure from GDK XGameRuntimeTypes.h (8 bytes)
-struct XVersion {
-    union {
-        struct {
-            uint16_t major;
-            uint16_t minor;
-            uint16_t build;
-            uint16_t revision;
-        };
-        uint64_t Value;
-    };
+struct alignas(8) XVersion {
+    uint16_t major;
+    uint16_t minor;
+    uint16_t build;
+    uint16_t revision;
 };
 static_assert(sizeof(XVersion) == 8, "XVersion must be 8 bytes");
 
@@ -321,25 +518,34 @@ struct XSystemAnalyticsInfo {
 };
 static_assert(sizeof(XSystemAnalyticsInfo) == 144, "XSystemAnalyticsInfo must be 144 bytes");
 
+static void copy_string_padded(char* dst, size_t dst_cap, const char* src) {
+    if (!dst || dst_cap == 0) return;
+    std::memset(dst, 0, dst_cap);
+    if (!src) return;
+    const size_t len = std::strlen(src);
+    const size_t copy_len = len < dst_cap - 1 ? len : dst_cap - 1;
+    std::memcpy(dst, src, copy_len);
+}
+
 // XSystemAnalyticsInfo XSystemGetAnalyticsInfo()
 // Returned by value per Microsoft GDK specification.
 XSystemAnalyticsInfo __stdcall XSystemGetAnalyticsInfo() {
     XSystemAnalyticsInfo info{};
     info.osVersion = {10, 0, 22000, 0};
     info.hostingOsVersion = {10, 0, 22000, 0};
-    std::strncpy(info.family, "Xbox", sizeof(info.family) - 1);
+    copy_string_padded(info.family, sizeof(info.family), "Xbox");
 
     const uint32_t dt = XSystemGetDeviceType();
     if (dt == static_cast<uint32_t>(XSystemDeviceType::XboxScarlettLockhart)) {
-        std::strncpy(info.form, "Xbox Series S", sizeof(info.form) - 1);
+        copy_string_padded(info.form, sizeof(info.form), "Xbox Series S");
     } else {
-        std::strncpy(info.form, "Xbox Series X", sizeof(info.form) - 1);
+        copy_string_padded(info.form, sizeof(info.form), "Xbox Series X");
     }
 
     char form_override[64];
     const DWORD n = GetEnvironmentVariableA("LEONIDA_ANALYTICS_FORM", form_override, sizeof(form_override));
     if (n > 0 && n < sizeof(form_override)) {
-        std::strncpy(info.form, form_override, sizeof(info.form) - 1);
+        copy_string_padded(info.form, sizeof(info.form), form_override);
     }
     return info;
 }
@@ -366,33 +572,116 @@ HRESULT __stdcall XPackageGetCurrentProcessPackageIdentifier(size_t bufferSize, 
     return S_OK;
 }
 
-// HRESULT XPackageGetMountPath(XPackageMountHandle mount, size_t pathSize, char* path).
-// Retrieves the installed filesystem path for the mounted package.
-// Reads LEONIDA_GAME_DIR when set, otherwise falls back to the current module's directory.
-HRESULT __stdcall XPackageGetMountPath(void* /*mount*/, size_t pathSize, char* path) {
-    if (!path || pathSize == 0) return E_INVALIDARG;
+// XPackageMountHandle: opaque 64-bit mount handle per GDK XPackage.h
+struct XPackageMountHandle {
+    uint64_t handle;
+};
 
-    char buf[MAX_PATH] = {};
-    const DWORD n = GetEnvironmentVariableA("LEONIDA_GAME_DIR", buf, sizeof(buf));
-    if (n == 0 || n >= sizeof(buf)) {
-        const DWORD mod_len = GetModuleFileNameA(nullptr, buf, sizeof(buf));
-        if (mod_len > 0 && mod_len < sizeof(buf)) {
-            char* slash = std::strrchr(buf, '\\');
-            char* fslash = std::strrchr(buf, '/');
-            char* last = slash > fslash ? slash : fslash;
-            if (last) {
-                *last = '\0';
-            } else {
-                return HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND);
+static std::mutex s_mount_mutex;
+static std::atomic<uint64_t> s_next_mount_id{1};
+static std::unordered_map<uint64_t, std::string> s_active_mounts;
+
+// Resolves the installation path for a specific content package identifier.
+// GDK specifies that XPackageMount is only for content packages; mounting the main game returns E_ACCESSDENIED.
+// Returns HRESULT_FROM_WIN32(ERROR_NOT_FOUND) if the package identifier is not installed.
+static HRESULT resolve_package_path(const char* packageIdentifier, char* out, size_t out_cap) {
+    if (!packageIdentifier || !out || out_cap == 0) return E_INVALIDARG;
+
+    // Check against configured process/game package identifier; mounting the game itself is denied
+    char game_id[XPACKAGE_IDENTIFIER_MAX_LENGTH] = {};
+    const DWORD n = GetEnvironmentVariableA("LEONIDA_PACKAGE_ID", game_id, sizeof(game_id));
+    const char* process_id = (n > 0 && n < sizeof(game_id)) ? game_id : kDefaultPackageIdentifier;
+
+    if (std::strcmp(packageIdentifier, process_id) == 0) {
+        return E_ACCESSDENIED;
+    }
+
+    // Check optional installed content packages mapping: "id1=path1;id2=path2"
+    char mapping[1024] = {};
+    const DWORD map_len = GetEnvironmentVariableA("LEONIDA_CONTENT_PACKAGES", mapping, sizeof(mapping));
+    if (map_len > 0 && map_len < sizeof(mapping)) {
+        char* token = mapping;
+        while (token && *token) {
+            char* sep = std::strchr(token, ';');
+            if (sep) *sep = '\0';
+            char* eq = std::strchr(token, '=');
+            if (eq) {
+                *eq = '\0';
+                if (std::strcmp(token, packageIdentifier) == 0) {
+                    const char* val = eq + 1;
+                    const size_t vlen = std::strlen(val);
+                    if (vlen + 1 > out_cap) return HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
+                    std::memcpy(out, val, vlen + 1);
+                    return S_OK;
+                }
             }
-        } else {
-            return HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND);
+            token = sep ? sep + 1 : nullptr;
         }
     }
 
-    const size_t len = std::strlen(buf);
-    if (pathSize < len + 1) return HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
-    std::memcpy(path, buf, len + 1);
+    return HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
+}
+
+// HRESULT XPackageMount(const char* packageIdentifier, XPackageMountHandle* mount)
+// Mounts an installed content package given its identifier and yields a valid mount handle.
+// Returns ERROR_NOT_FOUND if the package identifier is not recognized/installed.
+HRESULT __stdcall XPackageMount(const char* packageIdentifier, XPackageMountHandle* mount) {
+    if (!packageIdentifier || !mount) return E_INVALIDARG;
+    mount->handle = 0;
+
+    char buf[MAX_PATH] = {};
+    const HRESULT hr = resolve_package_path(packageIdentifier, buf, sizeof(buf));
+    if (FAILED(hr)) return hr;
+
+    const uint64_t id = s_next_mount_id.fetch_add(1);
+    {
+        std::lock_guard lock(s_mount_mutex);
+        s_active_mounts[id] = buf;
+    }
+    mount->handle = id;
+    return S_OK;
+}
+
+// void XPackageCloseMountHandle(XPackageMountHandle mount)
+// Closes a previously mounted package handle.
+void __stdcall XPackageCloseMountHandle(XPackageMountHandle mount) {
+    if (mount.handle == 0) return;
+    std::lock_guard lock(s_mount_mutex);
+    s_active_mounts.erase(mount.handle);
+}
+
+// HRESULT XPackageGetMountPathSize(XPackageMountHandle mount, size_t* pathSize).
+// Retrieves the size of the buffer needed to store the mounted package path, including the null terminator.
+HRESULT __stdcall XPackageGetMountPathSize(XPackageMountHandle mount, size_t* pathSize) {
+    if (mount.handle == 0 || !pathSize) return E_INVALIDARG;
+
+    std::string path;
+    {
+        std::lock_guard lock(s_mount_mutex);
+        auto it = s_active_mounts.find(mount.handle);
+        if (it == s_active_mounts.end()) return HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
+        path = it->second;
+    }
+
+    *pathSize = path.size() + 1;
+    return S_OK;
+}
+
+// HRESULT XPackageGetMountPath(XPackageMountHandle mount, size_t pathSize, char* path).
+// Retrieves the installed filesystem path for the mounted package.
+HRESULT __stdcall XPackageGetMountPath(XPackageMountHandle mount, size_t pathSize, char* path) {
+    if (mount.handle == 0 || !path || pathSize == 0) return E_INVALIDARG;
+
+    std::string mount_path;
+    {
+        std::lock_guard lock(s_mount_mutex);
+        auto it = s_active_mounts.find(mount.handle);
+        if (it == s_active_mounts.end()) return HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
+        mount_path = it->second;
+    }
+
+    if (pathSize < mount_path.size() + 1) return HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
+    std::memcpy(path, mount_path.c_str(), mount_path.size() + 1);
     return S_OK;
 }
 
@@ -418,6 +707,9 @@ SHIM_TABLE(xgameruntime,
     XGR(InitializeApiImplEx2),
     XGR(UninitializeApiImpl),
     XGR(QueryApiImpl),
+    // the same runtime through gameplatformservices.dll, which XCurl.dll loads from System32 (GetApiVersionImpl above)
+    {"gameplatformservices.dll", "QueryApiImpl", reinterpret_cast<void*>(&QueryApiImpl)},
+    {"gameplatformservices.dll", "GetApiVersionImpl", reinterpret_cast<void*>(&GetApiVersionImpl)},
     XGR(XGameRuntimeInitialize),
     XGR(XGameRuntimeUninitialize),
     XGR(XSystemGetDeviceType),
@@ -426,6 +718,9 @@ SHIM_TABLE(xgameruntime,
     XGR(XSystemGetAppMemoryUsage),
     XGR(XSystemGetAnalyticsInfo),
     XGR(XPackageGetCurrentProcessPackageIdentifier),
+    XGR(XPackageMount),
+    XGR(XPackageCloseMountHandle),
+    XGR(XPackageGetMountPathSize),
     XGR(XPackageGetMountPath),
     XGR(XPackageIsPackagedProcess),
     // XTaskQueue (third_party/xtaskqueue)

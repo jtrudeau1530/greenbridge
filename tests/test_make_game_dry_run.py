@@ -327,8 +327,9 @@ class PipelineStageIsolationTest(unittest.TestCase):
         expected_cache = os.path.join(self.out_dir, "pipeline_cache.bin")
         executed_cmds = []
 
-        def fake_run(args: list[str], **kwargs: object) -> None:
+        def fake_run(args: list[str], **kwargs: object) -> int:
             executed_cmds.append(args)
+            return 0
 
         with mock.patch("make_game.pipeline_check_exe", return_value=dummy_exe), \
                 mock.patch("make_game.run", side_effect=fake_run), \
@@ -336,6 +337,7 @@ class PipelineStageIsolationTest(unittest.TestCase):
             make_game.pipelines(self.work_dir, self.out_dir)
 
         self.assertEqual(len(executed_cmds), 1)
+        # The dummy can't print a usage line, so it is treated as a checker without --inflight-file.
         self.assertEqual(executed_cmds[0], [dummy_exe, spirv_dir, expected_cache])
 
     def test_pipelines_stage_alone_invokes_no_asset_or_shader_compilers(self) -> None:
@@ -386,9 +388,11 @@ class StageResumptionAndStepIsolationTest(unittest.TestCase):
         os.makedirs(spirv_dir, exist_ok=True)
 
         with open(os.path.join(dxbc_dir, "index.json"), "w", encoding="utf-8") as f:
-            f.write("{}")
+            f.write('[{"file": "shader.dxbc"}]')
         with open(os.path.join(dxbc_dir, "fssm_index.json"), "w", encoding="utf-8") as f:
-            f.write("{}")
+            f.write('[{"name": "shader"}]')
+        with open(os.path.join(dxbc_dir, "disasm", "shader.s"), "w", encoding="utf-8", newline="\n") as f:
+            f.write("synthetic listing\n")
         with open(os.path.join(dxbc_dir, "disasm.done"), "w", encoding="utf-8") as f:
             f.write("test llvm-mc 21\n")
         with open(os.path.join(spirv_dir, "index.json"), "w", encoding="utf-8") as f:
@@ -425,10 +429,15 @@ class StageResumptionAndStepIsolationTest(unittest.TestCase):
             fake_py_calls.append(tool)
             if tool == "shader_carve.py":
                 with open(os.path.join(dxbc_dir, "index.json"), "w", encoding="utf-8") as f:
-                    f.write("{}")
+                    f.write('[{"file": "shader.dxbc"}]')
             elif tool == "fssm_unpack.py":
                 with open(os.path.join(dxbc_dir, "fssm_index.json"), "w", encoding="utf-8") as f:
-                    f.write("{}")
+                    f.write('[{"name": "shader"}]')
+            elif tool == "shader_disasm.py":
+                disasm = os.path.join(dxbc_dir, "disasm")
+                os.makedirs(disasm, exist_ok=True)
+                with open(os.path.join(disasm, "shader.s"), "w", encoding="utf-8", newline="\n") as f:
+                    f.write("synthetic listing\n")
 
         with mock.patch("make_game.py", side_effect=fake_py), \
                 mock.patch("make_game.llvm_mc_signature", return_value="test llvm-mc 21"), \

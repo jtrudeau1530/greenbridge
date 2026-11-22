@@ -283,6 +283,17 @@ def test_v_perm_b32_selectors():
              "\tv_add_nc_u32 v8, v8, v1\n"
              "\tv_perm_b32 v9, v1, v2, v8\n"
              "\ts_endpgm\n"),
+            # The scalar carry is the second destination; wave64 writes both halves of its pair.
+            ("perm_carry_w32", "cs",
+             "\ts_mov_b32 s4, 0x08080808\n"
+             "\tv_add_co_u32 v8, s4, v1, v2\n"
+             "\tv_perm_b32 v9, v1, v2, s4\n"
+             "\ts_endpgm\n"),
+            ("perm_carry_w64", "vs",
+             "\ts_mov_b32 s5, 0x08080808\n"
+             "\tv_add_co_u32 v8, s[4:5], v1, v2\n"
+             "\tv_perm_b32 v9, v1, v2, s5\n"
+             "\ts_endpgm\n"),
         ]
         index = []
         for name, stage, listing in synthetic:
@@ -297,10 +308,10 @@ def test_v_perm_b32_selectors():
         stage_of = {e["name"]: e["stage"] for e in index}
         s = F.scan_disasm(dis, stage_of)
         vp = s["v_perm_b32"]
-        check(vp["shaders"] == {"ps": 2, "cs": 1, "vs": 1}, f"v_perm_b32 shader counts by stage: {vp['shaders']}")
-        check(vp["insns"] == 5, f"v_perm_b32 total instructions == 5 (got {vp['insns']})")
-        check((vp["immediate"], vp["const_reg"], vp["unresolved"]) == (1, 2, 2),
-              f"v_perm_b32 resolution split (1 imm, 2 const_reg, 2 unresolved), got {vp}")
+        check(vp["shaders"] == {"ps": 2, "cs": 2, "vs": 2}, f"v_perm_b32 shader counts by stage: {vp['shaders']}")
+        check(vp["insns"] == 7, f"v_perm_b32 total instructions == 7 (got {vp['insns']})")
+        check((vp["immediate"], vp["const_reg"], vp["unresolved"]) == (1, 2, 4),
+              f"v_perm_b32 resolution split (1 imm, 2 const_reg, 4 unresolved), got {vp}")
         check(vp["sign_extend_8_11_shaders"] == 2 and vp["sign_extend_8_11_insns"] == 2,
               f"v_perm_b32 8..11 sign-extend shader/insn counts == (2, 2), got {vp}")
         check(vp["selector_classes"] == {"0_7": 3, "8_11": 5, "12": 1, "13_plus": 3},
@@ -309,7 +320,7 @@ def test_v_perm_b32_selectors():
         out_json = os.path.join(tmp, "out.json")
         r = subprocess.run([sys.executable, "-I", os.path.join(TOOLS, "feature_scan.py"), sh, "--out", out_json],
                            capture_output=True, text=True)
-        check(r.returncode == 0 and "v_perm_b32: 4 shaders" in r.stdout and "selectors 8-11: 2 shaders / 2 insns" in r.stdout,
+        check(r.returncode == 0 and "v_perm_b32: 6 shaders" in r.stdout and "selectors 8-11: 2 shaders / 2 insns" in r.stdout,
               f"CLI prints v_perm_b32 summary counts (rc={r.returncode})")
         raw_json = open(out_json, encoding="utf-8").read()
         for name, _, _ in synthetic:
@@ -411,17 +422,42 @@ def test_typed_buffers_and_psv0():
     assert failures == 0, f"{failures} typed-buffer check(s) failed"
 
 
+def test_a_test_that_raises_fails_the_run_and_the_rest_still_run():
+    """The plain-script run used to hold every test in one try block that swallowed AssertionError: a failing bare
+    assert (test_duplicate_shader_names_keep_file_stages has one) skipped the tests after it and printed OK, exit 0."""
+    ran, reported = [], []
+
+    def raises():
+        ran.append("raises")
+        raise AssertionError("a bare assert failed")
+
+    def passes():
+        ran.append("passes")
+
+    raised = run_tests([raises, passes], report=reported.append)
+    check(raised == ["raises"], f"a test that raises is reported as failed ({raised})")
+    check(ran == ["raises", "passes"], f"the tests after it still run ({ran})")
+    check(reported == ["FAIL raises: a bare assert failed"], f"its message is printed ({reported})")
+    assert failures == 0, f"{failures} script-runner check(s) failed"
+
+
+def run_tests(tests, report=print):
+    """Run each test on its own, for the plain-script run (CI's standard-library job): one that raises
+    AssertionError is reported and the rest still run. Returns the names of the tests that raised."""
+    raised = []
+    for test in tests:
+        try:
+            test()
+        except AssertionError as error:
+            raised.append(test.__name__)
+            report(f"FAIL {test.__name__}: {error}")
+    return raised
+
+
 if __name__ == "__main__":
-    try:
-        test_feature_scan()
-        test_typed_buffers_and_psv0()
-        test_short_signature()
-        test_part_payload_outside_container_is_unreadable()
-        test_bad_shaders_folder_is_one_line()
-        test_v_perm_b32_selectors()
-        test_duplicate_shader_names_keep_file_stages()
-        test_out_inside_corpus_is_a_usage_error()
-    except AssertionError:
-        pass
-    print(f"test_feature_scan: {'OK' if not failures else 'FAILED'} ({failures} failure{'s' if failures != 1 else ''})")
-    sys.exit(1 if failures else 0)
+    # Every test_* function in the file, in file order, so a new test can't be left out of the script run.
+    raised = run_tests([fn for name, fn in list(globals().items()) if name.startswith("test_") and callable(fn)])
+    ok = not failures and not raised
+    print(f"test_feature_scan: {'OK' if ok else 'FAILED'} ({failures} failed check{'s' if failures != 1 else ''}, "
+          f"{len(raised)} failed test{'s' if len(raised) != 1 else ''})")
+    sys.exit(0 if ok else 1)

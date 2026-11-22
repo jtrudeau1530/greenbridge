@@ -46,6 +46,9 @@ class ModelTests(unittest.TestCase):
         self.assertEqual(ff.cube("v_cubesc_f32", x, y, z), ff.bits(-0.5))
         self.assertEqual(ff.cube("v_cubetc_f32", x, y, z), ff.bits(-0.25))
         self.assertEqual(ff.cube("v_cubema_f32", x, y, z), ff.bits(-4.0))
+        # Measured on RDNA2 (gfx1036): v_cubema_f32 returns +0.0 (never -0.0) when all axes are ±0.0.
+        self.assertEqual(ff.cube("v_cubema_f32", 0, 0, 0x80000000), 0)
+        self.assertEqual(ff.cube("v_cubema_f32", 0x80000000, 0x80000000, 0x80000000), 0)
 
 
 class HarnessTests(unittest.TestCase):
@@ -139,6 +142,18 @@ class HardwareOracle(unittest.TestCase):
         self.assertIsNone(ff.dev_omod_neg_zero(d, want, "ieee"))
         self.assertIsNone(ff.dev_omod_neg_zero(d, want, "keep"))
         self.assertIsNone(ff.dev_omod_neg_zero(self.case("v_ceil_f32", [0], [(0, {})], [], True), want))
+
+    def test_omod_label_does_not_count_a_kept_minus_zero_as_applied(self):
+        # ceil(-0.75) = -0: with and without the omod the model says -0, so a -0 from the hardware shows neither
+        # that the omod was applied nor that it was ignored (SHADER-353: 65 such programs under MODE.IEEE = 1 on
+        # gfx1031 were counted as "applied" while every unambiguous one was ignored).
+        d = self.case("v_ceil_f32", [ff.bits(-0.75)], [(0, {})], ["mul:2"], True)
+        self.assertEqual(ff.omod_label(d, [0x80000000, 0]), "-0 result kept (applied or ignored, same word)")
+        self.assertEqual(ff.omod_label(d, [0, 0]), "applied, but a -0 result becomes +0")
+        a = self.case("v_ceil_f32", [ff.bits(1.5)], [(0, {})], ["mul:2"], True)
+        self.assertEqual(ff.omod_label(a, [ff.bits(4.0), 0]), "applied")
+        self.assertEqual(ff.omod_label(a, [ff.bits(2.0), 0]), "ignored")
+        self.assertEqual(ff.omod_label(a, [ff.bits(3.0), 0]), "other")
 
     def test_zero_inf_probes_catch_a_plain_multiply(self):
         import random

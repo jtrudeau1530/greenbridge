@@ -23,6 +23,7 @@
 #include "vulkan_loader.h"
 #include "vk_device_pick.h"
 #include "vk_shader_fma.h"
+#include "vk_pc_tail.h"
 
 #include <cctype>
 #include <cstddef>
@@ -296,7 +297,16 @@ int main(int argc, char** argv) {
     // fewer bytes (128, the Vulkan minimum, as on some Intel Arc drivers and AMD's Windows driver for RDNA2 iGPUs)
     // cannot take that range: declaring it anyway is invalid, and there a shader reading past the limit crashed or
     // hung the device. 77, as vk_texture_test and vk_bindless_test: a device limit, not a wrong result (D3D-14).
-    const uint32_t pc_bytes = mesh_compute ? 152u : 144u;
+    // LEONIDA_PC_TAIL_UBO=1 (rdna2spirv.py --pc-tail-ubo): s0..s31 only, 128 bytes, which every device has; the
+    // tail is a uniform block at set 1 (vk_pc_tail.h). tools/mesh_compute_vs.py's vertex shader still reads the
+    // --mesh-compute output address from push constants, so that combination isn't run.
+    const bool pc_tail = leonida::vk_test::pc_tail_requested();
+    if (pc_tail && mesh_compute) {
+        std::fprintf(stderr, "unsupported: --mesh-compute's vertex shader reads the output address from push "
+                             "constants, not from the --pc-tail-ubo block\n");
+        return 77;
+    }
+    const uint32_t pc_bytes = pc_tail ? 128u : mesh_compute ? 152u : 144u;
     if (props.limits.maxPushConstantsSize < pc_bytes) {
         std::fprintf(stderr, "unsupported: need %u push constant bytes, device has %u\n", pc_bytes,
                      props.limits.maxPushConstantsSize);
@@ -326,12 +336,22 @@ int main(int argc, char** argv) {
         m8.maintenance8 = VK_TRUE; m8.pNext = chain; chain = &m8;
     }
 #endif
+    VkPhysicalDeviceVulkan11Features f11q{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES};
     VkPhysicalDeviceVulkan12Features f12q{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
+    f12q.pNext = &f11q;
     VkPhysicalDeviceVulkan13Features f13q{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
     f13q.pNext = &f12q;
     VkPhysicalDeviceFeatures2 f2q{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
     f2q.pNext = &f13q;
     vkGetPhysicalDeviceFeatures2(pd, &f2q);
+    // Translated vertex shaders read BaseVertex / BaseInstance (DrawParameters) to give v0 / v3 the hardware's
+    // zero-based ids.
+    VkPhysicalDeviceVulkan11Features f11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES};
+    if (f11q.shaderDrawParameters) {
+        f11.shaderDrawParameters = VK_TRUE;
+        f11.pNext = chain;
+        chain = &f11;
+    }
     VkPhysicalDeviceVulkan13Features f13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
     if (f13q.subgroupSizeControl) {
         f13.subgroupSizeControl = VK_TRUE;
@@ -390,6 +410,7 @@ int main(int argc, char** argv) {
     LOADD(vkCreateCommandPool); LOADD(vkAllocateCommandBuffers); LOADD(vkBeginCommandBuffer);
     LOADD(vkCmdBeginRenderPass); LOADD(vkCmdBindPipeline); LOADD(vkCmdDraw); LOADD(vkCmdEndRenderPass);
     LOADD(vkCmdBindVertexBuffers); LOADD(vkCmdBindIndexBuffer); LOADD(vkCmdDrawIndexed);
+    LOADD(vkCmdPipelineBarrier);
     LOADD(vkCmdCopyImageToBuffer); LOADD(vkEndCommandBuffer); LOADD(vkQueueSubmit); LOADD(vkQueueWaitIdle);
     LOADD(vkCreateBuffer); LOADD(vkGetBufferMemoryRequirements); LOADD(vkBindBufferMemory); LOADD(vkMapMemory);
     VkQueue q; vkGetDeviceQueue(dev, qi, 0, &q);
@@ -462,8 +483,11 @@ int main(int argc, char** argv) {
     VkFramebufferCreateInfo fbi{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
     fbi.renderPass = rp; fbi.attachmentCount = rpi.attachmentCount; fbi.pAttachments = views; fbi.width = W; fbi.height = H; fbi.layers = 1;
     VkFramebuffer fb; CHECK(vkCreateFramebuffer(dev, &fbi, nullptr, &fb));
+    bool tail_block = false;   // some stage reads the --pc-tail-ubo block (declares set 1)
     auto module = [&](const char* p, VkShaderModule* m) {
         auto code = read_spv(p);
+        if (pc_tail && leonida::vk_test::spirv_declares_set(code.data(), code.size() * 4, leonida::vk_test::pc_tail_set))
+            tail_block = true;
         VkShaderModuleCreateInfo smi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
         smi.codeSize = code.size() * 4; smi.pCode = code.data();
         return vkCreateShaderModule(dev, &smi, nullptr, m);
@@ -500,7 +524,10 @@ int main(int argc, char** argv) {
             stages[2].pNext = &reqSg;
         else if (!mesh && !gs_tested && (sgProps.requiredSubgroupSizeStages & VK_SHADER_STAGE_FRAGMENT_BIT))
             stages[1].pNext = &reqSg;
-        if (stages[1].pNext == &reqSg) std::fprintf(stderr, "fragment subgroup size: %u\n", req_sg);
+        // A device with one subgroup size runs every stage at it, required or not (AMD GCN: 64, with only COMPUTE
+        // in requiredSubgroupSizeStages), so the fragment stage of a plain draw already has the size asked for.
+        const bool fixed = !mesh && !gs_tested && sgProps.minSubgroupSize == sgProps.maxSubgroupSize;
+        if (stages[1].pNext == &reqSg || fixed) std::fprintf(stderr, "fragment subgroup size: %u\n", req_sg);
     } else if (req_sg > 0) {
         std::fprintf(stderr, "fragment subgroup size: %u not available\n", req_sg);
     }
@@ -534,6 +561,14 @@ int main(int argc, char** argv) {
     VkPushConstantRange pcr{pcs, 0, pc_bytes};
     VkPipelineLayoutCreateInfo pli{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
     pli.pushConstantRangeCount = 1; pli.pPushConstantRanges = &pcr;
+    // --pc-tail-ubo: the tail block at set 1 (set 0 stays empty here), one slot for the one draw.
+    leonida::vk_test::PcTail tail;
+    if (tail_block && !tail.create(vkGetDeviceProcAddr, dev, mp, props.limits.minUniformBufferOffsetAlignment, pcs, 1)) {
+        std::fprintf(stderr, "FAILED creating the --pc-tail-ubo block\n");
+        return 1;
+    }
+    const VkDescriptorSetLayout tail_layouts[] = {tail.empty_layout, tail.set_layout};
+    if (tail_block) { pli.setLayoutCount = 2; pli.pSetLayouts = tail_layouts; }
     VkPipelineLayout pl; CHECK(vkCreatePipelineLayout(dev, &pli, nullptr, &pl));
     VkGraphicsPipelineCreateInfo gpi{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
     gpi.stageCount = nstages; gpi.pStages = stages;
@@ -671,7 +706,7 @@ int main(int argc, char** argv) {
     auto push = reinterpret_cast<PFN_vkCmdPushConstants>(vkGetDeviceProcAddr(dev, "vkCmdPushConstants"));
     if (mesh_compute) {
         // The mesh shader as compute, then make its stores visible to the vertex shader's reads.
-        LOADD(vkCmdDispatch); LOADD(vkCmdPipelineBarrier);
+        LOADD(vkCmdDispatch);
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, cpipe);
         push(cmd, pl, pcs, 0, pc_bytes, pc);
         vkCmdDispatch(cmd, groups[0], groups[1], groups[2]);
@@ -695,6 +730,13 @@ int main(int argc, char** argv) {
     }
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
     push(cmd, pl, pcs, 0, pc_bytes, pc);
+    if (tail_block) {
+        LOADD(vkCmdBindDescriptorSets);
+        tail.write(0, pc, 4);           // heap base (VKH_HEAP) and code base, as pc[32..35] are without the flag
+        const uint32_t offset = tail.offset(0);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pl, leonida::vk_test::pc_tail_set, 1, &tail.set,
+                                1, &offset);
+    }
     // VKH_VERTICES=<n>: draw n vertices instead of one triangle, so a vertex shader fills whole waves (TEST-251).
     const char* vertices_env = std::getenv("VKH_VERTICES");
     if (draw_mesh_path) {
@@ -709,11 +751,21 @@ int main(int argc, char** argv) {
         vkCmdDraw(cmd, uint32_t(mesh_groups * mesh_prims * 3), 1, 0, 0);
     else if (mesh)
         reinterpret_cast<PFN_vkCmdDrawMeshTasksEXT>(vkGetDeviceProcAddr(dev, "vkCmdDrawMeshTasksEXT"))(cmd, groups[0], groups[1], groups[2]);
-    else
-        vkCmdDraw(cmd, 3, 1, 0, 0);
+    else {
+        // VKH_DRAW=<firstVertex>,<firstInstance>: draw the triangle with non-zero bases (vs_base_ids).
+        unsigned first_vertex = 0, first_instance = 0;
+        if (const char* d = std::getenv("VKH_DRAW")) std::sscanf(d, "%u,%u", &first_vertex, &first_instance);
+        vkCmdDraw(cmd, 3, 1, first_vertex, first_instance);
+    }
     vkCmdEndRenderPass(cmd);
     VkBufferImageCopy reg{}; reg.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}; reg.imageExtent = {W, H, 1};
     vkCmdCopyImageToBuffer(cmd, img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buf, 1, &reg);
+    // Make the image copy and any shader writes to the heap visible to the host after the queue wait.
+    VkMemoryBarrier readback{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    readback.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    readback.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0,
+                         1, &readback, 0, nullptr, 0, nullptr);
     CHECK(vkEndCommandBuffer(cmd));
     VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO}; si.commandBufferCount = 1; si.pCommandBuffers = &cmd;
     CHECK(vkQueueSubmit(q, 1, &si, VK_NULL_HANDLE));
