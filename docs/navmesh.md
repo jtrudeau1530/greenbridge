@@ -224,6 +224,40 @@ world_min_y = (sector_y - 256) * 128.0  #  -9,856 .. +13,056 m (max +13,184 m)
 
 The `24,480` unique static sector IDs form a complete, gap-free `136 Ã— 180` rectangle (`Z âˆˆ [-78.55, +403.84]` m).
 
+### Adjacent-polygon edges (`+0x88`, `493,024,188` records) and special links (`+0xA8`/`+0xB0`, `26,679,246` records)
+
+- **12-byte adjacent-polygon edges (`+0x88`, count `u32@0x90`, `493,024,188` records across `27,644` tiles):**
+  Each record is `{u32 adj_sector, u16 adj_poly, u16 edge_meta, u32 edge_flags}`. Across all `493,024,188 / 493,024,188`
+  records (`0` exceptions):
+  - **`458,728,869`** (`93.04%`) are intra-tile neighbors with `adj_sector == u32@0xC8` and `adj_poly < u32@0xC4`
+    (`0` out-of-bounds polygon indices);
+  - **`34,295,319`** (`6.96%`) are open or tile-border edges with `adj_sector == 0xFFFFFFFF` and `adj_poly == 0xFFFF`
+    (cross-tile border stitching is performed at runtime rather than serialized in `+0x88`).
+- **Polygon `+0x20` special-link prefix-sum chain (`124,768,148` polygons across `27,644` tiles):**
+  In every 44-byte polygon at `+0x98`, `u32@0x20` packs `link_count = w20 & 0x3F` (bits `0..5`, range `0..63`),
+  `link_start = (w20 >> 6) & 0x1FFFF` (bits `6..22`, up to `17,459`), and a 9-bit polygon flag field `w20 >> 23`
+  (bits `23..31`). Across all `27,644 / 27,644` tiles (including polygons with `link_count == 0` and linkless tiles
+  with `u32@0xD8 == 0`), `link_start` equals the exact running prefix sum of `link_count` across preceding polygons,
+  and the tile total after polygon `u32@0xC4 - 1` equals `u32@0xD8` (`0` failures).
+- **32-byte special links (`+0xA8`, count `u32@0xD4`, `26,679,246` records across `8,817` tiles) and `+0xB0` index table
+  (`u16[u32@0xD8]`, `26,903,247` entries):**
+  Each 32-byte record at `+0xA8` is `{u16[3] pos0, u16[3] pos1, u16 poly0, u16 poly1, u32 sector0, u32 sector1,
+  u16 flags0, u16 flags1, u16 heading, u16 pad}`:
+  - `+0x00..+0x05` (`u16[3]`) and `+0x06..+0x0B` (`u16[3]`): quantized 3D link endpoints `pos0` and `pos1`.
+  - `+0x0C..+0x0F` (`u16 poly0, u16 poly1`) and `+0x10..+0x17` (`u32 sector0, u32 sector1`): endpoint polygon indices
+    and sector IDs. Across all `26,679,246 / 26,679,246` links, at least one endpoint sector equals the owning tile's
+    `u32@0xC8` (`26,398,281` intra-tile with `sector0 == sector1 == u32@0xC8`; `143,913` cross-tile with
+    `sector0 == u32@0xC8`; `137,052` cross-tile with `sector1 == u32@0xC8`; `0` with neither). Whenever
+    `sector0 == u32@0xC8`, `poly0 < u32@0xC4` (`26,542,194 / 26,542,194`); whenever `sector1 == u32@0xC8`,
+    `poly1 < u32@0xC4` (`26,535,333 / 26,535,333`).
+  - `+0x18..+0x1B` (`u16 flags0, u16 flags1`): link attribute and traversal type words (`flags1` top values: `0x0050`
+    on `11,492,614`, `0x0040` on `9,705,698`, `0x0030` on `4,281,168`, `0x0060` on `425,369`).
+  - `+0x1C..+0x1D` (`u16 heading`): 8-bit quantized heading angle (`0..254`, `< 256` on `26,679,246 / 26,679,246`).
+  - `+0x1E..+0x1F` (`u16 pad`): zero padding (`0` on `26,679,246 / 26,679,246`).
+  - Across all `26,903,247 / 26,903,247` entries of `+0xB0`, every entry `li = u16@(b0 + 2*k)` in polygon `pi`'s slice
+    `[link_start .. link_start + link_count)` indexes a 32-byte link at `+0xA8` satisfying
+    `(poly0 == pi or poly1 == pi) and (sector0 == u32@0xC8 or sector1 == u32@0xC8)` (`0` failures).
+
 ### Split arrays and quadtree layout
 
 - Each `aiSplitArray` descriptor (`48` B: `{u64 vtable, u64 total, ptr64 blocks, ptr64 starts, u64 nblocks, u64 0}`)
@@ -307,12 +341,16 @@ stored elsewhere, and which vehicles the 31 are (wagons, boats and trains would 
 - `tools/navmesh_decode.py` (stdlib-only) decodes all four resource classes (`0DRP`, `0x00010015`, `grid`, `PSIN`),
   joins continuations (including tiny `< 64`-byte continuations), validates structural invariants, and writes aggregate
   JSON and optional numeric CSV metadata. It never writes payload bytes and never touches the TOC.
+- `tools/navmesh_links.py` (stdlib-only) decodes and verifies the 12-byte `+0x88` adjacent-polygon edges, the polygon
+  `+0x20` special-link prefix-sum chain, and the 32-byte `+0xA8` special links and `+0xB0` index table.
 
 ```powershell
 python -I tools/navmesh_decode.py <package>\navmeshes.rpf --out <temp>/navmesh-decode.json --csv <temp>/navmesh-decode.csv
 python -I tools/navmesh_decode.py <package>\navmeshes.rpf --deep --out <temp>/navmesh-decode-deep.json
 python -I tools/navmesh_decode.py <carve-dir> --out <temp>/carved-decode.json
+python -I tools/navmesh_links.py <package>\navmeshes.rpf --out <temp>/navmesh-links.json
 python -I -W error::ResourceWarning tests/test_navmesh_decode.py -v
+python -I tests/test_navmesh_links.py -v
 python -I tests/test_navmesh_index.py
 ```
 
