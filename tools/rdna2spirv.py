@@ -2168,22 +2168,26 @@ class Gen:
                     is_signed = signed
         dst1 = self.tmp()
         self.emit(f"{dst1} = OpSelect %uint {is_int_fmt} {self.cu(1)} {self.cu(0x3F800000)}")
+        # In-bounds gate applies to components read from buffer memory, leaving DST_SEL=1 intact (SHADER-429).
+        bounded_comps = []
+        for comp in comps:
+            cb = self.tmp()
+            self.emit(f"{cb} = OpSelect %uint {in_b} {comp} {self.cu(0)}")
+            bounded_comps.append(cb)
         outs = []
         for c in range(ncomp):
             sel = self.tmp()
             self.emit(f"{sel} = OpBitFieldUExtract %uint {d3} {self.cu(3 * c)} {self.cu(3)}")
             r = self.cu(0)
-            for code_v, src in ((1, dst1), (4, comps[0]), (5, comps[1]), (6, comps[2]), (7, comps[3])):
+            for code_v, src in ((1, dst1), (4, bounded_comps[0]), (5, bounded_comps[1]), (6, bounded_comps[2]), (7, bounded_comps[3])):
                 e, s = self.tmp(), self.tmp()
                 self.emit(f"{e} = OpIEqual %bool {sel} {self.cu(code_v)}")
                 self.emit(f"{s} = OpSelect %uint {e} {src} {r}")
                 r = s
-            rb = self.tmp()
-            self.emit(f"{rb} = OpSelect %uint {in_b} {r} {self.cu(0)}")
             if d16:
-                outs.append(rb)
+                outs.append(r)
             else:
-                self.dst({"k": "vgpr", "r": vd["r"] + c, "n": 1}, rb)
+                self.dst({"k": "vgpr", "r": vd["r"] + c, "n": 1}, r)
         if d16:
             # D16 packs two results per register, saturating integer formats according to signedness.
             def int_half(word):
