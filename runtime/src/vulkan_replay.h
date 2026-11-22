@@ -2757,8 +2757,8 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             barrier.dstStageMask = dst.stages;
             barrier.srcAccessMask = src.access;
             barrier.dstAccessMask = dst.access;
-            if (barrier.srcStageMask) restrict_to_queue(vk, barrier.srcStageMask, barrier.srcAccessMask);
-            if (barrier.dstStageMask) restrict_to_queue(vk, barrier.dstStageMask, barrier.dstAccessMask);
+            if (barrier.srcStageMask) detail::restrict_to_queue(vk, barrier.srcStageMask, barrier.srcAccessMask);
+            if (barrier.dstStageMask) detail::restrict_to_queue(vk, barrier.dstStageMask, barrier.dstAccessMask);
             VkDependencyInfo dependency{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
             dependency.memoryBarrierCount = 1;
             dependency.pMemoryBarriers = &barrier;
@@ -2793,8 +2793,8 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                 b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
                 b.image = p.binding.image;
                 b.subresourceRange = detail::layout_range(p.binding, piece.range);
-                if (b.srcStageMask) restrict_to_queue(vk, b.srcStageMask, b.srcAccessMask);
-                if (b.dstStageMask) restrict_to_queue(vk, b.dstStageMask, b.dstAccessMask);
+                if (b.srcStageMask) detail::restrict_to_queue(vk, b.srcStageMask, b.srcAccessMask);
+                if (b.dstStageMask) detail::restrict_to_queue(vk, b.dstStageMask, b.dstAccessMask);
                 barriers.push_back(b);
             }
             VkDependencyInfo dependency{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
