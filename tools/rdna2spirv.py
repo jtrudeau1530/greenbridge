@@ -372,6 +372,14 @@ class Gen:
         self.emit(f"{f} = OpCompositeExtract %float {v2} {1 if hi else 0}")
         return self.modify_f(f, s)
 
+    def fma_mix_srcs(self, a, mods):
+        """Read the 3 operands of v_fma_mix*: f16 at op_sel[i] when op_sel_hi[i] is set (via src_h so fimm is binary16), else f32."""
+        sel = next((m for m in mods if m.startswith("op_sel:")), "op_sel:[0,0,0]")
+        selhi = next((m for m in mods if m.startswith("op_sel_hi:")), "op_sel_hi:[0,0,0]")
+        sb = [int(x) for x in sel.split("[")[1].rstrip("]").split(",")]
+        hb = [int(x) for x in selhi.split("[")[1].rstrip("]").split(",")]
+        return [self.f16_in(src, sb[i]) if hb[i] else self.src_f(src) for i, src in enumerate(a[1:4])]
+
     def f16_bits(self, f, rtz=False):
         """f32 ``f`` -> f16 bits in the low 16 bits of a %uint, computed with integer ops only (SHADER-56).
 
@@ -895,10 +903,7 @@ class Gen:
         bit = 0
         for c, w in enumerate(widths):
             if kind == "f16":
-                v2, h = self.tmp(), self.tmp()
-                self.emit(f"{v2} = OpCompositeConstruct %v2float {self.tof(fcomps[c])} %f0")
-                self.emit(f"{h} = OpExtInst %uint %glsl PackHalf2x16 {v2}")
-                field = h
+                field = self.f16_bits(self.tof(fcomps[c]))
             elif kind == "unorm":
                 cl, sc, rd, u = self.tmp(), self.tmp(), self.tmp(), self.tmp()
                 self.emit(f"{cl} = OpExtInst %float %glsl FClamp {self.tof(fcomps[c])} %f0 %f1")
@@ -1179,9 +1184,8 @@ class Gen:
                     is_int = o
             for i in range(0, len(outs), 2):
                 lo, hi = outs[i], (outs[i + 1] if i + 1 < len(outs) else self.cu(0))
-                v2, ph, il, ih, ishi, pi, r = (self.tmp() for _ in range(7))
-                self.emit(f"{v2} = OpCompositeConstruct %v2float {self.tof(lo)} {self.tof(hi)}")
-                self.emit(f"{ph} = OpExtInst %uint %glsl PackHalf2x16 {v2}")
+                ph = self.f16_pack2(self.tof(lo), self.tof(hi))
+                il, ih, pi, r = (self.tmp() for _ in range(4))
                 self.emit(f"{il} = OpBitwiseAnd %uint {lo} {self.cu(0xFFFF)}")
                 self.emit(f"{ih} = OpShiftLeftLogical %uint {hi} {self.cu(16)}")
                 self.emit(f"{pi} = OpBitwiseOr %uint {il} {ih}")
@@ -3791,21 +3795,7 @@ class Gen:
             self.wqm(op, a)
         elif op == "v_fma_mix_f32":
             # Each source is f32, or (op_sel_hi bit set) an f16 from the low/high half chosen by op_sel.
-            sel = next((m for m in mods if m.startswith("op_sel:")), "op_sel:[0,0,0]")
-            selhi = next((m for m in mods if m.startswith("op_sel_hi:")), "op_sel_hi:[0,0,0]")
-            sb = [int(x) for x in sel.split("[")[1].rstrip("]").split(",")]
-            hb = [int(x) for x in selhi.split("[")[1].rstrip("]").split(",")]
-            vals = []
-            for i, src in enumerate(a[1:4]):
-                if hb[i]:
-                    u = self.src_u({**src, "neg": False, "abs": False})
-                    v2, f = self.tmp(), self.tmp()
-                    self.emit(f"{v2} = OpExtInst %v2float %glsl UnpackHalf2x16 {u}")
-                    self.emit(f"{f} = OpCompositeExtract %float {v2} {sb[i]}")
-                    f = self.tof(self.modify(self.tou(f), src))
-                    vals.append(f)
-                else:
-                    vals.append(self.src_f(src))
+            vals = self.fma_mix_srcs(a, mods)
             r = self.tmp()
             self.emit(f"{r} = OpExtInst %float %glsl Fma {vals[0]} {vals[1]} {vals[2]}")
             self.dst(a[0], self.tou(self.clamp_mods(r, mods)))
@@ -4014,35 +4004,11 @@ class Gen:
             self.dst(a[0], r)
             self.scc_nonzero(r)
         elif op in ("v_fma_mixlo_f16", "v_fma_mixhi_f16"):
-            sel = next((m for m in mods if m.startswith("op_sel:")), "op_sel:[0,0,0]")
-            selhi = next((m for m in mods if m.startswith("op_sel_hi:")), "op_sel_hi:[0,0,0]")
-            sb = [int(x) for x in sel.split("[")[1].rstrip("]").split(",")]
-            hb = [int(x) for x in selhi.split("[")[1].rstrip("]").split(",")]
-            vals = []
-            for i, src in enumerate(a[1:4]):
-                if hb[i]:
-                    u = self.src_u({**src, "neg": False, "abs": False})
-                    v2, f = self.tmp(), self.tmp()
-                    self.emit(f"{v2} = OpExtInst %v2float %glsl UnpackHalf2x16 {u}")
-                    self.emit(f"{f} = OpCompositeExtract %float {v2} {sb[i]}")
-                    vals.append(self.modify_f(f, src))
-                else:
-                    vals.append(self.src_f(src))
-            r, v, p, h16 = self.tmp(), self.tmp(), self.tmp(), self.tmp()
+            vals = self.fma_mix_srcs(a, mods)
+            r = self.tmp()
             self.emit(f"{r} = OpExtInst %float %glsl Fma {vals[0]} {vals[1]} {vals[2]}")
             r = self.clamp_mods(r, mods)
-            self.emit(f"{h16} = OpCopyObject %uint {self.f16_bits(r)}")
-            old = self.load_reg("vgpr", a[0]["r"])
-            keep, newv = self.tmp(), self.tmp()
-            if op == "v_fma_mixlo_f16":
-                self.emit(f"{keep} = OpBitwiseAnd %uint {old} {self.cu(0xFFFF0000)}")
-                self.emit(f"{newv} = OpBitwiseOr %uint {keep} {h16}")
-            else:
-                sh = self.tmp()
-                self.emit(f"{keep} = OpBitwiseAnd %uint {old} {self.cu(0xFFFF)}")
-                self.emit(f"{sh} = OpShiftLeftLogical %uint {h16} {self.cu(16)}")
-                self.emit(f"{newv} = OpBitwiseOr %uint {keep} {sh}")
-            self.dst(a[0], newv)
+            self.f16_out(a[0], r, hi=(op == "v_fma_mixhi_f16"))
         elif op == "v_cvt_pk_u8_f32":
             # Convert src0 to u8 (round to nearest even, clamp) and insert it at byte src1 of src2.
             x, byte, base = self.src_f(a[1]), self.src_u(a[2]), self.src_u(a[3])
@@ -4769,9 +4735,7 @@ class Gen:
                 if d16:
                     # d16: the compare result is an f16 in the low half, as in the other d16 paths below. Until
                     # 2026-11-21 it was written as f32 bits, whose low half is 0 for every result (1.0 = 0x3f800000).
-                    v2, r = self.tmp(), self.tmp()
-                    self.emit(f"{v2} = OpCompositeConstruct %v2float {d} %f0")
-                    self.emit(f"{r} = OpExtInst %uint %glsl PackHalf2x16 {v2}")
+                    r = self.f16_bits(d)
                 else:
                     r = self.tou(d)
                 self.dst({"k": "vgpr", "r": vdata["r"], "n": 1}, r)
