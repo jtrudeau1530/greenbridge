@@ -9779,13 +9779,11 @@ class Gen:
             if coherent:
                 self.image_load_coherent(dim, self.load_reg("sgpr", a[2]["r"] + 1), iv, img_idx, dmask, vdata, d16)
                 return
-            if dim in self.STORE_DIMS:
-                self.image_load_typed(dim, self.sgpr_word(a[2], 1), iv, img, img_idx,
-                                      dmask, vdata, self.cu(0), d16)
-                return
-            res = self.tmp()
-            self.emit(f"{res} = OpImageFetch %v4float {img} {iv} Lod {self.cu(0)}")
-            ncomp = bin(dmask).count("1")
+            # Cube loads use the same sampled 2D-array view and integer layer as array loads.
+            view_dim = "dim:SQ_RSRC_IMG_2D_ARRAY" if dim == "dim:SQ_RSRC_IMG_CUBE" else dim
+            self.image_load_typed(view_dim, self.sgpr_word(a[2], 1), iv, img, img_idx,
+                                  dmask, vdata, self.cu(0), d16)
+            return
         else:
             smp_idx = self.desc_lookup_sgpr(a[3], 4)
             sp, smp, si = self.tmp(), self.tmp(), self.tmp()
