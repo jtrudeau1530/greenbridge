@@ -158,10 +158,10 @@ mesh.
 
 A raw RSC8 scan of **862,555** resources across all 13 indexed RPF9 archives (every `rageobj`
 entry, unnamed pages and the >3 MiB band included; 25.6 GB compressed / 56.3 GB inflated) found
-453 ped-skeleton resources: 342 animal bounds, 2,212 `char_bipedbounds_*` fragments, 4 mannequins
-and 73 anim clips. **0** combined a ped skeleton with the skin/flesh shader, and 0 of the 908
-resources on that shader contained a single `SKEL_*` bone name. The unnamed-resource route
-therefore does not add a body.
+2,631 ped-skeleton resources: 342 animal bounds, 2,212 `char_bipedbounds_*` fragments,
+4 mannequins and 73 anim clips. **0** combined a ped skeleton with the skin/flesh shader, and
+0 of the 908 resources that use the skin/flesh shader contained a single `SKEL_*` bone name.
+The unnamed-resource route therefore does not add a body.
 
 The only **nude** continuous human-skeleton meshes are a **generic female mannequin** in
 `levels.rpf`: `gmt_mannequin_proxy_f_01a` (15,488 vertices / 27,725 triangles, 95 bones,
