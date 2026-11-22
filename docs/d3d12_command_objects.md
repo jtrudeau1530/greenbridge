@@ -396,9 +396,9 @@ vtable pointer of a public object.
 - The DLL's 29 shaders are `DXBC` containers with `SFI0`, `ISG1`, `OSG1`, `PSV0`, `RTS0`, `HASH` and `ACCC` parts
   and no `DXIL`. The `ACCC` payload starts with the tag `FSPX` in all 29; the game's own native shaders are `FSSM`
   inside `XBCH` ([design.md](design.md)). `FSPX` is a directory around an uncompressed RDNA2 program and its
-  dispatch state; `tools/fspx_unpack.py` unpacks it for the translator, which takes 13 of the 29 today, and
-  `make_game.py`'s `shaders` stage does both for the package's DLL. The 13 that use `v_dot4` instructions are not
-  translated yet ([fspx.md](fspx.md)).
+  dispatch state; `tools/fspx_unpack.py` unpacks it for the translator, which takes 17 of the 29 today, and
+  `make_game.py`'s `shaders` stage does both for the package's DLL. What stops the other 12 is listed in
+  [fspx.md](fspx.md), "Translation status".
 
 **Command list.** The console list is **not** the PC order past `ResourceBarrier`. Each row is backed by the
 argument shape at the call and, where marked "run", by the call seen in the run. Rows marked "inferred" fit the
