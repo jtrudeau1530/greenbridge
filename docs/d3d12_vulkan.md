@@ -443,7 +443,11 @@ What is implemented (all of it testable without the game):
   - `GetCopyableFootprints` for buffers, 1D and 1D-array textures, 2D textures and volumes, including BC1–7 and the
     two-plane depth-stencil formats.
     The test compares every output with the PC runtime's; that comparison found that planar
-    depth-stencil rows are padded to 512 bytes, not 256.
+    depth-stencil rows are padded to 512 bytes, not 256, and that subresources are aligned to 512 bytes counting
+    from `BaseOffset`, not from 0: the PC runtime moves the whole layout by the base, so an unaligned base (513,
+    2^32 + 1) keeps the same relative offsets and the same total (measured on an AMD Radeon RX 7600, drivers 26.11.1
+    and 26.11.2, Windows 10 in-box runtime; aligning from 0 gives mismatching offsets and totals at both unaligned
+    bases and none at 0 and 1024, which is why it went unnoticed).
   - the `1`/`2`/`3` variants as wrappers over the methods above (D3D-28): `CreateCommittedResource1/2/3`,
     `CreateCommandQueue1` and `GetCopyableFootprints1`. `D3D12_RESOURCE_DESC1` drops to `D3D12_RESOURCE_DESC`,
     and the initial state or `D3D12_BARRIER_LAYOUT` is not used, because new textures start `UNDEFINED` and move

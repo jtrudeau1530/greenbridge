@@ -6648,7 +6648,10 @@ public:
         const UINT per_plane = mips * (volume ? 1 : desc->DepthOrArraySize);
         if (!format.format || UINT64(first) + count > UINT64(per_plane) * planes) return fail();
 
-        UINT64 offset = base, end = base;
+        // Subresources are aligned to D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT counting from BaseOffset, not from 0: the
+        // PC runtime moves the whole layout by BaseOffset, so an unaligned base (513) keeps the same relative offsets
+        // and the same total. Measured by compare_footprints in d3d12_vulkan_device_test.
+        UINT64 offset = 0, end = 0;
         for (UINT i = 0; i < count; ++i) {
             const UINT index = first + i, plane = index / per_plane, mip = index % mips;
             const VkImageAspectFlags aspect =
@@ -6673,14 +6676,15 @@ public:
             if (planes == 2) footprint_format = plane ? DXGI_FORMAT_R8_TYPELESS : DXGI_FORMAT_R32_TYPELESS;
             const UINT slices = std::max(1u, depth >> (mip & 31));
             if (layouts)
-                layouts[i] = {offset, {footprint_format, blocks_wide * block.block, blocks_high * block.block, slices, pitch}};
+                layouts[i] = {base + offset,
+                              {footprint_format, blocks_wide * block.block, blocks_high * block.block, slices, pitch}};
             if (rows) rows[i] = blocks_high;
             if (row_sizes) row_sizes[i] = row_size;
             const UINT64 total_rows = UINT64(blocks_high) * slices;
             end = offset + (total_rows - 1) * pitch + row_size;
             offset += total_rows * pitch;
         }
-        if (total) *total = end - base;
+        if (total) *total = end;
     }
 
     // How much heap memory resources need and how to align them, for applications that suballocate heaps (section
