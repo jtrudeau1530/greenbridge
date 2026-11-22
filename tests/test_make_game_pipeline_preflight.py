@@ -38,7 +38,7 @@ class PreflightEnv:
         spirv = os.path.join(self.work, "shaders", "spirv")
         os.makedirs(spirv)
         with open(os.path.join(spirv, "index.json"), "w", encoding="utf-8") as f:
-            f.write("{}")
+            f.write('{"shader_0": {}}')   # a finished translation is never empty
 
     def assert_preflight_fails(self, stages, match):
         err = io.StringIO()

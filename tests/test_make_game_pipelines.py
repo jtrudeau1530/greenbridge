@@ -26,7 +26,7 @@ class PipelinesJobsTest(unittest.TestCase):
         os.makedirs(self.game)
         os.makedirs(spirv)
         with open(os.path.join(spirv, "index.json"), "w", encoding="utf-8") as f:
-            f.write("{}")
+            f.write('{"shader_0": {}}')   # a finished translation is never empty
 
     def checker_args(self, call):
         with mock.patch.object(make_game, "pipeline_check_exe", return_value="vk_pipeline_check.exe"), \
