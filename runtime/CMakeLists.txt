@@ -193,6 +193,9 @@ include(CTest)
 if(BUILD_TESTING)
   add_executable(pipeline_cache_file_test test/pipeline_cache_file_test.cpp)
   add_test(NAME pipeline_cache_file COMMAND pipeline_cache_file_test)
+  # XDXR build descriptions (docs/xdxr.md); compared with d3d12.h where the Windows SDK provides it.
+  add_executable(xdxr_descs_test test/xdxr_descs_test.cpp)
+  add_test(NAME xdxr_descs COMMAND xdxr_descs_test)
   if(WIN32)
     # Loader tests. They build their own PE images, so they need neither the game nor any other input.
     add_executable(loader_test
