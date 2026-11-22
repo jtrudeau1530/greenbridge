@@ -373,6 +373,13 @@ Every dictionary has 1 or 2 system pages and no graphics pages. Its pages are th
 each 16-byte aligned after the one before it. Join them, and a pointer `p` is the offset `p - 0x50000000` into
 the joined bytes.
 
+A continuation can begin with an animation pack whose header also looks like a dictionary root.
+When that header has a verifiable page-local name and hash, the grouper requires the preceding pages
+to contain the owner's complete pack table and an entry matching both the boundary pointer and the
+hash. A table on the candidate or any later page could belong to the next dictionary. Such a layout
+leaves the owner unresolved, even for a legitimate pack. This check applies only to recognized named
+boundaries. A malformed reference already present in the prefix can still match.
+
 Measured: 61,510 root streams. 61,510 join into resources: 35,750 with one system page and 25,760 with two.
 In 36 roots the page map says two pages, but the next listed stream does not start where the first one ends. Their
 second page is right after the first stream, but `anim_index.py` does not list it: in 28 it is a zlib stream that
