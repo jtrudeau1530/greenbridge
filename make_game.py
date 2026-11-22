@@ -1030,7 +1030,9 @@ def decode_xma(ff: str, xma_dir: str) -> None:
     for src in sorted(todo):
         dst = src[:-8] + ".wav"
         tmp = dst + ".part"
-        r = subprocess.run([ff, "-v", "error", "-y", "-i", src, "-c:a", "pcm_s16le", "-f", "wav", tmp])
+        # No stdin: ffmpeg reads it for key commands, which stops a build started in the background of a terminal.
+        r = subprocess.run([ff, "-v", "error", "-y", "-i", src, "-c:a", "pcm_s16le", "-f", "wav", tmp],
+                           stdin=subprocess.DEVNULL)
         if r.returncode == 0 and os.path.isfile(tmp):
             os.replace(tmp, dst)
         else:
