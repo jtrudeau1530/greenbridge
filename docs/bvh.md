@@ -335,6 +335,30 @@ barycentrics by the remap byte. A BVH with paired leaves, which the console buil
 therefore traverse to the wrong triangle for TRI1 and return permuted barycentrics wherever the remap is not
 `0x09`. Confirm this on RDNA2 hardware or against AMD's GPURT before changing the translator.
 
+**GPU builder.** `runtime/src/xdxr_build.comp` with `xdxr_build.h` writes the same layout on the GPU, straight into
+the destination buffer:
+
+1. one thread per triangle (TRI0 leaves, remap `0x09`) or per instance (128-byte records, the world-to-object
+   inverse, the BLAS root and identity-rotation flag);
+2. a 30-bit Morton key of each box centre, then a bitonic sort;
+3. BOX32 nodes, built level by level from four consecutive sorted children, with the parent table and each
+   instance's `ParentNode`;
+4. the header.
+
+The tree's shape depends only on the element count. `XdxrLayout` therefore computes the result and scratch sizes
+exactly when the build is recorded, and the same numbers can answer `GetRaytracingAccelerationStructurePrebuildInfo`.
+A triangle with a NaN vertex gets an empty box (D3D12 treats it as inactive). So do an instance with mask 0, one with
+no BLAS and one with a singular transform. An instance record holds its BLAS address in 256-byte units in 32 bits,
+so BLAS addresses must be below 2^40, as console GPU addresses are. Where device addresses are wider (llvmpipe's are
+host pointers), the builder takes a bias that is added to the addresses read from instance descs.
+
+`vk_xdxr_build_test <dir>` builds nine synthetic cases on the GPU and writes each structure with a description of its
+scene. `xdxr_bvh.py check-build <dir>` validates them and traces rays against brute force. `ctest` runs both as
+`xdxr_build` and `xdxr_build_check`.
+
+Not done yet: pairing triangles into TRI1 leaves, BOX16 nodes, updates, compaction and copies. A higher-quality
+build (SAH) would also come later.
+
 ```powershell
 python -I tools/xdxr_bvh.py selftest --seed 1 --rays 400   # build BLASes, compare closest hits with brute force
 python -I tools/xdxr_bvh.py validate <dumped BVH buffer>    # structural check of a runtime buffer
