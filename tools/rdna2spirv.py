@@ -26,7 +26,7 @@ import struct
 import subprocess
 import sys
 import tempfile
-from collections import Counter
+from collections import Counter, defaultdict
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(__file__))
@@ -150,6 +150,7 @@ class Gen:
         self.f16_halves = set()     # PS, --f16-interp-fallback: the same attributes, read from decoded-half inputs
         self.param_max = -1         # VS/MS: the highest exp paramN (--f16-interp-fallback keeps halves above it)
         self.f16_half_outs = {}     # VS/MS, --f16-interp-fallback: param n -> its two decoded-half output names
+        self.ij_capture = {}        # computed-I/J pairs: pair key -> the I float id the p1 loaded (SHADER-177)
         self.uses_psb = False
         self.uses_active = False
         self.uses_perm = False     # emulate: ds_permute_b32 parks its winning source lane in %x_perm
@@ -5396,7 +5397,7 @@ class Gen:
                     raise Unsupported(f"v_interp_mov_f32 vertex select {what}: only p0 is modelled")
             else:
                 self.interp_pair_src(op, a, ins)
-            f = self.attribute(attr["a"], attr["c"], flat=op == "v_interp_mov_f32")
+            f = self.attribute(attr["a"], attr["c"], flat=op == "v_interp_mov_f32", ij=self.interp_weights(ins))
             if self.pixel_interpolants is not None and (self.pixel_interpolants[1] >> attr["a"]) & 1:
                 # 16-bit interpolant (FSSM table flag bit 4) read through a 32-bit op: the stored value only
                 # has f16 precision, so round to nearest f16 and back. Reads through the *_f16 opcodes already
@@ -5641,7 +5642,7 @@ class Gen:
             # `high` (on both ops of the pair) selects the upper f16 of the packed channel (Mesa ACO
             # emit-interp_instr passes high_16bits to p1ll and p2). Under --bary-fallback there are no per-vertex
             # inputs, so the old smooth-f32 read stands and `high` cannot be told apart (docs/design.md).
-            f = self.attribute(attr["a"], attr["c"], half=1 if "high" in mods else 0)
+            f = self.attribute(attr["a"], attr["c"], half=1 if "high" in mods else 0, ij=self.interp_weights(ins))
             if op == "v_interp_p2_f16":
                 # VOP3 clamp applies to the f16 result (ACO: dst(F16); llvm-mc takes clamp but no omod on this op).
                 # Until 2026-11-22 it was dropped.
@@ -7190,7 +7191,11 @@ class Gen:
         with — p1 reads I = v0, p2 reads J = v1, per op. The model returns the attribute's interpolated value,
         which is only that when the register really holds that coordinate: the hardware register, or a plain
         v_mov copy rooted at it (self.v_interp_copy, from interp_copy_sources, which tracks each copy's root).
-        Anything else — the other coordinate, a copy rooted at the other one — is refused, not guessed at."""
+        Anything else — the other coordinate, a copy rooted at the other one — is refused, not guessed at.
+        A computed-I/J site (ins["ij"], interp_ij_analysis) is exempt: its operand is a value the program
+        wrote, and attribute() weights the interpolation with that value."""
+        if ins.get("ij") is not None:
+            return      # computed-I/J site: the analysis vetted the source; attribute() weights with it
         want, role = (0, "I") if op.startswith("v_interp_p1") else (1, "J")
         s = a[1] if len(a) > 1 else None
         c = self.v_interp_copy.get(s["r"]) if (s is not None and s.get("k") == "vgpr") else None
@@ -7199,13 +7204,41 @@ class Gen:
             what = f"v{s['r']}" if s is not None and s.get("k") == "vgpr" else "operand"
             raise Unsupported(f"{op} {role} source {what}: only v{want} (or a plain v_mov copy of it) is modelled")
 
-    def attribute(self, n, comp, flat=False, half=None):
+    def interp_weights(self, ins):
+        """(i, j) float ids for a computed-I/J v_interp site, or None for an untouched one (SHADER-177).
+
+        The pair's p1 loads both operand registers and records its I; the p2 reuses that I and loads its
+        J fresh. The program may rewrite an operand between the two ops (corpus form: J is set up after
+        the p1), and hardware's final value uses the I of the p1 with the J of the p2. The p1's own
+        full-sum value is dead: nothing may read the partial between the ops (interp_ij_analysis)."""
+        tag = ins.get("ij")
+        if tag is None:
+            return None
+        kind, key, i_reg, j_reg = tag
+        if kind == "p1":
+            i, j = self.pair_value(i_reg), self.pair_value(j_reg)
+            self.ij_capture[key] = i
+            return i, j
+        cap = self.ij_capture.get(key)
+        if cap is None:
+            raise Unsupported("computed I/J pair: p2 emitted before its p1")
+        return cap, self.pair_value(j_reg)
+
+    def pair_value(self, r):
+        """The value VGPR r holds now, as a float: the f32 bits the program last stored there."""
+        u = self.load_reg("vgpr", r)
+        t = self.tmp()
+        self.emit(f"{t} = OpBitcast %float {u}")
+        return t
+
+    def attribute(self, n, comp, flat=False, half=None, ij=None):
         """Component `comp` of fragment input attribute n (declared as a vec4 Input at Location n).
 
         An attribute in per_vertex (read by a *_f16 interp somewhere) is a PerVertexKHR vec4[3] of the producer's
         raw 32-bit words, which hold two f16 (low, high). `half` 0/1 decodes that f16 of each vertex, None keeps the
         word as an f32; the three values are then weighted as AMD does, P0 + i(P1 - P0) + j(P2 - P0) with i, j =
-        BaryCoordKHR.y, .z, or vertex 0's taken when `flat`.
+        BaryCoordKHR.y, .z, or vertex 0's taken when `flat`. `ij` overrides the weights with the given SPIR-V
+        values (computed-I/J sites, SHADER-177: the pair the program wrote into the operand registers).
 
         --f16-interp-fallback: an f16 read (`half` 0/1) of an attribute in f16_halves is component `comp` of the smooth
         input at f16_half_location(n, half), which the producer fills with that half decoded to f32 (F16_HALVES).
@@ -7244,10 +7277,15 @@ class Gen:
             pv.append(v)
         if flat:
             return pv[0]
-        bc, i, j, d1, d2, m1, m2, s, r = (self.tmp() for _ in range(9))
-        self.emit(f"{bc} = OpLoad %v3float %bary")
-        self.emit(f"{i} = OpCompositeExtract %float {bc} 1")
-        self.emit(f"{j} = OpCompositeExtract %float {bc} 2")
+        if ij is not None:
+            i, j = ij
+        else:
+            bc = self.tmp()
+            self.emit(f"{bc} = OpLoad %v3float %bary")
+            i, j = self.tmp(), self.tmp()
+            self.emit(f"{i} = OpCompositeExtract %float {bc} 1")
+            self.emit(f"{j} = OpCompositeExtract %float {bc} 2")
+        d1, d2, m1, m2, s, r = (self.tmp() for _ in range(6))
         self.emit(f"{d1} = OpFSub %float {pv[1]} {pv[0]}")
         self.emit(f"{d2} = OpFSub %float {pv[2]} {pv[0]}")
         self.emit(f"{m1} = OpFMul %float {d1} {i}")
@@ -9059,6 +9097,231 @@ def read_before_write_vgprs(insns):
             written.update(range(a[0]["r"], a[0]["r"] + a[0].get("n", 1)))
     return set(first)
 
+def interp_ij_analysis(insns, g):
+    """SHADER-177: how each v_interp_p1/p2's I/J operand reaches the site, and what to do with it.
+
+    Hardware weights the interpolation with the values the named VGPRs hold at the two ops, not with the
+    hardware's own pair (Vonsek's #1224 image evidence: zeroed sources interpolate to P0, swapped operand
+    roles to (v,u)). A program that overwrites v0/v1 with computed barycentrics -- evaluate-at-offset,
+    snapped coordinates, copies held in other registers -- therefore interpolates through the computed
+    pair. Each op of such a pair is annotated ins["ij"] = (kind, key, i VGPR, j VGPR):
+
+    * pristine: both operands of the pair are v0/v1 and nothing in the shader writes those registers
+      (11,888 of 12,101 PS). The single-lane model's own read -- the interpolated input -- is exact and
+      the site is left untouched.
+    * computed: either operand is written anywhere in the shader (v0/v1 -- conservative under branches)
+      or before the site (any other register). The attribute becomes PerVertexKHR and both ops
+      interpolate with the operand values loaded from %vgpr, which holds whatever the program computed:
+      v_mov, arithmetic on the pair, multi-writer sequences. The p1 loads its I and keeps it for the p2
+      (the program may rewrite an operand between the two ops: 574 corpus sites set J up between them),
+      and the p2 loads its J fresh; the p1's own full-sum value is dead unless something reads the
+      partial between the ops.
+
+    A source that is neither v0/v1 nor written is left to interp_pair_src (#1224), which refuses it at
+    emission naming the role; a plain v_mov copy of the pair (g.v_interp_copy) stays #1224's to model,
+    keeping its bit-identical .spv. Refused here (Unsupported, naming the pattern): a computed pair
+    whose ops are not in one basic block (the captured I would not dominate the p2), whose shared
+    partial register -- the f32 vdst, or the f16 p2's fourth operand naming the p1's vdst -- is written
+    between the ops, or read between them by anything but a p2's partial operand, any computed site
+    under --bary-fallback or --f16-interp-fallback (neither has PerVertexKHR inputs), and a computed v_interp_*_f32 on a 16-bit-flagged
+    interpolant (which half the 32-bit op reads is not established). Over the corpus all of these are
+    empty: 213 PS hold computed pairs, every pair sits in one block, and no partial is touched
+    between the ops.
+
+    Returns the set of attribute numbers the computed pairs need in g.per_vertex."""
+    P1 = ("v_interp_p1_f32", "v_interp_p1ll_f16", "v_interp_p1lv_f16")
+    P2_OF = {"v_interp_p1_f32": "v_interp_p2_f32",
+             "v_interp_p1ll_f16": "v_interp_p2_f16", "v_interp_p1lv_f16": "v_interp_p2_f16"}
+    writes = defaultdict(list)                 # vgpr -> indexes of insns writing it (read_before_write rules)
+    for n, ins in enumerate(insns):
+        a, op = ins["args"], ins["op"]
+        if not a:
+            continue
+        reads_all = op.startswith(("exp", "buffer_store", "image_store", "v_cmp", "v_cmpx", "ds_write", "global_store"))
+        if not reads_all and a[0]["k"] == "vgpr":
+            for r in range(a[0]["r"], a[0]["r"] + a[0].get("n", 1)):
+                writes[r].append(n)
+    sites = []
+    for n, ins in enumerate(insns):
+        op = base_op(ins["op"])
+        if op not in P1 and op not in ("v_interp_p2_f32", "v_interp_p2_f16"):
+            continue
+        a = ins["args"]
+        attr = next((x for x in a if x["k"] == "attr"), None)
+        if attr is None or len(a) < 2 or a[0]["k"] != "vgpr" or a[1]["k"] != "vgpr":
+            continue                               # the emission site raises its own Unsupported
+        partial = a[3]["r"] if (op == "v_interp_p2_f16" and len(a) > 3 and a[3]["k"] == "vgpr") else None
+        sites.append({"n": n, "ins": ins, "op": op, "vdst": a[0]["r"], "src": a[1]["r"], "partial": partial,
+                      "attr": attr["a"], "chan": attr["c"], "computed": False})
+
+    # Block index per instruction (translate's leader rule), for the reaching-write test and the
+    # same-block requirement.
+    def next_pc(i):
+        return i["pc"] + (len(i["enc"]) // 2 if i["enc"] else 4)
+
+    def branch_target(i):
+        if "target" in i:
+            return i["target"]
+        imm = next((x for x in i["args"] if x["k"] == "imm"), None)
+        v = imm["v"] & 0xFFFF if imm is not None else 0
+        return next_pc(i) + 4 * (v - 0x10000 if v & 0x8000 else v)
+
+    leaders = {insns[0]["pc"]}
+    for i in insns:
+        if base_op(i["op"]) in BRANCHES or base_op(i["op"]) == "s_endpgm":
+            leaders.add(branch_target(i))
+            leaders.add(next_pc(i))
+    blk, cur, prev, block_of_pc = [], None, None, {}
+    for k, i in enumerate(insns):
+        if i["pc"] in leaders and i["pc"] != prev:
+            cur = k                               # a block starts at a leader pc that newly appears
+        prev = i["pc"]
+        blk.append(cur)
+        block_of_pc[i["pc"]] = cur
+    preds = defaultdict(set)                    # block -> blocks that can run right before it
+    for b in sorted(set(blk)):
+        last = next((k for k in range(len(insns) - 1, -1, -1) if blk[k] == b), None)
+        op = base_op(insns[last]["op"])
+        if op == "s_endpgm":
+            continue
+        tgts = []
+        if op in BRANCHES:
+            t = block_of_pc.get(branch_target(insns[last]))
+            if t is None:
+                raise Unsupported("branch target outside code")
+            tgts.append(t)
+        if op != "s_branch" and last + 1 < len(insns):
+            tgts.append(blk[last + 1])         # conditional branches and plain fallthrough
+        for t in tgts:
+            preds[t].add(b)
+
+    def reaching_write(reg, s):
+        """A write of reg the site can see: earlier in its own block, or in any block a path runs
+        through first (loops included). A write at the site itself -- an interp whose destination is
+        its own I/J register -- happens after the operand is read and does not count."""
+        ws = writes.get(reg)
+        if not ws:
+            return False
+        b = blk[s["n"]]
+        if any(w < s["n"] and blk[w] == b for w in ws):
+            return True
+        seen, work = {b}, [b]
+        while work:
+            for p in preds[work.pop()]:
+                if p not in seen:
+                    seen.add(p)
+                    if any(w for w in ws if blk[w] == p):
+                        return True
+                    work.append(p)
+        return False
+
+    for s in sites:
+        if s["src"] in (0, 1):
+            s["computed"] = reaching_write(s["src"], s)
+        elif reaching_write(s["src"], s) and s["src"] not in g.v_interp_copy:
+            s["computed"] = True
+        # any other source is pristine: interp_pair_src (#1224) accepts it only as the op's own
+        # coordinate (v0 for p1, v1 for p2) or a plain v_mov copy rooted there — which
+        # interp_copy_sources already vetted, so such a copy keeps #1224's centre-interpolated
+        # read and its bit-identical .spv — and refuses the rest at emission, naming the role
+        if s["computed"] and s["op"].endswith("_f32") and g.pixel_interpolants is not None and \
+                (g.pixel_interpolants[1] >> s["attr"]) & 1:
+            raise Unsupported("computed I/J on 16-bit interpolant through v_interp_*_f32")
+
+    def partner(k, s):
+        """The other op of the pair: the p1 the p2 completes (nearest before), or the p2 that reads the
+        p1's vdst as its partial (nearest after). Same attribute channel; the f32 pair's vdst is shared,
+        the f16 p2 names the p1's vdst as its fourth operand."""
+        if s["op"] in P1:
+            want = (P2_OF[s["op"]],)
+            anchor = s["vdst"]
+        elif s["op"] == "v_interp_p2_f32":
+            want = ("v_interp_p1_f32",)
+            anchor = s["vdst"]
+        else:
+            want = ("v_interp_p1ll_f16", "v_interp_p1lv_f16")
+            anchor = s["partial"]
+        # The f32 pair shares the vdst; the f16 p2 names the p1's vdst as its fourth operand (its
+        # partial), and its own vdst is just where the f16 result goes.
+        cand = [t for t in sites if t["op"] in want
+                and (t["partial"] if t["op"] == "v_interp_p2_f16" else t["vdst"]) == anchor
+                and t["attr"] == s["attr"] and t["chan"] == s["chan"]]
+        if s["op"] in P1:
+            after = [t for t in cand if t["n"] > k]
+            return min(after, key=lambda t: t["n"]) if after else None
+        return max((t for t in cand if t["n"] < k), key=lambda t: t["n"], default=None)
+
+    # Which pairs are computed (either operand is): both ops then take the computed model, so a p2 whose
+    # own operand is pristine still weights with the I its p1 held.
+    pair_of = {}
+    for k, s in enumerate(sites):
+        m = partner(s["n"], s)
+        pair_of[id(s["ins"])] = m
+        if m is not None and (s["computed"] or m["computed"]):
+            s["computed"] = m["computed"] = True
+    attrs = set()
+    for k, s in enumerate(sites):
+        if not s["computed"]:
+            continue
+        m = pair_of[id(s["ins"])]
+        why = None
+        if m is None:
+            why = f"{s['op']} without its {'p2' if s['op'] in P1 else 'p1'} partner"
+        else:
+            lo, hi = min(s["n"], m["n"]), max(s["n"], m["n"])
+            p1 = s if s["op"] in P1 else m
+            kr = p1["vdst"]                     # where the p1 partial lives (the f16 p2 reads it by name)
+            if blk[lo] != blk[hi]:
+                why = "the pair's ops are not in one basic block"
+            else:
+                rr, ww = reg_reads_writes(insns[lo + 1:hi])
+                if kr in ww:
+                    why = "the p1 partial is rewritten between the ops"
+                elif kr in rr:
+                    # Another p2 reading the same partial is fine (two p2s of one p1); anything else
+                    # would observe the p1 partial P10*I, which the full-sum model does not produce.
+                    for t in insns[lo + 1:hi]:
+                        r, _ = reg_reads_writes([t])
+                        if kr in r and not (base_op(t["op"]) == "v_interp_p2_f16" and
+                                            t["args"][3:4] and t["args"][3]["k"] == "vgpr"
+                                            and t["args"][3]["r"] == kr):
+                            why = "the p1 partial is read between the ops"
+                            break
+        if why:
+            raise Unsupported(f"computed I/J pair: {why}")
+        p1, p2 = (s, m) if s["op"] in P1 else (m, s)
+        s["ins"]["ij"] = ("p1" if s["op"] in P1 else "p2", (p1["vdst"], p1["attr"], p1["chan"]),
+                          p1["src"], p2["src"])
+        attrs.add(s["attr"])
+    if attrs and BARY_FALLBACK:
+        raise Unsupported("computed I/J pair under --bary-fallback: no PerVertexKHR inputs")
+    if attrs and F16_HALVES:
+        # --f16-interp-fallback reads decoded halves from the producer: no per-vertex inputs either
+        raise Unsupported("computed I/J pair under --f16-interp-fallback: no PerVertexKHR inputs")
+    return attrs
+
+
+def reg_reads_writes(insns):
+    """(vgprs read, vgprs written) over a slice of insns, by read_before_write_vgprs' conventions."""
+    rr, ww = set(), set()
+    for ins in insns:
+        a, op = ins["args"], ins["op"]
+        if not a:
+            continue
+        reads_all = op.startswith(("exp", "buffer_store", "image_store", "v_cmp", "v_cmpx", "ds_write", "global_store"))
+        regs = []
+        for x in (a if reads_all else a[1:]):
+            if x["k"] == "vgpr":
+                regs += range(x["r"], x["r"] + x.get("n", 1))
+            elif x["k"] == "vlist":
+                regs += x["r"]
+        if base_op(op) in ("v_fmac_f32", "v_mac_f32", "v_fmac_f16") and a[0]["k"] == "vgpr":
+            regs.append(a[0]["r"])
+        rr.update(regs)
+        if not reads_all and a[0]["k"] == "vgpr":
+            ww.update(range(a[0]["r"], a[0]["r"] + a[0].get("n", 1)))
+    return rr, ww
+
 
 def input_signature_full(path, name):
     """ISG1 elements as (system value, declared mask, read/write mask)."""
@@ -9480,6 +9743,9 @@ def translate(path):
     insns = fold_far_branches(insns)
     if stage == "ps":
         g.v_interp_copy = interp_copy_sources(insns)   # before v_interp runs: I/J guards (SHADER-177)
+        # SHADER-177: annotate v_interp sites whose I/J operand is a computed pair, and let those
+        # attributes be read per-vertex (attribute() weights them with the operand values).
+        g.per_vertex |= interp_ij_analysis(insns, g)
     branchy = any(base_op(i["op"]) in BRANCHES for i in insns)
     if any(base_op(i["op"]) in BRANCHES and not i.get("enc") for i in insns):
         # A branch target is relative to the next PC, which needs the branch's `; encoding:` bytes (missing in a
