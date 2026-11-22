@@ -153,7 +153,7 @@ class ContainerTests(unittest.TestCase):
             size = rng.randrange(0, 400)
             data = bytearray(rng.randbytes(size))
             if size >= 4:
-                at = rng.randrange(0, size - 4)
+                at = rng.randrange(0, size - 3)
                 data[at : at + 4] = b"DXBC"
                 try:
                     psc.parse_container(bytes(data), at)
