@@ -3365,7 +3365,8 @@ class Gen:
             # dst = fma(src0, src1, dst). The accumulator is dst itself: low half, or high half under op_sel's dst bit.
             sel, dhi = self.opsel_bits(mods, 3)
             vals = [self.f16_in(a[1], sel[0]), self.f16_in(a[2], sel[1]), self.f16_in(a[0], sel[2])]
-            r = self.fma_f16_odd(*vals)     # one rounding, to f16 (SHADER-55)
+            r = self.fma_f16_odd(*vals)     # one rounding, to f16 (SHADER-55); omod/clamp keep round-to-odd valid
+            r = self.clamp_mods(r, mods)
             self.f16_out(a[0], r, dhi)  # GFX10: f16 ops keep the other half
         elif op in ("v_add_nc_u16", "v_sub_nc_u16"):
             # VOP3-only GFX10 names of the 16-bit add/sub (no carry): opsel-capable, so the high half is kept.
@@ -4114,6 +4115,10 @@ class Gen:
                 # has f16 precision, so round to nearest f16 and back. Reads through the *_f16 opcodes already
                 # narrow to f16 and are unchanged.
                 f = self.f16_roundtrip(f)
+            if op in ("v_interp_p2_f32", "v_interp_mov_f32"):
+                # VOP3 output modifiers (mul:2 / mul:4 / div:2, clamp) apply to the interpolated result
+                # (LLVM gfx10_asm_vop3.s). No-op when mods has none.
+                f = self.clamp_mods(f, mods)
             self.dst(a[0], self.tou(f))
         elif op == "s_movk_i32":
             v = a[1]["v"] & 0xFFFF
