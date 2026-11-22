@@ -1058,20 +1058,180 @@ inline std::vector<LayoutPiece> current(const LayoutTracker* tracker, ResourceId
     return out;
 }
 
+// Zero-fills a block-compressed image range via vkCmdCopyBufferToImage from either the device's zero page
+// (`vk.zero_buffer`) or a zeroed transfer-scratch chunk (`vk.copy_scratch` + `vk.fill_buffer`). Vulkan forbids
+// vkCmdClearColorImage on BC formats, yet D3D12 committed resources start zeroed unless CREATE_NOT_ZEROED is set
+// (D3D-220).
+inline bool zero_compressed_image(const ReplayFunctions& vk, VkCommandBuffer command_buffer,
+                                  const ResourceBinding& resource, const VkImageSubresourceRange& range,
+                                  VkImageLayout dst_layout) {
+    const BlockFormat fmt = block_format(resource.format, VK_IMAGE_ASPECT_COLOR_BIT);
+    if (fmt.block <= 1 || !fmt.bytes || !vk.copy_buffer_to_image) return false;
+    const std::uint32_t mip_begin = range.baseMipLevel;
+    const std::uint32_t mip_end =
+        range.levelCount == VK_REMAINING_MIP_LEVELS ? resource.mip_levels
+                                                    : std::min(resource.mip_levels, mip_begin + range.levelCount);
+    const std::uint32_t layer_begin = range.baseArrayLayer;
+    const std::uint32_t layer_end =
+        range.layerCount == VK_REMAINING_ARRAY_LAYERS ? resource.array_layers
+                                                      : std::min(resource.array_layers, layer_begin + range.layerCount);
+    if (mip_begin >= mip_end || layer_begin >= layer_end) return true;
+
+    constexpr VkDeviceSize kMaxChunk = 64u * 1024u;
+    const std::uint32_t layer_count = layer_end - layer_begin;
+    VkDeviceSize needed = 0;
+    for (std::uint32_t mip = mip_begin; mip < mip_end; ++mip) {
+        const VkExtent2D ext = mip_extent(resource, mip);
+        const std::uint64_t bx = (std::uint64_t(ext.width) + fmt.block - 1) / fmt.block;
+        const std::uint64_t by = (std::uint64_t(ext.height) + fmt.block - 1) / fmt.block;
+        const std::uint64_t mip_d = std::max(1u, resource.depth >> mip);
+        const std::uint64_t slice_bytes = bx * by * fmt.bytes;
+        if (slice_bytes >= kMaxChunk || mip_d > kMaxChunk / slice_bytes ||
+            layer_count > kMaxChunk / (slice_bytes * mip_d)) {
+            needed = kMaxChunk;
+            break;
+        }
+        needed = std::max<VkDeviceSize>(needed, slice_bytes * mip_d * layer_count);
+    }
+    if (!needed) return true;
+
+    VkBuffer zero_buf = VK_NULL_HANDLE;
+    VkDeviceSize zero_off = 0;
+    VkDeviceSize zero_cap = 0;
+    if (vk.zero_buffer && vk.zero_size >= fmt.bytes) {
+        const VkDeviceSize align = fmt.bytes;
+        const VkDeviceSize pad = (align - (vk.zero_offset % align)) % align;
+        if (vk.zero_size >= pad + fmt.bytes) {
+            zero_buf = vk.zero_buffer;
+            zero_off = vk.zero_offset + pad;
+            zero_cap = vk.zero_size - pad;
+        }
+    }
+    if (!zero_buf && vk.copy_scratch && vk.fill_buffer) {
+        // Round up to a multiple of fmt.bytes (8 or 16, always a multiple of 4 for vkCmdFillBuffer).
+        const VkDeviceSize fill_bytes = ((needed + fmt.bytes - 1) / fmt.bytes) * fmt.bytes;
+        VkBuffer scratch = VK_NULL_HANDLE;
+        VkDeviceSize offset = 0;
+        if (vk.copy_scratch(fill_bytes, scratch, offset)) {
+            const VkDeviceSize align = fmt.bytes;
+            const VkDeviceSize pad = (align - (offset % align)) % align;
+            if (fill_bytes >= pad + fmt.bytes) {
+                vk.fill_buffer(command_buffer, scratch, offset + pad, fill_bytes - pad, 0);
+                memory_barrier(vk, command_buffer, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                               VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+                zero_buf = scratch;
+                zero_off = offset + pad;
+                zero_cap = fill_bytes - pad;
+            }
+        }
+    }
+    if (!zero_buf || zero_cap < fmt.bytes) return false;
+
+    std::vector<VkBufferImageCopy> regions;
+    for (std::uint32_t mip = mip_begin; mip < mip_end; ++mip) {
+        const VkExtent2D ext = mip_extent(resource, mip);
+        const std::uint32_t mip_d = std::max(1u, resource.depth >> mip);
+        const std::uint64_t bx_total = (std::uint64_t(ext.width) + fmt.block - 1) / fmt.block;
+        const std::uint64_t by_total = (std::uint64_t(ext.height) + fmt.block - 1) / fmt.block;
+        const std::uint64_t slice_bytes = bx_total * by_total * fmt.bytes;
+        if (slice_bytes && slice_bytes <= zero_cap && mip_d <= zero_cap / slice_bytes &&
+            layer_count <= zero_cap / (slice_bytes * mip_d)) {
+            VkBufferImageCopy r{};
+            r.bufferOffset = zero_off;
+            r.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, mip, layer_begin, layer_count};
+            r.imageExtent = {ext.width, ext.height, mip_d};
+            regions.push_back(r);
+            continue;
+        }
+        const std::uint64_t row_bytes = bx_total * fmt.bytes;
+        for (std::uint32_t layer = layer_begin; layer < layer_end; ++layer) {
+            if (slice_bytes <= zero_cap) {
+                const std::uint32_t slices_per_copy =
+                    std::max<std::uint32_t>(1u, std::uint32_t(std::min<std::uint64_t>(mip_d, zero_cap / slice_bytes)));
+                for (std::uint32_t z = 0; z < mip_d; z += slices_per_copy) {
+                    VkBufferImageCopy r{};
+                    r.bufferOffset = zero_off;
+                    r.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, mip, layer, 1};
+                    r.imageOffset = {0, 0, std::int32_t(z)};
+                    r.imageExtent = {ext.width, ext.height, std::min(slices_per_copy, mip_d - z)};
+                    regions.push_back(r);
+                }
+            } else if (row_bytes <= zero_cap) {
+                const std::uint32_t rows_per_copy =
+                    std::max<std::uint32_t>(1u, std::uint32_t(std::min<std::uint64_t>(by_total, zero_cap / row_bytes)));
+                for (std::uint32_t z = 0; z < mip_d; ++z) {
+                    for (std::uint64_t y_blk = 0; y_blk < by_total; y_blk += rows_per_copy) {
+                        const std::uint32_t oy = std::uint32_t(y_blk * fmt.block);
+                        const std::uint32_t eh = std::min<std::uint32_t>(rows_per_copy * fmt.block, ext.height - oy);
+                        VkBufferImageCopy r{};
+                        r.bufferOffset = zero_off;
+                        r.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, mip, layer, 1};
+                        r.imageOffset = {0, std::int32_t(oy), std::int32_t(z)};
+                        r.imageExtent = {ext.width, eh, 1};
+                        regions.push_back(r);
+                    }
+                }
+            } else {
+                const std::uint32_t cols_per_copy =
+                    std::max<std::uint32_t>(1u, std::uint32_t(std::min<std::uint64_t>(bx_total, zero_cap / fmt.bytes)));
+                for (std::uint32_t z = 0; z < mip_d; ++z) {
+                    for (std::uint64_t y_blk = 0; y_blk < by_total; ++y_blk) {
+                        const std::uint32_t oy = std::uint32_t(y_blk * fmt.block);
+                        const std::uint32_t eh = std::min<std::uint32_t>(fmt.block, ext.height - oy);
+                        for (std::uint64_t x_blk = 0; x_blk < bx_total; x_blk += cols_per_copy) {
+                            const std::uint32_t ox = std::uint32_t(x_blk * fmt.block);
+                            const std::uint32_t ew =
+                                std::min<std::uint32_t>(cols_per_copy * fmt.block, ext.width - ox);
+                            VkBufferImageCopy r{};
+                            r.bufferOffset = zero_off;
+                            r.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, mip, layer, 1};
+                            r.imageOffset = {std::int32_t(ox), std::int32_t(oy), std::int32_t(z)};
+                            r.imageExtent = {ew, eh, 1};
+                            regions.push_back(r);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if (!regions.empty())
+        vk.copy_buffer_to_image(command_buffer, zero_buf, resource.image, dst_layout,
+                                std::uint32_t(regions.size()), regions.data());
+    return true;
+}
+
 // Images registered with the tracker in UNDEFINED have never been used. D3D12 committed resources start zeroed,
-// so each such piece is cleared to zero (colour 0, depth 0, stencil 0) and moved to `layout`, the layout the
-// operation about to run expects, before that operation; with not_zeroed, or a block-compressed format (which
-// Vulkan cannot clear), it is only moved. The tracker records it.
+// so each such piece is zero-filled (clear for uncompressed images, zero-buffer copy for block-compressed formats
+// when a zero page or transfer scratch is available) and moved to `layout`, the layout the operation about to run
+// expects; with not_zeroed, it is only moved. The tracker records it.
 inline void initialize(const ReplayFunctions& vk, VkCommandBuffer command_buffer, const ResourceBinding& resource,
                        ResourceId id, std::vector<LayoutPiece>& pieces, VkImageLayout layout, LayoutTracker* tracker) {
     constexpr VkAccessFlags any_memory = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
     for (auto& piece : pieces) {
         if (piece.layout != VK_IMAGE_LAYOUT_UNDEFINED) continue;
-        // Vulkan cannot clear block-compressed images; those start undefined (applications upload them first).
-        const bool compressed = block_format(resource.format, VK_IMAGE_ASPECT_COLOR_BIT).block > 1;
-        if (resource.not_zeroed || compressed) {
+        const BlockFormat fmt = block_format(resource.format, VK_IMAGE_ASPECT_COLOR_BIT);
+        const bool compressed = fmt.block > 1;
+        if (resource.not_zeroed) {
             image_barrier(vk, command_buffer, resource, piece.range, VK_IMAGE_LAYOUT_UNDEFINED, layout, 0,
                           VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, any_memory, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+        } else if (compressed) {
+            const bool can_zero =
+                vk.copy_buffer_to_image &&
+                ((vk.zero_buffer && vk.zero_size >= fmt.bytes) || (vk.copy_scratch && vk.fill_buffer));
+            if (can_zero) {
+                const VkImageLayout dst = image_layout(resource, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+                image_barrier(vk, command_buffer, resource, piece.range, VK_IMAGE_LAYOUT_UNDEFINED, dst, 0,
+                              VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+                              VK_PIPELINE_STAGE_TRANSFER_BIT);
+                const bool zeroed = zero_compressed_image(vk, command_buffer, resource, piece.range, dst);
+                image_barrier(vk, command_buffer, resource, piece.range, dst, layout,
+                              zeroed ? VK_ACCESS_TRANSFER_WRITE_BIT : 0,
+                              zeroed ? VK_PIPELINE_STAGE_TRANSFER_BIT : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, any_memory,
+                              VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+            } else {
+                image_barrier(vk, command_buffer, resource, piece.range, VK_IMAGE_LAYOUT_UNDEFINED, layout, 0,
+                              VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, any_memory, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+            }
         } else {
             const VkImageLayout dst = image_layout(resource, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
             image_barrier(vk, command_buffer, resource, piece.range, VK_IMAGE_LAYOUT_UNDEFINED, dst, 0,
