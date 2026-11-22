@@ -6051,6 +6051,18 @@ public:
             auto* fs = static_cast<D3D12_FEATURE_DATA_FORMAT_SUPPORT*>(data);
             fs->Support1 = D3D12_FORMAT_SUPPORT1_NONE;
             fs->Support2 = D3D12_FORMAT_SUPPORT2_NONE;
+            // The host runtime's format table (compare_invalid_arguments, "format support:"): a value it has no entry
+            // for is E_FAIL, not unsupported: past B4G4R4A4_UNORM (115) up to 188, which includes the planar video
+            // formats P208/V208/V408 (130-132), and from 192 up; 189-191 are the sampler-feedback formats and
+            // A4B4G4R4. UNKNOWN is a buffer format (raw and structured buffers).
+            const UINT format_value = static_cast<UINT>(fs->Format);
+            if (format_value > static_cast<UINT>(DXGI_FORMAT_B4G4R4A4_UNORM) &&
+                (format_value < 189 || format_value > 191))
+                return d3d12_trace::result(method, E_FAIL);
+            if (fs->Format == DXGI_FORMAT_UNKNOWN) {
+                fs->Support1 = D3D12_FORMAT_SUPPORT1_BUFFER;
+                return d3d12_trace::result(method, S_OK);
+            }
             const Format fmt = texture_storage_format(fs->Format, false);
             const Format depth_fmt = vulkan_format(fs->Format, true);
             VkFormat vk_fmt = fmt.format != VK_FORMAT_UNDEFINED ? fmt.format : depth_fmt.format;
