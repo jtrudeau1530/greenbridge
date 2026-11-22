@@ -819,5 +819,109 @@ class TestInterpMovF16RegisterAliasing(unittest.TestCase):
                 self.assertEqual(wave.vgprs[lane][2], initial_val)
 
 
+class InterpStatusFlags:
+    """Status flags and condition codes for a 16-bit attribute move."""
+
+    def __init__(self, u16_val: int) -> None:
+        self.raw_u16 = u16_val & MASK16
+        exp = (self.raw_u16 >> 10) & 0x1F
+        mant = self.raw_u16 & 0x03FF
+        self.is_negative = bool(self.raw_u16 & H_NEG_ZERO)
+        self.is_zero = (self.raw_u16 & 0x7FFF) == 0
+        self.is_subnormal = (exp == 0 and mant != 0)
+        self.is_inf = (exp == 0x1F and mant == 0)
+        self.is_nan = (exp == 0x1F and mant != 0)
+
+    def __repr__(self) -> str:
+        flags = [k for k, v in self.__dict__.items() if v is True]
+        return f"InterpStatusFlags({', '.join(flags)})"
+
+
+def evaluate_interp_vcc(
+    wave: SIMDWavefront,
+    vgpr_idx: int,
+    predicate: str,
+    *,
+    high: bool = False,
+) -> int:
+    """Generate 64-bit VCC mask evaluating condition on 16-bit half across active lanes."""
+    vcc = 0
+    for lane in range(wave.wave_size):
+        if (wave.exec_mask >> lane) & 1:
+            raw_word = wave.vgprs[lane][vgpr_idx]
+            lo, hi = unpack_f16_pair(raw_word)
+            target_u16 = hi if high else lo
+            flags = InterpStatusFlags(target_u16)
+            f_val = u16_to_f16(target_u16)
+
+            cond = False
+            if predicate == "eq_zero":
+                cond = flags.is_zero
+            elif predicate == "ge_zero":
+                cond = not flags.is_nan and not flags.is_negative
+            elif predicate == "lt_zero":
+                cond = not flags.is_nan and flags.is_negative and not flags.is_zero
+            elif predicate == "is_nan":
+                cond = flags.is_nan
+            elif predicate == "is_subnormal":
+                cond = flags.is_subnormal
+            elif predicate == "is_finite":
+                cond = not flags.is_nan and not flags.is_inf
+            else:
+                raise ValueError(f"Unknown predicate: {predicate}")
+
+            if cond:
+                vcc |= (1 << lane)
+    return vcc
+
+
+class TestInterpMovF16StatusFlagsAndConditionCodes(unittest.TestCase):
+    """Test suite for condition codes, status flags, and VCC predicate generation."""
+
+    def test_status_flags_signed_zeros(self):
+        flags_pos = InterpStatusFlags(H_POS_ZERO)
+        self.assertTrue(flags_pos.is_zero)
+        self.assertFalse(flags_pos.is_negative)
+
+        flags_neg = InterpStatusFlags(H_NEG_ZERO)
+        self.assertTrue(flags_neg.is_zero)
+        self.assertTrue(flags_neg.is_negative)
+
+    def test_status_flags_subnormals_and_specials(self):
+        flags_sub = InterpStatusFlags(H_SUB_MIN)
+        self.assertTrue(flags_sub.is_subnormal)
+        self.assertFalse(flags_sub.is_zero)
+
+        flags_inf = InterpStatusFlags(H_POS_INF)
+        self.assertTrue(flags_inf.is_inf)
+        self.assertFalse(flags_inf.is_nan)
+
+        flags_nan = InterpStatusFlags(H_QNAN)
+        self.assertTrue(flags_nan.is_nan)
+        self.assertFalse(flags_nan.is_inf)
+
+    def test_vcc_predicate_mask_across_simd_wave(self):
+        wave = SIMDWavefront(wave_size=64)
+        wave.exec_lo = 0xFFFFFFFF
+        wave.exec_hi = 0x00000000  # upper 32 inactive
+
+        # Alternating positive 1.0 (0x3C00) and negative -1.0 (0xBC00) in low half
+        for lane in range(64):
+            val = H_ONE if (lane % 2 == 0) else H_NEG_ONE
+            wave.vgprs[lane][0] = val
+
+        # ge_zero on low half should match even lanes in 0..31 (0x55555555)
+        vcc_ge = evaluate_interp_vcc(wave, 0, "ge_zero", high=False)
+        self.assertEqual(vcc_ge, 0x55555555)
+
+        # lt_zero on low half should match odd lanes in 0..31 (0xAAAAAAAA)
+        vcc_lt = evaluate_interp_vcc(wave, 0, "lt_zero", high=False)
+        self.assertEqual(vcc_lt, 0xAAAAAAAA)
+
+        # Inactive lanes (32..63) must have 0 in VCC
+        self.assertEqual(vcc_ge >> 32, 0)
+        self.assertEqual(vcc_lt >> 32, 0)
+
+
 if __name__ == "__main__":
     unittest.main()
