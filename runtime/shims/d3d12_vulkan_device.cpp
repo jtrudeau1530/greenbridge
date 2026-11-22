@@ -430,7 +430,7 @@ struct DeviceState {
     // Cached physical-device no-attachment sample counts for D3D12_OPTIONS19.
     UINT no_output_sample_counts = 0;
     float max_sampler_lod_bias = 0;
-    bool conservative_raster_tier1 = false;
+    D3D12_CONSERVATIVE_RASTERIZATION_TIER conservative_raster_tier = D3D12_CONSERVATIVE_RASTERIZATION_TIER_NOT_SUPPORTED;
     // VkPhysicalDeviceDepthStencilResolveProperties: the modes a depth or stencil ResolveSubresourceRegion can use.
     VkResolveModeFlags depth_resolve_modes = 0;
     VkResolveModeFlags stencil_resolve_modes = 0;
@@ -2685,7 +2685,7 @@ public:
         if (r.ConservativeRaster != D3D12_CONSERVATIVE_RASTERIZATION_MODE_OFF &&
             r.ConservativeRaster != D3D12_CONSERVATIVE_RASTERIZATION_MODE_ON) return E_INVALIDARG;
         if (r.ConservativeRaster == D3D12_CONSERVATIVE_RASTERIZATION_MODE_ON) {
-            if (!device_.conservative_raster_tier1) {
+            if (device_.conservative_raster_tier == D3D12_CONSERVATIVE_RASTERIZATION_TIER_NOT_SUPPORTED) {
                 log_once("conservative rasterization needs enabled VK_EXT_conservative_rasterization and Tier 1 precision", 1);
                 return E_INVALIDARG;
             }
@@ -3918,9 +3918,9 @@ public:
                 if (info.conservative_rasterization) resolve.pNext = &conservative;
                 VkPhysicalDeviceProperties2 props{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &resolve};
                 get_props2(info.physical, &props);
-                state_.conservative_raster_tier1 = leonida::conservative_raster::tier1(
+                state_.conservative_raster_tier = D3D12_CONSERVATIVE_RASTERIZATION_TIER(leonida::conservative_raster::tier(
                     info.conservative_rasterization, props.properties.limits.subPixelPrecisionBits,
-                    conservative.primitiveOverestimationSize);
+                    conservative.primitiveOverestimationSize, conservative.degenerateTrianglesRasterized == VK_TRUE));
                 state_.depth_resolve_modes = resolve.supportedDepthResolveModes;
                 state_.stencil_resolve_modes = resolve.supportedStencilResolveModes;
             }
@@ -5862,8 +5862,7 @@ public:
             opts->PSSpecifiedStencilRefSupported = TRUE;
             opts->TypedUAVLoadAdditionalFormats = TRUE;
             opts->ROVsSupported = TRUE;
-            opts->ConservativeRasterizationTier = state_.conservative_raster_tier1
-                ? D3D12_CONSERVATIVE_RASTERIZATION_TIER_1 : D3D12_CONSERVATIVE_RASTERIZATION_TIER_NOT_SUPPORTED;
+            opts->ConservativeRasterizationTier = state_.conservative_raster_tier;
             opts->MaxGPUVirtualAddressBitsPerResource = 40;
             opts->StandardSwizzle64KBSupported = FALSE;
             opts->CrossNodeSharingTier = D3D12_CROSS_NODE_SHARING_TIER_NOT_SUPPORTED;

@@ -106,8 +106,8 @@ struct VulkanDeviceInfo {
     // rejected at ExecuteCommandLists.
     bool conditional_rendering = false;
     bool storage_buffer_8bit = false; // storageBuffer8BitAccess enabled: byte-granular predicated buffer copies.
-    // VK_EXT_conservative_rasterization is enabled on the logical device. Tier 1 is exposed only when its
-    // physical-device precision/overestimation properties also meet the implemented requirements.
+    // VK_EXT_conservative_rasterization is enabled on the logical device. Tier 1/2 depend on the physical
+    // precision/overestimation properties; Tier 2 also requires post-snap degenerate triangles.
     bool conservative_rasterization = false;
     // VK_EXT_host_image_copy and its hostImageCopy feature are enabled on `device`: WriteToSubresource and
     // ReadFromSubresource on textures in CPU-visible heaps copy on the CPU instead of through a staging submit.

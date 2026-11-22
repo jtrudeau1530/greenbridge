@@ -660,15 +660,26 @@ The compute path, end to end:
   - **Logic ops** come from `RenderTarget[0]`, as in D3D12, and apply to every target (Vulkan has one per
     pipeline; it skips float formats). **`DepthClipEnable = FALSE`** is depth clamping: D3D12 clamps output depth
     to the viewport's range anyway.
-  - **Conservative rasterization (Tier 1):** the standalone device enables `VK_EXT_conservative_rasterization`
+  - **Conservative rasterization (Tier 1/2):** the standalone device enables `VK_EXT_conservative_rasterization`
     when available; caller-owned devices must set `VulkanDeviceInfo::conservative_rasterization` only if they
-    enabled it. OPTIONS reports Tier 1 only with at least eight subpixel precision bits and a finite, nonnegative
+    enabled it. OPTIONS reports at least Tier 1 only with at least eight subpixel precision bits and a finite, nonnegative
     primitive overestimation no greater than `0.5 - 1/512` pixels, leaving half a minimum grid step within the
     Tier 1 uncertainty bound. `ConservativeRaster=ON` uses overestimate mode with zero extra overestimation,
     including unbound-attachment variants. OFF keeps the ordinary pipeline. Missing support, unknown modes,
     wireframe and non-triangle PSOs are refused; conservative TIR (`ForcedSampleCount != 0`) remains `E_NOTIMPL`.
-    Tier 2/3 and `SV_InnerCoverage` are not exposed. See [Microsoft's rules](https://learn.microsoft.com/en-us/windows/win32/direct3d12/conservative-rasterization)
+    Tier 2 additionally requires `degenerateTrianglesRasterized` and primitive overestimation plus half a
+    device subpixel step no greater than 1/256 pixel. Other eligible devices retain Tier 1. Tier 3 and
+    `SV_InnerCoverage` are not exposed. See [Microsoft's rules](https://learn.microsoft.com/en-us/windows/win32/direct3d12/conservative-rasterization)
     and [Vulkan's properties](https://docs.vulkan.org/refpages/latest/refpages/source/VkPhysicalDeviceConservativeRasterizationPropertiesEXT.html).
+    `d3d12_conservative_tier2_test` checks the tighter geometric uncertainty bound, post-snap and exact
+    degenerates with distinct indices, provoking-vertex colour, constant depth, back-facing classification,
+    culling, indexed permutations, triangle strips, scissor and unbound-attachment variants. On RX 5700 XT
+    (Windows driver 32.0.21045.5002), 16 tight-bound scenes and 480 degenerate draws pass across Vulkan and native
+    AMD D3D12. The WARP comparison omits only its pixel-corner fixture: WARP drops that tiny triangle even though
+    Vulkan and native AMD cover it. `--warp-corner` retains the strict failing software-reference reproducer;
+    Vulkan always checks the corner. Variable `SV_Position.z` is not a provoking-vertex oracle: both native
+    references and Vulkan exhibit extrapolation for screen-space degenerates. This test checks constant depth
+    and separately varying colour, and does not claim a depth-buffer readback or variable-depth conformance.
     `d3d12_conservative_raster_test` checks geometric required/forbidden coverage, subpixel/sliver and degenerate
     triangles, culling, scissor, 1x/4x MSAA, variants, feature reporting and refusals. Uncertain edge pixels are
     allowed to differ. On RX 5700 XT (Windows 32.0.21045.5002), 48 scenario pairs pass on Vulkan and native AMD;
