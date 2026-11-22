@@ -95,7 +95,7 @@ namespace {
 constexpr DWORD kDataFileLoadFlags =
     LOAD_LIBRARY_AS_DATAFILE | LOAD_LIBRARY_AS_DATAFILE_EXCLUSIVE | LOAD_LIBRARY_AS_IMAGE_RESOURCE;
 
-HMODULE load_shim_or_bundled(const std::string& path, bool& handled) {
+HMODULE load_shim_or_bundled(const std::string& path, DWORD flags, bool& handled) {
     handled = false;
     if (HMODULE h = owned_handle(path)) {
         handled = true;
@@ -103,7 +103,8 @@ HMODULE load_shim_or_bundled(const std::string& path, bool& handled) {
     }
     const std::string dll = module_name(path);
     if (!dll.empty()) {
-        if (void* h = load_bundled_module(dll, handled); handled) return reinterpret_cast<HMODULE>(h);
+        if (void* h = load_bundled_module(dll, static_cast<uint32_t>(flags), handled); handled)
+            return reinterpret_cast<HMODULE>(h);
     }
     return nullptr;
 }
@@ -111,7 +112,7 @@ HMODULE load_shim_or_bundled(const std::string& path, bool& handled) {
 HMODULE WINAPI load_library_a(LPCSTR name) {
     if (name) {
         bool handled = false;
-        HMODULE h = load_shim_or_bundled(name, handled);
+        HMODULE h = load_shim_or_bundled(name, 0, handled);
         if (handled) return h;
     }
     return LoadLibraryA(name);
@@ -120,7 +121,7 @@ HMODULE WINAPI load_library_a(LPCSTR name) {
 HMODULE WINAPI load_library_w(LPCWSTR name) {
     if (name) {
         bool handled = false;
-        HMODULE h = load_shim_or_bundled(narrow(name), handled);
+        HMODULE h = load_shim_or_bundled(narrow(name), 0, handled);
         if (handled) return h;
     }
     return LoadLibraryW(name);
@@ -129,7 +130,7 @@ HMODULE WINAPI load_library_w(LPCWSTR name) {
 HMODULE WINAPI load_library_ex_a(LPCSTR name, HANDLE file, DWORD flags) {
     if (name && (flags & kDataFileLoadFlags) == 0) {
         bool handled = false;
-        HMODULE h = load_shim_or_bundled(name, handled);
+        HMODULE h = load_shim_or_bundled(name, flags, handled);
         if (handled) return h;
     }
     return LoadLibraryExA(name, file, flags);
@@ -138,7 +139,7 @@ HMODULE WINAPI load_library_ex_a(LPCSTR name, HANDLE file, DWORD flags) {
 HMODULE WINAPI load_library_ex_w(LPCWSTR name, HANDLE file, DWORD flags) {
     if (name && (flags & kDataFileLoadFlags) == 0) {
         bool handled = false;
-        HMODULE h = load_shim_or_bundled(narrow(name), handled);
+        HMODULE h = load_shim_or_bundled(narrow(name), flags, handled);
         if (handled) return h;
     }
     return LoadLibraryExW(name, file, flags);

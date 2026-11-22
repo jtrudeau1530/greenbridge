@@ -304,6 +304,7 @@ of an inline write of the same values.
 | `0x20ed6` | `+0x4a0` | 148 → none | `(list, count * 40, 16)` returns a pointer; on null the DLL prints `D3D12 XDXR Error: Failed to allocate upload buffer` and throws `E_FAIL` | **Measured**: an upload allocator `(size, alignment)` |
 | `0x20f99` | `+0x158` | 43 → 39 `SetComputeRootShaderResourceView` | `(0, p)`, `p` the pointer slot 148 returned at `0x20ed6`, unchanged | **Measured**: the CPU pointer is used as the GPU address |
 | `0x149ba` | `+0x280` | 80 → none | `(x, 1, 1, 0x8020)`: `EDX=EDI`, `R8D=R9D=1`, fifth argument `0x8020` (inline: the five-dword packet `0x4003cc00, x, 1, 1, W` of section 3.5a; the calls at `0x1525d` and `0x153b4` pass `0x20`) | Inferred: a `Dispatch` with one extra word |
+| `0x149ba` | `+0x280` | 80 → none | `(x, 1, 1, 0x8020)`: `EDX=EDI`, `R8D=R9D=1`, fifth argument `0x8020` (inline: the five-dword packet `0x4003cc00, x, 1, 1, W` of section 3.5a; the calls at `0x1525d` and `0x153b4` pass `0x20`, the one at `0x1d047` `0x8020`) | Inferred: a `Dispatch` with one extra word |
 | `0xd6de` | `+0x238` | 71 → none | `(&label, counter, 0 or 0x1000, 0)`: the counter at `[rbx+0x9c]` is incremented first; `0x1000` on the last item of a batch | Inferred: a GPU write of a 32-bit value to memory |
 | `0xd679` | `+0x248` | 73 → none | `(&label, 3, reference, 0xffffffff, 0)` | Inferred: a GPU wait until the masked value compares (function 3) with the reference |
 | `0xd7b4` | `+0x490` | 146 → GCL7 80 `Barrier` | the same global UAV barrier as `0x1da02` | **Measured** |
@@ -451,6 +452,35 @@ section 3.4 measured in the BVH builder's helper without a meaning (`+0x18`, `+0
 them, and it is the simplest contract for a layer that does not want to decode these packets. Whether the game's
 executable makes the same check before writing is unknown until it is available; it is compiled against the same
 console headers.
+
+**The five-word dispatch.** The BVH builder also writes `0x4003cc00, x, 1, 1, W`:
+
+- **Sites:** `0x14972`, `0x15215`, `0x1536a` and `0x1d002`, each checked against the dispatch limit `+0x28`. The
+  cursor advances 20 bytes and the flag byte at `+0x140` is cleared.
+- **Its vtable fallback is console slot 80** (section 3.3a), read from the code: when the buffer is full, each site
+  calls slot 80 (`+0x280`) instead, as `(x, 1, 1, W)` with the same `W` (`0x149ba`, `0x1525d`, `0x153b4`, `0x1d047`).
+  So the packet is slot 80's inline form; that slot 80 is a `Dispatch` with one extra word stays inferred.
+- **`W` is `0x8020`** at `0x14972` and `0x1d002`, and **`0x20`** at `0x15215` and `0x1536a`. What bit 15 of `W`
+  selects is not known.
+
+The FSR DLL never writes this form.
+
+**Byte `+0x143` is console-runtime state:** the BVH builder reads it at 31 sites and the FSR DLL at one (all `cmp
+byte ptr [reg+143h]`), but neither DLL writes it. Every store into `+0x140`..`+0x143` in either DLL is a byte store to
+`+0x140` or `+0x141`, and no wider store reaches `+0x143`. A replacement list can leave it 0.
+
+**The root-argument header word** is the root parameter's table entry `table[root]` (`+0x344 + 4·root`), adjusted
+only for root constants:
+
+- **Several 32-bit constants at once:** `table[root] + ((count − 1) << 16)`, then `count` dwords. Examples:
+  `+ 0x120000` for 19 constants (`0x14e3b`), `+ 0x70000` for 8 (`0x1d324`), `+ 0x30000` for 4.
+- **One constant at a non-zero offset:** `table[root] + 4 · destOffset`. At `0x19fca` the builder adds `0xc` and its
+  vtable fallback is slot 37 `(2, value, 3)`; at `0x1a346` it adds `0x14` and the fallback is `(2, value, 5)`.
+- **Otherwise the entry is written unchanged:** one constant at offset 0, a descriptor table (then 4 bytes), a root
+  CBV/SRV/UAV (then the full 8-byte GPU address, e.g. `0x19fff`).
+
+No site combines both adjustments. Before writing, every reader tests the entry against `0xC0000000` (98 sites in the
+builder, 7 in the FSR DLL), and sets the flag byte at `+0x140` only when both of those bits are clear.
 
 ### 3.5 What the package does not measure
 
