@@ -10,6 +10,12 @@ endif()
 
 option(LEONIDA_BUILD_WINDOWS_RUNTIME "Build the Windows runtime, its shims and their tests" ${WIN32})
 if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
+  # Custom CMAKE_CXX_FLAGS can replace MSVC's default /EHsc. Require C++ stack unwinding so error
+  # paths in the runtime and its libraries still destroy automatic objects when an exception leaves a frame.
+  if(CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
+    add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/EHsc>)
+  endif()
+
   # The d3d12_xs shim and its tests use version 1.2 root signatures (D3D12_ROOT_SIGNATURE_DESC2), which the Windows
   # SDK declares from 10.0.26100 on. Stop here with the fix instead of failing halfway through the build.
   include(CheckCXXSourceCompiles)
@@ -332,6 +338,11 @@ if(BUILD_TESTING)
   target_include_directories(vulkan_device_filter_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
   add_test(NAME vulkan_device_filter COMMAND vulkan_device_filter_test)
   if(TARGET gta6rt)
+    if(CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
+      add_executable(cpp_unwind_test test/cpp_unwind_test.cpp)
+      add_test(NAME cpp_unwind COMMAND cpp_unwind_test)
+    endif()
+
     # Compile-time ABI checks (D3D12/XMem structure sizes, alignments and member offsets against the Windows SDK).
     # The file existed but no target built it, so none of its static_asserts ever ran.
     add_executable(runtime_types_test test/test_runtime_types.cpp)
