@@ -130,8 +130,11 @@ void CALLBACK on_device(GameInputCallbackToken token, void*, IGameInputDevice* d
                         uint32_t previous) {
     g_device_events.push_back({device, current, previous, token});
 }
+DWORD g_reading_sleep_ms = 0;  // makes on_reading slow, for the Dispatch quota checks
+
 void CALLBACK on_reading(GameInputCallbackToken, void*, IGameInputReading* reading, bool) {
     if (reading) ++g_reading_events;
+    if (g_reading_sleep_ms) Sleep(g_reading_sleep_ms);
 }
 void CALLBACK on_guide(GameInputCallbackToken, void*, IGameInputDevice*, uint64_t, bool pressed) {
     g_guide_events.push_back(pressed);
@@ -1342,6 +1345,32 @@ int main() {
     check(wait && WaitForSingleObject(wait, 0) == WAIT_OBJECT_0, "the wait handle is signalled");
     if (dispatcher) dispatcher->Dispatch(1000);
     check(g_reading_events > before_dispatch, "Dispatch runs them");
+
+    // The quota: Dispatch runs at least one queued event, takes no more once the quota has passed, and returns whether
+    // events remain (re-signalling the wait handle). Four button changes queue four reading events.
+    auto queue_changes = [&](int n) {
+        for (int i = 0; i < n; ++i) {
+            SDL_SetJoystickVirtualButton(xbox.js, SDL_GAMEPAD_BUTTON_NORTH, i % 2 == 1);  // NORTH is down now: up, down, up, down
+            rt::gameinput::poll();
+        }
+    };
+    if (dispatcher) {
+        while (dispatcher->Dispatch(UINT64_MAX)) {}
+        queue_changes(4);
+        int before_quota = g_reading_events;
+        if (wait) WaitForSingleObject(wait, 0);  // consume the signal from queueing
+        check(dispatcher->Dispatch(0) && g_reading_events == before_quota + 1, "Dispatch(0) runs exactly one event and reports more");
+        check(wait && WaitForSingleObject(wait, 0) == WAIT_OBJECT_0, "the wait handle is signalled again while events remain");
+        g_reading_sleep_ms = 5;
+        before_quota = g_reading_events;
+        check(dispatcher->Dispatch(1000) && g_reading_events == before_quota + 1,
+              "a 1 ms quota stops after a 5 ms callback and reports more");
+        g_reading_sleep_ms = 0;
+        before_quota = g_reading_events;
+        check(!dispatcher->Dispatch(1'000'000) && g_reading_events >= before_quota + 2,
+              "a large quota drains the queue and returns false");
+        check(!dispatcher->Dispatch(0), "Dispatch on an empty queue returns false");
+    }
     if (wait) CloseHandle(wait);
     if (dispatcher) dispatcher->Release();
 

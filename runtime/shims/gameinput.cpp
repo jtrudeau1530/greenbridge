@@ -35,6 +35,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -660,6 +661,28 @@ void call(const Callback& c, const Event& e) {
     }
 }
 
+// Runs one queued event's callbacks on the calling thread, without holding the state lock.
+void deliver_event(const Event& e) {
+    State& s = g();
+    std::vector<Callback> targets;
+    {
+        std::lock_guard lock(s.mu);
+        for (const Callback& c : s.callbacks)
+            if (matches(c, e)) targets.push_back(c);
+    }
+    for (const Callback& c : targets) {
+        bool still = false;
+        {
+            std::lock_guard lock(s.mu);
+            for (const Callback& now : s.callbacks)
+                if (now.token == c.token) still = now.active;
+        }
+        if (still) call(c, e);
+    }
+    if (e.device) e.device->Release();
+    if (e.reading) e.reading->Release();
+}
+
 // Runs queued callbacks on the calling thread, without holding the state lock. Returns whether more events arrived
 // meanwhile.
 bool deliver() {
@@ -670,30 +693,41 @@ bool deliver() {
         std::lock_guard lock(s.mu);
         events.swap(s.queue);
     }
-    const DWORD self = GetCurrentThreadId();
-    s.delivering_thread = self;
-    for (const Event& e : events) {
-        std::vector<Callback> targets;
-        {
-            std::lock_guard lock(s.mu);
-            for (const Callback& c : s.callbacks)
-                if (matches(c, e)) targets.push_back(c);
-        }
-        for (const Callback& c : targets) {
-            bool still = false;
-            {
-                std::lock_guard lock(s.mu);
-                for (const Callback& now : s.callbacks)
-                    if (now.token == c.token) still = now.active;
-            }
-            if (still) call(c, e);
-        }
-        if (e.device) e.device->Release();
-        if (e.reading) e.reading->Release();
-    }
+    s.delivering_thread = GetCurrentThreadId();
+    for (const Event& e : events) deliver_event(e);
     s.delivering_thread = 0;
     std::lock_guard lock(s.mu);
     return !s.queue.empty();
+}
+
+// IGameInputDispatcher::Dispatch: runs queued events oldest first, at least one even with a quota of 0, and takes no
+// further event once quota_us microseconds have passed (an event already started runs to the end, so the quota is a
+// target, as on Windows). While events remain the wait handle is signalled again, so a title that waits on it before
+// each call comes back for the rest. Returns whether events remain.
+bool deliver_within(uint64_t quota_us) {
+    State& s = g();
+    std::lock_guard dl(s.deliver_mu);
+    const auto start = std::chrono::steady_clock::now();
+    s.delivering_thread = GetCurrentThreadId();
+    for (bool first = true;; first = false) {
+        if (!first) {
+            const auto spent = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start);
+            if (static_cast<uint64_t>(spent.count()) >= quota_us) break;
+        }
+        Event e;
+        {
+            std::lock_guard lock(s.mu);
+            if (s.queue.empty()) break;
+            e = s.queue.front();
+            s.queue.erase(s.queue.begin());
+        }
+        deliver_event(e);
+    }
+    s.delivering_thread = 0;
+    std::lock_guard lock(s.mu);
+    const bool remaining = !s.queue.empty();
+    if (remaining && s.wait_event) SetEvent(s.wait_event);
+    return remaining;
 }
 
 // ---- SDL backend (poll thread only) -----------------------------------------------------------------------------
@@ -1801,8 +1835,8 @@ public:
         }
         return r;
     }
-    // Runs the queued callbacks on the caller's thread. The quota is not enforced: the queue is short.
-    bool STDMETHODCALLTYPE Dispatch(uint64_t) override { return deliver(); }
+    // Runs the queued callbacks on the caller's thread within the quota (see deliver_within).
+    bool STDMETHODCALLTYPE Dispatch(uint64_t quotaInMicroseconds) override { return deliver_within(quotaInMicroseconds); }
     HRESULT STDMETHODCALLTYPE OpenWaitHandle(HANDLE* handle) override {
         if (!handle) return E_POINTER;
         *handle = nullptr;
