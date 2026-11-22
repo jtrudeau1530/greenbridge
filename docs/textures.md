@@ -759,7 +759,8 @@ referencing an unconfirmed or unknown built-in history entry raises
 5. **Port multi-slice layouts to C# `TtpfReader`.** All 697 multi-slice descriptors (127 2D
    arrays, 567 cubemaps, and 3 3D volumes) are now validated and exported in
    `tools/tex_headers.py` and `tools/ttpf_mips.py` (`docs/textures_arrays.md`); upstream C#
-   `TtpfReader` parity has landed upstream in `breadbbbb/rpf9-explorer` PRs #5 and #6 (pending a submodule pin update).
+   `TtpfReader` parity has landed in `breadbbbb/rpf9-explorer` PRs #5 and #6 and is carried by
+   the `917e9b9` submodule pin.
 6. **Do not fake a BCPack decoder.** The current fallback (export the largest lower mip that
    is zlib/raw) is used by 5,845 textures and should stay. The public BC1 candidate is not
    adopted: it is mip-consistent on 40/200 chunks, not byte-exact, and its window is
