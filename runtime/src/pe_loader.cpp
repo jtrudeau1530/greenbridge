@@ -161,6 +161,26 @@ Loader::Loader(std::filesystem::path game_dir) : game_dir_(std::move(game_dir)) 
 }
 
 Loader::~Loader() {
+    // Importers must release their resources before their dependencies. Keep every mapping, unwind table and TLS
+    // block alive throughout the notifications: a detach handler can still call an imported function or free an
+    // FLS slot whose destructor lives in another mapped image.
+    for (auto it = init_order_.rbegin(); it != init_order_.rend(); ++it) {
+        Module& m = **it;
+        if (!m.initialised) continue;  // a map-only load never opts in to running image code
+        m.initialised = false;
+        try {
+            run_tls_callbacks(m, DLL_PROCESS_DETACH);
+        } catch (const std::exception& e) {
+            // A module may have changed its callback table since attach. A destructor cannot propagate the validation
+            // error; report it and still let DllMain release resources before the image is freed.
+            std::fprintf(stderr, "[rt] TLS process detach failed for %s: %s\n", m.name.c_str(), e.what());
+        }
+        auto* nt = at<IMAGE_NT_HEADERS64>(m.base, reinterpret_cast<IMAGE_DOS_HEADER*>(m.base)->e_lfanew);
+        if ((nt->FileHeader.Characteristics & IMAGE_FILE_DLL) && m.entry_rva) {
+            auto entry = reinterpret_cast<BOOL(NTAPI*)(void*, DWORD, void*)>(m.base + m.entry_rva);
+            entry(m.base, DLL_PROCESS_DETACH, nullptr);  // explicit unload; the return value is ignored
+        }
+    }
     shims::remove_module_lookup(this);
     for (auto* m : order_) {
         // TLS state must go away before the image and its TLS block are unmapped.
