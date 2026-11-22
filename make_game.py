@@ -36,6 +36,7 @@ import json
 import ntpath
 import os
 import re
+import shlex
 import shutil
 import stat
 import struct
@@ -1604,10 +1605,20 @@ def runtime(game: str, out: str, v: dict, runtime_build: str | None = None, jobs
         with open(start, "w", encoding="utf-8", newline="\n") as f:
             f.write(WINE_LAUNCHER)
         os.chmod(start, os.stat(start).st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
-    if not os.path.isfile(os.path.join(game, v["expected_exe"])):
+    image = os.path.join(game, v["expected_exe"])
+    if not os.path.isfile(image):
         log(f"runtime: built, but {v['expected_exe']} is missing from your copy, so there is nothing to run yet.")
+    elif os.name == "nt":
+        def ps_literal(path: str) -> str:
+            # PowerShell also treats typographic single quotes as string delimiters.
+            return "'" + re.sub(r"['\u2018-\u201b]", r"\g<0>\g<0>", path) + "'"
+
+        log("runtime: built. Inspect the game's imports in PowerShell:\n"
+            f"  & {ps_literal(start)} --dry-run {ps_literal(image)}")
     else:
-        log(f"runtime: done. Start {start}")
+        # Wine inherits the package directory; the image argument needs no host-to-Windows path conversion.
+        command = shlex.join([start, "--dry-run", "./" + v["expected_exe"]])
+        log(f"runtime: built. Inspect the game's imports with Wine:\n  (cd {shlex.quote(game)} && {command})")
 
 
 def positive_int(text: str) -> int:
