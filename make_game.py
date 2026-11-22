@@ -43,6 +43,9 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 
+if __name__ == "__main__" and sys.version_info < (3, 12):   # before code an older Python can't run
+    sys.exit("ERROR: Python 3.12 or newer is needed: https://www.python.org/downloads/")
+
 ROOT = os.path.dirname(os.path.abspath(__file__))
 TOOLS = os.path.join(ROOT, "tools")
 sys.path.insert(0, TOOLS)
