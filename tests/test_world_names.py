@@ -95,6 +95,22 @@ class DictionaryTest(unittest.TestCase):
                      "synthetic_cell_b.rpf", "SyntheticCellC"):
             self.assertIn(name, WN._unique_names(dictionary.names))
 
+    def test_rpf9_names_index(self):
+        index = self.write("rpf9_names.json", json.dumps({
+            "summary": {"types": ["dr", "ft"]},
+            "files": [
+                {"offset": 16, "names": ["synthetic_tile_01_lod.#dr", "synthetic_tile_02_lod.#dr"]},
+                {"offset": 64, "names": ["synthetic_frag.#ft"]},
+                {"offset": 96, "names": "not a list"},
+            ],
+        }))
+        dictionary = WN.build_dictionary(rpf9_names=[index])
+        self.assertEqual(WN._unique_names(dictionary.names),
+                         {"synthetic_tile_01_lod", "synthetic_tile_02_lod", "synthetic_frag"})
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(WN.main(["build", "--rpf9-names", index,
+                                      "--out", os.path.join(self.dir, "names.json")]), 0)
+
     def test_directory_manifest_discovery(self):
         models = os.path.join(self.dir, "assets", "archive", "models")
         os.makedirs(models)

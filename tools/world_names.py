@@ -22,7 +22,7 @@ pull requests. Tests use synthetic names only.
 
 Usage:
     python -I tools/world_names.py build --manifest <models> --scan <scan.json> \
-        --names <names.txt> --xml <common-concat.txt> --out <names.json>
+        --names <names.txt> --rpf9-names <rpf9_names.json> --xml <common-concat.txt> --out <names.json>
     python -I tools/world_names.py resolve --dict <names.json> \
         --maps <maps.json> --archetypes <archetypes.json> --out <report.json>
 """
@@ -242,6 +242,20 @@ class NameDictionary:
             added += int(self.add(stem, source=source))
         return added
 
+    def add_rpf9_names(self, path: str, *, source: str = "rpf9_names") -> int:
+        """Names from an ``rpf9_names.py`` index (``files[].names``, spelled ``name.#dr``, ``name.#ft`` ...)."""
+        with open(path, encoding="utf-8-sig") as handle:
+            data = json.load(handle)
+        files = data.get("files") if isinstance(data, dict) else None
+        if not isinstance(files, list):
+            return 0
+        added = 0
+        for entry in files:
+            names = entry.get("names") if isinstance(entry, dict) else None
+            for name in names if isinstance(names, list) else ():
+                added += self.add_model_name(name, source=source)
+        return added
+
     def add_names_file(self, path: str, *, source: str = "names") -> int:
         added = 0
         with open(path, encoding="utf-8-sig", errors="replace") as handle:
@@ -344,7 +358,7 @@ class NameDictionary:
 
 
 def build_dictionary(manifests=(), scans=(), names_files=(), xml_files=(), *,
-                     derive_lod: bool = False) -> NameDictionary:
+                     derive_lod: bool = False, rpf9_names=()) -> NameDictionary:
     dictionary = NameDictionary()
     for path in manifests:
         if os.path.isdir(path):
@@ -360,6 +374,8 @@ def build_dictionary(manifests=(), scans=(), names_files=(), xml_files=(), *,
         dictionary.add_scan(path)
     for path in names_files:
         dictionary.add_names_file(path)
+    for path in rpf9_names:
+        dictionary.add_rpf9_names(path)
     for path in xml_files:
         dictionary.add_xml(path)
     if derive_lod:
@@ -499,11 +515,12 @@ def _load_json(path: str) -> dict:
 
 
 def _build(args) -> int:
-    if not (args.manifest or args.scan or args.names or args.xml):
-        print("build: at least one --manifest/--scan/--names/--xml source is required", file=sys.stderr)
+    if not (args.manifest or args.scan or args.names or args.xml or args.rpf9_names):
+        print("build: at least one --manifest/--scan/--names/--rpf9-names/--xml source is required",
+              file=sys.stderr)
         return 2
     dictionary = build_dictionary(args.manifest, args.scan, args.names, args.xml,
-                                  derive_lod=args.derive_lod)
+                                  derive_lod=args.derive_lod, rpf9_names=args.rpf9_names)
     counts = dictionary.counts()
     if counts["exact_names"] == 0:
         print("build: no names recovered from the given sources", file=sys.stderr)
@@ -560,6 +577,8 @@ def main(argv=None) -> int:
                        help="rpf9dump levels scan JSON with entries[].Path")
     build.add_argument("--names", action="append", default=[],
                        help="text file with one recovered name per line")
+    build.add_argument("--rpf9-names", action="append", default=[],
+                       help="rpf9_names.py index JSON (files[].names)")
     build.add_argument("--xml", action="append", default=[],
                        help="common.rpf XML or a concatenated XML text")
     build.add_argument("--derive-lod", action="store_true",
