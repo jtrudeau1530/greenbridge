@@ -802,6 +802,10 @@ struct ReplayFunctions {
     std::function<void(VkCommandBuffer)> order_timestamp_copy;
     std::function<void(VkCommandBuffer, VkQueryPool, std::uint32_t, std::uint32_t, VkBuffer, VkDeviceSize)>
         sum_occlusion;
+    // Creates a query pool of `count` queries of that type for the single-list replay()'s occlusion and
+    // pipeline-statistics segments (D3D-399); the batched path creates its own. Unset, or with any sum helper unset,
+    // replay() refuses a list whose queries overlap, as before.
+    std::function<std::shared_ptr<const OcclusionSegmentPool>(VkQueryType, std::uint32_t count)> create_segment_pool;
     PFN_vkCmdBindPipeline bind_pipeline = nullptr;              // dispatches
     PFN_vkCmdPushConstants push_constants = nullptr;
     PFN_vkCmdBindDescriptorSets bind_descriptor_sets = nullptr;  // set 0 of pipelines that declare bindings
@@ -3817,18 +3821,33 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
 }
 
 // prepare + emit for one list. A failed replay leaves the command buffer and the tracker untouched.
+// With `keep` and vk.create_segment_pool (and the sum helpers) set, overlapping occlusion or statistics queries get
+// segment pools as in the batched path; the caller holds `keep` until the command buffer has completed.
 template<typename Resolve>
 ReplayResult replay(const CommandList& list, VkCommandBuffer command_buffer, Resolve&& resolve,
-                    const ReplayFunctions& vk, LayoutTracker* tracker = nullptr) {
+                    const ReplayFunctions& vk, LayoutTracker* tracker = nullptr,
+                    std::vector<std::shared_ptr<const OcclusionSegmentPool>>* keep = nullptr) {
     if (tracker && tracker->separate_depth_stencil_layouts() != vk.separate_depth_stencil_layouts)
         return ReplayResult::unsupported;
+    const bool pools = keep && vk.create_segment_pool && vk.sum_occlusion && vk.resolve_binary_occlusion &&
+                       vk.sum_statistics && vk.sum_binary_occlusion;
     PreparedList prepared;
-    if (const auto result = prepare(list, resolve, vk, prepared); result != ReplayResult::success) return result;
+    if (const auto result = prepare(list, resolve, vk, prepared, pools); result != ReplayResult::success)
+        return result;
     if (tracker && zero_clear_unavailable(prepared, vk, *tracker)) return ReplayResult::unsupported;
+    std::shared_ptr<const OcclusionSegmentPool> physical, statistics;
+    if (pools && prepared.segment_count &&
+        !(physical = vk.create_segment_pool(VK_QUERY_TYPE_OCCLUSION, prepared.segment_count)))
+        return ReplayResult::unsupported;
+    if (pools && prepared.statistics_segment_count &&
+        !(statistics = vk.create_segment_pool(VK_QUERY_TYPE_PIPELINE_STATISTICS, prepared.statistics_segment_count)))
+        return ReplayResult::unsupported;
     QueryReplay queries;
-    if (const auto result = queries.plan(prepared); result != ReplayResult::success) return result;
+    if (const auto result = queries.plan(prepared, physical, 0, pools, statistics, 0); result != ReplayResult::success)
+        return result;
     emit(prepared, command_buffer, vk, tracker);
     queries.commit();  // the caller owns submission of the legacy command buffer
+    if (keep) keep->insert(keep->end(), queries.retained.begin(), queries.retained.end());
     return ReplayResult::success;
 }
 

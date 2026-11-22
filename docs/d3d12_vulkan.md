@@ -2699,6 +2699,13 @@ Implemented (`QueryHeap` in `runtime/shims/d3d12_vulkan_device.cpp`, the query c
   clear, copy, timestamp, resolve) and a resolve in the next execution with no wait between them. Under Wine
   (CrossOver 26.3, MoltenVK 1.4.3) the first case failed every run before this change (`t1` read 0).
 
+The single-list `replay()` helper replays overlapping occlusion kinds and statistics queries too (D3D-399) when
+the caller passes a `keep` vector and sets `ReplayFunctions::create_segment_pool` with the four sum helpers: it
+makes one occlusion and one pipeline-statistics segment pool sized to the list, plans them as the batched path does,
+and hands them to `keep`, which the caller holds until the command buffer has completed. Without them such a list is
+still refused with `ReplayResult::unsupported`. `replay_query_predication_test` case 14 checks both, on case 13's
+statistics list and case 10's occlusion pair (no GPU).
+
 Not implemented yet:
 
 - **Overlapping queries in the single-list `replay()` helper.** It has no segment pool, so a list whose occlusion
@@ -2707,6 +2714,8 @@ Not implemented yet:
 - Mesh-shader statistics (`PIPELINE_STATISTICS1`, D3D-132), and stream-output statistics that count real
   primitives (they wait for stream output itself). (`GetClockCalibration` is implemented: see section 4.4,
   "Fences, queues and frames in flight".)
+- Stream-output and mesh-shader statistics. (`GetClockCalibration` is implemented: see section 4.4, "Fences,
+  queues and frames in flight".)
 - Xbox-specific query heap types (if any) are **Open**; unknown types are logged.
 
 ### 4.7 Indirect commands and command signatures
