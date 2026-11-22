@@ -51,8 +51,11 @@ class Resolve(unittest.TestCase):
     def test_rejects_negative_compose_count(self):
         with tempfile.TemporaryDirectory() as tmp:
             tool = os.path.join(ROOT, "tools", "save_keys.py")
+            words = os.path.join(tmp, "words.txt")
+            with open(words, "w", encoding="utf-8") as f:
+                f.write("SyntheticWord\n")
             result = subprocess.run(
-                [sys.executable, "-I", tool, "resolve", tmp, "--dict", tmp, "--compose", "-1"],
+                [sys.executable, "-I", tool, "resolve", tmp, "--dict", words, "--compose", "-1"],
                 capture_output=True, text=True,
             )
             self.assertEqual(result.returncode, 2, result.stderr)
