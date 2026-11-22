@@ -448,6 +448,43 @@ class ExportTest(unittest.TestCase):
         system, _ = anim_glb.load_dictionary(self.anim, selected)
         self.assertEqual(system.d, first + tail)
 
+    def test_missing_pack_table_cannot_claim_a_named_neighbor(self):
+        data = clips_fixture.two_sequence_dictionary("incomplete")
+        refs = anim_clips.System(data).ptr(0x70)
+        first, _ = clips_fixture.split(data, refs, move_map=False)
+        other = clips_fixture.two_sequence_dictionary("neighbor")
+        selected, neighbor = clips_fixture.write_rpf(self.anim, [first, other])
+        with self.assertRaisesRegex(anim_glb.ExportError, "no clip dictionary"):
+            anim_glb.load_dictionary(self.anim, selected)
+        self.assertEqual(anim_glb.load_dictionary(self.anim, neighbor)[0].d, other)
+        _, summary = anim_clips.scan(self.anim)
+        self.assertEqual(summary["unresolved"], {"system page not the next stream": 1})
+        self.assertEqual(summary["counts"]["dictionaries"], 1)
+
+    def test_named_pack_at_continuation_boundary(self):
+        data = bytearray(clips_fixture.two_sequence_dictionary("abc"))
+        data.extend(bytes(96))
+        s = anim_clips.System(data)
+        refs = s.ptr(0x70)
+        pack = s.ptr(refs)
+        data[pack + 8:pack + 16] = data[8:16]
+        struct.pack_into("<15sB", data, pack + 0x38, b"abc-0", 0x85)
+        for late_map, late_table in ((False, False), (False, True), (True, True)):
+            first, tail = clips_fixture.split(data, pack, move_map=late_map)
+            # The pack table itself can follow the page that starts with the pack.
+            joined = bytearray(first + tail)
+            cuts_at = [0, pack, refs, len(joined)] if late_table else [0, pack, len(joined)]
+            joined[anim_clips.System(joined).ptr(8) + 8] = len(cuts_at) - 1
+            cuts = [joined[a:b] for a, b in zip(cuts_at, cuts_at[1:])]
+            with self.subTest(late_map=late_map, late_table=late_table):
+                root, *_ = clips_fixture.write_rpf(self.anim, cuts)
+                system, dictionary = anim_glb.load_dictionary(self.anim, root)
+                self.assertEqual(system.d, b"".join(cuts))
+                self.assertEqual(dictionary["packs"][0]["name"], "abc-0")
+                _, summary = anim_clips.scan(self.anim)
+                self.assertEqual(summary["unresolved"], {})
+                self.assertEqual(summary["counts"]["dictionaries"], 1)
+
     def test_middle_dictionary_page_count_straddles_fifth_and_sixth_pages(self):
         neighbor = clips_fixture.two_sequence_dictionary()
         data = bytearray(clips_fixture.two_sequence_dictionary("middle"))
