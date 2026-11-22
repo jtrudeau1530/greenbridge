@@ -549,11 +549,13 @@ void test_purge_ownership_scoping(const fs::path& dll, const fs::path& temp) {
     ChildProcess live(L"/c timeout /t 30 /nobreak > nul");
 
     const fs::path clone_root = fs::temp_directory_path();
-    const fs::path dead_file = clone_root / (L"leonida_tls_host_" + std::to_wstring(dead.pid) + L"_31.dll");
+    // An own-PID name stands in for a leftover of a dead run whose PID this process reused: the sweep runs before
+    // this process has created any clone, so such a file is always ownerless here.
+    const fs::path stale_file = clone_root / (L"leonida_tls_host_" + std::to_wstring(GetCurrentProcessId()) + L"_31.dll");
     const fs::path held_file = clone_root / (L"leonida_tls_host_" + std::to_wstring(dead.pid) + L"_32.dll");
     const fs::path live_file = clone_root / (L"leonida_tls_host_" + std::to_wstring(live.pid) + L"_33.dll");
     const char bytes[8] = "purgeXX";
-    write_file(dead_file, bytes, 8);
+    write_file(stale_file, bytes, 8);
     write_file(held_file, bytes, 8);
     write_file(live_file, bytes, 8);
     // An open handle without FILE_SHARE_DELETE stands in for another process's guard or mapped image: the purge's
@@ -574,16 +576,7 @@ void test_purge_ownership_scoping(const fs::path& dll, const fs::path& temp) {
     const auto clone_of_this_process = own_clone_files();
     check(clone_of_this_process.size() == 1, "this process owns exactly one clone file after the two-module load");
 
-    const bool dead_pid_still_free = [&] {
-        HANDLE p = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, dead.pid);
-        if (!p) return true;
-        CloseHandle(p);
-        return false;
-    }();
-    if (dead_pid_still_free)
-        check(!fs::exists(dead_file), "the purge deleted the clone whose owner process is gone");
-    else
-        std::printf("SKIP dead-owner deletion check: the child's PID was reused meanwhile\n");
+    check(!fs::exists(stale_file), "the purge deleted the clone whose owner process is gone");
     check(fs::exists(held_file), "the purge skipped the clone another handle holds open");
     check(fs::exists(live_file), "the purge skipped the clone whose owner process is still alive");
 
