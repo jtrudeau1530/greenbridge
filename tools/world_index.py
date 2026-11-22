@@ -282,16 +282,16 @@ def _needs_continuation(b):
     return False
 
 
-def _inflate_stream(m, s, size, max_inflate, keep=False):
-    """Inflate one zlib stream. Returns (data, used, eof, is_meta); data is kept for 0x7a or keep=True."""
+def _inflate_stream(m, s, end, max_inflate, keep=False):
+    """Inflate one zlib stream within m[s:end]. Returns (data, used, eof, is_meta); data is kept for 0x7a or keep=True."""
     d = zlib.decompressobj()
     chunks = []
     kept = 0
     head = bytearray()
     is_meta = False
     p = s
-    while not d.eof and p < size:
-        piece = m[p:p + CHUNK]
+    while not d.eof and p < end:
+        piece = m[p:min(p + CHUNK, end)]
         if not piece:
             break
         produced = d.decompress(piece)
@@ -332,7 +332,7 @@ def scan_rpf(path, start=None, limit=None, max_inflate=CAP, collect=None):
                 pos = s + 1
                 continue
             try:
-                data, used, eof, is_meta = _inflate_stream(m, s, size, max_inflate)
+                data, used, eof, is_meta = _inflate_stream(m, s, end, max_inflate)
             except zlib.error:
                 pos = s + 1
                 continue
@@ -347,13 +347,13 @@ def scan_rpf(path, start=None, limit=None, max_inflate=CAP, collect=None):
                     if parse_resource(data) is not None and not _needs_continuation(data):
                         break
                     nxt = (s + used + 15) & ~15
-                    if nxt >= size:
+                    if nxt >= end:
                         break
-                    mt = ZHDR.match(m, nxt, size)
+                    mt = ZHDR.match(m, nxt, end)
                     if not mt:
                         break
                     try:
-                        more, mused, meof, _ = _inflate_stream(m, nxt, size, max_inflate, keep=True)
+                        more, mused, meof, _ = _inflate_stream(m, nxt, end, max_inflate, keep=True)
                     except zlib.error:
                         break
                     if not meof or not more:
@@ -451,10 +451,10 @@ class ArchetypeCounts:
 
 
 def _count(minimum):
-    """An argparse type for a whole number of at least `minimum`."""
+    """An argparse type for a whole number (decimal or 0x hex) of at least `minimum`."""
     def parse(text):
         try:
-            value = int(text)
+            value = int(text, 0)
         except ValueError:
             raise argparse.ArgumentTypeError(f"not a whole number: {text!r}") from None
         if value < minimum:
@@ -471,7 +471,7 @@ def main(argv=None):
     ap.add_argument("--csv", help="optional CSV output")
     ap.add_argument("--start", type=_count(0), help="first byte of an RPF9 data-area window")
     ap.add_argument("--limit", type=_count(1), help="window size in bytes (default: to end of archive)")
-    ap.add_argument("--max-inflate", type=int, default=CAP,
+    ap.add_argument("--max-inflate", type=_count(1), default=CAP,
                     help="stop keeping bytes above this per resource, default 64 MiB")
     ap.add_argument("--archetypes-out",
                     help="also write entity counts and 64-bit keys per archetype hash (world_names resolve input)")
@@ -479,7 +479,7 @@ def main(argv=None):
     agg = ArchetypeCounts() if a.archetypes_out else None
     try:
         rows, stats = scan_path(a.path, a.start, a.limit, a.max_inflate, agg)
-    except ValueError as e:                 # a --start outside an archive's data area; nothing is written
+    except (OSError, ValueError) as e:      # a missing path or --start outside an archive's data area
         print(f"ERROR: {e}", file=sys.stderr)
         return 2
     summary = dict(stats)
