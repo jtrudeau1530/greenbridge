@@ -446,6 +446,24 @@ The character-part inventory (Lucia's named records and decoded parts, the `play
 drawable set, slot-name counts and texture coverage) is in
 [character_models.md](character_models.md).
 
+### Character census
+
+`tools/character_census.py` totals a decoded model tree or an `rpf9dump models` manifest:
+
+```powershell
+python -I tools/character_census.py <models-dir-or-manifest> [--json FILE] [--csv FILE]
+```
+
+It reads every nested `model.json` (the decoded-pack layout: `type`, `vertex_count`,
+`triangle_count`, `materials[].shader_name_hash`, `materials[].textures[].hash64`,
+`drawable.skeleton`/`drawable.models[].bone_palette` and `meshes[].skin_influences`), or the
+`Items[]` of a manifest (`Verts`, `Tris`, `IsFragment`, `HasBoneBindings`, `Materials[]`). It
+prints one row per model with kind, vertex/triangle counts, bones, 8-influence skin, shader
+hashes and texture keys, then totals by kind and by shader hash. A missing or wrongly typed field
+is reported on that row instead of ending the run. An `rpf9dump models` manifest records only
+`HasBoneBindings`, not a bone count or influence width, so those cells stay `?`. Report paths that
+alias an input are refused. The tests are synthetic: `python -I tests/test_character_census.py`.
+
 ## Shader render buckets
 
 `rpf9dump` writes two raw shader fields per material, `RenderBucket` (byte at shader +0x39) and
