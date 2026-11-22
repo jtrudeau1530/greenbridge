@@ -544,6 +544,245 @@ void test_initialise_rejects() {
     }
 }
 
+// The images below jump to host observers so notifications remain observable after the mappings are freed.
+// The FLS destructor itself starts in mapped code: leaving it registered would call unmapped memory at exit.
+void emit_jump_stub(std::vector<uint8_t>& img, size_t off, uint64_t target) {
+    img[off++] = 0x48;
+    img[off++] = 0xB8;  // movabs rax, target; jmp rax (preserves the notification arguments)
+    std::memcpy(img.data() + off, &target, sizeof(target));
+    off += sizeof(target);
+    img[off++] = 0xFF;
+    img[off] = 0xE0;
+}
+
+struct Notification {
+    void* base;
+    DWORD reason;
+    bool tls;
+    bool operator==(const Notification&) const = default;
+};
+std::vector<Notification> g_notifications;
+struct LiveImage {
+    void* base;
+    uint32_t tls_index;
+    void* tls_block;
+};
+std::vector<LiveImage> g_live_modules;
+bool g_detach_state_live = true;
+bool g_fail_attach = false;
+bool g_use_fls = false;
+DWORD g_fls_index = FLS_OUT_OF_INDEXES;
+int g_fls_callbacks = 0;
+
+void observe_notification(void* base, DWORD reason, void* reserved, bool tls) {
+    g_notifications.push_back({base, reason, tls});
+    if (reserved) g_detach_state_live = false;
+    if (reason != DLL_PROCESS_DETACH) return;
+    for (const auto& m : g_live_modules) {
+        MEMORY_BASIC_INFORMATION info{};
+        if (!VirtualQuery(m.base, &info, sizeof(info)) || info.State != MEM_COMMIT)
+            g_detach_state_live = false;
+        if (m.tls_index != rt::kNoTlsIndex && m.tls_block) {
+            auto** slots = reinterpret_cast<void**>(__readgsqword(0x58));
+            if (slots[m.tls_index] != m.tls_block ||
+                !VirtualQuery(m.tls_block, &info, sizeof(info)) || info.State != MEM_COMMIT ||
+                std::memcmp(m.tls_block, "TLS!", 4) != 0)
+                g_detach_state_live = false;
+        }
+    }
+}
+
+void NTAPI observe_tls(void* base, DWORD reason, void* reserved) {
+    observe_notification(base, reason, reserved, true);
+}
+
+void NTAPI observe_fls(void* value) {
+    if (value == reinterpret_cast<void*>(1)) ++g_fls_callbacks;
+}
+
+BOOL NTAPI observe_dllmain(void* base, DWORD reason, void* reserved) {
+    observe_notification(base, reason, reserved, false);
+    if (g_use_fls) {
+        if (reason == DLL_PROCESS_ATTACH) {
+            g_fls_index = FlsAlloc(reinterpret_cast<PFLS_CALLBACK_FUNCTION>(static_cast<uint8_t*>(base) + 0x1100));
+            if (g_fls_index == FLS_OUT_OF_INDEXES || !FlsSetValue(g_fls_index, reinterpret_cast<void*>(1)))
+                return FALSE;
+        } else if (reason == DLL_PROCESS_DETACH && g_fls_index != FLS_OUT_OF_INDEXES) {
+            if (!FlsFree(g_fls_index)) g_detach_state_live = false;
+            g_fls_index = FLS_OUT_OF_INDEXES;
+        }
+    }
+    return !(reason == DLL_PROCESS_ATTACH && g_fail_attach);
+}
+
+void reset_notifications() {
+    g_notifications.clear();
+    g_live_modules.clear();
+    g_detach_state_live = true;
+    g_fail_attach = false;
+    g_use_fls = false;
+    g_fls_callbacks = 0;
+}
+
+void expect_notifications(const char* what, const std::vector<Notification>& expected) {
+    if (g_notifications == expected) pass(what);
+    else failed(what, "unexpected TLS/DllMain notification count or order");
+}
+
+std::vector<uint8_t> make_lifecycle_image() {
+    auto img = make_init_image();
+    emit_jump_stub(img, 0x200, reinterpret_cast<uint64_t>(&observe_tls));
+    emit_jump_stub(img, 0x240, reinterpret_cast<uint64_t>(&observe_dllmain));
+    emit_jump_stub(img, 0x300, reinterpret_cast<uint64_t>(&observe_fls));
+    return img;
+}
+
+void test_process_detach() {
+    // A map-only load must remain free of image-code execution, including at destruction.
+    reset_notifications();
+    {
+        rt::Loader loader(g_dir);
+        loader.load(write_image(make_lifecycle_image()));
+    }
+    expect_notifications("a never-initialised image receives no detach notifications", {});
+
+    for (bool fail_attach : {false, true}) {
+        reset_notifications();
+        g_fail_attach = fail_attach;
+        g_use_fls = true;
+        void* base = nullptr;
+        bool rejected = false;
+        {
+            rt::Loader loader(g_dir);
+            auto& m = loader.load(write_image(make_lifecycle_image()));
+            base = m.base;
+            g_live_modules = {{m.base, m.tls_index, m.tls_block}};
+            try {
+                loader.initialise();
+                loader.initialise();  // successful attach is delivered once
+            } catch (const std::runtime_error&) {
+                rejected = true;
+            }
+        }
+        if (rejected == fail_attach) pass("attach success/failure is preserved");
+        else failed("attach success/failure is preserved", "unexpected initialise result");
+        expect_notifications(fail_attach ? "a FALSE attach is detached once" : "TLS and DllMain detach once after attach",
+                             {{base, DLL_PROCESS_ATTACH, true}, {base, DLL_PROCESS_ATTACH, false},
+                              {base, DLL_PROCESS_DETACH, true}, {base, DLL_PROCESS_DETACH, false}});
+        if (g_detach_state_live && g_fls_callbacks == 1 && g_fls_index == FLS_OUT_OF_INDEXES)
+            pass("detach frees FLS while the callback image and static TLS are live");
+        else
+            failed("detach frees FLS while the callback image and static TLS are live", "FLS cleanup missing or state freed early");
+        // Keep a failing negative-control run from crashing during process exit after reporting the regression.
+        if (g_fls_index != FLS_OUT_OF_INDEXES) {
+            FlsSetValue(g_fls_index, nullptr);
+            FlsFree(g_fls_index);
+            g_fls_index = FLS_OUT_OF_INDEXES;
+        }
+    }
+    g_live_modules.clear();
+    g_use_fls = false;
+}
+
+void test_process_detach_invalid_tls() {
+    reset_notifications();
+    g_use_fls = true;
+    void* base = nullptr;
+    {
+        rt::Loader loader(g_dir);
+        auto& m = loader.load(write_image(make_lifecycle_image()));
+        base = m.base;
+        loader.initialise();
+        // The callback table is writable in a normal PE, but this synthetic image keeps it in executable .text.
+        DWORD old_protection = 0;
+        if (!VirtualProtect(m.base + 0x1090, sizeof(uint64_t), PAGE_EXECUTE_READWRITE, &old_protection))
+            throw std::runtime_error("cannot make the synthetic TLS callback table writable");
+        *reinterpret_cast<uint64_t*>(m.base + 0x1090) = reinterpret_cast<uint64_t>(m.base) + m.size;
+        DWORD ignored = 0;
+        if (!VirtualProtect(m.base + 0x1090, sizeof(uint64_t), old_protection, &ignored))
+            throw std::runtime_error("cannot restore the synthetic TLS callback table protection");
+    }
+    expect_notifications("invalid TLS detach still calls DllMain for cleanup",
+                         {{base, DLL_PROCESS_ATTACH, true}, {base, DLL_PROCESS_ATTACH, false},
+                          {base, DLL_PROCESS_DETACH, false}});
+    if (g_fls_callbacks == 1 && g_fls_index == FLS_OUT_OF_INDEXES)
+        pass("invalid TLS detach still frees the mapped FLS callback");
+    else
+        failed("invalid TLS detach still frees the mapped FLS callback", "FLS cleanup missing");
+    reset_notifications();
+}
+
+void test_process_detach_without_entry() {
+    for (bool is_dll : {false, true}) {
+        reset_notifications();
+        auto img = make_lifecycle_image();
+        if (is_dll) nt_of(img)->OptionalHeader.AddressOfEntryPoint = 0;
+        else nt_of(img)->FileHeader.Characteristics &= ~IMAGE_FILE_DLL;
+        void* base = nullptr;
+        {
+            rt::Loader loader(g_dir);
+            auto& m = loader.load(write_image(img));
+            base = m.base;
+            loader.initialise();
+        }
+        expect_notifications(is_dll ? "a DLL without an entry point still detaches TLS" : "an EXE detaches TLS without calling its entry point",
+                             {{base, DLL_PROCESS_ATTACH, true}, {base, DLL_PROCESS_DETACH, true}});
+    }
+    reset_notifications();
+    auto first = make_lifecycle_image();
+    auto second = make_image();
+    nt_of(second)->OptionalHeader.ImageBase = 0x180000000;
+    nt_of(second)->FileHeader.Characteristics |= IMAGE_FILE_DLL;
+    emit_jump_stub(second, 0x200, reinterpret_cast<uint64_t>(&observe_dllmain));
+    void* first_base = nullptr;
+    {
+        rt::Loader loader(g_dir);
+        first_base = loader.load(write_image(first)).base;
+        loader.load(write_image(second));
+        g_fail_attach = true;
+        try {
+            loader.initialise();
+            failed("partial initialisation rejects the first DLL", "attach succeeded");
+        } catch (const std::runtime_error&) {
+            pass("partial initialisation rejects the first DLL");
+        }
+    }
+    expect_notifications("partial initialisation does not detach an untouched later DLL",
+                         {{first_base, DLL_PROCESS_ATTACH, true}, {first_base, DLL_PROCESS_ATTACH, false},
+                          {first_base, DLL_PROCESS_DETACH, true}, {first_base, DLL_PROCESS_DETACH, false}});
+    reset_notifications();
+}
+
+void test_process_detach_dependencies() {
+    reset_notifications();
+    auto dep = make_forwarder_image("KERNEL32.GetCurrentProcessId", 0x180000000);
+    auto parent = make_import_image("detach_dep.dll", "fwd");
+    for (auto* img : {&dep, &parent}) {
+        nt_of(*img)->FileHeader.Characteristics |= IMAGE_FILE_DLL;
+        nt_of(*img)->OptionalHeader.AddressOfEntryPoint = 0x11C0;
+        emit_jump_stub(*img, 0x3C0, reinterpret_cast<uint64_t>(&observe_dllmain));
+    }
+    write_image_as(dep, "detach_dep.dll");
+    void* parent_base = nullptr;
+    void* dep_base = nullptr;
+    {
+        rt::Loader loader(g_dir);
+        auto& m = loader.load(write_image_as(parent, "detach_parent.dll"));
+        parent_base = m.base;
+        for (const auto* mod : loader.modules())
+            g_live_modules.push_back({mod->base, mod->tls_index, mod->tls_block});
+        dep_base = loader.initialisation_order().front()->base;
+        loader.initialise();
+        loader.initialise();
+    }
+    expect_notifications("dependencies attach first and detach last",
+                         {{dep_base, DLL_PROCESS_ATTACH, false}, {parent_base, DLL_PROCESS_ATTACH, false},
+                          {parent_base, DLL_PROCESS_DETACH, false}, {dep_base, DLL_PROCESS_DETACH, false}});
+    if (g_detach_state_live) pass("all dependency mappings remain live until notifications finish");
+    else failed("all dependency mappings remain live until notifications finish", "a dependency was unmapped early");
+    g_live_modules.clear();
+}
+
 void test_forwarded_exports() {
     {
         const char* what = "a forwarded export binds to its target instead of into the string";
@@ -821,6 +1060,10 @@ int main() {
         test_delay_imports();
         test_initialise();
         test_initialise_rejects();
+        test_process_detach();
+        test_process_detach_invalid_tls();
+        test_process_detach_without_entry();
+        test_process_detach_dependencies();
         test_delay_descriptor_fields();
         test_forwarded_exports();
         test_unwind_registration();

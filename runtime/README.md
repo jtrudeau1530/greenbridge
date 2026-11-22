@@ -41,7 +41,10 @@ code from the mapped images runs. TLS reserves its module index through the runt
 
 `gta6rt --init <image>` runs the same mapping and then `Loader::initialise()`: each module's TLS
 callbacks and each DLL's `DllMain(DLL_PROCESS_ATTACH)`, dependencies first. An EXE's entry point is not
-run.
+run. When the loader is destroyed, initialised modules receive TLS callbacks and DLL entry-point calls with
+`DLL_PROCESS_DETACH`, in reverse initialisation order. All mapped images, unwind tables and static TLS stay
+available until these notifications finish, so DLLs can release resources such as FLS callbacks safely. The reserved
+argument is null (explicit unload). A map-only load receives no detach notifications.
 
 `--dry-run`, `--init` and `--run` are separate modes: give exactly one. Two together (`--dry-run --run`)
 print the usage and exit 2 before anything is mapped.
