@@ -12,6 +12,7 @@ the capabilities, which binding and component type each fetch reads, and, with a
 picks the branch, the branch taken for all 512 FORMAT values with a hit and with a miss.
 runtime/test/shaders/cs_imgload.asm checks the result on a GPU (vk_store_test load).
 """
+import itertools
 import os
 import re
 import shutil
@@ -57,7 +58,8 @@ def load_shader(dim, dmask=0xF):
 class Module:
     """The instructions of a SPIR-V assembly text by result id, its decorations and capabilities."""
 
-    def __init__(self, text):
+    def __init__(self, text: str, vgprs: dict[int, int] | None = None):
+        self.vgprs = vgprs
         self.text = text
         self.defs, self.binding, self.order = {}, {}, []
         self.caps = set(re.findall(r"^\s*OpCapability (\w+)", text, re.M))
@@ -87,6 +89,15 @@ class Module:
             out.append((rid, chain[1], self.defs[load[0]][1]))
         return out
 
+    def integer_coord_vgpr(self, operand):
+        op, cast = self.defs[operand]
+        assert op == "OpBitcast", op
+        op, load = self.defs[cast[1]]
+        assert op == "OpLoad", op
+        op, ptr = self.defs[load[1]]
+        assert (op, ptr[1]) == ("OpAccessChain", "%vgpr"), (op, ptr)
+        return self.value(ptr[2], 0, 0)
+
     def value(self, x, word1, index):
         """Evaluate the uint/bool id x given the T#'s word 1 and the bindless index of the lookup."""
         if x in ("%true", "%false"):
@@ -101,6 +112,8 @@ class Module:
         if op == "OpLoad":
             ptr_op, p = self.defs[a[1]]
             assert ptr_op == "OpAccessChain", ptr_op
+            if p[1] == "%vgpr" and self.vgprs is not None:
+                return self.vgprs[self.value(p[2], word1, index)]
             if p[1] == "%sgpr":
                 assert self.value(p[2], word1, index) == 1, "only T# word 1 is read"
                 return word1
@@ -109,6 +122,8 @@ class Module:
             words = self.defs[v[2]][1][1:]            # OpConstantComposite %fmt_mask_arr <words>
             return self.value(words[self.value(p[2], word1, index)], word1, index)
         u = [self.value(y, word1, index) for y in a[1:]]
+        if op == "OpBitcast":
+            return u[0]
         if op == "OpBitFieldUExtract":
             return (u[0] >> u[1]) & ((1 << u[2]) - 1)
         if op == "OpShiftRightLogical":
@@ -142,6 +157,24 @@ def format_class(fmt):
 
 
 class LoadOnlyShaders(unittest.TestCase):
+    def test_volume_mip_fetch_uses_xyz_level_and_descriptor_type(self):
+        for dst, modifier in (("v[0:1]", ""), ("v0", " d16")):
+            with self.subTest(modifier=modifier):
+                m = Module(translate([f"image_load_mip {dst}, v[4:7], s[0:7] "
+                                      f"dmask:0x9 dim:SQ_RSRC_IMG_3D unorm{modifier}"]))
+                fetches = m.fetches()
+                self.assertEqual({image[0] for _, _, image in fetches}, {"%float", "%uint", "%int"})
+                for rid, var, image in fetches:
+                    self.assertEqual((m.binding[var], image[1]), (6, "3D"))
+                    _, _, xyz, mask, lod = m.defs[rid][1]
+                    self.assertEqual(mask, "Lod")
+                    op, coords = m.defs[xyz]
+                    self.assertEqual((op, coords[0]), ("OpCompositeConstruct", "%v3int"))
+                    self.assertEqual([m.integer_coord_vgpr(v) for v in [*coords[1:], lod]], [4, 5, 6, 7])
+                for fmt, kind in ((75, "uint"), (76, "sint"), (77, "float")):  # RGBA32 formats
+                    self.assertEqual(m.branch(fmt << 20, 1), kind)
+                    self.assertEqual(m.branch(fmt << 20, 0), "float")
+
     def test_2d_explicit_mip_reaches_every_typed_fetch(self):
         m = Module(translate(["image_load_mip v[0:3], v[4:6], s[0:7] dmask:0xf dim:SQ_RSRC_IMG_2D",
                               "s_waitcnt vmcnt(0)"]))
@@ -151,13 +184,30 @@ class LoadOnlyShaders(unittest.TestCase):
             self.assertEqual(m.binding[var], 0)
             operands = m.defs[rid][1]
             self.assertEqual(operands[-2], "Lod")
-            op, cast = m.defs[operands[-1]]
-            self.assertEqual(op, "OpBitcast")
-            op, load = m.defs[cast[1]]
-            self.assertEqual(op, "OpLoad")
-            op, source = m.defs[load[1]]
-            self.assertEqual((op, source[1]), ("OpAccessChain", "%vgpr"))
-            self.assertEqual(m.value(source[2], 0, 0), 6)
+            self.assertEqual(m.integer_coord_vgpr(operands[-1]), 6)
+
+    def test_a16_2d_mip_address(self) -> None:
+        with open(os.path.join(ROOT, "tests", "semantic", "fixtures", "packed_mip_load_2d.asm"),
+                  encoding="ascii") as fixture:
+            forms = [line.strip() for line in fixture if line.startswith("image_load_mip")]
+        regs = {8: 0xFFFF8001, 9: 0xDEAD0003, 18: 0x8000FFFE, 5: 0xCAFE0007}
+        expected = ((0x8001, 0xFFFF, 3), (0xFFFE, 0x8000, 7))
+        self.assertEqual(len(forms), len(expected))
+        for line, address in zip(forms, expected):
+            with self.subTest(line=line):
+                m = Module(translate([line]), vgprs=regs)
+                fetches = m.fetches()
+                self.assertEqual({image[0] for _, _, image in fetches}, {"%float", "%uint", "%int"})
+                for rid, _, _ in fetches:
+                    _, _, coord, mode, lod = m.defs[rid][1]
+                    op, (ty, x, y) = m.defs[coord]
+                    self.assertEqual((op, ty, mode), ("OpCompositeConstruct", "%v2int", "Lod"))
+                    self.assertEqual(tuple(m.value(v, 0, 0) for v in (x, y, lod)), address)
+
+    def test_a16_2d_mip_status_is_unsupported(self) -> None:
+        for destination, status in (("v[0:1]", "tfe"), ("v0", "lwe")):
+            with self.subTest(status=status), self.assertRaises(rdna2spirv.Unsupported):
+                translate([f"image_load_mip {destination}, v[8:9], s[0:7] dmask:0x1 dim:SQ_RSRC_IMG_2D a16 {status}"])
 
     def test_2d_explicit_mip_d16_packs_only_selected_components(self):
         listing = ["image_load_mip v0, v[4:6], s[0:7] dmask:0x9 dim:SQ_RSRC_IMG_2D d16",
@@ -282,15 +332,30 @@ class LodQueryCoordinates(unittest.TestCase):
 
 
 class TypedGatherShaders(unittest.TestCase):
-    def test_2d_sample_lz_uses_matching_typed_view_at_level_zero(self):
-        for dst, modifier in (("v[0:3]", ""), ("v[0:1]", " d16")):
-            with self.subTest(modifier=modifier):
-                m = Module(translate([f"image_sample_lz {dst}, v[4:5], s[0:7], s[8:11] "
+    def test_2d_lod_samples_use_matching_typed_views(self):
+        instructions = (("image_sample_lz", "v[4:5]"), ("image_sample_l", "v[4:6]"))
+        destinations = (("v[0:3]", ""), ("v[0:1]", " d16"))
+        for (name, addr), (dst, modifier) in itertools.product(instructions, destinations):
+            with self.subTest(name=name, modifier=modifier):
+                m = Module(translate([f"{name} {dst}, {addr}, s[0:7], s[8:11] "
                                       f"dmask:0xf dim:SQ_RSRC_IMG_2D{modifier}"]))
                 samples = [args for _, op, args in m.order if op == "OpImageSampleExplicitLod"]
                 self.assertEqual({args[0] for args in samples}, {"%v4float", "%v4uint_st", "%v4int_st"})
+                # T# word 1 for R32_UINT, R32_SINT and R32_FLOAT, respectively.
+                for fmt, expected in ((20, "uint"), (21, "sint"), (22, "float")):
+                    self.assertEqual(m.branch(fmt << 20, 5), expected)
+                    self.assertEqual(m.branch(fmt << 20, 0), "float")
                 for ty, sampled, _, mask, lod in samples:
-                    self.assertEqual((mask, lod), ("Lod", "%f0"))
+                    self.assertEqual(mask, "Lod")
+                    if name == "image_sample_lz":
+                        self.assertEqual(lod, "%f0")
+                    else:
+                        op, cast = m.defs[lod]
+                        self.assertEqual(op, "OpBitcast")
+                        op, load = m.defs[cast[1]]
+                        self.assertEqual(op, "OpLoad")
+                        op, ptr = m.defs[load[1]]
+                        self.assertEqual((op, ptr[1], m.value(ptr[2], 0, 0)), ("OpAccessChain", "%vgpr", 6))
                     op, pair = m.defs[sampled]
                     self.assertEqual(op, "OpSampledImage")
                     _, image = m.defs[pair[1]]
@@ -418,6 +483,55 @@ class Validation(unittest.TestCase):
                         ]))
                     result = rdna2spirv.assemble_spirv(sa, sv)
                     self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+
+
+class VolumeGradientSamples(unittest.TestCase):
+    def test_volume_gradient_status_is_unsupported(self) -> None:
+        for dest, status in (("v[2:3]", "tfe"), ("v3", "lwe")):
+            with self.subTest(status=status), self.assertRaises(rdna2spirv.Unsupported):
+                translate([f"image_sample_d {dest}, v[10:18], s[0:7], s[8:11] "
+                           f"dmask:0x1 dim:SQ_RSRC_IMG_3D {status}"])
+
+    def test_volume_address_operands(self) -> None:
+        fixture = Path(ROOT) / "tests/semantic/fixtures/volume_gradients.asm"
+        for line in fixture.read_text(encoding="utf-8").splitlines():
+            if not line.startswith("image_sample_"):
+                continue
+            with self.subTest(line=line):
+                module = Module(translate([line]))
+                sample, = [args for _, op, args in module.order if op == "OpImageSampleExplicitLod"]
+                _, _, coords, mask, dx, dy, *clamp = sample
+                self.assertEqual(mask, "Grad|MinLod" if "_cl " in line else "Grad")
+                self.assertEqual(len(clamp), int("_cl " in line))
+
+                def source(value: str) -> tuple[int, int | None]:
+                    op, (_, word) = module.defs[value]
+                    self.assertEqual(op, "OpBitcast")
+                    op, args = module.defs[word]
+                    half = None
+                    if op == "OpBitcast":  # f16 coord converted to f32, then kept in a VGPR word
+                        extract, (_, unpacked, selector) = module.defs[args[1]]
+                        self.assertEqual(extract, "OpCompositeExtract")
+                        unpack, (_, _, name, packed) = module.defs[unpacked]
+                        self.assertEqual((unpack, name), ("OpExtInst", "UnpackHalf2x16"))
+                        half = int(selector)
+                        op, args = module.defs[packed]
+                    self.assertEqual(op, "OpLoad")
+                    access, (_, bank, index) = module.defs[args[1]]
+                    self.assertEqual((access, bank), ("OpAccessChain", "%vgpr"))
+                    return module.value(index, 0, 0), half
+
+                for vector, registers in ((dx, (10, 11, 12)), (dy, (13, 14, 15))):
+                    op, (ty, *components) = module.defs[vector]
+                    self.assertEqual((op, ty), ("OpCompositeConstruct", "%v3float"))
+                    self.assertEqual([source(c) for c in components], [(reg, None) for reg in registers])
+                op, (ty, *xyz) = module.defs[coords]
+                self.assertEqual((op, ty), ("OpCompositeConstruct", "%v3float"))
+                packed = " a16" in line
+                self.assertEqual([source(c) for c in xyz], [(16, 0), (16, 1), (17, 0)] if packed
+                                 else [(16, None), (17, None), (18, None)])
+                if clamp:
+                    self.assertEqual(source(clamp[0]), (17, 1) if packed else (19, None))
 
 
 if __name__ == "__main__":

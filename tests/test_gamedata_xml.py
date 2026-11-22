@@ -261,6 +261,34 @@ class GamedataXmlTest(unittest.TestCase):
         self.assertTrue(tail["truncated"])
         self.assertFalse(tail["malformed"])
 
+    def test_carve_catalog_marks_parsed_headerless_documents_complete(self) -> None:
+        carve = os.path.join(self.root, "headerless")
+        os.makedirs(carve)
+        rows = []
+        for off, data in ((0x1000, b"<Plain><Child/></Plain>"), (0x2000, b"<Empty/>")):
+            with open(os.path.join(carve, f"{off:012x}.bin"), "wb") as f:
+                f.write(data)
+            rows.append({"off": off, "stored": len(data), "size": len(data),
+                         "head": data[:16].hex(), "pre": ""})
+        with open(os.path.join(carve, "index.json"), "w", encoding="utf-8", newline="\n") as f:
+            json.dump({"files": rows}, f)
+
+        out = os.path.join(self.root, "headerless.json")
+        result = self.run_tool(carve, "--json", out, "--check")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        with open(out, encoding="utf-8") as f:
+            report = json.load(f)
+        self.assertEqual([row["root"] for row in report["rows"]], ["Plain", "Empty"])
+        for row in report["rows"]:
+            with self.subTest(root=row["root"]):
+                self.assertTrue(row["well_formed"])
+                self.assertTrue(row["complete"])
+                self.assertFalse(row["header"])
+                self.assertFalse(row["tail_only"])
+                self.assertFalse(row["fragment"])
+        self.assertEqual(report["summary"]["tail_only"], 0)
+        self.assertEqual(report["summary"]["fragments"], 0)
+
     def test_unwritable_csv_or_json_is_one_error_line(self):
         doc = self.write("alpha.xml", ALPHA)
         blocker = self.write("blocker", b"x")

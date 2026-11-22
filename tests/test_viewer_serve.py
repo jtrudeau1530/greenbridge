@@ -18,6 +18,8 @@ import sys
 import tempfile
 import threading
 import unittest
+import urllib.parse
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 VIEWER = ROOT / "viewer"
@@ -45,6 +47,33 @@ class HostAllowedTest(unittest.TestCase):
     def test_a_request_without_a_host_header_is_allowed(self):
         # Browsers always send Host; a missing one is a local tool, not a web page.
         self.assertTrue(serve.host_allowed(None))
+
+    def test_well_formed_edge_cases_are_allowed(self):
+        for host in (" localhost ", "localhost:80 ", "localhost.:8765", "127.0.0.1.", "127.0.0.1:65535", "localhost:0",
+                     "[::1]:0", "[::1]:00080"):
+            with self.subTest(host=host):
+                self.assertTrue(serve.host_allowed(host))
+
+    def test_malformed_ports_are_refused(self):
+        # Each of these used to be allowed: the port after the colon was never looked at.
+        for host in ("localhost:", "localhost:abc", "localhost:-1", "localhost:+80", "localhost: 80",
+                     "localhost:8 0", "localhost:65536", "localhost:99999", "localhost:123456",
+                     "localhost:８０", "127.0.0.1:0x50", "localhost:80.", "localhost:" + "9" * 5000):
+            with self.subTest(host=host[:40]):
+                self.assertFalse(serve.host_allowed(host))
+
+    def test_malformed_ipv6_literals_are_refused(self):
+        # The first seven used to be allowed: everything after "]" was ignored.
+        for host in ("[::1]junk", "[::1]x:8765", "[::1].", "[::1]]", "[::1]:", "[::1]:abc", "[::1]:8765:1",
+                     "[::1", "::1]", "[[::1]", "[]", "[]:8765", "[::1%25eth0]", "[0:0:0:0:0:0:0:1]x"):
+            with self.subTest(host=host):
+                self.assertFalse(serve.host_allowed(host))
+
+    def test_other_malformed_hosts_are_refused(self):
+        for host in (":8765", ":", "localhost..", "localhost..:8765", "127.0.0.1:80:80", "localhost:8765:1",
+                     "localhost\t:8765", "local host", "localhost\x00"):
+            with self.subTest(host=host):
+                self.assertFalse(serve.host_allowed(host))
 
 
 class SafeWorldPathTest(unittest.TestCase):
@@ -96,6 +125,27 @@ class SafeWorldPathTest(unittest.TestCase):
             with self.subTest(name=name):
                 self.assertIsNone(self.resolve("/world/" + name))
 
+    def test_windows_device_aliases_are_refused_without_isreserved(self):
+        # Python 3.12 has no os.path.isreserved. Check the fallback on newer Pythons too,
+        # before realpath or any other filesystem call can touch a console or serial device.
+        names = ("COM\u00b9", "com\u00b2.glb", "COM\u00b3.json", "LPT\u00b9", "lpt\u00b2.glb",
+                 "LPT\u00b3.json", "CONIN$", "conout$.bin",
+                 "NUL .glb", "COM1 .glb", "LPT9  .json")
+        with mock.patch.object(serve.os.path, "isreserved", None, create=True):
+            with mock.patch.object(serve.os.path, "realpath",
+                                   side_effect=AssertionError("device path reached realpath")) as realpath:
+                for name in names:
+                    for prefix in ("/world/", "/world/sub/"):
+                        with self.subTest(name=name, prefix=prefix):
+                            self.assertIsNone(self.resolve(prefix + urllib.parse.quote(name, safe="")))
+                realpath.assert_not_called()
+
+    def test_device_like_regular_filenames_still_resolve(self):
+        for name in ("COM10.glb", "LPT10.json", "COM\u2074.glb", "COM1_mesh.glb", "console.glb",
+                     "my.CON", "input.CONIN$"):
+            with self.subTest(name=name):
+                self.assertIsNotNone(self.resolve("/world/" + urllib.parse.quote(name, safe="")))
+
     def test_a_missing_world_or_bad_argument_is_refused(self):
         self.assertIsNone(serve.safe_world_path("", "/world/ok.bin"))
         self.assertIsNone(serve.safe_world_path(str(self.world), None))
@@ -110,11 +160,13 @@ class SafeWorldPathTest(unittest.TestCase):
         self.assertIsNone(self.resolve("/world/escape.bin"))
 
 
-def raw_request(port, target, host="127.0.0.1", method="GET"):
-    """Send a request without letting a client library normalise the target path."""
+def raw_request(port, target, host="127.0.0.1", method="GET", extra_headers=()):
+    """Send a request without letting a client library normalise the target path or merge headers.
+    `extra_headers` are raw "Name: value" lines sent after Host, e.g. a second Host field."""
     lines = [f"{method} {target} HTTP/1.1"]
     if host is not None:
         lines.append(f"Host: {host}")
+    lines += list(extra_headers)
     lines += ["Connection: close", "", ""]
     with socket.create_connection(("127.0.0.1", port), timeout=10) as sock:
         sock.sendall("\r\n".join(lines).encode("latin-1"))
@@ -192,6 +244,36 @@ class HandlerTest(unittest.TestCase):
                 self.assertEqual(status, 403)
                 self.assertIn("cache-control: no-store", head.lower())
 
+    def test_duplicate_host_headers_get_400(self):
+        # headers.get("Host") returned only the first field, so a loopback Host followed by a foreign one was served.
+        loopback = f"127.0.0.1:{self.port}"
+        cases = {
+            "loopback then foreign": (loopback, ["Host: evil.example"]),
+            "foreign then loopback": ("evil.example", [f"Host: {loopback}"]),
+            "the same loopback twice": (loopback, [f"Host: {loopback}"]),
+            "a lowercase second field": (loopback, ["host: evil.example"]),
+            "an empty second field": (loopback, ["Host:"]),
+            "three fields": (loopback, [f"Host: localhost:{self.port}", "Host: [::1]"]),
+        }
+        for method in ("GET", "HEAD"):
+            for target in ("/world/ok.bin", "/index.html"):
+                for label, (host, extra) in cases.items():
+                    with self.subTest(method=method, target=target, case=label):
+                        status, head, body = raw_request(self.port, target, host=host, method=method,
+                                                         extra_headers=extra)
+                        self.assertEqual(status, 400)
+                        self.assertIn("cache-control: no-store", head.lower())
+                        self.assertNotIn(b"world-bytes", body)
+                        self.assertNotIn(b"<title>viewer</title>", body)
+
+    def test_a_malformed_host_gets_403(self):
+        for host in (f"127.0.0.1:{self.port}junk", "localhost:abc", f"[::1]evil.example:{self.port}",
+                     "localhost:" + "9" * 5000):
+            with self.subTest(host=host[:40]):
+                status, _, body = raw_request(self.port, "/world/ok.bin", host=host)
+                self.assertEqual(status, 403)
+                self.assertNotIn(b"world-bytes", body)
+
     def test_traversal_attempts_get_403(self):
         for target in ("/world/../secret.txt", "/world/%2e%2e/secret.txt",
                        "/world/sub/../../secret.txt", "/world/..%5csecret.txt"):
@@ -199,6 +281,19 @@ class HandlerTest(unittest.TestCase):
                 status, _, body = raw_request(self.port, target, host=f"127.0.0.1:{self.port}")
                 self.assertEqual(status, 403)
                 self.assertNotIn(b"secret", body)
+
+    def test_windows_device_aliases_get_403_without_opening_them(self):
+        targets = ("/world/COM%C2%B9.glb", "/world/sub/lpt%C2%B2.json", "/world/CONIN%24",
+                   "/world/CONOUT%24.bin", "/world/NUL%20.glb")
+        with mock.patch.object(serve.os.path, "isreserved", None, create=True):
+            # If the path guard regresses, fail without ever opening an actual Windows device.
+            with mock.patch("builtins.open", side_effect=AssertionError("device path reached open")) as opened:
+                for method in ("GET", "HEAD"):
+                    for target in targets:
+                        with self.subTest(method=method, target=target):
+                            status, _, _ = raw_request(self.port, target, method=method)
+                            self.assertEqual(status, 403)
+                opened.assert_not_called()
 
     def test_the_viewer_page_itself_is_served(self):
         status, _, body = raw_request(self.port, "/index.html", host=f"127.0.0.1:{self.port}")

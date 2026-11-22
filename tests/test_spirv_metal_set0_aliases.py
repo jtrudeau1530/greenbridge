@@ -335,6 +335,25 @@ class TestSingleAndAliasedBindings(unittest.TestCase):
             self.assertIsNotNone(m_ptr)
             self.assertEqual(defs[m_ptr.group(1)], "OpTypeArray %img2d %msl_cap_b0")
 
+    def test_late_uint_is_defined_before_the_synthesized_array_length(self) -> None:
+        module = """\
+               OpDecorate %images DescriptorSet 0
+               OpDecorate %images Binding 0
+      %float = OpTypeFloat 32
+      %img2d = OpTypeImage %float 2D 0 0 0 1 Unknown
+     %rt_img = OpTypeRuntimeArray %img2d
+    %ptr_img = OpTypePointer UniformConstant %rt_img
+     %images = OpVariable %ptr_img UniformConstant
+       %uint = OpTypeInt 32 0
+  %old_count = OpConstant %uint 4
+"""
+        _parse_defs_and_order(module)
+        defs, _, _ = _parse_defs_and_order(m.rewrite(module, [64]))
+
+        self.assertEqual(defs["%msl_cap_b0"], "OpConstant %uint 64")
+        self.assertEqual(defs["%images"], "OpVariable %msl_ptr_b0 UniformConstant")
+        self.assertEqual(defs["%old_count"], "OpConstant %uint 4")
+
     def test_preexisting_msl_ids_in_input_never_collide(self):
         module = """\
                OpDecorate %images DescriptorSet 0

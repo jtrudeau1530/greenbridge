@@ -20,7 +20,8 @@ tests/semantic/spirv_mini_interp.py runs one invocation of forward-only code. Th
     composited. Float arithmetic raises, so a NaN payload can never be rewritten by the host.
 
 Inputs: Input variables decorated BuiltIn SubgroupLocalInvocationId read the lane number, SubgroupSize reads the
-wave size; other Input variables read zero, except the built-ins named in `builtins` (name -> function of the
+wave size; BaseVertex and BaseInstance read 0; other Input variables read zero, except the built-ins named in
+`builtins` (name -> function of the
 lane number giving that lane's integer value, e.g. {"VertexIndex": lambda lane: first + lane}). PushConstant words
 can be seeded (default zero).
 
@@ -313,6 +314,8 @@ class _Wave:
                         value = wave
                     elif builtins and b in builtins:
                         value = builtins[b](lane.index) & MASK
+                    elif b in ("BaseVertex", "BaseInstance"):
+                        value = 0     # a draw with no vertex/instance offset, unless `builtins` seeds one
                     elif b is None:
                         value = mod.zero(pointee)
                     else:

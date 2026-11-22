@@ -482,6 +482,29 @@ class TestSwizzleSearchCliAndRender(unittest.TestCase):
                     self.assertEqual(output.read_bytes(), original)
 
     @unittest.skipUnless(HAVE_NUMPY and HAVE_PIL, "numpy and PIL required")
+    def test_preview_ranks_thin_candidates_by_their_existing_edges(self) -> None:
+        from PIL import Image
+
+        green = bytes.fromhex("e007 0000 00000000")
+        white = bytes.fromhex("ffff 0000 00000000")
+        with tempfile.TemporaryDirectory() as td:
+            blob = Path(td) / "input.bin"
+            preview = Path(td) / "preview.png"
+            # Two complete green tiles for an 8x8 candidate. The narrower
+            # candidate also samples a third tile and sees a green/white edge.
+            blob.write_bytes(green * 4 + white * 2)
+            result = subprocess.run(
+                [sys.executable, "-I", str(TOOL), str(blob), "--tile", "16",
+                 "--widths", "4,8", "--tiles", "3", "--out", str(preview)],
+                capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            with Image.open(preview) as image:
+                self.assertEqual(image.size, (8, 8))
+                self.assertEqual(image.getcolors(), [(64, (0, 255, 0))])
+            self.assertNotIn("nan", result.stdout.lower())
+
+    @unittest.skipUnless(HAVE_NUMPY and HAVE_PIL, "numpy and PIL required")
     def test_render_bc1_synthetic_output(self):
         """render() must decode synthetic BC1 data and save a valid PNG preview."""
         with tempfile.TemporaryDirectory() as td:

@@ -12,19 +12,24 @@ import argparse
 import functools
 import http.server
 import os
+import sys
 import urllib.parse
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 _WINDOWS_RESERVED_DEVICES = frozenset({
-    "CON", "PRN", "AUX", "NUL",
-    *(f"COM{i}" for i in range(1, 10)),
-    *(f"LPT{i}" for i in range(1, 10)),
+    "CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$",
+    # Windows also treats superscript 1/2/3 as device numbers. Keep this fallback
+    # complete for Python 3.12, which has no os.path.isreserved.
+    *(f"COM{i}" for i in "123456789\u00b9\u00b2\u00b3"),
+    *(f"LPT{i}" for i in "123456789\u00b9\u00b2\u00b3"),
 })
 
 
 def _is_reserved_segment(seg: str) -> bool:
-    stem = seg.rstrip(" .").split(".", 1)[0].upper()
+    # Spaces before an extension do not make a device into a normal filename:
+    # Windows treats e.g. "NUL .glb" as NUL (as does ntpath.isreserved in Python 3.13+).
+    stem = seg.split(".", 1)[0].rstrip(" ").upper()
     if stem in _WINDOWS_RESERVED_DEVICES:
         return True
     isreserved = getattr(os.path, "isreserved", None)
@@ -41,15 +46,33 @@ _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "[::1]"})
 
 def host_allowed(host: str | None) -> bool:
     """True when a request's Host header names the loopback address. Browsers always send Host; a request without
-    one comes from a local tool, not a web page, and is allowed."""
+    one comes from a local tool, not a web page, and is allowed.
+
+    The value must be `name` or `name:port` (RFC 7230 section 5.4): text after an IPv6 literal's `]` other than
+    `:port`, a second colon, or a port that is not 1-5 ASCII digits up to 65535 is malformed and refused."""
     if host is None:
         return True
     host = host.strip().lower()
     if host.startswith("["):                        # [::1] or [::1]:8765
-        name = host[:host.find("]") + 1] if "]" in host else host
+        end = host.find("]")
+        if end < 0:
+            return False
+        name, rest = host[:end + 1], host[end + 1:]
+        if rest and not rest.startswith(":"):
+            return False                            # [::1]junk, [::1].
+        port = rest[1:] if rest else None
     else:
-        name = host.rsplit(":", 1)[0] if host.count(":") == 1 else host
-    return name.rstrip(".") in _LOOPBACK_HOSTS
+        name, colon, port = host.partition(":")
+        if not colon:
+            port = None
+        elif ":" in port:
+            return False                            # a bare IPv6 address, or name:port:more
+        if name.endswith("."):                      # one trailing dot: the fully qualified form
+            name = name[:-1]
+    # The length cap comes before int(): a port of thousands of digits would hit Python's int conversion limit.
+    if port is not None and not (0 < len(port) <= 5 and port.isascii() and port.isdigit() and int(port) <= 65535):
+        return False
+    return name in _LOOPBACK_HOSTS
 
 
 def safe_world_path(world_dir: str, req_path: str) -> str | None:
@@ -101,7 +124,13 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             pass
 
     def send_head(self):
-        if not host_allowed(self.headers.get("Host")):
+        # headers.get() returns only the first Host field, so a second one would go unchecked. RFC 7230 section 5.4:
+        # a request with more than one Host field gets 400.
+        hosts = self.headers.get_all("Host", [])
+        if len(hosts) > 1:
+            self.send_error(400, "Duplicate Host header")
+            return None
+        if not host_allowed(hosts[0] if hosts else None):
             self.send_error(403, "Forbidden: open the viewer at http://127.0.0.1 or http://localhost")
             return None
         clean = self.path.split("#", 1)[0].split("?", 1)[0]
@@ -160,4 +189,8 @@ def main():
 
 
 if __name__ == "__main__":
+    try:  # a redirected stdout is strict ANSI code page under -I; write '?' for what it cannot encode
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
     main()

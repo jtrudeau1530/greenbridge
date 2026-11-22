@@ -33,6 +33,7 @@ NEEDS = re.compile(r"^\t(image_store|image_atomic|buffer_store|tbuffer_|global_s
 BRANCH = re.compile(r"^\ts_c?branch", re.M)
 BACK = re.compile(r"^\ts_c?branch\S* (\d+)", re.M)
 CLEAR = struct.pack("<4f", -1, -1, -1, -1)      # what vk_texture_test clears the image to
+READBACK_BYTES = 64 * 64 * len(CLEAR)  # vk_texture_test writes a 64x64 RGBA32F image
 LOCATIONS = 32      # every pixel-shader input location gets a defined value
 SUPPORTED_BINDINGS = {0, 1, 2}
 HOSTED_FEATURES = {"bufferDeviceAddress", "runtimeDescriptorArray", "shaderInt64"}
@@ -260,7 +261,12 @@ def main(argv=None):
                 try:
                     h = subprocess.run([harness, vs, spirv, raw, "8", "92", "c00000", "14500000", "0"],
                                        capture_output=True, text=True, timeout=a.timeout)
-                    img = open(raw, "rb").read() if h.returncode == 0 and os.path.isfile(raw) else None
+                    img = None
+                    if h.returncode == 0 and os.path.isfile(raw):
+                        with open(raw, "rb") as readback:
+                            data = readback.read(READBACK_BYTES + 1)
+                        if len(data) == READBACK_BYTES:
+                            img = data
                     if img is not None and not colour:
                         img = bytes(img[i:i + 16] != CLEAR for i in range(0, len(img), 16))
                     got.append(img)
