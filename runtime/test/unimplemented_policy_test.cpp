@@ -14,6 +14,7 @@
 // LEONIDA_TEST_DIR names the folder for the image, as for loader_test; the default is the temp directory.
 #include <windows.h>
 
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -281,6 +282,142 @@ void test_in_process(const fs::path& dir) {
     rt::shims::set_unimplemented_policy(UnimplementedPolicy::Log);
 }
 
+// ---- stack alignment, stack walk and register preservation ---------------------------------------------------
+
+struct HookState {
+    int calls = 0;
+    uintptr_t slot_mod = 0;           // address of rt_unimplemented's return-address slot, mod 16
+    std::vector<DWORD64> rips;        // the frames from the hook up to the first one with no unwind data
+    int frames_with_unwind_data = 0;
+} g_hook;
+
+// Runs inside rt_unimplemented. At function entry rsp is 8 mod 16 when the caller's rsp was 16-byte aligned at the
+// call, so a slot address of 8 mod 16 proves the stub aligned the stack. Then it walks the stack the way a debugger or
+// the exception dispatcher would, through rt_unimplemented and the common stub, into the caller.
+void unwind_hook(const void* return_address_slot) {
+    ++g_hook.calls;
+    g_hook.slot_mod = reinterpret_cast<uintptr_t>(return_address_slot) & 15;
+    g_hook.rips.clear();
+    g_hook.frames_with_unwind_data = 0;
+    CONTEXT ctx;
+    RtlCaptureContext(&ctx);
+    for (int depth = 0; depth < 16; ++depth) {
+        g_hook.rips.push_back(ctx.Rip);
+        DWORD64 image_base = 0;
+        RUNTIME_FUNCTION* rf = RtlLookupFunctionEntry(ctx.Rip, &image_base, nullptr);
+        if (!rf) break;  // code with no unwind data (the synthetic image): the walk ends in the caller
+        ++g_hook.frames_with_unwind_data;
+        void* handler_data = nullptr;
+        DWORD64 establisher = 0;
+        RtlVirtualUnwind(UNW_FLAG_NHANDLER, image_base, ctx.Rip, rf, &ctx, &handler_data, &establisher, nullptr);
+    }
+}
+
+bool walk_contains(DWORD64 rip) {
+    for (DWORD64 r : g_hook.rips)
+        if (r == rip) return true;
+    return false;
+}
+
+#ifdef LEONIDA_HAVE_ABI_PROBE
+struct alignas(16) AbiProbe {
+    uint64_t gpr_in[8];
+    uint8_t xmm_in[10][16];
+    uint8_t pad[32];
+    uint64_t gpr_out[8];
+    uint8_t xmm_out[10][16];
+    uint64_t result;
+    uint64_t spare;  // rounds the size up to the 16-byte alignment
+};
+static_assert(offsetof(AbiProbe, xmm_in) == 0x40 && offsetof(AbiProbe, gpr_out) == 0x100 &&
+              offsetof(AbiProbe, xmm_out) == 0x140 && offsetof(AbiProbe, result) == 0x1E0, "abi_probe.asm layout");
+extern "C" uint64_t abi_probe_call(AbiProbe* p, void* fn);
+
+void fill_probe(AbiProbe& p) {
+    std::memset(&p, 0, sizeof p);
+    for (int i = 0; i < 8; ++i) p.gpr_in[i] = 0xA5A5000000000000ull | (0x1111ull * (i + 1));
+    for (int i = 0; i < 10; ++i)
+        for (int b = 0; b < 16; ++b) p.xmm_in[i][b] = static_cast<uint8_t>(0x10 * (i + 1) + b + 1);
+}
+
+int probe_mismatches(const AbiProbe& p) {
+    int bad = 0;
+    for (int i = 0; i < 8; ++i) bad += p.gpr_out[i] != p.gpr_in[i];
+    for (int i = 0; i < 10; ++i) bad += std::memcmp(p.xmm_out[i], p.xmm_in[i], 16) != 0;
+    return bad;
+}
+#endif
+
+void test_abi(const fs::path& dir) {
+    rt::Loader loader(dir);
+    rt::Module& m = loader.load(write_image(dir));
+    const DWORD64 expect_return[2] = {reinterpret_cast<DWORD64>(m.base) + return_rva(0),
+                                      reinterpret_cast<DWORD64>(m.base) + return_rva(1)};
+
+    rt::shims::set_unimplemented_test_hook(&unwind_hook);
+    rt::shims::set_unimplemented_policy(UnimplementedPolicy::Fail);
+    for (int i = 0; i < 2; ++i) {
+        const std::string tag = std::string("caller ") + (i == 0 ? "of the hresult" : "of the other") + " import: ";
+        g_hook = {};
+        uint64_t out = 0;
+        caller_of(m, i)(&out, 1, 2, 3);
+        check(g_hook.calls == 1, tag + "the test hook ran once");
+        check(g_hook.slot_mod == 8, tag + "rt_unimplemented is entered with rsp = 8 mod 16, so the call was aligned (" +
+                                        std::to_string(g_hook.slot_mod) + ")");
+        check(walk_contains(expect_return[i]),
+              tag + "RtlVirtualUnwind from inside rt_unimplemented reaches the caller's return address");
+        check(g_hook.frames_with_unwind_data >= 3,
+              tag + "the walk passes the hook, rt_unimplemented and the stub (" +
+                  std::to_string(g_hook.frames_with_unwind_data) + " frames with unwind data)");
+    }
+
+#ifdef LEONIDA_HAVE_ABI_PROBE
+    AbiProbe p;
+    void* const thunk0 = *reinterpret_cast<void**>(m.base + kTextRva + 0x0E0);  // IAT slot of import 0
+    for (auto policy : {UnimplementedPolicy::Fail, UnimplementedPolicy::Log}) {
+        const std::string tag = std::string("abi_probe via ") + (policy == UnimplementedPolicy::Fail ? "fail" : "log") + ": ";
+        rt::shims::set_unimplemented_policy(policy);
+        fill_probe(p);
+        g_hook = {};
+        const uint64_t r = abi_probe_call(&p, thunk0);
+        check(r == (policy == UnimplementedPolicy::Fail ? rt::shims::kENotImpl : 0), tag + "returns the policy's value");
+        check(probe_mismatches(p) == 0,
+              tag + "rbx rbp rdi rsi r12-r15 and xmm6-xmm15 are unchanged by the call (" +
+                  std::to_string(probe_mismatches(p)) + " differ)");
+        check(g_hook.slot_mod == 8, tag + "aligned at the call into rt_unimplemented");
+        DWORD64 fn = reinterpret_cast<DWORD64>(&abi_probe_call);
+        if (*reinterpret_cast<const uint8_t*>(fn) == 0xE9)  // a linker jump thunk: follow it to the function
+            fn += 5 + *reinterpret_cast<const int32_t*>(fn + 1);
+        bool in_probe = false;
+        for (DWORD64 rip : g_hook.rips) in_probe |= rip > fn && rip < fn + 0x200;
+        if (!in_probe) {
+            std::printf("fn=%llx rips:", fn);
+            for (DWORD64 x : g_hook.rips) std::printf(" %llx", x);
+            std::printf("\n");
+        }
+        check(in_probe, tag + "the stack walk reaches the calling function (unwinds through the stub)");
+    }
+
+    // Negative control: the harness must see a callee that breaks the ABI.
+    {
+        const uint8_t clobber[] = {0x31, 0xDB,        // xor ebx, ebx
+                                   0x0F, 0x57, 0xF6,  // xorps xmm6, xmm6
+                                   0xC3};
+        void* code = VirtualAlloc(nullptr, 0x1000, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+        std::memcpy(code, clobber, sizeof clobber);
+        fill_probe(p);
+        abi_probe_call(&p, code);
+        check(p.gpr_out[0] != p.gpr_in[0] && std::memcmp(p.xmm_out[0], p.xmm_in[0], 16) != 0,
+              "abi_probe notices a callee that clobbers rbx and xmm6 (control)");
+        VirtualFree(code, 0, MEM_RELEASE);
+    }
+#else
+    std::printf("skip  register preservation: built without ml64\n");
+#endif
+    rt::shims::set_unimplemented_test_hook(nullptr);
+    rt::shims::set_unimplemented_policy(UnimplementedPolicy::Log);
+}
+
 void test_env_and_default(const fs::path& dir) {
     const std::wstring args = L"--env-child \"" + dir.wstring() + L"\"";
     struct Case {
@@ -334,6 +471,7 @@ int wmain(int argc, wchar_t** argv) {
         const fs::path dir = test_dir();
         test_classification();
         test_in_process(dir);
+        test_abi(dir);
         test_env_and_default(dir);
         test_stop(dir);
         std::error_code ec;

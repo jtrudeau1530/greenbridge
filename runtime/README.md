@@ -165,7 +165,10 @@ when the Vulkan SDK is found:
 
 `unimplemented_policy_test` builds a small image whose two imports bind to nothing and checks `log`, `fail` and
 `stop` on it: return values, untouched out parameter, xmm0 = 0, environment parsing, and (in a child process) the
-`stop` message with the caller's module+RVA and the argument registers.
+`stop` message with the caller's module+RVA and the argument registers. It also checks that the stub keeps the stack
+16-byte aligned at the call into the runtime, that rbx/rbp/rdi/rsi/r12-r15 and xmm6-xmm15 survive a call
+(`test/fixtures/abi_probe.asm`, MASM; skipped without `ml64`), and that `RtlVirtualUnwind` from inside the call walks
+back to the caller.
 
 The PE-loader and Bink-decode tests that need the retail package are optional: when
 `LEONIDA_GAME_DIR` (and, for Bink, `LEONIDA_MOVIE`) is unset they print `SKIP` and exit 0. They read

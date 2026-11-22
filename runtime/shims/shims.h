@@ -46,6 +46,11 @@ using ModuleLookup = bool (*)(void* ctx, uint64_t address, std::string& module, 
 void add_module_lookup(void* ctx, ModuleLookup fn);
 void remove_module_lookup(void* ctx);
 
+// Test seam: called at the top of every unimplemented-import call with the address of rt_unimplemented's return
+// address slot (so a test can check stack alignment) and from inside the call (so it can walk the stack).
+using TestHook = void (*)(const void* return_address_slot);
+void set_unimplemented_test_hook(TestHook hook);
+
 // Makes a small thunk for an import with no binding; calling it follows the policy above. It passes the caller's
 // return address and the first four argument registers through unchanged.
 void* make_unimplemented_thunk(const std::string& dll, const std::string& name);

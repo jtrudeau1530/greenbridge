@@ -1,4 +1,5 @@
 #include <windows.h>
+#include <intrin.h>
 
 #include <atomic>
 #include <cstdint>
@@ -30,6 +31,8 @@ bool starts_with(const std::string& s, const char* prefix) { return s.rfind(pref
 
 std::mutex g_called_mutex;
 std::set<std::string> g_called;
+std::map<const char*, ReturnClass> g_seen;  // by the thunk's `what` pointer; both under g_called_mutex
+std::atomic<TestHook> g_test_hook{nullptr};
 
 // ---- Return-value policy ----------------------------------------------------------------------------------------
 
@@ -136,11 +139,28 @@ std::string describe_address(uint64_t addr) {
 // Called by the common stub with the import's "dll!name" string and the registers it saved. The return value goes
 // back to the game's caller in rax; the stub zeroes xmm0.
 extern "C" uint64_t rt_unimplemented(const char* what, const CallInfo* info) {
-    const std::string full = what;
-    const auto bang = full.find('!');
-    const std::string dll = bang == std::string::npos ? "" : full.substr(0, bang);
-    const ReturnClass cls = classify(lower_ascii(dll), bang == std::string::npos ? full : full.substr(bang + 1));
+    if (auto hook = g_test_hook.load()) hook(_AddressOfReturnAddress());
     const UnimplementedPolicy policy = unimplemented_policy();
+
+    // `what` is a string that lives for the process and is unique per import, so the pointer keys the per-import
+    // state. Strings are built only the first time an import is seen; a repeat call costs one map lookup.
+    ReturnClass cls;
+    bool first = false;
+    {
+        std::lock_guard lock(g_called_mutex);
+        auto it = g_seen.find(what);
+        if (it == g_seen.end()) {
+            const std::string full = what;
+            const auto bang = full.find('!');
+            cls = classify(lower_ascii(bang == std::string::npos ? "" : full.substr(0, bang)),
+                           bang == std::string::npos ? full : full.substr(bang + 1));
+            g_seen.emplace(what, cls);
+            g_called.insert(full);
+            first = true;
+        } else {
+            cls = it->second;
+        }
+    }
     const uint64_t fail_value = cls == ReturnClass::HResult ? kENotImpl : 0;
 
     if (policy == UnimplementedPolicy::Stop) {
@@ -164,14 +184,11 @@ extern "C" uint64_t rt_unimplemented(const char* what, const CallInfo* info) {
         TerminateProcess(GetCurrentProcess(), kStopExitCode);
         return 0;  // not reached
     }
-    {
-        std::lock_guard lock(g_called_mutex);
-        if (g_called.insert(what).second)
-            std::fprintf(stderr, "[rt] unimplemented: %s%s\n", what,
-                         policy == UnimplementedPolicy::Fail
-                             ? (cls == ReturnClass::HResult ? " (returns E_NOTIMPL)" : " (returns 0)")
-                             : "");
-    }
+    if (first)
+        std::fprintf(stderr, "[rt] unimplemented: %s%s\n", what,
+                     policy == UnimplementedPolicy::Fail
+                         ? (cls == ReturnClass::HResult ? " (returns E_NOTIMPL)" : " (returns 0)")
+                         : "");
     return policy == UnimplementedPolicy::Fail ? fail_value : 0;
 }
 
@@ -238,7 +255,10 @@ void* make_common_stub() {
     rf->BeginAddress = 0;
     rf->EndAddress = static_cast<DWORD>(n);
     rf->UnwindData = kUnwindOffset;
-    RtlAddFunctionTable(rf, 1, reinterpret_cast<DWORD64>(region));
+    // Without the table the stub still works; only a stack walk through it (a debugger, an exception) stops there.
+    if (!RtlAddFunctionTable(rf, 1, reinterpret_cast<DWORD64>(region)))
+        std::fprintf(stderr, "[rt] RtlAddFunctionTable failed for the unimplemented-import stub (error %lu): "
+                             "stack walks cannot pass through it\n", GetLastError());
     FlushInstructionCache(GetCurrentProcess(), region, kRegionSize);
     return region;
 }
@@ -274,6 +294,8 @@ UnimplementedPolicy unimplemented_policy() {
 void set_unimplemented_policy(UnimplementedPolicy p) { g_policy.store(static_cast<int>(p)); }
 
 ReturnClass classify_import(const std::string& dll, const std::string& name) { return classify(lower_ascii(dll), name); }
+
+void set_unimplemented_test_hook(TestHook hook) { g_test_hook.store(hook); }
 
 void add_module_lookup(void* ctx, ModuleLookup fn) {
     std::lock_guard lock(g_lookup_mutex);
