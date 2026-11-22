@@ -437,6 +437,37 @@ in `.bk2`), not XML. Of the 57 `.xml` path entries, 50 are under `$(common)/` an
 are under `data/` or `script/`. A further 40 `parentPath` attributes are relative references that cannot be
 resolved without the table of contents. No XInclude (`xi:include`) elements occur.
 
+## Shore wave placement
+
+The shore-break waves are placed by one `ShoreWavePlacementData` document, the coastline counterpart of
+`OceanSimPresets`. Element tree (counts per path; no values):
+
+| Path | Count | Content |
+|---|---:|---|
+| `Context` | 1 | empty |
+| `Patches/item` | 434 | `loop` and `waveType` (`value=`), then `ControlPoints` |
+| `Patches/item/ControlPoints/item` | 7,839 | `position` and `direction` (`x`, `y`), `lateralCoord`, `maxDistance`, `amplitude` (`value=`) |
+
+Measured over the 434 patches and 7,839 points:
+
+- **Patches are open 2D polylines.** 2 to 124 points per patch (median 14), median spacing 9.5 world units.
+  `loop` is false on all 434; 11 patches still repeat their first point at the end. Positions span x -9,602 to
+  2,335 and y -7,955 to 9,474, a larger box than the ten ocean preset locations. Positions have no z
+  component.
+- **`waveType`** takes 5 values, used by 181, 147, 69, 31 and 6 patches.
+- **`direction` is a unit vector** at every point (length 1.000 to three decimals). It runs across the polyline
+  rather than along it: the median |cos| between it and the local polyline tangent is 0.24 (quartiles 0.11 and
+  0.44), consistent with a wave travelling across the line towards the shore.
+- **`amplitude` is 1.0 at all 7,839 points**, so it carries no per-point variation in this build. The height
+  presumably comes from elsewhere, for example the per-weather `ShoreWaveAmplitude`, `ShoreWaveMinAmplitude`,
+  `ShoreWaveMaxAmplitude` and `ShoreWaveWindScale` fields of the weather data.
+- **`maxDistance`** ranges 3.0 to 120.4 (median 74.9): how far the wave runs from the line.
+- **`lateralCoord`** is a float in -2.94..3.50 with 7,820 distinct values. It is not arc length and not monotonic
+  along 433 of the 434 patches, so it is not a running texture coordinate along the line.
+
+Not measured here (hypothesis): what the five `waveType` values select, and what `lateralCoord` encodes (an
+offset across the line is one reading).
+
 ## Readable vs binary
 
 Readable: the 266 XML documents, 3 text/INI-like files, and the two `MHIU` 2048 x 2048
