@@ -36,6 +36,7 @@ from check import judged_words, words_match   # dump words not judged on some de
 from check import TEXOFF_ARGS, texoff_problem   # ps_texoff's expected words and arguments live in check.py
 from check import TEXOFF_FALLBACK, texoff_env   # LEONIDA_TEXOFF_FALLBACK=1: texel offsets without maintenance8
 from check import gpu_test_timeout, timed_out   # per-program time limit (LEONIDA_GPU_TEST_TIMEOUT)
+from check import run_readback
 from check import MESH_COMPUTE, mesh_env   # LEONIDA_MESH_COMPUTE=1: mesh shaders as compute + a generated VS
 from check import (WAVE32_LANE_DUMPS, WAVE32_LANE_ENV, bitmask_perm_narrow_skip, narrow_subgroup_skip,
                    unpinned_subgroup_skip, vcmpx_forms_narrow_skip, wave32_lane_skip)   # as in check.py
@@ -1073,17 +1074,16 @@ def run_suite(a, work: str) -> int:
             tool = os.path.join(a.build, "vk_texture_test" + ext)
             raw = os.path.join(raw_dir, f"{name}.raw")
             if name == "ps_texture_sample_d16":
-                Path(raw).unlink(missing_ok=True)
                 cmd = [tool, os.path.join(spirv_dir, "vs_ids.spv"), spv, raw, "0", "0", "0", "0", "0"]
             else:
                 mode = {"ps_cube_sample": ["cube"], "ps_sample_c_lz": ["dref"],
                         "ps_sample_c_lz_a16": ["dref_a16"]}.get(name, [])
                 cmd = [tool, *mode, raw]
-            rc, msg = run_cmd(cmd, cwd=spirv_dir)
+            rc, msg = run_readback(raw, run_cmd, cmd, cwd=spirv_dir)
             if rc == UNSUPPORTED:   # e.g. fewer push constant bytes than the texture tests need
                 results.append((name, None, unsupported_skip(msg)))
             elif name == "ps_texture_sample_d16" and rc == 0:
-                ok, detail = check_d16_texture(raw) if os.path.isfile(raw) else (False, "missing RGBA32F readback")
+                ok, detail = check_d16_texture(raw)
                 results.append((name, ok, detail))
             else:
                 results.append((name, rc == 0 and "PASSED" in msg, msg.splitlines()[-1] if msg else ""))
@@ -1091,8 +1091,8 @@ def run_suite(a, work: str) -> int:
             expected = TEXTURE_CONSTANTS[name]
             tool = os.path.join(a.build, "vk_texture_test" + ext)
             raw = os.path.join(raw_dir, f"{name}.raw")
-            rc, msg = run_cmd([tool, os.path.join(spirv_dir, "vs_ids.spv"), spv, raw, "0", "92", "c00000",
-                               "14500000", "0"], cwd=spirv_dir)
+            rc, msg = run_readback(raw, run_cmd, [tool, os.path.join(spirv_dir, "vs_ids.spv"), spv, raw, "0", "92",
+                                                "c00000", "14500000", "0"], cwd=spirv_dir)
             bad = 4096
             if rc == 0 and os.path.isfile(raw):
                 data = Path(raw).read_bytes()
@@ -1123,8 +1123,8 @@ def run_suite(a, work: str) -> int:
             # Texel offsets: needs vk_texture_test's texture, sampler and descriptor table (vk_harness binds none),
             # and VK_KHR_maintenance8 for the non-constant Offset; the tool exits 77 without it.
             raw = os.path.join(raw_dir, f"{name}.raw")
-            rc, msg = run_cmd([os.path.join(a.build, "vk_texture_test" + ext), vs_tri, spv, raw, *TEXOFF_ARGS],
-                              env=texoff_env())
+            rc, msg = run_readback(raw, run_cmd, [os.path.join(a.build, "vk_texture_test" + ext), vs_tri, spv, raw,
+                                                *TEXOFF_ARGS], env=texoff_env())
             if rc == UNSUPPORTED:
                 results.append((name, None, unsupported_skip(msg)))
             elif rc != 0:
@@ -1149,7 +1149,7 @@ def run_suite(a, work: str) -> int:
             bary_gs = os.path.join(spirv_dir, f"{name}.bary_gs.spv")
             if bary_fallback() and os.path.isfile(bary_gs):   # --bary-fallback PS: barycentrics from this GS
                 env = dict(env or os.environ, VKH_GS=bary_gs, VKH_GS_HELPER="1")
-            rc, msg = run_cmd([vk_harness, vs, spv, raw], env=env)
+            rc, msg = run_readback(raw, run_cmd, [vk_harness, vs, spv, raw], env=env)
             if rc == 77:   # vk_harness: the device lacks a feature this shader needs (e.g. barycentrics)
                 results.append((name, None, unsupported_skip(msg)))
                 continue
@@ -1252,7 +1252,7 @@ def run_suite(a, work: str) -> int:
         elif name == "gs_tri":
             raw = os.path.join(raw_dir, f"{name}.raw")
             env = dict(gfx_env or os.environ, VKH_GS=spv)
-            rc, msg = run_cmd([vk_harness, vs_tri, fs_loc1, raw], env=env)
+            rc, msg = run_readback(raw, run_cmd, [vk_harness, vs_tri, fs_loc1, raw], env=env)
             if rc == UNSUPPORTED:
                 results.append((name, None, unsupported_skip(msg)))
             elif rc != 0:
@@ -1271,7 +1271,7 @@ def run_suite(a, work: str) -> int:
         elif name in ("ms_tri", "ms_w64x_ballot", "ms_wave_info_s3"):
             raw = os.path.join(raw_dir, f"{name}.raw")
             env = mesh_env(spirv_dir, name, gfx_env)
-            rc, msg = run_cmd([vk_harness, spv, fs_passthru, raw], env=env)
+            rc, msg = run_readback(raw, run_cmd, [vk_harness, spv, fs_passthru, raw], env=env)
             # ms_w64x_ballot needs exact wave64 (a 64-wide subgroup, or --wave64-emulate): skip it elsewhere, as
             # the wave64 compute dumps are.
             no64 = (name == "ms_w64x_ballot" and not w64_emulated() and
@@ -1292,7 +1292,7 @@ def run_suite(a, work: str) -> int:
             if bary_fallback() and not f16_interp_fallback():
                 results.append((name, None, "SKIP (per-vertex f16 interpolants need barycentrics)"))
                 continue
-            rc, msg = run_cmd([vk_harness, spv, fs, raw], env=env)
+            rc, msg = run_readback(raw, run_cmd, [vk_harness, spv, fs, raw], env=env)
             if rc == UNSUPPORTED:
                 results.append((name, None, unsupported_skip(msg)))
             elif rc != 0:
@@ -1304,7 +1304,7 @@ def run_suite(a, work: str) -> int:
         elif name == "ms_clip":
             raw = os.path.join(raw_dir, f"{name}.raw")
             env = mesh_env(spirv_dir, name, gfx_env)
-            rc, msg = run_cmd([vk_harness, spv, fs_passthru, raw], env=env)
+            rc, msg = run_readback(raw, run_cmd, [vk_harness, spv, fs_passthru, raw], env=env)
             if rc == UNSUPPORTED:
                 results.append((name, None, unsupported_skip(msg)))
             elif rc != 0:
@@ -1317,7 +1317,7 @@ def run_suite(a, work: str) -> int:
             # ps_flat must still see vertex 0 of instance 0 (0x101), as check.py checks.
             raw = os.path.join(raw_dir, f"{name}.raw")
             env = dict(gfx_env or os.environ, VKH_DRAW="16,7")
-            rc, msg = run_cmd([vk_harness, spv, os.path.join(spirv_dir, "ps_flat.spv"), raw], env=env)
+            rc, msg = run_readback(raw, run_cmd, [vk_harness, spv, os.path.join(spirv_dir, "ps_flat.spv"), raw], env=env)
             if rc == UNSUPPORTED:
                 results.append((name, None, unsupported_skip(msg)))
             elif rc != 0:

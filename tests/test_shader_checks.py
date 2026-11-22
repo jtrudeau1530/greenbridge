@@ -298,6 +298,31 @@ class MeshWorkgroupChecks(unittest.TestCase):
         pixels[6], pixels[2] = pixels[2], pixels[6]
         self.assertIn("2/24 mismatches; first (0,1,0)", check.check_mesh_v5(b"".join(pixels)))
         self.assertIn("384 bytes", check.check_mesh_v5(b"".join(pixels[:-1])))
+
+    def test_a_previous_groups_file_cannot_pass_the_mesh_check(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            spirv = Path(tmp)
+            (spirv / "ms_v5_workgroup.spv").touch()
+            (spirv / "fs_passthru.spv").touch()
+            raw = spirv / "groups.raw"
+            raw.write_bytes(b"".join(struct.pack("<4f", 32 * g, 32 * g + 1, 32 * g + 31, 1)
+                                     for g in range(24)))
+            with patch.object(check, "run", return_value=(0, "")):
+                self.assertIn("missing readback: groups.raw", check.mesh_v5_test(tmp, spirv, raw))
+            self.assertFalse(raw.exists())
+
+    def test_readback_cleanup_failure_does_not_start_the_harness(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            raw = Path(tmp) / "groups.raw"
+            raw.mkdir()
+            with patch.object(check, "run") as launch:
+                status, message = check.run_readback(raw, launch, "unused")
+                launch.assert_not_called()
+            self.assertEqual(status, 1)
+            self.assertIn("could not remove the previous readback", message)
+            self.assertTrue(raw.is_dir())
+
+
 class PixelDeviceLimits(unittest.TestCase):
     """pixel_test with a fake harness: the device's limits decide SKIP instead of a failure."""
 
