@@ -1206,9 +1206,59 @@ const char* heap_desc_refusal(const D3D12_HEAP_DESC& desc) {
 // measured on an RX 9070 XT, an integrated Radeon and WARP, which agree on all of them. Cross-adapter resources
 // (valid there only as a row-major texture on a SHARED | SHARED_CROSS_ADAPTER heap) are refused: this layer has no
 // cross-adapter sharing.
+// The initial state a committed, placed or reserved resource may start in, as the host runtime answers it
+// (d3d12_vulkan_device_test's compare_placed_reserved and its "committed: ... state" cases, RTX 3060 / 610.88).
+// A buffer takes any bits, unknown ones too, except RAYTRACING_ACCELERATION_STRUCTURE without UAV access, or at all
+// on a device without acceleration structures (the host refuses it where OPTIONS5 reports no ray tracing: an
+// integrated Radeon, measured by @aguedou-34 on #2462; here, a device with neither the KHR acceleration structures
+// nor the XDXR builds). A texture
+// takes exactly GENERIC_READ, or one write state alone (RENDER_TARGET, UNORDERED_ACCESS and DEPTH_WRITE need the
+// matching resource flag), or any mix of read states (DEPTH_READ needs ALLOW_DEPTH_STENCIL; the shader-resource
+// states are refused with DENY_SHADER_RESOURCE). The buffer-only bits (vertex/constant, index, indirect, stream
+// output, acceleration structure) and undefined bits are refused on a texture, also inside a mix.
+const char* initial_state_refusal(bool buffer, UINT flags, D3D12_RESOURCE_STATES state,
+                                  bool acceleration_structures) {
+    const UINT s = UINT(state);
+    if (buffer) {
+        if ((s & D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE) && !acceleration_structures)
+            return "acceleration-structure state on a device without acceleration structures";
+        if ((s & D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE) &&
+            !(flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))
+            return "acceleration-structure state on a buffer without UAV access";
+        return nullptr;
+    }
+    if (s == D3D12_RESOURCE_STATE_GENERIC_READ) return nullptr;
+    constexpr UINT writes = D3D12_RESOURCE_STATE_RENDER_TARGET | D3D12_RESOURCE_STATE_UNORDERED_ACCESS |
+                            D3D12_RESOURCE_STATE_DEPTH_WRITE | D3D12_RESOURCE_STATE_COPY_DEST |
+                            D3D12_RESOURCE_STATE_RESOLVE_DEST | D3D12_RESOURCE_STATE_VIDEO_DECODE_WRITE |
+                            D3D12_RESOURCE_STATE_VIDEO_PROCESS_WRITE | D3D12_RESOURCE_STATE_VIDEO_ENCODE_WRITE;
+    constexpr UINT shader_reads =
+        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    constexpr UINT reads = D3D12_RESOURCE_STATE_DEPTH_READ | shader_reads | D3D12_RESOURCE_STATE_COPY_SOURCE |
+                           D3D12_RESOURCE_STATE_RESOLVE_SOURCE | D3D12_RESOURCE_STATE_SHADING_RATE_SOURCE |
+                           D3D12_RESOURCE_STATE_VIDEO_DECODE_READ | D3D12_RESOURCE_STATE_VIDEO_PROCESS_READ |
+                           D3D12_RESOURCE_STATE_VIDEO_ENCODE_READ;
+    if (s & ~(writes | reads)) return "initial state of a texture (buffer-only or undefined bits)";
+    if (s & writes) {
+        if (s & (s - 1)) return "initial state of a texture (a write state with another state)";
+        if (s == D3D12_RESOURCE_STATE_RENDER_TARGET && !(flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET))
+            return "RENDER_TARGET state without ALLOW_RENDER_TARGET";
+        if (s == D3D12_RESOURCE_STATE_UNORDERED_ACCESS && !(flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))
+            return "UNORDERED_ACCESS state without ALLOW_UNORDERED_ACCESS";
+        if (s == D3D12_RESOURCE_STATE_DEPTH_WRITE && !(flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL))
+            return "DEPTH_WRITE state without ALLOW_DEPTH_STENCIL";
+        return nullptr;
+    }
+    if ((s & D3D12_RESOURCE_STATE_DEPTH_READ) && !(flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL))
+        return "DEPTH_READ state without ALLOW_DEPTH_STENCIL";
+    if ((s & shader_reads) && (flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE))
+        return "shader-resource state with DENY_SHADER_RESOURCE";
+    return nullptr;
+}
+
 const char* committed_resource_refusal(const D3D12_HEAP_PROPERTIES& heap, D3D12_HEAP_FLAGS heap_flags,
                                        const D3D12_RESOURCE_DESC& desc, D3D12_RESOURCE_STATES state,
-                                       const D3D12_CLEAR_VALUE* clear) {
+                                       const D3D12_CLEAR_VALUE* clear, bool acceleration_structures) {
     if (const char* why = heap_properties_refusal(heap)) return why;
     // The DENY flags of a committed resource's heap are the runtime's to choose; most other bits are refused too.
     constexpr UINT committed_heap_flags = D3D12_HEAP_FLAG_SHARED | D3D12_HEAP_FLAG_ALLOW_DISPLAY |
@@ -1234,6 +1284,8 @@ const char* committed_resource_refusal(const D3D12_HEAP_PROPERTIES& heap, D3D12_
         return "upload heap state or UAV";
     if (heap.Type == D3D12_HEAP_TYPE_READBACK && (uav || (UINT(state) & ~UINT(D3D12_RESOURCE_STATE_COPY_DEST))))
         return "readback heap state or UAV";
+
+    if (const char* why = initial_state_refusal(buffer, flags, state, acceleration_structures)) return why;
 
     if (buffer) {
         if (!desc.Width || desc.Height != 1 || desc.DepthOrArraySize != 1 || desc.MipLevels != 1 ||
@@ -4124,6 +4176,10 @@ public:
 
     bool ok() const { return state_.context && state_.context->loaded(); }
     const VulkanDeviceInfo& info() const { return state_.info; }
+    // Acceleration-structure resources work: KHR builds, or the XDXR records (which need the GPU address arena).
+    bool acceleration_structures() const {
+        return state_.info.ray_tracing || (state_.info.xdxr_acceleration_structures && state_.info.buffer_device_address);
+    }
     bool upload_in_vram() const { return state_.upload_in_vram; }
     leonida::VulkanContext& context() { return *state_.context; }
     const leonida::BindlessSet* bindless() const { return state_.bindless.get(); }
@@ -5264,7 +5320,8 @@ public:
         if (!heap || !desc) return d3d12_trace::result(method, E_INVALIDARG);
         // The host runtime's argument checks (D3D-49). A refusal is logged once per reason and dimension, since a
         // game that trips one (for example with an Xbox-only flag through slot 76) gets no resource.
-        if (const char* why = committed_resource_refusal(*heap, heap_flags, *desc, state, clear)) {
+        if (const char* why = committed_resource_refusal(*heap, heap_flags, *desc, state, clear,
+                                                         acceleration_structures())) {
             log_once((std::string("CreateCommittedResource refused (") + why + "), dimension").c_str(),
                      desc->Dimension);
             return d3d12_trace::result(method, E_INVALIDARG);
@@ -5291,32 +5348,35 @@ public:
     // (64KB_STANDARD_SWIZZLE needs StandardSwizzle64KBSupported, which CheckFeatureSupport reports as FALSE). The
     // Xbox tiled layout word 0x101 (slot 76, section 4.2) is accepted as 64KB_UNDEFINED_SWIZZLE; that the console
     // uses it for reserved resources too is an assumption.
-    HRESULT STDMETHODCALLTYPE CreateReservedResource(const D3D12_RESOURCE_DESC* desc, D3D12_RESOURCE_STATES,
-                                                     const D3D12_CLEAR_VALUE*, REFIID riid, void** out) override {
+    HRESULT STDMETHODCALLTYPE CreateReservedResource(const D3D12_RESOURCE_DESC* desc, D3D12_RESOURCE_STATES state,
+                                                     const D3D12_CLEAR_VALUE* clear, REFIID riid,
+                                                     void** out) override {
         constexpr auto method = "ID3D12Device::CreateReservedResource";
-        return d3d12_trace::result(method, create_reserved(desc, riid, out));
+        return d3d12_trace::result(method, create_reserved(desc, state, clear, riid, out));
     }
 
     // Device4. Protected sessions are not supported.
-    HRESULT STDMETHODCALLTYPE CreateReservedResource1(const D3D12_RESOURCE_DESC* desc, D3D12_RESOURCE_STATES,
-                                                      const D3D12_CLEAR_VALUE*, ID3D12ProtectedResourceSession* session,
-                                                      REFIID riid, void** out) override {
+    HRESULT STDMETHODCALLTYPE CreateReservedResource1(const D3D12_RESOURCE_DESC* desc, D3D12_RESOURCE_STATES state,
+                                                      const D3D12_CLEAR_VALUE* clear,
+                                                      ID3D12ProtectedResourceSession* session, REFIID riid,
+                                                      void** out) override {
         if (session) {
             if (out) *out = nullptr;
             log_once("CreateReservedResource1 with a protected session not supported:", 1);
             return E_NOTIMPL;
         }
-        return create_reserved(desc, riid, out);
+        return create_reserved(desc, state, clear, riid, out);
     }
 
     // Device10: an initial layout instead of a state (resources start in their first use's layout here anyway).
     // Castable formats are not used: typeless resources are already mutable-format images.
     HRESULT STDMETHODCALLTYPE CreateReservedResource2(const D3D12_RESOURCE_DESC* desc, D3D12_BARRIER_LAYOUT,
-                                                      const D3D12_CLEAR_VALUE*, ID3D12ProtectedResourceSession* session,
+                                                      const D3D12_CLEAR_VALUE* clear,
+                                                      ID3D12ProtectedResourceSession* session,
                                                       UINT32 castable_formats, const DXGI_FORMAT*, REFIID riid,
                                                       void** out) override {
         if (castable_formats) log_once("CreateReservedResource2: castable formats ignored, count", int(castable_formats));
-        return CreateReservedResource1(desc, D3D12_RESOURCE_STATE_COMMON, nullptr, session, riid, out);
+        return CreateReservedResource1(desc, D3D12_RESOURCE_STATE_COMMON, clear, session, riid, out);
     }
 
     // Tiling of a reserved resource or a tiled (64KB_UNDEFINED_SWIZZLE) texture (src/resource_tiling.h). Anything
@@ -5438,21 +5498,21 @@ public:
     }
 
     HRESULT STDMETHODCALLTYPE CreatePlacedResource(ID3D12Heap* heap_interface, UINT64 heap_offset,
-                                                   const D3D12_RESOURCE_DESC* desc, D3D12_RESOURCE_STATES,
-                                                   const D3D12_CLEAR_VALUE*, REFIID riid, void** out) override {
-        return create_placed(heap_interface, heap_offset, desc, 0, nullptr, riid, out);
+                                                   const D3D12_RESOURCE_DESC* desc, D3D12_RESOURCE_STATES state,
+                                                   const D3D12_CLEAR_VALUE* clear, REFIID riid, void** out) override {
+        return create_placed(heap_interface, heap_offset, desc, state, clear, 0, nullptr, riid, out);
     }
 
     // Device8: the DESC1 placed variant without a castable list. A texture with a mip region gets the failure
     // answer, as on the PC runtime; a buffer's mip region is ignored.
     HRESULT STDMETHODCALLTYPE CreatePlacedResource1(ID3D12Heap* heap_interface, UINT64 heap_offset,
-                                                    const D3D12_RESOURCE_DESC1* desc, D3D12_RESOURCE_STATES,
-                                                    const D3D12_CLEAR_VALUE*, REFIID riid, void** out) override {
+                                                    const D3D12_RESOURCE_DESC1* desc, D3D12_RESOURCE_STATES state,
+                                                    const D3D12_CLEAR_VALUE* clear, REFIID riid, void** out) override {
         if (out) *out = nullptr;
         if (!desc) return E_INVALIDARG;
         if (texture_mip_region(*desc)) return E_INVALIDARG;
         const D3D12_RESOURCE_DESC base = resource_desc(*desc);
-        return create_placed(heap_interface, heap_offset, &base, 0, nullptr, riid, out);
+        return create_placed(heap_interface, heap_offset, &base, state, clear, 0, nullptr, riid, out);
     }
 
     // Device10: an initial layout instead of a state, and the castable-format list, which the placed texture's
@@ -5460,7 +5520,7 @@ public:
     // PC runtime); the layer reports RelaxedFormatCastingSupported, so a real list is passed through.
     HRESULT STDMETHODCALLTYPE CreatePlacedResource2(ID3D12Heap* heap_interface, UINT64 heap_offset,
                                                     const D3D12_RESOURCE_DESC1* desc, D3D12_BARRIER_LAYOUT layout,
-                                                    const D3D12_CLEAR_VALUE*, UINT32 castable_count,
+                                                    const D3D12_CLEAR_VALUE* clear, UINT32 castable_count,
                                                     const DXGI_FORMAT* castable, REFIID riid, void** out) override {
         if (out) *out = nullptr;
         if (!desc) return E_INVALIDARG;
@@ -5469,14 +5529,22 @@ public:
         if (desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER && layout != D3D12_BARRIER_LAYOUT_UNDEFINED)
             return E_INVALIDARG;
         const D3D12_RESOURCE_DESC base = resource_desc(*desc);
-        return create_placed(heap_interface, heap_offset, &base, castable_count, castable, riid, out);
+        // An initial layout replaces the state, so the state rules are not this call's.
+        return create_placed(heap_interface, heap_offset, &base, D3D12_RESOURCE_STATE_COMMON, clear, castable_count,
+                             castable, riid, out);
     }
 
     // The placed path every CreatePlacedResource variant shares. A castable-format list reaches the placed
     // texture's Vulkan image as the committed path's does (create_committed): a buffer with a list is
     // E_INVALIDARG, and so is a format with no Vulkan mapping.
+    // The arguments are answered as the host runtime answers them (d3d12_vulkan_device_test's
+    // compare_placed_reserved, RTX 3060 / 610.88): the description, initial state and clear value rules
+    // CreateCommittedResource has, then the placement: a buffer at a 64 KiB-aligned offset, a texture at a
+    // multiple of its GetResourceAllocationInfo alignment (4 KiB for a small texture), in a heap aligned at least
+    // as much, and the whole resource inside the heap. Only then is a null output E_UNEXPECTED, with nothing made.
     HRESULT create_placed(ID3D12Heap* heap_interface, UINT64 heap_offset, const D3D12_RESOURCE_DESC* desc,
-                          UINT32 castable_count, const DXGI_FORMAT* castable, REFIID riid, void** out) {
+                          D3D12_RESOURCE_STATES state, const D3D12_CLEAR_VALUE* clear, UINT32 castable_count,
+                          const DXGI_FORMAT* castable, REFIID riid, void** out) {
         if (out) *out = nullptr;
         auto* heap = Heap::from<Heap>(heap_interface);
         if (!heap || !desc) return E_INVALIDARG;
@@ -5484,15 +5552,29 @@ public:
             log_once("castable formats on a placed buffer are invalid; count", int(castable_count));
             return E_INVALIDARG;
         }
-        if (heap_offset % D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT) {
-            log_once("placed resource offset not 64 KiB aligned:", int(heap_offset));
+        // The description, state and clear value rules of a committed resource, but on a default heap: the heap's
+        // DENY flags are checked against the resource below, and the host takes any initial state for a buffer in
+        // an upload or readback heap (COPY_DEST in an upload heap, GENERIC_READ in a readback heap), where a
+        // committed buffer must start in GENERIC_READ or COPY_DEST. UAV access is refused there all the same.
+        const D3D12_HEAP_PROPERTIES default_heap{D3D12_HEAP_TYPE_DEFAULT};
+        const char* why = committed_resource_refusal(default_heap, D3D12_HEAP_FLAG_NONE, *desc, state, clear,
+                                                     acceleration_structures());
+        const D3D12_HEAP_TYPE heap_type = heap->properties().Type;
+        if (!why && (heap_type == D3D12_HEAP_TYPE_UPLOAD || heap_type == D3D12_HEAP_TYPE_READBACK) &&
+            (desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))
+            why = "UAV access in an upload or readback heap";
+        if (why) {
+            log_once((std::string("CreatePlacedResource refused (") + why + "), dimension").c_str(),
+                     desc->Dimension);
             return E_INVALIDARG;
         }
         const bool tiled = is_tiled_layout(desc->Layout);
-        const bool msaa = desc->SampleDesc.Count > 1;
         if (desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
             if (heap->flags() & D3D12_HEAP_FLAG_DENY_BUFFERS) return E_INVALIDARG;
-            if (desc->Layout != D3D12_TEXTURE_LAYOUT_ROW_MAJOR) return E_INVALIDARG;
+            if (heap_offset % D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT) {
+                log_once("placed buffer offset not 64 KiB aligned:", int(heap_offset));
+                return E_INVALIDARG;
+            }
             if (desc->Width > heap->bytes() || heap_offset > heap->bytes() - desc->Width) return E_INVALIDARG;
         } else {
             if (heap->properties().Type == D3D12_HEAP_TYPE_UPLOAD ||
@@ -5502,25 +5584,30 @@ public:
                                               D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)) != 0;
             if (rt_ds && (heap->flags() & D3D12_HEAP_FLAG_DENY_RT_DS_TEXTURES)) return E_INVALIDARG;
             if (!rt_ds && (heap->flags() & D3D12_HEAP_FLAG_DENY_NON_RT_DS_TEXTURES)) return E_INVALIDARG;
-            if (tiled || msaa) {
-                if (tiled && desc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
-                    desc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE3D)
-                    return E_INVALIDARG;
-                if (msaa && desc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D) return E_INVALIDARG;
-                const D3D12_RESOURCE_ALLOCATION_INFO alloc = allocation(*desc);
-                if (alloc.SizeInBytes == UINT64_MAX || heap->alignment() < alloc.Alignment ||
-                    heap_offset % alloc.Alignment || alloc.SizeInBytes > heap->bytes() ||
-                    heap_offset > heap->bytes() - alloc.SizeInBytes)
-                    return E_INVALIDARG;
-                if (tiled && static_cast<UINT>(desc->Layout) == kXboxTiledLayout) {
-                    log_once("placed resource with the Xbox tiled layout, as 64KB_UNDEFINED_SWIZZLE; dimension",
-                             int(desc->Dimension));
-                }
-            } else if (heap_offset >= heap->bytes()) {
+            if (tiled && desc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+                desc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE3D)
+                return E_INVALIDARG;
+            if (desc->SampleDesc.Count > 1 && desc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D)
+                return E_INVALIDARG;
+            // Extents, mips, samples, layout and alignment, as GetResourceAllocationInfo answers them (the sample
+            // quality is the description rules' above, as in CreateCommittedResource).
+            D3D12_RESOURCE_DESC checked = *desc;
+            checked.SampleDesc.Quality = 0;
+            const D3D12_RESOURCE_ALLOCATION_INFO alloc = allocation(checked);
+            if (alloc.SizeInBytes == UINT64_MAX || heap->alignment() < alloc.Alignment ||
+                heap_offset % alloc.Alignment || alloc.SizeInBytes > heap->bytes() ||
+                heap_offset > heap->bytes() - alloc.SizeInBytes) {
+                log_once("placed texture refused (size, alignment or room in the heap), dimension",
+                         int(desc->Dimension));
                 return E_INVALIDARG;
             }
+            if (tiled && static_cast<UINT>(desc->Layout) == kXboxTiledLayout) {
+                log_once("placed resource with the Xbox tiled layout, as 64KB_UNDEFINED_SWIZZLE; dimension",
+                         int(desc->Dimension));
+            }
         }
-        if (desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER && !heap->use_as_placed_buffer(out != nullptr)) {
+        if (!out) return E_UNEXPECTED;
+        if (desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER && !heap->use_as_placed_buffer(true)) {
             log_once("placed buffer refused: heap uses a separate allocation for sparse tiles", 1);
             return E_NOTIMPL;
         }
@@ -5547,10 +5634,6 @@ public:
         if (FAILED(hr)) {
             resource->Release();
             return hr;
-        }
-        if (!out) {
-            resource->Release();
-            return S_FALSE;
         }
         return hand_out(resource, riid, out);
     }
@@ -6608,10 +6691,16 @@ private:
     }
 
     // D3D12's layout rules for reserved resources. Buffers use sparse storage when supported.
-    HRESULT create_reserved(const D3D12_RESOURCE_DESC* desc, REFIID riid, void** out) {
+    // The arguments are answered as the host runtime answers them (d3d12_vulkan_device_test's
+    // compare_placed_reserved, RTX 3060 / 610.88): the description, initial state and clear value rules of a
+    // committed resource on a default heap, the reserved layouts below, and only then E_UNEXPECTED for a null
+    // output, with nothing made.
+    HRESULT create_reserved(const D3D12_RESOURCE_DESC* desc, D3D12_RESOURCE_STATES state,
+                            const D3D12_CLEAR_VALUE* clear, REFIID riid, void** out) {
         if (out) *out = nullptr;
         if (!desc) return E_INVALIDARG;
         D3D12_RESOURCE_DESC backing = *desc;
+        const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
         if (desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
             if (desc->Layout != D3D12_TEXTURE_LAYOUT_ROW_MAJOR) return E_INVALIDARG;
         } else {
@@ -6630,7 +6719,19 @@ private:
             }
             backing.MipLevels = desc->MipLevels;
         }
-        const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
+        if (const char* why = committed_resource_refusal(heap, D3D12_HEAP_FLAG_NONE, backing, state, clear,
+                                                         acceleration_structures())) {
+            log_once((std::string("CreateReservedResource refused (") + why + "), dimension").c_str(),
+                     desc->Dimension);
+            return E_INVALIDARG;
+        }
+        if (desc->Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) {
+            // Extents, mips and samples, as the committed backing below checks them (GetResourceAllocationInfo).
+            D3D12_RESOURCE_DESC checked = backing;
+            checked.SampleDesc.Quality = 0;
+            if (allocation(checked).SizeInBytes == UINT64_MAX) return E_INVALIDARG;
+        }
+        if (!out) return E_UNEXPECTED;
         ID3D12Resource* resource = nullptr;
         HRESULT hr;
         if (desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER && state_.sparse_buffer_memory_types) {
@@ -6648,10 +6749,6 @@ private:
         }
         if (FAILED(hr)) return hr;
         Resource::from<Resource>(resource)->make_reserved(desc->Layout);
-        if (!out) {  // a capability check: D3D12 allows a null output
-            resource->Release();
-            return S_FALSE;
-        }
         hr = resource->QueryInterface(riid, out);
         resource->Release();
         return hr;

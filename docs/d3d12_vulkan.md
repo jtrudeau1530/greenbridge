@@ -1670,7 +1670,14 @@ The trace will enumerate them.
   `HARDWARE_PROTECTED`, `CREATE_NOT_RESIDENT` and `CREATE_NOT_ZEROED`; a buffer refuses `ALLOW_SIMULTANEOUS_ACCESS`;
   MSAA takes quality 0 or one of the two standard patterns; a buffer may be `ALLOW_RENDER_TARGET` but not
   `ALLOW_DEPTH_STENCIL`, and is aligned 0 or 64 KiB only; upload heaps start in any part of `GENERIC_READ` (or
-  `COMMON`), readback heaps in `COPY_DEST` or `COMMON`, neither with UAVs; `ALLOW_DEPTH_STENCIL` is accepted for every
+  `COMMON`), readback heaps in `COPY_DEST` or `COMMON`, neither with UAVs; a texture starts in exactly
+  `GENERIC_READ`, in one write state alone (`RENDER_TARGET`, `UNORDERED_ACCESS` and `DEPTH_WRITE` only with the
+  matching resource flag, `COPY_DEST`, `RESOLVE_DEST`) or in a mix of read states (`DEPTH_READ` only with
+  `ALLOW_DEPTH_STENCIL`, the shader-resource states not with `DENY_SHADER_RESOURCE`), never with a buffer-only or
+  undefined state bit, while a buffer takes any bits except `RAYTRACING_ACCELERATION_STRUCTURE` without UAV access
+  (RTX 3060 / 610.88; the same rule applies to placed and reserved resources), or at all where the host reports no
+  ray tracing (an integrated Radeon without DXR, @aguedou-34 on #2462): the layer refuses it on a device with
+  neither KHR acceleration structures nor the XDXR builds; `ALLOW_DEPTH_STENCIL` is accepted for every
   format of the R32, R16, R24G8 and R32G8X24 families and nothing else; a clear value needs a render target or depth
   buffer and a format of the resource's family; descriptor heaps may have zero descriptors; non-monitored fences are
   refused; a null output is `S_FALSE` (a capability check) except for `CreateCommandQueue`, which answers
@@ -1692,6 +1699,12 @@ The trace will enumerate them.
   the range at `heap_va + offset`; a buffer uses that range in the arena, an image uses the offset as a key and
   binds its own memory. Vulkan image alignment can exceed D3D12's 64 KiB; because images do not share the arena,
   this mostly affects true aliasing, which is **Open** until tested on the target GPU.
+  Its arguments are answered as the host runtime answers them (`compare_placed_reserved` in
+  `d3d12_vulkan_device_test`, RTX 3060 / 610.88): the description, initial-state and clear-value rules of a committed
+  resource (but any initial state for a buffer in an upload or readback heap, and no UAVs there); a buffer at a
+  64 KiB-aligned offset; a texture at a multiple of its `GetResourceAllocationInfo` alignment (4 KiB for a small
+  texture), in a heap aligned at least as much, and whole inside the heap; the heap's `DENY` flags against the
+  resource; then a null output is `E_UNEXPECTED` and nothing is made.
 - `CreateReservedResource` **implemented** (`d3d12_vulkan_device.cpp`, `src/resource_tiling.h`, checked by
   `d3d12_vulkan_device_test` and `resource_tiling_test`):
   - `CreateReservedResource`, `CreateReservedResource1` (no protected sessions) and `CreateReservedResource2`
@@ -1701,6 +1714,8 @@ The trace will enumerate them.
     runtime: buffers are `ROW_MAJOR`, textures `64KB_UNDEFINED_SWIZZLE` (anything else, or a format without a tile
     shape, is `E_INVALIDARG`; `64KB_STANDARD_SWIZZLE` too, since `CheckFeatureSupport` reports
     `StandardSwizzle64KBSupported` as FALSE), and `GetHeapProperties` on a reserved resource is `E_INVALIDARG`.
+    The description, initial-state and clear-value rules are a committed resource's on a default heap, and a null
+    output is `E_UNEXPECTED` after them (`compare_placed_reserved`, RTX 3060 / 610.88).
     `CheckFeatureSupport` still reports `TiledResourcesTier` as not supported, so a game that checks it creates
     committed resources instead. Buffer mappings alone do not implement a full tiled-resources tier.
     The Xbox tiled layout word `0x101` is accepted as `64KB_UNDEFINED_SWIZZLE` (**Assumption**:
