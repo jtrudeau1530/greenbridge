@@ -1104,5 +1104,70 @@ class TestBufferAtomicUmaxConditionCodes(unittest.TestCase):
         self.assertEqual(self.interp.vcc, canary)
 
 
+class TestBufferAtomicUmaxBoundaryExtremes(unittest.TestCase):
+    """Unit tests for boundary extremes, address wrapping, and OOB conditions."""
+
+    def setUp(self) -> None:
+        self.mem = BufferMemory(4096)
+
+    def test_last_valid_dword_boundary(self) -> None:
+        desc = BufferResourceDescriptor(base_address=0, stride=0, num_records=100)
+        # Last valid 4-byte dword starts at offset 96 (96 + 4 = 100)
+        self.mem.write_u32(96, 42)
+        ret, in_bounds = ref_buffer_atomic_umax(self.mem, desc, soffset=0, vaddr=96, comp_val=50, glc=True)
+        self.assertTrue(in_bounds)
+        self.assertEqual(ret, 42)
+        self.assertEqual(self.mem.read_u32(96), 50)
+
+        # Offsets 97, 98, 99 all exceed num_records (97 + 4 = 101 > 100)
+        for oob_off in (97, 98, 99, 100):
+            ret, in_bounds = ref_buffer_atomic_umax(self.mem, desc, soffset=0, vaddr=oob_off, comp_val=100, glc=True)
+            self.assertFalse(in_bounds)
+            self.assertEqual(ret, 0)
+
+    def test_zero_capacity_buffer(self) -> None:
+        desc = BufferResourceDescriptor(base_address=0, stride=0, num_records=0)
+        ret, in_bounds = ref_buffer_atomic_umax(self.mem, desc, soffset=0, vaddr=0, comp_val=1, glc=True)
+        self.assertFalse(in_bounds)
+        self.assertEqual(ret, 0)
+
+    def test_unsigned_integer_extremes(self) -> None:
+        desc = BufferResourceDescriptor(base_address=0, stride=0, num_records=256)
+        # 0x7FFFFFFF vs 0x80000000:
+        # In signed comparison, 0x80000000 (-2147483648) < 0x7FFFFFFF (+2147483647).
+        # In unsigned comparison, 0x80000000 (2147483648) > 0x7FFFFFFF (2147483647).
+        self.mem.write_u32(0, 0x7FFFFFFF)
+        ret, in_bounds = ref_buffer_atomic_umax(self.mem, desc, soffset=0, vaddr=0, comp_val=0x80000000, glc=True)
+        self.assertTrue(in_bounds)
+        self.assertEqual(ret, 0x7FFFFFFF)
+        self.assertEqual(self.mem.read_u32(0), 0x80000000)
+
+        # 0xFFFFFFFF (max unsigned 32-bit) vs 0xFFFFFFFE
+        self.mem.write_u32(4, 0xFFFFFFFE)
+        ret, in_bounds = ref_buffer_atomic_umax(self.mem, desc, soffset=0, vaddr=4, comp_val=0xFFFFFFFF, glc=True)
+        self.assertTrue(in_bounds)
+        self.assertEqual(ret, 0xFFFFFFFE)
+        self.assertEqual(self.mem.read_u32(4), 0xFFFFFFFF)
+
+    def test_float_and_nan_bit_patterns_preserve_raw_unsigned_comparison(self) -> None:
+        # Buffer atomic umax treats all bits as raw unsigned integers, ignoring IEEE 754 semantics
+        desc = BufferResourceDescriptor(base_address=0, stride=0, num_records=256)
+        # Float -inf (0xFF800000) has unsigned int value 4286578688, > float qNaN (0x7FC00000: 2143289344)
+        qnan_bits = 0x7FC00000
+        neg_inf_bits = 0xFF800000
+        self.mem.write_u32(8, qnan_bits)
+        ret, in_bounds = ref_buffer_atomic_umax(self.mem, desc, soffset=0, vaddr=8, comp_val=neg_inf_bits, glc=True)
+        self.assertTrue(in_bounds)
+        self.assertEqual(ret, qnan_bits)
+        self.assertEqual(self.mem.read_u32(8), neg_inf_bits)
+
+        # Float -0.0 (0x80000000) > +0.0 (0x00000000) as unsigned int (2147483648 > 0)
+        self.mem.write_u32(12, 0)
+        ret, in_bounds = ref_buffer_atomic_umax(self.mem, desc, soffset=0, vaddr=12, comp_val=0x80000000, glc=True)
+        self.assertTrue(in_bounds)
+        self.assertEqual(ret, 0)
+        self.assertEqual(self.mem.read_u32(12), 0x80000000)
+
+
 if __name__ == "__main__":
     unittest.main()
