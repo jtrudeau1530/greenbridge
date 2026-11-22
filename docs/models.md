@@ -24,9 +24,6 @@ over `917e9b9`'s 350,251) with **0 decode failures**; the `levels.rpf` fragment,
 triangle cells are not independently reproduced (see the table note), and the earlier
 `917e9b9`, `c3708fb`, and `48557ea` measurements are kept below as controls. This page records the
 measured state; it is not a competing patch.
-decoding (PR #7). The 350,251-model counts below were measured at `917e9b9` and are kept as the
-control; the `e293917` re-count for the non-`levels.rpf` archives is in the table below. This page
-records both, and is not a competing patch.
 
 PR #1 reports 190,792 of 190,792 recognized candidates across the ten archives configured in
 Leonida, including 169 previously rejected candidates (also verified after archive readback). A
