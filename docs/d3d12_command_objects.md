@@ -274,8 +274,13 @@ The `+0x490` call is after the `Dispatch(1,1,1)` at `0x1d9cb`, in the per-descri
 call: one `D3D12_BARRIER_GROUP` of type `D3D12_BARRIER_TYPE_GLOBAL` (0) holding one `D3D12_GLOBAL_BARRIER` with
 `SyncBefore = SyncAfter = D3D12_BARRIER_SYNC_COMPUTE_SHADING` (`0x80`) and
 `AccessBefore = AccessAfter = D3D12_BARRIER_ACCESS_UNORDERED_ACCESS` (`0x10`), values as in SDK 10.0.26100
-`d3d12.h`. On the PC that method is GCL7 slot 80; on the console list it is slot 146. A second call site with the
-same constant is `0xd7b4` (section 3.3a).
+`d3d12.h`. The public PC equivalent is GCL7 slot 80.
+
+@MoonYueya's static enumeration of the Xbox Series 1.0.2.1 builder found 29 calls through console slot 146
+across seven functions. It counted 11 direct calls through the vtable entry and 18 calls through a register
+loaded from that entry. All 29 passed one global barrier group containing one `D3D12_GLOBAL_BARRIER` with
+the same compute-shading and unordered-access arguments described above. The counts cover the two
+enumerated dispatch forms in the builder's `.text`. [Static corroboration and coverage details](https://github.com/ItsNotRexed/Leonida/issues/1626)
 
 The same two inner functions (`0x1d540` and `0x1d7c0`) contain the `+0x70`, `+0xc8`, `+0x108`,
 `+0x138`, `+0x168` and `+0x490` calls; the outer batched function contains the `+0xd0` barrier.
@@ -286,8 +291,9 @@ signatures still require GCL4/GCL8 objects, but those bodies do not measure comm
 
 ### 3.3a Other builder call sites past the PC order
 
-The rest of `.text` has further calls through the list pointer. Each name below rests on the call shape; "inline"
-means the call is the fallback of an inline write of the same values.
+The rest of `.text` has further calls through the list pointer. The table shows examples, including one of the
+slot-146 sites counted in section 3.3. Each name rests on the call shape. “Inline” means the call is the fallback
+of an inline write of the same values.
 
 | RVA | Vtable offset | Console slot → PC method | Observed arguments | Confidence |
 |---:|---:|---|---|---|
