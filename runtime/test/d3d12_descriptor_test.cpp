@@ -672,12 +672,19 @@ int main() {
         EXPECT(sample_through_set(d, set0, set0_layout, {&gone, 1}, after_destruction.data()));
 #endif
 
-        // D3D-61, B4G4R4A4_UNORM: four bits a channel, B in bits 0-3, G 4-7, R 8-11, A 12-15. Each texel has a
-        // different value in every channel, so a swapped pair shows. Its footprint has two-byte texels; the view
-        // samples as RGBA8 with each nibble n read as n * 17.
-        {
+        struct PackedFormat {
+            DXGI_FORMAT dxgi;
+            VkFormat vk;
+            const char* name;
+        };
+        constexpr PackedFormat packed_formats[] = {
+            {DXGI_FORMAT_B4G4R4A4_UNORM, VK_FORMAT_A4R4G4B4_UNORM_PACK16, "B4G4R4A4"},
+            {DXGI_FORMAT_B5G5R5A1_UNORM, VK_FORMAT_A1R5G5B5_UNORM_PACK16, "B5G5R5A1"}
+        };
+        UINT64 packed_signal = 2;
+        for (const auto& format : packed_formats) {
             D3D12_RESOURCE_DESC packed_desc = texture_desc;
-            packed_desc.Format = DXGI_FORMAT_B4G4R4A4_UNORM;
+            packed_desc.Format = format.dxgi;
             Ref<ID3D12Resource> packed;
             EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &packed_desc,
                                                              D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
@@ -685,15 +692,26 @@ int main() {
             D3D12_PLACED_SUBRESOURCE_FOOTPRINT packed_placed{};
             UINT64 row_size = 0;
             device->GetCopyableFootprints(&packed_desc, 0, 1, 49152, &packed_placed, nullptr, &row_size, nullptr);
-            EXPECT(packed_placed.Footprint.Format == DXGI_FORMAT_B4G4R4A4_UNORM && row_size == size * 2 &&
+            EXPECT(packed_placed.Footprint.Format == format.dxgi && row_size == size * 2 &&
                    packed_placed.Footprint.RowPitch == 256);
-            const auto nibbles = [](UINT x, UINT y) {  // R, G, B, A
-                return std::array<UINT, 4>{x, y + 8, (x + y) & 15, 15 - x};
+            constexpr std::uint16_t b5_words[] = {0xfc00, 0x7c00, 0x83e1, 0xc117};
+            constexpr std::array<std::uint8_t, 4> b5_rgba[] = {
+                {255, 0, 0, 255}, {255, 0, 0, 0}, {0, 255, 8, 255}, {132, 66, 189, 255}
             };
+            std::array<std::array<std::uint8_t, 4>, texels> expected{};
             for (UINT y = 0; y < size; ++y)
                 for (UINT x = 0; x < size; ++x) {
-                    const auto n = nibbles(x, y);
-                    const std::uint16_t word = std::uint16_t(n[2] | (n[1] << 4) | (n[0] << 8) | (n[3] << 12));
+                    auto& rgba = expected[y * size + x];
+                    std::uint16_t word;
+                    if (format.dxgi == DXGI_FORMAT_B5G5R5A1_UNORM) {
+                        const UINT i = (x + y) % std::size(b5_words);
+                        word = b5_words[i];
+                        rgba = b5_rgba[i];
+                    } else {
+                        const UINT r = x, g = y + 8, b = (x + y) & 15, a = 15 - x;
+                        word = std::uint16_t(b | (g << 4) | (r << 8) | (a << 12));
+                        rgba = {std::uint8_t(r * 17), std::uint8_t(g * 17), std::uint8_t(b * 17), std::uint8_t(a * 17)};
+                    }
                     std::memcpy(static_cast<std::uint8_t*>(mapped) + packed_placed.Offset +
                                     y * packed_placed.Footprint.RowPitch + x * 2,
                                 &word, 2);
@@ -712,12 +730,14 @@ int main() {
             EXPECT(list->Close() == S_OK);
             queue->ExecuteCommandLists(1, lists);
             EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
-            EXPECT(SUCCEEDED(queue->Signal(fence.p, 3)) && SUCCEEDED(fence->SetEventOnCompletion(3, nullptr)));
+            ++packed_signal;
+            EXPECT(SUCCEEDED(queue->Signal(fence.p, packed_signal)) &&
+                   SUCCEEDED(fence->SetEventOnCompletion(packed_signal, nullptr)));
 
             g::Image packed_image{};
             EXPECT(image_at(null_slot, packed_image));
-            EXPECT(packed_image.format == g::format_from_vulkan(VK_FORMAT_A4R4G4B4_UNORM_PACK16) &&
-                   packed_image.format != 0);
+            EXPECT(packed_image.format == g::format_from_vulkan(format.vk) && packed_image.format != 0);
+            if (format.dxgi == DXGI_FORMAT_B5G5R5A1_UNORM) EXPECT(packed_image.swizzle == g::channels_bgra);
 #ifdef LEONIDA_TEST_CS_SAMPLE_SPV
             SampleKeys packed_keys{};
             std::memcpy(packed_keys.tsharp, view_bytes(null_slot), sizeof(packed_keys.tsharp));
@@ -725,17 +745,15 @@ int main() {
             std::vector<std::uint8_t> packed_results(bytes);
             EXPECT(sample_through_set(d, set0, set0_layout, {&packed_keys, 1}, packed_results.data()));
             for (UINT i = 0; i < texels; ++i) {
-                const auto n = nibbles(i % size, i / size);
-                const std::uint8_t want[4] = {std::uint8_t(n[0] * 17), std::uint8_t(n[1] * 17),
-                                              std::uint8_t(n[2] * 17), std::uint8_t(n[3] * 17)};
-                if (std::memcmp(&packed_results[i * 4], want, 4) != 0) {
-                    std::fprintf(stderr, "B4G4R4A4 texel %u: got %02x %02x %02x %02x, want %02x %02x %02x %02x\n", i,
+                const auto& want = expected[i];
+                if (std::memcmp(&packed_results[i * 4], want.data(), 4) != 0) {
+                    std::fprintf(stderr, "%s texel %u: got %02x %02x %02x %02x, want %02x %02x %02x %02x\n", format.name, i,
                                  packed_results[i * 4], packed_results[i * 4 + 1], packed_results[i * 4 + 2],
                                  packed_results[i * 4 + 3], want[0], want[1], want[2], want[3]);
                     EXPECT(false);
-                    break;
                 }
             }
+            std::printf("%s sampled: %u texels matched\n", format.name, texels);
 #endif
         }
 

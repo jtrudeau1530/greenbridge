@@ -241,6 +241,8 @@ What is implemented (all of it testable without the game):
     3D textures with mipmapped upload, image copy and readback, and multisampled 2D textures (single-mip render
     targets or depth-stencils, in the sample counts the GPU has for the format);
   - packed `R9G9B9E5_SHAREDEXP` textures map to `VK_FORMAT_E5B9G9R9_UFLOAT_PACK32` for uploads and sampled views;
+  - the descriptor shader samples `B5G5R5A1_UNORM` through a 2D SRV. Opaque and transparent red check bit 15,
+    and mixed-channel texels check the five-bit color fields;
   - `CheckFeatureSupport` for feature levels (up to 12_1), architecture, D3D12 options, GPU virtual-address
     support, format support and multisample quality levels. Other queries are logged and refused until the trace
     shows what the game asks (question 11);
