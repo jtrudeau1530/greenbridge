@@ -149,11 +149,17 @@ def _rotation(q, conjugate):
             (2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)))
 
 
+def _scale(entity, key):
+    """Missing scales use one; an explicit zero collapses the corresponding axes."""
+    value = entity.get(key)
+    return 1.0 if value is None else value
+
+
 def world_box(entity, lo, hi, conjugate, use_scale):
     """World AABB of archetype box [lo, hi] placed by ``entity`` (T * R * S, scale XY on X/Y and Z on Z)."""
     r = _rotation(entity.get("rotation"), conjugate)
-    sxy = (entity.get("scale_xy") or 1.0) if use_scale else 1.0
-    sz = (entity.get("scale_z") or 1.0) if use_scale else 1.0
+    sxy = _scale(entity, "scale_xy") if use_scale else 1.0
+    sz = _scale(entity, "scale_z") if use_scale else 1.0
     s = (sxy, sxy, sz)
     c = [(lo[i] + hi[i]) * 0.5 * s[i] for i in range(3)]
     e = [(hi[i] - lo[i]) * 0.5 * abs(s[i]) for i in range(3)]
@@ -202,7 +208,7 @@ def check_extents(maps, defs):
             continue
         out["maps_fully_defined"] += 1
         rotated = any(e.get("rotation") and [round(c, 6) for c in e["rotation"]] != [0, 0, 0, 1] for e in ents)
-        scaled = any(abs((e.get("scale_xy") or 1.0) - 1) > 1e-4 or abs((e.get("scale_z") or 1.0) - 1) > 1e-4
+        scaled = any(abs(_scale(e, "scale_xy") - 1) > 1e-4 or abs(_scale(e, "scale_z") - 1) > 1e-4
                      for e in ents)
         if rotated:
             rot = out["rotation"]
