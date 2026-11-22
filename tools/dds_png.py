@@ -7,6 +7,8 @@ block-compressed formats (BC1, BC2, BC3, BC4, BC5, BC7).
 BC7 covers all eight modes. DXGI 97/98/99 (typeless, UNORM, UNORM_SRGB) emit
 the stored RGBA8 values with no sRGB transfer, and the reserved mode (no mode
 bit in the first byte) decodes as transparent black. BC6H is not supported.
+DX10 premultiplied alpha is converted to straight alpha for PNG; sRGB colors are
+unpremultiplied in linear light and returned in their sRGB encoding.
 
 Usage:
     python -I tools/dds_png.py <in.dds> <out.png> [--max-size N]
@@ -30,6 +32,7 @@ DDS_HEADER_SIZE = 128
 DDS_DX10_HEADER_SIZE = 148
 DDSD_PITCH = 0x8
 DDS_ALPHA_MODE_MASK = 0x7
+DDS_ALPHA_MODE_PREMULTIPLIED = 2
 DDS_ALPHA_MODE_OPAQUE = 3
 
 DDPF_ALPHAPIXELS = 0x1
@@ -51,11 +54,15 @@ _FOURCC_MAP: dict[bytes, str] = {
 }
 
 _DXGI_MAP: dict[int, str] = {
+    # Typeless byte formats use the same channel layout as their UNORM variants.
+    27: "RGBA8",
     28: "RGBA8",
     29: "RGBA8",
     87: "BGRA8",
+    90: "BGRA8",
     91: "BGRA8",
     88: "BGRX8",
+    92: "BGRX8",
     93: "BGRX8",
     70: "BC1",
     71: "BC1",
@@ -76,6 +83,12 @@ _DXGI_MAP: dict[int, str] = {
     98: "BC7",
     99: "BC7",
 }
+
+_SRGB_DXGI_FORMATS = frozenset((29, 72, 75, 78, 91, 93, 99))
+_SRGB_TO_LINEAR = tuple(
+    x / 12.92 if x <= 0.04045 else ((x + 0.055) / 1.055) ** 2.4
+    for x in (v / 255.0 for v in range(256))
+)
 
 _CANONICAL_MASKS: dict[tuple[int, int, int, int], str] = {
     (0x00FF0000, 0x0000FF00, 0x000000FF, 0xFF000000): "BGRA8",
@@ -881,8 +894,27 @@ def _decode_bc7(data: bytes | bytearray | memoryview, offset: int, width: int, h
     return bytes(out)
 
 
+def _unpremultiply_rgba(rgba: bytes, srgb: bool) -> bytes:
+    """Straight RGBA8, rounding color channels to the nearest byte and keeping alpha unchanged."""
+    out = bytearray(rgba)
+    for p in range(0, len(out), 4):
+        alpha = rgba[p + 3]
+        if alpha == 0:
+            out[p:p + 3] = b"\x00\x00\x00"
+        elif alpha < 255:
+            for c in range(p, p + 3):
+                if srgb:
+                    linear = min(1.0, _SRGB_TO_LINEAR[rgba[c]] * 255.0 / alpha)
+                    encoded = (12.92 * linear if linear <= 0.0031308
+                               else 1.055 * linear ** (1.0 / 2.4) - 0.055)
+                    out[c] = min(255, int(encoded * 255.0 + 0.5))
+                else:
+                    out[c] = min(255, (rgba[c] * 255 + alpha // 2) // alpha)
+    return bytes(out)
+
+
 def decode_dds(data: bytes) -> tuple[int, int, bytes]:
-    """Decode mip 0 of a DDS buffer into top-down row-major RGBA8 bytes."""
+    """Decode mip 0 into top-down row-major RGBA8, with straight alpha for premultiplied DX10 images."""
     info, masks = _parse_header_internal(data)
     width = int(info["width"])  # type: ignore[arg-type]
     height = int(info["height"])  # type: ignore[arg-type]
@@ -914,7 +946,10 @@ def decode_dds(data: bytes) -> tuple[int, int, bytes]:
 
     if offset == DDS_DX10_HEADER_SIZE:
         misc_flags2 = struct.unpack_from("<I", data, 144)[0]
-        if misc_flags2 & DDS_ALPHA_MODE_MASK == DDS_ALPHA_MODE_OPAQUE:
+        alpha_mode = misc_flags2 & DDS_ALPHA_MODE_MASK
+        if alpha_mode == DDS_ALPHA_MODE_PREMULTIPLIED:
+            rgba = _unpremultiply_rgba(rgba, info["dxgi_format"] in _SRGB_DXGI_FORMATS)
+        elif alpha_mode == DDS_ALPHA_MODE_OPAQUE:
             opaque = bytearray(rgba)
             opaque[3::4] = b"\xff" * (width * height)
             rgba = bytes(opaque)

@@ -77,14 +77,12 @@ def run(spv, lanes, subgroup):
 
 class SwizzleExecTests(unittest.TestCase):
     def test_swizzled_fragment_color_with_disabled_neighbors(self) -> None:
+        fixture = os.path.join(support.HERE, "fixtures", "fragment_swizzle_exec.asm")
+        with open(fixture, encoding="ascii") as source:
+            instructions = [line.strip() for line in source if line.strip() and not line.startswith(";")]
         for pattern in ("QUAD_PERM,1,0,3,2", "SWAP,1"):
-            spv = support.translate_lines("ps_swizzle_exec", [
-                "v_mov_b32 v2, 0.75", "v_mov_b32 v4, 0.5", "s_mov_b32 exec_lo, 0xdddddddd",
-                f"ds_swizzle_b32 v4, v2 offset:swizzle({pattern})", "s_waitcnt lgkmcnt(0)",
-                "s_mov_b32 exec_lo, -1", "v_mbcnt_lo_u32_b32 v5, -1, 0", "v_lshlrev_b32 v5, 2, v5",
-                "buffer_store_dword v4, v5, s[0:3], 0 offen",  # read back the exported component for every lane
-                "exp mrt0 v4, v4, v4, v4 done vm", "s_endpgm",
-            ])
+            lines = [line.replace("QUAD_PERM,1,0,3,2", pattern) for line in instructions]
+            spv = support.translate_lines("ps_swizzle_exec", lines)
             for lanes in (32, 7):
                 with self.subTest(pattern=pattern, lanes=lanes):
                     # Lane 0 reads disabled lane 1. Lane 1 keeps its destination. Lanes 2/3 exchange active data.

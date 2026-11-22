@@ -410,7 +410,7 @@ class PipelineCheckExeTest(unittest.TestCase):
         out = os.path.join(self.tmp.name, "out")
         with mock.patch.object(make_game.os, "name", "posix"), \
                 mock.patch.object(make_game, "log"), \
-                mock.patch.object(make_game, "run") as run:
+                mock.patch.object(make_game, "run", return_value=0) as run:
             make_game.pipelines(work, out)
         self.assertEqual(run.call_args.args[0][0], exe)
 

@@ -438,8 +438,9 @@ World drawables do not carry the shared 597-name humanoid skeleton. Character `.
 store that name/hash table, and each character `#dr` model points at a local bone-hash array that
 maps into it. The measured name table, the following 597-record hierarchy/reference-TRS table,
 the model mapping and the texture-parameter split are in
-[character_skeleton.md](character_skeleton.md). No character bind matrices were recovered; that
-page records the reference-pose caveat rather than inventing a bind pose.
+[character_skeleton.md](character_skeleton.md). The character inverse bind matrices are at
+skeleton header `+0x30` and agree with the default bone transforms (see that page);
+`tools/anim_glb.py` exports a skinned part with them.
 
 The character-part inventory (Lucia's named records and decoded parts, the `player_story000_00`
 drawable set, slot-name counts and texture coverage) is in
@@ -497,6 +498,23 @@ vehicle models to far-away light recipes. Counts only; no model names.
 Not measured here (hypothesis): what the secondary tokens name (per-model parts or liveries would fit the
 model-name substrings), and where the light positions are generated at runtime (for example from the model's
 own light bones).
+
+## Skinned GLB export
+
+`tools/skinned_glb.py` writes a skinned GLB from decoded pack components and the shared ped
+skeleton:
+
+```
+python -I tools/skinned_glb.py out.glb --skeleton <dir> --component <dir> [--component ...]
+```
+
+It reads the 8-influence `JOINTS_0/1` and `WEIGHTS_0/1` streams from the graphics buffer, resolves
+the drawable's local joint palette through the ped table, and emits `skins` and
+`inverseBindMatrices` with the ped bind pose. The measured layout and offsets are in the tool
+docstring. On the 1.0.2.1 package, the head (8,983 v) and biker jacket (9,818 v) produce one skin
+with 596 ped joints (703 with the jacket's `GM_U01_*` helpers); every weight sums to 255, the
+rest-pose reconstruction error is 6e-8 m, and `gltf-validator` reports 0 errors / 0 warnings.
+`python -I tests/test_skinned_glb.py` runs 9 synthetic tests and needs no game files.
 
 ## What to do next
 

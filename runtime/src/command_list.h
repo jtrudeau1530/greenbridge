@@ -151,8 +151,11 @@ inline constexpr std::uint32_t clear_depth = 0x1;
 inline constexpr std::uint32_t clear_stencil = 0x2;
 inline constexpr std::uint32_t texture_barrier_discard = 0x1;
 
-// Portable color-view interpretation. Other views inherit their resource format as before.
-enum class ColorViewFormat : std::uint32_t { resource, rgba8_unorm, rgba8_srgb, rgba8_uint, rgba8_sint, rgba8_snorm };
+// The format a color view names, as a VkFormat number (0, `resource`, is the resource's own). The named values are
+// the RGBA8 family's; a typeless resource of any other family stores its view's VkFormat the same way (D3D-275).
+enum class ColorViewFormat : std::uint32_t {
+    resource = 0, rgba8_unorm = 37, rgba8_snorm = 38, rgba8_uint = 41, rgba8_sint = 42, rgba8_srgb = 43
+};
 
 // D3D12_QUERY_HEAP_TYPE and D3D12_QUERY_TYPE.
 namespace d3d12_query_heap {
@@ -769,11 +772,15 @@ public:
         return append(ClearUnorderedAccess{view, is_float, values, {rects.begin(), rects.end()}});
     }
 
-    // ExecuteBundle copies the closed bundle's commands at the call site. The COM layer validates D3D12 list
-    // types and bundle-only restrictions before calling this method.
-    bool execute_bundle(const CommandList& bundle) {
+    // ExecuteBundle copies the closed bundle's commands [first, last) at the call site. The COM layer validates D3D12
+    // list types and bundle-only restrictions before calling this method, and calls it once per stretch between the
+    // bundle's deferred state calls and draws (d3d12_com.cpp, GraphicsCommandList::ExecuteBundle).
+    bool execute_bundle(const CommandList& bundle, std::size_t first = 0, std::size_t last = std::size_t(-1)) {
         if (this == &bundle || closed_ || !bundle.closed_) return false;
-        commands_.insert(commands_.end(), bundle.commands_.begin(), bundle.commands_.end());
+        last = std::min(last, bundle.commands_.size());
+        if (first < last)
+            commands_.insert(commands_.end(), bundle.commands_.begin() + std::ptrdiff_t(first),
+                             bundle.commands_.begin() + std::ptrdiff_t(last));
         return true;
     }
 
