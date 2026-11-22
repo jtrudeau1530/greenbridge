@@ -118,13 +118,18 @@ int main(int argc, char** argv) {
     const uint32_t tsharp_va = 256;
 
     gipa = load_vulkan();
-    if (!gipa) { std::fprintf(stderr, "the Vulkan loader was not found\n"); return 1; }
+    if (!gipa) { std::fprintf(stderr, "the Vulkan loader was not found\n"); return 77; }
     VkInstance inst = VK_NULL_HANDLE;
 #define LI(n) auto n = reinterpret_cast<PFN_##n>(gipa(inst, #n))
     LI(vkCreateInstance);
     VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO}; app.apiVersion = VK_API_VERSION_1_2;
     VkInstanceCreateInfo ici{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO}; ici.pApplicationInfo = &app;
-    CHECK(vkCreateInstance(&ici, nullptr, &inst));
+    const VkResult instance_result = vkCreateInstance(&ici, nullptr, &inst);
+    if (instance_result == VK_ERROR_INCOMPATIBLE_DRIVER) return 77;  // no ICD, as on a GPU-less runner
+    if (instance_result != VK_SUCCESS) {
+        std::fprintf(stderr, "FAILED vkCreateInstance -> %d (line %d)\n", instance_result, __LINE__);
+        return 1;
+    }
     LI(vkEnumeratePhysicalDevices); LI(vkGetPhysicalDeviceProperties); LI(vkGetPhysicalDeviceQueueFamilyProperties);
     LI(vkGetPhysicalDeviceMemoryProperties); LI(vkCreateDevice); LI(vkGetDeviceProcAddr);
     uint32_t n = 0;
@@ -133,7 +138,7 @@ int main(int argc, char** argv) {
     if (n) CHECK(vkEnumeratePhysicalDevices(inst, &n, pds.data()));
     if (!n) {
         std::fprintf(stderr, "unsupported: no Vulkan physical device\n");
-        return two_mip ? 77 : 1;
+        return 77;  // a missing device is a skip in every texture-test mode
     }
     VkPhysicalDevice pd = VK_NULL_HANDLE;
     VkPhysicalDeviceProperties properties{};
@@ -160,7 +165,7 @@ int main(int argc, char** argv) {
     while (qi < qn && !(qf[qi].queueFlags & VK_QUEUE_GRAPHICS_BIT)) ++qi;
     if (qi == qn) {
         std::fprintf(stderr, "unsupported: no graphics queue family\n");
-        return two_mip ? 77 : 1;
+        return 77;  // a missing queue is a skip in every texture-test mode
     }
     float prio = 1;
     VkDeviceQueueCreateInfo qci{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
