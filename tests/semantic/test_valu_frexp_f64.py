@@ -715,6 +715,101 @@ class SIMDVALUInterpreter:
         return self.execute(ast)
 
 
+class TestValuFrexpF64RegisterAliasing(unittest.TestCase):
+    """Unit tests for register aliasing and in-place operand preservation."""
+
+    def test_full_aliasing_mant_dst_src0_scalar(self):
+        interp = ScalarVALUInterpreter()
+        initial_val = 6.0  # mantissa 0.75
+        interp.set_vgpr_u64(0, f64_to_bits(initial_val))
+        res = interp.execute_asm("v_frexp_mant_f64 v[0:1], v[0:1]")
+        self.assertEqual(bits_to_f64(res), 0.75)
+        self.assertEqual(bits_to_f64(interp.get_vgpr_u64(0)), 0.75)
+
+    def test_aliasing_exp_dst_low_src0_scalar(self):
+        interp = ScalarVALUInterpreter()
+        # v0 = v_frexp_exp_i32_f64 v[0:1] (dst is low dword of src0)
+        interp.set_vgpr_u64(0, f64_to_bits(12.0))  # 12.0 = 0.75 * 2^4 -> exp = 4
+        res = interp.execute_asm("v_frexp_exp_i32_f64 v0, v[0:1]")
+        self.assertEqual(s32(res), 4)
+        self.assertEqual(s32(interp.get_vgpr_u32(0)), 4)
+
+    def test_aliasing_exp_dst_high_src0_scalar(self):
+        interp = ScalarVALUInterpreter()
+        # v1 = v_frexp_exp_i32_f64 v[0:1] (dst is high dword of src0)
+        interp.set_vgpr_u64(0, f64_to_bits(0.25))  # 0.25 = 0.5 * 2^-1 -> exp = -1
+        res = interp.execute_asm("v_frexp_exp_i32_f64 v1, v[0:1]")
+        self.assertEqual(s32(res), -1)
+        self.assertEqual(s32(interp.get_vgpr_u32(1)), -1)
+
+    def test_partial_overlap_dst_hi_src0_lo_scalar(self):
+        interp = ScalarVALUInterpreter()
+        # v[1:2] = v_frexp_mant_f64 v[0:1]
+        interp.set_vgpr_u64(0, f64_to_bits(10.0))  # 10.0 = 0.625 * 2^4
+        res = interp.execute_asm("v_frexp_mant_f64 v[1:2], v[0:1]")
+        self.assertEqual(bits_to_f64(res), 0.625)
+        self.assertEqual(bits_to_f64(interp.get_vgpr_u64(1)), 0.625)
+
+    def test_partial_overlap_dst_lo_src0_hi_scalar(self):
+        interp = ScalarVALUInterpreter()
+        # v[0:1] = v_frexp_mant_f64 v[1:2]
+        interp.set_vgpr_u64(1, f64_to_bits(0.125))  # 0.125 = 0.5 * 2^-2
+        res = interp.execute_asm("v_frexp_mant_f64 v[0:1], v[1:2]")
+        self.assertEqual(bits_to_f64(res), 0.5)
+        self.assertEqual(bits_to_f64(interp.get_vgpr_u64(0)), 0.5)
+
+    def test_simd_wave64_aliasing_with_exec_mask(self):
+        sim = SIMDVALUInterpreter(wave_size=64)
+        canary = 0xABABABABCDCDEFEF
+        for lane in range(64):
+            if lane % 2 == 0:
+                sim.set_vgpr_u64(0, lane, f64_to_bits(2.0))
+            else:
+                sim.set_vgpr_u64(0, lane, canary)
+
+        sim.exec = 0x5555555555555555
+        results = sim.execute_asm("v_frexp_mant_f64 v[0:1], v[0:1]")
+        for lane in range(64):
+            if lane % 2 == 0:
+                self.assertEqual(bits_to_f64(results[lane]), 0.5)
+                self.assertEqual(bits_to_f64(sim.get_vgpr_u64(0, lane)), 0.5)
+            else:
+                self.assertEqual(results[lane], canary)
+                self.assertEqual(sim.get_vgpr_u64(0, lane), canary)
+
+    def test_simd_wave32_partial_overlap_divergent(self):
+        sim = SIMDVALUInterpreter(wave_size=32)
+        expected: list[float] = []
+        for lane in range(32):
+            val = (lane + 1) * 1.5
+            sim.set_vgpr_u64(1, lane, f64_to_bits(val))
+            py_m, _ = math.frexp(val)
+            expected.append(py_m)
+
+        results = sim.execute_asm("v_frexp_mant_f64 v[0:1], v[1:2]")
+        for lane in range(32):
+            self.assertEqual(bits_to_f64(results[lane]), expected[lane])
+            self.assertEqual(bits_to_f64(sim.get_vgpr_u64(0, lane)), expected[lane])
+
+    def test_simd_wave64_exp_aliasing_with_exec_mask(self):
+        sim = SIMDVALUInterpreter(wave_size=64)
+        canary = 0xCAFE1234
+        for lane in range(64):
+            sim.set_vgpr_u64(0, lane, f64_to_bits(8.0))  # 8.0 = 0.5 * 2^4 -> exp = 4
+            if lane % 2 != 0:
+                sim.set_vgpr_u32(0, lane, canary)
+
+        sim.exec = 0x5555555555555555
+        results = sim.execute_asm("v_frexp_exp_i32_f64 v0, v[0:1]")
+        for lane in range(64):
+            if lane % 2 == 0:
+                self.assertEqual(s32(results[lane]), 4)
+                self.assertEqual(s32(sim.get_vgpr_u32(0, lane)), 4)
+            else:
+                self.assertEqual(results[lane], canary)
+                self.assertEqual(sim.get_vgpr_u32(0, lane), canary)
+
+
 class TestValuFrexpF64SIMDMultiLane(unittest.TestCase):
     """Unit tests for SIMD multi-lane divergence and 32/64-bit EXEC masking."""
 
