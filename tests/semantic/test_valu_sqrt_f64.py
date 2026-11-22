@@ -373,6 +373,95 @@ class SIMDInterpreter:
 
 
 # ==============================================================================
+# Condition Codes, Status Flags, and Carry/Borrow Generation
+# ==============================================================================
+
+@dataclass(frozen=True)
+class FPStatusFlags:
+    """Architectural floating-point condition codes and IEEE 754 status flags."""
+    invalid: bool = False
+    overflow: bool = False
+    underflow: bool = False
+    inexact: bool = False
+    zero: bool = False
+    negative: bool = False
+    denormal: bool = False
+    infinite: bool = False
+    nan: bool = False
+
+
+def evaluate_v_sqrt_f64_flags(
+    src_bits: int,
+    res_bits: int,
+    abs_mod: bool = False,
+    neg_mod: bool = False,
+    clamp: bool = False,
+) -> FPStatusFlags:
+    """Evaluate IEEE 754 architectural flags and condition codes for v_sqrt_f64."""
+    s = apply_f64_modifiers(src_bits, abs_mod, neg_mod)
+
+    s_nan = is_nan(s)
+    s_snan = is_snan(s)
+    s_inf = is_inf(s)
+    s_neg = bool(s & SIGN_MASK)
+    s_zero = is_zero(s)
+
+    invalid = False
+    if s_snan:
+        invalid = True
+    elif (s_neg and not s_zero) or (s_inf and s_neg):
+        invalid = True
+
+    nan_flag = is_nan(res_bits)
+    inf_flag = is_inf(res_bits)
+    zero_flag = is_zero(res_bits)
+    neg_flag = bool(res_bits & SIGN_MASK)
+    denorm_flag = is_subnormal(res_bits)
+
+    overflow = False
+    underflow = False
+    if denorm_flag:
+        underflow = True
+
+    inexact = False
+    if not (s_nan or s_inf or nan_flag or inf_flag or invalid or s_zero):
+        f = bits_to_f64(s)
+        res_f = bits_to_f64(res_bits)
+        if not clamp:
+            if res_f * res_f != f:
+                inexact = True
+        else:
+            clamped_math = min(1.0, max(0.0, math.sqrt(f)))
+            if clamped_math != res_f or res_f * res_f != f:
+                inexact = True
+
+    return FPStatusFlags(
+        invalid=invalid,
+        overflow=overflow,
+        underflow=underflow,
+        inexact=inexact,
+        zero=zero_flag,
+        negative=neg_flag,
+        denormal=denorm_flag,
+        infinite=inf_flag,
+        nan=nan_flag,
+    )
+
+
+def compute_f64_sqrt_borrow(src_bits: int, res_bits: int) -> Tuple[int, int]:
+    """Demonstrate non-restoring square root integer mantissa remainder and borrow generation."""
+    _, exp, frac = split_f64_bits(src_bits)
+    _, res_exp, res_frac = split_f64_bits(res_bits)
+    m_src = (1 << 52) | frac if exp != 0 else frac
+    m_res = (1 << 52) | res_frac if res_exp != 0 else res_frac
+    radicand = m_src << 52
+    squared = m_res * m_res
+    remainder = radicand - squared
+    borrow = 1 if remainder < 0 else 0
+    return remainder, borrow
+
+
+# ==============================================================================
 # Unit Tests
 # ==============================================================================
 
@@ -786,6 +875,78 @@ class TestRegisterAliasing(unittest.TestCase):
         self.simd_interp.step(instr, state)
         for lane in range(32):
             self.assertEqual(bits_to_f64(state.get_vgpr64(lane, 0)), float(lane))
+
+
+class TestConditionCodesAndStatusFlags(unittest.TestCase):
+    """Unit tests for status flags, condition codes, and carry/borrow generation."""
+
+    def test_exact_finite_flags(self) -> None:
+        s = f64_to_bits(4.0)
+        res = oracle_v_sqrt_f64(s)
+        flags = evaluate_v_sqrt_f64_flags(s, res)
+        self.assertFalse(flags.invalid)
+        self.assertFalse(flags.overflow)
+        self.assertFalse(flags.underflow)
+        self.assertFalse(flags.inexact)
+        self.assertFalse(flags.zero)
+        self.assertFalse(flags.negative)
+        self.assertFalse(flags.denormal)
+        self.assertFalse(flags.infinite)
+        self.assertFalse(flags.nan)
+
+    def test_inexact_flag(self) -> None:
+        s = f64_to_bits(2.0)
+        res = oracle_v_sqrt_f64(s)
+        flags = evaluate_v_sqrt_f64_flags(s, res)
+        self.assertTrue(flags.inexact)
+        self.assertFalse(flags.invalid)
+
+    def test_invalid_operation_flag(self) -> None:
+        # Negative radicand
+        s_neg = f64_to_bits(-1.0)
+        res = oracle_v_sqrt_f64(s_neg)
+        flags = evaluate_v_sqrt_f64_flags(s_neg, res)
+        self.assertTrue(flags.invalid)
+        self.assertTrue(flags.nan)
+
+        # Signaling NaN operand
+        snan = 0x7FF0_0000_0000_0001
+        res_snan = oracle_v_sqrt_f64(snan)
+        flags_snan = evaluate_v_sqrt_f64_flags(snan, res_snan)
+        self.assertTrue(flags_snan.invalid)
+        self.assertTrue(flags_snan.nan)
+
+        # Negative infinity
+        res_ninf = oracle_v_sqrt_f64(NEG_INF)
+        flags_ninf = evaluate_v_sqrt_f64_flags(NEG_INF, res_ninf)
+        self.assertTrue(flags_ninf.invalid)
+        self.assertTrue(flags_ninf.nan)
+
+    def test_zero_and_negative_flags(self) -> None:
+        # +0.0
+        res_pz = oracle_v_sqrt_f64(POS_ZERO)
+        flags_pz = evaluate_v_sqrt_f64_flags(POS_ZERO, res_pz)
+        self.assertTrue(flags_pz.zero)
+        self.assertFalse(flags_pz.negative)
+
+        # -0.0
+        res_nz = oracle_v_sqrt_f64(NEG_ZERO)
+        flags_nz = evaluate_v_sqrt_f64_flags(NEG_ZERO, res_nz)
+        self.assertTrue(flags_nz.zero)
+        self.assertTrue(flags_nz.negative)
+
+    def test_infinite_flag(self) -> None:
+        res = oracle_v_sqrt_f64(POS_INF)
+        flags = evaluate_v_sqrt_f64_flags(POS_INF, res)
+        self.assertTrue(flags.infinite)
+        self.assertFalse(flags.invalid)
+
+    def test_sqrt_borrow_generation(self) -> None:
+        # Perfect square: 4.0
+        s4 = f64_to_bits(4.0)
+        res2 = oracle_v_sqrt_f64(s4)
+        rem, borrow = compute_f64_sqrt_borrow(s4, res2)
+        self.assertEqual(borrow, 0)
 
 
 if __name__ == "__main__":
