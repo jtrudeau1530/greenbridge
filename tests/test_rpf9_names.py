@@ -297,6 +297,42 @@ class NamesTest(unittest.TestCase):
             os.remove(arc)
             self.assertFalse(os.path.exists(arc))
 
+    def test_positive_max_length_and_shared_read_offsets(self):
+        # The first stream inflates to 65 bytes and, with a 64-byte feed cap, both compressed
+        # streams fit in one read; at completed EOF unconsumed_tail and unused_data both hold
+        # the next stream, so a flush would double unused_data and misplace the next offset.
+        real_decompressobj = rpf9_names.zlib.decompressobj
+        seen = []
+
+        class Rec:
+            def __init__(self, obj):
+                self._obj = obj
+
+            def decompress(self, data, max_length=-1):
+                seen.append(max_length)
+                return self._obj.decompress(data, max_length)
+
+            def __getattr__(self, name):
+                return getattr(self._obj, name)
+
+        first = zlib.compress(b"alpha.#dr " + b"x" * 55)  # 65 bytes inflated
+        nxt = stream(b"bravo.#ft")
+        with tempfile.TemporaryDirectory() as tmp:
+            arc = os.path.join(tmp, "t.rpf")
+            make_blob(arc, first, nxt)
+            with mock.patch.object(rpf9_names.zlib, "decompressobj",
+                                   lambda: Rec(real_decompressobj())):
+                with mock.patch.object(rpf9_names, "DECOMPRESS_MAX", 64):
+                    rows, summary = rpf9_names.scan_archive(arc)
+        self.assertTrue(seen, "decompress should have been called")
+        self.assertTrue(all(m > 0 for m in seen), seen)
+        self.assertEqual(summary["streams"], 2, summary)
+        self.assertEqual(rows[0]["size"], 65, rows)
+        self.assertEqual(rows[0]["offset"], 0x40, rows)
+        self.assertEqual(rows[0]["names"], ["alpha.#dr"], rows)
+        self.assertEqual(rows[1]["offset"], 0x40 + len(first), rows)
+        self.assertEqual(rows[1]["names"], ["bravo.#ft"], rows)
+
     def test_scan_archive_closes_mmap_on_validation_errors(self):
         cases = (
             ("bad_magic", b"NOPE" + bytes(60), None, "not an RPF9 archive"),

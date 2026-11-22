@@ -25,6 +25,11 @@ import zlib
 
 # zlib stream start, or a Bink 2 video ('KB2' + revision letter, then u32 size-8).
 ZHDR = re.compile(rb"\x78[\x01\x5e\x9c\xda]|KB2[a-z]")
+
+# Cap on the transient output a single decompress() call may produce, and the feed
+# quantum read from the map per decompress() call. ``max_inflate`` remains the bound on
+# how much of the inflated stream is kept for name extraction.
+DECOMPRESS_MAX = 1 << 20
 NAME = re.compile(rb"(?<![A-Za-z0-9_\-])([A-Za-z0-9_\-]{2,120})\.#([A-Za-z0-9]{1,8})(?![A-Za-z0-9_\-])")
 
 
@@ -114,22 +119,20 @@ def scan_archive(archive, start=None, limit=None, max_inflate=1 << 20, types=("d
                 prefix = bytearray()
                 total = 0
                 p = s
+                pending = b""
                 try:
-                    while not d.eof and p < end:
-                        chunk = m[p:min(p + (1 << 20), end)]
-                        if not chunk:
-                            break
-                        data = d.decompress(chunk)
+                    # Bound each decompress() call's transient output with max_length and
+                    # re-feed unconsumed_tail before pulling more input, so a stream cannot
+                    # balloon memory regardless of how large it inflates.
+                    while not d.eof and (pending or p < end):
+                        if not pending:
+                            pending = m[p:p + min(DECOMPRESS_MAX, end - p)]
+                            p += len(pending)
+                        data = d.decompress(pending, DECOMPRESS_MAX)
                         total += len(data)
                         if len(prefix) < max_inflate:
                             prefix.extend(data[:max_inflate - len(prefix)])
-                        p += len(chunk)
-                        if d.unused_data or d.eof:
-                            break
-                    tail = d.flush()
-                    total += len(tail)
-                    if len(prefix) < max_inflate:
-                        prefix.extend(tail[:max_inflate - len(prefix)])
+                        pending = d.unconsumed_tail
                 except zlib.error:
                     pos = s + 1
                     continue
