@@ -304,6 +304,33 @@ records. No unhandled layout tag appears:
 `data.rpf` or the `levels.rpf` samples. `data.rpf` uses `(8, 16)` exclusively; the 674
 `(12, 6)` geometries are spread over 256 models in the levels sample.
 
+## Vehicle ratings and performance estimates
+
+`common.rpf` has one `CVehicleBaseRatingsAndEstimatesMap` XML document (see [gamedata.md](gamedata.md)): a
+`Map` of 252 `Item key="<model>"` entries, each with four blocks. Counts and ranges only; no model names.
+
+| Block | Fields |
+|---|---|
+| `estimatesRoad`, `estimatesOffroad` | `fTopSpeed`, `fCornerSpeed`, `fAccelerationTime`, `fBrakingTime`, `fStandingQuarterTime`, `fStandingQuarterSpeed`, `fAvgLatTraction` |
+| `ratingsRoad`, `ratingsOffroad` | `fOverallRating`, `fSpeedRating`, `fHandlingRating`, `fAccelerationRating`, `fBrakesRating` |
+
+- **Keys are vehicle model names.** The 252 keys are distinct plain names (no hex hashes), and all 252 are the
+  base name of a `.yft` in the local archive catalog. 245 of them are also among the 319 models of the
+  distant-light recipes; 74 of those 319 have no rating entry.
+- **Ratings are not fractions.** All ten rating fields have a minimum of exactly 10 and medians of 142 to 585,
+  with maxima up to 1,327 (`fAccelerationRating`). `fOverallRating` is not the mean of the other four: the two
+  differ by a median of 38 and agree within 0.01 in only 10 of 504 cases.
+- **Estimates look like SI units.** Road `fTopSpeed` has a median of 44.3 and a maximum of 77.4 (m/s would make
+  that 160 and 279 km/h); `fStandingQuarterTime` has a median of 15.8, the right size for seconds over a
+  quarter mile; `fAvgLatTraction` has a median of 1.42 on road and 0.92 off road (lateral g would fit). Offroad
+  speeds are lower than road ones (median top speed 19.3).
+- **Sentinels.** On each surface, 11 entries have every estimate 0 and 10 more have zero speeds with an
+  infinite time (`inf`). `inf` occurs in 38 road and 99 offroad blocks overall, so a parser must accept `inf`
+  in these fields (it reads as "never reaches the test speed or distance").
+
+Not measured here (hypothesis): the rating scale and how `fOverallRating` weights its parts, and whether the
+estimates are precomputed from handling data or measured by simulation.
+
 ## Character skeletons
 
 World drawables do not carry the shared 597-name humanoid skeleton. Character `.#ft` fragments
