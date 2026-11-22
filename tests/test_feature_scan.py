@@ -195,6 +195,29 @@ def test_bad_shaders_folder_is_one_line():
 
 
 
+def test_duplicate_shader_names_keep_file_stages():
+    with tempfile.TemporaryDirectory() as tmp:
+        dx = os.path.join(tmp, "dxbc")
+        dis = os.path.join(dx, "disasm")
+        os.makedirs(dis)
+        index = []
+        for stem, stage in (("same", "gs"), ("same~1", "ms")):
+            with open(os.path.join(dx, stem + ".dxbc"), "wb") as f:
+                f.write(dxbc([]))
+            with open(os.path.join(dis, stem + ".s"), "w", encoding="utf-8") as f:
+                f.write("ds_ordered_count v0 gds\n")
+            index.append({"name": "same", "file": stem + ".dxbc", "stage": stage})
+        with open(os.path.join(dx, "index.json"), "w", encoding="utf-8") as f:
+            json.dump(index, f)
+
+        out = os.path.join(tmp, "out.json")
+        subprocess.run([sys.executable, "-I", os.path.join(TOOLS, "feature_scan.py"), tmp, "--out", out],
+                       capture_output=True, text=True, check=True)
+        with open(out, encoding="utf-8") as f:
+            ordered = json.load(f)["disasm"]["ordered_or_gws_shaders"]
+        assert ordered == {"gs": 1, "ms": 1}, f"ordered-count shaders keep their file stages: {ordered}"
+
+
 def test_v_perm_b32_selectors():
     """v_perm_b32 selector bytes: immediate, s_mov/v_mov const-reg, clobber invalidation, and no name leakage."""
     with tempfile.TemporaryDirectory() as tmp:
@@ -268,6 +291,7 @@ if __name__ == "__main__":
         test_part_payload_outside_container_is_unreadable()
         test_bad_shaders_folder_is_one_line()
         test_v_perm_b32_selectors()
+        test_duplicate_shader_names_keep_file_stages()
     except AssertionError:
         pass
     print(f"test_feature_scan: {'OK' if not failures else 'FAILED'} ({failures} failure{'s' if failures != 1 else ''})")
