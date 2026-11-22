@@ -1089,5 +1089,119 @@ class TestIEEE754BoundaryExtremes(unittest.TestCase):
         self.assertEqual(res_neg & SIGN_MASK_F64, SIGN_MASK_F64)
 
 
+class TestValuFractF64NegativeControls(unittest.TestCase):
+    """Unit tests for negative controls, syntax rejection, and invalid AST inputs."""
+
+    def test_invalid_register_indices(self) -> None:
+        with self.assertRaises(ValueError):
+            RegPair(-1, RegType.VGPR)
+        with self.assertRaises(ValueError):
+            RegPair(255, RegType.VGPR)
+        with self.assertRaises(ValueError):
+            RegPair(256, RegType.VGPR)
+
+    def test_invalid_destination_kind(self) -> None:
+        # VALU destination cannot be SGPR
+        with self.assertRaises(TypeError):
+            VFractF64Instruction(
+                dst=RegPair(0, RegType.SGPR),
+                src0=VOP3Operand(RegPair(2, RegType.VGPR)),
+            )
+
+    def test_scalar_interpreter_out_of_bounds_access(self) -> None:
+        interp = ScalarInterpreter()
+        state = ScalarMachineState()
+        with self.assertRaises(IndexError):
+            _ = state.vgprs[256]
+        with self.assertRaises(IndexError):
+            _ = state.sgprs[256]
+
+    def test_simd_interpreter_invalid_wave_size(self) -> None:
+        with self.assertRaises(ValueError):
+            SIMDState(num_lanes=16)
+        with self.assertRaises(ValueError):
+            SIMDState(num_lanes=128)
+
+    def test_non_finite_fraction_decode_rejection(self) -> None:
+        with self.assertRaises(ValueError):
+            f64_to_fraction(POS_INF_F64)
+        with self.assertRaises(ValueError):
+            f64_to_fraction(NEG_INF_F64)
+        with self.assertRaises(ValueError):
+            f64_to_fraction(CANONICAL_QNAN_F64)
+
+
+class TestValuFractF64MutationDetection(unittest.TestCase):
+    """Mutation tests: verifies that intentional sabotages/mutations of the oracle are caught."""
+
+    def test_mutation_unclamped_rounding_to_one(self) -> None:
+        # Sabotage: naive Python float fract without hardware clamp to LARGEST_BELOW_ONE_F64
+        def mutated_fract(bits: int) -> int:
+            f = bits_to_f64(bits)
+            return f64_to_bits(f - math.floor(f))
+
+        tiny_neg = f64_to_bits(-1e-18)
+        # Naive calculation produces exact 1.0 (0x3FF0000000000000), not LARGEST_BELOW_ONE_F64
+        with self.assertRaises(AssertionError):
+            self.assertEqual(mutated_fract(tiny_neg), LARGEST_BELOW_ONE_F64)
+
+    def test_mutation_signed_zero_sign_preservation(self) -> None:
+        # Sabotage: preserving -0.0 sign instead of returning +0.0
+        def mutated_fract_neg_zero(bits: int) -> int:
+            if bits == NEG_ZERO_F64:
+                return NEG_ZERO_F64
+            return oracle_v_fract_f64(bits)
+
+        with self.assertRaises(AssertionError):
+            self.assertEqual(mutated_fract_neg_zero(NEG_ZERO_F64), POS_ZERO_F64)
+
+    def test_mutation_infinity_zero_blindness(self) -> None:
+        # Sabotage: returning 0.0 for infinities instead of NaN
+        def mutated_fract_inf_zero(bits: int) -> int:
+            if is_inf_f64(bits):
+                return POS_ZERO_F64
+            return oracle_v_fract_f64(bits)
+
+        with self.assertRaises(AssertionError):
+            self.assertEqual(mutated_fract_inf_zero(POS_INF_F64), CANONICAL_QNAN_F64)
+
+    def test_mutation_nan_quietening_dropped(self) -> None:
+        # Sabotage: passing sNaN through without setting the quiet bit
+        snan = 0x7FF0_0000_1234_5678
+
+        def mutated_fract_drop_quiet(bits: int) -> int:
+            return bits
+
+        with self.assertRaises(AssertionError):
+            self.assertEqual(mutated_fract_drop_quiet(snan), snan | QNAN_BIT_F64)
+
+    def test_mutation_clamp_nan_preservation(self) -> None:
+        # Sabotage: preserving NaN when clamped instead of flushing to +0.0
+        def mutated_fract_clamp_nan(bits: int) -> int:
+            return bits
+
+        with self.assertRaises(AssertionError):
+            self.assertEqual(mutated_fract_clamp_nan(CANONICAL_QNAN_F64), POS_ZERO_F64)
+
+    def test_mutation_simd_exec_mask_leak(self) -> None:
+        # Sabotage: writing to inactive SIMD lanes
+        simd = SIMDInterpreter()
+        state = SIMDState(num_lanes=32, exec_mask=0x0000_0000)  # all inactive
+        canary = 0xAAAA_BBBB_CCCC_DDDD
+        state.set_vgpr64(0, 0, canary)
+
+        instr = VFractF64Instruction(
+            dst=RegPair(0, RegType.VGPR),
+            src0=VOP3Operand(Literal64.from_float(1.25)),
+        )
+        simd.step(instr, state)
+        self.assertEqual(state.get_vgpr64(0, 0), canary)
+
+        # Mutated unconditional write would overwrite the canary
+        state.set_vgpr64(0, 0, f64_to_bits(0.25))
+        with self.assertRaises(AssertionError):
+            self.assertEqual(state.get_vgpr64(0, 0), canary)
+
+
 if __name__ == "__main__":
     unittest.main()
