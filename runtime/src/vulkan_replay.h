@@ -703,6 +703,7 @@ struct GraphicsPipeline {
     // and stencil. Null when it cannot be built.
     static constexpr std::uint32_t unbound_depth = 1u << 8;
     std::function<VkPipeline(std::uint32_t unbound)> variant;
+    std::uint32_t samples = 1;  // rasterizationSamples; every bound attachment must have this count
 };
 
 // The 144-byte push-constant block every translated shader declares: s0..s31, heap base, code base.
@@ -1545,6 +1546,9 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
         a.binding = *binding;
         a.id = target.resource;
         if (!a.binding.image || a.binding.aspects != VK_IMAGE_ASPECT_COLOR_BIT) return ReplayResult::invalid_clear;
+        // D3D12 requires the PSO's SampleDesc on every bound target (a mismatch is undefined); Vulkan's dynamic
+        // rendering requires the counts to agree, so the list fails here instead of in the driver.
+        if (a.binding.samples != pipeline->samples) return ReplayResult::invalid_subresource;
         if (!view_range(a.binding, target, VK_IMAGE_ASPECT_COLOR_BIT, a.range)) return ReplayResult::invalid_subresource;
         ResourceBinding viewed = a.binding;
         if (pipeline->color_formats[slot] != VK_FORMAT_UNDEFINED) viewed.format = pipeline->color_formats[slot];
@@ -1559,6 +1563,7 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
         a.binding = *binding;
         a.id = draw.depth.resource;
         if (!a.binding.image || !(a.binding.aspects & depth_stencil_aspects)) return ReplayResult::invalid_clear;
+        if (a.binding.samples != pipeline->samples) return ReplayResult::invalid_subresource;
         if (!view_range(a.binding, draw.depth, a.binding.aspects, a.range)) return ReplayResult::invalid_subresource;
         ResourceBinding viewed = a.binding;
         viewed.format = pipeline->depth_format;

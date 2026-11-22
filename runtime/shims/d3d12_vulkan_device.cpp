@@ -2072,7 +2072,17 @@ public:
             log_once("invalid graphics pipeline sample count:", int(samples));
             return E_INVALIDARG;
         }
-        if (desc.SampleDesc.Quality != 0) {
+        // D3D12 takes quality 0 and the two pattern values (measured natively on an RX 7800 XT, a Radeon iGPU and
+        // WARP: 0, D3D12_STANDARD_MULTISAMPLE_PATTERN and D3D12_CENTER_MULTISAMPLE_PATTERN succeed, 1 is
+        // E_INVALIDARG, as NumQualityLevels is 1). The standard pattern is Vulkan's standard sample positions, so it
+        // is quality 0 here. The centre pattern puts every sample at the pixel centre, which needs custom sample
+        // locations: refused with a log until those are set.
+        if (desc.SampleDesc.Quality == UINT(D3D12_CENTER_MULTISAMPLE_PATTERN)) {
+            log_once("D3D12_CENTER_MULTISAMPLE_PATTERN needs custom sample locations (not set yet); samples",
+                     int(samples));
+            return E_NOTIMPL;
+        }
+        if (desc.SampleDesc.Quality != 0 && desc.SampleDesc.Quality != UINT(D3D12_STANDARD_MULTISAMPLE_PATTERN)) {
             log_once("invalid graphics pipeline sample quality:", int(desc.SampleDesc.Quality));
             return E_INVALIDARG;
         }
@@ -2381,6 +2391,7 @@ public:
         recipe_.assembly = assembly;
         recipe_.raster = raster;
         recipe_.multisample = multisample;
+        graphics_.samples = samples;
         recipe_.sample_mask = sample_mask;
         recipe_.depth = depth;
         recipe_.blends = std::move(blends);
