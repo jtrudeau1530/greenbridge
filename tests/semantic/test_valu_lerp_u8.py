@@ -660,5 +660,183 @@ class TestSIMDMultiLaneDivergence(unittest.TestCase):
             self.assertEqual(state.get_vgpr(lane, 0), expected)
 
 
+class TestRegisterAliasing(unittest.TestCase):
+    """Unit tests for register aliasing and in-place operand preservation."""
+
+    def test_dst_aliases_src0(self) -> None:
+        state = ScalarMachineState()
+        interp = ScalarInterpreter()
+
+        val_a = 0x10203040
+        val_b = 0x30405060
+        round_val = 0x01000100
+
+        state.set_vgpr(0, val_a)
+        state.set_vgpr(1, val_b)
+        state.set_vgpr(2, round_val)
+
+        instr = VLerpU8Instruction(
+            dst=Reg32(0, RegType.VGPR),
+            src0=VLerpOperand(Reg32(0, RegType.VGPR)),  # Aliased with dst
+            src1=VLerpOperand(Reg32(1, RegType.VGPR)),
+            src2=VLerpOperand(Reg32(2, RegType.VGPR)),
+        )
+
+        expected = oracle_v_lerp_u8(val_a, val_b, round_val)
+        res = interp.step(instr, state)
+        self.assertEqual(res, expected)
+        self.assertEqual(state.get_vgpr(0), expected)
+        # Verify src1 and src2 remain intact
+        self.assertEqual(state.get_vgpr(1), val_b)
+        self.assertEqual(state.get_vgpr(2), round_val)
+
+    def test_dst_aliases_src1(self) -> None:
+        state = ScalarMachineState()
+        interp = ScalarInterpreter()
+
+        val_a = 0x10203040
+        val_b = 0x30405060
+        round_val = 0x00010001
+
+        state.set_vgpr(0, val_a)
+        state.set_vgpr(1, val_b)
+        state.set_vgpr(2, round_val)
+
+        instr = VLerpU8Instruction(
+            dst=Reg32(1, RegType.VGPR),
+            src0=VLerpOperand(Reg32(0, RegType.VGPR)),
+            src1=VLerpOperand(Reg32(1, RegType.VGPR)),  # Aliased with dst
+            src2=VLerpOperand(Reg32(2, RegType.VGPR)),
+        )
+
+        expected = oracle_v_lerp_u8(val_a, val_b, round_val)
+        res = interp.step(instr, state)
+        self.assertEqual(res, expected)
+        self.assertEqual(state.get_vgpr(1), expected)
+        self.assertEqual(state.get_vgpr(0), val_a)
+        self.assertEqual(state.get_vgpr(2), round_val)
+
+    def test_dst_aliases_src2(self) -> None:
+        state = ScalarMachineState()
+        interp = ScalarInterpreter()
+
+        val_a = 0x10203040
+        val_b = 0x30405060
+        round_val = 0x01010101
+
+        state.set_vgpr(0, val_a)
+        state.set_vgpr(1, val_b)
+        state.set_vgpr(2, round_val)
+
+        instr = VLerpU8Instruction(
+            dst=Reg32(2, RegType.VGPR),
+            src0=VLerpOperand(Reg32(0, RegType.VGPR)),
+            src1=VLerpOperand(Reg32(1, RegType.VGPR)),
+            src2=VLerpOperand(Reg32(2, RegType.VGPR)),  # Aliased with dst
+        )
+
+        expected = oracle_v_lerp_u8(val_a, val_b, round_val)
+        res = interp.step(instr, state)
+        self.assertEqual(res, expected)
+        self.assertEqual(state.get_vgpr(2), expected)
+        self.assertEqual(state.get_vgpr(0), val_a)
+        self.assertEqual(state.get_vgpr(1), val_b)
+
+    def test_dst_aliases_src0_and_src1(self) -> None:
+        state = ScalarMachineState()
+        interp = ScalarInterpreter()
+
+        val = 0x55AA33CC
+        state.set_vgpr(0, val)
+
+        # Self-average: lerp(v0, v0, 0) == v0 and lerp(v0, v0, 1) == v0
+        instr = VLerpU8Instruction(
+            dst=Reg32(0, RegType.VGPR),
+            src0=VLerpOperand(Reg32(0, RegType.VGPR)),
+            src1=VLerpOperand(Reg32(0, RegType.VGPR)),
+            src2=VLerpOperand(Literal32(1)),
+        )
+
+        res = interp.step(instr, state)
+        self.assertEqual(res, val)
+        self.assertEqual(state.get_vgpr(0), val)
+
+    def test_dst_aliases_all_operands(self) -> None:
+        state = ScalarMachineState()
+        interp = ScalarInterpreter()
+
+        val = 0x7E8081FF
+        state.set_vgpr(0, val)
+
+        instr = VLerpU8Instruction(
+            dst=Reg32(0, RegType.VGPR),
+            src0=VLerpOperand(Reg32(0, RegType.VGPR)),
+            src1=VLerpOperand(Reg32(0, RegType.VGPR)),
+            src2=VLerpOperand(Reg32(0, RegType.VGPR)),
+        )
+
+        expected = oracle_v_lerp_u8(val, val, val)
+        self.assertEqual(expected, val)
+        res = interp.step(instr, state)
+        self.assertEqual(res, val)
+        self.assertEqual(state.get_vgpr(0), val)
+
+    def test_simd_multi_lane_aliased_dst_preservation(self) -> None:
+        state = SIMDState(num_lanes=32, exec_mask=0x0000FFFF)  # lanes 0..15 active, 16..31 inactive
+        interp = SIMDInterpreter()
+
+        original_v0 = [0x10000000 | lane for lane in range(32)]
+        for lane in range(32):
+            state.set_vgpr(lane, 0, original_v0[lane])
+            state.set_vgpr(lane, 1, 0x20202020)
+
+        instr = VLerpU8Instruction(
+            dst=Reg32(0, RegType.VGPR),
+            src0=VLerpOperand(Reg32(0, RegType.VGPR)),  # Aliased
+            src1=VLerpOperand(Reg32(1, RegType.VGPR)),
+            src2=VLerpOperand(Literal32(0)),
+        )
+
+        interp.step(instr, state)
+
+        for lane in range(32):
+            if lane < 16:
+                expected = oracle_v_lerp_u8(original_v0[lane], 0x20202020, 0)
+                self.assertEqual(state.get_vgpr(lane, 0), expected)
+            else:
+                self.assertEqual(state.get_vgpr(lane, 0), original_v0[lane])
+
+    def test_chained_in_place_accumulation(self) -> None:
+        state = ScalarMachineState()
+        interp = ScalarInterpreter()
+
+        # Filtering sequence: v0 = lerp(v0, v1, 1); v0 = lerp(v0, v2, 0)
+        state.set_vgpr(0, 0x00000000)
+        state.set_vgpr(1, 0x64646464)  # 100
+        state.set_vgpr(2, 0xC8C8C8C8)  # 200
+
+        instr1 = VLerpU8Instruction(
+            dst=Reg32(0, RegType.VGPR),
+            src0=VLerpOperand(Reg32(0, RegType.VGPR)),
+            src1=VLerpOperand(Reg32(1, RegType.VGPR)),
+            src2=VLerpOperand(Literal32(1)),
+        )
+        res1 = interp.step(instr1, state)
+        # (0 + 100 + 1) >> 1 = 50 (0x32)
+        self.assertEqual(res1, 0x32323232)
+        self.assertEqual(state.get_vgpr(0), 0x32323232)
+
+        instr2 = VLerpU8Instruction(
+            dst=Reg32(0, RegType.VGPR),
+            src0=VLerpOperand(Reg32(0, RegType.VGPR)),
+            src1=VLerpOperand(Reg32(2, RegType.VGPR)),
+            src2=VLerpOperand(Literal32(0)),
+        )
+        res2 = interp.step(instr2, state)
+        # (50 + 200 + 0) >> 1 = 125 (0x7D)
+        self.assertEqual(res2, 0x7D7D7D7D)
+        self.assertEqual(state.get_vgpr(0), 0x7D7D7D7D)
+
+
 if __name__ == "__main__":
     unittest.main()
