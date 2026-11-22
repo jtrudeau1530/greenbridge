@@ -9,6 +9,7 @@ import io
 import json
 import os
 import struct
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -300,6 +301,39 @@ class TestCli(unittest.TestCase):
     def test_missing_input(self):
         with contextlib.redirect_stderr(io.StringIO()):
             self.assertEqual(A.main(["/nonexistent", "--words", "/nonexistent.txt"]), 2)
+
+    @unittest.skipUnless(sys.platform == "win32", "the exclusive-lock repro needs Windows")
+    def test_locked_words_input_reports_rc_2_without_traceback(self):
+        # An exclusively locked (share-none) existing file passes the os.path.exists check, so the
+        # read_words() open must turn PermissionError into the one-line rc-2 error, not a traceback.
+        import ctypes
+        with tempfile.TemporaryDirectory() as tmp:
+            blob = os.path.join(tmp, "locked.awc")
+            with open(blob, "wb") as fh:
+                fh.write(b"\x00" * 16)
+            k32 = ctypes.windll.kernel32
+            handle = k32.CreateFileW(blob, 0x80000000, 0, None, 3, 0x80, None)
+            self.assertNotIn(handle, (0, -1), "could not lock the probe file")
+            try:
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+                    rc = A.main([blob, "--words", blob])
+            finally:
+                k32.CloseHandle(handle)
+            self.assertEqual(rc, 2)
+            self.assertIn("cannot read", err.getvalue())
+            self.assertIn("Permission denied", err.getvalue())
+            self.assertNotIn("Traceback", err.getvalue())
+
+    def test_unreadable_json_words_report_rc_2_without_traceback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            words = write(os.path.join(tmp, "words.json"), "{not json")
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+                rc = A.main([tmp, "--words", words])
+            self.assertEqual(rc, 2)
+            self.assertIn("cannot read", err.getvalue())
+            self.assertNotIn("Traceback", err.getvalue())
 
 
 if __name__ == "__main__":

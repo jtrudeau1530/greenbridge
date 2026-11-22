@@ -181,8 +181,13 @@ def main(argv=None) -> int:
     index, bad = [], 0
     used_names = set()
     for path in a.files:
-        with open(path, "rb") as f:
-            data = f.read()
+        try:
+            with open(path, "rb") as f:
+                data = f.read()
+        except OSError as error:
+            print(f"{path}: cannot read input: {error}", file=sys.stderr)
+            bad += 1
+            continue
         stem = os.path.splitext(os.path.basename(path))[0]
         if data[:4] == MAGIC:
             items = [(0, None, data)]

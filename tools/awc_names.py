@@ -327,7 +327,11 @@ def main(argv=None) -> int:
 
     words = []
     for path in a.words:
-        words += read_words(path)
+        try:
+            words += read_words(path)
+        except (OSError, ValueError) as error:
+            print(f"awc_names: error: cannot read {path}: {error}", file=sys.stderr)
+            return 2
     waves = conversation_waves(a.conversations)
     dictionary = Dictionary(words + waves)
     bases = dictionary.bases(a.min_token)
