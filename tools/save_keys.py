@@ -339,7 +339,14 @@ def main(argv=None):
     a = ap.parse_args(argv)
     if a.cmd == "resolve" and a.compose < 0:
         r.error("--compose must be 0 or more")
-    return {"collect": cmd_collect, "resolve": cmd_resolve}[a.cmd](a) or 0
+    try:
+        return {"collect": cmd_collect, "resolve": cmd_resolve}[a.cmd](a) or 0
+    except OSError as e:
+        if e.filename is None:                    # not a file we were asked to read (a closed pipe, say)
+            raise
+        # A missing or unreadable input or --dict file is one line naming it, not a traceback.
+        print(f"error: {e.filename}: {e.strerror or e}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":

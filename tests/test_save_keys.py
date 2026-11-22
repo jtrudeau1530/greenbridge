@@ -216,6 +216,58 @@ class MalformedJsavTest(unittest.TestCase):
         self.assertIn("0 distinct keys", r.stdout)
 
 
+class MissingFilesTest(unittest.TestCase):
+    """A path that can't be read is one error line naming it and exit code 1, for both commands."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.save = os.path.join(self.tmp.name, "save.json")
+        with open(self.save, "w", encoding="utf-8") as f:
+            json.dump({key("health"): 1}, f)
+        self.words = os.path.join(self.tmp.name, "words.txt")
+        with open(self.words, "wb") as f:
+            f.write(b"health\0")
+        self.missing = os.path.join(self.tmp.name, "nope.jsav")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def cli(self, *args):
+        tool = os.path.join(ROOT, "tools", "save_keys.py")
+        return subprocess.run([sys.executable, "-I", tool, *args], cwd=ROOT, capture_output=True, text=True)
+
+    def assert_one_error_line(self, r, path):
+        self.assertEqual(r.returncode, 1, r.stderr)
+        self.assertNotIn("Traceback", r.stderr)
+        self.assertEqual(len(r.stderr.strip().splitlines()), 1, r.stderr)
+        self.assertTrue(r.stderr.startswith("error: "), r.stderr)
+        self.assertIn(path, r.stderr)
+
+    def test_collect_names_a_missing_input(self):
+        self.assert_one_error_line(self.cli("collect", self.missing), self.missing)
+
+    def test_collect_names_the_missing_one_of_several(self):
+        self.assert_one_error_line(self.cli("collect", self.save, self.missing), self.missing)
+
+    def test_resolve_names_a_missing_input(self):
+        self.assert_one_error_line(self.cli("resolve", self.missing, "--dict", self.words), self.missing)
+
+    def test_resolve_names_a_missing_dictionary(self):
+        r = self.cli("resolve", self.save, "--dict", self.missing)
+        self.assert_one_error_line(r, self.missing)
+
+    def test_resolve_with_a_missing_dictionary_writes_no_report(self):
+        out = os.path.join(self.tmp.name, "names.json")
+        r = self.cli("resolve", self.save, "--dict", self.missing, "--out", out)
+        self.assert_one_error_line(r, self.missing)
+        self.assertFalse(os.path.exists(out))
+
+    def test_readable_files_still_resolve(self):
+        r = self.cli("resolve", self.save, "--dict", self.words)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("1 distinct keys", r.stdout)
+
+
 class DirectoryScanTest(unittest.TestCase):
     """A directory of saves must include .jsav files, not just .bin/.json/extensionless names."""
 
