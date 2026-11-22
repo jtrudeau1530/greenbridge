@@ -200,10 +200,13 @@ class WaveMachine(cpu_ref.Machine):
         op = ins["op"]
         base = cpu_ref.base_op(op)
         a = ins["args"]
-        if base in _BRANCHES:
-            return self._branch(base, a)
         if op == "exp":
             return self._export(ins)
+        mods = ins.get("mods") or []
+        if mods and base not in cpu_ref.FLOAT_OPS:
+            raise Unsupported(op, self.pc, f"modifier(s) {', '.join(mods)} are not modelled")
+        if base in _BRANCHES:
+            return self._branch(base, a)
         if base in ("v_add_nc_u32", "v_sub_nc_u32", "v_subrev_nc_u32", "v_mul_lo_u32"):
             self._expect(ins, 3)
             for lane in self._active_lanes():
@@ -273,6 +276,8 @@ class WaveMachine(cpu_ref.Machine):
             self._write_mask(a[0], v)
             return None
         if base == "s_mov_b32" and self._touches_mask(a):
+            if any(x["k"] == "special" and x["t"] in ("exec", "vcc") for x in a):
+                self._check_width(base, op)
             self._expect(ins, 2)
             v = a[1]["v"] & MASK32 if a[1]["k"] == "imm" else self._read_mask(a[1]) & MASK32
             self._write_mask(a[0], v)
@@ -327,6 +332,9 @@ class WaveMachine(cpu_ref.Machine):
 
     def _export(self, ins):
         a = ins["args"]
+        bad_mods = [m for m in (ins.get("mods") or []) if m not in ("done", "vm")]
+        if bad_mods:
+            raise Unsupported("exp", self.pc, f"modifier(s) {', '.join(bad_mods)} are not modelled")
         if len(a) != 5 or a[0].get("t") != "mrt0" or any(x["k"] != "vgpr" for x in a[1:]):
             raise Unsupported("exp", self.pc, "only `exp mrt0 vA, vB, vC, vD` is modelled")
         for lane in self._active_lanes():

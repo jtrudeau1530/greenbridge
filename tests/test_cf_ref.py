@@ -848,6 +848,11 @@ class ExportHaltStepAndErrorTests(CfRefTestCase):
             (["s_and_b32 vcc_lo, vcc_lo, scc", "s_endpgm"], 32),
             (["v_cmp_eq_u32_e64 v0, v0, 0", "s_endpgm"], 32),
             (["v_cmp_eq_u32_e32 vcc, v0", "s_endpgm"], 32),
+            (["v_add_nc_u32_e64 v2, v1, 1 clamp", "s_endpgm"], 32),
+            (["exp mrt0 v0, v0, v1, v1 done compr vm", "s_endpgm"], 32),
+            (["v_cmp_eq_u32_e32 vcc_lo, v0, v1 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf", "s_endpgm"], 32),
+            (["s_mov_b32 vcc, 1", "s_endpgm"], 64),
+            (["s_mov_b32 exec, 1", "s_endpgm"], 64),
         ]
         for insns, wave in unsupported_programs:
             with self.subTest(insn=insns[0], wave=wave):
