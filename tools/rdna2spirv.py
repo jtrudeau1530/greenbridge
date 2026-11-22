@@ -3138,20 +3138,20 @@ class Gen:
         return v
 
     def turn_angle(self, x):
-        """Reduce a turn count to [-0.5, 0.5) before scaling by 2*pi.
+        """Reduce a turn count to [-0.5, 0.5] before scaling by 2*pi (SHADER-88).
 
         RDNA's v_sin/v_cos take turns and range-reduce in turns. Scaling first loses the fractional part for large
         inputs (one f32 ulp at 255 turns is ~1.2e-4 rad) and leaves Sin outside the [-pi, pi] range where Vulkan
-        guarantees its precision. Fract first; keep -0 as -0 so Sin's sign survives. NaN and infinity stay NaN
-        through Fract/compare/select.
+        guarantees its precision. x - RoundEven(x) is exact in binary32 for every finite x, unlike Fract(x) (rounds
+        1 - |x| for a negative x: -2**-26 became +0, and -0.1 was ~1.7e-7 off). RoundEven rather than Round so +-0.5
+        reduce symmetrically. A zero keeps its sign (x - RoundEven(x) would turn -0 into +0). NaN and infinity stay
+        NaN through the subtraction.
         """
-        frac, gt, adj, sel, zero, t, arg = (self.tmp() for _ in range(7))
-        self.emit(f"{frac} = OpExtInst %float %glsl Fract {x}")
-        self.emit(f"{gt} = OpFOrdGreaterThan %bool {frac} {self.fconst(0.5)}")
-        self.emit(f"{adj} = OpFSub %float {frac} {self.fconst(1.0)}")
-        self.emit(f"{sel} = OpSelect %float {gt} {adj} {frac}")
+        rnd, d, zero, t, arg = (self.tmp() for _ in range(5))
+        self.emit(f"{rnd} = OpExtInst %float %glsl RoundEven {x}")
+        self.emit(f"{d} = OpFSub %float {x} {rnd}")
         self.emit(f"{zero} = OpFOrdEqual %bool {x} {self.fconst(0.0)}")
-        self.emit(f"{t} = OpSelect %float {zero} {x} {sel}")
+        self.emit(f"{t} = OpSelect %float {zero} {x} {d}")
         self.emit(f"{arg} = OpFMul %float {t} {self.fconst(6.283185307179586)}")
         return arg
 
