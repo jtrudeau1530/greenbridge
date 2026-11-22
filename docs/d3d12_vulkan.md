@@ -1382,6 +1382,32 @@ The trace will enumerate them.
   texture (an alignment the description asked for is kept). **Implemented** and compared field by field with the
   PC runtime and WARP by `d3d12_resource_desc_test`: 25 committed and reserved buffers and 2D, array, volume and
   multisampled textures (measured on an RTX 3060 host and WARP, Windows 10).
+- **Invalid arguments (D3D-49).** `CreateCommittedResource`, `CreateDescriptorHeap`, `CreateCommandQueue`,
+  `CreateFence` and `Map` return the host PC runtime's HRESULTs (no debug layer) for the cases in
+  `compare_invalid_arguments` (`d3d12_vulkan_device_test`): invalid ones, their valid neighbours, and
+  `ALLOW_RENDER_TARGET`/`ALLOW_DEPTH_STENCIL` on every format both devices create. Rules the host keeps that are easy
+  to get wrong: a committed resource takes no heap flag except `SHARED`, `ALLOW_DISPLAY` (textures only),
+  `HARDWARE_PROTECTED`, `CREATE_NOT_RESIDENT` and `CREATE_NOT_ZEROED`; a buffer refuses `ALLOW_SIMULTANEOUS_ACCESS`;
+  MSAA takes quality 0 or one of the two standard patterns; a buffer may be `ALLOW_RENDER_TARGET` but not
+  `ALLOW_DEPTH_STENCIL`, and is aligned 0 or 64 KiB only; upload heaps start in any part of `GENERIC_READ` (or
+  `COMMON`), readback heaps in `COPY_DEST` or `COMMON`, neither with UAVs; `ALLOW_DEPTH_STENCIL` is accepted for every
+  format of the R32, R16, R24G8 and R32G8X24 families and nothing else; a clear value needs a render target or depth
+  buffer and a format of the resource's family; descriptor heaps may have zero descriptors; non-monitored fences are
+  refused; a null output is `S_FALSE` (a capability check) except for `CreateCommandQueue`, which answers
+  `E_UNEXPECTED`, and `CreateDescriptorHeap` answers it before its flag, type and node rules (`S_FALSE` even for a
+  shader-visible RTV heap) where committed resources and fences check their arguments first; a `GPU_UPLOAD` heap is
+  refused, since `CheckFeatureSupport` reports `OPTIONS16.GPUUploadHeapSupported` FALSE (a host with GPU upload
+  heaps, which needs Resizable BAR, accepts it, so that case is compared only on a host without them); a
+  global-realtime queue is `DXGI_ERROR_ACCESS_DENIED` without the privilege; `Map` refuses a
+  non-empty read range past the buffer. Not compared, because the host faults or the layer cannot follow it: a null
+  heap-properties or descriptor-heap description (the host faults), more mips than the full chain (the RX 9070 XT
+  runtime keeps up to 16 on a 16×16 texture and dies on 17), `D32_FLOAT` and `D16_UNORM` as render targets and the R32
+  and R16 colour formats as depth buffers (accepted by the host; the layer creates the Vulkan format of the same name,
+  and the Vulkan drivers measured can't make that attachment, so the test prints these instead of failing),
+  cross-adapter resources (the host takes a row-major texture on a `SHARED | SHARED_CROSS_ADAPTER` heap; the layer has
+  no cross-adapter sharing), an unknown descriptor heap type (accepted by the host), and the driver's own answers:
+  R32G32B32 render targets, 2D textures wider than 16384, `L1` custom heaps, 16x MSAA and video formats and queues
+  differ between the RX 9070 XT, an integrated Radeon and WARP. The rest of the table agrees on all three.
 - `CreateHeap`: reserve a VA range with the requested size/alignment. `CreatePlacedResource`: assign the resource
   the range at `heap_va + offset`; a buffer uses that range in the arena, an image uses the offset as a key and
   binds its own memory. Vulkan image alignment can exceed D3D12's 64 KiB; because images do not share the arena,
