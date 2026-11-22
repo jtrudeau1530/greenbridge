@@ -3853,6 +3853,20 @@ class Gen:
         elif op == "s_movk_i32":
             v = a[1]["v"] & 0xFFFF
             self.dst(a[0], self.cu(v - 0x10000 if v & 0x8000 else v))
+        elif op in ("s_cmov_b32", "s_cmovk_i32"):
+            # D = SCC ? S0 : D (s_cmovk_i32: S0 is the 16-bit immediate, sign-extended). SCC is read, not written.
+            if a[0]["k"] != "sgpr":
+                raise Unsupported(op + " destination")
+            if op == "s_cmovk_i32":
+                v = a[1]["v"] & 0xFFFF
+                x = self.cu((v - 0x10000 if v & 0x8000 else v) & 0xFFFFFFFF)
+            else:
+                x = self.src_u(a[1])
+            old, c, r = self.tmp(), self.tmp(), self.tmp()
+            self.emit(f"{old} = OpCopyObject %uint {self.load_reg('sgpr', a[0]['r'])}")
+            self.emit(f"{c} = OpLoad %uint %scc")
+            self.emit(f"{r} = OpSelect %uint {self.tmp_bool_nz(c)} {x} {old}")
+            self.dst(a[0], r)
         elif op.startswith("v_cmp_") and not op.startswith("v_cmp_class") and not op.endswith(("_u64", "_i64")):
             self.compare(op, a, scalar=False)
         elif op.startswith("v_cmpx_") and not op.startswith("v_cmpx_class") and not op.endswith(("_u64", "_i64")):
