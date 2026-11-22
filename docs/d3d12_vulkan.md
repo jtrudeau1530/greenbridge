@@ -189,6 +189,7 @@ What is implemented (all of it testable without the game):
   destination's. The box fits the source's padded mip, so the scratch holds every block the destination reads). Each
   range and buffer bound is checked before anything is written. A copy runs in `TRANSFER_SRC`/`TRANSFER_DST`, or
   in place in `GENERAL` when the texture is in `COMMON`: that is D3D12's implicit promotion to a copy state.
+  A same-subresource `CopyTextureRegion` uses `GENERAL` for both sides; preparation rejects overlapping regions.
   A 3D mip is one subresource. Boxed volume transfers preserve the full footprint's row and slice strides.
   Whole-resource depth/stencil copies issue one `vkCmdCopyImage` per aspect, with a transfer write-to-read/write
   dependency between them; all mips and layers stay batched within each aspect. This avoids stencil corruption
