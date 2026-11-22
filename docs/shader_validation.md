@@ -1101,6 +1101,48 @@ E `0x7bff`, F `0x3c01`, G `0x3c01`), which the translator produces across all 7 
 `fma_mix_odd` in both nearest-even and toward-zero modes (SHADER-297). On Vulkan, using `fma_mix_odd` matches the
 exact single-rounded hardware words for all inputs.
 
+### `v_cvt_pknorm_*` NaN and rounding on RDNA2 (`tools/pknorm_probe.py`, SHADER-339)
+
+`docs/design.md` said `v_cvt_pknorm_i16_f32` / `v_cvt_pknorm_u16_f32` give 0 for a NaN, as `v_cvt_i32_f32` does,
+without a hardware measurement. The probe puts each NaN pattern in S0 and in S1 next to a finite value: quiet
+(`0x7fc00000`, `0xffc00000`), quiet with a payload (`0x7fc00001`, `0x7fffffff`, `0xffffffff`), signalling
+(`0x7f800001`, `0xff800001`, `0x7fa00000`). Finite values are the semantic test's (±0, ±1, ±0.5, ±2, ±inf,
+subnormals, steps of 1/32767 and 1/65535). It also has near-tie inputs: f32 values whose product with 32767 (or 65535)
+rounds to exactly k + 0.5 in f32, while the exact product is just below or just above it. There the translator's
+`OpFMul` then `RoundEven` and a single rounding of the exact product differ by one, in either direction.
+
+```
+python -I tools/pknorm_probe.py                 # the translator, on the CPU interpreter
+python -I tools/pknorm_probe.py --oracle hw     # also the native instruction on an AMD GPU (hardware oracle)
+```
+
+The `hw` side runs one lane per case in wave32 and wave64, under five MODEs:
+- the one inferred for the game (IEEE 0, DX10_CLAMP 1, f32 denormals flushed, f16/f64 kept, nearest);
+- the same with IEEE 1;
+- the same with DX10_CLAMP 0;
+- the same with both IEEE 1 and DX10_CLAMP 0;
+- the same with f32 denormals kept.
+
+It reports the NaN halves that give 0, the words equal to the translator's, and the near-tie words equal to a single
+rounding of the exact product. Exit 0 means every hardware word equals the translator's, 1 means one differs, 77
+means the oracle is unavailable. `tests/test_pknorm_probe.py` checks four near-tie words against a derivation written
+out by hand, and checks that the translator side rounds twice there and gives 0 for a NaN half.
+
+Results (134 cases per run):
+
+| GPU | Driver | NaN halves giving 0 | near ties: single / translator | other words equal |
+|---|---|---|---|---|
+| AMD Radeon iGPU (Ryzen 5 7600X, RDNA2, gfx1036), Windows 11, HIP backend, AMD clang (rocm-sdk-core 10.0.0) | 32.0.21045.29003 | 74 of 74 | 28 of 28 / 0 of 28 | 34 of 34 |
+
+The ten runs (two wave sizes, five MODEs) give the same words. A NaN gives 0 on RDNA2, as the translator assumes,
+whatever the IEEE, DX10_CLAMP and f32 denormal fields. The rounding does not match. The hardware rounds the exact
+product once, to nearest even. Examples:
+- `0x38400180` (exact 1.5 - 1.4e-9) gives 1, where the translator gives 2;
+- `0x3c004101` (exact 256.5 + 1.5e-5) gives 257, where the translator gives 256.
+
+The translator is not changed here. It needs the exact product: the product's rounding error is exact through `Fma`
+(`Fma(x, s, -p)`), and only its sign matters on a tie.
+
 ### f16 output modifiers, clamp and `v_fma_mix*` operands on RDNA2 (SHADER-135)
 
 *Measured on an RDNA2 iGPU (gfx1036), AMD Windows driver 32.0.21044.64, HIP backend, AMD clang 23.0.0git, `main`
