@@ -982,5 +982,149 @@ class TestBoundaryExtremesAndBitPatterns(unittest.TestCase):
                 self.assertEqual(reconstructed_i, expected_i)
 
 
+# ==============================================================================
+# Mutants for Mutation Detection
+# ==============================================================================
+
+def mutant_low_word_instead_of_high(opcode: Opcode, s0: int, s1: int) -> int:
+    """Mutant 1: Returns the low 32 bits instead of high 32 bits."""
+    if opcode == Opcode.V_MUL_HI_U32:
+        return (s0 * s1) & MASK32
+    else:
+        return (to_i32(s0) * to_i32(s1)) & MASK32
+
+
+def mutant_unsigned_for_signed(opcode: Opcode, s0: int, s1: int) -> int:
+    """Mutant 2: Executes unsigned multiplication even when signed is requested."""
+    return ref_mul_hi_u32(s0, s1)
+
+
+def mutant_signed_for_unsigned(opcode: Opcode, s0: int, s1: int) -> int:
+    """Mutant 3: Executes signed multiplication even when unsigned is requested."""
+    return ref_mul_hi_i32(s0, s1)
+
+
+def mutant_shift_31(opcode: Opcode, s0: int, s1: int) -> int:
+    """Mutant 4: Shifts by 31 bits instead of 32."""
+    if opcode == Opcode.V_MUL_HI_U32:
+        return ((s0 * s1) >> 31) & MASK32
+    else:
+        return (((to_i32(s0) * to_i32(s1)) & MASK64) >> 31) & MASK32
+
+
+def mutant_shift_33(opcode: Opcode, s0: int, s1: int) -> int:
+    """Mutant 5: Shifts by 33 bits instead of 32."""
+    if opcode == Opcode.V_MUL_HI_U32:
+        return ((s0 * s1) >> 33) & MASK32
+    else:
+        return (((to_i32(s0) * to_i32(s1)) & MASK64) >> 33) & MASK32
+
+
+def mutant_addition_operator(opcode: Opcode, s0: int, s1: int) -> int:
+    """Mutant 6: Replaces multiplication with addition."""
+    return (s0 + s1) & MASK32
+
+
+class TestNegativeControlsAndMutation(unittest.TestCase):
+    """Test suite for negative controls, syntax rejection, and mutation detection."""
+
+    def test_syntax_rejection_empty_lines(self) -> None:
+        with self.assertRaises(ValueError):
+            parse_asm_line("")
+        with self.assertRaises(ValueError):
+            parse_asm_line("   ; comment only")
+
+    def test_syntax_rejection_invalid_opcode(self) -> None:
+        for bad_op in ("v_mul_lo_u32", "v_mul_f32", "v_add_u32", "bad_opcode"):
+            with self.assertRaises(ValueError):
+                parse_asm_line(f"{bad_op} v0, v1, v2")
+
+    def test_syntax_rejection_operand_count(self) -> None:
+        with self.assertRaises(ValueError):
+            parse_asm_line("v_mul_hi_u32 v0, v1")
+        with self.assertRaises(ValueError):
+            parse_asm_line("v_mul_hi_u32 v0, v1, v2, v3")
+
+    def test_syntax_rejection_dst_sgpr(self) -> None:
+        with self.assertRaises(ValueError):
+            parse_asm_line("v_mul_hi_u32 s0, v1, v2")
+
+    def test_syntax_rejection_out_of_bounds_registers(self) -> None:
+        with self.assertRaises(ValueError):
+            parse_asm_line("v_mul_hi_u32 v256, v1, v2")
+        with self.assertRaises(ValueError):
+            parse_asm_line("v_mul_hi_u32 v0, s110, v2")
+
+    def test_syntax_rejection_malformed_tokens(self) -> None:
+        with self.assertRaises(ValueError):
+            parse_asm_line("v_mul_hi_u32 v0, bad_token_xyz, v2")
+
+    def test_mutation_detects_low_word_instead_of_high(self) -> None:
+        s0 = 0x80000000
+        s1 = 4
+        # (0x80000000 * 4) = 0x200000000 -> hi = 2, lo = 0
+        correct = ref_mul_hi_u32(s0, s1)
+        sabotaged = mutant_low_word_instead_of_high(Opcode.V_MUL_HI_U32, s0, s1)
+        self.assertEqual(correct, 2)
+        self.assertEqual(sabotaged, 0)
+        self.assertNotEqual(sabotaged, correct)
+
+    def test_mutation_detects_signedness_confusion(self) -> None:
+        # -1 * -1 = +1: signed hi = 0, unsigned hi = 0xFFFFFFFE
+        s0 = 0xFFFFFFFF
+        s1 = 0xFFFFFFFF
+        correct_i = ref_mul_hi_i32(s0, s1)
+        sabotaged_i = mutant_unsigned_for_signed(Opcode.V_MUL_HI_I32, s0, s1)
+        self.assertEqual(correct_i, 0)
+        self.assertEqual(sabotaged_i, 0xFFFFFFFE)
+        self.assertNotEqual(sabotaged_i, correct_i)
+
+        correct_u = ref_mul_hi_u32(s0, s1)
+        sabotaged_u = mutant_signed_for_unsigned(Opcode.V_MUL_HI_U32, s0, s1)
+        self.assertEqual(correct_u, 0xFFFFFFFE)
+        self.assertEqual(sabotaged_u, 0)
+        self.assertNotEqual(sabotaged_u, correct_u)
+
+    def test_mutation_detects_shift_displacement_error(self) -> None:
+        s0 = 0x80000000
+        s1 = 2
+        # Product = 0x100000000 (1 << 32)
+        correct = ref_mul_hi_u32(s0, s1)
+        self.assertEqual(correct, 1)
+
+        # Shift 31 gives 2
+        sabotaged_31 = mutant_shift_31(Opcode.V_MUL_HI_U32, s0, s1)
+        self.assertEqual(sabotaged_31, 2)
+        self.assertNotEqual(sabotaged_31, correct)
+
+        # Shift 33 gives 0
+        sabotaged_33 = mutant_shift_33(Opcode.V_MUL_HI_U32, s0, s1)
+        self.assertEqual(sabotaged_33, 0)
+        self.assertNotEqual(sabotaged_33, correct)
+
+    def test_mutation_detects_addition_instead_of_multiplication(self) -> None:
+        s0 = 0x10000
+        s1 = 0x10000
+        correct = ref_mul_hi_u32(s0, s1)
+        sabotaged = mutant_addition_operator(Opcode.V_MUL_HI_U32, s0, s1)
+        self.assertEqual(correct, 1)
+        self.assertEqual(sabotaged, 0x20000)
+        self.assertNotEqual(sabotaged, correct)
+
+    def test_mutation_detects_exec_mask_leakage(self) -> None:
+        sim = SIMDWavefront(wave_size=32)
+        sim.store_vgpr_wave(0, [OLD_VGPR_SENTINEL] * 32)
+        sim.store_vgpr_wave(1, [0x80000000] * 32)
+        sim.store_vgpr_wave(2, [2] * 32)
+
+        # Only lane 0 active
+        sim.exec_mask = 0x00000001
+        res = sim.step_v_mul_hi(Opcode.V_MUL_HI_U32, 0, 1, 2)
+
+        self.assertEqual(res[0], 1)
+        for lane in range(1, 32):
+            self.assertEqual(res[lane], OLD_VGPR_SENTINEL, f"Inactive lane {lane} was mutated!")
+
+
 if __name__ == "__main__":
     unittest.main()
