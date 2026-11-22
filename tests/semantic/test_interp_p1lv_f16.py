@@ -402,15 +402,8 @@ class InterpF16GuardsAndRejectionsTests(unittest.TestCase):
                 "exp mrt0 v2, v2, v2, v2 done vm",
                 "s_endpgm",
             ]),
-            ("v_interp_p1lv_f16 I source v6", [
-                "v_mov_b32_e32 v0, 0",
-                "v_mov_b32_e32 v6, v0",
-                "v_mov_b32_e32 v10, 0",
-                "v_interp_p1lv_f16 v2, v6, attr0.x, v10",
-                "v_interp_p2_f16 v2, v1, attr0.x, v2",
-                "exp mrt0 v2, v2, v2, v2 done vm",
-                "s_endpgm",
-            ]),
+            # An I source holding a zeroed v0 ("v_mov v0, 0; v_mov v6, v0") is a computed I of 0, which the translator
+            # models since #1545 (computed I/J barycentrics) instead of rejecting; it is no longer a bad case here.
             ("v_interp_p2_f16 J source v0", [
                 "v_mov_b32_e32 v10, 0",
                 "v_interp_p1lv_f16 v2, v0, attr0.x, v10",
