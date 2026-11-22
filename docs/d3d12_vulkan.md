@@ -2088,7 +2088,7 @@ struct entry {               // 10 uints = 40 bytes
 | 100k | `host_visible` | 151.640 (6.59) | 129.732 (7.71) | 11548.004 (0.09) | 2336.777 (0.43) | 163852.450 (0.01; `4096x15`, n=9) |
 | 100k | `host_device_local` | 5.468 (182.87) | 4.764 (209.93) | 72.233 (13.84) | 99.000 (10.10) | 690.168 (1.45) |
 
-Three consequences for the runtime and table layout (Intel and Apple numbers remain open via `vk_descriptor_bench`; AMD RDNA3 follows):
+Three consequences for the runtime and table layout (additional GPU measurements follow, including AMD RDNA3):
 
 1. **In `DEVICE_LOCAL` VRAM, the hash probe itself is cheap at all three sizes:** wave-uniform full-table sweeps run at `5.4–6.1 us / 1M` (`3.0–3.7 us / 1M` net after subtracting the `baseline_uniform` key-read dispatch), and divergent lookups hit `25.7–37.7 us / 1M` (`17.2–28.9 us / 1M` net).
 2. **`BindlessSet::create()` currently allocates PCIe `HOST_VISIBLE | HOST_COHERENT` system memory (`runtime/src/vulkan_bindless.h`):** once working sets exceed cache at 10k–100k entries, `host_visible` slows down by **9.6x–28x** even on wave-uniform full sweeps, **202x–335x** on divergent T# hits (`59x–181x` on T#+S# pairs), and **666x–755x** on 8-probe misses. `host_device_local` (ReBAR `DEVICE_LOCAL | HOST_VISIBLE | HOST_COHERENT`) matches `device_local` across all 1k–10k cases and 100k uniform sweeps, and is 2.1x–3.2x slower than pure `device_local` on 100k divergent lookups (80 MiB, spilling L2) while staying 24x–237x faster than `host_visible`. Staging binding 2 to `DEVICE_LOCAL` (or preferring `DEVICE_LOCAL | HOST_VISIBLE` when small) avoids this cliff without touching the shader contract.
@@ -2116,6 +2116,31 @@ On this GPU:
 4. **The 100k `divergent_miss` difference is table geometry, not the vendor.** `bc8e604`'s bounded relocation is already in this run and keeps the table at `524,288` slots (`19.07%` load, `max_probes=8`); the NVIDIA table above predates it and grew to `2,097,152` slots (`4.8%`, `max_probes=5`). More probes per lookup is why `290 us / 1M` here exceeds the NVIDIA `217 us / 1M`, even though the 1k–10k rows are close. The relocation is therefore already paying for itself (a 4x smaller 100k table), and the two 100k rows are not a vendor comparison.
 
 Raw CSV rows: [D3D-56 report](https://github.com/ItsNotRexed/Leonida/issues/313#issuecomment-7074181793), addendum with the repeatability runs: [same issue](https://github.com/ItsNotRexed/Leonida/issues/313#issuecomment-7074220711).
+
+**Measured (D3D-56, Intel integrated + RTX 5070 Ti Laptop).** These synthetic runs use `vk_descriptor_bench` from revision `f85582e`, Windows 11 Pro Insider Preview `10.0.29704`, MSVC 19.51, Vulkan SDK 1.4.363.0, and the exact `4096 x 64` invocations x `64` iterations (`16.78M` single / `33.55M` T#+S# pair lookups, median of 25 reps). NVIDIA runs used `--sizes 1000,1000,10000,100000 --warmup 200`; the Intel run additionally duplicated 100k (`--sizes 1000,1000,10000,100000,100000 --warmup 200`). The first 1k block is excluded because its `baseline_uniform` timing differed from the duplicate (Intel device-local: `0.771 ms` vs `0.594 ms`; NVIDIA device-local: `0.0555 ms` vs `0.0765 ms`). For Intel 100k, the second block is retained after the duplicate confirmed stable timing per allocation. Retained rows were not auto-scaled. Intel's device-local and host-visible placements ran together on the integrated GPU. NVIDIA device-local and ReBAR were measured in separate processes. The RTX 5070 Ti Laptop is `0x10de:0x2f58` (driver `621.01`, Vulkan `1.4.357`); Intel Graphics is `0x8086:0x7d67` (driver `32.0.101.8132`, Vulkan `1.4.325`).
+
+| GPU / entries (cap / load / bytes / mean probes) | Placement | `uniform_tsharp_hit` (us/1M, Glk/s) | `uniform_pair_ts` (us/1M, Glk/s) | `divergent_tsharp_hit` (us/1M, Glk/s) | `divergent_pair_ts` (us/1M, Glk/s) | `divergent_miss` (us/1M, Glk/s) |
+|---|---|---|---|---|---|---|
+| Intel iGPU, 1k (4,096 / 24.4% / 160 KiB / 1.316) | `device_local` | 85.669 (11.67) | 76.483 (13.07) | 468.524 (2.13) | 431.528 (2.32) | 1,735.402 (0.58) |
+| Intel iGPU, 1k | `host_visible` | 85.356 (11.72) | 76.500 (13.07) | 468.750 (2.13) | 425.419 (2.35) | 1,741.669 (0.57) |
+| Intel iGPU, 10k (65,536 / 15.3% / 2.50 MiB / 1.310) | `device_local` | 86.806 (11.52) | 76.642 (13.05) | 597.170 (1.67) | 507.250 (1.97) | 2,495.724 (0.40) |
+| Intel iGPU, 10k | `host_visible` | 87.665 (11.41) | 76.415 (13.09) | 597.099 (1.67) | 506.874 (1.97) | 2,496.882 (0.40) |
+| Intel iGPU, 100k (524,288 / 19.1% / 20.00 MiB / 1.416) | `device_local` | 101.132 (9.89) | 84.286 (11.86) | 672.021 (1.49) | 964.268 (1.04) | 5,580.289 (0.18) |
+| Intel iGPU, 100k | `host_visible` | 100.269 (9.97) | 84.437 (11.84) | 668.788 (1.50) | 975.549 (1.02) | 5,581.019 (0.18) |
+| RTX 5070 Ti Laptop, 1k (4,096 / 24.4% / 160 KiB / 1.316) | `device_local` | 11.028 (90.68) | 9.652 (103.60) | 48.388 (20.67) | 48.201 (20.75) | 195.543 (5.11) |
+| RTX 5070 Ti Laptop, 1k | `host_device_local` (ReBAR) | 11.072 (90.32) | 9.682 (103.29) | 51.245 (19.51) | 48.427 (20.65) | 194.840 (5.13) |
+| RTX 5070 Ti Laptop, 10k (65,536 / 15.3% / 2.50 MiB / 1.310) | `device_local` | 11.562 (86.49) | 10.164 (98.38) | 63.725 (15.69) | 66.871 (14.95) | 367.062 (2.72) |
+| RTX 5070 Ti Laptop, 10k | `host_device_local` (ReBAR) | 11.494 (87.00) | 10.184 (98.19) | 63.858 (15.66) | 66.909 (14.95) | 297.104 (3.37) |
+| RTX 5070 Ti Laptop, 100k (524,288 / 19.1% / 20.00 MiB / 1.416) | `device_local` | 11.993 (83.38) | 46.172 (21.66) | 116.020 (8.62) | 82.513 (12.12) | 788.086 (1.27) |
+| RTX 5070 Ti Laptop, 100k | `host_device_local` (ReBAR) | 9.186 (108.86) | 46.162 (21.66) | 99.737 (10.03) | 141.439 (7.07) | 632.504 (1.58) |
+
+On these devices:
+
+1. **The Intel placements are close on the lookup workloads.** Gross dispatch times for `device_local` and `host_visible` track within 1.5%; after subtracting `baseline_uniform`, differences are within 1.7% through 10k and within 11.2% on 100k uniform hits. At 100k, the baseline itself is repeatable per allocation but differs between them (`0.730 ms` device-local vs `0.608 ms` host-visible), so the net uniform rows carry more uncertainty. Both allocations use the iGPU's shared system memory; this does not predict discrete-GPU PCIe behavior.
+2. **NVIDIA ReBAR is close to device-local for uniform sweeps at 1k–10k and at 100k T#+S# pairs.** The 100k divergent and miss cases differ by workload (ReBAR is not uniformly faster or slower), so this run does not support a blanket placement ranking.
+3. **The NVIDIA host-visible run is omitted.** A separate full run returned `vkWaitForFences -> -4` while measuring the 10k host-visible cases; those partial timings are not reported. A safer capped profile is needed before drawing conclusions about PCIe system-memory lookup on this laptop.
+
+The run is synthetic and contains no game data. Raw retained rows and the corrected methodology are recorded in [the D3D-56 report on issue #313](https://github.com/ItsNotRexed/Leonida/issues/313#issuecomment-7078191651).
 
 ### 5.2 Per-stage code base
 
@@ -2353,7 +2378,7 @@ Xodus is LGPL-2.1 and is cited only for its coverage number, not as a code sourc
 - **The arena.** A single BDA arena is required by the shader contract for buffers, descriptor tables and code; the
   game's buffer working set may exceed `maxBufferSize` or PC VRAM. Host-visible arenas are slow; device-local
   arenas need staging and careful upload/readback handling. This is the main performance risk.
-- **Hash-table cost.** Every image/sampler access hashes a T#/S# and probes a storage buffer. **Measured (D3D-56, section 5.1)** on an RTX 5080 (driver 616.56): in `DEVICE_LOCAL` VRAM the lookup itself stays fast up to 100k entries (`3.0–3.7 us/1M` net wave-uniform full sweeps, `17.2–28.9 us/1M` net divergent hits), whereas `HOST_VISIBLE | HOST_COHERENT` system memory drops 9.6x–28x on uniform full sweeps and 59x–755x on divergent lookups at 10k–100k entries, and linear probing's 8-probe limit doubles a 100k table to `80.00 MiB` (`4.8%` load). **The runtime now keeps that table in `DEVICE_LOCAL` memory** and uploads only the slots that changed, from a mapped staging copy, with the copy and its barrier in the command buffer that will read it (D3D-76; 46.2x on a divergent miss at 100k on an RTX 2060 SUPER). Improving slot placement within the 8-probe window is the open optimisation (SHADER-100); Intel and Apple numbers remain open via `vk_descriptor_bench`; AMD RDNA3 is measured in section 5.1.
+- **Hash-table cost.** Every image/sampler access hashes a T#/S# and probes a storage buffer. **Measured (D3D-56, section 5.1)** on an RTX 5080 (driver 616.56): in `DEVICE_LOCAL` VRAM the lookup itself stays fast up to 100k entries (`3.0–3.7 us/1M` net wave-uniform full sweeps, `17.2–28.9 us/1M` net divergent hits), whereas `HOST_VISIBLE | HOST_COHERENT` system memory drops 9.6x–28x on uniform full sweeps and 59x–755x on divergent lookups at 10k–100k entries, and linear probing's 8-probe limit doubles a 100k table to `80.00 MiB` (`4.8%` load). **The runtime now keeps that table in `DEVICE_LOCAL` memory** and uploads only the slots that changed, from a mapped staging copy, with the copy and its barrier in the command buffer that will read it (D3D-76; 46.2x on a divergent miss at 100k on an RTX 2060 SUPER). Improving slot placement within the 8-probe window is the open optimisation (SHADER-100); Intel, RTX 5070 Ti Laptop and AMD RDNA3 are measured in section 5.1; Apple numbers remain open via `vk_descriptor_bench`.
 - **Wave64.** On NVIDIA, wave64 shaders use the translator's 32-wide approximation; cross-half ops are approximate.
   AMD GPUs with 64-wide subgroups are exact. This is a known fidelity gap, not specific to the layer.
 - **Xbox tiling/DCC.** Slot 76 and layout `0x101` are known, but the tiled data layout, detile path and DCC remain
