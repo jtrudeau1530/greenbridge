@@ -86,6 +86,11 @@ def main() -> int:
         if run.returncode == 77:
             print("SKIP 77: Leonida Vulkan device / sparse features unavailable")
             return 77
+        # The loader refuses the instance when a layer named in VK_INSTANCE_LAYERS (or the validation layer
+        # LEONIDA_VK_VALIDATION asks for) is not installed: that is the "layer absent" skip, not a layer failure.
+        if run.returncode != 0 and "vkCreateInstance" in out and "failed" in out:
+            print("SKIP 77: VK_LAYER_LUNARG_api_dump or VK_LAYER_KHRONOS_validation unavailable (vkCreateInstance failed)")
+            return 77
         if run.returncode != 0:
             print(out[-7000:], file=sys.stderr)
             raise AssertionError(f"Leonida GPU test failed exit={run.returncode}")
