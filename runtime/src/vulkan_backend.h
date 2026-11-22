@@ -500,56 +500,79 @@ public:
 
     void enqueue(VkSemaphore sem, std::uint64_t value, void* event_handle) {
         if (!sem || !event_handle) return;
-        if (device_lost_.load(std::memory_order_acquire)) {
-            SignalEventFn fn = nullptr;
-            {
-                std::lock_guard lock(mutex_);
-                fn = signal_event_;
-            }
-            if (fn) fn(event_handle);
-            return;
-        }
+        SignalEventFn immediate_fn = nullptr;
         {
             std::lock_guard lock(mutex_);
-            pending_.push_back({sem, value, event_handle, {}});
-            if (!thread_.joinable() && wakeup_sem_) thread_ = std::thread([this] { run(); });
-            signal_wakeup_locked();
+            if (stop_ || device_lost_.load(std::memory_order_acquire)) {
+                immediate_fn = signal_event_;
+            } else {
+                pending_.push_back({sem, value, event_handle, {}});
+                if (!thread_.joinable() && wakeup_sem_) thread_ = std::thread([this] { run(); });
+                signal_wakeup_locked();
+            }
+        }
+        if (immediate_fn) {
+            immediate_fn(event_handle);
+            return;
         }
         cv_.notify_one();
     }
 
     void enqueue_callback(VkSemaphore sem, std::uint64_t value, std::function<void()> cb) {
         if (!sem || !cb) return;
-        if (device_lost_.load(std::memory_order_acquire)) {
-            cb();
-            return;
-        }
+        std::function<void()> immediate_cb;
         {
             std::lock_guard lock(mutex_);
-            pending_.push_back({sem, value, nullptr, std::move(cb)});
-            if (!thread_.joinable() && wakeup_sem_) thread_ = std::thread([this] { run(); });
-            signal_wakeup_locked();
+            if (stop_ || device_lost_.load(std::memory_order_acquire)) {
+                immediate_cb = std::move(cb);
+            } else {
+                pending_.push_back({sem, value, nullptr, std::move(cb)});
+                if (!thread_.joinable() && wakeup_sem_) thread_ = std::thread([this] { run(); });
+                signal_wakeup_locked();
+            }
+        }
+        if (immediate_cb) {
+            immediate_cb();
+            return;
         }
         cv_.notify_one();
+    }
+
+    // Wakes run() when another path marks the device lost so pending waits complete and stop()/cancel() never hang.
+    void notify_device_lost() {
+        {
+            std::lock_guard lock(mutex_);
+            signal_wakeup_locked();
+        }
+        cv_.notify_all();
     }
 
     // Completes the pending waits for `sem` (a released D3D12 fence counts as reached, as on the PC runtime) and
     // blocks until any in-flight vkWaitSemaphores releases `sem` before the caller destroys the VkSemaphore.
     void cancel(VkSemaphore sem) {
         if (!sem) return;
-        std::unique_lock lock(mutex_);
-        std::erase_if(pending_, [this, sem](const Entry& e) {
-            if (e.semaphore != sem) return false;
-            if (e.callback) e.callback();
-            else if (signal_event_ && e.event_handle) signal_event_(e.event_handle);
-            return true;
-        });
-        if (!thread_.joinable()) return;
-        if (waiting_) {
-            const std::uint64_t target_epoch = epoch_ + 1;
-            signal_wakeup_locked();
-            epoch_cv_.wait(lock, [this, target_epoch] { return !waiting_ || epoch_ >= target_epoch; });
+        std::vector<Entry> cancelled;
+        SignalEventFn fn = nullptr;
+        {
+            std::unique_lock lock(mutex_);
+            fn = signal_event_;
+            std::size_t write = 0;
+            for (std::size_t i = 0; i < pending_.size(); ++i) {
+                if (pending_[i].semaphore == sem) {
+                    cancelled.push_back(std::move(pending_[i]));
+                } else {
+                    if (write != i) pending_[write] = std::move(pending_[i]);
+                    ++write;
+                }
+            }
+            pending_.resize(write);
+            if (thread_.joinable() && waiting_) {
+                const std::uint64_t target_epoch = epoch_ + 1;
+                signal_wakeup_locked();
+                epoch_cv_.wait(lock, [this, target_epoch] { return !waiting_ || epoch_ >= target_epoch; });
+            }
         }
+        dispatch_entries(cancelled, fn);
     }
 
     void stop() {
@@ -564,10 +587,18 @@ public:
     }
 
 private:
+    static void dispatch_entries(std::vector<Entry>& entries, SignalEventFn signal_event) {
+        for (Entry& e : entries) {
+            if (e.callback) e.callback();
+            else if (signal_event && e.event_handle) signal_event(e.event_handle);
+        }
+    }
+
     // Only signals wakeup_sem_ when run() is actively waiting (waiting_ == true) on wakeup_val_ + 1,
-    // eliminating any lost-wakeup race between snapshot construction and vkWaitSemaphores.
+    // eliminating any lost-wakeup race between snapshot construction and vkWaitSemaphores. Keep signaling even if
+    // device_lost_ is already set so a blocked vkWaitSemaphores wakes cleanly for cancel()/stop().
     void signal_wakeup_locked() {
-        if (!waiting_ || !wakeup_sem_ || device_lost_.load(std::memory_order_relaxed)) return;
+        if (!waiting_ || !wakeup_sem_) return;
         const std::uint64_t next = ++wakeup_val_;
         VkSemaphoreSignalInfo si{VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO};
         si.semaphore = wakeup_sem_;
@@ -578,7 +609,15 @@ private:
     void run() {
         std::unique_lock lock(mutex_);
         while (true) {
-            cv_.wait(lock, [this] { return stop_ || !pending_.empty(); });
+            cv_.wait(lock, [this] { return stop_ || !pending_.empty() || device_lost_.load(std::memory_order_acquire); });
+            if (device_lost_.load(std::memory_order_acquire)) {
+                std::vector<Entry> drained = std::move(pending_);
+                pending_.clear();
+                const SignalEventFn fn = signal_event_;
+                lock.unlock();
+                dispatch_entries(drained, fn);
+                return;
+            }
             if (stop_) return;
 
             semaphores_.clear();
@@ -605,25 +644,53 @@ private:
             ++epoch_;
             epoch_cv_.notify_all();
 
-            if (res == VK_ERROR_DEVICE_LOST) {
+            if (res == VK_ERROR_DEVICE_LOST || device_lost_.load(std::memory_order_acquire)) {
                 device_lost_.store(true, std::memory_order_release);
-                for (const Entry& e : pending_) {
-                    if (e.callback) e.callback();
-                    else if (signal_event_ && e.event_handle) signal_event_(e.event_handle);
-                }
+                std::vector<Entry> drained = std::move(pending_);
                 pending_.clear();
+                const SignalEventFn fn = signal_event_;
+                lock.unlock();
+                dispatch_entries(drained, fn);
                 return;
             }
             if (stop_) return;
 
-            std::erase_if(pending_, [this](const Entry& e) {
+            std::vector<Entry> ready;
+            bool lost = false;
+            std::size_t write = 0;
+            for (std::size_t i = 0; i < pending_.size(); ++i) {
                 std::uint64_t done = 0;
-                if (vk_.vkGetSemaphoreCounterValue(device_, e.semaphore, &done) != VK_SUCCESS) return false;
-                if (done < e.value) return false;
-                if (e.callback) e.callback();
-                else if (signal_event_ && e.event_handle) signal_event_(e.event_handle);
-                return true;
-            });
+                const VkResult cr = vk_.vkGetSemaphoreCounterValue(device_, pending_[i].semaphore, &done);
+                if (cr == VK_ERROR_DEVICE_LOST) {
+                    lost = true;
+                    for (std::size_t j = i; j < pending_.size(); ++j) ready.push_back(std::move(pending_[j]));
+                    break;
+                }
+                if (cr == VK_SUCCESS && done >= pending_[i].value) {
+                    ready.push_back(std::move(pending_[i]));
+                } else {
+                    if (write != i) pending_[write] = std::move(pending_[i]);
+                    ++write;
+                }
+            }
+            if (lost) {
+                pending_.resize(write);
+                for (Entry& e : pending_) ready.push_back(std::move(e));
+                pending_.clear();
+                device_lost_.store(true, std::memory_order_release);
+                const SignalEventFn fn = signal_event_;
+                lock.unlock();
+                dispatch_entries(ready, fn);
+                return;
+            }
+            pending_.resize(write);
+            if (!ready.empty()) {
+                const SignalEventFn fn = signal_event_;
+                lock.unlock();
+                dispatch_entries(ready, fn);
+                lock.lock();
+                if (stop_) return;
+            }
         }
     }
 
@@ -1126,7 +1193,15 @@ public:
     // Vulkan requires external synchronisation of a VkQueue; every D3D12 queue of the device may share one.
     std::mutex& submit_mutex() { return submit_mutex_; }
 
-    void mark_device_lost() noexcept { device_lost_.store(true, std::memory_order_release); }
+    void mark_device_lost() noexcept {
+        device_lost_.store(true, std::memory_order_release);
+        if (fence_dispatcher_) {
+            try {
+                fence_dispatcher_->notify_device_lost();
+            } catch (...) {
+            }
+        }
+    }
     bool is_device_lost() const noexcept { return device_lost_.load(std::memory_order_acquire); }
 
     void set_signal_event_fn(FenceWaitDispatcher::SignalEventFn fn) {
