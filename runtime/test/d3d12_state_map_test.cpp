@@ -589,7 +589,60 @@ int main() {
         CHECK(memory_type_order(memory, 0xF, host, local, 256 * mib) == (order{3, 1, 2}));
     }
 
-    std::printf("state map, enhanced barriers, subresource decoding, layout tracking, discard ranges, BAR detection "
-                "and memory types OK\n");
+    // block_format: bytes per texel, or per 4x4 block for block-compressed formats, of one aspect as a copy lays a
+    // subresource out in a buffer. Each expected size is the format's own texel/block size, derived independently of
+    // the table under test, so a mistyped entry (a wrong byte count or a missed 4x4 block) is caught before it
+    // silently corrupts a copy. Covers every VkFormat the DXGI format map can produce.
+    {
+        struct BlockCase {
+            VkFormat format;
+            std::uint32_t bytes;
+            std::uint32_t block;
+        };
+        static constexpr BlockCase block_cases[] = {
+            {VK_FORMAT_R32G32B32A32_SFLOAT, 16, 1}, {VK_FORMAT_R32G32B32A32_UINT, 16, 1},
+            {VK_FORMAT_R16G16B16A16_SFLOAT, 8, 1},  {VK_FORMAT_R16G16B16A16_UNORM, 8, 1},
+            {VK_FORMAT_R32G32_SFLOAT, 8, 1},        {VK_FORMAT_A2B10G10R10_UNORM_PACK32, 4, 1},
+            {VK_FORMAT_B10G11R11_UFLOAT_PACK32, 4, 1}, {VK_FORMAT_R8G8B8A8_UNORM, 4, 1},
+            {VK_FORMAT_R8G8B8A8_SRGB, 4, 1},        {VK_FORMAT_R8G8B8A8_UINT, 4, 1},
+            {VK_FORMAT_B8G8R8A8_UNORM, 4, 1},       {VK_FORMAT_B8G8R8A8_SRGB, 4, 1},
+            {VK_FORMAT_R16G16_SFLOAT, 4, 1},        {VK_FORMAT_R32_SFLOAT, 4, 1},
+            {VK_FORMAT_R32_UINT, 4, 1},             {VK_FORMAT_R8G8_UNORM, 2, 1},
+            {VK_FORMAT_R16_SFLOAT, 2, 1},           {VK_FORMAT_R16_UNORM, 2, 1},
+            {VK_FORMAT_R8_UNORM, 1, 1},
+            // Block-compressed: one 4x4 block is 8 bytes (BC1, BC4) or 16 bytes (BC2, BC3, BC5, BC6H, BC7).
+            {VK_FORMAT_BC1_RGBA_UNORM_BLOCK, 8, 4}, {VK_FORMAT_BC1_RGBA_SRGB_BLOCK, 8, 4},
+            {VK_FORMAT_BC4_UNORM_BLOCK, 8, 4},      {VK_FORMAT_BC4_SNORM_BLOCK, 8, 4},
+            {VK_FORMAT_BC2_UNORM_BLOCK, 16, 4},     {VK_FORMAT_BC2_SRGB_BLOCK, 16, 4},
+            {VK_FORMAT_BC3_UNORM_BLOCK, 16, 4},     {VK_FORMAT_BC3_SRGB_BLOCK, 16, 4},
+            {VK_FORMAT_BC5_UNORM_BLOCK, 16, 4},     {VK_FORMAT_BC5_SNORM_BLOCK, 16, 4},
+            {VK_FORMAT_BC6H_UFLOAT_BLOCK, 16, 4},   {VK_FORMAT_BC6H_SFLOAT_BLOCK, 16, 4},
+            {VK_FORMAT_BC7_UNORM_BLOCK, 16, 4},     {VK_FORMAT_BC7_SRGB_BLOCK, 16, 4},
+        };
+        for (const auto& c : block_cases) {
+            const BlockFormat bf = block_format(c.format, VK_IMAGE_ASPECT_COLOR_BIT);
+            CHECK(bf.bytes == c.bytes && bf.block == c.block);
+        }
+
+        // Depth plane keeps the format's size; depth is never block-compressed.
+        CHECK(block_format(VK_FORMAT_D16_UNORM, VK_IMAGE_ASPECT_DEPTH_BIT).bytes == 2);
+        CHECK(block_format(VK_FORMAT_D32_SFLOAT, VK_IMAGE_ASPECT_DEPTH_BIT).bytes == 4);
+        CHECK(block_format(VK_FORMAT_D24_UNORM_S8_UINT, VK_IMAGE_ASPECT_DEPTH_BIT).bytes == 4);
+        CHECK(block_format(VK_FORMAT_D32_SFLOAT_S8_UINT, VK_IMAGE_ASPECT_DEPTH_BIT).bytes == 4);
+        CHECK(block_format(VK_FORMAT_D32_SFLOAT, VK_IMAGE_ASPECT_DEPTH_BIT).block == 1);
+
+        // The stencil plane is one byte, whatever the format value is: the aspect decides it, not the format.
+        CHECK(block_format(VK_FORMAT_D24_UNORM_S8_UINT, VK_IMAGE_ASPECT_STENCIL_BIT).bytes == 1);
+        CHECK(block_format(VK_FORMAT_D32_SFLOAT_S8_UINT, VK_IMAGE_ASPECT_STENCIL_BIT).bytes == 1);
+        CHECK(block_format(VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_ASPECT_STENCIL_BIT).bytes == 1);
+        CHECK(block_format(VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_ASPECT_STENCIL_BIT).block == 1);
+
+        // A format copies cannot lay out yet is the {0, 1} sentinel, never a silent wrong size.
+        CHECK(block_format(VK_FORMAT_UNDEFINED, VK_IMAGE_ASPECT_COLOR_BIT).bytes == 0);
+        CHECK(block_format(VK_FORMAT_R64G64B64A64_SFLOAT, VK_IMAGE_ASPECT_COLOR_BIT).bytes == 0);
+    }
+
+    std::printf("state map, enhanced barriers, subresource decoding, layout tracking, discard ranges, block formats, "
+                "BAR detection and memory types OK\n");
     return 0;
 }
