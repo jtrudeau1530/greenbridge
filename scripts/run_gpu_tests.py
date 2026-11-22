@@ -79,7 +79,8 @@ def make_ms_psv0(threads_x: int, maxv: int, maxp: int, topology: int = 2, group_
 
 def assemble_to_s(llvm_mc: str, asm_path: str, s_path: str, name: str) -> None:
     """Assemble raw RDNA2 .asm with llvm-mc -show-encoding into .s format for rdna2spirv.py."""
-    raw = open(asm_path, encoding="utf-8").read()
+    with open(asm_path, encoding="utf-8") as source:
+        raw = source.read()
     cmd = mc_command.mc_command(llvm_mc) + ["-triple=amdgcn--amdpal", "-mcpu=gfx1013"]
     for ln in raw.splitlines():
         s = ln.strip()
@@ -210,13 +211,15 @@ def make_fs_passthru(loc: int) -> str:
 
 
 def read_raw_rgba32f(path: str) -> list[tuple[float, float, float, float]]:
-    data = open(path, "rb").read()
+    with open(path, "rb") as source:
+        data = source.read()
     n = len(data) // 16
     return [struct.unpack_from("<4f", data, 16 * i) for i in range(n)]
 
 
 def read_raw_u32(path: str) -> list[tuple[int, int, int, int]]:
-    data = open(path, "rb").read()
+    with open(path, "rb") as source:
+        data = source.read()
     n = len(data) // 16
     return [struct.unpack_from("<4I", data, 16 * i) for i in range(n)]
 
@@ -354,7 +357,8 @@ PIXEL_ENV = {"ps_vcc_x2": {"VKH_SGPRS": "0x1000,0,16,0", "VKH_HEAP": "0x1000=0x1
 
 def check_flat(raw_path: str) -> tuple[bool, str]:
     """ps_flat with vs_ids: the integer IDs come from the first (provoking) vertex, the UVs still interpolate."""
-    data = open(raw_path, "rb").read()
+    with open(raw_path, "rb") as source:
+        data = source.read()
     px = list(struct.iter_unpack("<2I2f", data))
     w = int(len(px) ** 0.5)
     wrong = sum((a, b) != (0x101, 0x102) for a, b, _, _ in px)
@@ -658,7 +662,8 @@ def run_suite(a, work: str) -> int:
     index = {}
     idx_path = os.path.join(spirv_dir, "index.json")
     if os.path.isfile(idx_path):
-        index = json.load(open(idx_path, encoding="utf-8"))
+        with open(idx_path, encoding="utf-8") as source:
+            index = json.load(source)
 
     ext = ".exe" if os.name == "nt" else ""
     vk_compute = os.path.join(a.build, "vk_compute_test" + ext)
@@ -1005,7 +1010,8 @@ def run_suite(a, work: str) -> int:
             elif name == "ps_flat":
                 ok, detail = check_flat(raw)
             elif name == "ps_interp_f16_high":
-                problem = interp_f16_high_problem(list(struct.iter_unpack("<4I", open(raw, "rb").read())))
+                with open(raw, "rb") as source:
+                    problem = interp_f16_high_problem(list(struct.iter_unpack("<4I", source.read())))
                 ok, detail = not problem, problem or "f16 low/high halves and f32 control within 2e-3"
             else:
                 ok, detail = False, "no checker defined"
@@ -1059,7 +1065,8 @@ def run_suite(a, work: str) -> int:
             elif rc != 0:
                 results.append((name, False, msg))
             else:
-                problem = interp_f16_high_problem(list(struct.iter_unpack("<4I", open(raw, "rb").read())))
+                with open(raw, "rb") as source:
+                    problem = interp_f16_high_problem(list(struct.iter_unpack("<4I", source.read())))
                 results.append((name, not problem, problem or "f16 low/high halves and f32 control within 2e-3"))
         elif name == "ms_clip":
             raw = os.path.join(raw_dir, f"{name}.raw")
