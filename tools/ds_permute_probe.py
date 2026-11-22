@@ -182,7 +182,7 @@ def main():
             mismatches += 1
         print(f"wave{wave} ({oracle.arch}): {res['cases_ok']}/{res['cases_total']} ds_permute_b32 cases exact")
     if args.json_out:
-        with open(args.json_out, "w", encoding="utf-8") as f:
+        with open(args.json_out, "w", encoding="utf-8", newline="\n") as f:
             json.dump(out, f, indent=2)
     return 1 if mismatches else 0
 
