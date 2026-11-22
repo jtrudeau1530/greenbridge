@@ -345,6 +345,10 @@ the model mapping and the texture-parameter split are in
 [character_skeleton.md](character_skeleton.md). No character bind matrices were recovered; that
 page records the reference-pose caveat rather than inventing a bind pose.
 
+The character-part inventory (Lucia's named records and decoded parts, the `player_story000_00`
+drawable set, slot-name counts and texture coverage) is in
+[character_models.md](character_models.md).
+
 ## Shader render buckets
 
 `rpf9dump` writes two raw shader fields per material, `RenderBucket` (byte at shader +0x39) and
