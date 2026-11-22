@@ -449,3 +449,47 @@ def test_cli_show_valid_formats(spec, capsys, monkeypatch):
     monkeypatch.setattr(sys, "argv", ["valu_fuzz.py", "--family", "f16", "--show", spec])
     assert vf.main() == 0
     assert "; model, thread 0:" in capsys.readouterr().out
+
+
+# ------------------------------------------------------------------ runner (translator and GPU faked)
+
+UNPINNED = "device: llvmpipe (LLVM 20.1.2, 256 bits) (subgroup 8..8)\ncompute subgroup size: 32 not available"
+
+
+def _run_main(monkeypatch, capsys, tmp_path, msg, extra):
+    """main() for two mem programs, every run returning all-zero words and vk_compute_test output `msg`."""
+    def translate(progs, work, _emulate):
+        (work / "spirv").mkdir(parents=True, exist_ok=True)
+        for p in progs:
+            (work / "spirv" / (p.name + ".spv")).touch()
+        return {p.name: {} for p in progs}, ""
+
+    def run_gpu(p, _spv, _build, _entry, _emulate, dump):
+        dump.write_bytes(bytes(4 * p.out_words()))
+        return 0, msg
+
+    monkeypatch.setattr(vf, "translate", translate)
+    monkeypatch.setattr(vf, "run_gpu", run_gpu)
+    monkeypatch.setattr(sys, "argv", ["valu_fuzz.py", "--family", "mem", "--programs", "2", "--work", str(tmp_path),
+                                      *extra])
+    status = vf.main()
+    return status, capsys.readouterr().out
+
+
+def test_unpinned_wave32_is_a_skip_not_a_mismatch(monkeypatch, capsys, tmp_path):
+    status, out = _run_main(monkeypatch, capsys, tmp_path, UNPINNED, ["--wave", "32"])
+    assert status == 2, out                                   # nothing ran
+    assert "MISMATCH" not in out
+    assert "2 skipped" in out and "can't run it at 32 lanes" in out
+
+
+def test_pinned_wave32_is_still_compared(monkeypatch, capsys, tmp_path):
+    status, out = _run_main(monkeypatch, capsys, tmp_path, "compute subgroup size: 32", ["--wave", "32"])
+    assert status == 1, out
+    assert "MISMATCH" in out
+
+
+def test_emulated_wave64_is_compared_at_any_subgroup_size(monkeypatch, capsys, tmp_path):
+    status, out = _run_main(monkeypatch, capsys, tmp_path, UNPINNED, ["--wave", "64", "--emulate"])
+    assert status == 1, out
+    assert "MISMATCH" in out and "0 skipped" in out

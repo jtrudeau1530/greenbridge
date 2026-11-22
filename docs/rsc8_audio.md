@@ -52,6 +52,40 @@ mean the header is not what the flags say); header slop, truncation and out-of-b
 rejected, covered by synthetic tests in `tests/test_rsc8_audio.py`. The other three archives have no
 zero-stream bank, so only `audio.rpf`'s bank and byte counts changed (banks 7,160 → 7,162, +40 bytes).
 
+## The undocumented `0x5a`/`0xd9` companion tags
+
+`audio.rpf` carries two tag types no other archive has, mostly on streams that hold no `0x5c` clip:
+**1,185 streams** with a `0x5a` tag (804 of them also with `0xd9`; shapes `{0x36,0x55,0x5a,0x76,0xa3,0xd9}` × 803,
+`{0x36,0x55,0x5a,0x76,0xa3}` × 381, and one `{0x36,0x55,0x5a,0x76,0xa3,0xbd,0xd9}`), all declaring **32,000 Hz**
+(one 32,007).
+
+`tools/rsc8_audio.py` decodes both structurally (`decode_grid20_table`, `decode_index_runs`) and validates
+them per stream in its scan tallies (`grid20_*`, `indexrun_*` summary keys): over the whole archive
+**387,233 `0x5a` entries / 0 invalid** and **4,853 `0xd9` groups / 0 invalid / 0 index overruns**. Every
+invariant below was measured on that full population; the field names describe structure, and the meaning of
+`value`, `s`, `t` and the counter's unit stays a labelled hypothesis.
+
+`0x5a` — `{u32 12345678; u32 unknown; N × 20-byte entries}` (`(size − 8) % 20 == 0` always):
+
+```
+0    f32  value          (3.658 .. 146.789 measured; spans up to 133 within one stream)
+4    u16  p              (a multiple of 32 on every measured entry)
+6    u16  z              (0 .. 16)
+8    u16  index_lo
+10   u16  index_hi       (index pairs tile 0..129 / 1..130 measured)
+12   u16  s
+14   u16  t
+16   u32  counter        (strictly increasing across all entries, all 1,185 streams)
+```
+
+Hypothesis (not confirmed): a time grid — the first entry-to-entry counter step averages the stream's
+samples-per-entry (p50 ratio 0.996), but the total exceeds the declared sample count by ~2¹¹–2¹³, so the unit
+is finer than one sample and not named here.
+
+`0xd9` — `{u32 K; K × {u32 2; u32 len; u32 hash; len × u32}}`: the run values ascend strictly inside each
+group, exactly one distinct `hash` appears per stream, the group count always equals `K`, and **every run
+value is smaller than the sibling `0x5a` table's entry count** (804/804), so the runs index `0x5a` entries.
+
 ### Resolution of the `docs/story.md` raw gaps
 
 The uninflatable raw regions noted in [story.md](story.md) are unencrypted `ADAT` (AWC) audio banks:

@@ -9,5 +9,6 @@
 	v_mov_b32 v7, 0x0000ffff
 	v_ffbh_i32_e32 v8, v7
 	v_swap_b32 v5, v6
+	v_xor_b32_e32 v2, 0x40000000, v2
 	exp mrt0 v2, v5, v6, v8 done vm
 	s_endpgm

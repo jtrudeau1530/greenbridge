@@ -365,6 +365,13 @@ if(BUILD_TESTING)
     set_target_properties(tiny_async PROPERTIES
       RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/fixtures/game/$<CONFIG>"
     )
+    # Reaches xgameruntime.dll through LoadLibraryW/GetProcAddress, as xgameruntime.lib's thunks do (no import).
+    add_executable(tiny_gdk_load test/fixtures/tiny_gdk_load.cpp)
+    target_compile_definitions(tiny_gdk_load PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(tiny_gdk_load PRIVATE /W4 /permissive- /utf-8)
+    set_target_properties(tiny_gdk_load PROPERTIES
+      RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/fixtures/game/$<CONFIG>"
+    )
     add_executable(tiny_game test/fixtures/tiny_game.cpp)
     target_link_libraries(tiny_game PRIVATE xgameruntime_stub)
     target_compile_definitions(tiny_game PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX _CRT_SECURE_NO_WARNINGS)  # plain fopen, as games use
@@ -556,6 +563,9 @@ if(BUILD_TESTING)
     add_test(NAME run_tiny_async COMMAND ${CMAKE_COMMAND}
       "-DLOADER=$<TARGET_FILE:gta6rt>" "-DGUEST=$<TARGET_FILE:tiny_async>"
       "-DRUNNER=${CMAKE_CROSSCOMPILING_EMULATOR}" -P "${CMAKE_CURRENT_SOURCE_DIR}/test/check_loaded_async.cmake")
+    add_test(NAME run_tiny_gdk_load COMMAND ${CMAKE_COMMAND}
+      "-DLOADER=$<TARGET_FILE:gta6rt>" "-DGUEST=$<TARGET_FILE:tiny_gdk_load>"
+      "-DRUNNER=${CMAKE_CROSSCOMPILING_EMULATOR}" -P "${CMAKE_CURRENT_SOURCE_DIR}/test/check_loaded_gdk.cmake")
     # The stand-in game passes only with its own arguments; with others it exits 1, which --run passes through.
     add_test(NAME run_tiny_game COMMAND gta6rt --run $<TARGET_FILE:tiny_game> -- hello 42)
     add_test(NAME run_tiny_game_exit_code COMMAND gta6rt --run $<TARGET_FILE:tiny_game> -- wrong args)
@@ -632,7 +642,7 @@ if(NOT TARGET Vulkan::Headers)
   endif()
 endif()
 if(TARGET Vulkan::Headers)
-  foreach(tool vk_harness vk_texture_test vk_compute_test vk_store_test vk_pipeline_check vk_command_replay_test
+  foreach(tool vk_harness vk_texture_test vk_sampler_test vk_compute_test vk_store_test vk_pipeline_check vk_command_replay_test
           vk_bindless_test vk_image_fuzz vk_descriptor_bench depth24_convert_test vk_predicate_capture_test vk_predicated_copy_test)
     add_executable(${tool} test/${tool}.cpp)
     target_link_libraries(${tool} PRIVATE Vulkan::Headers ${CMAKE_DL_LIBS})
@@ -797,6 +807,12 @@ if(TARGET Vulkan::Headers)
     # Emulation of R9G9B9E5_SHAREDEXP UAV textures as mutable R32_UINT on GPUs without E5B9G9R9 storage:
     # format support, 1D/2D/3D/reserved creation, SRV/UAV T#s, WARP differential UAV clears, cross-backing copies,
     # and set-0 storage write -> E5B9G9R9 sampled HDR round-trip.
+    add_executable(d3d12_d24_support_test test/d3d12_d24_support_test.cpp)
+    target_link_libraries(d3d12_d24_support_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
+    target_compile_definitions(d3d12_d24_support_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_d24_support_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME d3d12_d24_support COMMAND d3d12_d24_support_test)
+    set_tests_properties(d3d12_d24_support PROPERTIES SKIP_RETURN_CODE 77)
     add_executable(d3d12_r9g9b9e5_uav_test test/d3d12_r9g9b9e5_uav_test.cpp)
     target_link_libraries(d3d12_r9g9b9e5_uav_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
     target_compile_definitions(d3d12_r9g9b9e5_uav_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
@@ -947,7 +963,7 @@ if(TARGET Vulkan::Headers)
 
     # Milestone M0: a window, 60 cleared frames presented through the proxy on Vulkan.
     add_executable(d3d12_present_test test/d3d12_present_test.cpp)
-    target_link_libraries(d3d12_present_test PRIVATE gta6rt_d3d12_com user32 gdi32)
+    target_link_libraries(d3d12_present_test PRIVATE gta6rt_d3d12_com user32 gdi32 dxgi)
     target_compile_definitions(d3d12_present_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(d3d12_present_test PRIVATE /W4 /permissive- /utf-8)
     add_test(NAME d3d12_present COMMAND d3d12_present_test)

@@ -20,6 +20,9 @@ Exit code: 0 when every program that ran matches (or differs only in a program w
 mismatch or an untranslated program, 2 when the only failures are harness errors: vk_compute_test timed out or
 gave no dump for a program. Such a program is listed with the others (and kept with --keep) and the run goes on.
 A missing vk_compute_test for the translator oracle is one line and exit 1, before any program is generated.
+A wave32 program is skipped where vk_compute_test can't pin 32-lane subgroups ("compute subgroup size: 32 not
+available", e.g. Mesa llvmpipe at 8 lanes), and a run where every program was skipped exits 2. Wave64 programs
+translated with --wave64-emulate use no subgroup operations, so they are compared at any subgroup size.
 
 Needs LLVM_MC (llvm-mc with AMDGPU, as for the shaders stage), the Vulkan SDK and a built vk_compute_test
 (cmake --build runtime/build --target vk_compute_test). No game files.
@@ -794,6 +797,12 @@ class HarnessError(RuntimeError):
     """vk_compute_test did not give a result for one program: it hung, crashed or wrote no dump."""
 
 
+class Unpinned(RuntimeError):
+    """vk_compute_test ran a wave32 program but couldn't pin the 32-lane subgroups it needs, so its words came from
+    another wave size (Mesa llvmpipe: 8 lanes) and are no evidence either way: the program is skipped. Programs
+    translated with --wave64-emulate use no subgroup operations, so they are judged at any size."""
+
+
 GPU_TIMEOUT = 60    # seconds for one program; a translated program that never ends shows up as this
 
 
@@ -806,6 +815,11 @@ def run_gpu(exe, spv, prog, work, emulate):
         r = subprocess.run([exe, spv, "1", "dump"], capture_output=True, text=True, env=env, timeout=GPU_TIMEOUT)
     except subprocess.TimeoutExpired:
         raise HarnessError(f"vk_compute_test timed out after {GPU_TIMEOUT} s") from None
+    import compute_fixture
+    lanes = compute_fixture.unpinned_subgroup(r.stdout + r.stderr) if prog.wave == 32 else None
+    if lanes:
+        raise Unpinned(f"the device can't run it at {lanes} lanes (vk_compute_test: compute subgroup size: {lanes} "
+                       "not available)")
     if not os.path.exists(dump):
         detail = " ".join(f"{r.stdout}{r.stderr}".split())
         raise HarnessError(f"vk_compute_test gave no dump (exit {r.returncode}){': ' + detail if detail else ''}")
@@ -862,7 +876,7 @@ def still_fails(prog, ops, mode, ctx):
             return False
         try:
             bad, hyp = compare(prog, run_gpu(exe, spv, prog, work, mode == "emulate"), ops)
-        except HarnessError:
+        except (HarnessError, Unpinned):
             return False                # a reduction that hangs or crashes is not the mismatch being reduced
         return bool(bad) and not hyp
 
@@ -1008,7 +1022,12 @@ def main():
         print(f"  {key}: " + ", ".join(f"{k} {v}" for k, v in st.items()))
     if any(st["mismatch"] or st["rejected"] for st in stats.values()):
         return 1
-    return 2 if any(st.get("harness_errors") for st in stats.values()) else 0
+    if any(st.get("harness_errors") for st in stats.values()):
+        return 2
+    if stats and not any(st["match"] or st["hyp_only"] for st in stats.values()):
+        print("no program ran: every one was skipped")
+        return 2
+    return 0
 
 
 def kept_source(prog, mode, ops, guard):
@@ -1099,7 +1118,7 @@ def run_translator(args, mc, progs, waves, modes, stats, fails):
                     continue
                 key = f"wave{p.wave} {mode}"
                 st = stats.setdefault(key, {"programs": 0, "match": 0, "mismatch": 0, "hyp_only": 0,
-                                            "rejected": 0, "harness_errors": 0})
+                                            "rejected": 0, "harness_errors": 0, "skipped": 0})
                 st["programs"] += 1
                 spv = os.path.join(spdir, p.name + ".spv")
                 if not os.path.exists(spv):
@@ -1113,6 +1132,10 @@ def run_translator(args, mc, progs, waves, modes, stats, fails):
                     # lose every result before it. It is reported like the other failures and the run goes on.
                     st["harness_errors"] += 1
                     fails.append((p, mode, f"harness error: {e}", None))
+                    continue
+                except Unpinned as e:
+                    st["skipped"] += 1
+                    print(f"SKIP {p.name} [{mode}]: {e}")
                     continue
                 if not bad:
                     st["match"] += 1

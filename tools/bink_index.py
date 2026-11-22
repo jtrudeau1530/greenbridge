@@ -174,8 +174,13 @@ def scan_file(path, source):
     return rows, stats
 
 
-def scan_target(target):
-    """Index a single container or every file below a directory."""
+def scan_target(target, skip_report=None):
+    """Index a single container or every file below a directory.
+
+    ``skip_report``, when given, is one existing file path (the report the
+    caller is about to overwrite) that must be left out of the scan so that a
+    repeat invocation does not count the previous report's bytes.
+    """
     rows, total = [], {"files_scanned": 0, "streams": 0, "bytes": 0,
                        "zero_padding": 0, "unread_bytes": 0, "span": 0}
     if os.path.isdir(target):
@@ -183,7 +188,10 @@ def scan_target(target):
         paths = []
         for root, _dirs, files in os.walk(target):
             for name in files:
-                paths.append(os.path.join(root, name))
+                path = os.path.join(root, name)
+                if skip_report is not None and same_output_path(path, skip_report):
+                    continue
+                paths.append(path)
         for path in sorted(paths):
             got, stats = scan_file(path, os.path.relpath(path, base))
             rows.extend(got)
@@ -318,7 +326,10 @@ def main(argv=None):
         print(f"bink_index: error: {a.target}: no such file or directory", file=sys.stderr)
         return 2
 
-    rows, summary = scan_target(a.target)
+    skip_report = None
+    if a.out and os.path.isfile(a.out):
+        skip_report = a.out
+    rows, summary = scan_target(a.target, skip_report)
     probe = False
     if a.probe:
         ffprobe = shutil.which("ffprobe")
