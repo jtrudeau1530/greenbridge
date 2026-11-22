@@ -288,6 +288,7 @@ public:
     uint64_t seq = 0;
     Rumble wanted;
     GameInputBatteryState battery{0, 0, 0, 0, GameInputBatteryUnknown};
+    AppLocalDeviceId base_id{};  // id_bytes of the identity alone: twins share it, info.deviceId tells them apart
 
     // Poll-thread state.
     SDL_Gamepad* pad = nullptr;
@@ -521,6 +522,12 @@ void id_bytes(const std::string& identity, const SDL_GUID& guid, AppLocalDeviceI
     }
 }
 
+// Twin n of an identity. Twin 0 is the plain id, so a pad without twins keeps the id it always had. Real identities
+// start with "s:", "p:" or are empty, never "t:", so a twin id cannot be another pad's own id.
+void id_bytes(const std::string& identity, const SDL_GUID& guid, uint32_t twin, AppLocalDeviceId* out) {
+    id_bytes(twin ? "t:" + std::to_string(twin) + ":" + identity : identity, guid, out);
+}
+
 void fill_info(Device* d, SDL_Gamepad* p, const AppLocalDeviceId& id) {
     GameInputDeviceInfo& i = d->info;
     i = {};
@@ -595,16 +602,34 @@ void open_pad(SDL_JoystickID jid, uint64_t ts) {
     const char* serial = SDL_GetGamepadSerial(p);
     const char* path = SDL_GetGamepadPath(p);
     const std::string identity = (serial && *serial) ? std::string("s:") + serial : (path && *path) ? std::string("p:") + path : "";
-    AppLocalDeviceId id{};
-    id_bytes(identity, SDL_GetGamepadGUIDForID(jid), &id);
+    const SDL_GUID guid = SDL_GetGamepadGUIDForID(jid);
+    AppLocalDeviceId base{};
+    id_bytes(identity, guid, &base);
 
     const SDL_PropertiesID props = SDL_GetGamepadProperties(p);
     std::lock_guard lock(s.mu);
+    // The same pad coming back gets its old object. Pads with the same GUID and serial or path (identical pads with
+    // neither, mostly) are twins sharing one base id, told apart by order alone: the lowest disconnected twin is
+    // reused, and a new one gets the next free twin id. Which physical pad was which cannot be recovered, so twins
+    // that return in a different order swap objects and ids (docs/gameinput.md).
     Device* d = nullptr;
-    for (Device* old : s.devices)  // the same pad coming back gets its old object
-        if (old->status == GameInputDeviceNoStatus && std::memcmp(&old->info.deviceId, &id, sizeof id) == 0) d = old;
+    uint32_t twins = 0;
+    for (Device* old : s.devices) {  // creation order, so twins in twin order
+        if (std::memcmp(&old->base_id, &base, sizeof base) != 0) continue;
+        ++twins;
+        if (!d && old->status == GameInputDeviceNoStatus) d = old;
+    }
+    AppLocalDeviceId id = d ? d->info.deviceId : base;  // a copy: fill_info clears info before it writes the id
     if (!d) {
+        const auto taken = [&s](const AppLocalDeviceId& v) {
+            for (Device* o : s.devices)
+                if (std::memcmp(&o->info.deviceId, &v, sizeof v) == 0) return true;
+            return false;
+        };
+        id_bytes(identity, guid, twins, &id);
+        for (uint32_t n = twins + 1; taken(id); ++n) id_bytes(identity, guid, n, &id);
         d = new Device;
+        d->base_id = base;
         s.devices.push_back(d);
     }
     d->pad = p;
