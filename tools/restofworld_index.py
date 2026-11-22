@@ -371,6 +371,14 @@ def main():
     if not os.path.isdir(folder):
         ap.error(f"{folder} is not a folder, so {args.out} cannot be written")
     try:
+        overwrites_source = os.path.samefile(args.source, args.out)
+    except FileNotFoundError:
+        overwrites_source = False
+    except OSError as e:
+        ap.error(f"cannot compare source and output paths: {e}")
+    if overwrites_source:
+        ap.error("output must not overwrite the source archive")
+    try:
         if os.path.isdir(args.source):
             rows, summary = scan_dir(args.source, args.max_inflate)
         else:

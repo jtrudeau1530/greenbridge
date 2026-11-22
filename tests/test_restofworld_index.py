@@ -301,6 +301,21 @@ class ArchiveTest(unittest.TestCase):
             self.assertNotIn("Traceback", proc.stderr)
         self.assertFalse(os.path.exists(os.path.join(self.root, "no_such_folder")))
 
+    def test_cli_rejects_output_aliasing_source_archive(self):
+        with open(self.rpf, "rb") as f:
+            original = f.read()
+        output = os.path.join(os.path.dirname(self.rpf), ".", os.path.basename(self.rpf))
+
+        result = subprocess.run(
+            [sys.executable, "-I", TOOL, self.rpf, output],
+            capture_output=True, text=True,
+        )
+
+        with open(self.rpf, "rb") as f:
+            self.assertEqual(f.read(), original, "the source archive was overwritten")
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("output must not overwrite the source archive", result.stderr)
+
     def test_cli(self):
         out = os.path.join(self.root, "cli.json")
         proc = subprocess.run([sys.executable, "-I", TOOL, self.rpf, out, "--quiet"],
