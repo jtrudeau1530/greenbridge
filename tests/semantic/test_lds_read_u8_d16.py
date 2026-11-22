@@ -27,7 +27,7 @@ import spirv_mini_interp as si
 FSSM = bytearray(0x148)
 struct.pack_into("<4I", FSSM, 0x138, 0x8088, 32, 1, 1)
 FSSM = bytes(FSSM)
-VSHARP = [0, 0, 0x1000, 0]
+VSHARP = [0, 0, 0x1000, 0x31016FAC]
 
 LDS_BYTES = (0x01, 0xFF, 0x80, 0x7F)         # bytes at byte address 0..3 of LDS dword 0 = 0x7F80FF01
 OLD = 0xBEEF1234                             # every destination before the read

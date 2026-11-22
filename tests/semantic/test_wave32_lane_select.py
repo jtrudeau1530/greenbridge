@@ -22,7 +22,7 @@ import spirv_mini_interp as si
 FSSM = bytearray(0x148)
 struct.pack_into("<4I", FSSM, 0x138, 0x8088, 32, 1, 1)
 FSSM = bytes(FSSM)
-VSHARP = [0, 0, 0x1000, 0]
+VSHARP = [0, 0, 0x1000, 0x31016FAC]
 # The .asm header (and check.py): readlane(40) = lane 8 = 25, readlane(5) = 16, writelane(40) lands on lane 8,
 # so readlane(8) and readlane(40) both give 777. Lane 0 stores the four words.
 EXPECTED = [25, 16, 777, 777]

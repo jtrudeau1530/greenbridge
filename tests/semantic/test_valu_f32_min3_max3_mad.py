@@ -383,7 +383,7 @@ def run_cs_workgroup_exec(lines: list[str], lanes: int = 4) -> dict[int, int]:
         lanes,
         32,
         inputs_for=lambda i: {"%local_id": (i, 0, 0), "%wg_id": (0, 0, 0)},
-        push_constants=[0, 0, 64, 0] + [0] * 28,
+        push_constants=[0, 0, 64, 0x31016FAC] + [0] * 28,
         memory=mem,
     )
     return mem

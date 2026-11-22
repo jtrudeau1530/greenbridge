@@ -877,7 +877,7 @@ def test_pk_f16_int_pack_repro_513(emulate, make_shader, monkeypatch):
     mem = spirv_mini_interp.run_workgroup(
         spv, 64, sg_size,
         inputs_for=lambda i: {"%wg_id": (0, 0, 0), "%local_id": (i, 0, 0), "%sg_lane": i % sg_size},
-        push_constants=[0, 0, 0xFFFFFFFF, 0] + [0] * 28,
+        push_constants=[0, 0, 0xFFFFFFFF, 0x31016FAC] + [0] * 28,
         memory={},
     )
     assert [mem[256 + 4 * i] for i in range(3)] == [0x3CD53CD5, 0x3D553D55, 0x3DD53DD5]
@@ -916,7 +916,7 @@ def test_pk_and_scalar_f16_ops_emit_no_packhalf2x16(op_asm, make_shader):
 def test_buffer_format_f16_narrowing_avoids_packhalf2x16(make_shader, body):
     """The f16 of a d16 typed buffer load, and of an f16 format a typed buffer store writes, narrow with integer RTE
     like the d16 image results (#489): PackHalf2x16 rounds toward zero on AMD drivers."""
-    shader = make_shader("s_mov_b32 s0, 0x1000\ns_mov_b32 s1, 0\ns_mov_b32 s2, 0x100\ns_mov_b32 s3, 0x1fac\n"
+    shader = make_shader("s_mov_b32 s0, 0x1000\ns_mov_b32 s1, 0\ns_mov_b32 s2, 0x100\ns_mov_b32 s3, 0x31001fac\n"
                          "v_mov_b32 v1, 0\n" + body + "\ns_endpgm\n", "ps_buf_f16")
     spv = shader.translate()
     shader.validate(spv)
@@ -1053,7 +1053,7 @@ def test_encode_format_f16_uses_f16_bits_rte(suffix, fmt_code, expected_word, ma
         f"s_mov_b32 s0, {base:#x}\n"
         "s_mov_b32 s1, 0\n"
         "s_mov_b32 s2, 0x100\n"
-        f"s_mov_b32 s3, {fmt_code << 12:#x}\n"
+        f"s_mov_b32 s3, {fmt_code << 12 | 0x30000000:#x}\n"
         "v_mov_b32 v1, 0\n"
         "v_mov_b32 v2, 0x3f801000\n"  # 1.0 + 2^-11 -> 0x3c00 (tie to even)
         "v_mov_b32 v3, 0x3f803000\n"  # 1.0 + 3*2^-11 -> 0x3c02 (tie to even)
@@ -1078,7 +1078,7 @@ def test_remaining_d16_paths_avoid_packhalf2x16(make_shader):
         "s_mov_b32 s0, 0x1000\n"
         "s_mov_b32 s1, 0\n"
         "s_mov_b32 s2, 0x100\n"
-        f"s_mov_b32 s3, {77 << 12:#x}\n"  # format 77 = f32x4
+        f"s_mov_b32 s3, {77 << 12 | 0x30000000:#x}\n"  # format 77 = f32x4
         "v_mov_b32 v0, 0\n"
         "buffer_load_format_d16_xy v2, v0, s[0:3], 0 offen\n"
         "s_waitcnt vmcnt(0)\n"

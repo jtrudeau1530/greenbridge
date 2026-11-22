@@ -861,11 +861,9 @@ class Gen:
     def buffer_load(self, op, a, mods):
         """buffer_load_dword[xN] vD, vaddr, s[V#], soffset [offen|idxen] offset:N  -> buffer-device-address loads.
         addr = V#.base + soffset + inst_offset + (offen ? vaddr : 0) + (idxen ? vindex * V#.stride : 0), byte exact.
-        Raw buffer (stride 0, no idxen): dword i is loaded when O + 4*i + 4 <= num_records (O = soffset +
-        inst_offset + offen, the byte offset), else it is 0 and memory is not read. Measured on an AMD Radeon RX 6800
-        (gfx1030) for buffer_load_dword/x2/x4 with V# OOB_SELECT 3 (docs/design.md, Buffer bounds checking); x3 gets
-        the same rule. Structured buffers and idxen keep buffer_address's check of the first byte for every dword
-        (not measured). Inactive lanes don't load."""
+        Each dword is loaded only when it is in range per the V#'s OOB_SELECT (buffer_address; docs/design.md, Buffer
+        bounds checking): for modes 0 and 3 dword i ends inside the stride / num_records, else it is 0 and memory is
+        not read; modes 1 and 2 check the index / num_records once. Inactive lanes don't load."""
         if any(m in mods for m in ("lds", "tfe")) or "format" in op:
             raise Unsupported(op + " form")
         n = 1 if op.endswith("dword") else int(op.rsplit("x", 1)[1])
@@ -897,19 +895,15 @@ class Gen:
                 out.append(v)
             return out
 
-        if raw_parts is None:               # idxen: one check of the first byte for the whole load, as before
+        if raw_parts is None:               # literal mode 1/2: one check for the whole load
             cond = self.tmp()
             self.emit(f"{cond} = OpLogicalAnd %bool {act} {in_b}")
             phis = guarded(cond, range(n))
-        else:
-            o64, nr64, is_raw = raw_parts
+        else:                               # mode 0/3 (or a run-time V#): each dword checks its own end
             phis = []
             for i in range(n):
-                end, fits, ok, cond = (self.tmp() for _ in range(4))
-                self.emit(f"{end} = OpIAdd %ulong {o64} {self.cl(4 * i + 4)}")
-                self.emit(f"{fits} = OpUGreaterThanEqual %bool {nr64} {end}")
-                self.emit(f"{ok} = OpSelect %bool {is_raw} {fits} {in_b}")
-                self.emit(f"{cond} = OpLogicalAnd %bool {act} {ok}")
+                cond = self.tmp()
+                self.emit(f"{cond} = OpLogicalAnd %bool {act} {raw_parts(i)}")
                 phis += guarded(cond, [i])
         for i, v in enumerate(phis):
             self.dst({"k": "vgpr", "r": vd["r"] + i, "n": 1}, v)
@@ -1183,7 +1177,7 @@ class Gen:
         (word3 bits 12-18), then swizzled by DST_SEL_X/Y/Z/W (word3 bits 0-11: 0=0, 1=1, 4..7 = X..W).
         Formats outside FORMATS decode to 0. An element that starts mid-dword may spill into later dwords:
         need = ceil((byte_shift + size) / 4) loaded dwords, then the window is shifted so decode sees a
-        packed stream starting at the element. num_records bounds checking uses the starting offset only."""
+        packed stream starting at the element. The bounds check is on the whole element (buffer_address, elem="fmt")."""
         if fixed_fmt is not None:
             self.fixed_format_codes.add(fixed_fmt)
         else:
@@ -1193,7 +1187,7 @@ class Gen:
         d16 = "_d16_" in op
         ncomp = len(op.rsplit("_", 1)[1])
         vd = a[0]
-        addr, d3, in_b = self.buffer_address(a, mods)
+        addr, d3, in_b = self.buffer_address(a, mods, elem="fmt", fixed_fmt=fixed_fmt)
         if fixed_fmt is not None:
             fmt = self.cu(fixed_fmt)          # tbuffer: format from the instruction
         else:
@@ -1415,15 +1409,32 @@ class Gen:
             self.emit(f"OpBranch {lbl_end}")
             self.emit(f"{lbl_end} = OpLabel")
 
-    def buffer_address(self, a, mods, parts=False):
-        """(64-bit element address id, V# word3 id, in_bounds bool id) for a MUBUF instruction: vdata, vaddr, srsrc, soffset.
-        in_bounds is the check of the first byte (raw: offset < num_records; structured: see below), shared by
-        stores, atomics and format loads. parts=True adds a 4th element for buffer_load's per-dword raw bound:
-        (64-bit byte offset, 64-bit num_records, stride == 0 bool) ids, or None with idxen (that path is unchanged)."""
+    def buffer_address(self, a, mods, parts=False, elem=None, fixed_fmt=None):
+        """(64-bit element address id, V# word3 id, in_bounds bool id) for a MUBUF/MTBUF instruction: vdata, vaddr,
+        srsrc, soffset. The address is V#.base + soffset + inst_offset + (offen ? vaddr : 0) + (idxen ? vindex *
+        stride : 0), byte exact. in_bounds is the V# OOB_SELECT (word3 bits [29:28]) check of the first dword, shared
+        by stores, atomics and format loads. With `idx` = vindex (0 without idxen), `off` = inst_offset + vaddr offset
+        (offen), `offs` = off + soffset, out of range on RDNA2 as measured natively on gfx1036 (docs/buffer_bounds.md,
+        Mesa's GFX11 column) when, for a dword at byte k * 4 of the access:
+            0 STRUCTURED_WITH_OFFSET: idx >= num_records or off + 4k + 4 > stride
+            1 STRUCTURED:             idx >= num_records
+            2 DISABLED:               num_records == 0
+            3 RAW:                    offs + 4k + 4 > num_records (idx * stride is not part of the check)
+        A V# word3 that an s_mov_b32 wrote earlier in the block (`sgpr_imm`) folds to one of these; a run-time one
+        selects with OpSelect. elem="fmt" is for typed loads and stores: the whole element (its format's size, from the
+        instruction's fixed_fmt, a literal word3 or the V# at run time) must end inside. parts=True adds a 4th element for buffer_load: a function k -> in-range bool id for
+        dword k (modes 0 and 3, and a run-time V#), or None when the literal mode is 1 or 2 (every dword shares
+        in_bounds). Multi-dword loads are per dword for mode 3 (measured, RX 6800); mode 0 is by analogy."""
         vaddr, rsrc = a[1], a[2]
         soff = a[3] if len(a) > 3 else {"k": "imm", "v": 0}
         if rsrc["k"] != "sgpr" or rsrc.get("n") != 4:
             raise Unsupported("buffer V#")
+        lit3, lit1 = self.sgpr_imm.get(rsrc["r"] + 3), self.sgpr_imm.get(rsrc["r"] + 1)
+        # swizzled buffers (WORD1 SWIZZLE_ENABLE bit 31, WORD3 ADD_TID_ENABLE bit 23; Mesa gfx10-rsrc.json lines 326,
+        # 337) change the address and the bounds check, in every mode: a literal V# that asks for them is rejected, a
+        # run-time one is translated unswizzled (docs/design.md, Buffer bounds checking)
+        if (lit1 is not None and lit1 >> 31) or (lit3 is not None and lit3 >> 23 & 1):
+            raise Unsupported("buffer V# with SWIZZLE_ENABLE / ADD_TID_ENABLE (swizzled buffers not modelled)")
         d0, d1, d2, d3 = (self.load_reg("sgpr", rsrc["r"] + i) for i in (0, 1, 2, 3))
         hi, stride = self.tmp(), self.tmp()
         self.emit(f"{hi} = OpBitwiseAnd %uint {d1} {self.cu(0xFFFF)}")
@@ -1435,15 +1446,19 @@ class Gen:
         idx = None
         if "idxen" in mods:
             idx = self.load_reg("vgpr", vregs[0])
-            m, t = self.tmp(), self.tmp()
-            self.emit(f"{m} = OpIMul %uint {idx} {stride}")
-            self.emit(f"{t} = OpIAdd %uint {total} {m}")
-            total = t
+        voff = None
         if "offen" in mods:
-            o = self.load_reg("vgpr", vregs[1] if "idxen" in mods else vregs[0])
-            t = self.tmp()
-            self.emit(f"{t} = OpIAdd %uint {total} {o}")
-            total = t
+            voff = self.load_reg("vgpr", vregs[1] if "idxen" in mods else vregs[0])
+        # offs = soffset + inst_offset + vaddr offset (idx * stride excluded); the address adds idx * stride too
+        offs = total
+        if voff is not None:
+            offs = self.tmp()
+            self.emit(f"{offs} = OpIAdd %uint {total} {voff}")
+        total = offs
+        if idx is not None:
+            m, total = self.tmp(), self.tmp()
+            self.emit(f"{m} = OpIMul %uint {idx} {stride}")
+            self.emit(f"{total} = OpIAdd %uint {offs} {m}")
         self.uses_psb = True
         l64, h64, sh, base, o64, addr = (self.tmp() for _ in range(6))
         self.emit(f"{l64} = OpUConvert %ulong {d0}")
@@ -1452,24 +1467,95 @@ class Gen:
         self.emit(f"{base} = OpBitwiseOr %ulong {sh} {l64}")
         self.emit(f"{o64} = OpUConvert %ulong {total}")
         self.emit(f"{addr} = OpIAdd %ulong {base} {o64}")
-        is_raw, tot_ok, in_b = self.tmp(), self.tmp(), self.tmp()
-        self.emit(f"{is_raw} = OpIEqual %bool {stride} {self.cu(0)}")
-        self.emit(f"{tot_ok} = OpULessThan %bool {total} {d2}")
-        if idx is not None:
-            idx_ok = self.tmp()
-            self.emit(f"{idx_ok} = OpULessThan %bool {idx} {d2}")
-            self.emit(f"{in_b} = OpSelect %bool {is_raw} {tot_ok} {idx_ok}")
-            raw_parts = None
-        else:
-            d2_64, st_64, lim, str_ok = (self.tmp() for _ in range(4))
-            self.emit(f"{d2_64} = OpUConvert %ulong {d2}")
-            self.emit(f"{st_64} = OpUConvert %ulong {stride}")
-            self.emit(f"{lim} = OpIMul %ulong {d2_64} {st_64}")
-            self.emit(f"{str_ok} = OpULessThan %bool {o64} {lim}")
-            self.emit(f"{in_b} = OpSelect %bool {is_raw} {tot_ok} {str_ok}")
-            raw_parts = (o64, d2_64, is_raw)
+        mode = None if lit3 is None else lit3 >> 28 & 3
+        # idx (0 without idxen) < num_records and num_records != 0 do not depend on the dword; the two end checks do
+        p1 = p2 = None
+        if mode in (None, 0, 1):
+            p1 = self.tmp()
+            if idx is None:
+                self.emit(f"{p1} = OpINotEqual %bool {d2} {self.cu(0)}")
+            else:
+                self.emit(f"{p1} = OpULessThan %bool {idx} {d2}")
+        if mode in (None, 2):
+            p2 = self.tmp()
+            self.emit(f"{p2} = OpINotEqual %bool {d2} {self.cu(0)}")
+        lim = {}
+        if mode in (None, 0):
+            # off = inst_offset + vaddr offset, without soffset (docs/buffer_bounds.md)
+            off = self.cu(inst)
+            if voff is not None:
+                off = self.tmp()
+                self.emit(f"{off} = OpIAdd %uint {voff} {self.cu(inst)}")
+            lim[0] = (self.tmp(), self.tmp())
+            self.emit(f"{lim[0][0]} = OpUConvert %ulong {off}")
+            self.emit(f"{lim[0][1]} = OpUConvert %ulong {stride}")
+        if mode in (None, 3):
+            lim[3] = (self.tmp(), self.tmp())
+            self.emit(f"{lim[3][0]} = OpUConvert %ulong {offs}")
+            self.emit(f"{lim[3][1]} = OpUConvert %ulong {d2}")
+        sel = None
+        if mode is None:
+            md, m1, m2, m3 = (self.tmp() for _ in range(4))
+            self.emit(f"{md} = OpBitFieldUExtract %uint {d3} {self.cu(28)} {self.cu(2)}")
+            self.emit(f"{m1} = OpIEqual %bool {md} {self.cu(1)}")
+            self.emit(f"{m2} = OpIEqual %bool {md} {self.cu(2)}")
+            self.emit(f"{m3} = OpIEqual %bool {md} {self.cu(3)}")
+            sel = (m1, m2, m3)
+
+        def end_ok(which, end_bytes):
+            """The access ends inside its limit: offset + end <= stride (mode 0) or <= num_records (mode 3);
+            end_bytes is a Python int or the id of a ulong."""
+            x, limit = lim[which]
+            end, ok = self.tmp(), self.tmp()
+            self.emit(f"{end} = OpIAdd %ulong {x} {self.cl(end_bytes) if isinstance(end_bytes, int) else end_bytes}")
+            self.emit(f"{ok} = OpULessThanEqual %bool {end} {limit}")
+            return ok
+
+        def check_end(end_bytes):
+            """in-range bool of an access that ends end_bytes after its first byte."""
+            if mode == 1:
+                return p1
+            if mode == 2:
+                return p2
+            if mode == 3:
+                return end_ok(3, end_bytes)
+            e0 = self.tmp()
+            self.emit(f"{e0} = OpLogicalAnd %bool {p1} {end_ok(0, end_bytes)}")
+            if mode == 0:
+                return e0
+            s12, s3, r = self.tmp(), self.tmp(), self.tmp()
+            self.emit(f"{s12} = OpSelect %bool {sel[0]} {p1} {e0}")
+            self.emit(f"{s3} = OpSelect %bool {sel[1]} {p2} {s12}")
+            self.emit(f"{r} = OpSelect %bool {sel[2]} {end_ok(3, end_bytes)} {s3}")
+            return r
+
+        def check(k):
+            """in-range bool of dword k of the access (k = 0: the first dword)."""
+            return check_end(4 * k + 4)
+
+        if elem == "fmt":
+            # a typed element is all or nothing and ends at its size (measured, gfx1150: 32_32_32_32 at off 20 of 32
+            # reads 0 entirely): the size of the V#'s (or the instruction's) format
+            code = fixed_fmt if fixed_fmt is not None else (lit3 >> 12 & 0x7F if lit3 is not None else None)
+            if code is not None:
+                size = self.FORMATS.get(code, (4,))[0]
+            else:
+                fc, sz = self.tmp(), self.cu(4)
+                self.emit(f"{fc} = OpBitFieldUExtract %uint {d3} {self.cu(12)} {self.cu(7)}")
+                for fcode, (fsz, _, _) in self.FORMATS.items():
+                    if fsz != 4:
+                        e, n = self.tmp(), self.tmp()
+                        self.emit(f"{e} = OpIEqual %bool {fc} {self.cu(fcode)}")
+                        self.emit(f"{n} = OpSelect %uint {e} {self.cu(fsz)} {sz}")
+                        sz = n
+                size = self.tmp()
+                self.emit(f"{size} = OpUConvert %ulong {sz}")
+            in_b = check_end(size)
+            return addr, d3, in_b
+        in_b = check(0)
         if parts:
-            return addr, d3, in_b, raw_parts
+            # modes 0 and 3 end-check every dword on its own; 1 and 2 (a literal V#) share the first-byte check
+            return addr, d3, in_b, (check if mode in (None, 0, 3) else None)
         return addr, d3, in_b
 
     def buffer_store(self, op, a, mods):
@@ -1479,8 +1565,13 @@ class Gen:
             raise Unsupported(op + " form")
         d16 = "_d16_" in op
         vd = a[0]
-        addr, d3, in_b = self.buffer_address(a, mods)
-        if op.startswith("buffer_store_dword"):
+        dword_store = op.startswith("buffer_store_dword")
+        if dword_store:
+            addr, d3, in_b, per = self.buffer_address(a, mods, parts=True)
+        else:
+            addr, d3, in_b = self.buffer_address(a, mods, elem="fmt")
+            per = None
+        if dword_store:
             n = 1 if op.endswith("dword") else int(op.rsplit("x", 1)[1])
             words = [self.load_reg("vgpr", vd["r"] + i) for i in range(n)]
             plans = None
@@ -1511,6 +1602,23 @@ class Gen:
             fl = [self.tof(c) for c in comps] + ["%f0"] * (4 - len(comps))
             plans = (fmt, comps, f32, fl, icomps)
             words = None
+        if words is not None and per is not None and len(words) > 1:
+            # modes 0 and 3: every dword is stored only if it ends inside (measured: a store that straddles the edge
+            # writes the dwords before it); a store past the end of the buffer is a host-memory hazard otherwise
+            ptr = self.tmp()
+            self.emit(f"{ptr} = OpConvertUToPtr %_ptr_PSB_arr {self.host_addr(addr)}")
+            for i, w in enumerate(words):
+                cond, lbl_do, lbl_end = self.tmp(), self.tmp() + "_do", self.tmp() + "_end"
+                self.emit(f"{cond} = OpLogicalAnd %bool {self.active_b()} {per(i)}")
+                self.emit(f"OpSelectionMerge {lbl_end} None")
+                self.emit(f"OpBranchConditional {cond} {lbl_do} {lbl_end}")
+                self.emit(f"{lbl_do} = OpLabel")
+                p = self.tmp()
+                self.emit(f"{p} = OpAccessChain %_ptr_PSB_uint {ptr} {self.cu(i)}")
+                self.emit(f"OpStore {p} {w} Aligned 4")
+                self.emit(f"OpBranch {lbl_end}")
+                self.emit(f"{lbl_end} = OpLabel")
+            return
         act = self.tmp()
         self.emit(f"{act} = OpLogicalAnd %bool {self.active_b()} {in_b}")
         lbl_do, lbl_end = self.tmp() + "_do", self.tmp() + "_end"
