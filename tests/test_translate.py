@@ -72,7 +72,7 @@ def test_translation_is_deterministic(make_shader):
 
 def test_unsupported_instruction_is_reported_not_guessed(make_shader):
     """Anything outside the supported set must raise Unsupported rather than emit a wrong program."""
-    shader = make_shader(program("v_mov_b32 v1, 1.0\nv_sad_u8 v0, v1, v1, v1"))
+    shader = make_shader(program("v_mov_b32 v1, 1.0\nv_mqsad_u32_u8 v[8:11], v[2:3], v1, v[4:7]"))
     with pytest.raises(rdna2spirv.Unsupported):
         shader.translate()
 
@@ -93,6 +93,31 @@ def test_depth_compare_sample_result_width(make_shader, d16):
                        r"PackHalf2x16 \1$", spvasm, re.M)
     as_f32 = re.search(rf"^\s*%\w+ = OpBitcast %uint {d}$", spvasm, re.M)
     assert (bool(as_f16), bool(as_f32)) == (d16, not d16)
+
+
+def test_a16_sample_gradients_use_full_vgprs(make_shader):
+    path = os.path.join(ROOT, "runtime", "test", "shaders", "ps_texture_grad_a16.asm")
+    with open(path, encoding="utf-8") as fixture:
+        shader = make_shader(fixture.read(), "ps_texture_grad_a16")
+    spvasm = shader.translate()
+    sample = re.search(r"= OpImageSampleExplicitLod %v4float %\w+ %\w+ Grad (%\w+) (%\w+)$", spvasm, re.M)
+    assert sample, "the explicit-gradient sample is missing"
+    definitions = dict(re.findall(r"^\s*(%\w+) = (Op[^\n]+)", spvasm, re.M))
+
+    # Trace dPdx and dPdy back to the fixture's full 32-bit derivative words, in operand order.
+    for vector, registers in zip(sample.groups(), ((8, 9), (10, 11))):
+        assert definitions[vector].startswith("OpCompositeConstruct %v2float ")
+        components = definitions[vector].split()[2:]
+        assert len(components) == 2
+        for component, register in zip(components, registers):
+            cast, float_type, word = definitions[component].split()
+            assert (cast, float_type) == ("OpBitcast", "%float")
+            load, word_type, pointer = definitions[word].split()
+            assert (load, word_type) == ("OpLoad", "%uint")
+            *access, index = definitions[pointer].split()
+            assert access == ["OpAccessChain", "%_ptr_Function_uint", "%vgpr"]
+            assert definitions[index] == f"OpConstant %uint {register}"
+    shader.validate(spvasm)
 
 
 def test_unknown_stage_is_rejected(make_shader):
@@ -711,3 +736,72 @@ def test_mesh_s3_wave_id_emits_local_index_shift_and_bfe(make_shader):
     assert "%mwi = OpShiftLeftLogical %uint %wave %c18" in asm
     assert "OpStore %s3p %mwi" in asm
     assert "OpBitFieldUExtract %uint" in asm
+
+
+PK_F16_REPRO_513 = """\
+; mattr: +wavefrontsize64,-wavefrontsize32
+v_mov_b32_e32 v27, 0xbdd53e00
+v_mov_b32_e32 v32, 0x3d3d32a5
+v_and_b32_e32 v7, 7, v0
+v_lshlrev_b32_e32 v7, 7, v7
+v_or_b32_e32 v20, 0x3c00, v7
+v_pk_add_f16 v31, v32, v20 op_sel:[0,0] op_sel_hi:[0,0]
+v_pk_mul_f16 v34, v27, v31 op_sel:[0,0] op_sel_hi:[0,0]
+v_lshlrev_b32_e32 v1, 2, v0
+buffer_store_dword v34, v1, s[0:3], 0 offen
+v_add_nc_u32_e32 v2, 256, v1
+buffer_store_dword v31, v2, s[0:3], 0 offen
+s_endpgm
+"""
+
+
+@pytest.mark.parametrize("emulate", [False, True], ids=["wave64", "wave64-emulate"])
+def test_pk_f16_int_pack_repro_513(emulate, make_shader, monkeypatch):
+    """SHADER-70 (#513): v_pk_*_f16 packs with integer IEEE-754 RTE instead of PackHalf2x16 so drivers cannot fold
+    UnpackHalf2x16(PackHalf2x16(x)) back to unrounded f32, and produces exact RTE bits on the #513 repro."""
+    import sys
+
+    semantic_dir = os.path.join(ROOT, "tests", "semantic")
+    if semantic_dir not in sys.path:
+        sys.path.insert(0, semantic_dir)
+    import spirv_mini_interp
+
+    shader = make_shader(PK_F16_REPRO_513, name="cs_pk_f16_repro_513")
+    monkeypatch.setattr(rdna2spirv, "WAVE64_EMULATE", emulate)
+    spv = shader.translate()
+    shader.validate(spv)
+    assert "PackHalf2x16" not in spv
+
+    sg_size = 32 if emulate else 64
+    mem = spirv_mini_interp.run_workgroup(
+        spv, 64, sg_size,
+        inputs_for=lambda i: {"%wg_id": (0, 0, 0), "%local_id": (i, 0, 0), "%sg_lane": i % sg_size},
+        push_constants=[0, 0, 0xFFFFFFFF, 0] + [0] * 28,
+        memory={},
+    )
+    assert [mem[256 + 4 * i] for i in range(3)] == [0x3CD53CD5, 0x3D553D55, 0x3DD53DD5]
+    assert [mem[4 * i] for i in range(3)] == [0x3F403F40, 0x40004000, 0x40604060]
+
+
+@pytest.mark.parametrize("op_asm", [
+    "v_pk_add_f16 v3, v1, v2",
+    "v_pk_mul_f16 v3, v1, v2",
+    "v_pk_max_f16 v3, v1, v2",
+    "v_pk_min_f16 v3, v1, v2",
+    "v_pk_fma_f16 v3, v1, v2, v4",
+    "v_add_f16_e64 v3, v1, v2",
+])
+def test_pk_and_scalar_f16_ops_emit_no_packhalf2x16(op_asm, make_shader):
+    """All v_pk_*_f16 instructions and scalar f16_out ops validate and avoid GLSL PackHalf2x16."""
+    body = (
+        "v_mov_b32 v1, 0x3c003800\n"
+        "v_mov_b32 v2, 0x40003c00\n"
+        "v_mov_b32 v3, 0x00000000\n"
+        "v_mov_b32 v4, 0x38003400\n"
+        f"{op_asm}\n"
+        "v_mov_b32 v0, v3"
+    )
+    shader = make_shader(program(body))
+    spv = shader.translate()
+    shader.validate(spv)
+    assert "PackHalf2x16" not in spv

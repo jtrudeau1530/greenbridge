@@ -9,6 +9,29 @@ if(NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
 endif()
 
 if(WIN32)
+  # The d3d12_xs shim and its tests use version 1.2 root signatures (D3D12_ROOT_SIGNATURE_DESC2), which the Windows
+  # SDK declares from 10.0.26100 on. Stop here with the fix instead of failing halfway through the build.
+  include(CheckCXXSourceCompiles)
+  check_cxx_source_compiles([=[
+    #include <d3d12.h>
+    int main() { D3D12_VERSIONED_ROOT_SIGNATURE_DESC d{}; d.Version = D3D_ROOT_SIGNATURE_VERSION_1_2;
+                 return static_cast<int>(sizeof(d.Desc_1_2)); }
+  ]=] GTA6RT_SDK_HAS_ROOT_SIGNATURE_1_2)
+  if(NOT GTA6RT_SDK_HAS_ROOT_SIGNATURE_1_2)
+    if(CMAKE_VS_WINDOWS_TARGET_PLATFORM_VERSION)
+      set(_gta6rt_sdk "${CMAKE_VS_WINDOWS_TARGET_PLATFORM_VERSION}")
+    elseif(DEFINED ENV{WindowsSDKVersion})
+      string(REGEX REPLACE "[\\/]+$" "" _gta6rt_sdk "$ENV{WindowsSDKVersion}")
+    else()
+      set(_gta6rt_sdk "an older one")
+    endif()
+    message(FATAL_ERROR
+      "gta6rt needs the Windows SDK 10.0.26100 or newer (version 1.2 root signatures); "
+      "this build uses ${_gta6rt_sdk}. Install it with "
+      "`winget install Microsoft.WindowsSDK.10.0.26100` or the Visual Studio Installer, then delete the build "
+      "folder and configure again.")
+  endif()
+
   # Root-signature flag fix, shared by the d3d12_xs shim and its tests.
   add_library(gta6rt_d3d12_xs_rootsig STATIC
     shims/d3d12_xs_rootsig.cpp
@@ -168,6 +191,8 @@ endif()
 
 include(CTest)
 if(BUILD_TESTING)
+  add_executable(pipeline_cache_file_test test/pipeline_cache_file_test.cpp)
+  add_test(NAME pipeline_cache_file COMMAND pipeline_cache_file_test)
   if(WIN32)
     # Loader tests. They build their own PE images, so they need neither the game nor any other input.
     add_executable(loader_test
@@ -274,6 +299,31 @@ if(BUILD_TESTING)
     add_test(NAME loader_tls
       COMMAND loader_tls_test "$<TARGET_FILE:tiny_tls>"
     )
+
+    # LEONIDA_UNIMPLEMENTED=log|fail|stop: builds its own image with two imports that bind to nothing, calls them in
+    # process (log, fail) and in child processes (default/env parsing, stop). No game files, no GPU.
+    add_executable(unimplemented_policy_test
+      test/unimplemented_policy_test.cpp
+      src/pe_loader.cpp
+      shims/registry.cpp
+    )
+    # The register-preservation check needs a caller that sets rbx/rbp/rdi/rsi/r12-r15 and xmm6-15, which MSVC x64
+    # cannot do inline: test/fixtures/abi_probe.asm (MASM). Without ml64 the rest of the test still runs.
+    find_program(LEONIDA_ML64 ml64)  # CMake would otherwise pick the 32-bit ml with the Ninja generator
+    if(LEONIDA_ML64)
+      set(CMAKE_ASM_MASM_COMPILER "${LEONIDA_ML64}")
+      enable_language(ASM_MASM)
+      target_sources(unimplemented_policy_test PRIVATE test/fixtures/abi_probe.asm)
+      target_compile_definitions(unimplemented_policy_test PRIVATE LEONIDA_HAVE_ABI_PROBE=1)
+    else()
+      message(STATUS "ml64 not found: unimplemented_policy_test skips the register-preservation check")
+    endif()
+    target_include_directories(unimplemented_policy_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_compile_definitions(unimplemented_policy_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE _CRT_SECURE_NO_WARNINGS)
+    target_compile_options(unimplemented_policy_test PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/W4 /permissive- /utf-8 /EHsc>)
+    target_link_options(unimplemented_policy_test PRIVATE /OPT:NOREF)
+    add_dependencies(unimplemented_policy_test gta6rt_tls_host)
+    add_test(NAME unimplemented_policy COMMAND unimplemented_policy_test)
   endif()
 
   if(WIN32 AND TARGET root_sig_test)
@@ -393,9 +443,21 @@ if(LEONIDA_D3D12_SHIM_TESTS)
 endif()
 endif()
 
-# GPU test and pipeline tools load Vulkan at run time.
+# GPU test and pipeline tools load Vulkan at run time, so only the Vulkan headers are needed at build time.
 find_package(Vulkan QUIET)
-if(Vulkan_FOUND)
+if(NOT TARGET Vulkan::Headers)
+  find_path(Vulkan_INCLUDE_DIR
+    NAMES vulkan/vulkan.h
+    HINTS "$ENV{VULKAN_SDK}/Include" "$ENV{VULKAN_SDK}/include"
+  )
+  if(Vulkan_INCLUDE_DIR AND EXISTS "${Vulkan_INCLUDE_DIR}/vulkan/vulkan.h")
+    add_library(Vulkan::Headers INTERFACE IMPORTED)
+    set_target_properties(Vulkan::Headers PROPERTIES
+      INTERFACE_INCLUDE_DIRECTORIES "${Vulkan_INCLUDE_DIR}"
+    )
+  endif()
+endif()
+if(TARGET Vulkan::Headers)
   foreach(tool vk_harness vk_texture_test vk_compute_test vk_store_test vk_pipeline_check vk_command_replay_test
           vk_bindless_test)
     add_executable(${tool} test/${tool}.cpp)
@@ -442,6 +504,18 @@ if(Vulkan_FOUND)
     target_compile_definitions(d3d12_vulkan_device_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(d3d12_vulkan_device_test PRIVATE /W4 /permissive- /utf-8)
 
+    # The 1/2/3 method variants (D3D-28) against the methods they wrap, on the Vulkan device directly.
+    add_executable(d3d12_method_variants_test test/d3d12_method_variants_test.cpp)
+    target_link_libraries(d3d12_method_variants_test PRIVATE gta6rt_d3d12_com)
+    target_compile_definitions(d3d12_method_variants_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_method_variants_test PRIVATE /W4 /permissive- /utf-8)
+
+    # CreateSampler2 (D3D-28) against CreateSampler, and its refusals against the host's PC runtime.
+    add_executable(d3d12_sampler2_test test/d3d12_sampler2_test.cpp)
+    target_link_libraries(d3d12_sampler2_test PRIVATE gta6rt_d3d12_com)
+    target_compile_definitions(d3d12_sampler2_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_sampler2_test PRIVATE /W4 /permissive- /utf-8)
+
     # Descriptors through the proxy: copies between heaps, what texture views and samplers write into their slots,
     # and (where glslangValidator is found) a compute shader the test runs on the device's bindless set, which
     # finds a T# and an S# through the hash table and samples. The shader is GLSL, compiled here.
@@ -468,10 +542,16 @@ if(Vulkan_FOUND)
     endif()
 
     # Differential regression: run explicitly (requires Vulkan hardware and Windows WARP).
-    add_executable(d3d12_uint_clear_test test/d3d12_uint_clear_test.cpp)
-    target_link_libraries(d3d12_uint_clear_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
-    target_compile_definitions(d3d12_uint_clear_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
-    target_compile_options(d3d12_uint_clear_test PRIVATE /W4 /permissive- /utf-8)
+    add_executable(d3d12_clear_test test/d3d12_clear_test.cpp)
+    target_link_libraries(d3d12_clear_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
+    target_compile_definitions(d3d12_clear_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_clear_test PRIVATE /W4 /permissive- /utf-8)
+
+    # Synthetic typed-view readbacks against Windows WARP; run explicitly on a Vulkan GPU.
+    add_executable(d3d12_typeless_rtv_test test/d3d12_typeless_rtv_test.cpp)
+    target_link_libraries(d3d12_typeless_rtv_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
+    target_compile_definitions(d3d12_typeless_rtv_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_typeless_rtv_test PRIVATE /W4 /permissive- /utf-8)
 
     # The loader can create this device instead of the host's (D3D12XboxCreateDevice, LEONIDA_D3D12=vulkan).
     if(TARGET gta6rt)
@@ -489,6 +569,15 @@ if(Vulkan_FOUND)
 
   # Needs only the Vulkan headers, not a GPU.
   if(BUILD_TESTING)
+    add_executable(typeless_rtv_test test/typeless_rtv_test.cpp)
+    target_link_libraries(typeless_rtv_test PRIVATE Vulkan::Headers)
+    if(WIN32)
+      target_compile_definitions(typeless_rtv_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    endif()
+    add_test(NAME typeless_rtv COMMAND typeless_rtv_test)
+    add_executable(pipeline_cache_snapshot_test test/pipeline_cache_snapshot_test.cpp)
+    target_link_libraries(pipeline_cache_snapshot_test PRIVATE Vulkan::Headers)
+    add_test(NAME pipeline_cache_snapshot COMMAND pipeline_cache_snapshot_test)
     add_executable(clear_color_test test/clear_color_test.cpp)
     target_link_libraries(clear_color_test PRIVATE Vulkan::Headers)
     if(WIN32)
@@ -507,6 +596,6 @@ if(Vulkan_FOUND)
     add_test(NAME gfx10_descriptors COMMAND gfx10_descriptors_test)
   endif()
 else()
-  message(STATUS "Vulkan SDK not found: GPU test tools, vk_pipeline_check, d3d12_state_map_test and "
+  message(STATUS "Vulkan headers not found: GPU test tools, vk_pipeline_check, d3d12_state_map_test and "
                  "gfx10_descriptors_test are not built")
 endif()

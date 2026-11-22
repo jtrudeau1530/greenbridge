@@ -191,14 +191,17 @@ class SkipAssetsAndStageIsolationTest(unittest.TestCase):
             mock_pipelines.assert_called_once()
 
     def test_skip_assets_preflight_bypasses_dotnet_sdk_and_submodule_checks(self) -> None:
+        # The runtime stage is Windows-only, and preflight refuses it elsewhere before any check this test is
+        # about; with no Windows-only stages the same checks run on every system.
         with mock.patch("sys.version_info", (3, 12, 0)), \
+                mock.patch.object(make_game, "WINDOWS_ONLY", ()), \
                 mock.patch.object(make_game, "visual_cpp_tools_ok", return_value=True), \
                 mock.patch.object(make_game, "dotnet_sdk_ok") as mock_dotnet, \
                 mock.patch.object(make_game, "ensure_submodule") as mock_submodule, \
                 mock.patch.object(make_game, "tool_available", return_value=True), \
                 mock.patch("shutil.which", return_value="/usr/bin/tool"), \
                 mock.patch("shutil.disk_usage", return_value=mock.Mock(free=100 * (2**30))):
-            make_game.preflight(["shaders", "runtime", "pipelines"], self.work_dir, wav=True)
+            make_game.preflight(["shaders", "pipelines"], self.work_dir, wav=True)  # no runtime: Windows-only
             mock_dotnet.assert_not_called()
             mock_submodule.assert_not_called()
 
@@ -450,18 +453,35 @@ class StageResumptionAndStepIsolationTest(unittest.TestCase):
         with open(os.path.join(audio_dir, "xma.done"), "w", encoding="utf-8") as f:
             f.write("done\n")
 
-        dummy_exe = os.path.join(self.tmp.name, "rpf9dump.exe")
-        with open(dummy_exe, "w", encoding="utf-8") as f:
-            f.write("exe")
-
-        with mock.patch("make_game.rpf9dump", return_value=dummy_exe), \
+        with mock.patch("make_game.rpf9dump") as exporter, \
                 mock.patch("make_game.run") as mock_run, \
                 mock.patch("make_game.py") as mock_py, \
                 mock.patch("shutil.which", return_value=None), \
                 mock.patch("make_game.log"):
             make_game.assets(self.game_dir, self.work_dir, wav=False, jobs=1)
+            exporter.assert_not_called()
             mock_run.assert_not_called()
             mock_py.assert_not_called()
+
+    def test_pending_exports_refresh_the_existing_helper_once(self) -> None:
+        output = os.path.join(self.work_dir, "tools", "rpf9dump")
+        os.makedirs(output)
+        exe = os.path.join(output, "rpf9dump.exe" if os.name == "nt" else "rpf9dump")
+        with open(exe, "wb") as f:
+            f.write(b"previous build")
+        os.makedirs(os.path.join(self.tmp.name, "third_party", "rpf9-explorer", "Core"))
+        os.makedirs(os.path.join(self.work_dir, "assets", "audio"))
+
+        with mock.patch.object(make_game, "ROOT", self.tmp.name), \
+                mock.patch.object(make_game, "MODEL_ARCHIVES", ["scene.rpf"]), \
+                mock.patch.object(make_game, "need"), mock.patch.object(make_game, "py"), \
+                mock.patch.object(make_game, "run") as run, mock.patch("shutil.which", return_value=None):
+            make_game.assets(self.game_dir, self.work_dir, wav=False, jobs=1)
+
+        commands = [call.args[0] for call in run.call_args_list]
+        self.assertEqual(commands[0][:2], ["dotnet", "build"])
+        self.assertEqual([(cmd[0], cmd[1]) for cmd in commands[1:]],
+                         [(exe, mode) for mode in ("models", "textures", "audio", "xma")])
 
     def test_drop_removes_existing_marker_files(self) -> None:
         p1 = os.path.join(self.work_dir, "m1.txt")

@@ -4,6 +4,7 @@
 
 Zero game data: all tests use deterministic, synthetic byte sequences constructed in-memory.
 """
+import io
 import json
 import os
 import struct
@@ -11,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 import zlib
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -340,6 +342,45 @@ class TestCrcAndChecksumBounds(unittest.TestCase):
         dxbc = make_dxbc([(b"DXIL", dxil)])
         with self.assertRaises(zlib.error):
             fssm_unpack.unpack(dxbc)
+
+
+class TestMainBadSource(unittest.TestCase):
+    """A source that is missing, a file, or unlistable is one line on stderr, exit 2, and nothing is created."""
+
+    def run_tool(self, src):
+        return subprocess.run([sys.executable, "-I", TOOL, src], capture_output=True, text=True)
+
+    def test_missing_source_is_not_created(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "carve", "shaders")      # mistyped: neither folder exists
+            res = self.run_tool(src)
+            self.assertEqual(res.returncode, 2)
+            self.assertIn(src, res.stderr)
+            self.assertIn("does not exist", res.stderr)
+            self.assertNotIn("Traceback", res.stderr)
+            self.assertEqual(res.stdout, "")
+            self.assertEqual(os.listdir(tmp), [])            # on main: carve/shaders/fssm was made
+
+    def test_file_as_source(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "shader_a.dxbc")
+            with open(src, "wb") as f:
+                f.write(b"DXBC")
+            res = self.run_tool(src)
+            self.assertEqual(res.returncode, 2)
+            self.assertIn("is not a folder", res.stderr)
+            self.assertNotIn("Traceback", res.stderr)
+            self.assertEqual(os.listdir(tmp), ["shader_a.dxbc"])
+
+    def test_unlistable_source(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = io.StringIO()
+            with mock.patch.object(fssm_unpack.os, "listdir", side_effect=PermissionError(13, "Permission denied")), \
+                    mock.patch.object(sys, "stderr", out):
+                self.assertEqual(fssm_unpack.main([tmp]), 2)
+            self.assertIn("cannot list", out.getvalue())
+            self.assertIn("Permission denied", out.getvalue())
+            self.assertFalse(os.path.exists(os.path.join(tmp, "fssm")))
 
 
 class TestMainDirectoryProcessing(unittest.TestCase):

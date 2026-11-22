@@ -19,8 +19,8 @@ Design rules (see tests/semantic/README.md):
     keep the old behaviour.
 
 Values: uint/int are Python ints in [0, 2**32) or [0, 2**64) for 64-bit types (signedness is applied by the
-operation, as in SPIR-V); float is a Python float rounded to binary32; vectors are tuples; arrays are lists;
-bool is bool.
+operation, as in SPIR-V); float is a Python float rounded to binary32 (one made by OpBitcast also keeps its exact
+32-bit pattern, so a signalling NaN comes back out unchanged); vectors are tuples; arrays are lists; bool is bool.
 """
 import math
 import re
@@ -77,7 +77,25 @@ def f32(x):
         return float("inf") if x > 0 else float("-inf")
 
 
+class _F32(float):
+    """A binary32 value that came from a bit pattern (OpBitcast) and still carries that exact pattern.
+
+    struct's binary32 -> double conversion quiets a signalling NaN (it sets bit 22, issue #509), so the float
+    value alone cannot give the word back. OpBitcast, OpCopyObject, loads, stores, composites and outputs pass
+    the value on unchanged and keep `bits`; arithmetic on it returns a plain float, which drops them (SPIR-V
+    leaves the bits of a NaN result open)."""
+
+    __slots__ = ("bits",)
+
+    def __new__(cls, bits):
+        self = super().__new__(cls, struct.unpack("<f", struct.pack("<I", bits))[0])
+        self.bits = bits
+        return self
+
+
 def f32_bits(x):
+    if isinstance(x, _F32):
+        return x.bits
     try:
         return struct.unpack("<I", struct.pack("<f", x))[0]
     except OverflowError:
@@ -85,7 +103,7 @@ def f32_bits(x):
 
 
 def bits_f32(b):
-    return struct.unpack("<f", struct.pack("<I", b & MASK))[0]
+    return _F32(b & MASK)
 
 
 def half_to_float(h):
@@ -578,7 +596,11 @@ def _invocation(text, inputs, push_constants, memory, step=False):
             values[res] = int(f"{val(a[1]) & wmask(a[0]):0{bits}b}"[::-1], 2)
         elif op in ("OpConvertUToF", "OpConvertSToF"):
             x = val(a[1])
-            if isinstance(x, bool) or not isinstance(x, int) or x > MASK:
+            # The width comes from the operand's type, as in sval(): a 64-bit value below 2**32 passes the value
+            # check, and _s32() would then give it the wrong sign under OpConvertSToF.
+            t = types.t.get(id_type.get(a[1]))
+            if isinstance(x, bool) or not isinstance(x, int) or x > MASK \
+                    or (t is not None and (t[0] != "int" or t[1] != 32)):
                 raise UnsupportedConstruct(f"{op} on a non-32-bit-integer operand")
             values[res] = f32(float(_s32(x) if op == "OpConvertSToF" else x))
         elif op == "OpBitCount":
@@ -660,11 +682,34 @@ def _invocation(text, inputs, push_constants, memory, step=False):
             values[res] = not val(a[1])
         elif op in ("OpFAdd", "OpFSub", "OpFMul"):
             x, y = val(a[1]), val(a[2])
-            if not (isinstance(x, float) and isinstance(y, float)):
+            fn = (lambda p, q: f32(p + q)) if op == "OpFAdd" else (
+                (lambda p, q: f32(p - q)) if op == "OpFSub" else (lambda p, q: f32(p * q)))
+            if isinstance(x, tuple) and isinstance(y, tuple) and len(x) == len(y) and all(
+                    isinstance(p, float) and isinstance(q, float) for p, q in zip(x, y)):
+                values[res] = tuple(fn(p, q) for p, q in zip(x, y))
+            elif isinstance(x, float) and isinstance(y, float):
+                values[res] = fn(x, y)
+            else:
                 raise UnsupportedConstruct(f"{op} on non-float")
-            values[res] = f32(x + y if op == "OpFAdd" else x - y if op == "OpFSub" else x * y)
         elif op == "OpFNegate":
             values[res] = f32(-val(a[1]))
+        elif op == "OpQuantizeToF16":
+            # Single-instruction f32 -> f16 -> f32 round to nearest, with the
+            # SPIR-V subnormal rule: a magnitude too small for a normal f16
+            # becomes +0/-0. struct.pack('<e') keeps the subnormal, which would
+            # make the interpreter more precise than a conforming driver.
+            # Emitted by the translator for 16-bit interpolant reads; a
+            # Pack/Unpack round-trip is observably folded to a no-op by at
+            # least one driver.
+            h = float_to_half(val(a[1]))
+            if h & 0x7C00 == 0:
+                h &= 0x8000
+            values[res] = half_to_float(h)
+        elif op in ("OpConvertUToF", "OpConvertSToF"):
+            x = val(a[1])
+            if isinstance(x, bool) or not isinstance(x, int) or x > MASK:
+                raise UnsupportedConstruct(f"{op} on a non-32-bit-integer operand")
+            values[res] = f32(float(_s32(x) if op == "OpConvertSToF" else x))
         elif op in ("OpConvertFToU", "OpConvertFToS"):
             x, bits = val(a[1]), types.bits(a[0])
             if not isinstance(x, float) or not math.isfinite(x):
@@ -736,9 +781,15 @@ def _invocation(text, inputs, push_constants, memory, step=False):
                     raise UnsupportedConstruct(f"GLSL.std.450 {name} with these operands (undefined)")
                 v = max(args[0], args[1])
                 values[res] = f32(v if name == "FMax" else min(v, args[2]))
-            elif name == "RoundEven":
+            elif name in ("RoundEven", "Floor", "Ceil", "Trunc"):
+                # round() breaks ties to even. An integral result keeps the operand's sign (IEEE 754
+                # roundToIntegral), so RoundEven(-0.4), Ceil(-0.5) and Trunc(-0.5) are -0.0, not +0.0.
                 x = args[0]
-                values[res] = f32(float(round(x))) if math.isfinite(x) else x    # round() breaks ties to even
+                fn = {"RoundEven": round, "Floor": math.floor, "Ceil": math.ceil, "Trunc": math.trunc}[name]
+
+                def integral(v):
+                    return f32(math.copysign(float(fn(v)), v)) if math.isfinite(v) else v
+                values[res] = tuple(integral(v) for v in x) if isinstance(x, tuple) else integral(x)
             elif name == "FMin":
                 if any(math.isnan(x) for x in args):
                     raise UnsupportedConstruct(f"GLSL.std.450 {name} of NaN (undefined)")

@@ -7,9 +7,11 @@ import importlib.util
 import io
 import os
 import struct
+import subprocess
 import sys
 import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -240,6 +242,33 @@ class ExportBankTest(unittest.TestCase):
         with open(path, "wb") as f:
             f.write(bank)
         return path, pcm16, floats
+
+    def test_recursive_cli_preserves_bank_paths(self):
+        src = Path(self.tmp.name) / "banks"
+        samples = {"north/shared": 11, "south/shared": 22, "flat": 33}
+        fmt = format_block(1, 48000, 0, 1)
+        for stem, sample in samples.items():
+            bank = src / (stem + ".awc")
+            bank.parent.mkdir(parents=True, exist_ok=True)
+            bank.write_bytes(build_bank([(1, fmt, struct.pack("<h", sample))]))
+
+        for jobs in (1, 2):
+            with self.subTest(jobs=jobs):
+                out = Path(self.out) / str(jobs)
+                previous = out / "shared" / "00000001.wav"
+                previous.parent.mkdir(parents=True)
+                previous.write_bytes(b"previous export")
+                subprocess.run([sys.executable, "-I", awc.__file__, src, out, "--jobs", str(jobs)],
+                               check=True, capture_output=True)
+                for stem, sample in samples.items():
+                    self.assertEqual(read_wav(out / stem / "00000001.wav")["pcm"], struct.pack("<h", sample))
+                self.assertEqual(previous.read_bytes(), b"previous export")
+
+    def test_single_bank_cli_keeps_flat_output(self):
+        bank, pcm, _ = self.make_bank()
+        subprocess.run([sys.executable, "-I", awc.__file__, bank, self.out, "--jobs", "1"],
+                       check=True, capture_output=True)
+        self.assertEqual(read_wav(Path(self.out) / "synthetic" / "00000001.wav")["pcm"], pcm)
 
     def test_pcm16_and_float_and_opus(self):
         bank, pcm16, floats = self.make_bank()

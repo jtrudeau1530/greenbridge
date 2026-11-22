@@ -16,9 +16,9 @@ Usage:
 
     --out     JSON path (default: <input name>.navmesh-index.json in the current directory)
     --csv     optional CSV path
-    --start   first byte to scan, 0 or more (default: the archive's data start, u32 at offset 4)
-    --limit   stop after this many bytes, at least 1 (default: to the end)
-    --pattern glob for directory input (default: *.bin, the carve file names)
+    --start   first byte to scan in an archive, 0 or more (archive input only; default: u32 at offset 4)
+    --limit   stop after this many bytes, at least 1 (archive input only; default: to the end)
+    --pattern glob for directory input (directory input only; default: *.bin, the carve file names)
 """
 import argparse
 import csv
@@ -76,64 +76,64 @@ def page_fields(head):
 def scan_archive(path, start=None, limit=None):
     """Walk zlib streams like the fixed carver. Returns (rows, summary). Rows are marker matches only."""
     with open(path, "rb") as fh:
-        m = mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ)
-        size = len(m)
-        if start is None:
-            start = u32(m, 4) or 0
-        if not 0 <= start < size:
-            raise SystemExit(f"start {start} is outside {path} ({size} bytes)")
-        end = min(size, start + limit) if limit else size
-        rows, total, last, unread, zero = [], 0, start, 0, 0
-        total_stored = total_inflated = 0
-        pos = start
-        t0 = time.time()
-        while pos < end:
-            mt = ZHDR.search(m, pos, end)
-            if not mt:
-                break
-            s = mt.start()
-            d = zlib.decompressobj()
-            head, total_out, p = bytearray(), 0, s
-            try:
-                while not d.eof and p < size:
-                    chunk = m[p:p + CHUNK]
-                    if not chunk:
-                        break
-                    out = d.decompress(chunk)
+        with mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ) as m:
+            size = len(m)
+            if start is None:
+                start = u32(m, 4) or 0
+            if not 0 <= start < size:
+                raise SystemExit(f"start {start} is outside {path} ({size} bytes)")
+            end = min(size, start + limit) if limit else size
+            rows, total, last, unread, zero = [], 0, start, 0, 0
+            total_stored = total_inflated = 0
+            pos = start
+            t0 = time.time()
+            while pos < end:
+                mt = ZHDR.search(m, pos, end)
+                if not mt:
+                    break
+                s = mt.start()
+                d = zlib.decompressobj()
+                head, total_out, p = bytearray(), 0, s
+                try:
+                    while not d.eof and p < size:
+                        chunk = m[p:p + CHUNK]
+                        if not chunk:
+                            break
+                        out = d.decompress(chunk)
+                        if len(head) < HEAD:
+                            head.extend(out[:HEAD - len(head)])
+                        total_out += len(out)
+                        p += len(chunk)
+                        if d.unused_data or d.eof:
+                            break
+                    tail = d.flush()
                     if len(head) < HEAD:
-                        head.extend(out[:HEAD - len(head)])
-                    total_out += len(out)
-                    p += len(chunk)
-                    if d.unused_data or d.eof:
-                        break
-                tail = d.flush()
-                if len(head) < HEAD:
-                    head.extend(tail[:HEAD - len(head)])
-                total_out += len(tail)
-            except zlib.error:
-                pos = s + 1
-                continue
-            if not d.eof or total_out < 64:
-                pos = s + 1
-                continue
-            used = p - s - len(d.unused_data)
-            gap = m[last:s]
-            if gap.count(0) == len(gap):
-                zero += len(gap)
+                        head.extend(tail[:HEAD - len(head)])
+                    total_out += len(tail)
+                except zlib.error:
+                    pos = s + 1
+                    continue
+                if not d.eof or total_out < 64:
+                    pos = s + 1
+                    continue
+                used = p - s - len(d.unused_data)
+                gap = m[last:s]
+                if gap.count(0) == len(gap):
+                    zero += len(gap)
+                else:
+                    unread += len(gap)
+                fields = page_fields(head)
+                total += 1
+                total_stored += used
+                total_inflated += total_out
+                if fields:
+                    rows.append({"source": path, "offset": s, "stored": used, "size": total_out, **fields})
+                last = pos = s + used
+            tail = m[last:end]
+            if tail.count(0) == len(tail):
+                zero += len(tail)
             else:
-                unread += len(gap)
-            fields = page_fields(head)
-            total += 1
-            total_stored += used
-            total_inflated += total_out
-            if fields:
-                rows.append({"source": path, "offset": s, "stored": used, "size": total_out, **fields})
-            last = pos = s + used
-        tail = m[last:end]
-        if tail.count(0) == len(tail):
-            zero += len(tail)
-        else:
-            unread += len(tail)
+                unread += len(tail)
     span = end - start
     summary = {
         "input": path, "mode": "rpf", "start": start, "span": span, "streams": total,
@@ -147,8 +147,9 @@ def scan_archive(path, start=None, limit=None):
     return rows, summary
 
 
-def scan_directory(root, pattern="*.bin"):
+def scan_directory(root, pattern=None):
     """Read the first 128 bytes of each matching carved file. Rows are marker matches only."""
+    pattern = pattern or "*.bin"
     rows, files, total_size = [], 0, 0
     t0 = time.time()
     for path in sorted(glob.glob(os.path.join(root, "**", pattern), recursive=True)):
@@ -226,11 +227,16 @@ def main() -> int:
     ap.add_argument("--csv", help="optional CSV output")
     ap.add_argument("--start", type=offset, help="first byte to scan in an archive")
     ap.add_argument("--limit", type=byte_count, help="maximum bytes to scan in an archive")
-    ap.add_argument("--pattern", default="*.bin", help="directory input glob (default: *.bin)")
+    ap.add_argument("--pattern", default=None, help="directory input glob (default: *.bin)")
     a = ap.parse_args()
+    is_dir = os.path.isdir(a.input)
+    if is_dir and (a.start is not None or a.limit is not None):
+        ap.error("--start and --limit apply to a single archive, not a directory")
+    if not is_dir and a.pattern is not None:
+        ap.error("--pattern applies to a directory, not an archive")
     below_normal()
 
-    if os.path.isdir(a.input):
+    if is_dir:
         rows, summary = scan_directory(a.input, a.pattern)
     else:
         try:

@@ -14,23 +14,27 @@ What they check (`tools/rdna2spirv.py`, pixel shaders plus one compute shader):
   with `op_sel`, `v_add_nc_u16`, `v_sin_f16`/`v_cos_f16`, `s_buffer_load_dwordx2` into VCC and flat
   `v_interp_mov` input next to an interpolated one. `ps_ops5`, `ps_ops6`, `ps_vcc_x2` and `ps_flat` give 16 more
   asserted values, and `ps_fma_literal` 4 more: which operand the literal K multiplies in
-  `v_fmamk/fmaak/madmk/madak_f32`. `cs_bounds` runs as compute and asserts the four dwords in its buffer after in-bounds
+  `v_fmamk/fmaak/madmk/madak_f32`, and `ps_f16_vop2` (f16 VOP2 partial writes and `v_fmac_f16`, words measured on
+  RDNA2 hardware) four more. The other `ps_f16_*` shaders use GLSL functions this interpreter does not model;
+  `tests/test_f16_hw_words.py` runs all of them with `tests/spirv_interp.py`. `cs_bounds` runs as compute and asserts
+  the four dwords in its buffer after in-bounds
   load/store and out-of-bounds load/store attempts (the V# has num_records 16). `ps_ops4` and `ps_legacy_mul`
   are also asserted there, duplicating the matching `test_ps_semantics.py` cases. As above, constants are
   written by hand and recomputed by plain-Python references checked against each other. `cs_fmt_1010102` runs
   as compute too and asserts 16 dwords: 10:10:10:2 words read through formats 50 and 44 (from the V# and from
   tbuffer's own format) and stored in both. `ps_scc_minmax` asserts SCC after `s_min`/`s_max` `_i32`/`_u32`:
   0 on a tie, and 1 on a pair (-1 against 1) that only the right signedness orders that way.
-<<<<<<< HEAD
+- `test_alu_movrel.py` runs hand-written listings for `v_movrels_b32`, `v_movreld_b32` and `v_movrelsd_b32`
+  (10 cases): sentinels in v1..v8, M0 set by `s_mov_b32`, then the indexed register and its neighbours are
+  exported, so a write must land only in `VGPR[D.addr + M0]`. A plain-Python register-file model checks the
+  hand-written constants. `v_movrelsd_2_b32` is not handled by the translator yet.
 - `spirv_wave_interp.py` runs every invocation of one subgroup at once through structured control flow
   (split at a selection, rejoin at its merge, loops until no invocation is left) with the subgroup
   operations the translator emits. It is the SPIR-V side of `tools/cf_diff.py` (FUZZ-8);
   `test_spirv_wave_interp.py` pins its convergence rules on hand-written modules.
-=======
 - `test_global_mem_offset.py` runs the address arithmetic `global_load*`/`global_store*` emit (its own small
   evaluator, since the interpreter refuses 64-bit integers and PhysicalStorageBuffer) and asserts the address
   accessed for the signed 12-bit instruction offset (-4, -2048, 2047, 0) in both addressing modes.
->>>>>>> pr/421
 - `test_interp.py` tests the interpreter against the SPIR-V / GLSL.std.450 definitions. The interpreter raises
   `UnsupportedConstruct` for anything it does not model instead of approximating it. It can seed Input variables,
   PushConstant words and a flat physical-address memory map for the tests above.

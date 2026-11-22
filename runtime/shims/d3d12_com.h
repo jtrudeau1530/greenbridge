@@ -51,6 +51,9 @@ struct VulkanDeviceInfo {
     // buffers are created with VK_BUFFER_USAGE_CONDITIONAL_RENDERING_BIT_EXT. Without it a predicated list is
     // rejected at ExecuteCommandLists.
     bool conditional_rendering = false;
+    // VK_EXT_host_image_copy and its hostImageCopy feature are enabled on `device`: WriteToSubresource and
+    // ReadFromSubresource on textures in CPU-visible heaps copy on the CPU instead of through a staging submit.
+    bool host_image_copy = false;
 };
 
 // A Vulkan-backed ID3D12Device (PC ABI, up to ID3D12Device11) on caller-owned Vulkan objects, which must outlive

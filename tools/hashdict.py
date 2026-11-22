@@ -51,27 +51,54 @@ def main():
     if a.lookup:
         if len(a.lookup) < 2:
             ap.error("--lookup requires a dictionary and at least one hash")
-        with open(a.lookup[0], encoding="utf-8") as f:
-            d = json.load(f)
+        values = []
         for h in a.lookup[1:]:
-            print(h, d.get(f"{int(h, 16):08x}", "?"))
+            try:
+                values.append((h, int(h, 16)))
+            except ValueError:
+                ap.error(f"--lookup: {h!r} is not a hexadecimal hash")
+        try:
+            with open(a.lookup[0], encoding="utf-8") as f:
+                d = json.load(f)
+        except (OSError, ValueError) as e:
+            print(f"ERROR: cannot read the dictionary {a.lookup[0]}: {getattr(e, 'strerror', None) or e}",
+                  file=sys.stderr)
+            return 2
+        for h, v in values:
+            print(h, d.get(f"{v:08x}", "?"))
         return 0
     if a.carve is None:
         ap.error("a carve directory is required to build a dictionary")
+    if not os.path.isdir(a.carve):
+        what = "is not a folder" if os.path.exists(a.carve) else "does not exist"
+        print(f"ERROR: the carve folder {a.carve} {what}", file=sys.stderr)
+        return 2
     strings = set()
     full = set(a.archives.split(","))
+    missing = []                    # carved blobs an index.json lists that can't be read: skipped, reported
     for arch in sorted(os.listdir(a.carve)):
         p = os.path.join(a.carve, arch, "index.json")
         if not os.path.isfile(p):
             continue
-        for r in json.load(open(p, encoding="utf-8"))["files"]:
+        with open(p, encoding="utf-8") as f:
+            rows = json.load(f)["files"]
+        for r in rows:
             if r.get("type") == "bink2":
                 continue
             meta = r["head"].startswith("5053494e") or r["head"].startswith("52424630")
             if arch in full or meta:
-                with open(os.path.join(a.carve, arch, f"{r['off']:012x}.bin"), "rb") as f:
-                    harvest(f.read(), strings, a.min)
+                blob = os.path.join(a.carve, arch, f"{r['off']:012x}.bin")
+                try:
+                    with open(blob, "rb") as f:
+                        data = f.read()
+                except OSError:
+                    missing.append(blob)
+                    continue
+                harvest(data, strings, a.min)
         print(f"{arch}: {len(strings)} strings so far", flush=True)
+    if missing:
+        print(f"WARNING: {len(missing)} carved blobs listed in an index.json could not be read and were skipped "
+              f"(first: {missing[0]}). Re-run the carve to get their strings.", file=sys.stderr)
     for x in a.extra:
         if os.path.isdir(x):
             for root, _, files in os.walk(x):
