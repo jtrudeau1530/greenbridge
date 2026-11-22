@@ -25,6 +25,7 @@ import argparse
 import os
 import random
 import re
+import signal
 import struct
 import subprocess
 import sys
@@ -36,7 +37,9 @@ SHADERS = os.path.join(ROOT, "runtime", "test", "shaders")
 TRANSLATOR = os.path.join(TOOLS, "rdna2spirv.py")
 
 sys.path.insert(0, TOOLS)
+sys.path.insert(0, SHADERS)
 import mc_command  # noqa: E402
+from compute_fixture import find_test_program  # noqa: E402
 
 HARNESS = "vk_image_fuzz"
 DRAW = 64  # the harness draws a 64x64 full-screen triangle
@@ -52,6 +55,17 @@ FORMATS = {
 }
 SIZES = (8, 16, 32, 64)
 DMASKS = (0xf, *range(1, 0xf))
+STDERR_TAIL = 20  # lines of the harness's output a failure prints
+
+# Windows reports a crash as an NTSTATUS exit code (unsigned); the ones a driver crash tends to end with
+NTSTATUS = {
+    0xC0000005: "access violation",
+    0xC000001D: "illegal instruction",
+    0xC0000094: "integer divide by zero",
+    0xC00000FD: "stack overflow",
+    0xC0000374: "heap corruption",
+    0xC0000409: "stack buffer overrun",
+}
 
 
 def assemble(asm: str, name: str, work: str) -> None:
@@ -215,6 +229,20 @@ def compare(fmt_name, texels, width, height, got, dmask=0xf) -> list:
     return problems
 
 
+def exit_status(returncode: int) -> str:
+    """How the harness ended, for a failure line: "exit 1", "killed by SIGSEGV", "exit 0xc0000005 (access violation)"."""
+    if returncode < 0:  # POSIX: subprocess reports a fatal signal as its negative number
+        try:
+            name = signal.Signals(-returncode).name
+        except ValueError:
+            name = f"signal {-returncode}"
+        return f"killed by {name}"
+    status = returncode & 0xFFFFFFFF
+    if status >= 0xC0000000:
+        return f"exit 0x{status:08x}" + (f" ({NTSTATUS[status]})" if status in NTSTATUS else "")
+    return f"exit {returncode}"
+
+
 def run_case(fmt_name, width, height, rng, work, build, keep, show, dmask=0xf) -> bool:
     vk_format, _, _, model = FORMATS[fmt_name]
     asm = pixel_shader(width, height, dmask, model)
@@ -244,8 +272,18 @@ def run_case(fmt_name, width, height, rng, work, build, keep, show, dmask=0xf) -
         print(f"{fmt_name} {width}x{height} dmask:0x{dmask:x}: SKIP ({why})")
         return None
     if r.returncode != 0:
-        reason = (r.stderr or r.stdout).strip().splitlines()[-1:] or ["harness error"]
-        print(f"{fmt_name} {width}x{height} dmask:0x{dmask:x}: FAIL ({reason[0]})")
+        status = exit_status(r.returncode)
+        stream, lines = "stderr", (r.stderr or "").strip().splitlines()
+        if not lines:
+            stream, lines = "stdout", (r.stdout or "").strip().splitlines()
+        reason = f"{HARNESS} {status}" + (f": {lines[-1]}" if lines else ", no output")
+        print(f"{fmt_name} {width}x{height} dmask:0x{dmask:x}: FAIL ({reason})")
+        if len(lines) > 1:
+            shown = lines[-STDERR_TAIL:]
+            print(f"  {HARNESS} {stream}" + (f" (last {len(shown)} of {len(lines)} lines)"
+                                              if len(shown) < len(lines) else "") + ":")
+            for line in shown:
+                print(f"    {line}")
         return False
     got = read_rgba(out_path)
     problems = compare(fmt_name, texels, width, height, got, dmask)
@@ -286,7 +324,9 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="Differential fuzzer for the translator's image_load path")
     ap.add_argument("--programs", type=int, default=8)
     ap.add_argument("--seed", type=int, default=1)
-    ap.add_argument("--build", default=os.path.join(ROOT, "runtime", "build", "linux"))
+    # runtime/build, as docs/shader_validation.md builds it and lds_fuzz/valu_fuzz default to; a Visual Studio build's
+    # RelWithDebInfo/Release subfolder is found below.
+    ap.add_argument("--build", default=os.path.join(ROOT, "runtime", "build"))
     ap.add_argument("--work")
     ap.add_argument("--show", action="store_true")
     ap.add_argument("--formats", default=",".join(FORMATS))
@@ -302,6 +342,7 @@ def main() -> int:
     if a.programs < 1:
         print("--programs must be at least 1", file=sys.stderr)
         return 2
+    a.build = find_test_program(a.build, HARNESS) or a.build
     rng = random.Random(a.seed)
     work = a.work or tempfile.mkdtemp(prefix="image_fuzz_")
     os.makedirs(work, exist_ok=True)
@@ -333,4 +374,8 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    try:  # a redirected stdout is strict ANSI code page under -I; write '?' for what it cannot encode
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
     sys.exit(main())

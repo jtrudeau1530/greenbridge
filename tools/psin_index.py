@@ -17,7 +17,17 @@ The section table starts at the offset in `+4` and runs to the end of the file. 
 Sections are contiguous: the next section starts at `offset + size`, and the last one ends at EOF.
 The measured tags are `LSCH`, `LENM`, `LSNS`, `LGID`, `LRSC` and `CHKS`. `LGID` is an empty section
 (8 bytes). `LRSC` starts with a `0DRP` page directory header. `CHKS` carries the file size and a
-checksum. `LSNS` is high-entropy and is not decoded by this tool.
+checksum.
+
+`LSNS` is a block table followed by the blocks (measured over every `LSNS` section in the package; docs/psin.md):
+
+    +0   u32 little-endian    block count n (0 for the empty 12-byte section)
+    +4   n x (u32 kind, u32 byte count)
+         then the n blocks back to back, each a whole number of 16-byte records
+
+The byte counts fill the payload exactly. The kind's high byte is 1 or 2 (records read as 4- or 8-byte words);
+its low byte varies. The records themselves are uniformly random bytes that match no tested name hash; this tool
+reads the layout, not the contents.
 
 `LSCH` is a type schema and `LENM` its enum table (measured over all 18,640 PSIN streams in the archives of package
 1.0.2.1; see docs/psin.md). Both store all headers first and then all elements, and neither stores the
@@ -129,6 +139,26 @@ def decode_lenm(payload):
     return enums
 
 
+LSNS_RECORD = 16
+
+
+def decode_lsns(payload):
+    """The LSNS block table: [(kind, byte count)]. Raises ValueError unless the blocks fill the payload exactly."""
+    if len(payload) < 4:
+        raise ValueError("LSNS shorter than its block count")
+    n = _u32_le(payload, 0)
+    table_end = 4 + 8 * n
+    if table_end > len(payload):
+        raise ValueError(f"LSNS block table ({n} blocks) runs past the section")
+    blocks = [struct.unpack_from("<II", payload, 4 + 8 * i) for i in range(n)]
+    for kind, size in blocks:
+        if size % LSNS_RECORD:
+            raise ValueError(f"LSNS block of kind 0x{kind:x} has {size} bytes, not a multiple of {LSNS_RECORD}")
+    if table_end + sum(size for _kind, size in blocks) != len(payload):
+        raise ValueError("LSNS blocks do not fill the section")
+    return blocks
+
+
 def check_schema(structs):
     """Checks that hold on every measured LSCH. Returns the first problem, or ''."""
     for s in structs:
@@ -178,6 +208,9 @@ def parse(blob, schema=False):
         "enums": None,
         "enum_values": None,
         "schema_error": "",
+        "lsns_blocks": None,
+        "lsns_records": None,
+        "lsns_error": "",
         "complete": False,
         "error": "",
     }
@@ -216,6 +249,15 @@ def parse(blob, schema=False):
             if record["checksum_size"] is None:
                 record["checksum_size"] = section["checksum_size"]
                 record["checksum"] = section["checksum"]
+        elif tag == b"LSNS":
+            try:
+                blocks = decode_lsns(blob[payload_off:offset + size])
+            except ValueError as e:
+                section["lsns_error"] = record["lsns_error"] = str(e)
+            else:
+                section["blocks"] = [{"kind": f"0x{k:x}", "bytes": b} for k, b in blocks]
+                record["lsns_blocks"] = len(blocks)
+                record["lsns_records"] = sum(b for _k, b in blocks) // LSNS_RECORD
         elif tag == b"LSCH" and structs is None:
             try:
                 structs = decode_lsch(blob[payload_off:offset + size])
@@ -317,7 +359,21 @@ def summarize(records):
         "members": sum(r["members"] or 0 for r in records),
         "enums": sum(r["enums"] or 0 for r in records),
         "enum_values": sum(r["enum_values"] or 0 for r in records),
+        "lsns_decoded": sum(1 for r in records if r["lsns_blocks"] is not None),
+        "lsns_empty": sum(1 for r in records if r["lsns_blocks"] == 0),
+        "lsns_errors": sum(1 for r in records if r["lsns_error"]),
+        "lsns_records": sum(r["lsns_records"] or 0 for r in records),
+        "lsns_kinds": dict(sorted(_lsns_kinds(records).items())),
     }
+
+
+def _lsns_kinds(records):
+    kinds = {}
+    for r in records:
+        for s in r["sections"]:
+            for b in s.get("blocks", ()):
+                kinds[b["kind"]] = kinds.get(b["kind"], 0) + 1
+    return kinds
 
 
 def count(text):
@@ -385,9 +441,15 @@ def main():
           f"rsc122 {summary['rsc_122']}, checksummed {summary['checksummed']}; "
           f"LSCH decoded {summary['lsch_decoded']} ({summary['structs']} structs, {summary['members']} members), "
           f"LENM decoded {summary['lenm_decoded']} ({summary['enums']} enums, {summary['enum_values']} values), "
-          f"schema errors {summary['schema_errors']}")
+          f"schema errors {summary['schema_errors']}; "
+          f"LSNS decoded {summary['lsns_decoded']} ({summary['lsns_empty']} empty, {summary['lsns_records']} records), "
+          f"LSNS errors {summary['lsns_errors']}")
     return 0
 
 
 if __name__ == "__main__":
+    try:  # a redirected stdout is strict ANSI code page under -I; write '?' for what it cannot encode
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
     sys.exit(main())

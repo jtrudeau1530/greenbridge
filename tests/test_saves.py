@@ -13,6 +13,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOL = os.path.join(ROOT, "tools", "saves.py")
@@ -283,6 +284,42 @@ class SlayerTest(unittest.TestCase):
         self.assertIn("not decoded", out)
 
 
+class MalformedSlayerTest(unittest.TestCase):
+    """A truncated or lying SLAYER1 header is a SLAYER1-specific ValueError, not a struct.error."""
+
+    def test_a_short_non_slayer_blob_keeps_the_not_slayer_message(self):
+        with self.assertRaises(ValueError) as ctx:
+            saves.parse_slayer(b"NOPE")
+        self.assertEqual(str(ctx.exception), "not SLAYER1")
+
+    def test_bounds(self):
+        # Boundary cases around the name length: a short fixed preamble, an oversized declared name, and a
+        # name that fits but truncates the 8-byte payload-size field that follows it.
+        name = b"ABCD0000"
+        cases = [
+            (b"SLAYER1\0", "header is only 8 bytes"),
+            (b"SLAYER1\0" + struct.pack("<II", 1, 0x1000), "declares a 4096-byte name"),
+            (b"SLAYER1\0" + struct.pack("<II", 1, len(name)) + name + b"\x05", "needs 32 bytes"),
+        ]
+        for blob, needle in cases:
+            with self.subTest(size=len(blob)), self.assertRaises(ValueError) as ctx:
+                saves.parse_slayer(blob)
+            self.assertIn(needle, str(ctx.exception))
+
+    def test_cli_reports_an_error_with_a_path_and_no_traceback(self):
+        # End to end: the dispatch guard plus the parser message give one line, the path, and exit 2.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "truncated.dat")
+            write(path, b"SLAYER1\0" + struct.pack("<II", 1, 0x1000))
+            p = subprocess.run([sys.executable, "-I", TOOL, "info", path],
+                               capture_output=True, text=True, check=False)
+        self.assertEqual(p.returncode, 2, p.stderr)
+        self.assertIn("ERROR:", p.stderr)
+        self.assertIn(path, p.stderr)
+        self.assertIn("declares a 4096-byte name", p.stderr)
+        self.assertNotIn("Traceback", p.stderr)
+
+
 class ImportTest(unittest.TestCase):
     def test_encoding_matches_the_shim(self):
         # Same rule as encode_name() in runtime/shims/xgameruntime_services.cpp.
@@ -361,6 +398,20 @@ class ImportTest(unittest.TestCase):
             write(os.path.join(empty, "readme.txt"), b"nothing here")
             with self.assertRaises(SystemExit):
                 quiet(saves.import_saves, [empty, "--out", os.path.join(tmp, "o")])
+
+    def test_discovery_reads_at_most_eight_bytes_per_candidate(self):
+        # save_slot probes each candidate with eight bytes, then reads only the chosen payload in full.
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = os.path.join(tmp, "story")
+            jsav, _, _ = make_jsav()
+            write(os.path.join(folder, "SLOT0"), jsav)
+            write(os.path.join(folder, "notes.txt"), b"just text" * 1000)
+            with mock.patch.object(saves, "read", wraps=saves.read) as reader:
+                quiet(saves.save_slot, folder)
+        payload = os.path.join(folder, "SLOT0")
+        other = os.path.join(folder, "notes.txt")
+        self.assertEqual(reader.call_args_list,
+                         [mock.call(payload, 8), mock.call(other, 8), mock.call(payload)])
 
 
 class MalformedJsavTest(unittest.TestCase):

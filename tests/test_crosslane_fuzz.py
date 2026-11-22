@@ -192,6 +192,77 @@ class Modes(unittest.TestCase):
         self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
         self.assertIn("unknown mode 'emulat'", r.stderr)
 
+    def test_emulate_with_wave32_is_a_usage_error(self):
+        # emulate runs a wave64 program as two 32-lane halves, so --wave 32 selects nothing to run: it used to print
+        # a bare `summary:` and exit 0. The refusal comes before the missing-harness check, so no build is needed.
+        r = subprocess.run([sys.executable, "-I", TOOL, "--wave", "32", "--modes", "emulate", "--programs", "1",
+                            "--exe", os.path.join(TOOLS, "no-such-build", "vk_compute_test")],
+                           capture_output=True, text=True)
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("--modes emulate needs wave64 programs", r.stderr)
+        self.assertNotIn("vk_compute_test not found", r.stderr)
+        self.assertEqual(r.stdout, "")
+
+    def test_wave64_native_without_w64_native_is_a_usage_error(self):
+        # A wave64 program runs natively only when --w64-native asks for the cross-half approximation; without it the
+        # selection was empty and the run ended after a bare `summary:` with exit 0.
+        r = subprocess.run([sys.executable, "-I", TOOL, "--wave", "64", "--modes", "native", "--programs", "1",
+                            "--exe", os.path.join(TOOLS, "no-such-build", "vk_compute_test")],
+                           capture_output=True, text=True)
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("--w64-native", r.stderr)
+        self.assertNotIn("vk_compute_test not found", r.stderr)
+        self.assertEqual(r.stdout, "")
+
+    def test_wave64_native_with_w64_native_reaches_the_harness_check(self):
+        # Not a usage error any more: the run gets as far as looking for vk_compute_test.
+        r = subprocess.run([sys.executable, "-I", TOOL, "--wave", "64", "--modes", "native", "--programs", "1",
+                            "--w64-native", "--exe", os.path.join(TOOLS, "no-such-build", "vk_compute_test")],
+                           capture_output=True, text=True)
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("vk_compute_test not found", r.stderr)
+
+    def test_wave64_and_both_still_accept_emulate(self):
+        for wave in ("64", "both"):
+            with self.subTest(wave=wave):
+                r = subprocess.run([sys.executable, "-I", TOOL, "--wave", wave, "--modes", "emulate", "--self-test"],
+                                   capture_output=True, text=True)
+                self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+                self.assertIn("self-test OK", r.stdout)
+
+
+class Counts(unittest.TestCase):
+    """--programs and --ops cannot be below 1: a run of no programs ended in a bare `summary:` with no lines and exit
+    0, which reads as every program passing, and --ops 0 built a program with no ops. The other fuzzers refuse both."""
+
+    def run_tool(self, *args):
+        return subprocess.run([sys.executable, "-I", TOOL, *args], capture_output=True, text=True, timeout=300)
+
+    def test_zero_or_negative_programs_is_a_usage_error(self):
+        for value in ("0", "-1", "-5"):
+            with self.subTest(programs=value):
+                r = self.run_tool("--programs", value, "--self-test")
+                self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+                self.assertIn(f"--programs: must be at least 1 (got {value})", r.stderr)
+                self.assertEqual(r.stdout, "")
+
+    def test_zero_ops_is_a_usage_error(self):
+        r = self.run_tool("--ops", "0", "--self-test")
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("--ops: must be at least 1 (got 0)", r.stderr)
+        self.assertEqual(r.stdout, "")
+
+    def test_the_count_is_checked_before_the_harness_is_looked_for(self):
+        # Both are wrong here: a count below 1 is a usage error whatever the state of the build is.
+        r = self.run_tool("--exe", os.path.join(TOOLS, "no-such-build", "vk_compute_test"), "--programs", "0")
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertNotIn("vk_compute_test not found", r.stderr)
+
+    def test_a_count_of_one_still_runs(self):
+        r = self.run_tool("--programs", "1", "--ops", "1", "--self-test")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("self-test OK", r.stdout)
+
 
 class MissingHarness(unittest.TestCase):
     """Without vk_compute_test the translator oracle stops with one line before any program is generated. It used to
@@ -252,6 +323,35 @@ class GpuEnv(unittest.TestCase):
         self.assertEqual(env["KEEP"], "1")
         self.assertEqual(X.gpu_env(self.program(32, 1), False, "d", base={})["VKC_OUT_WORDS"],
                          str(max(len(X.OUT_REGS), 64)))
+
+
+class UnpinnedSubgroup(unittest.TestCase):
+    """A wave32 run vk_compute_test couldn't pin to 32 lanes is a skip; an emulated wave64 one is still compared."""
+
+    UNPINNED = "device: llvmpipe (LLVM 20.1.2, 256 bits) (subgroup 8..8)\ncompute subgroup size: 32 not available\n"
+
+    def _run_gpu(self, prog, emulate, stdout):
+        def fake(cmd, **kw):
+            with open(kw["env"]["VKC_DUMP"], "wb") as f:
+                f.write(bytes(4 * prog.group * len(X.OUT_REGS)))
+            return subprocess.CompletedProcess(cmd, 0, stdout=stdout, stderr="")
+        with tempfile.TemporaryDirectory() as work, mock.patch.object(X.subprocess, "run", side_effect=fake):
+            return X.run_gpu("vk_compute_test", "p.spv", prog, work, emulate)
+
+    def test_unpinned_wave32_raises(self):
+        with self.assertRaises(X.Unpinned) as ctx:
+            self._run_gpu(X.make_program(1, 32, 4), False, self.UNPINNED)
+        self.assertIn("can't run it at 32 lanes", str(ctx.exception))
+
+    def test_pinned_wave32_gives_its_words(self):
+        prog = X.make_program(1, 32, 4)
+        words = self._run_gpu(prog, False, "compute subgroup size: 32\n")
+        self.assertEqual(len(words), prog.group * len(X.OUT_REGS))
+
+    def test_emulated_wave64_gives_its_words(self):
+        prog = X.make_program(1, 64, 4)
+        words = self._run_gpu(prog, True, self.UNPINNED)
+        self.assertEqual(len(words), prog.group * len(X.OUT_REGS))
 
 
 class HardwareOracle(unittest.TestCase):
@@ -385,6 +485,28 @@ class HarnessErrors(unittest.TestCase):
         self.assertIn(f"{calls[1]} [native] harness error: vk_compute_test timed out after 60 s", out)
         self.assertIn("programs 4, match 3, mismatch 0, hyp_only 0, rejected 0, harness_errors 1", out)
         self.assertEqual(kept, [f"{calls[1]}_native.asm"])
+
+    def test_every_program_skipped_exits_2(self):
+        def run_gpu(exe, spv, prog, work, emulate):
+            raise X.Unpinned("the device can't run it at 32 lanes")
+
+        code, out = self._main(run_gpu, ["--programs", "4", "--wave", "32", "--modes", "native"])
+        self.assertEqual(code, 2)
+        self.assertIn("harness_errors 0, skipped 4", out)
+        self.assertIn("no program ran", out)
+        self.assertNotIn("mismatch;", out)
+
+    def test_skips_beside_matches_exit_0(self):
+        def run_gpu(exe, spv, prog, work, emulate):
+            if prog.wave == 32:
+                raise X.Unpinned("the device can't run it at 32 lanes")
+            return self._expected_words(prog)
+
+        code, out = self._main(run_gpu, ["--programs", "4", "--wave", "both", "--no-maskdata"])
+        self.assertEqual(code, 0, out)
+        self.assertIn("wave32 native: programs 2, match 0, mismatch 0, hyp_only 0, rejected 0, harness_errors 0, "
+                      "skipped 2", out)
+        self.assertIn("wave64 emulate: programs 2, match 2", out)
 
     def test_clean_run_still_exits_0(self):
         code, out = self._main(lambda exe, spv, prog, work, emulate: self._expected_words(prog),

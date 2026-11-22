@@ -63,9 +63,15 @@ def entry(v):
     return {"files": v[0], "bytes": v[1], "min": min(sizes), "max": max(sizes), "median": median_low(sizes)}
 
 
+USAGE = "usage: python -I classify_carve.py <work>\\carve"
+
+
 def main():
+    if sys.argv[1:] in (["-h"], ["--help"]):
+        print(USAGE)
+        return 0
     if len(sys.argv) != 2:
-        print("usage: python -I classify_carve.py <work>\\carve", file=sys.stderr)
+        print(USAGE, file=sys.stderr)
         return 2
     root = sys.argv[1]
     if not os.path.isdir(root):
@@ -116,4 +122,8 @@ def main():
 
 
 if __name__ == "__main__":
+    try:  # a redirected stdout is strict ANSI code page under -I; write '?' for what it cannot encode
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
     sys.exit(main())

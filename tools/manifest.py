@@ -60,6 +60,16 @@ def sha256(path: str) -> str:
     return h.hexdigest()
 
 
+def same_output_path(first: str, second: str) -> bool:
+    """True when writing ``second`` would truncate ``first`` (same path, case variant or hard link)."""
+    if os.path.normcase(os.path.realpath(first)) == os.path.normcase(os.path.realpath(second)):
+        return True
+    try:
+        return os.path.samefile(first, second)
+    except OSError:
+        return False
+
+
 def walk(game_dir: str, *, exclude=None):
     def scan_failed(error: OSError) -> None:
         raise error
@@ -81,7 +91,29 @@ def walk(game_dir: str, *, exclude=None):
 
 
 def create(game_dir: str, out: str, jobs: int = 1) -> int:
+    # walk() excludes the manifest path itself, so an existing game file named like --out would otherwise be
+    # hashed first and replaced by the manifest (os.replace below), leaving the recorded hash wrong. Allow only an
+    # existing file that already reads as a manifest (re-creating one in place); refuse any other existing target
+    # inside the folder and every hard link to a file that will be hashed.
+    if os.path.isdir(out):
+        raise ManifestError(f"--out is a folder, not a manifest file: {out}")
+    if os.path.isfile(out):
+        try:
+            inside = os.path.normcase(os.path.commonpath(
+                [os.path.realpath(game_dir), os.path.realpath(out)])) == os.path.normcase(os.path.realpath(game_dir))
+        except ValueError:
+            inside = False
+        if inside:
+            try:
+                load_manifest(out)
+            except (ManifestError, OSError):
+                raise ManifestError(f"--out would overwrite the input {out}; "
+                                    "choose a manifest path that is not one of the hashed files") from None
     files = sorted(walk(game_dir, exclude=out))
+    for _rel, path in files:
+        if same_output_path(out, path):
+            raise ManifestError(f"--out would overwrite the input {path}; "
+                                "choose a manifest path that is not one of the hashed files")
     total = sum(os.path.getsize(p) for _, p in files)
     entries = {}
     done = count = 0
@@ -205,4 +237,8 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    try:  # a redirected stdout is strict ANSI code page under -I; write '?' for what it cannot encode
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
     sys.exit(main())

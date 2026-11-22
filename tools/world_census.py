@@ -772,6 +772,16 @@ def job_count(text):
     return value
 
 
+def same_output_path(first, second):
+    """True when writing ``second`` would truncate ``first`` (same file, path or hard link)."""
+    if os.path.normcase(os.path.realpath(first)) == os.path.normcase(os.path.realpath(second)):
+        return True
+    try:
+        return os.path.samefile(first, second)
+    except OSError:
+        return False
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("archive")
@@ -802,7 +812,21 @@ def main(argv=None):
     if start < data_start or start >= end:
         print("bad scan range", file=sys.stderr)
         return 2
-    os.makedirs(a.out, exist_ok=True)
+    if same_output_path(a.archive, a.out):
+        print("error: --out must not overwrite the input archive", file=sys.stderr)
+        return 2
+    if os.path.isfile(a.out):
+        print(f"error: --out {a.out} is a file, not a directory", file=sys.stderr)
+        return 2
+    for report in ("summary.json", "maps.json"):
+        if same_output_path(a.archive, os.path.join(a.out, report)):
+            print(f"error: --out reports would overwrite input archive: {a.archive}", file=sys.stderr)
+            return 2
+    try:
+        os.makedirs(a.out, exist_ok=True)
+    except OSError as e:
+        print(f"error: cannot create output directory {a.out}: {e.strerror or e}", file=sys.stderr)
+        return 2
     expected = _expected_shards(start, end, a.shard_size)
     t0 = time.time()
     docs = _load_shards(a.out, expected, source_id) if a.resume or a.merge_only else {}
@@ -862,4 +886,8 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
+    try:  # a redirected stdout is strict ANSI code page under -I; write '?' for what it cannot encode
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
     sys.exit(main())

@@ -13,7 +13,7 @@
 //                                      dxcompiler.dll and dxil.dll on PATH)
 //   LEONIDA_BVH_DEVICE=vulkan         (optional: the Vulkan-backed ID3D12Device from #119 instead of a PC device)
 //
-// Without LEONIDA_GAME_DIR it prints "SKIP (no package)" and exits 0. Nothing from the DLL is written to disk.
+// Without LEONIDA_GAME_DIR it prints "SKIP (no package)" and exits 77 (CTest skip). Nothing from the DLL is written to disk.
 //
 // The exports are C++ members (demangled): XboxBvhBuilder::XboxBvhBuilder(ID3D12Device11*, bool) and ~XboxBvhBuilder().
 // sizeof(XboxBvhBuilder) is not exported, so the object lives in a large buffer filled with a sentinel, and the
@@ -501,7 +501,7 @@ int main() {
     const std::string game_dir_arg = env("LEONIDA_GAME_DIR");
     if (game_dir_arg.empty()) {
         std::printf("SKIP (no package)\n");
-        return 0;
+        return 77;
     }
     const std::filesystem::path game_dir = game_dir_arg;
     const std::filesystem::path dll = game_dir / "XboxBvhBuilder.dll";
@@ -564,12 +564,19 @@ int main() {
             // RT-54: the package's shaders are Xbox DXIL (target triple dxil-ms-xb2), which no PC driver has to
             // accept. NVIDIA's DXIL reader rejects one of them (the 49th CreateComputePipelineState, the only one
             // with a resource in a function signature) and can end the process inside the driver (0xC0000409)
-            // instead of returning an error, so the constructor can't be measured there. WARP accepts all 53.
-            // LEONIDA_BVH_HARDWARE=1 keeps the NVIDIA device, to check a newer driver.
+            // instead of returning an error, so the constructor can't be measured there. AMD faults the same way
+            // (0xC0000005 right after the first slot 62 call on an RX 7900 XTX, RT-89). WARP accepts all 53, so it is
+            // the default on every hardware vendor; LEONIDA_BVH_HARDWARE=1 keeps the hardware device, to check a
+            // newer driver.
             bool warp = env("LEONIDA_BVH_WARP") == "1";
-            if (!warp && first_hardware_vendor() == 0x10DE && env("LEONIDA_BVH_HARDWARE") != "1") {
-                note("NVIDIA adapter: using WARP, since NVIDIA's DXIL reader rejects one of the DLL's Xbox DXIL shaders "
-                     "and can abort the process (RT-54); LEONIDA_BVH_HARDWARE=1 keeps the NVIDIA device");
+            if (!warp && env("LEONIDA_BVH_HARDWARE") != "1") {
+                if (const UINT vendor = first_hardware_vendor()) {
+                    char id[8];
+                    std::snprintf(id, sizeof id, "%04x", vendor);
+                    note(std::string("hardware adapter (vendor ") + id + "): using WARP, since hardware DXIL readers "
+                         "reject the DLL's Xbox DXIL shaders and can end the process (RT-54 NVIDIA, RT-89 AMD); "
+                         "LEONIDA_BVH_HARDWARE=1 keeps the hardware device");
+                }
                 warp = true;
             }
             pc = create_pc_device(warp);

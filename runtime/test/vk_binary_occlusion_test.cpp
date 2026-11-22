@@ -100,7 +100,7 @@ struct Fixture {
         if (pool(d.device, &query, nullptr, &occlusion) != VK_SUCCESS) return false;
         if (d.pipeline_statistics_query) {
             query.queryType = VK_QUERY_TYPE_PIPELINE_STATISTICS;
-            query.queryCount = 1;
+            query.queryCount = 2;
             query.pipelineStatistics = 0x7ff;  // the same counters as the D3D12 heap
             if (pool(d.device, &query, nullptr, &statistics) != VK_SUCCESS) return false;
         }
@@ -181,6 +181,7 @@ int run(vktest::Device& d, const char* vertex, const char* fragment) {
     destination.buffer = dst;
     destination.buffer_offset = binding_offset;
     destination.size = bytes - binding_offset;
+    destination.host_readable = true;  // ResolveQueryData writes results that the CPU reads below.
     context.add_resource(destination_id, destination);
 
     ResourceBinding misaligned = destination;
@@ -253,15 +254,50 @@ int run(vktest::Device& d, const char* vertex, const char* fragment) {
         }
     }
     if (fixture.statistics) {
-        context.add_query_pool(stats_id, {fixture.statistics, d3d12_query_heap::pipeline_statistics, 1, false,
-                                          {false}});
+        // D3D-162: the normalisation dispatch of a binary resolve inside a pipeline-statistics query, and then the
+        // statistics sum of that split query inside a second one. Neither helper dispatch may reach the
+        // application's counters, and nothing else runs inside the queries, so every counter of both is 0.
+        constexpr auto statistics = d3d12_query::pipeline_statistics;
+        constexpr VkDeviceSize statistics_result = 11 * sizeof(std::uint64_t);
+        context.add_query_pool(stats_id, {fixture.statistics, d3d12_query_heap::pipeline_statistics, 2, false,
+                                          {false, false}});
+        constexpr ResourceId statistics_id = 6;
+        void* statistics_mapping = nullptr;
+        ResourceBinding statistics_dst{};
+        statistics_dst.size = 3 * statistics_result;
+        statistics_dst.buffer = d.buffer(statistics_dst.size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, &statistics_mapping);
+        EXPECT(statistics_dst.buffer && statistics_mapping);
+        std::memset(statistics_mapping, 0xcd, statistics_dst.size);
+        context.add_resource(statistics_id, statistics_dst);
         CommandList overlap;
-        EXPECT(overlap.begin_query({stats_id, d3d12_query::pipeline_statistics, 0}));
+        EXPECT(overlap.begin_query({stats_id, statistics, 0}));
         EXPECT(overlap.resolve_queries({query_id, d3d12_query::binary_occlusion, first_visible, 1, destination_id, 0}));
-        EXPECT(overlap.end_query({stats_id, d3d12_query::pipeline_statistics, 0}));
+        EXPECT(overlap.end_query({stats_id, statistics, 0}));
         EXPECT(overlap.close());
+        CommandList nested;
+        EXPECT(nested.begin_query({stats_id, statistics, 1}));
+        EXPECT(nested.resolve_queries({stats_id, statistics, 0, 1, statistics_id, 0}));
+        EXPECT(nested.end_query({stats_id, statistics, 1}));
+        EXPECT(nested.resolve_queries({stats_id, statistics, 0, 2, statistics_id, statistics_result}));
+        EXPECT(nested.close());
         const CommandList* overlap_list = &overlap;
-        EXPECT(queue.execute({&overlap_list, 1}) == ReplayResult::unsupported);
+        const CommandList* nested_list = &nested;
+        EXPECT(queue.execute({&overlap_list, 1}) == ReplayResult::success);
+        EXPECT(queue.execute({&nested_list, 1}) == ReplayResult::success);
+        EXPECT(queue.idle());
+        std::uint64_t visible = 0;
+        std::memcpy(&visible, static_cast<const char*>(mapped) + binding_offset, sizeof(visible));
+        EXPECT(visible == 1);
+        for (VkDeviceSize offset = 0; offset < statistics_dst.size; offset += 8) {
+            std::uint64_t counter = 0;
+            std::memcpy(&counter, static_cast<const char*>(statistics_mapping) + offset, sizeof(counter));
+            if (counter != 0) {
+                std::fprintf(stderr, "statistics byte %llu: got %llu, expected 0\n",
+                             static_cast<unsigned long long>(offset), static_cast<unsigned long long>(counter));
+                return 1;
+            }
+        }
+        std::puts("binary and statistics resolves inside pipeline-statistics queries: every counter 0");
     }
     std::printf("binary occlusion: %u visible, 3 zero, 3 repeated; ordinary result %llu; offsets and sentinels exact\n",
                 visible_count, static_cast<unsigned long long>(raw));

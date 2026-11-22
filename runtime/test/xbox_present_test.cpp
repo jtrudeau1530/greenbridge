@@ -5,13 +5,15 @@
 // Cases: 0 planes (blank), 1 plane (solid colour, two colours side by side, a source rectangle, an RGBA and a BGRA
 // source, an sRGB source), 2 planes (plane 0 shown), token errors (null, unknown, stale, repeated), suspend/resume
 // with re-registration, statistics, and a real-time loop at 60 Hz. Needs a window and a Vulkan GPU with presentation.
-// Set LEONIDA_VK_VALIDATION=1 for VK_LAYER_KHRONOS_validation; any validation error fails the test.
+// Set LEONIDA_VK_VALIDATION=1 for VK_LAYER_KHRONOS_validation; any validation error fails the test, except that
+// the NVIDIA layer's known sRGB-swapchain STORAGE check makes the run skip rather than pass or fail.
 #include "vk_test_device.h"
 #include "../shims/d3d12_com.h"
 #include "../shims/d3d12_xs_device.h"
 #include "../shims/xbox_present.h"
 
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 
@@ -86,6 +88,18 @@ bool region_is(const Frame& frame, UINT x0, UINT y0, UINT x1, UINT y1, Px want, 
 }  // namespace
 
 int main() {
+    {
+        // The callback's narrow exception must match the sRGB swapchain VUID, including its follow-ons, and nothing else.
+        VkDebugUtilsMessengerCallbackDataEXT data{};
+        data.messageIdNumber = 0xc036022f;
+        data.pMessage = "vkCreateSwapchainKHR(): VK_IMAGE_USAGE_STORAGE_BIT is not supported";
+        EXPECT(vktest::known_srgb_swapchain_storage_error(&data));
+        data.pMessage = "vkCreateSwapchainKHR(): imageArrayLayers 1, but the maximum is 0";
+        EXPECT(vktest::known_srgb_swapchain_storage_error(&data));
+        data.messageIdNumber = 0x12345678;
+        data.pMessage = "vkCreateSwapchainKHR(): another validation error";
+        EXPECT(!vktest::known_srgb_swapchain_storage_error(&data));
+    }
     vktest::Device d;
     if (!d.create(true)) {  // no Vulkan loader, device or presentation extensions: nothing to test (ctest: skipped)
         std::printf("no Vulkan device with presentation: skipped\n");
@@ -117,6 +131,7 @@ int main() {
         info.queue = d.queue;
         info.queue_family = d.family;
         info.presentation = true;
+        info.swapchain_maintenance1 = d.swapchain_maintenance1;
         ID3D12Device* inner = nullptr;
         EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&inner))));
         Ref<ID3D12Device> device;
@@ -449,9 +464,104 @@ int main() {
         EXPECT(region_is(frame, 0, 0, width, height, {51, 153, 230}));
         std::printf("suspend/resume with re-registration: ok\n");
 
+        // ImmediateThresholdPercent: a frame that missed its vblank by less than the threshold is shown at once (mid-scan,
+        // IMMEDIATE or FIFO_RELAXED), else it waits; the decision is the pacer's lateness on the fake clock, and the
+        // display statistic and immediate_presents() tell which way it went. Without VK_*_swapchain_maintenance1 (or
+        // an IMMEDIATE/FIFO_RELAXED mode the swapchain can switch to) the frame always waits.
+        {
+            const bool can_tear = xbox.presenter().tear_supported();
+            std::printf("tearing present mode available: %s (device swapchain_maintenance1: %s)\n",
+                        can_tear ? "yes" : "no", d.swapchain_maintenance1 ? "yes" : "no");
+            EXPECT(d.swapchain_maintenance1 || !can_tear);
+            clock.advance_us(4 * period);  // everything in flight is shown
+            EXPECT(SUCCEEDED(xbox.SetFrameIntervalX(nullptr, period, 1, 0)));
+            EXPECT(SUCCEEDED(xbox.ScheduleFrameEventX(rt::d3d12::xbox_frame_event_origin, 0, 0)));
+            EXPECT(xbox.pacer().frames_in_flight() == 0);
+            const std::uint64_t grid_epoch = clock.now_us();  // vblanks are at grid_epoch + n * period
+            const std::uint64_t tears_before = xbox.immediate_presents();
+            std::uint64_t expected_tears = tears_before;
+            // One frame: wait for its origin, spend `late_us` after the vblank it was due at, present with `threshold`.
+            // Checks the pixels, whether it was shown at once and the display statistic.
+            const auto frame_with = [&](std::uint64_t late_us, float threshold, bool pass_params, bool expect_tear) -> bool {
+                std::uint64_t t = 0;
+                const std::uint64_t now = clock.now_us();                 // to the next vblank: origin n
+                clock.advance_us(grid_epoch + ((now - grid_epoch) / period + 1) * period - now);
+                if (xbox.WaitFrameEventX(rt::d3d12::xbox_frame_event_origin, 0, 0, &t) != S_OK) return false;
+                clock.advance_us(period + late_us);                       // due at vblank n + 1; now = due + late_us
+                rt::d3d12::XboxPresentParameters params{threshold};
+                auto p = plane_of(rgba, t);
+                if (xbox.PresentX(1, &p, pass_params ? &params : nullptr) != S_OK) return false;
+                if (!grab(frame) || !region_is(frame, 0, 0, width, height, {51, 153, 230})) return false;
+                if (expect_tear) ++expected_tears;
+                if (xbox.immediate_presents() != expected_tears) {
+                    std::fprintf(stderr, "late %llu us, threshold %g: immediate_presents %llu, expected %llu\n",
+                                 static_cast<unsigned long long>(late_us), double(threshold),
+                                 static_cast<unsigned long long>(xbox.immediate_presents()),
+                                 static_cast<unsigned long long>(expected_tears));
+                    return false;
+                }
+                // The display statistic: at once (display time = present time, scan position = lateness) or at a vblank.
+                clock.advance_us(period);  // past the next vblank: shown either way
+                leonida::FrameStatistic stats[2];
+                UINT count = 2;
+                if (xbox.GetFrameStatisticsX(t, leonida::stat_present | leonida::stat_display, &count, stats) != S_OK ||
+                    count != 2)
+                    return false;
+                const bool at_once = stats[1].time_us == stats[0].time_us;
+                if (at_once != expect_tear) {
+                    std::fprintf(stderr, "late %llu us, threshold %g: shown at once = %d, expected %d\n",
+                                 static_cast<unsigned long long>(late_us), double(threshold), int(at_once), int(expect_tear));
+                    return false;
+                }
+                const float want_percent = expect_tear ? 100.0f * float(late_us) / float(period) : 0.0f;
+                return std::fabs(stats[1].percent_scanned - want_percent) < 0.01f;
+            };
+            const bool t = can_tear;
+            // The period is 16667 us: 8000 us is 48% of it, 2000 us 12%, 1000 us 6%.
+            EXPECT(frame_with(8000, 60.0f, true, t));      // 48% scanned, threshold 60%: shown at once
+            EXPECT(frame_with(8000, 49.0f, true, t));      // just inside the threshold
+            EXPECT(frame_with(8000, 47.0f, true, false));  // the scan is past 47%: waits for the vblank
+            EXPECT(frame_with(8000, 0.0f, true, false));   // threshold 0 disables it
+            EXPECT(frame_with(8000, 0.0f, false, false));  // no parameters: the same
+            EXPECT(frame_with(8000, -10.0f, true, false));
+            EXPECT(frame_with(0, 100.0f, true, false));    // on time: nothing to tear
+            EXPECT(frame_with(1000, 100.0f, true, t));     // 100: a late flip anywhere in the scan
+            EXPECT(frame_with(15000, 100.0f, true, t));
+            EXPECT(frame_with(2000, 10.0f, true, false));  // 12% scanned, threshold 10
+            EXPECT(frame_with(2000, 13.0f, true, t));
+            EXPECT(xbox.immediate_presents() == expected_tears);
+            std::printf("ImmediateThresholdPercent (%s): ok, %llu of 11 frames shown at once\n",
+                        can_tear ? "tearing present mode in use" : "unsupported here, frames wait",
+                        static_cast<unsigned long long>(xbox.immediate_presents() - tears_before));
+            if (can_tear) EXPECT(xbox.presenter().tear_presents() == xbox.immediate_presents() - tears_before);
+        }
+
+        owner.reset();  // one swapchain per window: the first presenter goes
+        // Kill switch: LEONIDA_PRESENT_NO_TEAR=1 keeps the swapchain FIFO-only, so a late frame with a threshold waits.
+        {
+            _putenv_s("LEONIDA_PRESENT_NO_TEAR", "1");
+            auto no_tear = rt::d3d12::create_window_presenter(inner, window);
+            _putenv_s("LEONIDA_PRESENT_NO_TEAR", "");
+            EXPECT(no_tear && no_tear->enable_capture());
+            EXPECT(!no_tear->tear_supported());
+            leonida::ManualFrameClock fake;
+            rt::d3d12::XboxPresentation fifo_only(std::move(no_tear), &fake);
+            EXPECT(SUCCEEDED(fifo_only.SetFrameIntervalX(nullptr, period, 1, 0)));
+            EXPECT(SUCCEEDED(fifo_only.ScheduleFrameEventX(rt::d3d12::xbox_frame_event_origin, 0, 0)));
+            fake.advance_us(period);
+            std::uint64_t t = 0;
+            EXPECT(fifo_only.WaitFrameEventX(rt::d3d12::xbox_frame_event_origin, 0, 0, &t) == S_OK);
+            fake.advance_us(period + 8000);  // half an interval late
+            rt::d3d12::XboxPresentParameters fifo_params{100.0f};
+            auto p = plane_of(rgba, t);
+            EXPECT(fifo_only.PresentX(1, &p, &fifo_params) == S_OK);
+            EXPECT(fifo_only.immediate_presents() == 0 && fifo_only.pacer().frames_in_flight() == 1);
+            EXPECT(fifo_only.presenter().read_back(frame.bytes, &frame.extent, &frame.format));
+            EXPECT(region_is(frame, 0, 0, width, height, {51, 153, 230}));
+            std::printf("no tearing mode (LEONIDA_PRESENT_NO_TEAR): late frame waits for the vblank: ok\n");
+        }
         // Real time, 60 Hz: 30 frames cycling through three colours; tokens count up one per wait, each frame shows
         // the colour that was presented, and the loop takes about 30 vblanks.
-        owner.reset();  // one swapchain per window: the first presenter goes
         auto presenter2 = rt::d3d12::create_window_presenter(inner, window);
         EXPECT(presenter2 && presenter2->enable_capture());
         rt::d3d12::XboxPresentation real(std::move(presenter2));  // the real clock
@@ -484,9 +594,16 @@ int main() {
     DestroyWindow(window);
     UnregisterClassW(window_class.lpszClassName, window_class.hInstance);
 
-    if (d.validation_errors()) {
-        std::fprintf(stderr, "%u validation errors\n", d.validation_errors());
+    const unsigned validation_errors = d.validation_errors();
+    const unsigned known_errors = d.known_validation_errors();
+    if (validation_errors != known_errors) {
+        std::fprintf(stderr, "%u validation errors (%u known sRGB swapchain checks)\n", validation_errors,
+                     known_errors);
         return 1;
+    }
+    if (known_errors) {
+        std::fprintf(stderr, "%u known sRGB swapchain STORAGE validation errors; skipped\n", known_errors);
+        return 77;
     }
     std::printf("xbox_present_test: all cases pass\n");
     return 0;

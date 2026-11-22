@@ -58,6 +58,7 @@ printed or written; the height bytes are not. Standard library only.
 """
 import argparse
 import json
+import math
 import os
 import struct
 import sys
@@ -77,6 +78,9 @@ def _u32(blob: bytes, offset: int) -> int:
 def _bounds(blob: bytes, offset: int) -> dict:
     lo = list(struct.unpack_from("<3f", blob, offset))
     hi = list(struct.unpack_from("<3f", blob, offset + 12))
+    for value in lo + hi:
+        if not math.isfinite(value):
+            raise ValueError(f"non-finite bound {value!r} at offset {offset:#x}")
     return {"min": lo, "max": hi}
 
 
@@ -391,4 +395,8 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    try:  # a redirected stdout is strict ANSI code page under -I; write '?' for what it cannot encode
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
     sys.exit(main())

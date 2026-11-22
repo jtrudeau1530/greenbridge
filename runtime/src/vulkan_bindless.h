@@ -724,7 +724,7 @@ private:
             full = true;
             grew = true;
         }
-        const DescriptorTable::Changes changes = table_.take_changes();
+        DescriptorTable::Changes changes = table_.take_changes();
         full = full || changes.all;
         bool recorded = false;
         // The staging buffer is written only for buffers that were just created (first upload or growth): a later
@@ -732,11 +732,11 @@ private:
         // flight can be reading bytes the CPU rewrites.
         const bool fresh = grew || !table_uploaded_;
         const auto upload_all = [&]() {
-            const std::vector<std::uint32_t> words = table_.build_gpu_buffer();
             if (fresh) {
-                std::memcpy(table_buffers_.staging.mapped, words.data(), bytes);
+                table_.write_to_buffer(table_buffers_.staging.mapped);
                 copy_table_range(command_buffer, 0, bytes);
             } else {
+                const std::vector<std::uint32_t> words = table_.build_gpu_buffer();
                 update_table_range(command_buffer, 0, words.data(), bytes);
             }
             recorded = true;
@@ -744,15 +744,16 @@ private:
         if (full) {
             upload_all();
         } else if (!changes.slots.empty()) {
-            std::vector<std::uint32_t> slots = changes.slots;
+            std::vector<std::uint32_t> slots = std::move(changes.slots);
             std::sort(slots.begin(), slots.end());
             slots.erase(std::unique(slots.begin(), slots.end()), slots.end());
+            std::vector<std::uint32_t> words;
             bool staged = true;
             for (std::size_t first = 0; staged && first < slots.size();) {
                 std::size_t last = first;
                 while (last + 1 < slots.size() && slots[last + 1] == slots[last] + 1) ++last;
                 const std::uint32_t count = std::uint32_t(last - first + 1);
-                std::vector<std::uint32_t> words(std::size_t(count) * 10);
+                words.resize(std::size_t(count) * 10);
                 staged = table_.read_slots(slots[first], count, words.data());
                 if (staged) {
                     update_table_range(command_buffer, entry_offset(slots[first]), words.data(),

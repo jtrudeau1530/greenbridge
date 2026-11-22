@@ -8,6 +8,11 @@ staged in a temporary directory. After validation, the build writes <out>/spirv/
 metadata.
 
 Compute shaders can override the default header with leading "; group: X,Y,Z" and "; rsrc2: 0x..." comments.
+A shader whose header has "; fssm-at: 0xOFFSET" and "; fssm-data: 0xWORD ..." comments also gets a synthetic
+FSSM program (the magic, zeros up to OFFSET, then the words): it is published as <out>/fssm/<name>.fssm and its
+SHA-256 goes into the index as fssm_sha256, which is what the layer looks a PSO's shader up by (the translator
+hashes <work>/fssm/<name>.fssm for the game's programs, and compute shaders here already). A test builds the shader container from that file. The words
+are also what a shader reads through s_getpc_b64 (the code base) at that offset.
 The stage comes from the name's prefix. Mesh and geometry shaders (ms_, gs_) also need a DXBC container with
 their signatures, which this doesn't make.
 The comment at the top of each .asm says which test program to run on the result and what it should print.
@@ -53,6 +58,24 @@ def asm_mattr(path):
 CLIP_CASES = {"vs_clip": 1, "vs_clip_param4": 4, "vs_clip_undeclared": 1}
 
 
+def asm_fssm(path):
+    """The synthetic FSSM program a vs_/ps_ shader's header asks for, or None."""
+    at, words = None, []
+    for ln in Path(path).read_text(encoding="utf-8").splitlines():
+        s = ln.strip()
+        if s and not s.startswith(";"):
+            break
+        m = re.match(r";\s*fssm-at:\s*(0x[0-9a-fA-F]+|\d+)", s)
+        if m:
+            at = int(m.group(1), 0)
+        m = re.match(r";\s*fssm-data:\s*(.*)", s)
+        if m:
+            words += [int(w, 0) for w in m.group(1).split()]
+    if at is None or not words or at < 4 or at % 4:
+        return None
+    return b"FSSM" + bytes(at - 4) + b"".join(struct.pack("<I", w) for w in words)
+
+
 def shader_source(name):
     return "vs_clip" if name in CLIP_CASES else name
 
@@ -86,6 +109,9 @@ def translate_tests(work, names):
         # rdna2spirv.py rejects assembler directives such as the "\t.text" llvm-mc prints first.
         code = "".join(ln for ln in r.stdout.splitlines(keepends=True) if not ln.lstrip().startswith("."))
         (disasm / (n + ".s")).write_text(f"; {n}  hand-written test\n{code}", encoding="utf-8")
+        program = None if n.startswith("cs_") else asm_fssm(asm_path)
+        if program:   # where the translator looks for a program to hash, as in the game's work folder
+            (fssm / (n + ".fssm")).write_bytes(program)
         if n.startswith("cs_"):
             (fssm / (n + ".fssm")).write_bytes(compute_header(asm_path))
         elif n in CLIP_CASES and n != "vs_clip_undeclared":
@@ -99,6 +125,8 @@ def translate_tests(work, names):
         cmd.append("--bary-fallback")
     if os.environ.get("LEONIDA_FMA") in ("glsl", "khr"):   # fused multiply-add as GLSL Fma (default) or OpFmaKHR
         cmd += ["--fma", os.environ["LEONIDA_FMA"]]
+    if os.environ.get("LEONIDA_F16_INTERP_FALLBACK") == "1":   # f16 interpolation without PerVertexKHR (MoltenVK)
+        cmd.append("--f16-interp-fallback")
     if os.environ.get("LEONIDA_TEXOFF_FALLBACK") == "1":   # texel offsets without VK_KHR_maintenance8
         cmd.append("--texel-offset-fallback")
     return subprocess.run(cmd).returncode
@@ -141,6 +169,10 @@ def main():
             for suffix in (".spv", ".spvasm"):
                 artifact = built / (n + suffix)
                 artifact.replace(spirv / artifact.name)
+            sidecar = work / "fssm" / (n + ".fssm")
+            if not n.startswith("cs_") and sidecar.is_file():
+                (out / "fssm").mkdir(exist_ok=True)
+                sidecar.replace(out / "fssm" / sidecar.name)
         index.replace(published_index)
         sys.path.insert(0, os.path.join(HERE, "..", "..", "..", "tools"))
         import spirv_stubs

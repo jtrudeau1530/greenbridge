@@ -87,7 +87,7 @@ struct SampleKeys {
     std::uint32_t tsharp[8];
     std::uint32_t ssharp[4];
     std::uint32_t first;
-    std::uint32_t mode;  // 0: normalized, 1: uint, 2: multisampled, 3: multisampled array
+    std::uint32_t mode;  // 0: normalized, 1: uint, 2: multisampled, 3: multisampled array, 4: 1D
     std::uint32_t layer;
 };
 
@@ -307,6 +307,7 @@ int main() {
         info.bindless = d.bindless;
         info.bindless_partially_bound = d.partially_bound;
         info.image_view_min_lod = d.image_view_min_lod;
+        info.sampler_filter_minmax = d.sampler_filter_minmax;
         ID3D12Device* inner = nullptr;
         EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&inner))));
         Ref<ID3D12Device> device;
@@ -555,7 +556,8 @@ int main() {
             array_lod_slot = first_lod_slot + lod_view_count,
             cube_lod_slot = array_lod_slot + array_clamp_count,
             ms_slot = cube_lod_slot + cube_lod_count, ms_array_slot, ms_slice_slot, ms_first_layer_slot,
-            ms_uint_slot, ms_uint_array_slot, ms_sint_slot, ms_sint_array_slot, view_slot_count
+            ms_uint_slot, ms_uint_array_slot, ms_sint_slot, ms_sint_array_slot,
+            line_default, line_mip, line_clamped, view_slot_count
         };
         D3D12_DESCRIPTOR_HEAP_DESC heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, view_slot_count,
                                              D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
@@ -567,6 +569,22 @@ int main() {
         EXPECT(view_cpu && sampler_cpu);
         const auto view_slot = [&](UINT i) { return D3D12_CPU_DESCRIPTOR_HANDLE{SIZE_T(view_cpu + i * step)}; };
         const auto view_bytes = [&](UINT i) { return reinterpret_cast<std::uint8_t*>(view_cpu + i * step); };
+
+        auto line_desc = sampled_desc;
+        line_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE1D;
+        line_desc.Height = 1;
+        Ref<ID3D12Resource> line;
+        EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &line_desc,
+                                                         D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&line.p))));
+        device->CreateShaderResourceView(line.p, nullptr, view_slot(line_default));
+        D3D12_SHADER_RESOURCE_VIEW_DESC line_view{};
+        line_view.Format = line_desc.Format;
+        line_view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE1D;
+        line_view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        line_view.Texture1D = {1, 1, 0};
+        device->CreateShaderResourceView(line.p, &line_view, view_slot(line_mip));
+        line_view.Texture1D = {0, UINT_MAX, 2};
+        device->CreateShaderResourceView(line.p, &line_view, view_slot(line_clamped));
 
         for (UINT i = 0; i < std::size(array_clamps); ++i) {
             D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
@@ -630,6 +648,12 @@ int main() {
             std::memcpy(words.data(), view_bytes(i), sizeof(words));
             return g::is_image(words) && g::decode(words, image);
         };
+        g::Image line_image{};
+        EXPECT(image_at(line_default, line_image) && line_image.type == g::ImageType::image_1d &&
+               line_image.width == size && line_image.height == 1 && line_image.first_mip == 0 &&
+               line_image.mip_count == line_desc.MipLevels && line_image.layer_count == 1);
+        EXPECT(image_at(line_mip, line_image) && line_image.type == g::ImageType::image_1d &&
+               line_image.first_mip == 1 && line_image.mip_count == 1);
         const auto null_at = [&](UINT i) {
             return std::all_of(view_bytes(i), view_bytes(i) + step, [](std::uint8_t byte) { return byte == 0; });
         };
@@ -1146,6 +1170,11 @@ int main() {
             to_texture.SubresourceIndex = mip;
             from_upload.PlacedFootprint = levels[mip];
             list->CopyTextureRegion(&to_texture, 0, 0, 0, &from_upload, nullptr);
+            // The first row of the same upload supplies the full 1D mip.
+            D3D12_TEXTURE_COPY_LOCATION to_line = to_texture;
+            to_line.pResource = line.p;
+            from_upload.PlacedFootprint.Footprint.Height = 1;
+            list->CopyTextureRegion(&to_line, 0, 0, 0, &from_upload, nullptr);
         }
         to_texture.SubresourceIndex = 0;
         to_texture.pResource = uint_texture.p;
@@ -1175,6 +1204,7 @@ int main() {
         const D3D12_RESOURCE_BARRIER sampled[] = {
             transition(typeless_volume.p, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
             transition(texture.p, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+            transition(line.p, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
             transition(packed.p, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
             transition(uint_texture.p, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
             transition(volume.p, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)};
@@ -1270,6 +1300,29 @@ int main() {
         }
         EXPECT(sample_through_set(d, set0, set0_layout, keys, results.data()));
         sampled_through_set = true;
+        {
+            const UINT slots[] = {line_default, line_mip, line_clamped, unknown};
+            SampleKeys line_keys[std::size(slots)]{};
+            for (UINT k = 0; k < std::size(slots); ++k) {
+                std::memcpy(line_keys[k].tsharp, view_bytes(slots[k]), sizeof(line_keys[k].tsharp));
+                std::memcpy(line_keys[k].ssharp, sampler_bytes, sizeof(line_keys[k].ssharp));
+                line_keys[k].first = k * texels;
+                line_keys[k].mode = 4;  // Sample from the 1D binding, including on a lookup miss.
+            }
+            std::array<std::uint8_t, std::size(slots) * bytes> pixels{};
+            EXPECT(sample_through_set(d, set0, set0_layout, line_keys, pixels.data()));
+            UINT matched[std::size(slots)]{};
+            for (UINT i = 0; i < texels; ++i) {
+                using Pixel = std::array<std::uint8_t, 4>;
+                const Pixel expected[] = {texel(i % size, 0), mip_colors[0],
+                                          d.image_view_min_lod ? mip_colors[1] : Pixel{}, Pixel{}};
+                for (UINT k = 0; k < std::size(slots); ++k)
+                    matched[k] += std::memcmp(pixels.data() + k * bytes + 4 * i, expected[k].data(), 4) == 0;
+            }
+            std::printf("1D SRVs (default, mip 1, min LOD 2, missing): %u/%u %u/%u %u/%u %u/%u texels matched\n",
+                        matched[0], texels, matched[1], texels, matched[2], texels, matched[3], texels);
+            for (UINT count : matched) EXPECT(count == texels);
+        }
         {
             // The registered literal S# wraps (the texture, texel for texel); the other one clamps as the fallback
             // sampler does (the right edge).
@@ -1857,8 +1910,104 @@ int main() {
 #endif
         }
 
+        // Minimum/maximum filter reduction modes on a 2x2 RGBA8 texture: every sample of cs_sample.comp's 8x8 grid
+        // lands strictly between texel centres, so all four texels have positive weight under WRAP addressing.
+        {
+            D3D12_RESOURCE_DESC minmax_desc = texture_desc;
+            minmax_desc.Width = minmax_desc.Height = 2;
+            minmax_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+            Ref<ID3D12Resource> minmax_texture;
+            EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &minmax_desc,
+                                                             D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                             IID_PPV_ARGS(&minmax_texture.p))));
+            D3D12_PLACED_SUBRESOURCE_FOOTPRINT minmax_fp{};
+            device->GetCopyableFootprints(&minmax_desc, 0, 1, 49152, &minmax_fp, nullptr, nullptr, nullptr);
+            constexpr std::uint8_t minmax_texels[2][2][4] = {
+                {{16, 240, 80, 255}, {240, 16, 160, 255}},
+                {{96, 128, 240, 255}, {176, 64, 16, 255}},
+            };
+            for (UINT y = 0; y < 2; ++y)
+                for (UINT x = 0; x < 2; ++x)
+                    std::memcpy(static_cast<std::uint8_t*>(mapped) + minmax_fp.Offset + y * minmax_fp.Footprint.RowPitch +
+                                    x * 4,
+                                minmax_texels[y][x], 4);
+            device->CreateShaderResourceView(minmax_texture.p, nullptr, view_slot(null_slot));
+
+            D3D12_DESCRIPTOR_HEAP_DESC mm_heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, 3,
+                                                    D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+            Ref<ID3D12DescriptorHeap> mm_samplers;
+            EXPECT(SUCCEEDED(device->CreateDescriptorHeap(&mm_heap_desc, IID_PPV_ARGS(&mm_samplers.p))));
+            const auto mm_cpu = reinterpret_cast<XboxHeapHandleFn>(slot(mm_samplers.p, 9))(mm_samplers.p);
+            const auto mm_slot = [&](UINT i) { return D3D12_CPU_DESCRIPTOR_HANDLE{SIZE_T(mm_cpu + i * sampler_step)}; };
+            const auto mm_bytes = [&](UINT i) { return reinterpret_cast<const std::uint8_t*>(mm_cpu + i * sampler_step); };
+            constexpr D3D12_FILTER mm_filters[3] = {
+                D3D12_FILTER_MINIMUM_MIN_MAG_MIP_LINEAR,
+                D3D12_FILTER_MAXIMUM_MIN_MAG_MIP_LINEAR,
+                D3D12_FILTER_MIN_MAG_MIP_LINEAR,
+            };
+            constexpr g::FilterMode mm_modes[3] = {g::FilterMode::minimum, g::FilterMode::maximum, g::FilterMode::blend};
+            for (UINT i = 0; i < 3; ++i) {
+                D3D12_SAMPLER_DESC sd = sampler_desc;
+                sd.Filter = mm_filters[i];
+                sd.AddressU = sd.AddressV = sd.AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+                device->CreateSampler(&sd, mm_slot(i));
+                g::SamplerWords sw{};
+                std::memcpy(sw.data(), mm_bytes(i), sizeof(sw));
+                EXPECT(g::decode(sw).filter_mode == mm_modes[i]);
+            }
+
+            EXPECT(SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.p, nullptr)));
+            D3D12_TEXTURE_COPY_LOCATION to_mm{minmax_texture.p, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {}};
+            to_mm.SubresourceIndex = 0;
+            D3D12_TEXTURE_COPY_LOCATION from_mm{upload.p, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, {}};
+            from_mm.PlacedFootprint = minmax_fp;
+            list->CopyTextureRegion(&to_mm, 0, 0, 0, &from_mm, nullptr);
+            const D3D12_RESOURCE_BARRIER mm_readable =
+                transition(minmax_texture.p, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            list->ResourceBarrier(1, &mm_readable);
+            EXPECT(list->Close() == S_OK);
+            queue->ExecuteCommandLists(1, lists);
+            EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
+            ++packed_signal;
+            EXPECT(SUCCEEDED(queue->Signal(fence.p, packed_signal)) &&
+                   SUCCEEDED(fence->SetEventOnCompletion(packed_signal, nullptr)));
+
+#ifdef LEONIDA_TEST_CS_SAMPLE_SPV
+            SampleKeys mm_keys[3]{};
+            for (UINT i = 0; i < 3; ++i) {
+                std::memcpy(mm_keys[i].tsharp, view_bytes(null_slot), sizeof(mm_keys[i].tsharp));
+                std::memcpy(mm_keys[i].ssharp, mm_bytes(i), sizeof(mm_keys[i].ssharp));
+                mm_keys[i].first = i * texels;
+            }
+            std::array<std::uint8_t, 3 * bytes> mm_pixels{};
+            EXPECT(sample_through_set(d, set0, set0_layout, mm_keys, mm_pixels.data()));
+            constexpr std::array<std::uint8_t, 4> want_min{16, 16, 16, 255};
+            constexpr std::array<std::uint8_t, 4> want_max{240, 240, 240, 255};
+            UINT min_matches = 0, max_matches = 0, blend_diff_min = 0, blend_diff_max = 0;
+            for (UINT i = 0; i < texels; ++i) {
+                const auto* got_min = &mm_pixels[0 * bytes + i * 4];
+                const auto* got_max = &mm_pixels[1 * bytes + i * 4];
+                const auto* got_blend = &mm_pixels[2 * bytes + i * 4];
+                if (d.sampler_filter_minmax) {
+                    min_matches += std::memcmp(got_min, want_min.data(), 4) == 0;
+                    max_matches += std::memcmp(got_max, want_max.data(), 4) == 0;
+                    blend_diff_min += std::memcmp(got_blend, want_min.data(), 4) != 0;
+                    blend_diff_max += std::memcmp(got_blend, want_max.data(), 4) != 0;
+                } else {
+                    min_matches += std::memcmp(got_min, got_blend, 4) == 0;
+                    max_matches += std::memcmp(got_max, got_blend, 4) == 0;
+                }
+            }
+            std::printf("sampler reduction min/max: min %u/%u, max %u/%u (blend differed: %u/%u vs min, %u/%u vs max)\n",
+                        min_matches, texels, max_matches, texels, blend_diff_min, texels, blend_diff_max, texels);
+            EXPECT(min_matches == texels && max_matches == texels);
+            if (d.sampler_filter_minmax) EXPECT(blend_diff_min == texels && blend_diff_max == texels);
+#endif
+        }
+
         upload.reset();
         array_texture.reset();
+        line.reset();
         volume.reset();
         typeless_volume.reset();
         typeless_heap.reset();

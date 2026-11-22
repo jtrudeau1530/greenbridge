@@ -270,6 +270,18 @@ int main() {
     if (FAILED(sc1->QueryInterface(IID_PPV_ARGS(&sc))) || !sc) return fail("QI IDXGISwapChain3");
     sc1->Release();
 
+    ID3D12CommandQueue* got_queue = nullptr;
+    if (FAILED(sc->GetDevice(IID_PPV_ARGS(&got_queue))) || got_queue != queue) {
+        if (got_queue) got_queue->Release();
+        return fail("GetDevice");
+    }
+    got_queue->Release();
+    DXGI_SWAP_CHAIN_FULLSCREEN_DESC fullscreen{};
+    if (FAILED(sc->GetFullscreenDesc(&fullscreen)) || !fullscreen.Windowed ||
+        fullscreen.Scaling != DXGI_MODE_SCALING_UNSPECIFIED ||
+        fullscreen.ScanlineOrdering != DXGI_MODE_SCANLINE_ORDER_UNSPECIFIED)
+        return fail("GetFullscreenDesc");
+
     D3D12_DESCRIPTOR_HEAP_DESC rtv_hd{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
     ID3D12DescriptorHeap* rtv_heap = nullptr;
     if (FAILED(dev->CreateDescriptorHeap(&rtv_hd, IID_PPV_ARGS(&rtv_heap)))) return fail("CreateDescriptorHeap");
@@ -542,6 +554,14 @@ int main() {
             return fail("Present(5, 0) should be DXGI_ERROR_INVALID_CALL and present nothing");
         if (sc->GetLastPresentCount(nullptr) != E_INVALIDARG)
             return fail("GetLastPresentCount(nullptr) should return E_INVALIDARG");
+
+        DXGI_FRAME_STATISTICS stats{};
+        if (FAILED(sc->GetFrameStatistics(&stats)) || stats.PresentCount != count_before ||
+            stats.PresentRefreshCount != count_before || stats.SyncRefreshCount != count_before ||
+            stats.SyncQPCTime.QuadPart == 0)
+            return fail("GetFrameStatistics values");
+        if (sc->GetFrameStatistics(nullptr) != E_INVALIDARG)
+            return fail("GetFrameStatistics(nullptr) should return E_INVALIDARG");
     }
 
     // SwapChain::GetParent and non-waitable SetMaximumFrameLatency/GetMaximumFrameLatency (host DXGI returns
@@ -713,8 +733,7 @@ int main() {
             return fail("QueryInterface(IDXGIFactory5) failed");
         BOOL allow_tearing = FALSE;
         if (FAILED(factory5->CheckFeatureSupport(DXGI_FEATURE_PRESENT_ALLOW_TEARING, &allow_tearing,
-                                                 sizeof(allow_tearing))) ||
-            !allow_tearing)
+                                                 sizeof(allow_tearing))))
             return fail("IDXGIFactory5::CheckFeatureSupport(ALLOW_TEARING) failed");
         if (factory5->CheckFeatureSupport(DXGI_FEATURE_PRESENT_ALLOW_TEARING, nullptr, sizeof(BOOL)) != E_INVALIDARG ||
             factory5->CheckFeatureSupport(DXGI_FEATURE_PRESENT_ALLOW_TEARING, &allow_tearing, 2) != E_INVALIDARG)

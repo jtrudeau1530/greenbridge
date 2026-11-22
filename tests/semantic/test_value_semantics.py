@@ -33,6 +33,9 @@ ISA semantics used (AMD RDNA2 ISA reference, VALU/VOP3/VOP3P chapters):
   v_fmaak_f32/madak_f32 D = S0 * S1 + K (printed vdst, src0, vsrc1, K).
   s_ff1_i32_b32 /       index of the lowest set / clear bit of S0, -1 (0xffffffff) when there is none. An inline
   s_ff0_i32_b32           constant or literal source is a 32-bit value, not a lane mask (SHADER-46).
+  v_mad_u32_u16 /       D = S0.lo * S1.lo + S2 mod 2^32, the halves zero- (u16) or sign-extended (i16); op_sel bit
+  v_mad_i32_i16           0/1 reads the high half of S0/S1. D is a whole dword (nothing of the old value is kept).
+  v_subrev_f16          D.lo = S1.lo - S0.lo; the high half of D is kept in the VOP2 and the VOP3 form.
   s_*_saveexec_b32/b64, a constant used as a lane mask gives lane L its bit L: of the 32-bit value for a b32 op,
   s_andn2_wrexec_*,       of the 64-bit value for a b64 op (inline constants sign-extended, literals with a zero
   s_mov/s_not/s_and_b64   high word). cs_w32_mask_imm / cs_w64_mask_imm run every lane of a wave (LaneMaskConstants).
@@ -64,7 +67,7 @@ EXPECTED_OPS4 = [0x34000010, 0x00120800, 0xBEEF0000, 0x12343C00]
 EXPECTED_OPS5 = [0x12340010, 0xBEEF0800, 0xAAAAFFFF, 0xDEADBC00]
 EXPECTED_OPS6 = [0xF800FFFF, 0x01000010, 0x00800800, 0x8000FFF0]
 EXPECTED_OPS7 = [0x00FF8077, 0xFF0000FF, 0x89ABCDEF, 0x00070003]
-EXPECTED_OPS8 = [0x80000000, 0xFFFFFFFF, 0x000F100E, 0x0F0F0F1F]
+EXPECTED_OPS8 = [0x80000000, 0xBFFFFFFF, 0x000F100E, 0x0F0F0F1F]
 EXPECTED_VCC_X2 = [0x11223344, 0x55667788, 0x00000000, 0x00000000]
 EXPECTED_F16_VOP2 = [0xAAAA4000, 0xAAAAC000, 0xAAAA3A00, 0x42003F00]        # hardware-measured
 EXPECTED_FLAT = [0x00000101, 0x00000102, 0x3F000000, 0x3E800000]
@@ -76,6 +79,8 @@ EXPECTED_FMT_1010102 = {0x00: 0x00000000, 0x04: 0x3F800000, 0x08: 0x00000000, 0x
                         0x20: 0x00000000, 0x24: 0x3F800000, 0x28: 0x00000000, 0x2C: 0x3F800000,
                         0x30: 0xC00FFC00, 0x34: 0x003FF003, 0x38: 0xE00003FF, 0x3C: 0xFFE00003}
 EXPECTED_SFF_IMM = [0x00000002, 0x00000001, 0x00000014, 0x00000010]
+EXPECTED_VALU16_MAD = [0x00000002, 0x00030002, 0x00008000, 0x00000004]
+EXPECTED_VALU16_SUBREV = [0xAAAABC00, 0xAAAAC000, 0xAAAA3C00, 0x42003800]
 EXPECTED_VCMP_F32_NAN = [0x0000376C, 0x0000FD5B, 0x0000D36C, 0x00000FE7]   # derivation in ps_vcmp_f32_nan.asm
 EXPECTED_VCMP_64 = [0x0000B3C4, 0x000091E6, 0x00006787, 0x00007C93]        # derivation in ps_vcmp_64.asm
 EXPECTED_ANDN2_EXEC = [1, 8, 16, 2064, 2068, 3, 20, 1544]                   # derivation in cs_w32_andn2_exec.asm
@@ -187,8 +192,9 @@ def reference_ops8():
     ffbl = (0x00010000 & -0x00010000).bit_length() - 1
     ffbh = 32 - 0x00010000.bit_length()
     xad = ((0xF0F0F0F0 ^ m) + 1) & m
+    signed_high = ((_s(0xFFFFFFFE) * 0x40000000) >> 32) & m
     return [(0x80000001 * 0xFFFFFFFF) >> 32,
-            ((_s(0xFFFFFFFE) * 0x40000000) >> 32) & m,
+            signed_high ^ 0x40000000,
             ((ffbh << 16) + (ffbl << 8) + bcnt) & m,
             (xad + 16 + m) & m]                                  # v_ffbh_u32(0) = 0xffffffff
 
@@ -276,6 +282,26 @@ def reference_sff_imm():
     # ps_sff_imm: s_ff1 of the inline constant 4 and of the literal 0x00100000; s_ff0 of the inline constant 61
     # (0b111101) and of the literal 0x0000ffff (the lowest clear bit is the lowest set bit of ~S0).
     return [_ff1(4), _ff1(~61), _ff1(0x00100000), _ff1(~0x0000FFFF)]
+
+
+def _mad_32_16(signed, s0, s1, s2, sel=(0, 0)):
+    """v_mad_u32_u16 / v_mad_i32_i16: the selected 16-bit halves, extended, multiplied, plus S2, mod 2^32."""
+    a, b = (s0 >> (16 * sel[0])) & 0xFFFF, (s1 >> (16 * sel[1])) & 0xFFFF
+    if signed:
+        a, b = _s16(a), _s16(b)
+    return (a * b + s2) & 0xFFFFFFFF
+
+
+def reference_valu16_mad():
+    v0, v1, v3, v5, v6, v7 = 0x1234FFFF, 0x5678FFFE, 0x00030000, 0x00018000, 0xFFFF7FFF, 0x40000000
+    return [_mad_32_16(False, v0, v1, v3), _mad_32_16(True, v0, v1, v3), _mad_32_16(True, v5, v6, v7),
+            _mad_32_16(True, v5, v6, 5, sel=(1, 1))]
+
+
+def reference_valu16_subrev():
+    a, b, d = _unhalf(0x3E00), _unhalf(0x3800), _unhalf(0x3C00)        # low halves: v0 1.5, v1 0.5, v5 1.0
+    return [0xAAAA0000 | _half(b - a), 0xAAAA0000 | _half(-b - a), 0xAAAA0000 | _half(min(1.0, b + a)),
+            0x42000000 | _half(a - d)]
 
 
 def _pack_nibbles(ops, pairs, test):
@@ -390,6 +416,8 @@ class OracleTests(unittest.TestCase):
         self.assertEqual(reference_bounds(), EXPECTED_BOUNDS)
         self.assertEqual(reference_fmt_1010102(), EXPECTED_FMT_1010102)
         self.assertEqual(reference_sff_imm(), EXPECTED_SFF_IMM)
+        self.assertEqual(reference_valu16_mad(), EXPECTED_VALU16_MAD)
+        self.assertEqual(reference_valu16_subrev(), EXPECTED_VALU16_SUBREV)
         self.assertEqual(reference_vcmp_f32_nan(), EXPECTED_VCMP_F32_NAN)
         self.assertEqual(reference_vcmp_64(), EXPECTED_VCMP_64)
         self.assertEqual(reference_andn2_exec(), EXPECTED_ANDN2_EXEC)
@@ -444,6 +472,16 @@ class TranslatorValueSemantics(unittest.TestCase):
         # Low halves in (the high halves hold other values), low half out, the destination's high half kept;
         # v_fmac_f16 accumulates into the low half of its destination.
         self.check("ps_f16_vop2", EXPECTED_F16_VOP2)
+
+    def test_mad_u32_u16_i32_i16_wrap_and_sign_extend(self):
+        # The u16 product plus S2 wraps at 32 bits; i16 sign-extends both halves (also the op_sel-selected high
+        # halves); the destination dword is replaced, its 0xaaaa5555 is not kept.
+        self.check("ps_valu16_mad", EXPECTED_VALU16_MAD)
+
+    def test_subrev_f16_reversed_and_keeps_high_half(self):
+        # S1 - S0 in the _e32 and _e64 forms (neg, clamp), low half out, the destination's high half kept, also
+        # when the destination is a source.
+        self.check("ps_valu16_subrev", EXPECTED_VALU16_SUBREV)
 
     def test_s_buffer_load_dwordx2_into_vcc(self):
         # The V# in s[0:3] points at 0x1000; the two dwords must come back in vcc_lo and vcc_hi, not be lost.

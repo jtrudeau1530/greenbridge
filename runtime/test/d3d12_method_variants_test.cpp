@@ -325,16 +325,94 @@ int main() {
             }
         }
 
-        // Castable formats: a list is refused, since the layer reports no relaxed format casting (D3D12_OPTIONS12).
-        // Not compared with the host, whose answer depends on its GPU's RelaxedFormatCastingSupported.
+        // Castable formats: the layer reports relaxed format casting and passes a real list to
+        // VkImageFormatListCreateInfo. A count with a null list is still no list; a buffer cannot have one.
         {
+            D3D12_FEATURE_DATA_D3D12_OPTIONS12 options12{};
+            EXPECT(SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS12, &options12,
+                                                         sizeof(options12))));
+            EXPECT(options12.RelaxedFormatCastingSupported == TRUE);
+            EXPECT(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS12, &options12,
+                                               sizeof(options12) - 1) == E_INVALIDARG);
             const D3D12_RESOURCE_DESC1 texture =
                 desc1(texture_desc(4, 4, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE));
             const DXGI_FORMAT own[] = {DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB};
             Ref<ID3D12Resource> r;
-            EXPECT(device->CreateCommittedResource3(&default_heap, D3D12_HEAP_FLAG_NONE, &texture,
-                                                    D3D12_BARRIER_LAYOUT_COMMON, nullptr, nullptr, 2, own,
+            EXPECT(SUCCEEDED(device->CreateCommittedResource3(&default_heap, D3D12_HEAP_FLAG_NONE, &texture,
+                                                              D3D12_BARRIER_LAYOUT_COMMON, nullptr, nullptr, 2, own,
+                                                              IID_PPV_ARGS(&r.p))));
+            EXPECT(rt::d3d12::vulkan_image(r.p));
+            r.reset();
+            const D3D12_RESOURCE_DESC1 buffer = desc1(buffer_desc(256));
+            EXPECT(device->CreateCommittedResource3(&upload_heap, D3D12_HEAP_FLAG_NONE, &buffer,
+                                                    D3D12_BARRIER_LAYOUT_UNDEFINED, nullptr, nullptr, 2, own,
                                                     IID_PPV_ARGS(&r.p)) == E_INVALIDARG && !r.p);
+            const DXGI_FORMAT unknown[] = {DXGI_FORMAT_UNKNOWN};
+            EXPECT(device->CreateCommittedResource3(&default_heap, D3D12_HEAP_FLAG_NONE, &texture,
+                                                    D3D12_BARRIER_LAYOUT_COMMON, nullptr, nullptr, 1, unknown,
+                                                    IID_PPV_ARGS(&r.p)) == E_INVALIDARG && !r.p);
+        }
+
+        // The creation-time castable list is also the view allow-list. An unlisted SRGB view leaves the slot null;
+        // a listed same-size cross-family cast writes a descriptor and creates its Vulkan view.
+        {
+            Ref<ID3D12DescriptorHeap> heap;
+            D3D12_DESCRIPTOR_HEAP_DESC heap_desc{};
+            heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+            heap_desc.NumDescriptors = 3;
+            heap_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+            EXPECT(SUCCEEDED(device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&heap.p))));
+            D3D12_CPU_DESCRIPTOR_HANDLE slot = heap->GetCPUDescriptorHandleForHeapStart();
+            const UINT stride = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+
+            const D3D12_RESOURCE_DESC1 unorm_desc =
+                desc1(texture_desc(4, 4, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE));
+            const DXGI_FORMAT unorm_only[] = {DXGI_FORMAT_R8G8B8A8_UNORM};
+            Ref<ID3D12Resource> unorm_texture;
+            EXPECT(SUCCEEDED(device->CreateCommittedResource3(&default_heap, D3D12_HEAP_FLAG_NONE, &unorm_desc,
+                                                              D3D12_BARRIER_LAYOUT_COMMON, nullptr, nullptr, 1, unorm_only,
+                                                              IID_PPV_ARGS(&unorm_texture.p))));
+            D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+            srv.Format = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+            srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+            srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            srv.Texture2D.MipLevels = 1;
+            device->CreateShaderResourceView(unorm_texture.p, &srv, slot);
+            std::uint32_t words[8]{};
+            std::memcpy(words, reinterpret_cast<void*>(slot.ptr), sizeof(words));
+            bool zero = true;
+            for (std::uint32_t word : words) zero = zero && word == 0;
+            EXPECT(zero);
+
+            // The resource's own format is viewable even when the castable list omits it. Vulkan still needs it
+            // in VkImageFormatListCreateInfo, so creation adds it; the default-format SRV must write a descriptor.
+            const DXGI_FORMAT srgb_only[] = {DXGI_FORMAT_R8G8B8A8_UNORM_SRGB};
+            Ref<ID3D12Resource> self_format_texture;
+            EXPECT(SUCCEEDED(device->CreateCommittedResource3(&default_heap, D3D12_HEAP_FLAG_NONE, &unorm_desc,
+                                                              D3D12_BARRIER_LAYOUT_COMMON, nullptr, nullptr, 1,
+                                                              srgb_only, IID_PPV_ARGS(&self_format_texture.p))));
+            srv.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+            slot.ptr += stride;
+            device->CreateShaderResourceView(self_format_texture.p, &srv, slot);
+            std::memcpy(words, reinterpret_cast<void*>(slot.ptr), sizeof(words));
+            bool nonzero = false;
+            for (std::uint32_t word : words) nonzero = nonzero || word != 0;
+            EXPECT(nonzero);
+
+            const D3D12_RESOURCE_DESC1 uint_desc =
+                desc1(texture_desc(4, 4, DXGI_FORMAT_R8G8B8A8_UINT, D3D12_RESOURCE_FLAG_NONE));
+            const DXGI_FORMAT uint_views[] = {DXGI_FORMAT_R8G8B8A8_UINT, DXGI_FORMAT_R32_UINT};
+            Ref<ID3D12Resource> uint_texture;
+            EXPECT(SUCCEEDED(device->CreateCommittedResource3(&default_heap, D3D12_HEAP_FLAG_NONE, &uint_desc,
+                                                              D3D12_BARRIER_LAYOUT_COMMON, nullptr, nullptr, 2, uint_views,
+                                                              IID_PPV_ARGS(&uint_texture.p))));
+            srv.Format = DXGI_FORMAT_R32_UINT;
+            slot.ptr += stride;
+            device->CreateShaderResourceView(uint_texture.p, &srv, slot);
+            std::memcpy(words, reinterpret_cast<void*>(slot.ptr), sizeof(words));
+            nonzero = false;
+            for (std::uint32_t word : words) nonzero = nonzero || word != 0;
+            EXPECT(nonzero);
         }
 
         // A texture from CreateCommittedResource3 (a castable count with a null list, which is no list) is

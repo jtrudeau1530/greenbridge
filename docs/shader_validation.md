@@ -334,6 +334,12 @@ that starts from a known pattern. It runs 4 to 12 random `ds_*` instructions, ea
 - **Reports.** A mismatch names the thread, the register or LDS word, and the op that last wrote it.
   `--no-exec KIND` drops one op kind's masks without changing the rest of the program, to separate
   a known finding from new ones.
+- **Subgroup size.** Wave32 programs, and wave64 ones built with `--emulate`, ask `vk_compute_test` for
+  32-lane subgroups (`VKC_SUBGROUP_SIZE=32`). Where the device can't pin that size, `vk_compute_test`
+  prints `compute subgroup size: 32 not available` and runs at the driver's choice, and the wave32
+  program is a skip, not a mismatch: its words come from another wave size. Mesa llvmpipe (8 lanes)
+  is such a device. Emulated wave64 uses no subgroup operations, so it is still compared there.
+  `valu_fuzz.py` and `crosslane_fuzz.py` follow the same rule.
 
 First results on an RX 6700 XT (RADV, Mesa 26.3.1), native wave64/wave32 and with
 `--wave64-emulate` at subgroup 32:
@@ -450,11 +456,13 @@ this. Images have their own fuzzer (`tools/image_fuzz.py`, below).
 The `buffer_format` family covers `buffer_load_format_*` on every format the translator decodes, with a
 random DST_SEL of 0/1/X/Y/Z/W, and `tbuffer_load_format_*` on the five formats the 1.0.2.1 corpus uses
 (`16_16_SNORM`, `8_8_8_8_UNORM`, `8_8_8_8_UINT`, `2_10_10_10_UNORM`, `16_16_16_16_UINT`, about 53,000
-instructions) with an identity swizzle. Its reference decodes each element from the GFX10 format *name*
-(`tools/gfx10_formats.json`; channel widths listed from the top bit), not from the translator's own
-table: UNORM/SNORM correctly rounded (`x/(2ⁿ−1)`), missing channels *c* mod *n*, DST_SEL 1 = integer 1
-for UINT/SINT and 1.0f otherwise (SHADER-86, RX 6700). Elements are naturally aligned. Left out: whether
-`tbuffer` applies the V#'s DST_SEL (unmeasured).
+instructions). Generated MTBUF cases use a bound 32_UINT V# and take their data format from the
+instruction. The reference decodes elements from the GFX10 format *name* in `tools/gfx10_formats.json`
+(channel widths listed from the top bit). UNORM/SNORM values use correctly rounded division.
+MUBUF repeats missing channels (*c* mod *n*) and DST_SEL 1 gives integer 1 for UINT/SINT and 1.0f
+otherwise (SHADER-86, RX 6700). MTBUF loads return instruction-format channels in order, zero-fill
+missing channels and return zero for an INVALID V# format (native gfx1036, wave32 and wave64).
+Elements are naturally aligned.
 
 Over 5,000 programs the reference and translator match bit for bit; breaking the `16_16_SNORM` kind, the
 `8_8_8_8_UINT` widths or the DST_SEL order in the translator makes 33, 37 and 191 of 300 programs fail.
@@ -547,7 +555,7 @@ every form has to mean the same on gfx1013 and gfx1150. Checked against Mesa ACO
 | `v_fma_f16`, `v_med3_f16`, `v_add_nc_u16`, `v_sub_nc_u16` VOP3 with `op_sel` | `op_sel` source bits, destination bit = high half, other half kept | same | run |
 | `v_mul_lo_u16`, `v_lshlrev/lshrrev/ashrrev_b16`, `v_max/min_u16/i16` VOP3 with `op_sel` | same fields | same fields and meaning, but LLVM's gfx11 assembler has no `op_sel` operand for these, and GFX11 renumbered the three shifts (`0x314..0x316` to `0x338..0x33a`) | run: with `op_sel` nonzero the instruction words are written out (`GFX11_VOP3_OPCODE`, checked against llvm-mc in the tests); all-zero `op_sel` uses the plain mnemonic |
 | `v_pk_add/mul/max/min/fma_f16`, `v_pk_lshlrev/lshrrev_b16`, `v_pk_ashrrev_i16` with `op_sel`/`op_sel_hi` | per-half selection | same | run |
-| `v_pack_b32_f16` | halves moved | same, but gfx1150 **quiets a signaling NaN** half (`0x7c96` becomes `0x7e96`) | run; a NaN half is "uncertain" in the model (RDNA2 not measured) |
+| `v_pack_b32_f16` | halves moved under IEEE mode 0; under IEEE mode 1 a **signaling NaN** half is quieted (`0x7c96` becomes `0x7e96`; measured on gfx1036, see the RDNA2 results below) | same, gfx1150 quiets it too (measured under IEEE mode 1 only) | run; a signaling-NaN half is "uncertain" in the model (the kernels run with IEEE mode 1) |
 | f16 transcendentals (`v_exp/log/rcp/rsq/sqrt/sin/cos_f16`) | write the low half | same | not generated: covered by FUZZ-29 (#1310), which sweeps all 65,536 inputs on the hardware oracle |
 | 16-bit integer VOP2 `_e32` forms (`v_add_u16_e32`, ...) | exist, define the whole register (design.md) | **do not exist** (only VOP3, with `op_sel`) | not generated, nothing to compare |
 | `v_pk_fmac_f16`, `v_mad_f16`/`v_mac_f16`, `v_subrev_f16` | various | removed or not in this fuzzer | not generated |
@@ -563,7 +571,18 @@ left the pipe); both together give 0 mismatches over 20,000 programs, and adding
 changes nothing (a vector load after a store of the same thread needs neither). The default (`--hw-sync scalar`) is
 vscnt wait plus `s_dcache_inv`; vector accesses only need `s_waitcnt vmcnt(0)`.
 
-*Results (Radeon 880M, gfx1150, driver 26.11.2, AMD clang 23.0.0git).* Hardware, 5 seeds (101 to 105) x 2,000 programs x wave32 and native wave64 per family: **`mem` 20,000 of 20,000 match, `f16` 20,000 of 20,000 match, 0 mismatches, 0 assembler rejections** (plus earlier development runs of a further 15,000 `mem` and 12,000 `f16` programs; the one mismatch they produced, the `v_pack_b32_f16` NaN quieting above, is now modelled as uncertain). Negative controls (`--negative-control --programs 500`, 1,000 programs per row, unperturbed model: 0 mismatches): `f16` hi half zeroed 994, `op_sel` destination ignored 863, packed halves swapped 864, `v_min` as `v_max` 424, `v_pack_b32_f16` halves swapped 254, `op_sel` of the encoded 16-bit integer ops ignored 862; `mem` OOB_SELECT ignored 506, mode 0 without the stride check 54, index unchecked 364, soffset left out of the check 69, whole-access instead of per-dword 45, out-of-range loads keeping the old value 590, `s_buffer_load` unbounded 209, its stride ignored 81. Every perturbation is caught. Not run here: `translator,hw` for `mem` (see below), RDNA2 hardware.
+*Results (Radeon 880M, gfx1150, driver 26.11.2, AMD clang 23.0.0git).* Hardware, 5 seeds (101 to 105) x 2,000 programs x wave32 and native wave64 per family: **`mem` 20,000 of 20,000 match, `f16` 20,000 of 20,000 match, 0 mismatches, 0 assembler rejections** (plus earlier development runs of a further 15,000 `mem` and 12,000 `f16` programs; the one mismatch they produced, the `v_pack_b32_f16` NaN quieting above, is now modelled as uncertain). Negative controls (`--negative-control --programs 500`, 1,000 programs per row, unperturbed model: 0 mismatches): `f16` hi half zeroed 994, `op_sel` destination ignored 863, packed halves swapped 864, `v_min` as `v_max` 424, `v_pack_b32_f16` halves swapped 254, `op_sel` of the encoded 16-bit integer ops ignored 862; `mem` OOB_SELECT ignored 506, mode 0 without the stride check 54, index unchecked 364, soffset left out of the check 69, whole-access instead of per-dword 45, out-of-range loads keeping the old value 590, `s_buffer_load` unbounded 209, its stride ignored 81. Every perturbation is caught. Not run here: `translator,hw` for `mem` (see below); RDNA2 is in the next paragraph.
+
+*Results on RDNA2 (gfx1036 integrated GPU, AMD Windows driver 32.0.21044.64, HIP backend, AMD clang 23.0.0git, `main` bb2e1842).*
+- **Hardware, same protocol** (seeds 101 to 105 x 2,000 programs x wave32 and native wave64 per family): **`f16` 20,000 of 20,000 and `mem` 20,000 of 20,000 match, 0 mismatches, 0 assembler rejections.** On a gfx1030, ROCm 6.2's clang 19 rejected 3,768 of 4,000 `f16` programs (#1365); clang 23 rejects none.
+- **Negative controls**, in the order above: `f16` 992, 865, 826, 430, 280 and 879 caught; `mem` 514, 57, 354, 60, 37, 580, 214 and 89 caught. The unperturbed model gives 0 mismatches.
+- **`translator,hw` at seed 3** (100 programs, the same GPU through the AMD Vulkan driver): `mem` 200 of 200 match, `f16` 199 of 200. The one difference, `s3_22_w64`, is a driver mismatch of the #1506 kind. The hardware and `tests/semantic/spirv_mini_interp` both give the model's value for it, and the same emulated SPIR-V matches on NVIDIA.
+- **`v_pack_b32_f16` with signaling NaNs**, measured with hand-written raw kernels in both wave sizes and both IEEE modes. The inputs were five signaling-NaN halves, quiet NaNs, ±0, +inf and a denormal, in either half, with `op_sel` and with `neg`.
+  - IEEE mode 1, the assembler's default: a signaling-NaN half is quieted. Bit 9 is set and the sign and payload are kept, as on gfx1150.
+  - IEEE mode 0: the half is moved unchanged.
+  - `neg` flips the sign before any quieting (`0x7c01` gives `0xfe01` under mode 1 and `0xfc01` under mode 0).
+  - Every other input is moved unchanged.
+  - The translator moves the bits, which is exact under IEEE mode 0. Which mode the game's shaders run in is not recorded here.
 
 *Findings.* The OOB_SELECT per-mode rules, the per-dword straddle rule and the `s_buffer_load` bound of design.md hold
 on gfx1150 (they were measured on RDNA2 and, for the vector part, on this GPU before; the `s_buffer_load` bound and the
@@ -838,6 +857,49 @@ reset in the kernel log.
   model produces: about half the results 1 ulp off. The kernel layout is checked without a GPU: each of the 65,536
   inputs is computed once and stored in its own half (`tests/test_f16_trans_sweep.py`). On a GPU the test checks
   exp2 of integers and wave32 = wave64.
+
+### `v_fma_mix*` f16 rounding in nearest mode (`tools/fma_mix_probe.py`)
+
+`docs/design.md` leaves one f16 question open. In round-to-nearest mode, does `v_fma_mixlo_f16` / `v_fma_mixhi_f16`
+round the exact x · y + z once, straight to f16? Or does it round to f32 first and then narrow, which is what the
+translator does (f32 `Fma`, then `f16_res`)? The RX 6800 word behind the toward-zero rule can't answer this. For
+1 · 2 - 2^-30 both readings give 0x4000 in nearest mode, and toward zero two truncations equal one.
+
+The two readings only differ when the f32 rounding lands exactly on an f16 tie, or moves a value off one. The probe has
+seven such inputs, each one f16 ulp apart under the two rules, plus one control:
+- a tie just above and just below, for both signs;
+- the subnormal tie at 2^-25;
+- the overflow tie at 65520 (inf against 65504);
+- a tie made by the product rather than by z;
+- the same with f16 operands (`op_sel_hi:[1,1,1]`).
+
+Every side reports which rule its words follow:
+
+```
+python -I tools/fma_mix_probe.py                       # the translator, on the CPU interpreter
+python -I tools/fma_mix_probe.py --oracle hw           # also the native instruction on an AMD GPU (hardware oracle)
+python -I tools/fma_mix_probe.py --oracle vulkan --build runtime/build   # also the translated shader on this GPU
+```
+
+The `hw` side is the measurement. It runs one wave32 lane per input, under the MODE inferred for the game: IEEE 0,
+DX10_CLAMP 1, f32 denormals flushed, f16 denormals kept, nearest. The `vulkan` side only shows that a driver runs the
+translator's sequence as written. Its operands come in user SGPRs, so the driver can't fold them. Exit 0 means every
+side follows the same rule. Exit 1 means they differ, or a side follows neither rule. Exit 77 means a requested side
+is unavailable.
+
+`tests/test_fma_mix_probe.py` checks the expected words against a derivation written out by hand. It also checks that
+the translator follows the double rule today, and that the compute shader gives the pixel shader's words on the
+interpreter. If the hardware rounds once, the fix is to use `Gen.fma_mix_odd` in nearest mode as well. Round-to-odd at
+f32 then narrows exactly. With that change the translator gives the single-rounded word on all seven inputs.
+
+Results:
+
+| GPU | Driver | `translator` | `vulkan` | `hw` |
+|---|---|---|---|---|
+| NVIDIA GeForce RTX 5060 (Blackwell), Windows 11 | 621.24 | double | double, 8 of 8 words | not AMD |
+
+The `hw` column is still empty: the question needs an RDNA GPU. On the RTX 5060, a translator copy changed to use
+`fma_mix_odd` in nearest mode gave the single-rounded word for all seven inputs on the `vulkan` side as well.
 
 ## Coverage plan and cost
 

@@ -45,11 +45,26 @@ def original(path):
     return len(insns), top
 
 
+REQUIRED = ("name", "stage", "statistic", "value")
+
+
 def load_stats(path):
-    """Counter names and raw values by (shader, stage), as written by vk_pipeline_check --stats."""
+    """Read counters keyed by (shader, stage) from vk_pipeline_check --stats."""
     out = defaultdict(dict)
     with open(path, newline="", encoding="utf-8") as f:
-        for row in csv.DictReader(f):
+        reader = csv.DictReader(f)
+        header = reader.fieldnames or []
+        missing = [c for c in REQUIRED if c not in header]
+        if missing:
+            raise ValueError(f"line 1: missing required header column(s): {', '.join(missing)}")
+        duplicates = [c for c in REQUIRED if header.count(c) > 1]
+        if duplicates:
+            raise ValueError(f"line 1: duplicated required header column(s): {', '.join(duplicates)}")
+        for row in reader:
+            line = reader.line_num
+            absent = [c for c in REQUIRED if row[c] is None]
+            if absent:
+                raise ValueError(f"line {line}: row missing required column(s): {', '.join(absent)}")
             out[row["name"], row["stage"]][row["statistic"]] = row["value"]
     return out
 
@@ -120,7 +135,12 @@ def main():
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
     if len(args) != 2:
         sys.exit(__doc__)
-    stats, disasm = load_stats(args[0]), args[1]
+    path = args[0]
+    try:
+        stats = load_stats(path)
+    except (OSError, ValueError, csv.Error) as e:
+        sys.exit(f"{path}: {e}")
+    disasm = args[1]
     rows = []
     for (name, stage), st in sorted(stats.items()):
         src = os.path.join(disasm, name + ".s")

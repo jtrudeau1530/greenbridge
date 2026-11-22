@@ -52,8 +52,18 @@ bool clear_and_read(ID3D12Device* device, DXGI_FORMAT whole_format, DXGI_FORMAT 
 
     const FLOAT full_float[4] = {0.25f, 0.5f, 0.75f, 0.25f}, part_float[4] = {0.0031308f, 0.18f, 0.5f, 0.75f};
     const FLOAT full_uint[4] = {7, 128, 255, 9}, part_uint[4] = {1.5f, 2.5f, 256, -1};
-    const FLOAT* full = whole_format == DXGI_FORMAT_R8G8B8A8_UINT ? full_uint : full_float;
-    const FLOAT* part = rect_format == DXGI_FORMAT_R8G8B8A8_UINT ? part_uint : part_float;
+    const FLOAT full_sint[4] = {-129, -23.75f, 126.75f, 130}, part_sint[4] = {-128, -0.5f, 1.75f, 127};
+    const FLOAT full_snorm[4] = {-1.25f, -0.75f, 0.25f, 1.25f}, part_snorm[4] = {-0.25f, 0.75f, 0.33f, -0.33f};
+    const auto clear_color = [&](DXGI_FORMAT format, bool rectangle) -> const FLOAT* {
+        switch (format) {
+        case DXGI_FORMAT_R8G8B8A8_UINT: return rectangle ? part_uint : full_uint;
+        case DXGI_FORMAT_R8G8B8A8_SINT: return rectangle ? part_sint : full_sint;
+        case DXGI_FORMAT_R8G8B8A8_SNORM: return rectangle ? part_snorm : full_snorm;
+        default: return rectangle ? part_float : full_float;
+        }
+    };
+    const FLOAT* full = clear_color(whole_format, false);
+    const FLOAT* part = clear_color(rect_format, true);
     constexpr unsigned bytes = 4;
     constexpr UINT width = 5, height = 3; // Odd dimensions expose incorrect treatment of footprint padding.
     Ref<ID3D12Resource> image, readback;
@@ -265,7 +275,30 @@ int main() {
             std::fprintf(stderr, "WARP reference unavailable\n");
             return 1;
         }
-        const DXGI_FORMAT formats[] = {DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, DXGI_FORMAT_R8G8B8A8_UINT};
+        const std::vector<DXGI_FORMAT> predication_formats{
+            DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, DXGI_FORMAT_R8G8B8A8_UINT};
+        auto formats = predication_formats;
+        const auto format_properties = vk.instance_fn<PFN_vkGetPhysicalDeviceFormatProperties>(
+            "vkGetPhysicalDeviceFormatProperties");
+        for (const auto [dxgi_format, vk_format] : {
+                 std::pair{DXGI_FORMAT_R8G8B8A8_SINT, VK_FORMAT_R8G8B8A8_SINT},
+                 std::pair{DXGI_FORMAT_R8G8B8A8_SNORM, VK_FORMAT_R8G8B8A8_SNORM}}) {
+            VkFormatProperties properties{};
+            format_properties(vk.physical, vk_format, &properties);
+            D3D12_FEATURE_DATA_FORMAT_SUPPORT warp_support{dxgi_format};
+            if (FAILED(host->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &warp_support, sizeof(warp_support))))
+                return 1;
+            if ((properties.optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT) &&
+                (warp_support.Support1 & D3D12_FORMAT_SUPPORT1_RENDER_TARGET)) {
+                formats.push_back(dxgi_format);
+            } else {
+                std::printf("RGBA8 signed format %d: skipped, color attachment support unavailable\n", int(dxgi_format));
+            }
+        }
+        const auto tolerance_for = [](DXGI_FORMAT format) {
+            // The signed vectors avoid ambiguous half-step normalized inputs.
+            return format == DXGI_FORMAT_R8G8B8A8_UNORM || format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB ? 1 : 0;
+        };
         const auto compare = [&](DXGI_FORMAT full, DXGI_FORMAT rect, bool partial, bool uav) {
             std::vector<unsigned char> actual, expected;
             if (!clear_and_read(ours.p, full, rect, partial, true, uav, actual) ||
@@ -274,7 +307,7 @@ int main() {
             for (std::size_t i = 0; i < actual.size(); ++i) {
                 const std::size_t x = (i / 4) % 5, y = i / 20;
                 const DXGI_FORMAT format = partial && x >= 1 && x < 4 && y >= 1 ? rect : full;
-                const int tolerance = format == DXGI_FORMAT_R8G8B8A8_UINT ? 0 : 1;
+                const int tolerance = tolerance_for(format);
                 if (std::abs(int(actual[i]) - int(expected[i])) > tolerance) {
                     std::fprintf(stderr, "full %d rect %d partial %d UAV %d byte %zu: Vulkan %u, WARP %u\n",
                         int(full), int(rect), int(partial), int(uav), i, unsigned(actual[i]), unsigned(expected[i]));
@@ -311,7 +344,7 @@ int main() {
                                     const std::size_t i = offset + byte;
                                     const bool selected = level == mip && layer >= selection.first &&
                                     layer - selection.first < selection.second;
-                                    const int tolerance = selected && format != DXGI_FORMAT_R8G8B8A8_UINT ? 1 : 0;
+                                    const int tolerance = selected ? tolerance_for(format) : 0;
                                     if (std::abs(int(actual[i]) - int(expected[i])) > tolerance) {
                                         std::fprintf(stderr, "array format %d mip %u partial %d byte %zu: Vulkan %u WARP %u\n",
                                         int(format), mip, int(partial), i, unsigned(actual[i]), unsigned(expected[i]));
@@ -339,7 +372,7 @@ int main() {
                     std::size_t offset = 0;
                     for (UINT level = 0; level < 3; ++level) {
                         const UINT size = std::max(1u, 5u >> level) * std::max(1u, 3u >> level) * 4;
-                        const int tolerance = level == mip && format != DXGI_FORMAT_R8G8B8A8_UINT ? 1 : 0;
+                        const int tolerance = level == mip ? tolerance_for(format) : 0;
                         for (UINT byte = 0; byte < size; ++byte) {
                             if (std::abs(int(actual[offset + byte]) - int(expected[offset + byte])) > tolerance) {
                                 std::fprintf(stderr, "2D mip %u format %d partial %d level %u byte %u mismatch\n",
@@ -359,8 +392,8 @@ int main() {
             for (bool array : {false, true}) {
                 for (bool automatic : {false, true}) {
                     for (UINT mip : {0u, 1u, 2u}) {
-                        for (const auto whole : formats) {
-                            for (const auto part : formats) {
+                        for (const auto whole : predication_formats) {
+                            for (const auto part : predication_formats) {
                                 if (!partial && part != whole) continue; // No rectangle: one case per whole-view format.
                                 for (const auto predicate : {std::pair{false, UINT64_C(0)}, std::pair{true, UINT64_C(0)},
                                      std::pair{true, UINT64_C(1)}, std::pair{true, UINT64_C(1) << 32},
@@ -426,14 +459,15 @@ int main() {
         };
         D3D12_RENDER_TARGET_VIEW_DESC invalid{};
         invalid.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
-        for (const auto format : {DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_R8G8B8A8_TYPELESS, DXGI_FORMAT_R16G16B16A16_FLOAT,
-                                 DXGI_FORMAT_R8G8B8A8_SINT, DXGI_FORMAT_R8G8B8A8_SNORM}) {
+        for (const auto format : {DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_R8G8B8A8_TYPELESS, DXGI_FORMAT_R16G16B16A16_FLOAT}) {
             invalid.Format = format;
             if (!rejects(DXGI_FORMAT_R8G8B8A8_TYPELESS, &invalid)) return 1;
         }
         if (!rejects(DXGI_FORMAT_R8G8B8A8_TYPELESS, nullptr)) return 1;
-        invalid.Format = DXGI_FORMAT_R8G8B8A8_UINT;
-        if (!rejects(DXGI_FORMAT_R8G8B8A8_UNORM, &invalid)) return 1;
+        for (const auto format : {DXGI_FORMAT_R8G8B8A8_SINT, DXGI_FORMAT_R8G8B8A8_SNORM, DXGI_FORMAT_R8G8B8A8_UINT}) {
+            invalid.Format = format;
+            if (!rejects(DXGI_FORMAT_R8G8B8A8_UNORM, &invalid)) return 1;
+        }
         invalid.Texture2D.MipSlice = 1;
         if (!rejects(DXGI_FORMAT_R8G8B8A8_TYPELESS, &invalid)) return 1;
         invalid.Texture2D.MipSlice = 0;

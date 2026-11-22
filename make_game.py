@@ -39,6 +39,7 @@ import stat
 import subprocess
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 TOOLS = os.path.join(ROOT, "tools")
@@ -739,7 +740,8 @@ WAVE64_MODES = ("auto", "on", "off")
 
 # The translator's fallback flags make_game.py can forward, and the argparse attribute each one reads.
 FALLBACK_FLAGS = (("--no-float-controls", "no_float_controls"), ("--bary-fallback", "bary_fallback"),
-                  ("--texel-offset-fallback", "texel_offset_fallback"), ("--mesh-compute", "mesh_compute"))
+                  ("--texel-offset-fallback", "texel_offset_fallback"), ("--mesh-compute", "mesh_compute"),
+                  ("--f16-interp-fallback", "f16_interp_fallback"))
 
 
 def fallback_flags(a) -> tuple[str, ...]:
@@ -808,8 +810,20 @@ def runtime_gpu_native64():
         return None
 
 
+def runtime_gpu_per_vertex():
+    """per_vertex_inputs as tools/vk_subgroup_info.py answers for the GPU the runtime would use: False where the
+    driver can't compile PerVertexKHR (MoltenVK) or lacks fragmentShaderBarycentric, None when it can't tell."""
+    try:
+        r = subprocess.run([sys.executable, "-I", os.path.join(TOOLS, "vk_subgroup_info.py")],
+                           capture_output=True, text=True, timeout=60)
+        v = json.loads(r.stdout.strip().splitlines()[-1]).get("per_vertex_inputs")
+        return None if v is None else bool(v)
+    except (OSError, ValueError, IndexError, subprocess.SubprocessError):
+        return None
+
+
 # Source and data files that produce the translated modules, metadata and partner stubs.
-TRANSLATION_SOURCES = ("rdna2spirv.py", "shader_ir.py", "cfg_structure.py", "fssm_header.py", "lane_masks.py",
+TRANSLATION_SOURCES = ("rdna2spirv.py", "shader_ir.py", "cfg_structure.py", "fssm_header.py", "lane_masks.py", "wave64_halves.py",
                        "shader_meta.py", "spirv_stubs.py", "gfx10_formats.json")
 
 
@@ -955,15 +969,29 @@ def assets(game: str, work: str, wav: bool, jobs: int) -> None:
     for root, _, files in os.walk(game):
         pools += [os.path.join(root, f) for f in files if f.lower().endswith(".ttpf")]
     settings = ttpf_assets.load_profile(work) if pools else None
-    for p in sorted(pools, key=os.path.getsize):
+    # rpf9dump names each pool's output folder after the source basename. Pools with the same basename
+    # in one destination namespace would share that folder and its manifest, so the second pool would
+    # look already exported and lose all its DDS. Give every member of a colliding group its own
+    # export root, keyed off the relative source path; unique pools keep their current folder.
+    info = []
+    for p in pools:
         name = os.path.splitext(os.path.basename(p))[0]
         parts = os.path.relpath(p, game).replace("\\", "/").split("/")
         dest = os.path.join(out, "ttpf_pack", parts[1]) if parts[0] == "pack" else os.path.join(out, "ttpf")
-        pool_dir = os.path.join(dest, name)
+        info.append((p, name, dest, "/".join(parts)))
+    counts = {}
+    for _, name, dest, _ in info:
+        key = (os.path.normcase(dest), os.path.normcase(name))
+        counts[key] = counts.get(key, 0) + 1
+    for p, name, dest, rel in sorted(info, key=lambda x: os.path.getsize(x[0])):
+        root = dest
+        if counts[(os.path.normcase(dest), os.path.normcase(name))] > 1:
+            root = os.path.join(dest, f"{name}~{hashlib.sha256(rel.encode('utf-8')).hexdigest()[:12]}")
+        pool_dir = os.path.join(root, name)
         manifest = ttpf_manifest(pool_dir)
         if manifest is None:
             log(f"assets: texture pool {os.path.relpath(p, game)}")
-            run([get_exporter(work), "ttpf", p, dest])
+            run([get_exporter(work), "ttpf", p, root])
             manifest = ttpf_manifest(pool_dir)
             if manifest is None:
                 fail(f"Texture exporter did not publish a complete manifest in {pool_dir}")
@@ -997,7 +1025,7 @@ def assets(game: str, work: str, wav: bool, jobs: int) -> None:
     # Every run: decodes what a stopped or failed run left, and everything once ffmpeg is installed later.
     ff = shutil.which("ffmpeg")
     if ff:
-        decode_xma(ff, xma_dir)
+        decode_xma(ff, xma_dir, jobs)
     else:
         log("assets: ffmpeg not on PATH: XMA2 streams kept as .xma.wav (ffmpeg decodes them)")
     log("assets: done")
@@ -1019,15 +1047,15 @@ def pending_xma(xma_dir: str) -> list:
     return todo
 
 
-def decode_xma(ff: str, xma_dir: str) -> None:
+def decode_xma(ff: str, xma_dir: str, jobs: int = 1) -> None:
     """XMA2 (.xma.wav) -> 16-bit PCM .wav with ffmpeg, for each stream that has no .wav yet. ffmpeg writes to a
     temporary name that is renamed when it succeeds, so a stopped or failed decode never leaves a short .wav."""
     todo = pending_xma(xma_dir)
     if not todo:
         return
     log(f"assets: XMA2 -> PCM WAV (ffmpeg), {len(todo)} stream(s)")
-    bad = []
-    for src in sorted(todo):
+
+    def one(src: str) -> bool:
         dst = src[:-8] + ".wav"
         tmp = dst + ".part"
         # No stdin: ffmpeg reads it for key commands, which stops a build started in the background of a terminal.
@@ -1035,10 +1063,16 @@ def decode_xma(ff: str, xma_dir: str) -> None:
                            stdin=subprocess.DEVNULL)
         if r.returncode == 0 and os.path.isfile(tmp):
             os.replace(tmp, dst)
-        else:
-            bad.append(src)
-            if os.path.isfile(tmp):
-                os.remove(tmp)
+            return True
+        if os.path.isfile(tmp):
+            os.remove(tmp)
+        return False
+
+    todo = sorted(todo)
+    # One ffmpeg per stream, `jobs` at a time; the threads only wait on their process. map keeps the order, so the
+    # first failure reported is the same as one at a time.
+    with ThreadPoolExecutor(max_workers=jobs) as ex:
+        bad = [src for src, good in zip(todo, ex.map(one, todo)) if not good]
     if bad:
         log(f"assets: ffmpeg could not decode {len(bad)} XMA2 stream(s), first {os.path.relpath(bad[0], xma_dir)}. "
             "They stay as .xma.wav; the next run tries them again.")
@@ -1202,6 +1236,9 @@ def main() -> int:
     ap.add_argument("--texel-offset-fallback", action="store_true",
                     help="fold the run-time texel offset of image_sample*_o into the coordinate, for devices "
                          "without VK_KHR_maintenance8")
+    ap.add_argument("--f16-interp-fallback", action="store_true",
+                    help="16-bit interpolation from decoded halves the vertex/mesh shader exports instead of "
+                         "PerVertexKHR inputs; on by itself when the runtime's GPU can't use them (MoltenVK)")
     ap.add_argument("--mesh-compute", action="store_true",
                     help="translate mesh shaders to compute shaders writing an output buffer, for devices "
                          "without VK_EXT_mesh_shader")
@@ -1267,6 +1304,10 @@ def main() -> int:
                 "(or pass --runtime-build)")
     emulate = "shaders" in stages and wave64_emulate(a.wave64_emulate)
     keep_emulated = a.wave64_emulate == "auto"
+    if "shaders" in stages and not a.f16_interp_fallback and runtime_gpu_per_vertex() is False:
+        log("shaders: the GPU the runtime would use can't take PerVertexKHR inputs (MoltenVK, or no "
+            "fragmentShaderBarycentric): translating with --f16-interp-fallback")
+        a.f16_interp_fallback = True
     fallbacks = fallback_flags(a) if "shaders" in stages else ()
     preflight(stages, work, a.wav, runtime_build, emulate=emulate, keep_emulated=keep_emulated,
               fallbacks=fallbacks, jobs=a.jobs)
@@ -1286,6 +1327,14 @@ def main() -> int:
 
 def cli() -> int:
     """main(), with Ctrl+C reported in one line instead of a traceback: every stage resumes on the next run."""
+    # A redirected stdout (make_game.py > build.log) is encoded with the console's ANSI code page on Windows, and
+    # -I ignores PYTHONUTF8, so a character outside that code page -- a Cyrillic, Greek or CJK user name in a
+    # found dump's path or in --out -- raises UnicodeEncodeError and ends the run. stderr escapes such
+    # characters already (backslashreplace); stdout is strict, so write '?' where the code page has no glyph.
+    try:
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
     try:
         return main()
     except KeyboardInterrupt:

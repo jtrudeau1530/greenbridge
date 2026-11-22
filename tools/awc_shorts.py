@@ -16,11 +16,13 @@ import csv
 import os
 import struct
 import sys
+import tempfile
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 # -I keeps the script directory off sys.path.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import awc_opus as awc  # noqa: E402
+from file_mode import published_mode  # noqa: E402
 
 FIELDS = ("bank", "stream", "duration_s", "channels", "packets", "file")
 
@@ -99,14 +101,28 @@ def main(argv=None) -> int:
         print(f"awc_shorts: error: source does not exist: {a.src!r}", file=sys.stderr)
         return 2
     banks = _banks(a.src)
-    os.makedirs(a.out, exist_ok=True)
+    try:
+        os.makedirs(a.out, exist_ok=True)
+    except OSError as e:
+        print(f"awc_shorts: cannot create {a.out}: {e}", file=sys.stderr)
+        return 1
     rows = []
+    io_failed = False
+
+    def report_failure(bank, error):
+        nonlocal io_failed
+        if isinstance(error, OSError):
+            io_failed = True
+            print(f"  FAILED {bank}: {error}", file=sys.stderr)
+        else:
+            print(f"  skip {bank}: {error}", file=sys.stderr)
+
     if a.jobs == 1:
         for i, (path, bank) in enumerate(banks, 1):
             try:
                 rows += export_bank(path, a.out, a.min_seconds, a.max_seconds, bank=bank)
             except (ValueError, struct.error, OSError, IndexError) as e:
-                print(f"  skip {bank}: {e}", file=sys.stderr)
+                report_failure(bank, e)
             if i % 200 == 0:
                 print(f"  {i}/{len(banks)} banks, {len(rows)} clips", flush=True)
     else:
@@ -117,17 +133,32 @@ def main(argv=None) -> int:
                 try:
                     rows += fut.result()
                 except (ValueError, struct.error, OSError, IndexError) as e:
-                    print(f"  skip {futures[fut]}: {e}", file=sys.stderr)
+                    report_failure(futures[fut], e)
                 if i % 200 == 0:
                     print(f"  {i}/{len(banks)} banks, {len(rows)} clips", flush=True)
+    if io_failed:
+        return 1
     rows.sort(key=lambda r: (r["bank"].lower(), r["stream"]))
-    with open(os.path.join(a.out, "shorts.csv"), "w", encoding="utf-8", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=FIELDS, lineterminator="\n")
-        w.writeheader()
-        w.writerows(rows)
+    catalog = os.path.join(a.out, "shorts.csv")
+    try:
+        with tempfile.TemporaryDirectory(dir=a.out, prefix=".shorts-") as staging:
+            staged = os.path.join(staging, "shorts.csv")
+            with open(staged, "w", encoding="utf-8", newline="") as f:
+                w = csv.DictWriter(f, fieldnames=FIELDS, lineterminator="\n")
+                w.writeheader()
+                w.writerows(rows)
+            os.chmod(staged, published_mode(catalog))
+            os.replace(staged, catalog)
+    except OSError as e:
+        print(f"awc_shorts: cannot write {catalog}: {e}", file=sys.stderr)
+        return 1
     print(f"{len(banks)} banks: {len(rows)} short streamed-music channels -> {a.out}", flush=True)
     return 0
 
 
 if __name__ == "__main__":
+    try:  # a redirected stdout is strict ANSI code page under -I; write '?' for what it cannot encode
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
     sys.exit(main())

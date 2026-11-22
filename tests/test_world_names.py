@@ -279,6 +279,22 @@ class CliTest(unittest.TestCase):
             self.assertEqual(names, {WN.joaat_hex(name): [name]
                                      for name in ("A&B", "Cell&Prop", "Cell&Prop.rpf")})
 
+    def test_resolve_rejects_a_malformed_dictionary(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dictionary = os.path.join(tmp, "names.json")
+            out = os.path.join(tmp, "report.json")
+            for field, data in (("names", [1]), ("derived", {"00000000": "name"}),
+                                ("names", {"00000000": [42]})):
+                with self.subTest(field=field, data=data):
+                    with open(dictionary, "w", encoding="utf-8") as handle:
+                        json.dump({"format": 1, field: data}, handle)
+                    err = io.StringIO()
+                    with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+                        self.assertNotEqual(WN.main(["resolve", "--dict", dictionary, "--out", out]), 0)
+                    self.assertIn(dictionary, err.getvalue())
+                    self.assertIn(field, err.getvalue())
+                    self.assertFalse(os.path.exists(out))
+
     def test_resolve_rejects_unrecognized_map_report(self):
         with tempfile.TemporaryDirectory() as tmp:
             dictionary = os.path.join(tmp, "names.json")
@@ -293,6 +309,49 @@ class CliTest(unittest.TestCase):
                 self.assertNotEqual(WN.main(["resolve", "--dict", dictionary, "--maps", maps, "--out", out]), 0)
             self.assertIn(maps, err.getvalue())
             self.assertFalse(os.path.exists(out))
+
+    def test_resolve_out_refuses_to_overwrite_an_input(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dictionary = os.path.join(tmp, "names.json")
+            maps = os.path.join(tmp, "maps.json")
+            archetypes = os.path.join(tmp, "archetypes.json")
+            with open(dictionary, "w", encoding="utf-8") as handle:
+                json.dump(WN.NameDictionary().to_json(), handle)
+            with open(maps, "w", encoding="utf-8") as handle:
+                json.dump({"maps": [{"map_name": WN.joaat("synthetic_cli_prop")}]}, handle)
+            with open(archetypes, "w", encoding="utf-8") as handle:
+                json.dump({"archetypes": {f"{WN.joaat('synthetic_cli_prop'):08x}": 1}}, handle)
+            with open(dictionary, "rb") as handle:
+                dict_bytes = handle.read()
+
+            cases = [
+                ("dict", ["--dict", dictionary]),
+                ("map", ["--dict", dictionary, "--maps", maps]),
+                ("archetype", ["--dict", dictionary, "--archetypes", archetypes]),
+            ]
+            for name, prefix in cases:
+                with self.subTest(input=name):
+                    source = {"dict": dictionary, "map": maps, "archetype": archetypes}[name]
+                    with open(source, "rb") as handle:
+                        original = handle.read()
+                    err = io.StringIO()
+                    with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+                        self.assertNotEqual(WN.main(["resolve", *prefix, "--out", source]), 0)
+                    self.assertIn(source, err.getvalue())
+                    with open(source, "rb") as handle:
+                        self.assertEqual(handle.read(), original)
+
+            # A hard link is another spelling of the same inode.
+            hardlink = os.path.join(tmp, "dict_hardlink.json")
+            try:
+                os.link(dictionary, hardlink)
+            except OSError:
+                self.skipTest("hard links unsupported on this filesystem")
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+                self.assertNotEqual(WN.main(["resolve", "--dict", dictionary, "--out", hardlink]), 0)
+            with open(dictionary, "rb") as handle:
+                self.assertEqual(handle.read(), dict_bytes)
 
     def test_build_and_resolve(self):
         with tempfile.TemporaryDirectory() as tmp:

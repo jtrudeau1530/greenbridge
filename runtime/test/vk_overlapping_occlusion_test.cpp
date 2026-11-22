@@ -15,6 +15,8 @@ namespace {
 using namespace leonida;
 constexpr std::uint32_t side = 8;
 constexpr std::uint32_t query_count = 4;
+constexpr std::uint32_t statistics_count = 4;
+constexpr std::uint32_t statistics_words = 11;  // D3D12_QUERY_DATA_PIPELINE_STATISTICS
 
 VkShaderModule load_shader(vktest::Device& d, const char* path) {
     std::ifstream file(path, std::ios::binary | std::ios::ate);
@@ -104,7 +106,7 @@ struct Fixture {
             pool(d.device, &query, nullptr, &second) != VK_SUCCESS) return false;
         if (d.pipeline_statistics_query) {
             query.queryType = VK_QUERY_TYPE_PIPELINE_STATISTICS;
-            query.queryCount = 1;
+            query.queryCount = statistics_count;
             query.pipelineStatistics = 0x7ff;  // the same counters as the D3D12 heap
             if (pool(d.device, &query, nullptr, &statistics) != VK_SUCCESS) return false;
         }
@@ -162,6 +164,8 @@ int run(vktest::Device& d, const char* vertex, const char* fragment) {
     constexpr std::uint32_t bursts = 130;
     Draws schedule{fixture, {8, 4, 2, 8, 4, 2, 3}};
     schedule.extents.insert(schedule.extents.end(), 2 * bursts + 1, 1);
+    // The statistics lists below: a split query (two segments), two unsplit references and a second split query.
+    if (d.pipeline_statistics_query) schedule.extents.insert(schedule.extents.end(), {3, 5, 3, 5, 3, 5});
     schedule.extents.insert(schedule.extents.end(), {2, 0, 0, 0});
     draws = &schedule;
     VulkanContext context(get_device_proc, d.device, true, d.conditional_rendering);
@@ -193,6 +197,7 @@ int run(vktest::Device& d, const char* vertex, const char* fragment) {
     dst.buffer = d.buffer(size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, &mapping);
     dst.buffer_offset = binding_offset;
     dst.size = size - binding_offset;
+    dst.host_readable = true;  // ResolveQueryData writes results that the CPU reads below.
     EXPECT(dst.buffer && mapping);
     std::memset(mapping, 0xcd, size);
     context.add_resource(dst_id, dst);
@@ -264,15 +269,47 @@ int run(vktest::Device& d, const char* vertex, const char* fragment) {
     const CommandList* invalid[] = {&duplicate};
     EXPECT(queue.execute(invalid) == ReplayResult::invalid_query);
 
+    // D3D-162: an occlusion sum inside a pipeline-statistics query. Its dispatch must not reach the application's
+    // counters, so the queue splits the statistics query around the resolve and sums the segments. Each segment
+    // gets one native draw before it ends (extents 3 and 5); two unsplit queries with the same draws are the
+    // reference, and CSInvocations stays 0 because no application compute runs.
+    constexpr ResourceId stats_dst_id = 6;
+    constexpr VkDeviceSize stats_result = statistics_words * sizeof(std::uint64_t), stats_slots = 5;
+    void* stats_mapping = nullptr;
+    ResourceBinding stats_dst{};
     if (fixture.statistics) {
-        context.add_query_pool(stats, {fixture.statistics, d3d12_query_heap::pipeline_statistics, 1, false, {false}});
-        CommandList incompatible;
-        EXPECT(incompatible.begin_query({stats, d3d12_query::pipeline_statistics, 0}));
-        EXPECT(incompatible.resolve_queries({a, occ, 3, 1, dst_id, 0}));
-        EXPECT(incompatible.end_query({stats, d3d12_query::pipeline_statistics, 0}));
-        EXPECT(incompatible.close());
-        const CommandList* rejected[] = {&incompatible};
-        EXPECT(queue.execute(rejected) == ReplayResult::unsupported);  // the dispatch would change CSInvocations
+        constexpr auto pipeline_statistics = d3d12_query::pipeline_statistics;
+        context.add_query_pool(stats, {fixture.statistics, d3d12_query_heap::pipeline_statistics, statistics_count,
+                                       false, std::vector<bool>(statistics_count, false)});
+        stats_dst.size = stats_slots * stats_result;
+        stats_dst.buffer = d.buffer(stats_dst.size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, &stats_mapping);
+        EXPECT(stats_dst.buffer && stats_mapping);
+        std::memset(stats_mapping, 0xcd, stats_dst.size);
+        context.add_resource(stats_dst_id, stats_dst);
+        CommandList split;
+        EXPECT(split.begin_query({stats, pipeline_statistics, 0}));
+        EXPECT(split.resolve_queries({a, occ, 3, 1, dst_id, 0}));  // 261 segments: a sum dispatch
+        EXPECT(split.end_query({stats, pipeline_statistics, 0}));
+        EXPECT(split.resolve_queries({stats, pipeline_statistics, 0, 1, stats_dst_id, 0}));
+        EXPECT(split.close());
+        CommandList reference;
+        for (std::uint32_t index : {1u, 2u}) {
+            EXPECT(reference.begin_query({stats, pipeline_statistics, index}));
+            EXPECT(reference.end_query({stats, pipeline_statistics, index}));
+        }
+        EXPECT(reference.resolve_queries({stats, pipeline_statistics, 1, 2, stats_dst_id, stats_result}));
+        EXPECT(reference.close());
+        // The statistics sum of query 0 is a helper dispatch too, inside query 3.
+        CommandList nested_sum;
+        EXPECT(nested_sum.begin_query({stats, pipeline_statistics, 3}));
+        EXPECT(nested_sum.resolve_queries({stats, pipeline_statistics, 0, 1, stats_dst_id, 4 * stats_result}));
+        EXPECT(nested_sum.end_query({stats, pipeline_statistics, 3}));
+        EXPECT(nested_sum.resolve_queries({stats, pipeline_statistics, 3, 1, stats_dst_id, 3 * stats_result}));
+        EXPECT(nested_sum.close());
+        const CommandList* statistics_lists[] = {&split, &reference};
+        EXPECT(queue.execute(statistics_lists) == ReplayResult::success);
+        const CommandList* nested_lists[] = {&nested_sum};
+        EXPECT(queue.execute(nested_lists) == ReplayResult::success);
     }
 
     // Overwrite every result from the first physical pool while the GPU is still gated. The first two
@@ -290,10 +327,11 @@ int run(vktest::Device& d, const char* vertex, const char* fragment) {
     EXPECT(gate.signal(1));
     EXPECT(queue.idle());
 
-    const std::map<VkDeviceSize, std::uint64_t> expected = {
+    std::map<VkDeviceSize, std::uint64_t> expected = {
         {8, 80}, {24, 80}, {32, 20}, {40, 84}, {48, 16}, {56, 0}, {64, 1}, {72, 80}, {80, 1},
         {88, 2 * bursts + 1}, {96, 1}, {112, 4}, {120, 0},
     };
+    if (fixture.statistics) expected[0] = 2 * bursts + 1;  // the sum resolved inside the statistics query
     for (VkDeviceSize offset = 0; offset < size; offset += 8) {
         const auto it = expected.find(offset - binding_offset);
         const auto want = it == expected.end() ? 0xcdcdcdcdcdcdcdcdULL : it->second;
@@ -304,6 +342,31 @@ int run(vktest::Device& d, const char* vertex, const char* fragment) {
                          static_cast<unsigned long long>(actual), static_cast<unsigned long long>(want));
             return 1;
         }
+    }
+    if (fixture.statistics) {
+        // Slots: 0 the split query, 1 and 2 the references, 3 the second split query, 4 query 0 summed inside it.
+        const auto word = [&](VkDeviceSize slot, std::uint32_t counter) {
+            std::uint64_t value = 0;
+            std::memcpy(&value, static_cast<const char*>(stats_mapping) + slot * stats_result + counter * 8, 8);
+            return value;
+        };
+        constexpr std::uint32_t cs_invocations = 10;
+        for (std::uint32_t counter = 0; counter < statistics_words; ++counter) {
+            const std::uint64_t want = word(1, counter) + word(2, counter);
+            for (VkDeviceSize slot : {0, 3, 4}) {
+                if (word(slot, counter) != want) {
+                    std::fprintf(stderr, "statistics slot %llu counter %u: got %llu, wanted %llu\n",
+                                 static_cast<unsigned long long>(slot), counter,
+                                 static_cast<unsigned long long>(word(slot, counter)),
+                                 static_cast<unsigned long long>(want));
+                    return 1;
+                }
+            }
+        }
+        EXPECT(word(0, cs_invocations) == 0 && word(1, 0) != 0 && word(2, 0) != 0);
+        std::printf("statistics split around a sum: IA vertices %llu, PS invocations %llu, CS invocations 0, "
+                    "equal to two unsplit queries\n",
+                    static_cast<unsigned long long>(word(0, 0)), static_cast<unsigned long long>(word(0, 7)));
     }
     std::printf("crossing 80/20; nested 84/16; %u segments summed; alternating binary results 1/1; "
                 "offsets and gated overwrites exact\n",

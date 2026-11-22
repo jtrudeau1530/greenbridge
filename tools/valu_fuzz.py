@@ -30,7 +30,9 @@ compared, so float rounding conventions can't masquerade as findings.
 A mismatch is printed with the thread, register, the two values and the op that last wrote the register, plus a
 --show line. --skip-op OP leaves an op out without changing the rest of the program, to set a known finding aside.
 Exit code: 0 when every program that ran matches, 1 on a mismatch or an untranslated program, 2 on a harness error
-or when nothing ran. Needs vk_compute_test's VKC_DUMP / VKC_OUT_WORDS (from FUZZ-6, #368).
+or when nothing ran. Needs vk_compute_test's VKC_DUMP / VKC_OUT_WORDS (from FUZZ-6, #368). A wave32 program is
+skipped where vk_compute_test can't pin 32-lane subgroups ("compute subgroup size: 32 not available", e.g. Mesa
+llvmpipe at 8 lanes); wave64 programs translated with --emulate use no subgroup operations and run at any size.
 
 Needs llvm-mc 21 or newer for --family f16 (docs/testing.md): llvm-mc 18 rejects op_sel on the 16-bit integer VOP3
 forms, so no f16 program assembles and the run stops with exit code 2. --family mem assembles with 18.
@@ -53,7 +55,7 @@ sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.join(ROOT, "runtime", "test", "shaders"))
 import mc_command  # noqa: E402
 from hw_oracle import asm  # noqa: E402
-from compute_fixture import compute_header, find_test_program  # noqa: E402
+from compute_fixture import compute_header, find_test_program, unpinned_subgroup  # noqa: E402
 
 THREADS = 64
 PERTURB = set()   # deliberately wrong models for --negative-control (see PERTURBATIONS)
@@ -988,6 +990,14 @@ def run_translator(progs, a):
             skipped += 1
             print(f"SKIP {p.name}: {msg.splitlines()[-1] if msg else 'unsupported'}")
             continue
+        # A wave32 program needs 32-lane subgroups. Where vk_compute_test couldn't pin them, its words come from
+        # another wave size and are no evidence either way. --wave64-emulate output uses no subgroup operations.
+        lanes = unpinned_subgroup(msg) if p.wave == 32 else None
+        if lanes:
+            skipped += 1
+            print(f"SKIP {p.name}: the device can't run it at {lanes} lanes "
+                  f"(vk_compute_test: compute subgroup size: {lanes} not available)")
+            continue
         data = dump.read_bytes() if dump.is_file() else b""
         if rc != 0 or len(data) != 4 * p.out_words():
             errors += 1
@@ -1112,4 +1122,8 @@ def main():
 
 
 if __name__ == "__main__":
+    try:  # a redirected stdout is strict ANSI code page under -I; write '?' for what it cannot encode
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
     sys.exit(main())

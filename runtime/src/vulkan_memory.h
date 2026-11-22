@@ -8,7 +8,9 @@
 #endif
 #include <vulkan/vulkan.h>
 
+#include <algorithm>
 #include <cstdint>
+#include <vector>
 
 namespace leonida {
 
@@ -31,6 +33,27 @@ inline bool resizable_bar(const VkPhysicalDeviceMemoryProperties& memory) {
         if ((heap.flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) && heap.size > kBarWindowBytes) return true;
     }
     return false;
+}
+
+// The memory types to try for an allocation of `size` bytes, best first: those with `required | preferred`, then
+// those with only `required`. A type whose heap is smaller than the allocation is left out, as the allocation would
+// break VUID-vkAllocateMemory-pAllocateInfo-01713 (some drivers still return VK_SUCCESS). Without Resizable BAR the
+// heap of DEVICE_LOCAL | HOST_VISIBLE memory is typically 256 MiB or less, so a larger host-visible allocation falls
+// through to system memory. A heap that is big enough but already partly used is left to the driver: a failed
+// vkAllocateMemory moves on to the next type.
+inline std::vector<std::uint32_t> memory_type_order(const VkPhysicalDeviceMemoryProperties& memory,
+                                                    std::uint32_t type_bits, VkMemoryPropertyFlags required,
+                                                    VkMemoryPropertyFlags preferred, VkDeviceSize size) {
+    std::vector<std::uint32_t> order;
+    for (const VkMemoryPropertyFlags flags : {required | preferred, required}) {
+        for (std::uint32_t i = 0; i < memory.memoryTypeCount && i < VK_MAX_MEMORY_TYPES; ++i) {
+            const VkMemoryType& type = memory.memoryTypes[i];
+            if (!(type_bits & (1u << i)) || (type.propertyFlags & flags) != flags) continue;
+            if (type.heapIndex >= memory.memoryHeapCount || memory.memoryHeaps[type.heapIndex].size < size) continue;
+            if (std::find(order.begin(), order.end(), i) == order.end()) order.push_back(i);
+        }
+    }
+    return order;
 }
 
 }  // namespace leonida

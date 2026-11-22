@@ -224,10 +224,15 @@ def build_synthetic_awc(stream_specs):
 
     Each item in `stream_specs` is a dict:
       `{"id": int, "rsc8": bytes, "samples": int, "rate": int, "codec": int, "channels": int}`
+
+    A spec may also carry `"extra_tags": {0x5A: bytes, 0xD9: bytes, ...}`; each payload is
+    appended after the fixed companions and gets its own tag row.
     """
     n = len(stream_specs)
-    # 7 tags per stream: 0x36, 0x55, 0x5c, 0x76, 0xa3, 0xb2, 0xbd
-    hdr_sz = 16 + 4 * n + 8 * (7 * n)
+    extra_per_stream = [spec.get("extra_tags") or {} for spec in stream_specs]
+    tag_total = sum(7 + len(extra) for extra in extra_per_stream)
+    # 7 fixed tags per stream (0x36, 0x55, 0x5c, 0x76, 0xa3, 0xb2, 0xbd) plus the extras
+    hdr_sz = 16 + 4 * n + 8 * tag_total
     data_buf = bytearray()
     tag_tables = []
 
@@ -269,6 +274,12 @@ def build_synthetic_awc(stream_specs):
         ob2 = hdr_sz + len(data_buf)
         data_buf.extend(struct.pack("<IfIf", 0, -37.5, 4800, -38.0))
 
+        extra_rows = []
+        for tt, payload in sorted((spec.get("extra_tags") or {}).items()):
+            oxx = hdr_sz + len(data_buf)
+            data_buf.extend(payload)
+            extra_rows.append((tt, len(payload), oxx))
+
         tag_tables.append([
             (0x36, 12, o36),
             (0x55, s55, o55),
@@ -277,7 +288,7 @@ def build_synthetic_awc(stream_specs):
             (0xA3, 12, oa3),
             (0xB2, 16, ob2),
             (0xBD, 16, obd),
-        ])
+        ] + extra_rows)
 
     hdr = bytearray()
     hdr.extend(struct.pack("<4sIII", b"ADAT", 0xFF020001, n, hdr_sz))
@@ -595,6 +606,57 @@ class AwcAndArchiveScanTest(unittest.TestCase):
             self.assertEqual(result.returncode, 2, result.stderr)
             self.assertIn("output must not overwrite the source file", result.stderr)
 
+    def test_window_edges_inside_a_bank(self):
+        """--start/--limit inside a bank: adat_bytes stays within the span, and RSC8 headers in a bank that
+        started before the window are not reported as outside ADAT."""
+        c0 = build_synthetic_rsc8(stream_hash=0x20112233, frames=142)
+        c1 = build_synthetic_rsc8(stream_hash=0x80778899, frames=74, inline_dict_name=True)
+        bank = build_synthetic_awc([
+            {"id": 0x00112233, "rsc8": c0, "samples": 89600},
+            {"id": 0x00778899, "rsc8": c1, "samples": 28800},
+        ])
+        stray = build_synthetic_rsc8(stream_hash=0x11112222, frames=61)
+        with tempfile.TemporaryDirectory() as tmp:
+            rpf = os.path.join(tmp, "synth.rpf")
+            with open(rpf, "wb") as f:
+                f.write(b"9FPR" + struct.pack("<III", 0x100, 0, 0) + bytes(0xF0))
+                boff = f.tell()
+                f.write(bank)
+                f.write(bytes(0x80))
+                soff = f.tell()
+                f.write(stray)
+            _, full = rsc8_audio.scan_rpf(rpf)
+            bank_size = full["adat_bytes"]
+            self.assertGreater(bank_size, 4 * 256)
+
+            # The window ends halfway through the bank: decoded whole, counted up to the window's end.
+            _, w = rsc8_audio.scan_rpf(rpf, start=boff, limit=bank_size // 2)
+            self.assertEqual((w["adat_banks"], w["rsc8_in_adat"]), (1, 2))
+            self.assertEqual(w["adat_bytes"], w["span"])
+            self.assertEqual((w["adat_banks_past_window"], w["adat_bytes_past_window"]),
+                             (1, bank_size - bank_size // 2))
+            # The rest of the bank, in the next window, completes the archive's ADAT bytes.
+            _, rest = rsc8_audio.scan_rpf(rpf, start=boff + bank_size // 2)
+            self.assertEqual(w["adat_bytes"] + rest["adat_bytes"], bank_size)
+            self.assertEqual(rest["adat_banks"], 0)
+
+            # The window starts inside the bank (looked back over several scan chunks): only the stray clip
+            # after the bank is outside ADAT.
+            old_chunk = rsc8_audio.SCAN_CHUNK_BYTES
+            try:
+                rsc8_audio.SCAN_CHUNK_BYTES = 256
+                for st in (boff + 16, boff + bank_size - 64):
+                    _, w = rsc8_audio.scan_rpf(rpf, start=st)
+                    self.assertEqual((w["adat_banks"], w["rsc8_outside_adat"]), (0, 1), st)
+                    self.assertEqual(w["window_starts_in_bank"], boff)
+                    self.assertEqual(w["adat_bytes"], boff + bank_size - st)
+                # Past the bank's end, no bank covers the start.
+                _, w = rsc8_audio.scan_rpf(rpf, start=soff - 0x40)
+            finally:
+                rsc8_audio.SCAN_CHUNK_BYTES = old_chunk
+            self.assertEqual((w["rsc8_outside_adat"], w["window_starts_in_bank"]), (1, None))
+            self.assertEqual((full["adat_banks_past_window"], full["window_starts_in_bank"]), (0, None))
+
     def test_cli_validation_errors(self):
         with tempfile.TemporaryDirectory() as tmp:
             missing = os.path.join(tmp, "missing.rpf")
@@ -667,7 +729,260 @@ class AwcAndArchiveScanTest(unittest.TestCase):
                 with open(out_json, encoding="utf-8") as f:
                     rep = json.load(f)
                 self.assertEqual(rep["records"], [])
-                self.assertGreaterEqual(rep["summary"]["rsc8_valid"], 1)
+
+def build_synthetic_empty_bank(flags=0xFF210001, hdr_sz=20):
+    """Build a synthetic zero-stream ADAT bank whose flag-selected tables fill the header exactly.
+
+    With `count == 0` the `0x10000` table contributes no bytes and `0x200000` adds `(count + 1) * 4`
+    bytes, so the header is the 16-byte prefix plus 4 bytes when that bit is set (the measured
+    20-byte shape), or exactly 16 bytes with no table flags.
+    """
+    if flags & 0x00400000:
+        raise ValueError("synthetic shape does not model the 0x400000 table")
+    expected = 16 + (4 if flags & 0x00200000 else 0)
+    if hdr_sz != expected:
+        raise ValueError(f"tables end at {expected}, not {hdr_sz}")
+    return b"ADAT" + struct.pack("<III", flags, 0, hdr_sz) + bytes(hdr_sz - 16)
+
+
+class ZeroStreamBankTest(unittest.TestCase):
+    def test_parses_when_tables_fill_the_header(self):
+        bank20 = build_synthetic_empty_bank()
+        parsed = rsc8_audio.parse_adat_header_bytes(bank20, 0, len(bank20))
+        self.assertIsNotNone(parsed)
+        self.assertEqual(parsed["count"], 0)
+        self.assertEqual(parsed["header_size"], 20)
+        self.assertEqual(parsed["end"], 20)
+        self.assertEqual(parsed["entries"], [])
+
+        bank16 = build_synthetic_empty_bank(flags=0, hdr_sz=16)
+        parsed16 = rsc8_audio.parse_adat_header_bytes(bank16, 0, len(bank16))
+        self.assertIsNotNone(parsed16)
+        self.assertEqual(parsed16["header_size"], 16)
+        self.assertEqual(parsed16["end"], 16)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "empty.awc")
+            with open(path, "wb") as f:
+                f.write(bank20)
+            with open(path, "rb") as f:
+                from_file = rsc8_audio.parse_adat_at_file(f, 0, os.path.getsize(path))
+            self.assertIsNotNone(from_file)
+            self.assertEqual(from_file["count"], 0)
+
+    def test_rejects_header_slop_and_truncation(self):
+        # Declared size 24 but the flag-selected tables end at 20: unaccounted bytes.
+        slop = b"ADAT" + struct.pack("<III", 0xFF210001, 0, 24) + bytes(8)
+        self.assertIsNone(rsc8_audio.parse_adat_header_bytes(slop, 0, len(slop)))
+
+        # Header says 20 but the buffer/file is shorter.
+        short = build_synthetic_empty_bank()[:18]
+        self.assertIsNone(rsc8_audio.parse_adat_header_bytes(short, 0, len(short)))
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "short.awc")
+            with open(path, "wb") as f:
+                f.write(short)
+            with open(path, "rb") as f:
+                self.assertIsNone(rsc8_audio.parse_adat_at_file(f, 0, os.path.getsize(path)))
+
+        # A zero count cannot rescue an out-of-bounds header.
+        oob = build_synthetic_empty_bank()
+        self.assertIsNone(rsc8_audio.parse_adat_header_bytes(oob, 8, len(oob)))
+
+    def test_decode_and_scan_count_empty_banks(self):
+        empty = build_synthetic_empty_bank()
+        decoded = rsc8_audio.decode_awc_bank(empty)
+        self.assertEqual(decoded["stream_count"], 0)
+        self.assertEqual(decoded["records"], [])
+        self.assertEqual(decoded["bank_size"], 20)
+
+        clip = build_synthetic_rsc8(stream_hash=0x20112233, frames=90)
+        speech = build_synthetic_awc([{"id": 0x00112233, "rsc8": clip, "samples": 48000}])
+        with tempfile.TemporaryDirectory() as tmp:
+            rpf = os.path.join(tmp, "synth.rpf")
+            with open(rpf, "wb") as f:
+                f.write(b"9FPR" + struct.pack("<III", 0x100, 0, 0) + bytes(0xF0))
+                f.write(speech)
+                f.write(bytes(0x40))
+                f.write(empty)
+                f.write(bytes(0x40))
+
+            records, summary = rsc8_audio.scan_rpf(rpf)
+            self.assertEqual(summary["adat_banks"], 2)
+            self.assertEqual(summary["adat_streams"], 1)
+            self.assertEqual(summary["rsc8_in_adat"], 1)
+            self.assertEqual(summary["rsc8_valid"], 1)
+            self.assertEqual(summary["rsc8_outside_adat"], 0)
+            self.assertEqual(len(records), 1)
+
+            # A directory scan sees the empty bank as a valid bank with no records, not an
+            # invalid file.
+            awc_path = os.path.join(tmp, "empty.awc")
+            with open(awc_path, "wb") as f:
+                f.write(empty)
+            out_json = os.path.join(tmp, "report.json")
+            cp = subprocess.run(
+                [sys.executable, "-I", TOOL, tmp, out_json, "--quiet"],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(cp.returncode, 0, cp.stderr)
+
+def build_minimal_tag_bank(sid, tags):
+    """Build a one-stream ADAT bank whose stream carries exactly `tags` ({tag: payload}, max 7)."""
+    assert 1 <= len(tags) <= 7
+    hdr_sz = 16 + 4 + 8 * len(tags)
+    rows = []
+    parts = []
+    off = hdr_sz
+    for tt, payload in sorted(tags.items()):
+        rows.append((tt, len(payload), off))
+        parts.append(payload)
+        off += len(payload)
+    hdr = bytearray(struct.pack("<4sIII", b"ADAT", 0xFF020001, 1, hdr_sz))
+    hdr += struct.pack("<I", (len(tags) << 29) | (sid & 0x1FFFFFFF))
+    for tt, tsz, toff in rows:
+        hdr += struct.pack("<Q", (tt << 56) | (tsz << 28) | toff)
+    assert len(hdr) == hdr_sz
+    return bytes(hdr) + b"".join(parts)
+
+
+def build_synthetic_grid20(entries):
+    """8-byte header (magic 12345678, unknown) + 20-byte entries, field order as measured."""
+    out = struct.pack("<II", rsc8_audio.GRID20_MAGIC, 7)
+    for value, p, z, lo, hi, s, t, counter in entries:
+        out += struct.pack("<fHHHHHHI", value, p, z, lo, hi, s, t, counter)
+    return out
+
+
+def build_synthetic_indexruns(groups, declared=None, hash_=0x4C633D07):
+    """u32 group count + groups of {u32 2; u32 len; u32 hash; len ascending u32s}."""
+    out = struct.pack("<I", declared if declared is not None else len(groups))
+    for marker, run in groups:
+        out += struct.pack("<III", marker, len(run), hash_) + b"".join(struct.pack("<I", v) for v in run)
+    return out
+
+
+class UndocumentedTagsTest(unittest.TestCase):
+    GRID = build_synthetic_grid20([
+        (14.21, 0, 0, 1, 2, 0x39CC, 0x4C15, 2894),
+        (14.12, 32, 0, 1, 2, 0x4193, 0x4C03, 5181),
+        (14.03, 32, 1, 2, 3, 0x49B5, 0x4B15, 7488),
+    ])
+    RUNS = build_synthetic_indexruns([(2, [1, 5, 9]), (2, [20, 21])])
+
+    def test_grid20_decodes_measured_layout(self):
+        g = rsc8_audio.decode_grid20_table(self.GRID)
+        self.assertTrue(g["size_ok"])
+        self.assertTrue(g["magic_ok"])
+        self.assertEqual(g["unknown"], 7)
+        self.assertEqual(g["entries"], 3)
+        self.assertEqual(g["counter_first"], 2894)
+        self.assertEqual(g["counter_last"], 7488)
+        self.assertTrue(g["counter_increasing"])
+        self.assertTrue(g["p_multiple_of_32"])
+        empty = rsc8_audio.decode_grid20_table(struct.pack("<II", rsc8_audio.GRID20_MAGIC, 0))
+        self.assertTrue(empty["size_ok"] and empty["magic_ok"])
+        self.assertEqual(empty["entries"], 0)
+
+    def test_grid20_flags_violations(self):
+        bad_magic = struct.pack("<II", 87654321, 0) + self.GRID[8:]
+        self.assertFalse(rsc8_audio.decode_grid20_table(bad_magic)["magic_ok"])
+        self.assertFalse(rsc8_audio.decode_grid20_table(self.GRID[:-1])["size_ok"])
+        self.assertFalse(rsc8_audio.decode_grid20_table(self.GRID[:6])["size_ok"])
+        flat = build_synthetic_grid20([
+            (1.0, 0, 0, 0, 1, 0, 0, 500),
+            (2.0, 32, 0, 0, 1, 0, 0, 400),
+        ])
+        self.assertFalse(rsc8_audio.decode_grid20_table(flat)["counter_increasing"])
+        skewed = build_synthetic_grid20([(1.0, 33, 0, 0, 1, 0, 0, 10)])
+        self.assertFalse(rsc8_audio.decode_grid20_table(skewed)["p_multiple_of_32"])
+
+    def test_indexrun_group_parse(self):
+        r = rsc8_audio.decode_index_runs(self.RUNS, grid_entries=22)
+        self.assertTrue(r["size_ok"])
+        self.assertTrue(r["group_count_matches"])
+        self.assertTrue(r["marker_ok"])
+        self.assertTrue(r["hash_single"])
+        self.assertEqual(r["hashes"], [0x4C633D07])
+        self.assertEqual(r["groups"], 2)
+        self.assertEqual(r["values"], 5)
+        self.assertEqual(r["index_max"], 21)
+        self.assertTrue(r["indices_ascending"])
+        self.assertTrue(r["indices_within_grid"])
+        self.assertFalse(rsc8_audio.decode_index_runs(self.RUNS, grid_entries=10)["indices_within_grid"])
+        self.assertIsNone(rsc8_audio.decode_index_runs(self.RUNS)["indices_within_grid"])
+
+    def test_indexrun_flags_violations(self):
+        declared_bad = build_synthetic_indexruns([(2, [1, 2])], declared=3)
+        self.assertFalse(rsc8_audio.decode_index_runs(declared_bad)["group_count_matches"])
+        marker_bad = build_synthetic_indexruns([(3, [1, 2])])
+        self.assertFalse(rsc8_audio.decode_index_runs(marker_bad)["marker_ok"])
+        descending = build_synthetic_indexruns([(2, [5, 4])])
+        self.assertFalse(rsc8_audio.decode_index_runs(descending)["indices_ascending"])
+        multi_hash = self.RUNS[:12] + struct.pack("<I", 0x11223344) + self.RUNS[16:]
+        self.assertFalse(rsc8_audio.decode_index_runs(multi_hash)["hash_single"])
+        # A run length that overruns the payload must not read past the buffer.
+        overrun = struct.pack("<IIIII", 1, 2, 0x4C633D07, 9, 5)
+        self.assertFalse(rsc8_audio.decode_index_runs(overrun)["size_ok"])
+        self.assertFalse(rsc8_audio.decode_index_runs(self.RUNS[:-2])["size_ok"])
+
+    def test_bank_tally_and_scan_summary(self):
+        grid25 = build_synthetic_grid20([
+            (float(i), 32 * i, i % 17, i, i + 1, 0x39CC + i, 0x4C15 - i, 1000 + 7 * i)
+            for i in range(25)
+        ])
+        bank = build_minimal_tag_bank(0x00112233, {
+            0x55: b"\xF8\x00" + bytes(62),
+            0x76: struct.pack("<I", 96000) + bytes(4) + struct.pack("<H", 48000) + bytes(18) + b"\x0B\x01",
+            0x5A: grid25,
+            0xD9: self.RUNS,
+        })
+        res = rsc8_audio.decode_awc_bank(bank)
+        self.assertEqual(res["stream_count"], 1)
+        self.assertEqual(res["grid20_streams"], 1)
+        self.assertEqual(res["grid20_entries"], 25)
+        self.assertEqual(res["grid20_invalid"], 0)
+        self.assertEqual(res["indexrun_streams"], 1)
+        self.assertEqual(res["indexrun_groups"], 2)
+        self.assertEqual(res["indexrun_invalid"], 0)
+        self.assertEqual(res["indexrun_index_overruns"], 0)
+
+        # A stream whose 0xd9 run points past its own 0x5a entries is counted as an overrun.
+        bad = build_minimal_tag_bank(0x00445566, {
+            0x55: b"\xF8\x00" + bytes(62),
+            0x5A: self.GRID,
+            0xD9: build_synthetic_indexruns([(2, [1, 2, 90])]),
+        })
+        res_bad = rsc8_audio.decode_awc_bank(bad)
+        self.assertEqual(res_bad["indexrun_index_overruns"], 1)
+        self.assertEqual(res_bad["grid20_invalid"], 0)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            rpf = os.path.join(tmp, "synth.rpf")
+            with open(rpf, "wb") as f:
+                f.write(b"9FPR" + struct.pack("<III", 0x100, 0, 0) + bytes(0xF0))
+                f.write(bank)
+                f.write(bytes(0x40))
+            _records, summary = rsc8_audio.scan_rpf(rpf)
+            self.assertEqual(summary["grid20_streams"], 1)
+            self.assertEqual(summary["grid20_entries"], 25)
+            self.assertEqual(summary["grid20_invalid"], 0)
+            self.assertEqual(summary["indexrun_groups"], 2)
+
+            awc_path = os.path.join(tmp, "grid.awc")
+            with open(awc_path, "wb") as f:
+                f.write(bank)
+            out_json = os.path.join(tmp, "report.json")
+            cp = subprocess.run(
+                [sys.executable, "-I", TOOL, awc_path, out_json, "--quiet"],
+                capture_output=True, text=True,
+            )
+            self.assertEqual(cp.returncode, 0, cp.stderr)
+            with open(out_json, encoding="utf-8") as f:
+                rep = json.load(f)
+            self.assertEqual(rep["summary"]["grid20_entries"], 25)
+            self.assertEqual(rep["summary"]["indexrun_groups"], 2)
 
 
 if __name__ == "__main__":
