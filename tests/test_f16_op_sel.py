@@ -42,6 +42,7 @@ OPS = [
     ("v_med3_f16", "v_med3_f16 v3, v1, v1, v1", 3),
     ("v_add_f16", "v_add_f16_e64 v3, v1, v1", 2),
     ("v_sub_f16", "v_sub_f16_e64 v3, v1, v1", 2),
+    ("v_subrev_f16", "v_subrev_f16_e64 v3, v1, v1", 2),
     ("v_mul_f16", "v_mul_f16_e64 v3, v1, v1", 2),
     ("v_max_f16", "v_max_f16_e64 v3, v1, v1", 2),
     ("v_min_f16", "v_min_f16_e64 v3, v1, v1", 2),

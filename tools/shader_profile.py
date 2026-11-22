@@ -128,6 +128,16 @@ def parse_registers(line: str) -> dict:
     return {"vgprs": vgprs, "sgprs": sgprs, "special": specials}
 
 
+def instruction_lines(lines):
+    for line in lines:
+        if line.startswith("; ---"):
+            break
+        if line.startswith("\t"):
+            code = line.partition(";")[0].strip()
+            if code and not code.startswith("."):
+                yield code
+
+
 def register_footprint(lines_or_text) -> dict:
     """Calculate the register footprint (max index, allocation count, and unique sets)
     across disassembly lines or text."""
@@ -140,9 +150,7 @@ def register_footprint(lines_or_text) -> dict:
     all_sgprs = set()
     all_specials = set()
 
-    for line in lines:
-        if not line.startswith("\t"):
-            continue
+    for line in instruction_lines(lines):
         regs = parse_registers(line)
         all_vgprs.update(regs["vgprs"])
         all_sgprs.update(regs["sgprs"])
@@ -167,15 +175,7 @@ def register_footprint(lines_or_text) -> dict:
 def profile_shader(text: str) -> dict:
     """Profile a single shader's disassembly: mnemonics, categories, ratios, and register footprint."""
     lines = text.splitlines()
-    mnemonics = Counter()
-    for line in lines:
-        if not line.startswith("\t"):
-            continue
-        code = line.strip().partition(";")[0].strip()
-        if not code:
-            continue
-        m = code.split()[0]
-        mnemonics[m] += 1
+    mnemonics = Counter(line.split(maxsplit=1)[0] for line in instruction_lines(lines))
 
     cats = count_categories(mnemonics)
     ratios = compute_ratios(cats)
@@ -230,7 +230,6 @@ def main():
             continue
         n += 1
         stage = name[:2].lower() if name[2:3] == "_" else "?"
-        seen = set()
         with open(os.path.join(a.src, name), encoding="utf-8", errors="replace") as f:
             text = f.read()
         prof = profile_shader(text)
@@ -239,15 +238,9 @@ def main():
         if a.per_shader:
             shaders.append({"name": name[:-2], "stage": stage, "instructions": prof["total_instructions"],
                             "vgpr_count": regs["vgpr_count"], "sgpr_count": regs["sgpr_count"]})
-        for line in text.splitlines():
-            if not line.startswith("\t"):
-                continue
-            m = line.split()[0]
-            occ[m] += 1
-            seen.add(m)
-        for m in seen:
-            users[m] += 1
-            per_stage[stage][m] += 1
+        occ.update(prof["mnemonics"])
+        users.update(prof["mnemonics"].keys())
+        per_stage[stage].update(prof["mnemonics"].keys())
         for w in set(re.findall(r"<stdin>:\d+:\d+: warning: invalid instruction encoding\n; (0x[0-9a-f]{2}(?: 0x[0-9a-f]{2}){3})", text)):
             invalid_users[w] += 1
     fam = defaultdict(lambda: [0, 0])

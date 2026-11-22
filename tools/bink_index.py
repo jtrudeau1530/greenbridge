@@ -79,11 +79,9 @@ def parse_header(data, offset):
         return None
     if not (16 <= width <= MAX_WIDTH and 16 <= height <= MAX_HEIGHT):
         return None
-    if not (1 <= fps_num <= 1000 and 1 <= fps_den <= 1000):
+    if fps_den == 0 or not fps_den <= fps_num <= 240 * fps_den:
         return None
     fps = fps_num / fps_den
-    if not 1.0 <= fps <= 240.0:
-        return None
     if audio > MAX_AUDIO_TRACKS:
         return None
 

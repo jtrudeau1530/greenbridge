@@ -117,6 +117,19 @@ class GamedataMapsTest(unittest.TestCase):
         self.assertEqual(mhiu["grid"]["width"], 300)
         self.assertEqual(mhiu["grid"]["height"], 300)
 
+    def test_complete_64k_map_leaves_the_next_stream_alone(self):
+        payload = mhiu_payload(b"\x07" * (255 * 255), prefix=65536 - 44 - 255 * 255)
+        self.assertEqual(len(payload), 65536)
+        self.add(payload)
+        self.add(b"unrelated resource")
+        self.finish()
+
+        p, data = self.run_tool()
+        self.assertEqual(p.returncode, 0, p.stderr)
+        row, = data["payloads"]
+        self.assertEqual((row["size"], row["chunks"]), (65536, 1))
+        self.assertEqual(row["grid"]["width"], 255)
+
     def test_rejects_nonzero_prefix(self):
         self.add(mhiu_payload(bytes(range(1, 17)), prefix=3, prefix_byte=1))
         self.finish()

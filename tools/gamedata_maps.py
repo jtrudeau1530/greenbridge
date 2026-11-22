@@ -162,13 +162,18 @@ def read_payloads(directory: str) -> list[dict]:
         if data[:4] not in MAGIC:
             i += 1
             continue
+        if len(data) < HEADER:
+            raise ValueError(f"truncated {data[:4].decode('ascii')} header at {rows[i]['off']:#x}")
+        target_size = HEADER + _u32(data, 0x24 if data[:4] == b"MHIU" else 0x28)
+        size = len(data)
         parts = [data]
         j = i
-        while rows[j].get("size") == 65536 and j + 1 < len(rows):
+        while size < target_size and rows[j].get("size") == 65536 and j + 1 < len(rows):
             nxt = _read_row(directory, rows[j + 1])
             if nxt[:4] in MAGIC or nxt.startswith((b"<?xml", b"\xef\xbb\xbf<")):
                 break
             parts.append(nxt)
+            size += len(nxt)
             j += 1
         payload = _join(rows[i], b"".join(parts))
         payload["stored"] = sum(rows[x].get("stored", 0) for x in range(i, j + 1))

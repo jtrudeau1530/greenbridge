@@ -338,6 +338,12 @@ class BCFeatureImplementationTests(unittest.TestCase):
         self.assertAlmostEqual(float(res16[0]), 255.0, places=3)
         self.assertAlmostEqual(float(res16[1]), 0.0, places=3)
 
+    def test_bc3_uses_four_colors_with_ascending_endpoints(self):
+        c0, c1 = 0x001F, 0xF800
+        block = make_synthetic_bc3_block(255, 0, [0] * 16, c0, c1, [3] * 16)
+        data = np.frombuffer(block, dtype=np.uint8).reshape(1, 16)
+        np.testing.assert_allclose(bc_feature.block_average(data, bpe=16)[0], [170, 0, 85])
+
     def test_smoothness_metric(self):
         """smoothness returns neighbor difference relative to spread (lower = more coherent)."""
         # Flat/constant image has zero neighbor differences -> 0.0
