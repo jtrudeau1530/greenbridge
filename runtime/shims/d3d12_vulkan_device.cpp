@@ -2941,6 +2941,7 @@ public:
         return set_event_on_multiple_fence_completion(*state_.context, fences, values, count, flags, event);
     }
     HRESULT STDMETHODCALLTYPE GetDeviceRemovedReason() override {
+        if (removed_.load(std::memory_order_acquire)) return DXGI_ERROR_DEVICE_REMOVED;
         return (state_.context && state_.context->is_device_lost()) ? DXGI_ERROR_DEVICE_REMOVED : S_OK;
     }
 
@@ -2993,6 +2994,34 @@ public:
         if (event) SetEvent(event);
         return S_OK;
     }
+
+    // STUB
+    HRESULT STDMETHODCALLTYPE EnumerateMetaCommands(UINT* count, D3D12_META_COMMAND_DESC*) override {
+        if (!count) return E_INVALIDARG;
+        *count = 0;
+        return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE EnumerateMetaCommandParameters(REFGUID, D3D12_META_COMMAND_PARAMETER_STAGE, UINT*,
+                                                             UINT*, D3D12_META_COMMAND_PARAMETER_DESC*) override {
+        return E_INVALIDARG;
+    }
+
+    HRESULT STDMETHODCALLTYPE CreateMetaCommand(REFGUID, UINT, const void*, SIZE_T, REFIID, void** out) override {
+        if (out) *out = nullptr;
+        return E_INVALIDARG;
+    }
+
+    // STUB
+    D3D12_DRIVER_MATCHING_IDENTIFIER_STATUS STDMETHODCALLTYPE CheckDriverMatchingIdentifier(
+        D3D12_SERIALIZED_DATA_TYPE type, const D3D12_SERIALIZED_DATA_DRIVER_MATCHING_IDENTIFIER*) override {
+        return type == D3D12_SERIALIZED_DATA_RAYTRACING_ACCELERATION_STRUCTURE
+                   ? D3D12_DRIVER_MATCHING_IDENTIFIER_UNRECOGNIZED
+                   : D3D12_DRIVER_MATCHING_IDENTIFIER_UNSUPPORTED_TYPE;
+    }
+
+    // STUB
+    void STDMETHODCALLTYPE RemoveDevice() override { removed_.store(true, std::memory_order_release); }
 
     HRESULT STDMETHODCALLTYPE CreateCommandQueue(const D3D12_COMMAND_QUEUE_DESC* desc, REFIID riid,
                                                  void** out) override {
@@ -4866,6 +4895,7 @@ private:
     std::mutex queue_mutex_;
     std::vector<bool> queue_busy_;
     DeviceState state_;
+    std::atomic<bool> removed_{false};
     OwnedRuntime owned_;
     IUnknown* outer_ = nullptr;  // the Xbox-ABI proxy, which owns a reference to this device
 };
