@@ -301,6 +301,43 @@ class SIMDInterpreter:
 
 
 # ==============================================================================
+# Condition Codes, Status Flags, and Carry/Borrow Evaluation
+# ==============================================================================
+
+@dataclass(frozen=True)
+class ArithmeticStatusFlags:
+    """Condition codes and arithmetic status flags for 32-bit operations."""
+    zero: bool
+    sign: bool
+    carry: bool
+    overflow: bool
+
+
+def evaluate_add_status_flags(
+    val_a: int,
+    val_b: int,
+    result: int,
+) -> ArithmeticStatusFlags:
+    """Evaluate condition codes, arithmetic flags, and carry/borrow generation for add."""
+    a = u32(val_a)
+    b = u32(val_b)
+    res = u32(result)
+
+    zero = (res == 0)
+    sign = bool(res & 0x80000000)
+    carry = (a + b) > MASK32
+    sa, sb, sres = s32(a), s32(b), s32(res)
+    overflow = ((sa > 0 and sb > 0 and sres < 0) or (sa < 0 and sb < 0 and sres >= 0))
+
+    return ArithmeticStatusFlags(
+        zero=zero,
+        sign=sign,
+        carry=carry,
+        overflow=overflow,
+    )
+
+
+# ==============================================================================
 # Unit Tests
 # ==============================================================================
 
@@ -640,6 +677,64 @@ class TestRegisterAliasing(unittest.TestCase):
         self.simd_interp.execute(instr, state)
         for lane in range(32):
             self.assertEqual(state.get_lane_vgpr(lane, 3), initial_addrs[lane])
+
+
+class TestConditionCodesAndStatusFlags(unittest.TestCase):
+    """Unit tests for condition codes, status flags, and carry generation."""
+
+    def test_normal_positive_flags(self) -> None:
+        res = ref_ds_add_src2_u32(10, 20)
+        flags = evaluate_add_status_flags(10, 20, res)
+        self.assertFalse(flags.zero)
+        self.assertFalse(flags.sign)
+        self.assertFalse(flags.carry)
+        self.assertFalse(flags.overflow)
+
+    def test_zero_flag(self) -> None:
+        res0 = ref_ds_add_src2_u32(0, 0)
+        flags0 = evaluate_add_status_flags(0, 0, res0)
+        self.assertTrue(flags0.zero)
+        self.assertFalse(flags0.sign)
+        self.assertFalse(flags0.carry)
+        self.assertFalse(flags0.overflow)
+
+        res_wrap = ref_ds_add_src2_u32(MASK32, 1)
+        flags_wrap = evaluate_add_status_flags(MASK32, 1, res_wrap)
+        self.assertTrue(flags_wrap.zero)
+        self.assertFalse(flags_wrap.sign)
+        self.assertTrue(flags_wrap.carry)
+        self.assertFalse(flags_wrap.overflow)
+
+    def test_sign_flag(self) -> None:
+        res = ref_ds_add_src2_u32(0x40000000, 0x40000000)
+        self.assertEqual(res, 0x80000000)
+        flags = evaluate_add_status_flags(0x40000000, 0x40000000, res)
+        self.assertTrue(flags.sign)
+        self.assertFalse(flags.carry)
+        self.assertTrue(flags.overflow)
+
+    def test_unsigned_carry_flag(self) -> None:
+        res = ref_ds_add_src2_u32(MASK32, 10)
+        self.assertEqual(res, 9)
+        flags = evaluate_add_status_flags(MASK32, 10, res)
+        self.assertTrue(flags.carry)
+        self.assertFalse(flags.zero)
+
+    def test_signed_overflow_flag(self) -> None:
+        # Max positive signed int + 1 -> negative signed int (overflow)
+        res_pos_ovf = ref_ds_add_src2_u32(0x7FFFFFFF, 1)
+        self.assertEqual(res_pos_ovf, 0x80000000)
+        flags_pos_ovf = evaluate_add_status_flags(0x7FFFFFFF, 1, res_pos_ovf)
+        self.assertTrue(flags_pos_ovf.overflow)
+        self.assertTrue(flags_pos_ovf.sign)
+
+        # Min negative signed int + min negative signed int (overflow)
+        res_neg_ovf = ref_ds_add_src2_u32(0x80000000, 0x80000000)
+        self.assertEqual(res_neg_ovf, 0)
+        flags_neg_ovf = evaluate_add_status_flags(0x80000000, 0x80000000, res_neg_ovf)
+        self.assertTrue(flags_neg_ovf.overflow)
+        self.assertTrue(flags_neg_ovf.carry)
+        self.assertTrue(flags_neg_ovf.zero)
 
 
 if __name__ == "__main__":
