@@ -549,5 +549,74 @@ class PathAndGameSelectionTest(PreflightTestBase):
         make_game.below_normal()
 
 
+class PreflightExportedAssetsSpaceTest(PreflightTestBase):
+    """A rerun over finished asset exports doesn't need room for a second copy of them."""
+
+    OGG = "awc_opus.py finished\n"
+    XMA = "rpf9dump xma finished\n"
+
+    def run_preflight(self, work, free_gb, wav=False):
+        usage = Usage(1000 * 2**30, (1000 - free_gb) * 2**30, free_gb * 2**30)
+        with mock.patch("sys.version_info", (3, 12, 0)), \
+             mock.patch("shutil.which", return_value="/usr/bin/tool"), \
+             mock.patch("make_game.tool_available", return_value=True), \
+             mock.patch("make_game.ensure_submodule", return_value=None), \
+             mock.patch("sys.stdout", io.StringIO()), \
+             mock.patch("shutil.disk_usage", return_value=usage):
+            make_game.preflight(["shaders", "assets"], work, wav=wav)
+
+    def write_markers(self, work, ogg=OGG, xma=XMA):
+        audio = os.path.join(work, "assets", "audio")
+        os.makedirs(audio, exist_ok=True)
+        for name, text in (("ogg.done", ogg), ("xma.done", xma)):
+            if text is not None:
+                with open(os.path.join(audio, name), "w", encoding="utf-8") as f:
+                    f.write(text)
+
+    def test_markers_written_by_assets_are_read_back(self):
+        with tempfile.TemporaryDirectory() as work:
+            audio = os.path.join(work, "assets", "audio")
+            os.makedirs(audio)
+            make_game.mark(os.path.join(audio, "ogg.done"), "awc_opus.py")
+            make_game.mark(os.path.join(audio, "xma.done"), "rpf9dump xma")
+            self.assertTrue(make_game.assets_exported(work))
+
+    def test_exported_assets_need_only_the_shader_space(self):
+        with tempfile.TemporaryDirectory() as work:
+            self.write_markers(work)
+            self.run_preflight(work, free_gb=220)  # 30 GB for the shaders, not 330
+            err = self.assert_fails(self.run_preflight, work, free_gb=20, match="about 30 GB is needed")
+            self.assertIn("20 GB free", err)
+
+    def test_fresh_work_folder_still_needs_the_asset_space(self):
+        with tempfile.TemporaryDirectory() as work:
+            self.assertFalse(make_game.assets_exported(work))
+            self.assert_fails(self.run_preflight, work, free_gb=220, match="about 330 GB is needed")
+
+    def test_stopped_export_still_needs_the_asset_space(self):
+        with tempfile.TemporaryDirectory() as work:
+            self.write_markers(work, xma=None)  # stopped before the XMA2 step
+            self.assertFalse(make_game.assets_exported(work))
+            self.assert_fails(self.run_preflight, work, free_gb=220, match="about 330 GB is needed")
+
+    def test_marker_with_other_contents_does_not_count(self):
+        for ogg, xma in (("", self.XMA), (self.OGG, "something else\n"), (self.XMA, self.OGG)):
+            with self.subTest(ogg=ogg, xma=xma), tempfile.TemporaryDirectory() as work:
+                self.write_markers(work, ogg=ogg, xma=xma)
+                self.assertFalse(make_game.assets_exported(work))
+
+    def test_marker_that_is_a_folder_does_not_count(self):
+        with tempfile.TemporaryDirectory() as work:
+            self.write_markers(work, xma=None)
+            os.makedirs(os.path.join(work, "assets", "audio", "xma.done"))
+            self.assertFalse(make_game.assets_exported(work))
+
+    def test_wav_still_counts_the_asset_space(self):
+        # The WAV decode writes several times the Ogg Opus size and has no marker of its own.
+        with tempfile.TemporaryDirectory() as work:
+            self.write_markers(work)
+            self.assert_fails(self.run_preflight, work, free_gb=220, wav=True, match="about 330 GB is needed")
+
+
 if __name__ == "__main__":
     unittest.main()
