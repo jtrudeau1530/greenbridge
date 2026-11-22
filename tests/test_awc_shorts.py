@@ -158,6 +158,33 @@ class ShortsTest(unittest.TestCase):
                 channels, _ = ogg_head_and_last_granule(f.read())
             self.assertEqual(channels, expected)
 
+    def check_truncated_bank_skipped(self, tool, jobs):
+        os.mkdir(os.path.join(self.tmp.name, "banks"))
+        self.write(os.path.join("banks", "good.awc"), 0xFC, 480000)
+        # Header says 5 streams but the bank ends after 16 bytes: parse_awc raises struct.error.
+        with open(os.path.join(self.tmp.name, "banks", "bad.awc"), "wb") as f:
+            f.write(b"ADAT" + struct.pack("<III", 0, 5, 16))
+        argv = [os.path.join(self.tmp.name, "banks"), self.out, "--min-seconds", "4",
+                "--max-seconds", "6", "--jobs", str(jobs)]
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()) as err:
+            self.assertEqual(tool.main(argv), 0)
+        self.assertIn("  skip bad: ", err.getvalue())
+        self.assertEqual(len(err.getvalue().splitlines()), 1)
+        import csv
+        with open(os.path.join(self.out, "shorts.csv"), encoding="utf-8") as f:
+            rows = list(csv.DictReader(f))
+        self.assertEqual([(r["bank"], r["stream"]) for r in rows], [("good", "00001234")])
+
+    def test_truncated_bank_skipped_serial(self):
+        self.check_truncated_bank_skipped(shorts, 1)
+
+    def test_truncated_bank_skipped_pool(self):
+        # A spawned worker must import the tool by name, so use the real module, not the spec-loaded copy.
+        sys.path.insert(0, os.path.join(ROOT, "tools"))
+        self.addCleanup(sys.path.remove, os.path.join(ROOT, "tools"))
+        import awc_shorts
+        self.check_truncated_bank_skipped(awc_shorts, 2)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
