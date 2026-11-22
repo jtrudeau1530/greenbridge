@@ -664,5 +664,73 @@ class DeclaredOptionalHeaderSizeTest(unittest.TestCase):
                 ):
                     pe_inspect.PeImage(bytes(data))
 
+
+class ShortHeaderTest(unittest.TestCase):
+    """A file too short for a header names the header it stops short of, not a signature that is present."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dir = self.tmp.name
+
+    def write(self, name: str, data: bytes) -> str:
+        path = os.path.join(self.dir, name)
+        with open(path, "wb") as f:
+            f.write(data)
+        return path
+
+    def dos_header(self, size: int, nt: int | None = None) -> bytes:
+        """`size` bytes starting with MZ, optionally with e_lfanew at 0x3c pointing at `nt`."""
+        data = bytearray(size)
+        data[0:2] = b"MZ"
+        if nt is not None:
+            struct.pack_into("<I", data, 0x3C, nt)
+        return bytes(data)
+
+    def check_rejected(self, name: str, data: bytes, expected: str, not_expected: str = "") -> None:
+        """PeImage raises the message, and the CLI prints it to stderr and exits 1; no traceback on either path."""
+        with self.assertRaisesRegex(pe_inspect.PeFormatError, expected):
+            pe_inspect.PeImage(data)
+        err = io.StringIO()
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+            self.assertEqual(pe_inspect.main([self.write(name, data), "--out", os.path.join(self.dir, "reports")]), 1)
+        self.assertIn(expected, err.getvalue())
+        if not_expected:
+            self.assertNotIn(not_expected, err.getvalue())
+
+    def test_mz_shorter_than_the_msdos_header_reports_the_length(self):
+        # a 4-byte truncated copy: the signature is there, the 64-byte MS-DOS header (e_lfanew lives at 0x3c) is not
+        self.check_rejected("short4.bin", self.dos_header(4),
+                            "file is 4 bytes, shorter than the 64-byte MS-DOS header", not_expected="no MZ header")
+
+    def test_mz_one_byte_short_of_the_msdos_header_reports_the_length(self):
+        self.check_rejected("short63.bin", self.dos_header(63),
+                            "file is 63 bytes, shorter than the 64-byte MS-DOS header", not_expected="no MZ header")
+
+    def test_file_without_the_mz_signature_still_reports_no_mz_header(self):
+        for name, data in (("aaaa.bin", b"AAAA"), ("empty.bin", b""), ("one_byte.bin", b"A"), ("m.bin", b"M")):
+            with self.subTest(name=name):
+                self.check_rejected(name, data, "no MZ header")
+
+    def test_e_lfanew_past_the_end_reports_a_short_file_not_a_missing_signature(self):
+        # 64 bytes: the MS-DOS header fits, the PE header it points at at 0x40 does not
+        self.check_rejected("nt_past.bin", self.dos_header(64, 0x40),
+                            "file is 64 bytes, too short to hold the PE header at 0x40",
+                            not_expected="no PE signature")
+
+    def test_pe_header_cut_after_the_signature_reports_a_short_file(self):
+        # PE\0\0 at 0x40 is there, the 20 bytes of file header after it are cut off
+        data = bytearray(self.dos_header(68, 0x40))
+        data[0x40:0x44] = b"PE\0\0"
+        self.check_rejected("coff_cut.bin", bytes(data),
+                            "file is 68 bytes, too short to hold the PE header at 0x40",
+                            not_expected="no PE signature")
+
+    def test_a_long_enough_file_with_a_wrong_signature_still_reports_no_pe_signature(self):
+        data = bytearray(self.dos_header(88, 0x40))
+        data[0x40:0x44] = b"XX\0\0"
+        self.check_rejected("bad_sig.bin", bytes(data), "no PE signature")
+
+
 if __name__ == "__main__":
     unittest.main()
