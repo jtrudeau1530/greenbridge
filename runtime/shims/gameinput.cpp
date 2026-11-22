@@ -106,6 +106,8 @@ rt::gameinput::Config read_config() {
     else if (!t.empty() && t != "rumble") std::fprintf(stderr, "[rt] gameinput: LEONIDA_DS_TRIGGERS=%s unknown, using rumble\n", t.c_str());
     if (const std::string g = env("LEONIDA_DS_TRIGGER_GAIN"); !g.empty())
         c.ds_trigger_gain = std::clamp(static_cast<float>(std::atof(g.c_str())), 0.0f, 4.0f);
+    if (const std::string g = env("LEONIDA_MOUSE_SENSITIVITY"); !g.empty())
+        c.mouse_sensitivity = std::clamp(static_cast<float>(std::atof(g.c_str())), 0.1f, 10.0f);
     if (const std::string f = env("LEONIDA_DS_TRIGGER_FREQ"); !f.empty())
         c.ds_trigger_frequency = static_cast<uint8_t>(std::clamp(std::atoi(f.c_str()), 1, 255));
     if (const std::string l = env("LEONIDA_DS_LIGHTBAR"); !l.empty()) {
@@ -875,8 +877,76 @@ constexpr int kMouseDecayNum = 7, kMouseDecayDen = 8;
 
 bool async_key_down(int vk) { return (GetAsyncKeyState(vk) & 0x8000) != 0; }
 
-// shortcut: plain cursor deltas stop at the screen edge; capture or recenter the cursor if that matters in game.
+// ---- raw mouse input (its own thread) ----
+//
+// The cursor stops at the edge of the screen, so cursor deltas stop too. Raw input reports what the mouse itself
+// moved, with no edge and no pointer acceleration. A message-only window (never shown) on its own thread receives
+// WM_INPUT and adds each movement to a running total; system_cursor_pos then returns that total as an edgeless
+// "cursor", and update_keyboard_pad takes the difference between polls exactly as it did with the real cursor.
+std::atomic<long long> g_raw_x{0}, g_raw_y{0};  // total raw movement since the thread started, mouse counts
+std::atomic<bool> g_raw_ready{false};           // registration worked; system_cursor_pos uses the totals
+std::atomic<bool> g_raw_started{false};         // the thread is started once per process
+
+LRESULT CALLBACK raw_mouse_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    if (msg == WM_INPUT) {
+        RAWINPUT raw{};
+        UINT size = sizeof(raw);
+        if (GetRawInputData(reinterpret_cast<HRAWINPUT>(lp), RID_INPUT, &raw, &size, sizeof(RAWINPUTHEADER)) !=
+                static_cast<UINT>(-1) &&
+            raw.header.dwType == RIM_TYPEMOUSE && !(raw.data.mouse.usFlags & MOUSE_MOVE_ABSOLUTE)) {
+            // Relative movement only: absolute reports (remote desktop, some VMs, tablets) are positions, not
+            // movement, and would make the stick jump.
+            g_raw_x += raw.data.mouse.lLastX;
+            g_raw_y += raw.data.mouse.lLastY;  // +Y is down, as for the cursor
+        }
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);  // also for WM_INPUT, which lets Windows clean up the input
+}
+
+void raw_mouse_thread() {
+    const HINSTANCE inst = GetModuleHandleW(nullptr);
+    WNDCLASSEXW wc{};
+    wc.cbSize = sizeof(wc);
+    wc.lpfnWndProc = raw_mouse_proc;
+    wc.hInstance = inst;
+    wc.lpszClassName = L"LeonidaRawMouse";
+    RegisterClassExW(&wc);
+    // HWND_MESSAGE: a window that is never shown and only receives messages. It must be created on the thread that
+    // runs the message loop below, because a window's messages go to the thread that created it.
+    HWND hwnd = CreateWindowExW(0, L"LeonidaRawMouse", L"", 0, 0, 0, 0, 0,
+                                HWND_MESSAGE, nullptr, inst, nullptr);
+    if (!hwnd) {
+        std::fprintf(stderr, "[rt] gameinput: no raw mouse input (window: error %lu); using the cursor position\n",
+                     GetLastError());
+        return;
+    }
+    RAWINPUTDEVICE dev{};
+    dev.usUsagePage = 0x01;  // HID generic desktop
+    dev.usUsage = 0x02;      // mouse
+    dev.dwFlags = RIDEV_INPUTSINK;  // also while this (invisible) window has no focus; focus is checked per poll
+    dev.hwndTarget = hwnd;
+    if (!RegisterRawInputDevices(&dev, 1, sizeof(dev))) {
+        std::fprintf(stderr, "[rt] gameinput: no raw mouse input (register: error %lu); using the cursor position\n",
+                     GetLastError());
+        DestroyWindow(hwnd);
+        return;
+    }
+    g_raw_ready = true;
+    std::fprintf(stderr, "[rt] gameinput: raw mouse input on (the right stick does not stop at the screen edge)\n");
+    MSG m;
+    while (GetMessageW(&m, nullptr, 0, 0) > 0) DispatchMessageW(&m);
+}
+
+void start_raw_mouse() {
+    if (!g_raw_started.exchange(true)) std::thread(raw_mouse_thread).detach();
+}
+
 bool system_cursor_pos(int* x, int* y) {
+    if (g_raw_ready) {  // the edgeless total; it wraps only after ±2^31 counts, and the poll uses differences
+        *x = static_cast<int>(g_raw_x.load());
+        *y = static_cast<int>(g_raw_y.load());
+        return true;
+    }
     POINT p;
     if (!GetCursorPos(&p)) return false;
     *x = p.x;
@@ -911,6 +981,33 @@ void detach_keyboard_pad() {
     g_keyboard = {};
 }
 
+// Keeps the cursor inside the game window while it has focus, so a click cannot land on another window, and releases
+// it on focus loss. Only with raw input (a clipped plain cursor would stop the stick at the window edge) and only for
+// a real foreground window of this process: not KeyboardPadMode::Always over a terminal, nor a test's fake focus.
+// Re-applied every 100 ms, because Windows drops the clip on some focus and resize changes.
+bool g_clipped = false;
+uint64_t g_clip_at = 0;
+
+void clip_cursor(bool want) {
+    if (!want) {
+        if (g_clipped) ClipCursor(nullptr);
+        g_clipped = false;
+        return;
+    }
+    const uint64_t now = now_us();
+    if (g_clipped && now - g_clip_at < 100'000) return;
+    const HWND w = GetForegroundWindow();
+    RECT r;
+    if (!w || !GetClientRect(w, &r)) return;
+    POINT top_left{r.left, r.top}, bottom_right{r.right, r.bottom};
+    if (!ClientToScreen(w, &top_left) || !ClientToScreen(w, &bottom_right)) return;
+    const RECT screen{top_left.x, top_left.y, bottom_right.x, bottom_right.y};
+    if (screen.right > screen.left && screen.bottom > screen.top && ClipCursor(&screen)) {
+        g_clipped = true;
+        g_clip_at = now;
+    }
+}
+
 bool attach_keyboard_pad() {
     SDL_VirtualJoystickDesc d;
     SDL_INIT_INTERFACE(&d);
@@ -931,17 +1028,21 @@ bool attach_keyboard_pad() {
     std::fprintf(stderr, "[rt] gameinput: keyboard pad attached (arrows d-pad, Enter A, Backspace B, X X, Y Y, "
                          "Q/E shoulders, Esc Menu, Tab View, WASD left stick, mouse right stick, right/left "
                          "button LT/RT)\n");
+    start_raw_mouse();
     return true;
 }
 
 // Before SDL_UpdateGamepads, so the buttons set here are in this poll's reading.
 void update_keyboard_pad() {
+    float sens;
     rt::gameinput::KeyboardPadMode mode;
     {
         std::lock_guard lock(g().mu);
         mode = g().config.keyboard_pad;
+        sens = g().config.mouse_sensitivity;
     }
     if (mode == rt::gameinput::KeyboardPadMode::Off) {
+        clip_cursor(false);
         if (g_keyboard.id) detach_keyboard_pad();
         g_keyboard.failed = false;
         return;
@@ -953,7 +1054,8 @@ void update_keyboard_pad() {
     bool aim = false, fire = false;
     // Out of focus every button, stick and trigger is released, so a key held while switching windows does not stay
     // pressed, and the cursor is read afresh on return, so moving it in another window does not swing the stick.
-    if (mode == rt::gameinput::KeyboardPadMode::Always || g_has_focus.load()()) {
+    const bool active = mode == rt::gameinput::KeyboardPadMode::Always || g_has_focus.load()();
+    if (active) {
         const rt::gameinput::KeyDownFn key_down = g_key_down.load();
         for (const auto& b : kKeyBindings) down[b.sdl_button] |= key_down(b.virtual_key);
         lx = key_down('D') - key_down('A');  // opposite keys cancel
@@ -964,9 +1066,9 @@ void update_keyboard_pad() {
         int x = 0, y = 0;
         const bool have = g_cursor_pos.load()(&x, &y);
         const bool moved = have && g_keyboard.have_cursor;
-        auto step = [](int v, int pixels) {
+        auto step = [sens](int v, int pixels) {
             const long long n = static_cast<long long>(v) * kMouseDecayNum / kMouseDecayDen +
-                                static_cast<long long>(pixels) * kMouseAxisPerPixel;
+                                std::lround(static_cast<long long>(pixels) * kMouseAxisPerPixel * sens);
             return static_cast<int>(std::clamp<long long>(n, -kStickFull, kStickFull));
         };
         g_keyboard.right_x = step(g_keyboard.right_x, moved ? x - g_keyboard.cursor_x : 0);
@@ -977,6 +1079,7 @@ void update_keyboard_pad() {
         g_keyboard.right_x = g_keyboard.right_y = 0;
         g_keyboard.have_cursor = false;
     }
+    clip_cursor(active && g_raw_ready && g_cursor_pos.load() == system_cursor_pos && foreground_is_ours());
     for (const auto& b : kKeyBindings) SDL_SetJoystickVirtualButton(g_keyboard.js, b.sdl_button, down[b.sdl_button]);
     const int reach = lx && ly ? kStickDiagonal : kStickFull;
     SDL_SetJoystickVirtualAxis(g_keyboard.js, SDL_GAMEPAD_AXIS_LEFTX, static_cast<Sint16>(lx * reach));
@@ -1190,10 +1293,12 @@ HRESULT find_reading(IGameInputReading* ref, uint32_t kind, IGameInputDevice* de
     if (device) {
         Device* dev = as_device(device);
         if (dev->info.deviceFamily == GameInputFamilyAggregate) {
-            const uint32_t effective_kind = (kind != GameInputKindUnknown) ? kind : dev->info.supportedInput;
+            if (kind != GameInputKindUnknown && !(kind & dev->info.supportedInput))
+                return GAMEINPUT_E_READING_NOT_FOUND;
+            const uint32_t effective_kind = (kind != GameInputKindUnknown) ? (kind & dev->info.supportedInput) : dev->info.supportedInput;
             scope.clear();
             for (Device* cd : s.connected) {
-                if (effective_kind == GameInputKindUnknown || (effective_kind & cd->info.supportedInput)) {
+                if (effective_kind & cd->info.supportedInput) {
                     scope.push_back(cd);
                 }
             }
@@ -1246,9 +1351,11 @@ public:
         if (device) {
             Device* d = as_device(device);
             if (d->info.deviceFamily == GameInputFamilyAggregate) {
-                const uint32_t effective_kind = (kind != GameInputKindUnknown) ? kind : d->info.supportedInput;
+                if (kind != GameInputKindUnknown && !(kind & d->info.supportedInput))
+                    return GAMEINPUT_E_READING_NOT_FOUND;
+                const uint32_t effective_kind = (kind != GameInputKindUnknown) ? (kind & d->info.supportedInput) : d->info.supportedInput;
                 for (Device* cd : g().connected) {
-                    if (effective_kind != GameInputKindUnknown && !(effective_kind & cd->info.supportedInput)) continue;
+                    if (!(effective_kind & cd->info.supportedInput)) continue;
                     if (Reading* r = cd->latest(); r && (!best || r->GetTimestamp() >= best->GetTimestamp())) best = r;
                 }
             } else {
@@ -1275,6 +1382,8 @@ public:
                                                  IGameInputReading** out) override {
         return find_reading(ref, kind, device, out, false);
     }
+    // E_NOTIMPL is GameInput v0's own answer: Microsoft's reference page says the method "was never implemented in
+    // v0" and returns E_NOTIMPL, and v1 removed it. A history lookup here would give a title what no GameInput does.
     HRESULT STDMETHODCALLTYPE GetTemporalReading(uint64_t, IGameInputDevice*, IGameInputReading** out) override {
         if (!out) return E_POINTER;
         *out = nullptr;
@@ -1283,6 +1392,9 @@ public:
 
     HRESULT STDMETHODCALLTYPE RegisterReadingCallback(IGameInputDevice* device, uint32_t kind, float, void* context,
                                                       GameInputReadingCallback fn, GameInputCallbackToken* token) override {
+        if (token) *token = kInvalidCallbackToken;
+        if (!fn) return E_INVALIDARG;
+        if (device && as_device(device)->info.deviceFamily == GameInputFamilyAggregate) return E_NOTIMPL;
         return add({0, CbType::Reading, as_device(device), kind, 0, context, reinterpret_cast<void*>(fn), true}, token);
     }
 
@@ -1291,6 +1403,7 @@ public:
                                                      GameInputDeviceCallback fn, GameInputCallbackToken* token) override {
         if (token) *token = kInvalidCallbackToken;
         if (!fn) return E_INVALIDARG;
+        if (device && as_device(device)->info.deviceFamily == GameInputFamilyAggregate) return E_NOTIMPL;
         State& s = g();
         GameInputCallbackToken t;
         std::vector<Event> now;

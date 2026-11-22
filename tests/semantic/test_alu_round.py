@@ -788,7 +788,8 @@ class TestSpirvMiniInterpExecution(unittest.TestCase):
             "v_trunc_f32 v2, v4",
             "v_rndne_f32 v3, v4",
         ])
-        self.assertEqual(out[0], f32_to_bits(-1.0))
+        # v_floor reads a denormal as zero (f32 denormals flushed, docs/design.md), so floor(-denormal) is -0.
+        self.assertEqual(out[0], NEG_ZERO_F32)
         self.assertEqual(out[1], NEG_ZERO_F32)
         self.assertEqual(out[2], NEG_ZERO_F32)
         self.assertEqual(out[3], NEG_ZERO_F32)

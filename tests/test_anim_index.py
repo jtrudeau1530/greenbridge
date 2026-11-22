@@ -314,6 +314,56 @@ class ArchiveTest(unittest.TestCase):
         with open(rigs, encoding="utf-8") as f:
             self.assertEqual(json.load(f), {"previous": True})
 
+    def test_cli_rejects_folder_destination(self):
+        folder_out = os.path.join(self.root, "out_folder")
+        os.makedirs(folder_out)
+        p = subprocess.run([sys.executable, "-I", TOOL, self.rpf, folder_out, "--quiet"],
+                           capture_output=True, text=True, encoding="utf-8", errors="replace")
+        self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
+        self.assertIn("is a folder, not a .csv or .json file", p.stderr)
+
+    def test_cli_rejects_invalid_extension(self):
+        txt_out = os.path.join(self.root, "out.txt")
+        p = subprocess.run([sys.executable, "-I", TOOL, self.rpf, txt_out, "--quiet"],
+                           capture_output=True, text=True, encoding="utf-8", errors="replace")
+        self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
+        self.assertIn("output must end in .json or .csv", p.stderr)
+
+    def test_cli_carve_dir_protects_manifest_and_input_files(self):
+        carve = os.path.join(self.root, "carved_manifest_test")
+        os.makedirs(carve)
+        manifest = os.path.join(carve, "index.json")
+        with open(manifest, "w", encoding="utf-8") as f:
+            f.write('{"manifest": true}')
+        bin_file = os.path.join(carve, "000000001000.bin")
+        with open(bin_file, "wb") as f:
+            f.write(b"A" * 64)
+        out_csv = os.path.join(self.root, "valid.csv")
+
+        # Refuse to overwrite carve manifest via out
+        p = subprocess.run([sys.executable, "-I", TOOL, carve, manifest, "--quiet"],
+                           capture_output=True, text=True, encoding="utf-8", errors="replace")
+        self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
+        self.assertIn("output would overwrite the carve manifest", p.stderr)
+
+        # Refuse to overwrite carve manifest via --rigs
+        p = subprocess.run([sys.executable, "-I", TOOL, carve, out_csv, "--rigs", manifest, "--quiet"],
+                           capture_output=True, text=True, encoding="utf-8", errors="replace")
+        self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
+        self.assertIn("--rigs would overwrite the carve manifest", p.stderr)
+
+        # Refuse to overwrite carved input file via out
+        p = subprocess.run([sys.executable, "-I", TOOL, carve, bin_file, "--quiet"],
+                           capture_output=True, text=True, encoding="utf-8", errors="replace")
+        self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
+        self.assertIn("output would overwrite an input file", p.stderr)
+
+        # Refuse to overwrite carved input file via --rigs
+        p = subprocess.run([sys.executable, "-I", TOOL, carve, out_csv, "--rigs", bin_file, "--quiet"],
+                           capture_output=True, text=True, encoding="utf-8", errors="replace")
+        self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
+        self.assertIn("--rigs would overwrite an input file", p.stderr)
+
     def test_directory(self):
         folder = os.path.join(self.root, "carved")
         os.makedirs(folder)
@@ -413,6 +463,20 @@ class RigArchiveTest(unittest.TestCase):
         self.assertIn("index and --rigs must use different paths", result.stderr)
         self.assertFalse(os.path.exists(out))
 
+    def test_cli_rejects_rigs_folder_and_invalid_extension(self):
+        out = os.path.join(self.root, "index.json")
+        folder = os.path.join(self.root, "rig_folder")
+        os.makedirs(folder)
+        p = subprocess.run([sys.executable, "-I", TOOL, self.rpf, out, "--rigs", folder, "--quiet"],
+                           capture_output=True, text=True, encoding="utf-8", errors="replace")
+        self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
+        self.assertIn("is a folder, not a JSON file", p.stderr)
+
+        p = subprocess.run([sys.executable, "-I", TOOL, self.rpf, out, "--rigs", os.path.join(self.root, "rigs.csv"), "--quiet"],
+                           capture_output=True, text=True, encoding="utf-8", errors="replace")
+        self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
+        self.assertIn("--rigs must end in .json", p.stderr)
+
     def test_cli_rigs(self):
         out = os.path.join(self.root, "index.json")
         rigs = os.path.join(self.root, "rigs.json")
@@ -493,6 +557,22 @@ class ShortStreamEndsTheResource(unittest.TestCase):
         with open(os.path.join(self.root, f"{0x1000 + CHUNK:06x}.bin"), "wb") as f:
             f.write(blob[CHUNK:])
         self.assertEqual(anim_index.collect_rbf0_dir(self.root), blob)
+
+    def test_directory_rigs_skips_json_and_csv_reports(self):
+        blob = self.rbf0 + bytes(CHUNK + 100 - len(self.rbf0))
+        with open(os.path.join(self.root, "000000.bin"), "wb") as f:
+            f.write(blob[:CHUNK])
+        with open(os.path.join(self.root, "010000.bin"), "wb") as f:
+            f.write(blob[CHUNK:])
+        with open(os.path.join(self.root, "020000.bin"), "wb") as f:
+            f.write(skeleton())
+        for report in ("index.json", "report.CSV"):
+            with open(os.path.join(self.root, report), "w", encoding="utf-8", newline="\n") as f:
+                f.write("{\"name\": \"SKEL_FakeReportBone\"}\n" * 4)
+        self.assertEqual(anim_index.collect_rbf0_dir(self.root), blob)
+        skels = anim_index.collect_skeletons_dir(self.root)
+        self.assertEqual([s["offset"] for s in skels], [0x20000])
+        self.assertEqual(skels[0]["names"], ["SKEL_Neck", "SKEL_Spine"])
 
 
 if __name__ == "__main__":

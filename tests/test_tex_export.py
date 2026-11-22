@@ -226,6 +226,26 @@ def test_every_tileable_format_exports_exact_top_mip_and_header(eq, tmp_path, fm
     assert dds[148:] == top.tobytes()
 
 
+@pytest.mark.parametrize("pillow_failure", ["missing", "unreadable DDS"])
+def test_mip_scoring_uses_raw_elements_when_pillow_cannot_decode(eq, tmp_path, monkeypatch, pillow_failure) -> None:
+    if pillow_failure == "missing":
+        monkeypatch.setitem(sys.modules, "PIL", None)
+    else:
+        image = pytest.importorskip("PIL.Image")
+
+        def cannot_open(*args: object, **kwargs: object) -> None:
+            raise OSError("synthetic Pillow DDS decode failure")
+
+        monkeypatch.setattr(image, "open", cannot_open)
+
+    carve, expected = build_case(eq, tmp_path, 28, top_first=False)
+    out = tmp_path / "out"
+    row = texture(28, "R8G8B8A8_UNORM", 64, 64, mips=2)
+
+    assert T.export_one(row, carve, str(out), {}) == "ok:last"
+    assert (out / "x.rpf" / row["export"]["file"]).read_bytes()[148:] == expected
+
+
 def test_gpu_chain_parts_are_read_in_order(eq, tmp_path):
     carve, expected = build_case(eq, tmp_path, 10, top_first=True)
     with open(os.path.join(carve, "x.rpf", f"{0x1000:012x}.bin"), "rb") as f:

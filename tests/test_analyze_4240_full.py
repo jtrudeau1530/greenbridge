@@ -119,6 +119,60 @@ class Analyze4240Test(unittest.TestCase):
         self.assertEqual(len(doc), 1)
         self.assertEqual(doc[0]["errors"], 1)
 
+    def test_json_naming_an_input_archive_is_refused_and_the_archive_kept(self):
+        # Before: the archive was read, then replaced with the JSON report.
+        path = self.truncated_archive()
+        with open(path, "rb") as f:
+            before = f.read()
+        for spelling in (path, os.path.join(self.root, ".", os.path.basename(path))):
+            with self.subTest(json=spelling):
+                p = self.run_tool(path, "--json", spelling)
+                self.assertEqual(p.returncode, 2, p.stderr)
+                self.assertIn("would overwrite the input archive", p.stderr)
+                self.assertNotIn("Traceback", p.stderr)
+                self.assertNotIn("Processing", p.stdout, "refused before the scan")
+                with open(path, "rb") as f:
+                    self.assertEqual(f.read(), before)
+
+    def test_json_naming_a_later_input_is_refused(self):
+        first, second = self.truncated_archive(), os.path.join(self.root, "second.rpf")
+        make_archive(second, BLOCK_6330)
+        p = self.run_tool(first, second, "--json", second)
+        self.assertEqual(p.returncode, 2, p.stderr)
+        self.assertIn("second.rpf", p.stderr)
+        self.assertTrue(open(second, "rb").read().startswith(b"9FPR"))
+
+    def test_json_through_a_link_to_an_input_is_refused(self):
+        path = self.truncated_archive()
+        link = os.path.join(self.root, "link.json")
+        try:
+            os.link(path, link)              # a hard link: another name for the archive itself
+        except OSError as e:
+            self.skipTest(f"hard links unavailable: {e}")
+        p = self.run_tool(path, "--json", link)
+        self.assertEqual(p.returncode, 2, p.stderr)
+        self.assertIn("would overwrite the input archive", p.stderr)
+        self.assertTrue(open(path, "rb").read().startswith(b"9FPR"))
+
+    def test_json_folder_is_refused_before_the_scan(self):
+        path = self.truncated_archive()
+        p = self.run_tool(path, "--json", self.root)
+        self.assertEqual(p.returncode, 2, p.stderr)
+        self.assertIn("is a folder", p.stderr)
+        self.assertNotIn("Traceback", p.stderr)
+        self.assertNotIn("Processing", p.stdout)
+
+    def test_a_failed_json_write_is_one_error_line(self):
+        path = self.truncated_archive()
+        blocker = os.path.join(self.root, "plain-file")
+        with open(blocker, "w", encoding="utf-8") as f:
+            f.write("x")
+        out = os.path.join(blocker, "stats.json")     # its parent is a file, so the folder can't be made
+        p = self.run_tool(path, "--json", out)
+        self.assertEqual(p.returncode, 2, p.stderr)
+        self.assertIn("cannot write", p.stderr)
+        self.assertNotIn("Traceback", p.stderr)
+
     def bad_offset_archive(self):
         path = os.path.join(self.root, "bad-offset.rpf")
         header = bytearray(0x780)
