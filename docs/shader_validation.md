@@ -933,6 +933,27 @@ every scalar. `vk_compute_test` reads them back with `VKC_OUT_WORDS` / `VKC_DUMP
   With `--dpp`: a DPP16 or DPP8 src0 on `v_mov`/`v_not`/`v_add_nc_u32`/`v_xor`, with every DPP16 control,
   `row_mask`, `bank_mask`, `bound_ctrl` and `fi`. Masks read as plain data (`v_mov_b32 v, s_mask`) belong to
   #293 and are left out with `--no-maskdata`.
+- **`--ext` (wave64 programs only).** Adds the ops the list above leaves out: carries (`v_add_co`, `v_sub_co`,
+  `v_subrev_co_u32` and the `_ci` forms) through SGPR pairs and VCC; `ds_bpermute_b32`, `ds_permute_b32` (address
+  permutations and colliding addresses) and `ds_swizzle_b32` (`QUAD_PERM`, `BITMASK_PERM`, `SWAP`, `REVERSE`,
+  `BROADCAST`); `v_readlane`/`v_writelane` with an SGPR lane select of 64 and up; `s_bcnt0/1` and `s_ff0/1` of a
+  mask, `s_and/or/xor/andn2_b64`, the ten `s_*_saveexec_b64` forms and `s_andn1/andn2_wrexec_b64`, `s_wqm_b64`,
+  `s_cmp_eq/lg_u64` and `s_bitcmp0/1_b64`, each followed by an `s_cselect_b32` so that its SCC is stored;
+  `s_cselect_b64` between masks, `s_mov_b64 exec, mask`, `s_bfm_b64` into a mask or EXEC; and a loop in LLVM's
+  SI_LOOP shape (per-lane trip counts of 1 to 8, a break mask, `s_andn2_b64 exec`, `s_cbranch_execnz` back to the
+  head) around one to four of the other ops. Without the flag, and for wave32 programs with it, a seed gives the
+  same program as before. The model of every op was checked on an AMD Radeon RDNA2 iGPU (gfx1036, Ryzen 9
+  9950X3D, raw wave64 kernels): `--ext --dpp --wave 64 --oracle hw --programs 100 --seed 21` matches 100/100,
+  with groups of one to three waves and partial waves. What that run settled where the ISA guide is terse: the
+  three DS ops need `s_waitcnt lgkmcnt(0)` before their result is used (without it a later VALU write to the same
+  VGPR is overwritten when the result arrives; the generator emits the wait); `ds_bpermute_b32` and
+  `ds_permute_b32` stay inside the lane's 32-lane half; with several senders `ds_permute_b32` keeps the highest
+  lane's value; an EXEC-off source reads 0 in `ds_bpermute_b32` and in `ds_swizzle_b32`. The translator matches
+  the same 100 programs on that GPU both natively (64-wide subgroup, `--w64-native`) and with
+  `--wave64-emulate`, apart from 15 that reach a known open case and are filed `hyp_only`: an EXEC-off
+  `v_permlane` source (#580) or `ds_swizzle_b32` source (#2780, tagged like the permlane case until it lands). An
+  RTX 5080 (driver 616.92) gives 46 matches and 14 `hyp_only` of 60 emulated programs (`--seed 23`). Not
+  generated: 32-bit ops on one half of a mask or of EXEC (#663, #3225) and carries with a DPP source (#3553).
 - **Reference.** A 64-lane model in the same file, written from the ISA (rules in its docstring). Its unit
   test, `tests/test_crosslane_fuzz.py`, needs no GPU.
 - **Defined behaviour only.** Lane selects, permlane and DPP never read a lane missing from a partial wave.
