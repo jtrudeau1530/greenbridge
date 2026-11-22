@@ -555,6 +555,35 @@ class SccVotePolarity(unittest.TestCase):
         self.assertEqual([w[0] for w in halves], [3 + k for k in range(32)] + [0] * 32)
         self.assertEqual(tier, "C")
 
+    def test_mov_of_the_mask_keeps_the_cmp_eq_vote(self):
+        # s_mov_b64 writes no SCC: scc0 after cmp_eq is "mask not empty", the wrong side to skip the narrowing. Tagged
+        # as a vote on the copy (non-empty polarity) the same skip looked like the exact one: a false tier A
+        tier, whole, halves = self.run_both("vs_mov_keeps_vote", vs(self.HEAD + [
+            "s_cmp_eq_u64 s[20:21], 0", "s_mov_b64 s[22:23], vcc", "s_cbranch_scc0 2",
+            "s_and_b64 exec, exec, s[22:23]", "v_add_nc_u32_e32 v6, 3, v0", "s_mov_b64 exec, s[10:11]"]))
+        self.assertEqual(tier, "C")
+        self.assertEqual(whole, halves)       # equal on this input; the tier is about the branch sense
+
+    def test_cselect_result_is_no_vote_execution(self):
+        # s_cselect_b64 reads SCC and writes none: scc1 after cmp_eq skips when the mask is empty; the narrowing by the
+        # cselect result is the wrong thing to skip and the halves differ from the wave
+        tier, whole, halves = self.run_both("vs_cselect_keeps_vote", vs(self.HEAD + [
+            "s_cmp_eq_u64 s[20:21], 0", "s_cselect_b64 s[22:23], s[20:21], exec", "s_cbranch_scc1 2",
+            "s_and_b64 exec, exec, s[22:23]", "v_add_nc_u32_e32 v6, 3, v0", "s_mov_b64 exec, s[10:11]"]))
+        self.assertEqual(tier, "C")
+        self.assertNotEqual(whole, halves)
+
+    def test_cselect_and_mov_keep_the_scc_vote(self):
+        # neither s_cselect_b64 nor s_mov_b64 of a mask writes SCC: the vote stays on the compared mask
+        for name, mid in (("vs_keep_cselect", "s_cselect_b64 s[22:23], s[20:21], exec"),
+                          ("vs_keep_mov_vcc", "s_mov_b64 s[22:23], vcc")):
+            self.tier(name, vs(self.HEAD + [
+                "s_cmp_eq_u64 s[20:21], 0", mid, "s_cbranch_scc1 1", "s_branch 1", "s_and_b64 exec, exec, s[20:21]",
+                "v_add_nc_u32_e32 v6, 3, v0"]), "C", contains=["unsafe-vote-branch"])
+            self.tier(name + "_a", vs(self.HEAD + [
+                "s_cmp_eq_u64 s[20:21], 0", mid, "s_cbranch_scc1 2", "s_and_b64 exec, exec, s[20:21]",
+                "v_add_nc_u32_e32 v6, 3, v0", "s_mov_b64 exec, s[10:11]"]), "A")
+
     def test_cmp_eq_wrong_polarity_classification(self):
         # the same skip with the branch sense flipped: scc0 after cmp_eq jumps over the narrowing when lanes vote yes
         self.tier("vs_cmp_eq_scc0", vs(self.HEAD + [

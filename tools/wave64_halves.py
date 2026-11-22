@@ -570,8 +570,9 @@ class Analysis:
                 elif r and r[0] in st["g"] and st["g"][r[0]][0] in ("mask", "elect", "wfmask"):
                     tag = st["g"][r[0]]
             put(dests[0], t_src, tag)
-            T["scc"] = X
-            st["g"]["scc"] = ("vote", _regs(dests[0])[0] if _regs(dests[0]) else "exec")
+            if not op.startswith(("s_mov", "s_cselect")):     # those leave SCC as it was: no vote on their dest
+                T["scc"] = X
+                st["g"]["scc"] = ("vote", _regs(dests[0])[0] if _regs(dests[0]) else "exec")
             return
 
         # --- register swap and dynamic indexing
