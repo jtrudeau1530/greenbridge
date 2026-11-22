@@ -637,5 +637,174 @@ class TestSymbolicAST(unittest.TestCase):
         self.assertEqual(i1, i2)
 
 
+# ==============================================================================
+# Deterministic Scalar Instruction Interpreter
+# ==============================================================================
+
+@dataclass
+class ScalarMachineState:
+    """Architectural register file for single-lane scalar interpretation."""
+    vgprs: List[int] = field(default_factory=lambda: [0] * 256)
+    sgprs: List[int] = field(default_factory=lambda: [0] * 106)
+    vcc: int = 0
+
+    def get_reg64(self, reg: RegPair) -> int:
+        if reg.kind == RegKind.VGPR:
+            lo = self.vgprs[reg.index] & MASK32
+            hi = self.vgprs[reg.index + 1] & MASK32
+            return pack_pk_f32(lo, hi)
+        elif reg.kind == RegKind.SGPR:
+            lo = self.sgprs[reg.index] & MASK32
+            hi = self.sgprs[reg.index + 1] & MASK32
+            return pack_pk_f32(lo, hi)
+        raise TypeError(f"Unknown RegKind: {reg.kind}")
+
+    def set_reg64(self, reg: RegPair, val: int) -> None:
+        lo, hi = unpack_pk_f32(val)
+        if reg.kind == RegKind.VGPR:
+            self.vgprs[reg.index] = lo
+            self.vgprs[reg.index + 1] = hi
+        elif reg.kind == RegKind.SGPR:
+            self.sgprs[reg.index] = lo
+            self.sgprs[reg.index + 1] = hi
+        else:
+            raise TypeError(f"Unknown RegKind: {reg.kind}")
+
+
+class ScalarInterpreter:
+    """Deterministic scalar instruction interpreter for packed single-precision min/max."""
+
+    def resolve_operand(self, op: VOP3POperand, state: ScalarMachineState) -> int:
+        if isinstance(op.source, RegPair):
+            return state.get_reg64(op.source)
+        elif isinstance(op.source, Literal64):
+            return op.source.bits
+        raise TypeError(f"Unsupported operand source type: {type(op.source)}")
+
+    def step(self, instr: VPkMinMaxF32Instruction, state: ScalarMachineState) -> int:
+        s0_raw = self.resolve_operand(instr.src0, state)
+        s1_raw = self.resolve_operand(instr.src1, state)
+
+        op_sel = (
+            instr.src0.op_sel[0],
+            instr.src1.op_sel[0],
+            instr.src0.op_sel[1],
+            instr.src1.op_sel[1],
+        )
+
+        if instr.opcode == Opcode.V_PK_MIN_F32:
+            res = oracle_pk_min_f32(
+                s0_raw, s1_raw,
+                op_sel=op_sel,
+                abs0_lo=instr.src0.abs_lo, neg0_lo=instr.src0.neg_lo,
+                abs1_lo=instr.src1.abs_lo, neg1_lo=instr.src1.neg_lo,
+                abs0_hi=instr.src0.abs_hi, neg0_hi=instr.src0.neg_hi,
+                abs1_hi=instr.src1.abs_hi, neg1_hi=instr.src1.neg_hi,
+                clamp=instr.clamp,
+            )
+        elif instr.opcode == Opcode.V_PK_MAX_F32:
+            res = oracle_pk_max_f32(
+                s0_raw, s1_raw,
+                op_sel=op_sel,
+                abs0_lo=instr.src0.abs_lo, neg0_lo=instr.src0.neg_lo,
+                abs1_lo=instr.src1.abs_lo, neg1_lo=instr.src1.neg_lo,
+                abs0_hi=instr.src0.abs_hi, neg0_hi=instr.src0.neg_hi,
+                abs1_hi=instr.src1.abs_hi, neg1_hi=instr.src1.neg_hi,
+                clamp=instr.clamp,
+            )
+        else:
+            raise ValueError(f"Unsupported opcode: {instr.opcode}")
+
+        state.set_reg64(instr.dst, res)
+        return res
+
+
+class TestScalarInterpreter(unittest.TestCase):
+    """Unit tests for the deterministic scalar interpreter."""
+
+    def setUp(self) -> None:
+        self.interp = ScalarInterpreter()
+        self.state = ScalarMachineState()
+
+    def test_scalar_vgpr_vgpr_pk_min(self) -> None:
+        # v[2:3]: (hi=2.0, lo=-1.0), v[4:5]: (hi=0.5, lo=1.0)
+        self.state.set_reg64(RegPair(2, RegKind.VGPR), pack_pk_f32(NEG_ONE, POS_TWO))
+        self.state.set_reg64(RegPair(4, RegKind.VGPR), pack_pk_f32(POS_ONE, POS_HALF))
+
+        instr = VPkMinMaxF32Instruction(
+            opcode=Opcode.V_PK_MIN_F32,
+            dst=RegPair(0, RegKind.VGPR),
+            src0=VOP3POperand(RegPair(2, RegKind.VGPR)),
+            src1=VOP3POperand(RegPair(4, RegKind.VGPR)),
+        )
+        res = self.interp.step(instr, self.state)
+        expected = pack_pk_f32(NEG_ONE, POS_HALF)
+        self.assertEqual(res, expected)
+        self.assertEqual(self.state.get_reg64(RegPair(0, RegKind.VGPR)), expected)
+
+    def test_scalar_vgpr_sgpr_pk_max(self) -> None:
+        # v[0:1]: (hi=-2.0, lo=0.5), s[4:5]: (hi=1.0, lo=1.0)
+        self.state.set_reg64(RegPair(0, RegKind.VGPR), pack_pk_f32(POS_HALF, NEG_TWO))
+        self.state.set_reg64(RegPair(4, RegKind.SGPR), pack_pk_f32(POS_ONE, POS_ONE))
+
+        instr = VPkMinMaxF32Instruction(
+            opcode=Opcode.V_PK_MAX_F32,
+            dst=RegPair(6, RegKind.VGPR),
+            src0=VOP3POperand(RegPair(0, RegKind.VGPR)),
+            src1=VOP3POperand(RegPair(4, RegKind.SGPR)),
+        )
+        res = self.interp.step(instr, self.state)
+        expected = pack_pk_f32(POS_ONE, POS_ONE)
+        self.assertEqual(res, expected)
+        self.assertEqual(self.state.get_reg64(RegPair(6, RegKind.VGPR)), expected)
+
+    def test_scalar_literal_and_modifiers(self) -> None:
+        # v[0:1]: (hi=-2.0, lo=-0.5)
+        # src0: abs on both -> (hi=2.0, lo=0.5)
+        # src1: literal (hi=1.0, lo=1.0)
+        self.state.set_reg64(RegPair(0, RegKind.VGPR), pack_pk_f32(NEG_HALF, NEG_TWO))
+
+        instr = VPkMinMaxF32Instruction(
+            opcode=Opcode.V_PK_MIN_F32,
+            dst=RegPair(4, RegKind.VGPR),
+            src0=VOP3POperand(RegPair(0, RegKind.VGPR), abs_lo=True, abs_hi=True),
+            src1=VOP3POperand(Literal64(pack_pk_f32(POS_ONE, POS_ONE))),
+        )
+        res = self.interp.step(instr, self.state)
+        expected = pack_pk_f32(POS_HALF, POS_ONE)
+        self.assertEqual(res, expected)
+
+    def test_scalar_clamp_mode(self) -> None:
+        # v[0:1]: (hi=2.0, lo=-1.0), v[2:3]: (hi=3.0, lo=-2.0)
+        self.state.set_reg64(RegPair(0, RegKind.VGPR), pack_pk_f32(NEG_ONE, POS_TWO))
+        self.state.set_reg64(RegPair(2, RegKind.VGPR), pack_pk_f32(NEG_TWO, f32_to_bits(3.0)))
+
+        instr = VPkMinMaxF32Instruction(
+            opcode=Opcode.V_PK_MAX_F32,
+            dst=RegPair(4, RegKind.VGPR),
+            src0=VOP3POperand(RegPair(0, RegKind.VGPR)),
+            src1=VOP3POperand(RegPair(2, RegKind.VGPR)),
+            clamp=True,
+        )
+        res = self.interp.step(instr, self.state)
+        expected = pack_pk_f32(POS_ZERO, POS_ONE)
+        self.assertEqual(res, expected)
+
+    def test_scalar_determinism(self) -> None:
+        runs = []
+        for _ in range(50):
+            st = ScalarMachineState()
+            st.set_reg64(RegPair(0, RegKind.VGPR), 0x3F80000040000000)
+            st.set_reg64(RegPair(2, RegKind.VGPR), 0x404000003F000000)
+            instr = VPkMinMaxF32Instruction(
+                opcode=Opcode.V_PK_MIN_F32,
+                dst=RegPair(4, RegKind.VGPR),
+                src0=VOP3POperand(RegPair(0, RegKind.VGPR)),
+                src1=VOP3POperand(RegPair(2, RegKind.VGPR)),
+            )
+            runs.append(self.interp.step(instr, st))
+        self.assertTrue(all(r == runs[0] for r in runs))
+
+
 if __name__ == "__main__":
     unittest.main()
