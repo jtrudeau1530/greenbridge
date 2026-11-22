@@ -667,6 +667,11 @@ Not measured here (hypothesis): which surfaces the 16 entries are (their names s
 variants), how `Type` selects a track type for peds, animals and vehicles, and the size of the deformation map
 (`DeformationWorldSpaceWidth` is the obvious input).
 
+## Map lights and the vehicle lane graph
+
+Light emitters on archetypes and entities, and the vehicle path nodes, links and junctions, are in
+[world_lights_paths.md](world_lights_paths.md) (`tools/world_lights_paths.py`).
+
 ## No-sharing rule
 
 Everything here is aggregate. Do not commit archives, carved streams, extracted models/textures, entity
