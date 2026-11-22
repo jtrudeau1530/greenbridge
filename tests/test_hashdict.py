@@ -63,8 +63,9 @@ class JenkinsHashTest(unittest.TestCase):
             self.assertEqual(h & 0xFFFFFFFF, h)
 
     def test_latin1_encoding_and_replacement(self):
-        # Latin-1 character in range 0-255
-        self.assertEqual(hashdict.joaat("café"), hashdict.joaat("caf\xe9"))
+        # Latin-1 character in range 0-255: é hashes as the one byte 0xE9. "café" and "caf\xe9" are the same
+        # Python string, so the value is pinned (Latin-1 joaat, computed independently) instead of compared.
+        self.assertEqual(hashdict.joaat("caf\xe9"), 0xEEFBF723)
         # Character outside Latin-1 range is replaced with '?'
         self.assertEqual(hashdict.joaat("caf\u20ac"), hashdict.joaat("caf?"))
 
