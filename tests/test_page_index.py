@@ -139,6 +139,32 @@ class PageIndexTest(unittest.TestCase):
                              [(0x1111, 0x10, 0x60, 0), (0x2222, 0x20, 0x120, 1)])
             self.assertEqual(page_doc["span"], 0x140)
 
+    def test_new_page_after_a_continuation_is_reported_with_both_streams(self):
+        # The first page's q38 target stays out of reach even after both following streams, so the
+        # second page is consumed as a continuation before it is recognised as a new directory page.
+        first = header(0x100, q38=0xC0, counts=(0, 0, 1, 0))
+        put_q38(first, 0xC0, [(0x1234, 0x10, 0x10000)])
+        cont = b"\xbb" * 0x100
+        second = header(0x100, q38=0xC0, counts=(0, 0, 1, 0))
+        put_q38(second, 0xC0, [(0x5678, 0x10, 0x60)])
+        with tempfile.TemporaryDirectory() as tmp:
+            arc = os.path.join(tmp, "nextpage.rpf")
+            out = os.path.join(tmp, "pages.json")
+            offsets = make_rpf(arc, [first, cont, second])
+            run_tool(arc, out)
+            with open(out, encoding="utf-8") as f:
+                doc = json.load(f)
+        self.assertEqual(doc["summary"]["pages"], 2)
+        reported, fresh = doc["pages"]
+        self.assertEqual([c["offset"] for c in reported["continuations"]], [offsets[1], offsets[2]])
+        self.assertFalse(reported["complete"])
+        self.assertEqual(reported["error"], "resource ended before q38 was complete")
+        self.assertEqual(reported["q38_records"], [])
+        self.assertEqual(reported["offset"], offsets[0])
+        self.assertTrue(fresh["complete"])
+        self.assertEqual(fresh["offset"], offsets[2])
+        self.assertEqual([(r["hash"], r["target"]) for r in fresh["q38_records"]], [(0x5678, 0x60)])
+
     def test_carve_directory_mode(self):
         page = header(0x100, q38=0xC0, counts=(0, 0, 1, 0))
         put_q38(page, 0xC0, [(0x9999, 0x20, 0x100)])

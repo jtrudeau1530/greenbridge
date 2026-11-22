@@ -346,6 +346,23 @@ class RttiScanCoreTest(unittest.TestCase):
             data = json.load(f)
         self.assertEqual(data["type_descriptors"], 1)
 
+    def test_output_it_cannot_write_is_one_line(self):
+        img_path = os.path.join(self.tmp.name, "unwritable.exe")
+        with open(img_path, "wb") as f:
+            f.write(make_synthetic_pe(text_bytes=b"\xc3" * 16, rdata_bytes=b"\x00" * 16))
+
+        for label, out in [
+            ("missing folder", os.path.join(self.tmp.name, "no_dir", "out.json")),
+            ("folder as file", self.tmp.name),
+        ]:
+            with self.subTest(label):
+                p = self.run_tool(img_path, "--out", out)
+                self.assertEqual(p.returncode, 1, p.stdout)
+                self.assertNotIn("Traceback", p.stderr)
+                self.assertTrue(p.stderr.startswith(f"ERROR: {out}: "), p.stderr)
+                self.assertEqual(len(p.stderr.strip().splitlines()), 1, p.stderr)
+                self.assertEqual(p.stdout, "")
+
     def test_invalid_pe_images_rejected_cleanly(self):
         good = bytearray(make_synthetic_pe(text_bytes=b"\xc3" * 16, rdata_bytes=b"\x00" * 16))
         bad_pe32 = bytearray(good)
