@@ -21,6 +21,7 @@
 #include "../src/resource_tiling.h"
 #include "../src/cached_pso.h"
 #include "../src/shader_library.h"
+#include "../src/spirv_f16_halves.h"
 #include "../src/vulkan_present.h"
 #include "../src/vulkan_device_filter.h"
 #include "../src/vulkan13_features.h"
@@ -2467,6 +2468,7 @@ public:
             const D3D12_SHADER_BYTECODE& code;
             const leonida::ShaderEntry* entry = nullptr;
             std::vector<std::uint8_t> fssm;
+            std::vector<std::uint32_t> words;
         };
         Stage stages[3] = {{"vs", VK_SHADER_STAGE_VERTEX_BIT, desc.VS},
                            {"gs", VK_SHADER_STAGE_GEOMETRY_BIT, desc.GS},
@@ -2513,11 +2515,24 @@ public:
                 }
                 code_stage = &stage;
             }
-            const std::vector<std::uint32_t> words = library->spirv(*stage.entry);
-            if (words.empty()) return E_FAIL;
+            stage.words = library->spirv(*stage.entry);
+            if (stage.words.empty()) return E_FAIL;
+        }
+        // --f16-interp-fallback (SHADER-378): align/synthesize VS decoded f16 halves for this (VS, PS) pair before
+        // creating the shader modules so colliding PS and high-param producers link within MoltenVK's 30 locations.
+        if (stages[0].entry && stages[1].entry && !stages[1].entry->f16_halves.empty()) {
+            std::string link_error;
+            if (!leonida::link_f16_halves(stages[0].words, *stages[0].entry, stages[1].words, *stages[1].entry,
+                                          &link_error)) {
+                std::fprintf(stderr, "[rt] d3d12: %s\n", link_error.c_str());
+                return E_FAIL;
+            }
+        }
+        for (Stage& stage : stages) {
+            if (!stage.entry) continue;
             VkShaderModuleCreateInfo module_info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
-            module_info.codeSize = words.size() * 4;
-            module_info.pCode = words.data();
+            module_info.codeSize = stage.words.size() * 4;
+            module_info.pCode = stage.words.data();
             VkShaderModule module = VK_NULL_HANDLE;
             if (vk.vkCreateShaderModule(dev, &module_info, nullptr, &module) != VK_SUCCESS) return E_FAIL;
             modules_.push_back(module);

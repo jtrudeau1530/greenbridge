@@ -636,7 +636,10 @@ struct ShaderEntry {
     std::string wave64_exchange;
     bool emulated() const { return !wave64_exchange.empty(); }
     std::vector<SignatureElement> input_signature;  // vertex shaders: what the input layout must feed
-    std::vector<std::uint32_t> outputs;             // pixel shaders: the render-target locations written
+    std::vector<std::uint32_t> inputs;              // pixel shaders: input locations declared
+    std::vector<std::uint32_t> outputs;             // pixel/vertex shaders: output locations written
+    // --f16-interp-fallback: param/attr index -> {low_half_location, high_half_location} (SHADER-378).
+    std::map<std::uint32_t, std::array<std::uint32_t, 2>> f16_halves;
 };
 
 class ShaderLibrary {
@@ -796,8 +799,19 @@ private:
                     e.input_signature.push_back(std::move(element));
                 }
             }
+            if (const Json* in = meta.find("inputs"); in && in->kind == Json::Kind::array)
+                for (const Json& item : in->array) e.inputs.push_back(u32(&item));
             if (const Json* o = meta.find("outputs"); o && o->kind == Json::Kind::array)
                 for (const Json& item : o->array) e.outputs.push_back(u32(&item));
+            if (const Json* fh = meta.find("f16_halves"); fh && fh->kind == Json::Kind::object) {
+                for (const auto& [key, val] : fh->object) {
+                    if (key.empty() || val.kind != Json::Kind::array || val.array.size() != 2) continue;
+                    char* end = nullptr;
+                    const unsigned long param = std::strtoul(key.c_str(), &end, 10);
+                    if (!end || *end != '\0') continue;
+                    e.f16_halves[std::uint32_t(param)] = {u32(&val.array[0]), u32(&val.array[1])};
+                }
+            }
             if (by_fspx) fspx_entries_[{e.stage, e.fspx_code_sha256}].push_back(e);
             if (by_fssm) entries_[{e.stage, e.fssm_sha256}].push_back(std::move(e));
             ++count_;

@@ -594,6 +594,8 @@ if(BUILD_TESTING)
   add_test(NAME descriptor_table COMMAND descriptor_table_test)
   add_executable(shader_library_test test/shader_library_test.cpp)
   add_test(NAME shader_library COMMAND shader_library_test)
+  add_executable(spirv_f16_halves_test test/spirv_f16_halves_test.cpp)
+  add_test(NAME spirv_f16_halves COMMAND spirv_f16_halves_test)
   # Optional: skips unless LEONIDA_SHADERS names a translated work folder (<work>/shaders/spirv).
   add_executable(shader_library_corpus_test test/shader_library_corpus_test.cpp)
   add_test(NAME shader_library_corpus COMMAND shader_library_corpus_test)
@@ -1266,6 +1268,14 @@ if(TARGET Vulkan::Headers)
     target_compile_options(d3d12_present_test PRIVATE /W4 /permissive- /utf-8)
     add_test(NAME d3d12_present COMMAND d3d12_present_test)
     set_tests_properties(d3d12_present PROPERTIES SKIP_RETURN_CODE 77)
+
+    # Per-pipeline --f16-interp-fallback linking (SHADER-378): 16-param VS + colliding PS rendered on Vulkan.
+    add_executable(d3d12_f16_halves_test test/d3d12_f16_halves_test.cpp shims/d3d12_xs_device.cpp)
+    target_link_libraries(d3d12_f16_halves_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
+    target_compile_definitions(d3d12_f16_halves_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_f16_halves_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME d3d12_f16_halves COMMAND d3d12_f16_halves_test)
+    set_tests_properties(d3d12_f16_halves PROPERTIES SKIP_RETURN_CODE 77)
 
     # PresentX and the frame events on the Vulkan device (shims/xbox_present.h), checked on swapchain pixels.
     add_executable(xbox_present_test test/xbox_present_test.cpp)

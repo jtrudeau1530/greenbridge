@@ -105,8 +105,32 @@ def pc_tail_chain(name, member, c):
 
 
 def f16_half_location(n, half):
-    """--f16-interp-fallback: the location of param n's decoded low (half 0) or high (half 1) f16 halves."""
+    """--f16-interp-fallback: the canonical location of param n's decoded low (half 0) or high (half 1) f16 halves."""
     return F16_HALF_TOP - 2 * n - 1 + half
+
+
+def assign_f16_half_locations(f16_attrs, raw_locs, top=F16_HALF_TOP):
+    """--f16-interp-fallback: map each attribute in `f16_attrs` to `(low_loc, high_loc)` in `0..top` (SHADER-378).
+
+    Keeps the canonical `28 - 2n` / `29 - 2n` slots whenever every pair fits in `0..top` without colliding with
+    `raw_locs` (preserving byte-identical output for non-colliding shaders). Otherwise packs all pairs downward from
+    `top` into free locations disjoint from `raw_locs`, raising `Unsupported` only when `0..top` has fewer than
+    `2 * len(f16_attrs)` free locations left.
+    """
+    attrs = sorted(f16_attrs)
+    if not attrs:
+        return {}
+    raw = set(raw_locs)
+    fixed = {n: (f16_half_location(n, 0), f16_half_location(n, 1)) for n in attrs}
+    if all(0 <= lo and hi <= top and lo not in raw and hi not in raw for lo, hi in fixed.values()):
+        return fixed
+    free = [loc for loc in range(top, -1, -1) if loc not in raw]
+    need = 2 * len(attrs)
+    if len(free) < need:
+        raise Unsupported(
+            f"--f16-interp-fallback: need {need} decoded-half locations, only {len(free)} free in 0..{top}"
+        )
+    return {n: (free[2 * k + 1], free[2 * k]) for k, n in enumerate(attrs)}
 
 
 def mesh_compute_layout(maxv, maxp, clip_count, cull_count, params):
@@ -186,6 +210,7 @@ class Gen:
         self.interpolated = set()   # inputs read through v_interp_p1/p2; the rest are flat (v_interp_mov only)
         self.per_vertex = set()     # PS: attribute numbers read by a *_f16 interp: PerVertexKHR, decoded per half
         self.f16_halves = set()     # PS, --f16-interp-fallback: the same attributes, read from decoded-half inputs
+        self.f16_half_locs = {}     # PS/VS/MS, --f16-interp-fallback: attr/param n -> (low_loc, high_loc)
         self.param_max = -1         # VS/MS: the highest exp paramN (--f16-interp-fallback keeps halves above it)
         self.f16_half_outs = {}     # VS/MS, --f16-interp-fallback: param n -> its two decoded-half output names
         self.ij_capture = {}        # computed-I/J pairs: pair key -> the I float id the p1 loaded (SHADER-177)
@@ -9462,11 +9487,8 @@ class Gen:
         input at f16_half_location(n, half), which the producer fills with that half decoded to f32 (F16_HALVES).
         Other reads of such an attribute take the raw word as on any location (smooth, or flat = provoking vertex)."""
         if half is not None and n in self.f16_halves:
-            loc = f16_half_location(n, half)
-            if loc < 0:
-                raise Unsupported(f"--f16-interp-fallback: attr{n} has no decoded-half location")
             name = f"%in_f16h{n}_{half}"
-            self.inputs[name] = loc
+            self.inputs.setdefault(name, None)  # resolved in assemble() once every raw attribute is known
             self.interpolated.add(name)
             p, v = self.tmp(), self.tmp()
             self.emit(f"{p} = OpAccessChain %_ptr_Input_float {name} {self.cu(comp)}")
@@ -10176,7 +10198,7 @@ class Gen:
             n = int(tgt[5:])
             for half, hv in enumerate(self.f16_halves_of(n, v)):
                 hname = f"%out_f16h{n}_{half}"
-                self.outputs[hname] = f"loc{f16_half_location(n, half)}"
+                self.outputs[hname] = f"loc{self.f16_half_locs[n][half]}"
                 old, sel = self.tmp(), self.tmp()
                 self.emit(f"{old} = OpLoad %v4float {hname}")
                 self.emit(f"{sel} = OpSelect %v4float {self.active_b()} {hv} {old}")
@@ -10185,9 +10207,11 @@ class Gen:
     def f16_halves_of(self, n, v):
         """--f16-interp-fallback: param n's exported vec4 `v` as two vec4s, the low and the high f16 half of each
         channel's raw word decoded to f32 (UnpackHalf2x16), or () when their locations would overlap a param this
-        shader exports (or fall below location 0): the PS reading them is then fed by another producer or rejects."""
-        if f16_half_location(n, 0) <= self.param_max:
-            return ()
+        shader exports (or fall below location 0): runtime PSO linking synthesizes missing halves per pair."""
+        if n not in self.f16_half_locs:
+            if f16_half_location(n, 0) <= self.param_max:
+                return ()
+            self.f16_half_locs[n] = (f16_half_location(n, 0), f16_half_location(n, 1))
         lo, hi = [], []
         for c in range(4):
             e, u, h2, a, b = (self.tmp() for _ in range(5))
@@ -10344,8 +10368,11 @@ def assemble(gen):
     gsx = gen.stage == "gs"
     msc = ms and MESH_COMPUTE
     # --f16-interp-fallback, mesh: the params whose decoded halves fit clear of this shader's params (Gen.f16_halves_of)
-    ms_halves = [n for n in sorted(gen.ms_params) if F16_HALVES and f16_half_location(n, 0) > gen.param_max] \
-        if ms and not msc else []
+    if ms and not msc and F16_HALVES:
+        for n in sorted(gen.ms_params):
+            if n not in gen.f16_half_locs and f16_half_location(n, 0) > gen.param_max:
+                gen.f16_half_locs[n] = (f16_half_location(n, 0), f16_half_location(n, 1))
+    ms_halves = [n for n in sorted(gen.ms_params) if n in gen.f16_half_locs] if ms and not msc else []
     if msc:
         gen.msc_layout = mesh_compute_layout(gen.ms["maxv"], gen.ms["maxp"], gen.clip_count if gen.uses_clip else 0,
                                              gen.cull_count if gen.uses_cull else 0, gen.ms_params)
@@ -10413,12 +10440,19 @@ def assemble(gen):
     # --bary-fallback: %bary is a plain input at the lowest location no attribute uses, so no capability or
     # extension. Lowest free, not one past the highest: a PS whose only input is attr30 would otherwise put it at 31,
     # past what drivers with 128 input components accept (#804 review).
+    if gen.stage == "ps" and gen.f16_halves:
+        raw_locs = {v for k, v in gen.inputs.items() if not k.startswith("%in_f16h") and v is not None}
+        gen.f16_half_locs = assign_f16_half_locations(gen.f16_halves, raw_locs)
+        for k in list(gen.inputs):
+            if k.startswith("%in_f16h"):
+                a_str, h_str = k[len("%in_f16h"):].split("_")
+                gen.inputs[k] = gen.f16_half_locs[int(a_str)][int(h_str)]
     used = set(gen.inputs.values())
     if len(used) != len(gen.inputs):    # --f16-interp-fallback: a decoded-half location is also an attribute
         raise Unsupported("--f16-interp-fallback: a decoded-half location is also read as an attribute")
     # The producer fills both halves of every attribute in f16_halves (the index's f16_halves lists the pair), so a
     # raw attribute at the location of a half this shader doesn't read is overwritten all the same.
-    reserved = {f16_half_location(n, h) for n in gen.f16_halves for h in (0, 1)}
+    reserved = {loc for pair in gen.f16_half_locs.values() for loc in pair} if gen.stage == "ps" else set()
     if any(not k.startswith("%in_f16h") and v in reserved for k, v in gen.inputs.items()):
         raise Unsupported("--f16-interp-fallback: a decoded-half location is also read as an attribute")
     gen.bary_location = next(n for n in range(len(used) + 1) if n not in used) if bary and BARY_FALLBACK else None
@@ -10547,7 +10581,7 @@ def assemble(gen):
                     "OpMemberDecorate %ms_cull_blk 0 BuiltIn CullPrimitiveEXT",
                     "OpMemberDecorate %ms_cull_blk 0 PerPrimitiveEXT"]
             dec += [f"OpDecorate %ms_out_param{n} Location {n}" for n in sorted(gen.ms_params)]
-            dec += [f"OpDecorate %ms_out_f16h{n}_{h} Location {f16_half_location(n, h)}" for n in ms_halves
+            dec += [f"OpDecorate %ms_out_f16h{n}_{h} Location {gen.f16_half_locs[n][h]}" for n in ms_halves
                     for h in (0, 1)]
     if vs:
         if gen.uses_clip:
@@ -12784,17 +12818,16 @@ def shader_meta(g, asm, src_path=None, fssm_path=None):
         m["bary_fallback_input"] = {"location": g.bary_location}
     if F16_HALVES and g.stage in ("vs", "ms", "ps"):
         # --f16-interp-fallback: PS = the attributes whose f16 reads take decoded halves, VS/MS = the params that
-        # export them; each as {n: [low-half location, high-half location]}. A pipeline links when every PS entry
-        # is among its producer's (see F16_HALVES).
-        if g.stage == "ps":
-            ns = sorted(g.f16_halves)
-        elif g.stage == "ms":
-            ns = sorted(g.ms_params)
+        # export them; each as {n: [low-half location, high-half location]}. When a PS's canonical half slots would
+        # collide with its raw attributes, assign_f16_half_locations packs them into free locations <= F16_HALF_TOP
+        # and runtime PSO linking patches/synthesizes the producer's halves to match (SHADER-378).
+        if g.stage == "ms" and getattr(g, "msc_layout", None) is not None:
+            pairs = {n: (f16_half_location(n, 0), f16_half_location(n, 1))
+                     for n in sorted(g.ms_params) if f16_half_location(n, 0) > g.param_max}
         else:
-            ns = sorted({int(t[5:]) for t in g.outputs.values() if t.startswith("param")})
-        ns = [n for n in ns if g.stage == "ps" or f16_half_location(n, 0) > g.param_max]
-        if ns:
-            m["f16_halves"] = {str(n): [f16_half_location(n, 0), f16_half_location(n, 1)] for n in ns}
+            pairs = g.f16_half_locs
+        if pairs:
+            m["f16_halves"] = {str(n): [lo, hi] for n, (lo, hi) in sorted(pairs.items())}
             if "mesh_compute" in m:     # tools/mesh_compute_vs.py exports them from the slot's raw params
                 m["mesh_compute"] = dict(m["mesh_compute"], f16_halves=m["f16_halves"])
     if g.build_meta:
