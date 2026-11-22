@@ -385,6 +385,44 @@ class CarveAndExtraCLITest(unittest.TestCase):
         with open(index, "rb") as f:
             self.assertEqual(f.read(), before)
 
+    def assert_carved_blob_preserved(self, output, blob):
+        with open(blob, "rb") as f:
+            original = f.read()
+        p = self.run_tool(self.carve_dir, "--out", output)
+        self.assertEqual(p.returncode, 2, p.stderr)
+        self.assertIn("is one of the inputs", p.stderr)
+        self.assertNotIn("Traceback", p.stderr)
+        with open(blob, "rb") as f:
+            self.assertEqual(f.read(), original)
+
+    def test_out_cannot_replace_a_harvested_blob(self):
+        # The existing --out check protects index.json and --extra, but the
+        # <offset>.bin files read during harvesting are inputs as well.
+        for archive, offset in (("common", 0), ("custom_pack", 32)):
+            with self.subTest(archive=archive):
+                blob = os.path.join(self.carve_dir, archive, f"{offset:012x}.bin")
+                self.assert_carved_blob_preserved(blob, blob)
+
+    def test_out_cannot_replace_a_hard_link_to_a_harvested_blob(self):
+        blob = os.path.join(self.carve_dir, "common", f"{0:012x}.bin")
+        alias = os.path.join(self.dir, "harvest_alias.json")
+        try:
+            os.link(blob, alias)
+        except (OSError, NotImplementedError) as error:
+            self.skipTest(f"hard links unavailable: {error}")
+        self.assert_carved_blob_preserved(alias, blob)
+        self.assertTrue(os.path.samefile(blob, alias))
+
+    def test_out_cannot_replace_a_symlink_to_a_harvested_blob(self):
+        blob = os.path.join(self.carve_dir, "common", f"{0:012x}.bin")
+        alias = os.path.join(self.dir, "harvest_link.json")
+        try:
+            os.symlink(blob, alias)
+        except (OSError, NotImplementedError) as error:
+            self.skipTest(f"symlinks unavailable: {error}")
+        self.assert_carved_blob_preserved(alias, blob)
+        self.assertTrue(os.path.islink(alias))
+
     def test_build_requires_an_explicit_carve_directory(self):
         empty = os.path.join(self.dir, "empty")
         os.mkdir(empty)
