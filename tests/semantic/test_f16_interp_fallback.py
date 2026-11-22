@@ -103,13 +103,71 @@ class FallbackPixelShader(unittest.TestCase):
         words = support.mrt0_words(spv, inputs={k: v for k, v in self.inputs().items() if k != "%in_f16h0_1"})
         self.assertEqual([f"{w & 0xFFFF:#06x}" for w in words[:2]], ["0x3f00", "0x3f00"])
 
-    def test_location_clash_is_rejected(self):
-        """attr28 read as f32 sits where attr0's low halves go: refuse instead of reading the wrong data."""
+    def test_location_clash_packs_dynamically(self):
+        """SHADER-378: attr28 read as f32 sits where attr0's canonical low half (28) would go: pack attr0's halves
+        into the highest free locations <= 29 instead of rejecting."""
         clash = ["v_interp_p1ll_f16 v2, v0, attr0.x", "v_interp_p2_f16 v2, v1, attr0.x, v2",
                  "v_interp_p1_f32_e32 v3, v0, attr28.x", "v_interp_p2_f32_e32 v3, v1, attr28.x",
                  "exp mrt0 v2, v3, v3, v3 done vm", "s_endpgm"]
-        with self.assertRaises(rdna2spirv.Unsupported):
-            translate("ps_f16_clash", clash)
+        spv, meta = translate("ps_f16_packed", clash)
+        self.assertEqual(meta["f16_halves"], {"0": [27, 29]})
+        self.assertIn("OpDecorate %in_f16h0_0 Location 27", spv)
+        self.assertIn("OpDecorate %in_attr28 Location 28", spv)
+        self.assertEqual(meta["inputs"], [27, 28])
+        words = support.mrt0_words(spv, inputs={"%in_f16h0_0": (lerp(LO), 0.0, 0.0, 0.0),
+                                                "%in_attr28": (0.6875, 0.0, 0.0, 0.0)})
+        self.assertEqual(f"{words[0] & 0xFFFF:#06x}", "0x3f00")
+        self.assertEqual(f32(words[1]), 0.6875)
+
+    def test_corpus_high_attr_patterns_pack_within_moltenvk_budget(self):
+        """SHADER-378: corpus PS patterns (raw attrs 0..14 with f16 reads on attrs >= 7, up to attr12) pack all
+        decoded halves into free locations <= 29 without colliding with any raw attribute."""
+        lines = []
+        for a in range(15):
+            lines += [f"v_interp_p1_f32_e32 v{10 + a}, v0, attr{a}.x",
+                      f"v_interp_p2_f32_e32 v{10 + a}, v1, attr{a}.x"]
+        for i, a in enumerate((0, 4, 5, 6, 7)):
+            v = 30 + i
+            lines += [f"v_interp_p1ll_f16 v{v}, v0, attr{a}.x",
+                      f"v_interp_p2_f16 v{v}, v1, attr{a}.x, v{v}"]
+        lines += ["v_interp_p1ll_f16 v40, v0, attr7.x high",
+                  "v_interp_p2_f16 v40, v1, attr7.x, v40 high",
+                  "exp mrt0 v34, v40, v24, v10 done vm", "s_endpgm"]
+        spv, meta = translate("ps_f16_corpus_pack", lines)
+        self.assertEqual(meta["f16_halves"], {
+            "0": [28, 29], "4": [26, 27], "5": [24, 25], "6": [22, 23], "7": [20, 21],
+        })
+        self.assertLessEqual(max(meta["inputs"]), 29)
+        self.assertEqual(len(meta["inputs"]), len(set(meta["inputs"])))
+        inputs = {f"%in_attr{a}": (float(a), 0.0, 0.0, 0.0) for a in range(15)}
+        for a in (0, 4, 5, 6):
+            inputs[f"%in_f16h{a}_0"] = (0.0, 0.0, 0.0, 0.0)
+        inputs["%in_f16h7_0"] = (lerp(LO), 0.0, 0.0, 0.0)
+        inputs["%in_f16h7_1"] = (lerp(HI), 0.0, 0.0, 0.0)
+        words = support.mrt0_words(spv, inputs=inputs)
+        self.assertEqual(f"{words[0] & 0xFFFF:#06x}", "0x3f00")      # attr7 low: 1.75
+        self.assertEqual(f"{words[1] & 0xFFFF:#06x}", "0x4880")      # attr7 high: 9.0
+        self.assertEqual(f32(words[2]), 14.0)                         # raw attr14
+
+    def test_high_attr_negative_canonical_slot_packs_dynamically(self):
+        """attr15 has canonical slot 28 - 30 = -2; dynamic packing still places it in 0..29."""
+        lines = ["v_interp_p1ll_f16 v2, v0, attr15.x", "v_interp_p2_f16 v2, v1, attr15.x, v2",
+                 "exp mrt0 v2, v2, v2, v2 done vm", "s_endpgm"]
+        spv, meta = translate("ps_f16_attr15", lines)
+        self.assertEqual(meta["f16_halves"], {"15": [28, 29]})
+        self.assertIn("OpDecorate %in_f16h15_0 Location 28", spv)
+
+    def test_location_budget_overflow_is_rejected(self):
+        """29 raw attributes (0..28) plus 1 f16 attribute needs 31 locations > 30: still rejected."""
+        lines = []
+        for a in range(29):
+            lines += [f"v_interp_p1_f32_e32 v{10 + a}, v0, attr{a}.x",
+                      f"v_interp_p2_f32_e32 v{10 + a}, v1, attr{a}.x"]
+        lines += ["v_interp_p1ll_f16 v2, v0, attr0.x", "v_interp_p2_f16 v2, v1, attr0.x, v2",
+                  "exp mrt0 v2, v10, v10, v10 done vm", "s_endpgm"]
+        with self.assertRaises(rdna2spirv.Unsupported) as ctx:
+            translate("ps_f16_overflow", lines)
+        self.assertIn("decoded-half locations", str(ctx.exception))
 
     def test_off_by_default(self):
         spv, meta = translate("ps_f16_fallback", SHADER.splitlines(), fallback=False)

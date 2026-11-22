@@ -339,7 +339,8 @@ int main() {
                  " \"vs_same_program\": {\"stage\": \"vs\", \"fssm_sha256\": \"" << hash << "\", \"input_signature\": ["
                  "{\"semantic\": \"TEXCOORD\", \"semantic_index\": 3, \"register\": -1, \"system_value\": 0, "
                  "\"component_type\": \"float\"}]},\n"
-                 " \"ps_out\": {\"stage\": \"ps\", \"fssm_sha256\": \"" << hash << "\", \"outputs\": [0, 2]},\n"
+                 " \"ps_out\": {\"stage\": \"ps\", \"fssm_sha256\": \"" << hash << "\", \"inputs\": [0, 1, 28, 29], "
+                 "\"outputs\": [0, 2], \"f16_halves\": {\"0\": [28, 29], \"bad\": [1], \"7\": [20, 21]}},\n"
                  " \"ps_native\": {\"stage\": \"ps\", \"fssm_sha256\": \"" << hash2 << "\", \"wave64\": true, "
                  "\"subgroup_size\": 64},\n"
                  " \"cs_emulated\": {\"stage\": \"cs\", \"fssm_sha256\": \"" << hash2 << "\", \"wave64\": true, "
@@ -364,6 +365,9 @@ int main() {
           vs_all[1]->input_signature[0].register_index == 0);
     const ShaderEntry* ps = library.find("ps", hash);
     CHECK(ps && ps->outputs.size() == 2 && ps->outputs[1] == 2);
+    CHECK(ps->inputs.size() == 4 && ps->inputs[0] == 0 && ps->inputs[3] == 29);
+    CHECK(ps->f16_halves.size() == 2 && ps->f16_halves.at(0)[0] == 28 && ps->f16_halves.at(0)[1] == 29 &&
+          ps->f16_halves.at(7)[0] == 20 && ps->f16_halves.at(7)[1] == 21);
     const ShaderEntry* entry = library.find("cs", sha256_hex(fssm_program(shader)));
     CHECK(entry && entry->name == "cs_test" && entry->binding_count == 1 && entry->push_constant_bytes == 144);
     CHECK(entry->local_size[0] == 64 && entry->uses_code_base && !entry->wave64);
