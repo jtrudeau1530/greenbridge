@@ -82,5 +82,10 @@ def test_small_fixed_seed_run_is_clean():
     assert counts["pass"] == 5, counts
 
 
+def test_cli_reports_the_number_of_programs_run(capsys):
+    assert sd.main(["--programs", "5", "--limit", "2"]) == 0
+    assert capsys.readouterr().out.startswith("2 programs (seed 1): 2 pass,")
+
+
 def test_self_test_passes():
     assert sd.self_test() is True
