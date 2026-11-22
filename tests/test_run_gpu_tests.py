@@ -69,16 +69,16 @@ class TextureTestOnASmallPushConstantDevice(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             args = SimpleNamespace(filter=name, build=tmp, llvm_mc="unused")
 
-            def translate(_cmd, env=None, gpu=True):
-                (Path(tmp) / "spirv" / f"{name}.spv").touch()
-                return 0, ""
+            def launch(cmd: list[str], **_kwargs: object) -> SimpleNamespace:
+                if cmd[:3] == [sys.executable, "-I", rgt.TRANSLATOR]:
+                    (Path(tmp) / "spirv" / f"{name}.spv").touch()
+                    return SimpleNamespace(returncode=0, stdout="", stderr="")
+                return SimpleNamespace(returncode=77, stdout="", stderr=self.UNSUPPORTED_MSG)
 
             output = io.StringIO()
-            texture = SimpleNamespace(returncode=77, stdout="", stderr=self.UNSUPPORTED_MSG)
             with (patch.object(rgt, "assemble_to_s", side_effect=lambda _mc, _src, dst, _name: Path(dst).touch()),
                   patch.object(rgt, "spirv_as"),
-                  patch.object(rgt, "run_cmd", side_effect=translate),
-                  patch.object(rgt.subprocess, "run", return_value=texture),
+                  patch.object(rgt.subprocess, "run", side_effect=launch),
                   contextlib.redirect_stdout(output), contextlib.redirect_stderr(output)):
                 rc = rgt.run_suite(args, tmp)
             return rc, output.getvalue()
