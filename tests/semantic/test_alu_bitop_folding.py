@@ -11,6 +11,11 @@ Features covered:
   - Involution: ~(~x) == x.
   - Absorption: x | (x & y) == x, x & (x | y) == x.
   - Commutativity, associativity, distributivity, De Morgan's laws, and complementarity.
+- Instruction interpreter modeling constant folding and canonicalization:
+  - AST representation of bitwise expressions (ConstExpr, RegExpr, UnaryExpr, BinaryExpr).
+  - Multi-instruction ALU folding sequences: v_and_b32, v_or_b32, v_xor_b32, v_not_b32.
+  - Symbolic simplification and concrete register state execution.
+  - Validation against SPIR-V translation and mini-interpreter execution.
 - Translator constant folding for shift/bfe/align operands:
   - Constant shift count modulo 32 mask elimination.
   - Constant v_bfe_u32/i32 offset and width extraction directly to OpBitField[US]Extract.
@@ -43,7 +48,6 @@ import support  # noqa: E402
 MASK32 = 0xFFFFFFFF
 STUB_DXBC = b"DXBC" + bytes(24) + struct.pack("<I", 0) + bytes(4)
 
-# Canonical bitwise test vectors spanning full 32-bit word domain
 CANONICAL_TEST_VECTORS = [
     0x00000000,
     0x00000001,
@@ -137,123 +141,366 @@ class BitwiseAlgebraOracle:
 
     @staticmethod
     def check_idempotence_and(x: int) -> bool:
-        """x & x == x"""
         return ref_and(x, x) == ref_u32(x)
 
     @staticmethod
     def check_idempotence_or(x: int) -> bool:
-        """x | x == x"""
         return ref_or(x, x) == ref_u32(x)
 
     @staticmethod
     def check_annihilator_and(x: int) -> bool:
-        """x & 0 == 0"""
         return ref_and(x, 0) == 0
 
     @staticmethod
     def check_annihilator_or(x: int) -> bool:
-        """x | 0xFFFFFFFF == 0xFFFFFFFF"""
         return ref_or(x, MASK32) == MASK32
 
     @staticmethod
     def check_identity_and(x: int) -> bool:
-        """x & 0xFFFFFFFF == x"""
         return ref_and(x, MASK32) == ref_u32(x)
 
     @staticmethod
     def check_identity_or(x: int) -> bool:
-        """x | 0 == x"""
         return ref_or(x, 0) == ref_u32(x)
 
     @staticmethod
     def check_identity_xor(x: int) -> bool:
-        """x ^ 0 == x"""
         return ref_xor(x, 0) == ref_u32(x)
 
     @staticmethod
     def check_self_inverse_xor(x: int) -> bool:
-        """x ^ x == 0"""
         return ref_xor(x, x) == 0
 
     @staticmethod
     def check_involution_not(x: int) -> bool:
-        """~(~x) == x"""
         return ref_not(ref_not(x)) == ref_u32(x)
 
     @staticmethod
     def check_absorption_or_and(x: int, y: int) -> bool:
-        """x | (x & y) == x"""
         return ref_or(x, ref_and(x, y)) == ref_u32(x)
 
     @staticmethod
     def check_absorption_and_or(x: int, y: int) -> bool:
-        """x & (x | y) == x"""
         return ref_and(x, ref_or(x, y)) == ref_u32(x)
 
     @staticmethod
     def check_commutativity_and(x: int, y: int) -> bool:
-        """x & y == y & x"""
         return ref_and(x, y) == ref_and(y, x)
 
     @staticmethod
     def check_commutativity_or(x: int, y: int) -> bool:
-        """x | y == y | x"""
         return ref_or(x, y) == ref_or(y, x)
 
     @staticmethod
     def check_commutativity_xor(x: int, y: int) -> bool:
-        """x ^ y == y ^ x"""
         return ref_xor(x, y) == ref_xor(y, x)
 
     @staticmethod
     def check_associativity_and(x: int, y: int, z: int) -> bool:
-        """(x & y) & z == x & (y & z)"""
         return ref_and(ref_and(x, y), z) == ref_and(x, ref_and(y, z))
 
     @staticmethod
     def check_associativity_or(x: int, y: int, z: int) -> bool:
-        """(x | y) | z == x | (y | z)"""
         return ref_or(ref_or(x, y), z) == ref_or(x, ref_or(y, z))
 
     @staticmethod
     def check_associativity_xor(x: int, y: int, z: int) -> bool:
-        """(x ^ y) ^ z == x ^ (y ^ z)"""
         return ref_xor(ref_xor(x, y), z) == ref_xor(x, ref_xor(y, z))
 
     @staticmethod
     def check_distributivity_and_over_or(x: int, y: int, z: int) -> bool:
-        """x & (y | z) == (x & y) | (x & z)"""
         return ref_and(x, ref_or(y, z)) == ref_or(ref_and(x, y), ref_and(x, z))
 
     @staticmethod
     def check_distributivity_or_over_and(x: int, y: int, z: int) -> bool:
-        """x | (y & z) == (x | y) & (x | z)"""
         return ref_or(x, ref_and(y, z)) == ref_and(ref_or(x, y), ref_or(x, z))
 
     @staticmethod
     def check_demorgan_and(x: int, y: int) -> bool:
-        """~(x & y) == (~x) | (~y)"""
         return ref_not(ref_and(x, y)) == ref_or(ref_not(x), ref_not(y))
 
     @staticmethod
     def check_demorgan_or(x: int, y: int) -> bool:
-        """~(x | y) == (~x) & (~y)"""
         return ref_not(ref_or(x, y)) == ref_and(ref_not(x), ref_not(y))
 
     @staticmethod
     def check_complement_and(x: int) -> bool:
-        """x & (~x) == 0"""
         return ref_and(x, ref_not(x)) == 0
 
     @staticmethod
     def check_complement_or(x: int) -> bool:
-        """x | (~x) == 0xFFFFFFFF"""
         return ref_or(x, ref_not(x)) == MASK32
 
     @staticmethod
     def check_complement_xor(x: int) -> bool:
-        """x ^ (~x) == 0xFFFFFFFF"""
         return ref_xor(x, ref_not(x)) == MASK32
+
+
+class Expr:
+    """Base expression node for bitwise ALU symbolic representation."""
+
+    def eval(self, env: dict[str, int]) -> int:
+        raise NotImplementedError
+
+    def fold(self) -> Expr:
+        raise NotImplementedError
+
+
+class ConstExpr(Expr):
+    """32-bit constant literal."""
+
+    def __init__(self, val: int) -> None:
+        self.val = ref_u32(val)
+
+    def eval(self, env: dict[str, int]) -> int:
+        return self.val
+
+    def fold(self) -> Expr:
+        return self
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, ConstExpr) and self.val == other.val
+
+    def __hash__(self) -> int:
+        return hash(("const", self.val))
+
+    def __repr__(self) -> str:
+        return f"Const(0x{self.val:08X})"
+
+
+class RegExpr(Expr):
+    """Register variable operand."""
+
+    def __init__(self, name: str) -> None:
+        self.name = name.lower()
+
+    def eval(self, env: dict[str, int]) -> int:
+        return ref_u32(env.get(self.name, 0))
+
+    def fold(self) -> Expr:
+        return self
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, RegExpr) and self.name == other.name
+
+    def __hash__(self) -> int:
+        return hash(("reg", self.name))
+
+    def __repr__(self) -> str:
+        return f"Reg({self.name})"
+
+
+class UnaryExpr(Expr):
+    """Unary bitwise operation (v_not_b32 / s_not_b32)."""
+
+    def __init__(self, op: str, operand: Expr) -> None:
+        self.op = op
+        self.operand = operand
+
+    def eval(self, env: dict[str, int]) -> int:
+        val = self.operand.eval(env)
+        if self.op in ("v_not_b32", "s_not_b32", "not"):
+            return ref_not(val)
+        raise ValueError(f"Unknown unary op {self.op}")
+
+    def fold(self) -> Expr:
+        sub = self.operand.fold()
+        if isinstance(sub, ConstExpr):
+            return ConstExpr(ref_not(sub.val))
+        if isinstance(sub, UnaryExpr) and sub.op in ("v_not_b32", "s_not_b32", "not"):
+            return sub.operand.fold()
+        return UnaryExpr(self.op, sub)
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, UnaryExpr) and self.op == other.op and self.operand == other.operand
+
+    def __hash__(self) -> int:
+        return hash(("unary", self.op, self.operand))
+
+    def __repr__(self) -> str:
+        return f"Unary({self.op}, {self.operand})"
+
+
+class BinaryExpr(Expr):
+    """Binary bitwise operation (v_and_b32, v_or_b32, v_xor_b32)."""
+
+    def __init__(self, op: str, lhs: Expr, rhs: Expr) -> None:
+        self.op = op
+        self.lhs = lhs
+        self.rhs = rhs
+
+    def eval(self, env: dict[str, int]) -> int:
+        l = self.lhs.eval(env)
+        r = self.rhs.eval(env)
+        if self.op in ("v_and_b32", "s_and_b32", "and"):
+            return ref_and(l, r)
+        elif self.op in ("v_or_b32", "s_or_b32", "or"):
+            return ref_or(l, r)
+        elif self.op in ("v_xor_b32", "s_xor_b32", "xor"):
+            return ref_xor(l, r)
+        raise ValueError(f"Unknown binary op {self.op}")
+
+    def fold(self) -> Expr:
+        l = self.lhs.fold()
+        r = self.rhs.fold()
+        op = self.op
+
+        if isinstance(l, ConstExpr) and isinstance(r, ConstExpr):
+            if op in ("v_and_b32", "s_and_b32", "and"):
+                return ConstExpr(ref_and(l.val, r.val))
+            elif op in ("v_or_b32", "s_or_b32", "or"):
+                return ConstExpr(ref_or(l.val, r.val))
+            elif op in ("v_xor_b32", "s_xor_b32", "xor"):
+                return ConstExpr(ref_xor(l.val, r.val))
+
+        if isinstance(l, ConstExpr) and not isinstance(r, ConstExpr):
+            l, r = r, l
+        elif not isinstance(l, ConstExpr) and not isinstance(r, ConstExpr):
+            if repr(l) > repr(r):
+                l, r = r, l
+
+        if op in ("v_and_b32", "s_and_b32", "and"):
+            if l == r:
+                return l
+            if isinstance(r, ConstExpr) and r.val == 0:
+                return ConstExpr(0)
+            if isinstance(r, ConstExpr) and r.val == MASK32:
+                return l
+            if (isinstance(r, UnaryExpr) and r.operand == l) or (isinstance(l, UnaryExpr) and l.operand == r):
+                return ConstExpr(0)
+            if isinstance(r, BinaryExpr) and r.op in ("v_or_b32", "s_or_b32", "or"):
+                if r.lhs == l or r.rhs == l:
+                    return l
+            if isinstance(l, BinaryExpr) and l.op in ("v_or_b32", "s_or_b32", "or"):
+                if l.lhs == r or l.rhs == r:
+                    return r
+
+        elif op in ("v_or_b32", "s_or_b32", "or"):
+            if l == r:
+                return l
+            if isinstance(r, ConstExpr) and r.val == MASK32:
+                return ConstExpr(MASK32)
+            if isinstance(r, ConstExpr) and r.val == 0:
+                return l
+            if (isinstance(r, UnaryExpr) and r.operand == l) or (isinstance(l, UnaryExpr) and l.operand == r):
+                return ConstExpr(MASK32)
+            if isinstance(r, BinaryExpr) and r.op in ("v_and_b32", "s_and_b32", "and"):
+                if r.lhs == l or r.rhs == l:
+                    return l
+            if isinstance(l, BinaryExpr) and l.op in ("v_and_b32", "s_and_b32", "and"):
+                if l.lhs == r or l.rhs == r:
+                    return r
+
+        elif op in ("v_xor_b32", "s_xor_b32", "xor"):
+            if l == r:
+                return ConstExpr(0)
+            if isinstance(r, ConstExpr) and r.val == 0:
+                return l
+            if isinstance(r, ConstExpr) and r.val == MASK32:
+                return UnaryExpr("v_not_b32", l).fold()
+            if (isinstance(r, UnaryExpr) and r.operand == l) or (isinstance(l, UnaryExpr) and l.operand == r):
+                return ConstExpr(MASK32)
+
+        return BinaryExpr(op, l, r)
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, BinaryExpr) and self.op == other.op and self.lhs == other.lhs and self.rhs == other.rhs
+
+    def __hash__(self) -> int:
+        return hash(("binary", self.op, self.lhs, self.rhs))
+
+    def __repr__(self) -> str:
+        return f"Binary({self.op}, {self.lhs}, {self.rhs})"
+
+
+class BitopFoldingInterpreter:
+    """RDNA2 instruction interpreter tracking registers, expressions, and folding."""
+
+    def __init__(self) -> None:
+        self.regs: dict[str, int] = {}
+        self.exprs: dict[str, Expr] = {}
+
+    def set_reg(self, reg: str, val: int) -> None:
+        r = reg.lower().strip()
+        v = ref_u32(val)
+        self.regs[r] = v
+        self.exprs[r] = ConstExpr(v)
+
+    def set_reg_symbolic(self, reg: str, name: str) -> None:
+        r = reg.lower().strip()
+        self.exprs[r] = RegExpr(name)
+
+    def get_reg(self, reg: str) -> int:
+        return self.regs.get(reg.lower().strip(), 0)
+
+    def get_expr(self, reg: str) -> Expr:
+        r = reg.lower().strip()
+        return self.exprs.get(r, RegExpr(r))
+
+    def _parse_operand(self, token: str) -> tuple[int, Expr]:
+        token = token.strip()
+        try:
+            val = int(token, 0)
+            u = ref_u32(val)
+            return u, ConstExpr(u)
+        except ValueError:
+            pass
+        reg = token.lower()
+        val = self.regs.get(reg, 0)
+        expr = self.exprs.get(reg, RegExpr(reg))
+        return val, expr
+
+    def execute_instruction(self, line: str) -> tuple[str, int, Expr]:
+        line = line.strip()
+        if not line or line.startswith(";") or line.startswith("//"):
+            return ("", 0, ConstExpr(0))
+        parts = line.split(None, 1)
+        raw_op = parts[0].lower()
+        op = raw_op.replace("_e32", "").replace("_e64", "")
+        operands = [p.strip() for p in parts[1].split(",")] if len(parts) > 1 else []
+
+        if op in ("v_mov_b32", "s_mov_b32"):
+            dst = operands[0].lower()
+            val, expr = self._parse_operand(operands[1])
+            self.regs[dst] = val
+            folded = expr.fold()
+            self.exprs[dst] = folded
+            return (dst, val, folded)
+
+        elif op in ("v_not_b32", "s_not_b32"):
+            dst = operands[0].lower()
+            val, expr = self._parse_operand(operands[1])
+            res = ref_not(val)
+            self.regs[dst] = res
+            folded = UnaryExpr("v_not_b32", expr).fold()
+            self.exprs[dst] = folded
+            return (dst, res, folded)
+
+        elif op in ("v_and_b32", "s_and_b32", "v_or_b32", "s_or_b32", "v_xor_b32", "s_xor_b32"):
+            dst = operands[0].lower()
+            v0, e0 = self._parse_operand(operands[1])
+            v1, e1 = self._parse_operand(operands[2])
+            if op in ("v_and_b32", "s_and_b32"):
+                res = ref_and(v0, v1)
+            elif op in ("v_or_b32", "s_or_b32"):
+                res = ref_or(v0, v1)
+            elif op in ("v_xor_b32", "s_xor_b32"):
+                res = ref_xor(v0, v1)
+            else:
+                raise ValueError(f"Unknown binary op {op}")
+            self.regs[dst] = res
+            folded = BinaryExpr(op, e0, e1).fold()
+            self.exprs[dst] = folded
+            return (dst, res, folded)
+
+        else:
+            raise ValueError(f"Unsupported instruction: {line}")
+
+    def execute_sequence(self, lines: list[str]) -> None:
+        for line in lines:
+            line = line.strip()
+            if line:
+                self.execute_instruction(line)
 
 
 class BitwiseAlgebraOracleTests(unittest.TestCase):
@@ -342,18 +589,165 @@ class BitwiseAlgebraOracleTests(unittest.TestCase):
     def test_composite_folding_identities(self):
         vectors = CANONICAL_TEST_VECTORS[:12]
         for x in vectors:
-            # x ^ 0xFFFFFFFF == ~x
             self.assertEqual(ref_xor(x, MASK32), ref_not(x))
             for y in vectors:
-                # (x | y) & (x | ~y) == x
                 lhs1 = ref_and(ref_or(x, y), ref_or(x, ref_not(y)))
                 self.assertEqual(lhs1, ref_u32(x))
-                # (x & y) | (x & ~y) == x
                 lhs2 = ref_or(ref_and(x, y), ref_and(x, ref_not(y)))
                 self.assertEqual(lhs2, ref_u32(x))
-                # x ^ (x & y) == x & ~y
                 lhs3 = ref_xor(x, ref_and(x, y))
                 self.assertEqual(lhs3, ref_andn2(x, y))
+
+
+class BitopFoldingInterpreterTests(unittest.TestCase):
+    """Test suite verifying instruction interpreter constant folding and sequences."""
+
+    def test_constant_folding_basic(self):
+        interp = BitopFoldingInterpreter()
+        interp.execute_sequence([
+            "v_mov_b32 v0, 0x12345678",
+            "v_mov_b32 v1, 0x0000FFFF",
+            "v_and_b32 v2, v0, v1",
+            "v_or_b32 v3, v0, v1",
+            "v_xor_b32 v4, v0, v1",
+            "v_not_b32 v5, v0",
+        ])
+        self.assertEqual(interp.get_reg("v2"), 0x00005678)
+        self.assertEqual(interp.get_expr("v2"), ConstExpr(0x00005678))
+        self.assertEqual(interp.get_reg("v3"), 0x1234FFFF)
+        self.assertEqual(interp.get_expr("v3"), ConstExpr(0x1234FFFF))
+        self.assertEqual(interp.get_reg("v4"), 0x1234A987)
+        self.assertEqual(interp.get_expr("v4"), ConstExpr(0x1234A987))
+        self.assertEqual(interp.get_reg("v5"), 0xEDCBA987)
+        self.assertEqual(interp.get_expr("v5"), ConstExpr(0xEDCBA987))
+
+    def test_idempotence_folding(self):
+        interp = BitopFoldingInterpreter()
+        interp.set_reg_symbolic("v0", "v0")
+        interp.execute_instruction("v_and_b32 v1, v0, v0")
+        self.assertEqual(interp.get_expr("v1"), RegExpr("v0"))
+
+        interp.execute_instruction("v_or_b32 v2, v0, v0")
+        self.assertEqual(interp.get_expr("v2"), RegExpr("v0"))
+
+    def test_annihilator_folding(self):
+        interp = BitopFoldingInterpreter()
+        interp.set_reg_symbolic("v0", "v0")
+        interp.execute_instruction("v_and_b32 v1, v0, 0")
+        self.assertEqual(interp.get_expr("v1"), ConstExpr(0))
+        interp.execute_instruction("v_and_b32 v2, 0, v0")
+        self.assertEqual(interp.get_expr("v2"), ConstExpr(0))
+
+        interp.execute_instruction("v_or_b32 v3, v0, 0xFFFFFFFF")
+        self.assertEqual(interp.get_expr("v3"), ConstExpr(MASK32))
+        interp.execute_instruction("v_or_b32 v4, 0xFFFFFFFF, v0")
+        self.assertEqual(interp.get_expr("v4"), ConstExpr(MASK32))
+
+    def test_identity_folding(self):
+        interp = BitopFoldingInterpreter()
+        interp.set_reg_symbolic("v0", "v0")
+        interp.execute_instruction("v_and_b32 v1, v0, 0xFFFFFFFF")
+        self.assertEqual(interp.get_expr("v1"), RegExpr("v0"))
+        interp.execute_instruction("v_and_b32 v2, 0xFFFFFFFF, v0")
+        self.assertEqual(interp.get_expr("v2"), RegExpr("v0"))
+
+        interp.execute_instruction("v_or_b32 v3, v0, 0")
+        self.assertEqual(interp.get_expr("v3"), RegExpr("v0"))
+        interp.execute_instruction("v_or_b32 v4, 0, v0")
+        self.assertEqual(interp.get_expr("v4"), RegExpr("v0"))
+
+        interp.execute_instruction("v_xor_b32 v5, v0, 0")
+        self.assertEqual(interp.get_expr("v5"), RegExpr("v0"))
+        interp.execute_instruction("v_xor_b32 v6, 0, v0")
+        self.assertEqual(interp.get_expr("v6"), RegExpr("v0"))
+
+    def test_self_inverse_folding(self):
+        interp = BitopFoldingInterpreter()
+        interp.set_reg_symbolic("v0", "v0")
+        interp.execute_instruction("v_xor_b32 v1, v0, v0")
+        self.assertEqual(interp.get_expr("v1"), ConstExpr(0))
+
+    def test_involution_folding(self):
+        interp = BitopFoldingInterpreter()
+        interp.set_reg_symbolic("v0", "v0")
+        interp.execute_sequence([
+            "v_not_b32 v1, v0",
+            "v_not_b32 v2, v1",
+            "v_not_b32 v3, v2",
+        ])
+        self.assertEqual(interp.get_expr("v2"), RegExpr("v0"))
+        self.assertEqual(interp.get_expr("v3"), UnaryExpr("v_not_b32", RegExpr("v0")))
+
+    def test_absorption_folding(self):
+        interp = BitopFoldingInterpreter()
+        interp.set_reg_symbolic("v0", "v0")
+        interp.set_reg_symbolic("v1", "v1")
+        interp.execute_sequence([
+            "v_and_b32 v2, v0, v1",
+            "v_or_b32 v3, v0, v2",
+            "v_or_b32 v4, v0, v1",
+            "v_and_b32 v5, v0, v4",
+        ])
+        self.assertEqual(interp.get_expr("v3"), RegExpr("v0"))
+        self.assertEqual(interp.get_expr("v5"), RegExpr("v0"))
+
+    def test_self_complement_folding(self):
+        interp = BitopFoldingInterpreter()
+        interp.set_reg_symbolic("v0", "v0")
+        interp.execute_sequence([
+            "v_not_b32 v1, v0",
+            "v_and_b32 v2, v0, v1",
+            "v_or_b32 v3, v0, v1",
+            "v_xor_b32 v4, v0, v1",
+        ])
+        self.assertEqual(interp.get_expr("v2"), ConstExpr(0))
+        self.assertEqual(interp.get_expr("v3"), ConstExpr(MASK32))
+        self.assertEqual(interp.get_expr("v4"), ConstExpr(MASK32))
+
+    def test_multi_instruction_alu_sequences(self):
+        interp = BitopFoldingInterpreter()
+        interp.set_reg("v0", 0x12345678)
+        interp.set_reg("v1", 0x9ABCDEF0)
+        interp.execute_sequence([
+            "v_and_b32 v2, v0, v1",
+            "v_or_b32 v3, v0, v2",
+            "v_xor_b32 v4, v3, v0",
+            "v_or_b32 v5, v4, 0x55555555",
+            "v_and_b32 v6, v5, 0xFFFFFFFF",
+        ])
+        self.assertEqual(interp.get_reg("v3"), 0x12345678)
+        self.assertEqual(interp.get_reg("v4"), 0)
+        self.assertEqual(interp.get_reg("v5"), 0x55555555)
+        self.assertEqual(interp.get_reg("v6"), 0x55555555)
+        self.assertEqual(interp.get_expr("v6"), ConstExpr(0x55555555))
+
+    def test_translator_spirv_lowering_equivalence(self):
+        lines = [
+            "v_mov_b32 v1, 0x12345678",
+            "v_mov_b32 v2, 0x9ABCDEF0",
+            "v_and_b32 v3, v1, v2",
+            "v_or_b32 v4, v1, v3",
+            "v_xor_b32 v0, v4, v1",
+        ]
+        body = "\n".join("\t" + line for line in lines)
+        asm = f"; alu_lowering_test\n{body}\n\texp mrt0 v0, v3, v4, v1 done vm\n\ts_endpgm\n"
+        with tempfile.TemporaryDirectory() as tmp:
+            d_dir = os.path.join(tmp, "disasm")
+            os.mkdir(d_dir)
+            s_path = os.path.join(d_dir, "ps_bitop_eval.s")
+            with open(s_path, "w", encoding="utf-8") as f:
+                f.write(asm)
+            with open(os.path.join(tmp, "ps_bitop_eval.dxbc"), "wb") as f:
+                f.write(STUB_DXBC)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", ResourceWarning)
+                spv = rdna2spirv.translate(s_path)
+        out = si.run_fragment(spv)["%out_mrt0"]
+        # out: (v0, v3, v4, v1)
+        self.assertEqual(out[0], 0)
+        self.assertEqual(out[1], ref_and(0x12345678, 0x9ABCDEF0))
+        self.assertEqual(out[2], 0x12345678)
+        self.assertEqual(out[3], 0x12345678)
 
 
 class BitopConstantFoldingTests(unittest.TestCase):
