@@ -715,6 +715,13 @@ if(BUILD_TESTING)
   if(WIN32 AND TARGET xgameruntime_test)
     add_test(NAME xgameruntime COMMAND xgameruntime_test)
   endif()
+  # The active-input tracker the GameInput shim feeds (src/active_input.h), on synthetic samples: no SDL, no
+  # controller, no GPU, so it builds and runs everywhere, with or without SDL3.
+  add_executable(active_input_test test/active_input_test.cpp)
+  if(MSVC)
+    target_compile_options(active_input_test PRIVATE /W4 /permissive- /utf-8)
+  endif()
+  add_test(NAME active_input COMMAND active_input_test)
   if(WIN32 AND TARGET gameinput_test)
     add_test(NAME gameinput COMMAND gameinput_test)
   elseif(TARGET gta6rt)
