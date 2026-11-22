@@ -225,6 +225,19 @@ class ScanTest(unittest.TestCase):
         self.assertIn("--out and --csv must use different paths", err.getvalue())
         self.assertFalse(os.path.exists(out))
 
+    def test_directory_with_glob_metacharacters_in_its_name(self):
+        # Before: os.path.join(path, "**", "*.bin"/"*.rpf") fed a root like "carve[1]" straight to glob, which
+        # read "[1]" as a character class and matched nothing.
+        folder = os.path.join(self.dir, "carve[1]")
+        os.makedirs(folder)
+        with open(os.path.join(folder, "a.bin"), "wb") as f:
+            f.write(bvh_payload(4))
+        with open(os.path.join(folder, "b.rpf"), "wb") as f:
+            f.write(make_rpf([bvh_payload(2)]))
+        rows, summary = bvh_index.scan_dir(folder)
+        self.assertEqual([r["kind"] for r in rows], ["bvh4"])
+        self.assertEqual(summary[0]["streams"], 1)
+
     def test_directory_of_payloads(self):
         for name, payload in (("a.bin", bvh_payload(4)), ("b.bin", instance_payload()), ("c.bin", b"z" * 80)):
             with open(os.path.join(self.dir, name), "wb") as f:

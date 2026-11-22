@@ -118,6 +118,24 @@ class NavmeshIndexTest(unittest.TestCase):
         self.assertIsNone(row["stored"])
         self.assertEqual(row["size"], 0x80)
 
+    def test_directory_with_glob_metacharacters_in_its_name(self):
+        # Before: os.path.join(root, "**", pattern) fed a root like "carve[1]" straight to glob, which read
+        # the "[1]" as a character class and matched nothing -- the index came back empty.
+        folder = os.path.join(self.root, "carve[1]")
+        os.makedirs(folder)
+        with open(os.path.join(folder, "page.bin"), "wb") as f:
+            f.write(page(pages=6))
+        with open(os.path.join(folder, "other.bin"), "wb") as f:
+            f.write(b"plain" * 100)
+        out = os.path.join(self.root, "dir_bracket.json")
+        self.run_tool(folder, "--out", out, "--pattern", "*.bin")
+        with open(out, encoding="utf-8") as f:
+            doc = json.load(f)
+        self.assertEqual(doc["summary"]["streams"], 2)
+        self.assertEqual(doc["summary"]["matched"], 1)
+        self.assertEqual(doc["summary"]["page_counts"], {"6": 1})
+        self.assertEqual(doc["pages"][0]["source"], "page.bin")
+
     def test_out_and_csv_in_missing_folders_are_created(self):
         # Before: write_outputs opened both paths directly, so a missing folder ended a finished scan in a
         # FileNotFoundError traceback and lost the index.
