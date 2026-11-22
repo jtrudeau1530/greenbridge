@@ -91,11 +91,17 @@ def put(state, a, k):
         regs = [a["r"] + i for i in range(n)]
     elif a["k"] == "slist":
         regs = [r if isinstance(r, int) else "vcc" for r in a["r"]]
-    elif a["k"] == "special" and a.get("t") in ("vcc", "vcc_lo"):
+    elif a["k"] == "special" and a.get("t") == "vcc":
         regs = ["vcc"]
-    elif a["k"] == "special" and a.get("t") == "vcc_hi":
-        # A separate write to vcc_hi lands in %vcc_hi, so vcc no longer holds one lane mask.
-        state.pop("vcc", None)
+    elif a["k"] == "special" and a.get("t") in ("vcc_lo", "vcc_hi"):
+        # A mask / 0 / -1 half-write updates that half of %vcc in wave64 (put_mask), keeping VCC a lane mask;
+        # a plain-data half-write (k is None) ends VCC's life as one lane mask.
+        if k is not None and state.get("vcc") in MASK_KINDS:
+            state["vcc"] = MASK
+        elif a.get("t") == "vcc_lo" and k is not None:
+            state["vcc"] = k
+        else:
+            state.pop("vcc", None)
         return
     else:
         return

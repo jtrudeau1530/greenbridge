@@ -408,7 +408,49 @@ int test_erase_moves_no_other_entry() {
     return 0;
 }
 
+int test_unresolvable_hash_collision() {
+    DescriptorTable table(32);
+    std::array<DescriptorKey, 9> keys{};
+    for (std::uint32_t i = 0; i < keys.size(); ++i) {
+        keys[i][0] = i;
+        // Invert the final FNV multiplication to make every complete hash zero.
+        std::uint32_t prefix = kFnvOffsetBasis;
+        for (int word = 0; word < 7; ++word) prefix = (prefix ^ keys[i][word]) * kFnvPrime;
+        keys[i][7] = prefix;
+        EXPECT(hash_descriptor_key(keys[i]) == 0);
+    }
+    for (std::uint32_t i = 0; i < 8; ++i) table.insert(keys[i], i + 1);
+    const auto before = table.build_gpu_buffer();
+    bool rejected = false;
+    try { table.insert(keys[8], 9); }
+    catch (const std::length_error&) { rejected = true; }
+    EXPECT(rejected && table.size() == 8 && table.capacity() == 32);
+    EXPECT(table.build_gpu_buffer() == before);
+    for (std::uint32_t i = 0; i < 8; ++i) EXPECT(table.lookup(keys[i]) == i + 1);
+    EXPECT(table.insert_or_update(keys[0].data(), 99) == DescriptorTable::InsertResult::replaced);
+    EXPECT(table.lookup(keys[0]) == 99);
+    EXPECT(table.erase(keys[0]));
+    EXPECT(table.insert(keys[8], 9) && table.lookup(keys[8]) == 9);
+    return 0;
+}
+
+int test_capacity_overflow() {
+    for (std::uint32_t requested : {0x80000001u, 0xffffffffu}) {
+        bool rejected = false;
+        try { DescriptorTable table(requested); }
+        catch (const std::length_error&) { rejected = true; }
+        EXPECT(rejected);
+    }
+    for (std::uint32_t requested : {0u, 1u, 16u, 17u, 31u, 32u}) {
+        DescriptorTable table(requested);
+        EXPECT(table.capacity() == (requested <= 16 ? 16 : 32));
+    }
+    return 0;
+}
+
 int main() {
+    EXPECT(test_unresolvable_hash_collision() == 0);
+    EXPECT(test_capacity_overflow() == 0);
     EXPECT(test_fnv1a_hash_matches_contract() == 0);
     EXPECT(test_ssharp_key_padding() == 0);
     EXPECT(test_basic_insertion_and_lookup() == 0);

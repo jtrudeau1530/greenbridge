@@ -422,6 +422,21 @@ def test_png_is_written_beside_the_dds_with_the_texels(eq, tmp_path, monkeypatch
     assert text.splitlines() == ["1 textures: {'ok:first': 1} -> " + str(out), "png: {'written': 1}"]
 
 
+def test_packed_r10g10b10a2_writes_a_png(eq, tmp_path, monkeypatch, capsys):
+    eq(4)
+    packed = struct.pack("<II", 1023 | (3 << 30), (1023 << 20) | (1 << 30))
+    carve = str(tmp_path / "carve")
+    write_blob(carve, "x.rpf", 0x1000, packed + bytes(4096 - len(packed)))
+    t = texture(24, "R10G10B10A2_UNORM", 2, 1, mips=1)
+    out, code, _ = png_main(tmp_path, monkeypatch, capsys, [t], carve, "--png")
+    assert code is None
+    stem = out / "x.rpf" / f"{0xABC:012x}_3_2x1_R10G10B10A2_UNORM"
+    assert stem.with_suffix(".dds").read_bytes()[148:] == packed
+    log = json.loads((out / "export_log.json").read_text(encoding="utf-8"))
+    assert log[0]["export"]["png"] == "written"
+    assert read_png(stem.with_suffix(".png")) == (2, 1, bytes((255, 0, 0, 255, 0, 0, 255, 85)))
+
+
 def test_undecodable_format_keeps_the_dds_and_counts_unsupported(eq, tmp_path, monkeypatch, capsys):
     carve, expected = build_case(eq, tmp_path, 10, top_first=True)  # R16G16B16A16_FLOAT: dds_png has no decoder
     t = texture(10, "R16G16B16A16_FLOAT", 64, 64, mips=2)

@@ -10,6 +10,7 @@
 #include <cstring>
 #include <mutex>
 #include <span>
+#include <stdexcept>
 #include <vector>
 
 namespace leonida {
@@ -69,6 +70,8 @@ public:
     enum class InsertResult { added, unchanged, replaced, added_with_relocation };
 
     explicit DescriptorTable(std::uint32_t initial_capacity = 16) {
+        // Slots use nonnegative int indices internally. Larger powers also wrap the capacity counter.
+        if (initial_capacity > max_capacity) throw std::length_error("Descriptor table capacity exceeds slot range");
         std::uint32_t cap = 16;
         while (cap < initial_capacity) cap <<= 1;
         mask_ = cap - 1;
@@ -291,6 +294,17 @@ private:
                 continue;
             }
 
+            // Nine distinct keys with the same full hash can never fit the shader's eight probes,
+            // regardless of capacity. Refuse before allocating ever larger tables.
+            if (empty_slot < 0) {
+                std::uint32_t same_hash = 0;
+                for (std::uint32_t k = 0; k < kDescriptorProbes; ++k) {
+                    const auto& entry = entries_[(h + k) & mask_];
+                    if (hash_descriptor_key(entry.key) == h) ++same_hash;
+                }
+                if (same_hash == kDescriptorProbes)
+                    throw std::length_error("Descriptor hash collision exceeds shader probe limit");
+            }
             const bool relocate = empty_slot < 0;
             std::uint32_t moved_to = 0;
             if (relocate) empty_slot = make_probe_slot(entries_, h, &moved_to);
@@ -332,6 +346,7 @@ private:
     }
 
     void grow_locked() {
+        if (entries_.size() >= max_capacity) throw std::length_error("Descriptor table capacity exhausted");
         std::uint32_t new_cap = static_cast<std::uint32_t>(entries_.size() * 2);
         while (true) {
             std::vector<DescriptorEntry> new_entries(new_cap);
@@ -364,10 +379,12 @@ private:
                 changed_slots_.clear();
                 break;
             }
+            if (new_cap >= max_capacity) throw std::length_error("Descriptor probe range exhausted");
             new_cap *= 2;
         }
     }
 
+    static constexpr std::uint32_t max_capacity = std::uint32_t{1} << 31;
     mutable std::mutex mutex_;
     std::uint32_t mask_ = 15;
     std::vector<DescriptorEntry> entries_;

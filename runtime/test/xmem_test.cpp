@@ -20,6 +20,9 @@ using XMemFreeFn = void(__stdcall*)(void*, uint64_t);
 using XMemVirtualQueryFn = SIZE_T(__stdcall*)(HANDLE, const void*, void*);
 // BOOL XMemGetWorkingSetStatistics(UINT32 kind, stats*): the FSR DLL passes kind 0x20000001 at every call site.
 using XMemGetWorkingSetStatisticsFn = BOOL(__stdcall*)(uint32_t, void*);
+using XMemVirtualAllocFn = void*(WINAPI*)(void*, SIZE_T, DWORD, ULONGLONG, DWORD);
+using XMemGetWriteWatchFn = UINT(WINAPI*)(DWORD, void*, SIZE_T, void**, ULONG_PTR*, ULONG*);
+using XMemResetWriteWatchFn = UINT(WINAPI*)(void*, SIZE_T);
 constexpr uint32_t kMeasuredKind = 0x20000001;
 
 int g_checks = 0;
@@ -129,6 +132,78 @@ void test_virtual_query(XMemVirtualQueryFn query) {
     check(bad == 0, "XMemVirtualQuery on an invalid address returns 0 without crashing");
 }
 
+void test_virtual_alloc(XMemVirtualAllocFn virtual_alloc, XMemGetWriteWatchFn get_write_watch,
+                       XMemResetWriteWatchFn reset_write_watch) {
+    SYSTEM_INFO system_info{};
+    GetSystemInfo(&system_info);
+    const SIZE_T page_size = system_info.dwPageSize;
+    check(page_size != 0, "GetSystemInfo reports a non-zero page size");
+    if (page_size == 0) return;
+
+    const SIZE_T region_size = page_size * 3;
+    void* const base = virtual_alloc(nullptr, region_size, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, 0,
+                                     PAGE_READWRITE);
+    check(base != nullptr, "XMemVirtualAlloc creates a synthetic write-watch region");
+    if (!base) return;
+
+    void* watched[4]{};
+    ULONG_PTR count = 4;
+    ULONG granularity = 0;
+    UINT status = get_write_watch(0, base, region_size, watched, &count, &granularity);
+    check(status == NO_ERROR && count == 0, "new write-watch region starts with no dirty pages");
+    check(status == NO_ERROR && granularity == page_size, "write-watch reports the host page granularity");
+
+    auto* const bytes = static_cast<volatile uint8_t*>(base);
+    bytes[0] = 0xa1;
+    bytes[page_size * 2] = 0xb2;
+
+    count = 4;
+    status = get_write_watch(0, base, region_size, watched, &count, &granularity);
+    bool saw_first_page = false;
+    bool saw_third_page = false;
+    bool all_addresses_are_page_aligned = count <= 4;
+    for (ULONG_PTR i = 0; i < count && i < 4; ++i) {
+        const uintptr_t address = reinterpret_cast<uintptr_t>(watched[i]);
+        const uintptr_t start = reinterpret_cast<uintptr_t>(base);
+        all_addresses_are_page_aligned &= address >= start && (address - start) % page_size == 0;
+        saw_first_page |= address == start;
+        saw_third_page |= address == start + page_size * 2;
+    }
+    check(status == NO_ERROR && count == 2 && saw_first_page && saw_third_page,
+          "write-watch reports each written page by its relative address");
+    check(all_addresses_are_page_aligned, "write-watch addresses are page aligned and within the region");
+
+    count = 4;
+    status = get_write_watch(0, base, region_size, watched, &count, &granularity);
+    check(status == NO_ERROR && count == 2, "query-only write-watch leaves dirty pages recorded");
+
+    status = reset_write_watch(base, region_size);
+    check(status == NO_ERROR, "XMemResetWriteWatch clears the synthetic region");
+    count = 4;
+    status = get_write_watch(0, base, region_size, watched, &count, &granularity);
+    check(status == NO_ERROR && count == 0, "reset write-watch query returns no dirty pages");
+
+    bytes[page_size] = 0xc3;
+    count = 4;
+    status = get_write_watch(0, base, region_size, watched, &count, &granularity);
+    check(status == NO_ERROR && count == 1 &&
+              reinterpret_cast<uintptr_t>(watched[0]) == reinterpret_cast<uintptr_t>(base) + page_size,
+          "write-watch records writes again after reset");
+
+    check(VirtualFree(base, 0, MEM_RELEASE), "release the synthetic write-watch region");
+
+    SetLastError(ERROR_SUCCESS);
+    void* const large_page = virtual_alloc(nullptr, page_size, MEM_RESERVE | MEM_COMMIT | 0x20000000, 0,
+                                           PAGE_READWRITE);
+    check(large_page == nullptr && GetLastError() == ERROR_NOT_SUPPORTED,
+          "unsupported large-page allocation is rejected before host allocation");
+
+    SetLastError(ERROR_SUCCESS);
+    void* const attributed = virtual_alloc(nullptr, page_size, MEM_RESERVE | MEM_COMMIT, 1, PAGE_READWRITE);
+    check(attributed == nullptr && GetLastError() == ERROR_NOT_SUPPORTED,
+          "nonzero XMem allocation attributes are rejected before host allocation");
+}
+
 void print_result() {
     if (g_failures == 0) {
         std::printf("xmem_test: OK (%d checks)\n", g_checks);
@@ -148,11 +223,20 @@ int main() {
     const auto query = reinterpret_cast<XMemVirtualQueryFn>(rt::shims::find("xmem.dll", "XMemVirtualQuery"));
     const auto get_stats =
         reinterpret_cast<XMemGetWorkingSetStatisticsFn>(rt::shims::find("xmem.dll", "XMemGetWorkingSetStatistics"));
+    const auto virtual_alloc =
+        reinterpret_cast<XMemVirtualAllocFn>(rt::shims::find("xmem.dll", "XMemVirtualAlloc"));
+    const auto get_write_watch =
+        reinterpret_cast<XMemGetWriteWatchFn>(rt::shims::find("xmem.dll", "XMemGetWriteWatch"));
+    const auto reset_write_watch =
+        reinterpret_cast<XMemResetWriteWatchFn>(rt::shims::find("xmem.dll", "XMemResetWriteWatch"));
 
     check(alloc != nullptr, "registry exposes xmem.dll!XMemAlloc");
     check(free_mem != nullptr, "registry exposes xmem.dll!XMemFree");
     check(query != nullptr, "registry exposes xmem.dll!XMemVirtualQuery");
     check(get_stats != nullptr, "registry exposes xmem.dll!XMemGetWorkingSetStatistics");
+    check(virtual_alloc != nullptr, "registry exposes xmem.dll!XMemVirtualAlloc");
+    check(get_write_watch != nullptr, "registry exposes xmem.dll!XMemGetWriteWatch");
+    check(reset_write_watch != nullptr, "registry exposes xmem.dll!XMemResetWriteWatch");
 
     if (!alloc || !free_mem || !query || !get_stats) {
         print_result();
@@ -162,6 +246,9 @@ int main() {
     test_alloc(alloc, free_mem);
     test_working_set(get_stats);
     test_virtual_query(query);
+    if (virtual_alloc && get_write_watch && reset_write_watch) {
+        test_virtual_alloc(virtual_alloc, get_write_watch, reset_write_watch);
+    }
 
     print_result();
     return g_failures ? 1 : 0;

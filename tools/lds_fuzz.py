@@ -730,7 +730,12 @@ def compare(p, got_regs, got_lds):
 
 # ---- the translator oracle ----
 
-def translate(progs, work, emulate):
+def pc_tail_env():
+    """True when LEONIDA_PC_TAIL_UBO asks for rdna2spirv.py --pc-tail-ubo (128-byte push constants)."""
+    return (os.environ.get("LEONIDA_PC_TAIL_UBO") or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def translate(progs, work, emulate, pc_tail=False):
     disasm, fssm, spirv = (work / d for d in ("disasm", "fssm", "spirv"))
     for d in (disasm, fssm, spirv):   # a reused --work must not leave an earlier run's listings or SPIR-V behind
         if d.exists():
@@ -754,6 +759,8 @@ def translate(progs, work, emulate):
     cmd = [sys.executable, "-I", os.path.join(HERE, "rdna2spirv.py"), str(disasm), "--out", str(spirv)]
     if emulate:
         cmd.append("--wave64-emulate")
+    if pc_tail:
+        cmd.append("--pc-tail-ubo")
     r = subprocess.run(cmd, capture_output=True, text=True)
     index = spirv / "index.json"
     if not index.exists():
@@ -761,12 +768,14 @@ def translate(progs, work, emulate):
     return json.loads(index.read_text(encoding="utf-8")) if index.exists() else {}
 
 
-def run_gpu(p, spv, build, index_entry, emulate, dump):
+def run_gpu(p, spv, build, index_entry, emulate, dump, pc_tail=False):
     exe = os.path.join(build, "vk_compute_test" + (".exe" if os.name == "nt" else ""))
     if not os.path.isfile(exe):
         sys.exit(f"vk_compute_test not found in {build} or its RelWithDebInfo/Release folder; "
                  "build it first (cmake --build <build dir> --target vk_compute_test)")
     env = dict(os.environ, VKC_OUT_WORDS=str(p.out_words), VKC_DUMP=str(dump))
+    if pc_tail:
+        env["LEONIDA_PC_TAIL_UBO"] = "1"
     args = [exe, str(spv), "1", "dump"]
     if p.wave == 64 and not emulate:
         args.append("--require-wave64")
@@ -792,13 +801,17 @@ def show_cmd(p, no_exec, opts):
 def run_translator(progs, a, work, tally):
     """The translator oracle: translate every program with a whole number of waves and run it on the GPU. Returns the
     exit code of this oracle (0, 1, 2) and fills tally["translator"][name] with the verdict."""
+    pc_tail = bool(getattr(a, "pc_tail_ubo", False))
     try:
         todo = [p for p in progs if not p.partial_wave]
         for p in progs:
             if p.partial_wave:
                 print(f"SKIP {p.name}: translator: a wave64 group of {p.threads} threads is a partial wave "
                       "(the translator cannot launch one)")
-        index = translate(todo, work, a.emulate) if todo else {}
+        if todo:
+            index = translate(todo, work, a.emulate, pc_tail=True) if pc_tail else translate(todo, work, a.emulate)
+        else:
+            index = {}
     except RuntimeError as e:
         print(e)
         return 2
@@ -813,7 +826,8 @@ def run_translator(progs, a, work, tally):
             continue
         dump = work / (p.name + ".bin")
         dump.unlink(missing_ok=True)
-        rc, msg = run_gpu(p, spv, a.build, index[p.name], a.emulate, dump)
+        rc, msg = (run_gpu(p, spv, a.build, index[p.name], a.emulate, dump, pc_tail=True)
+                   if pc_tail else run_gpu(p, spv, a.build, index[p.name], a.emulate, dump))
         if rc == 77:
             skipped += 1
             print(f"SKIP {p.name}: {msg.splitlines()[-1] if msg else 'unsupported'}")
@@ -1038,6 +1052,9 @@ def main():
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--wave", choices=("64", "32", "both"), default="both")
     ap.add_argument("--emulate", action="store_true", help="translate with --wave64-emulate, run at subgroup 32")
+    ap.add_argument("--pc-tail-ubo", action="store_true",
+                    help="translate with --pc-tail-ubo and run vk_compute_test with LEONIDA_PC_TAIL_UBO=1 "
+                         "(128-byte push constants; also set by LEONIDA_PC_TAIL_UBO=1)")
     ap.add_argument("--build", default=os.path.join(ROOT, "runtime", "build"))
     ap.add_argument("--work", default=None, help="keep the generated .asm and SPIR-V here")
     ap.add_argument("--model-only", action="store_true")
@@ -1066,6 +1083,7 @@ def main():
                     help="after the hardware run, re-judge its words with every perturbed model; exit 1 if one is "
                          "not caught")
     a = ap.parse_args()
+    a.pc_tail_ubo = a.pc_tail_ubo or pc_tail_env()
     if a.programs < 1 or a.max_report < 1:
         ap.error("--programs and --max-report must be at least 1")
     if a.extended:

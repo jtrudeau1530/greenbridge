@@ -161,6 +161,9 @@ int capture_fault(const EXCEPTION_POINTERS* ep, Call& c) {
     return EXCEPTION_EXECUTE_HANDLER;
 }
 
+// Each guard returns a copy of `c`, not `c` itself: with `return c;` the local becomes the named return value, and
+// clang-cl 19 and 20 crash (exit 139, in recoverAddrOfEscapedLocal) generating the __except filter that writes it,
+// which stops the Linux cross-build (runtime/cmake/clang-cl-xwin.cmake). MSVC is fine either way.
 Call guarded_configure(ffx::PfnConfigure fn, ffx::Context* ctx, const ffx::Header* desc) {
     Call c;
     __try {
@@ -168,7 +171,7 @@ Call guarded_configure(ffx::PfnConfigure fn, ffx::Context* ctx, const ffx::Heade
     } __except (capture_fault(GetExceptionInformation(), c)) {
         c.faulted = true;
     }
-    return c;
+    return Call(c);
 }
 
 Call guarded_query(ffx::PfnQuery fn, ffx::Context* ctx, ffx::Header* desc) {
@@ -178,7 +181,7 @@ Call guarded_query(ffx::PfnQuery fn, ffx::Context* ctx, ffx::Header* desc) {
     } __except (capture_fault(GetExceptionInformation(), c)) {
         c.faulted = true;
     }
-    return c;
+    return Call(c);
 }
 
 Call guarded_create(ffx::PfnCreateContext fn, ffx::Context* ctx, ffx::Header* desc) {
@@ -188,7 +191,7 @@ Call guarded_create(ffx::PfnCreateContext fn, ffx::Context* ctx, ffx::Header* de
     } __except (capture_fault(GetExceptionInformation(), c)) {
         c.faulted = true;
     }
-    return c;
+    return Call(c);
 }
 
 Call guarded_destroy(ffx::PfnDestroyContext fn, ffx::Context* ctx) {
@@ -198,7 +201,7 @@ Call guarded_destroy(ffx::PfnDestroyContext fn, ffx::Context* ctx) {
     } __except (capture_fault(GetExceptionInformation(), c)) {
         c.faulted = true;
     }
-    return c;
+    return Call(c);
 }
 
 Call guarded_dispatch(ffx::PfnDispatch fn, ffx::Context* ctx, const ffx::Header* desc) {
@@ -208,7 +211,7 @@ Call guarded_dispatch(ffx::PfnDispatch fn, ffx::Context* ctx, const ffx::Header*
     } __except (capture_fault(GetExceptionInformation(), c)) {
         c.faulted = true;
     }
-    return c;
+    return Call(c);
 }
 
 // PC stand-in for one console capability. The console build creates a DXGI_FORMAT_R9G9B9E5_SHAREDEXP texture with
