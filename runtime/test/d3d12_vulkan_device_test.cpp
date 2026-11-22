@@ -313,7 +313,16 @@ int cpu_copies(ID3D12Device* device, bool bc, const char* path) {
 
 // The host PC runtime's D3D12 device to compare answers with: the default adapter, or the one LEONIDA_HOST_ADAPTER
 // names ("warp", or part of an adapter's name); false if there is none.
+// Under Wine there is none to compare with either: its d3d12.dll (vkd3d) lays out depth-stencil formats in one plane,
+// rejects R9G9B9E5 and BC footprints and accepts descriptions Microsoft's runtime refuses, so it is no reference.
 bool create_host_device(Ref<ID3D12Device>& host) {
+    static const bool wine = GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "wine_get_version") != nullptr;
+    if (wine) {
+        static bool said = false;
+        if (!said) std::printf("host D3D12 is Wine's, not Microsoft's: comparisons with the host are skipped\n");
+        said = true;
+        return false;
+    }
     copycmp::Ptr<ID3D12Device> device;
     std::string name;
     if (!copycmp::create_host(device, name)) return false;
