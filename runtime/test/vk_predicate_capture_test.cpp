@@ -5,6 +5,21 @@
 #include <cstring>
 #include <cstdio>
 #define EXPECT(x) do { if (!(x)) { std::fprintf(stderr, "line %d: %s\n", __LINE__, #x); return 1; } } while (0)
+namespace {
+PFN_vkCmdPipelineBarrier2 real_barrier2 = nullptr;
+unsigned host_barriers = 0;
+VkPipelineStageFlags2 host_source_stages = 0;
+VKAPI_ATTR void VKAPI_CALL observe_barrier2(VkCommandBuffer cb, const VkDependencyInfo* info) {
+    for (std::uint32_t i = 0; i < info->memoryBarrierCount; ++i) {
+        const auto& barrier = info->pMemoryBarriers[i];
+        if (barrier.dstStageMask & VK_PIPELINE_STAGE_2_HOST_BIT) {
+            ++host_barriers;
+            host_source_stages |= barrier.srcStageMask;
+        }
+    }
+    real_barrier2(cb, info);
+}
+}
 int main() {
     vktest::Device d;
     if (!d.create()) return 1;
@@ -70,6 +85,50 @@ int main() {
         EXPECT(queue.execute({&pointer, 1}) == ReplayResult::success);
     }
     EXPECT(queue.idle());
+    // Failed submissions must not commit their speculative layout transitions.
+    EXPECT(context.layout(2, 0) == VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+    CommandList failed;
+    EXPECT(failed.transition({2, 0, d3d12_state::render_target, d3d12_state::copy_source}) && failed.close());
+    const CommandList* failed_pointer = &failed;
+    const auto real_submit = context.vk.vkQueueSubmit;
+    context.vk.vkQueueSubmit = +[](VkQueue, std::uint32_t, const VkSubmitInfo*, VkFence) -> VkResult {
+        return VK_ERROR_OUT_OF_HOST_MEMORY; // no GPU work and no device loss
+    };
+    const auto failed_result = queue.execute({&failed_pointer, 1});
+    context.vk.vkQueueSubmit = real_submit;
+    EXPECT(failed_result == ReplayResult::unsupported);
+    EXPECT(context.layout(2, 0) == VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+
+    // Preserve main's readback-stage collection on every logical queue kind, using real transfer readbacks.
+    ResourceBinding output{}; output.buffer = readback; output.size = count * 8; output.host_readable = true;
+    context.add_resource(3, output);
+    CommandList copy, capture_only, empty;
+    EXPECT(copy.copy_buffer({3, 0, 1, 0, 16}) && copy.close());
+    EXPECT(capture_only.set_predication({1, 0, d3d12_predication::equal_zero}) && capture_only.close());
+    EXPECT(empty.close());
+    real_barrier2 = context.vk.vkCmdPipelineBarrier2;
+    EXPECT(real_barrier2);
+    context.vk.vkCmdPipelineBarrier2 = observe_barrier2;
+    for (const auto kind : {VulkanQueue::QueueKind::direct, VulkanQueue::QueueKind::compute, VulkanQueue::QueueKind::copy}) {
+        VulkanQueue typed(context, d.queue, d.family, kind);
+        EXPECT(typed.ok());
+        const CommandList* no_write = &empty;
+        host_barriers = 0; host_source_stages = 0;
+        EXPECT(typed.execute({&no_write, 1}) == ReplayResult::success);
+        EXPECT(host_barriers == 0);
+        const CommandList* capture = &capture_only;
+        EXPECT(typed.execute({&capture, 1}) == (kind == VulkanQueue::QueueKind::copy
+                                                ? ReplayResult::unsupported : ReplayResult::success));
+        EXPECT(host_barriers == 0);
+        const CommandList* transfer = &copy;
+        EXPECT(typed.execute({&transfer, 1}) == ReplayResult::success);
+        EXPECT(typed.idle());
+        EXPECT(host_barriers == 1 && host_source_stages != 0);
+        EXPECT((host_source_stages & ~VulkanQueue::queue_supported_stages(kind)) == 0);
+        EXPECT((host_source_stages & ~(VK_PIPELINE_STAGE_2_COPY_BIT | VK_PIPELINE_STAGE_2_TRANSFER_BIT)) == 0);
+        EXPECT(std::memcmp(pixels, values, sizeof(values)) == 0);
+    }
+    context.vk.vkCmdPipelineBarrier2 = real_barrier2;
     EXPECT(d.run([&](VkCommandBuffer cb) {
         VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
         barrier.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT; barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
@@ -94,4 +153,5 @@ int main() {
     }
     EXPECT(d.validation_errors() == 0);
     std::puts("predicate capture: 32 gated + 32 reused submissions, 192 snapshots, offset rebinding and reset passed");
+    std::puts("predicate capture integration: failed-submit tracker rollback and direct/compute/copy readback stages passed");
 }
