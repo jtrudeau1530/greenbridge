@@ -257,10 +257,42 @@ int main() {
     VkDevice vk_dev = VK_NULL_HANDLE;
     if (create_dev(physical, &dci, nullptr, &vk_dev) != VK_SUCCESS) return fail("vkCreateDevice");
 
-#define DF(name) const auto name = reinterpret_cast<PFN_##name>(gdpa(vk_dev, #name))
+#define DF(name) [[maybe_unused]] const auto name = reinterpret_cast<PFN_##name>(gdpa(vk_dev, #name))
     DF(vkDestroyDevice);
     DF(vkDeviceWaitIdle);
     DF(vkGetDeviceQueue);
+    DF(vkCreateCommandPool);
+    DF(vkDestroyCommandPool);
+    DF(vkAllocateCommandBuffers);
+    DF(vkBeginCommandBuffer);
+    DF(vkEndCommandBuffer);
+    DF(vkQueueSubmit);
+    DF(vkQueueWaitIdle);
+    DF(vkCreateShaderModule);
+    DF(vkDestroyShaderModule);
+    DF(vkCreatePipelineLayout);
+    DF(vkDestroyPipelineLayout);
+    DF(vkCreateGraphicsPipelines);
+    DF(vkCreateComputePipelines);
+    DF(vkDestroyPipeline);
+    DF(vkCreateDescriptorSetLayout);
+    DF(vkDestroyDescriptorSetLayout);
+    DF(vkCreateDescriptorPool);
+    DF(vkDestroyDescriptorPool);
+    DF(vkAllocateDescriptorSets);
+    DF(vkUpdateDescriptorSets);
+    DF(vkCreateImageView);
+    DF(vkDestroyImageView);
+    DF(vkCmdBeginRendering);
+    DF(vkCmdEndRendering);
+    DF(vkCmdBindPipeline);
+    DF(vkCmdBindDescriptorSets);
+    DF(vkCmdSetViewport);
+    DF(vkCmdSetScissor);
+    DF(vkCmdDispatch);
+    DF(vkCmdPipelineBarrier);
+    DF(vkCmdDrawIndirectCount);
+    DF(vkCmdCopyImageToBuffer);
 #undef DF
 
     VkQueue vk_queue = VK_NULL_HANDLE;
