@@ -488,6 +488,36 @@ if(BUILD_TESTING)
       COMMAND loader_tls_test "$<TARGET_FILE:tiny_tls>"
     )
 
+    # DisableThreadLibraryCalls from a mapped DllMain (shims/library_loader.cpp). The fixture is built without the CRT, so
+    # DllMain's only work is that one call. No game files.
+    add_library(dll_thread_calls SHARED test/fixtures/dll_thread_calls.cpp)
+    target_compile_options(dll_thread_calls PRIVATE /W4 /permissive- /utf-8 /GS-)
+    target_link_options(dll_thread_calls PRIVATE /NODEFAULTLIB /ENTRY:dll_thread_calls_main)
+    target_link_libraries(dll_thread_calls PRIVATE kernel32)
+    set_target_properties(dll_thread_calls PROPERTIES
+      OUTPUT_NAME dll_thread_calls
+      PREFIX ""
+      RUNTIME_OUTPUT_DIRECTORY "${TINY_FIXTURE_DIR}"
+      ARCHIVE_OUTPUT_DIRECTORY "${TINY_FIXTURE_DIR}"
+    )
+    add_executable(dll_thread_calls_test
+      test/dll_thread_calls_test.cpp
+      src/pe_loader.cpp
+      shims/library_loader.cpp
+      shims/registry.cpp
+    )
+    target_include_directories(dll_thread_calls_test PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/src
+      ${CMAKE_CURRENT_SOURCE_DIR}/shims
+    )
+    target_compile_definitions(dll_thread_calls_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(dll_thread_calls_test PRIVATE /W4 /permissive- /utf-8 /EHsc)
+    target_link_options(dll_thread_calls_test PRIVATE /OPT:NOREF)
+    add_dependencies(dll_thread_calls_test dll_thread_calls)
+    add_test(NAME dll_thread_calls
+      COMMAND dll_thread_calls_test "$<TARGET_FILE:dll_thread_calls>"
+    )
+
     # LEONIDA_UNIMPLEMENTED=log|fail|stop: builds its own image with two imports that bind to nothing, calls them in
     # process (log, fail) and in child processes (default/env parsing, stop). No game files, no GPU.
     add_executable(unimplemented_policy_test
