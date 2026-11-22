@@ -813,5 +813,65 @@ class TestSIMDExecution(unittest.TestCase):
         self.assertEqual(results, expected)
 
 
+class TestRegisterAliasing(unittest.TestCase):
+    """Unit tests for register aliasing and in-place operand preservation."""
+
+    def test_inplace_dst_equals_src0(self) -> None:
+        interp = ScalarInterpreter()
+        interp.reg_file.set_vgpr_half(0, hi=False, val=f16_to_bits(3.0))
+        interp.reg_file.set_vgpr_half(1, hi=False, val=f16_to_bits(5.0))
+
+        # v0.l = v0.l * v1.l -> 15.0
+        res = interp.execute_asm("v_mul_f16 v0.l, v0.l, v1.l")
+        self.assertEqual(bits_to_f16(res), 15.0)
+        self.assertEqual(bits_to_f16(interp.reg_file.get_vgpr_half(0, hi=False)), 15.0)
+        # src1 v1.l must remain intact
+        self.assertEqual(bits_to_f16(interp.reg_file.get_vgpr_half(1, hi=False)), 5.0)
+
+    def test_inplace_dst_equals_src1(self) -> None:
+        interp = ScalarInterpreter()
+        interp.reg_file.set_vgpr_half(0, hi=False, val=f16_to_bits(7.0))
+        interp.reg_file.set_vgpr_half(1, hi=False, val=f16_to_bits(2.0))
+
+        # v1.l = v0.l * v1.l -> 14.0
+        res = interp.execute_asm("v_mul_f16 v1.l, v0.l, v1.l")
+        self.assertEqual(bits_to_f16(res), 14.0)
+        self.assertEqual(bits_to_f16(interp.reg_file.get_vgpr_half(1, hi=False)), 14.0)
+        # src0 v0.l must remain intact
+        self.assertEqual(bits_to_f16(interp.reg_file.get_vgpr_half(0, hi=False)), 7.0)
+
+    def test_inplace_self_squaring(self) -> None:
+        interp = ScalarInterpreter()
+        interp.reg_file.set_vgpr_half(2, hi=False, val=f16_to_bits(-4.0))
+
+        # v2.l = v2.l * v2.l -> 16.0
+        res = interp.execute_asm("v_mul_f16 v2.l, v2.l, v2.l")
+        self.assertEqual(bits_to_f16(res), 16.0)
+        self.assertEqual(bits_to_f16(interp.reg_file.get_vgpr_half(2, hi=False)), 16.0)
+
+    def test_subword_intra_register_crossover(self) -> None:
+        interp = ScalarInterpreter()
+        # Setup v3: low = 2.0, high = 3.0
+        interp.reg_file.set_vgpr_half(3, hi=False, val=f16_to_bits(2.0))
+        interp.reg_file.set_vgpr_half(3, hi=True, val=f16_to_bits(3.0))
+
+        # High = Low * High -> 2.0 * 3.0 = 6.0 into v3.h
+        res = interp.execute_asm("v_mul_f16 v3.h, v3.l, v3.h")
+        self.assertEqual(bits_to_f16(res), 6.0)
+        self.assertEqual(bits_to_f16(interp.reg_file.get_vgpr_half(3, hi=True)), 6.0)
+        # v3.l must remain exactly 2.0
+        self.assertEqual(bits_to_f16(interp.reg_file.get_vgpr_half(3, hi=False)), 2.0)
+
+    def test_successive_inplace_doubling_chain(self) -> None:
+        interp = ScalarInterpreter()
+        interp.reg_file.set_vgpr_half(0, hi=False, val=f16_to_bits(1.0))
+
+        # Doubling 5 times: 1.0 -> 2.0 -> 4.0 -> 8.0 -> 16.0 -> 32.0
+        for _ in range(5):
+            interp.execute_asm("v_mul_f16 v0.l, v0.l, 2.0")
+
+        self.assertEqual(bits_to_f16(interp.reg_file.get_vgpr_half(0, hi=False)), 32.0)
+
+
 if __name__ == "__main__":
     unittest.main()
