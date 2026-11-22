@@ -87,6 +87,11 @@ int main() {
         EXPECT(SUCCEEDED(rt::d3d12_xs::create_device_proxy(inner, __uuidof(ID3D12Device),
                                                            reinterpret_cast<void**>(&device.p))));
         rt::d3d12::set_device_outer(inner, device.p);
+        if (rt::d3d12::device_push_constants_need_fallback(inner)) {
+            std::printf("d3d12_msaa_draw_test: skipped, the PSOs need 144 push-constant bytes and this GPU has %u\n",
+                        rt::d3d12::device_max_push_constants_size(inner));
+            return 77;
+        }
 
         D3D12_ROOT_PARAMETER params[2] = {};
         params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
