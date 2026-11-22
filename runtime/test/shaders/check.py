@@ -659,6 +659,8 @@ def cvt_f32_sat_test(tools, spirv):
     for bits, unsigned, signed in CVT_F32_SAT_CASES:
         problem = compute_test(tools, spirv, "cs_cvt_f32_sat", "1", "dump", expected_words=[unsigned, signed],
                                env={"VKC_SGPRS": f"{bits:#010x}"})
+        if problem is None or isinstance(problem, Skip):
+            return problem   # the device can't run it as recorded (wave size not pinnable): the same for every input
         if problem:
             wrong.append(f"{bits:#010x}: {problem}")
     return f"{len(wrong)} of {len(CVT_F32_SAT_CASES)} inputs wrong, first {wrong[0]}" if wrong else ""

@@ -256,6 +256,23 @@ class FloatToIntSweep(unittest.TestCase):
         self.assertIn("1 of 16 inputs wrong", problem)
         self.assertIn("0x4f000000", problem)
 
+    def test_a_device_that_cannot_pin_the_wave_size_skips_instead_of_failing(self):
+        # Before: on a 4..32 device (Apple under MoltenVK) every dispatch came back as unpinned_subgroup_skip's Skip,
+        # and the sweep reported it as "16 of 16 inputs wrong, first 0x00000000: SKIP (...)", a failure.
+        calls = []
+
+        def harness(_tool, _shader, *_args, env=None):
+            calls.append(env.get("VKC_SUBGROUP_SIZE"))
+            return 1, "compute subgroup size: 32 not available\n"
+
+        with patch.object(check, "run", side_effect=harness), \
+                patch.object(check, "subgroup_size", return_value=32):
+            problem = check.cvt_f32_sat_test("tools", "spirv")
+        self.assertIsInstance(problem, check.Skip)
+        self.assertIn("can't run this shader at 32 lanes", problem)
+        self.assertNotIn("inputs wrong", problem)
+        self.assertEqual(calls, ["32"])   # the first dispatch decides; the other 15 would say the same
+
     def test_inputs_match_the_interpreter_test(self):
         # The GPU sweep and tests/semantic/test_float_to_int.py must judge the same inputs the same way.
         src = (Path(__file__).resolve().parent / "semantic" / "test_float_to_int.py").read_text(encoding="utf-8")
