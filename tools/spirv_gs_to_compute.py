@@ -177,7 +177,10 @@ def rewrite(text):
 
     out = []
     entry_label = None
-    state = "header"        # header -> body (in main, entry block) -> after the entry check
+    cur_block = None
+    block_tail = {}
+    main_start = None
+    state = "header"        # header -> main_entry -> main_vars -> main -> other
     for ln in text.splitlines():
         s = ln.strip()
         if s == "OpCapability Geometry":
@@ -205,13 +208,25 @@ def rewrite(text):
                 types = []
             if m.group(1) == main:
                 state = "main_entry"
+                main_start = len(out)
             out.append(ln)
             continue
         if s == "OpFunctionEnd":
+            if state in ("main", "main_vars") and main_start is not None and block_tail:
+                # Any block split by the primitive-count check or by OpEmitVertex now terminates in its final
+                # merge label; update every OpPhi predecessor (including loop-header back-edges) to that label.
+                for idx in range(main_start, len(out)):
+                    m_phi = re.match(r"^(\s*%\w+\s*=\s*OpPhi\s+%\w+)\s+(.*)$", out[idx])
+                    if m_phi:
+                        ops = m_phi.group(2).split()
+                        ops[1::2] = [block_tail.get(lbl, lbl) for lbl in ops[1::2]]
+                        out[idx] = f"{m_phi.group(1)} {' '.join(ops)}"
             state = "other"
+            cur_block = None
         if state == "main_entry" and re.match(r"%\w+ = OpLabel$", s):
             state = "main_vars"
             entry_label = s.split()[0]
+            cur_block = entry_label
             out.append(ln)
             continue
         if state == "main_vars" and not re.match(r"%\w+ = OpVariable ", s):
@@ -225,18 +240,16 @@ def rewrite(text):
                     f"%gsc_inbase = OpIMul {uint} %gsc_prim {k(vin)}",
                     f"%gsc_recbase = OpIMul {uint} %gsc_prim {k(mv)}",
                     f"%gsc_metabase = OpIMul {uint} %gsc_prim {k(mv + 1)}"]
+            block_tail[entry_label] = "%gsc_body"
         if state not in ("main", "main_vars"):
             out.append(ln)
             continue
         # ---- the body of main ----
-        # The primitive-count check splits the entry block: what followed its variables now sits in %gsc_body, so
-        # an OpPhi naming the entry label as a predecessor names %gsc_body instead.
-        m = re.match(r"(%\w+ = OpPhi %\w+) (.*)$", s)
-        if m:
-            ops = m.group(2).split()
-            ops[1::2] = ["%gsc_body" if lbl == entry_label else lbl for lbl in ops[1::2]]
-            s = f"{m.group(1)} {' '.join(ops)}"
-            ln = s
+        m_lbl = re.match(r"(%\w+) = OpLabel$", s)
+        if m_lbl:
+            cur_block = m_lbl.group(1)
+            out.append(ln)
+            continue
         m = re.match(r"(%\w+) = Op(?:InBounds)?AccessChain (%\w+) (%\w+) (.*)$", s)
         if m and m.group(3) in in_slot:
             idx = m.group(4).split()
@@ -268,17 +281,31 @@ def rewrite(text):
                     break
                 raise Unsupported(f"unhandled use of {v}: {s}")
         if s == "OpEmitVertex":
-            n, a = tmp(), tmp()
-            out += [f"{n} = OpLoad {uint} %gsc_n", f"{a} = OpIAdd {uint} %gsc_recbase {n}"]
-            for i, nv in enumerate(out_vars.values()):
-                b, c, val, p = tmp(), tmp(), tmp(), tmp()
-                out += [f"{b} = OpIMul {uint} {a} {k(nout)}", f"{c} = OpIAdd {uint} {b} {k(i)}",
-                        f"{val} = OpLoad {v4} {nv}", f"{p} = OpAccessChain %gsc_ptr_sb_v4 %gsc_rec {k(0)} {c}",
-                        f"OpStore {p} {val}"]
+            # Guard stores and counter increment on n < OutputVertices so over-emitting drops extra vertices
+            # instead of overflowing into primitive p+1's record/meta slots; %gsc_n stays <= mv for OpEndPrimitive
+            # and OpReturn as well (SHADER-617).
+            n, ok, lbl_do, lbl_end = tmp(), tmp(), tmp(), tmp()
+            out += [f"{n} = OpLoad {uint} %gsc_n",
+                    f"{ok} = OpULessThan {boolt} {n} {k(mv)}",
+                    f"OpSelectionMerge {lbl_end} None",
+                    f"OpBranchConditional {ok} {lbl_do} {lbl_end}",
+                    f"{lbl_do} = OpLabel"]
+            if out_vars:
+                a = tmp()
+                out.append(f"{a} = OpIAdd {uint} %gsc_recbase {n}")
+                for i, nv in enumerate(out_vars.values()):
+                    b, c, val, p = tmp(), tmp(), tmp(), tmp()
+                    out += [f"{b} = OpIMul {uint} {a} {k(nout)}", f"{c} = OpIAdd {uint} {b} {k(i)}",
+                            f"{val} = OpLoad {v4} {nv}", f"{p} = OpAccessChain %gsc_ptr_sb_v4 %gsc_rec {k(0)} {c}",
+                            f"OpStore {p} {val}"]
             d, e, q, n1 = tmp(), tmp(), tmp(), tmp()
             out += [f"{d} = OpIAdd {uint} %gsc_metabase {n}", f"{e} = OpIAdd {uint} {d} {k(1)}",
                     f"{q} = OpAccessChain %gsc_ptr_sb_u %gsc_meta {k(0)} {e}", f"OpStore {q} {k(0)}",
-                    f"{n1} = OpIAdd {uint} {n} {k(1)}", f"OpStore %gsc_n {n1}"]
+                    f"{n1} = OpIAdd {uint} {n} {k(1)}", f"OpStore %gsc_n {n1}",
+                    f"OpBranch {lbl_end}",
+                    f"{lbl_end} = OpLabel"]
+            if cur_block is not None:
+                block_tail[cur_block] = lbl_end
             continue
         if s == "OpEndPrimitive":
             # flag the last emitted vertex: meta[base + 1 + (n - 1)]; with none emitted this writes the count slot,
