@@ -209,13 +209,15 @@ def make_fs_passthru(loc: int) -> str:
 
 
 def read_raw_rgba32f(path: str) -> list[tuple[float, float, float, float]]:
-    data = open(path, "rb").read()
+    with open(path, "rb") as source:
+        data = source.read()
     n = len(data) // 16
     return [struct.unpack_from("<4f", data, 16 * i) for i in range(n)]
 
 
 def read_raw_u32(path: str) -> list[tuple[int, int, int, int]]:
-    data = open(path, "rb").read()
+    with open(path, "rb") as source:
+        data = source.read()
     n = len(data) // 16
     return [struct.unpack_from("<4I", data, 16 * i) for i in range(n)]
 
