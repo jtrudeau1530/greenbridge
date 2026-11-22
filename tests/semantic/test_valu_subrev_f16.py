@@ -1186,5 +1186,105 @@ class TestValuSubrevF16SIMDExecMasking(unittest.TestCase):
             self.assertEqual(bits_to_f16(results[lane]), float(lane))
 
 
+class TestValuSubrevF16RegisterAliasing(unittest.TestCase):
+    """Unit tests for register aliasing and in-place operand preservation for v_subrev_f16."""
+
+    def setUp(self) -> None:
+        self.scalar_interp = ScalarVALUInterpreter()
+        self.simd_interp = SIMDVALUInterpreter()
+
+    def test_dst_alias_src0(self) -> None:
+        # v0 = 1.0, v1 = 3.0. Instr: v_subrev_f16 v0, v0, v1 -> v0 = 3.0 - 1.0 = 2.0
+        state = ScalarMachineState()
+        state.set_vgpr(0, pack_half(ONE_F16, 0xAAAA))
+        state.set_vgpr(1, pack_half(THREE_F16, 0xBBBB))
+
+        res = self.scalar_interp.step("v_subrev_f16_e32 v0, v0, v1", state)
+        self.assertEqual(res, TWO_F16)
+        lo, hi = unpack_half(state.get_vgpr(0))
+        self.assertEqual(lo, TWO_F16)
+        self.assertEqual(hi, 0xAAAA)  # opposite half preserved
+        self.assertEqual(state.get_vgpr(1), pack_half(THREE_F16, 0xBBBB))  # src1 untouched
+
+    def test_dst_alias_src1(self) -> None:
+        # v0 = 1.0, v1 = 3.0. Instr: v_subrev_f16 v1, v0, v1 -> v1 = 3.0 - 1.0 = 2.0
+        state = ScalarMachineState()
+        state.set_vgpr(0, pack_half(ONE_F16, 0xAAAA))
+        state.set_vgpr(1, pack_half(THREE_F16, 0xBBBB))
+
+        res = self.scalar_interp.step("v_subrev_f16_e32 v1, v0, v1", state)
+        self.assertEqual(res, TWO_F16)
+        lo, hi = unpack_half(state.get_vgpr(1))
+        self.assertEqual(lo, TWO_F16)
+        self.assertEqual(hi, 0xBBBB)
+        self.assertEqual(state.get_vgpr(0), pack_half(ONE_F16, 0xAAAA))
+
+    def test_dst_alias_src0_and_src1_self_subtraction(self) -> None:
+        # Self-subtraction: v0 = 5.0. v_subrev_f16 v0, v0, v0 -> 5.0 - 5.0 = +0.0
+        state = ScalarMachineState()
+        f_5p0 = f16_to_bits(5.0)
+        state.set_vgpr(0, pack_half(f_5p0, 0xCCCC))
+
+        res = self.scalar_interp.step("v_subrev_f16_e32 v0, v0, v0", state)
+        self.assertEqual(res, POS_ZERO_F16)
+        lo, hi = unpack_half(state.get_vgpr(0))
+        self.assertEqual(lo, POS_ZERO_F16)
+        self.assertEqual(hi, 0xCCCC)
+
+    def test_intra_dword_half_word_aliasing_write_hi(self) -> None:
+        # v0 holds lo=1.0, hi=4.0.
+        # Instr: v_subrev_f16_e64 v0.h, v0, v0.h
+        # S0 reads v0.l (1.0), S1 reads v0.h (4.0).
+        # D writes to v0.h = 4.0 - 1.0 = 3.0. v0.l must remain 1.0.
+        state = ScalarMachineState()
+        state.set_vgpr(0, pack_half(ONE_F16, FOUR_F16))
+
+        ast = InstructionAST(
+            opcode=Opcode.V_SUBREV_F16,
+            dst=Register(RegKind.VGPR, 0, hi=True),
+            src0=Operand(reg=Register(RegKind.VGPR, 0, hi=False)),
+            src1=Operand(reg=Register(RegKind.VGPR, 0, hi=True)),
+            encoding=Encoding.VOP3,
+        )
+        res = self.scalar_interp.step(ast, state)
+        self.assertEqual(res, THREE_F16)
+        lo, hi = unpack_half(state.get_vgpr(0))
+        self.assertEqual(lo, ONE_F16)    # preserved
+        self.assertEqual(hi, THREE_F16)  # updated
+
+    def test_intra_dword_half_word_aliasing_write_lo(self) -> None:
+        # v0 holds lo=1.0, hi=4.0.
+        # Instr: v_subrev_f16_e64 v0, v0.h, v0
+        # S0 reads v0.h (4.0), S1 reads v0.l (1.0).
+        # D writes to v0.l = 1.0 - 4.0 = -3.0. v0.h must remain 4.0.
+        state = ScalarMachineState()
+        state.set_vgpr(0, pack_half(ONE_F16, FOUR_F16))
+
+        ast = InstructionAST(
+            opcode=Opcode.V_SUBREV_F16,
+            dst=Register(RegKind.VGPR, 0, hi=False),
+            src0=Operand(reg=Register(RegKind.VGPR, 0, hi=True)),
+            src1=Operand(reg=Register(RegKind.VGPR, 0, hi=False)),
+            encoding=Encoding.VOP3,
+        )
+        res = self.scalar_interp.step(ast, state)
+        self.assertEqual(bits_to_f16(res), -3.0)
+        lo, hi = unpack_half(state.get_vgpr(0))
+        self.assertEqual(lo, f16_to_bits(-3.0))
+        self.assertEqual(hi, FOUR_F16)  # preserved
+
+    def test_simd_multi_lane_aliasing(self) -> None:
+        state = SIMDWaveState(wave_size=32, exec_mask=0xFFFFFFFF)
+        for lane in range(32):
+            state.set_lane_vgpr(lane, 0, f16_to_bits(float(lane) * 2.0))
+            state.set_lane_vgpr(lane, 1, f16_to_bits(100.0))
+
+        # In-place update: v0 = v1 - v0 = 100.0 - lane * 2.0
+        self.simd_interp.step("v_subrev_f16_e32 v0, v0, v1", state)
+        for lane in range(32):
+            expected = f16_to_bits(100.0 - float(lane) * 2.0)
+            self.assertEqual(extract_half(state.get_lane_vgpr(lane, 0), hi_sel=False), expected)
+
+
 if __name__ == "__main__":
     unittest.main()
