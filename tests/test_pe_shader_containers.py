@@ -4,6 +4,7 @@ The containers are built by hand here: a u32 offset table at +32, and each chunk
 and a u32 size. The scan's job is to accept exactly that shape and to reject the `DXBC` immediates and error
 strings that occur in ordinary code.
 """
+
 import json
 import os
 import struct
@@ -15,7 +16,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 sys.path.insert(0, os.path.join(ROOT, "tools"))
 
-import pe_shader_containers as psc  # noqa: E402
+import pe_shader_containers as psc
 
 
 def container(parts) -> bytes:
@@ -26,11 +27,13 @@ def container(parts) -> bytes:
         offsets.append(header + len(body))
         body += fourcc + struct.pack("<I", len(payload)) + payload
         end = header + len(body)
-        body += bytes((-len(body)) % 4)      # chunks are 4-byte aligned; nothing follows the last one
+        body += bytes(
+            (-len(body)) % 4
+        )  # chunks are 4-byte aligned; nothing follows the last one
     total = end
     out = b"DXBC" + bytes(16) + struct.pack("<III", 1, total, len(parts))
     out += b"".join(struct.pack("<I", o) for o in offsets)
-    return out + body[:total - header]
+    return out + body[: total - header]
 
 
 def xdat(entries, base: int) -> bytes:
@@ -49,21 +52,34 @@ def dxil_payload(name: str, xbch: bool = True, bitcode: bool = True) -> bytes:
         entries.append((0x0D, b"XBCH" + bytes(20) + b"payload"))
     if bitcode:
         entries.append((0x07, b"BC\xc0\xde" + bytes(8)))
-    prefix = (b"e\x00\x05\x00" + struct.pack("<I", 24) + b"DXIL" + b"\x05\x01\x00\x00"
-              + struct.pack("<I", 0x70) + struct.pack("<I", 0x668))
+    prefix = (
+        b"e\x00\x05\x00"
+        + struct.pack("<I", 24)
+        + b"DXIL"
+        + b"\x05\x01\x00\x00"
+        + struct.pack("<I", 0x70)
+        + struct.pack("<I", 0x668)
+    )
     return prefix + xdat(entries, len(prefix))
 
 
 def ildn(name: str) -> bytes:
-    path = ("X:\\americas\\src\\dev\\rage\\3rdparty\\Microsoft\\XboxBvhBuilder\\Build\\Release\\Output\\"
-            f"XboxBvhBuilder\\{name}.pdb").encode()
+    path = (
+        "X:\\americas\\src\\dev\\rage\\3rdparty\\Microsoft\\XboxBvhBuilder\\Build\\Release\\Output\\"
+        f"XboxBvhBuilder\\{name}.pdb"
+    ).encode()
     return b"\x00\x00" + struct.pack("<H", len(path)) + path
 
 
 class ContainerTests(unittest.TestCase):
     def test_scan_reads_one_container(self):
-        data = container([(b"SFI0", bytes(8)), (b"ILDN", ildn("BitonicPreSort64CS")),
-                          (b"DXIL", dxil_payload("BitonicPreSort64CS"))])
+        data = container(
+            [
+                (b"SFI0", bytes(8)),
+                (b"ILDN", ildn("BitonicPreSort64CS")),
+                (b"DXIL", dxil_payload("BitonicPreSort64CS")),
+            ]
+        )
         found, rejected = psc.inspect(b"MZ" + bytes(64) + data, "fake.dll")
         self.assertEqual(rejected, [])
         self.assertEqual(len(found), 1)
@@ -109,7 +125,9 @@ class ContainerTests(unittest.TestCase):
         self.assertIsNone(psc.module_name(b""))
 
     def test_extract_writes_container_and_index(self):
-        data = container([(b"ILDN", ildn("RefitBVH4")), (b"DXIL", dxil_payload("RefitBVH4"))])
+        data = container(
+            [(b"ILDN", ildn("RefitBVH4")), (b"DXIL", dxil_payload("RefitBVH4"))]
+        )
         found, _ = psc.inspect(data, "fake.dll")
         with tempfile.TemporaryDirectory() as tmp:
             index = psc.extract(data, found, tmp)
@@ -118,7 +136,10 @@ class ContainerTests(unittest.TestCase):
             with open(os.path.join(tmp, "index.json"), "w", encoding="utf-8") as f:
                 json.dump(index, f)
             with open(os.path.join(tmp, "index.json"), encoding="utf-8") as f:
-                self.assertEqual(json.load(f)[0], {"name": "RefitBVH4", "file": "RefitBVH4.dxbc", "stage": "cs"})
+                self.assertEqual(
+                    json.load(f)[0],
+                    {"name": "RefitBVH4", "file": "RefitBVH4.dxbc", "stage": "cs"},
+                )
 
     def test_safe_stem(self):
         self.assertEqual(psc.safe_stem("a b/c", 1), "a_b_c")

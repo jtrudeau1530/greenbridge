@@ -22,6 +22,7 @@ data that must stay in the user's work folder, never in the repository. Nothing 
 
 Standard library only; reads files, never runs them.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -37,8 +38,8 @@ XDAT = b"XDAT"
 XBCH = b"XBCH"
 FSPX = b"FSPX"
 BITCODE = b"BC\xc0\xde"
-MAX_CHUNKS = 64          # a container with more chunks is not one this parser accepts
-NAME_LIMIT = 4096        # longer than any ILDN path seen; stops a malformed length from reading the image
+MAX_CHUNKS = 64  # a container with more chunks is not one this parser accepts
+NAME_LIMIT = 4096  # longer than any ILDN path seen; stops a malformed length from reading the image
 SAFE_NAME = re.compile(r"[^A-Za-z0-9_.-]+")
 
 
@@ -58,7 +59,7 @@ def parse_container(data: bytes, offset: int):
     reads the same shape. The checks below reject the four-byte `DXBC` immediates and error strings that
     occur in ordinary code.
     """
-    if data[offset:offset + 4] != DXBC:
+    if data[offset : offset + 4] != DXBC:
         raise ContainerError("no DXBC magic")
     if offset + 32 > len(data):
         raise ContainerError("truncated header")
@@ -75,13 +76,13 @@ def parse_container(data: bytes, offset: int):
         start = u32(data, offset + 32 + 4 * k)
         if not table_end <= start <= total - 8:
             raise ContainerError(f"chunk {k} offset {start} outside the container")
-        fourcc = data[offset + start:offset + start + 4]
+        fourcc = data[offset + start : offset + start + 4]
         size = u32(data, offset + start + 4)
         if start + 8 + size > total:
             raise ContainerError(f"chunk {k} payload past the container")
         if start % 4:
             raise ContainerError(f"chunk {k} offset {start} not 4-byte aligned")
-        if not all(0x20 <= b < 0x7f for b in fourcc):
+        if not all(0x20 <= b < 0x7F for b in fourcc):
             raise ContainerError(f"chunk {k} fourcc is not printable")
         chunks.append((fourcc, start, size))
     starts = [start for _, start, _ in chunks]
@@ -94,7 +95,7 @@ def parse_container(data: bytes, offset: int):
 
 def chunk_payload(data: bytes, offset: int, chunk) -> bytes:
     _, start, size = chunk
-    return data[offset + start + 8:offset + start + 8 + size]
+    return data[offset + start + 8 : offset + start + 8 + size]
 
 
 def module_name(ildn: bytes) -> str | None:
@@ -102,7 +103,7 @@ def module_name(ildn: bytes) -> str | None:
     if len(ildn) < 4:
         return None
     length = struct.unpack_from("<H", ildn, 2)[0]
-    path = ildn[4:4 + min(length, NAME_LIMIT)].split(b"\0", 1)[0]
+    path = ildn[4 : 4 + min(length, NAME_LIMIT)].split(b"\0", 1)[0]
     base = path.replace(b"\\", b"/").rsplit(b"/", 1)[-1].decode("latin-1")
     return base[:-4] if base.lower().endswith(".pdb") else base or None
 
@@ -123,9 +124,16 @@ def xdat_tags(dxil: bytes) -> list[dict]:
         tag, offset, size = struct.unpack_from("<III", dxil, at)
         if offset + size > len(dxil):
             continue
-        magic = dxil[offset:offset + 4]
-        out.append({"tag": tag, "size": size,
-                    "magic": magic.decode("latin-1") if all(0x20 <= b < 0x7f for b in magic) else ""})
+        magic = dxil[offset : offset + 4]
+        out.append(
+            {
+                "tag": tag,
+                "size": size,
+                "magic": magic.decode("latin-1")
+                if all(0x20 <= b < 0x7F for b in magic)
+                else "",
+            }
+        )
     return out
 
 
@@ -154,9 +162,14 @@ def inspect(data: bytes, image: str) -> tuple[list[dict], list[int]]:
             "image": image,
             "offset": i,
             "size": total,
-            "sha256": hashlib.sha256(data[i:i + total]).hexdigest(),
-            "name": module_name(chunk_payload(data, i, (b"ILDN",) + parts[b"ILDN"])) if b"ILDN" in parts else None,
-            "chunks": [{"fourcc": fourcc.decode("latin-1"), "size": size} for fourcc, _, size in chunks],
+            "sha256": hashlib.sha256(data[i : i + total]).hexdigest(),
+            "name": module_name(chunk_payload(data, i, (b"ILDN",) + parts[b"ILDN"]))
+            if b"ILDN" in parts
+            else None,
+            "chunks": [
+                {"fourcc": fourcc.decode("latin-1"), "size": size}
+                for fourcc, _, size in chunks
+            ],
             "xdat_tags": tags,
             "has_xbch": any(t["tag"] == 0x0D and t["magic"] == "XBCH" for t in tags),
             "has_fspx": (b"ACCC" in parts and dialect[:4] == FSPX),
@@ -184,18 +197,25 @@ def extract(data: bytes, records: list[dict], directory: str) -> list[dict]:
             file = f"{stem}_{k:02d}.dxbc"
             target = os.path.join(directory, file)
         with open(target, "wb") as f:
-            f.write(data[record["offset"]:record["offset"] + record["size"]])
+            f.write(data[record["offset"] : record["offset"] + record["size"]])
         index.append({"name": stem, "file": file, "stage": "cs"})
     return index
 
 
 def main(argv=None) -> int:
-    ap = argparse.ArgumentParser(description="Inventory the DXBC shader containers embedded in PE images.")
+    ap = argparse.ArgumentParser(
+        description="Inventory the DXBC shader containers embedded in PE images."
+    )
     ap.add_argument("images", nargs="+", help="PE image(s) to scan")
     ap.add_argument("--json", help="write the per-container records here")
-    ap.add_argument("--extract", metavar="DIR",
-                    help="write each container as <module>.dxbc plus index.json (game data: keep it out of the repo)")
-    ap.add_argument("--verbose", action="store_true", help="print one line per container")
+    ap.add_argument(
+        "--extract",
+        metavar="DIR",
+        help="write each container as <module>.dxbc plus index.json (game data: keep it out of the repo)",
+    )
+    ap.add_argument(
+        "--verbose", action="store_true", help="print one line per container"
+    )
     a = ap.parse_args(argv)
 
     all_records, status, index = [], 0, []
@@ -209,13 +229,25 @@ def main(argv=None) -> int:
             continue
         records, rejected = inspect(data, image)
         all_records.extend(records)
-        print(f"{image}: {len(records)} container(s), {len(rejected)} rejected DXBC hit(s)")
+        print(
+            f"{image}: {len(records)} container(s), {len(rejected)} rejected DXBC hit(s)"
+        )
         if a.verbose:
             for r in records:
                 name = r["name"] or "?"
-                flags = "".join(c for c, on in (("X", r["has_xbch"]), ("F", r["has_fspx"]), ("B", r["has_bitcode"])) if on)
+                flags = "".join(
+                    c
+                    for c, on in (
+                        ("X", r["has_xbch"]),
+                        ("F", r["has_fspx"]),
+                        ("B", r["has_bitcode"]),
+                    )
+                    if on
+                )
                 chunks = ",".join(c["fourcc"] for c in r["chunks"])
-                print(f"  {r['offset']:#x} {r['size']:>7} {flags:<3} {name:<28} {chunks}")
+                print(
+                    f"  {r['offset']:#x} {r['size']:>7} {flags:<3} {name:<28} {chunks}"
+                )
         if a.extract:
             index.extend(extract(data, records, a.extract))
 
