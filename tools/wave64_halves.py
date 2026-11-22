@@ -381,6 +381,10 @@ class Analysis:
             addr, data = [], list(srcs)
             if op != "exp" and srcs:
                 data, addr = [srcs[0]], list(srcs[1:])
+            if self.stage == "gs" and op.startswith(("ds_write", "ds_store")):
+                # ds_write vaddr, vdata...: in a legacy GS the write is an output slot from its offset alone
+                # (rdna2spirv.gs_ds drops the VGPR address, the lane's GSVS area), so only the data is observable
+                data, addr = list(srcs[1:]), []
             dt = 0
             for x in data:
                 dt |= self.rd(st, ins, x) | (MASKD | X if self.is_mask(ins, x) and x.get("k") != "imm" else 0)
