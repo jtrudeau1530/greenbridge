@@ -295,6 +295,159 @@ def parse_instruction(line: str) -> Instruction:
 
     raise NotImplementedError(f"Parser not implemented for opcode {opcode.value}")
 
+
+@dataclass
+class ScalarRegisterState:
+    """Architectural register state for the RDNA2 scalar execution unit."""
+    sgprs: list[int] = field(default_factory=lambda: [0] * 106)
+    exec: int = ALL_LANES_64
+    vcc: int = 0
+    m0: int = 0
+    scc: int = 0
+    pc: int = 0
+
+    def read_sgpr32(self, idx: int) -> int:
+        return self.sgprs[idx] & MASK32
+
+    def write_sgpr32(self, idx: int, val: int) -> None:
+        self.sgprs[idx] = val & MASK32
+
+    def read_sgpr64(self, idx: int) -> int:
+        if idx % 2 != 0:
+            raise ValueError(f"64-bit SGPR read requires even alignment: s[{idx}:{idx+1}]")
+        lo = self.sgprs[idx] & MASK32
+        hi = self.sgprs[idx + 1] & MASK32
+        return join_dwords(lo, hi)
+
+    def write_sgpr64(self, idx: int, val: int) -> None:
+        if idx % 2 != 0:
+            raise ValueError(f"64-bit SGPR write requires even alignment: s[{idx}:{idx+1}]")
+        lo, hi = split_dwords(val)
+        self.sgprs[idx] = lo
+        self.sgprs[idx + 1] = hi
+
+    def read_operand(self, op: Operand) -> int:
+        if op.imm is not None:
+            return op.imm & (MASK64 if op.size == 64 else MASK32)
+        assert op.reg is not None
+        reg = op.reg
+        if reg.kind == RegKind.SGPR:
+            return self.read_sgpr64(reg.index) if reg.size == 64 else self.read_sgpr32(reg.index)
+        if reg.kind == RegKind.EXEC:
+            return self.exec & MASK64 if reg.size == 64 else self.exec & MASK32
+        if reg.kind == RegKind.VCC:
+            return self.vcc & MASK64 if reg.size == 64 else self.vcc & MASK32
+        if reg.kind == RegKind.M0:
+            return self.m0 & MASK32
+        if reg.kind == RegKind.SCC:
+            return self.scc & 1
+        raise ValueError(f"Unsupported operand register kind: {reg.kind}")
+
+    def write_reg(self, reg: Register, val: int) -> None:
+        if reg.kind == RegKind.SGPR:
+            if reg.size == 64:
+                self.write_sgpr64(reg.index, val)
+            else:
+                self.write_sgpr32(reg.index, val)
+        elif reg.kind == RegKind.EXEC:
+            self.exec = val & (MASK64 if reg.size == 64 else MASK32)
+        elif reg.kind == RegKind.VCC:
+            self.vcc = val & (MASK64 if reg.size == 64 else MASK32)
+        elif reg.kind == RegKind.M0:
+            self.m0 = val & MASK32
+        elif reg.kind == RegKind.SCC:
+            self.scc = val & 1
+        else:
+            raise ValueError(f"Cannot write to register kind {reg.kind}")
+
+
+class ScalarSALUInterpreter:
+    """Deterministic interpreter simulating the RDNA2 SALU pipeline."""
+
+    def __init__(self, state: Optional[ScalarRegisterState] = None):
+        self.state = state if state is not None else ScalarRegisterState()
+
+    def step(self, inst: Instruction, labels: Optional[dict[str, int]] = None) -> bool:
+        """Execute a single instruction. Returns False if execution terminated."""
+        if inst.opcode == Opcode.S_ENDPGM:
+            return False
+
+        if inst.opcode == Opcode.S_AND_SAVEEXEC_B64:
+            assert inst.dst is not None and inst.src0 is not None
+            # Latched execution: read source value
+            src_val = self.state.read_operand(inst.src0)
+            old_exec = self.state.exec & MASK64
+            new_exec = (old_exec & src_val) & MASK64
+
+            # sdst receives prior EXEC
+            self.state.write_reg(inst.dst, old_exec)
+            # EXEC receives bitwise AND result
+            self.state.exec = new_exec
+            # SCC updated to (new_exec != 0)
+            self.state.scc = 1 if new_exec != 0 else 0
+            self.state.pc += 1
+            return True
+
+        if inst.opcode == Opcode.S_MOV_B64:
+            assert inst.dst is not None and inst.src0 is not None
+            val = self.state.read_operand(inst.src0)
+            self.state.write_reg(inst.dst, val)
+            self.state.pc += 1
+            return True
+
+        if inst.opcode == Opcode.S_MOV_B32:
+            assert inst.dst is not None and inst.src0 is not None
+            val = self.state.read_operand(inst.src0)
+            self.state.write_reg(inst.dst, val)
+            self.state.pc += 1
+            return True
+
+        if inst.opcode == Opcode.S_CBRANCH_EXECZ:
+            assert inst.label_target is not None and labels is not None
+            if self.state.exec == 0:
+                self.state.pc = labels[inst.label_target]
+            else:
+                self.state.pc += 1
+            return True
+
+        if inst.opcode == Opcode.S_CBRANCH_EXECNZ:
+            assert inst.label_target is not None and labels is not None
+            if self.state.exec != 0:
+                self.state.pc = labels[inst.label_target]
+            else:
+                self.state.pc += 1
+            return True
+
+        if inst.opcode == Opcode.S_CBRANCH_SCC0:
+            assert inst.label_target is not None and labels is not None
+            if self.state.scc == 0:
+                self.state.pc = labels[inst.label_target]
+            else:
+                self.state.pc += 1
+            return True
+
+        if inst.opcode == Opcode.S_CBRANCH_SCC1:
+            assert inst.label_target is not None and labels is not None
+            if self.state.scc == 1:
+                self.state.pc = labels[inst.label_target]
+            else:
+                self.state.pc += 1
+            return True
+
+        raise NotImplementedError(f"Interpreter support for {inst.opcode.value} not implemented")
+
+    def run(self, program: Program, max_steps: int = 1000) -> ScalarRegisterState:
+        """Run symbolic program until completion or max_steps exceeded."""
+        steps = 0
+        self.state.pc = 0
+        while self.state.pc < len(program.instructions) and steps < max_steps:
+            inst = program.instructions[self.state.pc]
+            running = self.step(inst, program.labels)
+            steps += 1
+            if not running:
+                break
+        return self.state
+
 MASK32: int = 0xFFFFFFFF
 MASK64: int = 0xFFFFFFFFFFFFFFFF
 SIGN_BIT64: int = 0x8000000000000000
@@ -566,6 +719,122 @@ class TestSaluAndSaveexecB64AST(unittest.TestCase):
         inst = Instruction(Opcode.S_AND_SAVEEXEC_B64, dst=bad_dst, src0=bad_src)
         with self.assertRaises(ValueError):
             inst.validate()
+
+
+class TestSaluAndSaveexecB64ScalarInterpreter(unittest.TestCase):
+    """Unit tests for the deterministic scalar instruction interpreter."""
+
+    def test_interp_basic_execution(self) -> None:
+        """Verify s_and_saveexec_b64 saves prior EXEC and updates EXEC with mask."""
+        state = ScalarRegisterState(exec=0x123456789ABCDEF0)
+        interp = ScalarSALUInterpreter(state)
+
+        # s_and_saveexec_b64 s[4:5], 0x00000000FFFFFFFF
+        inst = Instruction(
+            Opcode.S_AND_SAVEEXEC_B64,
+            dst=Register(RegKind.SGPR, 4, size=64),
+            src0=Operand(imm=0x00000000FFFFFFFF, size=64),
+        )
+        interp.step(inst)
+
+        # s[4:5] must hold saved prior EXEC
+        self.assertEqual(state.read_sgpr64(4), 0x123456789ABCDEF0)
+        # EXEC must be masked
+        self.assertEqual(state.exec, 0x000000009ABCDEF0)
+        # SCC must be 1 since result is non-zero
+        self.assertEqual(state.scc, 1)
+
+    def test_interp_exec_zero_clearing(self) -> None:
+        """Verify s_and_saveexec_b64 with zero mask clears EXEC and clears SCC."""
+        state = ScalarRegisterState(exec=ALL_LANES_64, scc=1)
+        interp = ScalarSALUInterpreter(state)
+
+        inst = Instruction(
+            Opcode.S_AND_SAVEEXEC_B64,
+            dst=Register(RegKind.SGPR, 0, size=64),
+            src0=Operand(imm=0, size=64),
+        )
+        interp.step(inst)
+
+        self.assertEqual(state.read_sgpr64(0), ALL_LANES_64)
+        self.assertEqual(state.exec, 0)
+        self.assertEqual(state.scc, 0)
+
+    def test_interp_scc_update(self) -> None:
+        """Verify SCC tracks (new_exec != 0) deterministically."""
+        state = ScalarRegisterState(exec=0x8000000000000000)
+        interp = ScalarSALUInterpreter(state)
+
+        # Mask preserving bit 63 -> SCC=1
+        inst1 = Instruction(
+            Opcode.S_AND_SAVEEXEC_B64,
+            dst=Register(RegKind.SGPR, 2, size=64),
+            src0=Operand(imm=0x8000000000000000, size=64),
+        )
+        interp.step(inst1)
+        self.assertEqual(state.scc, 1)
+
+        # Mask clearing bit 63 -> SCC=0
+        inst2 = Instruction(
+            Opcode.S_AND_SAVEEXEC_B64,
+            dst=Register(RegKind.SGPR, 4, size=64),
+            src0=Operand(imm=0x7FFFFFFFFFFFFFFF, size=64),
+        )
+        interp.step(inst2)
+        self.assertEqual(state.scc, 0)
+
+    def test_interp_saved_exec_to_sgpr_pair(self) -> None:
+        """Verify 64-bit saved EXEC split into s[d] low and s[d+1] high dwords."""
+        state = ScalarRegisterState(exec=0xAABBCCDDEEFF0011)
+        interp = ScalarSALUInterpreter(state)
+
+        inst = Instruction(
+            Opcode.S_AND_SAVEEXEC_B64,
+            dst=Register(RegKind.SGPR, 10, size=64),
+            src0=Operand(imm=ALL_LANES_64, size=64),
+        )
+        interp.step(inst)
+
+        self.assertEqual(state.read_sgpr32(10), 0xEEFF0011)
+        self.assertEqual(state.read_sgpr32(11), 0xAABBCCDD)
+
+    def test_interp_chained_saveexec_flow(self) -> None:
+        """Verify nested/chained saveexec save and restore."""
+        prog = Program()
+        # s_mov_b64 s[0:1], 0x5555555555555555 (even lanes)
+        prog.add_instruction(Instruction(Opcode.S_MOV_B64, dst=Register(RegKind.SGPR, 0, size=64),
+                                         src0=Operand(imm=EVEN_LANES_64, size=64)))
+        # s_and_saveexec_b64 s[4:5], s[0:1] -> saved=ALL, exec=EVEN
+        prog.add_instruction(Instruction(Opcode.S_AND_SAVEEXEC_B64, dst=Register(RegKind.SGPR, 4, size=64),
+                                         src0=Operand(reg=Register(RegKind.SGPR, 0, size=64), size=64)))
+        # s_mov_b64 exec, s[4:5] -> restores ALL
+        prog.add_instruction(Instruction(Opcode.S_MOV_B64, dst=Register(RegKind.EXEC, 0, size=64),
+                                         src0=Operand(reg=Register(RegKind.SGPR, 4, size=64), size=64)))
+        prog.add_instruction(Instruction(Opcode.S_ENDPGM))
+
+        interp = ScalarSALUInterpreter()
+        state = interp.run(prog)
+
+        self.assertEqual(state.read_sgpr64(4), ALL_LANES_64)
+        self.assertEqual(state.exec, ALL_LANES_64)
+
+    def test_interp_conditional_branching_execz(self) -> None:
+        """Verify s_cbranch_execz jumps when exec is zero."""
+        prog = Program()
+        # s_and_saveexec_b64 s[0:1], 0 -> exec becomes 0
+        prog.add_instruction(Instruction(Opcode.S_AND_SAVEEXEC_B64, dst=Register(RegKind.SGPR, 0, size=64),
+                                         src0=Operand(imm=0, size=64)))
+        prog.add_instruction(Instruction(Opcode.S_CBRANCH_EXECZ, label_target="target"))
+        prog.add_instruction(Instruction(Opcode.S_MOV_B32, dst=Register(RegKind.SGPR, 10, size=32),
+                                         src0=Operand(imm=999, size=32)))
+        prog.add_label("target")
+        prog.add_instruction(Instruction(Opcode.S_MOV_B32, dst=Register(RegKind.SGPR, 10, size=32),
+                                         src0=Operand(imm=42, size=32)))
+        prog.add_instruction(Instruction(Opcode.S_ENDPGM))
+
+        interp = ScalarSALUInterpreter()
+        state = interp.run(prog)
+        self.assertEqual(state.read_sgpr32(10), 42)
 
 
 if __name__ == "__main__":
