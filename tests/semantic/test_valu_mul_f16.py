@@ -488,11 +488,16 @@ def parse_v_mul_f16_asm(asm_line: str) -> ASTInstruction:
         raise ValueError(f"Cannot parse v_mul_f16 assembly: {asm_line}")
 
     dst_str, src0_str, src1_str, trailing = match.groups()
-    clamp = "clamp" in trailing
+    clamp = False
     omod = "none"
-    for candidate in ("mul:2", "mul:4", "div:2"):
-        if candidate in trailing:
-            omod = candidate
+    trailing_tokens = trailing.strip().split()
+    for tok in trailing_tokens:
+        if tok == "clamp":
+            clamp = True
+        elif tok in ("mul:2", "mul:4", "div:2"):
+            omod = tok
+        else:
+            raise ValueError(f"Invalid instruction modifier or token: {tok}")
 
     def parse_operand(op_str: str) -> ASTOperand:
         s = op_str.strip()
@@ -1105,6 +1110,91 @@ class TestIEEE754BoundaryExtremes(unittest.TestCase):
         qnan = CANONICAL_QNAN_F16
         self.assertEqual(ref_mul_f16(qnan, POS_ONE_F16, clamp=True), POS_ZERO_F16)
         self.assertEqual(ref_mul_f16(snan, POS_TWO_F16, clamp=True), POS_ZERO_F16)
+
+
+class TestNegativeControlsAndMutationDetection(unittest.TestCase):
+    """Negative controls, syntax rejection, and mutation detection test cases."""
+
+    def test_syntax_rejection_invalid_opcodes(self) -> None:
+        # Rejection of invalid opcode
+        with self.assertRaises(ValueError):
+            parse_v_mul_f16_asm("v_add_f16 v0.l, v1.l, v2.l")
+        with self.assertRaises(ValueError):
+            parse_v_mul_f16_asm("v_mul_f32 v0, v1, v2")
+
+    def test_syntax_rejection_malformed_registers(self) -> None:
+        # Invalid halfword specifier (.x instead of .l or .h)
+        with self.assertRaises(ValueError):
+            parse_v_mul_f16_asm("v_mul_f16 v0.x, v1.l, v2.l")
+        # Invalid register name
+        with self.assertRaises(ValueError):
+            parse_v_mul_f16_asm("v_mul_f16 reg0, v1.l, v2.l")
+
+    def test_syntax_rejection_invalid_destination(self) -> None:
+        # Destination with input modifier (abs/neg)
+        with self.assertRaises(ValueError):
+            parse_v_mul_f16_asm("v_mul_f16 -v0.l, v1.l, v2.l")
+        with self.assertRaises(ValueError):
+            parse_v_mul_f16_asm("v_mul_f16 |v0.l|, v1.l, v2.l")
+        # Non-VGPR destination
+        with self.assertRaises(TypeError):
+            parse_v_mul_f16_asm("v_mul_f16 s0.l, v1.l, v2.l")
+
+    def test_syntax_rejection_invalid_omod(self) -> None:
+        # Unsupported omod
+        with self.assertRaises(ValueError):
+            parse_v_mul_f16_asm("v_mul_f16 v0.l, v1.l, v2.l mul:8")
+
+    def test_mutation_sabotage_arithmetic_operator(self) -> None:
+        # Sabotage: replace multiplication by addition
+        s0 = f16_to_bits(3.0)
+        s1 = f16_to_bits(2.0)
+        expected_mul = ref_mul_f16(s0, s1)  # 6.0
+        mutated_add = f16_to_bits(bits_to_f16(s0) + bits_to_f16(s1))  # 5.0
+        self.assertNotEqual(expected_mul, mutated_add)
+
+    def test_mutation_sabotage_sign_logic(self) -> None:
+        # Sabotage: replace XOR sign rule with AND
+        s0 = f16_to_bits(-2.0)
+        s1 = f16_to_bits(3.0)
+        expected = ref_mul_f16(s0, s1)  # -6.0
+        sign0 = (s0 >> 15) & 1
+        sign1 = (s1 >> 15) & 1
+        mutated_sign = sign0 & sign1  # 1 & 0 = 0 -> +6.0
+        mutated_bits = (s0 & ~SIGN_MASK_F16) | (mutated_sign << 15)
+        self.assertNotEqual(expected, mutated_bits)
+
+    def test_mutation_sabotage_clamp_bypass(self) -> None:
+        # Sabotage: clamp omitted on negative result
+        s0 = f16_to_bits(-4.0)
+        s1 = f16_to_bits(2.0)
+        expected_clamped = ref_mul_f16(s0, s1, clamp=True)
+        mutated_unclamped = ref_mul_f16(s0, s1, clamp=False)
+        self.assertEqual(expected_clamped, POS_ZERO_F16)
+        self.assertEqual(mutated_unclamped, f16_to_bits(-8.0))
+        self.assertNotEqual(expected_clamped, mutated_unclamped)
+
+    def test_mutation_sabotage_nan_clamp_suppression(self) -> None:
+        # Sabotage: clamp fails to force NaN to +0.0
+        qnan = CANONICAL_QNAN_F16
+        expected = ref_mul_f16(qnan, POS_TWO_F16, clamp=True)
+        self.assertEqual(expected, POS_ZERO_F16)
+        mutated_nan_leak = qnan
+        self.assertNotEqual(expected, mutated_nan_leak)
+
+    def test_mutation_sabotage_exec_mask_leak(self) -> None:
+        # Sabotage: inactive SIMD lane is incorrectly overwritten
+        sim = SIMDWavefront(wave_size=32)
+        sim.exec_mask = 0x00000001  # only lane 0 active
+        sim.store_vgpr_half_wave(0, hi=False, values=[0xDEAD] * 32)
+        sim.store_vgpr_half_wave(1, hi=False, values=[POS_TWO_F16] * 32)
+        sim.store_vgpr_half_wave(2, hi=False, values=[POS_TWO_F16] * 32)
+
+        results = sim.step_v_mul_f16(0, False, 1, False, 2, False)
+        # Lane 0 active -> 4.0
+        self.assertEqual(bits_to_f16(results[0]), 4.0)
+        # Lane 1 inactive -> must remain 0xDEAD
+        self.assertEqual(results[1], 0xDEAD)
 
 
 if __name__ == "__main__":
