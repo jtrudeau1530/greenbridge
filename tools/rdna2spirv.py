@@ -3097,6 +3097,28 @@ class Gen:
         self.emit(f"{z} = OpSelect %uint {any_} {self.cu(1)} {self.cu(0)}")
         self.emit(f"OpStore %scc {z}")
 
+    MASK_SOP2_B32 = ("s_and_b32", "s_or_b32", "s_xor_b32", "s_andn2_b32", "s_orn2_b32", "s_nand_b32", "s_nor_b32",
+                     "s_xnor_b32", "s_cselect_b32")
+
+    def sop2_b32_srcs(self, op, a):
+        """The two sources of a 32-bit SOP2. In a wave32 program a bitwise op (or s_cselect) that writes EXEC / VCC
+        reads both through mask_src, so a constant, inline or held in an SGPR, gives each lane its own bit; a mask is
+        read as before. Until 2026-11-22
+        a constant was used whole: `s_and_b32 exec_lo, exec_lo, 0xff00` (or the same constant in an SGPR) left every
+        lane of EXEC on. Data ops, and wave64 programs (a b32 op there is on one half of a mask), are unchanged."""
+        if op in self.MASK_SOP2_B32 and not self.wave64 and len(a) >= 3:
+            d = a[0]
+            to_mask = d["k"] == "special" and d.get("t", "") in ("exec_lo", "vcc_lo", "exec", "vcc")
+            maskable = all(x["k"] in ("sgpr", "imm") or (x["k"] == "special" and
+                                                         x.get("t", "").startswith(("exec", "vcc"))) for x in a[1:3])
+            # Only when the result is a mask (EXEC / VCC destination). An SGPR destination is classified by
+            # lane_masks.py, which calls it data when the other operand is a constant; a per-lane bit stored there
+            # would then be counted as data (s_and_b32 s20, exec_lo, 1; s_bcnt1_i32_b32 s21, s20 gave 32 and 0
+            # instead of 1, found by @Pierre-Kookis on #1792), so that case keeps the data read.
+            if maskable and to_mask:
+                return self.mask_src(a[1], wide=False), self.mask_src(a[2], wide=False)
+        return self.src_u(a[1]), self.src_u(a[2])
+
     def scc_logic(self, a, r):
         """SCC of a 32-bit bitwise SOP2 (s_and/or/xor/andn2/orn2/nand/nor/xnor_b32): D != 0. In a wave32 program
         an operation on lane masks (a source holds one, or it writes EXEC) has the whole wave's mask as D, so SCC
@@ -3381,7 +3403,26 @@ class Gen:
         or of the 32-bit value with L mod 32 (a b32 op). Until 2026-11-22 every lane took bit 0 (0xff00 was no
         lane, 5 every lane)."""
         if a["k"] == "sgpr":
-            return self.load_reg("sgpr", a["r"])
+            if self.holds_lane_mask(a):
+                return self.load_reg("sgpr", a["r"])
+            # Not known to hold a mask: the SGPR may hold a constant (s_mov_b32 s20, 0x3ffffc00) that is the same in
+            # every invocation, so lane L takes its bit L, as for an immediate. Until 2026-11-22 the raw value was used
+            # and any non-zero constant enabled every lane. A mask the analysis missed is still exact: each
+            # invocation holds 0 or ~0 there, and bit L of that is the same 0 or 1. A pair in a wave64 64-bit
+            # context gives lanes 32..63 their bit from the high SGPR (a mask keeps the same 0 / ~0 in both).
+            lane = self.wave_lane()
+            word = self.load_reg("sgpr", a["r"])
+            if a.get("n", 1) == 2 and wide and self.wave64:
+                hi, up, sel = self.load_reg("sgpr", a["r"] + 1), self.tmp(), self.tmp()
+                self.emit(f"{up} = OpUGreaterThanEqual %bool {lane} {self.cu(32)}")
+                self.emit(f"{sel} = OpSelect %uint {up} {hi} {word}")
+                word = sel
+            sh, shr, bit, r = (self.tmp() for _ in range(4))
+            self.emit(f"{sh} = OpBitwiseAnd %uint {lane} {self.cu(31)}")
+            self.emit(f"{shr} = OpShiftRightLogical %uint {word} {sh}")
+            self.emit(f"{bit} = OpBitwiseAnd %uint {shr} {self.cu(1)}")
+            self.emit(f"{r} = OpSelect %uint {self.tmp_bool_nz(bit)} {self.cu(0xFFFFFFFF)} {self.cu(0)}")
+            return r
         if a["k"] == "special" and a["t"] in ("vcc", "vcc_lo", "vcc_hi"):
             v = self.tmp()
             self.emit(f"{v} = OpLoad %uint %vcc")
@@ -3933,13 +3974,16 @@ class Gen:
         if op in ("s_denorm_mode", "s_round_mode"):
             raise Unsupported(op + " (not in the corpus; MODE is modelled through s_setreg only)")
         if op == "s_mov_b32" and a[0]["k"] == "special" and a[0]["t"] in ("exec_lo", "exec_hi") and \
-                (a[0]["t"] == "exec_hi" or a[1]["k"] in ("imm", "fimm")):
+                (a[0]["t"] == "exec_hi" or a[1]["k"] in ("imm", "fimm") or
+                 (a[1]["k"] == "sgpr" and not self.holds_lane_mask(a[1]))):
             src = a[1]
             const = (src["v"] & 0xFFFFFFFF) if src["k"] == "imm" else None
             if src["k"] == "fimm":
                 const = struct.unpack("<I", struct.pack("<f", src["v"]))[0]
-            self.exec_half_write(0 if a[0]["t"] == "exec_lo" else 1, None if const is not None else self.src_u(src),
-                                 const)
+            # an SGPR that isn't a mask (a constant, say) gives each lane its own bit, as a constant does (mask_src)
+            val = None if const is not None else (self.mask_src(src, wide=False) if src["k"] == "sgpr"
+                                                  else self.src_u(src))
+            self.exec_half_write(0 if a[0]["t"] == "exec_lo" else 1, val, const)
         elif op == "v_mov_b32" or op == "s_mov_b32":
             lit_val = None
             if op == "s_mov_b32" and a[0]["k"] == "sgpr" and self.desc_cache_ok():
@@ -5960,7 +6004,7 @@ class Gen:
                     self.dst(a[0], r)
                     self.emit(f"OpStore %scc {self.cu(1 if val != 0 else 0)}")
                     return
-            x, y = self.src_u(a[1]), self.src_u(a[2])
+            x, y = self.sop2_b32_srcs(op, a)
             r = self.tmp()
             if op == "s_cselect_b32":
                 c, b = self.tmp(), self.tmp()
@@ -6776,9 +6820,9 @@ class Gen:
                         m = self.tmp()
                         self.emit(f"{m} = OpBitwiseAnd %uint {y_raw} {self.cu(31)}")
                         y = m
+                    x = self.src_u(a[1])
                 else:
-                    y = self.src_u(a[2])
-                x = self.src_u(a[1])
+                    x, y = self.sop2_b32_srcs(op, a)     # lane-mask sources as mask_src (s_and/or_b32 on EXEC)
                 self.emit(f"{r} = {kind} %uint {x} {y}")
             self.dst(a[0], r)
             if op in ("s_and_b32", "s_or_b32"):
