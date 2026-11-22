@@ -227,6 +227,24 @@ class Cli(unittest.TestCase):
             self.assertEqual(code, 1)
             self.assertIn("FSPX status 5", err)
 
+    def test_short_kind0_unpacks_without_keyerror(self):
+        with tempfile.TemporaryDirectory() as t:
+            src = os.path.join(t, "short.fspx")
+            with open(src, "wb") as f:
+                f.write(make_fspx([(0, struct.pack("<2I", 1, 2)), (6, program())]))
+            out = os.path.join(t, "out")
+            code, _, err = self.run_tool(src, "--out", out)
+            self.assertEqual(code, 0)
+            self.assertEqual(err, "")
+            with open(os.path.join(out, "index.json"), encoding="utf-8") as f:
+                index = json.load(f)
+            self.assertEqual(len(index), 1)
+            self.assertNotIn("threads", index[0])
+            self.assertNotIn("wave32", index[0])
+            with open(os.path.join(out, "fspx", "short.json"), encoding="utf-8") as f:
+                meta = json.load(f)
+            self.assertEqual(meta["words"], [1, 2])
+
 
 class TranslatorSidecars(unittest.TestCase):
     """rdna2spirv reads an FSPX program's code and dispatch state from fspx/ when there is no FSSM blob."""

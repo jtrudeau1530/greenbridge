@@ -201,7 +201,11 @@ def main(argv=None) -> int:
             stage = psv_stage(dxbc_parts(container)) if container else None
             meta["source"] = {"file": os.path.basename(path), "offset": off}
             entry = {"file": name + ".dxbc", "stage": "cs" if stage in (None, STAGE_COMPUTE) else f"psv{stage}",
-                     "source_offset": off, "threads": meta["threads"], "wave32": meta["wave32"]}
+                     "source_offset": off}
+            if "threads" in meta:
+                entry["threads"] = meta["threads"]
+            if "wave32" in meta:
+                entry["wave32"] = meta["wave32"]
             if container:
                 with open(os.path.join(a.out, name + ".dxbc"), "wb") as f:
                     f.write(container)
