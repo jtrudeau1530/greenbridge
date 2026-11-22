@@ -707,5 +707,228 @@ class TestValuMed3ScalarInterpreter(unittest.TestCase):
         self.assertEqual(bits_to_f32(res_clamp), 1.0)
 
 
+class SIMDVALUInterpreter:
+    """SIMD multi-lane execution model supporting Wave32 and Wave64 with EXEC masking."""
+
+    def __init__(self, wave_size: int = 64) -> None:
+        if wave_size not in (32, 64):
+            raise ValueError(f"Invalid wave_size: {wave_size}. Must be 32 or 64.")
+        self.wave_size = wave_size
+        self.num_vgprs = 256
+        self.num_sgprs = 106
+        self.vgpr = [[0] * self.wave_size for _ in range(self.num_vgprs)]
+        self.sgpr = [0] * self.num_sgprs
+        self.vcc = 0
+        self.exec = (1 << self.wave_size) - 1
+
+    def reset(self) -> None:
+        self.vgpr = [[0] * self.wave_size for _ in range(self.num_vgprs)]
+        self.sgpr = [0] * self.num_sgprs
+        self.vcc = 0
+        self.exec = (1 << self.wave_size) - 1
+
+    def get_vgpr_u32(self, reg: int, lane: int) -> int:
+        if not (0 <= reg < self.num_vgprs):
+            raise IndexError(f"VGPR index {reg} out of range [0, {self.num_vgprs})")
+        if not (0 <= lane < self.wave_size):
+            raise IndexError(f"Lane {lane} out of range [0, {self.wave_size})")
+        return self.vgpr[reg][lane] & MASK32
+
+    def set_vgpr_u32(self, reg: int, lane: int, val: int) -> None:
+        if not (0 <= reg < self.num_vgprs):
+            raise IndexError(f"VGPR index {reg} out of range [0, {self.num_vgprs})")
+        if not (0 <= lane < self.wave_size):
+            raise IndexError(f"Lane {lane} out of range [0, {self.wave_size})")
+        self.vgpr[reg][lane] = val & MASK32
+
+    def get_sgpr_u32(self, reg: int) -> int:
+        if not (0 <= reg < self.num_sgprs):
+            raise IndexError(f"SGPR index {reg} out of range [0, {self.num_sgprs})")
+        return self.sgpr[reg] & MASK32
+
+    def set_sgpr_u32(self, reg: int, val: int) -> None:
+        if not (0 <= reg < self.num_sgprs):
+            raise IndexError(f"SGPR index {reg} out of range [0, {self.num_sgprs})")
+        self.sgpr[reg] = val & MASK32
+
+    def eval_operand_lane(self, op: Operand, lane: int) -> int:
+        if op.kind == OperandKind.VGPR:
+            val = self.get_vgpr_u32(op.reg_index, lane)
+        elif op.kind == OperandKind.SGPR:
+            val = self.get_sgpr_u32(op.reg_index)
+        elif op.kind in (OperandKind.LITERAL_I32, OperandKind.LITERAL_U32, OperandKind.LITERAL_F32, OperandKind.INLINE_CONST):
+            val = op.literal_val & MASK32
+        else:
+            raise ValueError(f"Unsupported operand kind: {op.kind}")
+
+        if op.data_type == DataType.F32:
+            if op.abs_mod:
+                val &= ~SIGN_MASK_F32
+            if op.neg_mod:
+                val ^= SIGN_MASK_F32
+        return val
+
+    def execute(self, ast: InstructionAST) -> list[int]:
+        ast.validate()
+        s0_latched = [self.eval_operand_lane(ast.src0, lane) for lane in range(self.wave_size)]
+        s1_latched = [self.eval_operand_lane(ast.src1, lane) for lane in range(self.wave_size)]
+        s2_latched = [self.eval_operand_lane(ast.src2, lane) for lane in range(self.wave_size)]
+
+        results: list[int] = []
+        for lane in range(self.wave_size):
+            if not (self.exec & (1 << lane)):
+                results.append(self.get_vgpr_u32(ast.dst.reg_index, lane))
+                continue
+
+            s0 = s0_latched[lane]
+            s1 = s1_latched[lane]
+            s2 = s2_latched[lane]
+
+            if ast.opcode == "v_med3_f32":
+                res = ref_med3_f32(s0, s1, s2, clamp=ast.clamp, omod=ast.omod)
+            elif ast.opcode == "v_med3_i32":
+                res = ref_med3_i32(s0, s1, s2, clamp=ast.clamp)
+            elif ast.opcode == "v_med3_u32":
+                res = ref_med3_u32(s0, s1, s2, clamp=ast.clamp)
+            else:
+                raise NotImplementedError(f"Opcode {ast.opcode} not implemented")
+
+            self.set_vgpr_u32(ast.dst.reg_index, lane, res)
+            results.append(res)
+
+        return results
+
+    def execute_asm(self, asm_line: str) -> list[int]:
+        ast = parse_vop3_med3(asm_line)
+        return self.execute(ast)
+
+
+class TestValuMed3SIMDMultiLane(unittest.TestCase):
+    """Unit tests for SIMD multi-lane divergence and 32/64-bit EXEC masking."""
+
+    def test_wave32_uniform_execution(self):
+        sim = SIMDVALUInterpreter(wave_size=32)
+        for lane in range(32):
+            sim.set_vgpr_u32(1, lane, f32_to_bits(1.0))
+            sim.set_vgpr_u32(2, lane, f32_to_bits(5.0))
+            sim.set_vgpr_u32(3, lane, f32_to_bits(3.0))
+
+        results = sim.execute_asm("v_med3_f32 v0, v1, v2, v3")
+        self.assertEqual(len(results), 32)
+        for lane in range(32):
+            self.assertEqual(bits_to_f32(results[lane]), 3.0)
+            self.assertEqual(bits_to_f32(sim.get_vgpr_u32(0, lane)), 3.0)
+
+    def test_wave64_uniform_execution(self):
+        sim = SIMDVALUInterpreter(wave_size=64)
+        for lane in range(64):
+            sim.set_vgpr_u32(4, lane, 100)
+            sim.set_vgpr_u32(5, lane, 300)
+            sim.set_vgpr_u32(6, lane, 200)
+
+        results = sim.execute_asm("v_med3_u32 v0, v4, v5, v6")
+        self.assertEqual(len(results), 64)
+        for lane in range(64):
+            self.assertEqual(results[lane], 200)
+
+    def test_wave32_divergent_lanes(self):
+        sim = SIMDVALUInterpreter(wave_size=32)
+        expected: list[int] = []
+        for lane in range(32):
+            v1 = lane
+            v2 = lane * 2
+            v3 = 16
+            sim.set_vgpr_u32(1, lane, v1)
+            sim.set_vgpr_u32(2, lane, v2)
+            sim.set_vgpr_u32(3, lane, v3)
+            expected.append(ref_med3_i32(v1, v2, v3))
+
+        results = sim.execute_asm("v_med3_i32 v0, v1, v2, v3")
+        for lane in range(32):
+            self.assertEqual(results[lane], expected[lane])
+
+    def test_wave64_divergent_lanes(self):
+        sim = SIMDVALUInterpreter(wave_size=64)
+        expected: list[float] = []
+        for lane in range(64):
+            f1 = float(lane)
+            f2 = float(63 - lane)
+            f3 = 32.0
+            sim.set_vgpr_u32(1, lane, f32_to_bits(f1))
+            sim.set_vgpr_u32(2, lane, f32_to_bits(f2))
+            sim.set_vgpr_u32(3, lane, f32_to_bits(f3))
+            expected.append(bits_to_f32(ref_med3_f32(f32_to_bits(f1), f32_to_bits(f2), f32_to_bits(f3))))
+
+        results = sim.execute_asm("v_med3_f32 v0, v1, v2, v3")
+        for lane in range(64):
+            self.assertEqual(bits_to_f32(results[lane]), expected[lane])
+
+    def test_exec_mask_partial_inactivity_wave32(self):
+        sim = SIMDVALUInterpreter(wave_size=32)
+        canary = 0xDEADBEEF
+        for lane in range(32):
+            sim.set_vgpr_u32(0, lane, canary)
+            sim.set_vgpr_u32(1, lane, 10)
+            sim.set_vgpr_u32(2, lane, 30)
+            sim.set_vgpr_u32(3, lane, 20)
+
+        # Even lanes active (0x55555555)
+        sim.exec = 0x55555555
+        results = sim.execute_asm("v_med3_i32 v0, v1, v2, v3")
+
+        for lane in range(32):
+            if lane % 2 == 0:
+                self.assertEqual(results[lane], 20)
+                self.assertEqual(sim.get_vgpr_u32(0, lane), 20)
+            else:
+                self.assertEqual(results[lane], canary)
+                self.assertEqual(sim.get_vgpr_u32(0, lane), canary)
+
+    def test_exec_mask_partial_inactivity_wave64(self):
+        sim = SIMDVALUInterpreter(wave_size=64)
+        canary = 0xCAFEBABE
+        for lane in range(64):
+            sim.set_vgpr_u32(0, lane, canary)
+            sim.set_vgpr_u32(1, lane, f32_to_bits(1.0))
+            sim.set_vgpr_u32(2, lane, f32_to_bits(2.0))
+            sim.set_vgpr_u32(3, lane, f32_to_bits(3.0))
+
+        # Lower 32 lanes active
+        sim.exec = 0x00000000FFFFFFFF
+        results = sim.execute_asm("v_med3_f32 v0, v1, v2, v3")
+
+        for lane in range(64):
+            if lane < 32:
+                self.assertEqual(bits_to_f32(results[lane]), 2.0)
+            else:
+                self.assertEqual(results[lane], canary)
+
+    def test_exec_mask_all_inactive(self):
+        sim = SIMDVALUInterpreter(wave_size=64)
+        canary = 0x12345678
+        for lane in range(64):
+            sim.set_vgpr_u32(0, lane, canary)
+            sim.set_vgpr_u32(1, lane, 5)
+            sim.set_vgpr_u32(2, lane, 15)
+            sim.set_vgpr_u32(3, lane, 10)
+
+        sim.exec = 0x0
+        results = sim.execute_asm("v_med3_u32 v0, v1, v2, v3")
+        for lane in range(64):
+            self.assertEqual(results[lane], canary)
+            self.assertEqual(sim.get_vgpr_u32(0, lane), canary)
+
+    def test_simd_sgpr_uniform_broadcast(self):
+        sim = SIMDVALUInterpreter(wave_size=32)
+        sim.set_sgpr_u32(10, 50)
+        for lane in range(32):
+            sim.set_vgpr_u32(1, lane, lane)
+            sim.set_vgpr_u32(2, lane, 100)
+
+        results = sim.execute_asm("v_med3_i32 v0, v1, s10, v2")
+        for lane in range(32):
+            self.assertEqual(results[lane], ref_med3_i32(lane, 50, 100))
+
+
 if __name__ == "__main__":
     unittest.main()
