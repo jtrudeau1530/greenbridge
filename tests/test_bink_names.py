@@ -210,6 +210,25 @@ class TestCli(unittest.TestCase):
             with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
                 names_mod.main([tmp, "--mount", xml, "--out", xml])
 
+    def test_refuses_to_overwrite_pins_input(self):
+        # --out targeting the same --pins CSV must be rejected before the file is opened for writing
+        with tempfile.TemporaryDirectory() as tmp:
+            pins = os.path.join(tmp, "pins.csv")
+            with open(pins, "w", encoding="utf-8", newline="") as fh:
+                fh.write("offset,path\n0,f/a.bk2\n")
+            xml = os.path.join(tmp, "list.xml")
+            with open(xml, "w", encoding="utf-8") as fh:
+                fh.write(mount_xml(["f/a.bk2", "f/b.bk2"]))
+            archive = os.path.join(tmp, "test.rpf")
+            with open(archive, "wb") as fh:
+                fh.write(make_stream(1280, 720, 40))
+            with open(pins, "rb") as fh:
+                before = fh.read()
+            with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                names_mod.main([archive, "--mount", xml, "--pins", pins, "--out", pins])
+            with open(pins, "rb") as fh:
+                self.assertEqual(fh.read(), before, "the pins CSV must not be modified")
+
 
 if __name__ == "__main__":
     unittest.main()
