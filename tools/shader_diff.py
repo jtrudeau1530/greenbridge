@@ -202,7 +202,7 @@ def compare_pair(cpu_words, spv_words, *, writers=None):
             continue
         writer = writers.get(EXPORT_REGS[i])
         mismatch = f"lane word {i}: expected 0x{c:08x} ({c}), actual 0x{s:08x} ({s})"
-        if writer and writer[0] in _FLOAT_OPS:
+        if writer and cpu_ref.base_op(writer[0]) in _FLOAT_OPS:
             c_nan, s_nan = _is_nan_bits(c), _is_nan_bits(s)
             if c_nan and s_nan:
                 continue
