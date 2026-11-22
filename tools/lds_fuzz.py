@@ -53,9 +53,10 @@ READS = {   # name: (bytes, kind)
     "ds_read_b128": (16, "wide"),
     "ds_read_u8": (1, "u"), "ds_read_i8": (1, "i"), "ds_read_u16": (2, "u"), "ds_read_i16": (2, "i"),
     "ds_read_u16_d16": (2, "u_lo"), "ds_read_u16_d16_hi": (2, "u_hi"),
+    "ds_read_u8_d16": (1, "u_lo"), "ds_read_u8_d16_hi": (1, "u_hi"),
+    "ds_read_i8_d16": (1, "i_lo"), "ds_read_i8_d16_hi": (1, "i_hi"),
 }
-# The translator rejects ds_permute_b32 and the 8-bit d16 reads (ds_read_u8_d16[_hi], ds_read_i8_d16[_hi]), so
-# they are not generated.
+# The translator rejects ds_permute_b32, so it is not generated.
 WRITES = {  # name: (bytes, data bit offset)
     "ds_write_b32": (4, 0), "ds_write_b64": (8, 0), "ds_write_b96": (12, 0), "ds_write_b128": (16, 0),
     "ds_write_b8": (1, 0), "ds_write_b16": (2, 0), "ds_write_b8_d16_hi": (1, 16), "ds_write_b16_d16_hi": (2, 16),
