@@ -474,7 +474,7 @@ int compare_resolves(ID3D12Device* ours) {
     constexpr ResolveScenario scenarios[] = {
         ResolveScenario::full, ResolveScenario::rectangle, ResolveScenario::null_rectangle};
     int mismatches = 0;
-    unsigned comparisons = 0, skipped = 0;
+    unsigned compared = 0, matched = 0, skipped = 0;
 
     for (DXGI_FORMAT format : formats) {
         D3D12_FEATURE_DATA_FORMAT_SUPPORT host_format{format}, our_format{format};
@@ -484,6 +484,7 @@ int compare_resolves(ID3D12Device* ours) {
             ours->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &our_format, sizeof(our_format));
         if (FAILED(host_format_hr) || (UINT(host_format.Support1) & required) != required) {
             std::printf("resolve format %d: host does not advertise multisample colour resolve, skipped\n", int(format));
+            ++skipped;
             continue;
         }
         if (FAILED(our_format_hr) || (UINT(our_format.Support1) & required) != required) {
@@ -520,19 +521,21 @@ int compare_resolves(ID3D12Device* ours) {
                     ++mismatches;
                     continue;
                 }
+                ++compared;
                 if (host_pixels != our_pixels) {
                     std::fprintf(stderr, "resolve mismatch: format %d samples %u %s (host %zu bytes, Vulkan %zu)\n",
                                  int(format), samples, resolve_scenario_name(scenario),
                                  host_pixels.size(), our_pixels.size());
                     ++mismatches;
+                } else {
+                    ++matched;
                 }
-                ++comparisons;
             }
         }
     }
-    std::printf("Resolve comparison: %u matched cases, %u unsupported format/sample combinations skipped, "
-                "%d mismatches\n", comparisons, skipped, mismatches);
-    if (comparisons == 0) {
+    std::printf("Resolve comparison: %u compared, %u matched, %u unsupported format/sample combinations skipped, "
+                "%d mismatches\n", compared, matched, skipped, mismatches);
+    if (compared == 0) {
         std::fprintf(stderr, "Resolve comparison: no common supported format/sample combination was exercised\n");
         ++mismatches;
     }
