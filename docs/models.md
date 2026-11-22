@@ -537,9 +537,11 @@ are little-endian:
 The group walk and its counts above were reproduced on a 1.0.2.1 copy (the same `shaders.rpf`, SHA-256
 `0bc16345…`). So was @jeremygold02's census of both databases' effects with `tools/sgd5_effects.py
 --list-effects` (#3036, `0029eba7`): 932 effect records with 932 distinct name hashes, 913 of them with a
-technique table, 25,037 techniques and 28,798 passes. The census finds technique tables by a validated search
-inside each effect, not by a decoded pointer. The record and pass format below was also checked by hand on
-three records:
+technique table, 25,037 techniques and 28,798 passes. Since `c0439966` the tool also **walks** the records
+forward from each database's effect count, using only stored lengths: every record's string pool, the next
+record, and at the end the terminal word and zero padding. Its tests, run against this package
+(`LEONIDA_GAME_DIR` set, `tests/test_sgd5_effects.py`), pass: the walk and the earlier search agree on every
+record, technique and pass. The record and pass format below was also checked by hand on three records:
 
 | Record | Stage list sizes | Techniques | Passes (total = sum of counts) | First pass list 0 / list 1 ordinal |
 |---|---|---:|---:|---|
@@ -549,8 +551,7 @@ three records:
 
 Two things are still open:
 
-- **Decoding the pointers.** The census finds every effect's technique table by a validated search, not by a
-  decoded pointer, and the u32 after an effect's name is still opaque.
+- **The u32 after an effect's name.** What it means is still unknown.
 - **Which technique and pass the game draws with.** That is a run-time choice; it is presumably made in the
   executable (RT-5).
 
