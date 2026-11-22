@@ -96,10 +96,10 @@ def scan_directory(disasm):
                          "mask_word_source": {"exec_vcc": Counter(), "other": Counter()}}
                  for stage in GRAPHICS}
     other = {"shaders": 0, "wave64": 0}
-    for name in sorted(os.listdir(disasm)):
-        if not name.endswith(".s"):
-            continue
-        path = os.path.join(disasm, name)
+    with os.scandir(disasm) as entries:
+        paths = sorted(entry.path for entry in entries
+                       if entry.name.endswith(".s") and entry.is_file())
+    for path in paths:
         info = parse_file(path)
         stage = rdna2spirv.stage_of(info["name"], path)
         wave64 = wave64_rule(stage, info["insns"])
