@@ -154,6 +154,9 @@ int filter(EXCEPTION_POINTERS* e, Call* c) {
 using Ctor = void* (*)(void* self, void* device, bool flag);
 using Dtor = void (*)(void* self);
 
+// Each guard returns a copy of `c`, not `c` itself: with `return c;` the local becomes the named return value, and
+// clang-cl 19 and 20 crash (exit 139, in recoverAddrOfEscapedLocal) generating the __except filter that writes it,
+// which stops the Linux cross-build (runtime/cmake/clang-cl-xwin.cmake). MSVC is fine either way.
 Call guarded_ctor(Ctor fn, void* self, void* device, bool flag) {
     Call c;
     __try {
@@ -161,7 +164,7 @@ Call guarded_ctor(Ctor fn, void* self, void* device, bool flag) {
     } __except (filter(GetExceptionInformation(), &c)) {
         c.faulted = true;
     }
-    return c;
+    return Call(c);
 }
 
 Call guarded_dtor(Dtor fn, void* self) {
@@ -171,7 +174,7 @@ Call guarded_dtor(Dtor fn, void* self) {
     } __except (filter(GetExceptionInformation(), &c)) {
         c.faulted = true;
     }
-    return c;
+    return Call(c);
 }
 
 // main's loader (#95) maps, sets up TLS and runs DllMain, but doesn't register the image's x64 unwind tables yet
