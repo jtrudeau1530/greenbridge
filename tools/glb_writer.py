@@ -1166,23 +1166,24 @@ def build_instanced_glb(
                 raise GlbError("instance scale must have a positive determinant; mirror the mesh instead")
             if not all(math.isfinite(v) for v in t + sc):
                 raise GlbError("instance translation and scale must be finite")
-            b = instance_bounds(box_min, box_max, t, q, sc)
-            for k in range(3):
-                lo[k] = min(lo[k], b[k])
-                hi[k] = max(hi[k], b[k + 3])
             ts.append(t)
             rs.append(q)
             ss.append(sc)
         instances_total += len(insts)
         drawn_tris += mesh_tris * len(insts)
+        bounds_transforms = zip(ts, rs, ss)
         if mode == "gpu":
             attrs = {}
+            stored_transforms: list[Iterable[tuple[float, ...]]] = []
             for key, values, kind in (("TRANSLATION", ts, "VEC3"), ("ROTATION", rs, "VEC4"), ("SCALE", ss, "VEC3")):
-                data, _ = _pack_f32(values, 4 if kind == "VEC4" else 3)
+                components = 4 if kind == "VEC4" else 3
+                data, _ = _pack_f32(values, components)
+                stored_transforms.append(struct.iter_unpack(f"<{components}f", data))
                 bv = _append_buffer_view(bin_buf, buffer_views, data, target=None)
                 attrs[key] = len(accessors)
                 accessors.append({"bufferView": bv, "componentType": COMPONENT_FLOAT, "count": len(values), "type": kind})
             nodes.append({"mesh": mesh_idx, "extensions": {INSTANCING_EXTENSION: {"attributes": attrs}}})
+            bounds_transforms = zip(*stored_transforms)
         else:
             for t, q, sc in zip(ts, rs, ss):
                 node: dict = {"mesh": mesh_idx}
@@ -1193,6 +1194,11 @@ def build_instanced_glb(
                 if sc != [1.0, 1.0, 1.0]:
                     node["scale"] = [_clean_zero(v) for v in sc]
                 nodes.append(node)
+        for t, q, sc in bounds_transforms:
+            b = instance_bounds(box_min, box_max, t, q, sc)
+            for k in range(3):
+                lo[k] = min(lo[k], b[k])
+                hi[k] = max(hi[k], b[k + 3])
     if not nodes:
         raise GlbError("cannot build GLB: no mesh with primitives and instances")
     bin_pad = (-len(bin_buf)) % 4
