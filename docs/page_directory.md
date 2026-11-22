@@ -232,8 +232,11 @@ No name or type string is present in the page; these hashes remain opaque until 
 
 ### One page lacks the recurring `0x00000007` tag
 
-A separate Xbox Series 1.0.2.1 export contained 16,977 directory pages. The counts below apply only to that
-export. Each selected tag occurred once per page that contained it.
+The Xbox Series 1.0.2.1 export identifies `story000.rpf` as its source and contains 16,977 complete
+directory pages. A bounded source check used 17 evenly spaced rows (including the first and last) and
+the six-record exception described below. At the recorded compressed spans, the inflated length, page
+signature and both record lists (`q38` and `q28`) matched for 18/18 rows in `story000.rpf` and 0/18 in
+`data.rpf`. The counts below apply only to this export. Each selected tag occurred once per page that contained it.
 
 | Selected `q38` tag | Pages containing it |
 |---|---:|
