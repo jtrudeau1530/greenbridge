@@ -725,10 +725,12 @@ void* Loader::resolve_forwarder(const std::string& spec, Binding& binding, int d
         }
     }
 
+    // shim_key, not the bare module name: forwarder strings usually leave out ".dll" ("MSVCP140.?foo"), and the host
+    // CRT copies are named with it, so a forwarded CRT symbol must skip the bundled Xbox build as a direct import does.
     const std::filesystem::path candidates[] = {game_dir_ / module, game_dir_ / (module + ".dll")};
     for (const auto& candidate : candidates) {
         std::error_code ec;
-        if (prefer_host_copy(lower(module)) || !std::filesystem::exists(candidate, ec)) continue;
+        if (prefer_host_copy(shim_key) || !std::filesystem::exists(candidate, ec)) continue;
         Module& dep = load(candidate);
         if (auto it = dep.exports.find(symbol); it != dep.exports.end()) {
             binding = Binding::Module;
