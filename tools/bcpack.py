@@ -364,12 +364,32 @@ def _unknown_blocks(e_roots, i_roots, unknown_e, unknown_i):
     return sum(1 for e, i in zip(e_roots, i_roots) if e in unknown_e or i in unknown_i)
 
 
-def _bc1_blocks(lanes, nblocks, provisional):
+def _resolve_bc_history(codec, default_confirmed, default_provisional, history):
+    """Merge or replace BC1/BC3/BC4/BC5 history tables when external `history` is provided."""
+    loaded = _bptc.load_bc_history(codec, history)
+    if loaded is None:
+        return default_confirmed, default_provisional
+    ext_conf, ext_prov, replace = loaded
+    if replace:
+        confirmed = dict(ext_conf)
+        loose = {k: v for k, v in ext_prov.items() if k not in confirmed}
+        return confirmed, loose
+    confirmed = dict(default_confirmed)
+    confirmed.update(ext_conf)
+    loose = {k: v for k, v in default_provisional.items() if k not in confirmed}
+    for k, v in ext_prov.items():
+        if k not in confirmed:
+            loose[k] = v
+    return confirmed, loose
+
+
+def _bc1_blocks(lanes, nblocks, provisional, *, history=None):
     if any(lanes[1]):
         raise BcpackError("BC1 lane 1 is non-zero (unexpected)")
     quad = _tables.BC1_QUADRANT
-    confirmed = _tables.BC1_HISTORY_CONFIRMED
-    loose = _tables.BC1_HISTORY_PROVISIONAL
+    confirmed, loose = _resolve_bc_history(
+        1, _tables.BC1_HISTORY_CONFIRMED, _tables.BC1_HISTORY_PROVISIONAL, history
+    )
     out = bytearray(nblocks * 8)
     hist = [None] * nblocks
     mods = (32, 64, 32, 32, 64, 32)
@@ -424,13 +444,14 @@ _BC3_MODS = (256, 256, 32, 64, 32, 32, 64, 32)
 _BC3_NONE = (128, 128, 0, 0, 0, 0, 0, 0)
 
 
-def _bc3_blocks(lanes, nblocks, provisional):
+def _bc3_blocks(lanes, nblocks, provisional, *, history=None):
     if any(lanes[1]):
         raise BcpackError("BC3 lane 1 is non-zero (unexpected)")
     pairs = _tables.BC3_ALPHA_PAIR
     quads = _tables.BC3_COLOUR_QUADRANT
-    confirmed = _tables.BC3_HISTORY_CONFIRMED
-    loose = _tables.BC3_HISTORY_PROVISIONAL
+    confirmed, loose = _resolve_bc_history(
+        3, _tables.BC3_HISTORY_CONFIRMED, _tables.BC3_HISTORY_PROVISIONAL, history
+    )
     out = bytearray(nblocks * 16)
     hist = [None] * nblocks
     lost = [False] * nblocks
@@ -502,12 +523,13 @@ def _bc3_blocks(lanes, nblocks, provisional):
     return bytes(out)
 
 
-def _bc4_blocks(lanes, nblocks, provisional):
+def _bc4_blocks(lanes, nblocks, provisional, *, history=None):
     if any(lanes[1]):
         raise BcpackError("BC4 lane 1 is non-zero (unexpected)")
     pairs = _tables.BC4_PAIR
-    confirmed = _tables.BC4_HISTORY_CONFIRMED
-    loose = _tables.BC4_HISTORY_PROVISIONAL
+    confirmed, loose = _resolve_bc_history(
+        4, _tables.BC4_HISTORY_CONFIRMED, _tables.BC4_HISTORY_PROVISIONAL, history
+    )
     out = bytearray(nblocks * 8)
     hist = [None] * nblocks
     l0, l2, l3 = lanes[0], lanes[2], lanes[3]
@@ -545,12 +567,13 @@ def _bc4_blocks(lanes, nblocks, provisional):
     return bytes(out)
 
 
-def _bc5_blocks(lanes, nblocks, provisional):
+def _bc5_blocks(lanes, nblocks, provisional, *, history=None):
     if any(lanes[1]):
         raise BcpackError("BC5 lane 1 is non-zero (unexpected)")
     pairs = _tables.BC5_PAIR
-    confirmed = _tables.BC5_HISTORY_CONFIRMED
-    loose = _tables.BC5_HISTORY_PROVISIONAL
+    confirmed, loose = _resolve_bc_history(
+        5, _tables.BC5_HISTORY_CONFIRMED, _tables.BC5_HISTORY_PROVISIONAL, history
+    )
     out = bytearray(nblocks * 16)
     hist = [None] * nblocks
     lost = [False] * nblocks
@@ -1289,9 +1312,9 @@ def decode_with_info(raw, codec, out_size, *, allow_provisional=False, history=N
 
     When `allow_provisional` is False (strict mode), any unconfirmed or unknown
     built-in history reference raises `BcpackProvisionalError` and the returned
-    set is always empty. For BC6H (`codec 6`) and BC7 (`codec 7`), `history`
-    may point to a locally generated JSON file, directory, or dict supplying
-    the built-in initial history tables.
+    set is always empty. `history` may point to a locally generated JSON file,
+    directory, or dict supplying initial history tables for BC6H/BC7 (and
+    optional overrides for BC1-BC5).
     """
     rebuilder = _REBUILDERS.get(codec)
     if rebuilder is None:
@@ -1300,10 +1323,7 @@ def decode_with_info(raw, codec, out_size, *, allow_provisional=False, history=N
     lanes, _ = decode_lanes(raw, codec, out_size)
     nblocks = out_size // BLOCK_BYTES[codec]
     prov = set() if allow_provisional else None
-    if codec in (6, 7):
-        data = rebuilder(lanes, nblocks, prov, history=history)
-    else:
-        data = rebuilder(lanes, nblocks, prov)
+    data = rebuilder(lanes, nblocks, prov, history=history)
     return data, (prov if prov is not None else set())
 
 

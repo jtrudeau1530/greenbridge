@@ -155,16 +155,17 @@ def _read_history_section(history, codec_key, marker_key):
             return None
         path = candidate
     abspath = os.path.abspath(path)
-    mtime = os.path.getmtime(abspath)
+    st = os.stat(abspath)
+    cache_key = (st.st_mtime_ns, st.st_size)
     cached = _FILE_CACHE.get(abspath)
-    if cached is not None and cached[0] == mtime:
+    if cached is not None and cached[0] == cache_key:
         data = cached[1]
     else:
         with open(abspath, "r", encoding="utf-8") as fh:
             data = json.load(fh)
         if not isinstance(data, dict):
             raise ValueError(f"{path}: expected a JSON object")
-        _FILE_CACHE[abspath] = (mtime, data)
+        _FILE_CACHE[abspath] = (cache_key, data)
     if codec_key in data:
         return data[codec_key]
     return data if marker_key in data else None
@@ -305,3 +306,84 @@ def load_bc7(history=None):
         "history_index_confirmed_bits": tuple(ix_cb),
         "last_resort": frozenset(last_resort),
     }
+
+
+_BC_HISTORY_SPEC = {
+    1: ("bc1", (32, 64, 32, 32, 64, 32)),
+    3: ("bc3", (256, 256, 32, 64, 32, 32, 64, 32)),
+    4: ("bc4", (256, 256)),
+    5: ("bc5", (256, 256, 256, 256)),
+}
+
+
+def load_bc_history(codec, history=None):
+    """Load optional BC1/BC3/BC4/BC5 initial history overrides from `history`.
+
+    Returns `None` when `history` is `None` or does not contain a section for
+    `codec`. Otherwise returns `(confirmed, provisional, replace)` where
+    `confirmed` and `provisional` map `0..255` entry indices to validated
+    endpoint tuples and `replace` is a bool (default False: overlay onto the
+    built-in `bcpack_tables.py` defaults).
+    """
+    if history is None:
+        return None
+    spec = _BC_HISTORY_SPEC.get(codec)
+    if spec is None:
+        raise ValueError(f"unsupported BC history codec: {codec}")
+    codec_key, mods = spec
+    if isinstance(history, dict):
+        if codec_key in history:
+            sec = history[codec_key]
+        elif history.get("codec") == codec_key:
+            sec = history
+        else:
+            return None
+    else:
+        path = os.fspath(history)
+        if os.path.isdir(path):
+            candidate = os.path.join(path, f"{codec_key}.json")
+            if not os.path.isfile(candidate):
+                return None
+            path = candidate
+        abspath = os.path.abspath(path)
+        st = os.stat(abspath)
+        cache_key = (st.st_mtime_ns, st.st_size)
+        cached = _FILE_CACHE.get(abspath)
+        if cached is not None and cached[0] == cache_key:
+            data = cached[1]
+        else:
+            with open(abspath, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            if not isinstance(data, dict):
+                raise ValueError(f"{path}: expected a JSON object")
+            _FILE_CACHE[abspath] = (cache_key, data)
+        if codec_key in data:
+            sec = data[codec_key]
+        elif data.get("codec") == codec_key:
+            sec = data
+        else:
+            return None
+    if not isinstance(sec, dict):
+        raise ValueError(f"{codec_key} history section must be a JSON object")
+    if "codec" in sec and sec["codec"] != codec_key:
+        raise ValueError(f"expected codec {codec_key!r}, got {sec['codec']!r}")
+    ncols = len(mods)
+
+    def _parse_map(obj, label):
+        out = {}
+        for i, vals in _iter_entries(obj):
+            if not isinstance(vals, (list, tuple)) or len(vals) != ncols:
+                raise ValueError(f"{codec_key} {label}[{i}] must have {ncols} integers")
+            row = []
+            for v, mod in zip(vals, mods):
+                iv = int(v)
+                if not 0 <= iv < mod:
+                    raise ValueError(f"{codec_key} {label}[{i}] value {iv} outside 0..{mod - 1}")
+                row.append(iv)
+            out[i] = tuple(row)
+        return out
+
+    confirmed = _parse_map(sec.get("confirmed"), "confirmed")
+    provisional = _parse_map(sec.get("provisional"), "provisional")
+    replace = bool(sec.get("replace", False))
+    return confirmed, provisional, replace
