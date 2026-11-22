@@ -16,8 +16,9 @@
 //   VKT_HEAP_MB=<n>: size of the heap in MiB (default 64 KiB)
 //   VKT_NEED_MAINTENANCE8=1: the shader has a non-constant texel Offset outside gather (image_sample*_o, see
 //   ps_texoff.asm); print "unsupported: ..." and exit 77 when VK_KHR_maintenance8 cannot be enabled.
-// VK_KHR_maintenance8 and shaderImageGatherExtended (a non-constant gather Offset) are enabled when the device has
-// them.
+// VK_KHR_maintenance8, shaderImageGatherExtended (a non-constant gather Offset) and shaderResourceMinLod (the MinLod
+// clamp of image_sample_d_cl) are enabled when the device has them. A fragment shader that declares the MinLod
+// capability on a device without shaderResourceMinLod prints "unsupported: ..." and exits 77.
 #define VK_NO_PROTOTYPES
 #include "vulkan_loader.h"
 
@@ -46,6 +47,13 @@ static std::vector<uint32_t> read_spv(const char* p) {
     std::vector<uint32_t> w(b.size() / 4);
     std::memcpy(w.data(), b.data(), w.size() * 4);
     return w;
+}
+
+// Whether the module declares capability `cap` (OpCapability comes first, right after the 5-word header).
+static bool declares_capability(const std::vector<uint32_t>& spv, uint32_t cap) {
+    for (size_t i = 5; i + 1 < spv.size() && spv[i] == (2u << 16 | 17u); i += 2)   // OpCapability, 2 words
+        if (spv[i + 1] == cap) return true;
+    return false;
 }
 
 #include "../src/descriptor_table.h"
@@ -162,6 +170,11 @@ int main(int argc, char** argv) {
                  pdp.limits.minTexelGatherOffset, int(pdp.limits.maxTexelGatherOffset));
     VkPhysicalDeviceFeatures have; vkGetPhysicalDeviceFeatures(pd, &have);
     f2.features.shaderImageGatherExtended = have.shaderImageGatherExtended;
+    f2.features.shaderResourceMinLod = have.shaderResourceMinLod;
+    if (declares_capability(read_spv(fs_path.c_str()), 42) && !have.shaderResourceMinLod) {   // 42 = MinLod
+        std::printf("unsupported: shaderResourceMinLod (the shader clamps its LOD with MinLod)\n");
+        return 77;
+    }
     std::vector<const char*> enable;
     bool m8_on = false;
 #ifdef VK_KHR_MAINTENANCE_8_EXTENSION_NAME   // the structure type is an enumerator: defined() never sees it

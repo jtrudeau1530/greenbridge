@@ -353,6 +353,18 @@ class TextureMipChecks(unittest.TestCase):
         self.assertTrue(check.texture_mip_mismatch(image[:-1], 1))
 
 
+class GradientSampleChecks(unittest.TestCase):
+    def test_device_without_min_lod_is_a_skip(self):
+        answer = 77, "unsupported: shaderResourceMinLod (the shader clamps its LOD with MinLod)\n"
+        with patch.object(check, "run", return_value=answer):
+            result = check.texture_gradient_a16_test("tools", "spirv", "ps_texture_grad_cl_a16")
+        self.assertIsInstance(result, check.Skip)
+        self.assertEqual(result, "SKIP (unsupported: shaderResourceMinLod (the shader clamps its LOD with MinLod))")
+        with patch.object(check, "run", return_value=(1, "device lost")):
+            failure = check.texture_gradient_a16_test("tools", "spirv", "ps_texture_grad_cl_a16")
+        self.assertNotIsInstance(failure, check.Skip)
+        self.assertIn("device lost", failure)
+
 class TexelOffsetChecks(unittest.TestCase):
     """ps_texoff (image_sample*_o, image_gather4_lz_o): the judgement of a dump, and the skip without maintenance8."""
     LIMITS = "device: gpu\ntexel offset limits: -64..63, gather -32..31\n"

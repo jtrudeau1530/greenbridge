@@ -742,7 +742,8 @@ def run_suite(a, work: str) -> int:
             results.append((name, ok, problem or "two passes, 4096 RGBA32F pixels each exact; wrong mip and UV rejected"))
         elif name in GRADIENT_TESTS:
             problem = texture_gradient_a16_test(a.build, spirv_dir, name)
-            results.append((name, not problem, problem or "4096 RGBA pixels matched"))
+            ok = None if isinstance(problem, Skip) else not problem
+            results.append((name, ok, problem or "4096 RGBA pixels matched"))
         elif name in ("ps_texture_sample", "ps_cube_sample", "ps_texture_sample_d16", "ps_sample_c_lz",
                       "ps_sample_c_lz_a16"):
             # Bindless texture tests: vk_texture_test finds vs_ids.spv and the shader in its working directory.

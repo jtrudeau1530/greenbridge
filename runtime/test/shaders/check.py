@@ -386,6 +386,9 @@ def texture_gradient_a16_test(tools: str, spirv: str, name: str = "ps_texture_gr
         raw = Path(tmp) / "pixels.raw"
         code, out = run(os.path.join(tools, "vk_texture_test" + EXE), vs, fs, raw,
                         "0", "92", "c00000", "14500000", "0")
+        if code == UNSUPPORTED:   # vk_texture_test: e.g. no shaderResourceMinLod for the d_cl clamp
+            m = re.search(r"unsupported: .*", out)
+            return Skip(f"SKIP ({m.group(0) if m else 'unsupported device'})")
         if code or not raw.is_file():
             return failure(code, out, 3)
         data = raw.read_bytes()
