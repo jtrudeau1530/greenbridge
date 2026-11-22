@@ -408,10 +408,17 @@ int main() {
                 EXPECT(SUCCEEDED(device->CreateGraphicsPipelineState(&ms_pso_desc, IID_PPV_ARGS(&ms_full_pso.p))));
                 ms_pso_desc.SampleMask = 0x5u;
                 EXPECT(SUCCEEDED(device->CreateGraphicsPipelineState(&ms_pso_desc, IID_PPV_ARGS(&ms_half_pso.p))));
-                // Non-power-of-two sample count must be rejected.
-                ms_pso_desc.SampleDesc.Count = 3;
+                // Non-power-of-two sample count and non-zero sample quality (NumQualityLevels == 1) must be rejected.
+                ms_pso_desc.SampleDesc = {3, 0};
                 Ref<ID3D12PipelineState> ms_bad_pso;
-                EXPECT(device->CreateGraphicsPipelineState(&ms_pso_desc, IID_PPV_ARGS(&ms_bad_pso.p)) == E_INVALIDARG);
+                EXPECT(device->CreateGraphicsPipelineState(&ms_pso_desc, IID_PPV_ARGS(&ms_bad_pso.p)) == E_INVALIDARG &&
+                       !ms_bad_pso.p);
+                ms_pso_desc.SampleDesc = {4, 1};
+                EXPECT(device->CreateGraphicsPipelineState(&ms_pso_desc, IID_PPV_ARGS(&ms_bad_pso.p)) == E_INVALIDARG &&
+                       !ms_bad_pso.p);
+                ms_pso_desc.SampleDesc = {1, 1};
+                EXPECT(device->CreateGraphicsPipelineState(&ms_pso_desc, IID_PPV_ARGS(&ms_bad_pso.p)) == E_INVALIDARG &&
+                       !ms_bad_pso.p);
 
                 struct MsaaPass {
                     ID3D12PipelineState* pso;

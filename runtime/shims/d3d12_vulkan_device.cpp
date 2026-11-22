@@ -1846,6 +1846,10 @@ public:
             log_once("invalid graphics pipeline sample count:", int(samples));
             return E_INVALIDARG;
         }
+        if (desc.SampleDesc.Quality != 0) {
+            log_once("invalid graphics pipeline sample quality:", int(desc.SampleDesc.Quality));
+            return E_INVALIDARG;
+        }
         const leonida::ShaderLibrary* library = device_.library();
         if (!library) return E_FAIL;
 
