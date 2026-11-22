@@ -963,6 +963,9 @@ def main(argv=None):
     out = a.out or os.path.splitext(base)[0] + ".navmesh-decode.json"
     if a.csv and same_report_path(out, a.csv):
         ap.error("--out and --csv must use different paths")
+    for flag, path in (("--out", out), ("--csv", a.csv)):
+        if path and same_report_path(path, a.input):
+            ap.error(f"{flag} would overwrite the input {a.input}")
     rows = [] if a.csv else None
     try:
         summary = scan(a.input, a.start, a.limit, a.deep, rows)
