@@ -911,10 +911,10 @@ def smallest_max_subgroup(vulkaninfo_text: str):
     return min(per_device)
 
 
-def wave64_settings(mode: str) -> tuple[bool, bool]:
+def wave64_settings(mode: str, *, mesh_compute: bool = False) -> tuple[bool, bool]:
     """Return whether to translate with emulation and whether to reuse emulated shaders. A wave64 compute or mesh
     shader is only exact without it when the GPU gives it 64-wide subgroups; with it, it is exact on any subgroup
-    size, at the cost of a workgroup barrier per segment. "auto" keeps emulation off on native-wave64 RDNA2
+    size, at the cost of a workgroup barrier per segment. "auto" keeps emulation off on native-wave64 RDNA1/2
     under the AMD Windows driver. Elsewhere it turns emulation on unless every Vulkan device reports
     maxSubgroupSize >= 64 and the runtime probe does not rule out native wave64."""
     if mode == "on":
@@ -922,13 +922,19 @@ def wave64_settings(mode: str) -> tuple[bool, bool]:
     if mode == "off":
         return False, False
     gpu = runtime_gpu_info()
-    native64 = bool(gpu["native64"]) if "native64" in gpu else None
-    if gpu.get("rdna2_amd_windows") and native64:
-        # #857: AMD's Windows compiler for RDNA2 crashes on many emulated LDS compute pipelines.
+    rdna1 = gpu.get("rdna1_amd_windows", False)
+    # On RDNA1 the native mesh modules cannot run. Both the default build's compute pipelines and
+    # any mesh shaders translated with --mesh-compute use the GPU's compute subgroup capabilities.
+    compute_only = mesh_compute or (rdna1 and gpu.get("mesh_in_supported_stages") is False)
+    native64 = gpu.get("native64")
+    if compute_only:
+        native64 = gpu.get("native64_compute", native64)
+    if native64 and (rdna1 or gpu.get("rdna2_amd_windows")):
+        # #857: AMD's Windows compiler for RDNA1/2 crashes on many emulated LDS compute pipelines.
         # The runtime probe can identify that GPU even when vulkaninfo is unavailable.
-        log(f"shaders: the runtime's GPU ({gpu.get('device', '?')}) is RDNA2 on the AMD Windows driver "
-            "and runs wave64 natively. That driver can crash on emulated wave64 code (#857), so auto uses "
-            "native wave64 and does not reuse emulated outputs (--wave64-emulate on to force emulation)")
+        log(f"shaders: the runtime's GPU ({gpu.get('device', '?')}) is {'RDNA1' if rdna1 else 'RDNA2'} "
+            "on the AMD Windows driver and runs wave64 natively. That driver can crash on emulated wave64 code "
+            "(#857), so auto uses native wave64 and rebuilds emulated outputs (--wave64-emulate on to force emulation)")
         return False, False
     exe = shutil.which("vulkaninfo")
     size = None
@@ -944,16 +950,17 @@ def wave64_settings(mode: str) -> tuple[bool, bool]:
         return True, True
     on = size < 64
     if not on and native64 is False:
-        log(f"shaders: smallest maximum subgroup size is {size}, but the Vulkan query found no 64-wide path for both "
-            "compute and mesh (fixed default size or required-size control): wave64 emulation on")
+        stages = "compute" if compute_only else "both compute and mesh"
+        log(f"shaders: smallest maximum subgroup size is {size}, but the Vulkan query found no 64-wide path for "
+            f"{stages} (fixed default size or required-size control): wave64 emulation on")
         return True, True
     log(f"shaders: smallest maximum subgroup size is {size}: wave64 emulation {'on' if on else 'off'}")
     return on, True
 
 
-def wave64_emulate(mode: str) -> bool:
+def wave64_emulate(mode: str, *, mesh_compute: bool = False) -> bool:
     """Whether a new translation uses wave64 emulation."""
-    return wave64_settings(mode)[0]
+    return wave64_settings(mode, mesh_compute=mesh_compute)[0]
 
 
 def runtime_gpu_info() -> dict:
@@ -1507,8 +1514,8 @@ def main() -> int:
                          "instead of building it (off Windows: instead of the clang-cl + xwin cross-build)")
     ap.add_argument("--wave64-emulate", choices=WAVE64_MODES, default="auto",
                     help="translate wave64 compute and mesh shaders to be exact on any subgroup size (needed on "
-                         "32-wide GPUs: NVIDIA, Intel). auto (default) turns it on unless vulkaninfo shows that "
-                         "every GPU has 64-wide subgroups")
+                         "32-wide GPUs: NVIDIA, Intel). auto (default) checks GPU subgroup support and prefers "
+                         "native wave64 on affected AMD Windows drivers")
     ap.add_argument("--no-float-controls", action="store_true",
                     help="translate without SignedZeroInfNanPreserve (Depends on: #664), for devices whose "
                          "vk_pipeline_check skips a shader without shaderSignedZeroInfNanPreserveFloat32")
@@ -1585,7 +1592,7 @@ def main() -> int:
             stages = [s for s in stages if s not in WINDOWS_ONLY]
             log(f"{', '.join(WINDOWS_ONLY)}: left out, the cross-build needs {'; '.join(lacking)} "
                 "(or pass --runtime-build)")
-    emulate, keep_emulated = (wave64_settings(a.wave64_emulate) if "shaders" in stages
+    emulate, keep_emulated = (wave64_settings(a.wave64_emulate, mesh_compute=a.mesh_compute) if "shaders" in stages
                               else (False, a.wave64_emulate == "auto"))
     if "shaders" in stages and not a.f16_interp_fallback and runtime_gpu_per_vertex() is False:
         log("shaders: the GPU the runtime would use can't take PerVertexKHR inputs (MoltenVK, or no "

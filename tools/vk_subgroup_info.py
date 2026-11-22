@@ -16,14 +16,14 @@ extensions); that is not checked here. vk_pipeline_check (the pipelines stage) p
 VK_LOADER_DRIVERS_SELECT (e.g. '*amd*')
 narrows which drivers the loader offers.
 
-native64 matches the current translated SPIR-V 1.5 modules, which do not allow varying subgroup sizes: either 64 can
-be required for both compute and mesh, or the default subgroupSize is 64 and subgroup operations are supported in
-both stages. SPIR-V 1.6 modules or stages created with ALLOW_VARYING_SUBGROUP_SIZE need a different check.
+native64 matches the current translated SPIR-V 1.5 modules, which use a fixed subgroup size: compute and mesh must
+support subgroup operations and either have a default subgroupSize of 64 or allow 64 to be required. native64_compute
+applies the same check to compute alone, including mesh shaders translated with --mesh-compute. SPIR-V 1.6 modules
+or stages created with ALLOW_VARYING_SUBGROUP_SIZE need a different check.
 
-rdna2_amd_windows says whether the device is RDNA2 (gfx103x, by PCI device ID) under AMD's proprietary Windows driver.
-That driver's shader compiler crashes (an access violation in vkCreateComputePipelines) on many --wave64-emulate
-compute shaders with LDS: #857, from driver 32.0.21030 to at least 32.0.21045.29003, on iGPUs and RX 6000 cards
-alike, while RDNA3, RDNA4, RADV and NVIDIA take the same modules. make_game.py leaves emulation off for such a GPU.
+rdna1_amd_windows and rdna2_amd_windows identify those GPU families by PCI device ID under AMD's proprietary Windows
+driver. Its shader compiler can crash in vkCreateComputePipelines on emulated wave64 compute shaders with LDS
+(#857, reported on RX 5000, RX 6000 and RDNA2 iGPUs). make_game.py prefers native wave64 when the GPU can run it.
 
 per_vertex_inputs says whether the device can run a pixel shader with PerVertexKHR inputs (16-bit interpolation,
 docs/design.md): the fragmentShaderBarycentric feature, and a driver other than MoltenVK, whose SPIR-V to MSL
@@ -48,6 +48,9 @@ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_BARYCENTRIC_FEATURES_KHR = 100
 VK_DRIVER_ID_MOLTENVK = 14
 VK_DRIVER_ID_AMD_PROPRIETARY = 1
 AMD_VENDOR_ID = 0x1002
+# Navi 10, Navi 14, and Navi 12 PCI IDs from Linux amdgpu's chipset table.
+RDNA1_DEVICE_IDS = (0x7310, 0x7312, 0x7318, 0x7319, 0x731A, 0x731B, 0x731E, 0x731F,
+                    0x7340, 0x7341, 0x7347, 0x734F, 0x7360, 0x7362)
 # PCI device IDs of RDNA2 (gfx103x) GPUs: Navi 21/22/23/24 cards, and the iGPUs of Van Gogh (Steam Deck),
 # Rembrandt (Ryzen 6000), Mendocino (Ryzen 7020) and Raphael/Granite Ridge (Ryzen 7000/9000 desktop). #857 has
 # crash reports from 0x13C0, 0x164E, 0x73BF (RX 6800) and 0x73DF (RX 6700).
@@ -257,9 +260,10 @@ def query() -> dict:
         mesh_required = bool(required_stages & VK_SHADER_STAGE_MESH_BIT_EXT)
         compute_supported = bool(supported_stages & VK_SHADER_STAGE_COMPUTE_BIT)
         mesh_supported = bool(supported_stages & VK_SHADER_STAGE_MESH_BIT_EXT)
-        can_require_64 = (sgc and lo <= 64 <= hi and compute_required and mesh_required and
-                          compute_supported and mesh_supported)
-        has_default_64 = subgroup_size == 64 and compute_supported and mesh_supported
+        can_require_64 = sgc and lo <= 64 <= hi
+        default_64 = subgroup_size == 64
+        compute64 = compute_supported and (default_64 or (can_require_64 and compute_required))
+        mesh64 = mesh_supported and (default_64 or (can_require_64 and mesh_required))
         return {
             "device": name,
             "subgroup_size": subgroup_size,
@@ -270,11 +274,14 @@ def query() -> dict:
             "mesh_in_required_stages": mesh_required,
             "compute_in_supported_stages": compute_supported,
             "mesh_in_supported_stages": mesh_supported,
-            "native64": bool(can_require_64 or has_default_64),
+            "native64_compute": compute64,
+            "native64": compute64 and mesh64,
             "per_vertex_inputs": per_vertex,
             "vendor_id": vendor,
             "device_id": device,
             "driver_id": driver,
+            "rdna1_amd_windows": (vendor == AMD_VENDOR_ID and driver == VK_DRIVER_ID_AMD_PROPRIETARY
+                                  and device in RDNA1_DEVICE_IDS),
             "rdna2_amd_windows": rdna2_amd_windows(vendor, device, driver),
         }
     finally:
