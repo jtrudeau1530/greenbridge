@@ -84,7 +84,9 @@ inline constexpr VkImageAspectFlags depth_stencil_aspects = VK_IMAGE_ASPECT_DEPT
 // Read-only combinations share one layout when every bit agrees on it (depth_read with shader reads stays in
 // DEPTH_STENCIL_READ_ONLY_OPTIMAL, which can be sampled); otherwise they fall back to GENERAL.
 // Buffer-only and extension states map to GENERAL with conservative memory access.
-inline VulkanAccess vulkan_access(std::uint32_t states, bool presentable) {
+// conditional_rendering: VK_EXT_conditional_rendering is enabled. PREDICATION shares its bit with
+// INDIRECT_ARGUMENT, and conditional rendering reads the predicate in a stage of its own, so the bit covers both.
+inline VulkanAccess vulkan_access(std::uint32_t states, bool presentable, bool conditional_rendering = false) {
     namespace s = d3d12_state;
     constexpr VkAccessFlags any_memory = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
     if (states == s::common) {
@@ -156,6 +158,10 @@ inline VulkanAccess vulkan_access(std::uint32_t states, bool presentable) {
         out.layout = VK_IMAGE_LAYOUT_GENERAL;
         out.access |= any_memory;
         out.stages |= VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+    }
+    if (conditional_rendering && (states & s::predication)) {
+        out.access |= VK_ACCESS_CONDITIONAL_RENDERING_READ_BIT_EXT;
+        out.stages |= VK_PIPELINE_STAGE_CONDITIONAL_RENDERING_BIT_EXT;
     }
     return out;
 }
@@ -303,6 +309,10 @@ inline constexpr AccessStages access_stages[] = {
      VK_PIPELINE_STAGE_2_COPY_BIT | VK_PIPELINE_STAGE_2_BLIT_BIT | VK_PIPELINE_STAGE_2_RESOLVE_BIT |
          VK_PIPELINE_STAGE_2_CLEAR_BIT | VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT | VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
      VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT},
+    {VK_ACCESS_2_CONDITIONAL_RENDERING_READ_BIT_EXT,
+     VK_PIPELINE_STAGE_2_CONDITIONAL_RENDERING_BIT_EXT | VK_PIPELINE_STAGE_2_ALL_GRAPHICS_BIT |
+         VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+     VK_PIPELINE_STAGE_2_CONDITIONAL_RENDERING_BIT_EXT},
 };
 
 // One side of an enhanced barrier: D3D12 sync and access to a Vulkan stage mask and access mask that Vulkan accepts
@@ -315,10 +325,17 @@ struct BarrierScope {
     VkAccessFlags2 access;
 };
 
-inline BarrierScope vulkan_barrier_scope(std::uint32_t sync, std::uint32_t access) {
+// conditional_rendering: VK_EXT_conditional_rendering is enabled. SYNC_PREDICATION and ACCESS_PREDICATION share
+// their bits with EXECUTE_INDIRECT and INDIRECT_ARGUMENT, and conditional rendering reads the predicate in a stage
+// of its own, so those bits cover it too.
+inline BarrierScope vulkan_barrier_scope(std::uint32_t sync, std::uint32_t access, bool conditional_rendering = false) {
     BarrierScope out{vulkan_sync(sync), 0};
     if (!out.stages) return out;
+    if (conditional_rendering && (sync & d3d12_sync::predication))
+        out.stages |= VK_PIPELINE_STAGE_2_CONDITIONAL_RENDERING_BIT_EXT;
     out.access = vulkan_barrier_access(access);
+    if (conditional_rendering && (access & d3d12_access::predication) && !(access & d3d12_access::no_access))
+        out.access |= VK_ACCESS_2_CONDITIONAL_RENDERING_READ_BIT_EXT;
     for (const AccessStages& entry : access_stages)
         if ((out.access & entry.access) && !(out.stages & entry.supported)) out.stages |= entry.narrowest;
     return out;
@@ -1441,6 +1458,8 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
     const auto commands = prepared.list->commands();
     const bool separate = vk.separate_depth_stencil_layouts;
     const VulkanAccess transfer_dst = vulkan_access(d3d12_state::copy_dest, false);
+    // The extension is enabled: barriers into and out of PREDICATION also cover conditional rendering's read.
+    const bool predicates = vk.begin_conditional_rendering != nullptr;
     bool conditional_rendering = false;  // inside vkCmdBeginConditionalRenderingEXT
 
     for (std::size_t i = 0; i < commands.size(); ++i) {
@@ -1477,8 +1496,8 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             command);
 
         if (const auto* transition = std::get_if<TransitionBarrier>(&command)) {
-            const VulkanAccess from = vulkan_access(transition->before, p.binding.presentable);
-            const VulkanAccess to = vulkan_access(transition->after, p.binding.presentable);
+            const VulkanAccess from = vulkan_access(transition->before, p.binding.presentable, predicates);
+            const VulkanAccess to = vulkan_access(transition->after, p.binding.presentable, predicates);
             if (!p.binding.image) {
                 detail::memory_barrier(vk, command_buffer, from.access, from.stages, to.access, to.stages);
                 continue;
@@ -1507,8 +1526,8 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                         return {};
                 },
                 command);
-            const BarrierScope src = vulkan_barrier_scope(sync_before, access_before);
-            const BarrierScope dst = vulkan_barrier_scope(sync_after, access_after);
+            const BarrierScope src = vulkan_barrier_scope(sync_before, access_before, predicates);
+            const BarrierScope dst = vulkan_barrier_scope(sync_after, access_after, predicates);
             VkMemoryBarrier2 barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
             barrier.srcStageMask = src.stages;
             barrier.dstStageMask = dst.stages;
@@ -1533,8 +1552,8 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                 pieces = detail::current(tracker, id, range, before);
                 detail::initialize(vk, command_buffer, p.binding, id, pieces, before, tracker);
             }
-            const BarrierScope src = vulkan_barrier_scope(texture->sync_before, texture->access_before);
-            const BarrierScope dst = vulkan_barrier_scope(texture->sync_after, texture->access_after);
+            const BarrierScope src = vulkan_barrier_scope(texture->sync_before, texture->access_before, predicates);
+            const BarrierScope dst = vulkan_barrier_scope(texture->sync_after, texture->access_after, predicates);
             std::vector<VkImageMemoryBarrier2> barriers;
             for (const auto& piece : pieces) {
                 VkImageMemoryBarrier2 b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};

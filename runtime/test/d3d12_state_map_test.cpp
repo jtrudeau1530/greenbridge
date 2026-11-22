@@ -22,6 +22,7 @@ static_assert(s::non_pixel_shader_resource == D3D12_RESOURCE_STATE_NON_PIXEL_SHA
 static_assert(s::pixel_shader_resource == D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
 static_assert(s::stream_out == D3D12_RESOURCE_STATE_STREAM_OUT);
 static_assert(s::indirect_argument == D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
+static_assert(s::predication == D3D12_RESOURCE_STATE_PREDICATION);
 static_assert(s::copy_dest == D3D12_RESOURCE_STATE_COPY_DEST);
 static_assert(s::copy_source == D3D12_RESOURCE_STATE_COPY_SOURCE);
 static_assert(s::resolve_dest == D3D12_RESOURCE_STATE_RESOLVE_DEST);
@@ -210,6 +211,16 @@ int main() {
     CHECK(unknown.layout == VK_IMAGE_LAYOUT_GENERAL);
     CHECK(unknown.access & VK_ACCESS_MEMORY_WRITE_BIT);
     CHECK(unknown.stages & VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+    // PREDICATION is INDIRECT_ARGUMENT's bit. With VK_EXT_conditional_rendering it also covers the predicate read,
+    // as does GENERIC_READ, which contains it; without the extension those flags would be invalid and stay out.
+    static_assert(s::predication == s::indirect_argument);
+    const auto predicate = vulkan_access(s::predication, false, true);
+    CHECK(predicate.access == (VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_CONDITIONAL_RENDERING_READ_BIT_EXT));
+    CHECK(predicate.stages ==
+          (VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_CONDITIONAL_RENDERING_BIT_EXT));
+    CHECK(vulkan_access(s::generic_read, false, true).access & VK_ACCESS_CONDITIONAL_RENDERING_READ_BIT_EXT);
+    CHECK(!(vulkan_access(s::predication, false).access & VK_ACCESS_CONDITIONAL_RENDERING_READ_BIT_EXT));
+    CHECK(!(vulkan_access(s::copy_dest, false, true).stages & VK_PIPELINE_STAGE_CONDITIONAL_RENDERING_BIT_EXT));
 
     // Subresource indices: mip + layer * mips + plane * mips * layers.
     VkImageSubresourceRange range{};
@@ -324,6 +335,20 @@ int main() {
             const BarrierScope same = scope(sync, access);
             CHECK(same.stages == vulkan_sync(sync) && same.access == vulkan_barrier_access(access));
         }
+        // SYNC_PREDICATION / ACCESS_PREDICATION share EXECUTE_INDIRECT's and INDIRECT_ARGUMENT's bits; with the
+        // extension they add the conditional-rendering stage and read. An access named under a scope without that
+        // stage (SYNC_COPY) widens the scope by it; without the extension nothing changes.
+        static_assert(y::predication == y::execute_indirect && a::predication == a::indirect_argument);
+        const BarrierScope predicated = vulkan_barrier_scope(y::predication, a::predication, true);
+        CHECK(predicated.stages ==
+              (VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_2_CONDITIONAL_RENDERING_BIT_EXT));
+        CHECK(predicated.access ==
+              (VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_2_CONDITIONAL_RENDERING_READ_BIT_EXT));
+        CHECK(vulkan_barrier_scope(y::copy, a::predication, true).stages &
+              VK_PIPELINE_STAGE_2_CONDITIONAL_RENDERING_BIT_EXT);
+        const BarrierScope plain = vulkan_barrier_scope(y::predication, a::predication);
+        CHECK(plain.stages == vulkan_sync(y::predication) && plain.access == vulkan_barrier_access(a::predication));
+        CHECK(vulkan_barrier_scope(y::copy, a::copy_dest, true).access == VK_ACCESS_2_TRANSFER_WRITE_BIT);
         // No stages, no access (SYNC_NONE pairs with ACCESS_NO_ACCESS in D3D12).
         CHECK(scope(y::none, a::no_access).stages == 0 && scope(y::none, a::no_access).access == 0);
         CHECK(scope(y::none, a::shader_resource).access == 0);
