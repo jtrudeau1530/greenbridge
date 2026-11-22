@@ -312,7 +312,15 @@ run's command-list calls are the same 13, in the same order, on an RTX 2000 Ada 
 **Device.** At context creation it calls slots 14, 15, 18, 19, 27, 38 and 76 and heap slot 9, all with the shapes the
 PC order and the measured overrides predict; slot 76 takes the seven `CreateCommittedResource` arguments. During
 `ffxDispatch` it adds 16 `CreateRootSignature` and heap slot 10 (the recorder also has a path that calls 24
-`CopyDescriptorsSimple`, not taken in this run), plus its two compute-pipeline paths:
+`CopyDescriptorsSimple`, not taken in this run), plus its two compute-pipeline paths below.
+
+Which descriptor-copy path runs is decided by a **byte at `+0x18` of the device object**, read before each copy at
+`0x5bb8`, `0x5dd1`, `0x5f8c` and `0x617e`. When it is 0 (the run), the DLL copies the 32 bytes at the source CPU
+handle to the destination CPU handle itself (two 16-byte moves, e.g. `0x5bc0`–`0x5bce`), so CPU descriptor handles
+must be pointers to at least 32 writable bytes. When it is set, the same copy is device slot 24,
+`CopyDescriptorsSimple(1, dst, src, 0)` (calls at `0x5bed`, `0x5e06`, `0x5fc2`, `0x61b3`). A device proxy that sets
+that byte therefore sees this DLL's descriptor copies as calls. Like the list's fields (below), the byte is past the
+vtable pointer of a public object.
 
 - **Slot 67** (call at `0x56d9`) is **not** the PC `CreateProtectedResourceSession1`: it takes `(desc, riid, out)`
   with `IID_ID3D12PipelineState` and a console-only desc: the root signature at `+0x00`, two pointers into the DLL
@@ -323,6 +331,16 @@ PC order and the measured overrides predict; slot 76 takes the seven `CreateComm
   runtime refuses the DLL's code (`E_FAIL`): it is not a PC shader. The DLL's pipeline function then returns
   `0x8000000d` (`0x4b85`), but the dispatch goes on, records the null pipeline and faults (`0x65ff`), which is where a
   PC device stops.
+- **Pipeline slot 11 sizes the compute scratch.** After either path succeeds (slot 67 jumps to `0x5833`), the DLL
+  calls the new pipeline's slot 11 as `(0, 0, &obj)` (`0x586d`); the public `ID3D12PipelineState` ends at slot 8, so
+  this is a console-only method. On success it reads a dword through `obj`'s slot 3 (`0x5881`), multiplies it by
+  1024 (`shl ecx, 0xa`), stores it in the pipeline's record at `+0x44` and releases `obj` (slot 2). The context keeps
+  the largest value (`+0x10f8`). Before a dispatch whose pipeline has a non-zero value (`0x64d3`; zero skips the
+  binding), the DLL creates the scratch buffer once, `largest * 0xd0` bytes rounded up to 64 KiB, through device
+  slot 27 in state `UNORDERED_ACCESS` (`0x65ab`), names it `FFX_XBox_ComputeScratch`, and binds it with list slot
+  141 `(2, GPU VA, buffer size, this pipeline's value)` (`0x65f8`). Measured: the calls and the arithmetic. Open:
+  what the slot-11 object is, the unit of its dword (the factor 1024 suggests KiB), the meaning of `0xd0`, and
+  of the leading `2`.
 - The DLL's 29 shaders are `DXBC` containers with `SFI0`, `ISG1`, `OSG1`, `PSV0`, `RTS0`, `HASH` and `ACCC` parts
   and no `DXIL`. The `ACCC` payload starts with the tag `FSPX` in all 29; the game's own native shaders are `FSSM`
   inside `XBCH` ([design.md](design.md)). What `FSPX` holds, and whether the existing unpacker and translator can
@@ -343,9 +361,12 @@ shape and the shift around them, but the shape alone does not single the method 
 | 35 (`+0x118`) | **31** | `SetComputeRootDescriptorTable` | `(index, heap GPU start + offset)` at `0x59a0` |
 | 41 (`+0x148`) | **37** | `SetComputeRootConstantBufferView` (inferred) | `(index, 64-bit GPU VA from the constant allocator)` at `0x6738`; the root SRV/UAV setters take the same shape |
 | 53 (`+0x1a8`) | **49** | `ClearUnorderedAccessViewUint` | run: `(GPU handle, CPU handle, resource, …)` |
+| 54 (`+0x1b0`) | **50** | `ClearUnorderedAccessViewFloat` | `(GPU handle, CPU handle, resource, values, 0, null)` at `0x7296`; chosen over the slot-53 call at `0x72ee` by a compare of a local with `0x12` (`0x7266`), with the four values passed in place where the 53 path copies them to the stack |
+| 55 (`+0x1b8`) | **51** | `DiscardResource` | `(resource, null)` at `0x6dcb`, after the pending barriers are flushed through slot 26 |
+| 59 (`+0x1d8`) | — | console only (shape) | four calls, two shapes: `(1, blob, size)` at `0x6b5a` and `0x6d53`, the blob a run of qwords whose first is `0xf3080 \| (qword count & 0x7f)`; and `(0, &qword, 8)` with the qword 1 at `0x6e52` and `0x6eb8`, only when a profiling bit of the context is set (`0x6e2a`). The first argument is set as a byte (`mov dl, 1` / `xor edx, edx`). It looks like one slot for both ends of a GPU event; no public method takes a bool first. With 55 at +4 and 61 at +2, the two slots the console lacks are among 56–60 |
 | 61 (`+0x1e8`) | **59** | `ExecuteIndirect` | `(signature, 1, argument buffer, offset, null, 0)` at `0x59a0` |
-| 85 (`+0x2a8`) | — | console only | run: `(stack pointer, 0, 0)`, twice per dispatch |
-| 141 (`+0x468`) | — | console only | `(2, GPU VA, size, n)` at `0x65f8`: binds a buffer the DLL names `FFX_XBox_ComputeScratch` |
+| 85 (`+0x2a8`) | — | `CopyTextureRegion` shape (inferred) | run: `(stack pointer, 0, 0)`, twice per dispatch. Statically six arguments, `(&dst, 0, 0, 0, &src, null)`: the public `CopyTextureRegion` (PC 16) with two `D3D12_TEXTURE_COPY_LOCATION`s, not one pointer. At `0x7147` dst is `{texture, SUBRESOURCE_INDEX, 0}` and src `{buffer, PLACED_FOOTPRINT, footprint}`, the footprint from device slot 38 (`GetCopyableFootprints`, `0x708b`); at `0x7191` both are subresource 0 (texture to texture). The caller also clears the next stack argument (`0x70e7`); whether the method takes a seventh is open, as is what console slot 16 is |
+| 141 (`+0x468`) | — | console only | `(2, GPU VA, size, n)` at `0x65f8`: binds a buffer the DLL names `FFX_XBox_ComputeScratch`; `n` is the bound pipeline's scratch value from pipeline slot 11 (see above) |
 
 So the console list has four more methods than the PC list between `ResourceBarrier` (26) and `SetDescriptorHeaps`
 (console 32), and two fewer between `ClearUnorderedAccessViewUint` (console 53) and `ExecuteIndirect` (console 61).
