@@ -3,6 +3,8 @@
   - v_rcp_f32:       D.f32 = 1.0 / S0.f32
   - v_rcp_iflag_f32: D.f32 = 1.0 / S0.f32  (no FP flags)
   - v_rcp_f16:       D.f16 = 1.0 / S0.f16  (preserves the untouched 16-bit half of D)
+  - Newton-Raphson division iteration pipeline (v_rcp_f32 + v_fma_f32 + v_mul_f32)
+
 
 Per the SPIR-V specification and tests/semantic/README.md, OpFDiv by zero (+-0.0) is undefined and raises
 spirv_mini_interp.UnsupportedConstruct("OpFDiv by zero (undefined in SPIR-V)"). Accordingly, finite non-zero,
@@ -12,6 +14,8 @@ oracles, while +-0.0 divisors/inputs are verified to raise UnsupportedConstruct.
 NaN payloads are not pinned because values passing through Python floats lose exact NaN payload bits; NaN
 results are asserted as binary32/binary16 NaNs. Standard library only; hand-written RDNA2 listings only.
 """
+from __future__ import annotations
+
 from fractions import Fraction
 import gc
 import itertools
@@ -238,6 +242,90 @@ def ref_rcp_f16(h_bits: int, *, scale: Fraction = Fraction(1), clamp: bool = Fal
     return round_fraction_to_f16(f32_to_fraction(r_f32), neg_zero=bool(r_f32 & 0x80000000))
 
 
+def f32_to_float(bits: int) -> float:
+    return struct.unpack("<f", struct.pack("<I", bits & MASK32))[0]
+
+
+def f32_ulp_diff(a_bits: int, b_bits: int) -> int:
+    a_bits &= MASK32
+    b_bits &= MASK32
+    if a_bits == b_bits:
+        return 0
+    if (a_bits & 0x7FFFFFFF) == 0 and (b_bits & 0x7FFFFFFF) == 0:
+        return 0
+    if (a_bits >> 31) != (b_bits >> 31):
+        return (a_bits & 0x7FFFFFFF) + (b_bits & 0x7FFFFFFF)
+    return abs((a_bits & 0x7FFFFFFF) - (b_bits & 0x7FFFFFFF))
+
+
+def ref_exact_fdiv_f32(a_bits: int, b_bits: int) -> int:
+    """Exact-rational IEEE 754 float32 division reference oracle."""
+    a_bits &= MASK32
+    b_bits &= MASK32
+    sign = (a_bits ^ b_bits) & 0x80000000
+    absu_b = b_bits & 0x7FFFFFFF
+    absu_a = a_bits & 0x7FFFFFFF
+    if absu_b == 0:
+        raise ValueError("division by zero is undefined in SPIR-V")
+    if absu_a > 0x7F800000 or absu_b > 0x7F800000:
+        return 0x7FC00000
+    if absu_a == 0x7F800000 and absu_b == 0x7F800000:
+        return 0x7FC00000
+    if absu_b == 0x7F800000:
+        return sign
+    if absu_a == 0x7F800000:
+        return sign | 0x7F800000
+    if absu_a == 0:
+        return sign
+    fa = f32_to_fraction(a_bits)
+    fb = f32_to_fraction(b_bits)
+    return round_fraction_to_f32(fa / fb, neg_zero=bool(sign))
+
+
+def ref_newton_raphson_steps_f32(a_bits: int, b_bits: int) -> tuple[int, int, int, int]:
+    """Simulate RDNA2 4-step Newton-Raphson division in software.
+
+    Step 1: Initial reciprocal estimate y0 = rcp(b)
+    Step 2: Error term e = 1.0 - b * y0 via FMA (fma(-b, y0, 1.0))
+    Step 3: Refined reciprocal y1 = y0 + y0 * e via FMA (fma(y0, e, y0))
+    Step 4: Quotient q = a * y1 via FMul
+    """
+    a_bits &= MASK32
+    b_bits &= MASK32
+    if (b_bits & 0x7FFFFFFF) == 0:
+        raise ValueError("division by zero is undefined in SPIR-V")
+    y0_bits = ref_rcp_f32(b_bits)
+    y0 = f32_to_float(y0_bits)
+    b = f32_to_float(b_bits)
+    a = f32_to_float(a_bits)
+
+    e = si.fma_f32(-b, y0, 1.0)
+    e_bits = f32_bits(e)
+
+    y1 = si.fma_f32(y0, e, y0)
+    y1_bits = f32_bits(y1)
+
+    q = struct.unpack("<f", struct.pack("<f", a * y1))[0]
+    q_bits = f32_bits(q)
+    return y0_bits, e_bits, y1_bits, q_bits
+
+
+def ref_newton_raphson_fdiv_f32(a_bits: int, b_bits: int) -> int:
+    return ref_newton_raphson_steps_f32(a_bits, b_bits)[3]
+
+
+NR_FDIV_HAND_WORKED = (
+    ("one_half", 0x3F800000, 0x40000000, (0x3F000000, 0x00000000, 0x3F000000, 0x3F000000)),
+    ("seven_thirds", 0x40E00000, 0x40400000, (0x3EAAAAAB, 0xB3000000, 0x3EAAAAAB, 0x40155556)),
+    ("ten_fourths", 0x41200000, 0x40800000, (0x3E800000, 0x00000000, 0x3E800000, 0x40200000)),
+    ("neg_fifteen_fifths", 0xC1700000, 0x40A00000, (0x3E4CCCCD, 0xB2800000, 0x3E4CCCCD, 0xC0400000)),
+    ("pos_neg_div", 0x42C90000, 0xC1A20000, (0xBD4A4588, 0xB2000000, 0xBD4A4588, 0xC09ED098)),
+    ("pos_zero", 0x00000000, 0x40800000, (0x3E800000, 0x00000000, 0x3E800000, 0x00000000)),
+    ("neg_zero", 0x80000000, 0x40800000, (0x3E800000, 0x00000000, 0x3E800000, 0x80000000)),
+)
+
+
+
 RCP_F32_HAND_WORKED = (
     ("pos_one", 0x3F800000, 0x3F800000),
     ("neg_one", 0xBF800000, 0xBF800000),
@@ -384,6 +472,60 @@ class OracleSelfTests(unittest.TestCase):
         for name, h_bits, want in RCP_F16_HAND_WORKED:
             with self.subTest(kind="f16", name=name):
                 self.assertEqual(ref_rcp_f16(h_bits), want)
+
+
+class NewtonRaphsonOracleTests(unittest.TestCase):
+    def test_hand_worked_newton_raphson_steps(self):
+        for name, a_bits, b_bits, want_steps in NR_FDIV_HAND_WORKED:
+            with self.subTest(case=name):
+                got_steps = ref_newton_raphson_steps_f32(a_bits, b_bits)
+                self.assertEqual(got_steps, want_steps)
+
+    def test_exact_rational_division_oracle(self):
+        cases = (
+            (f32_bits(1.0), f32_bits(2.0), f32_bits(0.5)),
+            (f32_bits(8.0), f32_bits(4.0), f32_bits(2.0)),
+            (f32_bits(-9.0), f32_bits(3.0), f32_bits(-3.0)),
+            (f32_bits(100.0), f32_bits(-25.0), f32_bits(-4.0)),
+            (0x00000000, f32_bits(5.0), 0x00000000),
+            (0x80000000, f32_bits(5.0), 0x80000000),
+            (f32_bits(1.0), 0x7F800000, 0x00000000),
+            (f32_bits(-1.0), 0x7F800000, 0x80000000),
+        )
+        for a_bits, b_bits, want in cases:
+            with self.subTest(a=hex(a_bits), b=hex(b_bits)):
+                self.assertEqual(ref_exact_fdiv_f32(a_bits, b_bits), want)
+
+    def test_zero_divisor_raises_in_oracles(self):
+        for z in (0x00000000, 0x80000000):
+            with self.subTest(zero=hex(z)):
+                with self.assertRaises(ValueError):
+                    ref_newton_raphson_steps_f32(f32_bits(1.0), z)
+                with self.assertRaises(ValueError):
+                    ref_exact_fdiv_f32(f32_bits(1.0), z)
+
+    def test_newton_raphson_oracle_accuracy_within_one_ulp(self):
+        test_pairs = (
+            (1.0, 3.0),
+            (7.0, 3.0),
+            (22.0, 7.0),
+            (355.0, 113.0),
+            (12345.67, 0.00123),
+            (-9876.54, 321.0),
+            (1e12, 3.0),
+            (1e-12, 7.0),
+            (0.15625, 1.25),
+            (1024.0, 10.0),
+            (-4096.0, 13.0),
+        )
+        for a_f, b_f in test_pairs:
+            with self.subTest(a=a_f, b=b_f):
+                ab = f32_bits(a_f)
+                bb = f32_bits(b_f)
+                nr = ref_newton_raphson_fdiv_f32(ab, bb)
+                exact = ref_exact_fdiv_f32(ab, bb)
+                ulp = f32_ulp_diff(nr, exact)
+                self.assertLessEqual(ulp, 1, f"ULP diff {ulp} exceeds 1 for {a_f}/{b_f}: nr={nr:#010x} exact={exact:#010x}")
 
 
 # -----------------------------------------------------------------------------
@@ -791,6 +933,272 @@ class RcpExecMaskingTests(unittest.TestCase):
                     [mem[4 * i] for i in range(4)],
                     [active_want, OLD, active_want, OLD],
                 )
+
+
+# -----------------------------------------------------------------------------
+# 6. Newton-Raphson Multi-Step Division Emulation (v_rcp_f32 + v_fma_f32 + v_mul_f32)
+# -----------------------------------------------------------------------------
+
+def run_nr_fdiv_ps(a_bits: int, b_bits: int) -> int:
+    """Execute 4-step Newton-Raphson division in a pixel shader and return quotient bits."""
+    return run_ps_v0([
+        f"v_mov_b32 v0, {a_bits:#x}",
+        f"v_mov_b32 v1, {b_bits:#x}",
+        "v_rcp_f32_e32 v2, v1",
+        "v_fma_f32 v3, -v1, v2, 1.0",
+        "v_fma_f32 v4, v2, v3, v2",
+        "v_mul_f32_e32 v0, v0, v4",
+    ])
+
+
+def run_nr_fdiv_steps_cs(a_bits: int, b_bits: int) -> tuple[int, int, int, int]:
+    """Execute 4-step Newton-Raphson division in a compute shader and capture all intermediate registers."""
+    mem: dict[int, int] = {}
+    lines = [
+        f"v_mov_b32 v0, {a_bits:#x}",
+        f"v_mov_b32 v1, {b_bits:#x}",
+        "v_rcp_f32_e32 v2, v1",
+        "v_fma_f32 v3, -v1, v2, 1.0",
+        "v_fma_f32 v4, v2, v3, v2",
+        "v_mul_f32_e32 v5, v0, v4",
+        "v_mov_b32 v6, 0",
+        "buffer_store_dword v2, v6, s[0:3], 0 offen offset:0",
+        "buffer_store_dword v3, v6, s[0:3], 0 offen offset:4",
+        "buffer_store_dword v4, v6, s[0:3], 0 offen offset:8",
+        "buffer_store_dword v5, v6, s[0:3], 0 offen offset:12",
+    ]
+    run_cs(lines, group_size=1, subgroup_size=32, memory=mem)
+    return mem[0], mem[4], mem[8], mem[12]
+
+
+class NewtonRaphsonMultiStepEmulationTests(unittest.TestCase):
+    def test_hand_worked_pipeline_steps_match_oracle(self):
+        for name, a_bits, b_bits, want_steps in NR_FDIV_HAND_WORKED:
+            with self.subTest(case=name):
+                got_steps = run_nr_fdiv_steps_cs(a_bits, b_bits)
+                self.assertEqual(got_steps, want_steps)
+
+    def test_end_to_end_quotients_match_oracle(self):
+        cases = (
+            (f32_bits(1.0), f32_bits(2.0)),
+            (f32_bits(3.5), f32_bits(1.75)),
+            (f32_bits(10.0), f32_bits(3.0)),
+            (f32_bits(-15.0), f32_bits(4.0)),
+            (f32_bits(100.5), f32_bits(-20.25)),
+            (f32_bits(1e6), f32_bits(3.0)),
+            (f32_bits(2.5e-5), f32_bits(4.0e5)),
+            (f32_bits(1.0), f32_bits(7.0)),
+            (f32_bits(22.0), f32_bits(7.0)),
+            (f32_bits(-0.125), f32_bits(8.0)),
+            (0x00000000, f32_bits(4.0)),
+            (0x80000000, f32_bits(4.0)),
+            (0x00000000, f32_bits(-4.0)),
+            (0x80000000, f32_bits(-4.0)),
+        )
+        for a_bits, b_bits in cases:
+            with self.subTest(a=hex(a_bits), b=hex(b_bits)):
+                got = run_nr_fdiv_ps(a_bits, b_bits)
+                want = ref_newton_raphson_fdiv_f32(a_bits, b_bits)
+                self.assertEqual(got, want)
+
+    def test_vop3_encodings_and_register_reuse(self):
+        # In-place register reuse: v0 = dividend, v1 = divisor, v2 = y0 -> y1, v0 = quotient
+        lines = [
+            f"v_mov_b32 v0, {f32_bits(10.0):#x}",
+            f"v_mov_b32 v1, {f32_bits(2.0):#x}",
+            "v_rcp_f32_e64 v2, v1",
+            "v_fma_f32 v3, -v1, v2, 1.0",
+            "v_fma_f32 v2, v2, v3, v2",
+            "v_mul_f32_e64 v0, v0, v2",
+        ]
+        self.assertEqual(run_ps_v0(lines), f32_bits(5.0))
+
+        # Negative dividend and divisor with VOP3
+        lines_neg = [
+            f"v_mov_b32 v0, {f32_bits(-24.0):#x}",
+            f"v_mov_b32 v1, {f32_bits(-6.0):#x}",
+            "v_rcp_f32_e64 v2, v1",
+            "v_fma_f32 v3, -v1, v2, 1.0",
+            "v_fma_f32 v2, v2, v3, v2",
+            "v_mul_f32_e64 v0, v0, v2",
+        ]
+        self.assertEqual(run_ps_v0(lines_neg), f32_bits(4.0))
+
+    def test_sgpr_and_inline_constant_operands(self):
+        # SGPR divisor
+        lines_sgpr = [
+            f"s_mov_b32 s4, {f32_bits(4.0):#x}",
+            f"v_mov_b32 v0, {f32_bits(2.0):#x}",
+            "v_rcp_f32_e32 v2, s4",
+            "v_fma_f32 v3, -s4, v2, 1.0",
+            "v_fma_f32 v4, v2, v3, v2",
+            "v_mul_f32_e32 v0, v0, v4",
+        ]
+        self.assertEqual(run_ps_v0(lines_sgpr), f32_bits(0.5))
+
+        # Inline float constants as divisor (2.0)
+        lines_imm = [
+            f"v_mov_b32 v0, {f32_bits(12.0):#x}",
+            "v_rcp_f32_e32 v2, 2.0",
+            "v_fma_f32 v3, -2.0, v2, 1.0",
+            "v_fma_f32 v4, v2, v3, v2",
+            "v_mul_f32_e32 v0, v0, v4",
+        ]
+        self.assertEqual(run_ps_v0(lines_imm), f32_bits(6.0))
+
+    def test_multilane_simd_divergence_under_exec_mask(self):
+        mem: dict[int, int] = {}
+        lines = [
+            "v_lshlrev_b32 v6, 2, v0",
+            f"v_mov_b32 v7, {f32_bits(10.0):#x}",
+            f"v_mov_b32 v8, {f32_bits(2.0):#x}",
+            "v_cmp_eq_u32 vcc, v0, 2",
+            f"v_cndmask_b32 v7, v7, {f32_bits(-15.0):#x}, vcc",
+            f"v_cndmask_b32 v8, v8, {f32_bits(5.0):#x}, vcc",
+            f"v_mov_b32 v5, {OLD:#x}",
+            "v_and_b32 v9, v0, 1",
+            "v_cmpx_eq_u32 v9, 0",
+            "v_rcp_f32_e32 v2, v8",
+            "v_fma_f32 v3, -v8, v2, 1.0",
+            "v_fma_f32 v4, v2, v3, v2",
+            "v_mul_f32_e32 v5, v7, v4",
+            "s_mov_b32 exec_lo, -1",
+            "buffer_store_dword v5, v6, s[0:3], 0 offen",
+        ]
+        run_cs(lines, group_size=4, subgroup_size=32, memory=mem)
+        self.assertEqual(
+            [mem[4 * i] for i in range(4)],
+            [f32_bits(5.0), OLD, f32_bits(-3.0), OLD],
+        )
+
+
+class NewtonRaphsonAccuracyAndEdgeCaseTests(unittest.TestCase):
+    def test_quotient_accuracy_within_one_ulp_wide_dynamic_range(self):
+        cases = (
+            (1.0e-30, 2.0),
+            (3.14159265e-25, 1.41421356e-20),
+            (1.0e-15, 3.0),
+            (1.0e-5, 7.0),
+            (1.0, 3.0),
+            (7.0, 3.0),
+            (22.0, 7.0),
+            (355.0, 113.0),
+            (1.234567e5, 9.87654e-5),
+            (1.0e15, 3.0e5),
+            (1.0e25, 2.5e10),
+            (1.0e30, 4.0e15),
+            (-1.0e20, 3.0),
+            (1.0e20, -7.0),
+            (-5.5e15, -1.1e5),
+        )
+        for a_f, b_f in cases:
+            with self.subTest(a=a_f, b=b_f):
+                ab = f32_bits(a_f)
+                bb = f32_bits(b_f)
+                got = run_nr_fdiv_ps(ab, bb)
+                exact = ref_exact_fdiv_f32(ab, bb)
+                ulp = f32_ulp_diff(got, exact)
+                self.assertLessEqual(
+                    ulp, 1,
+                    f"Accuracy exceeds 1 ULP for {a_f}/{b_f}: got {got:#010x}, exact {exact:#010x}, diff {ulp}"
+                )
+
+    def test_subnormal_quotients_and_inputs(self):
+        cases = (
+            ("subnormal_div_2", 0x00000004, f32_bits(2.0), 0x00000002),
+            ("neg_subnormal_div_2", 0x80000004, f32_bits(2.0), 0x80000002),
+            ("subnormal_div_half", 0x00000002, f32_bits(0.5), 0x00000004),
+            ("normal_underflow_to_subnormal", 0x00400000, f32_bits(2.0), 0x00200000),
+            ("subnormal_divisor_to_normal", f32_bits(1.0), 0x00400000, 0x7F000000),
+        )
+        for name, ab, bb, want in cases:
+            with self.subTest(case=name):
+                got = run_nr_fdiv_ps(ab, bb)
+                self.assertEqual(got, want)
+
+    def test_sign_rule_preservation(self):
+        cases = (
+            (f32_bits(6.0), f32_bits(2.0), f32_bits(3.0)),
+            (f32_bits(6.0), f32_bits(-2.0), f32_bits(-3.0)),
+            (f32_bits(-6.0), f32_bits(2.0), f32_bits(-3.0)),
+            (f32_bits(-6.0), f32_bits(-2.0), f32_bits(3.0)),
+            (0x00000000, f32_bits(2.0), 0x00000000),
+            (0x80000000, f32_bits(2.0), 0x80000000),
+            (0x00000000, f32_bits(-2.0), 0x80000000),
+            (0x80000000, f32_bits(-2.0), 0x00000000),
+        )
+        for ab, bb, want in cases:
+            with self.subTest(a=hex(ab), b=hex(bb)):
+                self.assertEqual(run_nr_fdiv_ps(ab, bb), want)
+
+    def test_zero_and_infinite_divisor_behavior(self):
+        # Division by +-0.0 is undefined in SPIR-V and raises UnsupportedConstruct
+        for z in (0x00000000, 0x80000000):
+            with self.subTest(zero=hex(z)):
+                with self.assertRaises(si.UnsupportedConstruct):
+                    run_nr_fdiv_ps(f32_bits(1.0), z)
+
+        # Infinite divisor: 1 / +-inf -> +-0.0, step 2 FMA calculates 1 - inf * 0 -> NaN
+        for inf_bits in (0x7F800000, 0xFF800000):
+            with self.subTest(inf=hex(inf_bits)):
+                got = run_nr_fdiv_ps(f32_bits(1.0), inf_bits)
+                self.assertTrue(is_f32_nan_bits(got), f"expected NaN from inf divisor, got {got:#010x}")
+
+    def test_negative_controls_for_pipeline_sabotage(self):
+        a = f32_bits(7.0)
+        b = f32_bits(3.0)
+        lines = [
+            f"v_mov_b32 v0, {a:#x}",
+            f"v_mov_b32 v1, {b:#x}",
+            "v_rcp_f32_e32 v2, v1",
+            "v_fma_f32 v3, -v1, v2, 1.0",
+            "v_fma_f32 v4, v2, v3, v2",
+            "v_mul_f32_e32 v0, v0, v4",
+        ]
+        spv = translate_ps(lines)
+        correct_res = si.run_fragment(spv)["%out_mrt0"][0]
+        want = ref_newton_raphson_fdiv_f32(a, b)
+        self.assertEqual(correct_res, want)
+
+        # Sabotage 1: Corrupt error-term FMA to FMul
+        bad_fma, n1 = re.subn(r"OpExtInst %float %glsl Fma\b", "OpFMul %float", spv, count=1)
+        self.assertEqual(n1, 1)
+        bad_res1 = si.run_fragment(bad_fma)["%out_mrt0"][0]
+        self.assertNotEqual(bad_res1, want)
+        self.assertGreater(f32_ulp_diff(bad_res1, want), 1000)
+
+        # Sabotage 2: Corrupt final FMul to FAdd
+        bad_mul, n2 = re.subn(r"OpFMul %float\b", "OpFAdd %float", spv, count=1)
+        self.assertEqual(n2, 1)
+        bad_res2 = si.run_fragment(bad_mul)["%out_mrt0"][0]
+        self.assertNotEqual(bad_res2, want)
+        self.assertGreater(f32_ulp_diff(bad_res2, want), 1000)
+
+        # Sabotage 3: Inverting FMA sign (+b instead of -b in error term)
+        lines_bad_sign = [
+            f"v_mov_b32 v0, {a:#x}",
+            f"v_mov_b32 v1, {b:#x}",
+            "v_rcp_f32_e32 v2, v1",
+            "v_fma_f32 v3, v1, v2, 1.0",
+            "v_fma_f32 v4, v2, v3, v2",
+            "v_mul_f32_e32 v0, v0, v4",
+        ]
+        bad_sign_res = run_ps_v0(lines_bad_sign)
+        self.assertNotEqual(bad_sign_res, want)
+        self.assertGreater(f32_ulp_diff(bad_sign_res, want), 1000)
+
+        # Sabotage 4: Dropping base term in refinement (y0*e instead of y0 + y0*e)
+        lines_bad_refine = [
+            f"v_mov_b32 v0, {a:#x}",
+            f"v_mov_b32 v1, {b:#x}",
+            "v_rcp_f32_e32 v2, v1",
+            "v_fma_f32 v3, -v1, v2, 1.0",
+            "v_fma_f32 v4, v2, v3, 0.0",
+            "v_mul_f32_e32 v0, v0, v4",
+        ]
+        bad_refine_res = run_ps_v0(lines_bad_refine)
+        self.assertNotEqual(bad_refine_res, want)
+        self.assertGreater(f32_ulp_diff(bad_refine_res, want), 1000)
 
 
 class NegativeControlTests(unittest.TestCase):
