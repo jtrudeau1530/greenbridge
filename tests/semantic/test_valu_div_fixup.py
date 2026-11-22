@@ -49,6 +49,8 @@ F32_NORM_MIN = 0x00800000
 F32_NORM_MAX = 0x7F7FFFFF
 F32_SUB_MIN = 0x00000001
 F32_SUB_MAX = 0x007FFFFF
+F32_NEG_SUB_MIN = 0x80000001
+F32_NEG_SUB_MAX = 0x807FFFFF
 
 # IEEE-754 binary16 bit constants
 F16_POS_ZERO = 0x0000
@@ -68,6 +70,8 @@ F16_NORM_MIN = 0x0400
 F16_NORM_MAX = 0x7BFF
 F16_SUB_MIN = 0x0001
 F16_SUB_MAX = 0x03FF
+F16_NEG_SUB_MIN = 0x8001
+F16_NEG_SUB_MAX = 0x83FF
 
 OLD_VGPR_SENTINEL = 0xDEADBEEF
 
@@ -325,6 +329,14 @@ class TestF32Classification(unittest.TestCase):
         self.assertTrue(is_f32_qnan(custom_qnan))
         self.assertEqual(custom_qnan & 0x003FFFFF, 0x00000042)
 
+    def test_subnormal_classification(self):
+        self.assertTrue(is_f32_subnormal(F32_SUB_MIN))
+        self.assertTrue(is_f32_subnormal(F32_SUB_MAX))
+        self.assertTrue(is_f32_subnormal(F32_NEG_SUB_MIN))
+        self.assertTrue(is_f32_subnormal(F32_NEG_SUB_MAX))
+        self.assertFalse(is_f32_subnormal(F32_POS_ZERO))
+        self.assertFalse(is_f32_subnormal(F32_NORM_MIN))
+
 
 class TestDivFixupF32ZeroAndInfCases(unittest.TestCase):
     def test_zero_divided_by_zero_produces_qnan(self):
@@ -515,6 +527,14 @@ class TestF16Classification(unittest.TestCase):
         self.assertTrue(is_f16_qnan(custom_qnan))
         self.assertEqual(custom_qnan & 0x01FF, 0x0015)
 
+    def test_subnormal_classification(self):
+        self.assertTrue(is_f16_subnormal(F16_SUB_MIN))
+        self.assertTrue(is_f16_subnormal(F16_SUB_MAX))
+        self.assertTrue(is_f16_subnormal(F16_NEG_SUB_MIN))
+        self.assertTrue(is_f16_subnormal(F16_NEG_SUB_MAX))
+        self.assertFalse(is_f16_subnormal(F16_POS_ZERO))
+        self.assertFalse(is_f16_subnormal(F16_NORM_MIN))
+
 
 class TestDivFixupF16ZeroAndInfCases(unittest.TestCase):
     def test_zero_divided_by_zero_produces_qnan(self):
@@ -606,10 +626,6 @@ class TestDivFixupF16NaNCases(unittest.TestCase):
 
 class TestDivFixupF16OpSelAndHalfPreservation(unittest.TestCase):
     def test_op_sel_all_combinations_and_half_preservation(self):
-        # Pack distinct halves into registers:
-        # r0: (hi: 0.5, lo: 1.0)
-        # r1: (hi: 0.0, lo: 2.0)
-        # r2: (hi: 4.0, lo: 0.0)
         r0 = (F16_HALF << 16) | F16_ONE
         r1 = (F16_POS_ZERO << 16) | F16_TWO
         r2 = (F16_TWO << 16) | F16_POS_ZERO
@@ -642,13 +658,13 @@ class TestDivFixupF16OpSelAndHalfPreservation(unittest.TestCase):
 class TestDivFixupF16SimdWaveExecution(unittest.TestCase):
     def test_wave32_divergence_f16(self):
         wave = WaveDivFixupInterpreter(wave_size=32)
-        wave.exec_mask = 0xAAAAAAAA  # Odd lanes active
+        wave.exec_mask = 0xAAAAAAAA
 
         vdst, s0_reg, s1_reg, s2_reg = 0, 1, 2, 3
         for lane in range(32):
             wave.set_lane_vgpr(lane, s0_reg, F16_HALF)
             wave.set_lane_vgpr(lane, s1_reg, F16_POS_ZERO)
-            wave.set_lane_vgpr(lane, s2_reg, F16_ONE)  # 1 / 0 -> +inf
+            wave.set_lane_vgpr(lane, s2_reg, F16_ONE)
             wave.set_lane_vgpr(lane, vdst, 0x12345678)
 
         wave.v_div_fixup_f16(vdst, s0_reg, s1_reg, s2_reg, op_sel=(0, 0, 0, 0))
@@ -660,6 +676,220 @@ class TestDivFixupF16SimdWaveExecution(unittest.TestCase):
                 self.assertEqual(val >> 16, 0x1234)
             else:
                 self.assertEqual(val, 0x12345678)
+
+
+class TestDivFixupSubnormalOperands(unittest.TestCase):
+    def test_f32_subnormal_quotient_pass_through(self):
+        # Normal inputs producing subnormal quotient in s0 pass through untouched
+        for sub in (F32_SUB_MIN, F32_SUB_MAX, F32_NEG_SUB_MIN, F32_NEG_SUB_MAX):
+            with self.subTest(sub=hex(sub)):
+                res = ref_v_div_fixup_f32(sub, F32_TWO, F32_ONE)
+                self.assertEqual(res, sub)
+
+    def test_f32_subnormal_numerator_and_denominator(self):
+        # Subnormal denominator with normal numerator passes through s0
+        s0 = f32_to_bits(123456.0)
+        res1 = ref_v_div_fixup_f32(s0, F32_SUB_MIN, F32_ONE)
+        self.assertEqual(res1, s0)
+
+        # Normal denominator with subnormal numerator passes through s0
+        res2 = ref_v_div_fixup_f32(s0, F32_ONE, F32_SUB_MAX)
+        self.assertEqual(res2, s0)
+
+        # Both subnormal passes through s0
+        res3 = ref_v_div_fixup_f32(s0, F32_SUB_MIN, F32_SUB_MAX)
+        self.assertEqual(res3, s0)
+
+    def test_f32_subnormal_with_zero_and_inf(self):
+        # subnormal / zero -> signed inf
+        self.assertEqual(ref_v_div_fixup_f32(0, F32_POS_ZERO, F32_SUB_MIN), F32_POS_INF)
+        self.assertEqual(ref_v_div_fixup_f32(0, F32_NEG_ZERO, F32_SUB_MIN), F32_NEG_INF)
+        self.assertEqual(ref_v_div_fixup_f32(0, F32_POS_ZERO, F32_NEG_SUB_MIN), F32_NEG_INF)
+        self.assertEqual(ref_v_div_fixup_f32(0, F32_NEG_ZERO, F32_NEG_SUB_MIN), F32_POS_INF)
+
+        # zero / subnormal -> signed zero
+        self.assertEqual(ref_v_div_fixup_f32(0, F32_SUB_MIN, F32_POS_ZERO), F32_POS_ZERO)
+        self.assertEqual(ref_v_div_fixup_f32(0, F32_NEG_SUB_MIN, F32_POS_ZERO), F32_NEG_ZERO)
+        self.assertEqual(ref_v_div_fixup_f32(0, F32_SUB_MIN, F32_NEG_ZERO), F32_NEG_ZERO)
+        self.assertEqual(ref_v_div_fixup_f32(0, F32_NEG_SUB_MIN, F32_NEG_ZERO), F32_POS_ZERO)
+
+        # subnormal / inf -> signed zero
+        self.assertEqual(ref_v_div_fixup_f32(0, F32_POS_INF, F32_SUB_MAX), F32_POS_ZERO)
+        self.assertEqual(ref_v_div_fixup_f32(0, F32_NEG_INF, F32_SUB_MAX), F32_NEG_ZERO)
+
+    def test_f16_subnormal_quotient_pass_through(self):
+        for sub in (F16_SUB_MIN, F16_SUB_MAX, F16_NEG_SUB_MIN, F16_NEG_SUB_MAX):
+            with self.subTest(sub=hex(sub)):
+                res = ref_v_div_fixup_f16(sub, F16_TWO, F16_ONE)
+                self.assertEqual(res, sub)
+
+    def test_f16_subnormal_with_zero_and_inf(self):
+        # subnormal / zero -> signed inf
+        self.assertEqual(ref_v_div_fixup_f16(0, F16_POS_ZERO, F16_SUB_MIN), F16_POS_INF)
+        self.assertEqual(ref_v_div_fixup_f16(0, F16_NEG_ZERO, F16_SUB_MIN), F16_NEG_INF)
+        self.assertEqual(ref_v_div_fixup_f16(0, F16_POS_ZERO, F16_NEG_SUB_MIN), F16_NEG_INF)
+        self.assertEqual(ref_v_div_fixup_f16(0, F16_NEG_ZERO, F16_NEG_SUB_MIN), F16_POS_INF)
+
+        # zero / subnormal -> signed zero
+        self.assertEqual(ref_v_div_fixup_f16(0, F16_SUB_MIN, F16_POS_ZERO), F16_POS_ZERO)
+        self.assertEqual(ref_v_div_fixup_f16(0, F16_NEG_SUB_MIN, F16_POS_ZERO), F16_NEG_ZERO)
+        self.assertEqual(ref_v_div_fixup_f16(0, F16_SUB_MIN, F16_NEG_ZERO), F16_NEG_ZERO)
+        self.assertEqual(ref_v_div_fixup_f16(0, F16_NEG_SUB_MIN, F16_NEG_ZERO), F16_POS_ZERO)
+
+
+class TestDivFixupExhaustiveSignMatrix(unittest.TestCase):
+    def test_f32_sign_xor_rule_exhaustive_matrix(self):
+        signs = [(0, "+"), (1, "-")]
+        nonzeros = [
+            (F32_ONE, F32_NEG_ONE, "normal"),
+            (F32_SUB_MIN, F32_NEG_SUB_MIN, "subnormal"),
+        ]
+
+        for (s1_sign, s1_label), (s2_sign, s2_label) in itertools.product(signs, repeat=2):
+            expected_sign = s1_sign ^ s2_sign
+
+            # 1. Nonzero / 0 -> Inf
+            s1_zero = F32_NEG_ZERO if s1_sign else F32_POS_ZERO
+            for pos_val, neg_val, val_label in nonzeros:
+                s2_val = neg_val if s2_sign else pos_val
+                with self.subTest(op=f"{val_label}/{s1_label}0", s1=s1_label, s2=s2_label):
+                    res = ref_v_div_fixup_f32(0, s1_zero, s2_val)
+                    self.assertTrue(is_f32_inf(res))
+                    self.assertEqual(f32_sign(res), expected_sign)
+
+            # 2. Nonzero / Inf -> 0.0
+            s1_inf = F32_NEG_INF if s1_sign else F32_POS_INF
+            for pos_val, neg_val, val_label in nonzeros:
+                s2_val = neg_val if s2_sign else pos_val
+                with self.subTest(op=f"{val_label}/{s1_label}inf", s1=s1_label, s2=s2_label):
+                    res = ref_v_div_fixup_f32(0, s1_inf, s2_val)
+                    self.assertTrue(is_f32_zero(res))
+                    self.assertEqual(f32_sign(res), expected_sign)
+
+            # 3. 0 / Nonzero -> 0.0
+            s2_zero = F32_NEG_ZERO if s2_sign else F32_POS_ZERO
+            for pos_val, neg_val, val_label in nonzeros:
+                s1_val = neg_val if s1_sign else pos_val
+                with self.subTest(op=f"{s2_label}0/{val_label}", s1=s1_label, s2=s2_label):
+                    res = ref_v_div_fixup_f32(0, s1_val, s2_zero)
+                    self.assertTrue(is_f32_zero(res))
+                    self.assertEqual(f32_sign(res), expected_sign)
+
+    def test_f16_sign_xor_rule_exhaustive_matrix(self):
+        signs = [(0, "+"), (1, "-")]
+        nonzeros = [
+            (F16_ONE, F16_NEG_ONE, "normal"),
+            (F16_SUB_MIN, F16_NEG_SUB_MIN, "subnormal"),
+        ]
+
+        for (s1_sign, s1_label), (s2_sign, s2_label) in itertools.product(signs, repeat=2):
+            expected_sign = s1_sign ^ s2_sign
+
+            # Nonzero / 0 -> Inf
+            s1_zero = F16_NEG_ZERO if s1_sign else F16_POS_ZERO
+            for pos_val, neg_val, val_label in nonzeros:
+                s2_val = neg_val if s2_sign else pos_val
+                with self.subTest(op=f"f16_{val_label}/{s1_label}0", s1=s1_label, s2=s2_label):
+                    res = ref_v_div_fixup_f16(0, s1_zero, s2_val)
+                    self.assertTrue(is_f16_inf(res))
+                    self.assertEqual(f16_sign(res), expected_sign)
+
+
+class TestDivFixupNegativeControls(unittest.TestCase):
+    def test_sabotaged_sign_xor_fails(self):
+        # Sabotage: replace sign_xor with AND (fails when one operand is negative and other positive)
+        def bad_ref_f32(s0: int, s1: int, s2: int) -> int:
+            sign_and = f32_sign(s1) & f32_sign(s2)  # Sabotaged: AND instead of XOR
+            sign_bit = 0x80000000 if sign_and else 0x00000000
+            if is_f32_zero(s1) and not is_f32_zero(s2):
+                return sign_bit | F32_POS_INF
+            return s0
+
+        # (+1) / (-0) should be -inf, but sabotaged sign gives +inf
+        correct = ref_v_div_fixup_f32(0, F32_NEG_ZERO, F32_ONE)
+        sabotaged = bad_ref_f32(0, F32_NEG_ZERO, F32_ONE)
+        self.assertEqual(correct, F32_NEG_INF)
+        self.assertEqual(sabotaged, F32_POS_INF)
+        self.assertNotEqual(correct, sabotaged)
+
+    def test_sabotaged_snan_quieting_fails(self):
+        # Sabotage: returning sNaN directly without setting quiet bit
+        def bad_ref_f32(s0: int, s1: int, s2: int) -> int:
+            if is_f32_nan(s1):
+                return s1  # Sabotaged: forgot quiet_f32
+            return s0
+
+        res_correct = ref_v_div_fixup_f32(F32_ONE, F32_SNAN, F32_ONE)
+        res_bad = bad_ref_f32(F32_ONE, F32_SNAN, F32_ONE)
+        self.assertTrue(is_f32_qnan(res_correct))
+        self.assertTrue(is_f32_snan(res_bad))
+        self.assertNotEqual(res_correct, res_bad)
+
+    def test_sabotaged_zero_div_zero_fails(self):
+        # Sabotage: returning 0 instead of NaN for 0 / 0
+        def bad_ref_f32(s0: int, s1: int, s2: int) -> int:
+            if is_f32_zero(s1) and is_f32_zero(s2):
+                return F32_POS_ZERO  # Sabotaged: returns 0 instead of QNaN
+            return s0
+
+        res_correct = ref_v_div_fixup_f32(F32_ONE, F32_POS_ZERO, F32_POS_ZERO)
+        res_bad = bad_ref_f32(F32_ONE, F32_POS_ZERO, F32_POS_ZERO)
+        self.assertTrue(is_f32_qnan(res_correct))
+        self.assertFalse(is_f32_nan(res_bad))
+        self.assertNotEqual(res_correct, res_bad)
+
+    def test_sabotaged_inf_div_inf_fails(self):
+        # Sabotage: returning 1.0 instead of NaN for inf / inf
+        def bad_ref_f32(s0: int, s1: int, s2: int) -> int:
+            if is_f32_inf(s1) and is_f32_inf(s2):
+                return F32_ONE  # Sabotaged: returns 1.0 instead of QNaN
+            return s0
+
+        res_correct = ref_v_div_fixup_f32(F32_ONE, F32_POS_INF, F32_POS_INF)
+        res_bad = bad_ref_f32(F32_ONE, F32_POS_INF, F32_POS_INF)
+        self.assertTrue(is_f32_qnan(res_correct))
+        self.assertEqual(res_bad, F32_ONE)
+        self.assertNotEqual(res_correct, res_bad)
+
+    def test_sabotaged_nan_precedence_fails(self):
+        # Sabotage: checking s2 (numerator) before s1 (denominator)
+        def bad_ref_f32(s0: int, s1: int, s2: int) -> int:
+            if is_f32_nan(s2):  # Sabotaged: inverted priority
+                return quiet_f32(s2)
+            if is_f32_nan(s1):
+                return quiet_f32(s1)
+            return s0
+
+        s1_nan = 0x7F8000AA
+        s2_nan = 0x7F8000BB
+        correct = ref_v_div_fixup_f32(F32_ONE, s1_nan, s2_nan)
+        sabotaged = bad_ref_f32(F32_ONE, s1_nan, s2_nan)
+        self.assertEqual(correct, s1_nan | 0x00400000)
+        self.assertEqual(sabotaged, s2_nan | 0x00400000)
+        self.assertNotEqual(correct, sabotaged)
+
+    def test_sabotaged_inactive_lane_bleed_fails(self):
+        # Sabotage: interpreter mutates inactive lanes
+        wave = WaveDivFixupInterpreter(wave_size=4)
+        wave.exec_mask = 0b0001  # only lane 0 active
+
+        for lane in range(4):
+            wave.set_lane_vgpr(lane, 0, OLD_VGPR_SENTINEL)
+            wave.set_lane_vgpr(lane, 1, F32_ONE)
+            wave.set_lane_vgpr(lane, 2, F32_POS_ZERO)
+            wave.set_lane_vgpr(lane, 3, F32_ONE)
+
+        # Correct execution
+        wave.v_div_fixup_f32(0, 1, 2, 3)
+        self.assertEqual(wave.get_lane_vgpr(0, 0), F32_POS_INF)
+        self.assertEqual(wave.get_lane_vgpr(1, 0), OLD_VGPR_SENTINEL)
+        self.assertEqual(wave.get_lane_vgpr(2, 0), OLD_VGPR_SENTINEL)
+        self.assertEqual(wave.get_lane_vgpr(3, 0), OLD_VGPR_SENTINEL)
+
+        # Sabotaged execution: clobber all lanes regardless of exec
+        for lane in range(4):
+            wave.vgprs[lane][0] = 0x00000000
+        self.assertNotEqual(wave.get_lane_vgpr(1, 0), OLD_VGPR_SENTINEL)
 
 
 if __name__ == "__main__":
