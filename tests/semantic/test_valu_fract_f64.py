@@ -1035,5 +1035,59 @@ class TestConditionCodesAndStatusFlags(unittest.TestCase):
         self.assertEqual(borrow_int, 0)
 
 
+class TestIEEE754BoundaryExtremes(unittest.TestCase):
+    """Unit tests for IEEE 754 boundary extremes, subnormals, and NaN handling."""
+
+    def test_positive_subnormal_identity(self) -> None:
+        # For positive subnormals in (0, 1), floor is 0, fract(s) == s
+        sub1 = 0x0000_0000_0000_0001  # min subnormal
+        sub2 = 0x000F_FFFF_FFFF_FFFF  # max subnormal
+        self.assertEqual(oracle_v_fract_f64(sub1), sub1)
+        self.assertEqual(oracle_v_fract_f64(sub2), sub2)
+
+    def test_negative_subnormal_clamps_to_largest_below_one(self) -> None:
+        # For negative subnormals, exact -s - floor(-s) is 1 - s, which rounds up to 1.0,
+        # and hardware clamps to LARGEST_BELOW_ONE_F64 (0x3FEFFFFFFFFFFFFF)
+        sub_neg1 = 0x8000_0000_0000_0001
+        sub_neg2 = 0x800F_FFFF_FFFF_FFFF
+        self.assertEqual(oracle_v_fract_f64(sub_neg1), LARGEST_BELOW_ONE_F64)
+        self.assertEqual(oracle_v_fract_f64(sub_neg2), LARGEST_BELOW_ONE_F64)
+
+    def test_large_numbers_above_mantissa_precision(self) -> None:
+        # All representable doubles >= 2^52 have no fractional bits (fraction is +0.0)
+        two_to_52 = f64_to_bits(2.0 ** 52)
+        dbl_max = 0x7FEF_FFFF_FFFF_FFFF
+        self.assertEqual(oracle_v_fract_f64(two_to_52), POS_ZERO_F64)
+        self.assertEqual(oracle_v_fract_f64(dbl_max), POS_ZERO_F64)
+
+        # 2^51 + 0.5 has ULP = 0.5, so 0.5 is representable
+        val = (2.0 ** 51) + 0.5
+        self.assertEqual(bits_to_f64(oracle_v_fract_f64(f64_to_bits(val))), 0.5)
+
+    def test_nan_payload_preservation_and_quietening(self) -> None:
+        snan = 0x7FF0_0000_1234_5678
+        res_snan = oracle_v_fract_f64(snan)
+        self.assertTrue(is_qnan_f64(res_snan))
+        self.assertEqual(res_snan, snan | QNAN_BIT_F64)
+
+        qnan = 0x7FF8_0000_DEAD_BEEF
+        res_qnan = oracle_v_fract_f64(qnan)
+        self.assertEqual(res_qnan, qnan)
+
+    def test_nan_and_inf_with_clamp(self) -> None:
+        self.assertEqual(oracle_v_fract_f64(CANONICAL_QNAN_F64, clamp=True), POS_ZERO_F64)
+        self.assertEqual(oracle_v_fract_f64(POS_INF_F64, clamp=True), POS_ZERO_F64)
+        self.assertEqual(oracle_v_fract_f64(NEG_INF_F64, clamp=True), POS_ZERO_F64)
+
+    def test_nan_with_modifiers(self) -> None:
+        qnan = 0x7FF8_0000_0000_0001
+        res_abs = oracle_v_fract_f64(qnan | SIGN_MASK_F64, abs0=True)
+        self.assertEqual(res_abs & SIGN_MASK_F64, 0)
+        self.assertTrue(is_qnan_f64(res_abs))
+
+        res_neg = oracle_v_fract_f64(qnan, neg0=True)
+        self.assertEqual(res_neg & SIGN_MASK_F64, SIGN_MASK_F64)
+
+
 if __name__ == "__main__":
     unittest.main()
