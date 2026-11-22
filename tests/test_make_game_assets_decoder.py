@@ -65,6 +65,19 @@ class AssetsDecoderTest(unittest.TestCase):
         os.remove(os.path.join(self.models, make_game.DECODER_RECORD))
         self.assertEqual(self.export("d1"), ["models"])
 
+    def test_an_exporter_that_cannot_be_built_keeps_the_old_export(self):
+        self.export("d1")
+        with mock.patch.object(make_game, "MODEL_ARCHIVES", ["scene.rpf"]), \
+                mock.patch.object(make_game, "decoder_digest", lambda: "d2"), \
+                mock.patch.object(make_game, "rpf9dump", side_effect=SystemExit(1)), \
+                mock.patch.object(make_game, "log", lambda *a: None):
+            with self.assertRaises(SystemExit):
+                make_game.assets(os.path.join(self.work, "game"), self.work, False, 1)
+        self.assertTrue(os.path.isfile(os.path.join(self.models, "manifest.json")))
+        with open(os.path.join(self.models, make_game.DECODER_RECORD), encoding="utf-8") as f:
+            self.assertEqual(f.read(), "d1\n")
+        self.assertEqual(self.export("d2"), ["models", "textures"])
+
     def test_the_digest_follows_the_exporter_sources(self):
         with tempfile.TemporaryDirectory() as tools:
             os.makedirs(os.path.join(tools, "rpf9dump"))

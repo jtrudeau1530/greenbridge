@@ -1186,7 +1186,9 @@ def assets(game: str, work: str, wav: bool, jobs: int) -> None:
             folder = os.path.join(out, name, mode)
             record = os.path.join(folder, DECODER_RECORD)
             if os.path.isdir(folder) and read_shader_setting(record) != decoder:
-                # rpf9dump keeps the files it finds, so another decoder's output is removed first.
+                # rpf9dump keeps the files it finds, so another decoder's output is removed first. The exporter is
+                # built before that: a build that fails leaves the old export in place.
+                get_exporter(work)
                 log(f"assets: no matching decoder fingerprint for {mode} from {rel}: exporting again")
                 shutil.rmtree(folder)
             elif os.path.isfile(os.path.join(folder, "manifest.json")):
