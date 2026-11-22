@@ -1823,6 +1823,14 @@ The trace will enumerate them.
   texture a barrier has moved, a default-heap texture, which D3D12 does not allow but the layer copies and logs) is
   a `CopyTextureRegion` from or to a host-visible staging buffer, replayed on the device's queue and waited for, so
   the layout tracker and a first use's zero fill behave exactly as for the application's own copies.
+  Their arguments answer as the host runtime's do (`d3d12_subresource_copy_test` runs the same 117 steps on both
+  devices and compares every HRESULT and the whole destination of every read; RTX 3060, driver 610.88): a
+  subresource past the last, a box whose right, bottom or back edge lies past the mip's, or one that cuts a
+  compressed block is `E_INVALIDARG`; an empty or inverted box that passes those checks is `S_OK` and copies
+  nothing; the row and depth pitches are not checked, so rows or slices that overlap (a pitch smaller than a row,
+  or 0) are copied in order. Not compared: null data, which the host faults on (the layer answers `E_INVALIDARG`);
+  which bytes win when a read's rows overlap, which is the driver's copy order; and a default-heap texture, which
+  the host refuses and the layer copies on purpose.
 - 96-bit textures (`R32G32B32_FLOAT`/`_UINT`/`_SINT`/`_TYPELESS`, D3D-62) are `R32G32B32A32` images
   (`ResourceBinding::rgb96`), on every GPU. Most GPUs have no optimal-tiling RGB32 image (an RX 9070 XT reports
   no optimal features for `R32G32B32_SFLOAT`), and one that has would not avoid the repack: D3D12 places
