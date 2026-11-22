@@ -2746,7 +2746,7 @@ bool image_descriptor(const Resource& resource, const TextureView& view, leonida
     const auto dimension = line ? D3D12_RESOURCE_DIMENSION_TEXTURE1D :
                            view.type == g::ImageType::image_3d ? D3D12_RESOURCE_DIMENSION_TEXTURE3D :
                                                                D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-    if (desc.Dimension != dimension || (line && desc.DepthOrArraySize != 1) || msaa != (desc.SampleDesc.Count > 1)) {
+    if (desc.Dimension != dimension || (line && view.layer_count != 1) || msaa != (desc.SampleDesc.Count > 1)) {
         log_once("view type incompatible with texture dimension or sample count; view type", int(view.type));
         return false;
     }
@@ -4028,9 +4028,10 @@ public:
         TextureView view{};
         if (!desc) {
             const bool array = r->desc().DepthOrArraySize > 1;
-            if (r->desc().Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D && !array)
+            if (r->desc().Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D && !array) {
                 view.type = ImageType::image_1d;
-            else if (r->desc().Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D)
+                view.layer_count = 1;
+            } else if (r->desc().Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D)
                 view.type = ImageType::image_3d;
             else if (r->desc().SampleDesc.Count > 1)
                 view.type = array ? ImageType::image_2d_msaa_array : ImageType::image_2d_msaa;
@@ -4044,6 +4045,7 @@ public:
                 view.type = ImageType::image_1d;
                 view.first_mip = desc->Texture1D.MostDetailedMip;
                 view.mip_count = desc->Texture1D.MipLevels;
+                view.layer_count = 1;
                 view.min_lod = desc->Texture1D.ResourceMinLODClamp;
                 break;
             case D3D12_SRV_DIMENSION_TEXTURE3D:
