@@ -200,6 +200,23 @@ def main():
         fail(f"{len(FAILED)} shader(s) produced no disassembly, first {path}: {reason}")
     if not (res["clean"] or res["invalid words"] or res["reused"]):
         fail(f"no disassembly produced for {a.src}")
+    if os.path.isdir(a.src) and not a.limit:
+        # A shader dropped by a re-carve must not keep its old listing: the translator reads every .s in this folder,
+        # so a stale one would still be translated and indexed even though the corpus no longer has it. Prune only
+        # after a successful decode, so a missing llvm-mc or a failed shader never deletes a usable listing. --limit
+        # is a partial run on purpose and leaves the rest of the folder alone.
+        stems = {os.path.splitext(os.path.basename(p))[0] for p in files}
+        stale = []
+        try:
+            with os.scandir(out) as entries:
+                stale = sorted(e.path for e in entries
+                               if e.name.endswith(".s") and e.is_file() and e.name[:-2] not in stems)
+            for path in stale:
+                os.remove(path)
+        except OSError as e:
+            fail(f"cannot prune stale .s files in {out}: {e.strerror or e}")
+        if stale:
+            print(f"removed {len(stale)} stale .s file(s) that no .fssm in {a.src} names")
     return 0
 
 
