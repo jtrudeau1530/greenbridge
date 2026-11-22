@@ -725,5 +725,106 @@ class TestSIMDMultiLaneDivergenceAndExecMasking(unittest.TestCase):
         self.assertEqual(scalar.read_exec(), initial_exec)
 
 
+# -----------------------------------------------------------------------------
+# Commit 5: Register Aliasing and In-Place Operand Preservation
+# -----------------------------------------------------------------------------
+
+class TestRegisterAliasingAndInPlacePreservation(unittest.TestCase):
+    """Commit 5: Register aliasing, overlapping operands, and in-place preservation tests."""
+
+    def setUp(self) -> None:
+        self.state = ScalarMachineState()
+        self.interp = ScalarInterpreter()
+
+    def test_exact_src0_dst_aliasing_order_of_evaluation(self) -> None:
+        """Verify sdst == ssrc0: src0 must be captured before sdst is written with saved exec."""
+        val_src = 0x0000_FFFF_0000_FFFF
+        old_exec = 0x5555_5555_5555_5555
+        self.state.write_sgpr64(4, val_src)
+        self.state.write_exec(old_exec)
+
+        instr = ScalarInstruction(opcode="s_orn2_saveexec_b64", dst="s[4:5]", src0="s[4:5]")
+        saved, new_exec, scc = self.interp.step(instr, self.state)
+
+        # Saved EXEC returned and placed into s[4:5]
+        self.assertEqual(saved, old_exec)
+        self.assertEqual(self.state.read_sgpr64(4), old_exec)
+
+        # New EXEC must be computed from val_src, NOT from old_exec!
+        expected_new_exec = (val_src | (~old_exec & MASK64)) & MASK64
+        self.assertNotEqual(expected_new_exec, EXEC_ALL_ONES)
+        self.assertEqual(new_exec, expected_new_exec)
+        self.assertEqual(self.state.read_exec(), expected_new_exec)
+
+    def test_src0_is_exec_tautological_ones(self) -> None:
+        """Verify ssrc0 == exec: EXEC | ~EXEC is mathematically always ALL_ONES."""
+        arbitrary_execs = [
+            0x0000_0000_0000_0000,
+            0xFFFF_FFFF_FFFF_FFFF,
+            0x1234_5678_9ABC_DEF0,
+            0xAAAA_5555_AAAA_5555,
+            0x8000_0000_0000_0001,
+        ]
+        for ex in arbitrary_execs:
+            with self.subTest(ex=hex(ex)):
+                self.state.write_exec(ex)
+                instr = ScalarInstruction(opcode="s_orn2_saveexec_b64", dst="s[6:7]", src0="exec")
+                saved, new_exec, scc = self.interp.step(instr, self.state)
+                self.assertEqual(saved, ex)
+                self.assertEqual(self.state.read_sgpr64(6), ex)
+                self.assertEqual(new_exec, EXEC_ALL_ONES)
+                self.assertEqual(self.state.read_exec(), EXEC_ALL_ONES)
+                self.assertEqual(scc, SCC_SET)
+
+    def test_dst_is_exec_overwriting(self) -> None:
+        """Verify sdst == exec: new EXEC calculation takes precedence."""
+        self.state.write_sgpr64(8, 0x1111_1111_1111_1111)
+        self.state.write_exec(0x2222_2222_2222_2222)
+
+        instr = ScalarInstruction(opcode="s_orn2_saveexec_b64", dst="exec", src0="s[8:9]")
+        saved, new_exec, scc = self.interp.step(instr, self.state)
+
+        self.assertEqual(saved, 0x2222_2222_2222_2222)
+        expected_exec = (0x1111_1111_1111_1111 | (~0x2222_2222_2222_2222 & MASK64)) & MASK64
+        self.assertEqual(new_exec, expected_exec)
+        self.assertEqual(self.state.read_exec(), expected_exec)
+
+    def test_adjacent_register_non_interference(self) -> None:
+        """Verify non-targeted SGPR registers retain their exact contents without bleeding."""
+        sentinels = {}
+        for idx in range(0, 32, 2):
+            val = (0xABCD_0000_0000_0000 | (idx << 32) | (idx * 7919)) & MASK64
+            sentinels[idx] = val
+            self.state.write_sgpr64(idx, val)
+
+        self.state.write_exec(0xF0F0_F0F0_F0F0_F0F0)
+
+        # Target only s[14:15] with s[8:9]
+        instr = ScalarInstruction(opcode="s_orn2_saveexec_b64", dst="s[14:15]", src0="s[8:9]")
+        self.interp.step(instr, self.state)
+
+        # Check s[14:15] updated with saved exec
+        self.assertEqual(self.state.read_sgpr64(14), 0xF0F0_F0F0_F0F0_F0F0)
+
+        # Check all other SGPRs unaltered
+        for idx, expected_val in sentinels.items():
+            if idx == 14:
+                continue
+            self.assertEqual(self.state.read_sgpr64(idx), expected_val, f"SGPR s[{idx}:{idx+1}] corrupted!")
+
+    def test_null_destination_with_aliased_source(self) -> None:
+        """Verify sdst=null with ssrc0 being an SGPR preserves ssrc0 completely."""
+        self.state.write_sgpr64(18, 0x9999_8888_7777_6666)
+        self.state.write_exec(0x1234_1234_1234_1234)
+
+        instr = ScalarInstruction(opcode="s_orn2_saveexec_b64", dst="null", src0="s[18:19]")
+        saved, new_exec, scc = self.interp.step(instr, self.state)
+
+        self.assertEqual(saved, 0x1234_1234_1234_1234)
+        self.assertEqual(self.state.read_sgpr64(18), 0x9999_8888_7777_6666)
+        expected_exec = (0x9999_8888_7777_6666 | (~0x1234_1234_1234_1234 & MASK64)) & MASK64
+        self.assertEqual(self.state.read_exec(), expected_exec)
+
+
 if __name__ == "__main__":
     unittest.main()
