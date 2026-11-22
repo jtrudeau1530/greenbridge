@@ -71,7 +71,7 @@ def looks_like_opus(path: str) -> bool:
 
 
 def ogg_output_samples(path: str) -> int:
-    """End granule minus pre-skip for matching Opus stream endpoints, or 0 to use ffmpeg's timing."""
+    """End granule minus pre-skip for a single unchained Opus stream, or 0 to use ffmpeg's timing."""
     try:
         size = os.path.getsize(path)
         with open(path, "rb") as f:
@@ -90,29 +90,29 @@ def ogg_output_samples(path: str) -> int:
                 return 0
             serial = first[14:18]
             pre_skip, = struct.unpack_from("<H", head, 10)
-            start = max(0, size - 131072)
-            f.seek(start)
-            tail = f.read()
-        # The last page ends at EOF; walk back over possible "OggS" bytes inside the payload until one fits.
-        end = len(tail)
-        while True:
-            pos = tail.rfind(b"OggS", 0, end)
-            if pos < 0:
-                return 0
-            end = pos
-            if pos + 27 > len(tail) or tail[pos + 4] != 0:
-                continue
-            nseg = tail[pos + 26]
-            if pos + 27 + nseg > len(tail):
-                continue
-            body = sum(tail[pos + 27:pos + 27 + nseg])
-            if start + pos + 27 + nseg + body != size:
-                continue
-            # A chained file ends on a different logical stream with its own granule timeline.
-            if tail[pos + 5] not in (0x04, 0x05) or tail[pos + 14:pos + 18] != serial:
-                return 0
-            granule, = struct.unpack_from("<q", tail, pos + 6)
-            return granule - pre_skip if granule > pre_skip else 0
+            # Walk page headers forward so same-serial chained or multiplexed streams are rejected.
+            offset = body_end
+            while offset < size:
+                f.seek(offset)
+                hdr = f.read(27)
+                if len(hdr) != 27 or hdr[:4] != b"OggS" or hdr[4] != 0 or hdr[14:18] != serial:
+                    return 0
+                htype = hdr[5]
+                if htype not in (0x00, 0x01, 0x04, 0x05):
+                    return 0
+                nseg = hdr[26]
+                lacing = f.read(nseg)
+                if len(lacing) != nseg:
+                    return 0
+                offset += 27 + nseg + sum(lacing)
+                if offset > size:
+                    return 0
+                if htype & 0x04:
+                    if offset != size:
+                        return 0
+                    granule, = struct.unpack_from("<q", hdr, 6)
+                    return granule - pre_skip if granule > pre_skip else 0
+            return 0
     except (OSError, struct.error):
         return 0
 
