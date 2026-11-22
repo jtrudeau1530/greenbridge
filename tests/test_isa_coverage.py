@@ -11,9 +11,11 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOLS_DIR = os.path.join(ROOT, "tools")
@@ -86,6 +88,29 @@ def _fixture(text, suffix):
     f.write(text)
     f.close()
     return f.name
+
+
+class LlvmProbeTests(unittest.TestCase):
+    def test_backend_failure_is_not_instruction_support(self) -> None:
+        diagnostic = "llvm-mc: error: unable to get target for 'amdgcn'"
+        failure = subprocess.CompletedProcess(["llvm-mc"], 1, "", diagnostic)
+        with patch.object(ic.subprocess, "run", return_value=failure):
+            outcome = ic.probe_llvm_mc("llvm-mc", ["s_endpgm"])["s_endpgm"]
+        self.assertEqual(outcome, f"LLVM probe failed (exit 1): {diagnostic}")
+
+    def test_reports_success_and_known_instruction_diagnostics(self) -> None:
+        probes = (
+            ("s_endpgm", 0, "", "LLVM: valid on gfx1013"),
+            ("v_add_f32", 1, "<stdin>:1:1: error: too few operands for instruction", "LLVM: valid on gfx1013"),
+            ("v_bogus", 1, "<stdin>:1:1: error: invalid instruction", "unknown to LLVM"),
+            ("v_wmma_f32", 1, "<stdin>:1:1: error: instruction not supported on this GPU",
+             "LLVM: other GPU only (not gfx1013)"),
+        )
+        for name, code, diagnostic, expected in probes:
+            with self.subTest(name=name):
+                outcome = subprocess.CompletedProcess(["llvm-mc"], code, "", diagnostic)
+                with patch.object(ic.subprocess, "run", return_value=outcome):
+                    self.assertEqual(ic.probe_llvm_mc("llvm-mc", [name]), {name: expected})
 
 
 class FixtureTests(unittest.TestCase):
