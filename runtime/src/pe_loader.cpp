@@ -77,9 +77,20 @@ struct TlsHostModule {
 
 TlsHostModule load_tls_host() {
     TlsHostModule host;
-    wchar_t exe[MAX_PATH] = {};
-    if (!GetModuleFileNameW(nullptr, exe, MAX_PATH)) return host;
-    const std::filesystem::path path = std::filesystem::path(exe).parent_path() / L"gta6rt_tls_host.dll";
+    // Dynamic buffer loop for paths that exceed MAX_PATH
+    std::wstring exe_path;
+    DWORD size = MAX_PATH;
+    while (true) {
+        exe_path.resize(size);
+        DWORD len = GetModuleFileNameW(nullptr, exe_path.data(), size);
+        if (len == 0) return host;
+        if (len < size - 1) {
+            exe_path.resize(len);
+            break;
+        }
+        size *= 2;
+    }
+    const std::filesystem::path path = std::filesystem::path(exe_path).parent_path() / L"gta6rt_tls_host.dll";
     // The helper is linked with the static CRT (/MT), so it needs only system DLLs. Restricting the dependency search
     // to System32 keeps a game-supplied vcruntime next to the executable from being picked up.
     host.module = LoadLibraryExW(path.c_str(), nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);

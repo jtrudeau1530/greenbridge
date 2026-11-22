@@ -111,6 +111,9 @@ compute and mesh shaders 64-wide. The mode is saved next to the translated shade
 again. With `auto`, a work folder that previously used emulation keeps it for later translations and retries, even if
 the current GPU supports native wave64. Use `--wave64-emulate off` to translate it natively.
 
+The build records which llvm-mc command and version produced the disassembly. Changing either, or reusing a work
+folder that predates this record, reruns disassembly and translation while keeping the extracted shader inputs.
+
 The build records which translator sources produced the shaders. A change to those files reruns translation using the
 saved disassembly. Older work folders need one translation after upgrading to record this information.
 

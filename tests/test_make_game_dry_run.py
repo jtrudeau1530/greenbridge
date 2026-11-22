@@ -382,7 +382,7 @@ class StageResumptionAndStepIsolationTest(unittest.TestCase):
     def test_shaders_stage_skips_finished_steps_based_on_markers(self) -> None:
         dxbc_dir = os.path.join(self.work_dir, "shaders", "dxbc")
         spirv_dir = os.path.join(self.work_dir, "shaders", "spirv")
-        os.makedirs(dxbc_dir, exist_ok=True)
+        os.makedirs(os.path.join(dxbc_dir, "disasm"))
         os.makedirs(spirv_dir, exist_ok=True)
 
         with open(os.path.join(dxbc_dir, "index.json"), "w", encoding="utf-8") as f:
@@ -390,7 +390,7 @@ class StageResumptionAndStepIsolationTest(unittest.TestCase):
         with open(os.path.join(dxbc_dir, "fssm_index.json"), "w", encoding="utf-8") as f:
             f.write("{}")
         with open(os.path.join(dxbc_dir, "disasm.done"), "w", encoding="utf-8") as f:
-            f.write("shader_disasm.py finished\n")
+            f.write("test llvm-mc 21\n")
         with open(os.path.join(spirv_dir, "index.json"), "w", encoding="utf-8") as f:
             f.write("{}")
         with open(os.path.join(spirv_dir, "wave64_emulate.txt"), "w", encoding="utf-8") as f:
@@ -399,6 +399,7 @@ class StageResumptionAndStepIsolationTest(unittest.TestCase):
             f.write(make_game.translation_sources_digest() + "\n")
 
         with mock.patch("make_game.py") as mock_py, \
+                mock.patch("make_game.llvm_mc_signature", return_value="test llvm-mc 21"), \
                 mock.patch("make_game.translate") as mock_translate, \
                 mock.patch("make_game.log"):
             make_game.shaders(self.game_dir, self.work_dir, jobs=2, emulate=False, keep_emulated=True)
@@ -430,6 +431,7 @@ class StageResumptionAndStepIsolationTest(unittest.TestCase):
                     f.write("{}")
 
         with mock.patch("make_game.py", side_effect=fake_py), \
+                mock.patch("make_game.llvm_mc_signature", return_value="test llvm-mc 21"), \
                 mock.patch("make_game.translate") as mock_translate, \
                 mock.patch("make_game.need"), \
                 mock.patch("make_game.log"):
@@ -546,15 +548,11 @@ class StageResumptionAndStepIsolationTest(unittest.TestCase):
         self.assertFalse(os.path.isfile(p1))
         self.assertFalse(os.path.isfile(p2))
 
-    def test_mark_and_mark_done_create_expected_marker_files(self) -> None:
-        p1 = os.path.join(self.work_dir, "disasm.done")
-        p2 = os.path.join(self.work_dir, "step.done")
-        make_game.mark_done(p1)
-        make_game.mark(p2, "custom_step")
+    def test_mark_creates_expected_asset_marker(self) -> None:
+        marker = os.path.join(self.work_dir, "step.done")
+        make_game.mark(marker, "custom_step")
 
-        with open(p1, "r", encoding="utf-8") as f:
-            self.assertEqual(f.read().strip(), "shader_disasm.py finished")
-        with open(p2, "r", encoding="utf-8") as f:
+        with open(marker, "r", encoding="utf-8") as f:
             self.assertEqual(f.read().strip(), "custom_step finished")
 
 

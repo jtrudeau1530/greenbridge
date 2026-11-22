@@ -78,7 +78,10 @@ CS_SMEM = [0x5eed0024, 0x5eed0028, 0x5eed002c, 0x5eed0030, 0x5eed0010, 0x5eed001
 WAVE32_DUMPS = ("cs_store", "cs_smem_soffset_imm", "cs_wqm_w32", "cs_w32_lane_wrap", "cs_movrelsd_2", "cs_w32_permute",
                 "cs_barrier_divergent", "cs_w32_lds_u8_d16", "cs_bpermute32", "cs_w32_partial_scmp", "cs_exec_const")
 # Wave32 lane-mask dumps: their EXEC/VCC masks and lane selects cover 32 lanes, so a device whose widest subgroup is
-# narrower (Mesa llvmpipe: 8) can't produce their words. They are skipped there, as ps_bitmask_perm is.
+# narrower (Mesa llvmpipe: 8) can't produce their words. They are skipped there, as ps_bitmask_perm is. They run with
+# 32 lanes requested (WAVE32_LANE_ENV), as run_gpu_tests.py does: a device with a range like 8..32 (Intel ANV) may
+# otherwise pick a narrower size and return different words (#774).
+WAVE32_LANE_ENV = {"VKC_SUBGROUP_SIZE": "32"}
 WAVE32_LANE_DUMPS = ("cs_wqm_w32", "cs_w32_lane_wrap", "cs_w32_permute", "cs_bpermute32", "cs_w32_partial_scmp", "cs_exec_const")
 CS_DUMPS = [("cs_store", CS_STORE), ("cs_smem_soffset_imm", CS_SMEM),
             # SHADER-52: wave32 lane select is & 31; lane 40 wraps to 8
@@ -364,6 +367,20 @@ def narrow_subgroup_skip(out):
     return None
 
 
+def unpinned_subgroup_skip(out):
+    """A Skip when vk_compute_test says the VKC_SUBGROUP_SIZE it was given can't be pinned on this device, else None.
+    Output without the line (an older vk_compute_test) is judged as before."""
+    m = re.search(r"^compute subgroup size: (\d+) not available$", out, re.MULTILINE)
+    if m:
+        return Skip(f"SKIP (the device can't run this shader at {m.group(1)} lanes on request)")
+    return None
+
+
+def wave32_lane_skip(out):
+    """The skip rule for WAVE32_LANE_DUMPS, shared with run_gpu_tests.py."""
+    return narrow_subgroup_skip(out) or unpinned_subgroup_skip(out)
+
+
 def compute_test(tools, spirv, name, groups, mode, *, require_wave64=False, expected_words=None, needs_32_lanes=False,
                  env=None):
     """Return an empty string for a pass, None for unsupported wave64, a Skip for a wave32 lane-mask test on a device
@@ -375,11 +392,13 @@ def compute_test(tools, spirv, name, groups, mode, *, require_wave64=False, expe
         if not os.path.isfile(shader):
             return f"missing {name}.spv"
         args.append("--require-wave64")
+    if needs_32_lanes:
+        env = {**WAVE32_LANE_ENV, **(env or {})}
     extra = {"env": dict(os.environ, **env)} if env else {}
     code, out = run(os.path.join(tools, "vk_compute_test" + EXE), shader, groups, mode, *args, **extra)
     if require_wave64 and code == 77:  # vk_compute_test: the device cannot run a 64-wide compute subgroup
         return None
-    if needs_32_lanes and (skip := narrow_subgroup_skip(out)):
+    if needs_32_lanes and (skip := wave32_lane_skip(out)):
         return skip
     if code != 0:
         return failure(code, out, 2)

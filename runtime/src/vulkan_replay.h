@@ -37,6 +37,8 @@
 #include <cstdint>
 #include <functional>
 #include <limits>
+#include <map>
+#include <memory>
 #include <type_traits>
 #include <unordered_map>
 #include <utility>
@@ -597,14 +599,33 @@ private:
     std::unordered_map<ResourceId, Entry> entries_;
 };
 
-// A D3D12 query heap on Vulkan. `ended` is kept on the host: which queries hold a result, updated as lists are
-// emitted in submission order. A resolve of a query that was never ended writes zeros instead of waiting on it.
+// Each physical slot records one non-overlapping interval. Logical queries can share slots.
+struct OcclusionSegmentPool {
+    VkDevice device = VK_NULL_HANDLE;
+    PFN_vkDestroyQueryPool destroy = nullptr;
+    VkQueryPool pool = VK_NULL_HANDLE;
+
+    OcclusionSegmentPool() = default;
+    OcclusionSegmentPool(const OcclusionSegmentPool&) = delete;
+    OcclusionSegmentPool& operator=(const OcclusionSegmentPool&) = delete;
+    ~OcclusionSegmentPool() { if (pool) destroy(device, pool, nullptr); }
+};
+
+struct OcclusionResult {
+    std::shared_ptr<const OcclusionSegmentPool> segments;
+    std::uint32_t first = 0;
+    std::uint32_t count = 0;
+};
+
+// A D3D12 query heap on Vulkan. The host tracks which queries hold a result. A resolve of a query that
+// was never ended writes zeros instead of waiting on it.
 struct QueryPool {
     VkQueryPool pool = VK_NULL_HANDLE;
     std::uint32_t heap_type = 0;  // d3d12_query_heap
     std::uint32_t count = 0;
     bool precise = false;         // occlusionQueryPrecise: D3D12_QUERY_TYPE_OCCLUSION counts exact samples
     std::vector<bool> ended;
+    std::unordered_map<std::uint32_t, OcclusionResult> occlusion;
 };
 
 struct ReplayFunctions {
@@ -634,6 +655,8 @@ struct ReplayFunctions {
     PFN_vkCmdEndQuery end_query = nullptr;
     PFN_vkCmdWriteTimestamp write_timestamp = nullptr;
     PFN_vkCmdCopyQueryPoolResults copy_query_pool_results = nullptr;
+    std::function<void(VkCommandBuffer, VkQueryPool, std::uint32_t, std::uint32_t, VkBuffer, VkDeviceSize)>
+        sum_occlusion;
     // Resolves available binary-occlusion queries to 64-bit 0/1 values, outside conditional rendering.
     std::function<void(VkCommandBuffer, VkQueryPool, std::uint32_t first, std::uint32_t count,
                        VkBuffer dst, VkDeviceSize offset)> resolve_binary_occlusion;
@@ -675,6 +698,26 @@ enum class ReplayResult {
 
 namespace detail {
 
+struct QueryResolveRun {
+    VkQueryPool pool = VK_NULL_HANDLE;    // null: zero fill for queries that were never ended
+    std::uint32_t first = 0;
+    std::uint32_t count = 0;
+    VkDeviceSize offset = 0;
+    bool sum = false;
+};
+
+struct PreparedQuery {
+    static constexpr std::uint32_t no_segment = UINT32_MAX;
+    std::size_t command = 0;
+    QueryPool* heap = nullptr;
+    bool statistics_active = false;
+    std::uint32_t begin_segment = no_segment;
+    std::uint32_t end_segment = no_segment;
+    std::uint32_t first_result = 0;
+    std::uint32_t result_count = 0;
+    std::vector<QueryResolveRun> resolves;
+};
+
 struct Prepared {
     ResourceBinding binding;
     VkImageSubresourceRange range{};  // the barrier range, or the cleared view (cleared aspects only)
@@ -697,7 +740,6 @@ struct Prepared {
     uav_clear::Element element;                      // unordered-access clears: one element of the view's format
     VkClearColorValue clear_color{};                 // ... the value that writes it into the image
     std::vector<std::array<VkDeviceSize, 2>> fills;  // ... buffer byte ranges, offset and size
-    QueryPool* queries = nullptr;  // query commands: the heap
     VkAccelerationStructureKHR accel_dst = VK_NULL_HANDLE;
     VkAccelerationStructureKHR accel_src = VK_NULL_HANDLE;
 };
@@ -1238,12 +1280,45 @@ class PreparedList {
 public:
     const CommandList* list = nullptr;
     std::vector<detail::Prepared> commands;
-    bool binary_occlusion = false;  // the queue needs its internal resolve resources
+    std::vector<detail::PreparedQuery> queries;
+    VkQueryPool segment_pool = VK_NULL_HANDLE;
+    std::uint32_t segment_base = 0;
+    std::uint32_t segment_count = 0;
+    bool precise_segments = false;
     // Copies, resolves and UAV clears that run as transfers, recorded while a predicate was set. D3D12 skips them
     // when the predicate says so, but Vulkan's conditional rendering does not cover transfer commands, so they run
     // unconditionally (docs/d3d12_vulkan.md section 4.7). Counted so the caller can report it.
     std::size_t unpredicated_copies = 0;
 };
+
+inline ReplayResult plan_occlusion_segments(PreparedList& out) {
+    // Active logical queries cover a contiguous range of physical slots. A Begin or End closes the old
+    // slot and opens a new one if any query remains active. Each shared interval is recorded only once.
+    std::map<std::pair<QueryHeapId, std::uint32_t>, std::uint32_t> active;
+    std::uint32_t current = detail::PreparedQuery::no_segment;
+    for (auto& query : out.queries) {
+        const Command& command = out.list->commands()[query.command];
+        if (std::holds_alternative<ResolveQueries>(command)) continue;
+        const auto range = query_range(command);
+        if (range.type != d3d12_query::occlusion) continue;
+        const auto key = std::pair{range.heap, range.first};
+        query.end_segment = current;
+        if (std::holds_alternative<BeginQuery>(command)) {
+            // A flattened bundle can reuse a slot already active in the parent list.
+            if (!active.emplace(key, out.segment_count).second) return ReplayResult::invalid_query;
+            out.precise_segments |= query.heap->precise;
+        } else {
+            const auto start = active.find(key);
+            if (start == active.end()) return ReplayResult::invalid_query;
+            query.first_result = start->second;
+            query.result_count = out.segment_count - start->second;
+            active.erase(start);
+        }
+        current = active.empty() ? detail::PreparedQuery::no_segment : out.segment_count++;
+        query.begin_segment = current;
+    }
+    return active.empty() ? ReplayResult::success : ReplayResult::invalid_query;
+}
 
 // detail::initialize zero-clears an image piece the tracker holds in UNDEFINED (D3D12 committed resources start
 // zeroed) the first time a command touches it, with vkCmdClearColorImage or vkCmdClearDepthStencilImage. True when
@@ -1302,7 +1377,10 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
     const auto commands = list.commands();
     out.list = &list;
     out.commands.assign(commands.size(), {});
-    out.binary_occlusion = false;
+    out.queries.clear();
+    out.segment_pool = VK_NULL_HANDLE;
+    out.segment_base = out.segment_count = 0;
+    out.precise_segments = false;
     const bool rendering = vk.begin_rendering && vk.end_rendering && vk.clear_attachments && vk.image_view;
     const bool copies = vk.copy_buffer && vk.copy_buffer_to_image && vk.copy_image_to_buffer && vk.copy_image;
     const bool conditional = vk.begin_conditional_rendering && vk.end_conditional_rendering;
@@ -1316,10 +1394,9 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
     out.unpredicated_copies = 0;
     const bool queries = vk.reset_query_pool && vk.begin_query && vk.end_query && vk.write_timestamp &&
                          vk.copy_query_pool_results && vk.fill_buffer && vk.query_pool;
-    // Vulkan allows one active query of each type in a command buffer (VUID-vkCmdBeginQuery-queryPool-01922);
-    // D3D12 lets queries overlap. Overlapping occlusion (either kind) or pipeline-statistics queries need virtual
-    // queries (end the running Vulkan query, start another, sum on resolve); until then such a list is unsupported.
-    bool occlusion_active = false, statistics_active = false;
+    // Vulkan allows one active query per type. Only ordinary occlusion uses virtual segments.
+    std::size_t ordinary_active = 0;
+    bool overlaps = false, binary_active = false, statistics_active = false;
 
     for (std::size_t i = 0; i < commands.size(); ++i) {
         const auto& command = commands[i];
@@ -1532,17 +1609,25 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             // BeginQuery, EndQuery and ResolveQueryData are not among D3D12's predicated calls, and Vulkan's
             // conditional rendering leaves query commands and transfers alone, so a predicate changes nothing here.
             if (!queries) return ReplayResult::unsupported;
-            p.queries = vk.query_pool(range.heap);
-            if (!p.queries) return ReplayResult::unresolved_resource;
-            if (!query_fits_heap(p.queries->heap_type, range.type)) return ReplayResult::invalid_query;
-            if (range.first >= p.queries->count || range.count > p.queries->count - range.first)
+            QueryPool* heap = vk.query_pool(range.heap);
+            if (!heap) return ReplayResult::unresolved_resource;
+            if (!query_fits_heap(heap->heap_type, range.type)) return ReplayResult::invalid_query;
+            if (range.first >= heap->count || range.count > heap->count - range.first)
                 return ReplayResult::invalid_query;
             if (!query_result_size(range.type)) return ReplayResult::unsupported;
             if (range.type != d3d12_query::timestamp && !std::holds_alternative<ResolveQueries>(command)) {
-                bool& active = range.type == d3d12_query::pipeline_statistics ? statistics_active : occlusion_active;
                 const bool begin = std::holds_alternative<BeginQuery>(command);
-                if (begin && active) return ReplayResult::unsupported;
-                active = begin;  // the list pairs every End with its Begin
+                if (range.type == d3d12_query::occlusion) {
+                    if (begin && binary_active) return ReplayResult::unsupported;
+                    if (begin) overlaps |= ordinary_active++ != 0;
+                    else --ordinary_active;
+                } else if (range.type == d3d12_query::binary_occlusion) {
+                    if (begin && (binary_active || ordinary_active)) return ReplayResult::unsupported;
+                    binary_active = begin;
+                } else {
+                    if (begin && statistics_active) return ReplayResult::unsupported;
+                    statistics_active = begin;
+                }
             }
             if (const auto* resolve_queries = std::get_if<ResolveQueries>(&command)) {
                 // The destination is a buffer, as D3D12 requires, large enough for every result.
@@ -1556,9 +1641,9 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                 if (range.type == d3d12_query::binary_occlusion) {
                     // The internal dispatch would otherwise count towards the application's CSInvocations.
                     if (!vk.resolve_binary_occlusion || statistics_active) return ReplayResult::unsupported;
-                    out.binary_occlusion = true;
                 }
             }
+            out.queries.push_back({i, heap, statistics_active});
         } else if (const auto* ind = std::get_if<ExecuteIndirect>(&command)) {
             if (!bind(ind->argument_buffer) || !p.binding.buffer) return ReplayResult::unresolved_resource;
             if (ind->count_buffer) {
@@ -1586,7 +1671,150 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             }
         }
     }
+    if (ordinary_active) return ReplayResult::invalid_query;
+    if (overlaps) {
+        if (!vk.sum_occlusion || out.queries.size() >= detail::PreparedQuery::no_segment)
+            return ReplayResult::unsupported;
+        return plan_occlusion_segments(out);
+    }
     return ReplayResult::success;
+}
+
+// A submission is planned against the currently published query state plus its own earlier lists.
+// Keep every physical pool referenced by the recorded batch alive until that batch completes.
+class QueryReplay {
+public:
+    ReplayResult plan(PreparedList& list, const std::shared_ptr<const OcclusionSegmentPool>& pool = {},
+                      std::uint32_t base = 0, bool can_sum = false) {
+        if (list.segment_count) {
+            if (!pool) return ReplayResult::unsupported;
+            retain(pool);
+            list.segment_pool = pool->pool;
+            list.segment_base = base;
+        }
+        for (auto& query : list.queries) {
+            const Command& command = list.list->commands()[query.command];
+            if (const auto* begin = std::get_if<BeginQuery>(&command)) {
+                pending_[{query.heap, begin->index}] = {};
+            } else if (const auto* end = std::get_if<EndQuery>(&command)) {
+                Value result{true, {}};
+                if (query.result_count) result.occlusion = {pool, base + query.first_result, query.result_count};
+                pending_[{query.heap, end->index}] = std::move(result);
+            } else {
+                const auto& resolve = std::get<ResolveQueries>(command);
+                const bool binary = resolve.type == d3d12_query::binary_occlusion;
+                const std::uint32_t size = query_result_size(resolve.type);
+                const auto offset = list.commands[query.command].binding.buffer_offset + resolve.offset;
+                for (std::uint32_t i = 0; i < resolve.count; ++i) {
+                    const auto index = resolve.first + i;
+                    const auto value = lookup(*query.heap, index);
+                    needs_binary |= binary && value.ended;
+                    detail::QueryResolveRun run{value.ended ? query.heap->pool : VK_NULL_HANDLE,
+                                                index, 1, offset + VkDeviceSize(i) * size};
+                    if (value.occlusion.segments) {
+                        if (resolve.type != d3d12_query::occlusion) return ReplayResult::invalid_query;
+                        // A helper dispatch would otherwise change the application's pipeline statistics.
+                        const auto& saved = value.occlusion;
+                        run = {saved.segments->pool, saved.first, saved.count, run.offset, saved.count > 1};
+                        if (!can_sum || (run.sum && query.statistics_active)) return ReplayResult::unsupported;
+                        needs_sum |= run.sum;
+                        retain(saved.segments);
+                    }
+                    if (!query.resolves.empty() && !run.sum && run.count == 1) {
+                        auto& last = query.resolves.back();
+                        if (!last.sum && last.pool == run.pool && last.first + last.count == run.first) {
+                            ++last.count;
+                            continue;
+                        }
+                    }
+                    query.resolves.push_back(run);
+                }
+            }
+        }
+        return ReplayResult::success;
+    }
+
+    void commit() {
+        for (auto& [key, result] : pending_) {
+            const auto [heap, index] = key;
+            heap->ended[index] = result.ended;
+            if (result.occlusion.segments) heap->occlusion[index] = std::move(result.occlusion);
+            else heap->occlusion.erase(index);
+        }
+    }
+
+    bool needs_sum = false;
+    bool needs_binary = false;
+    std::vector<std::shared_ptr<const OcclusionSegmentPool>> retained;
+
+private:
+    struct Value {
+        bool ended = false;
+        OcclusionResult occlusion;
+    };
+
+    Value lookup(QueryPool& heap, std::uint32_t index) const {
+        if (const auto it = pending_.find({&heap, index}); it != pending_.end()) return it->second;
+        if (const auto it = heap.occlusion.find(index); it != heap.occlusion.end()) return {true, it->second};
+        return {heap.ended[index], {}};
+    }
+
+    void retain(const std::shared_ptr<const OcclusionSegmentPool>& pool) {
+        if (std::find(retained.begin(), retained.end(), pool) == retained.end()) retained.push_back(pool);
+    }
+
+    std::map<std::pair<QueryPool*, std::uint32_t>, Value> pending_;
+};
+
+inline void emit_query(const PreparedList& list, const detail::PreparedQuery& query, VkCommandBuffer cb,
+                       const ReplayFunctions& vk, const VkConditionalRenderingBeginInfoEXT& predicate) {
+    constexpr auto none = detail::PreparedQuery::no_segment;
+    if (query.end_segment != none || query.begin_segment != none) {
+        if (query.end_segment != none) vk.end_query(cb, list.segment_pool, list.segment_base + query.end_segment);
+        if (query.begin_segment != none) {
+            const auto index = list.segment_base + query.begin_segment;
+            vk.reset_query_pool(cb, list.segment_pool, index, 1);
+            vk.begin_query(cb, list.segment_pool, index, list.precise_segments ? VK_QUERY_CONTROL_PRECISE_BIT : 0);
+        }
+        return;
+    }
+    const auto& command = list.list->commands()[query.command];
+    const QueryPool& heap = *query.heap;
+    if (const auto* begin = std::get_if<BeginQuery>(&command)) {
+        vk.reset_query_pool(cb, heap.pool, begin->index, 1);
+        const bool precise = begin->type == d3d12_query::occlusion && heap.precise;
+        vk.begin_query(cb, heap.pool, begin->index, precise ? VK_QUERY_CONTROL_PRECISE_BIT : 0);
+    } else if (const auto* end = std::get_if<EndQuery>(&command)) {
+        if (end->type == d3d12_query::timestamp) {
+            vk.reset_query_pool(cb, heap.pool, end->index, 1);
+            vk.write_timestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, heap.pool, end->index);
+        } else {
+            vk.end_query(cb, heap.pool, end->index);
+        }
+    } else {
+        const auto& resolve = std::get<ResolveQueries>(command);
+        const bool binary = resolve.type == d3d12_query::binary_occlusion;
+        const auto size = query_result_size(resolve.type);
+        const auto dst = list.commands[query.command].binding.buffer;
+        bool suspended = false;
+        for (const auto& run : query.resolves) {
+            if (!run.pool) {
+                vk.fill_buffer(cb, dst, run.offset, VkDeviceSize(run.count) * size, 0);
+            } else if (run.sum || binary) {
+                // ResolveQueryData is unconditional even when the helper uses a dispatch.
+                if (predicate.buffer && !suspended) {
+                    vk.end_conditional_rendering(cb);
+                    suspended = true;
+                }
+                const auto& resolve_occlusion = run.sum ? vk.sum_occlusion : vk.resolve_binary_occlusion;
+                resolve_occlusion(cb, run.pool, run.first, run.count, dst, run.offset);
+            } else {
+                vk.copy_query_pool_results(cb, run.pool, run.first, run.count, dst, run.offset, size,
+                                           VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+            }
+        }
+        if (suspended) vk.begin_conditional_rendering(cb, &predicate);
+    }
 }
 
 // Ends the debug labels a submission left open, so every command buffer is balanced as Vulkan requires.
@@ -1609,6 +1837,7 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
     // The extension is enabled: barriers into and out of PREDICATION also cover conditional rendering's read.
     const bool predicates = vk.begin_conditional_rendering != nullptr;
     VkConditionalRenderingBeginInfoEXT predicate{VK_STRUCTURE_TYPE_CONDITIONAL_RENDERING_BEGIN_INFO_EXT};
+    std::size_t next_query = 0;
     // A dispatch honours conditional rendering and a copy does not (the layer runs copies unpredicated), so the
     // conversion around a copy must run whatever the predicate says: end it for the dispatch and begin it again.
     const auto run_depth24 = [&](const Depth24Job& job) {
@@ -1620,6 +1849,10 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
     for (std::size_t i = 0; i < commands.size(); ++i) {
         const auto& command = commands[i];
         const auto& p = prepared.commands[i];
+        if (next_query < prepared.queries.size() && prepared.queries[next_query].command == i) {
+            emit_query(prepared, prepared.queries[next_query++], command_buffer, vk, predicate);
+            continue;
+        }
         if (const auto* predication = std::get_if<Predication>(&command)) {
             // Conditional rendering cannot nest, so a new predicate ends the previous one first.
             if (predicate.buffer) vk.end_conditional_rendering(command_buffer);
@@ -1980,49 +2213,6 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                                    VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
                                    VK_PIPELINE_STAGE_TRANSFER_BIT);
             vk.copy_buffer(command_buffer, p.source.buffer, p.binding.buffer, 1, p.buffer_copies.data());
-        } else if (const auto* begin = std::get_if<BeginQuery>(&command)) {
-            // D3D12 queries need no reset; a Vulkan query is reset before every use. Nothing here runs inside a
-            // render pass, where a reset is not allowed: a draw path that opens one around queries must reset
-            // them before it.
-            QueryPool& heap = *p.queries;
-            vk.reset_query_pool(command_buffer, heap.pool, begin->index, 1);
-            heap.ended[begin->index] = false;
-            const bool precise = begin->type == d3d12_query::occlusion && heap.precise;
-            vk.begin_query(command_buffer, heap.pool, begin->index, precise ? VK_QUERY_CONTROL_PRECISE_BIT : 0);
-        } else if (const auto* end = std::get_if<EndQuery>(&command)) {
-            QueryPool& heap = *p.queries;
-            if (end->type == d3d12_query::timestamp) {
-                vk.reset_query_pool(command_buffer, heap.pool, end->index, 1);
-                vk.write_timestamp(command_buffer, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, heap.pool, end->index);
-            } else {
-                vk.end_query(command_buffer, heap.pool, end->index);
-            }
-            heap.ended[end->index] = true;
-        } else if (const auto* resolve = std::get_if<ResolveQueries>(&command)) {
-            // D3D12 leaves a query that was never ended undefined. Write zeros instead of waiting forever.
-            const QueryPool& heap = *p.queries;
-            const std::uint32_t size = query_result_size(resolve->type);
-            const bool binary = resolve->type == d3d12_query::binary_occlusion;
-            // ResolveQueryData is unconditional in D3D12, including our internal dispatch.
-            if (binary && predicate.buffer) vk.end_conditional_rendering(command_buffer);
-            std::uint32_t index = resolve->first;
-            const std::uint32_t last = resolve->first + resolve->count;
-            while (index < last) {
-                const bool ended = heap.ended[index];
-                std::uint32_t run = 1;
-                while (index + run < last && heap.ended[index + run] == ended) ++run;
-                const VkDeviceSize offset = p.binding.buffer_offset + resolve->offset +
-                                            VkDeviceSize(index - resolve->first) * size;
-                if (!ended)
-                    vk.fill_buffer(command_buffer, p.binding.buffer, offset, VkDeviceSize(run) * size, 0);
-                else if (binary)
-                    vk.resolve_binary_occlusion(command_buffer, heap.pool, index, run, p.binding.buffer, offset);
-                else
-                    vk.copy_query_pool_results(command_buffer, heap.pool, index, run, p.binding.buffer, offset, size,
-                                               VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
-                index += run;
-            }
-            if (binary && predicate.buffer) vk.begin_conditional_rendering(command_buffer, &predicate);
         } else if (const auto* ind = std::get_if<ExecuteIndirect>(&command)) {
             if (ind->count_buffer) {
                 if (ind->kind == IndirectKind::draw) {
@@ -2111,7 +2301,10 @@ ReplayResult replay(const CommandList& list, VkCommandBuffer command_buffer, Res
     PreparedList prepared;
     if (const auto result = prepare(list, resolve, vk, prepared); result != ReplayResult::success) return result;
     if (tracker && zero_clear_unavailable(prepared, vk, *tracker)) return ReplayResult::unsupported;
+    QueryReplay queries;
+    if (const auto result = queries.plan(prepared); result != ReplayResult::success) return result;
     emit(prepared, command_buffer, vk, tracker);
+    queries.commit();  // the caller owns submission of the legacy command buffer
     return ReplayResult::success;
 }
 
