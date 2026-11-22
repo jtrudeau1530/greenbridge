@@ -50,6 +50,8 @@ def main():
         ]
     else:
         expected = [
+            "ID3D12GraphicsCommandList::SetPipelineState called",
+            "ID3D12GraphicsCommandList::SetGraphicsRootSignature called",
             "ID3D12GraphicsCommandList::SetMarker called",
             "ID3D12GraphicsCommandList3::SetProtectedResourceSession unsupported",
             "ID3D12GraphicsCommandList3::SetProtectedResourceSession unsupported",
