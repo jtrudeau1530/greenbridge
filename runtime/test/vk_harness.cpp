@@ -11,6 +11,10 @@
 //                                its address and passes the heap base, so a V# in VKH_SGPRS can point into it.
 //   VKH_HEAP_DUMP=<file>         after the draw, writes the 64 KiB heap (needs VKH_HEAP, which may be empty-valued as
 //                                "0=0"), so a test can read what the pixel shader stored or atomically added.
+//   VKH_DRAW_MESH=<file> + VKH_VERTEX_LAYOUT=0:3f,1:2f
+//                                draws an indexed mesh instead of the 3-vertex triangle. The file is u32
+//                                vertex_count, u32 index_count, vertex_count*stride bytes, index_count u32
+//                                indices; the layout lists location:float-components, one item per attribute.
 //   VKH_SUBGROUP_SIZE=32|64      requires that subgroup size of the fragment shader (or of the compute or geometry
 //                                stage under test); stderr says "fragment subgroup size: N" when it took effect and
 //                                "... not available" when the device cannot require it (exit code stays 0).
@@ -82,6 +86,42 @@ static bool parse_heap(const char* s, std::vector<std::pair<uint32_t, uint32_t>>
     return true;
 }
 
+// VKH_VERTEX_LAYOUT=0:3f,1:2f: one attribute per item, float components only. Location 0 is the first float3.
+struct VertexAttr {
+    uint32_t location, components, offset;
+    VkFormat format;
+};
+
+static bool parse_vertex_layout(const char* s, VertexAttr* attrs, uint32_t& count, uint32_t& stride) {
+    count = 0; stride = 0;
+    while (*s) {
+        uint32_t loc, comps;
+        if (count == 8 || !parse_u32(s, loc) || *s++ != ':' || !parse_u32(s, comps) ||
+            comps < 1 || comps > 4 || *s++ != 'f' || !next_item(s))
+            return false;
+        static const VkFormat formats[4] = {VK_FORMAT_R32_SFLOAT, VK_FORMAT_R32G32_SFLOAT,
+                                            VK_FORMAT_R32G32B32_SFLOAT, VK_FORMAT_R32G32B32A32_SFLOAT};
+        attrs[count++] = {loc, comps, stride, formats[comps - 1]};
+        stride += comps * 4;
+    }
+    return count > 0;
+}
+
+// VKH_DRAW_MESH file: u32 vertex_count, u32 index_count, vertex_count*stride bytes, index_count u32 indices.
+static bool read_mesh(const char* path, uint32_t stride, std::vector<uint8_t>& vertices,
+                      std::vector<uint32_t>& indices) {
+    std::ifstream f(path, std::ios::binary);
+    uint32_t vcount = 0, icount = 0;
+    f.read(reinterpret_cast<char*>(&vcount), 4);
+    f.read(reinterpret_cast<char*>(&icount), 4);
+    if (!f || vcount == 0 || icount == 0 || vcount > 10000000u || icount > 30000000u) return false;
+    vertices.resize(size_t(vcount) * stride);
+    indices.resize(icount);
+    f.read(reinterpret_cast<char*>(vertices.data()), std::streamsize(vertices.size()));
+    f.read(reinterpret_cast<char*>(indices.data()), std::streamsize(indices.size() * 4));
+    return bool(f);
+}
+
 int main(int argc, char** argv) {
     if (argc < 4) {
         std::fprintf(stderr, "usage: vk_harness vs.spv fs.spv out.raw [w h [clip-test-s0 clip-test-s1]]\n"
@@ -113,6 +153,17 @@ int main(int argc, char** argv) {
     }
     // Push constants: s0..s31, heap base (32..33), code base (34..35), --mesh-compute output address (36..37).
     uint32_t pc[38] = {};
+    const char* draw_mesh_path = std::getenv("VKH_DRAW_MESH");
+    if (draw_mesh_path && !*draw_mesh_path) draw_mesh_path = nullptr;
+    VertexAttr vertex_attrs[8];
+    uint32_t vertex_attr_count = 0, vertex_stride = 0;
+    if (draw_mesh_path) {
+        const char* layout = std::getenv("VKH_VERTEX_LAYOUT");
+        if (!layout || !parse_vertex_layout(layout, vertex_attrs, vertex_attr_count, vertex_stride)) {
+            std::fprintf(stderr, "VKH_VERTEX_LAYOUT: expected locations like 0:3f,1:2f with VKH_DRAW_MESH\n");
+            return 2;
+        }
+    }
     const char* sgprs_env = std::getenv("VKH_SGPRS");
     if (sgprs_env && !parse_sgprs(sgprs_env, pc)) {
         std::fprintf(stderr, "VKH_SGPRS: expected up to 32 comma-separated words, got \"%s\"\n", sgprs_env);
@@ -338,6 +389,7 @@ int main(int argc, char** argv) {
     LOADD(vkCreateShaderModule); LOADD(vkCreatePipelineLayout); LOADD(vkCreateGraphicsPipelines);
     LOADD(vkCreateCommandPool); LOADD(vkAllocateCommandBuffers); LOADD(vkBeginCommandBuffer);
     LOADD(vkCmdBeginRenderPass); LOADD(vkCmdBindPipeline); LOADD(vkCmdDraw); LOADD(vkCmdEndRenderPass);
+    LOADD(vkCmdBindVertexBuffers); LOADD(vkCmdBindIndexBuffer); LOADD(vkCmdDrawIndexed);
     LOADD(vkCmdCopyImageToBuffer); LOADD(vkEndCommandBuffer); LOADD(vkQueueSubmit); LOADD(vkQueueWaitIdle);
     LOADD(vkCreateBuffer); LOADD(vkGetBufferMemoryRequirements); LOADD(vkBindBufferMemory); LOADD(vkMapMemory);
     VkQueue q; vkGetDeviceQueue(dev, qi, 0, &q);
@@ -448,11 +500,24 @@ int main(int argc, char** argv) {
             stages[2].pNext = &reqSg;
         else if (!mesh && !gs_tested && (sgProps.requiredSubgroupSizeStages & VK_SHADER_STAGE_FRAGMENT_BIT))
             stages[1].pNext = &reqSg;
-        if (stages[1].pNext == &reqSg) std::fprintf(stderr, "fragment subgroup size: %u\n", req_sg);
+        // A device with one subgroup size runs every stage at it, required or not (AMD GCN: 64, with only COMPUTE
+        // in requiredSubgroupSizeStages), so the fragment stage of a plain draw already has the size asked for.
+        const bool fixed = !mesh && !gs_tested && sgProps.minSubgroupSize == sgProps.maxSubgroupSize;
+        if (stages[1].pNext == &reqSg || fixed) std::fprintf(stderr, "fragment subgroup size: %u\n", req_sg);
     } else if (req_sg > 0) {
         std::fprintf(stderr, "fragment subgroup size: %u not available\n", req_sg);
     }
     VkPipelineVertexInputStateCreateInfo vin{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+    VkVertexInputBindingDescription vbind{0, vertex_stride, VK_VERTEX_INPUT_RATE_VERTEX};
+    VkVertexInputAttributeDescription vattr[8]{};
+    if (draw_mesh_path) {
+        for (uint32_t i = 0; i < vertex_attr_count; ++i)
+            vattr[i] = {vertex_attrs[i].location, 0, vertex_attrs[i].format, vertex_attrs[i].offset};
+        vin.vertexBindingDescriptionCount = 1;
+        vin.pVertexBindingDescriptions = &vbind;
+        vin.vertexAttributeDescriptionCount = vertex_attr_count;
+        vin.pVertexAttributeDescriptions = vattr;
+    }
     VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
     ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
     VkViewport vp{0, 0, float(W), float(H), 0, 1}; VkRect2D sc{{0, 0}, {W, H}};
@@ -512,6 +577,39 @@ int main(int argc, char** argv) {
     bai.memoryTypeIndex = memtype(br.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
     VkDeviceMemory bmem; CHECK(vkAllocateMemory(dev, &bai, nullptr, &bmem));
     CHECK(vkBindBufferMemory(dev, buf, bmem, 0));
+    std::vector<uint8_t> mesh_vertices;
+    std::vector<uint32_t> mesh_indices;
+    VkBuffer vbo = VK_NULL_HANDLE, ibo = VK_NULL_HANDLE;
+    VkDeviceMemory vbo_mem = VK_NULL_HANDLE, ibo_mem = VK_NULL_HANDLE;
+    if (draw_mesh_path) {
+        if (!read_mesh(draw_mesh_path, vertex_stride, mesh_vertices, mesh_indices)) {
+            std::fprintf(stderr, "VKH_DRAW_MESH: cannot read %s\n", draw_mesh_path);
+            return 1;
+        }
+        auto host_buffer = [&](VkDeviceSize bytes, VkBufferUsageFlags usage, VkBuffer& b,
+                               VkDeviceMemory& m, void*& p) -> bool {
+            VkBufferCreateInfo ci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+            ci.size = bytes; ci.usage = usage;
+            if (vkCreateBuffer(dev, &ci, nullptr, &b) != VK_SUCCESS) return false;
+            VkMemoryRequirements rq; vkGetBufferMemoryRequirements(dev, b, &rq);
+            VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+            ai.allocationSize = rq.size;
+            ai.memoryTypeIndex = memtype(rq.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                                              VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+            return vkAllocateMemory(dev, &ai, nullptr, &m) == VK_SUCCESS &&
+                   vkBindBufferMemory(dev, b, m, 0) == VK_SUCCESS &&
+                   vkMapMemory(dev, m, 0, bytes, 0, &p) == VK_SUCCESS;
+        };
+        void* vmap = nullptr;
+        void* imap = nullptr;
+        if (!host_buffer(VkDeviceSize(mesh_vertices.size()), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, vbo, vbo_mem, vmap) ||
+            !host_buffer(VkDeviceSize(mesh_indices.size() * 4), VK_BUFFER_USAGE_INDEX_BUFFER_BIT, ibo, ibo_mem, imap)) {
+            std::fprintf(stderr, "VKH_DRAW_MESH: cannot create the vertex or index buffer\n");
+            return 1;
+        }
+        std::memcpy(vmap, mesh_vertices.data(), mesh_vertices.size());
+        std::memcpy(imap, mesh_indices.data(), mesh_indices.size() * 4);
+    }
     void* heap_map = nullptr;
     if (heap_env) {
         LOADD(vkGetBufferDeviceAddress);
@@ -602,7 +700,13 @@ int main(int argc, char** argv) {
     push(cmd, pl, pcs, 0, pc_bytes, pc);
     // VKH_VERTICES=<n>: draw n vertices instead of one triangle, so a vertex shader fills whole waves (TEST-251).
     const char* vertices_env = std::getenv("VKH_VERTICES");
-    if (const unsigned vertices = vertices_env ? unsigned(std::strtoul(vertices_env, nullptr, 10)) : 0; vertices && !mesh)
+    if (draw_mesh_path) {
+        VkDeviceSize offset = 0;
+        vkCmdBindVertexBuffers(cmd, 0, 1, &vbo, &offset);
+        vkCmdBindIndexBuffer(cmd, ibo, 0, VK_INDEX_TYPE_UINT32);
+        vkCmdDrawIndexed(cmd, uint32_t(mesh_indices.size()), 1, 0, 0, 0);
+    } else if (const unsigned vertices = vertices_env ? unsigned(std::strtoul(vertices_env, nullptr, 10)) : 0;
+               vertices && !mesh)
         vkCmdDraw(cmd, vertices, 1, 0, 0);
     else if (mesh_compute)
         vkCmdDraw(cmd, uint32_t(mesh_groups * mesh_prims * 3), 1, 0, 0);

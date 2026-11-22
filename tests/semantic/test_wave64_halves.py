@@ -59,6 +59,7 @@ def meta_of(name, lines):
 
 
 PRO = ["s_mov_b64 s[10:11], exec"]           # the program is wave64 (a 64-bit op on EXEC)
+LANE_ID = ["v_mbcnt_lo_u32_b32 v10, -1, 0", "v_mbcnt_hi_u32_b32 v10, -1, v10"]   # the lane id, 0..63 in the wave
 EPI_VS = ["v_mov_b32_e32 v5, 0", "exp pos0 v5, v5, v5, v5 done", "exp param0 v6, v7, v5, v5", "s_endpgm"]
 EPI_PS = ["exp mrt0 v6, v7, v5, v5 done vm", "s_endpgm"]
 
@@ -126,6 +127,18 @@ class Classification(unittest.TestCase):
     def test_a_bpermute_swizzle_in_half(self):
         self.tier("ps_a_bperm", ps(["v_lshlrev_b32_e32 v4, 2, v0", "ds_bpermute_b32 v6, v4, v0"]), "A", [], [])
 
+    def test_a_bpermute_lane_id_address(self):
+        # the lane id is 0..63 in the wave and 0..31 in a half: equal modulo 32 lanes, which is all a wave64
+        # ds_bpermute uses (address bits 2..6, per half), so xor/and/or/add on it and a shift by 2 stay exact
+        self.tier("ps_a_bperm_id", ps([*LANE_ID, "v_xor_b32_e32 v11, 1, v10", "v_lshlrev_b32_e32 v11, 2, v11",
+                                       "ds_bpermute_b32 v6, v11, v0", "v_and_b32_e32 v12, -4, v10",
+                                       "v_or_b32_e32 v12, 2, v12", "v_lshl_add_u32 v12, v12, 2, 0",
+                                       "ds_bpermute_b32 v7, v12, v0", "s_waitcnt lgkmcnt(0)"]), "A", [], [])
+
+    def test_a_permute_lane_id_address(self):
+        self.tier("ps_a_perm_id", ps([*LANE_ID, "v_add_nc_u32_e32 v11, 5, v10", "v_lshlrev_b32_e32 v11, 2, v11",
+                                      "ds_permute_b32 v6, v11, v0", "s_waitcnt lgkmcnt(0)"]), "A", [], [])
+
     # -- tier B
     def test_b_waterfall(self):
         self.tier("ps_b_wf", ps([
@@ -167,6 +180,31 @@ class Classification(unittest.TestCase):
 
     def test_c_lane_id_exported(self):
         self.tier("ps_c_id", ps(["v_mbcnt_lo_u32_b32 v6, -1, 0", "v_mbcnt_hi_u32_b32 v6, -1, v6"]), "C", ["lane-id"])
+
+    def test_c_bpermute_lane_id_address_near_misses(self):
+        # a shift by 1: address bit 7 is not reached, lane bit 5 lands in bit 6, which the permute uses
+        self.tier("ps_c_bperm_shl1", ps([*LANE_ID, "v_lshlrev_b32_e32 v11, 1, v10", "ds_bpermute_b32 v6, v11, v0",
+                                         "s_waitcnt lgkmcnt(0)"]), "C", ["lane-id"])
+        # the low count alone is 32 for every upper-half lane of the wave
+        self.tier("ps_c_bperm_lo", ps(["v_mbcnt_lo_u32_b32 v10, -1, 0", "v_lshlrev_b32_e32 v11, 2, v10",
+                                       "ds_bpermute_b32 v6, v11, v0", "s_waitcnt lgkmcnt(0)"]), "C", ["lane-id"])
+        # a right shift moves lane bit 5 down into the bits the permute uses
+        self.tier("ps_c_bperm_shr", ps([*LANE_ID, "v_lshrrev_b32_e32 v11, 1, v10", "v_lshlrev_b32_e32 v11, 3, v11",
+                                        "ds_bpermute_b32 v6, v11, v0", "s_waitcnt lgkmcnt(0)"]), "C", ["lane-id"])
+        # combined with a lane mask: the mask is not the same in the wave and in a half
+        self.tier("ps_c_bperm_mask", ps([*LANE_ID, "v_and_b32_e32 v11, s10, v10", "v_lshlrev_b32_e32 v11, 2, v11",
+                                         "ds_bpermute_b32 v6, v11, v0", "s_waitcnt lgkmcnt(0)"]), "C")
+        # SDWA selects and integer clamp change the value: a byte of id << 7, a saturating id - 32
+        self.tier("ps_c_bperm_sdwa", ps([*LANE_ID, "v_lshlrev_b32_e32 v11, 7, v10",
+                                         "v_mov_b32_sdwa v12, v11 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:BYTE_1",
+                                         "v_lshlrev_b32_e32 v12, 2, v12", "ds_bpermute_b32 v6, v12, v0",
+                                         "s_waitcnt lgkmcnt(0)"]), "C", ["lane-id"])
+        self.tier("ps_c_bperm_clamp", ps([*LANE_ID, "v_add_nc_u32_e64 v11, v10, -32 clamp",
+                                          "v_lshlrev_b32_e32 v11, 2, v11", "ds_bpermute_b32 v6, v11, v0",
+                                          "s_waitcnt lgkmcnt(0)"]), "C", ["lane-id"])
+        # the lane id still taints the data it permutes, and the lane id itself
+        self.tier("ps_c_bperm_data", ps([*LANE_ID, "v_lshlrev_b32_e32 v11, 2, v10", "ds_bpermute_b32 v6, v11, v10",
+                                         "s_waitcnt lgkmcnt(0)"]), "C", ["lane-id"])
 
     def test_c_first_lane_index(self):
         self.tier("ps_c_ff1", ps(["v_cmp_eq_u32_e32 vcc, 1, v0", "s_ff1_i32_b64 s6, vcc", "v_mov_b32_e32 v6, s6"]),
@@ -274,6 +312,36 @@ class Execution(unittest.TestCase):
         self.assertEqual(tier, "B")
         self.assertEqual(whole, halves)
         self.assertEqual([w[0] for w in whole], [17 * (k & 7) + k for k in range(64)])
+
+    def test_a_bpermute_lane_id_address_invariant(self):
+        tier, whole, halves = self.run_both("vs_a_bperm_id", vs([
+            *LANE_ID, "v_xor_b32_e32 v11, 1, v10", "v_lshlrev_b32_e32 v11, 2, v11", "ds_bpermute_b32 v6, v11, v0",
+            "s_waitcnt lgkmcnt(0)"]))
+        self.assertEqual(tier, "A")
+        self.assertEqual(whole, halves)
+        self.assertEqual([w[0] for w in whole], [k ^ 1 for k in range(64)])
+
+    def test_a_permlane_swizzle_invariant(self):
+        # vertex k is lane k of the wave (and lane k % 32 of its half): every read stays in the lane's half
+        tier, whole, halves = self.run_both("vs_a_perm", vs([
+            "s_mov_b32 s20, 0x67452301", "s_mov_b32 s21, 0xefcdab89", "v_permlane16_b32 v6, v0, s20, s21",
+            "s_mov_b32 s22, 0x76543210", "s_mov_b32 s23, 0xfedcba98", "v_permlanex16_b32 v7, v0, s22, s23"]))
+        self.assertEqual(tier, "A")
+        self.assertEqual(whole, halves)
+        self.assertEqual([w[:2] for w in whole], [(k ^ 1, k ^ 16) for k in range(64)])
+        tier, whole, halves = self.run_both("vs_a_swz", vs([
+            "ds_swizzle_b32 v6, v0 offset:swizzle(QUAD_PERM,3,2,1,0)", "ds_swizzle_b32 v7, v0 offset:swizzle(SWAP,16)",
+            "s_waitcnt lgkmcnt(0)"]))
+        self.assertEqual(tier, "A")
+        self.assertEqual(whole, halves)
+        self.assertEqual([w[:2] for w in whole], [(k ^ 3, k ^ 16) for k in range(64)])
+
+    def test_c_bpermute_shift_by_one_differs(self):
+        # the negative control of the rule: lane bit 5 reaches an address bit the permute uses
+        tier, whole, halves = self.run_both("vs_c_bperm_shl1", vs([
+            *LANE_ID, "v_lshlrev_b32_e32 v11, 1, v10", "ds_bpermute_b32 v6, v11, v0", "s_waitcnt lgkmcnt(0)"]))
+        self.assertEqual(tier, "C")
+        self.assertNotEqual([w[0] for w in whole], [w[0] for w in halves])
 
     def test_b_readlane_of_uniform_value_at_lane_40(self):
         # lane 40 does not exist in a 32-lane wave: without the rewrite the shuffle reads a lane that is not running
@@ -538,6 +606,37 @@ class Refusal(unittest.TestCase):
             self.assertIsNone(rdna2spirv.translate.last_gen.w64g)
         finally:
             rdna2spirv.WAVE64_GRAPHICS = old
+
+
+class GeometryRing(unittest.TestCase):
+    """TEST-251: a legacy GS's LDS write is an output slot from its offset alone (rdna2spirv.gs_ds drops the VGPR
+    address, the lane's GSVS area), so a lane id that only forms that address is no partition dependence; the data
+    written, and a lane id in a memory store's address, still are. GPU twins: gs_w64_a_ring, gs_w64_c_lane_id."""
+    PRO = ["s_bfe_i32 s0, s3, 0x80008", "s_bfm_b64 exec, s0, 0", "s_cmp_eq_u32 s0, 64", "s_cselect_b64 exec, -1, exec",
+           "v_mbcnt_lo_u32_b32 v13, -1, 0", "v_mbcnt_hi_u32_b32 v13, -1, v13"]
+    EPI = ["s_sendmsg sendmsg(MSG_GS, GS_OP_EMIT, 0)", "s_sendmsg sendmsg(MSG_GS, GS_OP_CUT, 0)",
+           "s_sendmsg sendmsg(MSG_GS_DONE, GS_OP_NOP)", "s_endpgm"]
+
+    def tier(self, body):
+        sys.path.insert(0, os.path.join(HERE, "..", "..", "runtime", "test", "shaders"))
+        import build                                       # gs_container: gs_tri's ISG1/OSG1
+        name = "gs_w64_ring_test"
+        translate_listing(name, listing(name, self.PRO + body + self.EPI), build.gs_container())
+        w = rdna2spirv.translate.last_gen.w64g
+        return w["tier"], w["reasons"]
+
+    def test_lane_id_in_the_ring_address_is_tier_a(self):
+        self.assertEqual(self.tier(["v_mul_u32_u24_e32 v12, 0x60, v13", "v_mov_b32_e32 v14, 0",
+                                    "ds_write2_b32 v12, v14, v14 offset0:0 offset1:1"]), ("A", []))
+
+    def test_lane_id_written_to_the_ring_is_tier_c(self):
+        self.assertEqual(self.tier(["v_mov_b32_e32 v12, 0", "ds_write2_b32 v12, v13, v13 offset0:0 offset1:1"]),
+                         ("C", ["lane-id"]))
+
+    def test_lane_id_in_a_memory_store_address_is_tier_c(self):
+        self.assertEqual(self.tier(["v_mov_b32_e32 v14, 0", "v_lshlrev_b32_e32 v12, 2, v13",
+                                    "buffer_store_dword v14, v12, s[4:7], 0 offen",
+                                    "ds_write2_b32 v14, v14, v14 offset0:0 offset1:1"]), ("C", ["lane-id"]))
 
 
 if __name__ == "__main__":

@@ -301,6 +301,24 @@ class InstancedBuildTest(unittest.TestCase):
         gltf, _ = read_chunk(out, doc["chunks"][0]["id"])
         self.assertEqual((len(gltf["images"]), len(gltf["meshes"])), (1, 1))
 
+    def test_texture_cache_respects_each_build_size(self) -> None:
+        assets = os.path.join(self.tmp, "tex_assets")
+        twb._write_param_fixture(assets, twb.PARAM_CASES["albedo-first"])
+        ents = os.path.join(self.tmp, "tex.jsonl")
+        twp.write_entities(ents, [twp.entity("tri", (10, 10, 0))])
+
+        for limit, expected in ((1, 1), (0, 4), (2, 2)):
+            with self.subTest(limit=limit):
+                out = os.path.join(self.tmp, f"world_{limit}")
+                doc = world_build.build_world(assets, out, placements=ents, jobs=1, max_tex_size=limit)
+                gltf, bin_data = read_chunk(out, doc["chunks"][0]["id"])
+                (image,) = gltf["images"]
+                view = gltf["bufferViews"][image["bufferView"]]
+                start = view.get("byteOffset", 0)
+                width, height, rgba = twb.parse_and_validate_png(bin_data[start:start + view["byteLength"]])
+                self.assertEqual((width, height), (expected, expected))
+                self.assertEqual(tuple(rgba[:4]), tuple(twb.ALBEDO_RGBA))
+
     def test_cli_instancing_option(self):
         ents = os.path.join(self.tmp, "cli.jsonl")
         twp.write_entities(ents, [twp.entity("test_box", (10, 10, 0))])
@@ -370,6 +388,28 @@ class LodSetsTest(unittest.TestCase):
             assets = twp.write_assets(tmp)
             with self.assertRaisesRegex(ValueError, "lod-sets needs --placements"):
                 world_build.build_world(assets, os.path.join(tmp, "w"), lod_sets=True)
+
+    def test_cli_rejects_unnamed_lod_levels_with_lod_sets(self):
+        import contextlib
+        import io
+        with tempfile.TemporaryDirectory() as tmp:
+            assets = twp.write_assets(tmp)
+            ents = os.path.join(tmp, "e.jsonl")
+            twp.write_entities(ents, [self.lod_row((10, 10, 0), level) for level in (7, 255)])
+            out = os.path.join(tmp, "w")
+            for level in (7, 255):
+                with self.subTest(level=level), contextlib.redirect_stderr(io.StringIO()) as stderr:
+                    result = world_build.main([assets, "--out", out, "--no-textures", "--placements", ents,
+                                               "--lod-sets", "--lod-levels", f"0,{level}"])
+                    self.assertEqual(result, 1)
+                    self.assertIn(f"--lod-sets does not recognize lodLevel {level}", stderr.getvalue())
+                    self.assertFalse(os.path.exists(out))
+
+    def test_unnamed_lod_levels_work_without_lod_sets(self):
+        rows = [self.lod_row((10, 10, 0), level) for level in (7, 255)]
+        doc, _ = self.build(rows, lod_levels=(7, 255))
+        self.assertEqual(doc["stats"]["placements"]["placed"], 2)
+        self.assertNotIn("lod_bands", doc)
 
     def test_cli_places_every_level_with_lod_sets(self):
         import contextlib

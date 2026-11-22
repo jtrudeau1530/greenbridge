@@ -12,8 +12,27 @@ are offset-based (`recovered/...`), not the original paths.
 - The data area: zlib streams, Bink 2 video (`KB2[a-z]`) in `movies.rpf`, and raw AWC banks in `audio.rpf`.
 - From the existing survey in [docs/design.md](design.md): most archives are 93-99% plain zlib
   (`levels.rpf` 98.3%, about 1.1M files); `audio.rpf` is 99.9% raw AWC, not zlib; about half of
-  `story000.rpf` and `shared_minigame000.rpf` is non-zlib. Unread bytes are recorded as a range, never
-  guessed.
+  `story000.rpf` and `shared_minigame000.rpf` is non-zlib. Unread bytes are recorded as ranges (the `unread`
+  list in `rpf9_carve.py`'s `index.json`), never guessed.
+
+## Stream roles
+
+In the measured carve indexes, a resource's system prefix can be separated from its graphics pages without
+decoding the resource: the prefix ends at the first stream whose inflated size is a multiple of `0x10000`, plus at
+most one following non-multiple stream (a spill reached by a `0x5…` pointer). This reproduces the first
+`42 40 00 00` graphics page on all 36,911 resources with one in `packs.rpf` and the 20–21, 40–41 and 70–70.8 GiB
+`levels.rpf` windows, and on all 2,478 two-stream `0DRP` navmesh pages. It is a boundary, not a page test: only
+17,994 of the 40,038 graphics pages measured (44.9%) are multiples of `0x10000`, so the stream at the boundary is
+often the last system page. `42 40 00 00` stays the direct graphics-page marker.
+
+An inflated size of exactly `0x800000` is a chunk head, not a continuation. All 43 in `core_bvh4.rpf` follow a
+208–544-byte header stream and are followed by a separate continuation stream; the eight in the other measured
+indexes are resource or graphics pages. [bvh.md](bvh.md) records the same 8 MiB-first relationship from the payload
+side.
+
+The boundary rule is independently read by meetox80/6stars. No 6stars code, prose or table was used; the
+repository has **no licence** (all rights reserved), and every count above was re-measured from this package. See
+[related_projects.md](related_projects.md).
 
 ## Carving
 
@@ -30,9 +49,29 @@ one-line error and exit code 2 before any output is written, rather than silentl
 
 `<out_dir>/index.json` contains:
 
-- `summary`: archive, files, compressed/inflated bytes, Bink 2 bytes/files, zero padding, unread bytes, span;
+- `summary`: archive, files, compressed/inflated bytes, Bink 2 bytes/files, zero padding, unread bytes, the number of
+  unread ranges (`unread_ranges`), span;
 - `files`: `off`, `stored`, `size`, `pre` (bytes before the stream), `head` (first 16 inflated bytes), and for
-  Bink 2 the `w`/`h`/`frames` fields.
+  Bink 2 the `w`/`h`/`frames` fields;
+- `unread`: one row per gap that is not all zero bytes, between two streams, before the first or after the last:
+  `off`, `size`, and `entropy`, the Shannon entropy in bits/byte of its first `sampled` bytes (at most 1 MiB). A
+  gap is the whole region between two streams, so a mostly-zero gap with a few other bytes is one unread range. An
+  all-zero gap counts toward `zero_padding` only. The sizes add up to `unread_bytes`.
+
+Measured on `data.rpf` (481,544,304 bytes; span 481,474,576), the 20,268,240 unread bytes (4.2%) are **377
+ranges**: median 7,452 bytes, largest 1,149,226; 7 below 1 KiB, 297 from 1 KiB to 64 KiB, 73 of 64 KiB or more
+(16,565,898 bytes). By entropy:
+
+| Bits/byte | Ranges | Bytes |
+|---|---:|---:|
+| 7.5 or more | 278 | 18,257,882 |
+| 6 to 7.5 | 32 | 1,350,501 |
+| 4 to 6 | 37 | 460,464 |
+| below 4 | 30 | 199,393 |
+
+So 90% of the unread bytes look like compressed or encrypted data, with no zlib or Bink 2 header the walker accepts.
+The rest is lower-entropy structure worth a look with a hex editor at the listed offsets. The list holds offsets
+and sizes only; keep the index in your work folder like the carved files.
 
 The walker advances by `len(chunk)`, not by the 1 MiB read request. A short final slice used to make `p`
 overshoot EOF, so `used` exceeded the real stream size and every trailing stream was skipped; the regression

@@ -68,10 +68,32 @@ int main() {
     reinterpret_cast<Close>(vtable[17])(obj, queue);
     reinterpret_cast<Release>(vtable[2])(obj);
 
-    // A class not served yet (XNetworkingImpl) is refused, with the out pointer cleared.
+    // XNetworkingImpl is served through QueryApiImpl (slot 15: XNetworkingGetConnectivityHint).
     const GUID networking = {0x37e56907, 0x2f10, 0x41e8, {0xb7, 0x2f, 0x36, 0xed, 0xb1, 0x85, 0x33, 0x1a}};
+    void* net_obj = nullptr;
+    hr = query(&networking, networking, &net_obj);
+    if (hr != S_OK || !net_obj)
+        return fail("QueryApiImpl hands out XNetworkingImpl", static_cast<unsigned long>(hr));
+    void* const* net_vtable = *static_cast<void* const* const*>(net_obj);
+    struct Hint {
+        UINT32 level;
+        UINT32 cost;
+        UINT32 iana;
+        bool init;
+        bool appr;
+        bool over;
+        bool roam;
+    } hint{};
+    using GetHint = HRESULT(STDMETHODCALLTYPE*)(void*, Hint*);
+    hr = reinterpret_cast<GetHint>(net_vtable[15])(net_obj, &hint);
+    if (hr != S_OK || !hint.init)
+        return fail("XNetworkingImpl slot 15 (XNetworkingGetConnectivityHint)", static_cast<unsigned long>(hr));
+    reinterpret_cast<Release>(net_vtable[2])(net_obj);
+
+    // A class not served yet (an unprovided class id) is refused, with the out pointer cleared.
+    const GUID unprovided = {0x973a344e, 0x24bf, 0x4d0f, {0x84, 0x57, 0x56, 0xc5, 0x34, 0x89, 0x2b, 0x29}};
     void* out = reinterpret_cast<void*>(1);
-    hr = query(&networking, networking, &out);
+    hr = query(&unprovided, unprovided, &out);
     if (hr != static_cast<HRESULT>(0x80070032) || out != nullptr)
         return fail("QueryApiImpl refuses an unprovided class and clears its out pointer", static_cast<unsigned long>(hr));
     hr = uninit();

@@ -393,6 +393,33 @@ void test_keyboard_pad_sticks(IGameInput* input, IGameInputDevice* kb) {
     }
     check(monotonic && polls < 100 && sticks_at_rest(st), "keyboard pad: right stick decays to 0 when the mouse stops");
 
+    // LEONIDA_MOUSE_SENSITIVITY scales the axis units per count: 2 doubles, 0.5 halves; out of range clamps.
+    auto settle = [&] {
+        for (int i = 0; i < 200 && !sticks_at_rest(pad_state(input, kb)); ++i) rt::gameinput::poll();
+    };
+    set_env("LEONIDA_MOUSE_SENSITIVITY", "2");
+    rt::gameinput::reload_config();
+    g_cursor_x += 10;
+    rt::gameinput::poll();
+    check(approx(pad_state(input, kb).rightThumbstickX, 20480 / 32767.0f), "keyboard pad: mouse sensitivity 2 doubles the stick");
+    settle();
+    set_env("LEONIDA_MOUSE_SENSITIVITY", "0.5");
+    rt::gameinput::reload_config();
+    g_cursor_x -= 10;
+    rt::gameinput::poll();
+    check(approx(pad_state(input, kb).rightThumbstickX, -5120 / 32767.0f), "keyboard pad: mouse sensitivity 0.5 halves the stick");
+    settle();
+    set_env("LEONIDA_MOUSE_SENSITIVITY", "100");
+    rt::gameinput::reload_config();
+    check(rt::gameinput::config().mouse_sensitivity == 10.0f, "keyboard pad: mouse sensitivity clamps to 10");
+    set_env("LEONIDA_MOUSE_SENSITIVITY", "0");
+    rt::gameinput::reload_config();
+    check(approx(rt::gameinput::config().mouse_sensitivity, 0.1f), "keyboard pad: mouse sensitivity clamps to 0.1");
+    set_env("LEONIDA_MOUSE_SENSITIVITY", nullptr);
+    rt::gameinput::reload_config();
+    check(rt::gameinput::config().mouse_sensitivity == 1.0f && rt::gameinput::config().ds_trigger_gain == 1.0f,
+          "keyboard pad: mouse sensitivity defaults to 1 and leaves the trigger gain alone");
+
     g_keys[VK_RBUTTON] = true;
     rt::gameinput::poll();
     st = pad_state(input, kb);
@@ -577,6 +604,94 @@ bool found_is(IGameInput* input, IGameInputDevice* dev) {
 }
 
 // Pads SDL cannot tell apart: the same name, vendor and product, no serial, no path. Runs with no other pad connected.
+void test_aggregate_device(IGameInput* input) {
+    check(input->CreateAggregateDevice(GameInputKindGamepad, nullptr) == E_POINTER,
+          "CreateAggregateDevice rejects null output pointer");
+    IGameInputDevice* agg = nullptr;
+    check(input->CreateAggregateDevice(GameInputKindUnknown, &agg) == E_INVALIDARG && !agg,
+          "CreateAggregateDevice rejects GameInputKindUnknown");
+    check(input->CreateAggregateDevice(GameInputKindGamepad | GameInputKindKeyboard, &agg) == E_INVALIDARG && !agg,
+          "CreateAggregateDevice rejects multiple combined kind flags");
+    check(input->CreateAggregateDevice(0x80000000, &agg) == E_INVALIDARG && !agg,
+          "CreateAggregateDevice rejects unsupported kind flag");
+
+    check(input->CreateAggregateDevice(GameInputKindGamepad, &agg) == S_OK && agg != nullptr,
+          "CreateAggregateDevice creates an aggregate device for GameInputKindGamepad");
+    if (agg) {
+        const GameInputDeviceInfo* info = agg->GetDeviceInfo();
+        check(info && info->deviceFamily == GameInputFamilyAggregate,
+              "aggregate device reports GameInputFamilyAggregate");
+        check(info && info->supportedInput == GameInputKindGamepad,
+              "aggregate device reports supportedInput == GameInputKindGamepad");
+        check(agg->GetDeviceStatus() == GameInputDeviceConnected,
+              "aggregate device status is GameInputDeviceConnected");
+
+        IGameInputDevice* agg2 = nullptr;
+        check(input->CreateAggregateDevice(GameInputKindGamepad, &agg2) == S_OK && agg2 == agg,
+              "CreateAggregateDevice returns existing aggregate instance for the same kind");
+        if (agg2) agg2->Release();
+
+        // Reading test with no connected pad
+        IGameInputReading* r = nullptr;
+        check(input->GetCurrentReading(GameInputKindGamepad, agg, &r) == GAMEINPUT_E_READING_NOT_FOUND && !r,
+              "aggregate device returns READING_NOT_FOUND when no pads are connected");
+        check(input->GetCurrentReading(GameInputKindKeyboard, agg, &r) == GAMEINPUT_E_READING_NOT_FOUND && !r,
+              "aggregate device returns READING_NOT_FOUND for kind mismatch with no pads");
+
+        // Callback registration guards for aggregate device
+        GameInputCallbackToken reading_tok = 0xbeef;
+        check(input->RegisterReadingCallback(agg, GameInputKindGamepad, 0.0f, nullptr, on_reading, &reading_tok) == E_NOTIMPL &&
+                  reading_tok == kInvalidCallbackToken,
+              "RegisterReadingCallback rejects aggregate device with E_NOTIMPL and invalid token");
+
+        GameInputCallbackToken device_tok = 0xbeef;
+        check(input->RegisterDeviceCallback(agg, GameInputKindGamepad, GameInputDeviceConnected,
+                                            GameInputBlockingEnumeration, nullptr, on_device, &device_tok) == E_NOTIMPL &&
+                  device_tok == kInvalidCallbackToken,
+              "RegisterDeviceCallback rejects aggregate device with E_NOTIMPL and invalid token");
+
+        // Attach a virtual pad and verify aggregate device yields readings from it
+        Pad xbox;
+        attach(xbox, "Leonida virtual Xbox pad", 0x045E, 0x0B12, true);
+        rt::gameinput::poll();
+
+        SDL_SetJoystickVirtualButton(xbox.js, SDL_GAMEPAD_BUTTON_SOUTH, true);
+        rt::gameinput::poll();
+
+        check(input->GetCurrentReading(GameInputKindGamepad, agg, &r) == S_OK && r != nullptr,
+              "aggregate device yields reading from connected pad");
+        if (r) {
+            check(buttons_of(r) == GameInputGamepadA, "aggregate device reading reflects pad input state");
+            r->Release();
+        }
+
+        IGameInputReading* r_mismatch = nullptr;
+        check(input->GetCurrentReading(GameInputKindKeyboard, agg, &r_mismatch) == GAMEINPUT_E_READING_NOT_FOUND && !r_mismatch,
+              "aggregate device rejects kind mismatch even when pad is connected");
+
+        SDL_SetJoystickVirtualButton(xbox.js, SDL_GAMEPAD_BUTTON_SOUTH, false);
+        rt::gameinput::poll();
+        IGameInputReading* r2 = nullptr;
+        check(input->GetCurrentReading(GameInputKindGamepad, agg, &r2) == S_OK && r2 != nullptr,
+              "aggregate device yields updated reading after button release");
+        if (r2) {
+            check(buttons_of(r2) == 0, "aggregate reading shows button released");
+            IGameInputReading* prev = nullptr;
+            check(input->GetPreviousReading(r2, GameInputKindGamepad, agg, &prev) == S_OK && prev != nullptr,
+                  "GetPreviousReading with aggregate device filter finds prior reading");
+            if (prev) {
+                check(buttons_of(prev) == GameInputGamepadA, "prior reading has pressed button");
+                prev->Release();
+            }
+            r2->Release();
+        }
+
+        detach(xbox);
+        rt::gameinput::poll();
+        agg->Release();
+    }
+}
+
 void test_twins(IGameInput* input) {
     Pad pads[3];
     IGameInputDevice* dev[3] = {};
@@ -992,6 +1107,17 @@ int main() {
     check(input->GetPreviousReading(idle, GameInputKindGamepad, dev, nullptr) == E_POINTER &&
               input->GetPreviousReading(nullptr, GameInputKindGamepad, dev, &hit) == E_INVALIDARG && !hit,
           "history: a null output is E_POINTER, a null reference E_INVALIDARG");
+    // GetTemporalReading: E_NOTIMPL with a null reading, as GameInput v0 itself, for a timestamp in the history, one
+    // before it and the current time, with and without a device filter.
+    const uint64_t idle_us = idle->GetTimestamp();
+    bool temporal_notimpl = true;
+    for (const uint64_t at : {idle_us, idle_us - 1'000'000, input->GetCurrentTimestamp()})
+        for (IGameInputDevice* filter : {dev, static_cast<IGameInputDevice*>(nullptr)}) {
+            IGameInputReading* temporal = idle;  // a stale value the call must clear
+            temporal_notimpl &= input->GetTemporalReading(at, filter, &temporal) == E_NOTIMPL && !temporal;
+        }
+    check(temporal_notimpl && input->GetTemporalReading(idle_us, dev, nullptr) == E_POINTER,
+          "history: GetTemporalReading is E_NOTIMPL with a null reading, as in GameInput v0");
 
     // Two pads in one stream, one poll each: A on the Xbox pad, B on the DualSense, Y on the Xbox pad.
     IGameInputReading* start = current(input, dev);
@@ -1099,6 +1225,7 @@ int main() {
     test_twins(input);
     test_keyboard_pad(input);
     test_motion(input);
+    test_aggregate_device(input);
     input->Release();
 
     std::printf("%d checks, %d failures\n", g_checks, g_failures);
