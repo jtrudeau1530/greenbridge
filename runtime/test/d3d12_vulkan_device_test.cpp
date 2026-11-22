@@ -467,7 +467,7 @@ int compare_resolves(ID3D12Device* ours) {
         DXGI_FORMAT_R16G16B16A16_FLOAT,
         DXGI_FORMAT_R32G32B32A32_FLOAT,
     };
-    constexpr UINT sample_counts[] = {2, 4, 8};
+    constexpr UINT sample_counts[] = {2, 4, 8, 16};
     constexpr UINT required =
         UINT(D3D12_FORMAT_SUPPORT1_RENDER_TARGET) | UINT(D3D12_FORMAT_SUPPORT1_MULTISAMPLE_RENDERTARGET) |
         UINT(D3D12_FORMAT_SUPPORT1_MULTISAMPLE_RESOLVE);
