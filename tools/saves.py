@@ -24,7 +24,11 @@ import json
 import os
 import struct
 import sys
+import tempfile
 from datetime import datetime, timezone
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from file_mode import published_mode  # noqa: E402
 
 # ---------------------------------------------------------------------------------------------- ASAV
 ASAV_HDR = 0x170          # header size seen on every plain ASAV file
@@ -282,8 +286,24 @@ def pack_from_dir(src):
 
 def pack(src, out):
     data = pack_from_dir(src)
-    with open(out, 'wb') as f:
-        f.write(data)
+    parent = os.path.dirname(os.path.abspath(out))
+    tmp = None
+    try:
+        with tempfile.NamedTemporaryFile('wb', dir=parent, prefix='.saves-pack-', suffix='.tmp',
+                                         delete=False) as f:
+            tmp = f.name
+            f.write(data)
+        os.chmod(tmp, published_mode(out))
+        os.replace(tmp, out)
+    except BaseException:
+        if tmp is not None:
+            try:
+                # A failed replacement may leave a read-only staging file on Windows.
+                os.chmod(tmp, 0o600)
+                os.remove(tmp)
+            except OSError:
+                pass
+        raise
     print(f'wrote {out} ({len(data)} bytes)')
 
 
