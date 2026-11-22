@@ -159,6 +159,11 @@ struct Scene {
         vk.update_buffer = nop<PFN_vkCmdUpdateBuffer>();
         vk.begin_conditional_rendering = nop<PFN_vkCmdBeginConditionalRenderingEXT>();
         vk.end_conditional_rendering = nop<PFN_vkCmdEndConditionalRenderingEXT>();
+        vk.prepare_predicate = [](VkBuffer source, VkDeviceSize offset, PredicateCapture& out) {
+            out = {source, offset, fake_handle<VkBuffer>(0x5000), 0, VK_NULL_HANDLE};
+            return true;
+        };
+        vk.capture_predicate = [](VkCommandBuffer, const PredicateCapture&) {};
         vk.reset_query_pool = nop<PFN_vkCmdResetQueryPool>();
         vk.begin_query = nop<PFN_vkCmdBeginQuery>();
         vk.end_query = nop<PFN_vkCmdEndQuery>();

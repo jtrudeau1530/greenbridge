@@ -100,6 +100,62 @@ class Translated(unittest.TestCase):
             d.translated = real
 
 
+class Branches(unittest.TestCase):
+    """--branches: SCC consumer chains and s_cbranch_scc0/1 forward over 1..3 instructions."""
+
+    def test_reference_takes_the_branch_on_the_right_scc(self):
+        body = ("s_cmp_eq_u32 1, 1", "s_cbranch_scc1 +2", "s_mov_b32 s4, 7", "s_mov_b32 s5, 8", "s_mov_b32 s6, 9")
+        self.assertEqual(run(*body), [0, 0, 9, 1])                                  # taken: s4, s5 skipped
+        self.assertEqual(run(*(b.replace("scc1", "scc0") for b in body)), [7, 8, 9, 1])   # not taken
+        self.assertEqual(run("s_cmp_eq_u32 0, 1", "s_cbranch_scc0 +1", "s_mov_b32 s4, 7")[::3], [0, 0])
+
+    def test_a_consumer_chain_carries_scc(self):
+        # 0 - 1 borrows; s_addc adds it in and carries out of 0xffffffff + 0 + 1; s_cselect keeps that SCC
+        self.assertEqual(run("s_sub_u32 s4, 0, 1", "s_addc_u32 s5, s4, 0", "s_cselect_b32 s6, 5, 6"), [0xFFFFFFFF, 0, 5, 1])
+
+    def test_listing_offsets_count_literals(self):
+        lines = ["s_cbranch_scc0 +3", "s_add_u32 s4, s5, 0x12345", "s_movk_i32 s4, 0x8000", "s_cmp_lt_u32 s4, -1"]
+        self.assertEqual(d.listing(lines)[0], ("s_cbranch_scc0 4", 4))             # 8 + 4 + 4 bytes
+        self.assertEqual([n for _, n in d.listing(lines)], [4, 8, 4, 4])
+
+    def test_shrinking_keeps_the_skipped_range_consistent(self):
+        body = ["s_cbranch_scc1 +2", "s_mov_b32 s4, 1", "s_mov_b32 s5, 2", "s_mov_b32 s6, 3"]
+        self.assertEqual(d.drop(body, 1), ["s_cbranch_scc1 +1", "s_mov_b32 s5, 2", "s_mov_b32 s6, 3"])
+        self.assertEqual(d.drop(body, 3), body[:3])
+
+    def test_every_producer_meets_every_consumer_and_both_branches(self):
+        ops = sorted(o for o in d.OPS if o not in d.LANE_MASK_OPS)
+        producers = {o for o in ops if d.writes_scc(o)}
+        seen = set()
+        rng = d.random.Random(1)
+        for _ in range(3000):
+            lines = d.generate(rng, rng.randrange(1, 7), ops, branches=True)
+            for prev, nxt in zip(lines, lines[1:]):
+                op, after = prev.split()[0], nxt.split()[0]
+                if op in producers and (after in d.SCC_CONSUMERS or after in d.SCC_BRANCHES):
+                    seen.add((op, after))
+        want = {(p, c) for p in producers for c in d.SCC_CONSUMERS + d.SCC_BRANCHES}
+        self.assertEqual(want - seen, set())
+
+    def test_short_seeded_run_matches(self):
+        ops = sorted(o for o in d.OPS if o not in d.LANE_MASK_OPS)
+        counts, failures = d.run_suite(60, 3, 5, ops, branches=True)
+        self.assertEqual((counts["pass"], counts["skip"], failures), (60, {}, []))
+
+    def test_a_misplaced_branch_target_is_caught(self):
+        # One dword too far: the instruction after the skipped range is skipped too.
+        lines = (["s_mov_b32 s4, 1", "s_cmp_eq_u32 s4, s4", "s_cbranch_scc1 +1", "s_mov_b32 s5, 0x12345678",
+                  "s_mov_b32 s6, 3"] + d.observe([4, 5, 6]))
+        self.assertIsNone(d.check(lines))
+        real = d.listing
+        try:
+            d.listing = lambda ls: [(f"{t.rsplit(' ', 1)[0]} {int(t.rsplit(' ', 1)[1]) + 1}"
+                                     if t.startswith("s_cbranch") else t, n) for t, n in real(ls)]
+            self.assertIn("word 2 (s6)", d.check(lines))
+        finally:
+            d.listing = real
+
+
 class CliOps(unittest.TestCase):
     def test_ops_whitespace_and_duplicates_are_normalized(self):
         cases = [

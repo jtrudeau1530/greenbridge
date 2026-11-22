@@ -203,11 +203,11 @@ int main(int argc, char** argv) {
     VkPhysicalDeviceProperties2 props{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &props12};
     vkGetPhysicalDeviceProperties2(pd, &props);
     std::printf("device: %s%s\n", props.properties.deviceName, validation ? " (validation on)" : "");
-    const bool integer = spec.format == VK_FORMAT_R8G8B8A8_UINT || spec.format == VK_FORMAT_R8G8B8A8_SINT;
+    // Every format, UINT/SINT included, is a sampled image: a translated image_load fetches it from the sampled
+    // array, through a uint/sint alias for integer formats (SHADER-151), as the runtime binds a read-only texture.
     VkFormatProperties format_props{};
     vkGetPhysicalDeviceFormatProperties(pd, spec.format, &format_props);
-    const VkFormatFeatureFlags required = integer ? VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT : VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT;
-    if (!(format_props.optimalTilingFeatures & required)) {
+    if (!(format_props.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT)) {
         std::printf("unsupported: %s lacks the required image feature\n", spec.format_name.c_str());
         return unsupported;
     }
@@ -234,15 +234,10 @@ int main(int argc, char** argv) {
     need(have.features.shaderInt64, "shaderInt64");
     need(have.features.shaderSampledImageArrayDynamicIndexing, "shaderSampledImageArrayDynamicIndexing");
     need(have.features.fragmentStoresAndAtomics, "fragmentStoresAndAtomics");
-    need(have.features.shaderStorageImageReadWithoutFormat, "shaderStorageImageReadWithoutFormat");
-    need(have.features.shaderStorageImageWriteWithoutFormat, "shaderStorageImageWriteWithoutFormat");
+    // No without-format storage-image feature: a translated image_load fetches every format from the sampled
+    // arrays (SHADER-151), so Intel Xe-LP, which lacks shaderStorageImageReadWithoutFormat, runs these cases too.
     if (!missing.empty()) {
         std::printf("unsupported: the device lacks %s\n", missing.c_str());
-        if (missing.find("shaderStorageImageReadWithoutFormat") != std::string::npos ||
-            missing.find("shaderStorageImageWriteWithoutFormat") != std::string::npos)
-            std::printf("  (the translated image_load declares the without-format storage-image capabilities: its "
-                        "uint/sint path is chosen from the T# FORMAT at run time, even when the case only reads a "
-                        "float format)\n");
         return unsupported;
     }
     BindlessFeatures device_flags{
@@ -260,8 +255,6 @@ int main(int argc, char** argv) {
     VkPhysicalDeviceFeatures2 enable{.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
                                       .pNext = &enable12,
                                       .features = {.fragmentStoresAndAtomics = VK_TRUE,
-                                                   .shaderStorageImageReadWithoutFormat = VK_TRUE,
-                                                   .shaderStorageImageWriteWithoutFormat = VK_TRUE,
                                                    .shaderSampledImageArrayDynamicIndexing = VK_TRUE,
                                                    .shaderInt64 = VK_TRUE}};
     std::uint32_t qn = 0;
@@ -350,9 +343,8 @@ int main(int argc, char** argv) {
     std::memcpy(staging_map, texels.data(), texels.size());
     VkImage image = VK_NULL_HANDLE;
     VkImageView view = VK_NULL_HANDLE;
-    const VkImageLayout image_layout = integer ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    CHECK(make_image(spec.format, spec.width, spec.height,
-                     (integer ? VK_IMAGE_USAGE_STORAGE_BIT : VK_IMAGE_USAGE_SAMPLED_BIT) | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+    const VkImageLayout image_layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    CHECK(make_image(spec.format, spec.width, spec.height, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
                      &image, &view));
     // Render target, pass and framebuffer.
     constexpr VkFormat target_format = VK_FORMAT_R32G32B32A32_SFLOAT;
@@ -475,10 +467,7 @@ int main(int argc, char** argv) {
         std::printf("unsupported: cannot create the bindless set\n");
         return unsupported;
     }
-    StorageViews storage{};
-    if (spec.format == VK_FORMAT_R8G8B8A8_UINT) storage.as_uint = view;
-    if (spec.format == VK_FORMAT_R8G8B8A8_SINT) storage.as_sint = view;
-    const std::uint32_t index = set->add_image(ImageDimension::dim_2d, integer ? VK_NULL_HANDLE : view, image_layout, storage);
+    const std::uint32_t index = set->add_image(ImageDimension::dim_2d, view, image_layout);
     if (index < 1) {
         std::fprintf(stderr, "FAILED add_image -> 0 (line %d)\n", __LINE__);
         return 1;

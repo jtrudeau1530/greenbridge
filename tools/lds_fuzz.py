@@ -534,7 +534,7 @@ def translate(progs, work, emulate):
         cmd = mc + ["-triple=amdgcn--amdpal", "-mcpu=gfx1013", "-show-encoding"]
         if p.wave == 64:
             cmd.append("-mattr=+wavefrontsize64,-wavefrontsize32")
-        r = subprocess.run(cmd, input=text, capture_output=True, text=True)
+        r = mc_command.run(cmd, input=text, capture_output=True, text=True)
         if r.returncode or "error:" in r.stderr:
             raise RuntimeError(f"{p.name} did not assemble:\n{r.stderr}")
         code = "".join(ln for ln in r.stdout.splitlines(keepends=True) if not ln.lstrip().startswith("."))

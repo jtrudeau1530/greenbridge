@@ -21,16 +21,19 @@ class Text(unittest.TestCase):
         self.assertEqual(asm.family("gfx1150"), "gfx11")
         self.assertEqual(asm.family("gfx1030"), "gfx10")
         self.assertEqual(asm.family("gfx1013"), "gfx10")
+        self.assertEqual(asm.family("gfx1201"), "gfx12")
         with self.assertRaises(ValueError):
             asm.family("gfx90a")
 
     def test_kernel_uses_the_mnemonics_of_its_family(self):
         k11, k10 = asm.kernel_text("k0", PROG, "gfx1150"), asm.kernel_text("k0", PROG, "gfx1030")
-        self.assertIn("s_load_b64 s[2:3], s[0:1], 0x0", k11)
-        self.assertIn("global_store_b128 v0, v[8:11], s[2:3]", k11)
+        k12 = asm.kernel_text("k0", PROG, "gfx1201")
+        for k in (k11, k12):
+            self.assertIn("s_load_b64 s[2:3], s[0:1], 0x0", k)
+            self.assertIn("global_store_b128 v0, v[8:11], s[2:3]", k)
         self.assertIn("s_load_dwordx2", k10)
         self.assertIn("global_store_dwordx4", k10)
-        for k in (k11, k10):
+        for k in (k11, k12, k10):
             self.assertIn("  s_add_u32 s6, s4, s5\n", k)
             self.assertIn(".amdhsa_wavefront_size32 1", k)
             # the program runs between the output-pointer load and the store
@@ -71,6 +74,13 @@ class Filters(unittest.TestCase):
         self.assertIn("s_ff0", asm.skip_reason(PROG + ["s_ff0_i32_b32 s4, s5"], "gfx1150"))
         self.assertIsNone(asm.skip_reason(PROG + ["s_ff0_i32_b32 s4, s5"], "gfx1030"))      # GFX10 still has it
         self.assertIn("two different literals", asm.skip_reason(["s_and_b32 s4, 0x100, 0x200"], "gfx1030"))
+        # GFX12 keeps GFX11's removals and drops the SOPK compares, which GFX11 still has.
+        cmpk = PROG + ["s_cmpk_lt_i32 s4, 0x12"]
+        self.assertIsNone(asm.skip_reason(PROG, "gfx1201"))
+        self.assertIsNone(asm.skip_reason(cmpk, "gfx1150"))
+        self.assertIn("GFX12", asm.skip_reason(cmpk, "gfx1201"))
+        self.assertIn("s_ff0", asm.skip_reason(PROG + ["s_ff0_i32_b64 s[4:5], s[6:7]"], "gfx1201"))
+        self.assertEqual(len([op for op in asm.GFX12_REMOVED if op.startswith("s_cmpk_")]), 12)
 
 
 class Unavailable(unittest.TestCase):
@@ -88,6 +98,15 @@ class Unavailable(unittest.TestCase):
                            capture_output=True, text=True, env=env)
         self.assertEqual(r.returncode, 77, r.stdout + r.stderr)
         self.assertIn("unavailable", r.stdout)
+
+    def test_an_unsupported_architecture_is_unavailable_not_a_traceback(self):
+        # Oracle() checks the architecture right after finding the tools; stub those so this runs anywhere.
+        with unittest.mock.patch.object(runner, "find_clang", return_value="clang"), \
+                unittest.mock.patch.object(runner, "_find_lld", return_value="ld.lld"), \
+                unittest.mock.patch.object(runner, "find_hip_dll", return_value="amdhip64_7.dll"):
+            with self.assertRaises(runner.Unavailable) as cm:
+                runner.Oracle(arch="gfx90a")
+        self.assertIn("gfx90a", str(cm.exception))
 
     def test_unknown_oracle_is_a_usage_error(self):
         r = subprocess.run([sys.executable, "-I", str(TOOLS / "salu_diff.py"), "--oracle", "gpu"],

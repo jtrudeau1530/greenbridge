@@ -36,10 +36,11 @@ float depth24_to_float(uint d) {
 // The 24-bit UNORM of f as WARP and AMD's D3D12 drivers write it: the product with 2^24 - 1 is rounded to a float
 // first, then to the nearest integer with ties to even (NVIDIA's hardware breaks some ties the other way; see
 // depth24.h). NaN and negatives give 0, 1 and above the maximum.
-uint depth24_from_float(float f) {
-    if (!(f > 0.0)) return 0u;
-    if (f >= 1.0) return 0xffffffu;
-    return uint(roundEven(f * 16777215.0));
+uint depth24_from_bits(uint bits) {
+    // In unsigned order, all negative encodings and positive NaNs lie above positive infinity.
+    if (bits > 0x7f800000u) return 0u;
+    if (bits >= 0x3f800000u) return 0xffffffu;
+    return uint(roundEven(uintBitsToFloat(bits) * 16777215.0));
 }
 
 void main() {
@@ -48,5 +49,5 @@ void main() {
     uint a = pc.app_base + g.z * pc.app_slice + g.y * pc.app_row + g.x;
     uint s = pc.scratch_base + (g.z * pc.height + g.y) * pc.width + g.x;
     if (pc.to_float != 0u) scratch[s] = floatBitsToUint(depth24_to_float(app[a] & 0xffffffu));
-    else app[a] = depth24_from_float(uintBitsToFloat(scratch[s]));
+    else app[a] = depth24_from_bits(scratch[s]);
 }

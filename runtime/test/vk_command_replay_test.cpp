@@ -546,7 +546,7 @@ int part_e(vktest::Device& d) {
     constexpr std::uint32_t size = 4, layers = 5, texels = size * size;
     const VkImage color = d.image(VK_FORMAT_R8G8B8A8_UNORM, size, size, layers, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
     void* predicate_words = nullptr;
-    const VkBuffer predicate = d.buffer(32, VK_BUFFER_USAGE_CONDITIONAL_RENDERING_BIT_EXT, &predicate_words);
+    const VkBuffer predicate = d.buffer(32, VK_BUFFER_USAGE_CONDITIONAL_RENDERING_BIT_EXT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, &predicate_words);
     void* mapped = nullptr;
     const VkBuffer readback = d.buffer(texels * layers * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT, &mapped);
     EXPECT(color && predicate && readback);
@@ -587,6 +587,17 @@ int part_e(vktest::Device& d) {
         d.fn<PFN_vkCmdBeginConditionalRenderingEXT>("vkCmdBeginConditionalRenderingEXT");
     vk.end_conditional_rendering = d.fn<PFN_vkCmdEndConditionalRenderingEXT>("vkCmdEndConditionalRenderingEXT");
     EXPECT(vk.begin_conditional_rendering && vk.end_conditional_rendering);
+    VkPhysicalDeviceMemoryProperties memory{};
+    d.instance_fn<PFN_vkGetPhysicalDeviceMemoryProperties>("vkGetPhysicalDeviceMemoryProperties")(d.physical, &memory);
+    VkPhysicalDeviceProperties properties{};
+    d.instance_fn<PFN_vkGetPhysicalDeviceProperties>("vkGetPhysicalDeviceProperties")(d.physical, &properties);
+    PredicateReducer reducer(d.device_proc, d.device, memory, properties.limits.maxStorageBufferRange);
+    auto conditions = reducer.batch(32);
+    EXPECT(conditions);
+    vk.prepare_predicate = [&](VkBuffer source, VkDeviceSize offset, PredicateCapture& out) {
+        return conditions->prepare(source, offset, out);
+    };
+    vk.capture_predicate = [&](VkCommandBuffer cb, const PredicateCapture& p) { reducer.capture(cb, p); };
 
     // Lists that are rejected, and the count of copies Vulkan cannot predicate. Nothing is written by prepare().
     const auto prepared_with = [&](auto&& record, const ReplayFunctions& functions, PreparedList& out) {
