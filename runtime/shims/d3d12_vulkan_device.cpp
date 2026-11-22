@@ -6408,7 +6408,9 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
                           "separateDepthStencilLayouts");
     if (!v13.core)
         std::fprintf(stderr, "[rt] d3d12: Vulkan 1.2 device: dynamicRendering and synchronization2 through their KHR "
-                             "extensions\n");
+                             "extensions; %s\n",
+                     v13.extended_dynamic_state ? "extended dynamic state through VK_EXT_extended_dynamic_state(2)"
+                                                : "no extended dynamic state, so no graphics pipelines");
 
     // VK_EXT_conditional_rendering for SetPredication, VK_KHR_swapchain for DXGI presentation, and optional
     // VK_KHR_acceleration_structure + VK_KHR_ray_query for hardware BVH builds (BLAS + TLAS).
