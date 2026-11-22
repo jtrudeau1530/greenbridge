@@ -1092,5 +1092,106 @@ class TestIEEE754BoundaryExtremes(unittest.TestCase):
         self.assertLessEqual(u16_to_f16(res), 1.0)
 
 
+class TestNegativeControlsAndMutationDetection(unittest.TestCase):
+    """Test suite for negative controls, syntax rejection, and mutation detection."""
+
+    def test_out_of_bounds_registers(self) -> None:
+        with self.assertRaises(ValueError):
+            Reg(-1, RegType.VGPR)
+        with self.assertRaises(ValueError):
+            Reg(256, RegType.VGPR)
+        with self.assertRaises(ValueError):
+            Reg(-1, RegType.SGPR)
+        with self.assertRaises(ValueError):
+            Reg(106, RegType.SGPR)
+
+    def test_invalid_destination_types(self) -> None:
+        with self.assertRaises(ValueError):
+            VPkFmaClampF16Instruction(
+                dst=Reg(0, RegType.SGPR),
+                src0=VOP3POperand(reg=Reg(1, RegType.VGPR)),
+                src1=VOP3POperand(reg=Reg(2, RegType.VGPR)),
+                src2=VOP3POperand(reg=Reg(3, RegType.VGPR)),
+            )
+
+    def test_invalid_modifier_tuples(self) -> None:
+        with self.assertRaises(ValueError):
+            VPkFmaClampF16Instruction(
+                dst=Reg(0, RegType.VGPR),
+                src0=VOP3POperand(reg=Reg(1, RegType.VGPR)),
+                src1=VOP3POperand(reg=Reg(2, RegType.VGPR)),
+                src2=VOP3POperand(reg=Reg(3, RegType.VGPR)),
+                op_sel=(0, 0),  # invalid length 2, needs 3
+            )
+        with self.assertRaises(ValueError):
+            VPkFmaClampF16Instruction(
+                dst=Reg(0, RegType.VGPR),
+                src0=VOP3POperand(reg=Reg(1, RegType.VGPR)),
+                src1=VOP3POperand(reg=Reg(2, RegType.VGPR)),
+                src2=VOP3POperand(reg=Reg(3, RegType.VGPR)),
+                neg_lo=(0, 0, 3),  # value not in {0, 1}
+            )
+
+    def test_mutation_unclamped_fma(self) -> None:
+        def mutated_unclamped(s0: int, s1: int, s2: int) -> int:
+            f0 = Fraction(u16_to_f16(s0))
+            f1 = Fraction(u16_to_f16(s1))
+            f2 = Fraction(u16_to_f16(s2))
+            return f16_to_u16(float(f0 * f1 + f2))
+
+        # 2.0 * 2.0 + 1.0 = 5.0 -> oracle returns 1.0 (0x3C00), mutant returns 5.0 (0x4500)
+        s0 = f16_to_u16(2.0)
+        s1 = f16_to_u16(2.0)
+        s2 = f16_to_u16(1.0)
+        oracle_res = ref_fma_clamp_f16(s0, s1, s2)
+        mutant_res = mutated_unclamped(s0, s1, s2)
+        self.assertEqual(oracle_res, F16_POS_ONE)
+        self.assertNotEqual(oracle_res, mutant_res)
+
+    def test_mutation_unfused_intermediate_rounding(self) -> None:
+        def mutated_unfused(s0: int, s1: int, s2: int) -> int:
+            # Performs separate multiply and add with intermediate rounding
+            prod = f16_to_u16(u16_to_f16(s0) * u16_to_f16(s1))
+            sum_val = f16_to_u16(u16_to_f16(prod) + u16_to_f16(s2))
+            return clamp01_f16(sum_val)
+
+        a = 0x3C01  # 1.0 + 2^-10
+        b = 0x3BFF  # 1.0 - 2^-10
+        c = 0xBBFF  # -1.0 + 2^-10
+        oracle_res = ref_fma_clamp_f16(a, b, c)
+        mutant_res = mutated_unfused(a, b, c)
+        self.assertNotEqual(oracle_res, mutant_res)
+
+    def test_mutation_nan_unclamped(self) -> None:
+        def mutated_nan_leak(s0: int, s1: int, s2: int) -> int:
+            if is_f16_nan(s0):
+                return s0
+            return ref_fma_clamp_f16(s0, s1, s2)
+
+        snan = 0x7C01
+        oracle_res = ref_fma_clamp_f16(snan, F16_POS_ONE, F16_POS_ZERO)
+        mutant_res = mutated_nan_leak(snan, F16_POS_ONE, F16_POS_ZERO)
+        self.assertEqual(oracle_res, F16_POS_ZERO)
+        self.assertNotEqual(oracle_res, mutant_res)
+
+    def test_mutation_corrupted_inactive_exec_lane(self) -> None:
+        state = SIMDState(wave_size=32, exec_mask=0x00000001)  # only lane 0 active
+        state.set_vgpr(1, 0, OLD_VGPR_SENTINEL)
+
+        simd_interp = SIMDInterpreter()
+        instr = VPkFmaClampF16Instruction(
+            dst=Reg(0, RegType.VGPR),
+            src0=VOP3POperand(inline_val=0.5),
+            src1=VOP3POperand(inline_val=0.5),
+            src2=VOP3POperand(inline_val=0.5),
+        )
+        simd_interp.step(instr, state)
+        self.assertEqual(state.get_vgpr(1, 0), OLD_VGPR_SENTINEL)
+
+        # Inactive lane corrupted by mutant simulator
+        state.set_vgpr(1, 0, 0x11111111)
+        self.assertNotEqual(state.get_vgpr(1, 0), OLD_VGPR_SENTINEL)
+
+
 if __name__ == "__main__":
     unittest.main()
