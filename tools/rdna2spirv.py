@@ -3595,6 +3595,18 @@ class Gen:
         self.emit(f"{arg} = OpFMul %float {t} {self.fconst(6.283185307179586)}")
         return arg
 
+    def trig_exact_zero(self, op, x, r):
+        """v_sin/v_cos: +0 where the hardware gives an exact zero, i.e. sin at an odd half turn and cos at an odd quarter
+        turn (|x - RoundEven(x)| is 0.5 or 0.25). Sin(2*pi*0.5) with a rounded 2*pi is about -8.7e-8 instead. Measured
+        natively on gfx1036 for f32 and f16, both signs, from 0.25 up to 2^22 turns (SHADER-134)."""
+        rnd, d, ad, hit, out = (self.tmp() for _ in range(5))
+        self.emit(f"{rnd} = OpExtInst %float %glsl RoundEven {x}")
+        self.emit(f"{d} = OpFSub %float {x} {rnd}")
+        self.emit(f"{ad} = OpExtInst %float %glsl FAbs {d}")
+        self.emit(f"{hit} = OpFOrdEqual %bool {ad} {self.fconst(0.5 if 'sin' in op else 0.25)}")
+        self.emit(f"{out} = OpSelect %float {hit} %f0 {r}")
+        return out
+
     def fconst(self, x):
         bits = struct.unpack("<I", struct.pack("<f", x))[0]
         return self.tof(self.cu(bits))
@@ -4177,6 +4189,7 @@ class Gen:
             f = self.modify_f(f, a[1])
             t = self.turn_angle(f)
             self.emit(f"{r} = OpExtInst %float %glsl {'Sin' if 'sin' in op else 'Cos'} {t}")
+            r = self.trig_exact_zero(op, f, r)
             r = self.clamp_mods(r, mods)
             self.write_lo16(a[0], self.f16_bits(r))    # sin ignores MODE rounding on hardware (RX 6800, SHADER-35); cos is unmeasured, assumed like it
         elif op in ("v_pk_add_u16", "v_pk_add_i16", "v_pk_sub_u16", "v_pk_sub_i16", "v_pk_mul_lo_u16",
@@ -4270,6 +4283,7 @@ class Gen:
             t = self.turn_angle(x)
             r = self.tmp()
             self.emit(f"{r} = OpExtInst %float %glsl {'Sin' if 'sin' in op else 'Cos'} {t}")
+            r = self.trig_exact_zero(op, x, r)
             self.dst(a[0], self.tou(self.clamp_mods(r, mods)))
         elif op == "v_rndne_f32":
             x = self.src_f(a[1])
