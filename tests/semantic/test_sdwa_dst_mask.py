@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import gc
 import os
+from pathlib import Path
 import struct
 import sys
 import tempfile
@@ -55,6 +56,7 @@ if HERE not in sys.path:
 import rdna2spirv
 import spirv_mini_interp as si
 import support
+from shader_ir import parse_line
 
 MASK32 = 0xFFFFFFFF
 STUB_DXBC = b"DXBC" + bytes(24) + struct.pack("<I", 0) + bytes(4)
@@ -231,6 +233,22 @@ class SdwaDstInterpreterDirectTests(unittest.TestCase):
 
 class SdwaDstTranslatorTranslationTests(unittest.TestCase):
     """End-to-end RDNA2 -> SPIR-V translation and semantic interpreter execution of pixel shaders with SDWA dst."""
+
+    def test_first_partial_write_keeps_barycentric_input_bits(self) -> None:
+        fixture = Path(HERE) / "fixtures" / "sdwa_bary_input.asm"
+        spv = support.translate_listing("ps_sdwa_bary_input", fixture.read_bytes())
+        words = support.mrt0_words(spv, inputs={"%bary": (0.25, 0.25, 0.5)})
+        self.assertEqual(words, [0x3e8000ab, 0x3f00abcd] * 2)
+
+    def test_only_a_preserving_subword_write_reads_the_destination(self) -> None:
+        for select, unused, reads_dest in (("BYTE_2", "PRESERVE", True), ("WORD_0", "PRESERVE", True),
+                                           ("DWORD", "PRESERVE", False), ("WORD_0", "PAD", False),
+                                           ("BYTE_1", "SEXT", False)):
+            with self.subTest(select=select, unused=unused):
+                ins = parse_line(f"\tv_mov_b32_sdwa v0, v4 dst_sel:{select} dst_unused:UNUSED_{unused} src0_sel:DWORD")
+                reads = {0, 4} if reads_dest else {4}
+                self.assertEqual(rdna2spirv.read_before_write_vgprs([ins]), reads)
+                self.assertEqual(rdna2spirv.reg_reads_writes([ins]), (reads, {0}))
 
     def test_unused_pad_all_subreg_slices(self):
         asm = """\
