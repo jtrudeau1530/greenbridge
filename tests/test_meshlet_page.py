@@ -57,21 +57,34 @@ def block(n, colour=True, uv1=True, normal=True, flags=0x200):
 
 
 def other_block(n, tags=((0, 0x42, 8), (2, 0x21, 4), (11, 0x27, 4), (1, 0x26, 4), (12, 0x26, 4), (3, 0x28, 4),
-                         (4, 0x28, 4), (14, 0x28, 4)), mode=2, bad_size=False):
+                         (4, 0x28, 4), (14, 0x28, 4)), axis=2, bad_size=False, packed=None, bias=(0.0, 0.0, 0.0),
+                scale=(0.0, 0.0, 0.0)):
     """A `42 40 00 00` vertex block with n vertices: 0x80-byte header, streams stored in the order given (slot, tag,
-    stride), +0x5C = 0x200, +0x6C = mode, +0x7C = 4.0f. bad_size makes the second stream one vertex short."""
+    stride), +0x5C = 0x200, +0x60 = bias, +0x6C = axis, +0x70 = scale, +0x7C = 4.0f. bad_size makes the second stream
+    one vertex short. packed, if given, is the list of (a, b, c) quantised positions for slot 0."""
     head = bytearray(0x80)
     off = 0x80
     body = bytearray()
     for k, (slot, tag, stride) in enumerate(tags):
         struct.pack_into("<I", head, 4 * slot, tag | ((off // 2) << 8))
         count = n - 1 if bad_size and k == 1 else n
-        body += bytes((v * 7 + k) & 0xFF for v in range(stride * count))
+        if k == 0 and packed is not None:
+            body += b"".join(struct.pack("<Q", pack_position(*abc)) for abc in packed)
+        else:
+            body += bytes((v * 7 + k) & 0xFF for v in range(stride * count))
         off += stride * count
     struct.pack_into("<I", head, 0x5C, 0x200)
-    struct.pack_into("<I", head, 0x6C, mode)
+    struct.pack_into("<3f", head, 0x60, *bias)
+    struct.pack_into("<I", head, 0x6C, axis)
+    struct.pack_into("<3f", head, 0x70, *scale)
     struct.pack_into("<f", head, 0x7C, 4.0)
     return bytes(head + body)
+
+
+def pack_position(a, b, c):
+    """The 8-byte position word: a (24 bits) at bits 8-31, b's low byte at bits 0-7 and its high 16 bits at 32-47,
+    c (16 bits) at 48-63."""
+    return (b & 0xFF) | (a << 8) | ((b >> 8) << 32) | (c << 48)
 
 
 def group(sizes):
@@ -220,7 +233,7 @@ class ParseTests(unittest.TestCase):
         chunks = mp.parse_page(data)
         self.assertEqual([c["kind"] for c in chunks], ["block4240", "group"])
         b = chunks[0]
-        self.assertEqual((b["vertices"], b["flags"], b["mode"]), (40, 0x200, 2))
+        self.assertEqual((b["vertices"], b["flags"], b["axis"]), (40, 0x200, 2))
         self.assertEqual([s[0] for s in b["slots"]], [0, 1, 2, 3, 4, 11, 12, 14])
         summary = mp.summarise_page(data, "x")
         self.assertEqual((summary["starts_with"], summary["sequence"]), ("block4240", "QG"))
@@ -260,11 +273,11 @@ class ParseTests(unittest.TestCase):
         self.assertEqual([s[0] for s in chunks[0]["slots"]], [0, 1, 2, 3, 12])
 
     def test_totals_count_4240_blocks(self):
-        pages = [mp.summarise_page(page(other_block(12, mode=1), group([(12, 5)])), "a"),
-                 mp.summarise_page(page(other_block(8, mode=0)), "b")]
+        pages = [mp.summarise_page(page(other_block(12, axis=1), group([(12, 5)])), "a"),
+                 mp.summarise_page(page(other_block(8, axis=0)), "b")]
         t = mp.totals(pages)
         self.assertEqual((t["block_4240_led_pages"], t["blocks_4240"], t["vertices_4240"]), (2, 2, 20))
-        self.assertEqual((t["blocks_4240_flags"], t["blocks_4240_modes"]), ([0x200], [0, 1]))
+        self.assertEqual((t["blocks_4240_flags"], t["blocks_4240_axes"]), ([0x200], [0, 1]))
         self.assertEqual(t["groups_matching_4240_block_here"], 1)
 
     def test_stop_in_truncated_group(self):
@@ -334,6 +347,96 @@ class RejectTests(unittest.TestCase):
         data = page(block(4)) + struct.pack("<I", 0x1234) + b"\0" * 12
         summary = mp.summarise_page(data, "x")
         self.assertIn("unknown chunk", summary["error"])
+
+
+def grid_group(cols, rows):
+    """One meshlet over a cols x rows vertex grid (row-major), two consistently wound triangles per cell."""
+    tris = []
+    for r in range(rows - 1):
+        for c in range(cols - 1):
+            v = r * cols + c
+            tris += [(v, v + 1, v + cols), (v + 1, v + cols + 1, v + cols)]
+    vc = cols * rows
+    head = struct.pack("<3I", 0x80000000 | 1, len(tris), vc)
+    rec = struct.pack("<4I", (vc - 1) | ((len(tris) - 1) << 7), 0, 0x7FF7FF, 0x7FF)
+    body = b"".join(struct.pack("<I", a | (b << 7) | (c << 14)) for a, b, c in tris)
+    return head + rec + body + b"".join(struct.pack("<H", v) for v in range(vc))
+
+
+class Positions4240Tests(unittest.TestCase):
+    BIAS = (-1.5, 2.25, 0.5)
+    SCALE = (2.0 ** -20, 2.0 ** -18, 2.0 ** -10)
+    PACKED = [(0, 0, 0), (0xFFFFFF, 0xFFFFFF, 0xFFFF), (0xABCDEF, 0x123456, 0x789A), (1, 0x100, 2)]
+
+    def decode(self, axis):
+        data = page(other_block(4, axis=axis, packed=self.PACKED, bias=self.BIAS, scale=self.SCALE))
+        return mp.positions_4240(data, mp.parse_page(data)[0])
+
+    def test_packed_position_fields(self):
+        want = [tuple(b + s * q for b, s, q in zip(self.BIAS, self.SCALE, abc)) for abc in self.PACKED]
+        self.assertEqual(self.decode(2), want)
+        # the two 24-bit fields take their own bytes: a from bits 8-31, b from bits 32-47 and 0-7
+        self.assertEqual(self.decode(2)[2], (-1.5 + 0xABCDEF * 2.0 ** -20, 2.25 + 0x123456 * 2.0 ** -18,
+                                             0.5 + 0x789A * 2.0 ** -10))
+
+    def test_axis_order(self):
+        xyz = self.decode(2)
+        self.assertEqual(self.decode(0), [(c, b, a) for a, b, c in xyz])
+        self.assertEqual(self.decode(1), [(b, c, a) for a, b, c in xyz])
+
+    def test_bad_axis_and_tag_are_errors(self):
+        data = page(other_block(4, axis=3))
+        with self.assertRaises(mp.PageError):
+            mp.positions_4240(data, mp.parse_page(data)[0])
+        self.assertIn("axis word 3", mp.summarise_page(data, "x")["error"])
+        data = page(other_block(4, tags=((0, 0x28, 4), (1, 0x26, 4))))
+        with self.assertRaises(mp.PageError):
+            mp.positions_4240(data, mp.parse_page(data)[0])
+
+    def test_face_agreement(self):
+        flat = [(x, y, 0.0) for y in range(3) for x in range(3)]
+        tris = [(0, 1, 3), (1, 4, 3), (1, 2, 4), (2, 5, 4)]
+        self.assertEqual(mp.face_agreement(flat, tris), {"shared_edges": 3, "agree": 3, "opposed": 0})
+        flipped = tris[:3] + [(2, 4, 5)]
+        self.assertEqual(mp.face_agreement(flat, flipped), {"shared_edges": 3, "agree": 2, "opposed": 1})
+        # a fold of 90 degrees counts as neither
+        self.assertEqual(mp.face_agreement([(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (1.0, 0.0, 1.0)],
+                                           [(0, 1, 2), (1, 0, 3)]), {"shared_edges": 1, "agree": 0, "opposed": 0})
+
+    def test_page_checks_and_faces(self):
+        cols, rows = 6, 5
+        # a grid in (a, b) at c = 7: axis 0 turns it into a plane of constant x
+        packed = [(c * 4096, r * 4096 + 17, 7) for r in range(rows) for c in range(cols)]
+        data = page(other_block(cols * rows, axis=0, packed=packed, bias=self.BIAS, scale=self.SCALE),
+                    grid_group(cols, rows))
+        self.assertEqual([c["kind"] for c in mp.parse_page(data)], ["block4240", "group"])
+        plain = mp.summarise_page(data, "p")
+        self.assertEqual((plain["checks"]["positions_4240"], plain["checks"]["positions_4240_finite"],
+                          plain["checks"]["positions_4240_within_300m"]), (30, 30, 30))
+        self.assertNotIn("faces_4240_shared_edges", plain["checks"])
+        faces = mp.summarise_page(data, "p", faces=True)["checks"]
+        cells = (cols - 1) * (rows - 1)
+        shared = cells + (cols - 1) * (rows - 2) + (cols - 2) * (rows - 1)
+        self.assertEqual((faces["faces_4240_shared_edges"], faces["faces_4240_agree"], faces["faces_4240_opposed"]),
+                         (shared, shared, 0))
+        # axis 0 stores (z, y, x): the constant c field is x
+        self.assertEqual(len({p[0] for p in mp.positions_4240(data, mp.parse_page(data)[0])}), 1)
+
+    def test_cli_faces(self):
+        packed = [(c * 4096, r * 4096, 3) for r in range(4) for c in range(4)]
+        data = page(other_block(16, packed=packed, bias=self.BIAS, scale=self.SCALE), grid_group(4, 4))
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "p.bin")
+            with open(src, "wb") as fh:
+                fh.write(data)
+            out = os.path.join(tmp, "r.json")
+            r = subprocess.run([sys.executable, "-I", TOOL, src, "--faces", "--json", out, "--quiet"],
+                               capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            with open(out, encoding="utf-8") as fh:
+                checks = json.load(fh)["totals"]["checks"]
+        self.assertEqual((checks["positions_4240"], checks["faces_4240_agree"], checks["faces_4240_opposed"]),
+                         (16, 21, 0))
 
 
 class CliTests(unittest.TestCase):

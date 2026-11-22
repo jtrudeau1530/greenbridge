@@ -186,10 +186,10 @@ instead of stopping. The header is 0x80 bytes:
 |---:|---|---|---|
 | +0x00..+0x58 | 23 slot words, encoded as in the `63 30` block; slot 0 is tag 0x42 at +0x80 | all blocks | high |
 | +0x5C | u32 | 0x200, the same word as the `63 30` block's +0x5C | high (value), open (meaning) |
-| +0x60..+0x68 | three words that read as plausible f32 values | | open (likely a position offset) |
-| +0x6C | u32 | 0, 1 or 2 | open |
-| +0x70..+0x78 | three words that read as small positive f32 values | | open (likely per-axis scales) |
-| +0x7C | u32 | 0x40800000 (4.0f) | open |
+| +0x60..+0x68 | f32 × 3, position bias | all blocks | high (see below) |
+| +0x6C | u32, axis order of the stored position | 0, 1 or 2 in every block | high (see below) |
+| +0x70..+0x78 | f32 × 3, position scale | all positive | high (see below) |
+| +0x7C | u32 | 0x40800000 (4.0f) | high (value), open (meaning) |
 
 Per-vertex stride by slot tag: 0x42 is 8 bytes; 0x21, 0x26, 0x27 and 0x28 are 4 bytes (0x26 also in the `63 30`
 block, where it is RGBA8). The slots used are 0-4 and 11-14. The vertex count is the slot-0 span divided by 8, and
@@ -200,9 +200,37 @@ block (2), so nothing is left between chunks. 246 more hits have slot tags with 
 headers and are left alone. One `63 30` block also has a slot 12 (tag 0x26, 4 bytes) between slots 1 and 3; it
 sizes with the same tag rule.
 
-The 8-byte position stream and the 4-byte attributes are not decoded. As 4 × u16 the positions span the whole u16
-range on most axes, which suggests a quantisation to a box given by the f32 words above. The layout isn't settled,
-so the tool reports sizes and counts only.
+**Slot 0 is a packed position.** It's the `(8, 16)` position form that
+`third_party/rpf9-explorer/Core/RageModelDecoder.cs` (lines 772-790) already reads for models. Take the 8 bytes as one
+u64 `q`:
+- `a` = bits 8-31 (24 bits);
+- `b` = bits 32-47 shifted up 8, or'd with bits 0-7 (24 bits);
+- `c` = bits 48-63 (16 bits).
+
+Then `(a, b, c) = bias + scale × (a, b, c)`. The axis word says how the three are stored: 0 is (z, y, x), 1 is
+(y, z, x), 2 is (x, y, z). `tools/meshlet_page.py` decodes the positions with this rule (`positions_4240`) and reports
+counts only.
+
+I checked the rule independently over `shared_minigame000.rpf`, counts only:
+- **Field ends.** Across triangle edges of the 757 groups in the first 300 streams, the chance that a bit of `q`
+  differs between the two ends falls steadily towards bits 31, 47 and 63 (0.008, 0.008, 0.020) and jumps back to
+  about 0.45 at bits 32 and 48. So the fields end exactly there. Bits 0 and 8 differ about half as often as their
+  neighbours (0.24); they are the lowest bits of `b` and `a`.
+- **Scales.** Over 1,517 blocks, the edge-length ratio between the first two 16-bit fields follows the ratio of
+  +0x70 to +0x74 (r = −0.59 on the logs). For x and y the bias plus half of `scale × 2^24` lands on 0 for many
+  objects: within 5% of |bias| for 32% of axes, against at most 1.3% for any other power of two tried.
+- **Neighbouring faces.** These are the counts `--faces` gives over all 1,569 streams:
+
+| Positions | Finite | Within 300 m | Shared edges | Faces within ~25° (dot > 0.9) | Opposed (dot < −0.9) |
+|---:|---:|---:|---:|---:|---:|
+| 15,956,983 | 15,956,983 | 15,945,428 | 17,335,198 | 14,501,371 (83.7%) | 44,414 (0.26%) |
+
+Deliberately wrong reads of the first 300 streams don't hold up:
+- **The three u16 at bytes 0-5 as a position:** 40.9% within 25° and 20.0% opposed. The rule gives 79.3% and 0.09%.
+- **The low bytes swapped between `a` and `b`:** the same at 25°, but fewer neighbours within 0.1° than with no low
+  bytes at all. Within 0.1° the counts are 7.56% swapped, 8.59% with the high 16 bits only, and 9.19% with the rule.
+
+The 4-byte attribute streams (tags 0x21, 0x26, 0x27, 0x28) are still not decoded.
 
 With these blocks sized, the archive walk accepts 1,569 streams and leaves 0 unparsed:
 
@@ -216,12 +244,12 @@ stream. 520 streams end inside a group that continues in the next one; 5 stop at
 doesn't fit. The `63 30` checks are unchanged on the 3 extra blocks: all positions finite and all normals of unit
 length.
 
-Still open: the +0x5C word, meshlet record bits 14-31 and words +8/+12, and the `42 40 00 00` position and
-attribute encodings (the header words +0x60..+0x7C above). The record words +8/+12 keep their default
+Still open: the +0x5C and +0x7C words, meshlet record bits 14-31 and words +8/+12, and the `42 40 00 00`
+attribute encodings. The record words +8/+12 keep their default
 (0x007FF7FF / 0x7FF) in 2,453 of the 9,134 meshlets of the earlier scope. The rest stay close to 0x7FF/0x800 per
 12-bit field, which looks like a quantised vector. They don't correlate with the mean normal or the centre of the
-meshlet's vertices in a `63 30` block (|r| < 0.13 on the 2,449 meshlets that have one), so they need the `42 40`
-positions to test.
+meshlet's vertices in a `63 30` block (|r| < 0.13 on the 2,449 meshlets that have one). The `42 40` positions
+above make that test possible on the other 150,000 meshlets.
 
 ### `story000_script.rpf`, full
 
