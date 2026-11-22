@@ -726,5 +726,111 @@ class TestBoundaryExtremesAndBitPatterns(unittest.TestCase):
         self.assertEqual(ref_ds_sub_src2_u32(0x80000000, 1), 0x7FFFFFFF)
 
 
+class TestNegativeControlsAndMutations(unittest.TestCase):
+    """Unit tests for negative controls, syntax rejection, and mutation detection."""
+
+    def test_syntax_rejection_registers(self) -> None:
+        with self.assertRaises(ValueError):
+            RegisterOperand(-1, RegType.VGPR)
+        with self.assertRaises(ValueError):
+            RegisterOperand(256, RegType.VGPR)
+
+    def test_syntax_rejection_offsets(self) -> None:
+        v0 = RegisterOperand(0, RegType.VGPR)
+        with self.assertRaises(ValueError):
+            LDSAddressExpression(v0, offset0=-1)
+        with self.assertRaises(ValueError):
+            LDSAddressExpression(v0, offset0=256)
+        with self.assertRaises(ValueError):
+            LDSAddressExpression(v0, offset1=-1)
+        with self.assertRaises(ValueError):
+            LDSAddressExpression(v0, offset1=256)
+
+    def test_syntax_rejection_lds_capacity(self) -> None:
+        with self.assertRaises(ValueError):
+            LDSMemory(size_dwords=0)
+        with self.assertRaises(ValueError):
+            LDSMemory(size_dwords=500)
+
+    def test_syntax_rejection_simd_lanes(self) -> None:
+        with self.assertRaises(ValueError):
+            SIMDState(num_lanes=16)
+
+    def test_mutation_detection_reversed_sub(self) -> None:
+        def mutant_sub(a: int, b: int) -> int:
+            return u32(u32(b) - u32(a))
+
+        val_a, val_b = 30, 10
+        correct_res = ref_ds_sub_src2_u32(val_a, val_b)
+        mutant_res = mutant_sub(val_a, val_b)
+        self.assertEqual(correct_res, 20)
+        self.assertEqual(mutant_res, u32(-20))
+        self.assertNotEqual(correct_res, mutant_res)
+
+    def test_mutation_detection_unmasked_add(self) -> None:
+        def mutant_add(a: int, b: int) -> int:
+            return a + b
+
+        val_a, val_b = MASK32, 1
+        correct_res = ref_ds_add_src2_u32(val_a, val_b)
+        mutant_res = mutant_add(val_a, val_b)
+        self.assertEqual(correct_res, 0)
+        self.assertEqual(mutant_res, 0x100000000)
+        self.assertNotEqual(correct_res, mutant_res)
+
+    def test_mutation_detection_exec_leak(self) -> None:
+        class MutantSIMD(SIMDInterpreter):
+            def execute(self, instr: DSSrc2Instruction, state: SIMDState) -> None:
+                for lane in range(state.num_lanes):
+                    base_addr = state.get_lane_vgpr(lane, instr.addr.base_reg.index)
+                    _, _, idx_a, _ = calc_lds_src2_addresses(
+                        vaddr=base_addr,
+                        offset0=instr.addr.offset0,
+                        offset1=instr.addr.offset1,
+                        lds_dwords=state.lds.size_dwords,
+                    )
+                    state.lds.write_dword(idx_a, 999)
+
+        state = SIMDState(num_lanes=32, exec_mask=0, lds_dwords=1024)
+        v0 = RegisterOperand(0, RegType.VGPR)
+        instr = DSSrc2Instruction(
+            DSOpcode.DS_ADD_SRC2_U32,
+            LDSAddressExpression(v0, offset0=0, offset1=1),
+        )
+        state.lds.write_dword(0, 10)
+
+        mutant = MutantSIMD()
+        mutant.execute(instr, state)
+        self.assertEqual(state.lds.read_dword(0), 999)
+
+        state.lds.write_dword(0, 10)
+        standard = SIMDInterpreter()
+        standard.execute(instr, state)
+        self.assertEqual(state.lds.read_dword(0), 10)
+
+    def test_mutation_detection_vaddr_clobber(self) -> None:
+        class MutantScalar(ScalarInterpreter):
+            def execute(self, instr: DSSrc2Instruction, state: ScalarMachineState) -> None:
+                super().execute(instr, state)
+                state.set_vgpr(instr.addr.base_reg.index, 0xBADF00D)
+
+        state = ScalarMachineState(lds_dwords=1024)
+        state.set_vgpr(0, 0x10)
+        v0 = RegisterOperand(0, RegType.VGPR)
+        instr = DSSrc2Instruction(
+            DSOpcode.DS_ADD_SRC2_U32,
+            LDSAddressExpression(v0, offset0=0, offset1=1),
+        )
+
+        mutant = MutantScalar()
+        mutant.execute(instr, state)
+        self.assertEqual(state.get_vgpr(0), 0xBADF00D)
+
+        state.set_vgpr(0, 0x10)
+        standard = ScalarInterpreter()
+        standard.execute(instr, state)
+        self.assertEqual(state.get_vgpr(0), 0x10)
+
+
 if __name__ == "__main__":
     unittest.main()
