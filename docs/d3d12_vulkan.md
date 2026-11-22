@@ -259,6 +259,8 @@ What is implemented (all of it testable without the game):
   - Single-sampled `A8_UNORM` 2D textures use one byte per texel in `VK_FORMAT_R8_UNORM`. Their SRVs expose
     (0, 0, 0, A) before applying the caller's component mapping. Format support includes `MIP` when the Vulkan
     image supports multiple levels. Render-target, depth-stencil and UAV creation are unsupported for this format.
+    support, format support, format plane counts, multisample quality levels, shader model and root signature
+    version. Other queries are logged and refused until the trace shows what the game asks (question 11);
   - reserved resources and `GetResourceTiling` (section 4.2);
   - query heaps for occlusion, timestamps and pipeline statistics, and `GetTimestampFrequency` on the queue
     (section 4.6);
@@ -892,6 +894,11 @@ The trace will enumerate them.
     `SupportedSampleCountsWithNoOutputs = 0x1f`, `LEONIDA_VK_VALIDATION=1` with `0` validation errors).
 - `D3D12_FEATURE_FORMAT_SUPPORT`: map to `vkGetPhysicalDeviceFormatProperties`; multisample render-target
   and resolve bits also require the format's image-usage/sample-count query to succeed.
+- `D3D12_FEATURE_FORMAT_INFO`: report the DXGI plane count independently of Vulkan texture support. Both
+  depth/stencil families (including their view formats), NV12, P010, P016 and NV11 have two planes. The
+  device test compares counts and HRESULTs with native D3D12 on the same adapter. If an older host rejects the
+  sampler-feedback formats or `A4B4G4R4_UNORM` with `E_INVALIDARG`, the test still requires the layer to return
+  `S_OK` and one plane for them.
 - `D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS`: query `vkGetPhysicalDeviceImageFormatProperties` for the matching
   colour or depth/stencil attachment usage, plus the transfer and sampled usages used by the resource implementation.
   Vulkan exposes one standard sample pattern, so a supported sample count reports one quality level (quality index 0);
