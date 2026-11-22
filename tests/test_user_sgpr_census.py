@@ -3,6 +3,8 @@ import json
 import os
 import sys
 
+import pytest
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
 
@@ -71,6 +73,41 @@ def test_the_two_packing_models_are_told_apart():
     assert b["most_common_lowest_pointer_sgpr"] == 8
     assert "ptr64_hi" not in b["shaders_reading_kind"]
     assert b["below_base"] == {"s1:const32": 1}
+
+
+@pytest.mark.parametrize("output_kind", ["same-path", "relative-alias", "hard-link"])
+def test_json_report_refuses_to_overwrite_index(tmp_path, capsys, output_kind):
+    index = tmp_path / "index.json"
+    original = json.dumps(INDEX).encode("utf-8")
+    index.write_bytes(original)
+    output = index
+    if output_kind == "relative-alias":
+        subdir = tmp_path / "subdir"
+        subdir.mkdir()
+        output = subdir / ".." / index.name
+    elif output_kind == "hard-link":
+        output = tmp_path / "alias.json"
+        try:
+            output.hardlink_to(index)
+        except OSError as err:
+            pytest.skip(f"hard links unavailable: {err}")
+
+    with pytest.raises(SystemExit) as exc:
+        usc.main([str(index), "--json", str(output)])
+
+    assert exc.value.code == 2
+    assert "--json must not overwrite the input index" in capsys.readouterr().err
+    assert index.read_bytes() == original
+
+
+def test_json_report_accepts_a_separate_output(tmp_path):
+    index = tmp_path / "index.json"
+    output = tmp_path / "summary.json"
+    index.write_text(json.dumps(INDEX), encoding="utf-8")
+
+    assert usc.main([str(index), "--json", str(output)]) == 0
+    assert json.loads(output.read_text(encoding="utf-8"))["ps"]["lowest_pointer_sgpr"] == {"s8": 2, "s9": 1}
+    assert json.loads(index.read_text(encoding="utf-8")) == INDEX
 
 
 def test_expect_passes_and_fails(tmp_path, capsys):
