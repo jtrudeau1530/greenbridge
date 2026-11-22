@@ -867,6 +867,56 @@ int compare_allocation_info(ID3D12Device* ours) {
     if (empty_a.SizeInBytes != empty_b.SizeInBytes || empty_a.Alignment != empty_b.Alignment)
         mismatch("no resources", empty_a, empty_b);
 
+    // A visible mask above 1 names a node a single-node adapter does not have: the host answers the invalid
+    // allocation (size UINT64_MAX, 64 KiB alignment), for one resource and for none, through GetResourceAllocationInfo
+    // and its 1 and 2 variants, and leaves the per-resource array as it was.
+    {
+        Ref<ID3D12Device4> ours4, host4;
+        Ref<ID3D12Device8> ours8_mask, host8_mask;
+        ours->QueryInterface(IID_PPV_ARGS(&ours4.p));
+        host->QueryInterface(IID_PPV_ARGS(&host4.p));
+        ours->QueryInterface(IID_PPV_ARGS(&ours8_mask.p));
+        host->QueryInterface(IID_PPV_ARGS(&host8_mask.p));
+        const D3D12_RESOURCE_DESC buffer = buffer_desc(256);
+        D3D12_RESOURCE_DESC1 buffer1{};
+        buffer1.Dimension = buffer.Dimension;
+        buffer1.Width = buffer.Width;
+        buffer1.Height = buffer1.DepthOrArraySize = buffer1.MipLevels = 1;
+        buffer1.SampleDesc.Count = 1;
+        buffer1.Layout = buffer.Layout;
+        const auto same_info = [](const D3D12_RESOURCE_ALLOCATION_INFO& x, const D3D12_RESOURCE_ALLOCATION_INFO& y) {
+            return x.SizeInBytes == y.SizeInBytes && x.Alignment == y.Alignment;
+        };
+        for (const UINT mask : {0u, 1u, 2u, 3u, 0x80000000u}) {
+            char name[64];
+            std::snprintf(name, sizeof(name), "visible mask 0x%x", mask);
+            for (const UINT count : {0u, 1u}) {
+                const D3D12_RESOURCE_DESC* descs = count ? &buffer : nullptr;
+                const auto ia = ours->GetResourceAllocationInfo(mask, count, descs);
+                const auto ib = host->GetResourceAllocationInfo(mask, count, descs);
+                if (!same_info(ia, ib)) mismatch(name, ia, ib);
+            }
+            if (ours4.p && host4.p) {
+                const D3D12_RESOURCE_ALLOCATION_INFO1 sentinel{0xdead, 0xbeef, 0xcafe};
+                D3D12_RESOURCE_ALLOCATION_INFO1 each_a = sentinel, each_b = sentinel;
+                const auto ia = ours4->GetResourceAllocationInfo1(mask, 1, &buffer, &each_a);
+                const auto ib = host4->GetResourceAllocationInfo1(mask, 1, &buffer, &each_b);
+                if (!same_info(ia, ib) || each_a.Offset != each_b.Offset || each_a.SizeInBytes != each_b.SizeInBytes ||
+                    each_a.Alignment != each_b.Alignment)
+                    mismatch("visible mask, GetResourceAllocationInfo1", ia, ib);
+            }
+            if (ours8_mask.p && host8_mask.p) {
+                const D3D12_RESOURCE_ALLOCATION_INFO1 sentinel{0xdead, 0xbeef, 0xcafe};
+                D3D12_RESOURCE_ALLOCATION_INFO1 each_a = sentinel, each_b = sentinel;
+                const auto ia = ours8_mask->GetResourceAllocationInfo2(mask, 1, &buffer1, &each_a);
+                const auto ib = host8_mask->GetResourceAllocationInfo2(mask, 1, &buffer1, &each_b);
+                if (!same_info(ia, ib) || each_a.Offset != each_b.Offset || each_a.SizeInBytes != each_b.SizeInBytes ||
+                    each_a.Alignment != each_b.Alignment)
+                    mismatch("visible mask, GetResourceAllocationInfo2", ia, ib);
+            }
+        }
+    }
+
     Ref<ID3D12Device8> ours8;
     // MULTISAMPLE_QUALITY_LEVELS with TILED_RESOURCE: the same answers as the host, except 128-bit formats at 4x,
     // which the AMD drivers refuse and WARP and NVIDIA report (and GetResourceAllocationInfo allocates here).

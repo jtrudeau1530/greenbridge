@@ -5752,16 +5752,23 @@ public:
     // to D3D12's alignment for it; the alignment itself is D3D12's, since placed textures bind their own memory
     // (section 4.2). Several resources are laid out one after another, each at its own alignment. An invalid
     // description gives SizeInBytes = UINT64_MAX, as on D3D12. d3d12_vulkan_device_test compares with the PC runtime.
+    // A visible mask above 1 names a node the single-node adapter lacks: the same invalid answer, also for no
+    // resources at all, and the per-resource array is left untouched (host runtime and WARP, measured).
     D3D12_RESOURCE_ALLOCATION_INFO STDMETHODCALLTYPE GetResourceAllocationInfo(
-        UINT, UINT count, const D3D12_RESOURCE_DESC* descs) override {
+        UINT visible_mask, UINT count, const D3D12_RESOURCE_DESC* descs) override {
+        if (visible_mask > 1) return kInvalidAllocation;
         return place(count, descs, [&](UINT i) { return descs[i]; }, nullptr);
     }
     D3D12_RESOURCE_ALLOCATION_INFO STDMETHODCALLTYPE GetResourceAllocationInfo1(
-        UINT, UINT count, const D3D12_RESOURCE_DESC* descs, D3D12_RESOURCE_ALLOCATION_INFO1* each) override {
+        UINT visible_mask, UINT count, const D3D12_RESOURCE_DESC* descs,
+        D3D12_RESOURCE_ALLOCATION_INFO1* each) override {
+        if (visible_mask > 1) return kInvalidAllocation;
         return place(count, descs, [&](UINT i) { return descs[i]; }, each);
     }
     D3D12_RESOURCE_ALLOCATION_INFO STDMETHODCALLTYPE GetResourceAllocationInfo2(
-        UINT, UINT count, const D3D12_RESOURCE_DESC1* descs, D3D12_RESOURCE_ALLOCATION_INFO1* each) override {
+        UINT visible_mask, UINT count, const D3D12_RESOURCE_DESC1* descs,
+        D3D12_RESOURCE_ALLOCATION_INFO1* each) override {
+        if (visible_mask > 1) return kInvalidAllocation;
         return place(count, descs, [&](UINT i) {
             const D3D12_RESOURCE_DESC1& d = descs[i];
             if (d.SamplerFeedbackMipRegion.Width || d.SamplerFeedbackMipRegion.Height ||
