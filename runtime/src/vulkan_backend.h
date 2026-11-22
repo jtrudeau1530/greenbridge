@@ -175,6 +175,11 @@ public:
         return tracker_.layout(id, subresource);
     }
 
+    bool has_resource(ResourceId id) {
+        std::lock_guard lock(mutex_);
+        return resources_.find(id) != resources_.end();
+    }
+
     // `prepare` is called with the context locked, at the start of the command buffer of every
     // ExecuteCommandLists, before the lists are written: the device brings the bindless set 0 of the translated
     // shaders up to date there (vulkan_bindless.h) and records what the set needs first. When it fails, nothing

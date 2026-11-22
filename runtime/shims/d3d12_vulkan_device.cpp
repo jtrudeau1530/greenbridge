@@ -4,12 +4,16 @@
 // info, CPU texture copies (WriteToSubresource/ReadFromSubresource), query heaps, a few feature queries. Everything else is a
 // generated stub that reports itself once. See docs/d3d12_vulkan.md section 4.1/4.2 for what each answer means and
 // what is still open.
+#ifndef VK_USE_PLATFORM_WIN32_KHR
+#define VK_USE_PLATFORM_WIN32_KHR
+#endif
 #include "d3d12_com.h"
 
 #include "d3d12_stubs.h"  // generated
 #include "d3d12_com_object.h"
 #include "d3d12_trace.h"
 #include "d3d12_xs_device.h"
+#include "dxgi_com.h"
 #include "../src/gfx10_descriptors.h"
 #include "../src/vulkan_bindless.h"
 #include "../src/vulkan_memory.h"
@@ -1445,6 +1449,7 @@ public:
     bool ok() const { return state_.context && state_.context->loaded(); }
     const VulkanDeviceInfo& info() const { return state_.info; }
     bool upload_in_vram() const { return state_.upload_in_vram; }
+    leonida::VulkanContext& context() { return *state_.context; }
     const leonida::BindlessSet* bindless() const { return state_.bindless.get(); }
     void own(const OwnedRuntime& owned) { owned_ = owned; }
     void set_outer(IUnknown* outer) { outer_ = outer; }
@@ -1632,21 +1637,29 @@ public:
         d3d12_trace::record("ID3D12Device::CreateRenderTargetView");
         if (!destination.ptr) return;
         leonida::TargetView view{};
+        leonida::ResourceId rid = 0;
+        D3D12_RESOURCE_DESC rd{};
         if (const Resource* r = Resource::from<Resource>(resource)) {
-            const D3D12_RESOURCE_DESC rd = const_cast<Resource*>(r)->GetDesc();
-            view = {r->id(), 0, 0, rd.DepthOrArraySize};
+            rid = r->id();
+            rd = const_cast<Resource*>(r)->GetDesc();
+        } else if (resource && state_.context->has_resource(resource_id(resource))) {
+            rid = resource_id(resource);
+            rd = resource->GetDesc();
+        }
+        if (rid) {
+            view = {rid, 0, 0, rd.DepthOrArraySize};
             if (rd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D) {
-                view = volume_rtv(r->id(), rd, desc);
+                view = volume_rtv(rid, rd, desc);
             } else if (desc && desc->ViewDimension == D3D12_RTV_DIMENSION_TEXTURE2D) {
-                view = {r->id(), desc->Texture2D.MipSlice, 0, 1};
+                view = {rid, desc->Texture2D.MipSlice, 0, 1};
             } else if (desc && desc->ViewDimension == D3D12_RTV_DIMENSION_TEXTURE2DMS) {
-                view = {r->id(), 0, 0, 1};
+                view = {rid, 0, 0, 1};
             } else if (desc && desc->ViewDimension == D3D12_RTV_DIMENSION_TEXTURE2DARRAY) {
-                view = {r->id(), desc->Texture2DArray.MipSlice, desc->Texture2DArray.FirstArraySlice,
+                view = {rid, desc->Texture2DArray.MipSlice, desc->Texture2DArray.FirstArraySlice,
                         desc->Texture2DArray.ArraySize};
             } else if (desc && desc->ViewDimension == D3D12_RTV_DIMENSION_TEXTURE2DMSARRAY) {
                 // Multisample textures have one mip, so only the slice range is chosen (as for the DSV).
-                view = {r->id(), 0, desc->Texture2DMSArray.FirstArraySlice, desc->Texture2DMSArray.ArraySize};
+                view = {rid, 0, desc->Texture2DMSArray.FirstArraySlice, desc->Texture2DMSArray.ArraySize};
             } else if (desc) {
                 log_once("render-target view dimension not supported:", desc->ViewDimension);
                 view = {};
@@ -1654,7 +1667,7 @@ public:
             const bool typeless_rgba8 = rd.Format == DXGI_FORMAT_R8G8B8A8_TYPELESS;
             const bool typed_rgba8 = rd.Format == DXGI_FORMAT_R8G8B8A8_UNORM ||
                 rd.Format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB || rd.Format == DXGI_FORMAT_R8G8B8A8_UINT;
-            if (r->desc().Format == DXGI_FORMAT_A8_UNORM || (desc && desc->Format == DXGI_FORMAT_A8_UNORM)) {
+            if (rd.Format == DXGI_FORMAT_A8_UNORM || (desc && desc->Format == DXGI_FORMAT_A8_UNORM)) {
                 view = {};
             } else if (typeless_rgba8 || typed_rgba8) {
                 const DXGI_FORMAT requested = desc && desc->Format != DXGI_FORMAT_UNKNOWN ? desc->Format : rd.Format;
@@ -3034,6 +3047,20 @@ VkDescriptorSetLayout bindless_set_layout(ID3D12Device* device) {
     return set ? set->layout() : VK_NULL_HANDLE;
 }
 
+HRESULT create_dxgi_factory(ID3D12Device* device, REFIID riid, void** out) {
+    if (!out) return E_POINTER;
+    *out = nullptr;
+    if (!device) return E_INVALIDARG;
+    ID3D12Device* real = rt::d3d12_xs::device_proxy_real_device(device);
+    Device* d = Device::from<Device>(real ? real : device);
+    if (!d) return E_INVALIDARG;
+    const auto& i = d->info();
+    const auto gdpa = reinterpret_cast<PFN_vkGetDeviceProcAddr>(i.get_instance_proc(i.instance, "vkGetDeviceProcAddr"));
+    if (!gdpa) return E_FAIL;
+    return rt::dxgi::create_factory(d->context(), i.get_instance_proc, i.instance, i.physical, gdpa, i.queue,
+                                    i.queue_family, riid, out);
+}
+
 // Creates its own Vulkan 1.3 instance and device. LEONIDA_VK_VALIDATION=1 adds VK_LAYER_KHRONOS_validation.
 HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     if (!out) return E_POINTER;
@@ -3047,11 +3074,31 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
         return E_FAIL;
     }
     const auto create_instance = reinterpret_cast<PFN_vkCreateInstance>(get(nullptr, "vkCreateInstance"));
+    const auto enum_inst_exts = reinterpret_cast<PFN_vkEnumerateInstanceExtensionProperties>(
+        get(nullptr, "vkEnumerateInstanceExtensionProperties"));
+    std::vector<const char*> inst_exts;
+    if (enum_inst_exts) {
+        std::uint32_t ext_cnt = 0;
+        enum_inst_exts(nullptr, &ext_cnt, nullptr);
+        std::vector<VkExtensionProperties> available(ext_cnt);
+        enum_inst_exts(nullptr, &ext_cnt, available.data());
+        bool has_surface = false, has_win32 = false;
+        for (const auto& e : available) {
+            if (!std::strcmp(e.extensionName, VK_KHR_SURFACE_EXTENSION_NAME)) has_surface = true;
+            if (!std::strcmp(e.extensionName, VK_KHR_WIN32_SURFACE_EXTENSION_NAME)) has_win32 = true;
+        }
+        if (has_surface && has_win32) {
+            inst_exts.push_back(VK_KHR_SURFACE_EXTENSION_NAME);
+            inst_exts.push_back(VK_KHR_WIN32_SURFACE_EXTENSION_NAME);
+        }
+    }
     VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
     app.pApplicationName = "gta6rt";
     app.apiVersion = VK_API_VERSION_1_3;
     VkInstanceCreateInfo instance_info{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
     instance_info.pApplicationInfo = &app;
+    instance_info.enabledExtensionCount = static_cast<std::uint32_t>(inst_exts.size());
+    instance_info.ppEnabledExtensionNames = inst_exts.empty() ? nullptr : inst_exts.data();
     const char* layer = "VK_LAYER_KHRONOS_validation";
     const VkValidationFeatureEnableEXT sync_validation = VK_VALIDATION_FEATURE_ENABLE_SYNCHRONIZATION_VALIDATION_EXT;
     VkValidationFeaturesEXT validation_features{VK_STRUCTURE_TYPE_VALIDATION_FEATURES_EXT};
@@ -3133,20 +3180,24 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
                         : "no GPU named by LEONIDA_VK_DEVICE has Vulkan 1.3 with dynamicRendering, synchronization2, "
                           "timelineSemaphore and separateDepthStencilLayouts");
 
-    // VK_EXT_conditional_rendering for SetPredication, when the GPU has it (optional: docs/d3d12_vulkan.md 4.7).
+    // VK_EXT_conditional_rendering for SetPredication and VK_KHR_swapchain for DXGI presentation, when available.
     VkPhysicalDeviceConditionalRenderingFeaturesEXT conditional{
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CONDITIONAL_RENDERING_FEATURES_EXT};
+    bool has_swapchain = false;
     {
         std::uint32_t extension_count = 0;
         vkEnumerateDeviceExtensionProperties(info.physical, nullptr, &extension_count, nullptr);
         std::vector<VkExtensionProperties> extensions(extension_count);
         vkEnumerateDeviceExtensionProperties(info.physical, nullptr, &extension_count, extensions.data());
-        for (const auto& e : extensions)
+        for (const auto& e : extensions) {
             if (!std::strcmp(e.extensionName, VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME)) {
                 VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &conditional};
                 vkGetPhysicalDeviceFeatures2(info.physical, &features);
                 info.conditional_rendering = conditional.conditionalRendering == VK_TRUE;
+            } else if (!std::strcmp(e.extensionName, VK_KHR_SWAPCHAIN_EXTENSION_NAME)) {
+                has_swapchain = true;
             }
+        }
         if (!info.conditional_rendering)
             std::fprintf(stderr, "[rt] d3d12: the GPU has no VK_EXT_conditional_rendering: SetPredication is unsupported\n");
     }
@@ -3250,8 +3301,9 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     if (info.conditional_rendering) device_extensions.push_back(conditional_extension);
     if (info.host_image_copy) device_extensions.push_back(host_image_copy_name);
     if (calibrated) device_extensions.push_back(calibrated);
+    if (has_swapchain) device_extensions.push_back(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
     device_info.enabledExtensionCount = std::uint32_t(device_extensions.size());
-    device_info.ppEnabledExtensionNames = device_extensions.data();
+    device_info.ppEnabledExtensionNames = device_extensions.empty() ? nullptr : device_extensions.data();
     if (vkCreateDevice(info.physical, &device_info, nullptr, &owned.device) != VK_SUCCESS)
         return fail("vkCreateDevice failed");
     info.device = owned.device;
