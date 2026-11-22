@@ -244,7 +244,7 @@ class OobSelect(unittest.TestCase):
         self.assertEqual(len(MODE_EXTRACT.findall(spv)), 1, "s_movk_i32 did not fold into literal V#")
 
     def test_loads_literal_v_sharp_from_sgpr_copy(self):
-        # Copy propagation: s_mov_b32 / s_mov_b64 from a constant SGPR preserves sgpr_imm.
+        # Copy propagation: s_mov_b32 from a constant SGPR preserves sgpr_imm.
         w3 = 0x31000FAC
         lines = [f"s_mov_b32 s8, {w3:#x}", "s_mov_b32 s7, s8",
                  f"s_mov_b32 s4, {BASE:#x}", "s_mov_b32 s5, 0", "s_mov_b32 s6, 16",
@@ -253,5 +253,28 @@ class OobSelect(unittest.TestCase):
         spv = self.translate(lines)
         self.assertEqual(len(MODE_EXTRACT.findall(spv)), 1, "s_mov_b32 copy did not fold into literal V#")
 
+    def test_loads_literal_v_sharp_from_s_mov_b64_copy(self):
+        # Copy propagation: s_mov_b64 64-bit pair copy preserves sgpr_imm.
+        w3 = 0x31000FAC
+        val64 = (w3 << 32) | 16
+        lines = [f"s_mov_b64 s[8:9], {val64:#x}", "s_mov_b64 s[6:7], s[8:9]",
+                 f"s_mov_b32 s4, {BASE:#x}", "s_mov_b32 s5, 0",
+                 "buffer_load_dword v2, off, s[4:7], 0", "s_waitcnt vmcnt(0)",
+                 "buffer_store_dword v2, off, s[0:3], 0"]
+        spv = self.translate(lines)
+        self.assertEqual(len(MODE_EXTRACT.findall(spv)), 1, "s_mov_b64 pair copy did not fold into literal V#")
+
+    def test_loads_literal_v_sharp_from_s_mov_b64_overlapping_copy(self):
+        # Overlapping 64-bit copy s_mov_b64 s[6:7], s[5:6] where d == s + 1:
+        # Both source registers must be evaluated before writing destination,
+        # so s7 gets the old s6 literal rather than the newly written s6 (s5).
+        w3 = 0x31000FAC
+        lines = [f"s_mov_b32 s4, {BASE:#x}", "s_mov_b32 s5, 16",
+                 f"s_mov_b32 s6, {w3:#x}",
+                 "s_mov_b64 s[6:7], s[5:6]",
+                 "buffer_load_dword v2, off, s[4:7], 0", "s_waitcnt vmcnt(0)",
+                 "buffer_store_dword v2, off, s[0:3], 0"]
+        spv = self.translate(lines)
+        self.assertEqual(len(MODE_EXTRACT.findall(spv)), 1, "s_mov_b64 overlapping copy did not fold into literal V#")
 if __name__ == "__main__":
     unittest.main()
