@@ -105,6 +105,201 @@ def ref(op: str, x: int, y: int, z: int) -> tuple:
     return ref_mad_i64_i32(x, y, z)
 
 
+def parse_vgpr_pair(token: str) -> int:
+    """Parse a VGPR pair token like 'v[0:1]' into the base register index."""
+    token = token.strip().rstrip(",").lower()
+    if not (token.startswith("v[") and token.endswith("]")):
+        raise ValueError(f"Invalid VGPR pair syntax: {token}")
+    parts = token[2:-1].split(":")
+    if len(parts) != 2:
+        raise ValueError(f"Invalid VGPR pair format: {token}")
+    start, end = int(parts[0]), int(parts[1])
+    if end != start + 1:
+        raise ValueError(f"VGPR pair must be contiguous pair v[X:X+1]: {token}")
+    return start
+
+
+def parse_sgpr_pair(token: str) -> int | None:
+    """Parse an SGPR pair token like 's[10:11]' or 'null'."""
+    token = token.strip().rstrip(",").lower()
+    if token == "null":
+        return None
+    if token in ("vcc", "vcc_lo"):
+        return 106
+    if not (token.startswith("s[") and token.endswith("]")):
+        raise ValueError(f"Invalid SGPR pair syntax: {token}")
+    parts = token[2:-1].split(":")
+    if len(parts) != 2:
+        raise ValueError(f"Invalid SGPR pair format: {token}")
+    start, end = int(parts[0]), int(parts[1])
+    if end != start + 1:
+        raise ValueError(f"SGPR pair must be contiguous pair s[X:X+1]: {token}")
+    return start
+
+
+class Mad64SimdInterpreter:
+    """Deterministic SIMD wavefront interpreter for RDNA2 64-bit widening multiply-add instructions."""
+
+    def __init__(self, num_lanes: int = 64, num_vgprs: int = 256, num_sgprs: int = 108) -> None:
+        self.num_lanes = num_lanes
+        self.num_vgprs = num_vgprs
+        self.num_sgprs = num_sgprs
+        self.vgprs: list[list[int]] = [[0] * num_vgprs for _ in range(num_lanes)]
+        self.sgprs: list[int] = [0] * num_sgprs
+        self.exec_mask: int = (1 << num_lanes) - 1
+
+    def reset(self) -> None:
+        for lane in range(self.num_lanes):
+            self.vgprs[lane] = [0] * self.num_vgprs
+        self.sgprs = [0] * self.num_sgprs
+        self.exec_mask = (1 << self.num_lanes) - 1
+
+    def set_vgpr(self, lane: int, reg_idx: int, val: int) -> None:
+        if not (0 <= lane < self.num_lanes):
+            raise IndexError(f"Lane {lane} out of bounds")
+        if not (0 <= reg_idx < self.num_vgprs):
+            raise IndexError(f"VGPR v{reg_idx} out of bounds")
+        self.vgprs[lane][reg_idx] = u32(val)
+
+    def get_vgpr(self, lane: int, reg_idx: int) -> int:
+        if not (0 <= lane < self.num_lanes):
+            raise IndexError(f"Lane {lane} out of bounds")
+        if not (0 <= reg_idx < self.num_vgprs):
+            raise IndexError(f"VGPR v{reg_idx} out of bounds")
+        return self.vgprs[lane][reg_idx]
+
+    def set_vgpr_pair(self, lane: int, reg_idx: int, val: int) -> None:
+        self.set_vgpr(lane, reg_idx, val & M32)
+        self.set_vgpr(lane, reg_idx + 1, (val >> 32) & M32)
+
+    def get_vgpr_pair(self, lane: int, reg_idx: int) -> int:
+        lo = self.get_vgpr(lane, reg_idx)
+        hi = self.get_vgpr(lane, reg_idx + 1)
+        return pack_u64_pair(lo, hi)
+
+    def set_sgpr(self, reg_idx: int, val: int) -> None:
+        if not (0 <= reg_idx < self.num_sgprs):
+            raise IndexError(f"SGPR s{reg_idx} out of bounds")
+        self.sgprs[reg_idx] = u32(val)
+
+    def get_sgpr(self, reg_idx: int) -> int:
+        if not (0 <= reg_idx < self.num_sgprs):
+            raise IndexError(f"SGPR s{reg_idx} out of bounds")
+        return self.sgprs[reg_idx]
+
+    def set_sgpr_pair(self, reg_idx: int, val: int) -> None:
+        self.set_sgpr(reg_idx, val & M32)
+        self.set_sgpr(reg_idx + 1, (val >> 32) & M32)
+
+    def get_sgpr_pair(self, reg_idx: int) -> int:
+        lo = self.get_sgpr(reg_idx)
+        hi = self.get_sgpr(reg_idx + 1)
+        return pack_u64_pair(lo, hi)
+
+    def parse_src32(self, token: str, lane: int) -> int:
+        token = token.strip().rstrip(",")
+        low = token.lower()
+        if low.startswith("v") and low[1:].isdigit():
+            return self.get_vgpr(lane, int(low[1:]))
+        if low.startswith("s") and low[1:].isdigit():
+            return self.get_sgpr(int(low[1:]))
+        if low.startswith("0x") or low.startswith("-0x"):
+            return u32(int(token, 16))
+        return u32(int(token, 10))
+
+    def parse_src64(self, token: str, lane: int) -> int:
+        token = token.strip().rstrip(",")
+        low = token.lower()
+        if low.startswith("v[") and low.endswith("]"):
+            idx = parse_vgpr_pair(token)
+            return self.get_vgpr_pair(lane, idx)
+        if low.startswith("s[") and low.endswith("]"):
+            idx = parse_sgpr_pair(token)
+            if idx is None:
+                return 0
+            return self.get_sgpr_pair(idx)
+        val = int(token, 16) if (low.startswith("0x") or low.startswith("-0x")) else int(token, 10)
+        return u64(val)
+
+    def execute_line(self, line: str) -> None:
+        line = line.split(";", 1)[0].split("//", 1)[0].strip()
+        if not line:
+            return
+        parts = line.replace(",", " ").split()
+        op = parts[0].lower()
+        operands = parts[1:]
+
+        if op == "v_mov_b32":
+            dst_token = operands[0].lower()
+            if not (dst_token.startswith("v") and dst_token[1:].isdigit()):
+                raise ValueError(f"v_mov_b32 dst must be VGPR: {dst_token}")
+            dst_idx = int(dst_token[1:])
+            for lane in range(self.num_lanes):
+                if (self.exec_mask & (1 << lane)) != 0:
+                    val = self.parse_src32(operands[1], lane)
+                    self.set_vgpr(lane, dst_idx, val)
+
+        elif op == "s_mov_b32":
+            dst_token = operands[0].lower()
+            if dst_token.startswith("s") and dst_token[1:].isdigit():
+                val = self.parse_src32(operands[1], 0)
+                self.set_sgpr(int(dst_token[1:]), val)
+            else:
+                raise ValueError(f"Unsupported s_mov_b32 dst: {dst_token}")
+
+        elif op == "s_mov_b64":
+            dst_token = operands[0].lower()
+            val = self.parse_src64(operands[1], 0)
+            if dst_token == "exec":
+                self.exec_mask = val & ((1 << self.num_lanes) - 1)
+            else:
+                idx = parse_sgpr_pair(dst_token)
+                if idx is not None:
+                    self.set_sgpr_pair(idx, val)
+
+        elif op == "v_mad_u64_u32":
+            dst_idx = parse_vgpr_pair(operands[0])
+            sdst_idx = parse_sgpr_pair(operands[1])
+            carry_mask = 0
+            for lane in range(self.num_lanes):
+                if (self.exec_mask & (1 << lane)) != 0:
+                    s0 = self.parse_src32(operands[2], lane)
+                    s1 = self.parse_src32(operands[3], lane)
+                    s2 = self.parse_src64(operands[4], lane)
+                    res_u64, carry = ref_mad_u64_u32(s0, s1, s2)
+                    self.set_vgpr_pair(lane, dst_idx, res_u64)
+                    if carry:
+                        carry_mask |= (1 << lane)
+            if sdst_idx is not None:
+                self.set_sgpr_pair(sdst_idx, carry_mask)
+
+        elif op == "v_mad_i64_i32":
+            dst_idx = parse_vgpr_pair(operands[0])
+            sdst_idx = parse_sgpr_pair(operands[1])
+            sign_mask = 0
+            for lane in range(self.num_lanes):
+                if (self.exec_mask & (1 << lane)) != 0:
+                    s0 = self.parse_src32(operands[2], lane)
+                    s1 = self.parse_src32(operands[3], lane)
+                    s2 = self.parse_src64(operands[4], lane)
+                    res_u64, sign = ref_mad_i64_i32(s0, s1, s2)
+                    self.set_vgpr_pair(lane, dst_idx, res_u64)
+                    if sign:
+                        sign_mask |= (1 << lane)
+            if sdst_idx is not None:
+                self.set_sgpr_pair(sdst_idx, sign_mask)
+
+        elif op == "s_endpgm":
+            return
+
+        else:
+            raise ValueError(f"Unknown instruction: {op}")
+
+    def run_program(self, lines: list[str]) -> None:
+        for line in lines:
+            self.execute_line(line)
+
+
 SPECIAL32 = [0, 1, 2, 0x7FFFFFFF, 0x80000000, 0xFFFFFFFF, 0xFFFFFFFE, 0x12345678]
 SPECIAL64 = [0, 1, M64, 1 << 63, (1 << 63) - 1, 0xFFFFFFFF, 1 << 32, 0xFFFFFFFE00000001]
 
@@ -394,6 +589,204 @@ class Mad64SignedUnsignedDivergenceTests(unittest.TestCase):
         i_out = run_op("v_mad_i64_i32", 0x80000000, 2, 0)
         self.assertEqual(u_out, (0x100000000, 0))
         self.assertEqual(i_out, (0xFFFFFFFF00000000, 1))
+
+
+class Mad64OverflowModuloTests(unittest.TestCase):
+    """64-bit overflow and two's complement modulo arithmetic wrapping tests."""
+
+    def test_unsigned_wrap_modulo_64(self):
+        # 1 * 1 + (2^64 - 1) = 2^64 -> wraps to 0 with carry 1
+        res, carry = ref_mad_u64_u32(1, 1, M64)
+        self.assertEqual(res, 0)
+        self.assertEqual(carry, 1)
+
+        # 5 * 1 + (2^64 - 1) = 2^64 + 4 -> wraps to 4 with carry 1
+        res, carry = ref_mad_u64_u32(5, 1, M64)
+        self.assertEqual(res, 4)
+        self.assertEqual(carry, 1)
+
+        # (2^32 - 1)^2 = 2^64 - 2^33 + 1
+        # Adding (2^33 - 1) gives exactly 2^64 -> wraps to 0
+        acc = (1 << 33) - 1
+        res, carry = ref_mad_u64_u32(M32, M32, acc)
+        self.assertEqual(res, 0)
+        self.assertEqual(carry, 1)
+
+    def test_unsigned_large_product_wrap(self):
+        # Product + accumulator > 2^64
+        res, carry = ref_mad_u64_u32(M32, M32, M64)
+        self.assertEqual(res, 0xFFFFFFFE00000000)
+        self.assertEqual(carry, 1)
+
+    def test_signed_negative_underflow_wrap(self):
+        # Product is -2^32, accumulator is -2^63 (0x8000000000000000)
+        # Sum is -2^63 - 2^32. In 64-bit two's complement: 2^63 - 2^32 = 0x7FFFFFFF00000000
+        # Exact sum is negative, so sign bit 64 is 1
+        res, sign = ref_mad_i64_i32(0x80000000, 2, 1 << 63)
+        self.assertEqual(res, (1 << 63) - (1 << 32))
+        self.assertEqual(sign, 1)
+
+    def test_chained_accumulation_modulo_64(self):
+        # Verify deterministic wrapping over repeated steps
+        acc = 0xFFFFFFFFFFFFFFFE
+        for step in range(10):
+            acc, carry = ref_mad_u64_u32(2, 2, acc)
+        # Each step adds 4. Total added = 40.
+        # (2^64 - 2) + 40 = 2^64 + 38 = 38
+        self.assertEqual(acc, 38)
+
+
+class Mad64SimdDivergenceTests(unittest.TestCase):
+    """Multi-lane SIMD divergence and execution mask tests using Mad64SimdInterpreter."""
+
+    def test_all_lanes_active(self):
+        interp = Mad64SimdInterpreter(num_lanes=64)
+        for lane in range(64):
+            interp.set_vgpr(lane, 2, lane)
+            interp.set_vgpr(lane, 3, 10)
+            interp.set_vgpr_pair(lane, 12, 1000)
+        interp.run_program([
+            "s_mov_b64 exec, -1",
+            "v_mad_u64_u32 v[0:1], s[10:11], v2, v3, v[12:13]",
+        ])
+        for lane in range(64):
+            expected = lane * 10 + 1000
+            self.assertEqual(interp.get_vgpr_pair(lane, 0), expected)
+        # No carry out, so s[10:11] is 0
+        self.assertEqual(interp.get_sgpr_pair(10), 0)
+
+    def test_exec_mask_inactive_preservation(self):
+        # Even lanes active, odd lanes inactive
+        interp = Mad64SimdInterpreter(num_lanes=64)
+        sentinel = 0xDEADBEEFCAFEBABE
+        for lane in range(64):
+            interp.set_vgpr_pair(lane, 0, sentinel)
+            interp.set_vgpr(lane, 2, 7)
+            interp.set_vgpr(lane, 3, 11)
+            interp.set_vgpr_pair(lane, 12, 0)
+
+        # 0x5555555555555555 has bit=1 for even lanes (0, 2, 4...)
+        checkerboard = 0x5555555555555555
+        interp.run_program([
+            f"s_mov_b64 exec, {checkerboard:#x}",
+            "v_mad_u64_u32 v[0:1], null, v2, v3, v[12:13]",
+        ])
+        for lane in range(64):
+            if lane % 2 == 0:
+                self.assertEqual(interp.get_vgpr_pair(lane, 0), 77, f"Lane {lane} should be updated")
+            else:
+                self.assertEqual(interp.get_vgpr_pair(lane, 0), sentinel, f"Lane {lane} should be untouched")
+
+    def test_exec_mask_upper_half_disabled(self):
+        interp = Mad64SimdInterpreter(num_lanes=64)
+        sentinel = 0x1122334455667788
+        for lane in range(64):
+            interp.set_vgpr_pair(lane, 6, sentinel)
+            interp.set_vgpr(lane, 2, 100)
+            interp.set_vgpr(lane, 3, 2)
+            interp.set_vgpr_pair(lane, 4, 5)
+
+        # Lanes 0..31 active
+        interp.run_program([
+            "s_mov_b64 exec, 0x00000000FFFFFFFF",
+            "v_mad_u64_u32 v[6:7], null, v2, v3, v[4:5]",
+        ])
+        for lane in range(64):
+            if lane < 32:
+                self.assertEqual(interp.get_vgpr_pair(lane, 6), 205)
+            else:
+                self.assertEqual(interp.get_vgpr_pair(lane, 6), sentinel)
+
+    def test_exec_mask_zero_no_op(self):
+        interp = Mad64SimdInterpreter(num_lanes=64)
+        sentinel = 0x0102030405060708
+        for lane in range(64):
+            interp.set_vgpr_pair(lane, 0, sentinel)
+            interp.set_vgpr(lane, 2, 999)
+            interp.set_vgpr(lane, 3, 888)
+            interp.set_vgpr_pair(lane, 4, 777)
+        interp.run_program([
+            "s_mov_b64 exec, 0",
+            "v_mad_u64_u32 v[0:1], null, v2, v3, v[4:5]",
+        ])
+        for lane in range(64):
+            self.assertEqual(interp.get_vgpr_pair(lane, 0), sentinel)
+
+    def test_single_lane_exec(self):
+        interp = Mad64SimdInterpreter(num_lanes=64)
+        target_lane = 42
+        for lane in range(64):
+            interp.set_vgpr_pair(lane, 0, 0)
+            interp.set_vgpr(lane, 2, 50)
+            interp.set_vgpr(lane, 3, 20)
+            interp.set_vgpr_pair(lane, 4, 3)
+
+        interp.run_program([
+            f"s_mov_b64 exec, {1 << target_lane:#x}",
+            "v_mad_u64_u32 v[0:1], null, v2, v3, v[4:5]",
+        ])
+        for lane in range(64):
+            if lane == target_lane:
+                self.assertEqual(interp.get_vgpr_pair(lane, 0), 1003)
+            else:
+                self.assertEqual(interp.get_vgpr_pair(lane, 0), 0)
+
+    def test_divergent_lane_mask_generation(self):
+        # Lanes 5 and 55 generate carry out; other lanes do not
+        interp = Mad64SimdInterpreter(num_lanes=64)
+        for lane in range(64):
+            interp.set_vgpr(lane, 2, M32)
+            interp.set_vgpr(lane, 3, 1 if lane in (5, 55) else 0)
+            interp.set_vgpr_pair(lane, 4, M64)
+
+        interp.run_program([
+            "s_mov_b64 exec, -1",
+            "v_mad_u64_u32 v[0:1], s[10:11], v2, v3, v[4:5]",
+        ])
+        expected_mask = (1 << 5) | (1 << 55)
+        self.assertEqual(interp.get_sgpr_pair(10), expected_mask)
+
+
+class Mad64NegativeControlsTests(unittest.TestCase):
+    """Negative controls, textual sabotage, and invalid syntax rejection tests."""
+
+    def test_unsigned_versus_signed_mismatch_control(self):
+        # Negative control: running signed logic on high-bit unsigned inputs MUST diverge
+        for x in (0xFFFFFFFF, 0x80000000):
+            u_res, _ = ref_mad_u64_u32(x, 2, 0)
+            i_res, _ = ref_mad_i64_i32(x, 2, 0)
+            self.assertNotEqual(u_res, i_res)
+
+    def test_invalid_register_pair_tokens(self):
+        interp = Mad64SimdInterpreter(num_lanes=32)
+        # Not a pair
+        with self.assertRaises(ValueError):
+            interp.execute_line("v_mad_u64_u32 v0, null, v1, v2, v[3:4]")
+        # Out of bounds pair
+        with self.assertRaises(IndexError):
+            interp.execute_line("v_mad_u64_u32 v[300:301], null, v1, v2, v[3:4]")
+
+    def test_unaligned_register_pair(self):
+        interp = Mad64SimdInterpreter(num_lanes=32)
+        # Non-contiguous pair v[0:2]
+        with self.assertRaises(ValueError):
+            interp.execute_line("v_mad_u64_u32 v[0:2], null, v1, v2, v[3:4]")
+        # Inverted pair v[2:1]
+        with self.assertRaises(ValueError):
+            interp.execute_line("v_mad_u64_u32 v[2:1], null, v1, v2, v[3:4]")
+
+    def test_unknown_instruction(self):
+        interp = Mad64SimdInterpreter(num_lanes=32)
+        with self.assertRaises(ValueError):
+            interp.execute_line("v_mad_bogus_op v[0:1], null, v2, v3, 0")
+
+    def test_zero_multiplicand_invariance(self):
+        # Invariant: if S1 is 0, result must equal S2 regardless of S0
+        for s0 in (0, 1, 0x12345678, M32):
+            for s2 in (0, 1, 0xABCDEF0123456789, M64):
+                res, carry = ref_mad_u64_u32(s0, 0, s2)
+                self.assertEqual(res, s2)
+                self.assertEqual(carry, 0)
 
 
 class Mad64Tests(unittest.TestCase):
