@@ -1,7 +1,10 @@
 """tools/user_sgpr_census.py on hand-written index.json data (no game files, no GPU)."""
 import json
 import os
+from pathlib import Path
+import subprocess
 import sys
+import tempfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
@@ -79,3 +82,21 @@ def test_expect_passes_and_fails(tmp_path, capsys):
     assert usc.main([str(p), "--expect", "ps=8", "cs=4"]) == 0
     assert usc.main([str(p), "--expect", "ps=0"]) == 1
     assert "expected s0, got s8" in capsys.readouterr().err
+
+
+def test_cli_rejects_malformed_stage_assignment():
+    with tempfile.TemporaryDirectory() as tmp:
+        index = Path(tmp, "index.json")
+        report = Path(tmp, "report.json")
+        index.write_text(json.dumps(INDEX), encoding="utf-8")
+        tool = os.path.join(ROOT, "tools", "user_sgpr_census.py")
+        for option in ("--base", "--expect"):
+            for assignment in ("ps", "ps=bad", "=8", "ps=-1"):
+                result = subprocess.run(
+                    [sys.executable, "-I", tool, str(index), "--json", str(report), option, assignment],
+                    capture_output=True, text=True,
+                )
+                assert result.returncode == 2, result.stderr
+                assert "expected STAGE=SGPR" in result.stderr
+                assert "Traceback" not in result.stderr
+                assert not report.exists()
