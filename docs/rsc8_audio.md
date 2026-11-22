@@ -63,7 +63,7 @@ zero-stream bank, so only `audio.rpf`'s bank and byte counts changed (banks 7,16
 them per stream in its scan tallies (`grid20_*`, `indexrun_*` summary keys): over the whole archive
 **387,233 `0x5a` entries / 0 invalid** and **4,853 `0xd9` groups / 0 invalid / 0 index overruns**. Every
 invariant below was measured on that full population; the field names describe structure, and the meaning of
-`value`, `s`, `t` and the counter's unit stays a labelled hypothesis.
+`value`, `s`, `t` and the last entry's tail float stays a labelled hypothesis.
 
 `0x5a` — `{u32 12345678; u32 unknown; N × 20-byte entries}` (`(size − 8) % 20 == 0` always):
 
@@ -75,12 +75,18 @@ invariant below was measured on that full population; the field names describe s
 10   u16  index_hi       (index pairs tile 0..129 / 1..130 measured)
 12   u16  s
 14   u16  t
-16   u32  counter        (strictly increasing across all entries, all 1,185 streams)
+16   u32  counter        (every entry but the last: a sample position, see below)
+16   f32  tail           (the last entry only: 2/3 = 0x3f2aaaab on 1,182 streams, 0.666812 on 1, 0.725624 on 2)
 ```
 
-Hypothesis (not confirmed): a time grid — the first entry-to-entry counter step averages the stream's
-samples-per-entry (p50 ratio 0.996), but the total exceeds the declared sample count by ~2¹¹–2¹³, so the unit
-is finer than one sample and not named here.
+The counter is a sample position in the stream (ASSET-256, measured over all 1,185 streams and 386,048 counters,
+`tools/rsc8_audio.py`'s `grid20_counter_past_samples` = 0). On every entry but the last it ascends strictly and
+stays below the `0x76` sample count: the largest counter is 0.9986 of the stream's samples, the last one ends
+p10/p50/p90 0.8/1.85/5.4 mean entry steps before the stream's end, and the first entry-to-entry step averages
+the stream's samples-per-entry (p50 ratio 0.996). The last entry holds an f32 at `+16` in place of a counter.
+Read as a u32 it is about 1.06 × 10⁹, 2^9.9–2^15.2 times the sample count, which is what made the counter look
+finer than a sample before. What the tail float means is not known. Every one of these streams is mono XMA2
+(`0x76` codec 5) at 32,000 Hz (one at 32,007 Hz).
 
 `0xd9` — `{u32 K; K × {u32 2; u32 len; u32 hash; len × u32}}`: the run values ascend strictly inside each
 group, exactly one distinct `hash` appears per stream, the group count always equals `K`, and **every run

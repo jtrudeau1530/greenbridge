@@ -780,10 +780,13 @@ def decode_grid20_table(blob):
         +6  u16  z (0..16 measured)
         +8  u16  index_lo, +10 u16  index_hi
         +12 u16  s, +14 u16  t
-        +16 u32  counter (strictly increasing across the entries)
+        +16 u32  counter: a sample position, strictly increasing and below the stream's 0x76 sample
+                 count, on every entry but the last; the last entry holds an f32 there (2/3 on 1,182
+                 of the 1,185 streams), returned as ``tail_f32`` (ASSET-256)
 
-    Nothing is guessed about the meaning of ``value``, ``s``, ``t`` or the counter's unit; the
-    return value carries the structural facts and the invariant checks only.
+    Nothing is guessed about the meaning of ``value``, ``s``, ``t`` or the tail float; the return
+    value carries the structural facts and the invariant checks only. ``counter_first``,
+    ``counter_last`` and ``counter_increasing`` cover the counters, so the last entry is left out.
     """
     out = {
         "size_ok": False,
@@ -793,6 +796,7 @@ def decode_grid20_table(blob):
         "counter_first": None,
         "counter_last": None,
         "counter_increasing": None,
+        "tail_f32": None,
         "p_multiple_of_32": None,
     }
     raw = bytes(blob)
@@ -811,9 +815,12 @@ def decode_grid20_table(blob):
     for i in range(n):
         at = 8 + 20 * i
         p, _z = struct.unpack_from("<HH", raw, at + 4)
-        counter, = struct.unpack_from("<I", raw, at + 16)
         if p % 32:
             p_ok = False
+        if i == n - 1:  # the last entry's +16 is an f32, not a counter
+            out["tail_f32"], = struct.unpack_from("<f", raw, at + 16)
+            continue
+        counter, = struct.unpack_from("<I", raw, at + 16)
         if first is None:
             first = counter
         elif counter <= prev:
@@ -984,6 +991,8 @@ def _new_grid_tally():
         "grid20_streams": 0,
         "grid20_entries": 0,
         "grid20_invalid": 0,
+        # Streams with a 0x76 sample count whose last counter is not below it (0 over audio.rpf, ASSET-256).
+        "grid20_counter_past_samples": 0,
         "indexrun_streams": 0,
         "indexrun_groups": 0,
         "indexrun_invalid": 0,
@@ -1012,6 +1021,11 @@ def _tally_undocumented_tables(read_slice, bank_base, tmap, tally):
             tally["grid20_invalid"] += 1
         elif grid["entries"]:
             tally["grid20_entries"] += grid["entries"]
+            if TAG_FORMAT in tmap and grid["counter_last"] is not None:
+                fo, fs = tmap[TAG_FORMAT][0]
+                fb = read_slice(bank_base + fo, 4) if fs >= 4 else b""
+                if len(fb) == 4 and grid["counter_last"] >= _u32(fb, 0):
+                    tally["grid20_counter_past_samples"] += 1
     if TAG_INDEXRUN in tmap:
         io, isz = tmap[TAG_INDEXRUN][0]
         runs = None
