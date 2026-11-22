@@ -201,14 +201,16 @@ silhouette is geometry, not a painted-on atlas.
   index to a drawable plus texture. The first is height and body-shape presets
   (`SCALE_PLAYER_STORY000_00` is 1.62 m); the second lists gameplay components. Slot selection
   from names is a heuristic, not the game's rule.
-- **Lucia's hair.** The `packs.rpf` manifest lists ten `player_story000_00` hair drawables
-  (`hairbob`, `hairpixie`, `hairponytail`, `hairbuzzcut`); all ten decode to **3 vertices / 1
-  triangle**. Across `packs.rpf`, 219 of the 247 measurable hair entries are <=3 v / 1 t. The 68
-  larger rows are accessories (`hairaccsband`, 7,016 / 7,251 v), SLOD proxies (71-147 v), or the
-  one fused male head `cs_wyman_head_mr1_cau_000_o_hair_alt0` (13,529 v); no stand-alone
-  full-resolution female hair mesh exists. `levels.rpf` and `story000.rpf` have zero character
-  hair rows. A static Lucia export is bald by design; a render needs a clearly labelled
-  placeholder, not a missing decode.
+- **Lucia's hair.** The `packs.rpf` manifest has three `player_story000_00` hair rows
+  (`hairbob`, `hairpixie`, `hairponytail`), each **3 vertices / 1 triangle**; `hairbuzzcut`
+  appears only in male `_mr1` rows. All 54 non-SLOD rows of those four styles are 3 v / 1 t.
+  Across `packs.rpf`, 219 of the 267 measurable hair rows are <=3 v / 1 t. The 48 larger rows
+  are 29 accessories (`hairaccsband`, `hairaccsclip`, `hairaccessoriescuff`; up to 7,251 v), 10
+  SLOD proxies (71-147 v), 3 fused `cs_wyman_head_mr1_cau_000_o_hair_alt0` rows (up to 13,529 v),
+  3 `hairbun` and 1 `hairlob` unit-box stubs (24 v / 12 t), and 2 blowfly
+  `cri_fly_blow_m_00_hair_00` rows (1,436 / 2,040 v); no stand-alone full-resolution female hair
+  mesh exists. `levels.rpf` and `story000.rpf` have zero character hair rows. A static Lucia
+  export is bald by design; a render needs a clearly labelled placeholder, not a missing decode.
 - **`levels.rpf`.** The full archive was name-enumerated: 1,116,073 streams, 98.32% inflated,
   235,814 named streams, 318,266 unique names. It contains no Lucia, Mandy, `player_story` or
   `ambient_female` drawable; the Lucia and Mandy hits are props (photos, frames, luggage, a
@@ -228,16 +230,6 @@ silhouette is geometry, not a painted-on atlas.
 
 ```powershell
 rpf9dump models <packs.rpf> <outdir>
-```
-
-```python
-import json
-
-items = json.load(open(r"<outdir>/packs/models/manifest.json", encoding="utf-8"))["Items"]
-names = sorted({i["Name"] for i in items})
-print(len(items), len(names))
-print(sum(1 for i in items if i.get("IsFragment")), "fragments")
-print([n for n in names if "lucia" in n.lower()])
 ```
 
 ```python
