@@ -189,9 +189,11 @@ class D16NormalizedRoundsOnce(unittest.TestCase):
         self.assertEqual(self.d16_x(FMT_UNORM16, 0xFFFF), 0x12343C00)
         self.assertEqual(load_format(FMT_UNORM16, 0, 1, memory={BASE: 0xFFEF})[0], 0x3F7FF000)
 
-    def test_a_float_format_on_the_halfway_value_still_ties_to_even(self):
-        self.assertEqual(self.d16_x(FMT_F32, 0x3F7FF000), 0x12343C00)
-        self.assertEqual(self.d16_x(FMT_F32, 0xBF7FB000), 0x1234BBFE)
+    def test_a_float_format_rounds_toward_zero(self):
+        # A 32_FLOAT element is narrowed toward zero, not to nearest even: gfx1036 gives 0x3bff and 0xbbfd for these
+        # two halfway values (SHADER-358; more in test_buffer_f16_narrowing_hw.py).
+        self.assertEqual(self.d16_x(FMT_F32, 0x3F7FF000), 0x12343BFF)
+        self.assertEqual(self.d16_x(FMT_F32, 0xBF7FB000), 0x1234BBFD)
 
     def test_both_halves_of_a_pair(self):
         got = load_format(FMT_UNORM16X2, 0, 2, memory={BASE: 0xFFAF << 16 | 0xFFEF}, d16=True)[0]
