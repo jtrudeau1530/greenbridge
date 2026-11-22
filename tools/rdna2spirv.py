@@ -3180,6 +3180,35 @@ class Gen:
             self.emit(f"{_or} = OpAtomicOr %uint {p} {sc} {sem} {d_val}")
             if d is not None:
                 self.dst(d, old)
+        elif op in ("ds_add_f32", "ds_add_rtn_f32"):
+            # M = M + DATA as binary32 (RDNA2 ISA, DS_ADD_F32); the _rtn_ form returns the old M. No core SPIR-V atomic
+            # adds floats on Workgroup memory, so this is an OpAtomicCompareExchange loop with an OpFAdd (round to
+            # nearest even, NoContraction): exact under contention, every update one successful exchange of the
+            # value it read. How the LDS adder treats denormals and NaN payloads is not measured: OpFAdd's IEEE
+            # result is what is computed.
+            d, ad, dat = (a[0], a[1], a[2]) if rtn else (None, a[0], a[1])
+            p = self.lds_ptr(self.src_u(ad), off)
+            x = self.tof(self.src_u(dat))
+            lbl_hdr, lbl_cont, lbl_exit = (self.tmp() + t for t in ("_hdr", "_cont", "_exit"))
+            init = self.tmp()
+            self.emit(f"{init} = OpLoad %uint {p}")
+            entry = self.current_label_placeholder()
+            self.emit(f"OpBranch {lbl_hdr}")
+            self.emit(f"{lbl_hdr} = OpLabel")
+            cur, cur_f, sum_f, new, got, done = (self.tmp() for _ in range(6))
+            self.emit(f"{cur} = OpPhi %uint {init} {entry} {got} {lbl_cont}")
+            self.emit(f"{cur_f} = OpBitcast %float {cur}")
+            self.emit(f"{sum_f} = OpFAdd %float {cur_f} {x}")
+            self.emit(f"{new} = OpBitcast %uint {sum_f}")
+            self.emit(f"{got} = OpAtomicCompareExchange %uint {p} {sc} {sem} {sem} {new} {cur}")
+            self.emit(f"{done} = OpIEqual %bool {got} {cur}")
+            self.emit(f"OpLoopMerge {lbl_exit} {lbl_cont} None")
+            self.emit(f"OpBranchConditional {done} {lbl_exit} {lbl_cont}")
+            self.emit(f"{lbl_cont} = OpLabel")
+            self.emit(f"OpBranch {lbl_hdr}")
+            self.emit(f"{lbl_exit} = OpLabel")
+            if d is not None:
+                self.dst(d, cur)
         elif op in ("ds_cmpst_rtn_b32", "ds_cmpst_b32"):
             # tmp = M[A]; M[A] = (tmp == DATA) ? DATA2 : tmp; the _rtn_ form returns tmp, ds_cmpst_b32 drops it.
             d, ad, cmp_, src = (a[0], a[1], a[2], a[3]) if rtn else (None, a[0], a[1], a[2])
