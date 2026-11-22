@@ -635,18 +635,21 @@ def vcmpx_forms_narrow_skip(out):
     return None
 
 
-# cs_signed_zero_nan's words 0, 2 and 3 are -0 products (v_mul_f32, v_pk_mul_f16, v_mul_f16). Apple GPUs (MoltenVK)
-# return +0 for them with or without SignedZeroInfNanPreserve (#1203, SHADER-182), so there only its other words
-# (-0 + -0, the three NaN checks and the NaN conversion) are judged. Shared with run_gpu_tests.py.
-APPLE_UNJUDGED_WORDS = {"cs_signed_zero_nan": (0, 2, 3)}
+# Dump words a driver gets wrong with or without SignedZeroInfNanPreserve, by the first word of the device name on
+# vk_compute_test's "device: ..." line. Only these words go unjudged there. Shared with run_gpu_tests.py.
+# - Apple GPUs (MoltenVK) return +0 for cs_signed_zero_nan's -0 products, words 0, 2 and 3 (v_mul_f32, v_pk_mul_f16,
+#   v_mul_f16; #1203, SHADER-182).
+# - Mesa llvmpipe returns 0 in word 5, the NaN check of 0 * inf (an inline-constant 0), while its other NaN checks give
+#   1 (#664, Mesa with LLVM 21.1.8). The CI runs the GPU tests on llvmpipe.
+UNJUDGED_WORDS = {"Apple": {"cs_signed_zero_nan": (0, 2, 3)},
+                  "llvmpipe": {"cs_signed_zero_nan": (5,)}}
 
 
 def judged_words(name, out, words):
-    """The expected words with None where nothing is judged: APPLE_UNJUDGED_WORDS when vk_compute_test's
-    "device: ..." line names an Apple GPU, else every word as given."""
-    if re.search(r"^device: Apple\b", out, re.MULTILINE) is None:
-        return list(words)
-    unjudged = APPLE_UNJUDGED_WORDS.get(name, ())
+    """The expected words with None where nothing is judged: UNJUDGED_WORDS for the device that vk_compute_test's
+    "device: ..." line names, else every word as given."""
+    m = re.search(r"^device: (\S+)", out, re.MULTILINE)
+    unjudged = UNJUDGED_WORDS.get(m.group(1), {}).get(name, ()) if m else ()
     return [None if i in unjudged else w for i, w in enumerate(words)]
 
 
