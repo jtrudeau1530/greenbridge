@@ -2,12 +2,16 @@
 
     python -I tests/test_shader_ir.py
 """
+import contextlib
+import errno
 import importlib.util
+import io
 import os
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -296,6 +300,33 @@ class CliInputTest(unittest.TestCase):
     def run_tool(self, *args):
         return subprocess.run([sys.executable, "-I", os.path.join(ROOT, "tools", "shader_ir.py"), *args],
                               capture_output=True, text=True, timeout=60)
+
+    def test_census_reports_input_io_errors_without_a_partial_summary(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            first = os.path.join(tmp, "first.s")
+            second = os.path.join(tmp, "second.s")
+            for path in (first, second):
+                with open(path, "w", encoding="utf-8", newline="\n") as f:
+                    f.write("\ts_endpgm\n")
+            parse_file = shader_ir.parse_file
+
+            def fail_second(path):
+                if path == second:
+                    raise PermissionError(errno.EACCES, "permission denied", second)
+                return parse_file(path)
+
+            for owner, attr, effect, path, diagnostic in (
+                    (shader_ir.os, "scandir", OSError(errno.EIO, "I/O error", tmp), tmp, "cannot list"),
+                    (shader_ir, "parse_file", fail_second, second, "cannot read")):
+                with self.subTest(operation=attr):
+                    stdout, stderr = io.StringIO(), io.StringIO()
+                    with mock.patch.object(owner, attr, side_effect=effect), \
+                            contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                        self.assertEqual(shader_ir.main([tmp]), 2)
+                    self.assertEqual(stdout.getvalue(), "")
+                    self.assertEqual(len(stderr.getvalue().strip().splitlines()), 1)
+                    self.assertIn(diagnostic, stderr.getvalue())
+                    self.assertIn(path, stderr.getvalue())
 
     def test_bad_arguments_are_usage_errors(self):
         with tempfile.TemporaryDirectory() as tmp:

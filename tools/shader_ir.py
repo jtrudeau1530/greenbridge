@@ -243,12 +243,20 @@ def main(argv=None):
     a = ap.parse_args(argv)
     if not os.path.isdir(a.src):
         ap.error(f"{a.src} is not a folder")
-    with os.scandir(a.src) as entries:
-        files = sorted(entry.path for entry in entries
-                       if entry.name.endswith(".s") and entry.is_file())[:a.limit]
+    try:
+        with os.scandir(a.src) as entries:
+            files = sorted(entry.path for entry in entries
+                           if entry.name.endswith(".s") and entry.is_file())[:a.limit]
+    except OSError as e:
+        print(f"ERROR: cannot list {a.src}: {e.strerror or e}", file=sys.stderr)
+        return 2
     kinds, raw, n_ins, no_enc = Counter(), Counter(), 0, 0
     for path in files:
-        info = parse_file(path)
+        try:
+            info = parse_file(path)
+        except OSError as e:
+            print(f"ERROR: cannot read {e.filename or path}: {e.strerror or e}", file=sys.stderr)
+            return 2
         for ins in info["insns"]:
             n_ins += 1
             no_enc += ins["enc"] is None
