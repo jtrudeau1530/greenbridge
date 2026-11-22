@@ -317,8 +317,9 @@ side inwards:
 
 Known gaps in the descriptor path: buffer shader-resource and unordered-access views and constant-buffer views
 (the V# a shader would load for them; the structure is in `gfx10_descriptors.h`, the views are not written);
-views of 1D, 3D and multisampled textures, and depth-plane views (`R24_UNORM_X8_TYPELESS`,
-`R32_FLOAT_X8X24_TYPELESS`) of depth-stencil textures; stencil-plane views (`PlaneSlice` 1, as
+views of 1D, 3D and multisampled textures; depth-plane views (`R24_UNORM_X8_TYPELESS`,
+`R32_FLOAT_X8X24_TYPELESS`) are a T# of the texture's depth format (8_24_UNORM, X24_8_32_FLOAT) through the
+depth aspect, and stencil-plane views (`PlaneSlice` 1, as
 `X24_TYPELESS_G8_UINT` or `X32_TYPELESS_G8X24_UINT`) are an 8_UINT T# that set 0 shows through the stencil
 aspect, in its float-typed sampled arrays like other UINT views; descriptors the game writes itself, which need
 the execute-time scan of section 3.4 (only descriptors made through the device are registered); static samplers
