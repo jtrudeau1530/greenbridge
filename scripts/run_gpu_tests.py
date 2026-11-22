@@ -94,8 +94,9 @@ def assemble_to_s(llvm_mc: str, asm_path: str, s_path: str, name: str) -> None:
     if name in CLIP_CASES:
         cmd.append(f"-defsym=PARAM_SLOT={CLIP_CASES[name]}")
     cmd.append("-show-encoding")
-    p = mc_command.run(   # a missing llvm-mc: one line naming LLVM_MC/--llvm-mc, not a traceback
+    p = mc_command.run(   # a missing llvm-mc: a short message naming LLVM_MC/--llvm-mc, not a traceback
         cmd,
+        flag="--llvm-mc",
         input=raw,
         capture_output=True,
         text=True,
@@ -755,7 +756,8 @@ def run_suite(a, work: str) -> int:
             # With LEONIDA_W64_EMULATE=1 it was translated with --wave64-emulate and runs on any subgroup size.
             results.append((name,) + wavemask_check(vk_compute, spv, cs_env, w64_emulated()))
         elif name in ("cs_store", "cs_smem_soffset_imm", "cs_w32_lane_wrap", "cs_movrelsd_2", "cs_w32_permute", "cs_exec_const", "cs_w32_lds_u8_d16", "cs_wave64_ballot", "cs_wm_half_ops", "cs_wm_half_cmp", "cs_wm_bfm64", "cs_wm_scc_rfl", "cs_wqm_w64", "cs_wqm_w32", "cs_wqm_w64_half",
-
+                      "cs_dpp", "cs_dpp_row", "cs_dpp_mask", "cs_dpp8", "cs_dpp_ops", "cs_dpp_bank", "cs_dpp_fi",
+                      "cs_dpp_w64",
                       "cs_w64_mask_detect",
                       "cs_w64x_readlane", "cs_w64x_writelane", "cs_w64x_readfirstlane", "cs_w64x_bpermute", "cs_w64x_permute",
                       "cs_w64x_branch", "cs_w64x_ballot", "cs_w64x_wg128_branches", "cs_w64x_lds_raw",
@@ -778,6 +780,14 @@ def run_suite(a, work: str) -> int:
                 "cs_w32_lds_u8_d16": [0xBEEF00FF, 0x00FF1234, 0xBEEFFF80, 0xFF801234, 0xBEEF007F, 0x007F1234, 0xBEEF0080, 0xFFFF1234],
                 # constant EXEC masks (cs_exec_const.asm): each lane takes its own bit of the constant
                 "cs_exec_const": [16, 8, 2, 16, 0, 16],
+                "cs_dpp": [1, 0, 3, 2, 5, 4, 7, 6],
+                "cs_dpp_row": [0, 0, 1, 2, 3, 4, 5, 6],
+                "cs_dpp_mask": [1, 0, 3, 2, 0xEEEEEEEE, 0xEEEEEEEE, 0xEEEEEEEE, 0xEEEEEEEE],
+                "cs_dpp8": [7, 6, 5, 4, 3, 2, 1, 0],
+                "cs_dpp_ops": [100, 10, 11, 12, 13, 14, 15, 16],
+                "cs_dpp_bank": [0xFFFFFFFF, 0xFFFFFFFE, 0xFFFFFFFD, 0xFFFFFFFC, 7, 7, 7, 7],
+                "cs_dpp_fi": [1, 2, 3, 0x7777, 5, 6, 7, 0x7777],
+                "cs_dpp_w64": [1, 0, 3, 2, 5, 4, 7, 6],
                 "cs_wave64_ballot": [32, 16, 24, 40, 8, 48],
                 "cs_wm_half_ops": [32, 16, 16, 0, 16],
                 "cs_wm_half_cmp": [1, 0, 1, 1],
@@ -816,10 +826,10 @@ def run_suite(a, work: str) -> int:
             }
             want = cs_dump_wants[name]
             # Every dump but cs_store / cs_smem_soffset_imm / cs_w32_lane_wrap / cs_movrelsd_2 / cs_w32_permute /
-            # cs_w32_lds_u8_d16 and the wave32 cs_wqm_w32 / cs_bpermute32 is a whole-wave (wave64) mask test:
-            # ask for a 64-wide subgroup and skip, as check.py does, where the device has none (vk_compute_test
-            # exits 77) instead of reporting a failure. With LEONIDA_W64_EMULATE=1 they were translated with
-            # --wave64-emulate and run on any subgroup size.
+            # cs_w32_lds_u8_d16, the wave32 cs_wqm_w32 / cs_bpermute32 and the DPP tests is a whole-wave (wave64)
+            # mask test: ask for a 64-wide subgroup and skip, as check.py does, where the device has none
+            # (vk_compute_test exits 77) instead of reporting a failure. With LEONIDA_W64_EMULATE=1 they were
+            # translated with --wave64-emulate and run on any subgroup size.
             # cs_w64x_partial and cs_w64x_partial_scmp (40-thread groups) can't have full subgroups: they ask for
             # size 64 without them.
             emulated = w64_emulated()
@@ -827,8 +837,8 @@ def run_suite(a, work: str) -> int:
             wave64 = name not in ("cs_store", "cs_smem_soffset_imm", "cs_wqm_w32", "cs_w32_lane_wrap", "cs_movrelsd_2",
                                   "cs_w32_permute", "cs_barrier_divergent", "cs_barrier_early_end", "cs_barrier_loop",
                                   "cs_w32_lds_u8_d16", "cs_bpermute32", "cs_w32_partial_scmp",
-                                  "cs_exec_const") and not emulated and not partial
-
+                                  "cs_exec_const", "cs_dpp", "cs_dpp_row", "cs_dpp_mask", "cs_dpp8",
+                                  "cs_dpp_ops", "cs_dpp_bank", "cs_dpp_fi") and not emulated and not partial
             if partial and not emulated:
                 cs_env = dict(os.environ, VKC_SUBGROUP_SIZE="64")
             if name in WAVE32_LANE_DUMPS:   # 32 lanes even without index.json, as check.py requests (#774)

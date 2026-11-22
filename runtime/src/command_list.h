@@ -642,7 +642,8 @@ public:
     // Copies. The rules D3D12 states for the call itself are checked here; ranges against the resources are
     // checked at replay, when the resources are known.
     bool copy_buffer(const CopyBuffer& copy) {
-        if (!copy.dst || !copy.src || !copy.size) return false;
+        if (!copy.dst || !copy.src) return false;
+        if (!copy.size) return !closed_; // Native D3D12 accepts a zero-byte CopyBufferRegion as a no-op.
         return append(copy);
     }
 

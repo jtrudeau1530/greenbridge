@@ -24,6 +24,8 @@
 //   rectangles need color_attachment usage on the image (ResourceBinding::color_attachment);
 // - query commands need the query functions, fill_buffer and query_pool; resolve destinations have TRANSFER_DST
 //   usage and binary occlusion resolves need resolve_binary_occlusion.
+// - predicated buffer copies need the byte-copy helper and buffers with STORAGE_BUFFER usage; helper descriptors
+//   must remain alive through submission completion (VulkanQueue owns them).
 // A list that needs a missing function fails with ReplayResult::unsupported before anything is written.
 
 #include "command_list.h"
@@ -32,6 +34,7 @@
 
 #include <vulkan/vulkan.h>
 #include "vulkan_predicate.h"
+#include "vulkan_predicated_copy.h"
 
 #include <algorithm>
 #include <array>
@@ -734,6 +737,9 @@ struct ReplayFunctions {
     // Preparation only allocates a slot; capture records the GPU snapshot at the SetPredication command.
     std::function<bool(VkBuffer, VkDeviceSize, PredicateCapture&)> prepare_predicate;
     std::function<void(VkCommandBuffer, const PredicateCapture&)> capture_predicate;
+    std::function<bool(VkBuffer, VkBuffer, VkDeviceSize, VkDeviceSize, VkDeviceSize,
+                       std::vector<PredicatedCopyDispatch>&)> prepare_predicated_copy;
+    std::function<void(VkCommandBuffer, const std::vector<PredicatedCopyDispatch>&)> emit_predicated_copy;
     // Returns a 2D-array view of the range (caller-owned, alive until execution completes); rectangle clears.
     std::function<VkImageView(const ResourceBinding&, const VkImageSubresourceRange&)> image_view;
     // Footprint copies of a depth24_as_float texture (depth24.h): `depth24_prepare` makes the scratch and descriptors
@@ -781,6 +787,7 @@ struct PreparedQuery {
 
 struct Prepared {
     PredicateCapture predicate;
+    std::vector<PredicatedCopyDispatch> predicated_copy;
     ResourceBinding binding;
     VkImageSubresourceRange range{};  // the barrier range, or the cleared view (cleared aspects only)
     VkImageView view = VK_NULL_HANDLE;
@@ -1799,13 +1806,14 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
         } else if (std::holds_alternative<CopyBuffer>(command) || std::holds_alternative<CopyTexture>(command) ||
                    std::holds_alternative<CopyResource>(command)) {
             if (!copies) return ReplayResult::unsupported;
-            if (predicated) ++out.unpredicated_copies;
+            if (predicated && !std::holds_alternative<CopyBuffer>(command)) ++out.unpredicated_copies;
             const auto [dst_id, src_id] = copy_ids(command);
             const ResourceBinding* source = resolve(src_id);
             if (!bind(dst_id) || !source) return ReplayResult::unresolved_resource;
             if (p.binding.host_readable) {
                 out.wrote_readback = true;
-                out.readback_src_stages |= VK_PIPELINE_STAGE_2_COPY_BIT;
+                out.readback_src_stages |= predicated && std::holds_alternative<CopyBuffer>(command)
+                    ? VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT : VK_PIPELINE_STAGE_2_COPY_BIT;
             }
             p.source = *source;
             ReplayResult result = ReplayResult::success;
@@ -1814,8 +1822,19 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                     !detail::within(buffer_copy->dst_offset, buffer_copy->size, p.binding.size) ||
                     !detail::within(buffer_copy->src_offset, buffer_copy->size, p.source.size))
                     return ReplayResult::invalid_copy;
-                p.buffer_copies.push_back({p.source.buffer_offset + buffer_copy->src_offset,
-                                           p.binding.buffer_offset + buffer_copy->dst_offset, buffer_copy->size});
+                if (buffer_copy->src_offset > UINT64_MAX - p.source.buffer_offset ||
+                    buffer_copy->dst_offset > UINT64_MAX - p.binding.buffer_offset) return ReplayResult::invalid_copy;
+                const VkDeviceSize src = p.source.buffer_offset + buffer_copy->src_offset;
+                const VkDeviceSize dst = p.binding.buffer_offset + buffer_copy->dst_offset;
+                if (buffer_copy->size > UINT64_MAX - src || buffer_copy->size > UINT64_MAX - dst)
+                    return ReplayResult::invalid_copy;
+                if (p.source.buffer == p.binding.buffer && src < dst + buffer_copy->size && dst < src + buffer_copy->size)
+                    return ReplayResult::invalid_copy;
+                if (predicated) {
+                    if (statistics_active || !vk.prepare_predicated_copy || !vk.emit_predicated_copy ||
+                        !vk.prepare_predicated_copy(p.source.buffer, p.binding.buffer, src, dst, buffer_copy->size, p.predicated_copy))
+                        return ReplayResult::unsupported;
+                } else p.buffer_copies.push_back({src, dst, buffer_copy->size});
             } else if (const auto* texture_copy = std::get_if<CopyTexture>(&command)) {
                 result = detail::prepare_texture_copy(*texture_copy, p);
                 // A depth plane footprint of a D24 texture stored as D32: words of 24-bit UNORM, floats in the image.
@@ -2420,7 +2439,9 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
         } else if (std::holds_alternative<CopyBuffer>(command) || std::holds_alternative<CopyTexture>(command) ||
                    std::holds_alternative<CopyResource>(command)) {
             const auto [dst_id, src_id] = copy_ids(command);
-            if (!p.buffer_copies.empty()) {
+            if (!p.predicated_copy.empty()) {
+                vk.emit_predicated_copy(command_buffer, p.predicated_copy);
+            } else if (!p.buffer_copies.empty()) {
                 vk.copy_buffer(command_buffer, p.source.buffer, p.binding.buffer, std::uint32_t(p.buffer_copies.size()),
                                p.buffer_copies.data());
             } else if (!p.image_copies.empty()) {
