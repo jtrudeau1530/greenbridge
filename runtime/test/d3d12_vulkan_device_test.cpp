@@ -5677,6 +5677,49 @@ int main() {
             EXPECT(on.shaderResourceMinLod == have.features.shaderResourceMinLod);
             EXPECT(made->shader_output_layer == (have12.shaderOutputLayer == VK_TRUE));
             EXPECT(made->shader_output_viewport_index == (have12.shaderOutputViewportIndex == VK_TRUE));
+            // The pixel-shader extensions (barycentrics, the POPS interlock, maintenance8's texel offsets): each is
+            // enabled exactly when the GPU offers the extension and its feature. A structure is chained into the
+            // query only when its extension is offered.
+            const auto enumerate = reinterpret_cast<PFN_vkEnumerateDeviceExtensionProperties>(
+                made->get_instance_proc(made->instance, "vkEnumerateDeviceExtensionProperties"));
+            EXPECT(enumerate != nullptr);
+            std::vector<VkExtensionProperties> offered;
+            std::uint32_t offered_count = 0;
+            if (enumerate && enumerate(made->physical, nullptr, &offered_count, nullptr) == VK_SUCCESS) {
+                offered.resize(offered_count);
+                enumerate(made->physical, nullptr, &offered_count, offered.data());
+                offered.resize(offered_count);
+            }
+            const auto has = [&](const char* name) {
+                return std::any_of(offered.begin(), offered.end(),
+                                   [&](const VkExtensionProperties& e) { return std::strcmp(e.extensionName, name) == 0; });
+            };
+            VkPhysicalDeviceFragmentShaderBarycentricFeaturesKHR bary{
+                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_BARYCENTRIC_FEATURES_KHR};
+            VkPhysicalDeviceFragmentShaderInterlockFeaturesEXT lock{
+                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_INTERLOCK_FEATURES_EXT};
+            VkPhysicalDeviceFeatures2 ext_query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+            if (has(VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME)) {
+                bary.pNext = ext_query.pNext;
+                ext_query.pNext = &bary;
+            }
+            if (has(VK_EXT_FRAGMENT_SHADER_INTERLOCK_EXTENSION_NAME)) {
+                lock.pNext = ext_query.pNext;
+                ext_query.pNext = &lock;
+            }
+#ifdef VK_KHR_MAINTENANCE_8_EXTENSION_NAME
+            VkPhysicalDeviceMaintenance8FeaturesKHR m8{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_8_FEATURES_KHR};
+            if (has(VK_KHR_MAINTENANCE_8_EXTENSION_NAME)) {
+                m8.pNext = ext_query.pNext;
+                ext_query.pNext = &m8;
+            }
+#endif
+            if (features2) features2(made->physical, &ext_query);
+            EXPECT(made->fragment_shader_barycentric == (bary.fragmentShaderBarycentric == VK_TRUE));
+            EXPECT(made->fragment_shader_interlock == (lock.fragmentShaderPixelInterlock == VK_TRUE));
+#ifdef VK_KHR_MAINTENANCE_8_EXTENSION_NAME
+            EXPECT(made->maintenance8 == (m8.maintenance8 == VK_TRUE));
+#endif
         }
         D3D12_COMMAND_QUEUE_DESC queue_desc{};
         Ref<ID3D12CommandQueue> queue;
