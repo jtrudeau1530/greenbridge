@@ -219,5 +219,250 @@ class TestLdsXorRtnB32ReferenceOracle(unittest.TestCase):
             self.assertEqual(new2, MASK_32)
 
 
+# ============================================================================
+# Section 2: Symbolic AST Opcode Definitions and Typed Expressions
+# ============================================================================
+
+class RegType(Enum):
+    VGPR = auto()
+    SGPR = auto()
+    IMM = auto()
+
+
+@dataclass(frozen=True)
+class VGPR:
+    index: int
+
+    def __post_init__(self) -> None:
+        if not (0 <= self.index < DEFAULT_NUM_VGPRS):
+            raise ValueError(f"VGPR index out of range [0, {DEFAULT_NUM_VGPRS - 1}]: {self.index}")
+
+    def __str__(self) -> str:
+        return f"v{self.index}"
+
+
+@dataclass(frozen=True)
+class SGPR:
+    index: int
+
+    def __post_init__(self) -> None:
+        if not (0 <= self.index < DEFAULT_NUM_SGPRS):
+            raise ValueError(f"SGPR index out of range [0, {DEFAULT_NUM_SGPRS - 1}]: {self.index}")
+
+    def __str__(self) -> str:
+        return f"s{self.index}"
+
+
+@dataclass(frozen=True)
+class Immediate:
+    value: int
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "value", u32(self.value))
+
+    def __str__(self) -> str:
+        return f"0x{self.value:X}"
+
+
+@dataclass(frozen=True)
+class DSXorRtnB32Instruction:
+    dst: VGPR
+    addr: VGPR
+    data0: Union[VGPR, Immediate]
+    offset: int = 0
+    gds: bool = False
+
+    def __post_init__(self) -> None:
+        if not (0 <= self.offset <= OFFSET16_MASK):
+            raise ValueError(f"LDS offset out of 16-bit range [0, 65535]: {self.offset}")
+        if not isinstance(self.dst, VGPR):
+            raise TypeError(f"dst must be a VGPR, got {type(self.dst)}")
+        if not isinstance(self.addr, VGPR):
+            raise TypeError(f"addr must be a VGPR, got {type(self.addr)}")
+        if not isinstance(self.data0, (VGPR, Immediate)):
+            raise TypeError(f"data0 must be VGPR or Immediate, got {type(self.data0)}")
+
+    def disasm(self) -> str:
+        tokens = ["ds_xor_rtn_b32", str(self.dst), str(self.addr), str(self.data0)]
+        extra = []
+        if self.offset != 0:
+            extra.append(f"offset:{self.offset}")
+        if self.gds:
+            extra.append("gds")
+        core = f"{tokens[0]} {tokens[1]}, {tokens[2]}, {tokens[3]}"
+        return f"{core} {' '.join(extra)}".rstrip()
+
+
+class ASTExpr:
+    """Base class for symbolic typed expressions in RDNA2 bitwise algebra."""
+
+    def simplify(self) -> ASTExpr:
+        raise NotImplementedError
+
+    def evaluate(self, env: Dict[str, int]) -> int:
+        raise NotImplementedError
+
+
+@dataclass(frozen=True)
+class Symbol(ASTExpr):
+    name: str
+
+    def simplify(self) -> ASTExpr:
+        return self
+
+    def evaluate(self, env: Dict[str, int]) -> int:
+        if self.name not in env:
+            raise KeyError(f"Symbol '{self.name}' not found in evaluation environment")
+        return u32(env[self.name])
+
+    def __str__(self) -> str:
+        return self.name
+
+
+@dataclass(frozen=True)
+class Constant(ASTExpr):
+    value: int
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "value", u32(self.value))
+
+    def simplify(self) -> ASTExpr:
+        return self
+
+    def evaluate(self, env: Dict[str, int]) -> int:
+        return self.value
+
+    def __str__(self) -> str:
+        return f"0x{self.value:08X}"
+
+
+@dataclass(frozen=True)
+class BitXorExpr(ASTExpr):
+    left: ASTExpr
+    right: ASTExpr
+
+    def _flatten(self) -> List[ASTExpr]:
+        terms: List[ASTExpr] = []
+        for child in (self.left, self.right):
+            if isinstance(child, BitXorExpr):
+                terms.extend(child._flatten())
+            else:
+                terms.append(child)
+        return terms
+
+    def simplify(self) -> ASTExpr:
+        simplified_left = self.left.simplify()
+        simplified_right = self.right.simplify()
+
+        if isinstance(simplified_left, Constant) and isinstance(simplified_right, Constant):
+            return Constant(simplified_left.value ^ simplified_right.value)
+
+        terms: List[ASTExpr] = []
+        for child in (simplified_left, simplified_right):
+            if isinstance(child, BitXorExpr):
+                terms.extend(child._flatten())
+            else:
+                terms.append(child)
+
+        const_accum = 0
+        symbol_counts: Dict[str, int] = {}
+        for t in terms:
+            if isinstance(t, Constant):
+                const_accum ^= t.value
+            elif isinstance(t, Symbol):
+                symbol_counts[t.name] = symbol_counts.get(t.name, 0) + 1
+
+        remaining_symbols: List[Symbol] = [
+            Symbol(name) for name, count in sorted(symbol_counts.items()) if (count % 2) != 0
+        ]
+
+        if not remaining_symbols:
+            return Constant(const_accum)
+
+        result: Optional[ASTExpr] = None
+        for sym in remaining_symbols:
+            result = sym if result is None else BitXorExpr(result, sym)
+
+        if const_accum != 0:
+            assert result is not None
+            return BitXorExpr(result, Constant(const_accum))
+
+        assert result is not None
+        return result
+
+    def evaluate(self, env: Dict[str, int]) -> int:
+        return u32(self.left.evaluate(env) ^ self.right.evaluate(env))
+
+    def __str__(self) -> str:
+        return f"({self.left} ^ {self.right})"
+
+
+class TestSymbolicASTAndTypedExpressions(unittest.TestCase):
+    """Unit tests for symbolic AST opcode definitions and typed expressions."""
+
+    def test_instruction_valid_creation_and_disassembly(self) -> None:
+        instr = DSXorRtnB32Instruction(
+            dst=VGPR(0),
+            addr=VGPR(1),
+            data0=VGPR(2),
+            offset=16,
+        )
+        self.assertEqual(instr.disasm(), "ds_xor_rtn_b32 v0, v1, v2 offset:16")
+
+        instr_imm = DSXorRtnB32Instruction(
+            dst=VGPR(10),
+            addr=VGPR(20),
+            data0=Immediate(0x1234),
+            offset=0,
+            gds=True,
+        )
+        self.assertEqual(instr_imm.disasm(), "ds_xor_rtn_b32 v10, v20, 0x1234 gds")
+
+    def test_instruction_validation_vgpr_bounds(self) -> None:
+        with self.assertRaises(ValueError):
+            VGPR(256)
+        with self.assertRaises(ValueError):
+            VGPR(-1)
+
+    def test_instruction_validation_offset_bounds(self) -> None:
+        with self.assertRaises(ValueError):
+            DSXorRtnB32Instruction(dst=VGPR(0), addr=VGPR(1), data0=VGPR(2), offset=65536)
+        with self.assertRaises(ValueError):
+            DSXorRtnB32Instruction(dst=VGPR(0), addr=VGPR(1), data0=VGPR(2), offset=-1)
+
+    def test_symbolic_constant_folding(self) -> None:
+        expr = BitXorExpr(Constant(0x0F0F), Constant(0x00FF))
+        simplified = expr.simplify()
+        self.assertIsInstance(simplified, Constant)
+        self.assertEqual(simplified.evaluate({}), 0x0FF0)
+
+    def test_symbolic_identity_zero(self) -> None:
+        x = Symbol("X")
+        expr = BitXorExpr(x, Constant(0))
+        simplified = expr.simplify()
+        self.assertEqual(simplified, x)
+
+    def test_symbolic_self_inverse(self) -> None:
+        x = Symbol("X")
+        expr = BitXorExpr(x, x)
+        simplified = expr.simplify()
+        self.assertEqual(simplified, Constant(0))
+
+    def test_symbolic_involution(self) -> None:
+        x = Symbol("X")
+        y = Symbol("Y")
+        expr = BitXorExpr(BitXorExpr(x, y), y)
+        simplified = expr.simplify()
+        self.assertEqual(simplified, x)
+
+    def test_symbolic_evaluation_env(self) -> None:
+        x = Symbol("A")
+        y = Symbol("B")
+        expr = BitXorExpr(x, y)
+        env = {"A": 0b1010, "B": 0b1100}
+        self.assertEqual(expr.evaluate(env), 0b0110)
+
+
+
 if __name__ == "__main__":
     unittest.main()
