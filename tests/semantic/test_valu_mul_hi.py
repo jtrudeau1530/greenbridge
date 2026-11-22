@@ -329,6 +329,77 @@ class ScalarInterpreter:
         return self.execute_ast(inst)
 
 
+# ==============================================================================
+# SIMD Wavefront Execution Model (Wave32 / Wave64) for v_mul_hi
+# ==============================================================================
+
+def ref_simd_mul_hi(
+    opcode: Opcode,
+    src0_lanes: list[int],
+    src1_lanes: list[int],
+    wave_size: int = 64,
+    exec_mask: int | None = None,
+    prev_dst: list[int] | None = None,
+) -> list[int]:
+    """Reference SIMD execution oracle across wavefront lanes."""
+    if wave_size not in (32, 64):
+        raise ValueError(f"Unsupported wave size: {wave_size}")
+    if len(src0_lanes) != wave_size or len(src1_lanes) != wave_size:
+        raise ValueError(f"Operand length must match wave_size ({wave_size})")
+
+    active_mask = (1 << wave_size) - 1 if exec_mask is None else (exec_mask & ((1 << wave_size) - 1))
+    fallback = [0] * wave_size if prev_dst is None else prev_dst
+    if len(fallback) != wave_size:
+        raise ValueError(f"prev_dst length must match wave_size ({wave_size})")
+
+    output = list(fallback)
+    fn = ref_mul_hi_u32 if opcode == Opcode.V_MUL_HI_U32 else ref_mul_hi_i32
+    for lane in range(wave_size):
+        if (active_mask >> lane) & 1:
+            output[lane] = fn(src0_lanes[lane], src1_lanes[lane])
+    return output
+
+
+class SIMDWavefront:
+    """SIMD wavefront simulator modeling multi-lane execution and EXEC masking."""
+
+    def __init__(self, wave_size: int = 64, num_vgprs: int = 256) -> None:
+        if wave_size not in (32, 64):
+            raise ValueError(f"Wave size must be 32 or 64, got {wave_size}")
+        self.wave_size = wave_size
+        self.num_vgprs = num_vgprs
+        self.lanes = [VALURegisterFile(num_vgprs=num_vgprs) for _ in range(wave_size)]
+        self.exec_mask = (1 << wave_size) - 1
+        self.vcc = 0
+        self.sgprs = [0] * 106
+
+    def store_vgpr_wave(self, reg_idx: int, values: list[int]) -> None:
+        if len(values) != self.wave_size:
+            raise ValueError(f"Value count ({len(values)}) does not match wave_size ({self.wave_size})")
+        for lane in range(self.wave_size):
+            self.lanes[lane].set_vgpr(reg_idx, values[lane])
+
+    def load_vgpr_wave(self, reg_idx: int) -> list[int]:
+        return [self.lanes[lane].get_vgpr(reg_idx) for lane in range(self.wave_size)]
+
+    def step_v_mul_hi(
+        self,
+        opcode: Opcode,
+        dst_reg: int,
+        src0_reg: int,
+        src1_reg: int,
+    ) -> list[int]:
+        active_mask = self.exec_mask & ((1 << self.wave_size) - 1)
+        fn = ref_mul_hi_u32 if opcode == Opcode.V_MUL_HI_U32 else ref_mul_hi_i32
+        for lane in range(self.wave_size):
+            if (active_mask >> lane) & 1:
+                s0 = self.lanes[lane].get_vgpr(src0_reg)
+                s1 = self.lanes[lane].get_vgpr(src1_reg)
+                res = fn(s0, s1)
+                self.lanes[lane].set_vgpr(dst_reg, res)
+        return self.load_vgpr_wave(dst_reg)
+
+
 class TestVMulHiOracleAndModel(unittest.TestCase):
     """Test suite for reference mathematical oracle and architectural model."""
 
@@ -530,6 +601,101 @@ class TestScalarInterpreter(unittest.TestCase):
         res = interp.execute_asm("v_mul_hi_i32 v0, v5, v6")
         self.assertEqual(res, 0x40000000)
         self.assertEqual(interp.vgpr.get_vgpr(0), 0x40000000)
+
+
+class TestSIMDMultiLaneDivergence(unittest.TestCase):
+    """Test suite for SIMD multi-lane divergence and 32/64-bit EXEC masking."""
+
+    def test_wave32_all_active_u32(self) -> None:
+        sim = SIMDWavefront(wave_size=32)
+        s0_vals = [0x10000000 * (i + 1) for i in range(32)]
+        s1_vals = [0x10 for _ in range(32)]
+        sim.store_vgpr_wave(1, s0_vals)
+        sim.store_vgpr_wave(2, s1_vals)
+
+        res = sim.step_v_mul_hi(Opcode.V_MUL_HI_U32, 0, 1, 2)
+        for i in range(32):
+            expected = ref_mul_hi_u32(s0_vals[i], s1_vals[i])
+            self.assertEqual(res[i], expected)
+
+    def test_wave64_all_active_i32(self) -> None:
+        sim = SIMDWavefront(wave_size=64)
+        s0_vals = [to_u32(-1000000 * (i + 1)) for i in range(64)]
+        s1_vals = [to_u32(2000) for _ in range(64)]
+        sim.store_vgpr_wave(1, s0_vals)
+        sim.store_vgpr_wave(2, s1_vals)
+
+        res = sim.step_v_mul_hi(Opcode.V_MUL_HI_I32, 0, 1, 2)
+        for i in range(64):
+            expected = ref_mul_hi_i32(s0_vals[i], s1_vals[i])
+            self.assertEqual(res[i], expected)
+
+    def test_wave32_divergent_exec_mask(self) -> None:
+        sim = SIMDWavefront(wave_size=32)
+        sim.store_vgpr_wave(0, [OLD_VGPR_SENTINEL] * 32)
+        s0_vals = [0x80000000] * 32
+        s1_vals = [2] * 32
+        sim.store_vgpr_wave(1, s0_vals)
+        sim.store_vgpr_wave(2, s1_vals)
+
+        # Alternating active lanes: 0b0101...
+        sim.exec_mask = 0x55555555
+        res = sim.step_v_mul_hi(Opcode.V_MUL_HI_U32, 0, 1, 2)
+
+        for lane in range(32):
+            if lane % 2 == 0:
+                self.assertEqual(res[lane], 1)
+            else:
+                self.assertEqual(res[lane], OLD_VGPR_SENTINEL)
+
+    def test_wave64_divergent_exec_mask(self) -> None:
+        sim = SIMDWavefront(wave_size=64)
+        sim.store_vgpr_wave(0, [OLD_VGPR_SENTINEL] * 64)
+        s0_vals = [0xFFFFFFFF] * 64
+        s1_vals = [0xFFFFFFFF] * 64
+        sim.store_vgpr_wave(1, s0_vals)
+        sim.store_vgpr_wave(2, s1_vals)
+
+        # Lower 32 lanes active, upper 32 inactive
+        sim.exec_mask = 0x00000000_FFFFFFFF
+        res = sim.step_v_mul_hi(Opcode.V_MUL_HI_U32, 0, 1, 2)
+
+        for lane in range(32):
+            self.assertEqual(res[lane], 0xFFFFFFFE)
+        for lane in range(32, 64):
+            self.assertEqual(res[lane], OLD_VGPR_SENTINEL)
+
+    def test_wave32_upper_exec_bits_ignored(self) -> None:
+        sim = SIMDWavefront(wave_size=32)
+        sim.store_vgpr_wave(0, [OLD_VGPR_SENTINEL] * 32)
+        sim.store_vgpr_wave(1, [0x80000000] * 32)
+        sim.store_vgpr_wave(2, [4] * 32)
+
+        # Upper 32 bits should not affect wave32
+        sim.exec_mask = 0xDEADBEEF_FFFFFFFF
+        res = sim.step_v_mul_hi(Opcode.V_MUL_HI_U32, 0, 1, 2)
+        for lane in range(32):
+            self.assertEqual(res[lane], 2)
+
+    def test_simd_oracle_validation(self) -> None:
+        wave_size = 64
+        s0_vals = [(i * 0x04000000 + 0x12345) & MASK32 for i in range(wave_size)]
+        s1_vals = [((63 - i) * 0x02000000 + 0x6789A) & MASK32 for i in range(wave_size)]
+        exec_mask = 0xAAAAAAAAAAAAAAAA
+        prev_dst = [0xCAFE0000 | i for i in range(wave_size)]
+
+        expected = ref_simd_mul_hi(
+            Opcode.V_MUL_HI_U32, s0_vals, s1_vals, wave_size=wave_size, exec_mask=exec_mask, prev_dst=prev_dst
+        )
+
+        sim = SIMDWavefront(wave_size=wave_size)
+        sim.store_vgpr_wave(0, prev_dst)
+        sim.store_vgpr_wave(1, s0_vals)
+        sim.store_vgpr_wave(2, s1_vals)
+        sim.exec_mask = exec_mask
+
+        actual = sim.step_v_mul_hi(Opcode.V_MUL_HI_U32, 0, 1, 2)
+        self.assertEqual(actual, expected)
 
 
 if __name__ == "__main__":
