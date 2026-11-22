@@ -2806,7 +2806,8 @@ int compare_invalid_arguments(ID3D12Device* ours) {
                                                nullptr, __uuidof(ID3D12Resource), nullptr);
          }},
         // CreateHeap and CreateHeap1 (D3D-238): the four descriptions the host refused on an RX 5700 and WARP, the
-        // heap-property rules CreateCommittedResource shares, and valid neighbours.
+        // heap-property rules CreateCommittedResource shares. A refusal needs no arena; the valid neighbours do, so
+        // compare_heap_neighbours compares them on the standalone device.
         {"heap: alignment 4096", [](ID3D12Device* d) { return heap_create(d, heap_desc_of(4096)); }},
         {"heap1: alignment 4096", [](ID3D12Device* d) { return heap_create1(d, heap_desc_of(4096)); }},
         {"heap: custom heap, unknown page property", [](ID3D12Device* d) {
@@ -2839,38 +2840,6 @@ int compare_invalid_arguments(ID3D12Device* ours) {
         {"heap: default heap with a memory pool", [](ID3D12Device* d) {
              return heap_create(d, heap_desc_of(0, {D3D12_HEAP_TYPE_DEFAULT, D3D12_CPU_PAGE_PROPERTY_UNKNOWN,
                                                     D3D12_MEMORY_POOL_L0}));
-         }},
-        {"heap: alignment 0", [](ID3D12Device* d) { return heap_create(d, heap_desc_of(0)); }},
-        {"heap: alignment 64 KiB", [](ID3D12Device* d) {
-             return heap_create(d, heap_desc_of(D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT));
-         }},
-        {"heap: alignment 4 MiB", [](ID3D12Device* d) {
-             return heap_create(d, heap_desc_of(D3D12_DEFAULT_MSAA_RESOURCE_PLACEMENT_ALIGNMENT,
-                                                {D3D12_HEAP_TYPE_DEFAULT}, D3D12_HEAP_FLAG_NONE,
-                                                D3D12_DEFAULT_MSAA_RESOURCE_PLACEMENT_ALIGNMENT));
-         }},
-        {"heap1: alignment 4 MiB", [](ID3D12Device* d) {
-             return heap_create1(d, heap_desc_of(D3D12_DEFAULT_MSAA_RESOURCE_PLACEMENT_ALIGNMENT,
-                                                 {D3D12_HEAP_TYPE_DEFAULT}, D3D12_HEAP_FLAG_NONE,
-                                                 D3D12_DEFAULT_MSAA_RESOURCE_PLACEMENT_ALIGNMENT));
-         }},
-        {"heap: size 1000", [](ID3D12Device* d) {
-             return heap_create(d, heap_desc_of(0, {D3D12_HEAP_TYPE_DEFAULT}, D3D12_HEAP_FLAG_NONE, 1000));
-         }},
-        {"heap: upload", [](ID3D12Device* d) { return heap_create(d, heap_desc_of(0, {D3D12_HEAP_TYPE_UPLOAD})); }},
-        {"heap: readback", [](ID3D12Device* d) {
-             return heap_create(d, heap_desc_of(0, {D3D12_HEAP_TYPE_READBACK}));
-         }},
-        {"heap: custom write-combine L0", [](ID3D12Device* d) {
-             return heap_create(d, heap_desc_of(0, {D3D12_HEAP_TYPE_CUSTOM, D3D12_CPU_PAGE_PROPERTY_WRITE_COMBINE,
-                                                    D3D12_MEMORY_POOL_L0}));
-         }},
-        {"heap1: custom write-combine L0", [](ID3D12Device* d) {
-             return heap_create1(d, heap_desc_of(0, {D3D12_HEAP_TYPE_CUSTOM, D3D12_CPU_PAGE_PROPERTY_WRITE_COMBINE,
-                                                     D3D12_MEMORY_POOL_L0}));
-         }},
-        {"heap: ALLOW_ONLY_BUFFERS (two DENY flags)", [](ID3D12Device* d) {
-             return heap_create(d, heap_desc_of(0, {D3D12_HEAP_TYPE_DEFAULT}, D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS));
          }},
         // CreateDescriptorHeap. A null description faults in the host runtime, so it is not compared.
         {"descriptor heap: null output", [](ID3D12Device* d) {
@@ -3098,6 +3067,59 @@ int compare_invalid_arguments(ID3D12Device* ours) {
             ++mismatches;
             std::fprintf(stderr, "invalid arguments format %d %s: ours 0x%08lx, host 0x%08lx\n", f, what, a, b);
         }
+    }
+    return mismatches;
+}
+
+// D3D-238: the valid neighbours of the CreateHeap/CreateHeap1 refusals in compare_invalid_arguments, compared
+// with the host on a device that has the GPU address arena (without it the layer answers every heap E_NOTIMPL).
+int compare_heap_neighbours(ID3D12Device* ours) {
+    Ref<ID3D12Device> host;
+    if (!create_host_device(host)) return -1;
+    struct Case {
+        const char* name;
+        InvalidCase call;
+    };
+    static const Case cases[] = {
+        {"heap: alignment 0", [](ID3D12Device* d) { return heap_create(d, heap_desc_of(0)); }},
+        {"heap: alignment 64 KiB", [](ID3D12Device* d) {
+             return heap_create(d, heap_desc_of(D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT));
+         }},
+        {"heap: alignment 4 MiB", [](ID3D12Device* d) {
+             return heap_create(d, heap_desc_of(D3D12_DEFAULT_MSAA_RESOURCE_PLACEMENT_ALIGNMENT,
+                                                {D3D12_HEAP_TYPE_DEFAULT}, D3D12_HEAP_FLAG_NONE,
+                                                D3D12_DEFAULT_MSAA_RESOURCE_PLACEMENT_ALIGNMENT));
+         }},
+        {"heap1: alignment 4 MiB", [](ID3D12Device* d) {
+             return heap_create1(d, heap_desc_of(D3D12_DEFAULT_MSAA_RESOURCE_PLACEMENT_ALIGNMENT,
+                                                 {D3D12_HEAP_TYPE_DEFAULT}, D3D12_HEAP_FLAG_NONE,
+                                                 D3D12_DEFAULT_MSAA_RESOURCE_PLACEMENT_ALIGNMENT));
+         }},
+        {"heap: size 1000", [](ID3D12Device* d) {
+             return heap_create(d, heap_desc_of(0, {D3D12_HEAP_TYPE_DEFAULT}, D3D12_HEAP_FLAG_NONE, 1000));
+         }},
+        {"heap: upload", [](ID3D12Device* d) { return heap_create(d, heap_desc_of(0, {D3D12_HEAP_TYPE_UPLOAD})); }},
+        {"heap: readback", [](ID3D12Device* d) {
+             return heap_create(d, heap_desc_of(0, {D3D12_HEAP_TYPE_READBACK}));
+         }},
+        {"heap: custom write-combine L0", [](ID3D12Device* d) {
+             return heap_create(d, heap_desc_of(0, {D3D12_HEAP_TYPE_CUSTOM, D3D12_CPU_PAGE_PROPERTY_WRITE_COMBINE,
+                                                    D3D12_MEMORY_POOL_L0}));
+         }},
+        {"heap1: custom write-combine L0", [](ID3D12Device* d) {
+             return heap_create1(d, heap_desc_of(0, {D3D12_HEAP_TYPE_CUSTOM, D3D12_CPU_PAGE_PROPERTY_WRITE_COMBINE,
+                                                     D3D12_MEMORY_POOL_L0}));
+         }},
+        {"heap: ALLOW_ONLY_BUFFERS (two DENY flags)", [](ID3D12Device* d) {
+             return heap_create(d, heap_desc_of(0, {D3D12_HEAP_TYPE_DEFAULT}, D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS));
+         }},
+    };
+    int mismatches = 0;
+    for (const Case& c : cases) {
+        const HRESULT a = call_guarded(c.call, ours), b = call_guarded(c.call, host.p);
+        if (a == b) continue;
+        ++mismatches;
+        std::fprintf(stderr, "invalid arguments %s: ours 0x%08lx, host 0x%08lx\n", c.name, a, b);
     }
     return mismatches;
 }
@@ -4856,7 +4878,7 @@ int main() {
         EXPECT(SUCCEEDED(standalone->CreateHeap(&upload_heap_desc, IID_PPV_ARGS(&upload_placed_heap.p))));
 
         // D3D-238: heap descriptions the host refuses (RX 5700 and WARP), from CreateHeap and CreateHeap1 alike, and
-        // their valid neighbours. compare_invalid_arguments checks the same answers against a host device.
+        // their valid neighbours. compare_invalid_arguments and compare_heap_neighbours check them against a host.
         {
             const D3D12_HEAP_FLAGS deny_all = D3D12_HEAP_FLAG_DENY_BUFFERS | D3D12_HEAP_FLAG_DENY_RT_DS_TEXTURES |
                                               D3D12_HEAP_FLAG_DENY_NON_RT_DS_TEXTURES;
@@ -4895,6 +4917,10 @@ int main() {
             Ref<ID3D12Heap> unused;
             EXPECT(SUCCEEDED(standalone->QueryInterface(IID_PPV_ARGS(&device4.p))));
             EXPECT(device4->CreateHeap1(&placed_heap_desc, nullptr, IID_PPV_ARGS(&unused.p)) == S_OK && unused.p);
+            const int heap_mismatches = compare_heap_neighbours(standalone.p);
+            if (heap_mismatches < 0)
+                std::printf("CreateHeap valid neighbours: no host D3D12 device to compare with, skipped\n");
+            EXPECT(heap_mismatches <= 0);
         }
 
         auto tiled_2d = [&](UINT w, UINT h, DXGI_FORMAT fmt, UINT16 mips, D3D12_RESOURCE_FLAGS flags,
