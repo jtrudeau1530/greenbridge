@@ -1536,5 +1536,110 @@ class TestIEEE754BoundaryExtremes(unittest.TestCase):
         self.assertEqual(clamp_f16(SNAN_DEFAULT), POS_ZERO)
 
 
+# ==============================================================================
+# Negative Controls, Syntax Rejection, and Mutation Detection
+# ==============================================================================
+
+class TestNegativeControlsAndMutationDetection(unittest.TestCase):
+    """Negative controls, architectural syntax rejection, and mutation detection tests."""
+
+    def test_syntax_rejection_registers(self) -> None:
+        with self.assertRaises(ValueError):
+            Reg(256, RegKind.VGPR)
+        with self.assertRaises(ValueError):
+            Reg(-1, RegKind.VGPR)
+        with self.assertRaises(ValueError):
+            Reg(106, RegKind.SGPR)
+        with self.assertRaises(ValueError):
+            Reg(-1, RegKind.SGPR)
+
+    def test_syntax_rejection_instruction_dst(self) -> None:
+        # Cannot assign SGPR as destination of packed VALU instruction
+        with self.assertRaises(TypeError):
+            VPkMinMaxF16Instruction(
+                opcode=Opcode.V_PK_MIN_F16,
+                dst=Reg(0, RegKind.SGPR),
+                src0=VOP3POperand(Reg(1, RegKind.VGPR)),
+                src1=VOP3POperand(Reg(2, RegKind.VGPR)),
+            )
+
+    def test_syntax_rejection_op_sel(self) -> None:
+        with self.assertRaises(ValueError):
+            VOP3POperand(Reg(0, RegKind.VGPR), op_sel=(0, 2))
+        with self.assertRaises(ValueError):
+            VOP3POperand(Reg(0, RegKind.VGPR), op_sel=(-1, 1))
+
+    def test_syntax_rejection_literal_bounds(self) -> None:
+        with self.assertRaises(ValueError):
+            Literal32(-1)
+        with self.assertRaises(ValueError):
+            Literal32(0x1_0000_0000)
+
+    def test_syntax_rejection_simd_lanes(self) -> None:
+        with self.assertRaises(ValueError):
+            SIMDState(num_lanes=16)
+        with self.assertRaises(ValueError):
+            SIMDState(num_lanes=128)
+
+    def test_syntax_rejection_lane_reg_type(self) -> None:
+        state = SIMDState(num_lanes=32)
+        with self.assertRaises(TypeError):
+            state.set_lane_vgpr(0, Reg(0, RegKind.SGPR), 0)
+
+    def test_mutation_detection_opcode_inversion(self) -> None:
+        # Sabotaging min to max must be detected
+        s0 = pack_pk_f16(POS_ONE, POS_TWO)
+        s1 = pack_pk_f16(POS_HALF, POS_HALF)
+
+        correct_min = oracle_pk_min_f16(s0, s1)
+        mutated_max = oracle_pk_max_f16(s0, s1)
+
+        self.assertNotEqual(correct_min, mutated_max)
+        self.assertEqual(correct_min, pack_pk_f16(POS_HALF, POS_HALF))
+        self.assertEqual(mutated_max, pack_pk_f16(POS_ONE, POS_TWO))
+
+    def test_mutation_detection_signed_zero_tiebreak(self) -> None:
+        # Sabotaging signed zero tiebreak: min(-0.0, +0.0) must be -0.0, not +0.0
+        got = oracle_min_f16(NEG_ZERO, POS_ZERO)
+        self.assertEqual(got, NEG_ZERO)
+        self.assertNotEqual(got, POS_ZERO)
+
+        # max(-0.0, +0.0) must be +0.0, not -0.0
+        got_max = oracle_max_f16(NEG_ZERO, POS_ZERO)
+        self.assertEqual(got_max, POS_ZERO)
+        self.assertNotEqual(got_max, NEG_ZERO)
+
+    def test_mutation_detection_nan_suppression(self) -> None:
+        # Sabotaging NaN suppression to propagate NaN must be detected
+        got = oracle_min_f16(QNAN_CANONICAL, POS_TWO)
+        self.assertEqual(got, POS_TWO)
+        self.assertFalse(is_nan16(got))
+
+    def test_mutation_detection_clamp_bypass(self) -> None:
+        # Sabotaging clamp (omitting clamp on 2.0) must be detected
+        val = POS_TWO  # 2.0
+        clamped = clamp_f16(val)
+        self.assertEqual(clamped, POS_ONE)  # clamped to 1.0
+        self.assertNotEqual(clamped, val)
+
+    def test_mutation_detection_op_sel_tampering(self) -> None:
+        # s0: lo=1.0, hi=2.0; s1: lo=1.5, hi=3.0
+        s0 = pack_pk_f16(POS_ONE, POS_TWO)
+        s1 = pack_pk_f16(f16_to_bits(1.5), f16_to_bits(3.0))
+
+        # Standard op_sel: lo gets s0.lo (1.0) vs s1.lo (1.5) -> 1.0
+        #                  hi gets s0.hi (2.0) vs s1.hi (3.0) -> 2.0
+        std_res = oracle_pk_min_f16(s0, s1, op_sel=(0, 0, 1, 1))
+
+        # Tampered op_sel: swap s0 halves
+        #                  lo gets s0.hi (2.0) vs s1.lo (1.5) -> 1.5
+        #                  hi gets s0.lo (1.0) vs s1.hi (3.0) -> 1.0
+        tampered_res = oracle_pk_min_f16(s0, s1, op_sel=(1, 0, 0, 1))
+
+        self.assertNotEqual(std_res, tampered_res)
+        self.assertEqual(std_res, pack_pk_f16(POS_ONE, POS_TWO))
+        self.assertEqual(tampered_res, pack_pk_f16(f16_to_bits(1.5), POS_ONE))
+
+
 if __name__ == "__main__":
     unittest.main()
