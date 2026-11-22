@@ -14,13 +14,13 @@ Add-Type -Path "$CodeWalker\SharpDX.dll"; Add-Type -Path "$CodeWalker\SharpDX.Ma
 [void][Reflection.Assembly]::LoadFrom("$CodeWalker\CodeWalker.Core.dll")
 New-Item -ItemType Directory -Force $Out | Out-Null
 $fail = Join-Path $Out "failures.txt"
-"" | Set-Content $fail
+"" | Set-Content -LiteralPath $fail
 $ok = @{ pso = 0; rbf = 0 }; $bad = @{ pso = 0; rbf = 0 }; $n = 0
 
-foreach ($dir in Get-ChildItem $Carve -Directory) {
+foreach ($dir in Get-ChildItem -LiteralPath $Carve -Directory) {
     $idx = Join-Path $dir.FullName "index.json"
-    if (-not (Test-Path $idx)) { continue }
-    $files = (Get-Content $idx -Raw | ConvertFrom-Json).files |
+    if (-not (Test-Path -LiteralPath $idx)) { continue }
+    $files = (Get-Content -LiteralPath $idx -Raw | ConvertFrom-Json).files |
         Where-Object { $_.head.StartsWith("5053494e") -or $_.head.StartsWith("52424630") }
     if (-not $files) { continue }
     $dest = Join-Path $Out $dir.Name
@@ -44,7 +44,7 @@ foreach ($dir in Get-ChildItem $Carve -Directory) {
         } catch {
             $bad[$kind]++
             $msg = $_.Exception.InnerException; if (-not $msg) { $msg = $_.Exception }
-            "$($dir.Name)\$name $kind : $($msg.Message)" | Add-Content $fail
+            "$($dir.Name)\$name $kind : $($msg.Message)" | Add-Content -LiteralPath $fail
         }
     }
     if ($Limit -and $n -ge $Limit) { break }
