@@ -125,7 +125,7 @@ class WaveMachine(cpu_ref.Machine):
         if k == "special":
             t = dst["t"]
             if t == "vcc":
-                self.vcc = value & MASK64
+                self.vcc = (value & MASK64) if self.wave == 64 else ((self.vcc & ~MASK32 & MASK64) | (value & MASK32))
                 return
             if t == "vcc_lo":
                 self.vcc = (self.vcc & ~MASK32 & MASK64) | (value & MASK32)
@@ -154,6 +154,20 @@ class WaveMachine(cpu_ref.Machine):
         if self._wide(base) != (self.wave == 64):
             raise Unsupported(op, self.pc, f"{'64' if self._wide(base) else '32'}-bit mask op in a wave{self.wave} "
                                            "program is not modelled")
+
+    def _active_lanes(self):
+        m = self.exec & self.wmask
+        return [i for i in range(self.wave) if (m >> i) & 1]
+
+    def _read_special(self, name):
+        if name == "exec_hi" and self.wave == 32:
+            return 0
+        return super()._read_special(name)
+
+    def _write_scalar_dst(self, dst, value):
+        if dst.get("k") == "special" and dst.get("t") == "exec_hi" and self.wave == 32:
+            return
+        super()._write_scalar_dst(dst, value)
 
     # -- execution -----------------------------------------------------------------------------------------------
     def run(self):
