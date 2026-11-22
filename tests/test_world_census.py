@@ -9,6 +9,7 @@ import importlib.util
 import io
 import json
 import os
+import shutil
 import struct
 import subprocess
 import sys
@@ -673,6 +674,32 @@ class MainTest(unittest.TestCase):
                 self.assertEqual(len(err.strip().splitlines()), 1)
                 self.assertEqual(out, "")
         self.assertFalse(os.path.exists(self.out))
+
+    def test_same_output_path_identity(self):
+        a = os.path.join(self.dir, "test.rpf")
+        self.assertTrue(WC.same_output_path(a, a))
+        b = os.path.join(self.dir, "other.rpf")
+        self.assertFalse(WC.same_output_path(a, b))
+
+    def test_out_matching_archive_or_reports_is_rejected(self):
+        code, _, err = self.run_main(self.arc, "--out", self.arc)
+        self.assertEqual(code, 2)
+        self.assertIn("error: --out must not overwrite the input archive", err)
+
+        # Archive named summary.json would be overwritten if output directory is its parent
+        arc_summary = os.path.join(self.dir, "summary.json")
+        shutil.copyfile(self.arc, arc_summary)
+        code, _, err = self.run_main(arc_summary, "--out", self.dir)
+        self.assertEqual(code, 2)
+        self.assertIn("error: --out reports would overwrite input archive", err)
+
+    def test_out_as_existing_file_is_rejected(self):
+        file_out = os.path.join(self.dir, "existing_file.txt")
+        with open(file_out, "w") as f:
+            f.write("data")
+        code, _, err = self.run_main(self.arc, "--out", file_out)
+        self.assertEqual(code, 2)
+        self.assertIn("is a file, not a directory", err)
 
     def test_bad_scan_range(self):
         size = os.path.getsize(self.arc)
