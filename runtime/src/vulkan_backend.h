@@ -10,6 +10,7 @@
 #endif
 #include "binary_occlusion_spirv.h"
 #include "occlusion_sum_spirv.h"
+#include "statistics_sum_spirv.h"
 #include "vulkan_depth24.h"
 #include "vulkan_replay.h"
 
@@ -103,6 +104,7 @@ public:
     ~OcclusionResolve() {
         if (sum_pipeline_) vk_.vkDestroyPipeline(device_, sum_pipeline_, nullptr);
         if (binary_pipeline_) vk_.vkDestroyPipeline(device_, binary_pipeline_, nullptr);
+        if (statistics_pipeline_) vk_.vkDestroyPipeline(device_, statistics_pipeline_, nullptr);
         if (layout_) vk_.vkDestroyPipelineLayout(device_, layout_, nullptr);
         if (pool_) vk_.vkDestroyDescriptorPool(device_, pool_, nullptr);
         if (set_layout_) vk_.vkDestroyDescriptorSetLayout(device_, set_layout_, nullptr);
@@ -177,9 +179,33 @@ public:
         return vk_.vkCreatePipelineLayout(device_, &layout, nullptr, &layout_) == VK_SUCCESS;
     }
 
-    bool prepare(bool needs_sum, bool needs_binary) {
+    bool prepare(bool needs_sum, bool needs_binary, bool needs_statistics_sum = false) {
         return (!needs_sum || sum_pipeline_ || create_pipeline(occlusion_sum_spirv, sum_pipeline_)) &&
-               (!needs_binary || binary_pipeline_ || create_pipeline(binary_occlusion_spirv, binary_pipeline_));
+               (!needs_binary || binary_pipeline_ || create_pipeline(binary_occlusion_spirv, binary_pipeline_)) &&
+               (!needs_statistics_sum || statistics_pipeline_ ||
+                create_pipeline(statistics_sum_spirv, statistics_pipeline_));
+    }
+
+    // Adds `count` pipeline-statistics results (11 counters each) into one D3D12_QUERY_DATA_PIPELINE_STATISTICS at
+    // dst + offset: the segments of a statistics query that was split around helper dispatches (D3D-162).
+    void sum_statistics(VkCommandBuffer cb, VkQueryPool queries, std::uint32_t first, std::uint32_t count,
+                        VkBuffer dst, VkDeviceSize offset) const {
+        constexpr VkDeviceSize result = statistics_counters * word_size;
+        begin_scratch_write(cb);
+        vk_.vkCmdFillBuffer(cb, scratch_, 0, result, 0);
+        bind(cb, statistics_pipeline_);
+        while (count) {
+            const auto chunk = std::min(count, statistics_capacity);
+            vk_.vkCmdCopyQueryPoolResults(cb, queries, first, chunk, scratch_, result, result,
+                                          VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+            barrier(cb, transfer | compute, compute, VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+                    shader_access);
+            dispatch(cb, chunk, 1);
+            first += chunk;
+            count -= chunk;
+            if (count) barrier(cb, compute, transfer, shader_access, VK_ACCESS_TRANSFER_WRITE_BIT);
+        }
+        copy_result(cb, dst, offset, result);
     }
 
     void sum(VkCommandBuffer cb, VkQueryPool queries, std::uint32_t first, std::uint32_t count,
@@ -278,8 +304,11 @@ private:
     static constexpr std::uint32_t sum_capacity = 256;  // one more word holds the running sum
     static constexpr std::uint32_t binary_capacity = 1024;
     static constexpr std::uint32_t binary_group_size = 64;  // local_size_x in binary_occlusion.comp
+    static constexpr std::uint32_t statistics_counters = 11;  // local_size_x in statistics_sum.comp
+    static constexpr std::uint32_t statistics_capacity = 64;  // segments per pass; 11 more words hold the sums
     static constexpr VkDeviceSize word_size = sizeof(std::uint64_t);
-    static constexpr VkDeviceSize scratch_size = std::max(sum_capacity + 1, binary_capacity) * word_size;
+    static constexpr VkDeviceSize scratch_size =
+        std::max({sum_capacity + 1, binary_capacity, (statistics_capacity + 1) * statistics_counters}) * word_size;
     const VulkanDeviceFunctions& vk_;
     VkDevice device_;
     VkBuffer scratch_ = VK_NULL_HANDLE;
@@ -290,6 +319,7 @@ private:
     VkPipelineLayout layout_ = VK_NULL_HANDLE;
     VkPipeline sum_pipeline_ = VK_NULL_HANDLE;
     VkPipeline binary_pipeline_ = VK_NULL_HANDLE;
+    VkPipeline statistics_pipeline_ = VK_NULL_HANDLE;
 };
 
 // Zero-allocation O(1) Ring Buffer deferred deletion queue tied to the device timeline semaphore.
@@ -1134,42 +1164,56 @@ public:
                                                       std::uint32_t count, VkBuffer dst, VkDeviceSize offset) {
                 occlusion_resolve_->normalize(cb, pool, first, count, dst, offset);
             };
+            replay.sum_statistics = [this](VkCommandBuffer cb, VkQueryPool pool, std::uint32_t first,
+                                           std::uint32_t count, VkBuffer dst, VkDeviceSize offset) {
+                occlusion_resolve_->sum_statistics(cb, pool, first, count, dst, offset);
+            };
         }
         const auto resolve = [this](ResourceId id) { return context_.resolve(id); };
-        std::uint32_t segments = 0;
+        std::uint32_t segments = 0, statistics_segments = 0;
         for (std::size_t i = 0; i < lists.size(); ++i) {
             const auto result = prepare(*lists[i], resolve, replay, prepared[i]);
             if (result != ReplayResult::success) return result;
-            if (prepared[i].segment_count > UINT32_MAX - segments) return ReplayResult::unsupported;
-            segments += prepared[i].segment_count;
-        }
-        std::shared_ptr<OcclusionSegmentPool> physical;
-        if (segments) {
-            const auto& vk = context_.vk;
-            if (!vk.vkCreateQueryPool || !vk.vkDestroyQueryPool) return ReplayResult::unsupported;
-            physical = std::make_shared<OcclusionSegmentPool>();
-            physical->device = context_.device();
-            physical->destroy = vk.vkDestroyQueryPool;
-            VkQueryPoolCreateInfo info{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
-            info.queryType = VK_QUERY_TYPE_OCCLUSION;
-            info.queryCount = segments;
-            if (vk.vkCreateQueryPool(physical->device, &info, nullptr, &physical->pool) != VK_SUCCESS)
+            if (prepared[i].segment_count > UINT32_MAX - segments ||
+                prepared[i].statistics_segment_count > UINT32_MAX - statistics_segments)
                 return ReplayResult::unsupported;
+            segments += prepared[i].segment_count;
+            statistics_segments += prepared[i].statistics_segment_count;
         }
+        const auto segment_pool = [this](VkQueryType type, std::uint32_t count,
+                                         std::shared_ptr<OcclusionSegmentPool>& out) {
+            const auto& vk = context_.vk;
+            if (!vk.vkCreateQueryPool || !vk.vkDestroyQueryPool) return false;
+            out = std::make_shared<OcclusionSegmentPool>();
+            out->device = context_.device();
+            out->destroy = vk.vkDestroyQueryPool;
+            VkQueryPoolCreateInfo info{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+            info.queryType = type;
+            info.queryCount = count;
+            // The counters of a D3D12 pipeline-statistics heap, in D3D12_QUERY_DATA_PIPELINE_STATISTICS order.
+            if (type == VK_QUERY_TYPE_PIPELINE_STATISTICS) info.pipelineStatistics = 0x7ff;
+            return vk.vkCreateQueryPool(out->device, &info, nullptr, &out->pool) == VK_SUCCESS;
+        };
+        std::shared_ptr<OcclusionSegmentPool> physical, statistics;
+        if (segments && !segment_pool(VK_QUERY_TYPE_OCCLUSION, segments, physical)) return ReplayResult::unsupported;
+        if (statistics_segments &&
+            !segment_pool(VK_QUERY_TYPE_PIPELINE_STATISTICS, statistics_segments, statistics))
+            return ReplayResult::unsupported;
         QueryReplay queries;
-        std::uint32_t base = 0;
+        std::uint32_t base = 0, statistics_base = 0;
         for (auto& list : prepared) {
-            const auto result = queries.plan(list, physical, base, can_resolve_occlusion);
+            const auto result = queries.plan(list, physical, base, can_resolve_occlusion, statistics, statistics_base);
             if (result != ReplayResult::success) return result;
             base += list.segment_count;
+            statistics_base += list.statistics_segment_count;
         }
-        if (queries.needs_sum || queries.needs_binary) {
+        if (queries.needs_sum || queries.needs_binary || queries.needs_statistics_sum) {
             if (!occlusion_resolve_) {
                 auto helper = std::make_unique<OcclusionResolve>(context_.vk, context_.device());
                 if (!helper->initialize(occlusion_memory)) return ReplayResult::unsupported;
                 occlusion_resolve_ = std::move(helper);
             }
-            if (!occlusion_resolve_->prepare(queries.needs_sum, queries.needs_binary))
+            if (!occlusion_resolve_->prepare(queries.needs_sum, queries.needs_binary, queries.needs_statistics_sum))
                 return ReplayResult::unsupported;
         }
 
