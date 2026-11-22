@@ -28,6 +28,9 @@ What they check (`tools/rdna2spirv.py`, pixel shaders plus one compute shader):
   asserts the words and the exact addresses loaded for the raw-buffer rule measured on an RX 6800 (per-dword
   `num_records` check on the exact byte offset); `MeasuredBoundsShaders` runs the four GPU tests of the SMEM and
   raw MUBUF rules (`cs_smem_bounds`, `cs_smem_stride_align`, `cs_smem_sload_neg`, `cs_buf_tail`).
+- `test_buffer_oob_select.py` runs 33 hand-tabulated MUBUF cases through the translator and the interpreter, loads
+  and stores, each with a literal and a run-time V#: the first-byte bound of every OOB_SELECT mode (the RDNA2 rules of
+  docs/buffer_bounds.md, docs/design.md Buffer bounds checking), and that a literal RAW V# with ADD_TID/INDEX_STRIDE is Unsupported.
 - `test_scalar_mem_smem.py` runs the code `Gen.scalar_load` emits with its own small evaluator (64-bit
   addresses, forward selection constructs) and asserts the SGPR values and the addresses read, including the
   measured SMEM truncation, `s_buffer_load` `NUM_RECORDS` bound and signed `s_load` immediate.

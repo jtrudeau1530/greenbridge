@@ -244,7 +244,7 @@ int main(int argc, char** argv) {
         else std::printf("compute subgroup size: %u not available\n", req_sg);
     }
 
-    pc[0] = 0; pc[1] = 0; pc[2] = 0xFFFFFFFFu; pc[3] = 0;     // V#: base 0, stride 0, num_records max
+    pc[0] = 0; pc[1] = 0; pc[2] = 0xFFFFFFFFu; pc[3] = 0x31016FACu;     // V#: base 0, stride 0, num_records max, OOB_SELECT 3 (raw)
     pc[32] = uint32_t(heap); pc[33] = uint32_t(heap >> 32);    // heap base
     VkCommandPoolCreateInfo cpci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
     cpci.queueFamilyIndex = qi;
