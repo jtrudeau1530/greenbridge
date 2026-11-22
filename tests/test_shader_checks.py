@@ -4,7 +4,6 @@ import contextlib
 import io
 import struct
 from pathlib import Path
-import struct
 import sys
 import tempfile
 import unittest
@@ -23,10 +22,12 @@ WAVE32_WORDS = {n: w for n, w in check.CS_DUMPS if n in check.WAVE32_DUMPS and n
 
 
 # every test check.py runs: compute, cs_wavemask, the dumps (#73, #152 cross-half, partial), the two store
-# tests, pixel tests, the two-mip draw and three mesh fixtures (skipped here: build.py does not build mesh shaders)
+# tests, pixel tests, the two-mip draw, the gradient samples and three mesh fixtures (skipped here: build.py
+# does not build mesh shaders)
 TOTAL = (len(check.COMPUTE) + 1 + len(check.CS_DUMPS) + len(check.W64X_DUMPS) + len(check.W64X_PARTIAL) + 2
          + len(check.PIXEL_TESTS) + len(check.CLIP_TESTS) + len(check.BOUNDS) + len(check.GLOBAL_OFFSET)
-         + 9)  # three mesh fixtures, ps_tex, cs_cmpx_class_f32, both texture draws, cs_user_sgprs and cs_cvt_f32_sat
+         + 8 + len(check.GRADIENT_TESTS))  # three mesh fixtures, ps_tex, cs_cmpx_class_f32, the two-mip draw,
+                                           # cs_user_sgprs and cs_cvt_f32_sat
 CVT = {bits: [u, s] for bits, u, s in check.CVT_F32_SAT_CASES}
 
 
@@ -291,41 +292,6 @@ class SeededPixelTests(unittest.TestCase):
         self.assertIn("needs bufferDeviceAddress", problem)
 
 
-
-class SeededPixelTests(unittest.TestCase):
-    """ps_vcc_x2 reads a V# from s[0:3]; check.py hands vk_harness that V# and the heap words behind it (TEST-19)."""
-
-    def run_pixel_test(self, words, code=0, out=""):
-        seen = {}
-
-        def harness(_tool, _vs, _fs, raw, env=None):
-            seen["env"] = env
-            if not code:
-                Path(raw).write_bytes(struct.pack("<4I", *words) * (64 * 64))
-            return code, out
-
-        with tempfile.TemporaryDirectory() as tmp:
-            (Path(tmp) / "ps_vcc_x2.spv").touch()
-            with patch.object(check, "run", side_effect=harness):
-                problem = check.pixel_test(tmp, tmp, "ps_vcc_x2")
-        return problem, seen["env"] or {}
-
-    def test_v_sharp_and_heap_reach_the_harness(self):
-        problem, env = self.run_pixel_test((0x11223344, 0x55667788, 0, 0))
-        self.assertEqual(problem, "")
-        self.assertEqual(env.get("VKH_SGPRS"), "0x1000,0,16,0")
-        self.assertEqual(env.get("VKH_HEAP"), "0x1000=0x11223344,0x1004=0x55667788")
-
-    def test_unseeded_result_fails(self):
-        problem, _ = self.run_pixel_test((0, 0, 0, 0))
-        self.assertIn("4096 of 4096 pixels differ", problem)
-
-    def test_device_without_buffer_addresses_skips(self):
-        problem, _ = self.run_pixel_test((), code=77, out="unsupported: VKH_HEAP needs bufferDeviceAddress\n")
-        self.assertIsInstance(problem, check.Skip)
-        self.assertIn("needs bufferDeviceAddress", problem)
-
-
 class TextureMipChecks(unittest.TestCase):
     def test_mip_draw_reports_unsupported_device_and_preserves_other_failures(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -350,6 +316,18 @@ class TextureMipChecks(unittest.TestCase):
             self.assertTrue(check.texture_mip_mismatch(damaged, 1).startswith("(63,63):"))
         self.assertTrue(check.texture_mip_mismatch(image[:-1], 1))
 
+
+class GradientSampleChecks(unittest.TestCase):
+    def test_device_without_min_lod_is_a_skip(self):
+        answer = 77, "unsupported: shaderResourceMinLod (the shader clamps its LOD with MinLod)\n"
+        with patch.object(check, "run", return_value=answer):
+            result = check.texture_gradient_a16_test("tools", "spirv", "ps_texture_grad_cl_a16")
+        self.assertIsInstance(result, check.Skip)
+        self.assertEqual(result, "SKIP (unsupported: shaderResourceMinLod (the shader clamps its LOD with MinLod))")
+        with patch.object(check, "run", return_value=(1, "device lost")):
+            failure = check.texture_gradient_a16_test("tools", "spirv", "ps_texture_grad_cl_a16")
+        self.assertNotIsInstance(failure, check.Skip)
+        self.assertIn("device lost", failure)
 
 class TexelOffsetChecks(unittest.TestCase):
     """ps_texoff (image_sample*_o, image_gather4_lz_o): the judgement of a dump, and the skip without maintenance8."""
