@@ -48,19 +48,6 @@ class HashFamilies(unittest.TestCase):
 
 
 class Resolve(unittest.TestCase):
-    def test_rejects_negative_compose_count(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            tool = os.path.join(ROOT, "tools", "save_keys.py")
-            words = os.path.join(tmp, "words.txt")
-            with open(words, "w", encoding="utf-8") as f:
-                f.write("SyntheticWord\n")
-            result = subprocess.run(
-                [sys.executable, "-I", tool, "resolve", tmp, "--dict", words, "--compose", "-1"],
-                capture_output=True, text=True,
-            )
-            self.assertEqual(result.returncode, 2, result.stderr)
-            self.assertIn("--compose must be 0 or more", result.stderr)
-
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.dir = self.tmp.name
@@ -155,6 +142,11 @@ class Resolve(unittest.TestCase):
         self.assertIn("error: the folder for --out", r.stderr)
         self.assertNotIn("Traceback", r.stderr)
         self.assertEqual(r.stdout, "")      # refused before the resolve ran
+
+    def test_rejects_negative_compose_count(self):
+        result = self.resolve_cli(self.dir, "--dict", self.dict, "--compose", "-1")
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("--compose must be 0 or more", result.stderr)
 
     def test_compose_finds_two_word_names(self):
         text = run(["resolve", self.jsav, "--dict", self.dict, "--compose", "50"])
