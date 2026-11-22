@@ -1838,11 +1838,96 @@ class Gen:
         self.uses_long = True
         return full
 
+    GLOBAL_SUB = {  # op: (bytes, store?, signed, VGPR half the data comes from / lands in, or None = whole register)
+        "global_store_byte": (1, True, False, None), "global_store_byte_d16_hi": (1, True, False, 1),
+        "global_store_short": (2, True, False, None), "global_store_short_d16_hi": (2, True, False, 1),
+        "global_load_ubyte_d16": (1, False, False, 0), "global_load_ubyte_d16_hi": (1, False, False, 1),
+        "global_load_sbyte_d16": (1, False, True, 0), "global_load_sbyte_d16_hi": (1, False, True, 1),
+        "global_load_short_d16": (2, False, False, 0), "global_load_short_d16_hi": (2, False, False, 1)}
+
+    def global_byte_ptr(self, va):
+        """(pointer to the dword holding byte `va`, bit offset of that byte in it) for a ulong Xbox VA."""
+        lo, b3, b64, al, arr, p, sh = (self.tmp() for _ in range(7))
+        self.emit(f"{lo} = OpUConvert %uint {va}")
+        self.emit(f"{b3} = OpBitwiseAnd %uint {lo} {self.cu(3)}")
+        self.emit(f"{b64} = OpUConvert %ulong {b3}")
+        self.emit(f"{al} = OpISub %ulong {va} {b64}")
+        # MoltenVK 1.4.0 needs an addressable array element for the Metal atomic operations (as buffer stores).
+        self.emit(f"{arr} = OpConvertUToPtr %_ptr_PSB_arr {self.host_addr(al)}")
+        self.emit(f"{p} = OpAccessChain %_ptr_PSB_uint {arr} {self.cu(0)}")
+        self.emit(f"{sh} = OpShiftLeftLogical %uint {b3} {self.cu(3)}")
+        return p, sh
+
+    def global_sub(self, op, a, mods):
+        """8- and 16-bit global stores (global_store_byte/short[_d16_hi]) and the d16 loads
+        (global_load_{u,s}byte_d16[_hi], global_load_short_d16[_hi]). The access is done one byte at a time, so a
+        16-bit one that crosses a dword boundary is exact too: a store merges each byte into its dword with atomic and
+        / or (neighbouring bytes, maybe another lane's, are kept, as buffer stores do); a load reads each byte. A d16
+        load writes one 16-bit half of vdst (the u/sbyte forms zero/sign-extend the byte to 16 bits) and keeps the
+        other; a _d16_hi store takes its data from the high half. Inactive lanes neither store nor load."""
+        if any(m in mods for m in ("lds", "tfe", "slc", "dlc")):
+            raise Unsupported(op + " form")
+        nbytes, store, signed, half = self.GLOBAL_SUB[op]
+        data, vaddr, saddr = (a[1], a[0], a[2]) if store else (a[0], a[1], a[2])
+        if data["k"] != "vgpr" or data.get("n", 1) != 1:
+            raise Unsupported(op + " data")
+        full = self.global_address(op, vaddr, saddr, mods)
+        act = self.active_b()
+        lbl_do, lbl_end = self.tmp() + "_do", self.tmp() + "_end"
+        old = self.load_reg("vgpr", data["r"])
+        pre = self.current_label_placeholder()
+        self.emit(f"OpSelectionMerge {lbl_end} None")
+        self.emit(f"OpBranchConditional {act} {lbl_do} {lbl_end}")
+        self.emit(f"{lbl_do} = OpLabel")
+        value = None
+        for k in range(nbytes):
+            va = full
+            if k:
+                va = self.tmp()
+                self.emit(f"{va} = OpIAdd %ulong {full} {self.cl(k)}")
+            p, sh = self.global_byte_ptr(va)
+            if store:
+                byte, mk, inv, vs, t1, t2 = (self.tmp() for _ in range(6))
+                self.emit(f"{byte} = OpBitFieldUExtract %uint {old} {self.cu(16 * (half or 0) + 8 * k)} {self.cu(8)}")
+                self.emit(f"{mk} = OpShiftLeftLogical %uint {self.cu(0xFF)} {sh}")
+                self.emit(f"{inv} = OpNot %uint {mk}")
+                self.emit(f"{vs} = OpShiftLeftLogical %uint {byte} {sh}")
+                self.emit(f"{t1} = OpAtomicAnd %uint {p} {self.cu(1)} {self.cu(0)} {inv}")
+                self.emit(f"{t2} = OpAtomicOr %uint {p} {self.cu(1)} {self.cu(0)} {vs}")
+            else:
+                w, b = self.tmp(), self.tmp()
+                self.emit(f"{w} = OpLoad %uint {p} Aligned 4")
+                self.emit(f"{b} = OpBitFieldUExtract %uint {w} {sh} {self.cu(8)}")
+                if value is None:
+                    value = b
+                else:
+                    hi8, v2 = self.tmp(), self.tmp()
+                    self.emit(f"{hi8} = OpShiftLeftLogical %uint {b} {self.cu(8)}")
+                    self.emit(f"{v2} = OpBitwiseOr %uint {value} {hi8}")
+                    value = v2
+        if not store:
+            if signed:
+                sx = self.tmp()
+                self.emit(f"{sx} = OpBitFieldSExtract %uint {value} {self.cu(0)} {self.cu(8 * nbytes)}")
+                value = sx
+            new = self.tmp()
+            self.emit(f"{new} = OpBitFieldInsert %uint {old} {value} {self.cu(16 * half)} {self.cu(16)}")
+        self.emit(f"OpBranch {lbl_end}")
+        self.emit(f"{lbl_end} = OpLabel")
+        if not store:
+            ph = self.tmp()
+            self.emit(f"{ph} = OpPhi %uint {new} {lbl_do} {old} {pre}")
+            self.store_reg("vgpr", data["r"], ph)
+
     def global_mem(self, op, a, mods):
         """global_load_dword[xN] vD, vaddr, saddr|off offset:N / global_store_dword[xN] vaddr, vD, saddr|off.
         Address = (saddr: 64-bit SGPR pair + zero-extended 32-bit vaddr | off: 64-bit VGPR pair) + offset,
         an Xbox GPU VA translated through the heap base. Stores and loads only take effect in active lanes."""
         load = op.startswith("global_load")
+        if op.endswith("_addtid"):
+            # global_load/store_dword_addtid address by the lane id and M0, not vaddr; until 2026-11-22 it crashed
+            # here with IndexError (no vaddr operand)
+            raise Unsupported(op)
         if any(m in mods for m in ("lds", "tfe", "d16")):
             raise Unsupported(op + " form")
         sub = {"global_load_ushort": (16, False), "global_load_sshort": (16, True),
@@ -5508,6 +5593,8 @@ class Gen:
             self.emit(f"OpStore %scc {z}")
         elif op.startswith("global_atomic_"):
             self.global_atomic(op, a, mods)
+        elif op in self.GLOBAL_SUB:
+            self.global_sub(op, a, mods)
         elif op.startswith(("global_load_dword", "global_store_dword")) or \
                 op in ("global_load_ushort", "global_load_sshort", "global_load_ubyte", "global_load_sbyte"):
             self.global_mem(op, a, mods)
@@ -9549,7 +9636,8 @@ def read_before_write_vgprs(insns):
                 regs += range(x["r"], x["r"] + x.get("n", 1))
             elif x["k"] == "vlist":
                 regs += x["r"]
-        if base_op(op) in ("v_fmac_f32", "v_mac_f32", "v_mac_legacy_f32", "v_fmac_f16") and a[0]["k"] == "vgpr":
+        if (base_op(op) in ("v_fmac_f32", "v_mac_f32", "v_mac_legacy_f32", "v_fmac_f16") or
+                (op.startswith("global_load_") and "_d16" in op)) and a[0]["k"] == "vgpr":   # d16 keeps a half
             regs.append(a[0]["r"])
         for r in regs:
             if r not in written and r not in first:
