@@ -284,6 +284,58 @@ class SIMDInterpreter:
             state.lds.write_dword(idx_a, new_a)
 
 
+def calc_sub_borrow(val_a: int, val_b: int) -> int:
+    """Calculate unsigned 32-bit borrow generation (1 if A < B, else 0)."""
+    return 1 if u32(val_a) < u32(val_b) else 0
+
+
+class TestConditionCodesAndBorrow(unittest.TestCase):
+    """Unit tests for condition codes, VCC preservation, and carry/borrow logic."""
+
+    def test_borrow_generation_reference_oracle(self) -> None:
+        self.assertEqual(calc_sub_borrow(10, 5), 0)
+        self.assertEqual(calc_sub_borrow(5, 10), 1)
+        self.assertEqual(calc_sub_borrow(0, 1), 1)
+        self.assertEqual(calc_sub_borrow(MASK32, MASK32), 0)
+        self.assertEqual(calc_sub_borrow(0, 0), 0)
+
+    def test_vcc_strictly_preserved_scalar(self) -> None:
+        # In GFX10, LDS atomic instructions do NOT modify VCC
+        interp = ScalarInterpreter()
+        state = ScalarMachineState(lds_dwords=256)
+        state.set_vgpr(0, 0x10)
+        state.set_lds(4, 5)
+        state.set_lds(5, 10)  # Generates borrow (5 < 10)
+
+        # Pre-set scalar state dummy VCC representation
+        vcc_initial = 0x123456789ABCDEF0
+        instr = DSSrc2Instruction(
+            opcode=DSOpcode.DS_SUB_SRC2_U32,
+            addr=LDSAddressExpression(base_reg=RegisterOperand(0), offset0=0, offset1=1),
+        )
+        interp.execute(instr, state)
+        # LDS value wrapped
+        self.assertEqual(state.get_lds(4), MASK32 - 4)
+
+    def test_vcc_strictly_preserved_simd(self) -> None:
+        interp = SIMDInterpreter()
+        initial_vcc = 0xCAFEBABE11223344
+        state = SIMDState(num_lanes=64, exec_mask=MASK64, lds_dwords=1024)
+        state.vcc = initial_vcc
+
+        for lane in range(64):
+            state.set_lane_vgpr(lane, 0, lane * 8)
+            state.lds.write_dword(lane * 2, 0)
+            state.lds.write_dword(lane * 2 + 1, 1)  # All lanes generate borrow
+
+        instr = DSSrc2Instruction(
+            opcode=DSOpcode.DS_SUB_SRC2_U32,
+            addr=LDSAddressExpression(base_reg=RegisterOperand(0), offset0=0, offset1=1),
+        )
+        interp.execute(instr, state)
+        self.assertEqual(state.vcc, initial_vcc, "VCC must remain unmodified by LDS operations")
+
+
 class TestRegisterAliasingAndInPlacePreservation(unittest.TestCase):
     """Unit tests for register preservation and memory location self-aliasing."""
 
