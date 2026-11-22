@@ -318,6 +318,34 @@ Hash-only or opaque:
 6. **Model/texture layer.** The existing manifest gives names/bounds; texture keys are 64-bit asset keys in
    model materials. Placement itself contains neither geometry nor texture names.
 
+## Region tint map (`RegionTintMap`)
+
+One `RegionTintMap` XML document in `common.rpf` (see [gamedata.md](gamedata.md)) places a single streamed,
+tiled tint texture over the world. Counts only; no names.
+
+| Field | Value |
+|---|---|
+| `RegionTintMaps/Item` | 1 |
+| `WorldAABBMin`, `WorldAABBMax` | x -13,312 to 5,120, y -9,728 to 11,264 (18,432 x 20,992 units) |
+| `StreamingDesc/NumberOfTilesX`, `Y` | 36 x 41 |
+| `StreamingDesc/TileSize` | 512 x 512 |
+| `TintMapType`, `RegionTintMapFilename` | one token each |
+| `channelRed`, `channelGreen`, `channelBlue`, `channelAlpha`, `settings/pairs` | empty |
+
+Two exact matches tie this to the rest of the world data:
+
+- The tiles cover the box exactly: 36 x 512 = 18,432 and 41 x 512 = 20,992, so there is no partial tile.
+- The box is identical to the six-float bounds of the `PAMH` max/min heightmap in [gamedata.md](gamedata.md),
+  `(-13312, -9728)` to `(5120, 11264)` in x and y. The tint map and the coarse heightmap therefore share one
+  world rectangle, and that rectangle also has the same minimum x as the four `GridAtlasInfo` grids.
+
+Entity positions from a local index of map resources (2,036,542 placements, 2,011,519 of them in `levels.rpf`)
+lie within x -9,955 to 4,577 and y -8,096 to 9,440 at the 0.1th/99.9th percentiles, inside this rectangle.
+
+The texture named by `RegionTintMapFilename` is not an archive entry or texture-dictionary item in the local
+catalog, so the tile contents are unknown. With all four channel names empty, which tint each channel carries
+is not stated here either.
+
 ## Tool
 
 `tools/world_index.py` scans an RPF9 archive or a directory of carved streams and writes JSON/CSV with
