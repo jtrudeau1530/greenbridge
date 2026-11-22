@@ -31,6 +31,20 @@ SCC_MASK_CASES = {
 }
 
 
+@pytest.mark.parametrize("count", ["0", "-1"])
+def test_empty_program_batch_is_a_usage_error(count, capsys, monkeypatch):
+    def unexpected_suite(*args, **kwargs):
+        pytest.fail("started a suite with no programs")
+
+    monkeypatch.setattr(cf_diff, "run_suite", unexpected_suite)
+    with pytest.raises(SystemExit) as exc:
+        cf_diff.main(["--programs", count])
+    assert exc.value.code == 2
+    captured = capsys.readouterr()
+    assert "--programs must be at least 1" in captured.err
+    assert captured.out == ""
+
+
 def test_generation_is_deterministic():
     assert cf_diff.program_for(5, 3, 32, 3) == cf_diff.program_for(5, 3, 32, 3)
     assert cf_diff.program_for(5, 3, 32, 3) != cf_diff.program_for(5, 4, 32, 3)
