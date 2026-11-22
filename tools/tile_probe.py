@@ -145,6 +145,12 @@ def main():
     if not 0 <= a.offset < len(data):  # a negative offset used to probe the file's tail, one past the end nothing
         raise SystemExit(f"--offset {a.offset} is outside {a.blob} ({len(data)} bytes)")
     res = probe(data, a.offset)
+    if not res:
+        # Every candidate needs at least 16 rows of blocks at one of the widths; a short sample used to print
+        # nothing, write no preview and exit 0, which reads as a successful run with no result.
+        print(f"ERROR: no layout fits {a.blob} at offset {a.offset}: the sample is too short for every candidate "
+              "width (use a larger blob, or an --offset nearer its start)", file=sys.stderr)
+        return 1
     for s, bpe, wpx, mode in res[:6]:
         print(f"score {s:8.2f}  {bpe}-byte blocks  width {wpx:5}  {mode}")
     if a.out and res:
