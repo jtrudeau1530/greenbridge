@@ -6,6 +6,7 @@
 //
 // Contracts with the rest of the layer (the device proxy that will hand these objects out):
 // - an ID3D12Resource's leonida::ResourceId is its pointer value; the device registers it with the VulkanContext;
+// - so is an ID3D12QueryHeap's leonida::QueryHeapId, registered with its VkQueryPool;
 // - the CPU handle of an RTV or DSV points at a leonida::TargetView in the device's descriptor heap.
 #pragma once
 
@@ -56,6 +57,10 @@ struct VulkanDeviceInfo {
     bool host_image_copy = false;
     // The caller enabled textureCompressionBC on this logical device.
     bool texture_compression_bc = false;
+    // Optional device features the caller enabled. Without occlusionQueryPrecise, D3D12_QUERY_TYPE_OCCLUSION counts
+    // are only zero or non-zero; without pipelineStatisticsQuery, pipeline-statistics query heaps are refused.
+    bool occlusion_query_precise = false;
+    bool pipeline_statistics_query = false;
 };
 
 // A Vulkan-backed ID3D12Device (PC ABI, up to ID3D12Device11) on caller-owned Vulkan objects, which must outlive
@@ -73,6 +78,9 @@ void set_device_outer(ID3D12Device* device, IUnknown* outer);
 // The VkImage behind a texture created by such a device, or VK_NULL_HANDLE. For tests and the swapchain.
 VkImage vulkan_image(ID3D12Resource* resource);
 
+// The property flags of the Vulkan memory type behind a resource created by such a device, or 0. For tests.
+VkMemoryPropertyFlags vulkan_memory_flags(ID3D12Resource* resource);
+
 // Whether both resources use the requested typed, non-integer colour format for a regional average resolve.
 bool color_resolve_format_matches(DXGI_FORMAT format, ID3D12Resource* dst, ID3D12Resource* src);
 
@@ -82,6 +90,10 @@ std::uint32_t device_max_push_constants_size(ID3D12Device* device);
 // True when `device`'s Vulkan physical device has maxPushConstantsSize < 144 bytes, requiring
 // the uniform-buffer fallback for the 16-byte tail (heap/code base).
 bool device_push_constants_need_fallback(ID3D12Device* device);
+
+// True when `device` puts upload-heap buffers in DEVICE_LOCAL | HOST_VISIBLE memory: its GPU has Resizable BAR and
+// LEONIDA_UPLOAD_SYSMEM is not set (D3D-96).
+bool device_upload_in_vram(ID3D12Device* device);
 
 // The bindless set 0 a device with VulkanDeviceInfo::bindless keeps (vulkan_bindless.h), and its layout: what a
 // pipeline whose shader declares set-0 bindings is created with and binds. Null without such a set. The set is
@@ -99,6 +111,11 @@ bool front_back_stencil_ref(ID3D12GraphicsCommandList8* list, UINT& front, UINT&
 
 inline leonida::ResourceId resource_id(const ID3D12Resource* resource) {
     return reinterpret_cast<leonida::ResourceId>(resource);
+}
+
+// A query heap's ID in the command-list IR and the VulkanContext: its pointer value, as for resources.
+inline leonida::QueryHeapId query_heap_id(const ID3D12QueryHeap* heap) {
+    return reinterpret_cast<leonida::QueryHeapId>(heap);
 }
 
 }  // namespace rt::d3d12

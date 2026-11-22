@@ -38,8 +38,8 @@ struct Ptr {
     T* operator->() const { return p; }
 };
 
-// The host runtime's device for this comparison and a name for the report; false if there is none.
-inline bool create_host_impl(Ptr<ID3D12Device>& host, std::string& name) {
+// An explicit adapter LUID takes precedence over LEONIDA_HOST_ADAPTER for same-adapter comparisons.
+inline bool try_create_host(Ptr<ID3D12Device>& host, std::string& name, const LUID* luid = nullptr) {
     const HMODULE d3d12 = LoadLibraryExA("d3d12.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
     const HMODULE dxgi = LoadLibraryExA("dxgi.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
     if (!d3d12 || !dxgi) return false;
@@ -54,7 +54,9 @@ inline bool create_host_impl(Ptr<ID3D12Device>& host, std::string& name) {
     char want[128] = {};
     GetEnvironmentVariableA("LEONIDA_HOST_ADAPTER", want, sizeof(want));
     Ptr<IDXGIAdapter1> adapter;
-    if (want[0]) {
+    if (luid) {
+        if (FAILED(factory->EnumAdapterByLuid(*luid, IID_PPV_ARGS(&adapter.p)))) return false;
+    } else if (want[0]) {
         std::string needle(want);
         std::transform(needle.begin(), needle.end(), needle.begin(), [](unsigned char c) { return char(std::tolower(c)); });
         if (needle == "warp") {
@@ -98,7 +100,7 @@ inline bool create_host_impl(Ptr<ID3D12Device>& host, std::string& name) {
 // A host device, or false when there is none (the comparisons are then skipped). When LEONIDA_HOST_ADAPTER names an
 // adapter that cannot be had, the run fails: a typo must not turn the comparisons into a silent pass.
 inline bool create_host(Ptr<ID3D12Device>& host, std::string& name) {
-    if (create_host_impl(host, name)) return true;
+    if (try_create_host(host, name)) return true;
     char want[128] = {};
     if (GetEnvironmentVariableA("LEONIDA_HOST_ADAPTER", want, sizeof(want)) && want[0]) {
         std::fprintf(stderr, "LEONIDA_HOST_ADAPTER=%s: no such adapter, or no D3D12 device on it\n", want);

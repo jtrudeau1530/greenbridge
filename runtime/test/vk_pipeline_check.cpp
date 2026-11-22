@@ -14,6 +14,10 @@
 //   --slow SEC    print pipelines slower than SEC (default 30); compiles past 60 s are named while running
 //   --max-bytes N skip modules whose .spv is larger than N bytes (0 = no limit; names every skip)
 //   --stage S     which stages to check: all (default), cs, or graphics (aliases: --compute-only, --graphics-only)
+//   --stats FILE  write the driver's statistics for each translated shader (VK_KHR_pipeline_executable_properties:
+//                 instructions, registers, spills, scratch, waves...) as CSV rows name,stage,statistic,value. Only
+//                 the executable that runs the translated shader is written, not the partner stub's. Use without
+//                 cache.bin: a pipeline loaded from the cache may come without statistics.
 #include "vulkan_loader.h"
 #include "pipeline_cache_file.h"
 #include "pipeline_cache_snapshot.h"
@@ -359,7 +363,7 @@ int main(int argc, char** argv) {
         return 2;
     }
     std::setvbuf(stdout, nullptr, _IOLBF, 1 << 16);   // failures reach a redirected log as they happen
-    std::string dir = argv[1], cache_path;
+    std::string dir = argv[1], cache_path, stats_path;
     uint32_t jobs = std::max(1u, std::thread::hardware_concurrency() / 2);
     size_t start = 0, count = 0, max_bytes = 0;
     double slow = 30.0;
@@ -375,6 +379,7 @@ int main(int argc, char** argv) {
         else if (a == "--compute-only") stage_filter = "cs";
         else if (a == "--graphics-only") stage_filter = "graphics";
         else if (a == "--max-bytes") max_bytes = std::stoull(val());
+        else if (a == "--stats") stats_path = val();
         else cache_path = a;
     }
     if (stage_filter != "all" && stage_filter != "cs" && stage_filter != "graphics") {
@@ -457,6 +462,8 @@ int main(int argc, char** argv) {
 #ifdef VK_KHR_MAINTENANCE_8_EXTENSION_NAME
     VkPhysicalDeviceMaintenance8FeaturesKHR m8{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_8_FEATURES_KHR};
 #endif
+    VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR exe{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR};
     VkPhysicalDeviceVulkan12Features f12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
     VkPhysicalDeviceVulkan13Features f13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
     void* chain = nullptr;
@@ -477,6 +484,12 @@ int main(int argc, char** argv) {
 #else
     (void)want_m8;
 #endif
+    const bool ext_exe = link(&exe, reinterpret_cast<VkBaseOutStructure*>(&exe),
+                              VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME, !stats_path.empty());
+    if (!stats_path.empty() && !ext_exe) {
+        std::fprintf(stderr, "--stats: the device has no %s\n", VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME);
+        return 1;
+    }
     VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
     f2.pNext = chain;
     vkGetPhysicalDeviceFeatures2(pd, &f2);            // fills every linked struct with what's supported
@@ -521,6 +534,8 @@ int main(int argc, char** argv) {
     LOADD(vkCreateShaderModule); LOADD(vkDestroyShaderModule); LOADD(vkCreateDescriptorSetLayout);
     LOADD(vkCreatePipelineLayout); LOADD(vkCreateComputePipelines); LOADD(vkCreateGraphicsPipelines);
     LOADD(vkDestroyPipeline); LOADD(vkCreatePipelineCache); LOADD(vkGetPipelineCacheData);
+    LOADD(vkGetPipelineExecutablePropertiesKHR); LOADD(vkGetPipelineExecutableStatisticsKHR);
+    const VkPipelineCreateFlags capture = stats_path.empty() ? 0 : VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR;
 
     // Map enabled device features for per-shader compatibility checks.
     auto check_missing_feature = [&](const ShaderMeta& meta) -> std::string {
@@ -647,6 +662,39 @@ int main(int argc, char** argv) {
         std::printf("SKIPPED %s (%s)\n", name.c_str(), reason.c_str());
     };
 
+    std::FILE* stats_out = stats_path.empty() ? nullptr : std::fopen(stats_path.c_str(), "w");
+    if (!stats_path.empty() && !stats_out) { std::fprintf(stderr, "cannot write %s\n", stats_path.c_str()); return 1; }
+    if (stats_out) std::fprintf(stats_out, "name,stage,statistic,value\n");
+    // --stats: one CSV row per statistic of the executable that runs the translated shader (stage bit `bit`).
+    auto write_stats = [&](const std::string& name, const std::string& stage, VkShaderStageFlagBits bit, VkPipeline p) {
+        if (!stats_out) return;
+        VkPipelineInfoKHR pi{VK_STRUCTURE_TYPE_PIPELINE_INFO_KHR};
+        pi.pipeline = p;
+        uint32_t n = 0;
+        vkGetPipelineExecutablePropertiesKHR(dev, &pi, &n, nullptr);
+        std::vector<VkPipelineExecutablePropertiesKHR> exes(n, {VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_PROPERTIES_KHR});
+        vkGetPipelineExecutablePropertiesKHR(dev, &pi, &n, exes.data());
+        for (uint32_t e = 0; e < n; e++) {
+            if (!(exes[e].stages & bit)) continue;
+            VkPipelineExecutableInfoKHR ei{VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_INFO_KHR};
+            ei.pipeline = p; ei.executableIndex = e;
+            uint32_t m = 0;
+            vkGetPipelineExecutableStatisticsKHR(dev, &ei, &m, nullptr);
+            std::vector<VkPipelineExecutableStatisticKHR> st(m, {VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_STATISTIC_KHR});
+            vkGetPipelineExecutableStatisticsKHR(dev, &ei, &m, st.data());
+            std::lock_guard<std::mutex> g(mu);
+            for (auto& x : st) {
+                std::fprintf(stats_out, "%s,%s,%s,", name.c_str(), stage.c_str(), x.name);
+                switch (x.format) {
+                case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_BOOL32_KHR: std::fprintf(stats_out, "%u\n", x.value.b32); break;
+                case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_INT64_KHR: std::fprintf(stats_out, "%lld\n", (long long)x.value.i64); break;
+                case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_UINT64_KHR: std::fprintf(stats_out, "%llu\n", (unsigned long long)x.value.u64); break;
+                default: std::fprintf(stats_out, "%g\n", x.value.f64); break;
+                }
+            }
+        }
+    };
+
     auto record_pipe = [&](const std::string& name, const std::string& stage, uint32_t sg, bool sg_forced,
                            VkResult r, double sec) {
         std::lock_guard<std::mutex> g(mu);
@@ -715,11 +763,13 @@ int main(int argc, char** argv) {
                     const bool sg_forced = can_require_sg(meta.subgroup_size, VK_SHADER_STAGE_COMPUTE_BIT);
                     if (sg_forced) cpi.stage.pNext = &reqSg;
                     cpi.layout = pl;
+                    cpi.flags = capture;
                     const auto t0 = std::chrono::steady_clock::now();
                     { std::lock_guard<std::mutex> g(mu); inflight[std::this_thread::get_id()] = {name, t0}; }
                     VkPipeline p = VK_NULL_HANDLE;
                     VkResult r = vkCreateComputePipelines(dev, cache, 1, &cpi, nullptr, &p);
                     const double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+                    if (r == VK_SUCCESS) write_stats(name, stage, VK_SHADER_STAGE_COMPUTE_BIT, p);
                     if (r == VK_SUCCESS) vkDestroyPipeline(dev, p, nullptr);
                     record_pipe(name, stage, meta.subgroup_size, sg_forced, r, sec);
                 }
@@ -876,12 +926,14 @@ int main(int argc, char** argv) {
                         gpci.pDynamicState = &dyn_state;
                         gpci.layout = pl;
                         gpci.renderPass = VK_NULL_HANDLE;
+                        gpci.flags = capture;
 
                         const auto t0 = std::chrono::steady_clock::now();
                         { std::lock_guard<std::mutex> g(mu); inflight[std::this_thread::get_id()] = {name, t0}; }
                         VkPipeline p = VK_NULL_HANDLE;
                         VkResult r = vkCreateGraphicsPipelines(dev, cache, 1, &gpci, nullptr, &p);
                         const double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+                        if (r == VK_SUCCESS) write_stats(name, stage, stage_bit(stage), p);
                         if (r == VK_SUCCESS) vkDestroyPipeline(dev, p, nullptr);
                         record_pipe(name, stage, meta.subgroup_size, sg_forced, r, sec);
                     }
@@ -971,5 +1023,6 @@ int main(int argc, char** argv) {
     }
     std::printf("wall time: %.1fs on %u threads\n", elapsed(), jobs);
     const bool cache_saved = save_cache(true);  // keep successful pipelines even if another entry failed
+    if (stats_out) std::fclose(stats_out);
     return (check_failed || !cache_saved) ? 1 : 0;
 }

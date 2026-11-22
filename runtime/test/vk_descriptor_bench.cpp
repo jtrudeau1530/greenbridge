@@ -27,6 +27,7 @@
 #include <limits>
 #include <map>
 #include <numeric>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -967,7 +968,7 @@ struct Options {
     std::uint32_t reps = 25u;
     std::uint32_t warmup = 5u;
     double max_dispatch_ms = 120.0;
-    int device_index = -1;
+    std::optional<std::uint32_t> device_index;
     MemoryFilter mem_filter = MemoryFilter::All;
     bool list_devices = false;
     bool csv = false;
@@ -990,7 +991,7 @@ void print_usage() {
         "  --quick              fast check profile (sizes 1000,10000; groups 16; iters 4; reps 3)\n"
         "  --csv                emit CSV with timing_status and empty fields for unavailable measurements\n"
         "  --dump-spv PREFIX    write the 3 SPIR-V compute modules to PREFIX_*.spv and exit\n"
-        "  --self-test          CPU-only check of SPIR-V encoding and DescriptorTable oracle\n"
+        "  --self-test          CPU-only checks for CLI, SPIR-V encoding and descriptor lookup\n"
         "  --help               print this message\n");
 }
 
@@ -1003,7 +1004,7 @@ bool parse_u32(const char* s, std::uint32_t& out) {
     return true;
 }
 
-bool parse_args(int argc, char** argv, Options& opt, bool& show_help) {
+bool parse_args(int argc, const char* const* argv, Options& opt, bool& show_help) {
     show_help = false;
     for (int i = 1; i < argc; ++i) {
         const std::string_view arg(argv[i]);
@@ -1053,7 +1054,7 @@ bool parse_args(int argc, char** argv, Options& opt, bool& show_help) {
             const char* v = nullptr;
             std::uint32_t idx = 0u;
             if (!need_val(v) || !parse_u32(v, idx)) return false;
-            opt.device_index = static_cast<int>(idx);
+            opt.device_index = idx;
         } else if (arg == "--dump-spv") {
             const char* v = nullptr;
             if (!need_val(v)) return false;
@@ -1153,6 +1154,15 @@ struct MemoryPlacement {
 };
 
 int run_self_test() {
+    const char* const device_args[] = {"vk_descriptor_bench", "--device", "4294967295"};
+    Options device_options;
+    bool show_help = false;
+    if (device_options.device_index.has_value() || !parse_args(3, device_args, device_options, show_help) ||
+        device_options.device_index != std::numeric_limits<std::uint32_t>::max()) {
+        std::fprintf(stderr, "self-test: explicit device index became automatic selection\n");
+        return 1;
+    }
+
     const struct {
         const char* name;
         ShaderKind kind;
@@ -1340,13 +1350,14 @@ int main(int argc, char** argv) {
     VkPhysicalDeviceProperties pd_props{};
     std::uint32_t qi = 0;
     std::uint32_t ts_valid_bits = 0;
-    if (opt.device_index >= 0) {
-        if (static_cast<std::uint32_t>(opt.device_index) >= pd_count) {
-            std::fprintf(stderr, "invalid --device index %d (found %u devices)\n", opt.device_index, pd_count);
+    if (opt.device_index.has_value()) {
+        const std::uint32_t device_index = *opt.device_index;
+        if (device_index >= pd_count) {
+            std::fprintf(stderr, "invalid --device index %u (found %u devices)\n", device_index, pd_count);
             destroy_instance();
             return 2;
         }
-        VkPhysicalDevice cand = pds[static_cast<std::size_t>(opt.device_index)];
+        VkPhysicalDevice cand = pds[device_index];
         VkPhysicalDeviceProperties p{};
         vkGetPhysicalDeviceProperties(cand, &p);
         if (p.apiVersion < VK_API_VERSION_1_1 || !find_compute_queue(cand, qi, ts_valid_bits)) {

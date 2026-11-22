@@ -1,7 +1,7 @@
 // The Vulkan-backed ID3D12Device behind the Xbox-ABI device proxy, end to end, on a GPU. Everything goes through
 // the proxy the way the game will call it: device methods (forwarded slots), descriptor heaps from slot 14 with
 // start handles read in the Xbox shape (RAX), a texture from slot 76 with the Xbox layout word, committed
-// resources, views, command lists, a queue and a fence. Results are read back through D3D12 itself
+// resources, views, command lists, a queue, a fence and query heaps. Results are read back through D3D12 itself
 // (CopyTextureRegion into a readback heap, then Map). GetCopyableFootprints, GetResourceAllocationInfo and
 // GetResourceTiling are compared with the host PC runtime's, and so are copies (d3d12_copy_compare.h).
 // WriteToSubresource/ReadFromSubresource run on devices of their own, once per copy path. No shaders or game data.
@@ -11,6 +11,7 @@
 #include "../shims/d3d12_xs_device.h"
 #include "d3d12_copy_compare.h"  // D3D-46: copies compared with the host runtime
 #include "d3d12_depth24_compare.h"  // D24 clears compared with the host runtime
+#include "../src/vulkan_memory.h"  // D3D-96: resizable_bar
 
 #include <dxgi1_4.h>
 
@@ -369,6 +370,54 @@ bool host_has_graphics_command_list7(ID3D12Device* host) {
     return SUCCEEDED(list->QueryInterface(IID_PPV_ARGS(&list7.p)));
 }
 
+int compare_format_info(ID3D12Device* ours, const vktest::Device& vk) {
+    VkPhysicalDeviceIDProperties id{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES};
+    VkPhysicalDeviceProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &id};
+    vk.instance_fn<PFN_vkGetPhysicalDeviceProperties2>("vkGetPhysicalDeviceProperties2")(vk.physical, &properties);
+    LUID luid{};
+    static_assert(sizeof(luid) == sizeof(id.deviceLUID));
+    std::memcpy(&luid, id.deviceLUID, sizeof(luid));
+    copycmp::Ptr<ID3D12Device> host;
+    std::string adapter_name;
+    if (!id.deviceLUIDValid || !copycmp::try_create_host(host, adapter_name, &luid)) {
+        std::printf("FORMAT_INFO: no native D3D12 device on the Vulkan adapter, skipped comparison\n");
+        return 0;
+    }
+
+    unsigned compared = 0, host_unknown = 0;
+    int mismatches = 0;
+    const auto compare = [&](DXGI_FORMAT format, UINT size) {
+        D3D12_FEATURE_DATA_FORMAT_INFO expected{format, 0xff}, actual = expected;
+        HRESULT expected_hr = host->CheckFeatureSupport(D3D12_FEATURE_FORMAT_INFO, &expected, size);
+        // Some Windows runtimes predate these single-plane formats. Still require the layer to recognize them.
+        if (expected_hr == E_INVALIDARG && size == sizeof(expected) &&
+            (format == DXGI_FORMAT_SAMPLER_FEEDBACK_MIN_MIP_OPAQUE ||
+             format == DXGI_FORMAT_SAMPLER_FEEDBACK_MIP_REGION_USED_OPAQUE || format == DXGI_FORMAT_A4B4G4R4_UNORM)) {
+            expected_hr = S_OK;
+            expected.PlaneCount = 1;
+            ++host_unknown;
+            std::printf("FORMAT_INFO format %u: host returned E_INVALIDARG, checking for one plane\n", UINT(format));
+        }
+        const HRESULT our_hr = ours->CheckFeatureSupport(D3D12_FEATURE_FORMAT_INFO, &actual, size);
+        ++compared;
+        if (our_hr != expected_hr || actual.PlaneCount != expected.PlaneCount || actual.Format != format) {
+            std::fprintf(stderr, "FORMAT_INFO format %u size %u: HRESULT/planes %08lx/%u, expected %08lx/%u\n",
+                         UINT(format), size, static_cast<unsigned long>(our_hr), UINT(actual.PlaneCount),
+                         static_cast<unsigned long>(expected_hr), UINT(expected.PlaneCount));
+            ++mismatches;
+        }
+    };
+    constexpr UINT size = sizeof(D3D12_FEATURE_DATA_FORMAT_INFO);
+    // Include UNKNOWN, holes between format families, and the value after the last named format.
+    for (UINT format = 0; format <= UINT(DXGI_FORMAT_A4B4G4R4_UNORM) + 1; ++format)
+        compare(static_cast<DXGI_FORMAT>(format), size);
+    compare(DXGI_FORMAT_FORCE_UINT, size);
+    compare(DXGI_FORMAT_D24_UNORM_S8_UINT, size - 1);
+    std::printf("FORMAT_INFO on %s: %u queries, %u newer formats unknown to host, %d mismatches\n",
+                adapter_name.c_str(), compared, host_unknown, mismatches);
+    return mismatches;
+}
+
 // GetCopyableFootprints must match the PC runtime's exactly, since applications size and fill upload buffers from
 // it. Unaligned block-compressed cases are skipped when the host runtime cannot answer them, so the rest still
 // run. Returns the number of mismatches, or -1 when the host has no D3D12 device to compare with.
@@ -387,6 +436,7 @@ int compare_footprints(ID3D12Device* ours) {
         {texture_desc(8, 8, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE, 4, 2), 8},
         {texture_desc(13, 7, DXGI_FORMAT_R9G9B9E5_SHAREDEXP, D3D12_RESOURCE_FLAG_NONE, 4, 2), 8},
         {texture_desc(13, 7, DXGI_FORMAT_B5G5R5A1_UNORM, D3D12_RESOURCE_FLAG_NONE, 4, 2), 8},
+        {texture_desc(13, 7, DXGI_FORMAT_A8_UNORM, D3D12_RESOURCE_FLAG_NONE, 4, 2), 8},
         {texture_desc(13, 7, DXGI_FORMAT_R16G16B16A16_FLOAT, D3D12_RESOURCE_FLAG_NONE, 4), 4},
         {texture_desc(10, 6, DXGI_FORMAT_BC1_UNORM, D3D12_RESOURCE_FLAG_NONE, 4), 4},
         {texture_desc(4, 4, DXGI_FORMAT_BC7_UNORM_SRGB, D3D12_RESOURCE_FLAG_NONE, 1, 3), 3},
@@ -1071,6 +1121,21 @@ int compare_feature_support(ID3D12Device* ours) {
                          what, request, static_cast<unsigned long>(got_hr), got,
                          static_cast<unsigned long>(want_hr), want);
     };
+    // A host runtime older than a request refuses it with E_INVALIDARG where a newer one clamps it: Windows 10's
+    // d3d12.dll answers shader models up to 6.6 and root signatures up to 1.1. Such a request can't be compared with
+    // the host, so the layer's answer is checked against its own clamp instead. The requests ascend, so `answered`
+    // is the highest one the host has accepted so far.
+    unsigned predated = 0;
+    const auto host_predates = [&](const char* what, UINT request, UINT answered, HRESULT host_hr, HRESULT got_hr,
+                                   UINT got, UINT clamp) {
+        if (host_hr != E_INVALIDARG || !answered || request <= answered) return false;
+        ++predated;
+        if ((got_hr != S_OK || got != clamp) && mismatches++ < 8)
+            std::fprintf(stderr, "%s request 0x%02x: ours hr=0x%08lX value 0x%02x; the host runtime predates it, "
+                                 "the layer's clamp is S_OK 0x%02x\n",
+                         what, request, static_cast<unsigned long>(got_hr), got, clamp);
+        return true;
+    };
 
     // 5.1 upwards: D3D12's own baseline, which every SDK names, then 6.0-6.9 by number (only 6.0 is guaranteed to be
     // named by every SDK that has the query at all). And only values the runtime defines go to the host: it crashed
@@ -1083,12 +1148,18 @@ int compare_feature_support(ID3D12Device* ours) {
         static_cast<D3D_SHADER_MODEL>(0x65), static_cast<D3D_SHADER_MODEL>(0x66),
         static_cast<D3D_SHADER_MODEL>(0x67), static_cast<D3D_SHADER_MODEL>(0x68),
         static_cast<D3D_SHADER_MODEL>(0x69)};
+    UINT host_model = 0;
     for (const D3D_SHADER_MODEL model : models) {
         D3D12_FEATURE_DATA_SHADER_MODEL ours_data{model}, host_data{model};
         const HRESULT ours_hr =
             ours->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &ours_data, sizeof(ours_data));
         const HRESULT host_hr =
             host->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &host_data, sizeof(host_data));
+        if (SUCCEEDED(host_hr)) host_model = static_cast<UINT>(model);
+        if (host_predates("shader model", static_cast<UINT>(model), host_model, host_hr, ours_hr,
+                          static_cast<UINT>(ours_data.HighestShaderModel),
+                          std::min<UINT>(static_cast<UINT>(model), static_cast<UINT>(D3D_SHADER_MODEL_6_0))))
+            continue;
         const UINT want = std::min<UINT>(static_cast<UINT>(host_data.HighestShaderModel),
                                          static_cast<UINT>(D3D_SHADER_MODEL_6_0));
         report("shader model", static_cast<UINT>(model), ours_hr,
@@ -1098,17 +1169,28 @@ int compare_feature_support(ID3D12Device* ours) {
     // 0x3 is 1.2 by number: SDKs without the 1.2 headers do not name it (runtime/CMakeLists.txt probes for that).
     const D3D_ROOT_SIGNATURE_VERSION versions[] = {D3D_ROOT_SIGNATURE_VERSION_1_0, D3D_ROOT_SIGNATURE_VERSION_1_1,
                                                    static_cast<D3D_ROOT_SIGNATURE_VERSION>(0x3)};
+    UINT host_version = 0;
     for (const D3D_ROOT_SIGNATURE_VERSION version : versions) {
         D3D12_FEATURE_DATA_ROOT_SIGNATURE ours_data{version}, host_data{version};
         const HRESULT ours_hr =
             ours->CheckFeatureSupport(D3D12_FEATURE_ROOT_SIGNATURE, &ours_data, sizeof(ours_data));
         const HRESULT host_hr =
             host->CheckFeatureSupport(D3D12_FEATURE_ROOT_SIGNATURE, &host_data, sizeof(host_data));
+        if (SUCCEEDED(host_hr)) host_version = static_cast<UINT>(version);
+        if (host_predates("root signature", static_cast<UINT>(version), host_version, host_hr, ours_hr,
+                          static_cast<UINT>(ours_data.HighestVersion),
+                          std::min<UINT>(static_cast<UINT>(version),
+                                         static_cast<UINT>(D3D_ROOT_SIGNATURE_VERSION_1_1))))
+            continue;
         const UINT want = std::min<UINT>(static_cast<UINT>(host_data.HighestVersion),
                                          static_cast<UINT>(D3D_ROOT_SIGNATURE_VERSION_1_1));
         report("root signature", static_cast<UINT>(version), ours_hr,
                static_cast<UINT>(ours_data.HighestVersion), host_hr, want);
     }
+
+    if (predated)
+        std::printf("CheckFeatureSupport: %u requests the host runtime predates (e.g. Windows 10) checked against the "
+                    "layer's clamp instead of the host\n", predated);
 
     // A wrong DataSize is refused by both, in both queries.
     {
@@ -1563,6 +1645,8 @@ int main() {
         info.queue_family = d.family;
         info.conditional_rendering = d.conditional_rendering;  // SetPredication (the D24 tests check copies under it)
         info.texture_compression_bc = d.bc;
+        info.occlusion_query_precise = d.occlusion_query_precise;
+        info.pipeline_statistics_query = d.pipeline_statistics_query;
         ID3D12Device* inner = nullptr;
         EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&inner))));
         Ref<ID3D12Device> device;
@@ -1623,6 +1707,15 @@ int main() {
         EXPECT(SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_GPU_VIRTUAL_ADDRESS_SUPPORT, &va_support, sizeof(va_support))));
         EXPECT(va_support.MaxGPUVirtualAddressBitsPerResource == 40);
         EXPECT(va_support.MaxGPUVirtualAddressBitsPerProcess == 48);
+
+        EXPECT(compare_format_info(device.p, d) == 0);
+        // Use a real oversized buffer and check that rejecting it leaves the output untouched.
+        D3D12_FEATURE_DATA_FORMAT_INFO format_info[2]{{DXGI_FORMAT_D24_UNORM_S8_UINT, 0xff}};
+        EXPECT(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_INFO, nullptr, sizeof(format_info[0])) == E_INVALIDARG);
+        EXPECT(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_INFO, format_info, sizeof(format_info)) == E_INVALIDARG);
+        EXPECT(format_info[0].PlaneCount == 0xff);
+        EXPECT(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_INFO, format_info, sizeof(format_info[0])) == S_OK);
+        EXPECT(format_info[0].PlaneCount == 2);
 
         D3D12_FEATURE_DATA_FORMAT_SUPPORT format_support{DXGI_FORMAT_R8G8B8A8_UNORM};
         EXPECT(SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &format_support, sizeof(format_support))));
@@ -1935,6 +2028,25 @@ int main() {
         D3D12_HEAP_PROPERTIES heap_properties{};
         EXPECT(SUCCEEDED(upload->GetHeapProperties(&heap_properties, nullptr)) &&
                heap_properties.Type == D3D12_HEAP_TYPE_UPLOAD);
+
+        // D3D-96: upload buffers are in VRAM exactly when the GPU has Resizable BAR (and LEONIDA_UPLOAD_SYSMEM is not
+        // set), host-visible either way. The copies below read this buffer on the GPU, so both placements are checked.
+        {
+            VkPhysicalDeviceMemoryProperties memory{};
+            d.instance_fn<PFN_vkGetPhysicalDeviceMemoryProperties>("vkGetPhysicalDeviceMemoryProperties")(d.physical,
+                                                                                                          &memory);
+            char text[4] = {};
+            size_t length = 0;
+            const bool sysmem = getenv_s(&length, text, "LEONIDA_UPLOAD_SYSMEM") == 0 && length > 1 && text[0] != '0';
+            const bool in_vram = rt::d3d12::device_upload_in_vram(device.p);
+            EXPECT(in_vram == (leonida::resizable_bar(memory) && !sysmem));
+            const VkMemoryPropertyFlags upload_flags = rt::d3d12::vulkan_memory_flags(upload.p);
+            EXPECT((upload_flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) &&
+                   (upload_flags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT));
+            if (in_vram) EXPECT(upload_flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+            EXPECT(rt::d3d12::vulkan_memory_flags(readback.p) & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT);
+            std::printf("upload buffer memory: %s\n", in_vram ? "VRAM (Resizable BAR)" : "system memory");
+        }
 
         // Views into the heaps.
         device->CreateRenderTargetView(rt_resource.p, nullptr, rtv0);
@@ -2636,6 +2748,123 @@ int main() {
             report("reserved buffer", 0, down + tiled_bytes_down, up + tiled_bytes_up, 256);
         }
 
+        // Queries (docs/d3d12_vulkan.md section 4.6). The layer has no draws yet, so occlusion and pipeline
+        // statistics count nothing and read zero; what is checked is that every query is reset and run, that
+        // results land as UINT64s at the offsets asked for (over a 0xcd fill), that timestamps advance at the
+        // reported frequency, that a query keeps its result across executions, that one never ended reads zero
+        // instead of stalling the GPU, and that the D3D12 rules for the calls are kept.
+        {
+            UINT64 frequency = 0;
+            EXPECT(SUCCEEDED(queue->GetTimestampFrequency(&frequency)) && frequency >= 1'000'000);
+            EXPECT(queue->GetTimestampFrequency(nullptr) == E_INVALIDARG);
+            Ref<ID3D12QueryHeap> occlusion, timestamps, statistics, refused;
+            D3D12_QUERY_HEAP_DESC query_desc{D3D12_QUERY_HEAP_TYPE_OCCLUSION, 4, 0};
+            EXPECT(SUCCEEDED(device->CreateQueryHeap(&query_desc, IID_PPV_ARGS(&occlusion.p))));
+            EXPECT(device->CreateQueryHeap(&query_desc, __uuidof(ID3D12QueryHeap), nullptr) == S_FALSE);
+            {
+                Ref<ID3D12Device> parent;
+                EXPECT(SUCCEEDED(occlusion->GetDevice(IID_PPV_ARGS(&parent.p))) && parent.p == device.p);
+            }
+            query_desc = {D3D12_QUERY_HEAP_TYPE_TIMESTAMP, 3, 0};
+            EXPECT(SUCCEEDED(device->CreateQueryHeap(&query_desc, IID_PPV_ARGS(&timestamps.p))));
+            query_desc = {D3D12_QUERY_HEAP_TYPE_OCCLUSION, 0, 0};
+            EXPECT(device->CreateQueryHeap(&query_desc, IID_PPV_ARGS(&refused.p)) == E_INVALIDARG && !refused.p);
+            query_desc = {D3D12_QUERY_HEAP_TYPE_SO_STATISTICS, 1, 0};  // no stream output path yet
+            EXPECT(device->CreateQueryHeap(&query_desc, IID_PPV_ARGS(&refused.p)) == E_NOTIMPL && !refused.p);
+            query_desc = {D3D12_QUERY_HEAP_TYPE_PIPELINE_STATISTICS, 2, 0};
+            if (d.pipeline_statistics_query)
+                EXPECT(SUCCEEDED(device->CreateQueryHeap(&query_desc, IID_PPV_ARGS(&statistics.p))));
+            else
+                std::printf("pipeline statistics: no pipelineStatisticsQuery, skipped\n");
+
+            // Readback layout: timestamps at 0, occlusion at 64, statistics at 256, the second run's at 1024.
+            constexpr UINT64 ts_at = 0, occlusion_at = 64, statistics_at = 256, again_at = 1024;
+            const auto u64 = [&](UINT64 offset) {
+                UINT64 value;
+                std::memcpy(&value, down + offset, sizeof(value));
+                return value;
+            };
+            std::memset(down, 0xcd, 65536);
+            EXPECT(SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.p, nullptr)));
+            list->EndQuery(timestamps.p, D3D12_QUERY_TYPE_TIMESTAMP, 0);
+            if (statistics.p) list->BeginQuery(statistics.p, D3D12_QUERY_TYPE_PIPELINE_STATISTICS, 0);
+            // A rectangle clear runs in a render pass inside a query; clears count no samples.
+            device->CreateRenderTargetView(rt_resource.p, &rtv_desc, rtv1);  // the resolve test reused it
+            list->BeginQuery(occlusion.p, D3D12_QUERY_TYPE_OCCLUSION, 0);
+            barrier = transition(rt_resource.p, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+            list->ResourceBarrier(1, &barrier);
+            list->ClearRenderTargetView(rtv1, red, 1, &square);
+            list->EndQuery(occlusion.p, D3D12_QUERY_TYPE_OCCLUSION, 0);
+            list->BeginQuery(occlusion.p, D3D12_QUERY_TYPE_BINARY_OCCLUSION, 1);
+            list->CopyBufferRegion(readback.p, 8192, upload.p, 0, 32768);
+            list->EndQuery(occlusion.p, D3D12_QUERY_TYPE_BINARY_OCCLUSION, 1);
+            if (statistics.p) list->EndQuery(statistics.p, D3D12_QUERY_TYPE_PIPELINE_STATISTICS, 0);
+            list->EndQuery(timestamps.p, D3D12_QUERY_TYPE_TIMESTAMP, 1);
+            list->ResolveQueryData(timestamps.p, D3D12_QUERY_TYPE_TIMESTAMP, 0, 3, readback.p, ts_at);  // 2: never
+            list->ResolveQueryData(occlusion.p, D3D12_QUERY_TYPE_OCCLUSION, 0, 1, readback.p, occlusion_at);
+            list->ResolveQueryData(occlusion.p, D3D12_QUERY_TYPE_BINARY_OCCLUSION, 1, 1, readback.p, occlusion_at + 8);
+            list->ResolveQueryData(occlusion.p, D3D12_QUERY_TYPE_OCCLUSION, 2, 2, readback.p, occlusion_at + 16);
+            if (statistics.p)
+                list->ResolveQueryData(statistics.p, D3D12_QUERY_TYPE_PIPELINE_STATISTICS, 0, 2, readback.p,
+                                       statistics_at);
+            EXPECT(list->Close() == S_OK);
+            queue->ExecuteCommandLists(1, lists);
+            EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
+            EXPECT(SUCCEEDED(queue->Signal(fence.p, 10)) && SUCCEEDED(fence->SetEventOnCompletion(10, nullptr)));
+
+            const UINT64 t0 = u64(ts_at), t1 = u64(ts_at + 8);
+            EXPECT(t0 != 0 && t0 != 0xcdcdcdcdcdcdcdcdull && t1 >= t0);
+            EXPECT(double(t1 - t0) / double(frequency) < 10.0);  // the copy took less than ten seconds
+            EXPECT(u64(ts_at + 16) == 0);                        // never written
+            for (UINT i = 0; i < 4; ++i) EXPECT(u64(occlusion_at + 8 * i) == 0);
+            for (UINT i = 0; statistics.p && i < 22; ++i) EXPECT(u64(statistics_at + 8 * i) == 0);
+            EXPECT(u64(statistics.p ? statistics_at + 176 : statistics_at) == 0xcdcdcdcdcdcdcdcdull);  // not past it
+
+            // A second execution reuses timestamp 0 (reset before it is written again) and resolves timestamp 1,
+            // which keeps the result of the first execution.
+            EXPECT(SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.p, nullptr)));
+            list->EndQuery(timestamps.p, D3D12_QUERY_TYPE_TIMESTAMP, 0);
+            list->ResolveQueryData(timestamps.p, D3D12_QUERY_TYPE_TIMESTAMP, 0, 2, readback.p, again_at);
+            EXPECT(list->Close() == S_OK);
+            queue->ExecuteCommandLists(1, lists);
+            EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
+            EXPECT(SUCCEEDED(queue->Signal(fence.p, 11)) && SUCCEEDED(fence->SetEventOnCompletion(11, nullptr)));
+            EXPECT(u64(again_at) >= t1 && u64(again_at + 8) == t1);
+
+            // Lists that break the rules. Close reports what it can see; the rest is refused at execution, and
+            // nothing is submitted.
+            const auto refuse = [&](HRESULT close, leonida::ReplayResult result, auto&& record) {
+                if (FAILED(allocator->Reset()) || FAILED(list->Reset(allocator.p, nullptr))) return false;
+                record();
+                if (list->Close() != close) return false;
+                queue->ExecuteCommandLists(1, lists);
+                return rt::d3d12::last_execute_result(queue.p) == result;
+            };
+            using R = leonida::ReplayResult;
+            EXPECT(refuse(E_INVALIDARG, R::invalid_query,  // begun and never ended
+                          [&] { list->BeginQuery(occlusion.p, D3D12_QUERY_TYPE_OCCLUSION, 0); }));
+            EXPECT(refuse(E_INVALIDARG, R::success,  // timestamps have no Begin; the call is dropped
+                          [&] { list->BeginQuery(timestamps.p, D3D12_QUERY_TYPE_TIMESTAMP, 0); }));
+            EXPECT(refuse(E_INVALIDARG, R::success,  // offset not a multiple of 8
+                          [&] { list->ResolveQueryData(timestamps.p, D3D12_QUERY_TYPE_TIMESTAMP, 0, 1, readback.p, 4); }));
+            EXPECT(refuse(S_OK, R::invalid_query,  // past the end of the heap
+                          [&] { list->ResolveQueryData(occlusion.p, D3D12_QUERY_TYPE_OCCLUSION, 3, 2, readback.p, 0); }));
+            EXPECT(refuse(S_OK, R::invalid_query,  // a type the heap does not hold
+                          [&] { list->EndQuery(occlusion.p, D3D12_QUERY_TYPE_TIMESTAMP, 0); }));
+            EXPECT(refuse(S_OK, R::invalid_query,  // into a texture
+                          [&] { list->ResolveQueryData(timestamps.p, D3D12_QUERY_TYPE_TIMESTAMP, 0, 1, rt_resource.p, 0); }));
+            EXPECT(refuse(S_OK, R::invalid_query,  // past the end of the buffer
+                          [&] { list->ResolveQueryData(timestamps.p, D3D12_QUERY_TYPE_TIMESTAMP, 0, 2, readback.p, 65528); }));
+            EXPECT(refuse(S_OK, R::unsupported, [&] {  // valid D3D12, but Vulkan runs one occlusion query at a time
+                list->BeginQuery(occlusion.p, D3D12_QUERY_TYPE_OCCLUSION, 0);
+                list->BeginQuery(occlusion.p, D3D12_QUERY_TYPE_BINARY_OCCLUSION, 1);
+                list->EndQuery(occlusion.p, D3D12_QUERY_TYPE_BINARY_OCCLUSION, 1);
+                list->EndQuery(occlusion.p, D3D12_QUERY_TYPE_OCCLUSION, 0);
+            }));
+            EXPECT(SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.p, nullptr)));
+            EXPECT(SUCCEEDED(list->Close()));
+        }
+
         // Every child holds the proxy; once they are gone the proxy holds the only reference.
         upload->Unmap(0, nullptr);
         readback->Unmap(0, nullptr);
@@ -2683,6 +2912,11 @@ int main() {
         EXPECT(SUCCEEDED(standalone->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence.p))));
         EXPECT(SUCCEEDED(queue->Signal(fence.p, 5)));
         EXPECT(SUCCEEDED(fence->SetEventOnCompletion(5, nullptr)) && fence->GetCompletedValue() == 5);
+        UINT64 frequency = 0;
+        Ref<ID3D12QueryHeap> timestamps;
+        const D3D12_QUERY_HEAP_DESC query_desc{D3D12_QUERY_HEAP_TYPE_TIMESTAMP, 1, 0};
+        EXPECT(SUCCEEDED(queue->GetTimestampFrequency(&frequency)) && frequency);
+        EXPECT(SUCCEEDED(standalone->CreateQueryHeap(&query_desc, IID_PPV_ARGS(&timestamps.p))));
     }
 
     if (d.validation_errors()) {
@@ -2690,6 +2924,7 @@ int main() {
         return 1;
     }
     std::printf("Vulkan device behind the Xbox-ABI proxy: clears, zero-filled first use, uploads, texture, buffer and "
-                "BC copies, a resolve, reserved resources, and GetCopyableFootprints and GetResourceTiling all matched\n");
+                "BC copies, a resolve, reserved resources, queries, and GetCopyableFootprints and GetResourceTiling all "
+                "matched\n");
     return 0;
 }

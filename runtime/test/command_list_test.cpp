@@ -229,5 +229,50 @@ int main() {
     CHECK(std::get<Predication>(predicated.commands()[1]).offset == 16);
     const auto& off = std::get<Predication>(predicated.commands()[2]);
     CHECK(off.buffer == 0 && off.offset == 0 && off.op == 0);
+    // Queries: timestamps only end; other queries are begun and ended in one list, with the same type, and are not
+    // begun twice or resolved while running. Resolve offsets are multiples of 8; a resolve of nothing records nothing.
+    namespace q = d3d12_query;
+    namespace h = d3d12_query_heap;
+    CHECK(list.reset());
+    constexpr QueryHeapId heap = 70, other = 71;
+    CHECK(!list.begin_query({0, q::occlusion, 0}));
+    CHECK(!list.begin_query({heap, q::timestamp, 0}));
+    CHECK(list.end_query({heap, q::timestamp, 3}));
+    CHECK(list.end_query({heap, q::timestamp, 3}));  // a timestamp can be written again
+    CHECK(!list.end_query({heap, q::occlusion, 1}));  // never begun
+    CHECK(list.begin_query({heap, q::occlusion, 1}));
+    CHECK(!list.begin_query({heap, q::binary_occlusion, 1}));  // already running
+    CHECK(list.begin_query({other, q::occlusion, 1}));         // same index, another heap
+    CHECK(!list.end_query({heap, q::binary_occlusion, 1}));    // begun with another type
+    CHECK(!list.resolve_queries({heap, q::occlusion, 0, 2, 9, 0}));  // query 1 is running
+    CHECK(list.resolve_queries({heap, q::occlusion, 2, 2, 9, 0}));
+    CHECK(list.queries_open());
+    CHECK(list.end_query({heap, q::occlusion, 1}));
+    CHECK(list.end_query({other, q::occlusion, 1}));
+    CHECK(!list.queries_open());
+    CHECK(!list.resolve_queries({heap, q::occlusion, 0, 2, 9, 4}));  // offset not a multiple of 8
+    CHECK(!list.resolve_queries({heap, q::occlusion, 0, 2, 0, 8}));  // no destination
+    CHECK(!list.resolve_queries({heap, q::occlusion, 0xffffffff, 2, 9, 8}));  // range wraps
+    CHECK(list.resolve_queries({heap, q::occlusion, 0, 2, 9, 16}));
+    CHECK(list.resolve_queries({heap, q::occlusion, 0, 0, 9, 16}));  // nothing to resolve
+    CHECK(list.close());
+    CHECK(list.commands().size() == 8);
+    CHECK(std::get<EndQuery>(list.commands()[0]).index == 3 && std::get<EndQuery>(list.commands()[0]).type == q::timestamp);
+    CHECK(std::get<BeginQuery>(list.commands()[2]).heap == heap && std::get<BeginQuery>(list.commands()[3]).heap == other);
+    const auto& query_resolve = std::get<ResolveQueries>(list.commands()[7]);
+    CHECK(query_resolve.first == 0 && query_resolve.count == 2 && query_resolve.dst == 9 && query_resolve.offset == 16);
+
+    // A query still running at Close leaves the list closed and marked; Reset clears it.
+    CHECK(list.reset());
+    CHECK(list.begin_query({heap, q::pipeline_statistics, 0}));
+    CHECK(list.close() && list.queries_open());
+    CHECK(list.reset() && !list.queries_open());
+    CHECK(list.begin_query({heap, q::pipeline_statistics, 0}));  // free again after the reset
+
+    CHECK(query_fits_heap(h::occlusion, q::binary_occlusion) && !query_fits_heap(h::occlusion, q::timestamp));
+    CHECK(query_fits_heap(h::copy_queue_timestamp, q::timestamp) && !query_fits_heap(h::timestamp, q::occlusion));
+    CHECK(query_fits_heap(h::so_statistics, q::so_statistics_stream3) && !query_fits_heap(6, q::occlusion));
+    CHECK(query_result_size(q::occlusion) == 8 && query_result_size(q::timestamp) == 8);
+    CHECK(query_result_size(q::pipeline_statistics) == 88 && query_result_size(q::so_statistics_stream0) == 0);
     return 0;
 }

@@ -3,8 +3,9 @@
 // The command-list IR (docs/d3d12_vulkan.md section 3.2): what a D3D12 command list records, kept until
 // ExecuteCommandLists replays it on Vulkan (vulkan_replay.h). This slice covers legacy and enhanced barriers and
 // render-target, depth-stencil and unordered-access clears (whole views or rectangles), copies, resolves,
-// predication, discards, immediate buffer writes and atomic copies. It has no Windows or Vulkan dependency.
+// predication, discards, immediate buffer writes, atomic copies and queries. It has no Windows or Vulkan dependency.
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <optional>
@@ -147,6 +148,57 @@ inline constexpr std::uint32_t texture_barrier_discard = 0x1;
 
 // Portable color-view interpretation. Other views inherit their resource format as before.
 enum class ColorViewFormat : std::uint32_t { resource, rgba8_unorm, rgba8_srgb, rgba8_uint };
+
+// D3D12_QUERY_HEAP_TYPE and D3D12_QUERY_TYPE.
+namespace d3d12_query_heap {
+inline constexpr std::uint32_t occlusion = 0;
+inline constexpr std::uint32_t timestamp = 1;
+inline constexpr std::uint32_t pipeline_statistics = 2;
+inline constexpr std::uint32_t so_statistics = 3;
+inline constexpr std::uint32_t video_decode_statistics = 4;
+inline constexpr std::uint32_t copy_queue_timestamp = 5;
+inline constexpr std::uint32_t pipeline_statistics1 = 7;
+} // namespace d3d12_query_heap
+
+namespace d3d12_query {
+inline constexpr std::uint32_t occlusion = 0;
+inline constexpr std::uint32_t binary_occlusion = 1;
+inline constexpr std::uint32_t timestamp = 2;
+inline constexpr std::uint32_t pipeline_statistics = 3;
+inline constexpr std::uint32_t so_statistics_stream0 = 4;
+inline constexpr std::uint32_t so_statistics_stream3 = 7;
+inline constexpr std::uint32_t video_decode_statistics = 8;
+inline constexpr std::uint32_t pipeline_statistics1 = 10;
+} // namespace d3d12_query
+
+// Whether a heap of `heap_type` holds queries of `query_type` (the D3D12 pairing rules).
+constexpr bool query_fits_heap(std::uint32_t heap_type, std::uint32_t query_type) {
+    namespace h = d3d12_query_heap;
+    namespace q = d3d12_query;
+    switch (heap_type) {
+    case h::occlusion: return query_type == q::occlusion || query_type == q::binary_occlusion;
+    case h::timestamp:
+    case h::copy_queue_timestamp: return query_type == q::timestamp;
+    case h::pipeline_statistics: return query_type == q::pipeline_statistics;
+    case h::so_statistics: return query_type >= q::so_statistics_stream0 && query_type <= q::so_statistics_stream3;
+    case h::video_decode_statistics: return query_type == q::video_decode_statistics;
+    case h::pipeline_statistics1: return query_type == q::pipeline_statistics1;
+    default: return false;
+    }
+}
+
+// Bytes one resolved query takes: a UINT64 for occlusion and timestamps, D3D12_QUERY_DATA_PIPELINE_STATISTICS
+// (11 UINT64s) for pipeline statistics. 0 for the types this layer does not resolve.
+constexpr std::uint32_t query_result_size(std::uint32_t query_type) {
+    namespace q = d3d12_query;
+    switch (query_type) {
+    case q::occlusion:
+    case q::binary_occlusion:
+    case q::timestamp: return 8;
+    case q::pipeline_statistics: return 11 * 8;
+    default: return 0;
+    }
+}
 
 // A view captured by value while recording: the CPU descriptor slot may be rewritten after the call.
 struct TargetView {
@@ -393,10 +445,38 @@ struct Predication {
     std::uint32_t op;  // d3d12_predication
 };
 
+// Query heaps are identified like resources, by the COM object's pointer value. A heap's type and size are checked
+// at replay, when the heap is known.
+using QueryHeapId = std::uintptr_t;
+
+// BeginQuery: occlusion and pipeline statistics only (D3D12 has no Begin for timestamps).
+struct BeginQuery {
+    QueryHeapId heap;
+    std::uint32_t type;
+    std::uint32_t index;
+};
+
+// EndQuery; for a timestamp, the time at which every earlier command has finished.
+struct EndQuery {
+    QueryHeapId heap;
+    std::uint32_t type;
+    std::uint32_t index;
+};
+
+// ResolveQueryData: `count` results from `first` on, written to the buffer `dst` at `offset`.
+struct ResolveQueries {
+    QueryHeapId heap;
+    std::uint32_t type;
+    std::uint32_t first;
+    std::uint32_t count;
+    ResourceId dst;
+    std::uint64_t offset;
+};
+
 using Command = std::variant<TransitionBarrier, UavBarrier, AliasingBarrier, GlobalBarrier, BufferBarrier,
                              TextureBarrier, ClearRenderTarget, ClearDepthStencil, CopyBuffer, CopyTexture,
                              CopyResource, ResolveSubresource, Predication, ClearUnorderedAccess, DiscardResource,
-                             WriteImmediate, AtomicCopyBuffer>;
+                             WriteImmediate, AtomicCopyBuffer, BeginQuery, EndQuery, ResolveQueries>;
 
 class CommandList {
 public:
@@ -543,6 +623,37 @@ public:
         return append(predication);
     }
 
+    // Queries. D3D12 rules for the calls themselves: timestamps have only an EndQuery; any other query is begun and
+    // ended in the same list, with the same type, and is not begun again while it is running.
+    bool begin_query(const BeginQuery& query) {
+        if (closed_ || !query.heap || query.type == d3d12_query::timestamp) return false;
+        if (find_active(query.heap, query.index) != active_.end()) return false;
+        active_.push_back(query);
+        return append(query);
+    }
+
+    bool end_query(const EndQuery& query) {
+        if (closed_ || !query.heap) return false;
+        if (query.type != d3d12_query::timestamp) {
+            const auto it = find_active(query.heap, query.index);
+            if (it == active_.end() || it->type != query.type) return false;
+            active_.erase(it);
+        }
+        return append(query);
+    }
+
+    // The offset is a multiple of 8, as D3D12 requires. A resolve of no queries records nothing.
+    bool resolve_queries(const ResolveQueries& resolve) {
+        if (closed_ || !resolve.heap || !resolve.dst || resolve.offset % 8) return false;
+        if (resolve.count > ~std::uint32_t(0) - resolve.first) return false;
+        for (const BeginQuery& running : active_)
+            if (running.heap == resolve.heap && running.index - resolve.first < resolve.count) return false;
+        return resolve.count ? append(resolve) : true;
+    }
+
+    // A query begun and not ended. Such a list still closes (D3D12's Close reports the error), but is not replayed.
+    bool queries_open() const { return !active_.empty(); }
+
     bool close() {
         if (closed_) return false;
         closed_ = true;
@@ -552,6 +663,7 @@ public:
     bool reset() {
         if (!closed_) return false;
         commands_.clear();
+        active_.clear();
         closed_ = false;
         return true;
     }
@@ -582,7 +694,13 @@ private:
         return true;
     }
 
+    std::vector<BeginQuery>::iterator find_active(QueryHeapId heap, std::uint32_t index) {
+        return std::find_if(active_.begin(), active_.end(),
+                            [&](const BeginQuery& q) { return q.heap == heap && q.index == index; });
+    }
+
     std::vector<Command> commands_;
+    std::vector<BeginQuery> active_;  // queries begun and not yet ended
     bool closed_ = false;
 };
 
