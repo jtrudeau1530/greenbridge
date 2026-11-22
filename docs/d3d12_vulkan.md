@@ -742,7 +742,7 @@ The layer's descriptor model:
 - RTV/DSV creation builds a `VkImageView` and stores it in the host-side heap; `OMSetRenderTargets` resolves those
   handles to views for the rendering scope. RTV/DSV descriptors are never shader-visible.
 - View creation maps `D3D12_SRV_DIMENSION`/`D3D12_UAV_DIMENSION` to `VkImageViewType`, the mip and layer ranges,
-  sample count, and `D3D12_SHADER_COMPONENT_MAPPING` to `VkComponentMapping`. Single-sampled 2D colour SRVs
+  sample count, and `D3D12_SHADER_COMPONENT_MAPPING` to `VkComponentMapping`. Single-sampled 2D and 2D-array colour SRVs
   apply the T# minimum LOD in resource mip coordinates. A clamp inside the exposed mip range uses
   `VK_EXT_image_view_min_lod`. If the logical device lacks the feature, the runtime logs the unsupported view
   and its descriptor resolves to the fallback. A clamp at or below the first mip needs no extension. Above the
