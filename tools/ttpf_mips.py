@@ -801,6 +801,7 @@ class Pool:
     """Read-only RDS5 texture pool, mirroring TtpfReader's catalog checks."""
 
     def __init__(self, path):
+        self._cache_token = object()
         # A pool that fails a check used to keep its file open and mapped (locked on Windows).
         self._fh = self.data = None
         try:
@@ -917,7 +918,7 @@ class Pool:
             id(bcpack_history) if isinstance(bcpack_history, dict) else os.fspath(bcpack_history)
         )
         for virt, csize, src, packed, codec, pad in self.chunks_for(start, size):
-            key = (src, packed, codec, bcpack_mode if codec not in (0, 8) else "raw",
+            key = (self._cache_token, src, packed, codec, bcpack_mode if codec not in (0, 8) else "raw",
                    hist_key if codec not in (0, 8) else None)
             if key not in cache:
                 raw = self.data[src:src + packed]

@@ -14,7 +14,7 @@ import sys
 import tempfile
 import unittest
 import zlib
-from contextlib import redirect_stdout
+from contextlib import ExitStack, closing, redirect_stdout
 from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -1269,6 +1269,23 @@ def build_bc1_bcpack_pool(path, width=64, height=64, mips=5, non_tail=1, mode=4,
     with open(path, "wb") as f:
         f.write(blob)
     return layout, linear, bytes(payload)
+
+
+class PoolCacheTest(unittest.TestCase):
+    def test_shared_cache_keeps_matching_chunk_offsets_separate(self) -> None:
+        with tempfile.TemporaryDirectory() as temp, ExitStack() as stack:
+            record = pack_etpf_record(4, 4, 1, 0, 71, 1, 1, 4, 4096)
+            pools = []
+            payloads = (bytes((0x11,)) * 4096, bytes((0x22,)) * 4096)
+            for i, payload in enumerate(payloads):
+                path = os.path.join(temp, f"pool_{i}.ttpf")
+                write_rds5_pool(path, [record], [payload])
+                pools.append(stack.enter_context(closing(ttpf.Pool(path))))
+            self.assertEqual(pools[0].chunks, pools[1].chunks)
+            cache = {}
+            for pool, payload in zip(pools, payloads):
+                self.assertEqual(pool.read_range(4096, 4096, cache), payload)
+            self.assertEqual(pools[0].read_range(4096, 4096, cache), payloads[0])
 
 
 class SyntheticBcpackPoolTest(unittest.TestCase):
