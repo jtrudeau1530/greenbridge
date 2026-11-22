@@ -6889,8 +6889,10 @@ class Gen:
             f = self.attribute(attr["a"], attr["c"], half=1 if "high" in mods else 0, ij=self.interp_weights(ins))
             if op == "v_interp_p2_f16":
                 # VOP3 clamp applies to the f16 result (ACO: dst(F16); llvm-mc takes clamp but no omod on this op).
-                # Until 2026-11-22 it was dropped.
-                self.dst(a[0], self.f16_res(self.clamp_mods(f, mods)))
+                # Until 2026-11-22 it was dropped. A partial write like the other f16 results: the high half of vdst is
+                # kept (SHADER-430, measured on gfx1036 with tools/hw_oracle: a preset 0xdead high half survived every
+                # case). It used to be zeroed.
+                self.write_lo16(a[0], self.f16_res(self.clamp_mods(f, mods)))
             else:   # p1ll/p1lv produce the f32 intermediate consumed by p2_f16
                 self.dst(a[0], self.tou(f))
         elif op.startswith("s_cmp_"):

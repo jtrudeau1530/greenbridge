@@ -315,6 +315,39 @@ land exactly on a binary32 midpoint, and a tiny third addend decides the roundin
 rational arithmetic for FMA; a test pins the result so the implementation cannot regress to the
 double-rounded answer.
 
+#### `v_interp` ALU ops (`tools/interp_hw_probe.py`, SHADER-430)
+
+`v_interp_*` also run in a compute wave: they read the attribute words from LDS at M0. On gfx1036 with M0 = 0,
+attribute N takes 12 dwords from byte 48·N; channel c's P0 and P10 words are dwords 2c and 2c+1, and its P20 word is
+dword 8+c (found by filling LDS with markers and reading them back with `v_interp_mov_f32`). So the tool writes
+random parameter words there itself, packed f16 pairs and plain f32 values, runs every interp op through
+`tools/hw_oracle` and checks each result against exact rational models. It also runs 30 hand-built f16 rounding ties
+that tell one rounding of `p2_f16` from two.
+
+Measured on the **Radeon iGPU of a Ryzen 7 9800X3D (gfx1036, RDNA2)**, AMD driver 32.0.13036.4, Windows 10 22H2,
+`rocm-sdk-core` clang, seeds 1–8 × 4 kernels × 32 lanes. Every model matched, under both `--denorm32 3` (MODE keeps
+f32 denormals) and `--denorm32 0` (MODE flushes them). That is 292,474 checks per mode plus the 30 ties.
+
+| Op | Result on gfx1036 |
+| --- | --- |
+| `v_interp_mov_f32 p0` | the raw P0 word |
+| `v_interp_p1_f32` | fma(P10, I, P0) with one rounding to f32. A product rounded first and then added differed in 723 of 4,096 f32 cases (seeds 1–4). A packed channel's words are read as raw f32 bits |
+| `v_interp_p2_f32` | fma(P20, J, p1), one rounding |
+| `v_interp_p1ll_f16` (`high`) | the chosen f16 halves widened exactly, then fma(h10, I, h0) with one rounding to **f32** |
+| `v_interp_p2_f16` (`high`) | fma(h20, J, p1ll) rounded **once, to f16** (all 30 ties gave the single-rounding result, none the f32-then-f16 one). The high 16 bits of vdst are **kept** |
+| f32 denormals | follow MODE: with `denorm_mode_32 = 0` a denormal P0, P10 or P20 word reads as 0 |
+
+The translator wrote `p2_f16` as a full-register result with a zero high half. It now keeps the high half
+(`tests/semantic/test_interp_f16_high.py`). This compute route does not reach the other half of SHADER-430: what the
+SPI writes into LDS for a real draw, in particular whether a packed channel's P10/P20 are f32 differences of the raw
+words or per-half f16 differences under `FP16_INTERP_MODE`. That needs a pixel-shader harness on AMD hardware. Not
+covered either: `v_interp_p1lv_f16`, and f16 inf/NaN halves.
+
+```powershell
+python -I tools/interp_hw_probe.py                     # exit 0: all match; 77: no hardware oracle here
+python -I tools/interp_hw_probe.py --denorm32 0 --seeds 1,2,3,4,5,6,7,8
+```
+
 ## Harness design
 
 `tools/shader_diff.py` owns the test table, the seed and the comparison, leaving
