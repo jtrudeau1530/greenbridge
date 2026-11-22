@@ -153,6 +153,7 @@ Each shard records a local archive fingerprint based on file size, timestamps, f
 and up to three 4 KiB samples. If filesystem identifiers are unavailable, the resolved path also
 contributes to the hash. Verifying every byte would require reading the whole archive. Copies or metadata changes can require a rescan. `--resume` rescans missing,
 older-format and mismatched shards. `--merge-only` reports their ranges as missing and exits 1.
+Use `--resume` to refresh format 4 shards in place, since their stream totals can include warm-up streams twice.
 
 ```powershell
 python -I tools\world_census.py <levels.rpf> --out work\world\census --shard-size 2147483648 --jobs 12
