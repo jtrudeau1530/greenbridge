@@ -1087,6 +1087,14 @@ if(TARGET Vulkan::Headers)
     target_compile_options(d3d12_method_variants_test PRIVATE /W4 /permissive- /utf-8)
     add_test(NAME d3d12_method_variants COMMAND d3d12_method_variants_test)
     set_tests_properties(d3d12_method_variants PROPERTIES SKIP_RETURN_CODE 77)
+    # ID3D12Object private data (GetPrivateData, SetPrivateData, SetPrivateDataInterface, SetName) compared with
+    # the host runtime's answers on the device and four child objects.
+    add_executable(d3d12_private_data_test test/d3d12_private_data_test.cpp)
+    target_link_libraries(d3d12_private_data_test PRIVATE gta6rt_d3d12_com)
+    target_compile_definitions(d3d12_private_data_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_private_data_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME d3d12_private_data COMMAND d3d12_private_data_test)
+    set_tests_properties(d3d12_private_data PROPERTIES SKIP_RETURN_CODE 77)
 
     # CreateSampler2 (D3D-28) against CreateSampler, and its refusals against the host's PC runtime.
     add_executable(d3d12_sampler2_test test/d3d12_sampler2_test.cpp)
