@@ -654,7 +654,7 @@ def accessor_bytes(gltf: dict, bin_data: bytes, index: int) -> tuple[bytes, dict
     if not isinstance(stride, int) or stride < element:
         raise SkinError(f"accessor {index} has an invalid byteStride")
     start = view.get("byteOffset", 0) + accessor.get("byteOffset", 0)
-    end = start + stride * count
+    end = start + ((count - 1) * stride + element if count else 0)
     if start < 0 or end > len(bin_data):
         raise SkinError(f"accessor {index} is outside the BIN chunk")
     if stride == element:
