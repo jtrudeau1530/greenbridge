@@ -219,6 +219,8 @@ class Gen:
         self.x_tok = {}            # emulate: register -> the SSA id last stored to it in this block (its value's identity)
         self.x_gen = 0             # emulate: bumped at every label (control flow inside a block): forgets x_tok
         self.x_mcache = {}         # emulate: wave_mask key -> (lo, hi) already exchanged in this block
+        self.lane_either = {}      # id(instruction) -> SGPRs holding constant 0/-1 (EITHER) there
+        self.cur_either = ()
         self.x_lanes = 64          # emulate: workgroup invocations rounded up to whole waves
         self.bar_rounds = False    # native wave32 cs with an s_barrier outside uniform control flow (bar_scheduler)
         self.uses_storage3d = False
@@ -3156,7 +3158,7 @@ class Gen:
     def park_masks(self, blocks):
         """Run the lane-mask analysis and give every VGPR lane a mask is fetched back from a slot of its own,
         after the real registers in the %sgpr array (the array grows by as many)."""
-        self.lane_masks, self.mask_writes = lane_masks.analyse(*blocks)
+        self.lane_masks, self.mask_writes, self.lane_either = lane_masks.analyse(*blocks, include_either=True)
         # lane_masks merges a mask on one path with plain data on another by dropping the register,
         # so "not in cur_masks" does not prove it is data on every path. Keep a conservative set.
         self.ever_mask = {r for m in self.lane_masks.values() for r in m if isinstance(r, int)}
@@ -3207,7 +3209,13 @@ class Gen:
             t = a.get("t", "")
             return t.startswith("exec") or (t in ("vcc", "vcc_lo") and "vcc" in self.cur_masks) or \
                 (t == "vcc_hi" and self.wave64 and "vcc" in self.cur_masks)
-        return a["k"] == "sgpr" and all(a["r"] + i in self.cur_masks for i in range(a.get("n", 1)))
+        if a["k"] == "sgpr":
+            n = a.get("n", 1)
+            if n == 2:
+                return any(a["r"] + i in self.cur_masks for i in range(2)) and \
+                    all(a["r"] + i in self.cur_masks or a["r"] + i in self.cur_either for i in range(2))
+            return all(a["r"] + i in self.cur_masks for i in range(n))
+        return False
 
     def any_mask_word(self, a):
         """Whether any dword of an SGPR pair is a lane mask (EITHER constants are data here).
@@ -3236,7 +3244,8 @@ class Gen:
             if special:
                 key = ("exec", self.x_gen, self.x_tok.get("%active", "start"))
             elif a["k"] == "sgpr":
-                key = ("v", self.x_gen, self.x_tok.get(("sgpr", a["r"]), ("start", a["r"])))
+                toks = tuple(self.x_tok.get(("sgpr", a["r"] + i), ("start", a["r"] + i)) for i in range(a.get("n", 1)))
+                key = ("v", self.x_gen, toks)
             elif a["k"] == "special" and a["t"] in ("vcc", "vcc_lo", "vcc_hi"):
                 key = ("v", self.x_gen, self.x_tok.get("%vcc", ("start", "vcc")))
             if key in self.x_mcache:
@@ -3421,6 +3430,12 @@ class Gen:
         lane, 5 every lane)."""
         if a["k"] == "sgpr":
             if self.holds_lane_mask(a):
+                if self.wave64 and wide and a.get("n") == 2:
+                    lo, hi = self.load_reg("sgpr", a["r"]), self.load_reg("sgpr", a["r"] + 1)
+                    up, sel = self.tmp(), self.tmp()
+                    self.emit(f"{up} = OpUGreaterThanEqual %bool {self.wave_lane()} {self.cu(32)}")
+                    self.emit(f"{sel} = OpSelect %uint {up} {hi} {lo}")
+                    return sel
                 return self.load_reg("sgpr", a["r"])
             # Not known to hold a mask: the SGPR may hold a constant (s_mov_b32 s20, 0x3ffffc00) that is the same in
             # every invocation, so lane L takes its bit L, as for an immediate. Until 2026-11-22 the raw value was used
@@ -3669,6 +3684,7 @@ class Gen:
         self.cur_uniform_readlane = bool(self.w64g) and id(ins) in self.w64g["uniform_readlane"]
         if self.emulate:
             self.x_memory_order(base_op(ins["op"]))
+        self.cur_either = self.lane_either.get(id(ins), ())
         if ins["op"].endswith("_dpp"):
             return self.dpp_insn(ins)
         if not ins["op"].endswith("_sdwa"):
@@ -4424,7 +4440,9 @@ class Gen:
             # Count of set bits in the mask for lanes below this one (lo: lanes 0-31, hi: lanes 32-63), plus src1.
             self.uses_subgroup = True
             if self.holds_lane_mask(a[1]):              # a real mask: the lanes below this one that are set in it
-                mask = self.wave_mask(a[1])[0 if op.endswith("lo_u32_b32") else 1]
+                half = self.mask_half(a[1]) if self.wave64 else None
+                idx = (1 if half == "hi" else 0) if half is not None else (0 if op.endswith("lo_u32_b32") else 1)
+                mask = self.wave_mask(a[1])[idx]
                 acc = self.src_u(a[2])
             else:
                 mask, acc = self.src_u(a[1]), self.src_u(a[2])

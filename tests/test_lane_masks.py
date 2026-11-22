@@ -150,10 +150,32 @@ def test_bfm64_and_half_kinds():
     assert got3 == {6: L.MASK}
 
 
+def test_b64_mask_imm_and_include_either():
+    use64 = ins("s_bcnt1_i32_b64", s(8), s(6, 2))
+    use32 = ins("s_bcnt1_i32_b32", s(8), s(6))
+    vcmp = ins("v_cmp_eq_u32_e32", sp("vcc"), imm(0), v(0))
+    # 64-bit bitwise op of a lane mask with a non-0/-1 immediate stores a per-lane mask via mask_src/mask_dst.
+    got_and64 = L.analyse([[vcmp, ins("s_and_b64", s(6, 2), sp("vcc"), imm(0xFF)), use64]], [[]])[0][id(use64)]
+    assert got_and64 == {"vcc": L.MASK, 6: L.MASK_LO, 7: L.MASK_HI}
+    # 64-bit copy of a constant into vcc stores mask_src(imm) per lane into %vcc.
+    got_mov_vcc = L.analyse([[ins("s_mov_b64", sp("vcc"), imm(0x3F)), use64]], [[]])[0][id(use64)]
+    assert got_mov_vcc == {"vcc": L.MASK}
+    # Plain 64-bit data combined with an immediate stays data; 32-bit mask + non-0/-1 immediate into an SGPR stays data.
+    assert L.analyse([[ins("s_and_b64", s(6, 2), s(20, 2), imm(0xFF)), use64]], [[]])[0][id(use64)] == {}
+    assert L.analyse([[ins("s_and_b32", s(6), sp("exec_lo"), imm(1)), use32]], [[]])[0][id(use32)] == {}
+    # include_either=True exposes registers holding constant 0 / -1 (EITHER) alongside cur_masks.
+    blocks = [[ins("s_mov_b32", s(6), sp("exec_lo")), ins("s_mov_b32", s(7), imm(0)), use64]]
+    out, writes, either = L.analyse(blocks, [[]], include_either=True)
+    assert out[id(use64)] == {6: L.MASK_LO}
+    assert writes == set()
+    assert either[id(use64)] == {7}
+
+
 if __name__ == "__main__":
     test_straight_line()
     test_joins()
     test_parked_masks()
     test_masks_through_a_vgpr()
     test_bfm64_and_half_kinds()
+    test_b64_mask_imm_and_include_either()
     print("ok")
