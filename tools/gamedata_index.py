@@ -344,7 +344,7 @@ def write_csv(path: str, rows: list) -> None:
     fields = ["offset", "offset_hex", "stored", "size", "type", "root", "detail", "chunks",
               "complete", "header"]
     with open(path, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=fields)
+        w = csv.DictWriter(f, fieldnames=fields, lineterminator="\n")
         w.writeheader()
         w.writerows(rows)
 

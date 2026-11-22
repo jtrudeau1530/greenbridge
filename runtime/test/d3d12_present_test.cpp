@@ -108,11 +108,13 @@ PFN_vkCreateSemaphore real_create_semaphore = nullptr;
 PFN_vkDestroySemaphore real_destroy_semaphore = nullptr;
 PFN_vkGetPhysicalDeviceSurfaceFormatsKHR real_surface_formats = nullptr;
 PFN_vkCreateSwapchainKHR real_create_swapchain = nullptr;
+PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR real_get_caps = nullptr;
 VkResult fail_next_submit = VK_SUCCESS;  // armed: the next vkQueueSubmit returns this and submits nothing
 VkResult next_present = VK_SUCCESS;      // armed: the next present that succeeds reports this instead
 int fail_semaphore_in = 0;               // armed: the n-th vkCreateSemaphore from now fails
 bool fail_surface_formats = false;       // armed: the next surface-format query fails before creation
 bool observe_next_swapchain = false;
+bool report_undefined_extent = false;    // armed: surface capabilities reports undefined extent (0xFFFFFFFF)
 VkSwapchainKHR last_created_swapchain = VK_NULL_HANDLE;
 VkSwapchainKHR observed_old_swapchain = VK_NULL_HANDLE;
 unsigned out_of_date = 0;                // presents the real driver reported out of date
@@ -177,6 +179,16 @@ VKAPI_ATTR VkResult VKAPI_CALL create_swapchain(VkDevice device, const VkSwapcha
     return result;
 }
 
+VKAPI_ATTR VkResult VKAPI_CALL get_surface_capabilities(VkPhysicalDevice physical, VkSurfaceKHR surface,
+                                                        VkSurfaceCapabilitiesKHR* caps) {
+    const VkResult result = real_get_caps(physical, surface, caps);
+    if (result == VK_SUCCESS && report_undefined_extent && caps) {
+        caps->currentExtent.width = 0xFFFFFFFF;
+        caps->currentExtent.height = 0xFFFFFFFF;
+    }
+    return result;
+}
+
 VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL get_device(VkDevice device, const char* name) {
     const std::string_view n = name;
     if (n == "vkQueueSubmit") return reinterpret_cast<PFN_vkVoidFunction>(queue_submit);
@@ -188,9 +200,12 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL get_device(VkDevice device, const char*
 }
 
 VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL get_instance(VkInstance instance, const char* name) {
-    if (std::string_view(name) == "vkGetDeviceProcAddr") return reinterpret_cast<PFN_vkVoidFunction>(get_device);
-    if (std::string_view(name) == "vkGetPhysicalDeviceSurfaceFormatsKHR")
+    const std::string_view n = name;
+    if (n == "vkGetDeviceProcAddr") return reinterpret_cast<PFN_vkVoidFunction>(get_device);
+    if (n == "vkGetPhysicalDeviceSurfaceFormatsKHR")
         return reinterpret_cast<PFN_vkVoidFunction>(surface_formats);
+    if (n == "vkGetPhysicalDeviceSurfaceCapabilitiesKHR")
+        return reinterpret_cast<PFN_vkVoidFunction>(get_surface_capabilities);
     return real_get_instance(instance, name);
 }
 
@@ -204,6 +219,8 @@ void install(PFN_vkGetInstanceProcAddr instance_proc, VkInstance instance, VkDev
     real_surface_formats = reinterpret_cast<PFN_vkGetPhysicalDeviceSurfaceFormatsKHR>(
         instance_proc(instance, "vkGetPhysicalDeviceSurfaceFormatsKHR"));
     real_create_swapchain = reinterpret_cast<PFN_vkCreateSwapchainKHR>(real_get_device(device, "vkCreateSwapchainKHR"));
+    real_get_caps = reinterpret_cast<PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR>(
+        instance_proc(instance, "vkGetPhysicalDeviceSurfaceCapabilitiesKHR"));
 }
 }  // namespace driver
 
@@ -390,8 +407,17 @@ int main() {
         for (int i = 0; i < 4; ++i) EXPECT(frame(1));  // both frames in flight come round again
         EXPECT(presenter->presented() == before + 4 - (driver::out_of_date - out_of_date_before));
         EXPECT(SUCCEEDED(fence->SetEventOnCompletion(signalled, nullptr)));
+
+        // 4. Undefined surface extent (0xFFFFFFFF, reported by Intel UHD graphics / Win32 WSI; D3D-165):
+        //    the presenter queries the window client extent and clamps to surface bounds.
+        driver::report_undefined_extent = true;
+        EXPECT(frame(1));
+        EXPECT(presenter->extent().width == 400 && presenter->extent().height == 300);
+        driver::report_undefined_extent = false;
+
         std::printf("injected: out-of-date and suboptimal presents counted apart, a failed swapchain recreation "
-                    "released and retried, a failed blit submission recovered (%u real out-of-date presents)\n",
+                    "released and retried, a failed blit submission recovered, undefined surface extent resolved "
+                    "(%u real out-of-date presents)\n",
                     real_out_of_date);
 
         // What reached the screen: the centre of the client area, if the window is in front.

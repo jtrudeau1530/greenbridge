@@ -35,6 +35,9 @@ HARDWARE = {
     "ps_f16_const": (0xAAAA3D00, 0x38005555, 0xAAAA3800, 0x3F000000),
     "ps_f16_const2": (0x42003D00, 0x3D004200, 0xAAAABC00, 3),
     "ps_f16_pack": (0x34003C00, 0x38003400, 0x34000000, 0x44004200),
+    # neg/abs on the selected half: a sign flip / clear before packing (SHADER-260; the rule was measured on
+    # gfx1036 and these words follow it, they are not a direct readback of this shader)
+    "ps_f16_pack_mods": (0x4400B400, 0xC4003400, 0x4400C200, 0xB400B400),
 }
 OLD = 0xAAAA5555
 
@@ -137,9 +140,18 @@ def ref_pack():
             (v0 & w) << 16 | const(2.0) >> 16, (v1 & w) << 16 | v0 >> 16)
 
 
+def ref_pack_mods():
+    # -v / |v| on the selected half: NEG flips bit 15, ABS clears it, ABS first.
+    v0, v1, w = 0x42003400, 0x34004400, 0xFFFF
+    lo0, hi0, lo1, hi1 = v0 & w, v0 >> 16, v1 & w, v1 >> 16
+    return (lo0 ^ 0x8000 | (lo1 & 0x7FFF) << 16, lo0 | (lo1 ^ 0x8000) << 16,
+            hi0 ^ 0x8000 | lo1 << 16, lo0 ^ 0x8000 | (hi1 ^ 0x8000) << 16)
+
+
 REFERENCE = {"ps_f16_med3_opsel": ref_med3_opsel, "ps_f16_med3_mods": ref_med3_mods, "ps_f16_vop2": ref_vop2,
              "ps_f16_vop2b": ref_vop2b, "ps_f16_vop1": ref_vop1, "ps_f16_vop1b": ref_vop1b,
-             "ps_f16_const": ref_const, "ps_f16_const2": ref_const2, "ps_f16_pack": ref_pack}
+             "ps_f16_const": ref_const, "ps_f16_const2": ref_const2, "ps_f16_pack": ref_pack,
+             "ps_f16_pack_mods": ref_pack_mods}
 NAMES = sorted(HARDWARE)
 
 

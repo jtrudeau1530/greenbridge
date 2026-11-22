@@ -187,12 +187,33 @@ def main():
     ap.add_argument("--limit", type=positive_int, help="export only the first N textures (N >= 1)")
     ap.add_argument("--png", action="store_true", help="also write a PNG beside each DDS dds_png.py can decode")
     a = ap.parse_args()
-    with open(a.index, encoding="utf-8") as f:
-        texs = json.load(f)
-    texs.sort(key=lambda t: (t["archive"], t["gpu"]))
+    try:
+        with open(a.index, encoding="utf-8") as f:
+            texs = json.load(f)
+    except (OSError, ValueError) as e:
+        print(f"ERROR: cannot read {a.index}: {e}", file=sys.stderr)
+        return 2
+    if not isinstance(texs, list):
+        print(f"ERROR: cannot read {a.index}: expected a texture list, got {type(texs).__name__}", file=sys.stderr)
+        return 2
+    try:
+        texs.sort(key=lambda t: (t["archive"], t["gpu"]))
+    except KeyError as e:
+        print(f"ERROR: cannot read {a.index}: row has no {e.args[0]!r}", file=sys.stderr)
+        return 2
+    except TypeError as e:
+        print(f"ERROR: cannot read {a.index}: {e}", file=sys.stderr)
+        return 2
     if a.limit is not None:         # 0 used to read as "no limit", and a negative N dropped the last N
         texs = texs[: a.limit]
-    os.makedirs(a.out, exist_ok=True)
+    if os.path.exists(a.out) and not os.path.isdir(a.out):
+        print(f"ERROR: {a.out} is a file, not a folder", file=sys.stderr)
+        return 2
+    try:
+        os.makedirs(a.out, exist_ok=True)
+    except OSError as e:  # a report path under an existing file, or a dangling symlink
+        print(f"ERROR: cannot create {a.out}: {e.strerror or e}", file=sys.stderr)
+        return 2
     res, cache, pngs = Counter(), {}, Counter()
     for i, t in enumerate(texs, 1):
         try:

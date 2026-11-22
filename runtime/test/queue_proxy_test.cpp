@@ -33,6 +33,7 @@
 #include <cstring>
 #include <cwchar>
 #include <iterator>
+#include <mutex>
 #include <string>
 #include <system_error>
 #include <thread>
@@ -822,17 +823,14 @@ ChildRun run_process(const wchar_t* exe, const wchar_t* arguments, DWORD limit_m
                      RunnerFault fault = RunnerFault::none) {
     ChildRun run;
     std::wstring command = L"\"" + std::wstring(exe) + L"\" " + arguments;
-    SECURITY_ATTRIBUTES inherit{sizeof(inherit), nullptr, TRUE};
+    // Both ends are made uninheritable. The write end becomes inheritable only while the start lock is held, just for
+    // its own child's CreateProcessW: children are started from several threads at once (check_differential), and a
+    // write end inheritable at any other time would also go to a sibling started meanwhile, which would then keep this
+    // pipe open after this child ended.
     HANDLE read_end = nullptr, write_end = nullptr;
     if (fault == RunnerFault::pipe) SetLastError(ERROR_NOT_ENOUGH_MEMORY);
-    if (fault == RunnerFault::pipe || !CreatePipe(&read_end, &write_end, &inherit, 0)) {
+    if (fault == RunnerFault::pipe || !CreatePipe(&read_end, &write_end, nullptr, 0)) {
         report_runner_error("CreatePipe");
-        return run;
-    }
-    if (!SetHandleInformation(read_end, HANDLE_FLAG_INHERIT, 0)) {
-        report_runner_error("SetHandleInformation");
-        CloseHandle(read_end);
-        CloseHandle(write_end);
         return run;
     }
     STARTUPINFOW startup{sizeof(startup)};
@@ -841,10 +839,21 @@ ChildRun run_process(const wchar_t* exe, const wchar_t* arguments, DWORD limit_m
     startup.hStdError = GetStdHandle(STD_ERROR_HANDLE);
     startup.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
     PROCESS_INFORMATION process{};
-    const BOOL started =
-        CreateProcessW(exe, command.data(), nullptr, nullptr, TRUE, 0, nullptr, nullptr, &startup, &process);
-    const DWORD start_error = GetLastError();
-    CloseHandle(write_end);  // the child holds the only write end now: the reader sees the pipe end when it is gone
+    BOOL started = FALSE;
+    DWORD start_error = 0;
+    {
+        static std::mutex start_lock;
+        const std::lock_guard<std::mutex> hold(start_lock);
+        if (!SetHandleInformation(write_end, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT)) {
+            report_runner_error("SetHandleInformation");
+            CloseHandle(read_end);
+            CloseHandle(write_end);
+            return run;
+        }
+        started = CreateProcessW(exe, command.data(), nullptr, nullptr, TRUE, 0, nullptr, nullptr, &startup, &process);
+        start_error = GetLastError();
+        CloseHandle(write_end);  // the child holds the only write end now: the reader sees the pipe end when it is gone
+    }
     if (!started) {
         std::fprintf(stderr, "child runner: CreateProcessW \"%ls\" failed (error %lu)\n", exe, start_error);
         CloseHandle(read_end);
@@ -1044,14 +1053,49 @@ int check_child_runner() {
     return 0;
 }
 
+// How many differential children run at once: LEONIDA_QUEUE_PROXY_JOBS when set (1 = one after another, as before),
+// else half the logical processors, from 1 to 8. Each child pays its own device start-up (about 5 s each on an AMD
+// RDNA2 iGPU, TEST-242), and that waiting is what running them side by side hides.
+unsigned differential_jobs() {
+    char value[16] = {};
+    const DWORD length = GetEnvironmentVariableA("LEONIDA_QUEUE_PROXY_JOBS", value, sizeof(value));
+    if (length > 0 && length < sizeof(value)) {  // set, and short enough to be a number
+        const unsigned long jobs = std::strtoul(value, nullptr, 10);
+        if (jobs >= 1 && jobs <= 64) return static_cast<unsigned>(jobs);
+    }
+    const unsigned half = std::thread::hardware_concurrency() / 2;
+    return half < 1 ? 1 : half > 8 ? 8 : half;
+}
+
 // Each case, in a child process for the real object and in another for the proxy: the same HRESULT, the device
 // removed (or not) alike, and no validation errors. A case the real runtime faults on is reported, not compared.
+// The children run differential_jobs() at a time; the results are judged afterwards in case order, so the report is
+// the same as one child after another would give (a proxy child whose real one faulted is run but not judged).
 int check_differential(const Backend& b) {
     const char* label = b.label;
     int compared = 0, faulting = 0;
-    for (int i = 0; i < static_cast<int>(std::size(kDiffCases)); ++i) {
+    constexpr int kCases = static_cast<int>(std::size(kDiffCases));
+    std::vector<ChildResult> results(2 * kCases);  // [2 * case] real, [2 * case + 1] proxy
+    {
+        std::atomic<int> next{0};
+        const auto work = [&] {
+            for (int job; (job = next.fetch_add(1)) < 2 * kCases;)
+                results[job] = run_child(b.kind, job / 2, job % 2 == 1);
+        };
+        const unsigned jobs = differential_jobs();
+        std::vector<std::thread> pool;
+        try {
+            for (unsigned t = 1; t < jobs; ++t) pool.emplace_back(work);
+        } catch (const std::system_error& e) {  // fewer helpers; this thread still runs every job left
+            std::fprintf(stderr, "%s: %zu of %u differential runner threads (%s)\n", label, pool.size() + 1, jobs,
+                         e.what());
+        }
+        work();
+        for (std::thread& t : pool) t.join();
+    }
+    for (int i = 0; i < kCases; ++i) {
         const char* name = kDiffCases[i].name;
-        const ChildResult want = run_child(b.kind, i, false);
+        const ChildResult& want = results[2 * i];
         if (!want.ok) {
             std::fprintf(stderr, "%s: %s: the real-object child did not report\n", label, name);
             return 1;
@@ -1061,7 +1105,7 @@ int check_differential(const Backend& b) {
             ++faulting;
             continue;
         }
-        const ChildResult got = run_child(b.kind, i, true);
+        const ChildResult& got = results[2 * i + 1];
         if (!got.ok || !got.ran || got.hr != want.hr || got.removed != want.removed || got.validation ||
             want.validation) {
             std::fprintf(stderr,

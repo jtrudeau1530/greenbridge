@@ -135,6 +135,10 @@ def translate_tests(work, names):
 def main():
     if len(sys.argv) < 2:
         sys.exit(__doc__)
+    # The CMake test targets name the spirv-as/spirv-val folder here instead of passing a whole PATH, which the Visual
+    # Studio generator's command line can't carry intact (a PATH entry ending in a backslash escapes the next quote).
+    if os.environ.get("LEONIDA_SPIRV_TOOLS"):
+        os.environ["PATH"] = os.environ["LEONIDA_SPIRV_TOOLS"] + os.pathsep + os.environ.get("PATH", "")
     out = Path(sys.argv[1])
     available = sorted({p.stem for p in Path(HERE).glob("*.asm")} | CLIP_CASES.keys())
     names = sys.argv[2:] or available

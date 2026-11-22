@@ -134,3 +134,11 @@ def test_phi_from_entry_block_names_the_split_block(tmp_path):
     subprocess.run(["spirv-as", str(sa), "-o", str(sv), "--target-env", "vulkan1.2"], check=True)
     r = subprocess.run(["spirv-val", "--target-env", "vulkan1.2", str(sv)], capture_output=True, text=True)
     assert r.returncode == 0, r.stderr
+
+
+def test_help_is_a_clean_exit_zero(capsys):
+    for flag in ("-h", "--help"):
+        assert gsc.main(["spirv_gs_to_compute.py", flag]) == 0
+        out = capsys.readouterr().out
+        assert "spirv_gs_to_compute.py in.spv out.spv" in out
+        assert "SPIRV-Tools" in out

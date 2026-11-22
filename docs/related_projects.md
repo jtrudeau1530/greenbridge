@@ -96,6 +96,7 @@ GPL-3.0-or-later.
 **What we use it for:** `tools/isa_coverage.py` reads `amdgpu_isa_rdna2.xml` from a path the user supplies and counts
 which instructions the translator has a rule for ([isa_coverage.md](isa_coverage.md)). The XML is not vendored (11 MB);
 tests use a small fixture of our own in the same schema.
+
 ## Mesa (AMD register database and format tables) and LLVM's AMDGPU backend
 
 <https://gitlab.freedesktop.org/mesa/mesa> (`src/amd/registers/*.json`, `src/amd/common/ac_descriptors.c`),
