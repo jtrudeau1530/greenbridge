@@ -2520,13 +2520,20 @@ Games and middleware call these every frame (PIX events), so they must be cheap 
   values get the same label and log once.
 - **Private data, on every object.** `SetPrivateData`, `GetPrivateData`, `SetPrivateDataInterface` and `SetName`
   live in the shared `Object` base, so the device, queues, allocators, lists, fences, descriptor heaps and
-  resources all have them. `SetPrivateDataInterface` holds a reference until the entry is replaced (by bytes or
-  another interface), removed (a null interface or zero size) or the object is destroyed; `GetPrivateData` returns
-  the pointer with a reference added, as D3D12 does. A buffer too small for the entry gets `DXGI_ERROR_MORE_DATA`,
-  nothing copied and no reference added, and `*pDataSize` set to the size needed, so the caller can retry (as
-  vkd3d-proton's private store does). `SetName` stores the name as `WKPDID_D3DDebugObjectNameW`
-  (terminator included), which is where D3D12 keeps it. Names are not forwarded to `vkSetDebugUtilsObjectNameEXT`
-  yet: one D3D12 object may own several Vulkan objects.
+  resources all have them. Every answer is the host runtime's: `d3d12_private_data_test` runs the same 672 steps
+  on the device, a fence, a buffer, an allocator and a descriptor heap of both devices and compares each HRESULT,
+  returned size, byte and reference count (RTX 3060, driver 610.88, no debug layer):
+  - `SetPrivateDataInterface` holds a reference until the entry is replaced (by bytes or another interface),
+    removed or the object is destroyed; `GetPrivateData` returns the pointer with a reference added. A null
+    interface releases the one held and stays as a pointer-sized entry that reads back as null.
+  - A buffer too small for the entry gets `DXGI_ERROR_MORE_DATA`, nothing copied and no reference added, and
+    `*pDataSize` set to the size needed; a missing entry is `DXGI_ERROR_NOT_FOUND` with `*pDataSize` 0; a null
+    `pDataSize` is `E_INVALIDARG`.
+  - `SetPrivateData` with null data removes the entry whatever the size: `S_OK` when there was one, `S_FALSE` when
+    there wasn't. Zero bytes with data keep an empty entry (`S_OK`, size 0).
+  - `SetName` is not readable through `GetPrivateData`: neither `WKPDID_D3DDebugObjectNameW` nor the narrow key is
+    set. The layer keeps the name apart (`debug_name()`). A null name, which the host runtime faults on, clears it.
+  Names are not forwarded to `vkSetDebugUtilsObjectNameEXT` yet: one D3D12 object may own several Vulkan objects.
 
 ## 5. Producing the shader contract
 
