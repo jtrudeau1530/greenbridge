@@ -872,6 +872,37 @@ int main() {
         }
     }
 
+    // ResizeTarget on a windowed swapchain resizes the target's client area to the mode; the back buffers keep
+    // their size until ResizeBuffers(0, 0, 0) takes the new client area.
+    {
+        // Host-measured on Windows 11 / RX 7900 XTX: a null target is DXGI_ERROR_INVALID_CALL, and 0x0 is accepted
+        // (the window's minimum tracking size decides the resulting client area).
+        if (sc->ResizeTarget(nullptr) != DXGI_ERROR_INVALID_CALL)
+            return fail("ResizeTarget(nullptr) should be DXGI_ERROR_INVALID_CALL");
+        DXGI_MODE_DESC mode{};
+        mode.Width = 234;
+        mode.Height = 156;
+        mode.RefreshRate.Numerator = 60;
+        mode.RefreshRate.Denominator = 1;
+        mode.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        if (FAILED(sc->ResizeTarget(&mode))) return fail("ResizeTarget");
+        RECT cr{};
+        GetClientRect(hwnd, &cr);
+        if (cr.right != 234 || cr.bottom != 156) {
+            std::fprintf(stderr, "FAIL: ResizeTarget gave a %ldx%ld client area, want 234x156\n", cr.right, cr.bottom);
+            return 1;
+        }
+        DXGI_SWAP_CHAIN_DESC1 d{};
+        if (FAILED(sc->GetDesc1(&d))) return fail("GetDesc1 after ResizeTarget");
+        if (d.Width != 300 || d.Height != 200)
+            return fail("ResizeTarget should leave the back buffers for ResizeBuffers");
+        if (FAILED(sc->ResizeBuffers(0, 0, 0, DXGI_FORMAT_UNKNOWN, 0))) return fail("ResizeBuffers after ResizeTarget");
+        if (FAILED(sc->GetDesc1(&d)) || d.Width != 234 || d.Height != 156) {
+            std::fprintf(stderr, "FAIL: ResizeBuffers after ResizeTarget gave %ux%u, want 234x156\n", d.Width, d.Height);
+            return 1;
+        }
+    }
+
     // IDXGIFactory5::CheckFeatureSupport, DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING, and waitable frame-latency swapchains.
     {
         IDXGIFactory5* factory5 = nullptr;
