@@ -414,6 +414,24 @@ def check_uniform_branch(raw_path: str) -> tuple[bool, str]:
     return (n8 - n80 > 0 and n7 > 0), detail
 
 
+def check_d16_texture(raw_path: str) -> tuple[bool, str]:
+    """Point-sample the 8x8 UNORM gradient and round each component to binary16 before widening."""
+    data = Path(raw_path).read_bytes()
+    if len(data) != 64 * 64 * 16:
+        return False, f"expected a 64x64 RGBA32F frame, got {len(data)} bytes"
+    levels = [struct.unpack("<e", struct.pack("<e", i * 32 / 255.0))[0] for i in range(8)]
+    bad = 0
+    first = ""
+    for i, pixel in enumerate(struct.iter_unpack("<4f", data)):
+        x, y = i % 64, i // 64
+        expected = (levels[x // 8], levels[y // 8], levels[4], 1.0)
+        if pixel != expected:
+            if not bad:
+                first = f"at ({x},{y}): got {pixel}, want {expected}"
+            bad += 1
+    return (False, f"{bad}/4096 mismatches; {first}") if bad else (True, "4096/4096 RGBA pixels exact")
+
+
 def check_grad(raw_path: str, want_b: float, want_a: float) -> tuple[bool, str]:
     px = read_raw_rgba32f(raw_path)
     if problem := frame_problem(px):
@@ -837,6 +855,7 @@ def run_suite(a, work: str) -> int:
             tool = os.path.join(a.build, "vk_texture_test" + ext)
             raw = os.path.join(raw_dir, f"{name}.raw")
             if name == "ps_texture_sample_d16":
+                Path(raw).unlink(missing_ok=True)
                 cmd = [tool, os.path.join(spirv_dir, "vs_ids.spv"), spv, raw, "0", "0", "0", "0", "0"]
             else:
                 mode = {"ps_cube_sample": ["cube"], "ps_sample_c_lz": ["dref"],
@@ -851,13 +870,9 @@ def run_suite(a, work: str) -> int:
                 rc, msg = 1, start_failure(tool, e)
             if rc == UNSUPPORTED:   # e.g. fewer push constant bytes than the texture tests need
                 results.append((name, None, unsupported_skip(msg)))
-            elif name == "ps_texture_sample_d16" and rc == 0 and os.path.isfile(raw):
-                with open(raw, "rb") as f:
-                    f.seek((32 * 64 + 32) * 16)
-                    r, g, b, alpha = struct.unpack("<4f", f.read(16))
-                exp_b = struct.unpack("<e", struct.pack("<e", 128.0 / 255.0))[0]
-                ok = abs(r - exp_b) <= 0.05 and abs(g - exp_b) <= 0.05 and abs(b - exp_b) == 0.0 and alpha == 1.0
-                results.append((name, ok, f"center(32,32)=({r:.6f}, {g:.6f}, {b:.6f}, {alpha:.1f})"))
+            elif name == "ps_texture_sample_d16" and rc == 0:
+                ok, detail = check_d16_texture(raw) if os.path.isfile(raw) else (False, "missing RGBA32F readback")
+                results.append((name, ok, detail))
             else:
                 results.append((name, rc == 0 and "PASSED" in msg, msg.splitlines()[-1] if msg else ""))
         elif name == "ps_gather_wrap":
