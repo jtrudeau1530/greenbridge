@@ -884,5 +884,92 @@ class TestSaluAndn2SaveexecB64RegisterAliasing(unittest.TestCase):
         self.assertEqual(interp.scc, 1)
 
 
+# --- Condition Codes, Status Flags, and Carry/Borrow Independence ---
+
+class TestSaluAndn2SaveexecB64StatusFlags(unittest.TestCase):
+    """Test suite for SCC condition codes, status flags, and carry/borrow independence."""
+
+    def test_scc_generation_zero_vs_nonzero(self):
+        """Verify SCC is strictly 0 for zero result, and 1 for any nonzero result."""
+        interp = ScalarSaluInterpreter()
+
+        # Zero result test: S0 & ~EXEC = 0
+        interp.exec = 0x123456789ABCDEF0
+        interp.set_sgpr_u64(0, 0x123456789ABCDEF0)
+        interp.execute_asm("s_andn2_saveexec_b64 s[2:3], s[0:1]")
+        self.assertEqual(interp.exec, 0)
+        self.assertEqual(interp.scc, 0)
+
+        # Nonzero result test: S0 & ~EXEC != 0
+        interp.set_sgpr_u64(0, 0x1)
+        interp.execute_asm("s_andn2_saveexec_b64 s[4:5], s[0:1]")
+        self.assertEqual(interp.exec, 1)
+        self.assertEqual(interp.scc, 1)
+
+    def test_scc_boundary_bits(self):
+        """Verify each boundary bit position (0, 31, 32, 63) properly asserts SCC."""
+        boundary_bits = [0, 31, 32, 63]
+        for bit in boundary_bits:
+            interp = ScalarSaluInterpreter()
+            interp.exec = 0  # all ~EXEC bits are 1
+            mask = 1 << bit
+            interp.set_sgpr_u64(0, mask)
+            interp.execute_asm("s_andn2_saveexec_b64 s[2:3], s[0:1]")
+            self.assertEqual(interp.exec, mask)
+            self.assertEqual(interp.scc, 1, f"Bit {bit} failed to assert SCC")
+
+    def test_carry_borrow_vcc_independence(self):
+        """Verify that s_andn2_saveexec_b64 does not touch or corrupt VCC / carry flags."""
+        interp = ScalarSaluInterpreter()
+        # Set VCC registers s[104:105] to an identifiable canary
+        vcc_canary = 0xFEEDFACECAFEBEEF
+        interp.set_sgpr_u64(104, vcc_canary)
+
+        interp.exec = 0xFFFFFFFFFFFFFFFF
+        interp.set_sgpr_u64(0, 0x00000000FFFFFFFF)
+        interp.execute_asm("s_andn2_saveexec_b64 s[2:3], s[0:1]")
+
+        # VCC remains untouched
+        self.assertEqual(interp.get_sgpr_u64(104), vcc_canary)
+
+    def test_conditional_branch_emulation_scc_and_execz(self):
+        """Verify SCC and EXECZ equivalence for conditional skipping of empty waves."""
+        interp = ScalarSaluInterpreter()
+
+        # Case 1: All lanes disabled -> EXEC == 0, SCC == 0
+        interp.exec = MASK64
+        interp.execute_asm("s_andn2_saveexec_b64 s[0:1], -1")
+        # In RDNA2, compiler emits s_cbranch_execz or s_cbranch_scc0 to skip dead waves
+        branch_execz = (interp.exec == 0)
+        branch_scc0 = (interp.scc == 0)
+        self.assertTrue(branch_execz)
+        self.assertTrue(branch_scc0)
+        self.assertEqual(branch_execz, branch_scc0)
+
+        # Case 2: At least one lane enabled -> EXEC != 0, SCC == 1
+        interp.execute_asm("s_andn2_saveexec_b64 s[2:3], 1")
+        branch_execnz = (interp.exec != 0)
+        branch_scc1 = (interp.scc == 1)
+        self.assertTrue(branch_execnz)
+        self.assertTrue(branch_scc1)
+        self.assertEqual(branch_execnz, branch_scc1)
+
+    def test_scc_multi_cycle_toggling(self):
+        """Verify SCC state transitions cleanly between consecutive instructions."""
+        interp = ScalarSaluInterpreter()
+        states = [
+            (MASK64, MASK64, 0, 0),  # new_exec = 0, scc = 0
+            (MASK64, 0, MASK64, 1),  # new_exec = MASK64, scc = 1
+            (0, MASK64, 0, 0),       # new_exec = 0, scc = 0
+            (1, 0, 1, 1),            # new_exec = 1, scc = 1
+        ]
+        for s0, exec_in, expected_exec, expected_scc in states:
+            interp.exec = exec_in
+            interp.set_sgpr_u64(0, s0)
+            interp.execute_asm("s_andn2_saveexec_b64 s[2:3], s[0:1]")
+            self.assertEqual(interp.exec, expected_exec)
+            self.assertEqual(interp.scc, expected_scc)
+
+
 if __name__ == "__main__":
     unittest.main()
