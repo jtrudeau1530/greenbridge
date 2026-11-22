@@ -2030,16 +2030,21 @@ Implemented (`QueryHeap` in `runtime/shims/d3d12_vulkan_device.cpp`, the query c
   overwrites can be recorded before the earlier commands complete. `vk_overlapping_occlusion` checks crossing
   and nested scopes, more than one scratch chunk, alternating binary and ordinary resolves under a predicate,
   and gated submissions on a GPU.
-- **Resolves during a pipeline-statistics query** (D3D-162). The helper dispatches above (binary normalisation,
-  occlusion sums) and the statistics sum below would count in the application's `CSInvocations` if they ran inside
-  its query. So a statistics query that contains a resolve other than a timestamp copy is split. Its counters go to
-  physical `PIPELINE_STATISTICS` segments in a pool of the submission's own; a segment ends before each such resolve
-  and a new one begins after it. Its result is the sum of its segments, added per counter by a compute dispatch
-  (`statistics_sum.comp`) on the same scratch buffer, which is itself kept out of any statistics query still running.
+- **Helper dispatches during a pipeline-statistics query** (D3D-162). The helper dispatches above (binary
+  normalisation, occlusion sums), statistics sums, `SetPredication` captures, predicated buffer copies and D24/RGB96 footprint
+  conversions would count in the application's `CSInvocations` if they ran inside its query. Such a query is split.
+  Its counters go to physical `PIPELINE_STATISTICS` segments in a pool of the submission's own; a segment ends
+  before each helper and a new one begins after it. Non-query helpers and resolves share the segment numbering.
+  Its result is the sum of its segments, added per counter by a compute dispatch (`statistics_sum.comp`) on the
+  same scratch buffer, which is itself kept out of any statistics query still running.
   Whether a resolve dispatches is only known once the list is planned against the heaps, so every such resolve
   splits the query. `vk_binary_occlusion` checks that a binary resolve and a statistics sum inside statistics queries
   leave every counter at 0. `vk_overlapping_occlusion` puts a native draw in each segment and checks the split sums
-  against unsplit queries with the same draws, word by word.
+  against unsplit queries with the same draws, word by word. `vk_predicated_copy` checks captures, rebindings and
+  predicated copies; `depth24_convert` checks both conversion directions for D24 and RGB96. Their byte-exact
+  results still match and all 11 statistics counters are zero. Without a statistics pool (single-list `replay()` or
+  a queue without the summation helper), these three commands are refused before helper scratch allocation or
+  recording. The resolve fallback is unchanged: only resolves needing dispatches are refused there.
 - **Timestamps.** `GetTimestampFrequency` is `1e9 / timestampPeriod` (1 GHz on the test GPU). Every D3D12 queue
   shares one `VkQueue` for now (question 12), so they share one frequency.
 
@@ -2047,10 +2052,6 @@ Not implemented yet:
 
 - **Overlapping queries.** Replay refuses overlapping pipeline-statistics queries or occlusion overlaps involving
   a binary query with `ReplayResult::unsupported`.
-- **Other helper dispatches during a pipeline-statistics query.** Replay still refuses `SetPredication` and
-  predicated copies and D24/RGB96 footprint conversions while pipeline statistics are active, since their
-  dispatches would change the reported compute-invocation count. The single-list `replay()` helper, which has no
-  segment pool, keeps refusing the occlusion resolves above that need a dispatch there.
 - Stream-output and mesh-shader statistics. (`GetClockCalibration` is implemented: see section 4.4, "Fences,
   queues and frames in flight".)
 - Xbox-specific query heap types (if any) are **Open**; unknown types are logged.
@@ -2091,9 +2092,9 @@ Not implemented yet:
     CPU readback or per-predicate wait is used. This helper requires a compute-capable configured queue family;
     unsupported queues fail preparation instead of falling back to the low word. The synthetic GLSL source and
     embedded SPIR-V are shipped together; normal builds do not need a shader compiler.
-    Capturing a new predicate inside an active pipeline-statistics query is rejected as unsupported, because the
-    helper's compute invocation would otherwise pollute the application's result; capturing before the query is
-    allowed. Virtualising that query is not part of this change.
+    Capturing a new predicate inside an active pipeline-statistics query splits the query around the capture
+    dispatch (D3D-162, section 4.6), keeping its invocation out of the application's result. Without a statistics
+    segment pool, preparation still refuses the capture before allocating its scratch.
     Integration notes for #291 and D3D-27: the capture helper binds its own compute pipeline, descriptor set 0
     and push constants. The compute path must restore those bindings afterward, or bind its application state
     before each dispatch. Copies and compute dispatches cannot execute inside dynamic rendering, so render-pass
@@ -2112,7 +2113,8 @@ Not implemented yet:
   for ordinary copies; mixed lists accumulate both before main's queue-specific host-stage filtering.
   This helper also binds compute pipeline/set 0/push constants, so the
   application-state restoration requirement above applies. A predicated copy inside an active pipeline-statistics
-  query is rejected to avoid counting internal compute work.
+  query splits that query around the helper dispatches (D3D-162); without a statistics segment pool it is refused
+  before copy scratch allocation.
   Synthetic checks: `predicated_copy_test` covers preparation and rejection paths without a GPU;
   `d3d12_predicated_copy_test` compares 180 byte-exact cases against WARP and an independent literal oracle,
   plus 16 query-to-copy cases: real empty ordinary/binary occlusion queries resolve zero into a default-heap

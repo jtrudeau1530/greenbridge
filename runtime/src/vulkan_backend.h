@@ -1355,7 +1355,7 @@ public:
         std::uint32_t segments = 0, statistics_segments = 0;
         bool has_queries = false;
         for (std::size_t i = 0; i < lists.size(); ++i) {
-            const auto result = prepare(*lists[i], resolve, replay, prepared[i]);
+            const auto result = prepare(*lists[i], resolve, replay, prepared[i], can_resolve_occlusion);
             if (result != ReplayResult::success) return result;
             if (prepared[i].segment_count > UINT32_MAX - segments ||
                 prepared[i].statistics_segment_count > UINT32_MAX - statistics_segments)
