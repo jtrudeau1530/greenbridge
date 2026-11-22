@@ -14,6 +14,28 @@ INDEX = {"summary": {"files": 1, "bink2_files": 0, "span": 10, "compressed_bytes
 
 @unittest.skipUnless(os.name == "nt", "PowerShell research script")
 class CarveAllGamePathTest(unittest.TestCase):
+    def test_failed_carver_stops_without_replacing_coverage(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            game, out, tools = root / "game", root / "out", root / "tools"
+            for folder in (game, out, tools):
+                folder.mkdir()
+            (game / "first.rpf").write_bytes(b"x")
+            (game / "second.rpf").write_bytes(b"xx")
+            (tools / "python.cmd").write_bytes(b"@exit /b 7\r\n")
+            coverage = out / "coverage.json"
+            coverage.write_bytes(b"[]\n")
+            result = subprocess.run(
+                ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(SCRIPT),
+                 "-Game", str(game), "-Out", str(out)],
+                env={**os.environ, "PATH": str(tools) + os.pathsep + os.environ["PATH"]},
+                capture_output=True, text=True, timeout=30,
+            )
+            self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("Carving first.rpf failed (exit 7)", result.stderr)
+            self.assertNotIn("second.rpf", result.stdout + result.stderr)
+            self.assertEqual(coverage.read_bytes(), b"[]\n")
+
     def test_relative_and_trailing_separator_game_paths_find_existing_carves(self):
         with tempfile.TemporaryDirectory() as tmp:
             game, out = Path(tmp, "game"), Path(tmp, "out")
@@ -70,6 +92,28 @@ class CarveAllGamePathTest(unittest.TestCase):
             self.assertNotIn("carving", result.stdout)
             rows = json.loads((out / "coverage.json").read_text(encoding="utf-8-sig"))
             self.assertEqual([r["archive"] for r in rows], ["common.rpf", "pack\\p1\\p1.rpf"])
+
+    def test_colliding_archive_names_do_not_share_a_cached_index(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            game, out = Path(tmp, "game"), Path(tmp, "out")
+            (game / "pack").mkdir(parents=True)
+            (game / "pack" / "scene.rpf").write_bytes(b"x")
+            (game / "PACK_scene.rpf").write_bytes(b"xx")
+            cached = out / "pack_scene"
+            cached.mkdir(parents=True)
+            (cached / "index.json").write_text(json.dumps(INDEX), encoding="utf-8")
+            coverage = out / "coverage.json"
+            coverage.write_bytes(b"[]\n")
+
+            result = subprocess.run(
+                ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(SCRIPT),
+                 "-Game", str(game), "-Out", str(out)], capture_output=True, text=True, timeout=30,
+            )
+            self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("pack\\scene.rpf", result.stderr)
+            self.assertIn("PACK_scene.rpf", result.stderr)
+            self.assertNotIn("carving", result.stdout)
+            self.assertEqual(coverage.read_bytes(), b"[]\n")
 
 
 if __name__ == "__main__":

@@ -5,6 +5,7 @@
 The decode tests use synthetic audio and skip when ffmpeg is not on PATH.
 """
 import contextlib
+import errno
 import io
 import os
 from pathlib import Path
@@ -14,6 +15,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 import wave
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -665,6 +667,22 @@ class AudioWavCliTest(unittest.TestCase):
             code = audio_wav.main([missing])
         self.assertEqual(code, 2)
         self.assertIn(f"source not found: {missing}", err.getvalue())
+
+    def test_cli_reports_unreadable_source_directory(self):
+        bank = os.path.join(self.src_dir, "bank")
+        os.mkdir(bank)
+        scandir = os.scandir
+
+        def list_directory(path):
+            if path == bank:
+                raise PermissionError(errno.EACCES, "permission denied", path)
+            return scandir(path)
+
+        err = io.StringIO()
+        with mock.patch.object(os, "scandir", list_directory), contextlib.redirect_stderr(err):
+            code = audio_wav.main([self.src_dir])
+        self.assertEqual(code, 2)
+        self.assertIn(bank, err.getvalue())
 
     def test_cli_rejects_non_opus_file_extension(self):
         txt_file = os.path.join(self.dir, "test.txt")

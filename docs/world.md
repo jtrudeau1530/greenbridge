@@ -153,6 +153,16 @@ struct hash, byte size, `u64` pointer. The pointers are `0x50000000 | file offse
 reach an appended graphics page. Fields are not named on disk. Their 32-bit hashes are the **case-sensitive
 joaat** of the engine names; matching those hashes is how the fields below were identified.
 
+The member `type` byte uses the PSIN type enum ([psin.md](psin.md#layouts)). Measured in the `CMapData`
+(`d3593fa6`) and `CEntityDef` (`ce501483`) member tables of three carved `levels.rpf` maps: `0x34` is the
+`4×f32` quaternion (`rotation`), `0x32` a 12-byte vec3 (`position`), `0x33` its 16-byte padded form (the four
+extent triples), `0x21` f32 (`scaleXY`, `scaleZ`, `lodDist`, `childLodDist`), `0x12` i16 (`parentIndex`,
+`parentInstance`), `0x15` u32 (`flags`, `numChildren`), `0x08` u64 (`entity id`), `0x60` an 8-bit enum
+(`lodLevel`, `priorityLevel`), `0x4A` a u32 name hash, `0x52` and `0x5C` the two array forms, and `0x05` a struct
+reference whose `extra` word is the referenced struct hash. `0x0C` is a 16-byte vector in the PSIN table but did
+not occur in these schemas. 6stars independently reads these members with the same codes; no code or table was
+copied, and its repository has no licence.
+
 Every 0x7a header is checked the same way: the struct/instance table pointers must lie inside the stream, every
 struct's member table must lie inside the stream, and at least one block must have a known struct and a
 resolvable pointer. A block whose struct hash is not in the table is kept opaque rather than guessed (some
@@ -229,6 +239,80 @@ name-source lower bound, not a formula limit: with the names `tools/rpf9_names.p
 of the 1,670,435 entities a whole-archive `world_index.py` run reads resolve, all verified by the 64-bit key. See [world_names.md](world_names.md) and
 `tools/world_names.py`.
 
+## Archetype definitions (`CMapTypes`)
+
+The `.ytyp` role. A `CMapTypes` resource (root `d98bb561`, 0x50 bytes) is a `0x7a` metadata resource like a map
+file, counted as `meta` by `world_index.py`. Its archetypes are stored the way entities are: one block of
+fixed-size instances per struct, `CBaseArchetypeDef` (`82d6fc83`, 0xb8 bytes) and `CMloArchetypeDef`
+(`10506455`, 0x220 bytes). The interior struct repeats the base members at the same offsets and adds its own
+from +0xb8. `CTimeArchetypeDef` (`76b0c56c`) did not occur in the measured window. All three names, and the
+member names below, are case-sensitive joaat. `tools/world_archetypes.py` finds every field by hash in the
+resource's own member table.
+
+| Field | Hash | Offset | Type | Meaning |
+|---|---|---:|---|---|
+| `lodDist` | `bf74dfa7` | +0x38 | f32 | default LOD distance (an entity's `lodDist` of -1 uses it) |
+| `specialAttribute` | `6c1523e4` | +0x3c | u32 | |
+| `bbMin` / `bbMax` | `d9ef8236` / `e78aa618` | +0x40 / +0x4c | 3×f32 | model-space bounding box |
+| `bsCentre` / `bsRadius` | `d61872ff` / `82e8c5de` | +0x58 / +0x64 | 3×f32 / f32 | bounding sphere |
+| `flags` | `67d26872` | +0x68 | u32 | |
+| `hdTextureDist` | `ad5d5b4c` | +0x70 | f32 | |
+| `name` | `e6e17f14` | +0x78 | u32 | lower-cased joaat of the archetype name; what `CEntityDef.archetypeName` holds |
+| `clipDictionary` | `19471791` | +0x7c | u32 | hash |
+| `physicsDictionary` | `d3c717fc` | +0x80 | u32 | hash |
+| `assetType` | `069004b2` | +0x84 | enum (u32) | see below |
+| `assetName` | `9a77c7c5` | +0x88 | u32 | hash of the model resource name |
+| `extensions` | `f17e7f28` | +0x90 | array | |
+
+Unnamed members: five u64 (type `0x4f`) at +0x08..+0x28, `c067a638` (+0x30), `8f215e15` (u32, +0x6c),
+`66d9cb52` and `96b4753e` (u32 hashes, +0x74 and +0x8c), `9a7b6e6d` (+0xa0), `1b60404d` (u64, +0xa8, the same
+member hash as the entity id) and the enum `07d164a8` (+0xb0).
+
+Measured in the 8–9 GiB window of `levels.rpf`: 119
+`CMapTypes` resources hold 31,800 definitions (31,785 base, 15 interior) for 14,955 distinct names. Where a
+name is defined more than once, every copy has the same box.
+
+`assetType`, measured by name: each distinct `name` of the window against the `name.#dr` / `name.#ft` strings
+that `tools/rpf9_names.py --types dr,ft,dd` lists in the whole `levels.rpf` (266,456 `.#dr`, 50,801 `.#ft`, no
+`.#dd`):
+
+| `assetType` | names | listed as `.#ft` | listed as `.#dr` | not listed |
+|---:|---:|---:|---:|---:|
+| 1 | 3,614 | 3,611 | 0 | 3 |
+| 2 | 8,689 | 0 | 8,681 | 8 |
+| 3 | 2,637 | 0 | 2,327 | 310 |
+| 0 | 15 | 0 | 0 | 15 |
+
+1 is a fragment and 2 a drawable; no name crosses over. 3 is named like a drawable but is a different type;
+that it is the drawable-dictionary type is an inference (no `.#dd` string confirms it). The 15 type-0
+definitions are the interiors. For types 1–3, `assetName` equals `name` in every definition; for the
+interiors it does not.
+
+### Checking transforms against the map extents
+
+A map root's `entitiesExtentsMin`/`Max` is a box the map's own entities fill. With the definitions, that box can
+be rebuilt independently: transform each entity's archetype box and take the union. `world_archetypes.py
+--check-extents` does this for every map whose entities all have a definition in the window, with a 5 cm
+tolerance per bound. In the 8–9 GiB window, 1,088 of 1,398 maps are fully defined:
+
+| 827 maps with a rotated entity | stored quaternion | conjugated quaternion |
+|---|---:|---:|
+| union equals the stored extents | 236 | **616** |
+| median of the largest bound error | 0.627 m | **0.00016 m** |
+
+This confirms the conjugate rule of [Map placement records](#map-placement-records) on box geometry, not only
+on positions. The 211 maps that match neither have extents larger than the union, never smaller (827/827
+inside): something the entity list does not hold also widens them.
+
+**The stored extents ignore the entity scale.** Of the 179 fully-defined maps with a scaled entity, 155 match
+the union built without scale and 101 the union built with `scaleXY`/`scaleZ`; with scale, 41 unions are larger
+than the stored extents, without scale none is. This says how the extents were computed, not how the renderer
+applies scale; the scale rule of [Map placement records](#map-placement-records) stays as it is.
+
+```powershell
+python -I tools\world_archetypes.py <game>\levels.rpf --start 8589934592 --limit 1073741824 --check-extents --out <work>\world\archetypes_8-9.json
+```
+
 ### Measured placement summary
 
 | Scope | Map files | Entities |
@@ -276,6 +360,8 @@ lists; interiors and entity groups need the transform of whatever places them.
 Readable:
 - the 0x7a header, schema, struct/member tables and instance blocks;
 - map file count, per-file streaming/entity extents;
+- archetype definitions in `CMapTypes`: name, asset name and type, bounding box and sphere, default LOD
+  distance and flags ([Archetype definitions](#archetype-definitions-cmaptypes));
 - every entity's position, rotation, scale, flags, per-entity id, per-archetype 64-bit key, archetype hash and LOD
   fields;
 - in `common.rpf`, the full XML content-definition path list and cell names.
@@ -482,14 +568,14 @@ This is an approximation of point 5, per cell and per tier. Per-entity `lodDist`
 ### Measured
 
 On the 1.0.2.1 package, `levels.rpf`, Linux, 88 cores, `--no-textures`, 256 m chunks. Models were exported with
-rpf9-explorer at Leonida's pin (917e9b9) and with breadbbbb/rpf9-explorer#8 and #10 applied. Each placement was
+rpf9-explorer at the baseline revision (`917e9b9`) and with breadbbbb/rpf9-explorer#8 and #10 applied. Each placement was
 counted against the first export and built from the second.
 
 | Step | Result |
 |---|---|
 | `--entities-out` over the whole data area (24 parallel `--start/--limit` windows) | 1,670,435 rows, 66 s |
 | `lodLevel` split | 0: 1,153,122 · 5: 396,871 · 1: 100,953 · 2: 16,828 · 3: 1,708 · 4: 601 · 6: 352 |
-| HD + ORPHAN_HD placements with a recovered model (joaat + Murmur3-64) | 640,080 of 1,549,993 (41.3%) at the pin; 1,549,347 (99.96%) with #8/#10, from 121,411 resources |
+| HD + ORPHAN_HD placements with a recovered model (joaat + Murmur3-64) | 640,080 of 1,549,993 (41.3%) at `917e9b9`; 1,549,347 (99.96%) with #8/#10, from 121,411 resources |
 | 700 m × 700 m downtown box, 10,729 placements, `--jobs 16` | `bake` (#1183): 5 min, 22 GB peak RSS. `gpu`: 35 s; 0.43 GB in the largest process, 1.93 GB for all 17 processes; same 16 chunks and 29,331,138 triangles |
 | **whole city**, HD + ORPHAN_HD, `gpu`, `--jobs 40` | 1,549,343 placed (646 `unresolved_archetype`, 4 `model_not_loadable`, 0 `key_mismatch`, 0 `mirrored`), 121,407 distinct models → 2,940 chunks; 7.31 G triangles drawn, 3.34 G stored; 125 GB of GLB, median chunk 17 MB, largest 926 MB; 21 min; 3.4 GB in the largest process, 38 GB for all 41 processes |
 | **whole city, all tiers, `--lod-sets`, `gpu`, `--jobs 24`** | 1,669,771 placed (660 `unresolved_archetype`, 4 `model_not_loadable`), 228,566 distinct models → 12,340 chunks: HD 2,911 (median 16.9 MB), LOD 2,836 (0.6 MB), SLOD1 2,811, SLOD2 1,222, SLOD3 501, SLOD4 284 (all ≤ 0.1 MB median), ORPHAN_HD 1,775 (3.0 MB); bands as in the table above; 33 min; 2.6 GB in the largest process, 30 GB for all 25 |
@@ -512,7 +598,19 @@ Checks:
 
 The pin's 41.3% is a model-recovery gap, not a naming gap: almost every archetype name resolves (99.85%, see
 *What is readable* above), but only recovered models can be placed. The archetypes that #8/#10 add are `.#ft`
-fragments, whose headers the pinned `LooksLikeFragment` rejects (breadbbbb/rpf9-explorer#8).
+fragments. The pinned `LooksLikeFragment` now accepts the null optional pointers covered by
+`breadbbbb/rpf9-explorer#8`, so that header filter no longer explains the remaining model-recovery gap.
+Although 99.85% of archetype names resolve (see *What is readable* above), only 41.3% of HD and ORPHAN_HD
+placements had a recovered model at `917e9b9`. The additional archetypes recovered with #8/#10 were `.#ft`
+fragments. The pinned explorer (`e2939175`) includes both changes. Its fragment check accepts null pointers
+at header offsets 16, 32 and 40 and requires system pointers at offsets 8, 24 and 168.
+[Fragment check at the pinned revision](https://github.com/breadbbbb/rpf9-explorer/blob/e2939175c36a02d6ed25fa2c217b9d6ddcb8b516/Core/RageModelDecoder.cs#L66-L84)
+The 41.3% at the earlier pin (917e9b9) was a model-recovery gap, not a naming gap: almost every archetype name
+resolves (99.85%, see *What is readable* above), but only recovered models can be placed. The archetypes that
+#8/#10 add are `.#ft` fragments, whose headers `LooksLikeFragment` rejected before breadbbbb/rpf9-explorer#8 (it
+now accepts null optional pointers at `+16`/`+32`/`+40` and range-checks the 16-bit fields at `+48..+54`).
+Leonida's pin is now e2939175, which contains #8 and #10, so the pinned `LooksLikeFragment` accepts these headers;
+the 99.96% was measured on 917e9b9 with both applied and has not been recounted at e2939175.
 
 **Not verified or limited:**
 - Nothing here was looked at in a browser. The checks above are structural and numeric.

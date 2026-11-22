@@ -9,6 +9,7 @@
 //     refused with E_INVALIDARG, as bytecode without a program is today.
 // The shader (test/glsl/cs_user_data.comp) stands in for a translated one. No game data. Set LEONIDA_VK_VALIDATION=1
 // to run under VK_LAYER_KHRONOS_validation.
+#include "shader_fixture_path.h"
 #include "vk_test_device.h"
 #include "../shims/d3d12_com.h"
 #include "../src/shader_library.h"
@@ -165,12 +166,12 @@ int main() {
     const auto library = std::filesystem::temp_directory_path() / "leonida_fspx_compute_test";
     std::filesystem::remove_all(library);
     std::filesystem::create_directories(library / "fspx");
-    std::filesystem::copy_file(LEONIDA_TEST_CS_SPV, library / "fspx" / "cs_user_data.spv");
-    std::filesystem::copy_file(LEONIDA_TEST_CS_SPV, library / "fspx" / "cs_user_data_b.spv");
+    std::filesystem::copy_file(vktest::shader_fixture_path(LEONIDA_TEST_CS_SPV), library / "fspx" / "cs_user_data.spv");
+    std::filesystem::copy_file(vktest::shader_fixture_path(LEONIDA_TEST_CS_SPV), library / "fspx" / "cs_user_data_b.spv");
     // The review case on #1911: program C in two containers whose kind-0 entries differ, translated to two
     // different modules (the second has another generator word in its header, still a valid module).
     const auto code_c = kind6(9100);
-    std::filesystem::copy_file(LEONIDA_TEST_CS_SPV, library / "fspx" / "cs_c_state1.spv");
+    std::filesystem::copy_file(vktest::shader_fixture_path(LEONIDA_TEST_CS_SPV), library / "fspx" / "cs_c_state1.spv");
     {
         std::ifstream in(LEONIDA_TEST_CS_SPV, std::ios::binary);
         std::vector<char> words((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());

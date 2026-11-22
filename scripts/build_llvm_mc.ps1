@@ -70,8 +70,10 @@ $body = @"
 "@
 New-Item -ItemType Directory -Force $out | Out-Null
 # A .cmd file avoids cmd.exe's quote stripping on paths with spaces.
+# Switch cmd.exe to UTF-8 before it reads the paths in the batch file.
 $bat = Join-Path $Temp "_build.cmd"
-"@echo off`r`nset `"PATH=$installer;%PATH%`"`r`ncall `"$vcvars`" >nul || exit /b 1`r`n$body" | Set-Content -Encoding ascii $bat
+$batchText = "@echo off`r`nchcp 65001 >nul`r`nset `"PATH=$installer;%PATH%`"`r`ncall `"$vcvars`" >nul || exit /b 1`r`n$body`r`n"
+[System.IO.File]::WriteAllText($bat, $batchText, [System.Text.UTF8Encoding]::new($false))
 
 $p = Start-Process cmd.exe -ArgumentList "/c", "`"$bat`"" -NoNewWindow -PassThru
 $null = $p.Handle  # keeps the exit code readable after WaitForExit
