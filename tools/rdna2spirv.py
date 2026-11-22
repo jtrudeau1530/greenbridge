@@ -9154,6 +9154,34 @@ def mesh_psv(path, name):
     return None
 
 
+def native_paths(path, name):
+    """The .s file's sources next to its folder: fssm/<name>.fssm for the game's shaders, and fspx/<name>.code and
+    fspx/<name>.json for the FSPX programs tools/fspx_unpack.py writes (docs/fspx.md)."""
+    root = os.path.dirname(os.path.dirname(os.path.realpath(path)))
+    return (os.path.join(root, "fssm", name + ".fssm"), os.path.join(root, "fspx", name + ".code"),
+            os.path.join(root, "fspx", name + ".json"))
+
+
+def native_blob(path, name):
+    """The bytes the .s was disassembled from (its code_start offset is into these): the FSSM blob, or the FSPX
+    program when there is no FSSM for this name."""
+    fssm, code, _ = native_paths(path, name)
+    with open(fssm if os.path.isfile(fssm) or not os.path.isfile(code) else code, "rb") as f:
+        return f.read()
+
+
+def cs_dispatch_state(path, name):
+    """(COMPUTE_PGM_RSRC2, group x, y, z): FSSM header words 0x138..0x144, or an FSPX program's kind-0 entry."""
+    fssm, _, meta = native_paths(path, name)
+    if os.path.isfile(fssm) or not os.path.isfile(meta):
+        with open(fssm, "rb") as f:
+            hdr = f.read(0x148)
+        return struct.unpack_from("<4I", hdr, 0x138)
+    with open(meta, encoding="utf-8") as f:
+        m = _json.load(f)
+    return (m["rsrc2"], *m["threads"])
+
+
 def translate(path):
     info = parse_file(path)
     stage = stage_of(info["name"], path)
@@ -9164,9 +9192,7 @@ def translate(path):
         # Undecodable words are constant tables embedded in the code range (147/155 such VS/PS use s_getpc_b64 to
         # read them). LLVM skips them, so re-anchor every instruction to its true offset in the FSSM blob, then
         # translate only code reachable from entry; a branch into data is rejected below.
-        fssm = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(path))), "fssm", info["name"] + ".fssm")
-        with open(fssm, "rb") as f:
-            blob = f.read()
+        blob = native_blob(path, info["name"])
         pos = info["code_start"]
         for ins in insns:
             enc = bytes.fromhex(ins["enc"])
@@ -9256,11 +9282,9 @@ def translate(path):
         # what 2,689 CS read before writing: 2,281 fit exactly, the rest are loop artifacts of the straight-line
         # check): USER_SGPR [5:1], TGID_X/Y/Z_EN [9:7], TG_SIZE_EN [10], TIDIG_COMP_CNT [12:11]. Words
         # 0x13C/0x140/0x144 are the thread-group size. Layout (Mesa radv_shader_args.c): s0..user-1 = user data,
-        # then the enabled workgroup ids; v0, v1, v2 = thread id x, y, z (separate VGPRs on GFX10).
-        fssm = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(path))), "fssm", info["name"] + ".fssm")
-        with open(fssm, "rb") as f:
-            hdr = f.read(0x148)
-        rsrc2, lx, ly, lz = struct.unpack_from("<4I", hdr, 0x138)
+        # then the enabled workgroup ids; v0, v1, v2 = thread id x, y, z (separate VGPRs on GFX10). An FSPX program
+        # (the FidelityFX DLL's shaders) carries the same two fields in its kind-0 entry (docs/fspx.md).
+        rsrc2, lx, ly, lz = cs_dispatch_state(path, info["name"])
         if (rsrc2 >> 10) & 1:
             raise Unsupported("CS thread-group-size SGPR")
         if not (1 <= lx * ly * lz <= 1024):

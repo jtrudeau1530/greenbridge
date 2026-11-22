@@ -1,4 +1,5 @@
-"""Unit tests for tools/fspx_unpack.py (the FSPX payloads of the FidelityFX DLL's shader containers).
+"""Unit tests for tools/fspx_unpack.py (the FSPX payloads of the FidelityFX DLL's shader containers) and for the
+translator's FSPX sidecar reads (rdna2spirv.native_blob / cs_dispatch_state).
 
     python -I tests/test_fspx_unpack.py
 
@@ -225,6 +226,51 @@ class Cli(unittest.TestCase):
             code, _, err = self.run_tool(src, "--out", os.path.join(t, "out"))
             self.assertEqual(code, 1)
             self.assertIn("FSPX status 5", err)
+
+
+class TranslatorSidecars(unittest.TestCase):
+    """rdna2spirv reads an FSPX program's code and dispatch state from fspx/ when there is no FSSM blob."""
+
+    def setUp(self):
+        import rdna2spirv
+        self.tr = rdna2spirv
+
+    def layout(self, t, fssm=None, fspx_meta=None, code=None):
+        for sub in ("disasm", "fssm", "fspx"):
+            os.makedirs(os.path.join(t, sub), exist_ok=True)
+        s = os.path.join(t, "disasm", "cs_x.s")
+        with open(s, "w", encoding="utf-8") as f:
+            f.write("; cs_x\n")
+        if fssm is not None:
+            with open(os.path.join(t, "fssm", "cs_x.fssm"), "wb") as f:
+                f.write(fssm)
+        if fspx_meta is not None:
+            with open(os.path.join(t, "fspx", "cs_x.json"), "w", encoding="utf-8") as f:
+                json.dump(fspx_meta, f)
+        if code is not None:
+            with open(os.path.join(t, "fspx", "cs_x.code"), "wb") as f:
+                f.write(code)
+        return s
+
+    def test_fspx_dispatch_state_and_blob(self):
+        with tempfile.TemporaryDirectory() as t:
+            s = self.layout(t, fspx_meta={"rsrc2": 0x98, "threads": [32, 1, 1]}, code=b"CODE")
+            self.assertEqual(self.tr.cs_dispatch_state(s, "cs_x"), (0x98, 32, 1, 1))
+            self.assertEqual(self.tr.native_blob(s, "cs_x"), b"CODE")
+
+    def test_fssm_wins_when_both_exist(self):
+        hdr = bytearray(0x148)
+        struct.pack_into("<4I", hdr, 0x138, 0x18C, 64, 2, 1)
+        with tempfile.TemporaryDirectory() as t:
+            s = self.layout(t, fssm=bytes(hdr), fspx_meta={"rsrc2": 0x98, "threads": [32, 1, 1]}, code=b"CODE")
+            self.assertEqual(self.tr.cs_dispatch_state(s, "cs_x"), (0x18C, 64, 2, 1))
+            self.assertEqual(self.tr.native_blob(s, "cs_x"), bytes(hdr))
+
+    def test_neither_is_still_an_error(self):
+        with tempfile.TemporaryDirectory() as t:
+            s = self.layout(t)
+            with self.assertRaises(FileNotFoundError):
+                self.tr.cs_dispatch_state(s, "cs_x")
 
 
 if __name__ == "__main__":
