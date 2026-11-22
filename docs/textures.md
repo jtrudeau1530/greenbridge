@@ -742,10 +742,11 @@ referencing an unconfirmed or unknown built-in history entry raises
 
 ## Next step
 
-1. **BC6H and BC7 block rebuilders: in review (#576, ASSET-5).** The rANS entropy layer
-   already decodes both 16-lane formats; the BC6H/BC7 block rebuilders and history tables in #576
-   cover the remaining 5,435 BCPack chunks (752 skipped + remaining partial textures). They are not
-   on `main` until #576 merges, so steps 1 and 3 below stay open until then.
+1. **BC6H and BC7 block rebuilders: in review (#576; ASSET-38 in the tracker, ASSET-5 in the older list).**
+   The rANS entropy layer already decodes both 16-lane formats; the BC6H/BC7 block rebuilders and history
+   tables in #576 cover the remaining 5,435 BCPack chunks (752 skipped + remaining partial textures). They
+   are not on `main` until #576 merges, so this step stays open until then. (Step 3 is separate: #576 does
+   not add the BC6H/BC7 pixel decoders to `ttpf_mips.py check`.)
 2. **Port the BCPack decoder to `TtpfReader` (`rpf9-explorer` / `tools/rpf9dump`; ASSET-44).**
    The compact layout rule and the multi-slice layouts are already upstream in `rpf9-explorer`;
    what is left is the BCPack decoder. For reference, the layout rule in C#: select `tile = 65536` when `((mode >> 1) & 0xF) == 0` and
