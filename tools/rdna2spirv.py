@@ -35,6 +35,7 @@ import cfg_structure  # noqa: E402
 import fssm_header  # noqa: E402
 import lane_masks  # noqa: E402
 import shader_meta as _shader_meta  # noqa: E402
+import wave64_emulate_opt  # noqa: E402
 import wave64_halves  # noqa: E402
 
 STRUCTURED = True     # False (--dispatch-loop): every shader with branches as one loop around a switch
@@ -220,6 +221,8 @@ class Gen:
         self.x_gen = 0             # emulate: bumped at every label (control flow inside a block): forgets x_tok
         self.x_mcache = {}         # emulate: wave_mask key -> (lo, hi) already exchanged in this block
         self.x_lanes = 64          # emulate: workgroup invocations rounded up to whole waves
+        self.scc_live = None       # emulate: set of id(ins) whose SCC write is live-out (wave64_emulate_opt)
+        self.cur_scc_live = True   # emulate: whether the current instruction's SCC result is live-out
         self.bar_rounds = False    # native wave32 cs with an s_barrier outside uniform control flow (bar_scheduler)
         self.uses_storage3d = False
         self.uses_heap = False
@@ -3031,6 +3034,8 @@ class Gen:
         """SCC after a lane-mask instruction: 1 if the wave's mask is non-zero. One invocation holds one lane's
         bit, so that is a vote across the subgroup, as for s_cbranch_vccz. Taken per lane, the lanes of one wave
         could follow different s_cbranch_scc paths, which a hardware wave never does: it has one SCC."""
+        if not self.cur_scc_live:
+            return
         any_, z = self.tmp(), self.tmp()
         self.g_vote(any_, "Any", self.tmp_bool_nz(v))
         self.uses_vote = True
@@ -3242,6 +3247,8 @@ class Gen:
 
     def scc_any_half(self, v, half):
         """SCC = some lane of the wave (of one 32-lane half of a wave64 when `half`) has `v` non-zero."""
+        if not self.cur_scc_live:
+            return
         mine = self.tmp_bool_nz(v)
         if half:
             lane, inh, both = (self.tmp() for _ in range(3))
@@ -3549,6 +3556,7 @@ class Gen:
         self.cur_masks = self.lane_masks.get(id(ins), {})
         self.write_all_lanes = id(ins) in self.mask_writes
         self.cur_uniform_readlane = bool(self.w64g) and id(ins) in self.w64g["uniform_readlane"]
+        self.cur_scc_live = (not self.emulate) or (self.scc_live is None) or (id(ins) in self.scc_live)
         if self.emulate:
             self.x_memory_order(base_op(ins["op"]))
         if ins["op"].endswith("_dpp"):
@@ -8972,7 +8980,8 @@ def assemble(gen):
         gen.msc_epilogue = mesh_compute_epilogue(gen)
     if gen.emulate:
         # No subgroup operation is left (x_round does them through %x_buf), so none of their capabilities.
-        if any("OpGroupNonUniform" in l or "%sg_lane" in l for b in gen.blocks + list(gen.x_segs.values()) for l in b):
+        if any("OpGroupNonUniform" in l or "%sg_lane" in l
+               for b in gen.blocks + list(gen.x_segs.values()) if b is not None for l in b):
             raise Unsupported("wave64 emulation: a subgroup operation is left")
         gen.uses_subgroup = gen.uses_vote = gen.uses_ballot = gen.uses_wave_bits = gen.uses_quad = False
         x_waves, x_mask, x_sched, x_sink = gen.x_sizes()
@@ -9629,7 +9638,7 @@ def assemble(gen):
     elif gen.emulate:
         lines = x_scheduler(gen, x_threads)
         body = []
-        for i, blines in sorted(list(enumerate(gen.blocks)) + list(gen.x_segs.items())):
+        for i, blines in sorted([(i, b) for i, b in enumerate(gen.blocks) if b is not None] + list(gen.x_segs.items())):
             body.append(f"%blk{i} = OpLabel")
             body += blines
             body.append("OpBranch %sw_merge")
@@ -10760,8 +10769,136 @@ def translate(path):
                                         user_sgpr_limit=user_limit, system_sgprs=sys_sgprs)
 
     g.bar_rounds = needs_barrier_rounds(g, blocks, succ)
+    folds, fold_chain, absorbed = {}, {}, set()
+    if g.emulate:
+        g.scc_live = wave64_emulate_opt.scc_live_outs(blocks, succ)
+        folds, fold_chain, absorbed = wave64_emulate_opt.find_local_exec_folds(
+            blocks, raw_edges, succ, g.lane_masks, g.scc_live, g.mask_writes)
     g.x_seg = len(blocks) + 1           # emulate: continuation segments are numbered after "done" (len(blocks))
+
+    def emit_folded_region(fd):
+        """Emit a safe lane-local s_cbranch_execz/nz region inline behind `if (%active)`. Uniform control flow
+        before the branch orders any prior writes against reads in the region; inside the region zero x_split
+        calls occur, so all 64 lanes reach the merge label in the exact same scheduler round."""
+        if any((kind, "w") in g.x_dirty for kind in fd["mem_reads"]):
+            g.x_split()
+        g.desc_cache.clear()
+        g.sgpr_imm.clear()
+        g.x_tok.clear()
+        g.x_mcache.clear()
+        act = g.active_b()
+        lbl_do, lbl_end = g.tmp(), g.tmp()
+        g.emit(f"OpSelectionMerge {lbl_end} None")
+        g.emit(f"OpBranchConditional {act} {lbl_do} {lbl_end}")
+        g.emit(f"{lbl_do} = OpLabel")
+        marks_before = len(g.x_marks)
+        if fd["sub_tree"] is None:
+            for ins in blocks[fd["run"]]:
+                op = base_op(ins["op"])
+                if op == "s_endpgm" or op in BRANCHES:
+                    break
+                g.insn(ins)
+        else:
+            order = fd["order"]
+            idx_of = {u: i for i, u in enumerate(order)}
+            sub_end = len(order)
+            for i in range(sub_end + 1):
+                g.cu(i)
+            g.emit(f"OpStore %pc {g.cu(0)}")
+            stack = [("items", fd["sub_tree"])]
+            while stack:
+                step = stack.pop()
+                if step[0] == "items":
+                    for it in reversed(step[1]):
+                        stack.append(("item", it))
+                elif step[0] == "item":
+                    it = step[1]
+                    if it[0] == "block":
+                        u = order[it[1]]
+                        blbl = g.tmp()
+                        g.emit(f"OpBranch {blbl}")
+                        g.emit(f"{blbl} = OpLabel")
+                        g.desc_cache.clear()
+                        g.sgpr_imm.clear()
+                        g.x_tok.clear()
+                        g.x_mcache.clear()
+                        uterm = None
+                        for ins in blocks[u]:
+                            op = base_op(ins["op"])
+                            if op == "s_endpgm":
+                                uterm = ("end",)
+                                break
+                            if op in BRANCHES:
+                                uterm = ("br", op)
+                                break
+                            g.insn(ins)
+                        uedges = raw_edges[u]
+                        if uterm is None or uterm[0] == "end":
+                            nxt = idx_of.get(uedges[0], sub_end) if (uterm is None and uedges) else sub_end
+                            g.emit(f"OpStore %pc {g.cu(nxt)}")
+                        elif uterm[1] == "s_branch":
+                            g.emit(f"OpStore %pc {g.cu(idx_of.get(uedges[0], sub_end))}")
+                        else:
+                            uop = uterm[1]
+                            utgt = g.cu(idx_of.get(uedges[0], sub_end))
+                            ufall = g.cu(idx_of.get(uedges[1], sub_end) if len(uedges) > 1 else sub_end)
+                            if uop in ("s_cbranch_execz", "s_cbranch_execnz"):
+                                uact = g.active_b()
+                                if uop == "s_cbranch_execz":
+                                    ucond = g.tmp()
+                                    g.emit(f"{ucond} = OpLogicalNot %bool {uact}")
+                                else:
+                                    ucond = uact
+                            else:
+                                ucond = branch_condition(g, uop)
+                            ur = g.tmp()
+                            g.emit(f"{ur} = OpSelect %uint {ucond} {utgt} {ufall}")
+                            g.emit(f"OpStore %pc {ur}")
+                    elif it[0] == "guard":
+                        v, c, do, end = g.tmp(), g.tmp(), g.tmp(), g.tmp()
+                        g.emit(f"{v} = OpLoad %uint %pc")
+                        g.emit(f"{c} = OpIEqual %bool {v} {g.cu(it[1])}")
+                        g.emit(f"OpSelectionMerge {end} None")
+                        g.emit(f"OpBranchConditional {c} {do} {end}")
+                        g.emit(f"{do} = OpLabel")
+                        stack.append(("guard_end", end))
+                        stack.append(("items", it[2]))
+                    else:
+                        head, top, cont, end = g.tmp(), g.tmp(), g.tmp(), g.tmp()
+                        g.emit(f"OpBranch {head}")
+                        g.emit(f"{head} = OpLabel")
+                        g.emit(f"OpLoopMerge {end} {cont} None")
+                        g.emit(f"OpBranch {top}")
+                        g.emit(f"{top} = OpLabel")
+                        stack.append(("loop_end", it[1], head, cont, end))
+                        stack.append(("items", it[2]))
+                elif step[0] == "guard_end":
+                    g.emit(f"OpBranch {step[1]}")
+                    g.emit(f"{step[1]} = OpLabel")
+                else:
+                    _, sub_id, head, cont, end = step
+                    v, again = g.tmp(), g.tmp()
+                    g.emit(f"OpBranch {cont}")
+                    g.emit(f"{cont} = OpLabel")
+                    g.emit(f"{v} = OpLoad %uint %pc")
+                    g.emit(f"{again} = OpIEqual %bool {v} {g.cu(sub_id)}")
+                    g.emit(f"OpBranchConditional {again} {head} {end}")
+                    g.emit(f"{end} = OpLabel")
+        assert len(g.x_marks) == marks_before, "wave64 emulation: x_split inside a folded lane-local region"
+        g.emit(f"OpBranch {lbl_end}")
+        g.emit(f"{lbl_end} = OpLabel")
+        for kind in fd["mem_reads"]:
+            g.x_dirty.add((kind, "r"))
+        g.desc_cache.clear()
+        g.sgpr_imm.clear()
+        g.x_tok.clear()
+        g.x_mcache.clear()
+
     for n, blk in enumerate(blocks):
+        if n in absorbed:
+            g.blocks.append(None)
+            g.succ.append(succ[n])
+            continue
         g.body = []
         g.block_label = f"%blk{n}"
         g.x_marks, g.x_dirty = [], set()
@@ -10769,49 +10906,64 @@ def translate(path):
         g.x_gen += 1
         g.desc_cache.clear()            # a cached lookup is only good inside the block that made it
         g.sgpr_imm.clear()
-        term = None
-        for ins in blk:
-            op = base_op(ins["op"])
-            if op == "s_endpgm":
-                term = ("end",)
+        cur = n
+        while True:
+            term = None
+            for ins in blocks[cur]:
+                op = base_op(ins["op"])
+                if op == "s_endpgm":
+                    term = ("end",)
+                    break
+                if op in BRANCHES:
+                    term = ("br", op, index[target(ins)])
+                    break
+                g.insn(ins)
+            if cur in folds:
+                emit_folded_region(folds[cur])
+                if cur in fold_chain:
+                    cur = fold_chain[cur]
+                    g.desc_cache.clear()
+                    g.sgpr_imm.clear()
+                    g.x_tok.clear()
+                    g.x_mcache.clear()
+                    continue
+                g.emit(f"OpStore %pc {g.cu(folds[cur]['skip'])}")
+                g.succ.append(succ[n])
                 break
-            if op in BRANCHES:
-                term = ("br", op, index[target(ins)])
-                break
-            g.insn(ins)
-        edges = raw_edges[n]
-        fall = (edges[0] if edges else None) if term is None else (edges[1] if len(edges) > 1 else None)
-        # Every block leaves the number of the block to run next in %pc (len(blocks) = none: the program is over),
-        # and its possible successors in g.succ for cfg_structure.
-        if term is None or term[0] == "end":
-            nxt = fall if term is None else None
-            g.emit(f"OpStore %pc {g.cu(nxt if nxt is not None else len(blocks))}")
-            if nxt is None:
-                g.emit("OpStore %done %true")
-            g.succ.append([nxt] if nxt is not None else [])
-        else:
-            _, op, _ = term
-            tgt = edges[0]
-            if op == "s_branch":
-                g.emit(f"OpStore %pc {g.cu(tgt)}")
-                g.succ.append([tgt])
+            edges = raw_edges[cur]
+            fall = (edges[0] if edges else None) if term is None else (edges[1] if len(edges) > 1 else None)
+            # Every block leaves the number of the block to run next in %pc (len(blocks) = none: the program is over),
+            # and its possible successors in g.succ for cfg_structure.
+            if term is None or term[0] == "end":
+                nxt = fall if term is None else None
+                g.emit(f"OpStore %pc {g.cu(nxt if nxt is not None else len(blocks))}")
+                if nxt is None:
+                    g.emit("OpStore %done %true")
+                g.succ.append(succ[n] if cur != n else ([nxt] if nxt is not None else []))
             else:
-                marks0, body0 = len(g.x_marks), len(g.body)
-                cond = branch_condition(g, op)
-                alt = g.cu(fall) if fall is not None else g.cu(len(blocks))   # past the end = default -> done
-                r = g.tmp()
-                g.emit(f"{r} = OpSelect %uint {cond} {g.cu(tgt)} {alt}")
-                g.emit(f"OpStore %pc {r}")
-                if g.emulate and op in ("s_cbranch_vccz", "s_cbranch_vccnz", "s_cbranch_execz", "s_cbranch_execnz"):
-                    # This segment only reads the vote and sets %pc, and the code before the vote ran in an earlier
-                    # round: the successor can start in this one (x_scheduler). That only holds when the vote's own
-                    # x_split started this segment: then it holds the vote read and the %pc select and nothing else.
-                    # A vote that reused an earlier exchange (no split) would put the end of the block in the
-                    # successor's round, with no barrier between their memory accesses.
-                    if len(g.x_marks) != marks0 + 1 or g.x_marks[-1][0] < body0:
-                        raise Unsupported("wave64 emulation: a voted branch must start its own segment")
-                    g.emit("OpStore %x_chain %true")
-                g.succ.append(list(dict.fromkeys([tgt] + ([fall] if fall is not None else []))))
+                _, op, _ = term
+                tgt = edges[0]
+                if op == "s_branch":
+                    g.emit(f"OpStore %pc {g.cu(tgt)}")
+                    g.succ.append(succ[n] if cur != n else [tgt])
+                else:
+                    marks0, body0 = len(g.x_marks), len(g.body)
+                    cond = branch_condition(g, op)
+                    alt = g.cu(fall) if fall is not None else g.cu(len(blocks))   # past the end = default -> done
+                    r = g.tmp()
+                    g.emit(f"{r} = OpSelect %uint {cond} {g.cu(tgt)} {alt}")
+                    g.emit(f"OpStore %pc {r}")
+                    if g.emulate and op in ("s_cbranch_vccz", "s_cbranch_vccnz", "s_cbranch_execz", "s_cbranch_execnz"):
+                        # This segment only reads the vote and sets %pc, and the code before the vote ran in an earlier
+                        # round: the successor can start in this one (x_scheduler). That only holds when the vote's own
+                        # x_split started this segment: then it holds the vote read and the %pc select and nothing else.
+                        # A vote that reused an earlier exchange (no split) would put the end of the block in the
+                        # successor's round, with no barrier between their memory accesses.
+                        if len(g.x_marks) != marks0 + 1 or g.x_marks[-1][0] < body0:
+                            raise Unsupported("wave64 emulation: a voted branch must start its own segment")
+                        g.emit("OpStore %x_chain %true")
+                    g.succ.append(succ[n] if cur != n else list(dict.fromkeys([tgt] + ([fall] if fall is not None else []))))
+            break
         lines = [l.strip() for l in g.body]
         if g.x_marks:
             cuts = [0] + [i for i, _ in g.x_marks] + [len(lines)]
@@ -11000,7 +11152,8 @@ def x_scheduler(gen, threads):
           "OpLoopMerge %x_ch_merge %x_ch_cont None", "OpBranch %x_ch_body", "%x_ch_body = OpLabel",
           "%pcv = OpLoad %uint %pc", "OpSelectionMerge %sw_merge None",
           "OpSwitch %pcv %sw_default " + " ".join(f"{i} %blk{i}" for i in
-                                                  sorted(list(range(len(gen.blocks))) + list(gen.x_segs)))]
+                                                  sorted([i for i, b in enumerate(gen.blocks) if b is not None]
+                                                         + list(gen.x_segs)))]
     return L
 
 
