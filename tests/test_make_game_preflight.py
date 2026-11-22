@@ -821,6 +821,65 @@ class PreflightExportedAssetsSpaceTest(PreflightTestBase):
             self.write_markers(work)
             self.assert_fails(self.run_preflight, work, free_gb=220, wav=True, match="about 330 GB is needed")
 
+    # A stopped export: models, textures and most pools on disk, no xma.done yet.
+    def run_partial(self, work, free_gb, on_disk_gb, **kwargs):
+        with mock.patch("make_game.assets_bytes_on_disk", return_value=on_disk_gb * 2**30) as walk:
+            self.run_preflight(work, free_gb, **kwargs)
+        return walk
+
+    def test_stopped_export_counts_what_is_already_on_disk(self):
+        # The case this was found on: 270 GB already exported, 205 GB free, refused for 330 GB.
+        with tempfile.TemporaryDirectory() as work:
+            self.write_markers(work, xma=None)
+            self.run_partial(work, free_gb=205, on_disk_gb=270)  # 30 + 300 - 270 = 60 GB
+
+    def test_stopped_export_still_needs_what_is_left(self):
+        with tempfile.TemporaryDirectory() as work:
+            self.write_markers(work, xma=None)
+            err = self.assert_fails(self.run_partial, work, free_gb=205, on_disk_gb=50,
+                                    match="about 280 GB is needed")
+            self.assertIn("205 GB free", err)
+
+    def test_more_on_disk_than_the_estimate_leaves_the_shader_space(self):
+        with tempfile.TemporaryDirectory() as work:
+            self.write_markers(work, xma=None)
+            self.assert_fails(self.run_partial, work, free_gb=20, on_disk_gb=400, match="about 30 GB is needed")
+
+    def test_assets_folder_is_not_walked_when_there_is_room(self):
+        with tempfile.TemporaryDirectory() as work:
+            walk = self.run_partial(work, free_gb=500, on_disk_gb=270)
+            walk.assert_not_called()
+
+    def test_wav_still_counts_the_whole_asset_space_for_a_stopped_export(self):
+        with tempfile.TemporaryDirectory() as work:
+            self.write_markers(work, xma=None)
+            self.assert_fails(self.run_partial, work, free_gb=205, on_disk_gb=270, wav=True,
+                              match="about 330 GB is needed")
+
+    def test_assets_bytes_on_disk_sums_every_file_below_assets(self):
+        with tempfile.TemporaryDirectory() as work:
+            self.assertEqual(make_game.assets_bytes_on_disk(work), 0)  # no assets folder yet
+            for rel, size in (("levels/models/a.obj", 100), ("levels/manifest.json", 7),
+                              ("ttpf/pool/b.dds", 4096), ("top.bin", 1)):
+                path = os.path.join(work, "assets", *rel.split("/"))
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path, "wb") as f:
+                    f.write(b"\0" * size)
+            with open(os.path.join(work, "outside.bin"), "wb") as f:  # not under assets: not counted
+                f.write(b"\0" * 999)
+            self.assertEqual(make_game.assets_bytes_on_disk(work), 100 + 7 + 4096 + 1)
+
+    def test_assets_bytes_on_disk_does_not_follow_a_linked_folder(self):
+        with tempfile.TemporaryDirectory() as work, tempfile.TemporaryDirectory() as elsewhere:
+            with open(os.path.join(elsewhere, "big.bin"), "wb") as f:
+                f.write(b"\0" * 5000)
+            os.makedirs(os.path.join(work, "assets"))
+            try:
+                os.symlink(elsewhere, os.path.join(work, "assets", "link"), target_is_directory=True)
+            except (OSError, NotImplementedError):
+                self.skipTest("symbolic links are not available here")
+            self.assertEqual(make_game.assets_bytes_on_disk(work), 0)
+
 
 if __name__ == "__main__":
     unittest.main()

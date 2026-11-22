@@ -385,6 +385,27 @@ def assets_exported(work: str) -> bool:
     return not (shutil.which("ffmpeg") and pending_xma(os.path.join(audio, "xma")))
 
 
+def assets_bytes_on_disk(work: str) -> int:
+    """Bytes already under <work>/assets: the part of the assets stage's space that a stopped export has used and
+    a rerun won't write again, since the stage skips every step whose manifest or marker is there. One os.scandir
+    walk; on Windows the sizes come with the directory listing, so no file is opened. Links are not followed."""
+    total, stack = 0, [os.path.join(work, "assets")]
+    while stack:
+        try:
+            with os.scandir(stack.pop()) as it:
+                for e in it:
+                    try:
+                        if e.is_dir(follow_symlinks=False):
+                            stack.append(e.path)
+                        elif e.is_file(follow_symlinks=False):
+                            total += e.stat(follow_symlinks=False).st_size
+                    except OSError:
+                        continue
+        except OSError:   # no assets folder yet, or one that can't be listed: count nothing for it
+            continue
+    return total
+
+
 def pipeline_check_prerequisite(runtime_selected: bool = False) -> str:
     """Why the pipelines stage can't run yet. Kept here so preflight can fail before a long shader build;
     pipelines() prints its own, more detailed message when the stage is reached. On Windows the runtime stage
@@ -456,6 +477,15 @@ def preflight(stages: list, work: str, wav: bool = False, runtime_build: str | N
     if free_gb < need_gb and need.get("shaders") and shader_outputs_reusable(work, emulate, keep_emulated, fallbacks):
         log(f"preflight: the shaders in {work} can be reused; not counting their {need['shaders']} GB")
         need_gb -= need["shaders"]
+    # An export stopped part-way (no xma.done yet) has already put some of the 300 GB on the drive, and the rerun
+    # skips those steps. Only walked when the space is short, so a build with room to spare reads no folder.
+    # --wav still counts the whole estimate, as above: the WAV decode writes several times the Ogg Opus size and has
+    # no marker, so what is on disk says nothing about what it will still write.
+    if free_gb < need_gb and need.get("assets") and not wav:
+        done_gb = min(assets_bytes_on_disk(work) // 2**30, need["assets"])
+        if done_gb:
+            log(f"preflight: {done_gb} GB of a stopped asset export is already in {work}; not counting it again")
+            need_gb -= done_gb
     if free_gb < need_gb:
         fail(f"{free_gb:.0f} GB free on the drive of {work}, about {need_gb} GB is needed. "
              "Free some space or choose another drive with --work.")
