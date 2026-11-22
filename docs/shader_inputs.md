@@ -76,3 +76,122 @@ The light is skipped only through a profile intensity of 0 or less.
 - The entry's fourth dword (+12) is the intensity, as f32. When it's 0 or less the light is skipped before the rest of
   its record is read. #1892 gives the first three dwords as the RGB colour; the shader loads the whole entry later in the
   light's shading.
+
+## ACES LUT bakes (`postfx_aces`)
+
+Reported by @Silliana in [#1896](https://github.com/ItsNotRexed/Leonida/issues/1896). The corpus has ten bake
+programs: `CS_BakeACESLUT`, `CS_BakeACESWithGamutCompressLUT`, and the `TonemapOnly` versions of both, each with a
+choice of shaper (Linear, Log, PQ or QuasiLog; the `TonemapOnly` bakes exist only with QuasiLog). Each one writes
+an RGBA 3D LUT through a storage image (`image_store`, 3D). In the corpus the program names have lost the `A` of
+`ACES` (`CS_BakeCESLUT_…`) everywhere except the gamut-compress bakes.
+
+### First check for an identity-looking or flat LUT
+
+1. **Which spline you filled.** The bakes read their tone curve from a spline in the constant buffer. In the
+   `TonemapOnly` bakes, the dword at **+0x118** chooses between two of them (see [Two splines](#two-splines)):
+   non-zero uses the one at +0x70, zero uses the one at +0x00. Filling one and pointing the switch at the other
+   gives a flat or meaningless curve.
+2. **The dword at +0x13C.** It is the switch #1896 describes, but it doesn't turn the curve off: every path
+   evaluates the spline. At zero the spline is applied to R, G and B separately (three evaluations). When it is
+   non-zero, the shader also evaluates it on AP1 luminance (0.2722, 0.6741, 0.0537), for four evaluations. In the
+   non-`TonemapOnly` bakes the dword at +0x11C then blends the luminance result with the per-channel one.
+3. **The quasi-log addressing**, below, if you read the LUT back.
+
+### Quasi-log addressing
+
+The four QuasiLog bakes turn each LUT index *i* into a linear value as #1896 gives it:
+
+`linear = 0.18 · 2^(14 · (i · s − 0.41838)) − 0.0031`
+
+The shader's constants are −0.418377, 14.0, 0.18 and −0.0031050. The scale *s* is the first dword of a second
+constant buffer and multiplies the thread index; #1896's formula makes it 1/(N − 1) for an N-entry axis. Mid grey
+(linear 0.18) falls at *i* · *s* ≈ 0.4201, which is index 13.0 on a 32-entry axis. #1896 reports that mid grey comes
+out at about 0.103. That needs the bake to run and isn't measured here. The Linear, Log and PQ bakes don't contain
+these constants.
+
+### Two splines
+
+The RRT's own spline (the reference `SegmentedSplineParams_c5`) isn't an input: its coefficients are a constant
+table inside the program, read relative to the code (`s_getpc_b64`), with the thresholds log10 0.18 = −0.7447 and
+log10(0.18 · 2^18) = 4.673 as literals. The constant buffer holds the output tone curve, packed at 4 bytes per value
+(not the 16-byte stride an HLSL array would get).
+
+**At +0x00, all ten bakes: reference order** (`SegmentedSplineParams_c9`, 8 knots per half):
+
+| Offset | Values | Use |
+|---|---|---|
+| +0x00 | 10 × f32 | Low coefficients |
+| +0x28 | 10 × f32 | High coefficients |
+| +0x50 | 2 × f32 | Min point (x, y) |
+| +0x58 | 2 × f32 | Mid point (x, y) |
+| +0x60 | 2 × f32 | Max point (x, y) |
+| +0x68 | f32 | Low slope |
+| +0x6C | f32 | High slope |
+
+**At +0x70, the two `TonemapOnly` bakes only: points first.** This is the layout #1896 describes: three (x, y,
+slope) points come first, and the coefficient blocks follow them.
+
+| Offset | Values | Use |
+|---|---|---|
+| +0x70 | 3 × f32 | Min point (x, y, slope) |
+| +0x7C | 3 × f32 | Mid point (x, y, slope) |
+| +0x88 | 3 × f32 | Max point (x, y, slope) |
+| +0x94 | 6 × f32 | Low coefficients |
+| +0xAC | 6 × f32 | High coefficients |
+
+The x of each point is the value the shader compares log10(input) against, so the 12-byte stride is measured. The
+role of the other two values in each triplet is #1896's reading. The non-`TonemapOnly` bakes don't read +0x70 to
++0xC3; their next values start at +0xC4.
+
+#### Correction to #1896
+
+#1896 says the bakes use a non-reference order. That is true only of the `TonemapOnly` bakes' second spline at
++0x70. The spline at +0x00, which every bake reads (the only one outside the `TonemapOnly` bakes), is in the reference
+CTL order. The RRT spline isn't in the constant buffer at all. The +0x13C switch picks between a per-channel curve and
+one that also uses luminance; it doesn't decide whether the curve applies.
+
+## Sky passes (`sky_scattering`, `scattering_transmittance_system`)
+
+Reported by @Silliana in [#1897](https://github.com/ItsNotRexed/Leonida/issues/1897). This is a physically based
+atmosphere: two lookup tables are built at runtime and the sky passes sample them. Neither table is a texture on
+disk.
+
+### Order
+
+| Pass | Samples | Writes |
+|---|---|---|
+| `sky_scattering:CS_Transmittance` | nothing | one 2D storage image |
+| `sky_scattering:CS_MultipleScattering` | one 2D texture | one 2D storage image (of two, see below) |
+| `scattering_transmittance_system:CS_SkyAtmosphereLUT` | two 2D textures | three 2D storage images |
+| `sky_scattering:CS_SkyView` | two 2D textures | two 2D storage images (of four, see below) |
+
+`CS_Transmittance` reads no texture, so it goes first. `CS_MultipleScattering` samples one texture, the
+transmittance table #1897 names, so it runs second and not side by side with `CS_Transmittance`. `CS_SkyView` and
+`CS_SkyAtmosphereLUT` each sample two textures, the two tables, and run after both. Every sample is `image_sample_lz`
+(mip 0). Which texture is bound to which table comes from #1897, not from the program. If a sky pass runs before the
+tables are built, it reads whatever is in them, and the black or noisy sky looks like a translator bug.
+
+### The dword at +0xD0: output format, not an enable
+
+#1897 reports a SkyView dword that skips the stores when it is zero. In `CS_SkyView` and `CS_MultipleScattering`
+the dword at **+0xD0** of the pass's constant buffer is compared as a float with 0.0. Both outcomes store, but to
+different descriptors:
+
+| +0xD0 | `CS_SkyView` writes | `CS_MultipleScattering` writes |
+|---|---|---|
+| non-zero | RGB9E5 bits to the images at table +0x40 and +0x80 | RGB9E5 bits to the image at table +0x40 |
+| zero | float RGB (alpha 0) to the images at table +0x60 and +0xA0 | float RGB (alpha 1.0) to the image at table +0x60 |
+
+So a zero dword gives a black sky without an error if only the RGB9E5 images are bound: the stores go to the other
+pair of descriptors. Because the test is a float compare, write a float such as 1.0f there. An integer 1 is a
+denormal and compares equal to 0.0 if denormals are flushed. This is a hypothesis that depends on the program's float
+mode, which isn't checked here.
+
+### RGB9E5 output
+
+On the non-zero path both programs pack RGB9E5 themselves: they clamp each channel to [0, 65408], take the shared
+exponent from the largest, put R, G and B in bits 0–8, 9–17 and 18–26 and the exponent in 27–31. They then write the
+same 32-bit word to all four components of the storage image. The data is useless read back as floats, as #1897
+says. The layer's UAV path for `R9G9B9E5_SHAREDEXP` already covers this: on a GPU without native RGB9E5 storage it
+binds an `R32_UINT` storage view ([`d3d12_vulkan.md`](d3d12_vulkan.md), from #1375 and #1388).
+`CS_Transmittance` and `CS_SkyAtmosphereLUT` contain no RGB9E5 packing.
