@@ -298,6 +298,27 @@ Hash-only or opaque:
   this package are the loose RDS5 pools under `data/ttdb` plus `textures.rpf`, so placement records do not
   carry texture names, only material/asset keys in the model resources.
 
+## Location, interior, river and road names (`GameShape__Data__LocationNameLoopkup`)
+
+The place names shown to the player come from one `GameShape__Data__LocationNameLoopkup` XML document in
+`common.rpf` (the root name keeps its `Loopkup` spelling). Counts only; no names or keys.
+
+| Section | Items | Content |
+|---|---:|---|
+| `LocationNames/Item key=...` | 2,318 | `Name` (empty in 382); 46 items also name a `TextureDictionary` (2 distinct) and a `Texture` (46 distinct) |
+| `InteriorNames/Item key=...` | 1,358 | 2,280 inner `Item`s, each `Name` (empty in 434) and `Pos` (`x y z`); 1 position in 1,192 interiors, 2 or more in the other 166 |
+| `RiverNames/Item key=...` | 66 | the name as item text |
+| `RoadNames/Item key=...` | 409 | `Name` |
+
+- Keys are plain text, distinct within each section, and no key is shared between the location, river and road
+  sections.
+- **All 2,280 interior positions lie inside the world rectangle** shared by the `PAMH` heightmap and the region
+  tint map (x -13,312..5,120, y -9,728..11,264); none is at the origin. Heights run from -78 to 821 (median 5).
+- None of the keys is an archive entry name or the joaat of a model archetype name in the local catalog, the two
+  texture-dictionary names match archive entries but not `.ytd` ones, so the keys are their own namespace (probably shape
+  or zone ids resolved elsewhere at runtime; not measured). The 46 textures match no texture-dictionary item
+  in the catalog either.
+
 ## What a runtime needs
 
 1. **RPF9 page reader.** Read the `9FPR` header; the data area starts at the u32 at +0x04. Streams start on a

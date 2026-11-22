@@ -71,6 +71,52 @@ class AuditShader4RegsTests(unittest.TestCase):
             for limit, count in ((None, 2), (0, 0), (1, 1)):
                 self.assertEqual(audit_mod.audit(disasm, limit=limit)["cs"]["count"], count)
 
+    def test_bad_input_and_output_paths_are_one_error_line(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            disasm = os.path.join(tmp, "disasm")
+            os.mkdir(disasm)
+            with open(os.path.join(disasm, "cs_sample.s"), "w", encoding="utf-8") as f:
+                f.write("\ts_endpgm\n")
+            plain_file = os.path.join(tmp, "not-a-folder.bin")
+            with open(plain_file, "wb") as f:
+                f.write(b"RPF9")
+            missing = os.path.join(tmp, "missing")
+            a_folder = os.path.join(tmp, "out-folder")
+            os.mkdir(a_folder)
+
+            def run(argv):
+                out, err = io.StringIO(), io.StringIO()
+                with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                    rc = audit_mod.main(argv)
+                return rc, out.getvalue(), err.getvalue()
+
+            for argv, needle in (
+                ([missing], "no such folder"),
+                ([plain_file], "not a folder"),
+                ([disasm, "--fssm", missing], "--fssm"),
+                ([disasm, "--dxbc", plain_file], "--dxbc"),
+            ):
+                rc, stdout, stderr = run(argv)
+                self.assertEqual(rc, 2, argv)
+                self.assertEqual(stdout, "", argv)
+                self.assertEqual(len(stderr.splitlines()), 1, argv)
+                self.assertIn(needle, stderr, argv)
+
+            # The report's folder is created, so a finished audit is not lost.
+            out_json = os.path.join(tmp, "nested", "deeper", "report.json")
+            rc, stdout, stderr = run([disasm, "--json", out_json])
+            self.assertEqual((rc, stderr), (0, ""))
+            self.assertIn("wrote ", stdout)
+            with open(out_json, encoding="utf-8") as f:
+                self.assertEqual(json.load(f)["cs"]["count"], 1)
+
+            # A report path that cannot be written is one line, not a traceback.
+            rc, stdout, stderr = run([disasm, "--json", a_folder])
+            self.assertEqual(rc, 1)
+            self.assertEqual(len(stderr.splitlines()), 1)
+            self.assertIn("cannot write", stderr)
+            self.assertTrue(os.path.isdir(a_folder))
+
     def test_synthetic_cs_ms_gs_audit_and_s3_patterns(self):
         with tempfile.TemporaryDirectory() as tmp:
             disasm = os.path.join(tmp, "disasm")

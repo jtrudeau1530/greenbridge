@@ -1493,24 +1493,29 @@ public:
                 families(info.physical, &count, nullptr);
                 std::vector<VkQueueFamilyProperties> queues(count);
                 families(info.physical, &count, queues.data());
-                if (info.queue_family < count && (queues[info.queue_family].queueFlags & VK_QUEUE_COMPUTE_BIT))
+                if (info.queue_family < count && (queues[info.queue_family].queueFlags & VK_QUEUE_COMPUTE_BIT)) {
                     state_.context->configure_predication(get_device, state_.memory, limits.limits.maxStorageBufferRange, info.queue_family);
+                    if (info.storage_buffer_8bit) state_.context->configure_predicated_copy(get_device, limits.limits);
+                }
             }
         }
         if (info.host_image_copy) load_host_image_copy(get_device);
         // The copies of a D24 texture stored as D32 convert on the GPU (vulkan_depth24.h).
-        std::uint64_t max_storage_range = 1u << 27;  // the least Vulkan allows, if the limit cannot be read
-        if (info.physical && info.get_instance_proc) {
-            if (const auto get_props = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(
-                    info.get_instance_proc(info.instance, "vkGetPhysicalDeviceProperties"))) {
-                VkPhysicalDeviceProperties props{};
-                get_props(info.physical, &props);
-                max_storage_range = props.limits.maxStorageBufferRange;
+        // Only enable the converter when the GPU lacks native D24_UNORM_S8_UINT support.
+        if (!state_.depth_usable(VK_FORMAT_D24_UNORM_S8_UINT)) {
+            std::uint64_t max_storage_range = 1u << 27;  // the least Vulkan allows, if the limit cannot be read
+            if (info.physical && info.get_instance_proc) {
+                if (const auto get_props = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(
+                        info.get_instance_proc(info.instance, "vkGetPhysicalDeviceProperties"))) {
+                    VkPhysicalDeviceProperties props{};
+                    get_props(info.physical, &props);
+                    max_storage_range = props.limits.maxStorageBufferRange;
+                }
             }
+            state_.context->enable_depth24(get_device, [this](const VkMemoryRequirements& requirements) {
+                return state_.allocate(requirements, 0, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+            }, max_storage_range);
         }
-        state_.context->enable_depth24(get_device, [this](const VkMemoryRequirements& requirements) {
-            return state_.allocate(requirements, 0, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-        }, max_storage_range);
         if (info.bindless && state_.context->loaded() && !create_bindless(get_device))
             std::fprintf(stderr, "[rt] d3d12: the bindless set 0 could not be created\n");
         query_luid_and_clock(get_device);
@@ -3694,6 +3699,8 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     enable12.separateDepthStencilLayouts = VK_TRUE;
     info.buffer_device_address = chosen12.bufferDeviceAddress == VK_TRUE;
     enable12.bufferDeviceAddress = info.buffer_device_address ? VK_TRUE : VK_FALSE;
+    info.storage_buffer_8bit = chosen12.storageBuffer8BitAccess == VK_TRUE;
+    enable12.storageBuffer8BitAccess = info.storage_buffer_8bit;
     // Where the GPU has them: what the bindless set 0 needs (VulkanDeviceInfo::bindless), and the sampler features
     // D3D12 samplers can ask for.
     info.bindless = chosen12.runtimeDescriptorArray && chosen_features.shaderSampledImageArrayDynamicIndexing &&

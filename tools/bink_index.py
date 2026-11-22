@@ -282,6 +282,16 @@ def write_json(path, target, rows, summary, probe):
                   fh, indent=1)
 
 
+def same_output_path(first, second):
+    """True when writing ``second`` would truncate ``first`` (same file, path or hard link)."""
+    if os.path.normcase(os.path.realpath(first)) == os.path.normcase(os.path.realpath(second)):
+        return True
+    try:
+        return os.path.samefile(first, second)
+    except OSError:
+        return False
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("target", help="an .rpf archive, a .bk2 file, or a directory")
@@ -289,6 +299,8 @@ def main(argv=None):
     ap.add_argument("--format", choices=["csv", "json"], help="inferred from --out if omitted")
     ap.add_argument("--probe", action="store_true", help="run ffprobe on each stream")
     a = ap.parse_args(argv)
+    if a.out and same_output_path(a.target, a.out):
+        ap.error("--out must not overwrite the source")
     if not os.path.exists(a.target):
         print(f"bink_index: error: {a.target}: no such file or directory", file=sys.stderr)
         return 2
