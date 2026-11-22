@@ -344,19 +344,21 @@ int main() {
         check(rt::d3d12_xs::device_slot_first_call_seen(62), "slot 62 first-call flag is set");
 
         // Slot 67: Xbox native compute pipeline creation. Maps the console descriptor (+0x00 root signature,
-        // +0x28 code blob, +0x30 code size) to D3D12_COMPUTE_PIPELINE_STATE_DESC and calls CreateComputePipelineState.
+        // +0x28 kind 6 code blob, +0x30 code size) to D3D12_COMPUTE_PIPELINE_STATE_DESC and calls CreateComputePipelineState.
         struct XboxNativeComputeDesc {
             ID3D12RootSignature* root_signature;
-            const void* ptr1;
-            std::uint64_t size1;
-            const void* ptr2;
-            std::uint64_t size2;
-            const void* code;
-            std::uint64_t code_size;
+            const void* kind0;
+            std::uint64_t kind0_size;
+            const void* kind1;
+            std::uint64_t kind1_size;
+            const void* kind6;
+            std::uint64_t kind6_size;
+            const void* kind7;
+            std::uint64_t kind7_size;
         } xbox_desc{};
         xbox_desc.root_signature = root_signature.Get();
-        xbox_desc.code = bytecode->GetBufferPointer();
-        xbox_desc.code_size = bytecode->GetBufferSize();
+        xbox_desc.kind6 = bytecode->GetBufferPointer();
+        xbox_desc.kind6_size = bytecode->GetBufferSize();
 
         using XboxCreateNativeComputePsoFn = HRESULT(WINAPI*)(void*, const void*, const IID*, void**);
         auto create_native_pso = reinterpret_cast<XboxCreateNativeComputePsoFn>(proxy_vtbl[67]);

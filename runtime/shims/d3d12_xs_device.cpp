@@ -981,12 +981,13 @@ HRESULT proxy_create_compute_pipeline_state(DeviceProxy* self, const D3D12_COMPU
     return self->real->CreateComputePipelineState(desc, *riid, out);
 }
 
-// The Xbox slot 67 creates a compute pipeline from native GPU code: (desc, riid, out). Measured on
-// amd_fidelityfx_upscaler_xbox.dll (call at RVA 0x56d9): the root signature is at +0x00, two metadata pointers
-// with sizes at +0x08..+0x20, and the shader code blob at +0x28 with its byte size at +0x30. Translates the
-// console description to a standard D3D12_COMPUTE_PIPELINE_STATE_DESC and routes it to CreateComputePipelineState
-// on the PC device (slot 11), which on the Vulkan device resolves through the translator. The PC slot 67 is
-// CreateProtectedResourceSession1, a different method.
+// The Xbox slot 67 creates a compute pipeline from native GPU code: (desc, riid, out), named
+// DeserializeComputePipelineStateX in amd_fidelityfx_upscaler_xbox.dll's messages (call at RVA 0x56d9). The desc
+// passes the root signature at +0x00, followed by pointer/size pairs for the shader's FSPX entries (docs/fspx.md):
+// kind 0 (dispatch state) at +0x08/+0x10, kind 1 at +0x18/+0x20, kind 6 (the RDNA2 program) at +0x28/+0x30, and
+// kind 7 (records) at +0x38/+0x40. Translates the console description to a standard D3D12_COMPUTE_PIPELINE_STATE_DESC
+// with CS bytecode pointing at kind 6 and routes it to CreateComputePipelineState on the PC device (slot 11), which
+// on the Vulkan device resolves through the translator. The PC slot 67 is CreateProtectedResourceSession1.
 HRESULT proxy_create_compute_pipeline_from_native_code(DeviceProxy* self, const void* desc,
                                                        const IID* riid, void** out) {
     note_slot(67);
@@ -995,33 +996,39 @@ HRESULT proxy_create_compute_pipeline_from_native_code(DeviceProxy* self, const 
     if (!desc) return E_INVALIDARG;
     if (!riid) return E_POINTER;
 
+    // FSPX description layout (docs/fspx.md §How the DLL reads it):
     struct XboxNativeComputePipelineStateDesc {
-        ID3D12RootSignature* root_signature;
-        const void* ptr1;
-        std::uint64_t size1;
-        const void* ptr2;
-        std::uint64_t size2;
-        const void* code;
-        std::uint64_t code_size;
+        ID3D12RootSignature* root_signature;  // +0x00
+        const void* kind0;                    // +0x08: dispatch state
+        std::uint64_t kind0_size;             // +0x10: 28 bytes
+        const void* kind1;                    // +0x18: unknown
+        std::uint64_t kind1_size;             // +0x20: 20 bytes
+        const void* kind6;                    // +0x28: RDNA2 program code
+        std::uint64_t kind6_size;             // +0x30: program size in bytes
+        const void* kind7;                    // +0x38: resource/hash records
+        std::uint64_t kind7_size;             // +0x40: records size in bytes
     };
     const auto* xbox_desc = static_cast<const XboxNativeComputePipelineStateDesc*>(desc);
 
-    if (xbox_desc->ptr1 || xbox_desc->size1 || xbox_desc->ptr2 || xbox_desc->size2) {
+    if (xbox_desc->kind0 || xbox_desc->kind0_size || xbox_desc->kind1 || xbox_desc->kind1_size ||
+        xbox_desc->kind7 || xbox_desc->kind7_size) {
         static std::atomic<bool> logged{false};
         if (!logged.exchange(true, std::memory_order_relaxed)) {
             std::fprintf(stderr,
-                         "[rt] d3d12_xs: slot 67 metadata ptrs/sizes 0x%llx (0x%llx), 0x%llx (0x%llx)\n",
-                         static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(xbox_desc->ptr1)),
-                         static_cast<unsigned long long>(xbox_desc->size1),
-                         static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(xbox_desc->ptr2)),
-                         static_cast<unsigned long long>(xbox_desc->size2));
+                         "[rt] d3d12_xs: slot 67 FSPX metadata: kind0 0x%llx (%llu B), kind1 0x%llx (%llu B), kind7 0x%llx (%llu B)\n",
+                         static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(xbox_desc->kind0)),
+                         static_cast<unsigned long long>(xbox_desc->kind0_size),
+                         static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(xbox_desc->kind1)),
+                         static_cast<unsigned long long>(xbox_desc->kind1_size),
+                         static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(xbox_desc->kind7)),
+                         static_cast<unsigned long long>(xbox_desc->kind7_size));
         }
     }
 
     D3D12_COMPUTE_PIPELINE_STATE_DESC pc_desc{};
     pc_desc.pRootSignature = xbox_desc->root_signature;
-    pc_desc.CS.pShaderBytecode = xbox_desc->code;
-    pc_desc.CS.BytecodeLength = static_cast<SIZE_T>(xbox_desc->code_size);
+    pc_desc.CS.pShaderBytecode = xbox_desc->kind6;
+    pc_desc.CS.BytecodeLength = static_cast<SIZE_T>(xbox_desc->kind6_size);
     pc_desc.NodeMask = 0;
     pc_desc.CachedPSO = {nullptr, 0};
     pc_desc.Flags = D3D12_PIPELINE_STATE_FLAG_NONE;
