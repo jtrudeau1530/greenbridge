@@ -34,8 +34,12 @@
 
 namespace {
 
+// A windowed run is often started by double-click, where a console line vanishes with its window: say it in a box.
+bool g_windowed = false;
+
 [[noreturn]] void fatal(const std::string& what) {
     std::fprintf(stderr, "FAIL %s\n", what.c_str());
+    if (g_windowed) MessageBoxA(nullptr, what.c_str(), "bink_play", MB_OK | MB_ICONERROR);
     std::exit(1);
 }
 
@@ -209,8 +213,16 @@ int main(int argc, char** argv) {
             return 2;
         }
     }
+    g_windowed = !headless;
     if (game_dir_arg.empty() || movie_arg.empty()) {
         std::printf("SKIP (no package/movie)\n");
+        if (g_windowed)
+            MessageBoxA(nullptr,
+                        "bink_play needs a movie and the game folder:\n\n"
+                        "  bink_play <movie.bk2 | movies.rpf@OFFSET> --game-dir <package folder>\n\n"
+                        "To play a movie by name, use tools\\bink_play.py (or play_movie.bat):\n"
+                        "  python tools\\bink_play.py stinger --game-dir <package folder>",
+                        "bink_play", MB_OK | MB_ICONINFORMATION);
         return 77;
     }
     const std::filesystem::path game_dir = game_dir_arg;
