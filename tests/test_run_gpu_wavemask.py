@@ -60,7 +60,7 @@ class WavemaskInTheSuite(unittest.TestCase):
     def test_one_run_and_one_row(self):
         compute_runs = []
 
-        def fake_run_cmd(cmd, env=None):
+        def fake_run_cmd(cmd, env=None, gpu=True):
             if cmd[0] == sys.executable:                    # the translator: leave the .spv it would write
                 Path(cmd[cmd.index("--out") + 1], "cs_wavemask.spv").touch()
                 return 0, ""
