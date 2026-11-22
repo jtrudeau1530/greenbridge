@@ -77,6 +77,19 @@ HWND create_test_window(int width, int height) {
                            nullptr);
 }
 
+// Native DXGI on NVIDIA and WARP reports DISJOINT once after creation or ResizeBuffers, including when the
+// first query follows a Present. A null output must not consume that notification (D3D-211).
+bool check_statistics_disjoint(IDXGISwapChain* swapchain) {
+    if (swapchain->GetFrameStatistics(nullptr) != DXGI_ERROR_INVALID_CALL) return false;
+    DXGI_FRAME_STATISTICS stats;
+    std::memset(&stats, 0xcd, sizeof(stats));
+    if (swapchain->GetFrameStatistics(&stats) != DXGI_ERROR_FRAME_STATISTICS_DISJOINT) return false;
+    if (stats.PresentCount || stats.PresentRefreshCount || stats.SyncRefreshCount ||
+        stats.SyncQPCTime.QuadPart || stats.SyncGPUTime.QuadPart)
+        return false;
+    return swapchain->GetFrameStatistics(&stats) == S_OK;
+}
+
 }  // namespace
 
 int main() {
@@ -269,6 +282,8 @@ int main() {
     IDXGISwapChain3* sc = nullptr;
     if (FAILED(sc1->QueryInterface(IID_PPV_ARGS(&sc))) || !sc) return fail("QI IDXGISwapChain3");
     sc1->Release();
+
+    if (!check_statistics_disjoint(sc)) return fail("initial frame-statistics disjoint notification");
 
     ID3D12CommandQueue* got_queue = nullptr;
     if (FAILED(sc->GetDevice(IID_PPV_ARGS(&got_queue))) || got_queue != queue) {
@@ -555,13 +570,14 @@ int main() {
         if (sc->GetLastPresentCount(nullptr) != E_INVALIDARG)
             return fail("GetLastPresentCount(nullptr) should return E_INVALIDARG");
 
+        if (!check_statistics_disjoint(sc)) return fail("post-resize frame-statistics disjoint notification");
         DXGI_FRAME_STATISTICS stats{};
         if (FAILED(sc->GetFrameStatistics(&stats)) || stats.PresentCount != count_before ||
             stats.PresentRefreshCount != count_before || stats.SyncRefreshCount != count_before ||
             stats.SyncQPCTime.QuadPart == 0)
             return fail("GetFrameStatistics values");
-        if (sc->GetFrameStatistics(nullptr) != E_INVALIDARG)
-            return fail("GetFrameStatistics(nullptr) should return E_INVALIDARG");
+        if (sc->GetFrameStatistics(nullptr) != DXGI_ERROR_INVALID_CALL)
+            return fail("GetFrameStatistics(nullptr) should return DXGI_ERROR_INVALID_CALL");
     }
 
     // SwapChain::GetParent and non-waitable SetMaximumFrameLatency/GetMaximumFrameLatency (host DXGI returns
@@ -779,6 +795,7 @@ int main() {
             return fail("Present(1, ALLOW_TEARING) should return DXGI_ERROR_INVALID_CALL");
         if (FAILED(wsc->Present(0, DXGI_PRESENT_ALLOW_TEARING)))
             return fail("Present(0, ALLOW_TEARING) on untouched 10-bit offscreen swapchain failed");
+        if (!check_statistics_disjoint(wsc)) return fail("first statistics query after Present should be disjoint");
         if (WaitForSingleObject(waitable, 5000) != WAIT_OBJECT_0)
             return fail("Post-Present WaitForSingleObject on waitable swapchain failed");
         CloseHandle(waitable);
