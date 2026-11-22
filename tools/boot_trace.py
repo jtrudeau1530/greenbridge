@@ -3,8 +3,11 @@
 The loader writes the startup trace with `gta6rt --trace FILE` (one JSON object per line, flushed per event so it
 survives a crash; `runtime/README.md`, "Startup trace"), and the D3D12 proxy writes one `[d3d12-trace] #<seq>
 <method> <outcome>` line to stderr with `--trace-d3d12`. This tool turns both into the small report a first-boot
-triage needs: modules, imports, unimplemented calls and their callers, DllMain/TLS results, exceptions and the
-exit, then the D3D12 calls by outcome and the first call per method.
+triage needs: modules, unimplemented calls and their callers, DllMain/TLS results, exceptions and the exit, then
+the D3D12 calls by outcome and the first call per method.
+
+The method field can contain spaces (`SetMarker/BeginEvent with unknown metadata`), so the parser takes the
+outcome as the last field instead of assuming a single-word method.
 
 Usage:
     python -I boot_trace.py boot.jsonl [--d3d12 d3d12.log] [--json] [--limit N]
@@ -24,11 +27,30 @@ import json
 import re
 import sys
 
-D3D12_LINE = re.compile(r"^\[d3d12-trace\] #(\d+) (\S+) (\S+)\s*$")
+D3D12_LINE = re.compile(r"^\[d3d12-trace\] #(\d+) (.+) (\S+)\s*$")
 
 
 class TraceError(ValueError):
     """The file is unreadable or holds no valid trace event."""
+
+
+def _open_text(path: str):
+    """Open a trace as UTF-8, naming the one encoding trap before any line is parsed."""
+    try:
+        with open(path, "rb") as raw:
+            head = raw.read(3)
+    except OSError as e:
+        raise TraceError(f"cannot read {path}: {e.strerror or e}") from e
+    if head[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        raise TraceError(
+            f"{path} is UTF-16, which PowerShell 5.1 writes for `2>`; "
+            "use `2>&1 | Out-File -Encoding utf8` for the d3d12 log"
+        )
+    encoding = "utf-8-sig" if head == b"\xef\xbb\xbf" else "utf-8"
+    try:
+        return open(path, encoding=encoding, errors="replace")
+    except OSError as e:
+        raise TraceError(f"cannot read {path}: {e.strerror or e}") from e
 
 
 def parse_startup(path: str, limit: int = 10) -> dict:
@@ -52,11 +74,7 @@ def parse_startup(path: str, limit: int = 10) -> dict:
         "error": None,
     }
     seen_imports = set()
-    try:
-        fh = open(path, encoding="utf-8", errors="replace")  # noqa: SIM115 - closed by the with below
-    except OSError as e:
-        raise TraceError(f"cannot read {path}: {e.strerror or e}") from e
-    with fh:
+    with _open_text(path) as fh:
         for number, line in enumerate(fh, 1):
             line = line.strip()
             if not line:
@@ -143,13 +161,10 @@ def parse_d3d12(path: str, limit: int = 10) -> dict:
         "first": {},
         "failed": [],
         "unsupported": [],
+        "refused": [],
         "last_seq": 0,
     }
-    try:
-        fh = open(path, encoding="utf-8", errors="replace")  # noqa: SIM115 - closed by the with below
-    except OSError as e:
-        raise TraceError(f"cannot read {path}: {e.strerror or e}") from e
-    with fh:
+    with _open_text(path) as fh:
         for line in fh:
             match = D3D12_LINE.match(line.rstrip("\n"))
             if not match:
@@ -163,10 +178,15 @@ def parse_d3d12(path: str, limit: int = 10) -> dict:
             if method not in trace["first"]:
                 trace["methods"].append(method)
                 trace["first"][method] = {"seq": seq, "outcome": outcome}
-            if outcome in ("failed", "unsupported"):
+            if outcome in ("failed", "unsupported", "refused"):
                 bucket = trace[outcome]
                 if len(bucket) < limit:
                     bucket.append({"seq": seq, "method": method})
+    if trace["calls"] == 0:
+        raise TraceError(
+            f"{path} has no [d3d12-trace] line among {trace['ignored_lines']} line(s); "
+            "is it the stderr log of a --trace-d3d12 run, with the Vulkan device enabled?"
+        )
     return trace
 
 
@@ -209,7 +229,7 @@ def format_text(summary: dict, limit: int) -> str:
                 f"{dll} {count}"
                 for dll, count in sorted(startup["unimplemented_by_dll"].items())
             )
-            out.append(f"  by dll: {by_dll}")
+            out.append(f"  by dll (unique imports): {by_dll}")
         else:
             out.append("  unimplemented: none")
         if startup["debug_strings"]:
@@ -217,8 +237,14 @@ def format_text(summary: dict, limit: int) -> str:
         if startup["exception_count"]:
             out.append(f"  exceptions: {startup['exception_count']}")
             for exc in startup["exceptions"][:limit]:
-                extra = f" ({exc['cpp']})" if exc["cpp"] else ""
-                out.append(f"    code {exc['code']} at {exc['at']}{extra}")
+                cpp = exc.get("cpp")
+                detail = " (C++ throw)" if cpp is True else f" ({cpp})" if cpp else ""
+                if exc.get("access"):
+                    detail += f" ({exc['access']}"
+                    if exc.get("address"):
+                        detail += f" {exc['address']}"
+                    detail += ")"
+                out.append(f"    code {exc['code']} at {exc['at']}{detail}")
                 if exc.get("stack"):
                     out.append(f"      stack: {_tail(exc['stack'], limit)}")
         if startup["error"]:
@@ -231,6 +257,7 @@ def format_text(summary: dict, limit: int) -> str:
         outcomes = ", ".join(f"{k} {v}" for k, v in sorted(d3d12["outcomes"].items()))
         out.append(
             f"  {d3d12['calls']} call(s), {d3d12['ignored_lines']} other line(s)"
+            " (the [rt] diagnostics are not summarized)"
             + (f": {outcomes}" if outcomes else "")
         )
         if d3d12["methods"]:
@@ -241,6 +268,9 @@ def format_text(summary: dict, limit: int) -> str:
         if d3d12["failed"]:
             failed = [f"#{c['seq']} {c['method']}" for c in d3d12["failed"]]
             out.append(f"  failed: {_tail(failed, limit)}")
+        if d3d12["refused"]:
+            refused = [f"#{c['seq']} {c['method']}" for c in d3d12["refused"]]
+            out.append(f"  refused: {_tail(refused, limit)}")
     return "\n".join(out)
 
 

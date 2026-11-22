@@ -69,7 +69,15 @@ STARTUP = [
         "address": "0x0",
         "stack": ["game.exe+0x40", "game.exe+0x120"],
     },
-    {"seq": 12, "kind": "exit", "code": 0},
+    {
+        "seq": 12,
+        "kind": "exception",
+        "code": "0xe06d7363",
+        "at": "game.exe+0x30",
+        "cpp": True,
+    },
+    {"seq": 13, "kind": "future_event", "detail": "a kind this version does not know"},
+    {"seq": 14, "kind": "exit", "code": 0},
 ]
 
 D3D12 = [
@@ -78,6 +86,10 @@ D3D12 = [
     "[d3d12-trace] #2 CreateCommandQueue failed",
     "[d3d12-trace] #3 Foo unsupported",
     "[d3d12-trace] #4 D3D12XboxCreateDevice ok",
+    "[d3d12-trace] #5 SetMarker/BeginEvent with unknown metadata unsupported",
+    "[d3d12-trace] #6 MapTiles refused",
+    "[d3d12-trace] #7 CreateRootSignature called",
+    "[d3d12-trace] #8 SetMarker ignored",
 ]
 
 
@@ -90,9 +102,13 @@ class BootTraceTests(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def write(self, path, events):
+    def write(self, path, events, newline="\n"):
+        with open(path, "w", encoding="utf-8", newline="") as f:
+            f.writelines(json.dumps(event) + newline for event in events)
+
+    def write_lines(self, path, lines):
         with open(path, "w", encoding="utf-8") as f:
-            f.writelines(json.dumps(event) + "\n" for event in events)
+            f.write("\n".join(lines) + "\n")
 
     def test_startup_summary(self):
         self.write(self.startup, STARTUP)
@@ -101,6 +117,7 @@ class BootTraceTests(unittest.TestCase):
         self.assertEqual(trace["events"], len(STARTUP))
         self.assertEqual(trace["bad_lines"], 0)
         self.assertEqual(trace["kinds"]["map"], 2)
+        self.assertEqual(trace["kinds"]["future_event"], 1)
         self.assertEqual([m["module"] for m in trace["modules"]], ["game.exe", "x.dll"])
         self.assertEqual(trace["tls_callbacks"], 1)
         self.assertEqual(
@@ -112,10 +129,11 @@ class BootTraceTests(unittest.TestCase):
         self.assertEqual(trace["unimplemented"][0]["caller"], "game.exe+0x10")
         self.assertEqual(trace["unimplemented_by_dll"], {"x.dll": 1, "y.dll": 1})
         self.assertEqual(trace["debug_strings"], 1)
-        self.assertEqual(trace["exception_count"], 1)
+        self.assertEqual(trace["exception_count"], 2)
         self.assertEqual(
             trace["exceptions"][0]["stack"], ["game.exe+0x40", "game.exe+0x120"]
         )
+        self.assertIs(trace["exceptions"][1]["cpp"], True)
         self.assertEqual(trace["exit"], 0)
 
     def test_debug_text_is_not_printed(self):
@@ -127,33 +145,79 @@ class BootTraceTests(unittest.TestCase):
     def test_truncated_line_is_counted_not_fatal(self):
         self.write(self.startup, STARTUP)
         with open(self.startup, "a", encoding="utf-8") as f:
-            f.write('{"seq": 13, "kind":')
+            f.write('{"seq": 15, "kind":')
         trace = bt.parse_startup(self.startup)
         self.assertEqual(trace["events"], len(STARTUP))
         self.assertEqual(trace["bad_lines"], 1)
         self.assertEqual(trace["bad_line_numbers"], [len(STARTUP) + 1])
 
+    def test_crlf_and_non_object_lines_are_counted(self):
+        self.write(
+            self.startup,
+            [
+                {"seq": 1, "kind": "trace_open", "pid": 7},
+                {"seq": 2, "kind": "exit", "code": 0},
+            ],
+            newline="\r\n",
+        )
+        with open(self.startup, "a", encoding="utf-8") as f:
+            f.write("null\n")
+        trace = bt.parse_startup(self.startup)
+        self.assertEqual(trace["events"], 2)
+        self.assertEqual(trace["bad_lines"], 1)
+
     def test_d3d12_summary(self):
-        with open(self.d3d12, "w", encoding="utf-8") as f:
-            f.write("\n".join(D3D12) + "\n")
+        self.write_lines(self.d3d12, D3D12)
         trace = bt.parse_d3d12(self.d3d12)
-        self.assertEqual(trace["calls"], 4)
+        self.assertEqual(trace["calls"], 8)
         self.assertEqual(trace["ignored_lines"], 1)
-        self.assertEqual(trace["outcomes"], {"ok": 2, "failed": 1, "unsupported": 1})
         self.assertEqual(
-            trace["methods"], ["D3D12XboxCreateDevice", "CreateCommandQueue", "Foo"]
+            trace["outcomes"],
+            {
+                "ok": 2,
+                "failed": 1,
+                "unsupported": 2,
+                "refused": 1,
+                "called": 1,
+                "ignored": 1,
+            },
+        )
+        self.assertEqual(
+            trace["methods"],
+            [
+                "D3D12XboxCreateDevice",
+                "CreateCommandQueue",
+                "Foo",
+                "SetMarker/BeginEvent with unknown metadata",
+                "MapTiles",
+                "CreateRootSignature",
+                "SetMarker",
+            ],
         )
         self.assertEqual(
             trace["first"]["D3D12XboxCreateDevice"], {"seq": 1, "outcome": "ok"}
         )
         self.assertEqual(trace["failed"], [{"seq": 2, "method": "CreateCommandQueue"}])
-        self.assertEqual(trace["unsupported"], [{"seq": 3, "method": "Foo"}])
-        self.assertEqual(trace["last_seq"], 4)
+        self.assertEqual(
+            trace["unsupported"],
+            [
+                {"seq": 3, "method": "Foo"},
+                {"seq": 5, "method": "SetMarker/BeginEvent with unknown metadata"},
+            ],
+        )
+        self.assertEqual(trace["refused"], [{"seq": 6, "method": "MapTiles"}])
+        self.assertEqual(trace["last_seq"], 8)
+
+    def test_d3d12_text_report_names_refused_and_spaced_methods(self):
+        self.write_lines(self.d3d12, D3D12)
+        text = bt.format_text(bt.summarize(None, bt.parse_d3d12(self.d3d12)), 10)
+        self.assertIn("refused: #6 MapTiles", text)
+        self.assertIn("#5 SetMarker/BeginEvent with unknown metadata", text)
+        self.assertIn("[rt] diagnostics are not summarized", text)
 
     def test_json_cli(self):
         self.write(self.startup, STARTUP)
-        with open(self.d3d12, "w", encoding="utf-8") as f:
-            f.write("\n".join(D3D12) + "\n")
+        self.write_lines(self.d3d12, D3D12)
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
             self.assertEqual(
@@ -161,13 +225,38 @@ class BootTraceTests(unittest.TestCase):
             )
         data = json.loads(out.getvalue())
         self.assertEqual(data["startup"]["pid"], 123)
-        self.assertEqual(data["d3d12"]["calls"], 4)
+        self.assertEqual(data["d3d12"]["calls"], 8)
 
     def test_missing_and_empty_files_are_errors(self):
-        self.assertEqual(bt.main([os.path.join(self.tmp.name, "missing.jsonl")]), 2)
-        open(self.startup, "w").close()
-        self.assertEqual(bt.main([self.startup]), 2)
-        self.assertEqual(bt.main(["--limit", "0", self.startup]), 2)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertEqual(bt.main([os.path.join(self.tmp.name, "missing.jsonl")]), 2)
+            open(self.startup, "w").close()
+            self.assertEqual(bt.main([self.startup]), 2)
+            self.assertEqual(bt.main(["--limit", "0", self.startup]), 2)
+        self.assertIn("cannot read", err.getvalue())
+
+    def test_d3d12_log_without_trace_lines_is_an_error(self):
+        self.write_lines(self.d3d12, ["[rt] one", "[rt] two"])
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertEqual(bt.main(["--d3d12", self.d3d12]), 2)
+        self.assertIn("no [d3d12-trace] line", err.getvalue())
+
+    def test_utf16_log_is_named_before_parsing(self):
+        with open(self.d3d12, "wb") as f:
+            f.write(b"\xff\xfe" + "[d3d12-trace] #1 Foo ok\n".encode("utf-16-le"))
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertEqual(bt.main(["--d3d12", self.d3d12]), 2)
+        self.assertIn("UTF-16", err.getvalue())
+
+    def test_utf8_bom_is_stripped(self):
+        with open(self.d3d12, "wb") as f:
+            f.write(b"\xef\xbb\xbf" + b"[d3d12-trace] #1 Foo ok\n")
+        trace = bt.parse_d3d12(self.d3d12)
+        self.assertEqual(trace["calls"], 1)
+        self.assertEqual(trace["methods"], ["Foo"])
 
     def test_text_report_has_the_triage_units(self):
         self.write(self.startup, STARTUP)
@@ -178,7 +267,10 @@ class BootTraceTests(unittest.TestCase):
             "dllmain: 1 ok, 1 failed",
             "unimplemented: 2 unique",
             "x.dll!Foo from game.exe+0x10",
-            "exceptions: 1",
+            "by dll (unique imports): x.dll 1, y.dll 1",
+            "exceptions: 2",
+            "code 0xc0000005 at game.exe+0x40 (read 0x0)",
+            "code 0xe06d7363 at game.exe+0x30 (C++ throw)",
             "stack: game.exe+0x40, game.exe+0x120",
             "exit: 0",
         ):
