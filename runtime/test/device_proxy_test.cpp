@@ -151,7 +151,7 @@ int main() {
     unsigned slots = rt::d3d12_xs::device_proxy_slot_count(device.Get());
     std::printf("proxy forwards %u PC vtable slots (ID3D12Device..Device14 max is 83)\n", slots);
     check(slots >= 44, "proxy forwards at least the base ID3D12Device vtable");
-    check(!rt::d3d12_xs::device_slot_overridden(9), "device slot 9 is forwarded (PC CreateCommandAllocator)");
+    check(rt::d3d12_xs::device_slot_overridden(9), "device slot 9 is CreateCommandAllocator (allocator proxies)");
     check(!rt::d3d12_xs::device_slot_overridden(10), "device slot 10 is forwarded (PC CreateGraphicsPipelineState)");
     check(rt::d3d12_xs::device_slot_overridden(14), "device slot 14 is the descriptor-heap override");
     check(rt::d3d12_xs::device_slot_overridden(62), "device slot 62 is the compute-PSO override");
@@ -278,6 +278,8 @@ int main() {
     ComPtr<ID3D12CommandAllocator> allocator;
     hr = device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(allocator.GetAddressOf()));
     check(SUCCEEDED(hr) && allocator != nullptr, "device slot 9 forwards CreateCommandAllocator");
+    // A PC runtime allocator is not wrapped: the PC runtime's lists could not resolve an allocator proxy.
+    check(!rt::d3d12_xs::is_allocator_proxy(allocator.Get()), "slot 9 hands out the PC allocator unwrapped");
     check(rt::d3d12_xs::device_slot_hits(9) == 1, "slot 9 hit counter is 1");
 
     // Slot 76: buffer resource with the measured Xbox layout word 0x101; PC committed resources take ROW_MAJOR.
