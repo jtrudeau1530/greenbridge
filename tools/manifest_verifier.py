@@ -61,10 +61,19 @@ def sha256_file(path: str, chunk_size: int = CHUNK) -> str:
     return h.hexdigest()
 
 
-def walk(target_dir: str):
-    """Yields (relative_path, absolute_path) for all files in target_dir using forward slashes."""
+def walk(target_dir: str, *, exclude: str | None = None):
+    """Yields (relative_path, absolute_path) using forward slashes, excluding the selected manifest."""
+    excluded_dir = excluded_name = None
+    if exclude is not None:
+        directory, name = os.path.split(os.path.abspath(exclude))
+        excluded_dir = os.path.normcase(os.path.realpath(directory))
+        excluded_name = os.path.normcase(name)
+
     for root, _, files in os.walk(target_dir):
+        contains_manifest = excluded_dir is not None and os.path.normcase(os.path.realpath(root)) == excluded_dir
         for name in sorted(files):
+            if contains_manifest and os.path.normcase(name) == excluded_name:
+                continue
             abs_p = os.path.join(root, name)
             rel_p = os.path.relpath(abs_p, target_dir).replace("\\", "/")
             yield rel_p, abs_p
@@ -177,7 +186,7 @@ def verify_manifest(
         raise ManifestError(f"target directory does not exist: {target_dir}")
 
     want = load_manifest(manifest_path)
-    have = dict(walk(target_dir))
+    have = dict(walk(target_dir, exclude=manifest_path))
     untracked = sorted(set(have.keys()) - set(want.keys()))
 
     problems: dict[str, str] = {}

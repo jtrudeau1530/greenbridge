@@ -5,7 +5,7 @@ the corpus is correct. The CPU differential oracle in `tools/shader_diff.py` is 
 tested (`tests/test_shader_diff.py`): it compares the ISA model in `tools/cpu_ref.py` against
 translated SPIR-V run in `tests/semantic/spirv_mini_interp.py` over seeded straight-line programs.
 Run it with `python -I tools/shader_diff.py --programs 200 --seed 7` (`--self-test` checks the
-harness itself). The GPU-side runner described below is still future work.
+harness itself). The GPU-side runners are described below: `tools/valu_fuzz.py` (16-bit and memory ops), `tools/lds_fuzz.py`, `tools/crosslane_fuzz.py` and `tools/cf_diff.py`.
 
 ## Why `spirv-val` is not enough
 
@@ -224,8 +224,9 @@ First results on an RX 6700 XT (RADV, Mesa 26.3.1), native wave64/wave32 and wit
   under a masked wave32 `ds_bpermute`, and with #253's translator all 480 programs (seeds 1 to 3,
   native and emulated) match.
 - **Everything else matches.** With `--no-exec bpermute`, 1,040 programs match (seeds 1 to 8).
-- **Not covered.** The translator rejects `ds_permute_b32` and the 8-bit d16 reads
-  (`ds_read_u8_d16[_hi]`, `ds_read_i8_d16[_hi]`), so the fuzzer leaves them out.
+- **Not covered.** The translator rejects the 8-bit d16 reads (`ds_read_u8_d16[_hi]`,
+  `ds_read_i8_d16[_hi]`), so the fuzzer leaves them out. It supports `ds_permute_b32` since SHADER-90,
+  but the fuzzer does not generate it yet (FUZZ-10).
 ### Memory instructions (`tools/mem_diff.py`, FUZZ-5)
 
 `cpu_ref.py` has no memory model, so memory instructions get their own runner. `tools/mem_diff.py`
@@ -249,19 +250,16 @@ fields the translator does not model yet, so they need a GPU-confirmed rule befo
 this. Not covered yet: images.
 
 The `buffer_format` family covers `buffer_load_format_*` on every format the translator decodes, with a
-random DST_SEL of 0/X/Y/Z/W, and `tbuffer_load_format_*` on the five formats the 1.0.2.1 corpus uses
+random DST_SEL of 0/1/X/Y/Z/W, and `tbuffer_load_format_*` on the five formats the 1.0.2.1 corpus uses
 (`16_16_SNORM`, `8_8_8_8_UNORM`, `8_8_8_8_UINT`, `2_10_10_10_UNORM`, `16_16_16_16_UINT`, about 53,000
 instructions) with an identity swizzle. Its reference decodes each element from the GFX10 format *name*
 (`tools/gfx10_formats.json`; channel widths listed from the top bit), not from the translator's own
-table: UNORM/SNORM correctly rounded, missing channels 0, 0, 0, 1. Elements are naturally aligned. Left
-out: DST_SEL 1 on integer formats, and whether `tbuffer` applies the V#'s DST_SEL (neither is measured).
+table: UNORM/SNORM correctly rounded (`x/(2ⁿ−1)`), missing channels *c* mod *n*, DST_SEL 1 = integer 1
+for UINT/SINT and 1.0f otherwise (SHADER-86, RX 6700). Elements are naturally aligned. Left out: whether
+`tbuffer` applies the V#'s DST_SEL (unmeasured).
 
-Two results are counted apart, not as mismatches, until a gfx10 hardware measurement settles them
-(posted in #374): `norm-ulp1`, a UNORM/SNORM result 1 ULP from the correctly rounded value (the
-translator multiplies by a rounded reciprocal), and `missing-w32`, the missing W of a 32-bit format,
-where the translator returns 0 and every other format 1 / 1.0. Over 5,000 programs, everything else
-matches; breaking the `16_16_SNORM` kind, the `8_8_8_8_UINT` widths or the DST_SEL order in the
-translator makes 33, 37 and 191 of 300 programs fail.
+Over 5,000 programs the reference and translator match bit for bit; breaking the `16_16_SNORM` kind, the
+`8_8_8_8_UINT` widths or the DST_SEL order in the translator makes 33, 37 and 191 of 300 programs fail.
 
 A mutation check (inst offset dropped, V# stride narrowed, the SMEM pointer's high word dropped) makes
 76, 45 and 42 of 150 programs fail, so the runner does catch address errors.
@@ -313,8 +311,12 @@ every scalar. `vk_compute_test` reads them back with `VKC_OUT_WORDS` / `VKC_DUMP
   EXEC constants only enable lanes that exist. Every mask register is zero-initialised, as compiled code does,
   so a branch that skips the `v_cmp` writing a mask leaves a defined mask after the join.
 - **Hypotheses are reported apart.** `v_permlane16/x16` with op_sel FI = 0 reading a lane that is off in
-  EXEC is modelled as the DPP "invalid source" case (vD kept). That isn't measured on AMD hardware, and the
-  translator always reads the lane. A program that hits it counts as `hyp_only`, not as a mismatch.
+  EXEC is modelled as the DPP "invalid source" case (vD kept). That is now measured, with the same result on both:
+  @aslan2142 on RDNA2 and @AlxcBTW on RDNA3.5 (#374). FI = 1 returns the source lane's value, FI = 0 leaves the
+  destination unwritten and FI = 0 with BOUND_CTRL gives 0; #580 (SHADER-74) makes the translator do that. The
+  fuzzer has not caught up: its docstring (`tools/crosslane_fuzz.py`) still calls the case unmeasured and
+  `op_permlane` still tags it `hyp`, so a program that hits it is filed as `hyp_only`, not as a mismatch, whatever
+  the translator does. The model (vD kept) already matches the measurement; dropping the tag is a follow-up.
   `--permlane-fetch-inactive` models FI = 1 instead.
 - **Modes.** Wave32 runs natively. Wave64 runs with `--wave64-emulate`; `--w64-native` adds the plain build,
   which on a 32-wide subgroup is the documented cross-half approximation and is expected to mismatch.
@@ -330,32 +332,7 @@ First results on an RTX 4090 (subgroup 32, driver 621.14):
   should be left unwritten (invalid source without `bound_ctrl`, or a lane off in `row_mask`/`bank_mask`), and
   DPP16 ignored `fi:1`. Each was confirmed with a hand-written program.
 - **Everything else matches.** On `main`, 1,000 programs (`--seed 8 --ops 28 --no-maskdata --no-w32-hi-lanes`, 500 wave32 native and 500 wave64 emulated) give 0 mismatches. 297 of them are `hyp_only` (permlane with FI = 0 and an inactive source), and with `--permlane-fetch-inactive` all 1,000 match. Native wave64 on the 32-wide card mismatches as documented: `s_bcnt1` of EXEC counts one half, and a `v_readlane` from the other half wraps.
-- **Open question (#374):** what hardware does for permlane with FI = 0 (see above). It needs a run on an AMD GPU.
-
-### 16-bit and memory ops on the GPU (`tools/valu_fuzz.py`, FUZZ-2, FUZZ-5)
-
-`tools/valu_fuzz.py --family f16|mem` uses the same runner shape as `lds_fuzz.py`. It generates seeded
-64-thread compute programs, translates them, runs them with `vk_compute_test`'s `VKC_DUMP`, and compares every
-thread's 16 result VGPRs (plus the scratch memory for `mem`) bit for bit with a model of the instructions written in
-the same file. The model doesn't import the translator. `tests/test_valu_fuzz.py` checks the models on the CPU:
-the f16/f32 rounding against Python's IEEE packers, signed zeros, the partial-write rules and out-of-range
-buffer accesses. If llvm-mc is present, it also checks that every family's
-programs assemble for gfx1013.
-
-- **`f16`**: f16 add/sub/mul/min/max/fma/fmac/med3, `v_cvt_f16_f32`/`v_cvt_f32_f16`/`v_cvt_pkrtz_f16_f32`,
-  `v_pk_*` (f16 and shifts) with `op_sel`/`op_sel_hi`, 16-bit integer ops and `v_pack_b32_f16`. It only uses
-  encodings `llvm-mc -mcpu=gfx1013` accepts: on GFX10 the VOP3 forms of the f16 VOP2 ops take no `op_sel`, and the
-  16-bit integer ops exist only as `op_sel` VOP3. Which form keeps the other half follows the 16-bit row of
-  `docs/design.md`. Results whose exact value is NaN, infinite or denormal, denormal inputs, and min/max of +0
-  against -0 are marked uncertain and not compared.
-- **`mem`**: raw (`offen` + `soffset` + offset) and structured (`idxen`) `buffer_load/store_dword` to `dwordx4`
-  through V#s built in SGPRs, with a random `num_records` so some threads are out of range (loads read 0, stores
-  are dropped). Each thread uses only its own 64-byte slot. Accesses are wholly in or out of range, because
-  multi-dword accesses straddling `num_records` are the known gap in "Buffer bounds checking". Byte/short buffer
-  loads and scalar loads aren't generated: the translator rejects the former, and SHADER-41 covers the latter.
-
-`--skip-op OP` (an op name) sets a known finding aside without changing the rest of the program.
-`--show SEED:INDEX:WAVE` prints a program and its model.
+- **Closed question (#374):** what hardware does for permlane with FI = 0 was measured on RDNA2 and RDNA3.5 (see above).
 
 ## Coverage plan and cost
 

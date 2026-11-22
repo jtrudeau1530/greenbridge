@@ -147,7 +147,11 @@ candidates in independent shards and:
    `0DRP` signature or unaligned zlib stream.
 
 Each shard is written to `shard_<index>_<start>_<end>.json`; `summary.json` and `maps.json` are
-rebuilt from the shards, so an interrupted run resumes with `--resume` or `--merge-only`.
+rebuilt from the shards. Keep the input stable during a run and use one census per output directory.
+Each shard records a local archive fingerprint based on file size, timestamps, filesystem identifiers
+and up to three 4 KiB samples. If filesystem identifiers are unavailable, the resolved path also
+contributes to the hash. Verifying every byte would require reading the whole archive. Copies or metadata changes can require a rescan. `--resume` rescans missing,
+older-format and mismatched shards. `--merge-only` reports their ranges as missing and exits 1.
 
 ```powershell
 python -I tools\world_census.py <levels.rpf> --out work\world\census --shard-size 2147483648 --jobs 12

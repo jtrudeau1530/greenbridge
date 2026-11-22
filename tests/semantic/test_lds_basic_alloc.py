@@ -79,7 +79,7 @@ def compute_lds_allocation(base_dwords, ds_instructions=None):
     if ds_instructions:
         for ins in ds_instructions:
             op = ins.get("op", "")
-            if not op.startswith("ds_") or op.startswith(("ds_swizzle", "ds_bpermute")):
+            if not op.startswith("ds_") or op.startswith(("ds_swizzle", "ds_bpermute", "ds_permute")):
                 continue
             for m in ins.get("mods", []):
                 k, _, v = m.partition(":")

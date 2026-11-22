@@ -66,7 +66,7 @@ static_assert(sizeof(DescriptorEntry) == 40);
 
 class DescriptorTable {
 public:
-    enum class InsertResult { added, unchanged, replaced };
+    enum class InsertResult { added, unchanged, replaced, added_with_relocation };
 
     explicit DescriptorTable(std::uint32_t initial_capacity = 16) {
         std::uint32_t cap = 16;
@@ -77,13 +77,13 @@ public:
 
     // Inserts or updates a key -> index mapping.
     // If the key already exists in one of the 8 probe slots, its index is updated.
-    // If insertion would exceed 8 probes or 50% load, the table grows and re-hashes.
+    // Try one bounded relocation before growing. Load never exceeds 50%.
     bool insert(const std::uint32_t key[8], std::uint32_t index) {
         insert_or_update(key, index);
         return true;
     }
 
-    // Report the change under the same lock as the insert, so callers can synchronize a replacement.
+    // Report the change under the same lock so the GPU caller can synchronize writes to live slots.
     InsertResult insert_or_update(const std::uint32_t key[8], std::uint32_t index) {
         std::lock_guard lock(mutex_);
         return insert_locked(key, index);
@@ -191,6 +191,27 @@ public:
     }
 
 private:
+    // All eight slots for the incoming key are occupied. Try moving one resident
+    // to the first empty slot beyond that window, within its own eight probes.
+    // A later hole is farther from every resident, so failure here is final for a single move.
+    static int make_probe_slot(std::vector<DescriptorEntry>& entries, std::uint32_t hash) {
+        const auto mask = static_cast<std::uint32_t>(entries.size() - 1);
+        for (auto offset = kDescriptorProbes; offset < 2 * kDescriptorProbes - 1; ++offset) {
+            const auto hole = (hash + offset) & mask;
+            if (entries[hole].pad == kSlotOccupiedMarker) continue;
+            for (auto k = kDescriptorProbes; k > 0; --k) {
+                const auto slot = (hash + k - 1) & mask;
+                const auto home = hash_descriptor_key(entries[slot].key);
+                if (((hole - home) & mask) < kDescriptorProbes) {
+                    entries[hole] = entries[slot];
+                    return static_cast<int>(slot); // caller immediately overwrites the resident
+                }
+            }
+            break;
+        }
+        return -1;
+    }
+
     InsertResult insert_locked(const std::uint32_t key[8], std::uint32_t index) {
         while (true) {
             const std::uint32_t h = hash_descriptor_key(key);
@@ -210,17 +231,22 @@ private:
                 }
             }
 
-            // Check if we can place in an empty slot without exceeding 50% load
-            if (empty_slot >= 0 && (occupied_count_ + 1) * 2 <= entries_.size()) {
+            if ((occupied_count_ + 1) * 2 > entries_.size()) {
+                grow_locked();
+                continue;
+            }
+
+            const bool relocate = empty_slot < 0;
+            if (relocate) empty_slot = make_probe_slot(entries_, h);
+            if (empty_slot >= 0) {
                 auto& entry = entries_[empty_slot];
                 std::memcpy(entry.key, key, sizeof(entry.key));
                 entry.index = index;
                 entry.pad = kSlotOccupiedMarker;
                 ++occupied_count_;
-                return InsertResult::added;
+                return relocate ? InsertResult::added_with_relocation : InsertResult::added;
             }
 
-            // Table is full (>50% load) or no slot found in 8 probes: grow and retry
             grow_locked();
         }
     }
@@ -269,19 +295,20 @@ private:
             for (const auto& old : entries_) {
                 if (old.pad != kSlotOccupiedMarker) continue;
                 const std::uint32_t h = hash_descriptor_key(old.key);
-                bool placed = false;
+                int slot = -1;
                 for (std::uint32_t k = 0; k < kDescriptorProbes; ++k) {
                     const std::uint32_t s = (h + k) & new_mask;
                     if (new_entries[s].pad != kSlotOccupiedMarker) {
-                        new_entries[s] = old;
-                        placed = true;
+                        slot = static_cast<int>(s);
                         break;
                     }
                 }
-                if (!placed) {
+                if (slot < 0) slot = make_probe_slot(new_entries, h);
+                if (slot < 0) {
                     rehash_ok = false;
                     break;
                 }
+                new_entries[slot] = old;
             }
 
             if (rehash_ok) {
