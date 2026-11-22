@@ -34,24 +34,39 @@ The decoded export used by the previews contains 13 parts:
 | eyecap | `…_head_fr1_lat_000_m_eyecap.#dr` | 214 | 304 | `0x5CE55BAA340248BD` (sRGB + alpha) |
 | hands | `hand_fr1_000_nude_cull.#dr` | 10,440 | 13,534 | unresolved — key does not decode here |
 | feet | `feet_fr1_000_full.#dr` | 2,309 | 4,082 | unresolved — key does not decode here |
-| body (legacy) | `cs_lucia_legacypedcs_fr1_000_fullbody_ws00_full.#dr` | 1,748 | 1,816 | `0x996FDBA2DB30CC12` |
+| body (legacy) | `cs_lucia_legacypedcs_fr1_000_fullbody_ws00_full.#dr` | 874 | 908 | `0x996FDBA2DB30CC12` |
 | legacy head | `cs_lucia_legacyheadcs_fr1_001_regular_ws00_full.#dr` | 592 | 1,028 | `0x707771F769AA3542` |
 | jacket (biker) | `cs_lucia_jacketbiker_fr1_000_regular_c_hl_long_full.#dr` | 9,818 | 10,837 | none — `speculartex` only (`0xF5073AA039BB3CED`) |
 | crop tee | `player_story000_00_tshirtcrop_fr1_001_slim_cc_un_long_full.#dr` | 4,932 | 6,756 | none — `speculartex` only (`0x46E8FA9436E9D43C`) |
 | bikini top | `brabikini_fr1_012_regular_ws00_full.#dr` | 6,547 | 5,697 | none / unverified — likely `speculartex` only (`0xDF3615ADFB1F4787`) |
 | undies | `undiesgstring_fr1_002_slim_hw_full.#dr` | 961 | 913 | none / unverified — likely `speculartex` only (`0xCFD339832A9C724A`) |
 
+### Higher-detail variants
+
+The rows above are the preview build, not the densest rows in the archive. LOD0 counts come from
+the manifests; "distinct" is unique vertex positions decoded from a GLB, which removes duplicate
+cull seams:
+
+| Component | Denser variant | LOD0 V / T | Distinct |
+|---|---|---:|---:|
+| jacket | `player_story000_00_jacketbiker_fr1_000_regular_o_hl_long_full` | 11,093 / 12,023 | 9,597 |
+| crop tee | `player_story000_00_tshirtcrop_fr1_001_slim_cc_un_long_cull_00` | 12,254 / 15,437 | 4,558 |
+| jeans | `player_story000_00_pantsjeans_fr1_002_regular_hw_mid_full` | 4,917 / 5,550 | 2,826 |
+| boots | `cs_roxy_bootsankle_fr1_000_mid_hh_full` | 7,764 / 7,960 | - |
+
+The library maximum for jeans is `pantsjeans_fr1_019_slim_mw_long_full` at 23,880 V / 25,230 T;
+that is a single 0.41 x 0.26 x 0.95 m mesh, but the raw count includes seams, so validate it
+visually. `_cull_00` variants can have more raw vertices and less surface than their `_full`
+sibling; compare distinct positions, not the manifest total.
+
 Two caveats that matter for any render:
 
 - **`body` is the shared player/cutscene body.** The only `lucia`-named full-body record in
-  `packs.rpf` is `cs_lucia_legacypedcs_fr1_000_fullbody_ws00_full` (874- and 640-vertex rows;
-  1,748 / 1,816 decoded). Its `FragName` is byte-identical to `cs_monalisa` and `cs_mandy`, so it
-  is the shared player/cutscene body, not a unique high-detail mesh. Do not present it as a
-  high-detail hero body.
-- **`body` is not a base body.** The only `lucia`-named full-body record in `packs.rpf` is the
-  `cs_lucia_legacypedcs` clothed legacy ped. The decoded part is 1,748 vertices / 1,816
-  triangles, and the manifest lists 874- and 640-vertex rows of the same drawable. Do not present
-  it as Lucia's hero body.
+  `packs.rpf` is `cs_lucia_legacypedcs_fr1_000_fullbody_ws00_full`. Its LOD0 is **874 vertices /
+  908 triangles** (468 distinct positions); the 1,748 / 1,816 figure is LOD0 + LOD1 counted
+  twice, and the 640-vertex row is LOD2. Its `FragName` is byte-identical to `cs_monalisa` and
+  `cs_mandy`, so it is the shared player/cutscene body, not a unique high-detail mesh. Do not
+  present it as a high-detail hero body.
 - **The head drawable has no material texture references**, but its face comes from a **head-skin
   preset** keyed by the head name's `joaat32` (see Textures).
 
