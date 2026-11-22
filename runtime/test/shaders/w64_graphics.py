@@ -372,6 +372,8 @@ def check(tools, spirv, name):
             for size, (words, heap) in runs.items():
                 if size == 64:
                     continue
+                if tier == "C" and comparable(name, ref_words, None) != comparable(name, words, None):
+                    return "a partition-invariant word differs from the 64-lane reference"
                 if tier == "C":
                     if comparable(name, ref_words, None) != comparable(name, words, None):
                         return "a word that must not depend on the partition differs from the 64-lane reference"
