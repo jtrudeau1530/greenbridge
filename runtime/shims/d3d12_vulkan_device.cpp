@@ -5783,12 +5783,12 @@ public:
                  prio->Priority != D3D12_COMMAND_QUEUE_PRIORITY_HIGH &&
                  prio->Priority != D3D12_COMMAND_QUEUE_PRIORITY_GLOBAL_REALTIME))
                 return d3d12_trace::result(method, E_INVALIDARG);
-            // Matches CreateCommandQueue: DIRECT/COMPUTE/COPY work at NORMAL or HIGH; GLOBAL_REALTIME is refused.
+            // DIRECT/COMPUTE/COPY report NORMAL only: all VkQueues share priority 1.0f (HIGH has no distinct scheduling)
+            // and GLOBAL_REALTIME is refused in CreateCommandQueue.
             const bool supported_type = prio->CommandListType == D3D12_COMMAND_LIST_TYPE_DIRECT ||
                                         prio->CommandListType == D3D12_COMMAND_LIST_TYPE_COMPUTE ||
                                         prio->CommandListType == D3D12_COMMAND_LIST_TYPE_COPY;
-            const bool supported_priority = prio->Priority == D3D12_COMMAND_QUEUE_PRIORITY_NORMAL ||
-                                            prio->Priority == D3D12_COMMAND_QUEUE_PRIORITY_HIGH;
+            const bool supported_priority = prio->Priority == D3D12_COMMAND_QUEUE_PRIORITY_NORMAL;
             prio->PriorityForTypeIsSupported = (supported_type && supported_priority) ? TRUE : FALSE;
             return d3d12_trace::result(method, S_OK);
         }
