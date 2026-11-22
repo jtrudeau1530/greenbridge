@@ -2785,12 +2785,32 @@ WindowPresenter::~WindowPresenter() {
     device_->Release();
 }
 
-HRESULT WindowPresenter::present(ID3D12Resource* back_buffer, UINT sync_interval) {
-    if (!back_buffer) return E_INVALIDARG;
-    const VkResult result = presenter_->present(resource_id(back_buffer), sync_interval > 0);
+namespace {
+HRESULT present_result(VkResult result) {
     if (result == VK_SUCCESS) return S_OK;
     std::fprintf(stderr, "[rt] d3d12: present failed (VkResult %d)\n", int(result));
-    return result == VK_ERROR_DEVICE_LOST ? DXGI_ERROR_DEVICE_REMOVED : E_FAIL;
+    if (result == VK_ERROR_DEVICE_LOST) return DXGI_ERROR_DEVICE_REMOVED;
+    if (result == VK_ERROR_FORMAT_NOT_SUPPORTED) return DXGI_ERROR_UNSUPPORTED;
+    return E_FAIL;
+}
+}  // namespace
+
+HRESULT WindowPresenter::present(ID3D12Resource* back_buffer, UINT sync_interval, const D3D12_RECT* src_rect) {
+    if (!back_buffer) return E_INVALIDARG;
+    const leonida::PresentRect rect = src_rect ? leonida::PresentRect{src_rect->left, src_rect->top, src_rect->right,
+                                                                       src_rect->bottom}
+                                               : leonida::PresentRect{};
+    return present_result(presenter_->present(resource_id(back_buffer), sync_interval > 0, src_rect ? &rect : nullptr));
+}
+
+HRESULT WindowPresenter::present_blank(UINT sync_interval) {
+    return present_result(presenter_->present_blank(sync_interval > 0));
+}
+
+bool WindowPresenter::enable_capture() { return presenter_->enable_capture(); }
+
+bool WindowPresenter::read_back(std::vector<std::uint8_t>& pixels, VkExtent2D* extent, VkFormat* format) {
+    return presenter_->read_back(pixels, extent, format);
 }
 
 VkExtent2D WindowPresenter::extent() const { return presenter_->extent(); }
