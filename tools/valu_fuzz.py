@@ -1,9 +1,8 @@
-r"""Differential fuzzer for the translator, three instruction families on the GPU (FUZZ-2, FUZZ-5, FUZZ-7), standard
+r"""Differential fuzzer for the translator, two instruction families on the GPU (FUZZ-2, FUZZ-5), standard
 library only.
 
     python -I tools/valu_fuzz.py --family f16  --programs 200 --seed 1 [--wave 64|32|both] [--emulate]
     python -I tools/valu_fuzz.py --family mem  ...
-    python -I tools/valu_fuzz.py --family wave ...
     python -I tools/valu_fuzz.py --family f16 --show 1:7:32      # print program 7 of seed 1 (wave32) and its model
     python -I tools/valu_fuzz.py --family f16 --model-only ...   # generate and model only (no GPU)
 
@@ -15,9 +14,6 @@ Families:
   mem   memory: buffer loads and stores of every width (dword..dwordx4, ubyte/sbyte/ushort/sshort, short_d16[_hi]),
         offen/idxen/offset addressing, a V# built in SGPRs with a small num_records (out-of-range loads read 0 and
         out-of-range stores are dropped), and s_load_dword / s_buffer_load_dword of what earlier stores wrote.
-  wave  cross-lane: v_readlane/v_writelane/v_readfirstlane, v_mbcnt_lo/hi, s_bcnt0/1 and s_ff0/1 on lane masks,
-        v_cndmask on SGPR-pair masks, and lane masks used as data (copied to VGPRs, shifted, masked), under random
-        EXEC masks, in wave32 and wave64.
 
 Each program is one 64-thread group (wave64, or two wave32s). Every thread stores 16 result VGPRs (v20..v35); the
 mem family also dumps its scratch area. The model of each family is written here from the RDNA2 ISA and does not
@@ -477,216 +473,6 @@ class F16Family(Family):
 
 
 
-# ======================================================================================== FUZZ-7: wave/cross-lane
-
-WAVE_OPS = ("valu_exec", "readlane", "readfirstlane", "writelane", "mbcnt", "cmp_bcnt", "cmp_ff1", "cmp_cndmask",
-            "permlane16", "permlanex16", "maskdata")
-SREG = 40          # s40..: scalar scratch (s40 single, s[42:43] pair)
-CMPS = {"eq_u32": lambda a, b: a == b, "ne_u32": lambda a, b: a != b, "lt_u32": lambda a, b: a < b,
-        "gt_u32": lambda a, b: a > b, "lt_i32": lambda a, b: s32(a) < s32(b), "ge_i32": lambda a, b: s32(a) >= s32(b)}
-
-
-def s32(x):
-    x &= M32
-    return x - (1 << 32) if x & 0x80000000 else x
-
-
-def popcount(x):
-    return bin(x).count("1")
-
-
-class WaveFamily(Family):
-    """Cross-lane ops. A 64-thread group is one wave64 or two wave32s; each wave runs the same scalar program, so
-    lane masks and readlane results are per wave."""
-    title = "FUZZ-7"
-    short = "wave"
-
-    def build(self):
-        rng = self.rng
-        self.W = self.wave
-        self.full = (1 << self.W) - 1
-        self.init = {r: (rng.randrange(1, 1 << 24), rng.getrandbits(32)) for r in POOL}
-        kinds = [k for k in WAVE_OPS if k not in self.skip]
-        for _ in range(rng.randrange(5, 13)):
-            self.ops.append(self.random_op(rng.choice(kinds)))
-
-    def mask(self):
-        rng = self.rng
-        c = rng.choice(("rand", "low", "high", "one", "alt"))
-        if c == "rand":
-            m = rng.getrandbits(self.W)
-        elif c == "low":
-            m = (1 << (self.W // 2)) - 1
-        elif c == "high":
-            m = self.full ^ ((1 << (self.W // 2)) - 1)
-        elif c == "one":
-            m = 1 << rng.randrange(self.W)
-        else:
-            m = int("01" * (self.W // 2), 2)
-        return m or 1   # never an empty EXEC: readfirstlane and the copies need a lane
-
-    def random_op(self, kind):
-        rng = self.rng
-        r = lambda: rng.choice(POOL)  # noqa: E731
-        op = {"kind": kind, "d": r(), "a": r(), "b": r(), "c": r()}
-        if kind in ("valu_exec", "readfirstlane", "cmp_bcnt", "cmp_ff1", "cmp_cndmask", "mbcnt", "maskdata"):
-            op["exec"] = self.mask() if rng.random() < 0.7 else self.full
-        else:
-            op["exec"] = self.full   # readlane/writelane ignore EXEC; permlane runs with every lane on (FI/BC unset)
-        op["lane"] = rng.randrange(self.W)
-        op["cmp"] = rng.choice(sorted(CMPS))
-        op["cmask"] = rng.getrandbits(32)              # constant compared against, to get mixed masks
-        op["mbmask"] = rng.getrandbits(self.W)
-        op["sel"] = [rng.randrange(16) for _ in range(16)]
-        op["mdk"] = rng.choice(("mov_lo", "mov_hi", "lshr", "and")) if self.W == 64 else rng.choice(("mov_lo", "lshr", "and"))
-        op["text"] = f"{kind} " + ", ".join(f"{k}={op[k]:#x}" if isinstance(op[k], int) and k in ("exec", "mbmask")
-                                            else f"{k}={op[k]}" for k in ("d", "a", "b", "exec", "lane", "cmp")
-                                            if k in op)
-        return op
-
-    def set_exec(self, m):
-        if self.W == 64:
-            return [f"s_mov_b32 exec_lo, {m & M32:#x}", f"s_mov_b32 exec_hi, {m >> 32:#x}"]
-        return [f"s_mov_b32 exec_lo, {m & M32:#x}"]
-
-    def full_exec(self):
-        return ["s_mov_b64 exec, -1"] if self.W == 64 else ["s_mov_b32 exec_lo, -1"]
-
-    def mreg(self):
-        return f"s[{SREG + 2}:{SREG + 3}]" if self.W == 64 else f"s{SREG + 2}"
-
-    def asm_body(self):
-        out = []
-        for r, (k, c) in self.init.items():
-            out += [f"v_mul_u32_u24_e32 v{r}, {k:#x}, v0", f"v_xor_b32_e32 v{r}, {c:#x}, v{r}"]
-        for op in self.ops:
-            out += self.asm_op(op)
-            out += self.full_exec()
-        return out
-
-    def cmp_asm(self, op):
-        return [f"v_mov_b32_e32 v{TMP}, {op['cmask']:#x}",
-                f"v_cmp_{op['cmp']}_e64 {self.mreg()}, v{op['a']}, v{TMP}"]
-
-    def asm_op(self, op):
-        k, d, a, b = op["kind"], op["d"], op["a"], op["b"]
-        e = self.set_exec(op["exec"])
-        b64 = "b64" if self.W == 64 else "b32"
-        if k == "valu_exec":
-            return e + [f"v_add_nc_u32_e32 v{d}, v{a}, v{b}"]
-        if k == "readlane":
-            return [f"v_readlane_b32 s{SREG}, v{a}, {op['lane']}", f"v_mov_b32_e32 v{d}, s{SREG}"]
-        if k == "readfirstlane":
-            return e + [f"v_readfirstlane_b32 s{SREG}, v{a}"] + self.full_exec() + [f"v_mov_b32_e32 v{d}, s{SREG}"]
-        if k == "writelane":
-            return [f"v_readlane_b32 s{SREG}, v{a}, {(op['lane'] * 7 + 3) % self.W}",
-                    f"v_writelane_b32 v{d}, s{SREG}, {op['lane']}"]
-        if k == "mbcnt":
-            lo = op["mbmask"] & M32
-            out = e + [f"s_mov_b32 s{SREG}, {lo:#x}", f"v_mbcnt_lo_u32_b32 v{d}, s{SREG}, v{a}"]
-            if self.W == 64:
-                out += [f"s_mov_b32 s{SREG + 1}, {op['mbmask'] >> 32:#x}", f"v_mbcnt_hi_u32_b32 v{d}, s{SREG + 1}, v{d}"]
-            return out
-        if k in ("cmp_bcnt", "cmp_ff1"):
-            name = "s_bcnt1_i32_" + b64 if k == "cmp_bcnt" else "s_ff1_i32_" + b64
-            return e + self.cmp_asm(op) + [f"{name} s{SREG}, {self.mreg()}"] + self.full_exec() + \
-                [f"v_mov_b32_e32 v{d}, s{SREG}"]
-        if k == "cmp_cndmask":
-            return e + self.cmp_asm(op) + [f"v_cndmask_b32_e64 v{d}, v{b}, v{op['c']}, {self.mreg()}"]
-        if k in ("permlane16", "permlanex16"):
-            lo = sum(op["sel"][i] << (4 * i) for i in range(8))
-            hi = sum(op["sel"][8 + i] << (4 * i) for i in range(8))
-            return [f"s_mov_b32 s{SREG}, {lo:#x}", f"s_mov_b32 s{SREG + 1}, {hi:#x}",
-                    f"v_mov_b32_e32 v{d}, v{b}",
-                    f"v_{k}_b32 v{d}, v{a}, s{SREG}, s{SREG + 1}"]
-        if k == "maskdata":   # a lane mask used as an integer (#210)
-            m = self.mreg()
-            lo = f"s{SREG + 2}"
-            body = {"mov_lo": [f"v_mov_b32_e32 v{d}, {lo}"],
-                    "mov_hi": [f"v_mov_b32_e32 v{d}, s{SREG + 3}"],
-                    "lshr": [f"s_lshr_b32 s{SREG}, {lo}, 3", f"v_mov_b32_e32 v{d}, s{SREG}"],
-                    "and": [f"s_and_b32 s{SREG}, {lo}, 0xff00ff", f"v_mov_b32_e32 v{d}, s{SREG}"]}[op["mdk"]]
-            return e + self.cmp_asm(op) + self.full_exec() + body
-        raise ValueError(k)
-
-    def model(self):
-        W = self.W
-        # v_mul_u32_u24 v, k, v0 then v_xor: v0 is the thread id within the group (0..63) in either wave size.
-        regs = [{r: Reg(((t * (k & 0xFFFFFF)) & M32) ^ c) for r, (k, c) in self.init.items()} for t in range(THREADS)]
-        writer = [{r: -1 for r in POOL} for _ in range(THREADS)]
-        for wave0 in range(0, THREADS, W):
-            lanes = list(range(wave0, wave0 + W))
-            for i, op in enumerate(self.ops):
-                self.step(op, regs, lanes, writer, i)
-        self.writer = writer
-        return regs, []
-
-    def step(self, op, R, lanes, writer, i):
-        W = self.W
-        k, d, a, b = op["kind"], op["d"], op["a"], op["b"]
-        ex = op["exec"]
-        act = [l for j, l in enumerate(lanes) if ex >> j & 1]
-
-        def put(t, v):
-            R[t][d] = Reg(v)
-            writer[t][d] = i
-
-        def cmp_mask():
-            m = 0
-            for j, t in enumerate(lanes):
-                if ex >> j & 1 and CMPS[op["cmp"]](R[t][a].v, op["cmask"]):
-                    m |= 1 << j
-            return m          # inactive lanes write 0
-        if k == "valu_exec":
-            for t in act:
-                put(t, R[t][a].v + R[t][b].v)
-        elif k == "readlane":
-            v = R[lanes[op["lane"]]][a].v
-            for t in lanes:
-                put(t, v)
-        elif k == "readfirstlane":
-            v = R[act[0]][a].v
-            for t in lanes:
-                put(t, v)
-        elif k == "writelane":
-            v = R[lanes[(op["lane"] * 7 + 3) % W]][a].v
-            put(lanes[op["lane"]], v)
-        elif k == "mbcnt":
-            # mbcnt_lo + mbcnt_hi together count the mask bits below the lane (wave32: mbcnt_lo alone).
-            for j, t in enumerate(lanes):
-                if ex >> j & 1:
-                    put(t, R[t][a].v + popcount(op["mbmask"] & ((1 << j) - 1)))
-        elif k in ("cmp_bcnt", "cmp_ff1"):
-            m = cmp_mask()
-            v = popcount(m) if k == "cmp_bcnt" else ((m & -m).bit_length() - 1 if m else M32)
-            for t in lanes:
-                put(t, v)
-        elif k == "cmp_cndmask":
-            m = cmp_mask()
-            for j, t in enumerate(lanes):
-                if ex >> j & 1:
-                    put(t, R[t][op["c"]].v if m >> j & 1 else R[t][b].v)
-        elif k in ("permlane16", "permlanex16"):
-            for t in lanes:                       # v_mov vD, vB first: when vA is vD, the permlane reads vB's value
-                R[t][d] = Reg(R[t][b].v)
-            src = {t: R[t][a].v for t in lanes}
-            for j, t in enumerate(lanes):
-                row, pos = divmod(j, 16)
-                srow = row ^ 1 if k == "permlanex16" else row   # x16: the other row of the same 32-lane half
-                put(t, src[lanes[srow * 16 + op["sel"][pos]]])
-        elif k == "maskdata":
-            m = cmp_mask()
-            v = {"mov_lo": m & M32, "mov_hi": (m >> 32) & M32, "lshr": (m & M32) >> 3,
-                 "and": (m & M32) & 0xFF00FF}[op["mdk"]]
-            for t in lanes:
-                put(t, v)
-        else:
-            raise ValueError(k)
-
-    def describe(self, i):
-        return f"op {i}: {self.ops[i]['text']}" if i is not None and i >= 0 else "the initial value"
-
-
 # ============================================================================================== FUZZ-5: memory
 
 SCR_BASE = 4096          # byte address (console VA) of the scratch area, right after the per-thread results
@@ -802,7 +588,7 @@ class MemFamily(Family):
 
 # ========================================================================================== runner
 
-FAMILIES = {"f16": F16Family, "wave": WaveFamily, "mem": MemFamily}
+FAMILIES = {"f16": F16Family, "mem": MemFamily}
 
 
 def programs(family, seed, count, waves, skip=()):

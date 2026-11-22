@@ -244,5 +244,34 @@ class ScanTest(unittest.TestCase):
             self.assertEqual(cm.exception.code, 2)
 
 
+    def test_directory_scan_honours_max_inflate(self):
+        with open(os.path.join(self.dir, "one.rpf"), "wb") as f:
+            f.write(make_rpf([bvh_payload(4)]))
+        full = 0x140 + 4 * 64
+        rows, _ = bvh_index.scan_dir(self.dir)
+        self.assertEqual(rows[0]["kind"], "bvh4")
+        out = os.path.join(self.dir, "capped.json")
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(bvh_index.main([self.dir, "--max-inflate", "128", "--out", out]), 0)
+        with open(out) as f:
+            doc = json.load(f)
+        # Only 128 bytes were kept, so the 0x140-byte header cannot be read; the real size is still reported.
+        self.assertEqual(doc["streams"][0]["kind"], "raw")
+        self.assertEqual(doc["streams"][0]["size"], full)
+
+    def test_cli_rejects_start_or_limit_for_a_directory(self):
+        with open(os.path.join(self.dir, "one.rpf"), "wb") as f:
+            f.write(make_rpf([bvh_payload(2)]))
+        out = os.path.join(self.dir, "index.json")
+        for extra in (("--start", "0"), ("--limit", "100")):
+            err, so = io.StringIO(), io.StringIO()
+            with self.assertRaises(SystemExit) as cm, contextlib.redirect_stderr(err), contextlib.redirect_stdout(so):
+                bvh_index.main([self.dir, "--out", out, *extra])
+            self.assertEqual(cm.exception.code, 2)
+            self.assertIn("single archive", err.getvalue())
+            self.assertEqual(so.getvalue(), "")
+            self.assertFalse(os.path.exists(out))
+
+
 if __name__ == "__main__":
     unittest.main()

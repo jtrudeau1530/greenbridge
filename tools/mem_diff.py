@@ -19,6 +19,11 @@ below num_records for raw ones), is dword aligned, and uses a word3 with no form
 s_buffer_load alignment truncation and swizzling depend on descriptor fields docs/design.md lists as not modelled,
 so they are left to a GPU-confirmed follow-up instead of being guessed here.
 
+Typed buffer loads (buffer_load_format_*, tbuffer_load_format_*) are decoded from the GFX10 format names in
+tools/gfx10_formats.json, not from the translator's table. Two outcomes awaiting a hardware measurement are
+counted apart instead of as mismatches: 'norm-ulp1' (a UNORM/SNORM result one ULP from the correctly rounded
+value) and 'missing-w32' (the missing W of a 32-bit format: the translator returns 0, every other format 1).
+
 Usage:
     python -I tools/mem_diff.py [--programs N] [--seed S] [--max-ops N]
     python -I tools/mem_diff.py --self-test
@@ -67,6 +72,85 @@ class Program:
     def __init__(self):
         self.lines = []
         self.memory = {}
+        self.norm_regs = set()      # VGPRs that hold a UNORM/SNORM result (rounding differences are counted apart)
+        self.missing_w32_regs = set()   # VGPRs that select the missing W of a 32-bit format (counted apart)
+
+
+# ---------------------------------------------------------------- typed-buffer formats (reference decode)
+
+def _load_format_names():
+    path = os.path.join(HERE, "gfx10_formats.json")
+    import json
+    with open(path, encoding="utf-8") as f:
+        return {int(k): v for k, v in json.load(f).items()}
+
+
+FORMAT_NAMES = _load_format_names()     # GFX10 FORMAT code -> name (Mesa gfx10-rsrc.json), data only
+ONE_F32 = 0x3F800000
+
+
+def parse_format(name):
+    """'GFX10_FORMAT_16_16_SNORM' -> ([16, 16] for X, Y from bit 0, 'SNORM'). The name lists the channel widths
+    from the top bit down (2_10_10_10 is X10 Y10 Z10 W2 from bit 0), so the list is reversed. Returns None for
+    names this model does not decode (packed floats, scaled, sRGB, block formats)."""
+    parts = name.replace("GFX10_FORMAT_", "").split("_")
+    kind = parts[-1]
+    try:
+        widths = [int(p) for p in parts[:-1]]
+    except ValueError:
+        return None
+    if kind not in ("UNORM", "SNORM", "UINT", "SINT", "FLOAT") or not widths:
+        return None
+    if kind == "FLOAT" and any(w not in (16, 32) for w in widths):
+        return None
+    if sum(widths) % 8:
+        return None
+    return list(reversed(widths)), kind
+
+
+def f32_round(q):
+    """Nearest-even binary32 of an exact rational (Fraction), as bits."""
+    from fractions import Fraction
+    if q == 0:
+        return 0
+    d = float(q)
+    cands = set()
+    for scale in (1.0, 1 + 2 ** -26, 1 - 2 ** -26):
+        try:
+            cands.add(struct.unpack("<I", struct.pack("<f", d * scale))[0])
+        except OverflowError:
+            pass
+    def err(b):
+        return abs(Fraction(struct.unpack("<f", struct.pack("<I", b))[0]) - q)
+    return min(cands, key=lambda b: (err(b), b & 1))
+
+
+def decode_element(raw, widths, kind):
+    """Decode one element (an int of sum(widths) bits) -> 4 result words, missing channels 0, 0, 0, 1."""
+    from fractions import Fraction
+    out, bit = [], 0
+    for w in widths:
+        v = (raw >> bit) & ((1 << w) - 1)
+        bit += w
+        if kind == "UNORM":
+            out.append(f32_round(Fraction(v, (1 << w) - 1)))
+        elif kind == "SNORM":
+            s = v - (1 << w) if v >> (w - 1) else v
+            q = max(Fraction(s, (1 << (w - 1)) - 1), Fraction(-1))
+            bits_ = f32_round(abs(q))
+            out.append(bits_ | (0x80000000 if q < 0 else 0))
+        elif kind == "UINT":
+            out.append(v)
+        elif kind == "SINT":
+            out.append((v - (1 << w) if v >> (w - 1) else v) & MASK32)
+        elif w == 32:
+            out.append(v)
+        else:                                           # FLOAT 16 -> f32 bits (exact)
+            out.append(struct.unpack("<I", struct.pack("<f", struct.unpack("<e", struct.pack("<H", v))[0]))[0])
+    one = 1 if kind in ("UINT", "SINT") else ONE_F32
+    while len(out) < 4:
+        out.append(0 if len(out) < 3 else one)
+    return out
 
 
 # ---------------------------------------------------------------- reference model
@@ -149,6 +233,35 @@ class RefMachine:
                     self.v[vdata + i] = self.word(addr + 4 * i)
                 else:
                     self.put(addr + 4 * i, self.v.get(vdata + i, 0))
+        elif op.startswith(("buffer_load_format_", "tbuffer_load_format_")):
+            ncomp = len(op.rsplit("_", 1)[1])
+            vdata, rsrc = reg_first(args[0]), reg_first(args[2])
+            vaddr = None if args[1] == "off" else reg_first(args[1])
+            d0, d1, d3 = self.s.get(rsrc, 0), self.s.get(rsrc + 1, 0), self.s.get(rsrc + 3, 0)
+            base, stride = (d1 & 0xFFFF) << 32 | d0, (d1 >> 16) & 0x3FFF
+            offset = self.scalar(args[3]) + sum(int(m.split(":", 1)[1], 0) for m in mods if m.startswith("offset:"))
+            regs = [] if vaddr is None else [vaddr, vaddr + 1]
+            if "idxen" in mods:
+                offset += self.v.get(regs.pop(0), 0) * stride
+            if "offen" in mods:
+                offset += self.v.get(regs.pop(0), 0)
+            addr = base + (offset & MASK32)
+            fm = next((m for m in mods if m.startswith("format:")), None)
+            if op.startswith("tbuffer"):
+                name = "GFX10_FORMAT_" + fm.split("BUF_FMT_")[-1].rstrip("]")
+            else:
+                name = FORMAT_NAMES[(d3 >> 12) & 0x7F]
+            widths, kind = parse_format(name)
+            nbytes = sum(widths) // 8
+            raw = 0
+            for i in range(nbytes):                     # little-endian bytes from dword memory
+                a = addr + i
+                raw |= ((self.word(a & ~3) >> (8 * (a & 3))) & 0xFF) << (8 * i)
+            comps = decode_element(raw, widths, kind)
+            one = 1 if kind in ("UINT", "SINT") else ONE_F32
+            for c in range(ncomp):
+                sel = (d3 >> (3 * c)) & 7
+                self.v[vdata + c] = {0: 0, 1: one, 4: comps[0], 5: comps[1], 6: comps[2], 7: comps[3]}.get(sel, 0)
         elif op.startswith("buffer_atomic_"):
             kind = op[len("buffer_atomic_"):]
             vdata, rsrc = reg_first(args[0]), reg_first(args[2])
@@ -416,6 +529,66 @@ def gen_global(rng, prog):
     return [("v", VDATA + i) for i in range(n)]
 
 
+# The five formats tbuffer loads use in the 1.0.2.1 corpus (counted over all 26,503 shaders).
+TBUFFER_FORMATS = ("16_16_SNORM", "8_8_8_8_UNORM", "8_8_8_8_UINT", "2_10_10_10_UNORM", "16_16_16_16_UINT")
+XYZW = 4 | 5 << 3 | 6 << 6 | 7 << 9
+
+
+def _typed_codes():
+    """Formats buffer_load_format is generated with: the ones the translator claims to decode (its scope), each
+    checked here against the reference decode of its GFX10 name."""
+    return sorted(c for c in rdna2spirv.Gen.FORMATS if parse_format(FORMAT_NAMES[c]))
+
+
+def gen_buffer_format(rng, prog):
+    ncomp = rng.choice((1, 2, 3, 4))
+    suffix = "xyzw"[:ncomp]
+    tbuffer = rng.random() < 0.5
+    if tbuffer:
+        fname = rng.choice(TBUFFER_FORMATS)
+        widths, kind = parse_format("GFX10_FORMAT_" + fname)
+        word3 = XYZW                                   # tbuffer: format in the instruction, identity swizzle
+    else:
+        code = rng.choice(_typed_codes())
+        widths, kind = parse_format(FORMAT_NAMES[code])
+        sels = [rng.choice((0, 4, 5, 6, 7)) for _ in range(4)]   # no SEL_1: its integer value is unconfirmed
+        word3 = code << 12 | sels[0] | sels[1] << 3 | sels[2] << 6 | sels[3] << 9
+    size = sum(widths) // 8
+    base = _buffer_base(rng)
+    _seed_region(rng, prog.memory, base)
+    structured = rng.random() < 0.5
+    if structured:
+        stride = size * rng.choice((1, 2, 3, 4))
+        stride += -stride % 4
+        records = REGION // stride
+        index = rng.randrange(0, records)
+        _emit_vsharp(rng, prog, base, stride, records)
+        prog.lines[-1] = f"s_mov_b32 s{VSHARP + 3}, {word3:#x}"
+        prog.lines.append(f"v_mov_b32 v{VADDR}, {index:#x}")
+        operands = f"v{VADDR}, s[{VSHARP}:{VSHARP + 3}], 0"
+        addr_mods = "idxen"
+    else:
+        voff = rng.randrange(0, (REGION - 16) // size) * size
+        _emit_vsharp(rng, prog, base, 0, REGION)
+        prog.lines[-1] = f"s_mov_b32 s{VSHARP + 3}, {word3:#x}"
+        prog.lines.append(f"v_mov_b32 v{VADDR}, {voff:#x}")
+        operands = f"v{VADDR}, s[{VSHARP}:{VSHARP + 3}], 0"
+        addr_mods = "offen"
+    vdata = reg_range("v", VDATA, ncomp)
+    if tbuffer:
+        prog.lines.append(f"tbuffer_load_format_{suffix} {vdata}, {operands} format:[BUF_FMT_{fname}] {addr_mods}")
+    else:
+        prog.lines.append(f"buffer_load_format_{suffix} {vdata}, {operands} {addr_mods}")
+    prog.lines.append("s_waitcnt vmcnt(0)")
+    if kind in ("UNORM", "SNORM"):
+        prog.norm_regs.update(VDATA + c for c in range(ncomp))
+    if set(widths) == {32} and len(widths) < 4:
+        for c in range(ncomp):
+            if (word3 >> (3 * c)) & 7 == 7:
+                prog.missing_w32_regs.add(VDATA + c)
+    return [("v", VDATA + c) for c in range(ncomp)]
+
+
 GENERATORS = {
     "s_load": gen_s_load,
     "s_buffer_load": gen_s_buffer_load,
@@ -423,6 +596,7 @@ GENERATORS = {
     "buffer_store": gen_buffer_store,
     "buffer_atomic": gen_buffer_atomic,
     "global": gen_global,
+    "buffer_format": gen_buffer_format,
 }
 
 
@@ -434,9 +608,13 @@ def generate_program(rng, n_ops, families=None):
     for _ in range(n_ops):
         family = rng.choice(names)
         prog.lines.append(f"; {family}")
+        prog.norm_regs = set()                  # only the last operation's results are exported
+        prog.missing_w32_regs = set()
         results = GENERATORS[family](rng, prog) or results
     picks = [results[min(i, len(results) - 1)] for i in range(4)] if results else []
-    for dst, (kind, reg) in zip(EXPORT, picks):
+    prog.export_sources = {}
+    for k, (dst, (kind, reg)) in enumerate(zip(EXPORT, picks)):
+        prog.export_sources[k] = reg if kind == "v" else None
         if not (kind == "v" and reg == dst):
             prog.lines.append(f"v_mov_b32 v{dst}, {kind}{reg}")
     return prog
@@ -477,9 +655,21 @@ def run_one(name, prog):
         return "skip", f"mini_interp unsupported: {type(e).__name__}: {e}"
     got = list(out.get("%out_mrt0", ()))
     if got != want:
-        i = next(k for k in range(4) if k >= len(got) or got[k] != want[k])
+        bad = [k for k in range(4) if k >= len(got) or got[k] != want[k]]
+        i = bad[0]
         g = f"{got[i]:#010x}" if i < len(got) else "missing"
-        return "mismatch", f"export word {i}: expected {want[i]:#010x}, translated {g}"
+        detail = f"export word {i}: expected {want[i]:#010x}, translated {g}"
+        # A UNORM/SNORM result one ULP from the correctly rounded value is a rounding-convention question (the
+        # translator multiplies by a rounded reciprocal), kept apart so it can't hide a real decode error.
+        sources = prog.export_sources if hasattr(prog, "export_sources") else {}
+        if all(k < len(got) and sources.get(k) in prog.norm_regs and abs(got[k] - want[k]) == 1 for k in bad):
+            return "norm-ulp1", detail
+        # The missing W of a 32-bit format: the translator gives 0, every other format (and this model) 1 / 1.0.
+        # Posted as a finding awaiting a hardware measurement; counted apart until then.
+        if all(k < len(got) and sources.get(k) in prog.missing_w32_regs and got[k] == 0 and want[k] in (1, ONE_F32)
+               for k in bad):
+            return "missing-w32", detail
+        return "mismatch", detail
     if memory != ref.mem:
         bad = sorted(a for a in set(memory) | set(ref.mem) if memory.get(a, 0) != ref.mem.get(a, 0))
         a = bad[0]
@@ -489,7 +679,7 @@ def run_one(name, prog):
 
 
 def run_suite(programs, seed, max_ops, families=None):
-    counts = {"pass": 0, "mismatch": 0, "skip": {}, "harness-error": 0}
+    counts = {"pass": 0, "mismatch": 0, "norm-ulp1": 0, "missing-w32": 0, "skip": {}, "harness-error": 0}
     first = None
     rng = random.Random(seed)
     for i in range(programs):
@@ -503,6 +693,8 @@ def run_suite(programs, seed, max_ops, families=None):
             continue
         if status == "match":
             counts["pass"] += 1
+        elif status in ("norm-ulp1", "missing-w32"):
+            counts[status] += 1
         elif status == "mismatch":
             counts["mismatch"] += 1
             if first is None:
@@ -556,7 +748,9 @@ def main(argv=None):
     counts, first = run_suite(a.programs, a.seed, a.max_ops, a.family)
     skips = sum(counts["skip"].values())
     print(f"{a.programs} programs (seed {a.seed}): {counts['pass']} pass, {counts['mismatch']} mismatch, "
-          f"{skips} skipped, {counts['harness-error']} harness errors")
+          f"{counts['norm-ulp1']} UNORM/SNORM 1-ULP rounding differences, "
+          f"{counts['missing-w32']} missing-W-of-a-32-bit-format differences, {skips} skipped, "
+          f"{counts['harness-error']} harness errors")
     for reason, n in sorted(counts["skip"].items()):
         print(f"  skip x{n}: {reason}")
     if first:

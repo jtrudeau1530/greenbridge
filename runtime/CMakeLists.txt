@@ -395,9 +395,21 @@ if(LEONIDA_D3D12_SHIM_TESTS)
 endif()
 endif()
 
-# GPU test and pipeline tools load Vulkan at run time.
+# GPU test and pipeline tools load Vulkan at run time, so only the Vulkan headers are needed at build time.
 find_package(Vulkan QUIET)
-if(Vulkan_FOUND)
+if(NOT TARGET Vulkan::Headers)
+  find_path(Vulkan_INCLUDE_DIR
+    NAMES vulkan/vulkan.h
+    HINTS "$ENV{VULKAN_SDK}/Include" "$ENV{VULKAN_SDK}/include"
+  )
+  if(Vulkan_INCLUDE_DIR AND EXISTS "${Vulkan_INCLUDE_DIR}/vulkan/vulkan.h")
+    add_library(Vulkan::Headers INTERFACE IMPORTED)
+    set_target_properties(Vulkan::Headers PROPERTIES
+      INTERFACE_INCLUDE_DIRECTORIES "${Vulkan_INCLUDE_DIR}"
+    )
+  endif()
+endif()
+if(TARGET Vulkan::Headers)
   foreach(tool vk_harness vk_texture_test vk_compute_test vk_store_test vk_pipeline_check vk_command_replay_test
           vk_bindless_test)
     add_executable(${tool} test/${tool}.cpp)
@@ -470,10 +482,16 @@ if(Vulkan_FOUND)
     endif()
 
     # Differential regression: run explicitly (requires Vulkan hardware and Windows WARP).
-    add_executable(d3d12_uint_clear_test test/d3d12_uint_clear_test.cpp)
-    target_link_libraries(d3d12_uint_clear_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
-    target_compile_definitions(d3d12_uint_clear_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
-    target_compile_options(d3d12_uint_clear_test PRIVATE /W4 /permissive- /utf-8)
+    add_executable(d3d12_clear_test test/d3d12_clear_test.cpp)
+    target_link_libraries(d3d12_clear_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
+    target_compile_definitions(d3d12_clear_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_clear_test PRIVATE /W4 /permissive- /utf-8)
+
+    # Synthetic typed-view readbacks against Windows WARP; run explicitly on a Vulkan GPU.
+    add_executable(d3d12_typeless_rtv_test test/d3d12_typeless_rtv_test.cpp)
+    target_link_libraries(d3d12_typeless_rtv_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
+    target_compile_definitions(d3d12_typeless_rtv_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_typeless_rtv_test PRIVATE /W4 /permissive- /utf-8)
 
     # The loader can create this device instead of the host's (D3D12XboxCreateDevice, LEONIDA_D3D12=vulkan).
     if(TARGET gta6rt)
@@ -491,6 +509,12 @@ if(Vulkan_FOUND)
 
   # Needs only the Vulkan headers, not a GPU.
   if(BUILD_TESTING)
+    add_executable(typeless_rtv_test test/typeless_rtv_test.cpp)
+    target_link_libraries(typeless_rtv_test PRIVATE Vulkan::Headers)
+    if(WIN32)
+      target_compile_definitions(typeless_rtv_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    endif()
+    add_test(NAME typeless_rtv COMMAND typeless_rtv_test)
     add_executable(pipeline_cache_snapshot_test test/pipeline_cache_snapshot_test.cpp)
     target_link_libraries(pipeline_cache_snapshot_test PRIVATE Vulkan::Headers)
     add_test(NAME pipeline_cache_snapshot COMMAND pipeline_cache_snapshot_test)
@@ -512,6 +536,6 @@ if(Vulkan_FOUND)
     add_test(NAME gfx10_descriptors COMMAND gfx10_descriptors_test)
   endif()
 else()
-  message(STATUS "Vulkan SDK not found: GPU test tools, vk_pipeline_check, d3d12_state_map_test and "
+  message(STATUS "Vulkan headers not found: GPU test tools, vk_pipeline_check, d3d12_state_map_test and "
                  "gfx10_descriptors_test are not built")
 endif()
