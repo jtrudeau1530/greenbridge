@@ -653,7 +653,7 @@ def decode_grid(b, nstreams, stats, deep):
             chk["values_bijective"] = chk["occupied_equals_entries"] and _grid_values(b, groups, entries)
             if chk["values_bijective"] and chk["payload_in_bounds"]:
                 keys = _grid_slots(b, groups)
-                chk["keys_octree"] = _grid_octree(keys)
+                chk["keys_octree"] = len(keys) == entries and _grid_octree(keys)
                 if chk["keys_octree"]:
                     chk["inner_payload_ff00"] = _grid_payloads(b, payload, keys, stats)
     stats["groups"][groups] += 1

@@ -485,6 +485,7 @@ class NavmeshDecodeTest(unittest.TestCase):
             build_grid(entries=3, keys=[1, 8, 72]),                       # 72 >> 3 == 9 is absent
             build_grid(entries=3, keys=[1, 8, 16]),                       # 16 has its top bit at 4, not 3 or 6
             build_grid(entries=3, keys=[1, 0, 8]),                        # 0 is not a key
+            build_grid(entries=3, keys=[1, 8, 8]),                        # two slots share key 8
             build_grid(entries=3, keys=[1, 8, 9], words=[0x01, 0x01, 0x01]),  # inner root without 0xff00
             build_grid(entries=3, keys=[1, 8, 64], words=[0xFF00, 0x01, 0x01]),  # inner 8 without 0xff00
         ]
@@ -500,8 +501,8 @@ class NavmeshDecodeTest(unittest.TestCase):
             shallow = nd.scan(arc)
         cg = doc["checks"]["grid"]
         self.assertEqual(cg["payload_in_bounds"]["fail"], 1)
-        self.assertEqual(cg["values_bijective"], {"pass": 9, "fail": 0})
-        self.assertEqual(cg["keys_octree"], {"pass": 4, "fail": 4})
+        self.assertEqual(cg["values_bijective"], {"pass": 10, "fail": 0})
+        self.assertEqual(cg["keys_octree"], {"pass": 4, "fail": 5})
         self.assertEqual(cg["inner_payload_ff00"], {"pass": 2, "fail": 2})
         self.assertEqual(doc["grid"]["key_depth"], {"2": 16, "1": 5, "0": 2, "3": 1})
         self.assertEqual(doc["grid"]["inner_nodes"], 6)

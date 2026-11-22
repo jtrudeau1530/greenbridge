@@ -255,7 +255,7 @@ form an exact bijection onto `[0 .. N - 1]`: `value` indexes the `u32[N]` payloa
 
 **Keys (ASSET-287).** The `u64` keys are sentinel-bit linear octree keys over the cubic volume: `1` is the root and a
 child is `(parent << 3) | octant`, so the highest set bit sits at bit `3 × depth`. Measured on `27,482 / 27,482`
-resources: the root is present, every key's highest set bit is a multiple of 3, and every non-root key's parent (`key >>
+resources: the root is present, no key appears in two slots, every key's highest set bit is a multiple of 3, and every non-root key's parent (`key >>
 3`) is in the same table. Octant bit 2 is the vertical axis (cells stack on it); which of bits 0/1 is x and where the
 cube sits against the sector are **open**. Depths run `0..10` (`53,835,068` keys). The cell size at a resource's deepest
 level (`extent >> depth`) is 16 m on `12,694` resources (`12,693` 128 m tiles at depth 3, one 256 m tile), 8 m on `859`
