@@ -1,8 +1,8 @@
-// GetResourceTiling's arithmetic (src/resource_tiling.h), without a GPU. The expected tile shapes, standard mip
-// counts, per-mip tile counts and start indices are what the PC D3D12 runtime reported for the same reserved
-// resources on an RTX 5070; packed-tile counts are this layer's own rule (tight linear size in whole tiles), and
-// where the PC runtime chose differently the comment says so. d3d12_vulkan_device_test makes the same comparison
-// against the host runtime on the machine it runs on.
+// GetResourceTiling's arithmetic (src/resource_tiling.h), without a GPU. The expected tile shapes, per-mip tile
+// counts and start indices are what the PC D3D12 runtime reported for the same reserved resources on an RTX 5070.
+// Where the packed tail starts and how many tiles it takes follow AMD's PC runtime (D3D-65): the AmdCase table holds
+// AMD's values, and where another runtime chose differently the comment says so. d3d12_vulkan_device_test makes the
+// same comparison against the host runtime on the machine it runs on.
 #include "../src/resource_tiling.h"
 
 #include <cstdio>
