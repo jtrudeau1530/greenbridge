@@ -3744,6 +3744,28 @@ class Gen:
     def lds_store(self, addr, byte_off, val):
         self.lds_access(addr, byte_off, lambda p: self.emit(f"OpStore {p} {val}"))
 
+    def lds_u16_cross_read(self, addr, byte_off, w, sh):
+        """A 16-bit LDS read at byte 3 of a dword (bit offset `sh` 24) also takes byte 0 of the next dword, as RDNA2
+        LDS reads it in unaligned mode (llc -mcpu=gfx1030 -mattr=+unaligned-access-mode emits one ds_read_u16 at
+        offset 3). Returns (word, bit offset) for the 16-bit extract; the next dword is only read when crossing."""
+        cross, lo, hi, comb, w2, sh2 = (self.tmp() for _ in range(6))
+        x_do, x_end = self.tmp() + "_x", self.tmp() + "_xend"
+        self.emit(f"{cross} = OpIEqual %bool {sh} {self.cu(24)}")
+        pre = self.current_label_placeholder()
+        self.emit(f"OpSelectionMerge {x_end} None")
+        self.emit(f"OpBranchConditional {cross} {x_do} {x_end}")
+        self.emit(f"{x_do} = OpLabel")
+        nxt = self.lds_load(addr, byte_off + 1)
+        self.emit(f"{lo} = OpShiftRightLogical %uint {w} {self.cu(24)}")
+        self.emit(f"{hi} = OpShiftLeftLogical %uint {nxt} {self.cu(8)}")
+        self.emit(f"{comb} = OpBitwiseOr %uint {lo} {hi}")
+        last = self.current_label_placeholder()
+        self.emit(f"OpBranch {x_end}")
+        self.emit(f"{x_end} = OpLabel")
+        self.emit(f"{w2} = OpPhi %uint {comb} {last} {w} {pre}")
+        self.emit(f"{sh2} = OpSelect %uint {cross} {self.cu(0)} {sh}")
+        return w2, sh2
+
     def lds_atomic(self, addr, byte_off, rest):
         """`rest` is the atomic instruction after its result id, with {p} where the pointer goes."""
         def f(p):
@@ -3835,6 +3857,8 @@ class Gen:
             self.emit(f"{sh} = OpShiftLeftLogical %uint {s1} {self.cu(3)}")     # byte address -> bit offset
             self.emit(f"{sh2} = OpBitwiseAnd %uint {sh} {self.cu(31)}")
             w = self.lds_load(addr, off)
+            if bits == 16:
+                w, sh2 = self.lds_u16_cross_read(addr, off, w, sh2)
             f = "OpBitFieldSExtract" if op.split("_")[2].startswith("i") else "OpBitFieldUExtract"
             self.emit(f"{v} = {f} %uint {w} {sh2} {self.cu(bits)}")
             d = a[0]
@@ -3869,6 +3893,22 @@ class Gen:
                 self.emit(f"{t1} = OpAtomicAnd %uint {p} {sc} {sem} {inv}")
                 self.emit(f"{t2} = OpAtomicOr %uint {p} {sc} {sem} {pos}")
             self.lds_access(addr, off, sub_dword)
+            if bits == 16:
+                # A halfword at byte 3 writes its high byte to byte 0 of the next dword.
+                cross, hb, x_do, x_end = self.tmp(), self.tmp(), self.tmp() + "_x", self.tmp() + "_xend"
+                self.emit(f"{cross} = OpIEqual %bool {sh2} {self.cu(24)}")
+                self.emit(f"OpSelectionMerge {x_end} None")
+                self.emit(f"OpBranchConditional {cross} {x_do} {x_end}")
+                self.emit(f"{x_do} = OpLabel")
+                self.emit(f"{hb} = OpShiftRightLogical %uint {fld} {self.cu(8)}")
+
+                def next_byte0(p):
+                    t1, t2 = self.tmp(), self.tmp()
+                    self.emit(f"{t1} = OpAtomicAnd %uint {p} {sc} {sem} {self.cu(0xFFFFFF00)}")
+                    self.emit(f"{t2} = OpAtomicOr %uint {p} {sc} {sem} {hb}")
+                self.lds_access(addr, off + 1, next_byte0)
+                self.emit(f"OpBranch {x_end}")
+                self.emit(f"{x_end} = OpLabel")
         elif name in self.LDS_ATOMICS:
             d, ad, dat = (a[0], a[1], a[2]) if rtn else (None, a[0], a[1])
             old = self.lds_atomic(self.src_u(ad), off,
