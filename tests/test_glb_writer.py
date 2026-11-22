@@ -671,6 +671,21 @@ class TestWriteGlbFilesystem(unittest.TestCase):
 class TestObjParserAndBounds(unittest.TestCase):
     """Tests Wavefront OBJ parsing, coordinate transforms, UV flipping, and bounds."""
 
+    def test_utf8_bom_preserves_first_obj_record(self) -> None:
+        text = "v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n"
+        expected = glb_writer.parse_obj(text, is_path=False)
+        self.assertEqual(expected[0]["indices"], [0, 1, 2])
+
+        with tempfile.TemporaryDirectory() as folder:
+            source = os.path.join(folder, "triangle.obj")
+            with open(source, "w", encoding="utf-8-sig", newline="\n") as f:
+                f.write(text)
+            with self.subTest(source="file"):
+                self.assertEqual(glb_writer.parse_obj(source), expected)
+
+        with self.subTest(source="in-memory text"):
+            self.assertEqual(glb_writer.parse_obj("\ufeff" + text, is_path=False), expected)
+
     def test_parse_obj_zup_to_yup(self):
         # OBJ coordinate (1, 2, 3) in Z-up becomes (1, 3, -2) in glTF Y-up
         obj_text = "\n".join([

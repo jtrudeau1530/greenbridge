@@ -242,7 +242,7 @@ def parse_obj(
     # Preserve order of appearance for (group_index, material_name) primitives.
     builders: dict[tuple[int, str], dict] = {}
 
-    for raw_line in text.splitlines():
+    for raw_line in text.removeprefix("\ufeff").splitlines():
         line = raw_line.strip()
         if not line or line[0] == "#":
             continue
