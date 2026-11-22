@@ -7,6 +7,7 @@ import glob
 import math
 import os
 import re
+import struct
 
 import pytest
 
@@ -831,13 +832,62 @@ def test_gather4_l_run_time_sampler_selects_the_mode_from_the_sgpr(make_shader):
     text = shader.translate()
     shader.validate(text)
     assert _gather_address_bit_offsets(text) == [0, 3]      # CLAMP_X and CLAMP_Y
-    assert _count(text, "OpSMod") == 8 and _count(text, "OpSLessThan") == 4 and _count(text, "OpSGreaterThanEqual") == 4
+    # OpSLessThan: 4 for mirror, 8 for the border-mode range tests (SHADER-348: two per texel coordinate)
+    assert _count(text, "OpSMod") == 8 and _count(text, "OpSLessThan") == 12 and _count(text, "OpSGreaterThanEqual") == 4
 
 
-@pytest.mark.parametrize("word0", [4, 0x30, 0x7, 0x8000])
-def test_gather4_l_literal_border_or_unnormalized_sampler_is_unsupported(word0, make_shader):
+@pytest.mark.parametrize("word0", [4, 0x28, 0x8000])
+def test_gather4_l_literal_half_border_or_unnormalized_sampler_is_unsupported(word0, make_shader):
     with pytest.raises(rdna2spirv.Unsupported):
         make_shader(_gather_l(word0)).translate()
+
+
+# SHADER-348: modes 6 (clamp border) and 7 (mirror once border) give a tap outside the image the border colour's
+# channel, BORDER_COLOR_TYPE = S# word 3 [31:30] (0 transparent black, 1 opaque black, 2 opaque white, 3 table).
+def _gather_l_border(word0, word3, dynamic=False, dmask=1):
+    return program(
+        "s_mov_b32 s8, 0\ns_mov_b32 s9, 0\ns_mov_b32 s10, 0\ns_mov_b32 s11, 0\n"
+        "s_mov_b32 s12, 0\ns_mov_b32 s13, 0\ns_mov_b32 s14, 0\ns_mov_b32 s15, 0\n"
+        f"s_mov_b32 s16, {word0}\ns_mov_b32 s17, 0\ns_mov_b32 s18, 0\ns_mov_b32 s19, {word3}\n"
+        + ("s_add_u32 s16, s16, 0\ns_add_u32 s19, s19, 0\n" if dynamic else "")
+        + "v_mov_b32 v10, 0.5\nv_mov_b32 v11, 0.5\nv_mov_b32 v12, 0\n"
+        f"image_gather4_l v[0:3], v[10:12], s[8:15], s[16:19] dmask:{dmask:#x} dim:SQ_RSRC_IMG_2D")
+
+
+def _float_bits(text, name):
+    defs = dict(re.findall(r"^\s*(%\w+) = (.+)$", text, re.M))
+    expr = defs[name].split()
+    if expr[:2] == ["OpBitcast", "%float"]:
+        expr = defs[expr[2]].split()
+    assert expr[:2] in (["OpConstant", "%uint"], ["OpConstant", "%float"]), expr
+    return int(expr[2]) if expr[1] == "%uint" else struct.unpack("<I", struct.pack("<f", float(expr[2])))[0]
+
+
+@pytest.mark.parametrize("word0, taps", [(0x6, 4), (0x30, 4), (0x36, 4), (0x7, 4), (0x38, 4)])
+# Word 3 keeps BORDER_COLOR_PTR = 0x100 so llvm-mc prints it as an integer: 0x40000000 alone is the inline float 2.0,
+# which the translator reads at run time (covered by the run-time test below).
+@pytest.mark.parametrize("word3, dmask, one", [(0x100, 1, False), (1 << 30 | 0x100, 1, False), (1 << 30 | 0x100, 8, True),
+                                               (2 << 30 | 0x100, 1, True)])
+def test_gather4_l_literal_border_mode_selects_the_border_colour(word0, taps, word3, dmask, one, make_shader):
+    shader = make_shader(_gather_l_border(word0, word3, dmask=dmask))
+    text = shader.translate()
+    shader.validate(text)
+    selects = re.findall(r"= OpSelect %float %\w+ (%\w+) %\w+$", text, re.M)
+    assert len(selects) == taps                     # each of the four taps can leave the image
+    assert {_float_bits(text, s) for s in selects} == {0x3F800000 if one else 0}
+
+
+def test_gather4_l_literal_border_colour_from_the_table_is_unsupported(make_shader):
+    with pytest.raises(rdna2spirv.Unsupported):
+        make_shader(_gather_l_border(0x36, 3 << 30 | 0x100)).translate()
+
+
+def test_gather4_l_run_time_sampler_reads_the_border_type_from_word3(make_shader):
+    shader = make_shader(_gather_l_border(0x36, 2 << 30, dynamic=True))
+    text = shader.translate()
+    shader.validate(text)
+    assert re.search(r"= OpShiftRightLogical %uint %\w+ (%\w+)$", text, re.M)
+    assert len(re.findall(r"= OpSelect %float %\w+ %\w+ %\w+$", text, re.M)) >= 4
 
 
 # SHADER-152: the explicit-LOD gather's mip is floor(LOD + 0.5), ties up, like the native gather on Radeon
@@ -977,6 +1027,29 @@ def test_irreducible_cfg_node_splitting(pattern, make_shader, monkeypatch):
     assert "OpSwitch" not in spv_struct
 
 
+def test_deep_structured_nesting_uses_the_dispatch_loop(make_shader, monkeypatch):
+    """SHADER-299: a tree nested deeper than MAX_STRUCTURED_DEPTH is emitted in the flat dispatch-loop form, which
+    validates at the same depth in a fraction of the time; raising the bound brings the structured form back."""
+    # cfg_structure hoists tails past 16 guards deep (#1904), so a chain never structures deeper than 16; the bound is
+    # set below that here so the chain still exceeds it.
+    monkeypatch.setattr(rdna2spirv, "MAX_STRUCTURED_DEPTH", 8)
+    n = 24
+    body = "".join(f"s_cmp_eq_u32 s0, {i}\ns_cbranch_scc0 {3 + 2 * (n - i - 1)}\n" for i in range(n))
+    shader = make_shader(body + "v_mov_b32 v8, s0\nexp mrt0 v8, v8, v8, v8 done vm\ns_endpgm\n",
+                         name="ps_nesting_bound")
+    asm = shader.translate()
+    shader.validate(asm)
+    gen = rdna2spirv.translate.last_gen
+    assert gen.nesting > rdna2spirv.MAX_STRUCTURED_DEPTH
+    assert gen.control_flow == "dispatch loop" and "OpSwitch %pcv" in asm
+
+    monkeypatch.setattr(rdna2spirv, "MAX_STRUCTURED_DEPTH", gen.nesting)
+    structured = shader.translate()
+    shader.validate(structured)
+    assert rdna2spirv.translate.last_gen.control_flow == "structured"
+    assert "OpSwitch" not in structured
+
+
 MASK_REUSE_HEAD = "; mattr: +wavefrontsize64,-wavefrontsize32\nv_mbcnt_lo_u32_b32 v1, -1, 0\nv_mbcnt_hi_u32_b32 v1, -1, v1\n"
 
 
@@ -1114,6 +1187,22 @@ def test_repeated_tbuffer_loads_share_normalization(make_shader):
     spv = shader.translate()
     shader.validate(spv)
     assert spv.count("FindUMsb") == 2
+
+
+def test_array_resinfo_queries_width_height_layers_and_mip_count(make_shader):
+    shader = make_shader(
+        "v_mov_b32_e32 v1, 1\n"
+        "image_get_resinfo v[4:7], v1, s[8:15] dmask:0xf dim:SQ_RSRC_IMG_2D_ARRAY\n"
+        "s_waitcnt vmcnt(0)\nexp mrt0 v4, v5, v6, v7 done vm\ns_endpgm\n",
+        name="ps_array_resinfo",
+    )
+    asm = shader.translate()
+    shader.validate(asm)
+    assert "OpDecorate %images_arr Binding 3" in asm
+    size = re.search(r"(%\w+) = OpImageQuerySizeLod %v3int (%\w+) %\w+", asm)
+    assert size and f"OpImageQueryLevels %int {size[2]}" in asm
+    for axis in range(3):
+        assert f"OpCompositeExtract %int {size[1]} {axis}" in asm
 
 
 def test_image_sample_d16_avoids_packhalf2x16(make_shader):
@@ -1298,6 +1387,40 @@ def test_unnormalized_buffer_store_keeps_nan_bits(fmt, make_shader):
     memory = {0x1000: 0}
     _load_mini_interp().run_fragment(shader.translate(), memory=memory)
     assert memory[0x1000] == 0xFFC01000
+
+
+# GFX10 32-bit integer formats by component count: UINT code, SINT code (gfx10_formats.json).
+INT32_FORMATS = [(1, 20, 21), (2, 62, 63), (3, 72, 73), (4, 75, 76)]
+
+
+@pytest.mark.parametrize("n, uint_fmt, sint_fmt", INT32_FORMATS)
+def test_int32_buffer_formats_load_and_store_raw_bits(n, uint_fmt, sint_fmt, make_shader):
+    """SHADER-257: the 32-bit SINT typed-buffer formats (and 32_32_32_UINT) load and store each dword unchanged, as
+    their UINT twins do. Negative values and NaN-like patterns must survive both ways; a load's missing channels
+    repeat the format's own, as for every other format (SHADER-86)."""
+    si = _load_mini_interp()
+    words = [0xFFFFFFFF, 0x80000000, 0x7FC01000, 0x00000005][:n]
+    for fmt in (uint_fmt, sint_fmt):
+        desc = (f"s_mov_b32 s0, 0x1000\ns_mov_b32 s1, 0\ns_mov_b32 s2, {4 * n}\n"
+                f"s_mov_b32 s3, {0x31000fac | fmt << 12:#x}\n")
+        load = desc + ("buffer_load_format_xyzw v[4:7], off, s[0:3], 0\ns_waitcnt vmcnt(0)\n"
+                       "exp mrt0 v4, v5, v6, v7 done vm\ns_endpgm\n")
+        shader = make_shader(load, name=f"ps_int32_load_{fmt}")
+        spv = shader.translate()
+        shader.validate(spv)
+        memory = {0x1000 + 4 * i: w for i, w in enumerate(words)}
+        out = si.run_fragment(spv, memory=memory)["%out_mrt0"]
+        assert list(out) == [words[c % n] for c in range(4)], fmt
+
+        setup = "".join(f"v_mov_b32 v{4 + i}, {w:#x}\n" for i, w in enumerate(words))
+        regs = "v4" if n == 1 else f"v[4:{3 + n}]"
+        store = desc + setup + f"buffer_store_format_{'xyzw'[:n]} {regs}, off, s[0:3], 0\ns_endpgm\n"
+        shader = make_shader(store, name=f"ps_int32_store_{fmt}")
+        spv = shader.translate()
+        shader.validate(spv)
+        memory = {0x1000 + 4 * i: 0xDEADBEEF for i in range(5)}
+        si.run_fragment(spv, memory=memory)
+        assert [memory[0x1000 + 4 * i] for i in range(5)] == words + [0xDEADBEEF] * (5 - n), fmt
 
 
 @pytest.mark.parametrize("fmt, shifts, channels", [(56, (0, 8, 16, 24), (64, 128, 191, 255)),

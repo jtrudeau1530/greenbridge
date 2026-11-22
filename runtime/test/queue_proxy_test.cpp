@@ -33,6 +33,7 @@
 #include <cstring>
 #include <cwchar>
 #include <iterator>
+#include <mutex>
 #include <string>
 #include <system_error>
 #include <thread>
@@ -822,17 +823,14 @@ ChildRun run_process(const wchar_t* exe, const wchar_t* arguments, DWORD limit_m
                      RunnerFault fault = RunnerFault::none) {
     ChildRun run;
     std::wstring command = L"\"" + std::wstring(exe) + L"\" " + arguments;
-    SECURITY_ATTRIBUTES inherit{sizeof(inherit), nullptr, TRUE};
+    // Both ends are made uninheritable. The write end becomes inheritable only while the start lock is held, just for
+    // its own child's CreateProcessW: children are started from several threads at once (check_differential), and a
+    // write end inheritable at any other time would also go to a sibling started meanwhile, which would then keep this
+    // pipe open after this child ended.
     HANDLE read_end = nullptr, write_end = nullptr;
     if (fault == RunnerFault::pipe) SetLastError(ERROR_NOT_ENOUGH_MEMORY);
-    if (fault == RunnerFault::pipe || !CreatePipe(&read_end, &write_end, &inherit, 0)) {
+    if (fault == RunnerFault::pipe || !CreatePipe(&read_end, &write_end, nullptr, 0)) {
         report_runner_error("CreatePipe");
-        return run;
-    }
-    if (!SetHandleInformation(read_end, HANDLE_FLAG_INHERIT, 0)) {
-        report_runner_error("SetHandleInformation");
-        CloseHandle(read_end);
-        CloseHandle(write_end);
         return run;
     }
     STARTUPINFOW startup{sizeof(startup)};
@@ -841,10 +839,21 @@ ChildRun run_process(const wchar_t* exe, const wchar_t* arguments, DWORD limit_m
     startup.hStdError = GetStdHandle(STD_ERROR_HANDLE);
     startup.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
     PROCESS_INFORMATION process{};
-    const BOOL started =
-        CreateProcessW(exe, command.data(), nullptr, nullptr, TRUE, 0, nullptr, nullptr, &startup, &process);
-    const DWORD start_error = GetLastError();
-    CloseHandle(write_end);  // the child holds the only write end now: the reader sees the pipe end when it is gone
+    BOOL started = FALSE;
+    DWORD start_error = 0;
+    {
+        static std::mutex start_lock;
+        const std::lock_guard<std::mutex> hold(start_lock);
+        if (!SetHandleInformation(write_end, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT)) {
+            report_runner_error("SetHandleInformation");
+            CloseHandle(read_end);
+            CloseHandle(write_end);
+            return run;
+        }
+        started = CreateProcessW(exe, command.data(), nullptr, nullptr, TRUE, 0, nullptr, nullptr, &startup, &process);
+        start_error = GetLastError();
+        CloseHandle(write_end);  // the child holds the only write end now: the reader sees the pipe end when it is gone
+    }
     if (!started) {
         std::fprintf(stderr, "child runner: CreateProcessW \"%ls\" failed (error %lu)\n", exe, start_error);
         CloseHandle(read_end);
@@ -1044,14 +1053,100 @@ int check_child_runner() {
     return 0;
 }
 
+// How many differential children run at once: LEONIDA_QUEUE_PROXY_JOBS when set (1 = one after another, as before),
+// else half the logical processors, from 1 to 8. Each child pays its own device start-up (about 5 s each on an AMD
+// RDNA2 iGPU, TEST-242), and that waiting is what running them side by side hides.
+unsigned differential_jobs() {
+    char value[16] = {};
+    const DWORD length = GetEnvironmentVariableA("LEONIDA_QUEUE_PROXY_JOBS", value, sizeof(value));
+    if (length > 0 && length < sizeof(value)) {  // set, and short enough to be a number
+        const unsigned long jobs = std::strtoul(value, nullptr, 10);
+        if (jobs >= 1 && jobs <= 64) return static_cast<unsigned>(jobs);
+    }
+    const unsigned half = std::thread::hardware_concurrency() / 2;
+    return half < 1 ? 1 : half > 8 ? 8 : half;
+}
+
+// Cases that fault in the PC runtime (17..20, 25), modify device residency (1, 2, 26..29), or touch the shared
+// handle subsystem (30, 31) are isolated in child processes so the host device remains completely clean and intact.
+// Non-destructive argument-validation and proxy-wrapping cases run in-process for speed (<1 ms each).
+bool is_isolated_diff_case(int index) {
+    if (index == 1 || index == 2) return true;         // residency (descriptor heap)
+    if (index >= 17 && index <= 20) return true;       // faults on PC runtime (queue null args)
+    if (index == 25) return true;                      // faults on PC runtime (null fence entry)
+    if (index >= 26 && index <= 29) return true;       // residency (MakeResident/Evict/Priority/Enqueue)
+    if (index == 30 || index == 31) return true;       // shared handle creation
+    return false;
+}
+
+ChildResult run_in_process(const char* label, ID3D12Device* target_device, int index, bool through_proxy,
+                           unsigned long validation_errors = 0) {
+    ChildResult r{};
+    Event event;
+    DiffContext context{};
+    Ref<ID3D12CommandQueue> queue;
+    Ref<ID3D12Fence> fence, second;
+    if (make_context(label, target_device, context, queue, fence, second)) return r;
+    if (xs::is_queue_proxy(context.queue) != through_proxy || xs::is_fence_proxy(context.fence) != through_proxy) {
+        return r;
+    }
+    context.event = event.h;
+    HRESULT result = S_OK;
+    const bool ran = run_guarded(kDiffCases[index].run, &context, &result);
+    const HRESULT removed = ran ? target_device->GetDeviceRemovedReason() : S_OK;
+    r.ok = true;
+    r.ran = ran ? 1 : 0;
+    r.hr = static_cast<unsigned long>(result);
+    r.removed = static_cast<unsigned long>(removed);
+    r.validation = validation_errors;
+    return r;
+}
+
 // Each case, in a child process for the real object and in another for the proxy: the same HRESULT, the device
 // removed (or not) alike, and no validation errors. A case the real runtime faults on is reported, not compared.
+// Non-destructive argument-validation and proxy cases run in-process (<1 ms each instead of ~5 s per device creation).
+// Faulting, residency, or shared cases run in isolated child processes using differential_jobs() workers.
 int check_differential(const Backend& b) {
     const char* label = b.label;
     int compared = 0, faulting = 0;
-    for (int i = 0; i < static_cast<int>(std::size(kDiffCases)); ++i) {
+    constexpr int kCases = static_cast<int>(std::size(kDiffCases));
+    std::vector<ChildResult> results(2 * kCases);  // [2 * case] real, [2 * case + 1] proxy
+
+    const bool force_isolate_all = GetEnvironmentVariableA("LEONIDA_QUEUE_PROXY_ISOLATE_ALL", nullptr, 0) > 0;
+
+    std::vector<int> child_jobs;
+    for (int i = 0; i < kCases; ++i) {
+        if (force_isolate_all || is_isolated_diff_case(i)) {
+            child_jobs.push_back(2 * i);      // real
+            child_jobs.push_back(2 * i + 1);  // proxy
+        } else {
+            results[2 * i] = run_in_process(label, b.real, i, false);
+            results[2 * i + 1] = run_in_process(label, b.device, i, true);
+        }
+    }
+
+    if (!child_jobs.empty()) {
+        std::atomic<size_t> next{0};
+        const auto work = [&] {
+            for (size_t idx; (idx = next.fetch_add(1)) < child_jobs.size();) {
+                const int job = child_jobs[idx];
+                results[job] = run_child(b.kind, job / 2, job % 2 == 1);
+            }
+        };
+        const unsigned jobs = differential_jobs();
+        std::vector<std::thread> pool;
+        try {
+            for (unsigned t = 1; t < jobs && t < child_jobs.size(); ++t) pool.emplace_back(work);
+        } catch (const std::system_error& e) {
+            std::fprintf(stderr, "%s: %zu of %u differential runner threads (%s)\n", label, pool.size() + 1, jobs,
+                         e.what());
+        }
+        work();
+        for (std::thread& t : pool) t.join();
+    }
+    for (int i = 0; i < kCases; ++i) {
         const char* name = kDiffCases[i].name;
-        const ChildResult want = run_child(b.kind, i, false);
+        const ChildResult& want = results[2 * i];
         if (!want.ok) {
             std::fprintf(stderr, "%s: %s: the real-object child did not report\n", label, name);
             return 1;
@@ -1061,7 +1156,7 @@ int check_differential(const Backend& b) {
             ++faulting;
             continue;
         }
-        const ChildResult got = run_child(b.kind, i, true);
+        const ChildResult& got = results[2 * i + 1];
         if (!got.ok || !got.ran || got.hr != want.hr || got.removed != want.removed || got.validation ||
             want.validation) {
             std::fprintf(stderr,

@@ -16,6 +16,7 @@ import check
 
 GOOD_FMT = struct.pack("<64I", *check.FMT_1010102_WORDS, *[0xEEEEEEEE] * 48)
 GOOD_XY_XYZ = struct.pack("<192I", *check.FMT_XY_XYZ_WORDS, *[0xEEEEEEEE] * 108)
+GOOD_TBUFFER_STORE = struct.pack("<192I", *check.TBUFFER_STORE_WORDS, *[0xEEEEEEEE] * 140)
 FULL_WAVE = ((0, "compute subgroup size: 64\n0 mismatches\n"),
              (0, "compute subgroup size: 64\nout[0..7] = 32 16 24 40 8 48 4008636142 4008636142\n"))
 
@@ -27,12 +28,25 @@ PARTIAL = {n for n, _ in check.W64X_PARTIAL}
 WAVE32_WORDS = {n: w for n, w in check.CS_DUMPS if n in check.WAVE32_DUMPS and n not in ("cs_store", "cs_smem_soffset_imm")}
 
 
-# All check.py cases, including the four vk_store_test shaders and the three mesh fixtures.
-TOTAL = (len(check.COMPUTE) + 3 + len(check.CS_DUMPS) + len(check.W64X_DUMPS) + len(check.W64X_PARTIAL) + 4
+# All check.py cases, including the four vk_store_test shaders and the three mesh fixtures, and TEST-184's
+# vk_store_test "words" fixtures and image_get_lod draws.
+TOTAL = (len(check.COMPUTE) + 5 + len(check.CS_DUMPS) + len(check.W64X_DUMPS) + len(check.W64X_PARTIAL) + 4
          + len(check.PIXEL_TESTS) + len(check.CLIP_TESTS) + len(check.BOUNDS) + len(check.GLOBAL_OFFSET)
          + len(check.MIP_TEST_PASSES) + len(check.GRADIENT_TESTS)
-         + 10)  # three mesh fixtures, ps_tex, cs_cmpx_class_f32, cs_user_sgprs, cs_cvt_f32_sat, cs_fma_fused, ps_gather_wrap and ps_ssharp
+         + len(check.STORE_WORDS) + len(check.GET_LOD_TESTS)
+         + len(check.TEXTURE_CONSTANTS) + 11)  # three mesh fixtures, ps_tex, ps_imgatomic, five compute fixtures and
+         # ps_ssharp
 CVT = {bits: [u, s] for bits, u, s in check.CVT_F32_SAT_CASES}
+
+
+def words_output(name, flip=None):
+    """What vk_store_test prints in "words" mode when the shader left check.store_words(name) in the three images;
+    flip = (image, word index) changes one word."""
+    lines = ["device: fake"]
+    for image, words in zip(check.STORE_IMAGES, check.store_words(name)):
+        words = [w ^ 1 if flip == (image, i) else w for i, w in enumerate(words)]
+        lines.append(f"{image} words: " + " ".join(f"{w:#010x}" for w in words))
+    return "\n".join(lines) + "\n"
 
 
 def cvt_answer(env, wrong_for=None):
@@ -53,9 +67,13 @@ class Wave64Checks(unittest.TestCase):
                 if fmt[1] is not None:
                     dump.write_bytes(fmt[1])
                 return fmt[0], "out[0..7] = 0 0 0 0 0 0 0 0\n"   # stdout is not the oracle
-            if name == "cs_fmt_xy_xyz":
+            if name == "cs_fmt_sint32":
+                self.assertEqual((args, env["VKC_OUT_WORDS"]), (("1", "dump"), "64"))
+                Path(env["VKC_DUMP"]).write_bytes(struct.pack("<64I", *check.FMT_SINT32_WORDS))
+                return 0, ""
+            if name in ("cs_fmt_xy_xyz", "cs_tbuffer_store"):
                 self.assertEqual((args, env["VKC_OUT_WORDS"]), (("1", "dump"), "192"))
-                Path(env["VKC_DUMP"]).write_bytes(GOOD_XY_XYZ)
+                Path(env["VKC_DUMP"]).write_bytes(GOOD_XY_XYZ if name == "cs_fmt_xy_xyz" else GOOD_TBUFFER_STORE)
                 return 0, "out[0..7] = 0 0 0 0 0 0 0 0\n"
             if name == "cs_user_sgprs":
                 # The seeded words come back only if check.py passed them in VKC_SGPRS.
@@ -107,6 +125,8 @@ class Wave64Checks(unittest.TestCase):
             if name in dict(check.BOUNDS):    # the SMEM / raw MUBUF rule tests: their words, then the 0xee fill
                 words = (dict(check.BOUNDS)[name] + [0xEEEEEEEE] * 8)[:8]
                 return 0, "out[0..7] = " + " ".join(map(str, words)) + "\n"
+            if name == "cs_cvt_pk_u8":
+                return 0, "out[0..7] = " + " ".join(map(str, check.CVT_PK_U8_WORDS)) + "\n"
             if name == "cs_store":
                 return 0, "out[0..7] = " + " ".join(map(str, (check.CS_STORE + [0] * 8)[:8])) + "\n"
             if name == "cs_smem_soffset_imm":
@@ -117,13 +137,16 @@ class Wave64Checks(unittest.TestCase):
                 return 0, "2x3x4 workgroup Y/Z: 0 mismatches\n"
             if name in ("cs_imgstore", "cs_imgload", "cs_imgload_d16", "cs_sample_lz_int_d16"):   # vk_store_test checks
                 return 0, "0 bad\n0 bad\n0 bad\n"
+            if name in check.STORE_WORDS:     # vk_store_test "words": the three images, judged by check.py
+                self.assertEqual(args, ("words",))
+                return 0, words_output(name)
             return 0, "0 mismatches\n"
 
         with tempfile.TemporaryDirectory() as tmp:
             spirv = Path(tmp) / "spirv"
             spirv.mkdir()
             (spirv / "cs_wavemask.spv").touch()
-            for name in WAVE64_DUMPS:
+            for name in (*WAVE64_DUMPS, *check.STORE_WORDS):
                 (spirv / f"{name}.spv").touch()
             if not missing_ballot:
                 (spirv / "cs_wave64_ballot.spv").touch()
@@ -133,7 +156,8 @@ class Wave64Checks(unittest.TestCase):
                   patch.object(check, "pixel_test", return_value=""), patch.object(check, "texture_mip_test", return_value=""),
                   patch.object(check, "bindless_test", return_value=""), patch.object(check, "W64_EMULATED", emulated),
                   patch.object(check, "texture_gradient_a16_test", return_value=""),
-                  patch.object(check, "gather_wrap_test", return_value=""),
+                  patch.object(check, "texture_constant_test", return_value=""),
+                  patch.object(check, "get_lod_test", return_value=""),
                   patch.object(check, "sampler_test", return_value=""),
                   contextlib.redirect_stdout(output)):
                 status = check.main()
@@ -236,6 +260,23 @@ class FloatToIntSweep(unittest.TestCase):
         self.assertIn("1 of 16 inputs wrong", problem)
         self.assertIn("0x4f000000", problem)
 
+    def test_a_device_that_cannot_pin_the_wave_size_skips_instead_of_failing(self):
+        # Before: on a 4..32 device (Apple under MoltenVK) every dispatch came back as unpinned_subgroup_skip's Skip,
+        # and the sweep reported it as "16 of 16 inputs wrong, first 0x00000000: SKIP (...)", a failure.
+        calls = []
+
+        def harness(_tool, _shader, *_args, env=None):
+            calls.append(env.get("VKC_SUBGROUP_SIZE"))
+            return 1, "compute subgroup size: 32 not available\n"
+
+        with patch.object(check, "run", side_effect=harness), \
+                patch.object(check, "subgroup_size", return_value=32):
+            problem = check.cvt_f32_sat_test("tools", "spirv")
+        self.assertIsInstance(problem, check.Skip)
+        self.assertIn("can't run this shader at 32 lanes", problem)
+        self.assertNotIn("inputs wrong", problem)
+        self.assertEqual(calls, ["32"])   # the first dispatch decides; the other 15 would say the same
+
     def test_inputs_match_the_interpreter_test(self):
         # The GPU sweep and tests/semantic/test_float_to_int.py must judge the same inputs the same way.
         src = (Path(__file__).resolve().parent / "semantic" / "test_float_to_int.py").read_text(encoding="utf-8")
@@ -306,6 +347,24 @@ class PixelDeviceLimits(unittest.TestCase):
         self.assertIsInstance(problem, check.Skip)
         self.assertIn("no subgroup width", problem)
 
+    @staticmethod
+    def readlane_pixels(words=(0x40000079, 0x40000010, 0x40000064, 0x400000be)):
+        return struct.pack("<4I", *words) * (64 * 64)
+
+    def test_wave64_pixel_shader_skips_where_64_cannot_be_required(self):
+        out = "device: fake (subgroup 8..8)\nok 64x64\n"
+        problem = self.run_pixel("ps_w64x_readlane", 0, out, data=self.readlane_pixels((0, 0, 0, 0)))
+        self.assertIsInstance(problem, check.Skip)
+        self.assertIn("64-wide fragment subgroup", problem)
+        self.assertIn("8..8", problem)
+
+    def test_wave64_pixel_shader_is_judged_when_64_was_required(self):
+        out = "device: fake (subgroup 32..64)\nfragment subgroup size: 64 required\nok 64x64\n"
+        self.assertEqual(self.run_pixel("ps_w64x_readlane", 0, out, data=self.readlane_pixels()), "")
+        problem = self.run_pixel("ps_w64x_readlane", 0, out, data=self.readlane_pixels((0, 0, 0, 0)))
+        self.assertNotIsInstance(problem, check.Skip)
+        self.assertIn("pixels differ", problem)
+
     def test_bitmask_perm_skips_when_variable_device_runs_narrow_fragment_subgroup(self):
         out = "device: Intel(R) HD Graphics 530 (subgroup 8..32)\nok 64x64\n"
         for width in (8, 16):
@@ -338,6 +397,37 @@ class PixelDeviceLimits(unittest.TestCase):
                 problem = self.run_pixel("ps_bitmask_perm", 0, out, data=bad)
                 self.assertNotIsInstance(problem, check.Skip)
                 self.assertIn("wrong", problem)
+
+    @staticmethod
+    def vcmpx_pixels(words=(0xf05b2a48, 0xf05e8a12, 0xb174be18, 0x15550000)):
+        return b"".join(struct.pack("<4I", *words) for _ in range(64 * 64))
+
+    def test_vcmpx_forms_skips_on_variable_fragment_subgroup(self):
+        # TEST-205: no lane IDs in mrt0, so the skip is from the reported range (same class as #1318).
+        out = "device: Intel UHD 770 (subgroup 8..32)\nok 64x64\n"
+        problem = self.run_pixel("ps_vcmpx_forms", 0, out, data=self.vcmpx_pixels())
+        self.assertIsInstance(problem, check.Skip)
+        self.assertIn("8..32", problem)
+        self.assertIn("needs 32", problem)
+
+    def test_vcmpx_forms_skips_below_32_lanes(self):
+        out = "device: fake (subgroup 8..8)\nok 64x64\n"
+        problem = self.run_pixel("ps_vcmpx_forms", 0, out, data=self.vcmpx_pixels())
+        self.assertIsInstance(problem, check.Skip)
+        self.assertIn("narrower than 32 lanes", problem)
+
+    def test_vcmpx_forms_is_judged_at_32_lanes(self):
+        out = "device: NVIDIA (subgroup 32..32)\nok 64x64\n"
+        self.assertEqual(self.run_pixel("ps_vcmpx_forms", 0, out, data=self.vcmpx_pixels()), "")
+        bad = self.vcmpx_pixels((0, 0, 0, 0xffff))  # lane-mask-looking word3, as on UHD 770
+        problem = self.run_pixel("ps_vcmpx_forms", 0, out, data=bad)
+        self.assertNotIsInstance(problem, check.Skip)
+        self.assertIn("differ", problem)
+
+    def test_vcmpx_forms_skips_without_a_subgroup_width(self):
+        problem = self.run_pixel("ps_vcmpx_forms", 0, "ok 64x64\n", data=self.vcmpx_pixels())
+        self.assertIsInstance(problem, check.Skip)
+        self.assertIn("no subgroup width", problem)
 
 
 class SeededPixelTests(unittest.TestCase):
@@ -410,6 +500,137 @@ class GradientSampleChecks(unittest.TestCase):
             failure = check.texture_gradient_a16_test("tools", "spirv", "ps_texture_grad_cl_a16")
         self.assertNotIsInstance(failure, check.Skip)
         self.assertIn("device lost", failure)
+
+class StoreWordsChecks(unittest.TestCase):
+    """TEST-184: the image atomics and image_get_resinfo fixtures, judged from vk_store_test's three word lines."""
+
+    def test_words_of_the_asm_headers(self):
+        uint, sint, volume = check.store_words("cs_imgatomic")
+        self.assertEqual(uint[:17], [0x54, 0xFFFFFF9D, 6, 0xF067, 0x97, 0xFFFFFFF0, 106, 107, 200, 109, 5,
+                                     0xFFFFFFF0, 112, 0xC0FFEE, 114, 122, 180])
+        self.assertEqual(uint[17:], [100 + i for i in range(17, 64)])
+        self.assertEqual(sint[:16], [*range(100, 115), 7])
+        self.assertEqual(sint[16:], [0x100000000 - 2 * i for i in range(16, 64)])
+        self.assertEqual(volume, [200 + i for i in range(64)])
+        uint, sint, volume = check.store_words("cs_imgatomic3d")
+        self.assertEqual(uint, [100 + i for i in range(64)])
+        self.assertEqual(sint[:6], [257, 219, 244, 206, 230, 0xFF])
+        # texel i = 16z + 4y + x of the six cases: (1,2,3), (3,0,1), (0,3,2), (2,1,0), (2,3,1), (3,1,2)
+        self.assertEqual({i: w for i, w in enumerate(volume) if w != 200 + i},
+                         {57: 257 + 16, 19: 3, 6: 0xD00D, 39: 239 ^ 0xFF})
+        self.assertEqual((volume[44], volume[30]), (244, 230))      # smax with -16 and the missed cmpswap keep theirs
+        uint, sint, volume = check.store_words("cs_resinfo")
+        self.assertEqual(uint[:19], [16, 4, 1, 5, 8, 2, 1, 5, 2, 1, 1, 5, 4, 1, 0xABCD, 115, 2, 5, 5])
+        self.assertEqual((sint, volume), ([-2 * i & 0xFFFFFFFF for i in range(64)], [200 + i for i in range(64)]))
+
+    def test_expected_words_pass_and_any_other_word_fails(self):
+        for name in check.STORE_WORDS:
+            with self.subTest(name=name):
+                self.assertEqual(check.store_words_problem(words_output(name), name), "")
+                for image in check.STORE_IMAGES:
+                    for index in (0, 20, 63):     # a word the fixture changes or one it must leave alone
+                        problem = check.store_words_problem(words_output(name, flip=(image, index)), name)
+                        self.assertIn(f"1 of 64 {image} words differ; first word {index}:", problem)
+
+    def test_one_fixture_is_not_another(self):
+        for printed, judged_as in (("cs_resinfo", "cs_imgatomic"), ("cs_imgatomic", "cs_imgatomic3d"),
+                                   ("cs_imgatomic3d", "cs_resinfo")):
+            with self.subTest(printed=printed, judged_as=judged_as):
+                self.assertIn("uint words differ", check.store_words_problem(words_output(printed), judged_as))
+
+    def test_missing_or_short_lines_fail(self):
+        full = words_output("cs_imgatomic")
+        self.assertIn("printed no volume words", check.store_words_problem(full.rsplit("volume", 1)[0], "cs_imgatomic"))
+        self.assertIn("printed no uint words", check.store_words_problem("device: fake\n", "cs_imgatomic"))
+        short = full.replace(" 0x00000054", "", 1)                   # 63 words in the first line
+        self.assertIn("printed no uint words", check.store_words_problem(short, "cs_imgatomic"))
+
+    def test_the_tool_runs_in_words_mode_and_its_exit_codes_count(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "cs_imgatomic.spv").touch()
+            with patch.object(check, "run", return_value=(0, words_output("cs_imgatomic"))) as run:
+                self.assertEqual(check.store_words_test("tools", tmp, "cs_imgatomic"), "")
+            self.assertIn("vk_store_test", run.call_args.args[0])
+            self.assertEqual(run.call_args.args[2:], ("words",))
+            answer = 77, "unsupported: shaderStorageImageWriteWithoutFormat=0 shaderInt64=1\n"
+            with patch.object(check, "run", return_value=answer):
+                skip = check.store_words_test("tools", tmp, "cs_imgatomic")
+            self.assertIsInstance(skip, check.Skip)
+            self.assertIn("shaderStorageImageWriteWithoutFormat=0", skip)
+            with patch.object(check, "run", return_value=(1, "FAILED vkCreateComputePipelines -> -3\n")):
+                failure = check.store_words_test("tools", tmp, "cs_imgatomic")
+            self.assertNotIsInstance(failure, check.Skip)
+            self.assertIn("exit 1", failure)
+            self.assertEqual(check.store_words_test("tools", tmp, "cs_resinfo"), "missing cs_resinfo.spv")
+
+
+class GetLodChecks(unittest.TestCase):
+    """TEST-184: image_get_lod frames, (clamped, calculated) pairs within a sixteenth of a level."""
+
+    @staticmethod
+    def frame(pixel):
+        return struct.pack("<4f", *pixel) * (64 * 64)
+
+    def run_test(self, name, frames, code=0, out=""):
+        """get_lod_test with a fake vk_texture_test that writes frames[S# word 1]; returns (result, calls)."""
+        calls = []
+
+        def harness(_tool, _vs, _fs, raw, *args, env=None):
+            calls.append(args)
+            if not code:
+                Path(raw).write_bytes(frames[args[2]])
+            return code, out
+
+        with tempfile.TemporaryDirectory() as tmp:
+            for shader in ("vk_texture_test" + check.EXE, "vs_ids.spv", name + ".spv"):
+                (Path(tmp) / shader).touch()
+            with patch.object(check, "run", side_effect=harness):
+                return check.get_lod_test(tmp, tmp, name), calls
+
+    def test_expected_frames_pass_within_the_tolerance(self):
+        for name, draws in check.GET_LOD_TESTS.items():
+            with self.subTest(name=name):
+                frames = {limits: self.frame(want) for limits, _, want in draws}
+                result, calls = self.run_test(name, frames)
+                self.assertEqual(result, "")
+                self.assertEqual([c[2] for c in calls], [limits for limits, _, _ in draws])
+                self.assertEqual(["--two-mip" in c for c in calls], [two_mip for _, two_mip, _ in draws])
+        want = check.GET_LOD_TESTS["ps_get_lod"][0][2]
+        near = tuple(v + 1 / 32 for v in want)
+        self.assertEqual(check.get_lod_problem(self.frame(near), want), "")
+        self.assertIn("4096 of 4096 pixels differ", check.get_lod_problem(self.frame(tuple(v + 1 / 8 for v in want)), want))
+
+    def test_swapped_results_an_unclamped_lod_and_bad_frames_fail(self):
+        clamped_first = check.GET_LOD_TESTS["ps_get_lod"][1][2]           # (0, 1, 3, 0) under MAX_LOD 0.25
+        for what, pixel in (("calculated LOD first", (1.0, 0.0, 3.0, 0.0)),
+                            ("sampler limit not applied", (1.0, 1.0, 3.0, 1.0)),
+                            ("LOD of the unscaled coordinate", (0.0, 1.0, 1.0, 0.0)),
+                            ("NaN", (0.0, float("nan"), 3.0, 0.0))):
+            with self.subTest(what):
+                self.assertIn("pixels differ", check.get_lod_problem(self.frame(pixel), clamped_first))
+        one_bad = bytearray(self.frame(clamped_first))
+        struct.pack_into("<f", one_bad, 16 * (64 * 5 + 7) + 4, 0.5)
+        self.assertIn("1 of 4096 pixels differ", check.get_lod_problem(bytes(one_bad), clamped_first))
+        self.assertIn("first at (7,5)", check.get_lod_problem(bytes(one_bad), clamped_first))
+        self.assertIn("got 65520 bytes", check.get_lod_problem(self.frame(clamped_first)[:-16], clamped_first))
+
+    def test_second_draw_is_judged_and_named(self):
+        draws = check.GET_LOD_TESTS["ps_get_lod"]
+        frames = {limits: self.frame(draws[0][2]) for limits, _, _ in draws}    # the wide sampler's frame twice
+        result, _ = self.run_test("ps_get_lod", frames)
+        self.assertTrue(result.startswith("S# word 1 40000: 4096 of 4096 pixels differ"), result)
+
+    def test_unsupported_device_skips_and_other_failures_fail(self):
+        result, _ = self.run_test("ps_get_lod", {}, code=77,
+                                  out="unsupported: need 144 push constant bytes, device has 128\n")
+        self.assertIsInstance(result, check.Skip)
+        self.assertIn("144 push constant bytes", result)
+        result, _ = self.run_test("ps_get_lod", {}, code=1, out="FAILED vkCreateGraphicsPipelines -> -3\n")
+        self.assertNotIsInstance(result, check.Skip)
+        self.assertIn("exit 1", result)
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(check.get_lod_test(tmp, tmp, "ps_get_lod"), "missing vk_texture_test" + check.EXE)
+
 
 class TexelOffsetChecks(unittest.TestCase):
     """ps_texoff (image_sample*_o, image_gather4_lz_o): the judgement of a dump, and the skip without maintenance8."""

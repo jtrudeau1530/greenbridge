@@ -136,7 +136,7 @@ def build_command(kind, cc, src, out, workdir):
     installer = os.path.join(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
                              "Microsoft Visual Studio", "Installer")
     script = os.path.join(workdir, "build_hw_oracle.cmd")
-    with open(script, "w", encoding="ascii") as f:
+    with open(script, "w", encoding="ascii", newline="\n") as f:
         f.write(f'@echo off\r\nset "PATH={installer};%PATH%"\r\ncall "{cc}" >nul || exit /b 1\r\n'
                 + subprocess.list2cmdline(cl) + "\r\n")
     return ["cmd.exe", "/d", "/c", script]
@@ -281,12 +281,20 @@ class Oracle:
 
     def run(self, programs, words=4):
         """Run each program (a list of lines). Returns one entry per program: a list of `words` ints, or a str
-        explaining why it could not run (assembler rejection)."""
+        explaining why it could not run (assembler rejection, or a MODE field this architecture cannot set)."""
         results = [None] * len(programs)
+        for i, p in enumerate(programs):
+            why = asm.mode_skip_reason(p.mode, self.arch) if isinstance(p, asm.Kernel) else None
+            if why:
+                results[i] = why            # never assembled: the directive would fail its whole chunk
         for wave in (32, 64):
-            todo = [i for i, p in enumerate(programs) if (p.wave if isinstance(p, asm.Kernel) else 32) == wave]
+            todo = [i for i, p in enumerate(programs) if results[i] is None and
+                    (p.wave if isinstance(p, asm.Kernel) else 32) == wave]
             for lo in range(0, len(todo), self.chunk):
-                self._run_chunk(programs, todo[lo:lo + self.chunk], results, words, wave)
+                try:
+                    self._run_chunk(programs, todo[lo:lo + self.chunk], results, words, wave)
+                except asm.ModeUnavailable as e:
+                    raise Unavailable(str(e)) from None
         return results
 
     def _run_chunk(self, programs, idx, results, words, wave=32):

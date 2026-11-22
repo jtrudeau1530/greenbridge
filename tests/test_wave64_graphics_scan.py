@@ -140,6 +140,15 @@ class ScanTests(unittest.TestCase):
 
 
 class CliTests(unittest.TestCase):
+    def test_scan_ignores_shader_named_directories(self):
+        with tempfile.TemporaryDirectory() as src:
+            os.mkdir(os.path.join(src, "cache.s"))
+            name, text = PS_W64_SENSITIVE
+            with open(os.path.join(src, name), "w", encoding="utf-8") as f:
+                f.write(text)
+            report = scan.scan_directory(src)
+            self.assertEqual(report["per_stage"]["ps"]["shaders"], 1)
+
     def test_missing_source_directory_raises_error(self):
         with self.assertRaises(SystemExit) as cm:
             with contextlib.redirect_stderr(io.StringIO()):

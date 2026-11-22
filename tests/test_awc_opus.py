@@ -146,13 +146,16 @@ def build_music_bank(block_tocs, samples, rate=48000, last_size=None):
     return bytes(out + desc + data)
 
 
-def build_repeating_music_bank(chunks):
+def build_repeating_music_bank(chunks, group_samples=None):
     """Each chunk lists (skip samples, packets) for each channel group."""
     channels = len(chunks[0])
     chunk_size = 2048 * (channels + 1)
     bank = bytearray(build_music_bank([[0xF8] * channels for _ in chunks], 2880))
     _, music = awc.parse_awc(bank)
-    _, (data_offset, _) = music[0]
+    (descriptor_offset, _), (data_offset, _) = music[0]
+    if group_samples is not None:
+        for group, samples in enumerate(group_samples):
+            struct.pack_into("<I", bank, descriptor_offset + 12 + 16 * group + 4, samples)
     for block, groups in enumerate(chunks):
         at = data_offset + block * chunk_size
         for group, (skip, packets) in enumerate(groups):
@@ -414,8 +417,9 @@ class ExportBankTest(unittest.TestCase):
             self.assertEqual(last["serial"], 3)
 
     def test_stereo_plain_stream_length_is_per_channel(self):
-        # A stereo format tag stores interleaved samples. Three 960-frame stereo packets carry
-        # 2880 frames per channel; the declared 3840 is twice the real per-channel length.
+        # A stereo format tag stores interleaved samples: 3840 counts = 1920 frames per channel.
+        # Three 960-frame packets carry 2880 frames per channel, so the declared 1920 trims
+        # 960 frames of payload; the point is the halving, not a realistic stream length.
         packet = bytes([0x9C])          # CELT 20 ms, code 0, stereo bit: 960 frames per channel
         opus = bytearray(3 * 2048)
         for block in range(3):
@@ -435,8 +439,8 @@ class ExportBankTest(unittest.TestCase):
 
     def test_declared_samples_are_48khz_frames_not_scaled_by_rate(self):
         # Four 960-frame packets are 3840 frames; the tag declares 2880 real frames and a 32 kHz
-        # source rate. Scaling by 48000/32000 would make the length 4320, so the last granule
-        # would stay at 312 + 3840 and the padding would not be trimmed.
+        # source rate. Scaling by 48000/32000 would make the target 4320, above the payload, so
+        # the old code kept all 3840 packet frames (granule 3840, 3528 after the pre-skip).
         packet = bytes([0x08])          # SILK 20 ms, code 0: 960 frames
         opus = bytearray(4 * 2048)
         for block in range(4):
@@ -452,12 +456,13 @@ class ExportBankTest(unittest.TestCase):
             pages = parse_ogg_pages(f.read())
         self.assertEqual(pages[-1]["granule"], 312 + 2880)
 
-    def test_format_block_per_channel_frame_count_is_used(self):
-        # +0x0C is the per-channel Opus frame count and wins over dividing the +0 count:
-        # 9999 interleaved samples / 2 would be 4999 frames and would not trim the padding.
+    def test_inconsistent_format_frame_count_falls_back(self):
+        # +0x0C is authoritative only when it agrees with the interleaved +0 count:
+        # 1920 * 2 != 9999, so the block is malformed and +0 / channels (4999) is used
+        # instead of silently truncating the real audio.
         packet = bytes([0x9C])          # CELT 20 ms, code 0, stereo bit: 960 frames per channel
-        opus = bytearray(3 * 2048)
-        for block in range(3):
+        opus = bytearray(6 * 2048)
+        for block in range(6):
             struct.pack_into("<H", opus, block * 2048, len(packet))
             opus[block * 2048 + 2:block * 2048 + 2 + len(packet)] = packet
         fmt = bytearray(format_block(9999, 48000, 0x0B, 2))
@@ -470,7 +475,68 @@ class ExportBankTest(unittest.TestCase):
         awc.export_bank(path, self.out)
         with open(os.path.join(self.out, "frames", "0000000B.ogg"), "rb") as f:
             pages = parse_ogg_pages(f.read())
+        self.assertEqual(pages[-1]["granule"], 312 + 4999)
+
+    def test_consistent_format_frame_count_is_used(self):
+        # 3840 interleaved stereo samples = 1920 per channel, and +0x0C agrees.
+        packet = bytes([0x9C])          # CELT 20 ms, code 0, stereo bit: 960 frames per channel
+        opus = bytearray(3 * 2048)
+        for block in range(3):
+            struct.pack_into("<H", opus, block * 2048, len(packet))
+            opus[block * 2048 + 2:block * 2048 + 2 + len(packet)] = packet
+        fmt = bytearray(format_block(3840, 48000, 0x0B, 2))
+        struct.pack_into("<I", fmt, 12, 1920)
+        bank = build_bank([(12, bytes(fmt), bytes(opus))])
+        path = os.path.join(self.tmp.name, "frames_ok.awc")
+        with open(path, "wb") as f:
+            f.write(bank)
+
+        awc.export_bank(path, self.out)
+        with open(os.path.join(self.out, "frames_ok", "0000000C.ogg"), "rb") as f:
+            pages = parse_ogg_pages(f.read())
         self.assertEqual(pages[-1]["granule"], 312 + 1920)
+
+    def test_eos_page_is_emitted_at_the_trim_point(self):
+        # 27 packets of 160 bytes / 960 frames: the 26th packet crosses the target
+        # (312 + 24000 = 24312) and would otherwise flush a full page first. The EOS
+        # page must carry the reaching packet and drop the 27th padding packet, not
+        # emit a later page whose granule is smaller than the previous one.
+        packet = bytes([0x08]) + bytes(159)     # SILK 20 ms, 960 frames
+        packets = [packet] * 27
+        path = os.path.join(self.tmp.name, "trim.ogg")
+        awc.write_ogg_opus(path, packets, 1, 21, 24000)
+        with open(path, "rb") as f:
+            pages = parse_ogg_pages(f.read())
+        audio = pages[2:]
+        granules = [p["granule"] for p in audio]
+        self.assertEqual(granules, sorted(granules))
+        self.assertEqual(audio[-1]["granule"], 312 + 24000)
+        self.assertEqual(audio[-1]["flags"] & 0x04, 0x04)
+        self.assertEqual(sum(1 for p in audio for value in p["lacing"] if value < 255), 26)
+
+    def test_pre_skip_larger_than_the_stream_is_clamped(self):
+        # Six 960-frame packets are 5760 samples; a pre-skip of 65535 would put the
+        # EOS granule below the pre-skip and make the stream undecodable.
+        packet = bytes([0x08])
+        packets = [packet] * 6
+        path = os.path.join(self.tmp.name, "preskip.ogg")
+        awc.write_ogg_opus(path, packets, 1, 23, 4800, pre_skip=65535)
+        with open(path, "rb") as f:
+            pages = parse_ogg_pages(f.read())
+        self.assertEqual(struct.unpack_from("<H", pages[0]["body"], 10)[0], 5760)
+        self.assertGreaterEqual(pages[-1]["granule"], 5760)
+        with self.assertRaises(ValueError):
+            awc.write_ogg_opus(path, packets, 1, 24, 4800, pre_skip=65536)
+
+    def test_empty_packet_list_writes_an_eos_page(self):
+        # No audio packets is still a valid empty stream: the EOS flag must be present.
+        path = os.path.join(self.tmp.name, "empty.ogg")
+        self.assertEqual(awc.write_ogg_opus(path, [], 1, 25, 0), 0)
+        with open(path, "rb") as f:
+            pages = parse_ogg_pages(f.read())
+        self.assertEqual(len(pages), 3)
+        self.assertEqual(pages[-1]["flags"] & 0x04, 0x04)
+        self.assertEqual(pages[-1]["granule"], 0)
 
     def test_cli_pre_skip_override(self):
         bank, _, _ = self.make_bank()
@@ -480,6 +546,24 @@ class ExportBankTest(unittest.TestCase):
             pages = parse_ogg_pages(f.read())
         self.assertEqual(struct.unpack_from("<H", pages[0]["body"], 10)[0], 0)
         self.assertEqual(pages[-1]["granule"], 1920)
+
+
+class DuplicateIdTest(unittest.TestCase):
+    """Two streams in one bank can share a 29-bit id; the second used to overwrite the first's file."""
+
+    def test_streams_with_the_same_id_both_export(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "dup.awc")
+            fmt = format_block(2, 48000, 0x00, 1)
+            with open(path, "wb") as f:
+                f.write(build_bank([(0x123, fmt, struct.pack("<hh", 1, 2)),
+                                    (0x123, fmt, struct.pack("<hh", 3, 4))]))
+            counts = awc.export_bank(path, os.path.join(tmp, "out"))
+            od = os.path.join(tmp, "out", "dup")
+            self.assertEqual(counts["pcm"], 2)
+            self.assertEqual(sorted(os.listdir(od)), ["00000123.wav", "00000123~2.wav"])
+            self.assertNotEqual(read_wav(os.path.join(od, "00000123.wav")),
+                                read_wav(os.path.join(od, "00000123~2.wav")))
 
 
 class StreamedMusicTest(unittest.TestCase):
@@ -526,7 +610,7 @@ class StreamedMusicTest(unittest.TestCase):
         bank = build_repeating_music_bank([
             [(0, [a, b]), (0, [x, y])],
             [(1440, [a, b, c]), (960, [y, z])],
-        ])
+        ], group_samples=[2400, 2 * 2880])
         _, music = awc.parse_awc(bank)
         channels = awc.music_channels(bank, *music[0])
         self.assertEqual([group[4] for group in channels], [[a, b, c], [x, y, z]])
@@ -535,10 +619,11 @@ class StreamedMusicTest(unittest.TestCase):
 
         path = Path(self.tmp.name) / "repeated.awc"
         path.write_bytes(bank)
-        self.assertEqual(awc.export_bank(str(path), self.out)["music"], 2)
-        for sid, expected in (("00000100", a + b + c), ("00000101", x + y + z)):
+        self.assertEqual(awc.export_bank(str(path), self.out, pre_skip=0)["music"], 2)
+        for sid, expected, frames in (("00000100", a + b + c, 2400), ("00000101", x + y + z, 2880)):
             pages = parse_ogg_pages(Path(self.out, "repeated", sid + ".ogg").read_bytes())
             self.assertEqual(b"".join(page["body"] for page in pages[2:]), expected)
+            self.assertEqual(pages[-1]["granule"], frames)
 
     def test_rejects_inconsistent_repeats_in_both_parse_modes(self):
         a, b = b"\xf8a", b"\xf8b"
@@ -716,6 +801,57 @@ class MalformedMusicGeometryTest(unittest.TestCase):
         self.assertEqual(pages[-1]["granule"], 960)
         self.assertEqual(pages[-1]["body"], bytes([0x78]))
         self.assertTrue(os.path.isfile(os.path.join(od, "00000021.wav")))
+
+
+class ShortLastMusicBlockTest(unittest.TestCase):
+    """Game banks declare a large `chunk` stride and end the data tag inside the last block: blocks * chunk is
+    larger than the tag (1 block of a 524,288-byte chunk in a 264,192-byte tag on a 1.0.2.1 copy). Such a
+    descriptor is valid and its channels must still export; only blocks that start past the tag are refused."""
+
+    @staticmethod
+    def bank(blocks, stride, tail_cut=0):
+        """A mono music bank: each block is a 2048-byte record header plus one 2048-byte packet subblock,
+        laid out `stride` bytes apart; the data tag ends right after the last block's subblock."""
+        desc = bytearray(12 + 16)
+        struct.pack_into("<III", desc, 0, blocks, stride, 1)
+        struct.pack_into("<II", desc, 12, 0x100, 960 * blocks)
+        struct.pack_into("<H", desc, 22, 48000)
+        desc[24] = 0x0B
+        data = bytearray((blocks - 1) * stride + 4096 - tail_cut)
+        for b in range(blocks):
+            at = b * stride
+            struct.pack_into("<I", data, at + 4, 1)
+            if at + 2048 + 3 <= len(data):
+                struct.pack_into("<HB", data, at + 2048, 1, 0x78)
+        header = 16 + 4 + 2 * 8
+        out = bytearray(b"ADAT" + struct.pack("<III", 0, 1, header))
+        out += struct.pack("<I", 0x20 | (2 << 29))
+        out += struct.pack("<Q", tag(0x48, header, len(desc)))
+        out += struct.pack("<Q", tag(0x55, header + len(desc), len(data)))
+        return bytes(out + desc + data)
+
+    def channels(self, d):
+        _, music = awc.parse_awc(d)
+        return awc.music_channels(d, *music[0])
+
+    def test_single_short_block_exports(self):
+        ch = self.channels(self.bank(1, 524288))
+        self.assertEqual([(c[0], len(c[4])) for c in ch], [(0x100, 1)])
+
+    def test_last_block_shorter_than_the_stride_exports_every_block(self):
+        ch = self.channels(self.bank(3, 16384))
+        self.assertEqual([(c[0], len(c[4])) for c in ch], [(0x100, 3)])
+
+    def test_a_last_block_cut_inside_its_subblock_is_still_refused(self):
+        # The data tag ends 1,024 bytes into the last block's packet subblock: the subblock check refuses it.
+        self.assertEqual(self.channels(self.bank(2, 16384, tail_cut=1024)), [])
+
+    def test_a_block_starting_at_or_past_the_tag_end_is_refused(self):
+        d = bytearray(self.bank(2, 16384))
+        _, music = awc.parse_awc(bytes(d))
+        (m_at, _), _ = music[0]
+        struct.pack_into("<I", d, m_at, 3)           # declare a third block starting past the tag
+        self.assertEqual(self.channels(bytes(d)), [])
 
 
 class MalformedBankTest(unittest.TestCase):

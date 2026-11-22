@@ -84,7 +84,7 @@ def main() -> int:
         os.makedirs(out_dir, exist_ok=True)
         with tempfile.TemporaryDirectory(dir=out_dir) as staging:
             staged = os.path.join(staging, "rpf_probe.json")
-            with open(staged, "w", encoding="utf-8") as f:
+            with open(staged, "w", encoding="utf-8", newline="\n") as f:
                 json.dump(rows, f, indent=1)
             os.replace(staged, a.out)
     except OSError as error:

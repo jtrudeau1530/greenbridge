@@ -88,15 +88,23 @@ The exporters ignore the remaining bytes.
 | `5` | XMA2 | `.xma.wav`, RIFF XMA2; ffmpeg decodes it to PCM WAV |
 
 Opus data is stored in 2048-byte blocks. Each block is a sequence of `[u16 length][packet]`; a zero length pads
-the rest of the block. The first 312 decoded samples are the encoder's lookahead (libopus at 48 kHz); the AWC does
-not store it, so the exporter writes that value as `OpusHead` pre-skip and sets the last page's granule to
-`pre-skip + declared samples`. Decoders then drop the priming and stop at the real end instead of the padded final
-frame. `--pre-skip` overrides the 312 default for a stream encoded with a different lookahead.
+the rest of the block. The first 312 decoded samples are the encoder's lookahead. Measured on 30 real streams from
+four banks: decoded with pre-skip 0, the 5% and 10% attack points are at 312 samples (median 312; the 10% point
+ranges 278..868, none near 1920), so 312 is the exporter's default. The AWC does not store the value, so
+`--pre-skip` overrides it for a stream encoded with a different lookahead.
+
+The exporter writes that value as `OpusHead` pre-skip and emits the EOS page at the first packet that reaches
+`pre-skip + declared samples`; later packets are encoder padding and are dropped. Clamping only the last page
+would let its granule go backwards when the trim point falls before that page starts, and decoders would keep the
+excess: a 27-packet real-libopus fixture decoded 24,960 frames for 24,000 declared, while the reaching-packet
+form decodes exactly 24,000. An oversized `--pre-skip` is clamped to the stream length so the final granule never
+falls below it.
 
 The format tag's sample count is already in 48 kHz frames even when its rate field is 32 kHz, and `+0x0C` is the
-per-channel frame count (equal to `+0` for mono and half of it for stereo in all 7,451 measured streams). The
-exporter uses `+0x0C` and falls back to `+0 / channels` when a block leaves it zero; it never scales either count
-by the rate field, because scaling a 32 kHz stream by 48000/32000 leaves up to a frame of padding untrimmed.
+per-channel frame count (equal to `+0` for mono and half of it for stereo in all 7,451 measured streams, 0.5% of
+the 1.6M-stream corpus). The exporter uses `+0x0C` only when it agrees with `+0` (`frames * channels == samples`)
+and otherwise falls back to `+0 / channels`, so a malformed block cannot silently truncate audio. It never scales
+either count by the rate field, because scaling a 32 kHz stream by 48000/32000 leaves padding untrimmed.
 
 Codec `5` is not handled by `tools/awc_opus.py`. `rpf9dump xma` writes it as RIFF XMA2, and ffmpeg does the decode.
 
@@ -139,6 +147,7 @@ count unchanged. Reading `samples` as a frame count produces a file that reports
 | `rpf9dump audio <audio.rpf> <out>` | `<out>/audio/awc/<path>.awc` (the original banks) and `<out>/audio/audio_manifest.json` |
 | `rpf9dump xma <audio.rpf> <out>` | `<out>/audio/xma/<bank>/<stream id>.xma.wav` for every codec-5 stream |
 | `python -I tools/awc_opus.py <bank or dir> <out> [--jobs N] [--pre-skip N]` | `<out>/<bank>/<stream id>.ogg`, or `.wav` for codec 0/2; `--jobs` processes that many banks at once |
+| `python -I tools/opus_tags.py <ogg dir> --names <csv> [--dialogue <csv>]` | the same `.ogg` files, with names, dialogue labels and subtitles in their `OpusTags` header (see *Tags: names and subtitles*) |
 | `python -I tools/audio_wav.py <ogg dir> --out <wav dir> [--jobs N]` | 16-bit PCM WAV mirroring the Ogg tree; `--jobs` ffmpeg processes at once |
 
 When exporting a directory, `awc_opus.py` keeps the path to each bank below the input root. For example,
@@ -290,6 +299,41 @@ Each positional source is reported and thresholded on its own. A source is a dir
 bank, or an `audio_manifest.json` from `rpf9dump audio` (read without opening the banks). Pure Python; the run above
 took about 3 minutes on one core.
 
+## Tags: names and subtitles
+
+`awc_opus.py` writes an empty `OpusTags` header, so a player shows only the stream id. `tools/opus_tags.py` fills
+that header in place from the `awc_names.py` CSV and, for dialogue, the `text_tables.py` dialogue CSV
+([text.md](text.md#dialogue)):
+
+| Comment | Value |
+|---|---|
+| `TITLE` | the stream name |
+| `LABEL`, `SPEAKER` | the dialogue line label and the speaker code in it |
+| `SUBTITLE` | the English text, or the first language that has text |
+| `SUBTITLE_<LANG>` | the text in each language that has it (`SUBTITLE_DE`, `SUBTITLE_ZH-HANS`, ...) |
+
+Subtitle markup (`~n~`, `~sl:...~`, `~COLOR_...~` and other `~...~` tokens) becomes a space, and empty values are left
+out. A file is matched by its stream id and its bank: the folder below the Opus folder, or that path with leading
+folders removed, so one Opus folder can hold several archives' exports. `--source` limits the names to one source
+label of the names CSV.
+
+```sh
+python -I tools/opus_tags.py <work>/assets/audio/ogg --names <temp>/awc_names.csv --dialogue <temp>/dialogue.csv
+```
+
+Only page 1, which holds the `OpusTags` packet alone, is rewritten. The audio pages, page sequence and granule
+positions stay byte for byte as `awc_opus.py` wrote them, and a second run replaces the tags of the first. Unnamed
+streams are not touched. A tags packet that would not fit in one Ogg page (65,024 bytes) is skipped and counted;
+dialogue tags are a few kilobytes. `--dry-run` counts without writing.
+
+Checked on the 1.0.2.1 package (2026-11-22) with all 638 `shared_minigame000.rpf` banks and the first 3,000
+`story000.rpf` banks (83,088 Ogg Opus files): 45,311 named streams tagged, exactly the names CSV rows for those
+banks; 1,980 of them are dialogue lines and 1,703 have a subtitle. A fresh `awc_opus.py` export of
+`shared_minigame000.rpf` matches the tagged files on every page except page 1 (4,315 of 4,315 files). ffprobe
+reads the comments, and ffmpeg decodes a sample of 8,299 tagged files without errors. The run takes about 4 s.
+
+The tagged files hold game text as well as game audio: they stay in the work folder like any other export.
+
 ## Never commit or share extracted audio
 
 Extracted banks, Ogg Opus, WAV, XMA2 and the manifest are game data. Keep them in the work folder, never in the
@@ -299,7 +343,10 @@ the audio itself is not. See the ground rules in [design.md](design.md#ground-ru
 
 ## What has been checked
 
-- 300 random Opus streams decode with ffmpeg with no errors; their lengths match the declared sample counts.
+- 20 real Opus streams (6 at 48 kHz, 14 at 32 kHz) decode with ffmpeg to exactly their declared
+  per-channel frame counts after the EOS fix; 300 random streams decode with no errors. The earlier
+  "lengths match" check read the granule-derived duration, not decoded frames, so it did not catch
+  the backwards-EOS case.
 - All 1,818 XMA2 streams decode after `rpf9dump xma`.
 - A 4-channel streamed-music bank gives four 42.0 s mono channels with real levels and no decoder errors.
 - A 1-channel streamed-music descriptor can carry stereo Opus packets; it exports as one stereo Ogg with the

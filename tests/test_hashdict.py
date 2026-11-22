@@ -359,6 +359,70 @@ class CarveAndExtraCLITest(unittest.TestCase):
         self.assertEqual(p_lookup.returncode, 0, p_lookup.stderr)
         self.assertIn(f"{lookup_hash} model_prop", p_lookup.stdout)
 
+    def test_one_archive_folder_is_harvested_as_that_archive(self):
+        # <work>/carve/common (its own index.json, as the gamedata_* tools take it) used to give an empty
+        # dictionary with exit 0: only <carve>/<archive>/index.json was looked for.
+        p = self.run_tool(os.path.join(self.carve_dir, "common"), "--out", self.out_json)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("common: ", p.stdout)
+        with open(self.out_json, encoding="utf-8") as f:
+            d = json.load(f)
+        self.assertEqual(d.get(f"{hashdict.joaat('common_archive_asset'):08x}"), "common_archive_asset")
+        self.assertNotIn(f"{hashdict.joaat('bink2_skipped_asset'):08x}", d)
+        # An archive outside --archives still contributes only its PSIN/RBF0 blobs.
+        p = self.run_tool(os.path.join(self.carve_dir, "custom_pack"), "--out", self.out_json)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        with open(self.out_json, encoding="utf-8") as f:
+            self.assertEqual(json.load(f), {f"{hashdict.joaat('pso_metadata_token'):08x}": "pso_metadata_token"})
+
+    def test_out_naming_a_one_archive_index_is_refused(self):
+        index = os.path.join(self.carve_dir, "common", "index.json")
+        with open(index, "rb") as f:
+            before = f.read()
+        p = self.run_tool(os.path.join(self.carve_dir, "common"), "--out", index)
+        self.assertEqual(p.returncode, 2, p.stderr)
+        self.assertIn("is one of the inputs", p.stderr)
+        with open(index, "rb") as f:
+            self.assertEqual(f.read(), before)
+
+    def assert_carved_blob_preserved(self, output, blob):
+        with open(blob, "rb") as f:
+            original = f.read()
+        p = self.run_tool(self.carve_dir, "--out", output)
+        self.assertEqual(p.returncode, 2, p.stderr)
+        self.assertIn("is one of the inputs", p.stderr)
+        self.assertNotIn("Traceback", p.stderr)
+        with open(blob, "rb") as f:
+            self.assertEqual(f.read(), original)
+
+    def test_out_cannot_replace_a_harvested_blob(self):
+        # The existing --out check protects index.json and --extra, but the
+        # <offset>.bin files read during harvesting are inputs as well.
+        for archive, offset in (("common", 0), ("custom_pack", 32)):
+            with self.subTest(archive=archive):
+                blob = os.path.join(self.carve_dir, archive, f"{offset:012x}.bin")
+                self.assert_carved_blob_preserved(blob, blob)
+
+    def test_out_cannot_replace_a_hard_link_to_a_harvested_blob(self):
+        blob = os.path.join(self.carve_dir, "common", f"{0:012x}.bin")
+        alias = os.path.join(self.dir, "harvest_alias.json")
+        try:
+            os.link(blob, alias)
+        except (OSError, NotImplementedError) as error:
+            self.skipTest(f"hard links unavailable: {error}")
+        self.assert_carved_blob_preserved(alias, blob)
+        self.assertTrue(os.path.samefile(blob, alias))
+
+    def test_out_cannot_replace_a_symlink_to_a_harvested_blob(self):
+        blob = os.path.join(self.carve_dir, "common", f"{0:012x}.bin")
+        alias = os.path.join(self.dir, "harvest_link.json")
+        try:
+            os.symlink(blob, alias)
+        except (OSError, NotImplementedError) as error:
+            self.skipTest(f"symlinks unavailable: {error}")
+        self.assert_carved_blob_preserved(alias, blob)
+        self.assertTrue(os.path.islink(alias))
+
     def test_build_requires_an_explicit_carve_directory(self):
         empty = os.path.join(self.dir, "empty")
         os.mkdir(empty)
@@ -436,6 +500,27 @@ class OutputPathTest(unittest.TestCase):
             self.assertTrue(os.path.isfile(out))
             with open(out, encoding="utf-8") as f:
                 self.assertEqual(json.load(f), {})
+
+    def test_out_naming_an_input_is_refused_and_left_alone(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            carve = os.path.join(tmp, "carve")
+            os.makedirs(os.path.join(carve, "common"))
+            index = os.path.join(carve, "common", "index.json")
+            with open(index, "w", encoding="utf-8") as f:
+                json.dump({"files": []}, f)
+            extra = os.path.join(tmp, "names.txt")
+            with open(extra, "wb") as f:
+                f.write(b"adder\n")
+            for out in (extra, index):
+                with open(out, "rb") as f:
+                    before = f.read()
+                p = subprocess.run([sys.executable, "-I", TOOL, carve, "--extra", extra, "--out", out],
+                                   capture_output=True, text=True)
+                self.assertEqual(p.returncode, 2, p.stderr)
+                self.assertIn("is one of the inputs", p.stderr)
+                self.assertNotIn("Traceback", p.stderr)
+                with open(out, "rb") as f:
+                    self.assertEqual(f.read(), before)
 
 
 if __name__ == "__main__":

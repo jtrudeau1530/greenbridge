@@ -150,6 +150,25 @@ class GamedataIndexTest(unittest.TestCase):
         self.assertEqual(rows[0]["root"], "RootA")
         self.assertEqual(rows[0]["type"], "xml")
 
+    def test_printable_page_directory_stream_is_not_xml(self):
+        # A resource stream with the "0DRP" page marker at +16 whose first 4 KiB are over 95% printable and hold a
+        # "<": data.rpf's 337 such streams were reported as incomplete XML with no root.
+        head = bytes(8) + bytes.fromhex("80ca005000000000") + b"0DRP" + bytes(12)
+        page = head + (b"<abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ>" * 80)[:4096 - len(head)]
+        page += bytes(512)
+        tool = load_tool()
+        self.assertGreater(tool.printable(page), 0.95)      # the heuristic alone would call it text
+        self.add(page)
+        self.finish()
+        out = os.path.join(self.root, "index.json")
+        p = self.run_tool(self.carve, "--json", out)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        with open(out, encoding="utf-8") as f:
+            data = json.load(f)
+        self.assertNotIn("xml", data["summary"]["types"])
+        self.assertEqual(data["summary"]["xml_incomplete"], 0)
+        self.assertEqual([(r["type"], r["detail"]) for r in data["rows"]], [("other", "0DRP")])
+
     def test_archive_runs_the_carver_and_reads_roots(self):
         xml = b'<?xml version="1.0"?>\n<RootA><!-- synthetic fixture, longer than 64 bytes --><Item value="1"/></RootA>'
         blob = b"\x00\x01\x02binary\xff" * 32
@@ -177,6 +196,20 @@ class GamedataIndexTest(unittest.TestCase):
         self.assertEqual(s["types"]["xml"]["inflated"], len(xml))
         self.assertEqual(s["types"]["binary"]["files"], 1)
         self.assertEqual(s["roots"], {"RootA": {"files": 1, "inflated": len(xml)}})
+
+    def test_unwritable_csv_or_json_is_one_error_line(self):
+        self.add(b'<?xml version="1.0"?><RootA/>')
+        self.finish()
+        blocker = os.path.join(self.root, "blocker")
+        with open(blocker, "wb") as f:
+            f.write(b"x")
+        for flag, name in (("--csv", "out.csv"), ("--json", "out.json")):
+            with self.subTest(flag=flag):
+                out = os.path.join(blocker, name)
+                p = self.run_tool(self.carve, flag, out)
+                self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
+                self.assertIn("ERROR: cannot write", p.stderr)
+                self.assertNotIn("Traceback", p.stderr)
 
 
 class XmlClassificationTest(unittest.TestCase):

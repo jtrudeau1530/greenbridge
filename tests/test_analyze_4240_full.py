@@ -119,6 +119,43 @@ class Analyze4240Test(unittest.TestCase):
         self.assertEqual(len(doc), 1)
         self.assertEqual(doc[0]["errors"], 1)
 
+    def bad_offset_archive(self):
+        path = os.path.join(self.root, "bad-offset.rpf")
+        header = bytearray(0x780)
+        header[0:4] = b"9FPR"
+        struct.pack_into("<I", header, 4, 0x100000)   # data start past EOF
+        with open(path, "wb") as f:
+            f.write(bytes(header) + zlib.compress(BLOCK_6330, 9) + bytes(64))
+        return path
+
+    def test_offset_past_eof_is_rejected(self):
+        with self.assertRaises(ValueError) as cm:
+            A.process_archive(self.bad_offset_archive())
+        self.assertIn("past the end", str(cm.exception))
+
+    def test_bad_offset_is_one_error_line_and_left_out_of_the_report(self):
+        bad, good = self.bad_offset_archive(), self.truncated_archive()
+        report = os.path.join(self.root, "stats.json")
+        p = self.run_tool(bad, good, "--json", report)
+        self.assertEqual(p.returncode, 1, p.stderr)
+        self.assertIn("ERROR: ", p.stderr)
+        self.assertIn("bad-offset.rpf", p.stderr)
+        self.assertIn("past the end", p.stderr)
+        self.assertNotIn("Traceback", p.stderr)
+        self.assertNotIn("Streams: 0", p.stdout)
+        self.assertIn("Processing " + good, p.stdout, "the next archive is still read")
+        with open(report, encoding="utf-8") as f:
+            self.assertEqual(len(json.load(f)), 1)
+
+    def test_limit_reports_exactly_that_many_streams(self):
+        path = os.path.join(self.root, "five.rpf")
+        make_archive(path, *([BLOCK_6330] * 5))
+        for n in (1, 3, 5):
+            with self.subTest(limit=n):
+                stats = A.process_archive(path, limit=n)
+                self.assertEqual(stats["streams"], n)
+                self.assertEqual(stats["blocks_6330"], n)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

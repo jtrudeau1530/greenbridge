@@ -1,4 +1,4 @@
-# Builds runtime\build\gta6rt.exe with MSVC at BelowNormal priority, on half the cores.
+﻿# Builds runtime\build\gta6rt.exe with MSVC at BelowNormal priority, on half the cores.
 # Uses VS's CMake + Ninja when the "C++ CMake tools" component is installed, otherwise calls cl.exe directly.
 # The GameInput controller shim (SDL3, docs/gameinput.md) is built only on the CMake path: with an installed SDL3, or
 # with -FetchSdl3, which lets CMake download the pinned SDL3 release. The cl.exe fallback never builds it.
@@ -58,8 +58,10 @@ if defined VULKAN_SDK cl /nologo /std:c++20 /EHsc /O2 /DWIN32_LEAN_AND_MEAN /DNO
 }
 
 # A .cmd file avoids cmd.exe's quote stripping on paths with spaces.
+# Switch to UTF-8 (CP 65001) before invoking CMake/Ninja/cl.exe so non-English MSVC /showIncludes prefixes
+# (e.g. Spanish "Nota: inclusión del archivo:") match Ninja's msvc_deps_prefix instead of being mojibaked in OEM CP.
 $bat = Join-Path $out "_build.cmd"
-"@echo off`r`nset `"PATH=$installer;%PATH%`"`r`ncall `"$vcvars`" >nul || exit /b 1`r`n$body" | Set-Content -Encoding ascii $bat
+"@echo off`r`nchcp 65001 >nul`r`nset `"PATH=$installer;%PATH%`"`r`ncall `"$vcvars`" >nul || exit /b 1`r`n$body" | Set-Content -Encoding ascii $bat
 
 $p = Start-Process cmd.exe -ArgumentList "/c", "`"$bat`"" -NoNewWindow -PassThru
 $null = $p.Handle  # keeps the exit code readable after WaitForExit

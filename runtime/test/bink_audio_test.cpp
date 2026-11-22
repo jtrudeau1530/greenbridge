@@ -218,7 +218,7 @@ int main() {
     const std::string movie_arg = env("LEONIDA_MOVIE_AUDIO");
     if (game_dir_arg.empty() || movie_arg.empty()) {
         std::printf("SKIP (no package/audio movie)\n");
-        return 0;
+        return 77;
     }
 
     const std::filesystem::path game_dir = game_dir_arg;
@@ -237,7 +237,7 @@ int main() {
                     header.flags[i]);
     if (!header.audio_tracks) {
         std::printf("SKIP (movie has no audio tracks)\n");
-        return 0;
+        return 77;  // nothing was checked: a ctest SKIP (SKIP_RETURN_CODE 77), not a pass
     }
 
     try {

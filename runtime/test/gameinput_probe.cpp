@@ -85,12 +85,17 @@ int main(int argc, char** argv) {
         if (input->GetCurrentReading(GameInputKindGamepad, nullptr, &r) == S_OK) {
             GameInputGamepadState s{};
             GameInputUiNavigationState ui{};
+            GameInputMotionState m{};
+            const bool motion = r->GetMotionState(&m);
             r->GetGamepadState(&s);
             r->GetUiNavigationState(&ui);
             std::printf("\rbuttons=%04x ui=%06x LT=%.2f RT=%.2f L=(%+.2f,%+.2f) R=(%+.2f,%+.2f) seq=%llu   ", s.buttons,
                         ui.buttons, s.leftTrigger, s.rightTrigger, s.leftThumbstickX, s.leftThumbstickY,
                         s.rightThumbstickX, s.rightThumbstickY,
                         static_cast<unsigned long long>(r->GetSequenceNumber(GameInputKindGamepad)));
+            if (motion)  // fractions of motionInfo's maxima: accel includes gravity, so a resting pad shows ~0.5 g
+                std::printf("\n[a]=(%+.2f,%+.2f,%+.2f) [w]=(%+.2f,%+.2f,%+.2f)   ", m.accelerationX, m.accelerationY,
+                            m.accelerationZ, m.angularVelocityX, m.angularVelocityY, m.angularVelocityZ);
             std::fflush(stdout);
             r->Release();
         }

@@ -1,12 +1,12 @@
 // A stand-in game executable for `gta6rt --run`: what a real title does in its first second, run through the
 // loader instead of the Windows one. Test code, not game content. Run as
-//   gta6rt --run tiny_game.exe -- hello 42 [tls] [eh]
+//   gta6rt --run tiny_game.exe -- hello 42 [tls] [eh] [exit-code]
 // It checks its arguments, a static initializer, the heap, a file round trip, a second thread, and the
 // xgameruntime.dll imports (answered by the shim registry: the stub DLL it links against would fail them), then
-// calls exit() with 0 when everything held. Two checks are opt-in, by argument (CTest's run_tiny_game_tls and
-// run_tiny_game_eh): `tls`, thread_local on the game's own threads, which needs the loader's per-thread TLS (gta6rt
-// runs main on a thread it starts, not the one that loaded the image); and `eh`, a C++ exception caught inside the
-// image, which on MSVC needs more than the unwind tables #176 registers: _CxxThrowException finds the throwing image
+// calls exit() with 0 (42 with `exit-code`) when everything held. Two checks are opt-in, by argument (CTest's
+// run_tiny_game_tls and run_tiny_game_eh): `tls`, thread_local on the game's own threads, which needs the loader's
+// per-thread TLS (gta6rt starts main on a separate thread); and `eh`, a C++ exception caught inside the image.
+// On MSVC, `eh` needs more than the unwind tables #176 registers: _CxxThrowException finds the throwing image
 // with RtlPcToFileHeader, which the loader redirects in the host MSVC runtime. Arguments, not environment variables,
 // so scripts/run_wine_tests.py (which passes a test's command line but not its ENVIRONMENT) runs them too. stdout is
 // unbuffered, so a crash still shows how far the run got.
@@ -109,5 +109,6 @@ int main(int argc, char** argv) {
 
     std::printf("tiny_game: %s\n", g_failures ? "FAILED" : "OK");
     std::fflush(stdout);
-    std::exit(g_failures ? 1 : 0);  // through the shimmed exit(): ends the run, not gta6rt
+    // Reserve 42 for a successful guest test. The loader itself returns 1 on errors.
+    std::exit(g_failures ? 1 : (has_arg(argc, argv, "exit-code") ? 42 : 0));
 }

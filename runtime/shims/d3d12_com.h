@@ -25,6 +25,7 @@
 #include <vector>
 
 #include "../src/root_signature.h"
+#include "../src/subgroup_size.h"
 
 namespace leonida {
 class VulkanPresenter;
@@ -62,6 +63,8 @@ HRESULT set_event_on_multiple_fence_completion(leonida::VulkanContext& context, 
                                                const UINT64* values, UINT count,
                                                D3D12_MULTIPLE_FENCE_WAIT_FLAGS flags, HANDLE event);
 
+std::shared_ptr<const leonida::TileHeapAllocation> tile_heap(ID3D12Heap* heap, const leonida::VulkanContext& context);
+
 // The Vulkan objects a D3D12 device runs on. Vulkan 1.3 with dynamicRendering, synchronization2, timelineSemaphore
 // and (when separate_depth_stencil_layouts is set) separateDepthStencilLayouts enabled.
 struct VulkanDeviceInfo {
@@ -77,15 +80,20 @@ struct VulkanDeviceInfo {
     bool separate_depth_stencil_layouts = true;
     std::uint32_t max_push_constants_size = 0;
     bool push_constants_need_fallback = false;
+    // The subgroup sizes the device offers and whether subgroupSizeControl / computeFullSubgroups are enabled on it
+    // (src/subgroup_size.h). Default: nothing, so pipelines request no size.
+    leonida::SubgroupSizeCaps subgroup;
     // Enabled: runtimeDescriptorArray, the dynamic indexing of sampled- and storage-image arrays, and update after
     // bind for sampled images, storage images and storage buffers. The device then keeps the bindless set 0 of
     // the translated shaders (docs section 3.4), and texture views and samplers are put in it as they are
     // created. bindless_partially_bound: descriptorBindingPartiallyBound is enabled as well.
     bool bindless = false;
     bool bindless_partially_bound = false;
-    // samplerAnisotropy and samplerMirrorClampToEdge enabled; without them such samplers are approximated.
+    // samplerAnisotropy, samplerMirrorClampToEdge and samplerFilterMinmax enabled; without them such samplers are
+    // approximated.
     bool sampler_anisotropy = false;
     bool sampler_mirror_clamp_to_edge = false;
+    bool sampler_filter_minmax = false;
     // VK_KHR_calibrated_timestamps or VK_EXT_calibrated_timestamps is enabled on `device` (QueueClock).
     bool calibrated_timestamps = false;
     // VK_EXT_conditional_rendering (with its conditionalRendering feature) is enabled: SetPredication works, and
@@ -107,6 +115,11 @@ struct VulkanDeviceInfo {
     bool occlusion_query_precise = false;
     bool pipeline_statistics_query = false;
     bool presentation = false;  // VK_KHR_surface + VK_KHR_win32_surface on the instance, VK_KHR_swapchain on the device
+    // VK_KHR_swapchain_maintenance1 (or VK_EXT_swapchain_maintenance1) and its swapchainMaintenance1 feature are
+    // enabled on the device, with VK_KHR_get_surface_capabilities2 and the matching *_surface_maintenance1 on the
+    // instance (only meaningful with `presentation`): a vsync swapchain can switch to IMMEDIATE or FIFO_RELAXED per
+    // present, which PresentX's ImmediateThresholdPercent uses.
+    bool swapchain_maintenance1 = false;
     // VK_EXT_image_view_min_lod and its minLod feature are enabled on the logical device.
     bool image_view_min_lod = false;
     // The instance enabled VK_EXT_debug_utils: SetMarker/BeginEvent/EndEvent become debug labels. Otherwise they
@@ -119,12 +132,22 @@ struct VulkanDeviceInfo {
     // Optional VK_KHR_acceleration_structure + VK_KHR_deferred_host_operations + VK_KHR_ray_query are enabled:
     // GetRaytracingAccelerationStructurePrebuildInfo and BuildRaytracingAccelerationStructure (BLAS + TLAS) work.
     bool ray_tracing = false;
+    // BuildRaytracingAccelerationStructure writes the console's XDXR BVH4 records into the destination buffer
+    // (src/xdxr_build.h), the layout the game's translated traversal shaders read, instead of building a
+    // VkAccelerationStructureKHR; needs buffer_device_address and the GPU address arena. The standalone device sets it
+    // unless LEONIDA_RT_AS=khr (docs/d3d12_vulkan.md 4.8); with it set, ray_tracing is not enabled.
+    bool xdxr_acceleration_structures = false;
     // The core features enabled on `device`. Graphics PSOs that need independentBlend, fillModeNonSolid,
     // depthBiasClamp or dualSrcBlend are refused unless it is set here.
     VkPhysicalDeviceFeatures features{};
     // The translator's output folder (spirv/index.json + <name>.spv) for pipeline creation; empty: the
     // LEONIDA_SHADERS environment variable.
     std::string shader_dir;
+    // VK_EXT_custom_border_color (with customBorderColors and customBorderColorWithoutFormat) is enabled on
+    // `device`: samplers with custom border colours pass them through to Vulkan. Without it, custom border
+    // colours fall back to transparent black.
+    bool custom_border_color = false;
+    bool custom_border_color_without_format = false;
 };
 
 // A Vulkan-backed ID3D12Device (PC ABI, up to ID3D12Device11) on caller-owned Vulkan objects, which must outlive
@@ -174,11 +197,17 @@ bool device_push_constants_need_fallback(ID3D12Device* device);
 // LEONIDA_UPLOAD_SYSMEM is not set (D3D-96).
 bool device_upload_in_vram(ID3D12Device* device);
 
+// True when the device can map reserved buffers onto its D3D12 heaps.
+bool device_sparse_buffer_tiles(ID3D12Device* device);
+
 // The bindless set 0 a device with VulkanDeviceInfo::bindless keeps (vulkan_bindless.h), and its layout: what a
 // pipeline whose shader declares set-0 bindings is created with and binds. Null without such a set. The set is
 // brought up to date at every ExecuteCommandLists.
 VkDescriptorSet bindless_set(ID3D12Device* device);
 VkDescriptorSetLayout bindless_set_layout(ID3D12Device* device);
+// The bindless index the descriptor hash table holds for the 8 key dwords of a T# (or the 4 of an S# followed by
+// 0xFFFFFFFF x4), 0 (the fallback) when it has none or `device` has no such set. For tests.
+std::uint32_t bindless_hash_lookup(ID3D12Device* device, const std::uint32_t (&key)[8]);
 // Gives each S# a sampler in that set and a key in its hash table, as CreateSampler does, without a heap slot: for
 // the literal S#s a shader builds from immediates (`literal_samplers` in the shader index). An S# that has them
 // already is left as it is. E_INVALIDARG when `device` is not such a device; E_FAIL when one of them could not be
@@ -204,9 +233,15 @@ public:
     // `back_buffer` is a colour texture in D3D12's PRESENT state. sync_interval 0 presents without vsync.
     // S_OK also covers a skipped present while the window is minimised.
     // `src_rect` (when not null) limits the blit to that part of the texture, which is stretched to the window.
-    HRESULT present(ID3D12Resource* back_buffer, UINT sync_interval, const D3D12_RECT* src_rect = nullptr);
+    // `tear` (with sync_interval > 0): present in the tearing mode when the swapchain has one (tear_supported()), so a
+    // frame that missed its vblank is shown at once; last_present_tore() tells whether that happened.
+    HRESULT present(ID3D12Resource* back_buffer, UINT sync_interval, const D3D12_RECT* src_rect = nullptr,
+                    bool tear = false);
     // A black frame, nothing read (PresentX with no planes).
     HRESULT present_blank(UINT sync_interval);
+    bool tear_supported() const;
+    bool last_present_tore() const;
+    std::uint64_t tear_presents() const;
     // Screenshot support for tests: every presented frame is also copied to host memory (call before presenting).
     bool enable_capture();
     // See VulkanPresenter::set_abort: polled while a present waits for a swapchain image.
@@ -239,12 +274,20 @@ struct RootArgumentLayout {
 const RootArgumentLayout* root_signature_layout(ID3D12RootSignature* signature);
 std::uintptr_t compute_pipeline_id(ID3D12PipelineState* pipeline);
 std::uintptr_t graphics_pipeline_id(ID3D12PipelineState* pipeline);
+// What each stage of a Vulkan device's PSO asked for (src/subgroup_size.h), in creation order; null for another PSO.
+const std::vector<leonida::SubgroupRequest>* pipeline_subgroup_requests(ID3D12PipelineState* pipeline);
 
 // The size of every descriptor slot (GetDescriptorHandleIncrementSize), for handle ranges.
 inline constexpr UINT descriptor_size = 32;
 
 // ExecuteCommandLists returns void; this is what the last call on the queue did.
 leonida::ReplayResult last_execute_result(ID3D12CommandQueue* queue);
+
+// True when the current thread or process token has SeIncreaseBasePriorityPrivilege enabled (or the test override
+// forces it), which D3D12 requires for D3D12_COMMAND_QUEUE_PRIORITY_GLOBAL_REALTIME.
+bool has_global_realtime_privilege();
+// Test override for has_global_realtime_privilege(): -1 queries the token (default), 0 forces denied, 1 forces granted.
+void set_global_realtime_privilege_override_for_test(int state);
 
 // The front/back stencil references last recorded by ID3D12GraphicsCommandList8::OMSetFrontAndBackStencilRef on
 // `list`. The values are kept for the future pipeline path, which is what would apply them. False when `list` is

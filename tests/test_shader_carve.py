@@ -449,11 +449,31 @@ class ShaderCarveCliIntegrationTest(unittest.TestCase):
             f.write(make_rpf_entry("synthetic", 1, dxbc, compressed_override=compressed))
 
         res = self.run_carve(self.archive, self.out)
-        self.assertEqual(res.returncode, 0, res.stderr)
-        self.assertIn("0 shaders carved, 1 candidates rejected", res.stdout)
-        with open(os.path.join(self.out, "index.json"), encoding="utf-8") as f:
-            self.assertEqual(json.load(f), [])
-        self.assertEqual(os.listdir(self.out), ["index.json"])
+        self.assertEqual(res.returncode, 1, res.stderr)
+        self.assertIn("no shaders carved", res.stderr)
+        self.assertIn("rejected candidates: 1", res.stderr)
+        self.assertEqual(os.listdir(self.out), [])
+
+    def test_empty_carve_preserves_an_existing_index(self):
+        dxbc = make_dxbc([(b"PRIV", bytes(range(32)))])
+        with open(self.archive, "wb") as f:
+            f.write(make_rpf_entry("valid", 1, dxbc))
+        initial = self.run_carve(self.archive, self.out)
+        self.assertEqual(initial.returncode, 0, initial.stderr)
+        index_path = os.path.join(self.out, "index.json")
+        with open(index_path, "rb") as f:
+            previous = f.read()
+        with open(self.archive, "wb") as f:
+            f.write(b"no shader entries")
+
+        res = self.run_carve(self.archive, self.out)
+
+        self.assertEqual(res.returncode, 1, res.stderr)
+        self.assertIn("no shaders carved", res.stderr)
+        self.assertIn("rejected candidates: 0", res.stderr)
+        with open(index_path, "rb") as f:
+            self.assertEqual(f.read(), previous)
+        self.assertEqual(sorted(os.listdir(self.out)), ["index.json", "valid.dxbc"])
 
     def test_carve_rejects_incomplete_parts_and_continues(self):
         valid = make_dxbc([(b"PRIV", bytes(range(32)))])

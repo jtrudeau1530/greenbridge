@@ -17,15 +17,15 @@ run_fragment and multi-lane compute run_workgroup), and checked against hand-com
 plain-Python RDNA2 ISA reference functions. Standard library only; hand-written RDNA2 listings only.
 
 Findings & exclusions (no shared files modified):
-  1. v_rcp_iflag_f32 CANNOT execute in tests/semantic/spirv_mini_interp.py:
-     tools/rdna2spirv.py (lines 3693-3697) lowers v_rcp_iflag_f32 to `OpFDiv %float %f1 {x}`, and
-     tests/semantic/spirv_mini_interp.py does not implement `OpFDiv` (it raises `UnsupportedConstruct: OpFDiv`).
-     In addition, tools/rdna2spirv.py line 3697 emits `self.dst(a[0], self.tou(r))` without calling
-     `self.clamp_mods(r, mods)` (unlike `v_rcp_f32` at line 3737 and `v_rndne_f32` at line 2178), so VOP3 output
-     modifiers (`clamp`, `mul:2`, `mul:4`, `div:2`) on `v_rcp_iflag_f32_e64` are silently dropped by the translator.
-     Accordingly, `v_rcp_iflag_f32` is excluded from `spirv_mini_interp.py` value-execution assertions; its
-     independent RDNA2 ISA reference oracle and hand-worked constants are checked in OracleTests, and its
-     SPIR-V translation (`OpFDiv %float %f1 ...`) is checked structurally in RcpIflagF32OracleAndTranslationTests.
+  1. v_rcp_iflag_f32 lowers to `OpFDiv %float %f1 {x}` followed by the VOP3 output modifiers (`clamp`, `mul:2`,
+     `mul:4`, `div:2`) through `clamp_mods`, as `v_rcp_f32` does. When this file was written the translator dropped
+     those modifiers and spirv_mini_interp.py had no `OpFDiv`; both have changed since (FUZZ-3, ed6da6b6), so
+     RcpIflagF32OracleAndTranslationTests now executes it on exact inputs (powers of two, so the 1-ULP hardware
+     approximation and the interpreter's exact division agree) with each output modifier. A zero operand stays
+     out: `OpFDiv` by zero is undefined in SPIR-V and the interpreter refuses it (docs/design.md, "Denormal flush
+     and special results", Not modelled yet). gfx1036 hardware agrees with the translator on 2,570 of 3,000 fuzzed
+     programs with clamp/omod and differs on none (`tools/f32_fuzz.py --oracle translator,hw --ops
+     v_rcp_iflag_f32`, seeds 1 to 3; the rest are division by zero or cases the model does not judge).
   2. NaN caveats in SPIR-V / spirv_mini_interp.py:
      - For `v_rndne_f32` on NaN (`qNaN` / `sNaN`), SPIR-V / GLSL.std.450 `RoundEven` leaves NaN payload/quieting
        unspecified (spirv_mini_interp.py returns the input NaN unchanged; hardware quiets `sNaN`). Tests assert
@@ -729,15 +729,46 @@ class RndneF32Tests(unittest.TestCase):
 
 
 # -----------------------------------------------------------------------------
-# 4. v_rcp_iflag_f32 (Excluded from spirv_mini_interp execution; documented finding)
+# 4. v_rcp_iflag_f32
 # -----------------------------------------------------------------------------
 
 class RcpIflagF32OracleAndTranslationTests(unittest.TestCase):
-    """Documents and checks translation for v_rcp_iflag_f32 without executing OpFDiv in spirv_mini_interp.py.
+    """Checks the translation of v_rcp_iflag_f32 and executes it with source and output modifiers.
 
-    See module docstring: spirv_mini_interp.py raises UnsupportedConstruct("OpFDiv"), and tools/rdna2spirv.py
-    omits clamp_mods on v_rcp_iflag_f32.
+    See module docstring, finding 1: exact (power-of-two) inputs only, and no zero operand.
     """
+
+    def test_executes_with_output_modifiers(self):
+        got = run_ps_mrt0([
+            "v_mov_b32 v1, 0x40000000",                # +2.0
+            "v_rcp_iflag_f32_e64 v10, v1 mul:2",       # 0.5 * 2 = 1.0
+            "v_rcp_iflag_f32_e64 v11, v1 mul:4",       # 0.5 * 4 = 2.0
+            "v_rcp_iflag_f32_e64 v12, v1 div:2",       # 0.5 / 2 = 0.25
+            "v_rcp_iflag_f32_e64 v13, -v1 clamp",      # clamp(-0.5, 0, 1) = +0.0
+        ], ("v10", "v11", "v12", "v13"))
+        self.assertEqual(got, (f32_bits(1.0), f32_bits(2.0), f32_bits(0.25), f32_bits(0.0)))
+
+        got2 = run_ps_mrt0([
+            "v_mov_b32 v1, 0x3e800000",                # +0.25
+            "v_rcp_iflag_f32_e64 v10, v1 clamp",       # clamp(4.0, 0, 1) = 1.0
+            "v_rcp_iflag_f32_e64 v11, -|v1|",          # -4.0
+            "v_rcp_iflag_f32_e64 v12, v1 div:2 clamp", # clamp(2.0, 0, 1) = 1.0
+            "v_rcp_iflag_f32_e32 v13, v1",             # 4.0, no modifiers
+        ], ("v10", "v11", "v12", "v13"))
+        self.assertEqual(got2, (f32_bits(1.0), f32_bits(-4.0), f32_bits(1.0), f32_bits(4.0)))
+        for x_bits, want in ((0x40000000, 0x3F000000), (0x3E800000, 0x40800000), (0xC0000000, 0xBF000000)):
+            with self.subTest(x=f"{x_bits:#010x}"):
+                self.assertEqual(ref_rcp_iflag_f32(x_bits), want)
+
+    def test_dropping_output_modifiers_is_detected(self):
+        # Negative control: if the translator stopped applying the modifier, mul:2 would read back 0.5, not 1.0.
+        good = translate_ps(["v_mov_b32 v1, 0x40000000", "v_rcp_iflag_f32_e64 v0, v1 mul:2",
+                             "exp mrt0 v0, v0, v0, v0 done vm"])
+        self.assertEqual(si.run_fragment(good)["%out_mrt0"][0], f32_bits(1.0))
+        bad, n = re.subn(r"^(\s*%\w+) = OpFMul %float (%\w+) %\w+$", r"\1 = OpFMul %float \2 %f1", good,
+                         count=1, flags=re.M)
+        self.assertEqual(n, 1)
+        self.assertNotEqual(si.run_fragment(bad)["%out_mrt0"][0], f32_bits(1.0))
 
     def test_translates_to_op_fdiv_with_no_contraction(self):
         for line in (

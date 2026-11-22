@@ -886,7 +886,7 @@ def main():
         parent = os.path.dirname(os.path.abspath(a.out))
         if parent:
             os.makedirs(parent, exist_ok=True)
-        with open(a.out, "w", encoding="utf-8") as f:
+        with open(a.out, "w", encoding="utf-8", newline="\n") as f:
             json.dump({"summary": summary, "dictionaries": rows}, f, indent=1)
     except OSError as e:
         sys.exit(f"{a.out}: cannot write: {e.strerror or e}")

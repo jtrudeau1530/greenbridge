@@ -95,25 +95,47 @@ OPUS_PRE_SKIP = 312
 
 def write_ogg_opus(path: str, packets: list, channels: int, serial: int, length: int = 0,
                    pre_skip: int = OPUS_PRE_SKIP) -> int:
-    """length: the stream's declared per-channel sample count at 48 kHz; the last page's granule position is
+    """length: the stream's declared per-channel sample count at 48 kHz; the EOS page's granule position is
     trimmed to pre_skip + length (Ogg Opus granules count the pre-skip too), so decoders drop the encoder priming
-    at the start and stop at the exact end instead of the padded last frame."""
+    at the start and stop at the exact end instead of the padded last frame.
+
+    The EOS page is emitted at the packet that first reaches pre_skip + length; any later packets are encoder
+    padding and are dropped. Clamping only the final page would make its granule smaller than the previous page's
+    when the trim point falls before that page starts, which is invalid Ogg and makes decoders keep the excess.
+    """
+    if not 0 <= pre_skip <= 0xFFFF:
+        raise ValueError(f"pre-skip must be 0..65535, got {pre_skip}")
+    if length < 0:
+        raise ValueError(f"length must be non-negative, got {length}")
+    total = sum(opus_samples(p) for p in packets)
+    if pre_skip > total:
+        pre_skip = total          # a granule below the pre-skip makes the stream undecodable
     head = b"OpusHead" + struct.pack("<BBHIhB", 1, channels, pre_skip, 48000, 0, 0)
     tags = b"OpusTags" + struct.pack("<I", 8) + b"leonida " + struct.pack("<I", 0)
     out = [ogg_page(serial, 0, 0, [head], 0x02), ogg_page(serial, 1, 0, [tags], 0x00)]
     seq, granule, pending, size = 2, 0, [], 0
+    target = pre_skip + length if length > 0 else None
+    written = 0
+    if not packets:
+        out.append(ogg_page(serial, 2, pre_skip, [], 0x04))
+        write_file(path, b"".join(out))
+        return pre_skip
     for i, p in enumerate(packets):
         pending.append(p)
         granule += opus_samples(p)
         size += len(p)
+        reach = target is not None and granule >= target
         last = i == len(packets) - 1
-        if size > 4000 or len(pending) >= 50 or last:
-            g = min(granule, pre_skip + length) if (last and 0 < length) else granule
-            out.append(ogg_page(serial, seq, g, pending, 0x04 if last else 0x00))
+        if reach or size > 4000 or len(pending) >= 50 or last:
+            g = target if reach else granule
+            out.append(ogg_page(serial, seq, g, pending, 0x04 if (reach or last) else 0x00))
+            written = g
             seq += 1
             pending, size = [], 0
+            if reach or last:
+                break
     write_file(path, b"".join(out))
-    return granule
+    return written
 
 
 def write_file(path: str, data: bytes) -> None:
@@ -218,6 +240,7 @@ def music_channels(d: bytes, mus, data, collect_packets: bool = True):
     blocks, chunk, channels = struct.unpack_from("<III", d, m_at)
     if not (1 <= channels <= 32 and 1 <= blocks and chunk >= 2048 and m_size == 12 + 16 * channels):
         return []
+    # Every block must start inside the data tag. The last block can be shorter than the chunk stride.
     if (blocks - 1) * chunk >= d_size:
         return []
     info = []
@@ -275,6 +298,17 @@ def opus_packets(d: bytes, at: int, size: int):
     return out
 
 
+def export_stems(ids):
+    """The file stem for each stream, in stream-table order: `<id>` (8 hex digits) for the first stream with an
+    id and `<id>~2`, `<id>~3`, ... for later ones. A bank can hold two streams with the same 29-bit id; naming
+    them apart keeps the second from overwriting the first. awc_manifest notes the same stems."""
+    seen, out = {}, []
+    for sid in ids:
+        seen[sid] = seen.get(sid, 0) + 1
+        out.append(f"{sid:08X}" if seen[sid] == 1 else f"{sid:08X}~{seen[sid]}")
+    return out
+
+
 def export_bank(path: str, out_dir: str, pre_skip: int = OPUS_PRE_SKIP):
     with open(path, "rb") as f:
         d = f.read()
@@ -290,26 +324,29 @@ def export_bank(path: str, out_dir: str, pre_skip: int = OPUS_PRE_SKIP):
                 write_ogg_opus(os.path.join(od, f"{cid:08X}.ogg"), pk, packet_channels, cid, n48,
                                pre_skip=pre_skip)
                 counts["music"] += 1
-    for s in streams:
+    for s, stem in zip(streams, export_stems([s["id"] for s in streams])):
         at, size = s["data"]
         if s["codec"] == 0x0B and size % 2048 == 0 and s["channels"] in (1, 2):
             pk = opus_packets(d, at, size)
             if pk:
                 # +0x0C is the per-channel Opus frame count: equal to the +0 count for mono and
-                # half of it for stereo in all 7,451 measured streams. Fall back to dividing the
-                # interleaved count when a synthetic or malformed block leaves the field zero.
-                frames = s["frames"] or s["samples"] // max(1, s["channels"])
-                write_ogg_opus(os.path.join(od, f"{s['id']:08X}.ogg"), pk, s["channels"], s["id"], frames,
+                # half of it for stereo in all 7,451 measured streams. Use it only when it agrees
+                # with the interleaved +0 count; a synthetic or malformed block that disagrees
+                # must not silently truncate the real audio.
+                frames = s["frames"]
+                if not frames or frames * s["channels"] != s["samples"]:
+                    frames = s["samples"] // max(1, s["channels"])
+                write_ogg_opus(os.path.join(od, stem + ".ogg"), pk, s["channels"], s["id"], frames,
                                pre_skip=pre_skip)
                 counts["opus"] += 1
                 continue
         if s["codec"] == 2 and s["channels"] in (1, 2) and size == s["samples"] * s["channels"] * 4:
             # codec 2: 32-bit float PCM (4 bytes per sample; values can exceed +-1, e.g. impulse responses)
-            write_wav(os.path.join(od, f"{s['id']:08X}.wav"), d[at:at + size], s["rate"], s["channels"], True)
+            write_wav(os.path.join(od, stem + ".wav"), d[at:at + size], s["rate"], s["channels"], True)
             counts["pcm"] += 1
             continue
         if s["codec"] == 0 and s["channels"] in (1, 2):
-            write_wav(os.path.join(od, f"{s['id']:08X}.wav"), d[at:at + size], s["rate"], s["channels"])
+            write_wav(os.path.join(od, stem + ".wav"), d[at:at + size], s["rate"], s["channels"])
             counts["pcm"] += 1
             continue
         counts["other"] += 1

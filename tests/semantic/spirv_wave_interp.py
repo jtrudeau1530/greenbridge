@@ -38,6 +38,15 @@ class UnsupportedConstruct(NotImplementedError):
     """The module uses something this interpreter deliberately does not model."""
 
 
+class InvalidModule(AssertionError):
+    """The module breaks spirv-val's merge rule (see spirv_mini_interp.check_structure): a merge instruction must
+    directly precede its block's branch. Raised instead of running a shader no driver would accept."""
+
+
+_MERGE_FOLLOW = {"OpSelectionMerge": ("OpBranchConditional", "OpSwitch"),
+                 "OpLoopMerge": ("OpBranch", "OpBranchConditional")}
+
+
 class F:
     """A 32-bit float carried as its bit pattern."""
     __slots__ = ("bits",)
@@ -120,6 +129,7 @@ class _Module:
         self.id_type = {}
         cur = None
         in_body = False
+        merge_line = None           # (opcode, line) of a merge whose branch has not been seen yet
         for raw in text.splitlines():
             line = raw.strip()
             if not line:
@@ -130,6 +140,11 @@ class _Module:
             res, op, rest = m.groups()
             a = rest.split()
             if in_body:
+                if merge_line is not None:
+                    if op not in _MERGE_FOLLOW[merge_line[0]]:
+                        raise InvalidModule(f"{merge_line[1]!r} is followed by {line!r}, not by "
+                                            f"{' or '.join(_MERGE_FOLLOW[merge_line[0]])}")
+                    merge_line = None
                 if op == "OpFunctionEnd":
                     in_body = False
                     continue
@@ -145,10 +160,16 @@ class _Module:
                     raise UnsupportedConstruct(f"{op} before the first label")
                 if res and a and op != "OpStore":
                     self.id_type[res] = a[0]
+                if op == "OpVariable" and a[1:2] == ["Function"] and len(self.blocks) > 1:
+                    raise InvalidModule(f"{line!r} is a Function variable outside the function's first block")
                 if op == "OpPhi":
+                    if cur.body:
+                        raise InvalidModule(f"{line!r} follows a non-phi instruction of its block (spirv-val: "
+                                            "OpPhi must come first)")
                     cur.phis.append((res, a))
                 elif op in ("OpSelectionMerge", "OpLoopMerge"):
                     cur.merge = (op, a[0], a[1] if op == "OpLoopMerge" else None)
+                    merge_line = (op, line)
                 elif op in _TERMINATORS:
                     cur.term = (op, a)
                     cur = None

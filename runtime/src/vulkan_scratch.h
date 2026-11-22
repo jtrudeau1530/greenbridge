@@ -94,11 +94,14 @@ public:
     // Keeps for reuse (or frees) the chunks of finished submissions.
     void collect() {
         for (std::size_t i = 0; i < retired_.size();) {
-            std::uint64_t done = 0;
-            if (retired_[i].timeline) vk_.vkGetSemaphoreCounterValue(device_, retired_[i].timeline, &done);
-            if (done < retired_[i].ticket) {
-                ++i;
-                continue;
+            if (retired_[i].ticket != 0) {
+                std::uint64_t done = 0;
+                if (!retired_[i].timeline ||
+                    vk_.vkGetSemaphoreCounterValue(device_, retired_[i].timeline, &done) != VK_SUCCESS ||
+                    done < retired_[i].ticket) {
+                    ++i;
+                    continue;
+                }
             }
             for (auto& chunk : retired_[i].chunks) {
                 chunk.used = 0;

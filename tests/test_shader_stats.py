@@ -37,7 +37,7 @@ NOTHING = "ps: 1 shaders, code growth n/a; VGPRs n/a; scratch n/a, spills n/a; w
 
 
 class ShaderStats(unittest.TestCase):
-    def run_stats(self, rows, details=True, listings=None):
+    def run_stats(self, rows, details=True, listings=None, header="name,stage,statistic,value"):
         with tempfile.TemporaryDirectory() as tmp:
             disasm = os.path.join(tmp, "disasm")
             os.makedirs(disasm)
@@ -46,7 +46,7 @@ class ShaderStats(unittest.TestCase):
                     f.write(text)
             csv_path = os.path.join(tmp, "stats.csv")
             with open(csv_path, "w", encoding="utf-8") as f:
-                f.write("name,stage,statistic,value\n" + "".join(f"{r}\n" for r in rows))
+                f.write(header + "\n" + "".join(f"{r}\n" for r in rows))
             cmd = [sys.executable, "-I", SCRIPT, csv_path, disasm] + (["--details"] if details else [])
             return subprocess.run(cmd, capture_output=True, text=True)
 
@@ -128,6 +128,41 @@ class ShaderStats(unittest.TestCase):
                 self.assertEqual(r.returncode, 0, r.stderr)
                 self.assertNotIn("Traceback", r.stderr)
                 self.assertEqual(self.detail(r)[column], "-")
+
+    def test_missing_required_header_is_rejected_with_path_and_line(self):
+        r = self.run_stats(["ps_flat,ps,Instructions,16"], header="name,stage,statistic")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertNotIn("Traceback", r.stderr)
+        self.assertIn("stats.csv: line 1:", r.stderr)
+        self.assertIn("missing required header column(s): value", r.stderr)
+
+    def test_duplicate_required_header_is_rejected_before_rows(self):
+        r = self.run_stats(["ps_flat,ps_flat,ps,Instructions,16"], header="name,name,stage,statistic,value")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertNotIn("Traceback", r.stderr)
+        self.assertIn("stats.csv: line 1:", r.stderr)
+        self.assertIn("duplicated required header column(s): name", r.stderr)
+
+    def test_short_row_missing_a_cell_is_rejected_with_its_line(self):
+        r = self.run_stats(["ps_flat,ps,Instructions"])
+        self.assertNotEqual(r.returncode, 0)
+        self.assertNotIn("Traceback", r.stderr)
+        self.assertIn("stats.csv: line 2:", r.stderr)
+        self.assertIn("row missing required column(s): value", r.stderr)
+
+    def test_extra_headed_columns_and_explicitly_blank_value_remain_accepted(self):
+        r = self.run_stats(["ps_flat,ps,Instructions,,abc", "ps_flat,ps,VGPRs,8,xyz"],
+                           header="name,stage,statistic,value,extra")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        d = self.detail(r)
+        self.assertEqual((d[3], d[6]), ("-", "8"))
+
+    def test_header_only_report_is_a_valid_empty_report(self):
+        r = self.run_stats([], details=False)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertNotIn("Traceback", r.stderr)
+        self.assertNotIn("missing required", r.stderr)
+        self.assertIn("no shader is in both", r.stderr)
 
 
 if __name__ == "__main__":

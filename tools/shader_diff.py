@@ -38,7 +38,7 @@ if SEM_DIR not in sys.path:
 
 import cpu_ref  # noqa: E402
 import rdna2spirv  # noqa: E402
-from spirv_mini_interp import run_fragment  # noqa: E402
+from spirv_mini_interp import UnsupportedConstruct, run_fragment  # noqa: E402
 
 STUB_DXBC = b"DXBC" + bytes(24) + struct.pack("<I", 0) + bytes(4)
 
@@ -177,7 +177,7 @@ def generate_program(rng, n_ops):
 
 
 def _write_listing(path, lines, with_export):
-    with open(path, "w", encoding="utf-8") as f:
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
         f.write("; shader_diff case  code 0x0..0x1000\n")
         for line in lines:
             f.write("\t" + line + "\n")
@@ -243,7 +243,7 @@ def run_one(name, lines, writers):
             return ("skip", f"translator error {type(e).__name__}: {e}")
         try:
             out = run_fragment(spvasm)
-        except Exception as e:  # noqa: BLE001 - the interpreter is part of the comparison
+        except UnsupportedConstruct as e:
             return ("skip", f"mini_interp unsupported: {type(e).__name__}: {e}")
         if list(out) != ["%out_mrt0"]:
             return ("skip", f"mini_interp gave outputs {sorted(out)}, want [%out_mrt0]")

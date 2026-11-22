@@ -16,6 +16,7 @@
 //   - how long an upload and a readback take at 64x64 and 256x256, and up to 4096x4096 with LEONIDA_RGB96_LARGE
 //     set (single runs, each on a new queue).
 // No game data or shaders. Run explicitly (needs Vulkan hardware); LEONIDA_VK_VALIDATION=1 checks Vulkan usage.
+#include "host_wine.h"
 #include "vk_test_device.h"
 #include "../shims/d3d12_com.h"
 #include <dxgi1_4.h>
@@ -541,6 +542,8 @@ int main() {
         if (FAILED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&ours_staged.p)))) return 1;
         info.host_image_copy = vk.host_image_copy;
         if (FAILED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&ours.p)))) return 1;
+        // Wine has a WARP adapter too, but it is vkd3d, whose footprints differ from Microsoft's.
+        if (hostwine::host_is_wine()) return 77;  // WARP is the reference for every case
         Ref<IDXGIFactory4> factory;
         Ref<IDXGIAdapter> warp;
         if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory.p))) ||

@@ -188,7 +188,7 @@ def validate_cases():
         for name, asm in CASES.items():
             src = os.path.join(d, name + ".spvasm")
             spv = os.path.join(d, name + ".spv")
-            with open(src, "w", encoding="utf-8") as f:
+            with open(src, "w", encoding="utf-8", newline="\n") as f:
                 f.write(asm)
             ra = run(["spirv-as", src, "-o", spv, "--target-env", "vulkan1.4"])
             if ra is None or ra.returncode != 0:
@@ -214,6 +214,9 @@ def main():
     ap = argparse.ArgumentParser(description="Turing bring-up atlas (no game data).")
     ap.add_argument("--out", default=None, help="write JSON atlas to FILE (default: stdout)")
     a = ap.parse_args()
+    if a.out and os.path.isdir(a.out):
+        print(f"turing_atlas: error: --out is a folder, not a file: {a.out}", file=sys.stderr)
+        return 2
     cases = validate_cases()
     atlas = {"tool": "turing_atlas", "gpu": None, "features": vulkan_matrix(),
              "cases": cases}
@@ -224,11 +227,15 @@ def main():
         pass
     text = json.dumps(atlas, indent=2, sort_keys=True)
     if a.out:
-        folder = os.path.dirname(a.out)  # --out into a folder that does not exist yet, as awc_manifest.py does
-        if folder:
-            os.makedirs(folder, exist_ok=True)
-        with open(a.out, "w", encoding="utf-8") as f:
-            f.write(text + "\n")
+        try:
+            folder = os.path.dirname(a.out)
+            if folder:
+                os.makedirs(folder, exist_ok=True)
+            with open(a.out, "w", encoding="utf-8", newline="\n") as f:
+                f.write(text + "\n")
+        except OSError as error:
+            print(f"turing_atlas: error: cannot write {a.out}: {error.strerror or error}", file=sys.stderr)
+            return 2
         print(f"atlas -> {a.out}")
     else:
         print(text)

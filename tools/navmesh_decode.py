@@ -49,6 +49,7 @@ import re
 import struct
 import sys
 import time
+import unicodedata
 import zlib
 from collections import Counter
 
@@ -926,7 +927,7 @@ def _make_parent(path):
 def write_csv(path, rows):
     _make_parent(path)
     with open(path, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=COLUMNS, extrasaction="ignore")
+        w = csv.DictWriter(f, fieldnames=COLUMNS, extrasaction="ignore", lineterminator="\n")
         w.writeheader()
         for r in rows:
             w.writerow({k: ("" if r.get(k) is None else r.get(k)) for k in COLUMNS})
@@ -946,8 +947,35 @@ def _offset(text):
     return value
 
 
+_PC_CASE_SENSITIVE = 11  # <sys/unistd.h> on macOS; os.pathconf_names doesn't list it
+
+
+def _case_insensitive_volume(path):
+    """True when the volume that will hold `path` ignores letter case, as macOS's default APFS volume does.
+    os.path.normcase folds case only on Windows, so on macOS `R.json` and `r.json` would pass as two reports."""
+    if sys.platform != "darwin":
+        return False
+    while not os.path.exists(path):
+        parent = os.path.dirname(path)
+        if parent == path:
+            break
+        path = parent
+    try:
+        return os.pathconf(path, _PC_CASE_SENSITIVE) == 0
+    except (OSError, ValueError):
+        return True  # the macOS default; folding can only refuse a pair, never overwrite one
+
+
+def _path_key(path):
+    path = os.path.normcase(os.path.realpath(path))
+    if _case_insensitive_volume(path):
+        # APFS and HFS+ also treat composed and decomposed accents as one name.
+        path = unicodedata.normalize("NFD", path.casefold())
+    return path
+
+
 def same_report_path(first, second):
-    if os.path.normcase(os.path.realpath(first)) == os.path.normcase(os.path.realpath(second)):
+    if _path_key(first) == _path_key(second):
         return True
     try:
         return os.path.samefile(first, second)
@@ -983,7 +1011,7 @@ def main(argv=None):
         print("error: %s" % exc, file=sys.stderr)
         return 2
     _make_parent(out)
-    with open(out, "w", encoding="utf-8") as f:
+    with open(out, "w", encoding="utf-8", newline="\n") as f:
         json.dump(summary, f, indent=1, allow_nan=False)
     if a.csv:
         write_csv(a.csv, rows)

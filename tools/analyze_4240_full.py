@@ -70,6 +70,8 @@ def iter_archive_streams(path):
         try:
             size = len(m)
             pos = struct.unpack_from("<I", m, 4)[0] if size >= 8 else size
+            if pos > size:
+                raise ValueError(f"{path}: header data offset {pos} is past the end of the file ({size} bytes)")
             while pos < size:
                 match = ZHDR.search(m, pos)
                 if not match:
@@ -213,9 +215,9 @@ def process_archive(archive_path, limit=None):
     }
     
     for stream_name, stream_data in iter_archive_streams(archive_path):
-        stats["streams"] += 1
-        if limit and stats["streams"] > limit:
+        if limit and stats["streams"] >= limit:
             break
+        stats["streams"] += 1
         
         # Walk stream
         pos = 0
@@ -315,7 +317,13 @@ def main() -> int:
             status = 1
             continue
         print(f"Processing {path}...")
-        stats = process_archive(path, limit=args.limit)
+        try:
+            stats = process_archive(path, limit=args.limit)
+        except ValueError as e:
+            # A truncated archive or a bad data offset otherwise looks like an empty successful scan.
+            print(f"ERROR: {e}", file=sys.stderr)
+            status = 1
+            continue
         all_stats.append(stats)
         
         print(f"  Streams: {stats['streams']}")
@@ -344,7 +352,7 @@ def main() -> int:
         parent = os.path.dirname(os.path.abspath(args.json))
         if parent:      # every archive has been read by now; a missing folder used to lose the run
             os.makedirs(parent, exist_ok=True)
-        with open(args.json, "w", encoding="utf-8") as f:
+        with open(args.json, "w", encoding="utf-8", newline="\n") as f:
             json.dump(output, f, indent=2)
     return status
 

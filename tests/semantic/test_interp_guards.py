@@ -14,7 +14,12 @@ so anything else is refused instead of silently translating wrong (docs/design.m
   the zero-before-copy measurement renders (0,0) on hardware — while zeroing after the copy is fine,
   the copy saved the value). One corpus shader reads its J through a copy of v1 and must keep
   translating (bit-identical .spv);
-* a register written twice (the mov, then anything else) no longer qualifies;
+* a register written twice (the mov, then anything else) no longer qualifies — and since the
+  computed-I/J model landed, a written-again register, a copy of an already-overwritten v0/v1, or a
+  modified (dpp) mov is no longer refused but modelled: the operand is a value the program wrote,
+  and the model weights the interpolation with the value loaded from %vgpr (Vonsek's zero-before-copy
+  row renders P0, which is exactly those loads' result). A pristine copy in the wrong role stays
+  refused: it carries no computed value to model;
 * the standard forms (v0/v1 pairs, p0 mov) translate and compute exactly as before.
 
 On main (before the guards) the refused cases translated silently and passed spirv-val: the operand
@@ -28,10 +33,16 @@ import rdna2spirv
 
 ATTR0 = (0.5, 0.25, 0.0, 1.0)
 FLAT_ATTR1_X = 0x101          # attr1.x read through v_interp_mov only: the provoking vertex's word
+BARY = (0.25, 0.25, 0.5)       # (k, i, j): the weights the interpreter seeds v0/v1 from (.y/.z)
+# Three DISTINCT vertices of attr0 (raw words), so a test's weights are visible in the result.
+VERTS0 = ((0.0, 0.0, 1.0, 0.0), (2.0, 0.0, 3.0, 0.0), (0.0, 2.0, 5.0, 0.0))
 
 
 def f32_bits(x):
     return struct.unpack("<I", struct.pack("<f", x))[0]
+
+
+WORDS0 = [tuple(f32_bits(x) for x in v) for v in VERTS0]
 
 
 class InterpPairGuards(unittest.TestCase):
@@ -73,26 +84,34 @@ class InterpPairGuards(unittest.TestCase):
                 words = support.mrt0_words(spv, inputs={"%in_attr0": ATTR0})
                 self.assertEqual(words, [f32_bits(ATTR0[0])] * 4)
 
-    def test_copy_written_again_refused(self):
-        # Two writes (the copy, then an add) mean the register no longer provably holds the pair.
-        with self.assertRaises(rdna2spirv.Unsupported) as cm:
-            support.translate_lines("ps_copy2", ["v_mov_b32_e32 v6, v1",
-                                                 "v_add_f32_e32 v6, v0, v0",
-                                                 "v_interp_p1_f32_e32 v2, v0, attr0.x",
-                                                 "v_interp_p2_f32_e32 v2, v6, attr0.x",
-                                                 "exp mrt0 v2, v2, v2, v2 done vm",
-                                                 "s_endpgm"])
-        self.assertIn("v_interp_p2_f32 J source v6", str(cm.exception))
+    def test_copy_written_again_is_computed(self):
+        # Two writes (the copy, then an add) mean the register no longer provably holds the pair, so
+        # the guard would refuse it -- but the computed-I/J model represents it: the operand load
+        # reads the value the add wrote. J' = I + I doubles the second weight.
+        spv = support.translate_lines("ps_copy2", ["v_mov_b32_e32 v6, v1",
+                                                   "v_add_f32_e32 v6, v0, v0",
+                                                   "v_interp_p1_f32_e32 v2, v0, attr0.x",
+                                                   "v_interp_p2_f32_e32 v2, v6, attr0.x",
+                                                   "exp mrt0 v2, v2, v2, v2 done vm",
+                                                   "s_endpgm"])
+        words = support.mrt0_words(spv, inputs=support.varyings(spv, {0: WORDS0}, BARY))
+        i, j = BARY[1], 2 * BARY[1]
+        exp = VERTS0[0][0] + i * (VERTS0[1][0] - VERTS0[0][0]) + j * (VERTS0[2][0] - VERTS0[0][0])
+        self.assertEqual(words, [f32_bits(exp)] * 4)
+        self.assertIn("PerVertexKHR", spv)
 
-    def test_copy_with_modifiers_refused(self):
-        # A dpp mov is not a plain copy, so the single write does not establish the barycentric.
-        with self.assertRaises(rdna2spirv.Unsupported) as cm:
-            support.translate_lines("ps_copy3", ["v_mov_b32_dpp v6, v1 row_shl:1 row_mask:0xf bank_mask:0xf",
-                                                 "v_interp_p1_f32_e32 v2, v0, attr0.x",
-                                                 "v_interp_p2_f32_e32 v2, v6, attr0.x",
-                                                 "exp mrt0 v2, v2, v2, v2 done vm",
-                                                 "s_endpgm"])
-        self.assertIn("v_interp_p2_f32 J source v6", str(cm.exception))
+    def test_copy_with_modifiers_is_computed(self):
+        # A dpp mov is not a plain copy, so the single write does not establish the barycentric --
+        # but it is still a write of the operand register, and the computed-I/J model loads whatever
+        # value the program put there. The pair translates; the weights are the wave-wide dpp
+        # results, so this asserts translation (and the per-vertex read), not single-lane words.
+        spv = support.translate_lines("ps_copy3", ["v_mov_b32_dpp v6, v1 row_shl:1 row_mask:0xf bank_mask:0xf",
+                                                   "v_interp_p1_f32_e32 v2, v0, attr0.x",
+                                                   "v_interp_p2_f32_e32 v2, v6, attr0.x",
+                                                   "exp mrt0 v2, v2, v2, v2 done vm",
+                                                   "s_endpgm"])
+        self.assertIn("OpEntryPoint Fragment", spv)
+        self.assertIn("PerVertexKHR", spv)
 
     def test_swapped_and_same_register_roles_refused(self):
         # The roles are per op — p1 interpolates with I = v0, p2 with J = v1 — so a swapped pair
@@ -148,19 +167,22 @@ class InterpPairGuards(unittest.TestCase):
         words = support.mrt0_words(spv, inputs={"%in_attr0": ATTR0})
         self.assertEqual(words, [f32_bits(ATTR0[0])] * 4)
 
-    def test_copy_of_overwritten_source_refused(self):
+    def test_copy_of_overwritten_source_is_computed(self):
         # Vonsek measurement row 3: zeroing v0/v1 BEFORE the copy means the copy carries the
-        # computed (0) value, not the barycentric pair — hardware renders (0,0) — so the copy no
-        # longer qualifies. (The corpus's one copy PS copies v1 while it is still unwritten, then
-        # overwrites it: the saved-copy case above, which keeps translating.)
-        with self.assertRaises(rdna2spirv.Unsupported) as cm:
-            support.translate_lines("ps_rolz", ["v_mov_b32_e32 v0, 0", "v_mov_b32_e32 v1, 0",
-                                                "v_mov_b32_e32 v6, v0", "v_mov_b32_e32 v7, v1",
-                                                "v_interp_p1_f32_e32 v2, v6, attr0.x",
-                                                "v_interp_p2_f32_e32 v2, v7, attr0.x",
-                                                "exp mrt0 v2, v2, v2, v2 done vm",
-                                                "s_endpgm"])
-        self.assertIn("v_interp_p1_f32 I source v6", str(cm.exception))
+        # computed (0) value, not the barycentric pair — hardware renders (0,0) = P0 — so the copy
+        # no longer qualifies for the guard. The computed-I/J model represents it exactly: the
+        # operand loads read the zeros the program wrote, and the weights (0, 0) pick vertex 0.
+        # (The corpus's one copy PS copies v1 while it is still unwritten, then overwrites it: the
+        # saved-copy case above, which keeps translating untouched by this.)
+        spv = support.translate_lines("ps_rolz", ["v_mov_b32_e32 v0, 0", "v_mov_b32_e32 v1, 0",
+                                                  "v_mov_b32_e32 v6, v0", "v_mov_b32_e32 v7, v1",
+                                                  "v_interp_p1_f32_e32 v2, v6, attr0.x",
+                                                  "v_interp_p2_f32_e32 v2, v7, attr0.x",
+                                                  "exp mrt0 v2, v2, v2, v2 done vm",
+                                                  "s_endpgm"])
+        words = support.mrt0_words(spv, inputs=support.varyings(spv, {0: WORDS0}, BARY))
+        self.assertEqual(words, [f32_bits(VERTS0[0][0])] * 4)   # weights (0, 0): the provoking vertex
+        self.assertIn("PerVertexKHR", spv)
 
     def test_standard_pairs_and_p0_mov_unchanged(self):
         spv = support.translate_lines("ps_std", ["v_interp_p1_f32_e32 v2, v0, attr0.x",
@@ -181,19 +203,20 @@ class InterpPairGuards(unittest.TestCase):
         self.assertIn("OpEntryPoint Fragment", spv)
 
     def test_guard_uses_the_copy_analysis(self):
-        # Mutation check: with interp_copy_sources returning nothing, the copy case must refuse, so
-        # the acceptance above really flows through the tracking and not through a vacuous guard.
+        # Mutation check: with interp_copy_sources returning nothing, the copy case no longer takes
+        # the guard's centre-interpolated path; it falls through to the computed-I/J model
+        # (PerVertexKHR + operand loads), proving the acceptance above really flows through the
+        # tracking and not through a vacuous guard. Either path is exact for a real copy.
         lines = ["v_mov_b32_e32 v6, v1",
                  "v_interp_p1_f32_e32 v2, v0, attr0.x",
                  "v_interp_p2_f32_e32 v2, v6, attr0.x",
                  "exp mrt0 v2, v2, v2, v2 done vm",
                  "s_endpgm"]
-        self.assertIn("OpEntryPoint Fragment", support.translate_lines("ps_vc", lines))
+        self.assertNotIn("PerVertexKHR", support.translate_lines("ps_vc", lines))
         orig = rdna2spirv.interp_copy_sources
         rdna2spirv.interp_copy_sources = lambda insns: {}
         try:
-            with self.assertRaises(rdna2spirv.Unsupported):
-                support.translate_lines("ps_vc", lines)
+            self.assertIn("PerVertexKHR", support.translate_lines("ps_vc", lines))
         finally:
             rdna2spirv.interp_copy_sources = orig
 

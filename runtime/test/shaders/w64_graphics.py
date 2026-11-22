@@ -1,5 +1,5 @@
-"""SHADER-10 GPU checks: wave64 pixel shaders on 32-lane subgroups (docs/design.md, "Wave64 graphics: partition
-invariance").
+"""SHADER-10 GPU checks: wave64 pixel and vertex shaders on 32-lane subgroups (docs/design.md, "Wave64 graphics:
+partition invariance").
 
     python3 -I runtime/test/shaders/w64_graphics.py <build dir with spirv/> [tools dir] [name ...]
 
@@ -16,6 +16,13 @@ A device that can require only one size (NVIDIA: 32 only) cannot run the compari
 checked against the derived words (tiers A, B), the tier C check is skipped, and two environment variables let a
 second device stand in for the missing size: W64G_SAVE_REF=<dir> stores each 64-lane run of a device that can require
 it, and W64G_REF=<dir> compares every run of the other device with those files (equal for A and B, different for C).
+
+The vs_w64_* fixtures (TEST-251) are vertex shaders: Vulkan cannot require a vertex subgroup size, so the two sizes
+come from RADV, which runs the VS stage as wave64 by default and as wave32 with RADV_PERFTEST=gewave32 (GFX10+).
+Each draws 960 vertices with zero area (VKH_VERTICES) and stores four words per vertex to the heap; vs_w64_c_lane_id
+doubles as the probe that the wave size really changed, and without RADV only the default-size checks run. RADV packs
+62 or 64 vertices into a wave64 and 30 or 32 into a wave32, so the 32-lane run is a repacking, not the two halves of
+the 64-lane waves: a stricter test of tiers A and B, which key every word on the vertex index.
 """
 import os
 import struct
@@ -106,6 +113,25 @@ def _c_execz_sgpr(i):
     return (7 if _on(i) else None, _on(i), 0, 0)               # r0 = s5: 7 only where the active side ran
 
 
+# vs_w64_* fixtures: i is the vertex index, x = i % 64 and y = i // 64 as for a pixel.
+def _vs_a_skip(i):
+    x, y = _x(i), _y(i)
+    return (7 * y + x if x % 4 == 1 else 1000 + x, int(x % 4 == 1), 2000 + y + (9 if y % 4 == 2 else 0), x % 4 + 1)
+
+
+def _vs_b_readlane_uniform(i):
+    return (_x(i) + 123, 200, _x(i) + 123, 277)
+
+
+def _vs_c_lane_id(i):
+    return (None, None, i, 0)                                  # r0, r1 = the lane the vertex got
+
+
+VS_ENV = {"VKH_SGPRS": "0,0,65536,0x30000000", "VKH_HEAP": "0=0"}
+VS_VERTICES = 960        # 15 rows of 64 vertices: several waves at either size, and partial ones
+VS_RECORDS = 0x1000 // 4  # heap word of vertex 0's record (4 words per vertex); below it, the atomic's counter and slots
+
+
 # name -> (tier, expected words per pixel (None = not fixed), environment of the draw)
 FIXTURES = {
     "ps_w64_a_skip": ("A", _a_skip, {}),
@@ -122,13 +148,70 @@ FIXTURES = {
     "ps_w64_c_vote_else": ("C", _c_vote_else, {}),
     "ps_w64_c_scc_vote": ("C", _c_scc_vote, {}),
     "ps_w64_c_execz_sgpr": ("C", _c_execz_sgpr, {}),
+    "vs_w64_a_skip": ("A", _vs_a_skip, VS_ENV),
+    "vs_w64_b_waterfall": ("B", _b_waterfall, VS_ENV),
+    "vs_w64_b_readlane_uniform": ("B", _vs_b_readlane_uniform, dict(VS_ENV, VKH_SGPRS=VS_ENV["VKH_SGPRS"] + ",123")),
+    "vs_w64_b_ballot_atomic": ("B", _b_ballot, VS_ENV),
+    "vs_w64_c_bcnt_export": ("C", _c_bcnt, VS_ENV),
+    "vs_w64_c_readlane": ("C", _c_readlane, VS_ENV),
+    "vs_w64_c_lane_id": ("C", _vs_c_lane_id, VS_ENV),
 }
+
+VS_PROBE = "vs_w64_c_lane_id"
+_vs_applied = {}
+
+
+def _radv_perftest(size):
+    """RADV_PERFTEST for a vertex draw at `size`. Vulkan cannot require a vertex subgroup size (requiredSubgroupSizeStages
+    has no VERTEX on RADV or on the AMD driver), but RADV runs the VS/GS (NGG) stage as wave32 with gewave32 and as
+    wave64 without it on GFX10+. Other drivers ignore the variable; the probe then finds no change."""
+    flags = [f for f in os.environ.get("RADV_PERFTEST", "").split(",") if f and f != "gewave32"]
+    return ",".join(flags + ["gewave32"] * (size == 32))
+
+
+def _vs_wave_size(tools, spirv, size, tmp):
+    """Whether a vertex draw at `size` really ran at that wave size: the largest lane id of VS_PROBE is 32..63 in a
+    wave64 VS and below 32 in a wave32 one. Size 32 also needs size 64 to work, so that the two draws differ."""
+    if size not in _vs_applied:
+        def top(s):
+            words = _draw_vs(tools, spirv, VS_PROBE, s, tmp)[0]
+            return None if words is None else max(w[0] for w in words)
+        lane64, lane32 = top(64), top(32)
+        _vs_applied[64] = lane64 is not None and 32 <= lane64 < 64
+        _vs_applied[32] = _vs_applied[64] and lane32 is not None and lane32 < 32
+    return _vs_applied[size]
+
+
+def _draw_vs(tools, spirv, name, size, tmp):
+    """(records, heap) of one vertex draw at `size` (None: as the environment says), or (None, message)."""
+    env = dict(os.environ, **FIXTURES[name][2])
+    if size:
+        env["RADV_PERFTEST"] = _radv_perftest(size)
+    raw, heap = Path(tmp) / f"{name}.{size}.raw", Path(tmp) / f"{name}.{size}.heap"
+    env.update(VKH_VERTICES=str(VS_VERTICES), VKH_HEAP_DUMP=str(heap))
+    env.pop("VKH_SUBGROUP_SIZE", None)
+    # The triangles have zero area, so no pixel is drawn and any fragment shader does.
+    cmd = [os.path.join(tools, "vk_harness" + EXE), os.path.join(spirv, name + ".spv"),
+           os.path.join(spirv, "ps_w64_a_skip.spv"), str(raw)]
+    r = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=120)
+    out = r.stdout + r.stderr
+    if r.returncode == UNSUPPORTED:
+        return None, "unsupported: " + out.strip().splitlines()[-1]
+    if r.returncode or not heap.is_file():
+        return None, f"exit {r.returncode}: {' | '.join(out.strip().splitlines()[-3:])}"
+    words = list(struct.unpack("<%dI" % (65536 // 4), heap.read_bytes()))
+    return [tuple(words[VS_RECORDS + 4 * v:VS_RECORDS + 4 * v + 4]) for v in range(VS_VERTICES)], words
 
 
 def draw(tools, spirv, name, size, tmp):
     """(words per pixel, heap words or None, applied) of one draw. `applied`: the required size took effect (size
     None: no size asked, applied is None). The words are None when the draw failed; then `heap` is the message."""
     tier, expect, extra = FIXTURES[name]
+    if name.startswith("vs_"):
+        words, heap = _draw_vs(tools, spirv, name, size, tmp)
+        if words is None:
+            return None, heap, None
+        return words, heap, _vs_wave_size(tools, spirv, size, tmp) if size else None
     env = dict(os.environ, **extra)
     env.pop("VKH_SUBGROUP_SIZE", None)
     if size:
@@ -168,15 +251,16 @@ def expected_problem(name, words, heap):
     if wrong:
         i, w, want = wrong[0]
         return f"{len(wrong)} of {len(words)} pixels differ from the derived words, first ({_x(i)},{_y(i)}): got {w}, want {want}"
-    if name == "ps_w64_b_ballot_atomic":
-        want = sorted(_y(i) * W + _x(i) + 1 for i in range(W * H) if _x(i) % 4 == 1)
+    if name.endswith("_b_ballot_atomic"):
+        want = sorted(i + 1 for i in range(len(words)) if _x(i) % 4 == 1)
         n = len(want)
         if heap[0] != n:
             return f"counter is {heap[0]}, want {n}"
         slots = heap[64:64 + n]
         if sorted(slots) != want:
             return f"slot words are not the {n} wanted pixel numbers once each ({len(set(slots))} distinct)"
-        if any(heap[64 + n:]) or any(heap[1:64]):
+        end = VS_RECORDS if name.startswith("vs_") else len(heap)   # the vertex records follow the slots
+        if any(heap[64 + n:end]) or any(heap[1:64]):
             return "words outside the counter and the slots were written"
     return ""
 
@@ -184,7 +268,7 @@ def expected_problem(name, words, heap):
 def comparable(name, words, heap):
     """What two draws of the same fixture must share when the shader is partition invariant."""
     stable = [tuple(0 if g is None else v for g, v in zip(FIXTURES[name][1](i), w)) for i, w in enumerate(words)]
-    if name == "ps_w64_b_ballot_atomic":
+    if name.endswith("_b_ballot_atomic"):
         return stable, sorted(heap[64:64 + heap[0]]), heap[0]
     return stable, None, None
 
@@ -240,7 +324,7 @@ def check(tools, spirv, name):
                     if not partition_dependent(name, ref_words, words):
                         return "tier C but the run equals the 64-lane reference: the detector is wrong"
                     compared = True
-                elif name != "ps_w64_b_ballot_atomic" and comparable(name, ref_words, None) != comparable(name, words, None):
+                elif not name.endswith("_b_ballot_atomic") and comparable(name, ref_words, None) != comparable(name, words, None):
                     return "the run differs from the 64-lane reference"
         if tier == "C" and not compared:
             return Skip("SKIP (tier C needs a device that can require both 64 and 32, or W64G_REF)")

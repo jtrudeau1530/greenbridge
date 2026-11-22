@@ -640,7 +640,7 @@ def run_one(name, prog):
         dis = os.path.join(tmp, "disasm")
         os.mkdir(dis)
         path = os.path.join(dis, name + ".s")
-        with open(path, "w", encoding="utf-8") as f:
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
             f.write(_listing(prog.lines))
         with open(os.path.join(tmp, name + ".dxbc"), "wb") as f:
             f.write(STUB_DXBC)

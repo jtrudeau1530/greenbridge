@@ -68,17 +68,29 @@ NO_DEST = ("s_cmp", "s_bitcmp", "v_cmpx", "exp", "buffer_store", "global_store",
            "s_nop", "s_endpgm", "s_barrier", "s_sendmsg", "s_setprio", "s_inst_prefetch", "s_clause", "s_trap",
            "s_icache", "s_dcache", "s_sleep", "s_code_end", "s_denorm_mode", "s_round_mode", "s_waitcnt_vscnt",
            "s_ttracedata", "v_nop", "s_set", "s_sethalt", "s_setkill", "s_wakeup", "s_version", "buffer_gl",
-           "buffer_wbinvl", "ds_gws", "ds_nop", "s_pack")
+           "buffer_wbinvl", "ds_gws", "ds_nop")
 LOADS = ("buffer_load", "global_load", "flat_load", "scratch_load", "tbuffer_load", "image_load", "image_sample",
          "image_gather", "image_get", "s_load", "s_buffer_load", "ds_read", "v_interp")
 SINKS = ("exp", "buffer_store", "global_store", "flat_store", "scratch_store", "tbuffer_store", "image_store",
          "ds_write", "ds_store")
 SCC_LESS = ("s_mov", "s_cmov", "s_cselect", "s_load", "s_buffer_load", "s_getpc", "s_setpc", "s_nop", "s_waitcnt",
-            "s_sendmsg", "s_getreg", "s_setreg", "s_movrel", "s_bitset", "s_movk", "s_cbranch", "s_branch", "s_endpgm",
-            "s_barrier", "v_", "buffer_", "global_", "ds_", "exp", "image_", "flat_", "s_set", "s_inst", "s_clause")
+            "s_sendmsg", "s_getreg", "s_setreg", "s_movrel", "s_bitset", "s_movk", "s_mul", "s_pack", "s_sext",
+            "s_flbit", "s_ff0", "s_ff1", "s_brev", "s_bfm", "s_bitreplicate", "s_get_waveid", "s_cbranch", "s_branch",
+            "s_endpgm", "s_barrier", "v_", "buffer_", "global_", "ds_", "exp", "image_", "flat_", "s_set", "s_inst",
+            "s_clause")
 SAVEEXEC = ("s_and_saveexec_b", "s_or_saveexec_b", "s_xor_saveexec_b", "s_andn2_saveexec_b", "s_orn2_saveexec_b",
             "s_nand_saveexec_b", "s_nor_saveexec_b", "s_xnor_saveexec_b", "s_andn1_saveexec_b", "s_orn1_saveexec_b",
-            "s_and_wrexec_b", "s_andn2_wrexec_b")
+            "s_and_wrexec_b", "s_andn2_wrexec_b", "s_andn1_wrexec_b")
+RMW_DEST = (
+    "v_fmac_f32", "v_fmac_f16", "v_mac_f32", "v_mac_legacy_f32", "v_pk_fmac_f16",
+    "v_dot2c_f32_f16", "v_dot2c_f32_bf16", "v_dot2c_i32_i16", "v_dot4c_i32_i8", "v_dot8c_i32_i4",
+    "s_addk_i32", "s_mulk_i32", "s_cmovk_i32", "s_cmov_b32", "s_cmov_b64",
+    "s_bitset0_b32", "s_bitset0_b64", "s_bitset1_b32", "s_bitset1_b64",
+)
+MOVREL_OPS = (
+    "v_movrels_b32", "v_movreld_b32", "v_movrelsd_b32", "v_movrelsd_2_b32",
+    "v_swaprel_b32", "s_movrels_b32", "s_movrels_b64",
+)
 MASK_BITWISE = ("s_and_b", "s_or_b", "s_xor_b", "s_andn2_b", "s_orn2_b", "s_nand_b", "s_nor_b", "s_xnor_b", "s_not_b",
                 "s_mov_b", "s_cselect_b", "s_wqm_b")
 DPP_BAD = ("row_bcast", "wave_")
@@ -148,8 +160,13 @@ def operands(ins):
         returns = op.startswith(("ds_read", "ds_bpermute", "ds_permute", "ds_swizzle", "ds_consume", "ds_append")) \
             or "_rtn" in op
         dests, srcs = ([a[0]], list(a[1:])) if returns and a else ([], list(a))
+    elif op == "v_swap_b32" and len(a) >= 2:
+        dests, srcs = [a[0], a[1]], [a[0], a[1]]
     elif a:
-        dests, srcs = [a[0]], list(a[1:])
+        if op in RMW_DEST:
+            dests, srcs = [a[0]], [a[0], *a[1:]]
+        else:
+            dests, srcs = [a[0]], list(a[1:])
         if op.startswith("v_") and len(a) > 2 and (
                 "_co_" in op or op in ("v_mad_u64_u32", "v_mad_i64_i32", "v_div_scale_f32", "v_div_scale_f64")) \
                 and a[1].get("k") in ("sgpr", "special"):
@@ -160,14 +177,19 @@ def operands(ins):
         defs += ["exec", "scc"]
     if op.startswith("s_") and not op.startswith(SCC_LESS) and "scc" not in defs and not op.startswith("s_cbranch"):
         defs.append("scc")
-    if op in ("v_cndmask_b32", "v_addc_co_u32", "v_subb_co_u32", "v_subbrev_co_u32", "v_addc_u32", "v_subb_u32",
-              "v_div_fmas_f32", "v_div_fmas_f64") and len(a) <= 4 and "vcc" not in [r for x in a for r in _regs(x)]:
+    if op in ("v_add_co_ci_u32", "v_sub_co_ci_u32", "v_subrev_co_ci_u32",
+              "v_addc_co_u32", "v_subb_co_u32", "v_subbrev_co_u32",
+              "v_cndmask_b32", "v_addc_u32", "v_subb_u32") and len(srcs) == 2:
+        uses.append("vcc")
+    if op in ("v_div_fmas_f32", "v_div_fmas_f64") and "vcc" not in [r for x in srcs for r in _regs(x)]:
         uses.append("vcc")
     if op in ("s_cselect_b32", "s_cselect_b64", "s_addc_u32", "s_subb_u32", "s_cmov_b32", "s_cmov_b64",
-              "s_cbranch_scc0", "s_cbranch_scc1"):
+              "s_cmovk_i32", "s_cbranch_scc0", "s_cbranch_scc1"):
         uses.append("scc")
     if op in ("s_cbranch_vccz", "s_cbranch_vccnz"):
         uses.append("vcc")
+    if op in MOVREL_OPS:
+        uses.append("m0")
     return dests, srcs, defs, uses
 
 
@@ -229,6 +251,25 @@ class Analysis:
         """One instruction. Around the transfer function it keeps, per register, the exec tokens of the lane ranks
         (st["r"]) and of the aggregated-atomic bases (st["b"]) its value is made of: a slot address is exact only
         when its rank and its base belong to the same mask."""
+        if base_op(ins["op"]) == "v_swap_b32" and len(ins["args"]) == 2:
+            r0, r1 = _regs(ins["args"][0]), _regs(ins["args"][1])
+            if len(r0) == 1 and len(r1) == 1:
+                full = st["f"]
+                rk0, rk1 = st["r"].get(r0[0], frozenset()), st["r"].get(r1[0], frozenset())
+                bs0, bs1 = st["b"].get(r0[0], frozenset()), st["b"].get(r1[0], frozenset())
+                self.new_rank = self.new_base = None
+                self.transfer(n, i, ins, st, ev)
+                pairs = ((r0[0], rk1, bs1), (r1[0], rk0, bs0)) if full else (
+                    (r0[0], rk0 | rk1, bs0 | bs1), (r1[0], rk0 | rk1, bs0 | bs1))
+                for r, r_toks, b_toks in pairs:
+                    t = st["t"].get(r, 0)
+                    for key, bit, toks in (("r", RNK, r_toks), ("b", BASE, b_toks)):
+                        kept = toks if t & bit else frozenset()
+                        if kept:
+                            st[key][r] = kept
+                        else:
+                            st[key].pop(r, None)
+                return
         self.new_rank = self.new_base = None
         dests, srcs, _, uses = operands(ins)
         read = [r for x in srcs for r in _regs(x)] + [r for r in uses if r != "exec"]
@@ -390,13 +431,17 @@ class Analysis:
             else:
                 ctok = st["g"].get(mreg, (None, None))[1] if st["g"].get(mreg, ("",))[0] == "mask" else None
             put(a[0], bit | (t_src & ELECT), ("cnt", ctok) if bit == CNT and ctok is not None else None)
-            T["scc"] = X | (t_src & ELECT)
-            st["g"]["scc"] = ("vote", _regs(a[1])[0] if _regs(a[1]) else "exec")
+            if op == "s_bcnt1_i32_b64":
+                T["scc"] = X | (t_src & ELECT)
+                st["g"]["scc"] = ("vote", _regs(a[1])[0] if _regs(a[1]) else "exec")
             return
         if op in ("s_bcnt0_i32_b64", "s_bcnt0_i32_b32", "s_bcnt1_i32_b32", "s_ff0_i32_b64", "s_ff0_i32_b32",
                   "s_ff1_i32_b32", "s_flbit_i32_b64", "s_flbit_i32_b32", "s_flbit_i32") and len(a) == 2 \
                 and self.is_mask(ins, a[1]):
             put(a[0], X | t_src)
+            if op.startswith("s_bcnt"):
+                T["scc"] = X | t_src
+                st["g"].pop("scc", None)
             return
         if op in ("v_mbcnt_lo_u32_b32", "v_mbcnt_hi_u32_b32") and len(a) == 3:
             m, acc = a[1], a[2]
@@ -417,6 +462,11 @@ class Analysis:
                 self.new_rank = token if token is not None else ("unbound", n, i)
             else:
                 put(a[0], X | LANE | tacc)
+            return
+        if op == "s_bfm_b64" and dests:
+            # rdna2spirv.py compares per-half wave_lane (0..31) against offset..offset+size, so the upper half
+            # produces bits for lanes 0..31 instead of 32..63.
+            put(dests[0], t_src | LANE)
             return
 
         # --- cross-lane reads and writes
@@ -522,6 +572,78 @@ class Analysis:
             st["g"]["scc"] = ("vote", _regs(dests[0])[0] if _regs(dests[0]) else "exec")
             return
 
+        # --- register swap and dynamic indexing
+        if op == "v_swap_b32" and len(a) == 2:
+            r0, r1 = _regs(a[0]), _regs(a[1])
+            t0, t1 = self.rd(st, ins, a[0]), self.rd(st, ins, a[1])
+            if st["f"] and not (st["xg"] and st["xg"][0] == "elect"):
+                g0 = st["g"].get(r0[0]) if r0 else None
+                g1 = st["g"].get(r1[0]) if r1 else None
+                u0 = bool(r0 and isinstance(r0[0], tuple) and r0[0][0] == "v" and r0[0][1] in st["u"])
+                u1 = bool(r1 and isinstance(r1[0], tuple) and r1[0][0] == "v" and r1[0][1] in st["u"])
+                put(a[0], t1, g1, uniform=u1)
+                put(a[1], t0, g0, uniform=u0)
+            else:
+                tb = t0 | t1 | (ELECT if st["xg"] and st["xg"][0] == "elect" else 0)
+                put(a[0], tb, uniform=False)
+                put(a[1], tb, uniform=False)
+            return
+        if op in ("s_movrels_b32", "s_movrels_b64") and dests:
+            any_s = 0
+            for r, tv in T.items():
+                if isinstance(r, tuple) and r[0] == "s":
+                    any_s |= tv
+            if any(isinstance(k, int) and v in lane_masks.MASK_KINDS for k, v in self.masks.get(id(ins), {}).items()):
+                any_s |= MASKD | X
+            if any_s & TAG_BITS:
+                any_s |= X
+            put(dests[0], t_src | any_s)
+            return
+        if op == "v_movrels_b32" and dests:
+            src_base = a[1]["r"] if len(a) > 1 and a[1].get("k") == "vgpr" else 0
+            any_v = 0
+            for r, tv in T.items():
+                if isinstance(r, tuple) and r[0] == "v" and r[1] >= src_base:
+                    any_v |= tv
+            if any(isinstance(k, tuple) and k[0] in ("v", "lane") and k[1] >= src_base and v in lane_masks.MASK_KINDS
+                   for k, v in self.masks.get(id(ins), {}).items()):
+                any_v |= MASKD | X
+            if any_v & TAG_BITS:
+                any_v |= X
+            if st["xg"] and st["xg"][0] == "elect":
+                any_v |= ELECT
+            put(dests[0], t_src | any_v, uniform=False)
+            return
+        if op in ("v_movreld_b32", "v_movrelsd_b32", "v_movrelsd_2_b32", "v_swaprel_b32") and len(a) >= 2:
+            dst_base = (min(a[0]["r"], a[1]["r"])
+                        if op == "v_swaprel_b32" and a[0].get("k") == "vgpr" and a[1].get("k") == "vgpr"
+                        else (a[0]["r"] if a[0].get("k") == "vgpr" else 0))
+            any_v = 0
+            if op != "v_movreld_b32":
+                src_base = dst_base if op == "v_swaprel_b32" else (a[1]["r"] if a[1].get("k") == "vgpr" else 0)
+                for r, tv in T.items():
+                    if isinstance(r, tuple) and r[0] == "v" and r[1] >= src_base:
+                        any_v |= tv
+                if any(isinstance(k, tuple) and k[0] in ("v", "lane") and k[1] >= src_base
+                       and v in lane_masks.MASK_KINDS for k, v in self.masks.get(id(ins), {}).items()):
+                    any_v |= MASKD | X
+            wt = t_src | any_v
+            if wt & TAG_BITS:
+                wt |= X
+            if st["xg"] and st["xg"][0] == "elect":
+                wt |= ELECT
+            st["u"] = frozenset(u for u in st["u"] if u < dst_base)
+            for k in [k for k in st["l"] if k[0] >= dst_base]:
+                del st["l"][k]
+            for k, v in list(st["g"].items()):
+                if v[0] in ("wfs", "wfmask") and v[1] >= dst_base:
+                    del st["g"][k]
+                    T[k] = T.get(k, 0) | X
+            if wt:
+                bits_violation(wt)
+                T[("v", dst_base)] = T.get(("v", dst_base), 0) | wt
+            return
+
         # --- everything else: results depend on the sources
         if op in ("v_cndmask_b32", "v_cndmask_b16") or op.startswith("v_"):
             tj = t_src
@@ -600,18 +722,21 @@ class Analysis:
         T = st["t"]
         site = ("n", n, i)
         old = st["x"]
-        if any(_half(x) for x in dests + srcs):
+        if any(_half(x) for x in dests + srcs) or (op.startswith("s_") and op.endswith("_b32")):
             violation("mask-half")
         if any(op.startswith(p) for p in SAVEEXEC):
             m = srcs[0] if srcs else None
-            if dests:
-                T[_regs(dests[0])[0]] = 0
-                for r in _regs(dests[0]):
-                    T[r] = 0
-                    st["g"][r] = ("mask", old)
             mt = self.rd(st, ins, m) if m else 0
             mg = st["g"].get(_regs(m)[0]) if m and _regs(m) else None
-            self.new_exec(site, old, st, op.startswith(("s_and", "s_andn2")), mg, mt, violation, idiom)
+            is_wrexec = "_wrexec_" in op
+            narrowing = op.startswith(("s_and_saveexec_", "s_andn1_saveexec_", "s_and_wrexec_", "s_andn1_wrexec_"))
+            pos_mask = op.startswith(("s_and_saveexec_", "s_and_wrexec_"))
+            self.new_exec(site, old, st, narrowing, mg if pos_mask else None, mt, violation, idiom)
+            if dests:
+                saved_tok = site if is_wrexec else old
+                for r in _regs(dests[0]):
+                    T[r] = 0
+                    st["g"][r] = ("mask", saved_tok)
             T["scc"] = X
             st["g"]["scc"] = ("vote", "exec")
             return
@@ -624,17 +749,23 @@ class Analysis:
                 if mg:
                     mt = 0
             else:
-                mg = st["g"].get(_regs(x0)[0]) if x0 is not None and _regs(x0) else None
-                mt = self.rd(st, ins, x0) if x0 is not None else 0
-            if op in ("s_or_b64", "s_mov_b64") and mg and mg[0] == "mask" and (
-                    op == "s_mov_b64" or self.ancestor(mg[1], old)):
+                mg = st["g"].get(_regs(x0)[0]) if len(srcregs) == 1 and x0 is not None and _regs(x0) else None
+                mt = 0
+                for x in srcregs:
+                    mt |= self.rd(st, ins, x)
+            if (op == "s_mov_b64" or (op == "s_or_b64" and any(_regs(x) == ["exec"] for x in srcs))) \
+                    and mg and mg[0] == "mask" and (op == "s_mov_b64" or self.ancestor(mg[1], old)):
                 st["x"] = mg[1]
                 st["xg"], st["f"] = self.tok.get(mg[1], (None, None, False))[1:]
                 T["scc"] = X
                 st["g"]["scc"] = ("vote", "exec")
                 return
-            if op in ("s_and_b64", "s_andn2_b64", "s_and_b32") or op.startswith("v_cmpx"):
+            if op.startswith("v_cmpx"):
                 self.new_exec(site, old, st, True, mg, mt, violation, idiom)
+            elif op == "s_and_b64" and any(_regs(x) == ["exec"] for x in srcs):
+                self.new_exec(site, old, st, True, mg, mt, violation, idiom)
+            elif op == "s_andn2_b64" and len(srcs) == 2 and _regs(srcs[0]) == ["exec"]:
+                self.new_exec(site, old, st, True, None, mt, violation, idiom)
             else:
                 st["x"] = site
                 self.tok[site] = (None, None, False)
@@ -765,7 +896,8 @@ class Analysis:
             if op in ("s_waitcnt", "s_nop"):
                 continue
             a = ins["args"]
-            if op.startswith(("s_and_saveexec_b64", "s_andn2_saveexec_b64")) and len(a) == 2:
+            if op.startswith(("s_and_saveexec_b64", "s_andn2_saveexec_b64",
+                              "s_and_wrexec_b64", "s_andn2_wrexec_b64")) and len(a) == 2:
                 return (_regs(a[1]) or [None])[0] == reg
             if op in ("s_and_b64",) and len(a) == 3 and _regs(a[0]) == ["exec"]:
                 return reg in [(_regs(x) or [None])[0] for x in a[1:] if _regs(x) != ["exec"]]
@@ -907,6 +1039,10 @@ class Analysis:
                     rd = st.get(r, frozenset({(-1, 0)}))
                     if len(rd) > 1 and any(d[0] >= 0 and ctrl[d[0]] for d in rd):
                         stale.add((id(ins), r))
+                if base_op(ins["op"]) in ("s_movrels_b32", "s_movrels_b64") and any(
+                        isinstance(r, tuple) and r[0] == "s" and len(rd) > 1 and any(d[0] >= 0 and ctrl[d[0]] for d in rd)
+                        for r, rd in st.items()):
+                    stale.add((id(ins), "m0"))
                 for r in defs_of[(b, i)]:
                     st[r] = frozenset({(b, i)})
         return stale
@@ -955,8 +1091,23 @@ def main(argv=None):
                                              "(counts only, no shader names)")
     ap.add_argument("--census", required=True, metavar="INDEX_JSON", help="<spirv>/index.json from rdna2spirv.py")
     args = ap.parse_args(argv)
-    with open(args.census, encoding="utf-8") as f:
-        c = census(json.load(f))
+    # One line per bad input, as everywhere else in tools/: an unreadable path, a folder, a file that is not JSON and a
+    # JSON document that is not the index object used to end in a traceback (FileNotFoundError, PermissionError,
+    # JSONDecodeError, AttributeError).
+    try:
+        with open(args.census, encoding="utf-8") as f:
+            index = json.load(f)
+    except OSError as exc:
+        print(f"ERROR: cannot read {args.census}: {exc.strerror or exc}", file=sys.stderr)
+        return 2
+    except ValueError as exc:  # json.JSONDecodeError
+        print(f"ERROR: {args.census} is not JSON: {exc}", file=sys.stderr)
+        return 2
+    if not isinstance(index, dict):
+        print(f"ERROR: {args.census} is not an index object (a mapping of shader name to entry), got "
+              f"{type(index).__name__}. Give the <spirv>/index.json rdna2spirv.py writes.", file=sys.stderr)
+        return 2
+    c = census(index)
     total = Counter()
     for stage, counts in c["tiers"].items():
         print(f"{stage}: " + ", ".join(f"{t}={n}" for t, n in counts.items()))

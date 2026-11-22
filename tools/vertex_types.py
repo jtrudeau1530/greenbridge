@@ -383,15 +383,23 @@ def measure_block(data, at, T, rng, found=None):
 
 
 def iter_blocks(path, limit):
-    """Yield (archive, stream offset, inflated bytes) for zlib streams in an RPF9 data area starting 42 40 00 00."""
+    """Yield (archive, stream offset, inflated bytes) for zlib streams in an RPF9 data area starting 42 40 00 00.
+
+    The RPF9 archive contract matches rpf9_names.scan_archive: at least 8 bytes, magic b'RPF9' or b'9FPR', and
+    8 <= data_start <= size (an empty but valid header-only archive stays valid)."""
     found = 0
     with open(path, "rb") as fh:
-        if not os.fstat(fh.fileno()).st_size:
-            return
+        if os.fstat(fh.fileno()).st_size < 8:
+            raise ValueError("not an RPF9 archive")
         m = mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ)
         try:
             size = len(m)
-            pos = struct.unpack_from("<I", m, 4)[0] if size >= 8 else size
+            if m[:4] not in (b"RPF9", b"9FPR"):
+                raise ValueError("not an RPF9 archive")
+            data_start = struct.unpack_from("<I", m, 4)[0]
+            if not 8 <= data_start <= size:
+                raise ValueError("RPF9 data start is outside the archive")
+            pos = data_start
             while pos < size:
                 match = ZHDR.search(m, pos)
                 if not match:
@@ -498,14 +506,18 @@ def main(argv=None):
     T = {"streams": 0}
     errors = {}
     for path in archives:
-        for _, _, data in iter_blocks(path, args.limit):
-            T["streams"] += 1
-            try:
-                measure_stream(data, T, rng, errors)
-            except BlockError as exc:
-                add(errors, str(exc).split(":")[0])
-            except (struct.error, IndexError):
-                add(errors, "truncated")
+        try:
+            for _, _, data in iter_blocks(path, args.limit):
+                T["streams"] += 1
+                try:
+                    measure_stream(data, T, rng, errors)
+                except BlockError as exc:
+                    add(errors, str(exc).split(":")[0])
+                except (struct.error, IndexError):
+                    add(errors, "truncated")
+        except (ValueError, OSError) as exc:
+            print(f"error: {path}: {exc}", file=sys.stderr)
+            return 2
         print(f"{os.path.basename(path)}: {T['streams']} streams so far, {T.get('blocks', 0)} blocks measured", file=sys.stderr)
     out = summarise(T)
     out["skipped"] = errors
@@ -513,7 +525,7 @@ def main(argv=None):
     if args.json:
         try:
             os.makedirs(os.path.dirname(os.path.abspath(args.json)), exist_ok=True)
-            with open(args.json, "w", encoding="utf-8") as fh:
+            with open(args.json, "w", encoding="utf-8", newline="\n") as fh:
                 json.dump(out, fh, indent=1)
         except OSError as exc:
             print(f"error: cannot write {args.json}: {exc.strerror or exc}", file=sys.stderr)

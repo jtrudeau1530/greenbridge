@@ -3,6 +3,9 @@
 // Measured Xbox device deviations used here (vtable indices, x64):
 //   slot 62   CreateComputePipelineState(desc, w2, w3, iid, out): two words (0 from XboxBvhBuilder, meaning unknown)
 //             before the IID. The PC slot 62 is CreateStateObject.
+//   slot 67   CreateComputePipelineState from native code (desc, iid, out): converts the Xbox native-code desc
+//             (+0x00 root signature, +0x28 code, +0x30 size) to D3D12_COMPUTE_PIPELINE_STATE_DESC and forwards
+//             to PC CreateComputePipelineState (slot 11). The PC slot 67 is CreateProtectedResourceSession1.
 //   slot 76   resource creation -> PC CreateCommittedResource (PC slot 27), with the Xbox layout word ignored.
 // The measured slots 9/10 (GetCPU/GPUDescriptorHandleForHeapStart) are ID3D12DescriptorHeap methods, not device
 // methods: the PC device's 9/10 are CreateCommandAllocator/CreateGraphicsPipelineState and are forwarded unchanged.
@@ -57,8 +60,9 @@ unsigned device_proxy_slot_count(const void* device);
 ID3D12Device* device_proxy_real_device(const void* device);
 
 // True for slots the proxy handles itself rather than forwarding verbatim: IUnknown (0-2), 8 and 75 (queue
-// proxies), 14, 31/34/35/45/46/50 (proxies unwrapped), 32 and 36 (fence proxies), 62, 67 and 76.
-// Slots 9 and 10 are intentionally false; the handle conversion is on the heap proxy.
+// proxies), 9 (allocator proxies), 14, 31/34/35/45/46/50 (proxies unwrapped), 32 and 36 (fence proxies), 62, 67
+// and 76. Slot 10 is intentionally false: the measured 9/10 handle conversion is on the heap proxy, and device
+// slot 9 is CreateCommandAllocator, which the proxy handles for the allocator proxy.
 bool device_slot_overridden(unsigned slot);
 
 // Queue and fence proxies created by device slots 8/75 and 36. The real_* accessors return the wrapped object
@@ -72,7 +76,7 @@ unsigned queue_proxy_slot_count(const void* queue);
 unsigned fence_proxy_slot_count(const void* fence);
 unsigned queue_proxy_table_size();
 unsigned fence_proxy_table_size();
-// Live references on a queue or fence proxy (0 for anything else). Test helper.
+// Live references on a queue, fence or allocator proxy (0 for anything else). Test helper.
 unsigned long command_object_proxy_ref_count(const void* object);
 // Per-slot call counters and first-call flags, shared by all queue proxies and all fence proxies.
 std::uint64_t queue_slot_hits(unsigned slot);
@@ -82,8 +86,28 @@ bool fence_slot_first_call_seen(unsigned slot);
 // Vtable reads past a queue or fence proxy table that faulted in its guard region (counted by the fault logger).
 std::uint64_t queue_table_overruns();
 std::uint64_t fence_table_overruns();
-// True when both tables sit in front of their guard region (false only if the reservation failed).
+// True when the queue, fence and allocator tables sit in front of their guard regions (false only if a reservation
+// or the fault logger failed).
 bool command_object_tables_guarded();
+
+// Command allocator proxies (device slot 9): the public chain (9 slots: the base chain and Reset) is forwarded, a
+// slot past it up to the end of the table (64 slots) is logged and refused with E_NOTIMPL, and a read past the
+// table faults in a guard region, as for queues and fences. The console allocator's extra methods are not
+// measured and not guessed. Slot 9 wraps only an allocator that answers kLeonidaCommandAllocatorTag, Leonida's
+// own Vulkan-layer allocator: its command lists resolve the proxy (CreateCommandList, Reset). A PC runtime
+// allocator goes back unchanged, because the PC runtime's lists would take a proxy for their own allocator; a
+// command-list proxy that unwraps at Reset is what lets the host backend wrap allocators too.
+// {7d0e6b51-34a2-4f0c-9a61-0c5b2e8f4a10}: the Vulkan layer's CommandAllocator answers it with its implementation.
+inline constexpr GUID kLeonidaCommandAllocatorTag{
+    0x7d0e6b51, 0x34a2, 0x4f0c, {0x9a, 0x61, 0x0c, 0x5b, 0x2e, 0x8f, 0x4a, 0x10}};
+bool is_allocator_proxy(const void* allocator);
+// The wrapped allocator (no reference added), or null when `allocator` is not an allocator proxy.
+ID3D12CommandAllocator* allocator_proxy_real_allocator(const void* allocator);
+unsigned allocator_proxy_slot_count(const void* allocator);
+unsigned allocator_proxy_table_size();
+std::uint64_t allocator_slot_hits(unsigned slot);
+bool allocator_slot_first_call_seen(unsigned slot);
+std::uint64_t allocator_table_overruns();
 // Heap slots 0-2, 7 (GetDevice -> device proxy) and 9/10 (handle conversion).
 bool heap_slot_overridden(unsigned slot);
 

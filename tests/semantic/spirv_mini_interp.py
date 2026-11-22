@@ -37,11 +37,48 @@ class UnsupportedConstruct(NotImplementedError):
     """The module uses something this interpreter deliberately does not model."""
 
 
+class InvalidModule(AssertionError):
+    """The module breaks a SPIR-V structural rule spirv-val enforces, so no driver would accept it, even though
+    this interpreter could run it. Raised instead of returning results for a shader that never reaches a GPU."""
+
+
+def check_structure(body):
+    """spirv-val's merge, phi and Function-variable rules (SPIR-V 2.16.1-2): OpSelectionMerge must be the second-to-last instruction of its block,
+    directly before OpBranchConditional or OpSwitch, and OpLoopMerge directly before OpBranch or
+    OpBranchConditional. Until 2026-11-22 the interpreter skipped merges, so a translator change that put an
+    instruction between a merge and its branch (#1633: OpLoad %active) passed every semantic test while every
+    driver rejected the module. `body` is the list of (result, opcode, operands, line) of a function."""
+    follow = {"OpSelectionMerge": ("OpBranchConditional", "OpSwitch"),
+              "OpLoopMerge": ("OpBranch", "OpBranchConditional")}
+    # OpPhi must come first in its block: only OpLabel or other OpPhi before it (SPIR-V 2.16.2, "OpPhi ... must be
+    # the first instructions of a block"). A phi emitted after an instruction of the merge block is rejected by
+    # spirv-val, and every translator path that merges a guarded load (OpPhi of the loaded and the kept value)
+    # depends on the order.
+    # Function-storage OpVariable belongs in the function's first block (SPIR-V 2.16.1).
+    prev, blocks = None, 0
+    for _, op, a, line in body:
+        if op == "OpPhi" and prev not in ("OpLabel", "OpPhi"):
+            raise InvalidModule(f"{line!r} follows {prev or 'the start of the function'}, not OpLabel or OpPhi")
+        if op == "OpFunction":
+            blocks = 0
+        elif op == "OpLabel":
+            blocks += 1
+        elif op == "OpVariable" and a[1:2] == ["Function"] and blocks > 1:
+            raise InvalidModule(f"{line!r} is a Function variable outside the function's first block")
+        prev = op
+    for k, (_, op, _, line) in enumerate(body):
+        if op in follow:
+            nxt = body[k + 1][1] if k + 1 < len(body) else None
+            if nxt not in follow[op]:
+                raise InvalidModule(f"{line!r} is followed by {body[k + 1][3] if nxt else 'the end of the function'!r}"
+                                    f", not by {' or '.join(follow[op])}")
+
+
 # Instructions that carry no runtime semantics for a single-entry-point, straight-line module.
 _IGNORED = frozenset({
     "OpCapability", "OpExtension", "OpExtInstImport", "OpMemoryModel", "OpEntryPoint", "OpExecutionMode",
     "OpDecorate", "OpMemberDecorate", "OpTypeVoid", "OpTypeFunction", "OpLabel", "OpSelectionMerge",
-    "OpReturn", "OpFunctionEnd", "OpName", "OpSource",
+    "OpLoopMerge", "OpReturn", "OpFunctionEnd", "OpName", "OpSource",
 })
 
 _ATOMICS = frozenset({
@@ -463,6 +500,7 @@ def _invocation(text, inputs, push_constants, memory, step=False):
             raise UnsupportedConstruct(f"{op} in module header")
     if not in_body:
         raise UnsupportedConstruct("no function body")
+    check_structure(body)
 
     def deref(p):
         box, i = p
@@ -506,6 +544,7 @@ def _invocation(text, inputs, push_constants, memory, step=False):
     pc = fn_start.get("%main", 0)
     killed = False
     cur_label = prev_label = None
+    back_edges = 0
     while pc < len(body):
         if step:
             yield _TICK
@@ -544,8 +583,12 @@ def _invocation(text, inputs, push_constants, memory, step=False):
             killed = True
             break
         if op == "OpBranch":
-            if a[0] not in labels or labels[a[0]] < pc:
-                raise UnsupportedConstruct("non-forward branch")
+            if a[0] not in labels:
+                raise UnsupportedConstruct(f"unknown branch target {a[0]}")
+            if labels[a[0]] < pc:
+                back_edges += 1
+                if back_edges > 10000:
+                    raise UnsupportedConstruct("loop iteration limit exceeded")
             pc = labels[a[0]]
             continue
         if op == "OpBranchConditional":
@@ -553,8 +596,12 @@ def _invocation(text, inputs, push_constants, memory, step=False):
             if not isinstance(cond, bool):
                 raise UnsupportedConstruct("OpBranchConditional with a non-bool condition")
             target = a[1] if cond else a[2]
-            if target not in labels or labels[target] < pc:
-                raise UnsupportedConstruct("non-forward branch")
+            if target not in labels:
+                raise UnsupportedConstruct(f"unknown branch target {target}")
+            if labels[target] < pc:
+                back_edges += 1
+                if back_edges > 10000:
+                    raise UnsupportedConstruct("loop iteration limit exceeded")
             pc = labels[target]
             continue
         if op == "OpPhi":
@@ -845,18 +892,6 @@ def _invocation(text, inputs, push_constants, memory, step=False):
                 values[res] = fma_f32(x, y, z)
         elif op == "OpFNegate":
             values[res] = f32(-val(a[1]))
-        elif op == "OpFDiv":
-            x, y = val(a[1]), val(a[2])
-            if not (isinstance(x, float) and isinstance(y, float)):
-                raise UnsupportedConstruct("OpFDiv on non-float")
-            if y == 0.0:
-                raise UnsupportedConstruct("OpFDiv by zero (undefined in SPIR-V)")
-            if math.isinf(x) and math.isinf(y):
-                values[res] = math.nan
-            elif math.isnan(x) or math.isnan(y):
-                values[res] = math.nan
-            else:
-                values[res] = f32(x / y)        # x/inf is a signed zero, as in Python
         elif op == "OpQuantizeToF16":
             # Single-instruction f32 -> f16 -> f32 round to nearest, with the
             # SPIR-V subnormal rule: a magnitude too small for a normal f16

@@ -131,6 +131,9 @@ keys and their text sit in different archives.
 
 Standard library only. The four archives above take about 2 minutes on one core from a carve.
 
+`tools/opus_tags.py` writes the `--dialogue` rows into the exported Ogg Opus files as `LABEL`, `SPEAKER` and
+`SUBTITLE` comments (see [audio.md](audio.md#tags-names-and-subtitles)).
+
 ## Open questions
 
 - **Language per table.** The game must know each table's language. A field or a naming rule outside the tables

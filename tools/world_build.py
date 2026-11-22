@@ -1171,18 +1171,33 @@ def _compute_spawn(chunks: list[dict]) -> list[float]:
     ]
 
 
-def _write_json_atomic(path: str, data: dict) -> None:
-    tmp_path = path + ".tmp"
+def _write_json_atomic(path: str, data: dict, replace=None) -> None:
+    """Publish ``data`` as JSON at ``path`` through a private staging file in the same folder.
+
+    As for the GLB export (#425): an existing file named ``<path>.tmp`` is never used or removed, overlapping
+    writers each stage their own file (the last replacement wins), and the published file keeps the mode of the
+    one it replaces. ``replace`` defaults to ``os.replace``; ``_publish_world`` passes ``glb_writer._replace``,
+    which retries a Windows sharing violation (the viewer may hold world.json open during a rebuild).
+    """
+    replace = replace or os.replace
+    parent = os.path.dirname(os.path.abspath(path))
+    tmp_path = None
     try:
-        with open(tmp_path, "w", encoding="utf-8") as f:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=parent, prefix=".world-", suffix=".tmp", delete=False,
+        ) as f:
+            tmp_path = f.name
             json.dump(data, f, indent=2, allow_nan=False)
             f.write("\n")
             f.flush()
             os.fsync(f.fileno())
-        os.replace(tmp_path, path)
+        # NamedTemporaryFile creates 0600; give world.json the mode of the file it replaces, or a new file's.
+        os.chmod(tmp_path, published_mode(path))
+        # Closed first: Windows cannot rename an open file.
+        replace(tmp_path, path)
     except BaseException:
         try:
-            if os.path.exists(tmp_path):
+            if tmp_path is not None:
                 os.remove(tmp_path)
         except OSError:
             pass
@@ -1287,7 +1302,7 @@ def _publish_world(
                 backed_up.append(name)
             glb_mod._replace(staged, live)
             placed.append(name)
-        _write_json_atomic(world_path, world_doc)
+        _write_json_atomic(world_path, world_doc, replace=glb_mod._replace)
     except BaseException as exc:
         unrestored = []
         restore = set(backed_up)
@@ -1368,8 +1383,13 @@ def build_world(
             raise ValueError(f"region must be MINX,MINY,MAXX,MAXY with min < max, got {region!r}")
         if instancing not in INSTANCING_MODES:
             raise ValueError(f"instancing must be one of {INSTANCING_MODES}, got {instancing!r}")
-        if lod_sets and instancing == "bake":
-            raise ValueError("--lod-sets needs --instancing gpu or nodes")
+        if lod_sets:
+            if instancing == "bake":
+                raise ValueError("--lod-sets needs --instancing gpu or nodes")
+            lod_levels = tuple(lod_levels)
+            for level in lod_levels:
+                if level not in LOD_TIER_NAMES:
+                    raise ValueError(f"--lod-sets does not recognize lodLevel {level!r}; use levels 0..6")
     elif lod_sets:
         raise ValueError("--lod-sets needs --placements")
     workers = max(1, int(jobs))
@@ -1821,9 +1841,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument(
         "--lod-sets",
         action="store_true",
-        help="With --placements: one chunk set per LOD tier (HD, LOD, SLOD1-4, ORPHAN_HD; all lodLevel values "
-        "unless --lod-levels is given), plus each tier's camera distance band in world.json, measured from the "
-        "entities' childLodDist/lodDist, so the viewer shows one tier per grid cell.",
+        help="With --placements: one chunk set per LOD tier (HD, LOD, SLOD1-4, ORPHAN_HD). "
+        "Use --lod-levels to select a subset of levels 0..6. The camera distance bands in world.json "
+        "come from the entities' childLodDist/lodDist so the viewer shows one tier per grid cell.",
     )
     args = ap.parse_args(argv)
     lod_levels = args.lod_levels

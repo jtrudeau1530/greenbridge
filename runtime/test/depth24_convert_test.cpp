@@ -43,6 +43,25 @@ std::uint32_t as_bits(float f) {
     return bits;
 }
 
+PFN_vkCmdPipelineBarrier2 real_barrier2 = nullptr;
+std::uint32_t host_barriers = 0;
+VkPipelineStageFlags2 host_src_stages = 0;
+VkAccessFlags2 host_src_access = 0;
+VKAPI_ATTR void VKAPI_CALL observe_host(VkCommandBuffer cb, const VkDependencyInfo* dep) {
+    if (dep) {
+        for (std::uint32_t i = 0; i < dep->memoryBarrierCount; ++i) {
+            const auto& b = dep->pMemoryBarriers[i];
+            if ((b.dstStageMask & VK_PIPELINE_STAGE_2_HOST_BIT) &&
+                (b.dstAccessMask & VK_ACCESS_2_HOST_READ_BIT)) {
+                ++host_barriers;
+                host_src_stages |= b.srcStageMask;
+                host_src_access |= b.srcAccessMask;
+            }
+        }
+    }
+    real_barrier2(cb, dep);
+}
+
 }  // namespace
 
 int main() {
@@ -234,6 +253,7 @@ int main() {
         VulkanContext context(gpu.device_proc, gpu.device, true);
         EXPECT(context.loaded());
         context.enable_depth24(gpu.device_proc, alloc_device_local);
+        context.set_occlusion_resolve_memory(mem_props);
 
         constexpr int kIters = 16;
         constexpr std::uint32_t tex_w = 64, tex_h = 16;
@@ -456,7 +476,23 @@ int main() {
             rgb96_b.rgb96 = true;
             context.add_resource(id_rgb96_img, rgb96_b, VK_IMAGE_LAYOUT_UNDEFINED);
 
+            // D3D-162: both conversion directions and formats must leave all 11 application counters zero.
+            VkQueryPool statistics = VK_NULL_HANDLE;
+            void* statistics_data = nullptr;
+            if (gpu.pipeline_statistics_query) {
+                VkQueryPoolCreateInfo info{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+                info.queryType = VK_QUERY_TYPE_PIPELINE_STATISTICS;
+                info.queryCount = 1; info.pipelineStatistics = 0x7ff;
+                EXPECT(gpu.fn<PFN_vkCreateQueryPool>("vkCreateQueryPool")(gpu.device, &info, nullptr, &statistics) == VK_SUCCESS);
+                context.add_query_pool(100, {statistics, d3d12_query_heap::pipeline_statistics, 1, false, {false}, {}});
+                ResourceBinding counters{}; counters.size = 88; counters.host_readable = true;
+                counters.buffer = gpu.buffer(88, VK_BUFFER_USAGE_TRANSFER_DST_BIT, &statistics_data);
+                EXPECT(counters.buffer && statistics_data);
+                std::memset(statistics_data, 0xcd, 88);
+                context.add_resource(100, counters);
+            }
             CommandList slice_list;
+            if (statistics) EXPECT(slice_list.begin_query({100, d3d12_query::pipeline_statistics, 0}));
             EXPECT(slice_list.copy_resource({id_copy, id_src}));
             const CopyLocation fp_src{id_src, true, 0, 0, w, h, 1, w * 4};
             const CopyLocation fp_rgba_rb{id_rgba_rb, true, 0, 0, w, h, 1, w * 4};
@@ -472,6 +508,10 @@ int main() {
             EXPECT(slice_list.copy_texture({fp_d24_rb, 0, 0, 0, loc_d24, false, {}}));
             EXPECT(slice_list.copy_texture({loc_rgb96, 0, 0, 0, fp_rgb96_src, false, {}}));
             EXPECT(slice_list.copy_texture({fp_rgb96_rb, 0, 0, 0, loc_rgb96, false, {}}));
+            if (statistics) {
+                EXPECT(slice_list.end_query({100, d3d12_query::pipeline_statistics, 0}));
+                EXPECT(slice_list.resolve_queries({100, d3d12_query::pipeline_statistics, 0, 1, 100, 0}));
+            }
             EXPECT(slice_list.close());
 
             const CommandList* ptr = &slice_list;
@@ -512,7 +552,95 @@ int main() {
             for (std::size_t i = 0; i < arena_bytes / 4; ++i)
                 if (!in_written(i)) EXPECT(arena_ptr[i] == guard_word);
 
+            if (statistics) {
+                for (unsigned word = 0; word < 11; ++word) {
+                    std::uint64_t value = UINT64_MAX;
+                    std::memcpy(&value, static_cast<const char*>(statistics_data) + 8 * word, 8);
+                    EXPECT(value == 0);
+                }
+                gpu.fn<PFN_vkDestroyQueryPool>("vkDestroyQueryPool")(gpu.device, statistics, nullptr);
+            }
             std::printf("depth24: shared-buffer offsets (CopyResource, RGBA8, depth24 and rgb96 CopyTexture) ok\n");
+
+            // Host-readback barrier observation across logical queue kinds: compute-converted depth24 and rgb96
+            // readbacks must emit COMPUTE_SHADER_BIT / MEMORY_WRITE_BIT -> HOST_BIT / HOST_READ_BIT on direct and
+            // compute queues (and stay within queue_supported_stages on copy queues), and a host_readable buffer UAV
+            // clear must emit a TRANSFER_BIT / TRANSFER_WRITE_BIT -> HOST_BIT / HOST_READ_BIT barrier.
+            real_barrier2 = context.vk.vkCmdPipelineBarrier2;
+            EXPECT(real_barrier2 != nullptr);
+            context.vk.vkCmdPipelineBarrier2 = observe_host;
+
+            CommandList d24_rb_only, rgb96_rb_only, uav_clear_rb;
+            EXPECT(d24_rb_only.copy_texture({fp_d24_rb, 0, 0, 0, loc_d24, false, {}}) && d24_rb_only.close());
+            EXPECT(rgb96_rb_only.copy_texture({fp_rgb96_rb, 0, 0, 0, loc_rgb96, false, {}}) && rgb96_rb_only.close());
+            EXPECT(uav_clear_rb.clear_unordered_access({id_copy, true, 0, 0, slice_bytes, 4, 0, 0, 1}, false,
+                                                       {0x13572468u, 0, 0, 0}, {}) &&
+                   uav_clear_rb.close());
+
+            const CommandList* d24_ptr = &d24_rb_only;
+            const CommandList* rgb96_ptr = &rgb96_rb_only;
+            const CommandList* uav_ptr = &uav_clear_rb;
+            for (const auto kind : {VulkanQueue::QueueKind::direct, VulkanQueue::QueueKind::compute,
+                                    VulkanQueue::QueueKind::copy}) {
+                VulkanQueue typed(context, gpu.queue, gpu.family, kind);
+                EXPECT(typed.ok());
+
+                // depth24_as_float readback
+                for (std::uint32_t i = 0; i < slice_words; ++i) arena_ptr[d24_rb_off / 4 + i] = poison_word;
+                host_barriers = 0;
+                host_src_stages = 0;
+                host_src_access = 0;
+                EXPECT(typed.execute({&d24_ptr, 1}) == ReplayResult::success);
+                EXPECT(typed.idle() && host_barriers == 1);
+                EXPECT((host_src_stages & ~VulkanQueue::queue_supported_stages(kind)) == 0);
+                if (kind == VulkanQueue::QueueKind::copy) {
+                    EXPECT(host_src_stages == VK_PIPELINE_STAGE_2_TRANSFER_BIT);
+                    EXPECT(host_src_access == VK_ACCESS_2_TRANSFER_WRITE_BIT);
+                } else {
+                    EXPECT(host_src_stages == VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
+                    EXPECT(host_src_access == VK_ACCESS_2_MEMORY_WRITE_BIT);
+                }
+                for (std::uint32_t i = 0; i < slice_words; ++i)
+                    EXPECT(arena_ptr[d24_rb_off / 4 + i] == (arena_ptr[src_off / 4 + i] & depth24_max));
+
+                // rgb96 readback
+                for (std::uint32_t y = 0; y < rgb96_h; ++y)
+                    for (std::uint32_t x = 0; x < rgb96_w; ++x)
+                        for (std::uint32_t c = 0; c < 3; ++c)
+                            arena_ptr[rgb96_rb_off / 4 + (rgb96_fp_off + std::size_t(y) * rgb96_pitch) / 4 + x * 3 + c] =
+                                poison_word;
+                host_barriers = 0;
+                host_src_stages = 0;
+                host_src_access = 0;
+                EXPECT(typed.execute({&rgb96_ptr, 1}) == ReplayResult::success);
+                EXPECT(typed.idle() && host_barriers == 1);
+                EXPECT((host_src_stages & ~VulkanQueue::queue_supported_stages(kind)) == 0);
+                if (kind == VulkanQueue::QueueKind::copy) {
+                    EXPECT(host_src_stages == VK_PIPELINE_STAGE_2_TRANSFER_BIT);
+                    EXPECT(host_src_access == VK_ACCESS_2_TRANSFER_WRITE_BIT);
+                } else {
+                    EXPECT(host_src_stages == VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
+                    EXPECT(host_src_access == VK_ACCESS_2_MEMORY_WRITE_BIT);
+                }
+                for (std::uint32_t y = 0; y < rgb96_h; ++y)
+                    for (std::uint32_t x = 0; x < rgb96_w; ++x)
+                        for (std::uint32_t c = 0; c < 3; ++c)
+                            EXPECT(arena_ptr[rgb96_rb_off / 4 + (rgb96_fp_off + std::size_t(y) * rgb96_pitch) / 4 +
+                                             x * 3 + c] == rgb96_word(y, x, c));
+
+                // ClearUnorderedAccess on host_readable buffer
+                for (std::uint32_t i = 0; i < slice_words; ++i) arena_ptr[copy_off / 4 + i] = poison_word;
+                host_barriers = 0;
+                host_src_stages = 0;
+                host_src_access = 0;
+                EXPECT(typed.execute({&uav_ptr, 1}) == ReplayResult::success);
+                EXPECT(typed.idle() && host_barriers == 1);
+                EXPECT(host_src_stages == VK_PIPELINE_STAGE_2_TRANSFER_BIT);
+                EXPECT(host_src_access == VK_ACCESS_2_TRANSFER_WRITE_BIT);
+                for (std::uint32_t i = 0; i < slice_words; ++i) EXPECT(arena_ptr[copy_off / 4 + i] == 0x13572468u);
+            }
+            context.vk.vkCmdPipelineBarrier2 = real_barrier2;
+            std::printf("depth24: host-readback visibility barriers (depth24, rgb96, buffer UAV clear) ok\n");
         }
     }
 
@@ -572,6 +700,97 @@ int main() {
                 if (scratch_words[t * 4 + c] != (c < 3 ? t * 3 + c + 0x9e3779b9u : 0u)) ++wrong;
         EXPECT(wrong == 0);
         std::printf("depth24: 96-bit texels repack both ways, split into rows and into slices\n");
+    }
+
+    // 7. ScratchBuffers::collect() must check VkResult from vkGetSemaphoreCounterValue() (leaving in-flight
+    //    chunks retired if the query fails even when *pValue is overwritten with UINT64_MAX) and reclaim
+    //    ticket-0 batches without querying the timeline semaphore.
+    {
+        struct MockVk {
+            std::uint64_t next_handle = 1;
+            VkResult sem_result = VK_ERROR_DEVICE_LOST;
+            std::uint64_t sem_value = UINT64_MAX;
+            unsigned sem_queries = 0;
+            unsigned destroyed_buffers = 0;
+
+            static MockVk*& state() {
+                static MockVk* s = nullptr;
+                return s;
+            }
+            static VKAPI_ATTR VkResult VKAPI_CALL create_buf(VkDevice, const VkBufferCreateInfo*,
+                                                             const VkAllocationCallbacks*, VkBuffer* out) {
+                *out = reinterpret_cast<VkBuffer>(state()->next_handle++);
+                return VK_SUCCESS;
+            }
+            static VKAPI_ATTR void VKAPI_CALL destroy_buf(VkDevice, VkBuffer, const VkAllocationCallbacks*) {
+                ++state()->destroyed_buffers;
+            }
+            static VKAPI_ATTR void VKAPI_CALL mem_req(VkDevice, VkBuffer, VkMemoryRequirements* req) {
+                *req = {};
+                req->size = 4096;
+                req->alignment = 256;
+                req->memoryTypeBits = 1;
+            }
+            static VKAPI_ATTR VkResult VKAPI_CALL bind_buf(VkDevice, VkBuffer, VkDeviceMemory, VkDeviceSize) {
+                return VK_SUCCESS;
+            }
+            static VKAPI_ATTR void VKAPI_CALL free_mem(VkDevice, VkDeviceMemory, const VkAllocationCallbacks*) {}
+            static VKAPI_ATTR VkResult VKAPI_CALL get_sem(VkDevice, VkSemaphore, std::uint64_t* out) {
+                ++state()->sem_queries;
+                if (out) *out = state()->sem_value;
+                return state()->sem_result;
+            }
+            static VKAPI_ATTR VkResult VKAPI_CALL wait_idle(VkDevice) { return VK_SUCCESS; }
+            static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL gdpa(VkDevice, const char* name) {
+                if (std::strcmp(name, "vkCreateBuffer") == 0) return reinterpret_cast<PFN_vkVoidFunction>(create_buf);
+                if (std::strcmp(name, "vkDestroyBuffer") == 0)
+                    return reinterpret_cast<PFN_vkVoidFunction>(destroy_buf);
+                if (std::strcmp(name, "vkGetBufferMemoryRequirements") == 0)
+                    return reinterpret_cast<PFN_vkVoidFunction>(mem_req);
+                if (std::strcmp(name, "vkBindBufferMemory") == 0)
+                    return reinterpret_cast<PFN_vkVoidFunction>(bind_buf);
+                if (std::strcmp(name, "vkFreeMemory") == 0) return reinterpret_cast<PFN_vkVoidFunction>(free_mem);
+                if (std::strcmp(name, "vkGetSemaphoreCounterValue") == 0)
+                    return reinterpret_cast<PFN_vkVoidFunction>(get_sem);
+                if (std::strcmp(name, "vkDeviceWaitIdle") == 0) return reinterpret_cast<PFN_vkVoidFunction>(wait_idle);
+                return nullptr;
+            }
+        };
+        MockVk mock{};
+        MockVk::state() = &mock;
+        const VkSemaphore fake_sem = reinterpret_cast<VkSemaphore>(std::uintptr_t(0x1234));
+        {
+            ScratchBuffers scratch(&MockVk::gdpa, reinterpret_cast<VkDevice>(std::uintptr_t(1)),
+                                   [&](const VkMemoryRequirements&) {
+                                       return reinterpret_cast<VkDeviceMemory>(mock.next_handle++);
+                                   });
+            EXPECT(scratch.loaded());
+            VkBuffer b1 = VK_NULL_HANDLE, b2 = VK_NULL_HANDLE;
+            VkDeviceSize off = 0;
+            EXPECT(scratch.get(1024, b1, off));
+            scratch.retire(fake_sem, 1);
+            // Query fails with VK_ERROR_DEVICE_LOST while writing UINT64_MAX to *pValue: chunk must NOT be recycled!
+            scratch.collect();
+            EXPECT(scratch.get(1024, b2, off));
+            EXPECT(b2 != b1);  // b1 is still in flight; must not have been reclaimed into spare_
+            // Unsubmitted batch (ticket == 0): must reclaim without calling vkGetSemaphoreCounterValue.
+            const unsigned queries_before = mock.sem_queries;
+            scratch.retire(fake_sem, 0);
+            mock.sem_result = VK_SUCCESS;
+            mock.sem_value = 0;
+            scratch.collect();
+            EXPECT(mock.sem_queries == queries_before + 1);  // only queried for b1 (ticket 1), not b2 (ticket 0)
+            VkBuffer b3 = VK_NULL_HANDLE;
+            EXPECT(scratch.get(1024, b3, off));
+            EXPECT(b3 == b2);  // b2 was reclaimed cleanly from ticket 0
+            // Now b1's ticket completes cleanly.
+            mock.sem_value = 1;
+            scratch.collect();
+            scratch.retire(fake_sem, 0);
+        }
+        EXPECT(mock.destroyed_buffers == 2);
+        MockVk::state() = nullptr;
+        std::printf("depth24: ScratchBuffers::collect() checks vkGetSemaphoreCounterValue VkResult and ticket 0 ok\n");
     }
 
     EXPECT(gpu.validation_errors() == 0);

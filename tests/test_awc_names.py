@@ -188,6 +188,21 @@ class TestCli(unittest.TestCase):
             with open(json_out, encoding="utf-8") as fh:
                 self.assertEqual(json.load(fh)["summary"]["banks"]["streams"], 3)
 
+    def test_rejects_output_aliasing_conversation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bank = write(os.path.join(tmp, "one.awc"), make_bank(["zz_rootau_abcd_01"]))
+            original = b"ZZ_ROOTAU_ABCD\x00ZZ_A\x00"
+            conv = write(os.path.join(tmp, "c.pso"), original)
+            alias = os.path.join(tmp, ".", "c.pso")
+            err = io.StringIO()
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+                with self.assertRaises(SystemExit) as cm:
+                    A.main([bank, "--conversations", conv, "--out", alias])
+            self.assertEqual(cm.exception.code, 2)
+            self.assertIn("--out must not overwrite an input", err.getvalue())
+            with open(conv, "rb") as f:
+                self.assertEqual(f.read(), original)
+
     def test_hashdict_json_words(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = write(os.path.join(tmp, "hashes.json"), json.dumps({"0000abcd": "Some_Word"}))

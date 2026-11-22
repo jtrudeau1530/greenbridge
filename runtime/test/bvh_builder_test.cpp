@@ -13,7 +13,7 @@
 //                                      dxcompiler.dll and dxil.dll on PATH)
 //   LEONIDA_BVH_DEVICE=vulkan         (optional: the Vulkan-backed ID3D12Device from #119 instead of a PC device)
 //
-// Without LEONIDA_GAME_DIR it prints "SKIP (no package)" and exits 0. Nothing from the DLL is written to disk.
+// Without LEONIDA_GAME_DIR it prints "SKIP (no package)" and exits 77 (CTest skip). Nothing from the DLL is written to disk.
 //
 // The exports are C++ members (demangled): XboxBvhBuilder::XboxBvhBuilder(ID3D12Device11*, bool) and ~XboxBvhBuilder().
 // sizeof(XboxBvhBuilder) is not exported, so the object lives in a large buffer filled with a sentinel, and the
@@ -501,7 +501,7 @@ int main() {
     const std::string game_dir_arg = env("LEONIDA_GAME_DIR");
     if (game_dir_arg.empty()) {
         std::printf("SKIP (no package)\n");
-        return 0;
+        return 77;
     }
     const std::filesystem::path game_dir = game_dir_arg;
     const std::filesystem::path dll = game_dir / "XboxBvhBuilder.dll";

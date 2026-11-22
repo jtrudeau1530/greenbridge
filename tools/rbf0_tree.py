@@ -600,7 +600,7 @@ def write_csv(path, docs):
     The rows carry names and payloads, so the file is game data and must stay local.
     """
     with open(path, "w", encoding="utf-8", newline="") as f:
-        writer = csv.writer(f)
+        writer = csv.writer(f, lineterminator="\n")
         writer.writerow(CSV_COLUMNS)
         for doc in docs:
             root = doc["tree"]

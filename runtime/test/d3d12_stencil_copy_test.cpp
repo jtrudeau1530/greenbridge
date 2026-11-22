@@ -44,6 +44,7 @@ int main() {
     info.queue = vk.queue;
     info.queue_family = vk.family;
     if (FAILED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&ours.p)))) return 1;
+    if (copycmp::host_is_wine()) return 77;  // every case is compared with the host
     std::string adapter;
     if (!copycmp::create_host(host, adapter)) return 1;
     std::printf("depth/stencil copy reference: %s\n", adapter.c_str());

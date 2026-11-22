@@ -17,6 +17,8 @@ ISA semantics used (AMD RDNA2 ISA reference, VALU/VOP3/VOP3P chapters):
   v_add/sub/mul_f16,    low halves in, D.lo out, D's high half kept; neg/abs in the VOP3 form apply to the low
   v_fmac_f16              half that is read. v_fmac_f16: D.lo = S0.lo * S1.lo + D.lo. The ps_f16_vop2 words were
                           measured on an RX 6800 (gfx1030), wave32 and wave64 (see its .asm header).
+  v_cvt_f16_f32         VOP3 omod and clamp apply to the f16, after the rounding: round, omod, clamp (an RX 6800,
+                          see ps_outmods_f16.asm). With an omod a zero or denormal f16 gives +0.
   s_buffer_load_dwordx2 with destination vcc: dword 0 -> vcc_lo, dword 1 -> vcc_hi.
   v_interp_mov_f32      reads the flat (provoking-vertex) input attribute; the translator must declare it Flat.
   v_perm_b32            byte i = BYTE_PERMUTE({S0, S1}, S2 byte i) over 8 bytes, S1 = bytes 0-3: selector 0-7 picks
@@ -65,6 +67,7 @@ EXPECTED_OPS7 = [0x00FF8077, 0xFF0000FF, 0x89ABCDEF, 0x00070003]
 EXPECTED_OPS8 = [0x80000000, 0xBFFFFFFF, 0x000F100E, 0x0F0F0F1F]
 EXPECTED_VCC_X2 = [0x11223344, 0x55667788, 0x00000000, 0x00000000]
 EXPECTED_F16_VOP2 = [0xAAAA4000, 0xAAAAC000, 0xAAAA3A00, 0x42003F00]        # hardware-measured
+EXPECTED_CVT_F16_OUT_MODS = [0xAAAA3C00, 0xAAAA3E00, 0x7C000000, 0x3C000000]
 EXPECTED_FLAT = [0x00000101, 0x00000102, 0x3F000000, 0x3E800000]
 EXPECTED_SCC_MINMAX = [0x00030205, 0x00030207, 0x00030209, 0x00030203]
 EXPECTED_FMA_LITERAL = [0x41B80000, 0x41800000, 0x40E00000, 0x41A40000]
@@ -218,6 +221,24 @@ def reference_f16_vop2():
             0x42000000 | _half(a * b + acc)]
 
 
+def reference_cvt_f16_out_mods():
+    def f16(x):         # round to nearest even; struct refuses what rounds past 65504, which is inf
+        try:
+            return _half(x)
+        except OverflowError:
+            return 0xFC00 if x < 0 else 0x7C00
+
+    def cvt(x, omod=None, clamp=False):
+        h = f16(x)
+        if omod is not None and h & 0x7C00 != 0x7C00:
+            v = _unhalf(h) * omod if h & 0x7C00 else 0.0
+            h = f16(v) if abs(v) >= 2.0 ** -14 else 0         # zero and denormal: +0
+        return _half(min(max(_unhalf(h), 0.0), 1.0)) if clamp else h
+
+    return [0xAAAA0000 | cvt(1.5, clamp=True), 0xAAAA0000 | cvt(0.375, 4),
+            cvt(2.0 ** -15, 2) | cvt(65520.0, 0.5) << 16, cvt(-0.0, 2) | cvt(2.0, 2, clamp=True) << 16]
+
+
 def reference_vcc_x2():
     return [0x11223344, 0x55667788, 0, 0]
 
@@ -334,6 +355,7 @@ class OracleTests(unittest.TestCase):
         self.assertEqual(reference_ops8(), EXPECTED_OPS8)
         self.assertEqual(reference_vcc_x2(), EXPECTED_VCC_X2)
         self.assertEqual(reference_f16_vop2(), EXPECTED_F16_VOP2)
+        self.assertEqual(reference_cvt_f16_out_mods(), EXPECTED_CVT_F16_OUT_MODS)
         self.assertEqual(reference_flat(), EXPECTED_FLAT)
         self.assertEqual(reference_scc_minmax(), EXPECTED_SCC_MINMAX)
         self.assertEqual(reference_fma_literal(), EXPECTED_FMA_LITERAL)
@@ -394,6 +416,10 @@ class TranslatorValueSemantics(unittest.TestCase):
         # v_fmac_f16 accumulates into the low half of its destination.
         self.check("ps_f16_vop2", EXPECTED_F16_VOP2)
 
+    def test_cvt_f16_f32_output_modifiers(self):
+        # clamp, mul:4, and the RX 6800's order: 65520 div:2 is inf, 2^-15 mul:2 and -0 mul:2 are +0, 2.0 mul:2 clamp 1.0
+        self.check("ps_outmods_f16", EXPECTED_CVT_F16_OUT_MODS)
+
     def test_mad_u32_u16_i32_i16_wrap_and_sign_extend(self):
         # The u16 product plus S2 wraps at 32 bits; i16 sign-extends both halves (also the op_sel-selected high
         # halves); the destination dword is replaced, its 0xaaaa5555 is not kept.
@@ -448,6 +474,30 @@ class TranslatorValueSemantics(unittest.TestCase):
         for address, want in EXPECTED_FMT_1010102.items():
             with self.subTest(address=address):
                 self.assertEqual(f"{memory.get(address, 0):#010x}", f"{want:#010x}")
+
+    def test_signed_typed_buffers(self):
+        spv = support.translate_fixture("cs_fmt_sint32", fssm=CS_BOUNDS_FSSM)
+        memory = {}
+        support.run_fragment(
+            spv, inputs={"%wg_id": (0, 0, 0), "%local_id": (0, 0, 0)},
+            push_constants=[0, 0, 0x100, 0x31016FAC] + [0] * 28, memory=memory)
+        expected = {
+            0x0C: 1,                         # MUBUF integer DST_SEL=1
+            0x18: 0xFFFFFFFD,                # MUBUF 96-bit format, third component
+            0x34: 0x7FFFFFFF, 0x38: 0,       # MTBUF 64-bit format with absent third component
+            0x48: 0xFFFFFFFD, 0x4C: 0,       # MTBUF 96-bit format with absent fourth component
+            0x58: 0xFFFFFFFD, 0x5C: 17,      # MTBUF 128-bit format
+            0x60: 0x7FFF8000, 0x64: 0x0011FFFD,
+            0x68: 0x7FFF8000, 0x6C: 0x0011FFFD,
+            0x70: 0xFFFFFFFD, 0x74: 0xFFFFFFFD,
+            0x90: 0x80000000, 0xA8: 0xFFFFFFFD, 0xBC: 17,
+            0xC0: 0xFFFFFFFD, 0xC4: 0xFFFF8000, 0xC8: 0xFFFFFFFD,
+        }
+        for address, word in expected.items():
+            with self.subTest(address=hex(address)):
+                self.assertEqual(memory.get(address), word)
+        for address in (0x98, 0xAC, 0xCC):
+            self.assertNotIn(address, memory)
 
     def test_s_ff0_s_ff1_read_an_immediate_as_a_value(self):
         # SHADER-46: an inline constant or literal is a 32-bit value. Read as a lane mask (all ones or zero from

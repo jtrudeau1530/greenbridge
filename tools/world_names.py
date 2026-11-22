@@ -543,6 +543,15 @@ def _load_json(path: str) -> dict:
         return json.load(handle)
 
 
+def _same_report_path(first: str, second: str) -> bool:
+    if os.path.normcase(os.path.realpath(first)) == os.path.normcase(os.path.realpath(second)):
+        return True
+    try:
+        return os.path.samefile(first, second)
+    except OSError:
+        return False
+
+
 def _build(args) -> int:
     if not (args.manifest or args.scan or args.names or args.xml or args.rpf9_names):
         print("build: at least one --manifest/--scan/--names/--rpf9-names/--xml source is required",
@@ -560,6 +569,11 @@ def _build(args) -> int:
 
 
 def _resolve(args) -> int:
+    if args.out:
+        for path in (args.dict, *args.maps, *args.archetypes):
+            if _same_report_path(args.out, path):
+                raise ValueError(
+                    f"resolve: --out {args.out} would overwrite input {path}")
     try:
         dictionary = NameDictionary.from_json(_load_json(args.dict))
     except ValueError as exc:
@@ -592,7 +606,7 @@ def _write_json(path: str, data: dict) -> None:
     os.makedirs(directory, exist_ok=True)
     with tempfile.TemporaryDirectory(dir=directory, prefix=".world-names-") as staging:
         tmp = os.path.join(staging, "report.json")
-        with open(tmp, "w", encoding="utf-8") as handle:
+        with open(tmp, "w", encoding="utf-8", newline="\n") as handle:
             json.dump(data, handle, indent=1, sort_keys=True)
             handle.write("\n")
         os.replace(tmp, path)

@@ -751,7 +751,7 @@ def main():
     if parent:      # the scan is already done; a missing folder used to lose it in a FileNotFoundError
         os.makedirs(parent, exist_ok=True)
     try:
-        with open(path, "w", encoding="utf-8") as f:
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
             json.dump(allt, f)
     except OSError as e:
         print(f"ERROR: cannot write {path}: {e.strerror or e}", file=sys.stderr)

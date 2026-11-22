@@ -191,6 +191,79 @@ class NavmeshIndexTest(unittest.TestCase):
             with open(path, "rb") as f:
                 self.assertEqual(f.read(), originals[path], f"{args} touched the input")
 
+    def test_differently_cased_report_path_cannot_be_scanned_input(self):
+        # Before: on a case-insensitive filesystem, --out/--csv spelling the input folder in another case
+        # passed the containment check and replaced the carved file with the report, exit 0.
+        folder = os.path.join(self.root, "carve")
+        os.makedirs(os.path.join(folder, "sub"))
+        carved = os.path.join(folder, "page.bin")
+        nested = os.path.join(folder, "sub", "deep.bin")
+        for path in (carved, nested):
+            with open(path, "wb") as f:
+                f.write(page(pages=4))
+        cased = os.path.join(self.root, "CARVE")
+        if not os.path.isdir(cased):
+            self.skipTest("the temporary folder is on a case-sensitive filesystem")
+        module = load_tool_module()
+        for spelled in (os.path.join(cased, "page.bin"), os.path.join(cased, "PAGE.BIN"),
+                        os.path.join(cased, "sub", "deep.bin")):
+            self.assertTrue(module.is_scanned_input(spelled, folder, None), spelled)
+            self.assertTrue(module.is_scanned_input(spelled, cased, None), spelled)
+        for flag in ("--out", "--csv"):
+            r = subprocess.run([sys.executable, "-I", TOOL, folder, flag, os.path.join(cased, "page.bin")],
+                               cwd=ROOT, capture_output=True, text=True, check=False)
+            self.assertEqual(r.returncode, 2, r.stderr)
+            self.assertIn("would overwrite the input", r.stderr)
+            with open(carved, "rb") as f:
+                self.assertEqual(f.read(), page(pages=4), f"{flag} touched the input")
+
+    def test_report_path_linked_to_a_scanned_file_is_scanned_input(self):
+        # Before: a report path the pattern doesn't match was let through even when it is the same file as one the
+        # scan reads. A hard link does that on any filesystem, and so does PAGE.BIN for page.bin on a
+        # case-insensitive macOS or Linux volume, where fnmatch doesn't fold case: the report truncated the input.
+        folder = os.path.join(self.root, "carve")
+        os.makedirs(folder)
+        carved = os.path.join(folder, "page.bin")
+        with open(carved, "wb") as f:
+            f.write(page(pages=4))
+        linked = os.path.join(folder, "report.json")
+        try:
+            os.link(carved, linked)
+        except (OSError, NotImplementedError) as e:
+            self.skipTest(f"no hard links here: {e}")
+        module = load_tool_module()
+        self.assertTrue(module.is_scanned_input(linked, folder, None))
+        for flag in ("--out", "--csv"):
+            r = subprocess.run([sys.executable, "-I", TOOL, folder, flag, linked],
+                               cwd=ROOT, capture_output=True, text=True, check=False)
+            self.assertEqual(r.returncode, 2, r.stderr)
+            self.assertIn("would overwrite the input", r.stderr)
+            with open(carved, "rb") as f:
+                self.assertEqual(f.read(), page(pages=4), f"{flag} touched the input")
+
+    def test_unscanned_file_in_input_folder_is_not_scanned_input(self):
+        folder = os.path.join(self.root, "carve")
+        os.makedirs(folder)
+        with open(os.path.join(folder, "page.bin"), "wb") as f:
+            f.write(page(pages=4))
+        report = os.path.join(folder, "report.json")
+        with open(report, "wb") as f:
+            f.write(b"previous report")
+        module = load_tool_module()
+        self.assertFalse(module.is_scanned_input(report, folder, None))
+
+    def test_sibling_folder_with_shared_prefix_is_not_scanned_input(self):
+        folder = os.path.join(self.root, "carve")
+        sibling = os.path.join(self.root, "carve2")
+        os.makedirs(folder)
+        os.makedirs(sibling)
+        report = os.path.join(sibling, "page.bin")
+        with open(report, "wb") as f:
+            f.write(b"previous report")
+        module = load_tool_module()
+        self.assertFalse(module.is_scanned_input(report, folder, None))
+        self.assertFalse(module.is_scanned_input(os.path.join(folder, "missing.bin"), folder, None))
+
     def test_not_an_rpf(self):
         path = os.path.join(self.root, "not.rpf")
         with open(path, "wb") as f:

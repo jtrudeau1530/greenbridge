@@ -148,7 +148,16 @@ function buildTestChunk([cx, cz, size]) {
 }
 
 // ---------- scene ----------
-const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: "high-performance" });
+let renderer;
+try {
+  renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: "high-performance" });
+} catch (error) {
+  const start = document.getElementById("start");
+  start.setAttribute("role", "alert");
+  start.style.cursor = "default";
+  start.textContent = "Could not start WebGL. Check that WebGL is enabled, then reload.";
+  throw error;
+}
 renderer.setPixelRatio(Math.min(devicePixelRatio, 1.5));
 renderer.setSize(innerWidth, innerHeight);
 document.body.prepend(renderer.domElement);

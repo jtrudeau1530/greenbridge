@@ -385,7 +385,7 @@ def main() -> int:
         if census:
             out["pamh_census"] = census
         try:
-            with open(a.json, "w", encoding="utf-8") as f:
+            with open(a.json, "w", encoding="utf-8", newline="\n") as f:
                 json.dump(out, f, indent=1)
         except OSError as e:
             print(f"error: cannot write {a.json}: {e.strerror or e}", file=sys.stderr)

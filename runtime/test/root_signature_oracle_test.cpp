@@ -120,6 +120,48 @@ int main() {
     const PackResult packed = pack(model);
     check(packed.ok && packed.dword_count == 6, "oracle model packs to 6 dwords");
 
+    // The descriptor count and range offset are independent. The final SRV range is unbounded
+    // and begins immediately after the fixed range, but the whole table still occupies one GPU address.
+    {
+        D3D12_DESCRIPTOR_RANGE1 ranges[] = {
+            {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 2, 3, 0, D3D12_DESCRIPTOR_RANGE_FLAG_DATA_STATIC, 0},
+            {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, UINT32_MAX, 7, 1,
+             D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE, D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND},
+        };
+        D3D12_ROOT_PARAMETER1 table_and_constants[2] = {{}, params[0]};
+        auto& table = table_and_constants[0];
+        table.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        table.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+        table.DescriptorTable = {2, ranges};
+        const auto unbounded_desc = make_desc(table_and_constants, 2);
+        Blobs unbounded;
+        const HRESULT result =
+            D3D12SerializeVersionedRootSignature(&unbounded_desc, &unbounded.blob, &unbounded.error);
+        check(result == S_OK, "Microsoft serializer accepts an unbounded SRV range");
+        RootSignature table_model;
+        if (SUCCEEDED(result) && unbounded.blob &&
+            parse_blob(unbounded.blob, table_model) && table_model.params.size() == 2 &&
+            table_model.params[0].ranges.size() == 2) {
+            const auto& fixed = table_model.params[0].ranges[0];
+            const auto& tail = table_model.params[0].ranges[1];
+            check(table_model.params[0].type == ParamType::Table &&
+                      table_model.params[0].visibility == Visibility::Pixel &&
+                      fixed.num_descriptors == 2 && fixed.offset_in_table == 0 &&
+                      tail.range_type == D3D12_DESCRIPTOR_RANGE_TYPE_SRV &&
+                      tail.num_descriptors == UINT32_MAX && tail.base_shader_register == 7 &&
+                      tail.register_space == 1 && tail.flags == D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE &&
+                      tail.offset_in_table == kRangeOffsetAppend,
+                  "fixed and unbounded SRV ranges survive native serialization");
+            const auto table_pack = pack(table_model);
+            check(table_pack.ok && table_pack.d3d12_cost == 5 && table_pack.dword_count == 6 &&
+                      table_pack.provenance.size() == 6 &&
+                      table_pack.provenance[1].param_index == 0 && table_pack.provenance[2].param_index == 1,
+                  "unbounded SRV table occupies two SGPRs before the following constants");
+        } else {
+            check(false, "native unbounded table parses with two ranges and two parameters");
+        }
+    }
+
     // Static samplers, one signature per version: every field round-trips through the real serializer, and 1.2
     // adds D3D12_STATIC_SAMPLER_DESC1::Flags (a 14th dword) to each sampler record. Each also carries a table and a
     // root descriptor, so the 1.1/1.2 descriptor and range flags sit between the samplers and the header.

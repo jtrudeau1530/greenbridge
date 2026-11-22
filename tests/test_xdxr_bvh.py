@@ -261,6 +261,49 @@ class Validate(unittest.TestCase):
         self.assertEqual(X.validate(b"\0" * 10), ["buffer shorter than the 64-byte header"])
 
 
+class CheckBuild(unittest.TestCase):
+    """check-build on cases written the way vk_xdxr_build_test writes them, built here by the reference."""
+
+    def write_cases(self, d, corrupt=False):
+        import json
+        tris = X.grid_mesh(4, 3.0)
+        blas, info = X.build_blas(tris)
+        if corrupt:                                    # move one leaf's first vertex: traces must disagree
+            b = bytearray(blas)
+            for leaf in range(info["triangles"]):
+                struct.pack_into("<f", b, info["elements"] + 64 * leaf, 50.0)
+            blas = bytes(b)
+        va, bias = 0x12345600, 0x7F0000000000
+        with open(os.path.join(d, "blas_grid.bin"), "wb") as f:
+            f.write(blas)
+        with open(os.path.join(d, "blas_grid.json"), "w") as f:
+            json.dump({"kind": "blas", "address": va + bias,
+                       "triangles": [t + [0, i] for i, t in enumerate(tris)]}, f)
+        m = [[1, 0, 0, 2], [0, 1, 0, -1], [0, 0, 1, 0.5]]
+        tlas, _ = X.build_tlas([X.Instance(m, va, info["root"], info["bounds"])])
+        with open(os.path.join(d, "tlas.bin"), "wb") as f:
+            f.write(tlas)
+        with open(os.path.join(d, "tlas.json"), "w") as f:
+            json.dump({"kind": "tlas", "address": 0x40000000, "bias": bias, "blas": ["blas_grid"],
+                       "instances": [{"transform": sum(m, []), "mask": 255, "blas": 0}]}, f)
+
+    def run_check(self, corrupt):
+        with tempfile.TemporaryDirectory() as d:
+            self.write_cases(d, corrupt)
+            with contextlib.redirect_stdout(io.StringIO()):
+                return X.check_build(d, rays=200)
+
+    def test_reference_cases_pass(self):
+        self.assertEqual(self.run_check(False), [])
+
+    def test_corrupted_leaves_fail(self):
+        self.assertTrue(self.run_check(True))
+
+    def test_empty_directory(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.assertEqual(X.check_build(d), [f"no cases in {d}"])
+
+
 class Cli(unittest.TestCase):
     def test_validate_file(self):
         data, _ = X.build_blas(X.grid_mesh(3), pair=True)

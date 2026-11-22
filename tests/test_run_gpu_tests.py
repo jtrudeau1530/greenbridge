@@ -84,7 +84,7 @@ class TextureTestOnASmallPushConstantDevice(unittest.TestCase):
             return rc, output.getvalue()
 
     def test_bindless_texture_and_gather_tests_skip(self):
-        for name in ("ps_cube_sample", "ps_texture_sample_d16", "ps_gather_wrap"):
+        for name in ("ps_cube_sample", "ps_texture_sample_d16", "ps_gather_wrap", "ps_array_resinfo"):
             with self.subTest(name=name):
                 rc, out = self.run_one(name)
                 self.assertEqual(rc, 0, out)
@@ -301,6 +301,50 @@ class Wave32LaneDumps(unittest.TestCase):
                     "no device line\n"):
             with self.subTest(out=out):
                 self.assertIsNone(rgt.narrow_subgroup_skip(out))
+
+
+class ComputedIJWithoutPerVertexInputs(unittest.TestCase):
+    """ps_ij_computed (SHADER-177): without PerVertexKHR inputs (--bary-fallback, --f16-interp-fallback, the latter on
+    by default on MoltenVK) the translator refuses the computed I/J pair, so there is no .spv. Both runners SKIP it
+    there, before their missing-.spv check; a missing .spv without a fallback stays a translation failure."""
+    NAME = "ps_ij_computed"
+
+    def run_suite(self, bary, f16):
+        with tempfile.TemporaryDirectory() as tmp:
+            args = SimpleNamespace(filter=self.NAME, build=tmp, llvm_mc="unused")
+            env = {"LEONIDA_BARY_FALLBACK": "1" if bary else "0", "LEONIDA_F16_INTERP_FALLBACK": "1" if f16 else "0"}
+            out = io.StringIO()
+            with (patch.dict(rgt.os.environ, env),
+                  patch.object(rgt, "assemble_to_s", side_effect=lambda _mc, _src, dst, _name: Path(dst).touch()),
+                  patch.object(rgt, "spirv_as"),
+                  patch.object(rgt, "run_cmd", return_value=(0, "1 shaders: 0 translated, 0 pass spirv-val")),   # refused
+                  contextlib.redirect_stdout(out), contextlib.redirect_stderr(out)):
+                rc = rgt.run_suite(args, tmp)
+            return rc, out.getvalue()
+
+    def test_run_gpu_tests_skips_under_either_fallback(self):
+        for bary, f16 in ((True, False), (False, True)):
+            with self.subTest(bary=bary, f16=f16):
+                rc, out = self.run_suite(bary, f16)
+                self.assertIn("SKIP (computed I/J pairs need PerVertexKHR inputs", out)
+                self.assertIn("0/1 passed, 1 skipped", out)
+                self.assertNotIn("missing .spv", out)
+                self.assertEqual(rc, 0, out)
+
+    def test_run_gpu_tests_missing_spv_without_fallback_still_fails(self):
+        rc, out = self.run_suite(False, False)
+        self.assertIn("missing .spv (translation failed)", out)
+        self.assertEqual(rc, 1, out)
+
+    def test_check_py_skips_before_its_spv_check(self):
+        import check
+        with tempfile.TemporaryDirectory() as tmp:
+            for bary, f16 in ((True, False), (False, True)):
+                with self.subTest(bary=bary, f16=f16), \
+                        patch.object(check, "BARY_FALLBACK", bary), patch.object(check, "F16_HALVES", f16):
+                    self.assertIsInstance(check.pixel_test("unused", tmp, self.NAME), check.Skip)
+            with patch.object(check, "BARY_FALLBACK", False), patch.object(check, "F16_HALVES", False):
+                self.assertEqual(check.pixel_test("unused", tmp, self.NAME), f"missing {self.NAME}.spv")
 
 
 if __name__ == "__main__":

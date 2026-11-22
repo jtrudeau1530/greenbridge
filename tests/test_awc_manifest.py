@@ -139,6 +139,19 @@ class ManifestTest(unittest.TestCase):
         self.assertAlmostEqual(float(rows["00000001"]["duration_s"]), 0.1, places=6)
         self.assertAlmostEqual(float(rows["00000002"]["duration_s"]), 0.1, places=6)
 
+    def test_streams_with_the_same_id_are_both_listed(self):
+        path = os.path.join(self.tmp.name, "dup.awc")
+        with open(path, "wb") as f:
+            f.write(build_bank([(0x123, [(0x76, fmt(2, 48000, 0x00, 1)), (0x55, bytes(4))]),
+                                (0x123, [(0x76, fmt(4, 48000, 0x00, 1)), (0x55, bytes(8))])]))
+        p = self.run_tool(path)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        rows = list(csv.DictReader(io.StringIO(p.stdout)))
+        self.assertEqual([(r["stream"], r["declared_samples"]) for r in rows],
+                         [("00000123", "2"), ("00000123", "4")])
+        self.assertNotIn("00000123~2", rows[0]["notes"])
+        self.assertIn("00000123~2", rows[1]["notes"])
+
     def test_json_out_is_inferred_from_extension(self):
         bank = self.write_bank(with_music=False)
         out = os.path.join(self.tmp.name, "nested", "manifest.json")

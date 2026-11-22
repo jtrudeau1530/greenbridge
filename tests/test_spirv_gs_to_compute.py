@@ -1,6 +1,8 @@
 """tools/spirv_gs_to_compute.py: a translated geometry shader as a compute capture pass (SHADER-159)."""
+import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 
@@ -134,3 +136,63 @@ def test_phi_from_entry_block_names_the_split_block(tmp_path):
     subprocess.run(["spirv-as", str(sa), "-o", str(sv), "--target-env", "vulkan1.2"], check=True)
     r = subprocess.run(["spirv-val", "--target-env", "vulkan1.2", str(sv)], capture_output=True, text=True)
     assert r.returncode == 0, r.stderr
+
+
+@pytest.fixture
+def gs_module(tmp_path):
+    if not (HAVE_SPIRV and shutil.which("spirv-dis")):
+        pytest.skip("needs SPIRV-Tools on PATH")
+    source = tmp_path / "gs.spv"
+    subprocess.run(["spirv-as", "--target-env", "vulkan1.2", "-", "-o", str(source)],
+                   input=PHI_GS, text=True, check=True)
+    return source
+
+
+@pytest.mark.parametrize("overlap", ["input-output", "input-layout", "output-layout", "hardlinked-layout"])
+def test_cli_rejects_overlapping_paths_without_writing(tmp_path, gs_module, overlap):
+    source = gs_module
+    output = tmp_path / "cs.spv"
+    layout = tmp_path / "layout.json"
+    original = source.read_bytes()
+    if overlap == "input-output":
+        output = source
+    elif overlap == "input-layout":
+        layout = source
+    elif overlap == "output-layout":
+        subdir = tmp_path / "subdir"
+        subdir.mkdir()
+        layout = subdir / ".." / output.name
+    else:
+        try:
+            os.link(source, layout)
+        except OSError as e:
+            pytest.skip(f"hard links unavailable: {e}")
+
+    result = subprocess.run([sys.executable, "-I", os.path.join(ROOT, "tools", "spirv_gs_to_compute.py"),
+                             str(source), str(output), "--layout", str(layout)], capture_output=True, text=True)
+    assert result.returncode == 2, result.stderr
+    assert "same file" in result.stderr
+    assert source.read_bytes() == original
+    assert not (tmp_path / "cs.spv").exists()
+    if overlap == "hardlinked-layout":
+        assert layout.read_bytes() == original
+
+
+def test_cli_accepts_distinct_module_and_layout_paths(tmp_path, gs_module):
+    output = tmp_path / "cs.spv"
+    layout = tmp_path / "layout.json"
+    original = gs_module.read_bytes()
+    result = subprocess.run([sys.executable, "-I", os.path.join(ROOT, "tools", "spirv_gs_to_compute.py"),
+                             str(gs_module), str(output), "--layout", str(layout)], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    assert gs_module.read_bytes() == original
+    assert json.loads(layout.read_text(encoding="utf-8"))["topology"] == "triangle_strip"
+    subprocess.run(["spirv-val", "--target-env", "vulkan1.2", str(output)], check=True)
+
+
+def test_help_is_a_clean_exit_zero(capsys):
+    for flag in ("-h", "--help"):
+        assert gsc.main(["spirv_gs_to_compute.py", flag]) == 0
+        out = capsys.readouterr().out
+        assert "spirv_gs_to_compute.py in.spv out.spv" in out
+        assert "SPIRV-Tools" in out

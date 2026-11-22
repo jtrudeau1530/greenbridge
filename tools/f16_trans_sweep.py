@@ -454,7 +454,7 @@ def main(argv=None):
     finally:
         oracle.close()
     if a.json:
-        with open(a.json, "w", encoding="utf-8") as f:
+        with open(a.json, "w", encoding="utf-8", newline="\n") as f:
             json.dump(report, f, indent=1)
     return rc
 

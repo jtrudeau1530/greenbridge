@@ -82,4 +82,9 @@ if __name__ == "__main__":
         errors, checked, _um = S.check_sdk()
         assert errors == [], errors
         assert checked == 83
+    if os.environ.get("SCARAB_REF"):
+        errors, _notes = S.check_scarab(os.environ["SCARAB_REF"])
+        assert errors == [], errors
+    else:
+        print("SCARAB cross-check skipped: SCARAB_REF is not set")
     print("ok")

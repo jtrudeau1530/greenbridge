@@ -129,7 +129,10 @@ public:
     }
 
     // Erases a key from the table. Returns true if the key was found and erased, false otherwise.
-    // Backward-shifts downstream entries in the probe cluster so probe chains remain intact and compact.
+    // Only the key's own slot changes (it becomes empty): no other entry moves. Every lookup, here and in the
+    // shaders (rdna2spirv.py desc_probe), compares all kDescriptorProbes slots and never stops at an empty one, so
+    // a hole breaks no probe chain and inserts reuse it. Keeping the other entries in place is what lets the GPU
+    // copy of the table take an erase while shaders still probe it (BindlessSet::flush_needs_idle).
     bool erase(const std::uint32_t key[8]) {
         std::lock_guard lock(mutex_);
         return erase_locked(key);
@@ -321,24 +324,9 @@ private:
         }
         if (!found) return false;
 
-        // Backward-shift entries in the probe cluster to maintain probe chains
-        std::uint32_t i = found_slot;
-        std::uint32_t j = i;
+        // No backward shift: see erase().
+        entries_[found_slot] = DescriptorEntry{};
         mark(found_slot);
-        while (true) {
-            j = (j + 1) & mask_;
-            if (entries_[j].pad != kSlotOccupiedMarker) break;
-            const std::uint32_t r = hash_descriptor_key(entries_[j].key);
-            const std::uint32_t dist_r_to_i = (i - r) & mask_;
-            const std::uint32_t dist_r_to_j = (j - r) & mask_;
-            if (dist_r_to_i < dist_r_to_j && dist_r_to_i < kDescriptorProbes) {
-                entries_[i] = entries_[j];
-                mark(i);
-                i = j;
-            }
-        }
-        entries_[i] = DescriptorEntry{};
-        mark(i);
         --occupied_count_;
         return true;
     }

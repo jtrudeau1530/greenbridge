@@ -80,7 +80,7 @@ bool SDLCALL on_effect(void* u, const void* data, int size) {
 }
 void SDLCALL on_player(void* u, int index) { static_cast<Pad*>(u)->player = index; }
 
-void attach(Pad& pad, const char* name, uint16_t vendor, uint16_t product, bool trigger_motors) {
+void attach(Pad& pad, const char* name, uint16_t vendor, uint16_t product, bool trigger_motors, bool sensors = false) {
     SDL_VirtualJoystickDesc d;
     SDL_INIT_INTERFACE(&d);
     d.type = SDL_JOYSTICK_TYPE_GAMEPAD;
@@ -97,6 +97,11 @@ void attach(Pad& pad, const char* name, uint16_t vendor, uint16_t product, bool 
     d.SetLED = on_led;
     d.SendEffect = on_effect;
     d.SetPlayerIndex = on_player;
+    static const SDL_VirtualJoystickSensorDesc kSensors[] = {{SDL_SENSOR_GYRO, 250.0f}, {SDL_SENSOR_ACCEL, 250.0f}};
+    if (sensors) {
+        d.nsensors = 2;
+        d.sensors = kSensors;
+    }
     pad.id = SDL_AttachVirtualJoystick(&d);
     pad.js = pad.id ? SDL_OpenJoystick(pad.id) : nullptr;
     if (pad.js) {  // triggers at rest: the full-range virtual axis maps -32768 to 0
@@ -204,6 +209,134 @@ GameInputGamepadState pad_state(IGameInput* input, IGameInputDevice* dev, uint32
 bool sticks_at_rest(const GameInputGamepadState& st) {
     return st.leftThumbstickX == 0 && st.leftThumbstickY == 0 && st.rightThumbstickX == 0 &&
            st.rightThumbstickY == 0 && st.leftTrigger == 0 && st.rightTrigger == 0;
+}
+
+// ---- motion: SDL sensors through the shim ----
+void send_motion(Pad& pad, float ax, float ay, float az, float gx, float gy, float gz) {
+    const Uint64 ts = SDL_GetTicksNS();
+    const float accel[3] = {ax, ay, az};
+    const float gyro[3] = {gx, gy, gz};
+    SDL_SendJoystickVirtualSensorData(pad.js, SDL_SENSOR_ACCEL, ts, accel, 3);
+    SDL_SendJoystickVirtualSensorData(pad.js, SDL_SENSOR_GYRO, ts, gyro, 3);
+}
+
+GameInputMotionState motion_state(IGameInput* input, IGameInputDevice* dev, bool* ok = nullptr) {
+    GameInputMotionState ms{};
+    IGameInputReading* r = nullptr;
+    const bool got = input->GetCurrentReading(GameInputKindMotion, dev, &r) == S_OK && r && r->GetMotionState(&ms);
+    if (r) r->Release();
+    if (ok) *ok = got;
+    return ms;
+}
+
+void test_motion(IGameInput* input) {
+    const size_t events_before = g_device_events.size();  // other tests' events are still queued in the vector
+    Pad gyro_pad, plain;
+    attach(gyro_pad, "Leonida virtual gyro pad", 0x054C, 0x0CE6, false, true);  // Sony ids, sensors on
+    attach(plain, "Leonida virtual plain pad", 0x045E, 0x02FF, false);
+    rt::gameinput::poll();
+    check(rt::gameinput::connected_count() == 2, "motion: both pads connected");
+    // The connect events for these two pads are the first two CONNECTED events after `events_before`, deduplicated
+    // by device: earlier test sections leave their device callbacks registered, so every connect is delivered more
+    // than once, and a disconnect from a previous test may be queued in between.
+    std::vector<IGameInputDevice*> found;
+    for (size_t i = events_before; i < g_device_events.size() && found.size() < 2; ++i) {
+        const DeviceEvent& e = g_device_events[i];
+        if (!(e.current & GameInputDeviceConnected)) continue;
+        if (std::find(found.begin(), found.end(), e.device) != found.end()) continue;
+        found.push_back(e.device);
+    }
+    IGameInputDevice* mdev = found.size() > 0 ? found[0] : nullptr;  // attach order: gyro pad first
+    IGameInputDevice* pdev = found.size() > 1 ? found[1] : nullptr;
+    if (mdev) mdev->AddRef();
+    if (pdev) pdev->AddRef();
+    check(mdev && pdev, "motion: both device objects arrived");
+    if (!mdev || !pdev) return;
+
+    const GameInputDeviceInfo* mi = mdev->GetDeviceInfo();
+    const GameInputDeviceInfo* pi = pdev->GetDeviceInfo();
+    check((mi->supportedInput & GameInputKindMotion) != 0, "motion: the gyro pad reports GameInputKindMotion");
+    check((pi->supportedInput & GameInputKindMotion) == 0, "motion: the plain pad does not");
+    const GameInputMotionInfo* mmotion = static_cast<const GameInputMotionInfo*>(mi->motionInfo);
+    check(mmotion != nullptr && mmotion->maxAcceleration == 19.6133f && mmotion->maxAngularVelocity == 34.9066f &&
+              mmotion->maxMagneticFieldStrength == 0.0f,
+          "motion: motionInfo carries the shim's maxima (magnetometer unavailable)");
+    check(pi->motionInfo == nullptr, "motion: the plain pad's motionInfo is null");
+
+    // Before the first sensor sample arrives, SDL answers reads with zeros and the shim reports no motion at all.
+    IGameInputReading* r = nullptr;
+    GameInputMotionState unused{};
+    check(input->GetCurrentReading(GameInputKindGamepad, mdev, &r) == S_OK && r && !r->GetMotionState(&unused),
+          "motion: before the first sample, GetMotionState is false even on a sensor pad");
+    if (r) r->Release();
+
+    // 9.80665 m/s^2 is half of the 2 g maximum; 17.4533 rad/s is half of 2000 deg/s. A reading with the sample needs
+    // either a gamepad change or the ~8 ms motion cadence, so the test waits out the window before polling.
+    send_motion(gyro_pad, 0.0f, 0.0f, 9.80665f, 17.4533f, 0.0f, 0.0f);
+    Sleep(12);
+    rt::gameinput::poll();
+    bool got = false;
+    const GameInputMotionState ms = motion_state(input, mdev, &got);
+    check(got, "motion: GetMotionState true on a motion reading");
+    check(approx(ms.accelerationZ, 0.5f) && approx(ms.angularVelocityX, 0.5f),
+          "motion: accel and gyro normalised against the motionInfo maxima");
+    check(ms.accelerometerAccuracy == GameInputMotionAccuracyHigh && ms.gyroscopeAccuracy == GameInputMotionAccuracyHigh,
+          "motion: live sensors report High accuracy");
+    check(ms.magnetometerAccuracy == GameInputMotionAccuracyUnknown &&
+              ms.orientationAccuracy == GameInputMotionAccuracyUnknown,
+          "motion: sensors the shim does not provide report Unknown");
+
+    r = nullptr;
+    check(input->GetCurrentReading(GameInputKindMotion, pdev, &r) == GAMEINPUT_E_READING_NOT_FOUND && !r,
+          "motion: a motion query on the plain pad is READING_NOT_FOUND");
+    check(input->GetCurrentReading(GameInputKindGamepad, mdev, &r) == S_OK && r && !r->GetMotionState(nullptr) &&
+              (r->GetInputKind() & GameInputKindMotion),
+          "motion: GetMotionState(nullptr) is false; the gyro pad's reading kind includes Motion");
+    if (r) r->Release();
+    unused = {};
+    check(input->GetCurrentReading(GameInputKindGamepad, pdev, &r) == S_OK && r &&
+              !(r->GetInputKind() & GameInputKindMotion) && !r->GetMotionState(&unused),
+          "motion: the plain pad's reading has no motion kind and GetMotionState is false");
+    if (r) r->Release();
+
+    send_motion(gyro_pad, 100.0f, -100.0f, 0.0f, 0.0f, 0.0f, -100.0f);
+    Sleep(12);
+    rt::gameinput::poll();
+    const GameInputMotionState sat = motion_state(input, mdev);
+    check(sat.accelerationX == 1.0f && sat.accelerationY == -1.0f && sat.angularVelocityZ == -1.0f,
+          "motion: out-of-range sensor values clamp to the +-1 fraction range");
+
+    // The cadence: with the buttons idle, a changed gyro yields a new reading only once per ~8 ms window, not one
+    // per poll, so the history still spans the half second it is documented for.
+    send_motion(gyro_pad, 0.0f, 0.0f, 9.80665f, 0.0f, 0.0f, 0.0f);
+    rt::gameinput::poll();
+    IGameInputReading* first = nullptr;
+    check(input->GetCurrentReading(GameInputKindMotion, mdev, &first) == S_OK && first,
+          "motion: a reading exists after a sensor update");
+    send_motion(gyro_pad, 0.0f, 0.0f, 9.80665f, 34.9066f, 0.0f, 0.0f);  // gravity stays: zero accel means "no sample"
+    rt::gameinput::poll();
+    IGameInputReading* none = nullptr;
+    check(input->GetNextReading(first, GameInputKindMotion, mdev, &none) == GAMEINPUT_E_READING_NOT_FOUND && !none,
+          "motion: no new reading within the 8 ms cadence window");
+    Sleep(12);
+    rt::gameinput::poll();
+    IGameInputReading* next = nullptr;
+    check(input->GetNextReading(first, GameInputKindMotion, mdev, &next) == S_OK && next,
+          "motion: after the window the latest sensor state is in a new reading");
+    if (next) {
+        GameInputMotionState later{};
+        check(next->GetMotionState(&later) && approx(later.angularVelocityX, 1.0f),
+              "motion: the new reading carries the newest gyro sample");
+        next->Release();
+    }
+    if (first) first->Release();
+
+    detach(gyro_pad);
+    detach(plain);
+    rt::gameinput::poll();
+    if (mdev) mdev->Release();
+    if (pdev) pdev->Release();
+    check(rt::gameinput::connected_count() == 0, "motion: both pads closed again");
 }
 
 // WASD, the mouse and its buttons. Runs in the focused mode with focus and nothing held.
@@ -444,6 +577,76 @@ bool found_is(IGameInput* input, IGameInputDevice* dev) {
 }
 
 // Pads SDL cannot tell apart: the same name, vendor and product, no serial, no path. Runs with no other pad connected.
+void test_aggregate_device(IGameInput* input) {
+    check(input->CreateAggregateDevice(GameInputKindGamepad, nullptr) == E_POINTER,
+          "CreateAggregateDevice rejects null output pointer");
+    IGameInputDevice* agg = nullptr;
+    check(input->CreateAggregateDevice(GameInputKindUnknown, &agg) == E_INVALIDARG && !agg,
+          "CreateAggregateDevice rejects GameInputKindUnknown");
+    check(input->CreateAggregateDevice(GameInputKindGamepad | GameInputKindKeyboard, &agg) == E_INVALIDARG && !agg,
+          "CreateAggregateDevice rejects multiple combined kind flags");
+    check(input->CreateAggregateDevice(0x80000000, &agg) == E_INVALIDARG && !agg,
+          "CreateAggregateDevice rejects unsupported kind flag");
+
+    check(input->CreateAggregateDevice(GameInputKindGamepad, &agg) == S_OK && agg != nullptr,
+          "CreateAggregateDevice creates an aggregate device for GameInputKindGamepad");
+    if (agg) {
+        const GameInputDeviceInfo* info = agg->GetDeviceInfo();
+        check(info && info->deviceFamily == GameInputFamilyAggregate,
+              "aggregate device reports GameInputFamilyAggregate");
+        check(info && info->supportedInput == GameInputKindGamepad,
+              "aggregate device reports supportedInput == GameInputKindGamepad");
+        check(agg->GetDeviceStatus() == GameInputDeviceConnected,
+              "aggregate device status is GameInputDeviceConnected");
+
+        IGameInputDevice* agg2 = nullptr;
+        check(input->CreateAggregateDevice(GameInputKindGamepad, &agg2) == S_OK && agg2 == agg,
+              "CreateAggregateDevice returns existing aggregate instance for the same kind");
+        if (agg2) agg2->Release();
+
+        // Reading test with no connected pad
+        IGameInputReading* r = nullptr;
+        check(input->GetCurrentReading(GameInputKindGamepad, agg, &r) == GAMEINPUT_E_READING_NOT_FOUND && !r,
+              "aggregate device returns READING_NOT_FOUND when no pads are connected");
+
+        // Attach a virtual pad and verify aggregate device yields readings from it
+        Pad xbox;
+        attach(xbox, "Leonida virtual Xbox pad", 0x045E, 0x0B12, true);
+        rt::gameinput::poll();
+
+        SDL_SetJoystickVirtualButton(xbox.js, SDL_GAMEPAD_BUTTON_SOUTH, true);
+        rt::gameinput::poll();
+
+        check(input->GetCurrentReading(GameInputKindGamepad, agg, &r) == S_OK && r != nullptr,
+              "aggregate device yields reading from connected pad");
+        if (r) {
+            check(buttons_of(r) == GameInputGamepadA, "aggregate device reading reflects pad input state");
+            r->Release();
+        }
+
+        SDL_SetJoystickVirtualButton(xbox.js, SDL_GAMEPAD_BUTTON_SOUTH, false);
+        rt::gameinput::poll();
+        IGameInputReading* r2 = nullptr;
+        check(input->GetCurrentReading(GameInputKindGamepad, agg, &r2) == S_OK && r2 != nullptr,
+              "aggregate device yields updated reading after button release");
+        if (r2) {
+            check(buttons_of(r2) == 0, "aggregate reading shows button released");
+            IGameInputReading* prev = nullptr;
+            check(input->GetPreviousReading(r2, GameInputKindGamepad, agg, &prev) == S_OK && prev != nullptr,
+                  "GetPreviousReading with aggregate device filter finds prior reading");
+            if (prev) {
+                check(buttons_of(prev) == GameInputGamepadA, "prior reading has pressed button");
+                prev->Release();
+            }
+            r2->Release();
+        }
+
+        detach(xbox);
+        rt::gameinput::poll();
+        agg->Release();
+    }
+}
+
 void test_twins(IGameInput* input) {
     Pad pads[3];
     IGameInputDevice* dev[3] = {};
@@ -965,6 +1168,8 @@ int main() {
 
     test_twins(input);
     test_keyboard_pad(input);
+    test_motion(input);
+    test_aggregate_device(input);
     input->Release();
 
     std::printf("%d checks, %d failures\n", g_checks, g_failures);

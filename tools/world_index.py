@@ -35,6 +35,7 @@ import stat
 import struct
 import sys
 import tempfile
+import unicodedata
 import zlib
 from contextlib import contextmanager
 
@@ -395,7 +396,11 @@ def scan_rpf(path, start=None, limit=None, max_inflate=CAP, collect=None):
 
 
 def _directory_files(path):
-    for root, _, files in os.walk(path):
+    def scan_failed(error: OSError) -> None:
+        raise error
+
+    # A partial walk must fail before the caller starts writing reports.
+    for root, _, files in os.walk(path, onerror=scan_failed):
         for name in sorted(files):
             yield os.path.join(root, name)
 
@@ -412,6 +417,15 @@ def _carve_successors(folder):
         return {}
     return {f"{off:012x}.bin": f"{(off + stored + 15) & ~15:012x}.bin"
             for off, stored in by_off.items() if (off + stored + 15) & ~15 in by_off}
+
+
+def _read_carved(path, max_inflate):
+    """Read a carved file within the cap, or return None if it is too large."""
+    with open(path, "rb") as f:
+        if os.fstat(f.fileno()).st_size > max_inflate:
+            return None
+        data = f.read(max_inflate + 1)  # detect growth after fstat
+    return data if len(data) <= max_inflate else None
 
 
 def scan_path(path, start=None, limit=None, max_inflate=CAP, collect=None, *, directory_files=None):
@@ -435,10 +449,9 @@ def scan_path(path, start=None, limit=None, max_inflate=CAP, collect=None, *, di
                 stats["files"] += 1
                 stats["scanned_bytes"] += sub["scanned_bytes"]
                 continue
-            if os.path.getsize(p) > max_inflate:
+            b = _read_carved(p, max_inflate)
+            if b is None:
                 continue
-            with open(p, "rb") as f:
-                b = f.read(max_inflate + 1)
             stats["files"] += 1
             stats["scanned_bytes"] += len(b)
             # As in scan_rpf: a 0DRPz resource that needs a continuation takes the next stream, when the
@@ -475,8 +488,9 @@ def scan_path(path, start=None, limit=None, max_inflate=CAP, collect=None, *, di
         magic = f.read(4)
     if magic == b"9FPR":
         return scan_rpf(path, start, limit, max_inflate, collect)
-    with open(path, "rb") as f:
-        b = f.read(max_inflate + 1)
+    b = _read_carved(path, max_inflate)
+    if b is None:
+        return [], {"path": os.path.abspath(path), "files": 0, "scanned_bytes": 0}
     row = parse_resource(b, collect)
     return ([dict(row, offset=0, size=len(b), file=os.path.basename(path))] if row else [],
             {"path": os.path.abspath(path), "files": 1, "scanned_bytes": len(b)})
@@ -592,9 +606,32 @@ def _resolve_report_path(path):
     return os.path.join(os.path.realpath(path), *reversed(missing))
 
 
+_PC_CASE_SENSITIVE = 11  # <sys/unistd.h> on macOS; os.pathconf_names doesn't list it
+
+
+def _case_insensitive_volume(path):
+    """True when the volume that will hold `path` ignores letter case, as macOS's default APFS volume does.
+    os.path.normcase folds case only on Windows, so on macOS `out/R.json` and `out/r.json` would pass as two
+    reports and the second write would replace the first."""
+    if sys.platform != "darwin":
+        return False
+    while not os.path.exists(path):
+        parent = os.path.dirname(path)
+        if parent == path:
+            break
+        path = parent
+    try:
+        return os.pathconf(path, _PC_CASE_SENSITIVE) == 0
+    except (OSError, ValueError):
+        return True  # the macOS default; folding can only refuse a pair, never overwrite one
+
+
 def _pending_path_key(path):
     path = os.path.normcase(_resolve_report_path(path))
     if os.name != "nt":
+        if _case_insensitive_volume(path):
+            # APFS and HFS+ also treat composed and decomposed accents as one name.
+            path = unicodedata.normalize("NFD", path.casefold())
         return path
 
     # Drive and UNC paths can also be spelled using the extended-length prefix.
@@ -714,7 +751,7 @@ def _write_reports(a, rows, stats, agg):
     summary["versions"] = sorted({r["version"] for r in rows})
     doc = {"summary": summary, "resources": rows}
     os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
-    with open(a.out, "w", encoding="utf-8") as f:
+    with open(a.out, "w", encoding="utf-8", newline="\n") as f:
         json.dump(doc, f, indent=1, sort_keys=True)
     if a.csv:
         cols = ["source", "offset", "size", "signature", "version", "kind", "structs", "enums", "blocks",
@@ -724,7 +761,7 @@ def _write_reports(a, rows, stats, agg):
                 "position_max", "lod", "lod_dist_min", "lod_dist_max"]
         os.makedirs(os.path.dirname(os.path.abspath(a.csv)), exist_ok=True)
         with open(a.csv, "w", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=cols, extrasaction="ignore")
+            w = csv.DictWriter(f, fieldnames=cols, extrasaction="ignore", lineterminator="\n")
             w.writeheader()
             for r in rows:
                 r = dict(r)
@@ -735,7 +772,7 @@ def _write_reports(a, rows, stats, agg):
                 w.writerow(r)
     if agg is not None:
         os.makedirs(os.path.dirname(os.path.abspath(a.archetypes_out)), exist_ok=True)
-        with open(a.archetypes_out, "w", encoding="utf-8") as f:
+        with open(a.archetypes_out, "w", encoding="utf-8", newline="\n") as f:
             json.dump(agg.to_json(), f, indent=1, sort_keys=True)
         summary["archetype_file"] = agg.to_json()["summary"]
     return summary

@@ -33,6 +33,7 @@ MEMORY = {BASE: 0x11223344, BASE + 4: 0xDEADBEEF, BASE + 8: 0xCAFEF00D, BASE + 1
 # V# FORMAT codes (word3 bits 12-18), from rdna2spirv.FORMATS
 FMT_U32, FMT_U32X2, FMT_U32X4, FMT_UINT8X4, FMT_UINT16X2, FMT_UINT16X4, FMT_F16 = 20, 62, 75, 60, 27, 69, 13
 FMT_F32, FMT_F32X2, FMT_F32X3, FMT_UNORM8, FMT_UNORM8X4 = 22, 64, 74, 1, 56
+FMT_UNORM16, FMT_SNORM16, FMT_UNORM16X2 = 7, 8, 23
 DST_SEL_XYZW = 4 | 5 << 3 | 6 << 6 | 7 << 9
 # DST_SEL (X, 0, 1, 1): code 4, 0, 1, 1 — SHADER-86 measures float 1.0 vs integer 1
 DST_SEL_X_0_1_1 = 4 | 0 << 3 | 1 << 6 | 1 << 9
@@ -150,9 +151,9 @@ class D16DestinationHalves(unittest.TestCase):
 
 
 class D16NormalizedRounding(unittest.TestCase):
-    """d16 narrows a normalized value to f16 with round to nearest even, like the d16 image results (#489; inferred
-    for the hardware, not measured). These bytes are among the about half of unorm8 values where round toward zero,
-    which PackHalf2x16 becomes on AMD drivers, gives 1 ulp less."""
+    """d16 narrows a normalized value to f16 with round to nearest even (#489; measured for typed buffer loads on an
+    RX 6700, BUILD-161). These bytes are among the about half of unorm8 values where round toward zero, which
+    PackHalf2x16 becomes on AMD drivers, gives 1 ulp less."""
 
     def test_unorm8_x(self):
         # byte 5 is 0xbe: 190/255 is 0x39f6 to nearest even, 0x39f5 toward zero
@@ -161,6 +162,40 @@ class D16NormalizedRounding(unittest.TestCase):
     def test_unorm8x4_xyzw(self):
         # bytes 4..7 are 0xef, 0xbe, 0xad, 0xde: 0x3b7f, 0x39f6, 0x396d, 0x3af7 (0x39f5 and 0x3af6 toward zero)
         self.assertEqual(load_format(FMT_UNORM8X4, 4, 4, d16=True)[:2], (0x39F63B7F, 0x3AF7396D))
+
+
+class D16NormalizedRoundsOnce(unittest.TestCase):
+    """BUILD-161, measured on an RX 6700 (gfx1031) with tools/d16_format_probe.py: d16 rounds the exact UNORM/SNORM
+    quotient once, straight to f16. The f32 decode followed by f16_bits rounds twice, which is 1 ulp high where the
+    f32 lands exactly on an f16 halfway point: UNORM16 0xffaf and 0xffef, SNORM16 0x7ff7 and 0x8009."""
+
+    def d16_x(self, fmt, half, op="buffer_load_format", mods=""):
+        return load_format(fmt, 0, 1, memory={BASE: half}, d16=True, op=op, mods=mods)[0]
+
+    def test_unorm16_and_snorm16_halfway_values(self):
+        for fmt, half, want in ((FMT_UNORM16, 0xFFEF, 0x3BFF), (FMT_UNORM16, 0xFFAF, 0x3BFD),
+                                (FMT_SNORM16, 0x7FF7, 0x3BFF), (FMT_SNORM16, 0x8009, 0xBBFF)):
+            with self.subTest(fmt=fmt, half=hex(half)):
+                self.assertEqual(self.d16_x(fmt, half), 0x12340000 | want)
+
+    def test_mtbuf_takes_the_same_rule(self):
+        self.assertEqual(self.d16_x(FMT_UNORM16, 0xFFEF, "tbuffer_load_format", " format:[BUF_FMT_16_UNORM]"),
+                         0x12343BFF)
+        self.assertEqual(self.d16_x(FMT_SNORM16, 0x8009, "tbuffer_load_format", " format:[BUF_FMT_16_SNORM]"),
+                         0x1234BBFF)
+
+    def test_neighbours_and_the_f32_result_are_unchanged(self):
+        self.assertEqual(self.d16_x(FMT_UNORM16, 0xFFEE), 0x12343BFF)      # 65518/65535: not a halfway f32
+        self.assertEqual(self.d16_x(FMT_UNORM16, 0xFFFF), 0x12343C00)
+        self.assertEqual(load_format(FMT_UNORM16, 0, 1, memory={BASE: 0xFFEF})[0], 0x3F7FF000)
+
+    def test_a_float_format_on_the_halfway_value_still_ties_to_even(self):
+        self.assertEqual(self.d16_x(FMT_F32, 0x3F7FF000), 0x12343C00)
+        self.assertEqual(self.d16_x(FMT_F32, 0xBF7FB000), 0x1234BBFE)
+
+    def test_both_halves_of_a_pair(self):
+        got = load_format(FMT_UNORM16X2, 0, 2, memory={BASE: 0xFFAF << 16 | 0xFFEF}, d16=True)[0]
+        self.assertEqual(got, 0x3BFD3BFF)
 
 
 class CrossingDwordBoundary(unittest.TestCase):

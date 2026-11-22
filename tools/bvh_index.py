@@ -37,6 +37,7 @@ import re
 import struct
 import sys
 import time
+import unicodedata
 import zlib
 
 ZHDR = re.compile(rb"\x78[\x01\x5e\x9c\xda]")
@@ -313,7 +314,7 @@ def scan_dir(path, max_inflate=1 << 28):
                 print(f"{p}: skipped ({e})", file=sys.stderr)
                 continue
             rows += r
-            summaries.append(s)
+            summaries.extend(s)
         return rows, summaries
     for p in sorted(glob.glob(os.path.join(path, "**", "*.bin"), recursive=True)):
         size = os.path.getsize(p)
@@ -350,7 +351,7 @@ def write_outputs(rows, summaries, out, csv_path):
     if out:
         _make_parent(out)
         payload = summaries if len(summaries) > 1 else (summaries[0] if summaries else {})
-        with open(out, "w", encoding="utf-8") as f:
+        with open(out, "w", encoding="utf-8", newline="\n") as f:
             json.dump({"summary": payload, "streams": rows}, f, indent=0)
     if csv_path:
         _make_parent(csv_path)
@@ -362,7 +363,7 @@ def write_outputs(rows, summaries, out, csv_path):
                 "compression_params", "dehydrated", "chunked", "bounds_min", "bounds_max",
                 "hash", "off_a0", "hi16", "lo16", "desc_word", "fragment"]
         with open(csv_path, "w", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=cols, extrasaction="ignore")
+            w = csv.DictWriter(f, fieldnames=cols, extrasaction="ignore", lineterminator="\n")
             w.writeheader()
             for r in rows:
                 r = dict(r)
@@ -394,8 +395,35 @@ def offset(text):
     return value
 
 
+_PC_CASE_SENSITIVE = 11  # <sys/unistd.h> on macOS; os.pathconf_names doesn't list it
+
+
+def _case_insensitive_volume(path):
+    """True when the volume that will hold `path` ignores letter case, as macOS's default APFS volume does.
+    os.path.normcase folds case only on Windows, so on macOS `R.json` and `r.json` would pass as two reports."""
+    if sys.platform != "darwin":
+        return False
+    while not os.path.exists(path):
+        parent = os.path.dirname(path)
+        if parent == path:
+            break
+        path = parent
+    try:
+        return os.pathconf(path, _PC_CASE_SENSITIVE) == 0
+    except (OSError, ValueError):
+        return True  # the macOS default; folding can only refuse a pair, never overwrite one
+
+
+def _path_key(path):
+    path = os.path.normcase(os.path.realpath(path))
+    if _case_insensitive_volume(path):
+        # APFS and HFS+ also treat composed and decomposed accents as one name.
+        path = unicodedata.normalize("NFD", path.casefold())
+    return path
+
+
 def same_output_path(first, second):
-    if os.path.normcase(os.path.realpath(first)) == os.path.normcase(os.path.realpath(second)):
+    if _path_key(first) == _path_key(second):
         return True
     try:
         return os.path.samefile(first, second)

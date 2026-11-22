@@ -6,6 +6,7 @@ const { test } = require('node:test');
 
 // Exercise the viewer's actual loading and streaming code without WebGL, a network or game data.
 const html = readFileSync(join(__dirname, '..', 'viewer', 'index.html'), 'utf8');
+const viewerModule = html.match(/<script type="module">([\s\S]*?)<\/script>/)[1].replace(/^import .*;$/gm, '');
 const worldBegin = html.indexOf('// ---------- world description ----------');
 const worldEnd = html.indexOf('// Deterministic test terrain:', worldBegin);
 assert(worldBegin >= 0 && worldEnd > worldBegin, 'viewer world description section must exist');
@@ -69,8 +70,21 @@ test('test mode, a missing manifest, and an unreadable manifest have distinct me
     assert.match(unreachable.reason, /could not be loaded/);
 });
 
+test('a WebGL startup error replaces the fly prompt and preserves the original error', async () => {
+    const error = new Error('Error creating WebGL context.');
+    const attributes = new Map();
+    const start = { textContent: 'Click to fly', style: {}, setAttribute: (name, value) => attributes.set(name, value) };
+    const startup = vm.runInNewContext(`(async () => { ${viewerModule} })()`, {
+        THREE: { WebGLRenderer: class { constructor() { throw error; } } },
+        document: { getElementById: id => { assert.equal(id, 'start'); return start; } },
+    });
+    await assert.rejects(startup, actual => actual === error);
+    assert.match(start.textContent, /Could not start WebGL/);
+    assert.equal(start.style.cursor, 'default');
+    assert.equal(attributes.get('role'), 'alert');
+});
+
 test('the bounds overlay creates helpers on the first G press and reuses them', async () => {
-    const viewerModule = html.match(/<script type="module">([\s\S]*?)<\/script>/)[1].replace(/^import .*;$/gm, '');
     const chunks = [worldChunk, { id: 'other', url: 'other.glb', bounds: [5, 6, 7, 8, 9, 10] }];
     const handlers = new Map();
     const boundsGroup = await vm.runInNewContext(`(async () => { ${viewerModule}\nreturn boundsGroup; })()`, {

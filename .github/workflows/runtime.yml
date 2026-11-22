@@ -107,7 +107,9 @@ jobs:
             }
           }
       # For the wine job: the test list, the checkout it was made in, and the built executables, DLLs and synthetic
-      # occlusion test shaders. There is no game data on the runner.
+      # test shaders: the occlusion ones the tests are given as arguments, and generated/*.spv (compiled from
+      # runtime/test/glsl), which tests open through the absolute paths compiled into them. There is no game data
+      # on the runner.
       - name: List tests for Wine
         shell: bash
         run: |
@@ -124,6 +126,7 @@ jobs:
             runtime/build/binary_occlusion.frag.spv
             runtime/build/overlapping_occlusion.vert.spv
             runtime/build/overlapping_occlusion.frag.spv
+            runtime/build/generated/*.spv
             runtime/build/ctest.json
             runtime/build/windows-root.txt
           retention-days: 7

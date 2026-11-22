@@ -317,7 +317,7 @@ def cmd_resolve(a):
     print(f"  total (joaat)    {len(resolved):6} of {len(keys)} keys ({100 * len(resolved) / max(1, len(keys)):.1f}%)")
     if a.out:
         try:
-            with open(a.out, "w", encoding="utf-8") as f:
+            with open(a.out, "w", encoding="utf-8", newline="\n") as f:
                 json.dump({"%08x" % k: sorted(x.decode("latin-1") for x in v) for k, v in sorted(resolved.items())},
                           f, indent=1)
         except OSError as e:
@@ -337,6 +337,8 @@ def main(argv=None):
     r.add_argument("--compose", type=int, default=0, metavar="N")
     r.add_argument("--out")
     a = ap.parse_args(argv)
+    if a.cmd == "resolve" and a.compose < 0:
+        r.error("--compose must be 0 or more")
     return {"collect": cmd_collect, "resolve": cmd_resolve}[a.cmd](a) or 0
 
 

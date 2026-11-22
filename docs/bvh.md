@@ -334,6 +334,52 @@ node. It now reads the slots of the node type and applies the remap byte. AMD GP
 (`CalcTriangleCompressionVertexIndices`, `SwizzleBarycentrics`) and the XDXR path agree on both. TRI1 nodes
 therefore traverse to the right triangle (docs/design.md, Ray tracing row; `tests/semantic/test_image_bvh_tri.py`).
 
+**GPU builder.** `runtime/src/xdxr_build.comp` with `xdxr_build.h` writes the same layout on the GPU, straight into
+the destination buffer:
+
+1. one thread per triangle (TRI0 leaves, remap `0x09`) or per instance (128-byte records, the world-to-object
+   inverse, the BLAS root and identity-rotation flag);
+2. a 30-bit Morton key of each box centre, then a stable sort: up to 1,024 keys in one workgroup's shared memory
+   (one dispatch), more with a radix sort of 8 passes of 4-bit digits over 256-element tiles (24 dispatches
+   whatever the count, no padding to a power of two);
+3. BOX32 nodes, built level by level from four consecutive sorted children, with the parent table and each
+   instance's `ParentNode`;
+4. the header.
+
+The tree's shape depends only on the element count. `XdxrLayout` therefore computes the result and scratch sizes
+exactly when the build is recorded, and the same numbers can answer `GetRaytracingAccelerationStructurePrebuildInfo`.
+A triangle with a NaN vertex gets an empty box (D3D12 treats it as inactive). So do an instance with mask 0, one with
+no BLAS and one with a singular transform. An instance record holds its BLAS address in 256-byte units in 32 bits,
+so BLAS addresses must be below 2^40, as console GPU addresses are. Where device addresses are wider (llvmpipe's are
+host pointers), the builder takes a bias that is added to the addresses read from instance descs.
+
+The Vulkan layer uses it for `BuildRaytracingAccelerationStructure` unless `LEONIDA_RT_AS=khr`
+(`docs/d3d12_vulkan.md` §4.8); `d3d12_xdxr_rt_test <dir>` builds a BLAS and a TLAS through the D3D12 API and writes
+them the same way.
+
+`vk_xdxr_build_test <dir>` builds nine synthetic cases on the GPU and writes each structure with a description of its
+scene. `xdxr_bvh.py check-build <dir>` validates them and traces rays against brute force. `ctest` runs both as
+`xdxr_build` and `xdxr_build_check`.
+
+**Updates** (D3D12 `PERFORM_UPDATE`) refit: the source structure is copied to the destination unless it is the
+destination, the elements are rewritten at their slots, and each node's boxes are recomputed bottom-up from the
+children it already points to. The tree is kept, so a refit is valid for any motion and skips the Morton pass and
+the sort. It takes 0.07 ms for 1,000 triangles and 9.8 ms for 1,000,000 on an RTX 2050, against 0.19 ms and 22 ms for
+a build, but the tree traverses more slowly as the geometry moves away from where it was built.
+
+**Copies and postbuild info.** `CopyRaytracingAccelerationStructure` with `CLONE` or `COMPACT` copies the
+structure's bytes. The records are position-independent: node pointers count from the structure's start, and a TLAS
+names its BLASes by address, which a clone keeps. The size comes from the source header (`totalSizeIn64BNodes`), so
+a copy can follow a build in the same command list, and it is bounded by the destination resource. A build is
+already exactly its layout's size, so `COMPACTED_SIZE` and `CURRENT_SIZE` (from
+`EmitRaytracingAccelerationStructurePostbuildInfo` or the postbuild descs of a build) are both
+`totalSizeIn64BNodes * 64`, and compaction saves nothing. Serialization, deserialization and the tools-visualization
+mode are refused at replay as unsupported, not faked. In `LEONIDA_RT_AS=khr` mode the postbuild descs stay ignored,
+as before.
+
+Not done yet: pairing triangles into TRI1 leaves, BOX16 nodes, serialization. A higher-quality build (SAH) would also
+come later.
+
 ```powershell
 python -I tools/xdxr_bvh.py selftest --seed 1 --rays 400   # build BLASes, compare closest hits with brute force
 python -I tools/xdxr_bvh.py validate <dumped BVH buffer>    # structural check of a runtime buffer

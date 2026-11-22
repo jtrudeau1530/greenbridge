@@ -487,7 +487,7 @@ def main(argv=None):
             report = json.dumps({"bindings": rows}, indent=2)
             if args.json:
                 try:
-                    with open(args.json, "w", encoding="utf-8") as out:
+                    with open(args.json, "w", encoding="utf-8", newline="\n") as out:
                         out.write(report + "\n")
                 except OSError as exc:
                     print(f"error: cannot write {args.json}: {exc.strerror or exc}", file=sys.stderr)
@@ -514,7 +514,7 @@ def main(argv=None):
         print(json.dumps(total, indent=1))
     if args.json:
         try:
-            with open(args.json, "w", encoding="utf-8") as fh:
+            with open(args.json, "w", encoding="utf-8", newline="\n") as fh:
                 json.dump({"totals": total, "pages": pages}, fh, indent=1)
         except OSError as exc:
             print(f"error: cannot write {args.json}: {exc.strerror or exc}", file=sys.stderr)

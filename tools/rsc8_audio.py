@@ -1498,7 +1498,7 @@ def write_report(path, records, summary):
     ext = os.path.splitext(path)[1].lower()
     if ext == ".csv":
         def _write_csv(f):
-            w = csv.writer(f)
+            w = csv.writer(f, lineterminator="\n")
             w.writerow(CSV_COLUMNS)
             for r in records:
                 row = []

@@ -354,8 +354,8 @@ Checks over the 17,507 containers:
   6 partly reached containers are partial: the 0x5a and 0x76 members point at `f32` and u32-hash blocks that
   nothing else reaches.
 
-These numbers cover layout only. What each struct means, and the names behind its hashes, are not decoded here
-(see *Hashes*).
+These numbers cover layout only. What each struct means is not decoded here. The engine names behind the schema
+hashes are covered under *Hashes*, and the resource names behind hash values under *Name hashes in the data*.
 
 ### Tool
 
@@ -370,12 +370,68 @@ pasted into an issue or a pull request. `tests/test_psin_data.py` builds contain
 every layout above, the end padding, a bad fill, pointers out of range, an unlisted enum value, a skipped type and
 the CLI.
 
+### Name hashes in the data
+
+Members of type `0x4a`, `0x4d` and `0x4b` hold a u32 hash and type `0x4f` a u64 hash. Many of these values name other
+resources: drawables, fragments and maps. They use the two rules that [world_names.md](world_names.md) found for
+placement maps:
+
+| Member type | Value |
+|---|---|
+| `0x4a`, `0x4d`, `0x4b` (u32) | joaat of the lower-cased name |
+| `0x4f` (u64) | low 64 bits of MurmurHash3 x64 128, seed 0, over the name's bytes |
+
+`tools/psin_names.py` walks every container with `psin_data.py`, collects each hash value with the struct and member
+that hold it, and looks it up in a dictionary of names you already have: `rpf9_names.py` JSON (the `.#dr`/`.#ft`/`.#dd`
+suffix dropped) or plain name lists. Each run also hashes every name with `#zq` appended, through the same rules. Those
+names cannot be right, so their matches show how many real matches chance alone would give.
+
+Measured on the 1.0.2.1 package (2026-11-22). The data was 18,640 `PSIN` streams carved whole from 11 archives, so the
+container counts differ slightly from those above. The dictionary was 341,954 distinct names from `rpf9_names.py` over
+the same archives with default options; 317,257 of them come from `levels.rpf`.
+
+| Archive | Containers | With a resolved name | u32 resolved | u32 control | u64 resolved | u64 control |
+|---|---:|---:|---:|---:|---:|---:|
+| `data.rpf` | 2,200 | 116 | 9,939 | 52 | 28,905 | 0 |
+| `levels.rpf` | 6,951 | 957 | 7,310 | 51 | 34,309 | 0 |
+| `packs.rpf` | 543 | 335 | 2,755 | 2 | 10,190 | 0 |
+| `script.rpf` | 1,012 | 31 | 189 | 0 | 0 | 0 |
+| `navmeshes.rpf` | 21 | 1 | 95 | 0 | 209 | 0 |
+| `anim.rpf` | 10 | 1 | 3 | 0 | 0 | 0 |
+| `story000.rpf` | 5,316 | 2,648 | 403 | 25 | 90,612 | 0 |
+| `story000_script.rpf` | 2,270 | 1,264 | 19,894 | 169 | 23,612 | 0 |
+| `shared_minigame000.rpf` | 73 | 2 | 2 | 0 | 0 | 0 |
+| `core_restofworld.rpf`, `story000_restofworld.rpf` | 8 | 0 | 0 | 0 | 0 | 0 |
+| **Total** | **18,404** | **5,355** | **40,590** | **299** | **187,837** | **0** |
+
+- **The u64 rule is general.** 187,837 of the 443,968 non-zero u64 hash values resolve, with no control match.
+  They are spread over 119 of the 223 u64 fields, so the MurmurHash3 keys are not specific to placement maps. The
+  other u64 fields match nothing in this dictionary.
+- **The u32 rule is precise in name fields.** 40,590 matches against 299 for the control, about 0.7% expected false.
+  122 of the 306 fields with a match have at least 20 resolved values and a control under 1% of them. Those fields
+  hold 227,504 of the 228,427 resolved values (u32 and u64 together), with no control match. The other 184 fields
+  mix a few real names with chance hits on non-name hashes.
+- **Coverage.** 5,355 of 18,404 containers (29%) reference at least one known resource, and 23,049 distinct names
+  occur. Only 5,495 of the matches are in the placement fields that `world_names.py` already resolves.
+- The remaining values are not names in the dictionary. They may be names of other kinds (sounds, animations,
+  scenarios), or resources whose own name string `rpf9_names.py` does not find.
+
+```text
+python -I tools/psin_names.py <PSIN file or carve directory> --names <rpf9_names.json> [--names ...]
+                              [--json] [--fields N] [--refs OUT.tsv] [--limit N]
+```
+
+The text output gives the totals and the fields with the most resolved values, as hashes. `--json` adds the whole
+field table. `--refs` writes one row per resolved value: file, struct, field, type, value and name. These are game names,
+so keep them in your local work folder; only the counts belong in git, issues or pull requests. On the data above the
+run takes about 50 s. `tests/test_psin_names.py` builds containers from invented names.
+
 ## What it does not give
 
 - No plaintext script code, function names or string table. `LSNS` has a decoded block layout, but its
   16-byte records are uniformly random and match no tested name hash (see *`LSNS`*).
-- No station/track names, no model names, no file paths. The archive TOC is still the only source
-  for original names.
+- No station/track names or file paths. Model names occur only as hashes; a name list from elsewhere resolves
+  them (see *Name hashes in the data*). The archive TOC is still the only source for original paths.
 - No names. `LSCH` and `LENM` give the schema as 32-bit name hashes only; resolving them needs a name
   list from elsewhere (see *Hashes*).
 
@@ -410,6 +466,21 @@ code 2). Leave it out to index every container.
 section, truncated data, trailing bytes and the JSON CLI, and the `LSCH`/`LENM` layouts, empty sections,
 a count that fits nothing and both schema checks. It uses synthetic headers and joaat hashes of invented names
 only.
+
+### Viewing a container in ImHex
+
+[tools/imhex/psin.hexpat](../tools/imhex/psin.hexpat) is a pattern for the [ImHex](https://imhex.werwolv.net/) hex
+editor that lays out one container as this page describes it:
+- the header, the instance-data block table with its `pppppppp` end, and the blocks, as raw bytes;
+- the section chain;
+- the `LSCH` struct headers and members, and the `LENM` enums and values, with the header count found by the same
+  fill-exact rule as `psin_index.py`;
+- the `LSNS` block table and its opaque 16-byte records;
+- the `LRSC` `0DRP` version and root block, and the `CHKS` file size.
+
+A section that runs past the end of a truncated stream is shown as raw bytes. `tests/test_imhex_patterns.py` builds a
+synthetic container, checks it with `psin_index.py` and `psin_data.block_table`, and when ImHex is installed compares
+the pattern's output with both.
 
 ## Limits
 

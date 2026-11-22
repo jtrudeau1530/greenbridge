@@ -1,7 +1,9 @@
 // D3D-97: cross-queue Wait-before-Signal must make progress. No game files.
 #include "../shims/d3d12_com.h"
 
+#include <cstdlib>
 #include <cstdio>
+#include <cstring>
 
 namespace {
 template<class T> struct Ref {
@@ -10,19 +12,35 @@ template<class T> struct Ref {
     T* operator->() const { return p; }
 };
 
-bool wait_for(ID3D12Fence* fence, UINT64 value) {
+bool wait_for(ID3D12Fence* fence, UINT64 value, DWORD timeout_ms = 3000) {
     HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     if (!event) return false;
-    const bool complete = SUCCEEDED(fence->SetEventOnCompletion(value, event)) &&
-                          WaitForSingleObject(event, 3000) == WAIT_OBJECT_0;
+    if (FAILED(fence->SetEventOnCompletion(value, event))) {
+        CloseHandle(event);  // no wait was registered
+        return false;
+    }
+    if (WaitForSingleObject(event, timeout_ms) != WAIT_OBJECT_0) {
+        // The fence dispatcher can still hold this event, and a queued GPU Wait can keep the queue destructor
+        // blocked forever. End the failed test without closing live handles or waiting for blocked queues.
+        std::fputs("cross-queue Wait-before-Signal timed out\n", stderr);
+        std::fflush(stderr);
+        std::_Exit(1);
+    }
     CloseHandle(event);
-    return complete;
+    return true;
 }
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
     Ref<ID3D12Device> device;
     if (FAILED(rt::d3d12::create_vulkan_device_standalone(IID_PPV_ARGS(&device.p)))) return 77;
+    if (argc == 2 && std::strcmp(argv[1], "--timeout-control") == 0) {
+        Ref<ID3D12Fence> never_signaled;
+        if (FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&never_signaled.p)))) return 1;
+        // Expected to leave the process with code 1 promptly, without destroying the pending event.
+        wait_for(never_signaled.p, 1, 20);
+        return 0;  // a completed wait here means the control did not exercise the timeout path
+    }
     D3D12_COMMAND_QUEUE_DESC desc{};
     Ref<ID3D12CommandQueue> copy, compute, direct_a, direct_b;
     desc.Type = D3D12_COMMAND_LIST_TYPE_COPY;
@@ -49,11 +67,11 @@ int main() {
     const bool copy_complete = submitted && wait_for(done_copy.p, 1);
     const bool direct_complete = submitted && wait_for(done_direct.p, 1);
     if (!copy_complete || !direct_complete) {
-        // Unblock submitted waits before queue destructors call vkQueueWaitIdle.
-        gate_copy->Signal(1);
-        gate_direct->Signal(1);
-        std::fprintf(stderr, "cross-queue Wait-before-Signal did not complete\n");
-        return 1;
+        // A failed submit can leave a GPU Wait pending. Gate 1 is not a valid fallback once queue signals
+        // have claimed 2, so do not destroy queues or fences while their work may still be outstanding.
+        std::fputs("cross-queue Wait-before-Signal did not complete\n", stderr);
+        std::fflush(stderr);
+        std::_Exit(1);
     }
     std::puts("copy/compute and direct/direct Wait-before-Signal completed");
     return 0;

@@ -119,7 +119,7 @@ def one(path, out, mcpu):
         FAILED.append((path, reason))
         return "failed"
     name = os.path.splitext(os.path.basename(path))[0]
-    with open(os.path.join(out, name + ".s"), "w", encoding="utf-8") as f:
+    with open(os.path.join(out, name + ".s"), "w", encoding="utf-8", newline="\n") as f:
         f.write(f"; {name}  code 0x{start:x}..0x{end:x} ({how}), {mcpu}, {bad} invalid words\n")
         f.write(asm)
         if err.strip():
@@ -147,7 +147,10 @@ def main():
         fail(f"no .fssm files in {a.src}")
     files = files[: a.limit] if a.limit else files
     out = a.out or os.path.join(os.path.dirname(files[0]), "..", "disasm")
-    os.makedirs(out, exist_ok=True)
+    try:
+        os.makedirs(out, exist_ok=True)
+    except OSError as e:
+        fail(f"cannot create the output folder {out}: {e.strerror or e}")
     probe(a.mcpu)
     from collections import Counter
     with ThreadPoolExecutor(a.jobs) as ex:

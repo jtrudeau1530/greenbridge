@@ -136,17 +136,47 @@ class RunTestTest(unittest.TestCase):
         self.assertEqual(status, "skip")
         self.assertIn("exit 77", detail)
 
-    def test_a_signal_termination_fails_even_under_will_fail_or_skip(self):
-        # A host signal is reported as a failure, not reinterpreted by WILL_FAIL or SKIP_RETURN_CODE.
+    def test_ctest_output_expressions_determine_the_result(self):
+        usage = {"PASS_REGULAR_EXPRESSION": ["alternative", "usage: gta6rt"]}
+        forbidden = {"FAIL_REGULAR_EXPRESSION": ["running ", r"module\(s\) mapped"]}
+        for code, output, props, expected in (
+            (2, "usage: gta6rt", usage | forbidden, "pass"),
+            (0, "unexpected output", usage, "fail"),
+            (2, "usage: gta6rt\n1 module(s) mapped", usage | forbidden, "fail"),
+            (0, "running tiny_game.exe", forbidden, "fail"),
+            (2, "unexpected output", forbidden, "fail"),
+            (77, "unexpected output", usage | {"SKIP_RETURN_CODE": 77}, "skip"),
+            (0, "running tiny_game.exe", forbidden | {"WILL_FAIL": True}, "pass"),
+        ):
+            with self.subTest(code=code, output=output, props=props):
+                exe = self.program("regex.py", f"import sys\nprint({output!r}, file=sys.stderr)\nsys.exit({code})\n")
+                status, detail = self.run_entry(ctest_entry("regex", self.command_for(exe), props))
+                self.assertEqual(status, expected, detail)
+
+    def test_a_scalar_output_expression_is_matched_as_one_pattern(self):
+        required = {"PASS_REGULAR_EXPRESSION": "usage: gta6rt"}
+        forbidden = {"FAIL_REGULAR_EXPRESSION": r"module\(s\) mapped"}
+        for code, output, props, expected in (
+            (3, "unexpected output", required, "fail"),
+            (2, "usage: gta6rt", required, "pass"),
+            (0, "unexpected output", forbidden, "pass"),
+            (0, "1 module(s) mapped", forbidden, "fail"),
+        ):
+            with self.subTest(output=output, props=props):
+                exe = self.program("regex.py", f"import sys\nprint({output!r})\nsys.exit({code})\n")
+                status, detail = self.run_entry(ctest_entry("regex", self.command_for(exe), props))
+                self.assertEqual(status, expected, detail)
+
+    def test_a_signal_termination_fails_even_with_success_overrides(self):
         # The mocked negative returncode keeps the test portable across Windows and POSIX.
         exe = self.exiting(0)
-        fake = mock.Mock(returncode=-11, stdout=b"")
-        entry = ctest_entry("segv", self.command_for(exe),
-                            {"WILL_FAIL": "1", "SKIP_RETURN_CODE": "77"})
-        with mock.patch.object(rwt.subprocess, "run", return_value=fake):
-            status, detail = self.run_entry(entry)
-        self.assertEqual(status, "fail")
-        self.assertIn("signal 11", detail)
+        fake = mock.Mock(returncode=-11, stdout=b"usage: gta6rt")
+        for props in ({"WILL_FAIL": True}, {"PASS_REGULAR_EXPRESSION": ["usage: gta6rt"]}):
+            with self.subTest(props=props), mock.patch.object(rwt.subprocess, "run", return_value=fake):
+                entry = ctest_entry("segv", self.command_for(exe), props | {"SKIP_RETURN_CODE": 77})
+                status, detail = self.run_entry(entry)
+                self.assertEqual(status, "fail")
+                self.assertIn("signal 11", detail)
 
     def test_a_timeout_is_reported_without_hanging(self):
         slow = self.program("slow.py", "import time\ntime.sleep(5)\n")
@@ -181,6 +211,70 @@ class RunTestTest(unittest.TestCase):
                          os.path.normcase(os.path.realpath(self.artifact / "sub")))
 
 
+@unittest.skipIf(os.name == "nt", "the runner and its dosdevices links are for Linux and macOS")
+class DriveMapTest(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        base = Path(self._tmp.name)
+        self.root = base / "checkout"
+        (self.root / "runtime" / "build" / "generated").mkdir(parents=True)
+        (self.root / "runtime" / "build" / "generated" / "cs.spv").write_text("spirv", encoding="utf-8")
+        self.prefix = base / "prefix"
+        (self.prefix / "dosdevices").mkdir(parents=True)
+        self.link = self.prefix / "dosdevices" / "d:"
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_the_drive_leads_to_the_checkout_and_is_removed_afterwards(self):
+        with rwt.DriveMap("D:/a/Leonida/Leonida", str(self.root), str(self.prefix)) as drive:
+            seen = self.link / "a" / "Leonida" / "Leonida" / "runtime" / "build" / "generated" / "cs.spv"
+            self.assertEqual(seen.read_text(encoding="utf-8"), "spirv")
+            self.assertIn("drive d: maps", drive.note)
+            scratch = drive.scratch
+        self.assertFalse(os.path.lexists(self.link))
+        self.assertFalse(os.path.exists(scratch))
+        self.assertTrue((self.root / "runtime" / "build" / "generated" / "cs.spv").is_file())   # links only
+
+    def test_backslashes_and_a_lower_case_drive_are_accepted(self):
+        with rwt.DriveMap("d:\\work\\leonida\\", str(self.root), str(self.prefix)):
+            self.assertTrue((self.link / "work" / "leonida" / "runtime" / "build").is_dir())
+
+    def test_a_drive_the_prefix_already_has_is_left_alone(self):
+        other = self.prefix / "elsewhere"
+        other.mkdir()
+        os.symlink(other, self.link)
+        with rwt.DriveMap("D:/a/Leonida/Leonida", str(self.root), str(self.prefix)) as drive:
+            self.assertIn("already set", drive.note)
+        self.assertEqual(os.readlink(self.link), str(other))
+
+    def test_no_prefix_or_no_drive_letter_maps_nothing(self):
+        with rwt.DriveMap("D:/a/b", str(self.root), str(self.prefix / "absent")) as drive:
+            self.assertIn("no Wine prefix", drive.note)
+        with rwt.DriveMap("/home/runner/work", str(self.root), str(self.prefix)) as drive:
+            self.assertIn("no drive letter", drive.note)
+        self.assertFalse(os.path.lexists(self.link))
+
+    def test_main_maps_the_drive_while_the_tests_run(self):
+        # The "Wine" here is the Python interpreter, so the program reads the drive through its dosdevices link, which
+        # is where Wine resolves D:/win/root/... too.
+        probe = self.root / "probe.py"
+        target = self.link / "win" / "root" / "runtime" / "build" / "generated" / "cs.spv"
+        probe.write_text(f"import sys\nsys.exit(0 if open({str(target)!r}).read() == 'spirv' else 1)\n", encoding="utf-8")
+        listing = self.root / "ctest.json"
+        listing.write_text(json.dumps({"tests": [ctest_entry("compiled_in_path", [WINDOWS_ROOT + "/probe.py"])]}),
+                           encoding="utf-8")
+        argv = ["run_wine_tests.py", "--tests", str(listing), "--windows-root", WINDOWS_ROOT,
+                "--root", str(self.root), "--wine", sys.executable.replace(os.sep, "/")]
+        out = io.StringIO()
+        with mock.patch.dict(os.environ, {"WINEPREFIX": str(self.prefix)}), mock.patch.object(sys, "argv", argv), \
+                contextlib.redirect_stdout(out):
+            code = rwt.main()
+        self.assertEqual(code, 0, out.getvalue())
+        self.assertIn("[PASS] compiled_in_path", out.getvalue())
+        self.assertFalse(os.path.lexists(self.link))
+
+
 class MainTest(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -189,6 +283,10 @@ class MainTest(unittest.TestCase):
         self.artifact.mkdir()
         for name, code in (("ok.py", 0), ("bad.py", 1)):
             (self.artifact / name).write_text(f"import sys\nsys.exit({code})\n", encoding="utf-8")
+        # main() maps the checkout's drive into $WINEPREFIX: keep it away from a real prefix (~/.wine).
+        env = mock.patch.dict(os.environ, {"WINEPREFIX": str(self.root / "no-prefix")})
+        env.start()
+        self.addCleanup(env.stop)
 
     def tearDown(self):
         self._tmp.cleanup()
@@ -239,6 +337,24 @@ class MainTest(unittest.TestCase):
         self.assertIn("### Windows tests under Wine 11", text)
         self.assertIn("| `ok` | pass | yes |", text)
         self.assertIn("| `bad` | fail |  |", text)
+
+    def test_a_summary_in_a_missing_folder_creates_it(self):
+        summary = self.root / "missing" / "sub" / "summary.md"
+        code, _, err = self.run_main([ctest_entry("ok", self.command("ok.py"))],
+                                     "--summary", str(summary), "--label", "Wine 12")
+        self.assertEqual(code, 0)
+        self.assertEqual(err, "")
+        self.assertIn("### Windows tests under Wine 12", summary.read_text(encoding="utf-8"))
+
+    def test_an_unwritable_summary_is_one_error_line(self):
+        blocker = self.root / "blocker"
+        blocker.write_text("not a folder", encoding="utf-8")
+        summary = blocker / "summary.md"       # its parent is a file, not a folder
+        code, _, err = self.run_main([ctest_entry("ok", self.command("ok.py"))], "--summary", str(summary))
+        self.assertEqual(code, 1)
+        self.assertNotIn("Traceback", err)
+        self.assertIn("ERROR: cannot write the summary", err)
+        self.assertEqual(len(err.strip().splitlines()), 1, err)
 
     def test_a_file_that_is_not_json_is_one_error_line(self):
         listing = self.root / "notes.txt"

@@ -30,7 +30,15 @@ What they check (`tools/rdna2spirv.py`, pixel shaders plus one compute shader):
   raw MUBUF rules (`cs_smem_bounds`, `cs_smem_stride_align`, `cs_smem_sload_neg`, `cs_buf_tail`).
 - `test_buffer_oob_select.py` runs 33 hand-tabulated MUBUF cases through the translator and the interpreter, loads
   and stores, each with a literal and a run-time V#: the first-byte bound of every OOB_SELECT mode (the RDNA2 rules of
-  docs/buffer_bounds.md, docs/design.md Buffer bounds checking), and that a literal RAW V# with ADD_TID/INDEX_STRIDE is Unsupported.
+  docs/buffer_bounds.md, docs/design.md Buffer bounds checking).
+- `test_buffer_swizzle.py` runs hand-worked MUBUF cases for swizzled V#s (SWIZZLE_ENABLE) and ADD_TID_ENABLE, the
+  RDNA2 ISA's swizzled buffer_offset and its OOB_SELECT 3 rule (docs/design.md Swizzled buffer addressing): the
+  exact addresses loaded and stored for dword, multi-dword and typed accesses, each with a literal and a run-time
+  V#, and the GPU fixture `cs_buf_swizzle` on 64 threads.
+- `test_tbuffer_store.py` runs the GPU test `cs_tbuffer_store` (13 `tbuffer_store_format_*` stores through V#s
+  whose format differs from the instruction's, or is 0) and asserts the 52 words `check.py` expects, measured natively on a
+  Radeon 680M; also the default `BUF_FMT_8_UNORM` byte, a format without an encoder staying `Unsupported`, and the
+  store's data VGPRs counting as reads.
 - `test_scalar_mem_smem.py` runs the code `Gen.scalar_load` emits with its own small evaluator (64-bit
   addresses, forward selection constructs) and asserts the SGPR values and the addresses read, including the
   measured SMEM truncation, `s_buffer_load` `NUM_RECORDS` bound and signed `s_load` immediate.
@@ -43,6 +51,9 @@ What they check (`tools/rdna2spirv.py`, pixel shaders plus one compute shader):
   and the population count and lowest lane of D, against the ISA's two lines written as integers. Results in the
   low half only, the high half only, both and neither are all in the table. It also runs the GPU test
   `cs_w64x_andn2_exec`.
+- `test_saveexec_b64.py` does the same for `s_and_saveexec_b64`, `s_or_saveexec_b64`, `s_andn2_saveexec_b64` and
+  `s_andn2_wrexec_b64` with S0 a compare result in VCC or in an SGPR pair (13 pairs of S0 and EXEC for each op and
+  source), and runs the GPU test `cs_w64x_saveexec_b64`.
 - `spirv_wave_interp.py` runs every invocation of one subgroup at once through structured control flow
   (split at a selection, rejoin at its merge, loops until no invocation is left) with the subgroup
   operations the translator emits. It is the SPIR-V side of `tools/cf_diff.py` (FUZZ-8);
@@ -78,6 +89,10 @@ What they check (`tools/rdna2spirv.py`, pixel shaders plus one compute shader):
   undefined in SPIR-V (`UndefinedResult`); a "lane mod 32" model of issue #94 gives the words a 32-wide GPU
   shows (all 24 matched on an RTX 4070 SUPER, driver 610.88, without `--wave64-emulate`). Two SPIR-V sabotages (readlane lane & 31, bpermute without its half base) must change the
   64-wide result.
+- `test_w64x_scalar_load_order.py` translates wave64 programs with `--wave64-emulate` and checks the emitted rounds:
+  no case of the round loop's switch reads or writes buffer memory after a write, or writes after a read, so a
+  `buffer_store` and a later `s_load` / `s_buffer_load` of the wave (and a scalar load and a later store) run in
+  different rounds (#1587). Loads alone share a round.
 - `test_wave64_subgroup_ops.py` runs eight more wave64 GPU tests the same way (`cs_w64x_ballot`,
   `_readfirstlane`, `_load_ballot_load`, `_partial`, `cs_wave64_ballot`, `cs_wm_bfm64`, `cs_wm_half_cmp`,
   `cs_wavemask`): on one 64-wide subgroup every word equals the GPU check; on two 32-wide subgroups the

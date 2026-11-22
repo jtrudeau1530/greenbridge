@@ -6,6 +6,7 @@
 #include "../src/resource_tiling.h"
 
 #include <cstdio>
+#include <tuple>
 
 #define CHECK(condition) do {                                        \
     if (!(condition)) {                                              \
@@ -176,10 +177,35 @@ int main() {
         }
     }
 
+    // 2D 4x MSAA: tile shape divides by 4 in texels, 1 mip only, unsupported sample counts fail.
+    for (const auto& ms : {std::tuple{1u, 128u, 128u, 4u}, std::tuple{2u, 128u, 64u, 8u},
+                           std::tuple{4u, 64u, 64u, 16u}, std::tuple{8u, 64u, 32u, 32u},
+                           std::tuple{16u, 32u, 32u, 64u}}) {
+        const auto [bytes, sw, sh, want_tiles] = ms;
+        CHECK(resource_tiling({TiledKind::texture2d, 256, 256, 1, 1, bytes, 1, 4}, t));
+        CHECK(t.shape.width == sw && t.shape.height == sh && t.shape.depth == 1 && t.total_tiles == want_tiles);
+    }
+    CHECK(resource_tiling({TiledKind::texture2d, 64, 64, 1, 1, 1, 1, 4}, t) && t.total_tiles == 1);
+    CHECK(!resource_tiling({TiledKind::texture2d, 256, 256, 1, 1, 4, 1, 2}, t));
+    CHECK(!resource_tiling({TiledKind::texture2d, 256, 256, 1, 1, 4, 1, 8}, t));
+    CHECK(!resource_tiling({TiledKind::texture2d, 256, 256, 1, 2, 4, 1, 4}, t));
+    CHECK(!resource_tiling({TiledKind::texture3d, 64, 64, 16, 1, 4, 1, 4}, t));
+
     // Element sizes that have no tile shape, and empty descriptions.
     CHECK(!resource_tiling({TiledKind::texture2d, 64, 64, 1, 1, 12, 1}, t));
     CHECK(!resource_tiling({TiledKind::texture2d, 64, 64, 1, 0, 4, 1}, t));
     CHECK(!resource_tiling({TiledKind::texture2d, 0, 64, 1, 1, 4, 1}, t));
+
+    // Overflows and shift edge cases must fail cleanly instead of wrapping or crashing.
+    // 2^25 * 2^25 * 2^14 = 2^64 wraps per_slice * layers to 0 in unchecked uint64_t arithmetic.
+    CHECK(!resource_tiling({TiledKind::texture2d, 1ULL << 31, 1u << 31, 16384, 1, 16, 1}, t));
+    // block * elements.width overflowing uint32_t must not produce shape.width == 0 (divide by zero).
+    CHECK(!resource_tiling({TiledKind::texture2d, 128, 128, 1, 1, 16, 1u << 26}, t));
+    // Buffer width near UINT64_MAX must not wrap in up().
+    CHECK(!resource_tiling({TiledKind::buffer, ~std::uint64_t{0}}, t));
+    // mip >= 32 must clamp height/depth to 1 without shifting uint32_t by >= 32.
+    CHECK(resource_tiling({TiledKind::texture2d, 1024, 1024, 1, 33, 4, 1}, t));
+    CHECK(t.standard_mips == 4 && t.packed_mips == 29 && t.packed_tiles == 1 && t.total_tiles == 86);
     std::printf("resource tiling: buffer, 2D, array, block-compressed and volume layouts match\n");
     return 0;
 }

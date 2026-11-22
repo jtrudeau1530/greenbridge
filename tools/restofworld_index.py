@@ -322,11 +322,11 @@ def summarise(rows, span, zero, unread):
 def write_output(path, rows, summary):
     """Write CSV or JSON from the file extension."""
     if os.path.splitext(path)[1].lower() == ".json":
-        with open(path, "w", encoding="utf-8") as f:
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
             json.dump({"summary": summary, "files": rows}, f, indent=1)
         return
     with open(path, "w", encoding="utf-8", newline="") as f:
-        writer = csv.writer(f)
+        writer = csv.writer(f, lineterminator="\n")
         writer.writerow(COLUMNS)
         for row in rows:
             writer.writerow([f"0x{row['offset']:x}" if i == 0 else ("" if row[c] is None else row[c])
