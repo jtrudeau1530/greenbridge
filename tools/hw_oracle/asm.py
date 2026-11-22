@@ -305,6 +305,17 @@ def ds_line(line, arch):
             raise ValueError(f"cannot swap the operands of {line!r}")
         dst, addr, cmp_, store, tail = m.groups()
         rest = f"{dst}, {addr}, {store}, {cmp_}{tail}"
+    elif op == "ds_cmpst_b32" and family(arch) == "gfx11":
+        # The non-returning form is renamed as well, and its two data operands swap the same way: GFX10's
+        # ds_cmpst_b32 vaddr, cmp, store is GFX11's ds_cmpstore_b32 vaddr, store, cmp (measured on gfx1100: with
+        # M = 7, vaddr = 0 and data v1 = 9, v2 = 7 the dword becomes 9, so the store operand is v1). The rename is
+        # done here rather than in DS_RENAMED_GFX11 because the swap is only measured on GFX11, and renaming
+        # without swapping on GFX12 would silently compare and store the wrong way round.
+        m = re.fullmatch(r"(v\d+),\s*(v\d+),\s*(v\d+)(.*)", rest)
+        if not m:
+            raise ValueError(f"cannot swap the operands of {line!r}")
+        addr, cmp_, store, tail = m.groups()
+        return f"ds_cmpstore_b32 {addr}, {store}, {cmp_}{tail}"
     return ds_mnemonic(op, arch) + sep + rest
 
 
