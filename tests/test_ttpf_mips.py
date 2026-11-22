@@ -284,6 +284,18 @@ class BcDecodeTest(unittest.TestCase):
         dark = ttpf.decode_pixels(71, struct.pack("<HHI", 0xFFFF, 0x0000, 0xFFFFFFFF), 1, 1)
         self.assertLess(dark[0][0], 100)
 
+    def test_bc3_colour_ignores_endpoint_order_but_bc1_does_not(self):
+        # Row selectors 0, 1, 2, 3 (0xE4); BC3 = alpha half + the same colour half.
+        for c0, c1, bc1_row, bc3_row in (
+                (0x0000, 0xFFFF, [0.0, 255.0, 127.5, 0.0], [0.0, 255.0, 85.0, 170.0]),
+                (0xFFFF, 0xFFFF, [255.0, 255.0, 255.0, 0.0], [255.0] * 4)):
+            colour = struct.pack("<HHI", c0, c1, 0xE4E4E4E4)
+            with self.subTest(c0=c0, c1=c1):
+                bc1 = ttpf.decode_pixels(71, colour, 1, 1)
+                bc3 = ttpf.decode_pixels(77, solid_bc4(255) + colour, 1, 1)
+                self.assertEqual([p[0] for p in bc1[:4]], bc1_row)
+                self.assertEqual([p[0] for p in bc3[:4]], bc3_row)
+
     def test_metric_rewards_the_true_downsample(self):
         parent = [(0.0, 0.0, 0.0), (255.0, 0.0, 0.0), (0.0, 255.0, 0.0), (0.0, 0.0, 255.0)]
         child = [(63.75, 63.75, 63.75)]
@@ -326,6 +338,49 @@ class BcDecodeTest(unittest.TestCase):
         self.assertEqual(clamped, [(200.0, 100.0, 50.0)])
         unclamped = ttpf.block_means(pixels, 1, 1)
         self.assertEqual(unclamped, [(50.0, 25.0, 12.5)])
+
+
+class Bc3CheckTest(unittest.TestCase):
+    def run_check(self, fmt, lower_colour):
+        import io
+        from contextlib import redirect_stdout
+        # Black then white, selector 3: the high-resolution image is uniform gray 170.
+        top_colour = struct.pack("<HHI", 0, 0xFFFF, 0xFFFFFFFF)
+        layout = ttpf.surface_layout(256, 256, fmt, 7, 4096)
+        payload = bytearray(layout["size"])
+        for mip in layout["mips"]:
+            colour = top_colour if mip["index"] == 0 else lower_colour
+            block = solid_bc4(255) + colour
+            retile_to(layout, mip, block * (mip["blocks_w"] * mip["blocks_h"]), payload)
+        record = pack_etpf_record(256, 256, 6, 1, fmt, 1, 1, 4, 4096, 0x103)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "bc3.ttpf")
+            write_rds5_pool(path, [record], [payload])
+            pool = ttpf.Pool(path)
+            buf = io.StringIO()
+            try:
+                with redirect_stdout(buf):
+                    code = ttpf.check(pool, 0)
+            finally:
+                pool.close()
+        return code, json.loads(buf.getvalue())
+
+    def test_gray_chain_passes_whatever_the_endpoint_order(self):
+        # Reversed endpoints with selector 2 describe the same gray as the top level.
+        gray = struct.pack("<HHI", 0xFFFF, 0, 0xAAAAAAAA)
+        for fmt in (77, 78):
+            with self.subTest(fmt=fmt):
+                code, result = self.run_check(fmt, gray)
+                self.assertEqual(code, 0, result)
+                self.assertEqual(result["chain_error"], [0.0] * 6)
+
+    def test_black_child_under_gray_top_fails(self):
+        black = struct.pack("<HHI", 0, 0, 0)
+        for fmt in (77, 78):
+            with self.subTest(fmt=fmt):
+                code, result = self.run_check(fmt, black)
+                self.assertEqual(code, 1, result)
+                self.assertEqual(result["chain_error"], [170.0, 0.0, 0.0, 0.0, 0.0, 0.0])
 
 
 class SyntheticPoolTest(unittest.TestCase):
@@ -615,6 +670,181 @@ class SyntheticBcpackPoolTest(unittest.TestCase):
         with redirect_stdout(buf2):
             code_prov = ttpf.check(pool, 0, allow_provisional=True)
         self.assertEqual(code_prov, 0, buf2.getvalue())
+
+    def test_bc7_bcpack_pool_export_and_scan(self):
+        import io
+        from contextlib import redirect_stdout
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import test_bcpack as tb
+
+        # 64x64 DXGI 98 (BC7_UNORM, 16-byte blocks), 1 mip, 4 KiB tiles, codec 7.
+        layout = ttpf.surface_layout(64, 64, 98, 1, ttpf.tile_bytes(4))
+        mip = layout["mips"][0]
+        nblocks = mip["blocks_w"] * mip["blocks_h"]
+        # Solid mode-6 BC7 blocks with distinct per-block endpoints.
+        linear = bytearray()
+        for i in range(nblocks):
+            r0 = (i * 5) & 0x7F
+            g0 = (i * 3 + 17) & 0x7F
+            b0 = (i * 7 + 31) & 0x7F
+            acc = (1 << 6) | (r0 << 7) | (r0 << 14) | (g0 << 21) | (g0 << 28) | (b0 << 35) | (b0 << 42)
+            acc |= (0x7F << 49) | (0x7F << 56) | (1 << 63) | (1 << 64)
+            linear += acc.to_bytes(16, "little")
+        payload = bytearray(layout["size"])
+        retile_to(layout, mip, bytes(linear), payload)
+        # Fill any unused tail padding blocks in the tile with mode-6 blocks too.
+        mode6_pad = (1 << 6).to_bytes(16, "little")
+        for off in range(0, len(payload), 16):
+            if payload[off:off + 16] == b"\x00" * 16:
+                payload[off:off + 16] = mode6_pad
+        packed_payload = tb.encode_bc7_mode6_blocks(bytes(payload))
+
+        path = os.path.join(self.tmp.name, "bc7_bcpack.ttpf")
+        pad = (-len(packed_payload)) % 256
+        count = 3
+        table_end = 24 + (count - 1) * 8
+        etpf = ttpf.align(table_end, 256)
+        padded = ttpf.align(16 + 24 + 32, 4096)
+        source = etpf + padded
+        chunk_end = source + len(packed_payload) + pad
+        virt = padded
+        vsize = virt + layout["size"]
+        entry = (source // 256) | (7 << 26) | ((virt // 4096) << 30) | (pad << 52)
+        sentinel = (chunk_end // 256) | ((vsize // 4096) << 30)
+        header = bytearray(24)
+        header[0:4] = b"RDS5"
+        struct.pack_into("<I", header, 4, count)
+        struct.pack_into("<Q", header, 8, vsize | (22 << 56))
+        struct.pack_into("<I", header, 16, (count + 31) // 32)
+        a = (64 - 1) | ((64 - 1) << 14) | (0 << 28)
+        b = 1 | (98 << 3) | (1 << 21) | (4 << 23)
+        c = (virt // 4096) | (0x103 << 21)
+        record = struct.pack("<IIII", a, b, c, 0) + struct.pack("<Q", 0xCAFEBABE87654321)
+        blob = bytearray(chunk_end)
+        blob[0:24] = header
+        struct.pack_into("<QQ", blob, 24, entry, sentinel)
+        blob[etpf:etpf + 4] = b"ETPF"
+        struct.pack_into("<III", blob, etpf + 4, 634, 1, 24)
+        blob[etpf + 16:etpf + 16 + 24] = record
+        blob[source:source + len(packed_payload)] = packed_payload
+        with open(path, "wb") as f:
+            f.write(blob)
+
+        pool = ttpf.Pool(path)
+        self.addCleanup(pool.close)
+        a_info = ttpf.analyze(pool, 0)
+        self.assertTrue(a_info["full_chain"])
+        self.assertEqual(a_info["mip_codecs"][0], [7])
+
+        out_dds = os.path.join(self.tmp.name, "bc7_bcpack.dds")
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(ttpf.export(pool, 0, out_dds), 0)
+        with open(out_dds, "rb") as f:
+            dds = f.read()
+        self.assertEqual(dds[:4], b"DDS ")
+        self.assertEqual(struct.unpack_from("<I", dds, 128)[0], 98)
+        self.assertEqual(dds[148:], bytes(linear))
+
+        scan_out = os.path.join(self.tmp.name, "scan_bc7.json")
+        with redirect_stdout(io.StringIO()):
+            ttpf.scan_pools([path], scan_out)
+        with open(scan_out, encoding="utf-8") as f:
+            total = json.load(f)["total"]
+        self.assertEqual((total["after_bcpack_full"], total["after_bcpack_skip"],
+                          total["bcpack_unlocked_full"]), (1, 0, 1))
+
+    def test_bc7_bcpack_external_history_cli(self):
+        import io
+        from contextlib import redirect_stderr, redirect_stdout
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import test_bcpack as tb
+
+        layout = ttpf.surface_layout(64, 64, 98, 1, ttpf.tile_bytes(4))
+        mip = layout["mips"][0]
+        nblocks = mip["blocks_w"] * mip["blocks_h"]
+        linear = bytearray()
+        for i in range(nblocks):
+            r0 = (i * 5 + 11) & 0x7F
+            g0 = (i * 3 + 23) & 0x7F
+            b0 = (i * 7 + 41) & 0x7F
+            acc = (1 << 6) | (r0 << 7) | (r0 << 14) | (g0 << 21) | (g0 << 28) | (b0 << 35) | (b0 << 42)
+            acc |= (0x7F << 49) | (0x7F << 56) | (1 << 63) | (1 << 64)
+            linear += acc.to_bytes(16, "little")
+        payload = bytearray(layout["size"])
+        retile_to(layout, mip, bytes(linear), payload)
+        mode6_pad = (1 << 6).to_bytes(16, "little")
+        for off in range(0, len(payload), 16):
+            if payload[off:off + 16] == b"\x00" * 16:
+                payload[off:off + 16] = mode6_pad
+
+        hist_k = 19
+        ep_row = [0x45, 0x22 << 1, 0x33 << 1, 0x7F << 1, 0x45, 0x22 << 1, 0x33 << 1, 0x7F << 1] * 3
+        packed_payload = tb.encode_bc7_mode6_blocks(bytes(payload), first_ep_history=(hist_k, ep_row))
+
+        path = os.path.join(self.tmp.name, "bc7_hist.ttpf")
+        pad = (-len(packed_payload)) % 256
+        count = 3
+        etpf = ttpf.align(24 + (count - 1) * 8, 256)
+        padded = ttpf.align(16 + 24 + 32, 4096)
+        source = etpf + padded
+        chunk_end = source + len(packed_payload) + pad
+        virt = padded
+        vsize = virt + layout["size"]
+        entry = (source // 256) | (7 << 26) | ((virt // 4096) << 30) | (pad << 52)
+        sentinel = (chunk_end // 256) | ((vsize // 4096) << 30)
+        header = bytearray(24)
+        header[0:4] = b"RDS5"
+        struct.pack_into("<I", header, 4, count)
+        struct.pack_into("<Q", header, 8, vsize | (22 << 56))
+        struct.pack_into("<I", header, 16, (count + 31) // 32)
+        a = (64 - 1) | ((64 - 1) << 14) | (0 << 28)
+        b = 1 | (98 << 3) | (1 << 21) | (4 << 23)
+        c = (virt // 4096) | (0x103 << 21)
+        record = struct.pack("<IIII", a, b, c, 0) + struct.pack("<Q", 0xCAFEBABE11223344)
+        blob = bytearray(chunk_end)
+        blob[0:24] = header
+        struct.pack_into("<QQ", blob, 24, entry, sentinel)
+        blob[etpf:etpf + 4] = b"ETPF"
+        struct.pack_into("<III", blob, etpf + 4, 634, 1, 24)
+        blob[etpf + 16:etpf + 16 + 24] = record
+        blob[source:source + len(packed_payload)] = packed_payload
+        with open(path, "wb") as f:
+            f.write(blob)
+
+        hist_json = os.path.join(self.tmp.name, "bc7_history.json")
+        with open(hist_json, "w", encoding="utf-8") as f:
+            json.dump({
+                "bc7": {
+                    "historyEndpoints": {str(hist_k): ep_row},
+                    "historyEndpointBits": {str(hist_k): [8] * 24},
+                    "historyEndpointConfirmedBits": {str(hist_k): [8] * 24},
+                }
+            }, f)
+
+        out_dds = os.path.join(self.tmp.name, "bc7_hist.dds")
+        # Without --history: cleanly refuses with exit 2 and --history hint.
+        err = io.StringIO()
+        with redirect_stdout(io.StringIO()), redirect_stderr(err):
+            rc_no_hist = ttpf.main(["export", path, "0", out_dds])
+        self.assertEqual(rc_no_hist, 2)
+        self.assertIn("--history", err.getvalue())
+        self.assertFalse(os.path.exists(out_dds))
+
+        # With --history: strict export succeeds and matches exact linear blocks.
+        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            rc_ok = ttpf.main(["export", path, "0", out_dds, "--history", hist_json])
+        self.assertEqual(rc_ok, 0)
+        with open(out_dds, "rb") as f:
+            dds = f.read()
+        self.assertEqual(dds[148:], bytes(linear))
+
+        # Missing --history path: clean exit 2, no traceback.
+        err_missing = io.StringIO()
+        missing = os.path.join(self.tmp.name, "nope.json")
+        with redirect_stdout(io.StringIO()), redirect_stderr(err_missing):
+            rc_bad = ttpf.main(["export", path, "0", out_dds, "--history", missing])
+        self.assertEqual(rc_bad, 2)
+        self.assertNotIn("Traceback", err_missing.getvalue())
 
 
 class BadPoolTest(unittest.TestCase):

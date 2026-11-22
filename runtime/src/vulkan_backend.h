@@ -143,6 +143,13 @@ public:
         bindless_prepare_ = std::move(prepare);
     }
 
+    // Called after that command buffer's submit: true when it was accepted, false when vkQueueSubmit failed. The
+    // set keeps its upload pending in the second case, because the copy never reached the GPU.
+    void set_bindless_commit(std::function<void(bool)> commit) {
+        std::lock_guard lock(mutex_);
+        bindless_commit_ = std::move(commit);
+    }
+
     VulkanDeviceFunctions vk;
 
     // Vulkan requires external synchronisation of a VkQueue; every D3D12 queue of the device may share one.
@@ -185,6 +192,7 @@ private:
     LayoutTracker tracker_;
     std::map<std::tuple<VkImage, VkImageAspectFlags, std::uint32_t, std::uint32_t, std::uint32_t, VkFormat>, VkImageView> views_;
     std::function<bool(VkCommandBuffer)> bindless_prepare_;
+    std::function<void(bool)> bindless_commit_;
     ReplayFunctions replay_;
 };
 
@@ -286,7 +294,8 @@ public:
         if (context_.bindless_prepare_ && !context_.bindless_prepare_(command_buffer)) {
             // The command buffer holds at most what the set recorded for itself; submit it so the buffer is reused.
             context_.vk.vkEndCommandBuffer(command_buffer);
-            submit(command_buffer, VK_NULL_HANDLE, 0);
+            const bool submitted = submit(command_buffer, VK_NULL_HANDLE, 0);
+            if (context_.bindless_commit_) context_.bindless_commit_(submitted);
             return ReplayResult::unsupported;
         }
         for (const auto& list : prepared) emit(list, command_buffer, context_.replay_, &context_.tracker_);
@@ -298,7 +307,9 @@ public:
         context_.vk.vkCmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_HOST_BIT,
                                          0, 1, &host, 0, nullptr, 0, nullptr);
         context_.vk.vkEndCommandBuffer(command_buffer);
-        return submit(command_buffer, VK_NULL_HANDLE, 0) ? ReplayResult::success : ReplayResult::unsupported;
+        const bool submitted = submit(command_buffer, VK_NULL_HANDLE, 0);
+        if (context_.bindless_commit_) context_.bindless_commit_(submitted);
+        return submitted ? ReplayResult::success : ReplayResult::unsupported;
     }
 
     // ID3D12CommandQueue::Signal: the fence reaches `value` after all work submitted so far.
