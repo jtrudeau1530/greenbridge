@@ -465,7 +465,7 @@ class Gen:
         # 64 used as f32 operands (@Sanonymous01, SHADER-298). The f16 operands widen to normal f32 values.
         return [self.f16_in(src, sb[i]) if hb[i] else self.flush_f32(self.src_f(src)) for i, src in enumerate(a[1:4])]
 
-    def f16_bits(self, f, rtz=False):
+    def f16_bits(self, f, rtz=False, exact_tiny=False):
         """f32 ``f`` -> f16 bits in the low 16 bits of a %uint, computed with integer ops only (SHADER-56).
 
         GLSL.std.450 PackHalf2x16 leaves the rounding mode to the implementation, and drivers fold a
@@ -474,7 +474,9 @@ class Gen:
         ``rtz=False``: round to nearest even, |x| >= 65520 -> inf (v_cvt_f16_f32 and every f16 ALU result).
         ``rtz=True``: round toward zero, finite values above the range -> +-65504 (v_cvt_pkrtz_f16_f32).
         f16 denormals are produced (RDNA2's default FP16 denorm mode keeps them); f32 denormal inputs give +-0.
-        NaN -> quiet NaN with the top payload bits kept; +-inf -> +-inf."""
+        NaN -> quiet NaN with the top payload bits kept; +-inf -> +-inf.
+        ``exact_tiny``: the caller guarantees that every ``f`` below 2^-14 in magnitude is already an f16 value (a
+        sum of two f16 values, without omod: a multiple of 2^-24), so that range needs no rounding or underflow."""
         t = self.tmp
         x, sgn, sg, a = t(), t(), t(), t()
         self.emit(f"{x} = OpBitcast %uint {f}")
@@ -501,7 +503,7 @@ class Gen:
         self.emit(f"{short} = OpULessThan %bool {sh} {self.cu(25)}")
         self.emit(f"{shc} = OpSelect %uint {short} {sh} {self.cu(25)}")
         self.emit(f"{sub} = OpShiftRightLogical %uint {man} {shc}")
-        if not rtz:
+        if not rtz and not exact_tiny:
             one, msk, rem, half, odd, gt, eq, tie, up, upu, sub2 = (t() for _ in range(11))
             self.emit(f"{one} = OpShiftLeftLogical %uint {self.cu(1)} {shc}")
             self.emit(f"{msk} = OpISub %uint {one} {self.cu(1)}")
@@ -518,18 +520,25 @@ class Gen:
         # pick the range
         isn, issub, tiny, big, isinf, isnan = t(), t(), t(), t(), t(), t()
         self.emit(f"{isn} = OpUGreaterThanEqual %bool {a} {self.cu(0x38800000)}")
-        self.emit(f"{tiny} = OpULessThan %bool {e} {self.cu(101)}")
+        if not exact_tiny:
+            self.emit(f"{tiny} = OpULessThan %bool {e} {self.cu(101)}")
         r1, r2, r3, r4, r5, nanb, res = t(), t(), t(), t(), t(), t(), t()
         self.emit(f"{r1} = OpSelect %uint {isn} {nh} {sub}")
-        self.emit(f"{r2} = OpSelect %uint {tiny} {self.cu(0)} {r1}")
+        if exact_tiny:
+            r2 = r1     # zero shifts out through shc = 25
+        else:
+            self.emit(f"{r2} = OpSelect %uint {tiny} {self.cu(0)} {r1}")
         if rtz:
             self.emit(f"{big} = OpUGreaterThanEqual %bool {a} {self.cu(0x47800000)}")
             self.emit(f"{r3} = OpSelect %uint {big} {self.cu(0x7BFF)} {r2}")
         else:
             self.emit(f"{big} = OpUGreaterThanEqual %bool {a} {self.cu(0x477FF000)}")
             self.emit(f"{r3} = OpSelect %uint {big} {self.cu(0x7C00)} {r2}")
-        self.emit(f"{isinf} = OpIEqual %bool {a} {self.cu(0x7F800000)}")
-        self.emit(f"{r4} = OpSelect %uint {isinf} {self.cu(0x7C00)} {r3}")
+        if rtz:
+            self.emit(f"{isinf} = OpIEqual %bool {a} {self.cu(0x7F800000)}")
+            self.emit(f"{r4} = OpSelect %uint {isinf} {self.cu(0x7C00)} {r3}")
+        else:
+            r4 = r3     # inf is >= 65520, so the overflow select already gave 0x7C00
         pay = t()
         self.emit(f"{pay} = OpShiftRightLogical %uint {a} {self.cu(13)}")
         self.emit(f"{nanb} = OpBitwiseOr %uint {self.emit_and(pay, 0x3FF)} {self.cu(0x7E00)}")
@@ -543,15 +552,15 @@ class Gen:
         self.emit(f"{r} = OpBitwiseAnd %uint {v} {self.cu(k)}")
         return r
 
-    def f16_res(self, f):
+    def f16_res(self, f, exact_tiny=False):
         """f32 ``f`` -> f16 bits (low 16) as a VALU f16 result rounds it: to nearest even (f16_bits), or, when the
         program writes MODE.FP_ROUND[3:2], by the current mode in %mode_r16 (0 nearest even, 3 toward zero with
         f16_bits(rtz=True); 1 and 2 are refused when the setreg is translated). Shaders that never write the field
         get exactly f16_bits. Integer ops only either way (SHADER-56)."""
-        lo = self.f16_bits(f)
+        lo = self.f16_bits(f, exact_tiny=exact_tiny)
         if not self.round_mode:
             return lo
-        z, m, is_z, r = self.f16_bits(f, rtz=True), self.tmp(), self.tmp(), self.tmp()
+        z, m, is_z, r = self.f16_bits(f, rtz=True, exact_tiny=exact_tiny), self.tmp(), self.tmp(), self.tmp()
         self.emit(f"{m} = OpLoad %uint %mode_r16")
         self.emit(f"{is_z} = OpIEqual %bool {m} {self.cu(3)}")
         self.emit(f"{r} = OpSelect %uint {is_z} {z} {lo}")
@@ -855,19 +864,19 @@ class Gen:
         self.emit(f"{r} = OpLogicalAnd %bool {a} {b}")
         return r
 
-    def f16_pack2(self, lo, hi):
+    def f16_pack2(self, lo, hi, exact_tiny=False):
         """Two f32 values -> one %uint of two f16 halves (lo | hi << 16), each rounded as f16_res, without PackHalf2x16."""
-        a, b, sh, r = self.f16_res(lo), self.f16_res(hi), self.tmp(), self.tmp()
+        a, b, sh, r = self.f16_res(lo, exact_tiny), self.f16_res(hi, exact_tiny), self.tmp(), self.tmp()
         self.emit(f"{sh} = OpShiftLeftLogical %uint {b} {self.cu(16)}")
         self.emit(f"{r} = OpBitwiseOr %uint {a} {sh}")
         return r
 
-    def f16_out(self, d, r, hi=0, fract=False, mode=True):
+    def f16_out(self, d, r, hi=0, fract=False, mode=True, exact_tiny=False):
         """Narrow f32 ``r`` to f16 (f16_res: nearest even, or toward zero under MODE) and write it to the low half of ``d``, or to the high half when
         ``hi`` (op_sel destination bit). Either way the other half is kept (see write_lo16).
         ``fract`` (v_fract_f16): a result that rounded up to 1.0 (0x3c00) becomes 0x3bff, the largest f16 below 1,
         as on hardware (docs/design.md, float min/max/med3 with NaN and v_fract)."""
-        lo = self.f16_res(r) if mode else self.f16_bits(r)     # mode=False: the op ignores MODE rounding (rcp/rsq/sqrt)
+        lo = self.f16_res(r, exact_tiny) if mode else self.f16_bits(r)     # mode=False: the op ignores MODE rounding (rcp/rsq/sqrt)
         if fract:
             one, below = self.tmp(), self.tmp()
             self.emit(f"{one} = OpIEqual %bool {lo} {self.cu(0x3C00)}")
@@ -5727,7 +5736,7 @@ class Gen:
             c0, c1 = self.tmp(), self.tmp()
             self.emit(f"{c0} = OpCompositeExtract %float {r} 0")
             self.emit(f"{c1} = OpCompositeExtract %float {r} 1")
-            self.emit(f"{p} = OpCopyObject %uint {self.f16_pack2(c0, c1)}")
+            self.emit(f"{p} = OpCopyObject %uint {self.f16_pack2(c0, c1, exact_tiny=op == 'v_pk_add_f16')}")
             self.dst(a[0], p)
         elif op in ("s_movrels_b32", "s_movrels_b64"):
             # Relative SGPR read through M0 (RDNA2 ISA SOP1): D = SGPR[S0 + M0] (the b64 form reads the pair at
@@ -6058,7 +6067,9 @@ class Gen:
             else:
                 self.emit(f"{r} = OpExtInst %float %glsl {'NMax' if 'max' in op else 'NMin'} {vals[0]} {vals[1]}")
             r = self.clamp_mods(r, mods)
-            self.f16_out(a[0], r, dhi)  # GFX10: f16 ops keep the other half
+            # an f16 sum is exact below 2^-14; clamp keeps that, omod (div:2) doesn't
+            exact = k in ("OpFAdd", "OpFSub") and not any(m.startswith(("mul:", "div:")) for m in mods)
+            self.f16_out(a[0], r, dhi, exact_tiny=exact)  # GFX10: f16 ops keep the other half
         elif op.startswith(("v_cmp_", "v_cmpx_")) and op.endswith(("_u64", "_i64")) and op.split("_")[2] in ("eq", "ne", "lg"):
             # 64-bit equality compare: both halves of the register pairs. GFX10 v_cmpx has no destination operand:
             # it writes EXEC only (inactive lanes stay inactive).
