@@ -691,6 +691,125 @@ class SIMDVALUInterpreter:
         return self.execute(ast)
 
 
+# --- Mutated Oracles for Mutation Testing and Negative Controls ---
+
+def mutant_exponent_off_by_one(src0: int) -> int:
+    """Mutant A: uses biased exponent 1023 ([1.0, 2.0)) instead of 1022 ([0.5, 1.0))."""
+    res = ref_frexp_mant_f64(src0)
+    if is_zero_f64(res) or is_nan_f64(res) or is_inf_f64(res):
+        return res
+    # Force exponent 1023
+    sign = res & SIGN_MASK_F64
+    mant = res & MANT_MASK_F64
+    return sign | (1023 << 52) | mant
+
+
+def mutant_no_subnormal_normalization(src0: int) -> int:
+    """Mutant B: skips normalization of subnormal mantissa."""
+    src0 &= MASK64
+    exp_field = (src0 >> 52) & 0x7FF
+    if exp_field == 0 and (src0 & MANT_MASK_F64) != 0:
+        # Erroneously uses raw mantissa without shifting
+        return (src0 & SIGN_MASK_F64) | (FREXP_EXP_F64 << 52) | (src0 & MANT_MASK_F64)
+    return ref_frexp_mant_f64(src0)
+
+
+def mutant_no_clamp(src0: int) -> int:
+    """Mutant C: ignores clamp modifier."""
+    return ref_frexp_mant_f64(src0, clamp=False)
+
+
+def mutant_leak_vcc(interp: ScalarVALUInterpreter, ast: InstructionAST) -> None:
+    """Mutant D: corrupts VCC register during VALU FP execution."""
+    interp.execute(ast)
+    interp.vcc ^= 0x1
+
+
+def mutant_exec_leak(sim: SIMDVALUInterpreter, ast: InstructionAST) -> None:
+    """Mutant E: writes inactive lanes under EXEC mask."""
+    sim.execute(ast)
+    sim.set_vgpr_u64(ast.dst.reg_index, 0, 0x1234567890ABCDEF)
+
+
+class TestValuFrexpMantF64NegativeControlsAndMutations(unittest.TestCase):
+    """Negative controls, syntax rejection, and mutation detection for v_frexp_mant_f64."""
+
+    def test_syntax_rejection_invalid_opcode(self):
+        with self.assertRaises(ValueError):
+            parse_vop_frexp_mant_f64("v_add_f64 v[0:1], v[2:3]")
+
+    def test_syntax_rejection_insufficient_operands(self):
+        with self.assertRaises(ValueError):
+            parse_vop_frexp_mant_f64("v_frexp_mant_f64 v[0:1]")
+
+    def test_syntax_rejection_non_contiguous_dst(self):
+        with self.assertRaises(ValueError):
+            parse_vop_frexp_mant_f64("v_frexp_mant_f64 v[0:2], v[2:3]")
+
+    def test_syntax_rejection_non_contiguous_src0(self):
+        with self.assertRaises(ValueError):
+            parse_vop_frexp_mant_f64("v_frexp_mant_f64 v[0:1], v[2:4]")
+
+    def test_syntax_rejection_out_of_range_registers(self):
+        with self.assertRaises(ValueError):
+            parse_vop_frexp_mant_f64("v_frexp_mant_f64 v[255:256], v[2:3]")
+        with self.assertRaises(ValueError):
+            parse_vop_frexp_mant_f64("v_frexp_mant_f64 v[0:1], s[105:106]")
+
+    def test_syntax_rejection_invalid_modifier(self):
+        with self.assertRaises(ValueError):
+            ast = parse_vop_frexp_mant_f64("v_frexp_mant_f64 v[0:1], v[2:3]")
+            ast.omod = "mul:3"
+            ast.validate()
+
+    def test_syntax_rejection_invalid_types(self):
+        with self.assertRaises(ValueError):
+            parse_vop_frexp_mant_f64("v_frexp_mant_f64 v0, v[2:3]")
+        with self.assertRaises(ValueError):
+            parse_vop_frexp_mant_f64("v_frexp_mant_f64 v[0:1], v2")
+
+    def test_mutation_detection_exponent_off_by_one(self):
+        correct = ref_frexp_mant_f64(ONE_F64)
+        mutant = mutant_exponent_off_by_one(ONE_F64)
+        self.assertEqual(bits_to_f64(correct), 0.5)
+        self.assertEqual(bits_to_f64(mutant), 1.0)
+        self.assertNotEqual(correct, mutant)
+
+    def test_mutation_detection_no_subnormal_normalization(self):
+        correct = ref_frexp_mant_f64(MIN_SUBNORMAL_F64)
+        mutant = mutant_no_subnormal_normalization(MIN_SUBNORMAL_F64)
+        self.assertEqual(bits_to_f64(correct), 0.5)
+        self.assertNotEqual(correct, mutant)
+
+    def test_mutation_detection_no_clamp(self):
+        val = f64_to_bits(-2.0)
+        correct_clamped = ref_frexp_mant_f64(val, clamp=True)
+        mutant = mutant_no_clamp(val)
+        self.assertEqual(bits_to_f64(correct_clamped), 0.0)
+        self.assertEqual(bits_to_f64(mutant), -0.5)
+        self.assertNotEqual(correct_clamped, mutant)
+
+    def test_mutation_detection_corrupt_vcc(self):
+        interp = ScalarVALUInterpreter()
+        interp.vcc = 0x5555555555555555
+        interp.set_vgpr_u64(2, ONE_F64)
+        ast = parse_vop_frexp_mant_f64("v_frexp_mant_f64 v[0:1], v[2:3]")
+        interp.execute(ast)
+        self.assertEqual(interp.vcc, 0x5555555555555555)
+        mutant_leak_vcc(interp, ast)
+        self.assertNotEqual(interp.vcc, 0x5555555555555555)
+
+    def test_mutation_detection_exec_mask_leak(self):
+        sim = SIMDVALUInterpreter(wave_size=32)
+        sim.exec = 0x0
+        sim.set_vgpr_u64(0, 0, 0xAAAAAAAAAAAAAAAA)
+        ast = parse_vop_frexp_mant_f64("v_frexp_mant_f64 v[0:1], v[2:3]")
+        sim.execute(ast)
+        self.assertEqual(sim.get_vgpr_u64(0, 0), 0xAAAAAAAAAAAAAAAA)
+        mutant_exec_leak(sim, ast)
+        self.assertNotEqual(sim.get_vgpr_u64(0, 0), 0xAAAAAAAAAAAAAAAA)
+
+
 class TestValuFrexpMantF64IEEE754Boundaries(unittest.TestCase):
     """Deep verification of IEEE 754 boundary extremes, subnormals, and NaN handling."""
 
