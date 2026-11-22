@@ -146,25 +146,80 @@ def oracle_sincos_f16(
 
 _TMP_DIR: tempfile.TemporaryDirectory | None = None
 _SRC_PATH: str | None = None
+_CS_PATH: str | None = None
+_CS_FSSM: str | None = None
+VSHARP_CS = [0, 0, 0xFFFFFFFF, 0x31016FAC]
+
+
+class _Heap(dict):
+    """Word-addressable byte heap for compute shader buffer load/store emulation."""
+
+    def read(self, addr: int, size: int) -> bytes:
+        data = bytearray(size)
+        for offset in range(0, size, 4):
+            word = self.get((addr + offset) & 0xFFFFFFFF, 0)
+            struct.pack_into("<I", data, offset, word & 0xFFFFFFFF)
+        return bytes(data)
+
+    def write(self, addr: int, data: bytes) -> None:
+        for offset in range(0, len(data), 4):
+            chunk = data[offset : offset + 4]
+            if len(chunk) < 4:
+                chunk = chunk.ljust(4, b"\x00")
+            word = struct.unpack_into("<I", chunk)[0]
+            self[(addr + offset) & 0xFFFFFFFF] = word
+
+
+def _make_fssm(rsrc2: int, group: tuple[int, int, int]) -> bytes:
+    header = bytearray(0x148)
+    struct.pack_into("<4I", header, 0x138, rsrc2, *group)
+    return bytes(header)
 
 
 def setUpModule() -> None:
-    global _TMP_DIR, _SRC_PATH
+    global _TMP_DIR, _SRC_PATH, _CS_PATH, _CS_FSSM
     _TMP_DIR = tempfile.TemporaryDirectory()
     disasm_dir = os.path.join(_TMP_DIR.name, "disasm")
+    fssm_dir = os.path.join(_TMP_DIR.name, "fssm")
     os.mkdir(disasm_dir)
+    os.mkdir(fssm_dir)
     _SRC_PATH = os.path.join(disasm_dir, "ps_sincos.s")
+    _CS_PATH = os.path.join(disasm_dir, "cs_sincos.s")
+    _CS_FSSM = os.path.join(fssm_dir, "cs_sincos.fssm")
     with open(os.path.join(_TMP_DIR.name, "ps_sincos.dxbc"), "wb") as f:
         f.write(STUB_DXBC)
 
 
 def tearDownModule() -> None:
-    global _TMP_DIR, _SRC_PATH
+    global _TMP_DIR, _SRC_PATH, _CS_PATH, _CS_FSSM
     if _TMP_DIR is not None:
         gc.collect()
         _TMP_DIR.cleanup()
         _TMP_DIR = None
         _SRC_PATH = None
+        _CS_PATH = None
+        _CS_FSSM = None
+
+
+def run_cs(lines: list[str], group_size: int, memory: dict[int, int]) -> None:
+    if _TMP_DIR is None:
+        setUpModule()
+    with open(_CS_FSSM, "wb") as f:
+        f.write(_make_fssm(0x0088, (group_size, 1, 1)))
+    asm = "; cs_sincos\n" + "".join(f"\t{ln}\n" for ln in lines) + "\ts_endpgm\n"
+    with open(_CS_PATH, "w", encoding="utf-8") as f:
+        f.write(asm)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", ResourceWarning)
+        spv = rdna2spirv.translate(_CS_PATH)
+    si.run_workgroup(
+        spv,
+        group_size,
+        32,
+        inputs_for=lambda i: {"%wg_id": (0, 0, 0), "%local_id": (i, 0, 0)},
+        push_constants=VSHARP_CS + [0] * 28,
+        memory=memory,
+    )
 
 
 def translate_ps(lines: list[str]) -> str:
@@ -374,6 +429,189 @@ class SinCosF16ReferenceOracleTests(unittest.TestCase):
                 got = run(f"v_cos_f16{form} v0, v1", h_in, old=OLD)
                 self.assertEqual(got & 0xFFFF, oracle_sincos_f16("v_cos_f16", h_in))
                 self.assertEqual(got & 0xFFFF0000, OLD & 0xFFFF0000)
+
+
+class SinCosSIMDAndPackedHalfwordTests(unittest.TestCase):
+    """Semantic tests for packed 16-bit register execution and SIMD multi-lane divergence."""
+
+    def test_packed_dual_channel_repacking(self):
+        # Two independent angles packed in v1: hi = 0.25 (pi/2), lo = 0.0
+        v1_val = (H_QUARTER << 16) | H_POS_ZERO
+        lines = [
+            f"v_mov_b32 v1, {v1_val:#x}",
+            "v_sin_f16 v2, v1",           # sin(lo=0.0) -> 0.0 in v2.lo
+            "v_lshrrev_b32 v3, 16, v1",   # hi=0.25 in v3.lo
+            "v_cos_f16 v4, v3",           # cos(hi=0.25) -> ~0.0 (0x8001) in v4.lo
+            "v_pack_b32_f16 v0, v2, v4",  # packed [cos(hi), sin(lo)]
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = translate_ps(lines)
+        word = si.run_fragment(spv)["%out_mrt0"][0]
+        lo_got = word & 0xFFFF
+        hi_got = (word >> 16) & 0xFFFF
+        self.assertEqual(lo_got, oracle_sincos_f16("v_sin_f16", H_POS_ZERO))
+        self.assertEqual(hi_got, oracle_sincos_f16("v_cos_f16", H_QUARTER))
+
+        # Test pair 2: hi = 1.0 (2pi), lo = 0.5 (pi) -> [cos(1.0)=1.0, sin(0.5)=~0.0]
+        v1_val2 = (H_ONE << 16) | H_HALF
+        lines2 = [
+            f"v_mov_b32 v1, {v1_val2:#x}",
+            "v_sin_f16 v2, v1",
+            "v_lshrrev_b32 v3, 16, v1",
+            "v_cos_f16 v4, v3",
+            "v_pack_b32_f16 v0, v2, v4",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv2 = translate_ps(lines2)
+        word2 = si.run_fragment(spv2)["%out_mrt0"][0]
+        self.assertEqual(word2 & 0xFFFF, oracle_sincos_f16("v_sin_f16", H_HALF))
+        self.assertEqual((word2 >> 16) & 0xFFFF, oracle_sincos_f16("v_cos_f16", H_ONE))
+
+    def test_packed_destination_high_half_preservation(self):
+        sentinel_high = 0xCAFE0000
+        for op in ("v_sin_f16", "v_cos_f16"):
+            for turn in (0.0, 0.25, 0.5, 0.75):
+                h_in = f2h(turn)
+                got = run(f"{op} v0, v1", h_in, old=sentinel_high | 0x1234)
+                with self.subTest(op=op, turn=turn):
+                    self.assertEqual(got & 0xFFFF0000, sentinel_high)
+                    self.assertEqual(got & 0xFFFF, oracle_sincos_f16(op, h_in))
+
+    def test_packed_destination_aliasing(self):
+        # In-place destination aliasing: dst == src (v0, v0)
+        # v0 holds (0xFEED << 16) | H_QUARTER
+        v0_init = (0xFEED << 16) | H_QUARTER
+        lines = [
+            f"v_mov_b32 v0, {v0_init:#x}",
+            "v_sin_f16 v0, v0",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        got = si.run_fragment(translate_ps(lines))["%out_mrt0"][0]
+        self.assertEqual(got & 0xFFFF0000, 0xFEED0000)
+        self.assertEqual(got & 0xFFFF, H_ONE)
+
+        # Re-evaluating with cos: cos(1.0 turns) == 1.0 (0x3c00)
+        lines_cos = [
+            f"v_mov_b32 v0, {got:#x}",
+            "v_cos_f16 v0, v0",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        got_cos = si.run_fragment(translate_ps(lines_cos))["%out_mrt0"][0]
+        self.assertEqual(got_cos & 0xFFFF0000, 0xFEED0000)
+        self.assertEqual(got_cos & 0xFFFF, H_ONE)
+
+    def test_packed_quadrature_carrier(self):
+        # Angle 45 deg (0.125 turns): sin(45) == cos(45) == sqrt(2)/2 ~= 0.7071
+        lines = [
+            f"v_mov_b32 v1, {H_EIGHTH:#x}",
+            "v_sin_f16 v2, v1",
+            "v_cos_f16 v3, v1",
+            "v_pack_b32_f16 v0, v2, v3",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        word = si.run_fragment(translate_ps(lines))["%out_mrt0"][0]
+        s_val = h2f(word & 0xFFFF)
+        c_val = h2f((word >> 16) & 0xFFFF)
+        self.assertLessEqual(abs(s_val - c_val), TOL16)
+        self.assertLessEqual(abs(s_val - (math.sqrt(2.0) / 2.0)), TOL16)
+
+    def test_exec_masking_single_lane(self):
+        # When exec_lo == 0, VALU instruction does not execute and destination register keeps old value
+        lines_inactive = [
+            f"v_mov_b32 v1, {H_QUARTER:#x}",
+            "v_mov_b32 v0, 0xCAFEBABE",
+            "s_mov_b32 exec_lo, 0",
+            "v_sin_f16 v0, v1",
+            "s_mov_b32 exec_lo, 1",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        got_inactive = si.run_fragment(translate_ps(lines_inactive))["%out_mrt0"][0]
+        self.assertEqual(got_inactive, 0xCAFEBABE)
+
+        # When exec_lo == 1, instruction executes normally
+        lines_active = [
+            f"v_mov_b32 v1, {H_QUARTER:#x}",
+            "v_mov_b32 v0, 0xCAFEBABE",
+            "s_mov_b32 exec_lo, 1",
+            "v_sin_f16 v0, v1",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        got_active = si.run_fragment(translate_ps(lines_active))["%out_mrt0"][0]
+        self.assertEqual(got_active & 0xFFFF0000, 0xCAFE0000)
+        self.assertEqual(got_active & 0xFFFF, H_ONE)
+
+    def test_exec_masking_multi_lane_divergence(self):
+        # 8-thread workgroup: even lanes active (sin of 0.25 turns -> 1.0), odd lanes masked off
+        group_size = 8
+        lane_inputs = [H_QUARTER] * group_size
+        lane_olds = [0x55550000 + i for i in range(group_size)]
+
+        mem = _Heap(
+            {0x100 + 4 * i: inp for i, inp in enumerate(lane_inputs)}
+            | {0x200 + 4 * i: old for i, old in enumerate(lane_olds)}
+        )
+
+        lines = [
+            "v_lshlrev_b32_e32 v5, 2, v0",
+            "v_add_nc_u32_e32 v6, 0x100, v5",
+            "v_add_nc_u32_e32 v7, 0x200, v5",
+            "buffer_load_dword v1, v6, s[0:3], 0 offen",
+            "buffer_load_dword v2, v7, s[0:3], 0 offen",
+            "v_and_b32_e32 v3, 1, v0",
+            "v_cmp_eq_u32_e32 vcc_lo, 0, v3",
+            "s_and_saveexec_b32 s6, vcc_lo",
+            "v_sin_f16 v2, v1",
+            "s_mov_b32 exec_lo, s6",
+            "buffer_store_dword v2, v5, s[0:3], 0 offen",
+        ]
+        run_cs(lines, group_size=group_size, memory=mem)
+
+        got = [mem.get(4 * i) for i in range(group_size)]
+        want = []
+        for i in range(group_size):
+            if i % 2 == 0:
+                want.append((lane_olds[i] & 0xFFFF0000) | H_ONE)
+            else:
+                want.append(lane_olds[i])
+        self.assertEqual(got, want)
+
+    def test_exec_masking_multi_lane_partitioning(self):
+        # 8-thread workgroup: lanes 0..3 compute sin(0.25)=1.0, lanes 4..7 compute cos(0.25)=~0.0
+        group_size = 8
+        lane_inputs = [H_QUARTER] * group_size
+        mem = _Heap({0x100 + 4 * i: inp for i, inp in enumerate(lane_inputs)})
+
+        lines = [
+            "v_lshlrev_b32_e32 v5, 2, v0",
+            "v_add_nc_u32_e32 v6, 0x100, v5",
+            "buffer_load_dword v1, v6, s[0:3], 0 offen",
+            "v_mov_b32 v2, 0x33330000",
+            "v_cmp_lt_u32_e32 vcc_lo, v0, 4",
+            "s_and_saveexec_b32 s6, vcc_lo",
+            "v_sin_f16 v2, v1",
+            "s_not_b32 exec_lo, exec_lo",
+            "s_and_b32 exec_lo, exec_lo, s6",
+            "v_cos_f16 v2, v1",
+            "s_mov_b32 exec_lo, s6",
+            "buffer_store_dword v2, v5, s[0:3], 0 offen",
+        ]
+        run_cs(lines, group_size=group_size, memory=mem)
+
+        got = [mem.get(4 * i) for i in range(group_size)]
+        want = []
+        for i in range(group_size):
+            if i < 4:
+                want.append(0x33330000 | H_ONE)
+            else:
+                want.append(0x33330000 | oracle_sincos_f16("v_cos_f16", H_QUARTER))
+        self.assertEqual(got, want)
 
 
 if __name__ == "__main__":
