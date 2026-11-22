@@ -992,8 +992,95 @@ class TestRegisterAliasing(unittest.TestCase):
             self.assertEqual(state.sgprs[i], snapshot_sgprs[i], f"SGPR s{i} was unexpectedly modified")
 
 
+
+# ==============================================================================
+# Phase 6: Condition Codes, Status Flags, and Carry/Borrow Generation
+# ==============================================================================
+
+@dataclass
+class ScalarStatusFlags:
+    """Architectural STATUS register flags for AMD RDNA2 SALU."""
+    scc: int = 0
+    priv: int = 0
+    trap_en: int = 0
+    spi_prio: int = 0
+    carry_borrow: int = 0
+
+    def update_from_salu_or(self, new_exec: int) -> None:
+        """Update SCC from resulting EXEC mask.
+        
+        Logical bitwise operations in RDNA2 SALU do not generate carry or borrow.
+        All other status flags must remain untouched.
+        """
+        self.scc = 1 if (u64(new_exec) != 0) else 0
+        self.carry_borrow = 0
+
+    def evaluate_cbranch_scc0(self) -> bool:
+        """s_cbranch_scc0: taken if SCC == 0 (all lanes inactive)."""
+        return self.scc == 0
+
+    def evaluate_cbranch_scc1(self) -> bool:
+        """s_cbranch_scc1: taken if SCC == 1 (at least one lane active)."""
+        return self.scc == 1
+
+
+class TestConditionCodesAndStatusFlags(unittest.TestCase):
+    """Verifies SCC condition flag generation, carry/borrow neutrality, and cbranch semantics."""
+
+    def test_scc_zero_flag_behavior(self) -> None:
+        """EXEC == 0 results in SCC == 0."""
+        flags = ScalarStatusFlags()
+        flags.update_from_salu_or(0)
+        self.assertEqual(flags.scc, 0)
+        self.assertTrue(flags.evaluate_cbranch_scc0())
+        self.assertFalse(flags.evaluate_cbranch_scc1())
+
+    def test_scc_nonzero_flag_behavior(self) -> None:
+        """Any bit set in EXEC[63:0] results in SCC == 1."""
+        flags = ScalarStatusFlags()
+        for lane in range(64):
+            flags.update_from_salu_or(1 << lane)
+            self.assertEqual(flags.scc, 1, f"Lane {lane} set should produce SCC=1")
+            self.assertFalse(flags.evaluate_cbranch_scc0())
+            self.assertTrue(flags.evaluate_cbranch_scc1())
+
+    def test_no_carry_borrow_generation(self) -> None:
+        """s_or_saveexec_b64 is a bitwise logical op and must never generate carry or borrow."""
+        flags = ScalarStatusFlags(carry_borrow=1)
+        # Even with all bits set (0xFFFF_FFFF_FFFF_FFFF | 0xFFFF_FFFF_FFFF_FFFF), no carry is generated
+        flags.update_from_salu_or(ALL_LANES_ACTIVE_64)
+        self.assertEqual(flags.carry_borrow, 0)
+        self.assertEqual(flags.scc, 1)
+
+    def test_status_flags_preservation(self) -> None:
+        """Verify non-SCC status register bits (priv, trap_en, spi_prio) are preserved."""
+        flags = ScalarStatusFlags(priv=1, trap_en=1, spi_prio=3)
+        flags.update_from_salu_or(0x1234)
+        self.assertEqual(flags.scc, 1)
+        self.assertEqual(flags.priv, 1)
+        self.assertEqual(flags.trap_en, 1)
+        self.assertEqual(flags.spi_prio, 3)
+
+    def test_scc_and_execz_duality(self) -> None:
+        """scc == 0 is mathematically identical to exec_mask == 0 after s_or_saveexec_b64."""
+        test_masks = [
+            0x0,
+            0x1,
+            0x8000_0000_0000_0000,
+            0x0000_FFFF_0000_0000,
+            ALL_LANES_ACTIVE_64,
+        ]
+        flags = ScalarStatusFlags()
+        for mask in test_masks:
+            flags.update_from_salu_or(mask)
+            is_exec_zero = (mask == 0)
+            self.assertEqual(flags.scc == 0, is_exec_zero)
+            self.assertEqual(flags.scc == 1, not is_exec_zero)
+
+
 if __name__ == "__main__":
     unittest.main()
+
 
 
 
