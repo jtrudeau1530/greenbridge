@@ -13110,12 +13110,14 @@ def interp_ij_analysis(insns, g):
         b = blk[s["n"]]
         if any(w < s["n"] and blk[w] == b for w in ws):
             return True
-        seen, work = {b}, [b]
+        # b itself is not pre-seeded: reached again through a back-edge, a write after the site counts
+        # (and index 0 is a valid write, so test membership, not truthiness).
+        seen, work = set(), [b]
         while work:
             for p in preds[work.pop()]:
                 if p not in seen:
                     seen.add(p)
-                    if any(w for w in ws if blk[w] == p):
+                    if any(blk[w] == p for w in ws):
                         return True
                     work.append(p)
         return False
