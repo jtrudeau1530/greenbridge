@@ -23,6 +23,11 @@ inline PFN_vkGetInstanceProcAddr load_vulkan() {
     const auto entry = library ? GetProcAddress(library, "vkGetInstanceProcAddr") : nullptr;
 #elif defined(__APPLE__)
     static const auto entry = []() -> void* {
+        // MoltenVK compiles MSL with fast-math on by default, which lets Metal fold an f32 compare of a NaN with
+        // itself to "ordered" (v_cmpx_eq/le_f32 on (NaN, NaN) give true; ps_vcmpx_forms). Translated shaders need
+        // IEEE results, so turn it off before MoltenVK reads its configuration, unless the user set the variable
+        // (docs/design.md, "MoltenVK fast-math"). The same variable reaches MoltenVK behind the Vulkan loader.
+        setenv("MVK_CONFIG_FAST_MATH_ENABLED", "0", 0);
         // The default is direct MoltenVK: a portability driver would otherwise require instance opt-in.
         const char* requested = std::getenv("LEONIDA_VULKAN_LOADER");
         const bool overridden = requested && *requested;

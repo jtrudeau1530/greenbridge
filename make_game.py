@@ -752,7 +752,11 @@ def fallback_flags(a) -> tuple[str, ...]:
 def smallest_max_subgroup(vulkaninfo_text: str):
     """The smallest maxSubgroupSize vulkaninfo reports over all devices (text or --json output), or None."""
     size = r'maxSubgroupSize"?\s*[=:]\s*(\d+)'
-    starts = [m.start() for m in re.finditer(r'deviceName"?\s*[=:]', vulkaninfo_text)]
+    # A device's own name is the least indented one; deeper ones (VK_KHR_maintenance7's layered APIs, e.g.
+    # MoltenVK's Metal device, in both the text and the --json output) belong to the device above them.
+    names = list(re.finditer(r'(?m)^([ \t]*)"?deviceName"?\s*[=:]', vulkaninfo_text))
+    depth = min((len(m.group(1)) for m in names), default=0)
+    starts = [m.start() for m in names if len(m.group(1)) == depth]
     if not starts:
         sizes = [int(n) for n in re.findall(size, vulkaninfo_text)]
         return min(sizes) if sizes else None
@@ -790,6 +794,16 @@ def wave64_emulate(mode: str) -> bool:
             "(exact on every GPU; --wave64-emulate off to skip it on a GPU with 64-wide subgroups)")
         return True
     on = size < 64
+    if on:
+        gpu = runtime_gpu_info()
+        if gpu.get("rdna2_amd_windows") and gpu.get("native64"):
+            # #857: AMD's Windows compiler for RDNA2 crashes creating many emulated LDS compute pipelines. The
+            # runtime runs on this GPU, which takes wave64 natively, so the 32-wide device (an Intel iGPU next to
+            # an RX 6000 card, say) gets native wave64 modules it isn't used for.
+            log(f"shaders: smallest maximum subgroup size is {size}, but the runtime's GPU ({gpu.get('device', '?')}) "
+                "is RDNA2 on the AMD Windows driver, whose shader compiler crashes on emulated wave64 code (#857), "
+                "and runs wave64 natively: wave64 emulation off (--wave64-emulate on to force it)")
+            return False
     if not on and runtime_gpu_native64() is False:
         log(f"shaders: smallest maximum subgroup size is {size}, but the Vulkan query found no 64-wide path for both "
             "compute and mesh (fixed default size or required-size control): wave64 emulation on")
@@ -810,6 +824,17 @@ def runtime_gpu_native64():
         return None
 
 
+def runtime_gpu_info() -> dict:
+    """tools/vk_subgroup_info.py's answer for the GPU the runtime would use; {} when it can't tell."""
+    try:
+        r = subprocess.run([sys.executable, "-I", os.path.join(TOOLS, "vk_subgroup_info.py")],
+                           capture_output=True, text=True, timeout=60)
+        info = json.loads(r.stdout.strip().splitlines()[-1])
+        return info if isinstance(info, dict) and "error" not in info else {}
+    except (OSError, ValueError, IndexError, subprocess.SubprocessError):
+        return {}
+
+
 def runtime_gpu_per_vertex():
     """per_vertex_inputs as tools/vk_subgroup_info.py answers for the GPU the runtime would use: False where the
     driver can't compile PerVertexKHR (MoltenVK) or lacks fragmentShaderBarycentric, None when it can't tell."""
@@ -823,7 +848,7 @@ def runtime_gpu_per_vertex():
 
 
 # Source and data files that produce the translated modules, metadata and partner stubs.
-TRANSLATION_SOURCES = ("rdna2spirv.py", "shader_ir.py", "cfg_structure.py", "fssm_header.py", "lane_masks.py",
+TRANSLATION_SOURCES = ("rdna2spirv.py", "shader_ir.py", "cfg_structure.py", "fssm_header.py", "lane_masks.py", "wave64_halves.py",
                        "shader_meta.py", "spirv_stubs.py", "gfx10_formats.json")
 
 
@@ -969,15 +994,29 @@ def assets(game: str, work: str, wav: bool, jobs: int) -> None:
     for root, _, files in os.walk(game):
         pools += [os.path.join(root, f) for f in files if f.lower().endswith(".ttpf")]
     settings = ttpf_assets.load_profile(work) if pools else None
-    for p in sorted(pools, key=os.path.getsize):
+    # rpf9dump names each pool's output folder after the source basename. Pools with the same basename
+    # in one destination namespace would share that folder and its manifest, so the second pool would
+    # look already exported and lose all its DDS. Give every member of a colliding group its own
+    # export root, keyed off the relative source path; unique pools keep their current folder.
+    info = []
+    for p in pools:
         name = os.path.splitext(os.path.basename(p))[0]
         parts = os.path.relpath(p, game).replace("\\", "/").split("/")
         dest = os.path.join(out, "ttpf_pack", parts[1]) if parts[0] == "pack" else os.path.join(out, "ttpf")
-        pool_dir = os.path.join(dest, name)
+        info.append((p, name, dest, "/".join(parts)))
+    counts = {}
+    for _, name, dest, _ in info:
+        key = (os.path.normcase(dest), os.path.normcase(name))
+        counts[key] = counts.get(key, 0) + 1
+    for p, name, dest, rel in sorted(info, key=lambda x: os.path.getsize(x[0])):
+        root = dest
+        if counts[(os.path.normcase(dest), os.path.normcase(name))] > 1:
+            root = os.path.join(dest, f"{name}~{hashlib.sha256(rel.encode('utf-8')).hexdigest()[:12]}")
+        pool_dir = os.path.join(root, name)
         manifest = ttpf_manifest(pool_dir)
         if manifest is None:
             log(f"assets: texture pool {os.path.relpath(p, game)}")
-            run([get_exporter(work), "ttpf", p, dest])
+            run([get_exporter(work), "ttpf", p, root])
             manifest = ttpf_manifest(pool_dir)
             if manifest is None:
                 fail(f"Texture exporter did not publish a complete manifest in {pool_dir}")

@@ -115,10 +115,16 @@ def _bank_rows(path: str, bank: str) -> list:
     else:                                                    # older parser: streams + attribute
         streams = parsed
         music = getattr(awc_opus.parse_awc, "music", [])
-    bank_size, rows = len(d), {}
-    for s in streams:
-        rows[s["id"]] = _row(bank, s["id"], s["codec"], s["channels"], s["rate"], s["samples"],
-                             s["data"], bank_size, False)
+    bank_size, rows = len(d), []
+    # A bank can hold two streams with the same id: list both, and note the name awc_opus exports the later
+    # one under, instead of letting it replace the first row.
+    for s, stem in zip(streams, awc_opus.export_stems([s["id"] for s in streams])):
+        row = _row(bank, s["id"], s["codec"], s["channels"], s["rate"], s["samples"], s["data"], bank_size,
+                   False)
+        if stem != row["stream"]:
+            note = f"same id as an earlier stream in this bank; awc_opus exports it as {stem}"
+            row["notes"] = "; ".join(x for x in (row["notes"], note) if x)
+        rows.append(row)
     for mus, data in music or []:
         try:
             channels = awc_opus.music_channels(d, mus, data, collect_packets=False)
@@ -130,8 +136,13 @@ def _bank_rows(path: str, bank: str) -> list:
                   file=sys.stderr)
             continue
         for cid, samples, rate, codec, _packets, packet_channels in channels:
-            rows[cid] = _row(bank, cid, codec, packet_channels, rate, samples, data, bank_size, True)
-    return list(rows.values())
+            row = _row(bank, cid, codec, packet_channels, rate, samples, data, bank_size, True)
+            same = next((i for i, r in enumerate(rows) if r["stream"] == row["stream"]), None)
+            if same is None:
+                rows.append(row)
+            else:   # as before: a streamed-music channel replaces a row with its id
+                rows[same] = row
+    return rows
 
 
 def _same_report_path(first: str, second: str) -> bool:

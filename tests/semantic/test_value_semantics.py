@@ -33,6 +33,9 @@ ISA semantics used (AMD RDNA2 ISA reference, VALU/VOP3/VOP3P chapters):
   v_fmaak_f32/madak_f32 D = S0 * S1 + K (printed vdst, src0, vsrc1, K).
   s_ff1_i32_b32 /       index of the lowest set / clear bit of S0, -1 (0xffffffff) when there is none. An inline
   s_ff0_i32_b32           constant or literal source is a 32-bit value, not a lane mask (SHADER-46).
+  v_mad_u32_u16 /       D = S0.lo * S1.lo + S2 mod 2^32, the halves zero- (u16) or sign-extended (i16); op_sel bit
+  v_mad_i32_i16           0/1 reads the high half of S0/S1. D is a whole dword (nothing of the old value is kept).
+  v_subrev_f16          D.lo = S1.lo - S0.lo; the high half of D is kept in the VOP2 and the VOP3 form.
   s_*_saveexec_b32/b64, a constant used as a lane mask gives lane L its bit L: of the 32-bit value for a b32 op,
   s_andn2_wrexec_*,       of the 64-bit value for a b64 op (inline constants sign-extended, literals with a zero
   s_mov/s_not/s_and_b64   high word). cs_w32_mask_imm / cs_w64_mask_imm run every lane of a wave (LaneMaskConstants).
@@ -59,7 +62,7 @@ EXPECTED_OPS4 = [0x34000010, 0x00120800, 0xBEEF0000, 0x12343C00]
 EXPECTED_OPS5 = [0x12340010, 0xBEEF0800, 0xAAAAFFFF, 0xDEADBC00]
 EXPECTED_OPS6 = [0xF800FFFF, 0x01000010, 0x00800800, 0x8000FFF0]
 EXPECTED_OPS7 = [0x00FF8077, 0xFF0000FF, 0x89ABCDEF, 0x00070003]
-EXPECTED_OPS8 = [0x80000000, 0xFFFFFFFF, 0x000F100E, 0x0F0F0F1F]
+EXPECTED_OPS8 = [0x80000000, 0xBFFFFFFF, 0x000F100E, 0x0F0F0F1F]
 EXPECTED_VCC_X2 = [0x11223344, 0x55667788, 0x00000000, 0x00000000]
 EXPECTED_F16_VOP2 = [0xAAAA4000, 0xAAAAC000, 0xAAAA3A00, 0x42003F00]        # hardware-measured
 EXPECTED_FLAT = [0x00000101, 0x00000102, 0x3F000000, 0x3E800000]
@@ -71,6 +74,8 @@ EXPECTED_FMT_1010102 = {0x00: 0x00000000, 0x04: 0x3F800000, 0x08: 0x00000000, 0x
                         0x20: 0x00000000, 0x24: 0x3F800000, 0x28: 0x00000000, 0x2C: 0x3F800000,
                         0x30: 0xC00FFC00, 0x34: 0x003FF003, 0x38: 0xE00003FF, 0x3C: 0xFFE00003}
 EXPECTED_SFF_IMM = [0x00000002, 0x00000001, 0x00000014, 0x00000010]
+EXPECTED_VALU16_MAD = [0x00000002, 0x00030002, 0x00008000, 0x00000004]
+EXPECTED_VALU16_SUBREV = [0xAAAABC00, 0xAAAAC000, 0xAAAA3C00, 0x42003800]
 
 
 def _f32_bits(x):
@@ -176,8 +181,9 @@ def reference_ops8():
     ffbl = (0x00010000 & -0x00010000).bit_length() - 1
     ffbh = 32 - 0x00010000.bit_length()
     xad = ((0xF0F0F0F0 ^ m) + 1) & m
+    signed_high = ((_s(0xFFFFFFFE) * 0x40000000) >> 32) & m
     return [(0x80000001 * 0xFFFFFFFF) >> 32,
-            ((_s(0xFFFFFFFE) * 0x40000000) >> 32) & m,
+            signed_high ^ 0x40000000,
             ((ffbh << 16) + (ffbl << 8) + bcnt) & m,
             (xad + 16 + m) & m]                                  # v_ffbh_u32(0) = 0xffffffff
 
@@ -267,6 +273,26 @@ def reference_sff_imm():
     return [_ff1(4), _ff1(~61), _ff1(0x00100000), _ff1(~0x0000FFFF)]
 
 
+def _mad_32_16(signed, s0, s1, s2, sel=(0, 0)):
+    """v_mad_u32_u16 / v_mad_i32_i16: the selected 16-bit halves, extended, multiplied, plus S2, mod 2^32."""
+    a, b = (s0 >> (16 * sel[0])) & 0xFFFF, (s1 >> (16 * sel[1])) & 0xFFFF
+    if signed:
+        a, b = _s16(a), _s16(b)
+    return (a * b + s2) & 0xFFFFFFFF
+
+
+def reference_valu16_mad():
+    v0, v1, v3, v5, v6, v7 = 0x1234FFFF, 0x5678FFFE, 0x00030000, 0x00018000, 0xFFFF7FFF, 0x40000000
+    return [_mad_32_16(False, v0, v1, v3), _mad_32_16(True, v0, v1, v3), _mad_32_16(True, v5, v6, v7),
+            _mad_32_16(True, v5, v6, 5, sel=(1, 1))]
+
+
+def reference_valu16_subrev():
+    a, b, d = _unhalf(0x3E00), _unhalf(0x3800), _unhalf(0x3C00)        # low halves: v0 1.5, v1 0.5, v5 1.0
+    return [0xAAAA0000 | _half(b - a), 0xAAAA0000 | _half(-b - a), 0xAAAA0000 | _half(min(1.0, b + a)),
+            0x42000000 | _half(a - d)]
+
+
 def _isg1_dxbc(elements):
     """A DXBC container with one ISG1 input signature. elements: (register, mask, system value, component type)."""
     payload = bytearray(struct.pack("<II", len(elements), 8))
@@ -314,6 +340,8 @@ class OracleTests(unittest.TestCase):
         self.assertEqual(reference_bounds(), EXPECTED_BOUNDS)
         self.assertEqual(reference_fmt_1010102(), EXPECTED_FMT_1010102)
         self.assertEqual(reference_sff_imm(), EXPECTED_SFF_IMM)
+        self.assertEqual(reference_valu16_mad(), EXPECTED_VALU16_MAD)
+        self.assertEqual(reference_valu16_subrev(), EXPECTED_VALU16_SUBREV)
 
 
 class TranslatorValueSemantics(unittest.TestCase):
@@ -366,6 +394,16 @@ class TranslatorValueSemantics(unittest.TestCase):
         # v_fmac_f16 accumulates into the low half of its destination.
         self.check("ps_f16_vop2", EXPECTED_F16_VOP2)
 
+    def test_mad_u32_u16_i32_i16_wrap_and_sign_extend(self):
+        # The u16 product plus S2 wraps at 32 bits; i16 sign-extends both halves (also the op_sel-selected high
+        # halves); the destination dword is replaced, its 0xaaaa5555 is not kept.
+        self.check("ps_valu16_mad", EXPECTED_VALU16_MAD)
+
+    def test_subrev_f16_reversed_and_keeps_high_half(self):
+        # S1 - S0 in the _e32 and _e64 forms (neg, clamp), low half out, the destination's high half kept, also
+        # when the destination is a source.
+        self.check("ps_valu16_subrev", EXPECTED_VALU16_SUBREV)
+
     def test_s_buffer_load_dwordx2_into_vcc(self):
         # The V# in s[0:3] points at 0x1000; the two dwords must come back in vcc_lo and vcc_hi, not be lost.
         push = [0x1000, 0, 16, 0] + [0] * 28
@@ -410,6 +448,30 @@ class TranslatorValueSemantics(unittest.TestCase):
         for address, want in EXPECTED_FMT_1010102.items():
             with self.subTest(address=address):
                 self.assertEqual(f"{memory.get(address, 0):#010x}", f"{want:#010x}")
+
+    def test_signed_typed_buffers(self):
+        spv = support.translate_fixture("cs_fmt_sint32", fssm=CS_BOUNDS_FSSM)
+        memory = {}
+        support.run_fragment(
+            spv, inputs={"%wg_id": (0, 0, 0), "%local_id": (0, 0, 0)},
+            push_constants=[0, 0, 0x100, 0x31016FAC] + [0] * 28, memory=memory)
+        expected = {
+            0x0C: 1,                         # MUBUF integer DST_SEL=1
+            0x18: 0xFFFFFFFD,                # MUBUF 96-bit format, third component
+            0x34: 0x7FFFFFFF, 0x38: 0,       # MTBUF 64-bit format with absent third component
+            0x48: 0xFFFFFFFD, 0x4C: 0,       # MTBUF 96-bit format with absent fourth component
+            0x58: 0xFFFFFFFD, 0x5C: 17,      # MTBUF 128-bit format
+            0x60: 0x7FFF8000, 0x64: 0x0011FFFD,
+            0x68: 0x7FFF8000, 0x6C: 0x0011FFFD,
+            0x70: 0xFFFFFFFD, 0x74: 0xFFFFFFFD,
+            0x90: 0x80000000, 0xA8: 0xFFFFFFFD, 0xBC: 17,
+            0xC0: 0xFFFFFFFD, 0xC4: 0xFFFF8000, 0xC8: 0xFFFFFFFD,
+        }
+        for address, word in expected.items():
+            with self.subTest(address=hex(address)):
+                self.assertEqual(memory.get(address), word)
+        for address in (0x98, 0xAC, 0xCC):
+            self.assertNotIn(address, memory)
 
     def test_s_ff0_s_ff1_read_an_immediate_as_a_value(self):
         # SHADER-46: an inline constant or literal is a 32-bit value. Read as a lane mask (all ones or zero from

@@ -17,5 +17,6 @@
 	v_mov_b32_e32 v14, 0
 	v_ffbh_u32_e32 v15, v14
 	v_add3_u32 v16, v13, 16, v15
+	v_xor_b32_e32 v5, 0x40000000, v5
 	exp mrt0 v2, v5, v11, v16 done vm
 	s_endpgm

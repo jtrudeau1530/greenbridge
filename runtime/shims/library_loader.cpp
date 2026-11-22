@@ -32,10 +32,16 @@ struct Pseudo {
 
 namespace {
 
-std::mutex g_mutex;
+// Intentionally immortal: mapped-DLL DLL_PROCESS_DETACH and earlier atexit handlers can call GetProcAddress or
+// FreeLibrary on pseudo-handles during process teardown, after normal statics would have been destroyed.
+std::mutex& loader_mutex() {
+    static auto* m = new std::mutex;
+    return *m;
+}
+
 std::deque<Pseudo>& pseudos() {   // a deque never moves its elements, so handed-out handles stay valid
-    static std::deque<Pseudo> d;
-    return d;
+    static auto* d = new std::deque<Pseudo>;
+    return *d;
 }
 
 std::string lower_ascii(std::string s) {
@@ -67,7 +73,7 @@ std::string module_name(std::string path) {
 HMODULE owned_handle(const std::string& path) {
     const std::string dll = module_name(path);
     if (dll.empty() || !owns_dll(dll)) return nullptr;
-    std::lock_guard lock(g_mutex);
+    std::lock_guard lock(loader_mutex());
     for (auto& p : pseudos())
         if (p.dll == dll) return reinterpret_cast<HMODULE>(&p);
     pseudos().push_back(Pseudo{});
@@ -78,7 +84,7 @@ HMODULE owned_handle(const std::string& path) {
 
 // The owned module a handle names, or nullptr for a host module.
 const Pseudo* pseudo(HMODULE h) {
-    std::lock_guard lock(g_mutex);
+    std::lock_guard lock(loader_mutex());
     for (auto& p : pseudos())
         if (reinterpret_cast<HMODULE>(&p) == h) return &p;
     return nullptr;
@@ -120,14 +126,18 @@ HMODULE WINAPI get_module_handle_w(LPCWSTR name) {
 FARPROC WINAPI get_proc_address(HMODULE module, LPCSTR name) {
     const Pseudo* p = pseudo(module);
     if (!p) return GetProcAddress(module, name);
+    if (!name) {
+        SetLastError(ERROR_PROC_NOT_FOUND);
+        return nullptr;
+    }
     // A value below 0x10000 is an ordinal (IS_INTRESOURCE), as in the real GetProcAddress.
     const std::string what = IS_INTRESOURCE(name) ? "#" + std::to_string(reinterpret_cast<uintptr_t>(name)) : name;
     if (void* fn = find(p->dll, what)) return reinterpret_cast<FARPROC>(fn);
     {
-        static std::mutex m;
-        static std::set<std::string> seen;
-        std::lock_guard lock(m);
-        if (seen.insert(p->dll + "!" + what).second)
+        static auto* m = new std::mutex;
+        static auto* seen = new std::set<std::string>;
+        std::lock_guard lock(*m);
+        if (seen->insert(p->dll + "!" + what).second)
             std::fprintf(stderr, "[rt] loader: GetProcAddress(%s, %s): not served\n", p->dll.c_str(), what.c_str());
     }
     SetLastError(ERROR_PROC_NOT_FOUND);

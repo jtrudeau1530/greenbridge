@@ -47,7 +47,7 @@ empty. The measured tag counts over the 670 complete `script.rpf` records are:
 |---|---:|---|
 | `LSCH` | 670 | 464-544 bytes; the type schema (structs and members), decoded below |
 | `LENM` | 670 | the schema's enums and their values, decoded below |
-| `LSNS` | 670 | high-entropy body (8,608 bytes in the sampled record), not zlib/LZ4; not decoded |
+| `LSNS` | 670 | block table and 16-byte records; layout decoded below, record contents opaque |
 | `LGID` | 670 | empty (8-byte section) |
 | `LRSC` | 670 | starts with `0DRP` + version 122; resource page directory link |
 | `CHKS` | 670 | file size and a 32-bit checksum |
@@ -204,7 +204,62 @@ signatures are not joaat of a name. No name or hash from the game is committed h
   `LENM` for 59,945 of 60,354 and in another file for 395 more.
 - The region between the 8-byte header and `LSCH` is the instance data these structs describe: a block table
   and its data blocks, read from the root block that `LRSC` names. See *Instance data*.
-- `LSNS` (high-entropy) is not touched.
+- `LSNS` values occur nowhere else in the container (see *`LSNS`*).
+
+## `LSNS`
+
+`LSNS` is a block table followed by the blocks it lists:
+
+| Offset | Size | Field |
+|---|---|---|
+| +0 | 4 | little-endian block count n |
+| +4 | 8 × n | per block: u32 kind, u32 byte count |
+| +4 + 8n | | the n blocks back to back |
+
+The byte counts fill the section exactly, and every block is a whole number of 16-byte records. A section with
+n = 0 is 12 bytes long (tag, size, count) and is followed directly by `LGID`. The kind's high byte is 1 or 2 and
+reads like the word width (4- or 8-byte words), but the 16-byte rule holds for both. The low byte varies.
+
+Measured with `psin_index.py` over every complete container in five carved archives:
+
+| Archive | `LSNS` sections | Empty | 16-byte records | Errors |
+|---|---:|---:|---:|---:|
+| `data.rpf` | 2,083 | 886 | 164,512 | 0 |
+| `script.rpf` | 1,009 | 0 | 56,382 | 0 |
+| `story000_script.rpf` | 2,118 | 0 | 285,674 | 0 |
+| `core_restofworld.rpf` | 5 | 0 | 605 | 0 |
+| `story000_restofworld.rpf` | 2 | 0 | 1,975 | 0 |
+| **Total** | **5,217** | **886** | **509,148** | **0** |
+
+Blocks by kind across these sections: `0x101` 4,200, `0x11c` 2,118, `0x207` 1,235, `0x10f` 26, `0x204` 14,
+`0x113` 7, and 1-2 each of `0x102`, `0x205`, `0x208`, `0x109`, `0x11e` and `0x211`. Section sizes run from 12 to
+36,756 bytes (median 836).
+
+### The records
+
+The record contents are opaque. A wider pass over 16,169 containers that have an `LSNS` block (the archives
+above plus `levels.rpf`, `story000.rpf`, `packs.rpf` and `anim.rpf`; 22,101 blocks, 1,957,739 records) measured:
+
+- **Uniform bytes.** 8.0 bits/byte over the pooled records, and no record byte position favours any value.
+  (The per-section 5.2-8.0 bits/byte in [restofworld.md](restofworld.md) is the small-sample limit of short
+  sections.) Records are not version-4 GUIDs: no fixed version or variant nibble.
+- **No references.** No 32-bit or 64-bit record word occurs anywhere else in its container, `LSCH` included (a
+  300-container sample, 107,594 words). Instance data stores its own hashes directly (member types `0x4a`-`0x4f`).
+- **No name hash.** Against up to 3.3 million harvested identifiers and model names, each as is, lower-cased and
+  upper-cased, the records match none of these functions. Each search was checked against a planted known value.
+  - 32-bit words: joaat, FNV-1, FNV-1a, CRC-32, MurmurHash3-32 and xxHash32 all stay at the level of a salted
+    control (about 1,350 chance hits each; this test used a third of the dictionary, 1.0 million words,
+    against 5.8 million distinct 32-bit words).
+  - 64-bit words: MurmurHash3 x64 (either half; the function behind the 64-bit map keys in
+    [world_names.md](world_names.md)), xxHash64, XXH3-64, FNV-1 and FNV-1a 64 have 0 matches.
+  - Whole records: MD5, XXH3-128, BLAKE2b-128, truncated SHA-1 and SHA-256, and full MurmurHash3 x64 128 have
+    0 matches.
+- **Repeats.** 18,692 of the 22,101 blocks are distinct. Beyond repeated whole blocks, 99,071 records still repeat
+  across different blocks.
+
+Uniform bytes in exact 16-byte units that repeat record by record fit a deterministic 128-bit block cipher. They
+also fit 128-bit hashes of inputs outside the tested dictionary and functions. Which one it is has not been
+established. Per the project rules, no decryption is attempted.
 
 ## Instance data
 
@@ -299,8 +354,8 @@ Checks over the 17,507 containers:
   6 partly reached containers are partial: the 0x5a and 0x76 members point at `f32` and u32-hash blocks that
   nothing else reaches.
 
-These numbers cover layout only. What each struct means, and the names behind its hashes, are not decoded here
-(see *Hashes*).
+These numbers cover layout only. What each struct means is not decoded here. The engine names behind the schema
+hashes are covered under *Hashes*, and the resource names behind hash values under *Name hashes in the data*.
 
 ### Tool
 
@@ -315,12 +370,68 @@ pasted into an issue or a pull request. `tests/test_psin_data.py` builds contain
 every layout above, the end padding, a bad fill, pointers out of range, an unlisted enum value, a skipped type and
 the CLI.
 
+### Name hashes in the data
+
+Members of type `0x4a`, `0x4d` and `0x4b` hold a u32 hash and type `0x4f` a u64 hash. Many of these values name other
+resources: drawables, fragments and maps. They use the two rules that [world_names.md](world_names.md) found for
+placement maps:
+
+| Member type | Value |
+|---|---|
+| `0x4a`, `0x4d`, `0x4b` (u32) | joaat of the lower-cased name |
+| `0x4f` (u64) | low 64 bits of MurmurHash3 x64 128, seed 0, over the name's bytes |
+
+`tools/psin_names.py` walks every container with `psin_data.py`, collects each hash value with the struct and member
+that hold it, and looks it up in a dictionary of names you already have: `rpf9_names.py` JSON (the `.#dr`/`.#ft`/`.#dd`
+suffix dropped) or plain name lists. Each run also hashes every name with `#zq` appended, through the same rules. Those
+names cannot be right, so their matches show how many real matches chance alone would give.
+
+Measured on the 1.0.2.1 package (2026-11-22). The data was 18,640 `PSIN` streams carved whole from 11 archives, so the
+container counts differ slightly from those above. The dictionary was 341,954 distinct names from `rpf9_names.py` over
+the same archives with default options; 317,257 of them come from `levels.rpf`.
+
+| Archive | Containers | With a resolved name | u32 resolved | u32 control | u64 resolved | u64 control |
+|---|---:|---:|---:|---:|---:|---:|
+| `data.rpf` | 2,200 | 116 | 9,939 | 52 | 28,905 | 0 |
+| `levels.rpf` | 6,951 | 957 | 7,310 | 51 | 34,309 | 0 |
+| `packs.rpf` | 543 | 335 | 2,755 | 2 | 10,190 | 0 |
+| `script.rpf` | 1,012 | 31 | 189 | 0 | 0 | 0 |
+| `navmeshes.rpf` | 21 | 1 | 95 | 0 | 209 | 0 |
+| `anim.rpf` | 10 | 1 | 3 | 0 | 0 | 0 |
+| `story000.rpf` | 5,316 | 2,648 | 403 | 25 | 90,612 | 0 |
+| `story000_script.rpf` | 2,270 | 1,264 | 19,894 | 169 | 23,612 | 0 |
+| `shared_minigame000.rpf` | 73 | 2 | 2 | 0 | 0 | 0 |
+| `core_restofworld.rpf`, `story000_restofworld.rpf` | 8 | 0 | 0 | 0 | 0 | 0 |
+| **Total** | **18,404** | **5,355** | **40,590** | **299** | **187,837** | **0** |
+
+- **The u64 rule is general.** 187,837 of the 443,968 non-zero u64 hash values resolve, with no control match.
+  They are spread over 119 of the 223 u64 fields, so the MurmurHash3 keys are not specific to placement maps. The
+  other u64 fields match nothing in this dictionary.
+- **The u32 rule is precise in name fields.** 40,590 matches against 299 for the control, about 0.7% expected false.
+  122 of the 306 fields with a match have at least 20 resolved values and a control under 1% of them. Those fields
+  hold 227,504 of the 228,427 resolved values (u32 and u64 together), with no control match. The other 184 fields
+  mix a few real names with chance hits on non-name hashes.
+- **Coverage.** 5,355 of 18,404 containers (29%) reference at least one known resource, and 23,049 distinct names
+  occur. Only 5,495 of the matches are in the placement fields that `world_names.py` already resolves.
+- The remaining values are not names in the dictionary. They may be names of other kinds (sounds, animations,
+  scenarios), or resources whose own name string `rpf9_names.py` does not find.
+
+```text
+python -I tools/psin_names.py <PSIN file or carve directory> --names <rpf9_names.json> [--names ...]
+                              [--json] [--fields N] [--refs OUT.tsv] [--limit N]
+```
+
+The text output gives the totals and the fields with the most resolved values, as hashes. `--json` adds the whole
+field table. `--refs` writes one row per resolved value: file, struct, field, type, value and name. These are game names,
+so keep them in your local work folder; only the counts belong in git, issues or pull requests. On the data above the
+run takes about 50 s. `tests/test_psin_names.py` builds containers from invented names.
+
 ## What it does not give
 
-- No plaintext script code, function names or string table. `LSNS` is high-entropy and is not
-  decoded; the measured body does not decompress with zlib (15/-15/31) or raw LZ4.
-- No station/track names, no model names, no file paths. The archive TOC is still the only source
-  for original names.
+- No plaintext script code, function names or string table. `LSNS` has a decoded block layout, but its
+  16-byte records are uniformly random and match no tested name hash (see *`LSNS`*).
+- No station/track names or file paths. Model names occur only as hashes; a name list from elsewhere resolves
+  them (see *Name hashes in the data*). The archive TOC is still the only source for original paths.
 - No names. `LSCH` and `LENM` give the schema as 32-bit name hashes only; resolving them needs a name
   list from elsewhere (see *Hashes*).
 
@@ -360,7 +471,7 @@ only.
 
 - The 64 KiB split is not joined automatically. A caller that has the archive order can join adjacent
   blocks first; the tool then parses the complete container.
-- `LSNS` and `CHKS` payloads are opaque to this tool. `LSCH` and `LENM` are decoded as above, and the instance
+- `LSNS` record contents and the `CHKS` payload are opaque to this tool; only the `LSNS` block layout is read. `LSCH` and `LENM` are decoded as above, and the instance
   data by `tools/psin_data.py`. Struct, member and enum names stay 32-bit hashes, and most of them have no known
   name.
 - No game data, names, hashes or payloads are committed. The carve directories are local.

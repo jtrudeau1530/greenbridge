@@ -37,6 +37,27 @@ class UnsupportedConstruct(NotImplementedError):
     """The module uses something this interpreter deliberately does not model."""
 
 
+class InvalidModule(AssertionError):
+    """The module breaks a SPIR-V structural rule spirv-val enforces, so no driver would accept it, even though
+    this interpreter could run it. Raised instead of returning results for a shader that never reaches a GPU."""
+
+
+def check_structure(body):
+    """spirv-val's merge rule (SPIR-V 2.16.2): OpSelectionMerge must be the second-to-last instruction of its block,
+    directly before OpBranchConditional or OpSwitch, and OpLoopMerge directly before OpBranch or
+    OpBranchConditional. Until 2026-11-22 the interpreter skipped merges, so a translator change that put an
+    instruction between a merge and its branch (#1633: OpLoad %active) passed every semantic test while every
+    driver rejected the module. `body` is the list of (result, opcode, operands, line) of a function."""
+    follow = {"OpSelectionMerge": ("OpBranchConditional", "OpSwitch"),
+              "OpLoopMerge": ("OpBranch", "OpBranchConditional")}
+    for k, (_, op, _, line) in enumerate(body):
+        if op in follow:
+            nxt = body[k + 1][1] if k + 1 < len(body) else None
+            if nxt not in follow[op]:
+                raise InvalidModule(f"{line!r} is followed by {body[k + 1][3] if nxt else 'the end of the function'!r}"
+                                    f", not by {' or '.join(follow[op])}")
+
+
 # Instructions that carry no runtime semantics for a single-entry-point, straight-line module.
 _IGNORED = frozenset({
     "OpCapability", "OpExtension", "OpExtInstImport", "OpMemoryModel", "OpEntryPoint", "OpExecutionMode",
@@ -463,6 +484,7 @@ def _invocation(text, inputs, push_constants, memory, step=False):
             raise UnsupportedConstruct(f"{op} in module header")
     if not in_body:
         raise UnsupportedConstruct("no function body")
+    check_structure(body)
 
     def deref(p):
         box, i = p
@@ -680,6 +702,12 @@ def _invocation(text, inputs, push_constants, memory, step=False):
             for i in a[2:]:
                 v = v[int(i)]
             values[res] = v
+        elif op == "OpVectorExtractDynamic":
+            # SPIR-V: an Index outside the vector's component count gives an undefined value
+            v, i = val(a[1]), val(a[2])
+            if not isinstance(i, int) or not 0 <= i < len(v):
+                raise UnsupportedConstruct(f"OpVectorExtractDynamic index {i!r} outside the vector")
+            values[res] = v[i]
         elif op == "OpCompositeConstruct":
             values[res] = tuple(val(x) for x in a[1:])
         elif op == "OpBitwiseAnd":
@@ -930,6 +958,12 @@ def _invocation(text, inputs, push_constants, memory, step=False):
                 values[res] = f32(math.sin(args[0]) if name == "Sin" else math.cos(args[0]))
             elif name == "FAbs":
                 values[res] = f32(abs(args[0]))
+            elif name == "FSign":
+                # GLSL.std.450: 1.0 if x > 0, 0.0 if x = 0 (keeping the zero's sign), -1.0 if x < 0
+                x = args[0]
+                if math.isnan(x):
+                    raise UnsupportedConstruct("GLSL.std.450 FSign of a NaN (result not specified)")
+                values[res] = 1.0 if x > 0 else -1.0 if x < 0 else x
             elif name == "SAbs":
                 # Two's complement: the most negative value is its own absolute value (as on the hardware).
                 values[res] = abs(_s32(args[0])) & MASK

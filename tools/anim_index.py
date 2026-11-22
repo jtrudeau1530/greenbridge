@@ -26,6 +26,7 @@ import os
 import re
 import struct
 import sys
+import unicodedata
 import zlib
 
 # zlib stream start, or a Bink 2 video ('KB2' + revision letter). Kept in step with rpf9_carve.py.
@@ -457,7 +458,7 @@ def write_output(path, rows, summary):
             json.dump({"summary": summary, "files": rows}, f, indent=1)
         return
     with open(path, "w", encoding="utf-8", newline="") as f:
-        w = csv.writer(f)
+        w = csv.writer(f, lineterminator="\n")
         w.writerow(COLUMNS)
         for r in rows:
             w.writerow([f"0x{r['offset']:x}" if i == 0 else ("" if r[c] is None else r[c])
@@ -486,8 +487,35 @@ def byte_count(text):
     return value
 
 
+_PC_CASE_SENSITIVE = 11  # <sys/unistd.h> on macOS; os.pathconf_names doesn't list it
+
+
+def _case_insensitive_volume(path):
+    """True when the volume that will hold `path` ignores letter case, as macOS's default APFS volume does.
+    os.path.normcase folds case only on Windows, so on macOS `R.json` and `r.json` would pass as two reports."""
+    if sys.platform != "darwin":
+        return False
+    while not os.path.exists(path):
+        parent = os.path.dirname(path)
+        if parent == path:
+            break
+        path = parent
+    try:
+        return os.pathconf(path, _PC_CASE_SENSITIVE) == 0
+    except (OSError, ValueError):
+        return True  # the macOS default; folding can only refuse a pair, never overwrite one
+
+
+def _path_key(path):
+    path = os.path.normcase(os.path.realpath(path))
+    if _case_insensitive_volume(path):
+        # APFS and HFS+ also treat composed and decomposed accents as one name.
+        path = unicodedata.normalize("NFD", path.casefold())
+    return path
+
+
 def same_report_path(first, second):
-    if os.path.normcase(os.path.realpath(first)) == os.path.normcase(os.path.realpath(second)):
+    if _path_key(first) == _path_key(second):
         return True
     try:
         return os.path.samefile(first, second)

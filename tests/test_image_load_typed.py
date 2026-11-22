@@ -288,6 +288,20 @@ class TypedGatherShaders(unittest.TestCase):
                 self.assertEqual(footprints[0], footprints[1])
                 self.assertEqual(footprints[0], footprints[2])
 
+    def test_implicit_2d_sample_takes_gradients_before_typed_dispatch(self):
+        m = Module(translate(["image_sample v[0:1], v[4:5], s[0:7], s[8:11] "
+                              "dmask:0xf dim:SQ_RSRC_IMG_2D d16"]))
+        samples = [args for _, op, args in m.order if op == "OpImageSampleExplicitLod"]
+        self.assertEqual({args[0] for args in samples}, {"%v4float", "%v4uint_st", "%v4int_st"})
+        dispatch = re.search(r"OpBranchConditional %\w+ %\w+_s %\w+_rest", m.text)
+        self.assertIsNotNone(dispatch)
+        for _, _, coords, mode, dx, dy in samples:
+            self.assertEqual(mode, "Grad")
+            self.assertEqual(m.defs[dx], ("OpDPdx", ["%v2float", coords]))
+            self.assertEqual(m.defs[dy], ("OpDPdy", ["%v2float", coords]))
+            # The gradients must exist before the image-class selection can diverge.
+            self.assertLess(m.text.index(f"{dy} = OpDPdy"), dispatch.start())
+
     def test_2d_gather_picks_the_sampled_type_and_selected_component(self):
         for dst, modifier in (("v[0:3]", ""), ("v[0:1]", " d16")):
             with self.subTest(modifier=modifier):

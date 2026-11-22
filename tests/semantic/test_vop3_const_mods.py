@@ -166,11 +166,26 @@ class F16AndMixConstModifierTests(unittest.TestCase):
         # -0.5f, -1.0f, -1.0h * 2.0f + 0.5f = -1.5f, compare true = 1
         self.assertEqual(got, [0xBF000000, 0xBF800000, 0xBFC00000, 1])
 
-    def test_v_pack_b32_f16_still_rejects_modified_constant(self):
-        # Previously neg(0x3c00) silently folded to -0x3c00 (0xc400 = -4.0h) and bypassed the modifier check.
-        with self.assertRaises(rdna2spirv.Unsupported):
-            translate(["v_pack_b32_f16 v0, neg(0x3c00), 1.0"])
+    def test_v_pack_b32_f16_neg_flips_the_packed_half(self):
+        # SHADER-260, measured on gfx1036: `neg` on this instruction is a plain sign flip of the half it packs,
+        # before any quieting (0x7c01 -> 0xfc01 in IEEE mode 0 and -> 0xfe01 in mode 1), in either half and with
+        # op_sel. It used to be refused, together with every other modifier (and before that, neg(0x3c00) silently
+        # folded to -0x3c00 = 0xc400, -4.0h, bypassing the modifier check).
+        got = run([
+            "v_mov_b32 v1, 0x7c01",
+            "v_pack_b32_f16 v0, neg(0x3c00), 0x4000",     # -1.0h in the low half, 2.0h in the high one
+            "v_pack_b32_f16 v2, neg(v1), v1",            # sign flip on the low half only; no quieting is modelled
+        ])
+        self.assertEqual(got[:3], [0x4000BC00, 0x00007C01, 0x7C01FC01])
 
+    def test_v_pack_b32_f16_abs_clears_the_sign_of_the_packed_half(self):
+        # `abs` is the ISA's sign clear (|S|), applied before `neg`; it has no hardware run of this instruction yet.
+        got = run([
+            "v_mov_b32 v1, 0xbc00",
+            "v_pack_b32_f16 v0, abs(0xbc00), 0x4000",     # +1.0h in the low half, 2.0h in the high one
+            "v_pack_b32_f16 v2, -abs(v1), v1",            # clear then flip the low half; src1 stays -1.0h
+        ])
+        self.assertEqual(got[:3], [0x40003C00, 0x0000BC00, 0xBC00BC00])
 
 class F64ConstModifierStructureTests(unittest.TestCase):
     def test_f64_emits_fabs_then_fnegate_for_neg_abs_const(self):

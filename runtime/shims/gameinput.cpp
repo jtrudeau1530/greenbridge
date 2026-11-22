@@ -50,8 +50,9 @@ using namespace gi;
 
 namespace {
 
-constexpr uint32_t kSupportedKinds =
+constexpr uint32_t kBaseKinds =
     GameInputKindControllerAxis | GameInputKindControllerButton | GameInputKindGamepad | GameInputKindUiNavigation;
+constexpr uint32_t kSupportedKinds = kBaseKinds | GameInputKindMotion;  // everything a reading may carry
 constexpr uint32_t kAxisCount = 6;  // LX, LY, RX, RY, LT, RT
 constexpr uint32_t kButtonCount = SDL_GAMEPAD_BUTTON_COUNT;
 constexpr uint32_t kConnectedStatus = GameInputDeviceConnected | GameInputDeviceInputEnabled | GameInputDeviceOutputEnabled;
@@ -61,6 +62,14 @@ constexpr uint64_t kBatteryRefreshUs = 1'000'000;
 constexpr int kDsEffectSize = 47;  // the DualSense effects block SDL_SendGamepadEffect forwards (SDL's DS5EffectsState_t)
 constexpr uint64_t kHistoryUs = 500'000;  // a reading stays in the history until the one after it is this old
 constexpr size_t kHistoryCap = 512;       // readings per pad, whatever the poll rate
+// Motion. SDL gives accel in m/s^2 (gravity included) and gyro in rad/s; the state the ABI defines carries signed
+// fractions of the maxima motionInfo reports, so a reading stays within -1..1 however hard the pad is shaken. The
+// maxima are this shim's choice: SDL does not expose a sensor range, and 2 g / 2000 deg/s are the ranges a
+// DualSense's accelerometer and gyro can express (VERIFY: against the game and a real pad, docs/gameinput.md).
+constexpr float kMaxAcceleration = 19.6133f;     // 2 g in m/s^2
+constexpr float kMaxAngularVelocity = 34.9066f;  // 2000 deg/s in rad/s
+constexpr float kMotionSensorRate = 250.0f;      // requested sample rate; the device clamps to what it has
+constexpr uint64_t kMotionReadingUs = 8'000;     // a motion pad streams readings at ~125 Hz so the history stays sane
 
 uint64_t now_us() {
     static const LARGE_INTEGER freq = [] { LARGE_INTEGER f; QueryPerformanceFrequency(&f); return f; }();
@@ -133,6 +142,8 @@ struct Snapshot {
     float axes[kAxisCount] = {};
     bool buttons[kButtonCount] = {};
     bool guide = false;
+    GameInputMotionState motion{};  // valid only when has_motion; does not take part in operator==
+    bool has_motion = false;
     bool operator==(const Snapshot& o) const {  // field by field: the padding is not initialised
         const GameInputGamepadState &a = gamepad, &b = o.gamepad;
         return a.buttons == b.buttons && a.leftTrigger == b.leftTrigger && a.rightTrigger == b.rightTrigger &&
@@ -164,7 +175,9 @@ public:
         return r;
     }
 
-    uint32_t STDMETHODCALLTYPE GetInputKind() override { return kSupportedKinds; }
+    uint32_t STDMETHODCALLTYPE GetInputKind() override {
+        return s_.has_motion ? kSupportedKinds : kBaseKinds;  // a reading of a pad without sensors carries no motion
+    }
     uint64_t STDMETHODCALLTYPE GetSequenceNumber(uint32_t) override { return seq_; }
     uint64_t STDMETHODCALLTYPE GetTimestamp() override { return ts_; }
     void STDMETHODCALLTYPE GetDevice(IGameInputDevice** device) override;
@@ -191,7 +204,11 @@ public:
     bool STDMETHODCALLTYPE GetMouseState(void*) override { return false; }
     uint32_t STDMETHODCALLTYPE GetTouchCount() override { return 0; }
     uint32_t STDMETHODCALLTYPE GetTouchState(uint32_t, void*) override { return 0; }
-    bool STDMETHODCALLTYPE GetMotionState(void*) override { return false; }
+    bool STDMETHODCALLTYPE GetMotionState(void* state) override {
+        if (!state || !s_.has_motion) return false;
+        *static_cast<GameInputMotionState*>(state) = s_.motion;
+        return true;
+    }
     bool STDMETHODCALLTYPE GetArcadeStickState(void*) override { return false; }
     bool STDMETHODCALLTYPE GetFlightStickState(void*) override { return false; }
     bool STDMETHODCALLTYPE GetGamepadState(GameInputGamepadState* state) override {
@@ -281,6 +298,7 @@ public:
     GameInputControllerButtonInfo button_info[kButtonCount]{};
     GameInputGamepadInfo gamepad_info{};
     GameInputUiNavigationInfo ui_info{};
+    GameInputMotionInfo motion_info{};  // filled only when the pad has sensors; info.motionInfo points at it
     std::atomic<uint32_t> status{GameInputDeviceNoStatus};
     std::deque<Reading*> history;  // one reference each, oldest first; the newest is the current reading
     uint64_t evicted_order = 0;    // order of the newest reading dropped from history
@@ -294,9 +312,10 @@ public:
     SDL_Gamepad* pad = nullptr;
     SDL_JoystickID id = 0;
     int player = -1;
-    bool is_dualsense = false, has_rumble = false, has_trigger_rumble = false;
+    bool is_dualsense = false, has_rumble = false, has_trigger_rumble = false, has_motion = false;
     rt::gameinput::OutputState sent{};
     Snapshot last_snap{};  // what the latest reading holds
+    uint64_t last_reading_us = 0;  // for the motion cadence: readings stream at ~125 Hz on pads with sensors
     uint64_t motors_sent_at = 0, triggers_sent_at = 0, battery_at = 0;
     bool ds_sent_once = false;
 
@@ -446,7 +465,10 @@ uint16_t to_u16(float v) { return static_cast<uint16_t>(std::lround(std::clamp(v
 
 float axis(SDL_Gamepad* p, SDL_GamepadAxis a) { return std::max(-1.0f, SDL_GetGamepadAxis(p, a) / 32767.0f); }
 
-Snapshot read_pad(SDL_Gamepad* p) {
+float norm(float v, float max) { return std::clamp(v / max, -1.0f, 1.0f); }
+
+Snapshot read_pad(Device* d) {
+    SDL_Gamepad* p = d->pad;
     Snapshot s;
     auto down = [p](SDL_GamepadButton b) { return SDL_GetGamepadButton(p, b); };
     struct Map { SDL_GamepadButton sdl; uint32_t gi; };
@@ -485,6 +507,31 @@ Snapshot read_pad(SDL_Gamepad* p) {
     s.axes[5] = s.gamepad.rightTrigger;
     for (uint32_t i = 0; i < kButtonCount; ++i) s.buttons[i] = down(static_cast<SDL_GamepadButton>(i));
     s.guide = down(SDL_GAMEPAD_BUTTON_GUIDE);
+
+    // Motion, normalised against the maxima motionInfo reports (the ABI's fraction convention). Sensors were enabled
+    // when the pad was opened; a pad whose sensor read fails just reports no motion this poll. SDL answers reads
+    // with zeros before the device's first sample arrives, and gravity makes a real accelerometer never read
+    // exactly zero, so all-zero accel means "no sample yet" and the reading carries no motion at all.
+    if (d->has_motion) {
+        float accel[3], gyro[3];
+        if (SDL_GetGamepadSensorData(p, SDL_SENSOR_ACCEL, accel, 3) &&
+            SDL_GetGamepadSensorData(p, SDL_SENSOR_GYRO, gyro, 3) &&
+            (accel[0] != 0.0f || accel[1] != 0.0f || accel[2] != 0.0f)) {
+            s.has_motion = true;
+            s.motion.accelerationX = norm(accel[0], kMaxAcceleration);
+            s.motion.accelerationY = norm(accel[1], kMaxAcceleration);
+            s.motion.accelerationZ = norm(accel[2], kMaxAcceleration);
+            s.motion.angularVelocityX = norm(gyro[0], kMaxAngularVelocity);
+            s.motion.angularVelocityY = norm(gyro[1], kMaxAngularVelocity);
+            s.motion.angularVelocityZ = norm(gyro[2], kMaxAngularVelocity);
+            // SDL's gamepad API has no compass and the shim synthesises no orientation, so those stay zero and
+            // unknown rather than a made-up value.
+            s.motion.accelerometerAccuracy = GameInputMotionAccuracyHigh;
+            s.motion.gyroscopeAccuracy = GameInputMotionAccuracyHigh;
+            s.motion.magnetometerAccuracy = GameInputMotionAccuracyUnknown;
+            s.motion.orientationAccuracy = GameInputMotionAccuracyUnknown;
+        }
+    }
 
     // UI navigation derived from the gamepad (VERIFY against the console's own mapping).
     const uint32_t b = s.gamepad.buttons;
@@ -544,10 +591,19 @@ void fill_info(Device* d, SDL_Gamepad* p, const AppLocalDeviceId& id) {
     // filters on the family).
     i.deviceFamily = GameInputFamilyXboxOne;
     if (SDL_GetGamepadConnectionState(p) == SDL_JOYSTICK_CONNECTION_WIRELESS) i.capabilities |= GameInputDeviceCapabilityWireless;
-    i.supportedInput = kSupportedKinds;
+    // The per-device kind set: the reading-kind searches take the global kSupportedKinds as the outer bound and this
+    // as the per-device one, so only pads with sensors answer a motion query.
+    i.supportedInput = kBaseKinds;
     if (d->has_rumble) i.supportedRumbleMotors |= GameInputRumbleLowFrequency | GameInputRumbleHighFrequency;
     if (d->has_trigger_rumble || (d->is_dualsense && g().config.ds_triggers != rt::gameinput::DsTriggerMode::Off))
         i.supportedRumbleMotors |= GameInputRumbleLeftTrigger | GameInputRumbleRightTrigger;
+    if (d->has_motion) {
+        i.supportedInput |= GameInputKindMotion;
+        // The maxima GetMotionState's fractions divide by. The magnetometer is not available: SDL's gamepad API has
+        // no compass, and maxMagneticFieldStrength 0 says so (Microsoft's GameInputMotionInfo remarks).
+        d->motion_info = {kMaxAcceleration, kMaxAngularVelocity, 0.0f};
+        i.motionInfo = &d->motion_info;
+    }
     i.controllerAxisCount = kAxisCount;
     i.controllerButtonCount = kButtonCount;
     for (uint32_t a = 0; a < kAxisCount; ++a) {
@@ -583,6 +639,7 @@ void fill_info(Device* d, SDL_Gamepad* p, const AppLocalDeviceId& id) {
 // the title holds outlive their place here (~Reading only releases the device, which takes no lock). Under g().mu.
 Reading* push_reading(Device* d, const Snapshot& snap, uint64_t ts) {
     std::deque<Reading*>& h = d->history;
+    d->last_reading_us = ts;
     h.push_back(new Reading(d, snap, ++d->seq, ts, ++g().last_order));
     while (h.size() > kHistoryCap || (h.size() > 1 && h[1]->GetTimestamp() + kHistoryUs < ts)) {
         d->evicted_order = h.front()->order();
@@ -637,6 +694,13 @@ void open_pad(SDL_JoystickID jid, uint64_t ts) {
     d->is_dualsense = SDL_GetGamepadType(p) == SDL_GAMEPAD_TYPE_PS5;
     d->has_rumble = SDL_GetBooleanProperty(props, SDL_PROP_GAMEPAD_CAP_RUMBLE_BOOLEAN, false);
     d->has_trigger_rumble = SDL_GetBooleanProperty(props, SDL_PROP_GAMEPAD_CAP_TRIGGER_RUMBLE_BOOLEAN, false);
+    // Motion needs both sensors; SDL's orientation quaternion is left alone (no title asks for it, and a synthesised
+    // one would lie). Enabling at open: SDL delivers samples only for enabled sensors.
+    d->has_motion = SDL_GamepadHasSensor(p, SDL_SENSOR_GYRO) && SDL_GamepadHasSensor(p, SDL_SENSOR_ACCEL);
+    if (d->has_motion) {
+        SDL_SetGamepadSensorEnabled(p, SDL_SENSOR_GYRO, kMotionSensorRate);
+        SDL_SetGamepadSensorEnabled(p, SDL_SENSOR_ACCEL, kMotionSensorRate);
+    }
     d->sent = {};
     d->sent.is_dualsense = d->is_dualsense;
     d->sent.trigger_rumble = d->has_trigger_rumble;
@@ -662,13 +726,13 @@ void open_pad(SDL_JoystickID jid, uint64_t ts) {
     d->status = status;
     s.connected.push_back(d);
 
-    const Snapshot snap = read_pad(p);
+    const Snapshot snap = read_pad(d);
     d->last_snap = snap;
     push_reading(d, snap, ts);
     queue_event({CbType::Device, d, nullptr, ts, status, GameInputDeviceNoStatus, false, 0});
-    std::fprintf(stderr, "[rt] gameinput: connected %s (%04x:%04x, player %d%s%s)\n", d->name.c_str(), d->info.vendorId,
-                 d->info.productId, player + 1, d->is_dualsense ? ", DualSense trigger effects" : "",
-                 d->has_trigger_rumble ? ", trigger rumble" : "");
+    std::fprintf(stderr, "[rt] gameinput: connected %s (%04x:%04x, player %d%s%s%s)\n", d->name.c_str(),
+                 d->info.vendorId, d->info.productId, player + 1, d->is_dualsense ? ", DualSense trigger effects" : "",
+                 d->has_trigger_rumble ? ", trigger rumble" : "", d->has_motion ? ", gyro" : "");
 }
 
 void close_pad(Device* d, uint64_t ts) {
@@ -984,11 +1048,15 @@ void poll_once() {
         connected = s.connected;
     }
     for (Device* d : connected) {
-        const Snapshot snap = read_pad(d->pad);
+        const Snapshot snap = read_pad(d);
         const bool guide_changed = d->last_snap.guide != snap.guide;
         const bool changed = !(d->last_snap == snap);
         d->last_snap = snap;
-        if (changed) {
+        // A pad with sensors streams readings at ~125 Hz even when nothing else changes, so motion the title reads
+        // between its frames is never stuck at the last button event; pads without sensors only read on change, as
+        // before. push_reading stamps last_reading_us, so the cadence follows the actual history.
+        const bool motion_tick = snap.has_motion && now - d->last_reading_us >= kMotionReadingUs;
+        if (changed || motion_tick) {
             std::lock_guard lock(s.mu);
             queue_event({CbType::Reading, d, push_reading(d, snap, now), now, 0, 0, false, 0});
         }
@@ -1121,6 +1189,8 @@ HRESULT find_reading(IGameInputReading* ref, uint32_t kind, IGameInputDevice* de
     uint64_t horizon = 0;
     if (device) {
         if (as_device(device)->status == GameInputDeviceNoStatus) return GAMEINPUT_E_DEVICE_DISCONNECTED;
+        if (kind != GameInputKindUnknown && !(kind & as_device(device)->info.supportedInput))
+            return GAMEINPUT_E_READING_NOT_FOUND;  // the device does not do this kind (motion on a plain pad)
         scope = {as_device(device)};
     } else {
         horizon = r->device()->evicted_order;
@@ -1165,6 +1235,8 @@ public:
         if (device) {
             Device* d = as_device(device);
             if (d->status == GameInputDeviceNoStatus) return GAMEINPUT_E_DEVICE_DISCONNECTED;
+            if (kind != GameInputKindUnknown && !(kind & d->info.supportedInput))
+                return GAMEINPUT_E_READING_NOT_FOUND;  // the device does not do this kind (motion on a plain pad)
             best = d->latest();
         } else {
             for (Device* d : g().connected)  // the most recent reading from any gamepad

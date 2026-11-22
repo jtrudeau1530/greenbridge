@@ -74,10 +74,14 @@ def reconcile(shader_reads, dwords):
     issues = []
     by_sgpr = {}
     for read in shader_reads:
-        by_sgpr.setdefault(read["sgpr"], []).append(read["kind"])
+        sgpr = read["sgpr"]
+        if type(sgpr) is not int:  # bool is an int subclass, but not a valid SGPR index.
+            issues.append(f"invalid SGPR index {sgpr!r}: expected an integer")
+            continue
+        by_sgpr.setdefault(sgpr, []).append(read["kind"])
     for sgpr in sorted(by_sgpr):
         kinds = by_sgpr[sgpr]
-        if sgpr >= len(dwords):
+        if sgpr < 0 or sgpr >= len(dwords):
             issues.append(f"s{sgpr} read but layout has {len(dwords)} dwords")
             continue
         slot = dwords[sgpr]
@@ -89,6 +93,8 @@ def reconcile(shader_reads, dwords):
                 issues.append(
                     f"s{sgpr} ({kind}) incompatible with param "
                     f"{slot['param']} ({slot['ptype']})")
+            elif kind == "ptr64_lo" and slot["sub"] != 0:
+                issues.append(f"s{sgpr} (ptr64_lo) reads the high half of the address")
             if kind == "ptr64_hi":
                 lo = dwords[sgpr - 1] if sgpr > 0 else None
                 if slot["sub"] != 1 or lo is None or lo["param"] != slot["param"] \
@@ -102,7 +108,10 @@ def cluster(shaders):
     groups = {}
     for name, entry in shaders.items():
         reads = entry.get("user_sgpr_reads", [])
-        shape = tuple(sorted((r["sgpr"], r["kind"]) for r in reads))
+        shape = tuple(sorted(
+            ((r["sgpr"], r["kind"]) if type(r["sgpr"]) is int
+             else (f"invalid:{r['sgpr']!r}", r["kind"]) for r in reads),
+            key=lambda item: (type(item[0]) is not int, item[0], item[1])))
         groups.setdefault(shape, []).append(name)
     ranked = sorted(groups.items(), key=lambda kv: -len(kv[1]))
     return [(shape, len(names), names) for shape, names in ranked]

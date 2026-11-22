@@ -591,6 +591,20 @@ def main() -> int:
     parser.add_argument("--json", help="write the aggregate graph summary to this JSON")
     args = parser.parse_args()
 
+    if args.json:
+        if os.path.isdir(args.json):
+            parser.error(f"--json is a directory: {args.json}")
+        for target in args.targets:
+            source = os.path.join(target, "index.json") if os.path.isdir(target) else target
+            if gx.same_report_path(args.json, source):
+                parser.error(f"--json would overwrite the input {source}")
+            if os.path.isdir(target) and os.path.isfile(args.json):
+                root = os.path.normcase(os.path.abspath(target))
+                dest = os.path.normcase(os.path.abspath(args.json))
+                if os.path.dirname(dest) == root or dest.startswith(root + os.sep):
+                    if dest.endswith(".bin"):
+                        parser.error(f"--json would overwrite an input file: {args.json}")
+
     try:
         documents = list(gx.load_documents(args.targets))
     except FileNotFoundError as exc:

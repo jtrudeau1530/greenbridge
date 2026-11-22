@@ -82,6 +82,15 @@ CASES = {
     "v_pack_b32_f16": ("v_pack_b32_f16 v3, v1, v2", 0xAAAA3C00, 0xBBBB4000, 0, 0x40003C00),
     "v_pack_b32_f16_sel": ("v_pack_b32_f16 v3, v1, v2 op_sel:[1,0,0]", 0x3C00BBBB, 0xAAAA4000, 0, 0x4000 << 16 | 0x3C00),
     "v_pack_b32_f16_sel_hi": ("v_pack_b32_f16 v3, v1, v2 op_sel:[0,1,0]", 0xAAAA3C00, 0x4000BBBB, 0, 0x4000 << 16 | 0x3C00),
+    # SHADER-260: a `neg` on this instruction flips the sign bit of the half it packs (gfx1036, IEEE mode 0), not
+    # of the whole 32-bit source, and only that half.
+    "v_pack_b32_f16_neg_lo": ("v_pack_b32_f16 v3, neg(v1), v2", 0xAAAA3C00, 0xBBBB4000, 0, 0x4000BC00),
+    "v_pack_b32_f16_neg_hi_sel": ("v_pack_b32_f16 v3, v1, neg(v2) op_sel:[0,1,0]", 0xAAAA3C00, 0x4000BBBB, 0,
+                                  0xC0003C00),
+    # `abs` is the ISA's sign clear (|S|), applied before `neg`; it has no hardware run of this instruction yet.
+    "v_pack_b32_f16_abs_lo": ("v_pack_b32_f16 v3, abs(v1), v2", 0xAAAABC00, 0xBBBB4000, 0, 0x40003C00),
+    "v_pack_b32_f16_abs_snan": ("v_pack_b32_f16 v3, abs(v1), v2", 0xAAAAFC01, 0xBBBB4000, 0, 0x40007C01),
+    "v_pack_b32_f16_neg_abs": ("v_pack_b32_f16 v3, -abs(v1), v2", 0xAAAA3C00, 0xBBBB4000, 0, 0x4000BC00),
     # 16-bit float add keeps the other half of the destination (GFX10 partial write; see docs/design.md).
     # These pin the translator's keep; they do not reproduce the AMD driver quirk in valu_fuzz f16
     # seed 3 programme 38, where the same keep is lost on the GPU (driver 26.11.1, RX 9070).

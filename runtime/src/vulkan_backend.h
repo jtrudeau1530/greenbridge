@@ -10,8 +10,12 @@
 #endif
 #include "binary_occlusion_spirv.h"
 #include "occlusion_sum_spirv.h"
+#include "retire_tickets.h"
+#include "statistics_sum_spirv.h"
 #include "vulkan_depth24.h"
+#include "vulkan_scratch.h"
 #include "vulkan_replay.h"
+#include "xdxr_build.h"
 
 #include <algorithm>
 #include <atomic>
@@ -69,7 +73,8 @@ struct VulkanDeviceFunctions {
     X(vkCreateComputePipelines) X(vkDestroyPipeline) X(vkCmdBindPipeline) X(vkCmdBindDescriptorSets)            \
     X(vkCmdPushConstants) X(vkCmdDispatch)                                                                     \
     X(vkCmdBindVertexBuffers2) X(vkCmdBindIndexBuffer) X(vkCmdSetViewport) X(vkCmdSetScissor)                  \
-    X(vkCmdSetPrimitiveTopology) X(vkCmdSetStencilReference) X(vkCmdSetBlendConstants) X(vkCmdDraw)            \
+    X(vkCmdSetPrimitiveTopology) X(vkCmdSetPrimitiveRestartEnable) X(vkCmdSetStencilReference)                          \
+    X(vkCmdSetBlendConstants) X(vkCmdDraw)                                                                              \
     X(vkCmdDrawIndexed) X(vkCreateGraphicsPipelines)
 #define LEONIDA_VK_MEMBER(name) PFN_##name name = nullptr;
     LEONIDA_VK_DEVICE_FUNCTIONS(LEONIDA_VK_MEMBER)
@@ -101,7 +106,8 @@ struct VulkanDeviceFunctions {
 
     // Graphics pipelines also need these Vulkan 1.3 entry points (dynamic rendering, extended dynamic state).
     bool graphics_complete() const {
-        return vkCmdBeginRendering && vkCmdEndRendering && vkCmdBindVertexBuffers2 && vkCmdSetPrimitiveTopology;
+        return vkCmdBeginRendering && vkCmdEndRendering && vkCmdBindVertexBuffers2 && vkCmdSetPrimitiveTopology &&
+               vkCmdSetPrimitiveRestartEnable;
     }
 };
 
@@ -116,6 +122,7 @@ public:
     ~OcclusionResolve() {
         if (sum_pipeline_) vk_.vkDestroyPipeline(device_, sum_pipeline_, nullptr);
         if (binary_pipeline_) vk_.vkDestroyPipeline(device_, binary_pipeline_, nullptr);
+        if (statistics_pipeline_) vk_.vkDestroyPipeline(device_, statistics_pipeline_, nullptr);
         if (layout_) vk_.vkDestroyPipelineLayout(device_, layout_, nullptr);
         if (pool_) vk_.vkDestroyDescriptorPool(device_, pool_, nullptr);
         if (set_layout_) vk_.vkDestroyDescriptorSetLayout(device_, set_layout_, nullptr);
@@ -190,9 +197,33 @@ public:
         return vk_.vkCreatePipelineLayout(device_, &layout, nullptr, &layout_) == VK_SUCCESS;
     }
 
-    bool prepare(bool needs_sum, bool needs_binary) {
+    bool prepare(bool needs_sum, bool needs_binary, bool needs_statistics_sum = false) {
         return (!needs_sum || sum_pipeline_ || create_pipeline(occlusion_sum_spirv, sum_pipeline_)) &&
-               (!needs_binary || binary_pipeline_ || create_pipeline(binary_occlusion_spirv, binary_pipeline_));
+               (!needs_binary || binary_pipeline_ || create_pipeline(binary_occlusion_spirv, binary_pipeline_)) &&
+               (!needs_statistics_sum || statistics_pipeline_ ||
+                create_pipeline(statistics_sum_spirv, statistics_pipeline_));
+    }
+
+    // Adds `count` pipeline-statistics results (11 counters each) into one D3D12_QUERY_DATA_PIPELINE_STATISTICS at
+    // dst + offset: the segments of a statistics query that was split around helper dispatches (D3D-162).
+    void sum_statistics(VkCommandBuffer cb, VkQueryPool queries, std::uint32_t first, std::uint32_t count,
+                        VkBuffer dst, VkDeviceSize offset) const {
+        constexpr VkDeviceSize result = statistics_counters * word_size;
+        begin_scratch_write(cb);
+        vk_.vkCmdFillBuffer(cb, scratch_, 0, result, 0);
+        bind(cb, statistics_pipeline_);
+        while (count) {
+            const auto chunk = std::min(count, statistics_capacity);
+            vk_.vkCmdCopyQueryPoolResults(cb, queries, first, chunk, scratch_, result, result,
+                                          VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+            barrier(cb, transfer | compute, compute, VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+                    shader_access);
+            dispatch(cb, chunk, 1);
+            first += chunk;
+            count -= chunk;
+            if (count) barrier(cb, compute, transfer, shader_access, VK_ACCESS_TRANSFER_WRITE_BIT);
+        }
+        copy_result(cb, dst, offset, result);
     }
 
     void sum(VkCommandBuffer cb, VkQueryPool queries, std::uint32_t first, std::uint32_t count,
@@ -291,8 +322,11 @@ private:
     static constexpr std::uint32_t sum_capacity = 256;  // one more word holds the running sum
     static constexpr std::uint32_t binary_capacity = 1024;
     static constexpr std::uint32_t binary_group_size = 64;  // local_size_x in binary_occlusion.comp
+    static constexpr std::uint32_t statistics_counters = 11;  // local_size_x in statistics_sum.comp
+    static constexpr std::uint32_t statistics_capacity = 64;  // segments per pass; 11 more words hold the sums
     static constexpr VkDeviceSize word_size = sizeof(std::uint64_t);
-    static constexpr VkDeviceSize scratch_size = std::max(sum_capacity + 1, binary_capacity) * word_size;
+    static constexpr VkDeviceSize scratch_size =
+        std::max({sum_capacity + 1, binary_capacity, (statistics_capacity + 1) * statistics_counters}) * word_size;
     const VulkanDeviceFunctions& vk_;
     VkDevice device_;
     VkBuffer scratch_ = VK_NULL_HANDLE;
@@ -303,6 +337,7 @@ private:
     VkPipelineLayout layout_ = VK_NULL_HANDLE;
     VkPipeline sum_pipeline_ = VK_NULL_HANDLE;
     VkPipeline binary_pipeline_ = VK_NULL_HANDLE;
+    VkPipeline statistics_pipeline_ = VK_NULL_HANDLE;
 };
 
 // Zero-allocation O(1) Ring Buffer deferred deletion queue tied to the device timeline semaphore.
@@ -615,8 +650,9 @@ class VulkanContext {
 public:
     // conditional_rendering: VK_EXT_conditional_rendering is enabled on `device` (SetPredication).
     // ray_tracing: VK_KHR_acceleration_structure + VK_KHR_ray_query are enabled on `device`.
+    // xdxr: acceleration-structure builds write XDXR BVH4 records (xdxr_build.h) instead; needs bufferDeviceAddress.
     VulkanContext(PFN_vkGetDeviceProcAddr get, VkDevice device, bool separate_depth_stencil_layouts,
-                  bool conditional_rendering = false, bool ray_tracing = false)
+                  bool conditional_rendering = false, bool ray_tracing = false, bool xdxr = false)
         : device_(device), tracker_(separate_depth_stencil_layouts), ray_tracing_(ray_tracing) {
         loaded_ = vk.load(get, device);
         replay_.pipeline_barrier = vk.vkCmdPipelineBarrier;
@@ -649,6 +685,7 @@ public:
         replay_.copy_query_pool_results = vk.vkCmdCopyQueryPoolResults;
         replay_.bind_pipeline = vk.vkCmdBindPipeline;
         replay_.push_constants = vk.vkCmdPushConstants;
+        replay_.bind_descriptor_sets = vk.vkCmdBindDescriptorSets;
         replay_.dispatch = vk.vkCmdDispatch;
         replay_.compute_pipeline = [this](std::uintptr_t id) -> const ComputePipeline* {
             const auto it = pipelines_.find(id);
@@ -659,6 +696,7 @@ public:
         replay_.set_viewport = vk.vkCmdSetViewport;
         replay_.set_scissor = vk.vkCmdSetScissor;
         replay_.set_primitive_topology = vk.vkCmdSetPrimitiveTopology;
+        replay_.set_primitive_restart_enable = vk.vkCmdSetPrimitiveRestartEnable;
         replay_.set_stencil_reference = vk.vkCmdSetStencilReference;
         replay_.set_blend_constants = vk.vkCmdSetBlendConstants;
         replay_.draw = vk.vkCmdDraw;
@@ -680,7 +718,34 @@ public:
             }
             return false;
         };
-        if (ray_tracing_ && vk.vkCmdBuildAccelerationStructuresKHR) {
+        if (xdxr && loaded_) {
+            xdxr_ = std::make_unique<XdxrBuilder>(get, device);
+            if (xdxr_->loaded()) {
+                replay_.xdxr_check = [](const BuildAccelerationStructure& b) {
+                    XdxrLayout layout;
+                    return xdxr_inputs(b, nullptr, 0) && layout.compute(xdxr_elements(b), b.is_tlas) && b.dst_va &&
+                           b.scratch_va && (!b.is_tlas || !b.instance_count || b.instances_va);
+                };
+                replay_.xdxr_record = [this](VkCommandBuffer cb, const BuildAccelerationStructure& b) {
+                    // Every address is a console VA in the GPU address arena: the device address is heap_base + VA,
+                    // and the BLAS addresses in instance descs get the same bias.
+                    const std::uint64_t base = replay_.heap_base;
+                    XdxrLayout layout;
+                    layout.compute(xdxr_elements(b), b.is_tlas);
+                    if (b.is_tlas) {
+                        xdxr_->record_tlas(cb, layout, b.instances_va ? base + b.instances_va : 0, base + b.dst_va,
+                                           base + b.scratch_va, base);
+                    } else {
+                        std::vector<XdxrTriangles> geometries;
+                        xdxr_inputs(b, &geometries, base);
+                        xdxr_->record_blas(cb, layout, geometries, base + b.dst_va, base + b.scratch_va);
+                    }
+                };
+            } else {
+                xdxr_.reset();
+            }
+        }
+        if (!xdxr_ && ray_tracing_ && vk.vkCmdBuildAccelerationStructuresKHR) {
             replay_.build_acceleration_structures = vk.vkCmdBuildAccelerationStructuresKHR;
             replay_.resolve_acceleration_structure = [this](std::uint64_t va) {
                 const auto it = acceleration_structures_.find(va);
@@ -696,12 +761,6 @@ public:
         };
         replay_.separate_depth_stencil_layouts = separate_depth_stencil_layouts;
         if (loaded_) {
-            VkSemaphoreTypeCreateInfo type{VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO};
-            type.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
-            type.initialValue = 0;
-            VkSemaphoreCreateInfo info{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, &type};
-            if (vk.vkCreateSemaphore(device_, &info, nullptr, &retire_timeline_) != VK_SUCCESS)
-                retire_timeline_ = VK_NULL_HANDLE;
             fence_dispatcher_ = std::make_unique<FenceWaitDispatcher>(device_, vk, device_lost_);
         }
     }
@@ -710,7 +769,6 @@ public:
         fence_dispatcher_.reset();
         deletion_queue_.drain(UINT64_MAX, device_, vk);
         for (const auto& [key, view] : views_) vk.vkDestroyImageView(device_, view, nullptr);
-        if (retire_timeline_) vk.vkDestroySemaphore(device_, retire_timeline_, nullptr);
     }
 
     VulkanContext(const VulkanContext&) = delete;
@@ -787,7 +845,10 @@ public:
         query_pools_[id] = pool;
     }
     void remove_query_pool(QueryHeapId id) {
+        // Lock hierarchy: resource_mutex_ -> tracker_mutex_. Holding tracker_mutex_ before erasing keeps the
+        // QueryPool node alive until any in-flight execute() that unlocked resource_mutex_ finishes QueryReplay::commit().
         std::unique_lock lock(resource_mutex_);
+        std::lock_guard tlock(tracker_mutex_);
         query_pools_.erase(id);
     }
     // The heap's d3d12_query_heap type, or ~0u for a heap that is not registered.
@@ -852,6 +913,40 @@ public:
     }
 
     bool ray_tracing_supported() const { return ray_tracing_ && vk.vkCmdBuildAccelerationStructuresKHR != nullptr; }
+    bool xdxr_acceleration_structures() const { return xdxr_ != nullptr; }
+
+    // Triangles (BLAS) or instances (TLAS) a build has: what XdxrLayout is computed from, for the build and for
+    // GetRaytracingAccelerationStructurePrebuildInfo.
+    static std::uint32_t xdxr_elements(const BuildAccelerationStructure& b) {
+        if (b.is_tlas) return b.instance_count;
+        std::uint64_t n = 0;
+        for (const auto& t : b.triangles) n += (t.index_type ? t.index_count : t.vertex_count) / 3;
+        return n > 0xffffffffu ? 0xffffffffu : std::uint32_t(n);
+    }
+    // The geometries as the builder reads them, with `base` added to their VAs; false for an input it cannot read
+    // (a vertex format other than R32G32B32_FLOAT or R32G32_FLOAT, an index type other than none/R16/R32).
+    static bool xdxr_inputs(const BuildAccelerationStructure& b, std::vector<XdxrTriangles>* out, std::uint64_t base) {
+        if (b.is_tlas) return true;
+        for (const auto& t : b.triangles) {
+            if (t.vertex_format != VK_FORMAT_R32G32B32_SFLOAT && t.vertex_format != VK_FORMAT_R32G32_SFLOAT) return false;
+            if (t.index_type > 2) return false;
+            const std::uint32_t count = (t.index_type ? t.index_count : t.vertex_count) / 3;
+            if (count && !t.vertex_va) return false;
+            if (count && t.index_type && !t.index_va) return false;
+            if (!out) continue;
+            XdxrTriangles g;
+            g.vertices = t.vertex_va ? base + t.vertex_va : 0;
+            g.vertex_stride = t.vertex_stride;
+            g.xy_only = t.vertex_format == VK_FORMAT_R32G32_SFLOAT;
+            g.indices = t.index_type && t.index_va ? base + t.index_va : 0;
+            g.index_type = t.index_type;
+            g.triangle_count = count;
+            g.transform = t.transform_va ? base + t.transform_va : 0;
+            g.flags = t.flags | (t.opaque ? 1u : 0u);
+            out->push_back(g);
+        }
+        return true;
+    }
 
     void register_acceleration_structure(std::uint64_t va, VkAccelerationStructureKHR as) {
         if (!va || !as) return;
@@ -895,6 +990,14 @@ public:
         };
     }
 
+    // Copies the replay stages through a buffer (depth <-> colour, vulkan_replay.h) take device-local scratch from
+    // `allocate`. Without this such a copy is refused as unsupported.
+    void enable_copy_scratch(PFN_vkGetDeviceProcAddr get, ScratchBuffers::Allocate allocate) {
+        std::unique_lock lock(resource_mutex_);
+        scratch_ = std::make_unique<ScratchBuffers>(get, device_, std::move(allocate));
+        if (!scratch_->loaded()) scratch_.reset();
+    }
+
     // Called after that command buffer's submit: true when it was accepted, false when vkQueueSubmit failed. The
     // set keeps its upload pending in the second case, because the copy never reached the GPU.
     void set_bindless_commit(std::function<void(bool)> commit) {
@@ -910,30 +1013,39 @@ public:
     void defer_destroy(DeferredDeletionQueue::Kind kind, VkHandle handle) {
         const auto raw = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(handle));
         if (!raw) return;
+        std::lock_guard lock(submit_mutex_);
         const std::uint64_t safe_ticket = submitted_ticket_.load(std::memory_order_acquire) + 1;
         deletion_queue_.push(safe_ticket, kind, raw);
     }
 
     void defer_destroy(DeferredDeletionQueue::Kind kind, std::uint64_t raw_handle) {
         if (!raw_handle && kind != DeferredDeletionQueue::Kind::bindless_slot) return;
+        std::lock_guard lock(submit_mutex_);
         const std::uint64_t safe_ticket = submitted_ticket_.load(std::memory_order_acquire) + 1;
         deletion_queue_.push(safe_ticket, kind, raw_handle);
     }
 
-    std::uint64_t completed_retire_ticket() const {
-        if (!retire_timeline_) return submitted_ticket_.load(std::memory_order_acquire);
-        std::uint64_t done = 0;
-        vk.vkGetSemaphoreCounterValue(device_, retire_timeline_, &done);
-        return done;
+    std::uint64_t completed_retire_ticket() {
+        std::lock_guard lock(submit_mutex_);
+        if (is_device_lost()) return 0;
+        return retire_tickets_.completed([this](VkSemaphore semaphore, std::uint64_t value) {
+            std::uint64_t done = 0;
+            return vk.vkGetSemaphoreCounterValue(device_, semaphore, &done) == VK_SUCCESS && done >= value;
+        });
     }
 
     void drain_deleted_resources(std::uint64_t current_ticket) {
         deletion_queue_.drain(current_ticket, device_, vk);
     }
 
-    VkSemaphore retire_timeline() const noexcept { return retire_timeline_; }
-    std::uint64_t advance_retire_ticket() noexcept {
-        return submitted_ticket_.fetch_add(1, std::memory_order_acq_rel) + 1;
+    // Both methods are called with submit_mutex_ held. A queue's own progress timeline is
+    // monotonic even when another queue completes first; global tickets are retired in order.
+    void record_submit_locked(VkSemaphore progress, std::uint64_t value) {
+        const auto ticket = submitted_ticket_.fetch_add(1, std::memory_order_acq_rel) + 1;
+        retire_tickets_.record(ticket, progress, value);
+    }
+    void retire_queue_idle_locked(VkSemaphore progress) {
+        retire_tickets_.queue_idle(progress);
     }
 
     VulkanDeviceFunctions vk;
@@ -992,12 +1104,13 @@ private:
     VkDevice device_;
     bool loaded_ = false;
     bool ray_tracing_ = false;
+    std::unique_ptr<XdxrBuilder> xdxr_;   // set: acceleration structures are XDXR BVH4 records
     std::atomic<bool> device_lost_{false};
     alignas(64) std::shared_mutex resource_mutex_;  // shared for prepare lookups, unique for add/remove
     alignas(64) std::mutex tracker_mutex_;
     alignas(64) std::mutex views_mutex_;
     alignas(64) std::mutex submit_mutex_;
-    VkSemaphore retire_timeline_ = VK_NULL_HANDLE;
+    RetireTickets<VkSemaphore> retire_tickets_;
     std::atomic<std::uint64_t> submitted_ticket_{0};
     DeferredDeletionQueue deletion_queue_;
     std::unique_ptr<FenceWaitDispatcher> fence_dispatcher_;
@@ -1009,6 +1122,7 @@ private:
     std::map<std::tuple<VkImage, VkImageAspectFlags, std::uint32_t, std::uint32_t, std::uint32_t, VkFormat>, VkImageView> views_;
     std::function<bool(VkCommandBuffer)> bindless_prepare_;
     std::unique_ptr<Depth24Converter> depth24_;
+    std::unique_ptr<ScratchBuffers> scratch_;  // copies staged through a buffer (depth <-> colour)
     std::function<void(bool)> bindless_commit_;
     std::unordered_map<QueryHeapId, QueryPool> query_pools_;  // element pointers stay valid across inserts
     double timestamp_period_ = 0;
@@ -1110,11 +1224,17 @@ public:
         if (queue_) {
             std::lock_guard lock(context_.submit_mutex());
             for (; open_labels_; --open_labels_) context_.labels_.queue_end(queue_);
-            vk.vkQueueWaitIdle(queue_);
+            const VkResult idle_result = vk.vkQueueWaitIdle(queue_);
+            if (idle_result == VK_SUCCESS) {
+                if (progress_) context_.retire_queue_idle_locked(progress_);
+            } else {
+                context_.mark_device_lost();
+            }
         }
         if (progress_) {
             std::lock_guard lock(context_.tracker_mutex_);
             if (context_.depth24_) context_.depth24_->forget(progress_);  // its scratch is idle now
+            if (context_.scratch_) context_.scratch_->forget(progress_);
         }
         if (pool_) vk.vkDestroyCommandPool(context_.device(), pool_, nullptr);
         if (progress_) vk.vkDestroySemaphore(context_.device(), progress_, nullptr);
@@ -1147,6 +1267,14 @@ public:
                 if (active && d24) d24->retire(progress, 0);
             }
         } depth24_guard{context_.depth24_.get(), progress_, false};
+        struct ScratchGuard {  // the same for the copy scratch
+            ScratchBuffers* scratch = nullptr;
+            VkSemaphore progress = VK_NULL_HANDLE;
+            bool active = false;
+            ~ScratchGuard() {
+                if (active && scratch) scratch->retire(progress, 0);
+            }
+        } scratch_guard{context_.scratch_.get(), progress_, false};
         bindless_commit = context_.bindless_commit_;
         std::vector<PreparedList> prepared(lists.size());
         ReplayFunctions replay = context_.replay_;
@@ -1182,6 +1310,17 @@ public:
                 };
             }
         }
+        if (context_.scratch_) {
+            replay.copy_scratch = [this, &tracker_lock, &scratch_guard](VkDeviceSize bytes, VkBuffer& buffer,
+                                                                        VkDeviceSize& offset) {
+                if (!tracker_lock.owns_lock()) tracker_lock.lock();
+                if (!scratch_guard.active) {
+                    context_.scratch_->collect();
+                    scratch_guard.active = true;
+                }
+                return context_.scratch_->get(bytes, buffer, offset);
+            };
+        }
         if (context_.depth24_) {
             replay.depth24_prepare = [this, &tracker_lock, &depth24_guard](Depth24Job& job,
                                                                            std::vector<Depth24Job>& parts) {
@@ -1204,42 +1343,63 @@ public:
                                                       std::uint32_t count, VkBuffer dst, VkDeviceSize offset) {
                 occlusion_resolve_->normalize(cb, pool, first, count, dst, offset);
             };
+            replay.sum_statistics = [this](VkCommandBuffer cb, VkQueryPool pool, std::uint32_t first,
+                                           std::uint32_t count, VkBuffer dst, VkDeviceSize offset) {
+                occlusion_resolve_->sum_statistics(cb, pool, first, count, dst, offset);
+            };
         }
         const auto resolve = [this](ResourceId id) { return context_.resolve(id); };
-        std::uint32_t segments = 0;
+        std::uint32_t segments = 0, statistics_segments = 0;
+        bool has_queries = false;
         for (std::size_t i = 0; i < lists.size(); ++i) {
             const auto result = prepare(*lists[i], resolve, replay, prepared[i]);
             if (result != ReplayResult::success) return result;
-            if (prepared[i].segment_count > UINT32_MAX - segments) return ReplayResult::unsupported;
-            segments += prepared[i].segment_count;
-        }
-        std::shared_ptr<OcclusionSegmentPool> physical;
-        if (segments) {
-            const auto& vk = context_.vk;
-            if (!vk.vkCreateQueryPool || !vk.vkDestroyQueryPool) return ReplayResult::unsupported;
-            physical = std::make_shared<OcclusionSegmentPool>();
-            physical->device = context_.device();
-            physical->destroy = vk.vkDestroyQueryPool;
-            VkQueryPoolCreateInfo info{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
-            info.queryType = VK_QUERY_TYPE_OCCLUSION;
-            info.queryCount = segments;
-            if (vk.vkCreateQueryPool(physical->device, &info, nullptr, &physical->pool) != VK_SUCCESS)
+            if (prepared[i].segment_count > UINT32_MAX - segments ||
+                prepared[i].statistics_segment_count > UINT32_MAX - statistics_segments)
                 return ReplayResult::unsupported;
+            segments += prepared[i].segment_count;
+            statistics_segments += prepared[i].statistics_segment_count;
+            has_queries = has_queries || !prepared[i].queries.empty();
         }
+        const auto segment_pool = [this](VkQueryType type, std::uint32_t count,
+                                         std::shared_ptr<OcclusionSegmentPool>& out) {
+            const auto& vk = context_.vk;
+            if (!vk.vkCreateQueryPool || !vk.vkDestroyQueryPool) return false;
+            out = std::make_shared<OcclusionSegmentPool>();
+            out->device = context_.device();
+            out->destroy = vk.vkDestroyQueryPool;
+            VkQueryPoolCreateInfo info{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+            info.queryType = type;
+            info.queryCount = count;
+            // The counters of a D3D12 pipeline-statistics heap, in D3D12_QUERY_DATA_PIPELINE_STATISTICS order.
+            if (type == VK_QUERY_TYPE_PIPELINE_STATISTICS) info.pipelineStatistics = 0x7ff;
+            return vk.vkCreateQueryPool(out->device, &info, nullptr, &out->pool) == VK_SUCCESS;
+        };
+        std::shared_ptr<OcclusionSegmentPool> physical, statistics;
+        if (segments && !segment_pool(VK_QUERY_TYPE_OCCLUSION, segments, physical)) return ReplayResult::unsupported;
+        // Without the compute helper a split query could not be summed: leave statistics queries whole, as before.
+        if (statistics_segments && can_resolve_occlusion &&
+            !segment_pool(VK_QUERY_TYPE_PIPELINE_STATISTICS, statistics_segments, statistics))
+            return ReplayResult::unsupported;
+        // QueryReplay::plan() reads QueryPool::ended / occlusion and QueryReplay::commit() writes them after
+        // resource_lock is unlocked. Hold tracker_mutex_ across plan -> emit -> submit -> commit so concurrent queues
+        // see submission-order query state and remove_query_pool() waits until commit finishes.
+        if (has_queries && !tracker_lock.owns_lock()) tracker_lock.lock();
         QueryReplay queries;
-        std::uint32_t base = 0;
+        std::uint32_t base = 0, statistics_base = 0;
         for (auto& list : prepared) {
-            const auto result = queries.plan(list, physical, base, can_resolve_occlusion);
+            const auto result = queries.plan(list, physical, base, can_resolve_occlusion, statistics, statistics_base);
             if (result != ReplayResult::success) return result;
             base += list.segment_count;
+            statistics_base += list.statistics_segment_count;
         }
-        if (queries.needs_sum || queries.needs_binary) {
+        if (queries.needs_sum || queries.needs_binary || queries.needs_statistics_sum) {
             if (!occlusion_resolve_) {
                 auto helper = std::make_unique<OcclusionResolve>(context_.vk, context_.device());
                 if (!helper->initialize(occlusion_memory)) return ReplayResult::unsupported;
                 occlusion_resolve_ = std::move(helper);
             }
-            if (!occlusion_resolve_->prepare(queries.needs_sum, queries.needs_binary))
+            if (!occlusion_resolve_->prepare(queries.needs_sum, queries.needs_binary, queries.needs_statistics_sum))
                 return ReplayResult::unsupported;
         }
 
@@ -1264,6 +1424,10 @@ public:
             if (depth24_guard.active) {
                 context_.depth24_->retire(progress_, 0);
                 depth24_guard.active = false;
+            }
+            if (scratch_guard.active) {
+                context_.scratch_->retire(progress_, 0);
+                scratch_guard.active = false;
             }
             tracker_lock.unlock();
             if (bindless_commit) bindless_commit(submitted);
@@ -1324,6 +1488,10 @@ public:
         if (depth24_guard.active) {
             context_.depth24_->retire(progress_, submitted ? submitted_ : 0);
             depth24_guard.active = false;
+        }
+        if (scratch_guard.active) {
+            context_.scratch_->retire(progress_, submitted ? submitted_ : 0);
+            scratch_guard.active = false;
         }
         tracker_lock.unlock();
         if (bindless_commit) bindless_commit(submitted);
@@ -1410,14 +1578,9 @@ private:
         VkResult res = VK_SUCCESS;
         {
             std::lock_guard lock(context_.submit_mutex());
-            VkSemaphore signals[3]{progress_, VK_NULL_HANDLE, VK_NULL_HANDLE};
-            std::uint64_t signal_values[3]{ticket, 0, 0};
+            VkSemaphore signals[2]{progress_, VK_NULL_HANDLE};
+            std::uint64_t signal_values[2]{ticket, 0};
             std::uint32_t signal_count = 1;
-            if (context_.retire_timeline()) {
-                signals[signal_count] = context_.retire_timeline();
-                signal_values[signal_count] = context_.advance_retire_ticket();
-                ++signal_count;
-            }
             if (fence) {
                 signals[signal_count] = fence;
                 signal_values[signal_count] = value;
@@ -1437,6 +1600,7 @@ private:
             submit.signalSemaphoreCount = signal_count;
             submit.pSignalSemaphores = signals;
             res = context_.vk.vkQueueSubmit(queue_, 1, &submit, VK_NULL_HANDLE);
+            if (res == VK_SUCCESS) context_.record_submit_locked(progress_, ticket);
         }
         if (res == VK_ERROR_DEVICE_LOST) {
             context_.mark_device_lost();
@@ -1445,10 +1609,12 @@ private:
             return false;
         }
         const bool ok = (res == VK_SUCCESS);
-        waits_.clear();
-        wait_values_.clear();
-        for (auto& slot : buffers_)
-            if (slot.buffer == command_buffer) slot.ticket = ticket;
+        if (ok) {
+            waits_.clear();
+            wait_values_.clear();
+            for (auto& slot : buffers_)
+                if (slot.buffer == command_buffer) slot.ticket = ticket;
+        }
         return ok;
     }
 

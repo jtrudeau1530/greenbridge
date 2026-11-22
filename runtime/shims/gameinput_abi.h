@@ -224,6 +224,46 @@ struct GameInputControllerButtonInfo {
 struct GameInputGamepadInfo {};
 struct GameInputUiNavigationInfo {};
 
+// Motion: layouts from Microsoft's v0 documentation (learn.microsoft.com GameInputMotionInfo / GameInputMotionState /
+// GameInputMotionAccuracy; the GDK public header spells the same members). Accuracy is deprecated only in GameInput
+// v1 and later; v0 still uses it in GameInputMotionState.
+enum GameInputMotionAccuracy : int32_t {
+    GameInputMotionAccuracyUnknown = -1,
+    GameInputMotionAccuracyUnreliable = 0,
+    GameInputMotionAccuracyLow = 1,
+    GameInputMotionAccuracyMedium = 2,
+    GameInputMotionAccuracyHigh = 3,
+};
+
+struct GameInputMotionInfo {
+    float maxAcceleration;           // m/s^2; 0 says acceleration input is not available
+    float maxAngularVelocity;        // rad/s; 0 says angular-velocity input is not available
+    float maxMagneticFieldStrength;  // teslas; 0 says magnetic-field input is not available
+};
+
+// The state GetMotionState writes. Each float is the signed fraction of the GameInputMotionInfo maximum for its
+// sensor (1.0 = full magnitude); orientation is a quaternion. SDL delivers accel in m/s^2 (gravity included) and
+// gyro in rad/s, so the shim divides by the maxima it reports in motionInfo.
+struct GameInputMotionState {
+    float accelerationX;
+    float accelerationY;
+    float accelerationZ;
+    float angularVelocityX;
+    float angularVelocityY;
+    float angularVelocityZ;
+    float magneticFieldX;
+    float magneticFieldY;
+    float magneticFieldZ;
+    float orientationW;
+    float orientationX;
+    float orientationY;
+    float orientationZ;
+    GameInputMotionAccuracy accelerometerAccuracy;
+    GameInputMotionAccuracy gyroscopeAccuracy;
+    GameInputMotionAccuracy magnetometerAccuracy;
+    GameInputMotionAccuracy orientationAccuracy;
+};
+
 struct GameInputDeviceInfo {
     uint32_t infoSize;
     uint16_t vendorId;
@@ -280,6 +320,8 @@ static_assert(sizeof(GameInputGamepadState) == 28);
 static_assert(sizeof(GameInputRumbleParams) == 16);
 static_assert(sizeof(GameInputBatteryState) == 20);
 static_assert(sizeof(GameInputString) == 16);
+static_assert(sizeof(GameInputMotionInfo) == 12);
+static_assert(sizeof(GameInputMotionState) == 68);
 static_assert(sizeof(GameInputControllerAxisInfo) == 48);
 static_assert(sizeof(GameInputControllerButtonInfo) == 32);
 static_assert(offsetof(GameInputDeviceInfo, deviceId) == 32);

@@ -144,13 +144,27 @@ def build_jsav(version, n_code, hashes, flags, blocks):
 
 
 # ---------------------------------------------------------------------------------------------- SLAYER1
-def parse_slayer(d):
+SLAYER1_HDR = 16           # "SLAYER1\0" + u32 version + u32 name length
+
+
+def parse_slayer(d, path=None):
     if d[:8] != b'SLAYER1\0':
         raise ValueError('not SLAYER1')
+    where = f' in {path}' if path else ''
+    # The fixed preamble holds the magic, version and name length; a short file must be rejected here instead
+    # of letting struct.unpack_from raise a struct.error that says nothing about the save (see parse_asav/#923).
+    if len(d) < SLAYER1_HDR:
+        raise ValueError(f'SLAYER1 header is only {len(d)} bytes{where}, a SLAYER1 header is at least '
+                         f'{SLAYER1_HDR}')
     ver, nlen = struct.unpack_from('<II', d, 8)
-    name = d[16:16 + nlen].decode('ascii', 'replace')
-    size = struct.unpack_from('<Q', d, 16 + nlen)[0]
-    inner = 16 + nlen + 8
+    # The name and the 8-byte payload-size field that follows it must fit before either is read.
+    size_off = SLAYER1_HDR + nlen
+    if size_off + 8 > len(d):
+        raise ValueError(f'SLAYER1{where} declares a {nlen}-byte name; with the 8-byte payload size the header '
+                         f'needs {SLAYER1_HDR + nlen + 8} bytes, but the file has only {len(d)}')
+    name = d[SLAYER1_HDR:SLAYER1_HDR + nlen].decode('ascii', 'replace')
+    size = struct.unpack_from('<Q', d, size_off)[0]
+    inner = size_off + 8
     return {'magic': 'SLAYER1', 'version': ver, 'name': name, 'payload_size': size,
             'payload_offset': inner, 'file_size': len(d)}
 
@@ -166,9 +180,9 @@ def kind_of(d):
     return None
 
 
-def read(p):
+def read(p, n=-1):
     with open(p, 'rb') as f:
-        return f.read()
+        return f.read(n)
 
 
 def info_file(p, indent=''):
@@ -192,7 +206,7 @@ def info_file(p, indent=''):
         for (g, w), sizes in groups.items():
             print(f'{indent}  {g:6} wrapper {w}: {len(sizes)} blocks, {sum(sizes)} bytes, largest {max(sizes)}')
     elif k == 'SLAYER1':
-        h = parse_slayer(d)
+        h = parse_slayer(d, p)
         for key, v in h.items():
             print(f'{indent}  {key:15} {v}')
         inner = d[h['payload_offset']:]
@@ -353,7 +367,7 @@ def save_slot(folder):
     found = []
     for name in sorted(os.listdir(folder)):
         fp = os.path.join(folder, name)
-        if os.path.isfile(fp) and name not in ('chives.json', 'chives.dat') and kind_of(read(fp)[:8]) in ('ASAV', 'JSAV'):
+        if os.path.isfile(fp) and name not in ('chives.json', 'chives.dat') and kind_of(read(fp, 8)) in ('ASAV', 'JSAV'):
             found.append(name)
     if not found:
         raise SystemExit(f'{folder}: no ASAV/JSAV payload found')
@@ -371,7 +385,7 @@ def save_slot(folder):
     if os.path.isfile(packed):
         p = read(packed)
         if kind_of(p) == 'SLAYER1':
-            inner = p[parse_slayer(p)['payload_offset']:]
+            inner = p[parse_slayer(p, packed)['payload_offset']:]
             if inner[:4] == b'ASAV':
                 ih = parse_asav(inner)
                 slot, title = ih['slot_name'] or slot, ih['title']

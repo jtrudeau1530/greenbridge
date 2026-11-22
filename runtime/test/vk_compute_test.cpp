@@ -184,6 +184,10 @@ int main(int argc, char** argv) {
     // Output buffer = heap. Host-visible so the result can be read back directly.
     VkDeviceSize words = workgroup_yz ? yz_bins * (1 + origins) : VkDeviceSize(groups) * 64;
     if (out_words > words) words = out_words;
+    // "bvh" writes its nodes at heap offsets 0x100 to 0x264 below, past the 256 bytes one group's 64 words give: the
+    // shader then read them through the device address outside the buffer (VUID-RuntimeSpirv-PhysicalStorageBuffer64-11819).
+    const bool bvh = !std::strcmp(argv[3], "bvh");
+    if (bvh && words < 0x280 / sizeof(uint32_t)) words = 0x280 / sizeof(uint32_t);
     const VkDeviceSize bytes = words * sizeof(uint32_t);
     VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
     bci.size = bytes;
@@ -215,6 +219,9 @@ int main(int argc, char** argv) {
         for (int i = 0; i < 4; i++) for (int c = 0; c < 6; c++) f32(0x110 + 24 * i + 4 * c, boxes[i][c]);
         const float tri[2][9] = {{0, 0, 10, 1, 0, 10, 0, 1, 10}, {0, 0, 5, 1, 0, 5, 0, 1, 5}};
         for (int t = 0; t < 2; t++) for (int c = 0; c < 9; c++) f32(0x200 + 0x40 * t + 4 * c, tri[t][c]);
+        // Triangle-ID word at node +60: byte 0 (TRI0) = 0x09 returns vertex 1's and vertex 2's weights, what a
+        // builder writes (AMD GPURT WriteTriangleIdField); the translator reads it since the remap fix.
+        for (int t = 0; t < 2; t++) u32(0x200 + 0x40 * t + 60, 0x09);
     }
     VkBufferDeviceAddressInfo bai{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
     bai.buffer = buf;

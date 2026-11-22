@@ -6,6 +6,7 @@ oracle it compares with is right, so a mismatch is the translator's and not the 
 import json
 import os
 import random
+import signal
 import struct
 import subprocess
 import sys
@@ -168,15 +169,15 @@ def test_compare_treats_any_nan_as_equal():
     assert imf.compare("R32G32B32A32_SFLOAT", texels, width, height, got) == []
 
 
-def run_case_with_harness_result(monkeypatch, tmp_path, returncode, stdout):
-    """run_case with the translator stubbed out and vk_image_fuzz answering `returncode`/`stdout`."""
+def run_case_with_harness_result(monkeypatch, tmp_path, returncode, stdout, stderr=""):
+    """run_case with the translator stubbed out and vk_image_fuzz answering `returncode`/`stdout`/`stderr`."""
     build = tmp_path / "build"
     build.mkdir()
     (build / (imf.HARNESS + (".exe" if os.name == "nt" else ""))).touch()
     monkeypatch.setattr(imf, "assemble", lambda *_args: None)
     monkeypatch.setattr(imf, "translate", lambda work: str(tmp_path / "spirv"))
     monkeypatch.setattr(imf.subprocess, "run",
-                        lambda cmd, **_kw: subprocess.CompletedProcess(cmd, returncode, stdout, ""))
+                        lambda cmd, **_kw: subprocess.CompletedProcess(cmd, returncode, stdout, stderr))
     return imf.run_case("R8G8B8A8_UNORM", 4, 4, random.Random(1), str(tmp_path), str(build), False, False)
 
 
@@ -196,7 +197,45 @@ def test_unsupported_without_a_reason_line_still_skips(monkeypatch, tmp_path, ca
 def test_a_harness_error_is_a_failure_not_a_skip(monkeypatch, tmp_path, capsys):
     assert run_case_with_harness_result(monkeypatch, tmp_path, 1, "device: X\nvkCreateDevice failed\n") is False
     out = capsys.readouterr().out
-    assert "FAIL (vkCreateDevice failed)" in out and "SKIP" not in out
+    assert "FAIL (vk_image_fuzz exit 1: vkCreateDevice failed)" in out and "SKIP" not in out
+    assert "    device: X" in out  # the earlier lines are printed too
+
+
+def test_a_crash_names_the_signal_and_prints_stderr(monkeypatch, tmp_path, capsys):
+    # #1429: ANV segfaulted in vkCreateGraphicsPipelines and the fuzzer printed only "FAIL (harness error)".
+    stderr = "validation: pipeline layout ok\ncreating graphics pipeline\n"
+    assert run_case_with_harness_result(monkeypatch, tmp_path, -signal.SIGSEGV, "device: X\n", stderr) is False
+    out = capsys.readouterr().out
+    assert "FAIL (vk_image_fuzz killed by SIGSEGV: creating graphics pipeline)" in out
+    assert "  vk_image_fuzz stderr:\n    validation: pipeline layout ok\n    creating graphics pipeline\n" in out
+    assert "harness error" not in out
+
+
+def test_a_silent_crash_still_says_how_the_harness_ended(monkeypatch, tmp_path, capsys):
+    assert run_case_with_harness_result(monkeypatch, tmp_path, 0xC0000005, "") is False
+    out = capsys.readouterr().out
+    assert "FAIL (vk_image_fuzz exit 0xc0000005 (access violation), no output)" in out
+
+
+def test_a_long_stderr_prints_only_its_tail(monkeypatch, tmp_path, capsys):
+    stderr = "".join(f"line {i}\n" for i in range(50))
+    assert run_case_with_harness_result(monkeypatch, tmp_path, 3, "", stderr) is False
+    out = capsys.readouterr().out
+    assert f"stderr (last {imf.STDERR_TAIL} of 50 lines):" in out
+    assert "    line 49" in out and f"    line {50 - imf.STDERR_TAIL}\n" in out
+    assert f"    line {49 - imf.STDERR_TAIL}\n" not in out
+
+
+@pytest.mark.parametrize("returncode,want", [
+    (1, "exit 1"),
+    (2, "exit 2"),
+    (-signal.SIGABRT, "killed by SIGABRT"),
+    (-99, "killed by signal 99"),
+    (0xC0000409, "exit 0xc0000409 (stack buffer overrun)"),
+    (0xC0001234, "exit 0xc0001234"),
+])
+def test_exit_status(returncode, want):
+    assert imf.exit_status(returncode) == want
 
 
 def test_self_test_runs():

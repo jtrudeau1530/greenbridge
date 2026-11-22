@@ -225,6 +225,58 @@ class ArchiveTest(unittest.TestCase):
         self.assertEqual(doc["summary"]["files"], len(PAYLOADS))
         self.assertEqual(len(doc["files"]), len(PAYLOADS))
 
+    def test_csv_partial_staged_write_keeps_prior_bytes_and_cleans_up(self):
+        out = os.path.join(self.root, "out.csv")
+        with open(out, "w", encoding="utf-8", newline="") as f:
+            f.write("prior,bytes\r\n")
+        with open(out, "rb") as f:
+            prior = f.read()
+        rows = [{"offset": 0x100, "stored": 8, "size": 9, "signature": "psin",
+                 "version": None, "count": 1, "detail": ""},
+                {"offset": 0x200, "stored": 8, "size": 9, "signature": "text",
+                 "version": None, "count": None, "detail": "printable text"}]
+        real_csv_writer = csv.writer  # captured before story_index.csv (the csv module) is patched
+
+        class _FailingWriter:
+            """A csv writer that fails once the header and first row have hit the staged file."""
+
+            def __init__(self, fileobj, **kwargs):
+                self._w = real_csv_writer(fileobj, **kwargs)
+                self._n = 0
+
+            def writerow(self, row):
+                self._w.writerow(row)
+                self._n += 1
+                if self._n == 2:
+                    raise OSError("disk full")
+
+        before = sorted(os.listdir(self.root))
+        with self.assertRaises(OSError):
+            with mock.patch.object(story_index.csv, "writer", side_effect=_FailingWriter):
+                story_index.write_output(out, rows, {"files": 2})
+        with open(out, "rb") as f:
+            self.assertEqual(f.read(), prior)
+        self.assertEqual(sorted(os.listdir(self.root)), before)
+
+    def test_json_partial_staged_write_keeps_prior_bytes_and_cleans_up(self):
+        out = os.path.join(self.root, "out.json")
+        with open(out, "w", encoding="utf-8") as f:
+            f.write('{"prior": true}')
+        with open(out, "rb") as f:
+            prior = f.read()
+
+        def failing_dump(obj, f, **kwargs):
+            f.write('{"partial": ')
+            raise OSError("disk full")
+
+        before = sorted(os.listdir(self.root))
+        with self.assertRaises(OSError):
+            with mock.patch.object(story_index.json, "dump", side_effect=failing_dump):
+                story_index.write_output(out, [], {"files": 0})
+        with open(out, "rb") as f:
+            self.assertEqual(f.read(), prior)
+        self.assertEqual(sorted(os.listdir(self.root)), before)
+
     def test_cli(self):
         out = os.path.join(self.root, "cli.json")
         p = subprocess.run([sys.executable, "-I", TOOL, self.rpf, out, "--quiet"],

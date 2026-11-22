@@ -350,6 +350,9 @@ int main(int argc, char** argv) {
         const ColorFormat color_formats[] = {
             {DXGI_FORMAT_R8G8B8A8_UNORM, "R8G8B8A8_UNORM", 4, float_values, nf},
             {DXGI_FORMAT_R8G8B8A8_SNORM, "R8G8B8A8_SNORM", 4, float_values, nf},
+            // B8G8R8X8 is stored in a BGRA8 image; B8G8R8A8 next to it shows what the X byte changes.
+            {DXGI_FORMAT_B8G8R8A8_UNORM, "B8G8R8A8_UNORM", 4, float_values, nf},
+            {DXGI_FORMAT_B8G8R8X8_UNORM, "B8G8R8X8_UNORM", 4, float_values, nf},
             {DXGI_FORMAT_R32G32B32A32_FLOAT, "R32G32B32A32_FLOAT", 16, float_values, nf},
             {DXGI_FORMAT_R8G8_UINT, "R8G8_UINT", 2, int_values, ni},
             {DXGI_FORMAT_R8G8B8A8_UINT, "R8G8B8A8_UINT", 4, int_values, ni},

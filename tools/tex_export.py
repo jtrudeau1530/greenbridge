@@ -12,6 +12,11 @@ For each texture:
     otherwise on raw element bytes)
   - writes <out>/<archive>/<cpu blob>_<q index>_<WxH>_<format>.dds and records the choice in export_log.json,
     with "heuristic": true whenever two distinct placements fitted (the pick is a score, not a verified layout)
+  - with --png, also writes the same path with .png for every texture tools/dds_png.py can decode (BC1-BC5, BC7
+    and 8-bit RGBA/BGRA, stored values with no sRGB transfer; the blue channel of BC5 is a reconstructed normal Z).
+    The rest (BC6H and every other uncompressed format: R8, R8G8, 16-bit, R10G10B10A2, float, integer) keep their
+    DDS only and are counted as "png unsupported". A PNG that fails to decode or write is counted as
+    "png error:<Type>" and its DDS stays; neither changes the exit code
 
 Usage:
     python -I tex_export.py <textures_index.json> <carve dir> <out dir> [--limit N] [--png]
@@ -101,7 +106,7 @@ def score_image(w, h, fmt, payload, bpe):
     return float(d / (a.std() + 1e-6))
 
 
-def export_one(t, carve, out, blob_cache):
+def export_one(t, carve, out, blob_cache, png=False):
     fmt = t["fmt"]
     if fmt not in FMT:
         return "unsupported format"
@@ -140,10 +145,27 @@ def export_one(t, carve, out, blob_cache):
     name = f"{t['cpu']:012x}_{t['q_index']}_{w}x{h}_{t['fmt_name']}.dds"
     d = os.path.join(out, t["archive"])
     os.makedirs(d, exist_ok=True)
+    dds = dds_bytes(w, h, fmt, payload)
     with open(os.path.join(d, name), "wb") as f:
-        f.write(dds_bytes(w, h, fmt, payload))
+        f.write(dds)
     # two placements that fit at different offsets leave the pick to the score, not to a known layout
     t["export"] = {"file": name, "place": place, "score": round(s, 4), "heuristic": len(cands) > 1 and chain > top}
+    if png:
+        import dds_png  # lazy: only --png pays for it
+        png_path = os.path.join(d, name[:-4] + ".png")
+        try:
+            data = dds_png.dds_to_png_bytes(dds)
+            with open(png_path, "wb") as f:
+                f.write(data)
+            t["export"]["png"] = "written"
+        except dds_png.DdsError:  # a format it cannot decode; the payload is built here, so never a truncated one
+            t["export"]["png"] = "unsupported"
+        except Exception as e:  # noqa: BLE001  the DDS is already on disk and logged: a bad PNG must not undo that
+            t["export"]["png"] = "error:" + type(e).__name__
+            try:
+                os.remove(png_path)  # no truncated PNG left behind
+            except OSError:
+                pass
     return "ok:" + place
 
 
@@ -163,25 +185,51 @@ def main():
     ap.add_argument("carve")
     ap.add_argument("out")
     ap.add_argument("--limit", type=positive_int, help="export only the first N textures (N >= 1)")
+    ap.add_argument("--png", action="store_true", help="also write a PNG beside each DDS dds_png.py can decode")
     a = ap.parse_args()
-    with open(a.index, encoding="utf-8") as f:
-        texs = json.load(f)
-    texs.sort(key=lambda t: (t["archive"], t["gpu"]))
+    try:
+        with open(a.index, encoding="utf-8") as f:
+            texs = json.load(f)
+    except (OSError, ValueError) as e:
+        print(f"ERROR: cannot read {a.index}: {e}", file=sys.stderr)
+        return 2
+    if not isinstance(texs, list):
+        print(f"ERROR: cannot read {a.index}: expected a texture list, got {type(texs).__name__}", file=sys.stderr)
+        return 2
+    try:
+        texs.sort(key=lambda t: (t["archive"], t["gpu"]))
+    except KeyError as e:
+        print(f"ERROR: cannot read {a.index}: row has no {e.args[0]!r}", file=sys.stderr)
+        return 2
+    except TypeError as e:
+        print(f"ERROR: cannot read {a.index}: {e}", file=sys.stderr)
+        return 2
     if a.limit is not None:         # 0 used to read as "no limit", and a negative N dropped the last N
         texs = texs[: a.limit]
-    os.makedirs(a.out, exist_ok=True)
-    res, cache = Counter(), {}
+    if os.path.exists(a.out) and not os.path.isdir(a.out):
+        print(f"ERROR: {a.out} is a file, not a folder", file=sys.stderr)
+        return 2
+    try:
+        os.makedirs(a.out, exist_ok=True)
+    except OSError as e:  # a report path under an existing file, or a dangling symlink
+        print(f"ERROR: cannot create {a.out}: {e.strerror or e}", file=sys.stderr)
+        return 2
+    res, cache, pngs = Counter(), {}, Counter()
     for i, t in enumerate(texs, 1):
         try:
-            r = export_one(t, a.carve, a.out, cache)
+            r = export_one(t, a.carve, a.out, cache, a.png)
         except Exception as e:  # noqa: BLE001
             r = "error:" + type(e).__name__
         res[r] += 1
+        if r.startswith("ok:") and "png" in t["export"]:  # an "export" read from the index may be stale
+            pngs[t["export"]["png"]] += 1
         if i % 2000 == 0:
             print(f"[{i}/{len(texs)}] {dict(res)}", flush=True)
     with open(os.path.join(a.out, "export_log.json"), "w", encoding="utf-8") as f:
         json.dump(texs, f)
     print(f"{len(texs)} textures: {dict(res)} -> {a.out}")
+    if a.png:
+        print(f"png: {dict(pngs)}")
 
 
 if __name__ == "__main__":

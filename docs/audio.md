@@ -53,13 +53,25 @@ The exporters use three tag types:
 | `0x76` | format |
 | `0x48` | streamed-music descriptor |
 
+`tools/rsc8_audio.py` additionally decodes the speech companions `0x36` (peaks), `0xa3` (seek
+table), `0xb2` (loudness), `0xbd` (marker) and the two structural tags below; every other tag type
+is skipped.
+
+| Tag | Meaning |
+|---|---|
+| `0x5a` | 20-byte-entry grid table (`12345678` marker; see [rsc8_audio.md](rsc8_audio.md#the-undocumented-0x5a0xd9-companion-tags)) |
+| `0xd9` | grouped ascending index runs into the sibling `0x5a` entries |
+
+Both appear only in `audio.rpf`, on 1,185 streams (32,000 Hz; 804 of them carry both).
+
 ### Format tag (`0x76`)
 
 The fields the exporters read:
 
 ```
-+0    u32  sample count
++0    u32  sample count (Opus: 48 kHz frames, interleaved across channels)
 +8    u16  sample rate
++12   u32  Opus per-channel frame count (codec 0x0B; +0 for mono, +0/2 for stereo)
 +28   u8   codec
 +29   u8   channel count
 ```
@@ -81,9 +93,10 @@ not store it, so the exporter writes that value as `OpusHead` pre-skip and sets 
 `pre-skip + declared samples`. Decoders then drop the priming and stop at the real end instead of the padded final
 frame. `--pre-skip` overrides the 312 default for a stream encoded with a different lookahead.
 
-The format tag's sample count is already in 48 kHz frames even when its rate field is 32 kHz, and a stereo count is
-interleaved across both channels. The exporter therefore does not scale it by the rate field and halves it for
-stereo; scaling a 32 kHz stream by 48000/32000 leaves up to a frame of padding untrimmed.
+The format tag's sample count is already in 48 kHz frames even when its rate field is 32 kHz, and `+0x0C` is the
+per-channel frame count (equal to `+0` for mono and half of it for stereo in all 7,451 measured streams). The
+exporter uses `+0x0C` and falls back to `+0 / channels` when a block leaves it zero; it never scales either count
+by the rate field, because scaling a 32 kHz stream by 48000/32000 leaves up to a frame of padding untrimmed.
 
 Codec `5` is not handled by `tools/awc_opus.py`. `rpf9dump xma` writes it as RIFF XMA2, and ffmpeg does the decode.
 
@@ -122,6 +135,7 @@ count unchanged. Reading `samples` as a frame count produces a file that reports
 | `rpf9dump audio <audio.rpf> <out>` | `<out>/audio/awc/<path>.awc` (the original banks) and `<out>/audio/audio_manifest.json` |
 | `rpf9dump xma <audio.rpf> <out>` | `<out>/audio/xma/<bank>/<stream id>.xma.wav` for every codec-5 stream |
 | `python -I tools/awc_opus.py <bank or dir> <out> [--jobs N] [--pre-skip N]` | `<out>/<bank>/<stream id>.ogg`, or `.wav` for codec 0/2; `--jobs` processes that many banks at once |
+| `python -I tools/opus_tags.py <ogg dir> --names <csv> [--dialogue <csv>]` | the same `.ogg` files, with names, dialogue labels and subtitles in their `OpusTags` header (see *Tags: names and subtitles*) |
 | `python -I tools/audio_wav.py <ogg dir> --out <wav dir> [--jobs N]` | 16-bit PCM WAV mirroring the Ogg tree; `--jobs` ffmpeg processes at once |
 
 When exporting a directory, `awc_opus.py` keeps the path to each bank below the input root. For example,
@@ -244,22 +258,22 @@ The dictionary comes from two kinds of input:
 - `--conversations`: conversation data, which pairs a dialogue key with its line labels as
   `<ROOT>AU_<XXXX>\0<LABEL>\0`. A key with N distinct labels yields the waves `<key>_01` .. `<key>_<N>`. Wave `_01`
   speaks the first label, `_02` the second, and so on. In 1.0.2.1 the pairs are in 594 carved `story000.rpf`
-  streams, 4 `shared_minigame000.rpf` streams and 2 `data.rpf` streams, and they give 136,788 wave names.
+  streams, 4 `shared_minigame000.rpf` streams, 2 `data.rpf` streams and 1 `story000_restofworld.rpf` stream, and
+  they give 138,104 wave names.
 
-Measured on the 1.0.2.1 package (2026-11-22). The dictionary is about 2.9 million harvested identifiers plus the
-conversation waves:
+Measured on the 1.0.2.1 package (2026-11-22) with 2,455,498 distinct lowercase words: identifiers harvested from the
+carved archives (by a scan like `hashdict.py`, not `hashdict.py` itself) plus the conversation waves:
 
 | Archive | Banks | Distinct ids | Named | Dialogue | Family | Control (expected false) |
 |---|---:|---:|---:|---:|---:|---:|
 | `audio.rpf` | 7,162 | 1,606,237 | 92,043 | 0 | 92,043 | 352 |
-| `story000.rpf` | 63,861 | 234,458 | 172,781 | 119,492 | 53,289 | 62 |
+| `story000.rpf` | 63,861 | 234,458 | 173,800 | 120,511 | 53,289 | 62 |
 | `shared_minigame000.rpf` | 638 | 4,334 | 1,957 | 1,957 | 0 | 3 |
 
-`story000.rpf` is 73.7% named: dialogue is named almost entirely, because conversation data lists every key.
+`story000.rpf` is 74.1% named: dialogue is named almost entirely, because conversation data lists every key.
 `audio.rpf` is 5.7% named. Its sound effects, ambience and music have no list, so only numbered families are
-found. Adding 1,319 more dialogue words that exist only as harvested strings (not in any conversation pair) brings
-`story000.rpf` to 173,800. When two accepted families claim the same id in one bank (3 rows), the first family in
-sorted base order keeps it.
+found. Without the one `story000_restofworld.rpf` conversation stream, 1,019 dialogue streams stay unnamed. When two
+accepted families claim the same id in one bank (3 rows), the first family in sorted base order keeps it.
 
 The output names game files: keep it local, and do not commit it or attach it to an issue.
 
@@ -272,6 +286,41 @@ python -I tools/awc_names.py <work>/assets/audio/awc --words <temp>/hashes.json 
 Each positional source is reported and thresholded on its own. A source is a directory of `.awc` banks, a single
 bank, or an `audio_manifest.json` from `rpf9dump audio` (read without opening the banks). Pure Python; the run above
 took about 3 minutes on one core.
+
+## Tags: names and subtitles
+
+`awc_opus.py` writes an empty `OpusTags` header, so a player shows only the stream id. `tools/opus_tags.py` fills
+that header in place from the `awc_names.py` CSV and, for dialogue, the `text_tables.py` dialogue CSV
+([text.md](text.md#dialogue)):
+
+| Comment | Value |
+|---|---|
+| `TITLE` | the stream name |
+| `LABEL`, `SPEAKER` | the dialogue line label and the speaker code in it |
+| `SUBTITLE` | the English text, or the first language that has text |
+| `SUBTITLE_<LANG>` | the text in each language that has it (`SUBTITLE_DE`, `SUBTITLE_ZH-HANS`, ...) |
+
+Subtitle markup (`~n~`, `~sl:...~`, `~COLOR_...~` and other `~...~` tokens) becomes a space, and empty values are left
+out. A file is matched by its stream id and its bank: the folder below the Opus folder, or that path with leading
+folders removed, so one Opus folder can hold several archives' exports. `--source` limits the names to one source
+label of the names CSV.
+
+```sh
+python -I tools/opus_tags.py <work>/assets/audio/ogg --names <temp>/awc_names.csv --dialogue <temp>/dialogue.csv
+```
+
+Only page 1, which holds the `OpusTags` packet alone, is rewritten. The audio pages, page sequence and granule
+positions stay byte for byte as `awc_opus.py` wrote them, and a second run replaces the tags of the first. Unnamed
+streams are not touched. A tags packet that would not fit in one Ogg page (65,024 bytes) is skipped and counted;
+dialogue tags are a few kilobytes. `--dry-run` counts without writing.
+
+Checked on the 1.0.2.1 package (2026-11-22) with all 638 `shared_minigame000.rpf` banks and the first 3,000
+`story000.rpf` banks (83,088 Ogg Opus files): 45,311 named streams tagged, exactly the names CSV rows for those
+banks; 1,980 of them are dialogue lines and 1,703 have a subtitle. A fresh `awc_opus.py` export of
+`shared_minigame000.rpf` matches the tagged files on every page except page 1 (4,315 of 4,315 files). ffprobe
+reads the comments, and ffmpeg decodes a sample of 8,299 tagged files without errors. The run takes about 4 s.
+
+The tagged files hold game text as well as game audio: they stay in the work folder like any other export.
 
 ## Never commit or share extracted audio
 

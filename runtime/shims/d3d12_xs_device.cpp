@@ -95,7 +95,7 @@ const char* slot_name(unsigned slot) {
         case 46: return "SetResidencyPriority (proxies unwrapped)";
         case 50: return "EnqueueMakeResident (proxies unwrapped)";
         case 62: return "Xbox CreateComputePipelineState";
-        case 67: return "Xbox compute pipeline from native code";
+        case 67: return "Xbox DeserializeComputePipelineStateX";
         case 75: return "CreateCommandQueue1 -> queue proxy";
         case 76: return "Xbox resource creation";
         default: return "forwarded";
@@ -948,9 +948,10 @@ HRESULT proxy_unwrapping_call(DeviceProxy* self, std::uint64_t a1, std::uint64_t
 HRESULT proxy_create_descriptor_heap(DeviceProxy* self, const D3D12_DESCRIPTOR_HEAP_DESC* desc, const IID* riid,
                                      void** out) {
     note_slot(14);
-    if (!out) return E_POINTER;
-    *out = nullptr;  // _COM_Outptr_: NULL on every failure, as the PC device does
+    if (out) *out = nullptr;  // _COM_Outptr_: NULL on every failure, as the PC device does
     if (!riid) return E_POINTER;
+    // No output: a capability check, answered by the device (S_FALSE, as on the PC).
+    if (!out) return self->real->CreateDescriptorHeap(desc, *riid, nullptr);
 
     void* created = nullptr;
     HRESULT hr = self->real->CreateDescriptorHeap(desc, __uuidof(ID3D12DescriptorHeap), &created);
@@ -1043,14 +1044,16 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
             self, reinterpret_cast<const D3D12_COMPUTE_PIPELINE_STATE_DESC*>(a1), a2, a3,
             reinterpret_cast<const IID*>(a4), reinterpret_cast<void**>(a5)));
     } else if constexpr (Slot == 67) {
-        // Measured in amd_fidelityfx_upscaler_xbox.dll (call at RVA 0x56d9): (desc, riid, out), a console-only
-        // compute-pipeline desc with the root signature at +0x00 and a copy of a code blob at +0x28 (size at +0x30;
-        // most likely the shader's native code); the DLL falls back to slot 62 when it fails. The PC device's
-        // slot 67 is CreateProtectedResourceSession1, a different method, so it is refused here, not forwarded.
+        // Measured in amd_fidelityfx_upscaler_xbox.dll (call at RVA 0x56d9): (desc, riid, out), named
+        // DeserializeComputePipelineStateX in the DLL's own messages. The desc is the root signature at +0x00, then
+        // pointer/size pairs for the shader's FSPX entries, with the native RDNA2 program at +0x28 (docs/fspx.md);
+        // the DLL falls back to slot 62 when it fails. The PC device's slot 67 is CreateProtectedResourceSession1, a
+        // different method, so it is refused here, not forwarded.
         note_slot(67);
         static std::atomic<bool> logged{false};
         if (!logged.exchange(true, std::memory_order_relaxed))
-            std::fprintf(stderr, "[rt] d3d12_xs: device slot 67 (native-code compute pipeline) -> E_NOTIMPL\n");
+            std::fprintf(stderr,
+                         "[rt] d3d12_xs: device slot 67 (Xbox DeserializeComputePipelineStateX) -> E_NOTIMPL\n");
         if (a3) *reinterpret_cast<void**>(a3) = nullptr;
         return hr_to_u64(E_NOTIMPL);
     } else if constexpr (Slot == 76) {

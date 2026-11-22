@@ -101,10 +101,14 @@ class WaveMachine(cpu_ref.Machine):
                 return self.vcc & self.wmask
             if t == "vcc_lo":
                 return self.vcc & MASK32
+            if t == "vcc_hi":
+                return (self.vcc >> 32) & MASK32
             if t == "exec":
                 return self.exec & self.wmask
             if t == "exec_lo":
                 return self.exec & MASK32
+            if t == "exec_hi":
+                return 0 if self.wave == 32 else (self.exec >> 32) & MASK32
             if t == "null":
                 return 0
         if k == "imm":
@@ -126,11 +130,18 @@ class WaveMachine(cpu_ref.Machine):
             if t == "vcc_lo":
                 self.vcc = (self.vcc & ~MASK32 & MASK64) | (value & MASK32)
                 return
+            if t == "vcc_hi":
+                self.vcc = (self.vcc & MASK32) | ((value & MASK32) << 32)
+                return
             if t == "exec":
                 self.exec = value & MASK64
                 return
             if t == "exec_lo":
                 self.exec = (self.exec & ~MASK32 & MASK64) | (value & MASK32)
+                return
+            if t == "exec_hi":
+                if self.wave == 64:
+                    self.exec = (self.exec & MASK32) | ((value & MASK32) << 32)
                 return
             if t == "null":
                 return
@@ -201,12 +212,12 @@ class WaveMachine(cpu_ref.Machine):
             return self._vcmp(ins, base)
         if base.startswith("s_cmp_"):
             self._expect(ins, 2)
-            _, cc, ty = base.split("_")[1:]
+            cc, _, ty = base[len("s_cmp_"):].partition("_")
+            if cc not in _CMP or ty not in ("u32", "i32"):
+                raise Unsupported(op, self.pc, "compare is not modelled")
             x, y = self._int_src(a[0], 0, scalar=True), self._int_src(a[1], 0, scalar=True)
             if ty == "i32":
                 x, y = _signed(x), _signed(y)
-            elif ty != "u32":
-                raise Unsupported(op, self.pc, "compare type is not modelled")
             self.scc = 1 if _CMP[cc](x, y) else 0
             return None
         if base.endswith("_saveexec_b32") or base.endswith("_saveexec_b64"):
@@ -227,9 +238,11 @@ class WaveMachine(cpu_ref.Machine):
             self._expect(ins, 3)
             mask_op = self._touches_mask(a)
             if parts[2] == "b64" or mask_op:
-                self._check_width(base, op)
-                x, y = self._read_mask(a[1]), self._read_mask(a[2])
-                r = _SOP2_LOGIC[parts[1]](x, y, self.wmask) & self.wmask
+                if parts[2] == "b64" or any(x["k"] == "special" and x["t"] in ("exec", "vcc") for x in a):
+                    self._check_width(base, op)
+                mask = MASK64 if parts[2] == "b64" else MASK32
+                x, y = self._read_mask(a[1]) & mask, self._read_mask(a[2]) & mask
+                r = _SOP2_LOGIC[parts[1]](x, y, mask) & mask
                 self._write_mask(a[0], r)
             else:
                 x, y = self._int_src(a[1], 0, scalar=True), self._int_src(a[2], 0, scalar=True)

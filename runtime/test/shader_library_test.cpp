@@ -168,6 +168,24 @@ int main() {
     CHECK(fssm_program(fssm) == fssm);  // a bare FSSM blob passes through
     CHECK(fssm_program(container({{dynamic, 601}})).empty());  // stated size wrong
     CHECK(fssm_program(bytes("DXBC")).empty());
+    // Truncated DXBC part table: must return empty immediately instead of reading out-of-bounds offset 0
+    // (which would match "DXBC" at offset 0 or spin 0xFFFFFFFF iterations on a 32-byte header).
+    {
+        std::vector<std::uint8_t> trunc(32, 0);
+        std::memcpy(trunc.data(), "DXBC", 4);
+        trunc[4] = 4;   // if offset 0 is read as a part header, size=4 fits inside 32 bytes
+        trunc[28] = 1;  // parts = 1, but 0 bytes of part-offset table follow
+        CHECK(dxbc_part(trunc, "DXBC").empty());
+
+        std::vector<std::uint8_t> huge_parts(32, 0);
+        std::memcpy(huge_parts.data(), "DXBC", 4);
+        huge_parts[28] = 0xff;
+        huge_parts[29] = 0xff;
+        huge_parts[30] = 0xff;
+        huge_parts[31] = 0xff;  // parts = 0xFFFFFFFF with 0 bytes of part table
+        CHECK(dxbc_part(huge_parts, "DXIL").empty());
+        CHECK(fssm_program(huge_parts).empty());
+    }
     // Two different 0x0D payloads: the last one is the program, as tools/fssm_unpack.py (and so fssm_sha256) has it.
     CHECK(fssm_program(container({{fixed, 25}, {dynamic, 600}})) == skewed(600));
     CHECK(fssm_program(container({{dynamic, 600}, {fixed, 25}})) == bytes("hello hello hello leonida"));
@@ -176,6 +194,7 @@ int main() {
     const auto dir = std::filesystem::temp_directory_path() / "leonida_shader_library_test";
     std::filesystem::create_directories(dir);
     const std::string hash = sha256_hex(skewed(600));
+    const std::string hash2 = sha256_hex(bytes("another program"));
     {
         std::ofstream index(dir / "index.json", std::ios::binary);
         index << "{\"cs_test\": {\"stage\": \"cs\", \"fssm_sha256\": \"" << hash
@@ -190,6 +209,10 @@ int main() {
                  "{\"semantic\": \"TEXCOORD\", \"semantic_index\": 3, \"register\": -1, \"system_value\": 0, "
                  "\"component_type\": \"float\"}]},\n"
                  " \"ps_out\": {\"stage\": \"ps\", \"fssm_sha256\": \"" << hash << "\", \"outputs\": [0, 2]},\n"
+                 " \"ps_native\": {\"stage\": \"ps\", \"fssm_sha256\": \"" << hash2 << "\", \"wave64\": true, "
+                 "\"subgroup_size\": 64},\n"
+                 " \"cs_emulated\": {\"stage\": \"cs\", \"fssm_sha256\": \"" << hash2 << "\", \"wave64\": true, "
+                 "\"subgroup_size\": null, \"wave64_exchange\": \"workgroup\"},\n"
                  " \"ps_unhashed\": {\"stage\": \"ps\", \"bindings\": []}}";
         std::ofstream spv(dir / "cs_test.spv", std::ios::binary);
         const std::uint32_t words[5] = {0x07230203, 0x00010500, 0, 1, 0};
@@ -197,7 +220,7 @@ int main() {
     }
     ShaderLibrary library;
     std::string error;
-    CHECK(library.load(dir.string(), &error) && library.size() == 4);
+    CHECK(library.load(dir.string(), &error) && library.size() == 6);
     const ShaderEntry* vs = library.find("vs", hash);
     CHECK(vs && vs->input_signature.size() == 2 && vs->input_signature[0].semantic == "COLOR");
     CHECK(vs->input_signature[1].register_index == 2 && vs->input_signature[1].system_value == 6 &&
@@ -214,6 +237,13 @@ int main() {
     CHECK(entry && entry->name == "cs_test" && entry->binding_count == 1 && entry->push_constant_bytes == 144);
     CHECK(entry->local_size[0] == 64 && entry->uses_code_base && !entry->wave64);
     CHECK(!library.find("ms", hash));  // no mesh shader with this hash
+    // The subgroup fields of the index (wave64 / subgroup_size / wave64_exchange): absent, native and emulated.
+    CHECK(!entry->subgroup_size && entry->wave64_exchange.empty() && !entry->emulated());
+    const ShaderEntry* native = library.find("ps", hash2);
+    CHECK(native && native->wave64 && native->subgroup_size == 64 && !native->emulated());
+    const ShaderEntry* emulated = library.find("cs", hash2);
+    CHECK(emulated && emulated->wave64 && emulated->subgroup_size == 0 && emulated->wave64_exchange == "workgroup" &&
+          emulated->emulated());
     CHECK(library.spirv(*entry).size() == 5);
     CHECK(!library.load((dir / "missing").string(), &error) && !error.empty());
     {

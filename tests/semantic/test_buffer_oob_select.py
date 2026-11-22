@@ -222,19 +222,59 @@ class OobSelect(unittest.TestCase):
                 want = {BASE + addr + 4 * k: 0x11111111 * (k + 1) for k in range(4)} if ok else {}
                 self.assertEqual(dict(memory), want, ("store", mode, stride, nr, idx, off, runtime))
 
-    def test_swizzled_literal_v_sharp_is_unsupported_in_every_mode(self):
-        # SWIZZLE_ENABLE (WORD1 bit 31) and ADD_TID_ENABLE (WORD3 bit 23), Mesa gfx10-rsrc.json lines 326 and 337:
-        # swizzled addressing and bounds are not modelled, so a literal V# that asks for them is rejected in every mode
-        # instead of getting the unswizzled check. A run-time V# with those bits is translated unswizzled (known gap).
-        import rdna2spirv
+    def test_loads_literal_v_sharp_from_s_mov_b64(self):
+        # s_mov_b64 s[6:7], imm folds word3 (OOB_SELECT mode) without run-time extraction.
         for mode in range(4):
-            for w1, w3 in ((1 << 31, 0), (0, 1 << 23)):
-                with self.subTest(mode=mode, word1=hex(w1), word3=hex(w3)):
-                    lines = ["s_mov_b32 s4, 0x1000", f"s_mov_b32 s5, {w1:#x}", "s_mov_b32 s6, 16",
-                             f"s_mov_b32 s7, {0x01016FAC | mode << 28 | w3:#x}", "buffer_load_dword v2, off, s[4:7], 0"]
-                    with self.assertRaises(rdna2spirv.Unsupported):
-                        self.translate(lines)
+            with self.subTest(mode=mode):
+                w3 = 0x01000FAC | (mode << 28)
+                val64 = (w3 << 32) | 0x10
+                lines = [f"s_mov_b64 s[4:5], {BASE:#x}", f"s_mov_b64 s[6:7], {val64:#x}",
+                         "buffer_load_dword v2, off, s[4:7], 0", "s_waitcnt vmcnt(0)",
+                         "buffer_store_dword v2, off, s[0:3], 0"]
+                spv = self.translate(lines)
+                self.assertEqual(len(MODE_EXTRACT.findall(spv)), 1, f"mode {mode} did not fold from s_mov_b64")
 
+    def test_loads_literal_v_sharp_from_s_movk_i32(self):
+        # s_movk_i32 s7, imm sets word3 for modes where word3 fits in 16 bits sign-extended.
+        lines = [f"s_mov_b32 s4, {BASE:#x}", "s_mov_b32 s5, 0", "s_mov_b32 s6, 16",
+                 "s_movk_i32 s7, 0x3000",
+                 "buffer_load_dword v2, off, s[4:7], 0", "s_waitcnt vmcnt(0)",
+                 "buffer_store_dword v2, off, s[0:3], 0"]
+        spv = self.translate(lines)
+        self.assertEqual(len(MODE_EXTRACT.findall(spv)), 1, "s_movk_i32 did not fold into literal V#")
 
+    def test_loads_literal_v_sharp_from_sgpr_copy(self):
+        # Copy propagation: s_mov_b32 from a constant SGPR preserves sgpr_imm.
+        w3 = 0x31000FAC
+        lines = [f"s_mov_b32 s8, {w3:#x}", "s_mov_b32 s7, s8",
+                 f"s_mov_b32 s4, {BASE:#x}", "s_mov_b32 s5, 0", "s_mov_b32 s6, 16",
+                 "buffer_load_dword v2, off, s[4:7], 0", "s_waitcnt vmcnt(0)",
+                 "buffer_store_dword v2, off, s[0:3], 0"]
+        spv = self.translate(lines)
+        self.assertEqual(len(MODE_EXTRACT.findall(spv)), 1, "s_mov_b32 copy did not fold into literal V#")
+
+    def test_loads_literal_v_sharp_from_s_mov_b64_copy(self):
+        # Copy propagation: s_mov_b64 64-bit pair copy preserves sgpr_imm.
+        w3 = 0x31000FAC
+        val64 = (w3 << 32) | 16
+        lines = [f"s_mov_b64 s[8:9], {val64:#x}", "s_mov_b64 s[6:7], s[8:9]",
+                 f"s_mov_b32 s4, {BASE:#x}", "s_mov_b32 s5, 0",
+                 "buffer_load_dword v2, off, s[4:7], 0", "s_waitcnt vmcnt(0)",
+                 "buffer_store_dword v2, off, s[0:3], 0"]
+        spv = self.translate(lines)
+        self.assertEqual(len(MODE_EXTRACT.findall(spv)), 1, "s_mov_b64 pair copy did not fold into literal V#")
+
+    def test_loads_literal_v_sharp_from_s_mov_b64_overlapping_copy(self):
+        # Overlapping 64-bit copy s_mov_b64 s[6:7], s[5:6] where d == s + 1:
+        # Both source registers must be evaluated before writing destination,
+        # so s7 gets the old s6 literal rather than the newly written s6 (s5).
+        w3 = 0x31000FAC
+        lines = [f"s_mov_b32 s4, {BASE:#x}", "s_mov_b32 s5, 16",
+                 f"s_mov_b32 s6, {w3:#x}",
+                 "s_mov_b64 s[6:7], s[5:6]",
+                 "buffer_load_dword v2, off, s[4:7], 0", "s_waitcnt vmcnt(0)",
+                 "buffer_store_dword v2, off, s[0:3], 0"]
+        spv = self.translate(lines)
+        self.assertEqual(len(MODE_EXTRACT.findall(spv)), 1, "s_mov_b64 overlapping copy did not fold into literal V#")
 if __name__ == "__main__":
     unittest.main()

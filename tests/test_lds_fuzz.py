@@ -222,6 +222,48 @@ class Runner(unittest.TestCase):
         self.assertEqual(status, 2, out)
         self.assertIn("256 of", out)
 
+    UNPINNED = "device: llvmpipe (LLVM 20.1.2, 256 bits) (subgroup 8..8)\ncompute subgroup size: 32 not available"
+
+    def wrong_dump(self, msg):
+        """A run whose words are all zero, as a narrower subgroup leaves cross-lane results."""
+        def gpu(p, _spv, _build, _entry, _emulate, dump):
+            dump.write_bytes(bytes(4 * p.out_words))
+            return 0, msg
+        return gpu
+
+    def test_unpinned_wave32_is_a_skip_not_a_mismatch(self):
+        status, out = self.run_main(self.wrong_dump(self.UNPINNED), ("--wave", "32"))
+        self.assertEqual(status, 2, out)                      # nothing ran
+        self.assertNotIn("MISMATCH", out)
+        self.assertIn("2 skipped", out)
+        self.assertIn("can't run it at 32 lanes", out)
+
+    def test_pinned_wave32_is_still_compared(self):
+        status, out = self.run_main(self.wrong_dump("compute subgroup size: 32"), ("--wave", "32"))
+        self.assertEqual(status, 1, out)
+        self.assertIn("MISMATCH", out)
+
+    def test_emulated_wave64_is_compared_at_any_subgroup_size(self):
+        # --wave64-emulate output uses no subgroup operations, so llvmpipe's 8 lanes are a real test of it.
+        status, out = self.run_main(self.wrong_dump(self.UNPINNED), ("--emulate",))
+        self.assertEqual(status, 1, out)
+        self.assertIn("MISMATCH", out)
+        self.assertIn("0 skipped", out)
+
+
+class UnpinnedSubgroup(unittest.TestCase):
+    """compute_fixture.unpinned_subgroup reads vk_compute_test's VKC_SUBGROUP_SIZE line."""
+
+    def test_not_available_gives_the_size(self):
+        from compute_fixture import unpinned_subgroup
+        self.assertEqual(unpinned_subgroup("device: X (subgroup 8..8)\ncompute subgroup size: 32 not available\n"), 32)
+
+    def test_pinned_or_missing_line_gives_none(self):
+        from compute_fixture import unpinned_subgroup
+        self.assertIsNone(unpinned_subgroup("device: X (subgroup 32..64)\ncompute subgroup size: 32\n"))
+        self.assertIsNone(unpinned_subgroup("device: X (subgroup 32..32)\n1 groups x 64: 0 mismatches\n"))
+        self.assertIsNone(unpinned_subgroup(""))
+
 
 if __name__ == "__main__":
     unittest.main()

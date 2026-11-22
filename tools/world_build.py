@@ -74,6 +74,22 @@ def _placement_scale(value) -> float:
     return scale if math.isfinite(scale) else 1.0
 
 
+def _parse_archetype(value) -> int:
+    """Parse one placement's archetype: a real JSON integer is used as-is, a string is base-16.
+
+    bool is an int subclass but is never a valid archetype. Any other type (float, list, ...) is invalid and
+    raises, so the callers count the row as malformed. Shared by ``load_placements`` and ``iter_placements``
+    so the two readers stay in step.
+    """
+    if isinstance(value, bool):
+        raise ValueError("bool is not an archetype")
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        return int(value, 16)
+    raise TypeError("archetype must be an integer or a hex string")
+
+
 def load_placements(path: str, lod_levels=DEFAULT_LOD_LEVELS, region=None) -> tuple[list[dict], dict]:
     """Read ``world_index.py --entities-out`` rows. Returns (selected rows, counts).
 
@@ -93,7 +109,7 @@ def load_placements(path: str, lod_levels=DEFAULT_LOD_LEVELS, region=None) -> tu
             counts["rows"] += 1
             try:
                 row = json.loads(line)
-                arch = int(str(row["archetype"]), 16)
+                arch = _parse_archetype(row["archetype"])
                 pos = [float(v) for v in row["position"]]
                 rot = [float(v) for v in row["rotation"]]
                 selected_lod = row.get("lod_level") in levels
@@ -137,7 +153,7 @@ def iter_placements(path: str, counts: dict, lod_levels=DEFAULT_LOD_LEVELS, regi
             counts["rows"] += 1
             try:
                 row = json.loads(line)
-                arch = int(str(row["archetype"]), 16)
+                arch = _parse_archetype(row["archetype"])
                 pos = [float(v) for v in row["position"]]
                 rot = [float(v) for v in row["rotation"]]
                 selected_lod = row.get("lod_level") in levels
@@ -1155,18 +1171,33 @@ def _compute_spawn(chunks: list[dict]) -> list[float]:
     ]
 
 
-def _write_json_atomic(path: str, data: dict) -> None:
-    tmp_path = path + ".tmp"
+def _write_json_atomic(path: str, data: dict, replace=None) -> None:
+    """Publish ``data`` as JSON at ``path`` through a private staging file in the same folder.
+
+    As for the GLB export (#425): an existing file named ``<path>.tmp`` is never used or removed, overlapping
+    writers each stage their own file (the last replacement wins), and the published file keeps the mode of the
+    one it replaces. ``replace`` defaults to ``os.replace``; ``_publish_world`` passes ``glb_writer._replace``,
+    which retries a Windows sharing violation (the viewer may hold world.json open during a rebuild).
+    """
+    replace = replace or os.replace
+    parent = os.path.dirname(os.path.abspath(path))
+    tmp_path = None
     try:
-        with open(tmp_path, "w", encoding="utf-8") as f:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=parent, prefix=".world-", suffix=".tmp", delete=False,
+        ) as f:
+            tmp_path = f.name
             json.dump(data, f, indent=2, allow_nan=False)
             f.write("\n")
             f.flush()
             os.fsync(f.fileno())
-        os.replace(tmp_path, path)
+        # NamedTemporaryFile creates 0600; give world.json the mode of the file it replaces, or a new file's.
+        os.chmod(tmp_path, published_mode(path))
+        # Closed first: Windows cannot rename an open file.
+        replace(tmp_path, path)
     except BaseException:
         try:
-            if os.path.exists(tmp_path):
+            if tmp_path is not None:
                 os.remove(tmp_path)
         except OSError:
             pass
@@ -1271,7 +1302,7 @@ def _publish_world(
                 backed_up.append(name)
             glb_mod._replace(staged, live)
             placed.append(name)
-        _write_json_atomic(world_path, world_doc)
+        _write_json_atomic(world_path, world_doc, replace=glb_mod._replace)
     except BaseException as exc:
         unrestored = []
         restore = set(backed_up)

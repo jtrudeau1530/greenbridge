@@ -384,9 +384,11 @@ def _mc():
 def _mc_accepts_f16_opsel(mc):
     """llvm-mc 21+ is needed for op_sel on 16-bit VOP3 (docs/testing.md); older builds reject the modifier.
 
-    Probe a fixed instruction rather than a generated program, so a generator bug can never turn into a skip.
+    Probe a fixed instruction rather than a generated program, so a generator bug can never turn into a skip. The
+    probe is the form llvm-mc 18 rejects (docs/testing.md): a 16-bit integer op, which GFX10 has only as op_sel VOP3.
+    An f16 VOP2 op's VOP3 form takes no op_sel on GFX10 (tools/valu_fuzz.py), so no assembler accepts that as a probe.
     """
-    probe = "v_add_f16_e64 v0, v1, v2 op_sel:[0,0,0]\n"
+    probe = "v_ashrrev_i16_e64 v0, v1, v2 op_sel:[0,0,0]\n"
     r = subprocess.run(mc + ["-triple=amdgcn--amdpal", "-mcpu=gfx1013"], input=probe,
                        capture_output=True, text=True)
     return r.returncode == 0 and "error:" not in r.stderr
@@ -449,3 +451,47 @@ def test_cli_show_valid_formats(spec, capsys, monkeypatch):
     monkeypatch.setattr(sys, "argv", ["valu_fuzz.py", "--family", "f16", "--show", spec])
     assert vf.main() == 0
     assert "; model, thread 0:" in capsys.readouterr().out
+
+
+# ------------------------------------------------------------------ runner (translator and GPU faked)
+
+UNPINNED = "device: llvmpipe (LLVM 20.1.2, 256 bits) (subgroup 8..8)\ncompute subgroup size: 32 not available"
+
+
+def _run_main(monkeypatch, capsys, tmp_path, msg, extra):
+    """main() for two mem programs, every run returning all-zero words and vk_compute_test output `msg`."""
+    def translate(progs, work, _emulate):
+        (work / "spirv").mkdir(parents=True, exist_ok=True)
+        for p in progs:
+            (work / "spirv" / (p.name + ".spv")).touch()
+        return {p.name: {} for p in progs}, ""
+
+    def run_gpu(p, _spv, _build, _entry, _emulate, dump):
+        dump.write_bytes(bytes(4 * p.out_words()))
+        return 0, msg
+
+    monkeypatch.setattr(vf, "translate", translate)
+    monkeypatch.setattr(vf, "run_gpu", run_gpu)
+    monkeypatch.setattr(sys, "argv", ["valu_fuzz.py", "--family", "mem", "--programs", "2", "--work", str(tmp_path),
+                                      *extra])
+    status = vf.main()
+    return status, capsys.readouterr().out
+
+
+def test_unpinned_wave32_is_a_skip_not_a_mismatch(monkeypatch, capsys, tmp_path):
+    status, out = _run_main(monkeypatch, capsys, tmp_path, UNPINNED, ["--wave", "32"])
+    assert status == 2, out                                   # nothing ran
+    assert "MISMATCH" not in out
+    assert "2 skipped" in out and "can't run it at 32 lanes" in out
+
+
+def test_pinned_wave32_is_still_compared(monkeypatch, capsys, tmp_path):
+    status, out = _run_main(monkeypatch, capsys, tmp_path, "compute subgroup size: 32", ["--wave", "32"])
+    assert status == 1, out
+    assert "MISMATCH" in out
+
+
+def test_emulated_wave64_is_compared_at_any_subgroup_size(monkeypatch, capsys, tmp_path):
+    status, out = _run_main(monkeypatch, capsys, tmp_path, UNPINNED, ["--wave", "64", "--emulate"])
+    assert status == 1, out
+    assert "MISMATCH" in out and "0 skipped" in out
