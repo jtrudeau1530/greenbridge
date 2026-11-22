@@ -1,7 +1,7 @@
-# First light: a real game model with its own translated shaders
+# First light: a game model's UVs drawn with translated game shaders
 
 **Status: measured** on the 1.0.2.1 package and an NVIDIA RTX 2060 SUPER (driver 620.73.04, Vulkan 1.4.357,
-CachyOS). This is the first draw of a real game model with its own translated VS and PS on a real GPU. The image
+CachyOS). The fixture draws a model from the package with a vertex and pixel shader chosen to display its UVs. The image
 stays in the user's work folder; this note records the counts and the recipe, not the model, the shaders or a
 screenshot.
 
@@ -20,6 +20,13 @@ The shaders are two ordinary containers from `shaders.rpf`, carved and translate
 |---|---|---|
 | VS | `128867d3233a97ba5b203c313a24ab8a77df20c2a308091a5595bb9f669677f4` | forwards POSITION and TEXCOORD from the vertex fetch to clip space and a varying |
 | PS | `ed4147a5f7514947c2eb8d79255bd80f72761ac1ba2205dd811d3e050cf1b495` | writes the interpolated TEXCOORD as the colour; no bindings, no texture |
+
+The model's authored shader assignment can be checked separately. In the model export manifest for the OBJ
+above, `MeshShaders[0]` selects material slot 0, the only slot. Looking up its `Materials[0].Shader` in the
+native shader database yields one effect with one technique and four compute-only passes. The VS and PS
+in the table are the fixture's chosen pair. The model's use during gameplay remains unverified.
+See the [effect lookup](https://github.com/ItsNotRexed/Leonida/pull/3036) and the
+[Windows reproduction of the UV draw](https://github.com/ItsNotRexed/Leonida/pull/2893#issuecomment-7084947193).
 
 Both disassemble with no invalid word, translate, and pass `spirv-val`; `tools/shader_link_check.py check` reports
 the pair compatible. At 128×128 the draw covers **12,804 of 16,384 pixels (0.781)** and the centre pixel is
