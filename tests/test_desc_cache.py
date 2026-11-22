@@ -183,7 +183,10 @@ def test_lookup_result_is_broadcast_before_use():
         if "OpGroupNonUniformBroadcastFirst" in ln:
             bcast[ln.split()[0]] = ln.split()[-1]
     assert results and sorted(bcast.values()) == sorted(results), (results, bcast)
+    assert "OpCapability GroupNonUniform" in lines
     assert "OpCapability GroupNonUniformBallot" in lines
+    assert "OpCapability GroupNonUniformShuffle" not in lines
+    assert "%sg_lane = OpVariable %_ptr_Input_uint Input" not in lines
     for ln in lines:
         if ln.split()[1:2] == ["="] and "OpAccessChain" in ln and ("%images" in ln or "%samplers" in ln):
             assert not results & set(ln.split()), ln

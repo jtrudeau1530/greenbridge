@@ -199,7 +199,7 @@ class Gen:
         self.lconsts = {}              # 64-bit constants: value -> id
         self.uses_vote = False         # wave-uniform branches (OpGroupNonUniformAny)
         self.uses_ballot = False       # wave mask ballot (OpGroupNonUniformBallot)
-        self.uses_bcast_first = False  # OpGroupNonUniformBroadcastFirst (desc_lookup): the Ballot capability only
+        self.uses_bcast_first = False  # OpGroupNonUniformBroadcastFirst (desc_lookup): Ballot capability only
         self.uses_wave_bits = False    # a whole lane mask gathered from the wave (OpGroupNonUniformBitwiseOr)
         self.uses_quad = False         # s_wqm on a lane mask (OpGroupNonUniformQuadSwap)
         self.lane_masks = {}           # id(instruction) -> registers holding a lane mask there (lane_masks.py)
@@ -7957,13 +7957,15 @@ class Gen:
         self.emit(f"{r} = OpFunctionCall %uint %desc_lookup_fn " + " ".join(words))
         if self.emulate:
             return r
-        # The descriptor words are SGPRs, so the index is the same in every invocation of the subgroup; say so.
-        # Mesa ANV (26.2.7, Alder Lake Xe-LP) segfaults compiling a shader whose sampler index comes out of the
-        # probe loop when that sampler is used with both a float and an integer image; the broadcast avoids it.
-        # The wave64 emulation keeps no subgroup operation (x_round), so it is left out there.
+        # The descriptor words are SGPRs, so the index is the same in every invocation of the subgroup; the
+        # broadcast is an identity on every driver and makes that uniformity explicit to the compiler. Mesa ANV
+        # (26.2.7, Alder Lake Xe-LP) segfaults compiling a sampler index straight from the probe loop when one
+        # sampler serves both a float and integer image; the broadcast avoids it. The wave64 emulation keeps no
+        # subgroup operation (x_round), so it is left out there. Track this separately from uses_subgroup: this
+        # operation needs GroupNonUniform + GroupNonUniformBallot, but no Shuffle capability or lane input.
         b = self.tmp()
         self.emit(f"{b} = OpGroupNonUniformBroadcastFirst %uint {self.cu(3)} {r}")
-        self.uses_subgroup = self.uses_bcast_first = True
+        self.uses_bcast_first = True
         return b
 
     def desc_probe(self, words):
