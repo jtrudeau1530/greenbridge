@@ -591,12 +591,16 @@ struct DeviceState {
     // The first memory type with `required`, preferring one that also has `preferred`. `chosen`, when given, receives
     // the property flags of the type the memory came from.
     VkDeviceMemory allocate(const VkMemoryRequirements& requirements, VkMemoryPropertyFlags required,
-                            VkMemoryPropertyFlags preferred, VkMemoryPropertyFlags* chosen = nullptr) const {
+                            VkMemoryPropertyFlags preferred, VkMemoryPropertyFlags* chosen = nullptr,
+                            bool device_address = false) const {
+        VkMemoryAllocateFlagsInfo flags_info{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO};
+        flags_info.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
         for (const VkMemoryPropertyFlags flags : {required | preferred, required}) {
             for (std::uint32_t i = 0; i < memory.memoryTypeCount; ++i) {
                 if (!(requirements.memoryTypeBits & (1u << i))) continue;
                 if ((memory.memoryTypes[i].propertyFlags & flags) != flags) continue;
                 VkMemoryAllocateInfo allocate{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+                if (device_address) allocate.pNext = &flags_info;
                 allocate.allocationSize = requirements.size;
                 allocate.memoryTypeIndex = i;
                 VkDeviceMemory out = VK_NULL_HANDLE;
@@ -653,6 +657,11 @@ public:
     ~Resource() override {
         auto& vk = device_.context->vk;
         const VkDevice dev = device_.info.device;
+        if (accel_) {
+            device_.context->unregister_acceleration_structure(gpu_va_);
+            if (buffer_va_ && buffer_va_ != gpu_va_) device_.context->unregister_acceleration_structure(buffer_va_);
+            if (vk.vkDestroyAccelerationStructureKHR) vk.vkDestroyAccelerationStructureKHR(dev, accel_, nullptr);
+        }
         if (image_address_) device_.forget_image(image_address_);
         device_.context->remove_resource(id());
         if (image_) vk.vkDestroyImage(dev, image_, nullptr);
@@ -662,14 +671,16 @@ public:
 
     leonida::ResourceId id() const { return resource_id(this); }
     VkImage image() const { return image_; }
+    VkBuffer buffer() const { return buffer_; }
     const D3D12_RESOURCE_DESC& desc() const { return desc_; }
     VkFormat format() const { return format_; }                  // of the image
     VkImageAspectFlags aspects() const { return aspects_; }
     std::uint64_t image_address() const { return image_address_; }  // what a T# names the texture by
     VkMemoryPropertyFlags memory_flags() const { return memory_flags_; }  // of the memory type behind it
 
-    HRESULT create_buffer() {
+    HRESULT create_buffer(D3D12_RESOURCE_STATES initial_state = D3D12_RESOURCE_STATE_COMMON) {
         auto& vk = device_.context->vk;
+        const bool need_bda = device_.info.buffer_device_address || device_.info.ray_tracing;
         VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
         info.size = desc_.Width;
         info.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
@@ -677,6 +688,11 @@ public:
                      VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
                      VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT;
         if (device_.info.conditional_rendering) info.usage |= VK_BUFFER_USAGE_CONDITIONAL_RENDERING_BIT_EXT;
+        if (need_bda) info.usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+        if (device_.info.ray_tracing) {
+            info.usage |= VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR |
+                          VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR;
+        }
         if (vk.vkCreateBuffer(device_.info.device, &info, nullptr, &buffer_) != VK_SUCCESS) return E_OUTOFMEMORY;
         VkMemoryRequirements requirements{};
         vk.vkGetBufferMemoryRequirements(device_.info.device, buffer_, &requirements);
@@ -689,8 +705,9 @@ public:
             host_preferred = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
         memory_ = host ? device_.allocate(requirements,
                                           VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-                                          host_preferred, &memory_flags_)
-                       : device_.allocate(requirements, 0, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &memory_flags_);
+                                          host_preferred, &memory_flags_, need_bda)
+                       : device_.allocate(requirements, 0, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &memory_flags_,
+                                          need_bda);
         if (!memory_ || vk.vkBindBufferMemory(device_.info.device, buffer_, memory_, 0) != VK_SUCCESS)
             return E_OUTOFMEMORY;
         if (host) {
@@ -699,6 +716,30 @@ public:
             std::memset(mapped_, 0, std::size_t(desc_.Width));  // committed resources start zeroed
         } else {
             log_once("default-heap buffers are not zero-filled yet; dimension", int(desc_.Dimension));
+        }
+        if (need_bda && vk.vkGetBufferDeviceAddress) {
+            VkBufferDeviceAddressInfo bda{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
+            bda.buffer = buffer_;
+            buffer_va_ = vk.vkGetBufferDeviceAddress(device_.info.device, &bda);
+            gpu_va_ = buffer_va_;
+        }
+        if (device_.info.ray_tracing && initial_state == D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE &&
+            vk.vkCreateAccelerationStructureKHR && vk.vkGetAccelerationStructureDeviceAddressKHR) {
+            VkAccelerationStructureCreateInfoKHR asci{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_CREATE_INFO_KHR};
+            asci.buffer = buffer_;
+            asci.offset = 0;
+            asci.size = desc_.Width;
+            asci.type = VK_ACCELERATION_STRUCTURE_TYPE_GENERIC_KHR;
+            if (vk.vkCreateAccelerationStructureKHR(device_.info.device, &asci, nullptr, &accel_) == VK_SUCCESS) {
+                VkAccelerationStructureDeviceAddressInfoKHR dai{
+                    VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_DEVICE_ADDRESS_INFO_KHR};
+                dai.accelerationStructure = accel_;
+                const std::uint64_t as_va = vk.vkGetAccelerationStructureDeviceAddressKHR(device_.info.device, &dai);
+                if (as_va) gpu_va_ = as_va;
+                device_.context->register_acceleration_structure(gpu_va_, accel_);
+                if (buffer_va_ && buffer_va_ != gpu_va_)
+                    device_.context->register_acceleration_structure(buffer_va_, accel_);
+            }
         }
         leonida::ResourceBinding binding{};  // a buffer: no image
         binding.buffer = buffer_;
@@ -835,6 +876,7 @@ public:
         return S_OK;
     }
     void STDMETHODCALLTYPE Unmap(UINT, const D3D12_RANGE*) override {}
+    D3D12_GPU_VIRTUAL_ADDRESS STDMETHODCALLTYPE GetGPUVirtualAddress() override { return gpu_va_; }
 
     // CPU copies into and out of a texture subresource. D3D12 completes them before returning and leaves it to
     // the application to keep the GPU off the subresource meanwhile, so a blocking copy is the whole contract.
@@ -1063,10 +1105,13 @@ private:
     VkBuffer buffer_ = VK_NULL_HANDLE;
     VkDeviceMemory memory_ = VK_NULL_HANDLE;
     VkMemoryPropertyFlags memory_flags_ = 0;
+    VkAccelerationStructureKHR accel_ = VK_NULL_HANDLE;
     void* mapped_ = nullptr;
     VkFormat format_ = VK_FORMAT_UNDEFINED;
     VkImageAspectFlags aspects_ = 0;
     std::uint64_t image_address_ = 0;
+    std::uint64_t buffer_va_ = 0;
+    std::uint64_t gpu_va_ = 0;
     bool reserved_ = false;
     leonida::ResourceBinding binding_{};  // a texture's, as registered with the context
     bool host_transfer_ = false;          // created with VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT
@@ -1416,7 +1461,7 @@ public:
 
         state_.context = std::make_unique<leonida::VulkanContext>(get_device, info.device,
                                                                   info.separate_depth_stencil_layouts,
-                                                                  info.conditional_rendering);
+                                                                  info.conditional_rendering, info.ray_tracing);
         if (info.host_image_copy) load_host_image_copy(get_device);
         // The copies of a D24 texture stored as D32 convert on the GPU (vulkan_depth24.h).
         std::uint64_t max_storage_range = 1u << 27;  // the least Vulkan allows, if the limit cannot be read
@@ -1675,6 +1720,104 @@ public:
     HRESULT STDMETHODCALLTYPE CreateFence(UINT64 initial, D3D12_FENCE_FLAGS flags, REFIID riid, void** out) override {
         constexpr auto method = "ID3D12Device::CreateFence";
         return d3d12_trace::result(method, create_fence(*state_.context, initial, flags, riid, out, identity()));
+    }
+
+    HRESULT STDMETHODCALLTYPE CreateCommandSignature(const D3D12_COMMAND_SIGNATURE_DESC* desc, ID3D12RootSignature*,
+                                                     REFIID riid, void** out) override {
+        if (!out) return E_POINTER;
+        *out = nullptr;
+        if (!desc || desc->NumArgumentDescs == 0 || !desc->pArgumentDescs || desc->ByteStride == 0)
+            return E_INVALIDARG;
+        leonida::IndirectKind kind = leonida::IndirectKind::draw;
+        bool found = false;
+        for (UINT i = 0; i < desc->NumArgumentDescs; ++i) {
+            switch (desc->pArgumentDescs[i].Type) {
+            case D3D12_INDIRECT_ARGUMENT_TYPE_DRAW:
+                kind = leonida::IndirectKind::draw;
+                found = true;
+                break;
+            case D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED:
+                kind = leonida::IndirectKind::draw_indexed;
+                found = true;
+                break;
+            case D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH:
+                kind = leonida::IndirectKind::dispatch;
+                found = true;
+                break;
+            default: break;
+            }
+        }
+        if (!found) return E_NOTIMPL;
+        return create_command_signature(kind, desc->ByteStride, riid, out, identity());
+    }
+
+    void STDMETHODCALLTYPE GetRaytracingAccelerationStructurePrebuildInfo(
+        const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS* desc,
+        D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO* out) override {
+        if (!out) return;
+        *out = {};
+        auto& vk = state_.context->vk;
+        if (!desc || !state_.info.ray_tracing || !vk.vkGetAccelerationStructureBuildSizesKHR) return;
+
+        const bool is_tlas = (desc->Type == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL);
+        std::vector<VkAccelerationStructureGeometryKHR> geoms;
+        std::vector<std::uint32_t> max_prims;
+        if (is_tlas) {
+            VkAccelerationStructureGeometryKHR g{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR};
+            g.geometryType = VK_GEOMETRY_TYPE_INSTANCES_KHR;
+            g.geometry.instances.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_INSTANCES_DATA_KHR;
+            g.geometry.instances.arrayOfPointers = VK_FALSE;
+            geoms.push_back(g);
+            max_prims.push_back(desc->NumDescs);
+        } else {
+            for (UINT i = 0; i < desc->NumDescs; ++i) {
+                const D3D12_RAYTRACING_GEOMETRY_DESC* gd =
+                    (desc->DescsLayout == D3D12_ELEMENTS_LAYOUT_ARRAY_OF_POINTERS)
+                        ? (desc->ppGeometryDescs ? desc->ppGeometryDescs[i] : nullptr)
+                        : (desc->pGeometryDescs ? &desc->pGeometryDescs[i] : nullptr);
+                if (!gd || gd->Type != D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES) continue;
+                VkAccelerationStructureGeometryKHR g{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR};
+                g.geometryType = VK_GEOMETRY_TYPE_TRIANGLES_KHR;
+                g.flags = (gd->Flags & D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE) ? VK_GEOMETRY_OPAQUE_BIT_KHR : 0u;
+                auto& tr = g.geometry.triangles;
+                tr.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR;
+                tr.vertexFormat = (gd->Triangles.VertexFormat == DXGI_FORMAT_R32G32_FLOAT) ? VK_FORMAT_R32G32_SFLOAT
+                                                                                           : VK_FORMAT_R32G32B32_SFLOAT;
+                tr.vertexStride = gd->Triangles.VertexBuffer.StrideInBytes;
+                tr.maxVertex = gd->Triangles.VertexCount ? (gd->Triangles.VertexCount - 1u) : 0u;
+                tr.indexType = (gd->Triangles.IndexFormat == DXGI_FORMAT_R16_UINT)
+                                   ? VK_INDEX_TYPE_UINT16
+                                   : ((gd->Triangles.IndexFormat == DXGI_FORMAT_R32_UINT) ? VK_INDEX_TYPE_UINT32
+                                                                                          : VK_INDEX_TYPE_NONE_KHR);
+                geoms.push_back(g);
+                const std::uint32_t prims =
+                    (gd->Triangles.IndexFormat != DXGI_FORMAT_UNKNOWN && gd->Triangles.IndexCount >= 3)
+                        ? (gd->Triangles.IndexCount / 3u)
+                        : (gd->Triangles.VertexCount / 3u);
+                max_prims.push_back(prims);
+            }
+        }
+        if (geoms.empty()) return;
+
+        VkAccelerationStructureBuildGeometryInfoKHR bgi{
+            VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR};
+        bgi.type = is_tlas ? VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR
+                           : VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
+        if (desc->Flags & D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_UPDATE)
+            bgi.flags |= VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR;
+        if (desc->Flags & D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE)
+            bgi.flags |= VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR;
+        if (desc->Flags & D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_BUILD)
+            bgi.flags |= VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_BUILD_BIT_KHR;
+        bgi.geometryCount = static_cast<std::uint32_t>(geoms.size());
+        bgi.pGeometries = geoms.data();
+
+        VkAccelerationStructureBuildSizesInfoKHR sizes{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR};
+        vk.vkGetAccelerationStructureBuildSizesKHR(state_.info.device, VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR,
+                                                   &bgi, max_prims.data(), &sizes);
+        out->ResultDataMaxSizeInBytes = sizes.accelerationStructureSize;
+        out->ScratchDataSizeInBytes = sizes.buildScratchSize;
+        out->UpdateScratchDataSizeInBytes = sizes.updateScratchSize;
     }
 
     HRESULT STDMETHODCALLTYPE CreateDescriptorHeap(const D3D12_DESCRIPTOR_HEAP_DESC* desc, REFIID riid,
@@ -2048,7 +2191,7 @@ public:
     }
 
     HRESULT STDMETHODCALLTYPE CreateCommittedResource(const D3D12_HEAP_PROPERTIES* heap, D3D12_HEAP_FLAGS heap_flags,
-                                                      const D3D12_RESOURCE_DESC* desc, D3D12_RESOURCE_STATES,
+                                                      const D3D12_RESOURCE_DESC* desc, D3D12_RESOURCE_STATES initial_state,
                                                       const D3D12_CLEAR_VALUE*, REFIID riid, void** out) override {
         constexpr auto method = "ID3D12Device::CreateCommittedResource";
         if (out) *out = nullptr;
@@ -2057,7 +2200,8 @@ public:
         resource->attach_device(identity());
         HRESULT hr = E_NOTIMPL;
         if (desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
-            hr = desc->SampleDesc.Count == 1 && desc->SampleDesc.Quality == 0 ? resource->create_buffer() : E_INVALIDARG;
+            hr = desc->SampleDesc.Count == 1 && desc->SampleDesc.Quality == 0 ? resource->create_buffer(initial_state)
+                                                                              : E_INVALIDARG;
         } else if (desc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE1D &&
                    desc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
                    desc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE3D) {
@@ -3081,6 +3225,26 @@ VkMemoryPropertyFlags vulkan_memory_flags(ID3D12Resource* resource) {
     return r ? r->memory_flags() : 0;
 }
 
+VkBuffer vulkan_buffer(ID3D12Resource* resource) {
+    const Resource* r = Resource::from<Resource>(resource);
+    return r ? r->buffer() : VK_NULL_HANDLE;
+}
+
+bool device_supports_ray_tracing(ID3D12Device* device) {
+    if (!device) return false;
+    ID3D12Device* real = rt::d3d12_xs::device_proxy_real_device(device);
+    if (auto* d = Device::from<Device>(real ? real : device)) return d->context().ray_tracing_supported();
+    return false;
+}
+
+VkAccelerationStructureKHR vulkan_acceleration_structure(ID3D12Device* device, D3D12_GPU_VIRTUAL_ADDRESS va) {
+    if (!device || !va) return VK_NULL_HANDLE;
+    ID3D12Device* real = rt::d3d12_xs::device_proxy_real_device(device);
+    if (auto* d = Device::from<Device>(real ? real : device))
+        return d->context().resolve_acceleration_structure(va);
+    return VK_NULL_HANDLE;
+}
+
 bool color_resolve_format_matches(DXGI_FORMAT format, ID3D12Resource* dst, ID3D12Resource* src) {
     if (!dst || !src) return false;
     const Format requested = vulkan_format(format, false);
@@ -3292,15 +3456,20 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
                         : "no GPU named by LEONIDA_VK_DEVICE has Vulkan 1.3 with dynamicRendering, synchronization2, "
                           "timelineSemaphore and separateDepthStencilLayouts");
 
-    // VK_EXT_conditional_rendering for SetPredication and VK_KHR_swapchain for DXGI presentation, when available.
+    // VK_EXT_conditional_rendering for SetPredication, VK_KHR_swapchain for DXGI presentation, and optional
+    // VK_KHR_acceleration_structure + VK_KHR_ray_query for hardware BVH builds (BLAS + TLAS).
     VkPhysicalDeviceConditionalRenderingFeaturesEXT conditional{
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CONDITIONAL_RENDERING_FEATURES_EXT};
     bool has_swapchain = false;
+    VkPhysicalDeviceAccelerationStructureFeaturesKHR as_features{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR};
+    VkPhysicalDeviceRayQueryFeaturesKHR rq_features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR};
     {
         std::uint32_t extension_count = 0;
         vkEnumerateDeviceExtensionProperties(info.physical, nullptr, &extension_count, nullptr);
         std::vector<VkExtensionProperties> extensions(extension_count);
         vkEnumerateDeviceExtensionProperties(info.physical, nullptr, &extension_count, extensions.data());
+        bool has_as = false, has_dho = false, has_rq = false;
         for (const auto& e : extensions) {
             if (!std::strcmp(e.extensionName, VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME)) {
                 VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &conditional};
@@ -3308,7 +3477,19 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
                 info.conditional_rendering = conditional.conditionalRendering == VK_TRUE;
             } else if (!std::strcmp(e.extensionName, VK_KHR_SWAPCHAIN_EXTENSION_NAME)) {
                 has_swapchain = true;
+            } else if (!std::strcmp(e.extensionName, VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME)) {
+                has_as = true;
+            } else if (!std::strcmp(e.extensionName, VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME)) {
+                has_dho = true;
+            } else if (!std::strcmp(e.extensionName, VK_KHR_RAY_QUERY_EXTENSION_NAME)) {
+                has_rq = true;
             }
+        }
+        if (has_as && has_dho && has_rq && chosen12.bufferDeviceAddress) {
+            as_features.pNext = &rq_features;
+            VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &as_features};
+            vkGetPhysicalDeviceFeatures2(info.physical, &features);
+            info.ray_tracing = as_features.accelerationStructure == VK_TRUE && rq_features.rayQuery == VK_TRUE;
         }
         if (!info.conditional_rendering)
             std::fprintf(stderr, "[rt] d3d12: the GPU has no VK_EXT_conditional_rendering: SetPredication is unsupported\n");
@@ -3316,14 +3497,31 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     VkPhysicalDeviceConditionalRenderingFeaturesEXT enable_conditional{
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CONDITIONAL_RENDERING_FEATURES_EXT};
     enable_conditional.conditionalRendering = VK_TRUE;
+    VkPhysicalDeviceRayQueryFeaturesKHR enable_rq{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR};
+    enable_rq.rayQuery = VK_TRUE;
+    VkPhysicalDeviceAccelerationStructureFeaturesKHR enable_as{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR};
+    enable_as.accelerationStructure = VK_TRUE;
 
-    VkPhysicalDeviceVulkan13Features enable13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
-                                              info.conditional_rendering ? &enable_conditional : nullptr};
+    void* ext_chain = nullptr;
+    if (info.ray_tracing) {
+        enable_rq.pNext = ext_chain;
+        enable_as.pNext = &enable_rq;
+        ext_chain = &enable_as;
+    }
+    if (info.conditional_rendering) {
+        enable_conditional.pNext = ext_chain;
+        ext_chain = &enable_conditional;
+    }
+
+    VkPhysicalDeviceVulkan13Features enable13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES, ext_chain};
     enable13.dynamicRendering = VK_TRUE;
     enable13.synchronization2 = VK_TRUE;
     VkPhysicalDeviceVulkan12Features enable12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &enable13};
     enable12.timelineSemaphore = VK_TRUE;
     enable12.separateDepthStencilLayouts = VK_TRUE;
+    info.buffer_device_address = chosen12.bufferDeviceAddress == VK_TRUE;
+    enable12.bufferDeviceAddress = info.buffer_device_address ? VK_TRUE : VK_FALSE;
     // Where the GPU has them: what the bindless set 0 needs (VulkanDeviceInfo::bindless), and the sampler features
     // D3D12 samplers can ask for.
     info.bindless = chosen12.runtimeDescriptorArray && chosen_features.shaderSampledImageArrayDynamicIndexing &&
@@ -3414,6 +3612,11 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     if (info.host_image_copy) device_extensions.push_back(host_image_copy_name);
     if (calibrated) device_extensions.push_back(calibrated);
     if (has_swapchain) device_extensions.push_back(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
+    if (info.ray_tracing) {
+        device_extensions.push_back(VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME);
+        device_extensions.push_back(VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME);
+        device_extensions.push_back(VK_KHR_RAY_QUERY_EXTENSION_NAME);
+    }
     device_info.enabledExtensionCount = std::uint32_t(device_extensions.size());
     device_info.ppEnabledExtensionNames = device_extensions.empty() ? nullptr : device_extensions.data();
     if (vkCreateDevice(info.physical, &device_info, nullptr, &owned.device) != VK_SUCCESS)
