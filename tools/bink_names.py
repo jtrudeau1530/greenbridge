@@ -318,6 +318,8 @@ def main(argv=None):
     ap.add_argument("--max-skip", type=int, default=MAX_SKIP, help="most list entries skipped in a row")
     ap.add_argument("--out", help="names.csv or names.json; default is a summary only")
     a = ap.parse_args(argv)
+    if a.max_skip < 0:
+        ap.error("--max-skip must be 0 or more")
     inputs = [a.source, *a.mount] + ([a.pins] if a.pins else [])
     for path in inputs:
         if not os.path.exists(path):
