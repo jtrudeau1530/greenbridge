@@ -626,5 +626,130 @@ class TestSIMDMultiLaneDivergence(unittest.TestCase):
                 self.assertEqual(state.read_lane_vgpr(lane, 4), 0x1111_1111)
 
 
+# ==============================================================================
+# Register Aliasing and In-Place Operand Preservation
+# ==============================================================================
+
+class TestRegisterAliasingAndPreservation(unittest.TestCase):
+    """Verification of atomic read-before-write semantics and register aliasing with carry/borrow."""
+
+    def setUp(self) -> None:
+        self.interp = ScalarInterpreter()
+        self.state = ScalarModel()
+
+    def test_in_place_accumulator_dst_equals_src0(self) -> None:
+        # s0 = s0 + s1 + cin
+        self.state.set_scc(1)
+        self.state.write_sgpr(0, 100)
+        self.state.write_sgpr(1, 50)
+        instr_add = SAddSubbCoCiU32Instruction(
+            opcode=SOPOpcode.S_ADDC_U32,
+            dst=SGPROperand(0),
+            src0=SGPROperand(0),
+            src1=SGPROperand(1),
+        )
+        res, cc = self.interp.step(instr_add, self.state)
+        # 100 + 50 + 1 = 151
+        self.assertEqual(res, 151)
+        self.assertEqual(cc, 0)
+        self.assertEqual(self.state.read_sgpr(0), 151)
+        self.assertEqual(self.state.read_sgpr(1), 50)  # src1 preserved
+
+        # s0 = s0 - s1 - bin
+        self.state.set_scc(1)
+        instr_sub = SAddSubbCoCiU32Instruction(
+            opcode=SOPOpcode.S_SUBB_U32,
+            dst=SGPROperand(0),
+            src0=SGPROperand(0),
+            src1=SGPROperand(1),
+        )
+        res_sub, cc_sub = self.interp.step(instr_sub, self.state)
+        # 151 - 50 - 1 = 100
+        self.assertEqual(res_sub, 100)
+        self.assertEqual(cc_sub, 0)
+        self.assertEqual(self.state.read_sgpr(0), 100)
+
+    def test_in_place_accumulator_dst_equals_src1(self) -> None:
+        # s1 = s0 + s1 + cin
+        self.state.set_scc(1)
+        self.state.write_sgpr(0, 200)
+        self.state.write_sgpr(1, 80)
+        instr_add = SAddSubbCoCiU32Instruction(
+            opcode=SOPOpcode.S_ADDC_U32,
+            dst=SGPROperand(1),
+            src0=SGPROperand(0),
+            src1=SGPROperand(1),
+        )
+        res, cc = self.interp.step(instr_add, self.state)
+        # 200 + 80 + 1 = 281
+        self.assertEqual(res, 281)
+        self.assertEqual(self.state.read_sgpr(1), 281)
+        self.assertEqual(self.state.read_sgpr(0), 200)  # src0 preserved
+
+    def test_self_referential_source_aliasing(self) -> None:
+        # s2 = s0 + s0 + cin (doubling + 1)
+        self.state.set_scc(1)
+        self.state.write_sgpr(0, 0x4000_0000)
+        instr_double = SAddSubbCoCiU32Instruction(
+            opcode=SOPOpcode.S_ADDC_U32,
+            dst=SGPROperand(2),
+            src0=SGPROperand(0),
+            src1=SGPROperand(0),
+        )
+        res_double, cc_double = self.interp.step(instr_double, self.state)
+        self.assertEqual(res_double, 0x8000_0001)
+        self.assertEqual(cc_double, 0)
+        self.assertEqual(self.state.read_sgpr(0), 0x4000_0000)
+
+        # s3 = s0 - s0 - bin
+        # If bin == 1, s0 - s0 - 1 = -1 (0xFFFFFFFF) with borrow = 1
+        self.state.set_scc(1)
+        instr_self_sub = SAddSubbCoCiU32Instruction(
+            opcode=SOPOpcode.S_SUBB_U32,
+            dst=SGPROperand(3),
+            src0=SGPROperand(0),
+            src1=SGPROperand(0),
+        )
+        res_sub, cc_sub = self.interp.step(instr_self_sub, self.state)
+        self.assertEqual(res_sub, MAX_U32)
+        self.assertEqual(cc_sub, 1)
+
+    def test_tri_aliasing_dst_src0_src1(self) -> None:
+        # s0 = s0 + s0 + cin
+        self.state.set_scc(1)
+        self.state.write_sgpr(0, 15)
+        instr_tri_add = SAddSubbCoCiU32Instruction(
+            opcode=SOPOpcode.S_ADDC_U32,
+            dst=SGPROperand(0),
+            src0=SGPROperand(0),
+            src1=SGPROperand(0),
+        )
+        res, cc = self.interp.step(instr_tri_add, self.state)
+        # 15 + 15 + 1 = 31
+        self.assertEqual(res, 31)
+        self.assertEqual(cc, 0)
+        self.assertEqual(self.state.read_sgpr(0), 31)
+
+    def test_unreferenced_register_preservation(self) -> None:
+        for i in range(NUM_SGPRS):
+            self.state.write_sgpr(i, (i * 0x0202_0202) & MASK_U32)
+
+        self.state.set_scc(1)
+        instr = SAddSubbCoCiU32Instruction(
+            opcode=SOPOpcode.S_ADDC_U32,
+            dst=SGPROperand(77),
+            src0=SGPROperand(10),
+            src1=InlineConstant(3),
+        )
+        self.interp.step(instr, self.state)
+
+        for i in range(NUM_SGPRS):
+            if i == 77:
+                expected = ((10 * 0x0202_0202) + 3 + 1) & MASK_U32
+                self.assertEqual(self.state.read_sgpr(i), expected)
+            else:
+                self.assertEqual(self.state.read_sgpr(i), (i * 0x0202_0202) & MASK_U32)
+
+
 if __name__ == "__main__":
     unittest.main()
