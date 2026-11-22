@@ -674,6 +674,36 @@ class TestTextureModeProbing(unittest.TestCase):
             self.assertIn("winners: [(('4K_S', 'last'), 1)]", output)
             self.assertIn("probed 1 of 1 textures; 0 skipped", output)
 
+    def test_probe_top_mip_after_non_aligned_tile_grid(self) -> None:
+        # The 132x136 lower mip is 33x34 BC1 blocks, requiring 2x3 tiles of 32x16 blocks.
+        # The 264x272 top mip is 66x68 blocks, requiring 3x5 tiles.
+        width, height = 264, 272
+        top_blocks_w, top_blocks_h = 66, 68
+        block = np.array([0, 248, 0, 248, 0, 0, 0, 0], dtype=np.uint8)
+        top = np.tile(block, (top_blocks_h, top_blocks_w, 1))
+        offsets = tex_mode_probe.offsets_for(SYNTHETIC_EQ_4K_BC1, 12, 8, top_blocks_w, top_blocks_h)
+        gpu = make_swizzled_gpu_buffer(top, offsets, 8, (6 + 15) * 4096, start_offset=6 * 4096)
+
+        with tempfile.TemporaryDirectory() as directory:
+            archive = os.path.join(directory, "synthetic")
+            os.mkdir(archive)
+            with open(os.path.join(archive, f"{0x1000:012x}.bin"), "wb") as f:
+                f.write(gpu)
+            index = os.path.join(directory, "index.json")
+            with open(index, "w", encoding="utf-8", newline="\n") as f:
+                json.dump([{"archive": "synthetic", "gpu": 0x1000, "gpu_size": len(gpu),
+                            "fmt_name": "BC1_UNORM", "w": width, "h": height,
+                            "flags": self.flags, "data_off": 0}], f)
+            table = {"GFX10_SW_4K_S_PATINFO": [self.entry_correct]}
+            with mock.patch.object(tex_mode_probe, "load", return_value=(self.nib, table)), \
+                 mock.patch.object(tex_mode_probe, "equation", return_value=SYNTHETIC_EQ_4K_BC1), \
+                 mock.patch.object(sys, "argv", ["tex_mode_probe.py", index, directory]), \
+                 mock.patch("sys.stdout", new_callable=io.StringIO) as stdout:
+                tex_mode_probe.main()
+
+        self.assertRegex(stdout.getvalue(), r"best 0\.0000 4K_S .*? \[last\]")
+        self.assertIn("winners: [(('4K_S', 'last'), 1)]", stdout.getvalue())
+
     def test_probe_skips_truncated_gpu_segment(self):
         # Provide a GPU segment file that is too short for any candidate
         truncated_bytes = b"\x00" * 128

@@ -59,14 +59,21 @@ _HEX_RE = re.compile(r"^[0-9a-fA-F]+$")
 
 
 def joaat(text: str, *, case_sensitive: bool = False) -> int:
-    """Jenkins one-at-a-time joaat over the UTF-8 bytes.
+    """Jenkins one-at-a-time joaat over the engine's name bytes.
 
-    The engine lower-cases the name for the normal 32-bit hash. Pass
-    ``case_sensitive=True`` for the field/struct-name variant.
+    The engine lower-cases the name for the normal 32-bit hash, and hashes it as 8-bit bytes: the default
+    form is ``joaat`` of the lowercased Latin-1 bytes, the rule ``tools/hashdict.py`` (the pinned name
+    dictionary) and ``tools/awc_names.py`` use, so a name hashes alike in every tool. A character outside
+    Latin-1 cannot occur in a name and becomes ``?``. Encoding to UTF-8 first and lower-casing the bytes
+    afterwards gave a different hash for any non-ASCII name, since bytes.lower() only folds ASCII.
+
+    Pass ``case_sensitive=True`` for the field/struct-name variant, which keeps the exact bytes (UTF-8).
+    Every field name measured so far is ASCII, where both encodings agree.
     """
-    data = text.encode("utf-8")
-    if not case_sensitive:
-        data = data.lower()
+    if case_sensitive:
+        data = text.encode("utf-8")
+    else:
+        data = text.lower().encode("latin-1", "replace")
     h = 0
     for c in data:
         h = (h + c) & MASK32

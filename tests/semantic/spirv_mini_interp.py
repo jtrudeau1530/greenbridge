@@ -83,7 +83,7 @@ _IGNORED = frozenset({
 
 _ATOMICS = frozenset({
     "OpAtomicIAdd", "OpAtomicISub", "OpAtomicUMin", "OpAtomicUMax", "OpAtomicSMin", "OpAtomicSMax", "OpAtomicAnd",
-    "OpAtomicOr", "OpAtomicXor", "OpAtomicExchange", "OpAtomicCompareExchange",
+    "OpAtomicOr", "OpAtomicXor", "OpAtomicLoad", "OpAtomicExchange", "OpAtomicCompareExchange",
 })
 
 _LINE = re.compile(r"^(?:(%\S+)\s*=\s*)?(Op\w+)\s*(.*)$")
@@ -693,6 +693,9 @@ def _invocation(text, inputs, push_constants, memory, step=False):
                 old = deref(p)
                 if isinstance(old, bool) or not isinstance(old, int) or old > MASK:
                     raise UnsupportedConstruct(f"{op} on a variable element that is not a 32-bit integer")
+            if op == "OpAtomicLoad":
+                values[res] = old
+                continue
             if op == "OpAtomicCompareExchange":
                 new = val(a[5]) if old == val(a[6]) & MASK else old
             else:

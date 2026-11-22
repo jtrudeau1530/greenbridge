@@ -418,6 +418,21 @@ class MainTest(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertIn("not the output of ctest", err)
 
+    def test_missing_tests_is_not_a_zero_test_run(self):
+        code, _, err = self.run_main_json({})
+        self.assertEqual(code, 2)
+        self.assertIn("not the output of ctest", err)
+
+    def test_scalar_tests_rows_are_rejected(self):
+        code, _, err = self.run_main_json({"tests": ["binary", 3, None]})
+        self.assertEqual(code, 2)
+        self.assertIn("not the output of ctest", err)
+
+    def test_an_explicit_empty_tests_list_is_accepted(self):
+        code, out, _ = self.run_main_json({"tests": []})
+        self.assertEqual(code, 0)
+        self.assertIn("0 passed, 0 failed, 0 skipped under Wine (0 tests)", out)
+
     def run_main_json(self, document):
         listing = self.root / "wrong.json"
         listing.write_text(json.dumps(document), encoding="utf-8")

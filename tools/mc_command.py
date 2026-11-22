@@ -16,7 +16,7 @@ import shutil
 import subprocess
 
 
-def split_command(raw: str) -> list:
+def split_command(raw: str) -> list[str]:
     """Split a command line without eating the backslashes of a Windows path (POSIX shlex would)."""
     raw = raw.strip()
     if not raw:
@@ -28,10 +28,15 @@ def split_command(raw: str) -> list:
         # for it, but it is no file under that exact name, so it used to be split at its spaces.
         return [raw]
     try:
-        if os.name != "nt":
-            parts = shlex.split(raw)
-        else:
-            parts = shlex.split(raw, posix=False)
+        if os.name == "nt":
+            # Quotes can start inside an argument, as in -o="path with spaces".
+            lexer = shlex.shlex(raw, posix=True)
+            lexer.quotes = '"'
+            lexer.escape = ""
+            lexer.commenters = ""
+            lexer.whitespace_split = True
+            return list(lexer)
+        parts = shlex.split(raw)
     except ValueError as e:
         # shader_disasm.py calls mc_command() at import time: a bad LLVM_MC must give one clear line,
         # not a ValueError traceback before any tool's own argument parsing runs.

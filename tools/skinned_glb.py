@@ -51,6 +51,9 @@ the same RAGE Z-up -> glTF Y-up conversion as positions, ``(x, y, z) -> (x, z, -
 Only skinned primitives are exported, with clay materials. Textures, UV atlas
 data and materials of the source package are not copied. This is a static export
 path: it does not assemble a body or any other unrequested component.
+
+numpy is optional: when present it accelerates the weight pass; without it the
+standard-library path produces the same bytes and is covered by the tests.
 """
 from __future__ import annotations
 
@@ -696,6 +699,8 @@ def _component_primitives(gltf: dict, wanted: int) -> list[dict]:
 def build_skinned_glb(skeleton_path: str, component_paths: list[str], *,
                       generator: str = "Leonida skinned_glb") -> tuple[bytes, dict]:
     """Build one skinned GLB from a ped skeleton and one or more component models."""
+    if not component_paths:
+        raise SkinError("at least one --component is required")
     _skeleton_dir, skeleton_json = model_json_path(skeleton_path)
     ped_model = _load_json(skeleton_json)
     ped_skeleton = (ped_model.get("drawable") or {}).get("skeleton")

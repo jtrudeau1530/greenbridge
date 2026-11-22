@@ -269,6 +269,61 @@ class Filters(unittest.TestCase):
         self.assertEqual(len([op for op in asm.GFX12_REMOVED if op.startswith("s_cmpk_")]), 12)
 
 
+class VcvarsScript(unittest.TestCase):
+    """The .cmd that calls vcvars64.bat and cl holds the checkout, %TEMP% and Visual Studio paths. A character
+    outside ASCII in any of them (a user name, the Turkish default folder name) used to end in UnicodeEncodeError,
+    which is not the Unavailable that callers turn into a skip."""
+    NAME = "Ayşe Ğİı klasör"      # Turkish letters: none of them is ASCII
+
+    def build(self, tmp):
+        work = os.path.join(tmp, self.NAME)
+        os.makedirs(work)
+        src = os.path.join(work, "hw_oracle.c")
+        out = os.path.join(work, "hw_oracle.exe")
+        vcvars = os.path.join(work, "vcvars64.bat")
+        argv = runner.build_command("vcvars", vcvars, src, out, work)
+        with open(argv[-1], "rb") as f:
+            return argv, f.read(), (src, out, vcvars)
+
+    def test_paths_outside_ascii_are_written_as_utf8(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            argv, raw, paths = self.build(tmp)
+        self.assertEqual(argv[:3], ["cmd.exe", "/d", "/c"])
+        text = raw.decode("utf-8")                       # strict: every byte is UTF-8
+        for path in paths:
+            self.assertIn(path, text)
+        self.assertFalse(raw.startswith(b"\xef\xbb\xbf"))   # cmd.exe would read a BOM as part of the first command
+
+    def test_the_code_page_is_set_before_any_path_is_used(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _argv, raw, _paths = self.build(tmp)
+        lines = raw.decode("utf-8").split("\r\n")
+        self.assertEqual(lines[0], "@echo off")
+        self.assertEqual(lines[1], "chcp 65001 >nul")
+        self.assertTrue(all(line.isascii() for line in lines[:2]))
+        self.assertTrue(lines[2].startswith('set "PATH='))
+        self.assertTrue(lines[3].startswith('call "'))
+
+    def test_ascii_paths_give_the_same_commands_as_before(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            work = os.path.join(tmp, "work")
+            os.makedirs(work)
+            argv = runner.build_command("vcvars", "vcvars64.bat", "hw_oracle.c", "hw_oracle.exe", work)
+            with open(argv[-1], "rb") as f:
+                lines = f.read().decode("ascii").split("\r\n")
+        self.assertEqual(lines[3], 'call "vcvars64.bat" >nul || exit /b 1')
+        self.assertTrue(lines[4].startswith("cl /nologo /O1 hw_oracle.c /Fehw_oracle.exe /Fo"))
+
+    def test_the_direct_compilers_write_no_script(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            work = os.path.join(tmp, self.NAME)
+            os.makedirs(work)
+            self.assertEqual(runner.build_command("gcc", "gcc", "a.c", "a.exe", work),
+                             ["gcc", "-O1", "a.c", "-o", "a.exe"])
+            self.assertEqual(runner.build_command("msvc", "cl.exe", "a.c", "a.exe", work)[0], "cl.exe")
+            self.assertEqual(os.listdir(work), [])
+
+
 class Unavailable(unittest.TestCase):
     def test_missing_tools_are_reported_not_raised_as_crashes(self):
         with unittest.mock.patch.dict(os.environ, {"LEONIDA_AMD_CLANG": str(TOOLS / "no-such-clang.exe")}):
