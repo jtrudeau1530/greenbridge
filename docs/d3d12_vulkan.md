@@ -1148,9 +1148,15 @@ Why one arena rather than several? Because the shader gets exactly one `heap_bas
 code accesses. A draw can reference a descriptor table in one heap and a vertex buffer in another; both must
 satisfy the same `heap_base + va` equation. Several non-contiguous VkBuffers cannot provide that equation.
 
-Image keys must fit the T# base field. Keep them below 1 TB (a conservative 40-bit assumption; confirm against the
-T# layout the decoder uses) and above the arena. **Open:** the exact image-key range and whether any shader ever
-uses an image VA as a raw pointer.
+Image keys are 256-byte-aligned byte addresses. The [RDNA 2 ISA, §8.2.6, Table 45][rdna2-image-resource] defines
+the 40-bit T# base field as address bits 47:8. `gfx10_descriptors.h` encodes bits 39:8 in word 0 and bits 47:40
+in word 1[7:0]. The largest representable key is `0xFFFFFFFFFF00` (2^48 − 256 bytes). Bit 48 is not stored,
+so keys separated by 2^48 bytes produce the same base field.
+
+The runtime allocates image keys from `0x100000000` (4 GiB) in 256-byte steps, above the 4095 MiB arena cap.
+**Open:** whether any shader in the game uses an image VA as a raw pointer rather than through its T#.
+
+[rdna2-image-resource]: https://www.amd.com/content/dam/amd/en/documents/radeon-tech-docs/instruction-set-architectures/rdna2-shader-instruction-set-architecture.pdf
 
 **Memory type policy.** The first boot needs correctness, not bandwidth:
 
