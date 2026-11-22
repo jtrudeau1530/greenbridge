@@ -78,6 +78,14 @@ class TestHeader(unittest.TestCase):
         struct.pack_into("<I", bad_audio, 0x28, 999)
         self.assertIsNone(bink.parse_header(bad_audio, 0))
 
+    def test_frame_rate_limits(self):
+        for num, den in [(240, 1), (0xFFFFFFFF, 0xFFFFFFFF)]:
+            with self.subTest(num=num, den=den):
+                self.assertIsNotNone(bink.parse_header(make_stream(fps_num=num, fps_den=den), 0))
+        for num, den in [(0, 1), (1, 0), (0, 0), (1, 2), (240001, 1000)]:
+            with self.subTest(num=num, den=den):
+                self.assertIsNone(bink.parse_header(make_stream(fps_num=num, fps_den=den), 0))
+
 
 class TestScanAndWrite(unittest.TestCase):
     def setUp(self):
@@ -99,6 +107,19 @@ class TestScanAndWrite(unittest.TestCase):
         self.assertEqual(rows[0]["source"], "one.bk2")
         self.assertEqual(rows[0]["frames"], 7)
         self.assertEqual(summary["streams"], 1)
+
+    def test_fractional_rates_are_indexed(self):
+        path = os.path.join(self.dir, "fractional.bk2")
+        with open(path, "wb") as fh:
+            for num in (24000, 30000, 60000):
+                fh.write(make_stream(frames=120, fps_num=num, fps_den=1001))
+        rows, summary = bink.scan_target(path)
+        self.assertEqual(summary["streams"], 3)
+        self.assertEqual(
+            [(r["fps_num"], r["fps_den"], r["fps"], r["duration_s"]) for r in rows],
+            [(24000, 1001, 23.976, 5.005), (30000, 1001, 29.97, 4.004),
+             (60000, 1001, 59.94, 2.002)],
+        )
 
     def test_csv_and_json(self):
         rows, summary = bink.scan_target(self.dir)

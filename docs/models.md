@@ -11,20 +11,22 @@ dropped valid models in three validation paths, all in `third_party/rpf9-explore
 
 [Leonida issue #29](https://github.com/ItsNotRexed/Leonida/issues/29) tracks this work. The decoder
 fix in [rpf9-explorer PR #1](https://github.com/breadbbbb/rpf9-explorer/pull/1) is at head
-`c3708fb` and has now been independently validated on the package in the scopes below. It is
-awaiting upstream merge and a submodule pin bump. This page records the pre-PR gap, the independent
-validation, and the scope caveat; it is not a competing patch.
+`c3708fb` and has now been validated on the package, including a full ten-archive pass; details
+below. It is awaiting upstream merge and a submodule pin bump. This page records the pre-PR gap, the
+independent validation, and the scope caveat; it is not a competing patch.
 
 PR #1 reports 190,792 of 190,792 recognized candidates across the ten archives configured in
-Leonida, including 169 previously rejected candidates (also verified after archive readback). That
-ten-archive total was not independently reproduced here. Issue #29's run uses its own
-recognized-candidate set and covers primary-LOD geometry; the pre-fix counts below use
-`rpf9dump`'s page-scan candidates and export every recovered drawable/LOD variant. The two sets are
-different scopes, not contradictory.
+Leonida, including 169 previously rejected candidates (also verified after archive readback). A
+later full-archive run at the same head independently reproduced the ten-archive total: 190,792
+candidates, 190,792 recovered, read back and decoded, 0 decode or readback failures, no duplicate
+model names, and 2.22 billion triangles (the pre-fix export was 155,598 models / 1.95 billion
+triangles). Issue #29's run uses its own recognized-candidate set and covers primary-LOD geometry;
+the pre-fix counts below use `rpf9dump`'s page-scan candidates and export every recovered
+drawable/LOD variant. The two sets are different scopes, not contradictory.
 
 ## Independent validation
 
-Validated at PR #1 head `c3708fb` with .NET 8.0.428 on the real package:
+Scoped validation at PR #1 head `c3708fb` with .NET 8.0.428 on the real package:
 
 | Scope | Candidates | Recovered | Rejects | Readback |
 |---|---:|---:|---:|---:|
@@ -39,9 +41,29 @@ stems. All 963 pre-PR misses were recovered, and all 1,350 pre-PR OBJs were byte
 pre-PR versions. The PR smoke test passes; v1/v2 cache round-trip and two raw-segment entries were
 verified.
 
-Caveat: the full 76 GB `levels.rpf` and the other seven archives were not scanned, so the exact
-ten-archive 190,792/190,792 and 169/169 claims were not independently reproduced. No counterexample
-appeared in the tested scopes. A scoped validation comment was posted on PR #1.
+Caveat: this scoped run did not scan the full `levels.rpf`; the full pass below covers it. The
+`data.rpf` OBJ text is the only byte-identical file comparison; the full pass counted decoded
+models, not OBJ bytes. No counterexample appeared in the tested scopes.
+
+### Full-archive run
+
+A full pass at the same head over `levels.rpf` (70.9 GiB) and the other model-bearing archives
+reproduced the ten-archive total. The `48557ea` column is the pre-fix control:
+
+| Archive | Candidates | `48557ea` | `c3708fb` |
+|---|---:|---:|---:|
+| `levels.rpf` (full, 70.9 GiB) | 183,801 | 149,811 | **183,801** |
+| `pack/story000/story000.rpf` | 3,305 | 3,303 | **3,305** |
+| `data.rpf` | 2,313 | 1,350 | **2,313** |
+| `pack/shared_minigame000/shared_minigame000.rpf` | 971 | 783 | **971** |
+| `packs.rpf` | 314 | 314 | 314 |
+| `pack/core_restofworld/core_restofworld.rpf` | 88 | 37 | **88** |
+| `common`, `textures`, `story000_restofworld`, `core_restofworld001` | 0 | 0 | 0 |
+| **Total** | **190,792** | **155,598** | **190,792** |
+
+At `c3708fb`, every candidate is recovered, read back and decoded: 0 decode failures, 0 readback
+failures, no duplicate model names, and 2.22 billion triangles (1.95 billion before). The
+169-candidate subset is a different scope and was not isolated here.
 
 ## How the exporter works
 
@@ -54,6 +76,10 @@ stream at page offset +16. It inflates the first 176 bytes and keeps the offset 
 a drawable or fragment header (`RageModelDecoder.LooksLikeResource`). `RecoverAtOffsets` follows
 the following zlib blocks, splits the inflated bytes into the system segment and the graphics
 segment, probes the extents, and calls `RageModelDecoder.Decode`.
+
+To locate a named drawable before decoding, `tools/rpf9_names.py` indexes the measured
+`name.#dr`/`#ft`/`#dd` spellings in bounded zlib prefixes without the encrypted TOC; see
+[resource_names.md](resource_names.md).
 
 For each returned entry, `tools/rpf9dump/Program.cs` reads the segments, splits at
 `ResourceSystemBytes`, decodes the model, writes one OBJ, and writes the manifest. The manifest is

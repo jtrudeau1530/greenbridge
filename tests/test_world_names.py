@@ -215,6 +215,21 @@ class ResolveTest(unittest.TestCase):
 
 
 class CliTest(unittest.TestCase):
+    def test_resolve_rejects_unrecognized_map_report(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dictionary = os.path.join(tmp, "names.json")
+            maps = os.path.join(tmp, "wrong.json")
+            out = os.path.join(tmp, "report.json")
+            with open(dictionary, "w", encoding="utf-8") as handle:
+                json.dump(WN.NameDictionary().to_json(), handle)
+            with open(maps, "w", encoding="utf-8") as handle:
+                json.dump({"summary": {}}, handle)
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                self.assertNotEqual(WN.main(["resolve", "--dict", dictionary, "--maps", maps, "--out", out]), 0)
+            self.assertIn(maps, err.getvalue())
+            self.assertFalse(os.path.exists(out))
+
     def test_build_and_resolve(self):
         with tempfile.TemporaryDirectory() as tmp:
             manifest = os.path.join(tmp, "manifest.json")

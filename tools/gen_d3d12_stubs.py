@@ -59,10 +59,14 @@ def parse_interfaces(text):
 
 def chain(interfaces, leaf):
     names = []
+    seen = set()
     name = leaf
     while name != "IUnknown":
         if name not in interfaces:
             raise SystemExit(f"interface {name} not found in d3d12.h")
+        if name in seen:
+            raise SystemExit(f"circular inheritance in d3d12.h: {' -> '.join([*names, name])}")
+        seen.add(name)
         names.append(name)
         name = interfaces[name][0]
     return list(reversed(names))

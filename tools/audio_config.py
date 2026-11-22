@@ -157,7 +157,7 @@ def _file_at(starts, offset):
 
 def collect(src, min_ms=MIN_MS, max_ms=MAX_MS, names=None, join=False):
     records = []
-    parts = list(files_in(src))
+    parts = list(files_in(src)) if join else files_in(src)
     if join and len(parts) > 1:
         blob = b"".join(part for _, part in parts)
         starts = []

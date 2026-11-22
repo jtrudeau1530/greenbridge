@@ -1,7 +1,7 @@
 // Headless Vulkan harness: draws one triangle (3 vertices, no vertex buffers) with a given VS + FS into a
 // W x H RGBA32F image and writes the raw floats to a file. Used to check translated shaders on the real GPU.
 //
-//   vk_harness <vs.spv> <fs.spv> <out.raw> [width height]
+//   vk_harness <vs.spv> <fs.spv> <out.raw> [width height [clip-test-s0 clip-test-s1]]
 //   vk_harness <ms.spv> <fs.spv> <out.raw> --mesh-group-readback X Y Z
 // The latter captures one full-screen triangle per mesh workgroup, in Vulkan rasterization order.
 //
@@ -77,11 +77,12 @@ static bool parse_heap(const char* s, std::vector<std::pair<uint32_t, uint32_t>>
 
 int main(int argc, char** argv) {
     if (argc < 4) {
-        std::fprintf(stderr, "usage: vk_harness vs.spv fs.spv out.raw [w h]\n"
+        std::fprintf(stderr, "usage: vk_harness vs.spv fs.spv out.raw [w h [clip-test-s0 clip-test-s1]]\n"
                              "       vk_harness ms.spv fs.spv out.raw --mesh-group-readback X Y Z\n");
         return 2;
     }
     const bool group_readback = argc > 4 && !std::strcmp(argv[4], "--mesh-group-readback");
+    const bool clip_shifts = !group_readback && argc == 8;
     uint32_t groups[3] = {1, 1, 1};
     uint32_t W = 64, H = 64;
     if (group_readback) {
@@ -254,6 +255,10 @@ int main(int argc, char** argv) {
         return 77;
     }
     VkPhysicalDeviceFeatures feats{};
+    if (clip_shifts && !f2q.features.shaderClipDistance) {
+        std::fprintf(stderr, "unsupported: shaderClipDistance\n");
+        return 77;
+    }
     feats.geometryShader = gs_path ? VK_TRUE : VK_FALSE;
     feats.shaderClipDistance = f2q.features.shaderClipDistance;
     feats.shaderCullDistance = f2q.features.shaderCullDistance;
@@ -468,6 +473,10 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "mesh workgroups: %u x %u x %u\n", groups[0], groups[1], groups[2]);
     }
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
+    if (clip_shifts) {
+        const float shifts[] = {float(std::atof(argv[6])), float(std::atof(argv[7]))};
+        std::memcpy(pc, shifts, sizeof(shifts));
+    }
     reinterpret_cast<PFN_vkCmdPushConstants>(vkGetDeviceProcAddr(dev, "vkCmdPushConstants"))(
         cmd, pl, pcs, 0, sizeof(pc), pc);
     if (mesh)

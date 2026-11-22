@@ -132,6 +132,15 @@ class ManifestTest(unittest.TestCase):
         self.assertIs(doc["streams"][0]["streamed_music"], False)
         self.assertAlmostEqual(doc["streams"][0]["duration_s"], 0.1, places=6)
 
+    def test_recursive_report_distinguishes_banks_with_the_same_basename(self):
+        for folder in ("left", "right"):
+            os.mkdir(os.path.join(self.tmp.name, folder))
+            self.write_bank(os.path.join(folder, "shared.awc"), with_music=False)
+        p = self.run_tool(self.tmp.name, "--format", "json")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        rows = json.loads(p.stdout)["streams"]
+        self.assertEqual([row["bank"] for row in rows], ["left/shared.awc"] * 3 + ["right/shared.awc"] * 3)
+
     def test_stereo_streamed_music_uses_packet_channels_and_per_channel_samples(self):
         desc, data = music_blob([0x40], 1920, 48000, toc=0xFC)   # 2 x 960 interleaved samples
         path = os.path.join(self.tmp.name, "stereo.awc")

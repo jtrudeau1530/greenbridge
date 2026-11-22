@@ -365,6 +365,31 @@ class ManifestAtomicCreateTest(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()):
             return manifest.create(self.pkg, self.out, jobs=1)
 
+    def test_create_preserves_an_existing_partial_sibling(self):
+        sibling = self.out + ".partial"
+        with open(sibling, "wb") as f:
+            f.write(b"existing report")
+
+        self.assertEqual(self.create(), 0)
+        with open(sibling, "rb") as f:
+            self.assertEqual(f.read(), b"existing report")
+
+    def test_overlapping_creates_each_publish_their_own_manifest(self):
+        empty_pkg = os.path.join(self.tmp.name, "empty")
+        os.mkdir(empty_pkg)
+        replace = os.replace
+
+        def publish_inner_first(staged, destination):
+            with patch.object(manifest.os, "replace", replace):
+                self.assertEqual(manifest.create(empty_pkg, self.out), 0)
+            self.assertEqual(manifest.load_manifest(self.out), {})
+            replace(staged, destination)
+
+        with patch.object(manifest.os, "replace", side_effect=publish_inner_first):
+            self.assertEqual(self.create(), 0)
+        self.assertEqual(set(manifest.load_manifest(self.out)), {"sample.dat"})
+        self.assertEqual(sorted(os.listdir(self.tmp.name)), ["empty", "manifest.json", "pkg"])
+
     def test_an_interrupted_create_keeps_the_previous_manifest(self):
         self.assertEqual(self.create(), 0)
         with open(self.out, "rb") as f:

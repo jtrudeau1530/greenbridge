@@ -377,7 +377,7 @@ def load_rows(path: str) -> list[dict]:
             rows = data.get(key)
             if isinstance(rows, list):
                 return [row for row in rows if isinstance(row, dict)]
-    return []
+    raise ValueError(f"{path}: expected a map row list or a maps, resources or rows table")
 
 
 def resolve_maps(rows, dictionary: NameDictionary, *, include_derived: bool = False) -> dict:

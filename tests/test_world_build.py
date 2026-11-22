@@ -704,6 +704,15 @@ class DdsPngTest(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class GlbWriterTest(unittest.TestCase):
+    def test_negative_obj_scale_preserves_front_faces_and_normals(self):
+        vertices = "v 0 0 0\nv 1 0 0\nv 0 1 0\nvn 0 0 1\n"
+        for face in ("f 1 2 3", "f 1//1 2//1 3//1"):
+            with self.subTest(face=face):
+                prim, = glb_writer.parse_obj(vertices + face, is_path=False, up_axis="y", scale=-2)
+                corners = [prim["positions"][index] for index in prim["indices"]]
+                self.assertEqual(corners, [(0, 0, 0), (0, -2, 0), (-2, 0, 0)])
+                self.assertEqual(prim["normals"], [(0, 0, -1)] * 3)
+
     def test_parse_obj_quads_negative_indices_normals_uv_flip_zup_and_groups(self):
         # Group 0: quad in XY plane (Z-up) using positive indices, no vn -> auto unit normals.
         # Group 1: single triangle containing (1, 2, 3) using negative indices.

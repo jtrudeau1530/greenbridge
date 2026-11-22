@@ -147,6 +147,22 @@ class MainTests(unittest.TestCase):
             text = f.read()
         self.assertTrue(text.startswith('{\n "overall": {'))
 
+    def test_failed_write_preserves_previous_report(self):
+        self.archive("a", [{"head": RBF0_HEAD, "size": 1}])
+        self.run_main()
+        before = self.types()
+        files = sorted(os.listdir(self.root))
+
+        def fail_dump(_data, handle, **_kwargs):
+            handle.write("{")
+            raise OSError("synthetic write failure")
+
+        with mock.patch.object(carve.json, "dump", side_effect=fail_dump):
+            with self.assertRaisesRegex(OSError, "write failure"):
+                self.run_main()
+        self.assertEqual(self.types(), before)
+        self.assertEqual(sorted(os.listdir(self.root)), files)
+
 
 if __name__ == "__main__":
     unittest.main()
