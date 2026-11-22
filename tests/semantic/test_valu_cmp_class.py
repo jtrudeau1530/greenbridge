@@ -500,5 +500,193 @@ class TestValuCmpClassAST(unittest.TestCase):
         self.assertEqual(prog.to_assembly(), expected)
 
 
+# ---------------------------------------------------------------------------
+# Deterministic Scalar Instruction Interpreter
+# ---------------------------------------------------------------------------
+
+class ScalarVALUInterpreter:
+    """Deterministic scalar interpreter for GFX10/RDNA2 v_cmp_class instructions."""
+
+    def __init__(self) -> None:
+        self.vgprs: list[int] = [0] * 256
+        self.sgprs: list[int] = [0] * 106
+        self.vcc: int = 0
+        self.trace: list[str] = []
+
+    def read_reg_u32(self, kind: RegKind, idx: int) -> int:
+        if kind == RegKind.VGPR:
+            if idx < 0 or idx >= 256:
+                raise IndexError(f"VGPR index out of bounds: {idx}")
+            return self.vgprs[idx] & MASK32
+        elif kind == RegKind.SGPR:
+            if idx < 0 or idx >= 106:
+                raise IndexError(f"SGPR index out of bounds: {idx}")
+            return self.sgprs[idx] & MASK32
+        elif kind == RegKind.SPECIAL and idx == 0:
+            return self.vcc & MASK32
+        raise IndexError(f"Unsupported register domain: {kind.value}{idx}")
+
+    def write_reg_u32(self, kind: RegKind, idx: int, val: int) -> None:
+        val32 = val & MASK32
+        if kind == RegKind.VGPR:
+            if idx < 0 or idx >= 256:
+                raise IndexError(f"VGPR index out of bounds: {idx}")
+            self.vgprs[idx] = val32
+        elif kind == RegKind.SGPR:
+            if idx < 0 or idx >= 106:
+                raise IndexError(f"SGPR index out of bounds: {idx}")
+            self.sgprs[idx] = val32
+        elif kind == RegKind.SPECIAL and idx == 0:
+            self.vcc = (self.vcc & ~MASK32) | val32
+        else:
+            raise IndexError(f"Unsupported register domain: {kind.value}{idx}")
+
+    def read_reg_u64(self, kind: RegKind, idx: int) -> int:
+        if kind == RegKind.SPECIAL and idx == 0:
+            return self.vcc & MASK64
+        lo = self.read_reg_u32(kind, idx)
+        hi = self.read_reg_u32(kind, idx + 1)
+        return ((hi & MASK32) << 32) | (lo & MASK32)
+
+    def write_reg_u64(self, kind: RegKind, idx: int, val: int) -> None:
+        val64 = val & MASK64
+        if kind == RegKind.SPECIAL and idx == 0:
+            self.vcc = val64
+            return
+        lo = val64 & MASK32
+        hi = (val64 >> 32) & MASK32
+        self.write_reg_u32(kind, idx, lo)
+        self.write_reg_u32(kind, idx + 1, hi)
+
+    def read_operand_f32(self, op: Register | Immediate, mods: OperandModifiers) -> int:
+        if isinstance(op, Immediate):
+            raw = op.bits & MASK32
+        elif isinstance(op, Register):
+            raw = self.read_reg_u32(op.kind, op.index)
+        else:
+            raise TypeError(f"Unsupported operand type: {type(op)}")
+        return apply_f32_modifiers(raw, neg=mods.neg, abs_val=mods.abs_val)
+
+    def read_operand_f64(self, op: Register | Immediate, mods: OperandModifiers) -> int:
+        if isinstance(op, Immediate):
+            raw = op.bits & MASK64
+        elif isinstance(op, Register):
+            raw = self.read_reg_u64(op.kind, op.index)
+        else:
+            raise TypeError(f"Unsupported operand type: {type(op)}")
+        return apply_f64_modifiers(raw, neg=mods.neg, abs_val=mods.abs_val)
+
+    def read_operand_u32(self, op: Register | Immediate) -> int:
+        if isinstance(op, Immediate):
+            return op.bits & MASK32
+        elif isinstance(op, Register):
+            return self.read_reg_u32(op.kind, op.index)
+        raise TypeError(f"Unsupported operand type: {type(op)}")
+
+    def step(self, inst: Instruction) -> bool:
+        """Executes a single v_cmp_class instruction deterministically."""
+        # Read-before-write semantics
+        if inst.opcode == Opcode.V_CMP_CLASS_F32:
+            s0_val = self.read_operand_f32(inst.src0, inst.src0_mods)
+            s1_val = self.read_operand_u32(inst.src1)
+            matched = ref_cmp_class_f32(s0_val, s1_val)
+        elif inst.opcode == Opcode.V_CMP_CLASS_F64:
+            s0_val = self.read_operand_f64(inst.src0, inst.src0_mods)
+            s1_val = self.read_operand_u32(inst.src1)
+            matched = ref_cmp_class_f64(s0_val, s1_val)
+        else:
+            raise NotImplementedError(f"Unsupported opcode: {inst.opcode}")
+
+        # In scalar thread lane 0, boolean output is written to bit 0 of destination mask
+        bit_val = 1 if matched else 0
+        if inst.dst.is_vcc:
+            self.vcc = bit_val
+        elif inst.dst.is_sgpr:
+            if inst.dst.count == 2:
+                self.write_reg_u64(RegKind.SGPR, inst.dst.index, bit_val)
+            else:
+                self.write_reg_u32(RegKind.SGPR, inst.dst.index, bit_val)
+        else:
+            raise ValueError(f"Invalid comparison destination: {inst.dst}")
+
+        self.trace.append(f"{inst.to_assembly()} => {matched} (bit={bit_val})")
+        return matched
+
+    def run_program(self, prog: Program) -> list[bool]:
+        """Executes all instructions in a program sequentially."""
+        return [self.step(inst) for inst in prog.instructions]
+
+
+class TestValuCmpClassScalarInterpreter(unittest.TestCase):
+    """Unit tests for the deterministic scalar instruction interpreter."""
+
+    def test_scalar_f32_zero_check(self) -> None:
+        interp = ScalarVALUInterpreter()
+        interp.write_reg_u32(RegKind.VGPR, 0, POS_ZERO_F32)
+        interp.write_reg_u32(RegKind.SGPR, 4, CLASS_MASK_ZERO)
+
+        inst = Instruction(
+            opcode=Opcode.V_CMP_CLASS_F32,
+            dst=Register(RegKind.SPECIAL, 0, count=2),
+            src0=Register(RegKind.VGPR, 0, count=1),
+            src1=Register(RegKind.SGPR, 4, count=1),
+        )
+        res = interp.step(inst)
+        self.assertTrue(res)
+        self.assertEqual(interp.vcc, 1)
+
+    def test_scalar_f32_normal_against_inf(self) -> None:
+        interp = ScalarVALUInterpreter()
+        interp.write_reg_u32(RegKind.VGPR, 0, POS_ONE_F32)
+
+        inst = Instruction(
+            opcode=Opcode.V_CMP_CLASS_F32,
+            dst=Register(RegKind.SPECIAL, 0, count=2),
+            src0=Register(RegKind.VGPR, 0, count=1),
+            src1=Immediate(CLASS_MASK_INF),
+        )
+        res = interp.step(inst)
+        self.assertFalse(res)
+        self.assertEqual(interp.vcc, 0)
+
+    def test_scalar_f64_nan_check(self) -> None:
+        interp = ScalarVALUInterpreter()
+        interp.write_reg_u64(RegKind.VGPR, 2, QNAN_F64)
+
+        inst = Instruction(
+            opcode=Opcode.V_CMP_CLASS_F64,
+            dst=Register(RegKind.SGPR, 0, count=2),
+            src0=Register(RegKind.VGPR, 2, count=2),
+            src1=Immediate(CLASS_MASK_NAN),
+            encoding=Encoding.VOP3,
+        )
+        res = interp.step(inst)
+        self.assertTrue(res)
+        self.assertEqual(interp.read_reg_u64(RegKind.SGPR, 0), 1)
+
+    def test_scalar_program_chain(self) -> None:
+        interp = ScalarVALUInterpreter()
+        interp.write_reg_u32(RegKind.VGPR, 0, POS_INF_F32)
+        interp.write_reg_u64(RegKind.VGPR, 2, NEG_DENORM_MIN_F64)
+
+        prog = Program()
+        prog.append(Instruction(
+            opcode=Opcode.V_CMP_CLASS_F32,
+            dst=Register(RegKind.SPECIAL, 0, count=2),
+            src0=Register(RegKind.VGPR, 0, count=1),
+            src1=Immediate(CLASS_POS_INF),
+        ))
+        prog.append(Instruction(
+            opcode=Opcode.V_CMP_CLASS_F64,
+            dst=Register(RegKind.SGPR, 4, count=2),
+            src0=Register(RegKind.VGPR, 2, count=2),
+            src1=Immediate(CLASS_NEG_DENORMAL),
+            encoding=Encoding.VOP3,
+        ))
+        results = interp.run_program(prog)
+        self.assertEqual(results, [True, True])
+        self.assertEqual(len(interp.trace), 2)
+
+
 if __name__ == "__main__":
     unittest.main()
