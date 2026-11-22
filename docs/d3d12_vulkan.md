@@ -250,6 +250,9 @@ What is implemented (all of it testable without the game):
     support, format support, multisample quality levels, shader model and root signature version.
     `D3D12_OPTIONS8` reports unaligned block textures when the Vulkan logical device enables BC texture compression.
     Other queries are logged and refused until the trace shows what the game asks (question 11);
+  - `CheckFeatureSupport` for feature levels (up to 12_1), architecture, D3D12 options (`OPTIONS` and `OPTIONS2`–`5`, `7`, `9`, `11`, `13`–`21`), GPU virtual-address
+    support, format support and multisample quality levels. Other queries (including `OPTIONS1`/`6`/`8`/`10`/`12`, `FORMAT_INFO`, `SHADER_MODEL`, and `ROOT_SIGNATURE` left to sibling PRs) are logged and refused until the trace
+    shows what the game asks (question 11);
   - reserved resources and `GetResourceTiling` (section 4.2);
   - `GetCopyableFootprints` for buffers, 2D textures and volumes, including BC1–7 and the two-plane depth-stencil formats.
     The test compares every output with the PC runtime's; that comparison found that planar
@@ -865,7 +868,19 @@ The trace will enumerate them.
 - `D3D12_OPTIONS` families: report the tier the Vulkan feature set can honour (resource binding tier 3 when
   descriptor indexing and update-after-bind are available), plus wave ops, 16-bit, barycentrics, render passes,
   VRS, mesh shader tier, and RT tier 1.1 only if the layer can honour them. The game may branch on these; a false
-  "supported" is worse than a false "unsupported" at boot.
+  "supported" is worse than a false "unsupported" at boot. For `OPTIONS2`–`5`, `7`, `9`, `11`, `13`–`16`, and
+  `18`–`21` (D3D-86; leaving `OPTIONS1` to #745, `OPTIONS6`/`10` to #469, `OPTIONS8` to #715, and `OPTIONS12` to
+  #693):
+  - `OPTIONS4` reports `MSAA64KBAlignedTextureSupported = TRUE` (implemented in `GetResourceAllocationInfo`);
+  - `OPTIONS19` maps `SupportedSampleCountsWithNoOutputs` from `framebufferNoAttachmentsSampleCounts`, ties
+    `AnisoFilterWithPointMipSupported` to `VulkanDeviceInfo::sampler_anisotropy`, and reports the baseline heap
+    limits (`2048` samplers, `1000000` views);
+  - `OPTIONS21` reports baseline `D3D12_EXECUTE_INDIRECT_TIER_1_0`, and unimplemented features/tiers (`DepthBounds`,
+    `CastingFullyTypedFormat`, MSAA UAVs, independent stencil masks, render passes, RT, mesh shaders, sampler
+    feedback, wave MMA, work graphs, GPU upload heaps) stay `FALSE`/`NOT_SUPPORTED`/`TIER_0`. Checked live against
+    the host D3D12 runtime on the same adapter (`NVIDIA GeForce RTX 5080`, driver `616.56`, Windows 11): 15/15 feature
+    queries compared with `0` mismatches (`MSAA64KBAlignedTextureSupported = TRUE`,
+    `SupportedSampleCountsWithNoOutputs = 0x1f`, `LEONIDA_VK_VALIDATION=1` with `0` validation errors).
 - `D3D12_FEATURE_FORMAT_SUPPORT`: map to `vkGetPhysicalDeviceFormatProperties`; multisample render-target
   and resolve bits also require the format's image-usage/sample-count query to succeed.
 - `D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS`: query `vkGetPhysicalDeviceImageFormatProperties` for the matching

@@ -208,6 +208,9 @@ struct DeviceState {
     PFN_vkGetDeviceImageMemoryRequirements image_requirements = nullptr;  // Vulkan 1.3 or VK_KHR_maintenance4
     PFN_vkGetPhysicalDeviceFormatProperties2 format_properties2 = nullptr;
 
+    // Cached physical-device no-attachment sample counts for D3D12_OPTIONS19.
+    UINT no_output_sample_counts = 0;
+
     // VK_EXT_host_image_copy; null unless the device enabled it and its copies accept GENERAL.
     PFN_vkCopyMemoryToImageEXT copy_memory_to_image = nullptr;
     PFN_vkCopyImageToMemoryEXT copy_image_to_memory = nullptr;
@@ -1089,14 +1092,21 @@ public:
                 state_.image_requirements =
                     reinterpret_cast<PFN_vkGetDeviceImageMemoryRequirements>(get_device(info.device, name));
 
-        if (state_.info.max_push_constants_size == 0 && info.physical && info.get_instance_proc) {
+        if (info.physical && info.get_instance_proc) {
             const auto get_props = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(
                 info.get_instance_proc(info.instance, "vkGetPhysicalDeviceProperties"));
             if (get_props) {
                 VkPhysicalDeviceProperties props{};
                 get_props(info.physical, &props);
-                state_.info.max_push_constants_size = props.limits.maxPushConstantsSize;
-                state_.info.push_constants_need_fallback = (state_.info.max_push_constants_size < 144);
+                if (state_.info.max_push_constants_size == 0) {
+                    state_.info.max_push_constants_size = props.limits.maxPushConstantsSize;
+                    state_.info.push_constants_need_fallback = (state_.info.max_push_constants_size < 144);
+                }
+                constexpr VkSampleCountFlags kD3D12SampleCounts =
+                    VK_SAMPLE_COUNT_1_BIT | VK_SAMPLE_COUNT_2_BIT | VK_SAMPLE_COUNT_4_BIT |
+                    VK_SAMPLE_COUNT_8_BIT | VK_SAMPLE_COUNT_16_BIT | VK_SAMPLE_COUNT_32_BIT;
+                state_.no_output_sample_counts =
+                    static_cast<UINT>(props.limits.framebufferNoAttachmentsSampleCounts & kD3D12SampleCounts);
             }
         }
 
@@ -1921,6 +1931,109 @@ public:
             opts->UnalignedBlockTexturesSupported = state_.info.texture_compression_bc;
             return S_OK;
         }
+        case D3D12_FEATURE_D3D12_OPTIONS2: {
+            if (size != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS2)) return E_INVALIDARG;
+            auto* opts = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS2*>(data);
+            *opts = {};
+            opts->DepthBoundsTestSupported = FALSE;
+            opts->ProgrammableSamplePositionsTier = D3D12_PROGRAMMABLE_SAMPLE_POSITIONS_TIER_NOT_SUPPORTED;
+            return S_OK;
+        }
+        case D3D12_FEATURE_D3D12_OPTIONS3: {
+            if (size != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS3)) return E_INVALIDARG;
+            auto* opts = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS3*>(data);
+            *opts = {};
+            opts->CopyQueueTimestampQueriesSupported = FALSE;
+            // Only typeless resources set VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT.
+            opts->CastingFullyTypedFormatSupported = FALSE;
+            opts->WriteBufferImmediateSupportFlags = D3D12_COMMAND_LIST_SUPPORT_FLAG_NONE;
+            opts->ViewInstancingTier = D3D12_VIEW_INSTANCING_TIER_NOT_SUPPORTED;
+            opts->BarycentricsSupported = FALSE;
+            return S_OK;
+        }
+        case D3D12_FEATURE_D3D12_OPTIONS4: {
+            if (size != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS4)) return E_INVALIDARG;
+            auto* opts = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS4*>(data);
+            *opts = {};
+            // GetResourceAllocationInfo implements D3D12_SMALL_MSAA_RESOURCE_PLACEMENT_ALIGNMENT (64 KiB).
+            opts->MSAA64KBAlignedTextureSupported = TRUE;
+            opts->SharedResourceCompatibilityTier = D3D12_SHARED_RESOURCE_COMPATIBILITY_TIER_0;
+            opts->Native16BitShaderOpsSupported = FALSE;
+            return S_OK;
+        }
+        case D3D12_FEATURE_D3D12_OPTIONS5: {
+            if (size != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS5)) return E_INVALIDARG;
+            auto* opts = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS5*>(data);
+            *opts = {};
+            opts->SRVOnlyTiledResourceTier3 = FALSE;
+            opts->RenderPassesTier = D3D12_RENDER_PASS_TIER_0;
+            opts->RaytracingTier = D3D12_RAYTRACING_TIER_NOT_SUPPORTED;
+            return S_OK;
+        }
+        case D3D12_FEATURE_D3D12_OPTIONS7: {
+            if (size != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS7)) return E_INVALIDARG;
+            auto* opts = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS7*>(data);
+            *opts = {};
+            opts->MeshShaderTier = D3D12_MESH_SHADER_TIER_NOT_SUPPORTED;
+            opts->SamplerFeedbackTier = D3D12_SAMPLER_FEEDBACK_TIER_NOT_SUPPORTED;
+            return S_OK;
+        }
+        case D3D12_FEATURE_D3D12_OPTIONS9: {
+            if (size != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS9)) return E_INVALIDARG;
+            auto* opts = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS9*>(data);
+            *opts = {};
+            opts->MeshShaderPipelineStatsSupported = FALSE;
+            opts->MeshShaderSupportsFullRangeRenderTargetArrayIndex = FALSE;
+            opts->AtomicInt64OnTypedResourceSupported = FALSE;
+            opts->AtomicInt64OnGroupSharedSupported = FALSE;
+            opts->DerivativesInMeshAndAmplificationShadersSupported = FALSE;
+            opts->WaveMMATier = D3D12_WAVE_MMA_TIER_NOT_SUPPORTED;
+            return S_OK;
+        }
+        case D3D12_FEATURE_D3D12_OPTIONS11: {
+            if (size != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS11)) return E_INVALIDARG;
+            auto* opts = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS11*>(data);
+            *opts = {};
+            opts->AtomicInt64OnDescriptorHeapResourceSupported = FALSE;
+            return S_OK;
+        }
+        case D3D12_FEATURE_D3D12_OPTIONS13: {
+            if (size != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS13)) return E_INVALIDARG;
+            auto* opts = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS13*>(data);
+            *opts = {};
+            opts->UnrestrictedBufferTextureCopyPitchSupported = FALSE;
+            opts->UnrestrictedVertexElementAlignmentSupported = FALSE;
+            opts->InvertedViewportHeightFlipsYSupported = FALSE;
+            opts->InvertedViewportDepthFlipsZSupported = FALSE;
+            opts->TextureCopyBetweenDimensionsSupported = FALSE;
+            opts->AlphaBlendFactorSupported = FALSE;
+            return S_OK;
+        }
+        case D3D12_FEATURE_D3D12_OPTIONS14: {
+            if (size != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS14)) return E_INVALIDARG;
+            auto* opts = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS14*>(data);
+            *opts = {};
+            opts->AdvancedTextureOpsSupported = FALSE;
+            opts->WriteableMSAATexturesSupported = FALSE;
+            opts->IndependentFrontAndBackStencilRefMaskSupported = FALSE;
+            return S_OK;
+        }
+        case D3D12_FEATURE_D3D12_OPTIONS15: {
+            if (size != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS15)) return E_INVALIDARG;
+            auto* opts = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS15*>(data);
+            *opts = {};
+            opts->TriangleFanSupported = FALSE;
+            opts->DynamicIndexBufferStripCutSupported = FALSE;
+            return S_OK;
+        }
+        case D3D12_FEATURE_D3D12_OPTIONS16: {
+            if (size != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS16)) return E_INVALIDARG;
+            auto* opts = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS16*>(data);
+            *opts = {};
+            opts->DynamicDepthBiasSupported = FALSE;
+            opts->GPUUploadHeapSupported = FALSE;
+            return S_OK;
+        }
         case D3D12_FEATURE_D3D12_OPTIONS17: {
             // Non-normalized samplers are core Vulkan (unnormalizedCoordinates), with the restrictions
             // CreateSampler2 checks. No manual write tracking, as the RTX 4090 answers too.
@@ -1929,6 +2042,47 @@ public:
             *opts = {};
             opts->NonNormalizedCoordinateSamplersSupported = TRUE;
             return d3d12_trace::result(method, S_OK);
+        }
+        case D3D12_FEATURE_D3D12_OPTIONS18: {
+            if (size != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS18)) return E_INVALIDARG;
+            auto* opts = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS18*>(data);
+            *opts = {};
+            opts->RenderPassesValid = FALSE;
+            return S_OK;
+        }
+        case D3D12_FEATURE_D3D12_OPTIONS19: {
+            if (size != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS19)) return E_INVALIDARG;
+            auto* opts = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS19*>(data);
+            *opts = {};
+            opts->MismatchingOutputDimensionsSupported = FALSE;
+            opts->SupportedSampleCountsWithNoOutputs = state_.no_output_sample_counts;
+            opts->PointSamplingAddressesNeverRoundUp = FALSE;
+            opts->RasterizerDesc2Supported = FALSE;
+            opts->NarrowQuadrilateralLinesSupported = FALSE;
+            opts->AnisoFilterWithPointMipSupported = state_.info.sampler_anisotropy ? TRUE : FALSE;
+            opts->MaxSamplerDescriptorHeapSize = D3D12_MAX_SHADER_VISIBLE_SAMPLER_HEAP_SIZE;
+            opts->MaxSamplerDescriptorHeapSizeWithStaticSamplers = D3D12_MAX_SHADER_VISIBLE_SAMPLER_HEAP_SIZE;
+            opts->MaxViewDescriptorHeapSize = D3D12_MAX_SHADER_VISIBLE_DESCRIPTOR_HEAP_SIZE_TIER_2;
+            opts->ComputeOnlyCustomHeapSupported = FALSE;
+            return S_OK;
+        }
+        case D3D12_FEATURE_D3D12_OPTIONS20: {
+            if (size != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS20)) return E_INVALIDARG;
+            auto* opts = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS20*>(data);
+            *opts = {};
+            opts->ComputeOnlyWriteWatchSupported = FALSE;
+            opts->RecreateAtTier = D3D12_RECREATE_AT_TIER_NOT_SUPPORTED;
+            return S_OK;
+        }
+        case D3D12_FEATURE_D3D12_OPTIONS21: {
+            if (size != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS21)) return E_INVALIDARG;
+            auto* opts = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS21*>(data);
+            *opts = {};
+            opts->WorkGraphsTier = D3D12_WORK_GRAPHS_TIER_NOT_SUPPORTED;
+            opts->ExecuteIndirectTier = D3D12_EXECUTE_INDIRECT_TIER_1_0;
+            opts->SampleCmpGradientAndBiasSupported = FALSE;
+            opts->ExtendedCommandInfoSupported = FALSE;
+            return S_OK;
         }
         case D3D12_FEATURE_GPU_VIRTUAL_ADDRESS_SUPPORT: {
             if (size != sizeof(D3D12_FEATURE_DATA_GPU_VIRTUAL_ADDRESS_SUPPORT)) return d3d12_trace::result(method, E_INVALIDARG);
