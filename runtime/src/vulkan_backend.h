@@ -1443,7 +1443,7 @@ public:
     enum class QueueKind : std::uint8_t { direct, compute, copy };
 
     // The most command buffers a queue holds at once. At that many, a caller that outruns the GPU waits for the oldest
-    // submitted one to finish instead of allocating without bound. A GPU that makes no progress for kQueuedWaitNs does
+    // submitted one to finish (before taking any context lock, see wait_for_room) instead of allocating without bound. A GPU that makes no progress for kQueuedWaitNs does
     // not block the caller for good: the buffer is allocated anyway, as it was before the cap.
     static constexpr std::size_t kMaxQueuedCommandBuffers = 64;
     static constexpr std::uint64_t kQueuedWaitNs = 5'000'000'000;
@@ -1648,6 +1648,7 @@ public:
 private:
     ReplayResult execute_now(std::span<const CommandList* const> lists) {
         if (context_.is_device_lost()) return ReplayResult::unsupported;
+        wait_for_room();
         if (kind_ != QueueKind::direct)
             for (const auto* list : lists)
                 for (const auto& command : list->commands())
@@ -2232,6 +2233,17 @@ private:
         return reuse;
     }
 
+    // A queue at the cap with nothing finished waits here for its oldest submission. execute_now() calls it before it
+    // takes resource_mutex_ or tracker_mutex_: the submission waited for may itself wait on another queue's work, and
+    // that queue needs those locks to submit it. One execute runs at a time on a queue, so buffers_ is this caller's.
+    void wait_for_room() {
+        if (buffers_.size() < kMaxQueuedCommandBuffers) return;
+        const auto done = completed();
+        for (const auto& slot : buffers_)
+            if (slot.ticket <= done) return;
+        (void)wait_oldest_submitted();
+    }
+
     // Waits for the oldest submitted command buffer. False when none is submitted yet, or it does not finish in time.
     bool wait_oldest_submitted() {
         std::uint64_t oldest = UINT64_MAX;
@@ -2249,8 +2261,6 @@ private:
         if (context_.is_device_lost()) return nullptr;
         context_.drain_deleted_resources(context_.completed_retire_ticket());
         CommandSlot* reuse = recycle_finished();
-        if (!reuse && buffers_.size() >= kMaxQueuedCommandBuffers && wait_oldest_submitted())
-            reuse = recycle_finished();
         if (reuse) {
             if (context_.vk.vkResetCommandBuffer(reuse->buffer, 0) != VK_SUCCESS) return nullptr;
             reuse->predicate.reset();
