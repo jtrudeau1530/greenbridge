@@ -1078,8 +1078,103 @@ class TestConditionCodesAndStatusFlags(unittest.TestCase):
             self.assertEqual(flags.scc == 1, not is_exec_zero)
 
 
+
+# ==============================================================================
+# Phase 7: IEEE 754 Boundary Extremes, Subnormals, and NaN Handling
+# ==============================================================================
+
+class TestIEEE754BoundaryExtremes(unittest.TestCase):
+    """Verifies IEEE 754 bitcasts, subnormals, NaNs, and extreme bit pattern handling in SALU."""
+
+    def test_ieee754_zero_and_neg_zero_masks(self) -> None:
+        """+0.0 is all zeros (identity); -0.0 has only MSB (sign bit, lane 63) set."""
+        pos_zero_bits = f64_to_bits(0.0)
+        neg_zero_bits = f64_to_bits(-0.0)
+
+        self.assertEqual(pos_zero_bits, 0x0000_0000_0000_0000)
+        self.assertEqual(neg_zero_bits, 0x8000_0000_0000_0000)
+
+        # OR with +0.0 leaves mask unchanged
+        saved, new_exec, scc = oracle_s_or_saveexec_b64(0x1234_5678, pos_zero_bits)
+        self.assertEqual(new_exec, 0x1234_5678)
+
+        # OR with -0.0 activates lane 63
+        saved, new_exec, scc = oracle_s_or_saveexec_b64(0, neg_zero_bits)
+        self.assertEqual(new_exec, 0x8000_0000_0000_0000)
+        self.assertEqual(scc, 1)
+
+    def test_ieee754_infinities_and_nans(self) -> None:
+        """Infinities and NaNs are treated strictly as bit patterns; no quietening occurs in SALU."""
+        pos_inf_bits = f64_to_bits(float("inf"))
+        neg_inf_bits = f64_to_bits(float("-inf"))
+        qnan_bits = CANONICAL_QNAN64
+        snan_bits = 0x7FF0_0000_0000_0001  # SNaN (fraction != 0, quiet bit 51 is 0)
+
+        self.assertEqual(pos_inf_bits, 0x7FF0_0000_0000_0000)
+        self.assertEqual(neg_inf_bits, 0xFFF0_0000_0000_0000)
+
+        # Verify SALU preserves SNaN bits without converting to QNaN
+        saved, new_exec, scc = oracle_s_or_saveexec_b64(0, snan_bits)
+        self.assertEqual(new_exec, snan_bits)
+        self.assertEqual(new_exec & 0x0008_0000_0000_0000, 0, "Quiet bit should NOT be spontaneously set by SALU")
+        self.assertEqual(scc, 1)
+
+        # Combining +inf with neg_zero sets sign bit and exponent bits
+        saved, new_exec, scc = oracle_s_or_saveexec_b64(pos_inf_bits, 0x8000_0000_0000_0000)
+        self.assertEqual(new_exec, neg_inf_bits)
+        self.assertEqual(scc, 1)
+
+    def test_ieee754_subnormals_bit_patterns(self) -> None:
+        """Subnormal bit patterns (exponent=0, fraction!=0) are preserved bit-for-bit."""
+        min_subnormal = 0x0000_0000_0000_0001
+        max_subnormal = 0x000F_FFFF_FFFF_FFFF
+
+        saved, new_exec, scc = oracle_s_or_saveexec_b64(min_subnormal, max_subnormal)
+        self.assertEqual(saved, min_subnormal)
+        self.assertEqual(new_exec, max_subnormal)
+        self.assertEqual(scc, 1)
+
+    def test_walking_zeros_dense_masks(self) -> None:
+        """Test walking zero (single inactive lane) across all 64 lane positions."""
+        for lane in range(64):
+            dense_mask = u64(~(1 << lane))
+            # When combined with all zeros, new_exec is dense_mask
+            saved, new_exec, scc = oracle_s_or_saveexec_b64(0, dense_mask)
+            self.assertEqual(new_exec, dense_mask)
+            self.assertEqual(popcount64(new_exec), 63)
+            self.assertEqual(scc, 1)
+
+            # When combined with the missing lane, completes to all lanes active
+            saved2, new_exec2, scc2 = oracle_s_or_saveexec_b64(new_exec, 1 << lane)
+            self.assertEqual(new_exec2, ALL_LANES_ACTIVE_64)
+            self.assertEqual(popcount64(new_exec2), 64)
+            self.assertEqual(scc2, 1)
+
+    def test_alternating_and_checkerboard_merges(self) -> None:
+        """Alternating lane masks (0x5555... and 0xAAAA...) merge to all ones."""
+        saved, new_exec, scc = oracle_s_or_saveexec_b64(EVEN_LANES_64, ODD_LANES_64)
+        self.assertEqual(saved, EVEN_LANES_64)
+        self.assertEqual(new_exec, ALL_LANES_ACTIVE_64)
+        self.assertEqual(scc, 1)
+        self.assertEqual(popcount64(new_exec), 64)
+
+    def test_sparse_random_bit_masks(self) -> None:
+        """Fuzz with sparse masks having only 1, 2, or 3 random bits set."""
+        rng = random.Random(0x7547_7547)
+        for _ in range(50):
+            lanes = rng.sample(range(64), k=3)
+            mask_a = (1 << lanes[0]) | (1 << lanes[1])
+            mask_b = 1 << lanes[2]
+            saved, new_exec, scc = oracle_s_or_saveexec_b64(mask_a, mask_b)
+            self.assertEqual(saved, mask_a)
+            self.assertEqual(new_exec, mask_a | mask_b)
+            self.assertEqual(popcount64(new_exec), 3)
+            self.assertEqual(scc, 1)
+
+
 if __name__ == "__main__":
     unittest.main()
+
 
 
 
