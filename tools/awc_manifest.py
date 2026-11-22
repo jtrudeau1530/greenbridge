@@ -23,6 +23,7 @@ import json
 import os
 import struct
 import sys
+import tempfile
 
 # -I keeps the script directory off sys.path, so add it explicitly before importing the parser.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -137,11 +138,16 @@ def collect(src: str):
 
 
 def write_manifest(rows: list, banks: int, streamed: int, fmt: str, out: str) -> None:
+    """Write to stdout, or to a temporary file renamed over `out` once it is complete, so a failed
+    write keeps the previous manifest instead of truncating it."""
     doc = {"bank_count": banks, "stream_count": len(rows),
            "streamed_music_channel_count": streamed, "streams": rows}
+    tmp = None
     if out:
-        os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
-        f = open(out, "w", encoding="utf-8", newline="")
+        folder = os.path.dirname(os.path.abspath(out))
+        os.makedirs(folder, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=folder, prefix=".awc_manifest-", suffix=".tmp")
+        f = os.fdopen(fd, "w", encoding="utf-8", newline="")
     else:
         f = sys.stdout
     try:
@@ -156,9 +162,18 @@ def write_manifest(rows: list, banks: int, streamed: int, fmt: str, out: str) ->
                 row["duration_s"] = "" if r["duration_s"] is None else f"{r['duration_s']:.6f}"
                 row["streamed_music"] = "yes" if r["streamed_music"] else "no"
                 w.writerow(row)
+        if tmp:
+            f.close()
+            os.replace(tmp, out)
+            tmp = None
     finally:
         if f is not sys.stdout:
             f.close()
+        if tmp:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
 
 
 def main(argv=None) -> int:
