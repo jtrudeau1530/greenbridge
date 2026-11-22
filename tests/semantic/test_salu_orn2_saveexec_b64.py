@@ -1045,5 +1045,184 @@ class TestIEEE754BoundaryExtremesAndBitPatterns(unittest.TestCase):
                     self.assertEqual(scc, SCC_SET if expected != 0 else SCC_CLEARED)
 
 
+# -----------------------------------------------------------------------------
+# Commit 8: Negative Controls, Syntax Rejection, and Mutation Detection
+# -----------------------------------------------------------------------------
+
+def mutant_or_instead_of_orn2(src0: int, exec_in: int) -> Tuple[int, int, int]:
+    """Defect: computes OR instead of ORN2 (fails to invert second operand)."""
+    saved = exec_in & MASK64
+    new_exec = (src0 | exec_in) & MASK64
+    scc = SCC_SET if new_exec != 0 else SCC_CLEARED
+    return saved, new_exec, scc
+
+
+def mutant_orn1_instead_of_orn2(src0: int, exec_in: int) -> Tuple[int, int, int]:
+    """Defect: inverts first operand instead of second operand (~src0 | exec)."""
+    saved = exec_in & MASK64
+    new_exec = ((~src0 & MASK64) | exec_in) & MASK64
+    scc = SCC_SET if new_exec != 0 else SCC_CLEARED
+    return saved, new_exec, scc
+
+
+def mutant_andn2_instead_of_orn2(src0: int, exec_in: int) -> Tuple[int, int, int]:
+    """Defect: performs ANDN2 instead of ORN2 (AND instead of OR)."""
+    saved = exec_in & MASK64
+    new_exec = (src0 & (~exec_in & MASK64)) & MASK64
+    scc = SCC_SET if new_exec != 0 else SCC_CLEARED
+    return saved, new_exec, scc
+
+
+def mutant_drop_saved_exec(src0: int, exec_in: int) -> Tuple[int, int, int]:
+    """Defect: corrupts or zeroes the saved EXEC return value."""
+    saved = 0
+    new_exec = (src0 | (~exec_in & MASK64)) & MASK64
+    scc = SCC_SET if new_exec != 0 else SCC_CLEARED
+    return saved, new_exec, scc
+
+
+def mutant_inverted_scc_condition(src0: int, exec_in: int) -> Tuple[int, int, int]:
+    """Defect: inverts SCC condition flag logic."""
+    saved = exec_in & MASK64
+    new_exec = (src0 | (~exec_in & MASK64)) & MASK64
+    scc = SCC_CLEARED if new_exec != 0 else SCC_SET
+    return saved, new_exec, scc
+
+
+def mutant_32bit_truncation(src0: int, exec_in: int) -> Tuple[int, int, int]:
+    """Defect: truncates calculations to 32 bits, dropping high dword."""
+    saved = exec_in & MASK32
+    new_exec = ((src0 & MASK32) | (~exec_in & MASK32)) & MASK32
+    scc = SCC_SET if new_exec != 0 else SCC_CLEARED
+    return saved, new_exec, scc
+
+
+def validate_instruction_syntax(raw_asm: str) -> None:
+    """Strict syntax parser and checker for s_orn2_saveexec_b64."""
+    line = raw_asm.strip()
+    if not line:
+        raise ValueError("Empty assembly line")
+    parts = line.split(None, 1)
+    opcode = parts[0]
+    if opcode != "s_orn2_saveexec_b64":
+        raise ValueError(f"Unrecognized opcode: {opcode}")
+    if len(parts) < 2:
+        raise ValueError(f"Missing operands for {opcode}")
+
+    operands = [op.strip() for op in parts[1].split(",")]
+    if len(operands) != 2:
+        raise ValueError(f"Expected exactly 2 operands, got {len(operands)}")
+
+    dst = operands[0]
+
+    # Validate destination
+    if dst == "null" or dst == "exec":
+        pass
+    elif dst.startswith("v"):
+        raise ValueError(f"Vector register {dst} invalid for scalar ALU destination")
+    elif dst.startswith("s[") and dst.endswith("]"):
+        inner = dst[2:-1]
+        range_parts = inner.split(":")
+        if len(range_parts) != 2:
+            raise ValueError(f"Malformed SGPR range: {dst}")
+        lo, hi = int(range_parts[0]), int(range_parts[1])
+        if hi != lo + 1:
+            raise ValueError(f"64-bit SGPR pair must span exactly 2 dwords: {dst}")
+        if lo % 2 != 0:
+            raise ValueError(f"64-bit SGPR destination must be even-aligned: {dst}")
+        if not (0 <= lo <= 102):
+            raise ValueError(f"SGPR index out of architectural bounds [0..102]: {dst}")
+    else:
+        raise ValueError(f"Invalid scalar destination operand: {dst}")
+
+
+class TestNegativeControlsAndMutationDetection(unittest.TestCase):
+    """Commit 8: Negative controls, syntax rejection, and mutation detection tests."""
+
+    def test_mutation_or_instead_of_orn2_caught(self) -> None:
+        """Verify OR mutant produces incorrect result on test vector."""
+        src0 = 0x0000_0000_0000_0000
+        exec_in = 0x0000_0000_0000_0000
+        _, correct_exec, _ = oracle_s_orn2_saveexec_b64(src0, exec_in)
+        _, mutant_exec, _ = mutant_or_instead_of_orn2(src0, exec_in)
+        self.assertEqual(correct_exec, EXEC_ALL_ONES)
+        self.assertEqual(mutant_exec, 0)
+        self.assertNotEqual(correct_exec, mutant_exec)
+
+    def test_mutation_inverted_operand_order_caught(self) -> None:
+        """Verify ORN1 mutant (~src0 | exec) is caught due to non-commutativity."""
+        src0 = 0xFFFF_FFFF_0000_0000
+        exec_in = 0x0000_0000_0000_0000
+        _, correct_exec, _ = oracle_s_orn2_saveexec_b64(src0, exec_in)
+        _, mutant_exec, _ = mutant_orn1_instead_of_orn2(src0, exec_in)
+        self.assertEqual(correct_exec, EXEC_ALL_ONES)
+        self.assertEqual(mutant_exec, 0x0000_0000_FFFF_FFFF)
+        self.assertNotEqual(correct_exec, mutant_exec)
+
+    def test_mutation_andn2_caught(self) -> None:
+        """Verify ANDN2 mutant is distinguished from ORN2."""
+        src0 = 0x5555_5555_5555_5555
+        exec_in = 0x5555_5555_5555_5555
+        _, correct_exec, _ = oracle_s_orn2_saveexec_b64(src0, exec_in)
+        _, mutant_exec, _ = mutant_andn2_instead_of_orn2(src0, exec_in)
+        self.assertEqual(correct_exec, EXEC_ALL_ONES)
+        self.assertEqual(mutant_exec, 0)
+        self.assertNotEqual(correct_exec, mutant_exec)
+
+    def test_mutation_dropped_save_caught(self) -> None:
+        """Verify mutant dropping saved EXEC is caught."""
+        exec_in = 0x1234_5678_9ABC_DEF0
+        saved_corr, _, _ = oracle_s_orn2_saveexec_b64(0, exec_in)
+        saved_mut, _, _ = mutant_drop_saved_exec(0, exec_in)
+        self.assertEqual(saved_corr, exec_in)
+        self.assertEqual(saved_mut, 0)
+        self.assertNotEqual(saved_corr, saved_mut)
+
+    def test_mutation_inverted_scc_caught(self) -> None:
+        """Verify mutant inverting SCC flag is caught on zero and non-zero cases."""
+        _, _, scc_corr = oracle_s_orn2_saveexec_b64(0, EXEC_ALL_ONES)
+        _, _, scc_mut = mutant_inverted_scc_condition(0, EXEC_ALL_ONES)
+        self.assertEqual(scc_corr, SCC_CLEARED)
+        self.assertEqual(scc_mut, SCC_SET)
+        self.assertNotEqual(scc_corr, scc_mut)
+
+    def test_mutation_32bit_truncation_caught(self) -> None:
+        """Verify 32-bit truncation mutant is caught when upper 32 lanes differ."""
+        src0 = 0xAAAA_0000_0000_0000
+        exec_in = 0xFFFF_FFFF_FFFF_FFFF
+        _, correct_exec, _ = oracle_s_orn2_saveexec_b64(src0, exec_in)
+        _, mutant_exec, _ = mutant_32bit_truncation(src0, exec_in)
+        self.assertEqual(correct_exec, 0xAAAA_0000_0000_0000)
+        self.assertEqual(mutant_exec, 0)
+        self.assertNotEqual(correct_exec, mutant_exec)
+
+    def test_syntax_rejection_unaligned_sgpr(self) -> None:
+        """Verify rejection of unaligned SGPR pair destination."""
+        with self.assertRaises(ValueError) as ctx:
+            validate_instruction_syntax("s_orn2_saveexec_b64 s[1:2], s[4:5]")
+        self.assertIn("even-aligned", str(ctx.exception))
+
+    def test_syntax_rejection_out_of_bounds_sgpr(self) -> None:
+        """Verify rejection of out-of-bounds SGPR destination."""
+        with self.assertRaises(ValueError) as ctx:
+            validate_instruction_syntax("s_orn2_saveexec_b64 s[104:105], s[0:1]")
+        self.assertIn("bounds", str(ctx.exception))
+
+    def test_syntax_rejection_vgpr_as_scalar_dst(self) -> None:
+        """Verify rejection of VGPR used in scalar saveexec destination."""
+        with self.assertRaises(ValueError) as ctx:
+            validate_instruction_syntax("s_orn2_saveexec_b64 v[0:1], s[0:1]")
+        self.assertIn("Vector register", str(ctx.exception))
+
+    def test_syntax_rejection_malformed_syntax(self) -> None:
+        """Verify rejection of invalid opcode and missing operands."""
+        with self.assertRaises(ValueError):
+            validate_instruction_syntax("s_orn2_saveexec_b32 s[0:1], s[2:3]")
+        with self.assertRaises(ValueError):
+            validate_instruction_syntax("s_orn2_saveexec_b64 s[0:1]")
+        with self.assertRaises(ValueError):
+            validate_instruction_syntax("")
+
+
 if __name__ == "__main__":
     unittest.main()
