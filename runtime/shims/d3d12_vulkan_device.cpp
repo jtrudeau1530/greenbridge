@@ -5630,15 +5630,14 @@ public:
             log_once("placed buffer refused: heap uses a separate allocation for sparse tiles", 1);
             return E_NOTIMPL;
         }
-        // Only buffers are addressable, as in D3D12: a placed texture keeps a null VA and its own Vulkan image.
+        // Only buffers are addressable, as in D3D12: a placed texture keeps a null VA and its own Vulkan image, which
+        // create_texture makes for 1D, 2D and 3D alike (arrays and mips included), as for a committed texture.
         const VkDeviceSize placed_va = desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? heap->offset() + heap_offset : 0;
         auto* resource = new Resource(state_, *desc, heap->properties(), heap->flags(), placed_va);
         resource->attach_device(identity());
         HRESULT hr = E_NOTIMPL;
         if (desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
             hr = resource->create_placed_buffer();
-        } else if (!tiled && desc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D) {
-            log_once("placed resource dimension not supported:", int(desc->Dimension));
         } else {
             hr = S_OK;
             const Format format = state_.texture_format(*desc);
