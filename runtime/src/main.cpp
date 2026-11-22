@@ -129,7 +129,22 @@ int wmain(int argc, wchar_t** argv) {
             return 1;
         }
         rt::process::set_command_line(image.filename().wstring(), game_args);
-        std::printf("console paths: GAME: -> %ls, writes -> %ls\n", game_dir.c_str(), overlay_dir.c_str());
+        const std::wstring paths = L"console paths: GAME: -> " + game_dir.native() + L", writes -> " + overlay_dir.native();
+        const HANDLE out = GetStdHandle(STD_OUTPUT_HANDLE);
+        DWORD mode;
+        bool printed = false;
+        if (GetConsoleMode(out, &mode)) {
+            std::fflush(stdout);
+            const std::wstring line = paths + L"\r\n";
+            DWORD written;
+            printed = WriteConsoleW(out, line.data(), static_cast<DWORD>(line.size()), &written, nullptr) != FALSE;
+        }
+        if (!printed) {
+            const auto game = game_dir.u8string();
+            const auto overlay = overlay_dir.u8string();
+            std::printf("console paths: GAME: -> %s, writes -> %s\n",
+                        reinterpret_cast<const char*>(game.c_str()), reinterpret_cast<const char*>(overlay.c_str()));
+        }
         std::printf("running %s\n", main_module.name.c_str());
         std::fflush(stdout);
         const int code = rt::process::run_entry(main_module.base + main_module.entry_rva);
