@@ -411,6 +411,12 @@ public:
         std::lock_guard lock(mutex_);
         query_pools_.erase(id);
     }
+    // The heap's d3d12_query_heap type, or ~0u for a heap that is not registered.
+    std::uint32_t query_heap_type(QueryHeapId id) {
+        std::lock_guard lock(mutex_);
+        const auto it = query_pools_.find(id);
+        return it == query_pools_.end() ? ~0u : it->second.heap_type;
+    }
 
     // VkPhysicalDeviceLimits::timestampPeriod (nanoseconds per tick), or 0 when the queue writes no timestamps
     // (timestampValidBits 0). Set by the device before any queue uses it.

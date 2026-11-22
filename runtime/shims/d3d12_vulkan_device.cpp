@@ -1840,7 +1840,7 @@ public:
 
     HRESULT STDMETHODCALLTYPE CreateQueryHeap(const D3D12_QUERY_HEAP_DESC* desc, REFIID riid, void** out) override {
         if (out) *out = nullptr;
-        if (!desc || !desc->Count) return E_INVALIDARG;
+        if (!desc || !desc->Count || desc->NodeMask > 1) return E_INVALIDARG;  // one node
         auto* heap = new QueryHeap(state_);
         heap->attach_device(identity());
         if (const HRESULT hr = heap->create(*desc); FAILED(hr)) {
