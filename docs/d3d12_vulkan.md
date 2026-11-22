@@ -1545,6 +1545,11 @@ Not implemented yet:
     Capturing a new predicate inside an active pipeline-statistics query is rejected as unsupported, because the
     helper's compute invocation would otherwise pollute the application's result; capturing before the query is
     allowed. Virtualising that query is not part of this change.
+    Integration notes for #291 and D3D-27: the capture helper binds its own compute pipeline, descriptor set 0
+    and push constants. The compute path must restore those bindings afterward, or bind its application state
+    before each dispatch. Copies and compute dispatches cannot execute inside dynamic rendering, so render-pass
+    integration must place the capture outside the rendering scope while preserving capture at `SetPredication`.
+    These are requirements for those future integrations, not compute-dispatch or render-pass support added here.
   Open:
   - Copies and resolves. D3D12 predicates `CopyBufferRegion`, `CopyTextureRegion`, `CopyResource` and
     `ResolveSubresource`; Vulkan's conditional rendering does not cover transfer commands, so they run
