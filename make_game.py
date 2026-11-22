@@ -216,7 +216,10 @@ def choose_game() -> str:
         if not interactive:
             fail("More than one copy found: choose one with --game.")
         while True:
-            pick = input("Which one? ").strip()
+            try:
+                pick = input("Which one? ").strip()
+            except EOFError:   # Ctrl+Z / Ctrl+D, or a console that gives no input
+                fail("No copy chosen: choose one with --game.")
             if pick.isdigit() and 1 <= int(pick) <= len(found):
                 return found[int(pick) - 1][0]
     if not interactive:
@@ -224,7 +227,10 @@ def choose_game() -> str:
     print("Your game files weren't found automatically. Paste the folder that holds MicrosoftGame.Config "
           "and the .rpf archives.")
     while True:
-        d = input("Game folder: ").strip().strip('"')
+        try:
+            d = input("Game folder: ").strip().strip('"')
+        except EOFError:
+            fail("No folder given. Give the folder with --game.")
         if d and match_version(d):
             return d
         print("  That folder isn't a supported version of the game. Try again.")
@@ -918,5 +924,14 @@ def main() -> int:
     return 0
 
 
+def cli() -> int:
+    """main(), with Ctrl+C reported in one line instead of a traceback: every stage resumes on the next run."""
+    try:
+        return main()
+    except KeyboardInterrupt:
+        print("\nStopped. Run it again to continue where it left off.", file=sys.stderr)
+        return 130
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(cli())
