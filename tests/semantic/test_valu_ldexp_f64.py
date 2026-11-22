@@ -495,6 +495,173 @@ def parse_vop3_ldexp_f64(asm_line: str) -> InstructionAST:
     return ast
 
 
+class ScalarVALUInterpreter:
+    """Deterministic scalar instruction interpreter for RDNA2 VALU instructions."""
+
+    def __init__(self) -> None:
+        self.num_vgprs = 256
+        self.num_sgprs = 106
+        self.vgpr = [0] * self.num_vgprs
+        self.sgpr = [0] * self.num_sgprs
+        self.vcc = 0
+        self.exec = MASK64
+
+    def reset(self) -> None:
+        self.vgpr = [0] * self.num_vgprs
+        self.sgpr = [0] * self.num_sgprs
+        self.vcc = 0
+        self.exec = MASK64
+
+    def get_vgpr_u32(self, idx: int) -> int:
+        if not (0 <= idx < self.num_vgprs):
+            raise IndexError(f"VGPR index {idx} out of range [0, {self.num_vgprs})")
+        return self.vgpr[idx] & MASK32
+
+    def set_vgpr_u32(self, idx: int, val: int) -> None:
+        if not (0 <= idx < self.num_vgprs):
+            raise IndexError(f"VGPR index {idx} out of range [0, {self.num_vgprs})")
+        self.vgpr[idx] = val & MASK32
+
+    def get_vgpr_u64(self, idx: int) -> int:
+        if not (0 <= idx < self.num_vgprs - 1):
+            raise IndexError(f"64-bit VGPR base {idx} out of range [0, {self.num_vgprs - 1})")
+        lo = self.get_vgpr_u32(idx)
+        hi = self.get_vgpr_u32(idx + 1)
+        return join_dwords(lo, hi)
+
+    def set_vgpr_u64(self, idx: int, val64: int) -> None:
+        if not (0 <= idx < self.num_vgprs - 1):
+            raise IndexError(f"64-bit VGPR base {idx} out of range [0, {self.num_vgprs - 1})")
+        lo, hi = split_dwords(val64)
+        self.set_vgpr_u32(idx, lo)
+        self.set_vgpr_u32(idx + 1, hi)
+
+    def get_sgpr_u32(self, idx: int) -> int:
+        if not (0 <= idx < self.num_sgprs):
+            raise IndexError(f"SGPR index {idx} out of range [0, {self.num_sgprs})")
+        return self.sgpr[idx] & MASK32
+
+    def set_sgpr_u32(self, idx: int, val: int) -> None:
+        if not (0 <= idx < self.num_sgprs):
+            raise IndexError(f"SGPR index {idx} out of range [0, {self.num_sgprs})")
+        self.sgpr[idx] = val & MASK32
+
+    def get_sgpr_u64(self, idx: int) -> int:
+        if not (0 <= idx < self.num_sgprs - 1):
+            raise IndexError(f"64-bit SGPR base {idx} out of range [0, {self.num_sgprs - 1})")
+        lo = self.get_sgpr_u32(idx)
+        hi = self.get_sgpr_u32(idx + 1)
+        return join_dwords(lo, hi)
+
+    def set_sgpr_u64(self, idx: int, val64: int) -> None:
+        if not (0 <= idx < self.num_sgprs - 1):
+            raise IndexError(f"64-bit SGPR base {idx} out of range [0, {self.num_sgprs - 1})")
+        lo, hi = split_dwords(val64)
+        self.set_sgpr_u32(idx, lo)
+        self.set_sgpr_u32(idx + 1, hi)
+
+    def eval_operand_f64(self, op: Operand) -> int:
+        if op.data_type != DataType.F64:
+            raise TypeError(f"Expected DataType.F64, got {op.data_type}")
+        if op.kind == OperandKind.VGPR_PAIR:
+            val = self.get_vgpr_u64(op.reg_index)
+        elif op.kind == OperandKind.SGPR_PAIR:
+            val = self.get_sgpr_u64(op.reg_index)
+        elif op.kind == OperandKind.LITERAL_F64:
+            val = op.literal_val & MASK64
+        else:
+            raise ValueError(f"Unsupported operand kind for f64: {op.kind}")
+
+        if op.abs_mod:
+            val &= ~SIGN_MASK_F64
+        if op.neg_mod:
+            val ^= SIGN_MASK_F64
+        return val
+
+    def eval_operand_i32(self, op: Operand) -> int:
+        if op.data_type != DataType.I32:
+            raise TypeError(f"Expected DataType.I32, got {op.data_type}")
+        if op.kind == OperandKind.VGPR_SINGLE:
+            return s32(self.get_vgpr_u32(op.reg_index))
+        elif op.kind == OperandKind.SGPR_SINGLE:
+            return s32(self.get_sgpr_u32(op.reg_index))
+        elif op.kind in (OperandKind.LITERAL_I32, OperandKind.INLINE_CONST):
+            return s32(op.literal_val)
+        else:
+            raise ValueError(f"Unsupported operand kind for i32: {op.kind}")
+
+    def execute(self, ast: InstructionAST) -> int:
+        ast.validate()
+        if ast.opcode == "v_ldexp_f64":
+            s0_val = self.eval_operand_f64(ast.src0)
+            s1_val = self.eval_operand_i32(ast.src1)
+            res = ref_ldexp_f64(
+                s0_val,
+                s1_val,
+                clamp=ast.clamp,
+                omod=ast.omod,
+            )
+            self.set_vgpr_u64(ast.dst.reg_index, res)
+            return res
+        raise NotImplementedError(f"Opcode {ast.opcode} not implemented in scalar interpreter")
+
+    def execute_asm(self, asm_line: str) -> int:
+        ast = parse_vop3_ldexp_f64(asm_line)
+        return self.execute(ast)
+
+
+class TestValuLdexpF64ScalarInterpreter(unittest.TestCase):
+    """Unit tests for deterministic scalar instruction interpreter."""
+
+    def setUp(self):
+        self.interp = ScalarVALUInterpreter()
+
+    def test_scalar_interpreter_vgpr_sources(self):
+        # Set v[2:3] = 3.0, v4 = 2
+        self.interp.set_vgpr_u64(2, f64_to_bits(3.0))
+        self.interp.set_vgpr_u32(4, 2)
+        ast = parse_vop3_ldexp_f64("v_ldexp_f64 v[0:1], v[2:3], v4")
+        res = self.interp.execute(ast)
+        self.assertEqual(bits_to_f64(res), 12.0)
+        self.assertEqual(self.interp.get_vgpr_u64(0), res)
+
+    def test_scalar_interpreter_sgpr_sources(self):
+        # Set s[0:1] = 0.5, s2 = 4 -> 8.0
+        self.interp.set_sgpr_u64(0, f64_to_bits(0.5))
+        self.interp.set_sgpr_u32(2, 4)
+        ast = parse_vop3_ldexp_f64("v_ldexp_f64 v[6:7], s[0:1], s2")
+        res = self.interp.execute(ast)
+        self.assertEqual(bits_to_f64(res), 8.0)
+        self.assertEqual(self.interp.get_vgpr_u64(6), res)
+
+    def test_scalar_interpreter_literal_exponent(self):
+        self.interp.set_vgpr_u64(0, f64_to_bits(1.25))
+        ast = parse_vop3_ldexp_f64("v_ldexp_f64 v[2:3], v[0:1], 3")
+        res = self.interp.execute(ast)
+        self.assertEqual(bits_to_f64(res), 10.0)
+
+    def test_scalar_interpreter_input_modifiers(self):
+        # -|v[2:3]| * 2^1 with v[2:3] = 4.0 -> -8.0
+        self.interp.set_vgpr_u64(2, f64_to_bits(4.0))
+        self.interp.set_vgpr_u32(5, 1)
+        ast = parse_vop3_ldexp_f64("v_ldexp_f64 v[0:1], -|v[2:3]|, v5")
+        res = self.interp.execute(ast)
+        self.assertEqual(bits_to_f64(res), -8.0)
+
+    def test_scalar_interpreter_output_modifiers_clamp_omod(self):
+        self.interp.set_vgpr_u64(0, f64_to_bits(0.25))
+        self.interp.set_vgpr_u32(2, 1)  # 0.25 * 2^1 = 0.5
+        # With mul:4 -> 2.0; with clamp -> 1.0
+        ast = parse_vop3_ldexp_f64("v_ldexp_f64 v[4:5], v[0:1], v2 clamp mul:4")
+        res = self.interp.execute(ast)
+        self.assertEqual(bits_to_f64(res), 1.0)
+
+    def test_scalar_interpreter_asm_execution(self):
+        self.interp.set_vgpr_u64(10, f64_to_bits(2.5))
+        res = self.interp.execute_asm("v_ldexp_f64 v[0:1], v[10:11], -1")
+        self.assertEqual(bits_to_f64(res), 1.25)
+
+
 class TestValuLdexpF64SymbolicAST(unittest.TestCase):
     """Unit tests for symbolic AST opcode definitions and typed expressions."""
 
