@@ -1161,8 +1161,11 @@ inline ReplayResult prepare_texture_copy(const CopyTexture& copy, Prepared& p) {
         depth - 1 > (buffer.size - offset) / slice_pitch ||
         !within(offset + (depth - 1) * slice_pitch, (rows - 1) * placed.row_pitch + row_bytes, buffer.size))
         return ReplayResult::invalid_copy;
+    if (buffer.size > UINT64_MAX - buffer.buffer_offset) return ReplayResult::invalid_copy;
+    const VkDeviceSize backing_offset = buffer.buffer_offset + offset;
+    if (backing_offset % alignment) return ReplayResult::unsupported;
     VkBufferImageCopy region{};
-    region.bufferOffset = offset;
+    region.bufferOffset = backing_offset;
     region.bufferRowLength = placed.row_pitch / format.bytes * format.block;
     region.bufferImageHeight = depth > 1 ? std::uint32_t(slice_rows * format.block) : 0;
     region.imageSubresource = {range.aspectMask, range.baseMipLevel, range.baseArrayLayer, 1};
@@ -1176,8 +1179,15 @@ inline ReplayResult prepare_texture_copy(const CopyTexture& copy, Prepared& p) {
 // CopyResource: the whole buffer, or every subresource of two textures of the same shape.
 inline ReplayResult prepare_resource_copy(Prepared& p) {
     if (p.binding.buffer && p.source.buffer) {
-        if (p.binding.size != p.source.size) return ReplayResult::invalid_copy;
-        p.buffer_copies.push_back({0, 0, p.source.size});
+        if (p.binding.size != p.source.size || !p.source.size) return ReplayResult::invalid_copy;
+        if (p.source.size > UINT64_MAX - p.source.buffer_offset ||
+            p.binding.size > UINT64_MAX - p.binding.buffer_offset)
+            return ReplayResult::invalid_copy;
+        const VkDeviceSize src = p.source.buffer_offset;
+        const VkDeviceSize dst = p.binding.buffer_offset;
+        if (p.source.buffer == p.binding.buffer && src < dst + p.source.size && dst < src + p.source.size)
+            return ReplayResult::invalid_copy;
+        p.buffer_copies.push_back({src, dst, p.source.size});
         return ReplayResult::success;
     }
     const ResourceBinding &dst = p.binding, &src = p.source;
@@ -1626,7 +1636,7 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                     job.to_float = upload;
                     job.app = buffer.buffer;
                     job.app_offset = region.bufferOffset;
-                    job.app_size = buffer.size;
+                    job.app_size = buffer.buffer_offset + buffer.size;
                     job.width = region.imageExtent.width;
                     job.height = region.imageExtent.height;
                     job.slices = region.imageExtent.depth;
