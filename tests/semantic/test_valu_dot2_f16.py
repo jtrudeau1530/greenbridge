@@ -26,6 +26,7 @@ import struct
 import unittest
 from dataclasses import dataclass, field
 from enum import Enum, auto
+from fractions import Fraction
 from typing import List, Optional, Tuple, Union
 
 # ==============================================================================
@@ -627,6 +628,181 @@ class SIMDInterpreter:
 
 
 # ==============================================================================
+# Condition Codes, Status Flags, and Carry Generation
+# ==============================================================================
+
+@dataclass(frozen=True)
+class FPStatusFlags:
+    """Architectural floating-point condition codes and IEEE 754 status flags."""
+    invalid: bool = False
+    overflow: bool = False
+    underflow: bool = False
+    inexact: bool = False
+    zero: bool = False
+    negative: bool = False
+    denormal: bool = False
+    infinite: bool = False
+    nan: bool = False
+
+
+def evaluate_v_dot2_f16_flags(
+    src0_bits: int,
+    src1_bits: int,
+    res_bits: int,
+    abs0: Tuple[bool, bool] = (False, False),
+    neg0: Tuple[bool, bool] = (False, False),
+    abs1: Tuple[bool, bool] = (False, False),
+    neg1: Tuple[bool, bool] = (False, False),
+    op_sel: Tuple[int, int] = (0, 0),
+    op_sel_hi: Tuple[int, int] = (1, 1),
+    clamp: bool = False,
+) -> FPStatusFlags:
+    """Evaluate IEEE 754 architectural flags and condition codes for v_dot2_f16."""
+    s0_lo, s0_hi = unpack_f16x2(src0_bits)
+    s1_lo, s1_hi = unpack_f16x2(src1_bits)
+    s0_halves = (s0_lo, s0_hi)
+    s1_halves = (s1_lo, s1_hi)
+
+    h0_0 = apply_f16_modifiers(s0_halves[op_sel[0] & 1], abs0[0], neg0[0])
+    h1_0 = apply_f16_modifiers(s1_halves[op_sel[1] & 1], abs1[0], neg1[0])
+    h0_1 = apply_f16_modifiers(s0_halves[op_sel_hi[0] & 1], abs0[1], neg0[1])
+    h1_1 = apply_f16_modifiers(s1_halves[op_sel_hi[1] & 1], abs1[1], neg1[1])
+
+    # Check for signaling NaNs
+    has_snan = is_snan(h0_0) or is_snan(h1_0) or is_snan(h0_1) or is_snan(h1_1)
+
+    # Check for 0 * inf
+    has_zero_times_inf = (
+        (is_zero(h0_0) and is_inf(h1_0)) or (is_inf(h0_0) and is_zero(h1_0)) or
+        (is_zero(h0_1) and is_inf(h1_1)) or (is_inf(h0_1) and is_zero(h1_1))
+    )
+
+    # Check for +inf + -inf
+    p0 = mul_f16(h0_0, h1_0)
+    p1 = mul_f16(h0_1, h1_1)
+    has_inf_cancellation = is_inf(p0) and is_inf(p1) and ((p0 & SIGN_MASK) != (p1 & SIGN_MASK))
+
+    invalid = has_snan or has_zero_times_inf or has_inf_cancellation
+
+    nan_flag = is_nan(res_bits)
+    inf_flag = is_inf(res_bits)
+    zero_flag = is_zero(res_bits)
+    neg_flag = bool(res_bits & SIGN_MASK)
+    denorm_flag = is_subnormal(res_bits)
+
+    inputs_all_finite = not (is_inf(h0_0) or is_inf(h1_0) or is_inf(h0_1) or is_inf(h1_1) or
+                             is_nan(h0_0) or is_nan(h1_0) or is_nan(h0_1) or is_nan(h1_1))
+    overflow = inputs_all_finite and inf_flag
+
+    underflow = False
+    if denorm_flag:
+        underflow = True
+
+    inexact = False
+    if overflow:
+        inexact = True
+    elif inputs_all_finite and not (nan_flag or inf_flag):
+        try:
+            f0_0 = Fraction(bits_to_f16(h0_0))
+            f1_0 = Fraction(bits_to_f16(h1_0))
+            f0_1 = Fraction(bits_to_f16(h0_1))
+            f1_1 = Fraction(bits_to_f16(h1_1))
+            exact_math = (f0_0 * f1_0) + (f0_1 * f1_1)
+            res_frac = Fraction(bits_to_f16(res_bits))
+            if not clamp:
+                if exact_math != res_frac:
+                    inexact = True
+            else:
+                clamped_f = min(1.0, max(0.0, float(exact_math)))
+                if Fraction(clamped_f) != res_frac:
+                    inexact = True
+        except (ValueError, OverflowError):
+            pass
+
+    return FPStatusFlags(
+        invalid=invalid,
+        overflow=overflow,
+        underflow=underflow,
+        inexact=inexact,
+        zero=zero_flag,
+        negative=neg_flag,
+        denormal=denorm_flag,
+        infinite=inf_flag,
+        nan=nan_flag,
+    )
+
+
+def evaluate_v_dot2acc_f16_flags(
+    src0_bits: int,
+    src1_bits: int,
+    src2_acc_bits: int,
+    res_bits: int,
+    abs0: Tuple[bool, bool] = (False, False),
+    neg0: Tuple[bool, bool] = (False, False),
+    abs1: Tuple[bool, bool] = (False, False),
+    neg1: Tuple[bool, bool] = (False, False),
+    abs2: bool = False,
+    neg2: bool = False,
+    op_sel: Tuple[int, int] = (0, 0),
+    op_sel_hi: Tuple[int, int] = (1, 1),
+    clamp: bool = False,
+) -> FPStatusFlags:
+    """Evaluate IEEE 754 architectural flags and condition codes for v_dot2acc_f16."""
+    acc = apply_f16_modifiers(src2_acc_bits & MASK16, abs2, neg2)
+    base_flags = evaluate_v_dot2_f16_flags(
+        src0_bits=src0_bits,
+        src1_bits=src1_bits,
+        res_bits=res_bits,
+        abs0=abs0,
+        neg0=neg0,
+        abs1=abs1,
+        neg1=neg1,
+        op_sel=op_sel,
+        op_sel_hi=op_sel_hi,
+        clamp=clamp,
+    )
+
+    invalid = base_flags.invalid or is_snan(acc)
+    # Check if dot sum and acc produce +inf + -inf
+    dot_val = oracle_v_dot2_f16(src0_bits, src1_bits, abs0, neg0, abs1, neg1, op_sel, op_sel_hi)
+    if is_inf(dot_val) and is_inf(acc) and ((dot_val & SIGN_MASK) != (acc & SIGN_MASK)):
+        invalid = True
+
+    nan_flag = is_nan(res_bits)
+    inf_flag = is_inf(res_bits)
+    zero_flag = is_zero(res_bits)
+    neg_flag = bool(res_bits & SIGN_MASK)
+    denorm_flag = is_subnormal(res_bits)
+
+    return FPStatusFlags(
+        invalid=invalid,
+        overflow=base_flags.overflow,
+        underflow=base_flags.underflow,
+        inexact=base_flags.inexact,
+        zero=zero_flag,
+        negative=neg_flag,
+        denormal=denorm_flag,
+        infinite=inf_flag,
+        nan=nan_flag,
+    )
+
+
+def compute_f16_mantissa_carry(s0_bits: int, s1_bits: int) -> Tuple[int, int]:
+    """Demonstrate IEEE 754 11-bit mantissa carry generation during addition."""
+    _, exp0, frac0 = split_f16_bits(s0_bits)
+    _, exp1, frac1 = split_f16_bits(s1_bits)
+    m0 = (1 << 10) | frac0 if exp0 != 0 else frac0
+    m1 = (1 << 10) | frac1 if exp1 != 0 else frac1
+    if exp0 > exp1:
+        m1 >>= (exp0 - exp1)
+    elif exp1 > exp0:
+        m0 >>= (exp1 - exp0)
+    mant_sum = m0 + m1
+    carry_out = 1 if mant_sum >= (1 << 11) else 0
+    return mant_sum, carry_out
+
+
+# ==============================================================================
 # Unit Tests: Architectural Model and Reference Oracle
 # ==============================================================================
 
@@ -1195,6 +1371,110 @@ class TestRegisterAliasing(unittest.TestCase):
             if i not in (10, 11, 12):
                 self.assertEqual(state.get_vgpr(i), 0xA5A5_0000 | i)
             self.assertEqual(state.get_sgpr(i), 0x5A5A_0000 | i)
+
+
+class TestConditionCodesAndStatusFlags(unittest.TestCase):
+    """Unit tests for status flags, condition codes, and carry generation."""
+
+    def test_exact_finite_flags(self) -> None:
+        s0 = pack_f16x2(ONE_F16, TWO_F16)
+        s1 = pack_f16x2(THREE_F16, FOUR_F16)
+        res = oracle_v_dot2_f16(s0, s1)
+        flags = evaluate_v_dot2_f16_flags(s0, s1, res)
+        self.assertFalse(flags.invalid)
+        self.assertFalse(flags.overflow)
+        self.assertFalse(flags.underflow)
+        self.assertFalse(flags.inexact)
+        self.assertFalse(flags.zero)
+        self.assertFalse(flags.negative)
+        self.assertFalse(flags.denormal)
+        self.assertFalse(flags.infinite)
+        self.assertFalse(flags.nan)
+
+    def test_inexact_flag(self) -> None:
+        # 1.0 * 1.0 + 1.0 * (1/3 approx) -> inexact
+        s0 = pack_f16x2(ONE_F16, ONE_F16)
+        s1 = pack_f16x2(ONE_F16, f16_to_bits(0.3333333))
+        res = oracle_v_dot2_f16(s0, s1)
+        flags = evaluate_v_dot2_f16_flags(s0, s1, res)
+        self.assertTrue(flags.inexact)
+        self.assertFalse(flags.overflow)
+
+    def test_overflow_flag(self) -> None:
+        s0 = pack_f16x2(NORM_MAX, NORM_MAX)
+        s1 = pack_f16x2(TWO_F16, TWO_F16)
+        res = oracle_v_dot2_f16(s0, s1)
+        self.assertEqual(res, POS_INF)
+        flags = evaluate_v_dot2_f16_flags(s0, s1, res)
+        self.assertTrue(flags.overflow)
+        self.assertTrue(flags.infinite)
+        self.assertTrue(flags.inexact)
+
+    def test_underflow_and_denorm_flags(self) -> None:
+        s0 = pack_f16x2(SUB_MIN, POS_ZERO)
+        s1 = pack_f16x2(ONE_F16, POS_ZERO)
+        res = oracle_v_dot2_f16(s0, s1)
+        flags = evaluate_v_dot2_f16_flags(s0, s1, res)
+        self.assertTrue(flags.denormal)
+        self.assertTrue(flags.underflow)
+
+    def test_invalid_operation_flag_snan_and_inf_zero(self) -> None:
+        # SNaN input triggers invalid
+        s0 = pack_f16x2(CANONICAL_SNAN, ONE_F16)
+        s1 = pack_f16x2(ONE_F16, ONE_F16)
+        res = oracle_v_dot2_f16(s0, s1)
+        flags = evaluate_v_dot2_f16_flags(s0, s1, res)
+        self.assertTrue(flags.invalid)
+        self.assertTrue(flags.nan)
+
+        # 0 * inf triggers invalid
+        s0_inf = pack_f16x2(POS_INF, ONE_F16)
+        s1_zero = pack_f16x2(POS_ZERO, ONE_F16)
+        res_inf = oracle_v_dot2_f16(s0_inf, s1_zero)
+        flags_inf = evaluate_v_dot2_f16_flags(s0_inf, s1_zero, res_inf)
+        self.assertTrue(flags_inf.invalid)
+        self.assertTrue(flags_inf.nan)
+
+    def test_invalid_operation_flag_inf_cancellation(self) -> None:
+        # (+inf) + (-inf) product sum triggers invalid
+        s0 = pack_f16x2(POS_INF, NEG_INF)
+        s1 = pack_f16x2(ONE_F16, ONE_F16)
+        res = oracle_v_dot2_f16(s0, s1)
+        flags = evaluate_v_dot2_f16_flags(s0, s1, res)
+        self.assertTrue(flags.invalid)
+        self.assertTrue(flags.nan)
+
+    def test_zero_and_negative_flags(self) -> None:
+        s0 = pack_f16x2(POS_ZERO, POS_ZERO)
+        s1 = pack_f16x2(ONE_F16, ONE_F16)
+        res = oracle_v_dot2_f16(s0, s1)
+        flags = evaluate_v_dot2_f16_flags(s0, s1, res)
+        self.assertTrue(flags.zero)
+        self.assertFalse(flags.negative)
+
+        s0_neg = pack_f16x2(NEG_ONE_F16, NEG_TWO_F16)
+        s1_pos = pack_f16x2(TWO_F16, THREE_F16)
+        res_neg = oracle_v_dot2_f16(s0_neg, s1_pos)
+        flags_neg = evaluate_v_dot2_f16_flags(s0_neg, s1_pos, res_neg)
+        self.assertFalse(flags_neg.zero)
+        self.assertTrue(flags_neg.negative)
+
+    def test_dot2acc_flags_with_accumulator(self) -> None:
+        s0 = pack_f16x2(ONE_F16, TWO_F16)
+        s1 = pack_f16x2(THREE_F16, FOUR_F16)
+        res = oracle_v_dot2acc_f16(s0, s1, FIVE_F16)
+        flags = evaluate_v_dot2acc_f16_flags(s0, s1, FIVE_F16, res)
+        self.assertFalse(flags.invalid)
+        self.assertEqual(bits_to_f16(res), 16.0)
+
+    def test_mantissa_carry_generation(self) -> None:
+        # 1.0 + 1.0 in f16: mantissas 1.0000000000 + 1.0000000000 = 2.0000000000 -> carry_out = 1
+        _, carry1 = compute_f16_mantissa_carry(ONE_F16, ONE_F16)
+        self.assertEqual(carry1, 1)
+
+        # 1.0 + 0.25 in f16: mantissa sum < 2.0 -> carry_out = 0
+        _, carry0 = compute_f16_mantissa_carry(ONE_F16, f16_to_bits(0.25))
+        self.assertEqual(carry0, 0)
 
 
 if __name__ == "__main__":
