@@ -160,7 +160,9 @@ Totals compare_descriptor_heaps(ID3D12Device* ours, ID3D12Device* host, const ch
 
 int main() {
     vktest::Device vk;
-    if (!vk.create()) return 1;
+    const auto device_status = vk.initialize();
+    if (device_status == vktest::DeviceStatus::unavailable) return 77;   // no Vulkan GPU: ctest skips
+    if (device_status != vktest::DeviceStatus::ready) return 1;
     unsigned matched = 0, mismatched = 0, references = 0;
     {
         Ref<ID3D12Device> ours;
