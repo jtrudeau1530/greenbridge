@@ -22,41 +22,45 @@ BC1, BC3, BC4 and BC5 blocks (95.0% of all BCPack chunks, 89.6% of BCPack bytes)
 BC7 block rebuilders are left for the follow-up PR; `rpf9dump`'s C# `TtpfReader` still uses
 the baseline zlib/raw path until ported.
 
-The compact layout rule moves 206,661 textures into complete exports and 1,218 more into
-partial exports. After it (zlib/raw only), the totals are 305,264 complete, 16,419 partial
-and 35,432 skipped (48,220 − 12,788). The complete count equals the 305,264 all-zlib/raw
-textures in the storage table below, which is the consistency check: every texture with no
-BCPack mip exports its whole chain.
+The compact layout rule moves 206,661 2D textures into complete exports and 1,218 more into
+partial exports (`305,264` complete, `16,419` partial, `35,432` skipped under zlib/raw).
+Resolving the 697 multi-slice descriptors (127 2D arrays — including the 19 two-slice arrays
+formerly misread as DXGI 156/199/211/226 — 567 cubemaps, and 3 3D volumes; see
+`docs/textures_arrays.md`) adds 690 more complete exports and 4 partials under zlib/raw,
+bringing the zlib/raw totals to **305,954 complete**, **16,423 partial** and **34,738 skipped**
+(33,507 2D reader BCPack, 1,223 compact all-BCPack, 3 array all-BCPack and 5 DXGI 11; **0**
+remaining layout skips).
 
-Adding BCPack BC1, BC3, BC4 and BC5 in `tools/ttpf_mips.py` unlocks **47,882** more complete
-chains across the 57 pools, bringing the projected split to **353,146 complete** (98.9% of
-catalog entries), **2,515 partial** and **1,454 skipped** (702 non-BCPack layout/format cases
-plus 752 remaining BC6H/BC7 BCPack skips).
+Adding BCPack BC1, BC3, BC4 and BC5 in `tools/ttpf_mips.py` unlocks **47,886** more complete
+chains across the 57 pools (47,882 2D + 4 multi-slice arrays), bringing the projected split to
+**353,840 complete** (99.08% of catalog entries), **2,518 partial** and **757 skipped** (5 DXGI
+11 plus 752 remaining BC6H/BC7 BCPack skips; **0** layout skips and **0** skipped multi-slice
+descriptors).
 
-This is the same 308,895 / 48,220 total already recorded in `docs/design.md`. The recount
+This is the same 308,895 / 48,220 baseline already recorded in `docs/design.md`. The recount
 splits the 48,220 by cause: the old "(BCPack or unmapped)" label hides 14,713 skips whose
 recorded limitation is a layout/format check, not the codec, and overstates unmapped, which
-is zero. The compact layout rule resolves 12,788 of those 14,713; 1,925 remain layout or
-format cases (1,223 compact all-BCPack, 19 compact unknown element size, 678 arrays/volumes
-and 5 DXGI 11).
+is zero. Together, the compact 2D and multi-slice layout rules resolve all 697 multi-slice
+descriptors and 14,011 2D compact descriptors, leaving only BCPack and 5 DXGI 11 records.
 
 ## Skip breakdown
 
-| Cause | Before | After |
+| Cause | Before | After (zlib/raw) |
 |---|---:|---:|
 | BCPack blocks every usable mip (`TtpfReader`: "All source mips require…") | 33,507 | 33,507 |
 | compact mip mapping not in the validated profile table | 14,030 | 0 |
 | compact layout resolved, but every mip is BCPack | — | 1,223 |
-| compact element size unknown (DXGI 156/199/211/226) | — | 19 |
-| 2D array / volume descriptor (`dimension != 1` or `depth != 1`) | 678 | 678 |
+| former "compact element size unknown" (19 two-slice 2D arrays; see `docs/textures_arrays.md`) | — | 0 |
+| 2D array / cubemap / volume descriptor (`dimension != 1` or `depth > 1`; see `docs/textures_arrays.md`) | 678 | 0 |
+| array layout resolved, but every mip is BCPack | — | 3 |
 | element format not in the parser table (DXGI 11, `R16G16B16A16_UNORM`) | 5 | 5 |
 | no mapped allocation ("unmapped shard") | 0 | 0 |
-| **total** | **48,220** | **35,432** |
+| **total** | **48,220** | **34,738** |
 
-The "before" compact row becomes the measured rows below it after the layout rule: records
-the rule sizes but cannot decode because every mip is BCPack, and records whose element size
-is still unknown. The 1,218 mixed compact records that become partial exports are not skips;
-they are counted in the partial table below.
+The "before" compact row becomes the measured rows below it after the layout rules: records
+the rule sizes but cannot decode under zlib/raw because every mip is BCPack. The 1,218 mixed
+compact records and 4 mixed array records that become partial exports are not skips; they are
+counted in the partial totals below.
 
 The compact row is not one thing:
 
@@ -66,14 +70,16 @@ The compact row is not one thing:
 - 11,570 of the 14,030 have no BCPack chunk anywhere. They fail because
   `ValidatedCompactProfile` has no entry for their
   `(mode, width, height, mips, nonTail, bytes)` tuple, not because of a codec.
-- 19 compact records have no element-size mapping. All 19 are mode 1 (64 KiB): DXGI 156 (7),
-  199 (6), 211 (5) and 226 (1), at 256×256 with 7 mips (2) or 512×512 with 8 mips (17).
-  They are included in the 14,030 and also fail the profile table.
+- 19 mode-1 records (64 KiB) originally appeared as unknown DXGI formats 156 (7), 199 (6),
+  211 (5) and 226 (1) at 256×256 with 7 mips (2) or 512×512 with 8 mips (17). With the
+  corrected 7-bit format / 11-bit depth bitfield (`docs/textures_arrays.md`), all 19 are
+  two-slice 2D arrays (`depth = 2`) with standard DXGI formats 28/71/83/98 (18 complete
+  zlib/raw, 1 partial).
 
 The five format-11 records are 4×4, 8×4 or 128×4 `R16G16B16A16_UNORM`; the parser's
-element-size table has no 8-byte entry for format 11. The 678 array/volume records are
-non-2D descriptors (arrays or volumes), which the reader deliberately rejects until it has a
-validated slice layout.
+element-size table has no 8-byte entry for format 11. The 678 records formerly skipped as
+array/volume descriptors (plus the 19 two-slice arrays above, 697 total) now have validated
+layouts in `tools/tex_headers.py` and `tools/ttpf_mips.py` (`docs/textures_arrays.md`).
 
 ## The BCPack footprint
 
@@ -147,13 +153,14 @@ bit 1:
 | 3 | `SW_4KB_S` | 4 KiB | 50,811 |
 | 9–12 | array/volume | — | 567 |
 
-Modes 9–12 are exactly the 567 cube descriptors; the other 111 array/volume records use tile
-mode 0 or 1. Bit 0 of the field is independent: modes 4/5 share tile mode 2, 6/7 share tile
-mode 3, and 36/38 share tile modes 2/3. The reader's `mode == 0` test therefore gives a 4 KiB
-layout to modes 1 and 32, which are 64 KiB. Fifteen mode 1/32 descriptors have a known element
-size (4 mode 1, 11 mode 32); all fifteen match a 64 KiB allocation span and one (`maps_4_7`
-#6034) decodes at 0.00–0.33 levels (see below). The other 19 mode 1 records are the
-unknown-format ones in the table below.
+Modes 9–12 are exactly the 567 cubemap descriptors; the other 130 multi-slice records (127 2D
+arrays and 3 volumes) use tile mode 0 or 1. Bit 0 of the field is independent: modes 4/5 share
+tile mode 2, 6/7 share tile mode 3, and 36/38 share tile modes 2/3. The reader's `mode == 0`
+test therefore gives a 4 KiB layout to modes 1 and 32, which are 64 KiB. Fifteen single-slice
+mode 1/32 descriptors have a known element size (4 mode 1, 11 mode 32); all fifteen match a
+64 KiB allocation span and one (`maps_4_7` #6034) decodes at 0.00–0.33 levels (see below). The
+other 19 mode 1 records formerly counted as unknown-format 2D entries are two-slice 2D arrays
+(`depth = 2`, DXGI 28/71/83/98; see `docs/textures_arrays.md`).
 
 ### The layout is the AMD mip tail
 
@@ -162,11 +169,12 @@ stored smallest-first; a mip whose element count fits half a tile width and a ti
 among the last 8 (4 KiB) or 12 (64 KiB) mips, goes into one shared tile at offset 0 at the
 AMD entry offset (`m = max_tail - 1 - k`; `entry = m > 6 ? 16 << m : m << 8`).
 
-On all 356,413 2D descriptors with a known element size — the 232,789 already-trusted compact
-exports, the 14,011 layout-capable records the profile table rejects, and every non-compact
-mode — the computed size equals `next_allocation - base`. There are **0 mismatches**. The
-remaining 702 descriptors are 678 arrays/volumes and 24 formats without an element-size
-mapping.
+On all 356,413 single-slice 2D descriptors with a known element size — the 232,789
+already-trusted compact exports, the 14,011 layout-capable records the profile table rejects,
+and every non-compact mode — the computed size equals `next_allocation - base`. There are
+**0 mismatches**. Of the remaining 702 descriptors, 697 (127 2D arrays, 567 cubemaps, and 3
+volumes) are validated with 0 mismatches in `docs/textures_arrays.md`, leaving only the 5 DXGI
+11 (`R16G16B16A16_UNORM`) records without a format entry.
 
 `tools/tex_headers.py` exposes the rule without any container dependency:
 
@@ -213,13 +221,13 @@ tile. The allocation spans and the decoded content both put the tail at the comp
 | same layout, new tuple (4 KiB) | 13,956 |
 | same layout, modes 5/7/34/38 | 40 |
 | same layout, 64 KiB (modes 1/32) | 15 |
-| **layout resolved** | **14,011** |
-| format without an element-size mapping | 19 |
+| **2D compact layout resolved** | **14,011** |
+| two-slice 2D arrays (formerly misread as DXGI 156/199/211/226; see `docs/textures_arrays.md`) | 19 |
 | **total** | **14,030** |
 
-The rejected records contain 84 distinct six-tuples with a known element size, plus 4
-unknown-size tuples shared by the 19 records above (88 total). The ten largest known-size
-tuples are:
+The rejected 2D records contain 84 distinct six-tuples with a known element size; the 19
+remaining records are two-slice 2D arrays handled by `array_surface_layout`. The ten largest
+known-size 2D tuples are:
 
 | `mode` | Width×height | Mips | `non_tail` | Element bytes | Records |
 |---:|---|---:|---:|---:|---:|
@@ -241,10 +249,10 @@ What the layout change does to the 14,030:
 
 | | Textures |
 |---|---:|
-| complete zlib/raw chain | 11,570 |
-| partial export: some readable contiguous mip range | 1,218 |
-| still skipped: every mip is BCPack | 1,223 |
-| still skipped: element size unknown | 19 |
+| complete zlib/raw chain (2D compact) | 11,570 |
+| partial export: some readable contiguous mip range (2D compact) | 1,218 |
+| still skipped: every mip is BCPack (2D compact) | 1,223 |
+| two-slice 2D arrays (resolved in `docs/textures_arrays.md`: 18 full, 1 partial) | 19 |
 | **total** | **14,030** |
 
 - The 11,570 complete records hold all 35,727 mips (2.91 GiB decompressed).
@@ -303,19 +311,21 @@ chunk size, which includes tile padding.
 | compact skips that become complete | 11,570 | 35,727 | 2.91 GiB |
 | **newly complete** | **206,661** | **1,100,865** | **4.59 GiB** |
 
-The total export split before and after the layout rule:
+The total export split before and after the 2D compact and multi-slice layout rules (zlib/raw
+only; see `docs/textures_arrays.md` for the +690 complete / +4 partial multi-slice breakdown):
 
-| | Before | After | Change |
-|---|---:|---:|---:|
-| complete chain | 98,603 | 305,264 | +206,661 |
-| partial | 210,292 | 16,419 | −193,873 |
-| skipped | 48,220 | 35,432 | −12,788 |
-| **total** | **357,115** | **357,115** | |
+| | Before | After 2D compact | After + multi-slice | Change |
+|---|---:|---:|---:|---:|
+| complete chain | 98,603 | 305,264 | 305,954 | +207,351 |
+| partial | 210,292 | 16,419 | 16,423 | −193,869 |
+| skipped | 48,220 | 35,432 | 34,738 | −13,482 |
+| **total** | **357,115** | **357,115** | **357,115** | |
 
-The 35,432 remaining skips are exactly 33,507 BCPack + 1,223 compact all-BCPack + 19 compact
-unknown-size + 678 arrays/volumes + 5 DXGI 11. The 16,419 partials are 1,166 compact records
-that still miss BCPack mips, 14,035 other partials, and the 1,218 compact records converted
-from a skip to a partial export. Nothing here decodes BCPack.
+The 34,738 remaining zlib/raw skips are exactly 33,507 2D reader BCPack + 1,223 compact
+all-BCPack + 3 array all-BCPack + 5 DXGI 11 (**0** layout skips). The 16,423 partials are
+1,166 compact records that still miss BCPack mips, 14,035 other partials, 1,218 compact
+records converted from a skip to a partial export, and 4 partial 2D arrays. Nothing in this
+section decodes BCPack.
 
 ## What BCPack is
 
@@ -700,9 +710,9 @@ referencing an unconfirmed or unknown built-in history entry raises
 
 ### 5. Validation on the 57-pool corpus
 
-- **Full-corpus projection (`tools/ttpf_mips.py scan` across all 57 pools):**
-  - Baseline (layout rule, zlib/raw only): **305,264** complete, **16,419** partial, **35,432** skipped.
-  - With BCPack BC1/BC3/BC4/BC5: **353,146** complete (**+47,882**, 98.9% of catalog entries), **2,515** partial, **1,454** skipped (702 non-BCPack + 752 remaining BC6H/BC7).
+- **Full-corpus projection (`tools/ttpf_mips.py scan` across all 57 pools, including multi-slice layouts in `docs/textures_arrays.md`):**
+  - Baseline (2D compact + multi-slice layout rules, zlib/raw only): **305,954** complete, **16,423** partial, **34,738** skipped (33,507 2D BCPack + 1,223 compact BCPack + 3 array BCPack + 5 DXGI 11; 0 layout skips).
+  - With BCPack BC1/BC3/BC4/BC5: **353,840** complete (**+47,886**, **99.08%** of catalog entries), **2,518** partial, **757** skipped (5 DXGI 11 + 752 remaining BC6H/BC7; 0 layout skips and 0 multi-slice skips).
 - **Previously skipped examples above (`tools/ttpf_mips.py check`, strict mode):**
   - `graphics/ttdb_graphics.ttpf` #309 (128×128 BC1, 8 mips): **pass** (`max_error = 0.67`, `tail_origin_control = 102.3`).
   - `ui/ttdb_ui.ttpf` #0 (512×512 BC1, 1 mip): **pass**.
@@ -722,17 +732,20 @@ referencing an unconfirmed or unknown built-in history entry raises
 3. **Decode BC6H/BC7 in `tools/ttpf_mips.py` `check`.** `tools/ttpf_mips.py` currently
    decodes BC1/3/4/5 pixels for the downsample check; adding BC6H/BC7 pixel decoders extends
    chain-error validation to those two formats.
-4. **Identify DXGI 156/199/211/226 (19 records) and validate uncompressed tiling (formats
-   11, 28, 49, 56).** These are the remaining non-BCPack blockers besides arrays.
-5. **Arrays/volumes: 678 descriptors.** 567 use tile modes 9–12 and 111 are 2-slice; no
-   validated slice layout exists yet.
-5. **Do not fake a BCPack decoder.** The current fallback (export the largest lower mip that
+4. **Add DXGI 11 (`R16G16B16A16_UNORM`, 5 records) and validate 2D uncompressed tiling (formats
+   11, 28, 49, 56).** The 19 records formerly listed as DXGI 156/199/211/226 are resolved as
+   two-slice 2D arrays (`docs/textures_arrays.md`).
+5. **Port multi-slice layouts to C# `TtpfReader`.** All 697 multi-slice descriptors (127 2D
+   arrays, 567 cubemaps, and 3 3D volumes) are now validated and exported in
+   `tools/tex_headers.py` and `tools/ttpf_mips.py` (`docs/textures_arrays.md`); upstream C#
+   `TtpfReader` parity has landed upstream in `breadbbbb/rpf9-explorer` PRs #5 and #6 (pending a submodule pin update).
+6. **Do not fake a BCPack decoder.** The current fallback (export the largest lower mip that
    is zlib/raw) is used by 5,845 textures and should stay. The public BC1 candidate is not
    adopted: it is mip-consistent on 40/200 chunks, not byte-exact, and its window is
    unpublished. If a complete window/codebook and a plaintext check appear, add the decoder
    behind `TtpfReader.DecodeChunk`; the container already carries the mode (codec id) and
    decoded size, so no index work is needed.
-6. **If someone resumes the BCPack reverse engineering,** use the hard check the SixNG notes
+7. **If someone resumes the BCPack reverse engineering,** use the hard check the SixNG notes
    propose: every lane must consume exactly its byte budget and finish at the rANS lower
    bound, with a fixed symbol count. The entropy half now passes 200/200 chunks; the pixel
    half still needs reference blocks, and none are public.
