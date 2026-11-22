@@ -7,6 +7,7 @@ Usage:
 """
 import argparse
 import json
+import math
 import os
 import re
 import shutil
@@ -290,8 +291,17 @@ def check_pixel_const(raw_path: str, want: tuple[int, int, int, int]) -> tuple[b
     return True, "4096/4096 pixels exact"
 
 
+def frame_problem(px) -> str:
+    """Why a 64x64 frame can't be judged: a short frame or a NaN passes every tolerance test (check.py rejects both)."""
+    if len(px) != 64 * 64:
+        return f"expected 4096 pixels, got {len(px)}"
+    return "" if all(math.isfinite(v) for p in px for v in p) else "non-finite values in the frame"
+
+
 def check_bary(raw_path: str) -> tuple[bool, str]:
     px = read_raw_rgba32f(raw_path)
+    if problem := frame_problem(px):
+        return False, problem
     bad = 0
     first = ""
     for i, (ax, ay, bi, bj) in enumerate(px):
@@ -346,6 +356,8 @@ def check_flat(raw_path: str) -> tuple[bool, str]:
 def check_wqm(raw_path: str) -> tuple[bool, str]:
     """ps_wqm.asm: per pixel (wqm, own, wqm, own); wqm iff x%4 < 2 and y%4 >= 2, own iff x%4 == 1 and y%4 == 2."""
     px = read_raw_u32(raw_path)
+    if problem := frame_problem(px):
+        return False, problem
     w = int(len(px) ** 0.5)
     wrong = sum(tuple(p) != (a, b, a, b)
                 for i, p in enumerate(px)
@@ -394,6 +406,8 @@ def check_uniform_branch(raw_path: str) -> tuple[bool, str]:
 
 def check_grad(raw_path: str, want_b: float, want_a: float) -> tuple[bool, str]:
     px = read_raw_rgba32f(raw_path)
+    if problem := frame_problem(px):
+        return False, problem
     bad = 0
     first = ""
     for i, (r, g, b, a) in enumerate(px):
