@@ -393,13 +393,17 @@ def xwin_dir() -> "str | None":
     return d if os.path.isdir(os.path.join(d, "VC", "Tools", "MSVC")) and sdk else None
 
 
+CROSS_SUFFIXES = ("", *(f"-{n}" for n in range(40, 18, -1)))
+
+
 def cross_tool_suffix() -> "str | None":
-    """"" for the unversioned LLVM tools, "-N" for the newest full set named like clang-cl-21, else None."""
-    if all(shutil.which(t) for t in CROSS_TOOLS):
-        return ""
-    for n in range(40, 18, -1):
-        if all(shutil.which(f"{t}-{n}") for t in CROSS_TOOLS):
-            return f"-{n}"
+    """"" for the plain LLVM tool names, "-N" for a set named like clang-cl-21: the first complete set whose
+    clang-cl is 19 or newer, plain names first. None if there is none."""
+    for suffix in CROSS_SUFFIXES:
+        if all(shutil.which(t + suffix) for t in CROSS_TOOLS):
+            major = clang_cl_major("clang-cl" + suffix)
+            if major is None or major >= 19:
+                return suffix
     return None
 
 
@@ -407,17 +411,19 @@ def cross_build_dir() -> str:
     return os.path.join(ROOT, "runtime", "build", "windows")
 
 
-def cached_cross_compiler() -> "str | None":
-    """The compiler an existing runtime/build/windows was configured with, if it is still there."""
-    try:
-        with open(os.path.join(cross_build_dir(), "CMakeCache.txt"), encoding="utf-8", errors="replace") as f:
-            for line in f:
-                if line.startswith("CMAKE_CXX_COMPILER:"):
-                    path = line.split("=", 1)[1].strip()
-                    return path if os.path.isfile(path) else None
-    except OSError:
-        pass
-    return None
+def configured_cross_tools() -> dict:
+    """The LLVM tools an existing runtime/build/windows was configured with, from CMake's compiler files."""
+    found = {}
+    pattern = os.path.join(glob.escape(cross_build_dir()), "CMakeFiles", "*", "CMake*Compiler.cmake")
+    for path in sorted(glob.glob(pattern), key=os.path.getmtime):
+        try:
+            with open(path, encoding="utf-8", errors="replace") as f:
+                text = f.read()
+        except OSError:
+            continue
+        for m in re.finditer(r'^set\((CMAKE_(?:CXX_COMPILER|LINKER|AR|MT|RC_COMPILER)) "([^"]+)"\)', text, re.M):
+            found[m.group(1)] = m.group(2)
+    return found
 
 
 def clang_cl_major(exe: str = "clang-cl") -> "int | None":
@@ -434,16 +440,21 @@ def cross_build_missing() -> list:
     missing = []
     if not shutil.which("cmake"):
         missing.append("CMake 3.24 or newer")
-    cached = cached_cross_compiler()
-    suffix = None if cached else cross_tool_suffix()
-    if suffix is None and not cached:
-        absent = [t for t in CROSS_TOOLS if not shutil.which(t)]
-        missing.append(f"{', '.join(absent)}: LLVM 19 or newer (clang, lld and llvm), by these names or all five "
-                       "with one version suffix such as clang-cl-21")
-    elif suffix is not None:
-        major = clang_cl_major(f"clang-cl{suffix}")
-        if major is not None and major < 19:
+    configured = configured_cross_tools()
+    if configured:
+        gone = sorted({t for t in configured.values() if not shutil.which(t)})
+        if gone:
+            missing.append(f"{', '.join(gone)}, which runtime/build/windows was configured with: put it back on "
+                           "PATH, or delete runtime/build/windows to configure it with the tools on PATH now")
+    elif cross_tool_suffix() is None:
+        major = clang_cl_major() if all(shutil.which(t) for t in CROSS_TOOLS) else None
+        partial = next((s for s in CROSS_SUFFIXES[1:] if shutil.which("clang-cl" + s)), "")
+        absent = [t + partial for t in CROSS_TOOLS if not shutil.which(t + partial)]
+        if major is not None and not absent:
             missing.append(f"clang-cl 19 or newer (this one is {major}; the MSVC STL from xwin rejects older Clang)")
+        else:
+            missing.append(f"{', '.join(absent)}: LLVM 19 or newer (clang, lld and llvm), all five by their plain "
+                           "names or with one version suffix such as clang-cl-21")
     if not xwin_dir():
         missing.append("an xwin splat made with `xwin splat --use-winsysroot-style --preserve-ms-arch-notation` "
                        "(VC/Tools/MSVC and Windows Kits/10/Lib/<version>/um/x64) in XWIN_DIR or "
@@ -938,10 +949,10 @@ exec "${WINE:-wine}" "$here/gta6rt.exe" "$@"
 """
 
 
-def cmake_configure(build: str, *config: str, hint: str = "", first: tuple = ()) -> None:
-    """Configure runtime/ in build; the generator, build type and `first` apply only to a new build folder."""
+def cmake_configure(build: str, *config: str, hint: str = "") -> None:
+    """Configure runtime/ in build; the generator and build type are chosen only for a new build folder."""
     fresh = [] if os.path.isfile(os.path.join(build, "CMakeCache.txt")) else [
-        *(["-G", "Ninja"] if shutil.which("ninja") else []), "-DCMAKE_BUILD_TYPE=RelWithDebInfo", *first]
+        *(["-G", "Ninja"] if shutil.which("ninja") else []), "-DCMAKE_BUILD_TYPE=RelWithDebInfo"]
     run(["cmake", "-S", os.path.join(ROOT, "runtime"), "-B", build, *fresh, *config], hint=hint)
 
 
@@ -955,10 +966,10 @@ def cross_configure() -> str:
         fail("runtime: no xwin SDK in XWIN_DIR or ~/.local/share/xwin-sdk (docs/testing.md, "
              "\"The Windows runtime on Linux\"), and no --runtime-build.")
     build = cross_build_dir()
-    suffix = cross_tool_suffix() or ""
-    tools = tuple(f"-DCMAKE_{var}={name}{suffix}" for var, name in CROSS_VARS.items()) if suffix else ()
+    suffix = "" if configured_cross_tools() else cross_tool_suffix() or ""
+    tools = [f"-DCMAKE_{var}={name}{suffix}" for var, name in CROSS_VARS.items()] if suffix else []
     cmake_configure(build, "--toolchain", os.path.join(ROOT, "runtime", "cmake", "clang-cl-xwin.cmake"),
-                    f"-DXWIN_DIR={xwin}", first=tools, hint="CMake's error above says what the cross-build lacks "
+                    f"-DXWIN_DIR={xwin}", *tools, hint="CMake's error above says what the cross-build lacks "
                     "(docs/testing.md, \"The Windows runtime on Linux\"). Or pass --runtime-build, or drop "
                     "runtime from --stages (the default without it: check,shaders,assets,pipelines).")
     return build
