@@ -999,5 +999,187 @@ class TestIEEE754BitwiseBoundariesAndSubnormals(unittest.TestCase):
         self.assertFalse(is_f32_inf(res_max_norm))
 
 
+# ==============================================================================
+# Negative Controls, Syntax Rejection, and Parser Validation
+# ==============================================================================
+
+def parse_salu_co_ci_operand(token: str) -> SOP2Operand:
+    """Parse a single assembly operand token into a typed SOP2Operand."""
+    token = token.strip()
+    if not token:
+        raise ValueError("Operand token cannot be empty")
+
+    if token.startswith("s") and token[1:].isdigit():
+        idx = int(token[1:])
+        return SGPROperand(idx)
+
+    if token.startswith("0x") or token.startswith("0X"):
+        val = int(token, 16)
+        return LiteralU32(val)
+
+    try:
+        val = int(token)
+        if -16 <= val <= 64:
+            return InlineConstant(val)
+        return LiteralU32(val)
+    except ValueError:
+        pass
+
+    raise ValueError(f"Unrecognized operand syntax: '{token}'")
+
+
+def parse_salu_co_ci_instruction(asm_line: str) -> SAddSubbCoCiU32Instruction:
+    """Parse a SALU carry-in assembly instruction string into an AST node."""
+    line = asm_line.strip()
+    if not line:
+        raise ValueError("Empty instruction line")
+
+    parts = line.split(None, 1)
+    if len(parts) != 2:
+        raise ValueError(f"Invalid instruction format: '{asm_line}'")
+
+    op_str, args_str = parts
+    try:
+        opcode = SOPOpcode(op_str)
+    except ValueError:
+        raise ValueError(f"Unsupported opcode: '{op_str}'")
+
+    arg_tokens = [arg.strip() for arg in args_str.split(",")]
+    if len(arg_tokens) != 3:
+        raise ValueError(f"Expected 3 comma-separated operands, got {len(arg_tokens)}: '{args_str}'")
+
+    dst_token = arg_tokens[0]
+    if not (dst_token.startswith("s") and dst_token[1:].isdigit()):
+        raise TypeError(f"Destination must be an SGPR, got '{dst_token}'")
+    dst = SGPROperand(int(dst_token[1:]))
+
+    src0 = parse_salu_co_ci_operand(arg_tokens[1])
+    src1 = parse_salu_co_ci_operand(arg_tokens[2])
+
+    return SAddSubbCoCiU32Instruction(opcode=opcode, dst=dst, src0=src0, src1=src1)
+
+
+class TestNegativeControlsAndSyntaxRejection(unittest.TestCase):
+    """Verification that invalid opcodes, illegal syntax, and malformed inputs are rejected."""
+
+    def test_parser_valid_instructions(self) -> None:
+        instr1 = parse_salu_co_ci_instruction("s_addc_u32 s0, s1, s2")
+        self.assertEqual(instr1.opcode, SOPOpcode.S_ADDC_U32)
+        self.assertEqual(instr1.dst, SGPROperand(0))
+        self.assertEqual(instr1.src0, SGPROperand(1))
+        self.assertEqual(instr1.src1, SGPROperand(2))
+
+        instr2 = parse_salu_co_ci_instruction("s_subb_u32 s10, s20, 0x1234")
+        self.assertEqual(instr2.opcode, SOPOpcode.S_SUBB_U32)
+        self.assertEqual(instr2.dst, SGPROperand(10))
+        self.assertEqual(instr2.src0, SGPROperand(20))
+        self.assertEqual(instr2.src1, LiteralU32(0x1234))
+
+    def test_parser_unsupported_opcodes(self) -> None:
+        invalid_opcodes = [
+            "v_addc_u32 s0, s1, s2",
+            "s_mul_u32 s0, s1, s2",
+            "s_invalid_op s0, s1, s2",
+        ]
+        for line in invalid_opcodes:
+            with self.subTest(line=line):
+                with self.assertRaises(ValueError):
+                    parse_salu_co_ci_instruction(line)
+
+    def test_parser_invalid_operands_and_vgpr_rejection(self) -> None:
+        with self.assertRaises(ValueError):
+            parse_salu_co_ci_instruction("s_addc_u32 s0, v1, s2")
+        with self.assertRaises(ValueError):
+            parse_salu_co_ci_instruction("s_addc_u32 s0, s1, v2")
+        with self.assertRaises(TypeError):
+            parse_salu_co_ci_instruction("s_addc_u32 v0, s1, s2")
+        with self.assertRaises(TypeError):
+            parse_salu_co_ci_instruction("s_addc_u32 42, s1, s2")
+
+    def test_parser_sgpr_out_of_bounds(self) -> None:
+        with self.assertRaises(ValueError):
+            parse_salu_co_ci_instruction("s_addc_u32 s256, s0, s1")
+        with self.assertRaises(ValueError):
+            parse_salu_co_ci_instruction("s_addc_u32 s0, s500, s1")
+
+    def test_parser_multiple_literals_rejection(self) -> None:
+        with self.assertRaises(ValueError):
+            parse_salu_co_ci_instruction("s_addc_u32 s0, 0x1000, 0x2000")
+
+
+# ==============================================================================
+# Mutation Detection Engine
+# ==============================================================================
+
+class TestMutationDetectionEngine(unittest.TestCase):
+    """Mutation testing: verifies that all intentional mutants are killed by test vectors."""
+
+    def test_mutant_addc_sub_killed(self) -> None:
+        # Mutant: swaps addition with subtraction
+        def mutant(s0: int, s1: int, cin: int) -> Tuple[int, int]:
+            return (s0 - s1 - cin) & MASK_U32, 1 if s0 < (s1 + cin) else 0
+
+        gold = oracle_s_addc_u32(10, 5, cin=1)
+        mut = mutant(10, 5, cin=1)
+        self.assertNotEqual(gold, mut)
+
+    def test_mutant_addc_ignore_cin_killed(self) -> None:
+        # Mutant: ignores carry-in
+        def mutant(s0: int, s1: int, cin: int) -> Tuple[int, int]:
+            raw = s0 + s1
+            return raw & MASK_U32, 1 if raw >= MODULO_U32 else 0
+
+        gold = oracle_s_addc_u32(10, 5, cin=1)
+        mut = mutant(10, 5, cin=1)
+        self.assertEqual(gold[0], 16)
+        self.assertEqual(mut[0], 15)
+        self.assertNotEqual(gold, mut)
+
+    def test_mutant_addc_off_by_one_carry_killed(self) -> None:
+        # Mutant: carry only when > MODULO_U32
+        def mutant(s0: int, s1: int, cin: int) -> Tuple[int, int]:
+            raw = s0 + s1 + cin
+            return raw & MASK_U32, 1 if raw > MODULO_U32 else 0
+
+        gold = oracle_s_addc_u32(MAX_U32, 0, cin=1)
+        mut = mutant(MAX_U32, 0, cin=1)
+        self.assertEqual(gold[1], 1)
+        self.assertEqual(mut[1], 0)
+        self.assertNotEqual(gold, mut)
+
+    def test_mutant_subb_ignore_bin_killed(self) -> None:
+        # Mutant: ignores borrow-in
+        def mutant(s0: int, s1: int, bin_val: int) -> Tuple[int, int]:
+            raw = s0 - s1
+            return raw & MASK_U32, 1 if s0 < s1 else 0
+
+        gold = oracle_s_subb_u32(10, 5, bin_val=1)
+        mut = mutant(10, 5, bin_val=1)
+        self.assertEqual(gold[0], 4)
+        self.assertEqual(mut[0], 5)
+        self.assertNotEqual(gold, mut)
+
+    def test_mutant_subb_borrow_condition_missing_bin_killed(self) -> None:
+        # Mutant: borrow check fails to include borrow-in
+        def mutant(s0: int, s1: int, bin_val: int) -> Tuple[int, int]:
+            raw = s0 - s1 - bin_val
+            return raw & MASK_U32, 1 if s0 < s1 else 0
+
+        # When s0 == s1 and bin == 1, borrow SHOULD occur (s0 < s1 + 1)
+        gold = oracle_s_subb_u32(5, 5, bin_val=1)
+        mut = mutant(5, 5, bin_val=1)
+        self.assertEqual(gold[1], 1)
+        self.assertEqual(mut[1], 0)
+        self.assertNotEqual(gold, mut)
+
+    def test_mutant_truncate_31bit_killed(self) -> None:
+        def mutant(s0: int, s1: int, cin: int) -> Tuple[int, int]:
+            return (s0 + s1 + cin) & 0x7FFF_FFFF, 0
+
+        gold = oracle_s_addc_u32(0x8000_0000, 0, cin=0)
+        mut = mutant(0x8000_0000, 0, cin=0)
+        self.assertNotEqual(gold, mut)
+
+
 if __name__ == "__main__":
     unittest.main()
