@@ -112,6 +112,8 @@ public:
     bool debug_utils = false;          // VK_EXT_debug_utils is enabled on the instance
     // The subgroup sizes of the device, with subgroupSizeControl and computeFullSubgroups enabled where it has them.
     leonida::SubgroupSizeCaps subgroup;
+    bool custom_border_color = false;  // VK_EXT_custom_border_color and customBorderColors enabled
+    bool custom_border_color_without_format = false;
 
     Device() = default;
     Device(const Device&) = delete;
@@ -451,6 +453,23 @@ public:
         enable.pipelineStatisticsQuery = features.features.pipelineStatisticsQuery;
         occlusion_query_precise = features.features.occlusionQueryPrecise == VK_TRUE;
         pipeline_statistics_query = features.features.pipelineStatisticsQuery == VK_TRUE;
+
+        // VK_EXT_custom_border_color where the device has it.
+        VkPhysicalDeviceCustomBorderColorFeaturesEXT custom_border{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_FEATURES_EXT};
+        for (const auto& extension : extensions) {
+            if (std::strcmp(extension.extensionName, VK_EXT_CUSTOM_BORDER_COLOR_EXTENSION_NAME) != 0) continue;
+            VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &custom_border};
+            instance_fn<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2")(physical, &query);
+            custom_border_color = custom_border.customBorderColors == VK_TRUE;
+            custom_border_color_without_format = custom_border.customBorderColorWithoutFormat == VK_TRUE;
+        }
+        const char* custom_border_color_name = VK_EXT_CUSTOM_BORDER_COLOR_EXTENSION_NAME;
+        if (custom_border_color) {
+            custom_border.pNext = enable13.pNext;
+            enable13.pNext = &custom_border;
+        }
+
         VkDeviceCreateInfo device_info{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &enable12};
         device_info.queueCreateInfoCount = 1;
         device_info.pQueueCreateInfos = &queue_info;
@@ -489,6 +508,7 @@ public:
 #ifdef VK_KHR_SHADER_FMA_EXTENSION_NAME
         if (shader_fma) device_extensions.push_back(VK_KHR_SHADER_FMA_EXTENSION_NAME);
 #endif
+        if (custom_border_color) device_extensions.push_back(custom_border_color_name);
         device_info.enabledExtensionCount = std::uint32_t(device_extensions.size());
         device_info.ppEnabledExtensionNames = device_extensions.data();
         result = instance_fn<PFN_vkCreateDevice>("vkCreateDevice")(physical, &device_info, nullptr, &device);
