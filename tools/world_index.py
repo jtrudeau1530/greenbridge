@@ -22,7 +22,7 @@ stored rotation, scales and LOD fields), the placement input of ``world_build.py
 derived from your own copy of the game: keep the file in your local work folder.
 
 For a 76 GB archive, bound the run with --start/--limit. Coverage and the scanned window are written to the
-JSON summary.
+JSON summary. Place reports outside a directory input if you want to overwrite them on a later run.
 """
 import argparse
 import csv
@@ -390,33 +390,39 @@ def scan_rpf(path, start=None, limit=None, max_inflate=CAP, collect=None):
                       "scan_end": end, "scanned_bytes": scanned, "streams": streams}
 
 
-def scan_path(path, start=None, limit=None, max_inflate=CAP, collect=None):
+def _directory_files(path):
+    for root, _, files in os.walk(path):
+        for name in sorted(files):
+            yield os.path.join(root, name)
+
+
+def scan_path(path, start=None, limit=None, max_inflate=CAP, collect=None, *, directory_files=None):
     """Scan an RPF9 archive, or every carved file in a directory."""
-    if os.path.isdir(path):
+    if directory_files is not None or os.path.isdir(path):
         rows, stats = [], {"path": os.path.abspath(path), "files": 0, "scanned_bytes": 0}
-        for root, _, files in os.walk(path):
-            for name in sorted(files):
-                p = os.path.join(root, name)
-                with open(p, "rb") as f:
-                    head = f.read(4)
-                if head == b"9FPR":
-                    more, sub = scan_rpf(p, start, limit, max_inflate, collect)
-                    rows.extend(more)
-                    stats["files"] += 1
-                    stats["scanned_bytes"] += sub["scanned_bytes"]
-                    continue
-                if os.path.getsize(p) > max_inflate:
-                    continue
-                with open(p, "rb") as f:
-                    b = f.read(max_inflate + 1)
-                row = parse_resource(b, collect)
+        if directory_files is None:
+            directory_files = _directory_files(path)
+        for p in directory_files:
+            with open(p, "rb") as f:
+                head = f.read(4)
+            if head == b"9FPR":
+                more, sub = scan_rpf(p, start, limit, max_inflate, collect)
+                rows.extend(more)
                 stats["files"] += 1
-                stats["scanned_bytes"] += len(b)
-                if row is not None:
-                    row["offset"] = 0
-                    row["size"] = len(b)
-                    row["file"] = os.path.relpath(p, path).replace("\\", "/")
-                    rows.append(row)
+                stats["scanned_bytes"] += sub["scanned_bytes"]
+                continue
+            if os.path.getsize(p) > max_inflate:
+                continue
+            with open(p, "rb") as f:
+                b = f.read(max_inflate + 1)
+            row = parse_resource(b, collect)
+            stats["files"] += 1
+            stats["scanned_bytes"] += len(b)
+            if row is not None:
+                row["offset"] = 0
+                row["size"] = len(b)
+                row["file"] = os.path.relpath(p, path).replace("\\", "/")
+                rows.append(row)
         return rows, stats
     with open(path, "rb") as f:
         magic = f.read(4)
@@ -512,6 +518,43 @@ def _count(minimum):
     return parse
 
 
+def _file_identity(path):
+    try:
+        stat = os.stat(path)
+    except (FileNotFoundError, NotADirectoryError):
+        return None
+    return stat.st_dev, stat.st_ino
+
+
+def _check_report_paths(parser, reports, source, directory_files):
+    existing, pending = {}, {}
+    for flag, path in reports:
+        if not path:
+            continue
+        key = _file_identity(path)
+        if key is None:
+            key = os.path.normcase(os.path.realpath(path))
+            destinations = pending
+        else:
+            destinations = existing
+        if other := destinations.get(key):
+            parser.error(f"{other} and {flag} must use different paths")
+        destinations[key] = flag
+
+    source_id = _file_identity(source)
+    if source_id is None:
+        flag = pending.get(os.path.normcase(os.path.realpath(source)))
+    else:
+        flag = existing.get(source_id)
+    if flag:
+        parser.error(f"{flag} would overwrite the input {source}")
+
+    if existing and directory_files is not None:
+        for path in directory_files:
+            if flag := existing.get(_file_identity(path)):
+                parser.error(f"{flag} would overwrite the input {path}")
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("path", help="RPF9 archive, one carved file, or a directory of carved files")
@@ -527,15 +570,20 @@ def main(argv=None):
     ap.add_argument("--entities-out",
                     help="also write one JSON line per complete entity (world_build --placements input; local only)")
     a = ap.parse_args(argv)
+    reports = (("--out", a.out), ("--csv", a.csv), ("--archetypes-out", a.archetypes_out),
+               ("--entities-out", a.entities_out))
     agg = ArchetypeCounts() if a.archetypes_out else None
     ent_handle = ent = None
-    if a.entities_out:
-        os.makedirs(os.path.dirname(os.path.abspath(a.entities_out)), exist_ok=True)
-        ent_handle = open(a.entities_out, "w", encoding="utf-8", newline="\n")
-        ent = EntityRows(ent_handle)
     try:
+        # Check the same inputs the directory scan will read, before the streaming report exists.
+        directory_files = list(_directory_files(a.path)) if os.path.isdir(a.path) else None
+        _check_report_paths(ap, reports, a.path, directory_files)
+        if a.entities_out:
+            os.makedirs(os.path.dirname(os.path.abspath(a.entities_out)), exist_ok=True)
+            ent_handle = open(a.entities_out, "w", encoding="utf-8", newline="\n")
+            ent = EntityRows(ent_handle)
         sink = _Both(agg, ent) if agg is not None and ent is not None else (agg if agg is not None else ent)
-        rows, stats = scan_path(a.path, a.start, a.limit, a.max_inflate, sink)
+        rows, stats = scan_path(a.path, a.start, a.limit, a.max_inflate, sink, directory_files=directory_files)
     except (OSError, ValueError) as e:      # a missing path or --start outside an archive's data area
         print(f"ERROR: {e}", file=sys.stderr)
         if ent_handle is not None:
