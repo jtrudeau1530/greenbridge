@@ -144,6 +144,22 @@ python -I tools/salu_diff.py --branches --programs 2000 --seed 1
 python -I tests/test_salu_diff.py
 ```
 
+The `_sdwa` VALU forms have one too, `tools/sdwa_diff.py`: a separate reference for 92 VOP1/VOP2/VOPC opcodes in an
+integer and an f16 family (source selects, `sext()`, `dst_sel` with `dst_unused` PAD/SEXT/PRESERVE, SGPR and
+inline-constant sources, `clamp`, f16 neg/abs), seeded one-lane programs that chain through v1..v7 and VCC, the same
+interpreter, shrinking and exit codes as `salu_diff.py`. Forms where the translator is known to differ
+(`KNOWN_DIVERGENCES` in its docstring, which also lists what is modelled and skipped) are left out unless `--known`.
+`--oracle hw` runs the programs on an RDNA1/RDNA2 GPU only (GFX11 has no SDWA); every rule of the reference was
+checked that way on an RDNA2 iGPU (gfx1036), including two that differ from the non-SDWA forms: a 16-bit result
+with `dst_sel:DWORD` zeroes the high half, and a float inline constant in an f16 op is narrowed by `src_sel` as the
+f16 value.
+
+```
+python -I tools/sdwa_diff.py --programs 2000 --seed 1
+python -I tools/sdwa_diff.py --oracle hw --programs 500 --seed 1
+python -I tests/test_sdwa_diff.py
+```
+
 ### Hardware oracle (optional)
 
 `--oracle hw` also runs the same programs natively on an AMD GPU and compares the hardware's three SGPRs and SCC
