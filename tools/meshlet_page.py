@@ -26,10 +26,11 @@ Meshlet group (first u32 has bit 31 set):
                  meshlet's bounding-sphere radius around the w2/w3 centre, as an f16 (measured on `42 40` geometry)
          u32 w1: low u16 = first vertex reference, high u16 = first triangle (running sums)
          u32 w2, w3: bits 0-11 and 12-23 of w2 and bits 0-11 of w3 are the meshlet's centre in x, y and z as
-                     12-bit steps of 1/16 m around 2047, (field - 2047) / 16 (measured on `42 40` geometry; the
-                     default 0x007FF7FF / 0x7FF is the origin). w2 bits 24-31 (0 or 16) and w3 bits 14-30 are the
-                     normal cone: axis octahedral u = bits 14-19, v = bits 20-25 (x / 31.5 - 1), sin(half-angle) =
-                     (31 - bits 26-30) / 31; all zero = no cone. w2 bits 24-31 (0 or 16) are not decoded.
+                     12-bit steps around 2047, (field - 2047) * step (measured on `42 40` geometry; the default
+                     0x007FF7FF / 0x7FF is the origin). The step is 1/16 m, or 1/8 m when w2 bit 28 is set (large
+                     meshlets out to +-256 m; the other w2 bits 24-31 are 0). w3 bits 14-30 are the normal cone: axis
+                     octahedral u = bits 14-19, v = bits 20-25 (x / 31.5 - 1), sin(half-angle) = (31 - bits 26-30)
+                     / 31; all zero = no cone.
     then T u32 triangles: three 7-bit meshlet-local indices (bits 0-6, 7-13, 14-20), meshlet index in bits 21-31
     then V u16 vertex references into a vertex block
 
@@ -230,9 +231,15 @@ def face_agreement(positions, triangles):
     return out
 
 
+def centre_step(w2):
+    """Metres per step of a meshlet record's centre fields: 1/16, or 1/8 when w2 bit 28 is set."""
+    return 0.125 if (w2 >> 28) & 1 else 0.0625
+
+
 def meshlet_centre(w2, w3):
     """The centre stored in a meshlet record's words +8 and +12, in metres (see the module docstring)."""
-    return ((w2 & 0xFFF) - 2047) / 16, (((w2 >> 12) & 0xFFF) - 2047) / 16, ((w3 & 0xFFF) - 2047) / 16
+    step = centre_step(w2)
+    return ((w2 & 0xFFF) - 2047) * step, (((w2 >> 12) & 0xFFF) - 2047) * step, ((w3 & 0xFFF) - 2047) * step
 
 
 def meshlet_radius(w0):
@@ -290,14 +297,15 @@ def cone_agreement(data, group, positions):
 
 def centre_agreement(data, group, positions):
     """Compare each meshlet's stored centre with the centre of its vertices' box (axes whose difference rounds to 0
-    or to at most one 1/16 m step), and its stored radius with the farthest vertex from the stored centre (covers it,
-    covers it once the centre's rounding of at most sqrt(3)/32 m is allowed for, and is at most 1.25 times it plus
-    that rounding)."""
+    or to at most one step of 1/16 or 1/8 m), and its stored radius with the farthest vertex from the stored centre
+    (covers it, covers it once the centre's rounding of at most sqrt(3)/2 steps is allowed for, and is at most 1.25
+    times it plus that rounding)."""
     at, k = group["offset"], group["meshlets"]
     rec_at = at + 12
     refs_at = rec_at + 16 * k + 4 * group["triangles"]
     refs = struct.unpack_from(f"<{group['vertex_refs']}H", data, refs_at)
-    out = {"meshlets": k, "default_words": 0, "axes": 3 * k, "axes_exact": 0, "axes_within_step": 0,
+    out = {"meshlets": k, "default_words": 0, "coarse_steps": 0, "axes": 3 * k, "axes_exact": 0,
+           "axes_within_step": 0,
            "radius_covers": 0, "radius_covers_within_rounding": 0, "radius_tight": 0}
     for m in range(k):
         w0, w1, w2, w3 = struct.unpack_from("<4I", data, rec_at + 16 * m)
@@ -306,13 +314,14 @@ def centre_agreement(data, group, positions):
         pts = [positions[r] for r in refs[vb:vb + vc] if r < len(positions)]
         if len(pts) != vc:
             raise PageError("meshlet references a vertex past its block")
-        stored = meshlet_centre(w2, w3)
+        stored, size = meshlet_centre(w2, w3), centre_step(w2)
+        out["coarse_steps"] += size > 0.0625
         for i in range(3):
-            step = round(((min(p[i] for p in pts) + max(p[i] for p in pts)) / 2 - stored[i]) * 16)
+            step = round(((min(p[i] for p in pts) + max(p[i] for p in pts)) / 2 - stored[i]) / size)
             out["axes_exact"] += step == 0
             out["axes_within_step"] += abs(step) <= 1
         radius, far = meshlet_radius(w0), max(math.dist(p, stored) for p in pts)
-        slack = math.sqrt(3) / 32
+        slack = math.sqrt(3) / 2 * size
         out["radius_covers"] += radius >= far * (1 - 2 ** -11)
         out["radius_covers_within_rounding"] += radius + slack >= far
         out["radius_tight"] += radius <= 1.25 * far + slack
