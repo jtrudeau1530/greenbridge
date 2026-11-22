@@ -190,10 +190,10 @@ silhouette is geometry, not a painted-on atlas.
   `ambient_female` drawable; the Lucia and Mandy hits are props (photos, frames, luggage, a
   curtain). The only human-skeleton meshes in `levels.rpf` are the generic mannequin pair in
   **Bodies**.
-- **Bind pose and full skinning.** The delivered GLBs use identity inverse-bind matrices and do
-  not apply the 8-influence bone-palette skinning. Prior art places inverse bind matrices at the
-  skeleton header `+0x08`; that is not yet reproduced here, so the reference TRS remains the only
-  measured pose.
+- **Bind pose and skinning.** The delivered GLBs are static: they contain **0 skins, 0 `JOINTS_0`
+  and 0 `WEIGHTS_0`**, so there are no inverse-bind matrices to apply. The reference TRS is the
+  only exported pose, and the meshes are not skinned to the 596-bone ped skeleton. A rigged export
+  is still open; this is a data omission, not identity inverse-bind matrices.
 
 ## Reproduce
 
