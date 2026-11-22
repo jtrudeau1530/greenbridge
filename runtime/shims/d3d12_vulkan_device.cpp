@@ -131,6 +131,10 @@ Format vulkan_format(DXGI_FORMAT format, bool depth) {
     // Vulkan 1.3 requires sampling it (formerly VK_EXT_4444_formats).
     case DXGI_FORMAT_B4G4R4A4_UNORM: return {VK_FORMAT_A4R4G4B4_UNORM_PACK16, color};
     case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB: return {VK_FORMAT_B8G8R8A8_SRGB, color};
+    // The X byte has no channel of its own: the BGRA8 images hold it, and shader views read alpha as 1.
+    case DXGI_FORMAT_B8G8R8X8_TYPELESS: return {VK_FORMAT_B8G8R8A8_UNORM, color, true};
+    case DXGI_FORMAT_B8G8R8X8_UNORM: return {VK_FORMAT_B8G8R8A8_UNORM, color};
+    case DXGI_FORMAT_B8G8R8X8_UNORM_SRGB: return {VK_FORMAT_B8G8R8A8_SRGB, color};
     case DXGI_FORMAT_R16G16_TYPELESS: return {VK_FORMAT_R16G16_SFLOAT, color, true};
     case DXGI_FORMAT_R16G16_FLOAT: return {VK_FORMAT_R16G16_SFLOAT, color};
     case DXGI_FORMAT_R16G16_UINT: return {VK_FORMAT_R16G16_UINT, color};
@@ -225,6 +229,13 @@ bool rgb96_refused(const D3D12_RESOURCE_DESC& desc) {
                           D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL));
 }
 
+// B8G8R8X8: the BGRA8 Vulkan formats with the alpha byte unused. Its typeless family is a family of its own, so
+// views never cross between it and B8G8R8A8, although both land on the same VkFormat.
+bool alpha_unused(DXGI_FORMAT format) {
+    return format == DXGI_FORMAT_B8G8R8X8_TYPELESS || format == DXGI_FORMAT_B8G8R8X8_UNORM ||
+           format == DXGI_FORMAT_B8G8R8X8_UNORM_SRGB;
+}
+
 // The full mip chain's length for a texture this size.
 UINT16 full_mips(UINT64 width, UINT height, UINT depth) {
     UINT16 mips = 0;
@@ -284,7 +295,8 @@ struct TextureCreateInfo {
         info.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
         if (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) info.usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
         if (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) info.usage |= VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
-        if (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) {
+        // No B8G8R8X8 view is ever a UAV, so its typeless family needs no storage usage (not every GPU has it for BGRA8).
+        if ((desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) && !alpha_unused(desc.Format)) {
             info.usage |= VK_IMAGE_USAGE_STORAGE_BIT;
             if (!volume && info.samples == VK_SAMPLE_COUNT_1_BIT && attachment_usable)
                 info.usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
@@ -572,6 +584,13 @@ struct DeviceState {
         if (rgb96_refused(desc)) {
             if (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET)
                 log_once("96-bit (R32G32B32) render targets not supported; format", desc.Format);
+            return {};
+        }
+        // The host runtime refuses typed B8G8R8X8 with unordered access (its typeless family is accepted): the
+        // BGRA8 image could take storage writes, but D3D12 has no typed UAV for these formats.
+        if (alpha_unused(desc.Format) && desc.Format != DXGI_FORMAT_B8G8R8X8_TYPELESS &&
+            (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) {
+            log_once("B8G8R8X8 textures cannot allow unordered access; format", desc.Format);
             return {};
         }
         Format format = texture_storage_format(desc.Format, desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL);
@@ -2366,6 +2385,10 @@ bool image_descriptor(const Resource& resource, const TextureView& view, leonida
             log_once("incompatible typed A8 view format:", int(view.format));
             return false;
         }
+        if (alpha_unused(view.format) != alpha_unused(desc.Format)) {
+            log_once("view format from another typeless family (B8G8R8X8 and B8G8R8A8):", int(view.format));
+            return false;
+        }
         if ((view.format == DXGI_FORMAT_R9G9B9E5_SHAREDEXP) != (desc.Format == DXGI_FORMAT_R9G9B9E5_SHAREDEXP)) {
             log_once("incompatible R9G9B9E5 view format:", int(view.format));
             return false;
@@ -2433,9 +2456,11 @@ bool image_descriptor(const Resource& resource, const TextureView& view, leonida
     // D3D12's component mapping picks, for each of R, G, B, A, a channel of the format or a constant; the T#
     // says the same about the hardware's channels, which the format places.
     // A stencil view's format has its eight bits in G and no R, B or A of its own (0, 0, 1 when read).
+    // B8G8R8X8 has no alpha: it reads 1.
     g::Swizzle channels = g::format_swizzle(view_format);
     if (stencil) channels = {g::select_zero, g::select_x, g::select_zero, g::select_one};
     else if (desc.Format == DXGI_FORMAT_A8_UNORM) channels = {g::select_zero, g::select_zero, g::select_zero, g::select_x};
+    else if (alpha_unused(desc.Format)) channels[3] = g::select_one;
     for (UINT i = 0; i < 4; ++i) {
         const UINT from = D3D12_DECODE_SHADER_4_COMPONENT_MAPPING(i, view.mapping);
         if (msaa && from > D3D12_SHADER_COMPONENT_MAPPING_FORCE_VALUE_1) {
@@ -3601,6 +3626,11 @@ public:
                 return;
             }
         }
+        // B8G8R8X8 has no typed UAV, so no format of its family gives an unordered-access view.
+        if (alpha_unused(r->desc().Format) || alpha_unused(view.format)) {
+            log_once("unordered-access view of a B8G8R8X8 format; format", int(view.format));
+            return;
+        }
         write_image_descriptor(*r, view, destination, true);
     }
 
@@ -4426,8 +4456,9 @@ public:
             if (optimal & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT) {
                 s1 |= D3D12_FORMAT_SUPPORT1_DEPTH_STENCIL;
             }
-            if ((optimal & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) ||
-                (buffer & VK_FORMAT_FEATURE_STORAGE_TEXEL_BUFFER_BIT)) {
+            // B8G8R8X8 has no typed UAV in D3D12 (texture_format refuses it), whatever the BGRA8 image could do.
+            if (!alpha_unused(fs->Format) && ((optimal & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) ||
+                                              (buffer & VK_FORMAT_FEATURE_STORAGE_TEXEL_BUFFER_BIT))) {
                 s1 |= D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW;
                 // A typed UAV read is not a storage-image read: the translator reads the texture through its
                 // sampled binding with the T#'s numeric type (rdna2spirv.py image_read_typed), and a typed buffer
