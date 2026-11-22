@@ -14,7 +14,7 @@ import sys
 import tempfile
 import unittest
 import zlib
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -1089,6 +1089,37 @@ class SyntheticPoolTest(unittest.TestCase):
         # payload is exactly the concatenated block-linear chain
         linear = solid_chain(self.layout)
         self.assertEqual(data[148:], b"".join(linear[m["index"]] for m in self.layout["mips"]))
+
+    def test_export_requested_mip_prefix_with_unavailable_lower_mips(self) -> None:
+        layout = self.layout
+        linear = solid_chain(layout)
+        payload = bytearray(layout["size"])
+        for mip in layout["mips"]:
+            retile_to(layout, mip, linear[mip["index"]], payload)
+        top_start = layout["mips"][0]["offset"]
+        path = os.path.join(self.tmp.name, "partially-readable.ttpf")
+        record = pack_etpf_record(256, 256, 6, 1, 71, 1, 1, 4, 4096, meta=0x103)
+        write_rds5_pool(path, [record], [payload[:top_start], payload[top_start:]])
+        # Give the lower mip chunk an unsupported codec. The second chunk is still valid zlib.
+        with open(path, "r+b") as f:
+            f.seek(24)
+            entry, = struct.unpack("<Q", f.read(8))
+            f.seek(24)
+            f.write(struct.pack("<Q", (entry & ~(15 << 26)) | (15 << 26)))
+
+        out = os.path.join(self.tmp.name, "top.dds")
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(ttpf.main(["export", path, "0", out, "--mips", "1"]), 0)
+        with open(out, "rb") as f:
+            data = f.read()
+        self.assertEqual(struct.unpack_from("<I", data, 28), (1,))
+        self.assertTrue(data[148:] == linear[0], "DDS payload differs from the source top mip")
+
+        full = os.path.join(self.tmp.name, "full.dds")
+        with redirect_stderr(io.StringIO()) as err:
+            self.assertEqual(ttpf.main(["export", path, "0", full]), 2)
+        self.assertIn("not every requested mip uses a supported codec", err.getvalue())
+        self.assertFalse(os.path.exists(full))
 
     def test_scan_reports_the_whitelist_gate(self):
         # The synthetic tuple is validated, so it is not gated: the partial export is
