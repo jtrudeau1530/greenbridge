@@ -460,22 +460,34 @@ Results on a Radeon 880M (gfx1150, RDNA3.5, driver 26.11.2, AMD clang 23.0.0git)
 | seed 1, `--only` the twelve wave32 programs SHADER-105 names (1 18 20 23 24 26 29 30 32 33 34 38) | 12 | 0 |
 
 Negative control (1,000 extended programs): each of the 15 wrong models mismatches on 126 to 547 programs, none goes
-unnoticed. gfx1150 is RDNA3.5,
-not RDNA2: the match supports the model, and RDNA2 itself rests on the ISA text and the translator results on RDNA2
-cards.
+unnoticed. gfx1150 is RDNA3.5, not RDNA2; the RDNA2 runs follow.
+
+Results on the integrated Radeon of a Ryzen 7 9800X3D (gfx1036, RDNA2, AMD driver 32.0.13036.4, Windows HIP launcher,
+AMD clang 23.0.0git), `--oracle hw` on `main` `003e7812`:
+
+| Programs | Count (wave32 + wave64) | Mismatches |
+| --- | --- | --- |
+| default mix, seeds 1, 2, 3, 2,000 each | 12,000 | 0 |
+| `--extended`, seeds 1, 2, 3, 2,000 each (permute, masked swizzle, groups of 32 to 256) | 12,000 | 0 |
+
+`hyp_confirmed` (programs with a hypothesis op that matched) in the extended runs: 1158/1185, 1183/1177 and 1151/1189
+(wave32/wave64, seeds 1 to 3). So on RDNA2 too a masked `ds_swizzle_b32` whose source lane is off in EXEC reads 0,
+and `ds_permute_b32` follows the model. Negative control (extended, seed 1): each of the 15 wrong models mismatches,
+from 417 programs (`bpermute_inactive_reads`) to 1,123 (`write2_swapped`); none goes unnoticed.
 
 With `--oracle translator,hw` on the same Radeon 880M (Vulkan, subgroup 64), seed 1, 100 programs per run: the
 default mix matches the model on the translator, native and emulated (200/200 each). With `--extended` the
 translator differs from the hardware in 22 of 177 programs (native and emulated alike), all in a `ds_swizzle_b32`
 under an EXEC mask whose source lane is off: the translator hands the active lane the source lane's register, the
 hardware gives 0 (the swizzle hypothesis above). So the translator differs from gfx1150 for a masked
-`ds_swizzle_b32` with an off source lane; RDNA2 is unverified. Not fixed here. Partial-wave programs (`--threads` 32
+`ds_swizzle_b32` with an off source lane; the gfx1036 hardware runs above show RDNA2 gives 0 as well (SHADER-207). Not
+fixed here. Partial-wave programs (`--threads` 32
 in wave64) are skipped for the translator, which cannot launch them. NVIDIA was not run.
 
 **Other backends.** The Linux libdrm launcher of #1265 (`tools/hw_oracle/drm.py`) does not run these programs yet:
 it refuses a kernel with LDS and caps the output at 4096 words, and `lds_fuzz` turns that refusal into exit 77
-("unavailable"). RDNA2 results need LDS and a larger word count in that backend first. The numbers above are gfx1150
-only.
+("unavailable"). Linux RDNA2 results need LDS and a larger word count in that backend first; the gfx1036 numbers
+above come from the Windows HIP launcher.
 
 **Overlap with #789.** #789 adds `ds_permute_b32` to the default op mix of `lds_fuzz.py`; here it is opt-in
 (`--permute`) so that existing seeds keep their programs. Whichever lands second reconciles the two.
@@ -622,12 +634,25 @@ zero and denormal inputs (NaN payloads are compared as "any NaN", as in the tran
 longer `translator,hw` run was not done (the Vulkan side takes about half a minute per case on this machine).
 
 **RDNA3.5 is not RDNA2.** The gfx1150 T# and image unit are GFX11's; a match shows that the model is right for the
-texel fetch of these formats on that hardware, which is not the console's. The GFX10 words are built and assemble for
-gfx1030 (`tests/test_image_fuzz_hw.py`) but have not run on a GFX10 GPU. The Linux libdrm backend of #1265
+texel fetch of these formats on that hardware, which is not the console's. The GFX10 words have since run on RDNA2:
+
+Results on the integrated Radeon of a Ryzen 7 9800X3D (gfx1036, RDNA2, GFX10 T# layout, AMD driver 32.0.13036.4,
+Windows HIP launcher, AMD clang 23.0.0git), on `main` `003e7812`:
+
+| Run | Cases | Mismatches |
+| --- | --- | --- |
+| `--oracle hw`, seeds 1, 2, 3, 2,400 cases each (wave32 and wave64, all six formats, all 15 masks, 8 to 64 per side) | 7,200 | 0 |
+
+Negative control (`--oracle hw --programs 180 --seed 1 --negative-control`): the unperturbed model mismatches on 0 of
+180 cases; the seven wrong models are caught by the same counts as on gfx1150 (`unorm_256` 30, `swap_rb` 144,
+`sint_unsigned` 30, `alpha_zero` 16, `dmask_in_place` 132, `no_sentinels` 168, `transpose` 166), and a kernel built
+with the next format's `FORMAT` code is caught on every format (24 to 30 of 30 cases each). So the GFX10 T# words of
+`hw_oracle/tsharp.py` and the texel-fetch model hold on RDNA2 for these formats; `--oracle translator,hw` was not run
+there. The Linux libdrm backend of #1265
 (`tools/hw_oracle/drm.py`) was not tried: it copies only `.text` (the texture is in `.text`, so that works in
 principle, but it needs the loaded code to be 256-byte aligned, which the kernel checks and reports) and the LDS
-section above records a 4096-word output cap there, while a 64x64 case stores 16,384 words. Until that is measured
-on a GFX10 card, treat RDNA2 as unverified.
+section above records a 4096-word output cap there, while a 64x64 case stores 16,384 words. The RDNA2 results above
+are from the Windows HIP launcher only.
 
 ### 16-bit and memory ops on the GPU (`tools/valu_fuzz.py`, FUZZ-2, FUZZ-5)
 
