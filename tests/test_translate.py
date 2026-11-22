@@ -680,3 +680,16 @@ def test_wave64_emulate_reuses_a_mask_exchange(make_shader, monkeypatch):
         cmp + "v_mbcnt_lo_u32_b32 v3, s4, 0\nv_cmp_gt_u32_e64 s[6:7], 40, v1\ns_and_b32 s5, s5, s7\n"
         "v_mbcnt_hi_u32_b32 v3, s5, v3\n")
     assert (same, rewritten, same_exec, new_exec, pair, half) == (2, 4, 2, 4, 2, 4)
+
+
+def test_mesh_s3_wave_id_emits_local_index_shift_and_bfe(make_shader):
+    """Mesh shader prologue initializes s3[27:24] from LocalInvocationIndex >> 6 and s_bfe_u32 extracts it."""
+    path = os.path.join(ROOT, "runtime", "test", "shaders", "ms_wave_info_s3.asm")
+    with open(path, encoding="utf-8") as f:
+        shader = make_shader(f.read(), "ms_wave_info_s3", dxbc=SAMPLE_DXBC["ms_wave_info_s3"])
+    asm = shader.translate()
+    shader.validate(asm)
+    assert "%wave = OpShiftRightLogical %uint %lidx %c6" in asm
+    assert "%mwi = OpShiftLeftLogical %uint %wave %c18" in asm
+    assert "OpStore %s3p %mwi" in asm
+    assert "OpBitFieldUExtract %uint" in asm
