@@ -273,6 +273,27 @@ if(BUILD_TESTING)
     )
     add_test(NAME pe_loader COMMAND pe_loader_test "$<TARGET_FILE:tiny_dll>" "$<TARGET_FILE:tiny_exe>")
 
+    # Synthetic, hand-built images through Loader::load: range checks, wrapping RVAs, import-table termination and
+    # base relocations (HIGHLOW included). No fixture DLL is needed; the images are written to a temporary folder.
+    add_executable(test_pe_loader_bounds
+      test/test_pe_loader_bounds.cpp
+      src/pe_loader.cpp
+      shims/registry.cpp
+      shims/xmem.cpp
+      shims/d3d12_xs.cpp
+      shims/d3d12_xs_device.cpp
+    )
+    target_include_directories(test_pe_loader_bounds PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/src
+      ${CMAKE_CURRENT_SOURCE_DIR}/shims
+    )
+    target_compile_definitions(test_pe_loader_bounds PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(test_pe_loader_bounds PRIVATE /W4 /permissive- /utf-8)
+    target_link_options(test_pe_loader_bounds PRIVATE /OPT:NOREF)
+    target_link_libraries(test_pe_loader_bounds PRIVATE gta6rt_d3d12_xs_rootsig psapi)
+    add_dependencies(test_pe_loader_bounds gta6rt_tls_host)
+    add_test(NAME pe_loader_bounds COMMAND test_pe_loader_bounds)
+
     # Static TLS fixture: a DLL with __declspec(thread) and a TLS callback. It is ordinary test code; no game data
     # is involved. loader_tls_test needs gta6rt_tls_host.dll next to its own EXE, because that is where
     # Loader::initialize_tls looks for the reserved module TLS index.
