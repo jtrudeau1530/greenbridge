@@ -268,3 +268,17 @@ def test_main_writes_the_log_and_honours_limit(eq, tmp_path, monkeypatch, capsys
     monkeypatch.setattr(sys, "argv", ["tex_export.py", str(index), carve, str(out), "--limit", "1"])
     T.main()
     assert len(json.loads((out / "export_log.json").read_text(encoding="utf-8"))) == 1
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "x"])
+def test_main_rejects_a_limit_below_one(tmp_path, monkeypatch, capsys, value):
+    # --limit 0 exported every texture (0 read as "no limit") and -1 silently dropped the last one.
+    index = tmp_path / "textures_index.json"
+    index.write_text("[]", encoding="utf-8")
+    out = tmp_path / "out"
+    monkeypatch.setattr(sys, "argv", ["tex_export.py", str(index), str(tmp_path), str(out), "--limit", value])
+    with pytest.raises(SystemExit) as e:
+        T.main()
+    assert e.value.code == 2
+    assert "--limit" in capsys.readouterr().err
+    assert not out.exists()
