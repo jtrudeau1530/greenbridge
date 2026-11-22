@@ -409,6 +409,67 @@ bindings are reported as unresolved.
 python -I tools/meshlet_page.py <graphics-segment> --draw-system <system-segment> --drawable-offset <offset>
 ```
 
+**System-to-graphics model-page join (ASSET-157).** `tools/restofworld_model_join.py` joins model system pages to
+their owning graphics pages directly from an RPF9 archive or a carved stream directory without the encrypted TOC.
+The earlier 37-model figure came from `rpf9dump` at `48557ea`, before `pgDictionary<rmcDrawable>`, optional-pointer
+fragment and zero-radius drawable support (`e293917`; see [models.md](models.md)). Four in-band structural rules
+pair every model resource unambiguously:
+
+1. **Top-level framing and root header.** In an RPF9 data area, every top-level resource starts on a 4,096-byte
+   boundary plus `0x10` (`(offset & 0xFFF) == 0x10`) preceded by 16 zero bytes, with `u64@+0x00 == 0` and a
+   `0x50000000`-based system pointer at `+0x08` (`+0x10..+0x13 != "0DRP"`). Root headers separate into standalone
+   `rmcDrawable`, `fragType` (`fragment`), `pgDictionary<rmcDrawable>` (`drawable_dict`), standalone
+   `pgDictionary<grcTexture>` (`140` in `core_restofworld.rpf`: `115` `1+1`, `25` `1+2`), and `44` other non-model
+   system resources.
+2. **In-band `datResourceMap` page counts.** At `page_map = u64@+0x08 - 0x50000000`, `u32@+0x00 == 0`,
+   `u32@+0x04 == 0`, `u8@+0x08 = system_pages`, `u8@+0x09 = graphics_pages`, `u16@+0x0A == 0`, and `u32@+0x0C == 0`,
+   followed at `+0x10` by `system_pages + graphics_pages` zero-initialised `u64` runtime page-base slots (`924 / 924`
+   in `core_restofworld.rpf`, `1 / 1` in `story000_restofworld.rpf`). When `system_pages > 1`, `page_map` lies in the
+   final system stream after concatenating preceding 64 KiB system streams.
+3. **Contiguous 16-byte-padded runs and 64 KiB blocking.** Each resource owns `system_pages` contiguous zlib streams
+   followed immediately by `graphics_pages` contiguous zlib streams, with `0..15` zero padding bytes at every
+   internal boundary (`924 / 924`). Every non-final system stream (`2 / 2`) and every non-final graphics stream
+   (`96 / 96`) inflates to an exact multiple of 64 KiB (`(size & 0xFFFF) == 0`); the trailing `graphics_pages == 2`
+   continuation stream ranges from `656` to `63,520` bytes.
+4. **Cross-page LOD, vertex-block and meshlet validation.** Across all four LOD slots (`+0x50..+0x68`) of every
+   drawable (`583` 1-LOD, `287` 2-LOD, `25` 3-LOD, `41` 4-LOD), `vb+0x18` (`0x60000000`-based) lands on a `0x42`
+   (`(8, 16)`) or `0x63` (`(12, 6)`) vertex block whose byte span covers `u32@(fvf+0x138) >> 10` vertices, and
+   `geo+0x40` lands on a meshlet index buffer whose cluster count (`countFlags & 0xFFFF` when bone-palette bit
+   `0x40000000` is set, else `countFlags & 0x7FFFFFFF`), 8-bit per-cluster triangle counts (`((packed >> 7) & 0xFF) + 1`),
+   running offsets, packed triangle indices and vertex references all match the system descriptor and reach into the
+   final declared graphics page (`924 / 924`).
+
+| `core_restofworld.rpf` model class | Resources | `1+1` | `1+2` | `2+2` | System streams | Graphics streams | Drawables | Primary-LOD tris | All-LOD tris |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| `drawable_dict` (`795` x 1 child, `1` x 13) | 796 | 740 | 56 | 0 | 796 | 852 | 808 | 743,663 | 1,158,313 |
+| Standalone `drawable` | 75 | 58 | 16 | 1 | 76 | 93 | 75 | 312,068 | 369,031 |
+| `fragment` | 53 | 30 | 22 | 1 | 54 | 75 | 53 | 183,865 | 301,456 |
+| **Total joined (`0` unjoined)** | **924** | **828** | **94** | **2** | **926** | **1,020** | **936** | **1,239,596** | **1,828,800** |
+
+The join accounts for both page populations in full:
+
+- **System pages (`926` streams, `924` name-bearing):** all `922` single-system-page resources carry their `.#dr`/`.#ft`
+  name strings in `sys_page0`, while the two `2+2` resources (`1` standalone drawable `[131,072, 3,728]` and `1`
+  fragment `[65,536, 9,680]`) hold root and geometry structures in a nameless 64 KiB-multiple `sys_page0` and place
+  their name strings and `datResourceMap` tails in `sys_page1` (`922 + 2 = 924` name-bearing zero-prefix pages;
+  `936` drawables = `883` `.#dr` + `53` `.#ft`, `849` bone-bound, `75` with an empty embedded texture dictionary).
+- **Graphics pages (`1,020` streams):** all `924` `gfx_page0` streams start with `42 40 00 00`, and the `96`
+  `gfx_page1` continuation streams split into `34` `42 40 00 00` starts plus `62` meshlet-led starts (`924 + 34 = 958`,
+  claiming **958 / 958** `42 40 00 00`-start streams in the archive). All **13 / 13** streams that reach a
+  `42 40 00 00` vertex block after earlier meshlet groups (`8` standalone drawables, `5` fragments) sit inside those
+  `62` meshlet-led `gfx_page1` continuations (`47` `gfx_page1` streams carry a pointed-to `42 40 00 00` block; `49`
+  hold meshlet groups only). Primary-LOD geometry totals (`1,177` geometries, `1,001,667` vertices, `1,239,596`
+  triangles) match [models.md](models.md) to the triangle; all LODs total `2,021` geometries and `1,598,782` vertices.
+- **Other rest-of-world archives:** `story000_restofworld.rpf` joins **1 / 1** model resource (`drawable_dict`, `1+1`,
+  `3` child drawables, `3` geometries, `1,808` vertices, `2,620` triangles, claiming **1 / 1** `42 40 00 00`-start
+  stream); `core_restofworld001.rpf` has `0` model candidates and `0` `42 40 00 00` streams.
+
+```powershell
+python -I tools/restofworld_model_join.py <archive.rpf> <work>\model_join.json
+python -I tools/restofworld_model_join.py <work>\carve\<name> <work>\model_join.csv
+python -I tests/test_restofworld_model_join.py -v
+```
+
 **Component types (full corpus).** `tools/vertex_types.py` (at `1aef69e`, with the running-sum fix to
 `group_edges`) was run over the seven archives that hold target blocks: `data`, `packs`, `levels`, `story000`,
 `core_restofworld`, `shared_minigame000` and `story000_restofworld`. It measures a block only when the
@@ -493,9 +554,11 @@ The only UI-adjacent evidence is content-manifest XML and text; there is no UI c
 5. A `PSIN` section walker for `LSCH`, `LENM`, `LSNS`, `LGID`, `LRSC` and `CHKS`. The chain is
    measured; `LSNS` is a block table and 16-byte records ([psin.md](psin.md#lsns)), not zlib. Do not call it
    bytecode without evidence.
-6. A model-page joiner. `rpf9dump` already exports 37 core models; the 924 name-bearing system pages
-   are the larger page population, but grouping them into complete resources needs the missing TOC or
-   a page-graph rule.
+6. Model-page joining is implemented in `tools/restofworld_model_join.py` (and `rpf9dump` at `e293917`):
+   the `+0x08` `datResourceMap` page counts, 64 KiB stream blocking and `0x60000000` buffer validation join
+   all 924 `core_restofworld` model resources (936 drawables across 926 system and 1,020 graphics streams)
+   and the single `story000_restofworld` drawable dictionary (3 drawables) without the TOC. Archive path
+   names and external texture-dictionary links still need the TOC or hash matching.
 7. A vertex decoder for `42 40 00 00` blocks. ASSET-57 measured recurring stream widths;
    decoding vertex values still requires component types, final-stream widths and a way to
    locate the owning geometry when only a graphics page is available. Texture identification also remains open:
