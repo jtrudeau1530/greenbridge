@@ -299,6 +299,9 @@ def rewrite(text):
 
 def main(argv):
     args = argv[1:]
+    if args and args[0] in ("-h", "--help"):
+        print("usage: spirv_gs_to_compute.py in.spv out.spv [--layout out.json]")
+        return 0
     lay_path = None
     if "--layout" in args:
         i = args.index("--layout")
