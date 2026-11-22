@@ -191,6 +191,11 @@ int main() {
     CHECK(layout(s::generic_read) == VK_IMAGE_LAYOUT_GENERAL);
 
     // Accesses and stages.
+    const auto cb = vulkan_access(s::vertex_and_constant_buffer, false);
+    CHECK(cb.access & VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT);
+    CHECK(cb.access & VK_ACCESS_UNIFORM_READ_BIT);
+    CHECK(cb.access & VK_ACCESS_SHADER_READ_BIT);  // root CBV loaded through a physical storage buffer
+    CHECK(cb.stages & VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT);
     const auto rt = vulkan_access(s::render_target, false);
     CHECK(rt.access == (VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT));
     CHECK(rt.stages == VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
@@ -304,6 +309,9 @@ int main() {
           (VK_PIPELINE_STAGE_2_COPY_BIT | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT));
     CHECK(vulkan_sync(y::raytracing) == VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);
     CHECK(vulkan_barrier_access(a::no_access) == VK_ACCESS_2_NONE);
+    const auto cb_scope = vulkan_barrier_scope(y::pixel_shading, a::constant_buffer);
+    CHECK(cb_scope.access == (VK_ACCESS_2_UNIFORM_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT));
+    CHECK(cb_scope.stages == VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT);
     CHECK(vulkan_barrier_access(a::common) == (VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT));
     CHECK(vulkan_barrier_access(a::copy_source | a::shader_resource) ==
           (VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_SHADER_READ_BIT));
