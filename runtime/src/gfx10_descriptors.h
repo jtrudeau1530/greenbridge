@@ -146,6 +146,10 @@ inline ImageWords encode(const Image& image) {
 // TYPE names an image, so these eight dwords are a T# and not a V# followed by something else.
 inline constexpr bool is_image(const ImageWords& words) { return detail::get(words[3], 28, 4) >= 8; }
 
+inline constexpr float image_min_lod(const ImageWords& words) {
+    return float(detail::get(words[1], 8, 12)) / 256.0f;
+}
+
 // False when the dwords are not an image descriptor, or a field contradicts another: a reserved DST_SEL, a last
 // level or layer before the first, or a cube whose layers are not whole cubes.
 inline bool decode(const ImageWords& words, Image& out) {
@@ -154,7 +158,7 @@ inline bool decode(const ImageWords& words, Image& out) {
     Image image{};
     image.type = ImageType(get(words[3], 28, 4));
     image.address = ((std::uint64_t(get(words[1], 0, 8)) << 32) | words[0]) << 8;
-    image.min_lod = float(get(words[1], 8, 12)) / 256.0f;
+    image.min_lod = image_min_lod(words);
     image.format = get(words[1], 20, 9);
     image.width = (get(words[1], 30, 2) | (get(words[2], 0, 12) << 2)) + 1;
     image.height = get(words[2], 14, 14) + 1;

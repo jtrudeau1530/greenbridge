@@ -208,6 +208,7 @@ int main() {
         info.texture_compression_bc = d.bc;
         info.bindless = d.bindless;
         info.bindless_partially_bound = d.partially_bound;
+        info.image_view_min_lod = d.image_view_min_lod;
         ID3D12Device* inner = nullptr;
         EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&inner))));
         Ref<ID3D12Device> device;
@@ -311,22 +312,33 @@ int main() {
         texture_desc.MipLevels = 1;
         texture_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
         texture_desc.SampleDesc.Count = 1;
+        auto sampled_desc = texture_desc;
+        sampled_desc.MipLevels = 3;
         Ref<ID3D12Resource> texture, upload;
-        EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &texture_desc,
+        EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &sampled_desc,
                                                          D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
                                                          IID_PPV_ARGS(&texture.p))));
         const auto upload_desc = buffer_desc(65536, D3D12_RESOURCE_FLAG_NONE);
         EXPECT(SUCCEEDED(device->CreateCommittedResource(&upload_heap, D3D12_HEAP_FLAG_NONE, &upload_desc,
                                                          D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
                                                          IID_PPV_ARGS(&upload.p))));
-        D3D12_PLACED_SUBRESOURCE_FOOTPRINT placed{};
-        device->GetCopyableFootprints(&texture_desc, 0, 1, 0, &placed, nullptr, nullptr, nullptr);
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT levels[3]{};
+        device->GetCopyableFootprints(&sampled_desc, 0, 3, 0, levels, nullptr, nullptr, nullptr);
+        const auto& placed = levels[0];
         void* mapped = nullptr;
         EXPECT(SUCCEEDED(upload->Map(0, nullptr, &mapped)));
         for (UINT y = 0; y < size; ++y)
             for (UINT x = 0; x < size; ++x)
                 std::memcpy(static_cast<std::uint8_t*>(mapped) + placed.Offset + y * placed.Footprint.RowPitch + x * 4,
                             texel(x, y).data(), 4);
+        constexpr std::array<std::uint8_t, 4> mip_colors[] = {{16, 160, 64, 255}, {208, 48, 240, 255}};
+        for (UINT mip = 1; mip < 3; ++mip) {
+            const auto& level = levels[mip];
+            for (UINT y = 0; y < level.Footprint.Height; ++y)
+                for (UINT x = 0; x < level.Footprint.Width; ++x)
+                    std::memcpy(static_cast<std::uint8_t*>(mapped) + level.Offset + y * level.Footprint.RowPitch + x * 4,
+                                mip_colors[mip - 1].data(), 4);
+        }
         // The same bytes in an R8G8B8A8_UINT texture, from further into the upload buffer.
         D3D12_RESOURCE_DESC uint_desc = texture_desc;
         uint_desc.Format = DXGI_FORMAT_R8G8B8A8_UINT;
@@ -400,7 +412,7 @@ int main() {
         const UINT step = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
         const UINT sampler_step = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER);
         Ref<ID3D12DescriptorHeap> view_heap, sampler_heap;
-        D3D12_DESCRIPTOR_HEAP_DESC heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 10,
+        D3D12_DESCRIPTOR_HEAP_DESC heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 16,
                                              D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
         EXPECT(SUCCEEDED(device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&view_heap.p))));
         heap_desc = {D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, 4, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
@@ -410,6 +422,23 @@ int main() {
         EXPECT(view_cpu && sampler_cpu);
         const auto view_slot = [&](UINT i) { return D3D12_CPU_DESCRIPTOR_HANDLE{SIZE_T(view_cpu + i * step)}; };
         const auto view_bytes = [&](UINT i) { return reinterpret_cast<std::uint8_t*>(view_cpu + i * step); };
+
+        struct LodView { UINT first, count; float clamp; bool force_alpha_one = false; };
+        constexpr LodView lod_views[] = {
+            {0, 3, 0.25f}, {0, 3, 0.75f}, {1, 2, 1.75f}, {0, 2, 1.75f}, {1, 2, 0.75f}, {0, 2, 1.75f, true}
+        };
+        constexpr UINT first_lod_slot = 10;
+        for (UINT i = 0; i < std::size(lod_views); ++i) {
+            const auto& v = lod_views[i];
+            D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+            srv.Format = sampled_desc.Format;
+            srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+            srv.Shader4ComponentMapping = v.force_alpha_one
+                ? D3D12_ENCODE_SHADER_4_COMPONENT_MAPPING(0, 1, 2, D3D12_SHADER_COMPONENT_MAPPING_FORCE_VALUE_1)
+                : D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            srv.Texture2D = {v.first, v.count, 0, v.clamp};
+            device->CreateShaderResourceView(texture.p, &srv, view_slot(first_lod_slot + i));
+        }
 
         // The view in slot 1, a copy of it in slot 5, and in slot 3 bytes no view was created for.
         constexpr UINT own = 1, copied = 5, unknown = 3;
@@ -446,7 +475,7 @@ int main() {
         EXPECT(image_at(own, image));
         EXPECT(image.type == g::ImageType::image_2d && image.width == size && image.height == size);
         EXPECT(image.format == g::format_from_vulkan(VK_FORMAT_R8G8B8A8_UNORM) && image.format != 0);
-        EXPECT(image.first_mip == 0 && image.mip_count == 1 && image.layer_count == 1 && image.resource_mips == 1);
+        EXPECT(image.first_mip == 0 && image.mip_count == 3 && image.layer_count == 1 && image.resource_mips == 3);
         EXPECT(image.swizzle == g::identity_swizzle && image.address >= (1ull << 32) && image.address % 256 == 0);
         g::SamplerWords sampler_words{};
         std::memcpy(sampler_words.data(), sampler_bytes, sizeof(sampler_words));
@@ -837,8 +866,12 @@ int main() {
         to_texture.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
         from_upload.pResource = upload.p;
         from_upload.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-        from_upload.PlacedFootprint = placed;
-        list->CopyTextureRegion(&to_texture, 0, 0, 0, &from_upload, nullptr);
+        for (UINT mip = 0; mip < 3; ++mip) {
+            to_texture.SubresourceIndex = mip;
+            from_upload.PlacedFootprint = levels[mip];
+            list->CopyTextureRegion(&to_texture, 0, 0, 0, &from_upload, nullptr);
+        }
+        to_texture.SubresourceIndex = 0;
         to_texture.pResource = uint_texture.p;
         from_upload.PlacedFootprint = uint_placed;
         list->CopyTextureRegion(&to_texture, 0, 0, 0, &from_upload, nullptr);
@@ -903,6 +936,35 @@ int main() {
                 }
             }
             std::printf("OPTIONS8: 64 point samples of a 7x5 BC1 top mip matched\n");
+        }
+
+        // The same point sampler requests LOD zero from each view. The clamp is in resource mip space.
+        SampleKeys lod_keys[std::size(lod_views)]{};
+        std::array<std::uint8_t, std::size(lod_views) * bytes> lod_pixels{};
+        for (UINT i = 0; i < std::size(lod_views); ++i) {
+            std::memcpy(lod_keys[i].tsharp, view_bytes(first_lod_slot + i), sizeof(lod_keys[i].tsharp));
+            std::memcpy(lod_keys[i].ssharp, sampler_bytes, sizeof(lod_keys[i].ssharp));
+            lod_keys[i].first = i * texels;
+        }
+        EXPECT(sample_through_set(d, set0, set0_layout, lod_keys, lod_pixels.data()));
+        for (UINT i = 0; i < texels; ++i) {
+            using Pixel = std::array<std::uint8_t, 4>;
+            const Pixel expected[] = {
+                d.image_view_min_lod ? texel(i % size, i / size) : Pixel{},
+                d.image_view_min_lod ? mip_colors[0] : Pixel{},
+                d.image_view_min_lod ? mip_colors[1] : Pixel{},
+                {}, mip_colors[0], {0, 0, 0, 255}
+            };
+            static_assert(std::size(expected) == std::size(lod_views));
+            for (UINT view = 0; view < std::size(lod_views); ++view) {
+                const auto* sample = &lod_pixels[view * bytes + 4 * i];
+                if (std::memcmp(sample, expected[view].data(), 4)) {
+                    std::fprintf(stderr, "minimum LOD view %u texel %u: got %u %u %u %u, expected %u %u %u %u\n",
+                                 view, i, sample[0], sample[1], sample[2], sample[3],
+                                 expected[view][0], expected[view][1], expected[view][2], expected[view][3]);
+                    return 1;
+                }
+            }
         }
 
         SampleKeys volumes[2]{};
