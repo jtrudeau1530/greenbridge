@@ -1055,5 +1055,125 @@ class TestConditionCodesAndStatus(unittest.TestCase):
         self.assertFalse(branch_scc0_taken)
 
 
+# ==============================================================================
+# Phase 7 Unit Tests: IEEE 754 Boundary Extremes, Subnormals, and NaN Handling
+# ==============================================================================
+
+class TestIEEE754BoundaryExtremes(unittest.TestCase):
+    """Verify bitwise preservation, inversion, and EXEC transitions for IEEE 754 float bit representations."""
+
+    def setUp(self) -> None:
+        self.interp = ScalarInterpreter()
+
+    def test_signed_zero_extremes(self) -> None:
+        """Test +0.0 (0x0) and -0.0 (0x8000_0000_0000_0000) under saveexec operations."""
+        state = ScalarMachineState(exec_mask=NEG_ZERO_F64)
+        # s_nor_saveexec_b64 with POS_ZERO_F64
+        # new_exec = ~(0 | NEG_ZERO_F64) = ~0x8000_0000_0000_0000 = 0x7FFF_FFFF_FFFF_FFFF
+        instr = SaveExecInstruction(
+            opcode=Opcode.S_NOR_SAVEEXEC_B64,
+            sdst=Reg64(RegType.SGPR, 0),
+            ssrc0=Literal64(POS_ZERO_F64),
+        )
+        saved, new_exec, scc = self.interp.step(instr, state)
+        self.assertEqual(saved, NEG_ZERO_F64)
+        self.assertEqual(new_exec, 0x7FFF_FFFF_FFFF_FFFF)
+        self.assertEqual(scc, 1)
+
+        # Invert back with NAND
+        # ~(0x7FFF_FFFF_FFFF_FFFF & NEG_ZERO_F64) = ~(0) = ALL64
+        instr_nand = SaveExecInstruction(
+            opcode=Opcode.S_NAND_SAVEEXEC_B64,
+            sdst=Reg64(RegType.SGPR, 2),
+            ssrc0=Literal64(NEG_ZERO_F64),
+        )
+        saved2, new_exec2, scc2 = self.interp.step(instr_nand, state)
+        self.assertEqual(saved2, 0x7FFF_FFFF_FFFF_FFFF)
+        self.assertEqual(new_exec2, ALL64)
+        self.assertEqual(scc2, 1)
+
+    def test_infinities_and_exponent_masks(self) -> None:
+        """Verify behavior when EXEC and source carry positive/negative infinity bitmasks."""
+        state = ScalarMachineState(exec_mask=POS_INF_F64)  # 0x7FF0_0000_0000_0000
+        # SSRC0 = NEG_INF_F64 (0xFFF0_0000_0000_0000)
+        # POS_INF & NEG_INF = POS_INF (0x7FF0_0000_0000_0000)
+        # new_exec = ~POS_INF = 0x800F_FFFF_FFFF_FFFF
+        instr = SaveExecInstruction(
+            opcode=Opcode.S_NAND_SAVEEXEC_B64,
+            sdst=Reg64(RegType.SGPR, 4),
+            ssrc0=Literal64(NEG_INF_F64),
+        )
+        saved, new_exec, scc = self.interp.step(instr, state)
+        self.assertEqual(saved, POS_INF_F64)
+        self.assertEqual(new_exec, 0x800F_FFFF_FFFF_FFFF)
+        self.assertEqual(scc, 1)
+
+        # Confirm bitwise NOR on infinities
+        # POS_INF | NEG_INF = NEG_INF (0xFFF0_0000_0000_0000)
+        # ~(NEG_INF) = 0x000F_FFFF_FFFF_FFFF (the entire mantissa/fraction field)
+        state.exec_mask = POS_INF_F64
+        instr_nor = SaveExecInstruction(
+            opcode=Opcode.S_NOR_SAVEEXEC_B64,
+            sdst=Reg64(RegType.SGPR, 6),
+            ssrc0=Literal64(NEG_INF_F64),
+        )
+        saved_nor, new_exec_nor, scc_nor = self.interp.step(instr_nor, state)
+        self.assertEqual(new_exec_nor, FRAC_MASK_F64)
+        self.assertEqual(scc_nor, 1)
+
+    def test_nan_payload_preservation(self) -> None:
+        """Verify quiet and signaling NaN bit pattern transformations under saveexec."""
+        qnan = CANONICAL_QNAN_F64  # 0x7FF8_0000_0000_0000
+        snan = 0x7FF0_0000_0000_0001  # Signaling NaN with 1-ULP payload
+        custom_nan = 0x7FF4_0000_BEEF_CAFE
+
+        state = ScalarMachineState(exec_mask=qnan)
+        instr = SaveExecInstruction(
+            opcode=Opcode.S_NAND_SAVEEXEC_B64,
+            sdst=Reg64(RegType.SGPR, 8),
+            ssrc0=Literal64(custom_nan),
+        )
+        saved, new_exec, scc = self.interp.step(instr, state)
+        self.assertEqual(saved, qnan)
+        # qnan & custom_nan:
+        # 0x7FF8_0000_0000_0000 & 0x7FF4_0000_BEEF_CAFE = 0x7FF0_0000_0000_0000 (exponent bits)
+        # ~(0x7FF0_0000_0000_0000) = 0x800F_FFFF_FFFF_FFFF
+        self.assertEqual(new_exec, 0x800F_FFFF_FFFF_FFFF)
+        self.assertEqual(scc, 1)
+
+    def test_subnormal_extremes(self) -> None:
+        """Verify minimum and maximum double-precision subnormal bit representations."""
+        min_subnormal = 0x0000_0000_0000_0001  # 1 ULP in denormal range
+        max_subnormal = 0x000F_FFFF_FFFF_FFFF  # All mantissa bits set, exponent 0
+
+        state = ScalarMachineState(exec_mask=min_subnormal)
+        instr = SaveExecInstruction(
+            opcode=Opcode.S_NOR_SAVEEXEC_B64,
+            sdst=Reg64(RegType.SGPR, 10),
+            ssrc0=Literal64(max_subnormal),
+        )
+        saved, new_exec, scc = self.interp.step(instr, state)
+        self.assertEqual(saved, min_subnormal)
+        # min_subnormal | max_subnormal = max_subnormal (0x000F_FFFF_FFFF_FFFF)
+        # ~(0x000F_FFFF_FFFF_FFFF) = 0xFFF0_0000_0000_0000 (sign + exponent bits set)
+        self.assertEqual(new_exec, 0xFFF0_0000_0000_0000)
+        self.assertEqual(scc, 1)
+
+    def test_float_roundtrip_integrity(self) -> None:
+        """Verify float unpacking and reinterpretation across saveexec transitions."""
+        test_floats = [1.0, -1.0, 1.5, -0.0, 1e-300, float("inf"), float("-inf")]
+        for f in test_floats:
+            bits = f64_to_bits(f)
+            state = ScalarMachineState(exec_mask=bits)
+            instr = SaveExecInstruction(
+                opcode=Opcode.S_NAND_SAVEEXEC_B64,
+                sdst=Reg64(RegType.SGPR, 0),
+                ssrc0=Literal64(ALL64),
+            )
+            saved, new_exec, scc = self.interp.step(instr, state)
+            self.assertEqual(saved, bits)
+            self.assertEqual(new_exec, (~bits) & MASK64)
+
+
 if __name__ == "__main__":
     unittest.main()
