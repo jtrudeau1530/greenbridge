@@ -166,8 +166,10 @@ public:
         {
             std::lock_guard lock(context_.submit_mutex());
             vk.vkQueueWaitIdle(queue_);
+            // A WSI layer may perform a device-wide idle while destroying the swapchain.
+            // Keep that implicit idle serialized with submits from every context queue.
+            release(swapchain_);
         }
-        release(swapchain_);
         swapchain_ = VK_NULL_HANDLE;
         release_capture();
         composer_.reset();
@@ -879,7 +881,10 @@ private:
             }
         }
         if (extent.width == 0 || extent.height == 0) {
-            release(swapchain_);
+            {
+                std::lock_guard lock(context_.submit_mutex());
+                release(swapchain_);
+            }
             swapchain_ = VK_NULL_HANDLE;
             vsync_ = vsync;
             swapchain_srgb_ = srgb;
@@ -991,13 +996,18 @@ private:
         info.oldSwapchain = old;
         VkSwapchainKHR fresh = VK_NULL_HANDLE;
         const VkResult created = vkCreateSwapchainKHR_(device, &info, nullptr, &fresh);
-        release(old);  // retired by the creation attempt, whether or not it succeeded
+        {
+            std::lock_guard lock(context_.submit_mutex());
+            release(old);  // retired by the creation attempt, whether or not it succeeded
+        }
         if (created != VK_SUCCESS) return false;
 
         std::vector<VkImage> images;
         std::vector<VkSemaphore> ready;
         const auto discard = [&] {
             for (VkSemaphore semaphore : ready) vk.vkDestroySemaphore(device, semaphore, nullptr);
+            // The WSI implementation may block on the device here too.
+            std::lock_guard lock(context_.submit_mutex());
             vkDestroySwapchainKHR_(device, fresh, nullptr);
             return false;
         };
