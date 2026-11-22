@@ -918,7 +918,7 @@ class Pool:
         )
         for virt, csize, src, packed, codec, pad in self.chunks_for(start, size):
             key = (src, packed, codec, bcpack_mode if codec not in (0, 8) else "raw",
-                   hist_key if codec in (6, 7) else None)
+                   hist_key if codec not in (0, 8) else None)
             if key not in cache:
                 raw = self.data[src:src + packed]
                 if codec == 0:
@@ -1894,7 +1894,7 @@ def main(argv=None):
     pc.add_argument("--allow-provisional", action="store_true",
                     help="allow unconfirmed built-in BCPack history entries")
     pc.add_argument("--history",
-                    help="local JSON file or directory supplying BC6H/BC7 initial history tables")
+                    help="local JSON file or directory supplying BC6H/BC7 (and optional BC1-BC5) initial history tables")
     pe = sub.add_parser("export", help="write the full chain as DDS")
     pe.add_argument("pool")
     pe.add_argument("index", type=int)
@@ -1905,7 +1905,7 @@ def main(argv=None):
     pe.add_argument("--allow-provisional", action="store_true",
                     help="allow unconfirmed built-in BCPack history entries")
     pe.add_argument("--history",
-                    help="local JSON file or directory supplying BC6H/BC7 initial history tables")
+                    help="local JSON file or directory supplying BC6H/BC7 (and optional BC1-BC5) initial history tables")
     a = ap.parse_args(argv)
     if a.cmd == "scan":
         pools = []

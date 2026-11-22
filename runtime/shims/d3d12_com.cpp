@@ -24,6 +24,22 @@
 
 namespace rt::d3d12 {
 
+static std::uint64_t buffer_tiles(ID3D12Resource* buffer) {
+    if (!buffer) return 0;
+    const auto desc = buffer->GetDesc();
+    if (desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER || !desc.Width) return 0;
+    return 1 + (desc.Width - 1) / leonida::tile_size_in_bytes;
+}
+
+static bool buffer_tile_region(const D3D12_TILED_RESOURCE_COORDINATE* start, const D3D12_TILE_REGION_SIZE* size,
+                               std::uint64_t tiles, leonida::BufferTileRegion& region) {
+    if (start && (start->Y || start->Z || start->Subresource)) return false;
+    if (size && size->UseBox && (size->Height != 1 || size->Depth != 1)) return false;
+    region.first = start ? start->X : 0;
+    region.count = size ? (size->UseBox ? size->Width : size->NumTiles) : (start ? 1 : tiles);
+    return region.count && region.first < tiles && region.count <= tiles - region.first;
+}
+
 void stub(const char* method) {
     // Generated API stubs pass a bare method name; explanatory diagnostics are not separate calls.
     if (!std::strchr(method, '(')) d3d12_trace::record(method, "unsupported");
@@ -231,7 +247,9 @@ public:
     }
 
     // The bound heaps matter to direct heap indexing, which is still open (section 3.4); tables carry their VAs.
-    void STDMETHODCALLTYPE SetDescriptorHeaps(UINT, ID3D12DescriptorHeap* const*) override {}
+    void STDMETHODCALLTYPE SetDescriptorHeaps(UINT, ID3D12DescriptorHeap* const*) override {
+        d3d12_trace::record("ID3D12GraphicsCommandList::SetDescriptorHeaps", "ignored");
+    }
 
     void STDMETHODCALLTYPE SetComputeRoot32BitConstant(UINT index, UINT value, UINT offset) override {
         constants(compute_, index, 1, &value, offset);
@@ -267,6 +285,7 @@ public:
         address(graphics_, index, va, rt::rootsig::ParamType::Descriptor);
     }
     void STDMETHODCALLTYPE SetGraphicsRootDescriptorTable(UINT index, D3D12_GPU_DESCRIPTOR_HANDLE table) override {
+        d3d12_trace::record("ID3D12GraphicsCommandList::SetGraphicsRootDescriptorTable");
         address(graphics_, index, table.ptr, rt::rootsig::ParamType::Table);
     }
 
@@ -415,6 +434,25 @@ public:
         d3d12_trace::record("ID3D12GraphicsCommandList::CopyBufferRegion");
         if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);
         check(list_.copy_buffer({resource_id(dst), dst_offset, resource_id(src), src_offset, bytes}));
+    }
+
+    void STDMETHODCALLTYPE CopyTiles(ID3D12Resource* tiled, const D3D12_TILED_RESOURCE_COORDINATE* start,
+                                     const D3D12_TILE_REGION_SIZE* size, ID3D12Resource* linear,
+                                     UINT64 linear_offset, D3D12_TILE_COPY_FLAGS flags) override {
+        d3d12_trace::record("ID3D12GraphicsCommandList::CopyTiles");
+        const auto direction = flags & ~D3D12_TILE_COPY_FLAG_NO_HAZARD;
+        const bool to_linear = direction == D3D12_TILE_COPY_FLAG_SWIZZLED_TILED_RESOURCE_TO_LINEAR_BUFFER;
+        leonida::BufferTileRegion region;
+        if (!start || !size || !linear || linear == tiled ||
+            !buffer_tile_region(start, size, buffer_tiles(tiled), region) ||
+            (!to_linear && direction != D3D12_TILE_COPY_FLAG_LINEAR_BUFFER_TO_SWIZZLED_TILED_RESOURCE))
+            return check(false);
+        const auto tiled_id = resource_id(tiled), linear_id = resource_id(linear);
+        const auto tiled_offset = region.first * leonida::tile_size_in_bytes;
+        const auto bytes = region.count * leonida::tile_size_in_bytes;
+        check(list_.copy_buffer(to_linear
+            ? leonida::CopyBuffer{linear_id, linear_offset, tiled_id, tiled_offset, bytes, tiled_id}
+            : leonida::CopyBuffer{tiled_id, tiled_offset, linear_id, linear_offset, bytes, tiled_id}));
     }
 
     void STDMETHODCALLTYPE CopyTextureRegion(const D3D12_TEXTURE_COPY_LOCATION* dst, UINT x, UINT y, UINT z,
@@ -1074,22 +1112,36 @@ public:
         return true;
     }
 
-    // Reserved resources are fully backed at creation (docs/d3d12_vulkan.md section 4.2), so tile mappings are not
-    // emulated: every tile keeps its own memory. What that loses is reported once each: two resources mapped to the
-    // same heap tiles do not alias, and a tile unmapped (or remapped) keeps its contents.
-    void STDMETHODCALLTYPE UpdateTileMappings(ID3D12Resource*, UINT, const D3D12_TILED_RESOURCE_COORDINATE*,
-                                              const D3D12_TILE_REGION_SIZE*, ID3D12Heap*, UINT,
-                                              const D3D12_TILE_RANGE_FLAGS*, const UINT*, const UINT*,
-                                              D3D12_TILE_MAPPING_FLAGS) override {
-        d3d12_trace::record("ID3D12CommandQueue::UpdateTileMappings", "ignored");
-        note_once("ID3D12CommandQueue::UpdateTileMappings ignored: reserved resources are fully backed, mappings are not emulated");
+    void STDMETHODCALLTYPE UpdateTileMappings(ID3D12Resource* resource, UINT region_count,
+                                              const D3D12_TILED_RESOURCE_COORDINATE* starts,
+                                              const D3D12_TILE_REGION_SIZE* sizes, ID3D12Heap* heap, UINT range_count,
+                                              const D3D12_TILE_RANGE_FLAGS* flags, const UINT* offsets,
+                                              const UINT* counts, D3D12_TILE_MAPPING_FLAGS mapping_flags) override {
+        constexpr auto method = "ID3D12CommandQueue::UpdateTileMappings";
+        if (!update_buffer_tiles(resource, region_count, starts, sizes, heap, range_count, flags, offsets,
+                                 counts, mapping_flags)) {
+            d3d12_trace::record(method, "refused");
+            note_once("ID3D12CommandQueue::UpdateTileMappings: invalid mapping or buffer sparse residency unavailable");
+        } else {
+            d3d12_trace::record(method, "ok");
+        }
     }
 
-    void STDMETHODCALLTYPE CopyTileMappings(ID3D12Resource*, const D3D12_TILED_RESOURCE_COORDINATE*, ID3D12Resource*,
-                                            const D3D12_TILED_RESOURCE_COORDINATE*, const D3D12_TILE_REGION_SIZE*,
-                                            D3D12_TILE_MAPPING_FLAGS) override {
-        d3d12_trace::record("ID3D12CommandQueue::CopyTileMappings", "ignored");
-        note_once("ID3D12CommandQueue::CopyTileMappings ignored: reserved resources are fully backed, mappings are not emulated");
+    void STDMETHODCALLTYPE CopyTileMappings(ID3D12Resource* dst, const D3D12_TILED_RESOURCE_COORDINATE* dst_start,
+                                            ID3D12Resource* src, const D3D12_TILED_RESOURCE_COORDINATE* src_start,
+                                            const D3D12_TILE_REGION_SIZE* size, D3D12_TILE_MAPPING_FLAGS flags) override {
+        constexpr auto method = "ID3D12CommandQueue::CopyTileMappings";
+        std::lock_guard lock(mutex_);
+        leonida::BufferTileRegion from, to;
+        if ((flags & ~D3D12_TILE_MAPPING_FLAG_NO_HAZARD) || !dst_start || !src_start || !size ||
+            !buffer_tile_region(src_start, size, buffer_tiles(src), from) ||
+            !buffer_tile_region(dst_start, size, buffer_tiles(dst), to) ||
+            !queue_.copy_tile_mappings(resource_id(dst), to.first, resource_id(src), from)) {
+            d3d12_trace::record(method, "refused");
+            note_once("ID3D12CommandQueue::CopyTileMappings: invalid mapping or buffer sparse residency unavailable");
+        } else {
+            d3d12_trace::record(method, "ok");
+        }
     }
 
     HRESULT STDMETHODCALLTYPE Signal(ID3D12Fence* fence, UINT64 value) override {
@@ -1243,6 +1295,60 @@ private:
         const std::string label = event_label(metadata, data, size);
         std::lock_guard lock(mutex_);
         queue_.marker(kind, label.c_str());
+    }
+
+    bool update_buffer_tiles(ID3D12Resource* resource, UINT region_count, const D3D12_TILED_RESOURCE_COORDINATE* starts,
+                             const D3D12_TILE_REGION_SIZE* sizes, ID3D12Heap* heap, UINT range_count,
+                             const D3D12_TILE_RANGE_FLAGS* flags, const UINT* offsets, const UINT* counts,
+                             D3D12_TILE_MAPPING_FLAGS mapping_flags) {
+        if (!region_count || !range_count || (!starts && region_count != 1) ||
+            (mapping_flags & ~D3D12_TILE_MAPPING_FLAG_NO_HAZARD)) return false;
+        const auto tiles = buffer_tiles(resource);
+        std::vector<leonida::BufferTileRegion> regions(region_count);
+        std::uint64_t total = 0;
+        for (UINT i = 0; i < region_count; ++i) {
+            if (!buffer_tile_region(starts ? starts + i : nullptr, sizes ? sizes + i : nullptr, tiles, regions[i]))
+                return false;
+            if (regions[i].count > UINT64_MAX - total) return false;
+            total += regions[i].count;
+        }
+
+        std::vector<leonida::BufferTileRange> ranges;
+        ranges.reserve(range_count);
+        std::uint64_t remaining = total, heap_tiles_required = 0;
+        for (UINT i = 0; i < range_count; ++i) {
+            const auto count = counts ? counts[i] : (range_count == 1 ? total : 1);
+            if (!count) continue;
+            if (count > remaining) return false;
+            remaining -= count;
+            using leonida::TileRangeMode;
+            const auto flag = flags ? flags[i] : D3D12_TILE_RANGE_FLAG_NONE;
+            switch (flag) {
+            case D3D12_TILE_RANGE_FLAG_NONE:
+            case D3D12_TILE_RANGE_FLAG_REUSE_SINGLE_TILE: {
+                if (!offsets) return false;
+                const auto used = flag == D3D12_TILE_RANGE_FLAG_NONE ? count : 1;
+                if (used > UINT64_MAX - offsets[i]) return false;
+                heap_tiles_required = std::max(heap_tiles_required, offsets[i] + used);
+                ranges.push_back({flag == D3D12_TILE_RANGE_FLAG_NONE ? TileRangeMode::sequential : TileRangeMode::reuse,
+                                  offsets[i], count});
+                break;
+            }
+            case D3D12_TILE_RANGE_FLAG_NULL:
+                ranges.push_back({TileRangeMode::unmap, 0, count});
+                break;
+            case D3D12_TILE_RANGE_FLAG_SKIP:
+                ranges.push_back({TileRangeMode::skip, 0, count});
+                break;
+            default:
+                return false;
+            }
+        }
+        if (remaining || (heap_tiles_required &&
+            (!heap || heap_tiles_required > heap->GetDesc().SizeInBytes / leonida::tile_size_in_bytes))) return false;
+        std::lock_guard lock(mutex_);
+        return queue_.update_tiles(resource_id(resource), regions, ranges,
+                                   [&] { return heap_tiles_required ? tile_heap(heap, context_) : nullptr; });
     }
 
     D3D12_COMMAND_QUEUE_DESC desc_;
