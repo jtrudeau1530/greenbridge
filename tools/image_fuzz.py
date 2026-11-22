@@ -108,6 +108,10 @@ def translate(work: str, pc_tail: bool = False) -> str:
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode:
         raise SystemExit(f"translator failed:\n{r.stdout}\n{r.stderr}")
+    # The batch translator can exit successfully even when an individual shader is rejected.
+    missing = [name for name in ("vs_ids.spv", "ps_image_load.spv") if not os.path.isfile(os.path.join(spirv, name))]
+    if missing:
+        raise SystemExit(f"translator did not emit {', '.join(missing)}:\n{r.stdout}\n{r.stderr}")
     return spirv
 
 
