@@ -968,5 +968,112 @@ class TestSIMDMultiLaneDivergence(unittest.TestCase):
             self.assertEqual(state.get_vgpr_f32(lane, 3), 123.0)
 
 
+class TestRegisterAliasingAndPreservation(unittest.TestCase):
+    """Test suite for register aliasing and in-place operand preservation."""
+
+    def setUp(self) -> None:
+        self.scalar_interp = ScalarInterpInterpreter()
+        self.simd_interp = SIMDInterpInterpreter()
+
+    def test_inplace_p1_aliased_src_dst(self) -> None:
+        # v_interp_p1_f32 v0, v0, attr0.x
+        # Reading coordinate from v0 and writing result to v0
+        state = ScalarMachineState()
+        state.attributes.set_attribute(0, 0, 10.0, 5.0, 20.0)  # p0=10.0, p10=-5.0, p20=10.0
+        state.vgpr.set_f32(0, 2.0)  # s = 2.0
+
+        inst = InterpInstruction(
+            opcode=InterpOpcode.V_INTERP_P1_F32,
+            dst=0,
+            src=Operand(RegType.VGPR, 0),
+            attr=AttributeRef(0, Channel.X),
+        )
+        res = self.scalar_interp.step(inst, state)
+        # -5.0 * 2.0 + 10.0 = 0.0
+        self.assertEqual(bits_to_f32(res), 0.0)
+        self.assertEqual(state.vgpr.get_f32(0), 0.0)
+
+    def test_inplace_p2_aliased_src_dst(self) -> None:
+        # v_interp_p2_f32 v0, v0, attr0.y
+        # Where v0 acts as both coordinate S and accumulator D!
+        # D_new = P20 * v0_old + v0_old
+        state = ScalarMachineState()
+        state.attributes.set_attribute(0, 1, 0.0, 1.0, 4.0)  # p20 = 4.0
+        state.vgpr.set_f32(0, 3.0)  # v0 = 3.0
+
+        inst = InterpInstruction(
+            opcode=InterpOpcode.V_INTERP_P2_F32,
+            dst=0,
+            src=Operand(RegType.VGPR, 0),
+            attr=AttributeRef(0, Channel.Y),
+        )
+        res = self.scalar_interp.step(inst, state)
+        # 4.0 * 3.0 + 3.0 = 15.0
+        self.assertEqual(bits_to_f32(res), 15.0)
+        self.assertEqual(state.vgpr.get_f32(0), 15.0)
+
+    def test_adjacent_register_preservation(self) -> None:
+        state = ScalarMachineState()
+        state.attributes.set_attribute(1, 0, 1.0, 2.0, 3.0)
+        state.vgpr.set_f32(0, 111.0)
+        state.vgpr.set_f32(1, 0.5)
+        state.vgpr.set_f32(2, 222.0)
+        state.vgpr.set_f32(3, 333.0)
+
+        # Write to v1 using v1 as coordinate
+        inst = InterpInstruction(
+            opcode=InterpOpcode.V_INTERP_P1_F32,
+            dst=1,
+            src=Operand(RegType.VGPR, 1),
+            attr=AttributeRef(1, Channel.X),
+        )
+        self.scalar_interp.step(inst, state)
+
+        # v0, v2, v3 must remain exactly preserved
+        self.assertEqual(state.vgpr.get_f32(0), 111.0)
+        self.assertEqual(state.vgpr.get_f32(2), 222.0)
+        self.assertEqual(state.vgpr.get_f32(3), 333.0)
+        # v1 was updated: p10 * 0.5 + p0 = 1.0 * 0.5 + 1.0 = 1.5
+        self.assertEqual(state.vgpr.get_f32(1), 1.5)
+
+    def test_pipelined_accumulator_chain(self) -> None:
+        state = ScalarMachineState()
+        # attr0.z: p0=5.0, p10=2.0, p20=8.0
+        state.attributes.set_attribute(0, 2, 5.0, 7.0, 13.0)
+        # v0 = i = 0.5, v1 = j = 0.25
+        state.vgpr.set_f32(0, 0.5)
+        state.vgpr.set_f32(1, 0.25)
+        state.vgpr.set_f32(2, 999.0)  # Initial uninitialized value in destination
+
+        # Step 1: p1 writes to v2
+        p1 = InterpInstruction(InterpOpcode.V_INTERP_P1_F32, 2, Operand(RegType.VGPR, 0), AttributeRef(0, Channel.Z))
+        self.scalar_interp.step(p1, state)
+        # v2 = 2.0 * 0.5 + 5.0 = 6.0
+        self.assertEqual(state.vgpr.get_f32(2), 6.0)
+
+        # Step 2: p2 reads v2 and accumulates into v2
+        p2 = InterpInstruction(InterpOpcode.V_INTERP_P2_F32, 2, Operand(RegType.VGPR, 1), AttributeRef(0, Channel.Z))
+        self.scalar_interp.step(p2, state)
+        # v2 = 8.0 * 0.25 + 6.0 = 8.0
+        self.assertEqual(state.vgpr.get_f32(2), 8.0)
+
+    def test_simd_multi_lane_aliased_inplace(self) -> None:
+        state = SIMDState(num_lanes=32, exec_mask=0xFFFF_FFFF)
+        # attr1.w: p0=0.0, p10=1.0, p20=2.0
+        state.attributes.set_attribute(1, 3, 0.0, 1.0, 2.0)
+
+        for lane in range(32):
+            # v0 = lane float value
+            state.set_vgpr_f32(lane, 0, float(lane))
+
+        # Each lane executes in-place v_interp_p1_f32 v0, v0, attr1.w
+        inst = InterpInstruction(InterpOpcode.V_INTERP_P1_F32, 0, Operand(RegType.VGPR, 0), AttributeRef(1, Channel.W))
+        self.simd_interp.step(inst, state)
+
+        for lane in range(32):
+            # p10 * lane + p0 = 1.0 * lane + 0.0 = float(lane)
+            self.assertEqual(state.get_vgpr_f32(lane, 0), float(lane))
+
+
 if __name__ == "__main__":
     unittest.main()
