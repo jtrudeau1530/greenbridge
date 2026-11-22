@@ -920,5 +920,128 @@ class TestSIMDMultiLaneDivergence(unittest.TestCase):
         self.assertEqual(lds.read_dword(7), f32_to_bits(155.0))
 
 
+class TestRegisterAliasing(unittest.TestCase):
+    """Unit tests for register aliasing and in-place operand preservation."""
+
+    def setUp(self) -> None:
+        self.lds = LDSMemory(65536)
+        self.state = ScalarThreadState(lds=self.lds)
+        self.interp = ScalarDSInterpreter()
+
+    def test_scalar_dst_aliases_addr(self) -> None:
+        # ds_min_rtn_f32 v1, v1, v2: vdst == vaddr
+        # LDS dword 3 has 50.0. v1 initially has byte address 12 (dword 3).
+        # v2 has 10.0.
+        self.lds.write_dword(3, f32_to_bits(50.0))
+        self.state.set_vgpr(VGPR(1), 12)
+        self.state.set_vgpr(VGPR(2), f32_to_bits(10.0))
+
+        inst = DSMinMaxInstruction(DSOpcode.DS_MIN_RTN_F32, vaddr=VGPR(1), vdata=VGPR(2), vdst=VGPR(1))
+        ret = self.interp.execute(self.state, inst)
+
+        # v1 should now contain the previous LDS value (50.0), having correctly latched the address 12
+        self.assertEqual(ret, f32_to_bits(50.0))
+        self.assertEqual(self.state.get_vgpr(VGPR(1)), f32_to_bits(50.0))
+        # v2 (data) should remain untouched at 10.0
+        self.assertEqual(self.state.get_vgpr(VGPR(2)), f32_to_bits(10.0))
+        # LDS at dword 3 should be min(50.0, 10.0) = 10.0
+        self.assertEqual(self.lds.read_dword(3), f32_to_bits(10.0))
+
+    def test_scalar_dst_aliases_data(self) -> None:
+        # ds_max_rtn_f32 v2, v1, v2: vdst == vdata
+        # LDS dword 6 has 5.0. v1 has byte address 24 (dword 6).
+        # v2 initially has 25.0.
+        self.lds.write_dword(6, f32_to_bits(5.0))
+        self.state.set_vgpr(VGPR(1), 24)
+        self.state.set_vgpr(VGPR(2), f32_to_bits(25.0))
+
+        inst = DSMinMaxInstruction(DSOpcode.DS_MAX_RTN_F32, vaddr=VGPR(1), vdata=VGPR(2), vdst=VGPR(2))
+        ret = self.interp.execute(self.state, inst)
+
+        # v2 receives old LDS value (5.0)
+        self.assertEqual(ret, f32_to_bits(5.0))
+        self.assertEqual(self.state.get_vgpr(VGPR(2)), f32_to_bits(5.0))
+        # v1 (addr) remains untouched at 24
+        self.assertEqual(self.state.get_vgpr(VGPR(1)), 24)
+        # LDS at dword 6 updated to max(5.0, 25.0) = 25.0
+        self.assertEqual(self.lds.read_dword(6), f32_to_bits(25.0))
+
+    def test_scalar_addr_aliases_data_non_returning(self) -> None:
+        # ds_min_f32 v5, v5: vaddr == vdata
+        # Suppose v5 holds 16 (byte address 16 -> dword 4).
+        # As float bits, 16 is a tiny subnormal float (0x00000010).
+        # LDS dword 4 has 1.0.
+        self.lds.write_dword(4, ONE_F32)
+        self.state.set_vgpr(VGPR(5), 16)
+
+        inst = DSMinMaxInstruction(DSOpcode.DS_MIN_F32, vaddr=VGPR(5), vdata=VGPR(5))
+        self.interp.execute(self.state, inst)
+
+        # v5 register should be preserved exactly at 16
+        self.assertEqual(self.state.get_vgpr(VGPR(5)), 16)
+        # LDS at dword 4 should now have 16 (which is smaller than 1.0)
+        self.assertEqual(self.lds.read_dword(4), 16)
+
+    def test_scalar_triple_alias(self) -> None:
+        # ds_min_rtn_f32 v0, v0, v0: vdst == vaddr == vdata
+        # v0 holds 32 (byte address 32 -> dword 8).
+        # LDS dword 8 has 2.0.
+        self.lds.write_dword(8, TWO_F32)
+        self.state.set_vgpr(VGPR(0), 32)
+
+        inst = DSMinMaxInstruction(DSOpcode.DS_MIN_RTN_F32, vaddr=VGPR(0), vdata=VGPR(0), vdst=VGPR(0))
+        ret = self.interp.execute(self.state, inst)
+
+        # Returns old LDS value 2.0
+        self.assertEqual(ret, TWO_F32)
+        self.assertEqual(self.state.get_vgpr(VGPR(0)), TWO_F32)
+        # LDS dword 8 updated to min(2.0, float(32)) = 32
+        self.assertEqual(self.lds.read_dword(8), 32)
+
+    def test_operand_preservation_non_aliased(self) -> None:
+        # Non-aliased registers must not be corrupted
+        self.lds.write_dword(10, ONE_F32)
+        self.state.set_vgpr(VGPR(1), 40)
+        self.state.set_vgpr(VGPR(2), TWO_F32)
+        self.state.set_vgpr(VGPR(3), 0xCAFEBABE)
+
+        inst = DSMinMaxInstruction(DSOpcode.DS_MAX_RTN_F32, vaddr=VGPR(1), vdata=VGPR(2), vdst=VGPR(3))
+        self.interp.execute(self.state, inst)
+
+        self.assertEqual(self.state.get_vgpr(VGPR(1)), 40)
+        self.assertEqual(self.state.get_vgpr(VGPR(2)), TWO_F32)
+        self.assertEqual(self.state.get_vgpr(VGPR(3)), ONE_F32)
+
+    def test_simd_aliasing_under_divergence(self) -> None:
+        lds = LDSMemory(65536)
+        wave = SIMDWaveState(wave_size=32, exec_mask=0xAAAAAAAA, lds=lds)  # Odd lanes active
+        interp = SIMDDSInterpreter()
+
+        # Initialize LDS dwords with 10.0
+        for i in range(32):
+            lds.write_dword(i, f32_to_bits(10.0))
+
+        # Each lane has vdst == vaddr (v1 == v1)
+        for lane in range(32):
+            wave.set_vgpr(lane, VGPR(1), lane * 4)
+            wave.set_vgpr(lane, VGPR(2), f32_to_bits(float(lane)))
+
+        inst = DSMinMaxInstruction(DSOpcode.DS_MIN_RTN_F32, vaddr=VGPR(1), vdata=VGPR(2), vdst=VGPR(1))
+        returns = interp.execute(wave, inst)
+
+        for lane in range(32):
+            if lane % 2 != 0:
+                # Active lane: v1 received previous LDS value (10.0)
+                self.assertEqual(wave.get_vgpr(lane, VGPR(1)), f32_to_bits(10.0))
+                # LDS updated
+                expected_min = f32_to_bits(min(10.0, float(lane)))
+                self.assertEqual(lds.read_dword(lane), expected_min)
+            else:
+                # Inactive lane: v1 retained its initial address (lane * 4)
+                self.assertEqual(wave.get_vgpr(lane, VGPR(1)), lane * 4)
+                # LDS untouched
+                self.assertEqual(lds.read_dword(lane), f32_to_bits(10.0))
+
+
 if __name__ == "__main__":
     unittest.main()
