@@ -10,8 +10,8 @@
 //     timed on its own, so one slow kind stands out;
 //   - a frame: L lists of P passes, each pass a mix of what a frame without draws records today (barriers,
 //     whole-view and rectangle clears, buffer and texture copies, a UAV clear, queries and predication).
-// prepare includes allocating the PreparedList and planning the query batch. emit includes committing query state
-// and freeing the preparation data, as VulkanQueue::execute does.
+// prepare includes refilling the PreparedList storage kept from the last execution (as VulkanQueue::execute keeps
+// prepared_) and planning the query batch. emit includes committing query state, as execute does.
 // Each figure is the median over --reps runs after --warmup runs. Heap allocations (global operator new) and
 // Vulkan calls are counted per command; both are deterministic, unlike the times.
 //
@@ -320,6 +320,7 @@ template<typename Build>
 Result run(Scene& scene, std::size_t lists, Build&& build, int reps, int warmup) {
     using clock = std::chrono::steady_clock;
     std::vector<CommandList> recorded(lists);
+    std::vector<PreparedList> prepared;
     const VkCommandBuffer command_buffer = fake_handle<VkCommandBuffer>(0x10);
     const auto resolve = [&scene](ResourceId id) { return scene.resolve(id); };
     std::vector<double> t_record, t_prepare, t_emit;
@@ -337,7 +338,8 @@ Result run(Scene& scene, std::size_t lists, Build&& build, int reps, int warmup)
         clock::time_point t2;
         std::size_t a2, v2;
         {
-            std::vector<PreparedList> prepared(lists);
+            // The PreparedList storage is kept between executions, as VulkanQueue::execute keeps prepared_.
+            prepared.resize(lists);
             QueryReplay queries;
             for (std::size_t i = 0; i < lists; ++i) {
                 if (const auto r = prepare(recorded[i], resolve, scene.vk, prepared[i]); r != ReplayResult::success) {
@@ -508,26 +510,32 @@ int main(int argc, char** argv) {
     std::snprintf(name, sizeof name, "frame (%zu lists x %zu passes)", lists, passes);
     print_row(name, f, csv);
 
-    // The floor under prepare and emit: making and freeing one PreparedList entry per command, which execute does
-    // for every list before any command is looked at.
-    std::vector<double> floor_ns;
-    for (int rep = 0; rep < warmup + reps; ++rep) {
-        const auto t0 = std::chrono::steady_clock::now();
-        {
-            PreparedList list;
-            list.commands.assign(f.commands, {});
+    // The floor under prepare: one PreparedList entry per command, refilled in storage kept from the last
+    // execution (what execute does), and for comparison made in new storage and freed every time.
+    const auto entries_ns = [&](bool kept) {
+        std::vector<double> ns;
+        PreparedList storage;
+        for (int rep = 0; rep < warmup + reps; ++rep) {
+            const auto t0 = std::chrono::steady_clock::now();
+            if (kept) {
+                storage.commands.assign(f.commands, {});
+            } else {
+                PreparedList fresh;
+                fresh.commands.assign(f.commands, {});
+            }
+            const auto t1 = std::chrono::steady_clock::now();
+            if (rep >= warmup) ns.push_back(std::chrono::duration<double, std::nano>(t1 - t0).count() / double(f.commands));
         }
-        const auto t1 = std::chrono::steady_clock::now();
-        if (rep >= warmup)
-            floor_ns.push_back(std::chrono::duration<double, std::nano>(t1 - t0).count() / double(f.commands));
-    }
-    const double floor = median(floor_ns);
+        return median(ns);
+    };
+    const double kept = entries_ns(true), fresh = entries_ns(false);
     if (csv) {
-        std::printf("prepared_entries_only,%zu,0,%.1f,0,%.1f,0,0,0,0\n", f.commands, floor, floor);
+        std::printf("prepared_entries_kept,%zu,0,%.1f,0,%.1f,0,0,0,0\n", f.commands, kept, kept);
+        std::printf("prepared_entries_fresh,%zu,0,%.1f,0,%.1f,0,0,0,0\n", f.commands, fresh, fresh);
         return failures ? 1 : 0;
     }
-    std::printf("%-28s %8zu | %9s %9.1f %9s %9.1f |\n", "  PreparedList entries only", f.commands, "", floor, "",
-                floor);
+    std::printf("%-28s %8zu | %9s %9.1f %9s %9.1f |\n", "  entries, storage kept", f.commands, "", kept, "", kept);
+    std::printf("%-28s %8zu | %9s %9.1f %9s %9.1f |\n", "  entries, made fresh", f.commands, "", fresh, "", fresh);
     std::printf("\nframe: %.1f us per ExecuteCommandLists of %zu commands, layer only (no driver)\n",
                 (f.record.ns + f.prepare.ns + f.emit.ns) * double(f.commands) / 1000.0, f.commands);
     std::printf("one PreparedList entry (detail::Prepared): %zu bytes; one recorded Command: %zu bytes\n",

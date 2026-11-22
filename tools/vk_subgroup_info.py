@@ -8,10 +8,12 @@ On macOS it opens MoltenVK directly, using the same LEONIDA_VULKAN_LOADER overri
 
 Device choice follows the runtime (runtime/shims/d3d12_vulkan_device.cpp, runtime/src/vulkan_device_filter.h):
 LEONIDA_VK_DEVICE filters by deviceName substring case-insensitively (failing when nothing matches), then Vulkan 1.3
-devices with dynamicRendering, synchronization2, timelineSemaphore and separateDepthStencilLayouts and a graphics queue
-family; a discrete GPU wins (the last one), otherwise the first. The runtime also needs the rest of its device setup
-(surface, extensions); that is not checked here. vk_pipeline_check picks by device type only, so on a PC where the two
-differ the pipelines stage can run on another GPU than the one asked here. VK_LOADER_DRIVERS_SELECT (e.g. '*amd*')
+devices with dynamicRendering, synchronization2, timelineSemaphore, separateDepthStencilLayouts and bufferDeviceAddress
+and a graphics queue family; among those the first of the highest rank wins: a native driver over Microsoft's Dozen
+(vendor 0x1414, which reports a discrete GPU, #915), then discrete > integrated > virtual > CPU (vulkan_device_rank, as
+vk_device_pick.h picks and, with #1799, the runtime). The runtime also needs the rest of its device setup (surface,
+extensions); that is not checked here. vk_pipeline_check (the pipelines stage) picks through vk_device_pick.h.
+VK_LOADER_DRIVERS_SELECT (e.g. '*amd*')
 narrows which drivers the loader offers.
 
 native64 matches the current translated SPIR-V 1.5 modules, which do not allow varying subgroup sizes: either 64 can
@@ -67,6 +69,7 @@ F13_SIZE = 80               # sizeof(VkPhysicalDeviceVulkan13Features): 16 + 15 
 # Byte offsets of the VkBool32 members read below (16-byte header, then 4 bytes per member in header order)
 F12_SEPARATE_DEPTH_STENCIL_LAYOUTS = 16 + 4 * 35
 F12_TIMELINE_SEMAPHORE = 16 + 4 * 37
+F12_BUFFER_DEVICE_ADDRESS = 16 + 4 * 38
 F13_SUBGROUP_SIZE_CONTROL = 16 + 4 * 7
 F13_SYNCHRONIZATION2 = 16 + 4 * 9
 F13_DYNAMIC_RENDERING = 16 + 4 * 12
@@ -158,6 +161,16 @@ def physical_devices(vk, instance):
     raise RuntimeError("vkEnumeratePhysicalDevices repeatedly returned VK_INCOMPLETE")
 
 
+MICROSOFT_VENDOR_ID = 0x1414   # Dozen and the Basic Render Driver; no native GPU driver uses it
+
+
+def device_rank(device_type: int, vendor_id: int) -> int:
+    """vulkan_device_rank() (runtime/src/vulkan_device_filter.h, #1799) and vk_device_pick.h: a native driver over
+    Microsoft's layers (Dozen reports a discrete GPU, #915), then discrete > integrated > virtual > CPU > other."""
+    type_rank = {2: 4, 1: 3, 3: 2, 4: 1}.get(device_type, 0)   # DISCRETE, INTEGRATED, VIRTUAL, CPU
+    return (0 if vendor_id == MICROSOFT_VENDOR_ID else 10) + type_rank
+
+
 def query() -> dict:
     """The answer for the device the runtime would pick; raises RuntimeError with the reason when there is none."""
     if sys.maxsize <= 2**32:
@@ -184,6 +197,7 @@ def query() -> dict:
         device_filter = os.environ.get("LEONIDA_VK_DEVICE", "")
         wanted = device_filter.lower()
         chosen = None
+        chosen_rank = -1
         for d in devs:
             d = ctypes.c_void_p(d)
             sg = SubgroupSizeControl(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES)
@@ -210,7 +224,8 @@ def query() -> dict:
             set_next(f2, f12)
             vk.vkGetPhysicalDeviceFeatures2(d, f2)
             if not (u32(f13, F13_DYNAMIC_RENDERING) and u32(f13, F13_SYNCHRONIZATION2)
-                    and u32(f12, F12_TIMELINE_SEMAPHORE) and u32(f12, F12_SEPARATE_DEPTH_STENCIL_LAYOUTS)):
+                    and u32(f12, F12_TIMELINE_SEMAPHORE) and u32(f12, F12_SEPARATE_DEPTH_STENCIL_LAYOUTS)
+                    and u32(f12, F12_BUFFER_DEVICE_ADDRESS)):
                 continue
             fam = ctypes.c_uint32(0)
             vk.vkGetPhysicalDeviceQueueFamilyProperties(d, ctypes.byref(fam), None)
@@ -219,8 +234,11 @@ def query() -> dict:
             if not any(u32(fams, QUEUE_FAMILY_SIZE * i) & VK_QUEUE_GRAPHICS_BIT for i in range(fam.value)):
                 continue
             dtype = int.from_bytes(raw[PROPS_DEVICE_TYPE:PROPS_DEVICE_TYPE + 4], "little")
-            # the runtime's rule: the first usable device, replaced by every later discrete GPU
-            if chosen is None or dtype == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU:
+            vendor_id = int.from_bytes(raw[PROPS_VENDOR_ID:PROPS_VENDOR_ID + 4], "little")
+            # the runtime's and the harnesses' rule: the first usable device of the highest rank
+            rank = device_rank(dtype, vendor_id)
+            if rank > chosen_rank:
+                chosen_rank = rank
                 chosen = (dev_name,
                           subgroup.subgroupSize, subgroup.supportedStages, sg.minSubgroupSize, sg.maxSubgroupSize,
                           sg.requiredSubgroupSizeStages, bool(u32(f13, F13_SUBGROUP_SIZE_CONTROL)),

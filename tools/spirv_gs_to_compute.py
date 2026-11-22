@@ -27,6 +27,8 @@ import os
 import re
 import subprocess
 import sys
+from itertools import combinations
+from pathlib import Path
 
 LOCAL_SIZE = 64
 IN_VERTS = {"InputPoints": 1, "InputLines": 2, "InputLinesAdjacency": 4, "Triangles": 3,
@@ -312,6 +314,18 @@ def main(argv):
         del args[i:i + 2]
     if len(args) != 2:
         print(USAGE, file=sys.stderr)
+        return 2
+    paths = [("input", args[0]), ("SPIR-V output", args[1])]
+    if lay_path:
+        paths.append(("--layout output", lay_path))
+    try:
+        resolved = [(name, Path(path).resolve()) for name, path in paths]
+        for (left_name, left), (right_name, right) in combinations(resolved, 2):
+            if left == right or (left.exists() and right.exists() and left.samefile(right)):
+                print(f"{left_name} and {right_name} refer to the same file: {left}", file=sys.stderr)
+                return 2
+    except (OSError, RuntimeError, ValueError) as e:
+        print(f"cannot check input/output paths: {e}", file=sys.stderr)
         return 2
     dis = os.environ.get("SPIRV_DIS", "spirv-dis")
     asm = os.environ.get("SPIRV_AS", "spirv-as")
