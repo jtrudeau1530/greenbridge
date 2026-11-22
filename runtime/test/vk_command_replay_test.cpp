@@ -730,10 +730,10 @@ int part_f(vktest::Device& d) {
     EXPECT(list.write_immediate({va_a, 0x44444444, m::marker_out}));
     EXPECT(list.atomic_copy({b_id, 16, a_id, 0, 4, {{a_id, 0, 0, 4}}}));
     EXPECT(list.atomic_copy({c_id, 8, b_id, 0, 4, {{b_id, 0, 0, 4}}}));    // into the range inside b
-    EXPECT(list.discard({a_id, 0, all_subresources, false}));             // a buffer: kept
+    EXPECT(list.discard({a_id, 0, 0, false, true}));                      // a buffer: kept
     // rt: red, discarded whole, then green over the whole view. kept: red, then a discard with rectangles.
     EXPECT(list.clear_render_target({rt_id, 0, 0, 1}, {1, 0, 0, 1}));
-    EXPECT(list.discard({rt_id, 0, all_subresources, false}));
+    EXPECT(list.discard({rt_id, 0, 0, false, true}));
     EXPECT(list.clear_render_target({rt_id, 0, 0, 1}, {0, 1, 0, 1}));
     EXPECT(list.transition({rt_id, 0, s::render_target, s::copy_source}));
     EXPECT(list.clear_render_target({kept_id, 0, 0, 1}, {1, 0, 0, 1}));
@@ -765,7 +765,10 @@ int part_f(vktest::Device& d) {
             !rejected(atomic({b_id, 0, a_id, 0, 4, {{99, 0, 0, 4}}}), unresolved, vk) ||
             !rejected(atomic({b_id, 0, a_id, 0, 4, {{a_id, 0, 0, bytes + 4}}}), ReplayResult::invalid_copy, vk) ||
             !rejected(discard({rt_id, 1, 1, false}), ReplayResult::invalid_subresource, vk) ||
-            !rejected(discard({a_id, 1, 1, false}), ReplayResult::invalid_subresource, vk))
+            !rejected(discard({a_id, 1, 1, false}), ReplayResult::invalid_subresource, vk) ||
+            // An explicit count of UINT_MAX is a range, not the whole resource: it runs past rt and a.
+            !rejected(discard({rt_id, 0, all_subresources, false}), ReplayResult::invalid_subresource, vk) ||
+            !rejected(discard({a_id, 0, all_subresources, false}), ReplayResult::invalid_subresource, vk))
             return false;
         if (replay(list, cb, resolve, vk, &tracker) != ReplayResult::success) return false;
         d.read_back(cb, rt, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT, size, size, 1, pixels, 0);

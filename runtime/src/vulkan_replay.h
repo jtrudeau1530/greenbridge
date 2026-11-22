@@ -1140,15 +1140,16 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
         } else if (const auto* discard = std::get_if<DiscardResource>(&command)) {
             // Buffers and partial (rectangle) discards keep their contents, which "undefined" allows.
             if (!bind(discard->resource)) return ReplayResult::unresolved_resource;
+            const std::uint64_t end = std::uint64_t(discard->first_subresource) + discard->count;
             if (!p.binding.image) {
-                if (discard->count != all_subresources && discard->first_subresource + discard->count > 1)
-                    return ReplayResult::invalid_subresource;
-            } else if (discard->count == all_subresources) {
+                if (!discard->whole && end > 1) return ReplayResult::invalid_subresource;
+            } else if (discard->whole) {
                 VkImageSubresourceRange range{};
                 if (!image_range(p.binding, all_subresources, range)) return ReplayResult::invalid_subresource;
                 if (!discard->partial) p.discards.push_back(range);
             } else {
-                for (std::uint32_t s = discard->first_subresource; s < discard->first_subresource + discard->count; ++s) {
+                for (std::uint64_t i = discard->first_subresource; i < end; ++i) {
+                    const auto s = static_cast<std::uint32_t>(i);
                     VkImageSubresourceRange range{};
                     if (!image_range(p.binding, s, range)) return ReplayResult::invalid_subresource;
                     if (!discard->partial) p.discards.push_back(range);

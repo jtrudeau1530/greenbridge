@@ -308,13 +308,15 @@ struct ClearDepthStencil {
     std::vector<Rect> rects;
 };
 
-// DiscardResource. count == all_subresources: the whole resource (a null region). partial: the region had
-// rectangles, so only part of each subresource is discarded.
+// DiscardResource. whole: the whole resource (a null region); first_subresource and count are then ignored.
+// Otherwise count subresources from first_subresource, an explicit range even when count is all_subresources.
+// partial: the region had rectangles, so only part of each subresource is discarded.
 struct DiscardResource {
     ResourceId resource;
     std::uint32_t first_subresource;
     std::uint32_t count;
     bool partial;
+    bool whole = false;
 };
 
 // D3D12_WRITEBUFFERIMMEDIATE_MODE.
@@ -460,12 +462,13 @@ public:
         return append(ClearDepthStencil{target, flags, depth, stencil, {rects.begin(), rects.end()}});
     }
 
-    // DiscardResource: a count of 0 discards nothing, as in D3D12.
+    // DiscardResource: a count of 0 discards nothing, as in D3D12. An explicit range must end before
+    // all_subresources, the largest index plus one; whether it fits the resource is checked at replay.
     bool discard(const DiscardResource& discard) {
         if (!discard.resource) return false;
+        if (discard.whole) return append(DiscardResource{discard.resource, 0, 0, discard.partial, true});
         if (discard.count == 0) return !closed_;
-        if (discard.count != all_subresources && discard.first_subresource > all_subresources - discard.count)
-            return false;
+        if (std::uint64_t(discard.first_subresource) + discard.count > all_subresources) return false;
         return append(discard);
     }
 

@@ -364,7 +364,8 @@ and any validation error fails them.
   ordered between the writes so that a missing barrier would copy a stale or a later value; a buffer discard
   (kept), a texture cleared, discarded and cleared again, and a rectangle discard (kept); and the lists that must
   be refused (an address past a binding or in none, no `vkCmdUpdateBuffer`, a copy or dependent range past its
-  buffer, an unknown dependent resource, a subresource the resource does not have).
+  buffer, an unknown dependent resource, a subresource the resource does not have, and an explicit discard count of
+  `UINT_MAX`, which is a range and not the whole resource).
 - `d3d12_vulkan_device_test` also runs both atomic copies and the discards through COM, and checks that
   `WriteBufferImmediate` is refused at execution while no buffer has a GPU virtual address on `main`.
 - `vk_bindless_test` (run by `runtime/test/shaders/check.py` and `scripts/run_gpu_tests.py`): the translator's
@@ -970,7 +971,8 @@ mapped stages/accesses, and if no single layout serves all uses, use `GENERAL` a
   change. The other cases are no-ops, which "contents undefined" allows: buffers, discards with rectangles (only
   part of each subresource), a part never used yet (it is still to be zero-filled on first use), a list replayed
   without a tracker, and one plane of a combined depth-stencil image without `separateDepthStencilLayouts`
-  (discarding one plane would also discard the other).
+  (discarding one plane would also discard the other). A null region is recorded as `whole`; a region is always an
+  explicit range, even with `NumSubresources = UINT_MAX`, so its `FirstSubresource` is checked like any other.
 - Access bits and sync scopes are not one-to-one. D3D12 lets an access be named with a sync scope whose Vulkan
   stages cannot perform it: `SYNC_ALL_SHADING` with `ACCESS_VERTEX_BUFFER` is valid D3D12, but
   `VK_ACCESS_2_VERTEX_ATTRIBUTE_READ_BIT` needs `VERTEX_ATTRIBUTE_INPUT`, which shading stages are not. Vulkan

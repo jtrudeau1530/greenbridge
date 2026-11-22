@@ -237,7 +237,7 @@ public:
     // A null region discards the whole resource. Not allowed in a bundle.
     void STDMETHODCALLTYPE DiscardResource(ID3D12Resource* resource, const D3D12_DISCARD_REGION* region) override {
         if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);
-        if (!region) return check(list_.discard({resource_id(resource), 0, leonida::all_subresources, false}));
+        if (!region) return check(list_.discard({resource_id(resource), 0, 0, false, true}));
         if (region->NumRects && !region->pRects) return check(false);
         check(list_.discard({resource_id(resource), region->FirstSubresource, region->NumSubresources,
                              region->NumRects != 0}));

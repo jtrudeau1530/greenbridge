@@ -1662,6 +1662,17 @@ int main() {
             const D3D12_WRITEBUFFERIMMEDIATE_PARAMETER misaligned{0x10002, 1};
             list2->WriteBufferImmediate(1, &misaligned, nullptr);
             EXPECT(list->Close() == E_INVALIDARG);
+            // A region with NumSubresources = UINT_MAX is an explicit range, not a null region.
+            EXPECT(SUCCEEDED(list->Reset(allocator.p, nullptr)));
+            const D3D12_DISCARD_REGION all_from_one{0, nullptr, 1, UINT_MAX};
+            list->DiscardResource(rt_resource.p, &all_from_one);
+            EXPECT(list->Close() == E_INVALIDARG);
+            EXPECT(SUCCEEDED(list->Reset(allocator.p, nullptr)));
+            const D3D12_DISCARD_REGION all_from_zero{0, nullptr, 0, UINT_MAX};
+            list->DiscardResource(rt_resource.p, &all_from_zero);
+            EXPECT(list->Close() == S_OK);
+            queue->ExecuteCommandLists(1, lists);
+            EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::invalid_subresource);
 
             // Nothing on main gives a buffer a GPU virtual address yet (GetGPUVirtualAddress, #157/#291), so an
             // immediate write has no target: the list is refused and nothing is submitted.
