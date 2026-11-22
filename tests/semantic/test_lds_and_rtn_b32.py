@@ -910,5 +910,124 @@ class TestConditionCodesAndStatusFlags(unittest.TestCase):
         self.assertTrue(flags.result_has_sign_bit)
 
 
+class TestIEEE754BoundaryExtremes(unittest.TestCase):
+    """Unit tests for IEEE 754 boundary extremes, subnormals, and NaN handling."""
+
+    def setUp(self) -> None:
+        self.lds = LDSMemory(65536)
+        self.state = ScalarThreadState(lds=self.lds)
+        self.interp = ScalarDSInterpreter()
+
+    def test_snan_bit_preservation_without_quietening(self) -> None:
+        # IEEE 754 Single-Precision Signaling NaN:
+        # Exponent = 0xFF (bits 30..23), Quiet bit = 0 (bit 22), Payload != 0 (bits 21..0)
+        snan32 = 0x7F800001
+        self.assertEqual(snan32 & 0x00400000, 0)  # Quiet bit is 0
+
+        self.lds.write_dword(1, snan32)
+        self.state.set_vgpr(VGPR(1), 4)  # dword 1
+        self.state.set_vgpr(VGPR(2), 0xFFFFFFFF)  # Identity mask
+
+        inst = DSAndB32Instruction(DSOpcode.DS_AND_RTN_B32, vaddr=VGPR(1), vdata=VGPR(2), vdst=VGPR(3))
+        ret = self.interp.execute(self.state, inst)
+
+        # Returned value and LDS value must preserve sNaN exactly without setting quiet bit
+        self.assertEqual(ret, snan32)
+        self.assertEqual(ret & 0x00400000, 0)
+        self.assertEqual(self.lds.read_dword(1), snan32)
+        self.assertEqual(self.lds.read_dword(1) & 0x00400000, 0)
+
+    def test_qnan_payload_preservation(self) -> None:
+        # Quiet NaN with non-standard payload
+        qnan32 = 0x7FC01234
+        self.assertNotEqual(qnan32 & 0x00400000, 0)  # Quiet bit is 1
+
+        self.lds.write_dword(2, qnan32)
+        self.state.set_vgpr(VGPR(1), 8)
+        self.state.set_vgpr(VGPR(2), 0xFFFFFFFF)
+
+        inst = DSAndB32Instruction(DSOpcode.DS_AND_RTN_B32, vaddr=VGPR(1), vdata=VGPR(2), vdst=VGPR(4))
+        ret = self.interp.execute(self.state, inst)
+
+        self.assertEqual(ret, qnan32)
+        self.assertEqual(self.lds.read_dword(2), qnan32)
+
+    def test_signed_zeros_and_sign_bit_clearing(self) -> None:
+        pos_zero = 0x00000000  # +0.0
+        neg_zero = 0x80000000  # -0.0
+
+        # Masking -0.0 with 0x7FFFFFFF clears sign bit, giving +0.0
+        self.assertEqual(oracle_and_b32(neg_zero, 0x7FFFFFFF), pos_zero)
+        # Masking -0.0 with 0xFFFFFFFF preserves -0.0
+        self.assertEqual(oracle_and_b32(neg_zero, 0xFFFFFFFF), neg_zero)
+
+        self.lds.write_dword(0, neg_zero)
+        self.state.set_vgpr(VGPR(1), 0)
+        self.state.set_vgpr(VGPR(2), 0x7FFFFFFF)
+
+        inst = DSAndB32Instruction(DSOpcode.DS_AND_RTN_B32, vaddr=VGPR(1), vdata=VGPR(2), vdst=VGPR(5))
+        ret = self.interp.execute(self.state, inst)
+
+        self.assertEqual(ret, neg_zero)
+        self.assertEqual(self.lds.read_dword(0), pos_zero)
+
+    def test_infinities_sign_bit_manipulation(self) -> None:
+        pos_inf = 0x7F800000  # +inf
+        neg_inf = 0xFF800000  # -inf
+
+        self.lds.write_dword(3, neg_inf)
+        self.state.set_vgpr(VGPR(1), 12)
+        self.state.set_vgpr(VGPR(2), 0x7FFFFFFF)
+
+        inst = DSAndB32Instruction(DSOpcode.DS_AND_RTN_B32, vaddr=VGPR(1), vdata=VGPR(2), vdst=VGPR(6))
+        ret = self.interp.execute(self.state, inst)
+
+        self.assertEqual(ret, neg_inf)
+        self.assertEqual(self.lds.read_dword(3), pos_inf)
+
+    def test_subnormals_denorm_preservation(self) -> None:
+        # Smallest positive subnormal (denorm min)
+        subnorm_min = 0x00000001
+        # Largest subnormal (denorm max)
+        subnorm_max = 0x007FFFFF
+
+        # Bitwise operations must never flush denormals to zero (no FTZ)
+        self.assertEqual(oracle_and_b32(subnorm_min, 0xFFFFFFFF), subnorm_min)
+        self.assertEqual(oracle_and_b32(subnorm_max, 0xFFFFFFFF), subnorm_max)
+
+        self.lds.write_dword(4, subnorm_max)
+        self.state.set_vgpr(VGPR(1), 16)
+        self.state.set_vgpr(VGPR(2), subnorm_min)
+
+        inst = DSAndB32Instruction(DSOpcode.DS_AND_RTN_B32, vaddr=VGPR(1), vdata=VGPR(2), vdst=VGPR(7))
+        ret = self.interp.execute(self.state, inst)
+
+        self.assertEqual(ret, subnorm_max)
+        self.assertEqual(self.lds.read_dword(4), subnorm_min)
+
+    def test_ieee754_field_extraction_masks(self) -> None:
+        # Float 3.14159265 in hex: 0x40490FDB
+        pi_bits = 0x40490FDB
+
+        sign_mask = 0x80000000
+        exp_mask = 0x7F800000
+        mant_mask = 0x007FFFFF
+
+        self.assertEqual(oracle_and_b32(pi_bits, sign_mask), 0)
+        self.assertEqual(oracle_and_b32(pi_bits, exp_mask), 0x40000000)
+        self.assertEqual(oracle_and_b32(pi_bits, mant_mask), 0x00490FDB)
+
+        # End-to-end LDS execution extracting exponent
+        self.lds.write_dword(5, pi_bits)
+        self.state.set_vgpr(VGPR(1), 20)
+        self.state.set_vgpr(VGPR(2), exp_mask)
+
+        inst = DSAndB32Instruction(DSOpcode.DS_AND_RTN_B32, vaddr=VGPR(1), vdata=VGPR(2), vdst=VGPR(8))
+        ret = self.interp.execute(self.state, inst)
+
+        self.assertEqual(ret, pi_bits)
+        self.assertEqual(self.lds.read_dword(5), 0x40000000)
+
+
 if __name__ == "__main__":
     unittest.main()
