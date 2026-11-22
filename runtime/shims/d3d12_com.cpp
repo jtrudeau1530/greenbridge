@@ -203,6 +203,12 @@ public:
         check(list_.resolve_subresource({resource_id(dst), dst_subresource, resource_id(src), src_subresource, region}));
     }
 
+    // A null buffer turns predication off (docs/d3d12_vulkan.md section 4.7). Bundles may not set it.
+    void STDMETHODCALLTYPE SetPredication(ID3D12Resource* buffer, UINT64 offset, D3D12_PREDICATION_OP op) override {
+        if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);
+        check(list_.set_predication({resource_id(buffer), offset, u(op)}));
+    }
+
     void STDMETHODCALLTYPE ClearRenderTargetView(D3D12_CPU_DESCRIPTOR_HANDLE view, const FLOAT color[4], UINT count,
                                                  const D3D12_RECT* rects) override {
         if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);

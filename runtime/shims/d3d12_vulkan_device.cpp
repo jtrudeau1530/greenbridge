@@ -456,6 +456,7 @@ public:
                      VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
                      VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
                      VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT;
+        if (device_.info.conditional_rendering) info.usage |= VK_BUFFER_USAGE_CONDITIONAL_RENDERING_BIT_EXT;
         if (vk.vkCreateBuffer(device_.info.device, &info, nullptr, &buffer_) != VK_SUCCESS) return E_OUTOFMEMORY;
         VkMemoryRequirements requirements{};
         vk.vkGetBufferMemoryRequirements(device_.info.device, buffer_, &requirements);
@@ -719,7 +720,8 @@ public:
         }
 
         state_.context = std::make_unique<leonida::VulkanContext>(get_device, info.device,
-                                                                  info.separate_depth_stencil_layouts);
+                                                                  info.separate_depth_stencil_layouts,
+                                                                  info.conditional_rendering);
         if (info.bindless && state_.context->loaded() && !create_bindless(get_device))
             std::fprintf(stderr, "[rt] d3d12: the bindless set 0 could not be created\n");
     }
@@ -1507,6 +1509,7 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     LEONIDA_INSTANCE(vkGetPhysicalDeviceProperties);
     LEONIDA_INSTANCE(vkGetPhysicalDeviceQueueFamilyProperties);
     LEONIDA_INSTANCE(vkGetPhysicalDeviceFeatures2);
+    LEONIDA_INSTANCE(vkEnumerateDeviceExtensionProperties);
     LEONIDA_INSTANCE(vkCreateDevice);
     LEONIDA_INSTANCE(vkGetDeviceProcAddr);
 #undef LEONIDA_INSTANCE
@@ -1555,7 +1558,29 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
         return fail("no Vulkan 1.3 GPU with dynamicRendering, synchronization2, timelineSemaphore and "
                     "separateDepthStencilLayouts");
 
-    VkPhysicalDeviceVulkan13Features enable13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
+    // VK_EXT_conditional_rendering for SetPredication, when the GPU has it (optional: docs/d3d12_vulkan.md 4.7).
+    VkPhysicalDeviceConditionalRenderingFeaturesEXT conditional{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CONDITIONAL_RENDERING_FEATURES_EXT};
+    {
+        std::uint32_t extension_count = 0;
+        vkEnumerateDeviceExtensionProperties(info.physical, nullptr, &extension_count, nullptr);
+        std::vector<VkExtensionProperties> extensions(extension_count);
+        vkEnumerateDeviceExtensionProperties(info.physical, nullptr, &extension_count, extensions.data());
+        for (const auto& e : extensions)
+            if (!std::strcmp(e.extensionName, VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME)) {
+                VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &conditional};
+                vkGetPhysicalDeviceFeatures2(info.physical, &features);
+                info.conditional_rendering = conditional.conditionalRendering == VK_TRUE;
+            }
+        if (!info.conditional_rendering)
+            std::fprintf(stderr, "[rt] d3d12: the GPU has no VK_EXT_conditional_rendering: SetPredication is unsupported\n");
+    }
+    VkPhysicalDeviceConditionalRenderingFeaturesEXT enable_conditional{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CONDITIONAL_RENDERING_FEATURES_EXT};
+    enable_conditional.conditionalRendering = VK_TRUE;
+
+    VkPhysicalDeviceVulkan13Features enable13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
+                                              info.conditional_rendering ? &enable_conditional : nullptr};
     enable13.dynamicRendering = VK_TRUE;
     enable13.synchronization2 = VK_TRUE;
     VkPhysicalDeviceVulkan12Features enable12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &enable13};
@@ -1590,10 +1615,15 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     enable.shaderStorageImageArrayDynamicIndexing = info.bindless;
     enable.samplerAnisotropy = info.sampler_anisotropy;
     if (!chosen_bc) std::fprintf(stderr, "[rt] d3d12: the GPU has no BC texture support\n");
+    const char* conditional_extension = VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME;
     VkDeviceCreateInfo device_info{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &enable12};
     device_info.queueCreateInfoCount = 1;
     device_info.pQueueCreateInfos = &queue_info;
     device_info.pEnabledFeatures = &enable;
+    if (info.conditional_rendering) {
+        device_info.enabledExtensionCount = 1;
+        device_info.ppEnabledExtensionNames = &conditional_extension;
+    }
     if (vkCreateDevice(info.physical, &device_info, nullptr, &owned.device) != VK_SUCCESS)
         return fail("vkCreateDevice failed");
     info.device = owned.device;

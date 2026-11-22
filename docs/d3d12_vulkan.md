@@ -120,7 +120,7 @@ The design is therefore an **IR per command list**:
 - `Reset` on a command list discards its IR; the allocator owns the memory. D3D12 already requires the application
   not to reset an allocator whose lists are in flight; the layer can rely on that and assert in debug builds.
 - `Close` freezes the IR. `ExecuteBundle` is accepted only on a direct list, with an already-closed bundle as its callee; the bundle IR is copied by value at the call site, so the source can be reused or reset without changing the parent. Command-list creation and reset require an allocator of the same type. A bundle cannot be submitted directly to a command queue.
-- Bundle restrictions are checked while recording for the IR operations currently implemented here (barriers, clears, copies and resolves); those calls are not legal inside a D3D12 bundle and make `Close` return `E_INVALIDARG`. The currently implemented sticky front/back stencil reference is carried back to the parent when the bundle sets it. Draw and other graphics-state commands are still stubs, so this establishes validation and the IR insertion point but does not yet render bundle geometry.
+- Bundle restrictions are checked while recording for the IR operations currently implemented here (barriers, clears, copies, resolves and `SetPredication`); those calls are not legal inside a D3D12 bundle and make `Close` return `E_INVALIDARG`. The currently implemented sticky front/back stencil reference is carried back to the parent when the bundle sets it. Draw and other graphics-state commands are still stubs, so this establishes validation and the IR insertion point but does not yet render bundle geometry.
 - A queue's `ExecuteCommandLists` submits in order with one timeline semaphore signal. `Wait`/`Signal` become
   timeline-semaphore waits/signals. `Present` queues after the frame's work.
 
@@ -837,9 +837,27 @@ the first boot, implement the DXGI path and stub PresentX with a clear log.
   one Vulkan indirect call. Use a compute expansion pass that writes a Vulkan-shaped indirect buffer, or
   `VK_NV_device_generated_commands` on NVIDIA. Start with the simple signatures; the trace will show which
   signatures the game creates.
-- Predication (`SetPredication`) maps to `VK_EXT_conditional_rendering`; D3D12's 64-bit equal/not-equal value
-  becomes a 32-bit condition when the high dword is zero, or a small compute pass that evaluates the full 64-bit
-  comparison into the condition buffer.
+- Predication (`SetPredication`) maps to `VK_EXT_conditional_rendering` (D3D-18). Done: `GraphicsCommandList::
+  SetPredication` records a `Predication` command (`runtime/src/command_list.h`; offset 8-byte aligned, op
+  `EQUAL_ZERO` or `NOT_EQUAL_ZERO`, a null buffer turns it off). The replay (`runtime/src/vulkan_replay.h`) begins
+  conditional rendering on the predicate buffer, plain for `EQUAL_ZERO` (Vulkan discards when the word is 0) and
+  `VK_CONDITIONAL_RENDERING_INVERTED_BIT_EXT` for `NOT_EQUAL_ZERO`, ends it before a new predicate (it cannot
+  nest) and at the end of the list (predication does not carry over to the next list). While a predicate is set,
+  whole-view clears are replayed as one rectangle with `vkCmdClearAttachments`, because `vkCmdClearColorImage` and
+  `vkCmdClearDepthStencilImage` ignore conditional rendering. The standalone device enables the extension and its
+  `conditionalRendering` feature when the GPU has them, and then creates buffers with
+  `VK_BUFFER_USAGE_CONDITIONAL_RENDERING_BIT_EXT`; without it a predicated list is rejected (`unsupported`).
+  Checked by part E of `vk_command_replay_test` on an NVIDIA GeForce RTX 3070.
+  Open:
+  - Copies and resolves. D3D12 predicates `CopyBufferRegion`, `CopyTextureRegion`, `CopyResource` and
+    `ResolveSubresource`; Vulkan's conditional rendering does not cover transfer commands, so they run
+    unconditionally. `PreparedList::unpredicated_copies` counts them. A fix replays a predicated copy as a compute
+    dispatch, which conditional rendering does cover.
+  - The 64-bit value. Vulkan reads one 32-bit word, so the low dword of D3D12's value is used: wrong only when the
+    low dword is 0 and the high one is not (an occlusion count that is a non-zero multiple of 2^32). A fix is a small
+    compute pass that ORs both dwords into a condition buffer.
+  - Draws, dispatches and `ExecuteIndirect` are covered by conditional rendering as soon as they are replayed
+    (D3D-3, D3D-4, D3D-17); `ClearUnorderedAccessView*` and `ResolveSubresource` need the same check when added.
 
 ### 4.8 Ray tracing and XDXR
 
