@@ -45,9 +45,7 @@ struct HapticApi {
     void* (*open_joystick)(void* joystick);   // SDL_OpenHapticFromJoystick
     void (*close)(void* haptic);              // SDL_CloseHaptic
     uint32_t (*features)(void* haptic);       // SDL_GetHapticFeatures: the SDL_HAPTIC_* bits the device supports
-    int (*num_axes)(void* haptic);            // SDL_GetNumHapticAxes
     int (*max_effects)(void* haptic);         // SDL_GetMaxHapticEffects
-    bool (*effect_supported)(void* haptic, const void* effect);  // SDL_HapticEffectSupported
     int (*create_effect)(void* haptic, const void* effect);      // SDL_CreateHapticEffect, -1 on failure
     bool (*update_effect)(void* haptic, int effect, const void* data);  // SDL_UpdateHapticEffect
     bool (*run_effect)(void* haptic, int effect, uint32_t iterations);  // SDL_RunHapticEffect

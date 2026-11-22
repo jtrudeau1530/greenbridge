@@ -741,9 +741,7 @@ void* fake_open(void*) {
 }
 void fake_close(void*) { ++g_fake.closes; }
 uint32_t fake_features(void* h) { return static_cast<FakeHaptic*>(h)->features; }
-int fake_axes(void*) { return 1; }
 int fake_max_effects(void* h) { return static_cast<FakeHaptic*>(h)->max_effects; }
-bool fake_supported(void*, const void*) { return true; }
 int fake_create(void* h, const void* e) {
     FakeHaptic* f = static_cast<FakeHaptic*>(h);
     ++f->creates;
@@ -773,9 +771,8 @@ bool fake_gain(void* h, int gain) {
     f->last_gain = gain;
     return true;
 }
-const rt::gameinput::HapticApi kFakeHaptic{fake_open,  fake_close, fake_features, fake_axes, fake_max_effects,
-                                           fake_supported, fake_create, fake_update, fake_run, fake_stop,
-                                           fake_destroy, fake_gain};
+const rt::gameinput::HapticApi kFakeHaptic{fake_open,    fake_close, fake_features, fake_max_effects, fake_create,
+                                           fake_update,  fake_run,   fake_stop,     fake_destroy,    fake_gain};
 
 // The motors of one device, and the effect object its force-feedback motor hands out. Runs with no other pad.
 void test_force_feedback(IGameInput* input) {

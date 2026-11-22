@@ -103,11 +103,7 @@ bool same_guid(const GUID& a, const GUID& b) { return std::memcmp(&a, &b, sizeof
 void* sdl_open_haptic(void* js) { return SDL_OpenHapticFromJoystick(static_cast<SDL_Joystick*>(js)); }
 void sdl_close_haptic(void* h) { SDL_CloseHaptic(static_cast<SDL_Haptic*>(h)); }
 uint32_t sdl_haptic_features(void* h) { return SDL_GetHapticFeatures(static_cast<SDL_Haptic*>(h)); }
-int sdl_haptic_axes(void* h) { return SDL_GetNumHapticAxes(static_cast<SDL_Haptic*>(h)); }
 int sdl_haptic_max_effects(void* h) { return SDL_GetMaxHapticEffects(static_cast<SDL_Haptic*>(h)); }
-bool sdl_haptic_supported(void* h, const void* e) {
-    return SDL_HapticEffectSupported(static_cast<SDL_Haptic*>(h), static_cast<const SDL_HapticEffect*>(e));
-}
 int sdl_haptic_create(void* h, const void* e) {
     return SDL_CreateHapticEffect(static_cast<SDL_Haptic*>(h), static_cast<const SDL_HapticEffect*>(e));
 }
@@ -121,10 +117,10 @@ bool sdl_haptic_stop(void* h, int id) { return SDL_StopHapticEffect(static_cast<
 void sdl_haptic_destroy(void* h, int id) { SDL_DestroyHapticEffect(static_cast<SDL_Haptic*>(h), id); }
 bool sdl_haptic_gain(void* h, int gain) { return SDL_SetHapticGain(static_cast<SDL_Haptic*>(h), gain); }
 
-const rt::gameinput::HapticApi kSdlHaptic{sdl_open_haptic,  sdl_close_haptic, sdl_haptic_features, sdl_haptic_axes,
-                                          sdl_haptic_max_effects, sdl_haptic_supported, sdl_haptic_create,
-                                          sdl_haptic_update, sdl_haptic_run,  sdl_haptic_stop,
-                                          sdl_haptic_destroy, sdl_haptic_gain};
+const rt::gameinput::HapticApi kSdlHaptic{sdl_open_haptic,     sdl_close_haptic, sdl_haptic_features,
+                                          sdl_haptic_max_effects, sdl_haptic_create, sdl_haptic_update,
+                                          sdl_haptic_run,      sdl_haptic_stop,  sdl_haptic_destroy,
+                                          sdl_haptic_gain};
 std::atomic<const rt::gameinput::HapticApi*> g_haptic_api{&kSdlHaptic};
 const rt::gameinput::HapticApi& haptics() { return *g_haptic_api.load(); }
 
