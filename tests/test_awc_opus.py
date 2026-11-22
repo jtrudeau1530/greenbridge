@@ -335,6 +335,24 @@ class ExportBankTest(unittest.TestCase):
                     self.assertEqual(read_wav(out / stem / "00000001.wav")["pcm"], struct.pack("<h", sample))
                 self.assertEqual(previous.read_bytes(), b"previous export")
 
+    def test_cli_fails_when_bank_enumeration_is_incomplete(self):
+        src = Path(self.tmp.name) / "banks"
+        src.mkdir()
+        blocked = src / "blocked"
+
+        def walk(root, onerror=None):
+            yield root, ["blocked"], ["valid.awc"]
+            if onerror:
+                onerror(PermissionError(13, "Permission denied", blocked))
+
+        totals = {"opus": 0, "pcm": 0, "other": 0, "music": 0}
+        with mock.patch.object(awc.os, "walk", walk), mock.patch.object(awc, "export_bank", return_value=totals) as export, \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()) as err:
+            self.assertEqual(awc.main([str(src), self.out, "--jobs", "1"]), 1)
+        self.assertIn("blocked", err.getvalue())
+        self.assertIn("Permission denied", err.getvalue())
+        export.assert_not_called()
+
     def test_cli_bank_limits(self):
         src = Path(self.tmp.name) / "banks"
         src.mkdir()
