@@ -216,6 +216,122 @@ class SOrn2SaveExecB64ASTNode:
         return out_env
 
 
+# -----------------------------------------------------------------------------
+# Commit 3: Deterministic Scalar Instruction Interpreter
+# -----------------------------------------------------------------------------
+
+@dataclass
+class ScalarMachineState:
+    """Deterministic hardware state representing the RDNA2 Scalar ALU."""
+
+    sgpr: List[int] = field(default_factory=lambda: [0] * 104)
+    exec_mask: int = EXEC_ALL_ONES
+    scc: int = SCC_CLEARED
+
+    def read_sgpr32(self, idx: int) -> int:
+        if not (0 <= idx < 104):
+            raise IndexError(f"SGPR index out of range: {idx}")
+        return self.sgpr[idx] & MASK32
+
+    def write_sgpr32(self, idx: int, val: int) -> None:
+        if not (0 <= idx < 104):
+            raise IndexError(f"SGPR index out of range: {idx}")
+        self.sgpr[idx] = val & MASK32
+
+    def read_sgpr64(self, idx: int) -> int:
+        if idx % 2 != 0:
+            raise ValueError(f"64-bit SGPR access must be even-aligned: s{idx}")
+        lo = self.read_sgpr32(idx)
+        hi = self.read_sgpr32(idx + 1)
+        return u32_pair_to_u64(lo, hi)
+
+    def write_sgpr64(self, idx: int, val: int) -> None:
+        if idx % 2 != 0:
+            raise ValueError(f"64-bit SGPR access must be even-aligned: s{idx}")
+        lo, hi = u64_to_u32_pair(val)
+        self.write_sgpr32(idx, lo)
+        self.write_sgpr32(idx + 1, hi)
+
+    def read_exec(self) -> int:
+        return self.exec_mask & MASK64
+
+    def write_exec(self, val: int) -> None:
+        self.exec_mask = val & MASK64
+
+    def read_scc(self) -> int:
+        return self.scc & 1
+
+    def write_scc(self, val: int) -> None:
+        self.scc = 1 if val else 0
+
+
+@dataclass
+class ScalarInstruction:
+    """Decoded scalar instruction."""
+
+    opcode: str
+    dst: str
+    src0: Union[int, str]
+
+
+class ScalarInterpreter:
+    """Deterministic interpreter executing SALU instructions."""
+
+    @staticmethod
+    def parse_src64(operand: Union[int, str], state: ScalarMachineState) -> int:
+        if isinstance(operand, int):
+            return operand & MASK64
+        op = operand.strip().lower()
+        if op == "exec":
+            return state.read_exec()
+        if op == "null":
+            return 0
+        if op.startswith("s[") and op.endswith("]"):
+            inner = op[2:-1]
+            parts = inner.split(":")
+            idx = int(parts[0])
+            return state.read_sgpr64(idx)
+        if op.startswith("s") and not op.startswith("s["):
+            idx = int(op[1:])
+            return state.read_sgpr64(idx)
+        if op.startswith("0x"):
+            return int(op, 16) & MASK64
+        return int(op) & MASK64
+
+    def step(self, instr: ScalarInstruction, state: ScalarMachineState) -> Tuple[int, int, int]:
+        if instr.opcode != "s_orn2_saveexec_b64":
+            raise ValueError(f"Unsupported opcode in ScalarInterpreter: {instr.opcode}")
+
+        src0_val = self.parse_src64(instr.src0, state)
+        old_exec = state.read_exec()
+
+        saved_exec, new_exec, scc = oracle_s_orn2_saveexec_b64(src0_val, old_exec)
+
+        dst = instr.dst.strip().lower()
+        if dst == "null":
+            pass
+        elif dst == "exec":
+            pass
+        elif dst.startswith("s[") and dst.endswith("]"):
+            parts = dst[2:-1].split(":")
+            dst_idx = int(parts[0])
+            state.write_sgpr64(dst_idx, saved_exec)
+        elif dst.startswith("s") and not dst.startswith("s["):
+            dst_idx = int(dst[1:])
+            state.write_sgpr64(dst_idx, saved_exec)
+        else:
+            raise ValueError(f"Invalid destination register: {instr.dst}")
+
+        state.write_exec(new_exec)
+        state.write_scc(scc)
+
+        return saved_exec, new_exec, scc
+
+
+# -----------------------------------------------------------------------------
+# Test Suites
+# -----------------------------------------------------------------------------
+
 class TestReferenceOracleAndArchitecturalModel(unittest.TestCase):
     """Commit 1: Reference mathematical oracle and architectural model tests."""
 
@@ -329,17 +445,14 @@ class TestSymbolicASTDefinitions(unittest.TestCase):
         node = SOrn2SaveExecB64ASTNode(sdst=dst_valid, ssrc0=src_valid)
         self.assertTrue(node.type_check())
 
-        # Invalid dst width (32-bit SGPR for 64-bit saveexec)
         dst_invalid = RegRef("s4", RegType.SGPR, 4, RegWidth.B32)
         node_bad_dst = SOrn2SaveExecB64ASTNode(sdst=dst_invalid, ssrc0=src_valid)
         self.assertFalse(node_bad_dst.type_check())
 
-        # Invalid src width
         src_invalid = LiteralExpr(width=RegWidth.B32, val=0x1234)
         node_bad_src = SOrn2SaveExecB64ASTNode(sdst=dst_valid, ssrc0=src_invalid)
         self.assertFalse(node_bad_src.type_check())
 
-        # NULL destination is valid
         dst_null = RegRef("null", RegType.NULL, 0, RegWidth.B64)
         node_null = SOrn2SaveExecB64ASTNode(sdst=dst_null, ssrc0=src_valid)
         self.assertTrue(node_null.type_check())
@@ -386,6 +499,89 @@ class TestSymbolicASTDefinitions(unittest.TestCase):
         expected_exec = (0x00FF_00FF_00FF_00FF | (~0xAAAA_5555_AAAA_5555 & MASK64)) & MASK64
         self.assertEqual(final_env["exec"], expected_exec)
         self.assertEqual(final_env["scc"], SCC_SET if expected_exec != 0 else SCC_CLEARED)
+
+
+class TestDeterministicScalarInterpreter(unittest.TestCase):
+    """Commit 3: Deterministic scalar instruction interpreter tests."""
+
+    def setUp(self) -> None:
+        self.state = ScalarMachineState()
+        self.interp = ScalarInterpreter()
+
+    def test_interpreter_basic_execution(self) -> None:
+        """Test step execution with SGPR operands."""
+        self.state.write_sgpr64(4, 0x1111_2222_3333_4444)
+        self.state.write_exec(0x5555_6666_7777_8888)
+
+        instr = ScalarInstruction(opcode="s_orn2_saveexec_b64", dst="s[0:1]", src0="s[4:5]")
+        saved, new_exec, scc = self.interp.step(instr, self.state)
+
+        self.assertEqual(saved, 0x5555_6666_7777_8888)
+        self.assertEqual(self.state.read_sgpr64(0), 0x5555_6666_7777_8888)
+        expected_exec = (0x1111_2222_3333_4444 | (~0x5555_6666_7777_8888 & MASK64)) & MASK64
+        self.assertEqual(new_exec, expected_exec)
+        self.assertEqual(self.state.read_exec(), expected_exec)
+        self.assertEqual(self.state.read_scc(), SCC_SET if expected_exec != 0 else SCC_CLEARED)
+
+    def test_interpreter_null_destination(self) -> None:
+        """Verify writing to null destination discards saved exec without altering SGPRs."""
+        self.state.write_sgpr64(0, 0xCAFE_BABE_DEAD_BEEF)
+        self.state.write_exec(0xFFFF_0000_FFFF_0000)
+
+        instr = ScalarInstruction(opcode="s_orn2_saveexec_b64", dst="null", src0=0x0000_FFFF_0000_FFFF)
+        saved, new_exec, scc = self.interp.step(instr, self.state)
+
+        self.assertEqual(saved, 0xFFFF_0000_FFFF_0000)
+        # s[0:1] remains unchanged
+        self.assertEqual(self.state.read_sgpr64(0), 0xCAFE_BABE_DEAD_BEEF)
+        # exec is updated: src0 | ~exec = (0x0000_FFFF_0000_FFFF | 0x0000_FFFF_0000_FFFF) = 0x0000_FFFF_0000_FFFF
+        self.assertEqual(self.state.read_exec(), 0x0000_FFFF_0000_FFFF)
+        self.assertEqual(self.state.read_scc(), SCC_SET)
+
+    def test_interpreter_inline_constants(self) -> None:
+        """Verify behavior with inline constants 0, -1, 1."""
+        # src0 = 0, exec = ALL_ONES -> new_exec = 0, scc = 0
+        self.state.write_exec(EXEC_ALL_ONES)
+        instr0 = ScalarInstruction(opcode="s_orn2_saveexec_b64", dst="s[2:3]", src0=0)
+        _, new_exec, scc = self.interp.step(instr0, self.state)
+        self.assertEqual(new_exec, 0)
+        self.assertEqual(scc, SCC_CLEARED)
+        self.assertEqual(self.state.read_scc(), SCC_CLEARED)
+
+        # src0 = -1 (0xFFFFFFFFFFFFFFFF) -> new_exec = ALL_ONES, scc = 1
+        instr_neg1 = ScalarInstruction(opcode="s_orn2_saveexec_b64", dst="s[4:5]", src0=-1)
+        _, new_exec, scc = self.interp.step(instr_neg1, self.state)
+        self.assertEqual(new_exec, EXEC_ALL_ONES)
+        self.assertEqual(scc, SCC_SET)
+        self.assertEqual(self.state.read_scc(), SCC_SET)
+
+    def test_interpreter_sequential_program(self) -> None:
+        """Verify a multi-step sequence simulating control flow branching."""
+        # Step 1: Initial branch mask setup
+        self.state.write_exec(0xFFFF_FFFF_0000_0000)
+        self.state.write_sgpr64(6, 0x0000_0000_FFFF_0000)
+
+        # Step 2: Saveexec to s[8:9]
+        instr1 = ScalarInstruction(opcode="s_orn2_saveexec_b64", dst="s[8:9]", src0="s[6:7]")
+        self.interp.step(instr1, self.state)
+        self.assertEqual(self.state.read_sgpr64(8), 0xFFFF_FFFF_0000_0000)
+        # new_exec = 0x0000_0000_FFFF_0000 | ~0xFFFF_FFFF_0000_0000 = 0x0000_0000_FFFF_0000 | 0x0000_0000_FFFF_FFFF
+        # = 0x0000_0000_FFFF_FFFF
+        self.assertEqual(self.state.read_exec(), 0x0000_0000_FFFF_FFFF)
+
+        # Step 3: Second saveexec chaining with literal
+        instr2 = ScalarInstruction(opcode="s_orn2_saveexec_b64", dst="s[10:11]", src0=0)
+        self.interp.step(instr2, self.state)
+        self.assertEqual(self.state.read_sgpr64(10), 0x0000_0000_FFFF_FFFF)
+        # new_exec = 0 | ~0x0000_0000_FFFF_FFFF = 0xFFFF_FFFF_0000_0000
+        self.assertEqual(self.state.read_exec(), 0xFFFF_FFFF_0000_0000)
+
+    def test_interpreter_alignment_enforcement(self) -> None:
+        """Verify unaligned 64-bit SGPR accesses raise ValueError."""
+        with self.assertRaises(ValueError):
+            self.state.read_sgpr64(1)  # Odd index
+        with self.assertRaises(ValueError):
+            self.state.write_sgpr64(3, 123)  # Odd index
 
 
 if __name__ == "__main__":
