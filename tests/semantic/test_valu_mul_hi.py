@@ -238,6 +238,97 @@ def instruction_to_expression(inst: ASTInstruction) -> MulHiExpr:
     return MulHiExpr(opcode=inst.opcode, lhs=lhs, rhs=rhs)
 
 
+# ==============================================================================
+# Deterministic Scalar Instruction Interpreter for v_mul_hi
+# ==============================================================================
+
+def parse_asm_operand(tok: str) -> ASTOperand:
+    tok = tok.strip()
+    if tok.startswith("v") and tok[1:].isdigit():
+        return ASTOperand(kind=OperandKind.VGPR, reg_idx=int(tok[1:]))
+    elif tok.startswith("s") and tok[1:].isdigit():
+        return ASTOperand(kind=OperandKind.SGPR, reg_idx=int(tok[1:]))
+    elif tok.startswith("0x") or tok.startswith("0X"):
+        return ASTOperand(kind=OperandKind.LITERAL, imm_val=int(tok, 16) & MASK32)
+    else:
+        try:
+            val = int(tok)
+            return ASTOperand(kind=OperandKind.INLINE_INT, imm_val=val & MASK32)
+        except ValueError:
+            raise ValueError(f"Unrecognized assembly operand token: {tok}")
+
+
+def parse_asm_line(line: str) -> ASTInstruction:
+    clean = line.split(";")[0].split("//")[0].strip()
+    tokens = [t for t in clean.replace(",", " ").split() if t]
+    if not tokens:
+        raise ValueError("Empty assembly line")
+    op_str = tokens[0]
+    if op_str == "v_mul_hi_u32":
+        opcode = Opcode.V_MUL_HI_U32
+    elif op_str == "v_mul_hi_i32":
+        opcode = Opcode.V_MUL_HI_I32
+    else:
+        raise ValueError(f"Expected opcode v_mul_hi_u32 or v_mul_hi_i32, got {op_str}")
+
+    if len(tokens) != 4:
+        raise ValueError(f"{op_str} requires 3 operands (dst, src0, src1), got {len(tokens) - 1}: {tokens[1:]}")
+
+    dst = parse_asm_operand(tokens[1])
+    src0 = parse_asm_operand(tokens[2])
+    src1 = parse_asm_operand(tokens[3])
+    inst = ASTInstruction(opcode=opcode, dst=dst, src0=src0, src1=src1)
+    inst.validate()
+    return inst
+
+
+class ScalarInterpreter:
+    """Deterministic scalar instruction interpreter for RDNA2 VALU v_mul_hi."""
+
+    def __init__(self, num_vgprs: int = 256, num_sgprs: int = 106) -> None:
+        self.vgpr = VALURegisterFile(num_vgprs=num_vgprs)
+        self.num_sgprs = num_sgprs
+        self.sgprs = [0] * num_sgprs
+        self.vcc = 0
+        self.scc = 0
+
+    def get_sgpr(self, idx: int) -> int:
+        if not (0 <= idx < self.num_sgprs):
+            raise IndexError(f"SGPR index out of range: {idx}")
+        return self.sgprs[idx] & MASK32
+
+    def set_sgpr(self, idx: int, val: int) -> None:
+        if not (0 <= idx < self.num_sgprs):
+            raise IndexError(f"SGPR index out of range: {idx}")
+        self.sgprs[idx] = val & MASK32
+
+    def resolve_operand(self, op: ASTOperand) -> int:
+        if op.kind == OperandKind.VGPR:
+            return self.vgpr.get_vgpr(op.reg_idx)
+        elif op.kind == OperandKind.SGPR:
+            return self.get_sgpr(op.reg_idx)
+        elif op.kind in (OperandKind.LITERAL, OperandKind.INLINE_INT):
+            return op.imm_val & MASK32
+        raise ValueError(f"Unknown operand kind: {op.kind}")
+
+    def execute_ast(self, inst: ASTInstruction) -> int:
+        inst.validate()
+        s0 = self.resolve_operand(inst.src0)
+        s1 = self.resolve_operand(inst.src1)
+        if inst.opcode == Opcode.V_MUL_HI_U32:
+            res = ref_mul_hi_u32(s0, s1)
+        elif inst.opcode == Opcode.V_MUL_HI_I32:
+            res = ref_mul_hi_i32(s0, s1)
+        else:
+            raise ValueError(f"Unsupported opcode: {inst.opcode}")
+        self.vgpr.set_vgpr(inst.dst.reg_idx, res)
+        return res
+
+    def execute_asm(self, line: str) -> int:
+        inst = parse_asm_line(line)
+        return self.execute_ast(inst)
+
+
 class TestVMulHiOracleAndModel(unittest.TestCase):
     """Test suite for reference mathematical oracle and architectural model."""
 
@@ -380,6 +471,65 @@ class TestSymbolicAST(unittest.TestCase):
         )
         with self.assertRaises(ValueError):
             oob_dst.validate()
+
+
+class TestScalarInterpreter(unittest.TestCase):
+    """Test suite for deterministic scalar instruction interpreter."""
+
+    def test_execute_v_mul_hi_u32_vgpr_sources(self) -> None:
+        interp = ScalarInterpreter()
+        interp.vgpr.set_vgpr(1, 0x80000000)
+        interp.vgpr.set_vgpr(2, 2)
+
+        dst = ASTOperand(kind=OperandKind.VGPR, reg_idx=0)
+        src0 = ASTOperand(kind=OperandKind.VGPR, reg_idx=1)
+        src1 = ASTOperand(kind=OperandKind.VGPR, reg_idx=2)
+        inst = ASTInstruction(opcode=Opcode.V_MUL_HI_U32, dst=dst, src0=src0, src1=src1)
+
+        res = interp.execute_ast(inst)
+        self.assertEqual(res, 1)
+        self.assertEqual(interp.vgpr.get_vgpr(0), 1)
+
+    def test_execute_v_mul_hi_i32_vgpr_sources(self) -> None:
+        interp = ScalarInterpreter()
+        interp.vgpr.set_vgpr(1, to_u32(-10))
+        interp.vgpr.set_vgpr(2, to_u32(20))
+
+        dst = ASTOperand(kind=OperandKind.VGPR, reg_idx=0)
+        src0 = ASTOperand(kind=OperandKind.VGPR, reg_idx=1)
+        src1 = ASTOperand(kind=OperandKind.VGPR, reg_idx=2)
+        inst = ASTInstruction(opcode=Opcode.V_MUL_HI_I32, dst=dst, src0=src0, src1=src1)
+
+        res = interp.execute_ast(inst)
+        # -200 -> negative 64-bit product -> hi dword = 0xFFFFFFFF
+        self.assertEqual(res, 0xFFFFFFFF)
+        self.assertEqual(interp.vgpr.get_vgpr(0), 0xFFFFFFFF)
+
+    def test_execute_sgpr_and_literal_sources(self) -> None:
+        interp = ScalarInterpreter()
+        interp.set_sgpr(4, 0x10000)
+        interp.vgpr.set_vgpr(2, 0x20000)
+
+        # v0 = v_mul_hi_u32 v2, s4 -> (0x20000 * 0x10000) >> 32 = 0x200000000 >> 32 = 2
+        res = interp.execute_asm("v_mul_hi_u32 v0, v2, s4")
+        self.assertEqual(res, 2)
+        self.assertEqual(interp.vgpr.get_vgpr(0), 2)
+
+        # literal multiplication
+        res_lit = interp.execute_asm("v_mul_hi_u32 v1, v0, 0x80000000")
+        # 2 * 0x80000000 = 0x100000000 -> hi = 1
+        self.assertEqual(res_lit, 1)
+        self.assertEqual(interp.vgpr.get_vgpr(1), 1)
+
+    def test_execute_i32_assembly(self) -> None:
+        interp = ScalarInterpreter()
+        interp.vgpr.set_vgpr(5, 0x80000000)  # -2^31
+        interp.vgpr.set_vgpr(6, 0x80000000)  # -2^31
+
+        # (-2^31) * (-2^31) = +2^62 = 0x40000000_00000000 -> hi = 0x40000000
+        res = interp.execute_asm("v_mul_hi_i32 v0, v5, v6")
+        self.assertEqual(res, 0x40000000)
+        self.assertEqual(interp.vgpr.get_vgpr(0), 0x40000000)
 
 
 if __name__ == "__main__":
