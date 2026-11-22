@@ -78,6 +78,7 @@ std::vector<uint8_t> make_image() {
     nt->OptionalHeader.SizeOfHeaders = 0x200;
     nt->OptionalHeader.SizeOfImage = 0x2000;
     nt->OptionalHeader.Subsystem = IMAGE_SUBSYSTEM_WINDOWS_CUI;
+    nt->OptionalHeader.NumberOfRvaAndSizes = IMAGE_NUMBEROF_DIRECTORY_ENTRIES;
     auto* sec = IMAGE_FIRST_SECTION(nt);
     std::memcpy(sec->Name, ".text", 6);
     sec->VirtualAddress = kTextRva;

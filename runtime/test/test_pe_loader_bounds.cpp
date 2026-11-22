@@ -717,6 +717,72 @@ void test_highlow_relocations() {
     if (hold) VirtualFree(hold, 0, MEM_RELEASE);
 }
 
+// PE/COFF spec, optional header: NumberOfRvaAndSizes is "the number of data-directory entries in the remainder of
+// the optional header". Entries past it are not directories, whatever bytes they hold.
+void test_directory_count() {
+    std::printf("\n--- NumberOfRvaAndSizes bounds the data directories ---\n");
+    auto img = make_base_image(0x2000, 0x400);
+    auto* nt = nt_header_of(img);
+    nt->OptionalHeader.NumberOfRvaAndSizes = IMAGE_DIRECTORY_ENTRY_IMPORT;  // only the export entry is a directory
+    nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT] = {0xFFFFF000u, sizeof(IMAGE_IMPORT_DESCRIPTOR)};
+    nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT] = {0xFFFFF000u, 0x20};
+    expect_loader_success("Stale entries past NumberOfRvaAndSizes are not read as directories", img);
+}
+
+// A forwarder "kernel32.#65537" names an ordinal no export table can hold (ordinals are 16 bits). It must not be
+// truncated to ordinal 1 and bound to whatever kernel32 exports there.
+void test_forwarder_ordinal_range() {
+    std::printf("\n--- Forwarder ordinal range ---\n");
+    auto dll = make_base_image(0x2000, 0x400);
+    std::fill(dll.begin() + 0x200, dll.end(), uint8_t{0});
+    auto* dnt = nt_header_of(dll);
+    dnt->OptionalHeader.ImageBase = 0x150000000ull;
+    dnt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT] = {0x1000, 0x100};
+    auto* ed = reinterpret_cast<IMAGE_EXPORT_DIRECTORY*>(dll.data() + 0x200);  // RVA 0x1000
+    ed->Base = 1;
+    ed->NumberOfFunctions = 1;
+    ed->NumberOfNames = 1;
+    ed->AddressOfFunctions = 0x1040;
+    ed->AddressOfNames = 0x1050;
+    ed->AddressOfNameOrdinals = 0x1060;
+    const uint32_t forwarder_rva = 0x1080, name_rva = 0x10C0;
+    std::memcpy(dll.data() + 0x240, &forwarder_rva, 4);
+    std::memcpy(dll.data() + 0x250, &name_rva, 4);
+    std::memcpy(dll.data() + 0x280, "kernel32.#65537", 16);
+    std::memcpy(dll.data() + 0x2C0, "F", 2);
+    {
+        std::ofstream out(g_temp_dir / "fwd_ord.dll", std::ios::binary);
+        out.write(reinterpret_cast<const char*>(dll.data()), static_cast<std::streamsize>(dll.size()));
+    }
+
+    auto exe = make_base_image(0x2000, 0x400);
+    std::fill(exe.begin() + 0x200, exe.end(), uint8_t{0});
+    auto* ent = nt_header_of(exe);
+    ent->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT] = {0x1000, 2 * sizeof(IMAGE_IMPORT_DESCRIPTOR)};
+    auto* d = reinterpret_cast<IMAGE_IMPORT_DESCRIPTOR*>(exe.data() + 0x200);
+    d->OriginalFirstThunk = 0x1040;
+    d->Name = 0x1080;
+    d->FirstThunk = 0x1060;
+    const uint64_t hint_name = 0x1090;
+    std::memcpy(exe.data() + 0x240, &hint_name, 8);
+    std::memcpy(exe.data() + 0x260, &hint_name, 8);
+    std::memcpy(exe.data() + 0x280, "fwd_ord.dll", 12);
+    std::memcpy(exe.data() + 0x292, "F", 2);  // after the 2-byte hint
+
+    auto path = write_temp_image(exe);
+    try {
+        rt::Loader loader(g_temp_dir);
+        rt::Module& m = loader.load(path);
+        const bool one = m.imports.size() == 1;
+        check_condition(one && m.imports[0].binding == rt::Binding::Unimplemented,
+                        "Forwarder to ordinal 65537 is not truncated to a host ordinal",
+                        one ? "bound as " + std::to_string(static_cast<int>(m.imports[0].binding))
+                            : std::to_string(m.imports.size()) + " imports");
+    } catch (const std::exception& e) {
+        fail("Forwarder to ordinal 65537 is not truncated to a host ordinal", e.what());
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -735,6 +801,8 @@ int main() {
         test_virtual_address_range_wrapping();
         test_boundary_exact_fits();
         test_highlow_relocations();
+        test_directory_count();
+        test_forwarder_ordinal_range();
     } catch (const std::exception& e) {
         std::printf("FATAL: Unhandled exception during test execution: %s\n", e.what());
         ++g_failures;
