@@ -833,6 +833,22 @@ class CliTests(unittest.TestCase):
             with open(dst, "rb") as f:
                 self.assertEqual(f.read(8), dds.PNG_SIGNATURE)
 
+    def test_cli_rejects_output_aliasing_input(self):
+        original = dds_buffer(4, 4, bc1_block(0xFFFF, 0, [0, 0, 0, 0]),
+                              flags=DDPF_FOURCC, fourcc=b"DXT1")
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "in.dds")
+            alias = os.path.join(tmp, ".", "in.dds")
+            with open(src, "wb") as f:
+                f.write(original)
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                result = dds.main([src, alias])
+            with open(src, "rb") as f:
+                self.assertEqual(f.read(), original)
+            self.assertEqual(result, 1)
+            self.assertIn("output must not overwrite the input DDS", stderr.getvalue())
+
     def test_cli_reports_unsupported_input(self):
         with tempfile.TemporaryDirectory() as tmp:
             src = os.path.join(tmp, "in.dds")

@@ -11,14 +11,17 @@
 //   dimension: 0 = 2D, 1 = 2D array, 2 = 3D, 3 = 1D (the translator's STORE_DIMS); class: 0 = float, 1 = uint, 2 = sint.
 //   bindings 20/21: sampled multisample 2D images / 2D arrays, 256 each (runtime SRVs).
 //   bindings 22/23 and 24/25 are their UINT and SINT equivalents on devices supporting those classes.
+// These are the default counts (BindlessFeatures::counts). size_bindings() sizes the 2D, sampler and storage arrays
+// from the device's limits instead; the shaders declare runtime arrays, so any count works for them.
 //
 // A shader turns a T# or S# into an index through the hash table (descriptor_table.h) and uses that index in
 // whichever binding the instruction calls for: the sampled array of the image's dimension, or one of its storage
 // arrays. So an image has one index, the same in every binding of its dimension, and each dimension has its own
-// index space. The storage arrays hold 256, so an image with storage views gets an index below 256; one without
-// takes a higher index while there is one. Index 0 of every array is a fallback, because a miss gives 0: a 1x1
-// image of zeros, a nearest clamping sampler, and 1x1 storage images. The caller owns the views and samplers it
-// adds and keeps them alive while they are in the set; this class owns only the fallbacks and the table's buffer.
+// index space. The storage arrays are shorter (storage_capacity()), so an image with storage views gets an index
+// they hold; one without takes a higher index while there is one. Index 0 of every array is a fallback, because a
+// miss gives 0: a 1x1 image of zeros, a nearest clamping sampler, and 1x1 storage images. The caller owns the views
+// and samplers it adds and keeps them alive while they are in the set; this class owns only the fallbacks and the
+// table's buffer.
 //
 // Device features: runtimeDescriptorArray for the shaders. With BindlessFeatures::update_after_bind
 // (descriptorBindingSampledImageUpdateAfterBind, ...StorageImage..., ...StorageBuffer...) flush() may run while
@@ -62,12 +65,19 @@ struct StorageViews {
     VkImageView r32ui = VK_NULL_HANDLE;
 };
 
+namespace bindless {
+inline constexpr std::uint32_t binding_count = 26;
+constexpr std::array<std::uint32_t, binding_count> default_counts();
+} // namespace bindless
+
 struct BindlessFeatures {
     bool update_after_bind = false;
     bool partially_bound = false;
     // Fallback sample counts for RGBA8_UNORM, R32_UINT, R32_SINT. A single sample omits that class's MS bindings.
     std::array<VkSampleCountFlagBits, 3> ms_samples{
         VK_SAMPLE_COUNT_1_BIT, VK_SAMPLE_COUNT_1_BIT, VK_SAMPLE_COUNT_1_BIT};
+    // Descriptors in each binding, by binding number: bindless::bindings by default, or what size_bindings() chose.
+    std::array<std::uint32_t, bindless::binding_count> counts = bindless::default_counts();
 };
 
 namespace bindless {
@@ -79,7 +89,6 @@ struct Binding {
 
 inline constexpr std::uint32_t table_binding = 2;
 inline constexpr std::uint32_t sampler_binding = 1;
-inline constexpr std::uint32_t storage_indices = 256;  // what every storage array of bindings 8-19 holds
 inline constexpr std::uint32_t first_ms_binding = 20;
 inline constexpr std::uint32_t no_binding = 0xffffffffu;
 
@@ -100,6 +109,14 @@ inline constexpr std::array<Binding, 26> bindings = {{
     {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 256},  {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 256},
 }};
 
+static_assert(bindings.size() == binding_count);
+
+constexpr std::array<std::uint32_t, binding_count> default_counts() {
+    std::array<std::uint32_t, binding_count> counts{};
+    for (std::uint32_t b = 0; b < binding_count; ++b) counts[b] = bindings[b].count;
+    return counts;
+}
+
 constexpr bool binding_enabled(std::uint32_t binding, const BindlessFeatures& features) {
     return binding < first_ms_binding || features.ms_samples[(binding - first_ms_binding) / 2] != VK_SAMPLE_COUNT_1_BIT;
 }
@@ -108,15 +125,16 @@ constexpr bool binding_enabled(std::uint32_t binding, const BindlessFeatures& fe
 // per-stage or per-set limits have no room for additional pairs of MS arrays.
 constexpr void limit_ms_bindings(BindlessFeatures& features, std::uint32_t sampled_limit,
                                  std::uint32_t resource_limit) {
+    const auto& counts = features.counts;
     std::uint32_t sampled = 0, total = 0;
     for (std::uint32_t b = 0; b < first_ms_binding; ++b) {
-        if (bindings[b].type == VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE) sampled += bindings[b].count;
-        if (bindings[b].type != VK_DESCRIPTOR_TYPE_SAMPLER) total += bindings[b].count;
+        if (bindings[b].type == VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE) sampled += counts[b];
+        if (bindings[b].type != VK_DESCRIPTOR_TYPE_SAMPLER) total += counts[b];
     }
     for (std::uint32_t c = 0; c < features.ms_samples.size(); ++c) {
         if (features.ms_samples[c] == VK_SAMPLE_COUNT_1_BIT) continue;
         const auto b = first_ms_binding + 2 * c;
-        const auto pair = bindings[b].count + bindings[b + 1].count;
+        const auto pair = counts[b] + counts[b + 1];
         if (sampled + pair > sampled_limit || total + pair > resource_limit) {
             features.ms_samples[c] = VK_SAMPLE_COUNT_1_BIT;
         } else {
@@ -124,23 +142,6 @@ constexpr void limit_ms_bindings(BindlessFeatures& features, std::uint32_t sampl
             total += pair;
         }
     }
-}
-
-inline void limit_ms_bindings(BindlessFeatures& features, const VkPhysicalDeviceLimits& limits,
-                              const VkPhysicalDeviceVulkan12Properties& indexed) {
-    const auto sampled = features.update_after_bind
-        ? std::min(indexed.maxPerStageDescriptorUpdateAfterBindSampledImages,
-                   indexed.maxDescriptorSetUpdateAfterBindSampledImages)
-        : std::min(limits.maxPerStageDescriptorSampledImages, limits.maxDescriptorSetSampledImages);
-    auto resources = features.update_after_bind ? indexed.maxPerStageUpdateAfterBindResources : limits.maxPerStageResources;
-    // Fragment outputs count as stage resources. D3D12 allows up to eight render targets.
-    resources -= std::min(resources, std::min(limits.maxColorAttachments, 8u));
-    if (features.update_after_bind) {
-        // Standalone samplers count in the pool, but do not count against the per-stage resource limit.
-        const auto pool = indexed.maxUpdateAfterBindDescriptorsInAllPools;
-        resources = std::min(resources, pool - std::min(pool, bindings[sampler_binding].count));
-    }
-    limit_ms_bindings(features, sampled, resources);
 }
 
 constexpr bool multisampled(ImageDimension dimension) {
@@ -161,8 +162,114 @@ constexpr std::uint32_t r32ui_binding(ImageDimension dimension) {
     return dimension == ImageDimension::dim_2d ? 4 : dimension == ImageDimension::dim_3d ? 7 : no_binding;
 }
 
-// How many images of a dimension the set holds, the fallback included.
-constexpr std::uint32_t image_capacity(ImageDimension dimension) { return bindings[sampled_binding(dimension)].count; }
+// What size_bindings() grows to where the device's limits allow. At 32-64 bytes a descriptor the whole set is then
+// 3-6 MiB (93793 descriptors on an RTX 5070).
+inline constexpr std::uint32_t max_2d_images = 65536;
+inline constexpr std::uint32_t max_storage_indices = 4096;  // in each storage array, at most its dimension's images
+// A full D3D12 shader-visible sampler heap (2048) and room for literal and static S#s, within what the device can
+// create (maxSamplerAllocationCount, at least 4000) less the samplers that are not in the set.
+inline constexpr std::uint32_t max_samplers = 4096;
+inline constexpr std::uint32_t reserved_samplers = 64;
+// Growth leaves this many descriptors of each limit to the other sets of a pipeline layout.
+inline constexpr std::uint32_t growth_headroom = 64;
+
+// Sizes the 2D image, sampler and storage arrays from the device's limits: the update-after-bind ones with
+// features.update_after_bind, the plain ones otherwise. Every binding is visible to every stage, so the per-stage
+// limits apply to the whole set; fragment outputs count as stage resources (D3D12 allows eight render targets) and
+// standalone samplers do not, though they count in an update-after-bind pool.
+//   1. The default counts, or as much of them as the device holds: samplers, then storage, then 2D images.
+//   2. The MS pairs that fit beside them (limit_ms_bindings, which may turn classes off).
+//   3. Growth towards the maximums above, in the same order, within maxPerSetDescriptors. That limit only says
+//      what is sure to work (vkGetDescriptorSetLayoutSupport may allow more), so it never shrinks step 1.
+// A storage array holds the smaller of the storage count and its dimension's images: add_image never gives a
+// storage view an index past the sampled array. The other bindings keep their default counts.
+// Sets features.counts; returns false when a count is below its default because the device's limits are.
+inline bool size_bindings(BindlessFeatures& features, const VkPhysicalDeviceLimits& limits,
+                          const VkPhysicalDeviceVulkan11Properties& v11,
+                          const VkPhysicalDeviceVulkan12Properties& v12) {
+    const bool uab = features.update_after_bind;
+    const std::uint32_t sampled_limit =
+        uab ? std::min(v12.maxPerStageDescriptorUpdateAfterBindSampledImages,
+                       v12.maxDescriptorSetUpdateAfterBindSampledImages)
+            : std::min(limits.maxPerStageDescriptorSampledImages, limits.maxDescriptorSetSampledImages);
+    const std::uint32_t sampler_limit =
+        uab ? std::min(v12.maxPerStageDescriptorUpdateAfterBindSamplers, v12.maxDescriptorSetUpdateAfterBindSamplers)
+            : std::min(limits.maxPerStageDescriptorSamplers, limits.maxDescriptorSetSamplers);
+    const std::uint32_t storage_limit =
+        uab ? std::min(v12.maxPerStageDescriptorUpdateAfterBindStorageImages,
+                       v12.maxDescriptorSetUpdateAfterBindStorageImages)
+            : std::min(limits.maxPerStageDescriptorStorageImages, limits.maxDescriptorSetStorageImages);
+    std::uint32_t resource_limit = uab ? v12.maxPerStageUpdateAfterBindResources : limits.maxPerStageResources;
+    resource_limit -= std::min(resource_limit, std::min(limits.maxColorAttachments, 8u));
+    const std::uint32_t pool_limit = uab ? v12.maxUpdateAfterBindDescriptorsInAllPools : 0xffffffffu;
+
+    auto& counts = features.counts;
+    counts = default_counts();
+    std::uint32_t images = 1, samplers = 1, storage = 1;
+    // Until the end the 2D storage arrays are not capped by the 2D images, which grow after them: capping can only
+    // take descriptors away.
+    const auto apply = [&](bool final) {
+        counts[sampled_binding(ImageDimension::dim_2d)] = images;
+        counts[sampler_binding] = samplers;
+        for (std::uint32_t d = 0; d < 4; ++d) {
+            const auto dimension = ImageDimension(d);
+            const bool capped = final || dimension != ImageDimension::dim_2d;
+            const std::uint32_t held = capped ? std::min(storage, counts[sampled_binding(dimension)]) : storage;
+            for (std::uint32_t c = 0; c < 3; ++c) counts[storage_binding(dimension, c)] = held;
+            if (r32ui_binding(dimension) != no_binding) counts[r32ui_binding(dimension)] = held;
+        }
+    };
+    const auto fits = [&](std::uint32_t headroom, std::uint64_t set_limit) {
+        apply(false);
+        std::uint64_t sampled = 0, sampler = 0, stored = 0, buffers = 0;
+        for (std::uint32_t b = 0; b < binding_count; ++b) {
+            if (!binding_enabled(b, features)) continue;
+            const auto type = bindings[b].type;
+            (type == VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE   ? sampled
+             : type == VK_DESCRIPTOR_TYPE_SAMPLER       ? sampler
+             : type == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE ? stored
+                                                        : buffers) += counts[b];
+        }
+        const auto within = [&](std::uint64_t n, std::uint32_t limit) { return n + headroom <= limit; };
+        const std::uint64_t all = sampled + sampler + stored + buffers;
+        return within(sampled, sampled_limit) && within(sampler, sampler_limit) && within(stored, storage_limit) &&
+               within(sampled + stored + buffers, resource_limit) && all <= pool_limit && all <= set_limit;
+    };
+    // Raises n to the largest value up to `high` that fits; leaves it where it is when none does.
+    const auto grow = [&](std::uint32_t& n, std::uint32_t high, std::uint32_t headroom, std::uint64_t set_limit) {
+        std::uint32_t low = n;
+        while (low < high) {
+            n = low + (high - low + 1) / 2;
+            if (fits(headroom, set_limit)) low = n;
+            else high = n - 1;
+        }
+        n = low;
+    };
+
+    constexpr std::uint64_t no_limit = ~0ull;
+    const auto ms_samples = features.ms_samples;
+    features.ms_samples.fill(VK_SAMPLE_COUNT_1_BIT);
+    grow(samplers, bindings[sampler_binding].count, 0, no_limit);
+    grow(storage, bindings[storage_binding(ImageDimension::dim_2d, 0)].count, 0, no_limit);
+    grow(images, bindings[sampled_binding(ImageDimension::dim_2d)].count, 0, no_limit);
+    apply(false);
+    const bool full = images == bindings[0].count && samplers == bindings[sampler_binding].count &&
+                      storage == bindings[storage_binding(ImageDimension::dim_2d, 0)].count;
+    features.ms_samples = ms_samples;
+    limit_ms_bindings(features, sampled_limit, std::min(resource_limit, pool_limit - std::min(pool_limit, samplers)));
+
+    std::uint64_t set_limit = 0;
+    for (std::uint32_t b = 0; b < binding_count; ++b)
+        if (binding_enabled(b, features)) set_limit += counts[b];
+    set_limit = std::max(set_limit, std::uint64_t(v11.maxPerSetDescriptors));
+    const std::uint32_t creatable =
+        limits.maxSamplerAllocationCount - std::min(limits.maxSamplerAllocationCount, reserved_samplers);
+    grow(samplers, std::max(samplers, std::min(max_samplers, creatable)), growth_headroom, set_limit);
+    grow(images, std::max(images, max_2d_images), growth_headroom, set_limit);
+    grow(storage, std::max(storage, max_storage_indices), growth_headroom, set_limit);
+    apply(true);
+    return full;
+}
 
 } // namespace bindless
 
@@ -194,6 +301,15 @@ public:
     bool supports_ms_class(std::uint32_t component_class) const {
         return component_class < classes && features_.ms_samples[component_class] != VK_SAMPLE_COUNT_1_BIT;
     }
+    // How many images of a dimension the set holds, the fallback included, and how many of the lowest of those
+    // indices its storage arrays hold (0 for the MS dimensions, which have none). The same for samplers.
+    std::uint32_t image_capacity(ImageDimension dimension) const {
+        return features_.counts[bindless::sampled_binding(dimension)];
+    }
+    std::uint32_t storage_capacity(ImageDimension dimension) const {
+        return bindless::multisampled(dimension) ? 0 : features_.counts[bindless::storage_binding(dimension, 0)];
+    }
+    std::uint32_t sampler_capacity() const { return features_.counts[bindless::sampler_binding]; }
     // Set 0 of every pipeline layout made for translated shaders.
     VkDescriptorSetLayout layout() const { return layout_; }
     // Bound at set 0. The same set for the life of this object: flush() updates it in place.
@@ -239,7 +355,7 @@ public:
         const bool stores = storage.as_float || storage.as_uint || storage.as_sint || storage.r32ui;
         if (bindless::multisampled(dimension) && (stores || !supports_ms_class(sampled_class))) return 0;
         auto& used = image_used_[std::uint32_t(dimension)];
-        const std::uint32_t low_end = std::min(std::uint32_t(used.size()), bindless::storage_indices);
+        const std::uint32_t low_end = std::min(std::uint32_t(used.size()), storage_capacity(dimension));
         std::uint32_t index = stores ? 0 : allocate(used, low_end, std::uint32_t(used.size()));
         if (!index) index = allocate(used, 1, low_end);
         if (index) write_image(dimension, index, sampled, sampled_layout, storage, sampled_class);
@@ -422,10 +538,10 @@ private:
         std::uint32_t count = 0;
         for (std::uint32_t b = 0; b < bindless::bindings.size(); ++b) {
             if (!bindless::binding_enabled(b, features_)) continue;
-            entries[count] = {b, bindless::bindings[b].type, bindless::bindings[b].count, VK_SHADER_STAGE_ALL, nullptr};
+            entries[count] = {b, bindless::bindings[b].type, features_.counts[b], VK_SHADER_STAGE_ALL, nullptr};
             flags[count] = (features_.update_after_bind ? VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT : 0) |
                            (features_.partially_bound ? VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT : 0);
-            sizes[count] = {bindless::bindings[b].type, bindless::bindings[b].count};
+            sizes[count] = {bindless::bindings[b].type, features_.counts[b]};
             ++count;
         }
         VkDescriptorSetLayoutBindingFlagsCreateInfo flags_info{
@@ -451,10 +567,10 @@ private:
         if (vk_.vkAllocateDescriptorSets(device_, &set_info, &set_) != VK_SUCCESS) return false;
 
         for (std::uint32_t d = 0; d < dimensions; ++d) {
-            image_used_[d].assign(bindless::image_capacity(ImageDimension(d)), 0);
+            image_used_[d].assign(image_capacity(ImageDimension(d)), 0);
             image_used_[d][0] = 1;
         }
-        sampler_used_.assign(bindless::bindings[bindless::sampler_binding].count, 0);
+        sampler_used_.assign(sampler_capacity(), 0);
         sampler_used_[0] = 1;
         return true;
     }
@@ -716,7 +832,7 @@ private:
         infos.reserve(bindless::bindings.size());
         for (std::uint32_t b = 0; b < bindless::bindings.size(); ++b) {
             if (b == bindless::table_binding || !bindless::binding_enabled(b, features_)) continue;
-            const std::uint32_t count = features_.partially_bound ? 1 : bindless::bindings[b].count;
+            const std::uint32_t count = features_.partially_bound ? 1 : features_.counts[b];
             infos.emplace_back(count, fallback_info(b));
             VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
             write.dstSet = set_;
@@ -762,7 +878,7 @@ private:
         queue(sampled_at, index,
               sampled ? VkDescriptorImageInfo{VK_NULL_HANDLE, sampled, sampled_layout} : fallback_info(sampled_at));
         const auto store = [&](std::uint32_t binding, VkImageView view) {
-            if (binding == bindless::no_binding || index >= bindless::bindings[binding].count) return;
+            if (binding == bindless::no_binding || index >= features_.counts[binding]) return;
             queue(binding, index,
                   view ? VkDescriptorImageInfo{VK_NULL_HANDLE, view, VK_IMAGE_LAYOUT_GENERAL} : fallback_info(binding));
         };

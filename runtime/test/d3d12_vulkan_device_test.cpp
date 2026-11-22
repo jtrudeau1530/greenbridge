@@ -1785,6 +1785,18 @@ int main() {
         }
         EXPECT(device->GetNodeCount() == 1);
 
+        // _COM_Outptr_: a failed slot 14 leaves NULL in the caller's output, as the inner device does.
+        {
+            D3D12_DESCRIPTOR_HEAP_DESC empty{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 0};
+            void* inner_out = reinterpret_cast<void*>(0x1111);
+            EXPECT(inner->CreateDescriptorHeap(&empty, __uuidof(ID3D12DescriptorHeap), &inner_out) == E_INVALIDARG &&
+                   inner_out == nullptr);
+            void* proxy_out = reinterpret_cast<void*>(0x1111);
+            EXPECT(device->CreateDescriptorHeap(&empty, __uuidof(ID3D12DescriptorHeap), &proxy_out) ==
+                   E_INVALIDARG);
+            EXPECT(proxy_out == nullptr);
+        }
+
         // BC1 can be sampled, but it cannot be an attachment or a storage image.
         if (d.bc) {
             const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};

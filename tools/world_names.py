@@ -34,6 +34,7 @@ import json
 import os
 import re
 import sys
+import tempfile
 
 MASK32 = 0xFFFFFFFF
 MASK64 = 0xFFFFFFFFFFFFFFFF
@@ -580,13 +581,13 @@ def _resolve(args) -> int:
 
 def _write_json(path: str, data: dict) -> None:
     directory = os.path.dirname(os.path.abspath(path))
-    if directory:
-        os.makedirs(directory, exist_ok=True)
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as handle:
-        json.dump(data, handle, indent=1, sort_keys=True)
-        handle.write("\n")
-    os.replace(tmp, path)
+    os.makedirs(directory, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=directory, prefix=".world-names-") as staging:
+        tmp = os.path.join(staging, "report.json")
+        with open(tmp, "w", encoding="utf-8") as handle:
+            json.dump(data, handle, indent=1, sort_keys=True)
+            handle.write("\n")
+        os.replace(tmp, path)
 
 
 def main(argv=None) -> int:

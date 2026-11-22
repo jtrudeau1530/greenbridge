@@ -74,7 +74,7 @@ def load_format(fmt: int, offset: int, ncomp: int = 4, dst_sel: int = DST_SEL_XY
         f"\ts_mov_b32 s0, {BASE:#x}\n"
         "\ts_mov_b32 s1, 0\n"                  # base high bits 0, stride 0 (raw)
         "\ts_mov_b32 s2, 0x100\n"              # num_records (bytes)
-        f"\ts_mov_b32 s3, {fmt << 12 | dst_sel:#x}\n"
+        f"\ts_mov_b32 s3, {fmt << 12 | dst_sel | 0x30000000:#x}\n"
         f"\tv_mov_b32 v1, {offset:#x}\n"
         f"\t{op}_{suffix} {vdata}, v1, s[0:3], 0{mods} offen\n"
         "\ts_waitcnt vmcnt(0)\n"

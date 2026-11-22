@@ -526,6 +526,65 @@ int main() {
     if (sc->ResizeBuffers(2, 37, 19, DXGI_FORMAT_R32_UINT, 0) != DXGI_ERROR_UNSUPPORTED)
         return fail("ResizeBuffers should reject unsupported format DXGI_FORMAT_R32_UINT");
 
+    // Measured on host DXGI (RTX 5070 and WARP): DXGI_PRESENT_TEST returns S_OK without presenting, so the back
+    // buffer index stays; a sync interval above 4 is DXGI_ERROR_INVALID_CALL and presents nothing either.
+    {
+        const UINT before = sc->GetCurrentBackBufferIndex();
+        if (sc->Present(0, DXGI_PRESENT_TEST) != S_OK || sc->GetCurrentBackBufferIndex() != before)
+            return fail("Present(0, DXGI_PRESENT_TEST) presented a frame");
+        if (sc->Present(5, 0) != DXGI_ERROR_INVALID_CALL || sc->GetCurrentBackBufferIndex() != before)
+            return fail("Present(5, 0) should be DXGI_ERROR_INVALID_CALL and present nothing");
+    }
+
+    // Host DXGI refuses ResizeBuffers with DXGI_ERROR_INVALID_CALL while the app still holds a back buffer,
+    // and keeps the old buffers.
+    {
+        ID3D12Resource* held = nullptr;
+        if (FAILED(sc->GetBuffer(0, IID_PPV_ARGS(&held))) || !held) return fail("GetBuffer (held)");
+        const HRESULT hr = sc->ResizeBuffers(2, 64, 64, DXGI_FORMAT_UNKNOWN, 0);
+        DXGI_SWAP_CHAIN_DESC1 d{};
+        sc->GetDesc1(&d);
+        held->Release();
+        if (hr != DXGI_ERROR_INVALID_CALL || d.Width != 37 || d.Height != 19)
+            return fail("ResizeBuffers with a held back buffer should be DXGI_ERROR_INVALID_CALL and keep 37x19");
+    }
+
+    // Zero width or height means the window's client area, in ResizeBuffers (the usual WM_SIZE call) and at
+    // creation; host DXGI: ResizeBuffers(0, 0, 0) after resizing the window gives the new client size.
+    {
+        RECT wr{0, 0, 300, 200};
+        AdjustWindowRect(&wr, WS_OVERLAPPEDWINDOW, FALSE);
+        SetWindowPos(hwnd, nullptr, 0, 0, wr.right - wr.left, wr.bottom - wr.top, SWP_NOMOVE | SWP_NOZORDER);
+        RECT cr{};
+        GetClientRect(hwnd, &cr);
+        if (FAILED(sc->ResizeBuffers(0, 0, 0, DXGI_FORMAT_UNKNOWN, 0))) return fail("ResizeBuffers(0, 0, 0)");
+        DXGI_SWAP_CHAIN_DESC1 d{};
+        sc->GetDesc1(&d);
+        if (d.Width != UINT(cr.right) || d.Height != UINT(cr.bottom)) {
+            std::fprintf(stderr, "FAIL: ResizeBuffers(0, 0, 0) gave %ux%u, client area is %ldx%ld\n", d.Width, d.Height,
+                         cr.right, cr.bottom);
+            return 1;
+        }
+
+        HWND hwnd2 = create_test_window(200, 150);
+        if (!hwnd2) return fail("CreateWindowExW (second)");
+        GetClientRect(hwnd2, &cr);
+        DXGI_SWAP_CHAIN_DESC1 zd = scd;
+        zd.Width = 0;
+        zd.Height = 0;
+        IDXGISwapChain1* zsc = nullptr;
+        if (FAILED(factory->CreateSwapChainForHwnd(queue, hwnd2, &zd, nullptr, nullptr, &zsc)) || !zsc)
+            return fail("CreateSwapChainForHwnd 0x0");
+        zsc->GetDesc1(&d);
+        zsc->Release();
+        DestroyWindow(hwnd2);
+        if (d.Width != UINT(cr.right) || d.Height != UINT(cr.bottom)) {
+            std::fprintf(stderr, "FAIL: 0x0 swapchain is %ux%u, client area is %ldx%ld\n", d.Width, d.Height, cr.right,
+                         cr.bottom);
+            return 1;
+        }
+    }
+
     rtv_heap->Release();
     sc->Release();
     fence->Release();

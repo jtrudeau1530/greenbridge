@@ -262,6 +262,9 @@ struct DeviceState {
 
     // Cached physical-device no-attachment sample counts for D3D12_OPTIONS19.
     UINT no_output_sample_counts = 0;
+    // VkPhysicalDeviceDepthStencilResolveProperties: the modes a depth or stencil ResolveSubresourceRegion can use.
+    VkResolveModeFlags depth_resolve_modes = 0;
+    VkResolveModeFlags stencil_resolve_modes = 0;
 
     // VK_EXT_host_image_copy; null unless the device enabled it and its copies accept GENERAL.
     PFN_vkCopyMemoryToImageEXT copy_memory_to_image = nullptr;
@@ -502,9 +505,11 @@ struct DeviceState {
     }
 
     void release(const ImageEntry& entry) {  // descriptor_mutex held
-        bindless->remove_image(entry.dimension, entry.index);
-        context->vk.vkDestroyImageView(info.device, entry.sampled, nullptr);
-        if (entry.storage) context->vk.vkDestroyImageView(info.device, entry.storage, nullptr);
+        const std::uint64_t slot_handle =
+            (static_cast<std::uint64_t>(entry.dimension) << 32) | static_cast<std::uint64_t>(entry.index);
+        context->defer_destroy(leonida::DeferredDeletionQueue::Kind::bindless_slot, slot_handle);
+        context->defer_destroy(leonida::DeferredDeletionQueue::Kind::image_view, entry.sampled);
+        if (entry.storage) context->defer_destroy(leonida::DeferredDeletionQueue::Kind::image_view, entry.storage);
     }
 
     // Gives the T# `words` a view in set 0 and an entry in the hash table, unless it has them. `storage`: shaders
@@ -814,19 +819,17 @@ public:
         : device_(device), desc_(desc), heap_(heap), heap_flags_(heap_flags), va_(placed_va) {}
 
     ~Resource() override {
-        auto& vk = device_.context->vk;
-        const VkDevice dev = device_.info.device;
         if (accel_) {
             device_.context->unregister_acceleration_structure(gpu_va_);
             if (buffer_va_ && buffer_va_ != gpu_va_) device_.context->unregister_acceleration_structure(buffer_va_);
-            if (vk.vkDestroyAccelerationStructureKHR) vk.vkDestroyAccelerationStructureKHR(dev, accel_, nullptr);
+            device_.context->defer_destroy(leonida::DeferredDeletionQueue::Kind::acceleration_structure, accel_);
         }
         if (image_address_) device_.forget_image(image_address_);
         device_.context->remove_resource(id());
         if (in_arena_) device_.arena_release(arena_offset_, desc_.Width);
-        if (image_) vk.vkDestroyImage(dev, image_, nullptr);
-        if (buffer_) vk.vkDestroyBuffer(dev, buffer_, nullptr);
-        if (memory_) vk.vkFreeMemory(dev, memory_, nullptr);
+        if (image_) device_.context->defer_destroy(leonida::DeferredDeletionQueue::Kind::image, image_);
+        if (buffer_) device_.context->defer_destroy(leonida::DeferredDeletionQueue::Kind::buffer, buffer_);
+        if (memory_) device_.context->defer_destroy(leonida::DeferredDeletionQueue::Kind::device_memory, memory_);
     }
 
     leonida::ResourceId id() const { return resource_id(this); }
@@ -842,6 +845,7 @@ public:
     VkImageAspectFlags aspects() const { return aspects_; }
     std::uint64_t image_address() const { return image_address_; }  // what a T# names the texture by
     VkMemoryPropertyFlags memory_flags() const { return memory_flags_; }  // of the memory type behind it
+    const DeviceState& device_state() const { return device_; }
 
     // Default-heap buffers are ranges of the GPU address arena: console VA = offset, zeroed through the arena's host
     // mapping. Upload and readback buffers keep their own host memory; with buffer device addresses their console
@@ -951,6 +955,10 @@ public:
             }
         }
         binding.buffer = buffer_;
+        binding.size = desc_.Width;
+        binding.host_readable = (heap_.Type == D3D12_HEAP_TYPE_READBACK ||
+                                 (heap_.Type == D3D12_HEAP_TYPE_CUSTOM &&
+                                  heap_.CPUPageProperty == D3D12_CPU_PAGE_PROPERTY_WRITE_BACK));
         binding.va = va_;
         device_.context->add_resource(id(), binding);
         return S_OK;
@@ -2427,6 +2435,15 @@ public:
                 state_.no_output_sample_counts =
                     static_cast<UINT>(props.limits.framebufferNoAttachmentsSampleCounts & kD3D12SampleCounts);
             }
+            if (const auto get_props2 = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties2>(
+                    info.get_instance_proc(info.instance, "vkGetPhysicalDeviceProperties2"))) {
+                VkPhysicalDeviceDepthStencilResolveProperties resolve{
+                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_STENCIL_RESOLVE_PROPERTIES};
+                VkPhysicalDeviceProperties2 props{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &resolve};
+                get_props2(info.physical, &props);
+                state_.depth_resolve_modes = resolve.supportedDepthResolveModes;
+                state_.stencil_resolve_modes = resolve.supportedStencilResolveModes;
+            }
         }
 
         state_.context = std::make_unique<leonida::VulkanContext>(get_device, info.device,
@@ -2493,17 +2510,36 @@ public:
             state_.info.get_instance_proc(state_.info.instance, "vkGetPhysicalDeviceProperties2"));
         if (get_properties) {
             VkPhysicalDeviceVulkan12Properties indexed{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_PROPERTIES};
-            VkPhysicalDeviceProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &indexed};
+            VkPhysicalDeviceVulkan11Properties v11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_PROPERTIES, &indexed};
+            VkPhysicalDeviceProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &v11};
             get_properties(state_.info.physical, &properties);
             features.ms_samples = {VK_SAMPLE_COUNT_4_BIT, state_.ms_fallback_samples(VK_FORMAT_R32_UINT),
                                    state_.ms_fallback_samples(VK_FORMAT_R32_SINT)};
-            leonida::bindless::limit_ms_bindings(features, properties.properties.limits, indexed);
+            if (!leonida::bindless::size_bindings(features, properties.properties.limits, v11, indexed))
+                std::fprintf(stderr, "[rt] d3d12: the device's descriptor limits are below the bindless set's default "
+                                     "sizes; it holds less\n");
         }
+        namespace b = leonida::bindless;
+        std::fprintf(stderr, "[rt] d3d12: bindless set: %u 2D images, %u samplers, %u 2D-array, %u 3D, %u 1D, "
+                             "%u storage indices in 2D\n",
+                     features.counts[b::sampled_binding(leonida::ImageDimension::dim_2d)],
+                     features.counts[b::sampler_binding],
+                     features.counts[b::sampled_binding(leonida::ImageDimension::dim_2d_array)],
+                     features.counts[b::sampled_binding(leonida::ImageDimension::dim_3d)],
+                     features.counts[b::sampled_binding(leonida::ImageDimension::dim_1d)],
+                     features.counts[b::storage_binding(leonida::ImageDimension::dim_2d, 0)]);
         state_.bindless = std::make_unique<leonida::BindlessSet>(get_device, state_.info.device, state_.memory, features);
         if (!state_.bindless->ok() || !state_.context->vk.vkCreateSampler) {
             state_.bindless.reset();
             return false;
         }
+        state_.context->set_bindless_release(
+            [](void* user, std::uint32_t dim, std::uint32_t idx) {
+                auto* st = static_cast<DeviceState*>(user);
+                std::lock_guard lock(st->descriptor_mutex);
+                if (st->bindless) st->bindless->remove_image(static_cast<leonida::ImageDimension>(dim), idx);
+            },
+            &state_);
         state_.context->set_bindless_prepare([this](VkCommandBuffer command_buffer) {
             std::lock_guard lock(state_.descriptor_mutex);
             if (!state_.bindless->fallbacks_ready()) state_.bindless->record_fallback_init(command_buffer);
@@ -2582,8 +2618,12 @@ public:
 
     ~Device() override {
         if (state_.context) {
-            std::lock_guard lock(state_.context->submit_mutex());
-            state_.context->vk.vkDeviceWaitIdle(state_.info.device);
+            {
+                std::lock_guard lock(state_.context->submit_mutex());
+                state_.context->vk.vkDeviceWaitIdle(state_.info.device);
+            }
+            state_.context->drain_deleted_resources(UINT64_MAX);
+            state_.context->set_bindless_release(nullptr, nullptr);
         }
         state_.staging_queue.reset();  // it uses the context
         if (state_.context && state_.bindless) {
@@ -2609,6 +2649,7 @@ public:
     bool upload_in_vram() const { return state_.upload_in_vram; }
     leonida::VulkanContext& context() { return *state_.context; }
     const leonida::BindlessSet* bindless() const { return state_.bindless.get(); }
+    bool bind_sampler(const leonida::gfx10::SamplerWords& words) { return state_.bind_sampler(words); }
     const DeviceState& state() const { return state_; }
     IUnknown* holder() { return identity(); }
     void own(const OwnedRuntime& owned) { owned_ = owned; }
@@ -2662,7 +2703,9 @@ public:
                                                                 HANDLE event) override {
         return set_event_on_multiple_fence_completion(*state_.context, fences, values, count, flags, event);
     }
-    HRESULT STDMETHODCALLTYPE GetDeviceRemovedReason() override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE GetDeviceRemovedReason() override {
+        return (state_.context && state_.context->is_device_lost()) ? DXGI_ERROR_DEVICE_REMOVED : S_OK;
+    }
 
     // Residency and power (D3D-33, docs/d3d12_vulkan.md section 4.1). Vulkan has no residency API: memory from
     // vkAllocateMemory stays usable by the device until vkFreeMemory, and paging under pressure is the kernel
@@ -4568,6 +4611,51 @@ bool color_resolve_format_matches(DXGI_FORMAT format, ID3D12Resource* dst, ID3D1
     return matches(dst) && matches(src);
 }
 
+bool depth_stencil_resolve_supported(DXGI_FORMAT format, ID3D12Resource* dst, UINT dst_subresource, UINT x, UINT y,
+                                     ID3D12Resource* src, UINT src_subresource, const D3D12_RECT* rect,
+                                     D3D12_RESOLVE_MODE mode) {
+    const Resource* d = Resource::from<Resource>(dst);
+    const Resource* s = Resource::from<Resource>(src);
+    if (!d || !s) return false;
+    // The format names the depth format, or one plane by its shader-resource format. Measured on the PC runtime
+    // (RTX 5070 and WARP): Close fails for AVERAGE with the depth format or a stencil plane; the depth plane's
+    // own format (R32_FLOAT, R24_UNORM_X8_TYPELESS) takes AVERAGE as well as MIN and MAX.
+    DXGI_FORMAT family = format;
+    int named_plane = -1;  // -1: any plane of the depth format
+    switch (format) {
+    case DXGI_FORMAT_R32_FLOAT: family = DXGI_FORMAT_D32_FLOAT, named_plane = 0; break;
+    case DXGI_FORMAT_R24_UNORM_X8_TYPELESS: family = DXGI_FORMAT_D24_UNORM_S8_UINT, named_plane = 0; break;
+    case DXGI_FORMAT_X24_TYPELESS_G8_UINT: family = DXGI_FORMAT_D24_UNORM_S8_UINT, named_plane = 1; break;
+    case DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS: family = DXGI_FORMAT_D32_FLOAT_S8X24_UINT, named_plane = 0; break;
+    case DXGI_FORMAT_X32_TYPELESS_G8X24_UINT: family = DXGI_FORMAT_D32_FLOAT_S8X24_UINT, named_plane = 1; break;
+    default: break;
+    }
+    const Format requested = vulkan_format(family, true);
+    if (requested.typeless || !(requested.aspects & VK_IMAGE_ASPECT_DEPTH_BIT)) return false;
+    // The plane a subresource index names (0 depth, 1 stencil), or -1.
+    const auto plane = [&](const Resource* r, UINT subresource) {
+        const D3D12_RESOURCE_DESC& desc = r->desc();
+        if (!(desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) ||
+            vulkan_format(desc.Format, true).format != requested.format)
+            return -1;
+        const UINT planes = (requested.aspects & VK_IMAGE_ASPECT_STENCIL_BIT) ? 2 : 1;
+        const UINT per_plane = UINT(desc.MipLevels) * desc.DepthOrArraySize;
+        return per_plane && subresource / per_plane < planes ? int(subresource / per_plane) : -1;
+    };
+    const int resolved = plane(d, dst_subresource);
+    if (resolved < 0 || resolved != plane(s, src_subresource) || (named_plane >= 0 && resolved != named_plane) ||
+        s->desc().SampleDesc.Count <= 1 || d->desc().SampleDesc.Count != 1)
+        return false;
+    VkResolveModeFlagBits wanted = VK_RESOLVE_MODE_MIN_BIT;
+    if (mode == D3D12_RESOLVE_MODE_MAX) wanted = VK_RESOLVE_MODE_MAX_BIT;
+    else if (mode == D3D12_RESOLVE_MODE_AVERAGE && named_plane == 0) wanted = VK_RESOLVE_MODE_AVERAGE_BIT;
+    else if (mode != D3D12_RESOLVE_MODE_MIN) return false;
+    // The rendering scope that replays it resolves pixels in place (vulkan_replay.h).
+    if (rect ? (LONG(x) != rect->left || LONG(y) != rect->top) : (x || y)) return false;
+    const DeviceState& state = d->device_state();
+    return (resolved ? state.stencil_resolve_modes : state.depth_resolve_modes) & wanted;
+}
+
 std::uint32_t device_max_push_constants_size(ID3D12Device* device) {
     if (!device) return 0;
     ID3D12Device* real = rt::d3d12_xs::device_proxy_real_device(device);
@@ -4609,6 +4697,16 @@ VkDescriptorSet bindless_set(ID3D12Device* device) {
 VkDescriptorSetLayout bindless_set_layout(ID3D12Device* device) {
     const leonida::BindlessSet* set = bindless_of(device);
     return set ? set->layout() : VK_NULL_HANDLE;
+}
+
+HRESULT register_samplers(ID3D12Device* device, std::span<const leonida::gfx10::SamplerWords> samplers) {
+    if (!device) return E_INVALIDARG;
+    ID3D12Device* real = rt::d3d12_xs::device_proxy_real_device(device);
+    Device* d = Device::from<Device>(real ? real : device);
+    if (!d) return E_INVALIDARG;
+    bool all = true;
+    for (const leonida::gfx10::SamplerWords& words : samplers) all = d->bind_sampler(words) && all;
+    return all ? S_OK : E_FAIL;
 }
 
 WindowPresenter::WindowPresenter(IUnknown* device, std::unique_ptr<leonida::VulkanPresenter> presenter)

@@ -642,6 +642,12 @@ if(TARGET Vulkan::Headers)
   if(BUILD_TESTING)
     add_test(NAME vk_device_pick COMMAND vk_device_pick_test)
   endif()
+  # CPU-only: the bindless set's array sizes from synthetic device limits.
+  add_executable(bindless_sizing_test test/bindless_sizing_test.cpp)
+  target_link_libraries(bindless_sizing_test PRIVATE Vulkan::Headers)
+  if(BUILD_TESTING)
+    add_test(NAME bindless_sizing COMMAND bindless_sizing_test)
+  endif()
   if(NOT Vulkan_GLSLANG_VALIDATOR_EXECUTABLE)
     find_program(Vulkan_GLSLANG_VALIDATOR_EXECUTABLE glslangValidator HINTS "$ENV{VULKAN_SDK}/Bin" "$ENV{VULKAN_SDK}/bin")
   endif()
@@ -715,7 +721,7 @@ if(TARGET Vulkan::Headers)
     target_compile_definitions(d3d12_multithread_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(d3d12_multithread_test PRIVATE /W4 /permissive- /utf-8)
     add_test(NAME d3d12_multithread COMMAND d3d12_multithread_test)
-    set_tests_properties(d3d12_multithread PROPERTIES SKIP_RETURN_CODE 77)
+    set_tests_properties(d3d12_multithread PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
 
     # GCL8's QueryInterface and its one method need an allocator and a list, not a Vulkan device.
     add_executable(d3d12_gcl8_test test/d3d12_gcl8_test.cpp)
@@ -828,6 +834,14 @@ if(TARGET Vulkan::Headers)
     add_test(NAME d3d12_typeless_rtv COMMAND d3d12_typeless_rtv_test)
     set_tests_properties(d3d12_typeless_rtv PROPERTIES SKIP_RETURN_CODE 77)
 
+    # Depth/stencil ResolveSubresourceRegion against the host runtime and WARP; run explicitly on a Vulkan GPU.
+    add_executable(d3d12_depth_resolve_test test/d3d12_depth_resolve_test.cpp)
+    target_link_libraries(d3d12_depth_resolve_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
+    target_compile_definitions(d3d12_depth_resolve_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_depth_resolve_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME d3d12_depth_resolve COMMAND d3d12_depth_resolve_test)
+    set_tests_properties(d3d12_depth_resolve PROPERTIES SKIP_RETURN_CODE 77)
+
     # ID3D12Resource::GetDesc against the host runtime and WARP; run explicitly on a Vulkan GPU.
     add_executable(d3d12_resource_desc_test test/d3d12_resource_desc_test.cpp)
     target_link_libraries(d3d12_resource_desc_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
@@ -844,6 +858,15 @@ if(TARGET Vulkan::Headers)
     target_compile_options(d3d12_node_mask_test PRIVATE /W4 /permissive- /utf-8)
     add_test(NAME d3d12_node_mask COMMAND d3d12_node_mask_test)
     set_tests_properties(d3d12_node_mask PROPERTIES SKIP_RETURN_CODE 77)
+
+    # CopyResource / CopyTextureRegion between BC and its uncompressed equivalent (and depth <-> colour) against the
+    # host runtime and WARP; run explicitly on a Vulkan GPU.
+    add_executable(d3d12_copy_xfmt_test test/d3d12_copy_xfmt_test.cpp)
+    target_link_libraries(d3d12_copy_xfmt_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
+    target_compile_definitions(d3d12_copy_xfmt_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_copy_xfmt_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME d3d12_copy_xfmt COMMAND d3d12_copy_xfmt_test)
+    set_tests_properties(d3d12_copy_xfmt PROPERTIES SKIP_RETURN_CODE 77)
 
     # Vulkan-backed IDXGIFactory4 / IDXGISwapChain3 presentation over a Win32 HWND.
     add_executable(dxgi_swapchain_test test/dxgi_swapchain_test.cpp)

@@ -1297,6 +1297,15 @@ def main(argv=None):
     if not os.path.exists(args.source):
         print(f"{args.source}: path not found", file=sys.stderr)
         return 2
+    if args.out and os.path.isfile(args.source):
+        try:
+            overwrites_source = os.path.samefile(args.source, args.out)
+        except FileNotFoundError:
+            overwrites_source = False
+        except OSError as e:
+            ap.error(f"cannot compare source and output paths: {e}")
+        if overwrites_source:
+            ap.error("output must not overwrite the source file")
     collect = (not args.summary_only) and (args.out is not None)
     if os.path.isdir(args.source):
         if args.start is not None or args.limit is not None:

@@ -330,10 +330,18 @@ struct CopyResource {
     ResourceId src;
 };
 
+// D3D12_RESOLVE_MODE values a region resolve replays.
+namespace d3d12_resolve_mode {
+inline constexpr std::uint32_t minimum = 1;
+inline constexpr std::uint32_t maximum = 2;
+inline constexpr std::uint32_t average = 3;
+}
+
 struct ResolveRegion {
     std::uint32_t dst_x;
     std::uint32_t dst_y;
     std::optional<Rect> src_rect;
+    std::uint32_t mode = d3d12_resolve_mode::average;  // colour: average only; stencil: minimum or maximum
 };
 
 // Without a region, both subresources have the same extent. A region with no source rectangle takes the
@@ -656,6 +664,7 @@ public:
         if (!resolve.dst || !resolve.src || resolve.dst == resolve.src) return false;
         if (const auto& region = resolve.region) {
             if (region->dst_x > INT32_MAX || region->dst_y > INT32_MAX) return false;
+            if (region->mode < d3d12_resolve_mode::minimum || region->mode > d3d12_resolve_mode::average) return false;
             if (const auto& r = region->src_rect;
                 r && (r->left < 0 || r->top < 0 || r->right <= r->left || r->bottom <= r->top))
                 return false;

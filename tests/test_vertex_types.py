@@ -4,6 +4,8 @@
 
 Every byte here is built by the test. No game file, value or name is used.
 """
+import contextlib
+import io
 import json
 import os
 import random
@@ -13,6 +15,7 @@ import sys
 import tempfile
 import unittest
 import zlib
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOL = os.path.join(ROOT, "tools", "vertex_types.py")
@@ -152,6 +155,25 @@ class ArchiveTests(unittest.TestCase):
                 out = json.load(fh)
             self.assertEqual((out["streams"], out["blocks"]), (1, 1))
             self.assertEqual(out["tags"]["slot3:28"]["edge_jumps_signed"], 0)
+
+    def test_directory_scan_uses_stable_archive_order(self):
+        with tempfile.TemporaryDirectory() as root:
+            def walk(path):
+                directories = ["z", "a"]
+                yield path, directories, []
+                for directory in directories:
+                    yield os.path.join(path, directory), [], ["one.rpf"]
+
+            with (mock.patch.object(vt.os, "walk", side_effect=walk),
+                  mock.patch.object(vt, "iter_blocks", return_value=()) as blocks,
+                  contextlib.redirect_stdout(io.StringIO()),
+                  contextlib.redirect_stderr(io.StringIO())):
+                self.assertEqual(vt.main([root]), 0)
+
+            self.assertEqual(blocks.call_args_list, [
+                mock.call(os.path.join(root, "a", "one.rpf"), 0),
+                mock.call(os.path.join(root, "z", "one.rpf"), 0),
+            ])
 
     def test_negative_limit_is_an_error(self):
         r = subprocess.run([sys.executable, "-I", TOOL, TOOL, "--limit", "-1"], capture_output=True, text=True)

@@ -230,8 +230,9 @@ HRESULT heap_query_interface(HeapProxy* self, const IID* riid, void** out) {
 // ID3D12DeviceChild::GetDevice on the heap must hand back the Xbox-ABI device, not the raw PC device.
 HRESULT heap_get_device(HeapProxy* self, const IID* riid, void** out) {
     note_heap_slot(7);
-    if (!riid) return E_POINTER;
     if (!out) return E_POINTER;
+    *out = nullptr;
+    if (!riid) return E_POINTER;
     if (!self->device) return E_NOINTERFACE;
     return proxy_query_interface(self->device, riid, out);
 }
@@ -336,8 +337,9 @@ HRESULT create_heap_proxy(ID3D12DescriptorHeap* real, DeviceProxy* device, REFII
 HRESULT proxy_create_descriptor_heap(DeviceProxy* self, const D3D12_DESCRIPTOR_HEAP_DESC* desc, const IID* riid,
                                      void** out) {
     note_slot(14);
-    if (!riid) return E_POINTER;
     if (!out) return E_POINTER;
+    *out = nullptr;  // _COM_Outptr_: NULL on every failure, as the PC device does
+    if (!riid) return E_POINTER;
 
     void* created = nullptr;
     HRESULT hr = self->real->CreateDescriptorHeap(desc, __uuidof(ID3D12DescriptorHeap), &created);
@@ -361,8 +363,9 @@ HRESULT proxy_create_compute_pipeline_state(DeviceProxy* self, const D3D12_COMPU
             std::fprintf(stderr, "[rt] d3d12_xs: slot 62 extra words 0x%llx 0x%llx (ignored)\n",
                          static_cast<unsigned long long>(w2), static_cast<unsigned long long>(w3));
     }
-    if (!riid) return E_POINTER;
     if (!out) return E_POINTER;
+    *out = nullptr;
+    if (!riid) return E_POINTER;
     return self->real->CreateComputePipelineState(desc, *riid, out);
 }
 
@@ -371,9 +374,10 @@ HRESULT proxy_create_resource(DeviceProxy* self, const D3D12_HEAP_PROPERTIES* he
                               D3D12_RESOURCE_STATES initial_state, const D3D12_CLEAR_VALUE* clear_value,
                               const IID* riid, void** out) {
     note_slot(76);
+    if (!out) return E_POINTER;
+    *out = nullptr;
     if (!xbox_desc) return E_POINTER;
     if (!riid) return E_POINTER;
-    if (!out) return E_POINTER;
 
     // The measured description is 56 bytes plus Xbox extension words; D3D12_RESOURCE_DESC is exactly 56 bytes.
     // The Xbox layout word is 0x101 (tiled) or 0x1 (row-major buffer), and is not a PC layout value. Committed

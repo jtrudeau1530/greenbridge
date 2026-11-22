@@ -136,6 +136,62 @@ python -I tools/salu_diff.py --programs 2000 --seed 1
 python -I tests/test_salu_diff.py
 ```
 
+### Hardware oracle (optional)
+
+`--oracle hw` also runs the same programs natively on an AMD GPU and compares the hardware's three SGPRs and SCC
+with the reference (`--oracle translator,hw` does both; `hw` alone leaves the translator out and then also
+runs the 64-bit mask ops, which the hardware reads as plain integers). It tests the reference model, not the
+translator. No tool is needed unless you pass `--oracle hw`; when one is missing the run prints
+`hardware oracle unavailable: <what>` and exits 77, so CI is unaffected.
+
+```
+python -I tools/salu_diff.py --oracle hw --programs 5000 --seed 1
+python -I tools/hw_oracle/runner.py        # checks the setup: prints the device, or what is missing (exit 77)
+```
+
+Setup on Windows, about 800 MB and no admin rights:
+
+- **Driver.** The AMD Windows driver ships the HIP runtime as `amdhip64_7.dll` in System32; nothing else is
+  loaded from the SDK. `LEONIDA_HIP_DLL` overrides the path.
+- **Compiler.** AMD clang with the amdgcn backend and `ld.lld`. The stock LLVM from winget has no amdgcn
+  target. The ROCm wheel has one:
+  `py -m venv .venv` then `.venv\Scripts\python -m pip install --index-url https://stable.repo.amd.com/rocm/whl-next/ "rocm-sdk-core==10.0.0"`;
+  `clang.exe` ends up in `.venv\Lib\site-packages\_rocm_sdk_core\lib\llvm\bin`. A `.venv` in the working
+  directory or repository is found by itself; otherwise set `LEONIDA_AMD_CLANG` to that `clang.exe`.
+- **Linux/ROCm is not supported yet:** `hw_oracle.c` is Windows-only (it loads the driver's DLL).
+- **Host C compiler.** MinGW gcc (on PATH, or `LEONIDA_HOST_CC`) builds `tools/hw_oracle/hw_oracle.c` once into the
+  temp folder. By hand: `gcc -O1 tools/hw_oracle/hw_oracle.c -o hw_oracle.exe`.
+- `LEONIDA_HW_ARCH` overrides the detected architecture (`amdgpu-arch`, else `gfx1150`). GFX10 spellings
+  (`s_load_dwordx2`, `global_store_dwordx4`) are used for `gfx10xx`, so the same kernels assemble for an RDNA2 card
+  (checked by assembling for gfx1030 with clang and gfx1013 with `llvm-mc`; not run on one).
+
+How it works: each program becomes one kernel (`tools/hw_oracle/asm.py`: load the output pointer, run the program,
+store `v[8:11]`), 500 kernels per code object. The code object needs an `.amdgpu_metadata` block; without it the HIP
+runtime fails the load with error 209 (`hipErrorNoBinaryForGpu`), which looks like a wrong GPU. The launcher starts
+one workgroup of one thread per kernel and pre-fills the buffer with `0xDEAD0000`, so a kernel that did not write
+shows up as a mismatch. A program the assembler rejects is counted as a skip, not a pass.
+
+What it can and cannot say:
+
+- It says what **that GPU** does. A Radeon 880M is gfx1150 (RDNA3.5), not RDNA2: a match supports the reference, and
+  a difference is first checked against the RDNA2 ISA text before it is called a reference bug. Only an RDNA2
+  card settles RDNA2.
+- Skipped on gfx11, and listed in the run's skip counts: `s_ff0_i32_b32` and `s_ff0_i32_b64` (GFX11 has no
+  find-first-zero), and programs with two different 32-bit literals in one instruction (not encodable). Renamed
+  opcodes (`s_andn2_*` to `s_and_not1_*`, `s_ff1_*` to `s_ctz_*`, `s_flbit_i32_b32` to `s_clz_i32_u32`, ...) are
+  accepted by LLVM under their old names with the same behaviour and are run.
+- Only the scalar unit is observed, on one lane with EXEC = 1; nothing about wave64 or the other stages.
+
+Result of the first runs (Radeon 880M, driver 26.11.2, AMD clang 23.0.0git): about 40,000 seeded programs
+(1 to 10 instructions each, all opcodes in the table, seeds 1 to 3, 11, 21, 31, 41, 100, 200, with and without
+`--bfe-any` and `--inline64`) gave 0 mismatches apart from one finding. `s_bfe_i32` with `offset + width > 32`:
+the pseudocode taken literally (the old reference) sign-extends from bit `width - 1` of a zero-filled value, but
+the hardware stops the field at bit 31 (`width = min(width, 32 - offset)`) and sign-extends from there. 4,000 random
+control words, including bits 23 to 31 of the control word (ignored), fit that rule exactly. The translator already
+did this (0 of 600 differ), so the reference was the one that was wrong, and it now follows the measured rule. The
+rule rests on that gfx1150 measurement (4000 control words). LLVM's `constantFoldBFE` does the same for the VOP3
+`v_bfe` nodes, but with a 5-bit width, so it is only analogous; RDNA2 is unmeasured.
+
 Two assembler facts matter when writing edge cases:
 
 - An integer token in a float-operand position uses AMD's inline-constant encoding for values 0..64

@@ -199,9 +199,25 @@ What is implemented (all of it testable without the game):
   `ResolveSubresource` becomes `vkCmdResolveImage` in the same layouts as a copy: a multisampled colour
   subresource into a single-sampled one of the same size and format. `ResolveSubresourceRegion` uses the same
   Vulkan operation for non-integer colour with average mode, taking a source rectangle (or the entire subresource)
-  and a destination offset. Depth-stencil resolves, other resolve modes, and resolves between two formats of
-  one typeless family remain open. A multisampled texture copies only to one with the same sample count and has
-  no footprint.
+  and a destination offset. A `ResolveSubresourceRegion` of one depth or stencil plane (the subresource's plane
+  slice, the same on both sides) runs in a rendering scope of its own with no draws: the multisampled plane is the
+  depth or stencil attachment (load `LOAD`, store `NONE`), the destination its resolve target with the mode, the
+  render area the source rectangle. Both move from their resolve layouts to `DEPTH_STENCIL_ATTACHMENT_OPTIMAL` and
+  back around it; the destination's other plane is not attached and keeps its contents. The format is the depth
+  format or the plane's own (`R32_FLOAT`, `R24_UNORM_X8_TYPELESS`, `X24_TYPELESS_G8_UINT`, and the D32S8 pair, untested).
+  What the PC runtime accepts was measured on an RTX 5070 (driver 621.24) and on WARP: `MIN` and `MAX` of either
+  plane by either format, and `AVERAGE` of the depth plane by its own format only (its `Close` fails for `AVERAGE`
+  by the depth format or of stencil); the layer accepts the same. WARP is no reference for two of them: a resolve
+  with the format `D32_FLOAT` passes its `Close` but removes the device when run (`DXGI_ERROR_DRIVER_INTERNAL_ERROR`),
+  and a one-plane D24S8 resolve writes both planes; the RTX 5070 resolves only the plane named. A scope resolves each pixel in place, so a
+  destination offset other than the source rectangle's corner is refused, as is a mode missing from the device's
+  `supportedDepthResolveModes`/`supportedStencilResolveModes` (queried at device creation; one plane per scope, so
+  `independentResolve` never applies). Refused calls fail `Close` and record nothing. `d3d12_depth_resolve_test`
+  compares D32 and D24S8 resolves (typed and typeless resources, whole and rectangle) with the PC runtime; clears give
+  every sample of a pixel one value, so the modes over differing samples are not checked yet. `DECOMPRESS`,
+  `ResolveSubresource` of depth (which D3D12 does not offer) and resolves between two formats of one typeless family
+  remain open. A multisampled texture copies only to one with the same sample count
+  and has no footprint.
   Discards, immediate writes and atomic copies replay as section 4.2 describes.
 - **UAV clears** (`ClearUnorderedAccessViewUint` / `ClearUnorderedAccessViewFloat`). The CPU handle's slot is read
   while recording as the GFX10 descriptor a shader would load (section 3.4), so the clear works with any
@@ -393,16 +409,36 @@ What is implemented (all of it testable without the game):
 
 Descriptors and the bindless set (milestone M2, without the pipelines that will bind the set), from the shader's
 side inwards:
-- **`runtime/src/vulkan_bindless.h`**: set 0 includes the twenty bindings the translator declares, with the
-  array sizes `vk_pipeline_check` uses, and `DescriptorTable` (`runtime/src/descriptor_table.h`, section 5.1)
-  behind binding 2. One set for the device. Details:
+- **`runtime/src/vulkan_bindless.h`**: set 0 includes the twenty bindings the translator declares, and
+  `DescriptorTable` (`runtime/src/descriptor_table.h`, section 5.1) behind binding 2. One set for the device.
+  The translator declares every array as a runtime array, so the counts are the runtime's choice. Details:
+  - The device sizes the arrays once, when it creates the set. It does not recreate the set, because pipeline
+    layouts are built on `bindless_set_layout()`. `bindless::size_bindings` reads the update-after-bind limits
+    (`maxPerStageDescriptorUpdateAfterBind*`, `maxDescriptorSetUpdateAfterBind*`,
+    `maxPerStageUpdateAfterBindResources`, `maxUpdateAfterBindDescriptorsInAllPools`), or the plain limits for a
+    set without update-after-bind. It starts from the default counts below (4096 sampled 2D images, 1024
+    samplers, 1024 2D-array, 256 1D, 256 3D and 256 per storage array). Where a limit is lower, it clamps the
+    sampler, storage and 2D arrays, in that order, and the device logs it. Next come the MS pairs that fit. Then it
+    grows the arrays, in the same order, towards the maximums:
+    - samplers: up to 4096, and at most `maxSamplerAllocationCount` less 64 for samplers outside the set. That
+      covers a full 2048-sampler D3D12 heap plus room for literal and static S#s.
+    - 2D images: up to 65536.
+    - storage arrays: up to 4096 each.
+
+    Growth leaves 64 descriptors of each limit to the other sets of a pipeline layout. It also stays within
+    `maxPerSetDescriptors`, which never shrinks the default counts, because a layout past it may still be
+    supported. The other arrays keep their default counts. On an RTX 5070 (driver 621.24, 1048576 of each type
+    and 4000 samplers) the set has 65536 2D images, 3936 samplers and 4096 storage indices in 2D: 93793
+    descriptors, 3-6 MiB at 32-64 bytes a descriptor. The device prints the counts it chose, and
+    `bindless_sizing_test` checks the rules on synthetic limits.
   - An image has one index in its dimension (2D, 2D array, 3D, 1D, 2DMS or 2DMS array), shared by the
     bindings for that dimension. The runtime adds sampled-image bindings in pairs for 2DMS and 2DMS array:
     20/21 for floating-point and normalized color, 22/23 for unsigned integers, and 24/25 for signed integers.
     The runtime enables pairs that fit the device's descriptor limits and have a multisampled zero fallback
     of the matching numeric class. A missed key reads zero at texel (0, 0), layer 0, sample 0.
-  - The storage arrays are shorter (256), so an image with a storage view gets an index below 256 and a read-only
-    one goes above where there is room.
+  - The storage arrays are shorter (`BindlessSet::storage_capacity`). Each array holds at most as many images
+    as its dimension, and the 2D r32ui array is the same size as the other 2D storage arrays. So an image with a
+    storage view gets an index the storage arrays hold, and a read-only one goes above where there is room.
   - Index 0 of every array is a fallback (a 1x1 image of zeros, a nearest clamping sampler), because a miss is
     index 0.
   - Changes are queued and written by `flush()`, one write a slot, so a view that is removed before the next
@@ -467,9 +503,12 @@ descriptor, as D3D12 refuses it), and stencil-plane views (`PlaneSlice` 1, as
 aspect, in its float-typed sampled arrays like other single-sampled UINT views. Other gaps include descriptors
 the game writes itself, which need
 the execute-time scan of section 3.4 (only descriptors made through the device are registered); static samplers
-of root signatures and the literal S#s of shaders (`literal_samplers` in the index), which are not registered yet;
+of root signatures, which are not registered yet; the literal S#s of shaders (`literal_samplers` in the index),
+which `rt::d3d12::register_samplers` registers without a heap slot but which nothing passes to it yet (the call at
+pipeline creation comes with the shader index, #291);
 custom border colours, minimum/maximum filters, and anisotropy or mirror-once addressing without the Vulkan
-feature, each logged and approximated; the storage arrays hold 255 images a dimension; nothing writes through a
+feature, each logged and approximated; the storage arrays hold 255 images a dimension at the default counts, more
+where the device has room (4095 2D and 1023 2D-array on an RTX 5070); nothing writes through a
 storage view in a D3D12-level test yet (`vk_bindless_test` goes through the storage bindings at the Vulkan
 level). The set is flushed at every `ExecuteCommandLists`; a flush that erases keys or moves the table to a larger
 buffer (`BindlessSet::flush_needs_idle()`) first waits for the device to be idle and then frees the retired table
@@ -582,7 +621,8 @@ therefore every translated shader that declares bindings; tessellation, geometry
 multisampled pipelines, several viewports, primitive restart; `requiredSubgroupSize = 64` for wave64 compute;
 the game's present entry point (`PresentX`; the DXGI factory/swapchain and the presenter above are what it
 calls), HDR and fullscreen; buffer and constant-buffer views (UAV clears read the descriptor bytes, so they do
-not wait on view creation), typeless volume RTVs, depth-stencil resolves;
+not wait on view creation), typeless volume RTVs, depth-stencil resolves to a destination offset other than
+the source rectangle's;
 default-heap buffers are not zero-filled yet; a fence cannot be signalled to a lower value (Vulkan timelines only
 increase; such a signal is reported and dropped); instance step rates above 1 (they need vertex attribute
 divisors); read-only DSVs (the depth image always moves to `DEPTH_STENCIL_ATTACHMENT_OPTIMAL`, which matters once
@@ -637,7 +677,7 @@ and any validation error fails them.
   loads a T# and an S# from a descriptor table and samples. The test draws the gradient with the T# at the fourth
   slot probed, the fallback after the key is erased, the gradient again after the table has grown into a new
   buffer, another view at the same index, and the fallback after removal, with and without the
-  descriptor-indexing flags.
+  descriptor-indexing flags. Last, it draws through a 2D image past 5000 others and a sampler past 2100 others.
 - `d3d12_com_test`: drives the COM objects through their vtables. It also checks that a queue `Wait` on a fence
   the CPU has not signalled holds the GPU back.
 - `dxgi_swapchain_test`: creates a Win32 HWND and exercises `rt::d3d12::create_dxgi_factory`,
@@ -652,6 +692,9 @@ and any validation error fails them.
 - `d3d12_gcl8_test`: the public `ID3D12GraphicsCommandList8` surface: `QueryInterface` for its IID,
   `OMSetFrontAndBackStencilRef(1, 2)` with the recorded values, and the reference count around the query. It
   creates only an allocator and a list, so it needs no GPU or Vulkan loader.
+- `d3d12_depth_resolve_test`: depth and stencil `ResolveSubresourceRegion` of a 4x D32 or D24S8 target cleared with
+  three overlapping values, whole and by rectangle, compared with the PC runtime on the default adapter and WARP;
+  the refused calls must fail `Close` and leave the destination as cleared.
 - `d3d12_vulkan_device_test`: the Vulkan device behind the Xbox-ABI proxy, called the way the game will call it.
   It creates heaps through slot 14 and reads their start handles in RAX, creates a render target through slot 76
   with the Xbox layout word, then creates views, records clears and barriers, executes and waits on a fence.
@@ -754,6 +797,9 @@ and any validation error fails them.
     this one in Vulkan and binds the device's set. It reads the texture through the view's own slot and through
     a copy of it, and gets the fallback from a slot of bytes no view was made for and, after the texture is
     destroyed, from the view's own bytes.
+  - Capacity: 5000 distinct SRVs of that texture and one more, and 2100 distinct wrapping samplers in two
+    2048-slot heaps. The last view through the last sampler reads the texture one tile to the right. With the
+    sizes of before, both were past their arrays ("array is full") and the shader read the fallback.
 - `d3d12_compute_test`: the compute path through the proxy. It creates a root signature from the PC serializer's
   blob, and a PSO through slot 62 from a container shaped like the game's, found in a translator-style index by its
   FSSM hash (an unknown program is refused). It sets root constants, a root UAV and a descriptor table whose
@@ -956,10 +1002,12 @@ The layer's descriptor model:
   If the logical device lacks the feature, the runtime logs the unsupported view
   and its descriptor resolves to the fallback. A clamp at or below the first mip needs no extension. Above the
   last mip, the view retains its dimensions and maps sampled channels to zero while preserving constant channels.
-- Set 0 is a fixed bindless layout. The GPU tests use 4096 sampled 2D images, 1024 samplers, 1024 2D-array
-  images, 256 1D, 256 3D, 1024 storage images and 256 per storage dimension/class; start there and grow by
-  recreating the set at a frame boundary. Use `UPDATE_AFTER_BIND` and `PARTIALLY_BOUND` so a new view does not
-  require rewriting every descriptor; without those features, rebuild the set when it changes.
+- Set 0 is a fixed bindless layout, sized once when the device creates it. The defaults are 4096 sampled 2D
+  images, 1024 samplers, 1024 2D-array images, 256 1D, 256 3D and 256 per storage dimension/class. The 2D, sampler and
+  storage arrays grow to what the device's limits allow, up to 65536, 4096 and 4096 (see `vulkan_bindless.h`
+  above). The set is not recreated to grow, because recreating it would invalidate the pipeline
+  layouts built on it. Use `UPDATE_AFTER_BIND` and `PARTIALLY_BOUND` so a new view does not require rewriting
+  every descriptor; without those features, rebuild the set when it changes.
 - The command buffer binds set 0 once; descriptor-heap changes only update the arrays and the hash table.
 
 **Descriptor lifetime.** A bindless index may be referenced by in-flight command buffers after the resource is
@@ -1348,8 +1396,9 @@ The trace will enumerate them.
   images copy dimension, format, mip levels, array layers and sample count.
 - Copies: `CopyBufferRegion` → `vkCmdCopyBuffer` with arena offsets; `CopyTextureRegion` →
   `vkCmdCopyBufferToImage`/`vkCmdCopyImageToBuffer`/`vkCmdCopyImage`, using the `D3D12_PLACED_SUBRESOURCE_FOOTPRINT`
-  row pitch and height; `CopyResource` → a whole-subresource copy; colour resolves → `vkCmdResolveImage`.
-  Partial resolve regions need a shader or a region copy.
+  row pitch and height; `CopyResource` → a whole-subresource copy; colour resolves → `vkCmdResolveImage`;
+  depth and stencil resolves → a `vkCmdBeginRendering` scope with a resolve attachment (section 3.2).
+  Partial resolve regions to another offset need a shader or a region copy.
 - `WriteBufferImmediate` (D3D-26) → `vkCmdUpdateBuffer` of 4 bytes. The address is resolved when the list is
   executed, through `ReplayFunctions::buffer_at`: the buffer whose `ResourceBinding::va` range holds it, at
   `buffer_offset + (address - va)`. These are the same fields and lookup as #291's arena, and the device fills

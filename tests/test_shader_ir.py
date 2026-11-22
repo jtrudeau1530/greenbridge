@@ -311,6 +311,15 @@ class CliInputTest(unittest.TestCase):
                     self.assertIn("usage:", p.stderr)
                     self.assertNotIn("Traceback", p.stderr)
 
+    def test_s_directory_does_not_count_toward_limit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            os.mkdir(os.path.join(tmp, "a_cache.s"))
+            with open(os.path.join(tmp, "b_shader.s"), "w", encoding="utf-8") as f:
+                f.write("\ts_endpgm ; encoding: [0x00,0x00,0x81,0xbf]\n")
+            result = self.run_tool(tmp, "--limit", "1")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("1 shaders, 1 instructions", result.stdout)
+
     def test_folder_with_limit_still_works(self):
         with tempfile.TemporaryDirectory() as tmp:
             for name in ("a.s", "b.s"):

@@ -31,6 +31,7 @@ from check import (CMPX_CLASS_WORDS, CVT_F32_SAT_CASES, GRADIENT_TESTS, TEST_PRO
                    TEXTURE_MIP_TEST, GATHER_LOD_TEST, MIP_TEST_PASSES, GATHER_WRAP, USER_SGPRS_ENV, USER_SGPRS_WORDS, Skip, mesh_v5_test, not_found_message,
                    pick_build_dir, start_failure, texture_gradient_a16_test, texture_mip_test)
 from check import TEXOFF_ARGS, texoff_problem   # ps_texoff's expected words and arguments live in check.py
+from check import TEXOFF_FALLBACK, texoff_env   # LEONIDA_TEXOFF_FALLBACK=1: texel offsets without maintenance8
 from check import gpu_test_timeout, timed_out   # per-program time limit (LEONIDA_GPU_TEST_TIMEOUT)
 from check import WAVE32_LANE_DUMPS, WAVE32_LANE_ENV, narrow_subgroup_skip, wave32_lane_skip   # as in check.py
 
@@ -604,6 +605,8 @@ def run_suite(a, work: str) -> int:
             cmd.append("--wave64-emulate")
         if bary_fallback():   # raw barycentrics from an interpolated input, fed by a pass-through GS
             cmd.append("--bary-fallback")
+        if TEXOFF_FALLBACK:   # image_sample*_o: offset folded into the coordinate, no VK_KHR_maintenance8
+            cmd.append("--texel-offset-fallback")
         rc, out = run_cmd(cmd, gpu=False)
     print("=== rdna2spirv.py ===")
     print(out)
@@ -659,7 +662,7 @@ def run_suite(a, work: str) -> int:
         elif name == "cs_bvh":
             rc, msg = run_cmd([vk_compute, spv, "1", "bvh"], env=cs_env)
             results.append((name, rc == 0, msg.splitlines()[-1] if msg else ""))
-        elif name in ("cs_bounds", "cs_smem_bounds", "cs_smem_stride_align", "cs_smem_sload_neg", "cs_buf_tail",
+        elif name in ("cs_bounds", "cs_smem_bounds", "cs_smem_stride_align", "cs_smem_sload_neg", "cs_buf_tail", "cs_oob_select", "cs_oob_tail",
                       "cs_cmpx_class_f32"):
             # num_records bounds check (cs_bounds.asm): the out-of-bounds store is dropped and the out-of-bounds
             # load reads 0, so thread 0's four output words are fixed. One thread, no wave64 requirement.
@@ -675,6 +678,8 @@ def run_suite(a, work: str) -> int:
                 "cs_smem_sload_neg": [0x5EED0004, 0x5EED0000, 0x5EED0004, 0x5EED0004, 0x5EED0008, 0x5EED000C,
                                       0xEEEEEEEE, 0xEEEEEEEE],
                 "cs_buf_tail": [0, 0x5EED000C, 0x5EED0008, 0x5EED000C, 0, 0, 0x5EED0010, 0],
+                "cs_oob_select": [0x5EED000C, 0, 0x5EED0014, 0, 0x5EED0018, 0xEEEEEEEE, 0, 0],
+                "cs_oob_tail": [0, 0, 0x5EED0010, 0, 0xBEEF0000, 0xEEEEEEEE, 0, 0x5EED0010],
                 "cs_cmpx_class_f32": CMPX_CLASS_WORDS,
             }[name]
             words = dump_words(msg)
@@ -722,7 +727,8 @@ def run_suite(a, work: str) -> int:
                       "cs_w64x_branch", "cs_w64x_ballot", "cs_w64x_wg128_branches", "cs_w64x_lds_raw",
                       "cs_w64x_lds_war", "cs_w64x_partial", "cs_w64x_sbarrier", "cs_w64x_load_ballot_load",
                       "cs_w64x_mask_reuse", "cs_w64x_mask_reuse2", "cs_w64x_chain_barrier", "cs_barrier_divergent",
-                      "cs_bpermute32", "cs_w64x_partial_scmp", "cs_w32_partial_scmp"):
+                      "cs_bpermute32", "cs_w64x_partial_scmp", "cs_w32_partial_scmp", "cs_barrier_early_end",
+                      "cs_barrier_loop"):
             cs_dump_wants = {
                 "cs_store": [0x400080FF, 0xE00003FF, 0x3C004000, 0xEEEEEEEE, 0x40003C00, 0xBC003800],
                 # base + soffset + imm (cs_smem_soffset_imm.asm); out[4..7] are seeds the shader leaves alone
@@ -769,6 +775,10 @@ def run_suite(a, work: str) -> int:
                 "cs_bpermute32": [0, 50, 162, 99, 36, 218, 183, 15],     # wave32: needs 32 lanes
                 # SHADER-91: s_barrier sites in different wave-uniform branches meet (cs_barrier_divergent.asm)
                 "cs_barrier_divergent": [127, 126, 125, 124, 123, 122, 121, 120],
+                # SHADER-91: other waves end without s_barrier (cs_barrier_early_end.asm); a loop whose trip count
+                # differs per wave (cs_barrier_loop.asm)
+                "cs_barrier_early_end": [127, 126, 125, 124, 123, 122, 121, 120],
+                "cs_barrier_loop": [128, 96, 64, 32, 128, 96, 64, 0xEEEEEEEE],
             }
             want = cs_dump_wants[name]
             # Every dump but cs_store / cs_smem_soffset_imm / cs_w32_lane_wrap / cs_movrelsd_2 / cs_w32_permute /
@@ -781,8 +791,9 @@ def run_suite(a, work: str) -> int:
             emulated = w64_emulated()
             partial = name in ("cs_w64x_partial", "cs_w64x_partial_scmp")
             wave64 = name not in ("cs_store", "cs_smem_soffset_imm", "cs_wqm_w32", "cs_w32_lane_wrap", "cs_movrelsd_2",
-                                  "cs_w32_permute", "cs_barrier_divergent", "cs_w32_lds_u8_d16", "cs_bpermute32",
-                                  "cs_w32_partial_scmp", "cs_exec_const") and not emulated and not partial
+                                  "cs_w32_permute", "cs_barrier_divergent", "cs_barrier_early_end", "cs_barrier_loop",
+                                  "cs_w32_lds_u8_d16", "cs_bpermute32", "cs_w32_partial_scmp",
+                                  "cs_exec_const") and not emulated and not partial
 
             if partial and not emulated:
                 cs_env = dict(os.environ, VKC_SUBGROUP_SIZE="64")
@@ -799,7 +810,7 @@ def run_suite(a, work: str) -> int:
         elif name == "cs_imgstore":
             rc, msg = run_cmd([vk_store, spv])
             results.append((name, rc == 0, msg.splitlines()[-1] if msg else ""))
-        elif name == "cs_imgload":
+        elif name in ("cs_imgload", "cs_imgload_d16"):
             rc, msg = run_cmd([vk_store, spv, "load"])
             results.append((name, rc == 0, msg.splitlines()[-1] if msg else ""))
         elif name in MIP_TEST_PASSES:
@@ -868,12 +879,12 @@ def run_suite(a, work: str) -> int:
                 results.append((name, None, f"SKIP ({reason})"))
             else:
                 results.append((name, rc == 0, lines[-1] if lines else ""))
-        elif name == "ps_texoff":
+        elif name in ("ps_texoff", "ps_texoff_implicit"):
             # Texel offsets: needs vk_texture_test's texture, sampler and descriptor table (vk_harness binds none),
             # and VK_KHR_maintenance8 for the non-constant Offset; the tool exits 77 without it.
             raw = os.path.join(raw_dir, f"{name}.raw")
             rc, msg = run_cmd([os.path.join(a.build, "vk_texture_test" + ext), vs_tri, spv, raw, *TEXOFF_ARGS],
-                              env=dict(os.environ, VKT_NEED_MAINTENANCE8="1"))
+                              env=texoff_env())
             if rc == UNSUPPORTED:
                 results.append((name, None, unsupported_skip(msg)))
             elif rc != 0:

@@ -257,7 +257,7 @@ int main() {
     VkDevice vk_dev = VK_NULL_HANDLE;
     if (create_dev(physical, &dci, nullptr, &vk_dev) != VK_SUCCESS) return fail("vkCreateDevice");
 
-#define DF(name) const auto name = reinterpret_cast<PFN_##name>(gdpa(vk_dev, #name))
+#define DF(name) [[maybe_unused]] const auto name = reinterpret_cast<PFN_##name>(gdpa(vk_dev, #name))
     DF(vkDestroyDevice);
     DF(vkDeviceWaitIdle);
     DF(vkGetDeviceQueue);

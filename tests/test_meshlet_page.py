@@ -299,6 +299,19 @@ class CliTests(unittest.TestCase):
             with open(out2, encoding="utf-8") as fh:
                 self.assertEqual(json.load(fh)["totals"]["pages"], 2)
 
+    def test_page_report_write_failure_is_reported(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = os.path.join(tmp, "page.bin")
+            with open(source, "wb") as fh:
+                fh.write(page(block(4)))
+            out = os.path.join(tmp, "missing", "report.json")
+
+            result = self.run_tool(source, "--json", out, "--quiet")
+
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn(f"cannot write {out}", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+
     def test_missing_input(self):
         r = self.run_tool(os.path.join(tempfile.gettempdir(), "no-such-meshlet-page.bin"))
         self.assertEqual(r.returncode, 2)

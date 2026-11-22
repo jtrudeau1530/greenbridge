@@ -78,6 +78,7 @@ struct ResourceBinding {
     bool depth24_as_float = false;
     bool depth24 = false;  // a D24 family format, native or not: depth clears are quantised to 24 bits first
     bool color_attachment = false;     // has COLOR_ATTACHMENT usage: unordered-access rectangle clears need it
+    bool host_readable = false;        // D3D12_HEAP_TYPE_READBACK (or CUSTOM write-back): needs host-read flush
 };
 
 struct VulkanAccess {
@@ -789,6 +790,9 @@ struct Prepared {
     std::vector<VkBufferImageCopy> buffer_image_copies;  // one direction, given by which side is an image
     std::vector<VkImageCopy> image_copies;
     VkImageResolve resolve{};  // resolves
+    // Depth or stencil resolves: the mode, and the destination view (`view` is the source's).
+    VkResolveModeFlagBits resolve_mode = VK_RESOLVE_MODE_NONE;
+    VkImageView resolve_view = VK_NULL_HANDLE;
     bool has_depth24 = false;  // a depth plane copy of a depth24_as_float texture: convert through depth24
     Depth24Job depth24;                    // the whole copy: where its scratch floats are
     std::vector<Depth24Job> depth24_parts;  // the dispatches that convert it
@@ -1117,6 +1121,33 @@ inline ReplayResult prepare_texture_copy(const CopyTexture& copy, Prepared& p) {
         const auto padded = [block](std::uint32_t size) { return (size + block - 1) / block * block; };
         if (box.right > padded(from.width) || box.bottom > padded(from.height) || box.back > from_depth)
             return ReplayResult::invalid_copy;
+        if (const std::uint32_t dst_block = block_format(p.binding.format, dst.aspectMask).block; dst_block != block) {
+            // A BC format and its uncompressed equivalent ("Format Conversion using Direct3D 10.1"): one texel of the
+            // uncompressed side is one block of the other. The box is in source texels, the offset in destination
+            // texels, and Vulkan takes the extent in source texels, cut at the source's mip edge.
+            const auto blocks = [](std::uint32_t size, std::uint32_t b) { return (size + b - 1) / b; };
+            const bool same_bytes =
+                block_format(p.binding.format, dst.aspectMask).bytes == block_format(p.source.format, src.aspectMask).bytes;
+            if (!same_bytes || (box.left | box.top) % block || (copy.x | copy.y) % dst_block || box.left >= from.width ||
+                box.top >= from.height || !within(copy.z, box.back - box.front, to_depth) ||
+                copy.x / dst_block + blocks(box.right - box.left, block) > blocks(to.width, dst_block) ||
+                copy.y / dst_block + blocks(box.bottom - box.top, block) > blocks(to.height, dst_block))
+                return ReplayResult::invalid_copy;
+            const std::uint32_t w = std::min(padded(box.right - box.left), from.width - box.left);
+            const std::uint32_t h = std::min(padded(box.bottom - box.top), from.height - box.top);
+            // shortcut: into a BC mip whose edge block is partial, Vulkan's extent cannot reach the padded edge; such
+            // a copy is refused until it is staged through a buffer.
+            if (dst_block > 1 && (copy.x + w * dst_block > to.width || copy.y + h * dst_block > to.height))
+                return ReplayResult::invalid_copy;
+            p.image_copies.push_back({{src.aspectMask, src.baseMipLevel, src.baseArrayLayer, 1},
+                                      {std::int32_t(box.left), std::int32_t(box.top), std::int32_t(box.front)},
+                                      {dst.aspectMask, dst.baseMipLevel, dst.baseArrayLayer, 1},
+                                      {std::int32_t(copy.x), std::int32_t(copy.y), std::int32_t(copy.z)},
+                                      {w, h, box.back - box.front}});
+            p.range = dst;
+            p.source_range = src;
+            return ReplayResult::success;
+        }
         std::uint32_t w = box.right - box.left, h = box.bottom - box.top;
         const std::uint32_t d = box.back - box.front;
         if (block > 1) {
@@ -1218,7 +1249,15 @@ inline ReplayResult prepare_resource_copy(Prepared& p) {
         return ReplayResult::success;
     }
     const ResourceBinding &dst = p.binding, &src = p.source;
-    if (!dst.image || !src.image || dst.width != src.width || dst.height != src.height ||
+    // A BC texture and one of its uncompressed equivalent match block for texel ("Format Conversion using
+    // Direct3D 10.1"); the Vulkan extent is in source texels.
+    const std::uint32_t sb = block_format(src.format, VK_IMAGE_ASPECT_COLOR_BIT).block;
+    const std::uint32_t db = block_format(dst.format, VK_IMAGE_ASPECT_COLOR_BIT).block;
+    const auto blocks = [](std::uint32_t size, std::uint32_t b) { return (size + b - 1) / b; };
+    const bool same_shape = sb == db ? dst.width == src.width && dst.height == src.height
+                                     : blocks(dst.width, db) == blocks(src.width, sb) &&
+                                           blocks(dst.height, db) == blocks(src.height, sb);
+    if (!dst.image || !src.image || !same_shape ||
         dst.depth != src.depth || dst.volume != src.volume || dst.mip_levels != src.mip_levels ||
         dst.array_layers != src.array_layers || dst.aspects != src.aspects || dst.samples != src.samples ||
         block_format(dst.format, VK_IMAGE_ASPECT_COLOR_BIT).bytes != block_format(src.format, VK_IMAGE_ASPECT_COLOR_BIT).bytes)
@@ -1226,7 +1265,13 @@ inline ReplayResult prepare_resource_copy(Prepared& p) {
     for (const VkImageAspectFlags aspect : {VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_ASPECT_DEPTH_BIT, VK_IMAGE_ASPECT_STENCIL_BIT}) {
         if (!(dst.aspects & aspect)) continue;
         for (std::uint32_t mip = 0; mip < dst.mip_levels; ++mip) {
-            const VkExtent2D extent = mip_extent(dst, mip);
+            const VkExtent2D extent = mip_extent(src, mip), to = mip_extent(dst, mip);
+            // Lower mips can differ in blocks (BC 12x8 mip 1 is 2x1 blocks, R32G32 3x2 mip 1 is 1x1): more source
+            // blocks than the destination holds is refused, as by WARP. shortcut: a BC destination mip with a partial
+            // edge block cannot take a whole uncompressed texel per block in one vkCmdCopyImage; refused until such
+            // a copy is staged through a buffer.
+            if (sb != db && (blocks(extent.width, sb) * db > to.width || blocks(extent.height, sb) * db > to.height))
+                return ReplayResult::invalid_copy;
             p.image_copies.push_back({{aspect, mip, 0, dst.array_layers}, {0, 0, 0}, {aspect, mip, 0, dst.array_layers},
                                       {0, 0, 0}, {extent.width, extent.height, std::max(1u, src.depth >> mip)}});
         }
@@ -1236,7 +1281,8 @@ inline ReplayResult prepare_resource_copy(Prepared& p) {
     return ReplayResult::success;
 }
 
-// Resolve a multisampled colour image into a single-sampled image of the same format.
+// Resolve a multisampled colour image into a single-sampled image of the same format, or (a region) one plane of a
+// depth/stencil image into the same plane of another: MIN or MAX, or AVERAGE of depth.
 inline ReplayResult prepare_resolve(const ResolveSubresource& resolve, Prepared& p) {
     VkImageSubresourceRange dst{}, src{};
     if (!copy_subresource(p.binding, resolve.dst_subresource, dst) ||
@@ -1259,9 +1305,19 @@ inline ReplayResult prepare_resolve(const ResolveSubresource& resolve, Prepared&
     } else if (from.width != to.width || from.height != to.height) {
         return ReplayResult::invalid_copy;
     }
-    if (src.aspectMask != VK_IMAGE_ASPECT_COLOR_BIT || dst.aspectMask != VK_IMAGE_ASPECT_COLOR_BIT ||
-        p.source.format != p.binding.format)
-        return ReplayResult::unsupported;
+    if (src.aspectMask != dst.aspectMask || p.source.format != p.binding.format) return ReplayResult::unsupported;
+    const auto& region = resolve.region;
+    if (src.aspectMask == VK_IMAGE_ASPECT_COLOR_BIT) {
+        if (region && region->mode != d3d12_resolve_mode::average) return ReplayResult::unsupported;
+    } else {
+        // A rendering scope resolves each pixel in place, so the destination offset must be the source's.
+        if (!region || dst_offset.x != src_offset.x || dst_offset.y != src_offset.y ||
+            (region->mode == d3d12_resolve_mode::average && src.aspectMask != VK_IMAGE_ASPECT_DEPTH_BIT))
+            return ReplayResult::unsupported;
+        p.resolve_mode = region->mode == d3d12_resolve_mode::minimum   ? VK_RESOLVE_MODE_MIN_BIT
+                       : region->mode == d3d12_resolve_mode::maximum   ? VK_RESOLVE_MODE_MAX_BIT
+                                                                       : VK_RESOLVE_MODE_AVERAGE_BIT;
+    }
     p.resolve = {{src.aspectMask, src.baseMipLevel, src.baseArrayLayer, 1}, src_offset,
                  {dst.aspectMask, dst.baseMipLevel, dst.baseArrayLayer, 1}, dst_offset, extent};
     p.range = dst;
@@ -1516,6 +1572,9 @@ public:
     // when the predicate says so, but Vulkan's conditional rendering does not cover transfer commands, so they run
     // unconditionally (docs/d3d12_vulkan.md section 4.7). Counted so the caller can report it.
     std::size_t unpredicated_copies = 0;
+    // Set when any command writes to a host_readable (READBACK) buffer so VulkanQueue only flushes to HOST_BIT when needed.
+    bool wrote_readback = false;
+    VkPipelineStageFlags2 readback_src_stages = 0;
 };
 
 inline ReplayResult plan_occlusion_segments(PreparedList& out) {
@@ -1624,6 +1683,8 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
     // Vulkan allows one active query per type. Only ordinary occlusion uses virtual segments.
     std::size_t ordinary_active = 0;
     bool overlaps = false, binary_active = false, statistics_active = false;
+    out.wrote_readback = false;
+    out.readback_src_stages = 0;
 
     for (std::size_t i = 0; i < commands.size(); ++i) {
         const auto& command = commands[i];
@@ -1742,6 +1803,10 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             const auto [dst_id, src_id] = copy_ids(command);
             const ResourceBinding* source = resolve(src_id);
             if (!bind(dst_id) || !source) return ReplayResult::unresolved_resource;
+            if (p.binding.host_readable) {
+                out.wrote_readback = true;
+                out.readback_src_stages |= VK_PIPELINE_STAGE_2_COPY_BIT;
+            }
             p.source = *source;
             ReplayResult result = ReplayResult::success;
             if (const auto* buffer_copy = std::get_if<CopyBuffer>(&command)) {
@@ -1785,6 +1850,12 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             p.source = *source;
             if (const auto result = detail::prepare_resolve(*resolve_command, p); result != ReplayResult::success)
                 return result;
+            if (p.resolve_mode != VK_RESOLVE_MODE_NONE) {
+                if (!vk.begin_rendering || !vk.end_rendering || !vk.image_view) return ReplayResult::unsupported;
+                p.view = vk.image_view(p.source, p.source_range);
+                p.resolve_view = vk.image_view(p.binding, p.range);
+                if (!p.view || !p.resolve_view) return ReplayResult::unsupported;
+            }
         } else if (const auto* discard = std::get_if<DiscardResource>(&command)) {
             // Buffers and partial (rectangle) discards keep their contents, which "undefined" allows.
             if (!bind(discard->resource)) return ReplayResult::unresolved_resource;
@@ -1809,6 +1880,9 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             if (!vk.buffer_at(write->address, bytes, p.write_buffer, p.write_offset) || bytes < 4)
                 return ReplayResult::unresolved_resource;
             if (p.write_offset % 4) return ReplayResult::invalid_copy;
+            // WriteBufferImmediate resolves by VA and may target a readback buffer in COPY_DEST.
+            out.wrote_readback = true;
+            out.readback_src_stages |= VK_PIPELINE_STAGE_2_TRANSFER_BIT;
         } else if (const auto* atomic = std::get_if<AtomicCopyBuffer>(&command)) {
             if (!vk.copy_buffer) return ReplayResult::unsupported;
             if (predicated) ++out.unpredicated_copies;  // a transfer command, like the copies
@@ -1826,6 +1900,10 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             }
             p.buffer_copies.push_back({p.source.buffer_offset + atomic->src_offset,
                                        p.binding.buffer_offset + atomic->dst_offset, atomic->bytes});
+            if (p.binding.host_readable) {
+                out.wrote_readback = true;
+                out.readback_src_stages |= VK_PIPELINE_STAGE_2_COPY_BIT | VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+            }
         } else if (const auto* predication = std::get_if<Predication>(&command)) {
             predicated = predication->buffer != 0;
             if (!predicated) continue;
@@ -1871,6 +1949,10 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                 if (range.type == d3d12_query::binary_occlusion) {
                     // The internal dispatch would otherwise count towards the application's CSInvocations.
                     if (!vk.resolve_binary_occlusion || statistics_active) return ReplayResult::unsupported;
+                }
+                if (p.binding.host_readable) {
+                    out.wrote_readback = true;
+                    out.readback_src_stages |= VK_PIPELINE_STAGE_2_COPY_BIT | VK_PIPELINE_STAGE_2_TRANSFER_BIT;
                 }
             }
             out.queries.push_back({i, heap, statistics_active});
@@ -2395,6 +2477,55 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
         } else if (std::holds_alternative<ResolveSubresource>(command)) {
             // resolve_source and resolve_dest are the transfer layouts, as copy_source and copy_dest are.
             const auto [dst_id, src_id] = copy_ids(command);
+            if (p.resolve_mode != VK_RESOLVE_MODE_NONE) {
+                // A rendering scope of its own, with no draws: the source plane as the attachment, the destination
+                // as its resolve target. Both go to the attachment layout and back. Resolves run in the colour
+                // attachment output stage with colour attachment accesses, depth and stencil ones included.
+                constexpr VkAccessFlags attachment_access =
+                    VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT |
+                    VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+                constexpr VkPipelineStageFlags attachment_stages = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
+                                                                   VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT |
+                                                                   VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+                const VulkanAccess source_state = vulkan_access(d3d12_state::resolve_source, false);
+                const VulkanAccess dest_state = vulkan_access(d3d12_state::resolve_dest, false);
+                const VkImageLayout source_layout = image_layout(p.source, source_state.layout);
+                const VkImageLayout dest_layout = image_layout(p.binding, dest_state.layout);
+                auto source_pieces = detail::current(
+                    tracker, src_id, detail::planes_for_layout(p.source, p.source_range, separate), source_layout);
+                detail::initialize(vk, command_buffer, p.source, src_id, source_pieces, source_layout, tracker);
+                auto dest_pieces = detail::current(
+                    tracker, dst_id, detail::planes_for_layout(p.binding, p.range, separate), dest_layout);
+                detail::initialize(vk, command_buffer, p.binding, dst_id, dest_pieces, dest_layout, tracker);
+                const VkImageLayout source_attachment =
+                    image_layout(p.source, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+                const VkImageLayout dest_attachment =
+                    image_layout(p.binding, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+                detail::round_trip(vk, command_buffer, p.source, source_pieces, source_attachment, source_state,
+                                   attachment_access, attachment_stages, [&] {
+                    detail::round_trip(vk, command_buffer, p.binding, dest_pieces, dest_attachment, dest_state,
+                                       attachment_access, attachment_stages, [&] {
+                        VkRenderingAttachmentInfo info{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+                        info.imageView = p.view;
+                        info.imageLayout = source_attachment;
+                        info.resolveMode = p.resolve_mode;
+                        info.resolveImageView = p.resolve_view;
+                        info.resolveImageLayout = dest_attachment;
+                        info.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+                        info.storeOp = VK_ATTACHMENT_STORE_OP_NONE;  // the source is only read
+                        VkRenderingInfo rendering{VK_STRUCTURE_TYPE_RENDERING_INFO};
+                        rendering.renderArea = {{p.resolve.srcOffset.x, p.resolve.srcOffset.y},
+                                                {p.resolve.extent.width, p.resolve.extent.height}};
+                        rendering.layerCount = 1;
+                        // One plane only, so independentResolve(None) never applies.
+                        if (p.range.aspectMask == VK_IMAGE_ASPECT_DEPTH_BIT) rendering.pDepthAttachment = &info;
+                        else rendering.pStencilAttachment = &info;
+                        vk.begin_rendering(command_buffer, &rendering);
+                        vk.end_rendering(command_buffer);
+                    });
+                });
+                continue;
+            }
             const VkImageLayout src_layout = detail::copy_layout(
                 vk, command_buffer, p.source, src_id, detail::planes_for_layout(p.source, p.source_range, separate),
                 VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_TRANSFER_READ_BIT, tracker);

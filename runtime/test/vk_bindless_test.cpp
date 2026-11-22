@@ -166,9 +166,18 @@ int main(int argc, char** argv) {
         return unsupported;
     }
     VkPhysicalDeviceVulkan12Properties props12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_PROPERTIES};
-    VkPhysicalDeviceProperties2 props{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &props12};
+    VkPhysicalDeviceVulkan11Properties props11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_PROPERTIES, &props12};
+    VkPhysicalDeviceProperties2 props{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &props11};
     vkGetPhysicalDeviceProperties2(pd, &props);
     std::printf("device: %s%s\n", props.properties.deviceName, validation ? " (validation on)" : "");
+    // The pipeline layout pushes the 144-byte translated user-data block. A device with fewer push constant bytes
+    // (128 on Intel Arc and some AMD drivers) can't create it: a device limit, not a wrong result (TEST-149).
+    constexpr std::uint32_t push_bytes = 144;
+    if (props.properties.limits.maxPushConstantsSize < push_bytes) {
+        std::printf("unsupported: need %u push constant bytes, device has %u\n", push_bytes,
+                    props.properties.limits.maxPushConstantsSize);
+        return unsupported;
+    }
 
     // The features ps_tex's metadata names (bufferDeviceAddress, runtimeDescriptorArray, shaderInt64), dynamic
     // indexing of the image array, and whichever descriptor-indexing flags the set can use.
@@ -454,7 +463,7 @@ int main(int argc, char** argv) {
         std::uint32_t count = 0;
         for (std::uint32_t b = 0; b < bindless::bindings.size(); ++b)
             if (bindless::bindings[b].type == type && bindless::binding_enabled(b, f))
-                count += bindless::bindings[b].count;
+                count += f.counts[b];
         return count;
     };
     const auto fits = [&](const BindlessFeatures& f) {
@@ -505,17 +514,18 @@ int main(int argc, char** argv) {
     for (int configuration = 0; configuration < configuration_count; ++configuration) {
         BindlessFeatures flags = configurations[configuration];
         flags.ms_samples[0] = VK_SAMPLE_COUNT_4_BIT;
-        bindless::limit_ms_bindings(flags, props.properties.limits, props12);
+        // A device below the default counts gets a smaller set; this test needs at least those.
+        const bool full = bindless::size_bindings(flags, props.properties.limits, props11, props12);
         const char* name = flags.update_after_bind && flags.partially_bound ? "update after bind, partially bound"
                            : flags.update_after_bind ? "update after bind" : flags.partially_bound ? "partially bound" : "no flags";
-        if (!fits(flags)) {
+        if (!full || !fits(flags)) {
             std::printf("%s: skipped, the set does not fit this device's descriptor limits\n", name);
             continue;
         }
         BindlessSet set(vkGetDeviceProcAddr, dev, mp, flags);
         EXPECT(set.ok() && set.layout() && set.set());
 
-        const VkPushConstantRange push{VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, 144};
+        const VkPushConstantRange push{VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, push_bytes};
         const VkDescriptorSetLayout set_layout = set.layout();
         VkPipelineLayoutCreateInfo pli{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
         pli.setLayoutCount = 1;
@@ -614,13 +624,13 @@ int main(int argc, char** argv) {
         const std::uint32_t stored_index = set.add_image(ImageDimension::dim_2d, stored_view, VK_IMAGE_LAYOUT_GENERAL, as_storage);
         const std::uint32_t decoy_index = set.add_image(ImageDimension::dim_2d, decoy_view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
         const std::uint32_t gradient_index = set.add_image(ImageDimension::dim_2d, gradient_view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-        EXPECT(stored_index >= 1 && stored_index < bindless::storage_indices);
-        EXPECT(decoy_index >= bindless::storage_indices && gradient_index > decoy_index);
-        EXPECT(gradient_index < bindless::image_capacity(ImageDimension::dim_2d));
+        EXPECT(stored_index >= 1 && stored_index < set.storage_capacity(ImageDimension::dim_2d));
+        EXPECT(decoy_index >= set.storage_capacity(ImageDimension::dim_2d) && gradient_index > decoy_index);
+        EXPECT(gradient_index < set.image_capacity(ImageDimension::dim_2d));
         std::vector<std::uint32_t> filled;
-        for (std::uint32_t i = 1; i < bindless::image_capacity(ImageDimension::dim_1d); ++i)
+        for (std::uint32_t i = 1; i < set.image_capacity(ImageDimension::dim_1d); ++i)
             filled.push_back(set.add_image(ImageDimension::dim_1d, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_GENERAL));
-        EXPECT(filled.front() == 1 && filled.back() == bindless::image_capacity(ImageDimension::dim_1d) - 1);
+        EXPECT(filled.front() == 1 && filled.back() == set.image_capacity(ImageDimension::dim_1d) - 1);
         EXPECT(set.add_image(ImageDimension::dim_1d, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_GENERAL) == 0);
         set.remove_image(ImageDimension::dim_1d, 7);
         EXPECT(set.add_image(ImageDimension::dim_1d, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_GENERAL) == 7);
@@ -643,7 +653,8 @@ int main(int argc, char** argv) {
             StorageViews brief_storage;
             brief_storage.as_float = brief;
             const std::uint32_t brief_index = set.add_image(ImageDimension::dim_2d, brief, VK_IMAGE_LAYOUT_GENERAL, brief_storage);
-            EXPECT(brief_index >= 1 && brief_index < bindless::storage_indices && brief_index != stored_index);
+            EXPECT(brief_index >= 1 && brief_index < set.storage_capacity(ImageDimension::dim_2d) &&
+                   brief_index != stored_index);
             set.remove_image(ImageDimension::dim_2d, brief_index);
             vkDestroyImageView(dev, brief, nullptr);
         }
@@ -747,10 +758,30 @@ int main(int argc, char** argv) {
         compare("8 removed", zeros);
         EXPECT(set.add_image(ImageDimension::dim_2d, gradient_view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) == gradient_index);
 
+        // 9. More than 4096 2D images and more than a full D3D12 sampler heap (2048): the gradient and the S#
+        // through the last indices of both arrays, where the device's limits gave the set room for them.
+        std::uint32_t far_image = 0, far_sampler = 0;
+        if (set.image_capacity(ImageDimension::dim_2d) > 5000 + 8 && set.sampler_capacity() > 2100 + 8) {
+            for (std::uint32_t i = 0; i < 5000; ++i)
+                EXPECT(set.add_image(ImageDimension::dim_2d, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_GENERAL) != 0);
+            far_image = set.add_image(ImageDimension::dim_2d, gradient_view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+            for (std::uint32_t i = 0; i < 2100; ++i) far_sampler = set.add_sampler(nearest);
+            EXPECT(far_image > 5000 && far_sampler > 2100);
+            set.insert_key(tsharp, far_image);
+            set.insert_key(make_ssharp_key(ssharp.data()), far_sampler);
+            EXPECT(flush());
+            CHECK(draw());
+            compare("9 past 4096 images and 2048 samplers", nullptr);
+        } else {
+            std::printf("%s: no room past 5000 2D images and 2100 samplers on this device; step 9 skipped\n", name);
+        }
+
         std::printf("%s: descriptor table in %s memory\n", name,
                     set.table_in_device_local_memory() ? "device-local" : "host-visible");
-        std::printf("%s: gradient at the %uth slot probed, miss, table grown %u -> %u slots, rebound, restored, other view, removed\n", name,
-                    depth + 1, slots, slot_count());
+        std::printf("%s: gradient at the %uth slot probed, miss, table grown %u -> %u slots, rebound, restored, "
+                    "other view, removed, index %u of %u 2D images and %u of %u samplers\n", name, depth + 1, slots,
+                    slot_count(), far_image, set.image_capacity(ImageDimension::dim_2d), far_sampler,
+                    set.sampler_capacity());
         ++runs;
         vkDeviceWaitIdle(dev);
         vkDestroyPipeline(dev, pipeline, nullptr);

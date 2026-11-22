@@ -384,6 +384,15 @@ def offset(text):
     return value
 
 
+def same_output_path(first, second):
+    if os.path.normcase(os.path.realpath(first)) == os.path.normcase(os.path.realpath(second)):
+        return True
+    try:
+        return os.path.samefile(first, second)
+    except OSError:
+        return False
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("target", help="RPF9 archive or a directory of .rpf/.bin payloads")
@@ -394,6 +403,8 @@ def main(argv=None):
     ap.add_argument("--max-inflate", type=byte_count, default=1 << 28,
                     help="keep at most this many bytes of one stream")
     a = ap.parse_args(argv)
+    if a.out and a.csv and same_output_path(a.out, a.csv):
+        ap.error("--out and --csv must use different paths")
     if os.path.isdir(a.target) and (a.start is not None or a.limit is not None):
         ap.error("--start and --limit apply to a single archive, not a directory")
     below_normal()

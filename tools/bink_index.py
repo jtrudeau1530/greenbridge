@@ -306,10 +306,14 @@ def main(argv=None):
 
     fmt = a.format or ("json" if a.out and a.out.lower().endswith(".json") else "csv")
     if a.out:
-        if fmt == "json":
-            write_json(a.out, a.target, rows, summary, probe)
-        else:
-            write_csv(a.out, rows, probe)
+        try:
+            if fmt == "json":
+                write_json(a.out, a.target, rows, summary, probe)
+            else:
+                write_csv(a.out, rows, probe)
+        except OSError as error:
+            print(f"bink_index: error: cannot write {a.out}: {error}", file=sys.stderr)
+            return 2
         print(f"{len(rows)} Bink 2 streams, {summary['bytes']} bytes, "
               f"{summary['unread_bytes']} unread, {summary['zero_padding']} zero padding")
     else:

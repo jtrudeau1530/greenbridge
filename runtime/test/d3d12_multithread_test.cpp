@@ -52,25 +52,26 @@ int fail(const char* msg, int thread_id = -1, int iter = -1) {
 }  // namespace
 
 int main() {
-    vktest::Device d;
-    const auto status = d.initialize();
-    if (status == vktest::DeviceStatus::unavailable) return 77;  // no Vulkan GPU: ctest skips
-    if (status != vktest::DeviceStatus::ready) return fail("vktest::Device::initialize");
-
-    rt::d3d12::VulkanDeviceInfo info{};
-    info.get_instance_proc = d.instance_proc;
-    info.instance = d.instance;
-    info.physical = d.physical;
-    info.device = d.device;
-    info.queue = d.queue;
-    info.queue_family = d.family;
-    info.separate_depth_stencil_layouts = true;
-
     constexpr int kIterations = 32;
     {
-        Ref<ID3D12Device1> device;
-        if (FAILED(rt::d3d12::create_vulkan_device(info, __uuidof(ID3D12Device1), device.out())) || !device.p)
-            return fail("create_vulkan_device");
+        vktest::Device d;
+        const auto status = d.initialize();
+        if (status == vktest::DeviceStatus::unavailable) return 77;  // no Vulkan GPU: ctest skips
+        if (status != vktest::DeviceStatus::ready) return fail("vktest::Device::initialize");
+
+        rt::d3d12::VulkanDeviceInfo info{};
+        info.get_instance_proc = d.instance_proc;
+        info.instance = d.instance;
+        info.physical = d.physical;
+        info.device = d.device;
+        info.queue = d.queue;
+        info.queue_family = d.family;
+        info.separate_depth_stencil_layouts = true;
+
+        {
+            Ref<ID3D12Device1> device;
+            if (FAILED(rt::d3d12::create_vulkan_device(info, __uuidof(ID3D12Device1), device.out())) || !device.p)
+                return fail("create_vulkan_device");
 
             constexpr UINT kSize = 4;
         std::atomic<int> failures{0};
@@ -265,35 +266,160 @@ int main() {
 
     if (failures.load() != 0) return 1;
 
-    // Exercise SetEventOnMultipleFenceCompletion (ALL) across both queues' fences after concurrent work.
-    EventHandle multi_ev;
-    if (!multi_ev.h) return fail("CreateEventW (multi ALL)");
-    const UINT64 targets[2] = {++fence_vals[0], ++fence_vals[1]};
-    ID3D12Fence* pair[2] = {fences[0].p, fences[1].p};
-    if (FAILED(device->SetEventOnMultipleFenceCompletion(pair, targets, 2, D3D12_MULTIPLE_FENCE_WAIT_FLAG_ALL,
-                                                         multi_ev.h)))
-        return fail("SetEventOnMultipleFenceCompletion (ALL)");
-    if (FAILED(queues[0]->Signal(fences[0].p, targets[0])) || FAILED(queues[1]->Signal(fences[1].p, targets[1])))
-        return fail("Signal (multi ALL)");
-    if (WaitForSingleObject(multi_ev.h, 15000) != WAIT_OBJECT_0) return fail("WaitForSingleObject (multi ALL)");
+        // Cross-queue shared-resource handoff: queue 0 clears a shared texture and signals fence 0;
+        // queue 1 Wait()s on fence 0, transitions the SAME texture to COPY_SOURCE, copies to readback,
+        // and verifies every texel; then repeats with a second colour.
+        {
+            Ref<ID3D12CommandAllocator> alloc0, alloc1;
+            Ref<ID3D12GraphicsCommandList> cl0, cl1;
+            Ref<ID3D12DescriptorHeap> shared_rtv_heap;
+            Ref<ID3D12Resource> shared_rt, shared_rb;
+            EventHandle handoff_ev;
+            if (!handoff_ev.h) return fail("CreateEventW (handoff)");
+            if (FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&alloc0.p))) ||
+                FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&alloc1.p))) ||
+                FAILED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc0.p, nullptr,
+                                                 IID_PPV_ARGS(&cl0.p))) ||
+                FAILED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc1.p, nullptr,
+                                                 IID_PPV_ARGS(&cl1.p))))
+                return fail("CreateCommandAllocator/List (handoff)");
+            cl0->Close();
+            cl1->Close();
 
-    // Exercise SetEventOnMultipleFenceCompletion (ANY): signalling only fence 0 satisfies the wait while fence 1 stays below target.
-    EventHandle any_ev;
-    if (!any_ev.h) return fail("CreateEventW (multi ANY)");
-    const UINT64 any_targets[2] = {++fence_vals[0], fence_vals[1] + 10};
-    if (FAILED(device->SetEventOnMultipleFenceCompletion(pair, any_targets, 2, D3D12_MULTIPLE_FENCE_WAIT_FLAG_ANY,
-                                                         any_ev.h)))
-        return fail("SetEventOnMultipleFenceCompletion (ANY)");
-    if (FAILED(queues[0]->Signal(fences[0].p, any_targets[0]))) return fail("Signal (multi ANY)");
-    if (WaitForSingleObject(any_ev.h, 15000) != WAIT_OBJECT_0) return fail("WaitForSingleObject (multi ANY)");
-    }
+            D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+            if (FAILED(device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&shared_rtv_heap.p))))
+                return fail("CreateDescriptorHeap (handoff)");
 
-    if (d.validation_errors() != 0) {
-        std::fprintf(stderr, "FAIL: %u Vulkan validation error(s)\n", d.validation_errors());
+            D3D12_HEAP_PROPERTIES def_hp{D3D12_HEAP_TYPE_DEFAULT};
+            D3D12_RESOURCE_DESC rt_desc{};
+            rt_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+            rt_desc.Width = kSize;
+            rt_desc.Height = kSize;
+            rt_desc.DepthOrArraySize = 1;
+            rt_desc.MipLevels = 1;
+            rt_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+            rt_desc.SampleDesc.Count = 1;
+            rt_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+            if (FAILED(device->CreateCommittedResource(&def_hp, D3D12_HEAP_FLAG_NONE, &rt_desc,
+                                                       D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                       IID_PPV_ARGS(&shared_rt.p))))
+                return fail("CreateCommittedResource shared RT");
+
+            const D3D12_CPU_DESCRIPTOR_HANDLE rtv = shared_rtv_heap->GetCPUDescriptorHandleForHeapStart();
+            device->CreateRenderTargetView(shared_rt.p, nullptr, rtv);
+
+            D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp{};
+            UINT64 total_bytes = 0;
+            device->GetCopyableFootprints(&rt_desc, 0, 1, 0, &fp, nullptr, nullptr, &total_bytes);
+
+            D3D12_HEAP_PROPERTIES rb_hp{D3D12_HEAP_TYPE_READBACK};
+            D3D12_RESOURCE_DESC rb_desc{};
+            rb_desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+            rb_desc.Width = total_bytes;
+            rb_desc.Height = 1;
+            rb_desc.DepthOrArraySize = 1;
+            rb_desc.MipLevels = 1;
+            rb_desc.SampleDesc.Count = 1;
+            rb_desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+            if (FAILED(device->CreateCommittedResource(&rb_hp, D3D12_HEAP_FLAG_NONE, &rb_desc,
+                                                       D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                       IID_PPV_ARGS(&shared_rb.p))))
+                return fail("CreateCommittedResource shared RB");
+
+            const std::uint8_t colours[2][3] = {{180, 90, 45}, {30, 210, 120}};
+            D3D12_RESOURCE_STATES prev_state = D3D12_RESOURCE_STATE_COMMON;
+            for (int round = 0; round < 2; ++round) {
+                if (FAILED(alloc0->Reset()) || FAILED(cl0->Reset(alloc0.p, nullptr))) return fail("Reset cl0 (handoff)");
+                D3D12_RESOURCE_BARRIER b0{};
+                b0.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                b0.Transition = {shared_rt.p, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, prev_state,
+                                 D3D12_RESOURCE_STATE_RENDER_TARGET};
+                cl0->ResourceBarrier(1, &b0);
+                const float col[4] = {colours[round][0] / 255.0f, colours[round][1] / 255.0f,
+                                      colours[round][2] / 255.0f, 1.0f};
+                cl0->ClearRenderTargetView(rtv, col, 0, nullptr);
+                cl0->Close();
+
+                ID3D12CommandList* l0[1] = {cl0.p};
+                queues[0]->ExecuteCommandLists(1, l0);
+                const UINT64 v0 = ++fence_vals[0];
+                if (FAILED(queues[0]->Signal(fences[0].p, v0))) return fail("Signal q0 (handoff)");
+
+                // Queue 1 waits on queue 0's fence, then transitions and copies the same shared texture.
+                if (FAILED(queues[1]->Wait(fences[0].p, v0))) return fail("Wait q1 (handoff)");
+                if (FAILED(alloc1->Reset()) || FAILED(cl1->Reset(alloc1.p, nullptr))) return fail("Reset cl1 (handoff)");
+                D3D12_RESOURCE_BARRIER b1{};
+                b1.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                b1.Transition = {shared_rt.p, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                                 D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE};
+                cl1->ResourceBarrier(1, &b1);
+                D3D12_TEXTURE_COPY_LOCATION src_loc{shared_rt.p, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {0}};
+                D3D12_TEXTURE_COPY_LOCATION dst_loc{shared_rb.p, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, {}};
+                dst_loc.PlacedFootprint = fp;
+                cl1->CopyTextureRegion(&dst_loc, 0, 0, 0, &src_loc, nullptr);
+                cl1->Close();
+                prev_state = D3D12_RESOURCE_STATE_COPY_SOURCE;
+
+                ID3D12CommandList* l1[1] = {cl1.p};
+                queues[1]->ExecuteCommandLists(1, l1);
+                const UINT64 v1 = ++fence_vals[1];
+                if (FAILED(queues[1]->Signal(fences[1].p, v1)) ||
+                    FAILED(fences[1]->SetEventOnCompletion(v1, handoff_ev.h)) ||
+                    WaitForSingleObject(handoff_ev.h, 15000) != WAIT_OBJECT_0)
+                    return fail("Signal/Wait q1 (handoff)");
+
+                void* mapped = nullptr;
+                if (FAILED(shared_rb->Map(0, nullptr, &mapped)) || !mapped) return fail("Map (handoff)");
+                const auto* base = static_cast<const std::uint8_t*>(mapped);
+                bool bad = false;
+                for (UINT y = 0; y < kSize && !bad; ++y) {
+                    const auto* row = base + static_cast<std::size_t>(y) * fp.Footprint.RowPitch;
+                    for (UINT x = 0; x < kSize; ++x) {
+                        const auto* px = row + static_cast<std::size_t>(x) * 4;
+                        if (std::abs(int(px[0]) - int(colours[round][0])) > 1 ||
+                            std::abs(int(px[1]) - int(colours[round][1])) > 1 ||
+                            std::abs(int(px[2]) - int(colours[round][2])) > 1 || px[3] != 255) {
+                            bad = true;
+                            break;
+                        }
+                    }
+                }
+                shared_rb->Unmap(0, nullptr);
+                if (bad) return fail("shared-texture cross-queue readback mismatch");
+                if (FAILED(queues[0]->Wait(fences[1].p, v1))) return fail("Wait q0 (handoff)");
+            }
+        }
+
+        // Exercise SetEventOnMultipleFenceCompletion (ALL) across both queues' fences after concurrent work.
+        EventHandle multi_ev;
+        if (!multi_ev.h) return fail("CreateEventW (multi ALL)");
+        const UINT64 targets[2] = {++fence_vals[0], ++fence_vals[1]};
+        ID3D12Fence* pair[2] = {fences[0].p, fences[1].p};
+        if (FAILED(device->SetEventOnMultipleFenceCompletion(pair, targets, 2, D3D12_MULTIPLE_FENCE_WAIT_FLAG_ALL,
+                                                             multi_ev.h)))
+            return fail("SetEventOnMultipleFenceCompletion (ALL)");
+        if (FAILED(queues[0]->Signal(fences[0].p, targets[0])) || FAILED(queues[1]->Signal(fences[1].p, targets[1])))
+            return fail("Signal (multi ALL)");
+        if (WaitForSingleObject(multi_ev.h, 15000) != WAIT_OBJECT_0) return fail("WaitForSingleObject (multi ALL)");
+
+        // Exercise SetEventOnMultipleFenceCompletion (ANY): signalling only fence 0 satisfies the wait while fence 1 stays below target.
+        EventHandle any_ev;
+        if (!any_ev.h) return fail("CreateEventW (multi ANY)");
+        const UINT64 any_targets[2] = {++fence_vals[0], fence_vals[1] + 10};
+        if (FAILED(device->SetEventOnMultipleFenceCompletion(pair, any_targets, 2, D3D12_MULTIPLE_FENCE_WAIT_FLAG_ANY,
+                                                             any_ev.h)))
+            return fail("SetEventOnMultipleFenceCompletion (ANY)");
+        if (FAILED(queues[0]->Signal(fences[0].p, any_targets[0]))) return fail("Signal (multi ANY)");
+        if (WaitForSingleObject(any_ev.h, 15000) != WAIT_OBJECT_0) return fail("WaitForSingleObject (multi ANY)");
+        }
+    }  // vktest::Device::~Device() destroys VkDevice here so any leaked-object VUIDs are counted below.
+
+    if (vktest::validation_error_count() != 0) {
+        std::fprintf(stderr, "FAIL: %u Vulkan validation error(s)\n", vktest::validation_error_count());
         return 1;
     }
-    std::printf("d3d12_multithread_test: PASS (2 queues x %d concurrent submissions + resource churn + multi-fence wait; "
-                "0 validation errors)\n",
+    std::printf("d3d12_multithread_test: PASS (2 queues x %d concurrent submissions + resource churn + shared-texture "
+                "handoff + multi-fence ALL/ANY; 0 validation errors)\n",
                 kIterations);
     return 0;
 }

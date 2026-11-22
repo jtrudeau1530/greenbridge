@@ -145,6 +145,13 @@ for `run_gpu_tests.py`). The shaders are then translated with `--bary-fallback` 
 geometry shader that supplies the barycentrics (`docs/design.md`, "Barycentric fallback"), so the device needs
 geometry shaders instead.
 
+## GPUs without VK_KHR_maintenance8 (NVIDIA Pascal and older)
+
+`ps_texoff` and `ps_texoff_implicit` sample with a run-time texel offset, which needs `VK_KHR_maintenance8`;
+without it they're skipped, which is expected, not a failure. To test the fallback, set `LEONIDA_TEXOFF_FALLBACK=1`
+**for both `build.py` and `check.py`** (or for `run_gpu_tests.py`): the offset is then folded into the coordinate
+(`docs/design.md`, "Texel offsets"), and the +16/-32 sample is judged on every device.
+
 ## Choosing the GPU
 
 With more than one GPU, pick one through the Vulkan loader, for example

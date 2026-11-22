@@ -621,9 +621,11 @@ inline VkSamplerCreateInfo vulkan_sampler(const Sampler& sampler) {
 
 // ---- V#: SQ_BUF_RSRC_WORD0..3 ----
 
-// SQ_BUF_RSRC_WORD3.OOB_SELECT: the bounds check the hardware makes. The translator makes its own from the
-// stride (tools/rdna2spirv.py, buffer_address): stride 0 checks the byte offset against num_records, otherwise
-// the index, or the offset against num_records * stride.
+// SQ_BUF_RSRC_WORD3.OOB_SELECT: the bounds check the hardware makes, and the one the translator makes too
+// (tools/rdna2spirv.py, buffer_address; docs/design.md, Buffer bounds checking): structured_with_offset is out of
+// range at index >= num_records or offset + 4 > stride, structured at index >= num_records, disabled only at
+// num_records == 0, raw at offset + 4 > num_records (docs/buffer_bounds.md). A V# built here for a shader to read must say which: the default
+// below makes every stride-0 access out of range.
 enum class OobSelect : std::uint32_t {
     structured_with_offset = 0,
     structured = 1,

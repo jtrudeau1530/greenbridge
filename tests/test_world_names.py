@@ -231,6 +231,21 @@ class ResolveTest(unittest.TestCase):
 
 
 class CliTest(unittest.TestCase):
+    def test_write_json_preserves_existing_temp_sibling(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "names.json")
+            sibling = out + ".tmp"
+            with open(sibling, "w", encoding="utf-8") as f:
+                f.write("keep me")
+
+            WN._write_json(out, {"names": {}})
+
+            with open(sibling, encoding="utf-8") as f:
+                self.assertEqual(f.read(), "keep me")
+            with open(out, encoding="utf-8") as f:
+                self.assertEqual(json.load(f), {"names": {}})
+            self.assertCountEqual(os.listdir(tmp), ["names.json", "names.json.tmp"])
+
     def test_xml_unterminated_comment_keeps_later_files(self):
         with tempfile.TemporaryDirectory() as tmp:
             xml = os.path.join(tmp, "concat.xml")

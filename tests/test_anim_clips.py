@@ -206,7 +206,8 @@ def animation(page, frames, tracks, sequences):
     return a
 
 
-def dictionary(name="synthetic@dict", sequences=None, frames=None, tracks=None, external=0):
+def dictionary(name="synthetic@dict", sequences=None, frames=None, tracks=None, external=0, children=(),
+               external_hashes=()):
     """One clip dictionary page: one `.clip`, one `.motion`, one `.motionmatcher`, one local pack with one animation."""
     p = Page()
     pm = p.alloc(bytes(16))
@@ -231,22 +232,28 @@ def dictionary(name="synthetic@dict", sequences=None, frames=None, tracks=None, 
     p.ptr(lst, entries)
     struct.pack_into("<HH", p.b, lst + 8, 1, 1)
     p.ptr(clip + 0x68, lst)
-    motion = p.alloc(bytes(0x40))
+    motion = p.alloc(bytes(0x150))
     struct.pack_into("<I", p.b, motion + 0x20, 0x5000)
     p.string(motion + 0x30, "pack:/one.motion")
+    struct.pack_into("<I", p.b, motion + 0x58, 1)                    # one blend parameter
+    if children:                                                     # {u64 0; u32 clip hash; u32 dictionary hash}
+        kids = p.alloc(b"".join(struct.pack("<QII", 0, ch, dh) for ch, dh in children))
+        p.ptr(motion + 0x60, kids)
+        struct.pack_into("<HH", p.b, motion + 0x68, len(children), len(children))
     matcher = p.alloc(bytes(0x50))
     p.ptr(matcher + 0x20, motion)                     # a pointer at +0x20, like `.motion`
     p.b[matcher + 0x28:matcher + 0x38] = bytes(range(0x80, 0x90))   # 16-byte id; +0x30 is not a pointer
     p.string(matcher + 0x38, "pack:/one.motionmatcher")
     p.atmap(0x48, [(joaat32(name) << 32 | 1, clip), (joaat32(name) << 32 | 2, motion),
                    (joaat32(name) << 32 | 3, matcher)])
-    refs = p.alloc(bytes(16 * (1 + external)))
+    hashes = [0x1000 + i for i in range(external)] + list(external_hashes)
+    refs = p.alloc(bytes(16 * (1 + len(hashes))))
     p.ptr(refs, pack)
     struct.pack_into("<I", p.b, refs + 8, joaat32(name + "-0"))
-    for i in range(external):
-        struct.pack_into("<I", p.b, refs + 16 * (i + 1) + 8, 0x1000 + i)
+    for i, h in enumerate(hashes):
+        struct.pack_into("<I", p.b, refs + 16 * (i + 1) + 8, h)
     p.ptr(0x70, refs)
-    struct.pack_into("<HH", p.b, 0x78, 1 + external, 1 + external)
+    struct.pack_into("<HH", p.b, 0x78, 1 + len(hashes), 1 + len(hashes))
     p.b += bytes((-len(p.b)) % 16)
     return bytes(p.b)
 
@@ -277,9 +284,9 @@ def sequence(lo, hi):
     ])
 
 
-def two_sequence_dictionary(name="synthetic@dict"):
+def two_sequence_dictionary(name="synthetic@dict", **kw):
     # two sequences share frame 40
-    return dictionary(name, [sequence(0, 41), sequence(40, NF)], NF, TRACKS)
+    return dictionary(name, [sequence(0, 41), sequence(40, NF)], NF, TRACKS, **kw)
 
 
 def write_rpf(path, streams, gap_before=()):
@@ -409,11 +416,72 @@ class DecodeTest(unittest.TestCase):
             anim_clips.parse_dictionary(anim_clips.System(bytes(b)))
 
 
+def write_raw(path, parts):
+    """parts: [(bytes, compress?)] written 16-byte aligned after a minimal RPF9 header."""
+    body = bytearray(0x100)
+    body[:4] = b"9FPR"
+    struct.pack_into("<I", body, 4, 0x100)
+    offsets = []
+    for data, compress in parts:
+        offsets.append(len(body))
+        body += zlib.compress(data) if compress else data
+        body += bytes((-len(body)) % 16)
+    body += bytes(64)
+    with open(path, "wb") as f:
+        f.write(body)
+    return offsets
+
+
+class GapPageTest(unittest.TestCase):
+    """A dictionary's last system page that anim_index does not list: a zlib stream inflating to fewer than 64
+    bytes, or a 16-byte raw page. Both are joined only when the pages then parse."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.rpf = os.path.join(self.tmp.name, "gap.rpf")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def scan(self, parts):
+        write_raw(self.rpf, parts)
+        return anim_clips.scan(self.rpf)
+
+    def test_small_zlib_last_page(self):
+        page = two_sequence_dictionary("small@dict")
+        a, b = split(page, len(page) - 32, move_map=False)
+        rows, summary = self.scan([(a, True), (b, True), (two_sequence_dictionary("next@dict"), True)])
+        self.assertEqual(summary["streams"], 2)                 # anim_index skips the 32-byte page
+        self.assertEqual(summary["gap_pages"], {"small zlib page": 1})
+        self.assertEqual(summary["unresolved"], {})
+        self.assertEqual(summary["counts"]["dictionaries"], 2)
+        self.assertEqual(summary["counts"]["animations_decoded"], 2)
+        self.assertEqual(summary["pages"], {"1": 1, "2": 1})
+
+    def test_raw_16_byte_last_page(self):
+        page = two_sequence_dictionary("raw@dict")
+        a, b = split(page, len(page) - 16, move_map=False)
+        rows, summary = self.scan([(a, True), (b, False), (two_sequence_dictionary("next@dict"), True)])
+        self.assertEqual(summary["gap_pages"], {"raw 16-byte page": 1})
+        self.assertEqual(summary["counts"]["dictionaries"], 2)
+        self.assertEqual(summary["counts"]["animations_decoded"], 2)
+
+    def test_gap_that_does_not_parse_stays_unresolved(self):
+        page = two_sequence_dictionary("cut@dict")
+        a, _b = split(page, 0x400, move_map=False)              # the rest of the page is missing
+        rows, summary = self.scan([(a, True), (b"\x55" * 64, False), (two_sequence_dictionary("next@dict"), True)])
+        self.assertEqual(summary["gap_pages"], {})
+        self.assertEqual(summary["unresolved"], {"system page not the next stream": 1})
+        self.assertEqual(summary["counts"]["dictionaries"], 1)
+
+
 class ArchiveTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.rpf = os.path.join(self.tmp.name, "synthetic.rpf")
-        one = two_sequence_dictionary("first@dict")
+        second, nowhere = joaat32("second@dict"), joaat32("nowhere@dict")
+        one = two_sequence_dictionary("first@dict", children=[(1, second), (7, second), (1, nowhere)],
+                                      external_hashes=[second, nowhere])
         a, b = split(two_sequence_dictionary("second@dict"), 0x400)
         c, d = split(two_sequence_dictionary("third@dict"), 0x400, move_map=False)
         other = bytearray(0x60)
@@ -440,6 +508,14 @@ class ArchiveTest(unittest.TestCase):
         self.assertEqual(c["frames_sum_matches"], 2)
         self.assertEqual(c["boundary_quaternions"], c["boundary_quaternions_same_rotation"])
         self.assertEqual(c["track_type:bonerotation"], 4)
+        # `.motion` children are {clip hash, dictionary hash}; root refs without a pointer name dictionaries
+        self.assertEqual((c["motion_children"], c["motion_children_in_external_refs"],
+                          c["motion_children_dictionary_here"], c["motion_children_resolved_to_clip"]), (3, 3, 2, 1))
+        self.assertEqual((c["external_refs_to_a_dictionary_here"], c["external_hashes_distinct"],
+                          c["external_hashes_distinct_found_here"]), (1, 2, 1))
+        self.assertEqual(c["motion_parameters:1"], 2)
+        self.assertNotIn("_children", rows[0])
+        self.assertEqual(summary["gap_pages"], {})
         self.assertEqual([r["offset"] for r in rows], [self.offsets[0], self.offsets[1]])
         self.assertEqual([r["streams"] for r in rows], [1, 2])
 
@@ -466,6 +542,15 @@ class ArchiveTest(unittest.TestCase):
         self.assertEqual(doc["summary"]["counts"]["animations_decoded"], 2)
         for row in doc["dictionaries"]:      # per-dictionary rows hold counts, never values
             self.assertTrue(all(not isinstance(v, (list, dict)) for v in row.values()), row)
+
+    def test_decode_rejects_negative_frames(self):
+        result = subprocess.run(
+            [sys.executable, "-I", TOOL, self.rpf, "--decode", str(self.offsets[1]), "--frames", "-1"],
+            capture_output=True, text=True,
+        )
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("--frames must be 0 or more", result.stderr)
+        self.assertEqual(result.stdout, "")
 
     def test_decode_prints_values(self):
         d = anim_clips.decode_one(self.rpf, self.offsets[1], 2)

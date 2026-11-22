@@ -494,6 +494,9 @@ class StageResumptionAndStepIsolationTest(unittest.TestCase):
         legacy = json.dumps({"Count": 2, "Textures": [{"File": "first.dds"}, {"File": "second.dds"}]})
         base_call = mock.call(["rpf9dump", "ttpf", str(base_source), str(base_dest)])
         pack_call = mock.call(["rpf9dump", "ttpf", str(pack_source), str(pack_dest)])
+        def publish_catalog(cmd):
+            (Path(cmd[3]) / "sample" / "manifest.json").write_text(valid, encoding="utf-8")
+
         for case, base_manifest, pack_manifest, expected in (
             ("complete including skipped rows", valid, valid, []),
             ("listed DDS is missing", legacy, valid, [base_call]),
@@ -508,8 +511,8 @@ class StageResumptionAndStepIsolationTest(unittest.TestCase):
                 (pack_dest / "sample" / "manifest.json").write_text(pack_manifest, encoding="utf-8")
                 with mock.patch.object(make_game, "MODEL_ARCHIVES", ()), \
                         mock.patch.object(make_game, "rpf9dump", return_value="rpf9dump"), \
-                        mock.patch.object(make_game, "run") as run, mock.patch.object(make_game, "log"), \
-                        mock.patch("shutil.which", return_value=None):
+                        mock.patch.object(make_game, "run", side_effect=publish_catalog) as run, \
+                        mock.patch.object(make_game, "log"), mock.patch("shutil.which", return_value=None):
                     make_game.assets(self.game_dir, self.work_dir, wav=False, jobs=1)
                 self.assertEqual(run.call_args_list, expected)
 
