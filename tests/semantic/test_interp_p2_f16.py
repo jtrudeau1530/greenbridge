@@ -523,5 +523,156 @@ class TestInterpP2F16SymbolicAST(unittest.TestCase):
             bad_inst.validate()
 
 
+# ==============================================================================
+# Deterministic Scalar Instruction Interpreter for v_interp_p2_f16
+# ==============================================================================
+
+class ScalarMachineState:
+    """Deterministic machine state for scalar execution."""
+
+    def __init__(self) -> None:
+        self.vgpr = InterpolationRegisterFile()
+        self.attributes = AttributeBuffer()
+        self.sgpr: List[int] = [0] * 106
+        self.pc: int = 0
+
+
+def parse_asm_line(line: str) -> ASTInstruction:
+    """Parse textual assembly instruction into ASTInstruction."""
+    clean = line.split(";")[0].split("//")[0].strip()
+    if not clean:
+        raise ValueError("Empty instruction line")
+    tokens = [t for t in clean.replace(",", " ").split() if t]
+    opcode_str = tokens[0]
+    if opcode_str != "v_interp_p2_f16":
+        raise ValueError(f"Expected opcode v_interp_p2_f16, got {opcode_str}")
+
+    if len(tokens) < 4:
+        raise ValueError(f"Too few tokens for v_interp_p2_f16: {line}")
+
+    dst_tok = tokens[1]
+    dst_high = False
+    if dst_tok.endswith(".h") or dst_tok.endswith("[1]"):
+        dst_high = True
+        dst_tok = dst_tok[:-2]
+    if not dst_tok.startswith("v"):
+        raise ValueError(f"Destination must be a VGPR: {dst_tok}")
+    dst_idx = int(dst_tok[1:])
+    dst_op = ASTOperand(dst_idx, high=dst_high)
+
+    src_tok = tokens[2]
+    abs_mod = False
+    neg_mod = False
+    if src_tok.startswith("-"):
+        neg_mod = True
+        src_tok = src_tok[1:]
+    if src_tok.startswith("|") and src_tok.endswith("|"):
+        abs_mod = True
+        src_tok = src_tok[1:-1]
+    if not src_tok.startswith("v"):
+        raise ValueError(f"Source must be a VGPR: {src_tok}")
+    src_idx = int(src_tok[1:])
+    src_op = ASTOperand(src_idx, abs_mod=abs_mod, neg_mod=neg_mod)
+
+    attr_ref = AttributeRef.parse(tokens[3])
+
+    high_src = False
+    clamp = False
+    for mod in tokens[4:]:
+        mod_l = mod.lower()
+        if mod_l == "high":
+            high_src = True
+        elif mod_l == "clamp":
+            clamp = True
+        else:
+            raise ValueError(f"Unknown modifier: {mod}")
+
+    inst = ASTInstruction(
+        opcode=Opcode.V_INTERP_P2_F16,
+        dst=dst_op,
+        src_j=src_op,
+        attr=attr_ref,
+        high_src=high_src,
+        high_dst=dst_high,
+        clamp=clamp,
+    )
+    inst.validate()
+    return inst
+
+
+class ScalarInterpInterpreter:
+    """Deterministic scalar instruction interpreter."""
+
+    def step(self, inst: ASTInstruction, state: ScalarMachineState) -> int:
+        inst.validate()
+        j_raw_u32 = state.vgpr.read_vgpr_u32(inst.src_j.vgpr_index)
+        j_mod_u32 = apply_f32_modifiers(j_raw_u32, abs_mod=inst.src_j.abs_mod, neg_mod=inst.src_j.neg_mod)
+        j_f32 = u32_to_f32(j_mod_u32)
+
+        p1_accum_f32 = state.vgpr.read_vgpr_f32(inst.dst.vgpr_index)
+        p20_word = state.attributes.read_param_channel(2, inst.attr.attr_index, inst.attr.channel.value)
+        old_vdst = state.vgpr.read_vgpr_u32(inst.dst.vgpr_index)
+
+        res = ref_interp_p2_f16(
+            j_f32,
+            p20_word,
+            p1_accum_f32,
+            high_src=inst.high_src,
+            high_dst=inst.high_dst,
+            old_vdst_u32=old_vdst,
+            clamp=inst.clamp,
+        )
+        state.vgpr.write_vgpr_u32(inst.dst.vgpr_index, res)
+        state.pc += 1
+        return res
+
+    def execute_asm(self, line: str, state: ScalarMachineState) -> int:
+        inst = parse_asm_line(line)
+        return self.step(inst, state)
+
+
+class TestScalarInterpInterpreter(unittest.TestCase):
+    """Test suite for deterministic scalar instruction interpreter."""
+
+    def setUp(self) -> None:
+        self.interp = ScalarInterpInterpreter()
+        self.state = ScalarMachineState()
+
+    def test_scalar_p2_step(self):
+        # attr1.x: p20 = (lo: 4.0, hi: 8.0)
+        self.state.attributes.write_param_channel(2, 1, 0, pack_f16_pair(f16_to_u16(4.0), f16_to_u16(8.0)))
+        # v1 (j) = 0.5
+        self.state.vgpr.write_vgpr_f32(1, 0.5)
+        # v0 (p1_accum) = 3.0
+        self.state.vgpr.write_vgpr_f32(0, 3.0)
+
+        inst = ASTInstruction(
+            opcode=Opcode.V_INTERP_P2_F16,
+            dst=ASTOperand(0, high=False),
+            src_j=ASTOperand(1),
+            attr=AttributeRef(1, Channel.X),
+            high_src=False,
+            clamp=False,
+        )
+        # 3.0 + 0.5 * 4.0 = 5.0 (0x4500)
+        res = self.interp.step(inst, self.state)
+        lo, _ = unpack_f16_pair(res)
+        self.assertEqual(u16_to_f16(lo), 5.0)
+        self.assertEqual(self.state.pc, 1)
+
+    def test_scalar_asm_execution_with_modifiers(self):
+        # attr3.y: p20 = (lo: 2.0, hi: 6.0)
+        self.state.attributes.write_param_channel(2, 3, 1, pack_f16_pair(f16_to_u16(2.0), f16_to_u16(6.0)))
+        # v2 (j) = -0.5
+        self.state.vgpr.write_vgpr_f32(2, -0.5)
+        # v0 (p1_accum) = 2.0
+        self.state.vgpr.write_vgpr_f32(0, 2.0)
+
+        # Instruction with |v2| (0.5), high (uses 6.0), clamp -> 2.0 + 0.5 * 6.0 = 5.0 -> clamped to 1.0 (0x3C00)
+        res = self.interp.execute_asm("v_interp_p2_f16 v0, |v2|, attr3.y high clamp", self.state)
+        lo, _ = unpack_f16_pair(res)
+        self.assertEqual(lo, H_ONE)
+
+
 if __name__ == "__main__":
     unittest.main()
