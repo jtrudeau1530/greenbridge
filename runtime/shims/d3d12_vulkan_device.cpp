@@ -251,6 +251,9 @@ struct DeviceState {
 
     // Cached physical-device no-attachment sample counts for D3D12_OPTIONS19.
     UINT no_output_sample_counts = 0;
+    // VkPhysicalDeviceDepthStencilResolveProperties: the modes a depth or stencil ResolveSubresourceRegion can use.
+    VkResolveModeFlags depth_resolve_modes = 0;
+    VkResolveModeFlags stencil_resolve_modes = 0;
 
     // VK_EXT_host_image_copy; null unless the device enabled it and its copies accept GENERAL.
     PFN_vkCopyMemoryToImageEXT copy_memory_to_image = nullptr;
@@ -679,6 +682,7 @@ public:
     VkImageAspectFlags aspects() const { return aspects_; }
     std::uint64_t image_address() const { return image_address_; }  // what a T# names the texture by
     VkMemoryPropertyFlags memory_flags() const { return memory_flags_; }  // of the memory type behind it
+    const DeviceState& device_state() const { return device_; }
 
     HRESULT create_buffer(D3D12_RESOURCE_STATES initial_state = D3D12_RESOURCE_STATE_COMMON) {
         auto& vk = device_.context->vk;
@@ -1461,6 +1465,15 @@ public:
                     VK_SAMPLE_COUNT_1_BIT | VK_SAMPLE_COUNT_4_BIT | VK_SAMPLE_COUNT_8_BIT | VK_SAMPLE_COUNT_16_BIT;
                 state_.no_output_sample_counts =
                     static_cast<UINT>(props.limits.framebufferNoAttachmentsSampleCounts & kD3D12SampleCounts);
+            }
+            if (const auto get_props2 = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties2>(
+                    info.get_instance_proc(info.instance, "vkGetPhysicalDeviceProperties2"))) {
+                VkPhysicalDeviceDepthStencilResolveProperties resolve{
+                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_STENCIL_RESOLVE_PROPERTIES};
+                VkPhysicalDeviceProperties2 props{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &resolve};
+                get_props2(info.physical, &props);
+                state_.depth_resolve_modes = resolve.supportedDepthResolveModes;
+                state_.stencil_resolve_modes = resolve.supportedStencilResolveModes;
             }
         }
 
@@ -3306,6 +3319,51 @@ bool color_resolve_format_matches(DXGI_FORMAT format, ID3D12Resource* dst, ID3D1
                requested.format;
     };
     return matches(dst) && matches(src);
+}
+
+bool depth_stencil_resolve_supported(DXGI_FORMAT format, ID3D12Resource* dst, UINT dst_subresource, UINT x, UINT y,
+                                     ID3D12Resource* src, UINT src_subresource, const D3D12_RECT* rect,
+                                     D3D12_RESOLVE_MODE mode) {
+    const Resource* d = Resource::from<Resource>(dst);
+    const Resource* s = Resource::from<Resource>(src);
+    if (!d || !s) return false;
+    // The format names the depth format, or one plane by its shader-resource format. Measured on the PC runtime
+    // (RTX 5070 and WARP): Close fails for AVERAGE with the depth format or a stencil plane; the depth plane's
+    // own format (R32_FLOAT, R24_UNORM_X8_TYPELESS) takes AVERAGE as well as MIN and MAX.
+    DXGI_FORMAT family = format;
+    int named_plane = -1;  // -1: any plane of the depth format
+    switch (format) {
+    case DXGI_FORMAT_R32_FLOAT: family = DXGI_FORMAT_D32_FLOAT, named_plane = 0; break;
+    case DXGI_FORMAT_R24_UNORM_X8_TYPELESS: family = DXGI_FORMAT_D24_UNORM_S8_UINT, named_plane = 0; break;
+    case DXGI_FORMAT_X24_TYPELESS_G8_UINT: family = DXGI_FORMAT_D24_UNORM_S8_UINT, named_plane = 1; break;
+    case DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS: family = DXGI_FORMAT_D32_FLOAT_S8X24_UINT, named_plane = 0; break;
+    case DXGI_FORMAT_X32_TYPELESS_G8X24_UINT: family = DXGI_FORMAT_D32_FLOAT_S8X24_UINT, named_plane = 1; break;
+    default: break;
+    }
+    const Format requested = vulkan_format(family, true);
+    if (requested.typeless || !(requested.aspects & VK_IMAGE_ASPECT_DEPTH_BIT)) return false;
+    // The plane a subresource index names (0 depth, 1 stencil), or -1.
+    const auto plane = [&](const Resource* r, UINT subresource) {
+        const D3D12_RESOURCE_DESC& desc = r->desc();
+        if (!(desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) ||
+            vulkan_format(desc.Format, true).format != requested.format)
+            return -1;
+        const UINT planes = (requested.aspects & VK_IMAGE_ASPECT_STENCIL_BIT) ? 2 : 1;
+        const UINT per_plane = UINT(desc.MipLevels) * desc.DepthOrArraySize;
+        return per_plane && subresource / per_plane < planes ? int(subresource / per_plane) : -1;
+    };
+    const int resolved = plane(d, dst_subresource);
+    if (resolved < 0 || resolved != plane(s, src_subresource) || (named_plane >= 0 && resolved != named_plane) ||
+        s->desc().SampleDesc.Count <= 1 || d->desc().SampleDesc.Count != 1)
+        return false;
+    VkResolveModeFlagBits wanted = VK_RESOLVE_MODE_MIN_BIT;
+    if (mode == D3D12_RESOLVE_MODE_MAX) wanted = VK_RESOLVE_MODE_MAX_BIT;
+    else if (mode == D3D12_RESOLVE_MODE_AVERAGE && named_plane == 0) wanted = VK_RESOLVE_MODE_AVERAGE_BIT;
+    else if (mode != D3D12_RESOLVE_MODE_MIN) return false;
+    // The rendering scope that replays it resolves pixels in place (vulkan_replay.h).
+    if (rect ? (LONG(x) != rect->left || LONG(y) != rect->top) : (x || y)) return false;
+    const DeviceState& state = d->device_state();
+    return (resolved ? state.stencil_resolve_modes : state.depth_resolve_modes) & wanted;
 }
 
 std::uint32_t device_max_push_constants_size(ID3D12Device* device) {

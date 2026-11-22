@@ -825,6 +825,14 @@ if(TARGET Vulkan::Headers)
     add_test(NAME d3d12_typeless_rtv COMMAND d3d12_typeless_rtv_test)
     set_tests_properties(d3d12_typeless_rtv PROPERTIES SKIP_RETURN_CODE 77)
 
+    # Depth/stencil ResolveSubresourceRegion against the host runtime and WARP; run explicitly on a Vulkan GPU.
+    add_executable(d3d12_depth_resolve_test test/d3d12_depth_resolve_test.cpp)
+    target_link_libraries(d3d12_depth_resolve_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
+    target_compile_definitions(d3d12_depth_resolve_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_depth_resolve_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME d3d12_depth_resolve COMMAND d3d12_depth_resolve_test)
+    set_tests_properties(d3d12_depth_resolve PROPERTIES SKIP_RETURN_CODE 77)
+
     # ID3D12Resource::GetDesc against the host runtime and WARP; run explicitly on a Vulkan GPU.
     add_executable(d3d12_resource_desc_test test/d3d12_resource_desc_test.cpp)
     target_link_libraries(d3d12_resource_desc_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
