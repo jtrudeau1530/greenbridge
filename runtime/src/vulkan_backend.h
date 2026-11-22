@@ -688,7 +688,7 @@ public:
         predicate_family_ = family;
         predicate_reducer_ = std::make_unique<PredicateReducer>(get, device_, memory, max_range);
     }
-    // Configure before queue creation, only when storageBuffer8BitAccess is enabled on the device.
+    // Configure before submitting work, only when storageBuffer8BitAccess is enabled on the device.
     void configure_predicated_copy(PFN_vkGetDeviceProcAddr get, const VkPhysicalDeviceLimits& limits) {
         std::unique_lock lock(resource_mutex_);
         predicated_copier_ = std::make_unique<PredicatedBufferCopier>(get, device_, limits);

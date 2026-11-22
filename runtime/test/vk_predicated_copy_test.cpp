@@ -5,6 +5,18 @@
 #include <cstring>
 #include <cstdio>
 #define EXPECT(x) do { if (!(x)) { std::fprintf(stderr,"line %d: %s\n",__LINE__,#x); return 1; } } while(0)
+namespace {
+PFN_vkCmdPipelineBarrier2 real_barrier2 = nullptr;
+unsigned host_barriers = 0;
+VkPipelineStageFlags2 host_stages = 0;
+VKAPI_ATTR void VKAPI_CALL observe_host(VkCommandBuffer cb, const VkDependencyInfo* info) {
+    for (std::uint32_t i = 0; i < info->memoryBarrierCount; ++i) {
+        const auto& b = info->pMemoryBarriers[i];
+        if (b.dstStageMask & VK_PIPELINE_STAGE_2_HOST_BIT) { ++host_barriers; host_stages |= b.srcStageMask; }
+    }
+    real_barrier2(cb, info);
+}
+}
 int main() {
     vktest::Device d;
     if(!d.create())return 1;
@@ -36,7 +48,7 @@ int main() {
     std::memcpy(src_data,input.data(),bytes); std::memcpy(dst_data,expected.data(),bytes);
     const std::uint64_t predicates[]={UINT64_C(1)<<32,0}; std::memcpy(pred_data,predicates,sizeof(predicates));
     ResourceBinding a{};a.buffer=src;a.buffer_offset=1;a.size=bytes-1;
-    ResourceBinding b{};b.buffer=dst;b.buffer_offset=3;b.size=bytes-3;
+    ResourceBinding b{};b.buffer=dst;b.buffer_offset=3;b.size=bytes-3;b.host_readable=true;
     ResourceBinding p{};p.buffer=pred;p.size=16;
     context.add_resource(1,a);context.add_resource(2,b);context.add_resource(3,p);
     CommandList list;
@@ -59,6 +71,12 @@ int main() {
     EXPECT(std::memcmp(dst_data,expected.data(),bytes)!=0); // expected includes the not-yet-executed copies
     for(std::size_t i=0;i<bytes;++i) EXPECT(static_cast<unsigned char*>(dst_data)[i]==static_cast<unsigned char>(13*i+173));
     context.configure_predicated_copy(d.device_proc,limits);
+    const auto real_submit=context.vk.vkQueueSubmit;
+    context.vk.vkQueueSubmit=+[](VkQueue,std::uint32_t,const VkSubmitInfo*,VkFence)->VkResult{return VK_ERROR_OUT_OF_HOST_MEMORY;};
+    const auto rejected=queue.execute({&pointer,1});
+    context.vk.vkQueueSubmit=real_submit;
+    EXPECT(rejected==ReplayResult::unsupported);
+    for(std::size_t i=0;i<bytes;++i) EXPECT(static_cast<unsigned char*>(dst_data)[i]==static_cast<unsigned char>(13*i+173));
     queue.wait(gate.semaphore(),1);
     bool submitted=true;
     for(unsigned i=0;i<32;++i) if(queue.execute({&pointer,1})!=ReplayResult::success){submitted=false;break;}
@@ -68,6 +86,27 @@ int main() {
     for(unsigned i=0;i<32;++i) EXPECT(queue.execute({&pointer,1})==ReplayResult::success);
     EXPECT(queue.idle());
     EXPECT(std::memcmp(dst_data,expected.data(),bytes)==0 && std::memcmp(src_data,input.data(),bytes)==0);
+    real_barrier2=context.vk.vkCmdPipelineBarrier2; EXPECT(real_barrier2);
+    context.vk.vkCmdPipelineBarrier2=observe_host;
+    CommandList ordinary; EXPECT(ordinary.copy_buffer({2,5000,1,0,17}) && ordinary.close());
+    const CommandList* plain=&ordinary;
+    for(auto kind:{VulkanQueue::QueueKind::direct,VulkanQueue::QueueKind::compute,VulkanQueue::QueueKind::copy}) {
+        VulkanQueue typed(context,d.queue,d.family,kind); EXPECT(typed.ok());
+        host_barriers=0;host_stages=0;
+        if(kind==VulkanQueue::QueueKind::copy) {
+            EXPECT(typed.execute({&pointer,1})==ReplayResult::unsupported && host_barriers==0);
+            EXPECT(typed.execute({&plain,1})==ReplayResult::success);
+            EXPECT(host_stages==VK_PIPELINE_STAGE_2_COPY_BIT);
+        } else {
+            EXPECT(typed.execute({&pointer,1})==ReplayResult::success);
+            EXPECT(host_stages==(VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT|VK_PIPELINE_STAGE_2_COPY_BIT));
+        }
+        EXPECT(typed.idle() && host_barriers==1);
+        EXPECT((host_stages & ~VulkanQueue::queue_supported_stages(kind))==0);
+        EXPECT(std::memcmp(dst_data,expected.data(),bytes)==0);
+    }
+    context.vk.vkCmdPipelineBarrier2=real_barrier2;
     EXPECT(d.validation_errors()==0);
+    std::puts("predicated copy integration: failed-submit cleanup and direct/compute/copy host stages passed");
     std::puts("predicated copy: 32 gated + 32 reused submissions; byte offsets, forced windows, copy dependency, rebinding/reset and untouched bytes passed");
 }

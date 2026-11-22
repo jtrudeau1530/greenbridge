@@ -73,6 +73,21 @@ int main(){
     EXPECT(statistics.copy_buffer({2,0,1,0,1}));
     EXPECT(statistics.end_query({1,d3d12_query::pipeline_statistics,0})&&statistics.close());
     EXPECT(prepare(statistics,resolve,vk,result)==ReplayResult::unsupported);
+    // Readback visibility follows the actual producer, including mixed command lists.
+    destination.host_readable = false;
+    EXPECT(check({2,0,1,0,1})==ReplayResult::success && !result.wrote_readback && !result.readback_src_stages);
+    destination.host_readable = true;
+    EXPECT(check({2,0,1,0,1})==ReplayResult::success && result.wrote_readback);
+    EXPECT(result.readback_src_stages==VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
+    EXPECT(check({2,0,1,0,1},false)==ReplayResult::success && result.wrote_readback);
+    EXPECT(result.readback_src_stages==VK_PIPELINE_STAGE_2_COPY_BIT);
+    CommandList mixed;
+    EXPECT(mixed.set_predication({3,0,d3d12_predication::equal_zero}));
+    EXPECT(mixed.copy_buffer({2,0,1,0,1}) && mixed.set_predication({0,0,0}));
+    EXPECT(mixed.copy_buffer({2,1,1,1,1}) && mixed.close());
+    EXPECT(prepare(mixed,resolve,vk,result)==ReplayResult::success && result.wrote_readback);
+    EXPECT(result.readback_src_stages==(VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT|VK_PIPELINE_STAGE_2_COPY_BIT));
+    EXPECT(check({2,0,1,0,0})==ReplayResult::success && !result.wrote_readback && !result.readback_src_stages);
     PredicatedBufferCopier missing(+[](VkDevice,const char*)->PFN_vkVoidFunction{return nullptr;},VK_NULL_HANDLE,{});
     std::vector<PredicatedCopyDispatch> jobs;
     EXPECT(!missing.batch()->prepare(source.buffer,destination.buffer,0,0,1,jobs));
