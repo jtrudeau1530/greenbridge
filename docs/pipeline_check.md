@@ -95,6 +95,31 @@ The report above therefore states the limit and the skip count; a later run on a
 completed the full 26,503-entry set without them (`docs/design.md`). `--max-bytes` remains a visibility
 tool, not a pass: a skipped module has not been validated.
 
+## Application pipeline-cache feedback
+
+With `--cache-feedback`, the checker groups successful pipeline creations by translated shader stage
+and reports three counts. A **hit** means the driver set both the valid-feedback bit and the
+application-cache-hit bit. **No hit reported** means feedback was valid and the hit bit was clear.
+**Unavailable** means the driver returned no valid feedback, or feedback was unsupported.
+The three counts sum to the successful pipelines for the stage. Skips and failures are counted separately.
+
+A driver can also use its own caches. A clear hit bit does not establish a fresh compile, and a
+reported hit may reuse data populated earlier in the same process. The seed-file byte count alone
+cannot identify which pipelines benefited.
+
+To compare runs, start with a new cache path and keep the device, index and flags identical, including
+`--stats` if used. For example, from a scratch directory that contains no `sample.cache`, run the same
+command twice, replacing `path/to/spirv` with the local translated-shader directory.
+
+```sh
+vk_pipeline_check path/to/spirv sample.cache --cache-feedback
+vk_pipeline_check path/to/spirv sample.cache --cache-feedback
+```
+
+On Windows with an RTX 5090 (driver 621.14), a synthetic three-compute, one-vertex and one-pixel
+sample reported zero application-cache hits on its first run and five on the seeded run. On Mesa
+llvmpipe the same five pipelines succeeded both times and neither run reported a hit.
+
 ## Device
 
 The reported runs used an NVIDIA GeForce RTX 5070 Ti (discrete, subgroup size 32 only), driver
