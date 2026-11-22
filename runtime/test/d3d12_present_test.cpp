@@ -115,6 +115,8 @@ int fail_semaphore_in = 0;               // armed: the n-th vkCreateSemaphore fr
 bool fail_surface_formats = false;       // armed: the next surface-format query fails before creation
 bool observe_next_swapchain = false;
 bool report_undefined_extent = false;    // armed: surface capabilities reports undefined extent (0xFFFFFFFF)
+bool undefined_extent_queried = false;
+VkExtent2D last_swapchain_extent{};
 VkSwapchainKHR last_created_swapchain = VK_NULL_HANDLE;
 VkSwapchainKHR observed_old_swapchain = VK_NULL_HANDLE;
 unsigned out_of_date = 0;                // presents the real driver reported out of date
@@ -170,6 +172,7 @@ VKAPI_ATTR VkResult VKAPI_CALL surface_formats(VkPhysicalDevice physical, VkSurf
 
 VKAPI_ATTR VkResult VKAPI_CALL create_swapchain(VkDevice device, const VkSwapchainCreateInfoKHR* info,
                                                 const VkAllocationCallbacks* allocator, VkSwapchainKHR* out) {
+    if (info) last_swapchain_extent = info->imageExtent;
     if (observe_next_swapchain) {
         observed_old_swapchain = info->oldSwapchain;
         observe_next_swapchain = false;
@@ -185,6 +188,7 @@ VKAPI_ATTR VkResult VKAPI_CALL get_surface_capabilities(VkPhysicalDevice physica
     if (result == VK_SUCCESS && report_undefined_extent && caps) {
         caps->currentExtent.width = 0xFFFFFFFF;
         caps->currentExtent.height = 0xFFFFFFFF;
+        undefined_extent_queried = true;
     }
     return result;
 }
@@ -409,9 +413,14 @@ int main() {
         EXPECT(SUCCEEDED(fence->SetEventOnCompletion(signalled, nullptr)));
 
         // 4. Undefined surface extent (0xFFFFFFFF, reported by Intel UHD graphics / Win32 WSI; D3D-165):
-        //    the presenter queries the window client extent and clamps to surface bounds.
+        //    switch vsync to 0 to force swapchain recreation, verifying that vkGetPhysicalDeviceSurfaceCapabilitiesKHR
+        //    is reached while armed and that vkCreateSwapchainKHR receives the clamped client extent (400x300)
+        //    instead of 0xFFFFFFFF.
         driver::report_undefined_extent = true;
-        EXPECT(frame(1));
+        driver::undefined_extent_queried = false;
+        EXPECT(frame(0));
+        EXPECT(driver::undefined_extent_queried);
+        EXPECT(driver::last_swapchain_extent.width == 400 && driver::last_swapchain_extent.height == 300);
         EXPECT(presenter->extent().width == 400 && presenter->extent().height == 300);
         driver::report_undefined_extent = false;
 

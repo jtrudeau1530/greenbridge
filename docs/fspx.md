@@ -88,8 +88,11 @@ compute shader.
   - `fspx_unpack.py --disasm` defaults to `gfx1030`.
 - **What llvm-mc still rejects.** With `gfx1030`, 21 of the 29 decode with no invalid word. The other 89 words, in 8
   programs, are all VOP3P opcode 0x16 with `op_sel` 2 and `op_sel_hi` 5. That is the opcode of the 1,458
-  `v_dot4_i32_i8` that `llvm-mc` does decode, all of which have `op_sel` 0. What the hardware does with that `op_sel`
-  was not checked.
+  `v_dot4_i32_i8` that `llvm-mc` does decode, all of which have `op_sel` 0.
+  - Measured on RDNA2 hardware (gfx1036, through `tools/hw_oracle`, the instruction given as two raw words): with
+    `op_sel` 2 and `op_sel_hi` 5 the result is the dot product with the two 16-bit halves of the second source
+    exchanged, in all 5 operand sets (4 of them give another word under the plain rule). So `op_sel` selects halves
+    here as it does for the packed 16-bit ops. The words are in `tests/semantic/test_alu_dot4_i8.py`.
 
 ## Kind 7: records
 
@@ -108,12 +111,13 @@ compute shader.
 
 With `tools/fspx_unpack.py --disasm` and `tools/rdna2spirv.py` on the 29 programs:
 
-- **13 translate and pass `spirv-val`.** They are the 16 programs that use no dot4 instruction, minus 3 that stop at
-  `v_pk_add_u16`, `image_atomic_add` (2D) and `v_pk_fmac_f16`.
-- **The 13 programs that use dot4 do not translate yet.** The translator has neither dot4 form:
-  - 10 stop at `v_dot4_i32_i8`;
-  - 2 stop earlier, at a reachable word `llvm-mc` does not decode (the VOP3P words above);
-  - 1 stops earlier, at an `src_scc` operand.
+- **17 translate and pass `spirv-val`.** 13 of them are the 16 programs that use no dot4 instruction, minus 3 that
+  stop at `v_pk_add_u16`, `image_atomic_add` (2D) and `v_pk_fmac_f16`. The other 4 use dot4 (design.md, "Signed-byte
+  dot products").
+- **9 more programs that use dot4 do not translate yet.** The first thing each stops at:
+  - 6 at an `s_buffer_load_dwordx8` or `_dwordx16` whose destination range ends in `vcc_lo, vcc_hi`;
+  - 2 at a reachable word `llvm-mc` does not decode (the VOP3P words above);
+  - 1 at an `src_scc` operand.
 
 ## Unknown
 

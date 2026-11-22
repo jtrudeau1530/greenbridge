@@ -139,6 +139,17 @@ class TestFolder(unittest.TestCase):
         self.assertEqual(self.tags("story", "bank_02", "1FFFFFFF.ogg"), ["TITLE=door_slam_03"])
         self.assertEqual(self.tags("story", "bank_01", "00000123.ogg"), [])
 
+    def test_duplicate_id_stream_gets_the_same_tags(self):
+        # awc_opus.py names a bank's second stream with an id already used <id>~2 (export_stems); it has the same
+        # id, so it is the same name and dialogue line.
+        stem = awc_opus.export_stems([0x0ABCDEF1, 0x0ABCDEF1])[1]
+        make_ogg(os.path.join(self.opus, "story", "bank_01", stem + ".ogg"))
+        dialogue, langs = T.load_dialogue(self.dialogue)
+        stats = T.tag_folder(self.opus, T.load_names(self.names, "story"), dialogue, langs)
+        self.assertEqual((stats["ogg files"], stats["tagged"], stats["without a name"]), (4, 3, 1))
+        self.assertEqual(self.tags("story", "bank_01", stem + ".ogg"), self.tags("story", "bank_01", "0ABCDEF1.ogg"))
+        self.assertIn("TITLE=heistau_abcd_01", self.tags("story", "bank_01", stem + ".ogg"))
+
     def test_second_run_replaces_its_own_tags(self):
         names = T.load_names(self.names, "story")
         T.tag_folder(self.opus, names)

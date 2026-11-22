@@ -393,8 +393,9 @@ class ExportBankTest(unittest.TestCase):
             self.assertEqual(last["serial"], 3)
 
     def test_stereo_plain_stream_length_is_per_channel(self):
-        # A stereo format tag stores interleaved samples. Three 960-frame stereo packets carry
-        # 2880 frames per channel; the declared 3840 is twice the real per-channel length.
+        # A stereo format tag stores interleaved samples: 3840 counts = 1920 frames per channel.
+        # Three 960-frame packets carry 2880 frames per channel, so the declared 1920 trims
+        # 960 frames of payload; the point is the halving, not a realistic stream length.
         packet = bytes([0x9C])          # CELT 20 ms, code 0, stereo bit: 960 frames per channel
         opus = bytearray(3 * 2048)
         for block in range(3):
@@ -414,8 +415,8 @@ class ExportBankTest(unittest.TestCase):
 
     def test_declared_samples_are_48khz_frames_not_scaled_by_rate(self):
         # Four 960-frame packets are 3840 frames; the tag declares 2880 real frames and a 32 kHz
-        # source rate. Scaling by 48000/32000 would make the length 4320, so the last granule
-        # would stay at 312 + 3840 and the padding would not be trimmed.
+        # source rate. Scaling by 48000/32000 would make the target 4320, above the payload, so
+        # the old code kept all 3840 packet frames (granule 3840, 3528 after the pre-skip).
         packet = bytes([0x08])          # SILK 20 ms, code 0: 960 frames
         opus = bytearray(4 * 2048)
         for block in range(4):
@@ -431,12 +432,13 @@ class ExportBankTest(unittest.TestCase):
             pages = parse_ogg_pages(f.read())
         self.assertEqual(pages[-1]["granule"], 312 + 2880)
 
-    def test_format_block_per_channel_frame_count_is_used(self):
-        # +0x0C is the per-channel Opus frame count and wins over dividing the +0 count:
-        # 9999 interleaved samples / 2 would be 4999 frames and would not trim the padding.
+    def test_inconsistent_format_frame_count_falls_back(self):
+        # +0x0C is authoritative only when it agrees with the interleaved +0 count:
+        # 1920 * 2 != 9999, so the block is malformed and +0 / channels (4999) is used
+        # instead of silently truncating the real audio.
         packet = bytes([0x9C])          # CELT 20 ms, code 0, stereo bit: 960 frames per channel
-        opus = bytearray(3 * 2048)
-        for block in range(3):
+        opus = bytearray(6 * 2048)
+        for block in range(6):
             struct.pack_into("<H", opus, block * 2048, len(packet))
             opus[block * 2048 + 2:block * 2048 + 2 + len(packet)] = packet
         fmt = bytearray(format_block(9999, 48000, 0x0B, 2))
@@ -449,7 +451,68 @@ class ExportBankTest(unittest.TestCase):
         awc.export_bank(path, self.out)
         with open(os.path.join(self.out, "frames", "0000000B.ogg"), "rb") as f:
             pages = parse_ogg_pages(f.read())
+        self.assertEqual(pages[-1]["granule"], 312 + 4999)
+
+    def test_consistent_format_frame_count_is_used(self):
+        # 3840 interleaved stereo samples = 1920 per channel, and +0x0C agrees.
+        packet = bytes([0x9C])          # CELT 20 ms, code 0, stereo bit: 960 frames per channel
+        opus = bytearray(3 * 2048)
+        for block in range(3):
+            struct.pack_into("<H", opus, block * 2048, len(packet))
+            opus[block * 2048 + 2:block * 2048 + 2 + len(packet)] = packet
+        fmt = bytearray(format_block(3840, 48000, 0x0B, 2))
+        struct.pack_into("<I", fmt, 12, 1920)
+        bank = build_bank([(12, bytes(fmt), bytes(opus))])
+        path = os.path.join(self.tmp.name, "frames_ok.awc")
+        with open(path, "wb") as f:
+            f.write(bank)
+
+        awc.export_bank(path, self.out)
+        with open(os.path.join(self.out, "frames_ok", "0000000C.ogg"), "rb") as f:
+            pages = parse_ogg_pages(f.read())
         self.assertEqual(pages[-1]["granule"], 312 + 1920)
+
+    def test_eos_page_is_emitted_at_the_trim_point(self):
+        # 27 packets of 160 bytes / 960 frames: the 26th packet crosses the target
+        # (312 + 24000 = 24312) and would otherwise flush a full page first. The EOS
+        # page must carry the reaching packet and drop the 27th padding packet, not
+        # emit a later page whose granule is smaller than the previous one.
+        packet = bytes([0x08]) + bytes(159)     # SILK 20 ms, 960 frames
+        packets = [packet] * 27
+        path = os.path.join(self.tmp.name, "trim.ogg")
+        awc.write_ogg_opus(path, packets, 1, 21, 24000)
+        with open(path, "rb") as f:
+            pages = parse_ogg_pages(f.read())
+        audio = pages[2:]
+        granules = [p["granule"] for p in audio]
+        self.assertEqual(granules, sorted(granules))
+        self.assertEqual(audio[-1]["granule"], 312 + 24000)
+        self.assertEqual(audio[-1]["flags"] & 0x04, 0x04)
+        self.assertEqual(sum(1 for p in audio for value in p["lacing"] if value < 255), 26)
+
+    def test_pre_skip_larger_than_the_stream_is_clamped(self):
+        # Six 960-frame packets are 5760 samples; a pre-skip of 65535 would put the
+        # EOS granule below the pre-skip and make the stream undecodable.
+        packet = bytes([0x08])
+        packets = [packet] * 6
+        path = os.path.join(self.tmp.name, "preskip.ogg")
+        awc.write_ogg_opus(path, packets, 1, 23, 4800, pre_skip=65535)
+        with open(path, "rb") as f:
+            pages = parse_ogg_pages(f.read())
+        self.assertEqual(struct.unpack_from("<H", pages[0]["body"], 10)[0], 5760)
+        self.assertGreaterEqual(pages[-1]["granule"], 5760)
+        with self.assertRaises(ValueError):
+            awc.write_ogg_opus(path, packets, 1, 24, 4800, pre_skip=65536)
+
+    def test_empty_packet_list_writes_an_eos_page(self):
+        # No audio packets is still a valid empty stream: the EOS flag must be present.
+        path = os.path.join(self.tmp.name, "empty.ogg")
+        self.assertEqual(awc.write_ogg_opus(path, [], 1, 25, 0), 0)
+        with open(path, "rb") as f:
+            pages = parse_ogg_pages(f.read())
+        self.assertEqual(len(pages), 3)
+        self.assertEqual(pages[-1]["flags"] & 0x04, 0x04)
+        self.assertEqual(pages[-1]["granule"], 0)
 
     def test_cli_pre_skip_override(self):
         bank, _, _ = self.make_bank()

@@ -259,11 +259,11 @@ class InterpP1lvF16HalvesFallbackTests(unittest.TestCase):
         self.assertNotIn("BaryCoordKHR", spv)
         self.assertNotIn("FragmentBarycentricKHR", spv)
         self.assertNotIn("fragmentShaderBarycentric", meta["features"])
-        self.assertIn("OpDecorate %in_f16h0_0 Location 29", spv)
-        self.assertIn("OpDecorate %in_f16h0_1 Location 30", spv)
+        self.assertIn("OpDecorate %in_f16h0_0 Location 28", spv)
+        self.assertIn("OpDecorate %in_f16h0_1 Location 29", spv)
         self.assertNotIn("OpDecorate %in_f16h0_0 Flat", spv)
-        self.assertEqual(meta["f16_halves"], {"0": [29, 30]})
-        self.assertEqual(meta["inputs"], [29, 30])
+        self.assertEqual(meta["f16_halves"], {"0": [28, 29]})
+        self.assertEqual(meta["inputs"], [28, 29])
 
         inputs = {
             "%in_f16h0_0": (lerp(LO), 0.5, 3.5, 0.0),   # attr0 low: 1.75 (clamped->1.0), 0.5, 3.5 (p1lv f32)
@@ -372,9 +372,9 @@ class InterpF16BaryFallbackTests(unittest.TestCase):
         spv, meta = translate_with_flags("ps_both_flags", P1LV_CLAMP_PAIR,
                                          dxbc=PS_ATTR01_DXBC, bary_fallback=True, f16_halves=True)
         self.assertNotIn("PerVertexKHR", spv)
-        self.assertIn("OpDecorate %in_f16h0_0 Location 29", spv)
-        self.assertIn("OpDecorate %in_f16h0_1 Location 30", spv)
-        self.assertEqual(meta["f16_halves"], {"0": [29, 30]})
+        self.assertIn("OpDecorate %in_f16h0_0 Location 28", spv)
+        self.assertIn("OpDecorate %in_f16h0_1 Location 29", spv)
+        self.assertEqual(meta["f16_halves"], {"0": [28, 29]})
 
 
 class InterpF16GuardsAndRejectionsTests(unittest.TestCase):

@@ -28,7 +28,7 @@
 // driver refuses one of its textures (DXGI_FORMAT_R9G9B9E5_SHAREDEXP with ALLOW_UNORDERED_ACCESS); on WARP the
 // context is created as is. The other backend ids are controls: they end in FFX_API_RETURN_ERROR before the device
 // is touched. In step 7 the dispatch is recorded up to the DLL's compute pipeline, which a PC device cannot create
-// (slot 67 is console-only and refused; slot 62's code is not a PC shader). The INFO lines are the measurement; the
+// (slot 67 and 62 codes are not PC shaders). The INFO lines are the measurement; the
 // PASS/FAIL checks only cover what is known to work.
 #include <windows.h>
 
@@ -958,7 +958,7 @@ int main() {
                     note("  device slot 62 (compute pipeline from a D3D12_COMPUTE_PIPELINE_STATE_DESC) called " +
                          std::to_string(g_slot62_calls) + "x, last HRESULT " + hex(static_cast<uint32_t>(g_slot62_hr)));
                     if (g_formatted) note("  the DLL formatted HRESULT " + hex(g_first_formatted));
-                    // On a PC device both pipeline paths fail (67 is refused, 62's code is not a PC shader); on the
+                    // On a PC device both pipeline paths fail (neither slot 67's nor 62's code is a PC shader); on the
                     // Vulkan device CreateRootSignature (slot 16) is not implemented yet. Either way the dispatch goes
                     // on with a null pipeline and faults when it records it (RVA 0x65ff reads the pipeline's +0x10,
                     // the same pointer it passes to SetPipelineState): a documented stop, not a test failure.

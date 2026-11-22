@@ -178,6 +178,62 @@ class TestCli(unittest.TestCase):
             with open(outs["strings"], encoding="utf-8", newline="") as fh:
                 strings = list(csv.DictReader(fh))
             self.assertIn(("ZZ_MENU_TITLE", "das Menü"), {(s["label"], s["text"]) for s in strings})
+            self.assertFalse([f for f in os.listdir(tmp) if f.startswith(".text_tables-")],
+                             "staging files must not be left behind")
+
+    def test_failed_later_write_leaves_earlier_reports_intact(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "src")
+            os.mkdir(src)
+            write(os.path.join(src, "conv.pso"), CONV)
+            dialogue = os.path.join(tmp, "dialogue.csv")
+            old = "OLD GOOD REPORT\n"
+            with open(dialogue, "w", encoding="utf-8") as fh:
+                fh.write(old)
+            tables = os.path.join(tmp, "tables.csv")
+            os.mkdir(tables)                        # a later output that cannot be written
+            with contextlib.redirect_stderr(io.StringIO()) as err:
+                self.assertEqual(T.main([src, "--dialogue", dialogue, "--tables", tables]), 2)
+            self.assertIn("cannot write", err.getvalue())
+            with open(dialogue, encoding="utf-8") as fh:
+                self.assertEqual(fh.read(), old)
+            self.assertFalse([f for f in os.listdir(tmp) if f.startswith(".text_tables-")])
+
+    @unittest.skipUnless(os.name == "nt", "Windows denies os.replace on a file held open by a reader")
+    def test_reader_holding_a_later_report_keeps_all_reports(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "src")
+            os.mkdir(src)
+            write(os.path.join(src, "conv.pso"), CONV)
+            dialogue = os.path.join(tmp, "dialogue.csv")
+            tables = os.path.join(tmp, "tables.csv")
+            old_dialogue, old_tables = "OLD DIALOGUE\n", "OLD TABLES\n"
+            for path, text in ((dialogue, old_dialogue), (tables, old_tables)):
+                with open(path, "w", encoding="utf-8") as fh:
+                    fh.write(text)
+            with open(tables, "rb"):       # a reader keeps the second output open
+                with contextlib.redirect_stderr(io.StringIO()) as err:
+                    self.assertEqual(T.main([src, "--dialogue", dialogue, "--tables", tables]), 2)
+            self.assertIn("cannot write", err.getvalue())
+            with open(dialogue, encoding="utf-8") as fh:
+                self.assertEqual(fh.read(), old_dialogue)
+            with open(tables, encoding="utf-8") as fh:
+                self.assertEqual(fh.read(), old_tables)
+            self.assertFalse([f for f in os.listdir(tmp) if f.startswith(".text_tables-")],
+                             "staging and backup files must not be left behind")
+
+    def test_two_outputs_naming_one_file_are_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "src")
+            os.mkdir(src)
+            write(os.path.join(src, "conv.pso"), CONV)
+            out = os.path.join(tmp, "same.csv")
+            with contextlib.redirect_stderr(io.StringIO()) as err:
+                with self.assertRaises(SystemExit) as cm:
+                    T.main([src, "--dialogue", out, "--tables", out])
+            self.assertEqual(cm.exception.code, 2)
+            self.assertIn("distinct", err.getvalue())
+            self.assertFalse(os.path.exists(out), "no report may be written before the check")
 
     def test_missing_input(self):
         with contextlib.redirect_stderr(io.StringIO()):

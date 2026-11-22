@@ -351,7 +351,7 @@ def write_outputs(rows, summaries, out, csv_path):
     if out:
         _make_parent(out)
         payload = summaries if len(summaries) > 1 else (summaries[0] if summaries else {})
-        with open(out, "w", encoding="utf-8") as f:
+        with open(out, "w", encoding="utf-8", newline="\n") as f:
             json.dump({"summary": payload, "streams": rows}, f, indent=0)
     if csv_path:
         _make_parent(csv_path)

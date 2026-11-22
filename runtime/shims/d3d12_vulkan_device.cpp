@@ -15,6 +15,7 @@
 #include "d3d12_xs_device.h"
 #include "dxgi_com.h"
 #include "../src/gfx10_descriptors.h"
+#include "../src/uav_clear.h"
 #include "../src/vulkan_bindless.h"
 #include "../src/vulkan_memory.h"
 #include "../src/resource_tiling.h"
@@ -24,6 +25,9 @@
 #include "../src/vulkan13_features.h"
 
 #include <vulkan/vulkan_win32.h>
+#ifdef _MSC_VER
+#pragma comment(lib, "advapi32.lib")
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -58,6 +62,8 @@ static_assert(sizeof(leonida::TargetView) <= kDescriptorSize);
 // "unsupported" at boot. Raise these when a front end for the higher version lands.
 constexpr D3D_SHADER_MODEL kHighestShaderModel = D3D_SHADER_MODEL_6_0;
 constexpr D3D_ROOT_SIGNATURE_VERSION kHighestRootSignatureVersion = D3D_ROOT_SIGNATURE_VERSION_1_1;
+
+std::atomic<int> g_global_realtime_privilege_override{-1};
 
 void log_once(const char* what, int value) {
     static std::mutex mutex;
@@ -1060,6 +1066,21 @@ const char* heap_properties_refusal(const D3D12_HEAP_PROPERTIES& heap) {
     return nullptr;
 }
 
+// Why the host would refuse this CreateHeap/CreateHeap1 description, or null if these checks pass (D3D-238). A probe
+// on an RX 5700 and WARP refuses an alignment other than 0, 64 KiB and 4 MiB, the heap properties above (a type of 0,
+// a custom heap without a CPU page property), and a heap that denies buffers and both kinds of texture.
+const char* heap_desc_refusal(const D3D12_HEAP_DESC& desc) {
+    if (!desc.SizeInBytes) return "zero size";
+    if (desc.Alignment && desc.Alignment != D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT &&
+        desc.Alignment != D3D12_DEFAULT_MSAA_RESOURCE_PLACEMENT_ALIGNMENT)
+        return "alignment (0, 64 KiB or 4 MiB)";
+    if (const char* why = heap_properties_refusal(desc.Properties)) return why;
+    constexpr UINT deny_all = D3D12_HEAP_FLAG_DENY_BUFFERS | D3D12_HEAP_FLAG_DENY_RT_DS_TEXTURES |
+                              D3D12_HEAP_FLAG_DENY_NON_RT_DS_TEXTURES;
+    if ((UINT(desc.Flags) & deny_all) == deny_all) return "heap flags denying every resource kind";
+    return nullptr;
+}
+
 // Why the host would refuse this committed resource, or null if these checks pass. The flag and format tables were
 // measured on an RX 9070 XT, an integrated Radeon and WARP, which agree on all of them. Cross-adapter resources
 // (valid there only as a row-major texture on a SHARED | SHARED_CROSS_ADAPTER heap) are refused: this layer has no
@@ -1355,6 +1376,10 @@ public:
         binding.size = desc_.Width;
         binding.buffer = device_.arena.buffer;
         binding.buffer_offset = va_;
+        binding.va = va_;
+        binding.host_readable = (heap_.Type == D3D12_HEAP_TYPE_READBACK ||
+                                 (heap_.Type == D3D12_HEAP_TYPE_CUSTOM &&
+                                  heap_.CPUPageProperty == D3D12_CPU_PAGE_PROPERTY_WRITE_BACK));
         device_.context->add_resource(id(), binding);
         return S_OK;
     }
@@ -1460,8 +1485,9 @@ public:
     D3D12_RESOURCE_DESC STDMETHODCALLTYPE GetDesc() override {
         D3D12_RESOURCE_DESC desc = desc_;
         if (!desc.Alignment) {
-            desc.Alignment = desc.SampleDesc.Count > 1 ? D3D12_DEFAULT_MSAA_RESOURCE_PLACEMENT_ALIGNMENT
-                                                       : D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
+            desc.Alignment = (desc.SampleDesc.Count > 1 && !is_tiled_layout(desc.Layout))
+                                 ? D3D12_DEFAULT_MSAA_RESOURCE_PLACEMENT_ALIGNMENT
+                                 : D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
         }
         return desc;
     }
@@ -1937,6 +1963,7 @@ public:
     bool reserved() const { return reserved_; }
     VkDeviceSize offset() const { return offset_; }
     UINT64 bytes() const { return desc_.SizeInBytes; }
+    UINT64 alignment() const { return desc_.Alignment ? desc_.Alignment : D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT; }
     const D3D12_HEAP_PROPERTIES& properties() const { return desc_.Properties; }
     D3D12_HEAP_FLAGS flags() const { return desc_.Flags; }
 
@@ -2597,6 +2624,99 @@ struct TextureView {
     float min_lod = 0.0f;
 };
 
+// In-memory pipeline library (docs/d3d12_vulkan.md sections 3.6 and 4). D3D12 cached blobs are driver-specific
+// and ignored across runs; Serialize writes a versioned header so CreatePipelineLibrary recognizes our own blobs
+// and returns D3D12_ERROR_DRIVER_VERSION_MISMATCH for foreign or corrupt ones.
+class PipelineLibrary final
+    : public Child<PipelineLibrary, ID3D12PipelineLibrary1Stubs, ID3D12Object, ID3D12DeviceChild, ID3D12Pageable,
+                   ID3D12PipelineLibrary, ID3D12PipelineLibrary1> {
+public:
+    // {6e2a9d41-7b5f-4c83-8e14-2a9d6f3c5b10}
+    static constexpr GUID kTag{0x6e2a9d41, 0x7b5f, 0x4c83, {0x8e, 0x14, 0x2a, 0x9d, 0x6f, 0x3c, 0x5b, 0x10}};
+
+    struct Header {
+        std::uint32_t magic;
+        std::uint32_t version;
+        std::uint32_t count;
+        std::uint32_t reserved;
+    };
+    static constexpr std::uint32_t kMagic = 0x314C504Cu;  // "LPL1"
+    static constexpr std::uint32_t kVersion = 1;
+
+    ~PipelineLibrary() override {
+        std::lock_guard lock(mutex_);
+        for (auto& [name, pso] : entries_)
+            if (pso) pso->Release();
+        entries_.clear();
+    }
+
+    static bool valid_blob(const void* data, SIZE_T size) {
+        if (!data || size < sizeof(Header)) return false;
+        Header h{};
+        std::memcpy(&h, data, sizeof(h));
+        return h.magic == kMagic && h.version == kVersion && h.reserved == 0;
+    }
+
+    HRESULT STDMETHODCALLTYPE StorePipeline(LPCWSTR name, ID3D12PipelineState* pipeline) override {
+        if (!name || !*name || !pipeline) return E_INVALIDARG;
+        if (!PipelineState::from<PipelineState>(pipeline)) return E_INVALIDARG;
+        std::lock_guard lock(mutex_);
+        auto [it, inserted] = entries_.emplace(name, pipeline);
+        if (!inserted) return E_INVALIDARG;
+        pipeline->AddRef();
+        return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE LoadGraphicsPipeline(LPCWSTR name, const D3D12_GRAPHICS_PIPELINE_STATE_DESC* desc,
+                                                   REFIID riid, void** out) override {
+        if (!out) return E_POINTER;
+        *out = nullptr;
+        if (!name || !*name || !desc) return E_INVALIDARG;
+        return load_entry(name, false, true, riid, out);
+    }
+
+    HRESULT STDMETHODCALLTYPE LoadComputePipeline(LPCWSTR name, const D3D12_COMPUTE_PIPELINE_STATE_DESC* desc,
+                                                  REFIID riid, void** out) override {
+        if (!out) return E_POINTER;
+        *out = nullptr;
+        if (!name || !*name || !desc) return E_INVALIDARG;
+        return load_entry(name, true, false, riid, out);
+    }
+
+    HRESULT STDMETHODCALLTYPE LoadPipeline(LPCWSTR name, const D3D12_PIPELINE_STATE_STREAM_DESC* desc,
+                                           REFIID riid, void** out) override {
+        if (!out) return E_POINTER;
+        *out = nullptr;
+        if (!name || !*name || !desc || !desc->SizeInBytes || !desc->pPipelineStateSubobjectStream) return E_INVALIDARG;
+        return load_entry(name, false, false, riid, out);
+    }
+
+    SIZE_T STDMETHODCALLTYPE GetSerializedSize() override { return sizeof(Header); }
+
+    HRESULT STDMETHODCALLTYPE Serialize(void* data, SIZE_T size) override {
+        if (!data || size < sizeof(Header)) return E_INVALIDARG;
+        std::lock_guard lock(mutex_);
+        const Header h{kMagic, kVersion, static_cast<std::uint32_t>(entries_.size()), 0};
+        std::memcpy(data, &h, sizeof(h));
+        return S_OK;
+    }
+
+private:
+    HRESULT load_entry(LPCWSTR name, bool require_compute, bool require_graphics, REFIID riid, void** out) {
+        std::lock_guard lock(mutex_);
+        const auto it = entries_.find(name);
+        if (it == entries_.end()) return E_INVALIDARG;
+        PipelineState* ps = PipelineState::from<PipelineState>(it->second);
+        if (!ps) return E_INVALIDARG;
+        if (require_compute && !ps->compute()) return E_INVALIDARG;
+        if (require_graphics && !ps->graphics()) return E_INVALIDARG;
+        return it->second->QueryInterface(riid, out);
+    }
+
+    std::mutex mutex_;
+    std::unordered_map<std::wstring, ID3D12PipelineState*> entries_;
+};
+
 // The T# of a view: what the shader gets to know about it, in the structure the console's shaders read.
 // False (with a log) for a view set 0 cannot show yet.
 bool image_descriptor(const Resource& resource, const TextureView& view, leonida::gfx10::Image& out) {
@@ -2627,7 +2747,7 @@ bool image_descriptor(const Resource& resource, const TextureView& view, leonida
     const auto dimension = line ? D3D12_RESOURCE_DIMENSION_TEXTURE1D :
                            view.type == g::ImageType::image_3d ? D3D12_RESOURCE_DIMENSION_TEXTURE3D :
                                                                D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-    if (desc.Dimension != dimension || (line && desc.DepthOrArraySize != 1) || msaa != (desc.SampleDesc.Count > 1)) {
+    if (desc.Dimension != dimension || (line && view.layer_count != 1) || msaa != (desc.SampleDesc.Count > 1)) {
         log_once("view type incompatible with texture dimension or sample count; view type", int(view.type));
         return false;
     }
@@ -3075,7 +3195,19 @@ public:
             get_properties(state_.info.physical, &properties);
             features.ms_samples = {VK_SAMPLE_COUNT_4_BIT, state_.ms_fallback_samples(VK_FORMAT_R32_UINT),
                                    state_.ms_fallback_samples(VK_FORMAT_R32_SINT)};
-            if (!leonida::bindless::size_bindings(features, properties.properties.limits, v11, indexed))
+            // Past maxPerSetDescriptors, ask the driver about the grown layout (D3D-219: Intel's Xe-LP reports 6159).
+            const auto layout_support = reinterpret_cast<PFN_vkGetDescriptorSetLayoutSupport>(
+                get_device(state_.info.device, "vkGetDescriptorSetLayoutSupport"));
+            std::function<bool(const leonida::BindlessFeatures&)> layout_supported;
+            if (layout_support)
+                layout_supported = [&](const leonida::BindlessFeatures& candidate) {
+                    const leonida::bindless::SetLayout layout(candidate);
+                    VkDescriptorSetLayoutSupport support{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_SUPPORT};
+                    layout_support(state_.info.device, &layout.info, &support);
+                    return support.supported == VK_TRUE;
+                };
+            if (!leonida::bindless::size_bindings(features, properties.properties.limits, v11, indexed,
+                                                  layout_supported))
                 std::fprintf(stderr, "[rt] d3d12: the device's descriptor limits are below the bindless set's default "
                                      "sizes; it holds less\n");
         }
@@ -3360,8 +3492,8 @@ public:
             log_once("CreateCommandQueue refused (type, priority, flags or node mask), type", desc->Type);
             return d3d12_trace::result(method, E_INVALIDARG);
         }
-        // Global realtime priority needs a privilege the host grants only on request; without it, this answer.
-        if (desc->Priority == D3D12_COMMAND_QUEUE_PRIORITY_GLOBAL_REALTIME) {
+        // Global realtime priority needs SeIncreaseBasePriorityPrivilege enabled in the token; without it, this answer.
+        if (desc->Priority == D3D12_COMMAND_QUEUE_PRIORITY_GLOBAL_REALTIME && !has_global_realtime_privilege()) {
             log_once("CreateCommandQueue refused (global realtime priority), type", desc->Type);
             return d3d12_trace::result(method, DXGI_ERROR_ACCESS_DENIED);
         }
@@ -3494,7 +3626,7 @@ public:
         auto& vk = state_.context->vk;
         if (desc && state_.context->xdxr_acceleration_structures()) {
             // XDXR records: the layout depends only on the triangle or instance count (xdxr_build.h), so the sizes
-            // are exact. An update rebuilds the structure, so it needs the same scratch.
+            // are exact. An update refits (no sort); the build's scratch size covers it.
             leonida::BuildAccelerationStructure build{};
             build.is_tlas = desc->Type == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL;
             if (build.is_tlas) {
@@ -3657,7 +3789,7 @@ public:
         return hand_out(signature, riid, out);
     }
 
-    // PC slot 11; the Xbox ABI reaches it through device slot 62 (the proxy forwards).
+    // PC slot 11; the Xbox ABI reaches it through device slots 62 and 67 (the proxy forwards).
     HRESULT STDMETHODCALLTYPE CreateComputePipelineState(const D3D12_COMPUTE_PIPELINE_STATE_DESC* desc, REFIID riid,
                                                          void** out) override {
         if (!out) return E_POINTER;
@@ -3684,6 +3816,19 @@ public:
             return hr;
         }
         return hand_out(pipeline, riid, out);
+    }
+
+    // Device1: in-memory pipeline library (docs/d3d12_vulkan.md sections 3.6 and 4).
+    HRESULT STDMETHODCALLTYPE CreatePipelineLibrary(const void* blob, SIZE_T size, REFIID riid, void** out) override {
+        constexpr auto method = "ID3D12Device1::CreatePipelineLibrary";
+        if (out) *out = nullptr;
+        if (size > 0 && !blob) return d3d12_trace::result(method, E_INVALIDARG);
+        if (size > 0 && !PipelineLibrary::valid_blob(blob, size))
+            return d3d12_trace::result(method, D3D12_ERROR_DRIVER_VERSION_MISMATCH);
+        if (!out) return d3d12_trace::result(method, S_FALSE);
+        auto* lib = new PipelineLibrary();
+        lib->attach_device(identity());
+        return d3d12_trace::result(method, hand_out(lib, riid, out));
     }
 
     UINT STDMETHODCALLTYPE GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE) override {
@@ -3744,13 +3889,16 @@ public:
                                      r->allows_view_format(vulkan_format(requested, false).format));
                 if (typeless_rgba8 || (requested != rd.Format && listed &&
                                        rd.Format == DXGI_FORMAT_R8G8B8A8_UNORM)) {
-                    const bool plain = desc && desc->ViewDimension == D3D12_RTV_DIMENSION_TEXTURE2D;
-                    const bool array = desc && desc->ViewDimension == D3D12_RTV_DIMENSION_TEXTURE2DARRAY;
+                    const bool msaa = rd.SampleDesc.Count > 1;
+                    const bool plain = !msaa && desc && desc->ViewDimension == D3D12_RTV_DIMENSION_TEXTURE2D;
+                    const bool array = !msaa && desc && desc->ViewDimension == D3D12_RTV_DIMENSION_TEXTURE2DARRAY;
+                    const bool ms = msaa && desc && desc->ViewDimension == D3D12_RTV_DIMENSION_TEXTURE2DMS;
+                    const bool ms_array = msaa && desc && desc->ViewDimension == D3D12_RTV_DIMENSION_TEXTURE2DMSARRAY;
                     const UINT plane = plain ? desc->Texture2D.PlaneSlice :
                         array ? desc->Texture2DArray.PlaneSlice : 0;
                     // Subtraction keeps malformed layer ranges from overflowing during validation.
-                    if ((!plain && !array) || rd.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
-                        rd.SampleDesc.Count != 1 || plane || !view.resource || view.mip >= rd.MipLevels ||
+                    if ((!plain && !array && !ms && !ms_array) || rd.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
+                        plane || !view.resource || view.mip >= rd.MipLevels ||
                         !view.layer_count || view.first_layer >= rd.DepthOrArraySize ||
                         view.layer_count > rd.DepthOrArraySize - view.first_layer ||
                         !(rd.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET)) {
@@ -3843,6 +3991,24 @@ public:
                      std::size_t(count) * kDescriptorSize);
     }
 
+    // A constant-buffer view is a 16-byte GFX10 raw buffer V# in the first half of the slot (zeros in the rest).
+    // A null description, zero address, or zero size leaves the whole slot zeroed (null V#: reads return 0).
+    void STDMETHODCALLTYPE CreateConstantBufferView(const D3D12_CONSTANT_BUFFER_VIEW_DESC* desc,
+                                                    D3D12_CPU_DESCRIPTOR_HANDLE destination) override {
+        d3d12_trace::record("ID3D12Device::CreateConstantBufferView");
+        if (!destination.ptr) return;
+        std::memset(reinterpret_cast<void*>(destination.ptr), 0, kDescriptorSize);
+        if (!desc || !desc->BufferLocation || !desc->SizeInBytes) return;
+        leonida::gfx10::Buffer buffer{};
+        buffer.address = desc->BufferLocation;
+        buffer.stride = 0;
+        buffer.num_records = desc->SizeInBytes;
+        buffer.format = leonida::gfx10::format_from_vulkan(VK_FORMAT_R32_UINT);
+        buffer.oob_select = leonida::gfx10::OobSelect::raw;
+        const leonida::gfx10::BufferWords words = leonida::gfx10::encode(buffer);
+        std::memcpy(reinterpret_cast<void*>(destination.ptr), words.data(), sizeof(words));
+    }
+
     // A shader-resource view of a texture is a T# in the slot (docs section 3.4): the shader loads those eight
     // dwords through its descriptor table and finds the image by them. A slot left as zeros is a null descriptor:
     // nothing is registered for it, so the shader gets the fallback image. Buffer views are not implemented.
@@ -3866,9 +4032,10 @@ public:
         TextureView view{};
         if (!desc) {
             const bool array = r->desc().DepthOrArraySize > 1;
-            if (r->desc().Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D && !array)
+            if (r->desc().Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D && !array) {
                 view.type = ImageType::image_1d;
-            else if (r->desc().Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D)
+                view.layer_count = 1;
+            } else if (r->desc().Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D)
                 view.type = ImageType::image_3d;
             else if (r->desc().SampleDesc.Count > 1)
                 view.type = array ? ImageType::image_2d_msaa_array : ImageType::image_2d_msaa;
@@ -3882,6 +4049,7 @@ public:
                 view.type = ImageType::image_1d;
                 view.first_mip = desc->Texture1D.MostDetailedMip;
                 view.mip_count = desc->Texture1D.MipLevels;
+                view.layer_count = 1;
                 view.min_lod = desc->Texture1D.ResourceMinLODClamp;
                 break;
             case D3D12_SRV_DIMENSION_TEXTURE3D:
@@ -3938,6 +4106,95 @@ public:
         write_image_descriptor(*r, view, destination, false);
     }
 
+    // An unordered-access view of a buffer is a V# in the slot (docs section 3.4): the shader loads those four dwords
+    // through its descriptor table and reaches the bytes by the console VA in them. A structured view (format
+    // UNKNOWN and a stride) is `stride` and a record count, a raw one (R32_TYPELESS with the RAW flag) is a byte count,
+    // a typed one (any other format) is the format's GFX10_FORMAT code with the element size as the stride and an
+    // element count: the V# a buffer_load_format / buffer_store_format / buffer_atomic reads (OOB_SELECT 1, so the
+    // index is checked against NUM_RECORDS, docs/buffer_bounds.md). A slot left as zeros is a null descriptor.
+    // A UAV counter (docs section 3.4, "UAV counters") is a second, raw V# of 4 bytes in the slot's upper 16 bytes: the
+    // counter resource's address plus CounterOffsetInBytes. Append and consume are atomics a shader does on it.
+    void write_buffer_uav(ID3D12Resource* resource, ID3D12Resource* counter, const D3D12_UNORDERED_ACCESS_VIEW_DESC* desc,
+                          D3D12_CPU_DESCRIPTOR_HANDLE destination) {
+        namespace g = leonida::gfx10;
+        const D3D12_RESOURCE_DESC& rd = Resource::from<Resource>(resource)->desc();
+        if (!(rd.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) {
+            log_once("unordered-access view of a buffer created without ALLOW_UNORDERED_ACCESS; flags", int(rd.Flags));
+            return;
+        }
+        if (!desc || desc->ViewDimension != D3D12_UAV_DIMENSION_BUFFER) {
+            log_once("unordered-access view of a buffer needs a buffer view description; dimension",
+                     desc ? int(desc->ViewDimension) : -1);
+            return;
+        }
+        const D3D12_BUFFER_UAV& view = desc->Buffer;
+        const bool structured = desc->Format == DXGI_FORMAT_UNKNOWN;
+        const bool raw = desc->Format == DXGI_FORMAT_R32_TYPELESS && (view.Flags & D3D12_BUFFER_UAV_FLAG_RAW);
+        const bool typed = !structured && !raw;
+        std::uint32_t format_code = 0, element_bytes = 0;
+        g::Swizzle channels = g::identity_swizzle;
+        if (typed) {
+            // D3D12: a typed view has no RAW flag; its format is one of the typed-UAV formats the layer can name.
+            const Format mapped = vulkan_format(desc->Format, false);
+            const auto* layout = mapped.format != VK_FORMAT_UNDEFINED && !mapped.typeless && !mapped.rgb96 &&
+                                         !(view.Flags & D3D12_BUFFER_UAV_FLAG_RAW)
+                                     ? leonida::uav_clear::layout(mapped.format)
+                                     : nullptr;
+            format_code = layout ? g::format_from_vulkan(mapped.format) : 0;
+            if (!format_code || format_code >= 128) {  // the V#'s FORMAT is 7 bits
+                log_once("typed buffer unordered-access view format not supported; format", int(desc->Format));
+                return;
+            }
+            element_bytes = layout->bytes;
+            channels = g::format_swizzle(mapped.format);
+        }
+        const UINT64 unit = structured ? view.StructureByteStride : typed ? element_bytes : 4;
+        if (!unit || unit > 0x3fff || view.FirstElement > rd.Width / unit ||
+            (UINT64(view.FirstElement) + view.NumElements) > rd.Width / unit ||
+            UINT64(view.NumElements) * (structured || typed ? 1 : 4) > ~0u) {
+            log_once("unordered-access view of a buffer outside the resource or with a bad stride; elements",
+                     int(view.NumElements));
+            return;
+        }
+        // D3D12: a counter belongs to a structured view and sits in a buffer that allows unordered access, 4096-byte
+        // aligned with room for its 4 bytes; with no counter resource the offset is 0.
+        if (counter || view.CounterOffsetInBytes) {
+            const Resource* c = counter ? Resource::from<Resource>(counter) : nullptr;
+            const bool valid = c && !c->image() && structured &&
+                               (c->desc().Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) &&
+                               !(view.CounterOffsetInBytes % D3D12_UAV_COUNTER_PLACEMENT_ALIGNMENT) &&
+                               UINT64(view.CounterOffsetInBytes) + 4 <= c->desc().Width;
+            if (!valid) {
+                log_once("unordered-access view counter refused (a structured view, a buffer that allows unordered "
+                         "access, a 4096-aligned offset inside it); offset",
+                         int(view.CounterOffsetInBytes));
+                return;
+            }
+        }
+        const UINT64 va = resource->GetGPUVirtualAddress();
+        const UINT64 counter_va = counter ? counter->GetGPUVirtualAddress() : 0;
+        if (!va || (counter && !counter_va)) return;
+        g::Buffer buffer{};
+        buffer.address = va + view.FirstElement * unit;
+        buffer.stride = structured || typed ? std::uint32_t(unit) : 0;
+        buffer.num_records = std::uint32_t(structured || typed ? view.NumElements : UINT64(view.NumElements) * 4);
+        buffer.format = format_code;
+        buffer.swizzle = channels;
+        buffer.oob_select = typed ? g::OobSelect::structured
+                                  : structured ? g::OobSelect::structured_with_offset : g::OobSelect::raw;
+        const g::BufferWords words = g::encode(buffer);
+        std::memcpy(reinterpret_cast<void*>(destination.ptr), words.data(), sizeof(words));
+        if (counter) {
+            g::Buffer counter_buffer{};
+            counter_buffer.address = counter_va + view.CounterOffsetInBytes;
+            counter_buffer.num_records = 4;
+            counter_buffer.oob_select = g::OobSelect::raw;
+            const g::BufferWords counter_words = g::encode(counter_buffer);
+            std::memcpy(reinterpret_cast<char*>(destination.ptr) + sizeof(words), counter_words.data(),
+                        sizeof(counter_words));
+        }
+    }
+
     // An unordered-access view of a texture is a T# too, of one mip; set 0 also holds it as a storage image.
     void STDMETHODCALLTYPE CreateUnorderedAccessView(ID3D12Resource* resource, ID3D12Resource* counter,
                                                      const D3D12_UNORDERED_ACCESS_VIEW_DESC* desc,
@@ -3950,7 +4207,11 @@ public:
             if (resource) stub("ID3D12Device::CreateUnorderedAccessView(resource from another device)");
             return;
         }
-        if (!r->image() || counter) return stub("ID3D12Device::CreateUnorderedAccessView(buffer)");
+        if (!r->image()) return write_buffer_uav(resource, counter, desc, destination);
+        if (counter) {
+            log_once("unordered-access view of a texture with a counter resource; dimension", int(r->desc().Dimension));
+            return;
+        }
         if (!(r->desc().Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) {
             log_once("unordered-access view of a texture created without ALLOW_UNORDERED_ACCESS; flags",
                      int(r->desc().Flags));
@@ -3986,6 +4247,7 @@ public:
             return;
         }
         write_image_descriptor(*r, view, destination, true);
+        state_.context->note_storage_image(r->id());
     }
 
     // A sampler is an S# in the first 16 bytes of the slot; the shader finds the sampler by those four dwords.
@@ -4219,7 +4481,11 @@ public:
     // 64 KiB-aligned offset is simply that offset into the arena, and its console VA is the heap's place plus it.
     HRESULT STDMETHODCALLTYPE CreateHeap(const D3D12_HEAP_DESC* desc, REFIID riid, void** out) override {
         if (out) *out = nullptr;
-        if (!desc || !desc->SizeInBytes) return E_INVALIDARG;
+        if (!desc) return E_INVALIDARG;
+        if (const char* why = heap_desc_refusal(*desc)) {
+            log_once((std::string("CreateHeap refused (") + why + "), heap type").c_str(), int(desc->Properties.Type));
+            return E_INVALIDARG;
+        }
         if (!state_.arena.mapped) {
             log_once("heaps need the GPU address arena (bufferDeviceAddress); heap size in KiB:",
                      int(desc->SizeInBytes / 1024));
@@ -4237,6 +4503,18 @@ public:
             return S_FALSE;
         }
         return hand_out(heap, riid, out);
+    }
+
+    // Device4: CreateHeap with a protected session, which is refused as CreateCommittedResource1 refuses one. The host
+    // gives the same answers as CreateHeap for the D3D-238 descriptions.
+    HRESULT STDMETHODCALLTYPE CreateHeap1(const D3D12_HEAP_DESC* desc, ID3D12ProtectedResourceSession* session,
+                                          REFIID riid, void** out) override {
+        if (out) *out = nullptr;
+        if (session) {
+            log_once("protected resource session refused (not supported) by CreateHeap1", 1);
+            return E_INVALIDARG;
+        }
+        return CreateHeap(desc, riid, out);
     }
 
     HRESULT STDMETHODCALLTYPE CreatePlacedResource(ID3D12Heap* heap_interface, UINT64 heap_offset,
@@ -4291,26 +4569,35 @@ public:
             return E_INVALIDARG;
         }
         const bool tiled = is_tiled_layout(desc->Layout);
+        const bool msaa = desc->SampleDesc.Count > 1;
         if (desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
+            if (heap->flags() & D3D12_HEAP_FLAG_DENY_BUFFERS) return E_INVALIDARG;
             if (desc->Layout != D3D12_TEXTURE_LAYOUT_ROW_MAJOR) return E_INVALIDARG;
             if (desc->Width > heap->bytes() || heap_offset > heap->bytes() - desc->Width) return E_INVALIDARG;
-        } else if (heap_offset >= heap->bytes()) {
-            return E_INVALIDARG;
-        }
-        if (tiled) {
+        } else {
             if (heap->properties().Type == D3D12_HEAP_TYPE_UPLOAD ||
                 heap->properties().Type == D3D12_HEAP_TYPE_READBACK)
                 return E_INVALIDARG;
-            if (desc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
-                desc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE3D)
+            const bool rt_ds = (desc->Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET |
+                                              D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)) != 0;
+            if (rt_ds && (heap->flags() & D3D12_HEAP_FLAG_DENY_RT_DS_TEXTURES)) return E_INVALIDARG;
+            if (!rt_ds && (heap->flags() & D3D12_HEAP_FLAG_DENY_NON_RT_DS_TEXTURES)) return E_INVALIDARG;
+            if (tiled || msaa) {
+                if (tiled && desc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+                    desc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE3D)
+                    return E_INVALIDARG;
+                if (msaa && desc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D) return E_INVALIDARG;
+                const D3D12_RESOURCE_ALLOCATION_INFO alloc = allocation(*desc);
+                if (alloc.SizeInBytes == UINT64_MAX || heap->alignment() < alloc.Alignment ||
+                    heap_offset % alloc.Alignment || alloc.SizeInBytes > heap->bytes() ||
+                    heap_offset > heap->bytes() - alloc.SizeInBytes)
+                    return E_INVALIDARG;
+                if (tiled && static_cast<UINT>(desc->Layout) == kXboxTiledLayout) {
+                    log_once("placed resource with the Xbox tiled layout, as 64KB_UNDEFINED_SWIZZLE; dimension",
+                             int(desc->Dimension));
+                }
+            } else if (heap_offset >= heap->bytes()) {
                 return E_INVALIDARG;
-            const D3D12_RESOURCE_ALLOCATION_INFO alloc = allocation(*desc);
-            if (alloc.SizeInBytes == UINT64_MAX || alloc.SizeInBytes > heap->bytes() ||
-                heap_offset > heap->bytes() - alloc.SizeInBytes)
-                return E_INVALIDARG;
-            if (static_cast<UINT>(desc->Layout) == kXboxTiledLayout) {
-                log_once("placed resource with the Xbox tiled layout, as 64KB_UNDEFINED_SWIZZLE; dimension",
-                         int(desc->Dimension));
             }
         }
         // Only buffers are addressable, as in D3D12: a placed texture keeps a null VA and its own Vulkan image.
@@ -4322,8 +4609,6 @@ public:
             hr = resource->create_placed_buffer();
         } else if (!tiled && desc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D) {
             log_once("placed resource dimension not supported:", int(desc->Dimension));
-        } else if (desc->SampleDesc.Count > 1) {
-            log_once("multisampled placed resource not supported; samples", int(desc->SampleDesc.Count));
         } else {
             hr = S_OK;
             const Format format = state_.texture_format(*desc);
@@ -5090,21 +5375,19 @@ private:
         D3D12_RESOURCE_DESC resolved = desc;
         if (!resolved.MipLevels) resolved.MipLevels = full;
         if (resolved.MipLevels > full) return kInvalidAllocation;
-        if (samples > 1 && (volume || one_d || resolved.MipLevels != 1 ||
+        const bool depth_stencil = desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+        if (samples > 1 && (volume || one_d || resolved.MipLevels != 1 || !(desc.Flags & attachment) ||
+                            (desc.Flags & attachment) == attachment ||
                             (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)))
             return kInvalidAllocation;
         // The PC runtime: simultaneous access only single-sampled and without depth-stencil, and no volume depth.
-        const bool depth_stencil = desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
         if (((desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS) && (depth_stencil || samples > 1)) ||
             (volume && depth_stencil))
             return kInvalidAllocation;
         const bool tiled = is_tiled_layout(desc.Layout);
         if (tiled) {
-            if (one_d) return kInvalidAllocation;
+            if (one_d || (samples > 1 && samples != 4)) return kInvalidAllocation;
             if (desc.Alignment && desc.Alignment != align_64k) return kInvalidAllocation;
-            // Tiled MSAA is 4x single-mip 2D attachment only (measured on RTX 5070 Ti and WARP).
-            if (samples > 1 && (samples != 4 || !(desc.Flags & attachment) || (desc.Flags & attachment) == attachment))
-                return kInvalidAllocation;
         } else if (desc.Layout != D3D12_TEXTURE_LAYOUT_UNKNOWN) {
             log_once("GetResourceAllocationInfo layout as UNKNOWN:", desc.Layout);
         }
@@ -5167,12 +5450,10 @@ private:
         if (!image_descriptor(resource, view, image)) return;
         const leonida::gfx10::ImageWords words = leonida::gfx10::encode(image);
         const bool registered = state_.bind_image(words, image, resource.image(), resource.format(),
-                                                  resource.aspects(), storage, false,
+                                                  resource.aspects(), storage, resource.has_view_format_list(),
                                                   resource.r9g9b9e5_as_r32_uint());
         if (leonida::gfx10::multisampled(image.type) && !registered) return;
         std::memcpy(reinterpret_cast<void*>(destination.ptr), words.data(), sizeof(words));
-        state_.bind_image(words, image, resource.image(), resource.format(), resource.aspects(), storage,
-                          resource.has_view_format_list(), resource.r9g9b9e5_as_r32_uint());
     }
 
     // Shared by CreateCommittedResource and CreateCommittedResource3. A castable-format list is only meaningful on
@@ -6096,9 +6377,10 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     // Switching a vsync swapchain to IMMEDIATE or FIFO_RELAXED per present (PresentX's ImmediateThresholdPercent):
     // the KHR extension (promoted from the EXT one, same structures) with the surface extension of the same name
     // on the instance, else the EXT one. Only enabled where the instance has the surface half and the GPU the feature.
+    const char* swapchain_m1_name = nullptr;
+#if defined(VK_KHR_swapchain_maintenance1)
     VkPhysicalDeviceSwapchainMaintenance1FeaturesKHR swapchain_m1{
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SWAPCHAIN_MAINTENANCE_1_FEATURES_KHR};
-    const char* swapchain_m1_name = nullptr;
     if (has_swapchain && instance_has_surface) {
         const auto device_has = [&](const char* name) {
             return std::any_of(extensions.begin(), extensions.end(),
@@ -6119,6 +6401,7 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
             }
         }
     }
+#endif
     info.swapchain_maintenance1 = swapchain_m1_name != nullptr;
 
     VkDeviceCreateInfo device_info{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &enable12};
@@ -6178,6 +6461,31 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
         return E_FAIL;
     }
     return hand_out(device, riid, out);
+}
+
+bool has_global_realtime_privilege() {
+    const int override_state = g_global_realtime_privilege_override.load(std::memory_order_relaxed);
+    if (override_state >= 0) return override_state != 0;
+    HANDLE token = nullptr;
+    if (!OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, TRUE, &token) &&
+        !OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token))
+        return false;
+    LUID luid{};
+    BOOL enabled = FALSE;
+    if (LookupPrivilegeValueW(nullptr, L"SeIncreaseBasePriorityPrivilege", &luid)) {
+        PRIVILEGE_SET set{};
+        set.PrivilegeCount = 1;
+        set.Control = PRIVILEGE_SET_ALL_NECESSARY;
+        set.Privilege[0].Luid = luid;
+        set.Privilege[0].Attributes = SE_PRIVILEGE_ENABLED;
+        if (!PrivilegeCheck(token, &set, &enabled)) enabled = FALSE;
+    }
+    CloseHandle(token);
+    return enabled != FALSE;
+}
+
+void set_global_realtime_privilege_override_for_test(int state) {
+    g_global_realtime_privilege_override.store(state, std::memory_order_relaxed);
 }
 
 }  // namespace rt::d3d12

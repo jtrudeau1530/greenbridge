@@ -486,7 +486,7 @@ def main(argv=None):
             parent = os.path.dirname(os.path.abspath(a.json))
             if parent:
                 os.makedirs(parent, exist_ok=True)
-            with open(a.json, "w", encoding="utf-8") as fh:
+            with open(a.json, "w", encoding="utf-8", newline="\n") as fh:
                 json.dump(report, fh, indent=1)
         except OSError as exc:
             print(f"error: cannot write {a.json}: {exc.strerror or exc}", file=sys.stderr)

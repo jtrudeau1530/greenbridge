@@ -609,6 +609,22 @@ class WorldIndexTest(unittest.TestCase):
         rows, _ = WI.scan_path(self.carve([blob[:0x150], blob[0x150:]], gap=0x10))
         self.assertEqual(rows, [])
 
+    def test_carved_file_inflate_cap_matches_directory_scan(self):
+        resource = make_resource()
+        path = os.path.join(self.dir, "sample.bin")
+        with open(path, "wb") as f:
+            f.write(resource)
+
+        for source in (path, self.dir):
+            for cap, expected in ((len(resource) - 1, 0), (len(resource), 1)):
+                with self.subTest(source=source, cap=cap):
+                    entities = []
+                    rows, stats = WI.scan_path(source, max_inflate=cap, collect=entities)
+                    self.assertEqual(len(rows), expected)
+                    self.assertEqual(len(entities), expected)
+                    self.assertEqual(stats["files"], expected)
+                    self.assertEqual(stats["scanned_bytes"], expected * len(resource))
+
     def test_directory_inflate_cap_does_not_exclude_large_archives(self):
         resource = make_resource()
         cap = len(resource)

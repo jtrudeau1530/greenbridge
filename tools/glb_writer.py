@@ -453,10 +453,19 @@ def parse_obj(
                 first_vertex.setdefault(corner[0], vertex)
                 for corner, vertex in builder["vert_map"].items()
             ]
-            computed = _compute_smooth_normals(positions, (normal_vertices[i] for i in indices))
+            raw_normals = builder["normals"]
+            index_iter = iter(indices)
+            # Fully explicit triangles should not smooth neighboring generated normals.
+            normal_indices = (
+                normal_vertices[i]
+                for a, b, c in zip(index_iter, index_iter, index_iter)
+                if None in (raw_normals[a], raw_normals[b], raw_normals[c])
+                for i in (a, b, c)
+            )
+            computed = _compute_smooth_normals(positions, normal_indices)
             normals = [
                 normal if normal is not None else computed[normal_vertex]
-                for normal, normal_vertex in zip(builder["normals"], normal_vertices)
+                for normal, normal_vertex in zip(raw_normals, normal_vertices)
             ]
         else:
             normals = builder["normals"]

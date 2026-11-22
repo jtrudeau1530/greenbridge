@@ -352,7 +352,7 @@ def main() -> int:
         parent = os.path.dirname(os.path.abspath(args.json))
         if parent:      # every archive has been read by now; a missing folder used to lose the run
             os.makedirs(parent, exist_ok=True)
-        with open(args.json, "w", encoding="utf-8") as f:
+        with open(args.json, "w", encoding="utf-8", newline="\n") as f:
             json.dump(output, f, indent=2)
     return status
 

@@ -20,6 +20,8 @@ With LEONIDA_FMA=khr (or glsl), the fused multiply-adds are translated with --fm
 VK_KHR_shader_fma; the test programs enable it when the device has it, else they exit 77) or --fma glsl.
 With LEONIDA_BARY_FALLBACK=1, pixel shaders that read raw barycentrics are translated with --bary-fallback, and
 each gets a pass-through geometry shader, <name>.bary_gs.spv, that check.py draws it with (tools/bary_fallback_gs.py).
+Under that or LEONIDA_F16_INTERP_FALLBACK=1, ps_ij_computed isn't built: its computed I/J pair needs PerVertexKHR
+inputs, and check.py reports it as SKIP.
 """
 import json
 import os
@@ -38,6 +40,8 @@ import mc_command  # noqa: E402
 
 MC = mc_command.mc_command()
 RSRC2, GROUP = 0x8088, (64, 1, 1)
+# Not built under LEONIDA_BARY_FALLBACK=1 or LEONIDA_F16_INTERP_FALLBACK=1 (see main).
+NEEDS_PER_VERTEX_INPUTS = ("ps_ij_computed",)
 sys.path.insert(0, HERE)  # this script is also run with python -I
 from compute_fixture import compute_header  # noqa: E402
 
@@ -58,8 +62,8 @@ def asm_mattr(path):
 CLIP_CASES = {"vs_clip": 1, "vs_clip_param4": 4, "vs_clip_undeclared": 1}
 
 
-def asm_fssm(path):
-    """The synthetic FSSM program a vs_/ps_ shader's header asks for, or None."""
+def asm_fssm_fields(path):
+    """(offset, words) of the "fssm-at" and "fssm-data" header comments, (None, []) without them."""
     at, words = None, []
     for ln in Path(path).read_text(encoding="utf-8").splitlines():
         s = ln.strip()
@@ -71,9 +75,25 @@ def asm_fssm(path):
         m = re.match(r";\s*fssm-data:\s*(.*)", s)
         if m:
             words += [int(w, 0) for w in m.group(1).split()]
+    return at, words
+
+
+def asm_fssm(path):
+    """The synthetic FSSM program a vs_/ps_ shader's header asks for, or None."""
+    at, words = asm_fssm_fields(path)
     if at is None or not words or at < 4 or at % 4:
         return None
     return b"FSSM" + bytes(at - 4) + b"".join(struct.pack("<I", w) for w in words)
+
+
+def cs_fssm_extra(path):
+    """A compute shader's "fssm-at"/"fssm-data" words (at 0x148 or later, after compute_header's header), or None.
+    Two compute shaders with the same group size and RSRC2 would otherwise share one FSSM hash, which is what the
+    layer finds a PSO's shader by."""
+    at, words = asm_fssm_fields(path)
+    if at is None or not words or at < 0x148 or at % 4:
+        return None
+    return at, b"".join(struct.pack("<I", w) for w in words)
 
 
 def shader_source(name):
@@ -108,12 +128,16 @@ def translate_tests(work, names):
             sys.exit(f"{n}.asm did not assemble:\n{r.stderr}")
         # rdna2spirv.py rejects assembler directives such as the "\t.text" llvm-mc prints first.
         code = "".join(ln for ln in r.stdout.splitlines(keepends=True) if not ln.lstrip().startswith("."))
-        (disasm / (n + ".s")).write_text(f"; {n}  hand-written test\n{code}", encoding="utf-8")
+        (disasm / (n + ".s")).write_text(f"; {n}  hand-written test\n{code}", encoding="utf-8", newline="\n")
         program = None if n.startswith("cs_") else asm_fssm(asm_path)
         if program:   # where the translator looks for a program to hash, as in the game's work folder
             (fssm / (n + ".fssm")).write_bytes(program)
         if n.startswith("cs_"):
-            (fssm / (n + ".fssm")).write_bytes(compute_header(asm_path))
+            program = bytes(compute_header(asm_path))
+            extra = cs_fssm_extra(asm_path)
+            if extra:
+                program += bytes(extra[0] - len(program)) + extra[1]
+            (fssm / (n + ".fssm")).write_bytes(program)
         elif n in CLIP_CASES and n != "vs_clip_undeclared":
             (work / (n + ".dxbc")).write_bytes(clip_container())
         else:
@@ -149,6 +173,14 @@ def main():
     if skipped:
         print("not built (need a DXBC container with signatures):", ", ".join(skipped))
     names = [n for n in names if n not in skipped]
+    # A computed I/J pair needs PerVertexKHR inputs, which both fallbacks take away: the translator refuses it there,
+    # and check.py and run_gpu_tests.py report it as SKIP. Leave it out instead of losing the whole batch.
+    if os.environ.get("LEONIDA_BARY_FALLBACK") == "1" or os.environ.get("LEONIDA_F16_INTERP_FALLBACK") == "1":
+        per_vertex = [n for n in names if n in NEEDS_PER_VERTEX_INPUTS]
+        if per_vertex:
+            print("not built (computed I/J pairs need PerVertexKHR inputs, off under the fallback):",
+                  ", ".join(per_vertex))
+        names = [n for n in names if n not in per_vertex]
     if not names:
         return 0
     out.mkdir(parents=True, exist_ok=True)
@@ -168,13 +200,14 @@ def main():
         published_index = spirv / index.name
         combined = json.loads(published_index.read_text(encoding="utf-8")) if published_index.exists() else {}
         combined.update(validated)
-        index.write_text(json.dumps(combined, indent=2) + "\n", encoding="utf-8")
+        index.write_text(json.dumps(combined, indent=2) + "\n", encoding="utf-8", newline="\n")
         for n in validated:
             for suffix in (".spv", ".spvasm"):
                 artifact = built / (n + suffix)
                 artifact.replace(spirv / artifact.name)
             sidecar = work / "fssm" / (n + ".fssm")
-            if not n.startswith("cs_") and sidecar.is_file():
+            published = not n.startswith("cs_") or cs_fssm_extra(os.path.join(HERE, n + ".asm"))
+            if published and sidecar.is_file():
                 (out / "fssm").mkdir(exist_ok=True)
                 sidecar.replace(out / "fssm" / sidecar.name)
         index.replace(published_index)

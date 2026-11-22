@@ -371,9 +371,10 @@ vtable pointer of a public object.
 - **Slot 67** (call at `0x56d9`) is **not** the PC `CreateProtectedResourceSession1`: it takes `(desc, riid, out)`
   with `IID_ID3D12PipelineState`. The DLL's own messages name it `DeserializeComputePipelineStateX`. Its desc is the
   root signature at `+0x00`, then pointer and size pairs for the shader's `FSPX` entries: kind 0 at `+0x08`, kind 1
-  at `+0x18`, a copy of the kind-6 program at `+0x28`, and kind 7 at `+0x38` ([fspx.md](fspx.md)). The proxy used to
-  forward it to the PC method at the same index; it now refuses it (`E_NOTIMPL`). When it fails, the DLL takes
-  slot 62; its message for that failure calls the fallback "NewBE".
+  at `+0x18`, a copy of the kind-6 program at `+0x28`, and kind 7 at `+0x38` ([fspx.md](fspx.md)). The proxy maps the
+  console desc to `D3D12_COMPUTE_PIPELINE_STATE_DESC` and routes it to `CreateComputePipelineState` (PC slot 11). On a
+  PC device that call fails (`E_FAIL`) because the code is not a PC shader, so the DLL falls back to slot 62; its message
+  for that failure calls the fallback "NewBE".
 - **Slot 62** (call at `0x5825`) takes the measured `(D3D12_COMPUTE_PIPELINE_STATE_DESC*, 0, 0, riid, out)`. The PC
   runtime refuses the DLL's code (`E_FAIL`): it is not a PC shader. The DLL's pipeline function then returns
   `0x8000000d` (`0x4b85`), but the dispatch goes on, records the null pipeline and faults (`0x65ff`), which is where a
@@ -562,6 +563,26 @@ Queues and fences are wrapped the same way.
 - **What is not covered.** Command lists are not wrapped yet: `ExecuteCommandLists` passes the lists through,
   and a heap proxy given to a list's `SetDescriptorHeaps` reaches the real list unchanged. The command-list
   proxy of §3.5a adds the unwrap at both places.
+
+Command allocators get the same kind of proxy: device slot 9 (`CreateCommandAllocator`) returns one.
+
+- **What is forwarded.** The public chain, 9 slots: the base chain and `Reset` at 8. A slot past it, up to the
+  end of a 64-slot table, is logged and refused, and a read past the table faults in its own guard region.
+  The console allocator's extra methods are not measured.
+- **Where a list takes it.** A list takes an allocator from the title in `CreateCommandList` and `Reset`, so
+  the proxy is safe only where the list side resolves it. Slot 9 therefore wraps an allocator only when it
+  answers `kLeonidaCommandAllocatorTag` (`d3d12_xs_device.h`). That is the Vulkan layer's own allocator, whose
+  `CommandAllocator::from()` resolves the proxy for both list calls.
+- **On the host runtime.** A PC runtime allocator comes back unwrapped, logged once, because the PC runtime's
+  lists would take a proxy for their own allocator. A command-list proxy that unwraps at `Reset` (§3.5a) is
+  what lets the host backend wrap allocators too.
+- **Residency.** An allocator is a pageable, so `MakeResident`/`Evict`/`SetResidencyPriority`/
+  `EnqueueMakeResident` unwrap allocator proxies like heap, queue and fence proxies.
+
+`allocator_proxy_test` checks this on the Vulkan device and on the host runtime, and the mock test checks it
+over allocators with and without the tag. On the Vulkan device it checks forwarding, the refused tail, the guard
+region, identity, and D3D12's allocator rules through the proxy, and runs a list created and `Reset` on the
+proxy whose copies go through the queue and fence proxies and are read back.
 
 Which of this is measured: the slot numbers and signatures are the SDK's (public). That the console
 keeps the public queue and fence slots, and device slots 8/32/36/75, is an assumption the package cannot

@@ -9,6 +9,8 @@ the Vulkan implementation, not that the shader results are correct. Value-level 
 The checker exits nonzero if a module fails to load, a pipeline fails to compile, or the requested final
 cache save fails. It still finishes checking the other entries and attempts the final save so the next run
 can reuse successful pipelines. Entries reported as skipped do not count as failures.
+It also exits 2, before loading Vulkan, if `index.json` is missing, unreadable, empty or malformed, so a wrong
+directory can't pass as an empty corpus. A valid `{}` is an intentionally empty index.
 
 ## Check user-defined interfaces between stages
 
@@ -137,6 +139,42 @@ modules passed.
 The report above therefore states the limit and the skip count; a later run on an RTX 4060 Ti / 595
 completed the full 26,503-entry set without them (`docs/design.md`). `--max-bytes` remains a visibility
 tool, not a pass: a skipped module has not been validated.
+
+## Crash isolation (`--isolate`)
+
+A driver that dies while compiling one module (for example the RADV `SIGFPE` in
+[#1721](https://github.com/ItsNotRexed/Leonida/issues/1721)) ends the whole process, so the rest of the corpus
+used to need that module excluded by hand with `--start/--count`. With `--isolate` (POSIX only; on Windows it
+prints an error and exits with 2) the tool runs the check in child processes instead:
+
+```sh
+vk_pipeline_check <spirv dir> cache.bin --isolate [--isolate-batch 256] [--jobs N ...]
+```
+
+- The parent opens no Vulkan device. It runs this executable, one child at a time, over `--isolate-batch`
+  modules (default 256) of the same sorted, stage-filtered list, with the other options passed on (`--jobs` is
+  the thread count inside each child). `--stats` is refused: children would overwrite one file.
+- A child that is killed by a signal, or exits without finishing the pass after it started work, has its output
+  discarded and its batch is bisected (re-run in halves) down to the module that kills it. That module is printed as
+  `MODULE CRASH <name> (<stage>, driver crashed: SIGFPE)`, counted as a failed pipeline and listed at the end;
+  the other modules are checked as usual and counted once. If both halves of a crashed batch run clean (a crash
+  that needs several threads at once), the batch is reported as `MODULE CRASH [a, b) not reproduced ...` and
+  counts as a failure. A child that fails before it starts work (no device, bad arguments) stops the run
+  with exit status 1.
+- The pipeline cache: children run one after another and each seeds from and saves to the same `cache.bin`,
+  like the chunked runs above; the save is atomic, a crashed child saves nothing, so the file stays valid and
+  holds everything the finished children compiled. The parent prints its size at the end.
+- Exit status: 0 only if no module failed or crashed and the cache saved; 1 otherwise. The summary is
+  aggregated by the parent (modules, pipelines, skips, `--cache-feedback`); the per-stage wave and compile-time lines
+  of a normal run are not repeated. Output of a batch appears when its child finishes.
+- Each child loads the cache again, so a very large cache makes small batches slow; raise `--isolate-batch`.
+  There is no timeout: a hung compile still hangs.
+
+Test hook, not for normal use: `VK_PIPELINE_CHECK_SIMULATE_CRASH=<module name substring>[:SIGNAL]` makes the
+process raise `SIGNAL` (default `SIGFPE`; `SEGV`, `ABRT`, `KILL`, ... also accepted) just before the pipeline of a
+matching module is created. `tests/test_vk_pipeline_check_isolate.py` uses it with five hand-assembled compute
+shaders to check `--isolate` without a crashing driver; it skips when the tool isn't built or there is no
+Vulkan device.
 
 ## Application pipeline-cache feedback
 
