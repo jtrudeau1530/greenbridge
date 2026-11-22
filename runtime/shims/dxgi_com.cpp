@@ -22,6 +22,10 @@ void stub(const char* method) {
     if (seen.insert(method).second) std::fprintf(stderr, "[rt] dxgi: unimplemented %s\n", method);
 }
 
+bool valid_flip_buffer_count(UINT count) {
+    return count >= 2 && count <= DXGI_MAX_SWAP_CHAIN_BUFFERS;
+}
+
 VkFormat dxgi_to_vk_format(DXGI_FORMAT fmt) {
     switch (fmt) {
     case DXGI_FORMAT_B8G8R8A8_UNORM: return VK_FORMAT_B8G8R8A8_UNORM;
@@ -128,14 +132,13 @@ public:
         const VkExtent2D size = size_or_client(desc.Width, desc.Height, {256u, 256u});
         const std::uint32_t w = size.width;
         const std::uint32_t h = size.height;
-        const std::uint32_t count = desc.BufferCount ? desc.BufferCount : 2u;
         VkFormat vk_fmt = VK_FORMAT_UNDEFINED;
         if (desc.Format != DXGI_FORMAT_UNKNOWN) {
             vk_fmt = dxgi_to_vk_format(desc.Format);
             if (vk_fmt == VK_FORMAT_UNDEFINED) return false;
         }
         const bool allow_tearing = (flags_ & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING) != 0;
-        if (!swapchain_.create(hwnd, w, h, vk_fmt, count, allow_tearing)) return false;
+        if (!swapchain_.create(hwnd, w, h, vk_fmt, desc.BufferCount, allow_tearing)) return false;
         if (flags_ & DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT) {
             // DXGI: waitable swapchains default to maximum frame latency 1.
             max_frame_latency_.store(1, std::memory_order_relaxed);
@@ -234,11 +237,15 @@ public:
     }
 
     HRESULT STDMETHODCALLTYPE ResizeBuffers(UINT count, UINT width, UINT height, DXGI_FORMAT fmt, UINT flags) override {
+        if (count != 0 && !valid_flip_buffer_count(count)) return E_INVALIDARG;
         VkFormat vk_fmt = VK_FORMAT_UNDEFINED;
         if (fmt != DXGI_FORMAT_UNKNOWN) {
             vk_fmt = dxgi_to_vk_format(fmt);
             if (vk_fmt == VK_FORMAT_UNDEFINED) return DXGI_ERROR_UNSUPPORTED;
         }
+        constexpr UINT creation_only_flags = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT |
+                                             DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
+        if ((flags & creation_only_flags) != (flags_ & creation_only_flags)) return E_INVALIDARG;
         // DXGI refuses to resize while the app still holds a back buffer reference.
         for (auto* bb : buffers_)
             if (bb->held_by_app()) return DXGI_ERROR_INVALID_CALL;
@@ -246,8 +253,7 @@ public:
         const VkExtent2D size = size_or_client(width, height, swapchain_.extent());
         const std::uint32_t w = size.width;
         const std::uint32_t h = size.height;
-        const UINT waitable_bit = flags_ & DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
-        const UINT next_flags = (flags ? flags : flags_) | waitable_bit;
+        const UINT next_flags = flags ? flags : flags_;
         const bool allow_tearing = (next_flags & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING) != 0;
         if (!swapchain_.resize(w, h, vk_fmt, count, allow_tearing)) return E_FAIL;
         statistics_disjoint_.store(true, std::memory_order_relaxed);
@@ -782,6 +788,7 @@ public:
         if (!out) return E_POINTER;
         *out = nullptr;
         if (!hwnd || !desc) return E_INVALIDARG;
+        if (!valid_flip_buffer_count(desc->BufferCount)) return DXGI_ERROR_INVALID_CALL;
         auto* sc = new SwapChain(this, device, context_, gipa_, instance_, physical_, gdpa_, queue_, queue_family_);
         if (!sc->init(hwnd, *desc)) {
             sc->Release();
@@ -790,16 +797,46 @@ public:
         *out = static_cast<IDXGISwapChain1*>(sc);
         return S_OK;
     }
-    HRESULT STDMETHODCALLTYPE CreateSwapChainForCoreWindow(IUnknown*, IUnknown*, const DXGI_SWAP_CHAIN_DESC1*,
-                                                           IDXGIOutput*, IDXGISwapChain1**) override {
-        return E_NOTIMPL;
+    HRESULT STDMETHODCALLTYPE CreateSwapChainForCoreWindow(IUnknown* device, IUnknown* window,
+                                                           const DXGI_SWAP_CHAIN_DESC1* desc,
+                                                           IDXGIOutput* restrict_to_output,
+                                                           IDXGISwapChain1** out) override {
+        if (!out) return E_POINTER;
+        *out = nullptr;
+        if (!device || !window || !desc) return E_INVALIDARG;
+        // UWP / Game Core Scarlett titles present to an ICoreWindow. Extract the underlying
+        // Win32 HWND via ICoreWindowInterop.
+        static constexpr GUID kIID_ICoreWindowInterop = {
+            0x45D64A29, 0xA63E, 0x4CB6, {0xB4, 0x98, 0x57, 0x81, 0xD2, 0x98, 0xCB, 0x4F}};
+        struct ICoreWindowInterop : public IUnknown {
+            virtual HRESULT STDMETHODCALLTYPE get_WindowHandle(HWND* hwnd) = 0;
+            virtual HRESULT STDMETHODCALLTYPE put_MessageHandled(unsigned char value) = 0;
+        };
+        ICoreWindowInterop* interop = nullptr;
+        if (FAILED(window->QueryInterface(kIID_ICoreWindowInterop, reinterpret_cast<void**>(&interop))) || !interop) {
+            return DXGI_ERROR_INVALID_CALL;
+        }
+        HWND hwnd = nullptr;
+        const HRESULT hr = interop->get_WindowHandle(&hwnd);
+        interop->Release();
+        if (FAILED(hr) || !hwnd) return DXGI_ERROR_INVALID_CALL;
+        return CreateSwapChainForHwnd(device, hwnd, desc, nullptr, restrict_to_output, out);
     }
     HRESULT STDMETHODCALLTYPE GetSharedResourceAdapterLuid(HANDLE, LUID*) override { return E_NOTIMPL; }
     HRESULT STDMETHODCALLTYPE RegisterStereoStatusWindow(HWND, UINT, DWORD*) override { return E_NOTIMPL; }
     HRESULT STDMETHODCALLTYPE RegisterStereoStatusEvent(HANDLE, DWORD*) override { return E_NOTIMPL; }
     void STDMETHODCALLTYPE UnregisterStereoStatus(DWORD) override {}
-    HRESULT STDMETHODCALLTYPE RegisterOcclusionStatusWindow(HWND, UINT, DWORD*) override { return E_NOTIMPL; }
-    HRESULT STDMETHODCALLTYPE RegisterOcclusionStatusEvent(HANDLE, DWORD*) override { return E_NOTIMPL; }
+    HRESULT STDMETHODCALLTYPE RegisterOcclusionStatusWindow(HWND hwnd, UINT msg, DWORD* cookie) override {
+        (void)msg;
+        if (!hwnd || !cookie) return DXGI_ERROR_INVALID_CALL;
+        *cookie = next_occlusion_cookie_.fetch_add(1, std::memory_order_relaxed);
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE RegisterOcclusionStatusEvent(HANDLE event, DWORD* cookie) override {
+        if (!event || !cookie) return DXGI_ERROR_INVALID_CALL;
+        *cookie = next_occlusion_cookie_.fetch_add(1, std::memory_order_relaxed);
+        return S_OK;
+    }
     void STDMETHODCALLTYPE UnregisterOcclusionStatus(DWORD) override {}
     HRESULT STDMETHODCALLTYPE CreateSwapChainForComposition(IUnknown*, const DXGI_SWAP_CHAIN_DESC1*, IDXGIOutput*,
                                                             IDXGISwapChain1**) override {
@@ -885,6 +922,7 @@ private:
     HWND assoc_hwnd_ = nullptr;
     mutable std::once_flag tearing_once_;
     bool tearing_supported_ = false;
+    std::atomic<DWORD> next_occlusion_cookie_{1};
 };
 
 }  // namespace

@@ -19,10 +19,12 @@
 #include "../src/vulkan_present.h"
 
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <functional>
 #include <string_view>
 #include <thread>
 #include <vector>
@@ -49,10 +51,12 @@ namespace driver {
 PFN_vkGetInstanceProcAddr real_get_instance = nullptr;
 PFN_vkGetDeviceProcAddr real_get_device = nullptr;
 PFN_vkQueueSubmit real_submit = nullptr;
+PFN_vkQueuePresentKHR real_present = nullptr;
 PFN_vkCmdPipelineBarrier real_barrier = nullptr;
 PFN_vkCmdCopyImageToBuffer real_copy_i2b = nullptr;
 
 std::atomic<VkResult> fail_next_submit{VK_SUCCESS};
+std::function<void()> on_next_present;
 std::atomic<bool> observe_capture{false};
 std::atomic<bool> saw_capture_waw{false};
 std::atomic<std::uint32_t> capture_copies{0};
@@ -63,6 +67,15 @@ VKAPI_ATTR VkResult VKAPI_CALL queue_submit(VkQueue queue, std::uint32_t count, 
     const VkResult armed = fail_next_submit.exchange(VK_SUCCESS);
     if (armed != VK_SUCCESS) return armed;
     return real_submit(queue, count, submits, fence);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL queue_present(VkQueue queue, const VkPresentInfoKHR* info) {
+    if (on_next_present) {
+        auto cb = std::move(on_next_present);
+        on_next_present = {};
+        cb();
+    }
+    return real_present(queue, info);
 }
 
 VKAPI_ATTR void VKAPI_CALL cmd_pipeline_barrier(VkCommandBuffer cb, VkPipelineStageFlags src_stage,
@@ -100,6 +113,7 @@ VKAPI_ATTR void VKAPI_CALL cmd_copy_image_to_buffer(VkCommandBuffer cb, VkImage 
 VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL get_device(VkDevice device, const char* name) {
     const std::string_view n = name;
     if (n == "vkQueueSubmit") return reinterpret_cast<PFN_vkVoidFunction>(queue_submit);
+    if (n == "vkQueuePresentKHR") return reinterpret_cast<PFN_vkVoidFunction>(queue_present);
     if (n == "vkCmdPipelineBarrier") return reinterpret_cast<PFN_vkVoidFunction>(cmd_pipeline_barrier);
     if (n == "vkCmdCopyImageToBuffer") return reinterpret_cast<PFN_vkVoidFunction>(cmd_copy_image_to_buffer);
     return real_get_device(device, name);
@@ -114,6 +128,7 @@ void install(PFN_vkGetInstanceProcAddr instance_proc, VkInstance instance, VkDev
     real_get_instance = instance_proc;
     real_get_device = reinterpret_cast<PFN_vkGetDeviceProcAddr>(instance_proc(instance, "vkGetDeviceProcAddr"));
     real_submit = reinterpret_cast<PFN_vkQueueSubmit>(real_get_device(device, "vkQueueSubmit"));
+    real_present = reinterpret_cast<PFN_vkQueuePresentKHR>(real_get_device(device, "vkQueuePresentKHR"));
     real_barrier = reinterpret_cast<PFN_vkCmdPipelineBarrier>(real_get_device(device, "vkCmdPipelineBarrier"));
     real_copy_i2b = reinterpret_cast<PFN_vkCmdCopyImageToBuffer>(real_get_device(device, "vkCmdCopyImageToBuffer"));
 }
@@ -193,15 +208,36 @@ int main() {
         EXPECT(presenter.ok());
         EXPECT(presenter.enable_capture());
 
-        // 1. Failed vkQueueSubmit must NOT commit the UNDEFINED -> GENERAL transition in LayoutTracker.
+        // 1. Failed vkQueueSubmit must NOT commit the UNDEFINED -> GENERAL transition in LayoutTracker (O(1) rollback
+        //    even with many live tracked textures), and tracker_mutex_ must be released before vkQueuePresentKHR.
+        for (ResourceId extra = 1000; extra < 1512; ++extra)
+            context.add_resource(extra, side_rb, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
         EXPECT(context.layout(1, 0) == VK_IMAGE_LAYOUT_UNDEFINED);
         driver::fail_next_submit.store(VK_ERROR_OUT_OF_HOST_MEMORY);
         EXPECT(presenter.present(1, true) == VK_ERROR_OUT_OF_HOST_MEMORY);
         EXPECT(context.layout(1, 0) == VK_IMAGE_LAYOUT_UNDEFINED);
+        EXPECT(context.layout(1000, 0) == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
 
-        // Next present succeeds, runs the deferred zero-fill, and commits GENERAL.
+        // Next present succeeds, runs the deferred zero-fill, commits GENERAL, and unlocks tracker_mutex_ before
+        // vkQueuePresentKHR so other threads' emit() / layout() calls are not blocked by presentation.
+        std::atomic<bool> read_done{false};
+        VkImageLayout seen_during_present = VK_IMAGE_LAYOUT_UNDEFINED;
+        bool unblocked_during_present = false;
+        std::thread reader;
+        driver::on_next_present = [&] {
+            reader = std::thread([&] {
+                seen_during_present = context.layout(1, 0);
+                read_done.store(true, std::memory_order_release);
+            });
+            std::this_thread::sleep_for(std::chrono::milliseconds(30));
+            unblocked_during_present = read_done.load(std::memory_order_acquire);
+        };
         EXPECT(presenter.present(1, true) == VK_SUCCESS);
+        if (reader.joinable()) reader.join();
+        EXPECT(unblocked_during_present);
+        EXPECT(seen_during_present == VK_IMAGE_LAYOUT_GENERAL);
         EXPECT(context.layout(1, 0) == VK_IMAGE_LAYOUT_GENERAL);
+        for (ResourceId extra = 1000; extra < 1512; ++extra) context.remove_resource(extra);
         std::vector<std::uint8_t> pixels;
         VkExtent2D ext{};
         VkFormat fmt = VK_FORMAT_UNDEFINED;

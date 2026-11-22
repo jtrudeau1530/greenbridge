@@ -113,8 +113,9 @@ class CommandAllocator final
     : public Child<CommandAllocator, ID3D12CommandAllocatorStubs, ID3D12Object, ID3D12DeviceChild, ID3D12Pageable,
                     ID3D12CommandAllocator> {
 public:
-    // {7d0e6b51-34a2-4f0c-9a61-0c5b2e8f4a10}
-    static constexpr GUID kTag{0x7d0e6b51, 0x34a2, 0x4f0c, {0x9a, 0x61, 0x0c, 0x5b, 0x2e, 0x8f, 0x4a, 0x10}};
+    // {7d0e6b51-34a2-4f0c-9a61-0c5b2e8f4a10}, public in d3d12_xs_device.h: the device proxy's slot 9 wraps an allocator
+    // in an Xbox-ABI allocator proxy only when it answers this tag, because from() below resolves such a proxy.
+    static constexpr GUID kTag = d3d12_xs::kLeonidaCommandAllocatorTag;
     explicit CommandAllocator(D3D12_COMMAND_LIST_TYPE type) : type_(type) {}
     // Lists own their recorded commands, so there is nothing to free. As on the PC runtime (D3D-51, measured by
     // d3d12_vulkan_device_test): E_FAIL while a list is recording into this allocator, and S_OK while its lists are
@@ -124,7 +125,12 @@ public:
     // The one list that is recording into this allocator, or null. D3D12 allows one at a time.
     const void* recording() const { return recording_; }
     void set_recording(const void* list) { recording_ = list; }
-    static CommandAllocator* from(IUnknown* object) { return Child::from<CommandAllocator>(object); }
+    // An allocator proxy (the title's allocator from device slot 9) stands for the allocator behind it, so every
+    // list method that takes an allocator (CreateCommandList, Reset) resolves it here.
+    static CommandAllocator* from(IUnknown* object) {
+        if (ID3D12CommandAllocator* real = d3d12_xs::allocator_proxy_real_allocator(object)) object = real;
+        return Child::from<CommandAllocator>(object);
+    }
 
 private:
     D3D12_COMMAND_LIST_TYPE type_;
@@ -214,10 +220,14 @@ public:
         bind_root(compute_, signature);
     }
     void STDMETHODCALLTYPE SetGraphicsRootSignature(ID3D12RootSignature* signature) override {
+        d3d12_trace::record("ID3D12GraphicsCommandList::SetGraphicsRootSignature");
         bind_root(graphics_, signature);
     }
 
-    void STDMETHODCALLTYPE SetPipelineState(ID3D12PipelineState* state) override { set_pipeline(state); }
+    void STDMETHODCALLTYPE SetPipelineState(ID3D12PipelineState* state) override {
+        d3d12_trace::record("ID3D12GraphicsCommandList::SetPipelineState");
+        set_pipeline(state);
+    }
 
     // The bound heaps matter to direct heap indexing, which is still open (section 3.4); tables carry their VAs.
     void STDMETHODCALLTYPE SetDescriptorHeaps(UINT, ID3D12DescriptorHeap* const*) override {}

@@ -24,6 +24,7 @@
 #include "vk_shader_fma.h"
 #include "../src/vulkan_bindless.h"
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstdio>
@@ -105,7 +106,7 @@ std::uint32_t probe_depth(std::span<const std::uint32_t> table, const Descriptor
 
 int main(int argc, char** argv) {
     if (argc < 3) {
-        std::fprintf(stderr, "usage: vk_bindless_test <vs_ids.spv> <ps_tex.spv>\n");
+        std::fprintf(stderr, "usage: vk_bindless_test <vs_ids.spv> <ps_tex.spv | ps_imgatomic.spv>\n");
         return 2;
     }
     // A bad readback in a single channel must still fail when all three others match.
@@ -225,6 +226,15 @@ int main(int argc, char** argv) {
     VkPhysicalDeviceFeatures2 enable{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &enable12};
     enable.features.shaderInt64 = VK_TRUE;
     enable.features.shaderSampledImageArrayDynamicIndexing = VK_TRUE;
+    // ps_imgatomic: image atomics in a pixel shader need fragment stores and atomics.
+    const bool atomic_mode = std::strstr(argv[2], "imgatomic") != nullptr;
+    if (atomic_mode) {
+        if (!have.features.fragmentStoresAndAtomics) {
+            std::printf("unsupported: fragmentStoresAndAtomics (image atomics in a pixel shader)\n");
+            return unsupported;
+        }
+        enable.features.fragmentStoresAndAtomics = VK_TRUE;
+    }
 
     std::uint32_t qn = 0;
     vkGetPhysicalDeviceQueueFamilyProperties(pd, &qn, nullptr);
@@ -260,7 +270,7 @@ int main(int argc, char** argv) {
     LD(vkDeviceWaitIdle); LD(vkDestroyPipeline); LD(vkDestroyPipelineLayout);
     LD(vkDestroyCommandPool); LD(vkDestroyShaderModule); LD(vkDestroyFramebuffer); LD(vkDestroyRenderPass);
     LD(vkDestroySampler); LD(vkDestroyImageView); LD(vkDestroyImage); LD(vkDestroyBuffer);
-    LD(vkFreeMemory); LD(vkDestroyDevice);
+    LD(vkFreeMemory); LD(vkDestroyDevice); LD(vkCmdClearColorImage);
     VkQueue queue = VK_NULL_HANDLE;
     vkGetDeviceQueue(dev, qi, 0, &queue);
     VkPhysicalDeviceMemoryProperties mp;
@@ -662,6 +672,171 @@ int main(int argc, char** argv) {
         const std::uint32_t decoy_sampler = set.add_sampler(nearest);
         const std::uint32_t sampler_index = set.add_sampler(nearest);
         EXPECT(decoy_sampler == 1 && sampler_index == 2);
+
+        if (atomic_mode) {
+            // ps_imgatomic.asm: image_atomic_umax/umin/or on three 8x8 r32ui images and umax on a 4x4x4 one, from
+            // every pixel of the 64x64 draw (64 pixels per 2D texel), each found through its own T# key. Odd
+            // pixels are discarded after their atomics, which still count.
+            constexpr std::uint32_t atomic_va = 1024, AW = 8, A3 = 4;
+            const std::array<DescriptorKey, 4> keys{{{0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7, 0xa8},
+                                                     {0xb1, 0xb2, 0xb3, 0xb4, 0xb5, 0xb6, 0xb7, 0xb8},
+                                                     {0xc1, 0xc2, 0xc3, 0xc4, 0xc5, 0xc6, 0xc7, 0xc8},
+                                                     {0xd1, 0xd2, 0xd3, 0xd4, 0xd5, 0xd6, 0xd7, 0xd8}}};
+            for (std::uint32_t k = 0; k < 4; ++k)
+                std::memcpy(static_cast<char*>(heap_map) + atomic_va + 32 * k, keys[k].data(), 32);
+            const VkImageUsageFlags atomic_usage =
+                VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+            VkImage images[4];
+            VkImageView views[4];
+            for (int k = 0; k < 3; ++k) CHECK(make_image(VK_FORMAT_R32_UINT, AW, AW, atomic_usage, &images[k], &views[k]));
+            {   // the 3D image
+                VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+                ii.imageType = VK_IMAGE_TYPE_3D;
+                ii.format = VK_FORMAT_R32_UINT;
+                ii.extent = {A3, A3, A3};
+                ii.mipLevels = 1;
+                ii.arrayLayers = 1;
+                ii.samples = VK_SAMPLE_COUNT_1_BIT;
+                ii.usage = atomic_usage;
+                CHECK(vkCreateImage(dev, &ii, nullptr, &images[3]));
+                VkMemoryRequirements mr;
+                vkGetImageMemoryRequirements(dev, images[3], &mr);
+                VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+                ai.allocationSize = mr.size;
+                ai.memoryTypeIndex = memtype(mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+                VkDeviceMemory m;
+                CHECK(vkAllocateMemory(dev, &ai, nullptr, &m));
+                allocations.push_back(m);
+                CHECK(vkBindImageMemory(dev, images[3], m, 0));
+                VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+                vi.image = images[3];
+                vi.viewType = VK_IMAGE_VIEW_TYPE_3D;
+                vi.format = VK_FORMAT_R32_UINT;
+                vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+                CHECK(vkCreateImageView(dev, &vi, nullptr, &views[3]));
+            }
+            std::uint32_t indices[4];
+            for (int k = 0; k < 4; ++k) {
+                StorageViews storage;
+                storage.as_uint = views[k];
+                storage.r32ui = views[k];
+                indices[k] = set.add_image(k == 3 ? ImageDimension::dim_3d : ImageDimension::dim_2d, views[k],
+                                           VK_IMAGE_LAYOUT_GENERAL, storage);
+                EXPECT(indices[k] != 0);
+                EXPECT(set.insert_key(keys[k], indices[k]));
+            }
+            EXPECT(flush());
+
+            // Clear: umax and or start at 0, umin at all ones; then GENERAL for the shader's atomics.
+            CHECK(vkResetCommandBuffer(cmd, 0));
+            CHECK(vkBeginCommandBuffer(cmd, &begin));
+            if (!set.fallbacks_ready()) set.record_fallback_init(cmd);
+            for (int k = 0; k < 4; ++k) {
+                VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+                b.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+                b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+                b.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+                b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                b.image = images[k];
+                b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+                vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0,
+                                     nullptr, 0, nullptr, 1, &b);
+                VkClearColorValue value{};
+                for (auto& c : value.uint32) c = k == 1 ? 0xFFFFFFFFu : 0u;
+                vkCmdClearColorImage(cmd, images[k], VK_IMAGE_LAYOUT_GENERAL, &value, 1, &b.subresourceRange);
+                b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+                b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+                b.oldLayout = b.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+                vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0,
+                                     nullptr, 0, nullptr, 1, &b);
+            }
+            CHECK(submit());
+
+            // The draw, then the images and the render target read back.
+            const VkDeviceSize image_bytes = 3 * AW * AW * 4 + A3 * A3 * A3 * 4;
+            VkBuffer atomic_readback;
+            void* atomic_map;
+            CHECK(make_buffer(image_bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT, &atomic_readback, &atomic_map));
+            CHECK(vkResetCommandBuffer(cmd, 0));
+            CHECK(vkBeginCommandBuffer(cmd, &begin));
+            VkClearValue clear{};
+            for (float& channel : clear.color.float32) channel = 0.25f;
+            VkRenderPassBeginInfo rbi{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+            rbi.renderPass = pass;
+            rbi.framebuffer = framebuffer;
+            rbi.renderArea = scissor;
+            rbi.clearValueCount = 1;
+            rbi.pClearValues = &clear;
+            vkCmdBeginRenderPass(cmd, &rbi, VK_SUBPASS_CONTENTS_INLINE);
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+            const VkDescriptorSet bound = set.set();
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout, 0, 1, &bound, 0, nullptr);
+            std::uint32_t block[36] = {};
+            block[2] = atomic_va;
+            block[32] = std::uint32_t(heap_base);
+            block[33] = std::uint32_t(heap_base >> 32);
+            vkCmdPushConstants(cmd, pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
+                               sizeof(block), block);
+            vkCmdDraw(cmd, 3, 1, 0, 0);
+            vkCmdEndRenderPass(cmd);
+            VkMemoryBarrier after{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+            after.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+            after.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &after,
+                                 0, nullptr, 0, nullptr);
+            VkDeviceSize offset = 0;
+            for (int k = 0; k < 4; ++k) {
+                VkBufferImageCopy rc{};
+                rc.bufferOffset = offset;
+                rc.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+                rc.imageExtent = k == 3 ? VkExtent3D{A3, A3, A3} : VkExtent3D{AW, AW, 1};
+                vkCmdCopyImageToBuffer(cmd, images[k], VK_IMAGE_LAYOUT_GENERAL, atomic_readback, 1, &rc);
+                offset += k == 3 ? A3 * A3 * A3 * 4 : AW * AW * 4;
+            }
+            VkBufferImageCopy tc{};
+            tc.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+            tc.imageExtent = {W, H, 1};
+            vkCmdCopyImageToBuffer(cmd, target, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback, 1, &tc);
+            CHECK(submit());
+
+            // The model: every pixel's atomics, discarded or not.
+            std::vector<std::uint32_t> want(3 * AW * AW + A3 * A3 * A3, 0);
+            for (std::uint32_t t = 0; t < AW * AW; ++t) want[AW * AW + t] = 0xFFFFFFFFu;
+            for (std::uint32_t py = 0; py < H; ++py)
+                for (std::uint32_t px = 0; px < W; ++px) {
+                    const std::uint32_t id = px + 64 * py, t = (py >> 3) * AW + (px >> 3);
+                    want[t] = std::max(want[t], id);
+                    want[AW * AW + t] = std::min(want[AW * AW + t], id);
+                    want[2 * AW * AW + t] |= 1u << (id & 31);
+                    const std::uint32_t v = ((px & 3) * A3 + (py >> 4)) * A3 + (px >> 4);
+                    want[3 * AW * AW + v] = std::max(want[3 * AW * AW + v], id);
+                }
+            const auto* got = static_cast<const std::uint32_t*>(atomic_map);
+            const char* names[] = {"2D umax", "2D umin", "2D or", "3D umax"};
+            unsigned wrong = 0;
+            for (std::size_t i = 0; i < want.size(); ++i) {
+                if (got[i] == want[i]) continue;
+                const int k = i < 3 * AW * AW ? int(i / (AW * AW)) : 3;
+                if (wrong++ < 8)
+                    std::printf("  %s texel %zu: got 0x%08x, want 0x%08x\n", names[k],
+                                k == 3 ? i - 3 * AW * AW : i % (AW * AW), got[i], want[i]);
+            }
+            const float* rt = static_cast<const float*>(readback_map);
+            unsigned bad_rt = 0;
+            for (std::uint32_t py = 0; py < H; ++py)
+                for (std::uint32_t px = 0; px < W; ++px)
+                    bad_rt += rt[(py * W + px) * 4] != ((px & 1) ? 0.25f : 1.0f);
+            std::printf("ps_imgatomic: %u of %zu texels wrong (2D umax/umin/or 8x8 each, 3D umax 4x4x4); "
+                        "%u of %u render-target pixels wrong (odd columns discarded)\n",
+                        wrong, want.size(), bad_rt, W * H);
+            vkDeviceWaitIdle(dev);
+            if (g_validation_errors) {
+                std::printf("ps_imgatomic: %u validation errors\n", g_validation_errors);
+                return 1;
+            }
+            return wrong || bad_rt ? 1 : 0;
+        }
 
         // A view that comes and goes before the set is flushed is never written: a texture created and destroyed
         // between two submissions. Its slots are written once, with the fallback; a write of the destroyed view

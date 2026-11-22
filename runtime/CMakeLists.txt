@@ -394,10 +394,20 @@ if(BUILD_TESTING)
     set_target_properties(tiny_game PROPERTIES
       RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/fixtures/game/$<CONFIG>"
     )
+    # The same game with no .reloc, at the default EXE base, as RT-22 asks about the real one: it can only run at
+    # 0x140000000, which arm64 Wine on macOS uses for itself (src/base_reservation.h).
+    add_executable(tiny_game_fixed test/fixtures/tiny_game.cpp)
+    target_link_libraries(tiny_game_fixed PRIVATE xgameruntime_stub)
+    target_compile_definitions(tiny_game_fixed PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX _CRT_SECURE_NO_WARNINGS)
+    target_compile_options(tiny_game_fixed PRIVATE /W4 /permissive- /utf-8 /EHsc)
+    target_link_options(tiny_game_fixed PRIVATE /FIXED /DYNAMICBASE:NO /BASE:0x140000000)
+    set_target_properties(tiny_game_fixed PROPERTIES
+      RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/fixtures/game/$<CONFIG>"
+    )
     add_executable(tiny_game_exit_code_test test/tiny_game_exit_code_test.cpp)
     target_compile_definitions(tiny_game_exit_code_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(tiny_game_exit_code_test PRIVATE /W4 /permissive- /utf-8)
-    add_dependencies(tiny_game_exit_code_test gta6rt tiny_game)
+    add_dependencies(tiny_game_exit_code_test gta6rt tiny_game tiny_game_fixed)
     add_test(NAME pe_loader COMMAND pe_loader_test "$<TARGET_FILE:tiny_dll>" "$<TARGET_FILE:tiny_exe>")
 
     # Synthetic, hand-built images through Loader::load: range checks, wrapping RVAs, import-table termination and
@@ -499,6 +509,11 @@ if(BUILD_TESTING)
   add_test(NAME descriptor_table COMMAND descriptor_table_test)
   add_executable(shader_library_test test/shader_library_test.cpp)
   add_test(NAME shader_library COMMAND shader_library_test)
+  # Optional: skips unless LEONIDA_SHADERS names a translated work folder (<work>/shaders/spirv).
+  add_executable(shader_library_corpus_test test/shader_library_corpus_test.cpp)
+  add_test(NAME shader_library_corpus COMMAND shader_library_corpus_test)
+  # Reads all 26,503 containers and modules: about 9 minutes from a hard disk.
+  set_tests_properties(shader_library_corpus PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 3600)
   if(WIN32)
     # Optional: skips unless LEONIDA_GAME_DIR and LEONIDA_MOVIE are set.
     add_executable(bink_decode_test
@@ -595,6 +610,11 @@ if(BUILD_TESTING)
     add_test(NAME run_tiny_game COMMAND gta6rt --run $<TARGET_FILE:tiny_game> -- hello 42)
     add_test(NAME run_tiny_game_exit_code COMMAND tiny_game_exit_code_test
              "$<TARGET_FILE:gta6rt>" "$<TARGET_FILE:tiny_game>")
+    # Without relocations it can only run at 0x140000000 (base_reservation.h), so passing means it got there; the
+    # game's exact exit code comes back through the relaunch.
+    add_test(NAME run_tiny_game_fixed COMMAND gta6rt --run $<TARGET_FILE:tiny_game_fixed> -- hello 42)
+    add_test(NAME run_tiny_game_fixed_exit_code COMMAND tiny_game_exit_code_test
+             "$<TARGET_FILE:gta6rt>" "$<TARGET_FILE:tiny_game_fixed>")
     # Two modes at once are refused before anything is mapped (#886). The stand-in game's own arguments are passed,
     # so a gta6rt that ignored the conflict would run it, print "running" and exit 0.
     foreach(modes "dry-run;run" "dry-run;init" "init;run")
@@ -677,6 +697,11 @@ if(TARGET Vulkan::Headers)
     endif()
   endforeach()
   if(BUILD_TESTING)
+    add_test(NAME vk_pipeline_check_cli COMMAND "${CMAKE_COMMAND}"
+             "-DTOOL=$<TARGET_FILE:vk_pipeline_check>"
+             "-DTEST_DIR=${CMAKE_CURRENT_BINARY_DIR}/vk_pipeline_check_cli_input"
+             "-DRUNNER=${CMAKE_CROSSCOMPILING_EMULATOR}"
+             -P "${CMAKE_CURRENT_SOURCE_DIR}/test/check_vk_pipeline_cli.cmake")
     add_test(NAME depth24_convert COMMAND depth24_convert_test)
     set_tests_properties(depth24_convert PROPERTIES SKIP_RETURN_CODE 77)
     # The XDXR BVH builder: the GPU writes every case, then tools/xdxr_bvh.py validates and traces them.
@@ -752,6 +777,19 @@ if(TARGET Vulkan::Headers)
   target_link_libraries(vk_device_pick_test PRIVATE Vulkan::Headers)
   if(BUILD_TESTING)
     add_test(NAME vk_device_pick COMMAND vk_device_pick_test)
+  endif()
+  # Committed BC* texture zero-initialization via vk.zero_buffer or vk.copy_scratch (D3D-220).
+  add_executable(vk_bc_zero_init_test test/vk_bc_zero_init_test.cpp)
+  target_link_libraries(vk_bc_zero_init_test PRIVATE Vulkan::Headers ${CMAKE_DL_LIBS})
+  if(WIN32)
+    target_compile_definitions(vk_bc_zero_init_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  endif()
+  if(MSVC)
+    target_compile_options(vk_bc_zero_init_test PRIVATE /W4 /permissive- /utf-8)
+  endif()
+  if(BUILD_TESTING)
+    add_test(NAME vk_bc_zero_init COMMAND vk_bc_zero_init_test)
+    set_tests_properties(vk_bc_zero_init PROPERTIES SKIP_RETURN_CODE 77)
   endif()
   # CPU-only: the bindless set's array sizes from synthetic device limits.
   add_executable(bindless_sizing_test test/bindless_sizing_test.cpp)
@@ -961,6 +999,14 @@ if(TARGET Vulkan::Headers)
     target_compile_options(queue_proxy_test PRIVATE /W4 /permissive- /utf-8)
     add_test(NAME queue_proxy COMMAND queue_proxy_test)
     set_tests_properties(queue_proxy PROPERTIES SKIP_RETURN_CODE 77)
+    # Xbox-ABI command allocator proxies (device slot 9) on the Vulkan device, and the unwrapped PC allocator on the
+    # host runtime: forwarding, refused tail, guard region, lists and GPU copies on the proxy. 77: no device at all.
+    add_executable(allocator_proxy_test test/allocator_proxy_test.cpp)
+    target_link_libraries(allocator_proxy_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
+    target_compile_definitions(allocator_proxy_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(allocator_proxy_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME allocator_proxy COMMAND allocator_proxy_test)
+    set_tests_properties(allocator_proxy PROPERTIES SKIP_RETURN_CODE 77)
     # The countdown behind those event-backed waits, with no GPU: the full unsigned count, no wrap past zero.
     add_executable(d3d12_fence_waiter_test test/d3d12_fence_waiter_test.cpp)
     target_compile_definitions(d3d12_fence_waiter_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
@@ -1191,6 +1237,7 @@ if(TARGET Vulkan::Headers)
     target_compile_definitions(d3d12_indirect_zero_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(d3d12_indirect_zero_test PRIVATE /W4 /permissive- /utf-8)
     add_test(NAME d3d12_indirect_zero COMMAND d3d12_indirect_zero_test)
+    set_tests_properties(d3d12_indirect_zero PROPERTIES SKIP_RETURN_CODE 77)
     set_tests_properties(d3d12_node_mask PROPERTIES SKIP_RETURN_CODE 77)
     set_tests_properties(d3d12_indirect_zero PROPERTIES SKIP_RETURN_CODE 77)
 
