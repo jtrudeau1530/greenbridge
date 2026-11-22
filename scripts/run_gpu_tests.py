@@ -1099,6 +1099,8 @@ def run_suite(a, work: str) -> int:
                 "ps_vcmpx_forms": (0xF05B2A48, 0xF05E8A12, 0xB174BE18, 0x15550000),   # 14 v_cmpx forms (.asm header)
                 "ps_med3_mods": (0x3F800000, 0x40400000, 0x40C00000, 0x3F400000),
                 "ps_scc_minmax": (0x00030205, 0x00030207, 0x00030209, 0x00030203),
+                "ps_scc_logic32": (0x0fff0fff, 0x000f000f, 0xf00ff00f, 0x36),
+                "ps_scc_logic64": (0x0fff0fff, 0xff000000, 0xff0000ff, 0x16),
                 "ps_fma_literal": (0x41B80000, 0x41800000, 0x40E00000, 0x41A40000),
                 "ps_f64_mods": (0x40040000, 0x3FF00000, 0x3FE40000, 0x3FF00000),   # needs shaderFloat64
                 # f16 op_sel / partial writes / inline constants: RDNA2 hardware words (see the .asm headers)
