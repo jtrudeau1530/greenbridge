@@ -37,6 +37,7 @@ import json
 import math
 import mmap
 import os
+import statistics
 import struct
 import sys
 import tempfile
@@ -423,9 +424,9 @@ def graph_stats(nodes, links, junctions):
     if nodes:
         hist["bbox_min"] = [round(min(n["position"][k] for n in nodes), 1) for k in range(3)]
         hist["bbox_max"] = [round(max(n["position"][k] for n in nodes), 1) for k in range(3)]
-    lengths = sorted(l["length"] for l in links)
+    lengths = [l["length"] for l in links]
     if lengths:
-        hist["link_length_m"] = {"min": lengths[0], "median": lengths[len(lengths) // 2], "max": lengths[-1]}
+        hist["link_length_m"] = {"min": min(lengths), "median": statistics.median(lengths), "max": max(lengths)}
     s["street_named_nodes"] = sum(1 for n in nodes if n["street"])
     s["junction_nodes_resolved"] = sum(1 for j in junctions if j["node"] in by_key)
     s["junction_entrances"] = sum(len(j["entrances"]) for j in junctions)
@@ -437,10 +438,10 @@ def graph_stats(nodes, links, junctions):
     s["entrances_yield"] = sum(e["yield"] for j in junctions for e in j["entrances"])
     s["signalised_junctions"] = sum(1 for j in junctions if j["phases"])
     s["phases"] = sum(len(j["phases"]) for j in junctions)
-    durations = sorted(p["duration"] for j in junctions for p in j["phases"])
+    durations = [p["duration"] for j in junctions for p in j["phases"]]
     if durations:
-        hist["phase_duration_s"] = {"min": round(durations[0], 2), "median": round(durations[len(durations) // 2], 2),
-                                    "max": round(durations[-1], 2)}
+        hist["phase_duration_s"] = {"min": round(min(durations), 2), "median": round(statistics.median(durations), 2),
+                                    "max": round(max(durations), 2)}
     s["junction_nodes_flagged_junction"] = sum(1 for j in junctions if j["node"] in by_key
                                                and nodes[by_key[j["node"]]]["flags"] >> 4 & 1)
     s["nodes_flagged_junction"] = sum(1 for n in nodes if n["flags"] >> 4 & 1)

@@ -167,15 +167,15 @@ def node_resource(nodes):
 
 
 def link_resource(links):
-    """links: [(target address index, lanes to, lanes from, flags)]."""
+    """links: [(target address index, lanes to, lanes from, flags, length)]."""
     r = Resource()
     r.struct(T.LINK, LINK_SIZE, [(M["target"], 0x00, 0x05), (M["length"], 0x04, 0x13),
                                  (M["lanes_to"], 0x06, 0x11), (M["lanes_from"], 0x07, 0x11),
                                  (M["link_flags"], 0x0C, 0x65)])
     data = bytearray()
-    for to, lt, lf, flags in links:
+    for to, lt, lf, flags, length in links:
         rec = bytearray(LINK_SIZE)
-        struct.pack_into("<HHHBB", rec, 0, 0, to, 10, lt, lf)
+        struct.pack_into("<HHHBB", rec, 0, 0, to, length, lt, lf)
         struct.pack_into("<I", rec, 0x0C, flags)
         data += rec
     r.block(T.LINK, data)
@@ -225,7 +225,7 @@ GRAPH_NODES = [  # address, key, first link, num links, flags, mph
     (2, 102, 3, 1, 0, 40),
     (3, 103, 4, 0, 0, 10),
 ]
-GRAPH_LINKS = [(1, 1, 1, 1 << 10), (0, 1, 1, 1 << 10), (2, 1, 0, 0), (9, 1, 0, 0)]
+GRAPH_LINKS = [(1, 1, 1, 1 << 10, 10), (0, 1, 1, 1 << 10, 20), (2, 1, 0, 0, 30), (9, 1, 0, 0, 40)]
 
 
 class MetaTest(unittest.TestCase):
@@ -336,6 +336,10 @@ class GraphTest(unittest.TestCase):
         self.assertEqual(s["junction_nodes_flagged_junction"], 1)
         self.assertEqual(hist["link_flag_bits"][10], 2)
         self.assertEqual(hist["lanes_from"][0], 2)
+        # Even-sized samples take the stdlib median (the mean of the two middle
+        # values), not the upper-middle element lengths[len // 2] used before.
+        self.assertEqual(hist["link_length_m"], {"min": 10, "median": 25.0, "max": 40})
+        self.assertEqual(hist["phase_duration_s"], {"min": 8.0, "median": 19.0, "max": 30.0})
 
 
 class ScanTest(unittest.TestCase):
