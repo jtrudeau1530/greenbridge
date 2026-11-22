@@ -70,9 +70,11 @@ int main() {
     EXPECT(app && scratch && app_words && scratch_words);
 
     const auto convert = [&](bool to_float, std::uint32_t width, std::uint32_t height, std::uint32_t slices,
-                             std::uint32_t row_words, std::uint32_t slice_words, std::uint64_t offset, int limited = 0) {
+                             std::uint32_t row_words, std::uint32_t slice_words, std::uint64_t offset, int limited = 0,
+                             bool rgb96 = false) {
         Depth24Job job;
         job.to_float = to_float;
+        job.rgb96 = rgb96;
         job.app = app;
         job.app_offset = offset;
         job.app_size = std::uint64_t(words) * 4 + 4096;
@@ -345,6 +347,62 @@ int main() {
             }
         }
         std::printf("depth24: concurrent VulkanQueue::execute (lazy depth24 lock + parallel non-d24 prepare) ok\n");
+    // 6. 96-bit texels (Depth24Job::rgb96, D3D-62): three words a texel in the footprint, four in the scratch, the
+    // words copied as they are. A pitched copy at an offset, split into rows by the 1 KiB range.
+    {
+        constexpr std::uint32_t w = 37, h = 5, s = 3, row = 128, slice = 700;  // a row of texels is 111 words
+        constexpr std::uint64_t offset = 1100;
+        const auto word = [](std::uint32_t z, std::uint32_t y, std::uint32_t x, std::uint32_t c) {
+            // Bit patterns a float conversion would not keep, among others: NaN payloads, a denormal, -0.
+            constexpr std::uint32_t special[] = {0x7fa00001, 0xffc12345, 0x00000001, 0x80000000, 0xffffffff};
+            const std::uint32_t i = ((z * h + y) * w + x) * 3 + c;
+            return i % 7 == 0 ? special[i / 7 % 5] : i * 2654435761u + 12345u;
+        };
+        std::memset(app_words, 0xcd, 4096 * 4);
+        std::memset(scratch_words, 0xee, 4096 * 4);
+        for (std::uint32_t z = 0; z < s; ++z)
+            for (std::uint32_t y = 0; y < h; ++y)
+                for (std::uint32_t x = 0; x < w; ++x)
+                    for (std::uint32_t c = 0; c < 3; ++c) scratch_words[((z * h + y) * w + x) * 4 + c] = word(z, y, x, c);
+        EXPECT(convert(false, w, h, s, row, slice, offset, 2, true));
+        EXPECT(last_parts == 15);  // 1 KiB holds one row of 37 four-word texels: a part a row
+        for (std::uint32_t i = 0; i < 4096; ++i) {
+            const std::uint32_t rel = i - std::uint32_t(offset / 4);
+            const std::uint32_t z = rel / slice, y = (rel % slice) / row, in_row = (rel % slice) % row;
+            const bool inside = i >= offset / 4 && z < s && y < h && in_row < w * 3;
+            const std::uint32_t want = inside ? word(z, y, in_row / 3, in_row % 3) : 0xcdcdcdcdu;
+            if (app_words[i] != want) {
+                std::fprintf(stderr, "rgb96 readback: word %u got %08x want %08x\n", i, app_words[i], want);
+                return 1;
+            }
+        }
+        // The upload from the same layout: three words of each texel in the scratch, the fourth written as 0, and
+        // nothing past the last texel.
+        std::memset(scratch_words, 0xee, 4096 * 4);
+        EXPECT(convert(true, w, h, s, row, slice, offset, 2, true));
+        for (std::uint32_t z = 0; z < s; ++z)
+            for (std::uint32_t y = 0; y < h; ++y)
+                for (std::uint32_t x = 0; x < w; ++x)
+                    for (std::uint32_t c = 0; c < 4; ++c)
+                        EXPECT(scratch_words[((z * h + y) * w + x) * 4 + c] == (c < 3 ? word(z, y, x, c) : 0u));
+        EXPECT(scratch_words[w * h * s * 4] == 0xeeeeeeeeu);
+
+        // Slices too large to share a 1 MiB range: a part a slice (256 x 128 texels are 512 KiB of scratch).
+        constexpr std::uint32_t bw = 256, bh = 128, bs = 6, brow = 800, bslice = brow * bh + 64;
+        const std::uint32_t texels = bw * bh * bs;
+        for (std::uint32_t z = 0; z < bs; ++z)
+            for (std::uint32_t y = 0; y < bh; ++y)
+                for (std::uint32_t x = 0; x < bw * 3; ++x)
+                    app_words[z * bslice + y * brow + x] = (z * bh + y) * bw * 3 + x + 0x9e3779b9u;
+        std::memset(scratch_words, 0xee, std::size_t(texels) * 16);
+        EXPECT(convert(true, bw, bh, bs, brow, bslice, 0, 1, true));
+        EXPECT(last_parts == bs);
+        wrong = 0;
+        for (std::uint32_t t = 0; t < texels; ++t)
+            for (std::uint32_t c = 0; c < 4; ++c)
+                if (scratch_words[t * 4 + c] != (c < 3 ? t * 3 + c + 0x9e3779b9u : 0u)) ++wrong;
+        EXPECT(wrong == 0);
+        std::printf("depth24: 96-bit texels repack both ways, split into rows and into slices\n");
     }
 
     EXPECT(gpu.validation_errors() == 0);

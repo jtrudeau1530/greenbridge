@@ -12,7 +12,9 @@
 //   - what creation, GetResourceAllocationInfo and CheckFeatureSupport say, next to WARP's answers, and that
 //     the three agree with each other;
 //   - copies between a 96-bit texture and an RGBA32 one refused;
-//   - how long an upload and a readback take from 64x64 to 4096x4096 (single runs, each on a new queue).
+//   - an upload and a readback on a COPY queue;
+//   - how long an upload and a readback take at 64x64 and 256x256, and up to 4096x4096 with LEONIDA_RGB96_LARGE
+//     set (single runs, each on a new queue).
 // No game data or shaders. Run explicitly (needs Vulkan hardware); LEONIDA_VK_VALIDATION=1 checks Vulkan usage.
 #include "vk_test_device.h"
 #include "../shims/d3d12_com.h"
@@ -83,13 +85,13 @@ struct Gpu {
     Ref<ID3D12Fence> fence;
     UINT64 signalled = 0;
 
-    bool create(ID3D12Device* d) {
+    bool create(ID3D12Device* d, D3D12_COMMAND_LIST_TYPE type = D3D12_COMMAND_LIST_TYPE_DIRECT) {
         device = d;
         D3D12_COMMAND_QUEUE_DESC desc{};
+        desc.Type = type;
         CHECK(SUCCEEDED(d->CreateCommandQueue(&desc, IID_PPV_ARGS(&queue.p))));
-        CHECK(SUCCEEDED(d->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator.p))));
-        CHECK(SUCCEEDED(d->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.p, nullptr,
-                                             IID_PPV_ARGS(&list.p))));
+        CHECK(SUCCEEDED(d->CreateCommandAllocator(type, IID_PPV_ARGS(&allocator.p))));
+        CHECK(SUCCEEDED(d->CreateCommandList(0, type, allocator.p, nullptr, IID_PPV_ARGS(&list.p))));
         CHECK(SUCCEEDED(d->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence.p))));
         return true;
     }
@@ -415,6 +417,62 @@ bool timed(ID3D12Device* device, UINT size, double& upload_ms, double& readback_
     return true;
 }
 
+// An upload and a readback on a COPY queue, where streaming uploads run: the repack is a compute dispatch, which
+// the layer's copy queues must take. The texture starts in COMMON and is promoted, as a copy queue requires.
+bool copy_queue(ID3D12Device* device) {
+    Gpu gpu;
+    CHECK(gpu.create(device, D3D12_COMMAND_LIST_TYPE_COPY));
+    constexpr UINT width = 7, height = 5;
+    const D3D12_RESOURCE_DESC desc = texture_desc(DXGI_FORMAT_R32G32B32_UINT, false, width, height, 1, 1);
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
+    UINT64 total = 0;
+    device->GetCopyableFootprints(&desc, 0, 1, 0, &footprint, nullptr, nullptr, &total);
+    const D3D12_HEAP_PROPERTIES default_heap{D3D12_HEAP_TYPE_DEFAULT}, upload_heap{D3D12_HEAP_TYPE_UPLOAD},
+        readback_heap{D3D12_HEAP_TYPE_READBACK};
+    const D3D12_RESOURCE_DESC bytes = buffer_desc(total);
+    Ref<ID3D12Resource> texture, upload, readback;
+    CHECK(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &desc,
+                                                    D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&texture.p))));
+    CHECK(SUCCEEDED(device->CreateCommittedResource(&upload_heap, D3D12_HEAP_FLAG_NONE, &bytes,
+                                                    D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&upload.p))));
+    CHECK(SUCCEEDED(device->CreateCommittedResource(&readback_heap, D3D12_HEAP_FLAG_NONE, &bytes,
+                                                    D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&readback.p))));
+    std::uint8_t* mapped = nullptr;
+    CHECK(SUCCEEDED(upload->Map(0, nullptr, reinterpret_cast<void**>(&mapped))) && mapped);
+    for (UINT y = 0; y < height; ++y)
+        for (UINT x = 0; x < width; ++x)
+            for (UINT c = 0; c < 3; ++c) {
+                const std::uint32_t v = value(11, x, y, 0, c);
+                std::memcpy(mapped + footprint.Offset + UINT64(y) * footprint.Footprint.RowPitch + x * kTexel + c * 4, &v, 4);
+            }
+    upload->Unmap(0, nullptr);
+    {
+        const auto dst = subresource(texture.p, 0), src = placed(upload.p, footprint);
+        gpu.list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+    }
+    CHECK(gpu.run());  // the texture decays to COMMON, and is promoted again as a copy source
+    {
+        const auto dst = placed(readback.p, footprint), src = subresource(texture.p, 0);
+        gpu.list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+    }
+    CHECK(gpu.run());
+    CHECK(SUCCEEDED(readback->Map(0, nullptr, reinterpret_cast<void**>(&mapped))) && mapped);
+    for (UINT y = 0; y < height; ++y)
+        for (UINT x = 0; x < width; ++x)
+            for (UINT c = 0; c < 3; ++c) {
+                std::uint32_t v;
+                std::memcpy(&v, mapped + footprint.Offset + UINT64(y) * footprint.Footprint.RowPitch + x * kTexel + c * 4, 4);
+                if (v != value(11, x, y, 0, c)) {
+                    std::fprintf(stderr, "copy queue (%u,%u) channel %u: got %08x, want %08x\n", x, y, c, v,
+                                 value(11, x, y, 0, c));
+                    return false;
+                }
+            }
+    const D3D12_RANGE none{};
+    readback->Unmap(0, &none);
+    return true;
+}
+
 HRESULT creates(ID3D12Device* device, DXGI_FORMAT format, D3D12_RESOURCE_FLAGS flags) {
     const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
     const D3D12_RESOURCE_DESC desc = texture_desc(format, false, 4, 4, 1, 1, flags);
@@ -422,10 +480,16 @@ HRESULT creates(ID3D12Device* device, DXGI_FORMAT format, D3D12_RESOURCE_FLAGS f
     return device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, nullptr,
                                            IID_PPV_ARGS(&texture.p));
 }
-// GetResourceAllocationInfo has a size for the same description.
+// GetResourceAllocationInfo has a size, or GetCopyableFootprints a layout, for the same description.
 bool allocates(ID3D12Device* device, DXGI_FORMAT format, D3D12_RESOURCE_FLAGS flags) {
     const D3D12_RESOURCE_DESC desc = texture_desc(format, false, 4, 4, 1, 1, flags);
     return device->GetResourceAllocationInfo(0, 1, &desc).SizeInBytes != UINT64_MAX;
+}
+bool has_footprint(ID3D12Device* device, DXGI_FORMAT format, D3D12_RESOURCE_FLAGS flags) {
+    const D3D12_RESOURCE_DESC desc = texture_desc(format, false, 4, 4, 1, 1, flags);
+    UINT64 total = 0;
+    device->GetCopyableFootprints(&desc, 0, 1, 0, nullptr, nullptr, nullptr, &total);
+    return total != UINT64_MAX;
 }
 
 // What the layer refuses at ExecuteCommandLists: copies between a 96-bit texture and a four-channel one (their
@@ -461,7 +525,9 @@ bool refusals(ID3D12Device* device) {
 
 int main() {
     vktest::Device vk;
-    if (!vk.create()) return 1;
+    const auto device_status = vk.initialize();
+    if (device_status == vktest::DeviceStatus::unavailable) return 77;  // no Vulkan GPU: ctest skips
+    if (device_status != vktest::DeviceStatus::ready) return 1;
     unsigned compared = 0;
     {
         Ref<ID3D12Device> ours, ours_staged, host;
@@ -481,7 +547,7 @@ int main() {
             FAILED(factory->EnumWarpAdapter(IID_PPV_ARGS(&warp.p))) ||
             FAILED(D3D12CreateDevice(warp.p, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&host.p)))) {
             std::fprintf(stderr, "WARP reference unavailable\n");
-            return 1;
+            return 77;  // Wine: ctest skips
         }
 
         constexpr DXGI_FORMAT formats[] = {DXGI_FORMAT_R32G32B32_FLOAT, DXGI_FORMAT_R32G32B32_UINT,
@@ -533,14 +599,16 @@ int main() {
             // Unordered access and depth: refused, as the PC runtime refuses them.
             for (const auto flag : {D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL}) {
                 const HRESULT mine = creates(ours.p, format, flag), theirs = creates(host.p, format, flag);
-                if (mine != E_INVALIDARG || theirs != E_INVALIDARG || allocates(ours.p, format, flag)) {
-                    std::fprintf(stderr, "format %d flag %d: creation %08lx (WARP %08lx), or allocation info has a size\n",
+                if (mine != E_INVALIDARG || theirs != E_INVALIDARG || allocates(ours.p, format, flag) ||
+                    has_footprint(ours.p, format, flag) || has_footprint(host.p, format, flag)) {
+                    std::fprintf(stderr, "format %d flag %d: creation %08lx (WARP %08lx), or a size or a footprint\n",
                                  int(format), int(flag), mine, theirs);
                     return 1;
                 }
             }
             // Render targets are not implemented: creation and allocation info must not look as if they were.
-            if (SUCCEEDED(target) || allocates(ours.p, format, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET)) {
+            if (SUCCEEDED(target) || allocates(ours.p, format, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) ||
+                has_footprint(ours.p, format, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET)) {
                 std::fprintf(stderr, "format %d: a render target was created or sized\n", int(format));
                 return 1;
             }
@@ -562,7 +630,11 @@ int main() {
                         unsigned(theirs.Support2), target, host_target);
         }
         if (!refusals(ours.p)) return 1;
+        if (!copy_queue(ours.p) || !copy_queue(host.p)) return 1;
+        // The large sizes need hundreds of MiB and a real GPU: only with LEONIDA_RGB96_LARGE set.
+        const bool large = GetEnvironmentVariableA("LEONIDA_RGB96_LARGE", nullptr, 0) != 0;
         for (const UINT size : {64u, 256u, 1024u, 2048u, 4096u}) {
+            if (size > 256 && !large) break;
             double upload_ms = 0, readback_ms = 0, host_upload = 0, host_readback = 0;
             if (!timed(ours.p, size, upload_ms, readback_ms) || !timed(host.p, size, host_upload, host_readback)) return 1;
             std::printf("%ux%u: upload %.1f ms, readback %.1f ms (WARP %.1f, %.1f)\n", size, size, upload_ms, readback_ms,

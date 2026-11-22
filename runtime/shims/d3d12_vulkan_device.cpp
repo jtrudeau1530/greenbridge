@@ -2663,7 +2663,7 @@ public:
             }
             if (total) *total = ~0ull;
         };
-        if (!desc || !xr_bias_compatible(*desc)) return fail();
+        if (!desc || !xr_bias_compatible(*desc) || rgb96_refused(*desc)) return fail();
         const auto align = [](UINT64 value, UINT64 to) { return (value + to - 1) / to * to; };
         if (desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
             // The PC runtime refuses any buffer field that isn't its one valid value (all measured on WARP, Width,
