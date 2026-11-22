@@ -97,9 +97,12 @@ Your game folder is the one that holds `MicrosoftGame.Config` and the `.rpf` arc
 
 **Low disk space:** the ~350 GB figure is for the full build. To *run* the port, `--stages check,shaders,runtime`
 needs about 30 GB; the `assets` stage (~300 GB) is only for the asset tools, and `--wav` adds several times the
-Ogg Opus size. `--work` and `--out` can sit on another drive; a read-only package drive needs `--overlay` on a
-writable one. Leave the `.s` files in `work/shaders/dxbc/disasm` in place: deleting them while keeping the folder
-makes the stage look finished with zero shaders, and a symlinked `disasm` is refused.
+Ogg Opus size (the preflight prints this choice when the assets stage is what does not fit). `--work` and `--out`
+can sit on another drive. The runtime maps the package in place, so a read-only package drive needs
+`gta6rt --overlay <writable folder>`; `--overlay` is a `gta6rt` option, not a `make_game.py` one. Leave the `.s`
+files in `work/shaders/dxbc/disasm` in place: deleting them, along with the translated
+`work/shaders/spirv/index.json`, can leave the shaders stage looking finished with zero shaders. A `disasm`
+folder that is a symlink is refused when the stage has to clear it.
 
 **From a terminal**, with the same behaviour and more control:
 
