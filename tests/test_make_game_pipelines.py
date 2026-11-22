@@ -103,8 +103,9 @@ class PipelinesCrashRetryTest(unittest.TestCase):
                 return sys.stderr, logs
 
     def inflight_is(self, *names):
+        """As vk_pipeline_check writes it: name<TAB>phase, where a module can die in either phase."""
         with open(self.inflight, "w", encoding="utf-8") as f:
-            f.write("".join(n + "\n" for n in names))
+            f.write("".join(f"{n}\t{'module' if i % 2 else 'pipeline'}\n" for i, n in enumerate(names)))
 
     def skipped(self, args):
         return args[args.index("--skip-file") + 1] if "--skip-file" in args else None

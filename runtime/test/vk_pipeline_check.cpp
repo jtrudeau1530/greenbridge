@@ -26,10 +26,11 @@
 //                 that kills the driver (SIGFPE, SIGSEGV, ...) is recorded as failed ("MODULE CRASH") and the pass
 //                 goes on. A crashed batch is bisected to the module. Children run one after the other and share
 //                 cache.bin. Not compatible with --stats.
-//   --inflight-file F  keep the names of the modules being compiled in F, one per line, so whoever ran the check can
-//                 tell which module was compiling when the process died. F is rewritten when a module over
-//                 --large-module-bytes starts or finishes (it compiles alone, so F then names exactly it) and by the
-//                 5 s watchdog for the others, and emptied at the end. make_game.py's pipelines stage reads it.
+//   --inflight-file F  keep the modules that are in the driver in F, one "name<TAB>phase" line each (phase: module
+//                 while vkCreateShaderModule runs, pipeline while its pipeline is created), so whoever ran the check
+//                 can tell which module was there when the process died. F is rewritten when a module over
+//                 --large-module-bytes enters or leaves the driver (it is alone then, so F names exactly it) and by
+//                 the 5 s watchdog for the others, and emptied at the end. make_game.py's pipelines stage reads it.
 //   --skip-file F modules named in F (one per line) are not compiled: each is reported as MODULE CRASH and counted
 //                 as a failed pipeline, as --isolate does for a module that killed the driver. make_game.py writes F
 //                 after a crash, so the next run checks everything else instead of dying on the same module.
@@ -991,12 +992,19 @@ int main(int argc, char** argv) {
     std::map<std::string, VkShaderModule> stub_cache;
     std::atomic<size_t> next{0}, done{0};
     std::atomic<uint32_t> total_pipes_done{0};
-    std::map<std::thread::id, std::pair<std::string, std::chrono::steady_clock::time_point>> inflight;
-    // --inflight-file: rewrite the file from `inflight`. Called with mu held, at the moments named in the header.
+    // What each worker is doing in the driver: creating the shader module, then creating its pipeline.
+    struct InFlight {
+        std::string name;
+        std::chrono::steady_clock::time_point since;
+        const char* phase;   // "module" or "pipeline"
+    };
+    std::map<std::thread::id, InFlight> inflight;
+    // --inflight-file: rewrite the file from `inflight`, one "name<TAB>phase" line per module. Called with mu held, at
+    // the moments named in the header.
     auto write_inflight = [&] {
         if (inflight_path.empty()) return;
         if (std::FILE* f = std::fopen(inflight_path.c_str(), "w")) {
-            for (const auto& [tid, job] : inflight) std::fprintf(f, "%s\n", job.first.c_str());
+            for (const auto& [tid, job] : inflight) std::fprintf(f, "%s\t%s\n", job.name.c_str(), job.phase);
             std::fclose(f);
         }
     };
@@ -1135,6 +1143,11 @@ int main(int argc, char** argv) {
             std::shared_lock parallel(compile_gate, std::defer_lock);
             if (isolated) exclusive.lock();
             else if (large_module_bytes) parallel.lock();
+            {   // in flight from here: vkCreateShaderModule can also take long or die in the driver
+                std::lock_guard<std::mutex> g(mu);
+                inflight[std::this_thread::get_id()] = {name, std::chrono::steady_clock::now(), "module"};
+                if (isolated) write_inflight();   // alone in flight: the file names exactly this module
+            }
 
             f.seekg(0);
             std::vector<char> code((std::istreambuf_iterator<char>(f)), {});
@@ -1174,7 +1187,7 @@ int main(int argc, char** argv) {
                     const auto t0 = std::chrono::steady_clock::now();
                     {
                         std::lock_guard<std::mutex> g(mu);
-                        inflight[std::this_thread::get_id()] = {name, t0};
+                        inflight[std::this_thread::get_id()] = {name, t0, "pipeline"};
                         if (isolated) write_inflight();   // alone in flight: the file names exactly this module
                     }
                     VkPipeline p = VK_NULL_HANDLE;
@@ -1348,7 +1361,7 @@ int main(int argc, char** argv) {
                         const auto t0 = std::chrono::steady_clock::now();
                         {
                             std::lock_guard<std::mutex> g(mu);
-                            inflight[std::this_thread::get_id()] = {name, t0};
+                            inflight[std::this_thread::get_id()] = {name, t0, "pipeline"};
                             if (isolated) write_inflight();   // alone in flight: the file names exactly this module
                         }
                         VkPipeline p = VK_NULL_HANDLE;
@@ -1364,6 +1377,10 @@ int main(int argc, char** argv) {
                 record_skip(name, stage, "unsupported stage " + stage);
             }
             if (sm) vkDestroyShaderModule(dev, sm, nullptr);
+            {   // out of the driver on every path (a pipeline, a skip, a failed module)
+                std::lock_guard<std::mutex> g(mu);
+                if (inflight.erase(std::this_thread::get_id()) && inflight.empty()) write_inflight();
+            }
             if (++done % 1000 == 0) {
                 std::lock_guard<std::mutex> g(mu);
                 std::fprintf(stderr, "  %zu/%zu (%.0fs)\n", size_t(done), work.size(), elapsed());
@@ -1385,8 +1402,11 @@ int main(int argc, char** argv) {
             const auto now = std::chrono::steady_clock::now();
             write_inflight();   // --inflight-file: the modules compiling right now
             for (auto& [tid, job] : inflight) {
-                const double s = std::chrono::duration<double>(now - job.second).count();
-                if (s > 60 && int(s) % 60 < 5) std::fprintf(stderr, "  still compiling %s after %.0fs\n", job.first.c_str(), s);
+                const double s = std::chrono::duration<double>(now - job.since).count();
+                if (s > 60 && int(s) % 60 < 5)
+                    std::fprintf(stderr, "  still %s %s after %.0fs\n",
+                                 job.phase[0] == 'm' ? "creating the shader module of" : "compiling",
+                                 job.name.c_str(), s);
             }
             if (now - last_save > std::chrono::minutes(10)) {
                 g.unlock();

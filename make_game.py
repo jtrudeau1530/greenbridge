@@ -1326,9 +1326,10 @@ def checker_supports(exe: str, *options: str) -> bool:
 
 
 def read_names(path: str) -> "list[str]":
+    """The module names in vk_pipeline_check's --inflight-file ("name<TAB>phase" lines)."""
     try:
         with open(path, encoding="utf-8", errors="replace") as f:
-            return [line.strip() for line in f if line.strip()]
+            return [n for n in (line.split("\t", 1)[0].strip() for line in f) if n]
     except OSError:
         return []
 
