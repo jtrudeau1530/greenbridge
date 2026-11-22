@@ -18,6 +18,9 @@
 #include "../src/vulkan_bindless.h"
 #include "../src/vulkan_memory.h"
 #include "../src/resource_tiling.h"
+#include "../src/vulkan_present.h"
+
+#include <vulkan/vulkan_win32.h>
 #include "../src/vulkan_device_filter.h"
 
 #include <algorithm>
@@ -1759,6 +1762,8 @@ public:
     bool upload_in_vram() const { return state_.upload_in_vram; }
     leonida::VulkanContext& context() { return *state_.context; }
     const leonida::BindlessSet* bindless() const { return state_.bindless.get(); }
+    const DeviceState& state() const { return state_; }
+    IUnknown* holder() { return identity(); }
     bool bind_sampler(const leonida::gfx10::SamplerWords& words) { return state_.bind_sampler(words); }
     void own(const OwnedRuntime& owned) { owned_ = owned; }
     void set_outer(IUnknown* outer) { outer_ = outer; }
@@ -3604,6 +3609,75 @@ VkDescriptorSetLayout bindless_set_layout(ID3D12Device* device) {
     return set ? set->layout() : VK_NULL_HANDLE;
 }
 
+WindowPresenter::WindowPresenter(IUnknown* device, std::unique_ptr<leonida::VulkanPresenter> presenter)
+    : device_(device), presenter_(std::move(presenter)) {
+    device_->AddRef();
+}
+
+WindowPresenter::~WindowPresenter() {
+    presenter_.reset();  // before the device it runs on
+    device_->Release();
+}
+
+namespace {
+HRESULT present_result(VkResult result) {
+    if (result == VK_SUCCESS) return S_OK;
+    std::fprintf(stderr, "[rt] d3d12: present failed (VkResult %d)\n", int(result));
+    if (result == VK_ERROR_DEVICE_LOST) return DXGI_ERROR_DEVICE_REMOVED;
+    if (result == VK_ERROR_FORMAT_NOT_SUPPORTED) return DXGI_ERROR_UNSUPPORTED;
+    return E_FAIL;
+}
+}  // namespace
+
+HRESULT WindowPresenter::present(ID3D12Resource* back_buffer, UINT sync_interval, const D3D12_RECT* src_rect) {
+    if (!back_buffer) return E_INVALIDARG;
+    const leonida::PresentRect rect = src_rect ? leonida::PresentRect{src_rect->left, src_rect->top, src_rect->right,
+                                                                       src_rect->bottom}
+                                               : leonida::PresentRect{};
+    return present_result(presenter_->present(resource_id(back_buffer), sync_interval > 0, src_rect ? &rect : nullptr));
+}
+
+HRESULT WindowPresenter::present_blank(UINT sync_interval) {
+    return present_result(presenter_->present_blank(sync_interval > 0));
+}
+
+bool WindowPresenter::enable_capture() { return presenter_->enable_capture(); }
+
+void WindowPresenter::set_abort(std::function<bool()> abort) { presenter_->set_abort(std::move(abort)); }
+
+bool WindowPresenter::read_back(std::vector<std::uint8_t>& pixels, VkExtent2D* extent, VkFormat* format) {
+    return presenter_->read_back(pixels, extent, format);
+}
+
+VkExtent2D WindowPresenter::extent() const { return presenter_->extent(); }
+std::uint64_t WindowPresenter::presented() const { return presenter_->presented(); }
+
+std::unique_ptr<WindowPresenter> create_window_presenter(ID3D12Device* device, HWND window) {
+    Device* d = Device::from<Device>(device);
+    if (!d || !window) return nullptr;
+    const VulkanDeviceInfo& info = d->state().info;
+    if (!info.presentation) {
+        std::fprintf(stderr, "[rt] d3d12: the Vulkan device was created without presentation support\n");
+        return nullptr;
+    }
+    const auto create_surface = reinterpret_cast<PFN_vkCreateWin32SurfaceKHR>(
+        info.get_instance_proc(info.instance, "vkCreateWin32SurfaceKHR"));
+    if (!create_surface) return nullptr;
+    VkWin32SurfaceCreateInfoKHR surface_info{VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR};
+    surface_info.hinstance = GetModuleHandleW(nullptr);
+    surface_info.hwnd = window;
+    VkSurfaceKHR surface = VK_NULL_HANDLE;
+    if (create_surface(info.instance, &surface_info, nullptr, &surface) != VK_SUCCESS) return nullptr;
+    auto presenter = std::make_unique<leonida::VulkanPresenter>(*d->state().context, info.get_instance_proc,
+                                                                info.instance, info.physical, info.queue,
+                                                                info.queue_family, surface);  // owns the surface
+    if (!presenter->ok()) {
+        std::fprintf(stderr, "[rt] d3d12: cannot present to this window from the device's queue family\n");
+        return nullptr;
+    }
+    return std::make_unique<WindowPresenter>(d->holder(), std::move(presenter));
+}
+
 HRESULT register_samplers(ID3D12Device* device, std::span<const leonida::gfx10::SamplerWords> samplers) {
     if (!device) return E_INVALIDARG;
     ID3D12Device* real = rt::d3d12_xs::device_proxy_real_device(device);
@@ -3926,6 +4000,7 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
         device_extensions.push_back(VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME);
         device_extensions.push_back(VK_KHR_RAY_QUERY_EXTENSION_NAME);
     }
+    info.presentation = has_swapchain && instance_has_surface;
     device_info.enabledExtensionCount = std::uint32_t(device_extensions.size());
     device_info.ppEnabledExtensionNames = device_extensions.empty() ? nullptr : device_extensions.data();
     if (vkCreateDevice(info.physical, &device_info, nullptr, &owned.device) != VK_SUCCESS)
