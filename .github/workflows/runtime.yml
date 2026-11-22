@@ -1,5 +1,5 @@
-# Builds the loader (runtime/) with MSVC on every push and pull request, as scripts/build_runtime.ps1 does, so a
-# change that breaks the C++ build shows up in CI. Without the Vulkan SDK the GPU test tools are skipped.
+# Builds the loader (runtime/) with MSVC and Vulkan headers (plus GPU tools and llvmpipe tests on Linux) on runtime or
+# translator changes, so a change that breaks the C++ build or tests shows up in CI.
 name: Runtime
 
 on:
@@ -31,11 +31,40 @@ jobs:
   windows:
     runs-on: windows-latest
     timeout-minutes: 20
+    env:
+      SCCACHE_GHA_ENABLED: "true"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
       - uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
+      - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+      - name: Cache Vulkan headers
+        id: vulkan-headers-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .vulkan-headers/include
+          key: vulkan-headers-6802bb4733b63ed5efd3adb308a6c885ef180ea1
+      - name: Checkout Vulkan headers (vulkan-sdk-1.4.363.0)
+        if: steps.vulkan-headers-cache.outputs.cache-hit != 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: KhronosGroup/Vulkan-Headers
+          ref: 6802bb4733b63ed5efd3adb308a6c885ef180ea1 # vulkan-sdk-1.4.363.0
+          path: .vulkan-headers
+          sparse-checkout: include
+          persist-credentials: false
       - name: Configure
-        run: cmake -S runtime -B runtime/build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DLEONIDA_D3D12_SHIM_TESTS=ON
+        env:
+          VULKAN_SDK: ${{ github.workspace }}/.vulkan-headers
+        run: >-
+          cmake -S runtime -B runtime/build -G Ninja
+          -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          -DLEONIDA_D3D12_SHIM_TESTS=ON
+          -DCMAKE_CXX_COMPILER_LAUNCHER=sccache
+          -DCMAKE_POLICY_DEFAULT_CMP0141=NEW
+          -DCMAKE_MSVC_DEBUG_INFORMATION_FORMAT=Embedded
       - name: Build
         run: cmake --build runtime/build
       - name: CPU runtime tests
@@ -46,8 +75,11 @@ jobs:
   linux-gpu-tools:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
+    env:
+      SCCACHE_GHA_ENABLED: "true"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
       - name: Install Vulkan SDK, llvmpipe, llvm-mc and SPIRV-Tools
         run: |
           pkgs=(libvulkan-dev mesa-vulkan-drivers vulkan-tools spirv-tools)
@@ -58,7 +90,10 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends "${pkgs[@]}"
       - name: Configure
-        run: cmake -S runtime -B runtime/build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
+        run: >-
+          cmake -S runtime -B runtime/build -G Ninja
+          -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          -DCMAKE_CXX_COMPILER_LAUNCHER=sccache
       - name: Build
         run: cmake --build runtime/build --parallel
       - name: Check GPU tools exist
