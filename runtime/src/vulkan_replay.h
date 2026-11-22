@@ -2219,8 +2219,27 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                 const VkImageLayout dst_layout = detail::copy_layout(
                     vk, command_buffer, p.binding, dst_id, detail::planes_for_layout(p.binding, p.range, separate),
                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT, tracker);
-                vk.copy_image(command_buffer, p.source.image, src_layout, p.binding.image, dst_layout,
-                              std::uint32_t(p.image_copies.size()), p.image_copies.data());
+                const auto count = std::uint32_t(p.image_copies.size());
+                const auto depth_stencil = VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
+                if (std::holds_alternative<CopyResource>(command) &&
+                    (p.binding.aspects & depth_stencil) == depth_stencil) {
+                    // prepare_resource_copy groups regions by aspect. On RX 5700 XT (Windows driver
+                    // 32.0.21045.5002), copying both groups in one command corrupts stencil in multi-mip
+                    // arrays, even with validation clean. Order the aspect writes explicitly; a barrier
+                    // before or after the bulk copy does not fix it. Keep all mips/layers batched per aspect.
+                    const auto depth_count = p.source.mip_levels;
+                    vk.copy_image(command_buffer, p.source.image, src_layout, p.binding.image, dst_layout,
+                                  depth_count, p.image_copies.data());
+                    detail::memory_barrier(vk, command_buffer, VK_ACCESS_TRANSFER_WRITE_BIT,
+                                           VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                           VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
+                                           VK_PIPELINE_STAGE_TRANSFER_BIT);
+                    vk.copy_image(command_buffer, p.source.image, src_layout, p.binding.image, dst_layout,
+                                  count - depth_count, p.image_copies.data() + depth_count);
+                } else {
+                    vk.copy_image(command_buffer, p.source.image, src_layout, p.binding.image, dst_layout,
+                                  count, p.image_copies.data());
+                }
             } else if (p.binding.image) {
                 VkBuffer source = p.source.buffer;
                 std::vector<VkBufferImageCopy> converted;
