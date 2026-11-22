@@ -845,8 +845,9 @@ public:
     // RTX 5070 / 621.14): a null queue, window, description or output, an ID3D12Device in place of the queue, the
     // bitblt effects, a scaling or alpha mode a window can't present, a flag outside the ones a D3D12 window swap chain
     // takes (MODE_SWITCH, DISPLAY_ONLY, FRAME_LATENCY_WAITABLE_OBJECT, ALLOW_TEARING, the holographic restriction and
-    // 0x2000), and a shared, read-only, discard-on-present or unordered-access buffer usage are
-    // DXGI_ERROR_INVALID_CALL; a side above 16384 is E_INVALIDARG.
+    // 0x2000), a shared, read-only, discard-on-present or unordered-access buffer usage, MSAA, a buffer count outside
+    // 2..16 and a format the swap chain can't take are DXGI_ERROR_INVALID_CALL; a side above 16384 is E_INVALIDARG,
+    // only when nothing else is wrong.
     static HRESULT check_hwnd_swap_chain(IUnknown* device, HWND hwnd, const DXGI_SWAP_CHAIN_DESC1* desc,
                                          IDXGISwapChain1** out) {
         if (!device || !hwnd || !desc || !out) return DXGI_ERROR_INVALID_CALL;
@@ -865,6 +866,10 @@ public:
         constexpr DXGI_USAGE kRefusedUsage =
             DXGI_USAGE_SHARED | DXGI_USAGE_READ_ONLY | DXGI_USAGE_DISCARD_ON_PRESENT | DXGI_USAGE_UNORDERED_ACCESS;
         if (desc->BufferUsage & kRefusedUsage) return DXGI_ERROR_INVALID_CALL;
+        // The host checks these before the size: MSAA 4 or one buffer at width 16385 is still INVALID_CALL.
+        if (desc->SampleDesc.Count != 1 || desc->SampleDesc.Quality != 0) return DXGI_ERROR_INVALID_CALL;
+        if (!valid_flip_buffer_count(desc->BufferCount)) return DXGI_ERROR_INVALID_CALL;
+        if (dxgi_to_vk_format(desc->Format) == VK_FORMAT_UNDEFINED) return DXGI_ERROR_INVALID_CALL;
         if (desc->Width > D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION || desc->Height > D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION)
             return E_INVALIDARG;
         return S_OK;

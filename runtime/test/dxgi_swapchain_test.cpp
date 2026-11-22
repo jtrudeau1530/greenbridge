@@ -202,6 +202,26 @@ int compare_swap_chain_arguments(IDXGIFactory4* ours, ID3D12Device* our_device, 
         {"height 16385", with([](DXGI_SWAP_CHAIN_DESC1& d) { d.Height = 16385; })},
         {"one buffer", with([](DXGI_SWAP_CHAIN_DESC1& d) { d.BufferCount = 1; })},
         {"MSAA 4", with([](DXGI_SWAP_CHAIN_DESC1& d) { d.SampleDesc.Count = 4; })},
+        {"width 16385 and MSAA 4", with([](DXGI_SWAP_CHAIN_DESC1& d) {
+             d.Width = 16385;
+             d.SampleDesc.Count = 4;
+         })},
+        {"width 16385 and one buffer", with([](DXGI_SWAP_CHAIN_DESC1& d) {
+             d.Width = 16385;
+             d.BufferCount = 1;
+         })},
+        {"width 16385 and format UNKNOWN", with([](DXGI_SWAP_CHAIN_DESC1& d) {
+             d.Width = 16385;
+             d.Format = DXGI_FORMAT_UNKNOWN;
+         })},
+        {"height 16385 and format BC1", with([](DXGI_SWAP_CHAIN_DESC1& d) {
+             d.Height = 16385;
+             d.Format = DXGI_FORMAT_BC1_UNORM;
+         })},
+        {"width 16385 and effect DISCARD", with([](DXGI_SWAP_CHAIN_DESC1& d) {
+             d.Width = 16385;
+             d.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
+         })},
         {"null queue", base, Pass::null_queue},
         {"a device, not a queue", base, Pass::device},
         {"null window", base, Pass::null_window},
