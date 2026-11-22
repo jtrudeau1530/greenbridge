@@ -585,9 +585,20 @@ def main():
     ap.add_argument("--no-exec", action="append", default=[], choices=EXEC_KINDS,
                     help="run this op kind (e.g. bpermute) with all lanes active, to isolate a known finding")
     a = ap.parse_args()
-    if a.show:
+    if a.programs < 1 or a.max_report < 1:
+        ap.error("--programs and --max-report must be at least 1")
+    if a.show is not None:
         parts = a.show.split(":")
-        show(int(parts[0]), int(parts[1]), int(parts[2]) if len(parts) > 2 else 64, tuple(a.no_exec))
+        try:
+            if len(parts) not in (2, 3):
+                raise ValueError
+            seed, index = int(parts[0]), int(parts[1])
+            wave = int(parts[2]) if len(parts) == 3 else 64
+        except ValueError:
+            ap.error("--show expects SEED:INDEX[:WAVE] with INDEX >= 0 and WAVE in 32, 64")
+        if index < 0 or wave not in (32, 64):
+            ap.error("--show expects SEED:INDEX[:WAVE] with INDEX >= 0 and WAVE in 32, 64")
+        show(seed, index, wave, tuple(a.no_exec))
         return 0
     waves = (64, 32) if a.wave == "both" else (int(a.wave),)
     progs = programs(a.seed, a.programs, waves, tuple(a.no_exec))
