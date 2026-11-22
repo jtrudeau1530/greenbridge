@@ -1904,10 +1904,11 @@ public:
         case D3D12_FEATURE_SHADER_MODEL: {
             if (size != sizeof(D3D12_FEATURE_DATA_SHADER_MODEL)) return E_INVALIDARG;
             auto* model = static_cast<D3D12_FEATURE_DATA_SHADER_MODEL*>(data);
-            // Measured against the host PC runtime: a request above the supported model is clamped down to it, and
-            // a request below 6.0 is refused with E_INVALIDARG (0x5f crashed the host, so the test does not probe
-            // it). Refuse the same way instead of echoing an unrepresentable value back.
-            if (model->HighestShaderModel < D3D_SHADER_MODEL_6_0) return E_INVALIDARG;
+            // Measured against the host PC runtime: a request above the supported model is clamped down to it, 5.1
+            // is echoed because it is D3D12's own baseline (WARP and the RTX 5070 both answer it with S_OK), and a
+            // value below it is refused with E_INVALIDARG (0x5f crashed the host, so the test does not probe it).
+            // Refuse the same way instead of echoing an unrepresentable value back.
+            if (model->HighestShaderModel < D3D_SHADER_MODEL_5_1) return E_INVALIDARG;
             if (model->HighestShaderModel > kHighestShaderModel) model->HighestShaderModel = kHighestShaderModel;
             return S_OK;
         }

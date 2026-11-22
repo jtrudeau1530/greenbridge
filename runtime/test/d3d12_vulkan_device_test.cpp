@@ -942,11 +942,13 @@ int compare_feature_support(ID3D12Device* ours) {
                          static_cast<unsigned long>(want_hr), want);
     };
 
-    // 6.0 upwards by number: only 6.0 is guaranteed to be named by every SDK that has the query at all. And only
-    // values the runtime defines go to the host: it crashed the process on an undefined one (0x5f, and once on 0),
-    // so the layer's refusal of an undefined value is checked in main.
+    // 5.1 upwards: D3D12's own baseline, which every SDK names, then 6.0-6.9 by number (only 6.0 is guaranteed to be
+    // named by every SDK that has the query at all). And only values the runtime defines go to the host: it crashed
+    // the process on an undefined one (0x5f, and once on 0), so the layer's refusal of an undefined value is checked
+    // in main.
     const D3D_SHADER_MODEL models[] = {
-        D3D_SHADER_MODEL_6_0, static_cast<D3D_SHADER_MODEL>(0x61), static_cast<D3D_SHADER_MODEL>(0x62),
+        D3D_SHADER_MODEL_5_1, D3D_SHADER_MODEL_6_0, static_cast<D3D_SHADER_MODEL>(0x61),
+        static_cast<D3D_SHADER_MODEL>(0x62),
         static_cast<D3D_SHADER_MODEL>(0x63), static_cast<D3D_SHADER_MODEL>(0x64),
         static_cast<D3D_SHADER_MODEL>(0x65), static_cast<D3D_SHADER_MODEL>(0x66),
         static_cast<D3D_SHADER_MODEL>(0x67), static_cast<D3D_SHADER_MODEL>(0x68),
@@ -1135,6 +1137,10 @@ int main() {
             D3D12_FEATURE_DATA_SHADER_MODEL model{D3D_SHADER_MODEL_6_0};
             EXPECT(SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &model, sizeof(model))));
             EXPECT(model.HighestShaderModel == D3D_SHADER_MODEL_6_0);
+            // 5.1 is D3D12's baseline and the host answers it, so a caller asking for the minimum must get it back.
+            D3D12_FEATURE_DATA_SHADER_MODEL baseline{D3D_SHADER_MODEL_5_1};
+            EXPECT(SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &baseline, sizeof(baseline))));
+            EXPECT(baseline.HighestShaderModel == D3D_SHADER_MODEL_5_1);
             D3D12_FEATURE_DATA_SHADER_MODEL above{static_cast<D3D_SHADER_MODEL>(0x69)};
             EXPECT(SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &above, sizeof(above))));
             EXPECT(above.HighestShaderModel == D3D_SHADER_MODEL_6_0);  // clamped to what the layer accepts

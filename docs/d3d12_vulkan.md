@@ -739,9 +739,10 @@ The trace will enumerate them.
 - `D3D12_FEATURE_SHADER_MODEL`: answer the shader model the layer can honour, not the driver's maximum. Nothing in
   the runtime compiles DXIL: the game's shaders arrive as SPIR-V from the offline translator, and the only DXIL path
   (the BVH builder) is lowered to standard DXIL, whose baseline is 6.0. A request above it is clamped down to 6.0,
-  and an undefined value is refused with `E_INVALIDARG`. Measured against the host PC runtime (616.86) on an RTX
-  5070: 6.0-6.8 echo the request, 6.9 clamps to 6.8, and `0` is `E_INVALIDARG`; `0x5f` crashed the host runtime, which
-  the test records in a comment rather than repeating.
+  a request for 5.1 is answered with 5.1 (D3D12's own baseline, which a caller asking for the minimum expects), and a
+  value below 5.1 is refused with `E_INVALIDARG`. Measured against the host PC runtime (616.86) on an RTX 5070:
+  5.1-6.8 echo the request, 6.9 clamps to 6.8, and `0` is `E_INVALIDARG`; `0x5f` crashed the host runtime, which the
+  test records in a comment rather than repeating. WARP answers a 5.1 request the same way.
 - `D3D12_FEATURE_ROOT_SIGNATURE`: 1.1, the version the proxy can always produce. A 1.2 blob is rewritten as 1.1 when
   the host's serializer stops at 1.1 and nothing is lost (`d3d12_xs_rootsig.cpp`), and Windows 10's `d3d12.dll` stops
   there, so 1.1 is what the game can rely on everywhere. A higher request is clamped down like the shader model, and
