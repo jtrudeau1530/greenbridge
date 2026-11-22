@@ -1495,9 +1495,12 @@ The trace will enumerate them.
   operation group the wave intrinsics map to is present (`BASIC`, `VOTE`, `BALLOT`, `SHUFFLE`, `ARITHMETIC`),
   because D3D12 promises them all behind that one bool. `WaveLaneCountMin`/`Max` are the subgroup size range
   (`VkPhysicalDeviceSubgroupSizeControlProperties`, or the single `subgroupSize` without those 1.3 properties).
-  The exception is an Intel integrated GPU (D3D-121): Vulkan reports 8..32 there, Intel's D3D12 driver a fixed
-  16..16, and the layer answers 16..16 like the host. Measured on Xe-LP: UHD 770 (32.0.101.6129) and Raptor Lake-S
-  Mobile (101.7092). Discrete Arc keeps the Vulkan range until it is measured (TEST-57).
+  The exception is an Intel integrated GPU of the pre-Xe-LPG lines (D3D-121): Vulkan reports 8..32 there, Intel's
+  D3D12 driver a fixed 16..16, and the layer answers 16..16 like the host. Measured on Xe-LP: UHD 770
+  (32.0.101.6129), Raptor Lake-S Mobile (101.7092) and Tiger Lake 0x9a78 (101.7088). From Xe-LPG on the driver
+  answers the same range Vulkan reports (D3D-280, measured Meteor Lake 0x7d55 on 32.0.101.6127: 8..32 on both
+  sides), so those lines keep the Vulkan range (Meteor/Arrow Lake device IDs 0x7d40-0x7dc5, Lunar Lake
+  0x64a0-0x64b6). Discrete Arc keeps the Vulkan range until it is measured (TEST-57).
   `TotalLaneCount` has no Vulkan equivalent: D3D12 counts every lane of the device, and the layer answers one full
   wave, so a game that sizes work from it plans for less parallelism than the GPU has, never more. Measured
   against the host PC runtime (616.86) on an RTX 5070: `S_OK` with `WaveOps` 1, lanes 32..32 and a total of 6144,
