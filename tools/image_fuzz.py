@@ -14,12 +14,21 @@ sampled array) and converts loaded integers to exactly representable floats.
 Not covered yet: wider integer formats, mips, 1D/2D-array/3D/cube, `image_sample`/`gather` with filters and borders, and texel
 offsets with `VK_KHR_maintenance8`.
 
+Oracles (--oracle translator|hw|translator,hw): translator (default) is the path above. hw runs the same fetches as raw
+compute kernels natively on the AMD GPU through tools/hw_oracle/ (docs/shader_validation.md, "Hardware oracle for the
+image fetches"): a linear texture in device memory, a T# built for the GPU's family (hw_oracle/tsharp.py: GFX11 on
+gfx11xx, GFX10 on gfx103x), `image_load ... dmask:.. dim:SQ_RSRC_IMG_2D unorm` for every texel, every result register
+stored and compared word for word with this file's CPU model. It tests the MODEL (and, with translator,hw, shows what
+the translator did on a case the hardware disagrees with). A local gfx1150 is RDNA3.5, not RDNA2: a match supports the
+model, it does not prove RDNA2. --negative-control checks that deliberately wrong models and a wrong T# FORMAT are caught.
+
 Usage:
     python -I tools/image_fuzz.py [--programs N] [--seed S] [--build DIR] [--work DIR] [--show]
+    python -I tools/image_fuzz.py --oracle hw [--programs N] [--seed S] [--negative-control]
     python -I tools/image_fuzz.py --self-test
 
-Exit code: 0 when every case matches, 1 on a mismatch, 2 on a setup or harness error. Nothing here reads
-game files.
+Exit code: 0 when every case matches, 1 on a mismatch, 2 on a setup or harness error, 77 when --oracle hw was asked
+for and the hardware oracle's tools or GPU are missing. Nothing here reads game files.
 """
 import argparse
 import os
@@ -40,6 +49,7 @@ sys.path.insert(0, TOOLS)
 sys.path.insert(0, SHADERS)
 import mc_command  # noqa: E402
 from compute_fixture import find_test_program  # noqa: E402
+from hw_oracle import asm as hw_asm, tsharp  # noqa: E402
 
 HARNESS = "vk_image_fuzz"
 DRAW = 64  # the harness draws a 64x64 full-screen triangle
@@ -243,7 +253,9 @@ def exit_status(returncode: int) -> str:
     return f"exit {returncode}"
 
 
-def run_case(fmt_name, width, height, rng, work, build, keep, show, dmask=0xf) -> bool:
+def run_case(fmt_name, width, height, rng, work, build, keep, show, dmask=0xf, data=None) -> bool:
+    """data: the (texel bytes, T# words) to use instead of drawing them from rng (main draws all cases up front, so
+    the translator and the hardware oracle see the same textures)."""
     vk_format, _, _, model = FORMATS[fmt_name]
     asm = pixel_shader(width, height, dmask, model)
     assemble(asm, "ps_image_load", work)
@@ -251,7 +263,7 @@ def run_case(fmt_name, width, height, rng, work, build, keep, show, dmask=0xf) -
         with open(os.path.join(SHADERS, "vs_ids.asm"), encoding="utf-8") as f:
             assemble(f.read(), "vs_ids", work)
     spirv = translate(work)
-    texels, tsharp = make_texels(fmt_name, width, height, rng)
+    texels, tsharp = data if data is not None else make_texels(fmt_name, width, height, rng)
     texels_path = os.path.join(work, "texels.bin")
     with open(texels_path, "wb") as f:
         f.write(texels)
@@ -300,6 +312,184 @@ def run_case(fmt_name, width, height, rng, work, build, keep, show, dmask=0xf) -
     return False
 
 
+# ---- the hardware oracle ----
+
+HW_CHUNK = 24            # kernels per assembled module: each carries its texture, up to 64 KB of data
+WAVES = (32, 64)         # alternated from case to case: a texel fetch must not depend on the wave size
+FORMAT_ORDER = list(FORMATS)
+_X, _Y, _Z, _W, _0, _1 = (tsharp.SEL_X, tsharp.SEL_Y, tsharp.SEL_Z, tsharp.SEL_W, tsharp.SEL_0, tsharp.SEL_1)
+# DST_SEL per model. A one-channel format reads (r, 0, 0, 1): what the translator's image view gives it
+# (format_swizzle in runtime/src/gfx10_descriptors.h) and what the CPU model says.
+FORMAT_SWIZZLE = {"unorm8": (_X, _Y, _Z, _W), "half4": (_X, _Y, _Z, _W), "float4": (_X, _Y, _Z, _W),
+                  "float1": (_X, _0, _0, _1), "uint8": (_X, _Y, _Z, _W), "sint8": (_X, _Y, _Z, _W)}
+
+
+class Case:
+    """One fetch: a format, a texture size, a dmask and the texture bytes (drawn once, shared by every oracle)."""
+
+    def __init__(self, index, fmt, width, height, dmask, data, wave):
+        self.index, self.fmt, self.width, self.height = index, fmt, width, height
+        self.dmask, self.data, self.wave = dmask, data, wave
+
+    @property
+    def name(self):
+        return f"#{self.index} {self.fmt} {self.width}x{self.height} dmask:0x{self.dmask:x} wave{self.wave}"
+
+
+def make_cases(programs, seed, formats):
+    """The cases of a run, drawn in the order main always used (width, height, then the texels of each case), so a
+    seed names the same textures whichever oracle runs them."""
+    rng = random.Random(seed)
+    cases = []
+    for i in range(programs):
+        fmt = formats[i % len(formats)]
+        width, height = rng.choice(SIZES), rng.choice(SIZES)
+        dmask = DMASKS[(i // len(formats)) % len(DMASKS)]
+        cases.append(Case(i, fmt, width, height, dmask, make_texels(fmt, width, height, rng),
+                          WAVES[(i // len(formats)) % 2]))
+    return cases
+
+
+# What the model gets wrong on purpose (--negative-control): each name switches one deliberate error on in
+# expected_words, and the hardware words must then disagree with it somewhere.
+PERTURB = set()
+PERTURBATIONS = {
+    "unorm_256": "UNORM8 divides by 256 instead of 255",
+    "swap_rb": "red and blue swapped",
+    "sint_unsigned": "SINT8 read as unsigned",
+    "alpha_zero": "R32_SFLOAT missing alpha is 0, not 1",
+    "dmask_in_place": "dmask components stay in their own register instead of packing downwards",
+    "no_sentinels": "registers dmask does not write read as 0 instead of keeping their value",
+    "transpose": "texel (x, y) read as (y, x)",
+}
+
+
+def f32_bits(value: float) -> int:
+    return struct.unpack("<I", struct.pack("<f", value))[0]
+
+
+def expected_words(fmt_name, texels, width, height, dmask):
+    """The dwords the hardware stores for every texel (texel index * 4 words): the four result registers after an
+    image_load with this dmask, written over the sentinels. Integer formats come back as integers, the rest as f32."""
+    _, _, bpp, model = FORMATS[fmt_name]
+    values = oracle(fmt_name, texels, width, height)
+    if "unorm_256" in PERTURB and model == "unorm8":
+        values = [[f32(texels[i * 4 + c] / 256.0) for c in range(4)] for i in range(width * height)]
+    if "swap_rb" in PERTURB:
+        values = [[v[2], v[1], v[0], v[3]] for v in values]
+    if "sint_unsigned" in PERTURB and model == "sint8":
+        values = [[x & 0xff for x in v] for v in values]
+    if "alpha_zero" in PERTURB and model == "float1":
+        values = [[v[0], v[1], v[2], 0.0] for v in values]
+    if "transpose" in PERTURB:
+        values = [values[(i % width) * height + i // width] for i in range(width * height)]
+    sentinels = [0.0] * 4 if "no_sentinels" in PERTURB else list(SENTINELS)
+    integer = model in ("uint8", "sint8")
+    words = []
+    for v in values:
+        if "dmask_in_place" in PERTURB:
+            regs = [v[c] if dmask & (1 << c) else sentinels[c] for c in range(4)]
+        else:
+            picked = [v[c] for c in range(4) if dmask & (1 << c)]
+            regs = picked + sentinels[len(picked):]
+        for x in regs:
+            words.append(x & 0xFFFFFFFF if integer and isinstance(x, int) else f32_bits(x))
+    return words
+
+
+def word_equal(have: int, want: int, model: str) -> bool:
+    """Bit equality; for the float formats any NaN equals any NaN (payloads are not modelled)."""
+    if have == want:
+        return True
+    if model in ("uint8", "sint8"):
+        return False
+    return all((x & 0x7F800000) == 0x7F800000 and x & 0x007FFFFF for x in (have, want))
+
+
+def compare_hw(case, got):
+    """Mismatches (texel x, y, register, want, have) of one case's output words against the model."""
+    want = expected_words(case.fmt, case.data[0], case.width, case.height, case.dmask)
+    model = FORMATS[case.fmt][3]
+    problems = []
+    if len(got) != len(want):
+        return [(-1, -1, -1, len(want), len(got))]
+    for i, (h, w) in enumerate(zip(got, want)):
+        if not word_equal(h, w, model):
+            texel = i // 4
+            problems.append((texel % case.width, texel // case.width, i % 4, w, h))
+    return problems
+
+
+def hw_kernel(arch, case, fmt_override=None):
+    """The native kernel of a case (fmt_override: build the T# with another format's code, for the negative control)."""
+    bpp = FORMATS[case.fmt][2]
+    texture = tsharp.lay_out(case.data[0], case.width, case.height, bpp)
+    lines = tsharp.kernel_lines(arch, case.index, fmt_override or case.fmt, case.width, case.height, bpp,
+                                case.dmask, texture, FORMAT_SWIZZLE[FORMATS[case.fmt][3]])
+    threads, _ = tsharp.lanes(case.width, case.height)
+    return hw_asm.Kernel(lines, case.wave, threads, case.width * case.height * 4, raw=True)
+
+
+def run_hw(oracle, cases, a, quiet=False, fmt_override=None):
+    """Run every case natively and judge it against the model. Returns (stats, mismatching cases, {index: words})."""
+    kernels = [hw_kernel(oracle.arch, c, fmt_override(c) if fmt_override else None) for c in cases]
+    stats = {}
+    failed, words = [], {}
+    for c, got in zip(cases, oracle.run(kernels)):
+        st = stats.setdefault(c.wave, {"cases": 0, "match": 0, "mismatch": 0, "rejected": 0})
+        st["cases"] += 1
+        if isinstance(got, str):
+            st["rejected"] += 1
+            print(f"REJECTED {c.name} [hw]: {got}")
+            continue
+        if got and all(w == tsharp.POISON for w in got):
+            st["rejected"] += 1
+            print(f"ERROR {c.name} [hw]: the texture in the kernel is not 256-byte aligned (every word is the poison)")
+            continue
+        words[c.index] = got
+        problems = compare_hw(c, got)
+        if not problems:
+            st["match"] += 1
+            continue
+        st["mismatch"] += 1
+        failed.append(c)
+        if quiet:
+            continue
+        print(f"MISMATCH {c.name} [hw]: {len(problems)} words; reproduce with --oracle hw --seed {a.seed} "
+              f"--programs {c.index + 1}")
+        for x, y, reg, want, have in problems[:a.max_report]:
+            print(f"   texel ({x}, {y}) register {reg}: want 0x{want:08x} have 0x{have:08x}")
+    return stats, failed, words
+
+
+def negative_control(oracle, cases, a):
+    """Every deliberately wrong model, and a kernel with the wrong T# FORMAT, must be caught by the hardware words:
+    the real model passes, each perturbed one has to mismatch on at least one case. Exit 0 when all are caught."""
+    _, failed, words = run_hw(oracle, cases, a)
+    ran = [c for c in cases if c.index in words]
+    code = 1 if failed or not ran else 0
+    print(f"unperturbed model: {len(failed)} of {len(ran)} cases mismatch")
+    for name, what in PERTURBATIONS.items():
+        PERTURB.add(name)
+        try:
+            n = sum(bool(compare_hw(c, words[c.index])) for c in ran)
+        finally:
+            PERTURB.discard(name)
+        print(f"perturbation {name} ({what}): caught by {n} of {len(ran)} cases" + ("" if n else "   <-- NOT CAUGHT"))
+        code = code or (0 if n else 1)
+
+    def wrong_of(fmt):
+        return FORMAT_ORDER[(FORMAT_ORDER.index(fmt) + 1) % len(FORMAT_ORDER)]
+    _, bad, _ = run_hw(oracle, cases, a, quiet=True, fmt_override=lambda c: wrong_of(c.fmt))
+    for fmt in dict.fromkeys(c.fmt for c in cases):
+        n_all = sum(c.fmt == fmt for c in cases)
+        n_bad = sum(c.fmt == fmt for c in bad)
+        print(f"wrong T# FORMAT ({fmt} built as {wrong_of(fmt)}): caught by {n_bad} of {n_all} cases"
+              + ("" if n_bad else "   <-- NOT CAUGHT"))
+        code = code or (0 if n_bad else 1)
+    return code
+
+
 def self_test() -> int:
     """CPU-only: the oracle, the texel mapping and the generated shader without a GPU."""
     rng = random.Random(7)
@@ -320,6 +510,28 @@ def self_test() -> int:
     return 0
 
 
+
+
+def run_translator(cases, a, work) -> tuple:
+    """The translator oracle over the cases. Returns (passed, failed, skipped, {case index: True/False/None})."""
+    passed = failed = skipped = 0
+    verdicts = {}
+    for c in cases:
+        if a.show:
+            print(f"[{c.index + 1}/{len(cases)}] {c.fmt} {c.width}x{c.height} (work {work})")
+        result = run_case(c.fmt, c.width, c.height, None, work, a.build, False, a.show, c.dmask, c.data)
+        verdicts[c.index] = result
+        if result is None:
+            skipped += 1
+        elif result:
+            passed += 1
+        else:
+            failed += 1
+            print(f"  work dir kept: {work}")
+            break
+    return passed, failed, skipped, verdicts
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Differential fuzzer for the translator's image_load path")
     ap.add_argument("--programs", type=int, default=8)
@@ -330,10 +542,23 @@ def main() -> int:
     ap.add_argument("--work")
     ap.add_argument("--show", action="store_true")
     ap.add_argument("--formats", default=",".join(FORMATS))
+    ap.add_argument("--oracle", default="translator",
+                    help="comma-separated: translator (default; the shader through the translator and Vulkan), hw (the same "
+                         "fetches as native kernels on the AMD GPU through tools/hw_oracle/; exit 77 when it is not "
+                         "there) or translator,hw")
+    ap.add_argument("--hw-arch", default=None, help="GPU architecture to assemble for (default: detected)")
+    ap.add_argument("--negative-control", action="store_true",
+                    help="hw: check that deliberately wrong models and a wrong T# FORMAT are caught by the hardware words")
+    ap.add_argument("--max-report", type=int, default=6, help="hw: mismatching words to print per case")
     ap.add_argument("--self-test", action="store_true")
     a = ap.parse_args()
     if a.self_test:
         return self_test()
+    backends = tuple(dict.fromkeys(t.strip() for t in a.oracle.split(",")))
+    if not backends or any(t not in ("translator", "hw") for t in backends):
+        ap.error("--oracle takes translator, hw or translator,hw")
+    if a.negative_control and "hw" not in backends:
+        ap.error("--negative-control needs --oracle hw")
     formats = [f.strip() for f in a.formats.split(",") if f.strip()]
     unknown = [f for f in formats if f not in FORMATS]
     if unknown:
@@ -342,35 +567,61 @@ def main() -> int:
     if a.programs < 1:
         print("--programs must be at least 1", file=sys.stderr)
         return 2
+    if a.max_report < 1:
+        print("--max-report must be at least 1", file=sys.stderr)
+        return 2
+    hw_oracle = None
+    if "hw" in backends:
+        from hw_oracle import runner
+        try:
+            hw_oracle = runner.open_oracle(arch=a.hw_arch)
+            fam = tsharp.check_arch(hw_oracle.arch)
+        except runner.Unavailable as e:
+            print(f"hardware oracle unavailable: {e}")
+            return 77
+        except ValueError as e:
+            print(f"hardware oracle unavailable: {e}")
+            hw_oracle.close()
+            return 77
+        hw_oracle.chunk = HW_CHUNK
+        print(f"hardware oracle: {hw_oracle.device} ({hw_oracle.arch}, {fam} T# layout)")
+        if fam == "gfx11":
+            print("note: GFX11 is RDNA3 or newer, not RDNA2: a match supports the model and does not prove RDNA2")
     a.build = find_test_program(a.build, HARNESS) or a.build
-    rng = random.Random(a.seed)
+    cases = make_cases(a.programs, a.seed, formats)
     work = a.work or tempfile.mkdtemp(prefix="image_fuzz_")
     os.makedirs(work, exist_ok=True)
-    passed = failed = skipped = 0
-    for i in range(a.programs):
-        fmt = formats[i % len(formats)]
-        width = rng.choice(SIZES)
-        height = rng.choice(SIZES)
-        if a.show:
-            print(f"[{i + 1}/{a.programs}] {fmt} {width}x{height} (work {work})")
-        dmask = DMASKS[(i // len(formats)) % len(DMASKS)]
-        result = run_case(fmt, width, height, rng, work, a.build, False, a.show, dmask)
-        if result is None:
-            skipped += 1
-        elif result:
-            passed += 1
-        else:
-            failed += 1
-            print(f"  work dir kept: {work}")
-            break
-    ran = passed + failed
-    summary = f"{passed}/{ran} programs that ran match"
-    if failed:
-        summary += f"; {failed} mismatched"
-    if skipped:
-        summary += f"; {skipped} skipped"
-    print(summary)
-    return 0 if not failed else 1
+    code = 0
+    verdicts = {}
+    try:
+        if "translator" in backends:
+            passed, failed, skipped, verdicts = run_translator(cases, a, work)
+            summary = f"{passed}/{passed + failed} programs that ran match"
+            if failed:
+                summary += f"; {failed} mismatched"
+            if skipped:
+                summary += f"; {skipped} skipped"
+            print("translator: " + summary)
+            code = 1 if failed else 0
+        if hw_oracle:
+            if a.negative_control:
+                return max(code, negative_control(hw_oracle, cases, a))
+            stats, failed_cases, _ = run_hw(hw_oracle, cases, a)
+            for wave, st in sorted(stats.items()):
+                print(f"image_load wave{wave} hw: " + ", ".join(f"{k} {v}" for k, v in st.items()))
+            if "translator" in backends:
+                for c in failed_cases:
+                    seen = verdicts.get(c.index, "not run")
+                    seen = {True: "matches the model", False: "mismatches the model", None: "was skipped"}.get(seen, seen)
+                    print(f"  {c.name}: hardware disagrees with the model; the translator {seen}")
+            if any(st["mismatch"] or st["rejected"] for st in stats.values()):
+                code = 1
+            if sum(st["match"] for st in stats.values()) == 0:
+                code = max(code, 2)
+    finally:
+        if hw_oracle:
+            hw_oracle.close()
+    return code
 
 
 if __name__ == "__main__":
