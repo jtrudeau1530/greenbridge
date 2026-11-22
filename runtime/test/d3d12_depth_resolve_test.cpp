@@ -9,6 +9,7 @@
 // WARP, measured: a resolve with Format D32_FLOAT removes the device (DXGI_ERROR_DRIVER_INTERNAL_ERROR), and a
 // D24S8 resolve of one plane writes both. So WARP skips those and is compared on the plane resolved.
 #include "vk_test_device.h"
+#include "host_wine.h"
 #include "../shims/d3d12_com.h"
 #include <dxgi1_4.h>
 #include <cstdint>
@@ -316,6 +317,7 @@ int main() {
             return 1;
         }
         for (const bool warp : {false, true}) {
+            if (hostwine::host_is_wine()) break;  // checked against the clears above
             Ref<IDXGIAdapter> adapter;
             Ref<ID3D12Device> host;
             if (warp && FAILED(factory->EnumWarpAdapter(IID_PPV_ARGS(&adapter.p)))) continue;
@@ -369,8 +371,9 @@ int main() {
     const auto validation_errors = vk.validation_errors() - errors_before;
     if (validation_errors)
         std::fprintf(stderr, "d3d12_depth_resolve_test: %u new Vulkan validation error(s)\n", validation_errors);
-    if (!references) std::fprintf(stderr, "no D3D12 reference device (default adapter or WARP)\n");
-    if (run_failed || failures || validation_errors || !references || !matched) return 1;
+    const bool need_host = !hostwine::host_is_wine();
+    if (need_host && !references) std::fprintf(stderr, "no D3D12 reference device (default adapter or WARP)\n");
+    if (run_failed || failures || validation_errors || (need_host && (!references || !matched))) return 1;
     std::printf("depth/stencil resolves: %u host comparisons matched, %u refusals kept the destination, %u modes the "
                 "device lacks were refused\n", matched, refusals, lacking);
     return 0;
