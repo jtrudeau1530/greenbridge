@@ -20,8 +20,13 @@ import os
 import re
 import struct
 import sys
+import tempfile
 import time
 import zlib
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from file_mode import published_mode  # noqa: E402
 
 # zlib stream start, or a Bink 2 video ('KB2' + revision letter, then u32 size-8).
 ZHDR = re.compile(rb"\x78[\x01\x5e\x9c\xda]|KB2[a-z]")
@@ -187,6 +192,25 @@ def scan_archive(archive, start=None, limit=None, max_inflate=1 << 20, types=("d
             return rows, summary
 
 
+def publish_report(path, rows, summary):
+    """Write the report at ``path`` atomically, creating missing parent directories.
+
+    The full JSON is staged next to the destination so an interrupted run leaves only the old report or no report,
+    never a truncated one. Raised OSError carries a clear description of the staging/destination problem for
+    ``main`` to turn into a named nonzero diagnostic.
+    """
+    path = os.path.abspath(path)
+    directory = os.path.dirname(path)
+    os.makedirs(directory, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=directory, prefix=".rpf9_names-") as stage_dir:
+        temp = os.path.join(stage_dir, "report.json")
+        with open(temp, "w", encoding="utf-8") as f:
+            json.dump({"summary": summary, "files": rows}, f, indent=1)
+            f.write("\n")
+        os.chmod(temp, published_mode(path))
+        os.replace(temp, path)
+
+
 def _int_arg(text):
     try:
         return int(text, 0)
@@ -218,6 +242,13 @@ def main(argv=None):
     except ValueError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
+    out_abs = os.path.abspath(a.out)
+    try:
+        if os.path.exists(a.out) and os.path.samefile(a.archive, a.out):
+            raise ValueError(f"output {a.out!r} is the input archive")
+    except (OSError, ValueError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
     progress = None
     if not a.quiet:
         progress = lambda text: print(f"  {text}", file=sys.stderr, flush=True)
@@ -226,13 +257,11 @@ def main(argv=None):
     except (OSError, ValueError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
-    out_dir = os.path.dirname(os.path.abspath(a.out))
-    os.makedirs(out_dir, exist_ok=True)
-    tmp = a.out + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump({"summary": summary, "files": rows}, f, indent=1)
-        f.write("\n")
-    os.replace(tmp, a.out)
+    try:
+        publish_report(out_abs, rows, summary)
+    except OSError as exc:
+        print(f"ERROR: cannot write report {a.out!r}: {exc.strerror or exc}", file=sys.stderr)
+        return 2
     if not a.quiet:
         print(json.dumps(summary, indent=1))
     return 0
