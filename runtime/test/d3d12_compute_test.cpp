@@ -158,7 +158,7 @@ int main() {
     {
         std::ofstream index(library / "index.json", std::ios::binary);
         // An entry for the same program with set-0 bindings comes first, as in one group of the corpus: the PSO
-        // must take the binding-free entry, since pipelines do not bind set 0 yet (it has no module either).
+        // must take the binding-free entry, which needs no set 0 (the bound one has no module either).
         index << "{\"cs_user_data_bound\": {\"stage\": \"cs\", \"fssm_sha256\": \"" << leonida::sha256_hex(fssm)
               << "\", \"bindings\": [{\"binding\": 0}], \"push_constant_bytes\": 144, \"local_size\": [64, 1, 1]},\n"
                  " \"cs_user_data\": {\"stage\": \"cs\", \"fssm_sha256\": \"" << leonida::sha256_hex(fssm)

@@ -1880,8 +1880,8 @@ private:
 };
 
 // Among index entries for one program (containers with the same FSSM program; 789 groups in the 26,503-shader
-// corpus), the one to build: the first that `fits` and declares no set-0 bindings, which pipelines do not bind yet;
-// else the first that fits; else the first without bindings; else the first. Null when there is none.
+// corpus), the one to build: the first that `fits` and declares no set-0 bindings (the cheaper pipeline); else the
+// first that fits; else the first without bindings; else the first. Null when there is none.
 template<typename Fits>
 const leonida::ShaderEntry* pick_entry(const std::vector<const leonida::ShaderEntry*>& candidates, Fits&& fits) {
     const leonida::ShaderEntry* fitting = nullptr;
@@ -2001,6 +2001,7 @@ public:
             std::vector<std::uint8_t> fssm;
         };
         Stage stages[2] = {{"vs", VK_SHADER_STAGE_VERTEX_BIT, desc.VS}, {"ps", VK_SHADER_STAGE_FRAGMENT_BIT, desc.PS}};
+        bool uses_bindless = false;  // a stage declares set-0 bindings: the layout holds the device's set 0
         std::vector<VkPipelineShaderStageCreateInfo> stage_infos;
         const Stage* code_stage = nullptr;
         for (Stage& stage : stages) {
@@ -2023,9 +2024,12 @@ public:
                 return E_INVALIDARG;
             }
             if (stage.entry->binding_count) {
-                std::fprintf(stderr, "[rt] d3d12: %s uses set-0 bindings; pipelines do not bind set 0 yet\n",
-                             stage.entry->name.c_str());
-                return E_NOTIMPL;
+                if (!device_.bindless) {
+                    std::fprintf(stderr, "[rt] d3d12: %s uses set-0 bindings; the device has no bindless set 0\n",
+                                 stage.entry->name.c_str());
+                    return E_NOTIMPL;
+                }
+                uses_bindless = true;
             }
             if (stage.entry->uses_code_base) {
                 if (code_stage) {
@@ -2217,6 +2221,13 @@ public:
         VkPipelineLayoutCreateInfo layout_info{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
         layout_info.pushConstantRangeCount = 1;
         layout_info.pPushConstantRanges = &push;
+        VkDescriptorSetLayout set0_layout = VK_NULL_HANDLE;
+        if (uses_bindless) {
+            set0_layout = device_.bindless->layout();
+            layout_info.setLayoutCount = 1;
+            layout_info.pSetLayouts = &set0_layout;
+            graphics_.bindless_set = device_.bindless->set();
+        }
         if (vk.vkCreatePipelineLayout(dev, &layout_info, nullptr, &graphics_.layout) != VK_SUCCESS) return E_FAIL;
 
         // Kept for variants: a draw that leaves a slot unbound needs this pipeline with that format undefined.
@@ -2273,10 +2284,10 @@ public:
             std::fprintf(stderr, "[rt] d3d12: no translated compute shader for FSSM sha256 %s\n", hash.c_str());
             return E_INVALIDARG;
         }
-        if (entry->binding_count) {
-            // Set 0 (bindless images, samplers, the descriptor hash table): the device keeps it, pipelines do not
-            // declare or bind it yet (M2).
-            std::fprintf(stderr, "[rt] d3d12: %s uses set-0 bindings; pipelines do not bind set 0 yet\n",
+        // Set 0 (bindless images, samplers, the descriptor hash table): the device keeps it, and a pipeline whose
+        // shader declares bindings has it in its layout and has it bound at every dispatch.
+        if (entry->binding_count && !device_.bindless) {
+            std::fprintf(stderr, "[rt] d3d12: %s uses set-0 bindings; the device has no bindless set 0\n",
                          entry->name.c_str());
             return E_NOTIMPL;
         }
@@ -2295,6 +2306,13 @@ public:
         VkPipelineLayoutCreateInfo layout_info{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
         layout_info.pushConstantRangeCount = 1;
         layout_info.pPushConstantRanges = &push;
+        VkDescriptorSetLayout set0_layout = VK_NULL_HANDLE;
+        if (entry->binding_count) {
+            set0_layout = device_.bindless->layout();
+            layout_info.setLayoutCount = 1;
+            layout_info.pSetLayouts = &set0_layout;
+            pipeline_.bindless_set = device_.bindless->set();
+        }
         if (vk.vkCreatePipelineLayout(dev, &layout_info, nullptr, &pipeline_.layout) != VK_SUCCESS) return E_FAIL;
         VkComputePipelineCreateInfo pipeline_info{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
         pipeline_info.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
@@ -5358,6 +5376,11 @@ VkDescriptorSetLayout bindless_set_layout(ID3D12Device* device) {
     return set ? set->layout() : VK_NULL_HANDLE;
 }
 
+std::uint32_t bindless_hash_lookup(ID3D12Device* device, const std::uint32_t (&key)[8]) {
+    const leonida::BindlessSet* set = bindless_of(device);
+    return set ? set->table().lookup(key) : 0;
+}
+
 WindowPresenter::WindowPresenter(IUnknown* device, std::unique_ptr<leonida::VulkanPresenter> presenter)
     : device_(device), presenter_(std::move(presenter)) {
     device_->AddRef();
@@ -5549,15 +5572,18 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     bool chosen_bc = false;
     VkPhysicalDeviceFeatures chosen_features{};
     VkPhysicalDeviceVulkan12Features chosen12{};
+    bool chosen_draw_params = false;
     for (VkPhysicalDevice candidate : physicals) {
         VkPhysicalDeviceProperties props{};
         vkGetPhysicalDeviceProperties(candidate, &props);
         if (props.apiVersion < VK_API_VERSION_1_3 || !leonida::vulkan_device_wanted(props.deviceName)) continue;
         VkPhysicalDeviceVulkan13Features f13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
-        VkPhysicalDeviceVulkan12Features f12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &f13};
+        VkPhysicalDeviceVulkan11Features f11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES, &f13};
+        VkPhysicalDeviceVulkan12Features f12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &f11};
         VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &f12};
         vkGetPhysicalDeviceFeatures2(candidate, &features);
         const bool bc = features.features.textureCompressionBC;
+        const bool draw_params = f11.shaderDrawParameters;
         if (!f13.dynamicRendering || !f13.synchronization2 || !f12.timelineSemaphore ||
             !f12.separateDepthStencilLayouts || !f12.bufferDeviceAddress)
             continue;
@@ -5574,6 +5600,7 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
                 chosen_bc = bc;
                 chosen_features = features.features;
                 chosen12 = f12;
+                chosen_draw_params = draw_params;
             }
             break;
         }
@@ -5646,7 +5673,12 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     VkPhysicalDeviceVulkan13Features enable13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES, ext_chain};
     enable13.dynamicRendering = VK_TRUE;
     enable13.synchronization2 = VK_TRUE;
-    VkPhysicalDeviceVulkan12Features enable12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &enable13};
+    // Translated vertex shaders read BaseVertex / BaseInstance (SPIR-V DrawParameters) to give v0 / v3 the
+    // hardware's zero-based vertex and instance ids (docs/design.md, Inputs and outputs).
+    VkPhysicalDeviceVulkan11Features enable11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES, &enable13};
+    enable11.shaderDrawParameters = chosen_draw_params ? VK_TRUE : VK_FALSE;
+    if (!chosen_draw_params) std::fprintf(stderr, "[rt] d3d12: the GPU has no shaderDrawParameters\n");
+    VkPhysicalDeviceVulkan12Features enable12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &enable11};
     enable12.timelineSemaphore = VK_TRUE;
     enable12.separateDepthStencilLayouts = VK_TRUE;
     info.buffer_device_address = chosen12.bufferDeviceAddress == VK_TRUE;
@@ -5688,6 +5720,8 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     enable.textureCompressionBC = chosen_bc ? VK_TRUE : VK_FALSE;  // the game's textures are BC1-7
     enable.shaderSampledImageArrayDynamicIndexing = info.bindless;
     enable.shaderStorageImageArrayDynamicIndexing = info.bindless;
+    if (!chosen_features.shaderInt64)
+        std::fprintf(stderr, "[rt] d3d12: the GPU has no shaderInt64; translated shaders (all declare Int64) will not load\n");
     enable.samplerAnisotropy = info.sampler_anisotropy;
     enable.occlusionQueryPrecise = chosen_features.occlusionQueryPrecise;  // exact D3D12 occlusion counts
     enable.pipelineStatisticsQuery = chosen_features.pipelineStatisticsQuery;

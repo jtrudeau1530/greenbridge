@@ -571,7 +571,7 @@ The compute path, end to end:
     `tools/fssm_unpack.py` does by default and so as `fssm_sha256` was computed.
   - Index entries that share a program are all kept (789 groups of 1,182 entries in the corpus). A PSO takes the
     first entry that fits (for a VS: whose input signature the input layout feeds) and declares no set-0
-    bindings, since pipelines do not bind set 0 yet.
+    bindings (the cheaper pipeline: a binding-free entry has no set 0 in its layout).
   - A malformed index (bad numbers or `\u` escapes) is refused with an error instead of throwing into the shim,
     and an integer field outside 0..2^32−1 reads as 0.
 - Root signatures use the model already on `main` (`runtime/src/root_signature.h`, `rt::rootsig`): `parse_rts0`
@@ -589,7 +589,8 @@ The compute path, end to end:
   signature `pack()` refuses (more than 32 user dwords: the spill layout is open) is refused with its reason.
   **`CreateComputePipelineState`** (PC slot 11, Xbox slot 62 through the proxy) finds the shader by its FSSM
   hash, builds a pipeline with the 144-byte push-constant range and registers it for replay. Shaders that declare
-  set-0 bindings are refused with a log while pipelines do not declare or bind set 0 (M2).
+  set-0 bindings get the device's bindless set 0 in their layout and bound at every dispatch (M2); on a device without
+  that set they are refused with a log.
 - **Command list**: `Set{Compute,Graphics}RootSignature` (a different signature clears the arguments, as D3D12
   leaves them undefined; setting the bound one again keeps them, as D3D12 does), `SetPipelineState`, the 32-bit
   constant, root view and descriptor-table setters, `SetDescriptorHeaps` and `ClearState`. A wrong parameter type
@@ -814,6 +815,25 @@ and any validation error fails them.
     split by a 1 KiB range. It tests the pass, which needs no D24 absence, on whatever device
     `VK_LOADER_DRIVERS_SELECT` picks; the layer's own D24 path (the D3D12 tests above) is used only on a GPU without
     D24 depth-attachment support, so run those with the AMD driver selected (the Radeon 880M, RADV).
+- `d3d12_translated_draw_test`: milestone M1.5 (D3D-53), the same path with translator output.
+  - **Shaders:** `test/shaders/vs_m15.asm` and `ps_m15.asm` are hand-written RDNA2 (gfx1013). The build assembles them
+    with `llvm-mc` and translates them with `tools/rdna2spirv.py` through `test/shaders/build.py`. `build.py` also writes
+    each one's synthetic FSSM program (`; fssm-at` / `; fssm-data` in the header) to `fssm/` and the translator puts its
+    SHA-256 in `spirv/index.json`, so the layer's lookup is the one the game uses; the test loads that index as it is.
+    An unknown program is refused.
+  - **User data:** root parameter 0 is a descriptor table (`s0:s1`, the VA of its first slot), parameter 1 four root
+    constants (`s2..s5`: the draw's clip offset, and a bias for the PS).
+  - **Vertex fetch:** the VS has no input layout. It `s_load`s a V# the application wrote into a shader-visible slot and
+    fetches position and colour with `buffer_load_dwordx4 ... idxen`; the V# points at a DEFAULT-heap buffer in the arena.
+  - **Code base:** the PS starts with `s_getpc_b64` and `s_load`s four floats from offset 0x100 of its own FSSM program,
+    so the layer must have uploaded that program at the push-constant code base (dwords 34-35).
+  - **Draws:** a quad and a second V# over the same buffer, with different table slots and constants, into a
+    `R32G32B32A32_FLOAT` target. Every value is a short binary fraction, so the comparison is bit for bit: 4064 of 4096
+    pixels are exact, and the 32 whose centres lie on the triangle's long edge are counted apart.
+  - **Zero-based ids:** all draws use `StartVertexLocation` 0 and `StartInstanceLocation` 0, so `v0` is the same with
+    and without the translator's zero-based VS ids (#436, not in this tree: with its translator change applied the
+    result was identical, checked on both GPUs). Both devices enable `shaderDrawParameters` where supported, which
+    #436's shaders need. A non-zero base would differ (hardware: zero-based, the base in an SGPR), so the test avoids one.
 - `d3d12_method_variants_test`: each variant against the method it wraps, on the device directly (the proxy's
   slot 76 is the Xbox texture method, not `CreateCommittedResource3`). It runs 12 creation cases (buffers on the
   three heap types, textures, a volume, a multisampled target, and three shapes the base refuses) through every
@@ -940,13 +960,23 @@ The layer therefore owns the console VAs. It returns them from `ID3D12Resource::
 | Heaps and placed resources | `CreateHeap` reserves the requested size in the arena, so a buffer placed at a 64 KiB-aligned offset is that offset into the arena and its console VA is the heap's place plus the offset. A placed texture gets its own `VkDeviceMemory` and a null VA, as in D3D12. Tiled (`64KB_UNDEFINED_SWIZZLE`) placements are refused with `E_NOTIMPL`; reserved resources are not implemented. |
 | Descriptor heaps | Shader-visible CBV/SRV/UAV and sampler heaps are allocated in the low 4 GB of the arena. RTV/DSV heaps are host-side only. |
 | Shader code | Each FSSM blob is uploaded to the arena; its console VA is the code base. |
-| Upload/readback | `D3D12_HEAP_TYPE_UPLOAD`/`READBACK` resources are separate host-visible buffers outside the arena. Their console VAs are only used by copy APIs; if the game binds one as a vertex/index buffer or reads it in a shader, the layer biases the view/descriptor by `-heap_base` so the shader's addition lands on the host BDA (**Assumption**, to verify). |
+| Upload/readback | `D3D12_HEAP_TYPE_UPLOAD`/`READBACK` resources are separate host-visible buffers outside the arena. Their console VAs are only used by copy APIs; if the game binds one as a vertex/index buffer or reads it in a shader, the layer biases the view/descriptor by `-heap_base` so the shader's addition lands on the host BDA (**Assumption**; **measured to fail for a V#**, see below). |
 
 Non-arena buffers (upload/readback) can still be addressed by the shader without putting them in the arena: pass
 `console_va = host_bda - heap_base` (mod 2^64) in root descriptors and vertex/index/indirect views, so the shader's
 `heap_base + console_va` equals the host BDA. For descriptors, patch the V# base field the same way when the layer
 copies or scans them. This relies on the game not using the raw VA for anything except shader addressing
 (**Assumption**); if it does, the resource must move into the arena instead.
+
+**Measured (D3D-53, `d3d12_translated_draw_test`):** the bias works for 64-bit root arguments (`d3d12_compute_test`: a root
+CBV and a table slot that point at an upload buffer) but **not for a V#**. A V#'s base field is 48 bits
+(dword0 and dword1[15:0]), and an upload buffer's console VA, its device address minus `heap_base`, is negative on both test
+GPUs (`0xffffffffffce0000` on the AMD Radeon 880M, `0xffffffffffedc000` on the RTX 5070 Laptop; the buffer's device
+address lay below the arena's, an allocation-order fact of these runs, so it is not guaranteed either way). The shader
+adds `heap_base` to the truncated 48-bit value, which is a wild address: the draw faults and the whole queue submission is lost
+(the clear that came before it is lost as well). Any resource a game can put in a V# (a vertex, constant or structured buffer
+behind a descriptor) must therefore be an arena range, whatever the allocator happens to do, upload and readback heaps included. Until the layer does that, the
+translated-draw test fetches from a DEFAULT-heap buffer and does not draw from the upload buffer.
 
 Why not give each buffer its own BDA and set `heap_base = 0`? Because many shaders truncate descriptor-table
 pointers to 32 bits, and host BDAs are not guaranteed to be below 4 GB. The arena keeps console VAs low and stable.
@@ -2257,8 +2287,9 @@ M0–M2 do not need the executable.
 | # | Scope | What it proves | Done when |
 |---|---|---|---|
 | **M0** | `D3D12XboxCreateDevice` and the measured device overrides (heap start handles in RAX), one direct queue, allocator/list, fence, fake DXGI factory/adapter/output, `ALLOW_DISPLAY` back buffers, frame events + `PresentX` (DXGI swapchain only if the game creates one), clear + present | COM interception, the known Xbox device entry point and ABI overrides, presentation (`PresentX` + frame events, or swapchain), frame loop, clean shutdown | A window shows a stable clear colour for 60 frames, no Vulkan validation errors, every D3D12 call traced. **Synthetic part met** by `d3d12_present_test`: 60 frames through the proxy on Vulkan, validation clean, colour checked on screen. Still open: the game's present front end (frame events + `PresentX`, or a DXGI swapchain) and the per-call trace |
-| **M1** | Root signature with root constants (mask the measured `0x03000000` flag byte on a copy), one translated VS+PS, PSO, vertex buffer in the arena, draw, push constants `s0..s31` + heap base | PSO translation, shader hash lookup, vertex input, root-constant packing, heap base, present | The triangle matches a CPU/GPU reference; the existing texture-test style comparison passes with error 0. **Met with stand-in shaders** by `d3d12_draw_test`: every pixel of two indexed draws and a culled triangle matches, through the proxy, validation clean. With translated game shaders it waits for set 0 in pipelines (M2), since most of them declare bindings |
-| **M2** | Descriptor heap (heap slots 9/10 return in RAX), `CreateShaderResourceView`, sampler, root descriptor table, hash-table insert, bindless sampling | The full D3D12 descriptor path and the shader's T#/S# contract | A textured quad matches the synthetic 8×8 gradient or a known texture with error 0; the hash table has the expected entries |
+| **M1** | Root signature with root constants (mask the measured `0x03000000` flag byte on a copy), one translated VS+PS, PSO, vertex buffer in the arena, draw, push constants `s0..s31` + heap base | PSO translation, shader hash lookup, vertex input, root-constant packing, heap base, present | The triangle matches a CPU/GPU reference; the existing texture-test style comparison passes with error 0. **Met with stand-in shaders** by `d3d12_draw_test`: every pixel of two indexed draws and a culled triangle matches, through the proxy, validation clean. With translated game shaders most of them declare bindings, which M2 (pipelines bind set 0) lets through. **M1.5 (D3D-53) met with translator output** by `d3d12_translated_draw_test`: see below |
+| **M1.5** | The same, with real translator output: hand-written RDNA2 VS+PS, PSO found by FSSM hash, vertex fetch through a V# loaded from the user-data table, a root constant, a table in the arena, the code base | The push-constant, vertex-fetch and code-base contracts on translated code | Met by `d3d12_translated_draw_test`: three draws, every pixel off the triangle's edge exact in a float target, validation clean on the AMD Radeon 880M and the RTX 5070 Laptop. An upload buffer behind a V# is not supported (section 3.3) |
+| **M2** | Descriptor heap (heap slots 9/10 return in RAX), `CreateShaderResourceView`, sampler, root descriptor table, hash-table insert, bindless sampling | The full D3D12 descriptor path and the shader's T#/S# contract | A textured quad matches the synthetic 8×8 gradient or a known texture with error 0; the hash table has the expected entries. **Synthetic part met** by `d3d12_m2_textured_test`: through the proxy, D3D12 API only, a shader-visible CBV/SRV/UAV heap and a sampler heap (start handles from slots 9/10), two 8×8 textures uploaded with `Map` + `CopyTextureRegion`, `CreateShaderResourceView` and a POINT `CreateSampler`, a root signature of two descriptor tables, `SetDescriptorHeaps`, `SetGraphicsRootDescriptorTable` and `DrawIndexedInstanced` of a quad whose PS is translator output (`ps_m2.asm`: `s_load` of the T# and the S# from the tables, `image_sample`). Every one of the 4096 pixels matches the CPU-computed gradient (left half) and its point reflection (right half, second table) with error 0, and the hash table holds a distinct non-zero index for each of the two T#s and the S# and none for bytes nothing created; validation clean on the AMD Radeon 880M and the RTX 5070 Laptop. The layer change it needed: pipelines whose shader declares set-0 bindings (graphics and compute) were refused; their layout now holds the device's bindless set 0 and replay binds it at every draw and dispatch. Still open: shaders of the game itself (direct heap indexing, unbounded tables, static samplers, descriptors the game writes itself), no host D3D12/WARP byte comparison (the reference is computed on the CPU), and texture formats other than R8G8B8A8_UNORM, mips and arrays through a PSO (the descriptor test covers views and sampling on a compute shader) |
 | **M3** | Depth/stencil, multiple render targets, resource barriers, render passes, occlusion queries, fences, 2–3 frames in flight; run the game's first frames | Real frame structure and the first game code | The game reaches its first rendered frame (loading screen/menu or whatever the executable does) or stops on a single unsupported call with a clean report |
 | **M4** | Compute PSOs, UAVs, storage images, indirect dispatch, copy queues, async streaming | Asset loading and GPU compute | The world's streaming path runs without device loss; compute results match a CPU/reference check |
 | **M5** | Mesh shaders, `ExecuteIndirect`, bindless-table pressure, multi-threaded command lists, pipeline cache | World rendering | A stable open-world frame at any frame rate; then profile and optimise |
