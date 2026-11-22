@@ -311,9 +311,11 @@ every scalar. `vk_compute_test` reads them back with `VKC_OUT_WORDS` / `VKC_DUMP
   EXEC constants only enable lanes that exist. Every mask register is zero-initialised, as compiled code does,
   so a branch that skips the `v_cmp` writing a mask leaves a defined mask after the join.
 - **Hypotheses are reported apart.** `v_permlane16/x16` with op_sel FI = 0 reading a lane that is off in
-  EXEC is modelled as the DPP "invalid source" case (vD kept). That isn't measured on AMD hardware, and the
-  translator always reads the lane. A program that hits it counts as `hyp_only`, not as a mismatch.
-  `--permlane-fetch-inactive` models FI = 1 instead.
+  EXEC is modelled as the DPP "invalid source" case (vD kept). That is now measured on RDNA2 and RDNA3.5 (@aslan2142,
+  #374): FI = 1 returns the source lane's value, FI = 0 leaves the destination unwritten and FI = 0 with BOUND_CTRL
+  gives 0; #580 (SHADER-74) makes the translator do that. Where the translator still always reads the lane, a
+  program that hits the case counts as `hyp_only`, not as a mismatch. `--permlane-fetch-inactive` models FI = 1
+  instead.
 - **Modes.** Wave32 runs natively. Wave64 runs with `--wave64-emulate`; `--w64-native` adds the plain build,
   which on a 32-wide subgroup is the documented cross-half approximation and is expected to mismatch.
 - **Reports.** The thread, wave, lane and register of the first differences. `--minimize` drops ops while the
@@ -328,7 +330,7 @@ First results on an RTX 4090 (subgroup 32, driver 621.14):
   should be left unwritten (invalid source without `bound_ctrl`, or a lane off in `row_mask`/`bank_mask`), and
   DPP16 ignored `fi:1`. Each was confirmed with a hand-written program.
 - **Everything else matches.** On `main`, 1,000 programs (`--seed 8 --ops 28 --no-maskdata --no-w32-hi-lanes`, 500 wave32 native and 500 wave64 emulated) give 0 mismatches. 297 of them are `hyp_only` (permlane with FI = 0 and an inactive source), and with `--permlane-fetch-inactive` all 1,000 match. Native wave64 on the 32-wide card mismatches as documented: `s_bcnt1` of EXEC counts one half, and a `v_readlane` from the other half wraps.
-- **Open question (#374):** what hardware does for permlane with FI = 0 (see above). It needs a run on an AMD GPU.
+- **Closed question (#374):** what hardware does for permlane with FI = 0 was measured on RDNA2 and RDNA3.5 (see above).
 
 ### 16-bit and memory ops on the GPU (`tools/valu_fuzz.py`, FUZZ-2, FUZZ-5)
 
