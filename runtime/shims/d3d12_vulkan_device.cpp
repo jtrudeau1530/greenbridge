@@ -2246,7 +2246,15 @@ public:
         if (!desc || !xr_bias_compatible(*desc)) return fail();
         const auto align = [](UINT64 value, UINT64 to) { return (value + to - 1) / to * to; };
         if (desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
-            if (first != 0 || count != 1) return fail();
+            // The PC runtime refuses any buffer field that isn't its one valid value (all measured on WARP, Width,
+            // Height, Format, MipLevels 0, Layout and Count 0 also on an NVIDIA GPU). It doesn't look at Flags, so a
+            // buffer with the render-target flag still gets its footprint (D3D-122).
+            if (first != 0 || count != 1 || !desc->Width || desc->Height != 1 || desc->DepthOrArraySize != 1 ||
+                desc->MipLevels != 1 || desc->Format != DXGI_FORMAT_UNKNOWN ||
+                desc->Layout != D3D12_TEXTURE_LAYOUT_ROW_MAJOR || desc->SampleDesc.Count != 1 ||
+                desc->SampleDesc.Quality != 0 ||
+                (desc->Alignment && desc->Alignment != D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT))
+                return fail();
             if (layouts) layouts[0] = {base, {DXGI_FORMAT_UNKNOWN, UINT(desc->Width), 1, 1,
                                               UINT(align(desc->Width, D3D12_TEXTURE_DATA_PITCH_ALIGNMENT))}};
             if (rows) rows[0] = 1;
@@ -2261,6 +2269,16 @@ public:
             return fail();
         }
         if (one_d && desc->Height != 1) return fail();
+        // Structural checks only, as measured on the PC runtime (D3D-122). Not allocation()'s: the footprint path
+        // accepts extra mips, 2D ROW_MAJOR and Quality > 0 at one sample, and extent limits, alignment and
+        // multisample quality differ between adapters, so those stay unchecked.
+        const UINT samples = desc->SampleDesc.Count;
+        const bool multisample_ok = desc->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && desc->MipLevels == 1 &&
+                                    desc->Layout != D3D12_TEXTURE_LAYOUT_ROW_MAJOR && !(samples & (samples - 1)) &&
+                                    (desc->Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET |
+                                                    D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL));
+        if (!desc->Width || !desc->Height || !desc->DepthOrArraySize || !samples || (samples > 1 && !multisample_ok))
+            return fail();
         const Format format = texture_storage_format(desc->Format, true);  // typeless depth families are planar either way
         UINT mips = desc->MipLevels;
         const UINT depth = volume ? desc->DepthOrArraySize : 1;
