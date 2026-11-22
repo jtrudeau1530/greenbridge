@@ -1433,8 +1433,20 @@ Things that can invalidate this simple model, all **Open**:
 - **Shader visibility.** The layer starts with one global block in root-parameter order and treats visibility as
   access control, not as a per-stage reordering. If the console driver instead omits invisible parameters per
   stage, a VS and a PS would need different values at the same push-constant offsets, which Vulkan cannot express
-  with one block; that would force per-stage blocks or a per-stage indirection. The shader read sets will show
-  which model is right.
+  with one block; that would force per-stage blocks or a per-stage indirection. **Measured, VS/PS (D3D-318):**
+  consistent with one block in root order. The game's shaders carry no `RTS0` and the executable that pairs them
+  into pipelines is not in the package, so `python -I tools/user_sgpr_census.py <spirv/index.json> --pairs` pairs
+  a VS with a PS by technique name instead (names alike apart from the `VS_`/`PS_` token) and compares the user
+  SGPRs both read. Over the 1.0.2.1 corpus: 166 techniques have both stages (225 VS, 203 PS, 358 combinations).
+  - The 379 SGPRs both stages read have the same kind (pointer or constant) in every case. Over all 26,196,976
+    VS × PS combinations, the control, 25.5% of the shared reads differ in kind.
+  - In 79 combinations one stage reads an SGPR the other skips, below an SGPR both read. If that parameter were
+    omitted from the other stage, the parameters above it would move down one SGPR there; all 111 shared reads
+    above such an SGPR still agree.
+
+  It can't tell a hidden parameter from a visible one a stage doesn't read, and it doesn't see the root signature,
+  so the executable's pipeline table would settle it; `tests/test_user_sgpr_census.py` shows that the two models
+  give different counts. Mesh shaders (base s16) and the compute signatures are not covered here.
 - **Root signature larger than 32 dwords.** D3D12 allows up to 64 dwords. The console has 32 user SGPRs, so a
   driver must spill the rest to memory, probably behind a pointer in the user data. The current shader contract has
   no representation for that. The likely answer is that this game keeps its root signatures small (bindless

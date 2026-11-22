@@ -12,13 +12,22 @@ descriptor-table pointer is (docs/d3d12_vulkan.md §3.5, the "least verifiable p
     halves; two dwords per table put a ptr64_hi right after every table pointer (distance 2 between tables);
   * SGPRs read below a stage base given with --base (reserved / system block candidates).
 
+With --pairs it also compares the VS and PS of one technique (D3D-318, root-parameter visibility): shaders whose
+names differ only in the "VS_"/"PS_" stage token, after an optional one-character prefix and without the trailing
+8-digit hash and "_Wrapped". If the console omitted the parameters a stage can't see, a VS and a PS would hold
+different parameters at the same SGPR wherever one of them has a parameter the other lacks below it. With one block
+in root order they hold the same ones. So it counts, within those pairs, the SGPRs both stages read and whether the
+kind agrees (pointer or constant), separately for the reads above an SGPR that only one stage reads, against all
+VS x PS combinations as a control. Names are used for pairing only and are never printed.
+
 What it does NOT measure: logical root-parameter indices. It sees physical SGPRs only; mapping them to root
-parameters needs a root signature, which the shaders do not carry.
+parameters needs a root signature, which the shaders do not carry. Pairing by technique name approximates the
+pipelines the executable creates; it does not see them.
 
 It reads only spirv/index.json (user_sgpr_reads and stage from tools/shader_meta.py): no game bytes.
 
 Usage:
-    python -I tools/user_sgpr_census.py <spirv/index.json> [--json OUT]
+    python -I tools/user_sgpr_census.py <spirv/index.json> [--json OUT] [--pairs]
     python -I tools/user_sgpr_census.py <spirv/index.json> --expect ps=8 vs=8 cs=4 ms=16
         (exit 1 if, for a listed stage, the most common lowest-pointer SGPR is not the expected one)
 
@@ -28,6 +37,7 @@ cannot be written, each give one ERROR line and exit 2.
 import argparse
 import json
 import os
+import re
 import sys
 from collections import Counter, defaultdict
 
@@ -117,6 +127,77 @@ def load_index(path):
     return index
 
 
+# "<optional one-character prefix>VS_<technique>_<8 hex digits>_Wrapped" and the same with PS_: hash and suffix optional.
+TECHNIQUE_RE = re.compile(r"^.?(VS|PS)_(.+?)(?:_[0-9a-f]{8})?(?:_Wrapped)?$")
+
+
+def technique(name, stage):
+    """The technique a VS or PS name belongs to, or None when the name doesn't carry the stage's token."""
+    m = TECHNIQUE_RE.match(name)
+    return m.group(2) if m and m.group(1).lower() == stage else None
+
+
+def read_map(entry):
+    """{sgpr: kind} for one shader; an SGPR read as more than one kind keeps the sorted first."""
+    out = {}
+    for r in entry.get("user_sgpr_reads") or []:
+        if "sgpr" in r and r.get("kind"):
+            out[r["sgpr"]] = min(out.get(r["sgpr"], r["kind"]), r["kind"])
+    return out
+
+
+def pair_census(index):
+    """VS/PS of one technique (see the module docstring): agreement of the SGPRs both read, and the control."""
+    groups = defaultdict(lambda: {"vs": [], "ps": []})
+    stage_reads = {"vs": Counter(), "ps": Counter()}       # (sgpr, kind) -> shaders, for the control
+    for name, entry in index.items():
+        stage = entry.get("stage")
+        if stage not in stage_reads:
+            continue
+        m = read_map(entry)
+        for sk in m.items():
+            stage_reads[stage][sk] += 1
+        t = technique(name, stage)
+        if t is not None:
+            groups[t][stage].append(m)
+    paired = {t: g for t, g in groups.items() if g["vs"] and g["ps"]}
+    c = Counter()
+    for g in paired.values():
+        for v in g["vs"]:
+            for p in g["ps"]:
+                c["combinations"] += 1
+                shared = set(v) & set(p)
+                one_sided = set(v) ^ set(p)
+                c["identical_read_maps"] += v == p
+                if shared:
+                    c["combinations_sharing_an_sgpr"] += 1
+                if one_sided and shared and min(one_sided) < max(shared):
+                    c["combinations_with_a_one_sided_sgpr_below_a_shared_one"] += 1
+                for s in shared:
+                    same = v[s] == p[s]
+                    c["shared_same_kind" if same else "shared_different_kind"] += 1
+                    if any(k < s for k in one_sided):
+                        c["above_one_sided_same_kind" if same else "above_one_sided_different_kind"] += 1
+    control = Counter()
+    for (s, kv), nv in stage_reads["vs"].items():
+        for (s2, kp), np_ in stage_reads["ps"].items():
+            if s == s2:
+                control["same_kind" if kv == kp else "different_kind"] += nv * np_
+    keys = ("combinations", "combinations_sharing_an_sgpr", "identical_read_maps", "shared_same_kind",
+            "shared_different_kind", "combinations_with_a_one_sided_sgpr_below_a_shared_one",
+            "above_one_sided_same_kind", "above_one_sided_different_kind")
+    return {
+        "techniques_with_vs_and_ps": len(paired),
+        "vs_in_pairs": sum(len(g["vs"]) for g in paired.values()),
+        "ps_in_pairs": sum(len(g["ps"]) for g in paired.values()),
+        **{k: c[k] for k in keys},
+        "control_all_vs_ps": {"combinations": sum(1 for e in index.values() if e.get("stage") == "vs")
+                              * sum(1 for e in index.values() if e.get("stage") == "ps"),
+                              "shared_same_kind": control["same_kind"],
+                              "shared_different_kind": control["different_kind"]},
+    }
+
+
 def stage_sgpr(text):
     stage, _, value = text.partition("=")
     message = f"expected STAGE=SGPR with a nonnegative SGPR: {text!r}"
@@ -137,6 +218,8 @@ def main(argv=None):
                     help="fail if the most common lowest-pointer SGPR of STAGE is not SGPR")
     ap.add_argument("--base", nargs="*", type=stage_sgpr, default=[], metavar="STAGE=SGPR",
                     help="report the reads below this first root-argument SGPR per stage")
+    ap.add_argument("--pairs", action="store_true",
+                    help="compare the VS and PS of one technique (root-parameter visibility, D3D-318)")
     a = ap.parse_args(argv)
     if a.json:
         try:
@@ -156,10 +239,28 @@ def main(argv=None):
               f"{('s%d' % top) if top is not None else '-'} {s['lowest_pointer_sgpr']}; kinds {s['lowest_pointer_kind']}; "
               f"pointer gaps {s['pointer_gap']}; after a ptr32 {s['after_ptr32']}"
               + (f"; below base {s['below_base']}" if "below_base" in s else ""))
+    report = summary
+    if a.pairs:
+        pc = pair_census(index)
+        ctl = pc["control_all_vs_ps"]
+        def share(same, diff):
+            return f"{diff / (same + diff):.1%}" if same + diff else "-"
+        print(f"VS/PS pairs: {pc['techniques_with_vs_and_ps']} techniques with both stages ({pc['vs_in_pairs']} VS, "
+              f"{pc['ps_in_pairs']} PS), {pc['combinations']} combinations, {pc['combinations_sharing_an_sgpr']} "
+              f"sharing an SGPR, {pc['identical_read_maps']} with identical read maps")
+        print(f"  SGPRs both read: same kind {pc['shared_same_kind']}, different kind {pc['shared_different_kind']} "
+              f"({share(pc['shared_same_kind'], pc['shared_different_kind'])} different)")
+        print(f"  above an SGPR only one stage reads ({pc['combinations_with_a_one_sided_sgpr_below_a_shared_one']} "
+              f"combinations): same kind {pc['above_one_sided_same_kind']}, different kind "
+              f"{pc['above_one_sided_different_kind']}")
+        print(f"  control, all {ctl['combinations']} VS x PS combinations: same kind {ctl['shared_same_kind']}, "
+              f"different kind {ctl['shared_different_kind']} "
+              f"({share(ctl['shared_same_kind'], ctl['shared_different_kind'])} different)")
+        report = {**summary, "vs_ps_pairs": pc}
     if a.json:
         try:
             with open(a.json, "w", encoding="utf-8", newline="\n") as f:
-                json.dump(summary, f, indent=1, sort_keys=True)
+                json.dump(report, f, indent=1, sort_keys=True)
         except OSError as e:
             print(f"ERROR: cannot write {a.json}: {e.strerror or e}", file=sys.stderr)
             return 2
