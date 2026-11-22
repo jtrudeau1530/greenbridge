@@ -347,7 +347,9 @@ def plan_outputs(items, src, out, ffmpeg):
     def allocate(i, base):
         """Give input i the first unreserved name of base, base~2, ... that is free or holds its audio."""
         base_key = key(base)
-        stem, n = base, counters.get(base_key, 2)
+        first = counters.get(base_key, 2)
+        stem, n = (base, 2) if first == 2 else (f"{base}~{first}", first + 1)
+        skipped_unreserved = False
         while True:
             candidate = key(stem)
             if candidate not in reserved:
@@ -355,9 +357,10 @@ def plan_outputs(items, src, out, ffmpeg):
                     raise OSError(f"cannot distinguish names in a read-only directory and verify {stem}.wav")
                 if holds_own_audio(i, stem):
                     break
-                reserved[candidate] = i
+                skipped_unreserved = True
             stem, n = f"{base}~{n}", n + 1
-        counters[base_key] = n
+        if not skipped_unreserved:
+            counters[base_key] = n
         reserved[candidate] = i
         named[i] = (named[i][0], stem)
 
