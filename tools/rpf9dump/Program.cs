@@ -12,18 +12,24 @@ string baseName = Path.GetFileNameWithoutExtension(src);
 string outDir = Path.Combine(outRoot, baseName); Directory.CreateDirectory(outDir);
 long length = new FileInfo(src).Length;
 int ok = 0, fail = 0, skip = 0;
+// Every mode below works on all cores. Core's readers open their own read handle per call, entry and file names
+// come from offsets and indexes, and results are put back in source order, so outputs match a one-thread run.
+// ponytail: every core, no flag; add --jobs if someone needs the machine during a build.
+var par = new ParallelOptions { MaxDegreeOfParallelism = Environment.ProcessorCount };
 
 if (mode == "ttpf")
 {
     var info = TtpfReader.Inspect(src);
-    var rows = new List<object>();
-    foreach (var t in info.Textures)
+    var rows = new object[info.Textures.Count];
+    int done = 0;
+    Parallel.For(0, info.Textures.Count, par, i =>
     {
+        var t = info.Textures[i];
         string name = $"{t.Index:D6}_{Util.Safe(Path.GetFileNameWithoutExtension(t.Name))}.dds";
         string path = Path.Combine(outDir, name);
         string? file = t.CanExtract ? name : null, limitation = t.Limitation;
-        if (!t.CanExtract) skip++;
-        else if (File.Exists(path)) ok++;
+        if (!t.CanExtract) Interlocked.Increment(ref skip);
+        else if (File.Exists(path)) Interlocked.Increment(ref ok);
         else
         {
             try
@@ -33,14 +39,15 @@ if (mode == "ttpf")
                 byte[]? dds = null;
                 try { dds = TtpfReader.CreateDds(src, t.Index); }
                 catch (Exception e) when (e is NotSupportedException or InvalidDataException)
-                { skip++; file = null; limitation = e.Message; }
-                if (dds != null) { Util.WriteAllBytes(path, dds); ok++; }
+                { Interlocked.Increment(ref skip); file = null; limitation = e.Message; }
+                if (dds != null) { Util.WriteAllBytes(path, dds); Interlocked.Increment(ref ok); }
             }
-            catch (Exception e) { fail++; if (fail <= 5) Console.WriteLine($"  fail {t.Index}: {e.GetType().Name} {e.Message}"); }
-            if ((ok + fail) % 5000 == 0) Console.WriteLine($"  {ok + fail}/{info.Textures.Count}");
+            catch (Exception e) { if (Interlocked.Increment(ref fail) <= 5) Console.WriteLine($"  fail {t.Index}: {e.GetType().Name} {e.Message}"); }
+            int n = Interlocked.Increment(ref done);
+            if (n % 5000 == 0) Console.WriteLine($"  {n}/{info.Textures.Count}");
         }
-        rows.Add(new { t.Index, t.Name, t.Id, AssetKey = t.AssetKey.ToString("X16"), t.Width, t.Height, t.DxgiFormat, t.Mips, t.SourceMips, t.BaseMipLevel, Limitation = limitation, File = file });
-    }
+        rows[i] = new { t.Index, t.Name, t.Id, AssetKey = t.AssetKey.ToString("X16"), t.Width, t.Height, t.DxgiFormat, t.Mips, t.SourceMips, t.BaseMipLevel, Limitation = limitation, File = file };
+    });
     // The manifest is the build's completion marker. Keep successful DDS for retry, but withdraw a stale marker.
     string manifest = Path.Combine(outDir, "manifest.json");
     if (fail == 0)
@@ -66,7 +73,7 @@ else if (mode == "audio")
     for (int i = 0; i < todo.Count; i += 500)
         doc.ExtractAsync(todo.Skip(i).Take(500), sub).GetAwaiter().GetResult();
     ok = banks.Count;
-    var rows = banks.Select(e => { var info = AwcInfo.Inspect(src, e.Offset, e.Size);
+    var rows = banks.AsParallel().AsOrdered().WithDegreeOfParallelism(par.MaxDegreeOfParallelism).Select(e => { var info = AwcInfo.Inspect(src, e.Offset, e.Size);
         return new { e.Path, e.Offset, e.Size, Streams = info?.Streams.Select(s => new { s.Index, Id = s.Id.ToString("X8"), s.Codec, s.Channels, s.SampleRate, s.DurationSeconds, s.IsStreamed }) }; }).ToList();
     Util.WriteAllText(Path.Combine(outDir, "audio_manifest.json"), JsonSerializer.Serialize(new { src, Count = banks.Count, Banks = rows }, json));
 }
@@ -76,20 +83,20 @@ else if (mode == "xma")
     var doc = ArchiveReader.Open(src);
     var banks = doc.Entries.Where(e => e.Extension == ".awc" && e.CanExtract).ToList();
     string sub = Path.Combine(outDir, "xma"); Directory.CreateDirectory(sub);
-    foreach (var e in banks)
+    Parallel.ForEach(banks, par, e =>
     {
         var info = AwcInfo.Inspect(src, e.Offset, e.Size);
-        if (info == null) continue;
+        if (info == null) return;
         foreach (var st in info.Streams.Where(x => x.Codec == 5))
         {
             string dir = Path.Combine(sub, Util.Safe(Path.GetFileNameWithoutExtension(e.Name)));
             Directory.CreateDirectory(dir);
             string path = Path.Combine(dir, $"{st.Id:X8}.xma.wav");
-            if (File.Exists(path)) { ok++; continue; }
-            try { Util.WriteAtomic(path, tmp => AwcRecovery.WriteXmaWave(src, e.Offset, e.Size, st.Index, tmp)); ok++; }
-            catch (Exception ex) { fail++; if (fail <= 5) Console.WriteLine($"  fail {e.Name}#{st.Index}: {ex.GetType().Name} {ex.Message}"); }
+            if (File.Exists(path)) { Interlocked.Increment(ref ok); continue; }
+            try { Util.WriteAtomic(path, tmp => AwcRecovery.WriteXmaWave(src, e.Offset, e.Size, st.Index, tmp)); Interlocked.Increment(ref ok); }
+            catch (Exception ex) { if (Interlocked.Increment(ref fail) <= 5) Console.WriteLine($"  fail {e.Name}#{st.Index}: {ex.GetType().Name} {ex.Message}"); }
         }
-    }
+    });
     // make_game marks audio/xma done on exit 0, so a failed stream must fail the run to be retried.
     Console.WriteLine($"{mode} {baseName}: ok={ok} fail={fail} skip={skip} in {sw.Elapsed.TotalSeconds:0}s");
     return fail != 0 ? 1 : 0;
@@ -105,15 +112,18 @@ else if (mode is "models" or "textures")
         var prog = new Progress<long>(p => { long s = p / (4L << 30); if (s != last) { last = s; Console.WriteLine($"  scan {100.0 * p / length:0.0}%"); } });
         var cands = mode == "models" ? Rpf9ModelRecovery.FindCandidateOffsets(src, progress: prog) : Rpf9TextureRecovery.FindCandidateOffsets(src, progress: prog);
         Console.WriteLine($"  candidates {cands.Count:N0} ({sw.Elapsed.TotalSeconds:0}s)");
-        var entries = new List<ArchiveEntry>();
-        for (int i = 0; i < cands.Count; i += 32)
+        // Indexes are reassigned in offset order below, so the chunks' scheduling does not show in the result.
+        var chunks = cands.Chunk(32).ToArray();
+        var got = new IReadOnlyList<ArchiveEntry>[chunks.Length];
+        int validated = 0, found = 0;
+        Parallel.For(0, chunks.Length, par, i =>
         {
-            var chunk = cands.Skip(i).Take(32).ToArray();
-            var got = mode == "models" ? Rpf9ModelRecovery.RecoverAtOffsets(src, length, chunk, entries.Count) : Rpf9TextureRecovery.RecoverAtOffsets(src, length, chunk, entries.Count);
-            entries.AddRange(got);
-            if ((i / 32) % 200 == 0) Console.WriteLine($"  validated {i + chunk.Length:N0}/{cands.Count:N0} -> {entries.Count:N0} ({sw.Elapsed.TotalSeconds:0}s)");
-        }
-        entries = entries.OrderBy(e => e.Offset).Select((e, k) => e with { Index = k }).ToList();
+            got[i] = mode == "models" ? Rpf9ModelRecovery.RecoverAtOffsets(src, length, chunks[i]) : Rpf9TextureRecovery.RecoverAtOffsets(src, length, chunks[i]);
+            Interlocked.Add(ref found, got[i].Count);
+            int n = Interlocked.Add(ref validated, chunks[i].Length);
+            if (n / 6400 != (n - chunks[i].Length) / 6400) Console.WriteLine($"  validated {n:N0}/{cands.Count:N0} -> {Volatile.Read(ref found):N0} ({sw.Elapsed.TotalSeconds:0}s)");
+        });
+        var entries = got.SelectMany(g => g).OrderBy(e => e.Offset).Select((e, k) => e with { Index = k }).ToList();
         RecoveryIndexCache.Save(mode, src, entries, ScanCounts.Coverage(cands.Count, entries.Select(e => e.Offset).Distinct().Count()));
         candidates = cands.Count;
     }
@@ -148,8 +158,35 @@ else if (mode is "models" or "textures")
     void Row(object row) => JsonSerializer.Serialize(writer, row, json);
     int embedded = 0;
     var modelDecodeFailures = new SortedDictionary<string, int>(StringComparer.Ordinal);
-    foreach (var e in list)
+    // Entries are decoded and written in parallel a batch at a time; rows, counters and failure messages are then
+    // taken in list order on this thread, so the manifest and the log read as a one-thread run. The batch bounds
+    // how many rows (and the models they reference) are alive at once.
+    const int Batch = 1024;
+    var results = new Result[Batch];
+    for (int start = 0; start < list.Count; start += Batch)
     {
+        int n = Math.Min(Batch, list.Count - start);
+        Parallel.For(0, n, par, i => results[i] = Export(list[start + i]));
+        for (int i = 0; i < n; i++)
+        {
+            var r = results[i]; results[i] = default;
+            ok += r.Ok; fail += r.Fail; embedded += r.Embedded;
+            if (r.DecodeFailure is { } reason)
+            {
+                int count = modelDecodeFailures.GetValueOrDefault(reason.Code) + 1;
+                modelDecodeFailures[reason.Code] = count;
+                if (count <= 3)
+                    Console.Error.WriteLine($"  model decode failed at 0x{list[start + i].Offset:X}: {reason.Code} ({reason.Detail})");
+            }
+            if (r.Error != null && fail <= 5) Console.WriteLine(r.Error);
+            if (r.Row != null) Row(r.Row);
+        }
+        Console.WriteLine($"  exported {start + n:N0}/{list.Count:N0}");
+    }
+
+    Result Export(ArchiveEntry e)
+    {
+        int ok = 0, fail = 0, embedded = 0;
         string stem = Util.Safe(Path.GetFileNameWithoutExtension(e.Name));
         try
         {
@@ -160,15 +197,7 @@ else if (mode is "models" or "textures")
             {
                 var m = RageModelDecoder.Decode(sys, gfx, e.ResourceDrawableOffset);
                 if (m == null)
-                {
-                    var reason = ModelDecodeFailure.Explain(sys, gfx.Length);
-                    int count = modelDecodeFailures.GetValueOrDefault(reason.Code) + 1;
-                    modelDecodeFailures[reason.Code] = count;
-                    if (count <= 3)
-                        Console.Error.WriteLine($"  model decode failed at 0x{e.Offset:X}: {reason.Code} ({reason.Detail})");
-                    fail++;
-                    continue;
-                }
+                    return new Result(null, 0, 1, 0, ModelDecodeFailure.Explain(sys, gfx.Length), null);
                 string obj = Path.Combine(sub, stem + ".obj");
                 if (!File.Exists(obj)) Util.WriteAllText(obj, RageModelDecoder.CreateObj(m));
                 if (m.EmbeddedTextures != null && m.EmbeddedTextureDictionaryOffset is int dOff)
@@ -181,29 +210,29 @@ else if (mode is "models" or "textures")
                         try { Util.WriteAllBytes(p, Util.BgraDds(RageTextureDecoder.DecodeEmbeddedTexturePixels(sys, gfx, dOff, t.Index))); embedded++; } catch { }
                     }
                 }
-                Row(new { e.Offset, Drawable = e.ResourceDrawableOffset, File = stem + ".obj", m.Name, Meshes = m.Meshes.Count, Verts = m.Meshes.Sum(x => x.Positions.Count), Tris = m.Meshes.Sum(x => x.Indices.Count) / 3, m.IsFragment, m.HasBoneBindings,
+                return new Result(new { e.Offset, Drawable = e.ResourceDrawableOffset, File = stem + ".obj", m.Name, Meshes = m.Meshes.Count, Verts = m.Meshes.Sum(x => x.Positions.Count), Tris = m.Meshes.Sum(x => x.Indices.Count) / 3, m.IsFragment, m.HasBoneBindings,
                     Min = new[] { m.BoundsMin.X, m.BoundsMin.Y, m.BoundsMin.Z }, Max = new[] { m.BoundsMax.X, m.BoundsMax.Y, m.BoundsMax.Z },
                     MeshShaders = m.Meshes.Select(x => x.ShaderIndex).ToArray(),
                     Embedded = m.EmbeddedTextures?.Select(t => new { t.Index, t.Name, t.Width, t.Height, t.Format, Hash = t.NameHash.ToString("X8"), Key = t.AssetKey?.ToString("X16") }).ToArray(),
                     Materials = m.Materials?.Select(x => new { x.ShaderIndex, Shader = x.ShaderHash.ToString("X8"), Preset = x.PresetHash.ToString("X8"), x.RenderBucket,
-                        Textures = x.Textures.Select(r => new { Param = r.ParameterHash.ToString("X8"), r.TextureIndex, Name = r.NameHash.ToString("X8"), Id64 = r.OpaqueId64.ToString("X16"), Tag = r.Tag.ToString("X8") }).ToArray() }).ToArray() });
-                ok++;
+                        Textures = x.Textures.Select(r => new { Param = r.ParameterHash.ToString("X8"), r.TextureIndex, Name = r.NameHash.ToString("X8"), Id64 = r.OpaqueId64.ToString("X16"), Tag = r.Tag.ToString("X8") }).ToArray() }).ToArray() },
+                    1, 0, embedded, null, null);
             }
             else
             {
                 var dict = RageTextureDecoder.Inspect(sys, gfx);
-                if (dict == null) { fail++; continue; }
+                if (dict == null) return new Result(null, 0, 1, 0, null, null);
                 string td = Path.Combine(sub, stem); Directory.CreateDirectory(td);
                 foreach (var t in dict.Textures)
                 {
                     string p = Path.Combine(td, $"{t.Index:D3}_{Util.Safe(t.Name)}.dds");
                     try { if (!File.Exists(p)) Util.WriteAllBytes(p, RageTextureDecoder.CreateDds(sys, gfx, t.Index)); ok++; } catch { fail++; }
                 }
-                Row(new { e.Offset, Dir = stem, Textures = dict.Textures.Select(t => new { t.Index, t.Name, t.Width, t.Height, t.Format, t.MipCount, Hash = t.NameHash.ToString("X8"), Key = t.AssetKey?.ToString("X16") }).ToArray() });
+                return new Result(new { e.Offset, Dir = stem, Textures = dict.Textures.Select(t => new { t.Index, t.Name, t.Width, t.Height, t.Format, t.MipCount, Hash = t.NameHash.ToString("X8"), Key = t.AssetKey?.ToString("X16") }).ToArray() },
+                    ok, fail, 0, null, null);
             }
         }
-        catch (Exception ex) { fail++; if (fail <= 5) Console.WriteLine($"  fail {e.Name}: {ex.GetType().Name} {ex.Message}"); }
-        if ((ok + fail) % 1000 == 0) Console.WriteLine($"  exported {ok + fail:N0}/{list.Count:N0}");
+        catch (Exception ex) { return new Result(null, ok, fail + 1, embedded, null, $"  fail {e.Name}: {ex.GetType().Name} {ex.Message}"); }
     }
     if (mode == "models") Console.WriteLine($"  embedded textures {embedded:N0}");
     writer.WriteEndArray();
@@ -221,3 +250,6 @@ else if (mode is "models" or "textures")
 }
 Console.WriteLine($"{mode} {baseName}: ok={ok} fail={fail} skip={skip} in {sw.Elapsed.TotalSeconds:0}s");
 return mode == "ttpf" && fail != 0 ? 1 : 0;
+
+// One exported entry: its manifest row (null when nothing was written), counts, and a failure to report in order.
+readonly record struct Result(object? Row, int Ok, int Fail, int Embedded, ModelDecodeFailure? DecodeFailure, string? Error);

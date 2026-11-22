@@ -205,6 +205,8 @@ int main() {
     CHECK(vulkan_view_format(VK_FORMAT_D32_SFLOAT, 22) == VK_FORMAT_D32_SFLOAT);
     CHECK(vulkan_view_format(VK_FORMAT_BC1_RGBA_UNORM_BLOCK, 170) == VK_FORMAT_BC1_RGBA_SRGB_BLOCK);
     CHECK(vulkan_view_format(VK_FORMAT_R8G8B8A8_UNORM, 22) == VK_FORMAT_UNDEFINED);
+    CHECK(vulkan_view_format(VK_FORMAT_R8G8B8A8_UNORM, 22, true) == VK_FORMAT_R32_SFLOAT);
+    CHECK(vulkan_view_format(VK_FORMAT_R8G8B8A8_UINT, 20, true) == VK_FORMAT_R32_UINT);
     CHECK(vulkan_view_format(VK_FORMAT_UNDEFINED, 56) == VK_FORMAT_UNDEFINED);
 
     // DST_SEL as a component mapping.

@@ -326,8 +326,20 @@ int test_change_tracking() {
     EXPECT(table.capacity() > before);
     EXPECT(table.take_changes().all);
 
-    // Out-of-range slots are refused rather than read past the table.
+    // Out-of-range and wrapping uint32 slot ranges are refused rather than read past the table.
     EXPECT(!table.read_slot(std::uint32_t(table.capacity()), read));
+    EXPECT(!table.read_slots(UINT32_MAX, 1, read));
+    EXPECT(!table.read_slots(UINT32_MAX - 2, 4, read));
+    EXPECT(!table.read_slots(0, 1, nullptr));
+    EXPECT(table.read_slots(0, 0, nullptr));
+
+    // Direct write_to_buffer matches build_gpu_buffer byte-for-byte for both clear_pad modes.
+    for (bool clear_pad : {false, true}) {
+        const auto expected = table.build_gpu_buffer(clear_pad);
+        std::vector<std::uint32_t> direct(table.size_dwords(), 0xccccccccu);
+        table.write_to_buffer(direct.data(), clear_pad);
+        EXPECT(direct == expected);
+    }
     return 0;
 }
 

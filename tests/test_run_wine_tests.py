@@ -136,6 +136,18 @@ class RunTestTest(unittest.TestCase):
         self.assertEqual(status, "skip")
         self.assertIn("exit 77", detail)
 
+    def test_a_signal_termination_fails_even_under_will_fail_or_skip(self):
+        # A host signal is reported as a failure, not reinterpreted by WILL_FAIL or SKIP_RETURN_CODE.
+        # The mocked negative returncode keeps the test portable across Windows and POSIX.
+        exe = self.exiting(0)
+        fake = mock.Mock(returncode=-11, stdout=b"")
+        entry = ctest_entry("segv", self.command_for(exe),
+                            {"WILL_FAIL": "1", "SKIP_RETURN_CODE": "77"})
+        with mock.patch.object(rwt.subprocess, "run", return_value=fake):
+            status, detail = self.run_entry(entry)
+        self.assertEqual(status, "fail")
+        self.assertIn("signal 11", detail)
+
     def test_a_timeout_is_reported_without_hanging(self):
         slow = self.program("slow.py", "import time\ntime.sleep(5)\n")
         self.args.timeout = 0.2

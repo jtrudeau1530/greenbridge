@@ -3,7 +3,7 @@
 Usage:
     python -I serve.py [--world DIR] [--port 8765]
 
-`--world` is the folder holding world.json and the .glb chunks (default <work>\\world). It's served at
+`--world` is the folder holding world.json and the .glb chunks, typically <work>\\world. It's served at
 /world/ so game-derived files never need to live in this repo. Without it, the viewer shows test terrain.
 """
 from __future__ import annotations
@@ -136,11 +136,13 @@ def port_number(text: str) -> int:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--world", default=r"<work>\world")
+    ap.add_argument("--world", help="exported world directory (omit to show test terrain)")
     ap.add_argument("--port", type=port_number, default=8765,
                     help="0 asks the OS for a free port; the bound port is printed")
     a = ap.parse_args()
-    Handler.world = a.world if os.path.isdir(a.world) else None
+    if a.world is not None and not os.path.isdir(a.world):
+        ap.error(f"--world is not a directory: {a.world}")
+    Handler.world = a.world
     try:
         srv = http.server.ThreadingHTTPServer(("127.0.0.1", a.port), functools.partial(Handler, directory=HERE))
     except OSError as e:

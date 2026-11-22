@@ -595,6 +595,57 @@ class AwcAndArchiveScanTest(unittest.TestCase):
             self.assertEqual(result.returncode, 2, result.stderr)
             self.assertIn("output must not overwrite the source file", result.stderr)
 
+    def test_window_edges_inside_a_bank(self):
+        """--start/--limit inside a bank: adat_bytes stays within the span, and RSC8 headers in a bank that
+        started before the window are not reported as outside ADAT."""
+        c0 = build_synthetic_rsc8(stream_hash=0x20112233, frames=142)
+        c1 = build_synthetic_rsc8(stream_hash=0x80778899, frames=74, inline_dict_name=True)
+        bank = build_synthetic_awc([
+            {"id": 0x00112233, "rsc8": c0, "samples": 89600},
+            {"id": 0x00778899, "rsc8": c1, "samples": 28800},
+        ])
+        stray = build_synthetic_rsc8(stream_hash=0x11112222, frames=61)
+        with tempfile.TemporaryDirectory() as tmp:
+            rpf = os.path.join(tmp, "synth.rpf")
+            with open(rpf, "wb") as f:
+                f.write(b"9FPR" + struct.pack("<III", 0x100, 0, 0) + bytes(0xF0))
+                boff = f.tell()
+                f.write(bank)
+                f.write(bytes(0x80))
+                soff = f.tell()
+                f.write(stray)
+            _, full = rsc8_audio.scan_rpf(rpf)
+            bank_size = full["adat_bytes"]
+            self.assertGreater(bank_size, 4 * 256)
+
+            # The window ends halfway through the bank: decoded whole, counted up to the window's end.
+            _, w = rsc8_audio.scan_rpf(rpf, start=boff, limit=bank_size // 2)
+            self.assertEqual((w["adat_banks"], w["rsc8_in_adat"]), (1, 2))
+            self.assertEqual(w["adat_bytes"], w["span"])
+            self.assertEqual((w["adat_banks_past_window"], w["adat_bytes_past_window"]),
+                             (1, bank_size - bank_size // 2))
+            # The rest of the bank, in the next window, completes the archive's ADAT bytes.
+            _, rest = rsc8_audio.scan_rpf(rpf, start=boff + bank_size // 2)
+            self.assertEqual(w["adat_bytes"] + rest["adat_bytes"], bank_size)
+            self.assertEqual(rest["adat_banks"], 0)
+
+            # The window starts inside the bank (looked back over several scan chunks): only the stray clip
+            # after the bank is outside ADAT.
+            old_chunk = rsc8_audio.SCAN_CHUNK_BYTES
+            try:
+                rsc8_audio.SCAN_CHUNK_BYTES = 256
+                for st in (boff + 16, boff + bank_size - 64):
+                    _, w = rsc8_audio.scan_rpf(rpf, start=st)
+                    self.assertEqual((w["adat_banks"], w["rsc8_outside_adat"]), (0, 1), st)
+                    self.assertEqual(w["window_starts_in_bank"], boff)
+                    self.assertEqual(w["adat_bytes"], boff + bank_size - st)
+                # Past the bank's end, no bank covers the start.
+                _, w = rsc8_audio.scan_rpf(rpf, start=soff - 0x40)
+            finally:
+                rsc8_audio.SCAN_CHUNK_BYTES = old_chunk
+            self.assertEqual((w["rsc8_outside_adat"], w["window_starts_in_bank"]), (1, None))
+            self.assertEqual((full["adat_banks_past_window"], full["window_starts_in_bank"]), (0, None))
+
     def test_cli_validation_errors(self):
         with tempfile.TemporaryDirectory() as tmp:
             missing = os.path.join(tmp, "missing.rpf")
@@ -667,7 +718,110 @@ class AwcAndArchiveScanTest(unittest.TestCase):
                 with open(out_json, encoding="utf-8") as f:
                     rep = json.load(f)
                 self.assertEqual(rep["records"], [])
-                self.assertGreaterEqual(rep["summary"]["rsc8_valid"], 1)
+
+def build_synthetic_empty_bank(flags=0xFF210001, hdr_sz=20):
+    """Build a synthetic zero-stream ADAT bank whose flag-selected tables fill the header exactly.
+
+    With `count == 0` the `0x10000` table contributes no bytes and `0x200000` adds `(count + 1) * 4`
+    bytes, so the header is the 16-byte prefix plus 4 bytes when that bit is set (the measured
+    20-byte shape), or exactly 16 bytes with no table flags.
+    """
+    if flags & 0x00400000:
+        raise ValueError("synthetic shape does not model the 0x400000 table")
+    expected = 16 + (4 if flags & 0x00200000 else 0)
+    if hdr_sz != expected:
+        raise ValueError(f"tables end at {expected}, not {hdr_sz}")
+    return b"ADAT" + struct.pack("<III", flags, 0, hdr_sz) + bytes(hdr_sz - 16)
+
+
+class ZeroStreamBankTest(unittest.TestCase):
+    def test_parses_when_tables_fill_the_header(self):
+        bank20 = build_synthetic_empty_bank()
+        parsed = rsc8_audio.parse_adat_header_bytes(bank20, 0, len(bank20))
+        self.assertIsNotNone(parsed)
+        self.assertEqual(parsed["count"], 0)
+        self.assertEqual(parsed["header_size"], 20)
+        self.assertEqual(parsed["end"], 20)
+        self.assertEqual(parsed["entries"], [])
+
+        bank16 = build_synthetic_empty_bank(flags=0, hdr_sz=16)
+        parsed16 = rsc8_audio.parse_adat_header_bytes(bank16, 0, len(bank16))
+        self.assertIsNotNone(parsed16)
+        self.assertEqual(parsed16["header_size"], 16)
+        self.assertEqual(parsed16["end"], 16)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "empty.awc")
+            with open(path, "wb") as f:
+                f.write(bank20)
+            with open(path, "rb") as f:
+                from_file = rsc8_audio.parse_adat_at_file(f, 0, os.path.getsize(path))
+            self.assertIsNotNone(from_file)
+            self.assertEqual(from_file["count"], 0)
+
+    def test_rejects_header_slop_and_truncation(self):
+        # Declared size 24 but the flag-selected tables end at 20: unaccounted bytes.
+        slop = b"ADAT" + struct.pack("<III", 0xFF210001, 0, 24) + bytes(8)
+        self.assertIsNone(rsc8_audio.parse_adat_header_bytes(slop, 0, len(slop)))
+
+        # Header says 20 but the buffer/file is shorter.
+        short = build_synthetic_empty_bank()[:18]
+        self.assertIsNone(rsc8_audio.parse_adat_header_bytes(short, 0, len(short)))
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "short.awc")
+            with open(path, "wb") as f:
+                f.write(short)
+            with open(path, "rb") as f:
+                self.assertIsNone(rsc8_audio.parse_adat_at_file(f, 0, os.path.getsize(path)))
+
+        # A zero count cannot rescue an out-of-bounds header.
+        oob = build_synthetic_empty_bank()
+        self.assertIsNone(rsc8_audio.parse_adat_header_bytes(oob, 8, len(oob)))
+
+    def test_decode_and_scan_count_empty_banks(self):
+        empty = build_synthetic_empty_bank()
+        decoded = rsc8_audio.decode_awc_bank(empty)
+        self.assertEqual(decoded["stream_count"], 0)
+        self.assertEqual(decoded["records"], [])
+        self.assertEqual(decoded["bank_size"], 20)
+
+        clip = build_synthetic_rsc8(stream_hash=0x20112233, frames=90)
+        speech = build_synthetic_awc([{"id": 0x00112233, "rsc8": clip, "samples": 48000}])
+        with tempfile.TemporaryDirectory() as tmp:
+            rpf = os.path.join(tmp, "synth.rpf")
+            with open(rpf, "wb") as f:
+                f.write(b"9FPR" + struct.pack("<III", 0x100, 0, 0) + bytes(0xF0))
+                f.write(speech)
+                f.write(bytes(0x40))
+                f.write(empty)
+                f.write(bytes(0x40))
+
+            records, summary = rsc8_audio.scan_rpf(rpf)
+            self.assertEqual(summary["adat_banks"], 2)
+            self.assertEqual(summary["adat_streams"], 1)
+            self.assertEqual(summary["rsc8_in_adat"], 1)
+            self.assertEqual(summary["rsc8_valid"], 1)
+            self.assertEqual(summary["rsc8_outside_adat"], 0)
+            self.assertEqual(len(records), 1)
+
+            # A directory scan sees the empty bank as a valid bank with no records, not an
+            # invalid file.
+            awc_path = os.path.join(tmp, "empty.awc")
+            with open(awc_path, "wb") as f:
+                f.write(empty)
+            out_json = os.path.join(tmp, "report.json")
+            cp = subprocess.run(
+                [sys.executable, "-I", TOOL, tmp, out_json, "--quiet"],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(cp.returncode, 0, cp.stderr)
+            with open(out_json, encoding="utf-8") as f:
+                rep = json.load(f)
+            self.assertEqual(rep["summary"]["adat_banks"], 1)
+            self.assertEqual(rep["summary"]["invalid_files"], 0)
+            self.assertEqual(rep["summary"]["rsc8_in_adat"], 0)
+            self.assertEqual(rep["records"], [])
 
 
 if __name__ == "__main__":

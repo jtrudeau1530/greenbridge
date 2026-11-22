@@ -137,9 +137,7 @@ D3D12_RESOURCE_BARRIER transition(ID3D12Resource* resource, D3D12_RESOURCE_STATE
 
 int main() {
     vktest::Device d;
-    const auto device_status = d.initialize();
-    if (device_status == vktest::DeviceStatus::unavailable) return 77;   // no Vulkan GPU: ctest skips
-    if (device_status != vktest::DeviceStatus::ready) return 1;
+    EXPECT(d.create());
 
     // The shader program the PSO carries, and a translator index that maps its hash to the test module.
     constexpr std::uint32_t code_word = 5000;

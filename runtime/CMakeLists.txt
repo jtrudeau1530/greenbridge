@@ -570,6 +570,9 @@ if(BUILD_TESTING)
         PASS_REGULAR_EXPRESSION "usage: gta6rt"
         FAIL_REGULAR_EXPRESSION "running |module\\(s\\) mapped")
     endforeach()
+    # The opt-in checks, one test each: thread_local on the game's threads, a C++ exception caught inside the image.
+    add_test(NAME run_tiny_game_tls COMMAND gta6rt --run $<TARGET_FILE:tiny_game> -- hello 42 tls)
+    add_test(NAME run_tiny_game_eh COMMAND gta6rt --run $<TARGET_FILE:tiny_game> -- hello 42 eh)
   endif()
   if(WIN32 AND TARGET root_signature_test)
     add_test(NAME root_signature COMMAND root_signature_test)
@@ -726,8 +729,8 @@ if(TARGET Vulkan::Headers)
       COMMAND "${Python3_EXECUTABLE}" -I ${CMAKE_CURRENT_SOURCE_DIR}/../tools/gen_d3d12_stubs.py --out ${LEONIDA_STUBS}
               ${_stubs_header}
               ID3D12GraphicsCommandList8 ID3D12CommandQueue ID3D12CommandAllocator ID3D12Fence1
-              ID3D12Device11 ID3D12DescriptorHeap ID3D12Resource ID3D12QueryHeap ID3D12CommandSignature
-              ID3D12RootSignature ID3D12PipelineState
+              ID3D12Device11 ID3D12DescriptorHeap ID3D12Heap ID3D12Resource ID3D12QueryHeap ID3D12RootSignature
+              ID3D12PipelineState ID3D12CommandSignature
       DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/../tools/gen_d3d12_stubs.py ${LEONIDA_D3D12_HEADER}
       COMMENT "Generating D3D12 COM stubs"
       VERBATIM)
@@ -777,7 +780,7 @@ if(TARGET Vulkan::Headers)
 
     # The Vulkan device behind the Xbox-ABI proxy, end to end.
     add_executable(d3d12_vulkan_device_test test/d3d12_vulkan_device_test.cpp)
-    target_link_libraries(d3d12_vulkan_device_test PRIVATE gta6rt_d3d12_com)
+    target_link_libraries(d3d12_vulkan_device_test PRIVATE gta6rt_d3d12_com dxguid)  # IID_ID3D12MetaCommand (#1440)
     target_compile_definitions(d3d12_vulkan_device_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(d3d12_vulkan_device_test PRIVATE /W4 /permissive- /utf-8)
     add_test(NAME d3d12_vulkan_device COMMAND d3d12_vulkan_device_test)
@@ -1006,17 +1009,18 @@ if(TARGET Vulkan::Headers)
       # D3D12 API only.
       set(LEONIDA_M2_DIR ${CMAKE_CURRENT_BINARY_DIR}/generated/m2_shaders)
       set(LEONIDA_M2_FILES ${LEONIDA_M2_DIR}/spirv/index.json ${LEONIDA_M2_DIR}/fssm/vs_m2.fssm
-                           ${LEONIDA_M2_DIR}/fssm/ps_m2.fssm)
+                           ${LEONIDA_M2_DIR}/fssm/ps_m2.fssm ${LEONIDA_M2_DIR}/fssm/ps_m2_uoff.fssm)
       add_custom_command(
         OUTPUT ${LEONIDA_M2_FILES}
         COMMAND ${CMAKE_COMMAND} -E remove_directory ${LEONIDA_M2_DIR}
         COMMAND ${CMAKE_COMMAND} -E env "LLVM_MC=${LEONIDA_LLVM_MC}" "PATH=${LEONIDA_SPIRV_TOOLS_NATIVE};$ENV{PATH}"
                 $<TARGET_FILE:Python3::Interpreter> -I ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build.py
-                ${LEONIDA_M2_DIR} vs_m2 ps_m2
+                ${LEONIDA_M2_DIR} vs_m2 ps_m2 ps_m2_uoff
         DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build.py
                 ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/compute_fixture.py
                 ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/vs_m2.asm
                 ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/ps_m2.asm
+                ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/ps_m2_uoff.asm
                 ${CMAKE_CURRENT_SOURCE_DIR}/../tools/rdna2spirv.py
         COMMENT "Translating vs_m2 and ps_m2 for the textured draw test"
         VERBATIM)
@@ -1193,7 +1197,6 @@ if(TARGET Vulkan::Headers)
     else()
       message(STATUS "glslangValidator not found: d3d12_compute_test and d3d12_draw_test are not built")
     endif()
-
     # The loader can create this device instead of the host's (D3D12XboxCreateDevice, LEONIDA_D3D12=vulkan).
     if(TARGET gta6rt)
       target_link_libraries(gta6rt PRIVATE gta6rt_d3d12_com)

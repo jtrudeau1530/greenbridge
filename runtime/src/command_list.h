@@ -3,8 +3,8 @@
 // The command-list IR (docs/d3d12_vulkan.md section 3.2): what a D3D12 command list records, kept until
 // ExecuteCommandLists replays it on Vulkan (vulkan_replay.h). This slice covers legacy and enhanced barriers and
 // render-target, depth-stencil and unordered-access clears (whole views or rectangles), copies, resolves,
-// predication, discards, immediate buffer writes, atomic copies, queries, debug markers and dispatches. It has no
-// Windows or Vulkan dependency.
+// predication, discards, immediate buffer writes, atomic copies, queries, debug markers and dispatches. It has
+// no Windows or Vulkan dependency.
 
 #include <algorithm>
 #include <array>
@@ -151,7 +151,7 @@ inline constexpr std::uint32_t clear_stencil = 0x2;
 inline constexpr std::uint32_t texture_barrier_discard = 0x1;
 
 // Portable color-view interpretation. Other views inherit their resource format as before.
-enum class ColorViewFormat : std::uint32_t { resource, rgba8_unorm, rgba8_srgb, rgba8_uint };
+enum class ColorViewFormat : std::uint32_t { resource, rgba8_unorm, rgba8_srgb, rgba8_uint, rgba8_sint, rgba8_snorm };
 
 // D3D12_QUERY_HEAP_TYPE and D3D12_QUERY_TYPE.
 namespace d3d12_query_heap {

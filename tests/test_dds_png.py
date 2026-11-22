@@ -745,6 +745,17 @@ class DownscaleTests(unittest.TestCase):
         self.assertEqual((w, h), (1, 2))
         self.assertEqual([p[0] for p in pixels(out)], [5, 25])
 
+    def test_odd_extents_are_averaged_without_cropping(self):
+        line = b"".join(bytes((v, v, v, 255)) for v in (0, 0, 100, 200, 200))
+        for width, height in ((5, 1), (1, 5)):
+            with self.subTest(width=width, height=height):
+                w, h, out = dds.downscale_rgba(width, height, line, 2)
+                self.assertEqual((w, h), (max(1, width // 2), max(1, height // 2)))
+                self.assertEqual(pixels(out), [(20, 20, 20, 255), (180, 180, 180, 255)])
+
+        rgba = bytes(4 * 8) + bytes((90, 180, 0, 255))
+        self.assertEqual(dds.downscale_rgba(3, 3, rgba, 1), (1, 1, bytes((10, 20, 0, 28))))
+
     def test_repeated_halving(self):
         w, h, out = dds.downscale_rgba(8, 8, self.rgba_grid(8, 8), 2)
         self.assertEqual((w, h), (2, 2))

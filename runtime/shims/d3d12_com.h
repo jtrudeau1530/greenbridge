@@ -112,9 +112,9 @@ struct VulkanDeviceInfo {
     // The instance enabled VK_EXT_debug_utils: SetMarker/BeginEvent/EndEvent become debug labels. Otherwise they
     // do nothing.
     bool debug_utils = false;
-    // Vulkan 1.2 bufferDeviceAddress is enabled: buffers carry VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT, and
-    // buffers and shader-visible heaps live in the GPU address arena with console VAs (docs section 3.3), which
-    // GetGPUVirtualAddress returns. Without it, GetGPUVirtualAddress returns 0 and pipelines cannot be created.
+    // Vulkan 1.2 bufferDeviceAddress is enabled: buffers and shader-visible heaps then live in the GPU address
+    // arena and have console VAs (docs section 3.3), and GetGPUVirtualAddress returns those addresses; ray tracing
+    // needs it too. Without it, GetGPUVirtualAddress returns 0 and pipelines cannot be created.
     bool buffer_device_address = false;
     // Optional VK_KHR_acceleration_structure + VK_KHR_deferred_host_operations + VK_KHR_ray_query are enabled:
     // GetRaytracingAccelerationStructurePrebuildInfo and BuildRaytracingAccelerationStructure (BLAS + TLAS) work.

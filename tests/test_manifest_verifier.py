@@ -313,6 +313,11 @@ class TestManifestVerifier(unittest.TestCase):
         report_strict = mv.verify_manifest(self.game_dir, self.manifest_path, jobs=2, strict=True)
         self.assertFalse(report_strict.passed)
         self.assertEqual(report_strict.untracked, ["bonus.bin"])
+        self.assertEqual(report_strict.problem_count, 1)
+        self.assertEqual(report_strict.to_dict()["problem_count"], 1)
+        out = io.StringIO()
+        mv.print_report(report_strict, out=out)
+        self.assertIn("1 problem(s)", out.getvalue())
 
     def test_progress_reporting_callback_and_stream(self) -> None:
         progress_events: list[mv.ProgressInfo] = []
@@ -435,6 +440,10 @@ class TestManifestVerifier(unittest.TestCase):
         self.assertEqual(res_strict.returncode, 1)
         self.assertIn("NEW       new_file.dat", res_strict.stdout)
         self.assertIn("1 problem(s)", res_strict.stdout)
+
+        res_json = self.run_cli(self.game_dir, "--manifest", self.manifest_path, "--strict", "--json")
+        self.assertEqual(res_json.returncode, 1)
+        self.assertEqual(json.loads(res_json.stdout)["problem_count"], 1)
 
     def test_cli_strict_ignores_only_selected_in_tree_manifest(self) -> None:
         in_tree = self.write_manifest(os.path.join(self.game_dir, "nested", "manifest.json"), self.payloads)

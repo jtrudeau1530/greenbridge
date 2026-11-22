@@ -12,7 +12,9 @@ workgroups dispatched. Vertex v belongs to workgroup v / (3 * max_primitives), p
 corner v % 3. A primitive past the workgroup's count, or one marked culled, gets the same position outside the
 clip volume at all three corners, so it is clipped away. Otherwise the corner's vertex index (clamped to
 max_vertices - 1) selects the vertex whose position, clip and cull distances and params this shader outputs. The
-params go out at the locations the mesh shader used, so the pixel shader is unchanged.
+params go out at the locations the mesh shader used, so the pixel shader is unchanged. With rdna2spirv.py
+--f16-interp-fallback the layout also has "f16_halves" ({param: [low location, high location]}), and each of those
+params' f16 halves goes out decoded to f32 at those locations too, as a translated VS exports them.
 
     python -I tools/mesh_compute_vs.py <spirv dir>    # <name>.mesh_vs.spv per --mesh-compute MS in index.json
 
@@ -110,10 +112,25 @@ def vs_spvasm(layout):
     for loc, off in params:
         vals = load_floats("%vbase", off, 4)
         body += [f"%par{loc} = OpCompositeConstruct %v4float {' '.join(vals)}", f"OpStore %out{loc} %par{loc}"]
+    halves = sorted((int(k), [int(x) for x in v]) for k, v in lay.get("f16_halves", {}).items())
+    offsets = dict(params)
+    for loc, hlocs in halves:      # --f16-interp-fallback: each channel's two f16 halves decoded to f32
+        parts = ([], [])
+        for i in range(4):
+            w, h2 = load_word("%vbase", offsets[loc] + 4 * i), tmp("h")
+            body.append(f"{h2} = OpExtInst %v2float %glsl UnpackHalf2x16 {w}")
+            for half in (0, 1):
+                e = tmp("e")
+                body.append(f"{e} = OpCompositeExtract %float {h2} {half}")
+                parts[half].append(e)
+        for half, hloc in enumerate(hlocs):
+            body += [f"%hv{hloc} = OpCompositeConstruct %v4float {' '.join(parts[half])}",
+                     f"OpStore %out{hloc} %hv{hloc}"]
+    hout = [hloc for _, hlocs in halves for hloc in hlocs]
     body += ["OpReturn", "OpFunctionEnd"]
 
     outs = ["%out_pos"] + (["%out_clip"] if clip else []) + (["%out_cull"] if cull else []) + \
-        [f"%out{loc}" for loc, _ in params]
+        [f"%out{loc}" for loc, _ in params] + [f"%out{h}" for h in hout]
     caps = ["Shader", "Int64", "PhysicalStorageBufferAddresses"] + (["ClipDistance"] if clip else []) + \
         (["CullDistance"] if cull else [])
     head = [f"OpCapability {x}" for x in caps] + [
@@ -127,13 +144,13 @@ def vs_spvasm(layout):
         head.append("OpDecorate %out_clip BuiltIn ClipDistance")
     if cull:
         head.append("OpDecorate %out_cull BuiltIn CullDistance")
-    head += [f"OpDecorate %out{loc} Location {loc}" for loc, _ in params]
+    head += [f"OpDecorate %out{loc} Location {loc}" for loc in [p for p, _ in params] + hout]
     head += ["OpDecorate %arr_ud ArrayStride 4", "OpDecorate %PC Block", "OpMemberDecorate %PC 0 Offset 0"]
     head += [f"OpMemberDecorate %PC {k} Offset {4 * USER_SGPRS + 4 * (k - 1)}" for k in range(1, 7)]
     head += ["OpDecorate %rt_uint ArrayStride 4"]
     types = ["%void = OpTypeVoid", "%fn = OpTypeFunction %void", "%bool = OpTypeBool",
              "%uint = OpTypeInt 32 0", "%int = OpTypeInt 32 1", "%ulong = OpTypeInt 64 0",
-             "%float = OpTypeFloat 32", "%v4float = OpTypeVector %float 4"]
+             "%float = OpTypeFloat 32", "%v4float = OpTypeVector %float 4", "%v2float = OpTypeVector %float 2"]
     types += [f"{name} = OpConstant %uint {v}" for v, name in sorted(consts.items())]
     types += [f"{name} = OpConstant %ulong {v}" for v, name in sorted(ulongs.items())]
     types += [f"%n_ud = OpConstant %uint {USER_SGPRS}", "%arr_ud = OpTypeArray %uint %n_ud",
@@ -154,7 +171,7 @@ def vs_spvasm(layout):
         gvars.append("%out_clip = OpVariable %_ptr_Out_clip Output")
     if cull:
         gvars.append("%out_cull = OpVariable %_ptr_Out_cull Output")
-    gvars += [f"%out{loc} = OpVariable %_ptr_Out_v4 Output" for loc, _ in params]
+    gvars += [f"%out{loc} = OpVariable %_ptr_Out_v4 Output" for loc in [p for p, _ in params] + hout]
     fn = ["%main = OpFunction %void None %fn", "%entry = OpLabel"]
     return "\n".join(head + types + gvars + fn + body) + "\n"
 
@@ -222,4 +239,8 @@ def main(argv):
 
 
 if __name__ == "__main__":
+    try:  # a redirected stdout is strict ANSI code page under -I; write '?' for what it cannot encode
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
     sys.exit(main(sys.argv))

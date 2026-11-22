@@ -58,18 +58,19 @@ struct VulkanDeviceFunctions {
     X(vkCmdResolveImage) X(vkCmdFillBuffer) X(vkCmdUpdateBuffer) X(vkCreateSampler) X(vkDestroySampler)        \
     X(vkCmdBeginConditionalRenderingEXT) X(vkCmdEndConditionalRenderingEXT) X(vkCreateQueryPool)               \
     X(vkDestroyQueryPool) X(vkCmdResetQueryPool) X(vkCmdBeginQuery) X(vkCmdEndQuery) X(vkCmdWriteTimestamp)    \
-    X(vkCmdCopyQueryPoolResults) X(vkCmdBindPipeline) X(vkCmdPushConstants) X(vkCmdDispatch)                   \
-    X(vkCreateShaderModule) X(vkDestroyShaderModule) X(vkCreatePipelineLayout) X(vkDestroyPipelineLayout)      \
-    X(vkCreateComputePipelines) X(vkDestroyPipeline) X(vkGetBufferDeviceAddress) X(vkCmdBindVertexBuffers2)    \
-    X(vkCmdBindIndexBuffer) X(vkCmdSetViewport) X(vkCmdSetScissor) X(vkCmdSetPrimitiveTopology)                \
-    X(vkCmdSetStencilReference) X(vkCmdSetBlendConstants) X(vkCmdDraw) X(vkCmdDrawIndexed)                     \
-    X(vkCreateGraphicsPipelines) X(vkCmdDrawIndirect) X(vkCmdDrawIndexedIndirect) X(vkCmdDrawIndirectCount)    \
-    X(vkCmdDrawIndexedIndirectCount) X(vkCmdDispatchIndirect) X(vkGetAccelerationStructureBuildSizesKHR)       \
-    X(vkCreateAccelerationStructureKHR) X(vkDestroyAccelerationStructureKHR)                                   \
-    X(vkGetAccelerationStructureDeviceAddressKHR) X(vkCmdBuildAccelerationStructuresKHR)                       \
+    X(vkCmdCopyQueryPoolResults) X(vkCmdDrawIndirect) X(vkCmdDrawIndexedIndirect) X(vkCmdDrawIndirectCount)    \
+    X(vkCmdDrawIndexedIndirectCount) X(vkCmdDispatchIndirect) X(vkGetBufferDeviceAddress)                      \
+    X(vkGetAccelerationStructureBuildSizesKHR) X(vkCreateAccelerationStructureKHR)                             \
+    X(vkDestroyAccelerationStructureKHR) X(vkGetAccelerationStructureDeviceAddressKHR)                         \
+    X(vkCmdBuildAccelerationStructuresKHR)                                                                    \
     X(vkCreateDescriptorSetLayout) X(vkDestroyDescriptorSetLayout) X(vkCreateDescriptorPool)                   \
-    X(vkDestroyDescriptorPool) X(vkAllocateDescriptorSets) X(vkUpdateDescriptorSets)                           \
-    X(vkCmdBindDescriptorSets)
+    X(vkDestroyDescriptorPool) X(vkAllocateDescriptorSets) X(vkUpdateDescriptorSets)                          \
+    X(vkCreatePipelineLayout) X(vkDestroyPipelineLayout) X(vkCreateShaderModule) X(vkDestroyShaderModule)      \
+    X(vkCreateComputePipelines) X(vkDestroyPipeline) X(vkCmdBindPipeline) X(vkCmdBindDescriptorSets)            \
+    X(vkCmdPushConstants) X(vkCmdDispatch)                                                                     \
+    X(vkCmdBindVertexBuffers2) X(vkCmdBindIndexBuffer) X(vkCmdSetViewport) X(vkCmdSetScissor)                  \
+    X(vkCmdSetPrimitiveTopology) X(vkCmdSetStencilReference) X(vkCmdSetBlendConstants) X(vkCmdDraw)            \
+    X(vkCmdDrawIndexed) X(vkCreateGraphicsPipelines)
 #define LEONIDA_VK_MEMBER(name) PFN_##name name = nullptr;
     LEONIDA_VK_DEVICE_FUNCTIONS(LEONIDA_VK_MEMBER)
 #undef LEONIDA_VK_MEMBER
@@ -690,7 +691,7 @@ public:
         replay_.image_view = [this](const ResourceBinding& r, const VkImageSubresourceRange& range) {
             return view(r, range);
         };
-        replay_.query_pool = [this](QueryHeapId id) -> QueryPool* {  // called with mutex_ held
+        replay_.query_pool = [this](QueryHeapId id) -> QueryPool* {  // called with resource_mutex_ held
             const auto it = query_pools_.find(id);
             return it == query_pools_.end() ? nullptr : &it->second;
         };
@@ -803,6 +804,7 @@ public:
     void set_timestamp_period(double period) { timestamp_period_ = period; }
 
     // The device address of the GPU address arena: console VAs are offsets from it (docs section 3.3).
+    // execute() copies replay_ under a shared resource_mutex_, so writers hold it uniquely.
     void set_heap_base(std::uint64_t heap_base) {
         std::unique_lock lock(resource_mutex_);
         replay_.heap_base = heap_base;
@@ -820,8 +822,7 @@ public:
         return replay_.heap_base;
     }
 
-    // Pipelines are registered by an opaque id (the PSO object) for as long as the PSO lives. prepare() looks them
-    // up under the shared resource_mutex_.
+    // Pipelines are registered by an opaque id (the PSO object) for as long as the PSO lives.
     void add_pipeline(std::uintptr_t id, const ComputePipeline& pipeline) {
         std::unique_lock lock(resource_mutex_);
         pipelines_[id] = pipeline;
@@ -835,7 +836,6 @@ public:
         std::unique_lock lock(resource_mutex_);
         graphics_pipelines_[id] = pipeline;
     }
-
     // Configure before queue creation, when the selected queue family supports compute.
     void set_occlusion_resolve_memory(const VkPhysicalDeviceMemoryProperties& memory) {
         occlusion_resolve_memory_ = memory;

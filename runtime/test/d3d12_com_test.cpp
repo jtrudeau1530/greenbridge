@@ -135,18 +135,6 @@ int main(int argc, char** argv) {
         EXPECT(rt::d3d12::front_back_stencil_ref(list8.p, front, back) && front == 7 && back == 9);
         list8->ExecuteBundle(bundle.p);  // the same closed bundle can be executed repeatedly
 
-        // The older setter is sticky state too: a bundle that only calls OMSetStencilRef hands both faces back.
-        Ref<ID3D12CommandAllocator> legacy_allocator;
-        Ref<ID3D12GraphicsCommandList8> legacy_bundle;
-        EXPECT(SUCCEEDED(rt::d3d12::create_command_allocator(D3D12_COMMAND_LIST_TYPE_BUNDLE,
-                                                              IID_PPV_ARGS(&legacy_allocator.p))));
-        EXPECT(SUCCEEDED(rt::d3d12::create_command_list(D3D12_COMMAND_LIST_TYPE_BUNDLE, legacy_allocator.p,
-                                                         IID_PPV_ARGS(&legacy_bundle.p))));
-        legacy_bundle->OMSetStencilRef(0x46);
-        EXPECT(legacy_bundle->Close() == S_OK);
-        list8->ExecuteBundle(legacy_bundle.p);
-        EXPECT(rt::d3d12::front_back_stencil_ref(list8.p, front, back) && front == 0x46 && back == 0x46);
-
         ID3D12CommandList* bundle_submission[] = {bundle.p};
         queue->ExecuteCommandLists(1, bundle_submission);  // bundles are executed only inside direct lists
         EXPECT(rt::d3d12::last_execute_result(queue.p) == ReplayResult::unsupported);

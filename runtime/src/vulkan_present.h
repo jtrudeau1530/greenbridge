@@ -242,11 +242,8 @@ public:
 
         bool recorded = false;
         if (binding) {
-            // The back buffer's layout is tracked like any other texture: the resource lock while it is resolved,
-            // then the tracker's, which record() reads and updates, in the context's order (resource_mutex_ ->
-            // tracker_mutex_ -> submit_mutex_).
-            std::shared_lock resource_lock(context_.resource_mutex_);
-            std::lock_guard tracker_lock(context_.tracker_mutex_);
+            // The back buffer's layout is tracked like any other texture; this holds the context while it is read.
+            std::shared_lock lock(context_.resource_mutex_);  // the resource table (vulkan_backend.h)
             const ResourceBinding* current = context_.resolve(source);
             if (current && current->image && current->aspects == VK_IMAGE_ASPECT_COLOR_BIT) {
                 record(frame.commands, *current, source, image, source_rect);
