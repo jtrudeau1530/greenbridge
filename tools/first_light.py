@@ -565,6 +565,11 @@ def main(argv=None) -> int:
         if not a.no_fit:
             vertices = fit(vertices, a.width, a.height, True, not a.keep_z)
         write_mesh(os.path.join(out_dir, "mesh.bin"), vertices, indices)
+    else:  # a run without a model must not draw the mesh an earlier run left in the folder
+        try:
+            os.unlink(os.path.join(out_dir, "mesh.bin"))
+        except FileNotFoundError:
+            pass
     centre_pixel = [a.width // 2, a.height // 2]
     centre_uv = (
         uv_at(vertices, indices, centre_pixel[0], centre_pixel[1], a.width, a.height)
