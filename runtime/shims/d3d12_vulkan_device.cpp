@@ -3895,18 +3895,22 @@ public:
         const bool tiled = is_tiled_layout(desc->Layout);
         const bool msaa = desc->SampleDesc.Count > 1;
         if (desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
+            if (heap->flags() & D3D12_HEAP_FLAG_DENY_BUFFERS) return E_INVALIDARG;
             if (desc->Layout != D3D12_TEXTURE_LAYOUT_ROW_MAJOR) return E_INVALIDARG;
             if (desc->Width > heap->bytes() || heap_offset > heap->bytes() - desc->Width) return E_INVALIDARG;
         } else {
             if (heap->properties().Type == D3D12_HEAP_TYPE_UPLOAD ||
                 heap->properties().Type == D3D12_HEAP_TYPE_READBACK)
                 return E_INVALIDARG;
+            const bool rt_ds = (desc->Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET |
+                                              D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)) != 0;
+            if (rt_ds && (heap->flags() & D3D12_HEAP_FLAG_DENY_RT_DS_TEXTURES)) return E_INVALIDARG;
+            if (!rt_ds && (heap->flags() & D3D12_HEAP_FLAG_DENY_NON_RT_DS_TEXTURES)) return E_INVALIDARG;
             if (tiled || msaa) {
                 if (tiled && desc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
                     desc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE3D)
                     return E_INVALIDARG;
                 if (msaa && desc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D) return E_INVALIDARG;
-                if (msaa && (heap->flags() & D3D12_HEAP_FLAG_DENY_RT_DS_TEXTURES)) return E_INVALIDARG;
                 const D3D12_RESOURCE_ALLOCATION_INFO alloc = allocation(*desc);
                 if (alloc.SizeInBytes == UINT64_MAX || heap->alignment() < alloc.Alignment ||
                     heap_offset % alloc.Alignment || alloc.SizeInBytes > heap->bytes() ||
