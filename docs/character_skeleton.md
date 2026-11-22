@@ -259,7 +259,11 @@ named `cs_mandy` drawable**. Its 64-bit `ModelName` is `0x009B33B7D7C0CDFF`, and
 `0xC9888B65009B33B7` is byte-identical to `cs_lucia` and `cs_monalisa`: the shared female
 cutscene-ped fragment set. The realistic full-body in that family is `cs_lucia_legacypedcs`
 (874 v), so Mandy uses the same body as Lucia. Her nine-entry variation table has 18 u32 hashes;
-16 are unique to her, but none resolves to a shipped drawable or texture name.
+16 are unique to her. A deeper search — 373,484 shipped names / 725,869 normalised variants plus
+about 25 million generated strings — gives **0/18** exact matches. The sibling nine-entry table
+resolves 9 of 18 values to `joaat("outfit_01")` … `joaat("outfit_10")` (frequency corroborates
+it), so the table stores build-time design labels, not shipped asset names; the 18 component
+values are not recoverable by name enumeration.
 
 The entities linked to Mandy carry three different per-state archetype hashes
 (`0x18BB2550`, `0x73E83886`, `0x57DDFFC2`), which fits her outfit changing between states, not

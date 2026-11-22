@@ -149,8 +149,10 @@ parts have **no albedo**, so a preview must render them as clay rather than inve
 A geometry-first census — every `packs.rpf` drawable and fragment, all 50,802 `levels.rpf`
 fragments, 178,073 of 184,778 `levels.rpf` drawables (96.4%; the 6,705 above 3 MB were not
 decoded), all 4,195 `story000.rpf` drawables, and the `anim.rpf` rig dictionaries — found no
-Lucia or Mandy body. `story000.rpf` is mission map cells, not ped actors, and `anim.rpf`'s
-`LOD0_Body_Shapes_Female` is a rig program with no mesh.
+Lucia or Mandy body. `story000.rpf` is mission map cells, not ped actors: its full read finds
+4,195 drawables, 177,811 meshes, **0 skeletons, 0 fragments and 0 body-like names**, 28.5 M
+vertices of unrigged 64 m cells. `anim.rpf`'s `LOD0_Body_Shapes_Female` is a rig program with no
+mesh.
 
 The only **nude** continuous human-skeleton meshes are a **generic female mannequin** in
 `levels.rpf`: `gmt_mannequin_proxy_f_01a` (15,488 vertices / 27,725 triangles, 95 bones,
