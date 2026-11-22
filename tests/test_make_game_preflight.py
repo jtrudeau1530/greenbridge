@@ -436,7 +436,9 @@ class PreflightPrerequisiteTest(PreflightTestBase):
             ("current translation", {}, {}, False, True),
             ("matching emulation", {"spirv/wave64_emulate.txt": "on"}, {"emulate": True}, False, True),
             ("auto keeps emulation", {"spirv/wave64_emulate.txt": "on"}, {"keep_emulated": True}, False, True),
-            ("finished before disasm marker", {"dxbc/disasm.done": None}, {}, False, True),
+            ("missing disassembly marker", {"dxbc/disasm.done": None}, {}, False, False),
+            ("old disassembly marker", {"dxbc/disasm.done": "shader_disasm.py finished"}, {}, False, False),
+            ("changed LLVM", {"dxbc/disasm.done": "old llvm-mc"}, {}, False, False),
             ("stale translator", {"spirv/translation_sources.sha256": "stale"}, {}, False, False),
             ("old translation without fingerprint", {"spirv/translation_sources.sha256": None}, {}, False, False),
             ("needs emulation", {}, {"emulate": True}, False, False),
@@ -452,7 +454,7 @@ class PreflightPrerequisiteTest(PreflightTestBase):
                 files = {
                     "dxbc/index.json": "{}",
                     "dxbc/fssm_index.json": "{}",
-                    "dxbc/disasm.done": "shader_disasm.py finished",
+                    "dxbc/disasm.done": "test llvm-mc 21",
                     "spirv/index.json": "{}",
                     "spirv/translation_sources.sha256": fingerprint,
                     "spirv/wave64_emulate.txt": "off",
@@ -465,9 +467,10 @@ class PreflightPrerequisiteTest(PreflightTestBase):
                         os.makedirs(os.path.dirname(path), exist_ok=True)
                         with open(path, "w", encoding="utf-8") as handle:
                             handle.write(content + "\n")
-                if legacy_layout:
-                    os.makedirs(os.path.join(shader_root, "disasm"))
+                disasm_parts = ("disasm",) if legacy_layout else ("dxbc", "disasm")
+                os.makedirs(os.path.join(shader_root, *disasm_parts))
                 with mock.patch("sys.version_info", (3, 12, 0)), \
+                     mock.patch("make_game.llvm_mc_signature", return_value="test llvm-mc 21"), \
                      mock.patch("make_game.tool_available", return_value=True), \
                      mock.patch("shutil.which", return_value="/usr/bin/tool"), \
                      mock.patch("shutil.disk_usage", return_value=usage), \

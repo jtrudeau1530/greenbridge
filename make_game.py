@@ -37,6 +37,9 @@ import time
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 TOOLS = os.path.join(ROOT, "tools")
+sys.path.insert(0, TOOLS)
+from mc_command import mc_command  # noqa: E402
+
 VERSIONS = os.path.join(ROOT, "game")
 STAGES = ["check", "shaders", "assets", "runtime", "pipelines"]
 WINDOWS_ONLY = ("runtime",)   # off Windows only with --runtime-build
@@ -291,8 +294,7 @@ def preflight(stages: list, work: str, wav: bool = False, runtime_build: str | N
     if sys.version_info < (3, 12):
         missing.append("Python 3.12 or newer: https://www.python.org/downloads/")
     if "shaders" in stages:
-        llvm = os.environ.get("LLVM_MC", "llvm-mc")
-        if not tool_available(llvm):
+        if not tool_available(mc_command()[0]):
             missing.append(
                 "llvm-mc (LLVM 21+ with the AMDGPU target). The official Windows LLVM build has no AMDGPU "
                 "target: build a native one with scripts\\build_llvm_mc.ps1, or install llvm-21 in WSL and set "
@@ -411,6 +413,26 @@ def requested_shader_mode(had: str, emulate: bool, keep_emulated: bool) -> str:
     return "on" if emulate or (had == "on" and keep_emulated) else "off"
 
 
+def llvm_mc_signature() -> str:
+    command = mc_command()
+    command[0] = shutil.which(command[0]) or command[0]
+    try:
+        result = subprocess.run([*command, "--version"], capture_output=True, text=True, errors="replace", timeout=15)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        fail(f"Could not read the llvm-mc version. Check LLVM_MC: {error}")
+    version = result.stdout.strip()
+    if result.returncode != 0 or not version:
+        fallback = f"exit code {result.returncode}" if result.returncode else "no version printed"
+        detail = (result.stderr.strip().splitlines() or [fallback])[0]
+        fail(f"Could not read the llvm-mc version. Check LLVM_MC: {detail}")
+    return json.dumps([command, version])
+
+
+def disassembly_matches(dxbc: str, signature: str) -> bool:
+    return (os.path.isdir(os.path.join(dxbc, "disasm"))
+            and read_shader_setting(os.path.join(dxbc, "disasm.done")) == signature)
+
+
 def shader_outputs_reusable(work: str, emulate: bool, keep_emulated: bool) -> bool:
     """Check whether the shader stage can resume without carving, unpacking or translating again."""
     sh = os.path.join(work, "shaders")
@@ -420,11 +442,23 @@ def shader_outputs_reusable(work: str, emulate: bool, keep_emulated: bool) -> bo
                os.path.join(spirv, "index.json"))
     if not all(os.path.isfile(path) for path in markers):
         return False
-    if os.path.isdir(os.path.join(sh, "disasm")) and not os.path.isdir(os.path.join(dxbc, "disasm")):
-        return False  # Moving a legacy disassembly discards the translated output.
     had = read_shader_setting(os.path.join(spirv, "wave64_emulate.txt"), default="off")
     return (had == requested_shader_mode(had, emulate, keep_emulated)
-            and read_shader_setting(os.path.join(spirv, "translation_sources.sha256")) == translation_sources_digest())
+            and read_shader_setting(os.path.join(spirv, "translation_sources.sha256")) == translation_sources_digest()
+            and os.path.isfile(os.path.join(dxbc, "disasm.done"))
+            and disassembly_matches(dxbc, llvm_mc_signature()))
+
+
+def clear_shader_disassembly(work: str, disasm: str) -> None:
+    """Remove generated assembly so a failed decode cannot leave a file from an older run."""
+    expected = os.path.join(os.path.realpath(work), "shaders", "dxbc", "disasm")
+    if os.path.normcase(os.path.realpath(disasm)) != os.path.normcase(expected):
+        fail(f"The shader disassembly folder must be inside the work folder: {disasm}")
+    if os.path.isdir(disasm):
+        with os.scandir(disasm) as entries:
+            for entry in entries:
+                if entry.name.endswith(".s") and (entry.is_file(follow_symlinks=False) or entry.is_symlink()):
+                    os.unlink(entry.path)
 
 
 def shaders(game: str, work: str, jobs: int, emulate: bool = False, keep_emulated: bool = False) -> None:
@@ -436,37 +470,30 @@ def shaders(game: str, work: str, jobs: int, emulate: bool = False, keep_emulate
     # or holds many files: a run stopped part-way leaves both. Re-running a stage drops the later stages' proof.
     carved = os.path.join(dxbc, "index.json")             # shader_carve.py, renamed into place at the end
     unpacked = os.path.join(dxbc, "fssm_index.json")      # fssm_unpack.py, the same
-    disassembled = os.path.join(dxbc, "disasm.done")      # written here once shader_disasm.py exits with 0
+    disassembled = os.path.join(dxbc, "disasm.done")      # records the LLVM command and version after a successful run
     translated = os.path.join(spirv, "index.json")        # rdna2spirv.py --merge, renamed into place
     shard_plan = os.path.join(spirv, SHARD_PLAN)          # lets translate() keep finished shards; see there
+    signature = llvm_mc_signature()
     if not os.path.isfile(carved):
         log("shaders: carving shaders.rpf")
-        drop(unpacked, disassembled, translated, shard_plan)
+        drop(translated, shard_plan, disassembled, unpacked)
         py("shader_carve.py", src, dxbc)
     if not os.path.isfile(unpacked):
         log("shaders: unpacking native code")
-        drop(disassembled, translated, shard_plan)
+        drop(translated, shard_plan, disassembled)
         py("fssm_unpack.py", dxbc)
     # rdna2spirv.py finds index.json, the .dxbc files and fssm/ in the parent of the .s files' folder, so the
     # disassembly must sit inside the carve folder: next to it, every stage reads as "?" and is rejected.
     disasm = os.path.join(dxbc, "disasm")
-    old = os.path.join(sh, "disasm")
-    if os.path.isdir(old) and not os.path.isdir(disasm):
-        log("shaders: moving disasm into the carve folder and translating again")
-        os.rename(old, disasm)
-        shutil.rmtree(spirv, ignore_errors=True)
-        mark_done(disassembled)
-    if not os.path.isfile(disassembled) and os.path.isfile(translated):
-        # A work folder from before disasm.done existed: its translation finished, so its disassembly had too.
-        # Without this, every earlier build would disassemble and translate the whole corpus again.
-        mark_done(disassembled)
-    if not os.path.isfile(disassembled):
-        need(os.environ.get("LLVM_MC", "llvm-mc"),
-             "Install LLVM 21 or newer with the AMDGPU target, or set LLVM_MC to llvm-mc's path or whole command.")
+    if not disassembly_matches(dxbc, signature):
+        if os.path.isfile(disassembled) or os.path.isfile(translated):
+            log("shaders: llvm-mc changed or the saved disassembly could not be verified")
         log("shaders: disassembling (gfx1013)")
-        drop(translated, shard_plan)
+        drop(translated, shard_plan, disassembled)
+        clear_shader_disassembly(work, disasm)
         py("shader_disasm.py", os.path.join(dxbc, "fssm"), "--out", disasm, "--mcpu", "gfx1013", "--jobs", jobs)
-        mark_done(disassembled)
+        with open(disassembled, "w", encoding="utf-8") as f:
+            f.write(signature + "\n")
     # The translation also depends on the translator's own files, so their digest is kept beside it. A folder without
     # it (from before the file existed), with an unreadable one or with another one is translated again; carving, unpacking and
     # disassembly stay current.
@@ -505,11 +532,6 @@ def shaders(game: str, work: str, jobs: int, emulate: bool = False, keep_emulate
             f.write(sources + "\n")
         translate(disasm, spirv, jobs, emulate=emulate)
     log("shaders: done")
-
-
-def mark_done(path: str) -> None:
-    with open(path, "w", encoding="utf-8") as f:
-        f.write("shader_disasm.py finished\n")
 
 
 WAVE64_MODES = ("auto", "on", "off")
