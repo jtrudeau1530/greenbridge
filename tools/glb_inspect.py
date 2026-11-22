@@ -1,4 +1,4 @@
-"""Inspect a glTF 2.0 binary (.glb): meshes, materials, skins and POSITION bounds.
+"""Inspect a glTF 2.0 binary (.glb): meshes, materials, skins, animations and POSITION bounds.
 
 Usage:
     python -I tools/glb_inspect.py <model.glb> [--json FILE]
