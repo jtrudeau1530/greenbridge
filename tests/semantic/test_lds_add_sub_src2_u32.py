@@ -282,6 +282,55 @@ class SIMDInterpreter:
             state.lds.write_dword(idx_a, new_a)
 
 
+# ==============================================================================
+# Condition Codes, Status Flags, and Carry/Borrow Evaluation
+# ==============================================================================
+
+@dataclass(frozen=True)
+class ArithmeticStatusFlags:
+    """Condition codes and status flags for 32-bit addition/subtraction."""
+    zero: bool
+    sign: bool
+    carry: bool
+    borrow: bool
+    overflow: bool
+
+
+def evaluate_add_sub_status_flags(
+    opcode: DSOpcode,
+    val_a: int,
+    val_b: int,
+    result: int,
+) -> ArithmeticStatusFlags:
+    """Evaluate condition codes, flags, and carry/borrow generation."""
+    a = u32(val_a)
+    b = u32(val_b)
+    res = u32(result)
+
+    zero = (res == 0)
+    sign = bool(res & 0x80000000)
+    carry = False
+    borrow = False
+    overflow = False
+
+    if opcode == DSOpcode.DS_ADD_SRC2_U32:
+        carry = (a + b) > MASK32
+        sa, sb, sres = s32(a), s32(b), s32(res)
+        overflow = ((sa > 0 and sb > 0 and sres < 0) or (sa < 0 and sb < 0 and sres > 0))
+    elif opcode == DSOpcode.DS_SUB_SRC2_U32:
+        borrow = (a < b)
+        sa, sb, sres = s32(a), s32(b), s32(res)
+        overflow = ((sa > 0 and sb < 0 and sres < 0) or (sa < 0 and sb > 0 and sres > 0))
+
+    return ArithmeticStatusFlags(
+        zero=zero,
+        sign=sign,
+        carry=carry,
+        borrow=borrow,
+        overflow=overflow,
+    )
+
+
 class TestReferenceModelAndOracle(unittest.TestCase):
     """Unit tests for reference mathematical oracle and architectural model."""
 
@@ -388,7 +437,7 @@ class TestScalarInterpreter(unittest.TestCase):
         self.state = ScalarMachineState(lds_dwords=1024)
 
     def test_scalar_add_src2_execution(self) -> None:
-        self.state.set_vgpr(0, 0x10)  # dword 4
+        self.state.set_vgpr(0, 0x10)
         self.state.set_lds(4, 75)
         self.state.set_lds(5, 25)
 
@@ -403,7 +452,7 @@ class TestScalarInterpreter(unittest.TestCase):
         self.assertEqual(self.state.get_vgpr(0), 0x10)
 
     def test_scalar_sub_src2_execution(self) -> None:
-        self.state.set_vgpr(1, 0x20)  # dword 8
+        self.state.set_vgpr(1, 0x20)
         self.state.set_lds(8, 20)
         self.state.set_lds(9, 30)
 
@@ -612,6 +661,44 @@ class TestRegisterAliasing(unittest.TestCase):
             state.set_lds(2, val)
             self.scalar_interp.execute(instr, state)
             self.assertEqual(state.get_lds(2), 0)
+
+
+class TestConditionCodesAndStatusFlags(unittest.TestCase):
+    """Unit tests for condition codes, status flags, and carry/borrow generation."""
+
+    def test_add_carry_generation(self) -> None:
+        flags = evaluate_add_sub_status_flags(
+            DSOpcode.DS_ADD_SRC2_U32, MASK32, 1, 0
+        )
+        self.assertTrue(flags.carry)
+        self.assertTrue(flags.zero)
+        self.assertFalse(flags.sign)
+        self.assertFalse(flags.borrow)
+
+    def test_add_signed_overflow(self) -> None:
+        flags = evaluate_add_sub_status_flags(
+            DSOpcode.DS_ADD_SRC2_U32, 0x7FFFFFFF, 1, 0x80000000
+        )
+        self.assertTrue(flags.overflow)
+        self.assertTrue(flags.sign)
+        self.assertFalse(flags.carry)
+
+    def test_sub_borrow_generation(self) -> None:
+        flags = evaluate_add_sub_status_flags(
+            DSOpcode.DS_SUB_SRC2_U32, 0, 1, MASK32
+        )
+        self.assertTrue(flags.borrow)
+        self.assertFalse(flags.zero)
+        self.assertTrue(flags.sign)
+        self.assertFalse(flags.carry)
+
+    def test_sub_zero_flag(self) -> None:
+        flags = evaluate_add_sub_status_flags(
+            DSOpcode.DS_SUB_SRC2_U32, 42, 42, 0
+        )
+        self.assertTrue(flags.zero)
+        self.assertFalse(flags.borrow)
+        self.assertFalse(flags.sign)
 
 
 if __name__ == "__main__":
