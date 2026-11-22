@@ -428,6 +428,70 @@ class ScalarInterpreter:
 
 
 # ---------------------------------------------------------------------------
+# SIMD Multi-Lane Divergence and 32/64-Bit EXEC Masking Model
+# ---------------------------------------------------------------------------
+
+class Wavefront:
+    """SIMD Wavefront execution model for Wave32 and Wave64 execution on AMD RDNA2."""
+
+    def __init__(self, wave_size: int = 32, exec_mask: Optional[int] = None) -> None:
+        if wave_size not in (32, 64):
+            raise ValueError(f"Wave size must be 32 or 64, got {wave_size}")
+        self.wave_size: int = wave_size
+        self.full_mask: int = (1 << wave_size) - 1
+        self.exec_mask: int = exec_mask if exec_mask is not None else self.full_mask
+        self.lanes: List[RegisterFile] = [RegisterFile() for _ in range(wave_size)]
+        self.sgprs: List[int] = [0] * 106
+
+    def is_lane_active(self, lane_id: int) -> bool:
+        if not (0 <= lane_id < self.wave_size):
+            return False
+        return bool((self.exec_mask >> lane_id) & 1)
+
+    def read_shared_sgpr_half(self, reg_index: int, half: HalfwordSelect) -> int:
+        dword = self.sgprs[reg_index] & 0xFFFFFFFF
+        if half == HalfwordSelect.LOW_16:
+            return dword & 0xFFFF
+        return (dword >> 16) & 0xFFFF
+
+    def write_shared_sgpr_half(self, reg_index: int, half: HalfwordSelect, value_16: int) -> None:
+        dword = self.sgprs[reg_index] & 0xFFFFFFFF
+        val = value_16 & 0xFFFF
+        if half == HalfwordSelect.LOW_16:
+            self.sgprs[reg_index] = (dword & 0xFFFF0000) | val
+        else:
+            self.sgprs[reg_index] = (dword & 0x0000FFFF) | (val << 16)
+
+    def execute_simd(self, instr: ASTRsqF16) -> List[Optional[int]]:
+        instr.validate()
+        results: List[Optional[int]] = []
+
+        for lane_id in range(self.wave_size):
+            if not self.is_lane_active(lane_id):
+                results.append(None)
+                continue
+
+            rf = self.lanes[lane_id]
+            if instr.src0.op_type == OperandType.SGPR:
+                raw_src = self.read_shared_sgpr_half(instr.src0.reg_index, instr.src0.half)
+            else:
+                raw_src = rf.read_operand_16(instr.src0)
+
+            res_16 = oracle_v_rsq_f16(
+                raw_src,
+                abs_mod=instr.src0.abs_mod,
+                neg_mod=instr.src0.neg_mod,
+                clamp=instr.clamp,
+                omod=instr.omod,
+                ftz=instr.ftz,
+            )
+            rf.write_vgpr_half(instr.dst.reg_index, instr.dst.half, res_16)
+            results.append(res_16)
+
+        return results
+
+
+# ---------------------------------------------------------------------------
 # Unit Test Suites
 # ---------------------------------------------------------------------------
 
@@ -597,6 +661,89 @@ class TestScalarInterpreterRSQF16(unittest.TestCase):
         self.assertEqual(interp.cycle_count, 4)
         self.assertEqual(len(interp.trace_log), 1)
         self.assertIn("v_rsq_f16", interp.trace_log[0])
+
+
+class TestSIMDMultiLaneDivergenceRSQF16(unittest.TestCase):
+    """Unit tests verifying SIMD multi-lane execution and 32/64-bit EXEC masking."""
+
+    def test_wave32_alternating_exec_mask(self) -> None:
+        exec_mask = 0x55555555  # Even lanes active (0, 2, 4, ...), odd lanes inactive
+        wave = Wavefront(wave_size=32, exec_mask=exec_mask)
+
+        # Initialize v0 in all lanes to sentinel value 0xDEADBEEF
+        for lane_id in range(32):
+            wave.lanes[lane_id].write_vgpr(0, 0xDEADBEEF)
+            # Set source v1.l = 4.0 (0x4400)
+            wave.lanes[lane_id].write_vgpr_half(1, HalfwordSelect.LOW_16, H_FOUR)
+
+        dst = ASTOperand(op_type=OperandType.VGPR, reg_index=0, half=HalfwordSelect.LOW_16)
+        src = ASTOperand(op_type=OperandType.VGPR, reg_index=1, half=HalfwordSelect.LOW_16)
+        results = wave.execute_simd(ASTRsqF16(dst=dst, src0=src))
+
+        for lane_id in range(32):
+            if lane_id % 2 == 0:
+                self.assertEqual(results[lane_id], H_HALF)
+                self.assertEqual(wave.lanes[lane_id].read_vgpr_half(0, HalfwordSelect.LOW_16), H_HALF)
+                # Upper half should remain 0xDEAD
+                self.assertEqual(wave.lanes[lane_id].read_vgpr_half(0, HalfwordSelect.HIGH_16), 0xDEAD)
+            else:
+                self.assertIsNone(results[lane_id])
+                # Inactive lane must remain completely untouched!
+                self.assertEqual(wave.lanes[lane_id].read_vgpr(0), 0xDEADBEEF)
+
+    def test_wave64_boundary_masks(self) -> None:
+        # High 32 lanes active, low 32 lanes inactive
+        exec_mask = 0xFFFFFFFF00000000
+        wave = Wavefront(wave_size=64, exec_mask=exec_mask)
+
+        for lane_id in range(64):
+            wave.lanes[lane_id].write_vgpr(3, 0xCAFEBABE)
+            wave.lanes[lane_id].write_vgpr_half(4, HalfwordSelect.LOW_16, H_SIXTEEN)
+
+        dst = ASTOperand(op_type=OperandType.VGPR, reg_index=3, half=HalfwordSelect.LOW_16)
+        src = ASTOperand(op_type=OperandType.VGPR, reg_index=4, half=HalfwordSelect.LOW_16)
+        results = wave.execute_simd(ASTRsqF16(dst=dst, src0=src))
+
+        for lane_id in range(64):
+            if lane_id < 32:
+                self.assertIsNone(results[lane_id])
+                self.assertEqual(wave.lanes[lane_id].read_vgpr(3), 0xCAFEBABE)
+            else:
+                self.assertEqual(results[lane_id], H_QUARTER)
+                self.assertEqual(wave.lanes[lane_id].read_vgpr_half(3, HalfwordSelect.LOW_16), H_QUARTER)
+                self.assertEqual(wave.lanes[lane_id].read_vgpr_half(3, HalfwordSelect.HIGH_16), 0xCAFE)
+
+    def test_divergent_operands_per_lane(self) -> None:
+        # All 32 lanes active with divergent input values
+        wave = Wavefront(wave_size=32, exec_mask=0xFFFFFFFF)
+        inputs = [H_ONE, H_FOUR, H_SIXTEEN, H_QUARTER] * 8
+        expected = [H_ONE, H_HALF, H_QUARTER, H_TWO] * 8
+
+        for lane_id in range(32):
+            wave.lanes[lane_id].write_vgpr_half(5, HalfwordSelect.LOW_16, inputs[lane_id])
+
+        dst = ASTOperand(op_type=OperandType.VGPR, reg_index=6, half=HalfwordSelect.LOW_16)
+        src = ASTOperand(op_type=OperandType.VGPR, reg_index=5, half=HalfwordSelect.LOW_16)
+        results = wave.execute_simd(ASTRsqF16(dst=dst, src0=src))
+
+        for lane_id in range(32):
+            self.assertEqual(results[lane_id], expected[lane_id])
+            self.assertEqual(wave.lanes[lane_id].read_vgpr_half(6, HalfwordSelect.LOW_16), expected[lane_id])
+
+    def test_uniform_scalar_source_broadcast(self) -> None:
+        wave = Wavefront(wave_size=32, exec_mask=0x0000FFFF)  # First 16 lanes active
+        wave.write_shared_sgpr_half(2, HalfwordSelect.LOW_16, H_FOUR)  # 4.0
+
+        dst = ASTOperand(op_type=OperandType.VGPR, reg_index=0, half=HalfwordSelect.LOW_16)
+        src = ASTOperand(op_type=OperandType.SGPR, reg_index=2, half=HalfwordSelect.LOW_16)
+        results = wave.execute_simd(ASTRsqF16(dst=dst, src0=src))
+
+        for lane_id in range(32):
+            if lane_id < 16:
+                self.assertEqual(results[lane_id], H_HALF)
+                self.assertEqual(wave.lanes[lane_id].read_vgpr_half(0, HalfwordSelect.LOW_16), H_HALF)
+            else:
+                self.assertIsNone(results[lane_id])
 
 
 if __name__ == "__main__":
