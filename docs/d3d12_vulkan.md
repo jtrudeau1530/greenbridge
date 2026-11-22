@@ -344,6 +344,9 @@ side inwards:
   `CreateSampler` an S#; each then makes sure set 0 has the view or sampler and the table has the key. Details:
   - The key is the descriptor's bytes, so a copied descriptor needs nothing more, and an unordered-access view
     and a shader-resource view of the same mip are one entry.
+  - A D3D12 comparison sampler with function NEVER and an ordinary sampler both encode zero in the hardware
+    depth comparison field. The layer marks the NEVER comparison in S# word 3, bit 12 (unused with
+    DERIV_ADJUST_EN clear) to give it a separate lookup key and a comparison-enabled Vulkan sampler.
   - A view the layer cannot show (below) leaves a null descriptor, all zeros, which finds the fallback.
   - A texture is named in its T#s by an address of its own, above 4 GiB and 256 bytes apart, that nothing
     dereferences; its entries leave the set and the table when it is destroyed.
