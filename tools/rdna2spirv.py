@@ -1074,6 +1074,9 @@ class Gen:
             val = self.sdwa_dst(a, val)
         if a["k"] == "special" and a["t"] == "null":
             return                                    # result discarded
+        if self.wave64 and a["k"] == "special" and a["t"] in ("exec_lo", "exec_hi"):
+            self.exec_half_write(1 if a["t"] == "exec_hi" else 0, val)
+            return
         if a["k"] == "special" and a["t"] in ("exec_lo", "exec"):
             self.set_exec(val)
             return
@@ -3953,37 +3956,86 @@ class Gen:
     MASK_SOP2_B32 = ("s_and_b32", "s_or_b32", "s_xor_b32", "s_andn2_b32", "s_orn2_b32", "s_nand_b32", "s_nor_b32",
                      "s_xnor_b32", "s_cselect_b32")
 
+    @staticmethod
+    def _maskable_b32(x):
+        return x["k"] in ("sgpr", "imm") or (
+            x["k"] == "special" and (x.get("t", "").startswith(("exec", "vcc")) or x.get("t") == "null")
+        )
+
+    def _mask_b32_dst_half(self, d, srcs):
+        """For a 32-bit bitwise SALU op (s_not_b32 / MASK_SOP2_B32), return (to_mask_dst, half) where to_mask_dst
+        is True when d is EXEC or VCC (each lane holds its own bit) and half is 'lo'/'hi' in wave64 or None."""
+        if d["k"] != "special":
+            return False, None
+        t = d.get("t", "")
+        if not self.wave64:
+            return t in ("exec_lo", "vcc_lo", "exec", "vcc"), None
+        if t in ("exec_lo", "exec_hi"):
+            return True, "hi" if t == "exec_hi" else "lo"
+        if t in ("vcc_lo", "vcc_hi") and ("vcc" in self.cur_masks or any(self.holds_lane_mask(s) for s in srcs)):
+            return True, "hi" if t == "vcc_hi" else "lo"
+        return False, None
+
+    def _mask_b32_src(self, s, dst_half):
+        """Read one 32-bit source for a mask-writing bitwise SALU op (wave32, or wave64 half `dst_half`)."""
+        if self.wave64 and dst_half is not None and self.holds_lane_mask(s):
+            sh = self.mask_half(s)
+            if sh is not None and sh != dst_half:
+                # Opposite wave64 half (e.g. exec_lo <- vcc_hi): collect that half's 32-bit mask and take bit lane&31.
+                lo, hi = self.wave_mask(s)
+                word = hi if sh == "hi" else lo
+                lane = self.wave_lane()
+                s5, shr, bit, r = (self.tmp() for _ in range(4))
+                self.emit(f"{s5} = OpBitwiseAnd %uint {lane} {self.cu(31)}")
+                self.emit(f"{shr} = OpShiftRightLogical %uint {word} {s5}")
+                self.emit(f"{bit} = OpBitwiseAnd %uint {shr} {self.cu(1)}")
+                self.emit(f"{r} = OpSelect %uint {self.tmp_bool_nz(bit)} {self.cu(0xFFFFFFFF)} {self.cu(0)}")
+                return r
+        return self.mask_src(s, wide=False)
+
+    def _store_b32_mask_dst(self, d, val, to_mask_dst, dst_half):
+        """Store a 32-bit bitwise SALU result, preserving the untouched half of EXEC/VCC in wave64."""
+        if to_mask_dst and self.wave64 and d["k"] == "special" and d.get("t") in ("vcc_lo", "vcc_hi"):
+            self.put_mask(d, val, dst_half)
+            if d["t"] == "vcc_hi":
+                self.emit(f"OpStore %vcc_hi {val}")
+            return
+        self.dst(d, val)
+
     def sop2_b32_srcs(self, op, a):
-        """The two sources of a 32-bit SOP2. In a wave32 program a bitwise op (or s_cselect) that writes EXEC / VCC
-        reads both through mask_src, so a constant, inline or held in an SGPR, gives each lane its own bit; a mask is
-        read as before. Until 2026-11-22
-        a constant was used whole: `s_and_b32 exec_lo, exec_lo, 0xff00` (or the same constant in an SGPR) left every
-        lane of EXEC on. Data ops, and wave64 programs (a b32 op there is on one half of a mask), are unchanged."""
-        if op in self.MASK_SOP2_B32 and not self.wave64 and len(a) >= 3:
-            d = a[0]
-            to_mask = d["k"] == "special" and d.get("t", "") in ("exec_lo", "vcc_lo", "exec", "vcc")
-            maskable = all(x["k"] in ("sgpr", "imm") or (x["k"] == "special" and
-                                                         x.get("t", "").startswith(("exec", "vcc"))) for x in a[1:3])
-            # Only when the result is a mask (EXEC / VCC destination). An SGPR destination is classified by
-            # lane_masks.py, which calls it data when the other operand is a constant; a per-lane bit stored there
-            # would then be counted as data (s_and_b32 s20, exec_lo, 1; s_bcnt1_i32_b32 s21, s20 gave 32 and 0
-            # instead of 1, found by @Pierre-Kookis on #1792), so that case keeps the data read.
-            if maskable and to_mask:
-                return self.mask_src(a[1], wide=False), self.mask_src(a[2], wide=False)
+        """The two sources of a 32-bit SOP2. A bitwise op (or s_cselect) that writes EXEC / VCC reads both through
+        _mask_b32_src / mask_src (in wave32 and on either half of a wave64 mask), so a constant, inline or held in
+        an SGPR, gives each lane its own bit; a mask is read as before. Until 2026-11-22 a constant was used whole:
+        `s_and_b32 exec_lo, exec_lo, 0xff00` (or the same constant in an SGPR) left every lane of EXEC on. An SGPR
+        destination stays a data read, because lane_masks.py classifies it as data when the other operand is a
+        constant (s_and_b32 s20, exec_lo, 1; s_bcnt1_i32_b32 s21, s20 gave 32 and 0 instead of 1, #1792)."""
+        if op in self.MASK_SOP2_B32 and len(a) >= 3:
+            to_mask, dst_half = self._mask_b32_dst_half(a[0], a[1:3])
+            if to_mask and all(self._maskable_b32(x) for x in a[1:3]):
+                return self._mask_b32_src(a[1], dst_half), self._mask_b32_src(a[2], dst_half)
         return self.src_u(a[1]), self.src_u(a[2])
 
     def scc_logic(self, a, r):
-        """SCC of a 32-bit bitwise SOP2 (s_and/or/xor/andn2/orn2/nand/nor/xnor_b32): D != 0. In a wave32 program
-        an operation on lane masks (a source holds one, or it writes EXEC) has the whole wave's mask as D, so SCC
-        is the vote of scc_from_mask, as for the _b64 forms. Until 2026-11-22 it was this lane's bit instead:
-        `s_and_b32 s0, vcc_lo, exec_lo; s_cbranch_scc0` skipped the block in the lanes whose own bit was 0
-        although the wave runs it, and a loop closed by `s_andn2_b32 exec_lo, ...; s_cbranch_scc1` let each lane
-        leave on its last iteration, before the wave did (tools/cf_diff.py, FUZZ-8). In a wave64 program the
-        same op works on one half of a mask (lanes 0-31 or 32-63), whose SCC would be a vote of that half only;
-        that case still takes the lane's bit and is not covered by the fuzzer yet."""
-        writes_exec = a[0]["k"] == "special" and a[0].get("t", "").startswith("exec")
-        if not self.wave64 and (writes_exec or self.holds_lane_mask(a[1]) or self.holds_lane_mask(a[2])):
-            self.scc_from_mask(r)
+        """SCC of a 32-bit bitwise SALU op (s_not_b32 and s_and/or/xor/andn2/orn2/nand/nor/xnor_b32): D != 0.
+        When the op works on a lane mask (writes EXEC/VCC or reads a lane-mask operand), D is the wave's mask
+        (or one 32-lane half of it in wave64), so SCC is a subgroup Any vote over the wave (wave32) or that half
+        (wave64, scc_any_half) rather than this lane's own bit."""
+        srcs = a[1:]
+        to_mask_dst, dst_half = self._mask_b32_dst_half(a[0], srcs)
+        mask_srcs = [s for s in srcs if self.holds_lane_mask(s)]
+        if to_mask_dst:
+            self.scc_any_half(r, dst_half)
+        elif mask_srcs:
+            if not self.wave64:
+                self.scc_from_mask(r)
+            else:
+                halves = {self.mask_half(s) for s in mask_srcs} - {None}
+                if len(halves) == 1:
+                    self.scc_any_half(r, halves.pop())
+                elif not halves:
+                    self.scc_from_mask(r)
+                else:
+                    self.scc_nonzero(r)
         else:
             self.scc_nonzero(r)
 
@@ -6854,8 +6906,9 @@ class Gen:
                 else:
                     self.mask_dst(d, r)
         elif op == "s_not_b32":
+            to_mask_dst, dst_half = self._mask_b32_dst_half(a[0], a[1:2])
             x_val = self.imm_val(a[1])
-            if x_val is not None:
+            if x_val is not None and not to_mask_dst and not self.holds_lane_mask(a[1]):
                 val = (~x_val) & 0xFFFFFFFF
                 r = self.cu(val)
                 self.dst(a[0], r)
@@ -6863,13 +6916,12 @@ class Gen:
                     self.sgpr_imm[a[0]["r"]] = val
                 self.emit(f"OpStore %scc {self.cu(1 if val != 0 else 0)}")
             else:
-                x = self.src_u(a[1])
+                x = (self._mask_b32_src(a[1], dst_half)
+                     if (to_mask_dst and self._maskable_b32(a[1])) else self.src_u(a[1]))
                 r = self.tmp()
                 self.emit(f"{r} = OpNot %uint {x}")
-                self.dst(a[0], r)
-                z = self.tmp()
-                self.emit(f"{z} = OpSelect %uint {self.tmp_bool_nz(r)} {self.cu(1)} {self.cu(0)}")
-                self.emit(f"OpStore %scc {z}")
+                self._store_b32_mask_dst(a[0], r, to_mask_dst, dst_half)
+                self.scc_logic(a, r)
         elif op in ("s_cmp_eq_u64", "s_cmp_lg_u64"):
             # 64-bit compare of masks/pointers: equal iff both halves are equal.
             m0, m1 = self.holds_lane_mask(a[0]), self.holds_lane_mask(a[1])
@@ -7306,10 +7358,11 @@ class Gen:
         elif op in ("s_add_i32", "s_sub_i32", "s_min_u32", "s_max_u32", "s_xor_b32", "s_andn2_b32",
                     "s_cselect_b32", "s_orn2_b32", "s_nand_b32", "s_nor_b32", "s_xnor_b32"):
             val = None
+            to_mask_dst, dst_half = (self._mask_b32_dst_half(a[0], a[1:3])
+                                     if op in self.MASK_SOP2_B32 else (False, None))
             if op in ("s_xor_b32", "s_andn2_b32", "s_orn2_b32", "s_nand_b32", "s_nor_b32", "s_xnor_b32"):
                 x_val, y_val = self.imm_val(a[1]), self.imm_val(a[2])
-                writes_exec = a[0]["k"] == "special" and a[0].get("t", "").startswith("exec")
-                is_mask = not self.wave64 and (writes_exec or self.holds_lane_mask(a[1]) or self.holds_lane_mask(a[2]))
+                is_mask = to_mask_dst or self.holds_lane_mask(a[1]) or self.holds_lane_mask(a[2])
                 if x_val is not None and y_val is not None and not is_mask:
                     if op == "s_xor_b32":
                         val = (x_val ^ y_val) & 0xFFFFFFFF
@@ -7365,7 +7418,7 @@ class Gen:
                 k = {"s_add_i32": "OpIAdd", "s_sub_i32": "OpISub", "s_sub_u32": "OpISub",
                      "s_xor_b32": "OpBitwiseXor"}[op]
                 self.emit(f"{r} = {k} %uint {x} {y}")
-            self.dst(a[0], r)
+            self._store_b32_mask_dst(a[0], r, to_mask_dst, dst_half)
             # SCC (RDNA ISA): bitwise ops -> result != 0; s_add/sub_i32 -> signed overflow;
             # s_min_u32 -> S0 < S1, s_max_u32 -> S0 > S1; s_cselect leaves SCC.
             if op in ("s_xor_b32", "s_andn2_b32", "s_orn2_b32", "s_nand_b32", "s_nor_b32", "s_xnor_b32"):
@@ -8421,10 +8474,13 @@ class Gen:
             self.emit(f"{result} = OpSelect %uint {in_range} {converted} {saturated}")
             self.dst(a[0], result)
         elif op in U2 or op in S2:
+            to_mask_dst, dst_half = (self._mask_b32_dst_half(a[0], a[1:3])
+                                     if op in self.MASK_SOP2_B32 else (False, None))
             if op in S2:
                 x_val, y_val = self.imm_val(a[1]), self.imm_val(a[2])
-                writes_exec = a[0]["k"] == "special" and a[0].get("t", "").startswith("exec")
-                is_mask = not self.wave64 and (writes_exec or self.holds_lane_mask(a[1]) or self.holds_lane_mask(a[2]))
+                is_mask = to_mask_dst or (
+                    op in self.MASK_SOP2_B32 and (self.holds_lane_mask(a[1]) or self.holds_lane_mask(a[2]))
+                )
                 if x_val is not None and y_val is not None and not is_mask:
                     folded = None
                     if op == "s_and_b32":
@@ -8467,7 +8523,7 @@ class Gen:
                 else:
                     x, y = self.sop2_b32_srcs(op, a)     # lane-mask sources as mask_src (s_and/or_b32 on EXEC)
                 self.emit(f"{r} = {kind} %uint {x} {y}")
-            self.dst(a[0], r)
+            self._store_b32_mask_dst(a[0], r, to_mask_dst, dst_half)
             if op in ("s_and_b32", "s_or_b32"):
                 self.scc_logic(a, r)
             elif op in ("s_lshl_b32", "s_lshr_b32"):
