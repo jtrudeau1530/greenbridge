@@ -30,7 +30,7 @@ from collections import Counter, defaultdict
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(__file__))
-from shader_ir import parse_file  # noqa: E402
+from shader_ir import HDR, parse_file  # noqa: E402
 import cfg_structure  # noqa: E402
 import fssm_header  # noqa: E402
 import lane_masks  # noqa: E402
@@ -11159,6 +11159,35 @@ def native_blob(path, name):
         return f.read()
 
 
+def check_printed_encodings(path, info):
+    """A listing without undecodable words is translated from LLVM's text, which shows the instruction LLVM decoded,
+    not the bytes it read. Where those bytes sit next to the listing (fssm/ or fspx/), each instruction's printed
+    encoding must be the bytes at its offset (same_encoding), so a field the decoder drops is refused instead of
+    being translated as 0: llvm-mc's gfx1013 decoder prints 16-bit VOPC compares without their VOP3 op_sel bits
+    and re-encodes them as 0. On the 1.0.2.1 corpus all 30,335,381 instructions of the 25,030 such listings match.
+    Only a listing whose header names the code range it was disassembled from (shader_disasm.py), with a blob that
+    holds that range, is checked: a hand-written listing, run_gpu_tests.py's "code 0x0..0x0 (synthetic)" and a
+    test's header-only blob are not the bytes the text came from."""
+    with open(path, encoding="utf-8", errors="replace") as f:
+        m = HDR.match(f.readline())
+    if not m or int(m.group(3), 16) <= int(m.group(2), 16):
+        return
+    fssm, code, _ = native_paths(path, info["name"])
+    if not (os.path.isfile(fssm) or os.path.isfile(code)):
+        return
+    blob = native_blob(path, info["name"])
+    if int(m.group(3), 16) > len(blob):
+        return
+    for ins in info["insns"]:
+        if not ins.get("enc"):
+            continue
+        enc = bytes.fromhex(ins["enc"])
+        raw = blob[ins["pc"]:ins["pc"] + len(enc)]
+        if not same_encoding(raw, enc, base_op(ins["op"])):
+            raise Unsupported(f"{ins['op']} at 0x{ins['pc']:x}: the blob holds {raw.hex()}, LLVM printed "
+                              f"{enc.hex()} (a field the disassembler dropped)")
+
+
 def cs_dispatch_state(path, name):
     """(COMPUTE_PGM_RSRC2, group x, y, z): FSSM header words 0x138..0x144, or an FSPX program's kind-0 entry."""
     fssm, _, meta = native_paths(path, name)
@@ -11211,6 +11240,8 @@ def translate(path):
         insns = reachable_code(insns)
         if any(i.get("normalized") for i in insns):
             raise Unsupported("reachable instruction with normalized encoding")
+    else:
+        check_printed_encodings(path, info)
     g = Gen(stage)
     if stage in ("vs", "ms"):   # --f16-interp-fallback places the decoded halves clear of every param
         g.param_max = max((int(t[5:]) for i in insns if base_op(i["op"]) == "exp" for t in
