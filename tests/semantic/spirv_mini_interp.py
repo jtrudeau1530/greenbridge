@@ -527,6 +527,8 @@ def _invocation(text, inputs, push_constants, memory, step=False):
             constants[res] = values[res] = False
         elif op == "OpConstantNull":
             constants[res] = values[res] = types.zero(a[0])
+        elif op == "OpConstantComposite":           # a constant array or vector (e.g. %fmt_size_tab's table)
+            values[res] = [values[x] for x in a[1:]]
         elif op == "OpVariable":
             cls, pointee = ptr_types[a[0]]
             if a[1] != cls:
@@ -538,7 +540,7 @@ def _invocation(text, inputs, push_constants, memory, step=False):
             elif cls == "Input":
                 init = inputs.get(res, types.zero(pointee))
                 var_box[res] = [list(init) if isinstance(init, (list, tuple)) else init]
-            elif cls in ("Function", "Output", "Workgroup"):
+            elif cls in ("Function", "Output", "Workgroup", "Private"):
                 if len(a) > 2:
                     init = values[a[2]]
                     var_box[res] = [list(init) if isinstance(init, list) else init]
