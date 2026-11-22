@@ -122,6 +122,92 @@ def oracle_s_nor_saveexec_b64(ssrc0: int, old_exec: int) -> Tuple[int, int, int]
 
 
 # ==============================================================================
+# Symbolic AST Opcode Definitions and Typed Expressions
+# ==============================================================================
+
+class Opcode(str, Enum):
+    S_NAND_SAVEEXEC_B64 = "s_nand_saveexec_b64"
+    S_NOR_SAVEEXEC_B64 = "s_nor_saveexec_b64"
+
+
+class RegType(Enum):
+    SGPR = auto()
+    EXEC = auto()
+    VCC = auto()
+    SCC = auto()
+
+
+@dataclass(frozen=True)
+class Reg64:
+    """Represents a 64-bit architectural register (SGPR pair, EXEC, or VCC)."""
+    reg_type: RegType
+    index: int = 0
+
+    def __post_init__(self) -> None:
+        if self.reg_type == RegType.SGPR:
+            if not (0 <= self.index <= 254):
+                raise ValueError(f"SGPR pair base index {self.index} out of range [0, 254]")
+        elif self.reg_type in (RegType.EXEC, RegType.VCC, RegType.SCC):
+            if self.index != 0:
+                raise ValueError(f"Special register {self.reg_type.name} does not use non-zero index")
+
+    @property
+    def lo_reg(self) -> int:
+        return self.index
+
+    @property
+    def hi_reg(self) -> int:
+        return self.index + 1
+
+    @property
+    def name(self) -> str:
+        if self.reg_type == RegType.SGPR:
+            return f"s[{self.index}:{self.index + 1}]"
+        elif self.reg_type == RegType.EXEC:
+            return "exec"
+        elif self.reg_type == RegType.VCC:
+            return "vcc"
+        elif self.reg_type == RegType.SCC:
+            return "scc"
+        return f"unk_{self.reg_type.name}"
+
+
+@dataclass(frozen=True)
+class Literal64:
+    """Represents a 64-bit unsigned literal constant or bitmask."""
+    value: int
+
+    def __post_init__(self) -> None:
+        if not (0 <= self.value <= MASK64):
+            raise ValueError(f"Literal64 value {self.value:#x} out of 64-bit range")
+
+    @property
+    def name(self) -> str:
+        return f"{self.value:#018x}"
+
+
+Operand64 = Union[Reg64, Literal64]
+
+
+@dataclass(frozen=True)
+class SaveExecInstruction:
+    """Symbolic AST node representing a 64-bit saveexec instruction."""
+    opcode: Opcode
+    sdst: Reg64
+    ssrc0: Operand64
+
+    def __post_init__(self) -> None:
+        if self.sdst.reg_type not in (RegType.SGPR, RegType.EXEC):
+            raise TypeError(f"Destination sdst must be SGPR or EXEC, got {self.sdst.reg_type}")
+        if isinstance(self.ssrc0, Reg64):
+            if self.ssrc0.reg_type not in (RegType.SGPR, RegType.EXEC, RegType.VCC):
+                raise TypeError(f"Source ssrc0 register must be SGPR, EXEC, or VCC, got {self.ssrc0.reg_type}")
+
+    def disassemble(self) -> str:
+        return f"{self.opcode.value} {self.sdst.name}, {self.ssrc0.name}"
+
+
+# ==============================================================================
 # Phase 1 Unit Tests: Oracle and Architectural Model
 # ==============================================================================
 
@@ -225,6 +311,60 @@ class TestOracleAndModel(unittest.TestCase):
         self.assertEqual(saved_full, 0)
         self.assertEqual(new_exec_full, ALL64)
         self.assertEqual(scc_full, 1)
+
+
+# ==============================================================================
+# Phase 2 Unit Tests: Symbolic AST Opcode Definitions and Typed Expressions
+# ==============================================================================
+
+class TestSymbolicAST(unittest.TestCase):
+    """Verify symbolic AST construction, typed operand expressions, and disassembly."""
+
+    def test_reg64_properties(self) -> None:
+        s0_1 = Reg64(RegType.SGPR, 0)
+        self.assertEqual(s0_1.lo_reg, 0)
+        self.assertEqual(s0_1.hi_reg, 1)
+        self.assertEqual(s0_1.name, "s[0:1]")
+
+        exec_reg = Reg64(RegType.EXEC)
+        self.assertEqual(exec_reg.name, "exec")
+
+        vcc_reg = Reg64(RegType.VCC)
+        self.assertEqual(vcc_reg.name, "vcc")
+
+    def test_literal64_properties(self) -> None:
+        lit = Literal64(0x1234_5678_9ABC_DEF0)
+        self.assertEqual(lit.value, 0x1234_5678_9ABC_DEF0)
+        self.assertEqual(lit.name, "0x123456789abcdef0")
+
+    def test_ast_instruction_disassembly(self) -> None:
+        instr_nand = SaveExecInstruction(
+            opcode=Opcode.S_NAND_SAVEEXEC_B64,
+            sdst=Reg64(RegType.SGPR, 4),
+            ssrc0=Reg64(RegType.SGPR, 6),
+        )
+        self.assertEqual(instr_nand.disassemble(), "s_nand_saveexec_b64 s[4:5], s[6:7]")
+
+        instr_nor_lit = SaveExecInstruction(
+            opcode=Opcode.S_NOR_SAVEEXEC_B64,
+            sdst=Reg64(RegType.SGPR, 0),
+            ssrc0=Literal64(0x0000_FFFF_0000_FFFF),
+        )
+        self.assertEqual(instr_nor_lit.disassemble(), "s_nor_saveexec_b64 s[0:1], 0x0000ffff0000ffff")
+
+        instr_nor_vcc = SaveExecInstruction(
+            opcode=Opcode.S_NOR_SAVEEXEC_B64,
+            sdst=Reg64(RegType.EXEC),
+            ssrc0=Reg64(RegType.VCC),
+        )
+        self.assertEqual(instr_nor_vcc.disassemble(), "s_nor_saveexec_b64 exec, vcc")
+
+    def test_ast_immutability_and_hash(self) -> None:
+        instr1 = SaveExecInstruction(Opcode.S_NAND_SAVEEXEC_B64, Reg64(RegType.SGPR, 0), Reg64(RegType.SGPR, 2))
+        instr2 = SaveExecInstruction(Opcode.S_NAND_SAVEEXEC_B64, Reg64(RegType.SGPR, 0), Reg64(RegType.SGPR, 2))
+        self.assertEqual(instr1, instr2)
+        s = {instr1, instr2}
+        self.assertEqual(len(s), 1)
 
 
 if __name__ == "__main__":
