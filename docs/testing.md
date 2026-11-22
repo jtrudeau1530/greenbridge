@@ -126,6 +126,16 @@ python -I runtime/test/shaders/build.py <out dir>
 python -I runtime/test/shaders/check.py <out dir> <folder with the test programs>
 ```
 
+For the standalone `v_mullit_f32` readback, build the full-screen triangle and the
+hand-written semantic fixture, then run 120 draws with runtime SGPR inputs.
+The driver checks every pixel against an integer product rounded to 24 bits.
+It reports the input words, pixel and channel on the first mismatch.
+
+```sh
+python -I runtime/test/shaders/build.py <out-dir> vs_ids ps_mullit
+python -I runtime/test/shaders/mullit_readback.py <out-dir> <harness-directory>
+```
+
 For D3D12/runtime tests, `LEONIDA_VK_VALIDATION=1` enables `VK_LAYER_KHRONOS_validation`. When running with validation, set `DISABLE_RTSS_LAYER=1` and `DISABLE_VULKAN_OBS_CAPTURE=1` if MSI Afterburner (RivaTuner) or OBS is installed: their overlay layers can add unsupported swapchain usage, and in an elevated (administrator) terminal the loader ignores `VK_LOADER_LAYERS_DISABLE=~implicit~` (see "Known problems").
 
 ## The Windows runtime on Linux, under Wine or Proton
