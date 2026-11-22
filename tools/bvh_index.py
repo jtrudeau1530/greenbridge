@@ -19,6 +19,10 @@ Usage:
     python -I tools/bvh_index.py <archive.rpf> [--out index.json] [--csv index.csv]
                                  [--start N] [--limit BYTES] [--max-inflate BYTES]
     python -I tools/bvh_index.py <dir-with-rpf-or-bin> [--out index.json] [--csv index.csv]
+                                 [--max-inflate BYTES]
+
+--start and --limit apply to a single archive only; with a directory they are an error (exit 2).
+--max-inflate applies to every .rpf in the directory.
 
 Exit status is 0 even when nothing is found; the summary says how many streams were read.
 """
@@ -295,13 +299,13 @@ def summarize(rows, source, span, zero, unread, elapsed):
             "elapsed_s": round(elapsed, 2)}
 
 
-def scan_dir(path):
+def scan_dir(path, max_inflate=1 << 28):
     rpfs = sorted(glob.glob(os.path.join(path, "**", "*.rpf"), recursive=True))
     rows, summaries = [], []
     if rpfs:
         for p in rpfs:
             try:
-                r, s = scan_rpf(p)
+                r, s = scan_rpf(p, max_inflate=max_inflate)
             except (OSError, ValueError) as e:   # one unreadable archive should not lose the others
                 print(f"{p}: skipped ({e})", file=sys.stderr)
                 continue
@@ -387,9 +391,11 @@ def main(argv=None):
     ap.add_argument("--max-inflate", type=byte_count, default=1 << 28,
                     help="keep at most this many bytes of one stream")
     a = ap.parse_args(argv)
+    if os.path.isdir(a.target) and (a.start is not None or a.limit is not None):
+        ap.error("--start and --limit apply to a single archive, not a directory")
     below_normal()
     if os.path.isdir(a.target):
-        rows, summaries = scan_dir(a.target)
+        rows, summaries = scan_dir(a.target, a.max_inflate)
     else:
         try:
             rows, summaries = scan_rpf(a.target, a.start, a.limit, a.max_inflate)

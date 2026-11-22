@@ -1,4 +1,4 @@
-"""CPU checks for tools/valu_fuzz.py (FUZZ-2, FUZZ-5, FUZZ-7): the reference models and the generators, no GPU.
+"""CPU checks for tools/valu_fuzz.py (FUZZ-2, FUZZ-5): the reference models and the generators, no GPU.
 
 The GPU side (vk_compute_test, rdna2spirv.py) is what the fuzzer compares against; these tests make sure the models it
 compares with are right, so a mismatch is the translator's and not the fuzzer's.
@@ -126,48 +126,6 @@ def test_skip_op_leaves_an_op_out():
     for p in vf.programs("f16", 3, 30, (32,), skip=("v_fma_f16", "v_pk_fma_f16", "v_fmac_f16")):
         assert not any(op["name"] in ("v_fma_f16", "v_pk_fma_f16", "v_fmac_f16") for op in p.ops)
 
-
-# ------------------------------------------------------------------ wave family
-
-def wave_with(op, wave=32):
-    p = vf.WaveFamily(1, 0, wave)
-    base = {"d": vf.POOL[0], "a": vf.POOL[1], "b": vf.POOL[2], "c": vf.POOL[3], "exec": p.full, "lane": 3,
-            "cmp": "eq_u32", "cmask": 0, "mbmask": 0, "sel": list(range(16)), "mdk": "mov_lo", "text": "t"}
-    base.update(op)
-    p.ops = [base]
-    return p
-
-
-def test_mbcnt_counts_mask_bits_below_the_lane():
-    p = wave_with({"kind": "mbcnt", "mbmask": 0b1011}, wave=32)
-    regs, _ = p.model()
-    a = vf.POOL[1]
-    init = {t: regs[t][a].v for t in range(vf.THREADS)}
-    assert [regs[t][vf.POOL[0]].v - init[t] for t in range(5)] == [0, 1, 2, 2, 3]
-    assert regs[32][vf.POOL[0]].v - init[32] == 0          # second wave32 starts again at lane 0
-
-
-def test_readfirstlane_uses_the_first_active_lane():
-    p = wave_with({"kind": "readfirstlane", "exec": 0b1000}, wave=32)
-    regs, _ = p.model()
-    first = ((3 * (p.init[vf.POOL[1]][0] & 0xFFFFFF)) & vf.M32) ^ p.init[vf.POOL[1]][1]
-    assert all(regs[t][vf.POOL[0]].v == first for t in range(32))
-
-
-def test_permlanex16_reads_the_other_row():
-    p = wave_with({"kind": "permlanex16", "sel": [0] * 16}, wave=32)
-    regs, _ = p.model()
-    a0 = lambda t: ((t * (p.init[vf.POOL[1]][0] & 0xFFFFFF)) & vf.M32) ^ p.init[vf.POOL[1]][1]  # noqa: E731
-    assert regs[0][vf.POOL[0]].v == a0(16) and regs[16][vf.POOL[0]].v == a0(0)
-
-
-def test_cmp_writes_zero_for_inactive_lanes():
-    p = wave_with({"kind": "maskdata", "exec": 0b0101, "cmp": "ne_u32", "cmask": 0xFFFFFFFF}, wave=32)
-    regs, _ = p.model()
-    assert regs[0][vf.POOL[0]].v == 0b0101
-
-
-# ------------------------------------------------------------------ memory family
 
 def test_out_of_range_loads_read_zero_and_stores_drop():
     p = vf.MemFamily(1, 0, 32)

@@ -28,11 +28,20 @@ def solid_bc1(color):
     return struct.pack("<HHI", c, c, 0)
 
 
-def retile_to(layout, mip, linear, out):
-    pat = (ttpf.PATTERNS_4K if layout["tile"] == 4096 else ttp64)[
+def solid_bc4(v):
+    return bytes([v, v, 0, 0, 0, 0, 0, 0])
+
+
+def solid_bc5(r, g):
+    return solid_bc4(r) + solid_bc4(g)
+
+
+def retile_to(layout, mip, linear, out, base_offset=0):
+    pat = (ttpf.PATTERNS_4K if layout["tile"] == 4096 else ttpf.PATTERNS_64K)[
         {1: 0, 2: 1, 4: 2, 8: 3, 16: 4}[layout["element_bytes"]]]
     eb = layout["element_bytes"]
     bw, bh = layout["block_w"], layout["block_h"]
+    mip_off = base_offset + mip["offset"]
     for y in range(mip["blocks_h"]):
         for x in range(mip["blocks_w"]):
             off = ((y // bh) * (mip["padded_w"] // bw) + x // bw) * layout["tile"]
@@ -42,20 +51,41 @@ def retile_to(layout, mip, linear, out):
                 elif s < 0:
                     off |= (((y + mip["tile_y"]) >> (-s - 1)) & 1) << bit
             at = (y * mip["blocks_w"] + x) * eb
-            out[mip["offset"] + off:mip["offset"] + off + eb] = linear[at:at + eb]
+            out[mip_off + off:mip_off + off + eb] = linear[at:at + eb]
 
 
-ttpf64 = {
-    0: (1, 2, 3, -2, -1, -3, 4, -4, -5, 5, -6, 6, -7, 7, -8, 8),
-    1: (0, 1, 2, 3, -1, -2, -3, 4, -4, 5, -5, 6, -6, 7, -7, 8),
-    2: (0, 0, 1, 2, -1, -2, -3, 3, -4, 4, -5, 5, -6, 6, -7, 7),
-    3: (0, 0, 0, 1, -1, 2, 3, -2, -3, 4, -4, 5, -5, 6, -6, 7),
-    4: (0, 0, 0, 0, 1, -1, 2, -2, -3, 3, -4, 4, -5, 5, -6, 6),
-}
+def retile_volume(layout, linear):
+    eb = layout["element_bytes"]
+    pat = ttpf.VOLUME_PATTERNS_4K[{1: 0, 2: 1, 4: 2, 8: 3, 16: 4}[eb]]
+    bw, bh, bd = layout["block_w"], layout["block_h"], layout["block_d"]
+    mip = layout["mips"][0]
+    w, h, d = mip["blocks_w"], mip["blocks_h"], mip["blocks_d"]
+    tiles_x = mip["padded_w"] // bw
+    out = bytearray(layout["size"])
+    for z in range(d):
+        z_base = (z // bd) * layout["z_tile_stride"]
+        z_in_tile = 0
+        for bit, s in enumerate(pat):
+            if s >= 101:
+                z_in_tile |= ((z >> (s - 101)) & 1) << bit
+        for y in range(h):
+            y_tile = (y // bh) * tiles_x
+            y_in_tile = z_in_tile
+            for bit, s in enumerate(pat):
+                if s < 0:
+                    y_in_tile |= ((y >> (-s - 1)) & 1) << bit
+            for x in range(w):
+                off = z_base + (y_tile + x // bw) * layout["tile"] + y_in_tile
+                for bit, s in enumerate(pat):
+                    if 0 < s < 100:
+                        off |= ((x >> (s - 1)) & 1) << bit
+                at = ((z * h + y) * w + x) * eb
+                out[off:off + eb] = linear[at:at + eb]
+    return bytes(out)
 
 
-def solid_chain(layout, fmt=71):
-    """Build block-linear bytes for every mip; each block is one solid BC1 colour."""
+def solid_chain(layout, fmt=71, color_fn=None):
+    """Build block-linear bytes for every mip; each block is one solid BC1/BC4/BC5 colour."""
     eb = layout["element_bytes"]
     out = {}
     # Smooth gradient at the top level; every lower mip is the 2x2 block mean.
@@ -63,8 +93,11 @@ def solid_chain(layout, fmt=71):
     colours = {}
     for y in range(top["blocks_h"]):
         for x in range(top["blocks_w"]):
-            colours[(0, x, y)] = (min(255, x * 255 // max(1, top["blocks_w"] - 1)),
-                                  min(255, y * 255 // max(1, top["blocks_h"] - 1)), 128)
+            if color_fn is not None:
+                colours[(0, x, y)] = color_fn(x, y, top["blocks_w"], top["blocks_h"])
+            else:
+                colours[(0, x, y)] = (min(255, x * 255 // max(1, top["blocks_w"] - 1)),
+                                      min(255, y * 255 // max(1, top["blocks_h"] - 1)), 128)
     for m in range(1, len(layout["mips"])):
         pm = layout["mips"][m - 1]
         cm = layout["mips"][m]
@@ -85,9 +118,72 @@ def solid_chain(layout, fmt=71):
         for y in range(mip["blocks_h"]):
             for x in range(mip["blocks_w"]):
                 at = (y * mip["blocks_w"] + x) * eb
-                buf[at:at + eb] = solid_bc1(colours[(mip["index"], x, y)])[:eb].ljust(eb, b"\0")
+                c = colours[(mip["index"], x, y)]
+                if fmt == 80:
+                    blk = solid_bc4(c[0])
+                elif fmt == 83:
+                    blk = solid_bc5(c[0], c[1])
+                else:
+                    blk = solid_bc1(c)[:eb].ljust(eb, b"\0")
+                buf[at:at + eb] = blk
         out[mip["index"]] = bytes(buf)
     return out
+
+
+def write_rds5_pool(path, records, chunks):
+    """Write a synthetic RDS5/ETPF pool with one or more zlib-compressed chunks."""
+    count = len(chunks) + 2
+    table_end = 24 + (count - 1) * 8
+    etpf = ttpf.align(table_end, 256)
+    area = len(records) * 24
+    metadata = 16 + area + len(records) * 32
+    padded = ttpf.align(metadata, 4096)
+
+    source = etpf + padded
+    virt = padded
+    entries = []
+    packed_chunks = []
+    for raw in chunks:
+        assert len(raw) % 4096 == 0 and len(raw) > 0
+        packed_payload = zlib.compress(raw, 9)
+        pad = (-len(packed_payload)) % 256
+        entries.append((source // 256) | (8 << 26) | ((virt // 4096) << 30) | (pad << 52))
+        packed_chunks.append((source, packed_payload))
+        source += len(packed_payload) + pad
+        virt += len(raw)
+
+    vsize = virt
+    entries.append((source // 256) | ((vsize // 4096) << 30))
+
+    header = bytearray(24)
+    header[0:4] = b"RDS5"
+    struct.pack_into("<I", header, 4, count)
+    struct.pack_into("<Q", header, 8, vsize | (22 << 56))
+    struct.pack_into("<I", header, 16, (count + 31) // 32)
+    struct.pack_into("<I", header, 20, 0)
+
+    blob = bytearray(source)
+    blob[0:24] = header
+    for i, e in enumerate(entries):
+        struct.pack_into("<Q", blob, 24 + i * 8, e)
+    blob[etpf:etpf + 4] = b"ETPF"
+    struct.pack_into("<III", blob, etpf + 4, 634, len(records), area)
+    for i, rec in enumerate(records):
+        blob[etpf + 16 + i * 16:etpf + 16 + (i + 1) * 16] = rec
+        struct.pack_into("<Q", blob, etpf + 16 + len(records) * 16 + i * 8, 0x1234567890ABCDEF + i)
+    for src, payload in packed_chunks:
+        blob[src:src + len(payload)] = payload
+    with open(path, "wb") as f:
+        f.write(blob)
+    return padded
+
+
+def pack_etpf_record(width, height, packed_mips, non_tail, fmt, depth, dimension, mode,
+                     base, meta=0, extra=0):
+    a = (width - 1) | ((height - 1) << 14) | ((packed_mips & 0xF) << 28)
+    b = non_tail | (fmt << 3) | ((depth - 1) << 10) | (dimension << 21) | (mode << 23)
+    c = (base // 4096) | (meta << 21)
+    return struct.pack("<IIII", a, b, c, extra)
 
 
 def build_pool(path, width=256, height=256, mips=7, non_tail=1, fmt=71, mode=4,
@@ -194,6 +290,42 @@ class BcDecodeTest(unittest.TestCase):
         self.assertLess(ttpf.mean_abs_error(ttpf.downsample2(parent, 2, 2), child), 1.0)
         wrong = [(0.0, 255.0, 0.0)]
         self.assertGreater(ttpf.mean_abs_error(ttpf.downsample2(parent, 2, 2), wrong), 50)
+
+    def test_bc4_and_bc5_interpolation_modes(self):
+        # BC4 8-value mode (e0=210 > e1=70): index 0 -> 210, index 1 -> 70, index 2 -> (6*210+70)//7 = 190
+        bits8 = 0 | (1 << 3) | (2 << 6)
+        blk8 = bytes([210, 70]) + bits8.to_bytes(6, "little")
+        px8 = ttpf.decode_pixels(80, blk8, 1, 1)
+        self.assertEqual(px8[0], (210.0, 210.0, 210.0))
+        self.assertEqual(px8[1], (70.0, 70.0, 70.0))
+        self.assertEqual(px8[2], (190.0, 190.0, 190.0))
+
+        # BC4 6-value mode (e0=50 <= e1=150): index 6 -> 0, index 7 -> 255
+        bits6 = 0 | (1 << 3) | (6 << 6) | (7 << 9)
+        blk6 = bytes([50, 150]) + bits6.to_bytes(6, "little")
+        px6 = ttpf.decode_pixels(80, blk6, 1, 1)
+        self.assertEqual(px6[0], (50.0, 50.0, 50.0))
+        self.assertEqual(px6[1], (150.0, 150.0, 150.0))
+        self.assertEqual(px6[2], (0.0, 0.0, 0.0))
+        self.assertEqual(px6[3], (255.0, 255.0, 255.0))
+
+        # BC5 (fmt=83): channel R from first BC4 block, channel G from second, B=0.0
+        px5 = ttpf.decode_pixels(83, blk8 + blk6, 1, 1)
+        self.assertEqual(px5[0], (210.0, 50.0, 0.0))
+        self.assertEqual(px5[1], (70.0, 150.0, 0.0))
+        self.assertEqual(px5[2], (190.0, 0.0, 0.0))
+        self.assertEqual(px5[3], (210.0, 255.0, 0.0))
+
+    def test_block_means_sub_block_clamping(self):
+        # 4x4 block where only the top-left 2x2 texels are active; remaining 12 are zero-padded.
+        pixels = []
+        for y in range(4):
+            for x in range(4):
+                pixels.append((200.0, 100.0, 50.0) if (x < 2 and y < 2) else (0.0, 0.0, 0.0))
+        clamped = ttpf.block_means(pixels, 1, 1, pixels_w=2, pixels_h=2)
+        self.assertEqual(clamped, [(200.0, 100.0, 50.0)])
+        unclamped = ttpf.block_means(pixels, 1, 1)
+        self.assertEqual(unclamped, [(50.0, 25.0, 12.5)])
 
 
 class SyntheticPoolTest(unittest.TestCase):
@@ -317,15 +449,15 @@ class SyntheticPoolTest(unittest.TestCase):
     def test_scan_buckets_an_unknown_element_size(self):
         path = os.path.join(self.tmp.name, "unknown-format.ttpf")
         build_pool(path, meta=0x599)
-        # Rewrite the format field in the one ETPF record. The scan rejects the
-        # record before reading texture data, so the payload stays untouched.
+        # Rewrite the 7-bit format field to DXGI 11 (R16G16B16A16_UNORM, intentionally
+        # unmapped in ELEMENT_BYTES). The scan rejects the record before reading texture data.
         etpf = ttpf.align(24 + 2 * 8, 256)
         at = etpf + 16 + 4
         with open(path, "r+b") as f:
             f.seek(at)
             b = struct.unpack("<I", f.read(4))[0]
             f.seek(at)
-            f.write(struct.pack("<I", (b & ~(255 << 3)) | (156 << 3)))
+            f.write(struct.pack("<I", (b & ~(0x7F << 3)) | (11 << 3)))
         out = os.path.join(self.tmp.name, "scan4.json")
         import io
         from contextlib import redirect_stdout
@@ -333,6 +465,7 @@ class SyntheticPoolTest(unittest.TestCase):
             ttpf.scan_pools([path], out)
         with open(out, encoding="utf-8") as f:
             total = json.load(f)["total"]
+        self.assertEqual(total["format11"], 1)
         self.assertEqual(total["whitelist_gated"], 1)
         self.assertEqual(total["gated_layout_ok"], 0)
         self.assertEqual(total["gated_no_layout"], 1)
@@ -342,6 +475,25 @@ class SyntheticPoolTest(unittest.TestCase):
         self.assertEqual(total["gated_full_chain"], 0)
         self.assertEqual(total["after_full"], 0)
         self.assertEqual(total["after_skip"], 1)
+
+    def test_legacy_format_156_parses_as_format_28_depth_2(self):
+        # Raw 156 << 3 in the old 8-bit format view sets bit 10 (depth bit 0), so
+        # the fixed 7-bit format / 11-bit depth parser reads format=28, depth=2 (2D array).
+        path = os.path.join(self.tmp.name, "legacy156.ttpf")
+        build_pool(path, meta=0x599)
+        etpf = ttpf.align(24 + 2 * 8, 256)
+        at = etpf + 16 + 4
+        with open(path, "r+b") as f:
+            f.seek(at)
+            b = struct.unpack("<I", f.read(4))[0]
+            f.seek(at)
+            f.write(struct.pack("<I", (b & ~(0xFF << 3)) | (156 << 3)))
+        pool = ttpf.Pool(path)
+        self.addCleanup(pool.close)
+        d = pool.descriptor(0)
+        self.assertEqual((d["format"], d["depth"], d["dimension"]), (28, 2, 1))
+        a = ttpf.analyze(pool, 0)
+        self.assertEqual(a["shape"], "2d_array")
 
 
 def build_bc1_bcpack_pool(path, width=64, height=64, mips=5, non_tail=1, mode=4,
@@ -511,6 +663,467 @@ class BadPoolTest(unittest.TestCase):
             code, err = self.run_main("layout", self.good, index)
             self.assertEqual(code, 2)
             self.assertIn("out of range", err)
+
+
+class SyntheticArrayPoolTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def _build_array_pool(self, path, width=256, height=256, depth=3, fmt=83, mips=6,
+                          mode=1, truncate_pages=0):
+        eb = ttpf.element_bytes(fmt)
+        blk = 4 if fmt in ttpf.BC_FORMATS else 1
+        layout = ttpf.array_surface_layout(width, height, depth, mips, eb, blk,
+                                           ttpf.tile_bytes(mode))
+        payload = bytearray(layout["size"])
+        linear_slices = []
+        # Distinct smooth gradient per slice so slice-major control strongly disagrees.
+        for s in range(depth):
+            def color_fn(x, y, bw, bh, sl=s):
+                base_r = (sl * 90 + 20) % 256
+                base_g = (220 - sl * 80) % 256
+                r = min(255, max(0, (base_r + x * 120 // max(1, bw - 1)) % 256))
+                g = min(255, max(0, (base_g + y * 120 // max(1, bh - 1)) % 256))
+                return (r, g, 128)
+            lin = solid_chain(layout, fmt=fmt, color_fn=color_fn)
+            linear_slices.append(lin)
+            for mip in layout["mips"]:
+                retile_to(layout, mip, lin[mip["index"]], payload,
+                          base_offset=s * mip["slice_stride"])
+        chunk = bytes(payload[:-truncate_pages * 4096] if truncate_pages else payload)
+        base = ttpf.align(16 + 24 + 32, 4096)
+        rec = pack_etpf_record(width, height, mips, 0, fmt, depth, 1, mode, base)
+        write_rds5_pool(path, [rec], [chunk])
+        return layout, linear_slices
+
+    def test_2d_array_round_trip_check_export_and_scan(self):
+        import io
+        from contextlib import redirect_stdout
+        path = os.path.join(self.tmp.name, "array_bc5.ttpf")
+        layout, linear_slices = self._build_array_pool(path)
+        pool = ttpf.Pool(path)
+        self.addCleanup(pool.close)
+
+        a = ttpf.analyze(pool, 0)
+        self.assertEqual(a["shape"], "2d_array")
+        self.assertTrue(a["span_matches"])
+        self.assertTrue(a["full_chain"])
+        self.assertEqual(a["layout"]["depth"], 3)
+
+        desc = ttpf.describe(pool, 0)
+        self.assertEqual(desc["shape"], "2d_array")
+        self.assertEqual(desc["depth"], 3)
+        self.assertEqual(desc["mips_detail"][0]["slice_stride"], layout["mips"][0]["region"])
+
+        ok_meta, pages = ttpf.validate_chunk_metadata(pool, a["descriptor"], a["allocation_span"])
+        self.assertTrue(ok_meta)
+        self.assertEqual(pages, ())
+
+        # Byte-exact mip-major detile round-trip across all slices and mips.
+        tiled = pool.read_range(a["descriptor"]["base"], layout["size"])
+        for s in range(3):
+            for mip in layout["mips"]:
+                off = mip["offset"] + s * mip["slice_stride"]
+                got = ttpf.detile(layout, mip, tiled[off:off + mip["region"]])
+                self.assertEqual(got, linear_slices[s][mip["index"]])
+
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rc = ttpf.check(pool, 0)
+        res = json.loads(buf.getvalue())
+        self.assertEqual(rc, 0, res)
+        self.assertLessEqual(res["max_error"], 6.0)
+        self.assertGreater(res["slice_major_control_max_error"], 5 * res["max_error"])
+        self.assertGreater(res["slice_major_control_max_error"], 10.0)
+
+        out_dds = os.path.join(self.tmp.name, "array_bc5.dds")
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(ttpf.export(pool, 0, out_dds), 0)
+        with open(out_dds, "rb") as f:
+            dds = f.read()
+        self.assertEqual(dds[:4], b"DDS ")
+        dxgi_fmt, dim, misc, array_size, _ = struct.unpack_from("<IIIII", dds, 128)
+        self.assertEqual((dxgi_fmt, dim, misc, array_size), (83, 3, 0, 3))
+        expected_payload = b"".join(
+            linear_slices[s][m["index"]]
+            for s in range(3)
+            for m in layout["mips"]
+        )
+        self.assertEqual(dds[148:], expected_payload)
+
+        scan_out = os.path.join(self.tmp.name, "scan_array.json")
+        with redirect_stdout(io.StringIO()):
+            ttpf.scan_pools([path], scan_out)
+        with open(scan_out, encoding="utf-8") as f:
+            total = json.load(f)["total"]
+        self.assertEqual((total["arrays"], total["arrays_2d"], total["arrays_2d_full"]), (1, 1, 1))
+        self.assertEqual((total["after_full"], total["after_skip"]), (1, 0))
+
+    def test_2d_array_negative_controls(self):
+        import io
+        from contextlib import redirect_stdout, redirect_stderr
+
+        # Unsupported array mode (mode=4 instead of mode=1) rejected.
+        bad_mode = os.path.join(self.tmp.name, "array_bad_mode.ttpf")
+        self._build_array_pool(bad_mode, mode=4)
+        pool_m = ttpf.Pool(bad_mode)
+        self.addCleanup(pool_m.close)
+        am = ttpf.analyze(pool_m, 0)
+        self.assertIn("unsupported 2D array mode", am["blocked"])
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(ttpf.check(pool_m, 0), 2)
+        with redirect_stderr(io.StringIO()):
+            self.assertEqual(ttpf.export(pool_m, 0, os.path.join(self.tmp.name, "bad1.dds")), 2)
+
+        # Truncated span rejected by analyze, export, and scan_pools.
+        trunc = os.path.join(self.tmp.name, "array_trunc.ttpf")
+        self._build_array_pool(trunc, truncate_pages=1)
+        pool_t = ttpf.Pool(trunc)
+        self.addCleanup(pool_t.close)
+        at = ttpf.analyze(pool_t, 0)
+        self.assertFalse(at["span_matches"])
+        self.assertNotIn("available", at)
+        self.assertIn("allocation span", at["blocked"])
+        with redirect_stderr(io.StringIO()):
+            self.assertEqual(ttpf.export(pool_t, 0, os.path.join(self.tmp.name, "bad2.dds")), 2)
+        scan_out = os.path.join(self.tmp.name, "scan_trunc.json")
+        with redirect_stdout(io.StringIO()):
+            ttpf.scan_pools([trunc], scan_out)
+        with open(scan_out, encoding="utf-8") as f:
+            total = json.load(f)["total"]
+        self.assertEqual(total["multi_slice_layout_mismatch"], 1)
+        self.assertEqual((total["after_full"], total["after_skip"]), (0, 1))
+
+
+class SyntheticCubemapPoolTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def _build_cubemap_faces(self, layout, fmt=71):
+        tiled_full = bytearray(layout["full_bytes"])
+        linear_faces = []
+        for face in range(6):
+            def color_fn(x, y, bw, bh, f=face):
+                r = min(255, (f * 40 + x * 180 // max(1, bw - 1)) % 256)
+                g = min(255, ((5 - f) * 40 + y * 180 // max(1, bh - 1)) % 256)
+                b = 32 + f * 36
+                return (r, g, b)
+            lin = solid_chain(layout, fmt=fmt, color_fn=color_fn)
+            linear_faces.append(lin)
+            for mip in layout["mips"]:
+                retile_to(layout, mip, lin[mip["index"]], tiled_full,
+                          base_offset=face * layout["face_size"])
+        return bytes(tiled_full), linear_faces
+
+    def _build_cubemap_pool(self, path, non_tail=0, mode=None, depth=6,
+                            meta=0, extra=0, chunks_override=None):
+        width, height, fmt, mips = 128, 128, 71, 6
+        if mode is None:
+            mode = 18 + 2 * non_tail
+        if non_tail == 0:
+            chunk_pages = None
+        else:
+            chunk_pages = (6, 18)
+        layout = ttpf.cubemap_surface_layout(width, height, mips, 8, 4, non_tail, chunk_pages)
+        tiled_full, linear_faces = self._build_cubemap_faces(layout, fmt=fmt)
+        if chunks_override is not None:
+            chunks = chunks_override
+        elif non_tail == 0:
+            chunks = [tiled_full]
+        else:
+            # Chunk 0: 6-page dummy low-res snapshot; Chunk 1: 18-page full-res 6-face cubemap.
+            chunks = [b"\x5A" * (6 * 4096), tiled_full]
+            if meta == 0 and extra == 0:
+                # 5-bit codes: slot 0 = 6 (6 pages), slot 1 = 21 (18 pages) -> 6 | (21 << 5) = 0x2A6
+                meta = 6 | (21 << 5)
+        base = ttpf.align(16 + 24 + 32, 4096)
+        packed_mips = mips - non_tail
+        rec = pack_etpf_record(width, height, packed_mips, non_tail, fmt, depth, 2, mode,
+                               base, meta=meta, extra=extra)
+        write_rds5_pool(path, [rec], chunks)
+        return layout, linear_faces
+
+    def test_cubemap_mode18_and_streaming_mode20(self):
+        import io
+        from contextlib import redirect_stdout
+
+        for non_tail, mode, expected_offset, expected_pages in [
+            (0, 18, 0, ()),
+            (1, 20, 6 * 4096, (6, 18)),
+        ]:
+            with self.subTest(non_tail=non_tail, mode=mode):
+                path = os.path.join(self.tmp.name, f"cube_mode{mode}.ttpf")
+                layout, linear_faces = self._build_cubemap_pool(path, non_tail=non_tail, mode=mode)
+                pool = ttpf.Pool(path)
+                self.addCleanup(pool.close)
+
+                a = ttpf.analyze(pool, 0)
+                self.assertEqual(a["shape"], "cubemap")
+                self.assertTrue(a["span_matches"])
+                self.assertTrue(a["full_chain"])
+                self.assertEqual(a["layout"]["data_offset"], expected_offset)
+
+                ok_meta, pages = ttpf.validate_chunk_metadata(pool, a["descriptor"], a["allocation_span"])
+                self.assertTrue(ok_meta)
+                self.assertEqual(pages, expected_pages)
+
+                desc = ttpf.describe(pool, 0)
+                self.assertEqual(desc["shape"], "cubemap")
+                self.assertEqual(desc["data_offset"], expected_offset)
+                self.assertEqual(desc["snapshots"], non_tail + 1)
+
+                buf = io.StringIO()
+                with redirect_stdout(buf):
+                    rc = ttpf.check(pool, 0)
+                res = json.loads(buf.getvalue())
+                self.assertEqual(rc, 0, res)
+                self.assertEqual(len(res["per_face_max_error"]), 6)
+                self.assertLessEqual(res["max_error"], 6.0)
+                self.assertGreater(res["tail_origin_control"], 5 * res["max_error"])
+
+                out_dds = os.path.join(self.tmp.name, f"cube_mode{mode}.dds")
+                with redirect_stdout(io.StringIO()):
+                    self.assertEqual(ttpf.export(pool, 0, out_dds), 0)
+                with open(out_dds, "rb") as f:
+                    dds = f.read()
+                self.assertEqual(dds[:4], b"DDS ")
+                caps2 = struct.unpack_from("<I", dds, 112)[0]
+                self.assertEqual(caps2 & 0xFE00, 0xFE00)
+                dxgi_fmt, dim, misc, array_size, _ = struct.unpack_from("<IIIII", dds, 128)
+                self.assertEqual((dxgi_fmt, dim, misc, array_size), (71, 3, 4, 1))
+                expected_payload = b"".join(
+                    linear_faces[face][m["index"]]
+                    for face in range(6)
+                    for m in layout["mips"]
+                )
+                self.assertEqual(dds[148:], expected_payload)
+
+                scan_out = os.path.join(self.tmp.name, f"scan_cube{mode}.json")
+                with redirect_stdout(io.StringIO()):
+                    ttpf.scan_pools([path], scan_out)
+                with open(scan_out, encoding="utf-8") as f:
+                    total = json.load(f)["total"]
+                self.assertEqual((total["cubemaps"], total["cubemaps_full"]), (1, 1))
+                self.assertEqual((total["chunk_metadata_ok"], total["chunk_metadata_fail"]), (1, 0))
+                self.assertEqual((total["after_full"], total["after_skip"]), (1, 0))
+
+    def test_cubemap_negative_controls(self):
+        import io
+        from contextlib import redirect_stdout
+
+        # Wrong chunk metadata (code 4 = 4 pages instead of 6 for chunk 0).
+        bad_meta = os.path.join(self.tmp.name, "cube_bad_meta.ttpf")
+        self._build_cubemap_pool(bad_meta, non_tail=1, meta=(4 | (21 << 5)))
+        pool_bm = ttpf.Pool(bad_meta)
+        self.addCleanup(pool_bm.close)
+        abm = ttpf.analyze(pool_bm, 0)
+        self.assertIn("chunk metadata mismatch", abm["blocked"])
+        ok_meta, _ = ttpf.validate_chunk_metadata(pool_bm, abm["descriptor"], abm["allocation_span"])
+        self.assertFalse(ok_meta)
+
+        # depth != 6 rejected.
+        bad_depth = os.path.join(self.tmp.name, "cube_bad_depth.ttpf")
+        self._build_cubemap_pool(bad_depth, non_tail=0, depth=4)
+        pool_bd = ttpf.Pool(bad_depth)
+        self.addCleanup(pool_bd.close)
+        abd = ttpf.analyze(pool_bd, 0)
+        self.assertIn("unsupported cubemap depth", abd["blocked"])
+
+        # Invalid mode (mode=22 with non_tail=0) rejected.
+        bad_mode = os.path.join(self.tmp.name, "cube_bad_mode.ttpf")
+        self._build_cubemap_pool(bad_mode, non_tail=0, mode=22)
+        pool_bmod = ttpf.Pool(bad_mode)
+        self.addCleanup(pool_bmod.close)
+        abmod = ttpf.analyze(pool_bmod, 0)
+        self.assertIn("unsupported cubemap mode", abmod["blocked"])
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(ttpf.check(pool_bmod, 0), 2)
+
+    def test_cubemap_first_tail_zero_and_single_mip_check(self):
+        import io
+        from contextlib import redirect_stdout
+
+        base = ttpf.align(16 + 24 + 32, 4096)
+        # 32x32 BC1 4-mip and 1-mip cubemaps: every mip fits in one 4 KiB tail tile (first_tail == 0).
+        for mips, name in ((4, "cube_tail0.ttpf"), (1, "cube_1mip.ttpf")):
+            w = h = 32
+            layout = ttpf.cubemap_surface_layout(w, h, mips, 8, 4, 0)
+            self.assertEqual(layout["first_tail"], 0 if mips > 1 else 1)
+            buf = bytearray(layout["full_bytes"])
+            for face in range(6):
+                color = (face * 35, 60 + face * 25, 20 + face * 30)
+                for m in layout["mips"]:
+                    lin = solid_bc1(color) * (m["blocks_w"] * m["blocks_h"])
+                    retile_to(layout, m, lin, buf, base_offset=face * layout["face_size"])
+            path = os.path.join(self.tmp.name, name)
+            rec = pack_etpf_record(w, h, mips, 0, 71, 6, 2, 18, base, meta=0, extra=0)
+            write_rds5_pool(path, [rec], [bytes(buf)])
+            pool = ttpf.Pool(path)
+            self.addCleanup(pool.close)
+            out = io.StringIO()
+            with redirect_stdout(out):
+                rc = ttpf.check(pool, 0)
+            self.assertEqual(rc, 0)
+            res = json.loads(out.getvalue())
+            self.assertEqual(res["first_tail"], 0 if mips > 1 else 1)
+            self.assertIsNone(res["tail_origin_control"])
+            if mips == 1:
+                self.assertIsNone(res["max_error"])
+            else:
+                self.assertLessEqual(res["max_error"], 1.0)
+
+        # Mid-chunk base mismatch rejected by validate_chunk_metadata.
+        misaligned = os.path.join(self.tmp.name, "cube_mid_chunk.ttpf")
+        rec = pack_etpf_record(32, 32, 1, 0, 71, 6, 2, 18, base + 4096, meta=6, extra=0)
+        write_rds5_pool(misaligned, [rec], [bytes(6 * 4096)])
+        pool_m = ttpf.Pool(misaligned)
+        self.addCleanup(pool_m.close)
+        ok_meta, _ = ttpf.validate_chunk_metadata(pool_m, pool_m.descriptor(0), 6 * 4096)
+        self.assertFalse(ok_meta)
+
+        # non_tail == 3 alignment-padding validation (align_group 1/2/3 positive + negative).
+        # Group 1: chunk0 (4 pages) + pad (12) == 16; chunks = [4, 16, 64].
+        # Group 2: chunk0 (1) + chunk1 (3) + pad (12) == 16.
+        # Group 3: chunk0 (1) + chunk1 (3) + pad (4) == 8.
+        cases = [
+            ("g1_ok", (4 | (11 << 5) | (15 << 10)), (1 << 19) | (12 << 21), [4, 16, 64], True),
+            ("g1_bad", (4 | (11 << 5) | (15 << 10)), (1 << 19) | (11 << 21), [4, 16, 64], False),
+            ("g2_ok", (1 | (3 << 5) | (11 << 10)), (2 << 19) | (12 << 21), [1, 3, 16], True),
+            ("g3_ok", (1 | (3 << 5) | (8 << 10)), (3 << 19) | (4 << 21), [1, 3, 8], True),
+            ("g0_bad", (1 | (3 << 5) | (8 << 10)), (0 << 19) | (4 << 21), [1, 3, 8], False),
+        ]
+        for tag, val20, hi_extra, page_counts, expected in cases:
+            meta = val20 & 0x7FF
+            extra = ((val20 >> 11) & 0x1FF) | hi_extra
+            p_path = os.path.join(self.tmp.name, f"align_{tag}.ttpf")
+            chunks = [bytes(pg * 4096) for pg in page_counts]
+            span = sum(len(c) for c in chunks)
+            r = pack_etpf_record(256, 256, 6, 3, 71, 1, 1, 4, base, meta=meta, extra=extra)
+            write_rds5_pool(p_path, [r], chunks)
+            pl = ttpf.Pool(p_path)
+            self.addCleanup(pl.close)
+            ok_al, _ = ttpf.validate_chunk_metadata(pl, pl.descriptor(0), span)
+            self.assertEqual(ok_al, expected, tag)
+
+
+class SyntheticVolumePoolTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def _build_volume_pool(self, path, width, height, depth, fmt, mips=1, mode=2):
+        eb = ttpf.element_bytes(fmt)
+        if fmt in ttpf.VOLUME_FLOAT_FORMATS and mips == 1:
+            layout = ttpf.volume_surface_layout(width, height, depth, mips, eb)
+            channels = ttpf.VOLUME_FLOAT_FORMATS[fmt]
+            vals = []
+            for z in range(depth):
+                for y in range(height):
+                    for x in range(width):
+                        if channels == 1:
+                            vals.append(10.0 + 0.05 * z + 0.1 * x + 0.1 * y)
+                        else:
+                            vals.extend((
+                                10.0 + 0.02 * z + 0.05 * x,
+                                5.0 + 0.02 * z + 0.05 * y,
+                                8.0 + 0.01 * z,
+                                1.0,
+                            ))
+            linear = struct.pack(f"<{len(vals)}e", *vals)
+            tiled = retile_volume(layout, linear)
+        else:
+            layout = None
+            linear = b""
+            tiled = b"\x00" * 4096
+        base = ttpf.align(16 + 24 + 32, 4096)
+        rec = pack_etpf_record(width, height, mips, 0, fmt, depth, 3, mode, base)
+        write_rds5_pool(path, [rec], [tiled])
+        return layout, linear, tiled
+
+    def test_volume_fmt54_and_fmt10_round_trip_check_export_and_scan(self):
+        import io
+        from contextlib import redirect_stdout
+
+        cases = [
+            # fmt=54 (R16_FLOAT): depth=8 pads to block_d=16 -> padded_d=16
+            (16, 8, 8, 54, 16, 16),
+            # fmt=10 (R16G16B16A16_FLOAT): block_d=8 -> padded_d=8
+            (8, 8, 8, 10, 8, 8),
+        ]
+        for w, h, d, fmt, exp_bd, exp_pd in cases:
+            with self.subTest(dims=(w, h, d), fmt=fmt):
+                path = os.path.join(self.tmp.name, f"vol_fmt{fmt}.ttpf")
+                layout, linear, tiled = self._build_volume_pool(path, w, h, d, fmt)
+                pool = ttpf.Pool(path)
+                self.addCleanup(pool.close)
+
+                a = ttpf.analyze(pool, 0)
+                self.assertEqual(a["shape"], "volume")
+                self.assertTrue(a["span_matches"])
+                self.assertTrue(a["full_chain"])
+                self.assertEqual((a["layout"]["block_d"], a["layout"]["padded_d"]), (exp_bd, exp_pd))
+
+                desc = ttpf.describe(pool, 0)
+                self.assertEqual(desc["shape"], "volume")
+                self.assertEqual((desc["block_d"], desc["padded_d"]), (exp_bd, exp_pd))
+
+                # Byte-exact 3D detile round-trip.
+                self.assertEqual(ttpf.detile_volume(layout, tiled), linear)
+
+                buf = io.StringIO()
+                with redirect_stdout(buf):
+                    rc = ttpf.check(pool, 0)
+                res = json.loads(buf.getvalue())
+                self.assertEqual(rc, 0, res)
+                self.assertLess(res["volume_3d_z_diff"], 0.5 * res["volume_2d_control_z_diff"])
+
+                out_dds = os.path.join(self.tmp.name, f"vol_fmt{fmt}.dds")
+                with redirect_stdout(io.StringIO()):
+                    self.assertEqual(ttpf.export(pool, 0, out_dds), 0)
+                with open(out_dds, "rb") as f:
+                    dds = f.read()
+                self.assertEqual(dds[:4], b"DDS ")
+                dds_depth = struct.unpack_from("<I", dds, 24)[0]
+                caps2 = struct.unpack_from("<I", dds, 112)[0]
+                self.assertEqual(dds_depth, d)
+                self.assertEqual(caps2 & 0x200000, 0x200000)
+                dxgi_fmt, dim, misc, array_size, _ = struct.unpack_from("<IIIII", dds, 128)
+                self.assertEqual((dxgi_fmt, dim, misc, array_size), (fmt, 4, 0, 1))
+                self.assertEqual(dds[148:], linear)
+
+                scan_out = os.path.join(self.tmp.name, f"scan_vol{fmt}.json")
+                with redirect_stdout(io.StringIO()):
+                    ttpf.scan_pools([path], scan_out)
+                with open(scan_out, encoding="utf-8") as f:
+                    total = json.load(f)["total"]
+                self.assertEqual((total["volumes"], total["volumes_full"]), (1, 1))
+                self.assertEqual((total["after_full"], total["after_skip"]), (1, 0))
+
+    def test_volume_negative_controls(self):
+        import io
+        from contextlib import redirect_stdout, redirect_stderr
+
+        # mips=2 volume rejected.
+        bad_mips = os.path.join(self.tmp.name, "vol_mips2.ttpf")
+        self._build_volume_pool(bad_mips, 16, 8, 8, 54, mips=2)
+        pool_m = ttpf.Pool(bad_mips)
+        self.addCleanup(pool_m.close)
+        am = ttpf.analyze(pool_m, 0)
+        self.assertIn("unsupported 3D volume", am["blocked"])
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(ttpf.check(pool_m, 0), 2)
+
+        # BC volume (fmt=71) rejected.
+        bad_bc = os.path.join(self.tmp.name, "vol_bc1.ttpf")
+        self._build_volume_pool(bad_bc, 16, 16, 8, 71, mips=1)
+        pool_bc = ttpf.Pool(bad_bc)
+        self.addCleanup(pool_bc.close)
+        abc = ttpf.analyze(pool_bc, 0)
+        self.assertIn("unsupported 3D volume", abc["blocked"])
+        with redirect_stderr(io.StringIO()):
+            self.assertEqual(ttpf.export(pool_bc, 0, os.path.join(self.tmp.name, "bad_vol.dds")), 2)
 
 
 if __name__ == "__main__":

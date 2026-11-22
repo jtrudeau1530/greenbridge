@@ -147,16 +147,31 @@ work.
 
 No game data, keys, or extracted assets belong in this directory or in the repository.
 
-### Typed UINT clear regression
+### Typed clear regression
 
 `clear_color_test` checks numeric UINT conversion and unchanged float clears without a GPU.
-`d3d12_uint_clear_test` compares 21 full/rectangle readbacks with Windows WARP across the three
-currently supported typed UINT render-target formats. Fixtures are synthetic; no shaders or game data are needed.
+`d3d12_clear_test` compares full/rectangle readbacks with Windows WARP across UNORM, SNORM, FLOAT, UINT and SINT
+render-target formats, plus depth and stencil clears. Fixtures are synthetic; no shaders or game data are needed.
 The GPU test runs explicitly, while the CPU test is registered in CTest.
 
 ```powershell
 ctest --test-dir runtime/build -C RelWithDebInfo -R '^clear_color$' --output-on-failure
 $env:LEONIDA_VK_VALIDATION = '1'
 $env:VK_VALIDATION_VALIDATE_SYNC = '1'
-.\runtime\build\RelWithDebInfo\d3d12_uint_clear_test.exe
+.\runtime\build\RelWithDebInfo\d3d12_clear_test.exe
+```
+
+### RGBA8 typeless RTV clear regression (phase 1)
+
+`typeless_rtv_test` checks typed-view recording and replay without a GPU. It is registered in CTest.
+`d3d12_typeless_rtv_test` compares synthetic full and rectangular clears with Windows WARP through explicit
+UNORM/SRGB/UINT RTVs on a one-mip, one-layer, single-sample 2D RGBA8 typeless resource. It checks descriptor
+snapshots, alternating view formats, SRGB with UAV resource usage, and invalid view rejection.
+Other typeless families, typed-resource casts, SINT/SNORM, mip/array expansion, MSAA and 3D views are not added.
+
+```powershell
+ctest --test-dir runtime/build -C RelWithDebInfo -R '^typeless_rtv$' --output-on-failure
+$env:LEONIDA_VK_VALIDATION = '1'
+$env:VK_VALIDATION_VALIDATE_SYNC = '1'
+.\runtime\build\RelWithDebInfo\d3d12_typeless_rtv_test.exe
 ```
