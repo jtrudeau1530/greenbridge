@@ -536,7 +536,12 @@ public:
     explicit DescriptorHeap(const D3D12_DESCRIPTOR_HEAP_DESC& desc)
         : desc_(desc), storage_(new std::byte[std::size_t(desc.NumDescriptors) * kDescriptorSize]()) {}
 
-    D3D12_DESCRIPTOR_HEAP_DESC STDMETHODCALLTYPE GetDesc() override { return desc_; }
+    // A node mask of 0 reads back as the one node of a single adapter, as on the PC runtime (d3d12_node_mask_test).
+    D3D12_DESCRIPTOR_HEAP_DESC STDMETHODCALLTYPE GetDesc() override {
+        D3D12_DESCRIPTOR_HEAP_DESC desc = desc_;
+        if (!desc.NodeMask) desc.NodeMask = 1;
+        return desc;
+    }
     D3D12_CPU_DESCRIPTOR_HANDLE STDMETHODCALLTYPE GetCPUDescriptorHandleForHeapStart() override {
         return {reinterpret_cast<SIZE_T>(storage_.get())};
     }
@@ -698,11 +703,32 @@ public:
 
     // D3D12 answers only for committed and placed resources (E_INVALIDARG for reserved ones, measured on the PC
     // runtime).
+    //
+    // The node masks read back as the one node of a single adapter (0 becomes 1), and the heap flags as the runtime
+    // resolves them: the caller's, without the two creation-only bits (CREATE_NOT_RESIDENT, CREATE_NOT_ZEROED), plus
+    // the DENY bits of the resource classes this resource is not (buffers 0xC0, textures without render-target or
+    // depth use 0x44, the others 0x84). Measured on the PC runtime and WARP (d3d12_node_mask_test).
     HRESULT STDMETHODCALLTYPE GetHeapProperties(D3D12_HEAP_PROPERTIES* properties, D3D12_HEAP_FLAGS* flags) override {
         if (reserved_) return E_INVALIDARG;
-        if (properties) *properties = heap_;
-        if (flags) *flags = heap_flags_;
+        if (properties) {
+            *properties = heap_;
+            if (!properties->CreationNodeMask) properties->CreationNodeMask = 1;
+            if (!properties->VisibleNodeMask) properties->VisibleNodeMask = 1;
+        }
+        if (flags) *flags = resolved_heap_flags();
         return S_OK;
+    }
+
+    D3D12_HEAP_FLAGS resolved_heap_flags() const {
+        const UINT deny_buffers = D3D12_HEAP_FLAG_DENY_BUFFERS, deny_rt_ds = D3D12_HEAP_FLAG_DENY_RT_DS_TEXTURES,
+                   deny_non_rt_ds = D3D12_HEAP_FLAG_DENY_NON_RT_DS_TEXTURES;
+        UINT deny = deny_buffers | deny_rt_ds;  // a texture without render-target or depth use
+        if (desc_.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER)
+            deny = deny_rt_ds | deny_non_rt_ds;
+        else if (desc_.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL))
+            deny = deny_buffers | deny_non_rt_ds;
+        const UINT creation_only = D3D12_HEAP_FLAG_CREATE_NOT_RESIDENT | D3D12_HEAP_FLAG_CREATE_NOT_ZEROED;
+        return D3D12_HEAP_FLAGS((UINT(heap_flags_) & ~creation_only) | deny);
     }
 
     // Buffers on upload and readback heaps are mapped persistently; the ranges are hints, as on D3D12. A texture
