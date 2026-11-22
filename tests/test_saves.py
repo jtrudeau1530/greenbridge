@@ -316,6 +316,82 @@ class AtomicPackTest(unittest.TestCase):
         self.assertEqual(rd(self.out), self.new)
         self.assertEqual(os.stat(self.out).st_mode & 0o777, os.stat(self.source).st_mode & 0o777)
 
+    def test_hard_linked_destination_is_refused_without_splitting_aliases(self):
+        alias = os.path.join(self.root, "alias.jsav")
+        try:
+            os.link(self.out, alias)
+        except OSError as exc:
+            self.skipTest(f"cannot create hard links: {exc}")
+        before = sorted(os.listdir(self.root))
+        with self.assertRaisesRegex(ValueError, "hard link"):
+            quiet(saves.pack, self.extracted, self.out)
+        result = subprocess.run([sys.executable, "-I", TOOL, "pack", self.extracted, self.out],
+                                capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("hard link", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertTrue(os.path.samefile(self.out, alias))
+        self.assertEqual(rd(alias), self.old)
+        self.assertEqual(rd(self.out), self.old)
+        self.assertEqual(sorted(os.listdir(self.root)), before)
+
+    def symlink(self, target, link):
+        try:
+            os.symlink(target, link)
+        except (OSError, NotImplementedError) as exc:
+            self.skipTest(f"cannot create symbolic links: {exc}")
+
+    def test_destination_symlinks_update_the_target_and_remain_links(self):
+        probe = os.path.join(self.root, "symlink-probe")
+        self.symlink("missing-probe-target", probe)
+        os.unlink(probe)
+        for relative in (False, True):
+            for dangling in (False, True):
+                with self.subTest(relative=relative, dangling=dangling):
+                    label = f"{relative}-{dangling}"
+                    target_dir = os.path.join(self.root, "target-" + label)
+                    os.mkdir(target_dir)
+                    target = os.path.join(target_dir, "save.jsav")
+                    if not dangling:
+                        write(target, self.old)
+                    link = os.path.join(self.root, "link-" + label)
+                    spelling = os.path.relpath(target, self.root) if relative else target
+                    self.symlink(spelling, link)
+                    quiet(saves.pack, self.extracted, link)
+                    self.assertTrue(os.path.islink(link))
+                    self.assertEqual(os.readlink(link), spelling)
+                    self.assertEqual(rd(target), self.new)
+                    self.assertEqual(os.listdir(target_dir), ["save.jsav"])
+
+    def test_failed_publication_through_symlink_preserves_link_and_target(self):
+        link = os.path.join(self.root, "link.jsav")
+        self.symlink(os.path.basename(self.out), link)
+        before = sorted(os.listdir(self.root))
+        with mock.patch.object(saves.os, "replace", side_effect=PermissionError("destination locked")):
+            with self.assertRaises(PermissionError):
+                quiet(saves.pack, self.extracted, link)
+        self.assertTrue(os.path.islink(link))
+        self.assertEqual(os.readlink(link), os.path.basename(self.out))
+        self.assertEqual(rd(self.out), self.old)
+        self.assertEqual(sorted(os.listdir(self.root)), before)
+
+    @unittest.skipUnless(os.name == "nt", "Windows directory junction")
+    def test_destination_through_directory_junction_updates_the_target(self):
+        target_dir = os.path.join(self.root, "target")
+        os.mkdir(target_dir)
+        junction = os.path.join(self.root, "junction")
+        result = subprocess.run(["cmd", "/c", "mklink", "/J", junction, target_dir],
+                                capture_output=True, text=True)
+        if result.returncode:
+            self.skipTest("cannot create junction: " + result.stderr)
+        self.addCleanup(os.rmdir, junction)
+        target = os.path.join(target_dir, "save.jsav")
+        write(target, self.old)
+        quiet(saves.pack, self.extracted, os.path.join(junction, "save.jsav"))
+        self.assertTrue(os.path.isdir(junction))
+        self.assertEqual(rd(target), self.new)
+        self.assertEqual(os.listdir(target_dir), ["save.jsav"])
+
     @unittest.skipUnless(os.name == "posix", "POSIX permission bits")
     def test_replacement_preserves_existing_permission_bits(self):
         os.chmod(self.out, 0o640)

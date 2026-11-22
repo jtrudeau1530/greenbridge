@@ -10,6 +10,7 @@ Commands
   extract <file> <outdir>        JSAV  -> index.json + blocks/NNN_<group>_<hash>.json + save.pretty.json
                                  ASAV  -> header.json + payload.bin (+ payload.json if it is text)
   pack    <extracted dir> <out>  rebuild a JSAV from an `extract` folder (blocks are taken verbatim)
+                                 follows destination symlinks; destinations with multiple hard links are refused
   verify  <JSAV file>            extract + pack in memory and check the rebuild is byte-identical
   diff    <JSAV a> <JSAV b>      list blocks that were added, removed or changed between two saves
   import <save dir>... [--out DIR] [--map OLD=CONTAINER/BLOB]... [--with-packed] [--force] [--dry-run]
@@ -22,6 +23,7 @@ Commands
 """
 import json
 import os
+import stat
 import struct
 import sys
 import tempfile
@@ -300,16 +302,26 @@ def pack_from_dir(src):
 
 
 def pack(src, out):
+    # Publish at the symlink's target, as open(out, 'wb') did, without replacing the link itself.
+    destination = os.path.realpath(out)
+    try:
+        existing = os.stat(destination)
+    except FileNotFoundError:
+        pass
+    else:
+        # Replacing one hard-link name cannot update the other aliases atomically.
+        if stat.S_ISREG(existing.st_mode) and existing.st_nlink > 1:
+            raise ValueError(f'{out}: destination has multiple hard links; choose an unlinked output path')
     data = pack_from_dir(src)
-    parent = os.path.dirname(os.path.abspath(out))
+    parent = os.path.dirname(destination)
     tmp = None
     try:
         with tempfile.NamedTemporaryFile('wb', dir=parent, prefix='.saves-pack-', suffix='.tmp',
                                          delete=False) as f:
             tmp = f.name
             f.write(data)
-        os.chmod(tmp, published_mode(out))
-        os.replace(tmp, out)
+        os.chmod(tmp, published_mode(destination))
+        os.replace(tmp, destination)
     except BaseException:
         if tmp is not None:
             try:
