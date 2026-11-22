@@ -201,7 +201,9 @@ int main(int argc, char** argv) {
     void* chain = nullptr;
     if (fma.supported()) {
         enable.push_back(fma.extension());
+#ifdef VK_KHR_SHADER_FMA_EXTENSION_NAME  // older Vulkan headers have no VkPhysicalDeviceShaderFmaFeaturesKHR
         fma.features.pNext = chain; chain = &fma.features;
+#endif
     }
     VkPhysicalDeviceFragmentShaderBarycentricFeaturesKHR bary{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_BARYCENTRIC_FEATURES_KHR};
     VkPhysicalDeviceFragmentShaderInterlockFeaturesEXT lock{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_INTERLOCK_FEATURES_EXT};
