@@ -1477,5 +1477,123 @@ class TestConditionCodesAndStatusFlags(unittest.TestCase):
         self.assertEqual(carry0, 0)
 
 
+class TestIEEE754BoundariesAndNaN(unittest.TestCase):
+    """Unit tests for IEEE 754 boundary extremes, subnormals, and NaN behavior."""
+
+    def test_canonical_nan_quietening_and_propagation(self) -> None:
+        # SNaN in s0 should be quietened
+        s0_snan = pack_f16x2(CANONICAL_SNAN, ONE_F16)
+        s1 = pack_f16x2(ONE_F16, ONE_F16)
+        res = oracle_v_dot2_f16(s0_snan, s1)
+        self.assertTrue(is_nan(res))
+        self.assertTrue(is_qnan(res))
+
+        # QNaN in s1 should propagate
+        s1_qnan = pack_f16x2(ONE_F16, CANONICAL_QNAN)
+        res2 = oracle_v_dot2_f16(s1, s1_qnan)
+        self.assertTrue(is_nan(res2))
+        self.assertTrue(is_qnan(res2))
+
+    def test_nan_clamping_to_positive_zero(self) -> None:
+        # RDNA2 VALU clamp guarantees NaN is clamped to +0.0
+        s0_nan = pack_f16x2(CANONICAL_QNAN, ONE_F16)
+        s1 = pack_f16x2(ONE_F16, ONE_F16)
+        res_clamped = oracle_v_dot2_f16(s0_nan, s1, clamp=True)
+        self.assertEqual(res_clamped, POS_ZERO)
+
+        # Clamping NaN with accumulator
+        res_acc_clamped = oracle_v_dot2acc_f16(s1, s1, CANONICAL_QNAN, clamp=True)
+        self.assertEqual(res_acc_clamped, POS_ZERO)
+
+    def test_infinity_times_zero_produces_qnan(self) -> None:
+        s0 = pack_f16x2(POS_INF, ONE_F16)
+        s1 = pack_f16x2(POS_ZERO, ONE_F16)
+        res = oracle_v_dot2_f16(s0, s1)
+        self.assertTrue(is_nan(res))
+        self.assertTrue(is_qnan(res))
+
+    def test_infinity_addition_and_cancellation(self) -> None:
+        # (+inf) + (+inf) -> +inf
+        s0_inf = pack_f16x2(POS_INF, POS_INF)
+        s1_one = pack_f16x2(ONE_F16, ONE_F16)
+        res_inf = oracle_v_dot2_f16(s0_inf, s1_one)
+        self.assertEqual(res_inf, POS_INF)
+
+        # (+inf) + (-inf) -> Canonical QNaN
+        s0_canc = pack_f16x2(POS_INF, NEG_INF)
+        res_canc = oracle_v_dot2_f16(s0_canc, s1_one)
+        self.assertTrue(is_nan(res_canc))
+        self.assertTrue(is_qnan(res_canc))
+
+    def test_clamping_infinity_boundaries(self) -> None:
+        s0_pos_inf = pack_f16x2(POS_INF, ONE_F16)
+        s1_one = pack_f16x2(ONE_F16, ONE_F16)
+        # +inf clamped -> 1.0
+        res_clamped_pos = oracle_v_dot2_f16(s0_pos_inf, s1_one, clamp=True)
+        self.assertEqual(res_clamped_pos, ONE_F16)
+
+        # -inf clamped -> +0.0
+        s0_neg_inf = pack_f16x2(NEG_INF, ONE_F16)
+        res_clamped_neg = oracle_v_dot2_f16(s0_neg_inf, s1_one, clamp=True)
+        self.assertEqual(res_clamped_neg, POS_ZERO)
+
+    def test_subnormal_operands_and_gradual_underflow(self) -> None:
+        # Subnormal inputs
+        s0 = pack_f16x2(SUB_MIN, SUB_MAX)
+        s1 = pack_f16x2(ONE_F16, POS_ZERO)
+        # SUB_MIN * 1.0 + SUB_MAX * 0.0 = SUB_MIN
+        res = oracle_v_dot2_f16(s0, s1)
+        self.assertEqual(res, SUB_MIN)
+        self.assertTrue(is_subnormal(res))
+
+    def test_subnormal_precision_preservation(self) -> None:
+        s0 = pack_f16x2(SUB_MAX, POS_ZERO)
+        s1 = pack_f16x2(ONE_F16, POS_ZERO)
+        res = oracle_v_dot2_f16(s0, s1)
+        self.assertEqual(res, SUB_MAX)
+
+        s0_neg = pack_f16x2(NEG_SUB_MIN, POS_ZERO)
+        res_neg = oracle_v_dot2_f16(s0_neg, s1)
+        self.assertEqual(res_neg, NEG_SUB_MIN)
+
+    def test_largest_normal_overflow_boundaries(self) -> None:
+        # 65504.0 * 2.0 = 131008.0 -> overflows binary16 to +inf
+        s0 = pack_f16x2(NORM_MAX, POS_ZERO)
+        s1 = pack_f16x2(TWO_F16, POS_ZERO)
+        res = oracle_v_dot2_f16(s0, s1)
+        self.assertEqual(res, POS_INF)
+
+        # NORM_MAX + NORM_MAX -> +inf
+        s0_both = pack_f16x2(NORM_MAX, NORM_MAX)
+        s1_ones = pack_f16x2(ONE_F16, ONE_F16)
+        res_both = oracle_v_dot2_f16(s0_both, s1_ones)
+        self.assertEqual(res_both, POS_INF)
+
+    def test_signed_zero_multiplication_signs(self) -> None:
+        # (+0) * (-1) = -0; (+0) + (-0) = +0
+        s0 = pack_f16x2(POS_ZERO, POS_ZERO)
+        s1 = pack_f16x2(NEG_ONE_F16, ONE_F16)
+        res = oracle_v_dot2_f16(s0, s1)
+        self.assertEqual(res, POS_ZERO)
+
+        # (-0) * (+1) + (-0) * (+1) = -0 + -0 = -0
+        s0_neg = pack_f16x2(NEG_ZERO, NEG_ZERO)
+        s1_pos = pack_f16x2(ONE_F16, ONE_F16)
+        res_neg = oracle_v_dot2_f16(s0_neg, s1_pos)
+        self.assertEqual(res_neg, NEG_ZERO)
+
+    def test_subnormal_clamp_behavior(self) -> None:
+        # Positive subnormal is in (0, 1) -> remains positive subnormal
+        s0 = pack_f16x2(SUB_MAX, POS_ZERO)
+        s1 = pack_f16x2(ONE_F16, POS_ZERO)
+        res_sub = oracle_v_dot2_f16(s0, s1, clamp=True)
+        self.assertEqual(res_sub, SUB_MAX)
+
+        # Negative subnormal is < 0 -> clamps to +0.0
+        s0_neg = pack_f16x2(NEG_SUB_MAX, POS_ZERO)
+        res_neg = oracle_v_dot2_f16(s0_neg, s1, clamp=True)
+        self.assertEqual(res_neg, POS_ZERO)
+
+
 if __name__ == "__main__":
     unittest.main()
