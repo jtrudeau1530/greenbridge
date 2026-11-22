@@ -320,6 +320,21 @@ void check_run_time_load() {
                   XAsyncGetStatus(&block, true) == no_network &&
                   reinterpret_cast<ResultSize>(slot(n, 12))(n, &block, &size) == no_network && size == 0,
               "slots 11/12 (UTF-16 URL security info): the async call completes with no network");
+        // Slots 10/13 in Microsoft's order: (async, bufferByteCount, bufferByteCountUsed*, buffer*, information**).
+        // A sentinel buffer must stay untouched; the two outputs are written where they are, not into the buffer.
+        using SecurityResult = HRESULT(STDMETHODCALLTYPE*)(void*, XAsyncBlock*, size_t, size_t*, uint8_t*, void**);
+        for (int s : {10, 13}) {
+            uint8_t buffer[32];
+            std::memset(buffer, 0xA5, sizeof(buffer));
+            size_t used = 77;
+            void* info = &used;
+            const HRESULT hr = reinterpret_cast<SecurityResult>(slot(n, s))(n, &block, sizeof(buffer), &used, buffer, &info);
+            bool untouched = true;
+            for (uint8_t byte : buffer) untouched = untouched && byte == 0xA5;
+            check(hr == no_network && used == 0 && info == nullptr && untouched,
+                  s == 10 ? "slot 10 (ANSI result): outputs zeroed in place, the caller's buffer untouched"
+                          : "slot 13 (UTF-16 result): outputs zeroed in place, the caller's buffer untouched");
+        }
         using Verify = HRESULT(STDMETHODCALLTYPE*)(void*, void*, const void*);
         check(reinterpret_cast<Verify>(slot(n, 14))(n, nullptr, nullptr) == no_network,
               "slot 14 (XNetworkingVerifyServerCertificate) fails offline");

@@ -279,10 +279,13 @@ HRESULT STDMETHODCALLTYPE net_security_result_size(void*, XAsyncBlock* async, si
     *size = 0;
     return XAsyncGetStatus(async, false);
 }
-HRESULT STDMETHODCALLTYPE net_security_result(void*, XAsyncBlock* async, size_t, void*, void** info, size_t* used) {
+// XNetworkingQuerySecurityInformationForUrl[Utf16]AsyncResult(XAsyncBlock*, size_t bufferByteCount,
+// size_t* bufferByteCountUsed, uint8_t* buffer, XNetworkingSecurityInformation** securityInformation), in the order
+// of Microsoft's reference pages. The buffer itself is never written: there is no result to copy offline.
+HRESULT STDMETHODCALLTYPE net_security_result(void*, XAsyncBlock* async, size_t, size_t* used, uint8_t*, void** info) {
     if (!async) return E_POINTER;
-    if (info) *info = nullptr;
     if (used) *used = 0;
+    if (info) *info = nullptr;
     return XAsyncGetStatus(async, false);
 }
 HRESULT STDMETHODCALLTYPE net_verify_certificate(void*, void*, const void*) { return kNoNetwork; }
