@@ -432,3 +432,68 @@ class TestModuloWrapBoundaryAndBankConflicts(unittest.TestCase):
             self.assertEqual(res[1], lane * 2)
             dword = lane * 3
             self.assertEqual(interp.get_lds_dword(dword), lane * 2 + 1)
+
+
+class TestReturnValuePreservationAlignmentAndNegativeControls(unittest.TestCase):
+    """Tests return value preservation, 32-bit dword alignment, offset immediates, and negative controls."""
+
+    def test_return_value_preservation_and_aliasing(self):
+        # Verify returning atomic inc preserves pre-op value in vdst even when vdst aliases vaddr or vdata
+        interp = LdsSemanticInterpreter(lds_dwords=1024)
+        interp.set_lds_dword(10, 7)
+        interp.set_vgpr(5, 40)  # v5 = byte address 40 (dword 10)
+        interp.set_vgpr(6, 10)  # v6 = wrap limit 10
+
+        # Execute ds_inc_rtn_u32 v5, v5, v6 (vdst aliases vaddr)
+        # Should read old value 7 into v5 and update memory to 8
+        res = interp.parse_and_execute("ds_inc_rtn_u32 v5, v5, v6")
+        self.assertEqual(res, (10, 7))
+        self.assertEqual(interp.get_vgpr(5), 7)
+        self.assertEqual(interp.get_lds_dword(10), 8)
+
+    def test_alignment_and_offset_immediates(self):
+        # Verify byte addressing and offset addition
+        interp = LdsSemanticInterpreter(lds_dwords=1024)
+        interp.set_lds_dword(100, 2)
+        interp.set_vgpr(1, 384)       # base byte address 384 (dword 96)
+        interp.set_vgpr(2, 5)         # limit 5
+
+        # offset:16 adds 16 bytes -> 384 + 16 = 400 bytes -> dword 100
+        res = interp.parse_and_execute("ds_inc_rtn_u32 v0, v1, v2 offset:16")
+        self.assertEqual(res, (100, 2))
+        self.assertEqual(interp.get_lds_dword(100), 3)
+
+    def test_unaligned_low_bits_ignored(self):
+        # Unaligned low bits [1:0] of effective address are truncated (right shift by 2)
+        interp = LdsSemanticInterpreter(lds_dwords=1024)
+        interp.set_lds_dword(50, 4)
+        interp.set_vgpr(1, 201)       # 201 bytes -> dword index 201 >> 2 = 50 (remainder 1 ignored)
+        interp.set_vgpr(2, 10)
+
+        res = interp.parse_and_execute("ds_inc_rtn_u32 v0, v1, v2")
+        self.assertEqual(res, (50, 4))
+        self.assertEqual(interp.get_lds_dword(50), 5)
+
+    def test_negative_controls_malformed_instructions(self):
+        interp = LdsSemanticInterpreter(lds_dwords=1024)
+        with self.assertRaises(ValueError):
+            interp.parse_and_execute("ds_inc_u32 v1")  # too few arguments
+        with self.assertRaises(ValueError):
+            interp.parse_and_execute("ds_inc_rtn_u32 v0, v1")  # too few arguments
+        with self.assertRaises(ValueError):
+            interp.parse_and_execute("ds_unknown_op v0, v1, v2")  # invalid opcode
+        with self.assertRaises(ValueError):
+            interp.parse_and_execute("ds_inc_u32 r1, v2")  # invalid register syntax (not vN)
+
+    def test_negative_controls_index_out_of_bounds(self):
+        interp = LdsSemanticInterpreter(lds_dwords=256)
+        with self.assertRaises(IndexError):
+            interp.set_vgpr(300, 10)  # VGPR index out of range [0..255]
+        with self.assertRaises(IndexError):
+            interp.get_vgpr(300, 0)
+        with self.assertRaises(IndexError):
+            interp.set_lane_active(100, True)  # lane index out of range [0..63]
+        with self.assertRaises(ValueError):
+            LdsSemanticInterpreter(lds_dwords=0)  # non-positive lds dwords
+        with self.assertRaises(ValueError):
+            LdsSemanticInterpreter(lds_dwords=100)  # non power-of-two lds dwords
