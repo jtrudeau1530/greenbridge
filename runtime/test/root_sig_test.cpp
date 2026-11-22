@@ -63,10 +63,10 @@ D3D12_ROOT_SIGNATURE_DESC2 make_legacy_desc2(uint32_t flags) {
     return desc;
 }
 
-// Older in-box D3D12 runtimes (e.g. Windows 11 23H2) refuse root signature
-// 1.2 entirely, so the serializer checks that expect 1.2 to be accepted are
-// skipped there. The byte-level helper checks do not touch the serializer and
-// always run.
+// Older in-box D3D12 runtimes (e.g. Windows 11 23H2, Windows 10 22H2) refuse
+// root signature 1.2 entirely, so the checks of the host serializer's own 1.2
+// behaviour are skipped there. The byte-level helper checks, the 1.2 → 1.1
+// rewrite and the registered shim's 1.2 path always run.
 bool supports_root_signature_1_2() {
     ID3D12Device* device = nullptr;
     HRESULT hr = D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device));
@@ -154,6 +154,97 @@ void test_versioned_1_2(bool supports_1_2) {
     check(SUCCEEDED(hr), "versioned 1.2 copy with cleared flags is accepted by the PC serializer");
 }
 
+// A 1.2 description with a root parameter and two static samplers, the samplers' Flags 0 unless the caller sets them.
+struct Desc12 {
+    D3D12_ROOT_PARAMETER1 param{};
+    D3D12_STATIC_SAMPLER_DESC1 samplers[2]{};
+    D3D12_VERSIONED_ROOT_SIGNATURE_DESC desc{};
+    Desc12() {
+        param.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+        param.Constants = {3, 1, 4};
+        param.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+        for (int i = 0; i < 2; ++i) {
+            D3D12_STATIC_SAMPLER_DESC1& s = samplers[i];
+            s.Filter = i ? D3D12_FILTER_ANISOTROPIC : D3D12_FILTER_MIN_MAG_LINEAR_MIP_POINT;
+            s.AddressU = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+            s.AddressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+            s.AddressW = D3D12_TEXTURE_ADDRESS_MODE_BORDER;
+            s.MipLODBias = 0.5f * float(i + 1);
+            s.MaxAnisotropy = i ? 8u : 1u;
+            s.ComparisonFunc = D3D12_COMPARISON_FUNC_LESS_EQUAL;
+            s.BorderColor = D3D12_STATIC_BORDER_COLOR_OPAQUE_WHITE;
+            s.MinLOD = 1.0f;
+            s.MaxLOD = 9.0f + float(i);
+            s.ShaderRegister = 2u + i;
+            s.RegisterSpace = 5u;
+            s.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+        }
+        desc.Version = D3D_ROOT_SIGNATURE_VERSION_1_2;
+        desc.Desc_1_2 = {1, &param, 2, samplers, D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT};
+    }
+};
+
+bool same_sampler(const D3D12_STATIC_SAMPLER_DESC& a, const D3D12_STATIC_SAMPLER_DESC1& b) {
+    return a.Filter == b.Filter && a.AddressU == b.AddressU && a.AddressV == b.AddressV && a.AddressW == b.AddressW &&
+           a.MipLODBias == b.MipLODBias && a.MaxAnisotropy == b.MaxAnisotropy &&
+           a.ComparisonFunc == b.ComparisonFunc && a.BorderColor == b.BorderColor && a.MinLOD == b.MinLOD &&
+           a.MaxLOD == b.MaxLOD && a.ShaderRegister == b.ShaderRegister && a.RegisterSpace == b.RegisterSpace &&
+           a.ShaderVisibility == b.ShaderVisibility;
+}
+
+// The 1.2 → 1.1 rewrite the serializer shim uses on runtimes that stop at 1.1 (Windows 10, Windows 11 23H2).
+void test_downgrade_1_2_to_1_1(bool supports_1_2) {
+    Desc12 d;
+    std::vector<D3D12_STATIC_SAMPLER_DESC> storage;
+    D3D12_VERSIONED_ROOT_SIGNATURE_DESC v11{};
+    check(rt::d3d12_xs::downgrade_root_signature_1_2_to_1_1(d.desc, storage, v11),
+          "1.2 without sampler flags is rewritten as 1.1");
+    check(v11.Version == D3D_ROOT_SIGNATURE_VERSION_1_1 && v11.Desc_1_1.NumParameters == 1 &&
+              v11.Desc_1_1.pParameters == &d.param && v11.Desc_1_1.NumStaticSamplers == 2 &&
+              v11.Desc_1_1.pStaticSamplers == storage.data() &&
+              v11.Desc_1_1.Flags == D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT,
+          "the 1.1 rewrite keeps the parameters and flags and points at the converted samplers");
+    check(storage.size() == 2 && same_sampler(storage[0], d.samplers[0]) && same_sampler(storage[1], d.samplers[1]),
+          "every static sampler field survives the 1.1 rewrite");
+
+    Blobs b11;
+    check(SUCCEEDED(D3D12SerializeVersionedRootSignature(&v11, &b11.blob, &b11.error)),
+          "the 1.1 rewrite is accepted by the PC serializer");
+    if (supports_1_2) {
+        Blobs b12;
+        check(SUCCEEDED(D3D12SerializeVersionedRootSignature(&d.desc, &b12.blob, &b12.error)),
+              "the 1.2 original is accepted by the PC serializer");
+    } else {
+        std::printf("SKIP the 1.2 original is accepted by the PC serializer (runtime HighestVersion < 1.2)\n");
+    }
+
+    D3D12_VERSIONED_ROOT_SIGNATURE_DESC empty12{};
+    empty12.Version = D3D_ROOT_SIGNATURE_VERSION_1_2;
+    D3D12_VERSIONED_ROOT_SIGNATURE_DESC empty11{};
+    check(rt::d3d12_xs::downgrade_root_signature_1_2_to_1_1(empty12, storage, empty11) &&
+              empty11.Desc_1_1.NumStaticSamplers == 0 && empty11.Desc_1_1.pStaticSamplers == nullptr,
+          "an empty 1.2 description is rewritten as an empty 1.1 one");
+
+    for (D3D12_SAMPLER_FLAGS flag : {D3D12_SAMPLER_FLAG_UINT_BORDER_COLOR,
+                                     D3D12_SAMPLER_FLAG_NON_NORMALIZED_COORDINATES}) {
+        Desc12 f;
+        f.samplers[1].Flags = flag;
+        std::vector<D3D12_STATIC_SAMPLER_DESC> kept(1);
+        D3D12_VERSIONED_ROOT_SIGNATURE_DESC untouched{};
+        untouched.Version = D3D_ROOT_SIGNATURE_VERSION_1_0;
+        const bool rewritten = rt::d3d12_xs::downgrade_root_signature_1_2_to_1_1(f.desc, kept, untouched);
+        check(!rewritten && kept.size() == 1 && untouched.Version == D3D_ROOT_SIGNATURE_VERSION_1_0,
+              flag == D3D12_SAMPLER_FLAG_UINT_BORDER_COLOR
+                  ? "1.2 with a UINT border colour sampler flag is not rewritten, outputs untouched"
+                  : "1.2 with a non-normalized coordinates sampler flag is not rewritten, outputs untouched");
+    }
+
+    D3D12_VERSIONED_ROOT_SIGNATURE_DESC v11in{};
+    v11in.Version = D3D_ROOT_SIGNATURE_VERSION_1_1;
+    check(!rt::d3d12_xs::downgrade_root_signature_1_2_to_1_1(v11in, storage, empty11),
+          "a description that isn't 1.2 is not rewritten");
+}
+
 void test_legacy_entry_point() {
     D3D12_ROOT_SIGNATURE_DESC xbox = make_legacy_desc(kXboxFlags);
 
@@ -222,19 +313,62 @@ void test_registered_shim(bool supports_1_2) {
     check(xbox.Desc_1_0.Flags == static_cast<D3D12_ROOT_SIGNATURE_FLAGS>(kXboxFlags),
           "registered shim leaves the caller's descriptor unchanged");
 
-    if (supports_1_2) {
-        D3D12_VERSIONED_ROOT_SIGNATURE_DESC xbox12{};
-        xbox12.Version = D3D_ROOT_SIGNATURE_VERSION_1_2;
-        xbox12.Desc_1_2 = make_legacy_desc2(kXboxFlags);
+    // 1.2 serializes through the shim on every runtime: as 1.2 where the host takes it, rewritten as 1.1 where it
+    // stops at 1.1.
+    D3D12_VERSIONED_ROOT_SIGNATURE_DESC xbox12{};
+    xbox12.Version = D3D_ROOT_SIGNATURE_VERSION_1_2;
+    xbox12.Desc_1_2 = make_legacy_desc2(kXboxFlags);
 
-        Blobs blobs12;
-        HRESULT hr12 = fn(&xbox12, &blobs12.blob, &blobs12.error);
-        check(SUCCEEDED(hr12), "registered shim clears the Xbox flag byte for 1.2 and the PC serializer accepts");
-        check(xbox12.Desc_1_2.Flags == static_cast<D3D12_ROOT_SIGNATURE_FLAGS>(kXboxFlags),
-              "registered shim leaves the caller's 1.2 descriptor unchanged");
-    } else {
-        std::printf("SKIP registered shim 1.2 (runtime HighestVersion < 1.2)\n");
+    Blobs blobs12;
+    HRESULT hr12 = fn(&xbox12, &blobs12.blob, &blobs12.error);
+    check(SUCCEEDED(hr12), "registered shim clears the Xbox flag byte for 1.2 and the PC serializer accepts");
+    check(xbox12.Desc_1_2.Flags == static_cast<D3D12_ROOT_SIGNATURE_FLAGS>(kXboxFlags),
+          "registered shim leaves the caller's 1.2 descriptor unchanged");
+
+    // With parameters and samplers but no sampler flags; read back through the host deserializer.
+    Desc12 d;
+    d.desc.Desc_1_2.Flags = static_cast<D3D12_ROOT_SIGNATURE_FLAGS>(kXboxFlags | 0x1u);
+    Blobs full;
+    check(SUCCEEDED(fn(&d.desc, &full.blob, &full.error)),
+          "registered shim serializes 1.2 with samplers and no sampler flags");
+    if (full.blob) {
+        ID3D12VersionedRootSignatureDeserializer* de = nullptr;
+        const HRESULT hr_de = D3D12CreateVersionedRootSignatureDeserializer(
+            full.blob->GetBufferPointer(), full.blob->GetBufferSize(), IID_PPV_ARGS(&de));
+        check(SUCCEEDED(hr_de), "the shim's 1.2 blob deserializes");
+        if (SUCCEEDED(hr_de) && de) {
+            const D3D12_VERSIONED_ROOT_SIGNATURE_DESC* got = de->GetUnconvertedRootSignatureDesc();
+            const D3D_ROOT_SIGNATURE_VERSION want =
+                supports_1_2 ? D3D_ROOT_SIGNATURE_VERSION_1_2 : D3D_ROOT_SIGNATURE_VERSION_1_1;
+            check(got && got->Version == want,
+                  supports_1_2 ? "the shim's blob stays version 1.2 on a runtime that takes 1.2"
+                               : "the shim's blob is version 1.1 on a runtime that stops at 1.1");
+            if (got && got->Version == D3D_ROOT_SIGNATURE_VERSION_1_1) {
+                const D3D12_ROOT_SIGNATURE_DESC1& g = got->Desc_1_1;
+                check(g.Flags == D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT && g.NumParameters == 1 &&
+                          g.pParameters[0].ParameterType == D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS &&
+                          g.pParameters[0].Constants.ShaderRegister == 3 &&
+                          g.pParameters[0].Constants.RegisterSpace == 1 &&
+                          g.pParameters[0].Constants.Num32BitValues == 4 && g.NumStaticSamplers == 2 &&
+                          same_sampler(g.pStaticSamplers[0], d.samplers[0]) &&
+                          same_sampler(g.pStaticSamplers[1], d.samplers[1]),
+                      "the 1.1 blob has the Xbox byte cleared and the same parameter and samplers");
+            }
+            de->Release();
+        }
     }
+
+    // Sampler flags have no 1.1 form: the host's own answer where it takes 1.2, a refusal where it doesn't.
+    Desc12 flagged;
+    flagged.samplers[0].BorderColor = D3D12_STATIC_BORDER_COLOR_OPAQUE_WHITE_UINT;
+    flagged.samplers[0].Flags = D3D12_SAMPLER_FLAG_UINT_BORDER_COLOR;
+    Blobs fb;
+    const HRESULT hr_flagged = fn(&flagged.desc, &fb.blob, &fb.error);
+    if (supports_1_2)
+        check(SUCCEEDED(hr_flagged), "registered shim forwards 1.2 with sampler flags to a runtime that takes 1.2");
+    else
+        check(hr_flagged == E_INVALIDARG && !fb.blob,
+              "registered shim refuses 1.2 with sampler flags when the runtime stops at 1.1");
 }
 
 void test_deserializer() {
@@ -322,6 +456,7 @@ int main() {
     test_versioned_1_0();
     test_versioned_1_1();
     test_versioned_1_2(supports_1_2);
+    test_downgrade_1_2_to_1_1(supports_1_2);
     test_legacy_entry_point();
     test_preserves_low_bits_and_unknown_versions();
     test_registered_shim(supports_1_2);
