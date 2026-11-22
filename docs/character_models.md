@@ -91,6 +91,25 @@ it must not be painted with a normal or ORM map.
 The hands and feet keys (`0x4D89F2311DBBB7A8`, `0xA54D9F8B51CA6034`) did not resolve in the
 scanned TTPF pools. The head has no texture reference at all.
 
+## Materials
+
+A binding audit of 120 exported scenes (232 material rows) found 62 with a real `C8E8C282`
+albedo, 29 with a shared `peds_*` collage, 4 with a `C6F46E79` normal map as the base colour,
+and 137 with no texture. The 4 normal-map rows are the biker jacket and crop tee: those parts
+have **no albedo**, so a preview must render them as clay rather than invent a colour.
+
+- **The belt is not a separate part.** It is 172 connected components / 2,229 vertices inside the
+  jeans mesh, with no node, material or texture key; it cannot be separated without editing the
+  geometry.
+- **UVs above 1 are wraps, not atlas pages.** The blazer reaches U=2.0014 (1,628 vertices); after
+  subtracting 1, 90.9% of those vertices are within 1e-4 of a page-0 vertex. The jeans reach
+  U=-0.9936, a -1 mirror.
+- **The body atlas is a shared collage.** `996FDBA2DB30CC12` is 256x256 and contains several ped
+  variants (faces, a tropical shirt, blue jeans, dark cloth). Only 43.7% of the sheet is covered
+  by the body's islands, so bilinear sampling at an island edge can read a neighbouring variant.
+  The blue in an earlier preview came from the authored `baseColorFactor` `(0.200, 0.270, 0.400)`,
+  not from this atlas.
+
 ## What is not decoded
 
 - **Fragment children (tested).** A SixNG fragment-child walk (2026-11-21 build) finds **no**
