@@ -110,6 +110,35 @@ class Step(unittest.TestCase):
         self.assertAlmostEqual(bary[1][0], 0.3)
         self.assertAlmostEqual(bary[2][0], 0.6)
 
+    def test_triangle_barycentrics_independent_of_ray_scale_and_direction(self):
+        # Non-unit and diagonal rays (and scaled TLAS rays) have |dd[2]| != 1; i_num/t_den and j_num/t_den
+        # must still equal the true barycentrics (0.25, 0.25) and reconstruct the 3D hit point org + t * d.
+        target = [0.25, 0.25, 0.0]
+        for d in ([0.0, 0.0, 2.0], [0.0, 0.0, -2.0], [0.5, 0.5, 0.5], [-0.4, -0.3, -0.5], [1.0, 2.0, -3.0]):
+            org = [target[c] - 1.5 * d[c] for c in range(3)]
+            with self.subTest(d=d):
+                t_num, t_den, i_num, j_num = X.triangle_test(TRI, org, d)
+                self.assertNotEqual(t_num, math.inf)
+                t = t_num / t_den
+                b1, b2 = i_num / t_den, j_num / t_den
+                self.assertAlmostEqual(t, 1.5, places=12)
+                self.assertAlmostEqual(b1, 0.25, places=12)
+                self.assertAlmostEqual(b2, 0.25, places=12)
+                b0 = 1.0 - b1 - b2
+                for c in range(3):
+                    rebuilt = b0 * TRI[0][c] + b1 * TRI[1][c] + b2 * TRI[2][c]
+                    self.assertAlmostEqual(rebuilt, org[c] + t * d[c], places=12)
+
+    def test_triangle_edge_hit_with_zero_i_and_negative_major_axis_keeps_positive_j(self):
+        # Point (0.0, 0.25, 0.0) lies on edge v0-v2 (b1 == 0, b2 == 0.25). With dd[2] < 0, t_den < 0;
+        # j_num must share t_den's sign even when i_num == 0 so j_num / t_den is +0.25, not -0.25.
+        for dz in (-1.0, -2.5):
+            with self.subTest(dz=dz):
+                t_num, t_den, i_num, j_num = X.triangle_test(TRI, [0.0, 0.25, 1.0], [0.0, 0.0, dz])
+                self.assertNotEqual(t_num, math.inf)
+                self.assertAlmostEqual(i_num / t_den, 0.0, places=12)
+                self.assertAlmostEqual(j_num / t_den, 0.25, places=12)
+
     def test_tri1_reads_slots_1_3_2(self):
         quad = [[[0, 0, 0], [1, 0, 0], [1, 1, 0]], [[0, 0, 0], [1, 1, 0], [0, 1, 0]]]
         data, info = X.build_blas(quad, pair=True)
