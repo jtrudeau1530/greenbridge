@@ -3576,6 +3576,69 @@ class Gen:
             self.emit(f"{r} = OpExtInst %float %glsl {'Sin' if 'sin' in op else 'Cos'} {t}")
             r = self.clamp_mods(r, mods)
             self.write_lo16(a[0], self.f16_bits(r))    # sin ignores MODE rounding on hardware (RX 6800, SHADER-35); cos is unmeasured, assumed like it
+        elif op in ("v_pk_add_u16", "v_pk_add_i16", "v_pk_sub_u16", "v_pk_sub_i16", "v_pk_mul_lo_u16",
+                    "v_pk_mad_u16", "v_pk_mad_i16", "v_pk_max_u16", "v_pk_max_i16", "v_pk_min_u16", "v_pk_min_i16"):
+            # Packed 16-bit integer ops (VOP3P, RDNA2 ISA): result half 0 takes each source's half from op_sel[i],
+            # result half 1 from op_sel_hi[i] (defaults [0,..] and [1,..]); each half is computed on its own and
+            # wraps to 16 bits. clamp (add/sub/mad) saturates the half to its type's range; the exact value fits in
+            # 32 bits (0xFFFF * 0xFFFF + 0xFFFF < 2^32, and the i16 forms within int32). neg_lo/neg_hi are float-only.
+            # A constant operand reads as its low 16 bits; its high half under op_sel is not measured for integer
+            # ops (for f16 constants it reads +0.0, see src_h), so that form is rejected rather than guessed.
+            def bits(name, default):
+                m = next((m for m in mods if m.startswith(name + ":")), None)
+                return [int(v) for v in m.split("[")[1].rstrip("]").split(",")] if m else default
+            ns = 3 if "_mad_" in op else 2
+            sel, selhi = bits("op_sel", [0] * ns), bits("op_sel_hi", [1] * ns)
+            if len(sel) != ns or len(selhi) != ns or any(any(bits(n, [0] * ns)) for n in ("neg_lo", "neg_hi")):
+                raise Unsupported(op + " modifiers")
+            kind = op[len("v_pk_"):].rsplit("_", 1)[0]          # add, sub, mul_lo, mad, max, min
+            signed = op.endswith("i16")
+            clamp = "clamp" in mods
+            if clamp and kind not in ("add", "sub", "mad"):
+                raise Unsupported(op + " clamp")
+            for i in range(ns):
+                if a[1 + i]["k"] not in ("vgpr", "sgpr") and (sel[i] or selhi[i]):
+                    raise Unsupported(op + " high half of a constant")
+            srcs = [self.src_u(t) for t in a[1:1 + ns]]
+            ext = "OpBitFieldSExtract" if signed else "OpBitFieldUExtract"
+            halves = []
+            for sl in (sel, selhi):
+                v = []
+                for i in range(ns):
+                    e = self.tmp()
+                    self.emit(f"{e} = {ext} %uint {srcs[i]} {self.cu(16 * sl[i])} {self.cu(16)}")
+                    v.append(e)
+                r = self.tmp()
+                if kind in ("add", "sub"):
+                    self.emit(f"{r} = {'OpIAdd' if kind == 'add' else 'OpISub'} %uint {v[0]} {v[1]}")
+                elif kind == "mul_lo":
+                    self.emit(f"{r} = OpIMul %uint {v[0]} {v[1]}")
+                elif kind == "mad":
+                    m = self.tmp()
+                    self.emit(f"{m} = OpIMul %uint {v[0]} {v[1]}")
+                    self.emit(f"{r} = OpIAdd %uint {m} {v[2]}")
+                else:
+                    f = ("S" if signed else "U") + ("Max" if kind == "max" else "Min")
+                    self.emit(f"{r} = OpExtInst %uint %glsl {f} {v[0]} {v[1]}")
+                if clamp:
+                    c = self.tmp()
+                    if signed:
+                        self.emit(f"{c} = OpExtInst %uint %glsl SClamp {r} {self.cu(0xFFFF8000)} {self.cu(0x7FFF)}")
+                    elif kind == "sub":
+                        # unsigned difference below 0 clamps to 0: compare before the wrap
+                        lt = self.tmp()
+                        self.emit(f"{lt} = OpULessThan %bool {v[0]} {v[1]}")
+                        self.emit(f"{c} = OpSelect %uint {lt} {self.cu(0)} {r}")
+                    else:
+                        self.emit(f"{c} = OpExtInst %uint %glsl UMin {r} {self.cu(0xFFFF)}")
+                    r = c
+                r16 = self.tmp()
+                self.emit(f"{r16} = OpBitwiseAnd %uint {r} {self.cu(0xFFFF)}")
+                halves.append(r16)
+            hi, r = self.tmp(), self.tmp()
+            self.emit(f"{hi} = OpShiftLeftLogical %uint {halves[1]} {self.cu(16)}")
+            self.emit(f"{r} = OpBitwiseOr %uint {halves[0]} {hi}")
+            self.dst(a[0], r)
         elif op in ("v_pk_lshlrev_b16", "v_pk_lshrrev_b16", "v_pk_ashrrev_i16"):
             # Packed 16-bit shifts (VOP3P): result half h = src1 half (op_sel / op_sel_hi) shifted by src0 half & 15.
             def bits(name, default):
