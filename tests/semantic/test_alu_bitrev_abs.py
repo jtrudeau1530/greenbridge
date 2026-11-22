@@ -690,13 +690,16 @@ class SpirvEmissionTests(unittest.TestCase):
         self.assertIn("OpBitReverse %uint", spv)
 
     def test_s_abs_i32_emission(self):
-        spv = translate_lines(["s_mov_b32 s2, -42", "s_abs_i32 s0, s2", "v_mov_b32 v0, s0"])
+        # A loaded operand, not a literal: SHADER-315 folds scalar ALU ops on constants at translate time.
+        spv = translate_lines(["s_load_dword s2, s[0:1], 0x0", "s_waitcnt lgkmcnt(0)", "s_abs_i32 s0, s2",
+                               "v_mov_b32 v0, s0"])
         self.assertIn('OpExtInstImport "GLSL.std.450"', spv)
         self.assertIn("SAbs", spv)
         self.assertIn("OpStore %scc", spv)
 
     def test_s_absdiff_i32_emission(self):
-        spv = translate_lines(["s_mov_b32 s2, 10", "s_mov_b32 s3, 20", "s_absdiff_i32 s0, s2, s3", "v_mov_b32 v0, s0"])
+        spv = translate_lines(["s_load_dwordx2 s[2:3], s[0:1], 0x0", "s_waitcnt lgkmcnt(0)",
+                               "s_absdiff_i32 s0, s2, s3", "v_mov_b32 v0, s0"])
         self.assertIn("OpISub %uint", spv)
         self.assertIn("SAbs", spv)
         self.assertIn("OpStore %scc", spv)

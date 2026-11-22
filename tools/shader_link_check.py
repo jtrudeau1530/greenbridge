@@ -127,10 +127,19 @@ def stage_chain(refs):
     return stages
 
 
+def reject_duplicate_keys(pairs):
+    doc = {}
+    for key, value in pairs:
+        if key in doc:
+            raise ValueError(f"duplicate key {key!r}")
+        doc[key] = value
+    return doc
+
+
 def load_pipeline_manifest(path: Path, shader_dir: Path):
     try:
         with path.open(encoding="utf-8") as source:
-            doc = json.load(source)
+            doc = json.load(source, object_pairs_hook=reject_duplicate_keys)
     except (OSError, ValueError) as exc:
         raise ValueError(f"{path}: {exc}") from exc
     if (not isinstance(doc, dict) or set(doc) - {"pipelines", "version"}

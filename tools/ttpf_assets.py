@@ -76,12 +76,14 @@ def complete_pool(source, directory, manifest, settings):
                 index = row["Index"]
                 desc = pool.descriptor(index)
                 base = desc["base"]
-                if base < pool.chunks[0][0] or base >= pool.virtual_size:
+                if not pool.chunks or base < pool.chunks[0][0] or base >= pool.virtual_size:
                     continue
                 span = pool.span(index, base)
-                if not span or not pool.codecs(base, span) & bcpack.SUPPORTED_REBUILD_CODECS:
+                if not span:
                     continue
                 try:
+                    if not pool.codecs(base, span) & bcpack.SUPPORTED_REBUILD_CODECS:
+                        continue
                     if decoder and desc["dimension"] == 1 and desc["format"] in decoder.formats:
                         method = stamp
                         blob = decoder.dds(index)
