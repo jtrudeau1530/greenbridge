@@ -906,6 +906,25 @@ f 1//1 2//2 3//3
 
 
 class TestConcaveObjFaces(unittest.TestCase):
+    def test_collinear_corner_keeps_uv_in_exported_surface(self) -> None:
+        text = (
+            "v 0 0 0\nv 1 0 0\nv 2 0 0\nv 2 1 0\nv 0 1 0\n"
+            "vt 0 0.25\nvt 0.75 0.25\nf 1/1 2/2 3/1 4/1 5/1\n"
+        )
+        primitive, = glb_writer.parse_obj(text, is_path=False, up_axis="y")
+        packed = glb_writer.pack_primitive(primitive)
+        positions = list(struct.iter_unpack("<3f", packed["positions"]))
+        uvs = list(struct.iter_unpack("<2f", packed["uvs"]))
+        self.assertEqual(uvs[positions.index((1, 0, 0))], (0.75, 0.75))
+
+        areas = []
+        for triangle in struct.iter_unpack("<3H", packed["indices"]):
+            a, b, c = (positions[i] for i in triangle)
+            areas.append((b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]))
+        self.assertEqual(len(areas), 3)
+        self.assertTrue(all(area > 0 for area in areas), areas)
+        self.assertEqual(sum(areas), 4.0)
+
     def test_notched_face_preserves_its_surface_and_corner_attributes(self):
         # A square with a 2 x 3 notch, including a collinear point on its base.
         # Embed the outline in YZ so the down-axis projection matters.

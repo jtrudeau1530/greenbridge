@@ -145,11 +145,10 @@ def _resolve_obj_index(token: str, count: int) -> int | None:
     return None
 
 
-def _concave_triangles(points: list[tuple[float, float, float]]) -> list[tuple[int, int, int]] | None:
-    """Return corner triples for a simple planar face whose first-corner fan folds over.
+def _triangulate_face(points: list[tuple[float, float, float]]) -> list[tuple[int, int, int]] | None:
+    """Return corner triples when the first-corner fan folds over or emits a zero-area triangle.
 
-    None keeps the original fan for convex faces, already valid fans, or
-    degenerate input for which we cannot find a triangulation.
+    None keeps an already valid fan or falls back to it if ear clipping cannot complete.
     """
     # Project onto the plane with the largest signed area. Work relative to one
     # corner so translating the mesh far from the origin does not affect the sum.
@@ -172,7 +171,7 @@ def _concave_triangles(points: list[tuple[float, float, float]]) -> list[tuple[i
         cx, cy = xy[c]
         return winding * ((bx - ax) * (cy - ay) - (by - ay) * (cx - ax))
 
-    if all(turn(0, i, i + 1) >= 0 for i in range(1, len(points) - 1)):
+    if all(turn(0, i, i + 1) > 0 for i in range(1, len(points) - 1)):
         return None
 
     # Clip ears in boundary order. A point on the ear's edge blocks it too:
@@ -383,7 +382,7 @@ def parse_obj(
             if len(corners) > 3:
                 indices = None
                 if len({c[0] for c in corners}) == len(corners):
-                    indices = _concave_triangles([raw_v[c[0]] for c in corners])
+                    indices = _triangulate_face([raw_v[c[0]] for c in corners])
                 if indices is None:
                     indices = ((0, i, i + 1) for i in range(1, len(corners) - 1))
             tris = []
