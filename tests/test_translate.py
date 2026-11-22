@@ -808,6 +808,21 @@ def test_pk_and_scalar_f16_ops_emit_no_packhalf2x16(op_asm, make_shader):
     assert "PackHalf2x16" not in spv
 
 
+@pytest.mark.parametrize("body", [
+    "buffer_load_format_d16_xyzw v[2:3], v1, s[0:3], 0 offen\ns_waitcnt vmcnt(0)\nexp mrt0 v2, v3, v2, v3 done vm",
+    "v_mov_b32 v2, 1.0\nv_mov_b32 v3, 0.5\nv_mov_b32 v4, 0.25\nv_mov_b32 v5, 2.0\n"
+    "buffer_store_format_xyzw v[2:5], v1, s[0:3], 0 offen\nexp mrt0 v2, v3, v4, v5 done vm",
+], ids=["d16-load", "store"])
+def test_buffer_format_f16_narrowing_avoids_packhalf2x16(make_shader, body):
+    """The f16 of a d16 typed buffer load, and of an f16 format a typed buffer store writes, narrow with integer RTE
+    like the d16 image results (#489): PackHalf2x16 rounds toward zero on AMD drivers."""
+    shader = make_shader("s_mov_b32 s0, 0x1000\ns_mov_b32 s1, 0\ns_mov_b32 s2, 0x100\ns_mov_b32 s3, 0x1fac\n"
+                         "v_mov_b32 v1, 0\n" + body + "\ns_endpgm\n", "ps_buf_f16")
+    spv = shader.translate()
+    shader.validate(spv)
+    assert "PackHalf2x16" not in spv
+
+
 def test_image_sample_and_gather_d16_avoid_packhalf2x16(make_shader):
     """d16 image_sample and image_gather4 pack f32->f16 via integer ops (no PackHalf2x16) and pass spirv-val."""
     sample_asm = (
