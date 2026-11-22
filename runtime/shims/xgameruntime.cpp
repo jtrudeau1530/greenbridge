@@ -378,38 +378,19 @@ static std::mutex s_mount_mutex;
 static std::atomic<uint64_t> s_next_mount_id{1};
 static std::unordered_map<uint64_t, std::string> s_active_mounts;
 
-static HRESULT resolve_mount_path(char* out, size_t out_cap) {
-    const DWORD n = GetEnvironmentVariableA("LEONIDA_GAME_DIR", out, static_cast<DWORD>(out_cap));
-    if (n == 0 || n >= out_cap) {
-        const DWORD mod_len = GetModuleFileNameA(nullptr, out, static_cast<DWORD>(out_cap));
-        if (mod_len > 0 && mod_len < out_cap) {
-            char* slash = std::strrchr(out, '\\');
-            char* fslash = std::strrchr(out, '/');
-            char* last = slash > fslash ? slash : fslash;
-            if (last) {
-                *last = '\0';
-            } else {
-                return HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND);
-            }
-        } else {
-            return HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND);
-        }
-    }
-    return S_OK;
-}
-
 // Resolves the installation path for a specific content package identifier.
+// GDK specifies that XPackageMount is only for content packages; mounting the main game returns E_ACCESSDENIED.
 // Returns HRESULT_FROM_WIN32(ERROR_NOT_FOUND) if the package identifier is not installed.
 static HRESULT resolve_package_path(const char* packageIdentifier, char* out, size_t out_cap) {
     if (!packageIdentifier || !out || out_cap == 0) return E_INVALIDARG;
 
-    // Check against configured process/content package identifier
-    char installed_id[XPACKAGE_IDENTIFIER_MAX_LENGTH] = {};
-    const DWORD n = GetEnvironmentVariableA("LEONIDA_PACKAGE_ID", installed_id, sizeof(installed_id));
-    const char* target_id = (n > 0 && n < sizeof(installed_id)) ? installed_id : kDefaultPackageIdentifier;
+    // Check against configured process/game package identifier; mounting the game itself is denied
+    char game_id[XPACKAGE_IDENTIFIER_MAX_LENGTH] = {};
+    const DWORD n = GetEnvironmentVariableA("LEONIDA_PACKAGE_ID", game_id, sizeof(game_id));
+    const char* process_id = (n > 0 && n < sizeof(game_id)) ? game_id : kDefaultPackageIdentifier;
 
-    if (std::strcmp(packageIdentifier, target_id) == 0) {
-        return resolve_mount_path(out, out_cap);
+    if (std::strcmp(packageIdentifier, process_id) == 0) {
+        return E_ACCESSDENIED;
     }
 
     // Check optional installed content packages mapping: "id1=path1;id2=path2"
