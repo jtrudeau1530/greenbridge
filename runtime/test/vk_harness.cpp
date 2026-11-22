@@ -410,6 +410,7 @@ int main(int argc, char** argv) {
     LOADD(vkCreateCommandPool); LOADD(vkAllocateCommandBuffers); LOADD(vkBeginCommandBuffer);
     LOADD(vkCmdBeginRenderPass); LOADD(vkCmdBindPipeline); LOADD(vkCmdDraw); LOADD(vkCmdEndRenderPass);
     LOADD(vkCmdBindVertexBuffers); LOADD(vkCmdBindIndexBuffer); LOADD(vkCmdDrawIndexed);
+    LOADD(vkCmdPipelineBarrier);
     LOADD(vkCmdCopyImageToBuffer); LOADD(vkEndCommandBuffer); LOADD(vkQueueSubmit); LOADD(vkQueueWaitIdle);
     LOADD(vkCreateBuffer); LOADD(vkGetBufferMemoryRequirements); LOADD(vkBindBufferMemory); LOADD(vkMapMemory);
     VkQueue q; vkGetDeviceQueue(dev, qi, 0, &q);
@@ -705,7 +706,7 @@ int main(int argc, char** argv) {
     auto push = reinterpret_cast<PFN_vkCmdPushConstants>(vkGetDeviceProcAddr(dev, "vkCmdPushConstants"));
     if (mesh_compute) {
         // The mesh shader as compute, then make its stores visible to the vertex shader's reads.
-        LOADD(vkCmdDispatch); LOADD(vkCmdPipelineBarrier);
+        LOADD(vkCmdDispatch);
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, cpipe);
         push(cmd, pl, pcs, 0, pc_bytes, pc);
         vkCmdDispatch(cmd, groups[0], groups[1], groups[2]);
@@ -759,6 +760,12 @@ int main(int argc, char** argv) {
     vkCmdEndRenderPass(cmd);
     VkBufferImageCopy reg{}; reg.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}; reg.imageExtent = {W, H, 1};
     vkCmdCopyImageToBuffer(cmd, img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buf, 1, &reg);
+    // Make the image copy and any shader writes to the heap visible to the host after the queue wait.
+    VkMemoryBarrier readback{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    readback.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    readback.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0,
+                         1, &readback, 0, nullptr, 0, nullptr);
     CHECK(vkEndCommandBuffer(cmd));
     VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO}; si.commandBufferCount = 1; si.pCommandBuffers = &cmd;
     CHECK(vkQueueSubmit(q, 1, &si, VK_NULL_HANDLE));
