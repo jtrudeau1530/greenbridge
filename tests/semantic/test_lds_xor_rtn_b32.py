@@ -1064,6 +1064,134 @@ class TestRegisterAliasingAndInPlacePreservation(unittest.TestCase):
         self.assertEqual(state.get_vgpr(12), 0x1234_5678)
 
 
+# ============================================================================
+# Section 6: Condition Codes, Status Flags, and Carry/Borrow Generation
+# ============================================================================
+
+@dataclass(frozen=True)
+class ConditionFlags:
+    """Status flags and condition codes derived from atomic bitwise operations."""
+    z: bool               # Zero flag: result == 0
+    n: bool               # Sign/Negative flag: bit 31 set
+    p: bool               # Parity flag: True if number of set bits is even
+    modified: bool        # Memory changed: True if data != 0
+    carry_free_add: bool  # True if A & B == 0 (XOR equals unsigned addition)
+
+
+def compute_xor_condition_flags(old_val: int, data: int) -> ConditionFlags:
+    """Compute status flags for the result of (old_val ^ data)."""
+    old_u = u32(old_val)
+    data_u = u32(data)
+    result = old_u ^ data_u
+
+    z_flag = (result == 0)
+    n_flag = bool(result & 0x8000_0000)
+    # Parity: True if even number of 1-bits
+    popcount = bin(result).count("1")
+    p_flag = (popcount % 2 == 0)
+    modified = (data_u != 0)
+    carry_free_add = ((old_u & data_u) == 0)
+
+    return ConditionFlags(
+        z=z_flag,
+        n=n_flag,
+        p=p_flag,
+        modified=modified,
+        carry_free_add=carry_free_add,
+    )
+
+
+class TestConditionCodesStatusFlagsAndCarryBorrow(unittest.TestCase):
+    """Unit tests for condition codes, status flags, and carry/borrow relations."""
+
+    def test_ds_instruction_hardware_flag_isolation(self) -> None:
+        """DS instructions do not modify hardware scalar condition code (SCC)."""
+        state = ScalarMachineState()
+        interp = ScalarInterpreter()
+
+        # Simulate SCC stored in SGPR 0
+        state.set_sgpr(0, 1)  # SCC set
+        state.lds.write_dword(0x10, 0x1234)
+        state.set_vgpr(1, 0x10)
+        state.set_vgpr(2, 0x5678)
+
+        instr = DSXorRtnB32Instruction(dst=VGPR(0), addr=VGPR(1), data0=VGPR(2))
+        interp.step(instr, state)
+
+        # SCC is preserved unchanged
+        self.assertEqual(state.get_sgpr(0), 1)
+
+    def test_zero_flag_on_identity_cancellation(self) -> None:
+        """When old_val == data, result is 0 and Z flag is set."""
+        val = 0xABCD_EF01
+        flags = compute_xor_condition_flags(val, val)
+        self.assertTrue(flags.z)
+        self.assertFalse(flags.n)
+        self.assertTrue(flags.p)  # 0 has 0 bits, even parity
+        self.assertTrue(flags.modified)
+
+    def test_zero_flag_not_set_on_unequal(self) -> None:
+        flags = compute_xor_condition_flags(0x10, 0x20)
+        self.assertFalse(flags.z)
+
+    def test_sign_flag_negative_bit31(self) -> None:
+        """Bit 31 toggle determines sign flag transition."""
+        # Toggle bit 31 from 0 -> 1
+        flags_neg = compute_xor_condition_flags(0x0000_0001, 0x8000_0000)
+        self.assertTrue(flags_neg.n)
+
+        # Toggle bit 31 from 1 -> 0
+        flags_pos = compute_xor_condition_flags(0x8000_0001, 0x8000_0000)
+        self.assertFalse(flags_pos.n)
+
+    def test_carry_free_addition_equivalence(self) -> None:
+        """When A & B == 0, XOR is mathematically identical to binary addition."""
+        test_pairs = [
+            (0x1100_0000, 0x0022_0000),
+            (0xAAAA_0000, 0x0000_5555),
+            (0x0F0F_0F0F, 0xF0F0_F0F0),
+            (0x0000_0000, 0x1234_5678),
+        ]
+        for a, b in test_pairs:
+            self.assertEqual(a & b, 0)
+            flags = compute_xor_condition_flags(a, b)
+            self.assertTrue(flags.carry_free_add)
+            self.assertEqual(a ^ b, a + b)
+
+    def test_carry_generation_relation(self) -> None:
+        """Verify the universal algebraic relation: (A ^ B) == (A + B) - 2 * (A & B)."""
+        test_pairs = [
+            (0xFFFF_FFFF, 0x0000_0001),
+            (0x7FFF_FFFF, 0x7FFF_FFFF),
+            (0x1234_5678, 0x8765_4321),
+            (0xDEAD_BEEF, 0xCAFE_BABE),
+        ]
+        for a, b in test_pairs:
+            xor_result = a ^ b
+            sum_result = a + b
+            carry_bits = a & b
+            self.assertEqual(xor_result, sum_result - 2 * carry_bits)
+
+    def test_parity_generation(self) -> None:
+        """Parity flag: True when the number of set bits is even."""
+        # 0x3 has 2 bits (even -> True)
+        flags_even = compute_xor_condition_flags(0x1, 0x2)
+        self.assertTrue(flags_even.p)
+
+        # 0x7 has 3 bits (odd -> False)
+        flags_odd = compute_xor_condition_flags(0x0, 0x7)
+        self.assertFalse(flags_odd.p)
+
+    def test_memory_modification_status(self) -> None:
+        """When data == 0, memory is not modified (no-op read)."""
+        flags_unmodified = compute_xor_condition_flags(0x1234, 0x0)
+        self.assertFalse(flags_unmodified.modified)
+
+        flags_modified = compute_xor_condition_flags(0x1234, 0x1)
+        self.assertTrue(flags_modified.modified)
+
+
+
 
 
 
