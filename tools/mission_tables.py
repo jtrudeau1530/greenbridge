@@ -21,6 +21,12 @@ the little-endian word; the low half is `kind`. The two u16s are not byte-swappe
 `03 00 80 07` resolve kind 3 and offset 0x780, not 0x8007. A record whose offset is outside the file is
 still a record; it simply resolves to no entity.
 
+On PSIN input the two dwords at +16 and +20 are the halves of the container's u64 pointer: the low 20
+bits are a 1-based block number (the tool reads its low 16 bits as `kind`) and the bits above are the
+byte offset, split between `band` (the high dword) and `poolOffset` (the high half of the low dword).
+That is what the block-indexed resolution below reads; on a bare `.bin` there is no block table to
+index and only the first two resolutions apply.
+
 Pool element, 64 bytes, 16 dwords:
 
     +0x00  u32 archetype/state hash
@@ -42,18 +48,25 @@ plausible world range. The last two dwords are not required to be zero: a measur
 carries a second link hash in the third-last dword. Requiring `+0x38 == +0x3C == 0` would silently drop
 those entities, so the reader keeps them and reports the extra hash as `extra`.
 
-Resolution is two-step, because the measured streams prove two encodings:
+Resolution is three-step, because the measured streams prove three encodings:
 
 1. **File-absolute** (the common case): the record's offset is the byte address of the element.
 2. **Linked pool** (the family documented as the "next even-tagged pool chunk" rule): inside a PSIN
    container, a block of records is followed by the block that holds its elements. The record offset is
    then a 16-byte-unit offset into that pool block: `element = pool_block_base + (offset >> 4)`. The
    measured family uses offsets such as 0x0, 0xC00, 0x1800, ... while its elements sit 0xC0 bytes apart.
+3. **Block-indexed** (the container's own pointer form): `kind` is a 1-based block number, so
+   `block = blocks[kind - 1]` and the byte offset is `(band << 12) | (offset >> 4)`. This names a pool
+   even when the block is not the one after the record block, and it keeps the offset bits that do not
+   fit in `offset` alone. The records of one chunk are slices of one array, so their slot stride is
+   `(start[i + 1] - start[i]) / count[i]` when every slice agrees; a slot wider than 64 bytes then steps
+   by that stride rather than by 64.
 
-Both addresses are scored when they exist: the one that validates more of the record's `n` slots wins, and
-a tie keeps the file-absolute reading. A slot that fails the duplicated-component test is counted as
-skipped, never reported as an entity. The scoring matters on the pool-relative family, where an offset
-such as 0x3000 can also name an unrelated element elsewhere in the file.
+All three addresses are scored when they exist: the one that validates more of the record's `n` slots
+wins, and a tie keeps the earlier reading (file-absolute, then linked pool, then block-indexed). A slot
+that fails the duplicated-component test is counted as skipped, never reported as an entity. The scoring
+matters on the pool-relative families, where an offset such as 0x3000 can also name an unrelated element
+elsewhere in the file.
 
 Detection is structural rather than schema-driven so a bare `.bin` works as well as a PSIN container. A
 record chunk is a run of at least two consecutive 32-byte records with the same `kind`; a lone record is
@@ -156,6 +169,54 @@ def decode_element(blob, at):
     }
 
 
+def pool_byte_offset(record):
+    """The byte offset a PSIN block pointer carries: `band` holds its high bits, `offset` its low bits."""
+    return (record["band"] << 12) | (record["poolOffset"] >> POOL_SHIFT)
+
+
+def block_at(blocks, record):
+    """(base, size) of the block a PSIN pointer names, or (None, None) when there is no such block."""
+    kind = record["kind"]
+    if not blocks or not 1 <= kind <= len(blocks):
+        return None, None
+    _type, base, size = blocks[kind - 1]
+    return base, size
+
+
+def chunk_stride(records, blocks):
+    """The slot stride shared by a chunk's slices of one block, or None when the bytes do not prove one.
+
+    Consecutive records of one chunk are adjacent slices of one array, so the gap between two slice
+    starts is `count * stride`. The stride is returned only when every gap agrees, it is at least one
+    element wide, and the last slice fits in the block. A chunk whose records do not tile one block
+    (a single slice, or slices with gaps) returns None and the reader steps by ELEMENT_SIZE.
+    """
+    kinds = {record["kind"] for record in records}
+    if len(kinds) != 1 or not blocks:
+        return None
+    base, size = block_at(blocks, records[0])
+    if base is None:
+        return None
+    starts = [base + pool_byte_offset(record) for record in records]
+    if starts != sorted(starts) or len(set(starts)) != len(starts):
+        return None
+    strides = set()
+    for index in range(len(records) - 1):
+        count = records[index]["count"]
+        gap = starts[index + 1] - starts[index]
+        if not count or gap % count:
+            return None
+        strides.add(gap // count)
+    if len(strides) != 1:
+        return None
+    stride = strides.pop()
+    if stride < ELEMENT_SIZE or stride % 4:
+        return None
+    if starts[-1] + records[-1]["count"] * stride > base + size:
+        return None
+    return stride
+
+
 def scan_elements(blob, end):
     """Every valid pool element that starts in [0, end), keyed by its byte address."""
     found = {}
@@ -244,29 +305,37 @@ def linked_pool(blob, blocks, block_indices, chunk_at, elements):
     return None
 
 
-def resolve(record, elements, pool_base):
+def resolve(record, elements, pool_base, blocks=None, stride=None):
     """Resolve one record to [(address, element)].
 
-    Both the file-absolute address and the linked-pool address are tried when they exist. The one that
-    validates more of the record's `n` slots wins; a tie keeps the file-absolute reading. This matters on
-    the pool-relative family, where an offset such as 0x3000 can also land on an unrelated element in the
+    All three addresses are tried when they exist: the file-absolute address, the linked-pool address,
+    and the block-indexed address (`blocks[kind - 1]` plus the split pointer offset). The one that
+    validates more of the record's `n` slots wins; a tie keeps the earlier reading. This matters on the
+    pool-relative families, where an offset such as 0x3000 can also land on an unrelated element in the
     file and would otherwise shadow the correct pool slot.
 
-    Returns (entities, mode, skipped_slots). mode is "absolute", "pool", "empty" or "unresolved".
+    Returns (entities, mode, skipped_slots). mode is "absolute", "pool", "block", "empty" or
+    "unresolved".
     """
     count = record["count"]
     if count == 0:
         return [], "empty", 0
-    candidates = [(record["poolOffset"], "absolute")]
+    default_step = stride or ELEMENT_SIZE
+    candidates = [(record["poolOffset"], "absolute", ELEMENT_SIZE)]
     if pool_base is not None:
         address = pool_base + (record["poolOffset"] >> POOL_SHIFT)
-        candidates.append((address, "pool"))
+        candidates.append((address, "pool", ELEMENT_SIZE))
+    base, size = block_at(blocks, record)
+    if base is not None:
+        offset = pool_byte_offset(record)
+        if offset + count * default_step <= size:
+            candidates.append((base + offset, "block", default_step))
     best = None
-    for base, mode in candidates:
+    for base_at, mode, slot_step in candidates:
         entities = []
         skipped = 0
         for slot in range(count):
-            address = base + slot * ELEMENT_SIZE
+            address = base_at + slot * slot_step
             element = elements.get(address)
             if element is None:
                 skipped += 1
@@ -317,12 +386,13 @@ def parse_blob(blob, name="<memory>"):
     unresolved = 0
     for chunk in chunks:
         pool_base = linked_pool(blob, blocks, table_blocks, chunk["offset"], elements)
+        stride = chunk_stride([record for _at, record in chunk["records"]], blocks)
         for _at, record in chunk["records"]:
             records.append(record)
             state = states[record["key"]]
             state["key"] = record["key"]
             state["records"] += 1
-            found, _mode, skipped = resolve(record, elements, pool_base)
+            found, _mode, skipped = resolve(record, elements, pool_base, blocks, stride)
             skipped_slots += skipped
             if not found and record["count"]:
                 unresolved += 1

@@ -577,6 +577,76 @@ bool found_is(IGameInput* input, IGameInputDevice* dev) {
 }
 
 // Pads SDL cannot tell apart: the same name, vendor and product, no serial, no path. Runs with no other pad connected.
+void test_aggregate_device(IGameInput* input) {
+    check(input->CreateAggregateDevice(GameInputKindGamepad, nullptr) == E_POINTER,
+          "CreateAggregateDevice rejects null output pointer");
+    IGameInputDevice* agg = nullptr;
+    check(input->CreateAggregateDevice(GameInputKindUnknown, &agg) == E_INVALIDARG && !agg,
+          "CreateAggregateDevice rejects GameInputKindUnknown");
+    check(input->CreateAggregateDevice(GameInputKindGamepad | GameInputKindKeyboard, &agg) == E_INVALIDARG && !agg,
+          "CreateAggregateDevice rejects multiple combined kind flags");
+    check(input->CreateAggregateDevice(0x80000000, &agg) == E_INVALIDARG && !agg,
+          "CreateAggregateDevice rejects unsupported kind flag");
+
+    check(input->CreateAggregateDevice(GameInputKindGamepad, &agg) == S_OK && agg != nullptr,
+          "CreateAggregateDevice creates an aggregate device for GameInputKindGamepad");
+    if (agg) {
+        const GameInputDeviceInfo* info = agg->GetDeviceInfo();
+        check(info && info->deviceFamily == GameInputFamilyAggregate,
+              "aggregate device reports GameInputFamilyAggregate");
+        check(info && info->supportedInput == GameInputKindGamepad,
+              "aggregate device reports supportedInput == GameInputKindGamepad");
+        check(agg->GetDeviceStatus() == GameInputDeviceConnected,
+              "aggregate device status is GameInputDeviceConnected");
+
+        IGameInputDevice* agg2 = nullptr;
+        check(input->CreateAggregateDevice(GameInputKindGamepad, &agg2) == S_OK && agg2 == agg,
+              "CreateAggregateDevice returns existing aggregate instance for the same kind");
+        if (agg2) agg2->Release();
+
+        // Reading test with no connected pad
+        IGameInputReading* r = nullptr;
+        check(input->GetCurrentReading(GameInputKindGamepad, agg, &r) == GAMEINPUT_E_READING_NOT_FOUND && !r,
+              "aggregate device returns READING_NOT_FOUND when no pads are connected");
+
+        // Attach a virtual pad and verify aggregate device yields readings from it
+        Pad xbox;
+        attach(xbox, "Leonida virtual Xbox pad", 0x045E, 0x0B12, true);
+        rt::gameinput::poll();
+
+        SDL_SetJoystickVirtualButton(xbox.js, SDL_GAMEPAD_BUTTON_SOUTH, true);
+        rt::gameinput::poll();
+
+        check(input->GetCurrentReading(GameInputKindGamepad, agg, &r) == S_OK && r != nullptr,
+              "aggregate device yields reading from connected pad");
+        if (r) {
+            check(buttons_of(r) == GameInputGamepadA, "aggregate device reading reflects pad input state");
+            r->Release();
+        }
+
+        SDL_SetJoystickVirtualButton(xbox.js, SDL_GAMEPAD_BUTTON_SOUTH, false);
+        rt::gameinput::poll();
+        IGameInputReading* r2 = nullptr;
+        check(input->GetCurrentReading(GameInputKindGamepad, agg, &r2) == S_OK && r2 != nullptr,
+              "aggregate device yields updated reading after button release");
+        if (r2) {
+            check(buttons_of(r2) == 0, "aggregate reading shows button released");
+            IGameInputReading* prev = nullptr;
+            check(input->GetPreviousReading(r2, GameInputKindGamepad, agg, &prev) == S_OK && prev != nullptr,
+                  "GetPreviousReading with aggregate device filter finds prior reading");
+            if (prev) {
+                check(buttons_of(prev) == GameInputGamepadA, "prior reading has pressed button");
+                prev->Release();
+            }
+            r2->Release();
+        }
+
+        detach(xbox);
+        rt::gameinput::poll();
+        agg->Release();
+    }
+}
+
 void test_twins(IGameInput* input) {
     Pad pads[3];
     IGameInputDevice* dev[3] = {};
@@ -1099,6 +1169,7 @@ int main() {
     test_twins(input);
     test_keyboard_pad(input);
     test_motion(input);
+    test_aggregate_device(input);
     input->Release();
 
     std::printf("%d checks, %d failures\n", g_checks, g_failures);
