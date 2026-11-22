@@ -917,5 +917,131 @@ class TestUnsignedBoundaryExtremes(unittest.TestCase):
         self.assertEqual(oracle_max_u32(pat_a, pat_b), pat_b)
 
 
+class TestNegativeControlsAndMutations(unittest.TestCase):
+    """Unit tests for negative controls, syntax rejection, and mutation detection."""
+
+    def test_syntax_rejection_invalid_opcodes(self) -> None:
+        invalid_assemblies = [
+            "",
+            "   ",
+            "v_min_u32 v0, v1",
+            "ds_min_f32 v0, v1",
+            "ds_min_u64 v0, v1",
+            "ds_min_u32",
+            "ds_min_rtn_u32 v0, v1",
+            "ds_min_u32 v0, v1, v2",
+            "ds_min_u32 r0, v1",
+            "ds_min_u32 v0, s1",
+            "ds_min_u32 v256, v1",
+            "ds_min_u32 v0, v1 offset:70000",
+            "ds_min_u32 v0, v1 offset:-1",
+        ]
+        for asm in invalid_assemblies:
+            with self.subTest(asm=asm):
+                with self.assertRaises((ValueError, IndexError)):
+                    DSMinMaxU32Instruction.parse(asm)
+
+    def test_architectural_model_negative_controls(self) -> None:
+        with self.assertRaises(ValueError):
+            LDSMemory(1000)
+        with self.assertRaises(ValueError):
+            LDSMemory(-64)
+
+        with self.assertRaises(ValueError):
+            SIMDWaveState(wave_size=16)
+        with self.assertRaises(ValueError):
+            SIMDWaveState(wave_size=128)
+
+    def test_mutation_detection_inverted_min_max(self) -> None:
+        def mutant_min(a: int, b: int) -> int:
+            return oracle_max_u32(a, b)
+
+        self.assertNotEqual(mutant_min(10, 20), oracle_min_u32(10, 20))
+
+    def test_mutation_detection_signed_comparison(self) -> None:
+        # Mutant: treats 32-bit values as signed two's complement integers
+        def mutant_min_signed(a: int, b: int) -> int:
+            sa = (a & MASK32) - 0x100000000 if (a & 0x80000000) else (a & MASK32)
+            sb = (b & MASK32) - 0x100000000 if (b & 0x80000000) else (b & MASK32)
+            res = min(sa, sb)
+            return res & MASK32
+
+        # In signed: -1 (0xFFFFFFFF) < 0. But in unsigned: 0 < 0xFFFFFFFF!
+        # The mutant returns 0xFFFFFFFF, whereas true unsigned min is 0.
+        self.assertNotEqual(mutant_min_signed(0, 0xFFFFFFFF), oracle_min_u32(0, 0xFFFFFFFF))
+
+    def test_mutation_detection_destructive_aliasing(self) -> None:
+        class DestructiveMutantInterpreter(ScalarDSInterpreter):
+            def execute(self, state: ScalarThreadState, inst: DSMinMaxU32Instruction) -> Optional[int]:
+                if inst.opcode.is_return:
+                    assert inst.vdst is not None
+                    state.set_vgpr(inst.vdst, 0xBAD00000)
+                return super().execute(state, inst)
+
+        lds = LDSMemory(65536)
+        lds.write_dword(2, 500)
+        state = ScalarThreadState(lds=lds)
+        state.set_vgpr(VGPR(1), 8)  # dword 2
+        state.set_vgpr(VGPR(2), 50)
+
+        inst = DSMinMaxU32Instruction(DSOpcode.DS_MIN_RTN_U32, vaddr=VGPR(1), vdata=VGPR(2), vdst=VGPR(1))
+        mutant = DestructiveMutantInterpreter()
+        mutant.execute(state, inst)
+
+        self.assertNotEqual(lds.read_dword(2), 50)
+
+    def test_mutation_detection_ignore_exec_mask(self) -> None:
+        class MutantSIMDInterpreter(SIMDDSInterpreter):
+            def execute(self, state: SIMDWaveState, inst: DSMinMaxU32Instruction) -> Dict[int, int]:
+                saved_mask = state.exec_mask
+                state.exec_mask = (1 << state.wave_size) - 1
+                try:
+                    return super().execute(state, inst)
+                finally:
+                    state.exec_mask = saved_mask
+
+        lds = LDSMemory(65536)
+        lds.write_dword(5, 500)
+        wave = SIMDWaveState(wave_size=32, exec_mask=0x0, lds=lds)
+        for l in range(32):
+            wave.set_vgpr(l, VGPR(1), 20)
+            wave.set_vgpr(l, VGPR(2), 10)
+
+        inst = DSMinMaxU32Instruction(DSOpcode.DS_MIN_U32, vaddr=VGPR(1), vdata=VGPR(2))
+        mutant = MutantSIMDInterpreter()
+        mutant.execute(wave, inst)
+
+        self.assertEqual(lds.read_dword(5), 10)
+        lds.write_dword(5, 500)
+        SIMDDSInterpreter().execute(wave, inst)
+        self.assertEqual(lds.read_dword(5), 500)
+
+    def test_mutation_detection_dropped_offset(self) -> None:
+        class DroppedOffsetInterpreter(ScalarDSInterpreter):
+            def execute(self, state: ScalarThreadState, inst: DSMinMaxU32Instruction) -> Optional[int]:
+                no_off_inst = DSMinMaxU32Instruction(
+                    opcode=inst.opcode,
+                    vaddr=inst.vaddr,
+                    vdata=inst.vdata,
+                    vdst=inst.vdst,
+                    offset=OffsetImmediate(0),
+                )
+                return super().execute(state, no_off_inst)
+
+        lds = LDSMemory(65536)
+        lds.write_dword(1, 500)
+        lds.write_dword(2, 500)
+        state = ScalarThreadState(lds=lds)
+        state.set_vgpr(VGPR(1), 4)  # dword 1
+        state.set_vgpr(VGPR(2), 50)
+
+        inst = DSMinMaxU32Instruction(DSOpcode.DS_MIN_U32, vaddr=VGPR(1), vdata=VGPR(2), offset=OffsetImmediate(4))
+        mutant = DroppedOffsetInterpreter()
+        mutant.execute(state, inst)
+
+        self.assertEqual(lds.read_dword(1), 50)
+        self.assertEqual(lds.read_dword(2), 500)
+
+
 if __name__ == "__main__":
     unittest.main()
