@@ -38,8 +38,6 @@ The decoded export used by the previews contains 13 parts:
 | legacy head | `cs_lucia_legacyheadcs_fr1_001_regular_ws00_full.#dr` | 592 | 1,028 | `0x707771F769AA3542` |
 | jacket (biker) | `cs_lucia_jacketbiker_fr1_000_regular_c_hl_long_full.#dr` | 9,818 | 10,837 | `0xF5073AA039BB3CED` |
 | crop tee | `player_story000_00_tshirtcrop_fr1_001_slim_cc_un_long_full.#dr` | 4,932 | 6,756 | `0x46E8FA9436E9D43C` |
-| jacket (biker) | `cs_lucia_jacketbiker_fr1_000_regular_c_hl_long_full.#dr` | 9,818 | 10,837 | none (normal map only) |
-| crop tee | `player_story000_00_tshirtcrop_fr1_001_slim_cc_un_long_full.#dr` | 4,932 | 6,756 | none (normal map only) |
 | bikini top | `brabikini_fr1_012_regular_ws00_full.#dr` | 6,547 | 5,697 | `0xDF3615ADFB1F4787` |
 | undies | `undiesgstring_fr1_002_slim_hw_full.#dr` | 961 | 913 | `0xCFD339832A9C724A` |
 
@@ -83,8 +81,6 @@ component table.
 | `pants` | 459 | `pantsjeans`, `pantscargo`, `pantsleggings`, `pantstrack`, … |
 | `jeans` | 157 | `pantsjeans` / `shortsjeans` |
 | `jacket` | 327 | `jacketbiker`, `jacketdenim`, `jacketblazer`, `jackettrack`, … |
-| `uppr` | 17 | all `slod_uppr_*` super-LOD crowd parts |
-| `lowr` | 21 | all `slod_lowr_*` super-LOD crowd parts |
 | `uppr` | 17 | 14 are `slod_uppr_*`; 3 are `char_bipedbounds_female_armor…_uppr_l/r.#ft` |
 | `lowr` | 21 | 17 are `slod_lowr_*`; 4 are `char_bipedbounds_female_armor…_lowr_l/r.#ft` |
 | `jbib` | 0 | the GTA V slot code is not a name token here |
@@ -148,7 +144,9 @@ reconstruction, not Lucia's body.
 The player and cutscene body is a separate shared **clothed** fragment,
 `cs_lucia_legacypedcs_fr1_000_fullbody_ws00_full` (874 v), used by `cs_lucia`, `cs_monalisa`
 and `cs_mandy` (their `FragName` is identical). It is the body the game uses; it is low-poly and
-clothed, so it is not a high-detail nude body.
+clothed, so it is not a high-detail nude body. A flat-skin render of the 874-v body with its
+normal map disconnected still shows the modelled top, shorts and ankle boots, so the clothing
+silhouette is geometry, not a painted-on atlas.
 
 ## What is not decoded
 
