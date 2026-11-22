@@ -420,5 +420,54 @@ class Validation(unittest.TestCase):
                     self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
 
 
+class VolumeGradientSamples(unittest.TestCase):
+    def test_volume_gradient_status_is_unsupported(self) -> None:
+        for dest, status in (("v[2:3]", "tfe"), ("v3", "lwe")):
+            with self.subTest(status=status), self.assertRaises(rdna2spirv.Unsupported):
+                translate([f"image_sample_d {dest}, v[10:18], s[0:7], s[8:11] "
+                           f"dmask:0x1 dim:SQ_RSRC_IMG_3D {status}"])
+
+    def test_volume_address_operands(self) -> None:
+        fixture = Path(ROOT) / "tests/semantic/fixtures/volume_gradients.asm"
+        for line in fixture.read_text(encoding="utf-8").splitlines():
+            if not line.startswith("image_sample_"):
+                continue
+            with self.subTest(line=line):
+                module = Module(translate([line]))
+                sample, = [args for _, op, args in module.order if op == "OpImageSampleExplicitLod"]
+                _, _, coords, mask, dx, dy, *clamp = sample
+                self.assertEqual(mask, "Grad|MinLod" if "_cl " in line else "Grad")
+                self.assertEqual(len(clamp), int("_cl " in line))
+
+                def source(value: str) -> tuple[int, int | None]:
+                    op, (_, word) = module.defs[value]
+                    self.assertEqual(op, "OpBitcast")
+                    op, args = module.defs[word]
+                    half = None
+                    if op == "OpBitcast":  # f16 coord converted to f32, then kept in a VGPR word
+                        extract, (_, unpacked, selector) = module.defs[args[1]]
+                        self.assertEqual(extract, "OpCompositeExtract")
+                        unpack, (_, _, name, packed) = module.defs[unpacked]
+                        self.assertEqual((unpack, name), ("OpExtInst", "UnpackHalf2x16"))
+                        half = int(selector)
+                        op, args = module.defs[packed]
+                    self.assertEqual(op, "OpLoad")
+                    access, (_, bank, index) = module.defs[args[1]]
+                    self.assertEqual((access, bank), ("OpAccessChain", "%vgpr"))
+                    return module.value(index, 0, 0), half
+
+                for vector, registers in ((dx, (10, 11, 12)), (dy, (13, 14, 15))):
+                    op, (ty, *components) = module.defs[vector]
+                    self.assertEqual((op, ty), ("OpCompositeConstruct", "%v3float"))
+                    self.assertEqual([source(c) for c in components], [(reg, None) for reg in registers])
+                op, (ty, *xyz) = module.defs[coords]
+                self.assertEqual((op, ty), ("OpCompositeConstruct", "%v3float"))
+                packed = " a16" in line
+                self.assertEqual([source(c) for c in xyz], [(16, 0), (16, 1), (17, 0)] if packed
+                                 else [(16, None), (17, None), (18, None)])
+                if clamp:
+                    self.assertEqual(source(clamp[0]), (17, 1) if packed else (19, None))
+
+
 if __name__ == "__main__":
     unittest.main()

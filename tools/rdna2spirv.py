@@ -8358,8 +8358,9 @@ class Gen:
             self.uses_tex_array = True
         if ncoord == 1:
             self.uses_tex_1d = True
-        if is3d and op.endswith("_d"):
-            raise Unsupported(op + " 3D gradients")
+        if is3d and op in ("image_sample_d", "image_sample_d_cl") and ("tfe" in mods or "lwe" in mods):
+            raise Unsupported(op + " 3D gradient status")
+        grad_width = 3 if is3d else min(ncoord, 2)  # an array layer has no derivative
         # glc makes the access coherent (see image_load_coherent). Only image_load can be: a sampled read has no
         # coherent form in SPIR-V, so it is refused rather than read stale.
         coherent = "glc" in mods
@@ -8386,7 +8387,7 @@ class Gen:
             w_off = 1 if extras.endswith("_o") else 0
             extras = extras[:-2] if w_off else extras
             w_bias = 1 if extras in ("_b", "_c_b") else 0
-            w_grad = 2 * min(ncoord, 2) if extras in ("_d", "_d_cl") else 0
+            w_grad = 2 * grad_width if extras in ("_d", "_d_cl") else 0
             whole = w_off + w_bias + (1 if extras.startswith("_c") else 0) + w_grad
             unpacked = []
             for i, c in enumerate(coords):
@@ -8621,19 +8622,17 @@ class Gen:
                 bias, f = f[0], f[1:]
             grads = None
             if kind == "_d":
-                # Address: gradients first, then coords. 2D and 2D-array have 2-component gradients (the array
-                # layer has none): ds/dx, dt/dx, ds/dy, dt/dy. 1D has scalar ds/dx, ds/dy.
-                if ncoord == 1:
-                    if len(f) < 3:
-                        raise Unsupported(op + " coords")
-                    grads, f = (f[0], f[1]), f[2:]
+                # Address order: all dP/dx components, all dP/dy components, then the coordinates.
+                if len(f) < 2 * grad_width + ncoord:
+                    raise Unsupported(op + " coords")
+                if grad_width == 1:
+                    grads = (f[0], f[1])
                 else:
-                    if len(f) < 4 + ncoord:
-                        raise Unsupported(op + " coords")
                     gx, gy = self.tmp(), self.tmp()
-                    self.emit(f"{gx} = OpCompositeConstruct %v2float {f[0]} {f[1]}")
-                    self.emit(f"{gy} = OpCompositeConstruct %v2float {f[2]} {f[3]}")
-                    grads, f = (gx, gy), f[4:]
+                    self.emit(f"{gx} = OpCompositeConstruct %v{grad_width}float {' '.join(f[:grad_width])}")
+                    self.emit(f"{gy} = OpCompositeConstruct %v{grad_width}float {' '.join(f[grad_width:2 * grad_width])}")
+                    grads = (gx, gy)
+                f = f[2 * grad_width:]
             if clamp:
                 # The clamp is the component right after the coordinates. Under a16 an f16 pad may follow it, so
                 # it isn't the last one there (taking the last one read that pad until 2026-11-21).
