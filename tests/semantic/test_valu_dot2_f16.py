@@ -24,7 +24,9 @@ from __future__ import annotations
 import math
 import struct
 import unittest
-from typing import Tuple
+from dataclasses import dataclass, field
+from enum import Enum, auto
+from typing import List, Optional, Tuple, Union
 
 # ==============================================================================
 # Architectural Bit Masks and IEEE 754 binary16 Encodings
@@ -317,6 +319,118 @@ def oracle_v_dot2acc_f16(
 
 
 # ==============================================================================
+# Symbolic AST Opcode Definitions and Typed Expressions
+# ==============================================================================
+
+class RegType(Enum):
+    VGPR = auto()
+    SGPR = auto()
+
+
+@dataclass(frozen=True)
+class Reg:
+    """Architectural 32-bit register (VGPR or SGPR)."""
+    index: int
+    reg_type: RegType
+
+    def __post_init__(self) -> None:
+        if not (0 <= self.index <= 255):
+            raise ValueError(f"Register index {self.index} out of valid range [0, 255]")
+
+    @property
+    def name(self) -> str:
+        prefix = "v" if self.reg_type == RegType.VGPR else "s"
+        return f"{prefix}{self.index}"
+
+
+@dataclass(frozen=True)
+class Literal32:
+    """32-bit inline constant or literal packed halfword pair."""
+    bits: int
+
+    def __post_init__(self) -> None:
+        if not (0 <= self.bits <= MASK32):
+            raise ValueError(f"Literal32 bits 0x{self.bits:X} out of range [0, 0xFFFFFFFF]")
+
+    @classmethod
+    def from_f16x2(cls, lo: float, hi: float) -> Literal32:
+        return cls(pack_f16x2(f16_to_bits(lo), f16_to_bits(hi)))
+
+    @property
+    def name(self) -> str:
+        lo, hi = unpack_f16x2(self.bits)
+        return f"pack_f16({bits_to_f16(lo):g}, {bits_to_f16(hi):g})"
+
+
+@dataclass(frozen=True)
+class VOP3Operand:
+    """VOP3/VOP3P operand with sub-word modifiers (abs, neg per 16-bit half)."""
+    source: Union[Reg, Literal32]
+    abs_lo: bool = False
+    abs_hi: bool = False
+    neg_lo: bool = False
+    neg_hi: bool = False
+
+    def disassemble(self) -> str:
+        s = self.source.name
+        mods = []
+        if self.abs_lo or self.abs_hi:
+            mods.append("abs")
+        if self.neg_lo or self.neg_hi:
+            mods.append("neg")
+        if mods:
+            return f"{'/'.join(mods)}({s})"
+        return s
+
+
+@dataclass(frozen=True)
+class VDot2F16Instruction:
+    """Symbolic AST node representing AMD RDNA2 v_dot2_f16_f16 instruction."""
+    dst: Reg
+    src0: VOP3Operand
+    src1: VOP3Operand
+    clamp: bool = False
+    op_sel: Tuple[int, int] = (0, 0)
+    op_sel_hi: Tuple[int, int] = (1, 1)
+
+    def __post_init__(self) -> None:
+        if self.dst.reg_type != RegType.VGPR:
+            raise TypeError(f"Destination of VALU instruction must be VGPR, got {self.dst.reg_type}")
+
+    def disassemble(self) -> str:
+        s = f"v_dot2_f16_f16 {self.dst.name}, {self.src0.disassemble()}, {self.src1.disassemble()}"
+        if self.op_sel != (0, 0) or self.op_sel_hi != (1, 1):
+            s += f" op_sel:[{self.op_sel[0]},{self.op_sel[1]},{self.op_sel_hi[0]},{self.op_sel_hi[1]}]"
+        if self.clamp:
+            s += " clamp"
+        return s
+
+
+@dataclass(frozen=True)
+class VDot2AccF16Instruction:
+    """Symbolic AST node representing AMD RDNA2 v_dot2acc_f16_f16 instruction."""
+    dst: Reg
+    src0: VOP3Operand
+    src1: VOP3Operand
+    src2: VOP3Operand
+    clamp: bool = False
+    op_sel: Tuple[int, int] = (0, 0)
+    op_sel_hi: Tuple[int, int] = (1, 1)
+
+    def __post_init__(self) -> None:
+        if self.dst.reg_type != RegType.VGPR:
+            raise TypeError(f"Destination of VALU instruction must be VGPR, got {self.dst.reg_type}")
+
+    def disassemble(self) -> str:
+        s = f"v_dot2acc_f16_f16 {self.dst.name}, {self.src0.disassemble()}, {self.src1.disassemble()}, {self.src2.disassemble()}"
+        if self.op_sel != (0, 0) or self.op_sel_hi != (1, 1):
+            s += f" op_sel:[{self.op_sel[0]},{self.op_sel[1]},{self.op_sel_hi[0]},{self.op_sel_hi[1]}]"
+        if self.clamp:
+            s += " clamp"
+        return s
+
+
+# ==============================================================================
 # Unit Tests: Architectural Model and Reference Oracle
 # ==============================================================================
 
@@ -439,6 +553,85 @@ class TestDot2F16ModelAndOracle(unittest.TestCase):
         s1 = pack_f16x2(POS_ZERO, ONE_F16)
         res = oracle_v_dot2_f16(s0, s1)
         self.assertTrue(is_nan(res))
+
+
+class TestASTOpcodeDefinitions(unittest.TestCase):
+    """Unit tests for symbolic AST opcode definitions and typed expressions."""
+
+    def test_reg_attributes_and_bounds(self) -> None:
+        v0 = Reg(0, RegType.VGPR)
+        s5 = Reg(5, RegType.SGPR)
+        self.assertEqual(v0.name, "v0")
+        self.assertEqual(s5.name, "s5")
+        with self.assertRaises(ValueError):
+            Reg(256, RegType.VGPR)
+        with self.assertRaises(ValueError):
+            Reg(-1, RegType.SGPR)
+
+    def test_literal32_representation(self) -> None:
+        lit = Literal32.from_f16x2(1.0, 2.0)
+        self.assertEqual(lit.bits, 0x4000_3C00)
+        self.assertIn("1", lit.name)
+        self.assertIn("2", lit.name)
+        with self.assertRaises(ValueError):
+            Literal32(0x1_0000_0000)
+
+    def test_vop3_operand_disassembly(self) -> None:
+        op_plain = VOP3Operand(Reg(2, RegType.VGPR))
+        self.assertEqual(op_plain.disassemble(), "v2")
+        op_neg = VOP3Operand(Reg(4, RegType.SGPR), neg_lo=True)
+        self.assertEqual(op_neg.disassemble(), "neg(s4)")
+        op_abs_neg = VOP3Operand(Reg(8, RegType.VGPR), abs_lo=True, neg_hi=True)
+        self.assertEqual(op_abs_neg.disassemble(), "abs/neg(v8)")
+
+    def test_v_dot2_f16_disassembly(self) -> None:
+        instr = VDot2F16Instruction(
+            dst=Reg(0, RegType.VGPR),
+            src0=VOP3Operand(Reg(1, RegType.VGPR)),
+            src1=VOP3Operand(Reg(2, RegType.SGPR), abs_lo=True),
+            clamp=True,
+            op_sel=(1, 0),
+            op_sel_hi=(0, 1),
+        )
+        expected = "v_dot2_f16_f16 v0, v1, abs(s2) op_sel:[1,0,0,1] clamp"
+        self.assertEqual(instr.disassemble(), expected)
+
+    def test_v_dot2acc_f16_disassembly(self) -> None:
+        instr = VDot2AccF16Instruction(
+            dst=Reg(3, RegType.VGPR),
+            src0=VOP3Operand(Reg(4, RegType.VGPR)),
+            src1=VOP3Operand(Reg(5, RegType.VGPR)),
+            src2=VOP3Operand(Reg(6, RegType.VGPR)),
+        )
+        self.assertEqual(instr.disassemble(), "v_dot2acc_f16_f16 v3, v4, v5, v6")
+
+    def test_ast_structural_equality(self) -> None:
+        i1 = VDot2F16Instruction(
+            dst=Reg(0, RegType.VGPR),
+            src0=VOP3Operand(Reg(1, RegType.VGPR)),
+            src1=VOP3Operand(Literal32.from_f16x2(1.0, 1.0)),
+        )
+        i2 = VDot2F16Instruction(
+            dst=Reg(0, RegType.VGPR),
+            src0=VOP3Operand(Reg(1, RegType.VGPR)),
+            src1=VOP3Operand(Literal32.from_f16x2(1.0, 1.0)),
+        )
+        self.assertEqual(i1, i2)
+
+    def test_invalid_destination_rejection(self) -> None:
+        with self.assertRaises(TypeError):
+            VDot2F16Instruction(
+                dst=Reg(0, RegType.SGPR),
+                src0=VOP3Operand(Reg(1, RegType.VGPR)),
+                src1=VOP3Operand(Reg(2, RegType.VGPR)),
+            )
+        with self.assertRaises(TypeError):
+            VDot2AccF16Instruction(
+                dst=Reg(0, RegType.SGPR),
+                src0=VOP3Operand(Reg(1, RegType.VGPR)),
+                src1=VOP3Operand(Reg(2, RegType.VGPR)),
+                src2=VOP3Operand(Reg(3, RegType.VGPR)),
+            )
 
 
 if __name__ == "__main__":
