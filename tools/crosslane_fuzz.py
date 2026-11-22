@@ -726,11 +726,12 @@ def make_program(seed, wave, n_ops, **kw):
 # ---- running on the GPU ---------------------------------------------------------------------------------
 def assemble(mc, prog, src, disasm, fssm):
     import compute_fixture
+    import mc_command
     mattr = "+wavefrontsize64,-wavefrontsize32" if prog.wave == 64 else "+wavefrontsize32,-wavefrontsize64"
     cmd = mc + ["-triple=amdgcn--amdpal", "-mcpu=gfx1013", f"-mattr={mattr}", "-show-encoding"]
     if "@" in src:
         src = resolve_branches(cmd, prog, src)
-    r = subprocess.run(cmd, input=src, capture_output=True, text=True)
+    r = mc_command.run(cmd, input=src, capture_output=True, text=True)
     if r.returncode or "error:" in r.stderr:
         raise RuntimeError(f"{prog.name} did not assemble:\n{r.stderr}\n{src}")
     code = "".join(ln for ln in r.stdout.splitlines(keepends=True) if not ln.lstrip().startswith("."))
@@ -750,7 +751,8 @@ def resolve_branches(cmd, prog, src):
     lines = src.splitlines()
     insns = [i for i, ln in enumerate(lines) if ln.strip() and not ln.strip().startswith(";")]
     first = "\n".join(re.sub(r"@\d+$", "0", ln) for ln in lines) + "\n"
-    r = subprocess.run(cmd, input=first, capture_output=True, text=True)
+    import mc_command
+    r = mc_command.run(cmd, input=first, capture_output=True, text=True)
     if r.returncode or "error:" in r.stderr:
         raise RuntimeError(f"{prog.name} did not assemble:\n{r.stderr}\n{first}")
     sizes = [len(re.findall(r"0x[0-9a-f]{2}", m)) // 4 for m in re.findall(r"encoding: \[([^\]]*)\]", r.stdout)]
