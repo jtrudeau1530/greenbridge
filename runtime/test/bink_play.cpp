@@ -2,7 +2,13 @@
 // same path bink_decode_test checks). A local viewing tool for movies carved from your own copy; nothing it reads or
 // shows is written anywhere.
 //
-//   bink_play <movie.bk2 | archive.rpf@OFFSET> [--game-dir DIR] [--frames N] [--headless] [--loop]
+//   bink_play [NAME | movie.bk2 | archive.rpf@OFFSET] [--game-dir DIR] [--frames N] [--headless] [--loop]
+//
+// NAME is a movie's path in the game (Stinger/RSG_STINGER.bk2) or any unique part of it (stinger), looked up in the
+// name table tools/bink_play.py keeps (%LOCALAPPDATA%\Leonida\bink_names.csv); if there is none yet, bink_play runs
+// that tool once to build it. With no movie at all a windowed run plays the Rockstar stinger, so double-clicking
+// the executable plays it. The game folder comes from --game-dir, LEONIDA_GAME_DIR, or the archive the name table
+// was built from.
 //
 // A movie inside an archive plays where it is: `movies.rpf@OFFSET` hands BinkOpen the archive with
 // BinkSetFileOffset, so nothing is extracted (tools/bink_play.py finds the offset from the movie's name). A relative
@@ -17,6 +23,7 @@
 #include <windows.h>
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -192,6 +199,105 @@ void set_title(HWND hwnd, const Player& p, const std::wstring& name, double rate
     SetWindowTextW(hwnd, title);
 }
 
+constexpr const char* kDefaultMovie = "Stinger/RSG_STINGER.bk2";
+
+std::string lower_ascii(std::string v) {
+    for (char& c : v) c = (char)std::tolower((unsigned char)c);
+    std::replace(v.begin(), v.end(), '\\', '/');
+    return v;
+}
+
+struct NamedMovie {
+    std::string path;
+    uint64_t offset = 0;
+};
+
+struct NameTable {
+    std::filesystem::path archive;  // the archive the table was built from (its first line)
+    std::vector<NamedMovie> movies;
+};
+
+std::filesystem::path name_table_path() {
+    const std::string base = env("LOCALAPPDATA");
+    return base.empty() ? std::filesystem::path() : std::filesystem::path(base) / "Leonida" / "bink_names.csv";
+}
+
+// tools/bink_play.py's table: "# <archive>|<size>|<mtime>", then a header and path,offset,width,height,frames rows.
+// Stale when the archive's size changed. Paths in the table have no commas (they are game file paths).
+bool read_name_table(NameTable& out) {
+    const std::filesystem::path p = name_table_path();
+    std::ifstream f(p);
+    std::string line;
+    if (p.empty() || !f || !std::getline(f, line) || line.rfind("# ", 0) != 0) return false;
+    const std::string stamp = line.substr(2);
+    const size_t bar1 = stamp.find('|'), bar2 = stamp.find('|', bar1 + 1);
+    if (bar1 == std::string::npos || bar2 == std::string::npos) return false;
+    out.archive = std::filesystem::path(stamp.substr(0, bar1));
+    std::error_code ec;
+    const auto size = std::filesystem::file_size(out.archive, ec);
+    if (ec || std::to_string(size) != stamp.substr(bar1 + 1, bar2 - bar1 - 1)) return false;
+    std::getline(f, line);  // header
+    out.movies.clear();
+    while (std::getline(f, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        const size_t c1 = line.find(','), c2 = line.find(',', c1 + 1);
+        if (c1 == std::string::npos || c2 == std::string::npos) continue;
+        out.movies.push_back({line.substr(0, c1), std::strtoull(line.substr(c1 + 1, c2 - c1 - 1).c_str(), nullptr, 10)});
+    }
+    return !out.movies.empty();
+}
+
+// Builds the table with tools/bink_play.py (the repository's copy, two folders up from runtime/build), once.
+bool build_name_table(const std::filesystem::path& game_dir) {
+    wchar_t exe[MAX_PATH];
+    GetModuleFileNameW(nullptr, exe, MAX_PATH);
+    std::filesystem::path tool;
+    for (std::filesystem::path d = std::filesystem::path(exe).parent_path(); !d.empty() && d != d.root_path();
+         d = d.parent_path())
+        if (std::filesystem::is_regular_file(d / "tools" / "bink_play.py")) {
+            tool = d / "tools" / "bink_play.py";
+            break;
+        }
+    if (tool.empty() || game_dir.empty()) return false;
+    std::printf("naming the movies in movies.rpf (about half a minute, once)...\n");
+    std::fflush(stdout);
+    const std::wstring cmd = L"python \"" + tool.wstring() + L"\" --list --game-dir \"" + game_dir.wstring() + L"\"";
+    STARTUPINFOW si{sizeof(si)};
+    si.dwFlags = STARTF_USESTDHANDLES;
+    HANDLE nul = CreateFileW(L"NUL", GENERIC_WRITE, FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
+    si.hStdOutput = nul;  // the list itself isn't wanted, only the table it leaves behind
+    si.hStdError = GetStdHandle(STD_ERROR_HANDLE);
+    si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+    PROCESS_INFORMATION pi{};
+    std::vector<wchar_t> line(cmd.begin(), cmd.end());
+    line.push_back(0);
+    const bool ok = CreateProcessW(nullptr, line.data(), nullptr, nullptr, TRUE, 0, nullptr, nullptr, &si, &pi);
+    if (ok) {
+        WaitForSingleObject(pi.hProcess, INFINITE);
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+    }
+    if (nul != INVALID_HANDLE_VALUE) CloseHandle(nul);
+    return ok;
+}
+
+// The movie a NAME means: exactly that path (case-insensitive), else the only path containing it.
+NamedMovie find_named(const NameTable& table, const std::string& name) {
+    const std::string want = lower_ascii(name);
+    std::vector<const NamedMovie*> part;
+    for (const NamedMovie& m : table.movies) {
+        const std::string have = lower_ascii(m.path);
+        if (have == want) return m;
+        if (have.find(want) != std::string::npos) part.push_back(&m);
+    }
+    if (part.size() == 1) return *part[0];
+    std::string why = part.empty() ? "no movie is named like \"" + name + "\"" :
+                                     std::to_string(part.size()) + " movies match \"" + name + "\"; be more specific:";
+    for (size_t i = 0; i < part.size() && i < 20; ++i) why += "\n  " + part[i]->path;
+    if (part.empty()) why += " (python tools\\bink_play.py --list shows the names)";
+    fatal(why);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -209,22 +315,39 @@ int main(int argc, char** argv) {
         else if (a == "--loop") loop = true;
         else if (!a.empty() && a[0] != '-') movie_arg = a;
         else {
-            std::fprintf(stderr, "usage: bink_play <movie.bk2> [--game-dir DIR] [--frames N] [--headless] [--loop]\n");
+            std::fprintf(stderr, "usage: bink_play [NAME | movie.bk2 | archive.rpf@OFFSET] [--game-dir DIR] "
+                                 "[--frames N] [--headless] [--loop]\n");
             return 2;
         }
     }
     g_windowed = !headless;
-    if (game_dir_arg.empty() || movie_arg.empty()) {
+    // CTest's headless smoke run gives no movie: that is a skip, not a request for the default one.
+    if (movie_arg.empty() && headless) {
         std::printf("SKIP (no package/movie)\n");
-        if (g_windowed)
-            MessageBoxA(nullptr,
-                        "bink_play needs a movie and the game folder:\n\n"
-                        "  bink_play <movie.bk2 | movies.rpf@OFFSET> --game-dir <package folder>\n\n"
-                        "To play a movie by name, use tools\\bink_play.py (or play_movie.bat):\n"
-                        "  python tools\\bink_play.py stinger --game-dir <package folder>",
-                        "bink_play", MB_OK | MB_ICONINFORMATION);
         return 77;
     }
+    if (movie_arg.empty()) movie_arg = kDefaultMovie;
+
+    // A name (not a file, not archive@OFFSET) goes through the name table, which also knows the game folder.
+    std::error_code ec;
+    const bool is_name = movie_arg.find('@') == std::string::npos && !std::filesystem::is_regular_file(movie_arg, ec);
+    if (is_name) {
+        NameTable table;
+        if (!read_name_table(table)) {
+            if (game_dir_arg.empty())
+                fatal("bink_play needs the game folder once, to name the movies:\n\n"
+                      "  bink_play " + movie_arg + " --game-dir <package folder>\n\n"
+                      "After that, double-clicking bink_play.exe plays the stinger.");
+            build_name_table(game_dir_arg);
+            if (!read_name_table(table)) fatal("could not build the movie name table with tools\\bink_play.py");
+        }
+        const NamedMovie m = find_named(table, movie_arg);
+        std::printf("%s\n", m.path.c_str());
+        if (game_dir_arg.empty()) game_dir_arg = table.archive.parent_path().string();
+        movie_arg = table.archive.string() + "@" + std::to_string(m.offset);
+    }
+    if (game_dir_arg.empty()) fatal("no game folder: pass --game-dir or set LEONIDA_GAME_DIR");
+
     const std::filesystem::path game_dir = game_dir_arg;
     std::filesystem::path movie = movie_arg;
     uint64_t offset = 0;
@@ -235,7 +358,6 @@ int main(int argc, char** argv) {
         movie = movie_arg.substr(0, at);
         if (movie.is_relative() && !std::filesystem::exists(movie)) movie = game_dir / movie;
     }
-    std::error_code ec;
     if (!std::filesystem::is_regular_file(game_dir / "Bink2Scarlett.dll", ec))
         fatal("the game folder does not contain Bink2Scarlett.dll");
     if (!std::filesystem::is_regular_file(movie, ec)) fatal("the movie is not a file");

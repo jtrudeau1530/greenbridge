@@ -4,27 +4,25 @@
 a Bink 2 movie in a window at the movie's frame rate. A movie inside an archive plays where it is: nothing is
 extracted and nothing it decodes is written to disk.
 
-The easy way is by name, through `tools/bink_play.py`:
-
 ```sh
-set LEONIDA_GAME_DIR=C:\path\to\package
-python tools/bink_play.py Stinger/RSG_STINGER.bk2     # or any unique part of the name: stinger
-python tools/bink_play.py --list tv/                  # the names it knows
+bink_play                                   # no movie: plays Stinger/RSG_STINGER.bk2 (so a double-click plays it)
+bink_play stinger                           # a movie's path in the game, or any unique part of it
+bink_play TV/<name>.bk2 --loop
+bink_play movies.rpf@OFFSET | file.bk2      # an offset in an archive, or a loose .bk2
 ```
 
-It names the streams of `movies.rpf` with `tools/bink_names.py` (from `common.rpf`'s mount lists) and starts
-`bink_play movies.rpf@<offset>`. Naming takes about half a minute, so the table (names, offsets and frame sizes, no
-movie data) is kept in `%LOCALAPPDATA%\Leonida\bink_names.csv` and rebuilt when the archive changes.
+Options: `--game-dir DIR`, `--frames N`, `--headless`, `--loop`. The game folder comes from `--game-dir`,
+`LEONIDA_GAME_DIR`, or the archive the name table was built from.
 
-The executable itself:
+Names come from the table `tools/bink_play.py` keeps in `%LOCALAPPDATA%\Leonida\bink_names.csv` (names, offsets
+and frame sizes from `tools/bink_names.py` and `common.rpf`'s mount lists; no movie data), rebuilt when the archive's
+size changes. Without a table, `bink_play` runs that tool once to build it, which takes about half a minute and needs
+the game folder the first time: `bink_play stinger --game-dir C:\path\to\package`. After that a double-click
+is enough. `python tools/bink_play.py --list [TEXT]` lists the names.
 
-```sh
-bink_play <movie.bk2 | archive.rpf@OFFSET> [--game-dir DIR] [--frames N] [--headless] [--loop]
-```
-
-`--game-dir` defaults to `LEONIDA_GAME_DIR`, the movie to `LEONIDA_MOVIE`; a relative archive is taken from the game
-folder. For `archive@OFFSET` it calls `BinkSetFileOffset(OFFSET)` and opens the archive with `BinkOpen`'s
-`BINKFILEOFFSET` flag (0x20); without the flag the offset is ignored and `BinkOpen` reports "Not a Bink file".
+For `archive@OFFSET` it calls `BinkSetFileOffset(OFFSET)` and opens the archive with `BinkOpen`'s `BINKFILEOFFSET`
+flag (0x20); without the flag the offset is ignored and `BinkOpen` reports "Not a Bink file". An error in a windowed
+run is shown in a message box too, since a double-clicked console closes with the process.
 
 | Key | Action |
 |---|---|
@@ -38,8 +36,8 @@ The window title shows the frame number and the rate frames are being shown. The
 its aspect ratio kept (GDI `StretchDIBits`, no GPU path).
 
 `--headless` decodes without a window as fast as it can and prints the decode rate; `--frames N` stops after N
-frames. CTest runs `bink_play --headless --frames 30` as `bink_play_headless`, which skips (exit 77) unless both
-`LEONIDA_GAME_DIR` and `LEONIDA_MOVIE` are set.
+frames. CTest runs `bink_play --headless --frames 30` as `bink_play_headless`, which skips (exit 77) unless
+`LEONIDA_MOVIE` names a movie (a headless run never falls back to the stinger).
 
 ## Measured on 1.0.2.1
 
