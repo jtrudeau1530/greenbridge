@@ -297,7 +297,7 @@ public:
                     rank > best_rank) {
                     physical = candidate;
                     family = i;
-                    family_queue_count = families[i].queueCount;
+                    family_queue_count = candidate_families[i].queueCount;
                     chosen = props;
                     best_rank = rank;
                     v13_.choose(candidate13);
