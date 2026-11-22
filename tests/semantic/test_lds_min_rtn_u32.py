@@ -1129,5 +1129,130 @@ class TestDSMinRtnU32StatusFlags(unittest.TestCase):
         self.assertEqual(len(pairs), 0)
 
 
+class TestDSMinRtnU32IEEE754AndBoundaries(unittest.TestCase):
+    """Unit tests for IEEE 754 float bit pattern handling, subnormals, NaNs, and boundary extremes."""
+
+    def setUp(self) -> None:
+        self.lds = LDSMemory(65536)
+        self.state = ScalarThreadState(lds=self.lds)
+        self.interp = ScalarDSInterpreter(state=self.state)
+
+    def _float_to_bits(self, f: float) -> int:
+        return struct.unpack(">I", struct.pack(">f", f))[0]
+
+    def _bits_to_float(self, b: int) -> float:
+        return struct.unpack(">f", struct.pack(">I", b & MASK32))[0]
+
+    def test_float_zero_ordering(self) -> None:
+        # In IEEE 754, +0.0 == -0.0.
+        # In ds_min_rtn_u32, +0.0 (0x00000000) is strictly smaller than -0.0 (0x80000000).
+        pos_zero = self._float_to_bits(+0.0)  # 0x00000000
+        neg_zero = self._float_to_bits(-0.0)  # 0x80000000
+
+        self.assertEqual(pos_zero, 0x00000000)
+        self.assertEqual(neg_zero, 0x80000000)
+
+        old, new = ref_ds_min_rtn_u32(neg_zero, pos_zero)
+        self.assertEqual(old, neg_zero)
+        self.assertEqual(new, pos_zero)
+
+        old, new = ref_ds_min_rtn_u32(pos_zero, neg_zero)
+        self.assertEqual(old, pos_zero)
+        self.assertEqual(new, pos_zero)
+
+    def test_float_infinities(self) -> None:
+        # +infinity = 0x7F800000, -infinity = 0xFF800000
+        # In float: -inf < +inf.
+        # In ds_min_rtn_u32: +inf (0x7F800000) is unsigned smaller than -inf (0xFF800000).
+        pos_inf = 0x7F800000
+        neg_inf = 0xFF800000
+
+        old, new = ref_ds_min_rtn_u32(neg_inf, pos_inf)
+        self.assertEqual(old, neg_inf)
+        self.assertEqual(new, pos_inf)
+
+    def test_nan_bit_patterns_and_no_quieting(self) -> None:
+        # Signaling NaN (sNaN) and Quiet NaN (qNaN)
+        snan = 0x7F800001
+        qnan = 0x7FC00000
+        norm_val = 0x3F800000  # 1.0f
+
+        # Normal 1.0f (0x3F800000) < snan (0x7F800001)
+        old, new = ref_ds_min_rtn_u32(snan, norm_val)
+        self.assertEqual(old, snan)
+        self.assertEqual(new, norm_val)
+
+        # qNaN vs sNaN: sNaN (0x7F800001) < qNaN (0x7FC00000)
+        old, new = ref_ds_min_rtn_u32(qnan, snan)
+        self.assertEqual(old, qnan)
+        self.assertEqual(new, snan)
+
+        # Verify bitwise preservation in memory: sNaN payload must NOT be altered
+        self.lds.write_by_byte_addr(0x20, qnan)
+        self.state.set_vgpr(1, 0x20)
+        self.state.set_vgpr(2, snan)
+        inst = DSMinRtnU32Instruction(
+            opcode=DSOpcode.DS_MIN_RTN_U32,
+            vdst=vgpr(0),
+            vaddr=vgpr(1),
+            vdata0=vgpr(2),
+        )
+        ret = self.interp.execute_instruction(inst)
+        self.assertEqual(ret, qnan)
+        self.assertEqual(self.lds.read_by_byte_addr(0x20), snan)
+
+    def test_subnormal_numbers_and_no_flush_to_zero(self) -> None:
+        # Subnormals: 0x00000001 to 0x007FFFFF
+        # Hardware must not flush subnormals to zero in integer instructions
+        smallest_subnormal = 0x00000001
+        zero = 0x00000000
+
+        old, new = ref_ds_min_rtn_u32(smallest_subnormal, zero)
+        self.assertEqual(old, smallest_subnormal)
+        self.assertEqual(new, zero)
+
+        subnormal_a = 0x00000100
+        subnormal_b = 0x00000050
+        old, new = ref_ds_min_rtn_u32(subnormal_a, subnormal_b)
+        self.assertEqual(old, subnormal_a)
+        self.assertEqual(new, subnormal_b)
+
+    def test_unsigned_integer_extremes(self) -> None:
+        extremes = [
+            0x00000000,
+            0x00000001,
+            0x7FFFFFFF,
+            0x80000000,
+            0xFFFFFFFE,
+            0xFFFFFFFF,
+        ]
+        # Verify strict monotonicity of oracle over sorted list
+        for i in range(len(extremes)):
+            for j in range(len(extremes)):
+                val_a = extremes[i]
+                val_b = extremes[j]
+                expected = val_a if i <= j else val_b
+                self.assertEqual(oracle_min_u32(val_a, val_b), expected)
+
+    def test_address_boundary_extremes_and_wrapping(self) -> None:
+        # Last valid dword in 64 KiB LDS is index 16383 (byte 65532)
+        last_byte = 65532
+        self.lds.write_by_byte_addr(last_byte, 0x1234)
+        self.assertEqual(self.lds.read_by_byte_addr(last_byte), 0x1234)
+
+        # Byte 65536 wraps to byte 0
+        self.lds.write_by_byte_addr(0, 0x5678)
+        self.assertEqual(self.lds.read_by_byte_addr(65536), 0x5678)
+
+        # 32-bit address overflow with 16-bit offset
+        # vaddr = 0xFFFFFFFF, offset = 1 -> wraps to 0
+        eff = calc_lds_effective_address(0xFFFFFFFF, 1)
+        self.assertEqual(eff, 0)
+
+        # vaddr = 0xFFFFFFF0, offset = 32 -> wraps to 16
+        eff2 = calc_lds_effective_address(0xFFFFFFF0, 32)
+        self.assertEqual(eff2, 16)
+
+
 if __name__ == "__main__":
     unittest.main()
