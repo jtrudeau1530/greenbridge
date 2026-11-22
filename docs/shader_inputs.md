@@ -8,6 +8,38 @@ it.
 Measured on the local package's disassembly (`work/shaders/dxbc/disasm`) at `16282101`. Offsets, bit positions and
 counts only; no shader text.
 
+## Bloom and exposure
+
+Reported by @Silliana in [#3235](https://github.com/ItsNotRexed/Leonida/issues/3235). The observations below were
+checked against the local disassembly. Offsets are bytes into the constant buffer read by the named shader.
+
+### A black bloom chain (`PS_DownSampleBloomFilterKaris`)
+
+- Check the RGB tint at `+0x00`, `+0x04` and `+0x08` first. The shader multiplies the filtered colour by these
+  values before export. An all-zero tint makes bloom black even with a valid source. The fourth value at `+0x0C`
+  feeds the exported alpha.
+- The sample loop has a limit of 13. Its luminance-dependent weight has the form `1 / (1 + k × luminance)`,
+  with scale `k` at `+0x1C`. Setting it to zero removes that dependence for finite inputs. The spatial filter
+  and output tint still apply.
+
+### Flat, wrong or slowly changing exposure (`PS_CalculateExposure`)
+
+- The mode dword at `+0x410` selects the exposure calculation. A nonzero value takes the path that computes
+  logarithmic exposure from the measured luminance. Check this before diagnosing the automatic exposure path.
+- On the compensation path, a nonzero dword at `+0x40C` selects the fixed value at `+0x408`. Zero selects a
+  sample from a 1D compensation curve. Check that the curve is bound when using the texture path.
+- Check the previous-exposure texture when the pass changes slowly. The adaptation code subtracts its sample
+  from the target exposure and can blend back toward the target. It tests `+0x3B0` against zero and compares
+  a value derived from the exposure delta against the threshold at `+0x3B4`. For a single-frame comparison,
+  the issue report suggests seeding the previous exposure with the target.
+
+### Luminance downsample and bloom upsample
+
+All five sampling sites in `PS_LuminanceSourceDownsample` contribute to the export. All nine in
+`PS_UpSampleBloomFilterBlend` do too. Check the source resolution, sampling and reduction before comparing
+the luminance pyramid with a whole-frame average.
+When inspecting the upsample in isolation, check in the pipeline state how its output blends with the previous level.
+
 ## Studio-shot lighting (`PS_STUDIOSHOT_PBR_MATERIAL_STANDARD_LIGHTING`)
 
 Reported by @Silliana in [#1892](https://github.com/ItsNotRexed/Leonida/issues/1892). The corpus has one program
