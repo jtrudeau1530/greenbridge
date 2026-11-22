@@ -292,6 +292,27 @@ class Run(unittest.TestCase):
         with open(os.path.join(out, next(f for f in files if f.startswith("CSyntheticRoot"))), encoding="utf-8") as f:
             self.assertEqual(json.load(f)["label"], "synthetic_name")
 
+    def test_exports_all_documents_with_the_same_basename(self):
+        targets = []
+        for index in range(1, 4):
+            folder = os.path.join(self.tmp.name, str(index))
+            os.mkdir(folder)
+            path = os.path.join(folder, "same.xml")
+            with open(path, "wb") as f:
+                f.write(f'<COther><x value="{index}"/></COther>'.encode("ascii"))
+            targets.append(path)
+        out = os.path.join(self.tmp.name, "json")
+        for _ in range(2):
+            summary = R.run(targets, out_dir=out)
+            self.assertEqual(summary["documents"], 3)
+            files = sorted(os.listdir(out))
+            self.assertEqual(len(files), 3)
+            values = []
+            for name in files:
+                with open(os.path.join(out, name), encoding="utf-8") as f:
+                    values.append(json.load(f)["x"])
+            self.assertEqual(sorted(values), [1, 2, 3])
+
     def test_cli_missing_target(self):
         r = subprocess.run([sys.executable, "-I", os.path.join(TOOLS, "gamedata_reader.py"),
                             os.path.join(self.tmp.name, "nope")], capture_output=True, text=True)
