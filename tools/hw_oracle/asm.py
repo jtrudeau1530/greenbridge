@@ -187,8 +187,11 @@ def module_text(programs, arch, prefix="k", wave=32):
         if isinstance(prog, Kernel):
             text = raw_kernel_text(name, prog.lines, arch, prog.wave, prog.mode) if prog.raw else kernel_text(name, prog.lines, arch)
             if prog.raw and (prog.vgprs, prog.sgprs) != (32, 40):
-                text = text.replace(".amdhsa_next_free_vgpr 32", f".amdhsa_next_free_vgpr {prog.vgprs}", 1)
-                text = text.replace(".amdhsa_next_free_sgpr 40", f".amdhsa_next_free_sgpr {prog.sgprs}", 1)
+                for key, old, new in (("vgpr", 32, prog.vgprs), ("sgpr", 40, prog.sgprs)):
+                    line = f".amdhsa_next_free_{key} {old}"
+                    if line not in text:
+                        raise RuntimeError(f"raw kernel text has no {line!r} to replace")
+                    text = text.replace(line, f".amdhsa_next_free_{key} {new}", 1)
         else:
             text = kernel_text(name, prog, arch)
         names.append(name)

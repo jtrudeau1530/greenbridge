@@ -438,6 +438,7 @@ programs assemble for gfx1013.
   generated (the translator rejects them).
 
 `--skip-op OP` (an op name) sets a known finding aside without changing the rest of the program.
+`--show SEED:INDEX:WAVE` prints a program and its model.
 
 #### Hardware oracle (`--oracle hw`, `translator,hw`)
 
@@ -483,10 +484,7 @@ vscnt wait plus `s_dcache_inv`; vector accesses only need `s_waitcnt vmcnt(0)`.
 *Findings.* The OOB_SELECT per-mode rules, the per-dword straddle rule and the `s_buffer_load` bound of design.md hold
 on gfx1150 (they were measured on RDNA2 and, for the vector part, on this GPU before; the `s_buffer_load` bound and the
 `idxen offen` and offset-only soffset forms are new on gfx1150). The one difference is `v_pack_b32_f16` quieting
-signaling NaNs. The translator path of `mem` could not be run in this session (`vk_compute_test` loses the device on the
-RTX 5070 even for the unchanged generator of `main`), so `translator,hw` was only checked to the point that
-`rdna2spirv.py` translates every new program.
-`--show SEED:INDEX:WAVE` prints a program and its model.
+signaling NaNs (only signaling NaN halves are not judged; a quiet NaN is compared). The default translator path of `mem` ran on the Radeon 880M (`VK_LOADER_DRIVERS_SELECT=*amd*`, `vk_compute_test` built with g++ as in the lab script): `--family mem --programs 200 --seed 1` gave 400 of 400 programs (native wave64 and wave32) matching the model, 0 not translated, 0 harness errors, so the translator agrees with the model on the OOB_SELECT, straddle, `s_load` and `s_buffer_load` rules there. On the RTX 5070 `vk_compute_test` loses the device (-4) for this and for the unchanged generator of `main`, so use the AMD device.
 
 ### Wave and cross-lane ops on the GPU (`tools/crosslane_fuzz.py`, FUZZ-7)
 

@@ -243,6 +243,31 @@ def test_mem_generator_reaches_every_kind_and_mode():
     assert kinds == set(vf.MEM_OPS) and modes == {0, 1, 2, 3}
 
 
+def test_f16_pack_of_a_signaling_nan_half_is_uncertain_and_a_quiet_one_is_compared():
+    assert vf.is_f16_snan(0x7C96) and vf.is_f16_snan(0xFC01) and not vf.is_f16_snan(0x7E96)
+    assert not vf.is_f16_snan(0x7C00) and not vf.is_f16_snan(0x3C00)
+    p = vf.F16Family(1, 0, 32)
+    R = {r: vf.Reg(0x3C007E96) for r in vf.POOL}     # a quiet NaN low half
+    d, s0, s1 = vf.POOL[1], vf.POOL[2], vf.POOL[3]
+    p.step({"name": "v_pack_b32_f16", "d": d, "s": [s0, s1], "opsel": [0, 1]}, R)
+    assert R[d].v == 0x3C007E96 and not R[d].ulo and not R[d].uhi
+
+
+def test_compare_counts_the_words_it_does_not_judge():
+    p = vf.F16Family(1, 0, 32)
+    data = struct.pack(f"<{vf.THREADS * len(vf.POOL)}I", *([0] * (vf.THREADS * len(vf.POOL))))
+    vf.compare(p, data)
+    want, _ = p.model()
+    assert p.uncertain_words == sum(1 for t in range(vf.THREADS) for r in vf.POOL if want[t][r].ulo or want[t][r].uhi)
+
+
+def test_unknown_skip_op_is_a_usage_error(monkeypatch, capsys):
+    monkeypatch.setattr(sys, "argv", ["valu_fuzz.py", "--family", "mem", "--model-only", "--skip-op", "store_raw"])
+    with pytest.raises(SystemExit) as exc:
+        vf.main()
+    assert exc.value.code == 2 and "unknown op store_raw" in capsys.readouterr().err
+
+
 def test_f16_pack_of_a_nan_half_is_uncertain():
     p = vf.F16Family(1, 0, 32)
     R = {r: vf.Reg(0x3C007C96) for r in vf.POOL}     # high half 1.0, low half a signaling NaN

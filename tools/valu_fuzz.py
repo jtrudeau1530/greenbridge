@@ -250,8 +250,9 @@ def is_f16_denorm(h):
     return (h & 0x7C00) == 0 and (h & 0x3FF) != 0
 
 
-def is_f16_nan(h):
-    return (h & 0x7C00) == 0x7C00 and (h & 0x3FF) != 0
+def is_f16_snan(h):
+    """A signaling NaN: exponent all ones, quiet bit (9) clear, payload non-zero."""
+    return (h & 0x7E00) == 0x7C00 and (h & 0x3FF) != 0
 
 
 def f16_sign(h):
@@ -527,11 +528,11 @@ class F16Family(Family):
         elif n == "v_pack_b32_f16":
             sel = op["opsel"]
             lo, hi = half(s[0], sel[0]), half(s[1], sel[1])
-            # a NaN half is uncertain: gfx1150 quiets a signaling NaN here (0x7c96 -> 0x7e96); the model moves bits,
+            # a signaling NaN half is uncertain (a quiet NaN stays compared): gfx1150 quiets a signaling NaN here (0x7c96 -> 0x7e96); the model moves bits,
             # and whether RDNA2 does the same is not known
             if "pack_swapped" in PERTURB:
                 lo, hi = hi, lo
-            R[d] = Reg(lo | (hi << 16), unc(s[0], sel[0]) or is_f16_nan(lo), unc(s[1], sel[1]) or is_f16_nan(hi))
+            R[d] = Reg(lo | (hi << 16), unc(s[0], sel[0]) or is_f16_snan(lo), unc(s[1], sel[1]) or is_f16_snan(hi))
         elif n in PK_F16 or n in PK_SHIFT:
             k = len(s)
             out, us = [], []
@@ -810,9 +811,12 @@ def programs(family, seed, count, waves, skip=()):
 
 
 def compare(p, data):
+    """Differences between the model and the dumped words. p.uncertain_words is set to how many result words had a
+    half the model does not judge (so a summary can show how many comparisons were skipped)."""
     words = struct.unpack(f"<{len(data) // 4}I", data)
     want, extra = p.model()
     diffs = []
+    p.uncertain_words = sum(1 for t in range(THREADS) for r in POOL if want[t][r].ulo or want[t][r].uhi)
     for t in range(THREADS):
         for i, r in enumerate(POOL):
             got = words[t * len(POOL) + i]
@@ -904,7 +908,7 @@ def run_hw(oracle, progs, args, tag="hw", quiet=False):
     skip_args = "".join(f" --skip-op {k}" for k in args.skip_op)
     failed = []
     for p, got in zip(progs, oracle.run(kernels)):
-        st = stats.setdefault(p.wave, {"programs": 0, "match": 0, "mismatch": 0, "rejected": 0})
+        st = stats.setdefault(p.wave, {"programs": 0, "match": 0, "mismatch": 0, "rejected": 0, "uncertain_words": 0})
         st["programs"] += 1
         if isinstance(got, str):
             st["rejected"] += 1
@@ -913,6 +917,7 @@ def run_hw(oracle, progs, args, tag="hw", quiet=False):
             continue
         p.fill = FILL_HW
         diffs = compare(p, struct.pack(f"<{len(got)}I", *got))
+        st["uncertain_words"] += p.uncertain_words
         if not diffs:
             st["match"] += 1
             continue
@@ -968,6 +973,7 @@ def run_translator(progs, a):
         return 2
     failed = untranslated = skipped = errors = 0
     skip_args = "".join(f" --skip-op {k}" for k in a.skip_op)
+    uncertain = 0
     for p in progs:
         spv = work / "spirv" / (p.name + ".spv")
         if p.name not in index or not spv.is_file():
@@ -989,6 +995,7 @@ def run_translator(progs, a):
             continue
         p.fill = FILL_VK
         diffs = compare(p, data)
+        uncertain += p.uncertain_words
         if diffs:
             failed += 1
             idx = p.name.split("_")[3]
@@ -999,7 +1006,7 @@ def run_translator(progs, a):
     mode = "emulated" if a.emulate else "native"
     ran = len(progs) - untranslated - skipped - errors
     print(f"{a.family}: {ran - failed}/{ran} programs that ran match ({mode}); {failed} mismatched, {skipped} skipped, "
-          f"{untranslated} not translated, {errors} harness errors; work dir {work}")
+          f"{untranslated} not translated, {errors} harness errors; {uncertain} result words not judged; work dir {work}")
     if errors or ran == 0:
         return 2
     return 1 if failed or untranslated else 0
@@ -1040,6 +1047,10 @@ def main():
     backends = tuple(dict.fromkeys(t.strip() for t in a.oracle.split(",")))
     if not backends or any(t not in ("translator", "hw") for t in backends):
         ap.error("--oracle takes translator, hw or translator,hw")
+    known = set(F16_OPS) | set(MEM_OPS)
+    unknown = sorted(set(a.skip_op) - known)
+    if unknown:
+        ap.error(f"--skip-op: unknown op {', '.join(unknown)} (known: {', '.join(sorted(known))})")
     if a.negative_control and "hw" not in backends:
         ap.error("--negative-control needs --oracle hw")
     hw = "hw" in backends
