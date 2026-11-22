@@ -3944,21 +3944,21 @@ int main() {
 
         // RTX 5070 / 621.14 host answers, without requiring a host device for this regression.
         for (const UINT samples : {0u, 33u, 64u, UINT_MAX}) {
-            D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS levels{DXGI_FORMAT_R8G8B8A8_UNORM, samples,
+            D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS quality{DXGI_FORMAT_R8G8B8A8_UNORM, samples,
                                                                D3D12_MULTISAMPLE_QUALITY_LEVELS_FLAG_NONE, 99};
-            EXPECT(device->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &levels,
-                                               sizeof(levels)) == E_FAIL);
-            EXPECT(levels.NumQualityLevels == 0);
+            EXPECT(device->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &quality,
+                                               sizeof(quality)) == E_FAIL);
+            EXPECT(quality.NumQualityLevels == 0);
         }
         for (UINT format = 0; format <= 192; ++format) {
             const bool known = format != UINT(DXGI_FORMAT_R1_UNORM) &&
                                (format <= 115 || (format >= 189 && format <= 191));
             for (const UINT samples : {1u, 3u, 31u}) {
-                D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS levels{DXGI_FORMAT(format), samples,
+                D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS quality{DXGI_FORMAT(format), samples,
                                                                    D3D12_MULTISAMPLE_QUALITY_LEVELS_FLAG_NONE, 99};
-                EXPECT(device->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &levels,
-                                                   sizeof(levels)) == (known ? S_OK : E_FAIL));
-                EXPECT(levels.NumQualityLevels == (known ? UINT(samples == 1) : 99u));
+                EXPECT(device->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &quality,
+                                                   sizeof(quality)) == (known ? S_OK : E_FAIL));
+                EXPECT(quality.NumQualityLevels == (known ? UINT(samples == 1) : 99u));
             }
         }
         D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS invalid_format_levels{DXGI_FORMAT_FORCE_UINT, 1,
