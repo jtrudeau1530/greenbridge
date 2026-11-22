@@ -785,16 +785,46 @@ public:
         *out = static_cast<IDXGISwapChain1*>(sc);
         return S_OK;
     }
-    HRESULT STDMETHODCALLTYPE CreateSwapChainForCoreWindow(IUnknown*, IUnknown*, const DXGI_SWAP_CHAIN_DESC1*,
-                                                           IDXGIOutput*, IDXGISwapChain1**) override {
-        return E_NOTIMPL;
+    HRESULT STDMETHODCALLTYPE CreateSwapChainForCoreWindow(IUnknown* device, IUnknown* window,
+                                                           const DXGI_SWAP_CHAIN_DESC1* desc,
+                                                           IDXGIOutput* restrict_to_output,
+                                                           IDXGISwapChain1** out) override {
+        if (!out) return E_POINTER;
+        *out = nullptr;
+        if (!device || !window || !desc) return E_INVALIDARG;
+        // UWP / Game Core Scarlett titles present to an ICoreWindow. Extract the underlying
+        // Win32 HWND via ICoreWindowInterop.
+        static constexpr GUID kIID_ICoreWindowInterop = {
+            0x45D64A29, 0xA63E, 0x4CB6, {0xB4, 0x98, 0x57, 0x81, 0xD2, 0x98, 0xCB, 0x4F}};
+        struct ICoreWindowInterop : public IUnknown {
+            virtual HRESULT STDMETHODCALLTYPE get_WindowHandle(HWND* hwnd) = 0;
+            virtual HRESULT STDMETHODCALLTYPE put_MessageHandled(unsigned char value) = 0;
+        };
+        ICoreWindowInterop* interop = nullptr;
+        if (FAILED(window->QueryInterface(kIID_ICoreWindowInterop, reinterpret_cast<void**>(&interop))) || !interop) {
+            return DXGI_ERROR_INVALID_CALL;
+        }
+        HWND hwnd = nullptr;
+        const HRESULT hr = interop->get_WindowHandle(&hwnd);
+        interop->Release();
+        if (FAILED(hr) || !hwnd) return DXGI_ERROR_INVALID_CALL;
+        return CreateSwapChainForHwnd(device, hwnd, desc, nullptr, restrict_to_output, out);
     }
     HRESULT STDMETHODCALLTYPE GetSharedResourceAdapterLuid(HANDLE, LUID*) override { return E_NOTIMPL; }
     HRESULT STDMETHODCALLTYPE RegisterStereoStatusWindow(HWND, UINT, DWORD*) override { return E_NOTIMPL; }
     HRESULT STDMETHODCALLTYPE RegisterStereoStatusEvent(HANDLE, DWORD*) override { return E_NOTIMPL; }
     void STDMETHODCALLTYPE UnregisterStereoStatus(DWORD) override {}
-    HRESULT STDMETHODCALLTYPE RegisterOcclusionStatusWindow(HWND, UINT, DWORD*) override { return E_NOTIMPL; }
-    HRESULT STDMETHODCALLTYPE RegisterOcclusionStatusEvent(HANDLE, DWORD*) override { return E_NOTIMPL; }
+    HRESULT STDMETHODCALLTYPE RegisterOcclusionStatusWindow(HWND hwnd, UINT msg, DWORD* cookie) override {
+        (void)msg;
+        if (!hwnd || !cookie) return DXGI_ERROR_INVALID_CALL;
+        *cookie = next_occlusion_cookie_.fetch_add(1, std::memory_order_relaxed);
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE RegisterOcclusionStatusEvent(HANDLE event, DWORD* cookie) override {
+        if (!event || !cookie) return DXGI_ERROR_INVALID_CALL;
+        *cookie = next_occlusion_cookie_.fetch_add(1, std::memory_order_relaxed);
+        return S_OK;
+    }
     void STDMETHODCALLTYPE UnregisterOcclusionStatus(DWORD) override {}
     HRESULT STDMETHODCALLTYPE CreateSwapChainForComposition(IUnknown*, const DXGI_SWAP_CHAIN_DESC1*, IDXGIOutput*,
                                                             IDXGISwapChain1**) override {
@@ -880,6 +910,7 @@ private:
     HWND assoc_hwnd_ = nullptr;
     mutable std::once_flag tearing_once_;
     bool tearing_supported_ = false;
+    std::atomic<DWORD> next_occlusion_cookie_{1};
 };
 
 }  // namespace
