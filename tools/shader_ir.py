@@ -7,6 +7,7 @@ label/offset (for branches), hw register, and raw text for anything else.
 As a module: parse_file(path) -> {"name", "code_start", "insns": [...], "invalid": [pc...]}
 As a tool:  python -I shader_ir.py <disasm dir> [--limit N]   (parses everything and reports coverage)
 """
+import argparse
 import os
 import re
 import sys
@@ -153,13 +154,27 @@ def parse_file(path):
     return info
 
 
-def main():
-    src = sys.argv[1]
-    limit = int(sys.argv[3]) if len(sys.argv) > 3 and sys.argv[2] == "--limit" else None
-    files = sorted(f for f in os.listdir(src) if f.endswith(".s"))[:limit]
+def positive_int(text):
+    try:
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"invalid int value: {text!r}") from None
+    if value < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return value
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description="Parse a folder of .s disassembly and report operand coverage.")
+    ap.add_argument("src", help="folder of .s files written by shader_disasm.py")
+    ap.add_argument("--limit", type=positive_int, help="parse only the first N files, sorted by name")
+    a = ap.parse_args(argv)
+    if not os.path.isdir(a.src):
+        ap.error(f"{a.src} is not a folder")
+    files = sorted(f for f in os.listdir(a.src) if f.endswith(".s"))[:a.limit]
     kinds, raw, n_ins, no_enc = Counter(), Counter(), 0, 0
     for f in files:
-        info = parse_file(os.path.join(src, f))
+        info = parse_file(os.path.join(a.src, f))
         for ins in info["insns"]:
             n_ins += 1
             no_enc += ins["enc"] is None

@@ -17,6 +17,8 @@ game data. Non-XML payloads follow the 64 KiB block rule; a file whose inflated 
 64 KiB can merge with the next stream. XML documents close on their root element, so their grouping is exact.
 The tool is standard library only and never writes outside the requested output files.
 """
+from __future__ import annotations
+
 import argparse
 import csv
 import json

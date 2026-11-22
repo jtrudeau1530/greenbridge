@@ -229,13 +229,22 @@ def probe_row(row, ffprobe):
              "stream=codec_name,codec_type:format=duration", "-of", "json", name],
             capture_output=True, text=True, timeout=60,
         )
-        info = json.loads(proc.stdout) if proc.stdout.strip() else {}
-        video = next((s for s in info.get("streams", [])
-                      if s.get("codec_type") == "video"), None)
+        proc.check_returncode()
+        info = json.loads(proc.stdout)
+        if not isinstance(info, dict):
+            raise ValueError("expected an ffprobe JSON object")
+        streams, container = info.get("streams", []), info.get("format", {})
+        if (not isinstance(streams, list) or any(not isinstance(s, dict) for s in streams)
+                or not isinstance(container, dict)):
+            raise ValueError("invalid ffprobe stream or format metadata")
+        video = next((s for s in streams if s.get("codec_type") == "video"), None)
         codec = (video or {}).get("codec_name") or ""
+        duration = container.get("duration", "")
+        if not isinstance(codec, str) or not isinstance(duration, str):
+            raise ValueError("invalid ffprobe codec name or duration")
         row["decodes"] = "yes" if codec else "no"
         row["codec"] = codec
-        row["probe_duration_s"] = info.get("format", {}).get("duration", "")
+        row["probe_duration_s"] = duration
     except (OSError, subprocess.SubprocessError, ValueError):
         row["decodes"] = "no"
         row["codec"] = ""

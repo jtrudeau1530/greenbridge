@@ -283,6 +283,23 @@ class ArchiveTest(unittest.TestCase):
             self.assertNotIn("Traceback", proc.stderr)
             self.assertFalse(os.path.exists(out))
 
+    def test_missing_source_is_an_error_not_a_traceback(self):
+        out = os.path.join(self.root, "missing.json")
+        proc = subprocess.run([sys.executable, "-I", TOOL, os.path.join(self.root, "nope.rpf"), out, "--quiet"],
+                              capture_output=True, text=True, encoding="utf-8", errors="replace")
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertIn("nope.rpf", proc.stderr)
+        self.assertNotIn("Traceback", proc.stderr)
+        self.assertFalse(os.path.exists(out))
+
+    def test_unwritable_output_path_fails_before_the_scan(self):
+        for out in (os.path.join(self.root, "no_such_folder", "x.json"), self.root):
+            proc = subprocess.run([sys.executable, "-I", TOOL, self.rpf, out, "--quiet"],
+                                  capture_output=True, text=True, encoding="utf-8", errors="replace")
+            self.assertEqual(proc.returncode, 2, proc.stderr)
+            self.assertNotIn("Traceback", proc.stderr)
+        self.assertFalse(os.path.exists(os.path.join(self.root, "no_such_folder")))
+
     def test_cli(self):
         out = os.path.join(self.root, "cli.json")
         proc = subprocess.run([sys.executable, "-I", TOOL, self.rpf, out, "--quiet"],

@@ -71,6 +71,10 @@ class TreeError(RbfError):
     """A malformed or truncated RBF0 record stream."""
 
 
+class SelectionError(ValueError):
+    """An invalid resource offset or limit."""
+
+
 class Parser:
     """One RBF0 resource. `parse()` always returns a document, with a partial tree on failure."""
 
@@ -398,7 +402,14 @@ def _rows(source):
 
 
 def decode_source(source, roots=None, offset=None, limit=None, progress=None):
-    """Decode every RBF0 start in `source`, joining 64 KiB continuations. Returns (docs, summary)."""
+    """Decode RBF0 resources, joining 64 KiB continuations, and return (docs, summary).
+
+    An explicit offset must be nonnegative and an explicit limit must be positive.
+    """
+    if limit is not None and limit < 1:
+        raise SelectionError("--limit must be at least 1")
+    if offset is not None and offset < 0:
+        raise SelectionError("--offset must be non-negative")
     rows, read = _rows(source)
     starts = [i for i, row in enumerate(rows) if row["head"][:4] == MAGIC]
     if not starts:
@@ -656,17 +667,16 @@ def main(argv=None):
     ap.add_argument("--limit", type=int, help="stop after this many selected resources")
     ap.add_argument("--quiet", action="store_true")
     args = ap.parse_args(argv)
-    if args.limit is not None and args.limit < 1:
-        ap.error("--limit must be at least 1")
-    if args.offset is not None and args.offset < 0:
-        ap.error("--offset must be non-negative")
 
     def progress(n, total):
         if not args.quiet and (n % 100 == 0 or n == total):
             print(f"[{n}/{total}] resources", flush=True)
 
-    docs, summary = decode_source(args.source, roots=args.root, offset=args.offset,
-                                  limit=args.limit, progress=progress)
+    try:
+        docs, summary = decode_source(args.source, roots=args.root, offset=args.offset,
+                                      limit=args.limit, progress=progress)
+    except SelectionError as error:
+        ap.error(str(error))
     write_json(args.out, docs, summary)
     if args.csv:
         write_csv(args.csv, docs)

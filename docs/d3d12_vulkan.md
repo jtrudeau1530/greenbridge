@@ -1,7 +1,7 @@
 # Xbox D3D12 (`d3d12_xs`) to Vulkan
 
 **Status: in progress. A Vulkan-backed `ID3D12Device` (queues, allocators, command lists, fences, descriptor heaps,
-render-target and depth views, texture views and samplers, committed buffers, 2D textures and 3D texture transfers)
+render-target and depth views, texture views and samplers, committed and reserved buffers, 2D textures and 3D texture transfers)
 runs behind the Xbox-ABI device proxy (section 3.2). `D3D12XboxCreateDevice` uses it when `LEONIDA_D3D12=vulkan` is
 set and the host PC device otherwise. Buffer views, root signatures, PSOs, draws and the swapchain are not
 implemented.** This is the plan for replacing the console's
@@ -120,7 +120,7 @@ The design is therefore an **IR per command list**:
 - `Reset` on a command list discards its IR; the allocator owns the memory. D3D12 already requires the application
   not to reset an allocator whose lists are in flight; the layer can rely on that and assert in debug builds.
 - `Close` freezes the IR. `ExecuteBundle` is accepted only on a direct list, with an already-closed bundle as its callee; the bundle IR is copied by value at the call site, so the source can be reused or reset without changing the parent. Command-list creation and reset require an allocator of the same type. A bundle cannot be submitted directly to a command queue.
-- Bundle restrictions are checked while recording for the IR operations currently implemented here (barriers, clears, copies and resolves); those calls are not legal inside a D3D12 bundle and make `Close` return `E_INVALIDARG`. The currently implemented sticky front/back stencil reference is carried back to the parent when the bundle sets it. Draw and other graphics-state commands are still stubs, so this establishes validation and the IR insertion point but does not yet render bundle geometry.
+- Bundle restrictions are checked while recording for the IR operations currently implemented here (barriers, clears, copies, resolves and `SetPredication`); those calls are not legal inside a D3D12 bundle and make `Close` return `E_INVALIDARG`. The currently implemented sticky front/back stencil reference is carried back to the parent when the bundle sets it. Draw and other graphics-state commands are still stubs, so this establishes validation and the IR insertion point but does not yet render bundle geometry.
 - A queue's `ExecuteCommandLists` submits in order with one timeline semaphore signal. `Wait`/`Signal` become
   timeline-semaphore waits/signals. `Present` queues after the frame's work.
 
@@ -207,6 +207,7 @@ What is implemented (all of it testable without the game):
     targets or depth-stencils, in the sample counts the GPU has for the format);
   - `CheckFeatureSupport` for feature levels (up to 12_1) and architecture. Every other query is logged and
     refused until the trace shows what the game asks (question 11);
+  - reserved resources and `GetResourceTiling` (section 4.2);
   - `GetCopyableFootprints` for buffers, 2D textures and volumes, including BC1–7 and the two-plane depth-stencil formats.
     The test compares every output with the PC runtime's; that comparison found that planar
     depth-stencil rows are padded to 512 bytes, not 256.
@@ -674,6 +675,22 @@ The trace will enumerate them.
   on the PC runtime, so none here either. Texture sizes are the driver's on both runtimes, so only buffer sizes,
   alignments and invalid descriptions are compared with the host. One known difference: a mip count beyond the
   full chain is invalid here (Vulkan can't create it), while the PC runtime still answers with a size.
+- Residency and power (D3D-33) are no-ops that still check their arguments (`d3d12_vulkan_device.cpp`, tested in
+  `d3d12_vulkan_device_test`). Vulkan has no residency API: memory from `vkAllocateMemory` stays usable until
+  `vkFreeMemory`, and paging under pressure is the kernel driver's job, so every pageable object is always resident.
+  - `MakeResident` and `Evict` return `S_OK`, or `E_INVALIDARG` for a nonzero count with a null array. D3D12
+    documents `Evict` as a hint the runtime may defer, so dropping it is allowed.
+  - `SetResidencyPriority` (Device1): `S_OK`, or `E_INVALIDARG` for a nonzero count with a null object or priority
+    array. Priorities only order what the OS evicts first; any `UINT` is a valid priority.
+  - `EnqueueMakeResident` (Device3) signals its fence from the CPU with the given value before returning, since
+    the work is already complete. A queue `Wait` on that fence must not hang, which is why the signal stays.
+    `E_INVALIDARG` for a null fence, a nonzero count with a null array, or flags other than `NONE` and
+    `DENY_OVERBUDGET`; a refused call does not signal.
+  - `SetStablePowerState` returns `S_OK`: Vulkan has no clock control, and the result of a frame does not depend
+    on the clocks.
+  - `SetBackgroundProcessingMode` (Device6): no Vulkan API steers driver background work, so nothing runs. The
+    completion event is set at once and `*pbFurtherMeasurementsDesired` is `FALSE`. A mode or action outside the
+    SDK's enum is `E_INVALIDARG`.
 
 ### 4.2 Resources, heaps, placed and reserved
 
@@ -692,7 +709,32 @@ The trace will enumerate them.
   binds its own memory. Vulkan image alignment can exceed D3D12's 64 KiB; because images do not share the arena,
   this mostly affects true aliasing, which is **Open** until tested on the target GPU.
 - `CreateReservedResource`: reserve the full size linearly; tile mapping calls are logged, not emulated, for the
-  first boot.
+  first boot. **Implemented** (`d3d12_vulkan_device.cpp`, `src/resource_tiling.h`, checked by
+  `d3d12_vulkan_device_test` and `resource_tiling_test`):
+  - `CreateReservedResource`, `CreateReservedResource1` (no protected sessions) and `CreateReservedResource2`
+    (castable formats ignored) create a committed resource on a default heap, so every tile is backed and starts
+    zeroed (D3D12 tier 2 reads unmapped tiles as zero). D3D12's description rules are kept, as measured on the PC
+    runtime: buffers are `ROW_MAJOR`, textures `64KB_UNDEFINED_SWIZZLE` (anything else, or a format without a tile
+    shape, is `E_INVALIDARG`; `64KB_STANDARD_SWIZZLE` too, since `CheckFeatureSupport` reports
+    `StandardSwizzle64KBSupported` as FALSE), and `GetHeapProperties` on a reserved resource is `E_INVALIDARG`.
+    `CheckFeatureSupport` still reports `TiledResourcesTier` as not supported, so a game that checks it creates
+    committed resources instead; raising the tier is a decision for when the trace shows what the game does. The Xbox tiled layout word `0x101` is accepted as `64KB_UNDEFINED_SWIZZLE` (**Assumption**:
+    that the console uses it for reserved resources too).
+  - `GetResourceTiling`: the standard 64 KiB tile shapes, standard and packed mips (a mip is packed from the first
+    one smaller than a tile on any axis), each standard mip's tile counts, and the tile order (each array slice holds
+    its standard mips, then its packed tiles). The test compares all of these with the PC runtime for 18
+    buffer, 2D, array, block-compressed and volume layouts, and skips a layout the host refuses: which ones a PC
+    driver accepts varies (an RTX 3090 on driver 616.56, at tier 3, refuses texture arrays whose mips reach the
+    packed tail, measured by @CharlyRien in #295; an RTX 5070 on 621.01 accepts them). How many tiles the packed mips take is the driver's
+    choice: here it is their tight linear size in whole tiles; the PC runtime on an RTX 5070 reported one tile more
+    for 1000x300 and 100x100 RGBA8 and a 128^3 R8 volume, and the same count for the other layouts probed. Two
+    further measured differences: on array slices after the first, the PC runtime
+    writes a tile index into packed subresources instead of the documented `D3D12_PACKED_TILE` (ours follows the
+    documentation), and a resource that is not reserved has no tiles (all outputs zero), as on the PC runtime.
+  - `UpdateTileMappings` / `CopyTileMappings` log once and do nothing. What that loses: two resources mapped to the
+    same heap tiles do not alias, and a tile unmapped or remapped keeps its contents. If the trace shows the game
+    relies on either, the next step is sparse binding (`sparseBinding`, `sparseResidencyImage2D`) with the heaps
+    from D3D-16. `CopyTiles` on the command list is not implemented.
 - `D3D12_RESOURCE_DESC::Layout`: the public `ROW_MAJOR` and `64KB_STANDARD_SWIZZLE` values plus the Xbox `0x101`
   tiled value from slot 76. Row-major textures need `VK_IMAGE_TILING_LINEAR` (not usable for RT/DS) or a staging
   copy; `64KB_STANDARD_SWIZZLE` and `0x101` have no direct Vulkan equivalent. If the game uploads console-tiled data,
@@ -837,9 +879,27 @@ the first boot, implement the DXGI path and stub PresentX with a clear log.
   one Vulkan indirect call. Use a compute expansion pass that writes a Vulkan-shaped indirect buffer, or
   `VK_NV_device_generated_commands` on NVIDIA. Start with the simple signatures; the trace will show which
   signatures the game creates.
-- Predication (`SetPredication`) maps to `VK_EXT_conditional_rendering`; D3D12's 64-bit equal/not-equal value
-  becomes a 32-bit condition when the high dword is zero, or a small compute pass that evaluates the full 64-bit
-  comparison into the condition buffer.
+- Predication (`SetPredication`) maps to `VK_EXT_conditional_rendering` (D3D-18). Done: `GraphicsCommandList::
+  SetPredication` records a `Predication` command (`runtime/src/command_list.h`; offset 8-byte aligned, op
+  `EQUAL_ZERO` or `NOT_EQUAL_ZERO`, a null buffer turns it off). The replay (`runtime/src/vulkan_replay.h`) begins
+  conditional rendering on the predicate buffer, plain for `EQUAL_ZERO` (Vulkan discards when the word is 0) and
+  `VK_CONDITIONAL_RENDERING_INVERTED_BIT_EXT` for `NOT_EQUAL_ZERO`, ends it before a new predicate (it cannot
+  nest) and at the end of the list (predication does not carry over to the next list). While a predicate is set,
+  whole-view clears are replayed as one rectangle with `vkCmdClearAttachments`, because `vkCmdClearColorImage` and
+  `vkCmdClearDepthStencilImage` ignore conditional rendering. The standalone device enables the extension and its
+  `conditionalRendering` feature when the GPU has them, and then creates buffers with
+  `VK_BUFFER_USAGE_CONDITIONAL_RENDERING_BIT_EXT`; without it a predicated list is rejected (`unsupported`).
+  Checked by part E of `vk_command_replay_test` on an NVIDIA GeForce RTX 3070.
+  Open:
+  - Copies and resolves. D3D12 predicates `CopyBufferRegion`, `CopyTextureRegion`, `CopyResource` and
+    `ResolveSubresource`; Vulkan's conditional rendering does not cover transfer commands, so they run
+    unconditionally. `PreparedList::unpredicated_copies` counts them. A fix replays a predicated copy as a compute
+    dispatch, which conditional rendering does cover.
+  - The 64-bit value. Vulkan reads one 32-bit word, so the low dword of D3D12's value is used: wrong only when the
+    low dword is 0 and the high one is not (an occlusion count that is a non-zero multiple of 2^32). A fix is a small
+    compute pass that ORs both dwords into a condition buffer.
+  - Draws, dispatches and `ExecuteIndirect` are covered by conditional rendering as soon as they are replayed
+    (D3D-3, D3D-4, D3D-17); `ClearUnorderedAccessView*` and `ResolveSubresource` need the same check when added.
 
 ### 4.8 Ray tracing and XDXR
 
@@ -1302,6 +1362,25 @@ The file is an XVD container, not a PE; PE-oriented import tools do not apply.
 Reproduce: `rea.inspect_native_exports` and `rea.inspect_pe_imports` on the DLL, then a byte scan for the
 little-endian GUIDs from `d3d12.h`.
 
+Constructed by `runtime/test/bvh_builder_test.cpp` (1.0.2.1: `rt::Loader`, `Loader::initialise()` for TLS and
+`DllMain`, `.pdata` registered by the loader (#176), then `XboxBvhBuilder(ID3D12Device11*, bool)`
+on a PC device behind the Xbox-ABI proxy). Measured:
+
+- 0 unimplemented imports; `D3D12SerializeVersionedRootSignature` and `XMemVirtualQuery` bind to shims. The constructor writes 24 bytes of the object (`sizeof(XboxBvhBuilder)` >= 24;
+  the rest of its state is elsewhere). It prints nothing through `OutputDebugString` and never calls
+  `TerminateProcess`. On failure it throws the failing `HRESULT` as a C++ `long`.
+- **Device slot 62 is called as `(desc, 0, 0, &IID_ID3D12PipelineState, out)`**, with a plain
+  `D3D12_COMPUTE_PIPELINE_STATE_DESC` (root signature set, node mask 0, flags 0). The proxy used to read
+  `(desc, riid, out)`, so the first call returned `E_POINTER` and the constructor threw it.
+- With slot 62 read that way, on **WARP** the constructor returns after 62 ms: 17 root signatures (slot 16) and 53
+  compute PSOs (slot 62, 53 of 53 `S_OK`), CS bytecode 4–75 KB each. `~XboxBvhBuilder` returns and makes no device
+  call. Created is not the same as correct: the shaders are Xbox DXIL with `@xbox.*` intrinsics (section 7.2), and
+  nothing has been dispatched yet.
+- On an **RTX 4090** (driver 621.24) the first 48 PSOs return `S_OK`, and creating the 49th ends the process
+  with `0xC0000409` (fail-fast) on repeated runs; one run returned `E_OUTOFMEMORY` for it instead, which the
+  constructor threw. So the NVIDIA driver does not survive the builder's shaders as they are. The layer should not
+  hand Xbox DXIL to the PC driver.
+
 ### A.3 `amd_fidelityfx_upscaler_xbox.dll`
 
 - Size 786,432 bytes; PE32+ x86-64.
@@ -1310,6 +1389,25 @@ little-endian GUIDs from `d3d12.h`.
   `IID_ID3D12RootSignatureDeserializer` (0x047320), `IID_ID3D12PipelineState` (0x047330),
   `IID_ID3D12Heap` (0x047340), `IID_ID3D12RootSignature` (0x047350), `IID_ID3D12DescriptorHeap` (0x0472e0) and
   `IID_ID3D12CommandSignature` (0x047300). Again, presence ≠ use.
+- Run through the public FidelityFX API by `runtime/test/fsr_dispatch_test.cpp` (1.0.2.1: `rt::Loader` and
+  `Loader::initialise()`, with #93's static TLS, which the DLL's thread-safe statics need, and `.pdata` registered by
+  the loader (#176); PC D3D12 device on an RTX 4090 behind the Xbox-ABI proxy). Measured:
+  - It maps with 0 unimplemented imports: `D3D12CreateRootSignatureDeserializer` and `XMemAlloc` /
+    `XMemFree` / `XMemGetWorkingSetStatistics` bind to the shims, 82 imports to host DLLs. Its TLS template is
+    8 bytes with no callbacks. `DllMain(DLL_PROCESS_ATTACH)` returns TRUE.
+  - `ffxConfigure(GLOBALDEBUG)` and the CPU-only upscale queries accept the **PC struct type ids**: the
+    Performance ratio is 2.0 and 3840x2160 Quality renders at 2560x1440. `GET_VERSIONS` for the upscaler lists one
+    provider, `0xf5a5ca1e01001001` "4.1.1".
+  - `ffxCreateContext` reports, through the message callback, that only one configuration is built in:
+    `maxUpscaleSize` 1920x1080 ("only the fixed-resolution Quality shader tables are included", so a 1280x720
+    render size), with `HIGH_DYNAMIC_RANGE`, `DEPTH_INVERTED` and `AUTO_EXPOSURE` all required. It also requires an
+    `ffxCreateContextDescUpscaleVersion` in the chain; 4.1.2 is rejected as invalid, 4.1.1 and 4.0.0 are accepted.
+  - With all of that, `ffxCreateContext` returns `FFX_API_RETURN_ERROR` with no message, no XMem allocation and no
+    call on the device proxy, for the PC DX12 backend descriptor (`0x2`), for the same `{header, device}` layout
+    under the Xbox backend id (`0x02000000`, `0x02000001`, `0x02000002`), and with no backend descriptor at all. So
+    the build does not recognise the PC backend descriptor, and the Xbox one (`FFX_API_BACKEND_ID_XBOX` is declared
+    in the public `ffx_api.h`, its descriptors are not) is unknown. Hypothesis: it is the GDK's Xbox D3D12 backend
+    descriptor; the executable's `ffxCreateContext` call site would show its type and layout.
 
 ### A.4 Other DLLs and the executable
 

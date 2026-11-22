@@ -24,6 +24,9 @@ import struct
 import sys
 from collections import Counter, defaultdict
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from shader_carve import parts as dxbc_part_ranges  # noqa: E402
+
 # d3d12shader.h (Windows SDK 10.0.26100.0), D3D_SHADER_REQUIRES_*: the SFI0 part is this 64-bit mask.
 SFI0_FLAGS = {
     0x1: "DOUBLES", 0x2: "EARLY_DEPTH_STENCIL", 0x4: "UAVS_AT_EVERY_STAGE", 0x8: "64_UAVS",
@@ -54,12 +57,9 @@ GDS = re.compile(r"^\s*ds_\w+\b[^;]*\bgds\b")
 
 def parts(d: bytes) -> dict:
     """DXBC part fourcc -> payload."""
-    out = {}
-    for k in range(struct.unpack_from("<I", d, 28)[0]):
-        off = struct.unpack_from("<I", d, 32 + 4 * k)[0]
-        size = struct.unpack_from("<I", d, off + 4)[0]
-        out[d[off:off + 4].decode("latin-1")] = d[off + 8:off + 8 + size]
-    return out
+    if not d.startswith(b"DXBC"):
+        raise ValueError("missing DXBC magic")
+    return {tag: d[off:off + size] for tag, (off, size) in dxbc_part_ranges(d).items()}
 
 
 def streams(sig: bytes) -> set:
@@ -90,7 +90,7 @@ def scan_dxbc(dxbc_dir: str, index: list) -> dict:
         try:
             with open(path, "rb") as f:
                 p = parts(f.read())
-        except (OSError, struct.error):
+        except (OSError, ValueError):
             missing += 1
             continue
         if len(p.get("SFI0", b"")) >= 8:

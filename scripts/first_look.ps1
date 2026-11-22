@@ -30,7 +30,7 @@ Write-Host "`n== Loader dry run (map, relocate, bind imports; nothing executes)"
 & $rt --dry-run $Exe --game-dir $GameDir 2>&1 | Tee-Object (Join-Path $out "dryrun.txt") | Select-Object -Last 40
 
 # Shim to-do list, grouped by DLL, most functions first.
-$report = Get-Content (Join-Path $out "$name.json") -Raw | ConvertFrom-Json
+$report = Get-Content (Join-Path $out "$([IO.Path]::GetFileName($Exe)).json") -Raw | ConvertFrom-Json
 $todo = $report.imports | Where-Object { $_.where -eq "shim" } | Sort-Object { -$_.functions.Count }
 $lines = foreach ($t in $todo) { "{0,-40} {1,5}" -f $t.dll, $t.functions.Count }
 $lines | Set-Content (Join-Path $out "shim-todo.txt")

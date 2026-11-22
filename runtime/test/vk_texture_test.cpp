@@ -9,6 +9,10 @@
 //   vk_texture_test cube [out.raw]: ps_cube_sample against two 8x8 cubes, a 12-layer 2D array at binding 3 (the
 //   translator's view of a cube array); every pixel must be the texel a cube sample of its direction reads.
 //   VKT_HEAP_MB=<n>: size of the heap in MiB (default 64 KiB)
+//   VKT_NEED_MAINTENANCE8=1: the shader has a non-constant texel Offset outside gather (image_sample*_o, see
+//   ps_texoff.asm); print "unsupported: ..." and exit 77 when VK_KHR_maintenance8 cannot be enabled.
+// VK_KHR_maintenance8 and shaderImageGatherExtended (a non-constant gather Offset) are enabled when the device has
+// them.
 #define VK_NO_PROTOTYPES
 #include "vulkan_loader.h"
 
@@ -111,8 +115,35 @@ int main(int argc, char** argv) {
     f12.bufferDeviceAddress = VK_TRUE; f12.runtimeDescriptorArray = VK_TRUE; f12.descriptorIndexing = VK_TRUE;
     VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2}; f2.pNext = &f12;
     f2.features.shaderInt64 = VK_TRUE;
+    // Texel offsets: the limits the shader's Offset operands must stay inside, and the two optional features.
+    LI(vkEnumerateDeviceExtensionProperties); LI(vkGetPhysicalDeviceFeatures);
+    VkPhysicalDeviceProperties pdp; vkGetPhysicalDeviceProperties(pd, &pdp);
+    std::fprintf(stderr, "device: %s\ntexel offset limits: %d..%d, gather %d..%d\n", pdp.deviceName,
+                 pdp.limits.minTexelOffset, int(pdp.limits.maxTexelOffset),
+                 pdp.limits.minTexelGatherOffset, int(pdp.limits.maxTexelGatherOffset));
+    VkPhysicalDeviceFeatures have; vkGetPhysicalDeviceFeatures(pd, &have);
+    f2.features.shaderImageGatherExtended = have.shaderImageGatherExtended;
+    std::vector<const char*> enable;
+    bool m8_on = false;
+#ifdef VK_KHR_MAINTENANCE_8_EXTENSION_NAME   // the structure type is an enumerator: defined() never sees it
+    // Older Vulkan headers (as on some CI images) do not declare maintenance8; the test is then unsupported.
+    VkPhysicalDeviceMaintenance8FeaturesKHR m8{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_8_FEATURES_KHR};
+    uint32_t en = 0; vkEnumerateDeviceExtensionProperties(pd, nullptr, &en, nullptr);
+    std::vector<VkExtensionProperties> exts(en); vkEnumerateDeviceExtensionProperties(pd, nullptr, &en, exts.data());
+    for (auto& x : exts) m8_on = m8_on || !std::strcmp(x.extensionName, VK_KHR_MAINTENANCE_8_EXTENSION_NAME);
+    if (m8_on) {
+        enable.push_back(VK_KHR_MAINTENANCE_8_EXTENSION_NAME);
+        m8.maintenance8 = VK_TRUE; f12.pNext = &m8;
+        std::fprintf(stderr, "enabled %s\n", VK_KHR_MAINTENANCE_8_EXTENSION_NAME);
+    }
+#endif
+    if (std::getenv("VKT_NEED_MAINTENANCE8") && !m8_on) {
+        std::printf("unsupported: VK_KHR_maintenance8 (non-constant texel Offset)\n");
+        return 77;
+    }
     VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
     dci.pNext = &f2; dci.queueCreateInfoCount = 1; dci.pQueueCreateInfos = &qci;
+    dci.enabledExtensionCount = uint32_t(enable.size()); dci.ppEnabledExtensionNames = enable.data();
     VkDevice dev; CHECK(vkCreateDevice(pd, &dci, nullptr, &dev));
 #define LD(n) auto n = reinterpret_cast<PFN_##n>(vkGetDeviceProcAddr(dev, #n))
     LD(vkGetDeviceQueue); LD(vkCreateImage); LD(vkGetImageMemoryRequirements); LD(vkAllocateMemory);
