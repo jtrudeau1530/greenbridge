@@ -35,6 +35,8 @@ The output has a `summary` and one `files` row per stream that contains a matchi
 | `unique_names` | distinct names across the pass |
 | `by_type` | distinct names per suffix |
 | `zero_padding`, `unread_bytes` | gap accounting, as in the carve tool |
+| `bink2_files` | Bink 2 videos skipped whole |
+| `bink2_bytes` | total bytes of those Bink 2 videos |
 
 ## Measured pass
 
@@ -59,8 +61,9 @@ extraction. The generated index is local scratch because it contains game names.
 
 - Only the first `--max-inflate` bytes of each stream are inspected; a name after that prefix is
   not found. The default is deliberately larger than the measured name tables.
-- The scan is a zlib-stream walk, not a TOC read. Streams that are not clean zlib (raw blocks,
-  Bink) are skipped and counted in the gap accounting.
+- The scan is a zlib-stream walk, not a TOC read. Streams that are not clean zlib (raw blocks)
+  are skipped and counted in the gap accounting. Bink 2 videos are skipped whole and counted in
+  `bink2_files` / `bink2_bytes`.
 - Names are data, not proof that a resource is usable: a matching stream still has to be decoded by
   `rpf9dump` or `RageModelDecoder`.
 - Counts are package/version-specific. The output index is local and must not be committed.

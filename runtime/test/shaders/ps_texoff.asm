@@ -69,7 +69,19 @@ v_mov_b32_e32 v14, 0.5
 v_mov_b32_e32 v15, 0.5
 image_gather4_lz_o v[16:19], v[13:15], s[8:15], s[16:19] dmask:0x1 dim:SQ_RSRC_IMG_2D
 image_gather4_lz_o v[20:23], v[13:15], s[8:15], s[16:19] dmask:0x2 dim:SQ_RSRC_IMG_2D
+; A16: preserve a whole offset dword and unpack U from the low and V from the high half.
+; From texel (3,5), offsets (bx-3, by-5) reach the same (bx,by) as the full-precision sample in v4:5.
+v_add_nc_u32_e32 v44, 1, v2
+v_add_nc_u32_e32 v45, -1, v3
+v_and_b32_e32 v44, 63, v44
+v_and_b32_e32 v45, 63, v45
+v_lshl_or_b32 v44, v45, 8, v44
+v_mov_b32_e32 v45, 0x39803700
+image_sample_lz_o v[46:47], v[44:45], s[8:15], s[16:19] dmask:0x3 dim:SQ_RSRC_IMG_2D a16
 s_waitcnt vmcnt(0)
+v_xor_b32_e32 v46, v46, v4
+v_xor_b32_e32 v47, v47, v5
+v_or_b32_e32 v46, v46, v47
 v_mul_f32_e32 v4, 0x40ff0000, v4
 v_rndne_f32_e32 v4, v4
 v_cvt_u32_f32_e32 v4, v4
@@ -122,5 +134,8 @@ v_lshl_or_b32 v42, v19, 12, v42
 v_lshl_or_b32 v43, v21, 4, v20
 v_lshl_or_b32 v43, v22, 8, v43
 v_lshl_or_b32 v43, v23, 12, v43
+; A16 mismatch marks .x outside its valid 0x00..0x77 range.
+v_cmp_eq_u32_e32 vcc_lo, 0, v46
+v_cndmask_b32_e32 v40, -1, v40, vcc_lo
 exp mrt0 v40, v41, v42, v43 done vm
 s_endpgm

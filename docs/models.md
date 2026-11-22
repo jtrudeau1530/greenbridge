@@ -55,16 +55,59 @@ entries are dictionary children.
 | **Total** | **239,510** | **350,248** | **159,483** | **190,792** |
 
 The last column is the `c3708fb` recovery for comparison. `story000`'s standalone count is
-3,304 vs 3,305; the full new-pin standalone total is 190,765, 27 below the `c3708fb` 190,792
-(duplicates merged). The new entries are **159,483 drawable-dictionary children**: one model
-per embedded drawable in a dictionary root, not new pages. `core_restofworld` recovers 885 of
-1,024 candidates; the rest are rejected or duplicate candidates.
+3,304 vs 3,305; the full new-pin standalone total is 190,765, 27 below the `c3708fb` 190,792.
+Those 27 are not merged duplicates: they are the 27 models with more than 256 geometries that the
+probe rejects at `917e9b9` (26 in `levels.rpf`, 1 in `story000`; see
+[rejected candidates](#rejected-candidates-at-917e9b9)). The new entries are **159,483
+drawable-dictionary children**: one model per embedded drawable in a dictionary root, not new
+pages. `core_restofworld` recovers 873 of its 1,024 candidates (885 models); the 151 rejects are
+140 texture dictionaries and 11 drawable dictionaries whose drawable has radius 0.
 
 `levels.rpf` is the sum of ten parallel recovery shards over 206,981 candidates: **314,000
-models**, 130,225 dictionary children, 183,775 standalone. The last shard rejects 1,009
-candidates (incomplete or duplicate tail pages); the other shards recover their candidates 1:1
-or add dictionary children. The `levels.rpf` full export was not re-run, so its triangle total
-is still the old measurement.
+models**, 130,225 dictionary children, 183,775 standalone. 1,037 candidates are rejected: the
+1,009 in the last shard are texture dictionaries, not models, and 28 more in shards 1 to 7 are
+models the probe caps reject (see [rejected candidates](#rejected-candidates-at-917e9b9)). The
+`levels.rpf` full export was not re-run, so its triangle total is still the old measurement.
+
+### Rejected candidates at `917e9b9`
+
+Every candidate of each model-bearing archive was run through `RecoverAtOffsets` on its own and,
+for each reject, through a copy of `TryResource` that records which check drops it (it agrees
+with the real code on all 206,981 `levels.rpf` candidates). Measured on the 1.0.2.1 package:
+
+| Archive | Rejects | Texture dictionaries | Geometry cap (`:351`) | List 4 cap (`:387`) | Radius 0 |
+|---|---:|---:|---:|---:|---:|
+| `levels.rpf` | 1,037 | 1,009 | 26 | 2 | 0 |
+| `data.rpf` | 75 | 75 | 0 | 0 | 0 |
+| `pack/core_restofworld/...` | 151 | 140 | 0 | 0 | 11 |
+| `pack/shared_minigame000/...` | 18 | 18 | 0 | 0 | 0 |
+| `pack/story000/story000.rpf` | 1 | 0 | 1 | 0 | 0 |
+| `packs.rpf` | 0 | 0 | 0 | 0 | 0 |
+
+Line numbers are in `third_party/rpf9-explorer/Core/RageModelDecoder.cs`.
+
+- **Texture dictionaries (1,242).** `LooksLikeDrawableDictionary` (`:78`) checks only the
+  dictionary header, which texture dictionaries share, so they become model candidates and fail
+  at `:314` because their values are not drawables. `Rpf9TextureRecovery` recovers all 1,242.
+  In `levels.rpf` they are the archive's last 0.12 GiB, each a 256- to 880-byte system block
+  and a graphics block. None of them overlaps a recovered model. Upstream
+  [rpf9-explorer#9](https://github.com/breadbbbb/rpf9-explorer/pull/9) stops the scan from
+  proposing them.
+- **Geometry cap (27).** The probe allows at most 256 geometries per model (`:351`), while
+  `Decode` allows `MaxMeshes`, 1,024 (`:535`). These models have 263 to 377 geometries.
+- **List 4 cap (2).** The probe caps renderer list 4 at 4,096 entries (`:387`) but never uses
+  that count for sizing. These two dictionaries have 5,078 and 5,461.
+- **Radius 0 (11).** Drawable dictionaries whose drawable has a zero radius and non-empty bounds,
+  rejected by `LooksLikeDrawableHeader` (`:124`) through `:314`. Whether they decode otherwise
+  has not been checked.
+
+[rpf9-explorer#11](https://github.com/breadbbbb/rpf9-explorer/pull/11) raises both probe caps.
+With it, the 29 capped candidates recover (41 models, 3.25 million triangles), and every
+candidate already recovered decodes exactly as before in all six archives above.
+
+One `levels.rpf` copy measured for this showed a 1,038th reject: a zlib block whose Adler-32
+fails because of a single flipped bit in that copy (flipping it back restores the stored
+checksum). It is local corruption, not part of the package, and is left out of the table.
 
 ## Independent validation
 
@@ -261,6 +304,33 @@ records. No unhandled layout tag appears:
 `data.rpf` or the `levels.rpf` samples. `data.rpf` uses `(8, 16)` exclusively; the 674
 `(12, 6)` geometries are spread over 256 models in the levels sample.
 
+## Vehicle ratings and performance estimates
+
+`common.rpf` has one `CVehicleBaseRatingsAndEstimatesMap` XML document (see [gamedata.md](gamedata.md)): a
+`Map` of 252 `Item key="<model>"` entries, each with four blocks. Counts and ranges only; no model names.
+
+| Block | Fields |
+|---|---|
+| `estimatesRoad`, `estimatesOffroad` | `fTopSpeed`, `fCornerSpeed`, `fAccelerationTime`, `fBrakingTime`, `fStandingQuarterTime`, `fStandingQuarterSpeed`, `fAvgLatTraction` |
+| `ratingsRoad`, `ratingsOffroad` | `fOverallRating`, `fSpeedRating`, `fHandlingRating`, `fAccelerationRating`, `fBrakesRating` |
+
+- **Keys are vehicle model names.** The 252 keys are distinct plain names (no hex hashes), and all 252 are the
+  base name of a `.yft` in the local archive catalog. 245 of them are also among the 319 models of the
+  distant-light recipes; 74 of those 319 have no rating entry.
+- **Ratings are not fractions.** All ten rating fields have a minimum of exactly 10 and medians of 142 to 585,
+  with maxima up to 1,327 (`fAccelerationRating`). `fOverallRating` is not the mean of the other four: the two
+  differ by a median of 38 and agree within 0.01 in only 10 of 504 cases.
+- **Estimates look like SI units.** Road `fTopSpeed` has a median of 44.3 and a maximum of 77.4 (m/s would make
+  that 160 and 279 km/h); `fStandingQuarterTime` has a median of 15.8, the right size for seconds over a
+  quarter mile; `fAvgLatTraction` has a median of 1.42 on road and 0.92 off road (lateral g would fit). Offroad
+  speeds are lower than road ones (median top speed 19.3).
+- **Sentinels.** On each surface, 11 entries have every estimate 0 and 10 more have zero speeds with an
+  infinite time (`inf`). `inf` occurs in 38 road and 99 offroad blocks overall, so a parser must accept `inf`
+  in these fields (it reads as "never reaches the test speed or distance").
+
+Not measured here (hypothesis): the rating scale and how `fOverallRating` weights its parts, and whether the
+estimates are precomputed from handling data or measured by simulation.
+
 ## Character skeletons
 
 World drawables do not carry the shared 597-name humanoid skeleton. Character `.#ft` fragments
@@ -269,6 +339,59 @@ maps into it. The measured name table, the following 597-record hierarchy/refere
 the model mapping and the texture-parameter split are in
 [character_skeleton.md](character_skeleton.md). No character bind matrices were recovered; that
 page records the reference-pose caveat rather than inventing a bind pose.
+
+## Shader render buckets
+
+`rpf9dump` writes two raw shader fields per material, `RenderBucket` (byte at shader +0x39) and
+`RenderBucketMask` (u32 at +0x3C; `RageModelDecoder.cs:651`). Measured on a random sample of 3,000 `.ydr`/`.yft`
+models (27,435 shaders):
+
+- `RenderBucketMask == 0xFF00 | (1 << (RenderBucket & 0x7F))` in all 27,435. Bit 7 of `RenderBucket` is a
+  separate flag (set in 438) that does not change the mask.
+- `RenderBucket & 0x7F` takes the values 0-6, the GTA V drawable bucket list. Model-name tokens (counted per
+  shader, from the model's name) line up with it:
+
+| Bucket | GTA V meaning | Shaders | Name evidence (share of shaders whose model name matches) |
+|---:|---|---:|---|
+| 0 | opaque | 17,826 | baseline: water 0.6%, vegetation 0.5%, glass/window 0.2%, decal 0.1% |
+| 1 | alpha | 725 | glass/window 7.6% (38x baseline) |
+| 2 | decal | 7,282 | decal/graffiti/dirt 3.1% (31x) |
+| 3 | cutout | 1,311 | vegetation 2.8% (5.6x) |
+| 4 | no splash | 6 | one program (`fc34f08b`) |
+| 5 | no water | 6 | the same program |
+| 6 | water | 343 | water/river/pool/canal 80.2% |
+
+Names are per model and a building holds glass, decal and opaque shaders alike, so the token shares are low
+in absolute terms; the enrichment against bucket 0 is the signal. For export: bucket 1 needs blending, 2 is
+a projected decal, 3 needs alpha testing, 6 is a water surface.
+
+## Vehicle distant-light recipes
+
+`common.rpf` has one `CVehicleDistantLightData` XML document (see [gamedata.md](gamedata.md)) that ties
+vehicle models to far-away light recipes. Counts only; no model names.
+
+| Path | Count | Content |
+|---|---:|---|
+| `distantLights`, `presetLights` | 1 each | empty |
+| `recipeLights/Item` | 1,980 | `vehicleModelName`, `secondaryRecipes`, `lights` |
+| `recipeLights/Item/secondaryRecipes/Item` | 2,383 | one token each; 0 to 3 per recipe (0: 312, 1: 1,029, 2: 563, 3: 76) |
+| `recipeLights/Item/lights` | 1,980 | empty in all |
+
+- **Every `vehicleModelName` is a real fragment model.** The 1,980 recipes name 319 distinct models, and all
+  319 exist as `.yft` entries in the local archive catalog, each also with a `<name>_hi.yft` high-detail
+  variant. None is a `.ydr`. A loader can therefore key the recipes by the vehicle's `.yft` base name.
+- A model has 1 to 45 recipes (93 models have one); in 304 of the 319 models every recipe has a different set
+  of secondary tokens, so a recipe is selected by its secondaries, not by the model alone.
+- The 780 distinct secondary tokens are not catalog entries (2 coincide with an entry name) and not texture
+  dictionary items, and are never another recipe's model name. 1,242 of the 2,383 contain the recipe's own
+  model name.
+- **No light data is stored**: `lights` is empty in all 1,980 recipes and both top-level lists are empty. In
+  this build the document is an index from model and variant to recipe with the light positions absent,
+  so distant vehicle lights cannot be reconstructed from it.
+
+Not measured here (hypothesis): what the secondary tokens name (per-model parts or liveries would fit the
+model-name substrings), and where the light positions are generated at runtime (for example from the model's
+own light bones).
 
 ## What to do next
 

@@ -3,6 +3,7 @@
 Standard library only; no game data: the tools are mocked or fed hand-made inputs.
 """
 import ast
+import io
 import json
 import os
 import shutil
@@ -76,6 +77,10 @@ class ShaderStageResumeTest(unittest.TestCase):
         self.dxbc = os.path.join(self.work, "shaders", "dxbc")
         self.spirv = os.path.join(self.work, "shaders", "spirv")
         self.ran = []
+        self.real_llvm_mc_signature = make_game.llvm_mc_signature
+        version_probe = mock.patch.object(make_game, "llvm_mc_signature", return_value="test llvm-mc 21")
+        self.llvm_mc_signature = version_probe.start()
+        self.addCleanup(version_probe.stop)
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -94,7 +99,7 @@ class ShaderStageResumeTest(unittest.TestCase):
         elif tool == "shader_disasm.py":
             os.makedirs(os.path.join(self.dxbc, "disasm"), exist_ok=True)
 
-    def fake_translate(self, disasm, spirv, jobs, emulate=False):
+    def fake_translate(self, disasm, spirv, jobs, emulate=False, fallbacks=()):
         self.ran.append("translate (emulated)" if emulate else "translate")
         self.touch(spirv, "index.json")
 
@@ -111,6 +116,50 @@ class ShaderStageResumeTest(unittest.TestCase):
     def test_fresh_folder_runs_every_step_then_nothing(self):
         self.assertEqual(self.run_stage(), ["shader_carve.py", "fssm_unpack.py", "shader_disasm.py", "translate"])
         self.assertEqual(self.run_stage(), [])
+
+    def test_llvm_version_change_at_the_same_path_refreshes_only_the_dependent_steps(self):
+        wrapper = os.path.join(self.work, "fake llvm-mc.py")
+        with open(wrapper, "w", encoding="utf-8") as f:
+            f.write("import os, sys\n"
+                    "assert sys.argv[1:] == ['--version']\n"
+                    "print('LLVM version ' + os.environ['TEST_LLVM_VERSION'])\n")
+        command = f'"{sys.executable}" "{wrapper}"'
+        with mock.patch.object(make_game, "llvm_mc_signature", self.real_llvm_mc_signature):
+            with mock.patch.dict(os.environ, {"LLVM_MC": command, "TEST_LLVM_VERSION": "23.1.5"}):
+                self.run_stage()
+                self.assertEqual(self.run_stage(), [])
+                self.touch(self.dxbc, "disasm", "old.s")
+                self.touch(self.dxbc, "disasm", "notes.txt")
+                self.touch(self.spirv, make_game.SHARD_PLAN)
+            with mock.patch.dict(os.environ, {"LLVM_MC": command, "TEST_LLVM_VERSION": "21.1.0"}):
+                self.assertEqual(self.run_stage(), ["shader_disasm.py", "translate"])
+                self.assertFalse(os.path.exists(os.path.join(self.dxbc, "disasm", "old.s")))
+                self.assertTrue(os.path.isfile(os.path.join(self.dxbc, "disasm", "notes.txt")))
+                self.assertFalse(os.path.exists(os.path.join(self.spirv, make_game.SHARD_PLAN)))
+                self.assertEqual(self.run_stage(), [])
+
+    def test_llvm_change_leaves_no_completion_markers_if_disassembly_stops(self):
+        self.run_stage()
+        self.touch(self.spirv, make_game.SHARD_PLAN)
+        self.llvm_mc_signature.return_value = "test llvm-mc 23"
+        with mock.patch.object(make_game, "py", side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                make_game.shaders(os.path.join(self.work, "game"), self.work, 2)
+        self.assertFalse(os.path.exists(os.path.join(self.dxbc, "disasm.done")))
+        self.assertFalse(os.path.exists(os.path.join(self.spirv, "index.json")))
+        self.assertFalse(os.path.exists(os.path.join(self.spirv, make_game.SHARD_PLAN)))
+        self.assertEqual(self.run_stage(), ["shader_disasm.py", "translate"])
+        self.assertEqual(self.run_stage(), [])
+
+    def test_version_probe_fails_with_a_clear_error_for_a_failed_command(self):
+        failed = subprocess.CompletedProcess([], 1, stdout="", stderr="distribution not found")
+        with mock.patch.object(make_game.subprocess, "run", return_value=failed), \
+                mock.patch.object(make_game, "mc_command", return_value=["wsl", "-e", "llvm-mc"]), \
+                mock.patch("sys.stderr", new_callable=io.StringIO) as stderr:
+            with self.assertRaises(SystemExit) as exc:
+                self.real_llvm_mc_signature()
+        self.assertEqual(exc.exception.code, 1)
+        self.assertIn("Check LLVM_MC: distribution not found", stderr.getvalue())
 
     def test_unpack_stopped_after_creating_fssm_folder_runs_again(self):
         self.touch(self.dxbc, "index.json")
@@ -149,22 +198,23 @@ class ShaderStageResumeTest(unittest.TestCase):
         os.remove(os.path.join(self.dxbc, "fssm_index.json"))
         self.assertEqual(self.run_stage(), ["fssm_unpack.py", "shader_disasm.py", "translate"])
 
-    def test_legacy_folder_keeps_its_disassembly_and_refreshes_translation_once(self):
+    def test_legacy_folder_without_llvm_version_refreshes_disassembly_once(self):
         self.touch(self.dxbc, "index.json")
         self.touch(self.dxbc, "fssm_index.json")
         self.touch(self.dxbc, "disasm", "s0.s")
         self.touch(self.spirv, "index.json")                # translated by a build from before disasm.done
-        self.assertEqual(self.run_stage(), ["translate"])
+        self.assertEqual(self.run_stage(), ["shader_disasm.py", "translate"])
         self.assertTrue(os.path.isfile(os.path.join(self.dxbc, "disasm.done")))
         self.assertEqual(self.run_stage(), [])
 
-    def test_disasm_moved_from_the_old_place_is_kept_and_translated_again(self):
+    def test_old_disassembly_layout_is_rebuilt_in_the_current_location(self):
         self.touch(self.dxbc, "index.json")
         self.touch(self.dxbc, "fssm_index.json")
         self.touch(self.work, "shaders", "disasm", "s0.s")  # disasm next to the carve folder, the old layout
         self.touch(self.spirv, "index.json")
-        self.assertEqual(self.run_stage(), ["translate"])
-        self.assertTrue(os.path.isfile(os.path.join(self.dxbc, "disasm", "s0.s")))
+        self.assertEqual(self.run_stage(), ["shader_disasm.py", "translate"])
+        self.assertTrue(os.path.isdir(os.path.join(self.dxbc, "disasm")))
+        self.assertFalse(os.path.exists(os.path.join(self.dxbc, "disasm", "s0.s")))
 
     # SHADER-11: the translation depends on --wave64-emulate, so a change of mode translates again.
     def mode(self):
@@ -196,7 +246,7 @@ class ShaderStageResumeTest(unittest.TestCase):
     # A kill between the merge (index.json appears) and the end of shaders() must not leave a finished folder
     # whose mode is unknown or wrong.
     def kill_after_merge(self, emulate):
-        def translate_then_die(disasm, spirv, jobs, emulate=False):
+        def translate_then_die(disasm, spirv, jobs, emulate=False, fallbacks=()):
             self.touch(spirv, "index.json")                 # rdna2spirv.py --merge finished ...
             raise KeyboardInterrupt                         # ... and the PC died right after
         with mock.patch.object(make_game, "py", self.fake_py), \
@@ -310,7 +360,7 @@ class ShaderStageResumeTest(unittest.TestCase):
         self.run_stage(emulate=True)
         self.record_sources("0" * 64)
 
-        def failing_translate(disasm, spirv, jobs, emulate=False):
+        def failing_translate(disasm, spirv, jobs, emulate=False, fallbacks=()):
             self.assertTrue(emulate)
             raise SystemExit(1)
         with mock.patch.object(make_game, "py", self.fake_py), \

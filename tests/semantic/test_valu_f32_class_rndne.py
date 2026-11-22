@@ -60,7 +60,7 @@ import spirv_mini_interp as si  # noqa: E402
 
 MASK32 = 0xFFFFFFFF
 STUB_DXBC = b"DXBC" + bytes(24) + struct.pack("<I", 0) + bytes(4)
-VSHARP = [0, 0, 0xFFFFFFFF, 0]
+VSHARP = [0, 0, 0xFFFFFFFF, 0x31016FAC]
 HEAP_FILL = 0xEEEEEEEE
 
 # Class mask bits (AMD RDNA2 ISA V_CMP_CLASS_F32).

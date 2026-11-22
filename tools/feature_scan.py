@@ -87,9 +87,12 @@ def scan_dxbc(dxbc_dir: str, index: list) -> dict:
     non_zero_stream = Counter()  # stage -> shaders with an output element on a stream other than 0
     missing = 0
     for e in index:
+        if not isinstance(e, dict):
+            missing += 1
+            continue
         stage = e.get("stage") or "?"
         stages[stage] += 1
-        path = os.path.join(dxbc_dir, e["file"])
+        path = os.path.join(dxbc_dir, e.get("file") or "")
         try:
             with open(path, "rb") as f:
                 p = parts(f.read())
@@ -242,7 +245,14 @@ def scan_disasm(disasm_dir: str, stage_of: dict) -> dict:
 def scan_spirv(spirv_index: str) -> dict:
     with open(spirv_index, encoding="utf-8") as f:
         idx = json.load(f)
-    entries = idx.values() if isinstance(idx, dict) else idx
+    # An object maps shader names to rows; a list is the other accepted shape. A scalar is a
+    # broken index, not something to iterate -- report no translated shaders for it.
+    if isinstance(idx, dict):
+        entries = idx.values()
+    elif isinstance(idx, list):
+        entries = idx
+    else:
+        entries = ()
     total, code_base = Counter(), Counter()
     for m in entries:
         if not isinstance(m, dict):
@@ -279,14 +289,22 @@ def main() -> int:
               file=sys.stderr)
         return 2
     result = {"shaders": len(index), "dxbc": scan_dxbc(dxbc_dir, index)}
-    stage_of = {os.path.splitext(e["file"])[0]: e.get("stage") or "?" for e in index}
-    stage_of |= {e["name"]: e.get("stage") or "?" for e in index}
+    # Original names can be shared by variants, so indexed filenames take precedence.
+    # Non-object rows are already counted as unreadable by scan_dxbc; skip them here too.
+    rows = [e for e in index if isinstance(e, dict)]
+    stage_of = {e["name"]: e.get("stage") or "?" for e in rows if isinstance(e.get("name"), str)}
+    stage_of |= {os.path.splitext(e["file"])[0]: e.get("stage") or "?"
+                 for e in rows if isinstance(e.get("file"), str)}
     disasm = os.path.join(dxbc_dir, "disasm")
     if os.path.isdir(disasm):
         result["disasm"] = scan_disasm(disasm, stage_of)
     spirv = os.path.join(a.shaders, "spirv", "index.json")
     if os.path.isfile(spirv):
-        result["spirv"] = scan_spirv(spirv)
+        try:
+            result["spirv"] = scan_spirv(spirv)
+        except (OSError, ValueError) as e:
+            print(f"ERROR: cannot read {spirv}: {getattr(e, 'strerror', None) or e}", file=sys.stderr)
+            return 2
 
     d = result["dxbc"]
     print(f"{result['shaders']} shaders")
@@ -316,6 +334,9 @@ def main() -> int:
     if d["unreadable"]:
         print(f"{d['unreadable']} .dxbc files could not be read")
     if a.out:
+        folder = os.path.dirname(a.out)  # --out into a folder that does not exist yet, as awc_manifest.py does
+        if folder:
+            os.makedirs(folder, exist_ok=True)
         with open(a.out, "w", encoding="utf-8") as f:
             json.dump(result, f, indent=1)
     return 0

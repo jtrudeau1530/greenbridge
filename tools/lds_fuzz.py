@@ -36,7 +36,7 @@ ROOT = os.path.dirname(HERE)
 sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.join(ROOT, "runtime", "test", "shaders"))
 import mc_command  # noqa: E402
-from compute_fixture import compute_header  # noqa: E402
+from compute_fixture import compute_header, find_test_program  # noqa: E402
 
 THREADS = 64
 LDS_BYTES = 4096
@@ -534,7 +534,7 @@ def translate(progs, work, emulate):
         cmd = mc + ["-triple=amdgcn--amdpal", "-mcpu=gfx1013", "-show-encoding"]
         if p.wave == 64:
             cmd.append("-mattr=+wavefrontsize64,-wavefrontsize32")
-        r = subprocess.run(cmd, input=text, capture_output=True, text=True)
+        r = mc_command.run(cmd, input=text, capture_output=True, text=True)
         if r.returncode or "error:" in r.stderr:
             raise RuntimeError(f"{p.name} did not assemble:\n{r.stderr}")
         code = "".join(ln for ln in r.stdout.splitlines(keepends=True) if not ln.lstrip().startswith("."))
@@ -552,6 +552,9 @@ def translate(progs, work, emulate):
 
 def run_gpu(p, spv, build, index_entry, emulate, dump):
     exe = os.path.join(build, "vk_compute_test" + (".exe" if os.name == "nt" else ""))
+    if not os.path.isfile(exe):
+        sys.exit(f"vk_compute_test not found in {build} or its RelWithDebInfo/Release folder; "
+                 "build it first (cmake --build <build dir> --target vk_compute_test)")
     env = dict(os.environ, VKC_OUT_WORDS=str(OUT_WORDS), VKC_DUMP=str(dump))
     args = [exe, str(spv), "1", "dump"]
     if p.wave == 64 and not emulate:
@@ -585,9 +588,20 @@ def main():
     ap.add_argument("--no-exec", action="append", default=[], choices=EXEC_KINDS,
                     help="run this op kind (e.g. bpermute) with all lanes active, to isolate a known finding")
     a = ap.parse_args()
-    if a.show:
+    if a.programs < 1 or a.max_report < 1:
+        ap.error("--programs and --max-report must be at least 1")
+    if a.show is not None:
         parts = a.show.split(":")
-        show(int(parts[0]), int(parts[1]), int(parts[2]) if len(parts) > 2 else 64, tuple(a.no_exec))
+        try:
+            if len(parts) not in (2, 3):
+                raise ValueError
+            seed, index = int(parts[0]), int(parts[1])
+            wave = int(parts[2]) if len(parts) == 3 else 64
+        except ValueError:
+            ap.error("--show expects SEED:INDEX[:WAVE] with INDEX >= 0 and WAVE in 32, 64")
+        if index < 0 or wave not in (32, 64):
+            ap.error("--show expects SEED:INDEX[:WAVE] with INDEX >= 0 and WAVE in 32, 64")
+        show(seed, index, wave, tuple(a.no_exec))
         return 0
     waves = (64, 32) if a.wave == "both" else (int(a.wave),)
     progs = programs(a.seed, a.programs, waves, tuple(a.no_exec))
@@ -596,6 +610,7 @@ def main():
             p.model()
         print(f"{len(progs)} programs generated and modelled")
         return 0
+    a.build = find_test_program(a.build, "vk_compute_test") or a.build   # a Visual Studio config subfolder
     work = Path(a.work).resolve() if a.work else Path(tempfile.mkdtemp(prefix="lds_fuzz_"))
     work.mkdir(parents=True, exist_ok=True)
     try:

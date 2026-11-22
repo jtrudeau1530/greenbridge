@@ -4,7 +4,8 @@
 // implicit promotion from common, and enhanced barriers. Part C copies a volume (footprint, box and whole) and
 // resolves a multisampled target. Part D records every D3D12 sync/access pair as enhanced barriers, which the
 // validation layer must accept. Part E (where VK_EXT_conditional_rendering is available) checks SetPredication.
-// Part F (D3D-26) runs immediate buffer writes, atomic copies and discards.
+// Part F (D3D-26) runs immediate buffer writes, atomic copies and discards. Part G copies one subresource twice in one
+// list, which D3D12 orders on the queue and needs an explicit dependency for on Vulkan.
 // Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation; any validation error fails the test.
 #include "vk_test_device.h"
 #include "../src/vulkan_replay.h"
@@ -545,7 +546,7 @@ int part_e(vktest::Device& d) {
     constexpr std::uint32_t size = 4, layers = 5, texels = size * size;
     const VkImage color = d.image(VK_FORMAT_R8G8B8A8_UNORM, size, size, layers, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
     void* predicate_words = nullptr;
-    const VkBuffer predicate = d.buffer(32, VK_BUFFER_USAGE_CONDITIONAL_RENDERING_BIT_EXT, &predicate_words);
+    const VkBuffer predicate = d.buffer(32, VK_BUFFER_USAGE_CONDITIONAL_RENDERING_BIT_EXT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, &predicate_words);
     void* mapped = nullptr;
     const VkBuffer readback = d.buffer(texels * layers * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT, &mapped);
     EXPECT(color && predicate && readback);
@@ -586,6 +587,17 @@ int part_e(vktest::Device& d) {
         d.fn<PFN_vkCmdBeginConditionalRenderingEXT>("vkCmdBeginConditionalRenderingEXT");
     vk.end_conditional_rendering = d.fn<PFN_vkCmdEndConditionalRenderingEXT>("vkCmdEndConditionalRenderingEXT");
     EXPECT(vk.begin_conditional_rendering && vk.end_conditional_rendering);
+    VkPhysicalDeviceMemoryProperties memory{};
+    d.instance_fn<PFN_vkGetPhysicalDeviceMemoryProperties>("vkGetPhysicalDeviceMemoryProperties")(d.physical, &memory);
+    VkPhysicalDeviceProperties properties{};
+    d.instance_fn<PFN_vkGetPhysicalDeviceProperties>("vkGetPhysicalDeviceProperties")(d.physical, &properties);
+    PredicateReducer reducer(d.device_proc, d.device, memory, properties.limits.maxStorageBufferRange);
+    auto conditions = reducer.batch(32);
+    EXPECT(conditions);
+    vk.prepare_predicate = [&](VkBuffer source, VkDeviceSize offset, PredicateCapture& out) {
+        return conditions->prepare(source, offset, out);
+    };
+    vk.capture_predicate = [&](VkCommandBuffer cb, const PredicateCapture& p) { reducer.capture(cb, p); };
 
     // Lists that are rejected, and the count of copies Vulkan cannot predicate. Nothing is written by prepare().
     const auto prepared_with = [&](auto&& record, const ReplayFunctions& functions, PreparedList& out) {
@@ -611,8 +623,17 @@ int part_e(vktest::Device& d) {
         l.set_predication({0, 0, 0});
         l.copy_buffer({predicate_id, 16, predicate_id, 0, 8});                  // after it: counted 0
     };
-    EXPECT(prepared_with(copies, vk, scratch) == ReplayResult::success);
-    EXPECT(scratch.unpredicated_copies == 1);
+    EXPECT(prepared_with(copies, vk, scratch) == ReplayResult::unsupported);
+    ReplayFunctions copy_functions = vk;
+    // Preparation-only routing test; no fake descriptor set is ever submitted.
+    copy_functions.prepare_predicated_copy = [](VkBuffer, VkBuffer, VkDeviceSize, VkDeviceSize, VkDeviceSize bytes,
+                                                std::vector<PredicatedCopyDispatch>& out) {
+        out.push_back({VK_NULL_HANDLE, 0, 0, static_cast<std::uint32_t>(bytes)});
+        return true;
+    };
+    copy_functions.emit_predicated_copy = [](VkCommandBuffer, const std::vector<PredicatedCopyDispatch>&) {};
+    EXPECT(prepared_with(copies, copy_functions, scratch) == ReplayResult::success);
+    EXPECT(scratch.unpredicated_copies == 0);
 
     const Rect corner{0, 0, 2, 2};
     CommandList list;
@@ -816,12 +837,98 @@ int part_f(vktest::Device& d) {
     return 0;
 }
 
+// A subresource copied twice in one command list, as d3d12_vulkan_device_test's BC7 copy case does. D3D12 orders
+// back-to-back copies on the queue and leaves the image in COPY_DEST, so the second write needs no barrier from the
+// application; on Vulkan a texture that keeps its layout gets no transition on the second copy, so the earlier
+// transfer write has to be ordered explicitly or synchronization validation reports a write-after-write hazard.
+// The texels must show the second copy.
+int part_g(vktest::Device& d) {
+    constexpr std::uint32_t size = 4, texels = size * size, pitch = texture_data_pitch_alignment;
+    constexpr VkDeviceSize placed = VkDeviceSize(size) * pitch;  // one footprint, in the upload buffer
+    constexpr VkDeviceSize bytes = VkDeviceSize(texels) * 4;     // the readback holds tight rows
+    const VkImage image = d.image(VK_FORMAT_R8G8B8A8_UNORM, size, size, 1, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
+    void* up_mapped = nullptr;
+    const VkBuffer up = d.buffer(placed * 2, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, &up_mapped);
+    void* readback_mapped = nullptr;
+    const VkBuffer readback = d.buffer(bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT, &readback_mapped);
+    EXPECT(image && up && readback);
+
+    auto* source = static_cast<std::uint8_t*>(up_mapped);
+    for (std::uint32_t row = 0; row < size; ++row)
+        for (std::uint32_t col = 0; col < size; ++col) {
+            std::copy(red.begin(), red.end(), source + row * pitch + col * 4);              // first copy
+            std::copy(green.begin(), green.end(), source + placed + row * pitch + col * 4);  // second copy
+        }
+
+    ResourceBinding image_binding{};
+    image_binding.image = image;
+    image_binding.format = VK_FORMAT_R8G8B8A8_UNORM;
+    image_binding.width = image_binding.height = size;
+    image_binding.depth = 1;
+    image_binding.samples = 1;
+    ResourceBinding up_binding{};
+    up_binding.buffer = up;
+    up_binding.size = placed * 2;
+    constexpr ResourceId image_id = 30, up_id = 31;
+    const std::map<ResourceId, ResourceBinding> bindings{{image_id, image_binding}, {up_id, up_binding}};
+    const auto resolve = [&](ResourceId id) -> const ResourceBinding* {
+        const auto it = bindings.find(id);
+        return it == bindings.end() ? nullptr : &it->second;
+    };
+    LayoutTracker tracker(true);
+    tracker.track(image_id, image_binding, VK_IMAGE_LAYOUT_UNDEFINED);
+
+    ReplayFunctions vk{};
+    vk.pipeline_barrier = d.fn<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier");
+    vk.pipeline_barrier2 = d.fn<PFN_vkCmdPipelineBarrier2>("vkCmdPipelineBarrier2");
+    vk.clear_color_image = d.fn<PFN_vkCmdClearColorImage>("vkCmdClearColorImage");
+    vk.copy_buffer = d.fn<PFN_vkCmdCopyBuffer>("vkCmdCopyBuffer");
+    vk.copy_buffer_to_image = d.fn<PFN_vkCmdCopyBufferToImage>("vkCmdCopyBufferToImage");
+    vk.copy_image_to_buffer = d.fn<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer");
+    vk.copy_image = d.fn<PFN_vkCmdCopyImage>("vkCmdCopyImage");
+    vk.separate_depth_stencil_layouts = true;  // matches LayoutTracker
+
+    const CopyLocation dst{image_id, false, 0, 0, 0, 0, 0, 0};
+    const auto footprint = [&](VkDeviceSize offset) {
+        return CopyLocation{up_id, true, 0, offset, size, size, 1, pitch};
+    };
+    CommandList list;
+    EXPECT(list.copy_texture({dst, 0, 0, 0, footprint(0), false, {}}));
+    EXPECT(list.copy_texture({dst, 0, 0, 0, footprint(placed), false, {}}));  // same subresource, no transition between
+    EXPECT(list.transition({image_id, 0, s::copy_dest, s::copy_source}));
+    EXPECT(list.close());
+
+    const unsigned errors_before = d.validation_errors();
+    const bool ok = d.run([&](VkCommandBuffer cb) {
+        if (replay(list, cb, resolve, vk, &tracker) != ReplayResult::success) return false;
+        d.read_back(cb, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT, size, size, 1, readback,
+                    0);
+        VkMemoryBarrier host{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        host.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        host.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+        vk.pipeline_barrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &host, 0, nullptr, 0,
+                            nullptr);
+        return true;
+    });
+    EXPECT(ok);
+    EXPECT(tracker.layout(image_id, 0) == VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+
+    const auto* texels_read = static_cast<const std::uint8_t*>(readback_mapped);
+    for (std::uint32_t i = 0; i < texels; ++i) expect_rgba("G copied twice", texels_read, i, green);
+    const unsigned errors = d.validation_errors() - errors_before;
+    std::printf("G: one subresource copied twice in one list%s\n",
+                d.validation ? (errors ? ": validation errors" : ", no validation errors") : " (validation off)");
+    return 0;
+}
+
 } // namespace
 
 int main() {
     vktest::Device device;
     EXPECT(device.create());
-    if (part_a(device) || part_b(device) || part_c(device) || part_d(device) || part_e(device) || part_f(device)) return 1;
+    if (part_a(device) || part_b(device) || part_c(device) || part_d(device) || part_e(device) || part_f(device) ||
+        part_g(device))
+        return 1;
     if (g_mismatches) return 1;
     if (device.validation_errors()) {
         std::fprintf(stderr, "%u validation errors\n", device.validation_errors());

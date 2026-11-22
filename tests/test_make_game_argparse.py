@@ -26,7 +26,7 @@ class ArgparseDefaultsAndTypesTest(unittest.TestCase):
             with patch("make_game.below_normal"):
                 with patch("make_game.choose_game", return_value=os.path.abspath("C:/dummy_game")):
                     with patch("make_game.check", return_value={"expected_exe": "game.exe"}):
-                        with patch("make_game.preflight"):
+                        with patch("make_game.preflight"), patch("make_game.cross_build_missing", return_value=[]):
                             with patch("make_game.shaders"):
                                 with patch("make_game.assets"):
                                     with patch("make_game.runtime"):
@@ -241,9 +241,10 @@ class StageValidationAndSequencingTest(unittest.TestCase):
 
         expected_calls = [
             call.shaders(os.path.abspath(self.game_dir), os.path.abspath(self.work_dir), unittest.mock.ANY,
-                         emulate=unittest.mock.ANY, keep_emulated=True),
+                         emulate=unittest.mock.ANY, keep_emulated=True, fallbacks=unittest.mock.ANY),
             call.assets(os.path.abspath(self.game_dir), os.path.abspath(self.work_dir), False, unittest.mock.ANY),
-            call.runtime(os.path.abspath(self.game_dir), os.path.abspath(self.out_dir), unittest.mock.ANY, None),
+            call.runtime(os.path.abspath(self.game_dir), os.path.abspath(self.out_dir), unittest.mock.ANY, None,
+                         unittest.mock.ANY),
             call.pipelines(os.path.abspath(self.work_dir), os.path.abspath(self.out_dir), unittest.mock.ANY),
         ]
         self.assertEqual(manager.mock_calls, expected_calls)
@@ -312,14 +313,18 @@ class JobsHandlingTest(unittest.TestCase):
                                             "--stages", "shaders", "--jobs", "6"]):
                 with patch("make_game.below_normal"):
                     with patch("make_game.check", return_value={"expected_exe": "g.exe"}):
-                        with patch("make_game.preflight"):
+                        with patch("make_game.preflight") as mock_preflight:
                             with patch("make_game.log"):
                                 with patch("make_game.shaders") as mock_shaders, \
-                                        patch("make_game.wave64_emulate", return_value=True):
+                                        patch("make_game.wave64_emulate", return_value=True) as probe:
                                     ret = make_game.main()
                                     self.assertEqual(ret, 0)
+                                    probe.assert_called_once_with("auto")
+                                    mock_preflight.assert_called_once_with(
+                                        ["shaders"], os.path.abspath(work), False, None,
+                                        emulate=True, keep_emulated=True, fallbacks=(), jobs=6)
                                     mock_shaders.assert_called_once_with(os.path.abspath(game), os.path.abspath(work), 6,
-                                                                         emulate=True, keep_emulated=True)
+                                                                         emulate=True, keep_emulated=True, fallbacks=())
 
     def test_custom_jobs_forwarded_to_assets(self):
         with tempfile.TemporaryDirectory() as tmp:

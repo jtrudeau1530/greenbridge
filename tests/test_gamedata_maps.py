@@ -234,6 +234,18 @@ class GamedataMapsTest(unittest.TestCase):
         self.assertEqual(mhiu["grid"]["width"], 300)
         self.assertEqual(mhiu["grid"]["height"], 1)
 
+    def test_reports_an_unwritable_json_destination(self):
+        self.finish()
+        out = os.path.join(self.root, "missing", "maps.json")
+        result = subprocess.run(
+            [sys.executable, "-I", TOOL, self.carve, "--json", out],
+            capture_output=True, text=True,
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(f"cannot write {out}", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertNotIn("wrote", result.stdout)
+
     def test_complete_64k_map_leaves_the_next_stream_alone(self):
         payload = mhiu_payload(255, 1, [(0, 255, [7] * 255)], pixels=b"\x00" * 65229)
         self.assertEqual(len(payload), 65536)

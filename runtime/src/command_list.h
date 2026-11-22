@@ -3,13 +3,16 @@
 // The command-list IR (docs/d3d12_vulkan.md section 3.2): what a D3D12 command list records, kept until
 // ExecuteCommandLists replays it on Vulkan (vulkan_replay.h). This slice covers legacy and enhanced barriers and
 // render-target, depth-stencil and unordered-access clears (whole views or rectangles), copies, resolves,
-// predication, discards, immediate buffer writes, atomic copies and queries. It has no Windows or Vulkan dependency.
+// predication, discards, immediate buffer writes, atomic copies, queries and debug markers. It has no Windows or
+// Vulkan dependency.
 
 #include <algorithm>
 #include <array>
 #include <cstdint>
 #include <optional>
 #include <span>
+#include <string>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -32,6 +35,7 @@ inline constexpr std::uint32_t non_pixel_shader_resource = 0x40;
 inline constexpr std::uint32_t pixel_shader_resource = 0x80;
 inline constexpr std::uint32_t stream_out = 0x100;
 inline constexpr std::uint32_t indirect_argument = 0x200;
+inline constexpr std::uint32_t predication = 0x200;  // D3D12_RESOURCE_STATE_PREDICATION, the same bit
 inline constexpr std::uint32_t copy_dest = 0x400;
 inline constexpr std::uint32_t copy_source = 0x800;
 inline constexpr std::uint32_t resolve_dest = 0x1000;
@@ -326,10 +330,18 @@ struct CopyResource {
     ResourceId src;
 };
 
+// D3D12_RESOLVE_MODE values a region resolve replays.
+namespace d3d12_resolve_mode {
+inline constexpr std::uint32_t minimum = 1;
+inline constexpr std::uint32_t maximum = 2;
+inline constexpr std::uint32_t average = 3;
+}
+
 struct ResolveRegion {
     std::uint32_t dst_x;
     std::uint32_t dst_y;
     std::optional<Rect> src_rect;
+    std::uint32_t mode = d3d12_resolve_mode::average;  // colour: average only; stencil: minimum or maximum
 };
 
 // Without a region, both subresources have the same extent. A region with no source rectangle takes the
@@ -473,10 +485,62 @@ struct ResolveQueries {
     std::uint64_t offset;
 };
 
+// SetMarker, BeginEvent and EndEvent, replayed as VK_EXT_debug_utils labels when the device has them (and skipped
+// when it does not). The label is UTF-8; an end has none.
+struct DebugMarker {
+    enum class Kind : std::uint8_t { set, begin, end };
+    Kind kind;
+    std::string label;
+};
+
+// ExecuteIndirect argument kind (from ID3D12CommandSignature).
+enum class IndirectKind : std::uint8_t {
+    draw = 0,
+    draw_indexed = 1,
+    dispatch = 2,
+};
+
+struct ExecuteIndirect {
+    IndirectKind kind = IndirectKind::draw;
+    std::uint32_t stride = 0;
+    std::uint32_t max_count = 0;
+    ResourceId argument_buffer = 0;
+    std::uint64_t argument_offset = 0;
+    ResourceId count_buffer = 0;  // 0: fixed max_count; non-zero: vkCmdDraw*IndirectCount
+    std::uint64_t count_offset = 0;
+};
+
+// Triangle geometry descriptor for a BLAS build (ID3D12GraphicsCommandList4::BuildRaytracingAccelerationStructure).
+struct RtTriangleGeometry {
+    std::uint64_t vertex_va = 0;
+    std::uint32_t vertex_count = 0;
+    std::uint32_t vertex_stride = 0;
+    std::uint32_t vertex_format = 0;  // VkFormat (e.g. VK_FORMAT_R32G32B32_SFLOAT)
+    std::uint64_t index_va = 0;
+    std::uint32_t index_count = 0;
+    std::uint32_t index_type = 0;     // 0=NONE, 1=UINT16, 2=UINT32
+    std::uint64_t transform_va = 0;
+    bool opaque = true;
+};
+
+// BLAS or TLAS build command (VK_KHR_acceleration_structure).
+struct BuildAccelerationStructure {
+    bool is_tlas = false;
+    bool update = false;
+    std::uint32_t build_flags = 0;
+    std::uint64_t dst_va = 0;
+    std::uint64_t src_va = 0;
+    std::uint64_t scratch_va = 0;
+    std::uint64_t instances_va = 0;
+    std::uint32_t instance_count = 0;
+    std::vector<RtTriangleGeometry> triangles;
+};
+
 using Command = std::variant<TransitionBarrier, UavBarrier, AliasingBarrier, GlobalBarrier, BufferBarrier,
                              TextureBarrier, ClearRenderTarget, ClearDepthStencil, CopyBuffer, CopyTexture,
                              CopyResource, ResolveSubresource, Predication, ClearUnorderedAccess, DiscardResource,
-                             WriteImmediate, AtomicCopyBuffer, BeginQuery, EndQuery, ResolveQueries>;
+                             WriteImmediate, AtomicCopyBuffer, BeginQuery, EndQuery, ResolveQueries, DebugMarker,
+                             ExecuteIndirect, BuildAccelerationStructure>;
 
 class CommandList {
 public:
@@ -521,7 +585,8 @@ public:
     // Copies. The rules D3D12 states for the call itself are checked here; ranges against the resources are
     // checked at replay, when the resources are known.
     bool copy_buffer(const CopyBuffer& copy) {
-        if (!copy.dst || !copy.src || !copy.size) return false;
+        if (!copy.dst || !copy.src) return false;
+        if (!copy.size) return !closed_; // Native D3D12 accepts a zero-byte CopyBufferRegion as a no-op.
         return append(copy);
     }
 
@@ -543,6 +608,7 @@ public:
         if (!resolve.dst || !resolve.src || resolve.dst == resolve.src) return false;
         if (const auto& region = resolve.region) {
             if (region->dst_x > INT32_MAX || region->dst_y > INT32_MAX) return false;
+            if (region->mode < d3d12_resolve_mode::minimum || region->mode > d3d12_resolve_mode::average) return false;
             if (const auto& r = region->src_rect;
                 r && (r->left < 0 || r->top < 0 || r->right <= r->left || r->bottom <= r->top))
                 return false;
@@ -654,6 +720,22 @@ public:
     // A query begun and not ended. Such a list still closes (D3D12's Close reports the error), but is not replayed.
     bool queries_open() const { return !active_.empty(); }
 
+    // Debug markers. D3D12 does not ask a list to balance its events (one list may end what another began), so
+    // they are recorded as given; the replay balances them per submission (vulkan_replay.h, emit).
+    bool marker(DebugMarker::Kind kind, std::string label = {}) {
+        if (kind == DebugMarker::Kind::end) label.clear();
+        return append(DebugMarker{kind, std::move(label)});
+    }
+
+    bool execute_indirect(const ExecuteIndirect& indirect) {
+        if (!indirect.argument_buffer || !indirect.stride || !indirect.max_count) return false;
+        return append(indirect);
+    }
+
+    bool build_acceleration_structure(BuildAccelerationStructure build) {
+        if (!build.dst_va || !build.scratch_va) return false;
+        return append(std::move(build));
+    }
     bool close() {
         if (closed_) return false;
         closed_ = true;

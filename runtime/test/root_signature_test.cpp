@@ -119,6 +119,14 @@ int main() {
         check(!r.ok && r.error.find("64-dword") != std::string::npos,
               "65 constants refused by cost limit");
     }
+    // A count that wraps a 32-bit sum (1 + 0xFFFFFFFF) is still refused, not packed past dwords[32].
+    {
+        rt::rootsig::RootSignature sig;
+        sig.params = {consts(1), consts(0xFFFFFFFFu)};
+        const auto r = rt::rootsig::pack(sig);
+        check(!r.ok && r.error.find("64-dword") != std::string::npos,
+              "a constant count that wraps 32 bits is refused by the cost limit");
+    }
 
     // Canonical codec round-trips byte-exactly, sampler included.
     {

@@ -59,23 +59,26 @@ def tearDownModule():
 
 
 def load_format(fmt: int, offset: int, ncomp: int = 4, dst_sel: int = DST_SEL_XYZW,
-                memory: dict | None = None, d16: bool = False) -> tuple:
-    """buffer_load_format_[d16_]<x..xyzw> of format `fmt` at byte `offset`; returns the four mrt0 words. With d16 the
-    components come two to a register, so the first (ncomp + 1) // 2 words hold them."""
+                memory: dict | None = None, d16: bool = False, *, op: str = "buffer_load_format",
+                mods: str = "") -> tuple:
+    """Return four MRT words for a formatted load. D16 packs two components per register.
+    For a fixed-format load, pass its instruction name in op and its optional format modifier in mods."""
     if _TMP_DIR is None:
         setUpModule()
     suffix = ("d16_" if d16 else "") + "xyzw"[:ncomp]
     nregs = (ncomp + 1) // 2 if d16 else ncomp
     vdata = "v2" if nregs == 1 else f"v[2:{1 + nregs}]"
     regs = [f"v{2 + min(i, nregs - 1)}" for i in range(4)]
+    seed = "\tv_mov_b32 v2, 0x12345678\n\tv_mov_b32 v3, 0xa9bcdef0\n" if d16 else ""
     asm = (
         "; test_buffer_load_format\n"
         f"\ts_mov_b32 s0, {BASE:#x}\n"
         "\ts_mov_b32 s1, 0\n"                  # base high bits 0, stride 0 (raw)
         "\ts_mov_b32 s2, 0x100\n"              # num_records (bytes)
-        f"\ts_mov_b32 s3, {fmt << 12 | dst_sel:#x}\n"
+        f"\ts_mov_b32 s3, {fmt << 12 | dst_sel | 0x30000000:#x}\n"
         f"\tv_mov_b32 v1, {offset:#x}\n"
-        f"\tbuffer_load_format_{suffix} {vdata}, v1, s[0:3], 0 offen\n"
+        f"{seed}"
+        f"\t{op}_{suffix} {vdata}, v1, s[0:3], 0{mods} offen\n"
         "\ts_waitcnt vmcnt(0)\n"
         f"\texp mrt0 {', '.join(regs)} done vm\n"
         "\ts_endpgm\n"
@@ -121,6 +124,19 @@ class SubDwordElements(unittest.TestCase):
                 self.assertEqual(load_format(FMT_F16, off, 1)[0], f16_word(half))
 
 
+class D16DestinationHalves(unittest.TestCase):
+    def test_odd_and_even_component_writes(self):
+        # Little-endian UINT8 components at byte 0 are 44,33,22,11 (hex).
+        for offset, words in (
+            (0, ((0x12340044,), (0x00330044,), (0x00330044, 0xA9BC0022), (0x00330044, 0x00110022))),
+            (0x100, ((0x12340000,), (0,), (0, 0xA9BC0000), (0, 0))),
+        ):
+            for ncomp, want in enumerate(words, 1):
+                with self.subTest(offset=offset, ncomp=ncomp):
+                    got = load_format(FMT_UINT8X4, offset, ncomp, d16=True)
+                    self.assertEqual(got[:len(want)], want)
+
+
 class D16NormalizedRounding(unittest.TestCase):
     """d16 narrows a normalized value to f16 with round to nearest even, like the d16 image results (#489; inferred
     for the hardware, not measured). These bytes are among the about half of unorm8 values where round toward zero,
@@ -128,7 +144,7 @@ class D16NormalizedRounding(unittest.TestCase):
 
     def test_unorm8_x(self):
         # byte 5 is 0xbe: 190/255 is 0x39f6 to nearest even, 0x39f5 toward zero
-        self.assertEqual(load_format(FMT_UNORM8, 5, 1, d16=True)[0] & 0xFFFF, 0x39F6)
+        self.assertEqual(load_format(FMT_UNORM8, 5, 1, d16=True)[0], 0x123439F6)
 
     def test_unorm8x4_xyzw(self):
         # bytes 4..7 are 0xef, 0xbe, 0xad, 0xde: 0x3b7f, 0x39f6, 0x396d, 0x3af7 (0x39f5 and 0x3af6 toward zero)
@@ -202,6 +218,37 @@ class DstSelOneByFormat(unittest.TestCase):
         self.assertEqual(unorm[2:], (0x3F800000, 0x3F800000))
         u8 = load_format(FMT_UINT8X4, 4, dst_sel=DST_SEL_X_0_1_1)
         self.assertEqual(u8[2:], (1, 1))
+
+
+class TbufferDefaultFormat(unittest.TestCase):
+    """GFX10 MTBUF: an omitted format: is BUF_FMT_8_UNORM (code 1), not the V# FORMAT. llvm-mc encodes
+    `format:[BUF_FMT_8_UNORM]` and no modifier identically and disassembles both without it.
+
+    The V# says FMT_U32, which would return the whole dword. The bytes are UNORM endpoints, 0xFF -> 1.0 and
+    0x00 -> 0.0, so the expected words are exact.
+    """
+
+    MEM = {BASE: 0x112200FF}
+    EXPLICIT = " format:[BUF_FMT_8_UNORM]"
+
+    def tload(self, offset, ncomp, mods=""):
+        return load_format(FMT_U32, offset, ncomp, memory=self.MEM, op="tbuffer_load_format", mods=mods)
+
+    def test_x_unorm_endpoints_ignore_descriptor_format(self):
+        for off, want in ((0, 0x3F800000), (1, 0)):
+            with self.subTest(off=off):
+                self.assertEqual(self.tload(off, 1)[0], want)
+
+    def test_every_suffix_matches_explicit_8_unorm(self):
+        for ncomp in (1, 2, 3, 4):
+            with self.subTest(suffix="xyzw"[:ncomp]):
+                got = self.tload(0, ncomp)[:ncomp]
+                self.assertEqual(got[0], 0x3F800000)
+                self.assertEqual(got, self.tload(0, ncomp, self.EXPLICIT)[:ncomp])
+
+    def test_explicit_invalid_still_rejected(self):
+        with self.assertRaises(rdna2spirv.Unsupported):
+            self.tload(0, 1, " format:[BUF_FMT_INVALID]")
 
 
 class InterpreterConversions(unittest.TestCase):

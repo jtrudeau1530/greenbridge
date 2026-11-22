@@ -196,6 +196,22 @@ class GlbAtomicTests(unittest.TestCase):
             finally:
                 os.umask(old)
 
+    def test_concurrent_new_files_leave_the_umask_alone(self):
+        # A new file's mode comes from a probe file (file_mode.published_mode), never from setting the umask to 0
+        # and back, which could leave a threaded process at umask 0.
+        import file_mode
+        modes = []
+        with tempfile.TemporaryDirectory() as directory,                 mock.patch.object(file_mode.os, "umask", side_effect=AssertionError("umask touched")) as umask:
+            threads = [threading.Thread(target=lambda i=i: modes.append(
+                file_mode.published_mode(os.path.join(directory, f"new{i}.glb")))) for i in range(2)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+        umask.assert_not_called()
+        self.assertEqual(len(modes), 2)
+        self.assertEqual(modes[0], modes[1])
+
     def test_published_glb_is_writable(self):
         with tempfile.TemporaryDirectory() as directory:
             target = Path(directory) / "mesh.glb"

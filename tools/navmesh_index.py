@@ -187,11 +187,21 @@ def add_distribution(summary, rows):
     return summary
 
 
+def _make_parent(path):
+    """Create the folder an output path lives in: the scan is over by the time we write, so a missing
+    folder used to end the run in a FileNotFoundError and lose the result."""
+    parent = os.path.dirname(os.path.abspath(path))
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
+
 def write_outputs(rows, summary, out_path, csv_path):
+    _make_parent(out_path)
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump({"summary": summary, "pages": rows}, f, indent=1)
     written = []
     if csv_path:
+        _make_parent(csv_path)
         with open(csv_path, "w", newline="", encoding="utf-8") as f:
             w = csv.DictWriter(f, fieldnames=FIELDS, extrasaction="ignore")
             w.writeheader()
@@ -222,6 +232,15 @@ def offset(text):
     return value
 
 
+def same_report_path(first, second):
+    if os.path.normcase(os.path.realpath(first)) == os.path.normcase(os.path.realpath(second)):
+        return True
+    try:
+        return os.path.samefile(first, second)
+    except OSError:
+        return False
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("input", help="RPF9 archive, or a directory of carved .bin files")
@@ -236,6 +255,10 @@ def main() -> int:
         ap.error("--start and --limit apply to a single archive, not a directory")
     if not is_dir and a.pattern is not None:
         ap.error("--pattern applies to a directory, not an archive")
+    base = os.path.basename(os.path.normpath(a.input))
+    out_path = a.out or os.path.splitext(base)[0] + ".navmesh-index.json"
+    if a.csv and same_report_path(out_path, a.csv):
+        ap.error("--out and --csv must refer to different files")
     below_normal()
 
     if is_dir:
@@ -251,8 +274,6 @@ def main() -> int:
         rows, summary = scan_archive(a.input, a.start, a.limit)
 
     add_distribution(summary, rows)
-    base = os.path.basename(os.path.normpath(a.input))
-    out_path = a.out or os.path.splitext(base)[0] + ".navmesh-index.json"
     written = write_outputs(rows, summary, out_path, a.csv)
     print(json.dumps(summary, indent=1))
     print(f"wrote {out_path}" + (f", {', '.join(written)}" if written else ""))

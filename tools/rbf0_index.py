@@ -236,7 +236,7 @@ def join_resource(rows, index, read, check_gap=True):
     j = index + 1
     while j < len(rows) and chunks < MAX_CHUNKS and len(blob) < MAX_BYTES:
         nxt = rows[j]
-        if nxt["size"] > MAX_CHUNK or nxt["head"][:4] in (MAGIC, b"PSIN"):
+        if rows[j - 1]["size"] != MAX_CHUNK or nxt["size"] > MAX_CHUNK or nxt["head"][:4] in (MAGIC, b"PSIN"):
             break
         if check_gap and nxt["offset"] > rows[j - 1]["offset"] + rows[j - 1]["stored"] + 16:
             break
@@ -383,7 +383,7 @@ def scan_rpf(path, start=None, limit=None, progress=None, string_limit=16):
             if mm[s:s + 3] == b"KB2":
                 blen = (_u32(mm, s + 4) or 0) + 8
                 w, h = _u32(mm, s + 0x14), _u32(mm, s + 0x18)
-                if not (64 <= blen <= size - s and w and h and 16 <= w <= 8192 and 16 <= h <= 8192):
+                if not (64 <= blen <= end - s and w and h and 16 <= w <= 8192 and 16 <= h <= 8192):
                     pos = s + 1
                     continue
                 gap = mm[last:s]
@@ -396,8 +396,8 @@ def scan_rpf(path, start=None, limit=None, progress=None, string_limit=16):
             d = zlib.decompressobj()
             chunks, p = [], s
             try:
-                while not d.eof and p < size:
-                    block = mm[p:p + (1 << 20)]
+                while not d.eof and p < end:   # inside the --limit window, as in story_index (#712)
+                    block = mm[p:min(p + (1 << 20), end)]
                     chunks.append(d.decompress(block))
                     p += len(block)
                     if d.unused_data or d.eof:
@@ -435,7 +435,8 @@ def scan_dir(path, string_limit=16):
     entries = []
     for name in sorted(os.listdir(path)):
         full = os.path.join(path, name)
-        if not os.path.isfile(full):
+        # rpf9_carve.py's index.json and any .csv report sit next to the streams; they are not payloads.
+        if not os.path.isfile(full) or name.lower().endswith((".json", ".csv")):
             continue
         with open(full, "rb") as f:
             data = f.read()
@@ -501,6 +502,16 @@ def byte_count(text):
     return value
 
 
+def same_output_path(first, second):
+    """True when writing ``second`` would truncate ``first`` (same file, path or hard link)."""
+    if os.path.normcase(os.path.realpath(first)) == os.path.normcase(os.path.realpath(second)):
+        return True
+    try:
+        return os.path.samefile(first, second)
+    except OSError:
+        return False
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("source", help="an .rpf archive or a directory of carved streams")
@@ -511,6 +522,12 @@ def main():
     ap.add_argument("--all-strings", action="store_true", help="write every readable string to JSON (game data)")
     ap.add_argument("--quiet", action="store_true")
     a = ap.parse_args()
+    if same_output_path(a.source, a.out):
+        ap.error("output must not overwrite the source")
+    if a.strings < 0:
+        ap.exit(2, f"{ap.prog}: error: argument --strings: must be 0 or more\n")
+    if os.path.isdir(a.source) and (a.start is not None or a.limit is not None):
+        ap.error("--start and --limit apply to a single archive, not a directory")
     if os.path.isdir(a.out):
         ap.error(f"{a.out} is a folder, not a .csv or .json file")
     folder = os.path.dirname(os.path.abspath(a.out))

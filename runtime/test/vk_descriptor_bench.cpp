@@ -13,6 +13,7 @@
 //   LEONIDA_VK_VALIDATION=1 enables VK_LAYER_KHRONOS_validation; any validation error fails the run.
 #define VK_NO_PROTOTYPES
 #include "vulkan_loader.h"
+#include "vk_device_pick.h"
 #include "../src/descriptor_table.h"
 
 #include <algorithm>
@@ -1368,12 +1369,8 @@ int main(int argc, char** argv) {
         pd = cand;
         pd_props = p;
     } else {
-        auto score = [](VkPhysicalDeviceType t) -> int {
-            if (t == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) return 4;
-            if (t == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU) return 3;
-            if (t == VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU) return 2;
-            if (t == VK_PHYSICAL_DEVICE_TYPE_CPU) return 1;
-            return 0;
+        auto score = [](VkPhysicalDeviceType t, std::uint32_t vendor) -> int {
+            return leonida::vk_test::device_rank(t, vendor);
         };
         int best_score = -1;
         for (VkPhysicalDevice cand : pds) {
@@ -1381,7 +1378,7 @@ int main(int argc, char** argv) {
             vkGetPhysicalDeviceProperties(cand, &p);
             std::uint32_t c_qi = 0, c_ts = 0;
             if (p.apiVersion < VK_API_VERSION_1_1 || !find_compute_queue(cand, c_qi, c_ts)) continue;
-            const int s = score(p.deviceType);
+            const int s = score(p.deviceType, p.vendorID);
             if (s > best_score) {
                 best_score = s;
                 pd = cand;

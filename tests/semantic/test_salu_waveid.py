@@ -29,7 +29,7 @@ import rdna2spirv  # noqa: E402
 import spirv_mini_interp as si  # noqa: E402
 
 STUB_DXBC = b"DXBC" + bytes(24) + struct.pack("<I", 0) + bytes(4)
-VSHARP = [0, 0, 0x1000, 0]
+VSHARP = [0, 0, 0x1000, 0x31016FAC]
 THREADS = 128
 
 

@@ -22,7 +22,7 @@ import warnings
 import support
 import spirv_mini_interp as si
 
-VSHARP = [0, 0, 0x1000, 0]
+VSHARP = [0, 0, 0x1000, 0x31016FAC]
 OLD = 99
 ALL = 0xFFFFFFFF
 ALL64 = (1 << 64) - 1

@@ -88,7 +88,7 @@ def blocks_in(tree):
     return out
 
 
-def test_random_graphs():
+def _check_random_graphs():
     rng = random.Random(20261121)
     structured = refused = loops = split_ok = split_cap = 0
     for case in range(20000):
@@ -136,6 +136,10 @@ def test_random_graphs():
     return structured, refused, loops, split_ok, split_cap
 
 
+def test_random_graphs():
+    _check_random_graphs()
+
+
 def test_shapes():
     assert S.structure([[]]) == [("block", 0)]
     assert S.structure([[1], [2], []]) == [("block", 0), ("block", 1), ("block", 2)]          # no tests needed
@@ -175,5 +179,6 @@ def test_shapes():
 
 if __name__ == "__main__":
     test_shapes()
-    print("ok: %d graphs structured and run, %d irreducible (%d split-structured, %d capped), %d with loops" %
-          (lambda s, r, l, ok, cap: (s, r, ok, cap, l))(*test_random_graphs()))
+    structured, refused, loops, split_ok, split_cap = _check_random_graphs()
+    print(f"ok: {structured} graphs structured and run, {refused} irreducible "
+          f"({split_ok} split-structured, {split_cap} capped), {loops} with loops")

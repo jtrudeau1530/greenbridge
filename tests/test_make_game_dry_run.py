@@ -8,6 +8,7 @@ import shutil
 import sys
 import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -381,7 +382,7 @@ class StageResumptionAndStepIsolationTest(unittest.TestCase):
     def test_shaders_stage_skips_finished_steps_based_on_markers(self) -> None:
         dxbc_dir = os.path.join(self.work_dir, "shaders", "dxbc")
         spirv_dir = os.path.join(self.work_dir, "shaders", "spirv")
-        os.makedirs(dxbc_dir, exist_ok=True)
+        os.makedirs(os.path.join(dxbc_dir, "disasm"))
         os.makedirs(spirv_dir, exist_ok=True)
 
         with open(os.path.join(dxbc_dir, "index.json"), "w", encoding="utf-8") as f:
@@ -389,7 +390,7 @@ class StageResumptionAndStepIsolationTest(unittest.TestCase):
         with open(os.path.join(dxbc_dir, "fssm_index.json"), "w", encoding="utf-8") as f:
             f.write("{}")
         with open(os.path.join(dxbc_dir, "disasm.done"), "w", encoding="utf-8") as f:
-            f.write("shader_disasm.py finished\n")
+            f.write("test llvm-mc 21\n")
         with open(os.path.join(spirv_dir, "index.json"), "w", encoding="utf-8") as f:
             f.write("{}")
         with open(os.path.join(spirv_dir, "wave64_emulate.txt"), "w", encoding="utf-8") as f:
@@ -398,6 +399,7 @@ class StageResumptionAndStepIsolationTest(unittest.TestCase):
             f.write(make_game.translation_sources_digest() + "\n")
 
         with mock.patch("make_game.py") as mock_py, \
+                mock.patch("make_game.llvm_mc_signature", return_value="test llvm-mc 21"), \
                 mock.patch("make_game.translate") as mock_translate, \
                 mock.patch("make_game.log"):
             make_game.shaders(self.game_dir, self.work_dir, jobs=2, emulate=False, keep_emulated=True)
@@ -429,6 +431,7 @@ class StageResumptionAndStepIsolationTest(unittest.TestCase):
                     f.write("{}")
 
         with mock.patch("make_game.py", side_effect=fake_py), \
+                mock.patch("make_game.llvm_mc_signature", return_value="test llvm-mc 21"), \
                 mock.patch("make_game.translate") as mock_translate, \
                 mock.patch("make_game.need"), \
                 mock.patch("make_game.log"):
@@ -467,6 +470,52 @@ class StageResumptionAndStepIsolationTest(unittest.TestCase):
             mock_run.assert_not_called()
             mock_py.assert_not_called()
 
+    def test_texture_pools_resume_only_when_their_listed_dds_files_exist(self) -> None:
+        assets = Path(self.work_dir, "assets")
+        audio = assets / "audio"
+        audio.mkdir(parents=True)
+        for marker in ("audio_manifest.json", "ogg.done", "xma.done"):
+            (audio / marker).touch()
+
+        # Identically named pools in the base game and a pack have distinct completion markers.
+        game = Path(self.game_dir)
+        base_source = game / "data" / "ttdb" / "sample.ttpf"
+        pack_source = game / "pack" / "story" / "data" / "ttdb" / "sample.ttpf"
+        base_dest = assets / "ttpf"
+        pack_dest = assets / "ttpf_pack" / "story"
+        for src, dest in ((base_source, base_dest), (pack_source, pack_dest)):
+            src.parent.mkdir(parents=True)
+            src.touch()
+            (dest / "sample").mkdir(parents=True)
+            (dest / "sample" / "first.dds").write_bytes(b"completed sibling")
+        (pack_dest / "sample" / "second.dds").mkdir()
+
+        valid = json.dumps({"Count": 2, "Textures": [{"File": "first.dds"}, {"File": None}]})
+        legacy = json.dumps({"Count": 2, "Textures": [{"File": "first.dds"}, {"File": "second.dds"}]})
+        base_call = mock.call(["rpf9dump", "ttpf", str(base_source), str(base_dest)])
+        pack_call = mock.call(["rpf9dump", "ttpf", str(pack_source), str(pack_dest)])
+        def publish_catalog(cmd):
+            (Path(cmd[3]) / "sample" / "manifest.json").write_text(valid, encoding="utf-8")
+
+        for case, base_manifest, pack_manifest, expected in (
+            ("complete including skipped rows", valid, valid, []),
+            ("listed DDS is missing", legacy, valid, [base_call]),
+            ("listed DDS is a directory", valid, legacy, [pack_call]),
+            ("missing texture list", "{}", valid, [base_call]),
+            ("incomplete row list", '{"Count": 2, "Textures": [{"File": "first.dds"}]}', valid, [base_call]),
+            ("missing File field", valid, '{"Count": 1, "Textures": [{}]}', [pack_call]),
+            ("incomplete JSON", valid, "{", [pack_call]),
+        ):
+            with self.subTest(case=case):
+                (base_dest / "sample" / "manifest.json").write_text(base_manifest, encoding="utf-8")
+                (pack_dest / "sample" / "manifest.json").write_text(pack_manifest, encoding="utf-8")
+                with mock.patch.object(make_game, "MODEL_ARCHIVES", ()), \
+                        mock.patch.object(make_game, "rpf9dump", return_value="rpf9dump"), \
+                        mock.patch.object(make_game, "run", side_effect=publish_catalog) as run, \
+                        mock.patch.object(make_game, "log"), mock.patch("shutil.which", return_value=None):
+                    make_game.assets(self.game_dir, self.work_dir, wav=False, jobs=1)
+                self.assertEqual(run.call_args_list, expected)
+
     def test_pending_exports_refresh_the_existing_helper_once(self) -> None:
         output = os.path.join(self.work_dir, "tools", "rpf9dump")
         os.makedirs(output)
@@ -502,15 +551,11 @@ class StageResumptionAndStepIsolationTest(unittest.TestCase):
         self.assertFalse(os.path.isfile(p1))
         self.assertFalse(os.path.isfile(p2))
 
-    def test_mark_and_mark_done_create_expected_marker_files(self) -> None:
-        p1 = os.path.join(self.work_dir, "disasm.done")
-        p2 = os.path.join(self.work_dir, "step.done")
-        make_game.mark_done(p1)
-        make_game.mark(p2, "custom_step")
+    def test_mark_creates_expected_asset_marker(self) -> None:
+        marker = os.path.join(self.work_dir, "step.done")
+        make_game.mark(marker, "custom_step")
 
-        with open(p1, "r", encoding="utf-8") as f:
-            self.assertEqual(f.read().strip(), "shader_disasm.py finished")
-        with open(p2, "r", encoding="utf-8") as f:
+        with open(marker, "r", encoding="utf-8") as f:
             self.assertEqual(f.read().strip(), "custom_step finished")
 
 

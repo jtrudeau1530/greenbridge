@@ -14,7 +14,15 @@ import os
 import re
 import sys
 
-STR = re.compile(rb"[A-Za-z_][A-Za-z0-9_./:\\-]{2,200}")
+# A whole printable run, however long (one linear scan: a single character class, no nested quantifiers).
+STR = re.compile(rb"[A-Za-z_][A-Za-z0-9_./:\\-]{2,}")
+# A name (a whole run or one piece of it) longer than this is not added: it is a blob of text, not a name.
+# The old pattern cut every run at 201 characters, so no entry was ever longer than this.
+MAX_NAME_LEN = 201
+# The pieces of a path or dotted name, found one at a time (a run can be megabytes: no list of all its parts).
+PART = re.compile(r"[^./:\\]+")
+# Where re.split would yield an empty piece; only matters for --min 0 or less, which keeps "" as a name.
+EMPTY_PART = re.compile(r"[./:\\]{2}|[./:\\]$")
 
 
 def joaat(s: str) -> int:
@@ -32,11 +40,14 @@ def harvest(data: bytes, out: set, minlen: int):
     for m in STR.finditer(data):
         s = m.group(0).decode("latin-1")
         if len(s) >= minlen:
-            out.add(s)
+            if len(s) <= MAX_NAME_LEN:
+                out.add(s)
             # also the pieces of paths and dotted names, which are hashed on their own
-            for part in re.split(r"[./:\\]", s):
-                if len(part) >= minlen:
-                    out.add(part)
+            for pm in PART.finditer(s):
+                if minlen <= pm.end() - pm.start() <= MAX_NAME_LEN:
+                    out.add(pm.group(0))
+            if minlen <= 0 and EMPTY_PART.search(s):
+                out.add("")
 
 
 def main():
@@ -64,6 +75,9 @@ def main():
             print(f"ERROR: cannot read the dictionary {a.lookup[0]}: {getattr(e, 'strerror', None) or e}",
                   file=sys.stderr)
             return 2
+        if not isinstance(d, dict):
+            print(f"ERROR: the dictionary {a.lookup[0]} is not a JSON object of hash -> name", file=sys.stderr)
+            return 2
         for h, v in values:
             print(h, d.get(f"{v:08x}", "?"))
         return 0
@@ -80,8 +94,15 @@ def main():
         p = os.path.join(a.carve, arch, "index.json")
         if not os.path.isfile(p):
             continue
-        with open(p, encoding="utf-8") as f:
-            rows = json.load(f)["files"]
+        try:
+            with open(p, encoding="utf-8") as f:
+                rows = json.load(f)["files"]
+            if not isinstance(rows, list) or not all(isinstance(r, dict) for r in rows):
+                raise ValueError('"files" is not a list of entries')
+        except (OSError, ValueError, KeyError, TypeError) as e:
+            reason = getattr(e, "strerror", None) or (f"no {e} key" if isinstance(e, KeyError) else e)
+            print(f"ERROR: cannot read {p}: {reason}", file=sys.stderr)
+            return 2
         for r in rows:
             if r.get("type") == "bink2":
                 continue
@@ -109,8 +130,14 @@ def main():
     d = {}
     for s in sorted(strings):
         d.setdefault(f"{joaat(s):08x}", s)
-    with open(a.out, "w", encoding="utf-8") as f:
-        json.dump(d, f)
+    # Other tools create the output parent too: a long harvest must not be lost to a missing folder.
+    try:
+        os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
+        with open(a.out, "w", encoding="utf-8") as f:
+            json.dump(d, f)
+    except OSError as e:
+        print(f"ERROR: cannot write {a.out}: {e}", file=sys.stderr)
+        return 2
     print(f"{len(strings)} strings -> {len(d)} hashes -> {a.out}")
     return 0
 

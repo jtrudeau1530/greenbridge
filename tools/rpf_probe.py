@@ -12,6 +12,7 @@ import math
 import os
 import struct
 import sys
+import tempfile
 from collections import Counter
 
 
@@ -60,10 +61,19 @@ def main() -> int:
         reason = error.strerror or str(error)
         print(f"ERROR: {path}: {reason}", file=sys.stderr)
         return 2
-    rows.sort(key=lambda r: -r["size"])
-    os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
-    with open(a.out, "w", encoding="utf-8") as f:
-        json.dump(rows, f, indent=1)
+    rows.sort(key=lambda r: (-r["size"], r["file"]))
+    try:
+        out_dir = os.path.dirname(os.path.abspath(a.out))
+        os.makedirs(out_dir, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=out_dir) as staging:
+            staged = os.path.join(staging, "rpf_probe.json")
+            with open(staged, "w", encoding="utf-8") as f:
+                json.dump(rows, f, indent=1)
+            os.replace(staged, a.out)
+    except OSError as error:
+        reason = error.strerror or str(error)
+        print(f"ERROR: {a.out}: {reason}", file=sys.stderr)
+        return 2
     versions = Counter(r["version"] for r in rows)
     print(f"{len(rows)} archives, {sum(r['size'] for r in rows) / 2**30:.1f} GiB, versions {dict(versions)}")
     for r in rows:
