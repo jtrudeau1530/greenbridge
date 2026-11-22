@@ -151,6 +151,13 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "full 64-wide compute subgroups unavailable\n");
         return 77;
     }
+    std::ifstream f(argv[1], std::ios::binary);
+    std::vector<char> code((std::istreambuf_iterator<char>(f)), {});
+    const bool needs_float64 = leonida::vk_test::spirv_declares_capability(code.data(), code.size(), 10);  // Float64
+    if (needs_float64 && !f2q.features.shaderFloat64) {
+        std::fprintf(stderr, "unsupported: %s uses Float64 and the device has no shaderFloat64\n", argv[1]);
+        return 77;
+    }
     VkPhysicalDeviceVulkan13Features f13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
     VkPhysicalDeviceVulkan12Features f12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
     f12.bufferDeviceAddress = VK_TRUE;
@@ -161,6 +168,7 @@ int main(int argc, char** argv) {
     }
     VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
     f2.features.shaderInt64 = VK_TRUE;
+    f2.features.shaderFloat64 = needs_float64;
     f2.pNext = &f12;
     // OpFmaKHR (rdna2spirv.py --fma khr): VK_KHR_shader_fma, when the device has it.
     leonida::vk_test::ShaderFma fma;
@@ -227,8 +235,6 @@ int main(int argc, char** argv) {
     bai.buffer = buf;
     const uint64_t heap = vkGetBufferDeviceAddress(dev, &bai);
 
-    std::ifstream f(argv[1], std::ios::binary);
-    std::vector<char> code((std::istreambuf_iterator<char>(f)), {});
     if (!fma.accepts(code.data(), code.size(), argv[1])) return 77;
     VkShaderModuleCreateInfo smi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
     smi.codeSize = code.size(); smi.pCode = reinterpret_cast<const uint32_t*>(code.data());
