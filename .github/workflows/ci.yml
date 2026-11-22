@@ -90,6 +90,11 @@ jobs:
         env:
           RPF9DUMP_DLL: tools/rpf9dump/bin/Release/net8.0/rpf9dump.dll
         run: python -I tests/test_ttpf_export_resume.py
+      # The standard-library loop above runs this file before rpf9dump is built, where it skips for lack of the DLL.
+      - name: Test rpf9dump exit codes
+        env:
+          RPF9DUMP_DLL: tools/rpf9dump/bin/Release/net8.0/rpf9dump.dll
+        run: python -I tests/test_rpf9dump_exit_codes.py
       - name: Build the calibrated BCPack reader and test the texture pipeline
         env:
           RPF9DUMP_DLL: tools/rpf9dump/bin/Release/net8.0/rpf9dump.dll

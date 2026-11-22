@@ -1383,8 +1383,13 @@ def build_world(
             raise ValueError(f"region must be MINX,MINY,MAXX,MAXY with min < max, got {region!r}")
         if instancing not in INSTANCING_MODES:
             raise ValueError(f"instancing must be one of {INSTANCING_MODES}, got {instancing!r}")
-        if lod_sets and instancing == "bake":
-            raise ValueError("--lod-sets needs --instancing gpu or nodes")
+        if lod_sets:
+            if instancing == "bake":
+                raise ValueError("--lod-sets needs --instancing gpu or nodes")
+            lod_levels = tuple(lod_levels)
+            for level in lod_levels:
+                if level not in LOD_TIER_NAMES:
+                    raise ValueError(f"--lod-sets does not recognize lodLevel {level!r}; use levels 0..6")
     elif lod_sets:
         raise ValueError("--lod-sets needs --placements")
     workers = max(1, int(jobs))
@@ -1836,9 +1841,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument(
         "--lod-sets",
         action="store_true",
-        help="With --placements: one chunk set per LOD tier (HD, LOD, SLOD1-4, ORPHAN_HD; all lodLevel values "
-        "unless --lod-levels is given), plus each tier's camera distance band in world.json, measured from the "
-        "entities' childLodDist/lodDist, so the viewer shows one tier per grid cell.",
+        help="With --placements: one chunk set per LOD tier (HD, LOD, SLOD1-4, ORPHAN_HD). "
+        "Use --lod-levels to select a subset of levels 0..6. The camera distance bands in world.json "
+        "come from the entities' childLodDist/lodDist so the viewer shows one tier per grid cell.",
     )
     args = ap.parse_args(argv)
     lod_levels = args.lod_levels

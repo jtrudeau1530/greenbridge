@@ -450,6 +450,38 @@ class TestSwizzleSearchCliAndRender(unittest.TestCase):
             self.assertNotIn("Traceback", result.stderr)
 
     @unittest.skipUnless(HAVE_NUMPY and HAVE_PIL, "numpy and PIL required")
+    def test_preview_rejects_input_and_hardlink_alias(self):
+        """A preview must not overwrite the input or a hard link to it."""
+        for hardlink in (False, True):
+            with self.subTest(hardlink=hardlink):
+                with tempfile.TemporaryDirectory() as td:
+                    blob = Path(td) / "input.png"
+                    original = bytes(8 * 16 * 8)
+                    blob.write_bytes(original)
+
+                    output = Path(td) / "alias.png" if hardlink else blob
+                    if hardlink:
+                        os.link(blob, output)
+
+                    result = subprocess.run(
+                        [
+                            sys.executable, "-I", str(TOOL), str(blob),
+                            "--bpe", "8",
+                            "--tile", "512",
+                            "--widths", "64",
+                            "--tiles", "2",
+                            "--out", str(output),
+                        ],
+                        capture_output=True,
+                        text=True,
+                    )
+
+                    self.assertNotEqual(result.returncode, 0, result.stdout)
+                    self.assertIn("overwrite", result.stderr.lower())
+                    self.assertEqual(blob.read_bytes(), original)
+                    self.assertEqual(output.read_bytes(), original)
+
+    @unittest.skipUnless(HAVE_NUMPY and HAVE_PIL, "numpy and PIL required")
     def test_render_bc1_synthetic_output(self):
         """render() must decode synthetic BC1 data and save a valid PNG preview."""
         with tempfile.TemporaryDirectory() as td:
