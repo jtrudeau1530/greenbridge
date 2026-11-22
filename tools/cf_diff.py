@@ -598,6 +598,10 @@ def main(argv=None):
     ap.add_argument("--spirv-val", action="store_true",
                     help="also run spirv-as and spirv-val on every translation (a failure counts as a mismatch)")
     ap.add_argument("--self-test", action="store_true")
+    if argv is None:
+        argv = sys.argv[1:]
+    if not argv:
+        ap.error("no arguments given; pass --help for the available options")
     a = ap.parse_args(argv)
     if a.spirv_val:
         missing = [t for t in ("spirv-as", "spirv-val") if not shutil.which(t)]
