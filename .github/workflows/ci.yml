@@ -89,15 +89,20 @@ jobs:
           python-version: "3.12"
           cache: "pip"
           cache-dependency-path: tests/requirements.txt
-      - name: Install llvm-mc and spirv-tools
+      - name: Install llvm-mc (LLVM 21) and spirv-tools
+        shell: bash
         run: |
+          curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key | sudo gpg --dearmor -o /usr/share/keyrings/llvm-snapshot.gpg
+          echo "deb [signed-by=/usr/share/keyrings/llvm-snapshot.gpg] https://apt.llvm.org/noble/ llvm-toolchain-noble-21 main" | sudo tee /etc/apt/sources.list.d/llvm-21.list > /dev/null
           sudo apt-get update
-          pkgs=(spirv-tools)
-          if [ ! -x /usr/lib/llvm-18/bin/llvm-mc ]; then
-            pkgs+=(llvm-18)
-          fi
-          sudo apt-get install -y --no-install-recommends "${pkgs[@]}"
+          sudo apt-get install -y --no-install-recommends llvm-21 spirv-tools
           pip install -r tests/requirements.txt
+          LLVM_MC=/usr/lib/llvm-21/bin/llvm-mc
+          echo "LLVM_MC=$LLVM_MC" >> "$GITHUB_ENV"
+          version_out=$("$LLVM_MC" --version)
+          printf '%s\n' "$version_out"
+          grep -q 'LLVM version 21\.' <<< "$version_out"
+          grep -q 'amdgcn' <<< "$version_out"
       - name: Translator tests
         run: |
           pytest_files=()
