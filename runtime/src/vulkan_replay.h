@@ -1228,6 +1228,54 @@ public:
     std::size_t unpredicated_copies = 0;
 };
 
+// detail::initialize zero-clears an image piece the tracker holds in UNDEFINED (D3D12 committed resources start
+// zeroed) the first time a command touches it, with vkCmdClearColorImage or vkCmdClearDepthStencilImage. True when
+// a command of the list would need one of those and it is unset; replay() then refuses the list as unsupported, as
+// prepare() does for every other optional function, rather than emit calling a null pointer.
+inline bool zero_clear_unavailable(const PreparedList& prepared, const ReplayFunctions& vk,
+                                   const LayoutTracker& tracker) {
+    if (vk.clear_color_image && vk.clear_depth_stencil_image) return false;
+    std::vector<LayoutPiece> pieces;
+    const auto missing = [&](ResourceId id, const ResourceBinding& resource, const VkImageSubresourceRange& range) {
+        if (!id || !resource.image || resource.not_zeroed ||
+            block_format(resource.format, VK_IMAGE_ASPECT_COLOR_BIT).block > 1)   // only moved, never cleared
+            return false;
+        pieces.clear();
+        if (!tracker.pieces(id, range, pieces)) return false;
+        for (const auto& piece : pieces)
+            if (piece.layout == VK_IMAGE_LAYOUT_UNDEFINED &&
+                ((piece.range.aspectMask & VK_IMAGE_ASPECT_COLOR_BIT) ? !vk.clear_color_image
+                                                                      : !vk.clear_depth_stencil_image))
+                return true;
+        return false;
+    };
+    const auto commands = prepared.list->commands();
+    for (std::size_t i = 0; i < commands.size(); ++i) {
+        const auto& command = commands[i];
+        const auto& p = prepared.commands[i];
+        if (p.skip) continue;
+        if (const auto [dst, src] = copy_ids(command); dst || src) {
+            if (missing(dst, p.binding, p.range) || missing(src, p.source, p.source_range)) return true;
+            continue;
+        }
+        const ResourceId id = std::visit(
+            [](const auto& c) -> ResourceId {
+                using T = std::decay_t<decltype(c)>;
+                if constexpr (std::is_same_v<T, ClearRenderTarget> || std::is_same_v<T, ClearDepthStencil>)
+                    return c.target.resource;
+                else if constexpr (std::is_same_v<T, ClearUnorderedAccess>)
+                    return c.view.resource;
+                else if constexpr (requires { c.resource; })
+                    return c.resource;
+                else
+                    return 0;
+            },
+            command);
+        if (missing(id, p.binding, p.range)) return true;
+    }
+    return false;
+}
+
 // Resolves and checks every command. Nothing is written to a command buffer.
 // Resolve maps a ResourceId to a const ResourceBinding* (nullptr: unknown).
 template<typename Resolve>
@@ -1322,6 +1370,7 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                                             VK_IMAGE_ASPECT_COLOR_BIT); r != ReplayResult::success) return r;
             } else if (const auto r = rect_view(clear_rects(color_clear->rects), color_clear->target, VK_IMAGE_ASPECT_COLOR_BIT);
                        r != ReplayResult::success) return r;
+            if (!p.skip && p.rects.empty() && !vk.clear_color_image) return ReplayResult::unsupported;
         } else if (const auto* depth_clear = std::get_if<ClearDepthStencil>(&command)) {
             if (!bind(depth_clear->target.resource)) return ReplayResult::unresolved_resource;
             VkImageAspectFlags aspects = 0;
@@ -1335,6 +1384,7 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             if (const auto r = rect_view(clear_rects(depth_clear->rects), depth_clear->target, p.binding.aspects);
                 r != ReplayResult::success)
                 return r;
+            if (!p.skip && p.rects.empty() && !vk.clear_depth_stencil_image) return ReplayResult::unsupported;
         } else if (const auto* uav = std::get_if<ClearUnorderedAccess>(&command)) {
             const UavView& view = uav->view;
             if (!bind(view.resource)) return ReplayResult::unresolved_resource;
@@ -1362,6 +1412,7 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             const auto rects = attachment ? clear_rects(uav->rects) : std::span<const Rect>(uav->rects);
             if (const auto r = rect_view(rects, target, VK_IMAGE_ASPECT_COLOR_BIT); r != ReplayResult::success)
                 return r;
+            if (!p.skip && p.rects.empty() && !vk.clear_color_image) return ReplayResult::unsupported;
         } else if (std::holds_alternative<CopyBuffer>(command) || std::holds_alternative<CopyTexture>(command) ||
                    std::holds_alternative<CopyResource>(command)) {
             if (!copies) return ReplayResult::unsupported;
@@ -1924,6 +1975,7 @@ ReplayResult replay(const CommandList& list, VkCommandBuffer command_buffer, Res
         return ReplayResult::unsupported;
     PreparedList prepared;
     if (const auto result = prepare(list, resolve, vk, prepared); result != ReplayResult::success) return result;
+    if (tracker && zero_clear_unavailable(prepared, vk, *tracker)) return ReplayResult::unsupported;
     emit(prepared, command_buffer, vk, tracker);
     return ReplayResult::success;
 }
