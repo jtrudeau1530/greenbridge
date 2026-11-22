@@ -1,7 +1,7 @@
 """make_game.py: a resumed shaders stage keeps the translation shards that already finished.
 
 Standard library only; no GPU, no Vulkan SDK, no game data: the shard processes and the merge are mocked. A fake
-shard writes its index.part<i>.json the way rdna2spirv.py --shard does, as the last thing before it exits.
+shard writes its marker and then index.part<i>.json the way rdna2spirv.py --shard does.
 """
 import json
 import os
@@ -43,6 +43,8 @@ class ResumeShardsTest(unittest.TestCase):
             def wait(self):
                 if self.i in crash:
                     return 1
+                with open(os.path.join(spirv, f"shard{self.i}.json"), "w", encoding="utf-8") as f:
+                    json.dump({"index": self.i, "count": self.n}, f)
                 with open(os.path.join(spirv, f"index.part{self.i}.json"), "w", encoding="utf-8") as f:
                     json.dump({"tag": tag, "n": self.n}, f)
                 return 0
@@ -78,6 +80,12 @@ class ResumeShardsTest(unittest.TestCase):
             self.translate(3, tag="a", crash={1})
         self.assertFalse(os.path.exists(self.part(1)))
         self.assertEqual(self.translate(3, tag="b"), [1])
+
+    def test_a_shard_with_a_missing_marker_is_retried_alone(self) -> None:
+        self.translate(3, tag="a")
+        os.remove(os.path.join(self.spirv, "shard1.json"))
+        self.assertEqual(self.translate(3, tag="b"), [1])
+        self.assertEqual([self.tag(i) for i in range(3)], ["a", "b", "a"])
 
     def test_another_jobs_count_translates_everything_again(self):
         self.translate(3, tag="a")

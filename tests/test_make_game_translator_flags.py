@@ -78,6 +78,8 @@ class TranslateFallbacksTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as spirv:
             self.shards_in(spirv, fallbacks=ALL_FLAGS)           # writes the plan
             for i in range(2):                                   # as if the shards had finished
+                with open(os.path.join(spirv, f"shard{i}.json"), "w", encoding="utf-8") as f:
+                    json.dump({"index": i, "count": 2}, f)
                 with open(os.path.join(spirv, f"index.part{i}.json"), "w", encoding="utf-8") as f:
                     json.dump({"old": True}, f)
             again = self.shards_in(spirv, fallbacks=ALL_FLAGS)
