@@ -1848,6 +1848,11 @@ int compare_format_support(ID3D12Device* ours, const rt::d3d12::VulkanDeviceInfo
             continue;
         }
         ++compared;
+        if ((f == DXGI_FORMAT_R8G8B8A8_UNORM || f == DXGI_FORMAT_B8G8R8A8_UNORM ||
+             f == DXGI_FORMAT_B8G8R8X8_UNORM || f == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB ||
+             f == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB || f == DXGI_FORMAT_B8G8R8X8_UNORM_SRGB) &&
+            ((o1 ^ h1) & D3D12_FORMAT_SUPPORT1_BUFFER))
+            fail(f, "buffer support differs from host", o1, o2, h1, h2);
         if (o1 & format_rules & ~h1) fail(f, "1D, 3D, depth-stencil or MIP the host doesn't have", o1, o2, h1, h2);
         if (o2 & any_atomic & ~h2) fail(f, "UAV atomics the host doesn't have", o1, o2, h1, h2);
         if (integer_format(DXGI_FORMAT(f)) && (o1 & filtered))
@@ -4123,6 +4128,15 @@ int main() {
 
         const int options_mismatches = compare_feature_options(device.p, info);
         EXPECT(options_mismatches == 0);
+        // Uncompressed 8-bit sRGB formats support texture reads but cannot type a D3D12 buffer view.
+        for (DXGI_FORMAT format : {DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, DXGI_FORMAT_B8G8R8A8_UNORM_SRGB,
+                                   DXGI_FORMAT_B8G8R8X8_UNORM_SRGB}) {
+            D3D12_FEATURE_DATA_FORMAT_SUPPORT support{format};
+            EXPECT(SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &support, sizeof(support))));
+            EXPECT(!(support.Support1 & D3D12_FORMAT_SUPPORT1_BUFFER));
+            EXPECT(support.Support1 & D3D12_FORMAT_SUPPORT1_SHADER_LOAD);
+            EXPECT(support.Support1 & D3D12_FORMAT_SUPPORT1_TEXTURE2D);
+        }
         const int format_support_mismatches = compare_format_support(device.p, info);
         EXPECT(format_support_mismatches == 0);
         {
