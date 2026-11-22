@@ -2996,6 +2996,32 @@ class Gen:
             if code is None or code not in self.FORMATS:
                 raise Unsupported(op + " " + name)
             self.buffer_load_format(op[1:], a, mods, fixed_fmt=code)
+        elif op in ("s_bitset0_b64", "s_bitset1_b64"):
+            # D[S0 & 63] = 0 / 1 in the SGPR pair D (D is both source and destination); SCC is not written. The pair
+            # is 64-bit data (as for s_lshl_b64); a pair that lane_masks.py marks as a lane mask stays Unsupported.
+            d = a[0]
+            if d["k"] != "sgpr" or d.get("n") != 2 or self.holds_lane_mask(d):
+                raise Unsupported(op + " destination")
+            b = self.src_u(a[1])
+            m, low, bit, sh = self.tmp(), self.tmp(), self.tmp(), self.tmp()
+            self.emit(f"{m} = OpBitwiseAnd %uint {b} {self.cu(63)}")
+            self.emit(f"{low} = OpULessThan %bool {m} {self.cu(32)}")
+            self.emit(f"{bit} = OpBitwiseAnd %uint {m} {self.cu(31)}")
+            self.emit(f"{sh} = OpShiftLeftLogical %uint {self.cu(1)} {bit}")
+            for half in (0, 1):
+                old, want, mk, r = self.tmp(), self.tmp(), self.tmp(), self.tmp()
+                self.emit(f"{old} = OpCopyObject %uint {self.load_reg('sgpr', d['r'] + half)}")
+                # The bit lands in this half when (m < 32) matches (half == 0).
+                if half == 0:
+                    self.emit(f"{mk} = OpSelect %uint {low} {sh} {self.cu(0)}")
+                else:
+                    self.emit(f"{mk} = OpSelect %uint {low} {self.cu(0)} {sh}")
+                if op == "s_bitset1_b64":
+                    self.emit(f"{r} = OpBitwiseOr %uint {old} {mk}")
+                else:
+                    self.emit(f"{want} = OpNot %uint {mk}")
+                    self.emit(f"{r} = OpBitwiseAnd %uint {old} {want}")
+                self.store_reg("sgpr", d["r"] + half, r)
         elif op == "s_bitset1_b32":
             # sD |= 1 << (src & 31)   (sD is both source and destination)
             b = self.src_u(a[1])
