@@ -175,6 +175,18 @@ if(WIN32)
   target_link_options(xmem_test PRIVATE /OPT:NOREF)
   target_link_libraries(xmem_test PRIVATE psapi)
 
+  # The process shim's command line: GetCommandLineW must parse (CommandLineToArgvW) back to its __wargv.
+  add_executable(process_cmdline_test
+    test/process_cmdline_test.cpp
+    shims/process.cpp
+    shims/registry.cpp
+  )
+  target_include_directories(process_cmdline_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims)
+  target_compile_definitions(process_cmdline_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_compile_options(process_cmdline_test PRIVATE /W4 /permissive- /utf-8)
+  target_link_options(process_cmdline_test PRIVATE /OPT:NOREF)
+  target_link_libraries(process_cmdline_test PRIVATE shell32)
+
   # Offline GDK runtime shim (XGameRuntime, XSystem, XTaskQueue, XAsync), driven through the shim registry the way
   # a title calls it at boot. Like xmem_test it compiles its own registry.cpp.
   add_executable(xgameruntime_test
@@ -504,6 +516,9 @@ if(BUILD_TESTING)
   endif()
   if(WIN32 AND TARGET xmem_test)
     add_test(NAME xmem COMMAND xmem_test)
+  endif()
+  if(WIN32 AND TARGET process_cmdline_test)
+    add_test(NAME process_cmdline COMMAND process_cmdline_test)
   endif()
   if(WIN32 AND TARGET xgameruntime_test)
     add_test(NAME xgameruntime COMMAND xgameruntime_test)

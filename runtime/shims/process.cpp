@@ -44,17 +44,25 @@ HANDLE g_done = nullptr;
 std::string quote(const std::string& a) {
     if (!a.empty() && a.find_first_of(" \t\"") == std::string::npos) return a;
     std::string out = "\"";
+    size_t slashes = 0;  // CommandLineToArgvW: backslashes are literal unless they precede a quote
     for (char c : a) {
-        if (c == '"') out += '\\';
+        if (c == '\\') {
+            ++slashes;
+        } else {
+            if (c == '"') out.append(slashes + 1, '\\');
+            slashes = 0;
+        }
         out += c;
     }
-    return out + "\"";
+    return out.append(slashes, '\\') + "\"";  // a trailing run is doubled before the closing quote
 }
 
+// The narrow arguments are ANSI code page text (main.cpp passes std::filesystem::path::string(), and the CRT's
+// narrow argv is ACP too); under a UTF-8 activeCodePage CP_ACP is UTF-8 anyway.
 std::wstring widen(const std::string& s) {
-    int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, nullptr, 0);
+    int n = MultiByteToWideChar(CP_ACP, 0, s.c_str(), -1, nullptr, 0);
     std::wstring w(n > 0 ? n - 1 : 0, L'\0');
-    if (n > 1) MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, w.data(), n);
+    if (n > 1) MultiByteToWideChar(CP_ACP, 0, s.c_str(), -1, w.data(), n);
     return w;
 }
 
