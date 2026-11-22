@@ -4019,9 +4019,10 @@ class Gen:
             self.emit(f"{c2} = OpCompositeExtract %uint {s2} 1")
             self.emit(f"{carry} = OpBitwiseOr %uint {c1} {c2}")
             self.dst(vd, r)
-            m = self.tmp()
-            self.emit(f"{m} = OpSelect %uint {self.tmp_bool_nz(carry)} {self.cu(0xFFFFFFFF)} {self.cu(0)}")
             if not (cd["k"] == "special" and cd["t"] == "null"):
+                cm, m = self.tmp(), self.tmp()
+                self.emit(f"{cm} = OpLogicalAnd %bool {self.tmp_bool_nz(carry)} {self.active_b()}")  # inactive lanes write 0
+                self.emit(f"{m} = OpSelect %uint {cm} {self.cu(0xFFFFFFFF)} {self.cu(0)}")
                 self.mask_dst(cd, m)
         elif op == "v_mul_legacy_f32":
             # Legacy multiply treats 0 * anything (inf/NaN included) as 0.
@@ -4795,8 +4796,9 @@ class Gen:
             self.dst({"k": "vgpr", "r": vd["r"], "n": 1}, r_lo)
             self.dst({"k": "vgpr", "r": vd["r"] + 1, "n": 1}, r_hi)
             if not (sd["k"] == "special" and sd["t"] == "null"):
-                m = self.tmp()
-                self.emit(f"{m} = OpSelect %uint {self.tmp_bool_nz(bit64)} {self.cu(0xFFFFFFFF)} {self.cu(0)}")
+                bm, m = self.tmp(), self.tmp()
+                self.emit(f"{bm} = OpLogicalAnd %bool {self.tmp_bool_nz(bit64)} {self.active_b()}")  # inactive lanes write 0
+                self.emit(f"{m} = OpSelect %uint {bm} {self.cu(0xFFFFFFFF)} {self.cu(0)}")
                 self.mask_dst(sd, m)
         elif op in ("v_mad_u32_u16", "v_mad_i32_i16"):
             # D = S0.half * S1.half + S2 (RDNA ISA pseudocode), wrapping at 32 bits: the 16-bit halves zero-extended
