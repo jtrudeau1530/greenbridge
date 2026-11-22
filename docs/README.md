@@ -45,7 +45,7 @@ method, scope and caveats. No game data is included.
 
 | Document | Measured content |
 |---|---|
-| [audio.md](audio.md) | AWC banks: Opus, PCM and XMA2; lossless Ogg Opus repack and WAV paths; stream names from dictionary hits with a salted control. |
+| [audio.md](audio.md) | AWC banks: Opus, PCM and XMA2; lossless Ogg Opus repack and WAV paths; stream names from dictionary hits with a salted control; names and subtitles written into the Ogg Opus tags. |
 | [rsc8_audio.md](rsc8_audio.md) | 641,428 `RSC8` v8001 resources across 4 archives: 100% AWC tag `0x5c` facial/lip-sync `crClipDictionary` paired with 48 kHz mono Opus dialogue, 0 hidden audio containers. |
 | [audio.md](audio.md) | AWC banks: Opus, PCM and XMA2; lossless Ogg Opus repack and WAV paths. |
 | [rsc8_audio.md](rsc8_audio.md) | 641,428 `RSC8` v8001 resources across 4 archives: 100% AWC tag `0x5c` facial/lip-sync `crClipDictionary` paired with 48 kHz mono Opus dialogue, 0 hidden audio containers; the undocumented `0x5a`/`0xd9` companion tags (1,185 `audio.rpf` streams) decoded structurally. |
