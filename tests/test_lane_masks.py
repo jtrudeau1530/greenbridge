@@ -115,7 +115,8 @@ def test_masks_through_a_vgpr():
     blocks = [masks + via + [use]]
     got, writes = L.analyse(blocks, [[]])
     assert set(got[id(use)]) == {3, 47, ("v", 51)}
-    assert writes == {id(via[0]), id(via[1])}
+    # Only the v_or3 is a mask write: the v_mov copy is an ordinary VALU write (SHADER-21 part 2).
+    assert writes == {id(via[1])}
     # Mixed with data, or with the VGPR written by anything else in between, it is data.
     data = ins("s_buffer_load_dword", s(47), s(0, 4), imm(0))
     assert masks_at_last([[masks[0], data] + via + [use]], [[]]) == set()
@@ -123,6 +124,20 @@ def test_masks_through_a_vgpr():
     # A constant alone does not make a VGPR a mask (v_mov_b32 v, 0 is everywhere).
     blocks = [[ins("v_mov_b32_e32", v(51), imm(0)), ins("v_readfirstlane_b32", s(3), v(51)), use]]
     assert L.analyse(blocks, [[]]) == ({id(i): {} for i in blocks[0]}, set())
+
+
+def test_vmov_mask_copy_is_exec_gated():
+    # SHADER-21 part 2: a mask copied into a VGPR with v_mov_b32 is an ordinary
+    # VALU write, so inactive lanes keep the old VGPR; only per-lane mask
+    # computations (v_or3_b32 etc.) take the all-lanes store.
+    cmp_ = ins("v_cmp_lt_u32_e64", sp("vcc_lo"), v(5), v(6))
+    copy = ins("v_mov_b32_e32", v(2), sp("vcc_lo"))
+    calc = ins("v_or3_b32", v(3), sp("vcc_lo"), sp("vcc_lo"), sp("vcc_lo"))
+    use = ins("s_bcnt1_i32_b64", s(8), s(6, 2))
+    blocks = [[cmp_, copy, calc, use]]
+    got, writes = L.analyse(blocks, [[]])
+    assert ("v", 2) in got[id(use)] and ("v", 3) in got[id(use)]
+    assert writes == {id(calc)}
 
 
 def test_bfm64_and_half_kinds():
@@ -176,6 +191,7 @@ if __name__ == "__main__":
     test_joins()
     test_parked_masks()
     test_masks_through_a_vgpr()
+    test_vmov_mask_copy_is_exec_gated()
     test_bfm64_and_half_kinds()
     test_b64_mask_imm_and_include_either()
     print("ok")

@@ -11,7 +11,7 @@ instruction says which of the two it has, so this module works it out from what 
     masks[id(ins)]                      # dict mapping each register holding a lane mask on every path to ins
                                         # (SGPR number, "vcc", ("lane", vgpr, lane) parked in a VGPR lane, or
                                         # ("v", vgpr) passing through a VGPR) to its kind (MASK, MASK_LO, MASK_HI)
-    id(ins) in writes                   # ins writes a mask to a VGPR
+    id(ins) in writes                   # ins computes a mask into a VGPR (a plain copy does not count)
 
 A register counts as a mask only if every path to the instruction wrote a mask to it. Anything else is treated
 as data, which is what the translator did for all of them before.
@@ -23,7 +23,9 @@ lane's bit again, not the bit of the lane it was parked in.
 Masks through a VGPR: the compiler does some scalar work in the vector unit, such as an OR of three SGPRs
 (v_mov_b32 / v_or3_b32, then v_readfirstlane_b32 to get the scalar back). On hardware every lane computes the same
 whole mask and the first lane's copy is read. Here each lane computes its own bit, so it has to read its own
-copy, and it has to compute it whether or not it is active.
+copy, and it has to compute it whether or not it is active. A plain copy of a mask (v_mov_b32) is different:
+it moves an already-computed value, so it is an ordinary VALU write and inactive lanes keep the old VGPR
+(SHADER-21 part 2).
 """
 
 MASK = "mask"           # full lane mask (64-bit pair, vcc, or wave32 single register)
@@ -143,7 +145,10 @@ def step(state, ins):
         if None not in kinds and any(k in MASK_KINDS for k in kinds):
             ms = {k for k in kinds if k in MASK_KINDS}
             state[("v", a[0]["r"])] = ms.pop() if len(ms) == 1 else MASK
-            return True
+            # A plain copy (v_mov_b32) is an ordinary VALU write: inactive lanes keep the old
+            # VGPR (SHADER-21 part 2). Only per-lane mask computations take the all-lanes store,
+            # because whole-wave readers (wave_mask, v_readfirstlane) read every lane's bit.
+            return op != "v_mov_b32"
     if "_saveexec_b" in op or "_wrexec_b" in op or op == "s_bfm_b64":
         put(state, a[0], MASK)
     elif op.startswith(COPIES) and len(a) > 1:
