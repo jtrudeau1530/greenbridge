@@ -11458,12 +11458,26 @@ def translate(path):
         size = (g.cs or g.ms)["size"]
         g.x_lanes = -(-size[0] * size[1] * size[2] // 64) * 64
     insns = fold_far_branches(insns)
+    branchy = any(base_op(i["op"]) in BRANCHES for i in insns)
     if stage == "ps":
         g.v_interp_copy = interp_copy_sources(insns)   # before v_interp runs: I/J guards (SHADER-177)
         # SHADER-177: annotate v_interp sites whose I/J operand is a computed pair, and let those
         # attributes be read per-vertex (attribute() weights them with the operand values).
         g.per_vertex |= interp_ij_analysis(insns, g)
-    branchy = any(base_op(i["op"]) in BRANCHES for i in insns)
+        if any("ij" in i for i in insns):
+            # Computed v_interp sites load their I/J VGPRs at runtime; no_bary above stripped all
+            # v_interp sources, so an untouched (or conditionally written) v0/v1 still needs
+            # BaryCoordKHR loaded into %vgpr[0]/%vgpr[1] in the prologue.
+            with_ij = [dict(i, args=[x for k, x in enumerate(i["args"])
+                                     if not (i["op"].startswith("v_interp") and "ij" not in i
+                                             and x["k"] == "vgpr" and k != 0)])
+                       for i in insns]
+            ij_reads = read_before_write_vgprs(with_ij)
+            ij_used = {r for i in insns if "ij" in i for r in i["ij"][2:]} if branchy else set()
+            for r, comp in ((0, "bary_i"), (1, "bary_j")):
+                if (r in ij_reads or r in ij_used) and r not in g.frag_inputs:
+                    g.frag_inputs[r] = comp
+                    g.cu(r)
     if any(base_op(i["op"]) in BRANCHES and not i.get("enc") for i in insns):
         # A branch target is relative to the next PC, which needs the branch's `; encoding:` bytes (missing in a
         # hand-written listing). Until 2026-11-22 this was a TypeError in next_pc.
