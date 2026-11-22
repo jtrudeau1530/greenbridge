@@ -93,10 +93,10 @@ function fixture(count = 1) {
         },
         scene: { add: obj => added.push(obj), remove() {} },
         camera: { position: { x: 0, y: 0, z: 0 } },
-        world: { chunks: Array.from({ length: count }, (_, i) => ({
+        world: { test: false, chunks: Array.from({ length: count }, (_, i) => ({
             id: `chunk_${i}`, url: `${i}.glb`, bounds: [i, 0, 0, i + 1, 1, 1],
         })) },
-        buildTestChunk: () => ({ traverse() {} }),
+        buildTestChunk: ([x, z, size]) => ({ x, z, size, traverse() {} }),
     });
     vm.runInContext(source, context);
     added.length = 0; // Ignore the viewer's bounds-helper group.
@@ -330,8 +330,26 @@ test('canceling a retry preserves the failures already counted', async () => {
     assert.equal(f.state.failed, 3);
 });
 
+test('manifest chunks with test metadata still load their GLB', async t => {
+    const cases = [['truthy flag', true], ['terrain-like tuple', [0, 0, 256]]];
+    for (const [label, value] of cases) {
+        await t.test(label, async () => {
+            const f = fixture();
+            const chunk = { ...worldChunk, test: value };
+            f.context.world = await loadWorld(manifestResponse({ spawn: [0, 0, 0], chunks: [chunk] }));
+            f.frame();
+            assert.deepEqual(f.requests.map(request => request.url), [chunk.url]);
+            const object = f.object();
+            await f.succeed(0, object);
+            assert.equal(f.state.live.get(chunk.id).obj, object);
+            assert.deepEqual(f.added, [object]);
+        });
+    }
+});
+
 test('generated test terrain loads without network requests', () => {
     const f = fixture();
+    f.context.world.test = true;
     f.context.world.chunks[0].test = [0, 0, 256];
     f.frame(); f.frame();
     assert.equal(f.requests.length, 0);
