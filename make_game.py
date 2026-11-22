@@ -87,11 +87,13 @@ def below_normal() -> None:
         k32.SetPriorityClass(k32.GetCurrentProcess(), 0x00004000)
 
 
-def run(args: list, hint: str = "", **kw) -> None:
+def run(args: list, hint: str = "", check: bool = True, **kw) -> int:
+    """Run a command, logging it. A non-zero exit stops the build unless check is False; returns the exit code."""
     log("  " + " ".join(os.path.basename(str(a)) if i == 0 else str(a) for i, a in enumerate(args)))
     r = subprocess.run([str(a) for a in args], **kw)
-    if r.returncode != 0:
+    if check and r.returncode != 0:
         fail(f"{os.path.basename(str(args[0]))} exited with {r.returncode}" + (f". {hint}" if hint else ""))
+    return r.returncode
 
 
 def py(tool: str, *args) -> None:
@@ -1384,9 +1386,98 @@ def pipelines(work: str, out: str, jobs: "int | None" = None) -> None:
         fail("No translated shaders yet: run the shaders stage first.")
     log("pipelines: creating every shader module and compute pipeline on this GPU")
     os.makedirs(out, exist_ok=True)
+    cache = os.path.join(out, "pipeline_cache.bin")
+    inflight = os.path.join(out, "pipeline_inflight.txt")
+    skip = os.path.join(out, "pipeline_crashes.txt")
+    drop(inflight, skip)   # every module gets a fresh chance on each run (a new translator may have fixed it)
     # --jobs: make_game.py's own; without it vk_pipeline_check uses half the hardware threads whatever was asked
-    run([exe, spirv, os.path.join(out, "pipeline_cache.bin"), *(["--jobs", str(jobs)] if jobs else [])])
+    base = [exe, spirv, cache, *(["--jobs", str(jobs)] if jobs else [])]
+    if not checker_supports(exe, "--inflight-file", "--skip-file"):
+        # An older build takes any argument it doesn't know as the cache path, so it would write the cache into
+        # pipeline_inflight.txt and exit 0. Run it as before: a module that kills it stops the stage.
+        log("pipelines: this vk_pipeline_check has no --inflight-file; rebuild the runtime stage so a module that "
+            "crashes the driver is skipped instead of stopping the stage")
+        run(base)
+        log("pipelines: done")
+        return
+    base += ["--inflight-file", inflight]
+    crashed: "list[str]" = []
+    code = 0
+    for _ in range(PIPELINE_CRASH_RETRIES + 1):
+        code = run(base + (["--skip-file", skip] if crashed else []), check=False)
+        if code in (0, 1, 2) or interrupted(code):
+            break
+        # The driver took vk_pipeline_check down. Name the module it was compiling and check the rest without it:
+        # what was already compiled comes back from pipeline_cache.bin, saved every 10 minutes.
+        suspects = [n for n in read_names(inflight) if n not in crashed]
+        if len(suspects) > 1:   # several were compiling: keep the ones that also kill it on their own
+            suspects = [n for n in suspects if crashes_alone(exe, spirv, cache, n)]
+        if not suspects:
+            fail(f"vk_pipeline_check exited with {exit_label(code)} while no module could be named as the cause; "
+                 "run the pipelines stage again, and report it if it keeps happening")
+        for n in suspects:
+            log(f"pipelines: {n} took vk_pipeline_check down ({exit_label(code)}); checking the rest without it")
+        crashed += suspects
+        with open(skip, "w", encoding="utf-8") as f:
+            f.write("".join(n + "\n" for n in crashed))
+    else:
+        fail(f"vk_pipeline_check still crashed after {PIPELINE_CRASH_RETRIES} retries; modules that took it down: "
+             + ", ".join(crashed))
+    drop(inflight)
+    if code != 0:
+        why = f"; {len(crashed)} module(s) took the driver down and were counted as failed: " + ", ".join(crashed) \
+            if crashed else ""
+        fail(f"vk_pipeline_check exited with {exit_label(code)}{why}")
     log("pipelines: done")
+
+
+# How many times the pipelines stage restarts vk_pipeline_check after a module takes it down (each costs at most the
+# 10 minutes since the last cache checkpoint, plus loading the cache).
+PIPELINE_CRASH_RETRIES = 5
+
+
+def interrupted(code: int) -> bool:
+    """Ctrl+C or a kill, not a crash: SIGINT/SIGTERM off Windows, STATUS_CONTROL_C_EXIT on it."""
+    return code in (-2, -15) or (code & 0xFFFFFFFF) == 0xC000013A
+
+
+def exit_label(code: int) -> str:
+    """An exit code as Windows writes it (0x80000003 for an LLVM abort in the driver), or the signal off Windows."""
+    if code < 0:
+        return f"signal {-code}"
+    return f"{code} ({code:#010x})" if code > 255 else str(code)
+
+
+def checker_supports(exe: str, *options: str) -> bool:
+    """Whether this vk_pipeline_check build knows the options: run without arguments, it prints its usage (and exits
+    2) before touching Vulkan. Builds before --inflight-file don't reject unknown arguments, so asking is the only way
+    to tell."""
+    try:
+        r = subprocess.run([exe], capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    usage = (r.stdout or "") + (r.stderr or "")
+    return all(o in usage for o in options)
+
+
+def read_names(path: str) -> "list[str]":
+    """The module names in vk_pipeline_check's --inflight-file ("name<TAB>phase" lines)."""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            return [n for n in (line.split("\t", 1)[0].strip() for line in f) if n]
+    except OSError:
+        return []
+
+
+def crashes_alone(exe: str, spirv: str, cache: str, name: str) -> bool:
+    """Whether one module takes vk_pipeline_check down on its own: --start/--count select it in the checker's
+    name-sorted index (byte order, as its std::map)."""
+    with open(os.path.join(spirv, "index.json"), encoding="utf-8") as f:
+        names = sorted(json.load(f), key=lambda n: n.encode("utf-8"))
+    if name not in names:
+        return False
+    code = run([exe, spirv, cache, "--jobs", "1", "--start", str(names.index(name)), "--count", "1"], check=False)
+    return code not in (0, 1, 2) and not interrupted(code)
 
 
 def main() -> int:
