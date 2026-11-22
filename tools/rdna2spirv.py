@@ -100,6 +100,7 @@ class Gen:
         self.outputs = {}
         self.inputs = {}
         self.interpolated = set()   # inputs read through v_interp_p1/p2; the rest are flat (v_interp_mov only)
+        self.per_vertex = set()     # PS: attribute numbers read by a *_f16 interp: PerVertexKHR, decoded per half
         self.uses_psb = False
         self.uses_active = False
         self.uses_perm = False     # emulate: ds_permute_b32 parks its winning source lane in %x_perm
@@ -4611,7 +4612,10 @@ class Gen:
             attr = next((x for x in a if x["k"] == "attr"), None)
             if attr is None or self.stage != "ps":
                 raise Unsupported(op + " form")
-            f = self.attribute(attr["a"], attr["c"])
+            # `high` (on both ops of the pair) selects the upper f16 of the packed channel (Mesa ACO
+            # emit_interp_instr passes high_16bits to p1ll and p2). Under --bary-fallback there are no per-vertex
+            # inputs, so the old smooth-f32 read stands and `high` cannot be told apart (docs/design.md).
+            f = self.attribute(attr["a"], attr["c"], half=1 if "high" in mods else 0)
             if op == "v_interp_p2_f16":
                 # VOP3 clamp applies to the f16 result (ACO: dst(F16); llvm-mc takes clamp but no omod on this op).
                 # Until 2026-11-22 it was dropped.
@@ -6001,16 +6005,47 @@ class Gen:
                 self.dst({"k": "vgpr", "r": vdata["r"] + out, "n": 1}, self.tou(comp))
                 out += 1
 
-    def attribute(self, n, comp, flat=False):
-        """Component `comp` of fragment input attribute n (declared as a vec4 Input at Location n)."""
+    def attribute(self, n, comp, flat=False, half=None):
+        """Component `comp` of fragment input attribute n (declared as a vec4 Input at Location n).
+
+        An attribute in per_vertex (read by a *_f16 interp somewhere) is a PerVertexKHR vec4[3] of the producer's
+        raw 32-bit words, which hold two f16 (low, high). `half` 0/1 decodes that f16 of each vertex, None keeps the
+        word as an f32; the three values are then weighted as AMD does, P0 + i(P1 - P0) + j(P2 - P0) with i, j =
+        BaryCoordKHR.y, .z, or vertex 0's taken when `flat`."""
         name = f"%in_attr{n}"
         self.inputs[name] = n
         if not flat:
             self.interpolated.add(name)
-        p, v = self.tmp(), self.tmp()
-        self.emit(f"{p} = OpAccessChain %_ptr_Input_float {name} {self.cu(comp)}")
-        self.emit(f"{v} = OpLoad %float {p}")
-        return v
+        if n not in self.per_vertex:
+            p, v = self.tmp(), self.tmp()
+            self.emit(f"{p} = OpAccessChain %_ptr_Input_float {name} {self.cu(comp)}")
+            self.emit(f"{v} = OpLoad %float {p}")
+            return v
+        self.cu(3)      # the array length
+        pv = []
+        for k in range(1 if flat else 3):
+            p, v = self.tmp(), self.tmp()
+            self.emit(f"{p} = OpAccessChain %_ptr_Input_float {name} {self.cu(k)} {self.cu(comp)}")
+            self.emit(f"{v} = OpLoad %float {p}")
+            if half is not None:
+                h2, w = self.tmp(), self.tmp()
+                self.emit(f"{h2} = OpExtInst %v2float %glsl UnpackHalf2x16 {self.tou(v)}")
+                self.emit(f"{w} = OpCompositeExtract %float {h2} {half}")
+                v = w
+            pv.append(v)
+        if flat:
+            return pv[0]
+        bc, i, j, d1, d2, m1, m2, s, r = (self.tmp() for _ in range(9))
+        self.emit(f"{bc} = OpLoad %v3float %bary")
+        self.emit(f"{i} = OpCompositeExtract %float {bc} 1")
+        self.emit(f"{j} = OpCompositeExtract %float {bc} 2")
+        self.emit(f"{d1} = OpFSub %float {pv[1]} {pv[0]}")
+        self.emit(f"{d2} = OpFSub %float {pv[2]} {pv[0]}")
+        self.emit(f"{m1} = OpFMul %float {d1} {i}")
+        self.emit(f"{s} = OpFAdd %float {pv[0]} {m1}")
+        self.emit(f"{m2} = OpFMul %float {d2} {j}")
+        self.emit(f"{r} = OpFAdd %float {s} {m2}")
+        return r
 
     def texel_offset_fold(self, img, si, uv, off, n_off, ncoord, kind, implicit, lod, bias):
         """--texel-offset-fallback: return (uv + offset / size of the sampled level, implicit-LOD gradients or None).
@@ -6713,14 +6748,14 @@ def assemble(gen):
         if gen.uses_viewport:
             iface += ["%out_viewport"]
     iface += [f"%vin{reg}" for reg, _ in gen.vertex_inputs] + ["%user_data"]
-    bary = any(str(c).startswith("bary") for c in gen.frag_inputs.values())
+    bary = any(str(c).startswith("bary") for c in gen.frag_inputs.values()) or bool(gen.per_vertex)
     # --bary-fallback: %bary is a plain input at the lowest location no attribute uses, so no capability or
     # extension. Lowest free, not one past the highest: a PS whose only input is attr30 would otherwise put it at 31,
     # past what drivers with 128 input components accept (#804 review).
     used = set(gen.inputs.values())
     gen.bary_location = next(n for n in range(len(used) + 1) if n not in used) if bary and BARY_FALLBACK else None
     bary_builtin = bary and gen.bary_location is None
-    if gen.frag_inputs:
+    if gen.frag_inputs or bary:
         iface += ["%frag_coord"] + (["%front_facing"] if "front" in gen.frag_inputs.values() else []) +             (["%bary"] if bary else [])
     for i in range(USER_SGPRS):          # index constants for the user-data copy at entry
         gen.cu(i)
@@ -6839,7 +6874,9 @@ def assemble(gen):
             dec.append(f"OpDecorate {name} Location {int(''.join(ch for ch in tgt if ch.isdigit()))}")
     for name, n in gen.inputs.items():
         dec.append(f"OpDecorate {name} Location {n}")
-        if name not in gen.interpolated:
+        if n in gen.per_vertex:
+            dec.append(f"OpDecorate {name} PerVertexKHR")
+        elif name not in gen.interpolated:
             dec.append(f"OpDecorate {name} Flat")
     types = ["%void = OpTypeVoid", "%fn = OpTypeFunction %void", "%bool = OpTypeBool", "%uint = OpTypeInt 32 0",
              "%int = OpTypeInt 32 1", "%float = OpTypeFloat 32", "%v4float = OpTypeVector %float 4",
@@ -7049,7 +7086,7 @@ def assemble(gen):
             types += [f"%lds_arr = OpTypeArray %uint {gen.cu(gen.lds_dwords)}",
                       "%_ptr_WG_lds = OpTypePointer Workgroup %lds_arr", "%_ptr_WG_uint = OpTypePointer Workgroup %uint"]
             gvars += ["%lds = OpVariable %_ptr_WG_lds Workgroup"]
-    if gen.frag_inputs:
+    if gen.frag_inputs or bary:
         dec += ["OpDecorate %frag_coord BuiltIn FragCoord"]
         gvars += ["%frag_coord = OpVariable %_ptr_Input_v4 Input"]
         if "front" in gen.frag_inputs.values():
@@ -7090,7 +7127,10 @@ def assemble(gen):
                 gvars += ["%out_layer = OpVariable %_ptr_Output_int Output"]
             if gen.uses_viewport:
                 gvars += ["%out_viewport = OpVariable %_ptr_Output_int Output"]
-    gvars += [f"{n} = OpVariable %_ptr_Input_v4 Input" for n in gen.inputs]
+    if gen.per_vertex:      # the three vertices' raw words of a location a *_f16 interp reads (Gen.attribute)
+        types += [f"%arr_pv4 = OpTypeArray %v4float {gen.cu(3)}", "%_ptr_Input_pv4 = OpTypePointer Input %arr_pv4"]
+    gvars += [f"{n} = OpVariable {'%_ptr_Input_pv4' if k in gen.per_vertex else '%_ptr_Input_v4'} Input"
+              for n, k in gen.inputs.items()]
     if sg:
         gvars += ["%sg_lane = OpVariable %_ptr_Input_uint Input"]
     if tex:
@@ -7891,6 +7931,10 @@ def translate(path):
         if unexplained:
             raise Unsupported("PS system inputs")
         g.frag_inputs = layout
+        if not BARY_FALLBACK:
+            g.per_vertex = {x["a"] for i in insns if base_op(i["op"]) in ("v_interp_p1ll_f16", "v_interp_p1lv_f16",
+                                                                          "v_interp_p2_f16")
+                            for x in i["args"] if x["k"] == "attr"}
         for r in layout:
             g.cu(r)
         # FSSM pixel-input table (tools/fssm_header.py): the authoritative interpolant list. Position i of the
