@@ -5186,6 +5186,30 @@ class Gen:
         finally:
             self.dpp_guard = previous
 
+    def permute_known_selector(self, src0, src1, selector):
+        """Emit only the selected bytes of V_PERM_B32 when S2 is known."""
+        if selector == 0x03020100:
+            return src1
+        if selector == 0x07060504:
+            return src0
+
+        bytes_ = [(selector >> offset) & 0xFF for offset in range(0, 32, 8)]
+        out = self.cu(sum(0xFF << (8 * i) for i, code in enumerate(bytes_) if code > 12))
+        for i, code in enumerate(bytes_):
+            if code >= 12:
+                continue                              # Zero or 0xFF is already in out.
+            byte, result = self.tmp(), self.tmp()
+            if code < 8:
+                src = src1 if code < 4 else src0
+                self.emit(f"{byte} = OpBitFieldUExtract %uint {src} {self.cu(8 * (code & 3))} {self.cu(8)}")
+            else:
+                src = src1 if code < 10 else src0
+                sign = 15 + 16 * (code & 1)
+                self.emit(f"{byte} = OpBitFieldSExtract %uint {src} {self.cu(sign)} {self.cu(1)}")
+            self.emit(f"{result} = OpBitFieldInsert %uint {out} {byte} {self.cu(8 * i)} {self.cu(8)}")
+            out = result
+        return out
+
     def _insn(self, ins):
         op, a, mods = base_op(ins["op"]), ins["args"], ins["mods"]
         if op in NOOPS or op.startswith("s_waitcnt"):
@@ -8250,7 +8274,12 @@ class Gen:
             # {src0, src1}, RDNA2 ISA reference, V_PERM_B32); 12 -> 0x00, >=13 -> 0xFF.
             # Both candidate shifts are (k & 3) * 8, so every shift stays below 32 (SPIR-V leaves larger ones
             # undefined, even on the side of the OpSelect that is discarded).
-            s0, s1, sel = (self.src_u(t) for t in a[1:4])
+            s0, s1 = self.src_u(a[1]), self.src_u(a[2])
+            selector = self.imm_val(a[3])
+            if selector is not None:
+                self.dst(a[0], self.permute_known_selector(s0, s1, selector))
+                return
+            sel = self.src_u(a[3])
             out = self.cu(0)
             for i in range(4):
                 sb, lo_pick, hi_pick, k, b, k3, sh, chosen, inrange, val, shifted, acc = \
