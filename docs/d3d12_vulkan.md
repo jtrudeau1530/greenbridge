@@ -1854,8 +1854,10 @@ The trace will enumerate them.
     blending. `ALLOW_UNORDERED_ACCESS` and `ALLOW_DEPTH_STENCIL` are refused, as on WARP (measured in the test).
     `GetResourceAllocationInfo` gives no size for a description creation refuses. A typed 96-bit texture has
     views of its own format only; the `TYPELESS` one has `FLOAT`, `UINT` and `SINT` views (sampled in
-    `d3d12_descriptor_test`). `GetResourceTiling` reports nothing for a 96-bit texture: the tile shape of a
-    12-byte texel is not measured.
+    `d3d12_descriptor_test`). `GetResourceTiling` reports no tiling for a committed 96-bit texture on both
+    Microsoft WARP and an NVIDIA GTX 1660 SUPER: total tiles, the tile shape and every packed-mip field are zero,
+    and the returned subresource-tiling count is zero (so its output element is untouched). This holds for
+    `FLOAT`, `UINT`, `SINT` and `TYPELESS`; there is no standard tile shape to implement for a 12-byte texel.
 - Resource flags map to Vulkan usage: `ALLOW_RENDER_TARGET` → `COLOR_ATTACHMENT`, `ALLOW_DEPTH_STENCIL` →
   `DEPTH_STENCIL_ATTACHMENT`, `ALLOW_UNORDERED_ACCESS` → `STORAGE`, `ALLOW_SIMULTANEOUS_ACCESS` → concurrent
   sharing, `DENY_*` → omit the corresponding usage. Buffers get the union of usages their states and flags imply;
