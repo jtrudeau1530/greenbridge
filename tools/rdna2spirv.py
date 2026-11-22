@@ -2815,8 +2815,12 @@ class Gen:
         self.emit(f"{hi_in} = OpSelect %uint {low} {self.cu(0)} {v}")
         return lo_in, hi_in
 
-    def mask_src(self, a):
-        """A lane mask operand (sgpr pair, vcc, exec, imm) as one uint for this lane."""
+    def mask_src(self, a, wide=True):
+        """A lane mask operand (sgpr pair, vcc, exec, imm) as one uint for this lane. A constant is a mask with one
+        bit per lane, so lane L takes its bit L: of the 64-bit value (`wide`, the default: a 64-bit SALU operand or
+        the VALU mask of a wave64; inline constants sign-extended, a literal with a zero high word, as src64_data)
+        or of the 32-bit value with L mod 32 (a b32 op). Until 2026-11-22 every lane took bit 0 (0xff00 was no
+        lane, 5 every lane)."""
         if a["k"] == "sgpr":
             return self.load_reg("sgpr", a["r"])
         if a["k"] == "special" and a["t"] in ("vcc", "vcc_lo", "vcc_hi"):
@@ -2826,7 +2830,26 @@ class Gen:
         if a["k"] == "special" and a["t"] in ("exec", "exec_lo", "exec_hi"):
             return self.exec_value()
         if a["k"] == "imm":
-            return self.cu(0xFFFFFFFF if a["v"] & 1 else 0)
+            w64 = wide and self.wave64
+            v = a["v"] & (0xFFFFFFFFFFFFFFFF if w64 else 0xFFFFFFFF)
+            lo, hi = v & 0xFFFFFFFF, v >> 32
+            if lo in (0, 0xFFFFFFFF) and (hi == lo or not w64):
+                return self.cu(lo)              # 0 or -1: no lane or every lane, as before
+            lane = self.wave_lane()
+            sh, word, shr, bit, r = (self.tmp() for _ in range(5))
+            self.emit(f"{sh} = OpBitwiseAnd %uint {lane} {self.cu(31)}")
+            if w64 and hi != lo:
+                up = self.tmp()
+                self.emit(f"{up} = OpUGreaterThanEqual %bool {lane} {self.cu(32)}")
+                self.emit(f"{word} = OpSelect %uint {up} {self.cu(hi)} {self.cu(lo)}")
+            else:
+                self.emit(f"{word} = OpCopyObject %uint {self.cu(lo)}")
+            # Shift and mask, not OpBitFieldUExtract (Intel's driver takes the offset mod 16 for a 16-bit constant;
+            # see exec_half_write).
+            self.emit(f"{shr} = OpShiftRightLogical %uint {word} {sh}")
+            self.emit(f"{bit} = OpBitwiseAnd %uint {shr} {self.cu(1)}")
+            self.emit(f"{r} = OpSelect %uint {self.tmp_bool_nz(bit)} {self.cu(0xFFFFFFFF)} {self.cu(0)}")
+            return r
         raise Unsupported("mask operand")
 
     def is_mask_op(self, x):
@@ -3653,6 +3676,8 @@ class Gen:
                         lo, hi = (hi if half == "hi" else lo), self.cu(0)
             elif op.endswith("b64") and a[1]["k"] == "sgpr" and a[1].get("n") == 2:
                 lo, hi = self.load_reg("sgpr", a[1]["r"]), self.load_reg("sgpr", a[1]["r"] + 1)
+            elif op.endswith("b64") and a[1]["k"] == "imm":
+                lo, hi = self.src64_data(a[1], op)      # a constant's own 64 bits, as s_ff1_i32_b64 reads them
             else:
                 lo, hi = (self.mask_src(a[1]), self.cu(0)) if op.endswith("b64") else (self.src_u(a[1]), self.cu(0))
             if "bcnt0" in op:
@@ -5085,7 +5110,7 @@ class Gen:
         elif op in ("s_and_saveexec_b64", "s_or_saveexec_b64", "s_andn2_saveexec_b64", "s_and_saveexec_b32",
                     "s_or_saveexec_b32", "s_andn2_saveexec_b32"):
             saved = self.exec_value()
-            src = self.mask_src(a[1])
+            src = self.mask_src(a[1], wide=op.endswith("b64"))
             r = self.tmp()
             kind = op[2:].split("_saveexec")[0]
             if kind == "andn2":
@@ -5099,7 +5124,7 @@ class Gen:
             self.scc_from_mask(r)
         elif op in ("s_andn2_wrexec_b64", "s_andn2_wrexec_b32"):
             # RDNA ISA: EXEC = S0 & ~EXEC; D = EXEC; SCC = (EXEC != 0). Two operands: sdst, ssrc0.
-            x, y = self.mask_src(a[1]), self.exec_value()
+            x, y = self.mask_src(a[1], wide=op.endswith("b64")), self.exec_value()
             n, r = self.tmp(), self.tmp()
             self.emit(f"{n} = OpNot %uint {y}")
             self.emit(f"{r} = OpBitwiseAnd %uint {x} {n}")
