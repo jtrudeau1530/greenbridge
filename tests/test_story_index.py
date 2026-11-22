@@ -113,9 +113,10 @@ def bink():
     return bytes(data)
 
 
-PAYLOADS = [psin(), page(), rsc8(), nested(), rbf0(), chunks(), clip(), xml(), raw(), zero(), text(), bink()]
+PAYLOADS = [psin(), page(), rsc8(), nested(), rbf0(), chunks(), clip(), aux([(0x101, 40), (0x207, 20)]),
+            xml(), raw(), zero(), text(), bink()]
 EXPECTED = ["psin", "page-directory", "rsc8", "rpf9-nested", "rbf0", "typehash", "clip-stream",
-            "xml", "raw:11223344", "zero-prefix", "text", "bink2"]
+            "clip-stream", "xml", "raw:11223344", "zero-prefix", "text", "bink2"]
 
 
 class ClassifyTest(unittest.TestCase):
@@ -346,6 +347,9 @@ class ArchiveTest(unittest.TestCase):
         self.assertEqual(doc["summary"]["signatures"]["psin"]["files"], 1)
         self.assertEqual(doc["summary"]["signatures"]["page-directory"]["files"], 1)
         self.assertEqual(doc["summary"]["signatures"]["rsc8"]["files"], 1)
+        self.assertEqual(doc["summary"]["signatures"]["clip-stream"]["files"], 2)
+        clips = [row for row in doc["files"] if row["signature"] == "clip-stream"]
+        self.assertEqual([(row["count"], row["version"]) for row in clips], [(3, None), (2, None)])
 
     def test_cli_reports_a_report_write_error(self):
         out = os.path.join(self.root, "index.json")
