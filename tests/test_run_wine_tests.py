@@ -212,11 +212,26 @@ class RunTestTest(unittest.TestCase):
                 status, detail = self.run_entry(ctest_entry("regex", self.command_for(exe), props))
                 self.assertEqual(status, expected, detail)
 
+    def test_skip_output_overrides_a_normal_exit_status(self):
+        skip_pattern = "SKIP: missing adapter"
+        exe = self.program("skip.py", f"print({skip_pattern!r})\nraise SystemExit(3)\n")
+        for expression in (skip_pattern, ["different reason", skip_pattern]):
+            with self.subTest(expression=expression):
+                entry = ctest_entry("skip", self.command_for(exe), {"SKIP_REGULAR_EXPRESSION": expression})
+                status, detail = rwt.run_test(entry, self.args, [sys.executable, "-I"])
+                self.assertEqual(status, "skip", detail)
+                self.assertIn("SKIP_REGULAR_EXPRESSION", detail)
+
+        entry = ctest_entry("no_match", self.command_for(exe), {"SKIP_REGULAR_EXPRESSION": ["different reason"]})
+        status, detail = rwt.run_test(entry, self.args, [sys.executable, "-I"])
+        self.assertEqual(status, "fail", detail)
+
     def test_a_signal_termination_fails_even_with_success_overrides(self):
         # The mocked negative returncode keeps the test portable across Windows and POSIX.
         exe = self.exiting(0)
         fake = mock.Mock(returncode=-11, stdout=b"usage: gta6rt")
-        for props in ({"WILL_FAIL": True}, {"PASS_REGULAR_EXPRESSION": ["usage: gta6rt"]}):
+        for props in ({"WILL_FAIL": True}, {"PASS_REGULAR_EXPRESSION": ["usage: gta6rt"]},
+                      {"SKIP_REGULAR_EXPRESSION": ["usage: gta6rt"]}):
             with self.subTest(props=props), mock.patch.object(rwt.subprocess, "run", return_value=fake):
                 entry = ctest_entry("segv", self.command_for(exe), props | {"SKIP_RETURN_CODE": 77})
                 status, detail = self.run_entry(entry)
