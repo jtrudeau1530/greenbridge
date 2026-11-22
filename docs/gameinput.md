@@ -264,8 +264,9 @@ never touch SDL: they read the latest reading or leave a request, so a call cost
 button) run on that thread, as GameInput runs them on its own threads. Once the title creates a dispatcher
 (`IGameInput::CreateDispatcher`), callbacks are queued instead, the dispatcher's wait handle is signalled, and
 `IGameInputDispatcher::Dispatch` runs them on the title's thread, oldest first, within its quota: at least one queued
-event per call (a quota of 0 runs exactly one), no further event once the quota has passed, and the wait handle is
-signalled again while events remain.
+event per call (a quota of 0 runs exactly one), no further event once the quota has passed, and only the events
+queued when the call started (later ones wait for the next call, so even an unlimited quota returns). The wait
+handle is signalled again while events remain.
 
 The API surface:
 
@@ -276,7 +277,7 @@ The API surface:
 | `IGameInputDevice` | device info, status, battery, `SetRumbleState`, force-feedback motors with `CreateForceFeedbackEffect`/`IGameInputForceFeedbackEffect`, `IsForceFeedbackMotorPoweredOn`, `SetForceFeedbackMotorGain`, haptic trigger motors with `SetHapticMotorState` | raw device I/O, power off, input synchronization (no-ops) |
 | `IGameInputDispatcher` | `Dispatch`, `OpenWaitHandle` | the quota (the queue is short) |
 | `IGameInputDevice` | device info, status, battery, `SetRumbleState` | force feedback and haptic motors (none reported), raw device I/O, power off, input synchronization (no-ops) |
-| `IGameInputDispatcher` | `Dispatch` (with its quota), `OpenWaitHandle` | |
+| `IGameInputDispatcher` | `Dispatch` (with its quota), `OpenWaitHandle` | — |
 
 A device object stays alive for the whole process. When a pad is unplugged its status drops to
 `GameInputDeviceNoStatus` and its device callback runs; when the same pad is plugged in again (matched by SDL GUID and
