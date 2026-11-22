@@ -589,6 +589,73 @@ int main() {
         EXPECT(sample_through_set(d, set0, set0_layout, {&gone, 1}, after_destruction.data()));
 #endif
 
+        // D3D-61, B4G4R4A4_UNORM: four bits a channel, B in bits 0-3, G 4-7, R 8-11, A 12-15. Each texel has a
+        // different value in every channel, so a swapped pair shows. Its footprint has two-byte texels; the view
+        // samples as RGBA8 with each nibble n read as n * 17.
+        {
+            D3D12_RESOURCE_DESC packed_desc = texture_desc;
+            packed_desc.Format = DXGI_FORMAT_B4G4R4A4_UNORM;
+            Ref<ID3D12Resource> packed;
+            EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &packed_desc,
+                                                             D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                             IID_PPV_ARGS(&packed.p))));
+            D3D12_PLACED_SUBRESOURCE_FOOTPRINT packed_placed{};
+            UINT64 row_size = 0;
+            device->GetCopyableFootprints(&packed_desc, 0, 1, 49152, &packed_placed, nullptr, &row_size, nullptr);
+            EXPECT(packed_placed.Footprint.Format == DXGI_FORMAT_B4G4R4A4_UNORM && row_size == size * 2 &&
+                   packed_placed.Footprint.RowPitch == 256);
+            const auto nibbles = [](UINT x, UINT y) {  // R, G, B, A
+                return std::array<UINT, 4>{x, y + 8, (x + y) & 15, 15 - x};
+            };
+            for (UINT y = 0; y < size; ++y)
+                for (UINT x = 0; x < size; ++x) {
+                    const auto n = nibbles(x, y);
+                    const std::uint16_t word = std::uint16_t(n[2] | (n[1] << 4) | (n[0] << 8) | (n[3] << 12));
+                    std::memcpy(static_cast<std::uint8_t*>(mapped) + packed_placed.Offset +
+                                    y * packed_placed.Footprint.RowPitch + x * 2,
+                                &word, 2);
+                }
+            // Set 0 takes in a view at the next ExecuteCommandLists, so it is made before the upload runs.
+            device->CreateShaderResourceView(packed.p, nullptr, view_slot(null_slot));
+            EXPECT(SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.p, nullptr)));
+            D3D12_TEXTURE_COPY_LOCATION to_packed{packed.p, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {}};
+            to_packed.SubresourceIndex = 0;
+            D3D12_TEXTURE_COPY_LOCATION from_packed{upload.p, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, {}};
+            from_packed.PlacedFootprint = packed_placed;
+            list->CopyTextureRegion(&to_packed, 0, 0, 0, &from_packed, nullptr);
+            const D3D12_RESOURCE_BARRIER readable =
+                transition(packed.p, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            list->ResourceBarrier(1, &readable);
+            EXPECT(list->Close() == S_OK);
+            queue->ExecuteCommandLists(1, lists);
+            EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
+            EXPECT(SUCCEEDED(queue->Signal(fence.p, 3)) && SUCCEEDED(fence->SetEventOnCompletion(3, nullptr)));
+
+            g::Image packed_image{};
+            EXPECT(image_at(null_slot, packed_image));
+            EXPECT(packed_image.format == g::format_from_vulkan(VK_FORMAT_A4R4G4B4_UNORM_PACK16) &&
+                   packed_image.format != 0);
+#ifdef LEONIDA_TEST_CS_SAMPLE_SPV
+            SampleKeys packed_keys{};
+            std::memcpy(packed_keys.tsharp, view_bytes(null_slot), sizeof(packed_keys.tsharp));
+            std::memcpy(packed_keys.ssharp, sampler_bytes, sizeof(packed_keys.ssharp));
+            std::vector<std::uint8_t> packed_results(bytes);
+            EXPECT(sample_through_set(d, set0, set0_layout, {&packed_keys, 1}, packed_results.data()));
+            for (UINT i = 0; i < texels; ++i) {
+                const auto n = nibbles(i % size, i / size);
+                const std::uint8_t want[4] = {std::uint8_t(n[0] * 17), std::uint8_t(n[1] * 17),
+                                              std::uint8_t(n[2] * 17), std::uint8_t(n[3] * 17)};
+                if (std::memcmp(&packed_results[i * 4], want, 4) != 0) {
+                    std::fprintf(stderr, "B4G4R4A4 texel %u: got %02x %02x %02x %02x, want %02x %02x %02x %02x\n", i,
+                                 packed_results[i * 4], packed_results[i * 4 + 1], packed_results[i * 4 + 2],
+                                 packed_results[i * 4 + 3], want[0], want[1], want[2], want[3]);
+                    EXPECT(false);
+                    break;
+                }
+            }
+#endif
+        }
+
         upload.reset();
         uint_texture.reset();
         view_heap.reset();
