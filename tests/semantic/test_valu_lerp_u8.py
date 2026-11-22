@@ -30,6 +30,8 @@ Mathematical and Architectural Properties:
     - Bits [7:1] of each byte lane in src2 are strictly ignored by hardware and translator.
 """
 
+from dataclasses import dataclass
+from enum import Enum, auto
 from typing import List, Optional, Tuple, Union
 import unittest
 
@@ -84,6 +86,71 @@ def oracle_v_lerp_u8(src0: int, src1: int, src2: int) -> int:
     r3 = ref_lerp_u8_byte(b0_3, b1_3, b2_3)
 
     return pack_bytes_u32(r0, r1, r2, r3)
+
+
+# ==============================================================================
+# Symbolic AST Opcode Definitions and Typed Expressions
+# ==============================================================================
+
+class RegType(Enum):
+    VGPR = auto()
+    SGPR = auto()
+
+
+@dataclass(frozen=True)
+class Reg32:
+    """Represents a 32-bit architectural register (VGPR or SGPR)."""
+    index: int
+    reg_type: RegType
+
+    def __post_init__(self) -> None:
+        if not (0 <= self.index <= 255):
+            raise ValueError(f"Register index {self.index} out of range [0, 255]")
+
+    @property
+    def name(self) -> str:
+        prefix = "v" if self.reg_type == RegType.VGPR else "s"
+        return f"{prefix}{self.index}"
+
+
+@dataclass(frozen=True)
+class Literal32:
+    """Represents a 32-bit integer literal or inline constant."""
+    value: int
+
+    def __post_init__(self) -> None:
+        if not (0 <= self.value <= MASK32):
+            raise ValueError(f"Literal32 value {self.value:#x} out of range [0, 0xFFFFFFFF]")
+
+    @property
+    def name(self) -> str:
+        return f"{self.value:#010x}" if self.value > 9 else str(self.value)
+
+
+@dataclass(frozen=True)
+class VLerpOperand:
+    """Typed expression operand representing a register or literal."""
+    source: Union[Reg32, Literal32]
+
+    def disassemble(self) -> str:
+        return self.source.name
+
+
+@dataclass(frozen=True)
+class VLerpU8Instruction:
+    """Symbolic AST node representing an RDNA2 v_lerp_u8 VALU instruction."""
+    dst: Reg32
+    src0: VLerpOperand
+    src1: VLerpOperand
+    src2: VLerpOperand
+
+    def __post_init__(self) -> None:
+        if self.dst.reg_type != RegType.VGPR:
+            raise TypeError(f"Destination of VALU instruction must be VGPR, got {self.dst.reg_type}")
+
+    def disassemble(self) -> str:
+        return f"v_lerp_u8 {self.dst.name}, {self.src0.disassemble()}, {self.src1.disassemble()}, {self.src2.disassemble()}"
+
 
 
 # ==============================================================================
@@ -176,6 +243,52 @@ class TestVLerpU8ModelAndOracle(unittest.TestCase):
         self.assertEqual(b1, 0x00)
         self.assertEqual(b2, 0x00)
         self.assertEqual(b3, 0x00)
+
+
+class TestSymbolicAST(unittest.TestCase):
+    """Unit tests for symbolic AST opcode definitions and typed expressions."""
+
+    def test_register_validation_and_naming(self) -> None:
+        v0 = Reg32(0, RegType.VGPR)
+        v255 = Reg32(255, RegType.VGPR)
+        s12 = Reg32(12, RegType.SGPR)
+        self.assertEqual(v0.name, "v0")
+        self.assertEqual(v255.name, "v255")
+        self.assertEqual(s12.name, "s12")
+
+    def test_register_bounds_rejection(self) -> None:
+        with self.assertRaises(ValueError):
+            Reg32(-1, RegType.VGPR)
+        with self.assertRaises(ValueError):
+            Reg32(256, RegType.VGPR)
+        with self.assertRaises(ValueError):
+            Reg32(1000, RegType.SGPR)
+
+    def test_literal_values_and_naming(self) -> None:
+        lit_small = Literal32(1)
+        lit_hex = Literal32(0x10203040)
+        self.assertEqual(lit_small.name, "1")
+        self.assertEqual(lit_hex.name, "0x10203040")
+
+        with self.assertRaises(ValueError):
+            Literal32(-1)
+        with self.assertRaises(ValueError):
+            Literal32(0x1_0000_0000)
+
+    def test_instruction_ast_construction_and_disassembly(self) -> None:
+        dst = Reg32(0, RegType.VGPR)
+        src0 = VLerpOperand(Reg32(1, RegType.VGPR))
+        src1 = VLerpOperand(Reg32(4, RegType.SGPR))
+        src2 = VLerpOperand(Literal32(1))
+
+        instr = VLerpU8Instruction(dst=dst, src0=src0, src1=src1, src2=src2)
+        self.assertEqual(instr.disassemble(), "v_lerp_u8 v0, v1, s4, 1")
+
+    def test_destination_must_be_vgpr(self) -> None:
+        dst_sgpr = Reg32(0, RegType.SGPR)
+        src = VLerpOperand(Reg32(1, RegType.VGPR))
+        with self.assertRaises(TypeError):
+            VLerpU8Instruction(dst=dst_sgpr, src0=src, src1=src, src2=src)
 
 
 if __name__ == "__main__":
