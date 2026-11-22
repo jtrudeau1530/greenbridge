@@ -7,6 +7,7 @@ Zero game data used.
 """
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import io
 import json
@@ -114,6 +115,105 @@ class TestManifestVerifier(unittest.TestCase):
         self.write_manifest(flat_path, self.payloads, wrapper=False)
         entries = mv.load_manifest(flat_path)
         self.assertEqual(len(entries), len(SYNTHETIC_SIZES))
+
+    def test_load_manifest_flat_skips_metadata_keys(self) -> None:
+        flat_path = os.path.join(self.root, "manifest_flat_meta.json")
+        doc = {
+            "created": "2026-11-22 00:00:00",
+            "title": "synthetic",
+            "version": "1.0",
+            "note": "top-level metadata",
+            "alpha.bin": {
+                "size": len(self.payloads["alpha.bin"]),
+                "sha256": hashlib.sha256(self.payloads["alpha.bin"]).hexdigest(),
+            },
+        }
+        with open(flat_path, "w", encoding="utf-8") as f:
+            json.dump(doc, f)
+        entries = mv.load_manifest(flat_path)
+        self.assertEqual(list(entries.keys()), ["alpha.bin"])
+
+    def test_nested_manifest_verifies_files_named_like_metadata_keys(self) -> None:
+        meta_dir = os.path.join(self.root, "meta_game")
+        os.makedirs(meta_dir, exist_ok=True)
+        meta_files = {
+            "created": b"created-payload",
+            "title": b"title-payload!!",
+            "version": b"version-payload",
+            "note": b"note-payload",
+        }
+        for name, data in meta_files.items():
+            with open(os.path.join(meta_dir, name), "wb") as f:
+                f.write(data)
+        manifest_p = self.write_manifest(os.path.join(self.root, "meta_manifest.json"), meta_files, wrapper=True)
+
+        entries = mv.load_manifest(manifest_p)
+        self.assertEqual(sorted(entries.keys()), sorted(meta_files.keys()))
+
+        ok_report = mv.verify_manifest(meta_dir, manifest_p, jobs=2, strict=True)
+        self.assertTrue(ok_report.passed)
+        self.assertEqual(sorted(ok_report.matched), sorted(meta_files.keys()))
+        self.assertEqual(ok_report.untracked, [])
+
+        # Tamper (same size -> CHANGED), truncate (-> SIZE), remove (-> MISSING)
+        with open(os.path.join(meta_dir, "version"), "wb") as f:
+            f.write(b"VERSION-PAYLOAD")
+        with open(os.path.join(meta_dir, "title"), "wb") as f:
+            f.write(b"short")
+        os.remove(os.path.join(meta_dir, "note"))
+
+        bad_report = mv.verify_manifest(meta_dir, manifest_p, jobs=1, strict=True)
+        self.assertFalse(bad_report.passed)
+        self.assertEqual(bad_report.problems, {
+            "note": "MISSING",
+            "title": "SIZE",
+            "version": "CHANGED",
+        })
+        self.assertEqual(bad_report.matched, ["created"])
+        self.assertEqual(bad_report.untracked, [])
+
+    def test_load_manifest_non_dict_files_raises(self) -> None:
+        for bad_value in ("abc", [], 123, None):
+            with self.subTest(files_value=bad_value):
+                bad_path = os.path.join(self.root, f"bad_files_{type(bad_value).__name__}.json")
+                with open(bad_path, "w", encoding="utf-8") as f:
+                    json.dump({"created": "2026-11-22", "files": bad_value}, f)
+                with self.assertRaisesRegex(mv.ManifestError, "'files' must be a JSON object"):
+                    mv.load_manifest(bad_path)
+
+    def test_load_manifest_boolean_size_raises(self) -> None:
+        digest = hashlib.sha256(b"x").hexdigest()
+        for bool_size in (True, False):
+            for wrapper in (True, False):
+                with self.subTest(size=bool_size, wrapper=wrapper):
+                    bad_path = os.path.join(self.root, f"bool_size_{bool_size}_{wrapper}.json")
+                    entry = {"a.bin": {"size": bool_size, "sha256": digest}}
+                    doc = {"files": entry} if wrapper else entry
+                    with open(bad_path, "w", encoding="utf-8") as f:
+                        json.dump(doc, f)
+                    with self.assertRaises(mv.ManifestError):
+                        mv.load_manifest(bad_path)
+
+    def test_walk_unreadable_directory_raises_and_cli_exits_2(self) -> None:
+        def failing_walk(top: str, *args, onerror=None, **kwargs):
+            err = PermissionError(13, "Permission denied", os.path.join(top, "nested"))
+            if onerror is not None:
+                onerror(err)
+            return
+            yield  # pragma: no cover
+
+        with patch("tools.manifest_verifier.os.walk", side_effect=failing_walk):
+            with self.assertRaises(PermissionError):
+                list(mv.walk(self.game_dir))
+            with self.assertRaises(PermissionError):
+                mv.verify_manifest(self.game_dir, self.manifest_path, jobs=1)
+
+            stderr_buf = io.StringIO()
+            with contextlib.redirect_stderr(stderr_buf):
+                rc = mv.main([self.game_dir, "--manifest", self.manifest_path, "--quiet"])
+            self.assertEqual(rc, 2)
+            self.assertIn("ERROR:", stderr_buf.getvalue())
+            self.assertIn("Permission denied", stderr_buf.getvalue())
 
     def test_load_manifest_invalid_json(self) -> None:
         bad_json = os.path.join(self.root, "bad.json")
