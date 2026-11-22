@@ -427,6 +427,28 @@ class ExportTest(unittest.TestCase):
                           "--part", hex(self.offsets[1]), "--report", self.packs)
         self.assertEqual(r.returncode, 2)
 
+    def test_report_directory_is_refused_before_writing_a_glb(self):
+        out = os.path.join(self.tmp.name, "out.glb")
+        report = os.path.join(self.tmp.name, "report")
+        os.mkdir(report)
+        r = self.run_tool(self.packs, out, "--skeleton", hex(self.offsets[0]),
+                          "--part", hex(self.offsets[1]), "--report", report)
+        self.assertEqual(r.returncode, 2, r.stderr)
+        self.assertIn("--report is a directory", r.stderr)
+        self.assertNotIn("Traceback", r.stderr)
+        self.assertFalse(os.path.exists(out))
+
+    def test_report_write_failure_is_one_error_line(self):
+        out = os.path.join(self.tmp.name, "out.glb")
+        report = os.path.join(self.tmp.name, "missing", "report.json")
+        r = self.run_tool(self.packs, out, "--skeleton", hex(self.offsets[0]),
+                          "--part", hex(self.offsets[1]), "--report", report)
+        self.assertEqual(r.returncode, 2, r.stderr)
+        self.assertEqual(len(r.stderr.strip().splitlines()), 1, r.stderr)
+        self.assertIn("cannot write report", r.stderr)
+        self.assertIn(report, r.stderr)
+        self.assertEqual(r.stdout, "")
+
     def test_a_bad_offset_is_one_error_line(self):
         r = self.run_tool(self.packs, os.path.join(self.tmp.name, "x.glb"), "--skeleton", "0x20", "--part", "0x20")
         self.assertEqual(r.returncode, 2)
