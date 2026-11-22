@@ -59,12 +59,12 @@ overshoot EOF, so `used` exceeded the real stream size and every trailing stream
 test `tests/test_rpf9_carve.py` builds a two-stream archive to keep that fixed.
 
 A gap between streams counts as zero padding when every byte in it is zero, otherwise as unread.
-`tools/zero_span.py` decides that a 4 MiB window at a time, stopping at the first window with a non-zero byte.
-`rpf9_carve.py` and the other scanners that keep these counts (`rpf9_names`, `bvh_index`, `navmesh_index`,
-`navmesh_decode`, `rbf0_index`, `anim_index`, `restofworld_index`, `story_index`) all use it. They used to slice
-the gap out of the mapped archive, which copies all of it at once, so a non-zlib region of several GiB (about half
-of `story000.rpf`) needed that much memory. `tests/test_zero_span.py` runs each scanner on a 48 MiB gap and checks
-that the Python heap peak stays under 24 MiB.
+`rpf9_carve.py` checks a gap in 1 MiB pieces. The other scanners that keep these counts (`rpf9_names`,
+`bvh_index`, `navmesh_index`, `navmesh_decode`, `rbf0_index`, `anim_index`, `restofworld_index`, `story_index`)
+use `tools/zero_span.py`, which compares the gap with zeros 4 MiB at a time and stops at the first window with a
+non-zero byte. They used to slice the gap out of the mapped archive, which copies all of it at once. The largest
+gap in `story000.rpf` is 8.9 GiB, so that needed 8.9 GiB of memory. `tests/test_zero_span.py` runs all nine
+scanners on a 48 MiB gap and checks that each one's Python heap peak stays under 24 MiB.
 
 The carve is read-only and works on any `.rpf`, `.ttpf` or archive-like file. It does not decrypt the TOC, use
 keys, or write anything outside the output directory.
