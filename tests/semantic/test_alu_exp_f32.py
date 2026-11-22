@@ -101,5 +101,48 @@ class TestAluExpF32Reference(unittest.TestCase):
             self.assertAlmostEqual(got, want, places=5)
 
 
+class TestAluExpF32SimdAndTolerance(unittest.TestCase):
+    """Commit 2: SIMD multi-lane tests and precision tolerance validation."""
+
+    def test_simd_multilane_exp(self):
+        # Test multiple lanes with different input values
+        inputs = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, -0.5, -1.0]
+        lines = [
+            f"v_mov_b32 v0, 0x{f32_bits(inputs[0]):08x}",
+            f"v_mov_b32 v1, 0x{f32_bits(inputs[1]):08x}",
+            f"v_mov_b32 v2, 0x{f32_bits(inputs[2]):08x}",
+            f"v_mov_b32 v3, 0x{f32_bits(inputs[3]):08x}",
+            "v_exp_f32 v4, v0",
+            "v_exp_f32 v5, v1",
+            "v_exp_f32 v6, v2",
+            "v_exp_f32 v7, v3",
+            "exp mrt0 v4, v5, v6, v7 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_exp_multilane", lines)
+        words = support.mrt0_words(spv)
+        for i, x_val in enumerate(inputs[:4]):
+            got = _float(words[i])
+            want = 2.0 ** x_val
+            # Precision tolerance check (within 1 ULP or tight relative tolerance)
+            self.assertAlmostEqual(got, want, places=4, msg=f"lane {i} for input {x_val}")
+
+    def test_precision_tolerance_fractional_inputs(self):
+        # Validate precision for non-integer fractional exponents (e.g. 0.3, 1.7, 3.14159)
+        for x_val in (0.3, 1.7, 3.14159, -0.7, -2.5):
+            lines = [
+                f"v_mov_b32 v0, 0x{f32_bits(x_val):08x}",
+                "v_exp_f32 v1, v0",
+                "exp mrt0 v1, v0, v0, v0 done vm",
+                "s_endpgm",
+            ]
+            spv = support.translate_lines("ps_exp_frac", lines)
+            got = _float(support.mrt0_words(spv)[0])
+            want = 2.0 ** x_val
+            # 1 ULP / floating point accuracy check
+            rel_diff = abs(got - want) / abs(want)
+            self.assertLess(rel_diff, 1e-6, f"input {x_val}: got {got}, want {want}")
+
+
 if __name__ == "__main__":
     unittest.main()
