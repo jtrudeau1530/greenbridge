@@ -11,7 +11,7 @@ var sw = Stopwatch.StartNew();
 string baseName = Path.GetFileNameWithoutExtension(src);
 string outDir = Path.Combine(outRoot, baseName); Directory.CreateDirectory(outDir);
 long length = new FileInfo(src).Length;
-int ok = 0, fail = 0, skip = 0;
+int ok = 0, fail = 0, skip = 0, writeFail = 0;
 // Every mode below works on all cores. Core's readers open their own read handle per call, entry and file names
 // come from offsets and indexes, and results are put back in source order, so outputs match a one-thread run.
 // ponytail: every core, no flag; add --jobs if someone needs the machine during a build.
@@ -170,7 +170,7 @@ else if (mode is "models" or "textures")
         for (int i = 0; i < n; i++)
         {
             var r = results[i]; results[i] = default;
-            ok += r.Ok; fail += r.Fail; embedded += r.Embedded;
+            ok += r.Ok; fail += r.Fail; embedded += r.Embedded; writeFail += r.WriteFail;
             if (r.DecodeFailure is { } reason)
             {
                 int count = modelDecodeFailures.GetValueOrDefault(reason.Code) + 1;
@@ -197,9 +197,13 @@ else if (mode is "models" or "textures")
             {
                 var m = RageModelDecoder.Decode(sys, gfx, e.ResourceDrawableOffset);
                 if (m == null)
-                    return new Result(null, 0, 1, 0, ModelDecodeFailure.Explain(sys, gfx.Length), null);
+                    return new Result(null, 0, 1, 0, ModelDecodeFailure.Explain(sys, gfx.Length), null, 0);
                 string obj = Path.Combine(sub, stem + ".obj");
-                if (!File.Exists(obj)) Util.WriteAllText(obj, RageModelDecoder.CreateObj(m));
+                string objText = RageModelDecoder.CreateObj(m);
+                // A failed obj write means the model is missing from disk: fatal for the run (retryable),
+                // unlike the decode failures above, which no rerun would change.
+                try { if (!File.Exists(obj)) Util.WriteAllText(obj, objText); }
+                catch (Exception wex) { return new Result(null, 0, 1, 0, null, $"  fail {e.Name}: {wex.GetType().Name} {wex.Message}", 1); }
                 if (m.EmbeddedTextures != null && m.EmbeddedTextureDictionaryOffset is int dOff)
                 {
                     string td = Path.Combine(sub, stem + "_tex"); Directory.CreateDirectory(td);
@@ -216,23 +220,31 @@ else if (mode is "models" or "textures")
                     Embedded = m.EmbeddedTextures?.Select(t => new { t.Index, t.Name, t.Width, t.Height, t.Format, Hash = t.NameHash.ToString("X8"), Key = t.AssetKey?.ToString("X16") }).ToArray(),
                     Materials = m.Materials?.Select(x => new { x.ShaderIndex, Shader = x.ShaderHash.ToString("X8"), Preset = x.PresetHash.ToString("X8"), x.RenderBucket,
                         Textures = x.Textures.Select(r => new { Param = r.ParameterHash.ToString("X8"), r.TextureIndex, Name = r.NameHash.ToString("X8"), Id64 = r.OpaqueId64.ToString("X16"), Tag = r.Tag.ToString("X8") }).ToArray() }).ToArray() },
-                    1, 0, embedded, null, null);
+                    1, 0, embedded, null, null, 0);
             }
             else
             {
                 var dict = RageTextureDecoder.Inspect(sys, gfx);
-                if (dict == null) return new Result(null, 0, 1, 0, null, null);
+                if (dict == null) return new Result(null, 0, 1, 0, null, null, 0);
                 string td = Path.Combine(sub, stem); Directory.CreateDirectory(td);
+                int wfail = 0;
                 foreach (var t in dict.Textures)
                 {
                     string p = Path.Combine(td, $"{t.Index:D3}_{Util.Safe(t.Name)}.dds");
-                    try { if (!File.Exists(p)) Util.WriteAllBytes(p, RageTextureDecoder.CreateDds(sys, gfx, t.Index)); ok++; } catch { fail++; }
+                    if (File.Exists(p)) { ok++; continue; }
+                    // A decoder problem is counted like today and no rerun would change it; a failed DDS write
+                    // is retryable, so it additionally counts as a write failure and fails the run.
+                    byte[] dds;
+                    try { dds = RageTextureDecoder.CreateDds(sys, gfx, t.Index); }
+                    catch { fail++; continue; }
+                    try { Util.WriteAllBytes(p, dds); ok++; }
+                    catch { fail++; wfail++; }
                 }
                 return new Result(new { e.Offset, Dir = stem, Textures = dict.Textures.Select(t => new { t.Index, t.Name, t.Width, t.Height, t.Format, t.MipCount, Hash = t.NameHash.ToString("X8"), Key = t.AssetKey?.ToString("X16") }).ToArray() },
-                    ok, fail, 0, null, null);
+                    ok, fail, 0, null, null, wfail);
             }
         }
-        catch (Exception ex) { return new Result(null, ok, fail + 1, embedded, null, $"  fail {e.Name}: {ex.GetType().Name} {ex.Message}"); }
+        catch (Exception ex) { return new Result(null, ok, fail + 1, embedded, null, $"  fail {e.Name}: {ex.GetType().Name} {ex.Message}", 0); }
     }
     if (mode == "models") Console.WriteLine($"  embedded textures {embedded:N0}");
     writer.WriteEndArray();
@@ -246,10 +258,21 @@ else if (mode is "models" or "textures")
     writer.WriteEndObject();
     writer.Dispose();          // flushes; the later using-dispose is a no-op
     mstream.Dispose();
-    File.Move(partial, manifestPath, true);
+    // The manifest is the completion marker make_game resumes on. Like ttpf, keep the successful exports for
+    // a retry, but a run with write failures must not mark the stage finished: withdraw a stale marker and
+    // drop the partial instead of publishing it.
+    if (writeFail == 0)
+        File.Move(partial, manifestPath, true);
+    else
+    {
+        Console.WriteLine($"  {writeFail} write failure(s): manifest withheld; rerun retries the missing files");
+        File.Delete(manifestPath);
+        File.Delete(partial);
+    }
 }
 Console.WriteLine($"{mode} {baseName}: ok={ok} fail={fail} skip={skip} in {sw.Elapsed.TotalSeconds:0}s");
-return mode == "ttpf" && fail != 0 ? 1 : 0;
+return (mode == "ttpf" && fail != 0) || writeFail != 0 ? 1 : 0;
 
-// One exported entry: its manifest row (null when nothing was written), counts, and a failure to report in order.
-readonly record struct Result(object? Row, int Ok, int Fail, int Embedded, ModelDecodeFailure? DecodeFailure, string? Error);
+// One exported entry: its manifest row (null when nothing was written), counts, a failure to report in order,
+// and how many of its failures were output-write failures (the ones a retry can fix; decode failures are not).
+readonly record struct Result(object? Row, int Ok, int Fail, int Embedded, ModelDecodeFailure? DecodeFailure, string? Error, int WriteFail);
