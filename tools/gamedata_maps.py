@@ -12,10 +12,13 @@ match the published GTA V `heightmap.dat` (`HMAP`) layout:
     0x0A  u16 pad
     0x0C  six f32 bounds     (min xyz, max xyz)
     0x24  u32 data size      (bytes after this 44-byte header)
-    0x28  u32 unverified field
+    0x28  u8 default height  (23 in both measured payloads, 0 m quantised)
+    0x29  3 bytes            differ per file; not a checksum (padding?)
     0x2C  height x 8-byte row headers `{u16 start, u16 count, i32 offset}`
           then the packed u8 heights. A cell not covered by a row keeps the
-          measured default 23. The source index is `offset + start + i`.
+          default from 0x28. The source index is `offset + start + i`. The
+          encoder crops each row to its first and last non-default cell, so
+          no measured span starts or ends on the default.
     The old "zero prefix + square grid" reading was an artifact: the prefix is
     the zeroed row headers of the map's empty (default) rows.
 
@@ -51,7 +54,6 @@ import sys
 
 MAGIC = (b"MHIU", b"PAMH", b"SPS1Z")
 HEADER = 44
-DEFAULT_MHIU_HEIGHT = 23
 
 
 def _u16(blob: bytes, offset: int) -> int:
@@ -96,8 +98,9 @@ def parse_mhiu(blob: bytes) -> dict:
 
     rows = _rows(blob, height)
     pixels = blob[HEADER + height * 8:]
-    heights = bytearray([DEFAULT_MHIU_HEIGHT]) * (width * height)
-    empty = filled_rows = filled_cells = 0
+    default = blob[0x28]
+    heights = bytearray([default]) * (width * height)
+    empty = filled_rows = filled_cells = ends_at_default = 0
     spans = []
     for y in range(height):
         start, count = struct.unpack_from("<HH", rows, y * 8)
@@ -112,6 +115,8 @@ def parse_mhiu(blob: bytes) -> dict:
             raise ValueError(f"MHIU row {y} leaves the {len(pixels)}-byte pixel data")
         heights[y * width + start:y * width + start + count] = \
             pixels[source:source + count]
+        ends_at_default += (pixels[source] == default) + \
+            (pixels[source + count - 1] == default)
         filled_rows += 1
         filled_cells += count
         spans.append((source, source + count))
@@ -129,7 +134,8 @@ def parse_mhiu(blob: bytes) -> dict:
             "height": height,
             "bounds": bounds,
             "data_size": size,
-            "field28": _u32(blob, 0x28),
+            "default_height": default,
+            "pad_29": blob[0x29:0x2C].hex(),
             "z_mapping": "min.z + value/255 * (max.z - min.z)",
         },
         "grid": {
@@ -137,13 +143,14 @@ def parse_mhiu(blob: bytes) -> dict:
             "width": width,
             "height": height,
             "cells": width * height,
-            "default": DEFAULT_MHIU_HEIGHT,
+            "default": default,
             "row_records": height,
             "filled_rows": filled_rows,
             "empty_rows": empty,
             "filled_cells": filled_cells,
             "data_bytes": len(pixels),
-            "z_at_default": round(_z(DEFAULT_MHIU_HEIGHT, bounds), 2),
+            "span_ends_at_default": ends_at_default,
+            "z_at_default": round(_z(default, bounds), 2),
         },
         "_grid": bytes(heights),
     }

@@ -108,8 +108,11 @@ python -I make_game.py --wave64-emulate off            # auto (default), on or o
 it. The default, `auto`, asks `vulkaninfo` (part of the Vulkan SDK) and turns it on unless every GPU reports 64-wide
 subgroups, or when it can't tell; it also turns it on when the GPU the runtime would use can't be made to run
 compute and mesh shaders 64-wide. The mode is saved next to the translated shaders, and changing it translates them
-again. With `auto`, shaders already translated with emulation are kept even when this run would not emulate (they are
-exact on every GPU); `--wave64-emulate off` translates them natively.
+again. With `auto`, a work folder that previously used emulation keeps it for later translations and retries, even if
+the current GPU supports native wave64. Use `--wave64-emulate off` to translate it natively.
+
+The build records which translator sources produced the shaders. A change to those files reruns translation using the
+saved disassembly. Older work folders need one translation after upgrading to record this information.
 
 Stages run in order: `check`, `shaders`, `assets`, `runtime`, `pipelines` (creates every translated shader on your
 GPU driver and saves a pipeline cache, so the first boot doesn't compile them). The shader translation is the longest step: it runs

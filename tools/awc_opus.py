@@ -190,7 +190,7 @@ def music_channels(d: bytes, mus, data, collect_packets: bool = True):
             if info[c][3] != 0x0B or count == 0:
                 continue
             packets = opus_packets(d, start, count * 2048)
-            if packets and info[c][5] == 0:
+            if packets and info[c][5] < 2:
                 info[c][5] = 2 if any(p[0] & 0x04 for p in packets) else 1
             if not collect_packets:
                 continue

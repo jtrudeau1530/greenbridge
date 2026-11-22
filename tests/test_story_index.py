@@ -190,6 +190,21 @@ class ArchiveTest(unittest.TestCase):
         self.assertEqual(rows[0]["signature"], "psin")
         self.assertEqual(summary["span"], limit)
 
+    def test_scan_limit_excludes_crossing_streams(self):
+        for start, stored, limit in ((self.offsets[0], len(zlib.compress(psin())), 2),
+                                     (self.offsets[-1], len(bink()), len(bink()) - 1)):
+            with self.subTest(start=start):
+                rows, summary = story_index.scan_rpf(self.rpf, start=start, limit=stored)
+                self.assertEqual([r["stored"] for r in rows], [stored])
+                self.assertEqual(summary["readable_fraction"], 1.0)
+
+                rows, summary = story_index.scan_rpf(self.rpf, start=start, limit=limit)
+                self.assertEqual(summary["readable_fraction"], 0.0)
+                self.assertEqual(summary["span"], limit)
+                self.assertEqual(summary["unread_bytes"], limit)
+                self.assertEqual(summary["compressed_bytes"], 0)
+                self.assertEqual(rows, [])
+
     def test_csv_and_json(self):
         rows, summary = story_index.scan_rpf(self.rpf)
         csv_path = os.path.join(self.root, "out.csv")
@@ -228,6 +243,23 @@ class ArchiveTest(unittest.TestCase):
         self.assertEqual([r["offset"] for r in rows], [0x1000, 0x1100, 0x1200])
         self.assertEqual([r["signature"] for r in rows], ["psin", "page-directory", "rsc8"])
         self.assertEqual(summary["mode"], "directory")
+
+    def test_cli_directory_excludes_its_report_on_rerun(self):
+        folder = os.path.join(self.root, "carved")
+        os.makedirs(folder)
+        with open(os.path.join(folder, "000000000100.bin"), "wb") as f:
+            f.write(b"A" * 64)
+        out = os.path.join(folder, ".", "report.json")
+        for run in (1, 2):
+            with self.subTest(run=run):
+                p = subprocess.run([sys.executable, "-I", TOOL, folder, out, "--quiet"],
+                                   capture_output=True, text=True, encoding="utf-8", errors="replace")
+                self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+                with open(out, encoding="utf-8") as f:
+                    doc = json.load(f)
+                self.assertEqual(doc["summary"]["files"], 1)
+                self.assertEqual(doc["summary"]["compressed_bytes"], 64)
+                self.assertEqual([(r["offset"], r["stored"]) for r in doc["files"]], [(0x100, 64)])
 
     def test_empty_archive(self):
         empty = os.path.join(self.root, "empty.rpf")
