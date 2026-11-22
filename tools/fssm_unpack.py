@@ -29,6 +29,7 @@ import json
 import os
 import struct
 import sys
+import tempfile
 import zlib
 from collections import Counter
 
@@ -162,12 +163,14 @@ def main(argv=None) -> int:
         print(f"ERROR: no shader in {src} unpacked. Check that it holds the carved .dxbc files of a supported "
               "game version.", file=sys.stderr)
         return 1
-    tmp = os.path.join(src, "fssm_index.json.tmp")   # written last and renamed in, so a stopped run leaves none
-    with open(tmp, "w", encoding="utf-8", newline="\n") as f:
-        json.dump(rows, f)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, os.path.join(src, "fssm_index.json"))
+    # Stage privately and publish only after the index is complete and synced.
+    with tempfile.TemporaryDirectory(dir=src) as staging:
+        tmp = os.path.join(staging, "fssm_index.json")
+        with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+            json.dump(rows, f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, os.path.join(src, "fssm_index.json"))
     print("magic:", dict(Counter(r["magic"] for r in rows)))
     print("s_endpgm per blob:", dict(Counter(len(r["endpgm"]) for r in rows)))
     sizes = sorted(r["size"] for r in rows)
