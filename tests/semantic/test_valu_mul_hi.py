@@ -917,5 +917,70 @@ class TestConditionCodesAndStatusFlags(unittest.TestCase):
         self.assertEqual(mask_lt_i, 0b0100)
 
 
+class TestBoundaryExtremesAndBitPatterns(unittest.TestCase):
+    """Test suite for boundary extremes, signed/unsigned wrap, and bit patterns."""
+
+    def test_unsigned_powers_of_two_boundaries(self) -> None:
+        # Exactly 2^32: high word = 1, low word = 0
+        self.assertEqual(ref_mul_hi_u32(1 << 16, 1 << 16), 1)
+        self.assertEqual(ref_mul_hi_u32(1 << 31, 2), 1)
+
+        # 2^31 * 2^31 = 2^62 -> high word = 2^30 = 0x40000000
+        self.assertEqual(ref_mul_hi_u32(1 << 31, 1 << 31), 0x40000000)
+
+        # 2^31 - 1 with 2 -> (2^32 - 2) < 2^32 -> high word = 0
+        self.assertEqual(ref_mul_hi_u32(0x7FFFFFFF, 2), 0)
+
+    def test_unsigned_checkerboard_bit_patterns(self) -> None:
+        p0 = 0x55555555
+        p1 = 0xAAAAAAAA
+        prod = p0 * p1
+        expected_hi = (prod >> 32) & MASK32
+        self.assertEqual(ref_mul_hi_u32(p0, p1), expected_hi)
+
+    def test_signed_boundary_negation_and_wrap(self) -> None:
+        # INT32_MIN (-2^31) multiplied by -1 gives +2^31 (0x80000000)
+        # As 64-bit signed integer, this is +0x00000000_80000000 -> high word = 0
+        self.assertEqual(ref_mul_hi_i32(0x80000000, 0xFFFFFFFF), 0)
+
+        # INT32_MIN multiplied by 1 gives -2^31
+        # As 64-bit signed integer, sign-extended to 0xFFFFFFFF_80000000 -> high word = 0xFFFFFFFF
+        self.assertEqual(ref_mul_hi_i32(0x80000000, 1), 0xFFFFFFFF)
+
+        # INT32_MIN * INT32_MIN = +2^62 = 0x40000000_00000000 -> high word = 0x40000000
+        self.assertEqual(ref_mul_hi_i32(0x80000000, 0x80000000), 0x40000000)
+
+        # INT32_MIN * INT32_MAX = (-2^31) * (2^31 - 1) = -2^62 + 2^31 = 0xC0000000_80000000
+        self.assertEqual(ref_mul_hi_i32(0x80000000, 0x7FFFFFFF), 0xC0000000)
+
+        # INT32_MAX * INT32_MAX = (2^31 - 1)^2 = 2^62 - 2^32 + 1 = 0x3FFFFFFF_00000001
+        self.assertEqual(ref_mul_hi_i32(0x7FFFFFFF, 0x7FFFFFFF), 0x3FFFFFFF)
+
+    def test_signed_checkerboard_patterns(self) -> None:
+        p0 = 0x55555555  # positive
+        p1 = 0xAAAAAAAA  # negative in signed two's-complement
+        expected_hi = ((to_i32(p0) * to_i32(p1) & MASK64) >> 32) & MASK32
+        self.assertEqual(ref_mul_hi_i32(p0, p1), expected_hi)
+
+    def test_64bit_product_reconstruction_sweep(self) -> None:
+        # Sweep edge cases and verify high-low word reconstruction
+        test_values = [
+            0, 1, 2, 0x7FFF, 0xFFFF, 0x10000, 0x7FFFFFFF, 0x80000000,
+            0x80000001, 0xFFFFFFFE, 0xFFFFFFFF
+        ]
+        for a in test_values:
+            for b in test_values[:4]:
+                # Unsigned reconstruction
+                lo_u, hi_u = ref_mul_pair_u32(a, b)
+                reconstructed_u = (hi_u << 32) | lo_u
+                self.assertEqual(reconstructed_u, a * b)
+
+                # Signed reconstruction
+                lo_i, hi_i = ref_mul_pair_i32(a, b)
+                reconstructed_i = (hi_i << 32) | lo_i
+                expected_i = (to_i32(a) * to_i32(b)) & MASK64
+                self.assertEqual(reconstructed_i, expected_i)
+
+
 if __name__ == "__main__":
     unittest.main()
