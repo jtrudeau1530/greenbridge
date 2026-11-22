@@ -1036,5 +1036,124 @@ class TestSaluAndSaveexecB64SIMD(unittest.TestCase):
         self.assertEqual(wave.scalar.scc, 0)
 
 
+class TestSaluAndSaveexecB64RegisterAliasing(unittest.TestCase):
+    """Unit tests for register aliasing and in-place operand preservation."""
+
+    def test_aliasing_sdst_equals_ssrc0(self) -> None:
+        """Verify sdst == ssrc0: source is latched before destination receives old EXEC."""
+        state = ScalarRegisterState(exec=0x1111222233334444)
+        interp = ScalarSALUInterpreter(state)
+
+        # Preload s[4:5] with mask 0x0000FFFF0000FFFF
+        mask = 0x0000FFFF0000FFFF
+        state.write_sgpr64(4, mask)
+
+        # s_and_saveexec_b64 s[4:5], s[4:5]
+        inst = Instruction(
+            Opcode.S_AND_SAVEEXEC_B64,
+            dst=Register(RegKind.SGPR, 4, size=64),
+            src0=Operand(reg=Register(RegKind.SGPR, 4, size=64), size=64),
+        )
+        interp.step(inst)
+
+        # s[4:5] must receive the OLD EXEC (0x1111222233334444), NOT the AND result!
+        self.assertEqual(state.read_sgpr64(4), 0x1111222233334444)
+        # EXEC receives bitwise AND with original s[4:5] mask
+        expected_exec = 0x1111222233334444 & mask
+        self.assertEqual(state.exec, expected_exec)
+        self.assertEqual(state.scc, 1 if expected_exec != 0 else 0)
+
+    def test_aliasing_ssrc0_is_exec(self) -> None:
+        """Verify ssrc0 is EXEC: new_exec = EXEC & EXEC = EXEC."""
+        val = 0x0123456789ABCDEF
+        state = ScalarRegisterState(exec=val)
+        interp = ScalarSALUInterpreter(state)
+
+        # s_and_saveexec_b64 s[6:7], exec
+        inst = Instruction(
+            Opcode.S_AND_SAVEEXEC_B64,
+            dst=Register(RegKind.SGPR, 6, size=64),
+            src0=Operand(reg=Register(RegKind.EXEC, 0, size=64), size=64),
+        )
+        interp.step(inst)
+
+        self.assertEqual(state.read_sgpr64(6), val)
+        self.assertEqual(state.exec, val)
+        self.assertEqual(state.scc, 1)
+
+    def test_aliasing_sdst_is_exec(self) -> None:
+        """Verify sdst is EXEC: EXEC receives the final computed mask."""
+        initial_exec = 0xFFFFFFFFFFFFFFFF
+        mask = 0x5555555555555555
+        state = ScalarRegisterState(exec=initial_exec)
+        interp = ScalarSALUInterpreter(state)
+        state.write_sgpr64(2, mask)
+
+        # s_and_saveexec_b64 exec, s[2:3]
+        inst = Instruction(
+            Opcode.S_AND_SAVEEXEC_B64,
+            dst=Register(RegKind.EXEC, 0, size=64),
+            src0=Operand(reg=Register(RegKind.SGPR, 2, size=64), size=64),
+        )
+        interp.step(inst)
+
+        self.assertEqual(state.exec, mask)
+        self.assertEqual(state.scc, 1)
+
+    def test_aliasing_isolated_registers_untouched(self) -> None:
+        """Verify unreferenced registers in the register file remain completely invariant."""
+        state = ScalarRegisterState(exec=ALL_LANES_64)
+        interp = ScalarSALUInterpreter(state)
+
+        for i in range(0, 106, 2):
+            state.write_sgpr64(i, 0x1000000000000000 + i)
+        state.vcc = 0xAAAAAAAAAAAAAAAA
+        state.m0 = 0x12345678
+
+        # s_and_saveexec_b64 s[8:9], 0xF0F0F0F0F0F0F0F0
+        inst = Instruction(
+            Opcode.S_AND_SAVEEXEC_B64,
+            dst=Register(RegKind.SGPR, 8, size=64),
+            src0=Operand(imm=0xF0F0F0F0F0F0F0F0, size=64),
+        )
+        interp.step(inst)
+
+        # s[8:9] modified to old EXEC
+        self.assertEqual(state.read_sgpr64(8), ALL_LANES_64)
+
+        # All other SGPR pairs must remain untouched
+        for i in range(0, 106, 2):
+            if i != 8:
+                self.assertEqual(state.read_sgpr64(i), 0x1000000000000000 + i, f"SGPR s[{i}:{i+1}] corrupted")
+
+        # VCC and M0 must be untouched
+        self.assertEqual(state.vcc, 0xAAAAAAAAAAAAAAAA)
+        self.assertEqual(state.m0, 0x12345678)
+
+    def test_aliasing_in_place_preservation_across_cycles(self) -> None:
+        """Verify cyclic save/restore preserves values without bit rot."""
+        state = ScalarRegisterState(exec=0xFEEDFACECAFEBEEF)
+        interp = ScalarSALUInterpreter(state)
+
+        # Save to s[0:1], mask with 0x00FF00FF00FF00FF
+        inst1 = Instruction(
+            Opcode.S_AND_SAVEEXEC_B64,
+            dst=Register(RegKind.SGPR, 0, size=64),
+            src0=Operand(imm=0x00FF00FF00FF00FF, size=64),
+        )
+        interp.step(inst1)
+        self.assertEqual(state.read_sgpr64(0), 0xFEEDFACECAFEBEEF)
+        self.assertEqual(state.exec, 0x00ED00CE00FE00EF)
+
+        # Restore EXEC from s[0:1]
+        inst2 = Instruction(
+            Opcode.S_MOV_B64,
+            dst=Register(RegKind.EXEC, 0, size=64),
+            src0=Operand(reg=Register(RegKind.SGPR, 0, size=64), size=64),
+        )
+        interp.step(inst2)
+        self.assertEqual(state.exec, 0xFEEDFACECAFEBEEF)
+
+
 if __name__ == "__main__":
     unittest.main()
