@@ -369,6 +369,23 @@ std::shared_ptr<ReservationState> adapter_reservation_state(LUID luid, VkPhysica
     return entry;
 }
 
+// On discrete GPUs without Resizable BAR, Vulkan exposes a second smaller DEVICE_LOCAL heap for the
+// CPU-visible BAR1 aperture (typically 256 MiB) that aliases the same physical VRAM as the primary heap.
+// Pick the largest DEVICE_LOCAL heap so DedicatedVideoMemory and LOCAL budget/usage match Windows DXGI
+// instead of double-counting BAR1.
+std::uint32_t primary_device_local_heap(const VkPhysicalDeviceMemoryProperties& mem) {
+    std::uint32_t best = UINT32_MAX;
+    VkDeviceSize best_size = 0;
+    for (std::uint32_t i = 0; i < mem.memoryHeapCount; ++i) {
+        if ((mem.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) == 0) continue;
+        if (best == UINT32_MAX || mem.memoryHeaps[i].size > best_size) {
+            best = i;
+            best_size = mem.memoryHeaps[i].size;
+        }
+    }
+    return best;
+}
+
 // Vulkan-backed IDXGIAdapter3 reporting the physical device's name, IDs, LUID (matching
 // ID3D12Device::GetAdapterLuid), memory heap sizes, and video memory budget info.
 class Adapter final : public IDXGIAdapter3 {
@@ -486,11 +503,18 @@ public:
                 VkPhysicalDeviceMemoryProperties2 mem2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2, &budget};
                 get_mem2(physical_, &mem2);
                 const auto& mem = mem2.memoryProperties;
-                for (std::uint32_t i = 0; i < mem.memoryHeapCount; ++i) {
-                    const bool is_local = (mem.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) != 0;
-                    if (is_local == want_local) {
-                        info->Budget += budget.heapBudget[i];
-                        info->CurrentUsage += budget.heapUsage[i];
+                if (want_local) {
+                    const std::uint32_t local_heap = primary_device_local_heap(mem);
+                    if (local_heap != UINT32_MAX) {
+                        info->Budget = budget.heapBudget[local_heap];
+                        info->CurrentUsage = budget.heapUsage[local_heap];
+                    }
+                } else {
+                    for (std::uint32_t i = 0; i < mem.memoryHeapCount; ++i) {
+                        if ((mem.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) == 0) {
+                            info->Budget += budget.heapBudget[i];
+                            info->CurrentUsage += budget.heapUsage[i];
+                        }
                     }
                 }
             }
@@ -559,12 +583,11 @@ private:
                 gipa_(instance_, "vkGetPhysicalDeviceMemoryProperties"))) {
             VkPhysicalDeviceMemoryProperties mem{};
             get_mem(physical_, &mem);
-            std::uint64_t dedicated = 0;
+            const std::uint32_t local_heap = primary_device_local_heap(mem);
+            const std::uint64_t dedicated = (local_heap != UINT32_MAX) ? mem.memoryHeaps[local_heap].size : 0;
             std::uint64_t shared = 0;
             for (std::uint32_t i = 0; i < mem.memoryHeapCount; ++i) {
-                if (mem.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)
-                    dedicated += mem.memoryHeaps[i].size;
-                else
+                if ((mem.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) == 0)
                     shared += mem.memoryHeaps[i].size;
             }
             desc_.DedicatedVideoMemory = static_cast<SIZE_T>(dedicated);

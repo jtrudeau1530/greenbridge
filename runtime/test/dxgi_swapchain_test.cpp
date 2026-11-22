@@ -591,6 +591,18 @@ int main() {
             return fail("Adapter desc did not match Vulkan physical device");
         if (desc1.DedicatedVideoMemory + desc1.SharedSystemMemory == 0)
             return fail("Adapter reported zero total memory");
+        if (const auto get_mem = reinterpret_cast<PFN_vkGetPhysicalDeviceMemoryProperties>(
+                gipa(instance, "vkGetPhysicalDeviceMemoryProperties"))) {
+            VkPhysicalDeviceMemoryProperties mem{};
+            get_mem(physical, &mem);
+            VkDeviceSize max_local = 0;
+            for (std::uint32_t i = 0; i < mem.memoryHeapCount; ++i) {
+                if ((mem.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) && mem.memoryHeaps[i].size > max_local)
+                    max_local = mem.memoryHeaps[i].size;
+            }
+            if (desc1.DedicatedVideoMemory != static_cast<SIZE_T>(max_local))
+                return fail("DedicatedVideoMemory should match the primary DEVICE_LOCAL heap (without double-counting BAR1)");
+        }
         if (desc0.VendorId != desc1.VendorId || desc2.DeviceId != desc1.DeviceId)
             return fail("Adapter desc mismatch between GetDesc/GetDesc1/GetDesc2");
 
