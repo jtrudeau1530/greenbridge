@@ -341,7 +341,8 @@ class CliTests(unittest.TestCase):
         return subprocess.run([sys.executable, "-I", TOOL, *args], capture_output=True, text=True)
 
     def test_directory_and_archive(self):
-        pages = [page(block(20), group([(20, 18)])), page(group([(6, 4)]), block(6, colour=False, uv1=False))]
+        pages = [page(block(20), group([(20, 18)])), page(group([(6, 4)]), block(6, colour=False, uv1=False)),
+                 page(other_block(10), group([(10, 8)]))]
         with tempfile.TemporaryDirectory() as tmp:
             folder = os.path.join(tmp, "carve")
             os.mkdir(folder)
@@ -355,9 +356,11 @@ class CliTests(unittest.TestCase):
             self.assertEqual(r.returncode, 0, r.stderr)
             with open(out, encoding="utf-8") as fh:
                 totals = json.load(fh)["totals"]
-            self.assertEqual((totals["pages"], totals["block_led_pages"], totals["group_led_pages"]), (2, 1, 1))
-            self.assertEqual((totals["blocks"], totals["groups"], totals["vertices"]), (2, 2, 26))
+            self.assertEqual((totals["pages"], totals["block_led_pages"], totals["group_led_pages"]), (3, 1, 1))
+            self.assertEqual((totals["blocks"], totals["groups"], totals["vertices"]), (2, 3, 26))
             self.assertEqual(totals["groups_matching_block_near"], 2)
+            # a page that starts with a 42 40 block is read from a directory too, not only from an archive
+            self.assertEqual((totals["block_4240_led_pages"], totals["blocks_4240"]), (1, 1))
 
             # A minimal RPF9-like file: data offset at +4, then zlib streams (one is not a mesh page).
             rpf = os.path.join(tmp, "a.rpf")
@@ -368,7 +371,7 @@ class CliTests(unittest.TestCase):
             r = self.run_tool(rpf, "--json", out2, "--quiet")
             self.assertEqual(r.returncode, 0, r.stderr)
             with open(out2, encoding="utf-8") as fh:
-                self.assertEqual(json.load(fh)["totals"]["pages"], 2)
+                self.assertEqual(json.load(fh)["totals"]["pages"], 3)
 
     def test_page_report_write_failure_is_reported(self):
         with tempfile.TemporaryDirectory() as tmp:

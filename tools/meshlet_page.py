@@ -359,7 +359,7 @@ def iter_inputs(paths):
                     full = os.path.join(root, f)
                     with open(full, "rb") as fh:
                         head = fh.read(4)
-                        if len(head) == 4 and (head == b"\x63\x30\x00\x00" or head[3] & 0x80):
+                        if len(head) == 4 and (head in (b"\x63\x30\x00\x00", b"\x42\x40\x00\x00") or head[3] & 0x80):
                             data = head + fh.read()
                             if is_mesh_page(data):
                                 yield os.path.relpath(full, path), data
