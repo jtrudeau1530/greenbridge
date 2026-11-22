@@ -10,6 +10,7 @@
 #define VK_NO_PROTOTYPES
 #endif
 #include "binary_occlusion_spirv.h"
+#include "buffer_va_index.h"
 #include "occlusion_sum_spirv.h"
 #include "retire_tickets.h"
 #include "statistics_sum_spirv.h"
@@ -818,18 +819,19 @@ public:
             const auto it = graphics_pipelines_.find(id);
             return it == graphics_pipelines_.end() ? nullptr : &it->second;
         };
-        // Called with resource_mutex_ held. A linear search: fine for the first frames, an interval map when it shows.
+        // Called with resource_mutex_ held. A binary search of the buffers' VA ranges (buffer_va_index.h), kept in step
+        // with resources_ by set_resource_locked and remove_resource.
         // A range that runs past its buffer is cut at the buffer's end (`size` is updated): D3D12 reads past a view's
         // buffer as out of bounds, which is no reason to drop the submission.
         replay_.buffer_at = [this](std::uint64_t va, std::uint64_t& size, VkBuffer& buffer, VkDeviceSize& offset) {
-            for (const auto& [id, b] : resources_) {
-                if (b.image || !b.buffer || !b.va || va < b.va || va - b.va >= b.size) continue;
-                buffer = b.buffer;
-                offset = b.buffer_offset + (va - b.va);
-                size = std::min<std::uint64_t>(size, b.size - (va - b.va));
-                return true;
-            }
-            return false;
+            BufferVaIndex<ResourceId>::Hit hit{};
+            if (!buffer_vas_.find(va, hit)) return false;
+            const ResourceBinding* b = resolve(hit.id);
+            if (!b) return false;
+            buffer = b->buffer;
+            offset = b->buffer_offset + (va - b->va);
+            size = std::min<std::uint64_t>(size, b->size - (va - b->va));
+            return true;
         };
         if (xdxr && loaded_) {
             xdxr_ = std::make_unique<XdxrBuilder>(get, device);
@@ -927,11 +929,11 @@ public:
     // The image must already be in that layout, e.g. transitioned from UNDEFINED at creation.
     void add_resource(ResourceId id, const ResourceBinding& binding) {
         std::unique_lock lock(resource_mutex_);
-        resources_[id] = binding;
+        set_resource_locked(id, binding);
     }
     void add_resource(ResourceId id, const ResourceBinding& binding, VkImageLayout current_layout) {
         std::unique_lock rlock(resource_mutex_);
-        resources_[id] = binding;
+        set_resource_locked(id, binding);
         if (binding.image) {
             std::lock_guard tlock(tracker_mutex_);
             tracker_.track(id, binding, current_layout);
@@ -949,7 +951,7 @@ public:
 
     void add_sparse_buffer(ResourceId id, const ResourceBinding& binding, std::shared_ptr<SparseBuffer> buffer) {
         std::unique_lock lock(resource_mutex_);
-        resources_[id] = binding;
+        set_resource_locked(id, binding);
         sparse_buffers_.emplace(id, std::move(buffer));
     }
 
@@ -960,6 +962,7 @@ public:
             const auto it = resources_.find(id);
             if (it == resources_.end()) return;
             img = it->second.image;
+            unindex_buffer(id, it->second);
             resources_.erase(it);
             sparse_buffers_.erase(id);
         }
@@ -1227,6 +1230,22 @@ private:
     friend class VulkanQueue;
     friend class VulkanPresenter;
 
+    // buffer_at finds a buffer by VA: one with no image, a VkBuffer, a VA and bytes (what the linear search it replaced
+    // accepted). Both are called with resource_mutex_ held uniquely.
+    static bool addressable(const ResourceBinding& b) { return !b.image && b.buffer && b.va && b.size; }
+    void unindex_buffer(ResourceId id, const ResourceBinding& b) {
+        if (addressable(b)) buffer_vas_.erase(b.va, id);
+    }
+    // resources_[id] = binding, with the VA index kept in step (a re-registered ID drops its old range first).
+    void set_resource_locked(ResourceId id, const ResourceBinding& binding) {
+        auto [it, inserted] = resources_.try_emplace(id, binding);
+        if (!inserted) {
+            unindex_buffer(id, it->second);
+            it->second = binding;
+        }
+        if (addressable(binding)) buffer_vas_.insert(binding.va, binding.size, id);
+    }
+
     const ResourceBinding* resolve(ResourceId id) const {
         const auto it = resources_.find(id);
         return it == resources_.end() ? nullptr : &it->second;
@@ -1269,6 +1288,7 @@ private:
     DeferredDeletionQueue deletion_queue_;
     std::unique_ptr<FenceWaitDispatcher> fence_dispatcher_;
     std::unordered_map<ResourceId, ResourceBinding> resources_;
+    BufferVaIndex<ResourceId> buffer_vas_;  // the addressable buffers of resources_, by VA range (buffer_at)
     std::unordered_map<ResourceId, std::shared_ptr<SparseBuffer>> sparse_buffers_;
     std::unordered_map<std::uintptr_t, ComputePipeline> pipelines_;
     std::unordered_map<std::uintptr_t, GraphicsPipeline> graphics_pipelines_;
