@@ -21,8 +21,13 @@
 #include "../shims/d3d12_xs_device.h"
 #include "../src/shader_library.h"
 
+#include <algorithm>
 #include <array>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
+#include <vector>
 
 #ifndef LEONIDA_TEST_M2_DIR
 #error "LEONIDA_TEST_M2_DIR must name the folder build.py wrote (spirv/index.json, fssm/*.fssm)"
