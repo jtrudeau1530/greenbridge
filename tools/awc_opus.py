@@ -203,7 +203,10 @@ def music_channels(d: bytes, mus, data, collect_packets: bool = True):
     blocks, chunk, channels = struct.unpack_from("<III", d, m_at)
     if not (1 <= channels <= 32 and 1 <= blocks and chunk >= 2048 and m_size == 12 + 16 * channels):
         return []
-    if blocks * chunk > d_size:
+    # Every block must start inside the data tag. The last block is usually shorter than `chunk` (game banks
+    # hold e.g. 1 block of a 524,288-byte chunk in a 264,192-byte tag), so `blocks * chunk` is not a bound;
+    # each block's own record table and subblock run are checked against the bytes left below.
+    if (blocks - 1) * chunk >= d_size:
         return []
     info = []
     for c in range(channels):
@@ -214,6 +217,8 @@ def music_channels(d: bytes, mus, data, collect_packets: bool = True):
         info.append([cid, samples, rate, d[base + 12], [], 0])
     for b in range(blocks):
         at = d_at + b * chunk
+        if channels * 24 > d_size - b * chunk:
+            return []
         recs = [struct.unpack_from("<III", d, at + 24 * c + 4)[:2] for c in range(channels)]   # (count, skip)
         total = sum(r[0] for r in recs)
         header = (channels * 24 + total * 4 + 2047) & ~2047
