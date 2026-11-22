@@ -21,6 +21,7 @@
 // capability on a device without shaderResourceMinLod prints "unsupported: ..." and exits 77.
 #define VK_NO_PROTOTYPES
 #include "vulkan_loader.h"
+#include "vk_device_pick.h"
 
 #include <algorithm>
 #include <cmath>
@@ -132,12 +133,14 @@ int main(int argc, char** argv) {
     }
     VkPhysicalDevice pd = VK_NULL_HANDLE;
     VkPhysicalDeviceProperties properties{};
+    int best_rank = -1;
     for (uint32_t i = 0; i < n; ++i) {
         VkPhysicalDeviceProperties p;
         vkGetPhysicalDeviceProperties(pds[i], &p);
-        if (!pd || p.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) {
+        if (const int rank = leonida::vk_test::device_rank(p.deviceType, p.vendorID); rank > best_rank) {
             pd = pds[i];
             properties = p;
+            best_rank = rank;
         }
     }
     constexpr uint32_t push_words = 36;

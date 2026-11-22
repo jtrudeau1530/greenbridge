@@ -5,6 +5,7 @@
 
 #include "vulkan_loader.h"
 #include "../src/vulkan_device_filter.h"
+#include "vk_device_pick.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -198,6 +199,7 @@ public:
         });
         if (result != VK_SUCCESS) return failure("vkEnumeratePhysicalDevices", result);
         VkPhysicalDeviceProperties chosen{};
+        int best_rank = -1;
         for (auto candidate : devices) {
             VkPhysicalDeviceProperties props{};
             properties_of(candidate, &props);
@@ -208,10 +210,12 @@ public:
             families_of(candidate, &family_count, families.data());
             for (std::uint32_t i = 0; i < family_count; ++i) {
                 if (!(families[i].queueFlags & VK_QUEUE_GRAPHICS_BIT)) continue;
-                if (!physical || props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) {
+                if (const int rank = leonida::vk_test::device_rank(props.deviceType, props.vendorID);
+                    rank > best_rank) {
                     physical = candidate;
                     family = i;
                     chosen = props;
+                    best_rank = rank;
                 }
                 break;
             }
