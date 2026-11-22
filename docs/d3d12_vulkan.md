@@ -496,6 +496,15 @@ side inwards:
     `maxPerSetDescriptors`, which never shrinks the default counts, because a layout past it may still be
     supported: past it, the device grows only where `vkGetDescriptorSetLayoutSupport` accepts the grown layout.
     Intel's UHD 770 (101.7092) reports 6159 and accepts the full sizes, so it gets the same set as an RTX (D3D-219).
+    MoltenVK (1.4.2 and 1.4.3 on an M3 Max) reports 1212 and accepts only layouts with fewer descriptors than that
+    (`MVKDevice::getDescriptorSetLayoutSupport` compares the sum with it), although it creates and samples a set of
+    65536 2D images and 4096 samplers correctly (a native repro, and `d3d12_descriptor_test` under Wine with the set
+    grown). So on MoltenVK the D3D12 device doesn't ask: the per-type update-after-bind limits, which MoltenVK takes
+    from Metal's argument-buffer limits (500000 samplers on an M3 Max), decide alone, and the set grows as on other
+    GPUs. Where a set still ends up short of a full 2048-sampler D3D12 heap, the device logs that at startup. Past
+    the last free index, `CreateShaderResourceView` and `CreateSampler` log once that the array is full, and a
+    shader reads the fallback. `d3d12_descriptor_test` then fills each short array to its last index and checks that
+    the next view and sampler are refused.
     The other arrays keep their default counts. On an RTX 5070 (driver 621.24, 1048576 of each type
     and 4000 samplers) the set has 65536 2D images, 3936 samplers and 4096 storage indices in 2D: 93793
     descriptors, 3-6 MiB at 32-64 bytes a descriptor. The device prints the counts it chose, and

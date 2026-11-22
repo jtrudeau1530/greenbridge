@@ -3885,7 +3885,16 @@ public:
             const auto layout_support = reinterpret_cast<PFN_vkGetDescriptorSetLayoutSupport>(
                 get_device(state_.info.device, "vkGetDescriptorSetLayoutSupport"));
             std::function<bool(const leonida::BindlessFeatures&)> layout_supported;
-            if (layout_support)
+            // MoltenVK's vkGetDescriptorSetLayoutSupport compares every layout with maxPerSetDescriptors (1212, the
+            // limit without argument buffers) and rejects even 1212 itself, while it creates and samples a 65536-image,
+            // 4096-sampler update-after-bind set correctly (docs/d3d12_vulkan.md section 5). There size_bindings'
+            // per-type update-after-bind limits, which MoltenVK takes from Metal's argument-buffer limits, decide.
+            VkPhysicalDeviceDriverProperties driver{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
+            VkPhysicalDeviceProperties2 driver_properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &driver};
+            get_properties(state_.info.physical, &driver_properties);
+            if (driver.driverID == VK_DRIVER_ID_MOLTENVK)
+                layout_supported = [](const leonida::BindlessFeatures&) { return true; };
+            else if (layout_support)
                 layout_supported = [&](const leonida::BindlessFeatures& candidate) {
                     const leonida::bindless::SetLayout layout(candidate);
                     VkDescriptorSetLayoutSupport support{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_SUPPORT};
@@ -3906,6 +3915,13 @@ public:
                      features.counts[b::sampled_binding(leonida::ImageDimension::dim_3d)],
                      features.counts[b::sampled_binding(leonida::ImageDimension::dim_1d)],
                      features.counts[b::storage_binding(leonida::ImageDimension::dim_2d, 0)]);
+        // D3D12 promises a shader holds a full shader-visible sampler heap. Past this many distinct S#s, CreateSampler
+        // logs that the array is full and a shader reads the fallback (clamping) sampler.
+        if (features.counts[b::sampler_binding] < D3D12_MAX_SHADER_VISIBLE_SAMPLER_HEAP_SIZE + 1)
+            std::fprintf(stderr, "[rt] d3d12: the bindless set holds fewer samplers than a full shader-visible "
+                                 "sampler heap (%u of %u besides the fallback): its limits or "
+                                 "vkGetDescriptorSetLayoutSupport allow no more\n",
+                         features.counts[b::sampler_binding] - 1, unsigned(D3D12_MAX_SHADER_VISIBLE_SAMPLER_HEAP_SIZE));
         state_.bindless = std::make_unique<leonida::BindlessSet>(get_device, state_.info.device, state_.memory, features);
         if (!state_.bindless->ok() || !state_.context->vk.vkCreateSampler) {
             state_.bindless.reset();
@@ -6801,6 +6817,12 @@ VkDescriptorSetLayout bindless_set_layout(ID3D12Device* device) {
 std::uint32_t bindless_hash_lookup(ID3D12Device* device, const std::uint32_t (&key)[8]) {
     const leonida::BindlessSet* set = bindless_of(device);
     return set ? set->table().lookup(key) : 0;
+}
+
+BindlessRoom bindless_room(ID3D12Device* device) {
+    const leonida::BindlessSet* set = bindless_of(device);
+    if (!set) return {};
+    return {set->free_images(leonida::ImageDimension::dim_2d), set->free_samplers()};
 }
 
 WindowPresenter::WindowPresenter(IUnknown* device, std::unique_ptr<leonida::VulkanPresenter> presenter)

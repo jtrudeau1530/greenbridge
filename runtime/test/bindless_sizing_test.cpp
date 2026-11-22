@@ -203,6 +203,22 @@ int main() {
         EXPECT(totals(f).all <= 6159 || (count(f, D::dim_2d) == 4096 && f.counts[bindless::sampler_binding] == 1024));
     }
 
+    // MoltenVK 1.4.3 on an M3 Max: update-after-bind limits of 1000000 sampled images and 500000 samplers, but
+    // maxPerSetDescriptors 1212 and a vkGetDescriptorSetLayoutSupport that accepts only fewer descriptors than that
+    // (MVKDevice::getDescriptorSetLayoutSupport), though the device creates and samples far larger sets. So the
+    // set keeps the default counts: 1024 samplers, short of a full D3D12 sampler heap (d3d12_descriptor_test).
+    {
+        Device d = uniform(1048576, 1000000);
+        d.v12.maxPerStageDescriptorUpdateAfterBindSamplers = d.v12.maxDescriptorSetUpdateAfterBindSamplers = 500000;
+        d.limits.maxSamplerAllocationCount = 500000;
+        d.v11.maxPerSetDescriptors = 1212;
+        const auto below_1212 = [](const BindlessFeatures& candidate) { return totals(candidate).all < 1212; };
+        BindlessFeatures f = with_ms(true);
+        EXPECT(bindless::size_bindings(f, d.limits, d.v11, d.v12, below_1212));
+        EXPECT(count(f, D::dim_2d) == 4096 && f.counts[bindless::sampler_binding] == 1024 &&
+               storage(f, D::dim_2d) == 256);
+    }
+
     // The default features are today's counts, which the device-less users (vk_image_fuzz) still get.
     EXPECT(BindlessFeatures{}.counts == defaults);
     std::printf("bindless sizing: synthetic limits gave the expected counts\n");
