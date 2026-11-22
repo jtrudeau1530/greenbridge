@@ -6,6 +6,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import unittest.mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOL = os.path.join(ROOT, "tools", "psin_index.py")
@@ -134,6 +135,34 @@ class TestCli(unittest.TestCase):
                                    capture_output=True, text=True)
                 self.assertEqual(p.returncode, 2)
                 self.assertIn("must be at least 1", p.stderr)
+
+    def test_missing_source_is_one_line(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for missing in (os.path.join(tmp, "nope"), os.path.join(tmp, "nope.bin")):
+                p = subprocess.run([sys.executable, "-I", TOOL, missing, "--json"],
+                                   capture_output=True, text=True)
+                self.assertEqual(p.returncode, 2, p.stderr)
+                self.assertNotIn("Traceback", p.stderr)
+                self.assertIn(missing, p.stderr)
+                self.assertEqual(p.stdout, "")
+
+    def test_unlistable_folder_is_one_line(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            # A folder that cannot be listed (no permission); patched so the test runs the same on every OS.
+            with unittest.mock.patch("os.listdir", side_effect=PermissionError(13, "Permission denied")):
+                code, err = run_main([tmp])
+            self.assertEqual(code, 2)
+            self.assertIn("Permission denied", err)
+
+
+def run_main(argv):
+    import io
+    from contextlib import redirect_stderr, redirect_stdout
+    err = io.StringIO()
+    with unittest.mock.patch.object(sys, "argv", ["psin_index.py", *argv]), \
+            redirect_stdout(io.StringIO()), redirect_stderr(err):
+        code = P.main()
+    return code, err.getvalue()
 
 
 if __name__ == "__main__":
