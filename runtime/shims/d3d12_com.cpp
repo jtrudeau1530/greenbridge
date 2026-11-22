@@ -703,7 +703,9 @@ public:
 
     D3D12_COMMAND_QUEUE_DESC STDMETHODCALLTYPE GetDesc() override {
         d3d12_trace::record("ID3D12CommandQueue::GetDesc");
-        return desc_;
+        D3D12_COMMAND_QUEUE_DESC desc = desc_;
+        if (!desc.NodeMask) desc.NodeMask = 1;  // node mask 0 reads back as the one node, as on the host
+        return desc;
     }
 
     void STDMETHODCALLTYPE ExecuteCommandLists(UINT count, ID3D12CommandList* const* lists) override {
