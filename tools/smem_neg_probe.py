@@ -98,10 +98,10 @@ def kernel_lines():
     return lines, order
 
 
-def main():
+def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--oracle", choices=("translator", "hw"), default="translator")
-    a = ap.parse_args()
+    a = ap.parse_args(argv)
     want = expected()
     if a.oracle == "translator":
         for name, vals in want.items():
@@ -110,20 +110,23 @@ def main():
     import asm
     import runner
     try:
-        oracle = runner.Oracle()
+        oracle = runner.open_oracle()
     except runner.Unavailable as e:
         print(f"hardware oracle unavailable: {e}")
         return 77
-    lines, order = kernel_lines()
-    n = len(order)
-    got = {}
-    for wave in (32, 64):
-        res = oracle.run([asm.Kernel(lines, wave=wave, threads=1, words=n, raw=True, vgprs=8, sgprs=64)])[0]
-        if isinstance(res, str):
-            print(f"wave{wave}: kernel rejected: {res}")
-            return 2
-        got[wave] = res
-    print(f"device: {oracle.device} ({oracle.arch})")
+    try:
+        lines, order = kernel_lines()
+        n = len(order)
+        got = {}
+        for wave in (32, 64):
+            res = oracle.run([asm.Kernel(lines, wave=wave, threads=1, words=n, raw=True, vgprs=8, sgprs=64)])[0]
+            if isinstance(res, str):
+                print(f"wave{wave}: kernel rejected: {res}")
+                return 2
+            got[wave] = res
+        print(f"device: {oracle.device} ({oracle.arch})")
+    finally:
+        oracle.close()
     bad, i = 0, 0
     for name, _ls, regs, _soff, _xs in ROWS:
         w32 = got[32][i:i + len(regs)]
