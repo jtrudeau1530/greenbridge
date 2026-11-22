@@ -540,6 +540,19 @@ class PreflightPrerequisiteTest(PreflightTestBase):
                                         match="about 330 GB is needed")
                 self.assertIn("250 GB free", err)
 
+    def test_preflight_low_space_points_at_run_only_stages(self):
+        with tempfile.TemporaryDirectory() as tmp_work:
+            with mock.patch("sys.version_info", (3, 12, 0)), \
+                 mock.patch("shutil.which", return_value="/usr/bin/tool"), \
+                 mock.patch("make_game.tool_available", return_value=True), \
+                 mock.patch("make_game.ensure_submodule", return_value=None), \
+                 mock.patch("os.path.isfile", return_value=True), \
+                 mock.patch("shutil.disk_usage", return_value=Usage(500 * 2**30, 250 * 2**30, 250 * 2**30)):
+                err = self.assert_fails(make_game.preflight, ["shaders", "assets"], tmp_work, wav=False,
+                                        match="assets stage is optional")
+                self.assertIn("--stages check,shaders,runtime", err)
+                self.assertIn("about 330 GB is needed", err)
+
     def test_ensure_submodule_present_is_noop(self):
         with tempfile.TemporaryDirectory() as tmp:
             core_dir = os.path.join(tmp, "third_party", "rpf9-explorer", "Core")
