@@ -110,9 +110,16 @@ def main():
             print(f"no reference output from {ref_name}: cannot compare")
             return 1
         bad = [n for n, _, _ in CONFIGS[1:] if n in hashes and hashes[n] != ref]
+        missing = [n for n, _, _ in CONFIGS[1:] if n not in hashes]
         print(f"reference output hash: {next(iter(ref))} ({ref_name})")
-        print("emulated output equals the reference" if not bad else f"OUTPUT DIFFERS from the reference: {', '.join(bad)}")
-        return 1 if bad or len(hashes) < len(CONFIGS) else 0
+        if bad:
+            print(f"OUTPUT DIFFERS from the reference: {', '.join(bad)}")
+        if missing:
+            print(f"incomplete comparison: no complete result from {', '.join(missing)}")
+        if bad or missing:
+            return 1
+        print("emulated output equals the reference")
+        return 0
 
 
 if __name__ == "__main__":

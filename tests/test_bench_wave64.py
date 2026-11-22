@@ -43,6 +43,8 @@ class PartialFailure(unittest.TestCase):
         code, out = bench({"NVIDIA --wave64-emulate": 2})
         self.assertEqual(code, 1, out)
         self.assertIn("NVIDIA --wave64-emulate: failed or unsupported", out)
+        self.assertIn("incomplete comparison: no complete result from NVIDIA --wave64-emulate", out)
+        self.assertNotIn("emulated output equals the reference", out)
 
     def test_reference_fails_on_its_second_process(self):
         code, out = bench({"AMD native": 2})
