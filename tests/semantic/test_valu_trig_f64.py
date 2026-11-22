@@ -1016,5 +1016,87 @@ class TestSIMDMultiLaneDivergence(unittest.TestCase):
             ref_simd_trig_f64([0] * 16, wave_size=16)
 
 
+# ==============================================================================
+# Register Aliasing and In-Place Operand Preservation for v_trig_f64
+# ==============================================================================
+
+class TestRegisterAliasing(unittest.TestCase):
+    """Test suite for register aliasing and in-place operand preservation."""
+
+    def test_inplace_dst_equals_src0(self) -> None:
+        interp = ScalarInterpreter()
+        interp.vgpr.set_vgpr_pair(4, F64_QUARTER)
+
+        # v[4:5] = v_trig_f64(v[4:5]) -> sin(0.25 turns) = 1.0
+        res = interp.execute_asm("v_trig_f64 v[4:5], v[4:5]")
+        self.assertEqual(res, F64_ONE)
+        self.assertEqual(interp.vgpr.get_vgpr_pair(4), F64_ONE)
+
+    def test_partially_overlapping_register_pairs(self) -> None:
+        interp = ScalarInterpreter()
+        # Setup: src0 at v[0:1]
+        interp.vgpr.set_vgpr_pair(0, F64_QUARTER)
+        v0_before = interp.vgpr.get_vgpr(0)
+
+        # Execute with dst as unaligned v[1:2] overlapping src0 via v[1]
+        dst = ASTOperand(kind=OperandKind.VGPR_PAIR, reg_idx=1)
+        src0 = ASTOperand(kind=OperandKind.VGPR_PAIR, reg_idx=0)
+        inst = ASTInstruction(opcode="v_trig_f64", dst=dst, src0=src0, mode=TrigMode.SIN)
+        res = interp.execute_ast(inst)
+
+        self.assertEqual(res, F64_ONE)
+        self.assertEqual(interp.vgpr.get_vgpr_pair(1), F64_ONE)
+        # Non-overlapping boundary dword v[0] must remain completely unchanged
+        self.assertEqual(interp.vgpr.get_vgpr(0), v0_before)
+
+    def test_adjacent_register_isolation(self) -> None:
+        interp = ScalarInterpreter()
+        sentinel_lo = 0x11112222
+        sentinel_hi = 0x33334444
+        sentinel = join_dwords(sentinel_lo, sentinel_hi)
+
+        interp.vgpr.set_vgpr_pair(0, sentinel)
+        interp.vgpr.set_vgpr_pair(2, F64_QUARTER)
+        interp.vgpr.set_vgpr_pair(4, sentinel)
+
+        # Execute v_trig_f64 writing only to v[2:3]
+        interp.execute_asm("v_trig_f64 v[2:3], v[2:3]")
+
+        self.assertEqual(interp.vgpr.get_vgpr_pair(2), F64_ONE)
+        # Adjacent v[0:1] and v[4:5] must not be corrupted
+        self.assertEqual(interp.vgpr.get_vgpr_pair(0), sentinel)
+        self.assertEqual(interp.vgpr.get_vgpr_pair(4), sentinel)
+
+    def test_simd_inplace_divergent_mask(self) -> None:
+        sim = SIMDWavefront(wave_size=32)
+        init_vals = [f64_to_u64(0.25) if i % 2 == 1 else f64_to_u64(0.12345) for i in range(32)]
+        sim.store_vgpr_pair_wave(0, init_vals)
+
+        # Active on odd lanes only: 0xAAAAAAAA
+        sim.exec_mask = 0xAAAAAAAA
+        res = sim.step_v_trig_f64(0, 0, mode=TrigMode.SIN)
+
+        for lane in range(32):
+            if lane % 2 == 1:
+                # Active lane: updated to sin(0.25) = 1.0
+                self.assertEqual(res[lane], F64_ONE, f"Lane {lane} failed to update")
+            else:
+                # Inactive lane: preserved original
+                self.assertEqual(res[lane], init_vals[lane], f"Lane {lane} was mutated")
+
+    def test_successive_inplace_trig_chain(self) -> None:
+        interp = ScalarInterpreter()
+        # Start with 0.25 -> sin(0.25) = 1.0 -> sin(1.0) = 0.0 -> sin(0.0) = 0.0
+        interp.vgpr.set_vgpr_pair(0, F64_QUARTER)
+        interp.execute_asm("v_trig_f64 v[0:1], v[0:1]")
+        self.assertEqual(interp.vgpr.get_vgpr_pair(0), F64_ONE)
+
+        interp.execute_asm("v_trig_f64 v[0:1], v[0:1]")
+        self.assertEqual(interp.vgpr.get_vgpr_pair(0), F64_POS_ZERO)
+
+        interp.execute_asm("v_trig_f64 v[0:1], v[0:1]")
+        self.assertEqual(interp.vgpr.get_vgpr_pair(0), F64_POS_ZERO)
+
+
 if __name__ == "__main__":
     unittest.main()
