@@ -338,5 +338,22 @@ class CarveAndExtraCLITest(unittest.TestCase):
         self.assertEqual(mapping["18c8836d"], "str_63346_847129")
 
 
+class OutputPathTest(unittest.TestCase):
+    def test_out_creates_its_parent_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            carve = os.path.join(tmp, "carve")
+            os.makedirs(carve)
+            with open(os.path.join(carve, "index.json"), "w", encoding="utf-8") as f:
+                json.dump({"files": []}, f)
+            out = os.path.join(tmp, "nested", "deeper", "hashes.json")
+            p = subprocess.run([sys.executable, "-I", TOOL, carve, "--out", out],
+                               capture_output=True, text=True)
+            self.assertEqual(p.returncode, 0, p.stderr)
+            self.assertNotIn("Traceback", p.stderr)
+            self.assertTrue(os.path.isfile(out))
+            with open(out, encoding="utf-8") as f:
+                self.assertEqual(json.load(f), {})
+
+
 if __name__ == "__main__":
     unittest.main()
