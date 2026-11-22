@@ -424,7 +424,8 @@ def main(argv=None):
             print(f"error: {p} does not exist", file=sys.stderr)
             return 2
         if os.path.isdir(p):
-            for root, _, files in os.walk(p):
+            for root, directories, files in os.walk(p):
+                directories.sort()
                 archives += [os.path.join(root, f) for f in sorted(files) if f.lower().endswith(".rpf")]
         else:
             archives.append(p)
