@@ -64,8 +64,8 @@ SIZE_T __stdcall XMemVirtualQuery(HANDLE process, const void* address, void* out
 // 0x75b1): ECX is the constant 0x20000001 (its meaning is not known) and RDX points at a stack buffer (0x80 bytes
 // where the frame shows it). The caller reads a 64-bit size at +8 and treats a zero return as "no data". Taking the
 // pointer from the first argument wrote to address 0x20000001.
-// Only the first 16 bytes are touched: zero at +0 (unknown) and the process working set at +8. Do not claim more of
-// the struct than is measured.
+// Other Series layers (xcl, xbox-emulator) and title engine telemetry write the title's memory limit at +0 and
+// working set at +8 (RT-220).
 BOOL __stdcall XMemGetWorkingSetStatistics(uint32_t /*kind*/, void* stats) {
     if (!stats) {
         static std::atomic<bool> warned{false};
@@ -78,8 +78,15 @@ BOOL __stdcall XMemGetWorkingSetStatistics(uint32_t /*kind*/, void* stats) {
     PROCESS_MEMORY_COUNTERS pmc{};
     if (!GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc))) return FALSE;
 
+    MEMORYSTATUSEX ms{sizeof(ms)};
+    uint64_t total_memory = 12ULL * 1024 * 1024 * 1024;
+    if (GlobalMemoryStatusEx(&ms) && ms.ullTotalPhys != 0) {
+        total_memory = ms.ullTotalPhys;
+    }
+
     uint8_t* bytes = static_cast<uint8_t*>(stats);
     std::memset(bytes, 0, 16);
+    std::memcpy(bytes + 0, &total_memory, sizeof(total_memory));
     uint64_t working_set = pmc.WorkingSetSize;
     std::memcpy(bytes + 8, &working_set, sizeof(working_set));
     return TRUE;
