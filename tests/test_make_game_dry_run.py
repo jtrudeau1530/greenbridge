@@ -199,6 +199,7 @@ class SkipAssetsAndStageIsolationTest(unittest.TestCase):
                 mock.patch.object(make_game, "dotnet_sdk_ok") as mock_dotnet, \
                 mock.patch.object(make_game, "ensure_submodule") as mock_submodule, \
                 mock.patch.object(make_game, "tool_available", return_value=True), \
+                mock.patch.object(make_game, "pipeline_check_exe", return_value="/bin/vk_pipeline_check"), \
                 mock.patch("shutil.which", return_value="/usr/bin/tool"), \
                 mock.patch("shutil.disk_usage", return_value=mock.Mock(free=100 * (2**30))):
             make_game.preflight(["shaders", "pipelines"], self.work_dir, wav=True)  # no runtime: Windows-only
@@ -393,6 +394,8 @@ class StageResumptionAndStepIsolationTest(unittest.TestCase):
             f.write("{}")
         with open(os.path.join(spirv_dir, "wave64_emulate.txt"), "w", encoding="utf-8") as f:
             f.write("off\n")
+        with open(os.path.join(spirv_dir, "translation_sources.sha256"), "w", encoding="utf-8") as f:
+            f.write(make_game.translation_sources_digest() + "\n")
 
         with mock.patch("make_game.py") as mock_py, \
                 mock.patch("make_game.translate") as mock_translate, \

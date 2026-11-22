@@ -26,9 +26,9 @@ sys.path.insert(0, SHADER_DIR)
 from build import CLIP_CASES, clip_container, shader_source
 from check import Skip, clip_test, fmt_1010102_test
 from compute_fixture import compute_header
-from check import (CMPX_CLASS_WORDS, CVT_F32_SAT_CASES, TEST_PROGRAMS, TEXTURE_MIP_DEPENDENCIES, TEXTURE_MIP_TEST,
-                   USER_SGPRS_ENV, USER_SGPRS_WORDS, Skip, mesh_v5_test, not_found_message, pick_build_dir,
-                   start_failure, texture_gradient_a16_test, texture_mip_test)
+from check import (CMPX_CLASS_WORDS, CVT_F32_SAT_CASES, GRADIENT_TESTS, TEST_PROGRAMS, TEXTURE_MIP_DEPENDENCIES,
+                   TEXTURE_MIP_TEST, USER_SGPRS_ENV, USER_SGPRS_WORDS, Skip, mesh_v5_test, not_found_message,
+                   pick_build_dir, start_failure, texture_gradient_a16_test, texture_mip_test)
 from check import TEXOFF_ARGS, texoff_problem   # ps_texoff's expected words and arguments live in check.py
 from check import WAVE32_LANE_DUMPS, narrow_subgroup_skip   # wave32 lane-mask dumps skip below 32 lanes, as in check.py
 
@@ -427,9 +427,8 @@ def check_clip_half(raw_path: str, want_b: float, want_a: float) -> tuple[bool, 
 
 # Shaders a selected test draws with, built even when the filter leaves them out (#192).
 DRAWN_WITH = {"ps_flat": "vs_ids.asm", "ps_texture_sample": "vs_ids.asm", "ps_cube_sample": "vs_ids.asm",
-              "ps_texture_grad_a16": "vs_ids.asm",
-              "ps_texture_sample_d16": "vs_ids.asm",
-              "vs_clip": "ps_ops.asm"}
+              "ps_texture_sample_d16": "vs_ids.asm", "ps_sample_c_lz": "vs_ids.asm", "ps_sample_c_lz_a16": "vs_ids.asm",
+              **{name: "vs_ids.asm" for name in GRADIENT_TESTS}, "vs_clip": "ps_ops.asm"}
 
 
 def with_draw_shaders(asm_files: list[str]) -> list[str]:
@@ -512,17 +511,20 @@ def main() -> int:
 
 
 def run_suite(a, work: str) -> int:
+    asm_files = sorted({f for f in os.listdir(SHADER_DIR) if f.endswith(".asm")} | {n + ".asm" for n in CLIP_CASES})
+    if a.filter:
+        asm_files = [f for f in asm_files if a.filter in f]
+        if not asm_files:
+            print(f"error: --filter {a.filter!r} matched no GPU test cases", file=sys.stderr)
+            return 2
+    build_files = with_draw_shaders(asm_files)
+
     fssm_dir = os.path.join(work, "fssm")
     disasm_dir = os.path.join(work, "disasm")
     spirv_dir = os.path.join(work, "spirv")
     raw_dir = os.path.join(work, "raw")
     for d in (fssm_dir, disasm_dir, spirv_dir, raw_dir):
         os.makedirs(d, exist_ok=True)
-
-    asm_files = sorted({f for f in os.listdir(SHADER_DIR) if f.endswith(".asm")} | {n + ".asm" for n in CLIP_CASES})
-    if a.filter:
-        asm_files = [f for f in asm_files if a.filter in f]
-    build_files = with_draw_shaders(asm_files)
 
     # 1. Create synthetic DXBC / FSSM metadata + assemble .asm -> .s
     for fname in build_files:
@@ -675,7 +677,7 @@ def run_suite(a, work: str) -> int:
                       "cs_w64x_readlane", "cs_w64x_writelane", "cs_w64x_readfirstlane", "cs_w64x_bpermute", "cs_w64x_permute",
                       "cs_w64x_branch", "cs_w64x_ballot", "cs_w64x_wg128_branches", "cs_w64x_lds_raw",
                       "cs_w64x_lds_war", "cs_w64x_partial", "cs_w64x_sbarrier", "cs_w64x_load_ballot_load",
-                      "cs_w64x_mask_reuse", "cs_w64x_mask_reuse2", "cs_w64x_chain_barrier"):
+                      "cs_w64x_mask_reuse", "cs_w64x_mask_reuse2", "cs_w64x_chain_barrier", "cs_barrier_divergent"):
             cs_dump_wants = {
                 "cs_store": [0x400080FF, 0xE00003FF, 0x3C004000, 0xEEEEEEEE, 0x40003C00, 0xBC003800],
                 # base + soffset + imm (cs_smem_soffset_imm.asm); out[4..7] are seeds the shader leaves alone
@@ -713,6 +715,8 @@ def run_suite(a, work: str) -> int:
                 "cs_w64x_partial": [40, 40, 528, 0, 0, 532, 539, 524820],
                 "cs_w64x_sbarrier": [605, 605, 686, 686, 3032, 3013, 3032, 3031],
                 "cs_w64x_load_ballot_load": [43, 74, 75, 42, 42, 18, 41, 32],
+                # SHADER-91: s_barrier sites in different wave-uniform branches meet (cs_barrier_divergent.asm)
+                "cs_barrier_divergent": [127, 126, 125, 124, 123, 122, 121, 120],
             }
             want = cs_dump_wants[name]
             # Every dump but cs_store / cs_smem_soffset_imm / cs_w32_lane_wrap / cs_movrelsd_2 / cs_w32_permute is a whole-wave (wave64) mask test:
@@ -722,7 +726,8 @@ def run_suite(a, work: str) -> int:
             # cs_w64x_partial (a 40-thread group) can't have full subgroups: it asks for size 64 without them.
             emulated = w64_emulated()
             partial = name == "cs_w64x_partial"
-            wave64 = name not in ("cs_store", "cs_smem_soffset_imm", "cs_wqm_w32", "cs_w32_lane_wrap", "cs_movrelsd_2", "cs_w32_permute") and not emulated and not partial
+            wave64 = name not in ("cs_store", "cs_smem_soffset_imm", "cs_wqm_w32", "cs_w32_lane_wrap", "cs_movrelsd_2",
+                                  "cs_w32_permute", "cs_barrier_divergent") and not emulated and not partial
 
             if partial and not emulated:
                 cs_env = dict(os.environ, VKC_SUBGROUP_SIZE="64")
@@ -744,17 +749,20 @@ def run_suite(a, work: str) -> int:
             problem = texture_mip_test(a.build, spirv_dir)
             ok = None if isinstance(problem, Skip) else not problem
             results.append((name, ok, problem or "two passes, 4096 RGBA32F pixels each exact; wrong mip and UV rejected"))
-        elif name == "ps_texture_grad_a16":
-            problem = texture_gradient_a16_test(a.build, spirv_dir)
-            results.append((name, not problem, problem or "4096 RGBA pixels matched"))
-        elif name in ("ps_texture_sample", "ps_cube_sample", "ps_texture_sample_d16"):
+        elif name in GRADIENT_TESTS:
+            problem = texture_gradient_a16_test(a.build, spirv_dir, name)
+            ok = None if isinstance(problem, Skip) else not problem
+            results.append((name, ok, problem or "4096 RGBA pixels matched"))
+        elif name in ("ps_texture_sample", "ps_cube_sample", "ps_texture_sample_d16", "ps_sample_c_lz",
+                      "ps_sample_c_lz_a16"):
             # Bindless texture tests: vk_texture_test finds vs_ids.spv and the shader in its working directory.
             tool = os.path.join(a.build, "vk_texture_test" + ext)
             raw = os.path.join(raw_dir, f"{name}.raw")
             if name == "ps_texture_sample_d16":
                 cmd = [tool, os.path.join(spirv_dir, "vs_ids.spv"), spv, raw, "0", "0", "0", "0", "0"]
             else:
-                mode = ["cube"] if name == "ps_cube_sample" else []
+                mode = {"ps_cube_sample": ["cube"], "ps_sample_c_lz": ["dref"],
+                        "ps_sample_c_lz_a16": ["dref_a16"]}.get(name, [])
                 cmd = [tool, *mode, raw]
             try:
                 p = subprocess.run(cmd, capture_output=True, text=True, cwd=spirv_dir)
@@ -802,8 +810,6 @@ def run_suite(a, work: str) -> int:
             env = dict(gfx_env or os.environ, **PIXEL_ENV[name]) if name in PIXEL_ENV else gfx_env
             rc, msg = run_cmd([vk_harness, vs, spv, raw], env=env)
             if rc == 77:   # vk_harness: the device lacks a feature this shader needs (e.g. barycentrics)
-                m = re.search(r"unsupported: .*", msg)
-                results.append((name, None, f"SKIP ({m.group(0) if m else 'unsupported device'})"))
                 results.append((name, None, unsupported_skip(msg)))
                 continue
             if rc != 0:
@@ -837,6 +843,7 @@ def run_suite(a, work: str) -> int:
                 "ps_f16_const": (0xAAAA3D00, 0x38005555, 0xAAAA3800, 0x3F000000),
                 "ps_f16_const2": (0x42003D00, 0x3D004200, 0xAAAABC00, 3),
                 "ps_f16_pack": (0x34003C00, 0x38003400, 0x34000000, 0x44004200),
+                "ps_sff_imm": (2, 1, 20, 16),                  # SHADER-46: s_ff0/s_ff1 of an immediate
             }
             if name in const_wants:
                 ok, detail = check_pixel_const(raw, const_wants[name])

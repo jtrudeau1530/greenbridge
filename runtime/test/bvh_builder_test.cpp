@@ -398,6 +398,18 @@ int main() {
             check(pc != nullptr, "PC D3D12 device created");
         }
         if (!pc) return 1;
+        if (!on_vulkan) {
+            // The proxy answers ID3D12Device11 with a QueryInterface on the host device. The Windows 10 runtime
+            // without the Agility SDK stops before ID3D12Device11, on hardware and WARP alike (#688).
+            ID3D12Device11* host11 = nullptr;
+            if (FAILED(pc->QueryInterface(IID_PPV_ARGS(&host11))) || !host11) {
+                std::printf("SKIP (the host D3D12 runtime has no ID3D12Device11, e.g. Windows 10 without the Agility "
+                            "SDK; LEONIDA_BVH_DEVICE=vulkan runs on the Vulkan-backed device)\n");
+                pc->Release();
+                return g_failures ? 1 : 0;
+            }
+            host11->Release();
+        }
         pc->AddRef();  // kept for the debug messages; the proxy takes its own reference
         void* proxy = nullptr;
         const HRESULT hr = rt::d3d12_xs::create_device_proxy(pc, __uuidof(ID3D12Device11), &proxy);

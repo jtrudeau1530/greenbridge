@@ -11,7 +11,7 @@ Families:
         16-bit integer ops and v_pack_b32_f16, in the encodings GFX10 has (VOP2, VOP3, op_sel where llvm-mc
         -mcpu=gfx1013 accepts it). Which forms keep the other half of the destination follows the 16-bit row of the
         contract in docs/design.md (from Mesa ACO), so a mismatch means the translator disagrees with that contract.
-  mem   memory: buffer loads and stores of every width (dword..dwordx4, ubyte/sbyte/ushort/sshort, short_d16[_hi]),
+  mem   memory: buffer loads and stores of dword, dwordx2, dwordx3 and dwordx4 (the byte and short forms are not generated),
         offen/idxen/offset addressing, a V# built in SGPRs with a small num_records (out-of-range loads read 0 and
         out-of-range stores are dropped), and s_load_dword / s_buffer_load_dword of what earlier stores wrote.
 
@@ -24,6 +24,9 @@ A mismatch is printed with the thread, register, the two values and the op that 
 --show line. --skip-op OP leaves an op out without changing the rest of the program, to set a known finding aside.
 Exit code: 0 when every program that ran matches, 1 on a mismatch or an untranslated program, 2 on a harness error
 or when nothing ran. Needs vk_compute_test's VKC_DUMP / VKC_OUT_WORDS (from FUZZ-6, #368).
+
+Needs llvm-mc 21 or newer for --family f16 (docs/testing.md): llvm-mc 18 rejects op_sel on the 16-bit integer VOP3
+forms, so no f16 program assembles and the run stops with exit code 2. --family mem assembles with 18.
 """
 import argparse
 import json
@@ -681,9 +684,20 @@ def main():
     ap.add_argument("--max-report", type=int, default=8)
     ap.add_argument("--skip-op", action="append", default=[], help="leave this op out (a known finding)")
     a = ap.parse_args()
-    if a.show:
+    if a.programs < 1 or a.max_report < 1:
+        ap.error("--programs and --max-report must be at least 1")
+    if a.show is not None:
         parts = a.show.split(":")
-        show(a.family, int(parts[0]), int(parts[1]), int(parts[2]) if len(parts) > 2 else 64, tuple(a.skip_op))
+        try:
+            if len(parts) not in (2, 3):
+                raise ValueError
+            seed, index = int(parts[0]), int(parts[1])
+            wave = int(parts[2]) if len(parts) == 3 else 64
+        except ValueError:
+            ap.error("--show expects SEED:INDEX[:WAVE] with INDEX >= 0 and WAVE in 32, 64")
+        if index < 0 or wave not in (32, 64):
+            ap.error("--show expects SEED:INDEX[:WAVE] with INDEX >= 0 and WAVE in 32, 64")
+        show(a.family, seed, index, wave, tuple(a.skip_op))
         return 0
     waves = (64, 32) if a.wave == "both" else (int(a.wave),)
     progs = programs(a.family, a.seed, a.programs, waves, tuple(a.skip_op))

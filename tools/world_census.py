@@ -22,6 +22,7 @@ import json
 import mmap
 import os
 import re
+import shutil
 import stat
 import struct
 import sys
@@ -110,6 +111,48 @@ def _staged_json(path, doc, **options):
             if stat.S_ISREG(mode):
                 os.chmod(tmp, mode & 0o777)
         yield tmp
+
+
+def _publish_reports(archive, source_id, summary_tmp, summary_path, maps_tmp, maps_path):
+    # Publish the smaller summary first. A failed second replace leaves maps untouched,
+    # so only the old summary needs a backup. Keep it outside the staged-file directories.
+    recovery = tempfile.mkdtemp(prefix=".census-recovery-", dir=os.path.dirname(summary_path))
+    backup = os.path.join(recovery, "summary.json")
+    keep_backup = False
+    try:
+        try:
+            mode = os.lstat(summary_path).st_mode
+        except FileNotFoundError:
+            backup = None
+        else:
+            if not (stat.S_ISREG(mode) or stat.S_ISLNK(mode)):
+                raise OSError(f"cannot back up non-file report {summary_path}")
+            shutil.copy2(summary_path, backup, follow_symlinks=False)
+        with open(archive, "rb", buffering=0) as f:
+            if _source_info(f)[2] != source_id:
+                raise SourceChanged("archive changed before publishing reports")
+            os.replace(summary_tmp, summary_path)
+            try:
+                os.replace(maps_tmp, maps_path)
+            except OSError as publish_error:
+                try:
+                    if backup is None:
+                        os.unlink(summary_path)
+                    else:
+                        os.replace(backup, summary_path)
+                except OSError as restore_error:
+                    keep_backup = backup is not None
+                    recovery_hint = (f"previous summary saved at {backup}" if keep_backup
+                                     else f"remove {summary_path} to restore its previous absence")
+                    raise OSError(f"{publish_error}; restoring summary failed: {restore_error}; "
+                                  f"{recovery_hint}") from publish_error
+                raise
+    finally:
+        if not keep_backup:
+            try:
+                shutil.rmtree(recovery)
+            except OSError as e:
+                print(f"could not remove report backup {recovery}: {e}", file=sys.stderr)
 
 
 def inflate(m, s, size, max_inflate=CAP, keep=False):
@@ -804,11 +847,7 @@ def main(argv=None):
         maps_path = os.path.join(a.out, "maps.json")
         with _staged_json(summary_path, summary, indent=1, sort_keys=True) as summary_tmp, \
                 _staged_json(maps_path, maps, indent=1, sort_keys=True) as maps_tmp:
-            with open(a.archive, "rb", buffering=0) as f:
-                if _source_info(f)[2] != source_id:
-                    raise SourceChanged("archive changed before publishing reports")
-                os.replace(maps_tmp, maps_path)
-                os.replace(summary_tmp, summary_path)
+            _publish_reports(a.archive, source_id, summary_tmp, summary_path, maps_tmp, maps_path)
     except (SourceChanged, OSError) as e:
         print(str(e), file=sys.stderr)
         return 1

@@ -8,9 +8,9 @@ x.ogg.wav, x.opus.wav). Existing .wav files are skipped, so a stopped run contin
 .wav inputs are never decoded. With no --out, a source directory writes to <src>/wav and a single file writes
 next to itself.
 
-The output is pcm_s16le at the stream's own sample rate and channel count (Opus is always 48 kHz). It is trimmed
-to the Ogg Opus end granule (minus the header's pre-skip) with atrim, because ffmpeg otherwise can keep up to one
-extra partial frame when a stream's last page lies beyond the declared end. ffmpeg must be on PATH or given with
+The output is pcm_s16le at the stream's own sample rate and channel count (Opus is always 48 kHz). A single
+stream is trimmed to its Ogg Opus end granule minus pre-skip, because ffmpeg can keep samples beyond its declared
+end. For chained streams, ffmpeg handles each link's timing. ffmpeg must be on PATH or given with
 --ffmpeg; without it the tool exits with an explanation instead of a traceback.
 
 For PCM copies of the AWC banks' Opus streams, first repackage the banks with awc_opus.py, then run this tool on
@@ -65,15 +65,25 @@ def looks_like_opus(path: str) -> bool:
 
 
 def ogg_output_samples(path: str) -> int:
-    """Samples per channel the Ogg Opus stream declares (last page granule minus pre-skip), or 0 if unknown."""
+    """End granule minus pre-skip for matching Opus stream endpoints, or 0 to use ffmpeg's timing."""
     try:
         size = os.path.getsize(path)
         with open(path, "rb") as f:
             first = f.read(65536)
-            head = first.find(b"OpusHead")
-            if head < 0 or head + 12 > len(first):
+            if len(first) < 27 or first[:6] != b"OggS\x00\x02":
                 return 0
-            pre_skip = struct.unpack_from("<H", first, head + 10)[0]
+            # The Opus ID packet must finish on the BOS page and be its only packet.
+            body_start = 27 + first[26]
+            lacing = first[27:body_start]
+            if not lacing or lacing[-1] == 255 or lacing[:-1].count(255) != len(lacing) - 1:
+                return 0
+            body_end = body_start + sum(lacing)
+            head = first[body_start:body_end]
+            if (body_end > len(first) or len(head) < 19 or not head.startswith(b"OpusHead")
+                    or head[8] >= 16 or head[9] == 0):
+                return 0
+            serial = first[14:18]
+            pre_skip, = struct.unpack_from("<H", head, 10)
             start = max(0, size - 131072)
             f.seek(start)
             tail = f.read()
@@ -92,6 +102,9 @@ def ogg_output_samples(path: str) -> int:
             body = sum(tail[pos + 27:pos + 27 + nseg])
             if start + pos + 27 + nseg + body != size:
                 continue
+            # A chained file ends on a different logical stream with its own granule timeline.
+            if tail[pos + 5] not in (0x04, 0x05) or tail[pos + 14:pos + 18] != serial:
+                return 0
             granule, = struct.unpack_from("<q", tail, pos + 6)
             return granule - pre_skip if granule > pre_skip else 0
     except (OSError, struct.error):

@@ -161,6 +161,35 @@ class TestCli(unittest.TestCase):
             self.assertEqual(doc["records"][0]["name"], name)
             self.assertEqual(doc["records"][0]["stream_id"], hb & A.STREAM_MASK)
 
+    def test_invalid_ms_range_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            blob = os.path.join(tmp, "00000001.bin")
+            with open(blob, "wb") as f:
+                f.write(b"\x00" * 4 + make_record(0x2000, 123_456))
+            for extra in (["--min-ms", "0"], ["--min-ms", "-5"], ["--min-ms", "50000", "--max-ms", "10000"]):
+                with self.subTest(extra=extra):
+                    p = subprocess.run([sys.executable, "-I", TOOL, blob, *extra],
+                                       capture_output=True, text=True)
+                    self.assertEqual(p.returncode, 2)
+                    self.assertIn("require 1 <= min-ms <= max-ms", p.stderr)
+                    self.assertEqual(p.stdout, "")
+
+    def test_join_rejected_on_single_file_and_allowed_on_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            blob = os.path.join(tmp, "00000001.bin")
+            with open(blob, "wb") as f:
+                f.write(b"\x00" * 4 + make_record(0x2000, 123_456))
+            p_file = subprocess.run([sys.executable, "-I", TOOL, blob, "--join"],
+                                    capture_output=True, text=True)
+            self.assertEqual(p_file.returncode, 2)
+            self.assertIn("--join applies to a directory, not a single file", p_file.stderr)
+            self.assertEqual(p_file.stdout, "")
+
+            p_dir = subprocess.run([sys.executable, "-I", TOOL, tmp, "--join", "--json"],
+                                   capture_output=True, text=True)
+            self.assertEqual(p_dir.returncode, 0, p_dir.stderr)
+            self.assertEqual(json.loads(p_dir.stdout)["summary"]["records"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()

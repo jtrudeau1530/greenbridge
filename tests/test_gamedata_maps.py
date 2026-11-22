@@ -41,7 +41,8 @@ def mhiu_payload(width: int, height: int, rows, pixels: bytes,
     struct.pack_into("<HH", head, 0x06, width, height)
     struct.pack_into("<6f", head, 0x0C, -10.0, -20.0, -30.0, 40.0, 50.0, 60.0)
     struct.pack_into("<I", head, 0x24, len(data))
-    struct.pack_into("<I", head, 0x28, 0x12345678)
+    head[0x28] = default
+    head[0x29:0x2C] = bytes.fromhex("a55a3c")
     return bytes(head) + data
 
 
@@ -109,14 +110,32 @@ class GamedataMapsTest(unittest.TestCase):
         self.assertEqual(p["header"]["width"], 4)
         self.assertEqual(p["header"]["height"], 3)
         self.assertEqual(p["header"]["bounds"]["min"], [-10.0, -20.0, -30.0])
-        self.assertEqual(p["header"]["field28"], 0x12345678)
+        self.assertEqual(p["header"]["default_height"], 23)
+        self.assertEqual(p["header"]["pad_29"], "a55a3c")
         self.assertEqual(p["grid"]["filled_rows"], 2)
         self.assertEqual(p["grid"]["empty_rows"], 1)
         self.assertEqual(p["grid"]["filled_cells"], 6)
         self.assertEqual(p["grid"]["default"], 23)
+        self.assertEqual(p["grid"]["span_ends_at_default"], 0)
         self.assertEqual(list(p["_grid"]), [23, 23, 23, 23,
                                             23, 7, 8, 23,
                                             9, 10, 11, 12])
+
+    def test_mhiu_default_comes_from_the_header_byte(self):
+        payload = mhiu_payload(3, 2, [(0, 0, []), (1, 1, [40])], pixels=b"",
+                               default=99)
+        p = gamedata_maps.parse_mhiu(payload)
+        self.assertEqual(p["header"]["default_height"], 99)
+        self.assertEqual(p["grid"]["default"], 99)
+        self.assertEqual(list(p["_grid"]), [99, 99, 99, 99, 40, 99])
+        # z = -30 + 99/255 * 90
+        self.assertAlmostEqual(p["grid"]["z_at_default"], 4.94, places=2)
+
+    def test_mhiu_counts_span_ends_on_the_default(self):
+        payload = mhiu_payload(4, 2, [(0, 3, [23, 5, 6]), (1, 3, [7, 8, 23])],
+                               pixels=b"")
+        p = gamedata_maps.parse_mhiu(payload)
+        self.assertEqual(p["grid"]["span_ends_at_default"], 2)
 
     def test_mhiu_rejects_a_row_past_the_pixels(self):
         payload = mhiu_payload(4, 1, [(0, 4, [1, 2, 3, 4])], pixels=b"")

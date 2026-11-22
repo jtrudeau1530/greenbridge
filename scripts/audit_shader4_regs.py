@@ -21,6 +21,7 @@ from collections import Counter
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
 import shader_ir  # noqa: E402
+from shader_meta import SGPR_RMW  # noqa: E402
 
 NO_DEST_OPS = ("s_cmp", "s_bitcmp", "v_cmpx", "s_set", "s_rfe", "s_branch", "s_cbranch",
                "s_waitcnt", "s_barrier", "s_nop", "s_endpgm", "s_sendmsg", "s_sleep",
@@ -164,9 +165,10 @@ def rbw_registers(insns):
         if not args:
             continue
         is_no_dest = op.startswith(NO_DEST_OPS)
-        # Instructions that read their destination too (accumulators / atomics / writelane / swap).
+        reads_imm_dst = op in SGPR_RMW
+        # Instructions that read their destination too.
         dst_also_read = (
-            "fmac" in op or "mac_" in op or op == "v_writelane_b32"
+            reads_imm_dst or "fmac" in op or "mac_" in op or op == "v_writelane_b32"
             or op == "v_swap_b32" or "_atomic_" in op
         )
         # v_add_co_u32 / v_sub_co_u32 write both a[0] (VGPR) and a[1] (carry SGPR/vcc).
@@ -193,7 +195,7 @@ def rbw_registers(insns):
                     if r not in written_v:
                         rbw_v.add(r)
         if reads_s3_rbw:
-            dst_ids = {id(x) for x in dsts}
+            dst_ids = set() if reads_imm_dst else {id(x) for x in dsts}
             fmt_args = ", ".join(_fmt_s3_arg(x, is_dst=(id(x) in dst_ids)) for x in args)
             s3_patterns.append(f"{op} {fmt_args}".strip())
 
@@ -215,6 +217,8 @@ def detect_wave64(insns):
 
 
 def audit(disasm_dir, fssm_dir=None, dxbc_dir=None, stages=("cs", "ms", "gs"), limit=None):
+    if limit is not None and limit < 0:
+        raise ValueError("limit must be non-negative")
     parent = os.path.dirname(os.path.realpath(disasm_dir))
     fssm_dir = fssm_dir or os.path.join(parent, "fssm")
     dxbc_dir = dxbc_dir or parent
@@ -347,6 +351,8 @@ def main(argv=None):
     ap.add_argument("--json", dest="json_out", default=None, help="optional path to write full JSON report")
     ap.add_argument("--limit", type=int, default=None, help="stop after N .s files")
     a = ap.parse_args(argv)
+    if a.limit is not None and a.limit < 0:
+        ap.exit(2, f"{ap.prog}: error: --limit must be non-negative\n")
 
     rep = audit(a.disasm_dir, fssm_dir=a.fssm, dxbc_dir=a.dxbc, limit=a.limit)
     print_report(rep)

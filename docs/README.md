@@ -17,7 +17,7 @@ method, scope and caveats. No game data is included.
 
 | Document | Measured content |
 |---|---|
-| [models.md](models.md) | 155,598 models at the `48557ea` pin; `917e9b9` adds the `packs.rpf` dictionary roots (24,034 models there). |
+| [models.md](models.md) | 350,248 models at the `917e9b9` pin, including 159,483 drawable-dictionary children; the re-count table is in models.md. |
 | [resource_names.md](resource_names.md) | RPF9 named-resource index: bounded-inflate lookup for `name.#dr`/`#ft`/`#dd` without the TOC. |
 | [textures.md](textures.md) | 308,895 TTPF textures exported; 48,220 skips, mostly BCPack. |
 | [textures_arrays.md](textures_arrays.md) | 678 TTPF array/volume descriptors: 90 tile-mode-9 cubes have a validated 6-slice allocation layout; 588 remain unresolved. |
@@ -50,7 +50,9 @@ method, scope and caveats. No game data is included.
 | Document | Measured content |
 |---|---|
 | [d3d12_vulkan.md](d3d12_vulkan.md) | Xbox D3D12 to Vulkan plan and status; device proxy, queues, command lists, barriers, copies. |
+| [descriptor_lookup_apple.md](descriptor_lookup_apple.md) | M3 Max GPU timings for texture and sampler descriptor lookups at 1k, 10k and 100k live entries. |
 | [d3d12_xs_surface.md](d3d12_xs_surface.md) | The 116-slot `d3d12_xs.dll` export surface; 83/83 standard GUIDs match the PC SDK. |
+| [xdxr.md](xdxr.md) | `BATCHED_DESC2` (`0x50`) and `XDXR_STREAM_DESC` (`0x10`) from `XboxBvhBuilder.dll`'s reads; stream records' offsets and defaults; offline statistics not in the package. |
 | [d3d12_command_objects.md](d3d12_command_objects.md) | Measured command queue/list/fence/`PresentX` surface; verified vs prior art vs open. |
 | [runtime_imports.md](runtime_imports.md) | The 16 shipped modules' measured imports and shim/host/unimplemented split. |
 | [saves.md](saves.md) | Save containers: `JSAV` (index + JSON story save, byte-exact rebuild), `ASAV` header, `SLAYER1` packed copy (not decoded); `tools/saves.py` and import into the offline `XGameSave` folder; key hashes are case-sensitive joaat (`tools/save_keys.py`). |

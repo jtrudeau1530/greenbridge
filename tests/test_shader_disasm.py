@@ -79,6 +79,37 @@ class DisasmFailureTest(unittest.TestCase):
         self.assertIn("produced no disassembly", p.stderr)
         self.assertEqual(sorted(os.listdir(out)), [])
 
+    def test_llvm_error_discards_partial_disassembly(self):
+        mc = self.fake("import sys\n"
+                       "sys.stdin.read()\n"
+                       "if '-show-encoding' in sys.argv:\n"
+                       "    print('s_nop 0')\n"
+                       "    sys.stderr.write('error: disassembly stopped\\n')\n"
+                       "    sys.exit(1)\n"
+                       "print('s_endpgm')\n")
+        out = os.path.join(self.dir, "out")
+        p = self.run_tool(mc, out)
+        self.assertEqual(p.returncode, 1, p.stdout)
+        self.assertIn("'failed': 1", p.stdout)
+        self.assertIn(self.fssm, p.stderr)
+        self.assertIn("error: disassembly stopped", p.stderr)
+        self.assertEqual(len(p.stderr.splitlines()), 1)
+        self.assertEqual(sorted(os.listdir(out)), [])
+
+    def test_no_code_is_an_error_when_no_listings_are_written(self):
+        with open(self.fssm, "wb") as f:
+            f.write(b"FSSM\x01\x01" + bytes(320))
+        mc = self.fake("import sys\n"
+                       "sys.stdin.read()\n"
+                       "print('s_endpgm')\n")
+        out = os.path.join(self.dir, "out")
+        p = self.run_tool(mc, out)
+        self.assertEqual(p.returncode, 1, p.stdout)
+        self.assertIn("'no s_endpgm': 1", p.stdout)
+        self.assertIn(self.fssm, p.stderr)
+        self.assertEqual(len(p.stderr.splitlines()), 1)
+        self.assertEqual(sorted(os.listdir(out)), [])
+
     def test_a_real_disassembly_is_written(self):
         mc = self.fake("import sys\n"
                        "probe = sys.stdin.read().strip() == %r\n"

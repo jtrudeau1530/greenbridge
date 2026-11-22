@@ -31,9 +31,40 @@ drawable/LOD variant. The two sets are different scopes, not contradictory.
 
 `packs.rpf`'s `.#dr` pages are drawable-dictionary roots, not drawables, so the old candidate
 scan never saw them. At the new pin the dictionary walk recovers **24,034 models** from that
-archive (23,720 dictionary children plus the 314 fragments), against 314 before. The 314
-`48557ea`/`c3708fb` entries in the table below are therefore the pre-pin control, not the
-current `packs.rpf` result. The other archive rows were not re-counted at `917e9b9`.
+archive (23,720 dictionary children plus the 314 fragments), against 314 before. A full
+`rpf9dump models` export of the archive reports **`ok=24,034 fail=0 skip=0` in 263 s** (0
+embedded textures); the OBJs and manifest are local. The 314 `48557ea`/`c3708fb` entries in the
+table below are therefore the pre-pin control, not the current `packs.rpf` result. The other
+model-bearing archives were re-counted at the new pin; the results are below.
+
+### Other archives at `917e9b9`
+
+A fresh scan/recover at the new pin (no cache; `models/3`) shows the same pattern in every
+archive with drawable dictionaries: the `c3708fb` recovery is the non-child count, and the new
+entries are dictionary children.
+
+| Archive | Candidates | Models at `917e9b9` | Dictionary children | `c3708fb` |
+|---|---:|---:|---:|---:|
+| `data.rpf` | 2,402 | **2,581** | 268 | 2,313 |
+| `pack/shared_minigame000/...` | 1,070 | **1,288** | 317 | 971 |
+| `pack/core_restofworld/...` | 1,024 | **885** | 797 | 88 |
+| `pack/story000/story000.rpf` | 4,195 | **7,460** | 4,156 | 3,304 |
+| `packs.rpf` | 23,838 | **24,034** | 23,720 | 314 |
+| `levels.rpf` | 206,981 | **314,000** | 130,225 | 183,801 |
+| `common`, `textures`, `story000_restofworld`, `core_restofworld001` | 0 | 0 | 0 | 0 |
+| **Total** | **239,510** | **350,248** | **159,483** | **190,792** |
+
+The last column is the `c3708fb` recovery for comparison. `story000`'s standalone count is
+3,304 vs 3,305; the full new-pin standalone total is 190,765, 27 below the `c3708fb` 190,792
+(duplicates merged). The new entries are **159,483 drawable-dictionary children**: one model
+per embedded drawable in a dictionary root, not new pages. `core_restofworld` recovers 885 of
+1,024 candidates; the rest are rejected or duplicate candidates.
+
+`levels.rpf` is the sum of ten parallel recovery shards over 206,981 candidates: **314,000
+models**, 130,225 dictionary children, 183,775 standalone. The last shard rejects 1,009
+candidates (incomplete or duplicate tail pages); the other shards recover their candidates 1:1
+or add dictionary children. The `levels.rpf` full export was not re-run, so its triangle total
+is still the old measurement.
 
 ## Independent validation
 
@@ -73,8 +104,9 @@ reproduced the ten-archive total. The `48557ea` column is the pre-fix control:
 | **Total** | **190,792** | **155,598** | **190,792** |
 
 The `packs.rpf` row is the pre-dictionary-root control: at `917e9b9` that archive recovers
-24,034 models (see above), not 314. The other rows were measured before the dictionary-root
-change.
+24,034 models, and the other archives' new-pin counts are in the table above. The rows here are
+the `c3708fb` measurements (190,792 models); the new-pin re-count is 350,248. Triangle totals
+have not been re-run at the new pin.
 
 At `c3708fb`, every candidate is recovered, read back and decoded: 0 decode failures, 0 readback
 failures, no duplicate model names, and 2.22 billion triangles (1.95 billion before). The
@@ -242,7 +274,8 @@ page records the reference-pose caveat rather than inventing a bind pose.
 
 1. **Done:** [rpf9-explorer PR #1](https://github.com/breadbbbb/rpf9-explorer/pull/1) is merged upstream.
 2. **Done:** the pin is `917e9b9` (was `48557ea`).
-3. Re-run `tools/rpf9dump models` over the full ten-archive set configured in Leonida at the new
-   pin. `packs.rpf` is measured (24,034); the other archives still carry the `c3708fb` counts.
-4. Replace the sample numbers in this page with the full counts, and keep the README and issue #29
-   in sync.
+3. `tools/rpf9dump models` has been re-run over the model-bearing archives at the new pin; the
+   counts are in the table above. Triangle totals were not re-run, and the texture counts in
+   [textures.md](textures.md) come from the Python TTPF tool, which is independent of the
+   submodule pin.
+4. Keep the README and issue #29 in sync with the new counts.
