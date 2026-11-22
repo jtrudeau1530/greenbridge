@@ -133,6 +133,36 @@ class TestManifestVerifier(unittest.TestCase):
         entries = mv.load_manifest(flat_path)
         self.assertEqual(list(entries.keys()), ["alpha.bin"])
 
+    def test_load_manifest_duplicate_normalized_paths_raise(self) -> None:
+        digest = hashlib.sha256(b"x").hexdigest()
+        for wrapper in (True, False):
+            with self.subTest(wrapper=wrapper):
+                entry = {
+                    "nested/a.bin": {"size": 1, "sha256": digest},
+                    "nested\\a.bin": {"size": 1, "sha256": digest},
+                }
+                doc = {"files": entry} if wrapper else entry
+                bad_path = os.path.join(self.root, f"dup_wrapper_{wrapper}.json")
+                with open(bad_path, "w", encoding="utf-8") as f:
+                    json.dump(doc, f)
+                with self.assertRaises(mv.ManifestError) as cm:
+                    mv.load_manifest(bad_path)
+                self.assertIn(bad_path, str(cm.exception))
+                self.assertIn("nested/a.bin", str(cm.exception))
+
+    def test_load_manifest_single_spelling_control(self) -> None:
+        digest = hashlib.sha256(b"x").hexdigest()
+        for wrapper in (True, False):
+            for spelling in ("nested/a.bin", "nested\\a.bin"):
+                with self.subTest(wrapper=wrapper, spelling=spelling):
+                    entry = {spelling: {"size": 1, "sha256": digest}}
+                    doc = {"files": entry} if wrapper else entry
+                    p = os.path.join(self.root, f"one_{wrapper}_{'fwd' if '/' in spelling else 'bwd'}.json")
+                    with open(p, "w", encoding="utf-8") as f:
+                        json.dump(doc, f)
+                    entries = mv.load_manifest(p)
+                    self.assertEqual(list(entries.keys()), ["nested/a.bin"])
+
     def test_nested_manifest_verifies_files_named_like_metadata_keys(self) -> None:
         meta_dir = os.path.join(self.root, "meta_game")
         os.makedirs(meta_dir, exist_ok=True)
@@ -313,6 +343,11 @@ class TestManifestVerifier(unittest.TestCase):
         report_strict = mv.verify_manifest(self.game_dir, self.manifest_path, jobs=2, strict=True)
         self.assertFalse(report_strict.passed)
         self.assertEqual(report_strict.untracked, ["bonus.bin"])
+        self.assertEqual(report_strict.problem_count, 1)
+        self.assertEqual(report_strict.to_dict()["problem_count"], 1)
+        out = io.StringIO()
+        mv.print_report(report_strict, out=out)
+        self.assertIn("1 problem(s)", out.getvalue())
 
     def test_progress_reporting_callback_and_stream(self) -> None:
         progress_events: list[mv.ProgressInfo] = []
@@ -435,6 +470,10 @@ class TestManifestVerifier(unittest.TestCase):
         self.assertEqual(res_strict.returncode, 1)
         self.assertIn("NEW       new_file.dat", res_strict.stdout)
         self.assertIn("1 problem(s)", res_strict.stdout)
+
+        res_json = self.run_cli(self.game_dir, "--manifest", self.manifest_path, "--strict", "--json")
+        self.assertEqual(res_json.returncode, 1)
+        self.assertEqual(json.loads(res_json.stdout)["problem_count"], 1)
 
     def test_cli_strict_ignores_only_selected_in_tree_manifest(self) -> None:
         in_tree = self.write_manifest(os.path.join(self.game_dir, "nested", "manifest.json"), self.payloads)

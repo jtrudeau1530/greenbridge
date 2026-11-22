@@ -22,6 +22,20 @@ inline unsigned& validation_error_count() {
     return count;
 }
 
+inline unsigned& known_validation_error_count() {
+    static unsigned count = 0;
+    return count;
+}
+
+// The NVIDIA validation layer checks an sRGB swapchain as if it also had VK_IMAGE_USAGE_STORAGE_BIT, which the
+// presenter never requests and sRGB swapchain formats cannot support on that driver. Its VUID 01778 covers the
+// first message and the max-layers/max-extent follow-ons, so match the VUID rather than only the first text. The
+// presenter's own usage is checked against supportedUsageFlags before creation, so this VUID is the known false
+// positive here. It is counted separately so a test can skip only when it is the sole validation error.
+inline bool known_srgb_swapchain_storage_error(const VkDebugUtilsMessengerCallbackDataEXT* data) {
+    return data && data->pMessage && data->messageIdNumber == 0xc036022f;
+}
+
 // Only validation-type errors fail a test. General messages come from the loader and the layers around the
 // application: a third-party implicit layer that fails to load (an overlay or capture tool, for example) reports a
 // general error that says nothing about this code, so it is printed but not counted.
@@ -29,8 +43,14 @@ inline VKAPI_ATTR VkBool32 VKAPI_CALL on_validation(VkDebugUtilsMessageSeverityF
                                                     VkDebugUtilsMessageTypeFlagsEXT types,
                                                     const VkDebugUtilsMessengerCallbackDataEXT* data, void*) {
     const bool validation = (types & VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT) != 0;
-    if ((severity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT) && validation) ++validation_error_count();
-    std::fprintf(stderr, "%s: %s\n", validation ? "validation" : "vulkan (not counted)",
+    const bool known = (severity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT) && validation &&
+                       known_srgb_swapchain_storage_error(data);
+    if ((severity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT) && validation) {
+        ++validation_error_count();
+        if (known) ++known_validation_error_count();
+    }
+    std::fprintf(stderr, "%s%s: %s\n", validation ? "validation" : "vulkan (not counted)",
+                 known ? " (known sRGB swapchain check)" : "",
                  data && data->pMessage ? data->pMessage : "(no message)");
     return VK_FALSE;
 }
@@ -63,6 +83,7 @@ public:
     std::uint32_t family = 0;
     bool validation = false;
     bool bc = false;  // textureCompressionBC enabled
+    VkPhysicalDeviceFeatures enabled{};  // the core features enabled on `device`
     bool bindless = false;         // the features the bindless set 0 needs are enabled
     bool partially_bound = false;  // and its slots can stay empty
     bool image_view_min_lod = false;
@@ -117,6 +138,7 @@ public:
     }
 
     unsigned validation_errors() const { return validation_error_count(); }
+    unsigned known_validation_errors() const { return known_validation_error_count(); }
 
     // presentation: also enable VK_KHR_surface + VK_KHR_win32_surface and VK_KHR_swapchain (Windows only).
     bool create(bool presentation = false) { return initialize(presentation) == DeviceStatus::ready; }
@@ -251,7 +273,7 @@ public:
         VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &features12};
         instance_fn<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2")(physical, &features);
         if (!features13.dynamicRendering || !features13.synchronization2 || !features12.timelineSemaphore ||
-            !features12.separateDepthStencilLayouts) {
+            !features12.separateDepthStencilLayouts || !features12.bufferDeviceAddress) {
             std::fprintf(stderr, "the device lacks dynamicRendering, synchronization2, timelineSemaphore or "
                                  "separateDepthStencilLayouts\n");
             return DeviceStatus::unavailable;
@@ -302,6 +324,7 @@ public:
         enable12.descriptorBindingStorageImageUpdateAfterBind = bindless;
         enable12.descriptorBindingStorageBufferUpdateAfterBind = bindless;
         enable12.descriptorBindingPartiallyBound = partially_bound;
+        enable12.bufferDeviceAddress = VK_TRUE;
 
         const float priority = 1.0f;
         VkDeviceQueueCreateInfo queue_info{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
@@ -313,6 +336,7 @@ public:
         bc = features.features.textureCompressionBC == VK_TRUE;
         enable.shaderSampledImageArrayDynamicIndexing = bindless;
         enable.shaderStorageImageArrayDynamicIndexing = bindless;
+        enable.logicOp = features.features.logicOp;  // d3d12_draw_test's logic-op draw, where available
         const char* conditional_extension = VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME;
 
         // VK_EXT_host_image_copy where the device has it, for the D3D12 layer's CPU texture copies.
@@ -371,6 +395,7 @@ public:
         device_info.queueCreateInfoCount = 1;
         device_info.pQueueCreateInfos = &queue_info;
         device_info.pEnabledFeatures = &enable;
+        enabled = enable;
         std::vector<const char*> device_extensions;
         if (image_view_min_lod) device_extensions.push_back(VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME);
         if (conditional_rendering) device_extensions.push_back(conditional_extension);

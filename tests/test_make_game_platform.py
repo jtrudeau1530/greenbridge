@@ -5,7 +5,9 @@
 No game data: stage selection uses mocks, and the packaging and discovery tests create synthetic files.
 """
 import io
+import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -454,6 +456,40 @@ class RuntimeStageCopyTest(unittest.TestCase):
             self.run_stage(build, out)
             with open(os.path.join(out, make_game.RUNTIME_FILES[0]), "rb") as f:
                 self.assertEqual(f.read(), make_game.RUNTIME_FILES[0].encode())
+
+
+class RedirectedConsoleEncodingTest(unittest.TestCase):
+    """`--find` must survive a dump path no single-byte code page can write.
+
+    Windows encodes a redirected stdout (make_game.py > build.log) with the console's ANSI code page, and
+    `python -I` ignores PYTHONUTF8, so a path with a character outside that code page -- a Cyrillic, Greek or
+    CJK user name in the profile a dump sits under -- reached print() as UnicodeEncodeError and ended the
+    listing with a traceback (stderr escapes such characters; stdout was strict). The dump below sits under a
+    private-use character that no ANSI code page maps, so before the fix the child dies the same way on every
+    Windows locale; on UTF-8 systems the character prints and this passes either way.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def test_find_lists_a_dump_whose_path_the_console_code_page_cannot_write(self):
+        home = os.path.join(self.tmp.name, "home")
+        dump = os.path.join(home, "Downloads", "GTA6-\ue9c3")
+        os.makedirs(dump)
+        with open(os.path.join(ROOT, "game", "xbox-1.0.2.1.json"), encoding="utf-8") as f:
+            sizes = json.load(f)["files"]
+        for name in make_game.PROBES:      # match_version() reads only names and sizes
+            with open(os.path.join(dump, name), "wb") as f:
+                f.truncate(sizes[name]["size"])
+        env = dict(os.environ, USERPROFILE=home, HOME=home)
+        r = subprocess.run([sys.executable, "-I", os.path.join(ROOT, "make_game.py"), "--find"],
+                           capture_output=True, env=env, cwd=ROOT, encoding="utf-8", errors="replace")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotIn("Traceback", r.stderr)
+        self.assertNotIn("UnicodeEncodeError", r.stderr)
+        self.assertTrue(any(f"GTA6-{c}" in r.stdout for c in ("\ue9c3", "?")),
+                        f"the synthetic dump was not listed: {r.stdout!r}")
 
 
 if __name__ == "__main__":

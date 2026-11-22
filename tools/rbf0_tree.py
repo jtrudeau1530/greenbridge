@@ -671,6 +671,15 @@ def write_json(path, docs, summary):
         raise
 
 
+def same_output_path(first, second):
+    if os.path.normcase(os.path.realpath(first)) == os.path.normcase(os.path.realpath(second)):
+        return True
+    try:
+        return os.path.samefile(first, second)
+    except OSError:
+        return False
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("source", help="a carve directory, a complete resource, or a single RBF0 stream")
@@ -682,6 +691,14 @@ def main(argv=None):
     ap.add_argument("--limit", type=int, help="stop after this many selected resources")
     ap.add_argument("--quiet", action="store_true")
     args = ap.parse_args(argv)
+    # The reports are written after the decode: an out or --csv naming the source used to replace it, and the
+    # same file for both left only the CSV.
+    if args.csv and same_output_path(args.out, args.csv):
+        ap.error("out and --csv must be different files")
+    if os.path.isfile(args.source):
+        for flag, path in (("out", args.out), ("--csv", args.csv)):
+            if path and same_output_path(path, args.source):
+                ap.error(f"{flag} would overwrite the source {args.source}")
 
     def progress(n, total):
         if not args.quiet and (n % 100 == 0 or n == total):
@@ -724,4 +741,8 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
+    try:  # a redirected stdout is strict ANSI code page under -I; write '?' for what it cannot encode
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
     sys.exit(main())

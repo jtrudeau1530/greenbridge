@@ -16,6 +16,9 @@ import sys
 
 # A whole printable run, however long (one linear scan: a single character class, no nested quantifiers).
 STR = re.compile(rb"[A-Za-z_][A-Za-z0-9_./:\\-]{2,}")
+# For --min below 3 the run matcher must also accept one- and two-character identifiers, so the same
+# identifier syntax (first byte [A-Za-z_], the rest of the run [A-Za-z0-9_./:\\-]) is used with no minimum tail.
+SHORT_STR = re.compile(rb"[A-Za-z_][A-Za-z0-9_./:\\-]*")
 # A name (a whole run or one piece of it) longer than this is not added: it is a blob of text, not a name.
 # The old pattern cut every run at 201 characters, so no entry was ever longer than this.
 MAX_NAME_LEN = 201
@@ -37,7 +40,8 @@ def joaat(s: str) -> int:
 
 
 def harvest(data: bytes, out: set, minlen: int):
-    for m in STR.finditer(data):
+    run = STR if minlen >= 3 else SHORT_STR
+    for m in run.finditer(data):
         s = m.group(0).decode("latin-1")
         if len(s) >= minlen:
             if len(s) <= MAX_NAME_LEN:
@@ -144,4 +148,8 @@ def main():
 
 
 if __name__ == "__main__":
+    try:  # a redirected stdout is strict ANSI code page under -I; write '?' for what it cannot encode
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
     sys.exit(main())

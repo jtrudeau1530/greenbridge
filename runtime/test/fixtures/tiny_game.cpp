@@ -1,12 +1,15 @@
 // A stand-in game executable for `gta6rt --run`: what a real title does in its first second, run through the
 // loader instead of the Windows one. Test code, not game content. Run as
-//   gta6rt --run tiny_game.exe -- hello 42
+//   gta6rt --run tiny_game.exe -- hello 42 [tls] [eh]
 // It checks its arguments, a static initializer, the heap, a file round trip, a second thread, and the
 // xgameruntime.dll imports (answered by the shim registry: the stub DLL it links against would fail them), then
-// calls exit() with 0 when everything held. Two checks are opt-in: thread_local needs static TLS (#93;
-// LEONIDA_RUN_TLS=1), and a C++ exception (LEONIDA_RUN_EH=1) needs more than the unwind tables #176 registers on MSVC:
-// _CxxThrowException finds the throwing image with RtlPcToFileHeader, which only knows modules the Windows loader
-// mapped. With MinGW (libgcc's SEH unwinder) the #176 tables are enough and the check passes.
+// calls exit() with 0 when everything held. Two checks are opt-in, by argument (CTest's run_tiny_game_tls and
+// run_tiny_game_eh): `tls`, thread_local on the game's own threads, which needs the loader's per-thread TLS (gta6rt
+// runs main on a thread it starts, not the one that loaded the image); and `eh`, a C++ exception caught inside the
+// image, which on MSVC needs more than the unwind tables #176 registers: _CxxThrowException finds the throwing image
+// with RtlPcToFileHeader, which the loader redirects in the host MSVC runtime. Arguments, not environment variables,
+// so scripts/run_wine_tests.py (which passes a test's command line but not its ENVIRONMENT) runs them too. stdout is
+// unbuffered, so a crash still shows how far the run got.
 #include <windows.h>
 
 #include <cstdint>
@@ -36,9 +39,10 @@ struct StaticInit {
 };
 StaticInit g_static;
 
-bool env_on(const char* name) {
-    char buf[8] = {};
-    return GetEnvironmentVariableA(name, buf, sizeof buf) > 0 && buf[0] == '1';
+bool has_arg(int argc, char** argv, const char* name) {
+    for (int i = 3; i < argc; ++i)
+        if (std::strcmp(argv[i], name) == 0) return true;
+    return false;
 }
 
 thread_local int t_counter = 5;
@@ -46,8 +50,9 @@ thread_local int t_counter = 5;
 }  // namespace
 
 int main(int argc, char** argv) {
+    std::setvbuf(stdout, nullptr, _IONBF, 0);
     std::printf("tiny_game: started, argc=%d\n", argc);
-    check(argc == 3 && std::strcmp(argv[1], "hello") == 0 && std::strcmp(argv[2], "42") == 0,
+    check(argc >= 3 && std::strcmp(argv[1], "hello") == 0 && std::strcmp(argv[2], "42") == 0,
           "argv is the game's command line (\"hello\" \"42\"), not gta6rt's");
     check(std::strstr(GetCommandLineA(), "hello 42") != nullptr, "GetCommandLineA is the game's command line");
     check(g_static.value == 1234, "a static initializer ran before main");
@@ -82,15 +87,15 @@ int main(int argc, char** argv) {
     check(XSystemGetDeviceType() == 7, "XSystemGetDeviceType is answered by the gta6rt shim (Series X)");
     XGameRuntimeUninitialize();
 
-    if (env_on("LEONIDA_RUN_TLS")) {
+    if (has_arg(argc, argv, "tls")) {
         int seen = -1;
         std::thread t([&] { seen = t_counter; t_counter = 9; });
         t.join();
         check(t_counter == 5 && seen == 5, "thread_local starts at its initializer on each thread");
     } else {
-        std::printf("tiny_game: SKIP thread_local (needs static TLS, #93; LEONIDA_RUN_TLS=1)\n");
+        std::printf("tiny_game: SKIP thread_local (argument tls)\n");
     }
-    if (env_on("LEONIDA_RUN_EH")) {
+    if (has_arg(argc, argv, "eh")) {
         bool caught = false;
         try {
             throw std::string("boom");
@@ -99,7 +104,7 @@ int main(int argc, char** argv) {
         }
         check(caught, "a C++ exception is thrown and caught inside the image");
     } else {
-        std::printf("tiny_game: SKIP C++ exception (MSVC needs the image known to RtlPcToFileHeader; LEONIDA_RUN_EH=1)\n");
+        std::printf("tiny_game: SKIP C++ exception (argument eh)\n");
     }
 
     std::printf("tiny_game: %s\n", g_failures ? "FAILED" : "OK");

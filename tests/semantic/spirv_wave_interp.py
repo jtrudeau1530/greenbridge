@@ -20,9 +20,11 @@ tests/semantic/spirv_mini_interp.py runs one invocation of forward-only code. Th
     composited. Float arithmetic raises, so a NaN payload can never be rewritten by the host.
 
 Inputs: Input variables decorated BuiltIn SubgroupLocalInvocationId read the lane number, SubgroupSize reads the
-wave size; other Input variables read zero. PushConstant words can be seeded (default zero).
+wave size; other Input variables read zero, except the built-ins named in `builtins` (name -> function of the
+lane number giving that lane's integer value, e.g. {"VertexIndex": lambda lane: first + lane}). PushConstant words
+can be seeded (default zero).
 
-    run_wave(text, wave=32, push_constants=None, max_steps=2_000_000) ->
+    run_wave(text, wave=32, push_constants=None, max_steps=2_000_000, builtins=None) ->
         {"outputs": [ {output_name: tuple_of_words} or None (lane killed) for each lane ],
          "steps": instructions executed (summed over invocations)}
 """
@@ -268,7 +270,7 @@ def _copy(v):
 
 
 class _Wave:
-    def __init__(self, mod, wave, push_constants, max_steps):
+    def __init__(self, mod, wave, push_constants, max_steps, builtins=None):
         self.m = mod
         self.wave = wave
         self.pcw = list(push_constants or [])
@@ -288,6 +290,8 @@ class _Wave:
                         value = lane.index
                     elif b == "SubgroupSize":
                         value = wave
+                    elif builtins and b in builtins:
+                        value = builtins[b](lane.index) & MASK
                     elif b is None:
                         value = mod.zero(pointee)
                     else:
@@ -825,9 +829,9 @@ class _BuiltinNotModelled:
         self.name = name
 
 
-def run_wave(text, wave=32, push_constants=None, max_steps=2_000_000):
+def run_wave(text, wave=32, push_constants=None, max_steps=2_000_000, builtins=None):
     if wave not in (32, 64):
         raise ValueError("wave must be 32 or 64")
-    w = _Wave(_Module(text), wave, push_constants, max_steps)
+    w = _Wave(_Module(text), wave, push_constants, max_steps, builtins)
     outputs = w.run()
     return {"outputs": outputs, "steps": w.steps}

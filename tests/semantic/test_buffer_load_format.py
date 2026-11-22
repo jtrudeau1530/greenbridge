@@ -125,6 +125,18 @@ class SubDwordElements(unittest.TestCase):
 
 
 class D16DestinationHalves(unittest.TestCase):
+    def test_uint32_saturates_before_packing(self):
+        words = (0xfffe, 0x10000, 0x10001, 0xffffffff)
+        memory = {BASE + 4 * i: word for i, word in enumerate(words)}
+        for op, fmt, mods in (("buffer_load_format", FMT_U32X4, ""),
+                              ("tbuffer_load_format", FMT_U32, " format:[BUF_FMT_32_32_32_32_UINT]")):
+            with self.subTest(op=op):
+                self.assertEqual(load_format(fmt, 0, 4, memory=memory, op=op, mods=mods), words)
+                self.assertEqual(load_format(fmt, 0, 4, memory=memory, d16=True, op=op, mods=mods)[:2],
+                                 (0xfffffffe, 0xffffffff))
+                self.assertEqual(load_format(fmt, 0, 3, memory=memory, d16=True, op=op, mods=mods)[:2],
+                                 (0xfffffffe, 0xa9bcffff))
+
     def test_odd_and_even_component_writes(self):
         # Little-endian UINT8 components at byte 0 are 44,33,22,11 (hex).
         for offset, words in (

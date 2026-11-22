@@ -445,11 +445,22 @@ test('LOD sets show one tier per cell by horizontal distance, with slack before 
     Object.assign(pos, { x: 300, y: 500, z: 100 });          // 44 m east of the cell, high up: still HD
     f.frame();
     assert.deepEqual(f.requests.map(r => r.url), ['hd.glb']);
-    await f.succeed(0, f.object());
+    const hd = Object.assign(f.object(), { visible: true });
+    const lod = Object.assign(f.object(), { visible: true });
+    await f.succeed(0, hd);
     Object.assign(pos, { x: 256 + 150, y: 0, z: 100 });      // 150 m: LOD replaces HD (HD kept inside the slack)
     f.frame();
     assert.deepEqual(f.requests.map(r => r.url), ['hd.glb', 'lod.glb']);
     assert.ok(f.state.live.has('hd'));
+    await f.succeed(1, lod);
+    f.frame();
+    assert.equal(hd.visible, false);
+    assert.equal(lod.visible, true);
+    pos.x = 256 + 120;                                    // back inside HD, with LOD retained
+    f.frame();
+    assert.equal(hd.visible, true);
+    assert.equal(lod.visible, false);
+    assert.equal(f.requests.length, 2);
     Object.assign(pos, { x: 256 + 200, y: 0, z: 100 });      // past the slack: HD unloads
     f.frame();
     assert.ok(!f.state.live.has('hd'));

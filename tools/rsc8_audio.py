@@ -50,11 +50,13 @@ ADAT_MAGIC = b"ADAT"
 TAG_PEAK = 0x36
 TAG_STREAMED_MUSIC = 0x48
 TAG_DATA = 0x55
+TAG_GRID20 = 0x5A  # undocumented 20-byte-entry table; decode_grid20_table()
 TAG_RSC8_CLIP = 0x5C
 TAG_FORMAT = 0x76
 TAG_SEEKTABLE = 0xA3
 TAG_LOUDNESS = 0xB2
 TAG_MARKER = 0xBD
+TAG_INDEXRUN = 0xD9  # undocumented grouped index runs into the 0x5a entries; decode_index_runs()
 MARKER_MAGIC = 0xE5C74063
 
 ATTR_FLOAT = 0xFFFF0001
@@ -667,14 +669,16 @@ def decode_rsc8(data, *, stream_id=None, deep=True):
 def parse_adat_header_bytes(hb, bank_offset, file_size):
     """Parse one little-endian AWC (`ADAT`) bank header from bytes `hb`.
 
-    Returns a bank descriptor dict or `None` if malformed or out of bounds.
+    Returns a bank descriptor dict or `None` if malformed or out of bounds. A zero-stream bank
+    (`count == 0`) is valid when the flag-selected tables end exactly at the declared header size;
+    the package's `audio.rpf` carries two such 20-byte banks that the encrypted TOC lists as
+    `.awc` entries.
     """
     if bank_offset < 0 or len(hb) < 16 or hb[:4] != ADAT_MAGIC:
         return None
     flags, count, hdr_sz = struct.unpack_from("<III", hb, 4)
     if (
-        count == 0
-        or count > MAX_BANK_STREAMS
+        count > MAX_BANK_STREAMS
         or hdr_sz < 16
         or hdr_sz > MAX_HEADER_BYTES
         or hdr_sz > len(hb)
@@ -688,7 +692,11 @@ def parse_adat_header_bytes(hb, bank_offset, file_size):
         pos += count * 2
     if flags & 0x00200000:
         pos += (count + 1) * 4
-    if pos + count * 4 > hdr_sz:
+    if count == 0:
+        # No stream ids and no tag rows follow, so the tables must fill the header exactly.
+        if pos != hdr_sz:
+            return None
+    elif pos + count * 4 > hdr_sz:
         return None
 
     streams = []
@@ -731,7 +739,10 @@ def parse_adat_header_bytes(hb, bank_offset, file_size):
 
 
 def parse_adat_at_file(fh, bank_offset, file_size):
-    """Read and parse one `ADAT` bank header at `bank_offset` in open binary file `fh`."""
+    """Read and parse one `ADAT` bank header at `bank_offset` in open binary file `fh`.
+
+    Zero-stream banks are validated by :func:`parse_adat_header_bytes`.
+    """
     if bank_offset < 0 or bank_offset + 16 > file_size:
         return None
     fh.seek(bank_offset)
@@ -740,8 +751,7 @@ def parse_adat_at_file(fh, bank_offset, file_size):
         return None
     _, count, hdr_sz = struct.unpack_from("<III", hdr16, 4)
     if (
-        count == 0
-        or count > MAX_BANK_STREAMS
+        count > MAX_BANK_STREAMS
         or hdr_sz < 16
         or hdr_sz > MAX_HEADER_BYTES
         or bank_offset + hdr_sz > file_size
@@ -754,8 +764,136 @@ def parse_adat_at_file(fh, bank_offset, file_size):
     return parse_adat_header_bytes(hb, bank_offset, file_size)
 
 
+GRID20_MAGIC = 12345678
+MAX_GRID20_BYTES = 64 * 1024 * 1024
+MAX_INDEXRUN_GROUPS = 1 << 20
+
+
+def decode_grid20_table(blob):
+    """Structurally decode the undocumented ``0x5a`` companion table.
+
+    Measured on every one of the 1,185 ``audio.rpf`` streams that carry the tag: a u32
+    ``12345678`` marker, a u32 of unknown meaning, then ``N`` 20-byte entries::
+
+        +0  f32  value
+        +4  u16  p (a multiple of 32 on every measured entry)
+        +6  u16  z (0..16 measured)
+        +8  u16  index_lo, +10 u16  index_hi
+        +12 u16  s, +14 u16  t
+        +16 u32  counter (strictly increasing across the entries)
+
+    Nothing is guessed about the meaning of ``value``, ``s``, ``t`` or the counter's unit; the
+    return value carries the structural facts and the invariant checks only.
+    """
+    out = {
+        "size_ok": False,
+        "magic_ok": None,
+        "unknown": None,
+        "entries": None,
+        "counter_first": None,
+        "counter_last": None,
+        "counter_increasing": None,
+        "p_multiple_of_32": None,
+    }
+    raw = bytes(blob)
+    if len(raw) < 8 or len(raw) > MAX_GRID20_BYTES or (len(raw) - 8) % 20:
+        return out
+    out["size_ok"] = True
+    magic, unknown = struct.unpack_from("<II", raw, 0)
+    out["magic_ok"] = magic == GRID20_MAGIC
+    out["unknown"] = unknown
+    n = (len(raw) - 8) // 20
+    out["entries"] = n
+    prev = None
+    first = None
+    p_ok = True
+    increasing = True
+    for i in range(n):
+        at = 8 + 20 * i
+        p, _z = struct.unpack_from("<HH", raw, at + 4)
+        counter, = struct.unpack_from("<I", raw, at + 16)
+        if p % 32:
+            p_ok = False
+        if first is None:
+            first = counter
+        elif counter <= prev:
+            increasing = False
+        prev = counter
+    out["counter_first"] = first
+    out["counter_last"] = prev
+    out["counter_increasing"] = increasing
+    out["p_multiple_of_32"] = p_ok
+    return out
+
+
+def decode_index_runs(blob, grid_entries=None):
+    """Structurally decode the undocumented ``0xd9`` companion table.
+
+    Measured on all 804 ``audio.rpf`` streams that carry the tag: a u32 group count ``K``, then
+    ``K`` groups of ``{u32 2; u32 len; u32 hash; len u32s}``. The values ascend strictly inside a
+    group, exactly one distinct ``hash`` appears per stream, and every value is smaller than the
+    sibling ``0x5a`` table's entry count, so they index ``0x5a`` entries.
+    """
+    out = {
+        "size_ok": False,
+        "group_count_matches": None,
+        "marker_ok": None,
+        "hash_single": None,
+        "hashes": None,
+        "groups": None,
+        "values": None,
+        "indices_ascending": None,
+        "index_max": None,
+        "indices_within_grid": None,
+    }
+    raw = bytes(blob)
+    if len(raw) < 4 or len(raw) % 4 or len(raw) > MAX_GRID20_BYTES:
+        return out
+    out["size_ok"] = True
+    vals = struct.unpack_from(f"<{len(raw) // 4}I", raw, 0)
+    declared, at = vals[0], 1
+    groups = 0
+    hashes = set()
+    values = 0
+    index_max = 0
+    ascending = True
+    marker_ok = True
+    while at < len(vals):
+        if at + 3 > len(vals) or groups >= MAX_INDEXRUN_GROUPS:
+            out["size_ok"] = False
+            return out
+        marker, length, h = vals[at], vals[at + 1], vals[at + 2]
+        if marker != 2:
+            marker_ok = False
+        if length > len(vals) - at - 3:
+            out["size_ok"] = False
+            return out
+        hashes.add(h)
+        run = vals[at + 3 : at + 3 + length]
+        if any(run[i] >= run[i + 1] for i in range(len(run) - 1)):
+            ascending = False
+        if run:
+            index_max = max(index_max, run[-1])
+        values += length
+        at += 3 + length
+        groups += 1
+    out["group_count_matches"] = groups == declared
+    out["marker_ok"] = marker_ok
+    out["hash_single"] = len(hashes) == 1
+    out["hashes"] = sorted(hashes)
+    out["groups"] = groups
+    out["values"] = values
+    out["indices_ascending"] = ascending
+    out["index_max"] = index_max
+    if grid_entries is None:
+        out["indices_within_grid"] = None
+    else:
+        out["indices_within_grid"] = index_max < grid_entries
+    return out
+
+
 def _decode_companion_tags(read_slice, bank_offset, tag_map):
-    """Decode companion speech tags (`0x76`, `0x55`, `0x36`, `0xa3`, `0xb2`, `0xbd`) on a stream."""
+    """Decode companion speech tags (`0x76`, `0x55`, `0x36`, `0x5a`, `0xa3`, `0xb2`, `0xbd`, `0xd9`) on a stream."""
     comp = {
         "has_audio_data": TAG_DATA in tag_map,
         "audio_data_bytes": tag_map[TAG_DATA][0][1] if TAG_DATA in tag_map else 0,
@@ -790,6 +928,19 @@ def _decode_companion_tags(read_slice, bank_offset, tag_map):
             mb = read_slice(bank_offset + mo, 16)
             if len(mb) >= 16:
                 comp["marker_magic"] = _u32(mb, 0)
+    grid = None
+    if TAG_GRID20 in tag_map:
+        go, gs = tag_map[TAG_GRID20][0]
+        if 0 < gs <= MAX_GRID20_BYTES:
+            grid = decode_grid20_table(read_slice(bank_offset + go, gs))
+            comp["grid20"] = grid
+    if TAG_INDEXRUN in tag_map:
+        io, isz = tag_map[TAG_INDEXRUN][0]
+        if 0 < isz <= MAX_GRID20_BYTES:
+            comp["indexrun"] = decode_index_runs(
+                read_slice(bank_offset + io, isz),
+                grid["entries"] if grid and grid["size_ok"] else None,
+            )
     return comp
 
 
@@ -827,6 +978,62 @@ def _make_record(bank_offset, tag_offset, stream_id, decoded, comp):
     }
 
 
+def _new_grid_tally():
+    return {
+        "grid20_streams": 0,
+        "grid20_entries": 0,
+        "grid20_invalid": 0,
+        "indexrun_streams": 0,
+        "indexrun_groups": 0,
+        "indexrun_invalid": 0,
+        "indexrun_index_overruns": 0,
+    }
+
+
+def _tally_undocumented_tables(read_slice, bank_base, tmap, tally):
+    """Decode the undocumented ``0x5a``/``0xd9`` tags on one stream into a running tally.
+
+    A stream counts as invalid when one of the layout invariants measured over the whole ``audio.rpf``
+    population fails, so the tally doubles as a package-wide validator.
+    """
+    grid = None
+    if TAG_GRID20 in tmap:
+        go, gs = tmap[TAG_GRID20][0]
+        if 0 < gs <= MAX_GRID20_BYTES:
+            grid = decode_grid20_table(read_slice(bank_base + go, gs))
+        tally["grid20_streams"] += 1
+        if grid is None or not (
+            grid["size_ok"]
+            and grid["magic_ok"]
+            and grid["counter_increasing"]
+            and grid["p_multiple_of_32"]
+        ):
+            tally["grid20_invalid"] += 1
+        elif grid["entries"]:
+            tally["grid20_entries"] += grid["entries"]
+    if TAG_INDEXRUN in tmap:
+        io, isz = tmap[TAG_INDEXRUN][0]
+        runs = None
+        if 0 < isz <= MAX_GRID20_BYTES:
+            runs = decode_index_runs(
+                read_slice(bank_base + io, isz),
+                grid["entries"] if grid and grid["size_ok"] else None,
+            )
+        tally["indexrun_streams"] += 1
+        if runs is None or not (
+            runs["size_ok"]
+            and runs["group_count_matches"]
+            and runs["marker_ok"]
+            and runs["hash_single"]
+            and runs["indices_ascending"]
+        ):
+            tally["indexrun_invalid"] += 1
+        else:
+            tally["indexrun_groups"] += runs["groups"]
+            if runs["indices_within_grid"] is False:
+                tally["indexrun_index_overruns"] += 1
+
+
 def decode_awc_bank(data, bank_offset=0, *, deep=True):
     """Decode all `0x5c` (`RSC8` v8001) entries in one in-memory AWC (`ADAT`) bank."""
     bank = parse_adat_header_bytes(data, 0, len(data))
@@ -839,12 +1046,14 @@ def decode_awc_bank(data, bank_offset=0, *, deep=True):
     records = []
     tag_counts = {}
     non_rsc8_0x5c = 0
+    tally = _new_grid_tally()
     for sid, tags in bank["entries"]:
         tmap = {}
         for tt, toff, tsz in tags:
             key = f"0x{tt:02x}"
             tag_counts[key] = tag_counts.get(key, 0) + 1
             tmap.setdefault(tt, []).append((toff, tsz))
+        _tally_undocumented_tables(read_slice, 0, tmap, tally)
         for tt, toff, tsz in tags:
             if tt == TAG_RSC8_CLIP:
                 if tsz < 4 or tsz > MAX_RSC8_BYTES:
@@ -865,6 +1074,7 @@ def decode_awc_bank(data, bank_offset=0, *, deep=True):
         "tag_counts": tag_counts,
         "non_rsc8_0x5c": non_rsc8_0x5c,
         "records": records,
+        **tally,
     }
 
 
@@ -875,6 +1085,9 @@ def _new_summary(mode, source):
         "adat_banks": 0,
         "adat_streams": 0,
         "adat_bytes": 0,
+        "adat_banks_past_window": 0,
+        "adat_bytes_past_window": 0,
+        "window_starts_in_bank": None,
         "adat_tag_counts": {},
         "invalid_files": 0,
         "rsc8_decoded": 0,
@@ -904,6 +1117,7 @@ def _new_summary(mode, source):
         "min_tag_size": None,
         "max_tag_size": None,
         "elapsed_seconds": 0.0,
+        **_new_grid_tally(),
     }
 
 
@@ -972,8 +1186,37 @@ def _accumulate_record(summary, rec, *, in_adat=True, has_audio=None):
         summary["audio_codecs"][ck] = summary["audio_codecs"].get(ck, 0) + 1
 
 
+def _bank_covering(fh, start, file_size):
+    """The `ADAT` bank that starts before `start` and runs past it, or `None`.
+
+    Looks back from `start` (at most `MAX_AWC_FILE_BYTES`) for the nearest header that parses as a bank; banks
+    do not overlap, so only that one can cover `start`.
+    """
+    floor = max(0, start - MAX_AWC_FILE_BYTES)
+    hi = start
+    while hi > floor:
+        lo = max(floor, hi - SCAN_CHUNK_BYTES)
+        fh.seek(lo)
+        buf = fh.read(hi - lo + len(ADAT_MAGIC) - 1)   # a magic that starts just before hi; none starts at hi
+        idx = buf.rfind(ADAT_MAGIC)
+        while idx >= 0:
+            bank = parse_adat_at_file(fh, lo + idx, file_size)
+            if bank is not None:
+                return bank if bank["end"] > start else None
+            idx = buf.rfind(ADAT_MAGIC, 0, idx + len(ADAT_MAGIC) - 1)
+        hi = lo
+    return None
+
+
 def scan_rpf(path, *, start=0, limit=None, max_banks=None, deep=True, collect_records=True, progress=None):
-    """Scan an RPF9 archive sequentially for `ADAT` banks and `RSC8` v8001 resources."""
+    """Scan an RPF9 archive sequentially for `ADAT` banks and `RSC8` v8001 resources.
+
+    With a window (`start`/`limit`), `adat_bytes` counts the window's bytes that belong to a bank, so it never
+    exceeds `span` and adjacent windows add up to the whole archive. A bank that starts inside the window is
+    decoded whole and counted in `adat_banks`; its bytes past the window are `adat_bytes_past_window`. A bank that
+    starts before the window and covers `start` (its offset is `window_starts_in_bank`) is not decoded or counted
+    as a bank, and the `RSC8` headers inside it are not reported as outside `ADAT`.
+    """
     t0 = time.time()
     sz = os.path.getsize(path)
     if start < 0 or start > sz:
@@ -989,6 +1232,13 @@ def scan_rpf(path, *, start=0, limit=None, max_banks=None, deep=True, collect_re
         def read_slice(off, n):
             f2.seek(off)
             return f2.read(n)
+
+        if start > 0:
+            earlier = _bank_covering(f2, start, sz)
+            if earlier is not None:
+                summary["window_starts_in_bank"] = earlier["offset"]
+                summary["adat_bytes"] += min(earlier["end"], scan_end) - start
+                adat_ranges.append((earlier["offset"], earlier["end"]))
 
         pos = start
         next_prog = start + 2 * 1024 * 1024 * 1024
@@ -1017,7 +1267,10 @@ def scan_rpf(path, *, start=0, limit=None, max_banks=None, deep=True, collect_re
                     continue
                 summary["adat_banks"] += 1
                 summary["adat_streams"] += bank["count"]
-                summary["adat_bytes"] += bank["end"] - bank["offset"]
+                summary["adat_bytes"] += min(bank["end"], scan_end) - bank["offset"]
+                if bank["end"] > scan_end:
+                    summary["adat_banks_past_window"] += 1
+                    summary["adat_bytes_past_window"] += bank["end"] - scan_end
                 adat_ranges.append((bank["offset"], bank["end"]))
 
                 bank_size = bank["end"] - bank["offset"]
@@ -1043,6 +1296,7 @@ def scan_rpf(path, *, start=0, limit=None, max_banks=None, deep=True, collect_re
                         tk = f"0x{tt:02x}"
                         summary["adat_tag_counts"][tk] = summary["adat_tag_counts"].get(tk, 0) + 1
                         tmap.setdefault(tt, []).append((toff, tsz))
+                    _tally_undocumented_tables(bank_read_slice, aoff, tmap, summary)
                     if not has_5c:
                         continue
                     for tt, toff, tsz in tags:
@@ -1140,6 +1394,8 @@ def scan_dir(path, *, max_banks=None, deep=True, collect_records=True):
                 summary["rsc8_non_rsc8_0x5c"] += bank_res["non_rsc8_0x5c"]
                 for tk, tv in bank_res["tag_counts"].items():
                     summary["adat_tag_counts"][tk] = summary["adat_tag_counts"].get(tk, 0) + tv
+                for gk in _new_grid_tally():
+                    summary[gk] += bank_res[gk]
                 for rec in bank_res["records"]:
                     _accumulate_record(summary, rec, in_adat=True, has_audio=rec.get("has_audio_data"))
                     if collect_records:
@@ -1189,6 +1445,8 @@ def scan_single_file(path, *, start=0, limit=None, max_banks=None, deep=True, co
         summary = _new_summary("awc", path)
         summary["adat_banks"] = 1
         summary["adat_streams"] = bank_res["stream_count"]
+        for gk in _new_grid_tally():
+            summary[gk] += bank_res[gk]
         summary["adat_bytes"] = bank_res["bank_size"]
         summary["adat_tag_counts"] = bank_res["tag_counts"]
         summary["rsc8_non_rsc8_0x5c"] = bank_res["non_rsc8_0x5c"]
@@ -1354,4 +1612,8 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
+    try:  # a redirected stdout is strict ANSI code page under -I; write '?' for what it cannot encode
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
     sys.exit(main())

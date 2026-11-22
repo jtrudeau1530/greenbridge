@@ -136,6 +136,18 @@ class RunTestTest(unittest.TestCase):
         self.assertEqual(status, "skip")
         self.assertIn("exit 77", detail)
 
+    def test_a_signal_termination_fails_even_under_will_fail_or_skip(self):
+        # A host signal is reported as a failure, not reinterpreted by WILL_FAIL or SKIP_RETURN_CODE.
+        # The mocked negative returncode keeps the test portable across Windows and POSIX.
+        exe = self.exiting(0)
+        fake = mock.Mock(returncode=-11, stdout=b"")
+        entry = ctest_entry("segv", self.command_for(exe),
+                            {"WILL_FAIL": "1", "SKIP_RETURN_CODE": "77"})
+        with mock.patch.object(rwt.subprocess, "run", return_value=fake):
+            status, detail = self.run_entry(entry)
+        self.assertEqual(status, "fail")
+        self.assertIn("signal 11", detail)
+
     def test_a_timeout_is_reported_without_hanging(self):
         slow = self.program("slow.py", "import time\ntime.sleep(5)\n")
         self.args.timeout = 0.2
@@ -256,11 +268,33 @@ class MainTest(unittest.TestCase):
         return code, out.getvalue(), err.getvalue()
 
     def test_a_bad_timeout_is_refused_by_argparse(self):
-        for text in ("0", "-1", "abc"):
+        for text in ("0", "-1", "abc", "nan", "inf", "-inf"):
             with self.subTest(text=text):
                 with self.assertRaises(argparse.ArgumentTypeError):
                     rwt.positive_seconds(text)
         self.assertEqual(rwt.positive_seconds("0.5"), 0.5)
+
+    def test_a_nonfinite_timeout_is_a_usage_error(self):
+        for text in ("nan", "inf", "-inf"):
+            with self.subTest(text=text):
+                with self.assertRaises(SystemExit) as ctx:
+                    self.run_main([ctest_entry("ok", self.command("ok.py"))], "--timeout", text)
+                self.assertEqual(ctx.exception.code, 2)
+
+    def test_a_blank_wine_is_a_usage_error(self):
+        with self.assertRaises(SystemExit) as ctx:
+            self.run_main([ctest_entry("ok", self.command("ok.py"))], "--wine", "")
+        self.assertEqual(ctx.exception.code, 2)
+
+    def test_an_unclosed_quote_in_wine_is_a_usage_error(self):
+        with self.assertRaises(SystemExit) as ctx:
+            self.run_main([ctest_entry("ok", self.command("ok.py"))], "--wine", "wine 'unclosed")
+        self.assertEqual(ctx.exception.code, 2)
+
+    def test_wine_quoting_is_still_split(self):
+        self.assertEqual(rwt.wine_command("prog 'two words'"), ["prog", "two words"])
+        with self.assertRaises(argparse.ArgumentTypeError):
+            rwt.wine_command("   ")
 
 
 if __name__ == "__main__":

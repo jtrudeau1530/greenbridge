@@ -391,12 +391,25 @@ def to_markdown(r: dict) -> str:
     return "\n".join(out) + "\n"
 
 
+def same_output_path(first: str, second: str) -> bool:
+    """True when writing ``second`` would truncate ``first`` (same file, path or hard link)."""
+    if os.path.normcase(os.path.realpath(first)) == os.path.normcase(os.path.realpath(second)):
+        return True
+    try:
+        return os.path.samefile(first, second)
+    except OSError:
+        return False
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("image", nargs="+")
     ap.add_argument("--game-dir")
     ap.add_argument("--out", default=os.path.join(os.path.dirname(__file__), "..", "reports", "pe"))
     a = ap.parse_args(argv)
+    if os.path.isfile(a.out):
+        print(f"cannot create output directory {a.out}: path is a file, not a directory", file=sys.stderr)
+        return 1
     try:
         os.makedirs(a.out, exist_ok=True)
     except OSError as e:
@@ -430,10 +443,29 @@ def main(argv: list[str] | None = None) -> int:
             print(f"{img}: another input is also named {r['file']}; report written as {name}.json/.md",
                   file=sys.stderr)
         stem = os.path.join(a.out, name)
-        with open(stem + ".json", "w", encoding="utf-8") as f:
-            json.dump(r, f, indent=1)
-        with open(stem + ".md", "w", encoding="utf-8") as f:
-            f.write(to_markdown(r))
+        json_path = stem + ".json"
+        md_path = stem + ".md"
+        collision = None
+        for other in a.image:
+            if same_output_path(other, json_path):
+                collision = json_path
+                break
+            if same_output_path(other, md_path):
+                collision = md_path
+                break
+        if collision:
+            print(f"{img}: report {collision} would overwrite input file", file=sys.stderr)
+            rc = 1
+            continue
+        try:
+            with open(json_path, "w", encoding="utf-8") as f:
+                json.dump(r, f, indent=1)
+            with open(md_path, "w", encoding="utf-8") as f:
+                f.write(to_markdown(r))
+        except OSError as e:
+            print(f"{img}: cannot write report ({e.strerror or e})", file=sys.stderr)
+            rc = 1
+            continue
         enc = [s["name"] for s in r["sections"] if s["looks_encrypted"]]
         shim = sum(len(i["functions"]) for i in r["imports"] if i["where"] == "shim")
         print(f"{r['file']:<40} {r['machine']:<7} subsys={r['subsystem']!s:<7} pdata={r['pdata_functions']:<7} "
@@ -442,4 +474,8 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
+    try:  # a redirected stdout is strict ANSI code page under -I; write '?' for what it cannot encode
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
     sys.exit(main())

@@ -63,9 +63,10 @@ int main() {
     vk.copy_image = noop_copy_image;
     vk.depth24_prepare = [](Depth24Job& job, std::vector<Depth24Job>& parts) {
         depth24_jobs.push_back(job);
+        const std::uint64_t aw = std::uint64_t(job.width) * job.app_texel_words();
         const std::uint64_t span =
             ((std::uint64_t(job.slices) - 1) * job.app_slice_words +
-             (std::uint64_t(job.height) - 1) * job.app_row_words + job.width) * 4;
+             (std::uint64_t(job.height) - 1) * job.app_row_words + aw) * 4;
         if (job.app_offset % 4 || job.app_offset > job.app_size || span > job.app_size - job.app_offset) return false;
         job.scratch = handle<VkBuffer>(0x9000);
         job.scratch_offset = 0;
@@ -109,12 +110,25 @@ int main() {
     d24_img.depth24 = true;
     d24_img.depth24_as_float = true;
 
+    ResourceBinding rgb96_img{};
+    rgb96_img.image = handle<VkImage>(5);
+    rgb96_img.format = VK_FORMAT_R32G32B32A32_UINT;
+    rgb96_img.aspects = VK_IMAGE_ASPECT_COLOR_BIT;
+    rgb96_img.width = 17;
+    rgb96_img.height = 3;
+    rgb96_img.mip_levels = 1;
+    rgb96_img.array_layers = 1;
+    rgb96_img.depth = 1;
+    rgb96_img.samples = 1;
+    rgb96_img.rgb96 = true;
+
     const auto resolve = [&](ResourceId id) -> const ResourceBinding* {
         switch (id) {
         case 1: return &src_buf;
         case 2: return &dst_buf;
         case 3: return &rgba_img;
         case 4: return &d24_img;
+        case 5: return &rgb96_img;
         default: return nullptr;
         }
     };
@@ -257,6 +271,41 @@ int main() {
 
         src_buf.buffer_offset = 2;  // violates 4-byte depth alignment
         expect(run(up) == ReplayResult::unsupported, "depth24 upload rejects misaligned backing buffer_offset");
+        src_buf = saved_src;
+        dst_buf = saved_dst;
+    }
+
+    // 5. CopyTexture on rgb96 passes buffer_offset + offset and buffer_offset + size to Depth24Converter.
+    {
+        const auto saved_src = src_buf, saved_dst = dst_buf;
+        src_buf.buffer_offset = 2048;
+        src_buf.size = 1536;
+        dst_buf.buffer_offset = 4096 + 4;  // 4-byte aligned, non-256-aligned
+        dst_buf.size = 1536;
+
+        const CopyLocation rgb96_tex{5, false, 0, 0, 0, 0, 0, 0};
+        const CopyLocation fp_up{1, true, 0, 512, 17, 3, 1, 256};
+        CommandList up;
+        expect(up.copy_texture({rgb96_tex, 0, 0, 0, fp_up, false, {}}) && up.close(), "record rgb96 upload");
+        expect(run(up) == ReplayResult::success, "rgb96 upload with buffer_offset replays");
+        expect(depth24_jobs.size() == 1 && depth24_jobs[0].rgb96 && depth24_jobs[0].to_float &&
+                   depth24_jobs[0].app_offset == src_buf.buffer_offset + 512 &&
+                   depth24_jobs[0].app_size == src_buf.buffer_offset + src_buf.size &&
+                   depth24_jobs[0].app_row_words == 64,
+               "rgb96 upload passes backing offset and backing end size");
+
+        const CopyLocation fp_rb{2, true, 0, 512, 17, 3, 1, 256};
+        CommandList rb;
+        expect(rb.copy_texture({fp_rb, 0, 0, 0, rgb96_tex, false, {}}) && rb.close(), "record rgb96 readback");
+        expect(run(rb) == ReplayResult::success, "rgb96 readback with buffer_offset replays");
+        expect(depth24_jobs.size() == 1 && depth24_jobs[0].rgb96 && !depth24_jobs[0].to_float &&
+                   depth24_jobs[0].app_offset == dst_buf.buffer_offset + 512 &&
+                   depth24_jobs[0].app_size == dst_buf.buffer_offset + dst_buf.size &&
+                   depth24_jobs[0].app_row_words == 64,
+               "rgb96 readback passes backing offset and backing end size");
+
+        src_buf.buffer_offset = 2;  // violates 4-byte rgb96 alignment
+        expect(run(up) == ReplayResult::unsupported, "rgb96 upload rejects misaligned backing buffer_offset");
         src_buf = saved_src;
         dst_buf = saved_dst;
     }

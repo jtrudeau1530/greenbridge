@@ -633,6 +633,17 @@ class ArchiveTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "no clip dictionary"):
             anim_clips.decode_one(self.rpf, self.offsets[3], 2)
 
+    def test_budget_rejects_nan_and_negative(self):
+        for value in ("nan", "-1"):
+            r = subprocess.run(
+                [sys.executable, "-I", TOOL, self.rpf, os.path.join(self.tmp.name, "o.json"),
+                 "--budget", value],
+                capture_output=True, text=True,
+            )
+            self.assertEqual(r.returncode, 2, value)
+            self.assertIn("--budget", r.stderr)
+            self.assertEqual(r.stdout, "")
+
     def test_bad_arguments(self):
         for args in (["--jobs", "0", "x.json"], [], ["x.json", "--start", "-1"]):
             r = subprocess.run([sys.executable, "-I", TOOL, self.rpf, *args], capture_output=True, text=True)
@@ -650,6 +661,35 @@ class ArchiveTest(unittest.TestCase):
                                capture_output=True, text=True)
             self.assertNotEqual(r.returncode, 0, source)
             self.assertNotIn("Traceback", r.stderr)
+
+
+    def test_output_cannot_overwrite_source_archive(self):
+        with open(self.rpf, "rb") as f:
+            data = f.read()
+        other = os.path.join(os.path.dirname(self.rpf), ".", os.path.basename(self.rpf))
+        r = subprocess.run([sys.executable, "-I", TOOL, self.rpf, other, "--quiet"],
+                           capture_output=True, text=True)
+        self.assertEqual(r.returncode, 2, r.stderr)
+        self.assertIn("output must not overwrite the input archive", r.stderr)
+        self.assertNotIn("Traceback", r.stderr)
+        with open(self.rpf, "rb") as f:
+            self.assertEqual(f.read(), data)
+
+    def test_output_that_is_a_directory_is_refused_before_the_scan(self):
+        r = subprocess.run([sys.executable, "-I", TOOL, self.rpf, self.tmp.name, "--quiet"],
+                           capture_output=True, text=True)
+        self.assertEqual(r.returncode, 2, r.stderr)
+        self.assertIn("is a directory", r.stderr)
+        self.assertNotIn("Traceback", r.stderr)
+
+    def test_output_in_a_missing_folder_is_created(self):
+        out = os.path.join(self.tmp.name, "reports", "sub", "out.json")
+        r = subprocess.run([sys.executable, "-I", TOOL, self.rpf, out, "--quiet"],
+                           capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        with open(out, encoding="utf-8") as f:
+            doc = json.load(f)
+        self.assertEqual(doc["summary"]["counts"]["animations_decoded"], 2)
 
 
 if __name__ == "__main__":

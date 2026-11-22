@@ -831,6 +831,16 @@ def decode_one(path, offset, frames):
     return d
 
 
+def same_output_path(first, second):
+    """True when writing ``second`` would truncate ``first`` (same file, path or hard link)."""
+    if os.path.normcase(os.path.realpath(first)) == os.path.normcase(os.path.realpath(second)):
+        return True
+    try:
+        return os.path.samefile(first, second)
+    except OSError:
+        return False
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("archive", help="anim.rpf")
@@ -849,8 +859,15 @@ def main():
         ap.error("--jobs must be at least 1")
     if a.frames < 0:
         ap.error("--frames must be 0 or more")
+    if math.isnan(a.budget) or a.budget < 0:
+        ap.error("--budget must be 0 or a finite positive value (or infinite)")
     if a.decode is None and not a.out:
         ap.error("an output .json is required unless --decode is given")
+    if a.out:
+        if os.path.isdir(a.out):
+            ap.error(f"{a.out} is a directory, not a .json file")
+        if same_output_path(a.archive, a.out):
+            ap.error("output must not overwrite the input archive")
     try:
         if a.decode is not None:
             json.dump(decode_one(a.archive, a.decode, a.frames), sys.stdout, indent=1)
@@ -866,6 +883,9 @@ def main():
     except OSError as e:
         sys.exit(f"{e.filename or a.archive}: {e.strerror or e}")
     try:
+        parent = os.path.dirname(os.path.abspath(a.out))
+        if parent:
+            os.makedirs(parent, exist_ok=True)
         with open(a.out, "w", encoding="utf-8") as f:
             json.dump({"summary": summary, "dictionaries": rows}, f, indent=1)
     except OSError as e:
@@ -878,4 +898,8 @@ def main():
 
 
 if __name__ == "__main__":
+    try:  # a redirected stdout is strict ANSI code page under -I; write '?' for what it cannot encode
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
     sys.exit(main())

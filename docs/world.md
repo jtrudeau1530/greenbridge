@@ -608,6 +608,32 @@ disc; `RotationIdx` is 0 to 72; `ScaleZ` equals `Scale` in 52,021,564 and `Scale
 `ScaleZ` is its own value, not ambient occlusion. `OrientToTerrain` is 1.0 in all 208,239 lists, `IsSLODList`
 is set in 5,802, and `lodLevel` is ORPHAN_HD in 205,181 and SLOD1 in 3,058.
 
+## Procedural objects and plants (`CProceduralInfo`)
+
+In GTA V, `procedural.meta` scatters small objects and plants over ground by collision material: a tag table maps
+material procedural tags to entries in an object list and a plant list. This build's equivalent, one
+`CProceduralInfo` XML document in `common.rpf`, has the same three parts but only the table is filled. Counts
+only; no names.
+
+| Path | Count | Content |
+|---|---:|---|
+| `procObjInfos` | 1 | empty |
+| `plantInfos` | 1 | empty |
+| `procTagTable/Item` | 255 | `name`, optional `procObjTag` (66, all distinct) and `plantTag` (69, 57 distinct); 30 items have both |
+
+- **The two lists the tags point into are empty**, so no procObj or plant tag resolves inside this document. The
+  procedurally scattered objects and plants are therefore either stored elsewhere in this build or replaced by
+  the authored grass and prop instance lists above (225.5 million grass and 26.5 million prop instances).
+- The 255 table slots carry 107 distinct names. One name fills 149 slots, spread through the table (positions
+  67 to 254, not contiguous), and none of those 149 has a tag: they read as unused placeholder slots, which would
+  keep the slot index (the value a material would store) stable. The other 106 names occur once each, and
+  only one of them has neither tag.
+- `MaterialDataList`, which would carry each material's procedural tag, survives only from mid-document (see
+  the snow and mud section below); 1 of the 107 tag names occurs in its retained part.
+
+Not measured here (hypothesis): whether materials index this table by slot, as in GTA V, and where the
+object and plant definitions live.
+
 ## Deformable snow and mud (`CSnowTrackData`)
 
 The tracks left in snow, mud and similar ground are configured by one

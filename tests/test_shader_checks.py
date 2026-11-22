@@ -27,13 +27,11 @@ PARTIAL = {n for n, _ in check.W64X_PARTIAL}
 WAVE32_WORDS = {n: w for n, w in check.CS_DUMPS if n in check.WAVE32_DUMPS and n not in ("cs_store", "cs_smem_soffset_imm")}
 
 
-# every test check.py runs: compute, cs_wavemask, cs_fmt_1010102, cs_fmt_xy_xyz, the dumps (#73, #152 cross-half, partial), the three
-# vk_store_test checks (cs_imgstore, cs_imgload, cs_imgload_d16), pixel tests, the two-mip draws, the gradient samples and three mesh fixtures (skipped here: build.py
-# does not build mesh shaders)
-TOTAL = (len(check.COMPUTE) + 3 + len(check.CS_DUMPS) + len(check.W64X_DUMPS) + len(check.W64X_PARTIAL) + 3
+# All check.py cases, including the four vk_store_test shaders and the three mesh fixtures.
+TOTAL = (len(check.COMPUTE) + 3 + len(check.CS_DUMPS) + len(check.W64X_DUMPS) + len(check.W64X_PARTIAL) + 4
          + len(check.PIXEL_TESTS) + len(check.CLIP_TESTS) + len(check.BOUNDS) + len(check.GLOBAL_OFFSET)
          + len(check.MIP_TEST_PASSES) + len(check.GRADIENT_TESTS)
-         + 9)  # three mesh fixtures, ps_tex, cs_cmpx_class_f32, cs_user_sgprs, cs_cvt_f32_sat, cs_fma_fused and ps_gather_wrap
+         + 10)  # three mesh fixtures, ps_tex, cs_cmpx_class_f32, cs_user_sgprs, cs_cvt_f32_sat, cs_fma_fused, ps_gather_wrap and ps_ssharp
 CVT = {bits: [u, s] for bits, u, s in check.CVT_F32_SAT_CASES}
 
 
@@ -117,7 +115,7 @@ class Wave64Checks(unittest.TestCase):
                 return 0, "out[0..7] = " + " ".join(map(str, (WAVE32_WORDS[name] + [0] * 8)[:8])) + "\n"
             if name == "cs_workgroup_yz":     # #186: vk_compute_test's 2x3x4 Y/Z histogram line
                 return 0, "2x3x4 workgroup Y/Z: 0 mismatches\n"
-            if name in ("cs_imgstore", "cs_imgload", "cs_imgload_d16"):   # vk_store_test checks
+            if name in ("cs_imgstore", "cs_imgload", "cs_imgload_d16", "cs_sample_lz_int_d16"):   # vk_store_test checks
                 return 0, "0 bad\n0 bad\n0 bad\n"
             return 0, "0 mismatches\n"
 
@@ -136,6 +134,7 @@ class Wave64Checks(unittest.TestCase):
                   patch.object(check, "bindless_test", return_value=""), patch.object(check, "W64_EMULATED", emulated),
                   patch.object(check, "texture_gradient_a16_test", return_value=""),
                   patch.object(check, "gather_wrap_test", return_value=""),
+                  patch.object(check, "sampler_test", return_value=""),
                   contextlib.redirect_stdout(output)):
                 status = check.main()
         return status, output.getvalue()
@@ -560,6 +559,44 @@ class Wave32LaneDumps(unittest.TestCase):
                 self.assertEqual(self.run_dump(name, 0, out + self.words(name)), "")
                 self.assertNotIsInstance(self.run_dump(name, 0, out + self.words(name, flip=True)), check.Skip)
 
+
+
+class SamplerMipChecks(unittest.TestCase):
+    """The S#/T# oracle check.py judges vk_sampler_test with, against hand-worked levels."""
+
+    def test_levels_follow_the_s_and_t_fields(self):
+        want = {"point": (0, 1), "point max_lod 0": (0, 0), "point min_lod 1": (1, 1), "point bias +1": (1, 1),
+                "point bias -1": (0, 0), "none": (0, 0), "none min_lod 1": (0, 0), "point base 1": (1, 1)}
+        self.assertEqual({name for name, _, _ in check.SAMPLER_CASES}, set(want))
+        for name, words, view in check.SAMPLER_CASES:
+            with self.subTest(name=name):
+                self.assertEqual((check.sampler_level(words, view, 0), check.sampler_level(words, view, 1)), want[name])
+
+    def test_s_words_put_the_fields_where_mesa_does(self):
+        self.assertEqual(check.ssharp_words(1, min_lod=1, max_lod=15, bias=-1), (0x92, 0xf00100, 0x04003f00, 0))
+
+    @staticmethod
+    def image(level_lz, level_implicit):
+        return b"".join(struct.pack("<4f", *check.sampler_texel(level_lz, x, y), *check.sampler_texel(level_implicit, x, y))
+                        for y in range(64) for x in range(64))
+
+    def test_every_channel_and_the_last_pixel_are_judged(self):
+        words, view = check.ssharp_words(1), (0, 1)
+        good = self.image(0, 1)
+        self.assertEqual(check.sampler_mismatch(good, words, view), "")
+        for channel in range(4):
+            bad = bytearray(good)
+            struct.pack_into("<f", bad, len(good) - 16 + 4 * channel, 0.25)
+            self.assertTrue(check.sampler_mismatch(bytes(bad), words, view).startswith("(63,63):"))
+        self.assertIn("bytes", check.sampler_mismatch(good[:-16], words, view))
+
+    def test_a_wrong_level_or_swapped_uv_fails_where_predicted(self):
+        words, view = check.ssharp_words(1), (0, 1)
+        self.assertTrue(check.sampler_mismatch(self.image(1, 1), words, view).startswith("(0,0):"))
+        self.assertTrue(check.sampler_mismatch(self.image(0, 0), words, view).startswith("(0,0):"))
+        swapped = b"".join(struct.pack("<4f", *check.sampler_texel(0, y, x), *check.sampler_texel(1, y, x))
+                           for y in range(64) for x in range(64))
+        self.assertTrue(check.sampler_mismatch(swapped, words, view).startswith("(32,0):"))
 
 if __name__ == "__main__":
     unittest.main()
