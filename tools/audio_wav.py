@@ -6,11 +6,13 @@ Every .ogg/.opus file under the source is decoded to <out>/<relative path>.wav (
 the extension becomes .wav; files that would share a name, such as x.ogg and x.opus, keep their extension:
 x.ogg.wav, x.opus.wav). Existing .wav files are skipped, so a stopped run continues where it left off, and
 .wav inputs are never decoded. With no --out, a source directory writes to <src>/wav and a single file writes
-next to itself.
+next to itself. Resuming assumes the same set of sources: an existing plain-named WAV is trusted by name. Only an
+existing name shaped like a kept-extension one (x.ogg.wav, x.opus~2.wav) has its audio compared; if it differs,
+that file is left alone and the input moves on to the next ~N name.
 
-The output is pcm_s16le at the stream's own sample rate and channel count (Opus is always 48 kHz). It is trimmed
-to the Ogg Opus end granule (minus the header's pre-skip) with atrim, because ffmpeg otherwise can keep up to one
-extra partial frame when a stream's last page lies beyond the declared end. ffmpeg must be on PATH or given with
+The output is pcm_s16le at the stream's own sample rate and channel count (Opus is always 48 kHz). A single
+stream is trimmed to its Ogg Opus end granule minus pre-skip, because ffmpeg can keep samples beyond its declared
+end. For chained streams, ffmpeg handles each link's timing. ffmpeg must be on PATH or given with
 --ffmpeg; without it the tool exits with an explanation instead of a traceback.
 
 For PCM copies of the AWC banks' Opus streams, first repackage the banks with awc_opus.py, then run this tool on
@@ -18,7 +20,10 @@ its output (make_game.py does both, the second only with --wav).
 """
 import argparse
 import concurrent.futures
+from contextlib import ExitStack
+import errno
 from functools import cache
+import hashlib
 import os
 import shutil
 import struct
@@ -26,6 +31,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import unicodedata
 
 EXTS = (".ogg", ".opus")
 
@@ -65,15 +71,25 @@ def looks_like_opus(path: str) -> bool:
 
 
 def ogg_output_samples(path: str) -> int:
-    """Samples per channel the Ogg Opus stream declares (last page granule minus pre-skip), or 0 if unknown."""
+    """End granule minus pre-skip for matching Opus stream endpoints, or 0 to use ffmpeg's timing."""
     try:
         size = os.path.getsize(path)
         with open(path, "rb") as f:
             first = f.read(65536)
-            head = first.find(b"OpusHead")
-            if head < 0 or head + 12 > len(first):
+            if len(first) < 27 or first[:6] != b"OggS\x00\x02":
                 return 0
-            pre_skip = struct.unpack_from("<H", first, head + 10)[0]
+            # The Opus ID packet must finish on the BOS page and be its only packet.
+            body_start = 27 + first[26]
+            lacing = first[27:body_start]
+            if not lacing or lacing[-1] == 255 or lacing[:-1].count(255) != len(lacing) - 1:
+                return 0
+            body_end = body_start + sum(lacing)
+            head = first[body_start:body_end]
+            if (body_end > len(first) or len(head) < 19 or not head.startswith(b"OpusHead")
+                    or head[8] >= 16 or head[9] == 0):
+                return 0
+            serial = first[14:18]
+            pre_skip, = struct.unpack_from("<H", head, 10)
             start = max(0, size - 131072)
             f.seek(start)
             tail = f.read()
@@ -92,6 +108,9 @@ def ogg_output_samples(path: str) -> int:
             body = sum(tail[pos + 27:pos + 27 + nseg])
             if start + pos + 27 + nseg + body != size:
                 continue
+            # A chained file ends on a different logical stream with its own granule timeline.
+            if tail[pos + 5] not in (0x04, 0x05) or tail[pos + 14:pos + 18] != serial:
+                return 0
             granule, = struct.unpack_from("<q", tail, pos + 6)
             return granule - pre_skip if granule > pre_skip else 0
     except (OSError, struct.error):
@@ -153,6 +172,221 @@ def output_names(items, out=None):
         used.add(key)
         named.append((path, name))
     return named, renamed
+
+
+def fold_name(text):
+    # A broad, cheap filter. The output volume decides whether two candidate names are really aliases.
+    return unicodedata.normalize("NFD", unicodedata.normalize("NFD", os.path.normcase(text)).upper().casefold())
+
+
+def existing_entry(path, st):
+    if st.st_nlink == 1:
+        return st.st_dev, st.st_ino
+    # Two hard links have the same inode but can occupy separate directory entries, even on a read-only volume.
+    directory, leaf = os.path.split(path)
+    with os.scandir(directory) as entries:
+        matches = [e.name for e in entries if fold_name(e.name) == fold_name(leaf) and e.inode() == st.st_ino]
+    if leaf in matches or len(matches) == 1:
+        return st.st_dev, os.stat(directory).st_ino, leaf if leaf in matches else matches[0]
+    return None
+
+
+def native_collisions(group, named, target, unprobed):
+    """Ask the destination volume which suspect names identify one file, without touching the real targets."""
+    stems = {i: target(named[i][1]) for i in group}
+    collided = set()
+
+    def record(indices, tokens):
+        owners, missing = {}, []
+        for i, token in zip(indices, tokens):
+            if token is None:
+                missing.append(i)
+            else:
+                first = owners.setdefault(token, i)
+                if first != i:
+                    collided.update((first, i))
+        return missing
+
+    def existing_tokens(indices, suffix):
+        entries = []
+        for i in indices:
+            path = stems[i] + suffix
+            try:
+                st = os.lstat(path)
+            except OSError as e:
+                if e.errno not in (errno.ENOENT, errno.ENAMETOOLONG):
+                    raise
+                entries.append(None)
+                continue
+            entry = existing_entry(path, st)
+            if not st.st_ino or entry is None:
+                return []  # an ambiguous hard link cannot partition this group
+            entries.append(entry)
+        return entries
+
+    # Existing and missing spellings for a common suffix cannot be aliases. Classify the existing entries
+    # together, then apply another common witness to those still missing; never compare incompatible identities.
+    suffixes = [".wav"] + sorted({os.path.splitext(named[i][0])[1] + ".wav" for i in group})
+    remaining = group
+    while len(remaining) > 1:
+        for suffix in suffixes:
+            entries = existing_tokens(remaining, suffix)
+            if any(entries):
+                remaining = record(remaining, entries)
+                break
+        else:
+            break
+    if len(remaining) < 2:
+        return collided
+
+    probes, tokens = {}, []
+    try:
+        with ExitStack() as stack:
+            for i in remaining:
+                stem = stems[i]
+                parent = os.path.dirname(stem)
+                while not os.path.isdir(parent) and os.path.dirname(parent) != parent:
+                    parent = os.path.dirname(parent)
+                anchor = os.stat(parent)
+                volume_dir = anchor.st_dev, anchor.st_ino
+                if volume_dir not in probes:
+                    probes[volume_dir] = stack.enter_context(tempfile.TemporaryDirectory(dir=parent))
+                probe = os.path.join(probes[volume_dir], os.path.relpath(stem, parent) + ".wav")
+                os.makedirs(os.path.dirname(probe), exist_ok=True)
+                with open(probe, "ab"):
+                    pass
+                st = os.stat(probe)
+                if not st.st_ino:
+                    raise OSError(f"the filesystem did not report a file identity for {stem}")
+                tokens.append((st.st_dev, st.st_ino))
+    except OSError as e:
+        if e.errno not in (errno.EACCES, errno.EPERM, errno.EROFS):
+            raise
+        unprobed.update(remaining)       # only an existing PCM-verified repair may be reused
+    else:
+        record(remaining, tokens)
+    return collided
+
+
+def repair_base(stem):
+    """The kept-extension base of a possible repair, including names that already have a ~N counter."""
+    base, sep, counter = stem.rpartition("~")
+    if sep and counter.isascii() and counter.isdigit():
+        stem = base
+    return stem if stem.lower().endswith(EXTS) else None
+
+
+def plan_outputs(items, src, out, ffmpeg):
+    """Apply the existing naming rules first. Reserve their results before moving any residual native aliases."""
+    @cache
+    def parent(directory):
+        return os.path.realpath(os.path.join(out, directory))
+
+    def target(stem):
+        directory, name = os.path.split(stem)
+        return os.path.join(parent(directory), name)
+
+    folded_parent = cache(lambda directory: fold_name(parent(directory)))
+
+    def key(stem):
+        directory, name = os.path.split(stem)
+        return folded_parent(directory), fold_name(name)
+
+    def buckets(pairs):
+        reserved, groups, guarded = {}, {}, []
+        for i, (_, stem) in enumerate(pairs):
+            bucket = key(stem)
+            first = reserved.setdefault(bucket, i)
+            if i != first:
+                groups.setdefault(bucket, [first]).append(i)
+            base = repair_base(stem)
+            if base is not None:
+                guarded.append((i, base))
+        return reserved, groups, guarded
+
+    reserved, groups, guarded = buckets(items)
+    if not groups and not guarded:
+        return items, 0, 0
+    named, renamed, repaired, unprobed = list(items), 0, set(), set()
+    if groups:
+        named, renamed = output_names(items, out)
+        if renamed:
+            # Legacy assignments, including their counters, take precedence over all new names.
+            reserved, groups, guarded = buckets(named)
+        for group in groups.values():
+            repaired.update(native_collisions(group, named, target, unprobed))
+        repaired.update(unprobed)
+    counters, digests = {}, {}
+
+    def holds_own_audio(i, stem):
+        """True if stem.wav is free or already holds input i's decoded audio."""
+        path = named[i][0]
+        dst = os.path.join(out, stem + ".wav")
+        if not os.path.lexists(dst):
+            return True
+        if i not in digests:
+            if not digests:
+                print("Checking audio in existing kept-extension WAVs...", flush=True)
+            elif len(digests) % 100 == 0:
+                print(f"  Checked {len(digests)} input recordings...", flush=True)
+            digests[i] = audio_digest(ffmpeg, path, source=True)
+        if digests[i] and os.path.isfile(dst) and audio_digest(ffmpeg, dst, source=False) == digests[i]:
+            return True
+        print(f"  Keeping {dst}: its audio could not be verified for {path}.", file=sys.stderr)
+        return False
+
+    def allocate(i, base):
+        """Give input i the first unreserved name of base, base~2, ... that is free or holds its audio."""
+        base_key = key(base)
+        stem, n = base, counters.get(base_key, 2)
+        while True:
+            candidate = key(stem)
+            if candidate not in reserved:
+                if i in unprobed and not os.path.lexists(os.path.join(out, stem + ".wav")):
+                    raise OSError(f"cannot distinguish names in a read-only directory and verify {stem}.wav")
+                if holds_own_audio(i, stem):
+                    break
+                reserved[candidate] = i
+            stem, n = f"{base}~{n}", n + 1
+        counters[base_key] = n
+        reserved[candidate] = i
+        named[i] = (named[i][0], stem)
+
+    for i in sorted(repaired):
+        directory, leaf = os.path.split(os.path.relpath(named[i][0], src))
+        base, ext = os.path.splitext(leaf)
+        # Keep room for the source extension, a counter and ".wav" on a 255-byte filesystem.
+        while len(os.fsencode(base)) > 230:
+            base = base[:-1]
+        allocate(i, os.path.join(directory, base + ext))
+    # An earlier run may have left a repair under this shape for different audio. Plain names stay name-only.
+    moved = 0
+    for i, base in guarded:
+        if i not in repaired and not holds_own_audio(i, named[i][1]):
+            allocate(i, base)
+            moved += 1
+    return named, renamed, len(repaired) + moved
+
+
+def audio_digest(ffmpeg, path, *, source):
+    """Hash a metadata-free WAV stream, retaining its PCM, channel layout and sample rate."""
+    cmd = [ffmpeg, "-v", "error"]
+    if not source:
+        # Preserve an unspecified layout (e.g. four mapping-family-255 channels) when reading a prior WAV.
+        cmd += ["-f", "wav", "-guess_layout_max", "0"]
+    cmd += ["-i", path]
+    if source:
+        samples = ogg_output_samples(path)
+        if samples:
+            cmd += ["-af", f"atrim=end_sample={samples}"]
+    cmd += ["-map_metadata", "-1", "-fflags", "+bitexact", "-c:a", "pcm_s16le" if source else "copy", "-f", "wav", "-"]
+    with subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL) as proc:
+        header = proc.stdout.read(12)
+        h = hashlib.sha256(header)
+        for block in iter(lambda: proc.stdout.read(1024 * 1024), b""):
+            h.update(block)
+        valid = header[:4] in (b"RIFF", b"RF64") and header[8:] == b"WAVE"
+        return h.digest() if proc.wait() == 0 and valid else None
 
 
 def decode(ffmpeg: str, src: str, dst: str):
@@ -217,10 +451,16 @@ def main() -> int:
     if not ffmpeg:
         return 2
 
-    items, renamed = output_names(items, out)
+    try:
+        items, renamed, repaired = plan_outputs(items, src, out, ffmpeg)
+    except OSError as e:
+        error(f"could not safely distinguish WAV output names under {out}: {e}")
+        return 2
     if renamed:
         print(f"{renamed} file(s) share a name with another input (e.g. x.ogg and x.opus) and keep their extension "
               f"in the WAV name (x.ogg.wav)")
+    if repaired:
+        print(f"{repaired} file(s) needed distinct names on the output filesystem or beside an unverified WAV.")
 
     jobs = max(1, a.jobs)
     t0 = time.time()

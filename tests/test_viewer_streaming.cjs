@@ -63,6 +63,45 @@ test('test mode, a missing manifest, and an unreadable manifest have distinct me
     assert.match(unreachable.reason, /could not be loaded/);
 });
 
+test('the bounds overlay creates helpers on the first G press and reuses them', async () => {
+    const viewerModule = html.match(/<script type="module">([\s\S]*?)<\/script>/)[1].replace(/^import .*;$/gm, '');
+    const chunks = [worldChunk, { id: 'other', url: 'other.glb', bounds: [5, 6, 7, 8, 9, 10] }];
+    const handlers = new Map();
+    const boundsGroup = await vm.runInNewContext(`(async () => { ${viewerModule}\nreturn boundsGroup; })()`, {
+        THREE: {
+            WebGLRenderer: class { domElement = { addEventListener() {} }; setPixelRatio() {} setSize() {} setAnimationLoop() {} },
+            Scene: class { add() {} },
+            PerspectiveCamera: class { position = { fromArray() {} }; },
+            DirectionalLight: class { position = { set() {} }; },
+            Color: class {}, Fog: class {}, HemisphereLight: class {}, Clock: class {}, MeshStandardMaterial: class {},
+            Vector3: class { constructor(...xyz) { this.xyz = xyz; } },
+            Box3: class { constructor(min, max) { Object.assign(this, { min, max }); } },
+            Box3Helper: class { constructor(box, color) { Object.assign(this, { box, color }); } },
+            Group: class { children = []; add(child) { this.children.push(child); } },
+        },
+        document: { body: { prepend() {} }, getElementById: () => ({}), addEventListener() {} },
+        addEventListener: (type, handler) => handlers.set(type, handler),
+        devicePixelRatio: 1, innerWidth: 800, innerHeight: 600, URLSearchParams, location: { search: '' },
+        fetch: manifestResponse({ spawn: [0, 0, 0], chunks }), GLTFLoader: class {},
+    });
+    const pressG = (repeat = false) => handlers.get('keydown')({ code: 'KeyG', repeat });
+    assert.equal(boundsGroup.visible, false);
+    assert.equal(boundsGroup.children.length, 0);
+    pressG();
+    assert.equal(boundsGroup.visible, true);
+    const helpers = [...boundsGroup.children];
+    assert.deepEqual(helpers.map(({ box }) => [...box.min.xyz, ...box.max.xyz]), chunks.map(c => c.bounds));
+    assert.ok(helpers.every(helper => helper.color === 0x5fb3ff));
+    pressG(true);
+    assert.equal(boundsGroup.visible, true);
+    pressG();
+    assert.equal(boundsGroup.visible, false);
+    pressG();
+    assert.equal(boundsGroup.visible, true);
+    assert.equal(boundsGroup.children.length, helpers.length);
+    helpers.forEach((helper, i) => assert.equal(boundsGroup.children[i], helper));
+});
+
 const begin = html.indexOf('// ---------- chunk streaming ----------');
 const end = html.indexOf('// ---------- main loop ----------', begin);
 assert(begin >= 0 && end > begin, 'viewer streaming section must exist');
@@ -93,10 +132,10 @@ function fixture(count = 1) {
         },
         scene: { add: obj => added.push(obj), remove() {} },
         camera: { position: { x: 0, y: 0, z: 0 } },
-        world: { chunks: Array.from({ length: count }, (_, i) => ({
+        world: { test: false, chunks: Array.from({ length: count }, (_, i) => ({
             id: `chunk_${i}`, url: `${i}.glb`, bounds: [i, 0, 0, i + 1, 1, 1],
         })) },
-        buildTestChunk: () => ({ traverse() {} }),
+        buildTestChunk: ([x, z, size]) => ({ x, z, size, traverse() {} }),
     });
     vm.runInContext(source, context);
     added.length = 0; // Ignore the viewer's bounds-helper group.
@@ -242,6 +281,29 @@ test('successful chunks unload and can load again with a fresh attempt budget', 
     assert.equal(f.state.live.get('chunk_0').attempts, 1);
 });
 
+test('clay, wireframe and eviction preserve imported material metadata', async t => {
+    const f = fixture();
+    const materials = [{ dispose: t.mock.fn() }, { dispose: t.mock.fn() }];
+    const userData = { origMaterial: { label: 'imported glTF extras' } };
+    const mesh = { isMesh: true, material: materials, userData };
+
+    f.frame();
+    await f.succeed(0, { traverse: visit => visit(mesh) });
+    assert.equal(mesh.material, materials);
+
+    vm.runInContext('clay = true; applyClay(); wire = true; applyWire()', f.context);
+    assert.notEqual(mesh.material, materials);
+    assert.equal(mesh.material.wireframe, true);
+    for (const material of materials) assert.equal(material.wireframe, true);
+
+    vm.runInContext('clay = false; applyClay()', f.context);
+    assert.equal(mesh.material, materials);
+    vm.runInContext('clay = true; applyClay()', f.context);
+    f.state.drop('chunk_0');
+    for (const material of materials) assert.equal(material.dispose.mock.callCount(), 1);
+    assert.deepEqual(userData, { origMaterial: { label: 'imported glTF extras' } });
+});
+
 test('stale and evicted chunks close each shared bitmap once', async t => {
     const f = fixture();
     class Bitmap { close = t.mock.fn(); }
@@ -330,8 +392,26 @@ test('canceling a retry preserves the failures already counted', async () => {
     assert.equal(f.state.failed, 3);
 });
 
+test('manifest chunks with test metadata still load their GLB', async t => {
+    const cases = [['truthy flag', true], ['terrain-like tuple', [0, 0, 256]]];
+    for (const [label, value] of cases) {
+        await t.test(label, async () => {
+            const f = fixture();
+            const chunk = { ...worldChunk, test: value };
+            f.context.world = await loadWorld(manifestResponse({ spawn: [0, 0, 0], chunks: [chunk] }));
+            f.frame();
+            assert.deepEqual(f.requests.map(request => request.url), [chunk.url]);
+            const object = f.object();
+            await f.succeed(0, object);
+            assert.equal(f.state.live.get(chunk.id).obj, object);
+            assert.deepEqual(f.added, [object]);
+        });
+    }
+});
+
 test('generated test terrain loads without network requests', () => {
     const f = fixture();
+    f.context.world.test = true;
     f.context.world.chunks[0].test = [0, 0, 256];
     f.frame(); f.frame();
     assert.equal(f.requests.length, 0);

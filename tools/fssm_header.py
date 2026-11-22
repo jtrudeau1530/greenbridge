@@ -193,7 +193,11 @@ def stage_index(path):
 def files_of(path):
     if os.path.isfile(path):
         return [path]
-    return [os.path.join(path, name) for name in sorted(os.listdir(path)) if name.endswith(".fssm")]
+    return [
+        full
+        for name in sorted(os.listdir(path))
+        if name.endswith(".fssm") and os.path.isfile(full := os.path.join(path, name))
+    ]
 
 
 def summarize(path, stages, bindings=False):
@@ -229,7 +233,9 @@ def tally(rows, stages_known):
     else:
         # Without a stage index, a non-empty table is the only PS signal the blob carries.
         ps = [row for row in rows if row["entries"]]
-        counts = Counter(row["entries"] for row in rows)
+        # Keep the histogram in the same scope as ps_with_table/entries: non-PS blobs have no table
+        # and must not show up as a 0:N bucket in the reported corpus counts.
+        counts = Counter(row["entries"] for row in ps)
         scope = "all"
     return {
         "files": len(rows),
@@ -244,7 +250,10 @@ def tally(rows, stages_known):
 
 def non_negative(text):
     """--limit: a count of blobs. A negative one would slice from the end (paths[:-1] drops the last blob)."""
-    value = int(text)
+    try:
+        value = int(text, 0)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"invalid int value: {text!r}") from None
     if value < 0:
         raise argparse.ArgumentTypeError("must be 0 or more")
     return value
@@ -269,7 +278,11 @@ def main(argv=None):
     if args.limit is not None:
         paths = paths[:args.limit]
     stages = stage_index(args.path)
-    rows = [summarize(path, stages, args.bindings) for path in paths]
+    try:
+        rows = [summarize(path, stages, args.bindings) for path in paths]
+    except OSError as e:
+        print(f"ERROR: cannot read {e.filename or args.path}: {e.strerror or e}", file=sys.stderr)
+        return 2
     summary = tally(rows, bool(stages))
 
     if args.json:

@@ -4,6 +4,7 @@
 #define VK_NO_PROTOTYPES
 #endif
 #include "../src/vulkan_replay.h"
+#include "../src/vulkan_memory.h"  // resizable_bar
 
 #ifdef _WIN32
 #include <windows.h>
@@ -21,6 +22,7 @@ static_assert(s::non_pixel_shader_resource == D3D12_RESOURCE_STATE_NON_PIXEL_SHA
 static_assert(s::pixel_shader_resource == D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
 static_assert(s::stream_out == D3D12_RESOURCE_STATE_STREAM_OUT);
 static_assert(s::indirect_argument == D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
+static_assert(s::predication == D3D12_RESOURCE_STATE_PREDICATION);
 static_assert(s::copy_dest == D3D12_RESOURCE_STATE_COPY_DEST);
 static_assert(s::copy_source == D3D12_RESOURCE_STATE_COPY_SOURCE);
 static_assert(s::resolve_dest == D3D12_RESOURCE_STATE_RESOLVE_DEST);
@@ -128,6 +130,24 @@ constexpr bool video_queue_common_matches_sdk() {
     return leonida::d3d12_layout::video_queue_common == 30;
 }
 static_assert(video_queue_common_matches_sdk<D3D12_BARRIER_LAYOUT>());
+static_assert(leonida::d3d12_query_heap::occlusion == std::uint32_t(D3D12_QUERY_HEAP_TYPE_OCCLUSION));
+static_assert(leonida::d3d12_query_heap::timestamp == std::uint32_t(D3D12_QUERY_HEAP_TYPE_TIMESTAMP));
+static_assert(leonida::d3d12_query_heap::pipeline_statistics == std::uint32_t(D3D12_QUERY_HEAP_TYPE_PIPELINE_STATISTICS));
+static_assert(leonida::d3d12_query_heap::so_statistics == std::uint32_t(D3D12_QUERY_HEAP_TYPE_SO_STATISTICS));
+static_assert(leonida::d3d12_query_heap::video_decode_statistics ==
+              std::uint32_t(D3D12_QUERY_HEAP_TYPE_VIDEO_DECODE_STATISTICS));
+static_assert(leonida::d3d12_query_heap::copy_queue_timestamp == std::uint32_t(D3D12_QUERY_HEAP_TYPE_COPY_QUEUE_TIMESTAMP));
+static_assert(leonida::d3d12_query_heap::pipeline_statistics1 == std::uint32_t(D3D12_QUERY_HEAP_TYPE_PIPELINE_STATISTICS1));
+static_assert(leonida::d3d12_query::occlusion == std::uint32_t(D3D12_QUERY_TYPE_OCCLUSION));
+static_assert(leonida::d3d12_query::binary_occlusion == std::uint32_t(D3D12_QUERY_TYPE_BINARY_OCCLUSION));
+static_assert(leonida::d3d12_query::timestamp == std::uint32_t(D3D12_QUERY_TYPE_TIMESTAMP));
+static_assert(leonida::d3d12_query::pipeline_statistics == std::uint32_t(D3D12_QUERY_TYPE_PIPELINE_STATISTICS));
+static_assert(leonida::d3d12_query::so_statistics_stream0 == std::uint32_t(D3D12_QUERY_TYPE_SO_STATISTICS_STREAM0));
+static_assert(leonida::d3d12_query::so_statistics_stream3 == std::uint32_t(D3D12_QUERY_TYPE_SO_STATISTICS_STREAM3));
+static_assert(leonida::d3d12_query::video_decode_statistics == std::uint32_t(D3D12_QUERY_TYPE_VIDEO_DECODE_STATISTICS));
+static_assert(leonida::d3d12_query::pipeline_statistics1 == std::uint32_t(D3D12_QUERY_TYPE_PIPELINE_STATISTICS1));
+static_assert(leonida::query_result_size(leonida::d3d12_query::pipeline_statistics) ==
+              sizeof(D3D12_QUERY_DATA_PIPELINE_STATISTICS));
 #endif
 
 #include <cstdio>
@@ -191,6 +211,16 @@ int main() {
     CHECK(unknown.layout == VK_IMAGE_LAYOUT_GENERAL);
     CHECK(unknown.access & VK_ACCESS_MEMORY_WRITE_BIT);
     CHECK(unknown.stages & VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+    // PREDICATION is INDIRECT_ARGUMENT's bit. With VK_EXT_conditional_rendering it also covers the predicate read,
+    // as does GENERIC_READ, which contains it; without the extension those flags would be invalid and stay out.
+    static_assert(s::predication == s::indirect_argument);
+    const auto predicate = vulkan_access(s::predication, false, true);
+    CHECK(predicate.access == (VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_CONDITIONAL_RENDERING_READ_BIT_EXT));
+    CHECK(predicate.stages ==
+          (VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_CONDITIONAL_RENDERING_BIT_EXT));
+    CHECK(vulkan_access(s::generic_read, false, true).access & VK_ACCESS_CONDITIONAL_RENDERING_READ_BIT_EXT);
+    CHECK(!(vulkan_access(s::predication, false).access & VK_ACCESS_CONDITIONAL_RENDERING_READ_BIT_EXT));
+    CHECK(!(vulkan_access(s::copy_dest, false, true).stages & VK_PIPELINE_STAGE_CONDITIONAL_RENDERING_BIT_EXT));
 
     // Subresource indices: mip + layer * mips + plane * mips * layers.
     VkImageSubresourceRange range{};
@@ -305,6 +335,20 @@ int main() {
             const BarrierScope same = scope(sync, access);
             CHECK(same.stages == vulkan_sync(sync) && same.access == vulkan_barrier_access(access));
         }
+        // SYNC_PREDICATION / ACCESS_PREDICATION share EXECUTE_INDIRECT's and INDIRECT_ARGUMENT's bits; with the
+        // extension they add the conditional-rendering stage and read. An access named under a scope without that
+        // stage (SYNC_COPY) widens the scope by it; without the extension nothing changes.
+        static_assert(y::predication == y::execute_indirect && a::predication == a::indirect_argument);
+        const BarrierScope predicated = vulkan_barrier_scope(y::predication, a::predication, true);
+        CHECK(predicated.stages ==
+              (VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_2_CONDITIONAL_RENDERING_BIT_EXT));
+        CHECK(predicated.access ==
+              (VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_2_CONDITIONAL_RENDERING_READ_BIT_EXT));
+        CHECK(vulkan_barrier_scope(y::copy, a::predication, true).stages &
+              VK_PIPELINE_STAGE_2_CONDITIONAL_RENDERING_BIT_EXT);
+        const BarrierScope plain = vulkan_barrier_scope(y::predication, a::predication);
+        CHECK(plain.stages == vulkan_sync(y::predication) && plain.access == vulkan_barrier_access(a::predication));
+        CHECK(vulkan_barrier_scope(y::copy, a::copy_dest, true).access == VK_ACCESS_2_TRANSFER_WRITE_BIT);
         // No stages, no access (SYNC_NONE pairs with ACCESS_NO_ACCESS in D3D12).
         CHECK(scope(y::none, a::no_access).stages == 0 && scope(y::none, a::no_access).access == 0);
         CHECK(scope(y::none, a::shader_resource).access == 0);
@@ -360,6 +404,77 @@ int main() {
     merged.forget(1);
     CHECK(!merged.tracked(1));
 
-    std::printf("state map, enhanced barriers, subresource decoding and layout tracking OK\n");
+    // DiscardResource by subresource range (D3D-26), through prepare(): each listed subresource becomes one range,
+    // and the command loop goes on to the next command after a discard's own loop.
+    {
+        ResourceBinding target{};
+        target.image = reinterpret_cast<VkImage>(std::uintptr_t{3});
+        target.mip_levels = 3;
+        target.array_layers = 2;
+        const auto resolve = [&](ResourceId id) -> const ResourceBinding* { return id == 3 ? &target : nullptr; };
+        CommandList list;
+        CHECK(list.discard({3, 1, 3, false}));  // mips 1 and 2 of layer 0, mip 0 of layer 1
+        CHECK(list.discard({3, 5, 1, false}));  // mip 2 of layer 1, the last subresource
+        CHECK(list.discard({3, 0, 2, true}));   // a partial discard keeps the contents: nothing to record
+        CHECK(list.close());
+        PreparedList prepared;
+        CHECK(prepare(list, resolve, ReplayFunctions{}, prepared) == ReplayResult::success);
+        CHECK(prepared.commands.size() == 3);
+        const auto& first = prepared.commands[0].discards;
+        CHECK(first.size() == 3);
+        CHECK(first[0].baseMipLevel == 1 && first[0].baseArrayLayer == 0 && first[0].levelCount == 1);
+        CHECK(first[1].baseMipLevel == 2 && first[1].baseArrayLayer == 0);
+        CHECK(first[2].baseMipLevel == 0 && first[2].baseArrayLayer == 1 && first[2].layerCount == 1);
+        const auto& second = prepared.commands[1].discards;
+        CHECK(second.size() == 1 && second[0].baseMipLevel == 2 && second[0].baseArrayLayer == 1);
+        CHECK(prepared.commands[2].discards.empty());
+
+        // One subresource past the end is refused.
+        CommandList past;
+        CHECK(past.discard({3, 4, 3, false}));
+        CHECK(past.close());
+        CHECK(prepare(past, resolve, ReplayFunctions{}, prepared) == ReplayResult::invalid_subresource);
+    }
+
+    // Resizable BAR detection (D3D-96) on the heap layouts real cards report.
+    {
+        constexpr VkDeviceSize mib = VkDeviceSize(1) << 20;
+        constexpr VkMemoryPropertyFlags local = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+        constexpr VkMemoryPropertyFlags host = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+        constexpr VkMemoryPropertyFlags cached = host | VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
+        constexpr VkMemoryHeapFlags vram = VK_MEMORY_HEAP_DEVICE_LOCAL_BIT;
+        struct Type {
+            VkMemoryPropertyFlags flags;
+            std::uint32_t heap;
+        };
+        const auto memory = [](std::initializer_list<VkMemoryHeap> heaps, std::initializer_list<Type> types) {
+            VkPhysicalDeviceMemoryProperties out{};
+            for (const VkMemoryHeap& heap : heaps) out.memoryHeaps[out.memoryHeapCount++] = heap;
+            for (const Type& type : types) out.memoryTypes[out.memoryTypeCount++] = {type.flags, type.heap};
+            return out;
+        };
+        // RTX 5060 Ti, driver 621.14, Resizable BAR on: the host-visible VRAM type is in the 15.67 GiB VRAM heap.
+        CHECK(resizable_bar(memory({{16829644800ull, vram}, {8551161856ull, 0}},
+                                   {{0, 1}, {local, 0}, {host, 1}, {cached, 1}, {local | host, 0}})));
+        // RTX 3090, driver 616.56, Resizable BAR off: that type is in a heap of its own, the 214 MiB BAR window.
+        CHECK(!resizable_bar(memory({{24ull << 30, vram}, {32ull << 30, 0}, {224395264ull, vram}},
+                                    {{local, 0}, {host, 1}, {cached, 1}, {local | host, 2}})));
+        // A 256 MiB window (AMD without Smart Access Memory, RADV without Resizable BAR) is not enough; one byte more is.
+        VkPhysicalDeviceMemoryProperties window =
+            memory({{8ull << 30, vram}, {16ull << 30, 0}, {256 * mib, vram}}, {{local, 0}, {host, 1}, {local | host, 2}});
+        CHECK(!resizable_bar(window));
+        window.memoryHeaps[2].size = 256 * mib + 1;
+        CHECK(resizable_bar(window));
+        // A GPU whose memory is all device-local and host-visible (an integrated GPU).
+        CHECK(resizable_bar(memory({{8ull << 30, vram}}, {{local, 0}, {local | host, 0}})));
+        // Not without HOST_COHERENT, not in a heap without DEVICE_LOCAL, not with a heap index past the heaps.
+        CHECK(!resizable_bar(memory({{8ull << 30, vram}}, {{local | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT, 0}})));
+        CHECK(!resizable_bar(memory({{8ull << 30, 0}}, {{local | host, 0}})));
+        CHECK(!resizable_bar(memory({{8ull << 30, vram}}, {{local | host, 1}})));
+        CHECK(!resizable_bar(VkPhysicalDeviceMemoryProperties{}));
+    }
+
+    std::printf("state map, enhanced barriers, subresource decoding, layout tracking, discard ranges and BAR "
+                "detection OK\n");
     return 0;
 }

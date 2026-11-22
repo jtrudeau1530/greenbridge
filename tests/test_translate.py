@@ -4,6 +4,7 @@ Run from the repository root:  python -m pytest tests
 Needs llvm-mc (AMDGPU target) and spirv-tools; the tests skip themselves when those are missing.
 """
 import glob
+import math
 import os
 import re
 
@@ -72,7 +73,7 @@ def test_translation_is_deterministic(make_shader):
 
 def test_unsupported_instruction_is_reported_not_guessed(make_shader):
     """Anything outside the supported set must raise Unsupported rather than emit a wrong program."""
-    shader = make_shader(program("v_mov_b32 v1, 1.0\nv_mqsad_u32_u8 v[8:11], v[2:3], v1, v[4:7]"))
+    shader = make_shader(program("v_mov_b32 v1, 1.0\nv_sat_pk_u8_i16 v0, v1"))
     with pytest.raises(rdna2spirv.Unsupported):
         shader.translate()
 
@@ -89,11 +90,30 @@ def test_depth_compare_sample_result_width(make_shader, d16):
     dref = re.search(r"^\s*(%\w+) = OpImageSampleDrefExplicitLod %float ", spvasm, re.M)
     assert dref, "the depth compare sample is missing"
     d = re.escape(dref.group(1))
-    as_f16 = re.search(rf"^\s*(%\w+) = OpCompositeConstruct %v2float {d} %f0\n\s*%\w+ = OpExtInst %uint %glsl "
-                       r"PackHalf2x16 \1$", spvasm, re.M)
-    as_f32 = re.search(rf"^\s*%\w+ = OpBitcast %uint {d}$", spvasm, re.M)
-    assert (bool(as_f16), bool(as_f32)) == (d16, not d16)
+    bitcast = re.search(rf"^\s*(%\w+) = OpBitcast %uint {d}$", spvasm, re.M)
+    assert bitcast, "the depth compare bitcast is missing"
+    bc = re.escape(bitcast.group(1))
+    as_f16 = re.search(rf"^\s*%\w+ = OpShiftRightLogical %uint {bc} %c10$", spvasm, re.M)
+    assert bool(as_f16) == d16
 
+
+
+@pytest.mark.parametrize("export,depth", [
+    ("exp mrtz v2, off, off, off vm", True),               # Z only (SPI_SHADER_32_R)
+    ("exp mrtz v2, v3, off, off vm", True),                # Z and stencil (32_GR)
+    ("exp mrtz off, v3, off, off vm", False),              # stencil only (32_GR)
+    ("exp mrtz off, off, v3, off vm", False),              # sample mask only, 32-bit
+    ("exp mrtz v2, v2, v3, v3 compr vm", False),           # stencil and sample mask, 16-bit (UINT16_ABGR)
+], ids=["z", "z-stencil", "stencil", "mask", "compr"])
+def test_mrtz_depth_only_from_an_enabled_x(make_shader, export, depth):
+    """exp mrtz carries Z in x only when x is on in an uncompressed export; the 16-bit form holds stencil and sample
+    mask, never Z (Mesa ac_nir_lower_ps_late.c emit_ps_mrtz_export). Without a depth the shader must not replace it."""
+    shader = make_shader("v_mov_b32 v2, 0.5\nv_mov_b32 v3, 1\n" + export + "\nexp mrt0 v2, v2, v2, v2 done vm\n"
+                         "s_endpgm\n", "ps_mrtz")
+    spvasm = shader.translate()
+    shader.validate(spvasm)
+    assert ("BuiltIn FragDepth" in spvasm) == depth
+    assert ("DepthReplacing" in spvasm) == depth
 
 def test_a16_sample_gradients_use_full_vgprs(make_shader):
     path = os.path.join(ROOT, "runtime", "test", "shaders", "ps_texture_grad_a16.asm")
@@ -512,11 +532,36 @@ def test_wave64_bpermute_reads_zero_from_lanes_that_are_not_running(make_shader)
     assert re.search(
         r"(%t\d+) = OpGroupNonUniformBallot %v4uint_bal %c3 %true\n\s*"
         r"(%t\d+) = OpGroupNonUniformBallotBitExtract %bool %c3 \1 (%t\d+)\n\s*"
-        r"(%t\d+) = OpGroupNonUniformShuffle %uint %c3 %t\d+ \3\n\s*"
-        r"%t\d+ = OpSelect %uint \2 \4 %c0\n",
+        r"(%t\d+) = OpSelect %uint \2 \3 %t\d+\n\s*"
+        r"(%t\d+) = OpGroupNonUniformShuffle %uint %c3 %t\d+ \4\n\s*"
+        r"(%t\d+) = OpSelect %uint \2 %cffffffff %c0\n\s*"
+        r"%t\d+ = OpBitwiseAnd %uint \5 \6\n",
         asm,
     ), "wave64 ds_bpermute did not keep the shuffle only where the source lane is running"
 
+
+
+def test_wave32_bpermute_zeroes_inactive_and_missing_source_lanes(make_shader):
+    """Wave32 ds_bpermute (RDNA ISA 10.4.4): the source value is 0 where the source lane is off in EXEC, and the
+    shuffle result is kept only where the source lane is running, as in the wave64 path."""
+    shader = make_shader("v_lshlrev_b32_e32 v1, 2, v0\nds_bpermute_b32 v2, v1, v0\ns_waitcnt lgkmcnt(0)\ns_endpgm\n",
+                         name="cs_bperm32_ci")
+    asm = shader.translate()
+    shader.validate(asm)
+    assert not rdna2spirv.translate.last_gen.wave64
+    shuffle = re.search(
+        r"(%t\d+) = OpLoad %bool %active\n\s*"
+        r"(%t\d+) = OpSelect %uint \1 %t\d+ %c0\n\s*"
+        r"(%t\d+) = OpGroupNonUniformBallot %v4uint_bal %c3 %true\n\s*"
+        r"(%t\d+) = OpGroupNonUniformBallotBitExtract %bool %c3 \3 (%t\d+)\n\s*"
+        r"(%t\d+) = OpSelect %uint \4 \5 %t\d+\n\s*"
+        r"(%t\d+) = OpGroupNonUniformShuffle %uint %c3 \2 \6\n\s*"
+        r"(%t\d+) = OpSelect %uint \4 %cffffffff %c0\n\s*"
+        r"(?P<result>%t\d+) = OpBitwiseAnd %uint \7 \8\n",
+        asm,
+    )
+    assert shuffle, "wave32 ds_bpermute must mask inactive and missing source lanes"
+    assert f"OpBitwiseAnd %uint {shuffle['result']} " in asm, "the destination write must also mask the shuffle"
 
 WQM_MASK = "s_mov_b64 exec, -1\nv_cmp_gt_u32_e32 vcc_lo, 16, v0\ns_wqm_b64 s[6:7], vcc\ns_bcnt1_i32_b64 s8, s[6:7]\ns_endpgm\n"
 WQM_DATA = "s_mov_b32 s20, 0x00800010\ns_mov_b32 s21, 1\ns_wqm_b64 s[22:23], s[20:21]\ns_add_u32 s24, s22, s23\ns_endpgm\n"
@@ -603,6 +648,134 @@ def test_wave64_emulate_uses_no_subgroup_ops(path, make_shader, monkeypatch):
     shader.validate(emulated, KNOWN_VAL_ISSUES.get(stem))
     assert "OpGroupNonUniform" not in emulated and "%sg_lane" not in emulated
     assert "%x_buf" in emulated and emulated.count("OpControlBarrier") >= 2
+
+
+# SHADER-36: image_gather4_l(_o) runs every texel of its 2x2 footprint through the S#'s CLAMP_X/CLAMP_Y.
+def _gather_l(s_word0, dynamic=False, s_word1=0):
+    return program(
+        "s_mov_b32 s8, 0\ns_mov_b32 s9, 0\ns_mov_b32 s10, 0\ns_mov_b32 s11, 0\n"
+        "s_mov_b32 s12, 0\ns_mov_b32 s13, 0\ns_mov_b32 s14, 0\ns_mov_b32 s15, 0\n"
+        f"s_mov_b32 s16, {s_word0}\ns_mov_b32 s17, {s_word1}\ns_mov_b32 s18, 0\ns_mov_b32 s19, 0\n"
+        + ("s_add_u32 s16, s16, 0\n" if dynamic else "")
+        + "v_mov_b32 v10, 0.5\nv_mov_b32 v11, 0.5\nv_mov_b32 v12, 0\n"
+        "image_gather4_l v[0:3], v[10:12], s[8:15], s[16:19] dmask:0x1 dim:SQ_RSRC_IMG_2D")
+
+
+def _count(text, op):
+    return len(re.findall(rf"= {op} ", text))
+
+
+@pytest.mark.parametrize("mx", range(4))
+@pytest.mark.parametrize("my", range(4))
+def test_gather4_l_literal_sampler_emits_only_the_code_its_modes_need(mx, my, make_shader):
+    """CLAMP_X = bits [2:0], CLAMP_Y = [5:3]; 0 wrap, 1 mirror, 2 clamp, 3 mirror once. Each axis maps its two
+    texel coordinates: wrap = 1 OpSMod, mirror = 1 OpSMod + 1 OpSLessThan, mirror once = 1 OpSGreaterThanEqual."""
+    shader = make_shader(_gather_l(mx | my << 3))
+    text = shader.translate()
+    shader.validate(text)
+    assert _count(text, "OpSMod") == 2 * (mx in (0, 1)) + 2 * (my in (0, 1))
+    assert _count(text, "OpSLessThan") == 2 * (mx == 1) + 2 * (my == 1)
+    assert _count(text, "OpSGreaterThanEqual") == 2 * (mx == 3) + 2 * (my == 3)
+    assert "OpBitFieldUExtract" not in text      # the mode is known at translation time
+
+
+def test_gather4_l_literal_lod_bounds_feed_mip_selection(make_shader):
+    shader = make_shader(_gather_l(0x12, s_word1=(192 << 12) | 64))  # [0.25, 0.75] in unsigned 4.8
+    text = shader.translate()
+    shader.validate(text)
+    defs = dict(re.findall(r"^\s*(%\w+) = (.+)$", text, re.M))
+    biassed, = (expr for expr in defs.values() if expr.startswith("OpFAdd ") and expr.endswith(" %fhalf_g"))
+    clamp = defs[biassed.split()[-2]].split()
+    assert clamp[:4] == ["OpExtInst", "%float", "%glsl", "FClamp"]
+    for limit, bits in zip(clamp[-2:], (0x3e800000, 0x3f400000)):
+        cast, scalar, value = defs[limit].split()
+        assert (cast, scalar) == ("OpBitcast", "%float")
+        assert defs[value] == f"OpConstant %uint {bits}"
+
+
+def test_gather4_l_run_time_lod_bounds_clamp_without_fclamp(make_shader):
+    # A run-time S# here (the real game shape) must not use FClamp: LLPC 26.10.1 miscompiles it on this path and
+    # leaves the gather at mip 0 when MIN_LOD should raise it (#1032). FMax then FMin is the same clamp.
+    asm = ("s_mov_b32 s8, 0\ns_mov_b32 s9, 0\ns_mov_b32 s10, 0\ns_mov_b32 s11, 0\n"
+           "s_mov_b32 s12, 0\ns_mov_b32 s13, 0\ns_mov_b32 s14, 0\ns_mov_b32 s15, 0\n"
+           "s_load_dwordx4 s[16:19], s[0:1], 0\n"
+           "v_mov_b32 v10, 0.5\nv_mov_b32 v11, 0.5\nv_mov_b32 v12, 0\n"
+           "image_gather4_l v[0:3], v[10:12], s[8:15], s[16:19] dmask:0x1 dim:SQ_RSRC_IMG_2D")
+    shader = make_shader(program(asm))
+    text = shader.translate()
+    shader.validate(text)
+    defs = dict(re.findall(r"^\s*(%\w+) = (.+)$", text, re.M))
+    # The LOD rounds as Floor(lod + 0.5) (ties up, SHADER-152); the lod it adds the half to is the clamp's FMin.
+    biased, = (defs[e.split()[-1]].split() for e in defs.values()
+               if " Floor " in e and defs.get(e.split()[-1], "").startswith("OpFAdd %float ")
+               and defs[e.split()[-1]].endswith(" %fhalf_g"))
+    clamp = defs[biased[2]].split()
+    assert clamp[:4] == ["OpExtInst", "%float", "%glsl", "FMin"]
+    assert "FMax" in text
+    assert "FClamp" not in text
+
+
+def test_gather4_l_run_time_sampler_selects_the_mode_from_the_sgpr(make_shader):
+    shader = make_shader(_gather_l(0x12, dynamic=True))
+    text = shader.translate()
+    shader.validate(text)
+    assert _count(text, "OpBitFieldUExtract") == 2          # CLAMP_X and CLAMP_Y
+    assert _count(text, "OpSMod") == 8 and _count(text, "OpSLessThan") == 4 and _count(text, "OpSGreaterThanEqual") == 4
+
+
+@pytest.mark.parametrize("word0", [4, 0x30, 0x7, 0x8000])
+def test_gather4_l_literal_border_or_unnormalized_sampler_is_unsupported(word0, make_shader):
+    with pytest.raises(rdna2spirv.Unsupported):
+        make_shader(_gather_l(word0)).translate()
+
+
+# SHADER-152: the explicit-LOD gather's mip is floor(LOD + 0.5), ties up, like the native gather on Radeon
+# (LOD 0.5 with bounds [0,1] picked mip 1); the old RoundEven picked mip 0 there.
+def _gather_l_at_lod(lod):
+    return program(
+        "s_mov_b32 s8, 0\ns_mov_b32 s9, 0\ns_mov_b32 s10, 0\ns_mov_b32 s11, 0\n"
+        "s_mov_b32 s12, 0\ns_mov_b32 s13, 0\ns_mov_b32 s14, 0\ns_mov_b32 s15, 0\n"
+        # S# word 1: MIN_LOD 0, MAX_LOD 1.0 (unsigned 4.8), so the clamp below is [0, 1].
+        "s_mov_b32 s16, 0\ns_mov_b32 s17, 0x100000\ns_mov_b32 s18, 0\ns_mov_b32 s19, 0\n"
+        f"v_mov_b32 v10, 0.5\nv_mov_b32 v11, 0.5\nv_mov_b32 v12, {lod}\n"
+        "image_gather4_l v[0:3], v[10:12], s[8:15], s[16:19] dmask:0x1 dim:SQ_RSRC_IMG_2D")
+
+
+def test_gather4_l_rounds_the_lod_tie_up(make_shader):
+    """The LOD is clamped to the S# bounds first, then biased by +0.5 and floored; the result is not rounded to
+    even (which would send a 0.5 tie to mip 0)."""
+    shader = make_shader(_gather_l_at_lod(0.5))
+    text = shader.translate()
+    shader.validate(text)
+    clamp = re.search(r"(%\w+) = OpExtInst %float %glsl FClamp (%\w+) (%\w+) (%\w+)", text)
+    add = re.search(r"(%\w+) = OpFAdd %float (%\w+) %fhalf_g", text)
+    assert clamp and add, text
+    assert add.group(2) == clamp.group(1)              # the clamped LOD, not the raw one
+    assert re.search(rf"= OpExtInst %float %glsl Floor {add.group(1)}\b", text), text
+    assert "= OpExtInst %float %glsl RoundEven" not in text
+
+
+def _gather_mip(lod, levels):
+    """Reference for the translated sequence: clamp to [0, levels-1] after floor(lod + 0.5)."""
+    return min(max(math.floor(lod + 0.5), 0), levels - 1)
+
+
+@pytest.mark.parametrize("lod, levels, mip", [
+    (-2.0, 4, 0), (-1.5, 4, 0), (-0.5, 4, 0), (-0.1, 4, 0),
+    (0.0, 4, 0), (0.25, 4, 0), (0.499, 4, 0),
+    (0.5, 4, 1), (0.501, 4, 1), (0.75, 4, 1),
+    (1.5, 4, 2), (2.5, 4, 3), (3.5, 4, 3), (3.6, 4, 3),     # the last two are clamped to levels-1
+    (0.5, 2, 1), (1.5, 2, 1), (10.0, 1, 0),
+])
+def test_gather_mip_rounds_ties_up_and_clamps_to_the_level_range(lod, levels, mip):
+    assert _gather_mip(lod, levels) == mip
+
+
+def test_gather_mip_old_round_even_differs_only_at_ties():
+    # Negative control for the rule: Python's round() is round-half-to-even, the old translator's choice.
+    assert (_gather_mip(0.5, 4), round(0.5)) == (1, 0)
+    assert (_gather_mip(2.5, 4), round(2.5)) == (3, 2)
+    assert (_gather_mip(1.5, 4), round(1.5)) == (2, 2)
 # ---- Irreducible CFG node splitting (compute shaders) ----
 
 IRREDUCIBLE_PATTERNS = {
@@ -807,8 +980,23 @@ def test_pk_and_scalar_f16_ops_emit_no_packhalf2x16(op_asm, make_shader):
     assert "PackHalf2x16" not in spv
 
 
-def test_image_sample_and_gather_d16_avoid_packhalf2x16(make_shader):
-    """d16 image_sample and image_gather4 pack f32->f16 via integer ops (no PackHalf2x16) and pass spirv-val."""
+@pytest.mark.parametrize("body", [
+    "buffer_load_format_d16_xyzw v[2:3], v1, s[0:3], 0 offen\ns_waitcnt vmcnt(0)\nexp mrt0 v2, v3, v2, v3 done vm",
+    "v_mov_b32 v2, 1.0\nv_mov_b32 v3, 0.5\nv_mov_b32 v4, 0.25\nv_mov_b32 v5, 2.0\n"
+    "buffer_store_format_xyzw v[2:5], v1, s[0:3], 0 offen\nexp mrt0 v2, v3, v4, v5 done vm",
+], ids=["d16-load", "store"])
+def test_buffer_format_f16_narrowing_avoids_packhalf2x16(make_shader, body):
+    """The f16 of a d16 typed buffer load, and of an f16 format a typed buffer store writes, narrow with integer RTE
+    like the d16 image results (#489): PackHalf2x16 rounds toward zero on AMD drivers."""
+    shader = make_shader("s_mov_b32 s0, 0x1000\ns_mov_b32 s1, 0\ns_mov_b32 s2, 0x100\ns_mov_b32 s3, 0x1fac\n"
+                         "v_mov_b32 v1, 0\n" + body + "\ns_endpgm\n", "ps_buf_f16")
+    spv = shader.translate()
+    shader.validate(spv)
+    assert "PackHalf2x16" not in spv
+
+
+def test_image_sample_d16_avoids_packhalf2x16(make_shader):
+    """d16 image_sample packs f32->f16 via integer ops (no PackHalf2x16) and pass spirv-val."""
     sample_asm = (
         "s_load_dwordx8 s[8:15], s[0:1], 0x0\ns_waitcnt lgkmcnt(0)\n"
         "s_mov_b32 s16, 0x92\ns_mov_b32 s17, 0\ns_mov_b32 s18, 0\ns_mov_b32 s19, 0\n"
@@ -821,14 +1009,198 @@ def test_image_sample_and_gather_d16_avoid_packhalf2x16(make_shader):
     assert "PackHalf2x16" not in asm1
     assert "OpBitwiseOr %uint" in asm1 and "OpSelect %uint" in asm1
 
+
+@pytest.mark.parametrize("suffix,last_addr", [("lz", 1), ("l", 2), ("l_o", 3)])
+def test_gather_d16_avoids_packhalf2x16(make_shader, suffix, last_addr):
     gather_asm = (
         "s_load_dwordx8 s[8:15], s[0:1], 0x0\ns_waitcnt lgkmcnt(0)\n"
         "s_mov_b32 s16, 0x92\ns_mov_b32 s17, 0\ns_mov_b32 s18, 0\ns_mov_b32 s19, 0\n"
-        "image_gather4_lz v[4:5], v[0:1], s[8:15], s[16:19] dmask:0x1 dim:SQ_RSRC_IMG_2D d16\n"
+        f"image_gather4_{suffix} v[4:5], v[0:{last_addr}], s[8:15], s[16:19] dmask:0x1 dim:SQ_RSRC_IMG_2D d16\n"
         "s_waitcnt vmcnt(0)\nexp mrt0 v4, v5, v4, v5 done vm\ns_endpgm\n"
     )
-    sh2 = make_shader(gather_asm, name="ps_d16_gather_ci")
+    sh2 = make_shader(gather_asm, name=f"ps_d16_gather_{suffix}_ci")
     asm2 = sh2.translate()
     sh2.validate(asm2)
     assert "PackHalf2x16" not in asm2
     assert "OpBitwiseOr %uint" in asm2 and "OpSelect %uint" in asm2
+    assert asm2.count("OpImageFetch ") == (0 if suffix == "lz" else 4)
+
+
+def _load_mini_interp():
+    import sys
+    semantic_dir = os.path.join(ROOT, "tests", "semantic")
+    if semantic_dir not in sys.path:
+        sys.path.insert(0, semantic_dir)
+    import spirv_mini_interp
+    return spirv_mini_interp
+
+
+def test_fma_mix_decodes_fimm_as_binary16_and_preserves_other_half(make_shader):
+    """v_fma_mix{lo_f16,hi_f16,_f32} with op_sel_hi=1 decode fimm literals (e.g. 1.5, -2.0) as
+    f16 instead of f32 bit patterns, preserve the unwritten dst half, and emit no PackHalf2x16."""
+    si = _load_mini_interp()
+    ps = (
+        "; fma_mix_fimm\n"
+        "v_mov_b32 v1, 0x40000000\n"  # f32 2.0
+        "v_mov_b32 v2, 0x3e800000\n"  # f32 0.25
+        "v_mov_b32 v3, 0xbeef0000\n"  # sentinel high half
+        # 1.5 (f16) * 2.0 (f32) + 0.25 (f32) = 3.25 -> f16 0x4280; high half 0xbeef preserved
+        "v_fma_mixlo_f16 v3, 1.5, v1, v2 op_sel:[0,0,0] op_sel_hi:[1,0,0]\n"
+        "v_mov_b32 v4, 0x0000cafe\n"  # sentinel low half
+        "v_mov_b32 v5, 0x3f800000\n"  # f32 1.0
+        # (-2.0 (f16)) * 1.5 (f16) + 1.0 (f32) = -2.0 -> f16 0xc000; low half 0xcafe preserved
+        "v_fma_mixhi_f16 v4, -2.0, 1.5, v5 op_sel:[0,0,0] op_sel_hi:[1,1,0]\n"
+        # (-2.0 (f16)) * 1.5 (f16) + 0.25 (f32) = -2.75 -> f32 0xc0300000
+        "v_fma_mix_f32 v6, -2.0, 1.5, v2 op_sel:[0,0,0] op_sel_hi:[1,1,0]\n"
+        "exp mrt0 v3, v4, v6, v3 done vm\n"
+        "s_endpgm\n"
+    )
+    shader = make_shader(ps, name="ps_fma_mix_fimm")
+    spv = shader.translate()
+    shader.validate(spv)
+
+    out = si.run_fragment(spv)["%out_mrt0"]
+    assert out[0] == 0xBEEF4280
+    assert out[1] == 0xC000CAFE
+    assert out[2] == 0xC0300000
+    assert "PackHalf2x16" not in spv
+
+
+@pytest.mark.parametrize("op,sentinel,shift,f32_bits,expected_half", [
+    # RTE tie-to-even: 1.0 + 2^-11 -> 0x3c00 (even), 1.0 + 3*2^-11 -> 0x3c02 (even)
+    ("v_fma_mixlo_f16", 0xBEEF0000, 0, 0x3F801000, 0x3C00),
+    ("v_fma_mixlo_f16", 0xBEEF0000, 0, 0x3F803000, 0x3C02),
+    ("v_fma_mixhi_f16", 0x0000CAFE, 16, 0x3F801000, 0x3C00),
+    ("v_fma_mixhi_f16", 0x0000CAFE, 16, 0x3F803000, 0x3C02),
+    # Subnormals & subnormal ties: 2^-15 -> 0x0200, 2^-24 -> 0x0001, 2^-25 -> 0x0000, 3*2^-25 -> 0x0002
+    ("v_fma_mixlo_f16", 0x12340000, 0, 0x38000000, 0x0200),
+    ("v_fma_mixlo_f16", 0x12340000, 0, 0x33800000, 0x0001),
+    ("v_fma_mixlo_f16", 0x12340000, 0, 0x33000000, 0x0000),
+    ("v_fma_mixhi_f16", 0x00005678, 16, 0x33C00000, 0x0002),
+    # Overflow to +-Inf, -0.0, quiet NaN
+    ("v_fma_mixlo_f16", 0xAAAA0000, 0, 0x477FF000, 0x7C00),
+    ("v_fma_mixhi_f16", 0x0000BBBB, 16, 0xC77FF000, 0xFC00),
+    ("v_fma_mixlo_f16", 0xCCCC0000, 0, 0x80000000, 0x8000),
+    ("v_fma_mixhi_f16", 0x0000DDDD, 16, 0x7FC00000, 0x7E00),
+])
+def test_fma_mix_f16_rte_edge_cases_and_half_preservation(
+    op, sentinel, shift, f32_bits, expected_half, make_shader
+):
+    """v_fma_mixlo_f16 / v_fma_mixhi_f16 round f32 results with exact IEEE-754 binary16 RTE
+    (ties-to-even, subnormals, overflow, -0.0, quiet NaN) while preserving the other dst half."""
+    si = _load_mini_interp()
+    # Fma(1.0, x, -0.0) yields x (preserving -0.0 when x == -0.0)
+    ps = (
+        "; fma_mix_f16_rte\n"
+        "v_mov_b32 v1, 0x3f800000\n"
+        f"v_mov_b32 v2, {f32_bits:#010x}\n"
+        "v_mov_b32 v3, 0x80000000\n"
+        f"v_mov_b32 v4, {sentinel:#010x}\n"
+        f"{op} v4, v1, v2, v3 op_sel:[0,0,0] op_sel_hi:[0,0,0]\n"
+        "exp mrt0 v4, v4, v4, v4 done vm\n"
+        "s_endpgm\n"
+    )
+    shader = make_shader(ps, name="ps_fma_mix_f16_rte")
+    spv = shader.translate()
+    shader.validate(spv)
+    assert "PackHalf2x16" not in spv
+
+    out = si.run_fragment(spv)["%out_mrt0"]
+    expected_word = sentinel | (expected_half << shift)
+    assert out[0] == expected_word
+
+
+@pytest.mark.parametrize("suffix,fmt_code,expected_word", [
+    ("xy", 29, 0x3C023C00),  # format 29 = (4, "f16", (16, 16)): lo=0x3c00, hi=0x3c02
+    ("x", 13, 0x00003C00),   # format 13 = (2, "f16", (16,)): lo=0x3c00
+])
+def test_encode_format_f16_uses_f16_bits_rte(suffix, fmt_code, expected_word, make_shader):
+    """buffer_store_format_{x,xy} with f16 V# formats uses f16_bits RTE (no PackHalf2x16),
+    validates with spirv-val, and stores exact tie-to-even f16 bits."""
+    si = _load_mini_interp()
+    base = 0x1000
+    vdata = "v2" if suffix == "x" else "v[2:3]"
+    ps = (
+        "; buffer_store_format_f16_rte\n"
+        f"s_mov_b32 s0, {base:#x}\n"
+        "s_mov_b32 s1, 0\n"
+        "s_mov_b32 s2, 0x100\n"
+        f"s_mov_b32 s3, {fmt_code << 12:#x}\n"
+        "v_mov_b32 v1, 0\n"
+        "v_mov_b32 v2, 0x3f801000\n"  # 1.0 + 2^-11 -> 0x3c00 (tie to even)
+        "v_mov_b32 v3, 0x3f803000\n"  # 1.0 + 3*2^-11 -> 0x3c02 (tie to even)
+        f"buffer_store_format_{suffix} {vdata}, v1, s[0:3], 0 offen\n"
+        "s_waitcnt vmcnt(0)\n"
+        "exp mrt0 v2, v3, v2, v3 done vm\n"
+        "s_endpgm\n"
+    )
+    shader = make_shader(ps, name=f"ps_encode_format_f16_{suffix}")
+    spv = shader.translate()
+    shader.validate(spv)
+    assert "PackHalf2x16" not in spv
+
+    mem = {base: 0}
+    si.run_fragment(spv, memory=mem)
+    assert mem[base] == expected_word
+
+
+def test_remaining_d16_paths_avoid_packhalf2x16(make_shader):
+    """buffer_format d16 and image_sample_c_lz d16 avoid PackHalf2x16 and validate with spirv-val."""
+    tbuf_asm = (
+        "s_mov_b32 s0, 0x1000\n"
+        "s_mov_b32 s1, 0\n"
+        "s_mov_b32 s2, 0x100\n"
+        f"s_mov_b32 s3, {77 << 12:#x}\n"  # format 77 = f32x4
+        "v_mov_b32 v0, 0\n"
+        "buffer_load_format_d16_xy v2, v0, s[0:3], 0 offen\n"
+        "s_waitcnt vmcnt(0)\n"
+        "exp mrt0 v2, v2, v2, v2 done vm\n"
+        "s_endpgm\n"
+    )
+    sh1 = make_shader(tbuf_asm, name="ps_tbuffer_d16_nopack")
+    spv1 = sh1.translate()
+    sh1.validate(spv1)
+    assert "PackHalf2x16" not in spv1
+
+    cmplz_asm = (
+        "s_load_dwordx8 s[8:15], s[0:1], 0x0\ns_waitcnt lgkmcnt(0)\n"
+        "s_mov_b32 s16, 0x92\ns_mov_b32 s17, 0\ns_mov_b32 s18, 0\ns_mov_b32 s19, 0\n"
+        "image_sample_c_lz v4, v[0:2], s[8:15], s[16:19] dmask:0x1 dim:SQ_RSRC_IMG_2D d16\n"
+        "s_waitcnt vmcnt(0)\n"
+        "exp mrt0 v4, v4, v4, v4 done vm\n"
+        "s_endpgm\n"
+    )
+    sh2 = make_shader(cmplz_asm, name="ps_sample_c_lz_d16_nopack")
+    spv2 = sh2.translate()
+    sh2.validate(spv2)
+    assert "PackHalf2x16" not in spv2
+
+
+WAVE64_SCMP_MASK_CASES = """\
+; mattr: +wavefrontsize64,-wavefrontsize32
+v_cmp_lt_u32_e64 vcc, v0, 17
+s_and_b64 s[6:7], vcc, exec
+s_cmp_eq_u32 vcc_lo, vcc_hi
+s_cmp_lg_u32 exec_lo, exec_hi
+s_cmp_eq_u32 s6, s7
+s_cmp_eq_u32 vcc_lo, 0x80000003
+s_cmp_lt_u32 exec_hi, s4
+s_cmp_gt_i32 s6, 0
+s_cmp_eq_u64 vcc, s[4:5]
+s_cmp_lg_u64 exec, 0x12345678
+s_endpgm
+"""
+
+
+@pytest.mark.parametrize("emulate", [False, True], ids=["wave64", "wave64-emulate"])
+def test_wave64_scmp_mask_halves_and_scalars_validate(emulate, make_shader, monkeypatch):
+    """Opposite-half s_cmp_*_u32, ordering compares on mask halves, and mask-vs-scalar/imm u32/u64
+    compares translate and pass spirv-val in both native wave64 and --wave64-emulate modes."""
+    shader = make_shader(WAVE64_SCMP_MASK_CASES, name="cs_w64_scmp_masks")
+    monkeypatch.setattr(rdna2spirv, "WAVE64_EMULATE", emulate)
+    spv = shader.translate()
+    shader.validate(spv)
+    if emulate:
+        assert "OpGroupNonUniform" not in spv
+    else:
+        assert "OpGroupNonUniformBitwiseOr" in spv

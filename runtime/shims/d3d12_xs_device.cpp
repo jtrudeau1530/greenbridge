@@ -8,6 +8,7 @@
 // are IUnknown (0-2), slot 14 (which wraps the heap), 62 and 76, plus the heap proxy's 9/10 conversion from the
 // PC hidden-pointer form to the Xbox RAX form.
 #include "d3d12_xs_device.h"
+#include "d3d12_trace.h"
 
 #include <windows.h>
 
@@ -74,6 +75,7 @@ const char* slot_name(unsigned slot) {
         case 27: return "CreateCommittedResource (PC slot 27)";
         case 43: return "GetAdapterLuid";
         case 62: return "Xbox CreateComputePipelineState";
+        case 67: return "Xbox compute pipeline from native code";
         case 76: return "Xbox resource creation";
         default: return "forwarded";
     }
@@ -324,8 +326,9 @@ HRESULT create_heap_proxy(ID3D12DescriptorHeap* real, DeviceProxy* device, REFII
         proxy_release(device);
         return hr;
     }
-    std::fprintf(stderr, "[rt] d3d12_xs: heap proxy %p wraps PC heap %p (device proxy %p)\n",
-                 static_cast<void*>(proxy), static_cast<void*>(real), static_cast<void*>(device));
+    if (!d3d12_trace::enabled())
+        std::fprintf(stderr, "[rt] d3d12_xs: heap proxy %p wraps PC heap %p (device proxy %p)\n",
+                     static_cast<void*>(proxy), static_cast<void*>(real), static_cast<void*>(device));
     heap_release(proxy);
     return S_OK;
 }
@@ -410,6 +413,17 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
         return hr_to_u64(proxy_create_compute_pipeline_state(
             self, reinterpret_cast<const D3D12_COMPUTE_PIPELINE_STATE_DESC*>(a1), a2, a3,
             reinterpret_cast<const IID*>(a4), reinterpret_cast<void**>(a5)));
+    } else if constexpr (Slot == 67) {
+        // Measured in amd_fidelityfx_upscaler_xbox.dll (call at RVA 0x56d9): (desc, riid, out), a console-only
+        // compute-pipeline desc with the root signature at +0x00 and a copy of a code blob at +0x28 (size at +0x30;
+        // most likely the shader's native code); the DLL falls back to slot 62 when it fails. The PC device's
+        // slot 67 is CreateProtectedResourceSession1, a different method, so it is refused here, not forwarded.
+        note_slot(67);
+        static std::atomic<bool> logged{false};
+        if (!logged.exchange(true, std::memory_order_relaxed))
+            std::fprintf(stderr, "[rt] d3d12_xs: device slot 67 (native-code compute pipeline) -> E_NOTIMPL\n");
+        if (a3) *reinterpret_cast<void**>(a3) = nullptr;
+        return hr_to_u64(E_NOTIMPL);
     } else if constexpr (Slot == 76) {
         return hr_to_u64(proxy_create_resource(
             self, reinterpret_cast<const D3D12_HEAP_PROPERTIES*>(a1),
@@ -518,8 +532,9 @@ HRESULT create_device_proxy(ID3D12Device* real, REFIID riid, void** out) {
         delete proxy;
         return hr;
     }
-    std::fprintf(stderr, "[rt] d3d12_xs: device proxy %p wraps PC device %p (%u PC vtable slots)\n",
-                 static_cast<void*>(proxy), static_cast<void*>(real), slot_count);
+    if (!d3d12_trace::enabled())
+        std::fprintf(stderr, "[rt] d3d12_xs: device proxy %p wraps PC device %p (%u PC vtable slots)\n",
+                     static_cast<void*>(proxy), static_cast<void*>(real), slot_count);
     proxy_release(proxy);  // drop the creation reference; `out` holds the caller's reference
     return S_OK;
 }
@@ -548,7 +563,7 @@ ID3D12Device* device_proxy_real_device(const void* device) {
 }
 
 bool device_slot_overridden(unsigned slot) {
-    return slot <= 2 || slot == 14 || slot == 62 || slot == 76;
+    return slot <= 2 || slot == 14 || slot == 62 || slot == 67 || slot == 76;
 }
 
 bool heap_slot_overridden(unsigned slot) {

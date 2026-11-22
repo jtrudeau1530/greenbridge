@@ -167,11 +167,12 @@ addEventListener("mousemove", e => {
   yaw -= e.movementX * 0.0022; pitch = THREE.MathUtils.clamp(pitch - e.movementY * 0.0022, -1.55, 1.55);
 });
 addEventListener("wheel", e => { speed = THREE.MathUtils.clamp(speed * (e.deltaY < 0 ? 1.15 : 1 / 1.15), 1, 3000); }, { passive: true });
+const world = await loadWorld();
 addEventListener("keydown", e => {
   keys.add(e.code);
   if (e.code === "KeyF" && !e.repeat) wire = !wire, applyWire();
   if (e.code === "KeyT" && !e.repeat) clay = !clay, applyClay();
-  if (e.code === "KeyG" && !e.repeat) showBounds = !showBounds, boundsGroup.visible = showBounds;
+  if (e.code === "KeyG" && !e.repeat) toggleBounds();
   if (e.code === "KeyR") camera.position.fromArray(world.spawn);
 });
 addEventListener("keyup", e => keys.delete(e.code));
@@ -183,23 +184,32 @@ const LOAD_R = 1400, UNLOAD_R = 2000, MAX_INFLIGHT = 4;
 // when leaving and returning; successfully loaded chunks start fresh after unloading.
 const MAX_LOAD_ATTEMPTS = 3, RETRY_DELAY_MS = 1000;
 const loader = new GLTFLoader();
-const live = new Map(); let inflight = 0, wire = false, clay = false, showBounds = false, failed = 0;
+const live = new Map(); let inflight = 0, wire = false, clay = false, failed = 0;
+const originalMaterials = new WeakMap();
 const clayMat = new THREE.MeshStandardMaterial({ color: 0xb8c0ca, roughness: 0.85, wireframe: wire, side: THREE.DoubleSide });
 const boundsGroup = new THREE.Group(); boundsGroup.visible = false; scene.add(boundsGroup);
+function toggleBounds() {
+  boundsGroup.visible = !boundsGroup.visible;
+  if (!boundsGroup.visible || boundsGroup.children.length) return;
+  for (const { bounds: [minX, minY, minZ, maxX, maxY, maxZ] } of world.chunks) {
+    const box = new THREE.Box3(new THREE.Vector3(minX, minY, minZ), new THREE.Vector3(maxX, maxY, maxZ));
+    boundsGroup.add(new THREE.Box3Helper(box, 0x5fb3ff));
+  }
+}
 function applyClay(root) {
   clayMat.wireframe = wire;
   (root ? [root] : [...live.values()].map(c => c.obj).filter(Boolean)).forEach(o =>
     o.traverse(n => {
       if (!n.isMesh || !n.material) return;
-      if (n.userData.origMaterial === undefined) n.userData.origMaterial = n.material;
-      n.material = clay ? clayMat : n.userData.origMaterial;
+      if (!originalMaterials.has(n)) originalMaterials.set(n, n.material);
+      n.material = clay ? clayMat : originalMaterials.get(n);
     }));
 }
 function applyWire(root) {
   clayMat.wireframe = wire;
   (root ? [root] : [...live.values()].map(c => c.obj).filter(Boolean)).forEach(o =>
     o.traverse(n => {
-      const orig = n.userData?.origMaterial;
+      const orig = originalMaterials.get(n);
       if (orig) [].concat(orig).forEach(m => m.wireframe = wire);
       if (n.material && n.material !== orig) [].concat(n.material).forEach(m => m.wireframe = wire);
     }));
@@ -210,7 +220,7 @@ function disposeObject(obj) {
   obj.traverse(n => {
     if (n.geometry && !disposedGeo.has(n.geometry)) { disposedGeo.add(n.geometry); n.geometry.dispose(); }
     if (n.isInstancedMesh && typeof n.dispose === "function") n.dispose();
-    const allMats = [].concat(n.material || [], n.userData?.origMaterial || []);
+    const allMats = [].concat(n.material || [], originalMaterials.get(n) || []);
     for (const m of allMats) {
       if (!m || m === clayMat || disposedMat.has(m)) continue;
       disposedMat.add(m);
@@ -223,7 +233,7 @@ function disposeObject(obj) {
       }
       m.dispose();
     }
-    if (n.userData) delete n.userData.origMaterial;
+    originalMaterials.delete(n);
   });
   for (const bitmap of bitmaps) bitmap.close();
 }
@@ -290,22 +300,17 @@ function stream(now = performance.now()) {
     const previous = live.get(def.id);
     const entry = { def, obj: null, loading: true, attempts: (previous?.attempts || 0) + 1, retryAt: 0, previous };
     live.set(def.id, entry);
-    if (def.test) { entry.loading = false; entry.obj = buildTestChunk(def.test); scene.add(entry.obj); applyClay(entry.obj); applyWire(entry.obj); continue; }
+    if (world.test) { entry.loading = false; entry.obj = buildTestChunk(def.test); scene.add(entry.obj); applyClay(entry.obj); applyWire(entry.obj); continue; }
     entry.controller = new AbortController();
     void loadChunk(entry);
   }
 }
 
 // ---------- main loop ----------
-const world = await loadWorld();
 camera.position.fromArray(world.spawn);
 if (world.test) {
   document.getElementById("world-status").textContent = world.reason;
   document.getElementById("banner").classList.remove("hidden");
-}
-for (const c of world.chunks) {
-  const b = c.bounds, box = new THREE.Box3(new THREE.Vector3(b[0], b[1], b[2]), new THREE.Vector3(b[3], b[4], b[5]));
-  boundsGroup.add(new THREE.Box3Helper(box, 0x5fb3ff));
 }
 const hud = document.getElementById("hud"), clock = new THREE.Clock();
 let fpsT = 0, fpsN = 0, fps = 0;

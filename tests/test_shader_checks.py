@@ -4,7 +4,6 @@ import contextlib
 import io
 import struct
 from pathlib import Path
-import struct
 import sys
 import tempfile
 import unittest
@@ -14,6 +13,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "runtime" / "test" 
 import check
 
 
+GOOD_FMT = struct.pack("<64I", *check.FMT_1010102_WORDS, *[0xEEEEEEEE] * 48)
+FULL_WAVE = ((0, "compute subgroup size: 64\n0 mismatches\n"),
+             (0, "compute subgroup size: 64\nout[0..7] = 32 16 24 40 8 48 4008636142 4008636142\n"))
+
 # The other wave64-only dump tests (#73's cs_wm_*, the cs_w64x_* cross-half tests): name -> expected out[] words.
 WAVE64_DUMPS = {n: w for n, w in check.CS_DUMPS + check.W64X_DUMPS + check.W64X_PARTIAL
                 if n not in (*check.WAVE32_DUMPS, "cs_wave64_ballot")}
@@ -22,11 +25,13 @@ PARTIAL = {n for n, _ in check.W64X_PARTIAL}
 WAVE32_WORDS = {n: w for n, w in check.CS_DUMPS if n in check.WAVE32_DUMPS and n not in ("cs_store", "cs_smem_soffset_imm")}
 
 
-# every test check.py runs: compute, cs_wavemask, the dumps (#73, #152 cross-half, partial), the two store
-# tests, pixel tests, the two-mip draw and three mesh fixtures (skipped here: build.py does not build mesh shaders)
-TOTAL = (len(check.COMPUTE) + 1 + len(check.CS_DUMPS) + len(check.W64X_DUMPS) + len(check.W64X_PARTIAL) + 2
+# every test check.py runs: compute, cs_wavemask, cs_fmt_1010102, the dumps (#73, #152 cross-half, partial), the two store
+# tests, pixel tests, the two-mip draws, the gradient samples and three mesh fixtures (skipped here: build.py
+# does not build mesh shaders)
+TOTAL = (len(check.COMPUTE) + 2 + len(check.CS_DUMPS) + len(check.W64X_DUMPS) + len(check.W64X_PARTIAL) + 2
          + len(check.PIXEL_TESTS) + len(check.CLIP_TESTS) + len(check.BOUNDS) + len(check.GLOBAL_OFFSET)
-         + 9)  # three mesh fixtures, ps_tex, cs_cmpx_class_f32, both texture draws, cs_user_sgprs and cs_cvt_f32_sat
+         + len(check.MIP_TEST_PASSES) + len(check.GRADIENT_TESTS)
+         + 8)  # three mesh fixtures, ps_tex, cs_cmpx_class_f32, cs_user_sgprs, cs_cvt_f32_sat and ps_gather_wrap
 CVT = {bits: [u, s] for bits, u, s in check.CVT_F32_SAT_CASES}
 
 
@@ -38,9 +43,16 @@ def cvt_answer(env, wrong_for=None):
 
 
 class Wave64Checks(unittest.TestCase):
-    def run_checks(self, wavemask, ballot, *, missing_ballot=False, emulated=False):
+    def run_checks(self, wavemask, ballot, *, missing_ballot=False, emulated=False, fmt=(0, GOOD_FMT)):
         def harness(_tool, shader, *args, env=None):
             name = Path(shader).stem
+            if name == "cs_fmt_1010102":
+                self.assertEqual(args, ("1", "dump"))
+                self.fmt_env, dump = env, Path(env["VKC_DUMP"])
+                self.assertFalse(dump.exists())
+                if fmt[1] is not None:
+                    dump.write_bytes(fmt[1])
+                return fmt[0], "out[0..7] = 0 0 0 0 0 0 0 0\n"   # stdout is not the oracle
             if name == "cs_user_sgprs":
                 # The seeded words come back only if check.py passed them in VKC_SGPRS.
                 seeded = (env or {}).get("VKC_SGPRS") == check.USER_SGPRS_ENV["VKC_SGPRS"]
@@ -84,6 +96,9 @@ class Wave64Checks(unittest.TestCase):
             if name == "cs_global_neg_offset":
                 self.assertEqual(args[0], "40")
                 return 0, "out[0..7] = " + " ".join(map(str, check.GLOBAL_OFFSET[0][2])) + "\n"
+            if name in dict(check.BOUNDS):    # the SMEM / raw MUBUF rule tests: their words, then the 0xee fill
+                words = (dict(check.BOUNDS)[name] + [0xEEEEEEEE] * 8)[:8]
+                return 0, "out[0..7] = " + " ".join(map(str, words)) + "\n"
             if name == "cs_store":
                 return 0, "out[0..7] = 1073774847 3758097407 1006649344 4008636142 1073757184 3154130944 0 0\n"
             if name == "cs_smem_soffset_imm":
@@ -110,6 +125,7 @@ class Wave64Checks(unittest.TestCase):
                   patch.object(check, "pixel_test", return_value=""), patch.object(check, "texture_mip_test", return_value=""),
                   patch.object(check, "bindless_test", return_value=""), patch.object(check, "W64_EMULATED", emulated),
                   patch.object(check, "texture_gradient_a16_test", return_value=""),
+                  patch.object(check, "gather_wrap_test", return_value=""),
                   contextlib.redirect_stdout(output)):
                 status = check.main()
         return status, output.getvalue()
@@ -124,10 +140,7 @@ class Wave64Checks(unittest.TestCase):
         self.assertIn(f"{TOTAL - 5 - len(WAVE64_DUMPS)} of {TOTAL} pass, {5 + len(WAVE64_DUMPS)} skipped", out)
 
     def test_full_wave_checks_pass_with_expected_results(self):
-        status, out = self.run_checks(
-            (0, "compute subgroup size: 64\n0 mismatches\n"),
-            (0, "compute subgroup size: 64\nout[0..7] = 32 16 24 40 8 48 4008636142 4008636142\n"),
-        )
+        status, out = self.run_checks(*FULL_WAVE)
         self.assertEqual(status, 0, out)
         self.assertRegex(out, r"cs_wave64_ballot +ok")
         self.assertIn(f"{TOTAL - 3} of {TOTAL} pass, 3 skipped", out)
@@ -154,6 +167,34 @@ class Wave64Checks(unittest.TestCase):
                 self.assertEqual(status, 1, out)
                 self.assertRegex(out, rf"cs_wave64_ballot +{detail}")
                 self.assertIn(f"{TOTAL - 4} of {TOTAL} pass, 3 skipped", out)
+
+    def test_fmt_1010102_compares_the_whole_dump(self):
+        words = list(struct.unpack("<64I", GOOD_FMT))
+        for fmt, detail in (
+            ((0, struct.pack("<64I", *words[:15], 0xE00003FF, *words[16:])), "word 15: expected 0xffe00003, got 0xe00003ff"),
+            ((0, struct.pack("<64I", *words[:63], 0)), "word 63: expected 0xeeeeeeee, got 0x00000000"),
+            ((0, GOOD_FMT[:-4]), "expected 256 dump bytes, got 252"),
+            ((0, GOOD_FMT + bytes(4)), "expected 256 dump bytes, got 260"),
+            ((0, None), "no VKC_DUMP file written"),
+            ((1, GOOD_FMT), "exit 1"),
+        ):
+            with self.subTest(detail=detail):
+                status, out = self.run_checks(*FULL_WAVE, fmt=fmt)
+                self.assertEqual(status, 1, out)
+                self.assertRegex(out, rf"cs_fmt_1010102 +{detail}")
+                self.assertIn(f"{TOTAL - 4} of {TOTAL} pass, 3 skipped", out)
+
+    def test_fmt_1010102_child_env_is_private(self):
+        parent = {"VK_DRIVER_FILES": "driver.json", "VKC_OUT_WORDS": "128", "VKC_DUMP": "caller.bin"}
+        with patch.dict(check.os.environ, parent):
+            status, out = self.run_checks(*FULL_WAVE)
+            for key, value in parent.items():
+                self.assertEqual(check.os.environ[key], value)
+        self.assertEqual(status, 0, out)
+        self.assertRegex(out, r"cs_fmt_1010102 +ok")
+        self.assertEqual((self.fmt_env["VK_DRIVER_FILES"], self.fmt_env["VKC_OUT_WORDS"]), ("driver.json", "64"))
+        self.assertNotEqual(self.fmt_env["VKC_DUMP"], parent["VKC_DUMP"])
+        self.assertFalse(Path(self.fmt_env["VKC_DUMP"]).exists())
 
     def test_missing_wave64_fixture_fails_even_on_wave32(self):
         unsupported = 77, "full 64-wide compute subgroups unavailable\n"
@@ -291,41 +332,6 @@ class SeededPixelTests(unittest.TestCase):
         self.assertIn("needs bufferDeviceAddress", problem)
 
 
-
-class SeededPixelTests(unittest.TestCase):
-    """ps_vcc_x2 reads a V# from s[0:3]; check.py hands vk_harness that V# and the heap words behind it (TEST-19)."""
-
-    def run_pixel_test(self, words, code=0, out=""):
-        seen = {}
-
-        def harness(_tool, _vs, _fs, raw, env=None):
-            seen["env"] = env
-            if not code:
-                Path(raw).write_bytes(struct.pack("<4I", *words) * (64 * 64))
-            return code, out
-
-        with tempfile.TemporaryDirectory() as tmp:
-            (Path(tmp) / "ps_vcc_x2.spv").touch()
-            with patch.object(check, "run", side_effect=harness):
-                problem = check.pixel_test(tmp, tmp, "ps_vcc_x2")
-        return problem, seen["env"] or {}
-
-    def test_v_sharp_and_heap_reach_the_harness(self):
-        problem, env = self.run_pixel_test((0x11223344, 0x55667788, 0, 0))
-        self.assertEqual(problem, "")
-        self.assertEqual(env.get("VKH_SGPRS"), "0x1000,0,16,0")
-        self.assertEqual(env.get("VKH_HEAP"), "0x1000=0x11223344,0x1004=0x55667788")
-
-    def test_unseeded_result_fails(self):
-        problem, _ = self.run_pixel_test((0, 0, 0, 0))
-        self.assertIn("4096 of 4096 pixels differ", problem)
-
-    def test_device_without_buffer_addresses_skips(self):
-        problem, _ = self.run_pixel_test((), code=77, out="unsupported: VKH_HEAP needs bufferDeviceAddress\n")
-        self.assertIsInstance(problem, check.Skip)
-        self.assertIn("needs bufferDeviceAddress", problem)
-
-
 class TextureMipChecks(unittest.TestCase):
     def test_mip_draw_reports_unsupported_device_and_preserves_other_failures(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -350,6 +356,18 @@ class TextureMipChecks(unittest.TestCase):
             self.assertTrue(check.texture_mip_mismatch(damaged, 1).startswith("(63,63):"))
         self.assertTrue(check.texture_mip_mismatch(image[:-1], 1))
 
+
+class GradientSampleChecks(unittest.TestCase):
+    def test_device_without_min_lod_is_a_skip(self):
+        answer = 77, "unsupported: shaderResourceMinLod (the shader clamps its LOD with MinLod)\n"
+        with patch.object(check, "run", return_value=answer):
+            result = check.texture_gradient_a16_test("tools", "spirv", "ps_texture_grad_cl_a16")
+        self.assertIsInstance(result, check.Skip)
+        self.assertEqual(result, "SKIP (unsupported: shaderResourceMinLod (the shader clamps its LOD with MinLod))")
+        with patch.object(check, "run", return_value=(1, "device lost")):
+            failure = check.texture_gradient_a16_test("tools", "spirv", "ps_texture_grad_cl_a16")
+        self.assertNotIsInstance(failure, check.Skip)
+        self.assertIn("device lost", failure)
 
 class TexelOffsetChecks(unittest.TestCase):
     """ps_texoff (image_sample*_o, image_gather4_lz_o): the judgement of a dump, and the skip without maintenance8."""
@@ -441,6 +459,36 @@ class Wave32LaneDumps(unittest.TestCase):
             problem = check.compute_test("tools", "spirv", "cs_store", "1", "dump", expected_words=check.CS_STORE)
         self.assertTrue(problem)
         self.assertNotIsInstance(problem, check.Skip)
+
+    def test_lane_dumps_request_32_lanes(self):
+        # #774: like run_gpu_tests.py, so an 8..32 device (Intel ANV) doesn't judge the dump at a narrower size.
+        for name in check.WAVE32_LANE_DUMPS:
+            with self.subTest(name=name), patch.object(check, "run", return_value=(0, self.words(name))) as run:
+                check.compute_test("tools", "spirv", name, "1", "dump", expected_words=dict(check.CS_DUMPS)[name],
+                                   needs_32_lanes=True)
+                self.assertEqual(run.call_args.kwargs["env"]["VKC_SUBGROUP_SIZE"], "32")
+
+    def test_other_dumps_keep_the_default_size(self):
+        with patch.object(check, "run", return_value=(0, self.words("cs_store"))) as run:
+            check.compute_test("tools", "spirv", "cs_store", "1", "dump", expected_words=check.CS_STORE)
+        self.assertNotIn("env", run.call_args.kwargs)
+
+    def test_skipped_when_32_lanes_cannot_be_pinned(self):
+        for name in check.WAVE32_LANE_DUMPS:
+            for flip in (False, True):
+                with self.subTest(name=name, flip=flip):
+                    out = ("device: gpu (subgroup 8..32)\ncompute subgroup size: 32 not available\n"
+                           + self.words(name, flip))
+                    problem = self.run_dump(name, 0, out)
+                    self.assertIsInstance(problem, check.Skip)
+                    self.assertIn("at 32 lanes on request", problem)
+
+    def test_judged_when_32_lanes_are_pinned(self):
+        for name in check.WAVE32_LANE_DUMPS:
+            with self.subTest(name=name):
+                out = "device: gpu (subgroup 8..32)\ncompute subgroup size: 32\n"
+                self.assertEqual(self.run_dump(name, 0, out + self.words(name)), "")
+                self.assertNotIsInstance(self.run_dump(name, 0, out + self.words(name, flip=True)), check.Skip)
 
 
 if __name__ == "__main__":

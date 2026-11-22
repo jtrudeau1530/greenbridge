@@ -158,10 +158,31 @@ def _mc():
         return None
 
 
+def _mc_accepts_f16_opsel(mc):
+    """llvm-mc 21+ is needed for op_sel on 16-bit VOP3 (docs/testing.md); older builds reject the modifier.
+
+    Probe a fixed instruction rather than a generated program, so a generator bug can never turn into a skip.
+    """
+    probe = "v_add_f16_e64 v0, v1, v2 op_sel:[0,0,0]\n"
+    r = subprocess.run(mc + ["-triple=amdgcn--amdpal", "-mcpu=gfx1013"], input=probe,
+                       capture_output=True, text=True)
+    return r.returncode == 0 and "error:" not in r.stderr
+
+
+def test_f16_opsel_probe_distinguishes_old_assemblers():
+    # A fake assembler that rejects everything stands in for LLVM < 21; one that accepts stdin stands in for 21+.
+    reject = [sys.executable, "-c", "import sys; sys.exit(1)"]
+    accept = [sys.executable, "-c", "import sys; sys.stdin.read()"]
+    assert _mc_accepts_f16_opsel(reject) is False
+    assert _mc_accepts_f16_opsel(accept) is True
+
+
 @pytest.mark.skipif(_mc() is None, reason="llvm-mc with the AMDGPU target not found")
 @pytest.mark.parametrize("family", sorted(vf.FAMILIES))
 def test_programs_assemble_for_gfx1013(family):
     mc = _mc()
+    if family == "f16" and not _mc_accepts_f16_opsel(mc):
+        pytest.skip("llvm-mc 21+ is needed for op_sel on 16-bit VOP3 (docs/testing.md); set LLVM_MC")
     for p in vf.programs(family, 1, 6, (32, 64)):
         cmd = mc + ["-triple=amdgcn--amdpal", "-mcpu=gfx1013", "-show-encoding"]
         if p.wave == 64:
@@ -175,3 +196,33 @@ def test_model_only_runs_every_family(capsys, monkeypatch):
         monkeypatch.setattr(sys, "argv", ["valu_fuzz.py", "--family", family, "--programs", "4", "--model-only"])
         assert vf.main() == 0
     assert "programs generated and modelled" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("extra", [
+    ["--programs", "0"],
+    ["--programs", "-5"],
+    ["--max-report", "0"],
+    ["--max-report", "-1"],
+])
+def test_cli_rejects_non_positive_programs_and_max_report(extra, capsys, monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["valu_fuzz.py", "--family", "f16", "--model-only", *extra])
+    with pytest.raises(SystemExit) as exc:
+        vf.main()
+    assert exc.value.code == 2
+    assert "--programs and --max-report must be at least 1" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("bad", ["", "1", "a:b", "1:2:64:99", "1:-1", "1:2:16"])
+def test_cli_rejects_invalid_show(bad, capsys, monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["valu_fuzz.py", "--family", "f16", "--show", bad])
+    with pytest.raises(SystemExit) as exc:
+        vf.main()
+    assert exc.value.code == 2
+    assert "--show expects SEED:INDEX[:WAVE] with INDEX >= 0 and WAVE in 32, 64" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("spec", ["1:0", "1:2:32", "1:2:64"])
+def test_cli_show_valid_formats(spec, capsys, monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["valu_fuzz.py", "--family", "f16", "--show", spec])
+    assert vf.main() == 0
+    assert "; model, thread 0:" in capsys.readouterr().out

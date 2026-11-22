@@ -246,8 +246,13 @@ def main(argv=None):
     idx_path = os.path.join(spirv_dir, "index.json")
     if not os.path.isfile(idx_path):
         sys.exit(f"missing {idx_path}")
-    with open(idx_path, encoding="utf-8") as f:
-        index = json.load(f)
+    try:
+        with open(idx_path, encoding="utf-8") as f:
+            index = json.load(f)
+    except (OSError, ValueError) as e:
+        sys.exit(f"cannot read {idx_path}: {e}")
+    if not isinstance(index, dict):
+        sys.exit(f"cannot read {idx_path}: expected a JSON object of shader -> metadata entries")
     written = generate_for_index(spirv_dir, index)
     print(f"wrote {len(written)} stubs to {os.path.join(spirv_dir, 'stubs')}")
     return 0

@@ -16,9 +16,14 @@ complete object, number of slots that point into executable sections).
 """
 import argparse
 import json
+import os
 import re
 import struct
 import sys
+import tempfile
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from file_mode import published_mode  # noqa: E402
 
 
 
@@ -187,6 +192,28 @@ def scan_pe64_rtti(data: bytes) -> dict:
     }
 
 
+def write_report(path, text):
+    """Write the report next to its destination and swap it in, so a write that fails part-way (a full disk, a
+    locked range) leaves the previous report as it was instead of an empty or truncated file. The result keeps
+    the previous report's permission bits, or gets the usual ones for a new file."""
+    parent = os.path.dirname(os.path.abspath(path))
+    tmp = None
+    try:
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=parent, prefix=".rtti-", suffix=".tmp",
+                                         delete=False) as f:
+            tmp = f.name
+            f.write(text)
+        os.chmod(tmp, published_mode(path))
+        os.replace(tmp, path)
+    except BaseException:
+        if tmp is not None:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+        raise
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("image")
@@ -202,8 +229,11 @@ def main():
 
     out = {"image": a.image, **scanned}
     path = a.out or re.sub(r"\.(exe|dll)$", "", a.image, flags=re.I) + ".rtti.json"
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(out, f, indent=1)
+    try:
+        write_report(path, json.dumps(out, indent=1))
+    except OSError as exc:
+        print(f"ERROR: {path}: {exc.strerror or exc}", file=sys.stderr)
+        return 1
     print(f"{a.image}: {out['type_descriptors']} type descriptors, {len(out['classes'])} classes with RTTI, {len(out['vtables'])} vtables -> {path}")
     for c in out["classes"][:5]:
         print("  ", c["name"], "<-", ", ".join(c["bases"][:4]))

@@ -18,7 +18,9 @@ namespace {
 using XMemAllocFn = void*(__stdcall*)(size_t, uint64_t);
 using XMemFreeFn = void(__stdcall*)(void*, uint64_t);
 using XMemVirtualQueryFn = SIZE_T(__stdcall*)(HANDLE, const void*, void*);
-using XMemGetWorkingSetStatisticsFn = BOOL(__stdcall*)(void*);
+// BOOL XMemGetWorkingSetStatistics(UINT32 kind, stats*): the FSR DLL passes kind 0x20000001 at every call site.
+using XMemGetWorkingSetStatisticsFn = BOOL(__stdcall*)(uint32_t, void*);
+constexpr uint32_t kMeasuredKind = 0x20000001;
 
 int g_checks = 0;
 int g_failures = 0;
@@ -69,8 +71,10 @@ void test_alloc(XMemAllocFn alloc, XMemFreeFn free_mem) {
 void test_working_set(XMemGetWorkingSetStatisticsFn get_stats) {
     alignas(64) uint8_t stats[64];
     std::memset(stats, 0xa5, sizeof(stats));
-    const BOOL ok = get_stats(stats);
-    check(ok != FALSE, "XMemGetWorkingSetStatistics(64-byte out) returns TRUE");
+    // The pointer is the second argument: the first (0x20000001 here, as the FSR DLL passes it) must never be written
+    // through, which is what the one-argument form did.
+    const BOOL ok = get_stats(kMeasuredKind, stats);
+    check(ok != FALSE, "XMemGetWorkingSetStatistics(kind, 64-byte out) returns TRUE");
 
     uint64_t working_set = 0;
     std::memcpy(&working_set, stats + 8, sizeof(working_set));
@@ -85,7 +89,8 @@ void test_working_set(XMemGetWorkingSetStatisticsFn get_stats) {
     }
     check(ok != FALSE && tail_untouched, "XMemGetWorkingSetStatistics leaves bytes 16..63 untouched");
 
-    check(get_stats(nullptr) == FALSE, "XMemGetWorkingSetStatistics(nullptr) returns FALSE without crashing");
+    check(get_stats(kMeasuredKind, nullptr) == FALSE,
+          "XMemGetWorkingSetStatistics(kind, nullptr) returns FALSE without crashing");
 }
 
 void test_virtual_query(XMemVirtualQueryFn query) {

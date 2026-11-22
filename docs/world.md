@@ -198,7 +198,7 @@ world rotation (conjugate it for rendering). `scaleXY` applies to X/Y, `scaleZ` 
 | `scaleXY` | `9ca32637` | +0x54 | f32 | XY scale |
 | `scaleZ` | `10fb7c42` | +0x58 | f32 | Z scale |
 | `flags` | `67d26872` | +0x48 | u32 | entity flags |
-| entity id | `1b60404d` | +0x08 | u64 | per-entity id (unique; not a name key) |
+| entity id | `1b60404d` | +0x08 | u64 | per-entity id (not a name key; not unique, see world_names.md) |
 | archetype key | `c8a7b90a` | +0x20 | u64 | per-archetype key: MurmurHash3 x64 128 low 64 of the name |
 | `lodLevel` | `6c8f1715` | +0x7e | u8 | 0 HD, 1 LOD, 2 SLOD1, 3 SLOD2, 4 SLOD3, 5 ORPHAN_HD, 6 SLOD4 |
 | `parentIndex` | `d89231bd` | +0x5c | i16 | parent entity index (signed; -1 = none) |
@@ -225,7 +225,9 @@ table, not fixed offsets.
 assuming it. A local 79,738-name dictionary resolved 5,107/24,105 distinct archetype hashes (8,263/203,799
 entities) in two 1 GiB windows, every one confirmed by the 64-bit key, and rejected one 32-bit-only candidate.
 The same dictionary resolved 5/23,535 map names and 1/2,089 parent rows, all confirmed by the map key. This is a
-name-source lower bound, not a formula limit. See [world_names.md](world_names.md) and `tools/world_names.py`.
+name-source lower bound, not a formula limit: with the names `tools/rpf9_names.py` lists in `levels.rpf`, 99.85%
+of the 1,670,435 entities a whole-archive `world_index.py` run reads resolve, all verified by the 64-bit key. See [world_names.md](world_names.md) and
+`tools/world_names.py`.
 
 ### Measured placement summary
 
@@ -260,15 +262,14 @@ that was a lower bound, and the full pass settles the extrapolation. See
 coverage.
 
 The full count is lower than SixNG's published 30,785 map files / 2,249,490 entities
-(https://github.com/holdmysocks/SixNG). A census of the other ten non-radio archives found no maps
-outside `levels.rpf`, so the 7,250-map / 579,048-entity difference is not explained by other archives;
-duplicate map payloads and map-name hashes are zero, and the 138,839 `CMapData`-only metadata
-resources cannot account for the 579,048 entities (see
-[world_census.md](world_census.md#other-archives)). The census counts only
-validated `0x7a` resources whose schema includes `CMapData` and whose entity table is self-consistent;
-SixNG may count archive entries, nested maps, or map resources that this scanner rejects. Treat the
-23,535 / 1,670,442 figure as the measured count for this package and this validation rule, not as a
-claim about a different enumeration method.
+(https://github.com/holdmysocks/SixNG), and the whole difference is now accounted for map by map (see
+[world_census.md](world_census.md#the-sixng-difference-map-by-map)). The 23,528 maps both count agree
+on every entity count. SixNG also counts 7,257 `0x7a` resources that have `CEntityDef` objects but no
+`CMapData` struct: 961 interior archetype resources (`CMloArchetypeDef`, 540,665 entities in interior
+space) and 6,296 `35abc248` entity groups (39,622 entities in group-local space). It misses 7 maps
+(1,239 entities) whose entity data is in a continuation page. 7,257 − 7 = 7,250 maps and 580,287 −
+1,239 = 579,048 entities. The 23,535 / 1,670,442 census figure is the count of world placement
+lists; interiors and entity groups need the transform of whatever places them.
 
 ## What is readable, what is hash-only
 
@@ -284,12 +285,11 @@ Hash-only or opaque:
 - map file `name`/`parent` (32-bit hashes; `parent` is non-zero in 2,089 of the 23,535 census maps). A local
   dictionary resolves 5 names and 1 parent; all five names are confirmed by the map root's 64-bit key. The
   remaining map-cell names are not in the local model/XML exports;
-- most `archetypeName` values. The repo's model export reports 155,598 models with names/bounds, but the local
-  dictionary used here contains 79,738 exact names. It resolves 5,107 of 24,105 distinct archetype hashes
-  (8,263 of 203,799 entities, 4.05%) in the two 1 GiB windows in [world_names.md](world_names.md); every match
-  is confirmed by the 64-bit key. The unresolved 95.95% are hash-only because their names are not in the local
-  exports, not because a different formula was observed. This is a lower bound, not a claim that the names do
-  not exist;
+- `archetypeName` values are 32-bit hashes, but nearly all of them resolve. With the `name.#dr`/`name.#ft` strings
+  that `tools/rpf9_names.py` lists in `levels.rpf` as the dictionary, 1,667,978 of 1,670,435 entities (99.85%,
+  227,422 of 228,681 distinct hashes) resolve, every one verified by the entity's 64-bit key; see
+  [world_names.md](world_names.md#whole-archive-coverage). The earlier figures (5,107 of 24,105 hashes, 8,263 of
+  203,799 entities = 4.05%, in two 1 GiB windows) used only names already exported locally;
 - texture keys do not appear in placement records. They are 64-bit asset keys in model materials, so a runtime
   resolves placement → archetype → model → material asset key;
 - the 0–2 GiB 7-struct family's field semantics and most of its payload;
@@ -346,6 +346,49 @@ python -I tests\test_world_names.py
 For a 76 GB archive always bound the run with `--start/--limit`; the tool records the window in its summary.
 A 0x7a resource split beyond the first continuation, or a map whose entity block lives in a graphics page, is
 reported with fewer entities or as `meta` rather than guessed.
+
+## Instanced props and grass
+
+Map resources can carry two instance lists besides `CEntityDef`. All four struct names are the case-sensitive
+joaat of the GTA V class names, and every member below is named by the resource's own member table.
+`tools/instance_lists.py` reads them through that table (by name hash) and writes counts only.
+
+| Hash | Struct | Size | Members (offset) |
+|---|---|---:|---|
+| `0xBA049770` | `rage__fwPropInstanceListDef` | 0x170 | `CEntityDef` members, `InstanceList` 0x90, `BatchAABB` 0xA0, `ScaleRange` 0x160, `InstanceLodDist` 0x168 |
+| `0xEA6B3A96` | `rage__fwPropInstanceListDef__InstanceData` | 0x40 | `InstMat` 0x0 (3x4 floats, translation in the last column), `Tint` 0x34 |
+| `0x7C475B5D` | `rage__fwGrassInstanceListDef` | 0x1A0 | `CEntityDef` members, `BatchAABB` 0x80, `ScaleRange` 0xA0, `LodFadeStartDist` 0xB8, `InstanceLodDist` 0xBC, `OrientToTerrain` 0xC0, `slodID` 0xB0, `IsSLODList` 0x150, `SLODArchetypeList` 0x158 (array), `InstanceList` 0x178 |
+| `0xED86F522` | `rage__fwGrassInstanceListDef__InstanceData` | 0x10 | `Position` 0x0 (3 x u16 in `BatchAABB`), `NormalX` 0x6, `NormalY` 0x7, `Color` 0x8 (3 bytes), `Scale` 0xB, `ScaleZ` 0xC, `RotationIdx` 0xD |
+
+Two more grass-list members are named by joaat from a brute force over common engine words: `slodID` (0xB0, member hash `9fe78fd1`) and `SLODArchetypeList` (0x158, `b451fc98`), so grass lists carry their own link to an SLOD archetype set next to `IsSLODList`. The other unnamed members stay as hashes in the schema.
+
+An `InstanceList` is a u64 (low 12 bits: 1-based block index; bits 20+: offset in that block) and a u16 count.
+Instance blocks are usually in the physical buffer, so the tool joins each resource's virtual and physical
+streams from its block map (+0x08 -> +8 virtual count, +9 physical count).
+
+Full run over `levels.rpf`, `story000.rpf` and `shared_minigame000.rpf` (stream occurrences, duplicates
+included):
+
+| Archive | Map resources | With lists | Prop lists | Prop instances | Grass lists | Grass instances |
+|---|---:|---:|---:|---:|---:|---:|
+| `levels.rpf` | 188,447 | 135,560 | 690,779 | 24,778,818 | 202,143 | 219,453,097 |
+| `story000.rpf` | 48,084 | 2,683 | 4,833 | 1,652,980 | 5,504 | 5,641,657 |
+| `shared_minigame000.rpf` | 787 | 472 | 3,317 | 51,795 | 592 | 437,849 |
+| total | 237,318 | 138,715 | 698,929 | 26,483,593 | 208,239 | 225,532,603 |
+
+Struct sizes and every member offset in the table match the schema in all 98,722 resources with prop lists
+and all 57,650 with grass lists. 29,482 prop lists and 8,015 grass lists point to a block outside the
+streams the tool joined; their instances are not counted.
+
+Props (26,483,593 instances): every matrix is right-handed; 26,046,778 have orthonormal axes (within 0.01),
+25,936,781 are uniformly scaled and 4,692,108 have unit scale; the translation is inside the list's
+`BatchAABB` for 26,386,624. List `lodLevel`: LOD 424,012, HD 116,660, ORPHAN_HD 93,958, SLOD1 64,299. Every
+list has an ordered `ScaleRange` and `0 < InstanceLodDist <= lodDist`.
+
+Grass (225,532,603 instances): 225,379,032 `NormalX`/`NormalY` pairs (byte / 127.5 - 1) are inside the unit
+disc; `RotationIdx` is 0 to 72; `ScaleZ` equals `Scale` in 52,021,564 and `Scale` is 0 in 47,679,734, so
+`ScaleZ` is its own value, not ambient occlusion. `OrientToTerrain` is 1.0 in all 208,239 lists, `IsSLODList`
+is set in 5,802, and `lodLevel` is ORPHAN_HD in 205,181 and SLOD1 in 3,058.
 
 ## No-sharing rule
 

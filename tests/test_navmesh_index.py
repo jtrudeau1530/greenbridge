@@ -118,6 +118,24 @@ class NavmeshIndexTest(unittest.TestCase):
         self.assertIsNone(row["stored"])
         self.assertEqual(row["size"], 0x80)
 
+    def test_out_and_csv_in_missing_folders_are_created(self):
+        # Before: write_outputs opened both paths directly, so a missing folder ended a finished scan in a
+        # FileNotFoundError traceback and lost the index.
+        folder = os.path.join(self.root, "carve")
+        os.makedirs(folder)
+        with open(os.path.join(folder, "page.bin"), "wb") as f:
+            f.write(page(pages=5))
+        out = os.path.join(self.root, "no", "such", "index.json")
+        csv_path = os.path.join(self.root, "also", "missing", "index.csv")
+        self.run_tool(folder, "--out", out, "--csv", csv_path, "--pattern", "*.bin")
+        with open(out, encoding="utf-8") as f:
+            doc = json.load(f)
+        self.assertEqual(doc["summary"]["page_counts"], {"5": 1})
+        with open(csv_path, encoding="utf-8") as f:
+            lines = f.read().splitlines()
+        self.assertEqual(len(lines), 2)
+        self.assertIn("0DRP@16", lines[1])
+
     def test_not_an_rpf(self):
         path = os.path.join(self.root, "not.rpf")
         with open(path, "wb") as f:
@@ -224,6 +242,45 @@ class MissingInputTest(unittest.TestCase):
             self.assertIn("missing.rpf", p.stderr)
             self.assertNotIn("Traceback", p.stderr)
             self.assertFalse(os.path.exists(out))
+
+
+class LimitWindowTest(unittest.TestCase):
+    """--limit must bound the bytes read, not just where signatures are searched."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.rpf = os.path.join(self.tmp.name, "window.rpf")
+        self.streams = make_rpf(self.rpf)
+        self.mod = load_tool_module()
+
+    def summary(self, limit):
+        _rows, summary = self.mod.scan_archive(self.rpf, limit=limit)
+        self.assertLessEqual(summary["compressed_bytes"], summary["span"])
+        self.assertLessEqual(summary["readable_fraction"], 1.0)
+        self.assertEqual(summary["compressed_bytes"] + summary["zero_padding"] + summary["unread_bytes"],
+                         summary["span"])
+        return summary
+
+    def test_stream_crossing_the_limit_is_not_counted(self):
+        # The zlib header is inside the window but its body is not: counting it would make the
+        # compressed bytes exceed the span and readable_fraction greater than 1.
+        summary = self.summary(10)
+        self.assertEqual(summary["span"], 10)
+        self.assertEqual(summary["streams"], 0)
+        self.assertEqual(summary["compressed_bytes"], 0)
+
+    def test_stream_ending_at_the_limit_is_counted(self):
+        summary = self.summary(len(self.streams[0]))
+        self.assertEqual(summary["span"], len(self.streams[0]))
+        self.assertEqual(summary["streams"], 1)
+        self.assertEqual(summary["compressed_bytes"], len(self.streams[0]))
+        self.assertEqual(summary["readable_fraction"], 1.0)
+
+    def test_window_too_short_for_a_signature_has_no_streams(self):
+        summary = self.summary(1)
+        self.assertEqual(summary["streams"], 0)
+        self.assertEqual(summary["span"], 1)
 
 
 if __name__ == "__main__":

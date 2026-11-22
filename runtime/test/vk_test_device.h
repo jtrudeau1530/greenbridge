@@ -4,7 +4,10 @@
 #pragma once
 
 #include "vulkan_loader.h"
+#include "../src/vulkan_device_filter.h"
+#include "vk_device_pick.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -20,11 +23,30 @@ inline unsigned& validation_error_count() {
 }
 
 inline VKAPI_ATTR VkBool32 VKAPI_CALL on_validation(VkDebugUtilsMessageSeverityFlagBitsEXT severity,
-                                                    VkDebugUtilsMessageTypeFlagsEXT,
+                                                    VkDebugUtilsMessageTypeFlagsEXT types,
                                                     const VkDebugUtilsMessengerCallbackDataEXT* data, void*) {
-    if (severity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT) ++validation_error_count();
+    if ((severity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT) &&
+        (types & VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT))
+        ++validation_error_count();
     std::fprintf(stderr, "validation: %s\n", data && data->pMessage ? data->pMessage : "(no message)");
     return VK_FALSE;
+}
+
+enum class DeviceStatus { ready, unavailable, failed };
+
+template<typename Entry, typename Enumerate>
+VkResult enumerate_all(std::vector<Entry>& entries, Enumerate enumerate) {
+    VkResult result;
+    do {
+        std::uint32_t count = 0;
+        result = enumerate(&count, nullptr);
+        if (result != VK_SUCCESS) return result;
+        entries.resize(count);
+        if (count == 0) return VK_SUCCESS;
+        result = enumerate(&count, entries.data());
+        if (result == VK_SUCCESS) entries.resize(count);
+    } while (result == VK_INCOMPLETE);
+    return result;
 }
 
 class Device {
@@ -40,8 +62,13 @@ public:
     bool bc = false;  // textureCompressionBC enabled
     bool bindless = false;         // the features the bindless set 0 needs are enabled
     bool partially_bound = false;  // and its slots can stay empty
+    bool image_view_min_lod = false;
     bool conditional_rendering = false;  // VK_EXT_conditional_rendering enabled, where available
     bool host_image_copy = false;  // VK_EXT_host_image_copy and hostImageCopy enabled
+    bool occlusion_query_precise = false;    // occlusionQueryPrecise enabled
+    bool pipeline_statistics_query = false;  // pipelineStatisticsQuery enabled
+    bool request_debug_utils = false;  // set before create(): enable VK_EXT_debug_utils when the loader has it
+    bool debug_utils = false;          // VK_EXT_debug_utils is enabled on the instance
 
     Device() = default;
     Device(const Device&) = delete;
@@ -84,9 +111,15 @@ public:
 
     unsigned validation_errors() const { return validation_error_count(); }
 
-    bool create() {
+    bool create() { return initialize() == DeviceStatus::ready; }
+
+    DeviceStatus initialize() {
+        const auto failure = [](const char* call, VkResult result) {
+            std::fprintf(stderr, "%s failed (VkResult %d)\n", call, static_cast<int>(result));
+            return DeviceStatus::failed;
+        };
         instance_proc = load_vulkan();
-        if (!instance_proc) return false;
+        if (!instance_proc) return DeviceStatus::unavailable;
         const auto create_instance = reinterpret_cast<PFN_vkCreateInstance>(instance_proc(nullptr, "vkCreateInstance"));
         const auto enumerate_layers = reinterpret_cast<PFN_vkEnumerateInstanceLayerProperties>(
             instance_proc(nullptr, "vkEnumerateInstanceLayerProperties"));
@@ -101,72 +134,101 @@ public:
 #endif
         validation = env && std::strcmp(env, "0") != 0;
         const char* layer = "VK_LAYER_KHRONOS_validation";
-        const char* debug_utils = VK_EXT_DEBUG_UTILS_EXTENSION_NAME;
+        const char* debug_utils_name = VK_EXT_DEBUG_UTILS_EXTENSION_NAME;
         VkDebugUtilsMessengerCreateInfoEXT messenger_info{VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT};
         messenger_info.messageSeverity =
             VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT;
-        messenger_info.messageType = VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT |
-                                     VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT |
-                                     VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT;
+        messenger_info.messageType = VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT;
         messenger_info.pfnUserCallback = on_validation;
+
+        const VkValidationFeatureEnableEXT sync_validation =
+            VK_VALIDATION_FEATURE_ENABLE_SYNCHRONIZATION_VALIDATION_EXT;
+        VkValidationFeaturesEXT validation_features{VK_STRUCTURE_TYPE_VALIDATION_FEATURES_EXT, &messenger_info};
+        validation_features.enabledValidationFeatureCount = 1;
+        validation_features.pEnabledValidationFeatures = &sync_validation;
 
         VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
         app.apiVersion = VK_API_VERSION_1_3;
         VkInstanceCreateInfo instance_info{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
         instance_info.pApplicationInfo = &app;
         if (validation) {
-            std::uint32_t count = 0;
-            enumerate_layers(&count, nullptr);
-            std::vector<VkLayerProperties> layers(count);
-            enumerate_layers(&count, layers.data());
+            std::vector<VkLayerProperties> layers;
+            const VkResult layer_result = enumerate_all(layers, enumerate_layers);
+            if (layer_result != VK_SUCCESS) return failure("vkEnumerateInstanceLayerProperties", layer_result);
             bool found = false;
             for (const auto& properties : layers) found = found || std::strcmp(properties.layerName, layer) == 0;
             if (!found) {
                 std::fprintf(stderr, "LEONIDA_VK_VALIDATION is set but %s is not installed\n", layer);
-                return false;
+                return DeviceStatus::failed;
             }
-            instance_info.pNext = &messenger_info;
+            instance_info.pNext = &validation_features;
             instance_info.enabledLayerCount = 1;
             instance_info.ppEnabledLayerNames = &layer;
-            instance_info.enabledExtensionCount = 1;
-            instance_info.ppEnabledExtensionNames = &debug_utils;
+            debug_utils = true;  // the validation layer provides it
+        } else if (request_debug_utils) {
+            const auto enumerate = reinterpret_cast<PFN_vkEnumerateInstanceExtensionProperties>(
+                instance_proc(nullptr, "vkEnumerateInstanceExtensionProperties"));
+            std::uint32_t count = 0;
+            enumerate(nullptr, &count, nullptr);
+            std::vector<VkExtensionProperties> extensions(count);
+            enumerate(nullptr, &count, extensions.data());
+            for (const auto& e : extensions)
+                debug_utils = debug_utils || std::strcmp(e.extensionName, VK_EXT_DEBUG_UTILS_EXTENSION_NAME) == 0;
         }
-        if (create_instance(&instance_info, nullptr, &instance) != VK_SUCCESS) return false;
-        if (validation &&
-            instance_fn<PFN_vkCreateDebugUtilsMessengerEXT>("vkCreateDebugUtilsMessengerEXT")(
-                instance, &messenger_info, nullptr, &messenger_) != VK_SUCCESS)
-            return false;
+        if (debug_utils) {
+            instance_info.enabledExtensionCount = 1;
+            instance_info.ppEnabledExtensionNames = &debug_utils_name;
+        }
+        VkResult result = create_instance(&instance_info, nullptr, &instance);
+        if (result == VK_ERROR_INCOMPATIBLE_DRIVER) return DeviceStatus::unavailable;
+        if (result != VK_SUCCESS) return failure("vkCreateInstance", result);
+        if (validation) {
+            const auto create_messenger = instance_fn<PFN_vkCreateDebugUtilsMessengerEXT>("vkCreateDebugUtilsMessengerEXT");
+            if (!create_messenger) return failure("vkCreateDebugUtilsMessengerEXT", VK_ERROR_EXTENSION_NOT_PRESENT);
+            result = create_messenger(instance, &messenger_info, nullptr, &messenger_);
+            if (result != VK_SUCCESS) return failure("vkCreateDebugUtilsMessengerEXT", result);
+        }
 
         const auto enumerate = instance_fn<PFN_vkEnumeratePhysicalDevices>("vkEnumeratePhysicalDevices");
         const auto properties_of = instance_fn<PFN_vkGetPhysicalDeviceProperties>("vkGetPhysicalDeviceProperties");
         const auto families_of =
             instance_fn<PFN_vkGetPhysicalDeviceQueueFamilyProperties>("vkGetPhysicalDeviceQueueFamilyProperties");
-        std::uint32_t count = 0;
-        enumerate(instance, &count, nullptr);
-        std::vector<VkPhysicalDevice> devices(count);
-        enumerate(instance, &count, devices.data());
+        std::vector<VkPhysicalDevice> devices;
+        result = enumerate_all(devices, [&](std::uint32_t* count, VkPhysicalDevice* values) {
+            return enumerate(instance, count, values);
+        });
+        if (result != VK_SUCCESS) return failure("vkEnumeratePhysicalDevices", result);
         VkPhysicalDeviceProperties chosen{};
+        int best_rank = -1;
         for (auto candidate : devices) {
             VkPhysicalDeviceProperties props{};
             properties_of(candidate, &props);
-            if (props.apiVersion < VK_API_VERSION_1_3) continue;
+            if (props.apiVersion < VK_API_VERSION_1_3 || !leonida::vulkan_device_wanted(props.deviceName)) continue;
             std::uint32_t family_count = 0;
             families_of(candidate, &family_count, nullptr);
             std::vector<VkQueueFamilyProperties> families(family_count);
             families_of(candidate, &family_count, families.data());
             for (std::uint32_t i = 0; i < family_count; ++i) {
                 if (!(families[i].queueFlags & VK_QUEUE_GRAPHICS_BIT)) continue;
-                if (!physical || props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) {
+                if (const int rank = leonida::vk_test::device_rank(props.deviceType, props.vendorID);
+                    rank > best_rank) {
                     physical = candidate;
                     family = i;
                     chosen = props;
+                    best_rank = rank;
                 }
                 break;
             }
         }
         if (!physical) {
+            if (const std::string filter = leonida::vulkan_device_filter(); !filter.empty()) {
+                // A filter that matches nothing fails the test instead of skipping it.
+                std::fprintf(stderr, "LEONIDA_VK_DEVICE=%s: no Vulkan 1.3 device with a graphics queue matches\n",
+                             filter.c_str());
+                return DeviceStatus::failed;
+            }
             std::fprintf(stderr, "no Vulkan 1.3 device with a graphics queue\n");
-            return false;
+            return DeviceStatus::unavailable;
         }
         std::printf("device: %s%s\n", chosen.deviceName, validation ? " (validation on)" : "");
 
@@ -178,7 +240,7 @@ public:
             !features12.separateDepthStencilLayouts) {
             std::fprintf(stderr, "the device lacks dynamicRendering, synchronization2, timelineSemaphore or "
                                  "separateDepthStencilLayouts\n");
-            return false;
+            return DeviceStatus::unavailable;
         }
         // VK_EXT_conditional_rendering (SetPredication), where available.
         {
@@ -242,6 +304,18 @@ public:
         enumerate_extensions(physical, nullptr, &extension_count, nullptr);
         std::vector<VkExtensionProperties> extensions(extension_count);
         enumerate_extensions(physical, nullptr, &extension_count, extensions.data());
+        VkPhysicalDeviceImageViewMinLodFeaturesEXT min_lod{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_VIEW_MIN_LOD_FEATURES_EXT};
+        if (std::any_of(extensions.begin(), extensions.end(), [](const auto& e) {
+                return std::strcmp(e.extensionName, VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME) == 0;
+            })) {
+            VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &min_lod};
+            instance_fn<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2")(physical, &query);
+            image_view_min_lod = min_lod.minLod == VK_TRUE;
+            if (image_view_min_lod) {
+                min_lod.pNext = enable13.pNext;
+                enable13.pNext = &min_lod;
+            }
+        }
         VkPhysicalDeviceHostImageCopyFeaturesEXT host_copy{
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_IMAGE_COPY_FEATURES_EXT};
         for (const auto& extension : extensions) {
@@ -256,17 +330,22 @@ public:
             enable13.pNext = &host_copy;
         }
 
+        enable.occlusionQueryPrecise = features.features.occlusionQueryPrecise;  // query heaps, where available
+        enable.pipelineStatisticsQuery = features.features.pipelineStatisticsQuery;
+        occlusion_query_precise = features.features.occlusionQueryPrecise == VK_TRUE;
+        pipeline_statistics_query = features.features.pipelineStatisticsQuery == VK_TRUE;
         VkDeviceCreateInfo device_info{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &enable12};
         device_info.queueCreateInfoCount = 1;
         device_info.pQueueCreateInfos = &queue_info;
         device_info.pEnabledFeatures = &enable;
         std::vector<const char*> device_extensions;
+        if (image_view_min_lod) device_extensions.push_back(VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME);
         if (conditional_rendering) device_extensions.push_back(conditional_extension);
         if (host_image_copy) device_extensions.push_back(host_image_copy_name);
         device_info.enabledExtensionCount = std::uint32_t(device_extensions.size());
         device_info.ppEnabledExtensionNames = device_extensions.data();
-        if (instance_fn<PFN_vkCreateDevice>("vkCreateDevice")(physical, &device_info, nullptr, &device) != VK_SUCCESS)
-            return false;
+        result = instance_fn<PFN_vkCreateDevice>("vkCreateDevice")(physical, &device_info, nullptr, &device);
+        if (result != VK_SUCCESS) return failure("vkCreateDevice", result);
         device_proc = instance_fn<PFN_vkGetDeviceProcAddr>("vkGetDeviceProcAddr");
         fn<PFN_vkGetDeviceQueue>("vkGetDeviceQueue")(device, family, 0, &queue);
         instance_fn<PFN_vkGetPhysicalDeviceMemoryProperties>("vkGetPhysicalDeviceMemoryProperties")(physical,
@@ -274,7 +353,8 @@ public:
         VkCommandPoolCreateInfo pool{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
         pool.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
         pool.queueFamilyIndex = family;
-        return fn<PFN_vkCreateCommandPool>("vkCreateCommandPool")(device, &pool, nullptr, &pool_) == VK_SUCCESS;
+        result = fn<PFN_vkCreateCommandPool>("vkCreateCommandPool")(device, &pool, nullptr, &pool_);
+        return result == VK_SUCCESS ? DeviceStatus::ready : failure("vkCreateCommandPool", result);
     }
 
     bool depth_format_usable(VkFormat format) const {

@@ -73,13 +73,21 @@ int conversion_checks() {
     // Half floats round to nearest even; too large is infinity; tiny values become subnormals.
     EXPECT((element(VK_FORMAT_R16_SFLOAT, true, floats(1.0f, 0, 0, 0)) == V{0x00, 0x3c}));
     EXPECT((element(VK_FORMAT_R16_SFLOAT, true, floats(-2.0f, 0, 0, 0)) == V{0x00, 0xc0}));
-    EXPECT((element(VK_FORMAT_R16_SFLOAT, true, floats(65520.0f, 0, 0, 0)) == V{0x00, 0x7c}));
-    EXPECT((element(VK_FORMAT_R16_SFLOAT, true, floats(1e-7f, 0, 0, 0)) == V{0x02, 0x00}));
-    EXPECT((element(VK_FORMAT_R16_SFLOAT, true, floats(1.0f + 1.0f / 2048, 0, 0, 0)) == V{0x00, 0x3c}));  // a tie, to even
+    // Round toward zero, a finite overflow saturating to the largest finite (D3D11.3 3.2.2), as
+    // ClearUnorderedAccessViewFloat gives on WARP and on NVIDIA: 65520 and 70000 are 65504, not infinity.
+    EXPECT((element(VK_FORMAT_R16_SFLOAT, true, floats(65520.0f, 0, 0, 0)) == V{0xff, 0x7b}));
+    EXPECT((element(VK_FORMAT_R16_SFLOAT, true, floats(70000.0f, 0, 0, 0)) == V{0xff, 0x7b}));
+    EXPECT((element(VK_FORMAT_R16_SFLOAT, true, floats(-1e10f, 0, 0, 0)) == V{0xff, 0xfb}));
+    EXPECT((element(VK_FORMAT_R16_SFLOAT, true, floats(INFINITY, 0, 0, 0)) == V{0x00, 0x7c}));  // stays infinity
+    EXPECT((element(VK_FORMAT_R16_SFLOAT, true, floats(1e-7f, 0, 0, 0)) == V{0x01, 0x00}));
+    EXPECT((element(VK_FORMAT_R16_SFLOAT, true, floats(1.0f + 1.0f / 2048, 0, 0, 0)) == V{0x00, 0x3c}));  // truncated
     // The packed 11/11/10 floats: 1.0, 2.0 and 0.5; no sign, so negative is 0.
     EXPECT(word(element(VK_FORMAT_B10G11R11_UFLOAT_PACK32, true, floats(1.0f, 2.0f, 0.5f, 0))) ==
            (0x3c0u | 0x400u << 11 | 0x1c0u << 22));
     EXPECT(word(element(VK_FORMAT_B10G11R11_UFLOAT_PACK32, true, floats(-1.0f, 0, 0, 0))) == 0);
+    // Too large is the largest finite on every channel (host: 0xf7fdffbf), and 1/3 truncates (host: 0x1aa).
+    EXPECT(word(element(VK_FORMAT_B10G11R11_UFLOAT_PACK32, true, floats(1e6f, 1e6f, 1e6f, 0))) == 0xf7fdffbfu);
+    EXPECT(word(element(VK_FORMAT_B10G11R11_UFLOAT_PACK32, true, floats(0, 0, 1.0f / 3, 0))) >> 22 == 0x1aau);
     // Float into an integer channel: toward zero, clamped.
     EXPECT(word(element(VK_FORMAT_R32_SINT, true, floats(-3.7f, 0, 0, 0))) == std::uint32_t(-3));
     EXPECT((element(VK_FORMAT_R8G8_UINT, true, floats(300.0f, -5.0f, 0, 0)) == V{0xff, 0x00}));
@@ -409,7 +417,9 @@ int main() {
     if (conversion_checks()) return 1;
 
     vktest::Device d;
-    EXPECT(d.create());
+    const auto device_status = d.initialize();
+    if (device_status == vktest::DeviceStatus::unavailable) return 77;   // no Vulkan GPU: ctest skips
+    if (device_status != vktest::DeviceStatus::ready) return 1;
     {
         rt::d3d12::VulkanDeviceInfo info{};
         info.get_instance_proc = d.instance_proc;

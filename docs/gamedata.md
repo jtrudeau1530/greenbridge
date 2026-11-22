@@ -103,11 +103,12 @@ u8 arrays). The measured file is version 1.2; GTA V writes 1.1.
 | pad | 0x0A | `u16` | 0 |
 | six bounds | 0x0C | 6 x `f32` | `(-13000, -9000, -50)` to `(7000, 11000, 500)` |
 | data size | 0x24 | `u32` | bytes after the 44-byte header |
-| unknown | 0x28 | `u32` | `0x9A99E517` / `0x25B7CF17` |
+| default height | 0x28 | `u8` | 23 in both (0 m quantised) |
+| pad | 0x29 | 3 bytes | differ per file; not a checksum |
 
 At 0x2C there are `height` records of eight bytes
 `{u16 start, u16 count, i32 offset}`, then the packed u8 heights. A row with
-`count = 0` keeps the measured default **23**; the other rows fill cells
+`count = 0` keeps the default height from byte 0x28 (**23** in both payloads); the other rows fill cells
 `start .. start + count - 1` from `pixels[offset + start + i]`.
 
 | Payload | Filled rows | Empty rows | Packed bytes | Height range |
@@ -117,24 +118,32 @@ At 0x2C there are `height` records of eight bytes
 
 The row spans cover the packed bytes exactly: **0 gaps, 0 overlaps** in both
 payloads. The default 23 is `-0.39 m`, and 209 is `400.8 m`, so the default is
-the sea surface.
+the sea surface: `(0 - min.z) / (max.z - min.z) * 255 = 23.18`, so 23 is 0 m
+quantised to the header's Z box.
+
+The encoder crops each row to its first and last non-default cell. Over the
+3,451 filled rows of both payloads, **0 of the 6,902 span ends** hold 23,
+although 23 is 82% of all cells and occurs 849,544 times *inside* spans. The
+ends are 24 (6,402), 22 (343) and other neighbours of 23. Empty rows are rows
+that are entirely default. The decoder reads the default from byte 0x28 and
+reports `span_ends_at_default` so a different build can be checked the same way.
 
 The earlier "zero-filled prefix plus square byte grid" reading (1,090 x 1,090
 and 1,100 x 1,100) was an artifact. The prefix is the zeroed row headers of
 the empty rows, and the grid is 2048 x 2048. The largest square that ends at
 the payload end happened to fit the byte count, but it is not the format.
 
-### `PAMH`: `HMAP` v1.2, 144 x 164 max/min heightmap
+### `PAMH`: `HMAP` max/min heightmap (`common.rpf` 144 x 164, tiles 64 x 64)
 
 | Header | Offset | Type | Measured |
 |---|---|---|---|
 | magic | 0x00 | 4 bytes | `PAMH` (little-endian `HMAP`) |
-| version | 0x04 | 2 x `u8` | 1.2 |
-| pad | 0x06 | `u16` | 0 |
-| flag word | 0x08 | `u32` | `0x1BBC8CED` (GTA V's `compressed` field) |
-| width, height | 0x0C | 2 x `u16` | 144, 164 |
+| version | 0x04 | 2 x `u8` | 1.2 in `common.rpf`; overwritten in the `levels.rpf` tiles |
+| pad | 0x06 | `u16` | 0 in `common.rpf`; text in the tiles |
+| flag word | 0x08 | `u32` | `0x1BBC8CED` in `common.rpf`; padding in the tiles |
+| width, height | 0x0C | 2 x `u16` | 144, 164 in `common.rpf`; 64, 64 in every tile |
 | six bounds | 0x10 | 6 x `f32` | `(-13312, -9728, -302)` to `(5120, 11264, 404)` |
-| data size | 0x28 | `u32` | 48,544 |
+| data size | 0x28 | `u32` | 48,544 in `common.rpf`; 8,704 in a tile |
 
 At 0x2C there are 164 row records, then `width * height` **max** bytes and
 `width * height` **min** bytes. The measured max layer runs 110..255 and the
@@ -144,6 +153,34 @@ on land. The min layer is the ground or sea floor.
 
 The earlier u16 reading interleaved the two arrays: every measured `0x6E6E`
 was a `(110, 110)` max/min pair, not the value 28,270.
+
+### The 1,476 `PAMH` tiles in `levels.rpf`
+
+`levels.rpf` holds 1,476 more `PAMH` payloads. All of them decode with the
+same rules: a 44-byte header, 64 x 64 cells, 64 full-width row records with
+`start = 0`, `count = 64` and `offset = y * 64`, then 4,096 **max** bytes and
+4,096 **min** bytes. That is 6,045,696 cells in total.
+
+- The tiles are a 36 x 41 rectangle with **512 m** spacing, so they cover the
+  same `(-13312, -9728)` to `(5120, 11264)` box as the `common.rpf` payload,
+  with the same Z box `-302` to `404`.
+- Max values span 0..255 and min values 0..254. `min <= max` in all but 62
+  cells, all in the tile at `(-5120, 2048)`, where the encoder wrote a min
+  above its max.
+- Bytes 0x05..0x0B are leftover text, not a version minor and a flag. 0x04
+  stays 1, 0x05.. hold the tile name `n_m` (column + 1, row + 1), and the
+  remaining bytes keep the tail of the string `height`, right-aligned at 0x0B.
+  The 28 distinct 0x08..0x0B words are all text; none is zero and none changes
+  the arrays.
+- The census groups by grid size, not by the 0x04 version bytes, because
+  0x05 is the first digit of the name. Nothing depends on the 0x08 word.
+
+```powershell
+python -I tools/gamedata_maps.py <work>\carve\levels --json levels.json
+```
+
+The tool prints one `PAMH census 64x64: ...` line and writes the per-group
+counts. Only header fields and counts are written, never the height bytes.
 
 ### Cross-check and Z mapping
 
@@ -167,13 +204,25 @@ python -I tools/gamedata_maps.py <work>\carve\common --json maps.json
 
 ### Checksum and unknown fields
 
-- `PAMH` 0x08 is the HMAP `compressed` word (GTA V writes 1). The measured
-  `0x1BBC8CED` is not CRC32, Adler32, FNV-1a, joaat32 or a hashlib digest of
-  the max/min arrays; it is reported as a flag word, not a proven checksum.
-- `MHIU` 0x28 (`0x9A99E517` / `0x25B7CF17`) is not CRC32, Adler32, FNV-1a,
-  joaat32, Murmur3, xxHash32, lookup3, Fletcher32 or a hashlib digest window
-  of the decoded 2048 x 2048 grid, the packed bytes, the row table or the
-  whole payload. It remains unidentified.
+- `PAMH` 0x08 is GTA V's `compressed` word only in the `common.rpf` payload,
+  where it holds `0x1BBC8CED`. In the 1,476 `levels.rpf` tiles bytes 0x04..0x0B
+  are leftover text (tile name plus `height`), so 0x08 is padding there. The
+  `0x1BBC8CED` value is not CRC32, Adler32, FNV-1a, joaat32 or a hashlib
+  digest of the max/min arrays; it is reported as a flag word, not a proven
+  checksum.
+- `MHIU` 0x28 is a `u8` default height, not a 32-bit word (ASSET-48). Its
+  value is 23 in both payloads, the same value the empty rows were measured
+  to hold, and the row cropping above uses it. A full scan of all 12 archives
+  of package 1.0.2.1 (every zlib stream inflated far enough to read its magic)
+  finds **2 MHIU payloads**, both in `common.rpf`, so N = 2 for the header
+  values; the cropping rule is measured over all 6,902 span ends.
+- `MHIU` 0x29..0x2B differ between the two files and match none of CRC32,
+  Adler32, FNV-1/FNV-1a, joaat32 or an MD5/SHA-1/SHA-256/SHA3/BLAKE2 digest
+  (any 3-byte window, either byte order, or a 24-bit slice of the 32-bit
+  hashes) over the grid, the packed bytes, the row table, the header, the
+  body or the payload with 0x28..0x2B zeroed. They do not equal any count or
+  sum of the grid. They are most likely uninitialised struct padding after the
+  `u8` and are reported as `pad_29`; with N = 2 this is a hypothesis.
 
 ## XML documents
 
@@ -331,6 +380,30 @@ block as incomplete evidence: `gamedata_xml.py --check` is the reference for tha
 aggregate counts and schema/root/element/attribute names belong in git; the CSV/JSON, the element values, the
 `type`/`content` values and per-file paths stay on the local machine. The tests are synthetic.
 
+## `OceanSimPresets`
+
+`tools/gamedata_xml.py` lists `OceanSimPresets` among the time/weather/water roots. There is one such document.
+Its element tree (counts per path; no values or names):
+
+| Path | Count | Content |
+|---|---:|---|
+| `Presets/Item` | 10 | one preset per sea region |
+| `Presets/Item/Name`, `Id` | 10 each | region label and id |
+| `Presets/Item/Location` | 10 | `x`, `y` attributes in world units: x -7,995 to 3,183, y -4,572 to 8,645 |
+| `Presets/Item/Direction` | 10 | wave direction |
+| `Presets/Item/Octaves/Item` | 30 | exactly 3 per preset |
+| `Presets/Item/Octaves/Item/ControlPoints` | 30 | 4 `(x, y)` pairs each, both in 0..1 |
+| `WavefrontShapeA`, `B`, `G`, `R` `/Item/ControlPoints` | 1 each | one curve each |
+
+So the ocean is a small set of regional presets placed by world position, each with three wave octaves whose
+amplitude is a 4-point curve over a 0..1 input. The input is the sea state: the timecycle keyframe documents
+carry a `water_ocean_beaufort_scale` variable (26 documents, 676 values, 0 to 10), the Beaufort number per
+weather and time of day.
+
+Not measured here (hypothesis): which preset applies at a position (nearest `Location` is the obvious reading),
+how the Beaufort number maps onto the 0..1 curve input (Beaufort / 12 is one choice), and what the four
+`WavefrontShape` curves drive.
+
 ## Relationship to `data.rpf` and `script.rpf`
 
 | Archive | Size | Streams | Inflated | Dominant payloads | XML | `RBF0` | `PSIN` |
@@ -390,5 +463,5 @@ it applies to this note as well.
 The most useful next step is a **schema bridge**, not more carving: check whether the 118 XML root tags match
 RTTI class names in the executable, then build a streaming reader that dispatches on root and `type`. That
 turns the measured XML into the runtime's config layer without hand-writing 5,293 tags. The `MHIU`/`PAMH`
-heightmaps are decoded by `tools/gamedata_maps.py`; the MHIU `0x28` word remains unidentified, while the
-row-table layouts and the value-to-Z mapping are measured.
+heightmaps are decoded by `tools/gamedata_maps.py`; every MHIU header field is identified (0x28 is the
+default height), and the row-table layouts and the value-to-Z mapping are measured.

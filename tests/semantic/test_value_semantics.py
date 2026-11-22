@@ -31,6 +31,8 @@ ISA semantics used (AMD RDNA2 ISA reference, VALU/VOP3/VOP3P chapters):
   s_min/max_i32/u32     D = S0 < S1 ? S0 : S1 (max: >), SCC = 1 when S0 is chosen, so a tie gives S1 and SCC 0.
   v_fmamk_f32/madmk_f32 D = S0 * K + S1, K the literal (printed vdst, src0, K, vsrc1); fmamk is fused.
   v_fmaak_f32/madak_f32 D = S0 * S1 + K (printed vdst, src0, vsrc1, K).
+  s_ff1_i32_b32 /       index of the lowest set / clear bit of S0, -1 (0xffffffff) when there is none. An inline
+  s_ff0_i32_b32           constant or literal source is a 32-bit value, not a lane mask (SHADER-46).
 
 The appended cases for ps_ops5/ps_ops6 also pin the op_sel source-half selection for packed shifts, which the
 GPU-checked ps_ops4 does not exercise. cs_bounds (compute) pins the buffer num_records bounds checks: an
@@ -61,6 +63,7 @@ EXPECTED_FMT_1010102 = {0x00: 0x00000000, 0x04: 0x3F800000, 0x08: 0x00000000, 0x
                         0x10: 0x3F800000, 0x14: 0x00000000, 0x18: 0x3F800000, 0x1C: 0x00000000,
                         0x20: 0x00000000, 0x24: 0x3F800000, 0x28: 0x00000000, 0x2C: 0x3F800000,
                         0x30: 0xC00FFC00, 0x34: 0x003FF003, 0x38: 0xE00003FF, 0x3C: 0xFFE00003}
+EXPECTED_SFF_IMM = [0x00000002, 0x00000001, 0x00000014, 0x00000010]
 
 
 def _f32_bits(x):
@@ -245,6 +248,18 @@ def reference_fmt_1010102():
     return {4 * i: w for i, w in enumerate(words)}
 
 
+def _ff1(x):
+    """Index of the lowest set bit of a 32-bit value, 0xffffffff if none."""
+    x &= 0xFFFFFFFF
+    return (x & -x).bit_length() - 1 if x else 0xFFFFFFFF
+
+
+def reference_sff_imm():
+    # ps_sff_imm: s_ff1 of the inline constant 4 and of the literal 0x00100000; s_ff0 of the inline constant 61
+    # (0b111101) and of the literal 0x0000ffff (the lowest clear bit is the lowest set bit of ~S0).
+    return [_ff1(4), _ff1(~61), _ff1(0x00100000), _ff1(~0x0000FFFF)]
+
+
 def _isg1_dxbc(elements):
     """A DXBC container with one ISG1 input signature. elements: (register, mask, system value, component type)."""
     payload = bytearray(struct.pack("<II", len(elements), 8))
@@ -291,6 +306,7 @@ class OracleTests(unittest.TestCase):
         self.assertEqual(reference_fma_literal(), EXPECTED_FMA_LITERAL)
         self.assertEqual(reference_bounds(), EXPECTED_BOUNDS)
         self.assertEqual(reference_fmt_1010102(), EXPECTED_FMT_1010102)
+        self.assertEqual(reference_sff_imm(), EXPECTED_SFF_IMM)
 
 
 class TranslatorValueSemantics(unittest.TestCase):
@@ -387,6 +403,151 @@ class TranslatorValueSemantics(unittest.TestCase):
         for address, want in EXPECTED_FMT_1010102.items():
             with self.subTest(address=address):
                 self.assertEqual(f"{memory.get(address, 0):#010x}", f"{want:#010x}")
+
+    def test_s_ff0_s_ff1_read_an_immediate_as_a_value(self):
+        # SHADER-46: an inline constant or literal is a 32-bit value. Read as a lane mask (all ones or zero from
+        # bit 0), s_ff0 of 61 and of 0x0000ffff gave -1; the s_ff1 words guard the path it already got right.
+        self.check("ps_sff_imm", EXPECTED_SFF_IMM)
+
+
+class ReadLog(dict):
+    """A {byte_address: word} memory for run_fragment that records the address of every load."""
+
+    def __init__(self, *args):
+        super().__init__(*args)
+        self.reads = []
+
+    def get(self, key, default=None):
+        self.reads.append(key)
+        return super().get(key, default)
+
+
+VEC_REGION = 0x1000
+
+
+def _pattern_word(offset):
+    # byte n of the region holds 0x40 + n (as in the measurement), so an unaligned dword is its four exact bytes
+    return int.from_bytes(bytes((0x40 + offset + k) & 0xFF for k in range(4)), "little")
+
+
+class RawBufferTailBounds(unittest.TestCase):
+    """Raw MUBUF loads (V# stride 0) are bounded per dword, measured on an AMD Radeon RX 6800 (gfx1030), raw
+    compute kernel, wave32 and wave64, V# word3 0x31016fac (OOB_SELECT 3):
+
+        O = inst_offset + soffset + (offen ? vaddr : 0)        one byte offset, nothing truncated
+        dword i = data at base + O + 4*i (byte exact) if O + 4*i + 4 <= NUM_RECORDS, else 0 (and not read)
+
+    Each case is a one-thread compute program written by hand around one buffer_load (row names of the oracle's
+    model in the comments; rule in docs/design.md, Buffer bounds checking). It runs in spirv_mini_interp with a
+    memory whose every byte address holds the dword starting there; the test asserts the words stored and the
+    exact addresses loaded. Since 2e8101b the interpreter raises on a PhysicalStorageBuffer access that is not
+    4-byte aligned (undefined under the translator's Aligned 4), so a row that loads at an unaligned O sets
+    base_low to make base + O aligned: the bound sees only O, so the measured O / NUM_RECORDS pairs are kept, but
+    byte-exact data at an unaligned address is no longer checked here. The last tests pin paths the measurement did not cover and that keep their old check
+    of the first byte: structured buffers, idxen and stores (format loads share that check too; the
+    interpreter does not run their decode).
+    """
+
+    def run_program(self, load_lines, n, *, nr, base_low=0, word1=0, word3=0x31016FAC, offset=0, extra=()):
+        lines = ["v_cmpx_eq_u32_e32 0, v0",
+                 f"s_mov_b32 s4, {VEC_REGION + base_low:#x}", f"s_mov_b32 s5, {word1:#x}",
+                 f"s_mov_b32 s6, {nr:#x}", f"s_mov_b32 s7, {word3:#x}",
+                 f"v_mov_b32 v1, {offset:#x}", *extra, *load_lines, "s_waitcnt vmcnt(0)"]
+        lines += [f"buffer_store_dword v{2 + i}, off, s[0:3], 0 offset:{4 * i}" for i in range(n)]
+        lines.append("s_endpgm")
+        spv = support.translate_lines("cs_vec_tail", lines, fssm=CS_BOUNDS_FSSM)
+        memory = ReadLog({VEC_REGION + k: _pattern_word(k - base_low) for k in range(-4, 0x40)})
+        support.run_fragment(spv, inputs={"%wg_id": (0, 0, 0), "%local_id": (0, 0, 0)},
+                             push_constants=[0, 0, 0x100, 0] + [0] * 28, memory=memory)
+        words = [dict.get(memory, 4 * i) for i in range(n)]
+        return words, [a - VEC_REGION - base_low for a in memory.reads]
+
+    def check(self, line, n, want, **kw):
+        """want: per dword, the byte offset O + 4*i whose data it holds, or None for 0 (and no load)."""
+        words, reads = self.run_program([line], n, **kw)
+        self.assertEqual([f"{w:#010x}" for w in words],
+                         [f"{0 if o is None else _pattern_word(o):#010x}" for o in want], line)
+        self.assertEqual([hex(r) for r in reads], [hex(o) for o in want if o is not None], line)
+
+    def test_single_dword_needs_all_four_bytes(self):
+        # vx1-k0[1], lane 15: offset 0xf, NR 18 -> 0 (a start-only check, 0xf < 18, would read)
+        self.check("buffer_load_dword v2, v1, s[4:7], 0 offen", 1, [None], nr=18, offset=0xF)
+        # offset 0xe, NR 18: bytes 0xe..0x11 fit -> data (base_low 2: base + O aligned, see the class docstring)
+        self.check("buffer_load_dword v2, v1, s[4:7], 0 offen", 1, [0xE], nr=18, offset=0xE, base_low=2)
+
+    def test_multi_dword_load_is_bounded_per_dword(self):
+        # vx4a-k0[4..7], lane 3: x4 at offset 3, NR 18 -> d0..d2 data, d3 (bytes 15..18) 0
+        # (base_low here and below makes base + O aligned for the interpreter, see the class docstring)
+        self.check("buffer_load_dwordx4 v[2:5], v1, s[4:7], 0 offen", 4, [3, 7, 0xB, None], nr=18, offset=3,
+                   base_low=1)
+        # lane 2: d3 = bytes 14..17 fits -> all four data
+        self.check("buffer_load_dwordx4 v[2:5], v1, s[4:7], 0 offen", 4, [2, 6, 0xA, 0xE], nr=18, offset=2,
+                   base_low=2)
+        # vmix2-k0[4..7]: x4 off offset:13, NR 20 -> data, 0, 0, 0
+        self.check("buffer_load_dwordx4 v[2:5], off, s[4:7], 0 offset:13", 4, [13, None, None, None], nr=20,
+                   base_low=3)
+        # x2 at 8, NR 0xe: d0 data, d1 0
+        self.check("buffer_load_dwordx2 v[2:3], v1, s[4:7], 0 offen", 2, [8, None], nr=0xE, offset=8)
+
+    def test_offsets_are_summed_before_the_check(self):
+        # vx1-k*[7..13] style: soffset 3 + inst_offset 2 + vaddr 0xb = 0x10; NR 0x16 -> x2: data, 0
+        self.check("buffer_load_dwordx2 v[2:3], v1, s[4:7], s8 offen offset:2", 2, [0x10, None],
+                   nr=0x16, offset=0xB, extra=("s_mov_b32 s8, 3",))
+
+    def test_base_low_bits_kept_in_the_address_not_in_the_bound(self):
+        # vx4a-k3[4], [7] measured base & 3 = 3 with x4 at offset 3, NR 18 -> d0..d2 data at base + 3.., d3 0.
+        # Stand-in at offset 5 so that base + O is aligned for the interpreter (class docstring): d0..d2 data,
+        # d3 (bytes 0x11..0x14) 0; a bound that added base & 3 would also zero d2 (3 + 5 + 8 + 4 = 0x14 > 18).
+        self.check("buffer_load_dwordx4 v[2:5], v1, s[4:7], 0 offen", 4, [5, 9, 0xD, None],
+                   nr=18, offset=5, base_low=3)
+
+    def test_num_records_zero_reads_nothing(self):
+        self.check("buffer_load_dwordx4 v[2:5], v1, s[4:7], 0 offen", 4, [None] * 4, nr=0, offset=0)
+
+    # Not measured; these keep the check of the first byte they had before.
+    def test_structured_buffer_keeps_its_first_byte_check(self):
+        # stride 4, NR 2 (8 bytes): x4 at offset 4 starts inside, so all four dwords are loaded
+        self.check("buffer_load_dwordx4 v[2:5], v1, s[4:7], 0 offen", 4, [4, 8, 0xC, 0x10],
+                   nr=2, offset=4, word1=4 << 16)
+
+    def test_idxen_keeps_its_first_byte_check(self):
+        # stride 0, idxen with index 0 and offset:0xc, NR 0xe: offset 0xc < 0xe, so both dwords are loaded
+        self.check("buffer_load_dwordx2 v[2:3], v1, s[4:7], 0 idxen offset:12", 2, [0xC, 0x10], nr=0xE, offset=0)
+
+    def test_store_keeps_its_first_byte_check(self):
+        lines = ["v_cmpx_eq_u32_e32 0, v0", f"s_mov_b32 s4, {VEC_REGION:#x}", "s_mov_b32 s5, 0",
+                 "s_mov_b32 s6, 0xe", "s_mov_b32 s7, 0x31016fac", "v_mov_b32 v1, 0xc",
+                 "v_mov_b32 v2, 0x11111111", "v_mov_b32 v3, 0x22222222",
+                 "buffer_store_dwordx2 v[2:3], v1, s[4:7], 0 offen", "s_endpgm"]
+        spv = support.translate_lines("cs_vec_store", lines, fssm=CS_BOUNDS_FSSM)
+        memory = {}
+        support.run_fragment(spv, inputs={"%wg_id": (0, 0, 0), "%local_id": (0, 0, 0)},
+                             push_constants=[0, 0, 0x100, 0] + [0] * 28, memory=memory)
+        self.assertEqual(memory, {VEC_REGION + 0xC: 0x11111111, VEC_REGION + 0x10: 0x22222222})
+
+
+class MeasuredBoundsShaders(unittest.TestCase):
+    """The four GPU tests of the measured SMEM / raw MUBUF rules (runtime/test/shaders/cs_smem_bounds.asm,
+    cs_smem_stride_align.asm, cs_smem_sload_neg.asm, cs_buf_tail.asm), run here in the interpreter on a 256-byte
+    heap filled with 0xee like vk_compute_test's. The words are the ones derived in each .asm header."""
+
+    WANT = {
+        "cs_smem_bounds": [0, 0x5EED0010, 0x5EED000C, 0, 0x5EED000C, 0x5EED0010, 0, 0],
+        "cs_smem_stride_align": [0x5EED0010, 0, 0, 0x5EED0000, 0x5EED0000, 0x5EED0000, 0x5EED0000, 0x5EED0004],
+        "cs_smem_sload_neg": [0x5EED0004, 0x5EED0000, 0x5EED0004, 0x5EED0004, 0x5EED0008, 0x5EED000C,
+                              0xEEEEEEEE, 0xEEEEEEEE],
+        "cs_buf_tail": [0, 0x5EED000C, 0x5EED0008, 0x5EED000C, 0, 0, 0x5EED0010, 0],
+    }
+
+    def test_words(self):
+        for name, want in self.WANT.items():
+            with self.subTest(shader=name):
+                spv = support.translate_fixture(name, fssm=CS_BOUNDS_FSSM)
+                memory = {a: 0xEEEEEEEE for a in range(0, 0x100, 4)}
+                support.run_fragment(spv, inputs={"%wg_id": (0, 0, 0), "%local_id": (0, 0, 0)},
+                                     push_constants=[0, 0, 0xFFFFFFFF, 0] + [0] * 28, memory=memory)
+                self.assertEqual([f"{memory[4 * i]:#010x}" for i in range(8)], [f"{w:#010x}" for w in want])
+                self.assertEqual(set(memory), set(range(0, 0x100, 4)), "nothing written outside the heap")
 
 
 if __name__ == "__main__":

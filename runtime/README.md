@@ -43,6 +43,9 @@ code from the mapped images runs. TLS reserves its module index through the runt
 callbacks and each DLL's `DllMain(DLL_PROCESS_ATTACH)`, dependencies first. An EXE's entry point is not
 run.
 
+`--dry-run`, `--init` and `--run` are separate modes: give exactly one. Two together (`--dry-run --run`)
+print the usage and exit 2 before anything is mapped.
+
 The report line is:
 
 ```
@@ -122,7 +125,8 @@ Current limits, by design:
 
 `shims/registry.cpp` holds the static tables. The current shims are:
 
-- `xmem.dll` — `XMemAlloc`, `XMemFree`, `XMemGetWorkingSetStatistics`, and the measured three-argument
+- `xmem.dll` — `XMemAlloc`, `XMemFree`, the measured two-argument `XMemGetWorkingSetStatistics(kind, out)`, and the
+  measured three-argument
   `XMemVirtualQuery(process, address, out)`. Allocations are 64-byte aligned; the working-set and
   virtual-query outputs fill the observed 64-byte structures and return `FALSE`/`0` on a null or bad
   address.
@@ -134,6 +138,13 @@ Current limits, by design:
   Vulkan SDK and Python 3. The Vulkan device covers command submission, descriptor heaps, render-target and
   depth views, committed resources and copies (uploads, readbacks, BC textures); see `docs/d3d12_vulkan.md`
   section 3.2 for what is missing.
+
+- `gameinput.dll` / `xgameruntime.dll` — `GameInputCreate`: the v0 GameInput API for gamepads on SDL3
+  (`shims/gameinput.cpp`), so any controller SDL supports works, with rumble, Xbox trigger rumble, and on a
+  DualSense adaptive-trigger effects and the lightbar. Optional and CMake-only: built when an installed SDL3 is found,
+  or with `-DLEONIDA_SDL3_FETCH=ON` to download the pinned release; nothing is downloaded otherwise, and the
+  `scripts/build_runtime.ps1` cl.exe fallback never builds it. See [docs/gameinput.md](../docs/gameinput.md) for the mapping, the `LEONIDA_DS_*` settings and what is
+  unverified.
 
 The two serializer functions and `D3D12XboxCreateDevice` are the only `d3d12_xs` imports used by the
 shipped DLLs (measured; see `docs/design.md` and `docs/d3d12_vulkan.md`). The game executable's own
@@ -148,8 +159,9 @@ ctest --test-dir runtime/build -C RelWithDebInfo --output-on-failure
 ```
 
 On Windows the build configures the CPU tests that do not need a GPU or game files, including the
-root-signature forwarding test (`root_sig_test`) and the clear-command test. The Vulkan tools are built
-when the Vulkan SDK is found:
+root-signature forwarding test (`root_sig_test`) and the clear-command test. The Vulkan tools and
+D3D12-over-Vulkan COM targets are built when Vulkan headers are found (via `VULKAN_SDK`, an installed
+SDK, or `-DLEONIDA_VULKAN_HEADERS_FETCH=ON` to download the pinned Khronos Vulkan-Headers release):
 
 - `vk_harness` — hand-written RDNA2 shader programs on a real Vulkan device.
 - `vk_texture_test`, `vk_compute_test`, `vk_store_test` — texture, LDS/compute, and buffer-store paths.
@@ -162,6 +174,11 @@ when the Vulkan SDK is found:
   names and skips modules larger than the limit, which is how the corpus run works around the
   driver's compile time on multi-megabyte ray-tracing shaders. The measured partial pass is in
   [docs/pipeline_check.md](../docs/pipeline_check.md).
+
+`gameinput_test` (only with SDL3; otherwise CTest lists `gameinput` as not run) drives the GameInput shim on SDL virtual joysticks (no controller needed): enumeration, readings
+and the button/axis mapping, rumble and trigger rumble, DualSense effect bytes, a dispatcher, and hot-plug.
+`gameinput_probe [--seconds N] [--rumble]` is the manual check on a real pad: it prints live readings and plays each
+motor and trigger.
 
 `unimplemented_policy_test` builds a small image whose two imports bind to nothing and checks `log`, `fail` and
 `stop` on it: return values, untouched out parameter, xmm0 = 0, environment parsing, and (in a child process) the
@@ -187,6 +204,21 @@ in [docs/design.md](../docs/design.md), and the differential-validation design i
 work.
 
 No game data, keys, or extracted assets belong in this directory or in the repository.
+
+### First-boot D3D12 trace
+
+On a Vulkan-enabled build, select the Vulkan backend to trace device, command-list and queue calls handled
+by Leonida. Put `--trace-d3d12` before the separator for game arguments.
+
+```powershell
+$env:LEONIDA_D3D12 = 'vulkan'
+.\runtime\build\gta6rt.exe --run $gameExe --trace-d3d12 2>&1 |
+    Select-String '^\[d3d12-trace\]'
+```
+
+Each trace line contains a sequence number, a fixed API name and an outcome. `called` marks a void API call
+whose validation may be deferred. `ok`, `failed` and `unsupported` report known results. `ignored` marks a no-op.
+Share only the lines prefixed with `[d3d12-trace]`. Other runtime diagnostics are separate.
 
 ### Typed clear regression
 
@@ -218,3 +250,16 @@ $env:VK_VALIDATION_VALIDATE_SYNC = '1'
 ```
 
 RGBA8 typeless RTV clears support explicit UNORM/SRGB/UINT views of 2D mip slices and contiguous array-layer ranges, with sample count 1. Other format families, typed-resource casts, MSAA and 3D views are not expanded.
+
+### Resource descriptions
+
+`d3d12_resource_desc_test` creates the same committed and reserved resources on the Vulkan-backed device and on
+Windows D3D12 (the default adapter and WARP, whichever exist) and compares every field of `ID3D12Resource::GetDesc`:
+the `Alignment` and `MipLevels` a description left at 0 must read back as the host fills them in. A description the
+host refuses is skipped, and one only the layer refuses (1D textures today) is listed and not compared. It needs a
+Vulkan GPU and runs explicitly.
+
+```powershell
+$env:LEONIDA_VK_VALIDATION = '1'
+.\runtime\build\RelWithDebInfo\d3d12_resource_desc_test.exe
+```

@@ -5,6 +5,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import tracemalloc
 import unittest
 from unittest.mock import patch
 
@@ -27,6 +28,24 @@ def make_record(config_id, duration_ms, hash_a=0x11111111, hash_b=0x22222222, ta
     b[20:24] = b"\x00\x00\x02\x23"
     b[24:24 + len(tail)] = tail
     return bytes(b)
+
+
+def write_parts(tmp, parts):
+    """Write `parts` as 00.bin, 01.bin, ... so name order is part order."""
+    for i, data in enumerate(parts):
+        with open(os.path.join(tmp, f"{i:02d}.bin"), "wb") as f:
+            f.write(data)
+
+
+def located(rows):
+    return [(row["file"], row["file_offset"]) for row in rows]
+
+
+def without_location(rows):
+    return [{k: v for k, v in row.items() if k not in ("file", "file_offset")} for row in rows]
+
+
+BLOCKS = (1, 3, 24, 25, 46, 64, A.JOIN_BLOCK_BYTES)
 
 
 class TestHash(unittest.TestCase):
@@ -109,7 +128,93 @@ class TestScan(unittest.TestCase):
                 with open(os.path.join(tmp, filename), "wb") as f:
                     f.write(data)
             rows = A.collect(tmp, join=True)
-        self.assertEqual([(row["offset"], row["file"]) for row in rows], [(4, name)])
+        self.assertEqual([(row["offset"], row["file"], row["file_offset"]) for row in rows],
+                         [(4, name, 0)])
+
+
+class TestJoin(unittest.TestCase):
+    def assert_every_split(self, stream, markers, blocks=BLOCKS):
+        """Split `stream` at every byte, alone and between empty parts; check both coordinates."""
+        want = A.scan(stream)
+        self.assertEqual([row["offset"] for row in want], markers)
+        for split in range(len(stream) + 1):
+            a, b = stream[:split], stream[split:]
+            for parts, first, second in (((a, b), 0, 1), ((b"", a, b"", b, b""), 1, 3)):
+                expected = [(f"{first:02d}.bin", m) if m < split else (f"{second:02d}.bin", m - split)
+                            for m in markers]
+                with tempfile.TemporaryDirectory() as tmp:
+                    write_parts(tmp, parts)
+                    for block in blocks:
+                        with self.subTest(split=split, parts=len(parts), block=block), \
+                                patch.object(A, "JOIN_BLOCK_BYTES", block):
+                            rows = A.collect(tmp, join=True)
+                            self.assertEqual(without_location(rows), want)
+                            self.assertEqual(located(rows), expected)
+
+    def test_every_split_of_junk_adjacent_records_and_gap(self):
+        stream = (b"\x0c\x01junk" + make_record(0x10, 100_000) + make_record(0x11, 200_000)
+                  + b"\x00" * 7 + make_record(0x12, 300_000))
+        self.assert_every_split(stream, [10, 56, 109])
+
+    def test_lookalikes_and_skip_window_at_every_split(self):
+        real = make_record(0x30, 120_000)
+        bad2, bad3 = bytearray(real), bytearray(real)
+        bad2[9] = 0xFF
+        bad3[22] = 0xFF
+        near = (b"\x00" * 4 + bytes(bad2) + bytes(bad3) + make_record(0x31, 1_000)
+                + b"\x0c\x02" + real)
+        self.assert_every_split(near, [len(near) - 42], (1, A.JOIN_BLOCK_BYTES))
+        # A valid record whose duration starts in the previous record's tail lies inside the
+        # 46-byte step, so it is skipped in every layout, as in scan().
+        hidden = make_record(0x41, 150_000)
+        self.assertEqual(len(A.scan(hidden)), 1)
+        skip = b"\x00" * 4 + make_record(0x40, 150_000, tail=b"\x00" * 18 + hidden[:4]) + hidden[4:]
+        self.assert_every_split(skip, [8], (1, A.JOIN_BLOCK_BYTES))
+
+    def test_marker_needs_twenty_following_bytes_and_tiny_parts(self):
+        record = make_record(0x20, 150_000)
+        short = b"\x00" * 4 + record[:24]          # marker at 8, then exactly 20 bytes
+        self.assertEqual(A.scan(short), [])
+        self.assertEqual(len(A.scan(short + b"\x00")), 1)
+        cases = (((short,), []),
+                 ((short, b"", b"", b"\x00"), [("00.bin", 8)]),
+                 ((record[:1], record[1:2], record[2:3], record[3:]), [("03.bin", 1)]),
+                 ((record[:5], record[5:]), [("00.bin", 4)]),
+                 ((b"", record[:2], record[2:]), [("02.bin", 2)]))
+        for parts, expected in cases:
+            with self.subTest(sizes=[len(p) for p in parts]), tempfile.TemporaryDirectory() as tmp:
+                write_parts(tmp, parts)
+                self.assertEqual(located(A.collect(tmp, join=True)), expected)
+
+    def test_non_joined_offsets_are_local_and_join_handles_no_parts(self):
+        record = make_record(0x50, 100_000)
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(A.collect(tmp, join=True), [])
+            write_parts(tmp, (b"\x00" * 10, b"\x00" * 3 + record))
+            with open(os.path.join(tmp, "zz.txt"), "wb") as f:
+                f.write(b"\x00" * 4 + record)
+            for src, join, offset in ((tmp, False, 7), (tmp, True, 17),
+                                      (os.path.join(tmp, "01.bin"), False, 7)):
+                with self.subTest(src=os.path.basename(src), join=join):
+                    rows = A.collect(src, join=join)
+                    self.assertEqual([(r["file"], r["offset"], r["file_offset"]) for r in rows],
+                                     [("01.bin", offset, 7)])
+
+    def test_join_memory_is_bounded_by_the_read_block(self):
+        record = make_record(0x70, 100_000)
+        stream = (b"\x00" * ((1 << 19) - 23) + record) * 8    # 4 MiB, records straddle parts
+        with tempfile.TemporaryDirectory() as tmp:
+            write_parts(tmp, [stream[i:i + (1 << 19)] for i in range(0, len(stream), 1 << 19)])
+            tracemalloc.start()
+            try:
+                with patch.object(A, "JOIN_BLOCK_BYTES", 1 << 16):
+                    rows = A.collect(tmp, join=True)
+                peak = tracemalloc.get_traced_memory()[1]
+            finally:
+                tracemalloc.stop()
+        self.assertEqual(without_location(rows), A.scan(stream))
+        self.assertEqual(len(rows), 8)
+        self.assertLess(peak, 1 << 20)
 
 
 class TestCli(unittest.TestCase):
@@ -160,6 +265,56 @@ class TestCli(unittest.TestCase):
             self.assertEqual(doc["summary"]["named"], 1)
             self.assertEqual(doc["records"][0]["name"], name)
             self.assertEqual(doc["records"][0]["stream_id"], hb & A.STREAM_MASK)
+
+    def test_invalid_ms_range_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            blob = os.path.join(tmp, "00000001.bin")
+            with open(blob, "wb") as f:
+                f.write(b"\x00" * 4 + make_record(0x2000, 123_456))
+            for extra in (["--min-ms", "0"], ["--min-ms", "-5"], ["--min-ms", "50000", "--max-ms", "10000"]):
+                with self.subTest(extra=extra):
+                    p = subprocess.run([sys.executable, "-I", TOOL, blob, *extra],
+                                       capture_output=True, text=True)
+                    self.assertEqual(p.returncode, 2)
+                    self.assertIn("require 1 <= min-ms <= max-ms", p.stderr)
+                    self.assertEqual(p.stdout, "")
+
+    def test_join_rejected_on_single_file_and_allowed_on_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            blob = os.path.join(tmp, "00000001.bin")
+            with open(blob, "wb") as f:
+                f.write(b"\x00" * 4 + make_record(0x2000, 123_456))
+            p_file = subprocess.run([sys.executable, "-I", TOOL, blob, "--join"],
+                                    capture_output=True, text=True)
+            self.assertEqual(p_file.returncode, 2)
+            self.assertIn("--join applies to a directory, not a single file", p_file.stderr)
+            self.assertEqual(p_file.stdout, "")
+
+            p_dir = subprocess.run([sys.executable, "-I", TOOL, tmp, "--join", "--json"],
+                                   capture_output=True, text=True)
+            self.assertEqual(p_dir.returncode, 0, p_dir.stderr)
+            self.assertEqual(json.loads(p_dir.stdout)["summary"]["records"], 1)
+
+    def test_join_text_uses_local_offsets_and_json_keeps_global_ones(self):
+        first, second = make_record(0x64, 100_000), make_record(0x65, 200_000)
+        with tempfile.TemporaryDirectory() as tmp:
+            for name, data in (("first.bin", b"\x00" * 128 + first[:4]),
+                               ("middle.bin", first[4:] + b"\x00" * 40 + second)):
+                with open(os.path.join(tmp, name), "wb") as f:
+                    f.write(data)
+            text = subprocess.run([sys.executable, "-I", TOOL, tmp, "--join"],
+                                  capture_output=True, text=True)
+            doc = subprocess.run([sys.executable, "-I", TOOL, tmp, "--join", "--json"],
+                                 capture_output=True, text=True)
+        self.assertEqual(text.returncode, 0, text.stderr)
+        self.assertEqual(text.stdout.splitlines(), [
+            "middle.bin:     0  id=0x0064  dur=  100.000s  stream=0x02222222  0x22222222",
+            "middle.bin:    86  id=0x0065  dur=  200.000s  stream=0x02222222  0x22222222",
+            "2 records, 2 distinct ids, ids 0x0064-0x0065, 300.0 s total"])
+        self.assertEqual(doc.returncode, 0, doc.stderr)
+        rows = json.loads(doc.stdout)["records"]
+        self.assertEqual([(r["file"], r["offset"], r["file_offset"]) for r in rows],
+                         [("middle.bin", 132, 0), ("middle.bin", 218, 86)])
 
 
 if __name__ == "__main__":

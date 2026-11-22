@@ -71,9 +71,9 @@ GFX10_TO_DXGI = {
     27: 36,
     28: 38,
     29: 34,
-    43: 26,
-    44: 24,
-    48: 25,
+    36: 26,
+    50: 24,
+    54: 25,
     56: 28,
     57: 31,
     60: 30,
@@ -554,6 +554,7 @@ D3D10_RESOURCE_MISC_TEXTURECUBE = 0x4
 
 
 def dds_header(w, h, depth=1, mips=1, fmt=28, is_cube=False, linear_size=0, array_size=1):
+    """Build a DX10 DDS header; array_size counts cubes, not faces, for cubemaps."""
     hdr = bytearray(128)
     hdr[0:4] = b"DDS "
     flags = DDSD_CAPS | DDSD_HEIGHT | DDSD_WIDTH | DDSD_PIXELFORMAT
@@ -584,8 +585,7 @@ def dds_header(w, h, depth=1, mips=1, fmt=28, is_cube=False, linear_size=0, arra
 
     dim = D3D10_RESOURCE_DIMENSION_TEXTURE3D if depth > 1 else D3D10_RESOURCE_DIMENSION_TEXTURE2D
     misc = D3D10_RESOURCE_MISC_TEXTURECUBE if is_cube else 0
-    dx10_array = 6 if (is_cube and array_size == 1) else array_size
-    dxt10 = struct.pack("<IIIII", fmt, dim, misc, dx10_array, 0)
+    dxt10 = struct.pack("<IIIII", fmt, dim, misc, array_size, 0)
     return bytes(hdr) + dxt10
 
 
@@ -726,6 +726,9 @@ def main():
         print(f"{arch}: {len(t)} texture headers", flush=True)
         allt += t
     path = a.out or os.path.join(a.carve, "textures_index.json")
+    parent = os.path.dirname(os.path.abspath(path))
+    if parent:      # the scan is already done; a missing folder used to lose it in a FileNotFoundError
+        os.makedirs(parent, exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(allt, f)
     print(f"{len(allt)} textures -> {path}")

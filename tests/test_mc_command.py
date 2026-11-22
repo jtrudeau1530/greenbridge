@@ -47,6 +47,15 @@ class SplitCommandTest(unittest.TestCase):
             self.assertEqual(mc_command.split_command(path), [path])
             self.assertEqual(mc_command.split_command(f'"{path}"'), [path])
 
+    def test_unbalanced_quote_is_one_clear_error(self):
+        raw = '"unterminated --version'
+        for platform in ("nt", "posix"):
+            with self.subTest(platform=platform), mock.patch.object(mc_command.os, "name", platform):
+                with self.assertRaises(SystemExit) as ctx:
+                    mc_command.split_command(raw)
+                self.assertIn("LLVM_MC", str(ctx.exception))
+                self.assertIn("unterminated", str(ctx.exception))
+
     def test_mc_command_reads_the_environment(self):
         with mock.patch.dict(os.environ, {"LLVM_MC": "wsl -d Ubuntu -e /opt/llvm-21/bin/llvm-mc"}):
             self.assertEqual(mc_command.mc_command(),

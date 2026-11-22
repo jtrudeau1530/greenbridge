@@ -86,7 +86,9 @@ Two observations matter for a decoder:
 
 Top page-count values: 1 (1,883), 2 (7,571), 3 (9,241), 4 (2,022), 19–26 (1,592). The largest sampled page
 (5,636,096 bytes) is 94.6% zero bytes, with sparse pointers. That is a page directory/relocation table, not
-keyframe data. The marker is reported as a page marker, not as a known GTA V resource magic.
+keyframe data. The marker is reported as a page marker, not as a known GTA V resource magic. Each `0DRP` stream is
+the first system page of a resource; the page map at the `+0x08` pointer gives its page count (see
+[Keyframe decoding](#keyframe-decoding)).
 
 ### `MoVE` container
 
@@ -117,7 +119,9 @@ hold 711,536 inflated bytes and 2,298 distinct paths:
 | `.motion` | 12 |
 
 Paths are padded to 16-byte boundaries. The records include a 32-bit name hash; a second 32-bit value recurs as
-`0x98e1750c` in some tables, but its meaning is not established. The name hash is **joaat32 of the path stem**:
+`0x98e1750c` in some tables. It is `joaat32("bonerotation")`, the track-type hash of rotation tracks (see
+[Keyframe decoding](#keyframe-decoding)); these tables are second system pages of clip dictionaries. The name hash
+is **joaat32 of the path stem**:
 strip `pack:/`, strip the final extension, lowercase. In one 161-name table all 161 hashes matched exactly;
 across the 273 tables, 3,229 of 3,637 name occurrences (88.8%) and 248 of 273 tables matched every name. The
 remaining 11.2% are not explained (duplicate names, missing records or a different record layout). A separate scan of the first 4 KiB of the 130,449 `rpf9_carve` streams found 7,661 distinct
@@ -166,7 +170,9 @@ describes `PSIN` as PSO metadata, and these bytes do not show that it is animati
 The leading u32 is 2 or 3; the next four bytes are constant. Stored 18,168,950 bytes, inflated 32,691,776 bytes.
 1,767 distinct payloads (duplicates up to 10 copies). Entropy 4.03–7.79 bits/byte, so these are packed/quantized
 bitstreams rather than zlib streams. The 24-byte header has five small fields after the type; the measured
-version split and the track side are below. No keyframe values are claimed.
+version split and the track side are below. No keyframe values are claimed. Each of these streams is the second
+system page of a `0DRP` resource, the one right after its `0DRP` stream (see [Keyframe
+decoding](#keyframe-decoding)).
 
 ### Partial clip decode
 
@@ -205,7 +211,8 @@ Header fields measured over the 1,781 streams:
 **Still missing:** the page → packed-stream join. None of the 1,781 streams contains any of the 30 known bone
 hashes or the nine tested clip-name hashes, as 32-bit or 64-bit values; only the shared track-type hash
 `0x9A7B6E6D` crosses over. The track records and quantization-like blocks are visible, but the exact component
-count/order/delta coding did not survive a unit-quaternion norm test. No keyframe value is claimed.
+count/order/delta coding did not survive a unit-quaternion norm test. No keyframe value is claimed for these
+`0DRP` pages. The clip dictionaries' keyframes are decoded in [Keyframe decoding](#keyframe-decoding).
 
 ### Tail `RBF0` rig-set manager
 
@@ -279,8 +286,9 @@ Mapping to the name tables:
   **401** stay unresolved. By occurrence, 3,229 of 3,637 (88.8%) match, and 248 of 273 name tables are complete.
 - The RBF0 names do **not** overlap the clip/anim/motion namespace: direct name overlap is 0 and stem-hash
   overlap with the 2,298 paths is 0.
-- None of the 4,795 RBF0 names stores its joaat32 anywhere in the blob (0 matches); the rig-set and rig keys are
-  name strings, not a hash table. A decoder must carry the names forward.
+- The RBF0 table contains 4,795 distinct rig and rig-set names. An earlier version of the indexer reported
+  zero stored joaat32 matches for every input. The count for this corpus needs to be measured again with the
+  corrected `--rigs` report. A match indicates that the four hash bytes occur somewhere in the blob.
 
 ### Bone tables and motion matchers
 
@@ -329,6 +337,194 @@ At stream starts across the 130,449 `rpf9_carve` streams, the counts of `YCD`, `
 starts with `RBF0`; the rest start inside the same blob. One three-byte `YDD` sequence occurs at +0xE1 inside a
 high-entropy stream; it is not at a header boundary and is treated as coincidence, not as a YDD file.
 
+## Keyframe decoding
+
+`tools/anim_clips.py` decodes the clip dictionaries down to per-frame track values. It starts from the same stream
+walk as `anim_index.py`, so the stream numbers below are the corrected walk's 130,470. Run on the 1.0.2.1 copy:
+
+```powershell
+python -I tools/anim_clips.py <package>\anim.rpf <work>\anim-clips.json --jobs 8
+python -I tools/anim_clips.py <package>\anim.rpf --decode <dictionary offset> [--frames N]   # values to stdout
+```
+
+The JSON holds counts and one row per dictionary (offset, hash and counts, plus the name read from your copy).
+It holds no values. `--decode` prints one dictionary with its decoded values and writes no file.
+
+Provenance: channel types 0–8 follow the GTA V `crAnimation` channel set, as named by community tools such as
+CodeWalker's YCD reader (static, quantized, indirect-quantized and cached-quaternion channels). No code was taken
+from them. The resource framing, the GTA VI-only channel type 10, the type 3 and type 8 rules below and every
+count in this section were measured on the local copy.
+
+### Clip dictionaries are RAGE resources
+
+A clip dictionary is a system-only RAGE resource. Its **root stream** is one of the `starts with 8 zero bytes`
+streams above:
+
+```
++0x00  8 zero bytes
++0x08  u64 page-map pointer (0x50xxxxxx)
++0x10  zero up to +0x38
+```
+
+At the page map, the byte at +8 is the number of system pages and the byte at +9 the number of graphics pages.
+Every dictionary has 1 or 2 system pages and no graphics pages. Its pages are that many back-to-back streams,
+each 16-byte aligned after the one before it. Join them, and a pointer `p` is the offset `p - 0x50000000` into
+the joined bytes.
+
+Measured: 61,510 root streams. 61,474 join into resources: 35,750 with one system page and 25,724 with two. In 36
+roots the page map says two pages, but the next stream does not start where the first one ends (16-byte aligned).
+Where their second page is was not found; these roots are counted as unresolved, not joined by guesswork. Of the
+joined resources, 61,469 are clip dictionaries. 4 have `RIG` plus a version at +0x70 instead of a pack array (rig
+dictionaries, not decoded here), and 1 has some other value there. Together the dictionaries use 87,198 streams
+(3,799,425,432 stored / 7,072,304,832 inflated bytes). By `anim_index.py` class those streams are: zero-prefix
+66,079, raw 20,845, name-table 273, skeleton-names 1.
+
+The other classes fit the same framing:
+
+- **The 273 `pack:/` name tables** at the start of a stream are the second system page of a clip dictionary. All
+  273 sit inside dictionaries.
+- **The `0DRP` (version 122) streams** are a different resource kind with the same page map. Their system pages are
+  one stream in 2,892 resources and two in 19,931. In 19,909 of the two-page ones the second page is the next stream;
+  in the other 22 it is not. Their second pages include all 1,781 "2/3 packed clip streams" and all 1,371 type-hash
+  streams. So those classes are not stand-alone clip payloads: each one is the page right after a `0DRP` stream in
+  the same resource. The `0DRP` root objects are not decoded here. Neither are the 324 `MoVE` streams, which are not
+  pages of either kind.
+
+### Objects
+
+All offsets are page offsets. An `atString` is 16 bytes: `{char *ptr; u16 length; u16 capacity}`, or, when byte 15
+has bit 7 set, up to 15 characters stored inline with `byte 15 & 0x7F` as the length (909 clip names and 3 dictionary
+names). An array is `{T *ptr; u16 count; u16 capacity}`, and an `atMap` is `{Entry **buckets; u32 bucket count (11);
+u32; u32 count}` with `Entry {u64 key; T *value; Entry *next}`. Hashes are `joaat32` of the lowercased name.
+
+| Object | Field | Meaning |
+|---|---|---|
+| dictionary (page offset 0) | `+0x38` atString | dictionary name |
+| | `+0x48` atMap | clips; key = `joaat32(dictionary name) << 32 \| clip hash` |
+| | `+0x68` u32 | `joaat32(dictionary name)` (all 61,469 dictionaries) |
+| | `+0x70` array, 16-byte items | `{pack *ptr; u32 pack hash; u32 0}`; a null pointer is a pack outside this resource (hash only) |
+| animation pack | `+0x38` atString | pack name (`<dictionary>-N`) |
+| | `+0x48` atMap | animations, key = `joaat32` of the animation name |
+| | `+0x68` u32 | `joaat32(pack name)` |
+| `.clip` (`+0x20` u32 < 16) | `+0x28` atString | `pack:/<name>.clip` |
+| | `+0x68` pointer | list `{entry *ptr; u16 count; u16 capacity}`, entries 0x38 bytes: `+0` animation pointer, `+8` animation hash, `+0x28`/`+0x2C` start/end (s), `+0x30` rate |
+| | `+0x78` f32 | duration (s) |
+| `.motion` (`+0x20` is a pointer) | `+0x30` atString | `pack:/<name>.motion`; parametric, not decoded |
+| `.motionmatcher` (`+0x20` is a pointer) | `+0x28` 16 bytes, `+0x38` atString | an id, then `pack:/<name>.motionmatcher`; not decoded |
+| animation | `+0x24` u16 | frame count |
+| | `+0x28` f32 | duration = (frames − 1) / fps |
+| | `+0x50` array | sequence pointers |
+| | `+0x60` array, 12-byte items | tracks `{u32 bone hash; u32 track type; u32 format}` |
+
+A clip plays its animations at the same time, each over its own `[start, end]` window. In the samples, the
+animations of one clip covered different bones and could have different frame rates.
+
+**Track types** are `joaat32` of their names. This is the meaning of the recurring `0x98e1750c` noted above:
+
+| Hash | Name | Tracks |
+|---|---|---:|
+| `0x98e1750c` | `bonerotation` | 7,668,345 |
+| `0xf791a95f` | `bonetranslation` | 2,438,782 |
+| `0x2deefadd` | `genericcontrol` | 1,453,479 |
+| `0xf5c3a5b6` | `generictranslation` | 69,798 |
+| `0x6ddef121` | `cameratranslation` | 69,597 |
+| `0x364d3bdb` | `facialtranslation` | 63,394 |
+| `0x7aaa9f60` | `bonescale` | 24,581 |
+| `0xd9ad1a74` | `camerarotation` | 474 |
+| 36 other hashes | not named | 882,064 |
+
+A bone hash is `joaat32` of the lowercased bone name, for example `skel_pelvis`. In one checked rig, 64 of 66
+track bones matched the skeleton's names; bone hash 0 is the whole-body (mover) track. **Formats:** 0 =
+quaternion `(x, y, z, w)`, 2 = vec3, 4 = float (7,929,875, 2,905,236 and 1,823,181 tracks; format 3 is used by 12,222
+tracks and is not mapped).
+
+### Sequences
+
+An animation's frames are split over one or more sequences. Consecutive sequences **share one frame**, so
+`sum(sequence frames) = frames + sequences − 1` (true for 190,922 of 190,922 decoded animations). The repeated frame
+decodes to the same pose on both sides: 813,487 of 814,355 quaternion boundaries are the same rotation (|q₁·q₂| >
+0.9999, so q and −q count as equal), and 696,427 of 708,220 vec3/float boundaries agree within 1e-3. The cause of the
+remaining 0.1% and 1.7% was not investigated.
+
+A sequence is a 0x20-byte header and `length` bytes of data:
+
+| Header | Type | Meaning |
+|---|---|---|
+| `+0x04` | u32 | data length (excluding the header) |
+| `+0x0C` | u32 | frame-data offset in the data |
+| `+0x16` | u16 | frames in this sequence |
+| `+0x18` | u16 | bytes per frame |
+| `+0x1C` | u16 | sum of the type-4 bit widths (true in 212,171 of 212,171 sequences) |
+| `+0x1E` | u8 | 11 (the number of channel types) |
+
+The data holds, in order:
+
+1. **Channel definitions**, grouped by type 0 → 10. They end exactly at the frame-data offset in every decoded
+   sequence.
+2. **Frame data**: `frames × bytes per frame`. Each frame is an LSB-first bit field holding the type-3 values,
+   then the type-4 values, then the type-5 indices, in channel order.
+3. `u16 count[11]`, the number of channels of each type.
+4. 11 lists of `u16 (track << 2 | component)`, one per type, each padded to a multiple of 4 entries. Item `i` of
+   list `t` names the track and component of the `i`-th channel of type `t`.
+
+### Channel types
+
+| Type | Definition | Value | Channels |
+|---|---|---|---:|
+| 0 | 3 × f32 x, y, z | constant quaternion, w = +√(1 − x² − y² − z²) | 3,577,278 |
+| 1 | 3 × f32 | constant vec3 | 2,532,086 |
+| 2 | f32 | constant | 5,424,535 |
+| 3 | none | 32 frame bits = an f32 per frame | 40 |
+| 4 | u32 bits, f32 quantum, f32 offset | `bits` frame bits × quantum + offset | 7,594,553 |
+| 5 | u32 frame bits, u32 value bits, u32 words, f32 quantum, f32 offset, then the table (`words` u32, value-bits entries) | frame bits index the table; entry × quantum + offset | 484,234 |
+| 6 | — | not seen | 0 |
+| 7 | none | rebuilds one quaternion component (below) | 4,939,485 |
+| 8 | none | marks a quaternion with four stored components (below) | 227,467 |
+| 9 | — | not seen | 0 |
+| 10 | variable, see below | second-order delta coding (GTA VI) | 6,832,164 |
+
+**Type 10** (new in this build, and the most common animated channel):
+
+```
+u32 word count (whole channel, header included) | u8 c1, c2, c3, 0 | f32 quantum | f32 offset | bits (LSB-first):
+  nc = ceil(frames / 64) chunks:  nc × c1 bits   chunk payload positions (redundant, for random access)
+                                  nc × c2 bits   chunk start values
+  ceil((frames − 1) / 8) unary width codes: k zero bits then a one = bit width of the next 8 deltas
+  ... padding ...
+  last 8 × c3 u32 words: 8 lanes, interleaved (word w·8 + j belongs to lane j);
+  lane j holds delta j of every 8-delta group, k bits each, low bits first.
+decode, per chunk:  x = start; v = 0
+                    for each of the next 63 frames: v += zigzag(delta); x += v
+                    value = x × quantum + offset;   zigzag(u) = u / 2 for even u, −(u + 1) / 2 for odd u
+```
+
+Integrating a full chunk's 64th delta lands exactly on the next chunk's start value. That holds for
+all 48,114,845 of 48,114,845 chunk boundaries. There is one width code per 8 *deltas*: reading `ceil(frames / 8)`
+codes runs into the lanes.
+
+**Quaternion tracks.** A track with a type-0 channel is a constant `(x, y, z, +√(1 − x² − y² − z²))`. Otherwise
+its components come from scalar channels:
+
+- **Type 7** appears on a track that stores three components (comp 0–2). The missing component is
+  `+√(1 − sum of squares)`, placed at the type-7 channel's comp position, and the stored three fill the other
+positions in order. Measured: 4,939,485 sequence tracks; the largest |x, y, z| overshoot before normalising is
+0.0971.
+- **Type 8** always sits at comp 0 on a track that stores all four components. Nothing is rebuilt; the four values
+  are normalised. Measured: 227,467 sequence tracks; |q| of the four stored values is within 0.0190 of 1.
+
+Static quaternions: 3,577,278, and 0 of them have |x, y, z| > 1. The (x, y, z, w) order and the rebuilt sign fit the
+boundary check above. An earlier local comparison against one skeleton's bind rotations also fits (dot products
+0.97–1.0); that comparison is not part of the tool.
+
+### Coverage
+
+190,922 animations in 52,888 local packs; 190,922 decode with every check above passing and 0 fail (0 skipped by the
+time budget). 8,581 dictionaries have no local pack; dictionaries refer to 27,552 packs by hash only (18,593 distinct
+hashes), and none of those hashes is the hash of one of the 52,888 local packs. Clips: 312,065, of which 17,245 are
+`.motion` and 180 are `.motionmatcher` (`+0x20` is a pointer in both; the name is at `+0x30` for `.motion` and at
+`+0x38` for `.motionmatcher`, after a 16-byte id). Neither of those two kinds is decoded. Sequences: 212,171. A full
+run with `--jobs 44` took 5 min 44 s on 44 cores; the slowest dictionary took 32.7 s.
+
 ## Readable, compressed and still opaque
 
 - **Readable:** all 273 name tables (2,298 paths), the `0DRP` version/page count, 1,371 type-hash headers,
@@ -346,7 +542,7 @@ high-entropy stream; it is not at a header boundary and is treated as coincidenc
   sampled positions.
   No Oodle signature is known from these bytes; none is guessed.
 - **Still opaque:** high-entropy blocks inside `other` and zero-prefixed pages (4 KiB blocks up to 7.96
-  bits/byte), the packed component coding of the 1,781 clip streams, the page → packed-stream join, the
+  bits/byte), the `0DRP` root objects and the packed component coding of their 1,781 clip-stream pages, the
   fields of `MoVE` beyond the version/hash/size words, the 56 empty rig sets, the RBF0 numeric fields, and
   the rig→skeleton link (0 measured matches). Of the 30 bone names, 19 have a confirmed stored hash and 11 do
   not; the four motionmatcher paths bind to embedded tables, but not to an RBF0 rig.
@@ -359,7 +555,7 @@ high-entropy stream; it is not at a header boundary and is treated as coincidenc
 - None of the 1,350 model names occurs in the 8,020 animation paths collected here, and none occurs in the
   `RBF0` rig metadata either. The sampled clip hash `0x25ed0554e58ba1fc` and the recurring `0x98e1750c` are
   absent from all manifest names and integer/string values. A real cross-check needs the full model export
-  (155,598 models per `docs/design.md`) and the rig table.
+  (350,248 models per `docs/design.md`) and the rig table.
 - `common.rpf` is the readable metadata layer. It carved to 781 streams, 710 of them XML-ish. Strict keyword
   occurrences: `clip` 734, `anim` 1,131, `motion` 237, `gesture` 2, `bone` 428 (214 `<Bones>` open/close
   pairs), `ped_` 1,308, `blend` 40; `facial`, `ycd` and `skeleton` 0. The tags include `<AnimData>`,
@@ -390,8 +586,9 @@ above are measured. Treat those two labels as hypotheses until a decoder reads a
   decoded, and the marker is not proven to be animation-specific.
 - `MoVE` is named like motion data; the version, 32-bit hash and payload-size words are mapped, the remaining
   fields are not.
-- The 2/3 streams expose header variants, track arrays and bone masks, but the packed component coding and the
-  page → stream join are not decoded. No keyframe has been decoded.
+- The 2/3 streams expose header variants, track arrays and bone masks. They are the second system pages of `0DRP`
+  resources, whose root objects and packed coding are not decoded. The keyframes of the clip dictionaries are
+  decoded; see [Keyframe decoding](#keyframe-decoding).
 - The `RBF0` rig-set/rig/group entries are parsed. The numeric fields, the schema type table and the
   rig→skeleton reference are not; the measured skeleton match is 0.
 - The three motion matcher streams embed bone tables, but whether those define a full skeleton or only the
@@ -409,11 +606,13 @@ above are measured. Treat those two labels as hypotheses until a decoder reads a
    or an unparsed numeric field, not these pages. Do not infer it from the category names.
 3. **Group streams into resources.** The TOC is encrypted, so use the `0DRP` page header: count at +0x20,
    pointers at +0x08 and +0x28..+0x40, four u16 values at +0x48. The sampled layout places page headers among
-   zero-prefixed pages; a logical resource can span several streams. Do not assume one stream is one file.
+   zero-prefixed pages; a logical resource can span several streams. Do not assume one stream is one file. The
+   page map at the `+0x08` pointer gives the system page count, and that is how `tools/anim_clips.py` joins the
+   clip dictionaries.
 4. **Parse the name/hash tables.** Names are NUL-terminated and 16-byte aligned; the name hash is joaat32 of
    the stem (path without `pack:/` and without the final extension). The record stride varies (16 or 32 bytes in
-   sampled tables), so do not assume one layout. The recurring `0x98e1750c` needs a meaning before it can be
-   used as a type or source id.
+   sampled tables), so do not assume one layout. The recurring `0x98e1750c` is `joaat32("bonerotation")`, a
+   track type.
 5. **Join rigs to clips, then decode a known clip.** Two named clips are already followed to page-0 payloads
    (durations and track arrays above). The missing link is the **page → packed stream**: none of the 1,781
    packed streams contains the 30 known bone hashes or the nine tested clip hashes. Map the track records and
@@ -423,7 +622,7 @@ above are measured. Treat those two labels as hypotheses until a decoder reads a
 6. **Keep the compression boundary explicit.** Outer RPF9 zlib is understood. Do not add a zlib pass inside a
    page without evidence; the sampled pages had no valid nested stream.
 7. **Re-run the model cross-check with the full export.** The current 1,350-model data.rpf manifest has bone
-   bindings but no bone names or hashes. The full 155,598-model export plus the `RBF0` rig table is needed to
+   bindings but no bone names or hashes. The full 350,248-model export plus the `RBF0` rig table is needed to
    match skeletons to models.
 
 ## Reproduction
@@ -435,6 +634,9 @@ python -I tools/rpf9_carve.py <package>\anim.rpf <work>\anim-index --index-only
 # Signature index (CSV or JSON; --limit/--start for a bounded scan)
 python -I tools/anim_index.py <package>\anim.rpf <work>\anim-index.csv
 python -I tools/anim_index.py <work>\anim-carve <work>\anim-index.json
+
+# Keyframe decoding: counts and one row per clip dictionary; --decode prints one dictionary's values
+python -I tools/anim_clips.py <package>\anim.rpf <work>\anim-clips.json --jobs 8
 ```
 
 `tools/anim_index.py` reports `MoVE`, `0DRP`, `pack:/`, `SKEL_`, `RBF0`, `PSIN`, type-hash and 2/3 clip headers,

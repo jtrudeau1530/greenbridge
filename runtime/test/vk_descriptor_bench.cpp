@@ -13,6 +13,7 @@
 //   LEONIDA_VK_VALIDATION=1 enables VK_LAYER_KHRONOS_validation; any validation error fails the run.
 #define VK_NO_PROTOTYPES
 #include "vulkan_loader.h"
+#include "vk_device_pick.h"
 #include "../src/descriptor_table.h"
 
 #include <algorithm>
@@ -27,6 +28,7 @@
 #include <limits>
 #include <map>
 #include <numeric>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -693,6 +695,7 @@ struct TableDataset {
     std::vector<std::uint32_t> keys_buf;          // [T# (t_pow2) | S# (s_pow2) | Miss (t_pow2)] x 8 u32
     std::vector<std::uint32_t> expected_baseline; // per key slot: XOR of 8 key words
     std::vector<std::uint32_t> expected_lookup;   // per key slot: expected bindless index
+    std::vector<std::uint32_t> slot_entry_id;     // per key slot: unique entry index within its bank
 };
 
 bool build_dataset(std::uint32_t entry_count, TableDataset& out) {
@@ -775,8 +778,10 @@ bool build_dataset(std::uint32_t entry_count, TableDataset& out) {
     out.keys_buf.resize(static_cast<std::size_t>(total_slots) * 8u);
     out.expected_baseline.resize(total_slots);
     out.expected_lookup.resize(total_slots);
+    out.slot_entry_id.resize(total_slots);
 
-    const auto store_slot = [&](std::uint32_t slot, const DescriptorKey& key, std::uint32_t expected_idx) {
+    const auto store_slot = [&](std::uint32_t slot, const DescriptorKey& key, std::uint32_t expected_idx,
+                                std::uint32_t entry_id) {
         std::uint32_t xor_mix = 0u;
         for (std::uint32_t j = 0; j < 8u; ++j) {
             out.keys_buf[static_cast<std::size_t>(slot) * 8u + j] = key[j];
@@ -784,15 +789,16 @@ bool build_dataset(std::uint32_t entry_count, TableDataset& out) {
         }
         out.expected_baseline[slot] = xor_mix;
         out.expected_lookup[slot] = expected_idx;
+        out.slot_entry_id[slot] = entry_id;
     };
 
     for (std::uint32_t i = 0; i < out.t_pow2; ++i) {
         const std::uint32_t idx = t_perm[i % out.t_count];
-        store_slot(out.t_base + i, t_keys[idx], 1u + idx);
+        store_slot(out.t_base + i, t_keys[idx], 1u + idx, idx);
     }
     for (std::uint32_t i = 0; i < out.s_pow2; ++i) {
         const std::uint32_t idx = s_perm[i % out.s_count];
-        store_slot(out.s_base + i, s_keys[idx], 1u + out.t_count + idx);
+        store_slot(out.s_base + i, s_keys[idx], 1u + out.t_count + idx, idx);
     }
     std::uint32_t miss_seq = 0u;
     for (std::uint32_t i = 0; i < out.t_pow2; ++i) {
@@ -801,7 +807,7 @@ bool build_dataset(std::uint32_t entry_count, TableDataset& out) {
             mk = make_bench_miss(miss_seq++);
             if (!table.contains(mk) && probe_gpu_table(out.gpu_table, mk).first == 0u) break;
         }
-        store_slot(out.miss_base + i, mk, 0u);
+        store_slot(out.miss_base + i, mk, 0u, i);
     }
     return true;
 }
@@ -810,6 +816,7 @@ struct ScenarioSpec {
     const char* name;
     ShaderKind shader;
     bool divergent;
+    bool group_stride_is_iters;
     std::uint32_t group_stride;
     std::uint32_t lane_stride;
     std::uint32_t iter_stride;
@@ -821,7 +828,7 @@ struct ScenarioSpec {
 PushConstants make_push_constants(const ScenarioSpec& sc, const TableDataset& ds, std::uint32_t iters) {
     PushConstants pc{};
     pc.iters = iters;
-    pc.group_stride = sc.group_stride;
+    pc.group_stride = sc.group_stride_is_iters ? iters : sc.group_stride;
     pc.lane_stride = sc.lane_stride;
     pc.iter_stride = sc.iter_stride;
     pc.base_index = 0u;
@@ -839,6 +846,56 @@ PushConstants make_push_constants(const ScenarioSpec& sc, const TableDataset& ds
     }
     pc.dep_mask = sc.dep_chain ? pc.key_mask : 0u;
     return pc;
+}
+
+std::uint32_t count_unique_keys(const ScenarioSpec& sc, const TableDataset& ds, const PushConstants& pc,
+                                std::uint32_t eff_groups) {
+    const std::uint32_t primary_distinct =
+        (sc.bank == ScenarioSpec::Bank::TSharp) ? ds.t_count
+        : (sc.bank == ScenarioSpec::Bank::SSharp) ? ds.s_count
+                                                  : ds.t_pow2;
+    const std::uint32_t eff_invocations = eff_groups * kWorkgroupSize;
+    if (sc.dep_chain) {
+        if (eff_invocations >= primary_distinct) return primary_distinct;
+        std::vector<std::uint8_t> seen(primary_distinct, 0u);
+        std::uint32_t count = 0u;
+        for (std::uint32_t tid = 0; tid < eff_invocations; ++tid) {
+            const std::uint32_t wg = tid >> 6;
+            const std::uint32_t lid = tid & 63u;
+            const std::uint32_t start = pc.base_index + wg * pc.group_stride + lid * pc.lane_stride;
+            std::uint32_t prev = 0u;
+            for (std::uint32_t i = 0; i < pc.iters; ++i) {
+                const std::uint32_t idx1 = start + i * pc.iter_stride + (prev & pc.dep_mask);
+                const std::uint32_t kidx = pc.t_base + (idx1 & pc.key_mask);
+                const std::uint32_t eid = ds.slot_entry_id[kidx];
+                if (!seen[eid]) {
+                    seen[eid] = 1u;
+                    ++count;
+                }
+                prev = ds.expected_lookup[kidx];
+            }
+        }
+        return count;
+    }
+
+    std::uint64_t span = 1u;
+    if (pc.group_stride == 0u && pc.lane_stride == 0u && pc.iter_stride == 0u) {
+        span = 1u;
+    } else if (pc.lane_stride == 0u && pc.iter_stride == 1u && pc.group_stride == pc.iters) {
+        span = static_cast<std::uint64_t>(eff_groups) * static_cast<std::uint64_t>(pc.iters);
+    } else if (pc.group_stride == kWorkgroupSize && pc.lane_stride == 1u && pc.iter_stride == 1u) {
+        span = static_cast<std::uint64_t>(eff_groups) * kWorkgroupSize + pc.iters - 1u;
+    } else {
+        span = static_cast<std::uint64_t>(eff_invocations) * static_cast<std::uint64_t>(pc.iters);
+    }
+
+    const std::uint32_t primary_seen =
+        static_cast<std::uint32_t>(std::min<std::uint64_t>(primary_distinct, span));
+    if (sc.shader == ShaderKind::PairTSLookup) {
+        const std::uint32_t s_seen = static_cast<std::uint32_t>(std::min<std::uint64_t>(ds.s_count, span));
+        return primary_seen + s_seen;
+    }
+    return primary_seen;
 }
 
 std::uint32_t eval_invocation_oracle(const ScenarioSpec& sc, const TableDataset& ds, const PushConstants& pc,
@@ -912,7 +969,7 @@ struct Options {
     std::uint32_t reps = 25u;
     std::uint32_t warmup = 5u;
     double max_dispatch_ms = 120.0;
-    int device_index = -1;
+    std::optional<std::uint32_t> device_index;
     MemoryFilter mem_filter = MemoryFilter::All;
     bool list_devices = false;
     bool csv = false;
@@ -933,9 +990,9 @@ void print_usage() {
         "  --device N           select physical device index from --list-devices\n"
         "  --list-devices       list Vulkan physical devices and exit\n"
         "  --quick              fast check profile (sizes 1000,10000; groups 16; iters 4; reps 3)\n"
-        "  --csv                emit machine-readable CSV lines\n"
+        "  --csv                emit CSV with timing_status and empty fields for unavailable measurements\n"
         "  --dump-spv PREFIX    write the 3 SPIR-V compute modules to PREFIX_*.spv and exit\n"
-        "  --self-test          CPU-only check of SPIR-V encoding and DescriptorTable oracle\n"
+        "  --self-test          CPU-only checks for CLI, SPIR-V encoding and descriptor lookup\n"
         "  --help               print this message\n");
 }
 
@@ -948,7 +1005,7 @@ bool parse_u32(const char* s, std::uint32_t& out) {
     return true;
 }
 
-bool parse_args(int argc, char** argv, Options& opt, bool& show_help) {
+bool parse_args(int argc, const char* const* argv, Options& opt, bool& show_help) {
     show_help = false;
     for (int i = 1; i < argc; ++i) {
         const std::string_view arg(argv[i]);
@@ -998,7 +1055,7 @@ bool parse_args(int argc, char** argv, Options& opt, bool& show_help) {
             const char* v = nullptr;
             std::uint32_t idx = 0u;
             if (!need_val(v) || !parse_u32(v, idx)) return false;
-            opt.device_index = static_cast<int>(idx);
+            opt.device_index = idx;
         } else if (arg == "--dump-spv") {
             const char* v = nullptr;
             if (!need_val(v)) return false;
@@ -1098,6 +1155,15 @@ struct MemoryPlacement {
 };
 
 int run_self_test() {
+    const char* const device_args[] = {"vk_descriptor_bench", "--device", "4294967295"};
+    Options device_options;
+    bool show_help = false;
+    if (device_options.device_index.has_value() || !parse_args(3, device_args, device_options, show_help) ||
+        device_options.device_index != std::numeric_limits<std::uint32_t>::max()) {
+        std::fprintf(stderr, "self-test: explicit device index became automatic selection\n");
+        return 1;
+    }
+
     const struct {
         const char* name;
         ShaderKind kind;
@@ -1117,11 +1183,23 @@ int run_self_test() {
         std::fprintf(stderr, "self-test: unexpected 1k table metrics\n");
         return 1;
     }
-    const ScenarioSpec single_sc{"self_test", ShaderKind::SingleLookup, false, 1u, 0u, 1u, false,
+    const ScenarioSpec single_sc{"self_test", ShaderKind::SingleLookup, false, true, 0u, 0u, 1u, false,
                                  ScenarioSpec::Bank::TSharp, 1.0};
     const PushConstants pc = make_push_constants(single_sc, ds, 8u);
     if (eval_invocation_oracle(single_sc, ds, pc, 0u) == kFnvOffsetBasis) {
         std::fprintf(stderr, "self-test: degenerate checksum on lane 0\n");
+        return 1;
+    }
+    const ScenarioSpec hot_sc{"hot", ShaderKind::SingleLookup, false, false, 0u, 0u, 0u, false,
+                              ScenarioSpec::Bank::TSharp, 1.0};
+    const ScenarioSpec pair_sc{"pair", ShaderKind::PairTSLookup, false, true, 0u, 0u, 1u, false,
+                               ScenarioSpec::Bank::TSharp, 2.0};
+    const std::uint32_t hot_u = count_unique_keys(hot_sc, ds, make_push_constants(hot_sc, ds, 64u), 4096u);
+    const std::uint32_t q_u = count_unique_keys(single_sc, ds, make_push_constants(single_sc, ds, 4u), 16u);
+    const std::uint32_t full_u = count_unique_keys(single_sc, ds, make_push_constants(single_sc, ds, 64u), 4096u);
+    const std::uint32_t pair_u = count_unique_keys(pair_sc, ds, make_push_constants(pair_sc, ds, 64u), 4096u);
+    if (hot_u != 1u || q_u != 64u || full_u != ds.t_count || pair_u != ds.entry_count) {
+        std::fprintf(stderr, "self-test: unexpected unique_keys (%u, %u, %u, %u)\n", hot_u, q_u, full_u, pair_u);
         return 1;
     }
     std::printf("vk_descriptor_bench self-test passed (1k table cap=%u, load=%.1f%%, mean_probes=%.3f, max=%u)\n",
@@ -1273,13 +1351,14 @@ int main(int argc, char** argv) {
     VkPhysicalDeviceProperties pd_props{};
     std::uint32_t qi = 0;
     std::uint32_t ts_valid_bits = 0;
-    if (opt.device_index >= 0) {
-        if (static_cast<std::uint32_t>(opt.device_index) >= pd_count) {
-            std::fprintf(stderr, "invalid --device index %d (found %u devices)\n", opt.device_index, pd_count);
+    if (opt.device_index.has_value()) {
+        const std::uint32_t device_index = *opt.device_index;
+        if (device_index >= pd_count) {
+            std::fprintf(stderr, "invalid --device index %u (found %u devices)\n", device_index, pd_count);
             destroy_instance();
             return 2;
         }
-        VkPhysicalDevice cand = pds[static_cast<std::size_t>(opt.device_index)];
+        VkPhysicalDevice cand = pds[device_index];
         VkPhysicalDeviceProperties p{};
         vkGetPhysicalDeviceProperties(cand, &p);
         if (p.apiVersion < VK_API_VERSION_1_1 || !find_compute_queue(cand, qi, ts_valid_bits)) {
@@ -1290,12 +1369,8 @@ int main(int argc, char** argv) {
         pd = cand;
         pd_props = p;
     } else {
-        auto score = [](VkPhysicalDeviceType t) -> int {
-            if (t == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) return 4;
-            if (t == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU) return 3;
-            if (t == VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU) return 2;
-            if (t == VK_PHYSICAL_DEVICE_TYPE_CPU) return 1;
-            return 0;
+        auto score = [](VkPhysicalDeviceType t, std::uint32_t vendor) -> int {
+            return leonida::vk_test::device_rank(t, vendor);
         };
         int best_score = -1;
         for (VkPhysicalDevice cand : pds) {
@@ -1303,7 +1378,7 @@ int main(int argc, char** argv) {
             vkGetPhysicalDeviceProperties(cand, &p);
             std::uint32_t c_qi = 0, c_ts = 0;
             if (p.apiVersion < VK_API_VERSION_1_1 || !find_compute_queue(cand, c_qi, c_ts)) continue;
-            const int s = score(p.deviceType);
+            const int s = score(p.deviceType, p.vendorID);
             if (s > best_score) {
                 best_score = s;
                 pd = cand;
@@ -1559,10 +1634,17 @@ int main(int argc, char** argv) {
         VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
         bci.size = bytes;
         bci.usage = usage;
-        if (vkCreateBuffer(dev, &bci, nullptr, &out_buf.buffer) != VK_SUCCESS) return false;
+        // Every failure says which call failed and with what result, so a run that stops is never silent.
+        if (const VkResult r = vkCreateBuffer(dev, &bci, nullptr, &out_buf.buffer); r != VK_SUCCESS) {
+            std::fprintf(stderr, "vkCreateBuffer (%llu bytes) failed: VkResult %d\n",
+                         static_cast<unsigned long long>(bytes), static_cast<int>(r));
+            return false;
+        }
         VkMemoryRequirements mr{};
         vkGetBufferMemoryRequirements(dev, out_buf.buffer, &mr);
         if (mt_idx >= mp.memoryTypeCount || !(mr.memoryTypeBits & (1u << mt_idx))) {
+            std::fprintf(stderr, "memory type %u is not allowed for this buffer (memoryTypeBits 0x%x)\n", mt_idx,
+                         mr.memoryTypeBits);
             destroy_buf(out_buf);
             return false;
         }
@@ -1570,14 +1652,25 @@ int main(int argc, char** argv) {
         VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
         mai.allocationSize = mr.size;
         mai.memoryTypeIndex = mt_idx;
-        if (vkAllocateMemory(dev, &mai, nullptr, &out_buf.memory) != VK_SUCCESS ||
-            vkBindBufferMemory(dev, out_buf.buffer, out_buf.memory, 0u) != VK_SUCCESS) {
+        if (const VkResult r = vkAllocateMemory(dev, &mai, nullptr, &out_buf.memory); r != VK_SUCCESS) {
+            std::fprintf(stderr, "vkAllocateMemory (%llu bytes, memory type %u) failed: VkResult %d\n",
+                         static_cast<unsigned long long>(mr.size), mt_idx, static_cast<int>(r));
+            out_buf.memory = VK_NULL_HANDLE;
             destroy_buf(out_buf);
             return false;
         }
-        if (map_mem && vkMapMemory(dev, out_buf.memory, 0u, bytes, 0u, &out_buf.mapped) != VK_SUCCESS) {
+        if (const VkResult r = vkBindBufferMemory(dev, out_buf.buffer, out_buf.memory, 0u); r != VK_SUCCESS) {
+            std::fprintf(stderr, "vkBindBufferMemory failed: VkResult %d\n", static_cast<int>(r));
             destroy_buf(out_buf);
             return false;
+        }
+        if (map_mem) {
+            if (const VkResult r = vkMapMemory(dev, out_buf.memory, 0u, bytes, 0u, &out_buf.mapped); r != VK_SUCCESS) {
+                std::fprintf(stderr, "vkMapMemory (%llu bytes) failed: VkResult %d\n",
+                             static_cast<unsigned long long>(bytes), static_cast<int>(r));
+                destroy_buf(out_buf);
+                return false;
+            }
         }
         return true;
     };
@@ -1699,21 +1792,27 @@ int main(int argc, char** argv) {
     } else {
         std::printf("# device,%s,%s\n", pd_props.deviceName, driver_desc.c_str());
         std::printf("entries,capacity,load_pct,size_bytes,mean_probes,max_probes,placement,mem_type,flags,scenario,"
-                    "groups,iters,reps,med_ms,min_ms,max_ms,us_per_1m_lk,net_us_per_1m_lk,glk_per_s\n");
+                    "groups,iters,reps,unique_keys,med_ms,min_ms,max_ms,us_per_1m_lk,net_us_per_1m_lk,glk_per_s,timing_status\n");
     }
 
     const std::array<ScenarioSpec, 11> scenarios{{
-        {"baseline_uniform", ShaderKind::Baseline, false, 1u, 0u, 1u, false, ScenarioSpec::Bank::TSharp, 0.0},
-        {"baseline_divergent", ShaderKind::Baseline, true, 64u, 1u, 1u, false, ScenarioSpec::Bank::TSharp, 0.0},
-        {"uniform_hot_tsharp", ShaderKind::SingleLookup, false, 0u, 0u, 0u, false, ScenarioSpec::Bank::TSharp, 1.0},
-        {"uniform_tsharp_hit", ShaderKind::SingleLookup, false, 1u, 0u, 1u, false, ScenarioSpec::Bank::TSharp, 1.0},
-        {"uniform_ssharp_hit", ShaderKind::SingleLookup, false, 1u, 0u, 1u, false, ScenarioSpec::Bank::SSharp, 1.0},
-        {"uniform_pair_ts", ShaderKind::PairTSLookup, false, 1u, 0u, 1u, false, ScenarioSpec::Bank::TSharp, 2.0},
-        {"uniform_miss", ShaderKind::SingleLookup, false, 1u, 0u, 1u, false, ScenarioSpec::Bank::Miss, 1.0},
-        {"divergent_tsharp_hit", ShaderKind::SingleLookup, true, 64u, 1u, 1u, false, ScenarioSpec::Bank::TSharp, 1.0},
-        {"divergent_pair_ts", ShaderKind::PairTSLookup, true, 64u, 1u, 1u, false, ScenarioSpec::Bank::TSharp, 2.0},
-        {"divergent_miss", ShaderKind::SingleLookup, true, 64u, 1u, 1u, false, ScenarioSpec::Bank::Miss, 1.0},
-        {"latency_divergent", ShaderKind::SingleLookup, true, 64u, 1u, 1u, true, ScenarioSpec::Bank::TSharp, 1.0},
+        {"baseline_uniform", ShaderKind::Baseline, false, true, 0u, 0u, 1u, false, ScenarioSpec::Bank::TSharp, 0.0},
+        {"baseline_divergent", ShaderKind::Baseline, true, false, 64u, 1u, 1u, false, ScenarioSpec::Bank::TSharp, 0.0},
+        {"uniform_hot_tsharp", ShaderKind::SingleLookup, false, false, 0u, 0u, 0u, false, ScenarioSpec::Bank::TSharp,
+         1.0},
+        {"uniform_tsharp_hit", ShaderKind::SingleLookup, false, true, 0u, 0u, 1u, false, ScenarioSpec::Bank::TSharp,
+         1.0},
+        {"uniform_ssharp_hit", ShaderKind::SingleLookup, false, true, 0u, 0u, 1u, false, ScenarioSpec::Bank::SSharp,
+         1.0},
+        {"uniform_pair_ts", ShaderKind::PairTSLookup, false, true, 0u, 0u, 1u, false, ScenarioSpec::Bank::TSharp, 2.0},
+        {"uniform_miss", ShaderKind::SingleLookup, false, true, 0u, 0u, 1u, false, ScenarioSpec::Bank::Miss, 1.0},
+        {"divergent_tsharp_hit", ShaderKind::SingleLookup, true, false, 64u, 1u, 1u, false, ScenarioSpec::Bank::TSharp,
+         1.0},
+        {"divergent_pair_ts", ShaderKind::PairTSLookup, true, false, 64u, 1u, 1u, false, ScenarioSpec::Bank::TSharp,
+         2.0},
+        {"divergent_miss", ShaderKind::SingleLookup, true, false, 64u, 1u, 1u, false, ScenarioSpec::Bank::Miss, 1.0},
+        {"latency_divergent", ShaderKind::SingleLookup, true, false, 64u, 1u, 1u, true, ScenarioSpec::Bank::TSharp,
+         1.0},
     }};
 
     bool seen_rebar = false;
@@ -1824,6 +1923,17 @@ int main(int argc, char** argv) {
             const VkBufferUsageFlags map_usage =
                 VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | (pl_cfg.use_staging ? VK_BUFFER_USAGE_TRANSFER_DST_BIT : 0u);
             if (!alloc_buffer_mt(map_bytes, map_usage, pl_cfg.memory_type_index, !pl_cfg.use_staging, map_buf)) {
+                // The ReBAR placement is optional: a driver can list a DEVICE_LOCAL | HOST_VISIBLE type yet refuse
+                // the allocation (RTX 4080 SUPER, Windows 617.14: VK_ERROR_OUT_OF_DEVICE_MEMORY for 160 KiB).
+                // Skip it, as when no such type exists, so the other placements and table sizes still run.
+                if (std::strcmp(pl_cfg.label, "host_device_local") == 0) {
+                    if (!opt.csv)
+                        std::printf("  note: skipping placement host_device_local (memory type %u can't be "
+                                    "allocated, see stderr)\n", pl_cfg.memory_type_index);
+                    continue;
+                }
+                std::fprintf(stderr, "placement %s: allocating the %llu-byte table failed\n", pl_cfg.label,
+                             static_cast<unsigned long long>(map_bytes));
                 cleanup_all(keys_buf, map_buf);
                 return 1;
             }
@@ -1856,8 +1966,8 @@ int main(int argc, char** argv) {
                             pl_cfg.memory_type_index, pl_cfg.heap_index,
                             static_cast<double>(pl_cfg.heap_size) / (1024.0 * 1024.0),
                             format_mem_flags(pl_cfg.flags).c_str());
-                std::printf("  %-22s %9s %9s %9s %11s %12s %9s\n", "scenario", "med_ms", "min_ms", "max_ms",
-                            "us/1M_lk", "net_us/1M", "Glk/s");
+                std::printf("  %-22s %7s %9s %9s %9s %11s %12s %9s\n", "scenario", "keys", "med_ms", "min_ms",
+                            "max_ms", "us/1M_lk", "net_us/1M", "Glk/s");
             }
 
             double base_uniform_us_per_1m = 0.0;
@@ -1950,6 +2060,7 @@ int main(int argc, char** argv) {
                 const VkDeviceSize eff_out_bytes = static_cast<VkDeviceSize>(eff_invocations) * sizeof(std::uint32_t);
                 const double eff_single_lookups = static_cast<double>(eff_invocations) * static_cast<double>(eff_iters);
                 const bool was_scaled = (eff_groups != opt.groups || eff_iters != opt.iters);
+                const std::uint32_t unique_keys = count_unique_keys(sc, ds, pc, eff_groups);
 
                 // Warmup + correctness verification with readback
                 for (std::uint32_t w = 0; w <= eff_warmup; ++w) {
@@ -2053,46 +2164,53 @@ int main(int argc, char** argv) {
                 const double min_ms = samples_ms.front();
                 const double max_ms = samples_ms.back();
 
-                if (std::strcmp(sc.name, "baseline_uniform") == 0) {
-                    base_uniform_us_per_1m = (med_ms > 0.0) ? (med_ms * 1e9 / eff_single_lookups) : 0.0;
-                }
-                if (std::strcmp(sc.name, "baseline_divergent") == 0) {
-                    base_divergent_us_per_1m = (med_ms > 0.0) ? (med_ms * 1e9 / eff_single_lookups) : 0.0;
-                }
+                const bool is_lookup = sc.lookups_per_iter > 0.0;
+                double& baseline_us = sc.divergent ? base_divergent_us_per_1m : base_uniform_us_per_1m;
+                if (!is_lookup) baseline_us = med_ms * 1e9 / eff_single_lookups;
 
-                if (sc.lookups_per_iter <= 0.0) {
-                    if (!opt.csv) {
-                        std::printf("  %-22s %9.4f %9.4f %9.4f %11s %12s %9s", sc.name, med_ms, min_ms, max_ms, "-",
-                                    "-", "-");
-                        if (was_scaled) std::printf(" [scaled %ux%u, n=%u]", eff_groups, eff_iters, eff_reps);
-                        std::printf("\n");
-                    } else {
-                        std::printf("%u,%u,%.2f,%llu,%.4f,%u,%s,%u,\"%s\",%s,%u,%u,%u,%.6f,%.6f,%.6f,,,\n",
-                                    ds.entry_count, ds.capacity, ds.load_pct, static_cast<unsigned long long>(map_bytes),
-                                    ds.mean_probes, ds.max_probes, pl_cfg.label, pl_cfg.memory_type_index,
-                                    format_mem_flags(pl_cfg.flags).c_str(), sc.name, eff_groups, eff_iters, eff_reps,
-                                    med_ms, min_ms, max_ms);
-                    }
+                const bool have_times = max_ms > 0.0;
+                const bool have_rate = is_lookup && med_ms > 0.0;
+                const double total_lookups = eff_single_lookups * sc.lookups_per_iter;
+                const double us_per_1m = have_rate ? med_ms * 1e9 / total_lookups : 0.0;
+                const double net_us_per_1m = have_rate ? std::max(0.0, us_per_1m - baseline_us / sc.lookups_per_iter) : 0.0;
+                const double glk_s = med_ms > 1e-9 ? total_lookups / (med_ms * 1e6) : 0.0;
+
+                const char* status = nullptr;
+                if (!have_times) status = use_gpu_timestamps ? "GPU timestamps did not advance" : "host clock did not advance";
+                else if (med_ms == 0.0) status = "median below timer resolution";
+                else if (is_lookup && baseline_us == 0.0) status = "baseline timing unavailable";
+
+                if (opt.csv) {
+                    std::printf("%u,%u,%.2f,%llu,%.4f,%u,%s,%u,\"%s\",%s,%u,%u,%u,%u", ds.entry_count, ds.capacity,
+                                ds.load_pct, static_cast<unsigned long long>(map_bytes), ds.mean_probes, ds.max_probes,
+                                pl_cfg.label, pl_cfg.memory_type_index, format_mem_flags(pl_cfg.flags).c_str(), sc.name,
+                                eff_groups, eff_iters, eff_reps, unique_keys);
                 } else {
-                    const double total_lookups = eff_single_lookups * sc.lookups_per_iter;
-                    const double us_per_1m = (med_ms > 0.0) ? (med_ms * 1e9 / total_lookups) : 0.0;
-                    const double base_us = sc.divergent ? base_divergent_us_per_1m : base_uniform_us_per_1m;
-                    const double net_us_per_1m = std::max(0.0, us_per_1m - (base_us / sc.lookups_per_iter));
-                    const double glk_s = (med_ms > 1e-9) ? (total_lookups / (med_ms * 1e6)) : 0.0;
-                    if (!opt.csv) {
-                        std::printf("  %-22s %9.4f %9.4f %9.4f %11.3f %12.3f %9.2f", sc.name, med_ms, min_ms, max_ms,
-                                    us_per_1m, net_us_per_1m, glk_s);
-                        if (was_scaled) std::printf(" [scaled %ux%u, n=%u]", eff_groups, eff_iters, eff_reps);
-                        std::printf("\n");
-                    } else {
-                        std::printf("%u,%u,%.2f,%llu,%.4f,%u,%s,%u,\"%s\",%s,%u,%u,%u,%.6f,%.6f,%.6f,%.4f,%.4f,%.4f\n",
-                                    ds.entry_count, ds.capacity, ds.load_pct,
-                                    static_cast<unsigned long long>(map_bytes), ds.mean_probes, ds.max_probes,
-                                    pl_cfg.label, pl_cfg.memory_type_index, format_mem_flags(pl_cfg.flags).c_str(),
-                                    sc.name, eff_groups, eff_iters, eff_reps, med_ms, min_ms, max_ms, us_per_1m,
-                                    net_us_per_1m, glk_s);
-                    }
+                    std::printf("  %-22s %7u", sc.name, unique_keys);
                 }
+                const auto metric = [&](double value, bool available, int width, int precision, int csv_precision) {
+                    if (opt.csv) {
+                        std::putchar(',');
+                        if (available) std::printf("%.*f", csv_precision, value);
+                    } else if (available) {
+                        std::printf(" %*.*f", width, precision, value);
+                    } else {
+                        std::printf(" %*s", width, "-");
+                    }
+                };
+                metric(med_ms, have_times, 9, 4, 6);
+                metric(min_ms, have_times, 9, 4, 6);
+                metric(max_ms, have_times, 9, 4, 6);
+                metric(us_per_1m, have_rate, 11, 3, 4);
+                metric(net_us_per_1m, have_rate && baseline_us > 0.0, 12, 3, 4);
+                metric(glk_s, have_rate, 9, 2, 4);
+                if (opt.csv) {
+                    std::printf(",%s", status ? status : "ok");
+                } else {
+                    if (was_scaled) std::printf(" [scaled %ux%u, n=%u]", eff_groups, eff_iters, eff_reps);
+                    if (status) std::printf(" [%s]", status);
+                }
+                std::putchar('\n');
                 std::fflush(stdout);
             }
         }

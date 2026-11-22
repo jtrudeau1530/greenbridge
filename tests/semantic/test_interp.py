@@ -216,6 +216,52 @@ class InterpreterTests(unittest.TestCase):
                  "OpStore %out %res\n" + FOOTER)
         self.assertEqual(si.run_fragment(text, memory={4100: 0x12345678})["%out"][0], 0x12345678)
 
+    def test_physical_storage_buffer_access_is_one_aligned_32bit_word(self):
+        """The flat memory holds one 32-bit word per 4-byte-aligned address, so a PSB load or store of another
+        type, or at an address that is not 4-byte aligned (undefined under `Aligned 4`), must raise instead of
+        reading or writing one dictionary entry (a 64-bit load would give only its low word, a load at 4098 the
+        0 of a key nobody wrote)."""
+        text = HEADER.replace("OpMemoryModel Logical GLSL450",
+                              'OpCapability PhysicalStorageBufferAddresses\n'
+                              'OpExtension "SPV_KHR_physical_storage_buffer"\n'
+                              "OpMemoryModel PhysicalStorageBuffer64 GLSL450")
+        decls = ("%ulong = OpTypeInt 64 0\n"
+                 "%_ptr_PSB_uint = OpTypePointer PhysicalStorageBuffer %uint\n"
+                 "%_ptr_PSB_ulong = OpTypePointer PhysicalStorageBuffer %ulong\n"
+                 "%_ptr_PSB_float = OpTypePointer PhysicalStorageBuffer %float\n"
+                 "%a4096 = OpConstant %ulong 4096\n%a4098 = OpConstant %ulong 4098\n"
+                 "%cl_big = OpConstant %ulong 4294967296\n")
+        text = text.replace("%main = OpFunction", decls + "%main = OpFunction")
+        memory = {4096: 0x11223344, 4100: 0x55667788}
+
+        def run(body):
+            return si.run_fragment(text + body + "OpStore %out %res\n" + FOOTER, memory=dict(memory))
+
+        # Control: an aligned 32-bit load and store work.
+        self.assertEqual(run("%p = OpConvertUToPtr %_ptr_PSB_uint %a4096\n"
+                             "%res = OpLoad %uint %p Aligned 4\n")["%out"][0], 0x11223344)
+        mem = dict(memory)
+        si.run_fragment(text + "%p = OpConvertUToPtr %_ptr_PSB_uint %a4096\nOpStore %p %c8 Aligned 4\n"
+                        "%res = OpLoad %uint %p Aligned 4\nOpStore %out %res\n" + FOOTER, memory=mem)
+        self.assertEqual(mem, {4096: 8, 4100: 0x55667788})
+        cases = {
+            "unaligned load": "%p = OpConvertUToPtr %_ptr_PSB_uint %a4098\n%res = OpLoad %uint %p Aligned 4\n",
+            "unaligned store": "%p = OpConvertUToPtr %_ptr_PSB_uint %a4098\nOpStore %p %c8 Aligned 4\n"
+                               "%res = OpCopyObject %uint %c0\n",
+            "64-bit load": "%p = OpConvertUToPtr %_ptr_PSB_ulong %a4096\n%w = OpLoad %ulong %p Aligned 8\n"
+                           "%res = OpUConvert %uint %w\n",
+            "64-bit store": "%p = OpConvertUToPtr %_ptr_PSB_ulong %a4096\nOpStore %p %cl_big Aligned 8\n"
+                            "%res = OpCopyObject %uint %c0\n",
+            "float load": "%p = OpConvertUToPtr %_ptr_PSB_float %a4096\n%x = OpLoad %float %p Aligned 4\n"
+                          "%res = OpBitcast %uint %x\n",
+            "float store": "%p = OpConvertUToPtr %_ptr_PSB_float %a4096\nOpStore %p %f1 Aligned 4\n"
+                           "%res = OpCopyObject %uint %c0\n",
+        }
+        for name, body in cases.items():
+            with self.subTest(name):
+                with self.assertRaises(si.UnsupportedConstruct):
+                    run(body)
+
     def test_sconvert_sign_extends_and_truncates(self):
         """OpSConvert: sign-extend from the operand's width, wrap to the result's (the global_* offset path)."""
         text = HEADER.replace("OpCapability Shader", "OpCapability Shader\nOpCapability Int64")
@@ -385,6 +431,22 @@ class InterpreterTests(unittest.TestCase):
         self.assertEqual(run_word("%i = OpBitcast %float %cInf\n%b = OpIsInf %bool %i\n"
                                   "%res = OpSelect %uint %b %c1 %c0\n"), 1)
         self.assertEqual(run_word(nan + "%b = OpIsInf %bool %nan\n%res = OpSelect %uint %b %c1 %c0\n"), 0)
+
+    def test_float_compares_with_equal_operands(self):
+        # 2 vs 2 for every ordered and unordered relation (asked in review on #262): without this an interpreter
+        # that dropped the equality part of an Equal / LessThanEqual / GreaterThanEqual compare, or that turned
+        # NotEqual into "unordered only", would still pass the NaN and 2-vs-3 cases above.
+        for op, want in (("OpFOrdEqual", 1), ("OpFOrdNotEqual", 0), ("OpFOrdLessThan", 0),
+                         ("OpFOrdLessThanEqual", 1), ("OpFOrdGreaterThan", 0), ("OpFOrdGreaterThanEqual", 1),
+                         ("OpFUnordEqual", 1), ("OpFUnordNotEqual", 0), ("OpFUnordLessThan", 0),
+                         ("OpFUnordLessThanEqual", 1), ("OpFUnordGreaterThan", 0), ("OpFUnordGreaterThanEqual", 1)):
+            with self.subTest(op=op):
+                self.assertEqual(run_word(f"%b = {op} %bool %f2 %f2\n%res = OpSelect %uint %b %c1 %c0\n"), want)
+        # -0.0 equals +0.0 in both families.
+        for op, want in (("OpFOrdEqual", 1), ("OpFUnordEqual", 1), ("OpFOrdNotEqual", 0), ("OpFUnordNotEqual", 0)):
+            with self.subTest(op=op, operands="-0.0, +0.0"):
+                self.assertEqual(run_word("%z = OpBitcast %float %c0\n%n = OpFNegate %float %z\n"
+                                          f"%b = {op} %bool %n %z\n%res = OpSelect %uint %b %c1 %c0\n"), want)
 
     def test_phi_selects_the_value_from_the_taken_predecessor(self):
         for cond, want in (("%t", 1), ("%f", 2)):

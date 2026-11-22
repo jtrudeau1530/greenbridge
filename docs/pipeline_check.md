@@ -6,6 +6,10 @@ constant contract. It is a driver-level check: it proves the modules and pipelin
 the Vulkan implementation, not that the shader results are correct. Value-level checks are in
 `docs/shader_validation.md`.
 
+The checker exits nonzero if a module fails to load, a pipeline fails to compile, or the requested final
+cache save fails. It still finishes checking the other entries and attempts the final save so the next run
+can reuse successful pipelines. Entries reported as skipped do not count as failures.
+
 ## Corpus
 
 The translated corpus is 26,503 entries: 2,236 vertex, 12,101 pixel, 2,689 compute, 9,282 mesh and
@@ -64,6 +68,16 @@ overlay layers (a missing Epic JSON, three non-conforming layer names, one dupli
 22,092 full-shard modules were not re-run through the validation layer; their result is driver
 acceptance only.
 
+## Limiting concurrent compilation of large modules
+
+By default, a SPIR-V module larger than 4 MiB compiles alone. Smaller modules continue to use
+`--jobs`. The gate covers module creation and both compute and graphics pipelines. The size
+cutoff is a heuristic for [#884](https://github.com/ItsNotRexed/Leonida/issues/884), where several
+compiles that each needed gigabytes of host RAM ran at the same time. The pipeline cache still
+checkpoints during the run, and isolated modules count towards the regular results.
+
+`--large-module-bytes N` changes the cutoff in bytes. Set it to `0` to disable isolation.
+
 ## Skipping huge modules
 
 `vk_pipeline_check` now accepts `--max-bytes N`:
@@ -81,6 +95,31 @@ The report above therefore states the limit and the skip count; a later run on a
 completed the full 26,503-entry set without them (`docs/design.md`). `--max-bytes` remains a visibility
 tool, not a pass: a skipped module has not been validated.
 
+## Application pipeline-cache feedback
+
+With `--cache-feedback`, the checker groups successful pipeline creations by translated shader stage
+and reports three counts. A **hit** means the driver set both the valid-feedback bit and the
+application-cache-hit bit. **No hit reported** means feedback was valid and the hit bit was clear.
+**Unavailable** means the driver returned no valid feedback, or feedback was unsupported.
+The three counts sum to the successful pipelines for the stage. Skips and failures are counted separately.
+
+A driver can also use its own caches. A clear hit bit does not establish a fresh compile, and a
+reported hit may reuse data populated earlier in the same process. The seed-file byte count alone
+cannot identify which pipelines benefited.
+
+To compare runs, start with a new cache path and keep the device, index and flags identical, including
+`--stats` if used. For example, from a scratch directory that contains no `sample.cache`, run the same
+command twice, replacing `path/to/spirv` with the local translated-shader directory.
+
+```sh
+vk_pipeline_check path/to/spirv sample.cache --cache-feedback
+vk_pipeline_check path/to/spirv sample.cache --cache-feedback
+```
+
+On Windows with an RTX 5090 (driver 621.14), a synthetic three-compute, one-vertex and one-pixel
+sample reported zero application-cache hits on its first run and five on the seeded run. On Mesa
+llvmpipe the same five pipelines succeeded both times and neither run reported a hit.
+
 ## Device
 
 The reported runs used an NVIDIA GeForce RTX 5070 Ti (discrete, subgroup size 32 only), driver
@@ -95,8 +134,8 @@ pipeline is created with the runtime's resource contract. It does not prove:
 
 - that any shader computes the right values (see `docs/shader_validation.md`);
 - that the two incomplete shards are valid or invalid;
-- that the graphics pipelines (vertex/pixel/geometry/mesh) link and execute, since the tool creates
-  modules for those stages but only pipelines for compute;
+- that the graphics pipelines (vertex/pixel/geometry/mesh) execute or draw the right pixels: the tool
+  creates them with `vkCreateGraphicsPipelines` (dynamic rendering) but never draws with them;
 - that the game's descriptors, root signatures and push constants match the contract at run time
   (the missing executable still owns that).
 

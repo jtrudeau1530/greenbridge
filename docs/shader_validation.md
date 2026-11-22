@@ -5,7 +5,7 @@ the corpus is correct. The CPU differential oracle in `tools/shader_diff.py` is 
 tested (`tests/test_shader_diff.py`): it compares the ISA model in `tools/cpu_ref.py` against
 translated SPIR-V run in `tests/semantic/spirv_mini_interp.py` over seeded straight-line programs.
 Run it with `python -I tools/shader_diff.py --programs 200 --seed 7` (`--self-test` checks the
-harness itself). The GPU-side runner described below is still future work.
+harness itself). The GPU-side runners are described below: `tools/valu_fuzz.py` (16-bit and memory ops), `tools/lds_fuzz.py`, `tools/crosslane_fuzz.py` and `tools/cf_diff.py`.
 
 ## Why `spirv-val` is not enough
 
@@ -199,7 +199,7 @@ that starts from a known pattern. It runs 4 to 12 random `ds_*` instructions, ea
 `s_waitcnt` and `s_barrier`, then stores all 16 result VGPRs of every thread and the whole LDS.
 `vk_compute_test` reads them back with `VKC_OUT_WORDS` / `VKC_DUMP`.
 
-- **Instructions.** Every read width (`b32` to `b128`, `u8`/`i8`/`u16`/`i16`, `u16_d16[_hi]`), the
+- **Instructions.** Every read width (`b32` to `b128`, `u8`/`i8`/`u16`/`i16`, `u16_d16[_hi]`, `u8_d16[_hi]`, `i8_d16[_hi]`), the
   byte and short writes (also `d16_hi`), `read2`/`write2` with and without `st64`, the add, sub,
   min, max, and, or and xor atomics with and without return, `wrxchg`, `cmpst`, `ds_swizzle_b32`
   and `ds_bpermute_b32`.
@@ -224,9 +224,9 @@ First results on an RX 6700 XT (RADV, Mesa 26.3.1), native wave64/wave32 and wit
   under a masked wave32 `ds_bpermute`, and with #253's translator all 480 programs (seeds 1 to 3,
   native and emulated) match.
 - **Everything else matches.** With `--no-exec bpermute`, 1,040 programs match (seeds 1 to 8).
-- **Not covered.** The translator rejects the 8-bit d16 reads (`ds_read_u8_d16[_hi]`,
-  `ds_read_i8_d16[_hi]`), so the fuzzer leaves them out. It supports `ds_permute_b32` since SHADER-90,
-  but the fuzzer does not generate it yet (FUZZ-10).
+- **Not covered.** The fuzzer does not generate `ds_permute_b32` yet (FUZZ-10); the translator supports it since
+  SHADER-90. The 8-bit d16 reads (`ds_read_u8_d16[_hi]`, `ds_read_i8_d16[_hi]`) are translated since SHADER-85
+  (`cs_w32_lds_u8_d16`) and the fuzzer generates them.
 ### Memory instructions (`tools/mem_diff.py`, FUZZ-5)
 
 `cpu_ref.py` has no memory model, so memory instructions get their own runner. `tools/mem_diff.py`
@@ -247,7 +247,7 @@ dword aligned (sub-dword loads at their natural alignment), with no format in wo
 results, `OOB_SELECT`, swizzling and the `s_buffer_load` alignment truncation depend on descriptor
 fields the translator does not model yet, so they need a GPU-confirmed rule before they are fuzzed.
 `spirv_mini_interp` gained `OpSConvert` and the 32-bit atomics on PhysicalStorageBuffer memory for
-this. Not covered yet: images.
+this. Images have their own fuzzer (`tools/image_fuzz.py`, below).
 
 The `buffer_format` family covers `buffer_load_format_*` on every format the translator decodes, with a
 random DST_SEL of 0/1/X/Y/Z/W, and `tbuffer_load_format_*` on the five formats the 1.0.2.1 corpus uses
@@ -263,6 +263,37 @@ Over 5,000 programs the reference and translator match bit for bit; breaking the
 
 A mutation check (inst offset dropped, V# stride narrowed, the SMEM pointer's high word dropped) makes
 76, 45 and 42 of 150 programs fail, so the runner does catch address errors.
+
+### Images on the GPU (`tools/image_fuzz.py`)
+
+`tools/image_fuzz.py` starts on the image path, where the T# format, the view type and the binding layout
+meet the driver. Each case assembles a pixel shader that reads one texel with `image_load` (a nonzero `dmask`, the
+T# in `s[8:15]`), runs it through `runtime/test/vk_image_fuzz.cpp` against a synthetic texture of a chosen
+format, and compares every RGBA32F pixel with an oracle that models the RDNA2 texel fetch for that format: a
+fetch is a memory read, so there is no filter, border or LOD to model.
+
+```sh
+cmake --build runtime/build --target vk_image_fuzz
+python -I tools/image_fuzz.py --programs 8 --seed 1 [--show]
+python -I tools/image_fuzz.py --self-test
+python -m pytest tests/test_image_fuzz.py
+```
+
+Covered: 2D `image_load`, `R8G8B8A8_UNORM`, `R16G16B16A16_SFLOAT`, `R32G32B32A32_SFLOAT`, `R32_SFLOAT`,
+and `R8G8B8A8_UINT`/`SINT` storage images. The shader converts the loaded 8-bit integer values to float for
+readback; every such value is exactly representable, including signed negatives. Wider integers are not covered.
+Texture sizes divide the 64x64 draw (8/16/32/64), so every texel is read at least once. The nonzero masks cycle from
+`0xf` through `0x1`–`0xe`; 90 programs cover all 15 masks for each of the six default formats. Selected channels
+are packed into consecutive destination registers, while unwritten registers keep initialized sentinel values.
+The packing model follows the image VGPR usage description in AMD's
+[RDNA 1.0 ISA guide](https://www.amd.com/content/dam/amd/en/documents/radeon-tech-docs/instruction-set-architectures/rdna-shader-instruction-set-architecture.pdf);
+the Vulkan test compares translated shaders on the host GPU, not native RDNA2 execution.
+
+Devices: the harness needs `fragmentStoresAndAtomics` and both without-format storage-image features, because the
+translated `image_load` declares the uint/sint storage path even when the case reads a float format (the choice is
+made from the T# FORMAT at run time). An Intel UHD 770 (Xe-LP) lacks `shaderStorageImageReadWithoutFormat` and
+skips every case; the harness names the missing feature. Not covered yet: wider UINT/SINT formats, mips, 1D/2D-array/3D/cube,
+`image_sample`/`gather` with filters and borders, and texel offsets with `VK_KHR_maintenance8`.
 
 ### 16-bit and memory ops on the GPU (`tools/valu_fuzz.py`, FUZZ-2, FUZZ-5)
 
@@ -311,11 +342,14 @@ every scalar. `vk_compute_test` reads them back with `VKC_OUT_WORDS` / `VKC_DUMP
   EXEC constants only enable lanes that exist. Every mask register is zero-initialised, as compiled code does,
   so a branch that skips the `v_cmp` writing a mask leaves a defined mask after the join.
 - **Hypotheses are reported apart.** `v_permlane16/x16` with op_sel FI = 0 reading a lane that is off in
-  EXEC is modelled as the DPP "invalid source" case (vD kept). That is now measured on RDNA2 and RDNA3.5 (@aslan2142,
-  #374): FI = 1 returns the source lane's value, FI = 0 leaves the destination unwritten and FI = 0 with BOUND_CTRL
-  gives 0; #580 (SHADER-74) makes the translator do that. Where the translator still always reads the lane, a
-  program that hits the case counts as `hyp_only`, not as a mismatch. `--permlane-fetch-inactive` models FI = 1
-  instead.
+  EXEC is modelled as the DPP "invalid source" case (vD kept). That is now measured, with the same result on both:
+  @aslan2142 on RDNA2 and @AlxcBTW on RDNA3.5 (#374). FI = 1 returns the source lane's value, FI = 0 leaves the
+  destination unwritten and FI = 0 with BOUND_CTRL gives 0; #580 (SHADER-74) makes the translator do that. The
+  fuzzer's docstring (`tools/crosslane_fuzz.py`, since #750) already says it was measured, but `op_permlane` still
+  tags the case `hyp` because the translator models it only with #580, so a program that hits it and mismatches
+  is filed as `hyp_only` instead of `mismatch` (one that matches still counts as `match`). The model (vD kept)
+  already matches the measurement; dropping the tag once #580 lands is a follow-up.
+  `--permlane-fetch-inactive` models FI = 1 instead.
 - **Modes.** Wave32 runs natively. Wave64 runs with `--wave64-emulate`; `--w64-native` adds the plain build,
   which on a 32-wide subgroup is the documented cross-half approximation and is expected to mismatch.
 - **Reports.** The thread, wave, lane and register of the first differences. `--minimize` drops ops while the
@@ -331,31 +365,6 @@ First results on an RTX 4090 (subgroup 32, driver 621.14):
   DPP16 ignored `fi:1`. Each was confirmed with a hand-written program.
 - **Everything else matches.** On `main`, 1,000 programs (`--seed 8 --ops 28 --no-maskdata --no-w32-hi-lanes`, 500 wave32 native and 500 wave64 emulated) give 0 mismatches. 297 of them are `hyp_only` (permlane with FI = 0 and an inactive source), and with `--permlane-fetch-inactive` all 1,000 match. Native wave64 on the 32-wide card mismatches as documented: `s_bcnt1` of EXEC counts one half, and a `v_readlane` from the other half wraps.
 - **Closed question (#374):** what hardware does for permlane with FI = 0 was measured on RDNA2 and RDNA3.5 (see above).
-
-### 16-bit and memory ops on the GPU (`tools/valu_fuzz.py`, FUZZ-2, FUZZ-5)
-
-`tools/valu_fuzz.py --family f16|mem` uses the same runner shape as `lds_fuzz.py`. It generates seeded
-64-thread compute programs, translates them, runs them with `vk_compute_test`'s `VKC_DUMP`, and compares every
-thread's 16 result VGPRs (plus the scratch memory for `mem`) bit for bit with a model of the instructions written in
-the same file. The model doesn't import the translator. `tests/test_valu_fuzz.py` checks the models on the CPU:
-the f16/f32 rounding against Python's IEEE packers, signed zeros, the partial-write rules and out-of-range
-buffer accesses. If llvm-mc is present, it also checks that every family's
-programs assemble for gfx1013.
-
-- **`f16`**: f16 add/sub/mul/min/max/fma/fmac/med3, `v_cvt_f16_f32`/`v_cvt_f32_f16`/`v_cvt_pkrtz_f16_f32`,
-  `v_pk_*` (f16 and shifts) with `op_sel`/`op_sel_hi`, 16-bit integer ops and `v_pack_b32_f16`. It only uses
-  encodings `llvm-mc -mcpu=gfx1013` accepts: on GFX10 the VOP3 forms of the f16 VOP2 ops take no `op_sel`, and the
-  16-bit integer ops exist only as `op_sel` VOP3. Which form keeps the other half follows the 16-bit row of
-  `docs/design.md`. Results whose exact value is NaN, infinite or denormal, denormal inputs, and min/max of +0
-  against -0 are marked uncertain and not compared.
-- **`mem`**: raw (`offen` + `soffset` + offset) and structured (`idxen`) `buffer_load/store_dword` to `dwordx4`
-  through V#s built in SGPRs, with a random `num_records` so some threads are out of range (loads read 0, stores
-  are dropped). Each thread uses only its own 64-byte slot. Accesses are wholly in or out of range, because
-  multi-dword accesses straddling `num_records` are the known gap in "Buffer bounds checking". Byte/short buffer
-  loads and scalar loads aren't generated: the translator rejects the former, and SHADER-41 covers the latter.
-
-`--skip-op OP` (an op name) sets a known finding aside without changing the rest of the program.
-`--show SEED:INDEX:WAVE` prints a program and its model.
 
 ## Coverage plan and cost
 

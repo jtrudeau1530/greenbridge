@@ -1,0 +1,1322 @@
+// gameinput: Microsoft's GameInput API (v0) for gamepads, backed by SDL3, so any controller SDL knows works:
+// DualSense, DualShock 4, Switch Pro, Xbox and the rest of SDL's gamepad database.
+//
+// The Xbox build reads controllers through GameInput. This shim answers GameInputCreate with a COM object whose
+// vtables follow the public v0 API (gameinput_abi.h) and serves gamepads from SDL3:
+//
+//   - device enumeration, connect/disconnect and device callbacks (blocking and async enumeration)
+//   - GetCurrentReading, and GetNextReading / GetPreviousReading over each pad's last half second of readings
+//   - GetGamepadState, GetUiNavigationState, controller axes and buttons
+//   - SetRumbleState: the two body motors through SDL_RumbleGamepad, the impulse-trigger motors through
+//     SDL_RumbleGamepadTriggers on pads that have them; on a DualSense the trigger signal becomes an adaptive-trigger
+//     effect (SDL_SendGamepadEffect), as set by LEONIDA_DS_TRIGGERS. That is an approximation of the Xbox impulse
+//     trigger signal, not the PS5 version's authored effects.
+//   - DualSense/DualShock 4 lightbar colour (LEONIDA_DS_LIGHTBAR) and the player LEDs by connection order
+//   - the keyboard pad (LEONIDA_KEYBOARD_PAD): one SDL virtual gamepad whose buttons the keyboard presses, for menus
+//
+// One thread owns SDL: the background poll thread by default, or the caller of rt::gameinput::poll() when
+// LEONIDA_GAMEINPUT_THREAD=0. Title calls never touch SDL: they read the latest snapshot and leave rumble requests
+// that the next poll applies (2 ms at most with the thread). Callbacks run on the poll thread, as GameInput runs them
+// on its own threads, unless the title created a dispatcher; then IGameInputDispatcher::Dispatch delivers them.
+//
+// Buttons are positional, as on an Xbox pad: A is the bottom face button (Cross on a DualSense, B on a Switch Pro),
+// B the right one, X the left, Y the top. View is Back/Create/Share/Minus, Menu is Start/Options/Plus.
+//
+// Nothing here goes online. docs/gameinput.md has the mapping, the environment variables and the VERIFY list.
+//
+// ASSUMPTION: the console executable is not available, so the DLL it imports GameInputCreate from is unknown. The PC
+// API lives in gameinput.dll; on console the GDK links it through xgameruntime. Both names are registered.
+#include <windows.h>
+
+#include <SDL3/SDL.h>
+
+#include <algorithm>
+#include <atomic>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <deque>
+#include <mutex>
+#include <string>
+#include <thread>
+#include <vector>
+
+#include "gameinput.h"
+#include "gameinput_abi.h"
+#include "shims.h"
+
+using namespace gi;
+
+namespace {
+
+constexpr uint32_t kSupportedKinds =
+    GameInputKindControllerAxis | GameInputKindControllerButton | GameInputKindGamepad | GameInputKindUiNavigation;
+constexpr uint32_t kAxisCount = 6;  // LX, LY, RX, RY, LT, RT
+constexpr uint32_t kButtonCount = SDL_GAMEPAD_BUTTON_COUNT;
+constexpr uint32_t kConnectedStatus = GameInputDeviceConnected | GameInputDeviceInputEnabled | GameInputDeviceOutputEnabled;
+constexpr Uint32 kRumbleDurationMs = 0xFFFF;  // SDL's maximum; refreshed well before it runs out
+constexpr uint64_t kRumbleRefreshUs = 20'000'000;
+constexpr uint64_t kBatteryRefreshUs = 1'000'000;
+constexpr int kDsEffectSize = 47;  // the DualSense effects block SDL_SendGamepadEffect forwards (SDL's DS5EffectsState_t)
+constexpr uint64_t kHistoryUs = 500'000;  // a reading stays in the history until the one after it is this old
+constexpr size_t kHistoryCap = 512;       // readings per pad, whatever the poll rate
+
+uint64_t now_us() {
+    static const LARGE_INTEGER freq = [] { LARGE_INTEGER f; QueryPerformanceFrequency(&f); return f; }();
+    LARGE_INTEGER c;
+    QueryPerformanceCounter(&c);
+    return static_cast<uint64_t>(c.QuadPart / freq.QuadPart * 1'000'000 + c.QuadPart % freq.QuadPart * 1'000'000 / freq.QuadPart);
+}
+
+// Release for objects the shim keeps for the process: the count never drops below one, so they are never freed.
+ULONG release_floor(std::atomic<ULONG>& refs) {
+    ULONG r = refs.load();
+    while (r > 1 && !refs.compare_exchange_weak(r, r - 1)) {}
+    return r > 1 ? r - 1 : 1;
+}
+
+bool same_guid(const GUID& a, const GUID& b) { return std::memcmp(&a, &b, sizeof(GUID)) == 0; }
+
+// ---- configuration ----------------------------------------------------------------------------------------------
+
+std::string env(const char* name) {
+    char buf[64];
+    const DWORD n = GetEnvironmentVariableA(name, buf, sizeof buf);
+    if (n == 0 || n >= sizeof buf) return {};
+    std::string s(buf, n);
+    for (auto& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return s;
+}
+
+rt::gameinput::Config read_config() {
+    rt::gameinput::Config c;
+    const std::string t = env("LEONIDA_DS_TRIGGERS");
+    if (t == "off" || t == "0") c.ds_triggers = rt::gameinput::DsTriggerMode::Off;
+    else if (t == "resistance") c.ds_triggers = rt::gameinput::DsTriggerMode::Resistance;
+    else if (!t.empty() && t != "rumble") std::fprintf(stderr, "[rt] gameinput: LEONIDA_DS_TRIGGERS=%s unknown, using rumble\n", t.c_str());
+    if (const std::string g = env("LEONIDA_DS_TRIGGER_GAIN"); !g.empty())
+        c.ds_trigger_gain = std::clamp(static_cast<float>(std::atof(g.c_str())), 0.0f, 4.0f);
+    if (const std::string f = env("LEONIDA_DS_TRIGGER_FREQ"); !f.empty())
+        c.ds_trigger_frequency = static_cast<uint8_t>(std::clamp(std::atoi(f.c_str()), 1, 255));
+    if (const std::string l = env("LEONIDA_DS_LIGHTBAR"); !l.empty()) {
+        if (l == "off") {
+            c.lightbar_set = true;
+        } else if (l.size() == 6 && l.find_first_not_of("0123456789abcdef") == std::string::npos) {
+            const unsigned long rgb = std::strtoul(l.c_str(), nullptr, 16);
+            c.lightbar_set = true;
+            c.lightbar[0] = static_cast<uint8_t>(rgb >> 16);
+            c.lightbar[1] = static_cast<uint8_t>(rgb >> 8);
+            c.lightbar[2] = static_cast<uint8_t>(rgb);
+        } else {
+            std::fprintf(stderr, "[rt] gameinput: LEONIDA_DS_LIGHTBAR=%s is not RRGGBB or off, ignored\n", l.c_str());
+        }
+    }
+    if (env("LEONIDA_RUMBLE") == "0") c.rumble = false;
+    if (env("LEONIDA_GAMEINPUT_THREAD") == "0") c.background_thread = false;
+    const std::string k = env("LEONIDA_KEYBOARD_PAD");
+    if (k == "1" || k == "on" || k == "focus") c.keyboard_pad = rt::gameinput::KeyboardPadMode::Focused;
+    else if (k == "always") c.keyboard_pad = rt::gameinput::KeyboardPadMode::Always;
+    else if (!k.empty() && k != "0" && k != "off")
+        std::fprintf(stderr, "[rt] gameinput: LEONIDA_KEYBOARD_PAD=%s unknown (1, always or off), keyboard pad off\n",
+                     k.c_str());
+    return c;
+}
+
+// ---- objects ----------------------------------------------------------------------------------------------------
+
+class Device;
+
+struct Snapshot {
+    GameInputGamepadState gamepad{};
+    uint32_t ui = 0;
+    float axes[kAxisCount] = {};
+    bool buttons[kButtonCount] = {};
+    bool guide = false;
+    bool operator==(const Snapshot& o) const {  // field by field: the padding is not initialised
+        const GameInputGamepadState &a = gamepad, &b = o.gamepad;
+        return a.buttons == b.buttons && a.leftTrigger == b.leftTrigger && a.rightTrigger == b.rightTrigger &&
+               a.leftThumbstickX == b.leftThumbstickX && a.leftThumbstickY == b.leftThumbstickY &&
+               a.rightThumbstickX == b.rightThumbstickX && a.rightThumbstickY == b.rightThumbstickY && ui == o.ui &&
+               std::memcmp(buttons, o.buttons, sizeof buttons) == 0 && guide == o.guide;
+    }
+};
+
+class Reading final : public IGameInputReading {
+public:
+    Reading(Device* device, const Snapshot& s, uint64_t seq, uint64_t ts, uint64_t order);
+    ~Reading();
+
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** out) override {
+        if (!out) return E_POINTER;
+        if (same_guid(riid, IID_IUnknown) || same_guid(riid, IID_IGameInputReading)) {
+            AddRef();
+            *out = static_cast<IGameInputReading*>(this);
+            return S_OK;
+        }
+        *out = nullptr;
+        return E_NOINTERFACE;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return ++refs_; }
+    ULONG STDMETHODCALLTYPE Release() override {
+        const ULONG r = --refs_;
+        if (r == 0) delete this;
+        return r;
+    }
+
+    uint32_t STDMETHODCALLTYPE GetInputKind() override { return kSupportedKinds; }
+    uint64_t STDMETHODCALLTYPE GetSequenceNumber(uint32_t) override { return seq_; }
+    uint64_t STDMETHODCALLTYPE GetTimestamp() override { return ts_; }
+    void STDMETHODCALLTYPE GetDevice(IGameInputDevice** device) override;
+    bool STDMETHODCALLTYPE GetRawReport(void** report) override {
+        if (report) *report = nullptr;
+        return false;
+    }
+    uint32_t STDMETHODCALLTYPE GetControllerAxisCount() override { return kAxisCount; }
+    uint32_t STDMETHODCALLTYPE GetControllerAxisState(uint32_t count, float* out) override {
+        const uint32_t n = out ? std::min(count, kAxisCount) : 0;
+        std::memcpy(out, s_.axes, n * sizeof(float));
+        return n;
+    }
+    uint32_t STDMETHODCALLTYPE GetControllerButtonCount() override { return kButtonCount; }
+    uint32_t STDMETHODCALLTYPE GetControllerButtonState(uint32_t count, bool* out) override {
+        const uint32_t n = out ? std::min(count, kButtonCount) : 0;
+        std::memcpy(out, s_.buttons, n * sizeof(bool));
+        return n;
+    }
+    uint32_t STDMETHODCALLTYPE GetControllerSwitchCount() override { return 0; }
+    uint32_t STDMETHODCALLTYPE GetControllerSwitchState(uint32_t, GameInputSwitchPosition*) override { return 0; }
+    uint32_t STDMETHODCALLTYPE GetKeyCount() override { return 0; }
+    uint32_t STDMETHODCALLTYPE GetKeyState(uint32_t, void*) override { return 0; }
+    bool STDMETHODCALLTYPE GetMouseState(void*) override { return false; }
+    uint32_t STDMETHODCALLTYPE GetTouchCount() override { return 0; }
+    uint32_t STDMETHODCALLTYPE GetTouchState(uint32_t, void*) override { return 0; }
+    bool STDMETHODCALLTYPE GetMotionState(void*) override { return false; }
+    bool STDMETHODCALLTYPE GetArcadeStickState(void*) override { return false; }
+    bool STDMETHODCALLTYPE GetFlightStickState(void*) override { return false; }
+    bool STDMETHODCALLTYPE GetGamepadState(GameInputGamepadState* state) override {
+        if (!state) return false;
+        *state = s_.gamepad;
+        return true;
+    }
+    bool STDMETHODCALLTYPE GetRacingWheelState(void*) override { return false; }
+    bool STDMETHODCALLTYPE GetUiNavigationState(GameInputUiNavigationState* state) override {
+        if (!state) return false;
+        state->buttons = s_.ui;
+        return true;
+    }
+
+    Device* device() const { return device_; }
+    uint64_t order() const { return order_; }
+
+private:
+    std::atomic<ULONG> refs_{1};
+    Device* device_;
+    Snapshot s_;
+    uint64_t seq_, ts_;
+    uint64_t order_;  // place among every pad's readings, the order GetNextReading/GetPreviousReading follow
+};
+
+struct Rumble {
+    float low = 0, high = 0, left = 0, right = 0;
+};
+
+class Device final : public IGameInputDevice {
+public:
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** out) override {
+        if (!out) return E_POINTER;
+        if (same_guid(riid, IID_IUnknown) || same_guid(riid, IID_IGameInputDevice)) {
+            AddRef();
+            *out = static_cast<IGameInputDevice*>(this);
+            return S_OK;
+        }
+        *out = nullptr;
+        return E_NOINTERFACE;
+    }
+    // Devices live for the process: the registry keeps every device it has seen, so that a title holding one across a
+    // disconnect gets the same object back when the pad returns.
+    ULONG STDMETHODCALLTYPE AddRef() override { return ++refs_; }
+    ULONG STDMETHODCALLTYPE Release() override { return release_floor(refs_); }
+
+    const GameInputDeviceInfo* STDMETHODCALLTYPE GetDeviceInfo() override { return &info; }
+    uint32_t STDMETHODCALLTYPE GetDeviceStatus() override { return status.load(); }
+    void STDMETHODCALLTYPE GetBatteryState(GameInputBatteryState* state) override;
+    HRESULT STDMETHODCALLTYPE CreateForceFeedbackEffect(uint32_t, const void*, void** effect) override {
+        if (effect) *effect = nullptr;
+        return E_INVALIDARG;  // forceFeedbackMotorCount is 0
+    }
+    bool STDMETHODCALLTYPE IsForceFeedbackMotorPoweredOn(uint32_t) override { return false; }
+    void STDMETHODCALLTYPE SetForceFeedbackMotorGain(uint32_t, float) override {}
+    HRESULT STDMETHODCALLTYPE SetHapticMotorState(uint32_t, const void*) override { return E_INVALIDARG; }
+    void STDMETHODCALLTYPE SetRumbleState(const GameInputRumbleParams* params) override;
+    void STDMETHODCALLTYPE SetInputSynchronizationState(bool) override {}
+    void STDMETHODCALLTYPE SendInputSynchronizationHint() override {}
+    void STDMETHODCALLTYPE PowerOff() override {}
+    HRESULT STDMETHODCALLTYPE CreateRawDeviceReport(uint32_t, int32_t, void** report) override {
+        if (report) *report = nullptr;
+        return E_NOTIMPL;
+    }
+    HRESULT STDMETHODCALLTYPE GetRawDeviceFeature(uint32_t, void** report) override {
+        if (report) *report = nullptr;
+        return E_NOTIMPL;
+    }
+    HRESULT STDMETHODCALLTYPE SetRawDeviceFeature(void*) override { return E_NOTIMPL; }
+    HRESULT STDMETHODCALLTYPE SendRawDeviceOutput(void*) override { return E_NOTIMPL; }
+    HRESULT STDMETHODCALLTYPE SendRawDeviceOutputWithResponse(void*, void** response) override {
+        if (response) *response = nullptr;
+        return E_NOTIMPL;
+    }
+    HRESULT STDMETHODCALLTYPE ExecuteRawDeviceIoControl(uint32_t, size_t, const void*, size_t, void*, size_t* size) override {
+        if (size) *size = 0;
+        return E_NOTIMPL;
+    }
+    bool STDMETHODCALLTYPE AcquireExclusiveRawDeviceAccess(uint64_t) override { return false; }
+    void STDMETHODCALLTYPE ReleaseExclusiveRawDeviceAccess() override {}
+
+    // Shared state, under g().mu unless noted.
+    GameInputDeviceInfo info{};
+    std::string name;
+    GameInputString display_name{};
+    GameInputControllerAxisInfo axis_info[kAxisCount]{};
+    GameInputControllerButtonInfo button_info[kButtonCount]{};
+    GameInputGamepadInfo gamepad_info{};
+    GameInputUiNavigationInfo ui_info{};
+    std::atomic<uint32_t> status{GameInputDeviceNoStatus};
+    std::deque<Reading*> history;  // one reference each, oldest first; the newest is the current reading
+    uint64_t evicted_order = 0;    // order of the newest reading dropped from history
+    Reading* latest() const { return history.empty() ? nullptr : history.back(); }
+    uint64_t seq = 0;
+    Rumble wanted;
+    GameInputBatteryState battery{0, 0, 0, 0, GameInputBatteryUnknown};
+    AppLocalDeviceId base_id{};  // id_bytes of the identity alone: twins share it, info.deviceId tells them apart
+
+    // Poll-thread state.
+    SDL_Gamepad* pad = nullptr;
+    SDL_JoystickID id = 0;
+    int player = -1;
+    bool is_dualsense = false, has_rumble = false, has_trigger_rumble = false;
+    rt::gameinput::OutputState sent{};
+    Snapshot last_snap{};  // what the latest reading holds
+    uint64_t motors_sent_at = 0, triggers_sent_at = 0, battery_at = 0;
+    bool ds_sent_once = false;
+
+private:
+    std::atomic<ULONG> refs_{1};
+};
+
+Reading::Reading(Device* device, const Snapshot& s, uint64_t seq, uint64_t ts, uint64_t order)
+    : device_(device), s_(s), seq_(seq), ts_(ts), order_(order) {
+    device_->AddRef();
+}
+Reading::~Reading() { device_->Release(); }
+void Reading::GetDevice(IGameInputDevice** device) {
+    if (!device) return;
+    device_->AddRef();
+    *device = device_;
+}
+
+// ---- callbacks --------------------------------------------------------------------------------------------------
+
+enum class CbType { Device, Reading, Guide, KeyboardLayout };
+
+struct Callback {
+    GameInputCallbackToken token;
+    CbType type;
+    Device* device;  // filter, or null for all
+    uint32_t kind;
+    uint32_t status_filter;
+    void* context;
+    void* fn;
+    bool active;
+};
+
+struct Event {
+    CbType type;
+    Device* device;          // referenced
+    Reading* reading;        // referenced, Reading events only
+    uint64_t timestamp;
+    uint32_t current, previous;
+    bool pressed;
+    GameInputCallbackToken only;  // enumeration: deliver to this callback only
+};
+
+class Dispatcher;
+
+struct State {
+    std::recursive_mutex mu;       // everything below
+    std::mutex poll_mu;            // one poller at a time
+    std::recursive_mutex deliver_mu;  // held while callbacks run; UnregisterCallback waits on it
+    std::vector<Device*> devices;  // every device seen, for the process lifetime
+    std::vector<Device*> connected;  // open now, in connection order
+    std::vector<Callback> callbacks;
+    std::vector<Event> queue;
+    GameInputCallbackToken next_token = 1;
+    uint64_t last_order = 0;  // Reading::order of the newest reading
+    int dispatchers = 0;
+    HANDLE wait_event = nullptr;  // auto-reset, signalled when a dispatcher has work
+    rt::gameinput::Config config;
+    bool config_read = false;
+    bool sdl_ready = false, sdl_failed = false;
+    bool thread_started = false;
+    std::atomic<DWORD> delivering_thread{0};  // written by the delivering thread, read unlocked by UnregisterCallback
+};
+
+// Never destroyed: the poll thread may still run while the process exits.
+State& g() {
+    static State* s = new State;
+    return *s;
+}
+
+void queue_event(const Event& e) {
+    if (e.device) e.device->AddRef();
+    if (e.reading) e.reading->AddRef();
+    g().queue.push_back(e);
+}
+
+bool matches(const Callback& c, const Event& e) {
+    if (!c.active || c.type != e.type) return false;
+    if (e.only && e.only != c.token) return false;
+    if (c.device && c.device != e.device) return false;
+    switch (e.type) {
+        case CbType::Device:
+            if (!(c.kind & e.device->info.supportedInput) && c.kind != GameInputKindUnknown) return false;
+            return e.only || ((e.current ^ e.previous) & c.status_filter);
+        case CbType::Reading:
+            return (c.kind & kSupportedKinds) || c.kind == GameInputKindUnknown;
+        default:
+            return true;
+    }
+}
+
+void call(const Callback& c, const Event& e) {
+    switch (c.type) {
+        case CbType::Device:
+            reinterpret_cast<GameInputDeviceCallback>(c.fn)(c.token, c.context, e.device, e.timestamp, e.current, e.previous);
+            break;
+        case CbType::Reading:
+            reinterpret_cast<GameInputReadingCallback>(c.fn)(c.token, c.context, e.reading, false);
+            break;
+        case CbType::Guide:
+            reinterpret_cast<GameInputGuideButtonCallback>(c.fn)(c.token, c.context, e.device, e.timestamp, e.pressed);
+            break;
+        case CbType::KeyboardLayout:
+            break;
+    }
+}
+
+// Runs queued callbacks on the calling thread, without holding the state lock. Returns whether more events arrived
+// meanwhile.
+bool deliver() {
+    State& s = g();
+    std::lock_guard dl(s.deliver_mu);
+    std::vector<Event> events;
+    {
+        std::lock_guard lock(s.mu);
+        events.swap(s.queue);
+    }
+    const DWORD self = GetCurrentThreadId();
+    s.delivering_thread = self;
+    for (const Event& e : events) {
+        std::vector<Callback> targets;
+        {
+            std::lock_guard lock(s.mu);
+            for (const Callback& c : s.callbacks)
+                if (matches(c, e)) targets.push_back(c);
+        }
+        for (const Callback& c : targets) {
+            bool still = false;
+            {
+                std::lock_guard lock(s.mu);
+                for (const Callback& now : s.callbacks)
+                    if (now.token == c.token) still = now.active;
+            }
+            if (still) call(c, e);
+        }
+        if (e.device) e.device->Release();
+        if (e.reading) e.reading->Release();
+    }
+    s.delivering_thread = 0;
+    std::lock_guard lock(s.mu);
+    return !s.queue.empty();
+}
+
+// ---- SDL backend (poll thread only) -----------------------------------------------------------------------------
+
+uint16_t to_u16(float v) { return static_cast<uint16_t>(std::lround(std::clamp(v, 0.0f, 1.0f) * 65535.0f)); }
+
+float axis(SDL_Gamepad* p, SDL_GamepadAxis a) { return std::max(-1.0f, SDL_GetGamepadAxis(p, a) / 32767.0f); }
+
+Snapshot read_pad(SDL_Gamepad* p) {
+    Snapshot s;
+    auto down = [p](SDL_GamepadButton b) { return SDL_GetGamepadButton(p, b); };
+    struct Map { SDL_GamepadButton sdl; uint32_t gi; };
+    static const Map kMap[] = {
+        {SDL_GAMEPAD_BUTTON_START, GameInputGamepadMenu},
+        {SDL_GAMEPAD_BUTTON_BACK, GameInputGamepadView},
+        {SDL_GAMEPAD_BUTTON_SOUTH, GameInputGamepadA},
+        {SDL_GAMEPAD_BUTTON_EAST, GameInputGamepadB},
+        {SDL_GAMEPAD_BUTTON_WEST, GameInputGamepadX},
+        {SDL_GAMEPAD_BUTTON_NORTH, GameInputGamepadY},
+        {SDL_GAMEPAD_BUTTON_DPAD_UP, GameInputGamepadDPadUp},
+        {SDL_GAMEPAD_BUTTON_DPAD_DOWN, GameInputGamepadDPadDown},
+        {SDL_GAMEPAD_BUTTON_DPAD_LEFT, GameInputGamepadDPadLeft},
+        {SDL_GAMEPAD_BUTTON_DPAD_RIGHT, GameInputGamepadDPadRight},
+        {SDL_GAMEPAD_BUTTON_LEFT_SHOULDER, GameInputGamepadLeftShoulder},
+        {SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER, GameInputGamepadRightShoulder},
+        {SDL_GAMEPAD_BUTTON_LEFT_STICK, GameInputGamepadLeftThumbstick},
+        {SDL_GAMEPAD_BUTTON_RIGHT_STICK, GameInputGamepadRightThumbstick},
+    };
+    for (const Map& m : kMap)
+        if (down(m.sdl)) s.gamepad.buttons |= m.gi;
+    // GameInput: sticks in -1..1 with +Y up, triggers in 0..1. SDL: +Y down, -32768..32767, triggers 0..32767.
+    s.gamepad.leftThumbstickX = axis(p, SDL_GAMEPAD_AXIS_LEFTX);
+    s.gamepad.leftThumbstickY = -axis(p, SDL_GAMEPAD_AXIS_LEFTY);
+    s.gamepad.rightThumbstickX = axis(p, SDL_GAMEPAD_AXIS_RIGHTX);
+    s.gamepad.rightThumbstickY = -axis(p, SDL_GAMEPAD_AXIS_RIGHTY);
+    s.gamepad.leftTrigger = std::max(0.0f, axis(p, SDL_GAMEPAD_AXIS_LEFT_TRIGGER));
+    s.gamepad.rightTrigger = std::max(0.0f, axis(p, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER));
+
+    // Controller axes, 0..1 with 0.5 at rest for the sticks (VERIFY: the raw-axis convention of a GameInput gamepad).
+    s.axes[0] = (s.gamepad.leftThumbstickX + 1) * 0.5f;
+    s.axes[1] = (s.gamepad.leftThumbstickY + 1) * 0.5f;
+    s.axes[2] = (s.gamepad.rightThumbstickX + 1) * 0.5f;
+    s.axes[3] = (s.gamepad.rightThumbstickY + 1) * 0.5f;
+    s.axes[4] = s.gamepad.leftTrigger;
+    s.axes[5] = s.gamepad.rightTrigger;
+    for (uint32_t i = 0; i < kButtonCount; ++i) s.buttons[i] = down(static_cast<SDL_GamepadButton>(i));
+    s.guide = down(SDL_GAMEPAD_BUTTON_GUIDE);
+
+    // UI navigation derived from the gamepad (VERIFY against the console's own mapping).
+    const uint32_t b = s.gamepad.buttons;
+    const float t = 0.5f;
+    uint32_t& u = s.ui;
+    if (b & GameInputGamepadMenu) u |= GameInputUiNavigationMenu;
+    if (b & GameInputGamepadView) u |= GameInputUiNavigationView;
+    if (b & GameInputGamepadA) u |= GameInputUiNavigationAccept;
+    if (b & GameInputGamepadB) u |= GameInputUiNavigationCancel;
+    if (b & GameInputGamepadX) u |= GameInputUiNavigationContext1;
+    if (b & GameInputGamepadY) u |= GameInputUiNavigationContext2;
+    if (b & GameInputGamepadLeftThumbstick) u |= GameInputUiNavigationContext3;
+    if (b & GameInputGamepadRightThumbstick) u |= GameInputUiNavigationContext4;
+    if ((b & GameInputGamepadDPadUp) || s.gamepad.leftThumbstickY > t) u |= GameInputUiNavigationUp;
+    if ((b & GameInputGamepadDPadDown) || s.gamepad.leftThumbstickY < -t) u |= GameInputUiNavigationDown;
+    if ((b & GameInputGamepadDPadLeft) || s.gamepad.leftThumbstickX < -t) u |= GameInputUiNavigationLeft;
+    if ((b & GameInputGamepadDPadRight) || s.gamepad.leftThumbstickX > t) u |= GameInputUiNavigationRight;
+    if (b & GameInputGamepadLeftShoulder) u |= GameInputUiNavigationPageLeft;
+    if (b & GameInputGamepadRightShoulder) u |= GameInputUiNavigationPageRight;
+    if (s.gamepad.leftTrigger > t) u |= GameInputUiNavigationPageUp;
+    if (s.gamepad.rightTrigger > t) u |= GameInputUiNavigationPageDown;
+    if (s.gamepad.rightThumbstickY > t) u |= GameInputUiNavigationScrollUp;
+    if (s.gamepad.rightThumbstickY < -t) u |= GameInputUiNavigationScrollDown;
+    if (s.gamepad.rightThumbstickX < -t) u |= GameInputUiNavigationScrollLeft;
+    if (s.gamepad.rightThumbstickX > t) u |= GameInputUiNavigationScrollRight;
+    return s;
+}
+
+void id_bytes(const std::string& identity, const SDL_GUID& guid, AppLocalDeviceId* out) {
+    std::memcpy(out->value, guid.data, 16);
+    for (int half = 0; half < 2; ++half) {  // FNV-1a, two seeds
+        uint64_t h = half ? 0x84222325cbf29ce4ull : 0xcbf29ce484222325ull;
+        for (unsigned char c : identity) h = (h ^ c) * 0x100000001b3ull;
+        std::memcpy(out->value + 16 + half * 8, &h, 8);
+    }
+}
+
+// Twin n of an identity. Twin 0 is the plain id, so a pad without twins keeps the id it always had. Real identities
+// start with "s:", "p:" or are empty, never "t:", so a twin id cannot be another pad's own id.
+void id_bytes(const std::string& identity, const SDL_GUID& guid, uint32_t twin, AppLocalDeviceId* out) {
+    id_bytes(twin ? "t:" + std::to_string(twin) + ":" + identity : identity, guid, out);
+}
+
+void fill_info(Device* d, SDL_Gamepad* p, const AppLocalDeviceId& id) {
+    GameInputDeviceInfo& i = d->info;
+    i = {};
+    i.infoSize = sizeof(GameInputDeviceInfo);
+    i.vendorId = SDL_GetGamepadVendor(p);
+    i.productId = SDL_GetGamepadProduct(p);
+    i.revisionNumber = SDL_GetGamepadProductVersion(p);
+    i.usage = {0x01, 0x05};  // HID generic desktop / game pad
+    const uint16_t fw = SDL_GetGamepadFirmwareVersion(p);
+    i.firmwareVersion = {static_cast<uint16_t>(fw >> 8), static_cast<uint16_t>(fw & 0xFF), 0, 0};
+    i.deviceId = id;
+    i.deviceRootId = id;
+    // Every pad is presented as an Xbox gamepad, which is all a console title expects (VERIFY: whether a title
+    // filters on the family).
+    i.deviceFamily = GameInputFamilyXboxOne;
+    if (SDL_GetGamepadConnectionState(p) == SDL_JOYSTICK_CONNECTION_WIRELESS) i.capabilities |= GameInputDeviceCapabilityWireless;
+    i.supportedInput = kSupportedKinds;
+    if (d->has_rumble) i.supportedRumbleMotors |= GameInputRumbleLowFrequency | GameInputRumbleHighFrequency;
+    if (d->has_trigger_rumble || (d->is_dualsense && g().config.ds_triggers != rt::gameinput::DsTriggerMode::Off))
+        i.supportedRumbleMotors |= GameInputRumbleLeftTrigger | GameInputRumbleRightTrigger;
+    i.controllerAxisCount = kAxisCount;
+    i.controllerButtonCount = kButtonCount;
+    for (uint32_t a = 0; a < kAxisCount; ++a) {
+        d->axis_info[a] = {};
+        d->axis_info[a].mappedInputKinds = GameInputKindGamepad;
+        d->axis_info[a].isContinuous = true;
+        d->axis_info[a].hasRestValue = true;
+        d->axis_info[a].restValue = a < 4 ? 0.5f : 0.0f;
+        d->axis_info[a].resolution = 65536;
+        d->axis_info[a].legacyHidIndex = static_cast<uint16_t>(a);
+        d->axis_info[a].legacyDInputIndex = static_cast<uint16_t>(a);
+    }
+    for (uint32_t b = 0; b < kButtonCount; ++b) {
+        d->button_info[b] = {};
+        d->button_info[b].mappedInputKinds = GameInputKindGamepad;
+        d->button_info[b].legacyHidIndex = static_cast<uint16_t>(b);
+        d->button_info[b].legacyDInputIndex = static_cast<uint16_t>(b);
+    }
+    i.controllerAxisInfo = d->axis_info;
+    i.controllerButtonInfo = d->button_info;
+    i.gamepadInfo = &d->gamepad_info;
+    i.uiNavigationInfo = &d->ui_info;
+    const char* n = SDL_GetGamepadName(p);
+    d->name = n ? n : "Gamepad";
+    uint32_t points = 0;
+    for (unsigned char c : d->name) points += (c & 0xC0) != 0x80;
+    d->display_name = {static_cast<uint32_t>(d->name.size()), points, d->name.c_str()};
+    i.displayName = &d->display_name;
+}
+
+// Makes snap the device's current reading. A reading leaves the history once the one after it is more than kHistoryUs
+// old, so the last half second stays reachable however long the pad then idles; kHistoryCap bounds a flood. Readings
+// the title holds outlive their place here (~Reading only releases the device, which takes no lock). Under g().mu.
+Reading* push_reading(Device* d, const Snapshot& snap, uint64_t ts) {
+    std::deque<Reading*>& h = d->history;
+    h.push_back(new Reading(d, snap, ++d->seq, ts, ++g().last_order));
+    while (h.size() > kHistoryCap || (h.size() > 1 && h[1]->GetTimestamp() + kHistoryUs < ts)) {
+        d->evicted_order = h.front()->order();
+        h.front()->Release();
+        h.pop_front();
+    }
+    return h.back();
+}
+
+void open_pad(SDL_JoystickID jid, uint64_t ts) {
+    State& s = g();
+    SDL_Gamepad* p = SDL_OpenGamepad(jid);
+    if (!p) {
+        std::fprintf(stderr, "[rt] gameinput: cannot open gamepad %u: %s\n", static_cast<unsigned>(jid), SDL_GetError());
+        return;
+    }
+    const char* serial = SDL_GetGamepadSerial(p);
+    const char* path = SDL_GetGamepadPath(p);
+    const std::string identity = (serial && *serial) ? std::string("s:") + serial : (path && *path) ? std::string("p:") + path : "";
+    const SDL_GUID guid = SDL_GetGamepadGUIDForID(jid);
+    AppLocalDeviceId base{};
+    id_bytes(identity, guid, &base);
+
+    const SDL_PropertiesID props = SDL_GetGamepadProperties(p);
+    std::lock_guard lock(s.mu);
+    // The same pad coming back gets its old object. Pads with the same GUID and serial or path (identical pads with
+    // neither, mostly) are twins sharing one base id, told apart by order alone: the lowest disconnected twin is
+    // reused, and a new one gets the next free twin id. Which physical pad was which cannot be recovered, so twins
+    // that return in a different order swap objects and ids (docs/gameinput.md).
+    Device* d = nullptr;
+    uint32_t twins = 0;
+    for (Device* old : s.devices) {  // creation order, so twins in twin order
+        if (std::memcmp(&old->base_id, &base, sizeof base) != 0) continue;
+        ++twins;
+        if (!d && old->status == GameInputDeviceNoStatus) d = old;
+    }
+    AppLocalDeviceId id = d ? d->info.deviceId : base;  // a copy: fill_info clears info before it writes the id
+    if (!d) {
+        const auto taken = [&s](const AppLocalDeviceId& v) {
+            for (Device* o : s.devices)
+                if (std::memcmp(&o->info.deviceId, &v, sizeof v) == 0) return true;
+            return false;
+        };
+        id_bytes(identity, guid, twins, &id);
+        for (uint32_t n = twins + 1; taken(id); ++n) id_bytes(identity, guid, n, &id);
+        d = new Device;
+        d->base_id = base;
+        s.devices.push_back(d);
+    }
+    d->pad = p;
+    d->id = jid;
+    d->is_dualsense = SDL_GetGamepadType(p) == SDL_GAMEPAD_TYPE_PS5;
+    d->has_rumble = SDL_GetBooleanProperty(props, SDL_PROP_GAMEPAD_CAP_RUMBLE_BOOLEAN, false);
+    d->has_trigger_rumble = SDL_GetBooleanProperty(props, SDL_PROP_GAMEPAD_CAP_TRIGGER_RUMBLE_BOOLEAN, false);
+    d->sent = {};
+    d->sent.is_dualsense = d->is_dualsense;
+    d->sent.trigger_rumble = d->has_trigger_rumble;
+    d->ds_sent_once = false;
+    d->motors_sent_at = d->triggers_sent_at = d->battery_at = 0;
+    d->wanted = {};
+    fill_info(d, p, id);
+
+    // Player LEDs and SDL's default lightbar colour follow the slot: the lowest one not in use.
+    int player = 0;
+    for (bool used = true; used; ++player) {
+        used = false;
+        for (Device* c : s.connected) used |= c->player == player;
+        if (!used) break;
+    }
+    d->player = player;
+    SDL_SetGamepadPlayerIndex(p, player);
+    if (s.config.lightbar_set && SDL_GetBooleanProperty(props, SDL_PROP_GAMEPAD_CAP_RGB_LED_BOOLEAN, false))
+        SDL_SetGamepadLED(p, s.config.lightbar[0], s.config.lightbar[1], s.config.lightbar[2]);
+
+    uint32_t status = kConnectedStatus;
+    if (d->info.capabilities & GameInputDeviceCapabilityWireless) status |= GameInputDeviceWireless;
+    d->status = status;
+    s.connected.push_back(d);
+
+    const Snapshot snap = read_pad(p);
+    d->last_snap = snap;
+    push_reading(d, snap, ts);
+    queue_event({CbType::Device, d, nullptr, ts, status, GameInputDeviceNoStatus, false, 0});
+    std::fprintf(stderr, "[rt] gameinput: connected %s (%04x:%04x, player %d%s%s)\n", d->name.c_str(), d->info.vendorId,
+                 d->info.productId, player + 1, d->is_dualsense ? ", DualSense trigger effects" : "",
+                 d->has_trigger_rumble ? ", trigger rumble" : "");
+}
+
+void close_pad(Device* d, uint64_t ts) {
+    State& s = g();
+    std::lock_guard lock(s.mu);
+    const uint32_t old = d->status.exchange(GameInputDeviceNoStatus);
+    SDL_CloseGamepad(d->pad);
+    d->pad = nullptr;
+    d->player = -1;
+    if (!d->history.empty()) d->evicted_order = d->history.back()->order();  // the history ends with the session
+    for (Reading* r : d->history) r->Release();
+    d->history.clear();
+    s.connected.erase(std::remove(s.connected.begin(), s.connected.end(), d), s.connected.end());
+    queue_event({CbType::Device, d, nullptr, ts, GameInputDeviceNoStatus, old, false, 0});
+    std::fprintf(stderr, "[rt] gameinput: disconnected %s\n", d->name.c_str());
+}
+
+void ds_effect(float strength, uint8_t out[11]) {
+    const rt::gameinput::Config& c = g().config;
+    std::memset(out, 0, 11);
+    const uint8_t v = static_cast<uint8_t>(std::lround(std::clamp(strength * c.ds_trigger_gain, 0.0f, 1.0f) * 255.0f));
+    if (v == 0) {
+        out[0] = 0x05;  // effect off
+    } else if (c.ds_triggers == rt::gameinput::DsTriggerMode::Resistance) {
+        out[0] = 0x01;  // continuous resistance: start position, force
+        out[1] = 0;
+        out[2] = v;
+    } else {
+        out[0] = 0x06;  // vibration: frequency, amplitude, start position
+        out[1] = c.ds_trigger_frequency;
+        out[2] = v;
+        out[3] = 0;
+    }
+}
+
+void apply_output(Device* d, uint64_t now) {
+    State& s = g();
+    Rumble want;
+    {
+        std::lock_guard lock(s.mu);
+        want = d->wanted;
+    }
+    if (!s.config.rumble) want = {};
+    rt::gameinput::OutputState& o = d->sent;
+
+    if (d->has_rumble) {
+        const uint16_t lo = to_u16(want.low), hi = to_u16(want.high);
+        const bool stale = (lo || hi) && now - d->motors_sent_at > kRumbleRefreshUs;
+        if (lo != o.low || hi != o.high || stale) {
+            SDL_RumbleGamepad(d->pad, lo, hi, kRumbleDurationMs);
+            o.low = lo;
+            o.high = hi;
+            d->motors_sent_at = now;
+        }
+    }
+    if (d->is_dualsense) {
+        if (s.config.ds_triggers == rt::gameinput::DsTriggerMode::Off) return;  // leave the triggers alone
+        uint8_t right[11], left[11];
+        ds_effect(want.right, right);
+        ds_effect(want.left, left);
+        if (!d->ds_sent_once || std::memcmp(right, o.ds_right, 11) || std::memcmp(left, o.ds_left, 11)) {
+            uint8_t block[kDsEffectSize] = {};
+            block[0] = 0x04 | 0x08;  // valid flags: right and left trigger effect
+            std::memcpy(block + 10, right, 11);
+            std::memcpy(block + 21, left, 11);
+            if (SDL_SendGamepadEffect(d->pad, block, sizeof block)) {
+                std::memcpy(o.ds_right, right, 11);
+                std::memcpy(o.ds_left, left, 11);
+                d->ds_sent_once = true;
+            }
+        }
+    } else if (d->has_trigger_rumble) {
+        const uint16_t l = to_u16(want.left), r = to_u16(want.right);
+        const bool stale = (l || r) && now - d->triggers_sent_at > kRumbleRefreshUs;
+        if (l != o.left || r != o.right || stale) {
+            SDL_RumbleGamepadTriggers(d->pad, l, r, kRumbleDurationMs);
+            o.left = l;
+            o.right = r;
+            d->triggers_sent_at = now;
+        }
+    }
+}
+
+void refresh_battery(Device* d, uint64_t now) {
+    if (now - d->battery_at < kBatteryRefreshUs && d->battery_at) return;
+    d->battery_at = now;
+    int percent = -1;
+    const SDL_PowerState ps = SDL_GetGamepadPowerInfo(d->pad, &percent);
+    GameInputBatteryState b{0, 0, 0, 0, GameInputBatteryUnknown};
+    switch (ps) {
+        case SDL_POWERSTATE_ON_BATTERY: b.status = GameInputBatteryDischarging; break;
+        case SDL_POWERSTATE_CHARGING: b.status = GameInputBatteryCharging; break;
+        case SDL_POWERSTATE_CHARGED: b.status = GameInputBatteryIdle; break;
+        case SDL_POWERSTATE_NO_BATTERY: b.status = GameInputBatteryNotPresent; break;
+        default: break;
+    }
+    if (percent >= 0) {  // relative capacity (VERIFY: GameInput reports the capacity in device units)
+        b.remainingCapacity = percent / 100.0f;
+        b.fullChargeCapacity = 1.0f;
+    }
+    std::lock_guard lock(g().mu);
+    d->battery = b;
+}
+
+// ---- keyboard pad (poll thread only) ----------------------------------------------------------------------------
+//
+// The title reads gamepads, not the keyboard, so keys reach it as one more pad: an SDL virtual gamepad that this
+// code presses buttons on each poll. It then goes through open_pad and read_pad like any controller, so it gets a
+// device object, a player slot, readings, callbacks and UI navigation the same way. It has no motors, so rumble sent
+// to it is dropped. Keys are read with GetAsyncKeyState, which needs no window or message loop and works under Wine.
+
+constexpr rt::gameinput::KeyBinding kKeyBindings[] = {
+    {VK_UP, SDL_GAMEPAD_BUTTON_DPAD_UP, "Up"},
+    {VK_DOWN, SDL_GAMEPAD_BUTTON_DPAD_DOWN, "Down"},
+    {VK_LEFT, SDL_GAMEPAD_BUTTON_DPAD_LEFT, "Left"},
+    {VK_RIGHT, SDL_GAMEPAD_BUTTON_DPAD_RIGHT, "Right"},
+    {VK_RETURN, SDL_GAMEPAD_BUTTON_SOUTH, "Enter"},
+    {VK_BACK, SDL_GAMEPAD_BUTTON_EAST, "Backspace"},
+    {'X', SDL_GAMEPAD_BUTTON_WEST, "X"},
+    {'Y', SDL_GAMEPAD_BUTTON_NORTH, "Y"},
+    {'Q', SDL_GAMEPAD_BUTTON_LEFT_SHOULDER, "Q"},
+    {'E', SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER, "E"},
+    {VK_ESCAPE, SDL_GAMEPAD_BUTTON_START, "Esc"},
+    {VK_TAB, SDL_GAMEPAD_BUTTON_BACK, "Tab"},
+};
+
+bool async_key_down(int vk) { return (GetAsyncKeyState(vk) & 0x8000) != 0; }
+
+bool foreground_is_ours() {
+    const HWND w = GetForegroundWindow();
+    DWORD pid = 0;
+    return w && GetWindowThreadProcessId(w, &pid) && pid == GetCurrentProcessId();
+}
+
+std::atomic<rt::gameinput::KeyDownFn> g_key_down{async_key_down};
+std::atomic<rt::gameinput::HasFocusFn> g_has_focus{foreground_is_ours};
+
+struct KeyboardPad {
+    SDL_JoystickID id = 0;
+    SDL_Joystick* js = nullptr;
+    bool failed = false;  // attaching failed once; not retried every 2 ms
+};
+KeyboardPad g_keyboard;
+
+void detach_keyboard_pad() {
+    if (g_keyboard.js) SDL_CloseJoystick(g_keyboard.js);
+    if (g_keyboard.id) SDL_DetachVirtualJoystick(g_keyboard.id);
+    if (g_keyboard.id) std::fprintf(stderr, "[rt] gameinput: keyboard pad removed\n");
+    g_keyboard = {};
+}
+
+bool attach_keyboard_pad() {
+    SDL_VirtualJoystickDesc d;
+    SDL_INIT_INTERFACE(&d);
+    d.type = SDL_JOYSTICK_TYPE_GAMEPAD;
+    d.naxes = SDL_GAMEPAD_AXIS_COUNT;
+    d.nbuttons = SDL_GAMEPAD_BUTTON_COUNT;
+    d.button_mask = (1u << SDL_GAMEPAD_BUTTON_COUNT) - 1;
+    d.axis_mask = (1u << SDL_GAMEPAD_AXIS_COUNT) - 1;
+    d.name = "Keyboard pad (Leonida)";
+    g_keyboard.id = SDL_AttachVirtualJoystick(&d);
+    g_keyboard.js = g_keyboard.id ? SDL_OpenJoystick(g_keyboard.id) : nullptr;
+    if (!g_keyboard.js) {
+        std::fprintf(stderr, "[rt] gameinput: cannot attach the keyboard pad: %s\n", SDL_GetError());
+        detach_keyboard_pad();
+        g_keyboard.failed = true;
+        return false;
+    }
+    // Triggers at rest: SDL maps a full-range virtual axis to the trigger, so -32768 is released, 0 half pulled.
+    SDL_SetJoystickVirtualAxis(g_keyboard.js, SDL_GAMEPAD_AXIS_LEFT_TRIGGER, -32768);
+    SDL_SetJoystickVirtualAxis(g_keyboard.js, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER, -32768);
+    std::fprintf(stderr, "[rt] gameinput: keyboard pad attached (arrows d-pad, Enter A, Backspace B, X X, Y Y, "
+                         "Q/E shoulders, Esc Menu, Tab View)\n");
+    return true;
+}
+
+// Before SDL_UpdateGamepads, so the buttons set here are in this poll's reading.
+void update_keyboard_pad() {
+    rt::gameinput::KeyboardPadMode mode;
+    {
+        std::lock_guard lock(g().mu);
+        mode = g().config.keyboard_pad;
+    }
+    if (mode == rt::gameinput::KeyboardPadMode::Off) {
+        if (g_keyboard.id) detach_keyboard_pad();
+        g_keyboard.failed = false;
+        return;
+    }
+    if (!g_keyboard.js && (g_keyboard.failed || !attach_keyboard_pad())) return;
+
+    bool down[SDL_GAMEPAD_BUTTON_COUNT] = {};
+    // Out of focus every button is released, so a key held while switching windows does not stay pressed.
+    if (mode == rt::gameinput::KeyboardPadMode::Always || g_has_focus.load()()) {
+        const rt::gameinput::KeyDownFn key_down = g_key_down.load();
+        for (const auto& b : kKeyBindings) down[b.sdl_button] |= key_down(b.virtual_key);
+    }
+    for (const auto& b : kKeyBindings) SDL_SetJoystickVirtualButton(g_keyboard.js, b.sdl_button, down[b.sdl_button]);
+}
+
+bool init_sdl() {
+    State& s = g();
+    if (s.sdl_ready) return true;
+    if (s.sdl_failed) return false;
+    // No window: keep reading pads when another application has focus.
+    SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
+    // Never read pads through the host's GameInput underneath this GameInput shim (SDL's default is already off
+    // outside the GDK; this keeps it off if that default changes).
+#ifdef SDL_HINT_JOYSTICK_GAMEINPUT
+    SDL_SetHint(SDL_HINT_JOYSTICK_GAMEINPUT, "0");
+#endif
+    SDL_SetGamepadEventsEnabled(false);  // the shim reads state directly; nothing drains an event queue
+    if (!SDL_InitSubSystem(SDL_INIT_GAMEPAD)) {
+        std::fprintf(stderr, "[rt] gameinput: SDL gamepad init failed: %s; no controllers\n", SDL_GetError());
+        s.sdl_failed = true;
+        return false;
+    }
+    SDL_SetGamepadEventsEnabled(false);
+    s.sdl_ready = true;
+    const int v = SDL_GetVersion();
+    std::fprintf(stderr, "[rt] gameinput: SDL %d.%d.%d gamepads\n", SDL_VERSIONNUM_MAJOR(v), SDL_VERSIONNUM_MINOR(v),
+                 SDL_VERSIONNUM_MICRO(v));
+    return true;
+}
+
+void poll_once() {
+    State& s = g();
+    std::lock_guard pl(s.poll_mu);
+    if (!init_sdl()) return;
+    update_keyboard_pad();
+    SDL_UpdateGamepads();
+    const uint64_t now = now_us();
+
+    int count = 0;
+    SDL_JoystickID* ids = SDL_GetGamepads(&count);
+    std::vector<SDL_JoystickID> present(ids, ids + (ids ? count : 0));
+    SDL_free(ids);
+
+    std::vector<Device*> connected;
+    {
+        std::lock_guard lock(s.mu);
+        connected = s.connected;
+    }
+    for (Device* d : connected)
+        if (std::find(present.begin(), present.end(), d->id) == present.end() || !SDL_GamepadConnected(d->pad))
+            close_pad(d, now);
+    for (SDL_JoystickID jid : present) {
+        bool known = false;
+        {
+            std::lock_guard lock(s.mu);
+            for (Device* d : s.connected) known |= d->id == jid;
+        }
+        if (!known) open_pad(jid, now);
+    }
+
+    {
+        std::lock_guard lock(s.mu);
+        connected = s.connected;
+    }
+    for (Device* d : connected) {
+        const Snapshot snap = read_pad(d->pad);
+        const bool guide_changed = d->last_snap.guide != snap.guide;
+        const bool changed = !(d->last_snap == snap);
+        d->last_snap = snap;
+        if (changed) {
+            std::lock_guard lock(s.mu);
+            queue_event({CbType::Reading, d, push_reading(d, snap, now), now, 0, 0, false, 0});
+        }
+        if (guide_changed) {
+            std::lock_guard lock(s.mu);
+            queue_event({CbType::Guide, d, nullptr, now, 0, 0, snap.guide, 0});
+        }
+        refresh_battery(d, now);
+        apply_output(d, now);
+    }
+}
+
+void poll_and_deliver() {
+    poll_once();
+    State& s = g();
+    bool dispatch;
+    bool pending;
+    {
+        std::lock_guard lock(s.mu);
+        dispatch = s.dispatchers > 0;
+        pending = !s.queue.empty();
+    }
+    if (!pending) return;
+    if (dispatch) SetEvent(s.wait_event);
+    else deliver();
+}
+
+void poll_thread() {
+    HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+    if (!timer) timer = CreateWaitableTimerW(nullptr, FALSE, nullptr);
+    LARGE_INTEGER due;
+    due.QuadPart = -20'000;  // 2 ms, relative
+    for (;;) {
+        poll_and_deliver();
+        if (timer && SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE)) WaitForSingleObject(timer, INFINITE);
+        else Sleep(1);
+    }
+}
+
+void ensure_started() {
+    State& s = g();
+    std::lock_guard lock(s.mu);
+    if (!s.config_read) {
+        s.config = read_config();
+        s.config_read = true;
+        s.wait_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    }
+    if (s.config.background_thread && !s.thread_started) {
+        s.thread_started = true;
+        std::thread(poll_thread).detach();
+    }
+}
+
+// ---- IGameInputDevice methods that need State ----
+
+void Device::GetBatteryState(GameInputBatteryState* state) {
+    if (!state) return;
+    std::lock_guard lock(g().mu);
+    *state = battery;
+}
+
+void Device::SetRumbleState(const GameInputRumbleParams* params) {
+    std::lock_guard lock(g().mu);
+    wanted = params ? Rumble{params->lowFrequency, params->highFrequency, params->leftTrigger, params->rightTrigger} : Rumble{};
+}
+
+// ---- IGameInputDispatcher ----
+
+class Dispatcher final : public IGameInputDispatcher {
+public:
+    Dispatcher() {
+        std::lock_guard lock(g().mu);
+        ++g().dispatchers;
+    }
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** out) override {
+        if (!out) return E_POINTER;
+        if (same_guid(riid, IID_IUnknown) || same_guid(riid, IID_IGameInputDispatcher)) {
+            AddRef();
+            *out = static_cast<IGameInputDispatcher*>(this);
+            return S_OK;
+        }
+        *out = nullptr;
+        return E_NOINTERFACE;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return ++refs_; }
+    ULONG STDMETHODCALLTYPE Release() override {
+        const ULONG r = --refs_;
+        if (r == 0) {
+            {
+                std::lock_guard lock(g().mu);
+                --g().dispatchers;
+            }
+            delete this;
+        }
+        return r;
+    }
+    // Runs the queued callbacks on the caller's thread. The quota is not enforced: the queue is short.
+    bool STDMETHODCALLTYPE Dispatch(uint64_t) override { return deliver(); }
+    HRESULT STDMETHODCALLTYPE OpenWaitHandle(HANDLE* handle) override {
+        if (!handle) return E_POINTER;
+        *handle = nullptr;
+        if (!DuplicateHandle(GetCurrentProcess(), g().wait_event, GetCurrentProcess(), handle, 0, FALSE, DUPLICATE_SAME_ACCESS))
+            return HRESULT_FROM_WIN32(GetLastError());
+        return S_OK;
+    }
+
+private:
+    std::atomic<ULONG> refs_{1};
+};
+
+// ---- IGameInput ----
+
+Device* as_device(IGameInputDevice* d) { return static_cast<Device*>(d); }
+
+// GetNextReading (forward) and GetPreviousReading: the reading right after or right before the reference in the order
+// readings were taken, from the filter device's history or, with no filter, every connected pad's. Readings compare by
+// Reading::order, not timestamp, since pads polled together share one. The horizon is the newest reading dropped from
+// the histories searched (with no filter the reference's pad counts too, even unplugged): a step that would cross it
+// is REFERENCE_READING_TOO_OLD rather than a silent skip.
+HRESULT find_reading(IGameInputReading* ref, uint32_t kind, IGameInputDevice* device, IGameInputReading** out,
+                     bool forward) {
+    if (!out) return E_POINTER;
+    *out = nullptr;
+    if (!ref) return E_INVALIDARG;
+    if (kind != GameInputKindUnknown && !(kind & kSupportedKinds)) return GAMEINPUT_E_READING_NOT_FOUND;
+    const Reading* r = static_cast<Reading*>(ref);
+    State& s = g();
+    std::lock_guard lock(s.mu);
+    std::vector<Device*> scope = s.connected;
+    uint64_t horizon = 0;
+    if (device) {
+        if (as_device(device)->status == GameInputDeviceNoStatus) return GAMEINPUT_E_DEVICE_DISCONNECTED;
+        scope = {as_device(device)};
+    } else {
+        horizon = r->device()->evicted_order;
+    }
+    for (Device* d : scope) horizon = std::max(horizon, d->evicted_order);
+    if (forward ? horizon > r->order() : horizon >= r->order()) return GAMEINPUT_E_REFERENCE_READING_TOO_OLD;
+    Reading* best = nullptr;
+    for (Device* d : scope)
+        for (Reading* c : d->history) {
+            const bool beyond = forward ? c->order() > r->order() : c->order() < r->order() && c->order() > horizon;
+            if (beyond && (!best || (c->order() < best->order()) == forward)) best = c;  // the nearest one
+        }
+    if (!best) return GAMEINPUT_E_READING_NOT_FOUND;
+    best->AddRef();
+    *out = best;
+    return S_OK;
+}
+
+class GameInput final : public IGameInput {
+public:
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** out) override {
+        if (!out) return E_POINTER;
+        if (same_guid(riid, IID_IUnknown) || same_guid(riid, IID_IGameInput)) {
+            AddRef();
+            *out = static_cast<IGameInput*>(this);
+            return S_OK;
+        }
+        *out = nullptr;
+        return E_NOINTERFACE;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return ++refs_; }
+    ULONG STDMETHODCALLTYPE Release() override { return release_floor(refs_); }  // a process-wide singleton
+
+    uint64_t STDMETHODCALLTYPE GetCurrentTimestamp() override { return now_us(); }
+
+    HRESULT STDMETHODCALLTYPE GetCurrentReading(uint32_t kind, IGameInputDevice* device, IGameInputReading** out) override {
+        if (!out) return E_POINTER;
+        *out = nullptr;
+        if (kind != GameInputKindUnknown && !(kind & kSupportedKinds)) return GAMEINPUT_E_READING_NOT_FOUND;
+        std::lock_guard lock(g().mu);
+        Reading* best = nullptr;
+        if (device) {
+            Device* d = as_device(device);
+            if (d->status == GameInputDeviceNoStatus) return GAMEINPUT_E_DEVICE_DISCONNECTED;
+            best = d->latest();
+        } else {
+            for (Device* d : g().connected)  // the most recent reading from any gamepad
+                if (Reading* r = d->latest(); r && (!best || r->GetTimestamp() >= best->GetTimestamp())) best = r;
+        }
+        if (!best) return GAMEINPUT_E_READING_NOT_FOUND;
+        best->AddRef();
+        *out = best;
+        return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE GetNextReading(IGameInputReading* ref, uint32_t kind, IGameInputDevice* device,
+                                             IGameInputReading** out) override {
+        return find_reading(ref, kind, device, out, true);
+    }
+    HRESULT STDMETHODCALLTYPE GetPreviousReading(IGameInputReading* ref, uint32_t kind, IGameInputDevice* device,
+                                                 IGameInputReading** out) override {
+        return find_reading(ref, kind, device, out, false);
+    }
+    HRESULT STDMETHODCALLTYPE GetTemporalReading(uint64_t, IGameInputDevice*, IGameInputReading** out) override {
+        if (!out) return E_POINTER;
+        *out = nullptr;
+        return E_NOTIMPL;
+    }
+
+    HRESULT STDMETHODCALLTYPE RegisterReadingCallback(IGameInputDevice* device, uint32_t kind, float, void* context,
+                                                      GameInputReadingCallback fn, GameInputCallbackToken* token) override {
+        return add({0, CbType::Reading, as_device(device), kind, 0, context, reinterpret_cast<void*>(fn), true}, token);
+    }
+
+    HRESULT STDMETHODCALLTYPE RegisterDeviceCallback(IGameInputDevice* device, uint32_t kind, uint32_t status_filter,
+                                                     GameInputEnumerationKind enumeration, void* context,
+                                                     GameInputDeviceCallback fn, GameInputCallbackToken* token) override {
+        if (token) *token = kInvalidCallbackToken;
+        if (!fn) return E_INVALIDARG;
+        State& s = g();
+        GameInputCallbackToken t;
+        std::vector<Event> now;
+        {
+            std::lock_guard lock(s.mu);
+            t = s.next_token++;
+            s.callbacks.push_back({t, CbType::Device, as_device(device), kind, status_filter, context,
+                                   reinterpret_cast<void*>(fn), true});
+            if (enumeration != GameInputNoEnumeration) {
+                const uint64_t ts = now_us();
+                for (Device* d : s.connected) {
+                    if (device && as_device(device) != d) continue;
+                    if (kind != GameInputKindUnknown && !(kind & d->info.supportedInput)) continue;
+                    const uint32_t st = d->status;
+                    if (!(st & status_filter)) continue;
+                    const Event e{CbType::Device, d, nullptr, ts, st, GameInputDeviceNoStatus, false, t};
+                    if (enumeration == GameInputBlockingEnumeration) {
+                        d->AddRef();
+                        now.push_back(e);
+                    } else {
+                        queue_event(e);
+                    }
+                }
+            }
+        }
+        if (token) *token = t;
+        // Blocking enumeration: every connected device is reported before this returns, on the caller's thread.
+        for (const Event& e : now) {
+            fn(t, context, e.device, e.timestamp, e.current, e.previous);
+            e.device->Release();
+        }
+        return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE RegisterGuideButtonCallback(IGameInputDevice* device, void* context,
+                                                          GameInputGuideButtonCallback fn, GameInputCallbackToken* token) override {
+        return add({0, CbType::Guide, as_device(device), 0, 0, context, reinterpret_cast<void*>(fn), true}, token);
+    }
+    // Gamepads have no keyboard layout; the callback is accepted and never runs.
+    HRESULT STDMETHODCALLTYPE RegisterKeyboardLayoutCallback(IGameInputDevice* device, void* context,
+                                                             GameInputKeyboardLayoutCallback fn, GameInputCallbackToken* token) override {
+        return add({0, CbType::KeyboardLayout, as_device(device), 0, 0, context, reinterpret_cast<void*>(fn), true}, token);
+    }
+
+    void STDMETHODCALLTYPE StopCallback(GameInputCallbackToken token) override {
+        std::lock_guard lock(g().mu);
+        for (Callback& c : g().callbacks)
+            if (c.token == token) c.active = false;
+    }
+
+    // Removes the callback and, unless called from inside a callback, waits for one that is running to return.
+    // VERIFY: the timeout is not honoured; the wait is for at most one callback.
+    bool STDMETHODCALLTYPE UnregisterCallback(GameInputCallbackToken token, uint64_t) override {
+        State& s = g();
+        bool found = false;
+        {
+            std::lock_guard lock(s.mu);
+            auto it = std::find_if(s.callbacks.begin(), s.callbacks.end(), [token](const Callback& c) { return c.token == token; });
+            if (it != s.callbacks.end()) {
+                s.callbacks.erase(it);
+                found = true;
+            }
+        }
+        if (found && s.delivering_thread != GetCurrentThreadId()) std::lock_guard wait(s.deliver_mu);
+        return found;
+    }
+
+    HRESULT STDMETHODCALLTYPE CreateDispatcher(IGameInputDispatcher** out) override {
+        if (!out) return E_POINTER;
+        *out = new Dispatcher;
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE CreateAggregateDevice(uint32_t, IGameInputDevice** out) override {
+        if (out) *out = nullptr;
+        return E_NOTIMPL;
+    }
+    HRESULT STDMETHODCALLTYPE FindDeviceFromId(const AppLocalDeviceId* id, IGameInputDevice** out) override {
+        if (!out) return E_POINTER;
+        *out = nullptr;
+        if (!id) return E_INVALIDARG;
+        std::lock_guard lock(g().mu);
+        for (Device* d : g().devices)
+            if (std::memcmp(&d->info.deviceId, id, sizeof *id) == 0) {
+                d->AddRef();
+                *out = d;
+                return S_OK;
+            }
+        return GAMEINPUT_E_DEVICE_NOT_FOUND;
+    }
+    HRESULT STDMETHODCALLTYPE FindDeviceFromObject(IUnknown*, IGameInputDevice** out) override { return not_found(out); }
+    HRESULT STDMETHODCALLTYPE FindDeviceFromPlatformHandle(HANDLE, IGameInputDevice** out) override { return not_found(out); }
+    HRESULT STDMETHODCALLTYPE FindDeviceFromPlatformString(LPCWSTR, IGameInputDevice** out) override { return not_found(out); }
+    HRESULT STDMETHODCALLTYPE EnableOemDeviceSupport(uint16_t, uint16_t, uint8_t, uint8_t) override { return S_OK; }
+    // Input keeps arriving in the background: the runtime has no focus model yet.
+    void STDMETHODCALLTYPE SetFocusPolicy(uint32_t) override {}
+
+private:
+    static HRESULT not_found(IGameInputDevice** out) {
+        if (out) *out = nullptr;
+        return GAMEINPUT_E_DEVICE_NOT_FOUND;
+    }
+    static HRESULT add(Callback c, GameInputCallbackToken* token) {
+        if (token) *token = kInvalidCallbackToken;
+        if (!c.fn) return E_INVALIDARG;
+        std::lock_guard lock(g().mu);
+        c.token = g().next_token++;
+        g().callbacks.push_back(c);
+        if (token) *token = c.token;
+        return S_OK;
+    }
+    std::atomic<ULONG> refs_{1};
+};
+
+GameInput& instance() {
+    static GameInput* gi = new GameInput;
+    return *gi;
+}
+
+// HRESULT GameInputCreate(IGameInput** gameInput). One instance per process; each call adds a reference.
+HRESULT WINAPI GameInputCreate(IGameInput** out) {
+    if (!out) return E_POINTER;
+    ensure_started();
+    GameInput& gi = instance();
+    gi.AddRef();
+    *out = &gi;
+    return S_OK;
+}
+
+}  // namespace
+
+namespace rt::gameinput {
+
+const Config& config() {
+    ensure_started();
+    return g().config;
+}
+
+void reload_config() {
+    std::lock_guard lock(g().mu);
+    g().config = read_config();
+    g().config_read = true;
+}
+
+void poll() {
+    ensure_started();
+    poll_and_deliver();
+}
+
+int connected_count() {
+    std::lock_guard lock(g().mu);
+    return static_cast<int>(g().connected.size());
+}
+
+bool output_state(int i, OutputState* out) {
+    std::lock_guard lock(g().mu);
+    if (i < 0 || i >= static_cast<int>(g().connected.size()) || !out) return false;
+    *out = g().connected[static_cast<size_t>(i)]->sent;
+    return true;
+}
+
+void set_keyboard_source(KeyDownFn key_down, HasFocusFn has_focus) {
+    g_key_down = key_down ? key_down : async_key_down;
+    g_has_focus = has_focus ? has_focus : foreground_is_ours;
+}
+
+const KeyBinding* keyboard_bindings(int* count) {
+    if (count) *count = static_cast<int>(std::size(kKeyBindings));
+    return kKeyBindings;
+}
+
+}  // namespace rt::gameinput
+
+SHIM_TABLE(gameinput,
+    {"gameinput.dll", "GameInputCreate", reinterpret_cast<void*>(&GameInputCreate)},
+    {"xgameruntime.dll", "GameInputCreate", reinterpret_cast<void*>(&GameInputCreate)},
+);

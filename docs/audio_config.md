@@ -13,9 +13,17 @@ python -I tools/rpf9_carve.py audio.rpf <out> --limit 0x129B000
 python -I tools/audio_config.py <out> --join --json
 ```
 
-`--join` concatenates the carved streams in name order before scanning. That matters because the
-config is one logical blob split into zlib blocks, and a record can straddle a block boundary. On
-the measured carve the per-file scan finds 1,588 records and the joined scan finds 1,589.
+`--join` scans the carved streams in name order as one stream. That matters because the config is
+one logical blob split into zlib blocks, and a record can straddle a block boundary. On the
+measured carve the per-file scan finds 1,588 records and the joined scan finds 1,589. The parts are
+read in blocks and never concatenated (see Limits).
+
+Under `--join` each record has two positions. JSON `offset` is the byte position in the joined
+stream; `file_offset` is the position inside `file`, the part that holds the record's `0c` marker
+byte. Text output prints `file:file_offset`, so a reference such as `middle.bin:0` points at the
+marker in that file even when the duration sits at the end of the previous part (so `file_offset`
+can be 0-3 under `--join`). Without `--join`, `offset` and `file_offset` are both the position
+inside the file.
 
 ## Record layout
 
@@ -68,11 +76,14 @@ python -I tools/audio_config.py <carve dir or blob> [--json] [--names FILE] [--j
 ```
 
 - `scan(blob)` returns `offset`, `id`, `duration_ms`, `duration_s`, `hash_a`, `hash_b`,
-  `stream_id`.
-- `collect(src, names=..., join=...)` scans a blob or a directory; `names` maps hash B to a display
-  string when a NUL-separated local name pool is supplied.
+  `stream_id`. `scan_stream(chunks)` yields the same records for byte chunks read in order,
+  without joining them; its `offset` is the joined position.
+- `collect(src, names=..., join=...)` scans a blob or a directory and adds `file` and
+  `file_offset`; `names` maps hash B to a display string when a NUL-separated local name pool is
+  supplied.
 - `joaat` and `normalized_name` are the shared hash helpers.
-- Text output prints one line per record and a summary; `--json` writes `{records, summary}`.
+- Text output prints one `file:file_offset` line per record and a summary; `--json` writes
+  `{records, summary}`.
 
 `--names` is optional. The package's debug name stream and the localization credits are local game
 files; nothing from them is committed.
@@ -86,3 +97,7 @@ files; nothing from them is committed.
   another offset; use the first AWC bank (`ADAT`) as the boundary.
 - No start offsets, no play order and no playlists are stored here. The config's station content
   lists reference records, but the mix order is assembled at runtime.
+- A marker is reported only when at least 20 bytes follow it in the scanned input, as before.
+- `--join` memory: at most two read blocks of input (`JOIN_BLOCK_BYTES`, 1 MiB each) plus a
+  24-byte carry, one name and start offset per part, and the record list. The non-joined scan
+  reads one whole part at a time, and a single blob is read whole.

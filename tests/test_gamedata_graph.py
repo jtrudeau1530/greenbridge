@@ -258,6 +258,19 @@ class GamedataGraphTest(unittest.TestCase):
         self.assertEqual(s["content_graph"]["reachable_documents"], 2)
         self.assertEqual(s["content_graph"]["cycles"], 0)
 
+    def test_file_mode_counts_filenames_outside_file_lists(self):
+        with open(os.path.join(self.root, "sample.xml"), "wb") as f:
+            f.write(b"<root><group><filename>platform:/levels/a</filename>"
+                    b"<loadPath>platform:/levels/b</loadPath></group></root>")
+
+        p = self.run_tool("sample.xml", "--json", "graph.json")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        with open(os.path.join(self.root, "graph.json"), encoding="utf-8") as f:
+            s = json.load(f)["summary"]
+        self.assertEqual(s["references"], {"filename": 1})
+        self.assertEqual(s["nodes"]["targets"], 1)
+        self.assertEqual(s["edges"]["contains_file"], 1)
+
     def test_prefix_classification_keeps_unknown_schemes_unresolved(self):
         self.assertEqual(gg.classify_target("$(common)/fixture/a.bk2"),
                          ("$(common)", "fixture/a.bk2", "document_unmapped"))

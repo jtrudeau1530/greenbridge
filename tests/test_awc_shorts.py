@@ -118,6 +118,35 @@ class ShortsTest(unittest.TestCase):
         with contextlib.redirect_stderr(io.StringIO()):
             self.assertEqual(shorts.main(["x", self.out, "--min-seconds", "6", "--max-seconds", "5"]), 2)
 
+    def test_missing_source_preserves_csv(self):
+        path = self.write("good.awc", 0x78, 960)
+        args = [self.out, "--jobs", "1", "--min-seconds", "0"]
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(shorts.main([path, *args]), 0)
+        index = os.path.join(self.out, "shorts.csv")
+        with open(index, "rb") as f:
+            previous = f.read()
+
+        missing = os.path.join(self.tmp.name, "missing.awc")
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()) as err:
+            result = shorts.main([missing, *args])
+        with open(index, "rb") as f:
+            self.assertEqual(f.read(), previous)
+        self.assertEqual(result, 2)
+        self.assertIn("missing.awc", err.getvalue())
+        self.assertEqual(len(err.getvalue().splitlines()), 1)
+
+    def test_nan_duration_bounds(self):
+        path = self.write("good.awc", 0x78, 960)
+        for option in ("--min-seconds", "--max-seconds"):
+            with self.subTest(option=option):
+                args = [path, self.out, "--jobs", "1", option, "nan"]
+                with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()) as err:
+                    self.assertEqual(shorts.main(args), 2)
+                self.assertFalse(os.path.exists(self.out))
+                self.assertIn(option, err.getvalue())
+                self.assertEqual(len(err.getvalue().splitlines()), 1)
+
     def test_nested_banks_keep_both_clips(self):
         for folder, toc in (("left", 0x78), ("right", 0xFC)):
             os.mkdir(os.path.join(self.tmp.name, folder))

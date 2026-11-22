@@ -83,10 +83,11 @@ def main(argv=None) -> int:
         ap.error(f"{src} is not a file")
     if os.path.getsize(src) == 0:
         ap.error(f"{src} is empty")
+    if os.path.isfile(out):
+        ap.error(f"{out} is a file, not a folder")
     os.makedirs(out, exist_ok=True)
     index, seen, used, bad = [], {}, set(), 0
-    with open(src, "rb") as fh:
-        m = mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ)
+    with open(src, "rb") as fh, mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ) as m:
         for mt in ENTRY.finditer(m):
             name = mt.group(1).decode("latin-1")
             stored = struct.unpack("<I", mt.group(3))[0]
@@ -94,12 +95,13 @@ def main(argv=None) -> int:
             if not (16 < stored < 64 << 20 and 32 < size < 256 << 20):
                 continue
             start = mt.end()
+            decompressor = zlib.decompressobj(-15)
             try:
-                data = zlib.decompressobj(-15).decompress(m[start:start + stored], size + 1)
+                data = decompressor.decompress(m[start:start + stored], size + 1)
             except zlib.error:
                 bad += 1
                 continue
-            if data[:4] != b"DXBC" or len(data) != size:
+            if not decompressor.eof or data[:4] != b"DXBC" or len(data) != size:
                 bad += 1
                 continue
             try:

@@ -127,9 +127,17 @@ To regenerate a flat export from an earlier version, run `awc_opus.py` with the 
 `Channels` is the Opus packet channel count and `DurationSeconds` is per channel: the tag `0x48` descriptor's
 interleaved sample count is divided by that channel count.
 
-`audio_wav.py` runs ffmpeg with `-c:a pcm_s16le` at the stream's own rate and channel count, and trims to the Ogg
-Opus end granule. Existing `.wav` files are skipped, so a stopped run continues. With no `--out`, a directory writes
-to `<src>/wav` and a single file writes next to itself.
+`audio_wav.py` runs ffmpeg with `-c:a pcm_s16le` at the stream's own rate and channel count. For a single stream
+it trims to the final Ogg Opus granule minus pre-skip. Chained streams have a separate granule timeline for each
+link, so ffmpeg handles their end trimming. Existing WAVs are normally skipped on resume. If the destination
+filesystem treats two output names as the same file, the converter keeps the input extensions and adds a counter
+where needed. It leaves a previously shared WAV untouched. Before reusing a name ending in `.ogg.wav` or `.opus.wav`
+(including counters such as `.ogg~2.wav`), it decodes the source again and compares the PCM, rate and channel
+layout. These checks read the full streams serially during planning. If the audio differs (including decoding
+differences between ffmpeg versions) or the existing WAV cannot be verified, it stays in place and the converter
+tries the next counter. Plain existing WAVs are
+trusted by name, so resuming into the same output folder assumes the same set of inputs.
+With no `--out`, a directory writes to `<src>/wav` and a single file writes next to itself.
 
 ## How `make_game.py --wav` uses them
 
@@ -169,6 +177,44 @@ programming is assembled by the game from many assets, so a lone AWC is rarely a
 The music/radio **config table** is a separate structure: 1,589 records with exact durations, AWC stream ids,
 contiguous station grouping and no per-track start offsets. See [audio_config.md](audio_config.md) for the record
 layout and the station-content references.
+
+## Mission music: Home Sweet Home
+
+The credited "Burn This Shit Down" is not a radio-station track. It is the song for the
+**Home Sweet Home** mission (Chapter 1, mission 21/25): Lucia at Jason's house in Key Lento
+during the house fire and the escape. The mission and its localized objective/fail strings are
+present in `data.rpf`; the song audio is not.
+
+Measured coverage on the Xbox Series 1.0.2.1 package:
+
+| Container | Searched | Result |
+|---|---|---|
+| `story000.rpf` streamed-music banks | 753 banks / 2,642 channels | none |
+| `story000.rpf` plain banks | 201 banks / 1,950 streams | none |
+| `story000.rpf` Bink | 264 streams / 162 with audio / 165 tracks / 5,090 s | none |
+| `movies.rpf` Bink | 229 tracks / 12,401 s | none |
+| `audio.rpf` streamed cues under 30 s | 1,149 channels / 5.78 h | none |
+| `audio.rpf` all banks | 7,162 banks, all streams | none |
+| loop/chunked banks | 1,099 banks / 118,180 streams | none |
+| `packs.rpf` inflated | 144,364 files / 9.74 GB | 0 AWC, 0 Bink2 |
+| `data.rpf` inflated | 28,509 files / 1.41 GB | mission text, 0 song strings |
+| `script.rpf`, `common.rpf`, `story000_script.rpf` | 1,058 / 955 / 2,633 files | none |
+| `levels.rpf` raw | 94 `ADAT` magics, 2,820 `KB2` patterns | 0 valid AWC/Bink |
+
+Fingerprint search: about 19,807 files / 19.9 M Chromaprint frames / 653 fingerprint-hours, with a
+0.50-2.00 tempo sweep over the story-music and long-AWC targets. No candidate passes the vote
+threshold. The positive controls keep their earlier results: Sensimilla 2,284 votes / 0.911 bits
+/ 100 %; Don't Break My Heart 88 votes / 7.046 bits / 94.5 %.
+
+A `data.rpf` hash table contains 12 occurrences of `joaat("burn")`, but it is not the song: the
+config blob has none, no AWC stream ID matches its low 29 bits, and the table has no audio
+reference.
+
+Residual uncertainty: `levels.rpf` (76 GB) was not fully inflated, and a custom RSC8 audio
+resource is the only mission-side container not decoded; the retail track may be a third master
+or patch content not covered by the public references; sub-30 s stings were not exhaustively
+fingerprinted. No game audio is stored in the repository; the searches ran on a local copy and
+`radio-dump-v3` was not modified.
 
 ## Never commit or share extracted audio
 

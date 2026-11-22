@@ -204,7 +204,9 @@ leonida::gfx10::SamplerWords words_of(const std::vector<unsigned char>& bytes) {
 
 int main() {
     vktest::Device d;
-    EXPECT(d.create());
+    const auto device_status = d.initialize();
+    if (device_status == vktest::DeviceStatus::unavailable) return 77;   // no Vulkan GPU: ctest skips
+    if (device_status != vktest::DeviceStatus::ready) return 1;
     {
         rt::d3d12::VulkanDeviceInfo info{};
         info.get_instance_proc = d.instance_proc;
@@ -235,6 +237,20 @@ int main() {
             EXPECT(via2(desc2(desc)) == via1(desc));
             ++plain;
         }
+
+        // A comparison that always returns zero still needs a comparison-enabled Vulkan sampler,
+        // alongside an ordinary sampler with otherwise identical settings in the same set.
+        const auto regular = sampler(D3D12_FILTER_MIN_MAG_MIP_POINT, D3D12_TEXTURE_ADDRESS_MODE_CLAMP);
+        auto comparison = regular;
+        comparison.Filter = D3D12_FILTER_COMPARISON_MIN_MAG_MIP_POINT;
+        const auto regular_words = words_of(via1(regular));
+        const auto never_words = words_of(via1(comparison));
+        EXPECT(never_words != regular_words);
+        EXPECT(words_of(via2(desc2(comparison))) == never_words);
+        const auto regular_info = leonida::gfx10::vulkan_sampler(leonida::gfx10::decode(regular_words));
+        const auto never_info = leonida::gfx10::vulkan_sampler(leonida::gfx10::decode(never_words));
+        EXPECT(!regular_info.compareEnable);
+        EXPECT(never_info.compareEnable && never_info.compareOp == VK_COMPARE_OP_NEVER);
 
         // UINT border colours take the S#'s border types as the float ones do, marked as integers in
         // BORDER_COLOR_PTR (kIntegerBorderPtr), so that they are their own key and VK_BORDER_COLOR_INT_* in Vulkan.

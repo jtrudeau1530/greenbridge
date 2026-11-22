@@ -190,7 +190,7 @@ def music_channels(d: bytes, mus, data, collect_packets: bool = True):
             if info[c][3] != 0x0B or count == 0:
                 continue
             packets = opus_packets(d, start, count * 2048)
-            if packets and info[c][5] == 0:
+            if packets and info[c][5] < 2:
                 info[c][5] = 2 if any(p[0] & 0x04 for p in packets) else 1
             if not collect_packets:
                 continue
@@ -256,16 +256,22 @@ def export_bank(path: str, out_dir: str):
     return counts
 
 
-def main() -> int:
+def main(argv=None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("src")
     ap.add_argument("out")
     ap.add_argument("--limit", type=int, help="maximum number of banks to export (default: all)")
     ap.add_argument("--jobs", type=int, default=max(1, (os.cpu_count() or 2) // 2),
                     help="banks to export at once (default: half the CPU count)")
-    a = ap.parse_args()
+    a = ap.parse_args(argv)
     if a.limit is not None and a.limit < 0:
         ap.error("--limit must be non-negative")
+    if a.jobs < 1:
+        ap.error("--jobs must be at least 1")
+    if not os.path.exists(a.src):
+        ap.error(f"{a.src} does not exist")
+    if os.path.isfile(a.out):
+        ap.error(f"{a.out} is a file, not a folder")
     if os.path.isdir(a.src):
         banks = []
         for root, _, files in os.walk(a.src):

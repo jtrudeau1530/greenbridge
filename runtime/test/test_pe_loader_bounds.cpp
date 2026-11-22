@@ -628,6 +628,95 @@ void test_boundary_exact_fits() {
     }
 }
 
+// HIGHLOW (type 3) relocations: a 32-bit absolute address, which the x64 Windows loader applies too. The image
+// prefers base 0x10000, the lowest address VirtualAlloc hands out; the test holds that address so the loader has to
+// map the image higher, which makes the delta positive. The relocation table sits at the start of .text (RVA 0x1000)
+// and fixes up the dword at RVA 0x1100.
+std::vector<uint8_t> make_highlow_image(uint32_t stored, uint16_t type = IMAGE_REL_BASED_HIGHLOW,
+                                        uint64_t image_base = 0x10000) {
+    auto img = make_base_image(0x2000, 0x400);
+    std::fill(img.begin() + 0x200, img.end(), uint8_t{0});
+    auto* nt = nt_header_of(img);
+    nt->OptionalHeader.ImageBase = image_base;
+    auto& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC];
+    dir.VirtualAddress = 0x1000;
+    dir.Size = sizeof(IMAGE_BASE_RELOCATION) + 2 * sizeof(uint16_t);
+    auto* block = reinterpret_cast<IMAGE_BASE_RELOCATION*>(img.data() + 0x200);
+    block->VirtualAddress = 0x1000;
+    block->SizeOfBlock = dir.Size;
+    auto* entries = reinterpret_cast<uint16_t*>(block + 1);
+    entries[0] = static_cast<uint16_t>((type << 12) | 0x100);
+    entries[1] = static_cast<uint16_t>(IMAGE_REL_BASED_ABSOLUTE << 12);  // padding, as linkers write it
+    std::memcpy(img.data() + 0x300, &stored, sizeof(stored));           // RVA 0x1100
+    return img;
+}
+
+void test_highlow_relocations() {
+    std::printf("\n--- HIGHLOW (32-bit) base relocations ---\n");
+    // Hold the preferred base. If something else already holds it, the image is relocated all the same.
+    void* hold = VirtualAlloc(reinterpret_cast<void*>(0x10000), 0x2000, MEM_RESERVE, PAGE_NOACCESS);
+
+    // Case 1: the dword names RVA 0x1100 of an image at 0x10000. After the move it must name RVA 0x1100 of the new
+    // base when that fits in 32 bits; otherwise the load must be refused rather than truncated.
+    {
+        auto file_path = write_temp_image(make_highlow_image(0x10000 + 0x1100));
+        try {
+            rt::Loader loader(g_temp_dir);
+            rt::Module& m = loader.load(file_path);
+            const uint64_t want = reinterpret_cast<uint64_t>(m.base) + 0x1100;
+            check_condition(m.relocated, "HIGHLOW image was relocated away from its held base");
+            check_condition(want <= 0xFFFFFFFFull, "HIGHLOW image mapped low enough for a 32-bit address",
+                            "mapped at " + std::to_string(reinterpret_cast<uint64_t>(m.base)) + " yet accepted");
+            uint32_t got = 0;
+            std::memcpy(&got, m.base + 0x1100, sizeof(got));
+            check_condition(got == static_cast<uint32_t>(want), "HIGHLOW dword now names RVA 0x1100 of the new base",
+                            "got " + std::to_string(got) + ", want " + std::to_string(want));
+        } catch (const std::exception& e) {
+            const std::string msg = e.what();
+            // Only acceptable when the new base is too high for the 32-bit address.
+            check_condition(msg.find("does not fit at this base") != std::string::npos,
+                            "HIGHLOW image mapped above 4 GiB is refused with the 32-bit message", "threw: " + msg);
+        }
+    }
+
+    // Case 2: a dword near the top of the 32-bit range overflows for any base above 0x10000: refused, not wrapped.
+    expect_loader_rejection("HIGHLOW relocation past 4 GiB is refused, not truncated", make_highlow_image(0xFFFFFFF0u),
+                            "does not fit at this base");
+
+    // Case 3: other 32-bit forms (HIGH, type 1) are still refused by name.
+    expect_loader_rejection("HIGH (type 1) relocation is still unsupported",
+                            make_highlow_image(0, IMAGE_REL_BASED_HIGH), "unsupported relocation type 1");
+
+    // Case 4: the fix-up itself, whatever the address space looks like. The preferred base is a region this test
+    // holds, so the image lands elsewhere but usually near it; the delta is then small, and a dword in the middle of
+    // the 32-bit range must move by exactly that delta. (A delta too large for it must be refused, as in case 2.)
+    if (void* near_hold = VirtualAlloc(nullptr, 0x2000, MEM_RESERVE, PAGE_NOACCESS)) {
+        const uint64_t preferred = reinterpret_cast<uint64_t>(near_hold);
+        constexpr uint32_t stored = 0x80000000u;
+        auto file_path = write_temp_image(make_highlow_image(stored, IMAGE_REL_BASED_HIGHLOW, preferred));
+        try {
+            rt::Loader loader(g_temp_dir);
+            rt::Module& m = loader.load(file_path);
+            const int64_t delta = static_cast<int64_t>(reinterpret_cast<uint64_t>(m.base) - preferred);
+            const int64_t want = static_cast<int64_t>(stored) + delta;
+            uint32_t got = 0;
+            std::memcpy(&got, m.base + 0x1100, sizeof(got));
+            check_condition(m.relocated && want >= 0 && want <= 0xFFFFFFFFll,
+                            "HIGHLOW fix-up: relocated by a delta that fits", "delta " + std::to_string(delta));
+            check_condition(got == static_cast<uint32_t>(want), "HIGHLOW fix-up: the dword moved by exactly the delta",
+                            "got " + std::to_string(got) + ", want " + std::to_string(want) + ", delta " +
+                                std::to_string(delta));
+        } catch (const std::exception& e) {
+            const std::string msg = e.what();
+            check_condition(msg.find("does not fit at this base") != std::string::npos,
+                            "HIGHLOW fix-up: only a too-large delta is refused", "threw: " + msg);
+        }
+        VirtualFree(near_hold, 0, MEM_RELEASE);
+    }
+
+    if (hold) VirtualFree(hold, 0, MEM_RELEASE);
+}
+
 }  // namespace
 
 int main() {
@@ -635,7 +724,8 @@ int main() {
 
     const char* env_dir = std::getenv("LEONIDA_TEST_DIR");
     g_temp_dir = env_dir ? std::filesystem::path(env_dir)
-                         : std::filesystem::temp_directory_path() / "leonida_pe_bounds_test";
+                         : std::filesystem::temp_directory_path() /
+                               ("leonida_pe_bounds_test_" + std::to_string(GetCurrentProcessId()));
     std::filesystem::create_directories(g_temp_dir);
 
     try {
@@ -644,6 +734,7 @@ int main() {
         test_import_table_null_termination();
         test_virtual_address_range_wrapping();
         test_boundary_exact_fits();
+        test_highlow_relocations();
     } catch (const std::exception& e) {
         std::printf("FATAL: Unhandled exception during test execution: %s\n", e.what());
         ++g_failures;

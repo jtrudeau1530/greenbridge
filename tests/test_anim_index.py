@@ -322,6 +322,38 @@ class ArchiveTest(unittest.TestCase):
         self.assertEqual([r["signature"] for r in rows], ["move", "page-directory", "name-table"])
         self.assertEqual(summary["mode"], "directory")
 
+    def test_directory_rejects_start_and_limit(self):
+        folder = os.path.join(self.root, "carved")
+        os.makedirs(folder)
+        for offset in (0x100, 0x200):
+            with open(os.path.join(folder, f"{offset:012x}.bin"), "wb") as f:
+                f.write(b"A" * 64)
+        cases = [("--start", "0"), ("--limit", "1"), ("--limit", "1", "--start", "0x200")]
+        for i, flags in enumerate(cases):
+            with self.subTest(flags=flags):
+                out = os.path.join(self.root, f"bad{i}.json")
+                p = subprocess.run([sys.executable, "-I", TOOL, folder, out, "--quiet", *flags],
+                                   capture_output=True, text=True, encoding="utf-8", errors="replace")
+                self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
+                self.assertEqual(len(p.stderr.splitlines()), 1, p.stderr)
+                for flag in flags[::2]:
+                    self.assertIn(flag, p.stderr)
+                self.assertFalse(os.path.exists(out))
+
+    def test_directory_skips_the_carvers_index_and_reports(self):
+        """rpf9_carve.py writes index.json next to the streams; it and a report are not payloads."""
+        folder = os.path.join(self.root, "carved")
+        os.makedirs(folder)
+        for i, payload in enumerate((move(), page(), names())):
+            with open(os.path.join(folder, f"{0x1000 + i * 0x100:012x}.bin"), "wb") as f:
+                f.write(payload)
+        with open(os.path.join(folder, "index.json"), "w", encoding="utf-8") as f:
+            f.write('[{"off": 4096, "stored": 16}]')
+        with open(os.path.join(folder, "report.csv"), "w", encoding="utf-8") as f:
+            f.write("offset,size\n")
+        rows, summary = anim_index.scan_dir(folder)
+        self.assertEqual([r["offset"] for r in rows], [0x1000, 0x1100, 0x1200])
+
     def test_scan_rpf_closes_mmap_on_invalid_start(self):
         with tracked_mmaps() as created:
             with self.assertRaisesRegex(ValueError, "outside the archive"):
@@ -377,6 +409,32 @@ class RigArchiveTest(unittest.TestCase):
         self.assertEqual(doc["skeletons"][0]["distinct"], 2)
         self.assertEqual(doc["skeletons"][0]["kind"], "plain-bone-table")
         self.assertEqual(doc["skeletons"][1]["hashes_present"], 1)
+
+    def test_cli_rigs_stored_name_hashes(self):
+        hashed = b"\x3b\x39\x77\x99"     # JOAAT32("anim/rig/a") = 0x9977393b, little-endian
+        base = bytearray(b"RBF0" + struct.pack("<H", 0xFFFB) + struct.pack("<I", 1)
+                         + _u16s(b"rage__crRigSetManager") + b"\x00")
+        base += b"\x03\x60" + _u16s(b"anim/rigset/synthetic/one")
+        base += _entry(b"canonical@source", b"anim/rig/a", b"pose") + b"\xff" * 6
+        base += bytes((1 - len(base)) % 4)
+        self.assertEqual(len(base) % 4, 1)
+        cases = {"absent": (hashed[::-1], 0),
+                 "unaligned": (hashed, 1),
+                 "duplicate": (hashed + bytes(3) + hashed, 1)}
+        for label, (tail, expected) in cases.items():
+            with self.subTest(label):
+                carved = os.path.join(self.root, label)
+                os.mkdir(carved)
+                with open(os.path.join(carved, "000000.bin"), "wb") as f:
+                    f.write(bytes(base) + tail)
+                out = os.path.join(self.root, label + "-index.json")
+                rigs = os.path.join(self.root, label + "-rigs.json")
+                p = subprocess.run([sys.executable, "-I", TOOL, carved, out, "--rigs", rigs, "--quiet"],
+                                   capture_output=True, text=True, encoding="utf-8", errors="replace")
+                self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+                with open(rigs, encoding="utf-8") as f:
+                    summary = json.load(f)["rbf0"]["summary"]
+                self.assertEqual((summary["distinct_names"], summary["stored_name_hashes"]), (2, expected))
 
 
 if __name__ == "__main__":

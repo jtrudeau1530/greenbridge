@@ -4,22 +4,26 @@
 //
 //   vk_bindless_test <vs_ids.spv> <ps_tex.spv>
 //
-// A full-screen triangle is drawn into 64x64 RGBA32F and read back, seven times:
+// A full-screen triangle is drawn into 64x64 RGBA32F and read back, eight times:
 //   1. the T# and S# are in the table behind keys that share the T#'s first slot, so the shader has to probe:
 //      every pixel is the texel of an 8x8 gradient under it;
 //   2. the T# is erased: every pixel is the fallback at index 0 (zeros);
 //   3. the T# is back among 200 more keys and the table has grown into a new buffer: the gradient again;
 //   4. the T# is rebound to the decoy index: that image's colour;
 //   5. the T# is rebound to the original index: the gradient again;
-//   6. the original index is given another view: the decoy image's colour;
-//   7. the original index is removed: the fallback.
+//   6. the T# is rebound again, but the command buffer that carried the upload is never submitted and the set is
+//      told so: the retry still has to show the decoy's colour, not the old mapping;
+//   7. the original index is given another view: the decoy image's colour;
+//   8. the original index is removed: the fallback.
 // This runs with the descriptor-indexing flags the device has (update after bind, partially bound) and again
 // without any. Exit 77 with "unsupported: ..." when the device lacks a feature the shaders need.
 // LEONIDA_VK_VALIDATION=1 runs under VK_LAYER_KHRONOS_validation; a validation error fails the test.
 #define VK_NO_PROTOTYPES
 #include "vulkan_loader.h"
+#include "vk_device_pick.h"
 #include "../src/vulkan_bindless.h"
 
+#include <array>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -147,11 +151,15 @@ int main(int argc, char** argv) {
     std::vector<VkPhysicalDevice> pds(n);
     vkEnumeratePhysicalDevices(inst, &n, pds.data());
     VkPhysicalDevice pd = VK_NULL_HANDLE;
+    int best_rank = -1;
     for (auto d : pds) {
         VkPhysicalDeviceProperties p;
         vkGetPhysicalDeviceProperties(d, &p);
         if (p.apiVersion < VK_API_VERSION_1_2) continue;
-        if (!pd || p.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) pd = d;
+        if (const int rank = leonida::vk_test::device_rank(p.deviceType, p.vendorID); rank > best_rank) {
+            pd = d;
+            best_rank = rank;
+        }
     }
     if (!pd) {
         std::printf("unsupported: no Vulkan 1.2 device\n");
@@ -428,21 +436,45 @@ int main(int argc, char** argv) {
     }
     CHECK(submit());
 
+    // An adapter at the original 5632 sampled-image limit must keep the original set. The per-stage
+    // resource budget can also leave room for just one class (9985 original resources + 512).
+    constexpr auto ms_classes = [](std::uint32_t sampled, std::uint32_t total) {
+        BindlessFeatures f{};
+        f.ms_samples.fill(VK_SAMPLE_COUNT_4_BIT);
+        bindless::limit_ms_bindings(f, sampled, total);
+        return f.ms_samples;
+    };
+    static_assert(ms_classes(5632, 20000) ==
+                  std::array{VK_SAMPLE_COUNT_1_BIT, VK_SAMPLE_COUNT_1_BIT, VK_SAMPLE_COUNT_1_BIT});
+    static_assert(ms_classes(7168, 10497) ==
+                  std::array{VK_SAMPLE_COUNT_4_BIT, VK_SAMPLE_COUNT_1_BIT, VK_SAMPLE_COUNT_1_BIT});
+
     // Does a set with these flags fit the device? Every binding is visible to every stage.
-    constexpr std::uint32_t sampled_total = 4096 + 1024 + 256 + 256, sampler_total = 1024, storage_total = 1024 + 13 * 256;
+    const auto descriptors = [](VkDescriptorType type, const BindlessFeatures& f) {
+        std::uint32_t count = 0;
+        for (std::uint32_t b = 0; b < bindless::bindings.size(); ++b)
+            if (bindless::bindings[b].type == type && bindless::binding_enabled(b, f))
+                count += bindless::bindings[b].count;
+        return count;
+    };
     const auto fits = [&](const BindlessFeatures& f) {
+        const auto sampled_total = descriptors(VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, f);
+        const auto sampler_total = descriptors(VK_DESCRIPTOR_TYPE_SAMPLER, f);
+        const auto storage_total = descriptors(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, f);
+        const auto stage_resources = sampled_total + storage_total + 2;  // table buffer and fragment output
         const VkPhysicalDeviceLimits& l = props.properties.limits;
         if (f.update_after_bind)
             return props12.maxPerStageDescriptorUpdateAfterBindSampledImages >= sampled_total &&
                    props12.maxPerStageDescriptorUpdateAfterBindSamplers >= sampler_total &&
                    props12.maxPerStageDescriptorUpdateAfterBindStorageImages >= storage_total &&
-                   props12.maxPerStageUpdateAfterBindResources >= sampled_total + sampler_total + storage_total + 1 &&
+                   props12.maxPerStageUpdateAfterBindResources >= stage_resources &&
+                   props12.maxUpdateAfterBindDescriptorsInAllPools >= sampled_total + sampler_total + storage_total + 1 &&
                    props12.maxDescriptorSetUpdateAfterBindSampledImages >= sampled_total &&
                    props12.maxDescriptorSetUpdateAfterBindSamplers >= sampler_total &&
                    props12.maxDescriptorSetUpdateAfterBindStorageImages >= storage_total;
         return l.maxPerStageDescriptorSampledImages >= sampled_total && l.maxPerStageDescriptorSamplers >= sampler_total &&
                l.maxPerStageDescriptorStorageImages >= storage_total &&
-               l.maxPerStageResources >= sampled_total + sampler_total + storage_total + 1 &&
+               l.maxPerStageResources >= stage_resources &&
                l.maxDescriptorSetSampledImages >= sampled_total && l.maxDescriptorSetSamplers >= sampler_total &&
                l.maxDescriptorSetStorageImages >= storage_total;
     };
@@ -471,7 +503,9 @@ int main(int argc, char** argv) {
     BindlessFeatures configurations[2] = {device_flags, {}};
     const int configuration_count = (device_flags.update_after_bind || device_flags.partially_bound) ? 2 : 1;
     for (int configuration = 0; configuration < configuration_count; ++configuration) {
-        const BindlessFeatures flags = configurations[configuration];
+        BindlessFeatures flags = configurations[configuration];
+        flags.ms_samples[0] = VK_SAMPLE_COUNT_4_BIT;
+        bindless::limit_ms_bindings(flags, props.properties.limits, props12);
         const char* name = flags.update_after_bind && flags.partially_bound ? "update after bind, partially bound"
                            : flags.update_after_bind ? "update after bind" : flags.partially_bound ? "partially bound" : "no flags";
         if (!fits(flags)) {
@@ -564,6 +598,15 @@ int main(int argc, char** argv) {
             return submit();
         };
 
+        // Uploads the table where the device does: the copy and its barrier are recorded in a command buffer that
+        // runs before the draws that read binding 2.
+        const auto flush = [&]() {
+            vkResetCommandBuffer(cmd, 0);
+            if (const VkResult r = vkBeginCommandBuffer(cmd, &begin); r != VK_SUCCESS) return false;
+            const bool ok = set.flush(cmd);
+            return submit() == VK_SUCCESS && ok;
+        };
+
         // Index spaces. An image with storage views gets an index the storage arrays hold; one without goes above
         // them where the dimension has room. A dimension that is full gives 0, and removed indices come back.
         StorageViews as_storage;
@@ -605,10 +648,32 @@ int main(int argc, char** argv) {
             vkDestroyImageView(dev, brief, nullptr);
         }
 
-        // 1. The T# behind three keys that share its first slot, the S#, and other keys that name the decoy.
         const DescriptorTable& table = set.table();
         const auto slot_count = [&] { return std::uint32_t(table.capacity()); };
         const std::uint32_t slots = slot_count(), home = hash_descriptor_key(tsharp) & (slots - 1);
+        // Fill eight adjacent home slots across the end of the table. The ninth key
+        // shares the first home and can fit only by moving a resident already on the GPU.
+        {
+            std::array<DescriptorKey, kDescriptorProbes + 1> keys{};
+            for (std::uint32_t i = 0; i < keys.size(); ++i) {
+                auto& key = keys[i];
+                key[0] = i + 1;
+                const auto target = (slots - 4 + i % kDescriptorProbes) & (slots - 1);
+                while ((hash_descriptor_key(key) & (slots - 1)) != target) ++key[7];
+            }
+            for (std::uint32_t i = 0; i < kDescriptorProbes; ++i) set.insert_key(keys[i], decoy_index);
+            EXPECT(!set.flush_needs_idle() && flush());
+            EXPECT(set.insert_key(keys.back(), gradient_index));
+            EXPECT(slot_count() == slots && set.flush_needs_idle());
+            EXPECT(flush() && !set.flush_needs_idle());
+            for (const auto& key : keys) {
+                EXPECT(table.lookup(key) == (key == keys.back() ? gradient_index : decoy_index));
+                EXPECT(set.erase_key(key));
+            }
+            EXPECT(table.size() == 0 && flush());
+        }
+
+        // 1. The T# behind three keys that share its first slot, the S#, and other keys that name the decoy.
         std::uint32_t ahead = 0;
         for (std::uint32_t k = 1; ahead < 3; ++k) {
             if ((hash_descriptor_key(numbered(k)) & (slots - 1)) != home) continue;
@@ -620,7 +685,7 @@ int main(int argc, char** argv) {
         for (std::uint32_t k = 100000; k < 100006; ++k) set.insert_key(numbered(k), decoy_index);
         const std::uint32_t depth = probe_depth(table.build_gpu_buffer(), tsharp);
         EXPECT(slot_count() == slots && depth == 3 && !set.flush_needs_idle());
-        EXPECT(set.flush());
+        EXPECT(flush());
         CHECK(draw());
         compare("1 gradient", nullptr);
 
@@ -628,7 +693,7 @@ int main(int argc, char** argv) {
         const float zeros[4] = {0, 0, 0, 0};
         EXPECT(set.erase_key(tsharp) && !set.erase_key(tsharp));
         EXPECT(set.flush_needs_idle());  // erasing may move the keys behind it; nothing is running here
-        EXPECT(set.flush() && !set.flush_needs_idle());
+        EXPECT(flush() && !set.flush_needs_idle());
         CHECK(draw());
         compare("2 miss", zeros);
 
@@ -637,7 +702,7 @@ int main(int argc, char** argv) {
         EXPECT(!set.flush_needs_idle());  // one more entry, in place
         for (std::uint32_t k = 200000; k < 200200; ++k) set.insert_key(numbered(k), decoy_index);
         EXPECT(slot_count() > slots && table.lookup(tsharp) == gradient_index && set.flush_needs_idle());
-        EXPECT(set.flush());
+        EXPECT(flush());
         CHECK(draw());
         compare("3 grown", nullptr);
         set.release_retired();
@@ -647,25 +712,43 @@ int main(int argc, char** argv) {
         const std::uint32_t grown_slots = slot_count();
         EXPECT(set.insert_key(tsharp, gradient_index) && !set.flush_needs_idle());
         EXPECT(set.insert_key(tsharp, decoy_index) && slot_count() == grown_slots && set.flush_needs_idle());
-        EXPECT(set.flush() && !set.flush_needs_idle());
+        EXPECT(flush() && !set.flush_needs_idle());
         CHECK(draw());
         compare("4 rebound", orange_colour);
         EXPECT(set.insert_key(tsharp, gradient_index) && set.flush_needs_idle());
-        EXPECT(set.flush());
+        EXPECT(flush());
         CHECK(draw());
         compare("5 restored", nullptr);
 
+        // A submit that never reached the queue must keep the table upload pending: the retry has to see the new
+        // mapping instead of the fallback or the old index (a recovered submit failure, the case a device reports
+        // through table_upload_result(false)).
+        EXPECT(set.insert_key(tsharp, decoy_index) && set.flush_needs_idle());
+        vkResetCommandBuffer(cmd, 0);
+        CHECK(vkBeginCommandBuffer(cmd, &begin));
+        EXPECT(set.flush(cmd));  // recorded in a command buffer that is never submitted
+        CHECK(vkEndCommandBuffer(cmd));
+        set.table_upload_result(false);
+        EXPECT(set.flush_needs_idle());  // the retry rewrites the whole table: the device must idle first
+        EXPECT(flush());
+        CHECK(draw());
+        compare("6 rebound after a failed submit", orange_colour);
+        EXPECT(set.insert_key(tsharp, gradient_index) && set.flush_needs_idle());
+        EXPECT(flush());
+
         // Another view at the same index, then removal of the index.
         set.update_image(ImageDimension::dim_2d, gradient_index, decoy_view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-        EXPECT(set.flush());
+        EXPECT(flush());
         CHECK(draw());
-        compare("6 other view", orange_colour);
+        compare("7 other view", orange_colour);
         set.remove_image(ImageDimension::dim_2d, gradient_index);
-        EXPECT(set.flush());
+        EXPECT(flush());
         CHECK(draw());
-        compare("7 removed", zeros);
+        compare("8 removed", zeros);
         EXPECT(set.add_image(ImageDimension::dim_2d, gradient_view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) == gradient_index);
 
+        std::printf("%s: descriptor table in %s memory\n", name,
+                    set.table_in_device_local_memory() ? "device-local" : "host-visible");
         std::printf("%s: gradient at the %uth slot probed, miss, table grown %u -> %u slots, rebound, restored, other view, removed\n", name,
                     depth + 1, slots, slot_count());
         ++runs;

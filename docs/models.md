@@ -31,9 +31,83 @@ drawable/LOD variant. The two sets are different scopes, not contradictory.
 
 `packs.rpf`'s `.#dr` pages are drawable-dictionary roots, not drawables, so the old candidate
 scan never saw them. At the new pin the dictionary walk recovers **24,034 models** from that
-archive (23,720 dictionary children plus the 314 fragments), against 314 before. The 314
-`48557ea`/`c3708fb` entries in the table below are therefore the pre-pin control, not the
-current `packs.rpf` result. The other archive rows were not re-counted at `917e9b9`.
+archive (23,720 dictionary children plus the 314 fragments), against 314 before. A full
+`rpf9dump models` export of the archive reports **`ok=24,034 fail=0 skip=0` in 263 s** (0
+embedded textures); the OBJs and manifest are local. The 314 `48557ea`/`c3708fb` entries in the
+table below are therefore the pre-pin control, not the current `packs.rpf` result. The other
+model-bearing archives were re-counted at the new pin; the results are below.
+
+### Other archives at `917e9b9`
+
+A fresh scan/recover at the new pin (no cache; `models/3`) shows the same pattern in every
+archive with drawable dictionaries: the `c3708fb` recovery is the non-child count, and the new
+entries are dictionary children.
+
+| Archive | Candidates | Models at `917e9b9` | Dictionary children | `c3708fb` |
+|---|---:|---:|---:|---:|
+| `data.rpf` | 2,402 | **2,581** | 268 | 2,313 |
+| `pack/shared_minigame000/...` | 1,070 | **1,288** | 317 | 971 |
+| `pack/core_restofworld/...` | 1,024 | **885** | 797 | 88 |
+| `pack/story000/story000.rpf` | 4,195 | **7,460** | 4,156 | 3,304 |
+| `packs.rpf` | 23,838 | **24,034** | 23,720 | 314 |
+| `levels.rpf` | 206,981 | **314,000** | 130,225 | 183,801 |
+| `common`, `textures`, `story000_restofworld`, `core_restofworld001` | 0 | 0 | 0 | 0 |
+| **Total** | **239,510** | **350,248** | **159,483** | **190,792** |
+
+The last column is the `c3708fb` recovery for comparison. `story000`'s standalone count is
+3,304 vs 3,305; the full new-pin standalone total is 190,765, 27 below the `c3708fb` 190,792.
+Those 27 are not merged duplicates: they are the 27 models with more than 256 geometries that the
+probe rejects at `917e9b9` (26 in `levels.rpf`, 1 in `story000`; see
+[rejected candidates](#rejected-candidates-at-917e9b9)). The new entries are **159,483
+drawable-dictionary children**: one model per embedded drawable in a dictionary root, not new
+pages. `core_restofworld` recovers 873 of its 1,024 candidates (885 models); the 151 rejects are
+140 texture dictionaries and 11 drawable dictionaries whose drawable has radius 0.
+
+`levels.rpf` is the sum of ten parallel recovery shards over 206,981 candidates: **314,000
+models**, 130,225 dictionary children, 183,775 standalone. 1,037 candidates are rejected: the
+1,009 in the last shard are texture dictionaries, not models, and 28 more in shards 1 to 7 are
+models the probe caps reject (see [rejected candidates](#rejected-candidates-at-917e9b9)). The
+`levels.rpf` full export was not re-run, so its triangle total is still the old measurement.
+
+### Rejected candidates at `917e9b9`
+
+Every candidate of each model-bearing archive was run through `RecoverAtOffsets` on its own and,
+for each reject, through a copy of `TryResource` that records which check drops it (it agrees
+with the real code on all 206,981 `levels.rpf` candidates). Measured on the 1.0.2.1 package:
+
+| Archive | Rejects | Texture dictionaries | Geometry cap (`:351`) | List 4 cap (`:387`) | Radius 0 |
+|---|---:|---:|---:|---:|---:|
+| `levels.rpf` | 1,037 | 1,009 | 26 | 2 | 0 |
+| `data.rpf` | 75 | 75 | 0 | 0 | 0 |
+| `pack/core_restofworld/...` | 151 | 140 | 0 | 0 | 11 |
+| `pack/shared_minigame000/...` | 18 | 18 | 0 | 0 | 0 |
+| `pack/story000/story000.rpf` | 1 | 0 | 1 | 0 | 0 |
+| `packs.rpf` | 0 | 0 | 0 | 0 | 0 |
+
+Line numbers are in `third_party/rpf9-explorer/Core/RageModelDecoder.cs`.
+
+- **Texture dictionaries (1,242).** `LooksLikeDrawableDictionary` (`:78`) checks only the
+  dictionary header, which texture dictionaries share, so they become model candidates and fail
+  at `:314` because their values are not drawables. `Rpf9TextureRecovery` recovers all 1,242.
+  In `levels.rpf` they are the archive's last 0.12 GiB, each a 256- to 880-byte system block
+  and a graphics block. None of them overlaps a recovered model. Upstream
+  [rpf9-explorer#9](https://github.com/breadbbbb/rpf9-explorer/pull/9) stops the scan from
+  proposing them.
+- **Geometry cap (27).** The probe allows at most 256 geometries per model (`:351`), while
+  `Decode` allows `MaxMeshes`, 1,024 (`:535`). These models have 263 to 377 geometries.
+- **List 4 cap (2).** The probe caps renderer list 4 at 4,096 entries (`:387`) but never uses
+  that count for sizing. These two dictionaries have 5,078 and 5,461.
+- **Radius 0 (11).** Drawable dictionaries whose drawable has a zero radius and non-empty bounds,
+  rejected by `LooksLikeDrawableHeader` (`:124`) through `:314`. Whether they decode otherwise
+  has not been checked.
+
+[rpf9-explorer#11](https://github.com/breadbbbb/rpf9-explorer/pull/11) raises both probe caps.
+With it, the 29 capped candidates recover (41 models, 3.25 million triangles), and every
+candidate already recovered decodes exactly as before in all six archives above.
+
+One `levels.rpf` copy measured for this showed a 1,038th reject: a zlib block whose Adler-32
+fails because of a single flipped bit in that copy (flipping it back restores the stored
+checksum). It is local corruption, not part of the package, and is left out of the table.
 
 ## Independent validation
 
@@ -73,8 +147,9 @@ reproduced the ten-archive total. The `48557ea` column is the pre-fix control:
 | **Total** | **190,792** | **155,598** | **190,792** |
 
 The `packs.rpf` row is the pre-dictionary-root control: at `917e9b9` that archive recovers
-24,034 models (see above), not 314. The other rows were measured before the dictionary-root
-change.
+24,034 models, and the other archives' new-pin counts are in the table above. The rows here are
+the `c3708fb` measurements (190,792 models); the new-pin re-count is 350,248. Triangle totals
+have not been re-run at the new pin.
 
 At `c3708fb`, every candidate is recovered, read back and decoded: 0 decode failures, 0 readback
 failures, no duplicate model names, and 2.22 billion triangles (1.95 billion before). The
@@ -238,11 +313,37 @@ the model mapping and the texture-parameter split are in
 [character_skeleton.md](character_skeleton.md). No character bind matrices were recovered; that
 page records the reference-pose caveat rather than inventing a bind pose.
 
+## Shader render buckets
+
+`rpf9dump` writes two raw shader fields per material, `RenderBucket` (byte at shader +0x39) and
+`RenderBucketMask` (u32 at +0x3C; `RageModelDecoder.cs:651`). Measured on a random sample of 3,000 `.ydr`/`.yft`
+models (27,435 shaders):
+
+- `RenderBucketMask == 0xFF00 | (1 << (RenderBucket & 0x7F))` in all 27,435. Bit 7 of `RenderBucket` is a
+  separate flag (set in 438) that does not change the mask.
+- `RenderBucket & 0x7F` takes the values 0-6, the GTA V drawable bucket list. Model-name tokens (counted per
+  shader, from the model's name) line up with it:
+
+| Bucket | GTA V meaning | Shaders | Name evidence (share of shaders whose model name matches) |
+|---:|---|---:|---|
+| 0 | opaque | 17,826 | baseline: water 0.6%, vegetation 0.5%, glass/window 0.2%, decal 0.1% |
+| 1 | alpha | 725 | glass/window 7.6% (38x baseline) |
+| 2 | decal | 7,282 | decal/graffiti/dirt 3.1% (31x) |
+| 3 | cutout | 1,311 | vegetation 2.8% (5.6x) |
+| 4 | no splash | 6 | one program (`fc34f08b`) |
+| 5 | no water | 6 | the same program |
+| 6 | water | 343 | water/river/pool/canal 80.2% |
+
+Names are per model and a building holds glass, decal and opaque shaders alike, so the token shares are low
+in absolute terms; the enrichment against bucket 0 is the signal. For export: bucket 1 needs blending, 2 is
+a projected decal, 3 needs alpha testing, 6 is a water surface.
+
 ## What to do next
 
 1. **Done:** [rpf9-explorer PR #1](https://github.com/breadbbbb/rpf9-explorer/pull/1) is merged upstream.
 2. **Done:** the pin is `917e9b9` (was `48557ea`).
-3. Re-run `tools/rpf9dump models` over the full ten-archive set configured in Leonida at the new
-   pin. `packs.rpf` is measured (24,034); the other archives still carry the `c3708fb` counts.
-4. Replace the sample numbers in this page with the full counts, and keep the README and issue #29
-   in sync.
+3. `tools/rpf9dump models` has been re-run over the model-bearing archives at the new pin; the
+   counts are in the table above. Triangle totals were not re-run, and the texture counts in
+   [textures.md](textures.md) come from the Python TTPF tool, which is independent of the
+   submodule pin.
+4. Keep the README and issue #29 in sync with the new counts.

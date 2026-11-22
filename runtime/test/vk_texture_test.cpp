@@ -9,13 +9,19 @@
 //   --two-mip: expose a 128x128 quadrant texture and its solid cyan mip 1 to the 64x64 draw.
 //   vk_texture_test cube [out.raw]: ps_cube_sample against two 8x8 cubes, a 12-layer 2D array at binding 3 (the
 //   translator's view of a cube array); every pixel must be the texel a cube sample of its direction reads.
+//   vk_texture_test dref [out.raw]: ps_sample_c_lz against an 8x8 D32 texture at index 1 (texel x holds depth
+//   (x + 0.5) / 8) and a LESS_OR_EQUAL compare sampler at index 1; both of its results, f32 and d16, must be the
+//   1.0 or 0.0 the reference 0.5 gives against the texel each pixel reads.
+//   vk_texture_test dref_a16 [out.raw]: the same with ps_sample_c_lz_a16 (16-bit coordinates).
 //   VKT_HEAP_MB=<n>: size of the heap in MiB (default 64 KiB)
 //   VKT_NEED_MAINTENANCE8=1: the shader has a non-constant texel Offset outside gather (image_sample*_o, see
 //   ps_texoff.asm); print "unsupported: ..." and exit 77 when VK_KHR_maintenance8 cannot be enabled.
-// VK_KHR_maintenance8 and shaderImageGatherExtended (a non-constant gather Offset) are enabled when the device has
-// them.
+// VK_KHR_maintenance8, shaderImageGatherExtended (a non-constant gather Offset) and shaderResourceMinLod (the MinLod
+// clamp of image_sample_d_cl) are enabled when the device has them. A fragment shader that declares the MinLod
+// capability on a device without shaderResourceMinLod prints "unsupported: ..." and exits 77.
 #define VK_NO_PROTOTYPES
 #include "vulkan_loader.h"
+#include "vk_device_pick.h"
 
 #include <algorithm>
 #include <cmath>
@@ -44,7 +50,15 @@ static std::vector<uint32_t> read_spv(const char* p) {
     return w;
 }
 
+// Whether the module declares capability `cap` (OpCapability comes first, right after the 5-word header).
+static bool declares_capability(const std::vector<uint32_t>& spv, uint32_t cap) {
+    for (size_t i = 5; i + 1 < spv.size() && spv[i] == (2u << 16 | 17u); i += 2)   // OpCapability, 2 words
+        if (spv[i + 1] == cap) return true;
+    return false;
+}
+
 #include "../src/descriptor_table.h"
+#include "../src/gfx10_descriptors.h"
 
 int main(int argc, char** argv) {
     const uint32_t W = 64, H = 64, TW = 8;
@@ -55,6 +69,8 @@ int main(int argc, char** argv) {
     std::string vs_path, fs_path, out_path;
     int ptr_sgpr = 0;
     const bool cube = argc >= 2 && !std::strcmp(argv[1], "cube");
+    const bool dref_a16 = argc >= 2 && !std::strcmp(argv[1], "dref_a16");
+    const bool dref = dref_a16 || (argc >= 2 && !std::strcmp(argv[1], "dref"));
     bool autonomous = false;
     uint32_t ssharp[8] = {0x92, 0xc00000, 0x14500000, 0,
                           0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu};
@@ -64,7 +80,7 @@ int main(int argc, char** argv) {
         out_path = argv[3];
         ptr_sgpr = std::atoi(argv[4]);
         for (int i = 0; i < 4; ++i) ssharp[i] = (uint32_t)strtoul(argv[5 + i], 0, 16);
-    } else if (argc <= 2 || (cube && argc == 3)) {
+    } else if (argc <= 2 || ((cube || dref) && argc == 3)) {
         // Autonomous mode using synthetic hand-written shaders (no game files required)
         autonomous = true;
         auto find_spv = [](const char* name) -> std::string {
@@ -83,12 +99,15 @@ int main(int argc, char** argv) {
             return std::string("runtime/build/shaders/spirv/") + name;
         };
         vs_path = find_spv("vs_ids.spv");
-        fs_path = find_spv(cube ? "ps_cube_sample.spv" : "ps_texture_sample.spv");
-        const int out_arg = cube ? 2 : 1;
+        fs_path = find_spv(cube ? "ps_cube_sample.spv" : dref_a16 ? "ps_sample_c_lz_a16.spv"
+                           : dref ? "ps_sample_c_lz.spv" : "ps_texture_sample.spv");
+        const int out_arg = cube || dref ? 2 : 1;
         out_path = argc > out_arg ? argv[out_arg] : "runtime/build/vk_texture_test_out.raw";
         ptr_sgpr = 0;
+        if (dref)
+            ssharp[0] |= 3u << 12;              // the shader's S#: DEPTH_COMPARE_FUNC = LESSEQUAL
     } else {
-        std::fprintf(stderr, "usage: vk_texture_test [cube] [out] | vs fs out ptr_sgpr s0 s1 s2 s3 [--two-mip]\n");
+        std::fprintf(stderr, "usage: vk_texture_test [cube|dref|dref_a16] [out] | vs fs out ptr_sgpr s0 s1 s2 s3 [--two-mip]\n");
         return 2;
     }
     uint32_t tsharp[8] = {0x11111111, 0x22222222, 0x33333333, 0x44444444,
@@ -115,12 +134,14 @@ int main(int argc, char** argv) {
     }
     VkPhysicalDevice pd = VK_NULL_HANDLE;
     VkPhysicalDeviceProperties properties{};
+    int best_rank = -1;
     for (uint32_t i = 0; i < n; ++i) {
         VkPhysicalDeviceProperties p;
         vkGetPhysicalDeviceProperties(pds[i], &p);
-        if (!pd || p.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) {
+        if (const int rank = leonida::vk_test::device_rank(p.deviceType, p.vendorID); rank > best_rank) {
             pd = pds[i];
             properties = p;
+            best_rank = rank;
         }
     }
     constexpr uint32_t push_words = 36;
@@ -128,7 +149,7 @@ int main(int argc, char** argv) {
     if (properties.limits.maxPushConstantsSize < push_bytes) {
         std::fprintf(stderr, "unsupported: need %u push constant bytes, device has %u\n",
                      push_bytes, properties.limits.maxPushConstantsSize);
-        return two_mip ? 77 : 1;
+        return 77;   // a device limit, not a wrong result: every texture test skips (128-byte devices, D3D-14)
     }
     uint32_t qn = 0; vkGetPhysicalDeviceQueueFamilyProperties(pd, &qn, nullptr);
     std::vector<VkQueueFamilyProperties> qf(qn); vkGetPhysicalDeviceQueueFamilyProperties(pd, &qn, qf.data());
@@ -153,6 +174,11 @@ int main(int argc, char** argv) {
                  pdp.limits.minTexelGatherOffset, int(pdp.limits.maxTexelGatherOffset));
     VkPhysicalDeviceFeatures have; vkGetPhysicalDeviceFeatures(pd, &have);
     f2.features.shaderImageGatherExtended = have.shaderImageGatherExtended;
+    f2.features.shaderResourceMinLod = have.shaderResourceMinLod;
+    if (declares_capability(read_spv(fs_path.c_str()), 42) && !have.shaderResourceMinLod) {   // 42 = MinLod
+        std::printf("unsupported: shaderResourceMinLod (the shader clamps its LOD with MinLod)\n");
+        return 77;
+    }
     std::vector<const char*> enable;
     bool m8_on = false;
 #ifdef VK_KHR_MAINTENANCE_8_EXTENSION_NAME   // the structure type is an enumerator: defined() never sees it
@@ -220,6 +246,8 @@ int main(int argc, char** argv) {
     CHECK(make_buffer(heap_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT, &heap, &heapm, &heapp));
     std::memset(heapp, 0, size_t(heap_bytes));
     std::memcpy(static_cast<char*>(heapp) + tsharp_va, tsharp, 32);
+    if (two_mip)  // The gather test loads its S# from the four words just after the T#.
+        std::memcpy(static_cast<char*>(heapp) + tsharp_va + 32, ssharp, 16);
     VkBufferDeviceAddressInfo bdai{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO}; bdai.buffer = heap;
     VkDeviceAddress heap_base = vkGetBufferDeviceAddress(dev, &bdai);
     // Descriptor hash table: 16 slots.
@@ -230,11 +258,17 @@ int main(int argc, char** argv) {
     VkBuffer tb; VkDeviceMemory tbm; void* tbp;
     CHECK(make_buffer(table.size() * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &tb, &tbm, &tbp));
     std::memcpy(tbp, table.data(), table.size() * 4);
-    // Textures: index 0 = 1x1 magenta fallback, index 1 = 8x8 gradient (r = x/8, g = y/8, b = 0.5, a = 1).
-    // Binding 3 (2D arrays) gets the same fallback and two 8x8 cubes as 12 layers: layer l = (x/8, y/8, 20l/255, 1).
-    auto make_tex = [&](uint32_t w, uint32_t h, uint32_t mip_levels, uint32_t layers, VkImageViewType type, VkImage* img, VkImageView* view) {
+    // Textures: index 0 = 1x1 magenta fallback, index 1 = 8x8 gradient (r = x/8, g = y/8, b = 0.5, a = 1), or in dref
+    // mode an 8x8 D32 texture with depth (x + 0.5) / 8. Binding 3 (2D arrays) gets the same fallback and two 8x8 cubes
+    // as 12 layers: layer l = (x/8, y/8, 20l/255, 1).
+    auto aspect_of = [](VkFormat f) {
+        return f == VK_FORMAT_D32_SFLOAT ? VkImageAspectFlags(VK_IMAGE_ASPECT_DEPTH_BIT)
+                                         : VkImageAspectFlags(VK_IMAGE_ASPECT_COLOR_BIT);
+    };
+    auto make_tex = [&](uint32_t w, uint32_t h, uint32_t mip_levels, uint32_t layers, VkImageViewType type,
+                        VkFormat format, VkImage* img, VkImageView* view) {
         VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
-        ii.imageType = VK_IMAGE_TYPE_2D; ii.format = VK_FORMAT_R8G8B8A8_UNORM; ii.extent = {w, h, 1};
+        ii.imageType = VK_IMAGE_TYPE_2D; ii.format = format; ii.extent = {w, h, 1};
         ii.mipLevels = mip_levels; ii.arrayLayers = layers; ii.samples = VK_SAMPLE_COUNT_1_BIT; ii.tiling = VK_IMAGE_TILING_OPTIMAL;
         ii.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
         VkResult r = vkCreateImage(dev, &ii, nullptr, img); if (r) return r;
@@ -245,7 +279,7 @@ int main(int argc, char** argv) {
         r = vkBindImageMemory(dev, *img, m, 0); if (r) return r;
         VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
         vi.image = *img; vi.viewType = type; vi.format = ii.format;
-        vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, mip_levels, 0, layers};
+        vi.subresourceRange = {aspect_of(format), 0, mip_levels, 0, layers};
         return vkCreateImageView(dev, &vi, nullptr, view);
     };
     const uint32_t magenta = 0xFFFF00FFu;
@@ -258,6 +292,13 @@ int main(int argc, char** argv) {
                                          : (x * 32u) | ((y * 32u) << 8) | (128u << 16) | (255u << 24);
         }
     }
+    if (dref) {   // same size as the 8x8 gradient: one 32-bit word a texel
+        for (uint32_t y = 0; y < TW; y++)
+            for (uint32_t x = 0; x < TW; x++) {
+                const float depth = (x + 0.5f) / TW;
+                std::memcpy(&texels[y * TW + x], &depth, sizeof(depth));
+            }
+    }
     const uint32_t CUBE_LAYERS = 12;
     std::vector<uint32_t> cubes(CUBE_LAYERS * TW * TW);
     for (uint32_t y = 0; y < TW; y++)
@@ -265,11 +306,13 @@ int main(int argc, char** argv) {
             for (uint32_t l = 0; l < CUBE_LAYERS; l++)
                 cubes[(l * TW + y) * TW + x] = (x * 32u) | ((y * 32u) << 8) | ((l * 20u) << 16) | (255u << 24);
         }
+    const VkFormat tfmt[4] = {VK_FORMAT_R8G8B8A8_UNORM, dref ? VK_FORMAT_D32_SFLOAT : VK_FORMAT_R8G8B8A8_UNORM,
+                              VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R8G8B8A8_UNORM};
     VkImage timg[4]; VkImageView tview[4];
-    CHECK(make_tex(1, 1, 1, 1, VK_IMAGE_VIEW_TYPE_2D, &timg[0], &tview[0]));
-    CHECK(make_tex(texture_side, texture_side, levels, 1, VK_IMAGE_VIEW_TYPE_2D, &timg[1], &tview[1]));
-    CHECK(make_tex(1, 1, 1, 1, VK_IMAGE_VIEW_TYPE_2D_ARRAY, &timg[2], &tview[2]));
-    CHECK(make_tex(TW, TW, 1, CUBE_LAYERS, VK_IMAGE_VIEW_TYPE_2D_ARRAY, &timg[3], &tview[3]));
+    CHECK(make_tex(1, 1, 1, 1, VK_IMAGE_VIEW_TYPE_2D, tfmt[0], &timg[0], &tview[0]));
+    CHECK(make_tex(texture_side, texture_side, levels, 1, VK_IMAGE_VIEW_TYPE_2D, tfmt[1], &timg[1], &tview[1]));
+    CHECK(make_tex(1, 1, 1, 1, VK_IMAGE_VIEW_TYPE_2D_ARRAY, tfmt[2], &timg[2], &tview[2]));
+    CHECK(make_tex(TW, TW, 1, CUBE_LAYERS, VK_IMAGE_VIEW_TYPE_2D_ARRAY, tfmt[3], &timg[3], &tview[3]));
     VkBuffer up; VkDeviceMemory upm; void* upp;
     const VkDeviceSize texture_offset = 256;
     const VkDeviceSize texture_bytes = texels.size() * sizeof(uint32_t);
@@ -283,7 +326,18 @@ int main(int argc, char** argv) {
     sci.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
     sci.maxLod = float(levels - 1);
     sci.addressModeU = sci.addressModeV = sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-    VkSampler smp[2]; CHECK(vkCreateSampler(dev, &sci, nullptr, &smp[0])); CHECK(vkCreateSampler(dev, &sci, nullptr, &smp[1]));
+    VkSamplerCreateInfo sci1 = sci;            // index 1: the S# the shader names
+    if (two_mip) {
+        const leonida::gfx10::SamplerWords words{ssharp[0], ssharp[1], ssharp[2], ssharp[3]};
+        const auto sampler = leonida::gfx10::decode(words);
+        sci1.minLod = sampler.min_lod;
+        sci1.maxLod = sampler.max_lod;
+    }
+    if (dref) {
+        sci1.compareEnable = VK_TRUE;
+        sci1.compareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
+    }
+    VkSampler smp[2]; CHECK(vkCreateSampler(dev, &sci, nullptr, &smp[0])); CHECK(vkCreateSampler(dev, &sci1, nullptr, &smp[1]));
     // Render target.
     const VkFormat fmt = VK_FORMAT_R32G32B32A32_SFLOAT;
     VkImage rt; VkImageView rtv;
@@ -384,13 +438,13 @@ int main(int argc, char** argv) {
         VkImageMemoryBarrier ib{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
         ib.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED; ib.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL; ib.image = timg[t];
         const uint32_t mip_levels = t == 1 ? levels : 1;
-        ib.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, mip_levels, 0, up_layers[t]}; ib.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        ib.subresourceRange = {aspect_of(tfmt[t]), 0, mip_levels, 0, up_layers[t]}; ib.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
         ib.srcQueueFamilyIndex = ib.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &ib);
         VkDeviceSize offset = up_offset[t];
         for (uint32_t level = 0; level < mip_levels; ++level) {
             const uint32_t side = up_size[t] >> level;
-            VkBufferImageCopy c{}; c.bufferOffset = offset; c.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, 0, up_layers[t]};
+            VkBufferImageCopy c{}; c.bufferOffset = offset; c.imageSubresource = {aspect_of(tfmt[t]), level, 0, up_layers[t]};
             c.imageExtent = {side, side, 1};
             vkCmdCopyBufferToImage(cmd, up, timg[t], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c);
             offset += VkDeviceSize(side) * side * up_layers[t] * sizeof(uint32_t);
@@ -416,7 +470,10 @@ int main(int argc, char** argv) {
     CHECK(vkEndCommandBuffer(cmd));
     VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO}; si.commandBufferCount = 1; si.pCommandBuffers = &cmd;
     CHECK(vkQueueSubmit(q, 1, &si, VK_NULL_HANDLE)); CHECK(vkQueueWaitIdle(q));
-    std::ofstream(out_path, std::ios::binary).write(static_cast<const char*>(rbp), std::streamsize(W) * H * 16);
+    std::ofstream output(out_path, std::ios::binary);
+    output.write(static_cast<const char*>(rbp), std::streamsize(W) * H * 16);
+    output.close();
+    if (!output) { std::fprintf(stderr, "failed to write %s\n", out_path.c_str()); return 1; }
     std::fprintf(stderr, "ok -> %s (heap base 0x%llx)\n", out_path.c_str(), (unsigned long long)heap_base);
     if (autonomous && cube) {
         // Expected: the texel a cube sample of the pixel centre's direction reads from the second cube (layer 6 + face).
@@ -452,7 +509,28 @@ int main(int argc, char** argv) {
         std::printf("vk_texture_test cube: PASSED (%d pixels, each the texel a cube sample of its direction reads)\n",
                     checked);
     }
-    if (autonomous && !cube) {
+    if (autonomous && dref) {
+        // Expected: pixel column px reads texel x = floor(8u) at u = (px + 0.5) / 64 (never on a texel edge), whose
+        // depth (x + 0.5) / 8 passes the reference 0.5 under LESS_OR_EQUAL from x = 4 on. Both results, the f32 one
+        // and the d16 one widened back to f32, are exactly that 1.0 or 0.0.
+        const float* pixels = static_cast<const float*>(rbp);
+        int wrong_f32 = 0, wrong_d16 = 0;
+        for (uint32_t py = 0; py < H; py++)
+            for (uint32_t px = 0; px < W; px++) {
+                const uint32_t tx = std::min(TW - 1, uint32_t((px + 0.5f) / W * TW));
+                const float want = 0.5f <= (tx + 0.5f) / TW ? 1.0f : 0.0f;
+                const float* p = pixels + (py * W + px) * 4;
+                wrong_f32 += p[0] != want;
+                wrong_d16 += p[1] != want;
+            }
+        if (wrong_f32 || wrong_d16) {
+            std::fprintf(stderr, "vk_texture_test dref: FAILED, %d pixels wrong in the f32 result and %d in the d16 one "
+                         "(of %u)\n", wrong_f32, wrong_d16, W * H);
+            return 1;
+        }
+        std::printf("vk_texture_test dref: PASSED (%u pixels, f32 and d16 depth compares exact)\n", W * H);
+    }
+    if (autonomous && !cube && !dref) {
         const float* pixels = static_cast<const float*>(rbp);
         // Sample center pixel (32, 32)
         int idx = (32 * W + 32) * 4;

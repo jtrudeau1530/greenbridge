@@ -12,18 +12,23 @@ match the published GTA V `heightmap.dat` (`HMAP`) layout:
     0x0A  u16 pad
     0x0C  six f32 bounds     (min xyz, max xyz)
     0x24  u32 data size      (bytes after this 44-byte header)
-    0x28  u32 unverified field
+    0x28  u8 default height  (23 in both measured payloads, 0 m quantised)
+    0x29  3 bytes            differ per file; not a checksum (padding?)
     0x2C  height x 8-byte row headers `{u16 start, u16 count, i32 offset}`
           then the packed u8 heights. A cell not covered by a row keeps the
-          measured default 23. The source index is `offset + start + i`.
+          default from 0x28. The source index is `offset + start + i`. The
+          encoder crops each row to its first and last non-default cell, so
+          no measured span starts or ends on the default.
     The old "zero prefix + square grid" reading was an artifact: the prefix is
     the zeroed row headers of the map's empty (default) rows.
 
 `PAMH` (`HMAP` read little-endian)
     0x00  "PAMH"             (the `HMAP` magic stored little-endian)
-    0x04  u8 version major, u8 version minor
+    0x04  u8 version major, u8 version minor  (1.2 in `common.rpf`)
+    0x05  in the `levels.rpf` tiles 0x05..0x0B also hold leftover text of the
+          tile name; 0x04 stays 1 and the real fields start at 0x0C (see below)
     0x06  u16 pad
-    0x08  u32 compressed/flag word (GTA V writes 1; measured 0x1BBC8CED here)
+    0x08  u32: GTA V's `compressed` word in `common.rpf`, padding in the tiles
     0x0C  u16 width
     0x0E  u16 height
     0x10  six f32 bounds     (min xyz, max xyz)
@@ -32,6 +37,14 @@ match the published GTA V `heightmap.dat` (`HMAP`) layout:
           then `width * height` u8 max rows and `width * height` u8 min rows.
     On the measured file the first array is a flat 110 (2.5 m) sea-surface
     layer and the second is the ground; min <= max in all 23,616 cells.
+
+In the 1,476 64 x 64 tiles of `levels.rpf`, bytes 0x05..0x0B hold leftover text,
+not a version minor and a flag: 0x04 stays 1, 0x05.. hold the tile name `n_m`
+(n = column + 1, m = row + 1), and the remaining bytes keep the right-aligned
+tail of the string `height` (`ght`, `ht`, or a zero byte when the name is
+longer). The 28 distinct 0x08..0x0B words are all text and none of them changes
+the arrays, so 0x08 is padding there. The `common.rpf` payload happens to hold
+0x1BBC8CED, which is why it was once reported as a `compressed` flag.
 
 Both formats scale a u8 value into the header's Z box:
 
@@ -51,7 +64,6 @@ import sys
 
 MAGIC = (b"MHIU", b"PAMH", b"SPS1Z")
 HEADER = 44
-DEFAULT_MHIU_HEIGHT = 23
 
 
 def _u16(blob: bytes, offset: int) -> int:
@@ -96,8 +108,9 @@ def parse_mhiu(blob: bytes) -> dict:
 
     rows = _rows(blob, height)
     pixels = blob[HEADER + height * 8:]
-    heights = bytearray([DEFAULT_MHIU_HEIGHT]) * (width * height)
-    empty = filled_rows = filled_cells = 0
+    default = blob[0x28]
+    heights = bytearray([default]) * (width * height)
+    empty = filled_rows = filled_cells = ends_at_default = 0
     spans = []
     for y in range(height):
         start, count = struct.unpack_from("<HH", rows, y * 8)
@@ -112,6 +125,8 @@ def parse_mhiu(blob: bytes) -> dict:
             raise ValueError(f"MHIU row {y} leaves the {len(pixels)}-byte pixel data")
         heights[y * width + start:y * width + start + count] = \
             pixels[source:source + count]
+        ends_at_default += (pixels[source] == default) + \
+            (pixels[source + count - 1] == default)
         filled_rows += 1
         filled_cells += count
         spans.append((source, source + count))
@@ -129,7 +144,8 @@ def parse_mhiu(blob: bytes) -> dict:
             "height": height,
             "bounds": bounds,
             "data_size": size,
-            "field28": _u32(blob, 0x28),
+            "default_height": default,
+            "pad_29": blob[0x29:0x2C].hex(),
             "z_mapping": "min.z + value/255 * (max.z - min.z)",
         },
         "grid": {
@@ -137,13 +153,14 @@ def parse_mhiu(blob: bytes) -> dict:
             "width": width,
             "height": height,
             "cells": width * height,
-            "default": DEFAULT_MHIU_HEIGHT,
+            "default": default,
             "row_records": height,
             "filled_rows": filled_rows,
             "empty_rows": empty,
             "filled_cells": filled_cells,
             "data_bytes": len(pixels),
-            "z_at_default": round(_z(DEFAULT_MHIU_HEIGHT, bounds), 2),
+            "span_ends_at_default": ends_at_default,
+            "z_at_default": round(_z(default, bounds), 2),
         },
         "_grid": bytes(heights),
     }
@@ -171,11 +188,14 @@ def parse_pamh(blob: bytes) -> dict:
     half = width * height
     maximum = bytearray(half)
     minimum = bytearray(half)
+    full_width = 0
     for y in range(height):
         start, count = struct.unpack_from("<HH", rows, y * 8)
         offset = struct.unpack_from("<i", rows, y * 8 + 4)[0]
         if start + count > width:
             raise ValueError(f"PAMH row {y} leaves the {width}-cell width")
+        if start == 0 and count == width:
+            full_width += 1
         for i in range(count):
             x = start + i
             at = offset + x
@@ -190,7 +210,7 @@ def parse_pamh(blob: bytes) -> dict:
         "header": {
             "version_major": blob[0x04],
             "version_minor": blob[0x05],
-            "flag": _u32(blob, 0x08),
+            "padding08": _u32(blob, 0x08),
             "width": width,
             "height": height,
             "bounds": bounds,
@@ -203,6 +223,7 @@ def parse_pamh(blob: bytes) -> dict:
             "height": height,
             "cells": width * height,
             "row_records": height,
+            "full_width_rows": full_width,
             "max_min": min(maximum),
             "max_max": max(maximum),
             "min_min": min(minimum),
@@ -212,6 +233,52 @@ def parse_pamh(blob: bytes) -> dict:
         "_max": bytes(maximum),
         "_min": bytes(minimum),
     }
+
+
+def pamh_census(payloads: list[dict]) -> list[dict]:
+    """Group decoded PAMH payloads by grid size and count what varies inside a group.
+
+    The 0x08 word is padding, so it is counted, not used as a key. Byte 0x05 is the HMAP
+    version-minor byte in the common.rpf payload but holds text in the levels.rpf tiles, so it is
+    reported as a distribution instead of a group key."""
+    groups = {}
+    for p in payloads:
+        if p["type"] != "PAMH":
+            continue
+        h, g = p["header"], p["grid"]
+        grp = groups.get((g["width"], g["height"]))
+        if grp is None:
+            grp = groups[(g["width"], g["height"])] = {
+                "width": g["width"],
+                "height": g["height"],
+                "tiles": 0,
+                "cells": 0,
+                "bounds_min": list(h["bounds"]["min"]),
+                "bounds_max": list(h["bounds"]["max"]),
+                "full_width_row_tiles": 0,
+                "min_above_max": 0,
+                "version_minor": {},
+                "padding08_zero": 0,
+                "_padding": set(),
+            }
+        grp["tiles"] += 1
+        grp["cells"] += g["cells"]
+        for i in range(3):
+            grp["bounds_min"][i] = min(grp["bounds_min"][i], h["bounds"]["min"][i])
+            grp["bounds_max"][i] = max(grp["bounds_max"][i], h["bounds"]["max"][i])
+        if g["full_width_rows"] == g["height"]:
+            grp["full_width_row_tiles"] += 1
+        grp["min_above_max"] += g["min_above_max"]
+        minor = str(h["version_minor"])
+        grp["version_minor"][minor] = grp["version_minor"].get(minor, 0) + 1
+        if h["padding08"] == 0:
+            grp["padding08_zero"] += 1
+        grp["_padding"].add(h["padding08"])
+    out = list(groups.values())
+    for grp in out:
+        grp["padding08_distinct"] = len(grp.pop("_padding"))
+    out.sort(key=lambda x: (-x["tiles"], x["width"], x["height"]))
+    return out
 
 
 def parse_payload(blob: bytes) -> dict:
@@ -303,9 +370,18 @@ def main() -> int:
                   f'{g["min_above_max"]} cells min>max')
     if not payloads:
         print("no MHIU or PAMH payloads")
+    census = pamh_census(payloads)
+    for grp in census:
+        print(f'PAMH census {grp["width"]}x{grp["height"]}: {grp["tiles"]} tiles, '
+              f'{grp["full_width_row_tiles"]} with full-width rows, '
+              f'{grp["min_above_max"]} cells min>max, padding 08 zero {grp["padding08_zero"]}, '
+              f'{grp["padding08_distinct"]} distinct')
     if a.json:
+        out = {"payloads": [_public(p) for p in payloads]}
+        if census:
+            out["pamh_census"] = census
         with open(a.json, "w", encoding="utf-8") as f:
-            json.dump({"payloads": [_public(p) for p in payloads]}, f, indent=1)
+            json.dump(out, f, indent=1)
         print("wrote", a.json)
     return 0
 

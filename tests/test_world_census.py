@@ -15,6 +15,7 @@ import sys
 import tempfile
 import unittest
 import zlib
+from pathlib import Path
 from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -69,10 +70,10 @@ class WorldCensusTest(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def run_census(self, shard_size=1 << 30, jobs=1):
+    def run_census(self, shard_size=1 << 30, jobs=1, out_name="out"):
         arc = os.path.join(self.dir, "sample.rpf")
         make_archive(arc)
-        out = os.path.join(self.dir, "out")
+        out = os.path.join(self.dir, out_name)
         code = WC.main([arc, "--out", out, "--shard-size", str(shard_size), "--jobs", str(jobs)])
         with open(os.path.join(out, "summary.json"), encoding="utf-8") as f:
             return code, json.load(f)
@@ -102,6 +103,87 @@ class WorldCensusTest(unittest.TestCase):
         self.assertEqual(s["entities"], 4)
         self.assertEqual(s["duplicate_offsets"], 0)
         self.assertEqual(s["coverage"]["accounted"], s["coverage"]["span"])
+
+    def test_tiny_shards_give_the_same_stream_totals(self):
+        """Each shard starts scanning WARMUP bytes early to find its first stream boundary. Streams that start in
+        that window belong to the previous shard, so the stream and byte totals must not depend on the shard size."""
+        _, whole = self.run_census(out_name="whole")
+        _, tiny = self.run_census(shard_size=400, out_name="tiny")
+        self.assertGreater(tiny["shards_expected"], 1)
+        for key, value in whole["totals"].items():
+            with self.subTest(total=key):
+                self.assertEqual(tiny["totals"].get(key), value)
+        self.assertGreater(whole["totals"]["streams"], 0)
+
+    def test_version_4_warmup_shard_requires_a_rescan(self):
+        archive = Path(self.dir) / "sample.rpf"
+        out = Path(self.dir) / "out"
+        start, shard_size = 0x40, 0x200
+        boundary = start + shard_size
+        map_data, meta_data = TWI.make_resource(True), TWI.make_resource(False)
+        first, second = zlib.compress(map_data), zlib.compress(meta_data)
+        data = bytearray(boundary)
+        struct.pack_into("<4sI", data, 0, b"9FPR", start)
+        data[start:start + len(first)] = first
+        data.extend(second)
+        archive.write_bytes(data)
+
+        def run(*flags):
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                code = WC.main([str(archive), "--out", str(out), "--shard-size", str(shard_size),
+                                "--jobs", "1", *flags])
+            summary = json.loads((out / "summary.json").read_text(encoding="utf-8"))
+            return code, stdout.getvalue(), summary
+
+        code, _, fresh = run()
+        self.assertEqual(code, 0)
+        expected = {"streams": 2, "stored": len(first) + len(second),
+                    "inflated": len(map_data) + len(meta_data), "rejected": 0}
+        self.assertEqual({k: fresh["totals"][k] for k in expected}, expected)
+        self.assertTrue(fresh["census_exact"])
+        self.assertEqual(fresh["shards_complete"], 2)
+        maps = (out / "maps.json").read_bytes()
+
+        compatible_path, legacy_path = [Path(WC._shard_path(out, s)) for s in fresh["shards"]]
+        compatible = compatible_path.read_bytes()
+        legacy = json.loads(legacy_path.read_text(encoding="utf-8"))
+        # Format 4 counted the first shard's stream again during the second shard's warm-up.
+        legacy["format"] = 4
+        legacy["intervals"].insert(0, [start, start + len(first)])
+        legacy["stats"]["streams"] += 1
+        legacy["stats"]["stored"] += len(first)
+        legacy["stats"]["inflated"] += len(map_data)
+        legacy["stats"]["adopted"] = 1
+        legacy_path.write_text(json.dumps(legacy), encoding="utf-8")
+        stale = legacy_path.read_bytes()
+
+        code, _, partial = run("--merge-only")
+        self.assertEqual(code, 1)
+        self.assertEqual(partial["missing_ranges"], [[boundary, len(data)]])
+        self.assertEqual(partial["shards_complete"], 1)
+        self.assertFalse(partial["census_exact"])
+        self.assertEqual(partial["totals"]["streams"], 1)
+        self.assertEqual(legacy_path.read_bytes(), stale)
+
+        code, stdout, rebuilt = run("--resume")
+        self.assertEqual(code, 0)
+        self.assertIn("2 shards, 1 to scan", stdout)
+        self.assertEqual(rebuilt["totals"], fresh["totals"])
+        self.assertEqual(rebuilt["missing_ranges"], [])
+        self.assertTrue(rebuilt["census_exact"])
+        self.assertEqual((out / "maps.json").read_bytes(), maps)
+        self.assertEqual(compatible_path.read_bytes(), compatible)
+        self.assertEqual(json.loads(legacy_path.read_bytes())["format"], WC.FORMAT)
+
+        code, stdout, resumed = run("--resume")
+        self.assertEqual(code, 0)
+        self.assertIn("2 shards, 0 to scan", stdout)
+        code, _, merged = run("--merge-only")
+        self.assertEqual(code, 0)
+        for summary in (resumed, merged):
+            self.assertEqual(summary["totals"], fresh["totals"])
+            self.assertTrue(summary["census_exact"])
 
     def test_required_len_detects_split_page(self):
         blob = TWI.make_resource(True)
@@ -644,6 +726,76 @@ class MainTest(unittest.TestCase):
         self.assertEqual((s["maps"], s["entities"]), (4, 4))
         self.assertTrue(s["census_exact"])
         self.assertEqual(s["totals"]["meta_other"], 1)
+
+    def check_report_failure_and_retry(self, out, failure):
+        paths = [Path(out) / name for name in ("maps.json", "summary.json")]
+        before = [p.read_bytes() if p.exists() else None for p in paths]
+        args = (self.arc, "--out", out, "--jobs", "1", "--resume")
+        with failure:
+            code, _, err = self.run_main(*args)
+        self.assertEqual(code, 1, err)
+        for path, old_bytes in zip(paths, before):
+            self.assertEqual(path.read_bytes() if path.exists() else None, old_bytes, path.name)
+
+        code, stdout, err = self.run_main(*args)
+        self.assertEqual(code, 0, err)
+        self.assertIn("1 shards, 0 to scan", stdout)
+        maps, summary = (json.loads(path.read_bytes()) for path in paths)
+        self.assertEqual(len(maps["maps"]), 4)
+        self.assertEqual(maps["summary"], {k: summary[k] for k in maps["summary"]})
+
+    def test_failed_report_replace_restores_previous_files(self):
+        names = ("maps.json", "summary.json")
+        replace = os.replace
+        for failed in names:
+            for previous in (names, names[:1], names[1:], ()):
+                with self.subTest(failed=failed, previous=previous), tempfile.TemporaryDirectory() as out:
+                    for name in previous:
+                        (Path(out) / name).write_text(json.dumps({"previous": name}), encoding="utf-8")
+                    injected = False
+
+                    def fail_once(src, dst):
+                        nonlocal injected
+                        if not injected and Path(dst) == Path(out) / failed:
+                            injected = True
+                            raise PermissionError("report replacement failed")
+                        return replace(src, dst)
+
+                    self.check_report_failure_and_retry(out, mock.patch.object(os, "replace", fail_once))
+                    self.assertTrue(injected)
+
+    def test_failed_report_restore_keeps_recovery_copy(self):
+        out = Path(self.out)
+        out.mkdir()
+        maps, summary = out / "maps.json", out / "summary.json"
+        old_summary = b'{"previous": "summary"}'
+        old_maps = b'{"previous": "maps"}'
+        summary.write_bytes(old_summary)
+        maps.write_bytes(old_maps)
+        replace = os.replace
+
+        def fail_publish_and_restore(src, dst):
+            if Path(dst) == maps:
+                raise PermissionError("publish denied")
+            if Path(dst) == summary and Path(src).read_bytes() == old_summary:
+                raise PermissionError("restore denied")
+            return replace(src, dst)
+
+        with mock.patch.object(os, "replace", fail_publish_and_restore):
+            code, _, err = self.run_main(self.arc, "--out", self.out, "--jobs", "1")
+        self.assertEqual(code, 1)
+        self.assertIn("restore denied", err)
+        self.assertEqual(maps.read_bytes(), old_maps)
+        backups = [p for p in out.rglob("summary.json") if p != summary and p.read_bytes() == old_summary]
+        self.assertEqual(len(backups), 1)
+        self.assertIn(str(backups[0].parent), err)
+
+    @unittest.skipUnless(os.name == "nt", "Windows readers can deny replacement")
+    def test_report_held_open_preserves_both_files(self):
+        for held in ("maps.json", "summary.json"):
+            with self.subTest(held=held), tempfile.TemporaryDirectory() as out:
+                self.assertEqual(self.run_main(self.arc, "--out", out, "--jobs", "1", "--limit", "64")[0], 0)
+                self.check_report_failure_and_retry(out, open(Path(out) / held, "rb"))
 
     def test_limit_narrows_the_scan(self):
         code, _, _ = self.run_main(self.arc, "--out", self.out, "--jobs", "1", "--limit", "64")

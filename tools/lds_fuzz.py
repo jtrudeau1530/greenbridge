@@ -36,7 +36,7 @@ ROOT = os.path.dirname(HERE)
 sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.join(ROOT, "runtime", "test", "shaders"))
 import mc_command  # noqa: E402
-from compute_fixture import compute_header  # noqa: E402
+from compute_fixture import compute_header, find_test_program  # noqa: E402
 
 THREADS = 64
 LDS_BYTES = 4096
@@ -53,9 +53,10 @@ READS = {   # name: (bytes, kind)
     "ds_read_b128": (16, "wide"),
     "ds_read_u8": (1, "u"), "ds_read_i8": (1, "i"), "ds_read_u16": (2, "u"), "ds_read_i16": (2, "i"),
     "ds_read_u16_d16": (2, "u_lo"), "ds_read_u16_d16_hi": (2, "u_hi"),
+    "ds_read_u8_d16": (1, "u_lo"), "ds_read_u8_d16_hi": (1, "u_hi"),
+    "ds_read_i8_d16": (1, "i_lo"), "ds_read_i8_d16_hi": (1, "i_hi"),
 }
-# The translator rejects ds_permute_b32 and the 8-bit d16 reads (ds_read_u8_d16[_hi], ds_read_i8_d16[_hi]), so
-# they are not generated.
+# The translator rejects ds_permute_b32, so it is not generated.
 WRITES = {  # name: (bytes, data bit offset)
     "ds_write_b32": (4, 0), "ds_write_b64": (8, 0), "ds_write_b96": (12, 0), "ds_write_b128": (16, 0),
     "ds_write_b8": (1, 0), "ds_write_b16": (2, 0), "ds_write_b8_d16_hi": (1, 16), "ds_write_b16_d16_hi": (2, 16),
@@ -551,6 +552,9 @@ def translate(progs, work, emulate):
 
 def run_gpu(p, spv, build, index_entry, emulate, dump):
     exe = os.path.join(build, "vk_compute_test" + (".exe" if os.name == "nt" else ""))
+    if not os.path.isfile(exe):
+        sys.exit(f"vk_compute_test not found in {build} or its RelWithDebInfo/Release folder; "
+                 "build it first (cmake --build <build dir> --target vk_compute_test)")
     env = dict(os.environ, VKC_OUT_WORDS=str(OUT_WORDS), VKC_DUMP=str(dump))
     args = [exe, str(spv), "1", "dump"]
     if p.wave == 64 and not emulate:
@@ -584,9 +588,20 @@ def main():
     ap.add_argument("--no-exec", action="append", default=[], choices=EXEC_KINDS,
                     help="run this op kind (e.g. bpermute) with all lanes active, to isolate a known finding")
     a = ap.parse_args()
-    if a.show:
+    if a.programs < 1 or a.max_report < 1:
+        ap.error("--programs and --max-report must be at least 1")
+    if a.show is not None:
         parts = a.show.split(":")
-        show(int(parts[0]), int(parts[1]), int(parts[2]) if len(parts) > 2 else 64, tuple(a.no_exec))
+        try:
+            if len(parts) not in (2, 3):
+                raise ValueError
+            seed, index = int(parts[0]), int(parts[1])
+            wave = int(parts[2]) if len(parts) == 3 else 64
+        except ValueError:
+            ap.error("--show expects SEED:INDEX[:WAVE] with INDEX >= 0 and WAVE in 32, 64")
+        if index < 0 or wave not in (32, 64):
+            ap.error("--show expects SEED:INDEX[:WAVE] with INDEX >= 0 and WAVE in 32, 64")
+        show(seed, index, wave, tuple(a.no_exec))
         return 0
     waves = (64, 32) if a.wave == "both" else (int(a.wave),)
     progs = programs(a.seed, a.programs, waves, tuple(a.no_exec))
@@ -595,6 +610,7 @@ def main():
             p.model()
         print(f"{len(progs)} programs generated and modelled")
         return 0
+    a.build = find_test_program(a.build, "vk_compute_test") or a.build   # a Visual Studio config subfolder
     work = Path(a.work).resolve() if a.work else Path(tempfile.mkdtemp(prefix="lds_fuzz_"))
     work.mkdir(parents=True, exist_ok=True)
     try:
