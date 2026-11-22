@@ -805,5 +805,96 @@ class TestSIMDMultiLaneDivergence(unittest.TestCase):
             self.assertEqual(bits_to_f16(state.get_reg16(lane, Reg16(2, RegType.VGPR, SubWord.LO))), 100.0 + float(lane))
 
 
+class TestRegisterAliasing(unittest.TestCase):
+    """Unit tests for register aliasing and in-place operand preservation."""
+
+    def setUp(self) -> None:
+        self.scalar_interp = ScalarInterpreter()
+        self.simd_interp = SIMDInterpreter()
+
+    def test_dst_alias_src0(self) -> None:
+        state = ScalarMachineState()
+        state.set_reg16(Reg16(0, RegType.VGPR, SubWord.LO), f16_to_bits(15.5))
+        state.set_reg16(Reg16(2, RegType.VGPR, SubWord.LO), f16_to_bits(4.5))
+        instr = VAddF16Instruction(
+            dst=Reg16(0, RegType.VGPR, SubWord.LO),
+            src0=VOP3Operand16(Reg16(0, RegType.VGPR, SubWord.LO)),
+            src1=VOP3Operand16(Reg16(2, RegType.VGPR, SubWord.LO)),
+        )
+        self.scalar_interp.step(instr, state)
+        self.assertEqual(bits_to_f16(state.get_reg16(Reg16(0, RegType.VGPR, SubWord.LO))), 20.0)
+        # src1 untouched
+        self.assertEqual(bits_to_f16(state.get_reg16(Reg16(2, RegType.VGPR, SubWord.LO))), 4.5)
+
+    def test_dst_alias_src1(self) -> None:
+        state = ScalarMachineState()
+        state.set_reg16(Reg16(0, RegType.VGPR, SubWord.LO), f16_to_bits(15.5))
+        state.set_reg16(Reg16(2, RegType.VGPR, SubWord.LO), f16_to_bits(4.5))
+        instr = VAddF16Instruction(
+            dst=Reg16(2, RegType.VGPR, SubWord.LO),
+            src0=VOP3Operand16(Reg16(0, RegType.VGPR, SubWord.LO)),
+            src1=VOP3Operand16(Reg16(2, RegType.VGPR, SubWord.LO)),
+        )
+        self.scalar_interp.step(instr, state)
+        self.assertEqual(bits_to_f16(state.get_reg16(Reg16(2, RegType.VGPR, SubWord.LO))), 20.0)
+        # src0 untouched
+        self.assertEqual(bits_to_f16(state.get_reg16(Reg16(0, RegType.VGPR, SubWord.LO))), 15.5)
+
+    def test_dst_alias_both_srcs(self) -> None:
+        state = ScalarMachineState()
+        state.set_reg16(Reg16(0, RegType.VGPR, SubWord.LO), f16_to_bits(16.0))
+        instr = VAddF16Instruction(
+            dst=Reg16(0, RegType.VGPR, SubWord.LO),
+            src0=VOP3Operand16(Reg16(0, RegType.VGPR, SubWord.LO)),
+            src1=VOP3Operand16(Reg16(0, RegType.VGPR, SubWord.LO)),
+        )
+        self.scalar_interp.step(instr, state)
+        self.assertEqual(bits_to_f16(state.get_reg16(Reg16(0, RegType.VGPR, SubWord.LO))), 32.0)
+
+    def test_subword_cross_half_aliasing(self) -> None:
+        # Prepopulate v0 with lo=1.5, hi=2.5
+        state = ScalarMachineState()
+        state.set_reg16(Reg16(0, RegType.VGPR, SubWord.LO), f16_to_bits(1.5))
+        state.set_reg16(Reg16(0, RegType.VGPR, SubWord.HI), f16_to_bits(2.5))
+
+        instr = VAddF16Instruction(
+            dst=Reg16(0, RegType.VGPR, SubWord.HI),
+            src0=VOP3Operand16(Reg16(0, RegType.VGPR, SubWord.LO)),
+            src1=VOP3Operand16(Reg16(0, RegType.VGPR, SubWord.HI)),
+        )
+        self.scalar_interp.step(instr, state)
+        # hi updated to 4.0, lo untouched at 1.5
+        self.assertEqual(bits_to_f16(state.get_reg16(Reg16(0, RegType.VGPR, SubWord.HI))), 4.0)
+        self.assertEqual(bits_to_f16(state.get_reg16(Reg16(0, RegType.VGPR, SubWord.LO))), 1.5)
+
+    def test_inplace_iterative_accumulation(self) -> None:
+        state = ScalarMachineState()
+        state.set_reg16(Reg16(0, RegType.VGPR, SubWord.LO), f16_to_bits(0.0))
+        state.set_reg16(Reg16(2, RegType.VGPR, SubWord.LO), f16_to_bits(0.5))
+        instr = VAddF16Instruction(
+            dst=Reg16(0, RegType.VGPR, SubWord.LO),
+            src0=VOP3Operand16(Reg16(0, RegType.VGPR, SubWord.LO)),
+            src1=VOP3Operand16(Reg16(2, RegType.VGPR, SubWord.LO)),
+        )
+        for _ in range(100):
+            self.scalar_interp.step(instr, state)
+        self.assertEqual(bits_to_f16(state.get_reg16(Reg16(0, RegType.VGPR, SubWord.LO))), 50.0)
+
+    def test_simd_multi_lane_aliasing(self) -> None:
+        state = SIMDState(num_lanes=32, exec_mask=0xFFFF_FFFF)
+        for lane in range(32):
+            state.set_reg16(lane, Reg16(0, RegType.VGPR, SubWord.LO), f16_to_bits(float(lane)))
+            state.set_reg16(lane, Reg16(2, RegType.VGPR, SubWord.LO), f16_to_bits(1.0))
+
+        instr = VAddF16Instruction(
+            dst=Reg16(0, RegType.VGPR, SubWord.LO),
+            src0=VOP3Operand16(Reg16(0, RegType.VGPR, SubWord.LO)),
+            src1=VOP3Operand16(Reg16(2, RegType.VGPR, SubWord.LO)),
+        )
+        self.simd_interp.step(instr, state)
+        for lane in range(32):
+            self.assertEqual(bits_to_f16(state.get_reg16(lane, Reg16(0, RegType.VGPR, SubWord.LO))), float(lane) + 1.0)
+
+
 if __name__ == "__main__":
     unittest.main()
