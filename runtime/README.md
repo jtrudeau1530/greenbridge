@@ -354,7 +354,8 @@ $env:VK_VALIDATION_VALIDATE_SYNC = '1'
 
 `d3d12_rgb96_test` compares footprints, uploads, readbacks, boxes, texture-to-texture copies and CPU copies of
 `R32G32B32_FLOAT/UINT/SINT/TYPELESS` textures (2D arrays with mips, and volumes) with Windows WARP, bit for bit,
-and prints how long an upload and a readback take. `d3d12_descriptor_test` samples them (alpha reads as one). It
+checks that WARP and the hardware adapter report no resource tiling for all four formats, and prints how long an
+upload and a readback take. `d3d12_descriptor_test` samples them (alpha reads as one). It
 is registered in CTest (`d3d12_rgb96`).
 
 ```powershell
