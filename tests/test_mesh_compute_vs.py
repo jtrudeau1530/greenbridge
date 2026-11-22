@@ -4,6 +4,7 @@ import io
 import json
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -75,6 +76,38 @@ class Assembly(unittest.TestCase):
             for spv in built:
                 self.assertGreater(os.path.getsize(spv), 0)
                 self.assertTrue(os.path.isfile(spv[: -len(".spv")] + ".spvasm"))
+
+    def test_only_validated_binary_reaches_the_final_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            write_index(tmp, {"ms_a": {"mesh_compute": layout()}})
+            final = os.path.join(tmp, "ms_a.mesh_vs.spv")
+            with open(final, "wb") as f:
+                f.write(b"previous shader")
+
+            def assemble_and_validate(cmd: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+                if cmd[0] == "spirv-as":
+                    with open(cmd[-1], "wb") as f:
+                        f.write(b"new shader")
+                    return subprocess.CompletedProcess(cmd, 0, "", "")
+                self.assertEqual(cmd[0], "spirv-val")
+                with open(cmd[-1], "rb") as f:
+                    self.assertEqual(f.read(), b"new shader")
+                return subprocess.CompletedProcess(cmd, validation_code, "", "validator output")
+
+            with (mock.patch.object(vs, "tool_path", side_effect=lambda name: name),
+                  mock.patch.object(vs.subprocess, "run", side_effect=assemble_and_validate)):
+                validation_code = 1
+                with self.assertRaisesRegex(RuntimeError, "spirv-val failed"):
+                    vs.build_for_index(tmp)
+                with open(final, "rb") as f:
+                    self.assertEqual(f.read(), b"previous shader")
+
+                validation_code = 0
+                self.assertEqual(vs.build_for_index(tmp), [final])
+                with open(final, "rb") as f:
+                    self.assertEqual(f.read(), b"new shader")
+
+            self.assertEqual(sorted(os.listdir(tmp)), ["index.json", "ms_a.mesh_vs.spv", "ms_a.mesh_vs.spvasm"])
 
     def test_a_rejected_shader_names_the_tool(self):
         if not HAVE_SPIRV_TOOLS:

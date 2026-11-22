@@ -280,8 +280,9 @@ class PopsInvocationInterlock(unittest.TestCase):
         gen.uses_pops = True
         gen.body = ["OpNoOp"]
         spv = rdna2spirv.assemble(gen)
-        self.assertIn("OpBeginInvocationInterlockEXT", spv)
-        self.assertIn("OpEndInvocationInterlockEXT", spv)
+        self.assertEqual(spv.count("OpBeginInvocationInterlockEXT"), 1)
+        self.assertEqual(spv.count("OpEndInvocationInterlockEXT"), 1)
+        self.assertLess(spv.index("OpBeginInvocationInterlockEXT"), spv.index("OpEndInvocationInterlockEXT"))
 
     def test_branching_pops_pixel_shader_emits_begin_and_end_interlock(self):
         gen = rdna2spirv.Gen("ps")
@@ -289,16 +290,17 @@ class PopsInvocationInterlock(unittest.TestCase):
         gen.blocks = [["OpNoOp"]]
         gen.succ = [[]]
         spv = rdna2spirv.assemble(gen)
-        self.assertIn("OpBeginInvocationInterlockEXT", spv)
-        self.assertIn("OpEndInvocationInterlockEXT", spv)
+        self.assertEqual(spv.count("OpBeginInvocationInterlockEXT"), 1)
+        self.assertEqual(spv.count("OpEndInvocationInterlockEXT"), 1)
+        self.assertLess(spv.index("OpBeginInvocationInterlockEXT"), spv.index("OpEndInvocationInterlockEXT"))
 
     def test_non_pops_pixel_shader_omits_interlock_ops(self):
         gen = rdna2spirv.Gen("ps")
         gen.uses_pops = False
         gen.body = ["OpNoOp"]
         spv = rdna2spirv.assemble(gen)
-        self.assertNotIn("OpBeginInvocationInterlockEXT", spv)
-        self.assertNotIn("OpEndInvocationInterlockEXT", spv)
+        self.assertEqual(spv.count("OpBeginInvocationInterlockEXT"), 0)
+        self.assertEqual(spv.count("OpEndInvocationInterlockEXT"), 0)
 
 
 if __name__ == "__main__":

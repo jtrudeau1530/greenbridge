@@ -402,12 +402,12 @@ class WavValidationTest(unittest.TestCase):
     @patch.object(sys, "version_info", (3, 12, 0))
     def test_preflight_wav_without_assets_does_not_require_ffmpeg(self):
         def fake_which(cmd):
-            if cmd in ("spirv-as", "spirv-val"):
+            if cmd in ("llvm-mc", "spirv-as", "spirv-val"):
                 return f"/usr/bin/{cmd}"
             return None
 
         with patch("shutil.which", side_effect=fake_which):
-            with patch("make_game.tool_available", return_value=True):
+            with patch.dict(os.environ, {"LLVM_MC": "llvm-mc"}):
                 with patch("shutil.disk_usage") as mock_disk:
                     mock_disk.return_value = MagicMock(free=50 * (2**30))
                     with patch("os.makedirs"):
@@ -604,12 +604,12 @@ class PathContainmentAndDiskSpaceTest(unittest.TestCase):
     def test_preflight_space_calculation_and_failure(self):
         # Shaders needs 30GB, Assets needs 300GB -> 330GB total
         def fake_which(cmd):
-            if cmd in ("dotnet", "spirv-as", "spirv-val"):
+            if cmd in ("dotnet", "llvm-mc", "spirv-as", "spirv-val"):
                 return f"/bin/{cmd}"
             return None
 
         with patch("shutil.which", side_effect=fake_which):
-            with patch("make_game.tool_available", return_value=True):
+            with patch.dict(os.environ, {"LLVM_MC": "llvm-mc"}):
                 with patch("make_game.ensure_submodule"):
                     with patch("os.makedirs"):
                         with patch("shutil.disk_usage") as mock_disk:
