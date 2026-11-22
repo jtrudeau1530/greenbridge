@@ -1,10 +1,14 @@
 """Count and resolve hand-built SGD5 effects with python -I tests/test_sgd5_effects.py."""
+from contextlib import redirect_stderr, redirect_stdout
 import io
+import json
 import os
 from pathlib import Path
 import struct
 import sys
+import tempfile
 import unittest
+from unittest.mock import patch
 import zlib
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
@@ -72,6 +76,37 @@ def database(groups, effects, base=0):
 
 
 class EffectsTest(unittest.TestCase):
+    def test_discover_and_resolve_via_cli(self):
+        row = (1, 0, 0, 0, 0, 0)
+        data, layout = database({0: ("Light",)}, [
+            effect("Bulb", {0: (0,)}, [("Glow", [row]), ("Glow", [row, row])]),
+            effect("Bulb"), effect("Dark"),
+        ])
+        with tempfile.TemporaryDirectory() as folder, patch.object(sgd5_effects, "DATABASES", [layout]):
+            archive = Path(folder) / "mock.rpf"
+            archive.write_bytes(data)
+
+            def query(*args):
+                output = io.StringIO()
+                with redirect_stdout(output):
+                    self.assertEqual(sgd5_effects.main([str(archive), *args]), 0)
+                return json.loads(output.getvalue())[0]["matches"]
+
+            self.assertEqual(query(), [])
+            effects = query("--list-effects")
+            self.assertEqual([entry["effect"] for entry in effects], ["Bulb", "Bulb", "Dark"])
+            named, empty = query("--effect", effects[0]["effect"])
+            self.assertEqual([named["effect_offset"], empty["effect_offset"]],
+                             [entry["effect_offset"] for entry in effects[:2]])
+            self.assertEqual(empty["techniques"], [])
+            self.assertEqual([(t["technique_index"], t["pass_count"]) for t in named["techniques"]], [(0, 1), (1, 2)])
+            resolved = query("--effect", named["effect"], "--technique", named["techniques"][0]["technique"])
+            self.assertEqual([len(match["passes"]) for match in resolved], [1, 2])
+            self.assertEqual(resolved[0]["passes"][0][0]["record_offset"], data.index(label("Light")))
+            for bad in [("--technique", "Glow"), ("--list-effects", "--effect", "Bulb"), ("--effect", "Absent")]:
+                with self.subTest(bad=bad), redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                    query(*bad)
+
     def test_duplicate_names_resolve_per_effect_technique_and_pass(self):
         # Both length bytes are printable. The carver includes the program's
         # length byte in its match, and the effect's length looks like a letter.
