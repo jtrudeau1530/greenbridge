@@ -9,12 +9,18 @@ that pull request still runs Runtime (it touches ``rdna2spirv.py``), but a later
 ``foo.py`` would skip the GPU tests without anyone noticing. This test recomputes what the jobs read and fails
 when an entry is missing:
 
-* the seeds are every tracked file under ``runtime/``, the workflow itself and the scripts it runs: a
-  ``tools/<name>`` they spell out is needed, and so is a ``tools`` module a Python seed imports (the scripts and
-  shader checks put ``tools/`` on ``sys.path``);
+* the seeds are the code that runs during the jobs: the CMake files under ``runtime/`` and the workflow's
+  ``jobs:``, with ``#`` comments removed, and the Python under ``runtime/`` plus the scripts the workflow runs.
+  A ``tools/<name>`` a CMake line or a job step spells out is needed; so is a ``tools`` module a Python seed
+  imports (the scripts and shader checks put ``tools/`` on ``sys.path``) and a ``tools/`` file it names in a
+  string, such as ``os.path.join(TOOLS, "rdna2spirv.py")``;
 * from there, each needed tool's sibling imports, the ``tools/`` data files it names (``gfx10_formats.json`` is
-  loaded by name, which a ``.py``-only scan misses), modules named in strings (``importlib``) and ``tools/``
-  subdirectories it names (``hw_oracle``), to a fixed point.
+  loaded by name, which a ``.py``-only scan misses), modules it loads with ``importlib`` and ``tools/``
+  subdirectories it names, to a fixed point.
+
+Comments, docstrings and the C++, shader and header sources are not read as dependencies: a ``tools/<name>`` in
+them says where a table or a test came from, not that the build runs it, and counting those would make every
+such note a required entry.
 
 It also checks that the ``push`` and ``pull_request`` lists are the same, and that no ``tools/`` entry names a
 file that no longer exists. Listing more than the jobs need is allowed on purpose: an extra run costs one
@@ -83,21 +89,38 @@ def tracked(root, top):
     return names
 
 
-def imported_names(source):
-    """Top-level module names a Python file imports, plus every string constant (importlib, file names)."""
+def python_refs(source):
+    """(modules, strings) of a Python file: what it imports, including importlib.import_module("x") and
+    __import__("x"), and its string constants other than docstrings. Comments never reach the AST."""
     try:
         tree = ast.parse(source)
     except SyntaxError:
         return set(), set()
+    docstrings = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)) and node.body:
+            first = node.body[0]
+            if isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant):
+                docstrings.add(id(first.value))
     modules, strings = set(), set()
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             modules.update(alias.name.split(".")[0] for alias in node.names)
         elif isinstance(node, ast.ImportFrom) and node.module and node.level == 0:
             modules.add(node.module.split(".")[0])
-        elif isinstance(node, ast.Constant) and isinstance(node.value, str):
+        elif isinstance(node, ast.Call) and node.args and isinstance(node.args[0], ast.Constant):
+            func = node.func
+            name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", "")
+            if name in ("import_module", "__import__") and isinstance(node.args[0].value, str):
+                modules.add(node.args[0].value.split(".")[0])
+        if isinstance(node, ast.Constant) and isinstance(node.value, str) and id(node) not in docstrings:
             strings.add(node.value)
     return modules, strings
+
+
+def strip_hash_comments(text):
+    """CMake and YAML without their # comments (a # inside a quoted string is rare enough in both to ignore)."""
+    return "\n".join(line.split("#", 1)[0] for line in text.splitlines())
 
 
 def needed(root):
@@ -118,26 +141,47 @@ def needed(root):
             return f"tools/{name}"
         return None
 
-    seeds = [f for f in tracked(root, "runtime")] + [WORKFLOW]
-    seeds += sorted(set(SCRIPT_REF.findall(read(root, WORKFLOW))))
-    found = {}
-    for seed in seeds:
-        if not os.path.isfile(os.path.join(root, seed)):
-            continue
-        text = read(root, seed)
-        if seed == WORKFLOW:
-            # Only what the jobs run: the trigger's own list would make every listed entry "needed".
-            text = text[text.find("\njobs:"):] if "\njobs:" in text else ""
+    def spelled(text):
         for name in TOOLS_REF.findall(text):
             first = name.split("/")[0]
-            hit = entry(first if first in subdirs else name)
+            yield first if first in subdirs else name
+
+    def python_names(source, own_dir):
+        """tools/ entries a Python file imports or names in a string; own_dir's files shadow tools/."""
+        imports, strings = python_refs(source)
+        names = {m + ".py" for m in imports
+                 if m in modules and not (own_dir and os.path.exists(os.path.join(own_dir, m + ".py")))}
+        for s in strings:
+            names.update(spelled(s))
+            base = s.rstrip("/").split("/")[-1]
+            if base in data or base in subdirs or base.endswith(".py") and base[:-3] in modules:
+                if not (own_dir and "/" not in s and os.path.exists(os.path.join(own_dir, base))):
+                    names.add(base)
+        return names
+
+    workflow = read(root, WORKFLOW)
+    # Only what the jobs run: the trigger's own list would make every listed entry "needed".
+    jobs = strip_hash_comments(workflow[workflow.find("\njobs:"):] if "\njobs:" in workflow else "")
+    found = {}
+    for name in spelled(jobs):
+        hit = entry(name)
+        if hit:
+            found.setdefault(hit, f"run by {WORKFLOW}")
+    runtime = tracked(root, "runtime")
+    cmake = [f for f in runtime if f.endswith(".cmake") or f.split("/")[-1] == "CMakeLists.txt"]
+    python = [f for f in runtime if f.endswith(".py")] + sorted(set(SCRIPT_REF.findall(jobs)))
+    for seed in cmake:
+        for name in spelled(strip_hash_comments(read(root, seed))):
+            hit = entry(name)
             if hit:
                 found.setdefault(hit, f"named in {seed}")
-        if seed.endswith(".py"):
+    for seed in python:
+        if os.path.isfile(os.path.join(root, seed)):
             own = os.path.dirname(os.path.join(root, seed))
-            for module in imported_names(text)[0]:
-                if module in modules and not os.path.exists(os.path.join(own, module + ".py")):
-                    found.setdefault(f"tools/{module}.py", f"imported by {seed}")
+            for name in python_names(read(root, seed), own):
+                hit = entry(name)
+                if hit:
+                    found.setdefault(hit, f"read by {seed}")
 
     queue = list(found)
     while queue:
@@ -149,15 +193,7 @@ def needed(root):
         else:
             continue
         for source in sources:
-            imports, strings = imported_names(read(root, source))
-            names = {m + ".py" for m in imports if m in modules}
-            for s in strings:
-                base = s.rstrip("/").split("/")[-1]
-                if s in modules:                       # importlib.import_module("name")
-                    names.add(s + ".py")
-                elif base in data or base in subdirs or base.endswith(".py") and base[:-3] in modules:
-                    names.add(base)                    # a file or directory the tool opens or runs by name
-            for name in names:
+            for name in python_names(read(root, source), None):
                 hit = entry(name)
                 if hit and hit not in found:
                     found[hit] = f"via {source}"
@@ -226,6 +262,11 @@ class SyntheticTreeTest(unittest.TestCase):
         write("tools/formats.json", "{}\n")
         write("tools/subgroup_info.py", "X = 1\n")
         write("tools/unrelated.py", "X = 1\n")
+        # Notes, not reads: none of these may make tools/unrelated.py a required entry.
+        write("runtime/src/table.h", "// generated by tools/unrelated.py\nconst char *k = \"tools/unrelated.py\";\n")
+        write("runtime/test/shaders/probe.asm", "; checked with tools/unrelated.py\n")
+        write("runtime/test/shaders/check.py", '"""Words from tools/unrelated.py."""\n# see tools/unrelated.py\n')
+        write("runtime/cmake/extra.cmake", "# tools/unrelated.py made this list\n")
 
     def test_a_complete_list_passes(self):
         with tempfile.TemporaryDirectory() as tmp:
