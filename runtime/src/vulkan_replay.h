@@ -763,6 +763,10 @@ struct ReplayFunctions {
     // Resolves available binary-occlusion queries to 64-bit 0/1 values, outside conditional rendering.
     std::function<void(VkCommandBuffer, VkQueryPool, std::uint32_t first, std::uint32_t count,
                        VkBuffer dst, VkDeviceSize offset)> resolve_binary_occlusion;
+    // Adds `count` pipeline-statistics results into one D3D12_QUERY_DATA_PIPELINE_STATISTICS, outside conditional
+    // rendering: the segments of a statistics query split around resolves (D3D-162).
+    std::function<void(VkCommandBuffer, VkQueryPool, std::uint32_t first, std::uint32_t count,
+                       VkBuffer dst, VkDeviceSize offset)> sum_statistics;
     // VK_EXT_debug_utils, set only when the instance enabled it; debug markers are skipped without them.
     PFN_vkCmdInsertDebugUtilsLabelEXT insert_label = nullptr;
     PFN_vkCmdBeginDebugUtilsLabelEXT begin_label = nullptr;
@@ -828,6 +832,12 @@ struct PreparedQuery {
     std::uint32_t end_segment = no_segment;
     std::uint32_t first_result = 0;
     std::uint32_t result_count = 0;
+    // A pipeline-statistics query split around the resolves it contains (plan_statistics_segments): the physical
+    // statistics segment this command ends or begins, and for its EndQuery the segments that hold its result.
+    std::uint32_t statistics_end = no_segment;
+    std::uint32_t statistics_begin = no_segment;
+    std::uint32_t statistics_first = 0;
+    std::uint32_t statistics_count = 0;
     std::vector<QueryResolveRun> resolves;
 };
 
@@ -1673,6 +1683,10 @@ public:
     std::uint32_t segment_base = 0;
     std::uint32_t segment_count = 0;
     bool precise_segments = false;
+    // Physical pipeline-statistics segments (plan_statistics_segments), in a pool of their own.
+    VkQueryPool statistics_pool = VK_NULL_HANDLE;
+    std::uint32_t statistics_base = 0;
+    std::uint32_t statistics_segment_count = 0;
     // Copies, resolves and UAV clears that run as transfers, recorded while a predicate was set. D3D12 skips them
     // when the predicate says so, but Vulkan's conditional rendering does not cover transfer commands, so they run
     // unconditionally (docs/d3d12_vulkan.md section 4.7). Counted so the caller can report it.
@@ -1709,6 +1723,43 @@ inline ReplayResult plan_occlusion_segments(PreparedList& out) {
         query.begin_segment = current;
     }
     return active.empty() ? ReplayResult::success : ReplayResult::invalid_query;
+}
+
+// A resolve inside a pipeline-statistics query can record a helper dispatch (the binary-occlusion normalisation, an
+// occlusion or a statistics sum), and Vulkan would count its invocations in the application's CSInvocations. Such a
+// query is therefore split: its counters go to physical segments that end before each resolve inside it and begin
+// again after it, and its result is the sum of those segments (D3D-162). Whether a resolve dispatches is only known
+// when the list is planned against the heaps' state, so every resolve except a timestamp copy splits the query.
+// A BeginQuery without its EndQuery in the list is left as it was.
+inline void plan_statistics_segments(PreparedList& out) {
+    detail::PreparedQuery* begin = nullptr;
+    std::vector<detail::PreparedQuery*> inner;
+    for (auto& query : out.queries) {
+        const Command& command = out.list->commands()[query.command];
+        const auto range = query_range(command);
+        if (std::holds_alternative<ResolveQueries>(command)) {
+            if (begin && range.type != d3d12_query::timestamp) inner.push_back(&query);
+        } else if (range.type == d3d12_query::pipeline_statistics) {
+            if (std::holds_alternative<BeginQuery>(command)) {
+                begin = &query;
+                inner.clear();
+            } else if (begin) {
+                if (!inner.empty()) {
+                    const std::uint32_t first = out.statistics_segment_count;
+                    begin->statistics_begin = out.statistics_segment_count++;
+                    for (auto* resolve : inner) {
+                        resolve->statistics_end = out.statistics_segment_count - 1;
+                        resolve->statistics_begin = out.statistics_segment_count++;
+                    }
+                    query.statistics_end = out.statistics_segment_count - 1;
+                    query.statistics_first = first;
+                    query.statistics_count = out.statistics_segment_count - first;
+                }
+                begin = nullptr;
+                inner.clear();
+            }
+        }
+    }
 }
 
 // detail::initialize zero-clears an image piece the tracker holds in UNDEFINED (D3D12 committed resources start
@@ -1772,6 +1823,8 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
     out.segment_pool = VK_NULL_HANDLE;
     out.segment_base = out.segment_count = 0;
     out.precise_segments = false;
+    out.statistics_pool = VK_NULL_HANDLE;
+    out.statistics_base = out.statistics_segment_count = 0;
     const bool rendering = vk.begin_rendering && vk.end_rendering && vk.clear_attachments && vk.image_view;
     const bool copies = vk.copy_buffer && vk.copy_buffer_to_image && vk.copy_image_to_buffer && vk.copy_image;
     const bool conditional = vk.begin_conditional_rendering && vk.end_conditional_rendering;
@@ -2115,10 +2168,10 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                     !detail::within(p.binding.buffer_offset, resolve_queries->offset + bytes,
                                     std::numeric_limits<VkDeviceSize>::max()))
                     return ReplayResult::invalid_query;
-                if (range.type == d3d12_query::binary_occlusion) {
-                    // The internal dispatch would otherwise count towards the application's CSInvocations.
-                    if (!vk.resolve_binary_occlusion || statistics_active) return ReplayResult::unsupported;
-                }
+                // Inside a pipeline-statistics query, QueryReplay::plan checks that the helper dispatch is kept out
+                // of the application's counters.
+                if (range.type == d3d12_query::binary_occlusion && !vk.resolve_binary_occlusion)
+                    return ReplayResult::unsupported;
                 if (p.binding.host_readable) {
                     out.wrote_readback = true;
                     out.readback_src_stages |= VK_PIPELINE_STAGE_2_COPY_BIT | VK_PIPELINE_STAGE_2_TRANSFER_BIT;
@@ -2169,6 +2222,7 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
         }
     }
     if (ordinary_active) return ReplayResult::invalid_query;
+    plan_statistics_segments(out);
     if (overlaps) {
         if (!vk.sum_occlusion || out.queries.size() >= detail::PreparedQuery::no_segment)
             return ReplayResult::unsupported;
@@ -2181,13 +2235,30 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
 // Keep every physical pool referenced by the recorded batch alive until that batch completes.
 class QueryReplay {
 public:
+    // `statistics_pool` holds the list's pipeline-statistics segments (plan_statistics_segments). Without one, the
+    // list's statistics queries are not split, and a resolve inside one that needs a helper dispatch is refused.
     ReplayResult plan(PreparedList& list, const std::shared_ptr<const OcclusionSegmentPool>& pool = {},
-                      std::uint32_t base = 0, bool can_sum = false) {
+                      std::uint32_t base = 0, bool can_sum = false,
+                      const std::shared_ptr<const OcclusionSegmentPool>& statistics_pool = {},
+                      std::uint32_t statistics_base = 0) {
         if (list.segment_count) {
             if (!pool) return ReplayResult::unsupported;
             retain(pool);
             list.segment_pool = pool->pool;
             list.segment_base = base;
+        }
+        if (list.statistics_segment_count) {
+            if (statistics_pool) {
+                retain(statistics_pool);
+                list.statistics_pool = statistics_pool->pool;
+                list.statistics_base = statistics_base;
+            } else {
+                for (auto& query : list.queries) {
+                    query.statistics_end = query.statistics_begin = detail::PreparedQuery::no_segment;
+                    query.statistics_count = 0;
+                }
+                list.statistics_segment_count = 0;
+            }
         }
         for (auto& query : list.queries) {
             const Command& command = list.list->commands()[query.command];
@@ -2196,25 +2267,33 @@ public:
             } else if (const auto* end = std::get_if<EndQuery>(&command)) {
                 Value result{true, {}};
                 if (query.result_count) result.occlusion = {pool, base + query.first_result, query.result_count};
+                if (query.statistics_count)
+                    result.occlusion = {statistics_pool, statistics_base + query.statistics_first,
+                                        query.statistics_count};
                 pending_[{query.heap, end->index}] = std::move(result);
             } else {
                 const auto& resolve = std::get<ResolveQueries>(command);
                 const bool binary = resolve.type == d3d12_query::binary_occlusion;
+                const bool statistics = resolve.type == d3d12_query::pipeline_statistics;
+                // A helper dispatch inside an unsplit statistics query would count in the application's
+                // CSInvocations.
+                const bool uncounted = !query.statistics_active ||
+                                       query.statistics_end != detail::PreparedQuery::no_segment;
                 const std::uint32_t size = query_result_size(resolve.type);
                 const auto offset = list.commands[query.command].binding.buffer_offset + resolve.offset;
                 for (std::uint32_t i = 0; i < resolve.count; ++i) {
                     const auto index = resolve.first + i;
                     const auto value = lookup(*query.heap, index);
+                    if (binary && value.ended && !uncounted) return ReplayResult::unsupported;
                     needs_binary |= binary && value.ended;
                     detail::QueryResolveRun run{value.ended ? query.heap->pool : VK_NULL_HANDLE,
                                                 index, 1, offset + VkDeviceSize(i) * size};
                     if (value.occlusion.segments) {
-                        if (resolve.type != d3d12_query::occlusion) return ReplayResult::invalid_query;
-                        // A helper dispatch would otherwise change the application's pipeline statistics.
+                        if (resolve.type != d3d12_query::occlusion && !statistics) return ReplayResult::invalid_query;
                         const auto& saved = value.occlusion;
                         run = {saved.segments->pool, saved.first, saved.count, run.offset, saved.count > 1};
-                        if (!can_sum || (run.sum && query.statistics_active)) return ReplayResult::unsupported;
-                        needs_sum |= run.sum;
+                        if (!can_sum || (run.sum && !uncounted)) return ReplayResult::unsupported;
+                        (statistics ? needs_statistics_sum : needs_sum) |= run.sum;
                         retain(saved.segments);
                     }
                     if (!query.resolves.empty() && !run.sum && run.count == 1) {
@@ -2242,6 +2321,7 @@ public:
 
     bool needs_sum = false;
     bool needs_binary = false;
+    bool needs_statistics_sum = false;
     std::vector<std::shared_ptr<const OcclusionSegmentPool>> retained;
 
 private:
@@ -2275,8 +2355,25 @@ inline void emit_query(const PreparedList& list, const detail::PreparedQuery& qu
         }
         return;
     }
+    // A split pipeline-statistics query (plan_statistics_segments): its counters run in the physical segments.
+    const auto end_statistics = [&] {
+        if (query.statistics_end != none)
+            vk.end_query(cb, list.statistics_pool, list.statistics_base + query.statistics_end);
+    };
+    const auto begin_statistics = [&] {
+        if (query.statistics_begin == none) return;
+        const auto index = list.statistics_base + query.statistics_begin;
+        vk.reset_query_pool(cb, list.statistics_pool, index, 1);
+        vk.begin_query(cb, list.statistics_pool, index, 0);
+    };
     const auto& command = list.list->commands()[query.command];
     const QueryPool& heap = *query.heap;
+    if (!std::holds_alternative<ResolveQueries>(command) &&
+        (query.statistics_begin != none || query.statistics_end != none)) {
+        end_statistics();
+        begin_statistics();
+        return;
+    }
     if (const auto* begin = std::get_if<BeginQuery>(&command)) {
         vk.reset_query_pool(cb, heap.pool, begin->index, 1);
         const bool precise = begin->type == d3d12_query::occlusion && heap.precise;
@@ -2298,10 +2395,13 @@ inline void emit_query(const PreparedList& list, const detail::PreparedQuery& qu
         // queries) is suppressed inside an active conditional rendering scope after PredicateReducer::capture's
         // compute dispatch (D3D-148).
         const bool suspend = predicate.buffer && !query.resolves.empty();
+        end_statistics();
         if (suspend) vk.end_conditional_rendering(cb);
         for (const auto& run : query.resolves) {
             if (!run.pool) {
                 vk.fill_buffer(cb, dst, run.offset, VkDeviceSize(run.count) * size, 0);
+            } else if (run.sum && resolve.type == d3d12_query::pipeline_statistics) {
+                vk.sum_statistics(cb, run.pool, run.first, run.count, dst, run.offset);
             } else if (run.sum || binary) {
                 const auto& resolve_occlusion = run.sum ? vk.sum_occlusion : vk.resolve_binary_occlusion;
                 resolve_occlusion(cb, run.pool, run.first, run.count, dst, run.offset);
@@ -2311,6 +2411,7 @@ inline void emit_query(const PreparedList& list, const detail::PreparedQuery& qu
             }
         }
         if (suspend) vk.begin_conditional_rendering(cb, &predicate);
+        begin_statistics();
     }
 }
 

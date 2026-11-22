@@ -1838,6 +1838,16 @@ Implemented (`QueryHeap` in `runtime/shims/d3d12_vulkan_device.cpp`, the query c
   overwrites can be recorded before the earlier commands complete. `vk_overlapping_occlusion` checks crossing
   and nested scopes, more than one scratch chunk, alternating binary and ordinary resolves under a predicate,
   and gated submissions on a GPU.
+- **Resolves during a pipeline-statistics query** (D3D-162). The helper dispatches above (binary normalisation,
+  occlusion sums) and the statistics sum below would count in the application's `CSInvocations` if they ran inside
+  its query. So a statistics query that contains a resolve other than a timestamp copy is split. Its counters go to
+  physical `PIPELINE_STATISTICS` segments in a pool of the submission's own; a segment ends before each such resolve
+  and a new one begins after it. Its result is the sum of its segments, added per counter by a compute dispatch
+  (`statistics_sum.comp`) on the same scratch buffer, which is itself kept out of any statistics query still running.
+  Whether a resolve dispatches is only known once the list is planned against the heaps, so every such resolve
+  splits the query. `vk_binary_occlusion` checks that a binary resolve and a statistics sum inside statistics queries
+  leave every counter at 0. `vk_overlapping_occlusion` puts a native draw in each segment and checks the split sums
+  against unsplit queries with the same draws, word by word.
 - **Timestamps.** `GetTimestampFrequency` is `1e9 / timestampPeriod` (1 GHz on the test GPU). Every D3D12 queue
   shares one `VkQueue` for now (question 12), so they share one frequency.
 
@@ -1845,9 +1855,10 @@ Not implemented yet:
 
 - **Overlapping queries.** Replay refuses overlapping pipeline-statistics queries or occlusion overlaps involving
   a binary query with `ReplayResult::unsupported`.
-- **Occlusion resolves during a pipeline-statistics query.** Replay refuses binary resolves and ordinary resolves
-  that need a sum while pipeline statistics are active, since the internal dispatch would change the reported
-  compute-invocation count. Both dispatch paths need compute support on the graphics queue.
+- **Other helper dispatches during a pipeline-statistics query.** Replay still refuses `SetPredication` and
+  predicated copies while pipeline statistics are active, since their dispatches would change the reported
+  compute-invocation count. The single-list `replay()` helper, which has no segment pool, keeps refusing the
+  occlusion resolves above that need a dispatch there.
 - Stream-output and mesh-shader statistics. (`GetClockCalibration` is implemented: see section 4.4, "Fences,
   queues and frames in flight".)
 - Xbox-specific query heap types (if any) are **Open**; unknown types are logged.
