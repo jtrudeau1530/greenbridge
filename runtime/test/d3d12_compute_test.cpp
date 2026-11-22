@@ -10,6 +10,7 @@
 // No game data. Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation.
 #include "vk_test_device.h"
 #include "../shims/d3d12_com.h"
+#include "../src/gfx10_descriptors.h"
 #include "../src/shader_library.h"
 #include "../shims/d3d12_xs_device.h"
 
@@ -33,6 +34,8 @@ using XboxHeapHandleFn = std::uint64_t(WINAPI*)(void* heap);  // heap slots 9/10
 // Device slot 62 as XboxBvhBuilder.dll calls it on 1.0.2.1: (desc, 0, 0, riid, out) (main's 28cf235).
 using XboxComputePipelineFn = HRESULT(WINAPI*)(void* device, const D3D12_COMPUTE_PIPELINE_STATE_DESC*, std::uint64_t,
                                                std::uint64_t, const IID*, void**);
+// Device slot 67 as amd_fidelityfx_upscaler_xbox.dll calls it: (desc, riid, out).
+using XboxNativeComputePipelineFn = HRESULT(WINAPI*)(void* device, const void*, const IID*, void**);
 using SerializeFn = HRESULT(WINAPI*)(const D3D12_VERSIONED_ROOT_SIGNATURE_DESC*, ID3DBlob**, ID3DBlob**);
 
 template<class T>
@@ -169,6 +172,7 @@ int main() {
     constexpr UINT elements = 64, bytes = elements * 4;
     const std::uint32_t table_values[4] = {1000, 2000, 3000, 4000};
     std::vector<std::uint32_t> first(elements), second(elements);
+    std::vector<std::uint32_t> cbv_a_out(elements), cbv_oob_out(elements), cbv_b_out(elements), cbv_null_out(elements);
     {
         rt::d3d12::VulkanDeviceInfo info{};
         info.get_instance_proc = d.instance_proc;
@@ -220,6 +224,40 @@ int main() {
         pso_desc.CS = {other_container.data(), other_container.size()};
         EXPECT(device->CreateComputePipelineState(&pso_desc, IID_PPV_ARGS(&unknown.p)) == E_INVALIDARG && !unknown.p);
         pso_desc.CS = {container.data(), container.size()};
+
+        // The PSO through slot 67, compute pipeline from native code; maps to CreateComputePipelineState.
+        struct XboxNativeComputeDesc {
+            ID3D12RootSignature* root_signature;
+            const void* kind0;
+            std::uint64_t kind0_size;
+            const void* kind1;
+            std::uint64_t kind1_size;
+            const void* kind6;
+            std::uint64_t kind6_size;
+            const void* kind7;
+            std::uint64_t kind7_size;
+        } native_desc{};
+        native_desc.root_signature = root.p;
+        native_desc.kind6 = fssm.data();
+        native_desc.kind6_size = fssm.size();
+        Ref<ID3D12PipelineState> pso67, unknown67;
+        EXPECT(SUCCEEDED(reinterpret_cast<XboxNativeComputePipelineFn>(slot(device.p, 67))(
+            device.p, &native_desc, &pso_iid, reinterpret_cast<void**>(&pso67.p))));
+        EXPECT(pso67.p != nullptr);
+        native_desc.kind6 = other.data();
+        native_desc.kind6_size = other.size();
+        EXPECT(reinterpret_cast<XboxNativeComputePipelineFn>(slot(device.p, 67))(
+            device.p, &native_desc, &pso_iid, reinterpret_cast<void**>(&unknown67.p)) == E_INVALIDARG && !unknown67.p);
+        void* out_null = reinterpret_cast<void*>(0x1111);
+        EXPECT(reinterpret_cast<XboxNativeComputePipelineFn>(slot(device.p, 67))(
+            device.p, nullptr, &pso_iid, &out_null) == E_INVALIDARG && !out_null);
+        out_null = reinterpret_cast<void*>(0x1111);
+        native_desc.kind6 = fssm.data();
+        native_desc.kind6_size = fssm.size();
+        EXPECT(reinterpret_cast<XboxNativeComputePipelineFn>(slot(device.p, 67))(
+            device.p, &native_desc, nullptr, &out_null) == E_POINTER && !out_null);
+        EXPECT(reinterpret_cast<XboxNativeComputePipelineFn>(slot(device.p, 67))(
+            device.p, &native_desc, &pso_iid, nullptr) == E_POINTER);
 
         // A device whose maxPushConstantsSize is the Vulkan minimum (128 bytes) cannot hold the 144-byte block, so
         // its PSOs are refused instead of creating a pipeline layout the spec forbids (#224's fallback flag).
@@ -344,6 +382,128 @@ int main() {
         std::memcpy(first.data(), results, bytes);
         std::memcpy(second.data(), static_cast<const std::uint8_t*>(results) + bytes, bytes);
 
+        // CreateConstantBufferView: populate shader-visible descriptor heap slots with GFX10 V# descriptors for a
+        // 512-byte arena constant buffer (two 256-byte CBVs: A at +0, B at +256) and null CBVs.
+        {
+            const UINT inc = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+            EXPECT(inc == 32);
+            const auto cb_desc = buffer_desc(512, D3D12_RESOURCE_FLAG_NONE);
+            Ref<ID3D12Resource> cb_upload, cb_default, cb_readback;
+            EXPECT(SUCCEEDED(device->CreateCommittedResource(&upload_heap, D3D12_HEAP_FLAG_NONE, &cb_desc,
+                                                             D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                                                             IID_PPV_ARGS(&cb_upload.p))));
+            EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &cb_desc,
+                                                             D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                             IID_PPV_ARGS(&cb_default.p))));
+            const auto cb_rb_desc = buffer_desc(4 * bytes, D3D12_RESOURCE_FLAG_NONE);
+            EXPECT(SUCCEEDED(device->CreateCommittedResource(&readback_heap, D3D12_HEAP_FLAG_NONE, &cb_rb_desc,
+                                                             D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                             IID_PPV_ARGS(&cb_readback.p))));
+            void* cb_mapped = nullptr;
+            EXPECT(SUCCEEDED(cb_upload->Map(0, nullptr, &cb_mapped)));
+            auto* cb_words = static_cast<std::uint32_t*>(cb_mapped);
+            for (UINT i = 0; i < elements; ++i) {
+                cb_words[i] = 0x10000u + i;
+                cb_words[elements + i] = 0x20000u + i;
+            }
+            const D3D12_GPU_VIRTUAL_ADDRESS cb_va = cb_default->GetGPUVirtualAddress();
+            EXPECT(cb_va >= 0x10000 && cb_va < (1ull << 32));
+
+            const auto slot_cpu = [&](UINT idx) { return D3D12_CPU_DESCRIPTOR_HANDLE{SIZE_T(cpu + idx * inc)}; };
+            const auto slot_gpu = [&](UINT idx) { return D3D12_GPU_DESCRIPTOR_HANDLE{gpu + idx * inc}; };
+
+            // Pre-fill slot 3 with non-zero bytes to prove null CBV zeroes the entire 32-byte slot.
+            std::memset(reinterpret_cast<void*>(slot_cpu(3).ptr), 0xA5, inc);
+            device->CreateConstantBufferView(nullptr, slot_cpu(3));
+            std::uint8_t zeros[32] = {};
+            EXPECT(std::memcmp(reinterpret_cast<const void*>(slot_cpu(3).ptr), zeros, sizeof(zeros)) == 0);
+
+            // Zero BufferLocation or zero SizeInBytes also produces a zeroed null V#.
+            const D3D12_CONSTANT_BUFFER_VIEW_DESC zero_loc{0, 256};
+            std::memset(reinterpret_cast<void*>(slot_cpu(3).ptr), 0x5A, inc);
+            device->CreateConstantBufferView(&zero_loc, slot_cpu(3));
+            EXPECT(std::memcmp(reinterpret_cast<const void*>(slot_cpu(3).ptr), zeros, sizeof(zeros)) == 0);
+            const D3D12_CONSTANT_BUFFER_VIEW_DESC zero_size{cb_va, 0};
+            std::memset(reinterpret_cast<void*>(slot_cpu(3).ptr), 0x5A, inc);
+            device->CreateConstantBufferView(&zero_size, slot_cpu(3));
+            EXPECT(std::memcmp(reinterpret_cast<const void*>(slot_cpu(3).ptr), zeros, sizeof(zeros)) == 0);
+
+            const D3D12_CONSTANT_BUFFER_VIEW_DESC cbv_a{cb_va, 256};
+            const D3D12_CONSTANT_BUFFER_VIEW_DESC cbv_b{cb_va + 256, 256};
+            device->CreateConstantBufferView(&cbv_a, slot_cpu(1));
+            device->CreateConstantBufferView(&cbv_b, slot_cpu(2));
+
+            // Decode the written V# in slots 1 and 2 and verify every field + zeroed trailing 16 bytes.
+            for (const auto& [slot_idx, expected_va] :
+                 {std::pair{1u, std::uint64_t(cb_va)}, std::pair{2u, std::uint64_t(cb_va + 256)}}) {
+                leonida::gfx10::BufferWords raw{};
+                std::memcpy(raw.data(), reinterpret_cast<const void*>(slot_cpu(slot_idx).ptr), sizeof(raw));
+                leonida::gfx10::Buffer decoded{};
+                EXPECT(leonida::gfx10::decode(raw, decoded));
+                EXPECT(decoded.address == expected_va);
+                EXPECT(decoded.stride == 0);
+                EXPECT(decoded.num_records == 256);
+                EXPECT(decoded.format == leonida::gfx10::format_from_vulkan(VK_FORMAT_R32_UINT));
+                EXPECT(decoded.swizzle == leonida::gfx10::identity_swizzle);
+                EXPECT(decoded.oob_select == leonida::gfx10::OobSelect::raw);
+                EXPECT(std::memcmp(reinterpret_cast<const std::uint8_t*>(slot_cpu(slot_idx).ptr) + 16, zeros, 16) == 0);
+            }
+
+            // Copy CBV data into the arena buffer, then run 4 dispatches:
+            //   1) CBV A at byte offset 0 (all 64 dwords in-bounds)
+            //   2) CBV A at byte offset 128 (dwords 0..31 in-bounds, dwords 32..63 OOB -> 0)
+            //   3) CBV B at byte offset 0 (negative control: all 64 dwords flip to 0x20000 + i)
+            //   4) Null CBV at byte offset 0 (negative control: all 64 dwords become 0)
+            EXPECT(SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.p, pso.p)));
+            list->CopyBufferRegion(cb_default.p, 0, cb_upload.p, 0, 512);
+            const D3D12_RESOURCE_BARRIER cb_ready[] = {
+                transition(cb_default.p, D3D12_RESOURCE_STATE_COPY_DEST,
+                           D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER),
+                transition(out_a.p, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+            };
+            list->ResourceBarrier(2, cb_ready);
+            list->SetDescriptorHeaps(1, heaps);
+            list->SetComputeRootSignature(root.p);
+            list->SetComputeRootUnorderedAccessView(1, va_a);
+
+            const struct CbvDispatch {
+                UINT byte_offset;
+                UINT slot_idx;
+                UINT readback_offset;
+            } cbv_dispatches[] = {
+                {0, 1, 0 * bytes},
+                {128, 1, 1 * bytes},
+                {0, 2, 2 * bytes},
+                {0, 3, 3 * bytes},
+            };
+            for (const auto& d_cfg : cbv_dispatches) {
+                const std::uint32_t rc[2] = {d_cfg.byte_offset, 0};  // s1 == 0 selects CBV V# mode
+                list->SetComputeRoot32BitConstants(0, 2, rc, 0);
+                list->SetComputeRootDescriptorTable(2, slot_gpu(d_cfg.slot_idx));
+                list->Dispatch(1, 1, 1);
+                const auto to_src =
+                    transition(out_a.p, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                list->ResourceBarrier(1, &to_src);
+                list->CopyBufferRegion(cb_readback.p, d_cfg.readback_offset, out_a.p, 0, bytes);
+                const auto to_uav =
+                    transition(out_a.p, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                list->ResourceBarrier(1, &to_uav);
+            }
+            EXPECT(list->Close() == S_OK);
+            queue->ExecuteCommandLists(1, lists);
+            EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
+            EXPECT(SUCCEEDED(queue->Signal(fence.p, 2)));
+            EXPECT(SUCCEEDED(fence->SetEventOnCompletion(2, nullptr)));
+
+            void* cb_res = nullptr;
+            EXPECT(SUCCEEDED(cb_readback->Map(0, nullptr, &cb_res)));
+            const auto* src_bytes = static_cast<const std::uint8_t*>(cb_res);
+            std::memcpy(cbv_a_out.data(), src_bytes + 0 * bytes, bytes);
+            std::memcpy(cbv_oob_out.data(), src_bytes + 1 * bytes, bytes);
+            std::memcpy(cbv_b_out.data(), src_bytes + 2 * bytes, bytes);
+            std::memcpy(cbv_null_out.data(), src_bytes + 3 * bytes, bytes);
+        }
+
         for (auto* r : {&out_a, &out_b, &constants, &readback}) r->reset();
         pso.reset();
         root.reset();
@@ -364,6 +524,27 @@ int main() {
             std::fprintf(stderr, "element %u: got %u and %u, want %u and %u\n", i, first[i], second[i], a, b);
     }
     EXPECT(!mismatches);
+    UINT cbv_b_diff = 0, cbv_null_diff = 0;
+    for (std::uint32_t i = 0; i < elements; ++i) {
+        const std::uint32_t want_a = 0x10000u + i;
+        const std::uint32_t want_oob = i < 32 ? (0x10000u + 32u + i) : 0u;
+        const std::uint32_t want_b = 0x20000u + i;
+        if (cbv_a_out[i] != want_a && mismatches++ < 4)
+            std::fprintf(stderr, "CBV A[%u]: got 0x%x want 0x%x\n", i, cbv_a_out[i], want_a);
+        if (cbv_oob_out[i] != want_oob && mismatches++ < 4)
+            std::fprintf(stderr, "CBV OOB[%u]: got 0x%x want 0x%x\n", i, cbv_oob_out[i], want_oob);
+        if (cbv_b_out[i] != want_b && mismatches++ < 4)
+            std::fprintf(stderr, "CBV B[%u]: got 0x%x want 0x%x\n", i, cbv_b_out[i], want_b);
+        if (cbv_null_out[i] != 0u && mismatches++ < 4)
+            std::fprintf(stderr, "CBV null[%u]: got 0x%x want 0\n", i, cbv_null_out[i]);
+        if (cbv_b_out[i] != cbv_a_out[i]) ++cbv_b_diff;
+        if (cbv_null_out[i] != cbv_a_out[i]) ++cbv_null_diff;
+    }
+    EXPECT(!mismatches);
+    EXPECT(cbv_b_diff == elements && cbv_null_diff == elements);
+    std::printf("CreateConstantBufferView: 64/64 dwords matched for CBV A, 32 in-bounds + 32 OOB-zero matched at "
+                "+128, negative controls flipped %u/%u (CBV B) and %u/%u (null CBV)\n",
+                cbv_b_diff, elements, cbv_null_diff, elements);
     if (d.validation_errors()) {
         std::fprintf(stderr, "%u validation errors\n", d.validation_errors());
         return 1;

@@ -339,8 +339,9 @@ the destination buffer:
 
 1. one thread per triangle (TRI0 leaves, remap `0x09`) or per instance (128-byte records, the world-to-object
    inverse, the BLAS root and identity-rotation flag);
-2. a 30-bit Morton key of each box centre, then a stable radix sort: 8 passes of 4-bit digits, 24 dispatches
-   whatever the count, with no padding to a power of two;
+2. a 30-bit Morton key of each box centre, then a stable sort: up to 1,024 keys in one workgroup's shared memory
+   (one dispatch), more with a radix sort of 8 passes of 4-bit digits over 256-element tiles (24 dispatches
+   whatever the count, no padding to a power of two);
 3. BOX32 nodes, built level by level from four consecutive sorted children, with the parent table and each
    instance's `ParentNode`;
 4. the header.
@@ -360,8 +361,14 @@ them the same way.
 scene. `xdxr_bvh.py check-build <dir>` validates them and traces rays against brute force. `ctest` runs both as
 `xdxr_build` and `xdxr_build_check`.
 
-Not done yet: pairing triangles into TRI1 leaves, BOX16 nodes, updates, compaction and copies. A higher-quality
-build (SAH) would also come later.
+**Updates** (D3D12 `PERFORM_UPDATE`) refit: the source structure is copied to the destination unless it is the
+destination, the elements are rewritten at their slots, and each node's boxes are recomputed bottom-up from the
+children it already points to. The tree is kept, so a refit is valid for any motion and skips the Morton pass and
+the sort. It takes 0.07 ms for 1,000 triangles and 9.8 ms for 1,000,000 on an RTX 2050, against 0.19 ms and 22 ms for
+a build, but the tree traverses more slowly as the geometry moves away from where it was built.
+
+Not done yet: pairing triangles into TRI1 leaves, BOX16 nodes, compaction and copies. A higher-quality build (SAH)
+would also come later.
 
 ```powershell
 python -I tools/xdxr_bvh.py selftest --seed 1 --rays 400   # build BLASes, compare closest hits with brute force

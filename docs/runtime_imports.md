@@ -41,20 +41,22 @@ All 16 DLLs in the package map at their preferred base `0x180000000` with no rel
 | `XboxBvhBuilder.dll` | 909,312 | `0x227cc` | 3 | 54 | 0 | 0 |
 | `amd_fidelityfx_upscaler_xbox.dll` | 802,816 | `0x26780` | 5 | 81 | 0 | 0 |
 | `amd_fidelityfx_loader_xbox.dll` | 32,768 | `0x18d0` | 4 | 18 | 0 | 0 |
-| `libHttpClient.GDK.dll` | 999,424 | `0x11f0` | 7 | 191 | 0 | 0 |
-| `XCurl.dll` | 188,416 | `0x17b0` | 7 | 133 | 0 | 0 |
+| `libHttpClient.GDK.dll` | 999,424 | `0x11f0` | 10 | 188 | 0 | 0 |
+| `XCurl.dll` | 188,416 | `0x17b0` | 8 | 132 | 0 | 0 |
 | `concrt140.dll` | 303,104 | `0x29160` | 1 | 102 | 0 | 0 |
-| `msvcp140.dll` | 577,536 | `0x525a0` | 5 | 182 | 0 | 0 |
+| `msvcp140.dll` | 577,536 | `0x525a0` | 9 | 178 | 0 | 0 |
 | `msvcp140_1.dll` | 36,864 | `0x15c0` | 1 | 32 | 0 | 0 |
 | `msvcp140_2.dll` | 192,512 | `0x1efa0` | 1 | 95 | 0 | 0 |
 | `msvcp140_atomic_wait.dll` | 81,920 | `0x3c80` | 3 | 61 | 0 | 0 |
 | `msvcp140_codecvt_ids.dll` | 28,672 | `0x1340` | 1 | 23 | 0 | 0 |
 | `vccorlib140.dll` | 344,064 | `0x27e50` | 6 | 108 | 0 | 0 |
-| `vcomp140.dll` | 86,016 | `0x6580` | 3 | 75 | 0 | 0 |
+| `vcomp140.dll` | 86,016 | `0x6580` | 7 | 71 | 0 | 0 |
 | `vcruntime140.dll` | 110,592 | `0xf890` | 3 | 38 | 0 | 0 |
 | `vcruntime140_1.dll` | 49,152 | `0x3e90` | 1 | 33 | 0 | 0 |
 
 Since the library-loader shims (`runtime/shims/library_loader.cpp`), a module's `LoadLibrary*`, `GetModuleHandle*`, `GetProcAddress` and `FreeLibrary` imports count as shim, through `kernel32`, `kernelbase` or the `api-ms-win-core-libraryloader-*` set it names. That is why every image above has a few more shim and fewer host imports than before; the Xbox-specific imports below are unchanged.
+
+The process shim (`runtime/shims/process.cpp`) serves `ExitProcess` and `GetCommandLineA/W` the same way: through `kernel32`, `kernelbase`, and `api-ms-win-core-processthreads-l1-1-0` and `api-ms-win-core-processenvironment-l1-1-0`, the sets the API-set umbrella libraries (`OneCore_apiset.lib`, `mincore.lib`) bind them to. `vcomp140.dll` imports `ExitProcess` from the first of these. The UCRT's `_get_narrow_winmain_command_line` and `_get_wide_winmain_command_line` are served too, so a `WinMain` executable gets the game's command line as `lpCmdLine`. The table above is `gta6rt --dry-run` on each DLL at the commit that added this paragraph.
 
 The six unique Xbox-specific imports (eight consumer/import pairs) are exactly the set recorded in
 [`d3d12_vulkan.md` §7](d3d12_vulkan.md#7-prior-art-and-measured-xbox-abi):

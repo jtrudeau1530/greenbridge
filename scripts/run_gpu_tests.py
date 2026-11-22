@@ -548,7 +548,7 @@ OTHER_HARNESS = {"ps_m15": "d3d12_translated_draw_test", "vs_m15": "d3d12_transl
 # Shaders a selected test draws with, built even when the filter leaves them out (#192).
 DRAWN_WITH = {GATHER_LOD_TEST: "vs_ids.asm", "ps_flat": "vs_ids.asm", "ps_texture_sample": "vs_ids.asm", "ps_cube_sample": "vs_ids.asm",
               "ps_texture_sample_d16": "vs_ids.asm", "ps_sample_c_lz": "vs_ids.asm", "ps_sample_c_lz_a16": "vs_ids.asm",
-              **{name: "vs_ids.asm" for name in TEXTURE_CONSTANTS}, "ps_ssharp": "vs_ids.asm",
+              **{name: "vs_ids.asm" for name in TEXTURE_CONSTANTS}, "ps_ssharp": "vs_ids.asm", "ps_imgatomic": "vs_ids.asm",
               **{name: "vs_ids.asm" for name in GRADIENT_TESTS}, "vs_clip": "ps_clip_color.asm",
               "ps_interp_f16_high": "vs_f16_pack.asm", "ms_f16_pack": "ps_interp_f16_high.asm",
               "ps_interp_f32_mods": "vs_interp_consts.asm", "ps_interp_mov_mods": "vs_interp_consts.asm",
@@ -1043,10 +1043,12 @@ def run_suite(a, work: str) -> int:
             else:
                 results.append((name, rc == 0 and bad == 0, "4096/4096 pixels exact" if bad == 0 else
                                 f"{bad} pixels differ from {expected}: {msg.splitlines()[-1] if msg else ''}"))
-        elif name == "ps_tex":
-            # A texture through the descriptor hash table and the bindless set. vk_bindless_test compares the
-            # pixels itself, and exits 77 where the device lacks a feature the set or the shader needs.
-            rc, msg = run_cmd([vk_bindless, vs_tri, spv])
+        elif name in ("ps_tex", "ps_imgatomic"):
+            # A texture through the descriptor hash table and the bindless set (ps_tex), or image atomics in a pixel
+            # shader through the set's r32ui storage arrays (ps_imgatomic, drawn with vs_ids). vk_bindless_test
+            # compares the result itself, and exits 77 where the device lacks a feature the set or shader needs.
+            vs = os.path.join(spirv_dir, "vs_ids.spv") if name == "ps_imgatomic" else vs_tri
+            rc, msg = run_cmd([vk_bindless, vs, spv])
             lines = msg.splitlines()
             if rc == 77:
                 reason = next((ln for ln in lines if ln.startswith("unsupported:")), "unsupported device")
@@ -1111,6 +1113,8 @@ def run_suite(a, work: str) -> int:
                 "ps_vcmpx_forms": (0xF05B2A48, 0xF05E8A12, 0xB174BE18, 0x15550000),   # 14 v_cmpx forms (.asm header)
                 "ps_med3_mods": (0x3F800000, 0x40400000, 0x40C00000, 0x3F400000),
                 "ps_scc_minmax": (0x00030205, 0x00030207, 0x00030209, 0x00030203),
+                "ps_scc_logic32": (0x0fff0fff, 0x000f000f, 0xf00ff00f, 0x36),
+                "ps_scc_logic64": (0x0fff0fff, 0xff000000, 0xff0000ff, 0x16),
                 "ps_fma_literal": (0x41B80000, 0x41800000, 0x40E00000, 0x41A40000),
                 "ps_f64_mods": (0x40040000, 0x3FF00000, 0x3FE40000, 0x3FF00000),   # needs shaderFloat64
                 # f16 op_sel / partial writes / inline constants: RDNA2 hardware words (see the .asm headers)

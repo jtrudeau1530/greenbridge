@@ -867,18 +867,6 @@ def _invocation(text, inputs, push_constants, memory, step=False):
                 values[res] = fma_f32(x, y, z)
         elif op == "OpFNegate":
             values[res] = f32(-val(a[1]))
-        elif op == "OpFDiv":
-            x, y = val(a[1]), val(a[2])
-            if not (isinstance(x, float) and isinstance(y, float)):
-                raise UnsupportedConstruct("OpFDiv on non-float")
-            if y == 0.0:
-                raise UnsupportedConstruct("OpFDiv by zero (undefined in SPIR-V)")
-            if math.isinf(x) and math.isinf(y):
-                values[res] = math.nan
-            elif math.isnan(x) or math.isnan(y):
-                values[res] = math.nan
-            else:
-                values[res] = f32(x / y)        # x/inf is a signed zero, as in Python
         elif op == "OpQuantizeToF16":
             # Single-instruction f32 -> f16 -> f32 round to nearest, with the
             # SPIR-V subnormal rule: a magnitude too small for a normal f16

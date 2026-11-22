@@ -71,7 +71,8 @@ OUT_SCC = 30   # s_cselect_b32 s30, 1, 0 observes SCC at the end
 BFE_ANY = False    # any s_bfe_* control word (--bfe-any), not only offset + width <= 32
 INLINE64 = False   # inline constants in 64-bit positions (--inline64); the translator reads those as lane masks
 
-LANE_MASK_OPS = ("s_and_b64", "s_or_b64", "s_xor_b64", "s_andn2_b64", "s_orn2_b64", "s_not_b64", "s_wqm_b64",
+LANE_MASK_OPS = ("s_and_b64", "s_or_b64", "s_xor_b64", "s_andn2_b64", "s_orn2_b64", "s_nand_b64", "s_nor_b64",
+                 "s_xnor_b64", "s_not_b64", "s_wqm_b64",
                  "s_wqm_b32", "s_cselect_b64", "s_bfm_b64")
 
 INTERESTING = (0, 1, 2, 3, 31, 32, 33, 63, 64, 0x7FFFFFFF, 0x80000000, 0x80000001, 0xFFFFFFFF, 0xFFFFFFFE,
@@ -172,7 +173,9 @@ def _sop2():
 def _sop2_64():
     ops = {}
     for name, f in (("and", lambda a, b: a & b), ("or", lambda a, b: a | b), ("xor", lambda a, b: a ^ b),
-                    ("andn2", lambda a, b: a & ~b), ("orn2", lambda a, b: a | ~b)):
+                    ("andn2", lambda a, b: a & ~b), ("orn2", lambda a, b: a | ~b),
+                    ("nand", lambda a, b: ~(a & b)), ("nor", lambda a, b: ~(a | b)),
+                    ("xnor", lambda a, b: ~(a ^ b))):
         ops[f"s_{name}_b64"] = ("sop2_64", lambda a, b, c, f=f: (f(a, b) & M64, int(f(a, b) & M64 != 0)))
     ops["s_cselect_b64"] = ("sop2_64", lambda a, b, c: (a if c else b, None))
     ops["s_lshl_b64"] = ("sop2_64s", lambda a, b, c: ((a << (b & 63)) & M64, int((a << (b & 63)) & M64 != 0)))

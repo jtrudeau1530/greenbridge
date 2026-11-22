@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "../shims/shims.h"
+#include "base_reservation.h"
 
 namespace rt {
 
@@ -506,8 +507,11 @@ Module& Loader::map_image(const std::filesystem::path& path) {
     by_name_[lower(m->name)] = m;
     order_.push_back(m);
 
-    m->base = static_cast<uint8_t*>(
-        VirtualAlloc(reinterpret_cast<void*>(oh.ImageBase), oh.SizeOfImage, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    // Inside the range gta6rt reserved for this image before the process started (base_reservation.h), else as usual.
+    m->base = static_cast<uint8_t*>(base_reservation::commit_reserved(oh.ImageBase, oh.SizeOfImage));
+    if (!m->base)
+        m->base = static_cast<uint8_t*>(VirtualAlloc(reinterpret_cast<void*>(oh.ImageBase), oh.SizeOfImage,
+                                                     MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
     if (!m->base) {
         const auto relocs = directory(nt, IMAGE_DIRECTORY_ENTRY_BASERELOC);
         if (!relocs.Size)

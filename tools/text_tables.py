@@ -40,10 +40,12 @@ import os
 import re
 import struct
 import sys
+import tempfile
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
+from file_mode import published_mode  # noqa: E402
 from hashdict import joaat  # noqa: E402
 
 RESOURCE_MAGIC = b"0DRP"
@@ -288,6 +290,12 @@ def main(argv=None) -> int:
     ap.add_argument("--strings", help="CSV: every string (source, offset, lang, hash, label, text)")
     a = ap.parse_args(argv)
     outs = [p for p in (a.dialogue, a.tables, a.strings) if p]
+    seen = set()
+    for p in outs:
+        key = os.path.normcase(os.path.realpath(p))
+        if key in seen:
+            ap.error("outputs must be distinct files")
+        seen.add(key)
     for path in a.sources + a.labels:
         if not os.path.exists(path):
             print(f"text_tables: error: {path}: no such file or directory", file=sys.stderr)
@@ -308,24 +316,73 @@ def main(argv=None) -> int:
 
     lines = sum(len(v) for v in scan.pairs.values())
     langs = scan.languages()
+    jobs = []
+    if a.dialogue:
+        fields = ["wave", "key", "label", "speaker"] + [f"text_{x}" for x in langs]
+        jobs.append((a.dialogue, fields, scan.dialogue_rows()))
+    if a.tables:
+        jobs.append((a.tables, ["source", "offset", "lang", "group", "strings", "resolved"],
+                     ({"source": s, "offset": o, "lang": lang,
+                       "group": table_group(names[h] for h in t if h in names),
+                       "strings": len(t), "resolved": sum(h in names for h in t)}
+                      for s, o, lang, t in scan.tables)))
+    if a.strings:
+        jobs.append((a.strings, ["source", "offset", "lang", "hash", "label", "text"],
+                     ({"source": s, "offset": o, "lang": lang, "hash": f"{h:08x}", "label": names.get(h, ""),
+                       "text": _clean(text)}
+                      for s, o, lang, t in scan.tables for h, text in t.items())))
+    # Stage every report next to its destination, then swap them all in. A write that fails part-way must
+    # leave the previous reports intact instead of truncating the ones that came before it.
+    staged = []
+    originals = {}
     try:
-        if a.dialogue:
-            fields = ["wave", "key", "label", "speaker"] + [f"text_{x}" for x in langs]
-            _write_csv(a.dialogue, fields, scan.dialogue_rows())
-        if a.tables:
-            _write_csv(a.tables, ["source", "offset", "lang", "group", "strings", "resolved"],
-                       ({"source": s, "offset": o, "lang": lang,
-                         "group": table_group(names[h] for h in t if h in names),
-                         "strings": len(t), "resolved": sum(h in names for h in t)}
-                        for s, o, lang, t in scan.tables))
-        if a.strings:
-            _write_csv(a.strings, ["source", "offset", "lang", "hash", "label", "text"],
-                       ({"source": s, "offset": o, "lang": lang, "hash": f"{h:08x}", "label": names.get(h, ""),
-                         "text": _clean(text)}
-                        for s, o, lang, t in scan.tables for h, text in t.items()))
+        for dest, fields, rows in jobs:
+            parent = os.path.dirname(os.path.abspath(dest))
+            fd, tmp = tempfile.mkstemp(dir=parent, prefix=".text_tables-", suffix=".csv")
+            os.close(fd)
+            staged.append((tmp, dest))
+            _write_csv(tmp, fields, rows)
+        for _tmp, dest in staged:
+            if os.path.isdir(dest):
+                raise OSError(f"{dest} is a directory")
+        for tmp, dest in staged:
+            os.chmod(tmp, published_mode(dest))
+        # Move every old report aside before putting any new one in place. On Windows a report held
+        # open by a reader cannot be renamed; failing here leaves all the originals untouched.
+        for _tmp, dest in staged:
+            if os.path.lexists(dest):
+                fd, backup = tempfile.mkstemp(dir=os.path.dirname(os.path.abspath(dest)),
+                                              prefix=".text_tables-old-", suffix=".csv")
+                os.close(fd)
+                os.remove(backup)
+                os.replace(dest, backup)
+                originals[dest] = backup
+            else:
+                originals[dest] = None
+        for tmp, dest in staged:
+            os.replace(tmp, dest)
     except OSError as error:
+        for dest, backup in originals.items():
+            try:
+                if os.path.lexists(dest):
+                    os.remove(dest)
+                if backup is not None:
+                    os.replace(backup, dest)
+            except OSError:
+                pass
+        for tmp, _ in staged:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
         print(f"text_tables: error: cannot write: {error}", file=sys.stderr)
         return 2
+    for backup in originals.values():
+        if backup is not None:
+            try:
+                os.remove(backup)
+            except OSError:
+                pass
     with_text = collections.Counter()
     for row in scan.dialogue_rows():
         for lang in langs:

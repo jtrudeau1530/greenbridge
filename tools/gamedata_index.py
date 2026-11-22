@@ -41,6 +41,10 @@ XML_CLOSE_TAIL = re.compile(rb"</([A-Za-z_][\w.:-]*)>\s*$")
 # Tag-like text inside these cannot open or close an element.
 XML_NON_TAG = re.compile(rb"<!--.*?-->|<!\[CDATA\[.*?\]\]>|<\?.*?\?>", re.S)
 MAGIC = {b"MHIU": "MHIU", b"PAMH": "PAMH", b"SPS1Z": "SPS1Z", b"RBF0": "RBF0", b"PSIN": "PSIN"}
+# A resource whose page directory starts the stream carries "0DRP" at +16 (docs/animation.md, "0DRP page marker").
+# Its first 4 KiB can be over 95% printable, so without this check such a stream reads as text, and as XML when it
+# holds a "<": data.rpf has 337 of them and no XML at all (docs/gamedata.md, "Relationship to data.rpf").
+PAGE_MARKER, PAGE_MARKER_AT = b"0DRP", 16
 
 
 def printable(data: bytes) -> float:
@@ -123,6 +127,8 @@ def stream_kind(data: bytes, row: dict) -> str:
     for magic in MAGIC:
         if data.startswith(magic):
             return "other"
+    if data[PAGE_MARKER_AT:PAGE_MARKER_AT + len(PAGE_MARKER)] == PAGE_MARKER:
+        return "other"
     if printable(data) > 0.95:
         return "text"
     return "binary"
@@ -132,6 +138,8 @@ def magic_name(data: bytes) -> str:
     for magic, name in MAGIC.items():
         if data.startswith(magic):
             return name
+    if data[PAGE_MARKER_AT:PAGE_MARKER_AT + len(PAGE_MARKER)] == PAGE_MARKER:
+        return PAGE_MARKER.decode()
     return ""
 
 

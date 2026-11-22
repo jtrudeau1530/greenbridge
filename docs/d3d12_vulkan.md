@@ -477,7 +477,9 @@ side inwards:
 
     Growth leaves 64 descriptors of each limit to the other sets of a pipeline layout. It also stays within
     `maxPerSetDescriptors`, which never shrinks the default counts, because a layout past it may still be
-    supported. The other arrays keep their default counts. On an RTX 5070 (driver 621.24, 1048576 of each type
+    supported: past it, the device grows only where `vkGetDescriptorSetLayoutSupport` accepts the grown layout.
+    Intel's UHD 770 (101.7092) reports 6159 and accepts the full sizes, so it gets the same set as an RTX (D3D-219).
+    The other arrays keep their default counts. On an RTX 5070 (driver 621.24, 1048576 of each type
     and 4000 samplers) the set has 65536 2D images, 3936 samplers and 4096 storage indices in 2D: 93793
     descriptors, 3-6 MiB at 32-64 bytes a descriptor. The device prints the counts it chose, and
     `bindless_sizing_test` checks the rules on synthetic limits.
@@ -669,8 +671,9 @@ The compute path, end to end:
     place plus the placed offset as its console VA. A placed texture keeps its own `VkDeviceMemory` and a null VA;
     tiled (`64KB_UNDEFINED_SWIZZLE` and Xbox `0x101`) 2D/3D placed textures are backed the same way with
     tile-multiple `GetResourceAllocationInfo`, `GetResourceTiling`, and host-matched `E_INVALIDARG` checks
-    (D3D-191). `CreatePlacedResource2`'s castable-format list reaches the placed texture's image as the committed
-    path's does (D3D-90).
+    (D3D-191). Multisampled 2D placed textures (`UNKNOWN` and `4x` tiled) share that backing with host-matched heap
+    and offset alignment checks (`4 MiB` vs `64 KiB`, `D3D-222`). `CreatePlacedResource2`'s castable-format list
+    reaches the placed texture's image as the committed path's does (D3D-90).
 
 Known gaps: set 0 in pipelines (the device keeps the bindless set, but no pipeline declares or binds it yet) and
 therefore every translated shader that declares bindings; tessellation, geometry and mesh pipelines,
@@ -1041,7 +1044,7 @@ The layer therefore owns the console VAs. It returns them from `ID3D12Resource::
 | Address space | Two ranges. A **BDA arena** holds buffers, descriptor heaps and shader code; its device address is `heap_base`. A separate **image key range** supplies unique console VAs for images; those keys are never added to `heap_base`. The arena's `VkBuffer` is created with all buffer usages the game can bind (uniform, storage, vertex, index, indirect, transfer) plus `SHADER_DEVICE_ADDRESS`, and its memory with `VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT`. |
 | Buffers | A buffer resource is a range in the arena's single `VkBuffer`: offset = its console VA, size = the resource size. Buffer commands bind the arena buffer with that offset, so its device address is exactly `arena_bda + offset`; no per-resource `VkBuffer` object is needed. |
 | Images | Each image gets a unique console VA key and lives in its own `VkDeviceMemory` (or a suballocated device-local image heap) with optimal tiling. Shader image access goes through the T#/hash table, so nothing dereferences the key. Keeping images out of the arena avoids forcing optimal-tiled images into the arena's memory type and keeps the arena sized by buffers, not textures. |
-| Heaps and placed resources | `CreateHeap` reserves the requested size in the arena, so a buffer placed at a 64 KiB-aligned offset is that offset into the arena and its console VA is the heap's place plus the offset. A placed texture gets its own `VkDeviceMemory` and a null VA, as in D3D12. Tiled (`64KB_UNDEFINED_SWIZZLE` and Xbox `0x101`) 2D/3D placed textures share that backing and answer `GetResourceAllocationInfo` and `GetResourceTiling` (D3D-191). |
+| Heaps and placed resources | `CreateHeap` reserves the requested size in the arena, so a buffer placed at a 64 KiB-aligned offset is that offset into the arena and its console VA is the heap's place plus the offset. A placed texture gets its own `VkDeviceMemory` and a null VA, as in D3D12. Tiled (`64KB_UNDEFINED_SWIZZLE` and Xbox `0x101`) 2D/3D placed textures (D3D-191) and multisampled 2D placed textures (D3D-222) share that backing, answer `GetResourceAllocationInfo` and `GetResourceTiling`, and check heap/offset alignments. |
 | Descriptor heaps | Shader-visible CBV/SRV/UAV and sampler heaps are allocated in the low 4 GB of the arena. RTV/DSV heaps are host-side only. |
 | Shader code | Each FSSM blob is uploaded to the arena; its console VA is the code base. |
 | Upload/readback | `D3D12_HEAP_TYPE_UPLOAD`/`READBACK` resources are separate host-visible buffers outside the arena. Their console VAs are only used by copy APIs; if the game binds one as a vertex/index buffer or reads it in a shader, the layer biases the view/descriptor by `-heap_base` so the shader's addition lands on the host BDA (**Assumption**; **measured to fail for a V#**, see below). |
@@ -1167,6 +1170,9 @@ The layer's descriptor model:
   `VK_EXT_image_view_min_lod`. Vulkan allows the image-view minimum to be rounded down to an integer.
   With nearest mip filtering, the UHD 770 and Arrow Lake Xe-LPG returned mip 0 for a 2D minimum of 0.75.
   The Xe-LPG also returned mip 1 for a 2D-array minimum of 1.75. RTX and Radeon returned mips 1 and 2.
+  On Intel integrated GPUs the layer therefore passes the clamp rounded to the nearest level
+  (`ceil(minLod + 0.5) - 1`), which point mip filtering selects exactly; linear mip filtering then blends from that
+  whole level instead of the fraction (D3D-219). `LEONIDA_MIN_LOD_INTEGER=1` or `0` forces the rounding on or off.
   See [Vulkan image-level selection](https://docs.vulkan.org/spec/latest/chapters/textures.html#textures-image-level-selection)
   and the [Intel readbacks](https://github.com/ItsNotRexed/Leonida/pull/1015#issuecomment-7075135647).
   If the logical device lacks the feature, the runtime logs the unsupported view
@@ -2176,8 +2182,8 @@ Vulkan AS would be invisible to them. Two paths:
    the GPU and is checked against that reference. The standalone device uses it for `BuildRaytracingAccelerationStructure`
    and answers `GetRaytracingAccelerationStructurePrebuildInfo` from its layout, exactly. Acceleration-structure
    buffers then keep their console VAs, the addresses the records name each other by. `LEONIDA_RT_AS=khr` keeps
-   #743's `VkAccelerationStructureKHR` builds (for `RayQueryKHR`), which the game's shaders can't read. Updates rebuild
-   the structure; compaction, copies, serialization and the Xbox batched/streaming builds are not implemented. The
+   #743's `VkAccelerationStructureKHR` builds (for `RayQueryKHR`), which the game's shaders can't read. Updates refit
+   the source structure instead of rebuilding it ([bvh.md](bvh.md) §7a); compaction, copies, serialization and the Xbox batched/streaming builds are not implemented. The
    reported `RaytracingTier` is unchanged (`NOT_SUPPORTED`). Checked by `runtime/test/d3d12_xdxr_rt_test.cpp` through
    the D3D12 API.
 
@@ -2820,7 +2826,7 @@ on a PC device behind the Xbox-ABI proxy). Measured:
     (`+0x18`, `+0x28`, `+0x30`) the DLL writes commands through while there is room. Table and evidence:
     [d3d12_command_objects.md §3.5a](d3d12_command_objects.md).
     Device slot 67 is a console-only compute-pipeline call, `DeserializeComputePipelineStateX` in the DLL's own
-    messages, not the PC method at that index; the proxy now refuses it. The dispatch stops where the PC runtime
+    messages, not the PC method at that index; the proxy routes it to `CreateComputePipelineState`. The dispatch stops where the PC runtime
     refuses the DLL's compute code at slot 62: the DLL's shaders carry an `ACCC` part instead of DXIL, an `FSPX`
     payload with an RDNA2 program ([fspx.md](fspx.md)).
   - Its `throw 1` reaches the caller. Before #965 the throw carried an image base of 0, because `_CxxThrowException`
