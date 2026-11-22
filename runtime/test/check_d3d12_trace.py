@@ -35,7 +35,7 @@ def main():
     if options.queue:
         expected = [
             "ID3D12CommandQueue::ExecuteCommandLists failed",
-            "ID3D12GraphicsCommandList::SetMarker unsupported",
+            "ID3D12GraphicsCommandList3::SetProtectedResourceSession unsupported",
             "ID3D12GraphicsCommandList::Close failed",
             "ID3D12CommandQueue::Wait ok",
             "ID3D12CommandQueue::ExecuteCommandLists ok",
@@ -43,8 +43,9 @@ def main():
         ]
     else:
         expected = [
-            "ID3D12GraphicsCommandList::SetMarker unsupported",
-            "ID3D12GraphicsCommandList::SetMarker unsupported",
+            "ID3D12GraphicsCommandList::SetMarker called",
+            "ID3D12GraphicsCommandList3::SetProtectedResourceSession unsupported",
+            "ID3D12GraphicsCommandList3::SetProtectedResourceSession unsupported",
             "ID3D12GraphicsCommandList::Close ok",
             "ID3D12GraphicsCommandList::Close failed",
             "ID3D12GraphicsCommandList::Reset ok",

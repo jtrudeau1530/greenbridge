@@ -372,14 +372,20 @@ public:
         stub("ID3D12GraphicsCommandList8::OMSetFrontAndBackStencilRef (recorded; no pipeline path applies it)");
     }
 
-    // Debug markers, recorded in order with the other commands and replayed as VK_EXT_debug_utils labels.
+    // Debug markers, recorded in order with the other commands and replayed as VK_EXT_debug_utils labels. The trace
+    // names the call only, never the label.
     void STDMETHODCALLTYPE SetMarker(UINT metadata, const void* data, UINT size) override {
+        d3d12_trace::record("ID3D12GraphicsCommandList::SetMarker");
         check(list_.marker(leonida::DebugMarker::Kind::set, event_label(metadata, data, size)));
     }
     void STDMETHODCALLTYPE BeginEvent(UINT metadata, const void* data, UINT size) override {
+        d3d12_trace::record("ID3D12GraphicsCommandList::BeginEvent");
         check(list_.marker(leonida::DebugMarker::Kind::begin, event_label(metadata, data, size)));
     }
-    void STDMETHODCALLTYPE EndEvent() override { check(list_.marker(leonida::DebugMarker::Kind::end)); }
+    void STDMETHODCALLTYPE EndEvent() override {
+        d3d12_trace::record("ID3D12GraphicsCommandList::EndEvent");
+        check(list_.marker(leonida::DebugMarker::Kind::end));
+    }
 
     static GraphicsCommandList* from(IUnknown* object) { return Child::from<GraphicsCommandList>(object); }
 
@@ -666,12 +672,17 @@ public:
 
     // Queue labels, in order with the submissions around them.
     void STDMETHODCALLTYPE SetMarker(UINT metadata, const void* data, UINT size) override {
+        d3d12_trace::record("ID3D12CommandQueue::SetMarker");
         marker(leonida::DebugMarker::Kind::set, metadata, data, size);
     }
     void STDMETHODCALLTYPE BeginEvent(UINT metadata, const void* data, UINT size) override {
+        d3d12_trace::record("ID3D12CommandQueue::BeginEvent");
         marker(leonida::DebugMarker::Kind::begin, metadata, data, size);
     }
-    void STDMETHODCALLTYPE EndEvent() override { marker(leonida::DebugMarker::Kind::end, 0, nullptr, 0); }
+    void STDMETHODCALLTYPE EndEvent() override {
+        d3d12_trace::record("ID3D12CommandQueue::EndEvent");
+        marker(leonida::DebugMarker::Kind::end, 0, nullptr, 0);
+    }
 
     static CommandQueue* from(IUnknown* object) { return Child::from<CommandQueue>(object); }
 
