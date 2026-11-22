@@ -729,5 +729,20 @@ class NavmeshDecodeTest(unittest.TestCase):
                 self.assertNotIn("Traceback", proc.stderr)
 
 
+class OutputPathTest(unittest.TestCase):
+    """A report path that is already a folder is a usage error, not a PermissionError traceback."""
+
+    def test_out_that_is_a_directory_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source, out = os.path.join(tmp, "carved"), os.path.join(tmp, "reports")
+            os.makedirs(source)
+            os.makedirs(out)
+            r = subprocess.run([sys.executable, "-I", TOOL, source, "--out", out],
+                               capture_output=True, text=True, timeout=120)
+            self.assertEqual(r.returncode, 2, r.stderr)
+            self.assertIn("--out is a directory", r.stderr)
+            self.assertNotIn("Traceback", r.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()

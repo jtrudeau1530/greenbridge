@@ -1015,6 +1015,8 @@ def main(argv=None):
     for flag, path in (("--out", out), ("--csv", a.csv)):
         if not path:
             continue
+        if os.path.isdir(path):              # open() on a folder ends the run in a PermissionError traceback
+            ap.error(f"{flag} is a directory: {path}")
         if same_report_path(path, a.input):
             ap.error(f"{flag} would overwrite the input {a.input}")
         if os.path.isfile(path) and os.path.isdir(a.input):

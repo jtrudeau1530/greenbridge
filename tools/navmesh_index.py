@@ -314,6 +314,8 @@ def main() -> int:
     if a.csv and same_report_path(out_path, a.csv):
         ap.error("--out and --csv must refer to different files")
     for flag, path in (("--out", out_path), ("--csv", a.csv)):
+        if path and os.path.isdir(path):     # open() on a folder ends the run in a PermissionError traceback
+            ap.error(f"{flag} is a directory: {path}")
         if path and is_scanned_input(path, a.input, a.pattern):
             ap.error(f"{flag} would overwrite the input {path}")
     below_normal()
