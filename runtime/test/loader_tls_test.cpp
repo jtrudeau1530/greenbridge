@@ -202,9 +202,8 @@ void test_tls(const fs::path& dll) {
 void test_second_tls_module_rejected(const fs::path& dll, const fs::path& temp) {
     std::printf("\n-- one mapped TLS module at a time --\n");
     const fs::path copy = temp / "tiny_tls_second.dll";
-    std::error_code ec;
-    fs::copy_file(dll, copy, fs::copy_options::overwrite_existing, ec);
-    check(!ec, "copied the TLS fixture under a second name");
+    // CopyFileW, not fs::copy_file: MSVC's copy_file calls CopyFile2, which Wine 9 doesn't implement.
+    check(CopyFileW(dll.c_str(), copy.c_str(), FALSE) != 0, "copied the TLS fixture under a second name");
 
     {
         rt::Loader loader(dll.parent_path());
