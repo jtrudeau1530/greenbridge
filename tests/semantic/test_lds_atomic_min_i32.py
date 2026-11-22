@@ -15,6 +15,14 @@ Background & Specification Rules:
           dword_idx = (effective_byte >> 2) & (lds_dwords - 1)
           LDS[dword_idx] = min_i32(LDS[dword_idx], vdata)
         Non-returning form: the prior value in LDS[dword_idx] is discarded.
+    - `ds_min_rtn_i32 vdst, vaddr, vdata [offset:N]`:
+        Atomically computes:
+          effective_byte = (vaddr + byte_offset) & 0xFFFFFFFF
+          dword_idx = (effective_byte >> 2) & (lds_dwords - 1)
+          old_val = LDS[dword_idx]
+          LDS[dword_idx] = min_i32(old_val, vdata)
+          vdst = old_val
+        Returning form: writes the pre-atomic value into destination VGPR vdst.
     - Two's-Complement Signed 32-bit Integer Semantics:
         Operands are interpreted as signed integers in [-2^31, 2^31 - 1].
         Negative values (bit 31 set) compare strictly less than non-negative values:
@@ -958,11 +966,6 @@ OpReturn
 OpFunctionEnd
 """
         interp = LdsAtomicMinI32Interp(spvasm)
-        # Inactive lane 7 tries to set -999999, but is masked off.
-        # Active lanes:
-        # Lane 0 passes -10
-        # Lane 2 passes -50
-        # Lane 5 passes -30
         lane_vals = [-10, -999999, -50, -999999, -999999, -30, -999999, -999999]
         lane_inputs = [{"%lane_val": to_unsigned_u32(v)} for v in lane_vals]
 
@@ -974,6 +977,420 @@ OpFunctionEnd
         )
         # Active lanes: 0 (-10), 2 (-50), 5 (-30). Initial: 100. Min = -50.
         self.assertEqual(to_signed_i32(final_lds[0]), -50)
+
+
+class TestTwosComplementSignedBoundaries(unittest.TestCase):
+    """Verifies two's complement boundary values, extremes, and address wrapping."""
+
+    def test_int32_min_vs_int32_max_signed_vs_unsigned_extremes(self):
+        # INT32_MIN (0x80000000 = -2147483648) vs INT32_MAX (0x7FFFFFFF = +2147483647).
+        # Signed: min is 0x80000000 (-2147483648).
+        # Unsigned: min is 0x7FFFFFFF (2147483647).
+        spvasm = """
+OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+%uint = OpTypeInt 32 0
+%c16 = OpConstant %uint 16
+%c2 = OpConstant %uint 2
+%c0 = OpConstant %uint 0
+%c0_slot = OpConstant %uint 0
+%c_int_min = OpConstant %uint 0x80000000
+%lds_arr = OpTypeArray %uint %c16
+%_ptr_WG_lds = OpTypePointer Workgroup %lds_arr
+%_ptr_WG_uint = OpTypePointer Workgroup %uint
+%lds = OpVariable %_ptr_WG_lds Workgroup
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%ptr = OpAccessChain %_ptr_WG_uint %lds %c0_slot
+%dummy = OpAtomicSMin %uint %ptr %c2 %c0 %c_int_min
+OpReturn
+OpFunctionEnd
+"""
+        interp = LdsAtomicMinI32Interp(spvasm)
+        final_lds, _ = interp.run(seed_lds={0: UINT32_INT32_MAX})
+        self.assertEqual(final_lds[0], UINT32_INT32_MIN)
+        self.assertEqual(to_signed_i32(final_lds[0]), INT32_MIN_SIGNED)
+
+    def test_minus_one_vs_zero(self):
+        # -1 (0xFFFFFFFF) vs 0 (0x00000000). Signed min is -1 (0xFFFFFFFF).
+        spvasm = """
+OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+%uint = OpTypeInt 32 0
+%c16 = OpConstant %uint 16
+%c2 = OpConstant %uint 2
+%c0 = OpConstant %uint 0
+%c1_slot = OpConstant %uint 1
+%c_minus1 = OpConstant %uint 0xFFFFFFFF
+%lds_arr = OpTypeArray %uint %c16
+%_ptr_WG_lds = OpTypePointer Workgroup %lds_arr
+%_ptr_WG_uint = OpTypePointer Workgroup %uint
+%lds = OpVariable %_ptr_WG_lds Workgroup
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%ptr = OpAccessChain %_ptr_WG_uint %lds %c1_slot
+%dummy = OpAtomicSMin %uint %ptr %c2 %c0 %c_minus1
+OpReturn
+OpFunctionEnd
+"""
+        interp = LdsAtomicMinI32Interp(spvasm)
+        final_lds, _ = interp.run(seed_lds={1: 0})
+        self.assertEqual(final_lds[1], 0xFFFFFFFF)
+        self.assertEqual(to_signed_i32(final_lds[1]), -1)
+
+    def test_int32_min_vs_int32_min_plus_one(self):
+        # -2147483648 (0x80000000) vs -2147483647 (0x80000001). Signed min is 0x80000000.
+        s_min = reference_atomic_smin(0x80000000, 0x80000001)
+        self.assertEqual(s_min, 0x80000000)
+        s_min_rev = reference_atomic_smin(0x80000001, 0x80000000)
+        self.assertEqual(s_min_rev, 0x80000000)
+
+    def test_int32_max_vs_int32_max_minus_one(self):
+        # +2147483647 (0x7FFFFFFF) vs +2147483646 (0x7FFFFFFE). Signed min is 0x7FFFFFFE.
+        s_min = reference_atomic_smin(0x7FFFFFFF, 0x7FFFFFFE)
+        self.assertEqual(s_min, 0x7FFFFFFE)
+
+    def test_signed_boundaries_with_wrapping_byte_offsets(self):
+        # Hardware wrapping around 2^32 boundary:
+        # Byte address 0xFFFFFFFC (-4) + offset 8 = 4 (dword 1).
+        # Byte address 0xFFFFFFFC + offset 4 = 0 (dword 0).
+        lds_dwords = 64
+        self.assertEqual(reference_lds_index(0xFFFFFFFC, 8, lds_dwords), 1)
+        self.assertEqual(reference_lds_index(0xFFFFFFFC, 4, lds_dwords), 0)
+
+        spvasm = """
+OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+%uint = OpTypeInt 32 0
+%c64 = OpConstant %uint 64
+%c2 = OpConstant %uint 2
+%c0 = OpConstant %uint 0
+%c_base = OpConstant %uint 0xFFFFFFFC
+%c_off8 = OpConstant %uint 8
+%c_shift2 = OpConstant %uint 2
+%c_mask63 = OpConstant %uint 63
+%c_neg42 = OpConstant %uint 0xFFFFFFD6
+%lds_arr = OpTypeArray %uint %c64
+%_ptr_WG_lds = OpTypePointer Workgroup %lds_arr
+%_ptr_WG_uint = OpTypePointer Workgroup %uint
+%lds = OpVariable %_ptr_WG_lds Workgroup
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%sum = OpIAdd %uint %c_base %c_off8
+%didx = OpShiftRightLogical %uint %sum %c_shift2
+%wrapped = OpBitwiseAnd %uint %didx %c_mask63
+%ptr = OpAccessChain %_ptr_WG_uint %lds %wrapped
+%dummy = OpAtomicSMin %uint %ptr %c2 %c0 %c_neg42
+OpReturn
+OpFunctionEnd
+"""
+        interp = LdsAtomicMinI32Interp(spvasm)
+        final_lds, _ = interp.run(seed_lds={1: 100})
+        # (0xFFFFFFFC + 8) & 0xFFFFFFFF = 4 -> dword 1
+        # min(100, -42) = -42 (0xFFFFFFD6)
+        self.assertEqual(to_signed_i32(final_lds[1]), -42)
+
+
+class TestSpirvAtomicSMinReturningAndRetention(unittest.TestCase):
+    """Verifies returning form ds_min_rtn_i32 pre-atomic value retention and intermediate sequence."""
+
+    def test_ds_min_rtn_i32_single_lane_retention(self):
+        # Initial LDS[2] = 50. Lane supplies -20 (0xFFFFFFEC).
+        # vdst receives pre-atomic value 50.
+        # LDS[2] becomes -20.
+        spvasm = """
+OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main" %out
+OpExecutionMode %main LocalSize 1 1 1
+%uint = OpTypeInt 32 0
+%_ptr_Output_uint = OpTypePointer Output %uint
+%out = OpVariable %_ptr_Output_uint Output
+%c64 = OpConstant %uint 64
+%c2 = OpConstant %uint 2
+%c0 = OpConstant %uint 0
+%c2_slot = OpConstant %uint 2
+%c_neg20 = OpConstant %uint 0xFFFFFFEC
+%lds_arr = OpTypeArray %uint %c64
+%_ptr_WG_lds = OpTypePointer Workgroup %lds_arr
+%_ptr_WG_uint = OpTypePointer Workgroup %uint
+%lds = OpVariable %_ptr_WG_lds Workgroup
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%ptr = OpAccessChain %_ptr_WG_uint %lds %c2_slot
+%old = OpAtomicSMin %uint %ptr %c2 %c0 %c_neg20
+OpStore %out %old
+OpReturn
+OpFunctionEnd
+"""
+        interp = LdsAtomicMinI32Interp(spvasm)
+        final_lds, lane_outs = interp.run(seed_lds={2: 50})
+        self.assertEqual(to_signed_i32(final_lds[2]), -20)
+        self.assertEqual(lane_outs[0]["%out"], 50)
+
+    def test_ds_min_rtn_i32_single_lane_no_change_retention(self):
+        # Initial LDS[2] = -20 (0xFFFFFFEC). Lane supplies +50.
+        # vdst receives pre-atomic value -20.
+        # LDS[2] remains -20.
+        spvasm = """
+OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main" %out
+OpExecutionMode %main LocalSize 1 1 1
+%uint = OpTypeInt 32 0
+%_ptr_Output_uint = OpTypePointer Output %uint
+%out = OpVariable %_ptr_Output_uint Output
+%c64 = OpConstant %uint 64
+%c2 = OpConstant %uint 2
+%c0 = OpConstant %uint 0
+%c2_slot = OpConstant %uint 2
+%c50 = OpConstant %uint 50
+%lds_arr = OpTypeArray %uint %c64
+%_ptr_WG_lds = OpTypePointer Workgroup %lds_arr
+%_ptr_WG_uint = OpTypePointer Workgroup %uint
+%lds = OpVariable %_ptr_WG_lds Workgroup
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%ptr = OpAccessChain %_ptr_WG_uint %lds %c2_slot
+%old = OpAtomicSMin %uint %ptr %c2 %c0 %c50
+OpStore %out %old
+OpReturn
+OpFunctionEnd
+"""
+        interp = LdsAtomicMinI32Interp(spvasm)
+        final_lds, lane_outs = interp.run(seed_lds={2: 0xFFFFFFEC})
+        self.assertEqual(final_lds[2], 0xFFFFFFEC)
+        self.assertEqual(lane_outs[0]["%out"], 0xFFFFFFEC)
+        self.assertEqual(to_signed_i32(lane_outs[0]["%out"]), -20)
+
+    def test_ds_min_rtn_i32_multi_lane_monotonic_intermediate_retention(self):
+        # 8 lanes clash on LDS[0] using returning form.
+        # Initial value in LDS[0] = 100.
+        # Sequence of lane inputs: [80, 90, 60, -10, 40, -50, 0, -100]
+        #
+        # Step-by-step intermediate state:
+        # Lane 0: input 80. Pre-op is 100. LDS becomes min(100, 80) = 80.
+        # Lane 1: input 90. Pre-op is 80. LDS becomes min(80, 90) = 80.
+        # Lane 2: input 60. Pre-op is 80. LDS becomes min(80, 60) = 60.
+        # Lane 3: input -10. Pre-op is 60. LDS becomes min(60, -10) = -10.
+        # Lane 4: input 40. Pre-op is -10. LDS becomes min(-10, 40) = -10.
+        # Lane 5: input -50. Pre-op is -10. LDS becomes min(-10, -50) = -50.
+        # Lane 6: input 0. Pre-op is -50. LDS becomes min(-50, 0) = -50.
+        # Lane 7: input -100. Pre-op is -50. LDS becomes min(-50, -100) = -100.
+        #
+        # Expected outputs per lane: [100, 80, 80, 60, -10, -10, -50, -50]
+        # Final LDS[0]: -100.
+        spvasm = """
+OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main" %out
+OpExecutionMode %main LocalSize 8 1 1
+%uint = OpTypeInt 32 0
+%_ptr_Output_uint = OpTypePointer Output %uint
+%out = OpVariable %_ptr_Output_uint Output
+%c16 = OpConstant %uint 16
+%c2 = OpConstant %uint 2
+%c0 = OpConstant %uint 0
+%c0_slot = OpConstant %uint 0
+%lds_arr = OpTypeArray %uint %c16
+%_ptr_WG_lds = OpTypePointer Workgroup %lds_arr
+%_ptr_WG_uint = OpTypePointer Workgroup %uint
+%lds = OpVariable %_ptr_WG_lds Workgroup
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%ptr = OpAccessChain %_ptr_WG_uint %lds %c0_slot
+%old = OpAtomicSMin %uint %ptr %c2 %c0 %lane_val
+OpStore %out %old
+OpReturn
+OpFunctionEnd
+"""
+        interp = LdsAtomicMinI32Interp(spvasm)
+        seq_inputs = [80, 90, 60, -10, 40, -50, 0, -100]
+        lane_inputs = [{"%lane_val": to_unsigned_u32(v)} for v in seq_inputs]
+
+        final_lds, lane_outs = interp.run(
+            num_invocations=8,
+            seed_lds={0: 100},
+            lane_inputs=lane_inputs,
+        )
+
+        expected_ret_signed = [100, 80, 80, 60, -10, -10, -50, -50]
+        actual_ret_signed = [to_signed_i32(o["%out"]) for o in lane_outs]
+        self.assertEqual(actual_ret_signed, expected_ret_signed)
+        self.assertEqual(to_signed_i32(final_lds[0]), -100)
+
+        # Confirm monotonicity: each returned value is <= the previous
+        for k in range(1, len(actual_ret_signed)):
+            self.assertLessEqual(actual_ret_signed[k], actual_ret_signed[k - 1])
+
+
+class TestNegativeControlsAndErrors(unittest.TestCase):
+    """Verifies bounds enforcement, invalid operands, and error conditions."""
+
+    def test_out_of_bounds_lds_access_raises_bounds_error(self):
+        # Attempt to access dword index 32 on a 32-dword LDS array (valid: 0..31)
+        spvasm = """
+OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+%uint = OpTypeInt 32 0
+%c32 = OpConstant %uint 32
+%c2 = OpConstant %uint 2
+%c0 = OpConstant %uint 0
+%c32_bad = OpConstant %uint 32
+%lds_arr = OpTypeArray %uint %c32
+%_ptr_WG_lds = OpTypePointer Workgroup %lds_arr
+%_ptr_WG_uint = OpTypePointer Workgroup %uint
+%lds = OpVariable %_ptr_WG_lds Workgroup
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%ptr = OpAccessChain %_ptr_WG_uint %lds %c32_bad
+%dummy = OpAtomicSMin %uint %ptr %c2 %c0 %c0
+OpReturn
+OpFunctionEnd
+"""
+        interp = LdsAtomicMinI32Interp(spvasm)
+        with self.assertRaises(WorkgroupBoundsError):
+            interp.run()
+
+    def test_unsupported_spirv_header_opcode_raises(self):
+        spvasm = """
+OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpUnknownHeaderOpcode
+"""
+        with self.assertRaises(UnsupportedConstruct):
+            LdsAtomicMinI32Interp(spvasm)
+
+    def test_unsupported_spirv_body_opcode_raises(self):
+        spvasm = """
+OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%main = OpFunction %void None %fn
+%entry = OpLabel
+OpNonExistentOpcode %uint
+OpReturn
+OpFunctionEnd
+"""
+        interp = LdsAtomicMinI32Interp(spvasm)
+        with self.assertRaises(UnsupportedConstruct):
+            interp.run()
+
+    def test_invalid_localsize_product_exceeds_1024(self):
+        spvasm = """
+OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1025 1 1
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%main = OpFunction %void None %fn
+%entry = OpLabel
+OpReturn
+OpFunctionEnd
+"""
+        with self.assertRaises(WorkgroupBoundsError):
+            LdsAtomicMinI32Interp(spvasm)
+
+    def test_invalid_localsize_zero_dimension(self):
+        spvasm = """
+OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 0 1 1
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%main = OpFunction %void None %fn
+%entry = OpLabel
+OpReturn
+OpFunctionEnd
+"""
+        with self.assertRaises(WorkgroupBoundsError):
+            LdsAtomicMinI32Interp(spvasm)
+
+    def test_unsupported_non_32bit_int(self):
+        spvasm = """
+OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+%int64 = OpTypeInt 64 0
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%main = OpFunction %void None %fn
+%entry = OpLabel
+OpReturn
+OpFunctionEnd
+"""
+        with self.assertRaises(UnsupportedConstruct):
+            LdsAtomicMinI32Interp(spvasm)
+
+    def test_shift_right_amount_out_of_range(self):
+        spvasm = """
+OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+%uint = OpTypeInt 32 0
+%c32 = OpConstant %uint 32
+%c100 = OpConstant %uint 100
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%res = OpShiftRightLogical %uint %c100 %c32
+OpReturn
+OpFunctionEnd
+"""
+        interp = LdsAtomicMinI32Interp(spvasm)
+        with self.assertRaises(UnsupportedConstruct):
+            interp.run()
+
+    def test_shift_left_amount_out_of_range(self):
+        spvasm = """
+OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+%uint = OpTypeInt 32 0
+%c64 = OpConstant %uint 64
+%c100 = OpConstant %uint 100
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%res = OpShiftLeftLogical %uint %c100 %c64
+OpReturn
+OpFunctionEnd
+"""
+        interp = LdsAtomicMinI32Interp(spvasm)
+        with self.assertRaises(UnsupportedConstruct):
+            interp.run()
 
 
 class TestTranslatorSignedMinIntegration(unittest.TestCase):
@@ -1036,6 +1453,20 @@ class TestTranslatorSignedMinIntegration(unittest.TestCase):
         self.assertIn("%c2 %c0 %v_1", emitted_str)
         # Non-returning form must not store any destination register
         self.assertEqual(len(gen.stored_dsts), 0)
+
+    def test_ds_min_rtn_i32_returning_emission(self):
+        gen = self._make_mock_gen(stage="cs")
+        # ds_min_rtn_i32 v7, v1, v2, offset:16 (args: dst=v7, addr=v1, data=v2)
+        gen.lds_op("ds_min_rtn_i32", [{"r": 7}, {"r": 1}, {"r": 2}], ["offset:16"])
+        self.assertTrue(gen.uses_lds)
+        emitted_str = "\n".join(gen.emitted)
+
+        self.assertIn("OpAtomicSMin %uint", emitted_str)
+        self.assertIn("%c2 %c0 %v_2", emitted_str)
+        self.assertEqual(len(gen.stored_dsts), 1)
+        dest_reg, val_id = gen.stored_dsts[0]
+        self.assertEqual(dest_reg["r"], 7)
+        self.assertTrue(val_id.startswith("%t"))
 
     def test_ds_min_i32_outside_compute_raises(self):
         gen = self._make_mock_gen(stage="ps")
