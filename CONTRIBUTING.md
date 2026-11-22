@@ -49,10 +49,10 @@ methods are still open.
 - Tool checks: `python -m compileall -q make_game.py tools tests`. The optional
   `vk_pipeline_check <spirv dir> [cache.bin] [--jobs N]` creates a module (and, for compute shaders, a
   pipeline) for every translated shader and reports failures plus the saved cache path.
-- GPU tests are small hand-written RDNA2 programs in `runtime/test/shaders`. `build.py` there turns them into
-  SPIR-V (it needs `llvm-mc`, so WSL or a Linux container), and `check.py` runs them on your GPU and compares
-  the results. A new test gets its expected values in the comment at its top and a check in `check.py`.
-  [docs/testing.md](docs/testing.md) has the setup per OS and the problems testers have run into.
+- GPU tests are small hand-written RDNA2 programs in `runtime/test/shaders`. `build.py` turns them into SPIR-V
+  using `llvm-mc` with the AMDGPU target (LLVM 21+). `check.py` runs them on your GPU and compares the results.
+  A new test gets its expected values in the comment at its top and a check in `check.py`.
+  [docs/testing.md](docs/testing.md) covers setup per OS, including native Windows options, and known problems.
 - Say what you tested and on which GPU in the pull request.
 - Run the translator tests with `python -m unittest discover -s tests/semantic -v` (see `tests/semantic/README.md`). A new
   translator rule should come with a small hand-written `.asm` fixture and its expected output words.
