@@ -416,6 +416,16 @@ Measured over the 630 clouds:
   `Density` within -100..100 (median 0.5) and `FogHeight` within -100..300: signed values, so these act as
   offsets or overrides with a sign, not plain amounts.
 
+The cloud renderer's settings sit in one `STS_Config` document with 44 top-level sections: four cloud layers
+(`Nimbus`, `Cumulus`, `Stratus`, `Alto`) that share one set of 13 fields (noise weights and blends, erosion,
+density, lighting and multi-scattering density scale, shape fade, transition and altitude ranges, dilation,
+noise displacement); six media (`GlobalFog`, `LocalFog`, `Rain`, `Clouds`, `CloudsCirrus`, `CloudsHaze`) that
+share another set of 9; and 34 single-value or vector settings. Of the five cloud flags above, `Cumulus` and
+`Stratus` match a layer name, `Nimbus0`/`Nimbus1` would both fall on the one `Nimbus` layer, and
+`CirroStratus` has no layer of its own (`CloudsCirrus` is a medium, not a layer). The weather data's
+`CloudType` is fractional (14 distinct values from 0.01 to 0.67 over the 25 weathers), so it is a blend
+position rather than an index into these layers.
+
 Not measured here (hypothesis): how a cloud's radius range blends with the weather's `CloudType` and cloud maps,
 what a negative `Rain`/`Fog`/`Density` means (subtracting from the weather, or "unset"), and what the two
 `Nimbus` flags distinguish.
