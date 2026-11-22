@@ -2,6 +2,7 @@
 // Compare typed RTVs on one typeless RGBA8 resource against Windows D3D12/WARP.
 // No game data or shaders. Run explicitly (needs Vulkan hardware); LEONIDA_VK_VALIDATION=1 checks Vulkan usage.
 #include "vk_test_device.h"
+#include "host_wine.h"
 #include "../shims/d3d12_com.h"
 #include <dxgi1_4.h>
 #include <algorithm>
@@ -255,6 +256,7 @@ int main() {
         info.conditional_rendering = vk.conditional_rendering;
         info.storage_buffer_8bit = vk.storage_buffer_8bit;
         if (FAILED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&ours.p)))) return 1;
+        if (hostwine::host_is_wine()) return 77;  // WARP is the reference for the readbacks
         Ref<IDXGIFactory4> factory;
         Ref<IDXGIAdapter> warp;
         if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory.p))) ||

@@ -68,9 +68,9 @@ The port isn't downloaded ready-made. It's built on your PC from your own copy.
    and otherwise tells you what to do.
 3. Double-click **`Build.bat`**.
 
-It finds your copy of the game by itself: it looks in Downloads, Desktop, Documents, Games, your home folder and
-the top of every drive, two folders deep. It recognises the version from a few file sizes, without reading
-anything large. If you have more than one copy it asks which one, and if it finds none it asks you to paste the
+It finds your copy of the game by itself: it looks in Downloads, Desktop, Documents (also where Windows keeps them,
+such as in OneDrive), Games, your home folder and the top of every drive, two folders deep. It recognises the
+version from a few file sizes, without reading anything large. If you have more than one copy it asks which one, and if it finds none it asks you to paste the
 folder. Before starting it checks that everything below is installed and that there is enough free space, and it
 lists anything missing in one go. The result goes to `Documents\Leonida`. A stopped build continues where it left
 off.
@@ -97,7 +97,9 @@ Your game folder is the one that holds `MicrosoftGame.Config` and the `.rpf` arc
 
 ```powershell
 python -I make_game.py --find                          # list the copies found on this PC
+python -I make_game.py --pick                          # choose the game folder in a folder dialog
 python -I make_game.py --check                         # check your copy, build nothing
+python -I make_game.py --check --full-check            # also compare SHA-256 of every file (slow)
 python -I make_game.py --game "D:\path\to\your\package" --out "D:\Games\Leonida" --work "E:\leonida-work"
 python -I make_game.py --stages shaders,assets         # only some stages
 python -I make_game.py --game "D:\path\to\your\package" --wav   # also decode Opus to PCM WAV (large)
@@ -152,7 +154,7 @@ Pass the directory containing `index.json` and the translated SPIR-V files to `v
 
 The loader is a Windows program and runs under Wine or Proton; CI runs its tests under Wine on every change to
 `runtime/` (the `wine` job of the Runtime workflow). On Linux the `runtime` stage cross-builds it into
-`runtime/build/windows` with clang-cl and lld-link (LLVM 19+; plain names, or all five LLVM tools with one version
+`runtime/build/windows` with clang-cl and lld-link (LLVM 19+, but not 22.1.7 or 22.1.8, see [docs/testing.md](docs/testing.md#known-problems); plain names, or all five LLVM tools with one version
 suffix such as `clang-cl-21`) against the MSVC CRT and Windows SDK that
 [xwin](https://github.com/Jake-Shadle/xwin) lays out, in `XWIN_DIR` or `~/.local/share/xwin-sdk`
 ([docs/testing.md](docs/testing.md#the-windows-runtime-on-linux-under-wine-or-proton) has the one-time `xwin`
