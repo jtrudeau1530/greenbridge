@@ -254,6 +254,25 @@ class ArgumentTest(unittest.TestCase):
         return subprocess.run([sys.executable, "-I", TOOL, *args, "--quiet"],
                               capture_output=True, text=True, encoding="utf-8", errors="replace")
 
+    def test_negative_string_count_fails_before_an_index_is_written(self):
+        carve = os.path.join(self.root, "carve")
+        os.mkdir(carve)
+        blob = WIDE + _open(0, b"TestRoot")
+        blob += _value(1, 0x60, _name(b"a"), b"label")
+        blob += _value(1, 0x60, _name(b"b"))
+        blob += _value(1, 0x60, _name(b"c"))
+        blob += b"\xff\xff"
+        with open(os.path.join(carve, "00000000.bin"), "wb") as f:
+            f.write(blob)
+        out = os.path.join(self.root, "out.json")
+
+        p = self.run_tool(carve, out, "--strings", "-1")
+        self.assertEqual(p.returncode, 2, p.stderr)
+        self.assertIn("--strings", p.stderr)
+        self.assertIn("must be 0 or more", p.stderr)
+        self.assertEqual(len(p.stderr.splitlines()), 1)
+        self.assertFalse(os.path.exists(out))
+
     def test_missing_source_is_an_error_not_a_traceback(self):
         out = os.path.join(self.root, "missing.json")
         p = self.run_tool(os.path.join(self.root, "nope.rpf"), out)
