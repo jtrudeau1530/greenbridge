@@ -115,12 +115,11 @@ class ShortsTest(unittest.TestCase):
         self.assertTrue(rows[0]["file"].endswith("00001234.ogg"))
 
     def test_rejects_nonpositive_job_counts(self):
-        path = self.write("cli.awc", 0xFC, 480000)
         for jobs in ("0", "-1"):
             with self.subTest(jobs=jobs):
                 stderr = io.StringIO()
                 with contextlib.redirect_stderr(stderr), contextlib.redirect_stdout(io.StringIO()):
-                    self.assertEqual(shorts.main([path, self.out, "--jobs", jobs]), 2)
+                    self.assertEqual(shorts.main([self.tmp.name, self.out, "--jobs", jobs]), 2)
                 self.assertIn("--jobs must be at least 1", stderr.getvalue())
                 self.assertFalse(os.path.exists(self.out))
 
