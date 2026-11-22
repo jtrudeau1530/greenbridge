@@ -1204,8 +1204,11 @@ def _write_json_atomic(path: str, data: dict, replace=None) -> None:
         raise
 
 
-# Cell coordinates are written as decimal integers, without leading zeros.
-_CHUNK_FILE_RE = re.compile(r"c_(?:0|-?[1-9][0-9]*)_(?:0|-?[1-9][0-9]*)\.glb(?:\.tmp)?")
+# Cell coordinates are written as decimal integers, without leading zeros; --lod-sets prefixes the tier name.
+_LOD_TIER_PATTERN = "|".join(re.escape(name) for name in LOD_TIER_NAMES.values())
+_CHUNK_FILE_RE = re.compile(
+    rf"c_(?:(?:{_LOD_TIER_PATTERN})_)?(?:0|-?[1-9][0-9]*)_(?:0|-?[1-9][0-9]*)\.glb(?:\.tmp)?"
+)
 
 
 def _prune_stale_chunks(chunks_dir: str, keep_filenames: set[str]) -> None:
