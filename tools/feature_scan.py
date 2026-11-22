@@ -24,6 +24,9 @@ import struct
 import sys
 from collections import Counter, defaultdict
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from shader_carve import parts as dxbc_part_ranges  # noqa: E402
+
 # d3d12shader.h (Windows SDK 10.0.26100.0), D3D_SHADER_REQUIRES_*: the SFI0 part is this 64-bit mask.
 SFI0_FLAGS = {
     0x1: "DOUBLES", 0x2: "EARLY_DEPTH_STENCIL", 0x4: "UAVS_AT_EVERY_STAGE", 0x8: "64_UAVS",
@@ -50,16 +53,16 @@ MMA = re.compile(r"^\s*(v_mfma\w*|v_wmma\w*|v_smfmac\w*)\b")
 # ds_consume are included as the other counter-style DS ops (LDS unless they carry `gds`, which GDS below catches).
 ORDERED = re.compile(r"^\s*(ds_ordered_count|ds_gws_\w+|ds_append|ds_consume|ds_add_gs_reg\w*|ds_sub_gs_reg\w*)\b")
 GDS = re.compile(r"^\s*ds_\w+\b[^;]*\bgds\b")
+REG_SINGLE = re.compile(r"^([sv])(\d+)$")
+REG_RANGE = re.compile(r"^([sv])\[(\d+):(\d+)\]$")
+CONST_MOV_OPS = frozenset(("s_mov_b32", "s_mov_b32_e32", "v_mov_b32", "v_mov_b32_e32", "v_mov_b32_e64"))
 
 
 def parts(d: bytes) -> dict:
     """DXBC part fourcc -> payload."""
-    out = {}
-    for k in range(struct.unpack_from("<I", d, 28)[0]):
-        off = struct.unpack_from("<I", d, 32 + 4 * k)[0]
-        size = struct.unpack_from("<I", d, off + 4)[0]
-        out[d[off:off + 4].decode("latin-1")] = d[off + 8:off + 8 + size]
-    return out
+    if not d.startswith(b"DXBC"):
+        raise ValueError("missing DXBC magic")
+    return {tag: d[off:off + size] for tag, (off, size) in dxbc_part_ranges(d).items()}
 
 
 def streams(sig: bytes) -> set:
@@ -77,6 +80,11 @@ def streams(sig: bytes) -> set:
     return {struct.unpack_from("<I", sig, first + 32 * i)[0] for i in range(count)}
 
 
+def stage_name(row: dict) -> str:
+    stage = row.get("stage")
+    return stage if isinstance(stage, str) and stage else "?"
+
+
 def scan_dxbc(dxbc_dir: str, index: list) -> dict:
     stages = Counter()
     flags = defaultdict(Counter)  # flag -> stage -> shaders
@@ -84,13 +92,20 @@ def scan_dxbc(dxbc_dir: str, index: list) -> dict:
     non_zero_stream = Counter()  # stage -> shaders with an output element on a stream other than 0
     missing = 0
     for e in index:
-        stage = e.get("stage") or "?"
+        if not isinstance(e, dict):
+            missing += 1
+            continue
+        stage = stage_name(e)
         stages[stage] += 1
-        path = os.path.join(dxbc_dir, e["file"])
+        filename = e.get("file")
+        if not isinstance(filename, str) or not filename:
+            missing += 1
+            continue
+        path = os.path.join(dxbc_dir, filename)
         try:
             with open(path, "rb") as f:
                 p = parts(f.read())
-        except (OSError, struct.error):
+        except (OSError, ValueError):
             missing += 1
             continue
         if len(p.get("SFI0", b"")) >= 8:
@@ -115,22 +130,95 @@ def getpc_for_data(ops: list) -> bool:
     return any(op == "s_getpc_b64" and "s_setpc_b64" not in ops[i + 1:i + 4] for i, op in enumerate(ops))
 
 
+def _parse_imm(tok: str):
+    """Parse a decimal or 0x-hex integer immediate, or return None."""
+    try:
+        return int(tok, 0) & 0xFFFFFFFF
+    except ValueError:
+        return None
+
+
+def _written_regs(tok: str) -> list:
+    """Return individual sN/vN register names covered by a destination operand token."""
+    m = REG_SINGLE.match(tok)
+    if m:
+        return [tok]
+    m = REG_RANGE.match(tok)
+    if m:
+        prefix, lo, hi = m.group(1), int(m.group(2)), int(m.group(3))
+        if lo <= hi <= lo + 32:
+            return [f"{prefix}{i}" for i in range(lo, hi + 1)]
+    return []
+
+
+def _update_const_regs(const_reg: dict, op: str, operands: list) -> None:
+    """Track single-register immediate loads and invalidate any destination register written."""
+    if not operands:
+        return
+    dst = operands[0].split()[0] if operands[0].split() else ""
+    if op in CONST_MOV_OPS and len(operands) >= 2 and REG_SINGLE.match(dst):
+        src_tok = operands[1].split()[0] if operands[1].split() else ""
+        imm = _parse_imm(src_tok)
+        if imm is not None:
+            const_reg[dst] = imm
+            return
+    for r in _written_regs(dst):
+        const_reg.pop(r, None)
+
+
 def scan_disasm(disasm_dir: str, stage_of: dict) -> dict:
     mma, ordered, gds, code_data = Counter(), Counter(), Counter(), Counter()
     mma_ops, ordered_ops = Counter(), Counter()
+    vperm_shaders = Counter()
+    vperm_insns = vperm_imm = vperm_creg = vperm_unres = 0
+    vperm_sext_shaders = vperm_sext_insns = 0
+    vperm_classes = {"0_7": 0, "8_11": 0, "12": 0, "13_plus": 0}
     files = 0
     for fn in os.listdir(disasm_dir):
         if not fn.endswith(".s"):
             continue
         files += 1
         stage = stage_of.get(fn[:-2], "?")
-        seen_mma = seen_ord = seen_gds = False
+        seen_mma = seen_ord = seen_gds = seen_vperm = seen_vperm_sext = False
         ops = []
+        const_reg = {}
         with open(os.path.join(disasm_dir, fn), encoding="utf-8", errors="replace") as f:
             for line in f:
-                head = line.split(None, 1)
-                if head and not head[0].startswith((";", ".")):
-                    ops.append(head[0])
+                code = line.split(";", 1)[0].strip()
+                head = code.split(None, 1)
+                if head and not head[0].startswith("."):
+                    op = head[0]
+                    ops.append(op)
+                    operands = [x.strip() for x in head[1].split(",")] if len(head) > 1 else []
+                    if op in ("v_perm_b32", "v_perm_b32_e64") and len(operands) >= 4:
+                        seen_vperm = True
+                        vperm_insns += 1
+                        sel_tok = operands[3].split()[0] if operands[3].split() else ""
+                        sel_val = _parse_imm(sel_tok)
+                        if sel_val is not None:
+                            vperm_imm += 1
+                        elif sel_tok in const_reg:
+                            sel_val = const_reg[sel_tok]
+                            vperm_creg += 1
+                        else:
+                            vperm_unres += 1
+                        if sel_val is not None:
+                            has_sext = False
+                            for shift in (0, 8, 16, 24):
+                                b = (sel_val >> shift) & 0xFF
+                                if b <= 7:
+                                    vperm_classes["0_7"] += 1
+                                elif b <= 11:
+                                    vperm_classes["8_11"] += 1
+                                    has_sext = True
+                                elif b == 12:
+                                    vperm_classes["12"] += 1
+                                else:
+                                    vperm_classes["13_plus"] += 1
+                            if has_sext:
+                                vperm_sext_insns += 1
+                                seen_vperm_sext = True
+                    _update_const_regs(const_reg, op, operands)
                 m = MMA.match(line)
                 if m:
                     mma_ops[m.group(1)] += 1
@@ -144,22 +232,41 @@ def scan_disasm(disasm_dir: str, stage_of: dict) -> dict:
         mma[stage] += seen_mma
         ordered[stage] += seen_ord
         gds[stage] += seen_gds
+        vperm_shaders[stage] += seen_vperm
+        vperm_sext_shaders += int(seen_vperm_sext)
         code_data[stage] += getpc_for_data(ops)
     nz = lambda c: {k: v for k, v in c.items() if v}
     return {"files": files, "wave_mma_shaders": nz(mma), "wave_mma_ops": dict(mma_ops),
             "ordered_or_gws_shaders": nz(ordered), "ordered_or_gws_ops": dict(ordered_ops), "gds_shaders": nz(gds),
-            "getpc_for_data_shaders": nz(code_data)}
+            "getpc_for_data_shaders": nz(code_data),
+            "v_perm_b32": {
+                "shaders": nz(vperm_shaders),
+                "insns": vperm_insns,
+                "immediate": vperm_imm,
+                "const_reg": vperm_creg,
+                "unresolved": vperm_unres,
+                "sign_extend_8_11_shaders": vperm_sext_shaders,
+                "sign_extend_8_11_insns": vperm_sext_insns,
+                "selector_classes": vperm_classes,
+            }}
 
 
 def scan_spirv(spirv_index: str) -> dict:
     with open(spirv_index, encoding="utf-8") as f:
         idx = json.load(f)
-    entries = idx.values() if isinstance(idx, dict) else idx
+    # An object maps shader names to rows; a list is the other accepted shape. A scalar is a
+    # broken index, not something to iterate -- report no translated shaders for it.
+    if isinstance(idx, dict):
+        entries = idx.values()
+    elif isinstance(idx, list):
+        entries = idx
+    else:
+        entries = ()
     total, code_base = Counter(), Counter()
     for m in entries:
         if not isinstance(m, dict):
             continue
-        stage = m.get("stage", "?")
+        stage = stage_name(m)
         total[stage] += 1
         code_base[stage] += bool(m.get("uses_code_base"))
     return {"translated": dict(total), "uses_code_base": {k: v for k, v in code_base.items() if v}}
@@ -172,17 +279,41 @@ def main() -> int:
     a = ap.parse_args()
 
     dxbc_dir = os.path.join(a.shaders, "dxbc")
-    with open(os.path.join(dxbc_dir, "index.json"), encoding="utf-8") as f:
-        index = json.load(f)
+    index_path = os.path.join(dxbc_dir, "index.json")
+    if not os.path.isdir(a.shaders):
+        what = "is not a folder" if os.path.exists(a.shaders) else "does not exist"
+        print(f"ERROR: {a.shaders} {what}. Give the <work>/shaders folder make_game.py writes.", file=sys.stderr)
+        return 2
+    if not os.path.isfile(index_path):
+        print(f"ERROR: {index_path} is missing. Run the shaders stage of make_game.py first.", file=sys.stderr)
+        return 2
+    try:
+        with open(index_path, encoding="utf-8") as f:
+            index = json.load(f)
+    except (OSError, ValueError) as e:
+        print(f"ERROR: cannot read {index_path}: {getattr(e, 'strerror', None) or e}", file=sys.stderr)
+        return 2
+    if not isinstance(index, list):
+        print(f"ERROR: {index_path} is not a shader list. Run the shaders stage of make_game.py again.",
+              file=sys.stderr)
+        return 2
     result = {"shaders": len(index), "dxbc": scan_dxbc(dxbc_dir, index)}
-    stage_of = {os.path.splitext(e["file"])[0]: e.get("stage") or "?" for e in index}
-    stage_of |= {e["name"]: e.get("stage") or "?" for e in index}
+    # Original names can be shared by variants, so indexed filenames take precedence.
+    # Non-object rows are already counted as unreadable by scan_dxbc; skip them here too.
+    rows = [e for e in index if isinstance(e, dict)]
+    stage_of = {e["name"]: stage_name(e) for e in rows if isinstance(e.get("name"), str)}
+    stage_of |= {os.path.splitext(e["file"])[0]: stage_name(e)
+                 for e in rows if isinstance(e.get("file"), str)}
     disasm = os.path.join(dxbc_dir, "disasm")
     if os.path.isdir(disasm):
         result["disasm"] = scan_disasm(disasm, stage_of)
     spirv = os.path.join(a.shaders, "spirv", "index.json")
     if os.path.isfile(spirv):
-        result["spirv"] = scan_spirv(spirv)
+        try:
+            result["spirv"] = scan_spirv(spirv)
+        except (OSError, ValueError) as e:
+            print(f"ERROR: cannot read {spirv}: {getattr(e, 'strerror', None) or e}", file=sys.stderr)
+            return 2
 
     d = result["dxbc"]
     print(f"{result['shaders']} shaders")
@@ -197,6 +328,11 @@ def main() -> int:
         print(f"disasm: {s['files']} files | wave MMA shaders {s['wave_mma_shaders'] or 0} | ordered-count/GWS shaders "
               f"{s['ordered_or_gws_shaders'] or 0} {s['ordered_or_gws_ops'] or ''} | GDS shaders {s['gds_shaders'] or 0}")
         print("s_getpc_b64 used for code-embedded data (not a far branch), by stage:", s["getpc_for_data_shaders"] or 0)
+        vp = s["v_perm_b32"]
+        print(f"v_perm_b32: {sum(vp['shaders'].values())} shaders {vp['shaders'] or 0} | {vp['insns']} insns "
+              f"(imm {vp['immediate']}, const_reg {vp['const_reg']}, unresolved {vp['unresolved']}) | "
+              f"selectors 8-11: {vp['sign_extend_8_11_shaders']} shaders / {vp['sign_extend_8_11_insns']} insns | "
+              f"bytes {vp['selector_classes']}")
     else:
         print("disasm: not there yet (run the shaders stage)")
     if "spirv" in result:
@@ -207,10 +343,17 @@ def main() -> int:
     if d["unreadable"]:
         print(f"{d['unreadable']} .dxbc files could not be read")
     if a.out:
+        folder = os.path.dirname(a.out)  # --out into a folder that does not exist yet, as awc_manifest.py does
+        if folder:
+            os.makedirs(folder, exist_ok=True)
         with open(a.out, "w", encoding="utf-8") as f:
             json.dump(result, f, indent=1)
     return 0
 
 
 if __name__ == "__main__":
+    try:  # a redirected stdout is strict ANSI code page under -I; write '?' for what it cannot encode
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
     sys.exit(main())

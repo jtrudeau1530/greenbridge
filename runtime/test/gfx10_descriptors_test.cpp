@@ -205,6 +205,8 @@ int main() {
     CHECK(vulkan_view_format(VK_FORMAT_D32_SFLOAT, 22) == VK_FORMAT_D32_SFLOAT);
     CHECK(vulkan_view_format(VK_FORMAT_BC1_RGBA_UNORM_BLOCK, 170) == VK_FORMAT_BC1_RGBA_SRGB_BLOCK);
     CHECK(vulkan_view_format(VK_FORMAT_R8G8B8A8_UNORM, 22) == VK_FORMAT_UNDEFINED);
+    CHECK(vulkan_view_format(VK_FORMAT_R8G8B8A8_UNORM, 22, true) == VK_FORMAT_R32_SFLOAT);
+    CHECK(vulkan_view_format(VK_FORMAT_R8G8B8A8_UINT, 20, true) == VK_FORMAT_R32_UINT);
     CHECK(vulkan_view_format(VK_FORMAT_UNDEFINED, 56) == VK_FORMAT_UNDEFINED);
 
     // DST_SEL as a component mapping.
@@ -234,6 +236,8 @@ int main() {
     CHECK((one_field({.max_anisotropy = 0}) == SamplerWords{0, 0, 0, 0}));
     CHECK((one_field({.compare = CompareFunction::less_equal}) == SamplerWords{3u << 12, 0, 0, 0}));
     CHECK((one_field({.compare = CompareFunction::always}) == SamplerWords{7u << 12, 0, 0, 0}));
+    CHECK((one_field({.compare_never = true}) == SamplerWords{0, 0, 0, 1u << 12}));
+    CHECK(!decode(SamplerWords{0, 0, 1u << 31, 1u << 12}).compare_never);  // alternate WORD3 layout
     CHECK((one_field({.unnormalized = true}) == SamplerWords{1u << 15, 0, 0, 0}));  // FORCE_UNNORMALIZED
     CHECK((one_field({.filter_mode = FilterMode::maximum}) == SamplerWords{2u << 29, 0, 0, 0}));
     CHECK((one_field({.min_lod = 1.5f}) == SamplerWords{0, 0x180, 0, 0}));          // MIN_LOD, 4.8 fixed
@@ -298,6 +302,9 @@ int main() {
     CHECK(info.borderColor == VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE && info.anisotropyEnable == VK_FALSE);
     // MIP_FILTER_NONE: the base level only.
     CHECK(info.mipmapMode == VK_SAMPLER_MIPMAP_MODE_NEAREST && info.minLod == 0.0f && info.maxLod == 0.25f);
+    CHECK(vulkan_sampler({.lod_bias = -32.0f}, 15.0f).mipLodBias == -15.0f);
+    CHECK(vulkan_sampler({.lod_bias = 31.0f}, 15.0f).mipLodBias == 15.0f);
+    CHECK(vulkan_sampler({.lod_bias = 2.25f}, 15.0f).mipLodBias == 2.25f);
     info = vulkan_sampler(point);
     CHECK(info.magFilter == VK_FILTER_NEAREST && info.mipmapMode == VK_SAMPLER_MIPMAP_MODE_NEAREST);
     CHECK(info.addressModeV == VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE && info.mipLodBias == -0.75f);
@@ -313,6 +320,20 @@ int main() {
     CHECK(info.borderColor == VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK);
     info = vulkan_sampler({.border_color = BorderColor::table});  // the colour is not in the S#
     CHECK(info.borderColor == VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK);
+    // An integer border: the layer's mark in BORDER_COLOR_PTR, which the hardware reads only for a table colour.
+    for (const auto [type, want] : {std::pair{BorderColor::transparent_black, VK_BORDER_COLOR_INT_TRANSPARENT_BLACK},
+                                    std::pair{BorderColor::opaque_black, VK_BORDER_COLOR_INT_OPAQUE_BLACK},
+                                    std::pair{BorderColor::opaque_white, VK_BORDER_COLOR_INT_OPAQUE_WHITE}}) {
+        const Sampler integer{.border_color = type, .integer_border = true};
+        const SamplerWords words = encode(integer);
+        CHECK(words[3] == ((std::uint32_t(type) << 30) | kIntegerBorderPtr));
+        CHECK(decode(words) == integer && vulkan_sampler(integer).borderColor == want);
+        CHECK(words != encode(Sampler{.border_color = type}));  // its own key, apart from the float border
+    }
+    // Not for a table colour, whose pointer is its index.
+    CHECK((encode({.border_color = BorderColor::table, .border_color_index = 5, .integer_border = true}) ==
+           SamplerWords{0, 0, 0, (3u << 30) | 5}));
+    CHECK(!decode(SamplerWords{0, 0, 0, (3u << 30) | kIntegerBorderPtr}).integer_border);
     CHECK(vulkan_reduction_mode(FilterMode::blend) == VK_SAMPLER_REDUCTION_MODE_WEIGHTED_AVERAGE);
     CHECK(vulkan_reduction_mode(FilterMode::minimum) == VK_SAMPLER_REDUCTION_MODE_MIN);
     CHECK(vulkan_reduction_mode(FilterMode::maximum) == VK_SAMPLER_REDUCTION_MODE_MAX);

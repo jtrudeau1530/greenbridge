@@ -13,6 +13,8 @@ is reported as `raw:<hex>` instead of being guessed.
 Usage:
     python -I story_index.py <archive.rpf> <out.csv|out.json> [--start N] [--limit BYTES] [--quiet]
     python -I story_index.py <carved-dir> <out.csv|out.json> [--quiet]
+
+--start and --limit apply to a single archive only; with a directory they are an error (exit 2).
 """
 import argparse
 import csv
@@ -20,6 +22,7 @@ import json
 import mmap
 import os
 import re
+import stat
 import struct
 import sys
 import time
@@ -169,15 +172,15 @@ def scan_rpf(path, start=None, limit=None, progress=None):
                 break
             s = match.start()
             if m[s:s + 3] == b"KB2":
-                blen = (_u32(m, s + 4) or 0) + 8
-                w, h = _u32(m, s + 0x14), _u32(m, s + 0x18)
-                if not (64 <= blen <= size - s and w and h and 16 <= w <= 8192 and 16 <= h <= 8192):
+                head = m[s:min(s + 0x20, end)]
+                blen = (_u32(head, 4) or 0) + 8
+                w, h = _u32(head, 0x14), _u32(head, 0x18)
+                if not (64 <= blen <= end - s and w and h and 16 <= w <= 8192 and 16 <= h <= 8192):
                     pos = s + 1
                     continue
                 z, u = _gap(m[last:s])
                 zero += z
                 unread += u
-                head = m[s:s + min(blen, 0x20)]
                 record = classify(head, s, blen)
                 record["size"] = blen
                 rows.append(record)
@@ -186,8 +189,8 @@ def scan_rpf(path, start=None, limit=None, progress=None):
             d = zlib.decompressobj()
             chunks, p = [], s
             try:
-                while not d.eof and p < size:
-                    block = m[p:p + (1 << 20)]
+                while not d.eof and p < end:
+                    block = m[p:min(p + (1 << 20), end)]
                     chunks.append(d.decompress(block))
                     p += len(block)   # advance by the actual slice, not the requested 1 MiB
                     if d.unused_data or d.eof:
@@ -219,13 +222,24 @@ def scan_rpf(path, start=None, limit=None, progress=None):
     return rows, summary
 
 
-def scan_dir(path, progress=None):
-    """Index already-carved files. An offset is taken from a leading hexadecimal file name when possible."""
+def scan_dir(path, progress=None, output=None):
+    """Index carved files, excluding the output report. Use leading hex digits for offsets when possible."""
     entries = []
     t0 = time.time()
+    try:
+        report = os.stat(output) if output is not None else None
+    except FileNotFoundError:
+        report = None
     for name in sorted(os.listdir(path)):
         full = os.path.join(path, name)
-        if not os.path.isfile(full):
+        try:
+            info = os.stat(full)
+        except OSError:
+            continue
+        if not stat.S_ISREG(info.st_mode) or (report is not None and os.path.samestat(info, report)):
+            continue
+        # rpf9_carve.py's index.json and any .csv report sit next to the streams; they are not payloads.
+        if name.lower().endswith((".json", ".csv")):
             continue
         with open(full, "rb") as f:
             data = f.read()
@@ -301,35 +315,75 @@ def offset(text):
     return value
 
 
-def main():
+def same_output_path(first, second):
+    """True when writing ``second`` would truncate ``first`` (same file, path or hard link)."""
+    if os.path.normcase(os.path.realpath(first)) == os.path.normcase(os.path.realpath(second)):
+        return True
+    try:
+        return os.path.samefile(first, second)
+    except OSError:
+        return False
+
+
+def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("source", help="an .rpf archive or a directory of carved .bin files")
     ap.add_argument("out", help="output path ending in .csv or .json")
     ap.add_argument("--start", type=offset, help="first byte to scan (default: the RPF data start)")
     ap.add_argument("--limit", type=byte_count, help="number of bytes to scan")
     ap.add_argument("--quiet", action="store_true")
-    a = ap.parse_args()
+    a = ap.parse_args(argv)
+    if os.path.isdir(a.source) and (a.start is not None or a.limit is not None):
+        ap.error("--start and --limit apply to a single archive, not a directory")
+    if os.path.isdir(a.out):
+        ap.error(f"{a.out} is a folder, not a .csv or .json file")
+    if os.path.splitext(a.out)[1].lower() not in (".json", ".csv"):
+        ap.error("output must end in .json or .csv")
+    if same_output_path(a.source, a.out):
+        ap.error("output must not overwrite the source")
     if os.path.isdir(a.source):
-        rows, summary = scan_dir(a.source)
-    else:
-        def progress(n, pos, end):
-            if not a.quiet:
-                print(f"[{pos / max(1, end):6.1%}] {n} streams", flush=True)
-        try:
+        manifest = os.path.join(a.source, "index.json")
+        if os.path.isfile(manifest) and same_output_path(manifest, a.out):
+            ap.error(f"output would overwrite the carve manifest: {a.out}")
+        if os.path.isfile(a.out):
+            for name in os.listdir(a.source):
+                inp = os.path.join(a.source, name)
+                if os.path.isfile(inp) and not name.lower().endswith((".json", ".csv")):
+                    if same_output_path(inp, a.out):
+                        ap.error(f"output would overwrite an input file: {a.out}")
+    folder = os.path.dirname(os.path.abspath(a.out))
+    if not os.path.isdir(folder):
+        ap.error(f"{folder} is not a folder, so {a.out} cannot be written")
+    try:
+        if os.path.isdir(a.source):
+            rows, summary = scan_dir(a.source, output=a.out)
+        else:
+            def progress(n, pos, end):
+                if not a.quiet:
+                    print(f"[{pos / max(1, end):6.1%}] {n} streams", flush=True)
             rows, summary = scan_rpf(a.source, a.start, a.limit, progress)
-        except (OSError, ValueError) as e:
-            print(f"{a.source}: {e}", file=sys.stderr)
-            return 2
-    write_output(a.out, rows, summary)
-    top = dict(sorted(summary["signatures"].items(), key=lambda kv: -kv[1]["files"])[:15])
-    print(json.dumps({k: summary[k] for k in
-                      ("files", "compressed_bytes", "inflated_bytes", "zero_padding", "unread_bytes",
-                       "span", "readable_fraction", "bink2_files", "elapsed_seconds")}, indent=1))
-    print(f"{len(summary['signatures'])} signature classes; top 15:")
-    for name, counts in top.items():
-        print(f"  {name:24} {counts['files']:6} files {counts['stored']:12} stored {counts['inflated']:12} inflated")
+    except (OSError, ValueError) as e:
+        print(f"{a.source}: {e}", file=sys.stderr)
+        return 2
+    try:
+        write_output(a.out, rows, summary)
+    except OSError as e:
+        print(f"{a.out}: {e.strerror or e}", file=sys.stderr)
+        return 2
+    if not a.quiet:
+        top = dict(sorted(summary["signatures"].items(), key=lambda kv: -kv[1]["files"])[:15])
+        print(json.dumps({k: summary[k] for k in
+                          ("files", "compressed_bytes", "inflated_bytes", "zero_padding", "unread_bytes",
+                           "span", "readable_fraction", "bink2_files", "elapsed_seconds")}, indent=1))
+        print(f"{len(summary['signatures'])} signature classes; top 15:")
+        for name, counts in top.items():
+            print(f"  {name:24} {counts['files']:6} files {counts['stored']:12} stored {counts['inflated']:12} inflated")
     return 0
 
 
 if __name__ == "__main__":
+    try:  # a redirected stdout is strict ANSI code page under -I; write '?' for what it cannot encode
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
     sys.exit(main())

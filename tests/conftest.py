@@ -136,7 +136,8 @@ GS_TRI_DXBC = make_dxbc([signature_chunk(b"ISG1", [(0, 1, 0xF), (1, 0, 0xF)]),  
 MS_TRI_DXBC = make_dxbc([mesh_psv0_chunk()])                                          # 128 threads, 64/64, triangles
 MS_CLIP_DXBC = make_dxbc([mesh_psv0_chunk(),
                           signature_chunk(b"OSG1", [(0, 1, 0xF), (1, 2, 0x1)])])      # SV_Position + SV_ClipDistance.x
-SAMPLE_DXBC = {"gs_tri": GS_TRI_DXBC, "ms_tri": MS_TRI_DXBC, "ms_clip": MS_CLIP_DXBC,
+SAMPLE_DXBC = {"gs_tri": GS_TRI_DXBC, "ms_tri": MS_TRI_DXBC, "ms_clip": MS_CLIP_DXBC, "ms_wave_info_s3": MS_TRI_DXBC,
+               "ms_w64x_ballot": MS_TRI_DXBC,
                "ms_v5_workgroup": make_dxbc([mesh_psv0_chunk(threads=(32, 1, 1), max_vertices=3,
                                                            max_primitives=1, group_shared=128)])}
 
@@ -193,7 +194,15 @@ class Shader:
         r = subprocess.run(["spirv-as", str(sa), "-o", str(sv), "--target-env", "vulkan1.2"],
                            capture_output=True, text=True)
         assert r.returncode == 0, "spirv-as: " + r.stderr
-        r = subprocess.run(["spirv-val", "--target-env", "vulkan1.2", str(sv)], capture_output=True, text=True)
+        val = ["spirv-val", "--target-env", "vulkan1.2"]
+        r = subprocess.run(val + [str(sv)], capture_output=True, text=True)
+        if r.returncode != 0 and "Offset can only be used with OpImage*Gather" in r.stderr:
+            # image_sample*_o (sample ps_texoff.asm): a non-constant Offset outside gather is VK_KHR_maintenance8, and
+            # rdna2spirv.py validates with this flag (docs/design.md, "Texel offsets"). A spirv-val from before
+            # maintenance8 prints its usage text for the flag it doesn't know: nothing can be validated there.
+            r = subprocess.run(val + ["--allow-offset-texture-operand", str(sv)], capture_output=True, text=True)
+            if r.returncode != 0 and "USAGE" in r.stdout + r.stderr:
+                pytest.skip("this spirv-val has no --allow-offset-texture-operand (VK_KHR_maintenance8)")
         if r.returncode != 0 and known_val_issue and known_val_issue in r.stderr:
             pytest.xfail("known spirv-val issue (" + known_val_issue + "): " + r.stderr.strip().splitlines()[0])
         assert r.returncode == 0, "spirv-val: " + r.stderr

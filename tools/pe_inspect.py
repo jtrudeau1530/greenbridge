@@ -3,12 +3,17 @@
 Usage:
     python -I pe_inspect.py <image> [--game-dir DIR] [--out DIR]
 
-Writes <out>/<name>.json and <out>/<name>.md. Reads the file only; never runs it.
+Writes <out>/<file>.json and <out>/<file>.md, where <file> is the image's full file name (game.exe.json,
+game.dll.md), so an exe and a dll with the same stem get separate reports. Images with the same file name from
+different directories get a numbered suffix (x.exe-2.json), and the name used is printed to stderr. The same file
+given twice with the same import search folder is inspected once. Reads the file only; never runs it.
 
 Standard library only: the headers, the section table, the import, delay-import, export, TLS and relocation
 directories are parsed with struct, so the tool runs under `python -I` without third-party packages and is covered
 by the same standard-library-only CI job as the other tools.
 """
+from __future__ import annotations
+
 import argparse
 import json
 import math
@@ -43,7 +48,12 @@ def entropy(data: bytes) -> float:
     return -sum(c / n * math.log2(c / n) for c in Counter(data).values())
 
 
-def _cstring(data: bytes, offset: int, limit: int = 512) -> str | None:
+# An MSVC decorated name can be 4,096 characters (the documented limit of a decorated name); with the 512 this
+# was, a long template import became "?" and a DLL with a long name lost its whole entry.
+NAME_LIMIT = 4097
+
+
+def _cstring(data: bytes, offset: int, limit: int = NAME_LIMIT) -> str | None:
     end = data.find(b"\0", offset, min(len(data), offset + limit))
     if end < 0:
         return None
@@ -78,12 +88,16 @@ class PeImage:
         self.subsystem = struct.unpack_from("<H", data, opt + 68)[0]
         self.dll_characteristics = struct.unpack_from("<H", data, opt + 70)[0]
 
+        # NumberOfRvaAndSizes counts the data directories: a slot past it is not a directory, whatever bytes it
+        # holds (runtime/src/pe_loader.cpp reads them the same way). The count is the dword before the table.
         opt_end = min(len(data), opt + opt_size)
         dirs = opt + (112 if self.is64 else 96)
+        count = struct.unpack_from("<I", data, dirs - 4)[0] if dirs <= opt_end else 0
         self.directories = []
         for i in range(16):
             at = dirs + i * 8
-            self.directories.append(struct.unpack_from("<II", data, at) if at + 8 <= opt_end else (0, 0))
+            present = i < count and at + 8 <= opt_end
+            self.directories.append(struct.unpack_from("<II", data, at) if present else (0, 0))
 
         # A section's data can be virtual only, so lookups past SizeOfRawData have no file bytes to read.
         self.sections = []
@@ -108,10 +122,13 @@ class PeImage:
         if rva < self.size_of_headers:
             return rva if rva < len(self.data) else None
         for s in self.sections:
-            span = max(s["vsize"], s["rawsize"])
+            # A section is VirtualSize bytes in memory (SizeOfRawData when that is 0). File bytes past it are not
+            # mapped, as in runtime/src/pe_loader.cpp: with SizeOfRawData larger than the span to the next
+            # section, max(vsize, rawsize) answered the next section's RVAs from this one's raw tail.
+            span = s["vsize"] or s["rawsize"]
             if s["rva"] <= rva < s["rva"] + span:
                 delta = rva - s["rva"]
-                if delta >= s["rawsize"]:
+                if delta >= min(s["rawsize"], span):
                     return None
                 at = s["rawptr"] + delta
                 return at if at < len(self.data) else None
@@ -210,7 +227,14 @@ def _exports(img: PeImage) -> list[str]:
         names.append(symbol if symbol is not None else "?")
         named.add(struct.unpack_from("<H", img.data, ord_at)[0])
     for i in range(min(functions, MAX_ENTRIES)):
-        if i not in named:
+        if i in named:
+            continue
+        # A zero RVA in AddressOfFunctions marks an unused ordinal slot, not an export. A forwarder (an RVA inside the
+        # export directory) is a real export. A slot the file does not hold is skipped like any other unreadable entry.
+        slot = img.offset(addr_functions + i * 4)
+        if slot is None or slot + 4 > len(img.data):
+            continue
+        if struct.unpack_from("<I", img.data, slot)[0]:
             names.append(f"#{base + i}")
     return names
 
@@ -373,16 +397,39 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--game-dir")
     ap.add_argument("--out", default=os.path.join(os.path.dirname(__file__), "..", "reports", "pe"))
     a = ap.parse_args(argv)
-    os.makedirs(a.out, exist_ok=True)
+    try:
+        os.makedirs(a.out, exist_ok=True)
+    except OSError as e:
+        print(f"cannot create output directory {a.out}: {e.strerror or e}", file=sys.stderr)
+        return 1
     rc = 0
+    seen_paths: set[tuple[str, str]] = set()
+    used_names: set[str] = set()
     for img in a.image:
+        search_dir = a.game_dir or os.path.dirname(os.path.abspath(img))
+        key = (os.path.normcase(os.path.realpath(img)), os.path.normcase(os.path.abspath(search_dir)))
+        if key in seen_paths:
+            print(f"{img}: given more than once; inspected once", file=sys.stderr)
+            continue
+        seen_paths.add(key)
         try:
-            r = inspect(img, a.game_dir or os.path.dirname(os.path.abspath(img)))
+            r = inspect(img, search_dir)
         except (PeFormatError, OSError) as e:
             print(f"{img}: not a PE image ({e})", file=sys.stderr)
             rc = 1
             continue
-        stem = os.path.join(a.out, os.path.splitext(r["file"])[0])
+        # One report per image: the full file name keeps game.exe and game.dll apart, and a numbered suffix keeps
+        # a/x.exe and b/x.exe apart. Compared case-insensitively, as Windows file names are.
+        name = r["file"]
+        n = 1
+        while name.lower() in used_names:
+            n += 1
+            name = f"{r['file']}-{n}"
+        used_names.add(name.lower())
+        if n > 1:
+            print(f"{img}: another input is also named {r['file']}; report written as {name}.json/.md",
+                  file=sys.stderr)
+        stem = os.path.join(a.out, name)
         with open(stem + ".json", "w", encoding="utf-8") as f:
             json.dump(r, f, indent=1)
         with open(stem + ".md", "w", encoding="utf-8") as f:
@@ -395,4 +442,8 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
+    try:  # a redirected stdout is strict ANSI code page under -I; write '?' for what it cannot encode
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
     sys.exit(main())

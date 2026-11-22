@@ -1,8 +1,11 @@
 """Exercise the GPU atlas with synthetic vulkaninfo reports."""
+import contextlib
+import io
 import json
 import os
 import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -78,6 +81,85 @@ class VulkanMatrixTests(unittest.TestCase):
         for doc in ([], {}, {"capabilities": []}, no_name, missing_extensions, invalid_extensions, invalid_feature_block):
             with self.subTest(document=doc):
                 self.assert_unknown(self.probe(doc))
+
+
+class ValidationGateTests(unittest.TestCase):
+    """The malformed control must fail, or the atlas results prove nothing. Tools are mocked."""
+
+    def fake_run(self, accept_control=False, fail_assembly=False):
+        def run(cmd, **kw):
+            broken = any("broken_negative" in str(arg) for arg in cmd)
+            if cmd[0] == "spirv-as":
+                ok = 1 if fail_assembly and broken else 0
+                return subprocess.CompletedProcess(cmd, ok, "", "syntax error" if ok else "")
+            ok = 0 if not broken or accept_control else 1
+            return subprocess.CompletedProcess(cmd, ok, "", "" if ok else "invalid module")
+        return run
+
+    def probe(self, accept_control=False, fail_assembly=False):
+        with patch.object(turing_atlas.shutil, "which", return_value="tool"), \
+                patch.object(turing_atlas, "run", self.fake_run(accept_control, fail_assembly)):
+            return turing_atlas.validate_cases()
+
+    def main_with(self, accept_control=False, fail_assembly=False, tools=True, argv=None):
+        err = io.StringIO()
+        with patch.object(sys, "argv", argv or ["turing_atlas.py"]), \
+                patch.object(turing_atlas.shutil, "which", return_value="tool" if tools else None), \
+                patch.object(turing_atlas, "run", self.fake_run(accept_control, fail_assembly)), \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+            code = turing_atlas.main()
+        return code, err.getvalue()
+
+    def test_valid_cases_are_reported_normally_with_a_rejected_control(self):
+        cases = self.probe()
+        self.assertEqual(len(cases), len(turing_atlas.CASES))
+        self.assertTrue(all(cases[n]["assemble"] and cases[n]["valid"] for n in cases
+                            if n != "broken_negative"))
+        control = cases["broken_negative"]
+        self.assertTrue(control["assemble"])
+        self.assertFalse(control["valid"])
+        self.assertTrue(control["control_ok"])
+        self.assertNotIn("error", control)
+
+    def test_assembly_rejection_of_the_control_also_counts(self):
+        control = self.probe(fail_assembly=True)["broken_negative"]
+        self.assertFalse(control["assemble"])
+        self.assertTrue(control["control_ok"])
+        self.assertNotIn("error", control)
+
+    def test_an_accepted_control_is_flagged(self):
+        control = self.probe(accept_control=True)["broken_negative"]
+        self.assertFalse(control["control_ok"])
+        self.assertIn("not rejecting malformed modules", control["error"])
+
+    def test_main_exits_nonzero_when_the_control_was_accepted(self):
+        code, err = self.main_with(accept_control=True)
+        self.assertEqual(code, 2)
+        self.assertIn("turing_atlas: error:", err)
+        self.assertIn("broken_negative", err)
+
+    def test_main_succeeds_when_the_control_was_rejected(self):
+        for kwargs in ({}, {"fail_assembly": True}):
+            with self.subTest(**kwargs):
+                code, err = self.main_with(**kwargs)
+                self.assertEqual(code, 0)
+                self.assertEqual(err, "")
+
+    def test_out_in_a_missing_folder_creates_it(self):
+        # #934's class: a --out whose parent does not exist used to lose the whole run to a traceback.
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "nested", "dir", "atlas.json")
+            code, err = self.main_with(argv=["turing_atlas.py", "--out", out])
+            self.assertEqual((code, err), (0, ""))
+            self.assertTrue(os.path.isfile(out))
+
+    def test_missing_tools_skip_without_treating_it_as_a_control_failure(self):
+        with patch.object(turing_atlas.shutil, "which", return_value=None):
+            self.assertEqual(turing_atlas.validate_cases(),
+                             {"skipped": "spirv-as/spirv-val not on PATH (Vulkan SDK)"})
+        code, err = self.main_with(tools=False)
+        self.assertEqual(code, 0)
+        self.assertEqual(err, "")
 
 
 if __name__ == "__main__":

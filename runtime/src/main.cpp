@@ -9,7 +9,7 @@
 //   gta6rt --init <image> [--game-dir DIR]
 //       The same mapping, then each loaded DLL's TLS callbacks and DllMain(DLL_PROCESS_ATTACH) are run.
 //
-//   gta6rt --run <exe> [--game-dir DIR] [-- game arguments...]
+//   gta6rt --run <exe> [--game-dir DIR] [--trace-d3d12] [-- game arguments...]
 //       The same, then the EXE's own TLS callbacks and its entry point, on a game thread. The game's argv and
 //       command line are <exe name> plus the arguments after "--"; exit/ExitProcess from the game end the run
 //       (shims/process.cpp). gta6rt prints the binding report first and returns the game's exit code.
@@ -21,6 +21,7 @@
 #include <vector>
 
 #include "pe_loader.h"
+#include "../shims/d3d12_trace.h"
 #include "../shims/process_shim.h"
 #include "../shims/shims.h"
 
@@ -38,8 +39,8 @@ const char* binding_name(rt::Binding b) {
 int usage() {
     std::fprintf(stderr,
                  "usage: gta6rt --dry-run <image> [--game-dir DIR]\n"
-                 "       gta6rt --init <image> [--game-dir DIR]\n"
-                 "       gta6rt --run <exe> [--game-dir DIR] [-- game arguments...]\n");
+                 "       gta6rt --init <image> [--game-dir DIR] [--trace-d3d12]\n"
+                 "       gta6rt --run <exe> [--game-dir DIR] [--trace-d3d12] [-- game arguments...]\n");
     return 2;
 }
 
@@ -47,24 +48,27 @@ int usage() {
 
 int wmain(int argc, wchar_t** argv) {
     std::filesystem::path image, game_dir;
-    bool dry_run = false, init = false, run = false;
-    std::vector<std::string> game_args;
+    bool dry_run = false, init = false, run = false, trace_d3d12 = false;
+    std::vector<std::wstring> game_args;  // wide: path::string() throws on a character the code page lacks (RT-84)
     for (int i = 1; i < argc; ++i) {
         std::wstring a = argv[i];
         if (a == L"--") {
-            for (++i; i < argc; ++i) game_args.push_back(std::filesystem::path(argv[i]).string());
+            for (++i; i < argc; ++i) game_args.push_back(argv[i]);
             break;
         }
         if (a == L"--dry-run") dry_run = true;
         else if (a == L"--init") init = true;
         else if (a == L"--run") run = true;
+        else if (a == L"--trace-d3d12") trace_d3d12 = true;
         else if (a == L"--game-dir" && i + 1 < argc) game_dir = argv[++i];
         else if (image.empty()) image = a;
         else return usage();
     }
     if (image.empty()) return usage();
-    if (!dry_run && !init && !run) return usage();
+    // Exactly one mode: --dry-run --run would otherwise initialise the modules and call the entry point.
+    if (dry_run + init + run != 1) return usage();
     if (game_dir.empty()) game_dir = image.parent_path();
+    rt::d3d12_trace::set_enabled(trace_d3d12);
 
     try {
         rt::Loader loader(game_dir);
@@ -73,7 +77,7 @@ int wmain(int argc, wchar_t** argv) {
             loader.initialise();  // TLS callbacks, then DllMain(DLL_PROCESS_ATTACH) for DLLs
             std::printf("%zu module(s) initialised\n", loader.modules().size());
         }
-        int unimplemented = 0;
+        int unimplemented = 0, unimplemented_hresult = 0;
         for (auto* m : loader.modules()) {
             std::map<rt::Binding, int> counts;
             for (auto& r : m->imports) counts[r.binding]++;
@@ -83,17 +87,24 @@ int wmain(int argc, wchar_t** argv) {
                         counts[rt::Binding::Unimplemented]);
             for (auto& r : m->imports)
                 if (r.binding == rt::Binding::Unimplemented || r.binding == rt::Binding::Shim) {
-                    std::printf("    %-13s %s!%s\n", binding_name(r.binding), r.dll.c_str(), r.name.c_str());
-                    unimplemented += r.binding == rt::Binding::Unimplemented;
+                    const bool missing = r.binding == rt::Binding::Unimplemented;
+                    const bool hresult =
+                        missing && rt::shims::classify_import(r.dll, r.name) == rt::shims::ReturnClass::HResult;
+                    std::printf("    %-13s %s!%s%s\n", binding_name(r.binding), r.dll.c_str(), r.name.c_str(),
+                                hresult ? "  [returns HRESULT]" : "");
+                    unimplemented += missing;
+                    unimplemented_hresult += hresult;
                 }
         }
         std::printf("%zu module(s) mapped, %d unimplemented import(s)\n", loader.modules().size(), unimplemented);
+        std::printf("unimplemented by return policy: hresult=%d other=%d\n", unimplemented_hresult,
+                    unimplemented - unimplemented_hresult);
         if (!run) return 0;
         if (!main_module.entry_rva) {
             std::fprintf(stderr, "error: %s has no entry point\n", main_module.name.c_str());
             return 1;
         }
-        rt::process::set_command_line(image.filename().string(), game_args);
+        rt::process::set_command_line(image.filename().wstring(), game_args);
         std::printf("running %s\n", main_module.name.c_str());
         std::fflush(stdout);
         const int code = rt::process::run_entry(main_module.base + main_module.entry_rva);

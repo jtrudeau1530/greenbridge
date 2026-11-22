@@ -4,7 +4,9 @@
 
 Every byte here is built by the test. No game file or game asset name is used.
 """
+import contextlib
 import csv
+import io
 import json
 import os
 import struct
@@ -13,6 +15,7 @@ import sys
 import tempfile
 import unittest
 import zlib
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOL = os.path.join(ROOT, "tools", "story_index.py")
@@ -190,6 +193,21 @@ class ArchiveTest(unittest.TestCase):
         self.assertEqual(rows[0]["signature"], "psin")
         self.assertEqual(summary["span"], limit)
 
+    def test_scan_limit_excludes_crossing_streams(self):
+        for start, stored, limit in ((self.offsets[0], len(zlib.compress(psin())), 2),
+                                     (self.offsets[-1], len(bink()), len(bink()) - 1)):
+            with self.subTest(start=start):
+                rows, summary = story_index.scan_rpf(self.rpf, start=start, limit=stored)
+                self.assertEqual([r["stored"] for r in rows], [stored])
+                self.assertEqual(summary["readable_fraction"], 1.0)
+
+                rows, summary = story_index.scan_rpf(self.rpf, start=start, limit=limit)
+                self.assertEqual(summary["readable_fraction"], 0.0)
+                self.assertEqual(summary["span"], limit)
+                self.assertEqual(summary["unread_bytes"], limit)
+                self.assertEqual(summary["compressed_bytes"], 0)
+                self.assertEqual(rows, [])
+
     def test_csv_and_json(self):
         rows, summary = story_index.scan_rpf(self.rpf)
         csv_path = os.path.join(self.root, "out.csv")
@@ -212,11 +230,34 @@ class ArchiveTest(unittest.TestCase):
         p = subprocess.run([sys.executable, "-I", TOOL, self.rpf, out, "--quiet"],
                            capture_output=True, text=True, encoding="utf-8", errors="replace")
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertEqual(p.stdout, "")
         with open(out, encoding="utf-8") as f:
             doc = json.load(f)
         self.assertEqual(doc["summary"]["signatures"]["psin"]["files"], 1)
         self.assertEqual(doc["summary"]["signatures"]["page-directory"]["files"], 1)
         self.assertEqual(doc["summary"]["signatures"]["rsc8"]["files"], 1)
+
+    def test_cli_reports_a_report_write_error(self):
+        out = os.path.join(self.root, "index.json")
+        err = io.StringIO()
+        with (mock.patch.object(sys, "argv", [TOOL, self.rpf, out, "--quiet"]),
+              mock.patch.object(story_index, "write_output", side_effect=OSError("disk full")),
+              contextlib.redirect_stderr(err)):
+            self.assertEqual(story_index.main(), 2)
+        self.assertIn(f"{out}: disk full", err.getvalue())
+
+    def test_unwritable_or_bad_output_path_fails_before_the_scan(self):
+        for out in (os.path.join(self.root, "no_such_folder", "x.json"),
+                    os.path.join(self.root, "out.txt"),
+                    self.root):
+            with self.subTest(out=out):
+                p = subprocess.run([sys.executable, "-I", TOOL, self.rpf, out, "--quiet"],
+                                   capture_output=True, text=True, encoding="utf-8", errors="replace")
+                self.assertEqual(p.returncode, 2, p.stderr)
+                self.assertNotIn("Traceback", p.stderr)
+                self.assertEqual(p.stdout, "")
+        self.assertFalse(os.path.exists(os.path.join(self.root, "no_such_folder")))
+        self.assertFalse(os.path.exists(os.path.join(self.root, "out.txt")))
 
     def test_directory(self):
         folder = os.path.join(self.root, "carved")
@@ -228,6 +269,37 @@ class ArchiveTest(unittest.TestCase):
         self.assertEqual([r["offset"] for r in rows], [0x1000, 0x1100, 0x1200])
         self.assertEqual([r["signature"] for r in rows], ["psin", "page-directory", "rsc8"])
         self.assertEqual(summary["mode"], "directory")
+
+    def test_directory_skips_the_carvers_index_and_reports(self):
+        """rpf9_carve.py writes index.json next to the streams; it and a report are not payloads."""
+        folder = os.path.join(self.root, "carved")
+        os.makedirs(folder)
+        for i, payload in enumerate((psin(), page(), rsc8())):
+            with open(os.path.join(folder, f"{0x1000 + i * 0x100:012x}.bin"), "wb") as f:
+                f.write(payload)
+        with open(os.path.join(folder, "index.json"), "w", encoding="utf-8") as f:
+            f.write('[{"off": 4096, "stored": 16}]')
+        with open(os.path.join(folder, "report.csv"), "w", encoding="utf-8") as f:
+            f.write("offset,size\n")
+        rows, summary = story_index.scan_dir(folder)
+        self.assertEqual([r["offset"] for r in rows], [0x1000, 0x1100, 0x1200])
+
+    def test_cli_directory_excludes_its_report_on_rerun(self):
+        folder = os.path.join(self.root, "carved")
+        os.makedirs(folder)
+        with open(os.path.join(folder, "000000000100.bin"), "wb") as f:
+            f.write(b"A" * 64)
+        out = os.path.join(folder, ".", "report.json")
+        for run in (1, 2):
+            with self.subTest(run=run):
+                p = subprocess.run([sys.executable, "-I", TOOL, folder, out, "--quiet"],
+                                   capture_output=True, text=True, encoding="utf-8", errors="replace")
+                self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+                with open(out, encoding="utf-8") as f:
+                    doc = json.load(f)
+                self.assertEqual(doc["summary"]["files"], 1)
+                self.assertEqual(doc["summary"]["compressed_bytes"], 64)
+                self.assertEqual([(r["offset"], r["stored"]) for r in doc["files"]], [(0x100, 64)])
 
     def test_empty_archive(self):
         empty = os.path.join(self.root, "empty.rpf")
@@ -248,6 +320,83 @@ class ArchiveTest(unittest.TestCase):
             self.assertIn(message, p.stderr)
             self.assertNotIn("Traceback", p.stderr)
             self.assertFalse(os.path.exists(out))
+
+
+    def test_cli_rejects_start_or_limit_for_a_directory(self):
+        folder = os.path.join(self.root, "carved")
+        os.makedirs(folder)
+        out = os.path.join(self.root, "dir.json")
+        for extra in (("--start", "0"), ("--limit", "100")):
+            p = subprocess.run([sys.executable, "-I", TOOL, folder, out, "--quiet", *extra],
+                               capture_output=True, text=True, encoding="utf-8", errors="replace")
+            self.assertEqual(p.returncode, 2, p.stderr)
+            self.assertIn("single archive", p.stderr)
+            self.assertEqual(p.stdout, "")
+            self.assertFalse(os.path.exists(out))
+
+    def test_output_cannot_overwrite_source_archive(self):
+        with open(self.rpf, "rb") as f:
+            rpf_data = f.read()
+        arc = os.path.join(self.root, "archive.json")
+        with open(arc, "wb") as f:
+            f.write(rpf_data)
+
+        # Same path
+        p = subprocess.run([sys.executable, "-I", TOOL, arc, arc, "--quiet"],
+                           capture_output=True, text=True, encoding="utf-8", errors="replace")
+        self.assertEqual(p.returncode, 2)
+        self.assertIn("output must not overwrite the source", p.stderr)
+        with open(arc, "rb") as f:
+            self.assertEqual(f.read(), rpf_data)
+
+        # Hard-link alias
+        if hasattr(os, "link"):
+            alias = os.path.join(self.root, "alias.json")
+            try:
+                os.link(arc, alias)
+            except OSError:
+                alias = None
+            if alias:
+                p2 = subprocess.run([sys.executable, "-I", TOOL, arc, alias, "--quiet"],
+                                    capture_output=True, text=True, encoding="utf-8", errors="replace")
+                self.assertEqual(p2.returncode, 2)
+                self.assertIn("output must not overwrite the source", p2.stderr)
+                with open(arc, "rb") as f:
+                    self.assertEqual(f.read(), rpf_data)
+
+    def test_output_cannot_overwrite_carve_manifest(self):
+        folder = os.path.join(self.root, "carved_manifest")
+        os.makedirs(folder)
+        manifest = os.path.join(folder, "index.json")
+        with open(manifest, "w", encoding="utf-8") as f:
+            f.write('{"carve_manifest": true}')
+        with open(os.path.join(folder, "00000001.bin"), "wb") as f:
+            f.write(psin())
+
+        p = subprocess.run([sys.executable, "-I", TOOL, folder, manifest, "--quiet"],
+                           capture_output=True, text=True, encoding="utf-8", errors="replace")
+        self.assertEqual(p.returncode, 2)
+        self.assertIn("output would overwrite the carve manifest", p.stderr)
+        with open(manifest, "r", encoding="utf-8") as f:
+            self.assertEqual(f.read(), '{"carve_manifest": true}')
+
+    def test_output_cannot_overwrite_carved_input(self):
+        if not hasattr(os, "link"):
+            return
+        folder = os.path.join(self.root, "carved_linked")
+        os.makedirs(folder)
+        bin_path = os.path.join(folder, "00000001.bin")
+        with open(bin_path, "wb") as f:
+            f.write(psin())
+        linked_json = os.path.join(folder, "linked.json")
+        try:
+            os.link(bin_path, linked_json)
+        except OSError:
+            return
+        p = subprocess.run([sys.executable, "-I", TOOL, folder, linked_json, "--quiet"],
+                           capture_output=True, text=True, encoding="utf-8", errors="replace")
+        self.assertEqual(p.returncode, 2)
+        self.assertIn("output would overwrite an input file", p.stderr)
 
 
 if __name__ == "__main__":

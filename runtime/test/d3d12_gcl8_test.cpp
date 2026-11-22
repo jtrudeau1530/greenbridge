@@ -5,9 +5,11 @@
 // The method is recorded but not applied: the backend has no pipeline or draw path that could consume per-face
 // stencil references yet (docs/d3d12_vulkan.md section 3.2).
 #include "../shims/d3d12_com.h"
+#include "../shims/d3d12_trace.h"
 
 #include <cstddef>
 #include <cstdio>
+#include <cstring>
 
 #define EXPECT(condition) do { \
     if (!(condition)) { std::fprintf(stderr, "line %d: %s\n", __LINE__, #condition); return 1; } \
@@ -25,7 +27,9 @@ struct Ref {
 
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    if (argc == 2 && std::strcmp(argv[1], "--trace-d3d12") == 0) rt::d3d12_trace::set_enabled(true);
+    else if (argc != 1) return 2;
     using namespace rt::d3d12;
     Ref<ID3D12CommandAllocator> allocator;
     Ref<ID3D12GraphicsCommandList7> list7;
@@ -63,7 +67,14 @@ int main() {
         EXPECT(front_back_stencil_ref(list8.p, front, back));
         EXPECT(front == 3 && back == 4);
 
+        // A marker is traced by name, never by its label. A method still unsupported (protected sessions) goes
+        // through its generated stub on each call, even when the legacy diagnostic is deduplicated.
+        constexpr char marker[] = "synthetic-marker-argument";
+        list8.p->SetMarker(1, marker, static_cast<UINT>(sizeof(marker)));
+        list8.p->SetProtectedResourceSession(nullptr);
+        list8.p->SetProtectedResourceSession(nullptr);
         EXPECT(list8.p->Close() == S_OK);
+        EXPECT(list8.p->Close() == E_FAIL);
         EXPECT(SUCCEEDED(list7.p->Reset(allocator.p, nullptr)));
         EXPECT(front_back_stencil_ref(list8.p, front, back));
         EXPECT(front == 0 && back == 0);  // Reset returns list state to its default

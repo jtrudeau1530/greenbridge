@@ -391,6 +391,7 @@ def find_sdk_include():
                 candidates += glob.glob(os.path.join(root, "Windows Kits", "10", "Include", "*"))
     best = None
     for path in candidates:
+        path = os.path.normpath(path)                 # "...\um\" has an empty basename
         um = path if os.path.basename(path).lower() == "um" else os.path.join(path, "um")
         shared = os.path.join(os.path.dirname(um), "shared")
         if os.path.isdir(um):
@@ -410,7 +411,8 @@ def parse_sdk_guids(um_dir, shared_dir):
             continue
         for path in glob.glob(os.path.join(d, "*.h")):
             try:
-                text = open(path, encoding="utf-8", errors="replace").read()
+                with open(path, encoding="utf-8", errors="replace") as f:
+                    text = f.read()
             except OSError:
                 continue
             for m in re.finditer(r"DEFINE_GUID\(\s*((?:IID|DXGI_DEBUG)_[A-Za-z0-9_]+)\s*,\s*([^)]*)\)", text):
@@ -449,7 +451,8 @@ def check_sdk():
 
 
 def parse_scarab_iid_table(path):
-    text = open(path, encoding="utf-8").read()
+    with open(path, encoding="utf-8") as f:
+        text = f.read()
     out = {}
     for name, body in re.findall(r"GUID\s+((?:IID|DXGI_DEBUG)_[A-Za-z0-9_]+)\s*=\s*\{([^;]*)\};", text):
         nums = tuple(int(x, 16) for x in re.findall(r"0x([0-9A-Fa-f]+)", body))
@@ -459,7 +462,8 @@ def parse_scarab_iid_table(path):
 
 
 def parse_scarab_iid_console(path):
-    text = open(path, encoding="utf-8").read()
+    with open(path, encoding="utf-8") as f:
+        text = f.read()
     out = {}
     for m in re.finditer(r"GUID\s+(IID_[A-Za-z0-9_]+).*?ordinal\s+(\d+)", text):
         out[m.group(1)] = int(m.group(2))
@@ -586,4 +590,8 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
+    try:  # a redirected stdout is strict ANSI code page under -I; write '?' for what it cannot encode
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
     sys.exit(main())

@@ -3,7 +3,7 @@
 Usage:
     python -I serve.py [--world DIR] [--port 8765]
 
-`--world` is the folder holding world.json and the .glb chunks (default <work>\\world). It's served at
+`--world` is the folder holding world.json and the .glb chunks, typically <work>\\world. It's served at
 /world/ so game-derived files never need to live in this repo. Without it, the viewer shows test terrain.
 """
 from __future__ import annotations
@@ -123,15 +123,40 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         super().end_headers()
 
 
+def port_number(text: str) -> int:
+    """--port: 0-65535. Anything else used to reach socketserver and end in OverflowError."""
+    try:
+        value = int(text, 10)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"invalid int value: {text!r}") from None
+    if not 0 <= value <= 65535:
+        raise argparse.ArgumentTypeError("must be 0-65535")
+    return value
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--world", default=r"<work>\world")
-    ap.add_argument("--port", type=int, default=8765)
+    ap.add_argument("--world", help="exported world directory (omit to show test terrain)")
+    ap.add_argument("--port", type=port_number, default=8765,
+                    help="0 asks the OS for a free port; the bound port is printed")
     a = ap.parse_args()
-    Handler.world = a.world if os.path.isdir(a.world) else None
-    srv = http.server.ThreadingHTTPServer(("127.0.0.1", a.port), functools.partial(Handler, directory=HERE))
-    print(f"viewer: http://127.0.0.1:{a.port}/  world: {Handler.world or '(none: test terrain)'}", flush=True)
-    srv.serve_forever()
+    if a.world is not None and not os.path.isdir(a.world):
+        ap.error(f"--world is not a directory: {a.world}")
+    Handler.world = a.world
+    try:
+        srv = http.server.ThreadingHTTPServer(("127.0.0.1", a.port), functools.partial(Handler, directory=HERE))
+    except OSError as e:
+        # The usual cause is a viewer that is still running on the port; this ended in a traceback.
+        ap.error(f"can't listen on port {a.port}: {e.strerror or e}. Is a viewer already running? "
+                 "--port 0 asks the OS for a free port")
+    print(f"viewer: http://127.0.0.1:{srv.server_address[1]}/  world: {Handler.world or '(none: test terrain)'}",
+          flush=True)
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:      # Ctrl+C is how the viewer is stopped
+        print("viewer: stopped", flush=True)
+    finally:
+        srv.server_close()
 
 
 if __name__ == "__main__":

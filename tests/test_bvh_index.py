@@ -18,7 +18,7 @@ sys.path.insert(0, os.path.join(ROOT, "tools"))
 import bvh_index  # noqa: E402
 
 
-def bvh_payload(n=10, tag=bvh_index.TAG, end_delta=0):
+def bvh_payload(n=10, tag=bvh_index.TAG, end_delta=0, root=0x136AC):
     b = bytearray(0x140 + n * 64)
     struct.pack_into("<I", b, 0x100, tag)
     struct.pack_into("<I", b, 0x104, n)
@@ -30,7 +30,7 @@ def bvh_payload(n=10, tag=bvh_index.TAG, end_delta=0):
     struct.pack_into("<6f", b, 0x110, -1.5, -2.0, -3.0, 4.5, 5.0, 6.0)
     struct.pack_into("<I", b, 0x128, 0x1234)
     struct.pack_into("<i", b, 0x12C, -5)
-    struct.pack_into("<I", b, 0x130, 0x136AC)
+    struct.pack_into("<I", b, 0x130, root)
     struct.pack_into("<I", b, 0x134, 0x80)
     struct.pack_into("<I", b, 0x138, 0xFFFFAB40)
     struct.pack_into("<I", b, 0x13C, 0x808C8A89)
@@ -81,6 +81,7 @@ class ClassifyTest(unittest.TestCase):
         self.assertEqual(row["root_node_ptr"], 0x136AC)
         self.assertEqual((row["root_node_index"], row["root_node_type"]), (9941, 4))
         self.assertEqual(row["root_node_type_name"], "box16")
+        self.assertFalse(row["root_node_invalid"])
         self.assertEqual(row["offset_to_elements"], 0x80)
         self.assertEqual(row["offset_to_parents"], 0xFFFFAB40)
         self.assertEqual(row["compression_params"], 0x808C8A89)
@@ -96,13 +97,26 @@ class ClassifyTest(unittest.TestCase):
         self.assertEqual(hdr["root_node_index"], 9941)
         self.assertEqual(hdr["root_node_type"], 4)
         self.assertEqual(hdr["root_node_type_name"], "box16")
+        self.assertFalse(hdr["root_node_invalid"])
         self.assertTrue(hdr["bottom_level"])
         self.assertFalse(hdr["compressed"])
 
     def test_node_pointer(self):
         self.assertEqual(bvh_index.decode_node_pointer(0x136AC),
                          {"ptr": 0x136AC, "index": 9941, "type": 4, "name": "box16", "invalid": False})
-        self.assertEqual(bvh_index.decode_node_pointer(bvh_index.INVALID_NODE)["invalid"], True)
+        self.assertEqual(bvh_index.decode_node_pointer(bvh_index.INVALID_NODE),
+                         {"ptr": 0xFFFFFFFF, "index": 536870911, "type": 7,
+                          "name": "invalid", "invalid": True})
+
+    def test_invalid_root_node_pointer(self):
+        payload = bvh_payload(4, root=bvh_index.INVALID_NODE)
+        hdr = bvh_index.parse_header(payload)
+        self.assertTrue(hdr["root_node_invalid"])
+        self.assertEqual(hdr["root_node_type_name"], "invalid")
+        row = bvh_index.classify(payload, len(payload))
+        self.assertEqual(row["kind"], "bvh4")
+        self.assertTrue(row["root_node_invalid"])
+        self.assertEqual(row["root_node_type_name"], "invalid")
 
     def test_bvh4_chunk(self):
         b = bytearray(65536)
@@ -166,6 +180,19 @@ class ScanTest(unittest.TestCase):
         self.assertEqual(rows[1]["node_count"], 5)
         self.assertEqual(summary[0]["inflated"], 5000 + 0x140 + 5 * 64)
 
+    def test_fill_requires_all_bvh4_node_bytes(self):
+        path = os.path.join(self.dir, "one.rpf")
+        with open(path, "wb") as f:
+            f.write(make_rpf([bvh_payload(1)]))
+        rows, _ = bvh_index.scan_rpf(path, max_inflate=384)
+        self.assertEqual(rows[0]["fill"], {"81": 64, "total": 64})
+        for cap in (320, 352):
+            with self.subTest(cap=cap):
+                rows, _ = bvh_index.scan_rpf(path, max_inflate=cap)
+                self.assertEqual(rows[0]["kind"], "bvh4")
+                self.assertEqual(rows[0]["node_bytes"], 64)
+                self.assertNotIn("fill", rows[0])
+
     def test_index_outputs(self):
         path = os.path.join(self.dir, "pack.rpf")
         with open(path, "wb") as f:
@@ -178,10 +205,25 @@ class ScanTest(unittest.TestCase):
         self.assertEqual(doc["summary"]["streams"], 3)
         self.assertEqual(doc["summary"]["kinds"], {"instance208": 1, "bvh4": 1, "xml": 1})
         self.assertNotIn("head", doc["streams"][0])
+        self.assertEqual(doc["streams"][1]["version"], 6)
+        self.assertIsInstance(doc["streams"][1]["version"], int)
+        self.assertFalse(doc["streams"][1]["root_node_invalid"])
         with open(csv_path, encoding="utf-8") as f:
             text = f.read()
         self.assertIn("signature", text.splitlines()[0])
+        self.assertIn("root_node_invalid", text.splitlines()[0])
         self.assertIn("bvh4:0x81020006", text)
+
+    def test_cli_rejects_colliding_output_paths(self):
+        out = os.path.join(self.dir, "index.json")
+        alias = os.path.join(self.dir, ".", "index.json")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(SystemExit) as cm:
+                bvh_index.main([self.dir, "--out", out, "--csv", alias])
+        self.assertEqual(cm.exception.code, 2)
+        self.assertIn("--out and --csv must use different paths", err.getvalue())
+        self.assertFalse(os.path.exists(out))
 
     def test_directory_of_payloads(self):
         for name, payload in (("a.bin", bvh_payload(4)), ("b.bin", instance_payload()), ("c.bin", b"z" * 80)):
@@ -224,6 +266,88 @@ class ScanTest(unittest.TestCase):
             with self.assertRaises(SystemExit) as cm, contextlib.redirect_stderr(io.StringIO()):
                 bvh_index.main([path, "--limit", value])
             self.assertEqual(cm.exception.code, 2)
+
+
+    def test_directory_scan_honours_max_inflate(self):
+        with open(os.path.join(self.dir, "one.rpf"), "wb") as f:
+            f.write(make_rpf([bvh_payload(4)]))
+        full = 0x140 + 4 * 64
+        rows, _ = bvh_index.scan_dir(self.dir)
+        self.assertEqual(rows[0]["kind"], "bvh4")
+        out = os.path.join(self.dir, "capped.json")
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(bvh_index.main([self.dir, "--max-inflate", "128", "--out", out]), 0)
+        with open(out) as f:
+            doc = json.load(f)
+        # Only 128 bytes were kept, so the 0x140-byte header cannot be read; the real size is still reported.
+        self.assertEqual(doc["streams"][0]["kind"], "raw")
+        self.assertEqual(doc["streams"][0]["size"], full)
+
+    def test_cli_rejects_start_or_limit_for_a_directory(self):
+        with open(os.path.join(self.dir, "one.rpf"), "wb") as f:
+            f.write(make_rpf([bvh_payload(2)]))
+        out = os.path.join(self.dir, "index.json")
+        for extra in (("--start", "0"), ("--limit", "100")):
+            err, so = io.StringIO(), io.StringIO()
+            with self.assertRaises(SystemExit) as cm, contextlib.redirect_stderr(err), contextlib.redirect_stdout(so):
+                bvh_index.main([self.dir, "--out", out, *extra])
+            self.assertEqual(cm.exception.code, 2)
+            self.assertIn("single archive", err.getvalue())
+            self.assertEqual(so.getvalue(), "")
+            self.assertFalse(os.path.exists(out))
+
+
+    def test_report_cannot_overwrite_carve_manifest(self):
+        manifest = os.path.join(self.dir, "index.json")
+        with open(manifest, "w", encoding="utf-8") as f:
+            f.write('{"carve_manifest": true}')
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(SystemExit) as cm:
+                bvh_index.main([self.dir, "--out", manifest])
+        self.assertEqual(cm.exception.code, 2)
+        self.assertIn("would overwrite the carve manifest", err.getvalue())
+        with open(manifest, "r", encoding="utf-8") as f:
+            self.assertEqual(f.read(), '{"carve_manifest": true}')
+
+    def test_report_cannot_overwrite_a_carved_input(self):
+        payload = os.path.join(self.dir, "a.bin")
+        with open(payload, "wb") as f:
+            f.write(bvh_payload(4))
+        alias = os.path.join(self.dir, "alias.json")
+        try:
+            os.link(payload, alias)
+        except OSError:
+            self.skipTest("hard links are not available")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(SystemExit) as cm:
+                bvh_index.main([self.dir, "--out", alias])
+        self.assertEqual(cm.exception.code, 2)
+        self.assertIn("would overwrite an input file", err.getvalue())
+
+    def test_missing_report_folder_is_created(self):
+        out = os.path.join(self.dir, "missing", "sub", "index.json")
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(bvh_index.main([self.dir, "--out", out]), 0)
+        self.assertTrue(os.path.isfile(out))
+
+    def test_report_folder_is_rejected(self):
+        outdir = os.path.join(self.dir, "outdir")
+        os.makedirs(outdir, exist_ok=True)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(SystemExit) as cm:
+                bvh_index.main([self.dir, "--out", outdir])
+        self.assertEqual(cm.exception.code, 2)
+        self.assertIn("is a folder, not a report file", err.getvalue())
+
+
+def setUpModule():
+    # The tools' main() prints its summary JSON; keep it out of the test log (tests that check it redirect again).
+    quiet = contextlib.redirect_stdout(io.StringIO())
+    quiet.__enter__()
+    unittest.addModuleCleanup(quiet.__exit__, None, None, None)
 
 
 if __name__ == "__main__":

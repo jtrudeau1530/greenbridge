@@ -15,19 +15,20 @@ map resources and placement entities they contain.
 | Complete / validated map rows | **23,535 / 23,535** |
 | Exact entity counts | **1,670,442 / 1,670,442** |
 | Shards complete | **36 / 36** |
-| Zlib streams inflated | **1,122,614** |
-| Stored stream bytes | 75,165,813,806 |
-| Inflated bytes (all streams) | 175,587,890,693 |
-| Rejected zlib candidates | 906 |
-| Adopted continuation streams | 174 |
-| Metadata streams | 165,880 |
+| Zlib streams inflated | **1,117,857** |
+| Stored stream bytes | 74,877,281,159 |
+| Inflated bytes (all streams) | 174,941,755,029 |
+| Rejected zlib candidates | 840 |
+| Metadata streams | 164,914 |
 | Duplicate content groups | 0 |
 | Scan time | 290.8 s |
 
 A map row is a resource whose schema includes `CMapData`. `maps_exact` means every entity block
 counted against the declared `entity_size` and no entity block was left in a graphics page.
 `entities_exact` is the same check summed over all rows. Six entities of the 23,535 maps were split
-across a continuation; the joiner adopted 174 streams in total.
+across a continuation. The stream and byte totals don't depend on the shard size: each shard scans an
+8 MiB warm-up window before its start only to find a stream boundary, and the streams there are counted by
+the shard they belong to. The stored total therefore equals the accepted stream payload in Coverage below.
 
 ### Placement maps vs metadata
 
@@ -113,12 +114,47 @@ Adding these archives does not change the measured total: **23,535 maps / 1,670,
 in `levels.rpf`. SixNG publishes 30,785 map files / 2,249,490 entities, leaving 7,250 maps / 579,048
 entities. The difference is not explained by maps outside `levels.rpf` (zero found here) or by
 duplicates (the levels census reports zero byte-identical map payloads and zero duplicate map-name
-hashes). The census counts top-level `0x7a` resources and does not enumerate nested payloads, so it
-cannot rule out a nested-resource counting rule. `levels.rpf` also contains 138,839 `CMapData`-only
-metadata resources and 26,075 other `0x7a` metadata resources. The `CMapData`-only class has no
-`CEntityDef` table and cannot account for the 579,048 entities; the other class has no `CMapData` root
-and is not a placement map. Nothing shows SixNG counts either class, so the remaining difference is
-unexplained.
+hashes). `levels.rpf` also contains 138,839 `CMapData`-only metadata resources and 26,075 other `0x7a`
+metadata resources.
+
+### The SixNG difference, map by map
+
+A local SixNG `placements` run on the same package writes one file per map, keyed by the resource's
+stream offset, which is the `offset` of a census row. Matched by offset against a fresh census at
+48ad23f:
+
+| | Maps | Entities |
+|---|---:|---:|
+| in both | 23,528 | 1,669,203 (equal on every map) |
+| SixNG only: `CEntityDef` objects, `CMloArchetypeDef` (`10506455`) objects, no `CMapData` struct | 961 | 540,665 |
+| SixNG only: `CEntityDef` objects, one `35abc248` root object, no `CMapData` struct | 6,296 | 39,622 |
+| census only: entity table or schema past the first 64 KiB system page | 7 | 1,239 |
+| **SixNG total / census total** | **30,785 / 23,535** | **2,249,490 / 1,670,442** |
+
+The two SixNG-only classes are the "other" metadata resources above. SixNG counts a `0x7a` resource
+as a map when it has at least one `CEntityDef` object. The census also requires a `CMapData` struct
+in the schema, and no resource in either class has one. Neither class is a world placement list:
+
+- The 961 interior resources hold `CMloArchetypeDef` objects (1,358 in total). Their entities lie
+  within 173 m of the origin on every axis (median 5.9 m), so the coordinates are interior space.
+  This is consistent with interior entity lists that get their world transform from an interior instance in a
+  map. SixNG's `interiors` step reads them that way.
+- The 6,296 `35abc248` resources each have one root object and entities within 30.4 m of the
+  origin (median 0.9 m). SixNG's own source describes them as named, prefab-like entity groups in
+  group-local space, placed by nothing in the map data.
+
+The 7 census-only maps have a 65,536-byte first system page, and their `CEntityDef` block or the
+schema that the entity table needs lies in the continuation page. In 4 of them the continuation is a
+second zlib stream; in 3 it is a raw page. `world_census.assemble` joins that page. SixNG's output
+has no file for these 7.
+
+The net difference is 7,257 − 7 = 7,250 maps and 580,287 − 1,239 = 579,048 entities, the whole
+published gap. The 580,287 extra entities have no world position of their own: an interior instance
+or another placement has to supply the transform.
+
+The census's own join already tracks each continuation's real end (`out["end"] = nxt + mused`), so it
+does not have the padding miss that #1084 fixes in `world_index.scan_rpf`; the census numbers above
+do not depend on that fix.
 
 ## Exactness condition
 
@@ -147,7 +183,12 @@ candidates in independent shards and:
    `0DRP` signature or unaligned zlib stream.
 
 Each shard is written to `shard_<index>_<start>_<end>.json`; `summary.json` and `maps.json` are
-rebuilt from the shards, so an interrupted run resumes with `--resume` or `--merge-only`.
+rebuilt from the shards. Keep the input stable during a run and use one census per output directory.
+Each shard records a local archive fingerprint based on file size, timestamps, filesystem identifiers
+and up to three 4 KiB samples. If filesystem identifiers are unavailable, the resolved path also
+contributes to the hash. Verifying every byte would require reading the whole archive. Copies or metadata changes can require a rescan. `--resume` rescans missing,
+older-format and mismatched shards. `--merge-only` reports their ranges as missing and exits 1.
+Use `--resume` to refresh format 4 shards in place, since their stream totals can include warm-up streams twice.
 
 ```powershell
 python -I tools\world_census.py <levels.rpf> --out work\world\census --shard-size 2147483648 --jobs 12

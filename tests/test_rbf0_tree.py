@@ -12,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 from xml.etree import ElementTree as ET
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -370,6 +371,84 @@ class OutputTest(unittest.TestCase):
         rbf0_tree.write_xml(xml_dir, doc["resources"])  # a rerun overwrites, it does not add -0000 duplicates
         self.assertEqual(len(os.listdir(xml_dir)), 1)
 
+    def test_duplicate_offsets_keep_each_source(self):
+        names = ["000000000100-left.bin", "000000000100-right.bin"]
+        roots = ["RootA", "RootB"]
+        for name, root in zip(names, roots):
+            with open(os.path.join(self.root, name), "wb") as f:
+                f.write(b"RBF0" + _open(0, root.encode("ascii")) + CLOSE)
+        out = os.path.join(self.root, "tree.json")
+        self.assertEqual(rbf0_tree.main([self.root, out, "--quiet"]), 0)
+        with open(out, encoding="utf-8") as f:
+            resources = json.load(f)["resources"]
+        self.assertEqual([(doc["source"], doc["root_name"]) for doc in resources], list(zip(names, roots)))
+
+    def test_deep_tree_preserves_existing_json(self):
+        depth = 600
+        blob = b"RBF0" + _open(0, b"TestRoot") + _open(0) * (depth - 1) + CLOSE * depth
+        doc = rbf0_tree.parse_resource(blob)
+        self.assertEqual((doc["status"], doc["max_depth"]), ("ok", depth))
+        source = os.path.join(self.root, "deep.bin")
+        with open(source, "wb") as f:
+            f.write(blob)
+        out = os.path.join(self.root, "tree.json")
+        previous = b'{"previous": true}\n'
+        with open(out, "wb") as f:
+            f.write(previous)
+        tool = os.path.join(ROOT, "tools", "rbf0_tree.py")
+        result = subprocess.run([sys.executable, "-I", tool, source, out, "--quiet"],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 1)
+        with open(out, "rb") as f:
+            self.assertTrue(f.read() == previous, "existing JSON report changed")
+        self.assertEqual(len(result.stderr.splitlines()), 1)
+        self.assertIn(os.path.basename(out), result.stderr)
+        self.assertIn("depth", result.stderr)
+        self.assertCountEqual(os.listdir(self.root), ["deep.bin", "tree.json"])
+
+    @unittest.skipIf(os.name == "nt", "POSIX permission bits")
+    def test_report_keeps_the_usual_permission_bits(self):
+        out = os.path.join(self.root, "tree.json")
+        old = os.umask(0o022)
+        try:
+            rbf0_tree.write_json(out, [], {"resources": 0})
+            self.assertEqual(os.stat(out).st_mode & 0o777, 0o644)
+            os.chmod(out, 0o640)
+            rbf0_tree.write_json(out, [], {"resources": 0})
+            self.assertEqual(os.stat(out).st_mode & 0o777, 0o640)
+        finally:
+            os.umask(old)
+
+    def _run_cli(self, *argv):
+        tool = os.path.join(ROOT, "tools", "rbf0_tree.py")
+        return subprocess.run([sys.executable, "-I", tool, *argv, "--quiet"], capture_output=True, text=True)
+
+    def test_out_or_csv_over_the_source_file_is_refused(self):
+        source = os.path.join(self.root, "resource.bin")
+        blob = wide_blob()
+        with open(source, "wb") as f:
+            f.write(blob)
+        other = os.path.join(self.root, "tree.json")
+        for argv in ((source, os.path.join(self.root, ".", "resource.bin")),
+                     (source, other, "--csv", source)):
+            with self.subTest(argv=argv):
+                result = self._run_cli(*argv)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn("would overwrite the source", result.stderr)
+                self.assertNotIn("Traceback", result.stderr)
+                with open(source, "rb") as f:
+                    self.assertEqual(f.read(), blob)
+        self.assertFalse(os.path.exists(other))
+
+    def test_out_and_csv_on_the_same_file_are_refused(self):
+        with open(os.path.join(self.root, "00000000.bin"), "wb") as f:
+            f.write(wide_blob())
+        out = os.path.join(self.root, "reports", "tree.json")
+        result = self._run_cli(self.root, out, "--csv", out)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("must be different files", result.stderr)
+        self.assertFalse(os.path.exists(out))
+
     def test_root_filter_and_limit(self):
         with open(os.path.join(self.root, "00000000.bin"), "wb") as f:
             f.write(wide_blob())
@@ -381,6 +460,15 @@ class OutputTest(unittest.TestCase):
         self.assertEqual(summary["roots"], {"OtherRoot": 1})
         docs, _ = rbf0_tree.decode_source(self.root, limit=1)
         self.assertEqual(len(docs), 1)
+
+    def test_decode_source_validates_selection_before_reading(self):
+        for settings, message in (({"limit": 0}, "--limit must be at least 1"),
+                                  ({"limit": -1}, "--limit must be at least 1"),
+                                  ({"offset": -1}, "--offset must be non-negative")):
+            with self.subTest(settings=settings), patch.object(
+                    rbf0_tree, "_rows", side_effect=AssertionError("invalid selection reached the source reader")):
+                with self.assertRaisesRegex(ValueError, message):
+                    rbf0_tree.decode_source(self.root, **settings)
 
     def test_bad_resource_exit_code(self):
         with open(os.path.join(self.root, "00000000.bin"), "wb") as f:

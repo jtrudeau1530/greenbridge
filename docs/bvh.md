@@ -96,8 +96,9 @@ at commit `9639942de5a8e5b01d91977f60ed82cda22d5f41`: `XboxBvh4Header` at L2531 
 
 **Probe provenance.** The sample column is the 64-byte header at payload offset `0x100` of the complete `bvh4`
 stream at archive offset `0x4050` (16,464) in `shared_minigame000_bvh4.rpf`, inflated size 655,360 bytes. The
-pack is read-only and is not in the repository; only these header fields are quoted. `tools/bvh_index.py` reports
-the same stream as `node_count=9943` and `tail_offset=636416`.
+pack is read-only and is not in the repository; only these header fields and the four root-record words quoted
+below are reproduced. `tools/bvh_index.py` reports the same stream as `node_count=9943` and
+`tail_offset=636416`.
 
 The offsets are relative to the header at `0x100`, not to the start of the payload. In the sample,
 `offsetToNodes` therefore addresses `0x59580` and `offsetToElements` addresses `0x4380`. The node and element
@@ -125,8 +126,9 @@ node_address = header + (ptr >> 3) * 64
 ```
 
 The type values are `0..3` = `TRI0..TRI3`, `4` = `BOX16`, `5` = `BOX32`, `6` = `INSTANCE`, `7` =
-`AABB_GEOMETRY`. `0xffffffff` is the invalid pointer. A `BOX32` node occupies 128 bytes, so it consumes two
-64-byte units; all other node records occupy 64 bytes.
+`AABB_GEOMETRY`. `0xffffffff` is the invalid pointer; the indexer reports it as `root_node_invalid: true` with
+the type name `invalid`, rather than naming it `AABB_GEOMETRY`. A `BOX32` node occupies 128 bytes, so it consumes
+two 64-byte units; all other node records occupy 64 bytes.
 
 The runtime records, which are what the traversal shaders read, are defined in the same file at L2285 (`Node16`),
 L2302 (`Node32`) and L2342 (`Leaf`). The sample is dehydrated, so these source layouts are not instantiated by
@@ -273,12 +275,13 @@ into three 64 KiB/26 KiB chunks. These list the per-tile BVH packs; they are the
 
 `tools/bvh_index.py` (standard library only) scans an RPF9 archive or a directory of `.rpf`/`.bin` payloads and
 writes JSON and/or CSV with offset, stored size, inflated size, kind, signature, node count, tail offset, the
-`XboxBvh4Header` fields, root pointer/index/type, declared bytes, bounds, descriptor key/transform and fill
-counts. It reads only headers and emits no payload bytes.
+`XboxBvh4Header` fields, root pointer/index/type/invalid flag, declared bytes, bounds, descriptor key/transform
+and fill counts. It reads only headers and emits no payload bytes. The row's `version` is the low 16 bits of
+`flags` as an integer; `flags` keeps the full 32-bit word.
 
 ```powershell
-python -I tools/bvh_index.py <archive.rpf> --out index.json --csv index.csv
-python -I tools/bvh_index.py <carve-dir> --out index.json
+python -I tools/bvh_index.py <archive.rpf> --out <temp>/index.json --csv <temp>/index.csv
+python -I tools/bvh_index.py <carve-dir> --out <temp>/index.json
 python -I tests/test_bvh_index.py
 ```
 

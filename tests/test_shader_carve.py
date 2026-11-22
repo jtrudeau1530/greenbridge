@@ -9,13 +9,17 @@ Validates tools/shader_carve.py without touching game files or proprietary asset
 - Candidate size filtering, raw deflate decompression error handling, and container integrity checks
 - End-to-end archive carving, duplicate variant naming, filename character sanitization, and index.json output
 """
+import contextlib
+import io
 import json
+import mmap
 import os
 import struct
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 import zlib
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -437,6 +441,20 @@ class ShaderCarveCliIntegrationTest(unittest.TestCase):
         self.assertIsNone(index[5]["sm"])
         self.assertIn("PRIV", index[5]["parts"])
 
+    def test_carve_rejects_unfinished_deflate_stream(self):
+        dxbc = make_dxbc([(b"DXIL", make_dxil_payload(0x66, 5))])
+        compressor = zlib.compressobj(wbits=-15)
+        compressed = compressor.compress(dxbc) + compressor.flush(zlib.Z_SYNC_FLUSH)
+        with open(self.archive, "wb") as f:
+            f.write(make_rpf_entry("synthetic", 1, dxbc, compressed_override=compressed))
+
+        res = self.run_carve(self.archive, self.out)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn("0 shaders carved, 1 candidates rejected", res.stdout)
+        with open(os.path.join(self.out, "index.json"), encoding="utf-8") as f:
+            self.assertEqual(json.load(f), [])
+        self.assertEqual(os.listdir(self.out), ["index.json"])
+
     def test_carve_rejects_incomplete_parts_and_continues(self):
         valid = make_dxbc([(b"PRIV", bytes(range(32)))])
         short_directory = bytearray(valid)
@@ -464,6 +482,74 @@ class ShaderCarveCliIntegrationTest(unittest.TestCase):
         missing = os.path.join(self.dir, "missing.rpf")
         res = self.run_carve(missing, self.out)
         self.assertNotEqual(res.returncode, 0)
+
+    def test_bad_inputs_are_usage_errors_and_leave_no_output_folder(self):
+        empty = os.path.join(self.dir, "empty.rpf")
+        open(empty, "wb").close()
+        cases = ((os.path.join(self.dir, "missing.rpf"), "is not a file"),
+                 (self.dir, "is not a file"),
+                 (empty, "is empty"))
+        for archive, message in cases:
+            res = self.run_carve(archive, self.out)
+            self.assertEqual(res.returncode, 2, res.stderr)
+            self.assertIn(message, res.stderr)
+            self.assertNotIn("Traceback", res.stderr)
+            self.assertFalse(os.path.exists(self.out))
+
+        dxbc = make_dxbc([(b"PRIV", bytes(range(32)))])
+        with open(self.archive, "wb") as f:
+            f.write(make_rpf_entry("valid", 1, dxbc))
+        out_file = os.path.join(self.dir, "out_file")
+        with open(out_file, "wb") as f:
+            f.write(b"x")
+        res = self.run_carve(self.archive, out_file)
+        self.assertEqual(res.returncode, 2, res.stderr)
+        self.assertIn("is a file, not a folder", res.stderr)
+        self.assertNotIn("Traceback", res.stderr)
+
+    def test_carve_preserves_existing_index_temp_sibling(self):
+        dxbc = make_dxbc([(b"PRIV", bytes(range(32)))])
+        with open(self.archive, "wb") as f:
+            f.write(make_rpf_entry("valid", 1, dxbc))
+        os.mkdir(self.out)
+        sibling = os.path.join(self.out, "index.json.tmp")
+        with open(sibling, "w", encoding="utf-8") as f:
+            f.write("keep me")
+
+        result = self.run_carve(self.archive, self.out)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        with open(sibling, encoding="utf-8") as f:
+            self.assertEqual(f.read(), "keep me")
+        with open(os.path.join(self.out, "index.json"), encoding="utf-8") as f:
+            self.assertEqual([row["name"] for row in json.load(f)], ["valid"])
+        self.assertFalse(any(os.path.isdir(os.path.join(self.out, name)) for name in os.listdir(self.out)))
+
+    def test_main_closes_mmap_on_exit(self):
+        dxbc = make_dxbc([(b"PRIV", bytes(range(32)))])
+        with open(self.archive, "wb") as f:
+            f.write(make_rpf_entry("valid", 1, dxbc))
+        real_mmap = mmap.mmap
+        opened = []
+
+        def record(*args, **kwargs):
+            m = real_mmap(*args, **kwargs)
+            opened.append(m)
+            return m
+
+        with mock.patch("shader_carve.mmap.mmap", side_effect=record):
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(shader_carve.main([self.archive, self.out]), 0)
+        self.assertEqual(len(opened), 1)
+        self.assertTrue(opened[0].closed)
+        os.remove(self.archive)
+        self.assertFalse(os.path.exists(self.archive))
+
+    def test_no_arguments_is_a_usage_error(self):
+        res = subprocess.run([sys.executable, "-I", TOOL], capture_output=True, text=True)
+        self.assertEqual(res.returncode, 2, res.stderr)
+        self.assertIn("required", res.stderr)
+        self.assertNotIn("Traceback", res.stderr)
 
 
 if __name__ == "__main__":

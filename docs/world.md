@@ -198,7 +198,7 @@ world rotation (conjugate it for rendering). `scaleXY` applies to X/Y, `scaleZ` 
 | `scaleXY` | `9ca32637` | +0x54 | f32 | XY scale |
 | `scaleZ` | `10fb7c42` | +0x58 | f32 | Z scale |
 | `flags` | `67d26872` | +0x48 | u32 | entity flags |
-| entity id | `1b60404d` | +0x08 | u64 | per-entity id (unique; not a name key) |
+| entity id | `1b60404d` | +0x08 | u64 | per-entity id (not a name key; not unique, see world_names.md) |
 | archetype key | `c8a7b90a` | +0x20 | u64 | per-archetype key: MurmurHash3 x64 128 low 64 of the name |
 | `lodLevel` | `6c8f1715` | +0x7e | u8 | 0 HD, 1 LOD, 2 SLOD1, 3 SLOD2, 4 SLOD3, 5 ORPHAN_HD, 6 SLOD4 |
 | `parentIndex` | `d89231bd` | +0x5c | i16 | parent entity index (signed; -1 = none) |
@@ -225,7 +225,9 @@ table, not fixed offsets.
 assuming it. A local 79,738-name dictionary resolved 5,107/24,105 distinct archetype hashes (8,263/203,799
 entities) in two 1 GiB windows, every one confirmed by the 64-bit key, and rejected one 32-bit-only candidate.
 The same dictionary resolved 5/23,535 map names and 1/2,089 parent rows, all confirmed by the map key. This is a
-name-source lower bound, not a formula limit. See [world_names.md](world_names.md) and `tools/world_names.py`.
+name-source lower bound, not a formula limit: with the names `tools/rpf9_names.py` lists in `levels.rpf`, 99.85%
+of the 1,670,435 entities a whole-archive `world_index.py` run reads resolve, all verified by the 64-bit key. See [world_names.md](world_names.md) and
+`tools/world_names.py`.
 
 ### Measured placement summary
 
@@ -260,15 +262,14 @@ that was a lower bound, and the full pass settles the extrapolation. See
 coverage.
 
 The full count is lower than SixNG's published 30,785 map files / 2,249,490 entities
-(https://github.com/holdmysocks/SixNG). A census of the other ten non-radio archives found no maps
-outside `levels.rpf`, so the 7,250-map / 579,048-entity difference is not explained by other archives;
-duplicate map payloads and map-name hashes are zero, and the 138,839 `CMapData`-only metadata
-resources cannot account for the 579,048 entities (see
-[world_census.md](world_census.md#other-archives)). The census counts only
-validated `0x7a` resources whose schema includes `CMapData` and whose entity table is self-consistent;
-SixNG may count archive entries, nested maps, or map resources that this scanner rejects. Treat the
-23,535 / 1,670,442 figure as the measured count for this package and this validation rule, not as a
-claim about a different enumeration method.
+(https://github.com/holdmysocks/SixNG), and the whole difference is now accounted for map by map (see
+[world_census.md](world_census.md#the-sixng-difference-map-by-map)). The 23,528 maps both count agree
+on every entity count. SixNG also counts 7,257 `0x7a` resources that have `CEntityDef` objects but no
+`CMapData` struct: 961 interior archetype resources (`CMloArchetypeDef`, 540,665 entities in interior
+space) and 6,296 `35abc248` entity groups (39,622 entities in group-local space). It misses 7 maps
+(1,239 entities) whose entity data is in a continuation page. 7,257 − 7 = 7,250 maps and 580,287 −
+1,239 = 579,048 entities. The 23,535 / 1,670,442 census figure is the count of world placement
+lists; interiors and entity groups need the transform of whatever places them.
 
 ## What is readable, what is hash-only
 
@@ -284,12 +285,11 @@ Hash-only or opaque:
 - map file `name`/`parent` (32-bit hashes; `parent` is non-zero in 2,089 of the 23,535 census maps). A local
   dictionary resolves 5 names and 1 parent; all five names are confirmed by the map root's 64-bit key. The
   remaining map-cell names are not in the local model/XML exports;
-- most `archetypeName` values. The repo's model export reports 155,598 models with names/bounds, but the local
-  dictionary used here contains 79,738 exact names. It resolves 5,107 of 24,105 distinct archetype hashes
-  (8,263 of 203,799 entities, 4.05%) in the two 1 GiB windows in [world_names.md](world_names.md); every match
-  is confirmed by the 64-bit key. The unresolved 95.95% are hash-only because their names are not in the local
-  exports, not because a different formula was observed. This is a lower bound, not a claim that the names do
-  not exist;
+- `archetypeName` values are 32-bit hashes, but nearly all of them resolve. With the `name.#dr`/`name.#ft` strings
+  that `tools/rpf9_names.py` lists in `levels.rpf` as the dictionary, 1,667,978 of 1,670,435 entities (99.85%,
+  227,422 of 228,681 distinct hashes) resolve, every one verified by the entity's 64-bit key; see
+  [world_names.md](world_names.md#whole-archive-coverage). The earlier figures (5,107 of 24,105 hashes, 8,263 of
+  203,799 entities = 4.05%, in two 1 GiB windows) used only names already exported locally;
 - texture keys do not appear in placement records. They are 64-bit asset keys in model materials, so a runtime
   resolves placement → archetype → model → material asset key;
 - the 0–2 GiB 7-struct family's field semantics and most of its payload;
@@ -297,6 +297,27 @@ Hash-only or opaque:
 - texture dictionaries: no `.#td` system page was found in the sampled `levels.rpf` windows. World textures in
   this package are the loose RDS5 pools under `data/ttdb` plus `textures.rpf`, so placement records do not
   carry texture names, only material/asset keys in the model resources.
+
+## Location, interior, river and road names (`GameShape__Data__LocationNameLoopkup`)
+
+The place names shown to the player come from one `GameShape__Data__LocationNameLoopkup` XML document in
+`common.rpf` (the root name keeps its `Loopkup` spelling). Counts only; no names or keys.
+
+| Section | Items | Content |
+|---|---:|---|
+| `LocationNames/Item key=...` | 2,318 | `Name` (empty in 382); 46 items also name a `TextureDictionary` (2 distinct) and a `Texture` (46 distinct) |
+| `InteriorNames/Item key=...` | 1,358 | 2,280 inner `Item`s, each `Name` (empty in 434) and `Pos` (`x y z`); 1 position in 1,192 interiors, 2 or more in the other 166 |
+| `RiverNames/Item key=...` | 66 | the name as item text |
+| `RoadNames/Item key=...` | 409 | `Name` |
+
+- Keys are plain text, distinct within each section, and no key is shared between the location, river and road
+  sections.
+- **All 2,280 interior positions lie inside the world rectangle** shared by the `PAMH` heightmap and the region
+  tint map (x -13,312..5,120, y -9,728..11,264); none is at the origin. Heights run from -78 to 821 (median 5).
+- None of the keys is an archive entry name or the joaat of a model archetype name in the local catalog, the two
+  texture-dictionary names match archive entries but not `.ytd` ones, so the keys are their own namespace (probably shape
+  or zone ids resolved elsewhere at runtime; not measured). The 46 textures match no texture-dictionary item
+  in the catalog either.
 
 ## What a runtime needs
 
@@ -318,13 +339,43 @@ Hash-only or opaque:
 6. **Model/texture layer.** The existing manifest gives names/bounds; texture keys are 64-bit asset keys in
    model materials. Placement itself contains neither geometry nor texture names.
 
+## Region tint map (`RegionTintMap`)
+
+One `RegionTintMap` XML document in `common.rpf` (see [gamedata.md](gamedata.md)) places a single streamed,
+tiled tint texture over the world. Counts only; no names.
+
+| Field | Value |
+|---|---|
+| `RegionTintMaps/Item` | 1 |
+| `WorldAABBMin`, `WorldAABBMax` | x -13,312 to 5,120, y -9,728 to 11,264 (18,432 x 20,992 units) |
+| `StreamingDesc/NumberOfTilesX`, `Y` | 36 x 41 |
+| `StreamingDesc/TileSize` | 512 x 512 |
+| `TintMapType`, `RegionTintMapFilename` | one token each |
+| `channelRed`, `channelGreen`, `channelBlue`, `channelAlpha`, `settings/pairs` | empty |
+
+Two exact matches tie this to the rest of the world data:
+
+- The tiles cover the box exactly: 36 x 512 = 18,432 and 41 x 512 = 20,992, so there is no partial tile.
+- The box is identical to the six-float bounds of the `PAMH` max/min heightmap in [gamedata.md](gamedata.md),
+  `(-13312, -9728)` to `(5120, 11264)` in x and y. The tint map and the coarse heightmap therefore share one
+  world rectangle, and that rectangle also has the same minimum x as the four `GridAtlasInfo` grids.
+
+Entity positions from a local index of map resources (2,036,542 placements, 2,011,519 of them in `levels.rpf`)
+lie within x -9,955 to 4,577 and y -8,096 to 9,440 at the 0.1th/99.9th percentiles, inside this rectangle.
+
+The texture named by `RegionTintMapFilename` is not an archive entry or texture-dictionary item in the local
+catalog, so the tile contents are unknown. With all four channel names empty, which tint each channel carries
+is not stated here either.
+
 ## Tool
 
 `tools/world_index.py` scans an RPF9 archive or a directory of carved streams and writes JSON/CSV with
 `offset, size, signature, version, kind, structs, blocks, entities, extents, position bounds, LOD counts`,
 map name/parent hashes and the map root's 64-bit name key. It implements the header/schema validation above
-and the continuation join. It does not decrypt anything, does not extract models/textures, and keeps the
-output aggregate (one row per resource, no entity dump).
+and the continuation join. It does not decrypt anything and does not extract models/textures. Its JSON/CSV
+output is aggregate (one row per resource). `--entities-out` adds a local-only JSON-lines file with one row per
+complete entity (archetype hash and key, position, stored rotation, scales, LOD fields), the input of
+`world_build.py --placements` below.
 
 `tools/world_census.py` scans the whole `levels.rpf` data area in shards and counts every validated
 `0x7a` map resource and placement entity. The measured full pass is 23,535 maps / 1,670,442 entities
@@ -346,6 +397,275 @@ python -I tests\test_world_names.py
 For a 76 GB archive always bound the run with `--start/--limit`; the tool records the window in its summary.
 A 0x7a resource split beyond the first continuation, or a map whose entity block lives in a graphics page, is
 reported with fewer entities or as `meta` rather than guessed.
+
+## Building a placed world
+
+`tools/world_build.py --placements` builds the viewer's chunks from map placements instead of each model's own
+coordinates. It covers points 3 and 4 of *What a runtime needs*, and approximates point 5 with `--lod-sets`
+(below).
+
+1. `world_index.py <levels.rpf> --entities-out <work>\world\entities.jsonl` writes one row per complete entity.
+2. rpf9dump exports the models (`models/manifest.json` + OBJ).
+3. `world_build.py <assets> --out <world> --placements <entities.jsonl>`. Each selected entity is matched to an
+   exported model by the lower-cased joaat of the manifest `Name` without its `.#dr`/`.#ft` suffix. When the
+   entity row carries the +0x20 key, the model's Murmur3-64 must equal it, as in `world_names.py`; a 32-bit-only
+   match is a `key_mismatch` and is not placed. The model is scaled by (`scaleXY`, `scaleXY`, `scaleZ`), rotated
+   by the **conjugate** of the stored quaternion, translated to `position`, and converted from RAGE Z-up to
+   glTF Y-up `(x, z, -y)`.
+
+`--lod-levels` picks the `lodLevel` values to place (default `0,5`: HD and ORPHAN_HD) and `--region
+MINX,MINY,MAXX,MAXY` bounds the RAGE world X/Y. `world.json` then has `"layout": "placements"` and a
+`stats.placements` block: `rows`, `malformed`, `other_lod_level`, `outside_region`, `selected`, `placed`,
+`placed_unverified` (no key in the row), `key_mismatch`, `unresolved_archetype` (no exported model has that name),
+`model_not_loadable`, `degenerate_scale`, `mirrored` and `distinct_models`.
+
+### Shared geometry (`--instancing`)
+
+A city has 1.55 M HD placements of about 120 k models, and most models are placed many times. By default
+(`--instancing gpu`) each model's OBJ is parsed once into a packed cache file, each chunk stores every model it uses
+once, and the placements in the chunk are instance transforms (`EXT_mesh_gpu_instancing`: one node per model with
+`TRANSLATION`/`ROTATION`/`SCALE` accessors; listed in `extensionsRequired`). three.js's `GLTFLoader`, which the
+viewer uses, turns each such node into `InstancedMesh`es. `--instancing nodes` writes one plain glTF node per
+placement instead, for loaders without the extension (a draw call per placement). `--instancing bake` keeps the
+first version's output, where every placement is a transformed copy of the geometry.
+
+Each chunk is written as soon as it is built, so memory holds about 100 bytes per placement plus the models of
+the chunks being written, not the whole map. `--jobs N` packs models and writes chunks in N processes.
+
+Every instance transform has a positive determinant, so the winding is right in any loader:
+- the TRS is the baked transform split into node form (checked against it on random rotations and scales);
+- a negative `scaleXY` is a 180° turn about the model's Z axis and is folded into the rotation;
+- a negative `scaleZ` mirrors. Those placements draw a mirrored copy of the mesh (glTF Y negated, winding
+  reversed) with a positive scale, counted as `mirrored`;
+- a zero scale cannot be inverted for normals; those rows are counted as `degenerate_scale` and not placed.
+
+Chunk records add `distinct_models` (meshes stored) and `stored_triangles`; `triangles` stays the drawn count
+(each mesh's triangles times its placements). `world.json` adds `instancing`, `stats.stored_triangles`,
+`stats.chunk_bytes` and `stats.max_chunk_bytes`.
+
+### LOD sets (`--lod-sets`)
+
+`--lod-sets` places every `lodLevel` (unless `--lod-levels` narrows it) and builds one chunk set per tier, ids
+`c_<tier>_<x>_<z>` with tiers `hd`, `lod`, `slod1`, `slod2`, `slod3`, `slod4` and `orphan_hd`. Each chunk record
+names its `lod` tier and its grid `cell` (`[minx, minz, maxx, maxz]`, glTF metres). `world.json` gets
+`lod_bands`: for each tier, the camera distance band in which it is drawn, from the selected entities:
+
+- a tier starts at its own median `childLodDist` (the distance inside which a parent hands over to its children);
+  HD starts at 0;
+- it ends where the next coarser tier present starts; the coarsest tier ends at its median `lodDist`;
+- ORPHAN_HD has no parent and runs from 0 to its median `lodDist`.
+
+`stats.lod_tiers` records the medians and each tier's chunk and placement counts. The viewer loads a tiered chunk
+while the horizontal distance from the camera to its cell is inside the band, and keeps it up to 32 m past the
+band, so each cell shows one tier. Worlds without `lod_bands` stream as before.
+
+Tier medians over all 1,670,435 entities (`lodDist` ≤ 0 means "use the archetype's default" and is left out):
+
+| Tier | Entities | Median `childLodDist` | Median `lodDist` | Band |
+|---|---:|---:|---:|---|
+| HD | 1,153,122 | — | 124 (97,625 set) | 0–130 |
+| LOD | 100,953 | 130 | 450 | 130–450 |
+| SLOD1 | 16,828 | 450 | 1,000 | 450–1,000 |
+| SLOD2 | 1,708 | 1,000 | 2,000 | 1,000–1,976 |
+| SLOD3 | 601 | 1,976 | 4,000 | 1,976–6,043.5 |
+| SLOD4 | 352 | 6,043.5 | 20,000 | 6,043.5–20,000 |
+| ORPHAN_HD | 396,871 | — | 1,000 | 0–1,000 |
+
+From HD to SLOD2, each tier's median `lodDist` is within 5% of the next tier's median `childLodDist` (124/130,
+450/450, 1,000/1,000, 2,000/1,976), so the two fields agree on the bands. For SLOD3 they differ (4,000 and
+6,043.5), and the band follows `childLodDist`.
+
+This is an approximation of point 5, per cell and per tier. Per-entity `lodDist` overrides and the
+`parentIndex`/`numChildren` links are not used: an entity row doesn't say which map file it came from, and
+`parentIndex` is an index into that file's entity table.
+
+### Measured
+
+On the 1.0.2.1 package, `levels.rpf`, Linux, 88 cores, `--no-textures`, 256 m chunks. Models were exported with
+rpf9-explorer at Leonida's pin (917e9b9) and with breadbbbb/rpf9-explorer#8 and #10 applied. Each placement was
+counted against the first export and built from the second.
+
+| Step | Result |
+|---|---|
+| `--entities-out` over the whole data area (24 parallel `--start/--limit` windows) | 1,670,435 rows, 66 s |
+| `lodLevel` split | 0: 1,153,122 · 5: 396,871 · 1: 100,953 · 2: 16,828 · 3: 1,708 · 4: 601 · 6: 352 |
+| HD + ORPHAN_HD placements with a recovered model (joaat + Murmur3-64) | 640,080 of 1,549,993 (41.3%) at the pin; 1,549,347 (99.96%) with #8/#10, from 121,411 resources |
+| 700 m × 700 m downtown box, 10,729 placements, `--jobs 16` | `bake` (#1183): 5 min, 22 GB peak RSS. `gpu`: 35 s; 0.43 GB in the largest process, 1.93 GB for all 17 processes; same 16 chunks and 29,331,138 triangles |
+| **whole city**, HD + ORPHAN_HD, `gpu`, `--jobs 40` | 1,549,343 placed (646 `unresolved_archetype`, 4 `model_not_loadable`, 0 `key_mismatch`, 0 `mirrored`), 121,407 distinct models → 2,940 chunks; 7.31 G triangles drawn, 3.34 G stored; 125 GB of GLB, median chunk 17 MB, largest 926 MB; 21 min; 3.4 GB in the largest process, 38 GB for all 41 processes |
+| **whole city, all tiers, `--lod-sets`, `gpu`, `--jobs 24`** | 1,669,771 placed (660 `unresolved_archetype`, 4 `model_not_loadable`), 228,566 distinct models → 12,340 chunks: HD 2,911 (median 16.9 MB), LOD 2,836 (0.6 MB), SLOD1 2,811, SLOD2 1,222, SLOD3 501, SLOD4 284 (all ≤ 0.1 MB median), ORPHAN_HD 1,775 (3.0 MB); bands as in the table above; 33 min; 2.6 GB in the largest process, 30 GB for all 25 |
+| what the viewer loads at the densest HD cell (camera at street level in its centre) | with `lod_bands`: 577 chunks, 180 M triangles, 3.1 GB of GLB (5 HD, 69 ORPHAN_HD, the rest LOD/SLOD); the same city without LOD sets at the viewer's 1,400 m radius: 119 chunks, 1,060 M triangles, 16.3 GB |
+
+Checks:
+- Every chunk of the whole-city build passes a structural check: accessors inside their bufferViews, indices
+  below the vertex count, POSITION `min`/`max` equal to the data, the instancing attributes' counts equal, unit
+  rotations, and positive finite scales. Recomputed from the GLBs, the chunk bounds, placement counts (1,549,343)
+  and drawn triangles (7,311,221,858) equal `world.json`.
+- three r160's `GLTFLoader` (the viewer's loader), run under Node, parses 65 of the city chunks: 60 random and the
+  5 largest, including the 926 MB one. It builds `InstancedMesh`es whose drawn triangles equal `world.json`, with
+  bounds inside the chunk's bounds. It also parses all 16 chunks of the box and 35 chunks of the LOD-set build
+  (4 random and the largest per tier).
+- The LOD-set build's 12,340 chunks pass the same structural check; 1,669,771 placements and 7,527,211,045 drawn
+  triangles equal `world.json`.
+- On the downtown box, the conjugate of every stored rotation equals SixNG's independently derived world rotation:
+  |dot| ≥ 0.9999 on 29,124 of 29,125 entities matched by position and archetype, and the minimum is 0.99894.
+  Scales are equal on all 29,125. The instance TRS equals that transform (see the tests).
+
+The pin's 41.3% is a model-recovery gap, not a naming gap: almost every archetype name resolves (99.85%, see
+*What is readable* above), but only recovered models can be placed. The archetypes that #8/#10 add are `.#ft`
+fragments, whose headers the pinned `LooksLikeFragment` rejects (breadbbbb/rpf9-explorer#8).
+
+**Not verified or limited:**
+- Nothing here was looked at in a browser. The checks above are structural and numeric.
+- Memory grows with `--jobs` (each worker holds the models of one chunk), not with the map: 38 GB at 40 jobs, 30
+  GB at 24 jobs for a bigger build, 1.9 GB at 16 jobs for the box.
+- With LOD sets, most of what is still loaded near the centre is ORPHAN_HD: it has no parent tier, so its band is
+  0 to 1,000 m.
+- Chunk sizes follow model detail. A few dense downtown cells exceed 100 MB, and the largest stores 24 M
+  triangles of 2,204 distinct models, so a smaller `--chunk-size` there helps a browser.
+- No placement in this package has a negative `scaleZ`, so the mirrored path is checked by the synthetic tests
+  only.
+- Textures were not part of these runs (`--no-textures`).
+
+```powershell
+python -I tools\world_index.py <levels.rpf> --out work\world\index.json --entities-out work\world\entities.jsonl
+python -I tools\world_build.py work\assets --out work\world\placed --no-textures --jobs 16 `
+    --placements work\world\entities.jsonl
+python -I tools\world_build.py work\assets --out work\world\lod --no-textures --jobs 16 `
+    --placements work\world\entities.jsonl --lod-sets
+python -I tests\test_world_place.py
+python -I tests\test_world_instancing.py
+node --test tests\test_viewer_streaming.cjs
+```
+
+The entity rows and the placed chunks come from your own copy of the game; keep them in the local work folder.
+## Trains (`CTrainConfigs`)
+
+Trains are configured by one `CTrainConfigs` XML document in `common.rpf` (see [gamedata.md](gamedata.md)).
+Counts only; no names.
+
+| Path | Count | Content |
+|---|---:|---|
+| `trainConfigs/Item` | 46 | `name` (46 distinct), station stop durations, announce/beep/hang/swing flags, `carriageGap`, `defaultMaxSpeed`, `maxAcceleration`, `maxDeceleration`, `populateTrainDist`, `deathToReviveTime`, `carriages` |
+| `.../carriages/Item` | 314 | `modelName` (304), `modelSetName` (300), `maxPedsPerCarriage`, `flipModelDir`, `doInteriorLights`; 1 to 17 per train (median 8) |
+| `trainGroups/Item` | 5 | `name` and `trainConfigRefs` (24, 4, 5, 1 and 2 refs) |
+| `.../trainConfigRefs/Item` | 36 | `trainConfigsName` and `trainConfigIndex` |
+
+**Group references: resolve by name, not by index.** All 36 `trainConfigsName` values name a config and all 36
+`trainConfigIndex` values are in range, but only 25 indices equal the position of the named config. The other 11
+are exactly one less. The split is clean: every reference to a config at (0-based) position 23 or earlier agrees, and every
+reference to a config at position 26 or later is off by one. That is what one config inserted at position 24 or
+25 after the indices were written would produce, so `trainConfigIndex` looks stale: a loader that trusts it
+would pick a different config for 11 of the 36 references. 12 of the 46 configs are in no group.
+
+Carriage models: the 304 `modelName` values use 13 distinct names; 9 are `.yft` base names in the local archive
+catalog and all 9 are among the vehicle distant-light models, while 4 match no archive entry. The 23 distinct
+`modelSetName` values resolve to an archive entry name in 9 cases. Every carriage has a model name, a model set,
+or both (290 have both).
+
+Ranges: `defaultMaxSpeed` 8 to 15 (median 8), `maxAcceleration` 1 and `maxDeceleration` 2 in all 46,
+`populateTrainDist` 40 in all 46, `carriageGap` -0.5 to 0.1.
+
+## Instanced props and grass
+
+Map resources can carry two instance lists besides `CEntityDef`. All four struct names are the case-sensitive
+joaat of the GTA V class names, and every member below is named by the resource's own member table.
+`tools/instance_lists.py` reads them through that table (by name hash) and writes counts only.
+
+| Hash | Struct | Size | Members (offset) |
+|---|---|---:|---|
+| `0xBA049770` | `rage__fwPropInstanceListDef` | 0x170 | `CEntityDef` members, `InstanceList` 0x90, `BatchAABB` 0xA0, `ScaleRange` 0x160, `InstanceLodDist` 0x168 |
+| `0xEA6B3A96` | `rage__fwPropInstanceListDef__InstanceData` | 0x40 | `InstMat` 0x0 (3x4 floats, translation in the last column), `Tint` 0x34 |
+| `0x7C475B5D` | `rage__fwGrassInstanceListDef` | 0x1A0 | `CEntityDef` members, `BatchAABB` 0x80, `ScaleRange` 0xA0, `LodFadeStartDist` 0xB8, `InstanceLodDist` 0xBC, `OrientToTerrain` 0xC0, `slodID` 0xB0, `IsSLODList` 0x150, `SLODArchetypeList` 0x158 (array), `InstanceList` 0x178 |
+| `0xED86F522` | `rage__fwGrassInstanceListDef__InstanceData` | 0x10 | `Position` 0x0 (3 x u16 in `BatchAABB`), `NormalX` 0x6, `NormalY` 0x7, `Color` 0x8 (3 bytes), `Scale` 0xB, `ScaleZ` 0xC, `RotationIdx` 0xD |
+
+Two more grass-list members are named by joaat from a brute force over common engine words: `slodID` (0xB0, member hash `9fe78fd1`) and `SLODArchetypeList` (0x158, `b451fc98`), so grass lists carry their own link to an SLOD archetype set next to `IsSLODList`. The other unnamed members stay as hashes in the schema.
+
+An `InstanceList` is a u64 (low 12 bits: 1-based block index; bits 20+: offset in that block) and a u16 count.
+Instance blocks are usually in the physical buffer, so the tool joins each resource's virtual and physical
+streams from its block map (+0x08 -> +8 virtual count, +9 physical count).
+
+Full run over `levels.rpf`, `story000.rpf` and `shared_minigame000.rpf` (stream occurrences, duplicates
+included):
+
+| Archive | Map resources | With lists | Prop lists | Prop instances | Grass lists | Grass instances |
+|---|---:|---:|---:|---:|---:|---:|
+| `levels.rpf` | 188,447 | 135,560 | 690,779 | 24,778,818 | 202,143 | 219,453,097 |
+| `story000.rpf` | 48,084 | 2,683 | 4,833 | 1,652,980 | 5,504 | 5,641,657 |
+| `shared_minigame000.rpf` | 787 | 472 | 3,317 | 51,795 | 592 | 437,849 |
+| total | 237,318 | 138,715 | 698,929 | 26,483,593 | 208,239 | 225,532,603 |
+
+Struct sizes and every member offset in the table match the schema in all 98,722 resources with prop lists
+and all 57,650 with grass lists. 29,482 prop lists and 8,015 grass lists point to a block outside the
+streams the tool joined; their instances are not counted.
+
+Props (26,483,593 instances): every matrix is right-handed; 26,046,778 have orthonormal axes (within 0.01),
+25,936,781 are uniformly scaled and 4,692,108 have unit scale; the translation is inside the list's
+`BatchAABB` for 26,386,624. List `lodLevel`: LOD 424,012, HD 116,660, ORPHAN_HD 93,958, SLOD1 64,299. Every
+list has an ordered `ScaleRange` and `0 < InstanceLodDist <= lodDist`.
+
+Grass (225,532,603 instances): 225,379,032 `NormalX`/`NormalY` pairs (byte / 127.5 - 1) are inside the unit
+disc; `RotationIdx` is 0 to 72; `ScaleZ` equals `Scale` in 52,021,564 and `Scale` is 0 in 47,679,734, so
+`ScaleZ` is its own value, not ambient occlusion. `OrientToTerrain` is 1.0 in all 208,239 lists, `IsSLODList`
+is set in 5,802, and `lodLevel` is ORPHAN_HD in 205,181 and SLOD1 in 3,058.
+
+## Procedural objects and plants (`CProceduralInfo`)
+
+In GTA V, `procedural.meta` scatters small objects and plants over ground by collision material: a tag table maps
+material procedural tags to entries in an object list and a plant list. This build's equivalent, one
+`CProceduralInfo` XML document in `common.rpf`, has the same three parts but only the table is filled. Counts
+only; no names.
+
+| Path | Count | Content |
+|---|---:|---|
+| `procObjInfos` | 1 | empty |
+| `plantInfos` | 1 | empty |
+| `procTagTable/Item` | 255 | `name`, optional `procObjTag` (66, all distinct) and `plantTag` (69, 57 distinct); 30 items have both |
+
+- **The two lists the tags point into are empty**, so no procObj or plant tag resolves inside this document. The
+  procedurally scattered objects and plants are therefore either stored elsewhere in this build or replaced by
+  the authored grass and prop instance lists above (225.5 million grass and 26.5 million prop instances).
+- The 255 table slots carry 107 distinct names. One name fills 149 slots, spread through the table (positions
+  67 to 254, not contiguous), and none of those 149 has a tag: they read as unused placeholder slots, which would
+  keep the slot index (the value a material would store) stable. The other 106 names occur once each, and
+  only one of them has neither tag.
+- `MaterialDataList`, which would carry each material's procedural tag, survives only from mid-document (see
+  the snow and mud section below); 1 of the 107 tag names occurs in its retained part.
+
+Not measured here (hypothesis): whether materials index this table by slot, as in GTA V, and where the
+object and plant definitions live.
+
+## Deformable snow and mud (`CSnowTrackData`)
+
+The tracks left in snow, mud and similar ground are configured by one
+`CSnowTrackData` XML document in `common.rpf` (see [gamedata.md](gamedata.md) for how it is carved). Counts
+only; no values or names.
+
+| Path | Count | Content |
+|---|---:|---|
+| `CommonDeepSurfaceParams/Item` | 16 | `Name`, `DebugColor`, `PhysicsMaterials`, and three parameter blocks: `HeightMapGenerationParams` (14 fields: depth, berm, noise, viscosity, lifetime, fade, blur, `POMScale`, plus `SupportPropFlatten` on 2), `TerrainRenderParams` (height, bump-map and displacement blend, normal scale), `PathRegenAndFlattenParams` (berm height, trail width, vegetation and explosion flattening) |
+| `.../PhysicsMaterials/Item` | 24 | one material name each; 0 to 6 per surface (0 on 6 surfaces, 1 on 5) |
+| `MudParams` | 1 | 23 fields: soak and puddle-fill ramps, puddle scale/ripple/slope/mask/specular, mip bias, POM and height-map puddle scale, two tint colours |
+| `TrackTypeData/Item` | 9 | `Name`, `Type` (3 distinct, used 5, 2 and 2 times), 17 numeric fields (sphere and berm scale, depth offset and bias, trail width/V-scale/depth/velocity ranges, grass flattening on land and in water), and three texture names: trail, print, mud displacement |
+| `SnowNormalMapName` | 1 | one texture name |
+| `GlobalDeepSurfaceParams` | 1 | tessellation-mask mip bias, deformation and parallax world-space widths, path-segment cull distance and time |
+| `TrailmapParams` | 1 | width and side offsets, and water-push sphere and trail strengths |
+
+So the system is a world-space height map stamped by moving spheres and trails, rendered with tessellation,
+parallax occlusion mapping and a normal map, with a separate mud/puddle layer; that is the reading of the field
+names, and the values were not tested in a renderer.
+
+Cross-checks:
+
+- **Physics materials.** The 24 names are distinct. `MaterialDataList`, the material table, survives only from
+  the middle of the document (its first block is in the unread region of `common.rpf`); 13 of the 24 names occur
+  in the retained part. The other 11 may be in the lost part, so no name is shown to be missing.
+- **Textures.** The 9 distinct texture names (8 track textures and the snow normal map) match no archive entry
+  name and no texture-dictionary item name or its joaat hash in the local catalog (118,925 named items). The
+  catalog is incomplete for names, so this does not show the textures are absent.
+
+Not measured here (hypothesis): which surfaces the 16 entries are (their names suggest snow, mud and sand
+variants), how `Type` selects a track type for peds, animals and vehicles, and the size of the deformation map
+(`DeformationWorldSpaceWidth` is the obvious input).
 
 ## No-sharing rule
 

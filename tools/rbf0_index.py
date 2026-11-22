@@ -236,7 +236,7 @@ def join_resource(rows, index, read, check_gap=True):
     j = index + 1
     while j < len(rows) and chunks < MAX_CHUNKS and len(blob) < MAX_BYTES:
         nxt = rows[j]
-        if nxt["size"] > MAX_CHUNK or nxt["head"][:4] in (MAGIC, b"PSIN"):
+        if rows[j - 1]["size"] != MAX_CHUNK or nxt["size"] > MAX_CHUNK or nxt["head"][:4] in (MAGIC, b"PSIN"):
             break
         if check_gap and nxt["offset"] > rows[j - 1]["offset"] + rows[j - 1]["stored"] + 16:
             break
@@ -366,8 +366,7 @@ def scan_rpf(path, start=None, limit=None, progress=None, string_limit=16):
     rows = []
     if os.path.getsize(path) == 0:
         raise ValueError("empty file")
-    with open(path, "rb") as fh:
-        mm = mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ)
+    with open(path, "rb") as fh, mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ) as mm:
         size = len(mm)
         first = struct.unpack_from("<I", mm, 4)[0] if size >= 8 else 0
         pos = start if start is not None else first
@@ -384,7 +383,7 @@ def scan_rpf(path, start=None, limit=None, progress=None, string_limit=16):
             if mm[s:s + 3] == b"KB2":
                 blen = (_u32(mm, s + 4) or 0) + 8
                 w, h = _u32(mm, s + 0x14), _u32(mm, s + 0x18)
-                if not (64 <= blen <= size - s and w and h and 16 <= w <= 8192 and 16 <= h <= 8192):
+                if not (64 <= blen <= end - s and w and h and 16 <= w <= 8192 and 16 <= h <= 8192):
                     pos = s + 1
                     continue
                 gap = mm[last:s]
@@ -397,8 +396,8 @@ def scan_rpf(path, start=None, limit=None, progress=None, string_limit=16):
             d = zlib.decompressobj()
             chunks, p = [], s
             try:
-                while not d.eof and p < size:
-                    block = mm[p:p + (1 << 20)]
+                while not d.eof and p < end:   # inside the --limit window, as in story_index (#712)
+                    block = mm[p:min(p + (1 << 20), end)]
                     chunks.append(d.decompress(block))
                     p += len(block)
                     if d.unused_data or d.eof:
@@ -424,7 +423,6 @@ def scan_rpf(path, start=None, limit=None, progress=None, string_limit=16):
         zero += len(gap) if z else 0
         unread += 0 if z else len(gap)
         mspan = end - span_start
-        mm.close()
     with ArchiveReader(path) as reader:
         records = resources_from_rows(rows, reader.read, check_gap=True, string_limit=string_limit)
     summary = summarise(rows, records, mspan, zero, unread, "rpf9")
@@ -437,7 +435,8 @@ def scan_dir(path, string_limit=16):
     entries = []
     for name in sorted(os.listdir(path)):
         full = os.path.join(path, name)
-        if not os.path.isfile(full):
+        # rpf9_carve.py's index.json and any .csv report sit next to the streams; they are not payloads.
+        if not os.path.isfile(full) or name.lower().endswith((".json", ".csv")):
             continue
         with open(full, "rb") as f:
             data = f.read()
@@ -503,6 +502,16 @@ def byte_count(text):
     return value
 
 
+def same_output_path(first, second):
+    """True when writing ``second`` would truncate ``first`` (same file, path or hard link)."""
+    if os.path.normcase(os.path.realpath(first)) == os.path.normcase(os.path.realpath(second)):
+        return True
+    try:
+        return os.path.samefile(first, second)
+    except OSError:
+        return False
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("source", help="an .rpf archive or a directory of carved streams")
@@ -513,6 +522,17 @@ def main():
     ap.add_argument("--all-strings", action="store_true", help="write every readable string to JSON (game data)")
     ap.add_argument("--quiet", action="store_true")
     a = ap.parse_args()
+    if same_output_path(a.source, a.out):
+        ap.error("output must not overwrite the source")
+    if a.strings < 0:
+        ap.exit(2, f"{ap.prog}: error: argument --strings: must be 0 or more\n")
+    if os.path.isdir(a.source) and (a.start is not None or a.limit is not None):
+        ap.error("--start and --limit apply to a single archive, not a directory")
+    if os.path.isdir(a.out):
+        ap.error(f"{a.out} is a folder, not a .csv or .json file")
+    folder = os.path.dirname(os.path.abspath(a.out))
+    if not os.path.isdir(folder):
+        ap.error(f"{folder} is not a folder, so {a.out} cannot be written")
     limit = None if a.all_strings else a.strings
     try:
         if os.path.isdir(a.source):
@@ -524,6 +544,8 @@ def main():
             rows, records, summary = scan_rpf(a.source, a.start, a.limit, progress, string_limit=limit)
     except ValueError as e:
         sys.exit(f"{a.source}: {e}")
+    except OSError as e:
+        sys.exit(f"{a.source}: {e.strerror or e}")
     write_output(a.out, records, summary, all_strings=a.all_strings)
     if not a.quiet:
         s = summary["rbf0"]
@@ -534,4 +556,8 @@ def main():
 
 
 if __name__ == "__main__":
+    try:  # a redirected stdout is strict ANSI code page under -I; write '?' for what it cannot encode
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
     sys.exit(main())

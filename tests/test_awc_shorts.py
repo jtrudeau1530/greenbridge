@@ -7,9 +7,11 @@ import importlib.util
 import io
 import os
 import struct
+import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -91,7 +93,7 @@ class ShortsTest(unittest.TestCase):
         with open(os.path.join(self.out, "stereo", "00001234.ogg"), "rb") as f:
             channels, granule = ogg_head_and_last_granule(f.read())
         self.assertEqual(channels, 2)
-        self.assertEqual(granule, 960)   # the synthetic bank has one 20 ms packet
+        self.assertEqual(granule, 960)   # one 20 ms packet; the declared count exceeds the payload
 
     def test_mono_selection_and_filter(self):
         path = self.write("mono.awc", 0x78, 480000)      # 10 s mono
@@ -114,9 +116,79 @@ class ShortsTest(unittest.TestCase):
         self.assertEqual(rows[0]["channels"], "2")
         self.assertTrue(rows[0]["file"].endswith("00001234.ogg"))
 
+    def test_rejects_nonpositive_job_counts(self):
+        for jobs in ("0", "-1"):
+            with self.subTest(jobs=jobs):
+                stderr = io.StringIO()
+                with contextlib.redirect_stderr(stderr), contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(shorts.main([self.tmp.name, self.out, "--jobs", jobs]), 2)
+                self.assertIn("--jobs must be at least 1", stderr.getvalue())
+                self.assertFalse(os.path.exists(self.out))
+
     def test_bad_range(self):
         with contextlib.redirect_stderr(io.StringIO()):
             self.assertEqual(shorts.main(["x", self.out, "--min-seconds", "6", "--max-seconds", "5"]), 2)
+
+    def test_missing_source_preserves_csv(self):
+        path = self.write("good.awc", 0x78, 960)
+        args = [self.out, "--jobs", "1", "--min-seconds", "0"]
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(shorts.main([path, *args]), 0)
+        index = os.path.join(self.out, "shorts.csv")
+        with open(index, "rb") as f:
+            previous = f.read()
+
+        missing = os.path.join(self.tmp.name, "missing.awc")
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()) as err:
+            result = shorts.main([missing, *args])
+        with open(index, "rb") as f:
+            self.assertEqual(f.read(), previous)
+        self.assertEqual(result, 2)
+        self.assertIn("missing.awc", err.getvalue())
+        self.assertEqual(len(err.getvalue().splitlines()), 1)
+
+    def test_clip_write_error_preserves_catalog_in_both_worker_modes(self):
+        path = self.write("blocked.awc", 0xFC, 480000)
+        os.makedirs(os.path.join(self.out, "blocked", "00001234.ogg"))
+        index = os.path.join(self.out, "shorts.csv")
+        with open(index, "wb") as f:
+            f.write(b"previous catalog\n")
+        tool = os.path.join(ROOT, "tools", "awc_shorts.py")
+        for jobs in ("1", "2"):
+            with self.subTest(jobs=jobs):
+                result = subprocess.run([sys.executable, "-I", tool, path, self.out, "--jobs", jobs],
+                                        capture_output=True, text=True, timeout=60)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn("blocked", result.stderr)
+                self.assertNotIn("Traceback", result.stderr)
+                with open(index, "rb") as f:
+                    self.assertEqual(f.read(), b"previous catalog\n")
+
+    def test_partial_csv_write_preserves_catalog(self):
+        path = self.write("good.awc", 0xFC, 480000)
+        os.makedirs(self.out)
+        index = os.path.join(self.out, "shorts.csv")
+        with open(index, "wb") as f:
+            f.write(b"previous catalog\n")
+        args = [path, self.out, "--jobs", "1"]
+        with mock.patch.object(shorts.csv.DictWriter, "writerows", side_effect=OSError("disk full")), \
+                contextlib.redirect_stderr(io.StringIO()) as err:
+            self.assertEqual(shorts.main(args), 1)
+        self.assertIn("shorts.csv", err.getvalue())
+        with open(index, "rb") as f:
+            self.assertEqual(f.read(), b"previous catalog\n")
+        self.assertEqual(sorted(os.listdir(self.out)), ["good", "shorts.csv"])
+
+    def test_nan_duration_bounds(self):
+        path = self.write("good.awc", 0x78, 960)
+        for option in ("--min-seconds", "--max-seconds"):
+            with self.subTest(option=option):
+                args = [path, self.out, "--jobs", "1", option, "nan"]
+                with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()) as err:
+                    self.assertEqual(shorts.main(args), 2)
+                self.assertFalse(os.path.exists(self.out))
+                self.assertIn(option, err.getvalue())
+                self.assertEqual(len(err.getvalue().splitlines()), 1)
 
     def test_nested_banks_keep_both_clips(self):
         for folder, toc in (("left", 0x78), ("right", 0xFC)):
@@ -128,6 +200,33 @@ class ShortsTest(unittest.TestCase):
             with open(os.path.join(self.out, folder, "shared", "00001234.ogg"), "rb") as f:
                 channels, _ = ogg_head_and_last_granule(f.read())
             self.assertEqual(channels, expected)
+
+    def check_truncated_bank_skipped(self, tool, jobs):
+        os.mkdir(os.path.join(self.tmp.name, "banks"))
+        self.write(os.path.join("banks", "good.awc"), 0xFC, 480000)
+        # Header says 5 streams but the bank ends after 16 bytes: parse_awc raises struct.error.
+        with open(os.path.join(self.tmp.name, "banks", "bad.awc"), "wb") as f:
+            f.write(b"ADAT" + struct.pack("<III", 0, 5, 16))
+        argv = [os.path.join(self.tmp.name, "banks"), self.out, "--min-seconds", "4",
+                "--max-seconds", "6", "--jobs", str(jobs)]
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()) as err:
+            self.assertEqual(tool.main(argv), 0)
+        self.assertIn("  skip bad: ", err.getvalue())
+        self.assertEqual(len(err.getvalue().splitlines()), 1)
+        import csv
+        with open(os.path.join(self.out, "shorts.csv"), encoding="utf-8") as f:
+            rows = list(csv.DictReader(f))
+        self.assertEqual([(r["bank"], r["stream"]) for r in rows], [("good", "00001234")])
+
+    def test_truncated_bank_skipped_serial(self):
+        self.check_truncated_bank_skipped(shorts, 1)
+
+    def test_truncated_bank_skipped_pool(self):
+        # A spawned worker must import the tool by name, so use the real module, not the spec-loaded copy.
+        sys.path.insert(0, os.path.join(ROOT, "tools"))
+        self.addCleanup(sys.path.remove, os.path.join(ROOT, "tools"))
+        import awc_shorts
+        self.check_truncated_bank_skipped(awc_shorts, 2)
 
 
 if __name__ == "__main__":

@@ -202,6 +202,21 @@ void test_version_1_1(SerializeFn serialize, DeserializeFn deserialize, ID3D12De
 }
 
 void test_version_1_2(SerializeFn serialize, DeserializeFn deserialize, ID3D12Device& device) {
+    // Older in-box D3D12 runtimes refuse root signature 1.2, so the whole 1.2 path is skipped there.
+    // Windows 11 23H2 answers with a lower HighestVersion; Windows 10 doesn't know 1.2 and fails the
+    // query with E_INVALIDARG instead.
+    D3D12_FEATURE_DATA_ROOT_SIGNATURE feature{D3D_ROOT_SIGNATURE_VERSION_1_2};
+    const HRESULT query = device.CheckFeatureSupport(D3D12_FEATURE_ROOT_SIGNATURE, &feature, sizeof(feature));
+    if (query == E_INVALIDARG) {
+        std::puts("SKIP root signature 1.2 (runtime does not know version 1.2)");
+        return;
+    }
+    require_success(query, "query WARP root signature support");
+    if (feature.HighestVersion < D3D_ROOT_SIGNATURE_VERSION_1_2) {
+        std::puts("SKIP root signature 1.2 (runtime HighestVersion < 1.2)");
+        return;
+    }
+
     const D3D12_DESCRIPTOR_RANGE1 range{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 2, 5, 6,
                                         D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE,
                                         D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND};
@@ -245,18 +260,11 @@ void test_version_1_2(SerializeFn serialize, DeserializeFn deserialize, ID3D12De
                 direct_desc.Flags == shim_desc.Flags, "legacy projection header matches");
     }
 
-    D3D12_FEATURE_DATA_ROOT_SIGNATURE feature{D3D_ROOT_SIGNATURE_VERSION_1_2};
-    require_success(device.CheckFeatureSupport(D3D12_FEATURE_ROOT_SIGNATURE, &feature, sizeof(feature)),
-                    "query WARP root signature support");
-    if (feature.HighestVersion >= D3D_ROOT_SIGNATURE_VERSION_1_2) {
-        ComPtr<ID3D12RootSignature> signature;
-        require_success(device.CreateRootSignature(0, data, size, IID_PPV_ARGS(&signature)),
-                        "create WARP 1.2 root signature");
-        require(signature != nullptr, "WARP returned a 1.2 root signature");
-        std::puts("PASS WARP 1.2 root signature creation");
-    } else {
-        std::puts("SKIP WARP 1.2 root signature creation (feature version unavailable)");
-    }
+    ComPtr<ID3D12RootSignature> signature;
+    require_success(device.CreateRootSignature(0, data, size, IID_PPV_ARGS(&signature)),
+                    "create WARP 1.2 root signature");
+    require(signature != nullptr, "WARP returned a 1.2 root signature");
+    std::puts("PASS WARP 1.2 root signature creation");
     std::puts("PASS root signature 1.2 serialization, versioned reflection, and legacy comparison");
 }
 
@@ -274,7 +282,11 @@ int main() {
         ComPtr<IDXGIAdapter> adapter;
         ComPtr<ID3D12Device> device;
         require_success(CreateDXGIFactory1(IID_PPV_ARGS(&factory)), "create DXGI factory");
-        require_success(factory->EnumWarpAdapter(IID_PPV_ARGS(&adapter)), "enumerate WARP adapter");
+        if (const HRESULT warp = factory->EnumWarpAdapter(IID_PPV_ARGS(&adapter)); FAILED(warp)) {
+            // Windows always has WARP; Wine doesn't. CTest reads exit code 77 as a skip (SKIP_RETURN_CODE).
+            std::printf("SKIP no WARP adapter (0x%08lX)\n", static_cast<unsigned long>(warp));
+            return 77;
+        }
         require_success(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device)),
                         "create WARP device");
         test_version_1_0(serialize, deserialize, *device.Get());

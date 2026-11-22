@@ -61,3 +61,83 @@ if __name__ == "__main__":
         if name.startswith("test_") and callable(fn):
             fn()
             print("ok", name)
+
+
+def test_64k_block_extent_comes_from_the_element_count():
+    # XOR modes have no x/y bit that appears alone, so the old solo-bit guess returned 1x1 or too small.
+    for bpe, bw, bh in ((1, 256, 256), (2, 256, 128), (4, 128, 128), (8, 128, 64), (16, 64, 64)):
+        _, meta = A.offsets([(1, 0), (0, 1)], bpe, 1, 1)
+        assert meta[:2] == (bw, bh), (bpe, meta)
+        assert bw * bh * bpe == 65536
+
+
+def cli(tmp_path, *args):
+    import subprocess
+    tool = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tools", "amd_swizzle.py")
+    return subprocess.run([sys.executable, "-I", tool, str(tmp_path / "blob.bin"), *args],
+                          capture_output=True, text=True, timeout=120, check=False)
+
+
+def test_out_cannot_overwrite_the_input(tmp_path):
+    # Before: --out naming the blob rendered the preview over the sample it had just detiled.
+    blob = tmp_path / "blob.bin"
+    blob.write_bytes(bytes(range(256)) * 64)
+    before = blob.read_bytes()
+    p = cli(tmp_path, "--width", "256", "--height", "256", "--out", str(blob))
+    assert p.returncode == 1, p.stderr
+    assert "overwrite the input" in p.stderr
+    assert "Traceback" not in p.stderr
+    assert blob.read_bytes() == before
+
+
+def test_out_directory_is_a_message_not_a_traceback(tmp_path):
+    (tmp_path / "blob.bin").write_bytes(bytes(range(256)) * 64)
+    p = cli(tmp_path, "--width", "256", "--height", "256", "--out", str(tmp_path))
+    assert p.returncode == 1, p.stderr
+    assert "is a directory" in p.stderr
+    assert "Traceback" not in p.stderr
+
+
+def test_uncompressed_feature_uses_raw_rgb_bytes():
+    import numpy as np
+    raw = np.arange(8, dtype=np.uint8).reshape(-1, 4)
+    got = A.feature(raw, 4)
+    assert got.shape == (2, 3)
+    assert got.tolist() == [[0, 1, 2], [4, 5, 6]]
+
+
+def test_cli_detiles_4k_tables_with_4k_blocks():
+    # A 128x128 RGBA gradient tiled in 4 KB blocks (32x32 elements, row-major). The same pattern entry under
+    # a 64K table name must not be picked by --modes 4K, and the 4K table must detile with 12-bit, 4 KB blocks.
+    import subprocess
+    import numpy as np
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tools"))
+    from tile_probe import score
+    rows = {"NIBBLE01": ["0", "0", "X0", "Y0", "X1", "Y1", "X2", "Y2"], "NIBBLE2": ["X3", "Y3", "X4", "Y4"],
+            "NIBBLE3": ["X5", "Y5", "X6", "Y6"], "NIBBLE4": ["0", "0", "0", "0"]}
+    text = "".join(table(name, [row]) for name, row in rows.items())
+    for name in ("GFX10_SW_4K_S_PATINFO", "GFX10_SW_64K_S_PATINFO"):
+        text += (f"const ADDR_SW_PATINFO {name}[] =\n{{\n"
+                 "    {   0,    0,    0,    0,    0, } , // 1 pipes 4 bpe\n};\n")
+    y, x = np.mgrid[0:128, 0:128]
+    linear = np.stack([x * 2, y * 2, (x + y) // 2, np.full_like(x, 255)], axis=-1).astype(np.uint8)
+    with tempfile.TemporaryDirectory() as d:
+        hdr = os.path.join(d, "gfx10SwizzlePattern.h")
+        with open(hdr, "w", encoding="utf-8") as f:
+            f.write(text)
+        nibbles, tables = A.load(hdr)
+        eq = A.equation(nibbles, tables["GFX10_SW_4K_S_PATINFO"][0], 12)
+        off, meta = A.offsets(eq, 4, 128, 128, 4096)
+        assert meta[:2] == (32, 32)
+        tiled = np.zeros(128 * 128 * 4, np.uint8)
+        for c in range(4):
+            tiled[off.reshape(-1) + c] = linear[..., c].reshape(-1)
+        blob = os.path.join(d, "blob.bin")
+        tiled.tofile(blob)
+        p = subprocess.run([sys.executable, "-I", A.__file__, blob, "--bpe", "4", "--width", "128",
+                            "--height", "128", "--modes", "4K"], capture_output=True, text=True,
+                           env=dict(os.environ, AMD_SWIZZLE_HEADER=hdr))
+    assert p.returncode == 0, p.stderr
+    lines = p.stdout.splitlines()
+    assert [ln.split()[1] for ln in lines] == ["GFX10_SW_4K_S_PATINFO"], p.stdout
+    assert float(lines[0].split()[0]) == round(score(linear[..., :3].astype(np.float32)), 2), p.stdout

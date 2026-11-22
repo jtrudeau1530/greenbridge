@@ -1,8 +1,10 @@
 // End-to-end checks for the loader's static TLS, against locally built fixtures.
 //
 // tiny_tls.dll has a __declspec(thread) variable, a TLS callback in .CRT$XLB and a DllMain that counts calls. The test
-// proves that load() installs the TLS template and index without running any image code, and that the callbacks only
-// run through the opt-in run_tls_callbacks().
+// proves that load() installs the TLS template and index without running any image code, that the callbacks run only
+// through run_tls_callbacks() until initialise(), that every thread started after load() gets its own copy of the
+// template (and the thread events once the module is initialised), and that a thread which outlives its Loader
+// gives its copy back when it ends.
 //
 // The loader reserves its module TLS index with gta6rt_tls_host.dll, so that DLL must sit next to this EXE; CTest
 // builds and places both in the build directory. No game files are needed and no real package DLL is mapped.
@@ -81,8 +83,7 @@ const IMAGE_RUNTIME_FUNCTION_ENTRY* mapped_pdata(const rt::Module& m, uint32_t* 
     return reinterpret_cast<const IMAGE_RUNTIME_FUNCTION_ENTRY*>(m.base + dir.VirtualAddress);
 }
 
-// The loader only initializes the thread that calls load(). install_tls_for_thread()/uninstall_tls_for_thread() are
-// the seam the runtime must use for every thread it creates; the worker case below exercises it.
+// load() installs the calling thread; the helper DLL's thread events install every thread started after it.
 void** module_tls_slots() { return reinterpret_cast<void**>(__readgsqword(0x58)); }
 
 template <class Fn>
@@ -163,25 +164,32 @@ void test_tls(const fs::path& dll) {
         check(detach_count() == 1 && last_reason() == DLL_PROCESS_DETACH,
               "the callback receives DLL_PROCESS_DETACH");
 
-        // A new thread starts with the helper DLL's block in the module slot. The runtime installs the mapped
-        // module's template through the thread seam, then removes it before the thread exits.
+        // A new thread already has its own copy of the template when its code starts (the helper DLL's
+        // DLL_THREAD_ATTACH installed it). install_tls_for_thread is then a no-op, and the copy is freed when the
+        // thread ends.
         int worker_before = -1;
         int worker_after = -1;
-        void* worker_previous = nullptr;
+        void* worker_block = nullptr;
+        void* worker_after_install = nullptr;
         std::thread worker([&] {
-            worker_previous = module_tls_slots()[m.tls_index];
-            loader.install_tls_for_thread(m);
+            worker_block = module_tls_slots()[m.tls_index];
             worker_before = get();
+            loader.install_tls_for_thread(m);
+            worker_after_install = module_tls_slots()[m.tls_index];
             set(99);
             worker_after = get();
-            loader.uninstall_tls_for_thread(m);
         });
         worker.join();
-        check(worker_previous != nullptr && worker_previous != m.tls_block,
-              "a new thread starts with the helper DLL's block, not the mapped module's data");
-        check(worker_before == 7, "the new thread sees the template value 7, not the main thread's 42");
+        check(worker_block != nullptr && worker_block != m.tls_block && worker_block != m.tls_saved_block,
+              "a new thread starts with its own block, not the main thread's or the helper DLL's");
+        check(worker_before == 7, "the new thread sees the template value 7 without an install call");
+        check(worker_after_install == worker_block, "install_tls_for_thread on that thread is a no-op");
         check(worker_after == 99, "the new thread's write is confined to its own block");
         check(get() == 42, "the main thread's TLS value is unchanged after the worker exit");
+        MEMORY_BASIC_INFORMATION worker_info{};
+        check(VirtualQuery(worker_block, &worker_info, sizeof(worker_info)) == 0 || worker_info.State == MEM_FREE,
+              "the worker's block is freed when the worker ends");
+        check(callback_count() == 2, "thread events don't run TLS callbacks before initialise()");
 
         const uint32_t first_index = m.tls_index;
         rt::Module& again = loader.load(dll);
@@ -199,12 +207,111 @@ void test_tls(const fs::path& dll) {
     check(VirtualQuery(block, &info, sizeof(info)) == 0 || info.State == MEM_FREE, "~Loader frees the TLS block");
 }
 
+// Starts a thread suspended, so the fixture can watch it before its DLL_THREAD_ATTACH runs.
+struct WatchedThread {
+    HANDLE handle = nullptr;
+    template <class Fn>
+    WatchedThread(void(__cdecl* watch)(DWORD), Fn* body) {
+        handle = CreateThread(
+            nullptr, 0, [](void* p) -> DWORD { (*static_cast<Fn*>(p))(); return 0; }, body, CREATE_SUSPENDED,
+            nullptr);
+        if (!handle) throw std::runtime_error("CreateThread failed");
+        watch(GetThreadId(handle));
+        ResumeThread(handle);
+    }
+    void join() {
+        WaitForSingleObject(handle, INFINITE);  // signalled after the thread's DLL_THREAD_DETACH
+        CloseHandle(handle);
+        handle = nullptr;
+    }
+    ~WatchedThread() {
+        if (handle) join();
+    }
+    WatchedThread(const WatchedThread&) = delete;
+    WatchedThread& operator=(const WatchedThread&) = delete;
+};
+
+void test_thread_events(const fs::path& dll) {
+    std::printf("\n-- thread events after initialise() --\n");
+    rt::Loader loader(dll.parent_path());
+    rt::Module& m = loader.load(dll);
+    const auto get = find_export<int(__cdecl*)()>(m, "tiny_tls_get");
+    const auto set = find_export<void(__cdecl*)(int)>(m, "tiny_tls_set");
+    const auto watch = find_export<void(__cdecl*)(DWORD)>(m, "tiny_tls_watch_thread");
+    const auto thread_attach = find_export<int(__cdecl*)()>(m, "tiny_tls_thread_attach_count");
+    const auto thread_detach = find_export<int(__cdecl*)()>(m, "tiny_tls_thread_detach_count");
+    const auto value_at_attach = find_export<int(__cdecl*)()>(m, "tiny_tls_value_at_thread_attach");
+
+    set(11);
+    loader.initialise();
+    check(m.initialised, "initialise() ran the module");
+
+    int seen = -1;
+    int attach_inside = -1;
+    int detach_inside = -1;
+    auto body = [&] {
+        seen = get();
+        attach_inside = thread_attach();
+        detach_inside = thread_detach();
+        set(3);
+    };
+    WatchedThread t(watch, &body);
+    t.join();
+    check(attach_inside == 1, "a new thread gets DLL_THREAD_ATTACH once, before its own code runs");
+    check(value_at_attach() == 7, "its TLS copy is in place when the callback runs (template value 7)");
+    check(seen == 7, "the thread reads the template value, not the main thread's 11");
+    check(detach_inside == 0 && thread_detach() == 1, "DLL_THREAD_DETACH runs once, when the thread ends");
+    check(get() == 11, "the main thread's value is unchanged");
+}
+
+void test_thread_outlives_loader(const fs::path& dll) {
+    std::printf("\n-- a thread that outlives its Loader --\n");
+    HANDLE go = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    HANDLE ready = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    void* block = nullptr;
+    HANDLE thread = nullptr;
+    {
+        rt::Loader loader(dll.parent_path());
+        rt::Module& m = loader.load(dll);
+        // Initialised, so the module's TLS callbacks take thread events: the thread below ends after ~Loader has
+        // delivered the process detach and unmapped the image, and running its DLL_THREAD_DETACH callback then
+        // would jump into freed memory.
+        loader.initialise();
+        const uint32_t index = m.tls_index;
+        struct Ctx {
+            HANDLE go, ready;
+            uint32_t index;
+            void** block;
+        } ctx{go, ready, index, &block};
+        static Ctx s_ctx;
+        s_ctx = ctx;
+        thread = CreateThread(
+            nullptr, 0,
+            [](void*) -> DWORD {
+                *s_ctx.block = module_tls_slots()[s_ctx.index];
+                SetEvent(s_ctx.ready);
+                WaitForSingleObject(s_ctx.go, INFINITE);
+                return 0;  // the Loader is gone by now; its DLL_THREAD_DETACH must still give the slot back
+            },
+            nullptr, 0, nullptr);
+        WaitForSingleObject(ready, INFINITE);
+        check(block != nullptr && block != m.tls_block, "the thread got its own copy while the Loader was alive");
+    }
+    SetEvent(go);
+    WaitForSingleObject(thread, INFINITE);
+    CloseHandle(thread);
+    CloseHandle(go);
+    CloseHandle(ready);
+    MEMORY_BASIC_INFORMATION info{};
+    check(VirtualQuery(block, &info, sizeof(info)) == 0 || info.State == MEM_FREE,
+          "its copy is freed when it ends after the Loader, with no callback into the unmapped image");
+}
+
 void test_second_tls_module_rejected(const fs::path& dll, const fs::path& temp) {
     std::printf("\n-- one mapped TLS module at a time --\n");
     const fs::path copy = temp / "tiny_tls_second.dll";
-    std::error_code ec;
-    fs::copy_file(dll, copy, fs::copy_options::overwrite_existing, ec);
-    check(!ec, "copied the TLS fixture under a second name");
+    // CopyFileW, not fs::copy_file: MSVC's copy_file calls CopyFile2, which Wine 9 doesn't implement.
+    check(CopyFileW(dll.c_str(), copy.c_str(), FALSE) != 0, "copied the TLS fixture under a second name");
 
     {
         rt::Loader loader(dll.parent_path());
@@ -261,6 +368,8 @@ int main(int argc, char** argv) {
 
         TempDir temp;
         test_tls(tls_dll);
+        test_thread_events(tls_dll);
+        test_thread_outlives_loader(tls_dll);
         test_second_tls_module_rejected(tls_dll, temp.path);
     } catch (const std::exception& e) {
         ++g_checks;

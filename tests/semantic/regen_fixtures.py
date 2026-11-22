@@ -16,11 +16,18 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(os.path.dirname(HERE))
 ASM_DIR = os.path.join(ROOT, "runtime", "test", "shaders")
 FIXTURE_DIR = os.path.join(HERE, "fixtures", "disasm")
-SHADERS = ("ps_sdwa", "ps_ops", "ps_ops2", "ps_ops3", "ps_ops4", "ps_ops5", "ps_ops6", "ps_ops7", "ps_ops8",
-           "ps_legacy_mul", "ps_vcc_x2", "ps_flat", "cs_bounds", "cs_fmt_1010102", "cs_w64x_readlane",
-           "cs_w64x_writelane", "cs_w64x_bpermute", "cs_w64x_ballot", "cs_w64x_readfirstlane",
+SHADERS = ("cs_smem_bounds", "cs_smem_stride_align", "cs_smem_sload_neg", "cs_buf_tail",  # SMEM / raw MUBUF bounds measured on RDNA2
+           "ps_fnan_med3", "ps_fnan_fract",    # float NaN / fract rows measured on RDNA2 hardware
+           "ps_sdwa", "ps_ops", "ps_ops2", "ps_ops3", "ps_ops4", "ps_ops5", "ps_ops6", "ps_ops7", "ps_ops8",
+           "ps_legacy_mul", "ps_vcc_x2", "ps_vcmpx_forms", "ps_flat", "cs_bounds", "cs_fmt_1010102", "cs_w64x_readlane",
+           "cs_w64x_writelane", "cs_w64x_bpermute", "cs_w32_permute", "cs_w32_int_ext", "cs_w64x_permute", "cs_w64x_ballot", "cs_w64x_readfirstlane",
            "cs_w64x_load_ballot_load", "cs_w64x_partial", "cs_wave64_ballot", "cs_wm_bfm64", "cs_wm_half_cmp",
-           "cs_wavemask", "cs_cvt_f32_sat", "ps_scc_minmax", "ps_fma_literal")
+           "cs_wavemask", "cs_cvt_f32_sat", "ps_scc_minmax", "ps_fma_literal", "ps_f16_vop2",
+           "ps_f32_mods", "ps_f64_mods", "ps_sff_imm", "cs_w32_lds_u8_d16", "cs_w32_lane_wrap", "ps_bary",
+           "cs_oob_select", "cs_oob_tail", "cs_w32_mask_imm", "cs_w64_mask_imm",
+           # TEST-175: GPU fixtures for the docs/design.md rules that were checked on the CPU only
+           "ps_cmp_nlg", "ps_cvt_off", "ps_fmac_f16_mods", "ps_vop3_const_mods", "ps_interp_f32_mods", "ps_interp_mov_mods",
+           "cs_w64x_andn2_exec")   # s_andn2_saveexec_b64 / s_andn2_wrexec_b64 (test_andn2_exec_b64.py)
 
 
 def render(name):

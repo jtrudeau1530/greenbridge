@@ -17,6 +17,8 @@ game data. Non-XML payloads follow the 64 KiB block rule; a file whose inflated 
 64 KiB can merge with the next stream. XML documents close on their root element, so their grouping is exact.
 The tool is standard library only and never writes outside the requested output files.
 """
+from __future__ import annotations
+
 import argparse
 import csv
 import json
@@ -35,6 +37,8 @@ BOM = b"\xef\xbb\xbf"
 XML_DECL = re.compile(rb"<\?xml[^>]*\?>")
 XML_OPEN = re.compile(rb"<([A-Za-z_][\w.:-]*)")
 XML_CLOSE_TAIL = re.compile(rb"</([A-Za-z_][\w.:-]*)>\s*$")
+# Tag-like text inside these cannot open or close an element.
+XML_NON_TAG = re.compile(rb"<!--.*?-->|<!\[CDATA\[.*?\]\]>|<\?.*?\?>", re.S)
 MAGIC = {b"MHIU": "MHIU", b"PAMH": "PAMH", b"SPS1Z": "SPS1Z", b"RBF0": "RBF0", b"PSIN": "PSIN"}
 
 
@@ -47,9 +51,10 @@ def printable(data: bytes) -> float:
 
 
 def has_xml_decl(data: bytes) -> bool:
-    if data.startswith(BOM) and XML_DECL.match(data[3:]):
-        return True
-    return bool(XML_DECL.match(data) or XML_DECL.match(data.lstrip(b" \t\r\n")))
+    # xml_root() drops the BOM before looking for the declaration; do the same here, or a BOM followed by
+    # whitespace makes the two disagree and the stream is grouped by the 64 KiB binary rule instead.
+    text = data[3:] if data.startswith(BOM) else data
+    return bool(XML_DECL.match(text) or XML_DECL.match(text.lstrip(b" \t\r\n")))
 
 
 def xml_root(data: bytes) -> str:
@@ -80,13 +85,23 @@ def tail_root(data: bytes) -> str:
 
 
 def xml_complete(root: str, data: bytes) -> bool:
+    """True when every <root> in data is closed, not merely when a </root> occurs somewhere in the tail.
+
+    A nested element with the same name as the root used to satisfy the old substring test, so a truncated
+    document was reported complete and its continuation streams were not absorbed into the payload.
+    """
     if not root:
         return False
-    close = b"</" + root.encode("ascii", "replace") + b">"
-    if close in data[-65536:]:
-        return True
-    return bool(re.search(rb"<" + re.escape(root.encode("ascii", "replace")) + rb"\b[^>]*/>\s*$",
-                          data[-4096:]))
+    text = XML_NON_TAG.sub(b"", data)
+    name = re.escape(root.encode("ascii", "replace"))
+    # A quoted attribute value may contain '>'; consume quoted strings as one unit or a self-closing
+    # tag with such a value is mistaken for an unclosed element.
+    opens = re.findall(rb"<" + name + rb"(?=[\s/>])(?:\"[^\"]*\"|'[^']*'|[^'\">])*>", text)
+    closes = re.findall(rb"</" + name + rb"\s*>", text)
+    self_closed = sum(1 for tag in opens if tag.rstrip().endswith(b"/>"))
+    if len(opens) - self_closed > len(closes):
+        return False
+    return bool(closes or self_closed)
 
 
 def standalone_xml(data: bytes) -> bool:
@@ -314,13 +329,31 @@ def summarize(rows: list, source_summary: dict, target: str) -> dict:
     }
 
 
+def _make_parent(path: str) -> None:
+    """Create the folder an output path lives in: the scan is over by the time we write, so a missing
+    folder used to end the run in a FileNotFoundError and lose the result."""
+    parent = os.path.dirname(os.path.abspath(path))
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
+
 def write_csv(path: str, rows: list) -> None:
+    _make_parent(path)
     fields = ["offset", "offset_hex", "stored", "size", "type", "root", "detail", "chunks",
               "complete", "header"]
     with open(path, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=fields)
         w.writeheader()
         w.writerows(rows)
+
+
+def same_report_path(first: str, second: str) -> bool:
+    if os.path.normcase(os.path.realpath(first)) == os.path.normcase(os.path.realpath(second)):
+        return True
+    try:
+        return os.path.samefile(first, second)
+    except OSError:
+        return False
 
 
 def main() -> int:
@@ -330,7 +363,22 @@ def main() -> int:
     ap.add_argument("--csv", help="write one row per payload to this CSV")
     ap.add_argument("--json", help="write the summary and rows to this JSON")
     a = ap.parse_args()
+    if a.csv and a.json and same_report_path(a.csv, a.json):
+        ap.error("--csv and --json must use different paths")
 
+    if not os.path.exists(a.target):
+        print(f"ERROR: {a.target} does not exist", file=sys.stderr)
+        return 2
+    protected = [a.target] if os.path.isfile(a.target) else [os.path.join(a.target, "index.json")]
+    if a.carve_dir:
+        protected.append(os.path.join(a.carve_dir, "index.json"))
+    for flag, path in (("--json", a.json), ("--csv", a.csv)):
+        if path:
+            if os.path.isdir(path):
+                ap.error(f"{flag} is a directory: {path}")
+            for input_path in protected:
+                if same_report_path(path, input_path):
+                    ap.error(f"{flag} would overwrite the input {input_path}")
     source = None
     try:
         if os.path.isdir(a.target):
@@ -339,6 +387,17 @@ def main() -> int:
             source = ArchiveSource(a.target, a.carve_dir)
         rows = build_rows(source.rows, source)
         summary = summarize(rows, source.summary, a.target)
+    except RuntimeError as e:          # rpf9_carve.py refused the archive; its own message says why
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 2
+    except FileNotFoundError as e:
+        print(f"ERROR: {e.filename} is missing. Give a carve folder from rpf9_carve.py or an .rpf archive.",
+              file=sys.stderr)
+        return 2
+    except (OSError, ValueError, KeyError, TypeError) as e:
+        where = getattr(e, "filename", None) or a.target
+        print(f"ERROR: cannot read {where}: {getattr(e, 'strerror', None) or e!r}", file=sys.stderr)
+        return 2
     finally:
         if isinstance(source, ArchiveSource):
             source.close()
@@ -346,6 +405,7 @@ def main() -> int:
     if a.csv:
         write_csv(a.csv, rows)
     if a.json:
+        _make_parent(a.json)
         with open(a.json, "w", encoding="utf-8") as f:
             json.dump({"summary": summary, "rows": rows}, f, indent=1)
 
@@ -365,4 +425,8 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    try:  # a redirected stdout is strict ANSI code page under -I; write '?' for what it cannot encode
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
     sys.exit(main())

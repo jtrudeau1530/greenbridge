@@ -36,8 +36,8 @@ MUTATIONS = [
      'f = "OpBitFieldUExtract"\n            self.emit(f"{r} = {f} %uint {x} {om} {wc}")',
      "test_ps_ops"),
     ("v_pk_fma_f16 multiplies src0 by itself", TRANSLATOR,
-     'OpExtInst %v2float %glsl Fma {vx} {vy} {srcs[2]}',
-     'OpExtInst %v2float %glsl Fma {vx} {vx} {srcs[2]}',
+     'for e_, v_ in zip(ex, (vx, vy, srcs[2])):',
+     'for e_, v_ in zip(ex, (vx, vx, srcs[2])):',
      "test_ps_ops"),
     ("v_fma_f16 ignores source op_sel half", TRANSLATOR,
      'self.emit(f"{f} = OpCompositeExtract %float {v2} {1 if hi else 0}")',
@@ -63,21 +63,9 @@ MUTATIONS = [
      'self.emit(f"{amt} = OpBitFieldUExtract %uint {sh_src} {self.cu(16 * sl[0])} {self.cu(4)}")',
      'self.emit(f"{amt} = OpBitFieldUExtract %uint {sh_src} {self.cu(0)} {self.cu(4)}")',
      "test_ps_ops4"),
-    ("v_sin_f16 omits turns-to-radians 2*pi factor", TRANSLATOR,
-     '        elif op in ("v_sin_f16", "v_cos_f16"):\n'
-     '            u = self.src_u({**a[1], "neg": False, "abs": False})\n'
-     '            v2, f, t, r, w2, pk, lo = (self.tmp() for _ in range(7))\n'
-     '            self.emit(f"{v2} = OpExtInst %v2float %glsl UnpackHalf2x16 {u}")\n'
-     '            self.emit(f"{f} = OpCompositeExtract %float {v2} 0")\n'
-     '            f = self.modify_f(f, a[1])\n'
-     '            self.emit(f"{t} = OpFMul %float {f} {self.fconst(6.283185307179586)}")',
-     '        elif op in ("v_sin_f16", "v_cos_f16"):\n'
-     '            u = self.src_u({**a[1], "neg": False, "abs": False})\n'
-     '            v2, f, t, r, w2, pk, lo = (self.tmp() for _ in range(7))\n'
-     '            self.emit(f"{v2} = OpExtInst %v2float %glsl UnpackHalf2x16 {u}")\n'
-     '            self.emit(f"{f} = OpCompositeExtract %float {v2} 0")\n'
-     '            f = self.modify_f(f, a[1])\n'
-     '            self.emit(f"{t} = OpFMul %float {f} {self.fconst(1.0)}")',
+    ("v_sin/v_cos omits turns-to-radians 2*pi factor", TRANSLATOR,
+     'self.emit(f"{arg} = OpFMul %float {t} {self.fconst(6.283185307179586)}")',
+     'self.emit(f"{arg} = OpFMul %float {t} {self.fconst(1.0)}")',
      "test_ps_ops4"),
     ("v_mul_legacy_f32 drops zero-times-anything guard", TRANSLATOR,
      '        elif op == "v_mul_legacy_f32":\n'

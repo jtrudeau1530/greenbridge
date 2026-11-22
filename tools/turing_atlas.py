@@ -198,6 +198,15 @@ def validate_cases():
             out[name] = {"assemble": True,
                          "valid": bool(rv and rv.returncode == 0),
                          "stderr": ((rv.stderr if rv else "") or "")[:300]}
+    # The control must be rejected: if spirv-as or spirv-val accepts a malformed module, none of the
+    # other results say anything about the toolchain gate and the atlas must not be read as a pass.
+    control = out.get("broken_negative")
+    if isinstance(control, dict):
+        rejected = control.get("assemble") is False or control.get("valid") is False
+        control["control_ok"] = rejected
+        if not rejected:
+            control["error"] = ("broken_negative was accepted: the spirv-as/spirv-val gate is not rejecting "
+                                "malformed modules, so the other case results are not trustworthy")
     return out
 
 
@@ -205,8 +214,9 @@ def main():
     ap = argparse.ArgumentParser(description="Turing bring-up atlas (no game data).")
     ap.add_argument("--out", default=None, help="write JSON atlas to FILE (default: stdout)")
     a = ap.parse_args()
+    cases = validate_cases()
     atlas = {"tool": "turing_atlas", "gpu": None, "features": vulkan_matrix(),
-             "cases": validate_cases()}
+             "cases": cases}
     # Surface the discrete GPU name at top level when present.
     try:
         atlas["gpu"] = atlas["features"].get("device", {}).get("name")
@@ -214,13 +224,24 @@ def main():
         pass
     text = json.dumps(atlas, indent=2, sort_keys=True)
     if a.out:
+        folder = os.path.dirname(a.out)  # --out into a folder that does not exist yet, as awc_manifest.py does
+        if folder:
+            os.makedirs(folder, exist_ok=True)
         with open(a.out, "w", encoding="utf-8") as f:
             f.write(text + "\n")
         print(f"atlas -> {a.out}")
     else:
         print(text)
+    control = cases.get("broken_negative") if isinstance(cases, dict) else None
+    if isinstance(control, dict) and control.get("error"):
+        print(f"turing_atlas: error: {control['error']}", file=sys.stderr)
+        return 2
     return 0
 
 
 if __name__ == "__main__":
+    try:  # a redirected stdout is strict ANSI code page under -I; write '?' for what it cannot encode
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
     sys.exit(main())

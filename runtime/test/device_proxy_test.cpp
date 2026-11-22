@@ -7,6 +7,7 @@
 //             hidden return pointer in RDX, so slot 14 wraps it)
 //   slot 62  CreateComputePipelineState
 //   slot 76  resource creation with an Xbox layout word (0x101)
+//   slot 8/36 CreateCommandQueue/CreateFence (return queue and fence proxies that run GPU work)
 // Slot 9 on the device is CreateCommandAllocator on the PC vtable and must still forward, which proves the handle
 // getters were not wedged into the device slots. Console output also shows the proxy's first-call slot log.
 #include <windows.h>
@@ -115,11 +116,16 @@ int main() {
     check(SUCCEEDED(hr) && factory, "DXGI factory created");
     ComPtr<IDXGIAdapter> warp;
     if (factory) hr = factory->EnumWarpAdapter(IID_PPV_ARGS(warp.GetAddressOf()));
-    check(SUCCEEDED(hr) && warp, "WARP adapter enumerated");
-    if (!warp) {
-        std::printf("device_proxy_test: FAILED (no WARP)\n");
+    if (!factory) {
+        std::printf("device_proxy_test: FAILED (no DXGI factory)\n");
         return 1;
     }
+    if (!warp) {
+        // Windows always has WARP; Wine doesn't. CTest reads exit code 77 as a skip (SKIP_RETURN_CODE).
+        std::printf("SKIP device_proxy_test: no WARP adapter (0x%08lX)\n", static_cast<unsigned long>(hr));
+        return 77;
+    }
+    check(true, "WARP adapter enumerated");
 
     auto create_device = reinterpret_cast<XboxCreateDeviceFn>(
         rt::shims::find("d3d12_xs.dll", "D3D12XboxCreateDevice"));
@@ -150,6 +156,8 @@ int main() {
     check(rt::d3d12_xs::device_slot_overridden(14), "device slot 14 is the descriptor-heap override");
     check(rt::d3d12_xs::device_slot_overridden(62), "device slot 62 is the compute-PSO override");
     check(rt::d3d12_xs::device_slot_overridden(76), "device slot 76 is the resource override");
+    check(rt::d3d12_xs::device_slot_overridden(67),
+          "device slot 67 is refused (console native-code compute pipeline, not PC CreateProtectedResourceSession1)");
 
     void** proxy_vtbl = *reinterpret_cast<void***>(device.Get());
     void** real_vtbl = real ? *reinterpret_cast<void***>(real) : nullptr;
@@ -333,6 +341,57 @@ int main() {
         check(SUCCEEDED(hr) && pso != nullptr, "slot 62 creates a compute PSO via CreateComputePipelineState");
         check(rt::d3d12_xs::device_slot_hits(62) == 1, "slot 62 hit counter is 1");
         check(rt::d3d12_xs::device_slot_first_call_seen(62), "slot 62 first-call flag is set");
+    }
+
+    // _COM_Outptr_ (d3d12.h): a failed create leaves NULL in the output. WARP accepts invalid heap descriptions,
+    // so the PC-failure case for slot 14 is in d3d12_vulkan_device_test; these are the proxy's own early returns.
+    {
+        void* proxy_out = reinterpret_cast<void*>(0x1111);
+        using Slot14Fn = HRESULT(WINAPI*)(void*, const D3D12_DESCRIPTOR_HEAP_DESC*, const IID*, void**);
+        hr = reinterpret_cast<Slot14Fn>(proxy_vtbl[14])(device.Get(), &heap_desc, nullptr, &proxy_out);
+        check(FAILED(hr) && proxy_out == nullptr, "slot 14 nulls its output for a null IID");
+        using Slot62Fn = HRESULT(WINAPI*)(void*, const D3D12_COMPUTE_PIPELINE_STATE_DESC*, std::uint64_t,
+                                          std::uint64_t, const IID*, void**);
+        proxy_out = reinterpret_cast<void*>(0x1111);
+        D3D12_COMPUTE_PIPELINE_STATE_DESC empty_pso{};
+        hr = reinterpret_cast<Slot62Fn>(proxy_vtbl[62])(device.Get(), &empty_pso, 0, 0, nullptr, &proxy_out);
+        check(FAILED(hr) && proxy_out == nullptr, "slot 62 nulls its output for a null IID");
+        using Slot76Fn = HRESULT(WINAPI*)(void*, const D3D12_HEAP_PROPERTIES*, D3D12_HEAP_FLAGS,
+                                          const D3D12_RESOURCE_DESC*, D3D12_RESOURCE_STATES,
+                                          const D3D12_CLEAR_VALUE*, const IID*, void**);
+        proxy_out = reinterpret_cast<void*>(0x1111);
+        hr = reinterpret_cast<Slot76Fn>(proxy_vtbl[76])(device.Get(), &heap_properties, D3D12_HEAP_FLAG_NONE,
+                                                         nullptr, D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                         &iid_resource, &proxy_out);
+        check(FAILED(hr) && proxy_out == nullptr, "slot 76 nulls its output for a null description");
+    }
+
+    // Slots 8 and 36 on the device the shim made: a title gets queue and fence proxies, and they run GPU work.
+    {
+        using CreateQueueFn = HRESULT(WINAPI*)(void*, const D3D12_COMMAND_QUEUE_DESC*, const IID*, void**);
+        using CreateFenceFn = HRESULT(WINAPI*)(void*, UINT64, D3D12_FENCE_FLAGS, const IID*, void**);
+        void** vtable = *reinterpret_cast<void***>(device.Get());
+        const D3D12_COMMAND_QUEUE_DESC queue_desc{};
+        const IID iid_queue = __uuidof(ID3D12CommandQueue);
+        const IID iid_fence = __uuidof(ID3D12Fence);
+        ComPtr<ID3D12CommandQueue> queue;
+        ComPtr<ID3D12Fence> fence;
+        hr = reinterpret_cast<CreateQueueFn>(vtable[8])(device.Get(), &queue_desc, &iid_queue,
+                                                        reinterpret_cast<void**>(queue.GetAddressOf()));
+        check(SUCCEEDED(hr) && rt::d3d12_xs::is_queue_proxy(queue.Get()), "slot 8 returns a queue proxy");
+        hr = reinterpret_cast<CreateFenceFn>(vtable[36])(device.Get(), 0, D3D12_FENCE_FLAG_NONE, &iid_fence,
+                                                         reinterpret_cast<void**>(fence.GetAddressOf()));
+        check(SUCCEEDED(hr) && rt::d3d12_xs::is_fence_proxy(fence.Get()), "slot 36 returns a fence proxy");
+        if (queue && fence) {
+            HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+            check(event && SUCCEEDED(queue->Signal(fence.Get(), 1)) &&
+                      SUCCEEDED(fence->SetEventOnCompletion(1, event)) && WaitForSingleObject(event, 5000) == 0,
+                  "the queue proxy signals the fence proxy on the GPU");
+            if (event) CloseHandle(event);
+            ComPtr<ID3D12Device> owner;
+            check(SUCCEEDED(queue->GetDevice(IID_PPV_ARGS(owner.GetAddressOf()))) && owner.Get() == device.Get(),
+                  "the queue proxy's GetDevice is the device the shim returned");
+        }
     }
 
     // Hold a reference to the PC device so the final check can prove the proxy's Release balances its own.

@@ -4,6 +4,8 @@ Usage:
     python -I rpf_probe.py <game_dir> [--out FILE]
 
 Reads the first 64 KiB of each archive only. It doesn't decrypt or extract anything.
+A directory scan or archive read error stops the survey before it writes the report.
+The report destination must not name an input archive or an alias of one.
 """
 import argparse
 import json
@@ -11,6 +13,7 @@ import math
 import os
 import struct
 import sys
+import tempfile
 from collections import Counter
 
 
@@ -39,6 +42,15 @@ def probe(path: str) -> dict:
     }
 
 
+def _same_report_path(first: str, second: str) -> bool:
+    if os.path.normcase(os.path.realpath(first)) == os.path.normcase(os.path.realpath(second)):
+        return True
+    try:
+        return os.path.samefile(first, second)
+    except OSError:
+        return False
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("game_dir")
@@ -50,19 +62,35 @@ def main() -> int:
         raise error
 
     try:
+        archives = []
         for root, _, files in os.walk(a.game_dir, onerror=scan_failed):
             for name in files:
                 if name.lower().endswith(".rpf"):
-                    rows.append(probe(os.path.join(root, name)))
+                    archives.append(os.path.join(root, name))
+        for path in archives:
+            if _same_report_path(a.out, path):
+                print(f"ERROR: --out would overwrite an input archive: {path}", file=sys.stderr)
+                return 2
+        for path in archives:
+            rows.append(probe(path))
     except OSError as error:
         path = error.filename or a.game_dir
         reason = error.strerror or str(error)
         print(f"ERROR: {path}: {reason}", file=sys.stderr)
         return 2
-    rows.sort(key=lambda r: -r["size"])
-    os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
-    with open(a.out, "w", encoding="utf-8") as f:
-        json.dump(rows, f, indent=1)
+    rows.sort(key=lambda r: (-r["size"], r["file"]))
+    try:
+        out_dir = os.path.dirname(os.path.abspath(a.out))
+        os.makedirs(out_dir, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=out_dir) as staging:
+            staged = os.path.join(staging, "rpf_probe.json")
+            with open(staged, "w", encoding="utf-8") as f:
+                json.dump(rows, f, indent=1)
+            os.replace(staged, a.out)
+    except OSError as error:
+        reason = error.strerror or str(error)
+        print(f"ERROR: {a.out}: {reason}", file=sys.stderr)
+        return 2
     versions = Counter(r["version"] for r in rows)
     print(f"{len(rows)} archives, {sum(r['size'] for r in rows) / 2**30:.1f} GiB, versions {dict(versions)}")
     for r in rows:
@@ -73,4 +101,8 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    try:  # a redirected stdout is strict ANSI code page under -I; write '?' for what it cannot encode
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
     sys.exit(main())

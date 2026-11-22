@@ -76,8 +76,14 @@ The exporters ignore the remaining bytes.
 | `5` | XMA2 | `.xma.wav`, RIFF XMA2; ffmpeg decodes it to PCM WAV |
 
 Opus data is stored in 2048-byte blocks. Each block is a sequence of `[u16 length][packet]`; a zero length pads
-the rest of the block. The last Ogg page's granule is trimmed to the sample count declared in the format tag, so a
-decoder stops at the real end instead of the padded final frame.
+the rest of the block. The first 312 decoded samples are the encoder's lookahead (libopus at 48 kHz); the AWC does
+not store it, so the exporter writes that value as `OpusHead` pre-skip and sets the last page's granule to
+`pre-skip + declared samples`. Decoders then drop the priming and stop at the real end instead of the padded final
+frame. `--pre-skip` overrides the 312 default for a stream encoded with a different lookahead.
+
+The format tag's sample count is already in 48 kHz frames even when its rate field is 32 kHz, and a stereo count is
+interleaved across both channels. The exporter therefore does not scale it by the rate field and halves it for
+stereo; scaling a 32 kHz stream by 48000/32000 leaves up to a frame of padding untrimmed.
 
 Codec `5` is not handled by `tools/awc_opus.py`. `rpf9dump xma` writes it as RIFF XMA2, and ffmpeg does the decode.
 
@@ -115,17 +121,29 @@ count unchanged. Reading `samples` as a frame count produces a file that reports
 |---|---|
 | `rpf9dump audio <audio.rpf> <out>` | `<out>/audio/awc/<path>.awc` (the original banks) and `<out>/audio/audio_manifest.json` |
 | `rpf9dump xma <audio.rpf> <out>` | `<out>/audio/xma/<bank>/<stream id>.xma.wav` for every codec-5 stream |
-| `python -I tools/awc_opus.py <bank or dir> <out> [--jobs N]` | `<out>/<bank>/<stream id>.ogg`, or `.wav` for codec 0/2; `--jobs` processes that many banks at once |
+| `python -I tools/awc_opus.py <bank or dir> <out> [--jobs N] [--pre-skip N]` | `<out>/<bank>/<stream id>.ogg`, or `.wav` for codec 0/2; `--jobs` processes that many banks at once |
 | `python -I tools/audio_wav.py <ogg dir> --out <wav dir> [--jobs N]` | 16-bit PCM WAV mirroring the Ogg tree; `--jobs` ffmpeg processes at once |
+
+When exporting a directory, `awc_opus.py` keeps the path to each bank below the input root. For example,
+`a/music.awc` writes under `<out>/a/music/`. Passing that file on its own writes under `<out>/music/`.
+To regenerate a flat export from an earlier version, run `awc_opus.py` with the original bank directory and a fresh output directory.
 
 `audio_manifest.json` is the bank index: each bank's `Path`, `Offset`, `Size`, and its `Streams` with `Index`,
 `Id` (hex), `Codec`, `Channels`, `SampleRate`, `DurationSeconds` and `IsStreamed`. For streamed music,
 `Channels` is the Opus packet channel count and `DurationSeconds` is per channel: the tag `0x48` descriptor's
 interleaved sample count is divided by that channel count.
 
-`audio_wav.py` runs ffmpeg with `-c:a pcm_s16le` at the stream's own rate and channel count, and trims to the Ogg
-Opus end granule. Existing `.wav` files are skipped, so a stopped run continues. With no `--out`, a directory writes
-to `<src>/wav` and a single file writes next to itself.
+`audio_wav.py` runs ffmpeg with `-c:a pcm_s16le` at the stream's own rate and channel count. For a single stream
+it trims to the final Ogg Opus granule minus pre-skip. Chained streams have a separate granule timeline for each
+link, so ffmpeg handles their end trimming. Existing WAVs are normally skipped on resume. If the destination
+filesystem treats two output names as the same file, the converter keeps the input extensions and adds a counter
+where needed. It leaves a previously shared WAV untouched. Before reusing a name ending in `.ogg.wav` or `.opus.wav`
+(including counters such as `.ogg~2.wav`), it decodes the source again and compares the PCM, rate and channel
+layout. These checks read the full streams serially during planning. If the audio differs (including decoding
+differences between ffmpeg versions) or the existing WAV cannot be verified, it stays in place and the converter
+tries the next counter. Plain existing WAVs are
+trusted by name, so resuming into the same output folder assumes the same set of inputs.
+With no `--out`, a directory writes to `<src>/wav` and a single file writes next to itself.
 
 ## How `make_game.py --wav` uses them
 
@@ -165,6 +183,95 @@ programming is assembled by the game from many assets, so a lone AWC is rarely a
 The music/radio **config table** is a separate structure: 1,589 records with exact durations, AWC stream ids,
 contiguous station grouping and no per-track start offsets. See [audio_config.md](audio_config.md) for the record
 layout and the station-content references.
+
+## Mission music: Home Sweet Home
+
+The credited "Burn This Shit Down" is not a radio-station track. It is the song for the
+**Home Sweet Home** mission (Chapter 1, mission 21/25): Lucia at Jason's house in Key Lento
+during the house fire and the escape. The mission and its localized objective/fail strings are
+present in `data.rpf`; the song audio is not.
+
+Measured coverage on the Xbox Series 1.0.2.1 package:
+
+| Container | Searched | Result |
+|---|---|---|
+| `story000.rpf` streamed-music banks | 753 banks / 2,642 channels | none |
+| `story000.rpf` plain banks | 201 banks / 1,950 streams | none |
+| `story000.rpf` Bink | 264 streams / 162 with audio / 165 tracks / 5,090 s | none |
+| `movies.rpf` Bink | 229 tracks / 12,401 s | none |
+| `audio.rpf` streamed cues under 30 s | 1,149 channels / 5.78 h | none |
+| `audio.rpf` all banks | 7,162 banks, all streams | none |
+| loop/chunked banks | 1,099 banks / 118,180 streams | none |
+| `packs.rpf` inflated | 144,364 files / 9.74 GB | 0 AWC, 0 Bink2 |
+| `data.rpf` inflated | 28,509 files / 1.41 GB | mission text, 0 song strings |
+| `script.rpf`, `common.rpf`, `story000_script.rpf` | 1,058 / 955 / 2,633 files | none |
+| `levels.rpf` raw | 94 `ADAT` magics, 2,820 `KB2` patterns | 0 valid AWC/Bink |
+
+Fingerprint search: about 19,807 files / 19.9 M Chromaprint frames / 653 fingerprint-hours, with a
+0.50-2.00 tempo sweep over the story-music and long-AWC targets. No candidate passes the vote
+threshold. The positive controls keep their earlier results: Sensimilla 2,284 votes / 0.911 bits
+/ 100 %; Don't Break My Heart 88 votes / 7.046 bits / 94.5 %.
+
+A `data.rpf` hash table contains 12 occurrences of `joaat("burn")`, but it is not the song: the
+config blob has none, no AWC stream ID matches its low 29 bits, and the table has no audio
+reference.
+
+Residual uncertainty: `levels.rpf` (76 GB) was not fully inflated, and a custom RSC8 audio
+resource is the only mission-side container not decoded; the retail track may be a third master
+or patch content not covered by the public references; sub-30 s stings were not exhaustively
+fingerprinted. No game audio is stored in the repository; the searches ran on a local copy and
+`radio-dump-v3` was not modified.
+
+## Stream names
+
+The stream table stores only `joaat(lowercase name) & 0x1FFFFFFF`, so the exporters name files by id.
+`tools/awc_names.py` recovers names by hashing dictionary words against those ids. With about 1.8 million distinct
+ids in a 2^29 space, roughly 0.3% of arbitrary words collide by chance, so a hit is accepted only under one of two
+rules:
+
+| Rule | Accepted when |
+|---|---|
+| `dialogue` | the word is shaped like a dialogue wave, `<root>au_<4 letters>_<NN>`, and is in the dictionary exactly |
+| `family` | one base (a name without its trailing `_<number>`) hits ids in the same bank with several numbered suffixes (`''`, `_00`-`_40`, `_1`-`_9`): at least 3 members, or 2 with adjacent numbers. Every token of the base occurs in at least 5 dictionary words, and at least one member is itself a dictionary word |
+
+Each run repeats the attack with `zq` prepended to every word. Those names can't be right, so what the control
+accepts estimates the false names. Per source, the dialogue rule is kept only when its control is under 2% of its
+real count, and the family rule takes the smallest family size whose control is under 2%.
+
+The dictionary comes from two kinds of input:
+
+- `--words`: plain word lists, or a `hashdict.py` JSON (its values).
+- `--conversations`: conversation data, which pairs a dialogue key with its line labels as
+  `<ROOT>AU_<XXXX>\0<LABEL>\0`. A key with N distinct labels yields the waves `<key>_01` .. `<key>_<N>`. Wave `_01`
+  speaks the first label, `_02` the second, and so on. In 1.0.2.1 the pairs are in 594 carved `story000.rpf`
+  streams, 4 `shared_minigame000.rpf` streams and 2 `data.rpf` streams, and they give 136,788 wave names.
+
+Measured on the 1.0.2.1 package (2026-11-22). The dictionary is about 2.9 million harvested identifiers plus the
+conversation waves:
+
+| Archive | Banks | Distinct ids | Named | Dialogue | Family | Control (expected false) |
+|---|---:|---:|---:|---:|---:|---:|
+| `audio.rpf` | 7,162 | 1,606,237 | 92,043 | 0 | 92,043 | 352 |
+| `story000.rpf` | 63,861 | 234,458 | 172,781 | 119,492 | 53,289 | 62 |
+| `shared_minigame000.rpf` | 638 | 4,334 | 1,957 | 1,957 | 0 | 3 |
+
+`story000.rpf` is 73.7% named: dialogue is named almost entirely, because conversation data lists every key.
+`audio.rpf` is 5.7% named. Its sound effects, ambience and music have no list, so only numbered families are
+found. Adding 1,319 more dialogue words that exist only as harvested strings (not in any conversation pair) brings
+`story000.rpf` to 173,800. When two accepted families claim the same id in one bank (3 rows), the first family in
+sorted base order keeps it.
+
+The output names game files: keep it local, and do not commit it or attach it to an issue.
+
+```sh
+python -I tools/hashdict.py <carve dir> --out <temp>/hashes.json
+python -I tools/awc_names.py <work>/assets/audio/awc --words <temp>/hashes.json \
+    --conversations <carve dir>/story000 --out <temp>/awc_names.csv
+```
+
+Each positional source is reported and thresholded on its own. A source is a directory of `.awc` banks, a single
+bank, or an `audio_manifest.json` from `rpf9dump audio` (read without opening the banks). Pure Python; the run above
+took about 3 minutes on one core.
 
 ## Never commit or share extracted audio
 

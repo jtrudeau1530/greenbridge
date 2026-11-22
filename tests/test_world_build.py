@@ -5,7 +5,8 @@
 Covers:
   - tools/dds_png.py     (DDS header parsing, BGRA8/RGBA8/BGRX8/BC1/BC2/BC3/BC4/BC5, downscale, PNG encoder)
   - tools/glb_writer.py  (OBJ parser, bounds, binary glTF 2.0 writer, texture dedup, 32-bit indices, summary)
-  - tools/world_build.py (manifest discovery, TTPF indexing, texture resolution, spatial/grid/no-tex/limit builds)
+  - tools/world_build.py (manifest discovery, TTPF indexing, texture resolution, spatial/grid/no-tex/limit builds,
+                          --base-color-param selection with GLB pixel readback)
   - viewer/serve.py      (safe_world_path traversal hardening)
 
 Every texture, mesh, manifest, and archive layout is generated synthetically in memory or a temporary directory.
@@ -23,6 +24,7 @@ import sys
 import tempfile
 import threading
 import unittest
+import unittest.mock
 import zlib
 from http.server import HTTPServer, ThreadingHTTPServer
 
@@ -1230,6 +1232,191 @@ def _chunk_disk_path(world_dir: str, chunk_url: str) -> str:
     return os.path.join(world_dir, *rel.split("/"))
 
 
+NORMAL_RGBA = (128, 128, 255, 255)
+ALBEDO_RGBA = (240, 40, 20, 255)
+PLAIN_RGBA = (20, 70, 140, 255)
+ALBEDO_PARAM = "C8E8C282"
+NORMAL_PARAM = "C6F46E79"
+TTPF_ALBEDO_KEY = "AABBCCDDEEFF0011"
+
+
+def _uniform_bgra_dds(rgba, size=4):
+    return make_bgra8_dds(size, size, bytes(rgba) * (size * size))
+
+
+def _param_ref(param, texture_index, id64="0000000000000000"):
+    ref = {"TextureIndex": texture_index, "Name": "00000000", "Id64": id64, "Tag": "00000000"}
+    if param is not None:
+        ref["Param"] = param
+    return ref
+
+
+PARAM_CASES = {
+    "normal-first": [_param_ref(NORMAL_PARAM, 0), _param_ref(ALBEDO_PARAM, 1)],
+    "albedo-first": [_param_ref(ALBEDO_PARAM, 1), _param_ref(NORMAL_PARAM, 0)],
+    "no-albedo": [_param_ref(NORMAL_PARAM, 0)],
+    "unannotated": [_param_ref(None, 2)],
+}
+
+
+def _write_param_fixture(assets_dir, refs, *, materials=True, ttpf=False):
+    """One textured triangle whose shader 0 references embedded normal/albedo/plain DDS files."""
+    models_dir = os.path.join(assets_dir, "models")
+    tex_dir = os.path.join(models_dir, "tri_tex")
+    os.makedirs(tex_dir)
+    names = ("normal", "albedo", "plain")
+    for idx, (name, rgba) in enumerate(zip(names, (NORMAL_RGBA, ALBEDO_RGBA, PLAIN_RGBA))):
+        with open(os.path.join(tex_dir, f"{idx:03d}_{name}.dds"), "wb") as f:
+            f.write(_uniform_bgra_dds(rgba))
+    with open(os.path.join(models_dir, "tri.obj"), "w", encoding="utf-8") as f:
+        f.write("v 0 0 0\nv 1 0 0\nv 0 1 0\nvt 0 0\nvt 1 0\nvt 0 1\nf 1/1 2/2 3/3\n")
+    if ttpf:
+        ttpf_dir = os.path.join(assets_dir, "ttpf")
+        os.makedirs(ttpf_dir)
+        with open(os.path.join(ttpf_dir, "albedo.dds"), "wb") as f:
+            f.write(_uniform_bgra_dds(ALBEDO_RGBA))
+        with open(os.path.join(ttpf_dir, "manifest.json"), "w", encoding="utf-8") as f:
+            json.dump({"Textures": [{"AssetKey": TTPF_ALBEDO_KEY, "File": "albedo.dds"}]}, f)
+    item = {
+        "File": "tri.obj",
+        "Name": "tri",
+        "MeshShaders": [0],
+        "Embedded": [
+            {"Index": idx, "Name": name, "Hash": "00000000", "Key": None}
+            for idx, name in enumerate(names)
+        ],
+        "Materials": [{"ShaderIndex": 0, "Textures": refs}] if materials else [],
+    }
+    with open(os.path.join(models_dir, "manifest.json"), "w", encoding="utf-8") as f:
+        json.dump({"Items": [item]}, f)
+
+
+def _glb_first_base_color_pixel(glb_path):
+    """Read the first base-color texel with the suite's independent GLB and PNG readers."""
+    with open(glb_path, "rb") as f:
+        gltf, bin_data = parse_and_validate_glb(f.read())
+    for mat in gltf.get("materials", []):
+        tex_ref = mat.get("pbrMetallicRoughness", {}).get("baseColorTexture")
+        if tex_ref is None:
+            continue
+        image = gltf["images"][gltf["textures"][tex_ref["index"]]["source"]]
+        view = gltf["bufferViews"][image["bufferView"]]
+        start = view.get("byteOffset", 0)
+        _, _, rgba = parse_and_validate_png(bin_data[start:start + view["byteLength"]])
+        return gltf, tuple(rgba[:4])
+    return gltf, None
+
+
+class BaseColorParamTest(unittest.TestCase):
+    """--base-color-param selects base colour by shader parameter hash; checked by GLB pixel readback."""
+
+    TOOL = os.path.join(TOOLS, "world_build.py")
+
+    def _run_cli(self, assets_dir, out_dir, *extra_args):
+        cmd = [sys.executable, "-I", self.TOOL, assets_dir, "--out", out_dir, *extra_args]
+        return subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+
+    def _read_world(self, out_dir):
+        with open(os.path.join(out_dir, "world.json"), encoding="utf-8") as f:
+            world = json.load(f)
+        self.assertEqual(len(world["chunks"]), 1)
+        gltf, pixel = _glb_first_base_color_pixel(_chunk_disk_path(out_dir, world["chunks"][0]["url"]))
+        return world["stats"], gltf, pixel
+
+    def _export(self, refs, *args, materials=True, ttpf=False):
+        with tempfile.TemporaryDirectory() as tmp:
+            assets_dir = os.path.join(tmp, "assets")
+            out_dir = os.path.join(tmp, "world")
+            _write_param_fixture(assets_dir, refs, materials=materials, ttpf=ttpf)
+            proc = self._run_cli(assets_dir, out_dir, *args)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            return self._read_world(out_dir)
+
+    def _assert_textured(self, expected_rgba, refs, *args, **fixture):
+        stats, _, pixel = self._export(refs, *args, **fixture)
+        self.assertEqual(stats["textures_embedded"], 1)
+        self.assertEqual(pixel, expected_rgba)
+
+    def _assert_clay(self, refs, *args, **fixture):
+        stats, gltf, pixel = self._export(refs, *args, **fixture)
+        self.assertIsNone(pixel)
+        self.assertEqual(stats["textures_embedded"], 0)
+        self.assertEqual(gltf.get("images", []), [])
+        _, clay_gltf, _ = self._export(refs, "--no-textures", **fixture)
+        self.assertEqual(gltf.get("materials"), clay_gltf.get("materials"))
+
+    def test_default_behaviour_unchanged(self):
+        expected = {
+            "normal-first": NORMAL_RGBA,
+            "albedo-first": ALBEDO_RGBA,
+            "no-albedo": NORMAL_RGBA,
+            "unannotated": PLAIN_RGBA,
+        }
+        for case, rgba in expected.items():
+            with self.subTest(case=case):
+                self._assert_textured(rgba, PARAM_CASES[case])
+        with self.subTest(case="no-materials"):
+            # Legacy fallback maps the first sorted DDS to shader 0.
+            self._assert_textured(NORMAL_RGBA, [], materials=False)
+
+    def test_selected_param_picks_albedo_regardless_of_order(self):
+        for case in ("normal-first", "albedo-first"):
+            for value in (ALBEDO_PARAM, "0xc8e8c282"):
+                with self.subTest(case=case, value=value):
+                    self._assert_textured(ALBEDO_RGBA, PARAM_CASES[case], "--base-color-param", value)
+
+    def test_selected_param_without_resolvable_match_is_clay(self):
+        cases = (
+            ("no-albedo", PARAM_CASES["no-albedo"], True),
+            ("unannotated", PARAM_CASES["unannotated"], True),
+            ("unresolved-match", [_param_ref(ALBEDO_PARAM, 7), _param_ref(NORMAL_PARAM, 0)], True),
+            ("no-materials", [], False),
+        )
+        for case, refs, materials in cases:
+            with self.subTest(case=case):
+                self._assert_clay(refs, "--base-color-param", ALBEDO_PARAM, materials=materials)
+
+    def test_first_resolvable_match_wins(self):
+        refs = [_param_ref(ALBEDO_PARAM, 7), _param_ref(NORMAL_PARAM, 0), _param_ref(ALBEDO_PARAM, 1)]
+        self._assert_textured(ALBEDO_RGBA, refs, "--base-color-param", ALBEDO_PARAM)
+
+    def test_selected_param_resolves_external_ttpf(self):
+        refs = [_param_ref(NORMAL_PARAM, 0), _param_ref(ALBEDO_PARAM, -1, TTPF_ALBEDO_KEY)]
+        self._assert_textured(NORMAL_RGBA, refs, ttpf=True)
+        self._assert_textured(ALBEDO_RGBA, refs, "--base-color-param", ALBEDO_PARAM, ttpf=True)
+
+    def test_no_textures_with_param_is_clay(self):
+        stats, gltf, pixel = self._export(
+            PARAM_CASES["normal-first"], "--no-textures", "--base-color-param", ALBEDO_PARAM
+        )
+        self.assertIsNone(pixel)
+        self.assertEqual(stats["textures_embedded"], 0)
+        self.assertEqual(gltf.get("images", []), [])
+
+    def test_api_matches_cli(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            assets_dir = os.path.join(tmp, "assets")
+            out_dir = os.path.join(tmp, "world")
+            _write_param_fixture(assets_dir, PARAM_CASES["normal-first"])
+            world_build.build_world(assets_dir, out_dir, base_color_param="0xC8E8C282")
+            stats, _, pixel = self._read_world(out_dir)
+        self.assertEqual(stats["textures_embedded"], 1)
+        self.assertEqual(pixel, ALBEDO_RGBA)
+
+    def test_invalid_param_rejected_before_output(self):
+        for value in ("C8E8C28", "C8E8C2822", "0xZZZZZZZZ", ""):
+            with self.subTest(value=value), tempfile.TemporaryDirectory() as tmp:
+                assets_dir = os.path.join(tmp, "assets")
+                out_dir = os.path.join(tmp, "world")
+                _write_param_fixture(assets_dir, PARAM_CASES["normal-first"])
+                proc = self._run_cli(assets_dir, out_dir, "--base-color-param", value)
+                self.assertEqual(proc.returncode, 2, proc.stderr)
+                self.assertIn("--base-color-param", proc.stderr)
+                with self.assertRaises(ValueError):
+                    world_build.build_world(assets_dir, out_dir, base_color_param=value)
+                self.assertFalse(os.path.exists(out_dir))
+
+
 class WorldBuildTest(unittest.TestCase):
     TOOL = os.path.join(TOOLS, "world_build.py")
 
@@ -1248,6 +1435,20 @@ class WorldBuildTest(unittest.TestCase):
                 with open(path, "rb") as f:
                     snapshot[os.path.relpath(path, directory)] = f.read()
         return snapshot
+
+    def test_compute_spawn_keeps_large_chunks_within_viewer_load_radius(self):
+        load_radius = 1400.0  # viewer/index.html LOAD_R
+        floor = [{"bounds": [x, -2.0, -7000.0, x + 4000.0, 0.0, -3000.0]} for x in (1000.0, 5000.0, 9000.0)]
+        tower = [{"bounds": [-500.0, 0.0, -500.0, -490.0, 3000.0, -490.0]}]
+        for chunks, b in ((floor, floor[1]["bounds"]), (tower, tower[0]["bounds"])):
+            with self.subTest(bounds=b):
+                spawn = world_build._compute_spawn(chunks)
+                self.assertEqual(spawn[0], 0.5 * (b[0] + b[3]))
+                nearest = [min(max(p, lo), hi) for p, lo, hi in zip(spawn, b[:3], b[3:])]
+                self.assertLess(math.dist(spawn, nearest), load_radius)
+        small = [{"bounds": [10.0, 0.0, 20.0, 110.0, 5.0, 120.0]}]
+        self.assertEqual(world_build._compute_spawn(small), [60.0, 30.0, 180.0])
+        self.assertEqual(world_build._compute_spawn([]), [0.0, 20.0, 40.0])
 
     def test_unusable_input_preserves_output_and_reports_failure(self):
         cases = ("unrelated_directory", "corrupt_manifest", "invalid_schema", "empty_manifest",
@@ -1298,6 +1499,40 @@ class WorldBuildTest(unittest.TestCase):
                     self.assertEqual(self._output_snapshot(output), before)
                     if not existing_output:
                         self.assertFalse(os.path.exists(output))
+
+    def test_malformed_optional_material_arrays_match_missing_fields(self):
+        cases = (
+            ("MeshShaders", 7),
+            ("MeshShaders", "0"),
+            ("MeshShaders", {"0": 0}),
+            ("Embedded", True),
+            ("Materials", 7),
+            ("Materials", {"0": {}}),
+            ("Textures", 1.5),
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            assets, output = os.path.join(tmp, "assets"), os.path.join(tmp, "world")
+            path = _write_synthetic_assets(assets)["models_manifest_path"]
+            with open(path, encoding="utf-8") as f:
+                original = f.read()
+
+            def build(manifest):
+                with open(path, "w", encoding="utf-8") as f:
+                    json.dump(manifest, f)
+                result = world_build.build_world(assets, output)
+                self.assertEqual(result["stats"]["models"], 2)
+                return self._output_snapshot(output)
+
+            for field, malformed in cases:
+                with self.subTest(field=field, malformed=malformed):
+                    manifest = json.loads(original)
+                    record = manifest["Items"][0]
+                    if field == "Textures":
+                        record = record["Materials"][0]
+                    del record[field]
+                    expected = build(manifest)
+                    record[field] = malformed
+                    self.assertEqual(build(manifest), expected)
 
     def test_limit_zero_explicitly_replaces_world_with_empty_output(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1576,6 +1811,135 @@ class WorldBuildTest(unittest.TestCase):
                 world_build.build_world(missing, out_dir)
             p = self._run_cli(missing, out_dir)
             self.assertNotEqual(p.returncode, 0)
+
+
+class WorldBuildStagingTest(unittest.TestCase):
+    """A rebuild that fails or is interrupted must leave the previous world.json and its chunks as they were."""
+
+    _snapshot = staticmethod(WorldBuildTest._output_snapshot)
+
+    @staticmethod
+    def _failing_write_glb(exc: BaseException, fail_on_call: int = 2):
+        """Wrap the real write_glb so that call number `fail_on_call` raises `exc` instead of writing."""
+        real = glb_writer.write_glb
+        lock = threading.Lock()
+        calls = [0]
+
+        def write_glb(path, *args, **kwargs):
+            with lock:
+                calls[0] += 1
+                n = calls[0]
+            if n == fail_on_call:
+                raise exc
+            return real(path, *args, **kwargs)
+
+        return write_glb
+
+    def _previous_world(self, tmp: str) -> tuple[str, str, dict]:
+        # The previous world is untextured; the failing rebuild embeds textures, so every chunk it
+        # would publish differs from the one on disk and an early overwrite shows up in the snapshot.
+        assets, output = os.path.join(tmp, "assets"), os.path.join(tmp, "world")
+        _write_synthetic_assets(assets, origin_overlap=False)
+        world_build.build_world(assets, output, textures=False)
+        before = self._snapshot(output)
+        self.assertEqual(sum(1 for k in before if k.startswith("chunks" + os.sep)), 2)
+        return assets, output, before
+
+    def test_successful_build_publishes_every_chunk_and_world_json(self):
+        for jobs in (1, 4):
+            with self.subTest(jobs=jobs), tempfile.TemporaryDirectory() as tmp:
+                assets, output = os.path.join(tmp, "assets"), os.path.join(tmp, "world")
+                _write_synthetic_assets(assets, origin_overlap=False)
+                result = world_build.build_world(assets, output, jobs=jobs)
+                with open(os.path.join(output, "world.json"), encoding="utf-8") as f:
+                    document = json.load(f)
+                self.assertEqual(document, result)
+                self.assertEqual(len(document["chunks"]), 2)
+                for chunk in document["chunks"]:
+                    with open(_chunk_disk_path(output, chunk["url"]), "rb") as f:
+                        parse_and_validate_glb(f.read())
+                self.assertEqual(sorted(os.listdir(output)), ["chunks", "world.json"])
+                self.assertEqual(sorted(os.listdir(os.path.join(output, "chunks"))),
+                                 sorted(f"{c['id']}.glb" for c in document["chunks"]))
+
+    def test_failed_chunk_write_leaves_existing_world_untouched(self):
+        failures = (glb_writer.GlbError("synthetic broken asset"), OSError("synthetic write error"),
+                    KeyboardInterrupt())
+        for exc in failures:
+            for jobs in (1, 4):
+                with self.subTest(exc=type(exc).__name__, jobs=jobs), tempfile.TemporaryDirectory() as tmp:
+                    assets, output, before = self._previous_world(tmp)
+                    with unittest.mock.patch.object(glb_writer, "write_glb", self._failing_write_glb(exc)):
+                        with self.assertRaises(type(exc)):
+                            world_build.build_world(assets, output, jobs=jobs)
+                    self.assertEqual(self._snapshot(output), before)
+
+    def test_failed_first_build_leaves_no_output_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            assets, output = os.path.join(tmp, "assets"), os.path.join(tmp, "world")
+            _write_synthetic_assets(assets, origin_overlap=False)
+            with unittest.mock.patch.object(glb_writer, "write_glb", self._failing_write_glb(OSError("disk full"))):
+                with self.assertRaises(OSError):
+                    world_build.build_world(assets, output)
+            self.assertFalse(os.path.exists(output))
+
+    def test_corrupt_staged_chunk_is_rejected_before_publishing(self):
+        real = glb_writer.write_glb
+
+        def truncating_write_glb(path, *args, **kwargs):
+            info = real(path, *args, **kwargs)
+            with open(path, "r+b") as f:
+                f.truncate(16)
+            return info
+
+        with tempfile.TemporaryDirectory() as tmp:
+            assets, output, before = self._previous_world(tmp)
+            with unittest.mock.patch.object(glb_writer, "write_glb", truncating_write_glb):
+                with self.assertRaises(ValueError):
+                    world_build.build_world(assets, output)
+            self.assertEqual(self._snapshot(output), before)
+
+    def test_world_json_write_failure_restores_previous_chunks(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            assets, output, before = self._previous_world(tmp)
+            with unittest.mock.patch.object(world_build, "_write_json_atomic",
+                                            side_effect=OSError("synthetic world.json write error")):
+                with self.assertRaises(OSError):
+                    world_build.build_world(assets, output)
+            self.assertEqual(self._snapshot(output), before)
+
+    def test_staging_left_by_a_killed_build_is_removed_on_the_next_build(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            assets, output = os.path.join(tmp, "assets"), os.path.join(tmp, "world")
+            _write_synthetic_assets(assets, origin_overlap=False)
+            leftover = os.path.join(output, world_build.CHUNK_STAGING_PREFIX + "killed")
+            os.makedirs(leftover)
+            with open(os.path.join(leftover, "c_0_0.glb"), "wb") as f:
+                f.write(b"partial")
+            world_build.build_world(assets, output)
+            self.assertEqual(sorted(os.listdir(output)), ["chunks", "world.json"])
+
+    def test_stale_cleanup_preserves_staging_with_unrestored_previous_chunks(self):
+        prefix = world_build.CHUNK_STAGING_PREFIX
+        with tempfile.TemporaryDirectory() as tmp:
+            empty = os.path.join(tmp, prefix + "empty")
+            os.makedirs(empty)
+            incomplete = os.path.join(tmp, prefix + "incomplete")
+            os.makedirs(os.path.join(incomplete, "previous"))  # an empty previous/ holds nothing to recover
+            with open(os.path.join(incomplete, "c_1_0.glb"), "wb") as f:
+                f.write(b"partial")
+            recovery = os.path.join(tmp, prefix + "recovery")
+            os.makedirs(os.path.join(recovery, "previous"))
+            with open(os.path.join(recovery, "previous", "c_0_0.glb"), "wb") as f:
+                f.write(b"previous chunk")
+            unrelated = os.path.join(tmp, "notes")
+            os.makedirs(unrelated)
+
+            world_build._remove_stale_staging(tmp)
+
+            self.assertEqual(sorted(os.listdir(tmp)), sorted([prefix + "recovery", "notes"]))
+            with open(os.path.join(recovery, "previous", "c_0_0.glb"), "rb") as f:
+                self.assertEqual(f.read(), b"previous chunk")
 
 
 # ---------------------------------------------------------------------------

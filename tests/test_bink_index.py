@@ -9,8 +9,10 @@ import io
 import json
 import os
 import struct
+import subprocess
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -63,6 +65,17 @@ class TestHeader(unittest.TestCase):
         self.assertEqual(row["audio_codecs"], ["binkaudio_dct", "binkaudio_dct"])
         self.assertEqual(row["audio_channels"], [2, 2])
 
+    def test_audio_descriptors_stay_within_declared_size(self):
+        stream = struct.pack("<4s10I", b"KB2a", 40, 1, 0, 1, 16, 16, 30, 1, 0, 1) + bytes(4)
+        prefix = b"archive prefix"
+        data = prefix + stream
+        row = bink.parse_header(data, len(prefix))
+        self.assertEqual(row["size"], 48)
+        self.assertEqual(row["audio_rates"], [])
+        self.assertEqual(row["audio_channels"], [])
+        self.assertEqual(bink.parse_header(data + struct.pack("<HHI", 44100, 0x2000, 17),
+                                           len(prefix)), row)
+
     def test_truncated_file_is_skipped(self):
         data = make_stream()[:-100]
         self.assertIsNone(bink.parse_header(data, 0))
@@ -108,6 +121,16 @@ class TestScanAndWrite(unittest.TestCase):
         self.assertEqual(rows[0]["frames"], 7)
         self.assertEqual(summary["streams"], 1)
 
+    def test_short_file_bytes_are_accounted_for(self):
+        path = os.path.join(self.dir, "tiny.bk2")
+        with open(path, "wb") as fh:
+            fh.write(b"KB2a" + bytes(16))
+        rows, summary = bink.scan_target(path)
+        self.assertEqual(rows, [])
+        self.assertEqual(summary["span"], 20)
+        self.assertEqual(summary["unread_bytes"], 20)
+        self.assertEqual(summary["zero_padding"], 0)
+
     def test_fractional_rates_are_indexed(self):
         path = os.path.join(self.dir, "fractional.bk2")
         with open(path, "wb") as fh:
@@ -120,6 +143,23 @@ class TestScanAndWrite(unittest.TestCase):
             [(24000, 1001, 23.976, 5.005), (30000, 1001, 29.97, 4.004),
              (60000, 1001, 59.94, 2.002)],
         )
+
+    def test_probe_handles_failed_or_malformed_results(self):
+        rows, _ = bink.scan_target(self.dir)
+        valid_info = {"streams": [{"codec_type": "video", "codec_name": "bink2"}],
+                      "format": {"duration": "0.233"}}
+        for status, info, expected in (
+            (0, valid_info, ("yes", "bink2", "0.233")),
+            (1, valid_info, ("no", "", "")),
+            (0, [], ("no", "", "")),
+            (0, {"streams": [None]}, ("no", "", "")),
+            (0, {"streams": valid_info["streams"], "format": None}, ("no", "", "")),
+        ):
+            with self.subTest(status=status, info=info):
+                proc = subprocess.CompletedProcess(["ffprobe"], status, json.dumps(info))
+                with mock.patch.object(bink.subprocess, "run", return_value=proc):
+                    row = bink.probe_row(dict(rows[0]), "ffprobe")
+                self.assertEqual((row["decodes"], row["codec"], row["probe_duration_s"]), expected)
 
     def test_csv_and_json(self):
         rows, summary = bink.scan_target(self.dir)
@@ -168,6 +208,60 @@ class TestCommandLine(unittest.TestCase):
         with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(bink.main([missing]), 2)
         self.assertIn("no such file or directory", err.getvalue())
+
+    def test_output_write_failure_is_an_error(self):
+        for extension in ("csv", "json"):
+            with self.subTest(extension=extension):
+                path = os.path.join(self.tmp.name, "missing", f"index.{extension}")
+                out, err = io.StringIO(), io.StringIO()
+                with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                    self.assertEqual(bink.main([self.path, "--out", path]), 2)
+                self.assertEqual(out.getvalue(), "")
+                self.assertIn(f"cannot write {path}", err.getvalue())
+
+
+    def test_output_cannot_overwrite_carve_manifest(self):
+        carve = os.path.join(self.tmp.name, "carve")
+        os.makedirs(carve, exist_ok=True)
+        manifest = os.path.join(carve, "index.json")
+        with open(manifest, "w", encoding="utf-8") as f:
+            f.write('{"carve_manifest": true}')
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(SystemExit) as cm:
+                bink.main([carve, "--out", manifest])
+        self.assertEqual(cm.exception.code, 2)
+        self.assertIn("would overwrite the carve manifest", err.getvalue())
+        with open(manifest, "r", encoding="utf-8") as f:
+            self.assertEqual(f.read(), '{"carve_manifest": true}')
+
+    def test_output_cannot_overwrite_a_carved_input(self):
+        carve = os.path.join(self.tmp.name, "carve2")
+        os.makedirs(carve, exist_ok=True)
+        payload = os.path.join(carve, "00000001.bin")
+        with open(payload, "wb") as f:
+            f.write(make_stream())
+        linked = os.path.join(carve, "linked.json")   # a .json alias of the .bin input
+        try:
+            os.link(payload, linked)
+        except OSError:
+            self.skipTest("hard links are not available")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(SystemExit) as cm:
+                bink.main([carve, "--out", linked])
+        self.assertEqual(cm.exception.code, 2)
+        self.assertIn("would overwrite an input file", err.getvalue())
+        with open(payload, "rb") as f:
+            self.assertEqual(f.read(), make_stream())
+
+    def test_output_folder_is_rejected(self):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(SystemExit) as cm:
+                bink.main([self.path, "--out", self.tmp.name])
+        self.assertEqual(cm.exception.code, 2)
+        self.assertIn("is a folder, not a report file", err.getvalue())
 
 
 if __name__ == "__main__":

@@ -1,7 +1,7 @@
 r"""Differential oracle for the RDNA2 translator (standard library only).
 
 Runs seeded straight-line ALU programs through two independent oracles and
-compares them bit-exact:
+compares their output words:
   * tools/cpu_ref.py      - the ISA model, executed per lane (lanes=1, lane=0)
   * rdna2spirv + tests/semantic/spirv_mini_interp.py - the translated SPIR-V
 
@@ -186,27 +186,31 @@ def _write_listing(path, lines, with_export):
         f.write("\ts_endpgm\n")
 
 
-def compare_pair(cpu_words, spv_words):
-    """Bit-exact compare of two 4-word exports. Returns a mismatch string or None.
+def compare_pair(cpu_words, spv_words, *, writers=None):
+    """Compare two 4-word exports and return the first mismatch or None.
 
-    NaN words match only if both sides are NaN (payloads recorded); finite
-    words must be exactly equal.
+    Results of floating-point instructions can have different NaN payloads.
+    All other words must match bit for bit.
     """
     if len(cpu_words) != 4 or len(spv_words) != 4:
         return f"shape mismatch: cpu has {len(cpu_words)} words, spv has {len(spv_words)}"
+    writers = writers or {}
     for i in range(4):
         c = cpu_words[i] & 0xFFFFFFFF
         s = spv_words[i] & 0xFFFFFFFF
         if c == s:
             continue
-        c_nan, s_nan = _is_nan_bits(c), _is_nan_bits(s)
-        if c_nan and s_nan:
-            continue  # both NaN: payloads legitimately differ, not a mismatch
-        if c_nan or s_nan:
-            return (f"lane word {i}: only one side is NaN "
-                    f"(cpu=0x{c:08x} spv=0x{s:08x})")
-        return (f"lane word {i}: expected 0x{c:08x} ({c}), "
-                f"actual 0x{s:08x} ({s})")
+        writer = writers.get(EXPORT_REGS[i])
+        mismatch = f"lane word {i}: expected 0x{c:08x} ({c}), actual 0x{s:08x} ({s})"
+        if writer and cpu_ref.base_op(writer[0]) in _FLOAT_OPS:
+            c_nan, s_nan = _is_nan_bits(c), _is_nan_bits(s)
+            if c_nan and s_nan:
+                continue
+            if c_nan or s_nan:
+                mismatch = f"lane word {i}: only one side is NaN (cpu=0x{c:08x} spv=0x{s:08x})"
+        if writer:
+            mismatch += f" (last writer {writer[0]} at body line {writer[1]})"
+        return mismatch
     return None
 
 
@@ -246,16 +250,10 @@ def run_one(name, lines, writers):
         regs = cpu_res["registers"]["vgpr"]
         cpu_words = [regs.get(r, [0])[0] if isinstance(regs.get(r), list) else regs.get(r, 0)
                      for r in EXPORT_REGS]
-        mismatch = compare_pair(cpu_words, list(out["%out_mrt0"]))
+        mismatch = compare_pair(cpu_words, list(out["%out_mrt0"]), writers=writers)
         if mismatch is None:
             return ("match", "")
-        first_bad = next(i for i in range(4)
-                         if (cpu_words[i] & 0xFFFFFFFF) != (list(out["%out_mrt0"])[i] & 0xFFFFFFFF)
-                         or (_is_nan_bits(cpu_words[i] & 0xFFFFFFFF) !=
-                             _is_nan_bits(list(out["%out_mrt0"])[i] & 0xFFFFFFFF)))
-        writer = writers.get(EXPORT_REGS[first_bad], ("?", 0))
-        return ("mismatch",
-                f"{mismatch} (last writer {writer[0]} at body line {writer[1]})")
+        return ("mismatch", mismatch)
 
 
 def run_suite(programs, seed, max_ops, limit=None):
@@ -311,12 +309,29 @@ def self_test():
     return True
 
 
+def _at_least_one(value):
+    """An integer option that must be at least 1.
+
+    0 and negative values used to run nothing (--programs, --limit) or raise
+    `empty range in randrange(1, 1)` (--max-ops) instead of being refused.
+    """
+    try:
+        n = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected an integer, got {value!r}") from None
+    if n < 1:
+        raise argparse.ArgumentTypeError(f"must be at least 1 (got {n})")
+    return n
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Differential oracle: cpu_ref vs translated SPIR-V.")
-    ap.add_argument("--programs", type=int, default=200)
+    ap.add_argument("--programs", type=_at_least_one, default=200, help="number of programs to run (default: 200)")
     ap.add_argument("--seed", type=int, default=1)
-    ap.add_argument("--max-ops", type=int, default=8)
-    ap.add_argument("--limit", type=int, default=None, help="run only the first N programs")
+    ap.add_argument("--max-ops", type=_at_least_one, default=8,
+                    help="maximum ops per generated program (default: 8)")
+    ap.add_argument("--limit", type=_at_least_one, default=None,
+                    help="run only the first N programs (N >= 1)")
     ap.add_argument("--list-ops", action="store_true", help="print the op table and exit")
     ap.add_argument("--self-test", action="store_true", help="run harness canaries and exit")
     a = ap.parse_args(argv)
@@ -328,18 +343,22 @@ def main(argv=None):
         return 0 if self_test() else 1
     counts, first_failure = run_suite(a.programs, a.seed, a.max_ops, a.limit)
     total_skips = sum(counts["skip"].values())
-    print(f"{a.programs} programs (seed {a.seed}): "
+    total_run = counts["pass"] + counts["mismatch"] + total_skips + counts["harness-error"]
+    print(f"{total_run} programs (seed {a.seed}): "
           f"{counts['pass']} pass, {counts['mismatch']} mismatch, "
           f"{total_skips} skipped, {counts['harness-error']} harness errors")
     for reason, n in sorted(counts["skip"].items()):
         print(f"  skip x{n}: {reason}")
     if first_failure is not None:
-        print("FIRST MISMATCH:\n" + first_failure)
-        return 1
+        print("FIRST FAILURE:\n" + first_failure)
     if counts["harness-error"]:
         return 2
-    return 0
+    return 1 if counts["mismatch"] else 0
 
 
 if __name__ == "__main__":
+    try:  # a redirected stdout is strict ANSI code page under -I; write '?' for what it cannot encode
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
     sys.exit(main())

@@ -20,12 +20,30 @@ def f32(x):
         return math.copysign(math.inf, x)
 
 
+class _F32(float):
+    """A binary32 value made from a bit pattern (OpBitcast) that keeps that exact pattern.
+
+    struct's binary32 -> double conversion quiets a signalling NaN (sets bit 22, issue #509), so the float alone
+    cannot give the word back. Copies, selects, composites, loads and stores pass the value on unchanged and keep
+    `bits`; arithmetic on it returns a plain float, which drops them (SPIR-V leaves the bits of a NaN result
+    open). The same fix as spirv_mini_interp (#533)."""
+
+    __slots__ = ("bits",)
+
+    def __new__(cls, bits):
+        self = super().__new__(cls, struct.unpack("<f", struct.pack("<I", bits))[0])
+        self.bits = bits
+        return self
+
+
 def f2u(x):
+    if isinstance(x, _F32):
+        return x.bits
     return struct.unpack("<I", struct.pack("<f", x))[0]
 
 
 def u2f(u):
-    return struct.unpack("<f", struct.pack("<I", u & M32))[0]
+    return _F32(u & M32)
 
 
 def s32(u):
@@ -127,10 +145,16 @@ def run(spvasm):
         "OpLogicalOr": lambda a, b: a or b, "OpLogicalAnd": lambda a, b: a and b,
         "OpSLessThanEqual": lambda a, b: a <= b, "OpSGreaterThanEqual": lambda a, b: a >= b,
         "OpULessThan": lambda a, b: a < b, "OpUGreaterThan": lambda a, b: a > b,
+        "OpULessThanEqual": lambda a, b: a <= b, "OpUGreaterThanEqual": lambda a, b: a >= b,
+        "OpFUnordNotEqual": lambda a, b: a != b,          # true when either is NaN, as Python's != is
         "OpIEqual": lambda a, b: a == b, "OpINotEqual": lambda a, b: a != b,
     }
 
+    F64 = {"OpFAdd": lambda a, b: a + b, "OpFSub": lambda a, b: a - b, "OpFMul": lambda a, b: a * b}
+
     def glsl(fn, a):
+        if fn in ("Fma", "FMin", "FMax", "FClamp") and isinstance(a[0], tuple):      # vector: per component
+            return tuple(glsl(fn, list(c)) for c in zip(*a))
         if fn == "UnpackHalf2x16":
             return (f32(half_to_float(a[0])), f32(half_to_float(a[0] >> 16)))
         if fn == "PackHalf2x16":
@@ -140,9 +164,22 @@ def run(spvasm):
             if any(math.isnan(x) or math.isinf(x) for x in a):
                 return f32(a[0] * a[1] + a[2])
             return f32(float(Fraction(a[0]) * Fraction(a[1]) + Fraction(a[2])))
-        simple = {"FMin": min, "FMax": max, "FAbs": abs, "Floor": math.floor, "Ceil": math.ceil, "Trunc": math.trunc,
+        rounding = {"Floor": math.floor, "Ceil": math.ceil, "Trunc": math.trunc, "RoundEven": round}
+        if fn in rounding:      # a zero result keeps the sign of the operand (IEEE 754; RDNA2 and Vulkan GPUs do)
+            return a[0] if math.isnan(a[0]) or math.isinf(a[0]) else math.copysign(float(rounding[fn](a[0])), a[0])
+        simple = {"FMin": min, "FMax": max, "FAbs": abs, "Sin": math.sin, "Cos": math.cos,
                   "Sqrt": math.sqrt, "InverseSqrt": lambda x: 1 / math.sqrt(x), "Exp2": lambda x: 2.0 ** x,
-                  "Log2": math.log2, "RoundEven": lambda x: float(round(x))}
+                  "Log2": math.log2}
+        if fn in ("NMin", "NMax"):
+            # A NaN operand gives the other operand (both NaN: a NaN); zeros ordered -0 < +0 as on RDNA2.
+            def pick(x, y):
+                if math.isnan(x) or math.isnan(y):
+                    return y if math.isnan(x) else x
+                kx, ky = (x, math.copysign(1.0, x)), (y, math.copysign(1.0, y))
+                return y if (ky < kx if fn == "NMin" else ky > kx) else x
+            if isinstance(a[0], tuple):
+                return tuple(pick(x, y) for x, y in zip(a[0], a[1]))
+            return pick(a[0], a[1])
         if fn in simple:
             return f32(float(simple[fn](*a)))
         if fn == "Fract":
@@ -175,7 +212,11 @@ def run(spvasm):
             val[res] = get(args[1])
         elif op == "OpBitcast":
             t, v = types[args[0]][0], get(args[1])
-            if t == "Float":
+            if types[args[0]] == ("Float", "64"):          # v2uint (lo, hi) -> double
+                val[res] = struct.unpack("<d", struct.pack("<II", v[0] & M32, v[1] & M32))[0]
+            elif t == "Vector" and isinstance(v, float):  # double -> v2uint (lo, hi)
+                val[res] = struct.unpack("<II", struct.pack("<d", v))
+            elif t == "Float":
                 val[res] = u2f(v) if isinstance(v, int) else v
             else:
                 bits = f2u(v) if isinstance(v, float) else v & M32
@@ -183,7 +224,13 @@ def run(spvasm):
         elif op == "OpSelect":
             val[res] = get(args[2]) if get(args[1]) else get(args[3])
         elif op in ARITH:
-            val[res] = ARITH[op](get(args[1]), get(args[2]))
+            t, x, y = types.get(args[0], ("",)), get(args[1]), get(args[2])
+            if t == ("Float", "64") and op in F64:
+                val[res] = F64[op](x, y)                   # binary64: Python floats, no f32 rounding
+            elif isinstance(x, tuple) and isinstance(y, tuple):     # vector operands: component by component
+                val[res] = tuple(ARITH[op](p, q) for p, q in zip(x, y))
+            else:
+                val[res] = ARITH[op](x, y)
         elif op == "OpNot":
             val[res] = ~get(args[1]) & M32
         elif op == "OpLogicalNot":

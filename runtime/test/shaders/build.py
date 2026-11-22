@@ -11,6 +11,10 @@ Compute shaders can override the default header with leading "; group: X,Y,Z" an
 The stage comes from the name's prefix. Mesh and geometry shaders (ms_, gs_) also need a DXBC container with
 their signatures, which this doesn't make.
 The comment at the top of each .asm says which test program to run on the result and what it should print.
+With LEONIDA_FMA=khr (or glsl), the fused multiply-adds are translated with --fma khr (OpFmaKHR, which needs
+VK_KHR_shader_fma; the test programs enable it when the device has it, else they exit 77) or --fma glsl.
+With LEONIDA_BARY_FALLBACK=1, pixel shaders that read raw barycentrics are translated with --bary-fallback, and
+each gets a pass-through geometry shader, <name>.bary_gs.spv, that check.py draws it with (tools/bary_fallback_gs.py).
 """
 import json
 import os
@@ -49,6 +53,10 @@ def asm_mattr(path):
 CLIP_CASES = {"vs_clip": 1, "vs_clip_param4": 4, "vs_clip_undeclared": 1}
 
 
+def shader_source(name):
+    return "vs_clip" if name in CLIP_CASES else name
+
+
 def clip_container():
     # One OSG1 element: stream 0, SV_ClipDistance0.xy, float, logical register 2.
     name = b"SV_ClipDistance\0"
@@ -62,7 +70,7 @@ def translate_tests(work, names):
     disasm.mkdir()
     fssm.mkdir()
     for n in names:
-        asm_path = os.path.join(HERE, ("vs_clip" if n in CLIP_CASES else n) + ".asm")
+        asm_path = os.path.join(HERE, shader_source(n) + ".asm")
         raw = Path(asm_path).read_text(encoding="utf-8")
         mattr = asm_mattr(asm_path)
         cmd = MC + ["-triple=amdgcn--amdpal", "-mcpu=gfx1013"]
@@ -72,7 +80,7 @@ def translate_tests(work, names):
             cmd.append(f"-mattr={mattr}")
         cmd.append("-show-encoding")
         # Feed the text on stdin: an LLVM_MC command that runs in WSL cannot open a Windows path argument.
-        r = subprocess.run(cmd, input=raw, capture_output=True, text=True)
+        r = mc_command.run(cmd, input=raw, capture_output=True, text=True)
         if r.returncode or "error:" in r.stderr:
             sys.exit(f"{n}.asm did not assemble:\n{r.stderr}")
         # rdna2spirv.py rejects assembler directives such as the "\t.text" llvm-mc prints first.
@@ -87,6 +95,14 @@ def translate_tests(work, names):
     cmd = [sys.executable, "-I", TRANSLATOR, disasm, "--out", spirv]
     if os.environ.get("LEONIDA_W64_EMULATE") == "1":   # wave64 on 32-wide subgroups (compute shaders only)
         cmd.append("--wave64-emulate")
+    if os.environ.get("LEONIDA_BARY_FALLBACK") == "1":   # raw barycentrics without VK_KHR_fragment_shader_barycentric
+        cmd.append("--bary-fallback")
+    if os.environ.get("LEONIDA_FMA") in ("glsl", "khr"):   # fused multiply-add as GLSL Fma (default) or OpFmaKHR
+        cmd += ["--fma", os.environ["LEONIDA_FMA"]]
+    if os.environ.get("LEONIDA_F16_INTERP_FALLBACK") == "1":   # f16 interpolation without PerVertexKHR (MoltenVK)
+        cmd.append("--f16-interp-fallback")
+    if os.environ.get("LEONIDA_TEXOFF_FALLBACK") == "1":   # texel offsets without VK_KHR_maintenance8
+        cmd.append("--texel-offset-fallback")
     return subprocess.run(cmd).returncode
 
 
@@ -131,6 +147,10 @@ def main():
         sys.path.insert(0, os.path.join(HERE, "..", "..", "..", "tools"))
         import spirv_stubs
         spirv_stubs.generate_for_index(str(spirv), combined)
+        if os.environ.get("LEONIDA_BARY_FALLBACK") == "1":
+            # The pass-through geometry shader each --bary-fallback PS is drawn with (<name>.bary_gs.spv).
+            import bary_fallback_gs
+            bary_fallback_gs.build_for_index(str(spirv))
     return 0
 
 

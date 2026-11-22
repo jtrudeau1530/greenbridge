@@ -4,6 +4,7 @@
 
 Every byte here is built by the test. No game file or game asset name is used.
 """
+import contextlib
 import csv
 import json
 import os
@@ -12,6 +13,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 import zlib
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -19,6 +21,26 @@ TOOL = os.path.join(ROOT, "tools", "anim_index.py")
 sys.path.insert(0, os.path.join(ROOT, "tools"))
 
 import anim_index  # noqa: E402
+
+
+@contextlib.contextmanager
+def tracked_mmaps():
+    """Record every mmap.mmap opened by anim_index and close any leak on exit."""
+    real_mmap = anim_index.mmap.mmap
+    created = []
+
+    def wrap(*args, **kwargs):
+        mapping = real_mmap(*args, **kwargs)
+        created.append(mapping)
+        return mapping
+
+    try:
+        with mock.patch.object(anim_index.mmap, "mmap", side_effect=wrap):
+            yield created
+    finally:
+        for mapping in created:
+            if not mapping.closed:
+                mapping.close()
 
 
 def move():
@@ -91,6 +113,9 @@ def _fd(text):
 
 def _entry(source, rig, group):
     return _fd(source) + b"\xff\xff\x06\x00" + bytes(6) + _fd(rig) + b"\xff\xff\x07\x00" + bytes(6) + _fd(group)
+
+
+CHUNK = 65536   # anim_index.MAX_CHUNK: the 64 KiB stream size of a split resource
 
 
 def rbf0_blob():
@@ -251,6 +276,20 @@ class ArchiveTest(unittest.TestCase):
             self.assertNotIn("Traceback", p.stderr)
             self.assertFalse(os.path.exists(out))
 
+    def test_missing_source_or_out_folder_is_one_line(self):
+        missing = os.path.join(self.root, "missing.rpf")
+        out_in_missing = os.path.join(self.root, "no_dir", "out.json")
+        for source, out, path in ((missing, os.path.join(self.root, "m.json"), missing),
+                                  (self.rpf, out_in_missing, out_in_missing)):
+            with self.subTest(path=os.path.relpath(path, self.root)):
+                p = subprocess.run([sys.executable, "-I", TOOL, source, out, "--quiet"],
+                                   capture_output=True, text=True, encoding="utf-8", errors="replace")
+                self.assertEqual(p.returncode, 1, p.stderr)
+                self.assertTrue(p.stderr.startswith(path + ": "), p.stderr)
+                self.assertNotIn("Traceback", p.stderr)
+                self.assertEqual(p.stdout, "")
+        self.assertFalse(os.path.exists(os.path.join(self.root, "m.json")))
+
     def test_cli(self):
         out = os.path.join(self.root, "cli.json")
         p = subprocess.run([sys.executable, "-I", TOOL, self.rpf, out, "--quiet"],
@@ -260,6 +299,20 @@ class ArchiveTest(unittest.TestCase):
             doc = json.load(f)
         self.assertEqual(doc["summary"]["signatures"]["move"]["files"], 1)
         self.assertEqual(doc["summary"]["signatures"]["page-directory"]["files"], 1)
+
+    def test_cli_rigs_without_rigset_keys_keeps_existing_file(self):
+        # PAYLOADS' RBF0 stream has a schema name but no anim/rigset/ keys, so parse_rbf0 rejects it.
+        out = os.path.join(self.root, "index.json")
+        rigs = os.path.join(self.root, "rigs.json")
+        with open(rigs, "w", encoding="utf-8") as f:
+            f.write('{"previous": true}')
+        p = subprocess.run([sys.executable, "-I", TOOL, self.rpf, out, "--rigs", rigs, "--quiet"],
+                           capture_output=True, text=True, encoding="utf-8", errors="replace")
+        self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
+        self.assertIn("no anim/rigset/ keys found", p.stderr)
+        self.assertNotIn("Traceback", p.stderr)
+        with open(rigs, encoding="utf-8") as f:
+            self.assertEqual(json.load(f), {"previous": True})
 
     def test_directory(self):
         folder = os.path.join(self.root, "carved")
@@ -272,15 +325,58 @@ class ArchiveTest(unittest.TestCase):
         self.assertEqual([r["signature"] for r in rows], ["move", "page-directory", "name-table"])
         self.assertEqual(summary["mode"], "directory")
 
+    def test_directory_rejects_start_and_limit(self):
+        folder = os.path.join(self.root, "carved")
+        os.makedirs(folder)
+        for offset in (0x100, 0x200):
+            with open(os.path.join(folder, f"{offset:012x}.bin"), "wb") as f:
+                f.write(b"A" * 64)
+        cases = [("--start", "0"), ("--limit", "1"), ("--limit", "1", "--start", "0x200")]
+        for i, flags in enumerate(cases):
+            with self.subTest(flags=flags):
+                out = os.path.join(self.root, f"bad{i}.json")
+                p = subprocess.run([sys.executable, "-I", TOOL, folder, out, "--quiet", *flags],
+                                   capture_output=True, text=True, encoding="utf-8", errors="replace")
+                self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
+                self.assertEqual(len(p.stderr.splitlines()), 1, p.stderr)
+                for flag in flags[::2]:
+                    self.assertIn(flag, p.stderr)
+                self.assertFalse(os.path.exists(out))
+
+    def test_directory_skips_the_carvers_index_and_reports(self):
+        """rpf9_carve.py writes index.json next to the streams; it and a report are not payloads."""
+        folder = os.path.join(self.root, "carved")
+        os.makedirs(folder)
+        for i, payload in enumerate((move(), page(), names())):
+            with open(os.path.join(folder, f"{0x1000 + i * 0x100:012x}.bin"), "wb") as f:
+                f.write(payload)
+        with open(os.path.join(folder, "index.json"), "w", encoding="utf-8") as f:
+            f.write('[{"off": 4096, "stored": 16}]')
+        with open(os.path.join(folder, "report.csv"), "w", encoding="utf-8") as f:
+            f.write("offset,size\n")
+        rows, summary = anim_index.scan_dir(folder)
+        self.assertEqual([r["offset"] for r in rows], [0x1000, 0x1100, 0x1200])
+
+    def test_scan_rpf_closes_mmap_on_invalid_start(self):
+        with tracked_mmaps() as created:
+            with self.assertRaisesRegex(ValueError, "outside the archive"):
+                anim_index.scan_rpf(self.rpf, start=os.path.getsize(self.rpf) + 1)
+            self.assertEqual(len(created), 1)
+            self.assertTrue(created[0].closed)
+            os.remove(self.rpf)
+            self.assertFalse(os.path.exists(self.rpf))
+
 
 class RigArchiveTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.root = self.tmp.name
         self.rpf = os.path.join(self.root, "rigs.rpf")
+        # A real continuation follows a full 64 KiB stream: pad the rig table (parse_rbf0 ignores the tail)
+        # and cut it there.
         blob = rbf0_blob()
-        cut = blob.find(b"\xff" * 6) + 6
-        self.parts = [blob[:cut], blob[cut:]]
+        blob += bytes(CHUNK + 4096 - len(blob))
+        self.parts = [blob[:CHUNK], blob[CHUNK:]]
         self.skel = b"SKEL_Synthetic\x00SKEL_Second\x00"
         self.skel += bytes(64 - len(self.skel))
         self.front = b"\x0f\x00\xe0\x00\x0c\x00\x16\x00SKEL_Front\x00"
@@ -306,6 +402,17 @@ class RigArchiveTest(unittest.TestCase):
         self.assertEqual(r["summary"]["rigsets"], 3)
         self.assertEqual(r["summary"]["entries"], 3)
 
+    def test_cli_rejects_a_shared_rig_destination(self):
+        out = os.path.join(self.root, "index.json")
+        alias = os.path.join(self.root, ".", "index.json")
+        result = subprocess.run(
+            [sys.executable, "-I", TOOL, self.rpf, out, "--rigs", alias, "--quiet"],
+            capture_output=True, text=True,
+        )
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("index and --rigs must use different paths", result.stderr)
+        self.assertFalse(os.path.exists(out))
+
     def test_cli_rigs(self):
         out = os.path.join(self.root, "index.json")
         rigs = os.path.join(self.root, "rigs.json")
@@ -318,6 +425,74 @@ class RigArchiveTest(unittest.TestCase):
         self.assertEqual(doc["skeletons"][0]["distinct"], 2)
         self.assertEqual(doc["skeletons"][0]["kind"], "plain-bone-table")
         self.assertEqual(doc["skeletons"][1]["hashes_present"], 1)
+
+    def test_cli_rigs_stored_name_hashes(self):
+        hashed = b"\x3b\x39\x77\x99"     # JOAAT32("anim/rig/a") = 0x9977393b, little-endian
+        base = bytearray(b"RBF0" + struct.pack("<H", 0xFFFB) + struct.pack("<I", 1)
+                         + _u16s(b"rage__crRigSetManager") + b"\x00")
+        base += b"\x03\x60" + _u16s(b"anim/rigset/synthetic/one")
+        base += _entry(b"canonical@source", b"anim/rig/a", b"pose") + b"\xff" * 6
+        base += bytes((1 - len(base)) % 4)
+        self.assertEqual(len(base) % 4, 1)
+        cases = {"absent": (hashed[::-1], 0),
+                 "unaligned": (hashed, 1),
+                 "duplicate": (hashed + bytes(3) + hashed, 1)}
+        for label, (tail, expected) in cases.items():
+            with self.subTest(label):
+                carved = os.path.join(self.root, label)
+                os.mkdir(carved)
+                with open(os.path.join(carved, "000000.bin"), "wb") as f:
+                    f.write(bytes(base) + tail)
+                out = os.path.join(self.root, label + "-index.json")
+                rigs = os.path.join(self.root, label + "-rigs.json")
+                p = subprocess.run([sys.executable, "-I", TOOL, carved, out, "--rigs", rigs, "--quiet"],
+                                   capture_output=True, text=True, encoding="utf-8", errors="replace")
+                self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+                with open(rigs, encoding="utf-8") as f:
+                    summary = json.load(f)["rbf0"]["summary"]
+                self.assertEqual((summary["distinct_names"], summary["stored_name_hashes"]), (2, expected))
+
+
+class ShortStreamEndsTheResource(unittest.TestCase):
+    """A stream shorter than 64 KiB is the last one of its resource: the adjacent stream is not joined."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = self.tmp.name
+        self.rbf0 = rbf0_blob()
+        self.other = b"\x5a" * 300   # raw, adjacent, no stop signature: only the size rule ends the join
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_archive(self):
+        rpf = os.path.join(self.root, "rigs.rpf")
+        header = bytearray(0x100)
+        header[:4] = b"9FPR"
+        struct.pack_into("<I", header, 4, len(header))
+        body = bytearray()
+        for payload in (self.rbf0, self.other):
+            body += zlib.compress(payload)
+            body += bytes((-len(body)) % 16)
+        with open(rpf, "wb") as f:
+            f.write(header + body)
+        rows, _ = anim_index.scan_rpf(rpf)
+        self.assertEqual(anim_index.collect_rbf0(rpf, rows), self.rbf0)
+
+    def test_directory(self):
+        with open(os.path.join(self.root, "001000.bin"), "wb") as f:
+            f.write(self.rbf0)
+        with open(os.path.join(self.root, f"{0x1000 + len(self.rbf0):06x}.bin"), "wb") as f:
+            f.write(self.other)
+        self.assertEqual(anim_index.collect_rbf0_dir(self.root), self.rbf0)
+
+    def test_directory_full_stream_still_joins(self):
+        blob = self.rbf0 + bytes(CHUNK + 100 - len(self.rbf0))
+        with open(os.path.join(self.root, "001000.bin"), "wb") as f:
+            f.write(blob[:CHUNK])
+        with open(os.path.join(self.root, f"{0x1000 + CHUNK:06x}.bin"), "wb") as f:
+            f.write(blob[CHUNK:])
+        self.assertEqual(anim_index.collect_rbf0_dir(self.root), blob)
 
 
 if __name__ == "__main__":

@@ -7,8 +7,9 @@ how the XOR modes spread neighbouring blocks across pipes).
 
 As a tool:
     python -I amd_swizzle.py <blob> --bpe 8 --width 2048 --height 2048 [--offset N] [--modes 64K] [--out best.png]
-tries every 64 KB pattern table and configuration for that element size, scores each by image smoothness, and
-renders the best. As a module, `detile(data, pattern, bpe, wb, hb)` returns linear blocks.
+tries every pattern table whose name has the --modes part (64K by default; 4K, 256, S_X, ...) and configuration
+for that element size, each with its own block size, scores each by image smoothness, and renders the best. As a
+module, `detile(data, pattern, bpe, wb, hb, block_bytes)` returns linear blocks.
 """
 import argparse
 import os
@@ -19,6 +20,19 @@ import numpy as np
 
 HEADER = os.environ.get("AMD_SWIZZLE_HEADER", r"<ref>\mesa-addrlib\gfx10SwizzlePattern.h")
 BPE_INDEX = {1: 0, 2: 1, 4: 2, 8: 3, 16: 4}
+# Address bits of one block for each pattern table size, as tex_mode_probe.py uses them (12 for 4 KB, 16 for 64 KB).
+BLOCK_BITS = {"256": 8, "4K": 12, "64K": 16}
+
+
+def block_bits(table_name):
+    """Address bits of one block of a pattern table (`GFX10_SW_4K_S_PATINFO` -> 12), or None for another size."""
+    parts = table_name.split("_")
+    return BLOCK_BITS.get(parts[2]) if len(parts) > 3 else None
+
+
+def table_matches(table_name, modes):
+    """Whether --modes picks this table: whole name parts, so 4K does not also pick the 64K tables."""
+    return f"_{modes.strip('_')}_" in f"{table_name}_"
 
 
 def _symbols():
@@ -46,7 +60,8 @@ def _term(text, env):
 
 
 def load(path=HEADER):
-    text = open(path, encoding="utf-8", errors="replace").read()
+    with open(path, encoding="utf-8", errors="replace") as f:
+        text = f.read()
     env = _symbols()
     nibbles = {}
     for name in ("NIBBLE01", "NIBBLE2", "NIBBLE3", "NIBBLE4"):
@@ -90,18 +105,34 @@ def offsets(eq, bpe, wb, hb, block_bytes=65536):
     # Macro-block size in elements, from which coordinate bits the equation uses below block_bytes.
     xb = max((mx.bit_length() for mx, _ in eq if mx), default=0)
     yb = max((my.bit_length() for _, my in eq if my), default=0)
-    # The block's own extent: the x/y bits that appear as the *sole* term of some address bit.
-    solo_x = [mx.bit_length() for mx, my in eq if mx and not my and mx & (mx - 1) == 0]
-    solo_y = [my.bit_length() for mx, my in eq if my and not mx and my & (my - 1) == 0]
-    bw = 1 << max(solo_x + [0])
-    bh = 1 << max(solo_y + [0])
+    # The block's own extent from the element count. Deriving it from the x/y bits that appear alone in an
+    # address bit only works for the S modes; in the XOR modes the high bits are almost always XORed, so the
+    # block came out too small (72/75 RDNA2 R_X entries). tex_export.detile_offsets uses this same formula for
+    # 4 KB blocks and it matches every 64 KB entry.
+    elems = block_bytes // bpe
+    lb = elems.bit_length() - 1
+    bw = 1 << ((lb + 1) // 2)
+    bh = elems // bw
     blocks_x = (wb + bw - 1) // bw
     block = (y // bh) * blocks_x + (x // bw)
     return off + block * block_bytes, (bw, bh, xb, yb)
 
 
-def detile(data, eq, bpe, wb, hb):
-    off, _ = offsets(eq, bpe, wb, hb)
+def feature(linear, bpe):
+    """Per-element RGB for the smoothness score: raw RGB for uncompressed bpe, colour endpoint for BC."""
+    if bpe == 4:
+        return linear.reshape(-1, 4)[:, :3].astype(np.float32)
+    if bpe == 2:
+        p = linear.reshape(-1, 2).astype(np.float32)
+        return np.stack([p[:, 0], p[:, 1], (p[:, 0] + p[:, 1]) * 0.5], axis=-1)
+    if bpe == 1:
+        return np.repeat(linear.reshape(-1, 1).astype(np.float32), 3, axis=1)
+    from tile_probe import block_feature
+    return block_feature(linear, bpe)
+
+
+def detile(data, eq, bpe, wb, hb, block_bytes=65536):
+    off, _ = offsets(eq, bpe, wb, hb, block_bytes)
     idx = off // bpe
     raw = np.frombuffer(data[: len(data) // bpe * bpe], np.uint8).reshape(-1, bpe)
     if idx.max() >= len(raw):
@@ -111,7 +142,7 @@ def detile(data, eq, bpe, wb, hb):
 
 def main():
     sys.path.insert(0, os.path.dirname(__file__))
-    from tile_probe import block_feature, score
+    from tile_probe import check_preview_path, score
     from swizzle_search import render  # noqa: F401
     ap = argparse.ArgumentParser()
     ap.add_argument("blob")
@@ -122,25 +153,31 @@ def main():
     ap.add_argument("--modes", default="_64K_")
     ap.add_argument("--out")
     a = ap.parse_args()
+    if a.out:
+        check_preview_path(a.out, a.blob)
     nibbles, tables = load()
-    data = open(a.blob, "rb").read()[a.offset:]
-    wb, hb = a.width // 4, a.height // 4
+    with open(a.blob, "rb") as f:
+        data = f.read()[a.offset:]
+    # BC formats cover 4x4 pixels per element; uncompressed 1/2/4 bpe formats have one pixel per element.
+    block = 4 if a.bpe in (8, 16) else 1
+    wb, hb = a.width // block, a.height // block
     res = []
     for tname, entries in tables.items():
-        if a.modes not in tname:
+        bits = block_bits(tname)
+        if bits is None or not table_matches(tname, a.modes):
             continue
         for e in entries:
             if f" {a.bpe} bpe" not in e[5]:
                 continue
-            eq = equation(nibbles, e, 16)
-            lin = detile(data, eq, a.bpe, wb, hb)
+            eq = equation(nibbles, e, bits)
+            lin = detile(data, eq, a.bpe, wb, hb, 1 << bits)
             if lin is None:
                 continue
-            img = block_feature(lin, a.bpe).reshape(hb, wb, 3)
-            res.append((score(img), tname, e[5], e))
+            img = feature(lin, a.bpe).reshape(hb, wb, 3)
+            res.append((score(img), tname, e[5], e, bits))
     res.sort(key=lambda r: r[0])
     seen = set()
-    for s, t, c, _ in res:
+    for s, t, c, _, _ in res:
         if (t, c) in seen:
             continue
         seen.add((t, c))
@@ -151,13 +188,19 @@ def main():
         import io
         import struct
         from PIL import Image
-        lin = detile(data, equation(nibbles, res[0][3], 16), a.bpe, wb, hb)
+        bits = res[0][4]
+        lin = detile(data, equation(nibbles, res[0][3], bits), a.bpe, wb, hb, 1 << bits)
         hdr = bytearray(128)
         hdr[0:4] = b"DDS "
         struct.pack_into("<IIIIIII", hdr, 4, 124, 0x1007, a.height, a.width, lin.size, 0, 1)
         struct.pack_into("<I", hdr, 108, 0x1000)
         if a.bpe == 8:
             struct.pack_into("<II4s", hdr, 76, 32, 4, b"DXT1")
+            body = bytes(hdr)
+        elif a.bpe == 4:
+            # Uncompressed RGBA8, not BC7: the 4 bpe path is a plain pixel grid.
+            struct.pack_into("<IIIIIIII", hdr, 76, 32, 0x41, 0, 32,
+                             0xFF, 0xFF00, 0xFF0000, 0xFF000000)
             body = bytes(hdr)
         else:
             struct.pack_into("<II4s", hdr, 76, 32, 4, b"DX10")
@@ -167,4 +210,8 @@ def main():
 
 
 if __name__ == "__main__":
+    try:  # a redirected stdout is strict ANSI code page under -I; write '?' for what it cannot encode
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
     sys.exit(main())

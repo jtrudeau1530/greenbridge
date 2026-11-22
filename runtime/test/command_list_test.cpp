@@ -107,7 +107,7 @@ int main() {
     // Copies: D3D12's own call rules (aligned footprints, a non-empty box, distinct CopyResource operands).
     CHECK(list.reset());
     CHECK(list.copy_buffer({1, 0, 2, 16, 64}));
-    CHECK(!list.copy_buffer({1, 0, 2, 16, 0}));
+    CHECK(list.copy_buffer({1, 0, 2, 16, 0}));
     CHECK(!list.copy_buffer({0, 0, 2, 16, 64}));
     const CopyLocation texture{3, false, 0, 0, 0, 0, 0, 0};
     const CopyLocation placed{4, true, 0, 512, 8, 8, 1, 256};
@@ -139,6 +139,21 @@ int main() {
     const auto& resolved = std::get<ResolveSubresource>(list.commands()[5]);
     CHECK(resolved.dst == 7 && resolved.dst_subresource == 1 && resolved.src == 8 && resolved.src_subresource == 0);
 
+    // Dispatches keep the user data they were recorded with; no pipeline is refused, no groups records nothing.
+    CHECK(list.reset());
+    Dispatch dispatch{0x1234, {}, 2, 1, 1};
+    dispatch.user_data[0] = 7;
+    dispatch.user_data[31] = 9;
+    CHECK(list.dispatch(dispatch));
+    dispatch.user_data[0] = 8;  // the caller's block changes after recording
+    CHECK(!list.dispatch({0, {}, 1, 1, 1}));
+    CHECK(list.dispatch({0x1234, {}, 0, 1, 1}));
+    CHECK(list.close());
+    CHECK(!list.dispatch(dispatch));
+    CHECK(list.commands().size() == 1);
+    const auto& recorded = std::get<Dispatch>(list.commands()[0]);
+    CHECK(recorded.pipeline == 0x1234 && recorded.user_data[0] == 7 && recorded.user_data[31] == 9 && recorded.x == 2);
+
     CHECK(list.reset());
     CHECK(!list.closed() && list.commands().empty());
     CHECK(!list.reset());
@@ -146,6 +161,39 @@ int main() {
     CHECK(list.close());
     CHECK(list.commands().size() == 1);
     CHECK(std::get<ClearRenderTarget>(list.commands()[0]).target.resource == 36);
+
+    // D3D-26: discards, immediate writes and atomic copies.
+    CHECK(list.reset());
+    CHECK(list.discard({40, 0, 0, false, true}));                  // the whole resource
+    CHECK(list.discard({40, 2, 3, true}));
+    CHECK(list.discard({40, 0, 0, false}));                       // nothing to discard: not recorded
+    CHECK(!list.discard({0, 0, 0, false, true}));
+    CHECK(!list.discard({40, 0xfffffff0u, 0x20, false}));         // past the last subresource index
+    CHECK(!list.discard({40, 1, all_subresources, false}));       // an explicit count of UINT_MAX is a range
+    CHECK(!list.discard({40, all_subresources, 1, false}));
+    CHECK(list.write_immediate({0x1000, 7, write_immediate_mode::marker_out}));
+    CHECK(!list.write_immediate({0, 7, 0}));                      // null address
+    CHECK(!list.write_immediate({0x1002, 7, 0}));                 // not 4-byte aligned
+    CHECK(!list.write_immediate({0x1000, 7, 3}));                 // not a mode
+    const DependentRange dependent{41, 0, 0, 64};
+    CHECK(list.atomic_copy({42, 8, 43, 16, 8, {dependent}}));
+    CHECK(list.atomic_copy({42, 4, 42, 8, 4, {dependent}}));      // within one buffer
+    CHECK(!list.atomic_copy({42, 8, 42, 8, 8, {dependent}}));     // onto itself
+    CHECK(!list.atomic_copy({42, 4, 43, 16, 8, {dependent}}));    // UINT64 at an offset that is not 8-aligned
+    CHECK(!list.atomic_copy({42, 8, 43, 16, 2, {dependent}}));    // neither UINT nor UINT64
+    CHECK(!list.atomic_copy({42, 8, 43, 16, 4, {}}));             // no dependencies
+    CHECK(!list.atomic_copy({42, 8, 43, 16, 4, {{0, 0, 0, 4}}})); // a null dependent resource
+    CHECK(!list.atomic_copy({0, 8, 43, 16, 4, {dependent}}));
+    CHECK(list.close());
+    CHECK(!list.discard({40, 0, 0, false, true}) && !list.discard({40, 0, 0, false}));
+    CHECK(list.commands().size() == 5);
+    CHECK(std::get<DiscardResource>(list.commands()[0]).whole);
+    CHECK(std::get<DiscardResource>(list.commands()[1]).first_subresource == 2 &&
+          std::get<DiscardResource>(list.commands()[1]).partial && !std::get<DiscardResource>(list.commands()[1]).whole);
+    CHECK(std::get<WriteImmediate>(list.commands()[2]).value == 7);
+    const auto& atomic = std::get<AtomicCopyBuffer>(list.commands()[3]);
+    CHECK(atomic.bytes == 8 && atomic.dst_offset == 8 && atomic.dependencies.size() == 1 &&
+          atomic.dependencies[0].end == 64);
 
     // Synthetic IR values here test copy-by-value mechanics only; the COM test below enforces D3D12 bundle
     // restrictions on every currently implemented forbidden operation.
@@ -180,5 +228,66 @@ int main() {
     CHECK(!open_parent.execute_bundle(open_parent));  // a list cannot execute itself
     CHECK(open_parent.commands().empty());
 
+    // SetPredication (D3D-18): the op must be one of the two D3D12 values and the offset 8-byte aligned; a null
+    // buffer turns it off whatever the other arguments are.
+    namespace pred = d3d12_predication;
+    CommandList predicated;
+    CHECK(predicated.set_predication({7, 0, pred::equal_zero}));
+    CHECK(predicated.set_predication({7, 16, pred::not_equal_zero}));
+    CHECK(!predicated.set_predication({7, 4, pred::equal_zero}));   // not 8-byte aligned
+    CHECK(!predicated.set_predication({7, 0, 2}));                  // no such op
+    CHECK(predicated.set_predication({0, 4, 2}));                   // off: offset and op ignored
+    CHECK(predicated.close());
+    CHECK(!predicated.set_predication({7, 0, pred::equal_zero}));  // closed
+    CHECK(predicated.commands().size() == 3);
+    CHECK(std::get<Predication>(predicated.commands()[0]).op == pred::equal_zero);
+    CHECK(std::get<Predication>(predicated.commands()[1]).offset == 16);
+    const auto& off = std::get<Predication>(predicated.commands()[2]);
+    CHECK(off.buffer == 0 && off.offset == 0 && off.op == 0);
+    // Queries: timestamps only end; other queries are begun and ended in one list, with the same type, and are not
+    // begun twice or resolved while running. Resolve offsets are multiples of 8; a resolve of nothing records nothing.
+    namespace q = d3d12_query;
+    namespace h = d3d12_query_heap;
+    CHECK(list.reset());
+    constexpr QueryHeapId heap = 70, other = 71;
+    CHECK(!list.begin_query({0, q::occlusion, 0}));
+    CHECK(!list.begin_query({heap, q::timestamp, 0}));
+    CHECK(list.end_query({heap, q::timestamp, 3}));
+    CHECK(list.end_query({heap, q::timestamp, 3}));  // a timestamp can be written again
+    CHECK(!list.end_query({heap, q::occlusion, 1}));  // never begun
+    CHECK(list.begin_query({heap, q::occlusion, 1}));
+    CHECK(!list.begin_query({heap, q::binary_occlusion, 1}));  // already running
+    CHECK(list.begin_query({other, q::occlusion, 1}));         // same index, another heap
+    CHECK(!list.end_query({heap, q::binary_occlusion, 1}));    // begun with another type
+    CHECK(!list.resolve_queries({heap, q::occlusion, 0, 2, 9, 0}));  // query 1 is running
+    CHECK(list.resolve_queries({heap, q::occlusion, 2, 2, 9, 0}));
+    CHECK(list.queries_open());
+    CHECK(list.end_query({heap, q::occlusion, 1}));
+    CHECK(list.end_query({other, q::occlusion, 1}));
+    CHECK(!list.queries_open());
+    CHECK(!list.resolve_queries({heap, q::occlusion, 0, 2, 9, 4}));  // offset not a multiple of 8
+    CHECK(!list.resolve_queries({heap, q::occlusion, 0, 2, 0, 8}));  // no destination
+    CHECK(!list.resolve_queries({heap, q::occlusion, 0xffffffff, 2, 9, 8}));  // range wraps
+    CHECK(list.resolve_queries({heap, q::occlusion, 0, 2, 9, 16}));
+    CHECK(list.resolve_queries({heap, q::occlusion, 0, 0, 9, 16}));  // nothing to resolve
+    CHECK(list.close());
+    CHECK(list.commands().size() == 8);
+    CHECK(std::get<EndQuery>(list.commands()[0]).index == 3 && std::get<EndQuery>(list.commands()[0]).type == q::timestamp);
+    CHECK(std::get<BeginQuery>(list.commands()[2]).heap == heap && std::get<BeginQuery>(list.commands()[3]).heap == other);
+    const auto& query_resolve = std::get<ResolveQueries>(list.commands()[7]);
+    CHECK(query_resolve.first == 0 && query_resolve.count == 2 && query_resolve.dst == 9 && query_resolve.offset == 16);
+
+    // A query still running at Close leaves the list closed and marked; Reset clears it.
+    CHECK(list.reset());
+    CHECK(list.begin_query({heap, q::pipeline_statistics, 0}));
+    CHECK(list.close() && list.queries_open());
+    CHECK(list.reset() && !list.queries_open());
+    CHECK(list.begin_query({heap, q::pipeline_statistics, 0}));  // free again after the reset
+
+    CHECK(query_fits_heap(h::occlusion, q::binary_occlusion) && !query_fits_heap(h::occlusion, q::timestamp));
+    CHECK(query_fits_heap(h::copy_queue_timestamp, q::timestamp) && !query_fits_heap(h::timestamp, q::occlusion));
+    CHECK(query_fits_heap(h::so_statistics, q::so_statistics_stream3) && !query_fits_heap(6, q::occlusion));
+    CHECK(query_result_size(q::occlusion) == 8 && query_result_size(q::timestamp) == 8);
+    CHECK(query_result_size(q::pipeline_statistics) == 88 && query_result_size(q::so_statistics_stream0) == 0);
     return 0;
 }

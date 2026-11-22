@@ -87,6 +87,20 @@ class BuildDestinationTest(unittest.TestCase):
         self.run_build(self.game, os.path.join(alias, "new"),
                        os.path.join(self.root, "work"), rejected=False)
 
+    def test_drive_root_game_folder_rules(self):
+        if os.name != "nt":
+            self.skipTest("Windows drive root check")
+        drive = os.path.splitdrive(self.root)[0] + "\\"
+        content_dir = os.path.join(drive, "Content")
+        independent_dir = os.path.join(drive, "Leonida_Build")
+        with patch("os.listdir", return_value=["Content"]):
+            # Allowed: destination is an independent folder on the drive root
+            self.run_build(drive, independent_dir, os.path.join(independent_dir, "work"), rejected=False)
+            # Rejected: destination is inside the game dump's own top-level entry
+            self.run_build(drive, os.path.join(content_dir, "out"), os.path.join(self.root, "work"), rejected=True)
+            # Rejected: destination is the drive root itself
+            self.run_build(drive, drive, os.path.join(self.root, "work"), rejected=True)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -5,6 +5,7 @@ Usage:
     python -I manifest.py verify <game_dir> [--manifest FILE] [--jobs N]
 
 Files are hashed with up to --jobs threads (default: half the CPU count; 1 = serial).
+The manifest itself is excluded when its path is inside the scanned folder.
 On Windows it lowers its own priority to BelowNormal so the PC stays usable.
 """
 import argparse
@@ -41,7 +42,13 @@ def positive_int(text: str) -> int:
 def below_normal() -> None:
     if os.name == "nt":
         import ctypes
+        from ctypes import wintypes
+
         k32 = ctypes.windll.kernel32
+        k32.GetCurrentProcess.argtypes = ()
+        k32.GetCurrentProcess.restype = wintypes.HANDLE
+        k32.SetPriorityClass.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+        k32.SetPriorityClass.restype = wintypes.BOOL
         k32.SetPriorityClass(k32.GetCurrentProcess(), 0x00004000)  # BELOW_NORMAL_PRIORITY_CLASS
 
 
@@ -53,19 +60,28 @@ def sha256(path: str) -> str:
     return h.hexdigest()
 
 
-def walk(game_dir: str):
+def walk(game_dir: str, *, exclude=None):
     def scan_failed(error: OSError) -> None:
         raise error
 
+    excluded_dir = excluded_name = None
+    if exclude is not None:
+        directory, name = os.path.split(os.path.abspath(exclude))
+        excluded_dir = os.path.normcase(os.path.realpath(directory))
+        excluded_name = os.path.normcase(name)
+
     # os.walk otherwise treats missing or unreadable directories as empty.
     for root, _, files in os.walk(game_dir, onerror=scan_failed):
+        contains_manifest = excluded_dir is not None and os.path.normcase(os.path.realpath(root)) == excluded_dir
         for name in sorted(files):
+            if contains_manifest and os.path.normcase(name) == excluded_name:
+                continue
             p = os.path.join(root, name)
             yield os.path.relpath(p, game_dir).replace("\\", "/"), p
 
 
 def create(game_dir: str, out: str, jobs: int = 1) -> int:
-    files = sorted(walk(game_dir))
+    files = sorted(walk(game_dir, exclude=out))
     total = sum(os.path.getsize(p) for _, p in files)
     entries = {}
     done = count = 0
@@ -126,7 +142,7 @@ def load_manifest(manifest: str) -> dict:
 
 def verify(game_dir: str, manifest: str, jobs: int = 1) -> int:
     want = load_manifest(manifest)
-    have = dict(walk(game_dir))
+    have = dict(walk(game_dir, exclude=manifest))
     problems = {}
     pending = []
     for rel, info in want.items():
@@ -189,4 +205,8 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    try:  # a redirected stdout is strict ANSI code page under -I; write '?' for what it cannot encode
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
     sys.exit(main())

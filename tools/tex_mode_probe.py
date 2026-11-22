@@ -2,7 +2,7 @@
 
 Candidates: every addrlib 4K/64K pattern for the element size, crossed with two placements of the top mip
 (at the texture's data offset, or at the end of its mip chain, since GFX10 stores mips smallest first).
-Scored with exact BC1/BC3 block averages (smoothness relative to the image's own spread).
+Scored with average RGB colours for BC1, BC2 and BC3 blocks (smoothness relative to the image's own spread).
 
 Usage:
     python -I tex_mode_probe.py <textures_index.json> <carve dir> [--fmt BC1] [--n 12]
@@ -46,18 +46,40 @@ def offsets_for(eq, bb, bpe, wb, hb):
     return (o + ((y // bh) * nbx + x // bw) * (1 << bb)) // bpe
 
 
+def gpu_blob(carve, t):
+    """The texture's whole GPU blob: every carved part of `gpu_chain` in order (data_off counts from the first),
+    as tex_export.py reads it; a single `gpu` file when the index has no chain."""
+    parts = []
+    for off, _ in t.get("gpu_chain") or [[t["gpu"], t["gpu_size"]]]:
+        with open(os.path.join(carve, t["archive"], f"{off:012x}.bin"), "rb") as f:
+            parts.append(f.read())
+    return b"".join(parts)
+
+
+def positive_int(text):
+    """--n: 0 probed nothing and printed an empty ranking as a result; a negative N dropped the last N textures."""
+    try:
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not a whole number: {text!r}") from None
+    if value < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return value
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("index")
     ap.add_argument("carve")
     ap.add_argument("--fmt", default="BC1", help="BC1, BC2, or BC3, optionally with a DXGI suffix")
-    ap.add_argument("--n", type=int, default=12)
+    ap.add_argument("--n", type=positive_int, default=12, help="probe the first N matching textures (N >= 1)")
     a = ap.parse_args()
     if bc_bpe(a.fmt) is None:
         ap.error(f"no color scorer for {a.fmt!r}; expected BC1, BC2, or BC3")
     nib, tab = load()
-    texs = [t for t in json.load(open(a.index)) if t["fmt_name"].startswith(a.fmt)
-            and bc_bpe(t["fmt_name"]) is not None and t["w"] >= 256 and t["h"] >= 256]
+    with open(a.index, encoding="utf-8") as f:
+        texs = [t for t in json.load(f) if t["fmt_name"].startswith(a.fmt)
+                and bc_bpe(t["fmt_name"]) is not None and t["w"] >= 256 and t["h"] >= 256]
     texs = texs[: a.n]
     cands = {}
     for tname, ents in tab.items():
@@ -68,10 +90,10 @@ def main():
                         eq = equation(nib, e, bb)
                         cands.setdefault((bb, tuple(eq)), f"{tname.replace('GFX10_SW_', '').replace('_PATINFO', '')} {e[5][:22]}")
     wins = Counter()
+    skipped = 0
     for t in texs:
         bpe = bc_bpe(t["fmt_name"])
-        with open(os.path.join(a.carve, t["archive"], f"{t['gpu']:012x}.bin"), "rb") as f:
-            G = f.read()
+        G = gpu_blob(a.carve, t)
         wb, hb = (t["w"] + 3) // 4, (t["h"] + 3) // 4
         mips = (t["flags"] >> 16) & 0xFF
         res = []
@@ -91,11 +113,20 @@ def main():
         if res:
             lin_raw = np.frombuffer(G[t["data_off"]:t["data_off"] + wb * hb * bpe], np.uint8)
             lin = smoothness(block_average(lin_raw.reshape(-1, bpe), bpe).reshape(hb, wb, 3)) if len(lin_raw) == wb * hb * bpe else -1
+            second = f"{res[1][0]:.4f} {res[1][1]} [{res[1][2]}]" if len(res) > 1 else "n/a"
             print(f"{t['w']}x{t['h']} {t['fmt_name']} mips={mips} gpu={t['gpu_size']}  best {res[0][0]:.4f} {res[0][1]} [{res[0][2]}]"
-                  f"  2nd {res[1][0]:.4f} {res[1][1]} [{res[1][2]}]  linear {lin:.4f}")
+                  f"  2nd {second}  linear {lin:.4f}")
             wins[(res[0][1].split(' ')[0], res[0][2])] += 1
+        else:
+            skipped += 1
+            print(f"{t['w']}x{t['h']} {t['fmt_name']} gpu={t['gpu']:#x}  skipped: no candidate fits in the GPU blob")
     print("winners:", wins.most_common())
+    print(f"probed {len(texs) - skipped} of {len(texs)} textures; {skipped} skipped")
 
 
 if __name__ == "__main__":
+    try:  # a redirected stdout is strict ANSI code page under -I; write '?' for what it cannot encode
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
     sys.exit(main())

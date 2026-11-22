@@ -1,5 +1,7 @@
 """Synthetic tests for tools/page_index.py. No game files are read or needed."""
+import contextlib
 import csv
+import io
 import json
 import os
 import struct
@@ -8,9 +10,13 @@ import sys
 import tempfile
 import unittest
 import zlib
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOL = os.path.join(ROOT, "tools", "page_index.py")
+sys.path.insert(0, os.path.dirname(TOOL))
+import page_index
+
 BASE = 0x50000000
 
 
@@ -52,6 +58,18 @@ def run_tool(source, out, extra=()):
 
 
 class PageIndexTest(unittest.TestCase):
+    def test_cli_reports_output_write_errors(self):
+        with tempfile.TemporaryDirectory() as source:
+            for extension, writer in (("json", "write_json"), ("csv", "write_csv")):
+                with self.subTest(extension=extension):
+                    out = os.path.join(source, f"index.{extension}")
+                    stderr = io.StringIO()
+                    with (mock.patch.object(sys, "argv", [TOOL, source, out, "--quiet"]),
+                          mock.patch.object(page_index, writer, side_effect=OSError("disk full")),
+                          contextlib.redirect_stderr(stderr)):
+                        self.assertEqual(page_index.main(), 2)
+                    self.assertIn(f"{out}: disk full", stderr.getvalue())
+
     def test_simple_page_and_q28_raw(self):
         page = header(0x200, q28=0x180, q38=0x100, counts=(1, 0, 1, 0))
         page[0x60:0xA0] = b"\xaa" * 0x40
@@ -139,6 +157,32 @@ class PageIndexTest(unittest.TestCase):
                              [(0x1111, 0x10, 0x60, 0), (0x2222, 0x20, 0x120, 1)])
             self.assertEqual(page_doc["span"], 0x140)
 
+    def test_new_page_after_a_continuation_is_reported_with_both_streams(self):
+        # The first page's q38 target stays out of reach even after both following streams, so the
+        # second page is consumed as a continuation before it is recognised as a new directory page.
+        first = header(0x100, q38=0xC0, counts=(0, 0, 1, 0))
+        put_q38(first, 0xC0, [(0x1234, 0x10, 0x10000)])
+        cont = b"\xbb" * 0x100
+        second = header(0x100, q38=0xC0, counts=(0, 0, 1, 0))
+        put_q38(second, 0xC0, [(0x5678, 0x10, 0x60)])
+        with tempfile.TemporaryDirectory() as tmp:
+            arc = os.path.join(tmp, "nextpage.rpf")
+            out = os.path.join(tmp, "pages.json")
+            offsets = make_rpf(arc, [first, cont, second])
+            run_tool(arc, out)
+            with open(out, encoding="utf-8") as f:
+                doc = json.load(f)
+        self.assertEqual(doc["summary"]["pages"], 2)
+        reported, fresh = doc["pages"]
+        self.assertEqual([c["offset"] for c in reported["continuations"]], [offsets[1], offsets[2]])
+        self.assertFalse(reported["complete"])
+        self.assertEqual(reported["error"], "resource ended before q38 was complete")
+        self.assertEqual(reported["q38_records"], [])
+        self.assertEqual(reported["offset"], offsets[0])
+        self.assertTrue(fresh["complete"])
+        self.assertEqual(fresh["offset"], offsets[2])
+        self.assertEqual([(r["hash"], r["target"]) for r in fresh["q38_records"]], [(0x5678, 0x60)])
+
     def test_carve_directory_mode(self):
         page = header(0x100, q38=0xC0, counts=(0, 0, 1, 0))
         put_q38(page, 0xC0, [(0x9999, 0x20, 0x100)])
@@ -164,6 +208,8 @@ class PageIndexTest(unittest.TestCase):
             rpf = os.path.join(tmp, "a.rpf")
             make_rpf(rpf, [header(0x100)])
             cases = ((os.path.join(tmp, "out.txt"), (), "must end in .json or .csv"),
+                     (os.path.join(tmp, "no_such_folder", "out.json"), (), "is not a folder"),
+                     (tmp, (), "is a folder"),
                      (os.path.join(tmp, "out.json"), ("--limit", "0"), "must be at least 1"),
                      (os.path.join(tmp, "out.json"), ("--limit", "-5"), "must be at least 1"),
                      (os.path.join(tmp, "out.json"), ("--start", "-1"), "must be 0 or more"))
@@ -172,7 +218,29 @@ class PageIndexTest(unittest.TestCase):
                                       capture_output=True, text=True)
                 self.assertEqual(proc.returncode, 2, proc.stderr)
                 self.assertIn(message, proc.stderr)
-                self.assertFalse(os.path.exists(out))
+                if out != tmp:
+                    self.assertFalse(os.path.exists(out))
+
+    def test_scan_limit_excludes_crossing_stream(self):
+        page = header(0x100, q38=0xC0, counts=(0, 0, 1, 0))
+        put_q38(page, 0xC0, [(0x1234, 0x20, 0x60)])
+        stored = len(zlib.compress(page))
+        with tempfile.TemporaryDirectory() as tmp:
+            arc = os.path.join(tmp, "limit.rpf")
+            offsets = make_rpf(arc, [page])
+            exact = os.path.join(tmp, "exact.json")
+            run_tool(arc, exact, ("--start", str(offsets[0]), "--limit", str(stored)))
+            with open(exact, encoding="utf-8") as f:
+                doc = json.load(f)
+            self.assertEqual(doc["summary"]["pages"], 1)
+            self.assertEqual(doc["summary"]["streams"], 1)
+
+            short = os.path.join(tmp, "short.json")
+            run_tool(arc, short, ("--start", str(offsets[0]), "--limit", str(stored - 1)))
+            with open(short, encoding="utf-8") as f:
+                doc = json.load(f)
+            self.assertEqual(doc["summary"]["pages"], 0)
+            self.assertEqual(doc["summary"]["streams"], 0)
 
     def test_start_outside_the_archive_is_one_line(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -192,6 +260,80 @@ class PageIndexTest(unittest.TestCase):
             run_tool(rpf, out)
             with open(out, encoding="utf-8") as f:
                 self.assertEqual(json.load(f)["summary"]["pages"], 0)
+
+
+    def test_directory_rejects_start_or_limit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "out.json")
+            for extra in (("--start", "0"), ("--limit", "100")):
+                proc = subprocess.run([sys.executable, "-I", TOOL, tmp, out, "--quiet", *extra],
+                                      capture_output=True, text=True)
+                self.assertEqual(proc.returncode, 2, proc.stderr)
+                self.assertIn("single archive", proc.stderr)
+                self.assertEqual(proc.stdout, "")
+                self.assertFalse(os.path.exists(out))
+
+    def test_output_cannot_overwrite_source_archive(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            arc = os.path.join(tmp, "archive.json")
+            make_rpf(arc, [header(0x100)])
+            with open(arc, "rb") as f:
+                original = f.read()
+
+            # Same path
+            proc = subprocess.run([sys.executable, "-I", TOOL, arc, arc, "--quiet"],
+                                  capture_output=True, text=True)
+            self.assertEqual(proc.returncode, 2)
+            self.assertIn("output must not overwrite the source", proc.stderr)
+            with open(arc, "rb") as f:
+                self.assertEqual(f.read(), original)
+
+            # Hard-link alias
+            if hasattr(os, "link"):
+                alias = os.path.join(tmp, "alias.json")
+                try:
+                    os.link(arc, alias)
+                except OSError:
+                    alias = None
+                if alias:
+                    proc2 = subprocess.run([sys.executable, "-I", TOOL, arc, alias, "--quiet"],
+                                           capture_output=True, text=True)
+                    self.assertEqual(proc2.returncode, 2)
+                    self.assertIn("output must not overwrite the source", proc2.stderr)
+                    with open(arc, "rb") as f:
+                        self.assertEqual(f.read(), original)
+
+    def test_output_cannot_overwrite_carve_manifest(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest = os.path.join(tmp, "index.json")
+            with open(manifest, "w", encoding="utf-8") as f:
+                f.write('{"carve_manifest": true}')
+            with open(os.path.join(tmp, "00000001.bin"), "wb") as f:
+                f.write(header(0x100))
+
+            proc = subprocess.run([sys.executable, "-I", TOOL, tmp, manifest, "--quiet"],
+                                  capture_output=True, text=True)
+            self.assertEqual(proc.returncode, 2)
+            self.assertIn("output would overwrite the carve manifest", proc.stderr)
+            with open(manifest, "r", encoding="utf-8") as f:
+                self.assertEqual(f.read(), '{"carve_manifest": true}')
+
+    def test_output_cannot_overwrite_carved_input(self):
+        if not hasattr(os, "link"):
+            return
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_path = os.path.join(tmp, "00000001.bin")
+            with open(bin_path, "wb") as f:
+                f.write(header(0x100))
+            linked_json = os.path.join(tmp, "linked.json")
+            try:
+                os.link(bin_path, linked_json)
+            except OSError:
+                return
+            proc = subprocess.run([sys.executable, "-I", TOOL, tmp, linked_json, "--quiet"],
+                                  capture_output=True, text=True)
+            self.assertEqual(proc.returncode, 2)
+            self.assertIn("output would overwrite an input file", proc.stderr)
 
 
 if __name__ == "__main__":

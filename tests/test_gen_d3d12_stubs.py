@@ -3,6 +3,7 @@
     python -I tests/test_gen_d3d12_stubs.py
 """
 import importlib.util
+import json
 import os
 import subprocess
 import sys
@@ -113,6 +114,14 @@ class ParseInterfacesTests(unittest.TestCase):
         names = [item[2] for item in IFACES["IBase"][1] if item[0] == "m"]
         self.assertIn("AfterComment", names)
 
+    def test_cpp_line_comments_do_not_change_the_method_list(self):
+        header = GOOD_HEADER.replace(
+            "    virtual void STDMETHODCALLTYPE DoThing(UINT a, UINT b) = 0;",
+            "    // virtual void STDMETHODCALLTYPE Omitted() = 0; };\n"
+            "    virtual void STDMETHODCALLTYPE DoThing(UINT a, // parameter note\n"
+            "        UINT b) = 0; // trailing comment")
+        self.assertEqual(gen.parse_interfaces(header), IFACES)
+
     def test_preprocessor_lines_pass_through(self):
         items = gen.parse_interfaces(GUARDED_HEADER)["IGuarded"][1]
         self.assertEqual(items[0], ("#", "#if 0"))
@@ -185,6 +194,38 @@ class EmitClassTests(unittest.TestCase):
         self.assertIn('stub("IGuarded::Gone")', text)
 
 
+class CoverageTests(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.dir = tmp.name
+        self.source = os.path.join(self.dir, "impl.cpp")
+        with open(self.source, "w", encoding="utf-8") as f:
+            f.write(
+                "HRESULT STDMETHODCALLTYPE DoThing(UINT a);\n"
+                "HRESULT STDMETHODCALLTYPE GetThing(UINT i) const;\n"
+                "void NotAnOverride();\n"
+            )
+
+    def test_reports_open_methods_in_vtable_order(self):
+        report = gen.coverage(IFACES, ["IChild"], [self.source])
+        self.assertEqual(report, [{
+            "interface": "IChild",
+            "methods": 5,
+            "implemented": 2,
+            "open": ["IBase::Multi", "IBase::AfterComment", "IChild::Size"],
+        }])
+
+    def test_no_sources_means_every_method_is_open(self):
+        report = gen.coverage(IFACES, ["IBase"], [])
+        self.assertEqual(report[0]["implemented"], 0)
+        self.assertEqual(report[0]["open"], ["IBase::DoThing", "IBase::Multi", "IBase::AfterComment"])
+
+    def test_repeated_interface_is_reported_once(self):
+        report = gen.coverage(IFACES, ["IChild", "IChild"], [self.source])
+        self.assertEqual([row["interface"] for row in report], ["IChild"])
+
+
 class MainTests(unittest.TestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
@@ -237,6 +278,15 @@ class MainTests(unittest.TestCase):
             text = f.read()
         self.assertLess(text.index("class IBaseStubs"), text.index("class IChildStubs"))
 
+    def test_repeated_interface_is_emitted_once(self):
+        self.assertEqual(self.run_main("IChild", "IBase"), 0)
+        with open(self.out, encoding="utf-8") as f:
+            expected = f.read()
+
+        self.assertEqual(self.run_main("IChild", "IBase", "IChild"), 0)
+        with open(self.out, encoding="utf-8") as f:
+            self.assertEqual(f.read(), expected)
+
     def test_unknown_interface_raises(self):
         with self.assertRaises(SystemExit):
             self.run_main("IWho")
@@ -250,6 +300,34 @@ class MainTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("IChild -> IBase -> IChild", result.stderr)
         self.assertFalse(os.path.exists(self.out))
+
+    def test_report_without_out(self):
+        source = os.path.join(self.dir, "impl.cpp")
+        with open(source, "w", encoding="utf-8") as f:
+            f.write("HRESULT STDMETHODCALLTYPE DoThing(UINT a);\n")
+        report = os.path.join(self.dir, "coverage.json")
+        args = ["gen_d3d12_stubs.py", "--header", self.header, "--report", report,
+                "--source", source, "IChild"]
+        with mock.patch("sys.argv", args):
+            self.assertEqual(gen.main(), 0)
+        with open(report, encoding="utf-8") as f:
+            data = json.load(f)
+        self.assertEqual(data[0]["interface"], "IChild")
+        self.assertEqual(data[0]["open"],
+                         ["IBase::Multi", "IBase::AfterComment", "IChild::GetThing", "IChild::Size"])
+        self.assertFalse(os.path.exists(self.out))
+
+    def test_out_or_report_is_required(self):
+        with mock.patch("sys.argv", ["gen_d3d12_stubs.py", "--header", self.header, "IChild"]):
+            with self.assertRaises(SystemExit):
+                gen.main()
+
+    def test_report_requires_a_source(self):
+        report = os.path.join(self.dir, "coverage.json")
+        with mock.patch("sys.argv", ["gen_d3d12_stubs.py", "--header", self.header,
+                                     "--report", report, "IChild"]):
+            with self.assertRaises(SystemExit):
+                gen.main()
 
     def test_find_header_uses_the_include_environment(self):
         with mock.patch.dict(os.environ, {"INCLUDE": self.dir}, clear=False):

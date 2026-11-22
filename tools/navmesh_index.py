@@ -16,12 +16,13 @@ Usage:
 
     --out     JSON path (default: <input name>.navmesh-index.json in the current directory)
     --csv     optional CSV path
-    --start   first byte to scan, 0 or more (default: the archive's data start, u32 at offset 4)
-    --limit   stop after this many bytes, at least 1 (default: to the end)
-    --pattern glob for directory input (default: *.bin, the carve file names)
+    --start   first byte to scan in an archive, 0 or more (archive input only; default: u32 at offset 4)
+    --limit   stop after this many bytes, at least 1 (archive input only; default: to the end)
+    --pattern glob for directory input (directory input only; default: *.bin, the carve file names)
 """
 import argparse
 import csv
+import fnmatch
 import glob
 import json
 import mmap
@@ -76,64 +77,66 @@ def page_fields(head):
 def scan_archive(path, start=None, limit=None):
     """Walk zlib streams like the fixed carver. Returns (rows, summary). Rows are marker matches only."""
     with open(path, "rb") as fh:
-        m = mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ)
-        size = len(m)
-        if start is None:
-            start = u32(m, 4) or 0
-        if not 0 <= start < size:
-            raise SystemExit(f"start {start} is outside {path} ({size} bytes)")
-        end = min(size, start + limit) if limit else size
-        rows, total, last, unread, zero = [], 0, start, 0, 0
-        total_stored = total_inflated = 0
-        pos = start
-        t0 = time.time()
-        while pos < end:
-            mt = ZHDR.search(m, pos, end)
-            if not mt:
-                break
-            s = mt.start()
-            d = zlib.decompressobj()
-            head, total_out, p = bytearray(), 0, s
-            try:
-                while not d.eof and p < size:
-                    chunk = m[p:p + CHUNK]
-                    if not chunk:
-                        break
-                    out = d.decompress(chunk)
+        with mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ) as m:
+            size = len(m)
+            if start is None:
+                start = u32(m, 4) or 0
+            if not 0 <= start < size:
+                raise SystemExit(f"start {start} is outside {path} ({size} bytes)")
+            end = min(size, start + limit) if limit else size
+            rows, total, last, unread, zero = [], 0, start, 0, 0
+            total_stored = total_inflated = 0
+            pos = start
+            t0 = time.time()
+            while pos < end:
+                mt = ZHDR.search(m, pos, end)
+                if not mt:
+                    break
+                s = mt.start()
+                d = zlib.decompressobj()
+                head, total_out, p = bytearray(), 0, s
+                try:
+                    # --limit bounds the scanned window, not just the header search: a stream whose body
+                    # runs past `end` must not be counted, or the byte accounting exceeds the window.
+                    while not d.eof and p < end:
+                        chunk = m[p:min(p + CHUNK, end)]
+                        if not chunk:
+                            break
+                        out = d.decompress(chunk)
+                        if len(head) < HEAD:
+                            head.extend(out[:HEAD - len(head)])
+                        total_out += len(out)
+                        p += len(chunk)
+                        if d.unused_data or d.eof:
+                            break
+                    tail = d.flush()
                     if len(head) < HEAD:
-                        head.extend(out[:HEAD - len(head)])
-                    total_out += len(out)
-                    p += len(chunk)
-                    if d.unused_data or d.eof:
-                        break
-                tail = d.flush()
-                if len(head) < HEAD:
-                    head.extend(tail[:HEAD - len(head)])
-                total_out += len(tail)
-            except zlib.error:
-                pos = s + 1
-                continue
-            if not d.eof or total_out < 64:
-                pos = s + 1
-                continue
-            used = p - s - len(d.unused_data)
-            gap = m[last:s]
-            if gap.count(0) == len(gap):
-                zero += len(gap)
+                        head.extend(tail[:HEAD - len(head)])
+                    total_out += len(tail)
+                except zlib.error:
+                    pos = s + 1
+                    continue
+                if not d.eof or total_out < 64:
+                    pos = s + 1
+                    continue
+                used = p - s - len(d.unused_data)
+                gap = m[last:s]
+                if gap.count(0) == len(gap):
+                    zero += len(gap)
+                else:
+                    unread += len(gap)
+                fields = page_fields(head)
+                total += 1
+                total_stored += used
+                total_inflated += total_out
+                if fields:
+                    rows.append({"source": path, "offset": s, "stored": used, "size": total_out, **fields})
+                last = pos = s + used
+            tail = m[last:end]
+            if tail.count(0) == len(tail):
+                zero += len(tail)
             else:
-                unread += len(gap)
-            fields = page_fields(head)
-            total += 1
-            total_stored += used
-            total_inflated += total_out
-            if fields:
-                rows.append({"source": path, "offset": s, "stored": used, "size": total_out, **fields})
-            last = pos = s + used
-        tail = m[last:end]
-        if tail.count(0) == len(tail):
-            zero += len(tail)
-        else:
-            unread += len(tail)
+                unread += len(tail)
     span = end - start
     summary = {
         "input": path, "mode": "rpf", "start": start, "span": span, "streams": total,
@@ -147,8 +150,9 @@ def scan_archive(path, start=None, limit=None):
     return rows, summary
 
 
-def scan_directory(root, pattern="*.bin"):
+def scan_directory(root, pattern=None):
     """Read the first 128 bytes of each matching carved file. Rows are marker matches only."""
+    pattern = pattern or "*.bin"
     rows, files, total_size = [], 0, 0
     t0 = time.time()
     for path in sorted(glob.glob(os.path.join(root, "**", pattern), recursive=True)):
@@ -184,11 +188,21 @@ def add_distribution(summary, rows):
     return summary
 
 
+def _make_parent(path):
+    """Create the folder an output path lives in: the scan is over by the time we write, so a missing
+    folder used to end the run in a FileNotFoundError and lose the result."""
+    parent = os.path.dirname(os.path.abspath(path))
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
+
 def write_outputs(rows, summary, out_path, csv_path):
+    _make_parent(out_path)
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump({"summary": summary, "pages": rows}, f, indent=1)
     written = []
     if csv_path:
+        _make_parent(csv_path)
         with open(csv_path, "w", newline="", encoding="utf-8") as f:
             w = csv.DictWriter(f, fieldnames=FIELDS, extrasaction="ignore")
             w.writeheader()
@@ -219,6 +233,29 @@ def offset(text):
     return value
 
 
+def same_report_path(first, second):
+    if os.path.normcase(os.path.realpath(first)) == os.path.normcase(os.path.realpath(second)):
+        return True
+    try:
+        return os.path.samefile(first, second)
+    except OSError:
+        return False
+
+
+def is_scanned_input(path, input_path, pattern):
+    """True when a report path is one of the files the scan reads: writing it would destroy the input."""
+    if same_report_path(path, input_path):
+        return True
+    if not os.path.isdir(input_path) or not os.path.isfile(path):
+        return False
+    root, target = os.path.abspath(input_path), os.path.abspath(path)
+    if os.path.dirname(target) != root and not target.startswith(root + os.sep):
+        return False
+    pattern = pattern or "*.bin"
+    return (fnmatch.fnmatch(os.path.relpath(target, root), pattern)
+            or fnmatch.fnmatch(os.path.basename(target), pattern))
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("input", help="RPF9 archive, or a directory of carved .bin files")
@@ -226,22 +263,35 @@ def main() -> int:
     ap.add_argument("--csv", help="optional CSV output")
     ap.add_argument("--start", type=offset, help="first byte to scan in an archive")
     ap.add_argument("--limit", type=byte_count, help="maximum bytes to scan in an archive")
-    ap.add_argument("--pattern", default="*.bin", help="directory input glob (default: *.bin)")
+    ap.add_argument("--pattern", default=None, help="directory input glob (default: *.bin)")
     a = ap.parse_args()
+    is_dir = os.path.isdir(a.input)
+    if is_dir and (a.start is not None or a.limit is not None):
+        ap.error("--start and --limit apply to a single archive, not a directory")
+    if not is_dir and a.pattern is not None:
+        ap.error("--pattern applies to a directory, not an archive")
+    base = os.path.basename(os.path.normpath(a.input))
+    out_path = a.out or os.path.splitext(base)[0] + ".navmesh-index.json"
+    if a.csv and same_report_path(out_path, a.csv):
+        ap.error("--out and --csv must refer to different files")
+    for flag, path in (("--out", out_path), ("--csv", a.csv)):
+        if path and is_scanned_input(path, a.input, a.pattern):
+            ap.error(f"{flag} would overwrite the input {path}")
     below_normal()
 
-    if os.path.isdir(a.input):
+    if is_dir:
         rows, summary = scan_directory(a.input, a.pattern)
     else:
-        with open(a.input, "rb") as f:
-            magic = f.read(8)
+        try:
+            with open(a.input, "rb") as f:
+                magic = f.read(8)
+        except OSError as e:
+            raise SystemExit(f"{a.input}: {e.strerror or e}")
         if len(magic) < 8 or magic[1:4] != b"FPR" or magic[0] not in b"789":
             raise SystemExit(f"{a.input}: not an RPF7/8/9 archive (magic {magic[:4]!r})")
         rows, summary = scan_archive(a.input, a.start, a.limit)
 
     add_distribution(summary, rows)
-    base = os.path.basename(os.path.normpath(a.input))
-    out_path = a.out or os.path.splitext(base)[0] + ".navmesh-index.json"
     written = write_outputs(rows, summary, out_path, a.csv)
     print(json.dumps(summary, indent=1))
     print(f"wrote {out_path}" + (f", {', '.join(written)}" if written else ""))
@@ -249,4 +299,8 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    try:  # a redirected stdout is strict ANSI code page under -I; write '?' for what it cannot encode
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
     sys.exit(main())

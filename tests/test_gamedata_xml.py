@@ -139,6 +139,23 @@ class GamedataXmlTest(unittest.TestCase):
         for value in ("fixture.bk2", "synthetic note", "synthetic_set", "0 1", "fixture.xml"):
             self.assertNotIn(value, blob)
 
+    def test_counts_tail_references_across_parser_buffer_boundary(self):
+        start = b"<root><child>"
+        close = b"</child>"
+        tail = b"$(common)/x</root>"
+        short = self.write("short.xml", start + b"x" + close + tail)
+        padding = b"x" * (16384 - len(start) - len(close))
+        long = self.write("long.xml", start + padding + close + tail)
+        out = os.path.join(self.root, "catalog.json")
+        p = self.run_tool(short, long, "--check", "--json", out)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+
+        with open(out, encoding="utf-8") as f:
+            data = json.load(f)
+        rows = {row["source"]: row for row in data["rows"]}
+        self.assertEqual(rows["short.xml"]["refs"], {"$(common)": 1})
+        self.assertEqual(rows["long.xml"]["refs"], {"$(common)": 1})
+
     def test_check_reports_tail_only_fragment_and_malformed(self):
         tail = self.write("tail.xml", TAIL)
         p = self.run_tool(tail, "--check")
@@ -158,6 +175,27 @@ class GamedataXmlTest(unittest.TestCase):
         self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
         self.assertIn("1 malformed", p.stdout)
         self.assertIn("line 1", p.stdout)
+
+    def test_check_reports_unknown_encoding_as_malformed(self):
+        unknown = self.write("unknown.xml", b'<?xml version="1.0" encoding="not-a-charset"?><root/>')
+        valid = self.write("valid.xml", b"<root/>")
+        p = self.run_tool(unknown, valid, "--check")
+        self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
+        self.assertNotIn("Traceback", p.stderr)
+        self.assertIn("1 well-formed", p.stdout)
+        self.assertIn("1 malformed", p.stdout)
+        self.assertIn("not-a-charset", p.stdout)
+
+    def test_comments_inside_cdata_are_not_counted(self):
+        doc = self.write("comments.xml", b"<!-- real --><Root><![CDATA[<!-- text -->]]></Root><!-- real -->")
+        out = os.path.join(self.root, "catalog.json")
+        p = self.run_tool(doc, "--json", out)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        with open(out, encoding="utf-8") as f:
+            report = json.load(f)
+        self.assertTrue(report["rows"][0]["well_formed"])
+        self.assertEqual(report["rows"][0]["comments"], 2)
+        self.assertEqual(report["summary"]["comments"], 2)
 
     def test_carve_directory_joins_chunks_and_marks_fragment(self):
         carve = os.path.join(self.root, "carve")

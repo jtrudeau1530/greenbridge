@@ -23,11 +23,14 @@ import os
 import re
 import struct
 import sys
+import tempfile
+from contextlib import suppress
 from xml.etree import ElementTree as ET
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import rbf0_index  # noqa: E402
+from file_mode import published_mode  # noqa: E402
 
 MAGIC = rbf0_index.MAGIC
 PROLOGUE = rbf0_index.PROLOGUE
@@ -69,6 +72,10 @@ def _render(value):
 
 class TreeError(RbfError):
     """A malformed or truncated RBF0 record stream."""
+
+
+class SelectionError(ValueError):
+    """An invalid resource offset or limit."""
 
 
 class Parser:
@@ -384,10 +391,9 @@ def _rows(source):
         entries.sort(key=lambda e: e[0])
         rows = [{"offset": off, "stored": os.path.getsize(full), "size": os.path.getsize(full),
                  "head": head, "name": name} for off, name, full, head in entries]
-        by_offset = {row["offset"]: full for row, (_, _, full, _) in zip(rows, entries)}
 
         def read(row):
-            with open(by_offset[row["offset"]], "rb") as f:
+            with open(os.path.join(source, row["name"]), "rb") as f:
                 return f.read()
         return rows, read
     with open(source, "rb") as f:
@@ -398,7 +404,14 @@ def _rows(source):
 
 
 def decode_source(source, roots=None, offset=None, limit=None, progress=None):
-    """Decode every RBF0 start in `source`, joining 64 KiB continuations. Returns (docs, summary)."""
+    """Decode RBF0 resources, joining 64 KiB continuations, and return (docs, summary).
+
+    An explicit offset must be nonnegative and an explicit limit must be positive.
+    """
+    if limit is not None and limit < 1:
+        raise SelectionError("--limit must be at least 1")
+    if offset is not None and offset < 0:
+        raise SelectionError("--offset must be non-negative")
     rows, read = _rows(source)
     starts = [i for i, row in enumerate(rows) if row["head"][:4] == MAGIC]
     if not starts:
@@ -640,9 +653,31 @@ def write_csv(path, docs):
 
 
 def write_json(path, docs, summary):
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump({"tool": "rbf0_tree", "format": 1, "summary": summary, "resources": docs},
-                  f, indent=1, ensure_ascii=False, allow_nan=False)
+    """Replace the report only after the full JSON has been written, keeping its permission bits."""
+    directory = os.path.dirname(os.path.abspath(path))
+    temp = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=directory,
+                                         prefix=".rbf0_tree-", suffix=".tmp", delete=False) as f:
+            temp = f.name
+            json.dump({"tool": "rbf0_tree", "format": 1, "summary": summary, "resources": docs},
+                      f, indent=1, ensure_ascii=False, allow_nan=False)
+        os.chmod(temp, published_mode(path))   # NamedTemporaryFile creates 0600
+        os.replace(temp, path)
+    except BaseException:
+        if temp is not None:
+            with suppress(OSError):
+                os.unlink(temp)
+        raise
+
+
+def same_output_path(first, second):
+    if os.path.normcase(os.path.realpath(first)) == os.path.normcase(os.path.realpath(second)):
+        return True
+    try:
+        return os.path.samefile(first, second)
+    except OSError:
+        return False
 
 
 def main(argv=None):
@@ -656,21 +691,40 @@ def main(argv=None):
     ap.add_argument("--limit", type=int, help="stop after this many selected resources")
     ap.add_argument("--quiet", action="store_true")
     args = ap.parse_args(argv)
-    if args.limit is not None and args.limit < 1:
-        ap.error("--limit must be at least 1")
-    if args.offset is not None and args.offset < 0:
-        ap.error("--offset must be non-negative")
+    # The reports are written after the decode: an out or --csv naming the source used to replace it, and the
+    # same file for both left only the CSV.
+    if args.csv and same_output_path(args.out, args.csv):
+        ap.error("out and --csv must be different files")
+    if os.path.isfile(args.source):
+        for flag, path in (("out", args.out), ("--csv", args.csv)):
+            if path and same_output_path(path, args.source):
+                ap.error(f"{flag} would overwrite the source {args.source}")
 
     def progress(n, total):
         if not args.quiet and (n % 100 == 0 or n == total):
             print(f"[{n}/{total}] resources", flush=True)
 
-    docs, summary = decode_source(args.source, roots=args.root, offset=args.offset,
-                                  limit=args.limit, progress=progress)
-    write_json(args.out, docs, summary)
-    if args.csv:
-        write_csv(args.csv, docs)
-    paths = write_xml(args.xml, docs) if args.xml else []
+    path = args.source
+    try:
+        docs, summary = decode_source(path, roots=args.root, offset=args.offset,
+                                      limit=args.limit, progress=progress)
+        path = args.out
+        write_json(path, docs, summary)
+        if args.csv:
+            path = args.csv
+            write_csv(path, docs)
+        paths = []
+        if args.xml:
+            path = args.xml
+            paths = write_xml(path, docs)
+    except SelectionError as error:
+        ap.error(str(error))
+    except RecursionError:
+        print(f"{path!r}: tree exceeds the export depth limit", file=sys.stderr)
+        return 1
+    except OSError as error:
+        print(f"{path!r}: {error.strerror or error}", file=sys.stderr)
+        return 1
     if not args.quiet:
         print(f"{summary['resources']} resources: {summary['ok']} ok, {summary['bad']} bad, "
               f"{summary['truncated']} truncated, {summary['trailing']} trailing")
@@ -687,4 +741,8 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
+    try:  # a redirected stdout is strict ANSI code page under -I; write '?' for what it cannot encode
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
     sys.exit(main())

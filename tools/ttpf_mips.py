@@ -1,36 +1,47 @@
-"""Measure and decode the TTPF (RDS5) compact mip chain, including the packed tail.
+"""Measure and decode TTPF (RDS5) textures: 2D compact mip chains, 2D arrays,
+streaming cubemaps, and 3D volumes.
 
 The compact profile in `TtpfReader` is the AMD Gfx10 mip-tail layout: mips smaller
 than half a tile share one tile at offset 0, and the rest are standalone, smallest
 first. `TtpfReader` only trusts a hand-validated tuple table and stops at the
-descriptor's `nonTail` field, which is not the layout boundary. The layout rule lives
-in `tex_headers.py` (`compact_surface_layout` and the helpers around it); this tool
-supplies the RDS5 reader, decoders and commands. It computes the layout from the
-descriptor, validates it against the native allocation span, then decodes zlib/raw
-mips and supported BCPack codecs (BC1, BC3, BC4 and BC5 via `bcpack.py`, strict
-confirmed-history mode by default; pass `--allow-provisional` to opt into unconfirmed
-built-in history entries).
+descriptor's `nonTail` field, which is not the layout boundary. Multi-slice
+descriptors use the same 16-byte ETPF record with a 7-bit DXGI format
+(`(b >> 3) & 0x7F`) and an 11-bit depth (`((b >> 10) & 0x7FF) + 1`):
+  - 2D arrays (`dimension = 1, depth > 1, mode = 1`): mip-major SW_64KB_D.
+  - Cubemaps (`dimension = 2, depth = 6, mode = 18 + 2 * non_tail`): `non_tail + 1`
+    back-to-back streaming snapshots; the final chunk holds the full-res 6-face
+    slice-major SW_4KB_S cubemap.
+  - 3D volumes (`dimension = 3, depth > 1, mode = 2, mips = 1`): single-mip 3D
+    SW_4KB_S tiling.
+
+The layout rules live in `tex_headers.py`; this tool supplies the RDS5 reader,
+decoders and commands. It computes the layout from the descriptor, validates it
+against the native allocation span, then decodes zlib/raw mips and supported
+BCPack codecs (BC1, BC3, BC4, BC5, BC6H and BC7 via `bcpack.py`, strict
+confirmed-history mode by default; pass `--allow-provisional` to opt into
+unconfirmed built-in history entries, and `--history <path>` to supply locally
+generated BC6H/BC7 initial history tables).
 
 Read-only: no texture bytes are printed or committed. `scan` emits aggregate
 counters only (both the zlib/raw baseline and the BCPack-enabled projection).
-`layout` prints descriptor fields and offsets. `check` prints the BC block-average
-error against a 2x2 downsample of the parent mip; it decodes BC1, BC3, BC4_UNORM
-and BC5_UNORM (BC2, the SNORM BC4/5 variants, BC6H and BC7 are sized but not
-decoded, and uncompressed tiling is not validated). `export` writes a full BC chain
-when every source mip uses a supported codec.
+`layout` prints descriptor fields and offsets. `check` prints the BC
+block-average error against a 2x2 downsample of the parent mip (across all
+slices/faces for arrays and cubemaps; BC1, BC3, BC4_UNORM and BC5_UNORM) or 3D
+Z-continuity vs 2D control for float16 volumes. `export` writes a DX10 DDS when
+every source mip uses a supported codec.
 
     python -I tools/ttpf_mips.py scan <game root or pool paths...> [--json out] [--tuples]
     python -I tools/ttpf_mips.py layout <pool.ttpf> <index>
-    python -I tools/ttpf_mips.py check <pool.ttpf> <index> [--allow-provisional]
-    python -I tools/ttpf_mips.py export <pool.ttpf> <index> <out.dds> [--mips N] [--force] [--allow-provisional]
+    python -I tools/ttpf_mips.py check <pool.ttpf> <index> [--allow-provisional] [--history path]
+    python -I tools/ttpf_mips.py export <pool.ttpf> <index> <out.dds> [--mips N] [--force] [--allow-provisional] [--history path]
 
-Standard library only. The RDS5/ETPF checks mirror rpf9-explorer's `TtpfReader`
-(MIT); the tile patterns and tail formula are the AMD Gfx10 4 KiB/64 KiB layouts
-already used by that reader and recorded in docs/textures.md.
+Standard library only. The tile patterns and tail formula are the public AMD
+Gfx10 4 KiB/64 KiB layouts recorded in docs/textures.md and docs/textures_arrays.md.
 """
 import argparse
 import glob
 import json
+import math
 import mmap
 import os
 import struct
@@ -40,8 +51,9 @@ import zlib
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import bcpack  # noqa: E402
 from tex_headers import (  # noqa: E402
-    compact_surface_layout, gfx10_tile_bytes, gfx10_tile_mode,
-    parse_etpf_texture_record,
+    array_surface_layout, compact_surface_layout, cubemap_surface_layout,
+    decode_etpf_chunk_pages, etpf_streaming_padding, gfx10_tile_bytes,
+    gfx10_tile_mode, parse_etpf_texture_record, volume_surface_layout,
 )
 
 MAX_OUTPUT = 256 * 1024 * 1024
@@ -76,6 +88,16 @@ PATTERNS_64K = {
     3: (0, 0, 0, 1, -1, 2, 3, -2, -3, 4, -4, 5, -5, 6, -6, 7),
     4: (0, 0, 0, 0, 1, -1, 2, -2, -3, 3, -4, 4, -5, 5, -6, 6),
 }
+# AMD Gfx10 3D SW_4KB_S intra-tile bit order (addrlib GFX10_SW_4K_S 3D):
+# >0 and <100 = X bit (s-1), <0 = Y bit (-s-1), >=101 = Z bit (s-101).
+VOLUME_PATTERNS_4K = {
+    0: (1, 2, 101, -1, 102, -2, 3, 103, -3, 4, 104, -4),
+    1: (0, 1, 2, 101, -1, 102, 3, -2, 103, 4, -3, 104),
+    2: (0, 0, 1, 2, 101, -1, 102, -2, 3, 103, -3, 104),
+    3: (0, 0, 0, 1, 101, -1, 2, 102, -2, 3, 103, -3),
+    4: (0, 0, 0, 0, 1, -1, 101, 2, -2, 102, 3, 103),
+}
+VOLUME_FLOAT_FORMATS = {10: 4, 54: 1}  # DXGI format -> float16 channels per voxel
 
 # The profile tuples `TtpfReader.ValidatedCompactProfile` accepts. Reproduced only
 # so `scan` can show the reader's published skip/partial split next to the layout
@@ -206,16 +228,52 @@ def detile(layout, mip, tiled):
     return bytes(out)
 
 
+def detile_volume_slice(layout, tiled, z):
+    """Copy one Z slice out of a 3D SW_4KB_S tiled volume into row-major linear order."""
+    eb = layout["element_bytes"]
+    pat = VOLUME_PATTERNS_4K[{1: 0, 2: 1, 4: 2, 8: 3, 16: 4}[eb]]
+    bw, bh, bd = layout["block_w"], layout["block_h"], layout["block_d"]
+    mip = layout["mips"][0]
+    w, h = mip["blocks_w"], mip["blocks_h"]
+    tiles_x = mip["padded_w"] // bw
+    z_base = (z // bd) * layout["z_tile_stride"]
+    z_in_tile = 0
+    for bit, s in enumerate(pat):
+        if s >= 101:
+            z_in_tile |= ((z >> (s - 101)) & 1) << bit
+    out = bytearray(w * h * eb)
+    for y in range(h):
+        y_tile = (y // bh) * tiles_x
+        y_in_tile = z_in_tile
+        for bit, s in enumerate(pat):
+            if s < 0:
+                y_in_tile |= ((y >> (-s - 1)) & 1) << bit
+        row_at = y * w * eb
+        for x in range(w):
+            off = z_base + (y_tile + x // bw) * layout["tile"] + y_in_tile
+            for bit, s in enumerate(pat):
+                if 0 < s < 100:
+                    off |= ((x >> (s - 1)) & 1) << bit
+            at = row_at + x * eb
+            out[at:at + eb] = tiled[off:off + eb]
+    return bytes(out)
+
+
+def detile_volume(layout, tiled):
+    """Detile all Z slices of a 3D SW_4KB_S volume into Z-major linear order."""
+    return b"".join(detile_volume_slice(layout, tiled, z) for z in range(layout["depth"]))
+
+
 # --- BC decoding (color only; enough for the downsample check) -------------
 
 def _rgb565(c):
     return ((c >> 11) & 31) * 255.0 / 31, ((c >> 5) & 63) * 255.0 / 63, (c & 31) * 255.0 / 31
 
 
-def decode_bc1_block(data, at):
+def decode_bc1_block(data, at, four_color=False):
     c0, c1, idx = struct.unpack_from("<HHI", data, at)
     p0, p1 = _rgb565(c0), _rgb565(c1)
-    if c0 > c1:
+    if four_color or c0 > c1:
         pal = [p0, p1, tuple((2 * a + b) / 3 for a, b in zip(p0, p1)),
                tuple((a + 2 * b) / 3 for a, b in zip(p0, p1))]
     else:
@@ -244,7 +302,8 @@ def decode_pixels(fmt, data, blocks_w, blocks_h):
             if fmt in (71, 72):
                 blk = decode_bc1_block(data, (by * blocks_w + bx) * 8)
             elif fmt in (77, 78):
-                blk = decode_bc1_block(data, at + 8)
+                # BC3 colour uses four entries regardless of endpoint order.
+                blk = decode_bc1_block(data, at + 8, four_color=True)
             elif fmt in (80,):
                 blk = decode_bc4_block(data, (by * blocks_w + bx) * 8)
             elif fmt in (83,):
@@ -260,21 +319,31 @@ def decode_pixels(fmt, data, blocks_w, blocks_h):
     return [p for row in px for p in row]
 
 
-def block_means(pixels, blocks_w, blocks_h):
+def block_means(pixels, blocks_w, blocks_h, pixels_w=None, pixels_h=None):
+    pw = blocks_w * 4 if pixels_w is None else pixels_w
+    ph = blocks_h * 4 if pixels_h is None else pixels_h
     out = []
     for by in range(blocks_h):
         for bx in range(blocks_w):
             acc = [0.0, 0.0, 0.0]
+            n = 0
             for y in range(4):
+                if by * 4 + y >= ph:
+                    continue
                 for x in range(4):
+                    if bx * 4 + x >= pw:
+                        continue
                     q = pixels[(by * 4 + y) * (blocks_w * 4) + bx * 4 + x]
                     for k in range(3):
                         acc[k] += q[k]
-            out.append((acc[0] / 16, acc[1] / 16, acc[2] / 16))
+                    n += 1
+            out.append((acc[0] / n, acc[1] / n, acc[2] / n) if n else (0.0, 0.0, 0.0))
     return out
 
 
 def downsample2(blocks, blocks_w, blocks_h):
+    """2x2 mean over a block grid. This only predicts the child mip when the parent block grid
+    is exactly twice the child's; `check` uses `predict_child_means` instead."""
     ow, oh = max(1, blocks_w // 2), max(1, blocks_h // 2)
     out = []
     for y in range(oh):
@@ -293,10 +362,88 @@ def downsample2(blocks, blocks_w, blocks_h):
     return out
 
 
+class MipGeometryError(ValueError):
+    """Two adjacent mips do not form a 2x2 downsample, or a block list does not fit its mip."""
+
+
 def mean_abs_error(a, b):
+    if len(a) != len(b):
+        raise MipGeometryError(f"cannot compare {len(a)} predicted blocks with {len(b)} mip blocks")
     if not a:
         return None
     return sum(abs(x - y) for pa, pb in zip(a, b) for x, y in zip(pa, pb)) / (3 * len(a))
+
+
+def _visible_grid(mip):
+    """Return the (blocks_w, blocks_h) that hold visible texels, checking the block grid."""
+    pw, ph, bw, bh = mip["pixels_w"], mip["pixels_h"], mip["blocks_w"], mip["blocks_h"]
+    vw, vh = (pw + 3) // 4, (ph + 3) // 4
+    if pw < 1 or ph < 1 or bw < vw or bh < vh:
+        raise MipGeometryError(
+            f"mip {mip.get('index')} geometry: {bw}x{bh} blocks cannot hold {pw}x{ph} pixels")
+    return vw, vh
+
+
+def _visible_rows(layout, mip, data):
+    """Crop block-linear `data` from `detile` to the mip's visible blocks, tightly packed.
+
+    Storage grids can be wider or taller than the visible grid (17x13 BC1 stores its 8x6
+    child as 3x2 blocks); standard DDS readers expect only the visible rows. Aligned grids
+    are returned unchanged.
+    """
+    vw, vh = _visible_grid(mip)
+    bw, eb = mip["blocks_w"], layout["element_bytes"]
+    if (vw, vh) == (bw, mip["blocks_h"]):
+        return data
+    return b"".join(data[y * bw * eb:(y * bw + vw) * eb] for y in range(vh))
+
+
+def visible_block_means(means, mip):
+    """Select the `block_means` entries whose blocks hold visible texels, row-major."""
+    vw, vh = _visible_grid(mip)
+    bw = mip["blocks_w"]
+    if len(means) != bw * mip["blocks_h"]:
+        raise MipGeometryError(
+            f"mip {mip.get('index')} geometry: {len(means)} block means for "
+            f"{bw}x{mip['blocks_h']} blocks")
+    return [means[by * bw + bx] for by in range(vh) for bx in range(vw)]
+
+
+def predict_child_means(pixels, parent, child):
+    """Predict the visible block means of `child` as a 2x2 box downsample of `parent` pixels.
+
+    Child texel (x, y) is the mean of parent texels (2x + dx, 2y + dy), dx, dy in {0, 1},
+    clamped to the last visible parent row/column. Each child block averages only its
+    visible texels, so padding in either mip is never read. Returns one (r, g, b) per block
+    of the child's visible grid, ordered like `visible_block_means`.
+    """
+    pw, ph, cw, ch = parent["pixels_w"], parent["pixels_h"], child["pixels_w"], child["pixels_h"]
+    _visible_grid(parent)
+    vw, vh = _visible_grid(child)
+    if (cw, ch) != (max(1, pw // 2), max(1, ph // 2)):
+        raise MipGeometryError(
+            f"mip {child.get('index')} geometry: {cw}x{ch} is not the 2x2 downsample of {pw}x{ph}")
+    stride = parent["blocks_w"] * 4
+    if len(pixels) != stride * parent["blocks_h"] * 4:
+        raise MipGeometryError(
+            f"mip {parent.get('index')} geometry: {len(pixels)} pixels for "
+            f"{parent['blocks_w']}x{parent['blocks_h']} blocks")
+    out = []
+    for by in range(vh):
+        for bx in range(vw):
+            acc = [0.0, 0.0, 0.0]
+            n = 0
+            for y in range(by * 4, min(by * 4 + 4, ch)):
+                for x in range(bx * 4, min(bx * 4 + 4, cw)):
+                    for dy in range(2):
+                        row = min(ph - 1, 2 * y + dy) * stride
+                        for dx in range(2):
+                            q = pixels[row + min(pw - 1, 2 * x + dx)]
+                            for k in range(3):
+                                acc[k] += q[k]
+                            n += 1
+            out.append(tuple(a / n for a in acc))
+    return out
 
 
 # --- RDS5 / ETPF container ------------------------------------------------
@@ -305,6 +452,15 @@ class Pool:
     """Read-only RDS5 texture pool, mirroring TtpfReader's catalog checks."""
 
     def __init__(self, path):
+        # A pool that fails a check used to keep its file open and mapped (locked on Windows).
+        self._fh = self.data = None
+        try:
+            self._open(path)
+        except Exception:
+            self.close()
+            raise
+
+    def _open(self, path):
         self.path = path
         self._fh = open(path, "rb")
         try:
@@ -363,8 +519,10 @@ class Pool:
         self._starts = [c[0] for c in self.chunks]
 
     def close(self):
-        self.data.close()
-        self._fh.close()
+        if self.data is not None:
+            self.data.close()
+        if self._fh is not None:
+            self._fh.close()
 
     def descriptor(self, index):
         if not 0 <= index < self.textures:
@@ -401,13 +559,17 @@ class Pool:
         allowed = ({0, 8} | bcpack.SUPPORTED_REBUILD_CODECS) if allow_bcpack else {0, 8}
         return self.codecs(start, size) <= allowed
 
-    def read_range(self, start, size, cache=None, *, bcpack_mode="strict"):
+    def read_range(self, start, size, cache=None, *, bcpack_mode="strict", bcpack_history=None):
         if bcpack_mode not in ("strict", "provisional", "off"):
             raise ValueError(f"invalid bcpack_mode: {bcpack_mode!r}")
         cache = {} if cache is None else cache
         out = bytearray(size)
+        hist_key = None if bcpack_history is None else (
+            id(bcpack_history) if isinstance(bcpack_history, dict) else os.fspath(bcpack_history)
+        )
         for virt, csize, src, packed, codec, pad in self.chunks_for(start, size):
-            key = (src, packed, codec, bcpack_mode if codec not in (0, 8) else "raw")
+            key = (src, packed, codec, bcpack_mode if codec not in (0, 8) else "raw",
+                   hist_key if codec in (6, 7) else None)
             if key not in cache:
                 raw = self.data[src:src + packed]
                 if codec == 0:
@@ -416,7 +578,9 @@ class Pool:
                     cache[key] = zlib.decompress(raw)
                 elif bcpack_mode != "off" and codec in bcpack.SUPPORTED_REBUILD_CODECS:
                     cache[key] = bcpack.decode(
-                        raw, codec, csize, allow_provisional=(bcpack_mode == "provisional")
+                        raw, codec, csize,
+                        allow_provisional=(bcpack_mode == "provisional"),
+                        history=bcpack_history,
                     )
                 else:
                     raise BcpackRequired(
@@ -458,60 +622,280 @@ def validated_aux(desc):
               ELEMENT_BYTES.get(desc["format"]) == a["bytes_b"])))
 
 
+def validate_chunk_metadata(pool, desc, span):
+    """Verify ``(meta, extra)`` streaming chunk sizes and alignment padding.
+
+    Returns ``(ok, pages)`` where ``pages`` is the decoded tuple of 4 KiB chunk
+    page counts (empty when ``meta == 0 and extra == 0``).
+    """
+    meta, extra = desc["meta"], desc["extra"]
+    if meta == 0 and extra == 0:
+        return True, ()
+    pages = decode_etpf_chunk_pages(meta, extra)
+    if not pages:
+        return False, None
+    try:
+        chunks = pool.chunks_for(desc["base"], span)
+    except ValueError:
+        return False, None
+    if len(chunks) != len(pages):
+        return False, None
+    if chunks[0][0] != desc["base"] or sum(c[1] for c in chunks) != span:
+        return False, None
+    for chunk, expected_pages in zip(chunks, pages):
+        if chunk[1] != expected_pages * 4096:
+            return False, None
+    align_group, pad_pages = etpf_streaming_padding(extra)
+    if desc["dimension"] == 2 or desc["non_tail"] == 1:
+        if align_group != 0 or pad_pages != 0:
+            return False, None
+    elif desc["dimension"] == 1 and desc["non_tail"] == 3:
+        if align_group == 1:
+            if pages[0] + pad_pages != 16:
+                return False, None
+        elif align_group == 2:
+            if len(pages) < 2 or pages[0] + pages[1] + pad_pages != 16:
+                return False, None
+        elif align_group == 3:
+            if len(pages) < 2 or pages[0] + pages[1] + pad_pages != 8:
+                return False, None
+        else:
+            return False, None
+    else:
+        if align_group != 0 or pad_pages != 0:
+            return False, None
+    return True, pages
+
+
+def _mip_range_codecs(pool, base, offset, region, slices=1, slice_stride=0):
+    codecs = set()
+    for s in range(slices):
+        codecs |= pool.codecs(base + offset + s * slice_stride, region)
+    return codecs
+
+
+def _decode_volume_voxels(fmt, data, width, height, depth):
+    """Decode float16 volume bytes into a flat list of per-voxel float tuples."""
+    channels = VOLUME_FLOAT_FORMATS.get(fmt)
+    if channels is None:
+        return None
+    n = width * height * depth * channels
+    vals = struct.unpack_from(f"<{n}e", data, 0)
+    if channels == 1:
+        return [(v,) for v in vals]
+    return [vals[i:i + channels] for i in range(0, n, channels)]
+
+
+def _volume_z_diff(voxels, width, height, depth):
+    """Mean absolute difference between adjacent Z slices (finite voxels only)."""
+    plane = width * height
+    total = 0.0
+    count = 0
+    for z in range(depth - 1):
+        a0 = z * plane
+        b0 = (z + 1) * plane
+        for p in range(plane):
+            va = voxels[a0 + p]
+            vb = voxels[b0 + p]
+            for ca, cb in zip(va, vb):
+                if math.isfinite(ca) and math.isfinite(cb):
+                    total += abs(ca - cb)
+                    count += 1
+    return (total / count) if count else None
+
+
 def analyze(pool, index, *, allow_bcpack=True):
     """Descriptor + layout + per-mip codec availability for one texture."""
     d = pool.descriptor(index)
     out = dict(descriptor=d, tile_mode=tile_mode(d["mode"]), tile=tile_bytes(d["mode"]))
-    if d["dimension"] != 1 or d["depth"] != 1:
-        out["blocked"] = "array/volume descriptor"
-        return out
-    try:
-        layout = surface_layout(d["width"], d["height"], d["format"], d["mips"],
-                                out["tile"])
-    except LayoutError as e:
-        out["blocked"] = str(e)
-        return out
-    out["layout"] = layout
     if d["base"] == 0 or (d["base"] >> 12) == 0x1FFFFF:
         out["blocked"] = "no mapped allocation"
         return out
     span = pool.span(index, d["base"])
     out["allocation_span"] = span
-    out["span_matches"] = span == layout["size"]
-    if not out["span_matches"]:
-        out["blocked"] = "layout does not match the allocation span"
-        return out
-    avail = []
-    mip_codecs = []
-    for mip in layout["mips"]:
+    allowed = ({0, 8} | bcpack.SUPPORTED_REBUILD_CODECS) if allow_bcpack else {0, 8}
+
+    if d["dimension"] == 1 and d["depth"] == 1:
+        out["shape"] = "2d"
         try:
-            codecs = sorted(pool.codecs(d["base"] + mip["offset"], mip["region"]))
-            mip_codecs.append(codecs)
-            avail.append(pool.readable(d["base"] + mip["offset"], mip["region"],
-                                       allow_bcpack=allow_bcpack))
+            layout = surface_layout(d["width"], d["height"], d["format"], d["mips"],
+                                    out["tile"])
+        except LayoutError as e:
+            out["blocked"] = str(e)
+            return out
+        out["layout"] = layout
+        out["span_matches"] = span == layout["size"]
+        if not out["span_matches"]:
+            out["blocked"] = "layout does not match the allocation span"
+            return out
+        avail = []
+        mip_codecs = []
+        for mip in layout["mips"]:
+            try:
+                cs = pool.codecs(d["base"] + mip["offset"], mip["region"])
+                mip_codecs.append(sorted(cs))
+                avail.append(cs <= allowed)
+            except ValueError:
+                avail = []
+                mip_codecs = []
+                break
+        out["available"] = avail
+        out["mip_codecs"] = mip_codecs
+        if avail:
+            limit = d["non_tail"] if compact_row(d) else d["mips"]
+            limit = max(0, min(limit, len(avail)))
+            base_mip = next((i for i in range(limit) if avail[i]), None)
+            exported = 0
+            if base_mip is not None:
+                while base_mip + exported < limit and avail[base_mip + exported]:
+                    exported += 1
+            out["reader_limit"] = limit
+            out["reader_base_mip"] = base_mip
+            out["reader_exported"] = exported
+            out["full_chain"] = bool(avail) and all(avail)
+            out["recoverable_mips"] = sum(1 for a in avail[exported:] if a) if base_mip == 0 else 0
+        return out
+
+    if d["dimension"] == 1 and d["depth"] > 1:
+        out["shape"] = "2d_array"
+        if d["mode"] != 1:
+            out["blocked"] = f"unsupported 2D array mode {d['mode']}"
+            return out
+        try:
+            eb = element_bytes(d["format"])
+            blk = 4 if d["format"] in BC_FORMATS else 1
+            layout = array_surface_layout(d["width"], d["height"], d["depth"], d["mips"],
+                                          eb, blk, out["tile"])
+        except (LayoutError, ValueError) as e:
+            out["blocked"] = str(e)
+            return out
+        out["layout"] = layout
+        out["span_matches"] = span == layout["size"]
+        if not out["span_matches"]:
+            out["blocked"] = "array layout does not match the allocation span"
+            return out
+        avail = []
+        mip_codecs = []
+        for mip in layout["mips"]:
+            try:
+                cs = _mip_range_codecs(pool, d["base"], mip["offset"], mip["region"],
+                                       d["depth"], mip["slice_stride"])
+                mip_codecs.append(sorted(cs))
+                avail.append(cs <= allowed)
+            except ValueError:
+                avail = []
+                mip_codecs = []
+                break
+        out["available"] = avail
+        out["mip_codecs"] = mip_codecs
+        if avail:
+            out["reader_limit"] = 0
+            out["reader_base_mip"] = None
+            out["reader_exported"] = 0
+            out["full_chain"] = all(avail)
+        return out
+
+    if d["dimension"] == 2:
+        out["shape"] = "cubemap"
+        if d["depth"] != 6:
+            out["blocked"] = f"unsupported cubemap depth {d['depth']}"
+            return out
+        if d["non_tail"] > 3 or d["mode"] != 18 + 2 * d["non_tail"]:
+            out["blocked"] = f"unsupported cubemap mode {d['mode']} (non_tail={d['non_tail']})"
+            return out
+        ok, pages = validate_chunk_metadata(pool, d, span)
+        if not ok:
+            out["blocked"] = "cubemap streaming chunk metadata mismatch"
+            return out
+        if d["non_tail"] > 0 and len(pages) != d["non_tail"] + 1:
+            out["blocked"] = "cubemap streaming chunk metadata mismatch"
+            return out
+        if d["non_tail"] == 0 and len(pages) not in (0, 1):
+            out["blocked"] = "cubemap chunk metadata mismatch"
+            return out
+        try:
+            eb = element_bytes(d["format"])
+            blk = 4 if d["format"] in BC_FORMATS else 1
+            layout = cubemap_surface_layout(d["width"], d["height"], d["mips"], eb, blk,
+                                            d["non_tail"], pages if pages else None)
+        except (LayoutError, ValueError) as e:
+            out["blocked"] = str(e)
+            return out
+        out["layout"] = layout
+        out["span_matches"] = span == layout["size"]
+        if not out["span_matches"]:
+            out["blocked"] = "cubemap layout does not match the allocation span"
+            return out
+        avail = []
+        mip_codecs = []
+        face_base = d["base"] + layout["data_offset"]
+        for mip in layout["mips"]:
+            try:
+                cs = _mip_range_codecs(pool, face_base, mip["offset"], mip["region"],
+                                       6, layout["face_size"])
+                mip_codecs.append(sorted(cs))
+                avail.append(cs <= allowed)
+            except ValueError:
+                avail = []
+                mip_codecs = []
+                break
+        out["available"] = avail
+        out["mip_codecs"] = mip_codecs
+        if avail:
+            out["reader_limit"] = 0
+            out["reader_base_mip"] = None
+            out["reader_exported"] = 0
+            out["full_chain"] = all(avail)
+        return out
+
+    if d["dimension"] == 3:
+        out["shape"] = "volume"
+        if d["mode"] != 2 or d["mips"] != 1 or d["format"] in BC_FORMATS:
+            out["blocked"] = (
+                f"unsupported 3D volume mode={d['mode']} mips={d['mips']} format={d['format']}")
+            return out
+        try:
+            eb = element_bytes(d["format"])
+            layout = volume_surface_layout(d["width"], d["height"], d["depth"], d["mips"], eb)
+        except (LayoutError, ValueError) as e:
+            out["blocked"] = str(e)
+            return out
+        out["layout"] = layout
+        out["span_matches"] = span == layout["size"]
+        if not out["span_matches"]:
+            out["blocked"] = "volume layout does not match the allocation span"
+            return out
+        try:
+            cs = pool.codecs(d["base"], layout["size"])
+            avail = [cs <= allowed]
+            mip_codecs = [sorted(cs)]
         except ValueError:
             avail = []
             mip_codecs = []
-            break
-    out["available"] = avail
-    out["mip_codecs"] = mip_codecs
-    if avail:
-        limit = d["non_tail"] if compact_row(d) else d["mips"]
-        limit = max(0, min(limit, len(avail)))
-        base_mip = next((i for i in range(limit) if avail[i]), None)
-        exported = 0
-        if base_mip is not None:
-            while base_mip + exported < limit and avail[base_mip + exported]:
-                exported += 1
-        out["reader_limit"] = limit
-        out["reader_base_mip"] = base_mip
-        out["reader_exported"] = exported
-        out["full_chain"] = bool(avail) and all(avail)
-        out["recoverable_mips"] = sum(1 for a in avail[exported:] if a) if base_mip == 0 else 0
+        out["available"] = avail
+        out["mip_codecs"] = mip_codecs
+        if avail:
+            out["reader_limit"] = 0
+            out["reader_base_mip"] = None
+            out["reader_exported"] = 0
+            out["full_chain"] = avail[0]
+        return out
+
+    out["shape"] = "unknown"
+    out["blocked"] = f"unsupported descriptor dimension {d['dimension']}"
     return out
 
 
 # --- commands --------------------------------------------------------------
+
+def same_output_path(first, second):
+    if os.path.normcase(os.path.realpath(first)) == os.path.normcase(os.path.realpath(second)):
+        return True
+    try:
+        return os.path.samefile(first, second)
+    except OSError:
+        return False
+
 
 def find_pools(arg):
     if os.path.isfile(arg):
@@ -523,7 +907,12 @@ def find_pools(arg):
 
 
 def scan_pools(paths, as_json=None, include_tuples=False):
-    total = dict(pools=0, entries=0, arrays=0, unsupported_format=0, format11=0,
+    total = dict(pools=0, entries=0, arrays=0, arrays_2d=0, arrays_2d_full=0,
+                 arrays_2d_partial=0, arrays_2d_bcpack=0, cubemaps=0, cubemaps_full=0,
+                 cubemaps_partial=0, cubemaps_bcpack=0, volumes=0, volumes_full=0,
+                 volumes_bcpack=0, multi_slice_layout_mismatch=0,
+                 chunk_metadata_ok=0, chunk_metadata_fail=0,
+                 unsupported_format=0, format11=0,
                  layout_mismatch=0, reader_full=0, reader_partial=0,
                  reader_skip_bcpack=0, whitelist_gated=0, gated_layout_ok=0,
                  gated_full_chain=0, gated_full_mips=0, gated_full_bytes=0,
@@ -542,7 +931,10 @@ def scan_pools(paths, as_json=None, include_tuples=False):
     gated_tuples = {}
     bcpack_allowed = {0, 8} | bcpack.SUPPORTED_REBUILD_CODECS
     for path in paths:
-        pool = Pool(path)
+        try:
+            pool = Pool(path)
+        except (OSError, ValueError) as exc:
+            raise ValueError(f"{path}: {exc}") from None
         try:
             total["pools"] += 1
             for i in range(pool.textures):
@@ -550,8 +942,39 @@ def scan_pools(paths, as_json=None, include_tuples=False):
                 total["entries"] += 1
                 tm = str(tile_mode(d["mode"]))
                 total["tile_modes"][tm] = total["tile_modes"].get(tm, 0) + 1
+                span = pool.span(i, d["base"]) if d["base"] else None
+                if span is not None:
+                    meta_ok, _ = validate_chunk_metadata(pool, d, span)
+                    if meta_ok:
+                        total["chunk_metadata_ok"] += 1
+                    else:
+                        total["chunk_metadata_fail"] += 1
                 if d["dimension"] != 1 or d["depth"] != 1:
                     total["arrays"] += 1
+                    a = analyze(pool, i, allow_bcpack=False)
+                    shape = a.get("shape")
+                    prefix = {"2d_array": "arrays_2d", "cubemap": "cubemaps",
+                              "volume": "volumes"}.get(shape)
+                    if prefix:
+                        total[prefix] += 1
+                    if "available" not in a or not a["available"]:
+                        total["multi_slice_layout_mismatch"] += 1
+                        continue
+                    avail = a["available"]
+                    mip_codecs = a.get("mip_codecs") or []
+                    avail_bc = [set(cs) <= bcpack_allowed for cs in mip_codecs]
+                    if prefix:
+                        if all(avail):
+                            total[f"{prefix}_full"] += 1
+                        elif any(avail):
+                            if f"{prefix}_partial" in total:
+                                total[f"{prefix}_partial"] += 1
+                        else:
+                            total[f"{prefix}_bcpack"] += 1
+                    if avail_bc and all(avail_bc):
+                        total["after_bcpack_full"] += 1
+                    elif any(avail_bc):
+                        total["after_bcpack_partial"] += 1
                     continue
                 # The reader's gate: modes 4/6/36 and aux mode 2 need a validated tuple;
                 # every other non-0/2 mode is rejected by the same branch.
@@ -577,7 +1000,6 @@ def scan_pools(paths, as_json=None, include_tuples=False):
                         else:
                             total["gated_other_layout_error"] += 1
                     continue
-                span = pool.span(i, d["base"])
                 if d["base"] == 0 or span != layout["size"]:
                     total["layout_mismatch"] += 1
                     if gated:
@@ -696,13 +1118,16 @@ def scan_pools(paths, as_json=None, include_tuples=False):
     total["gated_accounted"] = (total["gated_layout_ok"] + total["gated_no_layout"] +
                                 total["gated_span_mismatch"] + total["gated_unreadable_range"])
     total["gated_tuple_distinct"] = len(gated_tuples)
-    # Projected split once the reader uses the computed layout: existing full
-    # exports plus compact partials that complete plus gated records that
-    # complete; partials lose the completed rows and gain the gated partials.
+    # Projected split once the reader uses the computed 2D + multi-slice layouts:
+    # existing full exports plus compact partials, gated 2D records, and resolved
+    # arrays/cubemaps/volumes that complete; partials lose completed 2D rows and
+    # gain newly partial gated 2D + array rows.
     total["after_full"] = (total["reader_full"] + total["compact_full_rows"] +
-                           total["gated_full_chain"])
+                           total["gated_full_chain"] + total["arrays_2d_full"] +
+                           total["cubemaps_full"] + total["volumes_full"])
     total["after_partial"] = (total["reader_partial"] - total["compact_full_rows"] +
-                              total["gated_partial"])
+                              total["gated_partial"] + total["arrays_2d_partial"] +
+                              total["cubemaps_partial"])
     total["after_skip"] = total["entries"] - total["after_full"] - total["after_partial"]
     total["after_bcpack_skip"] = (total["entries"] - total["after_bcpack_full"] -
                                   total["after_bcpack_partial"])
@@ -713,30 +1138,46 @@ def scan_pools(paths, as_json=None, include_tuples=False):
             for key, count in sorted(gated_tuples.items(), key=lambda kv: (-kv[1], kv[0]))
         ]
     report = dict(total=total)
-    if as_json:
-        with open(as_json, "w", encoding="utf-8") as f:
-            json.dump(report, f, indent=1)
+    # Printed first: a report path that can't be written used to end the scan in a traceback with nothing shown.
     print(json.dumps(report, indent=1))
+    if as_json:
+        try:
+            os.makedirs(os.path.dirname(os.path.abspath(as_json)), exist_ok=True)
+            with open(as_json, "w", encoding="utf-8") as f:
+                json.dump(report, f, indent=1)
+        except OSError as exc:
+            raise ValueError(f"cannot write {as_json}: {exc.strerror or exc}") from None
 
 
 def describe(pool, index):
     a = analyze(pool, index)
     d = a["descriptor"]
-    out = dict(index=index, width=d["width"], height=d["height"], format=d["format"],
+    out = dict(index=index, shape=a.get("shape"), width=d["width"], height=d["height"],
+               depth=d["depth"], dimension=d["dimension"], format=d["format"],
                mips=d["mips"], non_tail=d["non_tail"], mode=d["mode"],
                tile_mode=a["tile_mode"], tile=a["tile"], base=d["base"],
                meta=d["meta"], extra=d["extra"])
     if "layout" in a:
-        out["allocation_size"] = a["layout"]["size"]
+        lay = a["layout"]
+        out["allocation_size"] = lay["size"]
         out["allocation_span"] = a.get("allocation_span")
         out["span_matches"] = a.get("span_matches")
-        out["first_tail_mip"] = a["layout"]["first_tail"]
+        out["first_tail_mip"] = lay["first_tail"]
         mip_codecs = a.get("mip_codecs") or []
+        if a.get("shape") == "cubemap":
+            out["data_offset"] = lay["data_offset"]
+            out["face_size"] = lay["face_size"]
+            out["snapshots"] = lay["snapshots"]
+        elif a.get("shape") == "volume":
+            out["block_d"] = lay["block_d"]
+            out["padded_d"] = lay["padded_d"]
+            out["z_tile_stride"] = lay["z_tile_stride"]
         out["mips_detail"] = [
             dict(index=m["index"], blocks=[m["blocks_w"], m["blocks_h"]], offset=m["offset"],
                  region=m["region"], tail=m["in_tail"], tile_origin=[m["tile_x"], m["tile_y"]],
+                 **({"slice_stride": m["slice_stride"]} if "slice_stride" in m else {}),
                  **({"codecs": mip_codecs[m["index"]]} if m["index"] < len(mip_codecs) else {}))
-            for m in a["layout"]["mips"]]
+            for m in lay["mips"]]
     if "available" in a:
         out["available"] = a["available"]
         out["reader_limit"] = a["reader_limit"]
@@ -747,61 +1188,215 @@ def describe(pool, index):
     return out
 
 
-def check(pool, index, *, allow_provisional=False):
+def _check_mip_chain(layout, fmt, slice_bytes_fn):
+    """Detile every mip of one 2D slice and return (means_per_mip, mip_errors, predictions).
+
+    predictions[k] is the visible-block prediction for mip k from the decoded pixels of
+    mip k - 1 (None for mip 0 or an undecodable parent); mip_errors[k - 1] compares it with
+    mip k's visible blocks, so odd parent block counts and partial edge blocks are covered.
+    """
+    means, errs, preds = [], [], [None]
+    prev_px = None
+    for k, mip in enumerate(layout["mips"]):
+        data = detile(layout, mip, slice_bytes_fn(mip))
+        px = decode_pixels(fmt, data, mip["blocks_w"], mip["blocks_h"])
+        means.append(None if px is None else block_means(
+            px, mip["blocks_w"], mip["blocks_h"], mip["pixels_w"], mip["pixels_h"]))
+        if k:
+            pred = None if prev_px is None else predict_child_means(prev_px, layout["mips"][k - 1], mip)
+            preds.append(pred)
+            errs.append(None if pred is None or px is None else round(
+                mean_abs_error(pred, visible_block_means(means[k], mip)), 2))
+        prev_px = px
+    return means, errs, preds
+
+
+def _check_mip_chain_means(layout, fmt, slice_bytes_fn):
+    """Detile every mip of one 2D slice and return (means_per_mip, mip_errors)."""
+    means, errs, _ = _check_mip_chain(layout, fmt, slice_bytes_fn)
+    return means, errs
+
+
+def _tail_origin_control(layout, fmt, tiled, preds):
+    """Negative control: the first tail mip decoded at the tile origin instead of its in-tile
+    offset, against its prediction from the parent mip. None when it cannot be decoded."""
+    ft = layout["first_tail"]
+    if not preds or ft >= len(preds) or preds[ft] is None:
+        return None
+    tm = layout["mips"][ft]
+    bad = dict(tm, tile_x=0, tile_y=0)
+    data = detile(layout, bad, tiled[:layout["tile"]])
+    px = decode_pixels(fmt, data, tm["blocks_w"], tm["blocks_h"])
+    if px is None:
+        return None
+    means = block_means(px, tm["blocks_w"], tm["blocks_h"], tm["pixels_w"], tm["pixels_h"])
+    return round(mean_abs_error(preds[ft], visible_block_means(means, tm)), 2)
+
+
+def _read_range_or_block(pool, start, size, cache, bcpack_mode, index, shape=None,
+                         bcpack_history=None):
+    try:
+        return pool.read_range(start, size, cache, bcpack_mode=bcpack_mode,
+                               bcpack_history=bcpack_history)
+    except BcpackRequired as exc:
+        msg = dict(index=index, blocked=str(exc))
+    except bcpack.BcpackProvisionalError as exc:
+        msg = dict(
+            index=index,
+            blocked=f"provisional BCPack history required ({exc}); pass --allow-provisional",
+        )
+    except (OSError, ValueError) as exc:
+        msg = dict(index=index, blocked=str(exc))
+    if shape is not None:
+        msg["shape"] = shape
+    print(json.dumps(msg, indent=1))
+    return None
+
+
+def check(pool, index, *, allow_provisional=False, history=None):
+    try:
+        return _check_texture(pool, index, allow_provisional=allow_provisional, history=history)
+    except MipGeometryError as exc:
+        print(json.dumps(dict(index=index, blocked=str(exc)), indent=1))
+        return 2
+
+
+def _check_texture(pool, index, *, allow_provisional=False, history=None):
     a = analyze(pool, index)
-    if "layout" not in a:
+    if "layout" not in a or "available" not in a or a.get("blocked"):
         print(json.dumps(dict(index=index, blocked=a.get("blocked")), indent=1))
         return 2
     layout = a["layout"]
     d = a["descriptor"]
+    shape = a.get("shape", "2d")
     cache = {}
     bcpack_mode = "provisional" if allow_provisional else "strict"
-    try:
-        tiled = pool.read_range(d["base"], layout["size"], cache, bcpack_mode=bcpack_mode)
-    except BcpackRequired as exc:
-        print(json.dumps(dict(index=index, blocked=str(exc)), indent=1))
+
+    if shape == "volume":
+        if d["format"] not in VOLUME_FLOAT_FORMATS:
+            print(json.dumps(dict(index=index, shape=shape, blocked=(
+                f"format {d['format']} is not one of the float16 volume formats this tool decodes "
+                "(10/54)")), indent=1))
+            return 2
+        tiled = _read_range_or_block(pool, d["base"], layout["size"], cache, bcpack_mode, index,
+                                     shape, history)
+        if tiled is None:
+            return 2
+        linear_3d = detile_volume(layout, tiled)
+        vox_3d = _decode_volume_voxels(d["format"], linear_3d, d["width"], d["height"], d["depth"])
+        z_diff_3d = _volume_z_diff(vox_3d, d["width"], d["height"], d["depth"])
+        # Negative control: treat the buffer as stacked 2D SW_4KB_S planes.
+        lay_2d = compact_surface_layout(d["width"], d["height"], 1, layout["element_bytes"], 1, 4096)
+        mip_2d = lay_2d["mips"][0]
+        plane_bytes = lay_2d["size"]
+        buf_2d = bytearray()
+        for z in range(d["depth"]):
+            off = z * plane_bytes
+            if off + plane_bytes <= len(tiled):
+                buf_2d += detile(lay_2d, mip_2d, tiled[off:off + plane_bytes])
+            else:
+                buf_2d += bytes(d["width"] * d["height"] * layout["element_bytes"])
+        vox_2d = _decode_volume_voxels(d["format"], bytes(buf_2d), d["width"], d["height"], d["depth"])
+        z_diff_2d = _volume_z_diff(vox_2d, d["width"], d["height"], d["depth"])
+        result = dict(index=index, shape=shape, width=d["width"], height=d["height"],
+                      depth=d["depth"], format=d["format"], mips=d["mips"], tile=layout["tile"],
+                      block_d=layout["block_d"], padded_d=layout["padded_d"],
+                      volume_3d_z_diff=round(z_diff_3d, 6) if z_diff_3d is not None else None,
+                      volume_2d_control_z_diff=round(z_diff_2d, 6) if z_diff_2d is not None else None,
+                      full_chain=a.get("full_chain"))
+        print(json.dumps(result, indent=1))
+        ok = (z_diff_3d is not None and z_diff_2d is not None and
+              z_diff_3d < 0.5 * z_diff_2d)
+        return 0 if ok else 1
+
+    if shape == "2d_array":
+        tiled = _read_range_or_block(pool, d["base"], layout["size"], cache, bcpack_mode, index,
+                                     shape, history)
+        if tiled is None:
+            return 2
+        per_slice_max = []
+        all_errs = []
+        for s in range(d["depth"]):
+            means, errs = _check_mip_chain_means(
+                layout, d["format"],
+                lambda m, sl=s: tiled[m["offset"] + sl * m["slice_stride"]:
+                                      m["offset"] + sl * m["slice_stride"] + m["region"]])
+            if all(m is None for m in means):
+                print(json.dumps(dict(index=index, shape=shape, blocked=(
+                    f"format {d['format']} is not one of the BC formats this tool decodes "
+                    "(71/72/77/78/80/83)")), indent=1))
+                return 2
+            per_slice_max.append(max((e for e in errs if e is not None), default=None))
+            all_errs.extend(errs)
+        # Negative control: interpret the same allocation as slice-major.
+        single = surface_layout(d["width"], d["height"], d["format"], d["mips"], layout["tile"])
+        ctrl_errs = []
+        for s in range(d["depth"]):
+            base_s = s * layout["slice_size"]
+            _, cerrs = _check_mip_chain_means(
+                single, d["format"],
+                lambda m, b0=base_s: tiled[b0 + m["offset"]:b0 + m["offset"] + m["region"]])
+            ctrl_errs.extend(e for e in cerrs if e is not None)
+        result = dict(index=index, shape=shape, width=d["width"], height=d["height"],
+                      depth=d["depth"], format=d["format"], mips=d["mips"],
+                      first_tail=layout["first_tail"], tile=layout["tile"],
+                      per_slice_max_error=per_slice_max,
+                      max_error=max((e for e in all_errs if e is not None), default=None),
+                      slice_major_control_max_error=max(ctrl_errs, default=None),
+                      full_chain=a.get("full_chain"))
+        print(json.dumps(result, indent=1))
+        return 0 if all(e is not None and e <= 6 for e in all_errs) else 1
+
+    if shape == "cubemap":
+        tiled = _read_range_or_block(pool, d["base"] + layout["data_offset"], layout["full_bytes"],
+                                     cache, bcpack_mode, index, shape, history)
+        if tiled is None:
+            return 2
+        per_face_max = []
+        all_errs = []
+        face0_preds = None
+        for face in range(6):
+            fbase = face * layout["face_size"]
+            means, errs, preds = _check_mip_chain(
+                layout, d["format"],
+                lambda m, b0=fbase: tiled[b0 + m["offset"]:b0 + m["offset"] + m["region"]])
+            if all(m is None for m in means):
+                print(json.dumps(dict(index=index, shape=shape, blocked=(
+                    f"format {d['format']} is not one of the BC formats this tool decodes "
+                    "(71/72/77/78/80/83)")), indent=1))
+                return 2
+            if face == 0:
+                face0_preds = preds
+            per_face_max.append(max((e for e in errs if e is not None), default=None))
+            all_errs.extend(errs)
+        control = None
+        if 0 < layout["first_tail"] < d["mips"]:
+            control = _tail_origin_control(layout, d["format"], tiled, face0_preds)
+        result = dict(index=index, shape=shape, width=d["width"], height=d["height"],
+                      depth=6, format=d["format"], mips=d["mips"], non_tail=d["non_tail"],
+                      snapshots=layout["snapshots"], data_offset=layout["data_offset"],
+                      first_tail=layout["first_tail"], tile=layout["tile"],
+                      per_face_max_error=per_face_max,
+                      max_error=max((e for e in all_errs if e is not None), default=None),
+                      tail_origin_control=control, full_chain=a.get("full_chain"))
+        print(json.dumps(result, indent=1))
+        return 0 if all(e is not None and e <= 6 for e in all_errs) else 1
+
+    tiled = _read_range_or_block(pool, d["base"], layout["size"], cache, bcpack_mode, index,
+                                 bcpack_history=history)
+    if tiled is None:
         return 2
-    except bcpack.BcpackProvisionalError as exc:
-        print(json.dumps(dict(
-            index=index,
-            blocked=f"provisional BCPack history required ({exc}); pass --allow-provisional",
-        ), indent=1))
-        return 2
-    decoded, means = [], []
-    for mip in layout["mips"]:
-        data = detile(layout, mip, tiled[mip["offset"]:mip["offset"] + mip["region"]])
-        px = decode_pixels(d["format"], data, mip["blocks_w"], mip["blocks_h"])
-        if px is None:
-            decoded.append(None)
-            means.append(None)
-        else:
-            decoded.append(px)
-            means.append(block_means(px, mip["blocks_w"], mip["blocks_h"]))
-    if all(px is None for px in decoded):
+    means, errs, preds = _check_mip_chain(
+        layout, d["format"],
+        lambda m: tiled[m["offset"]:m["offset"] + m["region"]])
+    if all(m is None for m in means):
         print(json.dumps(dict(index=index, blocked=(
             f"format {d['format']} is not one of the BC formats this tool decodes "
             "(71/72/77/78/80/83)")), indent=1))
         return 2
-    errs = []
-    for k in range(1, d["mips"]):
-        if means[k - 1] is None or means[k] is None:
-            errs.append(None)
-            continue
-        pm = layout["mips"][k - 1]
-        cm = layout["mips"][k]
-        errs.append(round(mean_abs_error(downsample2(means[k - 1], pm["blocks_w"], pm["blocks_h"]),
-                                         means[k]), 2))
     control = None
-    if layout["first_tail"] < d["mips"] and decoded[layout["first_tail"] - 1] is not None:
-        tm = layout["mips"][layout["first_tail"]]
-        bad = dict(tm, tile_x=0, tile_y=0)
-        data = detile(layout, bad, tiled[:layout["tile"]])
-        px = decode_pixels(d["format"], data, tm["blocks_w"], tm["blocks_h"])
-        if px is not None:
-            pm = layout["mips"][layout["first_tail"] - 1]
-            control = round(mean_abs_error(
-                downsample2(means[layout["first_tail"] - 1], pm["blocks_w"], pm["blocks_h"]),
-                block_means(px, tm["blocks_w"], tm["blocks_h"])), 2)
+    if 0 < layout["first_tail"] < d["mips"]:
+        control = _tail_origin_control(layout, d["format"], tiled, preds)
     result = dict(index=index, width=d["width"], height=d["height"], format=d["format"],
                   mips=d["mips"], non_tail=d["non_tail"], first_tail=layout["first_tail"],
                   tile=layout["tile"], chain_error=errs, max_error=max(
@@ -811,63 +1406,114 @@ def check(pool, index, *, allow_provisional=False):
     return 0 if all(e is not None and e <= 6 for e in errs) else 1
 
 
-def dds_bytes(width, height, fmt, mips, linear, payload):
+def dds_bytes(width, height, fmt, mips, linear, payload,
+              depth=1, array_size=1, is_cube=False, is_volume=False):
     hdr = bytearray(128)
     hdr[0:4] = b"DDS "
-    flags = 0x81007 if mips == 1 else 0xA1007
-    struct.pack_into("<IIIIIII", hdr, 4, 124, flags, height, width, linear, 0, mips)
+    flags = 0x1007 | (0x80000 if fmt in BC_FORMATS else 0x8)
+    if mips > 1:
+        flags |= 0x20000
+    if is_volume:
+        flags |= 0x800000
+    caps = 0x1000
+    if mips > 1:
+        caps |= 0x400008
+    if is_cube or is_volume or array_size > 1:
+        caps |= 0x8
+    caps2 = 0
+    if is_cube:
+        caps2 |= 0xFE00
+    if is_volume:
+        caps2 |= 0x200000
+    struct.pack_into("<IIIIIII", hdr, 4, 124, flags, height, width, linear,
+                     depth if is_volume else 0, mips)
     struct.pack_into("<II4s", hdr, 76, 32, 4, b"DX10")
-    struct.pack_into("<II", hdr, 108, 0x1000 if mips == 1 else 0x401008, 0)
-    return bytes(hdr) + struct.pack("<IIIII", fmt, 3, 0, 1, 0) + payload
+    struct.pack_into("<II", hdr, 108, caps, caps2)
+    dim = 4 if is_volume else 3
+    misc = 0x4 if is_cube else 0
+    dx10_array = 1 if (is_cube or is_volume) else array_size
+    return bytes(hdr) + struct.pack("<IIIII", fmt, dim, misc, dx10_array, 0) + payload
 
 
-def export(pool, index, out_path, mips=None, force=False, *, allow_provisional=False):
-    a = analyze(pool, index)
+def texture_dds(pool, a, mips=None, *, allow_provisional=False, history=None):
+    """Build the complete DDS in memory before publishing it to disk."""
     if "layout" not in a or "available" not in a:
-        print(f"texture {index}: {a.get('blocked', 'layout unavailable')}", file=sys.stderr)
-        return 2
+        raise ValueError(a.get("blocked", "layout unavailable"))
     d = a["descriptor"]
-    if d["format"] not in BC_FORMATS:
-        print(f"texture {index}: format {d['format']} is uncompressed; this tool does not "
-              "validate uncompressed tiling, so it will not write a DDS", file=sys.stderr)
-        return 2
+    shape = a.get("shape", "2d")
+    if shape != "volume" and d["format"] not in BC_FORMATS:
+        raise ValueError(f"format {d['format']} is uncompressed; this tool does not validate uncompressed 2D tiling")
+    if shape == "volume" and d["format"] not in VOLUME_FLOAT_FORMATS:
+        raise ValueError(f"volume format {d['format']} is not validated for export")
     if not a["full_chain"]:
-        print(f"texture {index}: not every source mip uses a supported codec "
-              "(zlib/raw/BCPack BC1/BC3/BC4/BC5)", file=sys.stderr)
-        return 2
+        raise ValueError("not every source mip uses a supported codec (zlib/raw/BCPack BC1/BC3/BC4/BC5/BC6H/BC7)")
     count = d["mips"] if mips is None else mips
     if count < 1 or count > d["mips"]:
-        print(f"texture {index}: --mips must be 1..{d['mips']}", file=sys.stderr)
-        return 2
+        raise ValueError(f"--mips must be 1..{d['mips']}")
     layout = a["layout"]
     cache = {}
     bcpack_mode = "provisional" if allow_provisional else "strict"
     payload = bytearray()
-    try:
+    if shape == "volume":
+        tiled = pool.read_range(d["base"], layout["size"], cache,
+                                bcpack_mode=bcpack_mode, bcpack_history=history)
+        payload += detile_volume(layout, tiled)
+    elif shape == "2d_array":
+        for s in range(d["depth"]):
+            for mip in layout["mips"][:count]:
+                tiled = pool.read_range(d["base"] + mip["offset"] + s * mip["slice_stride"],
+                                        mip["region"], cache,
+                                        bcpack_mode=bcpack_mode, bcpack_history=history)
+                payload += _visible_rows(layout, mip, detile(layout, mip, tiled))
+    elif shape == "cubemap":
+        face_base = d["base"] + layout["data_offset"]
+        for face in range(6):
+            for mip in layout["mips"][:count]:
+                tiled = pool.read_range(face_base + face * layout["face_size"] + mip["offset"],
+                                        mip["region"], cache,
+                                        bcpack_mode=bcpack_mode, bcpack_history=history)
+                payload += _visible_rows(layout, mip, detile(layout, mip, tiled))
+    else:
         for mip in layout["mips"][:count]:
             tiled = pool.read_range(d["base"] + mip["offset"], mip["region"], cache,
-                                    bcpack_mode=bcpack_mode)
-            payload += detile(layout, mip, tiled)
-    except BcpackRequired as exc:
-        print(f"texture {index}: {exc}", file=sys.stderr)
-        return 2
-    except bcpack.BcpackProvisionalError as exc:
-        print(f"texture {index}: provisional BCPack history required ({exc}); "
-              "pass --allow-provisional", file=sys.stderr)
-        return 2
+                                    bcpack_mode=bcpack_mode, bcpack_history=history)
+            payload += _visible_rows(layout, mip, detile(layout, mip, tiled))
     if 148 + len(payload) > MAX_OUTPUT:
-        print("DDS exceeds the 256 MiB output limit", file=sys.stderr)
+        raise ValueError("DDS exceeds the 256 MiB output limit")
+    top_w, top_h = (_visible_grid(layout["mips"][0]) if d["format"] in BC_FORMATS else (0, 0))
+    linear = (top_w * top_h * layout["element_bytes"]
+              if d["format"] in BC_FORMATS else d["width"] * layout["element_bytes"])
+    return dds_bytes(
+        d["width"], d["height"], d["format"], count, linear, bytes(payload),
+        depth=d["depth"] if shape == "volume" else 1,
+        array_size=d["depth"] if shape == "2d_array" else 1,
+        is_cube=(shape == "cubemap"),
+        is_volume=(shape == "volume"),
+    )
+
+
+def export(pool, index, out_path, mips=None, force=False, *, allow_provisional=False, history=None):
+    a = analyze(pool, index)
+    try:
+        blob = texture_dds(pool, a, mips, allow_provisional=allow_provisional, history=history)
+    except bcpack.BcpackProvisionalError as exc:
+        print(f"texture {index}: provisional BCPack history required ({exc}); pass --allow-provisional", file=sys.stderr)
+        return 2
+    except (BcpackRequired, OSError, ValueError) as exc:
+        print(f"texture {index}: {exc}", file=sys.stderr)
         return 2
     if os.path.exists(out_path) and not force:
         print(f"{out_path} exists; pass --force to replace it", file=sys.stderr)
         return 2
-    top = layout["mips"][0]
-    linear = (top["blocks_w"] * top["blocks_h"] * layout["element_bytes"]
-              if d["format"] in BC_FORMATS else d["width"] * layout["element_bytes"])
+    d = a["descriptor"]
+    count = d["mips"] if mips is None else mips
+    shape = a.get("shape", "2d")
     with open(out_path, "wb") as f:
-        f.write(dds_bytes(d["width"], d["height"], d["format"], count, linear, payload))
-    print(f"texture {index}: {d['width']}x{d['height']} fmt {d['format']} {count} mips "
-          f"({148 + len(payload)} bytes) -> {out_path}")
+        f.write(blob)
+    dims = (f"{d['width']}x{d['height']}x{d['depth']}" if shape in ("2d_array", "volume")
+            else f"{d['width']}x{d['height']}")
+    print(f"texture {index}: {shape} {dims} fmt {d['format']} {count} mips "
+          f"({len(blob)} bytes) -> {out_path}")
     return 0
 
 
@@ -887,33 +1533,73 @@ def main(argv=None):
     pc.add_argument("index", type=int)
     pc.add_argument("--allow-provisional", action="store_true",
                     help="allow unconfirmed built-in BCPack history entries")
+    pc.add_argument("--history",
+                    help="local JSON file or directory supplying BC6H/BC7 initial history tables")
     pe = sub.add_parser("export", help="write the full chain as DDS")
     pe.add_argument("pool")
     pe.add_argument("index", type=int)
     pe.add_argument("out")
     pe.add_argument("--mips", type=int)
     pe.add_argument("--force", action="store_true")
+    pe.add_argument("--calibration", metavar="PROFILE.json", help="export using an explicit locally fitted profile")
     pe.add_argument("--allow-provisional", action="store_true",
                     help="allow unconfirmed built-in BCPack history entries")
+    pe.add_argument("--history",
+                    help="local JSON file or directory supplying BC6H/BC7 initial history tables")
     a = ap.parse_args(argv)
     if a.cmd == "scan":
         pools = []
         for p in a.paths:
             pools += find_pools(p)
-        scan_pools(pools, a.json, a.tuples)
+        # The report is written after every pool is read: a pool given as --json used to be replaced by it.
+        if a.json:
+            if os.path.isdir(a.json):
+                print(f"ERROR: --json {a.json} is a directory", file=sys.stderr)
+                return 2
+            for p in pools:
+                if same_output_path(a.json, p):
+                    print(f"ERROR: --json would overwrite the input {p}", file=sys.stderr)
+                    return 2
+        try:
+            scan_pools(pools, a.json, a.tuples)
+        except ValueError as exc:   # a truncated or unsupported pool: name it instead of a traceback
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 2
         return 0
-    pool = Pool(a.pool)
     try:
+        pool = Pool(a.pool)
+    except (OSError, ValueError) as exc:
+        print(f"ERROR: {a.pool}: {exc}", file=sys.stderr)
+        return 2
+    try:
+        if not 0 <= a.index < pool.textures:
+            print(f"ERROR: texture {a.index} is out of range: {a.pool} holds {pool.textures}",
+                  file=sys.stderr)
+            return 2
         if a.cmd == "layout":
             print(json.dumps(describe(pool, a.index), indent=1))
             return 0
         if a.cmd == "check":
-            return check(pool, a.index, allow_provisional=a.allow_provisional)
+            return check(pool, a.index, allow_provisional=a.allow_provisional, history=a.history)
+        if a.calibration:
+            if a.history:
+                print("ERROR: choose either --calibration or --history", file=sys.stderr)
+                return 2
+            try:
+                from calibrated_texture import export_file
+                return export_file(pool, a.index, a.out, a.mips, a.force, a.calibration)
+            except (OSError, ImportError, ValueError, TypeError, KeyError, IndexError) as exc:
+                print(f"calibrated export failed: {exc}", file=sys.stderr)
+                return 2
         return export(pool, a.index, a.out, a.mips, a.force,
-                      allow_provisional=a.allow_provisional)
+                      allow_provisional=a.allow_provisional, history=a.history)
     finally:
         pool.close()
 
 
 if __name__ == "__main__":
+    try:  # a redirected stdout is strict ANSI code page under -I; write '?' for what it cannot encode
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
     sys.exit(main())

@@ -494,11 +494,25 @@ What is evidence-backed:
   ([`present_adapter.h:11-66`](https://github.com/p-portela/SCARAB/blob/d304fa2/components/present-adapter/include/present_adapter.h)).
   Nothing is implemented.
 
-For Leonida, §8.2 question 6 ("DXGI, `PresentX`, or both") remains **Open**. What is new is a
-narrower hypothesis: if the game uses `PresentX`, it is a queue method carrying up to 2 planes and
-up to 8 views per plane, with four named flags; the call site must be found by tracing the queue
-vtable beyond the public chain, not by guessing a slot. The DXGI path remains the first
-implementation, as [d3d12_vulkan.md §4.5](d3d12_vulkan.md) already says.
+Public samples add the call shapes (not slots). From MIT/zlib code
+([Xbox-GDK-Samples](https://github.com/microsoft/Xbox-GDK-Samples) SimpleDeviceAndSwapChain and FramePacing,
+[directxtk12modelviewer](https://github.com/walbourn/directxtk12modelviewer), SDL2's Xbox D3D12 backend), as
+collected in [d3d12_vulkan.md §4.5](d3d12_vulkan.md):
+
+- `PresentX(planeCount, planes, params)` on the queue, 3 arguments; plane fields `Token`, `ResourceCount`,
+  `ppResources`, `pSrcViewRects`, `ColorSpace`; 2 planes for HDR + GameDVR; `params` carries
+  `ImmediateThresholdPercent`. `SuspendX(0)` and `ResumeX()` on the queue.
+- On the device: `SetFrameIntervalX` (4 args), `ScheduleFrameEventX` (4), `WaitFrameEventX` (5, returns a frame
+  token), `GetFrameStatisticsX` (4). Back buffers are committed resources with `ALLOW_DISPLAY`; DXGI is used
+  only for `IDXGIDevice1`→`GetAdapter`→`EnumOutputs`. No DXGI swapchain.
+
+Vtable slots, struct layouts and enum values are still **unmeasured**.
+
+§8.2 question 6 ("DXGI, `PresentX`, or both") is **partly answered**: public GDKX code presents through
+`PresentX` and frame events only. That the game does the same is a **hypothesis**; the game is not observed.
+The call site must still be found by tracing the queue vtable beyond the public chain, not by guessing a
+slot. The plan in [d3d12_vulkan.md §4.5](d3d12_vulkan.md) is now a `PresentX` + frame-event presenter first,
+with DXGI factory/adapter/output enumeration kept and the DXGI swapchain as fallback.
 
 The `DXGIX*` free functions are a separate question. If the game imports them from `d3d12_xs.dll`,
 Leonida's loader will report them as unimplemented; a Vulkan present-array implementation would
@@ -554,9 +568,9 @@ evidence.
 | #3 root signature → `s0..s31` | **still unknown** | Only flag names (`D3D12CONS_ROOT_SIGNATURE_FLAG_FORCE_MEMORY_BASED_ABI`, `_RAYTRACING`); no mapping. Leonida's own register-based/spill facts already go further. |
 | #4 descriptor bytes and increments | **still unknown** | No measured increment. `D3D12CONS_DESCRIPTOR_HEAP_TYPE_SAMPLER_UNBOUNDED` is a new name, not a size. |
 | #5 VA range / arena capacity | **still unknown** | — |
-| #6 DXGI vs `PresentX` | **described** | `PresentX` is a queue method; ≤2 planes, ≤8 views, four flag names. No signature, slot or call sequence. |
+| #6 DXGI vs `PresentX` | **described** | `PresentX` is a queue method; ≤2 planes, ≤8 views, four flag names. Public samples give the call sequence and argument counts (no DXGI swapchain; frame events + `PresentX`), see §7. No slot or layout; game itself not observed. |
 | #7 standard AS vs BVH builder | **still unknown** | New names: `D3D12ConsRehydrateRaytracingAccelerationStructure`, `D3D12CONS_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_DEHYDRATE`, `DispatchRaysX`, `DispatchRaysDimensionsX`. No layouts. |
-| #8 XDXR struct layouts | **still unknown** | — |
+| #8 XDXR struct layouts | **still unknown** | Nothing from SCARAB. Measured since from `XboxBvhBuilder.dll` itself, see [xdxr.md](xdxr.md). |
 | #9 tiled data layout / DCC | **described** | Flag, copy and state names; no values, no swizzle. |
 | #10 binning/DCC/VRS/WMMA usage | **described** | `D3D12CONS_PIPELINE_STATE_FLAG_DISABLE_AUTO_DPBB`, `_DISABLE_RB_PLUS`, `RSSetShadingRateX`; usage still unknown. |
 | #11 `CheckFeatureSupport` answers | **still unknown** | — |

@@ -3,7 +3,8 @@
     python -I tools/vk_subgroup_info.py          # prints one JSON line, exit 0 if a device answered, 1 if not
 
 make_game.py uses it to choose between native wave64 translation and --wave64-emulate. It talks to the system's
-Vulkan loader through ctypes (standard library only), so it works before the runtime stage has built anything.
+Vulkan implementation through ctypes (standard library only), so it works before the runtime stage has built anything.
+On macOS it opens MoltenVK directly, using the same LEONIDA_VULKAN_LOADER override as the C++ test tools.
 
 Device choice follows the runtime (runtime/shims/d3d12_vulkan_device.cpp): Vulkan 1.3 devices with dynamicRendering,
 synchronization2, timelineSemaphore and separateDepthStencilLayouts and a graphics queue family; a discrete GPU wins
@@ -12,9 +13,14 @@ that is not checked here. vk_pipeline_check picks by device type only, so on a P
 stage can run on another GPU than the one asked here. VK_LOADER_DRIVERS_SELECT (e.g. '*amd*') narrows which
 drivers the loader offers.
 
-native64 matches vk_pipeline_check's can_require_sg(64, bit) for the compute and the mesh stage: the
-subgroupSizeControl feature, minSubgroupSize <= 64 <= maxSubgroupSize, and the stage in requiredSubgroupSizeStages.
-Mesh shaders are always wave64 natively, so both stage bits are needed.
+native64 matches the current translated SPIR-V 1.5 modules, which do not allow varying subgroup sizes: either 64 can
+be required for both compute and mesh, or the default subgroupSize is 64 and subgroup operations are supported in
+both stages. SPIR-V 1.6 modules or stages created with ALLOW_VARYING_SUBGROUP_SIZE need a different check.
+
+per_vertex_inputs says whether the device can run a pixel shader with PerVertexKHR inputs (16-bit interpolation,
+docs/design.md): the fragmentShaderBarycentric feature, and a driver other than MoltenVK, whose SPIR-V to MSL
+conversion rejects the decoration ("PerVertexKHR decoration is not supported in MSL", MoltenVK 1.4.2). Where it is
+false, the shaders are translated with --f16-interp-fallback.
 """
 import ctypes
 import json
@@ -25,9 +31,15 @@ VK_STRUCTURE_TYPE_APPLICATION_INFO = 0
 VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO = 1
 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2 = 1000059000
 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2 = 1000059001
+VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES = 1000094000
 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES = 51
 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES = 53
 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES = 1000225000
+VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES = 1000196000
+VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_BARYCENTRIC_FEATURES_KHR = 1000203000
+VK_DRIVER_ID_MOLTENVK = 14
+DRIVER_PROPS_SIZE = 536     # sizeof(VkPhysicalDeviceDriverProperties): 16 + driverID + 2 x char[256] + version, padded
+BARY_FEATURES_SIZE = 24     # sizeof(VkPhysicalDeviceFragmentShaderBarycentricFeaturesKHR): 16 + one VkBool32
 VK_SHADER_STAGE_COMPUTE_BIT = 0x20
 VK_SHADER_STAGE_MESH_BIT_EXT = 0x80
 VK_QUEUE_GRAPHICS_BIT = 1
@@ -70,6 +82,12 @@ class SubgroupSizeControl(ctypes.Structure):
                 ("requiredSubgroupSizeStages", ctypes.c_uint32)]
 
 
+class SubgroupProperties(ctypes.Structure):
+    _fields_ = [("sType", ctypes.c_uint32), ("pNext", ctypes.c_void_p), ("subgroupSize", ctypes.c_uint32),
+                ("supportedStages", ctypes.c_uint32), ("supportedOperations", ctypes.c_uint32),
+                ("quadOperationsInAllStages", ctypes.c_uint32)]
+
+
 def block(size: int, stype: int):
     """A zeroed struct of `size` bytes with sType set (sType and pNext head every Vulkan struct used here)."""
     buf = ctypes.create_string_buffer(size)
@@ -86,7 +104,13 @@ def u32(buf, off: int) -> int:
 
 
 def load_vulkan():
-    names = ["vulkan-1.dll"] if os.name == "nt" else ["libvulkan.so.1", "libvulkan.1.dylib"]
+    if os.name == "nt":
+        names = ["vulkan-1.dll"]
+    elif sys.platform == "darwin":
+        override = os.environ.get("LEONIDA_VULKAN_LOADER")
+        names = [override] if override else ["libMoltenVK.dylib", "/opt/homebrew/lib/libMoltenVK.dylib"]
+    else:
+        names = ["libvulkan.so.1", "libvulkan.1.dylib"]
     for n in names:
         try:
             return ctypes.CDLL(n)
@@ -140,8 +164,13 @@ def query() -> dict:
         for d in devs:
             d = ctypes.c_void_p(d)
             sg = SubgroupSizeControl(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES)
+            subgroup = SubgroupProperties()
+            subgroup.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES
+            subgroup.pNext = ctypes.addressof(sg)
+            drv = block(DRIVER_PROPS_SIZE, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES)
+            sg.pNext = ctypes.addressof(drv)
             props = block(16 + PROPS_SIZE, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2)
-            ctypes.c_void_p.from_buffer(props, 8).value = ctypes.addressof(sg)
+            set_next(props, subgroup)
             vk.vkGetPhysicalDeviceProperties2(d, props)
             raw = bytes(props)[16:]
             if int.from_bytes(raw[PROPS_API_VERSION:PROPS_API_VERSION + 4], "little") < VK_API_VERSION_1_3:
@@ -149,6 +178,8 @@ def query() -> dict:
             f13 = block(F13_SIZE, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES)
             f12 = block(F12_SIZE, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES)
             set_next(f12, f13)
+            bary = block(BARY_FEATURES_SIZE, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_BARYCENTRIC_FEATURES_KHR)
+            set_next(f13, bary)
             f2 = block(FEATURES2_SIZE, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2)
             set_next(f2, f12)
             vk.vkGetPhysicalDeviceFeatures2(d, f2)
@@ -165,16 +196,32 @@ def query() -> dict:
             # the runtime's rule: the first usable device, replaced by every later discrete GPU
             if chosen is None or dtype == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU:
                 chosen = (raw[PROPS_DEVICE_NAME:PROPS_DEVICE_NAME + 256].split(b"\0")[0].decode("utf-8", "replace"),
-                          sg.minSubgroupSize, sg.maxSubgroupSize, sg.requiredSubgroupSizeStages,
-                          bool(u32(f13, F13_SUBGROUP_SIZE_CONTROL)))
+                          subgroup.subgroupSize, subgroup.supportedStages, sg.minSubgroupSize, sg.maxSubgroupSize,
+                          sg.requiredSubgroupSizeStages, bool(u32(f13, F13_SUBGROUP_SIZE_CONTROL)),
+                          bool(u32(bary, 16)) and u32(drv, 16) != VK_DRIVER_ID_MOLTENVK)
         if chosen is None:
             raise RuntimeError("no Vulkan 1.3 GPU with the features and graphics queue the runtime needs")
-        name, lo, hi, stages, sgc = chosen
-        comp = bool(stages & VK_SHADER_STAGE_COMPUTE_BIT)
-        mesh = bool(stages & VK_SHADER_STAGE_MESH_BIT_EXT)
-        return {"device": name, "min_subgroup_size": lo, "max_subgroup_size": hi,
-                "subgroup_size_control": sgc, "compute_in_required_stages": comp, "mesh_in_required_stages": mesh,
-                "native64": sgc and lo <= 64 <= hi and comp and mesh}
+        name, subgroup_size, supported_stages, lo, hi, required_stages, sgc, per_vertex = chosen
+        compute_required = bool(required_stages & VK_SHADER_STAGE_COMPUTE_BIT)
+        mesh_required = bool(required_stages & VK_SHADER_STAGE_MESH_BIT_EXT)
+        compute_supported = bool(supported_stages & VK_SHADER_STAGE_COMPUTE_BIT)
+        mesh_supported = bool(supported_stages & VK_SHADER_STAGE_MESH_BIT_EXT)
+        can_require_64 = (sgc and lo <= 64 <= hi and compute_required and mesh_required and
+                          compute_supported and mesh_supported)
+        has_default_64 = subgroup_size == 64 and compute_supported and mesh_supported
+        return {
+            "device": name,
+            "subgroup_size": subgroup_size,
+            "min_subgroup_size": lo,
+            "max_subgroup_size": hi,
+            "subgroup_size_control": sgc,
+            "compute_in_required_stages": compute_required,
+            "mesh_in_required_stages": mesh_required,
+            "compute_in_supported_stages": compute_supported,
+            "mesh_in_supported_stages": mesh_supported,
+            "native64": bool(can_require_64 or has_default_64),
+            "per_vertex_inputs": per_vertex,
+        }
     finally:
         vk.vkDestroyInstance(inst, None)
 
@@ -189,4 +236,8 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    try:  # a redirected stdout is strict ANSI code page under -I; write '?' for what it cannot encode
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
     sys.exit(main())

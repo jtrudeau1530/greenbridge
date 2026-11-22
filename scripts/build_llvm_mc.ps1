@@ -6,14 +6,28 @@
 #
 #   powershell -ExecutionPolicy Bypass -File scripts\build_llvm_mc.ps1
 #   powershell -ExecutionPolicy Bypass -File scripts\build_llvm_mc.ps1 -Dest D:\tools\llvm-mc -NoEnv
+#
+# The default -Dest is outside AppData on purpose: `python` from the Python install manager (the app execution alias
+# in WindowsApps) doesn't see folders that other programs create under %LOCALAPPDATA% or %APPDATA%, so an llvm-mc.exe
+# there looks missing to make_game.py and the tools, although LLVM_MC names it.
 param(
     [string]$Version = "21.1.8",
-    [string]$Dest = (Join-Path $env:LOCALAPPDATA "Leonida\llvm-mc"),
+    [string]$Dest = (Join-Path $env:USERPROFILE ".leonida\llvm-mc"),
     [string]$Temp = (Join-Path $env:TEMP "leonida-llvm-mc"),
     [switch]$NoEnv,   # don't set LLVM_MC for the current user
     [switch]$Keep     # keep the sources and build folder (faster rebuilds)
 )
 $ErrorActionPreference = "Stop"
+
+if (-not $Keep) {
+    # Compare directory boundaries, including when the paths do not exist yet.
+    $paths = $ExecutionContext.SessionState.Path
+    $tempDir = [IO.Path]::GetFullPath($paths.GetUnresolvedProviderPathFromPSPath($Temp)).TrimEnd('\') + '\'
+    $destDir = [IO.Path]::GetFullPath($paths.GetUnresolvedProviderPathFromPSPath($Dest)).TrimEnd('\') + '\'
+    if ($destDir.StartsWith($tempDir, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "Cleanup would delete the installation. Choose a -Dest outside -Temp or use -Keep."
+    }
+}
 
 foreach ($t in "git", "python") {
     if (-not (Get-Command $t -ErrorAction SilentlyContinue)) { throw "$t wasn't found on PATH." }
@@ -74,7 +88,13 @@ if ($LASTEXITCODE -ne 0 -or -not ($probe -match "s_endpgm")) { throw "the built 
 New-Item -ItemType Directory -Force $Dest | Out-Null
 $final = Join-Path $Dest "llvm-mc.exe"
 Copy-Item -Force $exe $final
-if (-not $Keep) { Remove-Item -Recurse -Force $Temp }
+if (-not $Keep) {
+    try {
+        Remove-Item -LiteralPath $Temp -Recurse -Force
+    } catch {
+        Write-Warning "Installed $final, but cleanup of '$Temp' failed: $($_.Exception.Message)"
+    }
+}
 if (-not $NoEnv) {
     [Environment]::SetEnvironmentVariable("LLVM_MC", $final, "User")
     Write-Host "LLVM_MC set for this user (open a new terminal to pick it up)."

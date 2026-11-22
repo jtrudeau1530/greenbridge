@@ -4,6 +4,7 @@
 
 Everything is synthetic: a hand-built RPF9 header, zlib streams and a fake page. No game data is used.
 """
+import importlib.util
 import json
 import os
 import struct
@@ -11,12 +12,20 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 import zlib
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOL = os.path.join(ROOT, "tools", "navmesh_index.py")
 KEY = 0x8A2D3FF3DF663960
 FIELD68 = 141492
+
+
+def load_tool_module():
+    spec = importlib.util.spec_from_file_location("navmesh_index_under_test", TOOL)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def page(version=122, pages=3, key=KEY, field68=FIELD68):
@@ -109,6 +118,79 @@ class NavmeshIndexTest(unittest.TestCase):
         self.assertIsNone(row["stored"])
         self.assertEqual(row["size"], 0x80)
 
+    def test_out_and_csv_in_missing_folders_are_created(self):
+        # Before: write_outputs opened both paths directly, so a missing folder ended a finished scan in a
+        # FileNotFoundError traceback and lost the index.
+        folder = os.path.join(self.root, "carve")
+        os.makedirs(folder)
+        with open(os.path.join(folder, "page.bin"), "wb") as f:
+            f.write(page(pages=5))
+        out = os.path.join(self.root, "no", "such", "index.json")
+        csv_path = os.path.join(self.root, "also", "missing", "index.csv")
+        self.run_tool(folder, "--out", out, "--csv", csv_path, "--pattern", "*.bin")
+        with open(out, encoding="utf-8") as f:
+            doc = json.load(f)
+        self.assertEqual(doc["summary"]["page_counts"], {"5": 1})
+        with open(csv_path, encoding="utf-8") as f:
+            lines = f.read().splitlines()
+        self.assertEqual(len(lines), 2)
+        self.assertIn("0DRP@16", lines[1])
+
+    def assert_output_collision(self, *args):
+        r = subprocess.run([sys.executable, "-I", TOOL, *args], cwd=self.root, capture_output=True, text=True)
+        self.assertEqual(r.returncode, 2, r.stderr)
+        self.assertIn("--out and --csv must refer to different files", r.stderr)
+
+    def test_explicit_output_collision_before_scan(self):
+        # A missing input would give a different error if the scan started.
+        self.assert_output_collision("missing.rpf", "--out", "new.json", "--csv", "./new.json")
+        self.assertFalse(os.path.exists(os.path.join(self.root, "new.json")))
+
+    def test_default_output_collision_preserves_report(self):
+        make_rpf(os.path.join(self.root, "nav.rpf"))
+        report = os.path.join(self.root, "nav.navmesh-index.json")
+        with open(report, "wb") as f:
+            f.write(b"previous report")
+        self.assert_output_collision("nav.rpf", "--csv", report)
+        with open(report, "rb") as f:
+            self.assertEqual(f.read(), b"previous report")
+
+    def test_hard_link_output_collision(self):
+        report = os.path.join(self.root, "out.json")
+        with open(report, "wb") as f:
+            f.write(b"previous report")
+        try:
+            os.link(report, os.path.join(self.root, "out.csv"))
+        except OSError as exc:
+            self.skipTest(f"cannot create a hard link: {exc}")
+        self.assert_output_collision(self.root, "--out", "out.json", "--csv", "out.csv")
+        with open(report, "rb") as f:
+            self.assertEqual(f.read(), b"previous report")
+
+    def test_report_path_cannot_be_scanned_input(self):
+        # Before: --out/--csv naming a file the scan reads replaced that file with the report, exit 0.
+        folder = os.path.join(self.root, "carve")
+        os.makedirs(folder)
+        carved = os.path.join(folder, "page.bin")
+        with open(carved, "wb") as f:
+            f.write(page(pages=4))
+        rpf = os.path.join(self.root, "nav.rpf")
+        make_rpf(rpf)
+        originals = {}
+        for path in (carved, rpf):
+            with open(path, "rb") as f:
+                originals[path] = f.read()
+        cases = [((folder, "--out", carved), carved), ((folder, "--csv", carved), carved),
+                 ((rpf, "--out", rpf), rpf), ((rpf, "--csv", rpf), rpf)]
+        for args, path in cases:
+            r = subprocess.run([sys.executable, "-I", TOOL, *args], cwd=ROOT, capture_output=True, text=True,
+                               check=False)
+            self.assertEqual(r.returncode, 2, r.stderr)
+            self.assertIn("would overwrite the input", r.stderr)
+            self.assertNotIn("Traceback", r.stderr)
+            with open(path, "rb") as f:
+                self.assertEqual(f.read(), originals[path], f"{args} touched the input")
+
     def test_not_an_rpf(self):
         path = os.path.join(self.root, "not.rpf")
         with open(path, "wb") as f:
@@ -127,6 +209,133 @@ class NavmeshIndexTest(unittest.TestCase):
                                cwd=ROOT, capture_output=True, text=True)
             self.assertEqual(r.returncode, 2, r.stderr)
             self.assertFalse(os.path.exists(out))
+
+    def test_directory_refuses_start_and_limit(self):
+        folder = os.path.join(self.root, "carve")
+        os.makedirs(folder)
+        with open(os.path.join(folder, "page.bin"), "wb") as f:
+            f.write(page())
+        for extra in (("--start", "0"), ("--limit", "128"), ("--start", "0", "--limit", "128")):
+            out = os.path.join(self.root, "dir_bad.json")
+            r = subprocess.run([sys.executable, "-I", TOOL, folder, "--out", out, *extra],
+                               cwd=ROOT, capture_output=True, text=True)
+            self.assertEqual(r.returncode, 2, r.stderr)
+            self.assertIn("--start and --limit apply to a single archive, not a directory", r.stderr)
+            self.assertFalse(os.path.exists(out))
+
+    def test_archive_refuses_pattern(self):
+        rpf = os.path.join(self.root, "nav.rpf")
+        make_rpf(rpf)
+        for pat in ("*.bin", "*.dat"):
+            out = os.path.join(self.root, "rpf_bad.json")
+            r = subprocess.run([sys.executable, "-I", TOOL, rpf, "--out", out, "--pattern", pat],
+                               cwd=ROOT, capture_output=True, text=True)
+            self.assertEqual(r.returncode, 2, r.stderr)
+            self.assertIn("--pattern applies to a directory, not an archive", r.stderr)
+            self.assertFalse(os.path.exists(out))
+
+    def test_scan_archive_closes_mmap_on_success(self):
+        mod = load_tool_module()
+        rpf = os.path.join(self.root, "close_ok.rpf")
+        make_rpf(rpf)
+        real_mmap = mod.mmap.mmap
+        created = []
+
+        def tracking_mmap(*args, **kwargs):
+            m = real_mmap(*args, **kwargs)
+            created.append(m)
+            return m
+
+        try:
+            with mock.patch.object(mod.mmap, "mmap", side_effect=tracking_mmap):
+                rows, summary = mod.scan_archive(rpf)
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(summary["matched"], 1)
+            self.assertEqual(len(created), 1)
+            self.assertTrue(created[0].closed)
+            os.remove(rpf)
+            self.assertFalse(os.path.exists(rpf))
+        finally:
+            for m in created:
+                if not m.closed:
+                    m.close()
+
+    def test_scan_archive_closes_mmap_on_start_out_of_range(self):
+        mod = load_tool_module()
+        rpf = os.path.join(self.root, "close_err.rpf")
+        make_rpf(rpf)
+        size = os.path.getsize(rpf)
+        real_mmap = mod.mmap.mmap
+        created = []
+
+        def tracking_mmap(*args, **kwargs):
+            m = real_mmap(*args, **kwargs)
+            created.append(m)
+            return m
+
+        try:
+            with mock.patch.object(mod.mmap, "mmap", side_effect=tracking_mmap):
+                with self.assertRaises(SystemExit):
+                    mod.scan_archive(rpf, start=size)
+            self.assertEqual(len(created), 1)
+            self.assertTrue(created[0].closed)
+            os.remove(rpf)
+            self.assertFalse(os.path.exists(rpf))
+        finally:
+            for m in created:
+                if not m.closed:
+                    m.close()
+
+
+class MissingInputTest(unittest.TestCase):
+    def test_missing_input_is_a_message_not_a_traceback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "n.json")
+            p = subprocess.run([sys.executable, "-I", TOOL, os.path.join(tmp, "missing.rpf"), "--out", out],
+                               capture_output=True, text=True, timeout=60)
+            self.assertEqual(p.returncode, 1, p.stderr)
+            self.assertIn("missing.rpf", p.stderr)
+            self.assertNotIn("Traceback", p.stderr)
+            self.assertFalse(os.path.exists(out))
+
+
+class LimitWindowTest(unittest.TestCase):
+    """--limit must bound the bytes read, not just where signatures are searched."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.rpf = os.path.join(self.tmp.name, "window.rpf")
+        self.streams = make_rpf(self.rpf)
+        self.mod = load_tool_module()
+
+    def summary(self, limit):
+        _rows, summary = self.mod.scan_archive(self.rpf, limit=limit)
+        self.assertLessEqual(summary["compressed_bytes"], summary["span"])
+        self.assertLessEqual(summary["readable_fraction"], 1.0)
+        self.assertEqual(summary["compressed_bytes"] + summary["zero_padding"] + summary["unread_bytes"],
+                         summary["span"])
+        return summary
+
+    def test_stream_crossing_the_limit_is_not_counted(self):
+        # The zlib header is inside the window but its body is not: counting it would make the
+        # compressed bytes exceed the span and readable_fraction greater than 1.
+        summary = self.summary(10)
+        self.assertEqual(summary["span"], 10)
+        self.assertEqual(summary["streams"], 0)
+        self.assertEqual(summary["compressed_bytes"], 0)
+
+    def test_stream_ending_at_the_limit_is_counted(self):
+        summary = self.summary(len(self.streams[0]))
+        self.assertEqual(summary["span"], len(self.streams[0]))
+        self.assertEqual(summary["streams"], 1)
+        self.assertEqual(summary["compressed_bytes"], len(self.streams[0]))
+        self.assertEqual(summary["readable_fraction"], 1.0)
+
+    def test_window_too_short_for_a_signature_has_no_streams(self):
+        summary = self.summary(1)
+        self.assertEqual(summary["streams"], 0)
+        self.assertEqual(summary["span"], 1)
 
 
 if __name__ == "__main__":

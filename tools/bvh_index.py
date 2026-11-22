@@ -19,6 +19,11 @@ Usage:
     python -I tools/bvh_index.py <archive.rpf> [--out index.json] [--csv index.csv]
                                  [--start N] [--limit BYTES] [--max-inflate BYTES]
     python -I tools/bvh_index.py <dir-with-rpf-or-bin> [--out index.json] [--csv index.csv]
+                                 [--max-inflate BYTES]
+
+--start and --limit apply to a single archive only; with a directory they are an error (exit 2).
+--max-inflate applies to every .rpf in the directory.
+Archive rows include a fill histogram only when the complete node range was kept.
 
 Exit status is 0 even when nothing is found; the summary says how many streams were read.
 """
@@ -60,8 +65,9 @@ def below_normal():
 def decode_node_pointer(value):
     """Decode the low three type bits and the high 29-bit 64-byte node index."""
     typ = value & 7
+    invalid = value == INVALID_NODE
     return {"ptr": value, "index": value >> 3, "type": typ,
-            "name": NODE_TYPE_NAMES.get(typ, "invalid"), "invalid": value == INVALID_NODE}
+            "name": "invalid" if invalid else NODE_TYPE_NAMES[typ], "invalid": invalid}
 
 
 def parse_header(head):
@@ -95,6 +101,7 @@ def parse_header(head):
         "root_node_index": root_ptr["index"],
         "root_node_type": root_ptr["type"],
         "root_node_type_name": root_ptr["name"],
+        "root_node_invalid": root_ptr["invalid"],
         "offset_to_elements": struct.unpack_from("<I", head, 0x134)[0],
         "offset_to_parents": struct.unpack_from("<I", head, 0x138)[0],
         "compression_params": struct.unpack_from("<I", head, 0x13C)[0],
@@ -157,6 +164,7 @@ def classify(head, size, tail=None):
                           root_node_index=hdr["root_node_index"],
                           root_node_type=hdr["root_node_type"],
                           root_node_type_name=hdr["root_node_type_name"],
+                          root_node_invalid=hdr["root_node_invalid"],
                           offset_to_elements=hdr["offset_to_elements"],
                           offset_to_parents=hdr["offset_to_parents"],
                           compression_params=hdr["compression_params"],
@@ -188,7 +196,7 @@ def inflate_stream(m, s, size, max_inflate):
 
     try:
         while not d.eof and p < size:
-            chunk = m[p:p + (1 << 20)]
+            chunk = m[p:min(p + (1 << 20), size)]   # size is the scan window's end
             if not chunk:
                 break
             take(d.decompress(chunk))
@@ -211,7 +219,7 @@ def _count_stream(m, s, size):
     d = zlib.decompressobj()
     total, p = 0, s
     while not d.eof and p < size:
-        chunk = m[p:p + (1 << 20)]
+        chunk = m[p:min(p + (1 << 20), size)]
         if not chunk:
             break
         total += len(d.decompress(chunk))
@@ -247,7 +255,9 @@ def scan_rpf(path, start=None, limit=None, max_inflate=1 << 28):
                 if not mt:
                     break
                 s = mt.start()
-                got = inflate_stream(m, s, size, max_inflate)
+                # Bounded by the scan window (the archive without --limit): a stream that runs past it is left out,
+                # so readable + zero + unread add up to the span, as in story_index (#712).
+                got = inflate_stream(m, s, end, max_inflate)
                 if got is None:
                     pos = s + 1
                     continue
@@ -259,7 +269,7 @@ def scan_rpf(path, start=None, limit=None, max_inflate=1 << 28):
                     unread += len(gap)
                 row = classify(head, total, kept[-HEAD:] if len(kept) >= HEAD else kept)
                 row.update(source=path, offset=s, stored=used, size=total)
-                if row["kind"] in ("bvh4", "bvh4-chunk") and row["declared_bytes"] <= total:
+                if row["kind"] in ("bvh4", "bvh4-chunk") and row["declared_bytes"] <= len(kept):
                     body = kept[HEAD:HEAD + row["node_count"] * 64]
                     row["fill"] = {("%02x" % b): body.count(bytes([b])) for b in FILL_BYTES if body.count(bytes([b]))}
                     row["fill"]["total"] = len(body)
@@ -292,13 +302,13 @@ def summarize(rows, source, span, zero, unread, elapsed):
             "elapsed_s": round(elapsed, 2)}
 
 
-def scan_dir(path):
+def scan_dir(path, max_inflate=1 << 28):
     rpfs = sorted(glob.glob(os.path.join(path, "**", "*.rpf"), recursive=True))
     rows, summaries = [], []
     if rpfs:
         for p in rpfs:
             try:
-                r, s = scan_rpf(p)
+                r, s = scan_rpf(p, max_inflate=max_inflate)
             except (OSError, ValueError) as e:   # one unreadable archive should not lose the others
                 print(f"{p}: skipped ({e})", file=sys.stderr)
                 continue
@@ -328,16 +338,27 @@ def scan_dir(path):
     return rows, [summary]
 
 
+def _make_parent(path):
+    """Create the folder a report lives in: the scan is over by the time we write, so a missing
+    folder used to end the run in a FileNotFoundError and lose the result."""
+    parent = os.path.dirname(os.path.abspath(path))
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
+
 def write_outputs(rows, summaries, out, csv_path):
     if out:
+        _make_parent(out)
         payload = summaries if len(summaries) > 1 else (summaries[0] if summaries else {})
         with open(out, "w", encoding="utf-8") as f:
             json.dump({"summary": payload, "streams": rows}, f, indent=0)
     if csv_path:
+        _make_parent(csv_path)
         cols = ["source", "offset", "stored", "size", "kind", "signature", "version", "node_count",
                 "node_bytes", "declared_bytes", "tail_offset", "flags", "crc32", "num_elements",
                 "offset_to_nodes", "offset_to_prim_remap", "root_node_ptr", "root_node_index",
-                "root_node_type", "root_node_type_name", "offset_to_elements", "offset_to_parents",
+                "root_node_type", "root_node_type_name", "root_node_invalid", "offset_to_elements",
+                "offset_to_parents",
                 "compression_params", "dehydrated", "chunked", "bounds_min", "bounds_max",
                 "hash", "off_a0", "hi16", "lo16", "desc_word", "fragment"]
         with open(csv_path, "w", newline="", encoding="utf-8") as f:
@@ -373,6 +394,15 @@ def offset(text):
     return value
 
 
+def same_output_path(first, second):
+    if os.path.normcase(os.path.realpath(first)) == os.path.normcase(os.path.realpath(second)):
+        return True
+    try:
+        return os.path.samefile(first, second)
+    except OSError:
+        return False
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("target", help="RPF9 archive or a directory of .rpf/.bin payloads")
@@ -383,9 +413,34 @@ def main(argv=None):
     ap.add_argument("--max-inflate", type=byte_count, default=1 << 28,
                     help="keep at most this many bytes of one stream")
     a = ap.parse_args(argv)
+    if a.out and a.csv and same_output_path(a.out, a.csv):
+        ap.error("--out and --csv must use different paths")
+    if a.out and same_output_path(a.target, a.out):
+        ap.error("--out must not overwrite the source")
+    if a.csv and same_output_path(a.target, a.csv):
+        ap.error("--csv must not overwrite the source")
+    for flag, path in (("--out", a.out), ("--csv", a.csv)):
+        if path and os.path.isdir(path):
+            ap.error(f"{flag} is a folder, not a report file: {path}")
+    if os.path.isdir(a.target):
+        manifest = os.path.join(a.target, "index.json")
+        for flag, path in (("--out", a.out), ("--csv", a.csv)):
+            if not path:
+                continue
+            if os.path.isfile(manifest) and same_output_path(path, manifest):
+                ap.error(f"{flag} would overwrite the carve manifest: {path}")
+            if os.path.isfile(path):
+                for root, _dirs, names in os.walk(a.target):
+                    for name in names:
+                        if name.lower().endswith((".json", ".csv")):
+                            continue
+                        if same_output_path(os.path.join(root, name), path):
+                            ap.error(f"{flag} would overwrite an input file: {path}")
+    if os.path.isdir(a.target) and (a.start is not None or a.limit is not None):
+        ap.error("--start and --limit apply to a single archive, not a directory")
     below_normal()
     if os.path.isdir(a.target):
-        rows, summaries = scan_dir(a.target)
+        rows, summaries = scan_dir(a.target, a.max_inflate)
     else:
         try:
             rows, summaries = scan_rpf(a.target, a.start, a.limit, a.max_inflate)
@@ -401,4 +456,8 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
+    try:  # a redirected stdout is strict ANSI code page under -I; write '?' for what it cannot encode
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
     sys.exit(main())

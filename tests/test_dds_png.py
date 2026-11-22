@@ -68,6 +68,171 @@ def bc4_block(v0, v1, indices, base=0):
     return struct.pack("<BB", v0, v1) + indices.to_bytes(6, "little")
 
 
+# BC7 vectors are hand-assembled from the Microsoft BC7 format mode reference and
+# the Khronos BPTC specification. Expected values are worked out by hand from the
+# spec formulas (endpoint MSB replication, weights, (a*(64-w)+b*w+32)>>6); the
+# 0-to-255 ramps below are those interpolations for each weight table.
+RAMP2 = (0, 84, 171, 255)
+RAMP3 = (0, 36, 72, 108, 147, 183, 219, 255)
+RAMP4 = (0, 16, 36, 52, 68, 84, 104, 120, 135, 151, 171, 187, 203, 219, 239, 255)
+
+
+def bc7_block(*fields):
+    """Pack (value, bit_width) fields LSB-first into one 128-bit BC7 block."""
+    packed = 0
+    pos = 0
+    for value, width in fields:
+        assert 0 <= value < (1 << width), (value, width)
+        packed |= value << pos
+        pos += width
+    assert pos == 128, pos
+    return packed.to_bytes(16, "little")
+
+
+def bc7_mode(mode):
+    """The mode field: `mode` zero bits, then a one bit."""
+    return (1 << mode, mode + 1)
+
+
+def bc7_values(values, width):
+    return [(v, width) for v in values]
+
+
+def bc7_indices(indices, width, anchors):
+    """Per-pixel index fields; anchor pixels drop their implicit zero MSB."""
+    return [(v, width - 1 if p in anchors else width) for p, v in enumerate(indices)]
+
+
+def gray(v, a=255):
+    return (v, v, v, a)
+
+
+# Mode 0, partition 0 (subsets 0011/0011/0221/2222, anchors 0, 3, 15), 4-bit RGB
+# endpoints plus one p-bit each. Subset 0 is a black-to-white ramp; subsets 1 and
+# 2 are flat (8, 4, 2) with p-bit 1 -> 5-bit (17, 9, 5) and p-bit 0 -> (16, 8, 4).
+BC7_MODE0 = bc7_block(
+    bc7_mode(0), (0, 4),
+    *bc7_values([0, 15, 8, 8, 8, 8], 4),
+    *bc7_values([0, 15, 4, 4, 4, 4], 4),
+    *bc7_values([0, 15, 2, 2, 2, 2], 4),
+    *bc7_values([0, 1, 1, 1, 0, 0], 1),
+    *bc7_indices([3, 7, 5, 3, 1, 4, 5, 5, 6, 5, 5, 5, 5, 5, 5, 3], 3, (0, 3, 15)),
+)
+BC7_MODE0_PIXELS = [
+    gray(108), gray(255), (140, 74, 41, 255), (140, 74, 41, 255),
+    gray(36), gray(147), (140, 74, 41, 255), (140, 74, 41, 255),
+    gray(219), (132, 66, 33, 255), (132, 66, 33, 255), (140, 74, 41, 255),
+    (132, 66, 33, 255), (132, 66, 33, 255), (132, 66, 33, 255), (132, 66, 33, 255),
+]
+
+# Mode 1, partition 17 (subset 1 = pixels 1, 2, 3, 7; anchors 0, 2), 6-bit RGB and
+# one shared p-bit per subset. Subset 0 is flat (32, 16, 8) + p 1 -> 7-bit
+# (65, 33, 17) -> (131, 66, 34). Subset 1 runs red -> green with p 0: 63 -> 126 -> 253.
+BC7_MODE1 = bc7_block(
+    bc7_mode(1), (17, 6),
+    *bc7_values([32, 32, 63, 0], 6),
+    *bc7_values([16, 16, 0, 63], 6),
+    *bc7_values([8, 8, 0, 0], 6),
+    *bc7_values([1, 0], 1),
+    *bc7_indices([2, 0, 3, 4, 6, 6, 6, 7, 6, 6, 6, 6, 6, 6, 6, 6], 3, (0, 2)),
+)
+BC7_MODE1_PIXELS = [
+    (131, 66, 34, 255), (253, 0, 0, 255), (146, 107, 0, 255), (107, 146, 0, 255),
+    (131, 66, 34, 255), (131, 66, 34, 255), (131, 66, 34, 255), (0, 253, 0, 255),
+] + [(131, 66, 34, 255)] * 8
+
+# Mode 2, partition 11 (columns 0, 0, 1, 2; anchors 0, 6, 15), 5-bit RGB, no
+# p-bits. Subset 0 is a gray ramp, subset 1 flat (16, 8, 4) -> (132, 66, 33),
+# subset 2 runs red -> blue.
+BC7_MODE2 = bc7_block(
+    bc7_mode(2), (11, 6),
+    *bc7_values([0, 31, 16, 16, 31, 0], 5),
+    *bc7_values([0, 31, 8, 8, 0, 0], 5),
+    *bc7_values([0, 31, 4, 4, 0, 31], 5),
+    *bc7_indices([1, 2, 3, 0, 3, 0, 1, 1, 0, 0, 2, 2, 0, 0, 3, 1], 2, (0, 6, 15)),
+)
+BC7_MODE2_PIXELS = [
+    gray(84), gray(171), (132, 66, 33, 255), (255, 0, 0, 255),
+    gray(255), gray(0), (132, 66, 33, 255), (171, 0, 84, 255),
+    gray(0), gray(0), (132, 66, 33, 255), (84, 0, 171, 255),
+    gray(0), gray(0), (132, 66, 33, 255), (171, 0, 84, 255),
+]
+
+# Mode 3, partition 18 (subset 1 = pixels 8, 12, 13, 14; anchors 0, 8), 7-bit RGB
+# plus one p-bit per endpoint: subset 1 endpoints (64, 32, 16) become
+# (128, 64, 32) with p 0 and (129, 65, 33) with p 1.
+BC7_MODE3 = bc7_block(
+    bc7_mode(3), (18, 6),
+    *bc7_values([0, 127, 64, 64], 7),
+    *bc7_values([0, 127, 32, 32], 7),
+    *bc7_values([0, 127, 16, 16], 7),
+    *bc7_values([0, 1, 0, 1], 1),
+    *bc7_indices([1, 2, 3, 0, 0, 0, 0, 0, 1, 0, 0, 0, 3, 0, 2, 3], 2, (0, 8)),
+)
+BC7_MODE3_PIXELS = [
+    gray(84), gray(171), gray(255), gray(0),
+    gray(0), gray(0), gray(0), gray(0),
+    (128, 64, 32, 255), gray(0), gray(0), gray(0),
+    (129, 65, 33, 255), (128, 64, 32, 255), (129, 65, 33, 255), gray(255),
+]
+
+
+def bc7_mode4(rotation, selector):
+    """Mode 4: gray 5-bit colour ramp, 6-bit alpha 255 -> 0, 2-bit then 3-bit indices."""
+    return bc7_block(
+        bc7_mode(4), (rotation, 2), (selector, 1),
+        *bc7_values([0, 31], 5), *bc7_values([0, 31], 5), *bc7_values([0, 31], 5),
+        *bc7_values([63, 0], 6),
+        *bc7_indices([p % 4 for p in range(16)], 2, (0,)),
+        *bc7_indices([p % 8 for p in range(16)], 3, (0,)),
+    )
+
+
+# Mode 5, rotation 2 (swap G and A): 7-bit colour (127, 0..127, 64) -> (255, ramp,
+# 129), 8-bit alpha 10 -> 250, colour indices by column, alpha indices by row.
+BC7_MODE5 = bc7_block(
+    bc7_mode(5), (2, 2),
+    *bc7_values([127, 127], 7), *bc7_values([0, 127], 7), *bc7_values([64, 64], 7),
+    *bc7_values([10, 250], 8),
+    *bc7_indices([p % 4 for p in range(16)], 2, (0,)),
+    *bc7_indices([p // 4 for p in range(16)], 2, (0,)),
+)
+BC7_MODE5_PIXELS = [
+    (255, (10, 89, 171, 250)[p // 4], 129, RAMP2[p % 4]) for p in range(16)
+]
+
+# Mode 6: 7-bit RGBA plus p-bits 0 / 1, so endpoints are R 0 / 255, G 254 / 1,
+# B 128 / 129, A 254 / 255. Pixel p uses 4-bit index p.
+BC7_MODE6 = bc7_block(
+    bc7_mode(6),
+    *bc7_values([0, 127], 7), *bc7_values([127, 0], 7),
+    *bc7_values([64, 64], 7), *bc7_values([127, 127], 7),
+    *bc7_values([0, 1], 1),
+    *bc7_indices(list(range(16)), 4, (0,)),
+)
+
+# Mode 7, partition 0 (columns 0, 0, 1, 1; anchors 0, 15), 5-bit RGBA plus p-bits.
+# Subset 0 ramps every channel 0 -> 255; subset 1 is flat (16, 8, 4, 2) + p 1 ->
+# 6-bit (33, 17, 9, 5) -> (134, 69, 36, 20), so the p-bit reaches alpha too.
+BC7_MODE7 = bc7_block(
+    bc7_mode(7), (0, 6),
+    *bc7_values([0, 31, 16, 16], 5), *bc7_values([0, 31, 8, 8], 5),
+    *bc7_values([0, 31, 4, 4], 5), *bc7_values([0, 31, 2, 2], 5),
+    *bc7_values([0, 1, 1, 1], 1),
+    *bc7_indices([1, 2, 3, 3, 3, 0, 2, 1, 0, 0, 1, 1, 0, 0, 2, 0], 2, (0, 15)),
+)
+BC7_MODE7_PIXELS = [
+    gray(84, 84), gray(171, 171), (134, 69, 36, 20), (134, 69, 36, 20),
+    gray(255, 255), gray(0, 0), (134, 69, 36, 20), (134, 69, 36, 20),
+    gray(0, 0), gray(0, 0), (134, 69, 36, 20), (134, 69, 36, 20),
+    gray(0, 0), gray(0, 0), (134, 69, 36, 20), (134, 69, 36, 20),
+]
+
+
+def bc7_dds(width, height, payload, dxgi=98):
+    return dds_buffer(width, height, payload, flags=DDPF_FOURCC, fourcc=b"DX10", dxgi=dxgi)
+
+
 def pixel(rgba, width, x, y):
     start = (y * width + x) * 4
     return tuple(rgba[start:start + 4])
@@ -205,10 +370,20 @@ class HeaderTests(unittest.TestCase):
         self.assertIn("DX10", str(ctx.exception))
 
     def test_rejects_unknown_dxgi_format(self):
-        # 98 is BC7_UNORM, which this decoder deliberately does not claim.
-        with self.assertRaises(dds.DdsError) as ctx:
-            dds.parse_dds_header(dds_buffer(4, 4, flags=DDPF_FOURCC, fourcc=b"DX10", dxgi=98))
-        self.assertIn("98", str(ctx.exception))
+        # 94-96 are BC6H typeless/UF16/SF16, which this decoder deliberately does not claim.
+        for dxgi in (94, 95, 96):
+            with self.subTest(dxgi=dxgi):
+                with self.assertRaises(dds.DdsError) as ctx:
+                    dds.parse_dds_header(dds_buffer(4, 4, flags=DDPF_FOURCC, fourcc=b"DX10", dxgi=dxgi))
+                self.assertIn(str(dxgi), str(ctx.exception))
+
+    def test_bc7_dxgi_aliases(self):
+        for dxgi in (97, 98, 99):
+            with self.subTest(dxgi=dxgi):
+                info = dds.parse_dds_header(dds_buffer(4, 4, flags=DDPF_FOURCC, fourcc=b"DX10", dxgi=dxgi))
+                self.assertEqual(info["format"], "BC7")
+                self.assertEqual(info["dxgi_format"], dxgi)
+                self.assertEqual(info["data_offset"], 148)
 
     def test_rejects_non_contiguous_mask(self):
         with self.assertRaises(dds.DdsError) as ctx:
@@ -454,6 +629,85 @@ class Bc5Tests(unittest.TestCase):
         self.assertEqual([p[3] for p in pixels(rgba)], [255, 255])
 
 
+class Bc7Tests(unittest.TestCase):
+    def decode(self, payload, width=4, height=4, dxgi=98):
+        w, h, rgba = dds.decode_dds(bc7_dds(width, height, payload, dxgi))
+        self.assertEqual((w, h), (width, height))
+        self.assertEqual(len(rgba), width * height * 4)
+        return pixels(rgba)
+
+    def test_partitioned_modes(self):
+        cases = {
+            0: (BC7_MODE0, BC7_MODE0_PIXELS),
+            1: (BC7_MODE1, BC7_MODE1_PIXELS),
+            2: (BC7_MODE2, BC7_MODE2_PIXELS),
+            3: (BC7_MODE3, BC7_MODE3_PIXELS),
+            7: (BC7_MODE7, BC7_MODE7_PIXELS),
+        }
+        for mode, (block, expected) in cases.items():
+            with self.subTest(mode=mode):
+                self.assertEqual(self.decode(block), expected)
+
+    def test_mode4_index_selector_and_rotation(self):
+        # Selector 0: colour takes the 2-bit indices, alpha (255 -> 0) the 3-bit ones.
+        self.assertEqual(
+            self.decode(bc7_mode4(rotation=0, selector=0)),
+            [gray(RAMP2[p % 4], RAMP3[7 - p % 8]) for p in range(16)],
+        )
+        # Selector 1 swaps the index sets; rotation 1 then swaps R and A.
+        self.assertEqual(
+            self.decode(bc7_mode4(rotation=1, selector=1)),
+            [(RAMP2[3 - p % 4], RAMP3[p % 8], RAMP3[p % 8], RAMP3[p % 8]) for p in range(16)],
+        )
+
+    def test_mode5_separate_alpha_indices_and_rotation(self):
+        self.assertEqual(self.decode(BC7_MODE5), BC7_MODE5_PIXELS)
+
+    def test_mode6_four_bit_indices_and_pbits(self):
+        decoded = self.decode(BC7_MODE6)
+        self.assertEqual([p[0] for p in decoded], list(RAMP4))
+        self.assertEqual(decoded[0], (0, 254, 128, 254))
+        self.assertEqual(decoded[8], (135, 120, 129, 255))
+        self.assertEqual(decoded[15], (255, 1, 129, 255))
+
+    def test_reserved_mode_is_transparent_black(self):
+        for block in (bytes(16), b"\x00" + b"\xff" * 15):
+            with self.subTest(block=block.hex()):
+                self.assertEqual(self.decode(block), [(0, 0, 0, 0)] * 16)
+
+    def test_srgb_and_typeless_keep_stored_bytes(self):
+        payload = BC7_MODE6 + BC7_MODE7
+        unorm = self.decode(payload, 8, 4, dxgi=98)
+        # Mode 6 pixel 8 is at row 2, column 0 of the 8-wide image.
+        self.assertEqual(unorm[16], (135, 120, 129, 255))
+        for dxgi in (97, 99):
+            with self.subTest(dxgi=dxgi):
+                self.assertEqual(self.decode(payload, 8, 4, dxgi=dxgi), unorm)
+
+    def test_blocks_are_placed_and_clipped(self):
+        blocks = [BC7_MODE6, BC7_MODE7, BC7_MODE2, BC7_MODE6]
+        expected_blocks = [self.decode(block) for block in blocks]
+        for width, height in ((5, 7), (8, 8)):
+            with self.subTest(size=(width, height)):
+                decoded = self.decode(b"".join(blocks), width, height)
+                for y in range(height):
+                    for x in range(width):
+                        block = expected_blocks[(y // 4) * 2 + x // 4]
+                        self.assertEqual(decoded[y * width + x], block[(y % 4) * 4 + x % 4], (x, y))
+        # A 3x5 image is a 1x2 grid of blocks; 1x1 keeps only the first pixel.
+        decoded = self.decode(BC7_MODE0 + BC7_MODE6, 3, 5)
+        self.assertEqual(decoded[:3], BC7_MODE0_PIXELS[:3])
+        self.assertEqual(decoded[3:6], BC7_MODE0_PIXELS[4:7])
+        self.assertEqual(decoded[12:15], [(0, 254, 128, 254), (16, 238, 128, 254), (36, 218, 128, 254)])
+        self.assertEqual(self.decode(BC7_MODE6, 1, 1), [(0, 254, 128, 254)])
+
+    def test_truncated_payload(self):
+        for width, height, size in ((4, 4, 15), (5, 7, 63)):
+            with self.subTest(size=(width, height)):
+                with self.assertRaisesRegex(dds.DdsError, "Truncated BC7"):
+                    dds.decode_dds(bc7_dds(width, height, b"\x00" * size))
+
+
 class TruncationTests(unittest.TestCase):
     def test_truncated_block_payloads(self):
         cases = {
@@ -491,6 +745,17 @@ class DownscaleTests(unittest.TestCase):
         self.assertEqual((w, h), (1, 2))
         self.assertEqual([p[0] for p in pixels(out)], [5, 25])
 
+    def test_odd_extents_are_averaged_without_cropping(self):
+        line = b"".join(bytes((v, v, v, 255)) for v in (0, 0, 100, 200, 200))
+        for width, height in ((5, 1), (1, 5)):
+            with self.subTest(width=width, height=height):
+                w, h, out = dds.downscale_rgba(width, height, line, 2)
+                self.assertEqual((w, h), (max(1, width // 2), max(1, height // 2)))
+                self.assertEqual(pixels(out), [(20, 20, 20, 255), (180, 180, 180, 255)])
+
+        rgba = bytes(4 * 8) + bytes((90, 180, 0, 255))
+        self.assertEqual(dds.downscale_rgba(3, 3, rgba, 1), (1, 1, bytes((10, 20, 0, 28))))
+
     def test_repeated_halving(self):
         w, h, out = dds.downscale_rgba(8, 8, self.rgba_grid(8, 8), 2)
         self.assertEqual((w, h), (2, 2))
@@ -508,6 +773,12 @@ class DownscaleTests(unittest.TestCase):
     def test_invalid_dimensions(self):
         with self.assertRaises(dds.DdsError):
             dds.downscale_rgba(0, 4, b"", 2)
+
+    def test_negative_max_size_rejected(self):
+        buf = self.rgba_grid(4, 4)
+        with self.assertRaisesRegex(dds.DdsError, "Invalid max_size: -1"):
+            dds.downscale_rgba(4, 4, buf, -1)
+        self.assertEqual(dds.downscale_rgba(4, 4, buf, 0), (4, 4, buf))
 
 
 class PngTests(unittest.TestCase):
@@ -552,6 +823,14 @@ class PngTests(unittest.TestCase):
         ), max_size=4)
         self.assertEqual(struct.unpack(">II", png_chunks(png)[0][1][:8]), (4, 4))
 
+    def test_dds_to_png_rejects_negative_max_size(self):
+        payload = bc1_block(0xFFFF, 0x0000, [0, 0, 0, 0]) * 4
+        data = dds_buffer(8, 8, payload, flags=DDPF_FOURCC, fourcc=b"DXT1")
+        with self.assertRaisesRegex(dds.DdsError, "Invalid max_size: -1"):
+            dds.dds_to_png_bytes(data, max_size=-1)
+        png = dds.dds_to_png_bytes(data, max_size=0)
+        self.assertEqual(struct.unpack(">II", png_chunks(png)[0][1][:8]), (8, 8))
+
 
 class CliTests(unittest.TestCase):
     def test_cli_writes_png(self):
@@ -565,6 +844,22 @@ class CliTests(unittest.TestCase):
             with open(dst, "rb") as f:
                 self.assertEqual(f.read(8), dds.PNG_SIGNATURE)
 
+    def test_cli_rejects_output_aliasing_input(self):
+        original = dds_buffer(4, 4, bc1_block(0xFFFF, 0, [0, 0, 0, 0]),
+                              flags=DDPF_FOURCC, fourcc=b"DXT1")
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "in.dds")
+            alias = os.path.join(tmp, ".", "in.dds")
+            with open(src, "wb") as f:
+                f.write(original)
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                result = dds.main([src, alias])
+            with open(src, "rb") as f:
+                self.assertEqual(f.read(), original)
+            self.assertEqual(result, 1)
+            self.assertIn("output must not overwrite the input DDS", stderr.getvalue())
+
     def test_cli_reports_unsupported_input(self):
         with tempfile.TemporaryDirectory() as tmp:
             src = os.path.join(tmp, "in.dds")
@@ -576,6 +871,31 @@ class CliTests(unittest.TestCase):
                 self.assertEqual(dds.main([src, dst]), 1)
             self.assertIn("FourCC", err.getvalue())
             self.assertFalse(os.path.exists(dst))
+
+    def test_cli_rejects_negative_max_size(self):
+        payload = bc1_block(0xFFFF, 0x0000, [0, 0, 0, 0]) * 4
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "in.dds")
+            dst = os.path.join(tmp, "out.png")
+            with open(src, "wb") as f:
+                f.write(dds_buffer(8, 8, payload, flags=DDPF_FOURCC, fourcc=b"DXT1"))
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err), self.assertRaises(SystemExit) as cm:
+                dds.main([src, dst, "--max-size", "-1"])
+            self.assertEqual(cm.exception.code, 2)
+            self.assertIn("--max-size must be 0 or more", err.getvalue())
+            self.assertFalse(os.path.exists(dst))
+
+    def test_cli_allows_zero_max_size(self):
+        payload = bc1_block(0xFFFF, 0x0000, [0, 0, 0, 0]) * 4
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "in.dds")
+            dst = os.path.join(tmp, "out.png")
+            with open(src, "wb") as f:
+                f.write(dds_buffer(8, 8, payload, flags=DDPF_FOURCC, fourcc=b"DXT1"))
+            self.assertEqual(dds.main([src, dst, "--max-size", "0"]), 0)
+            with open(dst, "rb") as f:
+                self.assertEqual(f.read(8), dds.PNG_SIGNATURE)
 
 
 if __name__ == "__main__":
