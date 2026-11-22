@@ -36,6 +36,7 @@ import zlib
 # -I keeps the script directory off sys.path, so add it explicitly before importing the sibling module.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from report_paths import same_report_path  # noqa: E402
+from zero_span import gap_split  # noqa: E402
 
 CHUNK = 1 << 20
 HEAD = 0x80
@@ -124,11 +125,9 @@ def scan_archive(path, start=None, limit=None):
                     pos = s + 1
                     continue
                 used = p - s - len(d.unused_data)
-                gap = m[last:s]
-                if gap.count(0) == len(gap):
-                    zero += len(gap)
-                else:
-                    unread += len(gap)
+                gap_zero, gap_unread = gap_split(m, last, s)
+                zero += gap_zero
+                unread += gap_unread
                 fields = page_fields(head)
                 total += 1
                 total_stored += used
@@ -136,11 +135,9 @@ def scan_archive(path, start=None, limit=None):
                 if fields:
                     rows.append({"source": path, "offset": s, "stored": used, "size": total_out, **fields})
                 last = pos = s + used
-            tail = m[last:end]
-            if tail.count(0) == len(tail):
-                zero += len(tail)
-            else:
-                unread += len(tail)
+            gap_zero, gap_unread = gap_split(m, last, end)
+            zero += gap_zero
+            unread += gap_unread
     span = end - start
     summary = {
         "input": path, "mode": "rpf", "start": start, "span": span, "streams": total,

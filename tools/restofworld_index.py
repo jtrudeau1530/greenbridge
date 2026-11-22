@@ -27,6 +27,11 @@ import sys
 import time
 import zlib
 
+ROOT = os.path.dirname(os.path.abspath(__file__))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
+from zero_span import gap_split  # noqa: E402
+
 # zlib stream start, or Bink 2 video ('KB2' + revision letter). Kept in step with rpf9_carve.py.
 ZHDR = re.compile(rb"\x78[\x01\x5e\x9c\xda]|KB2[a-z]")
 PSIN_TAGS = (b"LSCH", b"LENM", b"LSNS", b"LGID", b"LRSC", b"CHKS")
@@ -182,9 +187,6 @@ def classify(data, offset, stored):
     return row
 
 
-def _gap(gap):
-    return (len(gap), 0) if gap.count(0) == len(gap) else (0, len(gap))
-
 
 def scan_rpf(path, start=None, limit=None, max_inflate=MAX_INFLATE):
     """Walk an RPF9 data area. Returns (rows, summary). No TOC is read or decrypted."""
@@ -214,7 +216,7 @@ def scan_rpf(path, start=None, limit=None, max_inflate=MAX_INFLATE):
                     if not (64 <= blen <= end - s and w and h and 16 <= w <= 8192 and 16 <= h <= 8192):
                         pos = s + 1
                         continue
-                    z, u = _gap(m[last:s])
+                    z, u = gap_split(m, last, s)
                     zero += z
                     unread += u
                     rows.append(classify(m[s:s + 256], s, blen))
@@ -253,14 +255,14 @@ def scan_rpf(path, start=None, limit=None, max_inflate=MAX_INFLATE):
                     pos = s + 1
                     continue
                 used = p - s - len(d.unused_data)
-                z, u = _gap(m[last:s])
+                z, u = gap_split(m, last, s)
                 zero += z
                 unread += u
                 row = classify(bytes(psin) if head[:4] == b"PSIN" else head, s, used)
                 row["size"] = total
                 rows.append(row)
                 last = pos = s + used
-            z, u = _gap(m[last:end])
+            z, u = gap_split(m, last, end)
             zero += z
             unread += u
     summary = summarise(rows, end - span_start, zero, unread)

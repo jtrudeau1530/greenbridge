@@ -40,6 +40,11 @@ import time
 import unicodedata
 import zlib
 
+ROOT = os.path.dirname(os.path.abspath(__file__))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
+from zero_span import gap_split  # noqa: E402
+
 ZHDR = re.compile(rb"\x78[\x01\x5e\x9c\xda]")
 TAG = 0x81020006
 HEAD = 0x140
@@ -263,11 +268,9 @@ def scan_rpf(path, start=None, limit=None, max_inflate=1 << 28):
                     pos = s + 1
                     continue
                 head, kept, total, used = got
-                gap = m[last:s]
-                if gap.count(0) == len(gap):
-                    zero += len(gap)
-                else:
-                    unread += len(gap)
+                gap_zero, gap_unread = gap_split(m, last, s)
+                zero += gap_zero
+                unread += gap_unread
                 row = classify(head, total, kept[-HEAD:] if len(kept) >= HEAD else kept)
                 row.update(source=path, offset=s, stored=used, size=total)
                 if row["kind"] in ("bvh4", "bvh4-chunk") and row["declared_bytes"] <= len(kept):
@@ -276,11 +279,9 @@ def scan_rpf(path, start=None, limit=None, max_inflate=1 << 28):
                     row["fill"]["total"] = len(body)
                 rows.append(row)
                 last = pos = s + used
-            tailgap = m[last:end]
-            if tailgap.count(0) == len(tailgap):
-                zero += len(tailgap)
-            else:
-                unread += len(tailgap)
+            gap_zero, gap_unread = gap_split(m, last, end)
+            zero += gap_zero
+            unread += gap_unread
         finally:
             m.close()
     return rows, [summarize(rows, path, span, zero, unread, time.time() - t0)]

@@ -58,6 +58,14 @@ The walker advances by `len(chunk)`, not by the 1 MiB read request. A short fina
 overshoot EOF, so `used` exceeded the real stream size and every trailing stream was skipped; the regression
 test `tests/test_rpf9_carve.py` builds a two-stream archive to keep that fixed.
 
+A gap between streams counts as zero padding when every byte in it is zero, otherwise as unread.
+`tools/zero_span.py` decides that a 4 MiB window at a time, stopping at the first window with a non-zero byte.
+`rpf9_carve.py` and the other scanners that keep these counts (`rpf9_names`, `bvh_index`, `navmesh_index`,
+`navmesh_decode`, `rbf0_index`, `anim_index`, `restofworld_index`, `story_index`) all use it. They used to slice
+the gap out of the mapped archive, which copies all of it at once, so a non-zlib region of several GiB (about half
+of `story000.rpf`) needed that much memory. `tests/test_zero_span.py` runs each scanner on a 48 MiB gap and checks
+that the Python heap peak stays under 24 MiB.
+
 The carve is read-only and works on any `.rpf`, `.ttpf` or archive-like file. It does not decrypt the TOC, use
 keys, or write anything outside the output directory.
 

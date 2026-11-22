@@ -54,6 +54,11 @@ import zlib
 from collections import Counter
 from collections.abc import Iterator
 
+ROOT = os.path.dirname(os.path.abspath(__file__))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
+from zero_span import gap_split  # noqa: E402
+
 BASE = 0x50000000
 ZHDR = re.compile(rb"\x78[\x01\x5e\x9c\xda]")
 HEX_PREFIX = re.compile(r"^(?:0[xX])?([0-9a-fA-F]{6,})(?:[^0-9a-zA-Z]|$)")
@@ -795,8 +800,8 @@ def _scan_rpf(path, start, limit, deep, rows):
                                 "checks_failed": " ".join(k for k, v in sorted(chk.items()) if not v)})
                     rows.append(row)
             if last < end:
-                gap = m[last:end]
-                carver["zero_padding" if gap.count(0) == len(gap) else "unread"] += len(gap)
+                gap_zero, gap_unread = gap_split(m, last, end)
+                carver["zero_padding" if not gap_unread else "unread"] += gap_zero + gap_unread
     return _summary(path, "rpf", start, end, carver, classes, checks, stats, time.time() - t0)
 
 
@@ -811,8 +816,8 @@ def _account(m, carver, last, s, used, inflated, end):
         carver["past_window_stored"] += used
         return last
     if s > last and last < end:
-        gap = m[last:min(s, end)]
-        carver["zero_padding" if gap.count(0) == len(gap) else "unread"] += len(gap)
+        gap_zero, gap_unread = gap_split(m, last, min(s, end))
+        carver["zero_padding" if not gap_unread else "unread"] += gap_zero + gap_unread
     carver["streams"] += 1
     carver["stored"] += used
     carver["inflated"] += inflated
