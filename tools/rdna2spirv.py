@@ -3387,6 +3387,30 @@ class Gen:
             self.emit(f"{lane} = OpLoad %uint %sg_lane")
         return lane
 
+    def ballot_lsb_by_words(self, bal):
+        """The lowest set bit of a subgroup ballot, from its four words with FindILsb: the lane
+        OpGroupNonUniformBallotFindLSB gives (a ballot has no bit at or above the subgroup size), without asking for
+        the subgroup size. MoltenVK lowers BallotFindLSB, like the SubgroupSize built-in, to Metal's
+        threads_per_simdgroup input, which a vertex function can't declare (Apple M4, MoltenVK 1.4.2), so vertex
+        shaders use this form. Like the op, the result means nothing for an empty ballot; callers select 0 then."""
+        r = None
+        for k in (3, 2, 1, 0):            # the lowest non-zero word wins, so it is selected last
+            w, lsb = self.tmp(), self.tmp()
+            self.emit(f"{w} = OpCompositeExtract %uint {bal} {k}")
+            self.emit(f"{lsb} = OpExtInst %uint %glsl FindILsb {w}")
+            if k:
+                at = self.tmp()
+                self.emit(f"{at} = OpIAdd %uint {lsb} {self.cu(32 * k)}")
+                lsb = at
+            if r is None:
+                r = lsb
+            else:
+                nz, pick = self.tmp(), self.tmp()
+                self.emit(f"{nz} = OpINotEqual %bool {w} {self.cu(0)}")
+                self.emit(f"{pick} = OpSelect %uint {nz} {lsb} {r}")
+                r = pick
+        return r
+
     # ---- wave64 emulation (--wave64-emulate) ----
     # A wave64 compute or mesh shader runs exact on any subgroup size. Each lane is one invocation as usual, but no
     # subgroup operation is used: everything a lane needs from the rest of its wave goes through a Workgroup buffer
@@ -4827,7 +4851,10 @@ class Gen:
             v, act = self.src_u(a[1]), self.active_b()
             bal, lsb, any_, first, r = (self.tmp() for _ in range(5))
             self.emit(f"{bal} = OpGroupNonUniformBallot %v4uint_bal {self.cu(3)} {act}")
-            self.emit(f"{lsb} = OpGroupNonUniformBallotFindLSB %uint {self.cu(3)} {bal}")
+            if self.stage == "vs":
+                lsb = self.ballot_lsb_by_words(bal)
+            else:
+                self.emit(f"{lsb} = OpGroupNonUniformBallotFindLSB %uint {self.cu(3)} {bal}")
             self.emit(f"{any_} = OpGroupNonUniformAny %bool {self.cu(3)} {act}")
             self.emit(f"{first} = OpSelect %uint {any_} {lsb} {self.cu(0)}")
             self.emit(f"{r} = OpGroupNonUniformShuffle %uint {self.cu(3)} {v} {first}")
