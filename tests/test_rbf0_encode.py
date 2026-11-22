@@ -9,6 +9,7 @@ import json
 import math
 import os
 import struct
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -101,7 +102,33 @@ def roundtrip(blob):
     return rbf0_encode.encode(doc)
 
 
+def edited_unicode_doc(field, value, wide=True):
+    doc = rbf0_tree.parse_resource(Stream(wide).open("root").string("label", b"x").text(b"t").close().bytes())
+    if field == "descriptor":
+        doc["tree"]["name"] = value
+        doc["descriptors"][0]["name"] = value
+    elif field == "string":
+        node = doc["tree"]["content"][0]
+        node["value"] = value
+        node.pop("byte_length", None)
+    else:
+        node = doc["tree"]["content"][1]
+        node["text"] = value
+        node.pop("length", None)
+    return doc
+
+
 class RoundTrip(unittest.TestCase):
+    def test_non_bmp_unicode_survives_json_and_encoding(self):
+        for wide in (True, False):
+            for field in ("descriptor", "string", "text"):
+                with self.subTest(wide=wide, field=field):
+                    doc = edited_unicode_doc(field, "caf\u00e9 \U0001f9ea", wide)
+                    doc = json.loads(json.dumps(doc))  # a valid escaped surrogate pair becomes one scalar
+                    encoded = rbf0_encode.encode(doc)
+                    self.assertIn("caf\u00e9 \U0001f9ea".encode("utf-8"), encoded)
+                    self.assertEqual(roundtrip(encoded), encoded)
+
     def test_every_record_wide_and_narrow(self):
         for wide in (True, False):
             blob = every_record(wide)
@@ -155,6 +182,14 @@ class Refusals(unittest.TestCase):
         self.assertEqual(self.reason(Stream().open("r").text(b"caf\xe9\x00").close().bytes()), "utf8")
         bad_name = b"RBF0" + PROLOGUE + bytes((0, 0)) + struct.pack("<H", 2) + b"\xc3\x28" + bytes(6) + b"\xff\xff"
         self.assertEqual(self.reason(bad_name), "utf8")
+
+    def test_unpaired_surrogates_in_edited_json_fields(self):
+        for wide in (True, False):
+            for field in ("descriptor", "string", "text"):
+                for value in ("\ud800", "\udfff", "prefix\ud800suffix"):
+                    with self.subTest(wide=wide, field=field, value=repr(value)):
+                        doc = json.loads(json.dumps(edited_unicode_doc(field, value, wide)))
+                        self.assertEqual(self.reason(doc=doc), "utf8")
 
     def test_incomplete_parses(self):
         whole = Stream().open("r").int("i", 1).close().bytes()
@@ -229,6 +264,28 @@ class Cli(unittest.TestCase):
             self.assertEqual(f.read(), every_record(True))
         with self.assertRaises(SystemExit):                            # never into a non-empty directory
             self.run_main(report, out_dir)
+
+    def test_cli_refuses_surrogates_and_continues_with_valid_resources(self):
+        good = every_record(True)
+        docs = [rbf0_tree.parse_resource(good)]
+        docs += [edited_unicode_doc(field, "\ud800") for field in ("descriptor", "string", "text")]
+        docs.append(rbf0_tree.parse_resource(good))
+        for i, doc in enumerate(docs):
+            doc["offset"] = 0x100 + i
+        report = os.path.join(self.tmp.name, "surrogates.json")
+        with open(report, "w", encoding="utf-8", newline="\n") as f:
+            json.dump({"tool": "rbf0_tree", "resources": docs}, f)
+        out_dir = os.path.join(self.tmp.name, "surrogate-out")
+        result = subprocess.run([sys.executable, "-I", os.path.join(ROOT, "tools", "rbf0_encode.py"),
+                                 report, out_dir], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("2 resource(s) written, 3 refused", result.stdout)
+        self.assertEqual(result.stdout.count("utf8:"), 3)
+        self.assertEqual(result.stderr, "")
+        self.assertEqual(sorted(os.listdir(out_dir)), ["00000100.rbf", "00000104.rbf"])
+        for name in os.listdir(out_dir):
+            with open(os.path.join(out_dir, name), "rb") as f:
+                self.assertEqual(f.read(), good)
 
     def test_argument_errors(self):
         for argv in ([], ["--check", self.carve, "extra"], ["--check", self.carve, "--limit", "0"],
