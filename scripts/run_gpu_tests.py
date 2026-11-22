@@ -826,8 +826,8 @@ def run_suite(a, work: str) -> int:
                 "cs_buf_tail": [0, 0x5EED000C, 0x5EED0008, 0x5EED000C, 0, 0, 0x5EED0010, 0],
                 "cs_oob_select": [0x5EED000C, 0, 0x5EED0014, 0, 0x5EED0018, 0xEEEEEEEE, 0, 0],
                 "cs_oob_tail": [0, 0, 0x5EED0010, 0, 0xBEEF0000, 0xEEEEEEEE, 0, 0x5EED0010],
-                # swizzled MUBUF addressing and ADD_TID_ENABLE (lanes 0 and 1 store; derivation in the .asm header)
-                "cs_buf_swizzle": [0x5EED0024, 0x5EED0044, 0x5EED004C, 0x5EED0008, 0x5EED0028, 0, 0xBEEF0000,
+                # swizzled MUBUF addressing (measured natively on gfx1036) and ADD_TID_ENABLE (lanes 0 and 1 store)
+                "cs_buf_swizzle": [0x5EED0024, 0x5EED0044, 0x5EED004C, 0x5EED0008, 0x5EED000C, 0, 0xBEEF0000,
                                    0xBEEF0001],
                 "cs_cmpx_class_f32": CMPX_CLASS_WORDS,
                 "cs_cvt_pk_u8": CVT_PK_U8_WORDS,

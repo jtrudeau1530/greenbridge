@@ -301,6 +301,32 @@ differences** (plus `tools/salu_diff.py --oracle hw,translator --bfe-any --progr
   saturating by its sign). All are fixed (#1831, #1856), so `KNOWN_DIVERGENCES` is empty and all 87 cases
   match.
 
+#### RDNA2 swizzled buffer addressing (`tools/buffer_swizzle_probe.py`, SHADER-343)
+
+`tools/buffer_swizzle_probe.py` runs 22 hand-written MUBUF/MTBUF buffer-swizzle cases across 8 groups (both wave32
+and wave64) natively on an AMD GPU through `tools/hw_oracle` and compares every output word against
+`tools/rdna2spirv.py` + `tests/semantic/spirv_mini_interp.py`.
+
+Measured on an **AMD Radeon(TM) Graphics (gfx1036, RDNA2)**, Windows AMD driver `32.0.21042.62`, ROCm clang
+(`--oracle both --wave both`): **22 cases: 22 bit-exact matches, 0 known divergences, 0 unexpected mismatches,
+0 unexpected wave32/wave64 diffs** (and the 64-thread `add_tid_wave_lane` case matches wave32 and wave64
+individually, confirming wave-lane wrap at 32 vs 64).
+
+Six silicon divergences from the earlier ISA-only implementation were found and fixed in `tools/rdna2spirv.py`:
+
+- `idxen = 1` ignores `ADD_TID_ENABLE` completely (both address and bounds, linear and swizzled).
+- `SWIZZLE_ENABLE = 1` with `idxen = 0` and `ADD_TID_ENABLE = 0` has no effect (linear address, mode 3 stays RAW).
+- Multi-dword raw accesses step by `+4 * IS` only in scratch-swizzle mode (`SWIZZLE_ENABLE = 1`, `idxen = 0`,
+  `ADD_TID_ENABLE = 1`), whereas indexed swizzle (`idxen = 1`) steps linearly by `+4` bytes even across `IS`
+  boundaries.
+- Scratch-swizzle mode suppresses typed formats > 4 bytes (MUBUF and MTBUF loads/stores) and 8-byte
+  `buffer_atomic_*_x2` even in `OOB_SELECT 2` (while formats <= 4 bytes succeed); indexed swizzle executes them
+  linearly.
+- `OOB_SELECT 3` with active swizzle and `stride != 0` checks `(index + soffset) >= num_records` or
+  `off + payload > stride`.
+- `uint32(voff + inst_offset)` wraps at 32 bits before bounds checking, whereas RAW mode 3
+  `uint64(off) + uint64(soffset)` does not wrap at 32 bits.
+
 Two assembler facts matter when writing edge cases:
 
 - An integer token in a float-operand position uses AMD's inline-constant encoding for values 0..64

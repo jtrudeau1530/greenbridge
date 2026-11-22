@@ -2345,8 +2345,9 @@ class Gen:
 
     def buf_dword_ptr(self, arr, host, step, i):
         """Pointer to dword i (a Python int or a uint id) of a buffer access whose first dword is at host address
-        `host`, `arr` the same address as a PSB array: arr[i] for the linear layout (step None), else host + i * step,
-        since dword k of a swizzled access is 4 * index_stride bytes after dword k - 1 (buffer_address)."""
+        `host`, `arr` the same address as a PSB array: arr[i] for the linear layout (step None), else host + i * step
+        in scratch-swizzle mode (SWIZZLE_ENABLE=1, idxen=0, ADD_TID_ENABLE=1), where dword k is 4 * index_stride
+        bytes after dword k - 1 (buffer_address)."""
         ix = self.cu(i) if isinstance(i, int) else i
         p = self.tmp()
         if step is None or i == 0:
@@ -2360,25 +2361,26 @@ class Gen:
         return p
 
     def buffer_address(self, a, mods, parts=False, elem=None, fixed_fmt=None):
-        """(64-bit element address id, V# word3 id, in_bounds bool id) for a MUBUF/MTBUF instruction: vdata, vaddr,
-        srsrc, soffset. The address is V#.base + soffset + inst_offset + (offen ? vaddr : 0) + (idxen ? vindex *
-        stride : 0), byte exact. in_bounds is the V# OOB_SELECT (word3 bits [29:28]) check of the first dword, shared
-        by stores, atomics and format loads. With `idx` = vindex (0 without idxen), `off` = inst_offset + vaddr offset
-        (offen), `offs` = off + soffset, out of range on RDNA2 as measured natively on gfx1036 (docs/buffer_bounds.md,
-        Mesa's GFX11 column) when, for a dword at byte k * 4 of the access:
+        """(64-bit element address id, V# word3 id, in_bounds bool id, ..., step) for a MUBUF/MTBUF instruction:
+        vdata, vaddr, srsrc, soffset. With `idx` = idxen ? vindex : (ADD_TID_ENABLE ? lane : 0) (idxen ignores
+        ADD_TID_ENABLE), `off` = uint32((offen ? vaddr : 0) + inst_offset) (32-bit wrap), `offs` = uint64(off) +
+        uint64(soffset) (64-bit, no wrap), out of range on RDNA2 as measured natively on gfx1036
+        (docs/buffer_bounds.md, docs/design.md):
             0 STRUCTURED_WITH_OFFSET: idx >= num_records or off + 4k + 4 > stride
             1 STRUCTURED:             idx >= num_records
             2 DISABLED:               num_records == 0
-            3 RAW:                    offs + 4k + 4 > num_records (idx * stride is not part of the check)
-        A V# word3 that an s_mov_b32 wrote earlier in the block (`sgpr_imm`) folds to one of these; a run-time one
-        selects with OpSelect. elem="fmt" is for typed loads and stores: the whole element (its format's size, from the
-        instruction's fixed_fmt, a literal word3 or the V# at run time) must end inside. parts=True adds a 4th element for buffer_load: a function k -> in-range bool id for
-        dword k (modes 0 and 3, and a run-time V#), or None when the literal mode is 1 or 2 (every dword shares
-        in_bounds). Multi-dword loads are per dword for mode 3 (measured, RX 6800); mode 0 is by analogy.
-        A swizzled V# (SWIZZLE_ENABLE) gets the RDNA2 ISA's swizzled buffer_offset, ADD_TID_ENABLE adds the wave lane
-        to idx, and mode 3 checks like mode 0 when swizzled with a stride (ISA table 35). Every tuple ends with `step`:
-        None when consecutive dwords of the access are 4 bytes apart, else the id of that distance (4 * index_stride
-        when swizzled, selected at run time for a run-time word1), for buf_dword_ptr."""
+            3 RAW (linear or stride 0): offs + 4k + 4 > num_records
+            3 SWIZZLED (swz_active and stride != 0): uint64(idx) + uint64(soffset) >= num_records or off + 4k + 4 > stride
+        SWIZZLE_ENABLE (word1[31]) activates only when idxen or ADD_TID_ENABLE is active (`swz_active`); with neither,
+        addressing is linear and mode 3 stays RAW. Two swizzle sub-modes exist on RDNA2 (measured natively on gfx1036,
+        wave32 & wave64):
+            - Scratch swizzle (`SWIZZLE_ENABLE=1, idxen=0, ADD_TID_ENABLE=1`): raw multi-dword accesses step by
+              `4 * index_stride` bytes (`step`), and typed formats > 4 bytes (plus 8-byte `buffer_atomic_*_x2`) are
+              suppressed (even in mode 2).
+            - Indexed swizzle (`SWIZZLE_ENABLE=1, idxen=1`): multi-dword raw, typed, and `_x2` atomic accesses step
+              linearly by `+4` bytes (`step = None`), and typed formats > 4 bytes execute normally.
+        A literal V# word1/word3 (`sgpr_imm`) folds each bit; a run-time one selects dynamically. elem="fmt" checks the
+        whole element's format size; parts=True adds a 4th element `k -> in-range bool id` for per-dword checks."""
         vaddr, rsrc = a[1], a[2]
         soff = a[3] if len(a) > 3 else {"k": "imm", "v": 0}
         if (rsrc["k"] == "sgpr" and rsrc.get("n") == 4):
@@ -2392,57 +2394,88 @@ class Gen:
         hi, stride = self.tmp(), self.tmp()
         self.emit(f"{hi} = OpBitwiseAnd %uint {d1} {self.cu(0xFFFF)}")
         self.emit(f"{stride} = OpBitFieldUExtract %uint {d1} {self.cu(16)} {self.cu(14)}")
-        # Swizzled buffers (docs/design.md, Swizzled buffer addressing; RDNA2 ISA 8.1.5 "Swizzled Buffer Addressing"
-        # and table 35; fields from Mesa gfx10-rsrc.json SQ_BUF_RSRC_WORD1/WORD3): SWIZZLE_ENABLE is word1 bit 31,
-        # INDEX_STRIDE word3 [22:21] (IS = 8 << n indices), ADD_TID_ENABLE word3 bit 23, element_size fixed at 4.
-        # A literal word folds its bit (a Python bool); a run-time one is a SPIR-V id (0 or 1).
+        # Swizzled buffers (docs/design.md, Swizzled buffer addressing; native gfx1036 measurement): SWIZZLE_ENABLE is
+        # word1[31], INDEX_STRIDE word3[22:21] (IS = 8 << n), ADD_TID_ENABLE word3[23], element_size fixed at 4.
+        # A literal word folds its bit (a Python bool); a run-time one is None.
         swz = bool(lit1 >> 31) if lit1 is not None else None
         tid = bool(lit3 >> 23 & 1) if lit3 is not None else None
+        has_idx = "idxen" in mods
         inst = next((int(m.split(":")[1], 0) for m in mods if m.startswith("offset:")), 0)
+        soff_zero = soff["k"] == "imm" and soff["v"] == 0
         soff_v = self.src_u(soff)
-        total = self.tmp()
-        self.emit(f"{total} = OpIAdd %uint {soff_v} {self.cu(inst)}")
         vregs = [] if vaddr["k"] == "special" else [vaddr["r"] + i for i in range(vaddr.get("n", 1))]
-        idx = None
-        if "idxen" in mods:
-            idx = self.load_reg("vgpr", vregs[0])
         voff = None
         if "offen" in mods:
-            voff = self.load_reg("vgpr", vregs[1] if "idxen" in mods else vregs[0])
-        # ADD_TID_ENABLE adds the lane within the wave (thread_id[5:0]) to the index, swizzled or linear (ISA table
-        # 33 and the Ring/stream-out column of table 36, which is linear with add_tid); the bounds check sees it too
-        if tid is not False:
+            voff = self.load_reg("vgpr", vregs[1] if has_idx else vregs[0])
+        # Effective index: idxen uses vindex alone and ignores ADD_TID_ENABLE; without idxen, ADD_TID_ENABLE supplies
+        # the wave lane (thread_id[5:0]).
+        tid_b = None
+        if has_idx:
+            idx = self.load_reg("vgpr", vregs[0])
+        elif tid is False:
+            idx = None
+        else:
             lane = self.wave_lane()
-            if tid is None:                   # lane * the run-time bit
-                b, t = self.tmp(), self.tmp()
-                self.emit(f"{b} = OpBitFieldUExtract %uint {d3} {self.cu(23)} {self.cu(1)}")
-                self.emit(f"{t} = OpIMul %uint {lane} {b}")
-                lane = t
-            if idx is None:
-                idx = lane
+            if tid is None:                   # lane * run-time ADD_TID_ENABLE
+                tid_b, idx = self.tmp(), self.tmp()
+                self.emit(f"{tid_b} = OpBitFieldUExtract %uint {d3} {self.cu(23)} {self.cu(1)}")
+                self.emit(f"{idx} = OpIMul %uint {lane} {tid_b}")
             else:
-                s = self.tmp()
-                self.emit(f"{s} = OpIAdd %uint {idx} {lane}")
-                idx = s
-        # offs = soffset + inst_offset + vaddr offset (idx * stride excluded): the raw bounds check's offset
-        offs = total
+                idx = lane
+        # SWIZZLE_ENABLE activates only with idxen or ADD_TID_ENABLE; scratch-swizzle stepping/suppression applies only
+        # when SWIZZLE_ENABLE=1, idxen=0, ADD_TID_ENABLE=1.
+        swz_u = None
+        if has_idx:
+            swz_active = swz
+            scratch_swz = False
+            if swz_active is None:
+                swz_u = self.tmp()
+                self.emit(f"{swz_u} = OpBitFieldUExtract %uint {d1} {self.cu(31)} {self.cu(1)}")
+        elif swz is False or tid is False:
+            swz_active = False
+            scratch_swz = False
+        elif swz is True and tid is True:
+            swz_active = True
+            scratch_swz = True
+        else:
+            swz_active = None
+            scratch_swz = None
+            if swz is True:
+                swz_u = tid_b
+            else:
+                swz_b = self.tmp()
+                self.emit(f"{swz_b} = OpBitFieldUExtract %uint {d1} {self.cu(31)} {self.cu(1)}")
+                if tid is True:
+                    swz_u = swz_b
+                else:
+                    swz_u = self.tmp()
+                    self.emit(f"{swz_u} = OpBitwiseAnd %uint {swz_b} {tid_b}")
+        # off = uint32((offen ? voff : 0) + inst_offset): wraps at 32 bits on RDNA2.
         if voff is not None:
-            offs = self.tmp()
-            self.emit(f"{offs} = OpIAdd %uint {total} {voff}")
-        total = offs
-        # step: bytes between consecutive dwords of one access, None for the linear 4 (callers index an array then)
+            if inst:
+                off = self.tmp()
+                self.emit(f"{off} = OpIAdd %uint {voff} {self.cu(inst)}")
+            else:
+                off = voff
+        else:
+            off = self.cu(inst)
+        # step: bytes between consecutive dwords of a raw access, None for linear +4 (including all idxen=1 and fmt).
         step = None
-        if swz is False:
+        if swz_active is False:
+            if soff_zero:
+                total = off
+            else:
+                total = self.tmp()
+                self.emit(f"{total} = OpIAdd %uint {soff_v} {off}")
             if idx is not None:
-                m, total = self.tmp(), self.tmp()
+                m, t = self.tmp(), self.tmp()
                 self.emit(f"{m} = OpIMul %uint {idx} {stride}")
-                self.emit(f"{total} = OpIAdd %uint {offs} {m}")
+                self.emit(f"{t} = OpIAdd %uint {total} {m}")
+                total = t
             sw3 = False
         else:
-            # buffer_offset = (index / IS * stride + offset / 4 * 4) * IS + index % IS * 4 + offset % 4, Offset =
-            # inst_offset + vaddr offset (no soffset), added to base + soffset; IS = 2^L. Dword k of the access is
-            # element offset / 4 + k, 4 * IS bytes further. L = 0 (a run-time V# without SWIZZLE_ENABLE) is the
-            # linear address: index * stride + offset. 32-bit arithmetic, like the linear address.
+            # buffer_offset = (index / IS * stride + (off & ~3)) * IS + (index % IS) * 4 + (off & 3), IS = 2^L;
+            # L = 0 (run-time V# with swz_u == 0) reduces to the linear address index * stride + off.
             if lit3 is not None:
                 Li = 3 + (lit3 >> 21 & 3)
                 L = self.cu(Li)
@@ -2450,48 +2483,49 @@ class Gen:
                 f, L, Li = self.tmp(), self.tmp(), None
                 self.emit(f"{f} = OpBitFieldUExtract %uint {d3} {self.cu(21)} {self.cu(2)}")
                 self.emit(f"{L} = OpIAdd %uint {f} {self.cu(3)}")
-            if swz is None:                   # L * the run-time bit: 0 when not swizzled
-                b, t = self.tmp(), self.tmp()
-                self.emit(f"{b} = OpBitFieldUExtract %uint {d1} {self.cu(31)} {self.cu(1)}")
-                self.emit(f"{t} = OpIMul %uint {L} {b}")
+            if swz_active is None:            # L * swz_u: 0 when not swizzled
+                t = self.tmp()
+                self.emit(f"{t} = OpIMul %uint {L} {swz_u}")
                 L, Li = t, None
-            off_s = self.cu(inst)
-            if voff is not None:
-                off_s = self.tmp()
-                self.emit(f"{off_s} = OpIAdd %uint {voff} {self.cu(inst)}")
             om4, ol, sh = self.tmp(), self.tmp(), self.tmp()
-            self.emit(f"{om4} = OpBitwiseAnd %uint {off_s} {self.cu(0xFFFFFFFC)}")
-            self.emit(f"{ol} = OpBitwiseAnd %uint {off_s} {self.cu(3)}")
-            if idx is not None:
-                msb, ms, inner, lsb, l4, im = (self.tmp() for _ in range(6))
-                self.emit(f"{msb} = OpShiftRightLogical %uint {idx} {L}")
-                self.emit(f"{ms} = OpIMul %uint {msb} {stride}")
-                self.emit(f"{inner} = OpIAdd %uint {ms} {om4}")
-                self.emit(f"{sh} = OpShiftLeftLogical %uint {inner} {L}")
-                if Li is not None:
-                    self.emit(f"{lsb} = OpBitwiseAnd %uint {idx} {self.cu((1 << Li) - 1)}")
-                else:                         # index - (index >> L << L)
-                    hi_part = self.tmp()
-                    self.emit(f"{hi_part} = OpShiftLeftLogical %uint {msb} {L}")
-                    self.emit(f"{lsb} = OpISub %uint {idx} {hi_part}")
-                self.emit(f"{l4} = OpShiftLeftLogical %uint {lsb} {self.cu(2)}")
-                self.emit(f"{im} = OpIAdd %uint {sh} {l4}")
-                sh = im
-            else:
-                self.emit(f"{sh} = OpShiftLeftLogical %uint {om4} {L}")
-            b_off, total = self.tmp(), self.tmp()
-            self.emit(f"{b_off} = OpIAdd %uint {sh} {ol}")
-            self.emit(f"{total} = OpIAdd %uint {soff_v} {b_off}")
+            self.emit(f"{om4} = OpBitwiseAnd %uint {off} {self.cu(0xFFFFFFFC)}")
+            self.emit(f"{ol} = OpBitwiseAnd %uint {off} {self.cu(3)}")
+            msb, ms, inner, lsb, l4, im = (self.tmp() for _ in range(6))
+            self.emit(f"{msb} = OpShiftRightLogical %uint {idx} {L}")
+            self.emit(f"{ms} = OpIMul %uint {msb} {stride}")
+            self.emit(f"{inner} = OpIAdd %uint {ms} {om4}")
+            self.emit(f"{sh} = OpShiftLeftLogical %uint {inner} {L}")
             if Li is not None:
-                step = self.cu(4 << Li)
+                self.emit(f"{lsb} = OpBitwiseAnd %uint {idx} {self.cu((1 << Li) - 1)}")
+            else:                             # index - (index >> L << L)
+                hi_part = self.tmp()
+                self.emit(f"{hi_part} = OpShiftLeftLogical %uint {msb} {L}")
+                self.emit(f"{lsb} = OpISub %uint {idx} {hi_part}")
+            self.emit(f"{l4} = OpShiftLeftLogical %uint {lsb} {self.cu(2)}")
+            self.emit(f"{im} = OpIAdd %uint {sh} {l4}")
+            b_off = self.tmp()
+            self.emit(f"{b_off} = OpIAdd %uint {im} {ol}")
+            if soff_zero:
+                total = b_off
             else:
-                step = self.tmp()
-                self.emit(f"{step} = OpShiftLeftLogical %uint {self.cu(4)} {L}")
-            # OOB_SELECT 3 with SWIZZLE_ENABLE and a stride != 0 checks like mode 0 (ISA table 35): index >=
-            # num_records or offset + payload > stride, offset without soffset
-            if lit1 is not None:
-                sw3 = (lit1 >> 16 & 0x3FFF) != 0
-            else:                             # L * stride != 0: swizzled (L >= 3) and a stride (no overflow)
+                total = self.tmp()
+                self.emit(f"{total} = OpIAdd %uint {soff_v} {b_off}")
+            if elem != "fmt" and scratch_swz is not False:
+                if Li is not None:
+                    step = self.cu(4 << Li)
+                else:
+                    step = self.tmp()
+                    self.emit(f"{step} = OpShiftLeftLogical %uint {self.cu(4)} {L}")
+            # OOB_SELECT 3 with active swizzle and stride != 0 checks (idx + soffset) >= num_records or off + payload > stride.
+            if lit1 is not None and (lit1 >> 16 & 0x3FFF) == 0:
+                sw3 = False
+            elif swz_active is True:
+                if lit1 is not None:
+                    sw3 = True
+                else:
+                    sw3 = self.tmp()
+                    self.emit(f"{sw3} = OpINotEqual %bool {stride} {self.cu(0)}")
+            else:                             # L * stride != 0: swz_u == 1 (L >= 3) and stride != 0 (no overflow)
                 ls, sw3 = self.tmp(), self.tmp()
                 self.emit(f"{ls} = OpIMul %uint {L} {stride}")
                 self.emit(f"{sw3} = OpINotEqual %bool {ls} {self.cu(0)}")
@@ -2505,9 +2539,11 @@ class Gen:
         self.emit(f"{addr} = OpIAdd %ulong {base} {o64}")
         mode = None if lit3 is None else lit3 >> 28 & 3
         mode0_rule = mode in (None, 0) or (mode == 3 and sw3 is not False)
-        # idx (0 without idxen) < num_records and num_records != 0 do not depend on the dword; the two end checks do
-        p1 = p2 = None
-        if mode in (None, 0, 1) or mode0_rule:
+        need_raw = mode in (None, 3) and sw3 is not True
+        need_p3 = mode in (None, 3) and sw3 is not False
+        need_p1 = mode in (None, 0, 1) or (need_p3 and soff_zero)
+        p1 = p2 = p3_idx = None
+        if need_p1:
             p1 = self.tmp()
             if idx is None:
                 self.emit(f"{p1} = OpINotEqual %bool {d2} {self.cu(0)}")
@@ -2516,20 +2552,39 @@ class Gen:
         if mode in (None, 2):
             p2 = self.tmp()
             self.emit(f"{p2} = OpINotEqual %bool {d2} {self.cu(0)}")
+        off64 = d2_64 = soff64 = None
+        if mode0_rule or need_raw:
+            off64 = self.tmp()
+            self.emit(f"{off64} = OpUConvert %ulong {off}")
+        if need_raw or (need_p3 and not soff_zero and idx is not None):
+            d2_64 = self.tmp()
+            self.emit(f"{d2_64} = OpUConvert %ulong {d2}")
+        if not soff_zero and (need_raw or (need_p3 and idx is not None)):
+            soff64 = self.tmp()
+            self.emit(f"{soff64} = OpUConvert %ulong {soff_v}")
+        if need_p3:
+            if soff_zero:
+                p3_idx = p1
+            elif idx is None:
+                p3_idx = self.tmp()
+                self.emit(f"{p3_idx} = OpULessThan %bool {soff_v} {d2}")
+            else:
+                idx64, idx_s, p3_idx = self.tmp(), self.tmp(), self.tmp()
+                self.emit(f"{idx64} = OpUConvert %ulong {idx}")
+                self.emit(f"{idx_s} = OpIAdd %ulong {idx64} {soff64}")
+                self.emit(f"{p3_idx} = OpULessThan %bool {idx_s} {d2_64}")
         lim = {}
         if mode0_rule:
-            # off = inst_offset + vaddr offset, without soffset (docs/buffer_bounds.md)
-            off = self.cu(inst)
-            if voff is not None:
-                off = self.tmp()
-                self.emit(f"{off} = OpIAdd %uint {voff} {self.cu(inst)}")
-            lim[0] = (self.tmp(), self.tmp())
-            self.emit(f"{lim[0][0]} = OpUConvert %ulong {off}")
-            self.emit(f"{lim[0][1]} = OpUConvert %ulong {stride}")
-        if mode in (None, 3):
-            lim[3] = (self.tmp(), self.tmp())
-            self.emit(f"{lim[3][0]} = OpUConvert %ulong {offs}")
-            self.emit(f"{lim[3][1]} = OpUConvert %ulong {d2}")
+            st64 = self.tmp()
+            self.emit(f"{st64} = OpUConvert %ulong {stride}")
+            lim[0] = (off64, st64)
+        if need_raw:
+            if soff_zero:
+                offs64 = off64
+            else:
+                offs64 = self.tmp()
+                self.emit(f"{offs64} = OpIAdd %ulong {off64} {soff64}")
+            lim[3] = (offs64, d2_64)
         sel = None
         if mode is None:
             md, m1, m2, m3 = (self.tmp() for _ in range(4))
@@ -2548,15 +2603,15 @@ class Gen:
             self.emit(f"{ok} = OpULessThanEqual %bool {end} {limit}")
             return ok
 
-        def raw_or_swizzled(e0, end_bytes):
-            """mode 3: the raw end check, or mode 0's e0 for a swizzled V# with a stride (sw3)."""
+        def raw_or_swizzled(e3_sw, end_bytes):
+            """mode 3: the raw end check, or the swizzled-with-stride check (sw3)."""
             if sw3 is True:
-                return e0
+                return e3_sw
             raw = end_ok(3, end_bytes)
             if sw3 is False:
                 return raw
             r = self.tmp()
-            self.emit(f"{r} = OpSelect %bool {sw3} {e0} {raw}")
+            self.emit(f"{r} = OpSelect %bool {sw3} {e3_sw} {raw}")
             return r
 
         def check_end(end_bytes):
@@ -2567,16 +2622,30 @@ class Gen:
                 return p2
             if mode == 3 and sw3 is False:
                 return end_ok(3, end_bytes)
-            e0 = self.tmp()
-            self.emit(f"{e0} = OpLogicalAnd %bool {p1} {end_ok(0, end_bytes)}")
+            off_ok = end_ok(0, end_bytes)
             if mode == 0:
+                e0 = self.tmp()
+                self.emit(f"{e0} = OpLogicalAnd %bool {p1} {off_ok}")
                 return e0
             if mode == 3:
-                return raw_or_swizzled(e0, end_bytes)
+                e3_sw = self.tmp()
+                self.emit(f"{e3_sw} = OpLogicalAnd %bool {p3_idx} {off_ok}")
+                return raw_or_swizzled(e3_sw, end_bytes)
+            e0 = self.tmp()
+            self.emit(f"{e0} = OpLogicalAnd %bool {p1} {off_ok}")
+            if sw3 is False:
+                e3 = end_ok(3, end_bytes)
+            else:
+                if p3_idx == p1:
+                    e3_sw = e0
+                else:
+                    e3_sw = self.tmp()
+                    self.emit(f"{e3_sw} = OpLogicalAnd %bool {p3_idx} {off_ok}")
+                e3 = raw_or_swizzled(e3_sw, end_bytes)
             s12, s3, r = self.tmp(), self.tmp(), self.tmp()
             self.emit(f"{s12} = OpSelect %bool {sel[0]} {p1} {e0}")
             self.emit(f"{s3} = OpSelect %bool {sel[1]} {p2} {s12}")
-            self.emit(f"{r} = OpSelect %bool {sel[2]} {raw_or_swizzled(e0, end_bytes)} {s3}")
+            self.emit(f"{r} = OpSelect %bool {sel[2]} {e3} {s3}")
             return r
 
         def check(k):
@@ -2604,7 +2673,33 @@ class Gen:
                 size = self.tmp()
                 self.emit(f"{size} = OpUConvert %ulong {sz}")
             in_b = check_end(size)
-            return addr, d3, in_b, step
+            if scratch_swz is not False:
+                # Native gfx1036 measurement (wave32 & wave64): in scratch-swizzle mode (SWIZZLE_ENABLE=1, idxen=0,
+                # ADD_TID_ENABLE=1), typed formats > 4 bytes and 8-byte buffer_atomic_*_x2 are suppressed even in
+                # OOB_SELECT 2 (DISABLED).
+                if isinstance(size, int):
+                    if size > 4:
+                        if scratch_swz is True:
+                            in_b = "%false"
+                        else:
+                            ns, ok = self.tmp(), self.tmp()
+                            self.emit(f"{ns} = OpIEqual %bool {swz_u} {self.cu(0)}")
+                            self.emit(f"{ok} = OpLogicalAnd %bool {in_b} {ns}")
+                            in_b = ok
+                else:
+                    le4 = self.tmp()
+                    self.emit(f"{le4} = OpULessThanEqual %bool {size} {self.cl(4)}")
+                    if scratch_swz is True:
+                        ok = self.tmp()
+                        self.emit(f"{ok} = OpLogicalAnd %bool {in_b} {le4}")
+                        in_b = ok
+                    else:
+                        ns, allow, ok = self.tmp(), self.tmp(), self.tmp()
+                        self.emit(f"{ns} = OpIEqual %bool {swz_u} {self.cu(0)}")
+                        self.emit(f"{allow} = OpLogicalOr %bool {ns} {le4}")
+                        self.emit(f"{ok} = OpLogicalAnd %bool {in_b} {allow}")
+                        in_b = ok
+            return addr, d3, in_b, None
         in_b = check(0)
         if parts:
             # modes 0 and 3 end-check every dword on its own; 1 and 2 (a literal V#) share the first-byte check
