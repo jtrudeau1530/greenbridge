@@ -76,6 +76,7 @@ struct ResourceBinding {
     bool depth24_as_float = false;
     bool depth24 = false;  // a D24 family format, native or not: depth clears are quantised to 24 bits first
     bool color_attachment = false;     // has COLOR_ATTACHMENT usage: unordered-access rectangle clears need it
+    bool host_readable = false;        // D3D12_HEAP_TYPE_READBACK (or CUSTOM write-back): needs host-read flush
 };
 
 struct VulkanAccess {
@@ -1330,6 +1331,9 @@ public:
     // when the predicate says so, but Vulkan's conditional rendering does not cover transfer commands, so they run
     // unconditionally (docs/d3d12_vulkan.md section 4.7). Counted so the caller can report it.
     std::size_t unpredicated_copies = 0;
+    // Set when any command writes to a host_readable (READBACK) buffer so VulkanQueue only flushes to HOST_BIT when needed.
+    bool wrote_readback = false;
+    VkPipelineStageFlags2 readback_src_stages = 0;
 };
 
 inline ReplayResult plan_occlusion_segments(PreparedList& out) {
@@ -1438,6 +1442,8 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
     // Vulkan allows one active query per type. Only ordinary occlusion uses virtual segments.
     std::size_t ordinary_active = 0;
     bool overlaps = false, binary_active = false, statistics_active = false;
+    out.wrote_readback = false;
+    out.readback_src_stages = 0;
 
     for (std::size_t i = 0; i < commands.size(); ++i) {
         const auto& command = commands[i];
@@ -1556,6 +1562,10 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             const auto [dst_id, src_id] = copy_ids(command);
             const ResourceBinding* source = resolve(src_id);
             if (!bind(dst_id) || !source) return ReplayResult::unresolved_resource;
+            if (p.binding.host_readable) {
+                out.wrote_readback = true;
+                out.readback_src_stages |= VK_PIPELINE_STAGE_2_COPY_BIT;
+            }
             p.source = *source;
             ReplayResult result = ReplayResult::success;
             if (const auto* buffer_copy = std::get_if<CopyBuffer>(&command)) {
@@ -1620,6 +1630,9 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             if (!vk.update_buffer || !vk.buffer_at) return ReplayResult::unsupported;
             if (!vk.buffer_at(write->address, 4, p.write_buffer, p.write_offset)) return ReplayResult::unresolved_resource;
             if (p.write_offset % 4) return ReplayResult::invalid_copy;
+            // WriteBufferImmediate resolves by VA and may target a readback buffer in COPY_DEST.
+            out.wrote_readback = true;
+            out.readback_src_stages |= VK_PIPELINE_STAGE_2_TRANSFER_BIT;
         } else if (const auto* atomic = std::get_if<AtomicCopyBuffer>(&command)) {
             if (!vk.copy_buffer) return ReplayResult::unsupported;
             if (predicated) ++out.unpredicated_copies;  // a transfer command, like the copies
@@ -1637,6 +1650,10 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             }
             p.buffer_copies.push_back({p.source.buffer_offset + atomic->src_offset,
                                        p.binding.buffer_offset + atomic->dst_offset, atomic->bytes});
+            if (p.binding.host_readable) {
+                out.wrote_readback = true;
+                out.readback_src_stages |= VK_PIPELINE_STAGE_2_COPY_BIT | VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+            }
         } else if (const auto* predication = std::get_if<Predication>(&command)) {
             predicated = predication->buffer != 0;
             if (!predicated) continue;
@@ -1682,6 +1699,10 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                 if (range.type == d3d12_query::binary_occlusion) {
                     // The internal dispatch would otherwise count towards the application's CSInvocations.
                     if (!vk.resolve_binary_occlusion || statistics_active) return ReplayResult::unsupported;
+                }
+                if (p.binding.host_readable) {
+                    out.wrote_readback = true;
+                    out.readback_src_stages |= VK_PIPELINE_STAGE_2_COPY_BIT | VK_PIPELINE_STAGE_2_TRANSFER_BIT;
                 }
             }
             out.queries.push_back({i, heap, statistics_active});
