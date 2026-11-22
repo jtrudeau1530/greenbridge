@@ -62,9 +62,9 @@ This writes `reports/exe/` (JSON plus a readable summary). Check it in this orde
    `shim` (needs a reimplementation). The `shim` list is the real to-do list.
 3. **.pdata function count.** This gives function boundaries for patching and later analysis.
 4. **Inline command-list writes.** `python -I tools/inline_scan.py <game>\game_scarlett_master.exe --sites` (a few
-   minutes; it streams `dumpbin /disasm`). "UNCHECKED 0" means every inline write checks the cursor limit, so a
-   layer that keeps the cursor at the limit receives every command through the vtable; any unchecked site is a
-   write that layer never sees. The package's DLLs check at every site
+   minutes; it streams `dumpbin /disasm`; it exits 2 when it reads no instructions). "UNCHECKED 0" means every
+   inline write checks the cursor limit, so a layer that keeps the cursor at the limit receives every command
+   through the vtable; any unchecked site is a write that layer never sees. The package's DLLs check at every site
    ([d3d12_command_objects.md](d3d12_command_objects.md), "Every inline write in the package's DLLs checks first").
 
 Then `runtime\build\gta6rt.exe --dry-run <exe>` maps the image and binds every import to the shim table without
