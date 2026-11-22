@@ -777,15 +777,50 @@ public:
         if (!data) return E_INVALIDARG;
         if (feature == DXGI_FEATURE_PRESENT_ALLOW_TEARING) {
             if (size != sizeof(BOOL)) return E_INVALIDARG;
-            const auto present_modes = reinterpret_cast<PFN_vkGetPhysicalDeviceSurfacePresentModesKHR>(
-                gipa_ ? gipa_(instance_, "vkGetPhysicalDeviceSurfacePresentModesKHR") : nullptr);
-            *static_cast<BOOL*>(data) = present_modes ? TRUE : FALSE;
+            std::call_once(tearing_once_, [this] { tearing_supported_ = probe_immediate_present_mode(); });
+            *static_cast<BOOL*>(data) = tearing_supported_ ? TRUE : FALSE;
             return S_OK;
         }
         return E_INVALIDARG;
     }
 
 private:
+    bool probe_immediate_present_mode() const {
+        if (!gipa_ || !instance_ || !physical_) return false;
+        const auto create_surface =
+            reinterpret_cast<PFN_vkCreateWin32SurfaceKHR>(gipa_(instance_, "vkCreateWin32SurfaceKHR"));
+        const auto destroy_surface =
+            reinterpret_cast<PFN_vkDestroySurfaceKHR>(gipa_(instance_, "vkDestroySurfaceKHR"));
+        const auto present_modes = reinterpret_cast<PFN_vkGetPhysicalDeviceSurfacePresentModesKHR>(
+            gipa_(instance_, "vkGetPhysicalDeviceSurfacePresentModesKHR"));
+        if (!create_surface || !destroy_surface || !present_modes) return false;
+        const HINSTANCE hinst = GetModuleHandleW(nullptr);
+        HWND probe_hwnd = CreateWindowExW(0, L"STATIC", L"", WS_POPUP, 0, 0, 1, 1, nullptr, nullptr, hinst, nullptr);
+        if (!probe_hwnd) return false;
+        VkWin32SurfaceCreateInfoKHR sci{VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR};
+        sci.hinstance = hinst;
+        sci.hwnd = probe_hwnd;
+        VkSurfaceKHR surf = VK_NULL_HANDLE;
+        bool has_immediate = false;
+        if (create_surface(instance_, &sci, nullptr, &surf) == VK_SUCCESS && surf) {
+            std::uint32_t count = 0;
+            if (present_modes(physical_, surf, &count, nullptr) == VK_SUCCESS && count > 0) {
+                std::vector<VkPresentModeKHR> modes(count);
+                if (present_modes(physical_, surf, &count, modes.data()) == VK_SUCCESS) {
+                    for (VkPresentModeKHR m : modes) {
+                        if (m == VK_PRESENT_MODE_IMMEDIATE_KHR) {
+                            has_immediate = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            destroy_surface(instance_, surf, nullptr);
+        }
+        DestroyWindow(probe_hwnd);
+        return has_immediate;
+    }
+
     std::atomic<ULONG> refs_{1};
     leonida::VulkanContext& context_;
     PFN_vkGetInstanceProcAddr gipa_;
@@ -795,6 +830,8 @@ private:
     VkQueue queue_;
     std::uint32_t queue_family_;
     HWND assoc_hwnd_ = nullptr;
+    mutable std::once_flag tearing_once_;
+    bool tearing_supported_ = false;
 };
 
 }  // namespace
