@@ -416,7 +416,7 @@ int main() {
         EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &sampled_desc,
                                                          D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
                                                          IID_PPV_ARGS(&texture.p))));
-        const auto upload_desc = buffer_desc(65536, D3D12_RESOURCE_FLAG_NONE);
+        const auto upload_desc = buffer_desc(131072, D3D12_RESOURCE_FLAG_NONE);
         EXPECT(SUCCEEDED(device->CreateCommittedResource(&upload_heap, D3D12_HEAP_FLAG_NONE, &upload_desc,
                                                          D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
                                                          IID_PPV_ARGS(&upload.p))));
@@ -506,15 +506,16 @@ int main() {
             for (UINT x = 0; x < mip_size; ++x) row[x] = std::uint8_t(208 + y * mip_size + x);
         }
 
-        // Three layers with three distinct mip colours each. The test views start at layer 1 and mip 1.
+        // Three cubes with distinct colours for each face and mip. The 2D array views use layers 1 and 2.
         auto array_desc = sampled_desc;
         array_desc.Width = array_desc.Height = 4;
-        array_desc.DepthOrArraySize = 3;
+        constexpr UINT face_count = 18;
+        array_desc.DepthOrArraySize = face_count;
         Ref<ID3D12Resource> array_texture;
         EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &array_desc,
                                                          D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
                                                          IID_PPV_ARGS(&array_texture.p))));
-        D3D12_PLACED_SUBRESOURCE_FOOTPRINT array_levels[9]{};
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT array_levels[face_count * 3]{};
         device->GetCopyableFootprints(&array_desc, 0, UINT(std::size(array_levels)), 49152, array_levels,
                                       nullptr, nullptr, nullptr);
         const auto array_color = [](UINT layer, UINT mip) {
@@ -541,10 +542,16 @@ int main() {
         };
         constexpr UINT first_lod_slot = 10;
         constexpr float array_clamps[] = {1.0f, 1.75f, 2.0f, 2.25f};
+        struct CubeLodView { D3D12_SRV_DIMENSION dimension; UINT first_face, faces, minimum_mip; };
+        constexpr CubeLodView cube_lods[] = {
+            {D3D12_SRV_DIMENSION_TEXTURECUBE, 0, 6, 1}, {D3D12_SRV_DIMENSION_TEXTURECUBE, 0, 6, 2},
+            {D3D12_SRV_DIMENSION_TEXTURECUBEARRAY, 6, 12, 1}, {D3D12_SRV_DIMENSION_TEXTURECUBEARRAY, 6, 12, 2},
+        };
         // Keep multisample views after the preceding volume and minimum-LOD views.
         enum : UINT {
             array_lod_slot = first_lod_slot + std::size(lod_views),
-            ms_slot = array_lod_slot + std::size(array_clamps), ms_array_slot, ms_slice_slot, ms_first_layer_slot,
+            cube_lod_slot = array_lod_slot + std::size(array_clamps),
+            ms_slot = cube_lod_slot + std::size(cube_lods), ms_array_slot, ms_slice_slot, ms_first_layer_slot,
             ms_uint_slot, ms_uint_array_slot, ms_sint_slot, ms_sint_array_slot, view_slot_count
         };
         D3D12_DESCRIPTOR_HEAP_DESC heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, view_slot_count,
@@ -565,6 +572,19 @@ int main() {
             srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
             srv.Texture2DArray = {1, 2, 1, 2, 0, array_clamps[i]};
             device->CreateShaderResourceView(array_texture.p, &srv, view_slot(array_lod_slot + i));
+        }
+
+        for (UINT i = 0; i < std::size(cube_lods); ++i) {
+            const auto& cube_lod = cube_lods[i];
+            D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+            srv.Format = array_desc.Format;
+            srv.ViewDimension = cube_lod.dimension;
+            srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            if (cube_lod.dimension == D3D12_SRV_DIMENSION_TEXTURECUBE)
+                srv.TextureCube = {1, 2, float(cube_lod.minimum_mip)};
+            else
+                srv.TextureCubeArray = {1, 2, cube_lod.first_face, cube_lod.faces / 6, float(cube_lod.minimum_mip)};
+            device->CreateShaderResourceView(array_texture.p, &srv, view_slot(cube_lod_slot + i));
         }
 
         for (UINT i = 0; i < std::size(lod_views); ++i) {
@@ -691,6 +711,18 @@ int main() {
         EXPECT(sampler.address_u == g::AddressMode::wrap && sampler.address_v == g::AddressMode::clamp_last_texel &&
                sampler.address_w == g::AddressMode::clamp_last_texel);
         EXPECT(sampler.compare == g::CompareFunction::never && sampler.min_lod == 0.0f && sampler.max_lod > 14.9f);
+        // Two literal S#s, as a shader builds from immediates: the same wrapping sampler with other LOD ranges, so
+        // other keys. The first is registered without a heap slot (twice: the second time changes nothing), the
+        // second not, so a shader finds the first and gets the fallback for the second.
+        g::Sampler literal = sampler;
+        literal.max_lod = 4.0f;
+        const g::SamplerWords literal_words = g::encode(literal);
+        literal.max_lod = 5.0f;
+        const g::SamplerWords unregistered_words = g::encode(literal);
+        EXPECT(literal_words != sampler_words && unregistered_words != literal_words);
+        EXPECT(rt::d3d12::register_samplers(device.p, {&literal_words, 1}) == S_OK);
+        EXPECT(rt::d3d12::register_samplers(device.p, {&literal_words, 1}) == S_OK);
+        EXPECT(rt::d3d12::register_samplers(nullptr, {&literal_words, 1}) == E_INVALIDARG);
 
         // The UINT texture's view in slot 0, and three border samplers after the first: UINT (0,0,0,0) and
         // (1,1,1,1) from CreateSampler2, which the proxy does not have (the inner device does), and float white.
@@ -1227,6 +1259,24 @@ int main() {
         }
         EXPECT(sample_through_set(d, set0, set0_layout, keys, results.data()));
         sampled_through_set = true;
+        {
+            // The registered literal S# wraps (the texture, texel for texel); the other one clamps as the fallback
+            // sampler does (the right edge).
+            SampleKeys literal_keys[2] = {keys[0], keys[0]};
+            std::memcpy(literal_keys[0].ssharp, literal_words.data(), sizeof(literal_keys[0].ssharp));
+            std::memcpy(literal_keys[1].ssharp, unregistered_words.data(), sizeof(literal_keys[1].ssharp));
+            literal_keys[1].first = texels;
+            std::array<std::uint8_t, 2 * bytes> literal_pixels{};
+            EXPECT(sample_through_set(d, set0, set0_layout, literal_keys, literal_pixels.data()));
+            UINT wrapped = 0, clamped = 0;
+            for (UINT i = 0; i < texels; ++i) {
+                wrapped += std::memcmp(literal_pixels.data() + 4 * i, texel(i % size, i / size).data(), 4) == 0;
+                clamped += std::memcmp(literal_pixels.data() + bytes + 4 * i, texel(size - 1, i / size).data(), 4) == 0;
+            }
+            std::printf("literal S#s: registered %u/%u texels wrapped, unregistered %u/%u clamped\n", wrapped, texels,
+                        clamped, texels);
+            EXPECT(wrapped == texels && clamped == texels);
+        }
         if (bc.p) {
             SampleKeys bc_key = keys[0];
             std::memcpy(bc_key.tsharp, view_bytes(null_slot), sizeof(bc_key.tsharp));
@@ -1311,6 +1361,35 @@ int main() {
         lod_mismatches += array_mismatches;
         std::printf("array minimum LOD: %u/%u samples matched across two layers and four views\n",
                     UINT(array_pixels.size() / 4) - array_mismatches, UINT(array_pixels.size() / 4));
+
+        SampleKeys cube_keys[std::size(cube_lods)]{};
+        std::array<std::uint8_t, std::size(cube_lods) * bytes> cube_pixels{};
+        for (UINT i = 0; i < std::size(cube_lods); ++i) {
+            cube_keys[i] = keys[0];
+            std::memcpy(cube_keys[i].tsharp, view_bytes(cube_lod_slot + i), sizeof(cube_keys[i].tsharp));
+            cube_keys[i].layer = cube_lods[i].faces;
+            cube_keys[i].first = i * texels;
+        }
+        EXPECT(sample_through_set(d, set0, set0_layout, cube_keys, cube_pixels.data()));
+        UINT cube_errors = 0;
+        for (UINT view = 0; view < std::size(cube_lods); ++view) {
+            const auto& v = cube_lods[view];
+            UINT errors = 0;
+            for (UINT i = 0; i < texels; ++i) {
+                const UINT face = v.first_face + i % v.faces;
+                const auto want = v.minimum_mip == 1 || d.image_view_min_lod
+                    ? array_color(face, v.minimum_mip) : std::array<std::uint8_t, 4>{};
+                const auto* sample = cube_pixels.data() + (view * texels + i) * 4;
+                if (std::memcmp(sample, want.data(), 4) && errors++ == 0)
+                    std::fprintf(stderr, "cube view %u, face %u, min mip %u: got %u,%u,%u,%u; expected %u,%u,%u,%u\n",
+                                 view, face, v.minimum_mip, sample[0], sample[1], sample[2], sample[3],
+                                 want[0], want[1], want[2], want[3]);
+            }
+            cube_errors += errors;
+        }
+        lod_mismatches += cube_errors;
+        std::printf("cube minimum LOD: %u/%u samples matched across cube and cube-array views\n",
+                    UINT(cube_pixels.size() / 4) - cube_errors, UINT(cube_pixels.size() / 4));
 
         const D3D12_CPU_DESCRIPTOR_HANDLE volume_slots[] = {view_slot(volume_all), view_slot(volume_mip),
                                                             linear_slot, srgb_slot};
@@ -1443,6 +1522,88 @@ int main() {
             }
             for (auto& resource : test.textures) resource.reset();
             std::printf("MSAA format %u: 2D and array integer reads and zero fallbacks matched\n", UINT(test.format));
+        }
+
+        // More than 4096 SRVs and more than a full shader-visible sampler heap (2048): 5000 distinct views of the
+        // texture (mip ranges by swizzles), then one more that samples as the texture, and 2100 distinct wrapping
+        // samplers (MaxLOD apart). The last view through the last sampler must give the texture, one tile to the
+        // right; a fallback view or the fallback (clamping) sampler would not.
+        {
+            constexpr UINT many_views = 5000, many_samplers = 2100, heap_samplers = 2048;
+            Ref<ID3D12DescriptorHeap> many_view_heap, many_sampler_heaps[2];
+            D3D12_DESCRIPTOR_HEAP_DESC many_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, many_views + 1,
+                                                 D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+            EXPECT(SUCCEEDED(device->CreateDescriptorHeap(&many_desc, IID_PPV_ARGS(&many_view_heap.p))));
+            many_desc = {D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, heap_samplers, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                         0};
+            for (auto& heap : many_sampler_heaps)
+                EXPECT(SUCCEEDED(device->CreateDescriptorHeap(&many_desc, IID_PPV_ARGS(&heap.p))));
+            const auto cpu_start = [&](ID3D12DescriptorHeap* heap) {
+                return reinterpret_cast<XboxHeapHandleFn>(slot(heap, 9))(heap);
+            };
+            const std::uint64_t many_view_cpu = cpu_start(many_view_heap.p);
+            std::vector<std::array<std::uint32_t, 8>> tsharps;
+            constexpr UINT mip_ranges[][2] = {{0, 1}, {0, 2}, {1, 1}, {1, 2}};
+            for (UINT i = 0; i < many_views; ++i) {
+                const UINT swizzle = i / UINT(std::size(mip_ranges));
+                const UINT c0 = swizzle % 6, c1 = swizzle / 6 % 6, c2 = swizzle / 36 % 6, c3 = swizzle / 216 % 6;
+                D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+                srv.Format = sampled_desc.Format;
+                srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+                srv.Shader4ComponentMapping = D3D12_ENCODE_SHADER_4_COMPONENT_MAPPING(c0, c1, c2, c3);
+                const auto& mips = mip_ranges[i % std::size(mip_ranges)];
+                srv.Texture2D = {mips[0], mips[1], 0, 0};
+                const D3D12_CPU_DESCRIPTOR_HANDLE at{SIZE_T(many_view_cpu + i * step)};
+                device->CreateShaderResourceView(texture.p, &srv, at);
+                std::memcpy(tsharps.emplace_back().data(), reinterpret_cast<const void*>(many_view_cpu + i * step), 32);
+            }
+            // Every mip with alpha forced to one: the texture's texels (alpha 255), under a T# no other view has.
+            D3D12_SHADER_RESOURCE_VIEW_DESC last_srv{};
+            last_srv.Format = sampled_desc.Format;
+            last_srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+            last_srv.Shader4ComponentMapping =
+                D3D12_ENCODE_SHADER_4_COMPONENT_MAPPING(0, 1, 2, D3D12_SHADER_COMPONENT_MAPPING_FORCE_VALUE_1);
+            last_srv.Texture2D = {0, UINT(-1), 0, 0};
+            const std::uint64_t last_view = many_view_cpu + many_views * step;
+            device->CreateShaderResourceView(texture.p, &last_srv, D3D12_CPU_DESCRIPTOR_HANDLE{SIZE_T(last_view)});
+            std::memcpy(tsharps.emplace_back().data(), reinterpret_cast<const void*>(last_view), 32);
+            std::memcpy(tsharps.emplace_back().data(), view_bytes(own), 32);
+            std::sort(tsharps.begin(), tsharps.end());
+            EXPECT(std::unique(tsharps.begin(), tsharps.end()) == tsharps.end());  // distinct set entries
+
+            std::vector<std::array<std::uint32_t, 4>> ssharps;
+            std::uint64_t last_sampler = 0;
+            for (UINT i = 0; i < many_samplers; ++i) {
+                D3D12_SAMPLER_DESC many_sampler = sampler_desc;
+                many_sampler.MaxLOD = float(i + 1) / 256.0f;  // the S# keeps 8 fraction bits; LOD 0 is sampled
+                last_sampler = cpu_start(many_sampler_heaps[i / heap_samplers].p) + (i % heap_samplers) * sampler_step;
+                device->CreateSampler(&many_sampler, D3D12_CPU_DESCRIPTOR_HANDLE{SIZE_T(last_sampler)});
+                std::memcpy(ssharps.emplace_back().data(), reinterpret_cast<const void*>(last_sampler), 16);
+            }
+            std::memcpy(ssharps.emplace_back().data(), sampler_bytes, 16);
+            std::sort(ssharps.begin(), ssharps.end());
+            EXPECT(std::unique(ssharps.begin(), ssharps.end()) == ssharps.end());
+
+            // The next ExecuteCommandLists writes them into the set.
+            EXPECT(SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.p, nullptr)));
+            EXPECT(list->Close() == S_OK);
+            queue->ExecuteCommandLists(1, lists);
+            EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
+            d.fn<PFN_vkDeviceWaitIdle>("vkDeviceWaitIdle")(d.device);
+            SampleKeys last_keys{};
+            std::memcpy(last_keys.tsharp, reinterpret_cast<const void*>(last_view), sizeof(last_keys.tsharp));
+            std::memcpy(last_keys.ssharp, reinterpret_cast<const void*>(last_sampler), sizeof(last_keys.ssharp));
+            std::array<std::uint8_t, bytes> last_texels{};
+            EXPECT(sample_through_set(d, set0, set0_layout, {&last_keys, 1}, last_texels.data()));
+            UINT differ = 0;
+            for (UINT i = 0; i < texels; ++i)
+                if (std::memcmp(last_texels.data() + 4 * i, texel(i % size, i / size).data(), 4) != 0 && differ++ < 4)
+                    std::fprintf(stderr, "view %u through sampler %u, texel %u: got %u,%u,%u,%u\n", many_views + 1,
+                                 many_samplers, i, last_texels[4 * i], last_texels[4 * i + 1], last_texels[4 * i + 2],
+                                 last_texels[4 * i + 3]);
+            EXPECT(differ == 0);
+            std::printf("bindless capacity: the %uth SRV through the %uth sampler gave the texture\n", many_views + 1,
+                        many_samplers);
         }
 #endif
 

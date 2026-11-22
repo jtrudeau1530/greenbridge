@@ -25,10 +25,10 @@ PARTIAL = {n for n, _ in check.W64X_PARTIAL}
 WAVE32_WORDS = {n: w for n, w in check.CS_DUMPS if n in check.WAVE32_DUMPS and n not in ("cs_store", "cs_smem_soffset_imm")}
 
 
-# every test check.py runs: compute, cs_wavemask, cs_fmt_1010102, the dumps (#73, #152 cross-half, partial), the two store
-# tests, pixel tests, the two-mip draws, the gradient samples and three mesh fixtures (skipped here: build.py
+# every test check.py runs: compute, cs_wavemask, cs_fmt_1010102, the dumps (#73, #152 cross-half, partial), the three
+# vk_store_test checks (cs_imgstore, cs_imgload, cs_imgload_d16), pixel tests, the two-mip draws, the gradient samples and three mesh fixtures (skipped here: build.py
 # does not build mesh shaders)
-TOTAL = (len(check.COMPUTE) + 2 + len(check.CS_DUMPS) + len(check.W64X_DUMPS) + len(check.W64X_PARTIAL) + 2
+TOTAL = (len(check.COMPUTE) + 2 + len(check.CS_DUMPS) + len(check.W64X_DUMPS) + len(check.W64X_PARTIAL) + 3
          + len(check.PIXEL_TESTS) + len(check.CLIP_TESTS) + len(check.BOUNDS) + len(check.GLOBAL_OFFSET)
          + len(check.MIP_TEST_PASSES) + len(check.GRADIENT_TESTS)
          + 8)  # three mesh fixtures, ps_tex, cs_cmpx_class_f32, cs_user_sgprs, cs_cvt_f32_sat and ps_gather_wrap
@@ -107,7 +107,7 @@ class Wave64Checks(unittest.TestCase):
                 return 0, "out[0..7] = " + " ".join(map(str, (WAVE32_WORDS[name] + [0] * 8)[:8])) + "\n"
             if name == "cs_workgroup_yz":     # #186: vk_compute_test's 2x3x4 Y/Z histogram line
                 return 0, "2x3x4 workgroup Y/Z: 0 mismatches\n"
-            if name in ("cs_imgstore", "cs_imgload"):
+            if name in ("cs_imgstore", "cs_imgload", "cs_imgload_d16"):   # vk_store_test checks
                 return 0, "0 bad\n0 bad\n0 bad\n"
             return 0, "0 mismatches\n"
 

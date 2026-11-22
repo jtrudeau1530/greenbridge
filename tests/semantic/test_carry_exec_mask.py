@@ -31,7 +31,7 @@ import rdna2spirv  # noqa: E402
 import spirv_mini_interp as si  # noqa: E402
 
 STUB_DXBC = b"DXBC" + bytes(24) + struct.pack("<I", 0) + bytes(4)
-VSHARP = [0, 0, 0xFFFFFFFF, 0]
+VSHARP = [0, 0, 0xFFFFFFFF, 0x31016FAC]  # OOB_SELECT 3 (raw): stores are in range up to num_records (#1104)
 SENTINEL = 0xDEADBEEF
 ENC4 = " ; encoding: [0x00,0x00,0x00,0x00]"
 

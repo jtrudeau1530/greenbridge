@@ -3,21 +3,24 @@
 param([Parameter(Mandatory)][string]$Game, [Parameter(Mandatory)][string]$Out)
 $root = Split-Path $PSScriptRoot -Parent
 $tool = Join-Path $root "tools\rpf9_carve.py"
-# -Game may be relative or end in a separator; archive names are cut from the resolved, separator-ended prefix.
+# -Game may be relative or end in a separator; archive names are cut from a separator-ended prefix.
 $Game = (Resolve-Path -LiteralPath $Game).ProviderPath
-$prefix = $Game.TrimEnd('\') + '\'
+# Resolve-Path preserves 8.3 short components (e.g. RUNNER~1), while Get-ChildItem emits canonical
+# FullName paths. Deriving the prefix from Resolve-Path then cuts the wrong number of characters and
+# re-carves already-caved archives; use the canonical form for both sides of the Substring.
+$prefix = (Get-Item -LiteralPath $Game).FullName.TrimEnd('\') + '\'
 $rows = @()
-foreach ($f in Get-ChildItem $Game -Recurse -Filter *.rpf | Sort-Object Length) {
+foreach ($f in Get-ChildItem -LiteralPath $Game -Recurse -Filter *.rpf | Sort-Object Length) {
     $rel = $f.FullName.Substring($prefix.Length)
     $dest = Join-Path $Out ([IO.Path]::GetFileNameWithoutExtension(($rel -replace "[\\/]", "_")))
-    if (-not (Test-Path (Join-Path $dest "index.json"))) {
+    if (-not (Test-Path -LiteralPath (Join-Path $dest "index.json"))) {
         Write-Host ("{0:HH:mm:ss} carving {1} ({2:N1} GiB)" -f (Get-Date), $rel, ($f.Length / 1GB))
         python -I $tool $f.FullName $dest | Select-Object -Last 1
     }
-    $s = (Get-Content (Join-Path $dest "index.json") -Raw | ConvertFrom-Json).summary
+    $s = (Get-Content -LiteralPath (Join-Path $dest "index.json") -Raw | ConvertFrom-Json).summary
     $rows += [pscustomobject]@{ archive = $rel; files = $s.files; bink2 = $s.bink2_files; span = $s.span
                                readable = [math]::Round(($s.compressed_bytes) / $s.span, 4)
                                unread = [math]::Round($s.unread_bytes / $s.span, 4); inflated = $s.inflated_bytes }
 }
-$rows | ConvertTo-Json | Set-Content -Encoding utf8 (Join-Path $Out "coverage.json")
+$rows | ConvertTo-Json | Set-Content -Encoding utf8 -LiteralPath (Join-Path $Out "coverage.json")
 $rows | Format-Table archive, files, bink2, @{n = "GiB"; e = { [math]::Round($_.span / 1GB, 2) } }, readable, unread -AutoSize | Out-String -Width 200

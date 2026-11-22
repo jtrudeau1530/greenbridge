@@ -31,8 +31,11 @@ from check import (CMPX_CLASS_WORDS, CVT_F32_SAT_CASES, GRADIENT_TESTS, TEST_PRO
                    TEXTURE_MIP_TEST, GATHER_LOD_TEST, MIP_TEST_PASSES, GATHER_WRAP, USER_SGPRS_ENV, USER_SGPRS_WORDS, Skip, mesh_v5_test, not_found_message,
                    pick_build_dir, start_failure, texture_gradient_a16_test, texture_mip_test)
 from check import TEXOFF_ARGS, texoff_problem   # ps_texoff's expected words and arguments live in check.py
+from check import TEXOFF_FALLBACK, texoff_env   # LEONIDA_TEXOFF_FALLBACK=1: texel offsets without maintenance8
 from check import gpu_test_timeout, timed_out   # per-program time limit (LEONIDA_GPU_TEST_TIMEOUT)
+from check import MESH_COMPUTE, mesh_env   # LEONIDA_MESH_COMPUTE=1: mesh shaders as compute + a generated VS
 from check import WAVE32_LANE_DUMPS, WAVE32_LANE_ENV, narrow_subgroup_skip, wave32_lane_skip   # as in check.py
+from check import PIXEL_VERTEX, interp_f16_high_problem   # ps_interp_f16_high's producers and check
 
 
 def make_dxbc(chunks: list[tuple[bytes, bytes]]) -> bytes:
@@ -411,6 +414,24 @@ def check_uniform_branch(raw_path: str) -> tuple[bool, str]:
     return (n8 - n80 > 0 and n7 > 0), detail
 
 
+def check_d16_texture(raw_path: str) -> tuple[bool, str]:
+    """Point-sample the 8x8 UNORM gradient and round each component to binary16 before widening."""
+    data = Path(raw_path).read_bytes()
+    if len(data) != 64 * 64 * 16:
+        return False, f"expected a 64x64 RGBA32F frame, got {len(data)} bytes"
+    levels = [struct.unpack("<e", struct.pack("<e", i * 32 / 255.0))[0] for i in range(8)]
+    bad = 0
+    first = ""
+    for i, pixel in enumerate(struct.iter_unpack("<4f", data)):
+        x, y = i % 64, i // 64
+        expected = (levels[x // 8], levels[y // 8], levels[4], 1.0)
+        if pixel != expected:
+            if not bad:
+                first = f"at ({x},{y}): got {pixel}, want {expected}"
+            bad += 1
+    return (False, f"{bad}/4096 mismatches; {first}") if bad else (True, "4096/4096 RGBA pixels exact")
+
+
 def check_grad(raw_path: str, want_b: float, want_a: float) -> tuple[bool, str]:
     px = read_raw_rgba32f(raw_path)
     if problem := frame_problem(px):
@@ -462,7 +483,8 @@ def check_clip_half(raw_path: str, want_b: float, want_a: float) -> tuple[bool, 
 DRAWN_WITH = {GATHER_LOD_TEST: "vs_ids.asm", "ps_flat": "vs_ids.asm", "ps_texture_sample": "vs_ids.asm", "ps_cube_sample": "vs_ids.asm",
               "ps_texture_sample_d16": "vs_ids.asm", "ps_sample_c_lz": "vs_ids.asm", "ps_sample_c_lz_a16": "vs_ids.asm",
               "ps_gather_wrap": "vs_ids.asm",
-              **{name: "vs_ids.asm" for name in GRADIENT_TESTS}, "vs_clip": "ps_ops.asm"}
+              **{name: "vs_ids.asm" for name in GRADIENT_TESTS}, "vs_clip": "ps_ops.asm",
+              "ps_interp_f16_high": "vs_f16_pack.asm", "ms_f16_pack": "ps_interp_f16_high.asm"}
 
 
 def with_draw_shaders(asm_files: list[str]) -> list[str]:
@@ -571,7 +593,7 @@ def run_suite(a, work: str) -> int:
                 (b"ISG1", make_sig_chunk([(1, 3, 0, 0xF, 0xF), (0, 3, 1, 0xF, 0xF)])),
                 (b"OSG1", make_sig_chunk([(1, 3, 0, 0xF, 0xF), (0, 3, 1, 0xF, 0xF)])),
             ])
-        elif name in ("ms_tri", "ms_w64x_ballot", "ms_wave_info_s3"):
+        elif name in ("ms_tri", "ms_w64x_ballot", "ms_wave_info_s3", "ms_f16_pack"):
             dxbc = make_dxbc([(b"PSV0", make_ms_psv0(128, 64, 64, 2))])
         elif name == "ms_v5_workgroup":
             dxbc = make_dxbc([(b"PSV0", make_ms_psv0(32, 3, 1, group_shared=128))])
@@ -604,6 +626,10 @@ def run_suite(a, work: str) -> int:
             cmd.append("--wave64-emulate")
         if bary_fallback():   # raw barycentrics from an interpolated input, fed by a pass-through GS
             cmd.append("--bary-fallback")
+        if TEXOFF_FALLBACK:   # image_sample*_o: offset folded into the coordinate, no VK_KHR_maintenance8
+            cmd.append("--texel-offset-fallback")
+        if MESH_COMPUTE:   # mesh shaders as compute writing to a buffer, drawn by tools/mesh_compute_vs.py
+            cmd.append("--mesh-compute")
         rc, out = run_cmd(cmd, gpu=False)
     print("=== rdna2spirv.py ===")
     print(out)
@@ -613,6 +639,11 @@ def run_suite(a, work: str) -> int:
         import bary_fallback_gs
         for gs in bary_fallback_gs.build_for_index(spirv_dir):
             print("bary fallback GS:", os.path.basename(gs))
+
+    if MESH_COMPUTE:
+        import mesh_compute_vs
+        for vs_spv in mesh_compute_vs.build_for_index(spirv_dir):
+            print("mesh compute VS:", os.path.basename(vs_spv))
 
     # 3. Build helper SPIR-V shaders
     vs_tri = os.path.join(spirv_dir, "vs_tri.spv")
@@ -659,7 +690,7 @@ def run_suite(a, work: str) -> int:
         elif name == "cs_bvh":
             rc, msg = run_cmd([vk_compute, spv, "1", "bvh"], env=cs_env)
             results.append((name, rc == 0, msg.splitlines()[-1] if msg else ""))
-        elif name in ("cs_bounds", "cs_smem_bounds", "cs_smem_stride_align", "cs_smem_sload_neg", "cs_buf_tail",
+        elif name in ("cs_bounds", "cs_smem_bounds", "cs_smem_stride_align", "cs_smem_sload_neg", "cs_buf_tail", "cs_oob_select", "cs_oob_tail",
                       "cs_cmpx_class_f32"):
             # num_records bounds check (cs_bounds.asm): the out-of-bounds store is dropped and the out-of-bounds
             # load reads 0, so thread 0's four output words are fixed. One thread, no wave64 requirement.
@@ -675,6 +706,8 @@ def run_suite(a, work: str) -> int:
                 "cs_smem_sload_neg": [0x5EED0004, 0x5EED0000, 0x5EED0004, 0x5EED0004, 0x5EED0008, 0x5EED000C,
                                       0xEEEEEEEE, 0xEEEEEEEE],
                 "cs_buf_tail": [0, 0x5EED000C, 0x5EED0008, 0x5EED000C, 0, 0, 0x5EED0010, 0],
+                "cs_oob_select": [0x5EED000C, 0, 0x5EED0014, 0, 0x5EED0018, 0xEEEEEEEE, 0, 0],
+                "cs_oob_tail": [0, 0, 0x5EED0010, 0, 0xBEEF0000, 0xEEEEEEEE, 0, 0x5EED0010],
                 "cs_cmpx_class_f32": CMPX_CLASS_WORDS,
             }[name]
             words = dump_words(msg)
@@ -722,7 +755,8 @@ def run_suite(a, work: str) -> int:
                       "cs_w64x_branch", "cs_w64x_ballot", "cs_w64x_wg128_branches", "cs_w64x_lds_raw",
                       "cs_w64x_lds_war", "cs_w64x_partial", "cs_w64x_sbarrier", "cs_w64x_load_ballot_load",
                       "cs_w64x_mask_reuse", "cs_w64x_mask_reuse2", "cs_w64x_chain_barrier", "cs_barrier_divergent",
-                      "cs_bpermute32", "cs_w64x_partial_scmp", "cs_w32_partial_scmp"):
+                      "cs_bpermute32", "cs_w64x_partial_scmp", "cs_w32_partial_scmp", "cs_barrier_early_end",
+                      "cs_barrier_loop"):
             cs_dump_wants = {
                 "cs_store": [0x400080FF, 0xE00003FF, 0x3C004000, 0xEEEEEEEE, 0x40003C00, 0xBC003800],
                 # base + soffset + imm (cs_smem_soffset_imm.asm); out[4..7] are seeds the shader leaves alone
@@ -769,6 +803,10 @@ def run_suite(a, work: str) -> int:
                 "cs_bpermute32": [0, 50, 162, 99, 36, 218, 183, 15],     # wave32: needs 32 lanes
                 # SHADER-91: s_barrier sites in different wave-uniform branches meet (cs_barrier_divergent.asm)
                 "cs_barrier_divergent": [127, 126, 125, 124, 123, 122, 121, 120],
+                # SHADER-91: other waves end without s_barrier (cs_barrier_early_end.asm); a loop whose trip count
+                # differs per wave (cs_barrier_loop.asm)
+                "cs_barrier_early_end": [127, 126, 125, 124, 123, 122, 121, 120],
+                "cs_barrier_loop": [128, 96, 64, 32, 128, 96, 64, 0xEEEEEEEE],
             }
             want = cs_dump_wants[name]
             # Every dump but cs_store / cs_smem_soffset_imm / cs_w32_lane_wrap / cs_movrelsd_2 / cs_w32_permute /
@@ -781,8 +819,9 @@ def run_suite(a, work: str) -> int:
             emulated = w64_emulated()
             partial = name in ("cs_w64x_partial", "cs_w64x_partial_scmp")
             wave64 = name not in ("cs_store", "cs_smem_soffset_imm", "cs_wqm_w32", "cs_w32_lane_wrap", "cs_movrelsd_2",
-                                  "cs_w32_permute", "cs_barrier_divergent", "cs_w32_lds_u8_d16", "cs_bpermute32",
-                                  "cs_w32_partial_scmp", "cs_exec_const") and not emulated and not partial
+                                  "cs_w32_permute", "cs_barrier_divergent", "cs_barrier_early_end", "cs_barrier_loop",
+                                  "cs_w32_lds_u8_d16", "cs_bpermute32", "cs_w32_partial_scmp",
+                                  "cs_exec_const") and not emulated and not partial
 
             if partial and not emulated:
                 cs_env = dict(os.environ, VKC_SUBGROUP_SIZE="64")
@@ -799,7 +838,7 @@ def run_suite(a, work: str) -> int:
         elif name == "cs_imgstore":
             rc, msg = run_cmd([vk_store, spv])
             results.append((name, rc == 0, msg.splitlines()[-1] if msg else ""))
-        elif name == "cs_imgload":
+        elif name in ("cs_imgload", "cs_imgload_d16"):
             rc, msg = run_cmd([vk_store, spv, "load"])
             results.append((name, rc == 0, msg.splitlines()[-1] if msg else ""))
         elif name in MIP_TEST_PASSES:
@@ -816,6 +855,7 @@ def run_suite(a, work: str) -> int:
             tool = os.path.join(a.build, "vk_texture_test" + ext)
             raw = os.path.join(raw_dir, f"{name}.raw")
             if name == "ps_texture_sample_d16":
+                Path(raw).unlink(missing_ok=True)
                 cmd = [tool, os.path.join(spirv_dir, "vs_ids.spv"), spv, raw, "0", "0", "0", "0", "0"]
             else:
                 mode = {"ps_cube_sample": ["cube"], "ps_sample_c_lz": ["dref"],
@@ -830,13 +870,9 @@ def run_suite(a, work: str) -> int:
                 rc, msg = 1, start_failure(tool, e)
             if rc == UNSUPPORTED:   # e.g. fewer push constant bytes than the texture tests need
                 results.append((name, None, unsupported_skip(msg)))
-            elif name == "ps_texture_sample_d16" and rc == 0 and os.path.isfile(raw):
-                with open(raw, "rb") as f:
-                    f.seek((32 * 64 + 32) * 16)
-                    r, g, b, alpha = struct.unpack("<4f", f.read(16))
-                exp_b = struct.unpack("<e", struct.pack("<e", 128.0 / 255.0))[0]
-                ok = abs(r - exp_b) <= 0.05 and abs(g - exp_b) <= 0.05 and abs(b - exp_b) == 0.0 and alpha == 1.0
-                results.append((name, ok, f"center(32,32)=({r:.6f}, {g:.6f}, {b:.6f}, {alpha:.1f})"))
+            elif name == "ps_texture_sample_d16" and rc == 0:
+                ok, detail = check_d16_texture(raw) if os.path.isfile(raw) else (False, "missing RGBA32F readback")
+                results.append((name, ok, detail))
             else:
                 results.append((name, rc == 0 and "PASSED" in msg, msg.splitlines()[-1] if msg else ""))
         elif name == "ps_gather_wrap":
@@ -868,12 +904,12 @@ def run_suite(a, work: str) -> int:
                 results.append((name, None, f"SKIP ({reason})"))
             else:
                 results.append((name, rc == 0, lines[-1] if lines else ""))
-        elif name == "ps_texoff":
+        elif name in ("ps_texoff", "ps_texoff_implicit"):
             # Texel offsets: needs vk_texture_test's texture, sampler and descriptor table (vk_harness binds none),
             # and VK_KHR_maintenance8 for the non-constant Offset; the tool exits 77 without it.
             raw = os.path.join(raw_dir, f"{name}.raw")
             rc, msg = run_cmd([os.path.join(a.build, "vk_texture_test" + ext), vs_tri, spv, raw, *TEXOFF_ARGS],
-                              env=dict(os.environ, VKT_NEED_MAINTENANCE8="1"))
+                              env=texoff_env())
             if rc == UNSUPPORTED:
                 results.append((name, None, unsupported_skip(msg)))
             elif rc != 0:
@@ -885,6 +921,11 @@ def run_suite(a, work: str) -> int:
         elif name.startswith("ps_"):
             raw = os.path.join(raw_dir, f"{name}.raw")
             vs = os.path.join(spirv_dir, "vs_ids.spv") if name == "ps_flat" else vs_tri   # check.py draws ps_flat with vs_ids
+            if name in PIXEL_VERTEX:
+                if bary_fallback():   # no PerVertexKHR inputs under --bary-fallback (docs/design.md)
+                    results.append((name, None, "SKIP (per-vertex f16 interpolants need barycentrics)"))
+                    continue
+                vs = os.path.join(spirv_dir, PIXEL_VERTEX[name] + ".spv")
             env = dict(gfx_env or os.environ, **PIXEL_ENV[name]) if name in PIXEL_ENV else gfx_env
             bary_gs = os.path.join(spirv_dir, f"{name}.bary_gs.spv")
             if bary_fallback() and os.path.isfile(bary_gs):   # --bary-fallback PS: barycentrics from this GS
@@ -944,6 +985,9 @@ def run_suite(a, work: str) -> int:
                 ok, detail = check_wqm(raw)
             elif name == "ps_flat":
                 ok, detail = check_flat(raw)
+            elif name == "ps_interp_f16_high":
+                problem = interp_f16_high_problem(list(struct.iter_unpack("<4I", open(raw, "rb").read())))
+                ok, detail = not problem, problem or "f16 low/high halves and f32 control within 2e-3"
             else:
                 ok, detail = False, "no checker defined"
             results.append((name, ok, detail))
@@ -968,7 +1012,7 @@ def run_suite(a, work: str) -> int:
                             problem or "24/24 workgroup coordinates exact (2 x 3 x 4)"))
         elif name in ("ms_tri", "ms_w64x_ballot", "ms_wave_info_s3"):
             raw = os.path.join(raw_dir, f"{name}.raw")
-            env = dict(gfx_env or os.environ, VKH_MESH="1")
+            env = mesh_env(spirv_dir, name, gfx_env)
             rc, msg = run_cmd([vk_harness, spv, fs_passthru, raw], env=env)
             # ms_w64x_ballot needs exact wave64 (a 64-wide subgroup, or --wave64-emulate): skip it elsewhere, as
             # the wave64 compute dumps are.
@@ -983,9 +1027,24 @@ def run_suite(a, work: str) -> int:
             else:
                 ok, detail = check_grad(raw, 0.5, 1.0)
                 results.append((name, ok, detail))
-        elif name == "ms_clip":
+        elif name == "ms_f16_pack":   # mesh producer of packed f16 params, drawn with ps_interp_f16_high
             raw = os.path.join(raw_dir, f"{name}.raw")
             env = dict(gfx_env or os.environ, VKH_MESH="1")
+            fs = os.path.join(spirv_dir, "ps_interp_f16_high.spv")
+            if bary_fallback():
+                results.append((name, None, "SKIP (per-vertex f16 interpolants need barycentrics)"))
+                continue
+            rc, msg = run_cmd([vk_harness, spv, fs, raw], env=env)
+            if rc == UNSUPPORTED:
+                results.append((name, None, unsupported_skip(msg)))
+            elif rc != 0:
+                results.append((name, False, msg))
+            else:
+                problem = interp_f16_high_problem(list(struct.iter_unpack("<4I", open(raw, "rb").read())))
+                results.append((name, not problem, problem or "f16 low/high halves and f32 control within 2e-3"))
+        elif name == "ms_clip":
+            raw = os.path.join(raw_dir, f"{name}.raw")
+            env = mesh_env(spirv_dir, name, gfx_env)
             rc, msg = run_cmd([vk_harness, spv, fs_passthru, raw], env=env)
             if rc == UNSUPPORTED:
                 results.append((name, None, unsupported_skip(msg)))

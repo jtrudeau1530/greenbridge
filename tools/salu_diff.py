@@ -9,20 +9,30 @@ and compares four exported words bit for bit: three SGPRs and SCC (through s_cse
 The reference is separate from tools/cpu_ref.py on purpose: it models only the scalar unit, keeps
 SCC explicit for every opcode, and does not share code with the translator.
 
+With --oracle hw the same programs also run natively on an AMD GPU (tools/hw_oracle/) and the hardware's four
+words are compared with the reference: that validates the reference itself, not the translator. The GPU is
+whatever the machine has (gfx11 on an RDNA3 laptop), so a difference is checked against the ISA text before it
+counts as a reference bug. Without the oracle tools the run exits 77.
+
 Usage:
     python -I tools/salu_diff.py [--programs N] [--seed S] [--max-ops N] [--ops s_min_i32,s_cselect_b32]
+    python -I tools/salu_diff.py --oracle hw             # hardware vs reference only
+    python -I tools/salu_diff.py --oracle translator,hw  # both
     python -I tools/salu_diff.py --list-ops
     python -I tools/salu_diff.py --self-test
 
 Exit 0 when every program matches, 1 on a mismatch (the shortest failing program is printed after
-removing instructions that do not matter), 2 on a harness error. Skips are counted with their reasons.
+removing instructions that do not matter), 2 on a harness error, 77 when the requested hardware oracle is
+unavailable. Skips are counted with their reasons.
 
-By default the opcodes in LANE_MASK_OPS are left out: the translator models those 64-bit values (and
+By default the opcodes in LANE_MASK_OPS are left out (a hardware-only run keeps them: the GPU has no wave-mask
+view of a 64-bit SGPR pair): the translator models those 64-bit values (and
 s_wqm_b32) as per-lane wave masks, so a 64-bit integer reference disagrees with them by design (--ops
 names them explicitly). s_bfe_* control words stay inside offset + width <= 32 unless --bfe-any: past
-that the reference follows the ISA pseudocode literally and the translator sign-extends s_bfe_i32 from
-bit 31, and which one hardware does is an open question in #156. Known divergence on main: s_ff0/ff1_i32_b32
-with a constant source, until SHADER-46 (#349) lands.
+that the field stops at bit 31 (width = min(width, 32 - offset), so s_bfe_i32 sign-extends from the top bit
+that exists). gfx1150 hardware and the translator both do that; the ISA pseudocode does not say so, and RDNA2
+itself is unmeasured (#156). Known divergence on main: s_ff0/ff1_i32_b32 with a constant source, until
+SHADER-46 (#349) lands.
 """
 import argparse
 import gc
@@ -100,6 +110,10 @@ def wqm(x, width):
 
 def bfe(src, ctl, signed):
     off, width = ctl & 31, (ctl >> 16) & 0x7F
+    # A field that runs past bit 31 stops there: s_bfe_i32 sign-extends from the top bit that exists (LLVM
+    # constantFoldBFE does for v_bfe; 5-bit width there). The s_bfe rule itself rests on the gfx1150 measurement
+    # (4000 random control words, --oracle hw); RDNA2 is unmeasured.
+    width = min(width, 32 - off)
     if width == 0:
         return 0
     field = (src >> off) & ((1 << width) - 1)
@@ -406,20 +420,38 @@ class Skip(Exception):
     pass
 
 
-def check(lines):
-    """None on a match, else a description. Raises Skip / RefError."""
-    want = reference(lines)
-    got = translated(lines)
-    # A signalling-NaN pattern comes back quiet: the exported words pass through Python floats in the interpreter.
-    bad = [k for k in range(4) if want[k] != got[k] and not (is_nan(want[k]) and is_nan(got[k]))]
+def _diff(lines, want, got, label, quiet_nan):
+    # A signalling-NaN pattern comes back quiet through the interpreter's Python floats; hardware is exact.
+    bad = [k for k in range(4) if want[k] != got[k] and not (quiet_nan and is_nan(want[k]) and is_nan(got[k]))]
     if not bad:
         return None
     i = bad[0]
     what = "SCC" if i == 3 else lines[-4 + i].split(", ")[1]
-    return f"word {i} ({what}): reference 0x{want[i]:08x}, translated 0x{got[i]:08x}"
+    return f"word {i} ({what}): reference 0x{want[i]:08x}, {label} 0x{got[i]:08x}"
 
 
-def shrink(lines):
+def check(lines, backends=("translator",), hw=None):
+    """None on a match, else a description. Raises Skip (every backend skipped) / RefError.
+    hw is the hardware result for this program (four words or a str reason), or a callable lines -> that."""
+    want = reference(lines)
+    problems, skips = [], []
+    if "translator" in backends:
+        try:
+            problems.append(_diff(lines, want, translated(lines), "translated", True))
+        except Skip as e:
+            skips.append(e)
+    if "hw" in backends:
+        got = hw(lines) if callable(hw) else hw
+        if isinstance(got, str):
+            skips.append(Skip(f"hardware: {got}"))
+        else:
+            problems.append(_diff(lines, want, got, "hardware", False))
+    if skips and len(skips) == len(backends):
+        raise skips[0]
+    return "; ".join(p for p in problems if p) or None
+
+
+def shrink(lines, check_fn=check):
     """Drop instructions (not seeds or the observation) while the program still mismatches."""
     n_seed = len(REGS)
     body = lines[n_seed:-5]
@@ -429,7 +461,7 @@ def shrink(lines):
         for i in range(len(body)):
             trial = lines[:n_seed] + body[:i] + body[i + 1:] + lines[-5:]
             try:
-                if check(trial):
+                if check_fn(trial):
                     body = body[:i] + body[i + 1:]
                     changed = True
                     break
@@ -438,14 +470,31 @@ def shrink(lines):
     return lines[:n_seed] + body + lines[-5:]
 
 
-def run_suite(programs, seed, max_ops, ops):
+def hw_prepare(oracle, programs):
+    """Run every program on the hardware in batches. Returns per program the four words, or a str reason it was skipped."""
+    from hw_oracle import asm
+    out = [None] * len(programs)
+    todo = []
+    for i, lines in enumerate(programs):
+        why = asm.skip_reason(lines, oracle.arch)
+        if why:
+            out[i] = why
+        else:
+            todo.append(i)
+    for i, r in zip(todo, oracle.run([programs[i] for i in todo])):
+        out[i] = r
+    return out
+
+
+def run_suite(programs, seed, max_ops, ops, backends=("translator",), oracle=None):
     counts = {"pass": 0, "mismatch": 0, "skip": {}}
     failures = []
     rng = random.Random(seed)
-    for i in range(programs):
-        lines = generate(rng, rng.randrange(1, max_ops + 1), ops)
+    progs = [generate(rng, rng.randrange(1, max_ops + 1), ops) for _ in range(programs)]
+    hw_words = hw_prepare(oracle, progs) if "hw" in backends else [None] * programs
+    for i, lines in enumerate(progs):
         try:
-            problem = check(lines)
+            problem = check(lines, backends, hw_words[i])
         except Skip as e:
             counts["skip"][str(e)] = counts["skip"].get(str(e), 0) + 1
             continue
@@ -480,12 +529,19 @@ def main(argv=None):
     ap.add_argument("--self-test", action="store_true")
     ap.add_argument("--all-failures", action="store_true", help="print every failing program, not just the first")
     ap.add_argument("--bfe-any", action="store_true",
-                    help="also give s_bfe_* control words past offset + width = 32 (an open hardware question)")
+                    help="also give s_bfe_* control words past offset + width = 32 (measured on gfx1150: the field stops at bit 31; RDNA2 unmeasured)")
     ap.add_argument("--inline64", action="store_true",
                     help="also use inline constants as 64-bit sources (the translator reads them as lane masks)")
+    ap.add_argument("--oracle", default="translator",
+                    help="comma-separated comparison targets: translator (default), hw (natively on the AMD GPU; see "
+                         "tools/hw_oracle/). 'hw' alone compares the hardware with the reference only")
+    ap.add_argument("--hw-arch", default=None, help="GPU architecture to assemble for (default: detected)")
     a = ap.parse_args(argv)
     if a.programs < 1 or a.max_ops < 1:
         ap.error("--programs and --max-ops must be at least 1")
+    backends = tuple(dict.fromkeys(t.strip() for t in a.oracle.split(",")))
+    if not backends or any(t not in ("translator", "hw") for t in backends):
+        ap.error("--oracle takes translator, hw or translator,hw")
     global INLINE64, BFE_ANY
     INLINE64, BFE_ANY = a.inline64, a.bfe_any
     if a.list_ops:
@@ -500,19 +556,36 @@ def main(argv=None):
             ap.error("--ops must be a comma-separated list of opcodes")
         ops = sorted(set(tokens))
     else:
-        ops = sorted(o for o in OPS if o not in LANE_MASK_OPS)
+        ops = sorted(o for o in OPS if backends == ("hw",) or o not in LANE_MASK_OPS)
     unknown = [o for o in ops if o not in OPS]
     if unknown:
         ap.error("unknown ops: " + ", ".join(unknown))
-    counts, failures = run_suite(a.programs, a.seed, a.max_ops, ops)
-    skips = sum(counts["skip"].values())
-    print(f"{a.programs} programs (seed {a.seed}): {counts['pass']} pass, {counts['mismatch']} mismatch, {skips} skipped")
-    for reason, n in sorted(counts["skip"].items(), key=lambda kv: -kv[1]):
-        print(f"  skip x{n}: {reason}")
-    for i, problem, lines in failures[: None if a.all_failures else 1]:
-        small = shrink(lines)
-        print(f"MISMATCH program {i}: {check(small) or problem}")
-        print("\n".join("\t" + line for line in small))
+    oracle = None
+    if "hw" in backends:
+        from hw_oracle import runner
+        try:
+            oracle = runner.open_oracle(arch=a.hw_arch)
+        except runner.Unavailable as e:
+            print(f"hardware oracle unavailable: {e}")
+            return 77
+        print(f"hardware oracle: {oracle.device}")
+    try:
+        counts, failures = run_suite(a.programs, a.seed, a.max_ops, ops, backends, oracle)
+        skips = sum(counts["skip"].values())
+        print(f"{a.programs} programs (seed {a.seed}, {'+'.join(backends)}): {counts['pass']} pass, "
+              f"{counts['mismatch']} mismatch, {skips} skipped")
+        for reason, n in sorted(counts["skip"].items(), key=lambda kv: -kv[1]):
+            print(f"  skip x{n}: {reason}")
+
+        def check_fn(lines):
+            return check(lines, backends, (lambda l: oracle.run([l])[0]) if oracle else None)
+        for i, problem, lines in failures[: None if a.all_failures else 1]:
+            small = shrink(lines, check_fn)
+            print(f"MISMATCH program {i}: {check_fn(small) or problem}")
+            print("\n".join("\t" + line for line in small))
+    finally:
+        if oracle:
+            oracle.close()
     return 1 if failures else 0
 
 

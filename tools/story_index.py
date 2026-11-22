@@ -343,7 +343,11 @@ def main():
     except (OSError, ValueError) as e:
         print(f"{a.source}: {e}", file=sys.stderr)
         return 2
-    write_output(a.out, rows, summary)
+    try:
+        write_output(a.out, rows, summary)
+    except OSError as e:
+        print(f"{a.out}: {e.strerror or e}", file=sys.stderr)
+        return 2
     if not a.quiet:
         top = dict(sorted(summary["signatures"].items(), key=lambda kv: -kv[1]["files"])[:15])
         print(json.dumps({k: summary[k] for k in

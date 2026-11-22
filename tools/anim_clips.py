@@ -4,7 +4,13 @@ The table of contents is encrypted, so this starts from the same stream walk as 
 that inflates cleanly to its end. A clip dictionary is a RAGE resource whose system pages are one or two of those
 streams. Its root stream starts with 8 zero bytes, a 0x50xxxxxx page-map pointer at +8 and zeros up to +0x38. The
 page map's byte at +8 gives the number of system pages, and the dictionary takes that many back-to-back streams.
-Pointers are then offsets into the joined pages (pointer - 0x50000000). See docs/animation.md, "Keyframe decoding".
+A last page that anim_index does not list (a zlib stream inflating to fewer than 64 bytes, or a 16-byte raw page
+right after the stream) is joined when the pages then parse. Pointers are then offsets into the joined pages
+(pointer - 0x50000000). See docs/animation.md, "Keyframe decoding".
+
+Hash-only references are joined across the archive: a root pack reference with a null pointer is another
+dictionary's joaat32(name), and each `.motion` child is {clip hash, dictionary hash}; the counts say how many of
+them are found in the same archive.
 
 Every animation is decoded down to the per-frame values. The default output is counts only: the number of
 dictionaries, clips, animations, sequences, channels by type and track types. The checks are also counted: channel
@@ -143,7 +149,20 @@ def parse_clip(s, at):
     if kind >= 16:  # +0x20 is a pointer: a parametric clip that refers to packs outside the dictionary
         name_at = s.u64(at + 0x30)
         if SYSTEM <= name_at < SYSTEM + len(s.d):      # `.motion`: name at +0x30
-            return {"kind": "motion", "name": s.string(at + 0x30), "animations": []}
+            motion = {"kind": "motion", "name": s.string(at + 0x30), "animations": [], "children": None,
+                      "parameters": None}
+            try:
+                # +0x58 u32 parameter count; +0x60 array of {u64 0; u32 clip hash; u32 dictionary hash}
+                children, n = s.array(at + 0x60)
+                if children is None:
+                    motion["children"], motion["parameters"] = [], s.u32(at + 0x58)
+                elif children + 16 * n <= len(s.d) and all(s.u64(children + 16 * i) == 0 for i in range(n)):
+                    motion["children"] = [(s.u32(children + 16 * i + 8), s.u32(children + 16 * i + 12))
+                                          for i in range(n)]
+                    motion["parameters"] = s.u32(at + 0x58)
+            except (DecodeError, struct.error):
+                pass
+            return motion
         # `.motionmatcher`: a 16-byte id at +0x28, name at +0x38
         return {"kind": "motionmatcher", "name": s.string(at + 0x38), "animations": []}
     clip = {"kind": "clip", "name": s.string(at + 0x28), "duration": s.f32(at + 0x78), "animations": []}
@@ -163,15 +182,19 @@ def parse_dictionary(s):
     if refs_word and not SYSTEM <= refs_word < SYSTEM + len(s.d):
         # Same root layout, other content: "RIG" + version at +0x70 is a rig dictionary.
         raise NotClipDictionary("rig" if s.d[0x70:0x73] == b"RIG" else "other")
-    d = {"name": s.string(0x38), "hash": s.u32(0x68), "clips": [], "packs": [], "external_packs": 0}
-    for _key, value in s.atmap(0x48):
+    d = {"name": s.string(0x38), "hash": s.u32(0x68), "clips": [], "packs": [], "external_packs": 0,
+         "external_hashes": []}
+    for key, value in s.atmap(0x48):
         if value is not None:
-            d["clips"].append(parse_clip(s, value))
+            clip = parse_clip(s, value)
+            clip["hash"] = key & 0xFFFFFFFF          # the key is joaat32(dictionary) << 32 | clip hash
+            d["clips"].append(clip)
     refs, n = s.array(0x70)
     for i in range(n):
         pack = s.ptr(refs + 16 * i)
         if pack is None:
-            d["external_packs"] += 1        # only a hash; the pack is not in this resource
+            d["external_packs"] += 1        # only a hash: another clip dictionary's joaat32(name)
+            d["external_hashes"].append(s.u32(refs + 16 * i + 8))
             continue
         anims = [parse_animation(s, v) for _k, v in s.atmap(pack + 0x48) if v is not None]
         d["packs"].append({"name": s.string(pack + 0x38), "hash": s.u32(pack + 0x68), "animations": anims})
@@ -444,10 +467,47 @@ def _next_to(prev, row):
     return row["offset"] == (prev["offset"] + prev["stored"] + 15) & ~15
 
 
+def _gap_page(m, row, first):
+    """The page right after `row` when it is not a listed stream: a zlib stream that inflates to fewer than the
+    64 bytes anim_index lists, or a 16-byte raw tail (as rpf9-explorer reads). It is used only when the joined
+    pages parse as a clip dictionary. -> segment dict or None."""
+    d = zlib.decompressobj()
+    d.decompress(m[row["offset"]:row["offset"] + row["stored"]])
+    end = row["offset"] + row["stored"] - len(d.unused_data)
+    at = (end + 15) & ~15
+    if at + 16 > len(m) or m[end:at] != bytes(at - end):
+        return None
+    if anim_index.ZHDR.match(m, at) and m[at:at + 3] != b"KB2":
+        z, chunk = zlib.decompressobj(), m[at:at + 4096]
+        try:
+            page = z.decompress(chunk)
+        except zlib.error:
+            return None
+        if not z.eof:
+            return None
+        seg = {"offset": at, "stored": len(chunk) - len(z.unused_data), "raw": False, "kind": "small zlib page"}
+    else:
+        page = bytes(m[at:at + 16])
+        seg = {"offset": at, "stored": 16, "raw": True, "kind": "raw 16-byte page"}
+    try:
+        parse_dictionary(System(first + page))
+    except (DecodeError, struct.error, IndexError):
+        return None
+    return seg
+
+
+def segment(rows, k):
+    """(offset, stored, raw) for a stream index or a gap page."""
+    if isinstance(k, dict):
+        return k["offset"], k["stored"], k["raw"]
+    return rows[k]["offset"], rows[k]["stored"], False
+
+
 def group(m, rows):
-    """-> ([(root index, [stream indices])], unresolved count by reason). A dictionary takes the page map's
-    system page count of back-to-back streams; a page that is not the next stream is reported, not guessed."""
-    out, unresolved, taken = [], collections.Counter(), set()
+    """-> ([(root index, [stream indices or gap pages])], unresolved count by reason, gap pages by kind). A
+    dictionary takes the page map's system page count of back-to-back streams. When the last page is not the next
+    listed stream, the bytes right after the stream are tried (`_gap_page`); otherwise the root is reported."""
+    out, unresolved, taken, gaps = [], collections.Counter(), set(), collections.Counter()
     for i, row in enumerate(rows):
         if i in taken or row["signature"] != "zero-prefix":
             continue
@@ -470,12 +530,18 @@ def group(m, rows):
         while len(parts) < pages and k + 1 < len(rows) and _next_to(rows[k], rows[k + 1]):
             k += 1
             parts.append(k)
+        if len(parts) == pages - 1:
+            joined = b"".join(_inflate(m, rows[j]) for j in parts)
+            gap = _gap_page(m, rows[k], joined)
+            if gap is not None:
+                parts.append(gap)
+                gaps[gap["kind"]] += 1
         if len(parts) != pages:
             unresolved["system page not the next stream"] += 1
             continue
-        taken.update(parts)
+        taken.update(p for p in parts if not isinstance(p, dict))
         out.append((i, parts))
-    return out, unresolved
+    return out, unresolved, gaps
 
 
 def new_stats():
@@ -495,9 +561,9 @@ def decode_resource(path, segments, budget=None):
     stats = new_stats()
     with open(path, "rb") as fh:
         data = b""
-        for off, stored in segments:
+        for off, stored, raw in segments:
             fh.seek(off)
-            data += zlib.decompressobj().decompress(fh.read(stored))
+            data += fh.read(stored) if raw else zlib.decompressobj().decompress(fh.read(stored))
     s = System(data)
     row = {"offset": segments[0][0], "streams": len(segments), "system_bytes": len(data)}
     try:
@@ -516,6 +582,16 @@ def decode_resource(path, segments, budget=None):
     stats["clips"] += len(d["clips"])
     stats["clips_motion"] += sum(c["kind"] == "motion" for c in d["clips"])
     stats["clips_motionmatcher"] += sum(c["kind"] == "motionmatcher" for c in d["clips"])
+    external = set(d["external_hashes"])
+    for c in d["clips"]:
+        if c["kind"] != "motion":
+            continue
+        if c["children"] is None:
+            stats["motion_children_unreadable"] += 1
+            continue
+        stats[f"motion_parameters:{c['parameters']}"] += 1
+        stats["motion_children"] += len(c["children"])
+        stats["motion_children_in_external_refs"] += sum(dh in external for _ch, dh in c["children"])
     stats["clip_animation_refs"] += sum(len(c["animations"]) for c in d["clips"])
     stats["packs_local"] += len(d["packs"])
     stats["packs_external"] += d["external_packs"]
@@ -545,10 +621,36 @@ def decode_resource(path, segments, budget=None):
         stats["animations_skipped_over_budget"] += skipped
         stats["dictionaries_over_budget"] += 1
         row["over_budget"] = True
+    # for the archive-wide join in scan(); scan() removes these lists from the rows it returns
+    row["_clip_hashes"] = [c["hash"] for c in d["clips"] if c["kind"] == "clip"]
+    row["_children"] = [ch for c in d["clips"] if c["kind"] == "motion" and c["children"] for ch in c["children"]]
+    row["_external"] = d["external_hashes"]
     row.update(hash=f"0x{d['hash']:08x}", name=d["name"], clips=len(d["clips"]), packs=len(d["packs"]),
                external_packs=d["external_packs"], animations=ok + failed + skipped, decoded=ok,
                seconds=round(time.monotonic() - started, 3))
     return row, stats
+
+
+def join_references(rows, stats):
+    """Resolve hash-only references across the archive: a root `+0x70` item with a null pointer names another
+    dictionary (its joaat32 name hash), and a `.motion` child is {clip hash, dictionary hash}."""
+    clips_by_dict = collections.defaultdict(set)
+    for r in rows:
+        if "_clip_hashes" in r:
+            clips_by_dict[int(r["hash"], 16)].update(r["_clip_hashes"])
+    ext_seen = set()
+    for r in rows:
+        for h in r.pop("_external", []):
+            stats["external_refs_to_a_dictionary_here"] += h in clips_by_dict
+            if h not in ext_seen:
+                ext_seen.add(h)
+                stats["external_hashes_distinct"] += 1
+                stats["external_hashes_distinct_found_here"] += h in clips_by_dict
+        for ch, dh in r.pop("_children", []):
+            if dh in clips_by_dict:
+                stats["motion_children_dictionary_here"] += 1
+                stats["motion_children_resolved_to_clip"] += ch in clips_by_dict[dh]
+        r.pop("_clip_hashes", None)
 
 
 def _decode_star(args):
@@ -558,9 +660,9 @@ def _decode_star(args):
 def scan(path, start=None, limit=None, jobs=1, progress=None, budget=None):
     rows, walk = anim_index.scan_rpf(path, start, limit)
     with open(path, "rb") as fh, mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ) as m:
-        groups, unresolved = group(m, rows)
-    work = [(path, [(rows[k]["offset"], rows[k]["stored"]) for k in parts], budget) for _i, parts in groups]
-    used = [k for _i, parts in groups for k in parts]
+        groups, unresolved, gaps = group(m, rows)
+    work = [(path, [segment(rows, k) for k in parts], budget) for _i, parts in groups]
+    used = [k for _i, parts in groups for k in parts if not isinstance(k, dict)]
     stats, out = new_stats(), []
     if jobs > 1 and len(work) > 1:
         import multiprocessing
@@ -578,11 +680,13 @@ def scan(path, start=None, limit=None, jobs=1, progress=None, budget=None):
             if progress and n % 5000 == 0:
                 progress(n, len(work))
     out.sort(key=lambda r: r["offset"])
+    join_references(out, stats)
     summary = {
         "streams": walk["files"],
         "dictionary_roots": len(groups) + sum(unresolved.values()),
         "dictionaries_grouped": len(groups),
         "unresolved": dict(unresolved),
+        "gap_pages": dict(gaps),
         "pages": {str(k): v for k, v in sorted(collections.Counter(len(p) for _i, p in groups).items())},
         "dictionary_streams": len(used),
         "dictionary_stored_bytes": sum(rows[k]["stored"] for k in used),
@@ -598,14 +702,15 @@ def scan(path, start=None, limit=None, jobs=1, progress=None, budget=None):
 def decode_one(path, offset, frames):
     rows, _walk = anim_index.scan_rpf(path, offset, 64 << 20)
     with open(path, "rb") as fh, mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ) as m:
-        groups, _unresolved = group(m, rows[:4])
+        groups, _unresolved, _gaps = group(m, rows[:4])
     if not groups or rows[groups[0][0]]["offset"] != offset:
         raise ValueError(f"no clip dictionary starts at 0x{offset:x}")
     with open(path, "rb") as fh:
         data = b""
         for k in groups[0][1]:
-            fh.seek(rows[k]["offset"])
-            data += zlib.decompressobj().decompress(fh.read(rows[k]["stored"]))
+            off, stored, raw = segment(rows, k)
+            fh.seek(off)
+            data += fh.read(stored) if raw else zlib.decompressobj().decompress(fh.read(stored))
     s = System(data)
     d = parse_dictionary(s)
     for pack in d["packs"]:
@@ -641,6 +746,8 @@ def main():
     a = ap.parse_args()
     if a.jobs < 1:
         ap.error("--jobs must be at least 1")
+    if a.frames < 0:
+        ap.error("--frames must be 0 or more")
     if a.decode is None and not a.out:
         ap.error("an output .json is required unless --decode is given")
     try:

@@ -115,6 +115,9 @@ def _entry(source, rig, group):
     return _fd(source) + b"\xff\xff\x06\x00" + bytes(6) + _fd(rig) + b"\xff\xff\x07\x00" + bytes(6) + _fd(group)
 
 
+CHUNK = 65536   # anim_index.MAX_CHUNK: the 64 KiB stream size of a split resource
+
+
 def rbf0_blob():
     """Synthetic RBF0 with three rig sets (one empty), three rig entries and three source kinds."""
     b = bytearray(b"RBF0" + struct.pack("<H", 0xFFFB) + struct.pack("<I", 1) + _u16s(b"rage__crRigSetManager") + b"\x00")
@@ -369,9 +372,11 @@ class RigArchiveTest(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.root = self.tmp.name
         self.rpf = os.path.join(self.root, "rigs.rpf")
+        # A real continuation follows a full 64 KiB stream: pad the rig table (parse_rbf0 ignores the tail)
+        # and cut it there.
         blob = rbf0_blob()
-        cut = blob.find(b"\xff" * 6) + 6
-        self.parts = [blob[:cut], blob[cut:]]
+        blob += bytes(CHUNK + 4096 - len(blob))
+        self.parts = [blob[:CHUNK], blob[CHUNK:]]
         self.skel = b"SKEL_Synthetic\x00SKEL_Second\x00"
         self.skel += bytes(64 - len(self.skel))
         self.front = b"\x0f\x00\xe0\x00\x0c\x00\x16\x00SKEL_Front\x00"
@@ -396,6 +401,17 @@ class RigArchiveTest(unittest.TestCase):
         r = anim_index.parse_rbf0(blob)
         self.assertEqual(r["summary"]["rigsets"], 3)
         self.assertEqual(r["summary"]["entries"], 3)
+
+    def test_cli_rejects_a_shared_rig_destination(self):
+        out = os.path.join(self.root, "index.json")
+        alias = os.path.join(self.root, ".", "index.json")
+        result = subprocess.run(
+            [sys.executable, "-I", TOOL, self.rpf, out, "--rigs", alias, "--quiet"],
+            capture_output=True, text=True,
+        )
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("index and --rigs must use different paths", result.stderr)
+        self.assertFalse(os.path.exists(out))
 
     def test_cli_rigs(self):
         out = os.path.join(self.root, "index.json")
@@ -435,6 +451,48 @@ class RigArchiveTest(unittest.TestCase):
                 with open(rigs, encoding="utf-8") as f:
                     summary = json.load(f)["rbf0"]["summary"]
                 self.assertEqual((summary["distinct_names"], summary["stored_name_hashes"]), (2, expected))
+
+
+class ShortStreamEndsTheResource(unittest.TestCase):
+    """A stream shorter than 64 KiB is the last one of its resource: the adjacent stream is not joined."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = self.tmp.name
+        self.rbf0 = rbf0_blob()
+        self.other = b"\x5a" * 300   # raw, adjacent, no stop signature: only the size rule ends the join
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_archive(self):
+        rpf = os.path.join(self.root, "rigs.rpf")
+        header = bytearray(0x100)
+        header[:4] = b"9FPR"
+        struct.pack_into("<I", header, 4, len(header))
+        body = bytearray()
+        for payload in (self.rbf0, self.other):
+            body += zlib.compress(payload)
+            body += bytes((-len(body)) % 16)
+        with open(rpf, "wb") as f:
+            f.write(header + body)
+        rows, _ = anim_index.scan_rpf(rpf)
+        self.assertEqual(anim_index.collect_rbf0(rpf, rows), self.rbf0)
+
+    def test_directory(self):
+        with open(os.path.join(self.root, "001000.bin"), "wb") as f:
+            f.write(self.rbf0)
+        with open(os.path.join(self.root, f"{0x1000 + len(self.rbf0):06x}.bin"), "wb") as f:
+            f.write(self.other)
+        self.assertEqual(anim_index.collect_rbf0_dir(self.root), self.rbf0)
+
+    def test_directory_full_stream_still_joins(self):
+        blob = self.rbf0 + bytes(CHUNK + 100 - len(self.rbf0))
+        with open(os.path.join(self.root, "001000.bin"), "wb") as f:
+            f.write(blob[:CHUNK])
+        with open(os.path.join(self.root, f"{0x1000 + CHUNK:06x}.bin"), "wb") as f:
+            f.write(blob[CHUNK:])
+        self.assertEqual(anim_index.collect_rbf0_dir(self.root), blob)
 
 
 if __name__ == "__main__":

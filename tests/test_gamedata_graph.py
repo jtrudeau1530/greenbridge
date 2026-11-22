@@ -97,6 +97,16 @@ class GamedataGraphTest(unittest.TestCase):
         return subprocess.run([sys.executable, "-I", TOOL, *args], cwd=self.root,
                               capture_output=True, text=True, encoding="utf-8", errors="replace")
 
+    def test_cli_reports_unwritable_graph_report(self):
+        self.finish()
+        out = os.path.join(self.root, "missing", "graph.json")
+
+        result = self.run_tool(self.carve, "--json", out)
+
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn(f"cannot write {out}", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+
     def test_cycle_at_end_of_a_deep_include_chain(self):
         size = sys.getrecursionlimit() + 50
         adjacency = {node: [node + 1] for node in range(size - 1)}
@@ -286,6 +296,56 @@ class GamedataGraphTest(unittest.TestCase):
                          ("$(future)", "a", "unknown_macro"))
         self.assertEqual(gg.classify_target("../Item[@key='X']"),
                          ("relative/locator", "../Item[@key='X']", "relative_locator"))
+
+
+INHERIT = (
+    b'<Root><Sets>'
+    b'<Item key="base"/>'
+    b'<Item key="mid" parentPath="../Item[@key=\'base\']"/>'
+    b'<Item key="leaf" parentPath="../Item[@key=\'mid\']"/>'
+    b'<Item key="dq" parentPath=\'../Item[@key="base"]\'/>'
+    b'<Item key="case" parentPath="../Item[@key=\'BASE\']"/>'
+    b'<Item key="nonform" parentPath="Item/base"/>'
+    b'<Item key="twin"/><Item key="twin"/>'
+    b'<Item key="amb" parentPath="../Item[@key=\'twin\']"/>'
+    b'<Item key="loopa" parentPath="../Item[@key=\'loopb\']"/>'
+    b'<Item key="loopb" parentPath="../Item[@key=\'loopa\']"/>'
+    b'</Sets>'
+    b'<Other><Item key="far" parentPath="../Item[@key=\'base\']"/></Other>'
+    b'</Root>'
+)
+
+
+class ParentPathInheritanceTest(unittest.TestCase):
+    def graph(self, *payloads):
+        return gg.build_graph([{"data": p, "complete": True} for p in payloads])
+
+    def test_sibling_locators_resolve_inside_the_document(self):
+        s = self.graph(INHERIT)["summary"]["parent_path_inheritance"]
+        self.assertEqual(s["documents"], 1)
+        self.assertEqual(s["sites"], 9)
+        self.assertEqual(s["xpath_sibling_form"], 8)       # "Item/base" is not the ../Tag[@a='v'] form
+        # mid, leaf, dq, loopa, loopb; "case" is exact-match only; "far" has no sibling "base" in <Other>
+        self.assertEqual(s["resolved_in_document"], 5)
+        self.assertEqual(s["ambiguous"], 1)                # two siblings share the key "twin"
+        self.assertEqual(s["unresolved"], 3)
+        self.assertEqual(s["chain_depths"], {"1": 2, "2": 1})  # mid and dq -> base, leaf -> mid -> base
+        self.assertEqual(s["cycles"], 2)                   # loopa and loopb each walk back to themselves
+
+    def test_existing_counts_are_unchanged(self):
+        s = self.graph(INHERIT)["summary"]
+        self.assertEqual(s["references"], {"parentPath": 9})
+        self.assertEqual(s["edges"]["parent_path"], 9)
+        self.assertEqual(s["resolution"], {"relative_locator": 9})
+
+    def test_no_locator_documents(self):
+        s = self.graph(PLAIN, BAD)["summary"]["parent_path_inheritance"]
+        self.assertEqual((s["documents"], s["sites"], s["cycles"], s["chain_depths"]), (0, 0, 0, {}))
+
+    def test_summary_keeps_no_key_strings(self):
+        text = json.dumps(self.graph(INHERIT))
+        for word in ("base", "leaf", "twin", "loopa", "far"):
+            self.assertNotIn(word, text)
 
 
 if __name__ == "__main__":

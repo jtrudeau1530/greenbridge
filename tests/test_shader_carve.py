@@ -507,6 +507,24 @@ class ShaderCarveCliIntegrationTest(unittest.TestCase):
         self.assertIn("is a file, not a folder", res.stderr)
         self.assertNotIn("Traceback", res.stderr)
 
+    def test_carve_preserves_existing_index_temp_sibling(self):
+        dxbc = make_dxbc([(b"PRIV", bytes(range(32)))])
+        with open(self.archive, "wb") as f:
+            f.write(make_rpf_entry("valid", 1, dxbc))
+        os.mkdir(self.out)
+        sibling = os.path.join(self.out, "index.json.tmp")
+        with open(sibling, "w", encoding="utf-8") as f:
+            f.write("keep me")
+
+        result = self.run_carve(self.archive, self.out)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        with open(sibling, encoding="utf-8") as f:
+            self.assertEqual(f.read(), "keep me")
+        with open(os.path.join(self.out, "index.json"), encoding="utf-8") as f:
+            self.assertEqual([row["name"] for row in json.load(f)], ["valid"])
+        self.assertFalse(any(os.path.isdir(os.path.join(self.out, name)) for name in os.listdir(self.out)))
+
     def test_main_closes_mmap_on_exit(self):
         dxbc = make_dxbc([(b"PRIV", bytes(range(32)))])
         with open(self.archive, "wb") as f:

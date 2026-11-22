@@ -14,8 +14,6 @@ The expected words are hand-computed constants; a small plain-Python model of th
 is checked against the same constants, so a typo in either is caught. Standard library only.
 
 Not tested:
-- v_movrelsd_2_b32 (the GFX10 variant with separate source and destination offsets in M0) is not handled by the
-  translator yet: it raises Unsupported (a follow-up for whoever implements it).
 - An index past the VGPR file. The translator emits an unchecked OpAccessChain into its 256-entry %vgpr array,
   so S0.addr + M0 or D.addr + M0 >= 256 is undefined in SPIR-V (the mini interpreter raises
   UnsupportedConstruct). An index below 256 but beyond the VGPRs the shader uses reads or writes the translator's

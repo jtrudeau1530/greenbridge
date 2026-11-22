@@ -211,6 +211,14 @@ int main(int argc, char** argv) {
         std::printf("unsupported: %s lacks the required image feature\n", spec.format_name.c_str());
         return unsupported;
     }
+    // The pipeline layout pushes the 144-byte translated user-data block. A device with fewer push constant bytes
+    // (128 on Intel Arc and some AMD drivers) can't create it: a device limit, not a wrong result (TEST-149).
+    constexpr std::uint32_t push_bytes = 144;
+    if (props.properties.limits.maxPushConstantsSize < push_bytes) {
+        std::printf("unsupported: need %u push constant bytes, device has %u\n", push_bytes,
+                    props.properties.limits.maxPushConstantsSize);
+        return unsupported;
+    }
     VkPhysicalDeviceVulkan12Features have12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
     VkPhysicalDeviceFeatures2 have{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &have12};
     vkGetPhysicalDeviceFeatures2(pd, &have);
@@ -476,7 +484,7 @@ int main(int argc, char** argv) {
         return 1;
     }
     set->insert_key(make_tsharp_key(spec.tsharp), index);
-    const VkPushConstantRange push{.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, .size = 144};
+    const VkPushConstantRange push{.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, .size = push_bytes};
     const VkDescriptorSetLayout set_layout = set->layout();
     VkPipelineLayoutCreateInfo pli{.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
                                    .setLayoutCount = 1,

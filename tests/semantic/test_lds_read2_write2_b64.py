@@ -38,7 +38,7 @@ STUB_DXBC = b"DXBC" + bytes(24) + struct.pack("<I", 0) + bytes(4)
 FSSM = bytearray(0x148)
 struct.pack_into("<4I", FSSM, 0x138, 0x40088, 32, 1, 1)
 FSSM = bytes(FSSM)
-VSHARP = [0, 0, 0x1000, 0]
+VSHARP = [0, 0, 0x1000, 0x31016FAC]
 LDS_BYTES = 4096
 A = (0x11111111, 0x22222222)        # vdata0 (lo, hi)
 B = (0x33333333, 0x44444444)        # vdata1 (lo, hi)

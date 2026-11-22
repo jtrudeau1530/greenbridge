@@ -179,6 +179,12 @@ bool g_keys[256] = {};
 bool g_focus = false;
 bool fake_key_down(int vk) { return vk >= 0 && vk < 256 && g_keys[vk]; }
 bool fake_focus() { return g_focus; }
+int g_cursor_x = 0, g_cursor_y = 0;
+bool fake_cursor(int* x, int* y) {
+    *x = g_cursor_x;
+    *y = g_cursor_y;
+    return true;
+}
 
 GameInputGamepadState pad_state(IGameInput* input, IGameInputDevice* dev, uint32_t* ui = nullptr) {
     GameInputGamepadState st{};
@@ -195,9 +201,99 @@ GameInputGamepadState pad_state(IGameInput* input, IGameInputDevice* dev, uint32
     return st;
 }
 
+bool sticks_at_rest(const GameInputGamepadState& st) {
+    return st.leftThumbstickX == 0 && st.leftThumbstickY == 0 && st.rightThumbstickX == 0 &&
+           st.rightThumbstickY == 0 && st.leftTrigger == 0 && st.rightTrigger == 0;
+}
+
+// WASD, the mouse and its buttons. Runs in the focused mode with focus and nothing held.
+void test_keyboard_pad_sticks(IGameInput* input, IGameInputDevice* kb) {
+    rt::gameinput::poll();
+    check(sticks_at_rest(pad_state(input, kb)), "keyboard pad: sticks and triggers at rest");
+
+    struct Dir { std::vector<int> keys; float x, y; const char* what; };
+    const float d = 23170 / 32767.0f;
+    const Dir dirs[] = {
+        {{'W'}, 0, 1, "keyboard pad: W is left stick up"},
+        {{'S'}, 0, -1, "keyboard pad: S is left stick down"},
+        {{'A'}, -1, 0, "keyboard pad: A is left stick left"},
+        {{'D'}, 1, 0, "keyboard pad: D is left stick right"},
+        {{'W', 'S'}, 0, 0, "keyboard pad: W and S cancel"},
+        {{'A', 'D'}, 0, 0, "keyboard pad: A and D cancel"},
+        {{'W', 'S', 'D'}, 1, 0, "keyboard pad: W+S cancel, D still full right"},
+        {{'W', 'D'}, d, d, "keyboard pad: W+D is up-right on the round gate"},
+        {{'S', 'A'}, -d, -d, "keyboard pad: S+A is down-left on the round gate"},
+    };
+    for (const Dir& e : dirs) {
+        for (int k : e.keys) g_keys[k] = true;
+        rt::gameinput::poll();
+        const GameInputGamepadState st = pad_state(input, kb);
+        check(approx(st.leftThumbstickX, e.x) && approx(st.leftThumbstickY, e.y) && st.buttons == 0 &&
+                  st.rightThumbstickX == 0 && st.rightThumbstickY == 0,
+              e.what);
+        for (int k : e.keys) g_keys[k] = false;
+    }
+    rt::gameinput::poll();
+    check(sticks_at_rest(pad_state(input, kb)), "keyboard pad: left stick centers on release");
+
+    // 10 px right, 10 px down in one poll: 10 x 1024 axis units each, +Y down on screen is stick down.
+    g_cursor_x += 10;
+    g_cursor_y += 10;
+    rt::gameinput::poll();
+    GameInputGamepadState st = pad_state(input, kb);
+    check(approx(st.rightThumbstickX, 10240 / 32767.0f) && approx(st.rightThumbstickY, -10240 / 32767.0f) &&
+              st.leftThumbstickX == 0,
+          "keyboard pad: mouse delta moves the right stick");
+    g_cursor_x -= 500;
+    rt::gameinput::poll();
+    check(approx(pad_state(input, kb).rightThumbstickX, -1), "keyboard pad: a large mouse delta clamps to full");
+    // The mouse stops: the stick falls back, never past center, to exactly 0.
+    int polls = 0;
+    float last = -1;
+    bool monotonic = true;
+    for (; polls < 200; ++polls) {
+        rt::gameinput::poll();
+        st = pad_state(input, kb);
+        monotonic &= st.rightThumbstickX >= last && st.rightThumbstickX <= 0;
+        last = st.rightThumbstickX;
+        if (st.rightThumbstickX == 0 && st.rightThumbstickY == 0) break;
+    }
+    check(monotonic && polls < 100 && sticks_at_rest(st), "keyboard pad: right stick decays to 0 when the mouse stops");
+
+    g_keys[VK_RBUTTON] = true;
+    rt::gameinput::poll();
+    st = pad_state(input, kb);
+    check(approx(st.leftTrigger, 1) && st.rightTrigger == 0 && st.buttons == 0,
+          "keyboard pad: right mouse button is the left trigger");
+    g_keys[VK_LBUTTON] = true;
+    rt::gameinput::poll();
+    st = pad_state(input, kb);
+    check(approx(st.leftTrigger, 1) && approx(st.rightTrigger, 1), "keyboard pad: left mouse button is the right trigger");
+    g_keys[VK_RBUTTON] = false;
+    rt::gameinput::poll();
+    st = pad_state(input, kb);
+    check(st.leftTrigger == 0 && approx(st.rightTrigger, 1), "keyboard pad: releasing a mouse button releases its trigger");
+
+    // Losing focus releases sticks and triggers; the cursor moved meanwhile does not swing the stick on return.
+    g_keys['W'] = g_keys['D'] = g_keys[VK_LBUTTON] = true;
+    g_cursor_x += 20;
+    rt::gameinput::poll();
+    check(!sticks_at_rest(pad_state(input, kb)), "keyboard pad: sticks and trigger held before focus loss");
+    g_focus = false;
+    g_cursor_x += 300;
+    rt::gameinput::poll();
+    check(sticks_at_rest(pad_state(input, kb)), "keyboard pad: losing focus releases sticks and triggers");
+    g_keys['W'] = g_keys['D'] = g_keys[VK_LBUTTON] = false;
+    g_cursor_x += 300;
+    g_focus = true;
+    rt::gameinput::poll();
+    check(sticks_at_rest(pad_state(input, kb)), "keyboard pad: no mouse jump when focus returns");
+}
+
 // Runs with no other pad connected and the device callback from main still registered.
 void test_keyboard_pad(IGameInput* input) {
     rt::gameinput::set_keyboard_source(fake_key_down, fake_focus);
+    rt::gameinput::set_cursor_source(fake_cursor);
 
     set_env("LEONIDA_KEYBOARD_PAD", nullptr);
     rt::gameinput::reload_config();
@@ -285,6 +381,11 @@ void test_keyboard_pad(IGameInput* input) {
           "keyboard pad: LEONIDA_KEYBOARD_PAD=always reads keys without focus");
     g_keys[VK_DOWN] = g_keys[VK_RETURN] = false;
 
+    set_env("LEONIDA_KEYBOARD_PAD", "1");
+    rt::gameinput::reload_config();
+    g_focus = true;
+    test_keyboard_pad_sticks(input, kb);
+
     // Turning it off removes the pad; turning it on again brings back the same device object.
     set_env("LEONIDA_KEYBOARD_PAD", "off");
     rt::gameinput::reload_config();
@@ -303,6 +404,7 @@ void test_keyboard_pad(IGameInput* input) {
     rt::gameinput::poll();
     check(rt::gameinput::connected_count() == 0, "keyboard pad: removed at the end");
     rt::gameinput::set_keyboard_source(nullptr, nullptr);
+    rt::gameinput::set_cursor_source(nullptr);
 }
 
 bool same_id(const AppLocalDeviceId& a, const AppLocalDeviceId& b) { return std::memcmp(&a, &b, sizeof a) == 0; }

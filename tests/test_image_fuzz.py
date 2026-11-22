@@ -168,6 +168,37 @@ def test_compare_treats_any_nan_as_equal():
     assert imf.compare("R32G32B32A32_SFLOAT", texels, width, height, got) == []
 
 
+def run_case_with_harness_result(monkeypatch, tmp_path, returncode, stdout):
+    """run_case with the translator stubbed out and vk_image_fuzz answering `returncode`/`stdout`."""
+    build = tmp_path / "build"
+    build.mkdir()
+    (build / (imf.HARNESS + (".exe" if os.name == "nt" else ""))).touch()
+    monkeypatch.setattr(imf, "assemble", lambda *_args: None)
+    monkeypatch.setattr(imf, "translate", lambda work: str(tmp_path / "spirv"))
+    monkeypatch.setattr(imf.subprocess, "run",
+                        lambda cmd, **_kw: subprocess.CompletedProcess(cmd, returncode, stdout, ""))
+    return imf.run_case("R8G8B8A8_UNORM", 4, 4, random.Random(1), str(tmp_path), str(build), False, False)
+
+
+def test_unsupported_device_skips_with_the_harness_reason(monkeypatch, tmp_path, capsys):
+    # TEST-149: a 128-byte push constant device exits 77 with its own reason, which the skip line quotes.
+    result = run_case_with_harness_result(
+        monkeypatch, tmp_path, 77, "device: X\nunsupported: need 144 push constant bytes, device has 128\n")
+    assert result is None
+    assert "SKIP (unsupported: need 144 push constant bytes, device has 128)" in capsys.readouterr().out
+
+
+def test_unsupported_without_a_reason_line_still_skips(monkeypatch, tmp_path, capsys):
+    assert run_case_with_harness_result(monkeypatch, tmp_path, 77, "device: X\n") is None
+    assert "SKIP (the device does not support the set)" in capsys.readouterr().out
+
+
+def test_a_harness_error_is_a_failure_not_a_skip(monkeypatch, tmp_path, capsys):
+    assert run_case_with_harness_result(monkeypatch, tmp_path, 1, "device: X\nvkCreateDevice failed\n") is False
+    out = capsys.readouterr().out
+    assert "FAIL (vkCreateDevice failed)" in out and "SKIP" not in out
+
+
 def test_self_test_runs():
     r = subprocess.run([sys.executable, "-I", os.path.join(ROOT, "tools", "image_fuzz.py"), "--self-test"],
                        capture_output=True, text=True)
