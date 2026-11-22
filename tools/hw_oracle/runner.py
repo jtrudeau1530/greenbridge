@@ -124,7 +124,10 @@ class Oracle:
         self.lld = _find_lld(self.clang)
         self.dll = find_hip_dll()
         self.arch = arch or detect_arch(self.clang)
-        asm.family(self.arch)
+        try:
+            asm.family(self.arch)
+        except ValueError as e:   # a GPU the kernels have no spellings for is a skip, like a missing tool
+            raise Unavailable(f"{e} (set LEONIDA_HW_ARCH)") from None
         self.chunk = chunk
         self.workdir = workdir or tempfile.mkdtemp(prefix="leonida-hw-oracle-")
         self.exe = self._build_launcher()
