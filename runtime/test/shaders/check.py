@@ -648,6 +648,10 @@ def bitmask_perm_narrow_skip(out, px):
         return None
     lanes = {p[0] for p in px}
     width = max(lanes) + 1
+    # "pippi" reads lane ^ 9. Where that lane runs (every lane at 16 wide, none at 8) the word is defined and has
+    # to be right: a narrow run excuses only the sources that aren't there.
+    if any(a != lane ^ 9 for lane, a, _, _ in px if lane ^ 9 < width):
+        return None
     if lo <= width < 32 and width & (width - 1) == 0 and lanes == set(range(width)):
         return Skip(f"SKIP (fragment subgroup ran at {width} lanes on {lo}..{hi} device; needs 32)")
     return None

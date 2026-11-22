@@ -170,6 +170,12 @@ To test the wave64 emulation that makes them exact on these GPUs, set `LEONIDA_W
 `check.py`, the shaders are checked against the emulated expectations without being emulated, and every wave64 test
 fails.
 
+`ps_bitmask_perm` is a wave32 pixel shader, and a pixel shader's width can't be requested on every device. Intel
+drivers report subgroups of 8..32 and may run it 8 or 16 wide; its second pattern reads lanes 16-31, which then
+don't run. The test skips when the frame shows that (#1318), and the translation gives 0 for a source lane that
+isn't running instead of an undefined value (#618). At 16 wide the first pattern stays inside the running lanes, so
+it is still checked before the skip.
+
 ## Wave64 pixel, vertex and geometry shaders (`w64_graphics.py`)
 
 Graphics stages have no emulation: on a 32-wide subgroup a wave64 VS, PS or GS runs as two 32-lane halves, and the

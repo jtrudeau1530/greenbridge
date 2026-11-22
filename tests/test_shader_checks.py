@@ -399,6 +399,17 @@ class PixelDeviceLimits(unittest.TestCase):
                 self.assertIsInstance(problem, check.Skip)
                 self.assertIn(f"{width} lanes", problem)
 
+    def test_bitmask_perm_narrow_run_still_judges_the_sources_that_run(self):
+        # At 16 lanes "pippi" (lane ^ 9) stays inside the running lanes, so a wrong word there is a failure.
+        out = "device: Intel(R) HD Graphics 530 (subgroup 8..32)\nok 64x64\n"
+        bad = b"".join(struct.pack("<4I", i % 16, i % 16, 0, 0) for i in range(64 * 64))
+        problem = self.run_pixel("ps_bitmask_perm", 0, out, data=bad)
+        self.assertNotIsInstance(problem, check.Skip)
+        self.assertIn("wrong", problem)
+        # At 8 lanes every "pippi" source is lane 8 or above, so nothing can be judged and any word skips.
+        any8 = b"".join(struct.pack("<4I", i % 8, 12345, 0, 0) for i in range(64 * 64))
+        self.assertIsInstance(self.run_pixel("ps_bitmask_perm", 0, out, data=any8), check.Skip)
+
     def test_bitmask_perm_judges_variable_device_at_32_lanes(self):
         out = "device: Intel(R) HD Graphics 530 (subgroup 8..32)\nok 64x64\n"
         self.assertEqual(self.run_pixel("ps_bitmask_perm", 0, out, data=self.bitmask_pixels(32)), "")
