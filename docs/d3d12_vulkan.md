@@ -785,6 +785,8 @@ Known gaps found in review, not fixed here:
   or holding back a batch until its wait value is submitted would fix it.
 - **Lookups:** `buffer_at` searches every resource for each vertex and index view; an ordered map by VA would do
   when it shows.
+- **Fences:** a CPU `ID3D12Fence::Signal` checks only the semaphore's current value, so it can signal below a GPU
+  signal that is still pending (`VUID-VkSemaphoreSignalInfo-value-03258`).
 
 Build `runtime/` (Vulkan SDK and Python 3 on `PATH`) and run `ctest --test-dir <build> --output-on-failure` for the
 CPU tests:
@@ -1892,7 +1894,9 @@ The trace will enumerate them.
   Partial resolve regions to another offset need a shader or a region copy.
 - `WriteBufferImmediate` (D3D-26) → `vkCmdUpdateBuffer` of 4 bytes. The address is resolved when the list is
   executed, through `ReplayFunctions::buffer_at`: the buffer whose `ResourceBinding::va` range holds it, at
-  `buffer_offset + (address - va)`. These are the same fields and lookup as #291's arena, and the device fills
+  `buffer_offset + (address - va)`. `VulkanContext` finds it by binary search over the buffers' VA ranges
+  (`runtime/src/buffer_va_index.h`, kept in step with the registered resources); aliasing placed buffers can
+  overlap, and the one whose range starts closest below the address wins (`buffer_va_index_test`). These are the same fields and lookup as #291's arena, and the device fills
   `va` once `GetGPUVirtualAddress` lands (#157/#291); until then, a list with an immediate write is refused as
   `unresolved_resource`. `DEFAULT` adds no barrier: it is ordered like any copy, by the application's barriers.
   `MARKER_OUT` waits for every earlier command to finish and sees its writes (`ALL_COMMANDS`/`MEMORY_WRITE` →
