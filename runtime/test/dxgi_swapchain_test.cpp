@@ -16,6 +16,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <iterator>
 #include <vector>
 
 namespace {
@@ -92,6 +93,150 @@ bool check_statistics_disjoint(IDXGISwapChain* swapchain) {
 }
 
 }  // namespace
+
+
+// CreateSwapChainForHwnd on a guarded call: a host runtime that faults on a case reports it instead of ending the test.
+HRESULT create_guarded(IDXGIFactory4* factory, IUnknown* queue, HWND hwnd, const DXGI_SWAP_CHAIN_DESC1* desc,
+                       IDXGISwapChain1** out) {
+    __try {
+        return factory->CreateSwapChainForHwnd(queue, hwnd, desc, nullptr, nullptr, out);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return HRESULT(0xC0000005);
+    }
+}
+
+// CreateSwapChainForHwnd with descriptions D3D12 refuses (and the valid ones next to them), against the host runtime's
+// DXGI: each case gets its own window on each side, and the HRESULTs must match. Returns the number of mismatches,
+// or -1 without a host D3D12 device.
+int compare_swap_chain_arguments(IDXGIFactory4* ours, ID3D12Device* our_device, ID3D12CommandQueue* our_queue) {
+    using CreateDevice = HRESULT(WINAPI*)(IUnknown*, D3D_FEATURE_LEVEL, REFIID, void**);
+    using CreateFactory2 = HRESULT(WINAPI*)(UINT, REFIID, void**);
+    const HMODULE d3d12 = LoadLibraryExA("d3d12.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    const HMODULE dxgi = LoadLibraryExA("dxgi.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    const auto create_device = d3d12 ? reinterpret_cast<CreateDevice>(
+                                           reinterpret_cast<void*>(GetProcAddress(d3d12, "D3D12CreateDevice")))
+                                     : nullptr;
+    const auto create_factory = dxgi ? reinterpret_cast<CreateFactory2>(
+                                           reinterpret_cast<void*>(GetProcAddress(dxgi, "CreateDXGIFactory2")))
+                                     : nullptr;
+    ID3D12Device* host_device = nullptr;
+    IDXGIFactory4* host_factory = nullptr;
+    ID3D12CommandQueue* host_queue = nullptr;
+    const D3D12_COMMAND_QUEUE_DESC queue_desc{D3D12_COMMAND_LIST_TYPE_DIRECT, 0, D3D12_COMMAND_QUEUE_FLAG_NONE, 0};
+    if (!create_device || !create_factory ||
+        FAILED(create_device(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&host_device))) ||
+        FAILED(create_factory(0, IID_PPV_ARGS(&host_factory))) ||
+        FAILED(host_device->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&host_queue)))) {
+        if (host_factory) host_factory->Release();
+        if (host_device) host_device->Release();
+        return -1;
+    }
+    DXGI_SWAP_CHAIN_DESC1 base{};
+    base.Width = 64;
+    base.Height = 64;
+    base.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    base.SampleDesc.Count = 1;
+    base.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+    base.BufferCount = 2;
+    base.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+    enum class Pass { queue, null_queue, device, null_window, null_desc, null_out };
+    struct Case {
+        const char* name;
+        DXGI_SWAP_CHAIN_DESC1 desc;
+        Pass pass = Pass::queue;
+    };
+    const auto with = [&](void (*edit)(DXGI_SWAP_CHAIN_DESC1&)) {
+        DXGI_SWAP_CHAIN_DESC1 d = base;
+        edit(d);
+        return d;
+    };
+    const Case cases[] = {
+        {"valid", base},
+        {"flip sequential, 3 buffers", with([](DXGI_SWAP_CHAIN_DESC1& d) {
+             d.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
+             d.BufferCount = 3;
+         })},
+        {"effect DISCARD", with([](DXGI_SWAP_CHAIN_DESC1& d) { d.SwapEffect = DXGI_SWAP_EFFECT_DISCARD; })},
+        {"effect SEQUENTIAL", with([](DXGI_SWAP_CHAIN_DESC1& d) { d.SwapEffect = DXGI_SWAP_EFFECT_SEQUENTIAL; })},
+        {"effect 99", with([](DXGI_SWAP_CHAIN_DESC1& d) { d.SwapEffect = DXGI_SWAP_EFFECT(99); })},
+        {"scaling NONE", with([](DXGI_SWAP_CHAIN_DESC1& d) { d.Scaling = DXGI_SCALING_NONE; })},
+        {"scaling ASPECT_RATIO_STRETCH",
+         with([](DXGI_SWAP_CHAIN_DESC1& d) { d.Scaling = DXGI_SCALING_ASPECT_RATIO_STRETCH; })},
+        {"scaling 7", with([](DXGI_SWAP_CHAIN_DESC1& d) { d.Scaling = DXGI_SCALING(7); })},
+        {"alpha IGNORE", with([](DXGI_SWAP_CHAIN_DESC1& d) { d.AlphaMode = DXGI_ALPHA_MODE_IGNORE; })},
+        {"alpha PREMULTIPLIED", with([](DXGI_SWAP_CHAIN_DESC1& d) { d.AlphaMode = DXGI_ALPHA_MODE_PREMULTIPLIED; })},
+        {"alpha STRAIGHT", with([](DXGI_SWAP_CHAIN_DESC1& d) { d.AlphaMode = DXGI_ALPHA_MODE_STRAIGHT; })},
+        {"alpha 9", with([](DXGI_SWAP_CHAIN_DESC1& d) { d.AlphaMode = DXGI_ALPHA_MODE(9); })},
+        {"flag NONPREROTATED", with([](DXGI_SWAP_CHAIN_DESC1& d) { d.Flags = DXGI_SWAP_CHAIN_FLAG_NONPREROTATED; })},
+        {"flag ALLOW_MODE_SWITCH",
+         with([](DXGI_SWAP_CHAIN_DESC1& d) { d.Flags = DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH; })},
+        {"flag GDI_COMPATIBLE", with([](DXGI_SWAP_CHAIN_DESC1& d) { d.Flags = DXGI_SWAP_CHAIN_FLAG_GDI_COMPATIBLE; })},
+        {"flag DISPLAY_ONLY", with([](DXGI_SWAP_CHAIN_DESC1& d) { d.Flags = DXGI_SWAP_CHAIN_FLAG_DISPLAY_ONLY; })},
+        {"flag FRAME_LATENCY_WAITABLE_OBJECT", with([](DXGI_SWAP_CHAIN_DESC1& d) {
+             d.Flags = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
+         })},
+        {"flag FOREGROUND_LAYER",
+         with([](DXGI_SWAP_CHAIN_DESC1& d) { d.Flags = DXGI_SWAP_CHAIN_FLAG_FOREGROUND_LAYER; })},
+        {"flag HW_PROTECTED", with([](DXGI_SWAP_CHAIN_DESC1& d) { d.Flags = DXGI_SWAP_CHAIN_FLAG_HW_PROTECTED; })},
+        {"flag ALLOW_TEARING", with([](DXGI_SWAP_CHAIN_DESC1& d) { d.Flags = DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING; })},
+        {"flag 0x1000", with([](DXGI_SWAP_CHAIN_DESC1& d) { d.Flags = 0x1000; })},
+        {"flag 0x2000", with([](DXGI_SWAP_CHAIN_DESC1& d) { d.Flags = 0x2000; })},
+        {"flag 0x4000", with([](DXGI_SWAP_CHAIN_DESC1& d) { d.Flags = 0x4000; })},
+        {"flag 0x80000000", with([](DXGI_SWAP_CHAIN_DESC1& d) { d.Flags = 0x80000000u; })},
+        {"usage 0", with([](DXGI_SWAP_CHAIN_DESC1& d) { d.BufferUsage = 0; })},
+        {"usage SHADER_INPUT", with([](DXGI_SWAP_CHAIN_DESC1& d) {
+             d.BufferUsage = DXGI_USAGE_SHADER_INPUT | DXGI_USAGE_RENDER_TARGET_OUTPUT;
+         })},
+        {"usage SHARED", with([](DXGI_SWAP_CHAIN_DESC1& d) { d.BufferUsage = DXGI_USAGE_SHARED; })},
+        {"usage READ_ONLY", with([](DXGI_SWAP_CHAIN_DESC1& d) { d.BufferUsage = DXGI_USAGE_READ_ONLY; })},
+        {"usage DISCARD_ON_PRESENT",
+         with([](DXGI_SWAP_CHAIN_DESC1& d) { d.BufferUsage = DXGI_USAGE_DISCARD_ON_PRESENT; })},
+        {"usage UNORDERED_ACCESS", with([](DXGI_SWAP_CHAIN_DESC1& d) {
+             d.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT | DXGI_USAGE_UNORDERED_ACCESS;
+         })},
+        {"16384 x 16", with([](DXGI_SWAP_CHAIN_DESC1& d) {
+             d.Width = 16384;
+             d.Height = 16;
+         })},
+        {"width 16385", with([](DXGI_SWAP_CHAIN_DESC1& d) { d.Width = 16385; })},
+        {"height 16385", with([](DXGI_SWAP_CHAIN_DESC1& d) { d.Height = 16385; })},
+        {"one buffer", with([](DXGI_SWAP_CHAIN_DESC1& d) { d.BufferCount = 1; })},
+        {"MSAA 4", with([](DXGI_SWAP_CHAIN_DESC1& d) { d.SampleDesc.Count = 4; })},
+        {"null queue", base, Pass::null_queue},
+        {"a device, not a queue", base, Pass::device},
+        {"null window", base, Pass::null_window},
+        {"null description", base, Pass::null_desc},
+        {"null output", base, Pass::null_out},
+    };
+    int mismatches = 0;
+    for (const Case& c : cases) {
+        HRESULT result[2];
+        for (int side = 0; side < 2; ++side) {
+            IDXGIFactory4* factory = side ? host_factory : ours;
+            IUnknown* queue = side ? static_cast<IUnknown*>(host_queue) : static_cast<IUnknown*>(our_queue);
+            if (c.pass == Pass::null_queue) queue = nullptr;
+            if (c.pass == Pass::device) queue = side ? static_cast<IUnknown*>(host_device) : our_device;
+            HWND hwnd = create_test_window(64, 64);
+            IDXGISwapChain1* chain = nullptr;
+            result[side] = create_guarded(factory, queue, c.pass == Pass::null_window ? nullptr : hwnd,
+                                          c.pass == Pass::null_desc ? nullptr : &c.desc,
+                                          c.pass == Pass::null_out ? nullptr : &chain);
+            if (chain) chain->Release();
+            if (hwnd) DestroyWindow(hwnd);
+        }
+        if (result[0] != result[1]) {
+            ++mismatches;
+            std::fprintf(stderr, "CreateSwapChainForHwnd %s: ours 0x%08lx, host 0x%08lx\n", c.name,
+                         static_cast<unsigned long>(result[0]), static_cast<unsigned long>(result[1]));
+        }
+    }
+    std::printf("CreateSwapChainForHwnd: %zu descriptions compared with the host runtime, %d mismatches\n",
+                std::size(cases), mismatches);
+    host_queue->Release();
+    host_factory->Release();
+    host_device->Release();
+    return mismatches;
+}
 
 int main() {
     const PFN_vkGetInstanceProcAddr gipa = load_vulkan();
@@ -274,6 +419,11 @@ int main() {
         FAILED(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence))))
         return fail("queue/alloc/cl/fence");
     cl->Close();
+
+    // Before the test's own swap chain: the host comparison creates and releases its own windows and chains.
+    const int argument_mismatches = compare_swap_chain_arguments(factory, dev, queue);
+    if (argument_mismatches < 0) std::printf("CreateSwapChainForHwnd: no host D3D12 device to compare with, skipped\n");
+    if (argument_mismatches > 0) return fail("CreateSwapChainForHwnd answers differ from the host runtime");
 
     DXGI_SWAP_CHAIN_DESC1 scd{};
     scd.Width = 128;
