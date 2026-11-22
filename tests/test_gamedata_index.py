@@ -197,6 +197,20 @@ class GamedataIndexTest(unittest.TestCase):
         self.assertEqual(s["types"]["binary"]["files"], 1)
         self.assertEqual(s["roots"], {"RootA": {"files": 1, "inflated": len(xml)}})
 
+    def test_unwritable_csv_or_json_is_one_error_line(self):
+        self.add(b'<?xml version="1.0"?><RootA/>')
+        self.finish()
+        blocker = os.path.join(self.root, "blocker")
+        with open(blocker, "wb") as f:
+            f.write(b"x")
+        for flag, name in (("--csv", "out.csv"), ("--json", "out.json")):
+            with self.subTest(flag=flag):
+                out = os.path.join(blocker, name)
+                p = self.run_tool(self.carve, flag, out)
+                self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
+                self.assertIn("ERROR: cannot write", p.stderr)
+                self.assertNotIn("Traceback", p.stderr)
+
 
 class XmlClassificationTest(unittest.TestCase):
     """Synthetic XML classification cases; no game data, no files written."""
