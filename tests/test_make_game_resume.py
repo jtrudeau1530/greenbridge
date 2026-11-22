@@ -134,7 +134,13 @@ class EarlierStepDropsThePlanTest(unittest.TestCase):
 
             def fake_translate(disasm, out, jobs, emulate=False, fallbacks=()):
                 seen["plan"] = os.path.exists(plan)
-            with mock.patch.object(make_game, "py"), mock.patch.object(make_game, "need"), \
+            def fake_disassemble(*args):
+                disasm = os.path.join(dxbc, "disasm")
+                os.makedirs(disasm)
+                with open(os.path.join(disasm, "shader.s"), "w", encoding="utf-8", newline="\n") as f:
+                    f.write("synthetic listing\n")
+
+            with mock.patch.object(make_game, "py", side_effect=fake_disassemble), mock.patch.object(make_game, "need"), \
                     mock.patch.object(make_game, "llvm_mc_signature", return_value="test llvm-mc 21"), \
                     mock.patch.object(make_game, "translate", side_effect=fake_translate), \
                     mock.patch.object(make_game, "log", lambda *a: None):

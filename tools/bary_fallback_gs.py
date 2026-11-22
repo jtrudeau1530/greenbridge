@@ -114,6 +114,8 @@ def write_for_index(spirv_dir, pair: tuple[str, str] | None = None):
         return []
     with open(index_path, encoding="utf-8") as f:
         index = json.load(f)
+    if not isinstance(index, dict):
+        raise ValueError(f"{index_path}: translation index must be a JSON object")
     clip_count = cull_count = 0
     names = sorted(index)
     suffix = ""

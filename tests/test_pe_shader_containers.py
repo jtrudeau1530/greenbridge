@@ -144,6 +144,27 @@ class ContainerTests(unittest.TestCase):
                     {"name": "RefitBVH4", "file": "RefitBVH4.dxbc", "stage": "cs"},
                 )
 
+    def test_extract_retries_existing_suffixes(self):
+        data = container(
+            [(b"ILDN", ildn("RefitBVH4")), (b"DXIL", dxil_payload("RefitBVH4"))]
+        )
+        found, _ = psc.inspect(data, "fake.dll")
+        with tempfile.TemporaryDirectory() as tmp:
+            # Occupy both initial candidates for the first record (index 0).
+            with open(os.path.join(tmp, "RefitBVH4.dxbc"), "wb") as f:
+                f.write(b"stale")
+            with open(os.path.join(tmp, "RefitBVH4_00.dxbc"), "wb") as f:
+                f.write(b"stale")
+            index = psc.extract(data, found, tmp)
+            self.assertEqual(index[0]["file"], "RefitBVH4_01.dxbc")
+            with open(os.path.join(tmp, index[0]["file"]), "rb") as f:
+                self.assertEqual(f.read(), data)
+            # The occupied candidates were untouched.
+            with open(os.path.join(tmp, "RefitBVH4.dxbc"), "rb") as f:
+                self.assertEqual(f.read(), b"stale")
+            with open(os.path.join(tmp, "RefitBVH4_00.dxbc"), "rb") as f:
+                self.assertEqual(f.read(), b"stale")
+
     def test_safe_stem(self):
         self.assertEqual(psc.safe_stem("a b/c", 1), "a_b_c")
         self.assertEqual(psc.safe_stem(None, 7), "container_07")

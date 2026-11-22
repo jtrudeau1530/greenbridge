@@ -11,10 +11,12 @@
 //   VKC_SGPRS=w4,w5,... (env): set s4, s5, ... (decimal or 0x hex, up to s31), the user SGPRs after the output V#,
 //   so a test can take input words (cs_user_sgprs.asm). They are zero otherwise. Same syntax as vk_harness's VKH_SGPRS.
 // Contract (docs/design.md): push constants = s0..s31 (128 bytes), heap base lo/hi, code base lo/hi (144 bytes).
+// LEONIDA_PC_TAIL_UBO=1 (modules from rdna2spirv.py --pc-tail-ubo): s0..s31 only, the rest at set 1 (vk_pc_tail.h).
 // The output buffer is the "heap": Xbox VA 0 maps to its device address, and s[0:3] hold a V# with base 0.
 #include "vulkan_loader.h"
 #include "vk_device_pick.h"
 #include "vk_shader_fma.h"
+#include "vk_pc_tail.h"
 
 #include <cctype>
 #include <cmath>
@@ -151,6 +153,13 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "full 64-wide compute subgroups unavailable\n");
         return 77;
     }
+    std::ifstream f(argv[1], std::ios::binary);
+    std::vector<char> code((std::istreambuf_iterator<char>(f)), {});
+    const bool needs_float64 = leonida::vk_test::spirv_declares_capability(code.data(), code.size(), 10);  // Float64
+    if (needs_float64 && !f2q.features.shaderFloat64) {
+        std::fprintf(stderr, "unsupported: %s uses Float64 and the device has no shaderFloat64\n", argv[1]);
+        return 77;
+    }
     VkPhysicalDeviceVulkan13Features f13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
     VkPhysicalDeviceVulkan12Features f12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
     f12.bufferDeviceAddress = VK_TRUE;
@@ -161,6 +170,7 @@ int main(int argc, char** argv) {
     }
     VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
     f2.features.shaderInt64 = VK_TRUE;
+    f2.features.shaderFloat64 = needs_float64;
     f2.pNext = &f12;
     // OpFmaKHR (rdna2spirv.py --fma khr): VK_KHR_shader_fma, when the device has it.
     leonida::vk_test::ShaderFma fma;
@@ -178,7 +188,7 @@ int main(int argc, char** argv) {
     LOADD(vkCreatePipelineLayout); LOADD(vkCreateComputePipelines); LOADD(vkCreateCommandPool);
     LOADD(vkAllocateCommandBuffers); LOADD(vkBeginCommandBuffer); LOADD(vkCmdBindPipeline);
     LOADD(vkCmdPushConstants); LOADD(vkCmdDispatch); LOADD(vkEndCommandBuffer); LOADD(vkQueueSubmit);
-    LOADD(vkQueueWaitIdle); LOADD(vkCmdPipelineBarrier); LOADD(vkCmdDispatchBase);
+    LOADD(vkQueueWaitIdle); LOADD(vkCmdPipelineBarrier); LOADD(vkCmdDispatchBase); LOADD(vkCmdBindDescriptorSets);
     VkQueue q; vkGetDeviceQueue(dev, qi, 0, &q);
 
     // Output buffer = heap. Host-visible so the result can be read back directly.
@@ -227,15 +237,28 @@ int main(int argc, char** argv) {
     bai.buffer = buf;
     const uint64_t heap = vkGetBufferDeviceAddress(dev, &bai);
 
-    std::ifstream f(argv[1], std::ios::binary);
-    std::vector<char> code((std::istreambuf_iterator<char>(f)), {});
     if (!fma.accepts(code.data(), code.size(), argv[1])) return 77;
     VkShaderModuleCreateInfo smi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
     smi.codeSize = code.size(); smi.pCode = reinterpret_cast<const uint32_t*>(code.data());
     VkShaderModule sm; CHECK(vkCreateShaderModule(dev, &smi, nullptr, &sm));
-    VkPushConstantRange pcr{VK_SHADER_STAGE_COMPUTE_BIT, 0, 144};
+    // 144 push-constant bytes: s0..s31, heap base, code base. With LEONIDA_PC_TAIL_UBO=1 (rdna2spirv.py
+    // --pc-tail-ubo) only s0..s31; the tail, if the module reads it, is a uniform block at set 1 (vk_pc_tail.h), one
+    // slot for the dispatch and one per workgroup_yz origin.
+    const bool pc_tail = leonida::vk_test::pc_tail_requested();
+    const uint32_t pc_bytes = pc_tail ? 128u : 144u;
+    leonida::vk_test::PcTail tail;
+    const bool tail_block = pc_tail &&
+        leonida::vk_test::spirv_declares_set(code.data(), code.size(), leonida::vk_test::pc_tail_set);
+    if (tail_block && !tail.create(vkGetDeviceProcAddr, dev, mp, props.limits.minUniformBufferOffsetAlignment,
+                                   VK_SHADER_STAGE_COMPUTE_BIT, 1 + origins)) {
+        std::fprintf(stderr, "FAILED creating the --pc-tail-ubo block\n");
+        return 1;
+    }
+    VkPushConstantRange pcr{VK_SHADER_STAGE_COMPUTE_BIT, 0, pc_bytes};
     VkPipelineLayoutCreateInfo pli{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
     pli.pushConstantRangeCount = 1; pli.pPushConstantRanges = &pcr;
+    const VkDescriptorSetLayout tail_layouts[] = {tail.empty_layout, tail.set_layout};
+    if (tail_block) { pli.setLayoutCount = 2; pli.pSetLayouts = tail_layouts; }
     VkPipelineLayout pl; CHECK(vkCreatePipelineLayout(dev, &pli, nullptr, &pl));
     VkComputePipelineCreateInfo cpi{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
     if (workgroup_yz) cpi.flags |= VK_PIPELINE_CREATE_DISPATCH_BASE_BIT;
@@ -270,14 +293,27 @@ int main(int argc, char** argv) {
     VkCommandBufferBeginInfo cbi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     CHECK(vkBeginCommandBuffer(cmd, &cbi));
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
-    vkCmdPushConstants(cmd, pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, 144, pc);
+    vkCmdPushConstants(cmd, pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, pc_bytes, pc);
+    auto bind_tail = [&](uint32_t slot) {
+        if (!tail_block) return;
+        tail.write(slot, pc, 4);
+        const uint32_t offset = tail.offset(slot);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pl, leonida::vk_test::pc_tail_set, 1, &tail.set,
+                                1, &offset);
+    };
+    bind_tail(0);
     vkCmdDispatch(cmd, groups, groups_y, groups_z);
     // A permutation within one axis can leave the full-grid histogram unchanged. Dispatch one group at
     // each known origin into its own histogram, selected by the host independently of the shader's SGPRs.
     for (uint32_t g = 0; g < origins; ++g) {
         const uint64_t base = heap + (g + 1) * yz_bins * sizeof(uint32_t);
         const uint32_t address[] = {uint32_t(base), uint32_t(base >> 32)};
-        vkCmdPushConstants(cmd, pl, VK_SHADER_STAGE_COMPUTE_BIT, 32 * sizeof(uint32_t), sizeof(address), address);
+        if (pc_tail) {
+            pc[32] = address[0]; pc[33] = address[1];     // the heap base is the tail's dwords 0..1
+            bind_tail(g + 1);
+        } else {
+            vkCmdPushConstants(cmd, pl, VK_SHADER_STAGE_COMPUTE_BIT, 32 * sizeof(uint32_t), sizeof(address), address);
+        }
         vkCmdDispatchBase(cmd, g % groups, (g / groups) % groups_y, g / (groups * groups_y), 1, 1, 1);
     }
     VkMemoryBarrier readback{VK_STRUCTURE_TYPE_MEMORY_BARRIER};

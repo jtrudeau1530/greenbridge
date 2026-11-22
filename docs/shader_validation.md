@@ -357,6 +357,39 @@ land exactly on a binary32 midpoint, and a tiny third addend decides the roundin
 rational arithmetic for FMA; a test pins the result so the implementation cannot regress to the
 double-rounded answer.
 
+#### `v_interp` ALU ops (`tools/interp_hw_probe.py`, SHADER-430)
+
+`v_interp_*` also run in a compute wave: they read the attribute words from LDS at M0. On gfx1036 with M0 = 0,
+attribute N takes 12 dwords from byte 48·N; channel c's P0 and P10 words are dwords 2c and 2c+1, and its P20 word is
+dword 8+c (found by filling LDS with markers and reading them back with `v_interp_mov_f32`). So the tool writes
+random parameter words there itself, packed f16 pairs and plain f32 values, runs every interp op through
+`tools/hw_oracle` and checks each result against exact rational models. It also runs 30 hand-built f16 rounding ties
+that tell one rounding of `p2_f16` from two.
+
+Measured on the **Radeon iGPU of a Ryzen 7 9800X3D (gfx1036, RDNA2)**, AMD driver 32.0.13036.4, Windows 10 22H2,
+`rocm-sdk-core` clang, seeds 1–8 × 4 kernels × 32 lanes. Every model matched, under both `--denorm32 3` (MODE keeps
+f32 denormals) and `--denorm32 0` (MODE flushes them). That is 292,474 checks per mode plus the 30 ties.
+
+| Op | Result on gfx1036 |
+| --- | --- |
+| `v_interp_mov_f32 p0` | the raw P0 word |
+| `v_interp_p1_f32` | fma(P10, I, P0) with one rounding to f32. A product rounded first and then added differed in 723 of 4,096 f32 cases (seeds 1–4). A packed channel's words are read as raw f32 bits |
+| `v_interp_p2_f32` | fma(P20, J, p1), one rounding |
+| `v_interp_p1ll_f16` (`high`) | the chosen f16 halves widened exactly, then fma(h10, I, h0) with one rounding to **f32** |
+| `v_interp_p2_f16` (`high`) | fma(h20, J, p1ll) rounded **once, to f16** (all 30 ties gave the single-rounding result, none the f32-then-f16 one). The high 16 bits of vdst are **kept** |
+| f32 denormals | follow MODE: with `denorm_mode_32 = 0` a denormal P0, P10 or P20 word reads as 0 |
+
+The translator wrote `p2_f16` as a full-register result with a zero high half. It now keeps the high half
+(`tests/semantic/test_interp_f16_high.py`). This compute route does not reach the other half of SHADER-430: what the
+SPI writes into LDS for a real draw, in particular whether a packed channel's P10/P20 are f32 differences of the raw
+words or per-half f16 differences under `FP16_INTERP_MODE`. That needs a pixel-shader harness on AMD hardware. Not
+covered either: `v_interp_p1lv_f16`, and f16 inf/NaN halves.
+
+```powershell
+python -I tools/interp_hw_probe.py                     # exit 0: all match; 77: no hardware oracle here
+python -I tools/interp_hw_probe.py --denorm32 0 --seeds 1,2,3,4,5,6,7,8
+```
+
 ## Harness design
 
 `tools/shader_diff.py` owns the test table, the seed and the comparison, leaving
@@ -381,6 +414,26 @@ double-rounded answer.
 The existing `runtime/test` tools already expose the hard parts (device selection, push constants,
 descriptor setup, readback). The differential runner should call them rather than grow a second
 Vulkan stack.
+
+### Integer VALU across the whole wave (`tools/wint_diff.py`)
+
+The one-lane fuzzers cannot see which lanes an instruction writes or the lane masks it reads and makes.
+`tools/wint_diff.py` runs seeded integer VALU programs on every lane of a wave32 or wave64 wave (`--wave 32|64|both`)
+with EXEC rewritten between instructions: compares into SGPR masks and VCC (e64 and e32), `v_cmpx` into EXEC,
+`v_cndmask_b32` on those masks, the carry-out and carry-in forms (`v_add/sub/subrev_co_u32`, `_co_ci_u32`, e64
+and e32), `v_mad_u64_u32`/`v_mad_i64_i32` with a mask carry-out, 16-bit e64/VOP3 ops with `op_sel` writing one half,
+data moved into an SGPR mask, and a set of 32-bit ops. The reference is a per-lane ISA model in the tool; the
+translated side runs in `tests/semantic/spirv_wave_interp.py`. Shrinking, skips and exit codes are those of
+`salu_diff.py`. Forms the translator is known to get wrong (VCC holding data read as a mask, #2206 for wave32 and
+open for wave64; a mask read as VALU data, #293) are left out unless `--known`. `--oracle hw` runs each program as
+one wave on an AMD GPU and compares every lane; on an RDNA2 iGPU (gfx1036) 1,000 programs in both wave sizes,
+the known forms included, matched the reference.
+
+```
+python -I tools/wint_diff.py --programs 2000 --seed 1 --wave both
+python -I tools/wint_diff.py --oracle hw --programs 500 --seed 1 --wave both
+python -I tests/test_wint_diff.py
+```
 
 ### LDS and `ds_*` on the GPU (`tools/lds_fuzz.py`, FUZZ-6)
 
@@ -680,6 +733,24 @@ principle, but it needs the loaded code to be 256-byte aligned, which the kernel
 section above records a 4096-word output cap there, while a 64x64 case stores 16,384 words. The RDNA2 results above
 are from the Windows HIP launcher only.
 
+### 32-bit integer VALU in every encoding (`tools/vint_diff.py`)
+
+`tools/shader_diff.py` checks the common integer opcodes with VGPR sources in their e32 form. `tools/vint_diff.py`
+adds the rest of the 32-bit integer VALU a compiler emits: the VOP1/VOP2 opcodes as e32 and e64, the VOP3-only ones
+(`v_add3_u32`, `v_lshl_add_u32`, `v_alignbit/alignbyte/perm_b32`, `v_min3/max3/med3`, the 24- and 16-bit
+multiplies with `op_sel`, `v_bcnt`, `v_bfm`, `v_ffbh/ffbl`, `v_cvt_pk_*16_*32`, ...) and VOPC e64 into a mask with
+`v_cndmask_b32_e64`, with VGPR, SGPR, integer and float inline-constant and literal sources in every position the
+encoding allows (one literal and two scalar values per VOP3). It runs one lane through
+`tests/semantic/spirv_mini_interp.py` against its own ISA model, with the shrinking, skips and exit codes of
+`salu_diff.py`; a compare's mask read as VALU data (#293) is left out unless `--known`. `--oracle hw` runs the same
+programs on an AMD GPU; on an RDNA2 iGPU (gfx1036) 1,500 programs, the known form included, matched the reference. A 32-bit literal in a 16-bit source of `v_mad_u32_u16`/`v_mad_i32_i16` does not assemble, so literals there have 16 bits (zero-extended, measured).
+
+```
+python -I tools/vint_diff.py --programs 2000 --seed 1
+python -I tools/vint_diff.py --oracle hw --programs 500 --seed 1
+python -I tests/test_vint_diff.py
+```
+
 ### 16-bit and memory ops on the GPU (`tools/valu_fuzz.py`, FUZZ-2, FUZZ-5)
 
 `tools/valu_fuzz.py --family f16|mem` uses the same runner shape as `lds_fuzz.py`. It generates seeded
@@ -764,6 +835,33 @@ vscnt wait plus `s_dcache_inv`; vector accesses only need `s_waitcnt vmcnt(0)`.
 on gfx1150 (they were measured on RDNA2 and, for the vector part, on this GPU before; the `s_buffer_load` bound and the
 `idxen offen` and offset-only soffset forms are new on gfx1150). The one difference is `v_pack_b32_f16` quieting
 signaling NaNs (only signaling NaN halves are not judged; a quiet NaN is compared). The default translator path of `mem` ran on the Radeon 880M (`VK_LOADER_DRIVERS_SELECT=*amd*`, `vk_compute_test` built with g++ as in the lab script): `--family mem --programs 200 --seed 1` gave 400 of 400 programs (native wave64 and wave32) matching the model, 0 not translated, 0 harness errors, so the translator agrees with the model on the OOB_SELECT, straddle, `s_load` and `s_buffer_load` rules there. On the RTX 5070 `vk_compute_test` loses the device (-4) for this and for the unchanged generator of `main`, so use the AMD device.
+
+### Packed and 16-bit integer VALU (`tools/pk16_diff.py`)
+
+`valu_fuzz.py --family f16` runs the 16-bit shifts, `v_add/sub_nc_u16`, `v_mul_lo_u16` and the 16-bit min/max on
+the GPU with VGPR sources. `tools/pk16_diff.py` adds the packed integer ops (`v_pk_add/sub_u16/i16`,
+`v_pk_mul_lo_u16`, `v_pk_min/max_u16/i16`, `v_pk_mad_u16/i16` and the packed shifts) with `op_sel`, `op_sel_hi` and
+`clamp`, and the 16-bit VOP3 ops (`v_add/sub_nc_i16`, `v_min3/max3/med3_u16/i16`, `v_mad_u16/i16` next to the ones
+above) with `op_sel` on every source and on the destination half and `clamp`. Sources are VGPRs, SGPRs, integer and
+float inline constants and literals within the constant-bus limits. It runs one lane through
+`tests/semantic/spirv_mini_interp.py` against its own ISA model, with the shrinking, skips and exit codes of
+`salu_diff.py`. A constant whose high half a packed add/sub/mul/min/max/mad reads is left out unless `--known` (the
+translator rejects it; #2224 changes that).
+
+Measured on an RDNA2 iGPU (gfx1036) with `--oracle hw`: 2,300 programs, the `--known` forms included, match the
+model. A 16-bit VOP3 op keeps the other half of its destination. A constant source is its 32-bit value split like a
+register: `-16` is `0xfff0`/`0xffff`, `1.0` is `0x0000`/`0x3f80` (f32 bits, unlike the f16 ops), and a literal of a
+16-bit VOP3 op has 16 bits (`0xffff` with `op_sel` reads 0). The VOP2-named 16-bit ops (`v_mul_lo_u16`,
+`v_min/max_*16`, the shifts) only have a VOP3 encoding on GFX10, and the generator writes them with `_e64`, because
+without encoding bytes the translator reads a bare mnemonic as the VOP2 write that zeroes the high half. For the same
+reason, rules that depend on the encoding bytes, such as a literal's 12-byte VOP3 encoding (SHADER-208), are out of
+its reach.
+
+```
+python -I tools/pk16_diff.py --programs 3000 --seed 11 --max-ops 8
+python -I tools/pk16_diff.py --oracle hw --programs 500 --seed 1
+python -I tests/test_pk16_diff.py
+```
 
 ### Wave and cross-lane ops on the GPU (`tools/crosslane_fuzz.py`, FUZZ-7)
 
@@ -1023,6 +1121,34 @@ What the hardware answered where the model does not judge (gfx1150; the RDNA2 ru
   mode and op, never `0x7fc00000`. `v_cvt_f16_f32` and `v_cvt_pkrtz_f16_f32` turn a NaN into an f16 NaN with the top 10
   payload bits and the quiet bit set (not the canonical `0x7e00` the model writes; payload not judged, quietness is).
   `v_cvt_f32_f16` keeps the f16 payload shifted left by 13 and does not quiet it (the model agrees).
+
+### f32 misc ops and float compares (`tools/fmisc_diff.py`)
+
+`tools/f32_fuzz.py` generates the f32 arithmetic. `tools/fmisc_diff.py` covers the f32 ops it leaves out:
+`v_fract_f32`, `v_frexp_mant_f32`, `v_frexp_exp_i32_f32`, `v_ldexp_f32`, `v_cvt_u32_f32`, `v_cvt_i32_f32`,
+`v_cvt_off_f32_i4` and `v_fmamk_f32`. It also covers the 16 `v_cmp_*_f32` conditions (e32 into VCC, e64 into an SGPR
+mask or VCC) and `v_cmp_class_f32` e64, each read back with `v_cndmask_b32_e64`. Programs use VOP3 `neg`/`abs`,
+`mul:2`/`mul:4`/`div:2` and `clamp`, with VGPR, SGPR, inline-constant and literal sources within the constant-bus
+limits. It runs one lane through `tests/semantic/spirv_mini_interp.py` against its own exact-rational ISA model, with
+the shrinking, skips and exit codes of `salu_diff.py`. Any NaN matches any NaN. It does not judge denormal operands
+or results, a computed NaN read as an integer, the clamp of a NaN or an output modifier that gives a zero: those
+programs are counted as skips with the reason.
+
+`--oracle hw` runs the kernels under the MODE inferred for the game's shaders (IEEE off, f32 denormals flushed). With
+the assembler's compute default (IEEE on) the hardware ignores `omod`: `v_fract_f32_e64 v4, -v16 mul:2` with v16 = 0.5
+gives 0.5. On an RDNA2 iGPU (gfx1036), 1,800 programs gave 1,563 judged and 0 mismatches, so the model's rules hold
+there. Those rules cover the `0x3f7fffff` cap of `v_fract_f32`, `fract(-0) = +0`, `frexp` of ±inf/NaN/±0, `ldexp`
+overflow and underflow, saturating conversions, one rounding in `v_fmamk_f32`, unordered compares and the class bits.
+Modifiers do not change whether a signalling NaN is signalling: `v_cmp_class_f32` with `-v`, `|v|` or `-|v|` on
+`0x7f800001` still sets bit 0. The translator applies those modifiers with `OpFNegate`/`FAbs`, and in the
+interpreter that quiets the NaN. That form is left out unless `--known` (`class-snan-mods`, posted as a finding).
+`v_cmp_class_f32` without modifiers and `v_cvt_f32_ubyteN` are in `f32_fuzz.py`.
+
+```
+python -I tools/fmisc_diff.py --programs 3000 --seed 11 --max-ops 8
+python -I tools/fmisc_diff.py --oracle hw --programs 500 --seed 1
+python -I tests/test_fmisc_diff.py
+```
 
 
 ### f16 transcendentals on the hardware (`tools/f16_trans_sweep.py`, FUZZ-29)
@@ -1309,7 +1435,7 @@ The `hw` side runs one lane per case in wave32 and wave64, under five MODEs:
 It reports the NaN halves that give 0, the words equal to the translator's, and the near-tie words equal to a single
 rounding of the exact product. Exit 0 means every hardware word equals the translator's, 1 means one differs, 77
 means the oracle is unavailable. `tests/test_pknorm_probe.py` checks four near-tie words against a derivation written
-out by hand, and checks that the translator side rounds twice there and gives 0 for a NaN half.
+out by hand, and checks that the translator side rounds once there (since SHADER-363) and gives 0 for a NaN half.
 
 Results (134 cases per run):
 
@@ -1323,8 +1449,10 @@ product once, to nearest even. Examples:
 - `0x38400180` (exact 1.5 - 1.4e-9) gives 1, where the translator gives 2;
 - `0x3c004101` (exact 256.5 + 1.5e-5) gives 257, where the translator gives 256.
 
-The translator is not changed here. It needs the exact product: the product's rounding error is exact through `Fma`
-(`Fma(x, s, -p)`), and only its sign matters on a tie.
+SHADER-363 fixes the translator. It keeps the f32 product p and its exact error `Fma(x, s, -p)`. When p lies exactly
+on k + 0.5, the error's sign gives floor(p) + 1 or floor(p), and a zero error keeps `RoundEven` (an exact tie). The
+probe then exits 0 on the same iGPU: all 134 words equal the translator's in all ten runs (wave32 and wave64, five
+MODEs), including the 28 near ties.
 
 ### f16 output modifiers, clamp and `v_fma_mix*` operands on RDNA2 (SHADER-135)
 
@@ -1418,6 +1546,15 @@ Hardware validation was executed via `tools/hw_oracle` and `tools/salu_diff.py` 
 - **24-bit products and 64-bit shifts (`v_mul_hi_*24`, `v_lshrrev_b64`, `v_ashrrev_i64`)**:
   - Verified across signed/unsigned products, edge signs, and 0..63 shift counts: **0 mismatches**.
 
+### Packed 16-bit integer operations on RDNA2 (SHADER-302)
+
+*Measured on an RDNA2 iGPU (gfx1036), Windows 11, AMD Windows driver 32.0.21045.29003, HIP backend (`amdhip64_6.dll`), AMD clang 23.0.0git (`rocm-sdk-core 10.0.0`).*
+
+380 raw compute kernels covering all 11 packed 16-bit integer instructions (`v_pk_add_u16`, `v_pk_sub_u16`, `v_pk_add_i16`, `v_pk_sub_i16`, `v_pk_mul_lo_u16`, `v_pk_mad_u16`, `v_pk_mad_i16`, `v_pk_max_u16`, `v_pk_min_u16`, `v_pk_max_i16`, `v_pk_min_i16`), tested in both wave32 and wave64:
+
+- **Constant operands under `op_sel` / `op_sel_hi`:** Integer constants under VOP3P are uniformly treated as 32-bit dwords `C`. When `op_sel[i] == 0`, bits `[15:0]` are selected; when `op_sel[i] == 1`, bits `[31:16]` are selected. Positive inline constants zero-extend (`5` → `0x00000005`: lo=`0x0005`, hi=`0x0000`; `64` → `0x00000040`: lo=`0x0040`, hi=`0x0000`). Negative inline constants sign-extend (`-1` → `0xFFFFFFFF`: lo=`0xFFFF`, hi=`0xFFFF`; `-16` → `0xFFFFFFF0`: lo=`0xFFF0`, hi=`0xFFFF`). 32-bit literals preserve their full dword (`0x12345678`: lo=`0x5678`, hi=`0x1234`; `0x80017fff`: lo=`0x7fff`, hi=`0x8001`). Float inline tokens (`0.5`, `1.0`, `-2.0`, `4.0`) assemble as their 32-bit IEEE 754 bit patterns (`1.0` → `0x3f800000`: lo=`0x0000`, hi=`0x3f80`).
+- **`clamp` saturation:** Unsigned add/mad saturate to `0xFFFF`; unsigned sub saturates underflow to `0x0000`; signed add/sub/mad saturate to `[-32768, 32767]`.
+- **Silicon vs Translator parity:** 380 of 380 kernels match bit-for-bit between native hardware and `tools/rdna2spirv.py` lowered to SPIR-V (0 mismatches, 0 wave32/wave64 differences).
 
 ## Coverage plan and cost
 

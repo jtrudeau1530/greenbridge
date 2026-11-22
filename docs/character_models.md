@@ -156,9 +156,12 @@ Lucia or Mandy body. `story000.rpf` is mission map cells, not ped actors: its fu
 vertices of unrigged 64 m cells. `anim.rpf`'s `LOD0_Body_Shapes_Female` is a rig program with no
 mesh.
 
-A raw RSC8 scan of all 75,135 `packs.rpf` entries (all inflated) found 376 ped-skeleton
-resources, every one a `char_*bounds` or bounds fragment; **0** were a ped mesh with skin and
-**0** had body height. The unnamed-resource route therefore does not add a body.
+A raw RSC8 scan of **862,555** resources across all 13 indexed RPF9 archives (every `rageobj`
+entry, unnamed pages and the >3 MiB band included; 25.6 GB compressed / 56.3 GB inflated) found
+453 ped-skeleton resources: 342 animal bounds, 2,212 `char_bipedbounds_*` fragments, 4 mannequins
+and 73 anim clips. **0** combined a ped skeleton with the skin/flesh shader, and 0 of the 908
+resources on that shader contained a single `SKEL_*` bone name. The unnamed-resource route
+therefore does not add a body.
 
 The only **nude** continuous human-skeleton meshes are a **generic female mannequin** in
 `levels.rpf`: `gmt_mannequin_proxy_f_01a` (15,488 vertices / 27,725 triangles, 95 bones,

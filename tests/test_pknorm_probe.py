@@ -3,7 +3,8 @@ translator side gives 0 for every NaN half. Standard library only; no GPU, no LL
 
 The near-tie words below are worked out by hand, not taken from the tool's own model. x is the f32 the word encodes;
 "exact" is x * 32767 (i16) or x * 65535 (u16) without rounding; "f32" is that product rounded to f32 (ulp 2^-23 on
-[1, 2), 2^-15 on [256, 512)), which is what the translator's OpFMul gives before RoundEven:
+[1, 2), 2^-15 on [256, 512)), which is what a plain OpFMul gives before RoundEven. RDNA2 rounds once (gfx1036,
+SHADER-339) and so does the translator since SHADER-363:
 
   0x38400180 (i16)  x ~ 4.5778e-5; exact 1.5 - 1.4e-9: once -> 1; f32 rounds it to 1.5, even -> 2
   0x37c000c0 (u16)  x ~ 2.2889e-5; exact 1.5 - 3.5e-10: once -> 1; f32 rounds it to 1.5 -> 2
@@ -62,11 +63,12 @@ class Inputs(unittest.TestCase):
 
 
 class Translator(unittest.TestCase):
-    def test_translator_rounds_twice_on_the_near_ties_and_zeroes_nan(self):
+    def test_translator_rounds_once_on_the_near_ties_and_zeroes_nan(self):
+        # SHADER-363: the translator rounds the exact product once, as RDNA2 does (gfx1036, SHADER-339).
         cases = [(op, word, probe.NANS[0]) for op, word in BY_HAND] + [(op, probe.NANS[3], 0) for op in probe.OPS]
         got = probe.run_translator(cases)
         for (op, word, _), w in zip(cases[:len(BY_HAND)], got):
-            self.assertEqual(w, BY_HAND[(op, word)][1], (op, hex(word)))     # low half: double rounding; high: NaN -> 0
+            self.assertEqual(w, BY_HAND[(op, word)][0], (op, hex(word)))     # low half: single rounding; high: NaN -> 0
         for w in got[len(BY_HAND):]:
             self.assertEqual(w, 0)
 

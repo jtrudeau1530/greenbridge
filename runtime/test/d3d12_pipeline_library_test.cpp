@@ -8,6 +8,7 @@
 //   - GetSerializedSize + Serialize round-trip into a second CreatePipelineLibrary;
 //   - GPU execution of both loaded compute and loaded graphics PSOs under LEONIDA_VK_VALIDATION=1.
 // No game data.
+#include "shader_fixture_path.h"
 #include "vk_test_device.h"
 #include "d3d12_test_shaders.h"
 #include "../shims/d3d12_com.h"
@@ -69,11 +70,11 @@ int main() {
 
     const auto lib_dir = std::filesystem::temp_directory_path() / "leonida_pipeline_library_test";
     std::filesystem::create_directories(lib_dir);
-    std::filesystem::copy_file(LEONIDA_TEST_CS_SPV, lib_dir / "cs.spv",
+    std::filesystem::copy_file(vktest::shader_fixture_path(LEONIDA_TEST_CS_SPV), lib_dir / "cs.spv",
                                std::filesystem::copy_options::overwrite_existing);
-    std::filesystem::copy_file(LEONIDA_TEST_VS_SPV, lib_dir / "vs.spv",
+    std::filesystem::copy_file(vktest::shader_fixture_path(LEONIDA_TEST_VS_SPV), lib_dir / "vs.spv",
                                std::filesystem::copy_options::overwrite_existing);
-    std::filesystem::copy_file(LEONIDA_TEST_PS_SPV, lib_dir / "ps.spv",
+    std::filesystem::copy_file(vktest::shader_fixture_path(LEONIDA_TEST_PS_SPV), lib_dir / "ps.spv",
                                std::filesystem::copy_options::overwrite_existing);
     {
         std::ofstream idx(lib_dir / "index.json", std::ios::binary);
