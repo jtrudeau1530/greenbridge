@@ -421,5 +421,101 @@ class TestInterpMovF16SymbolicAST(unittest.TestCase):
         self.assertEqual(res, 0xAAAA3C00)
 
 
+class InterpMovF16ScalarInterpreter:
+    """Deterministic scalar instruction interpreter for v_interp_mov_f16."""
+
+    def __init__(
+        self,
+        reg_file: InterpolationRegisterFile | None = None,
+        attr_buf: AttributeBuffer | None = None,
+    ) -> None:
+        self.reg_file = reg_file if reg_file is not None else InterpolationRegisterFile()
+        self.attr_buf = attr_buf if attr_buf is not None else AttributeBuffer()
+
+    def execute(self, inst: ASTInstruction) -> None:
+        inst.validate()
+        attr_word = self.attr_buf.read_param_channel(
+            inst.param.index,
+            inst.attr.attr_index,
+            inst.attr.channel.value,
+        )
+        old_val = self.reg_file.read_vgpr_u32(inst.dst.vgpr_index)
+        new_val = ref_interp_mov_f16(
+            attr_word,
+            high_src=inst.high_src,
+            high_dst=inst.dst.high,
+            old_dst_u32=old_val,
+            clamp=inst.clamp,
+        )
+        self.reg_file.write_vgpr_u32(inst.dst.vgpr_index, new_val)
+
+
+class TestInterpMovF16ScalarInterpreter(unittest.TestCase):
+    """Test suite for deterministic scalar instruction interpreter."""
+
+    def setUp(self) -> None:
+        self.rf = InterpolationRegisterFile()
+        self.buf = AttributeBuffer()
+        self.interp = InterpMovF16ScalarInterpreter(self.rf, self.buf)
+
+    def test_scalar_interpreter_basic_mov_lo_and_hi(self):
+        # Pack attr 2 chan Z: lo = 1.0 (0x3C00), hi = 2.0 (0x4000)
+        self.buf.write_param_channel(0, 2, Channel.Z.value, pack_f16_pair(H_ONE, H_TWO))
+
+        # 1. Move low half to low half of v0
+        inst_lo = ASTInstruction(
+            opcode=Opcode.V_INTERP_MOV_F16,
+            dst=ASTOperand(0, high=False),
+            param=ParamType.P0,
+            attr=AttributeRef(2, Channel.Z),
+            high_src=False,
+        )
+        self.interp.execute(inst_lo)
+        self.assertEqual(self.rf.read_vgpr_u32(0), 0x00003C00)
+
+        # 2. Move high half to high half of v0 (preserving low half)
+        inst_hi = ASTInstruction(
+            opcode=Opcode.V_INTERP_MOV_F16,
+            dst=ASTOperand(0, high=True),
+            param=ParamType.P0,
+            attr=AttributeRef(2, Channel.Z),
+            high_src=True,
+        )
+        self.interp.execute(inst_hi)
+        self.assertEqual(self.rf.read_vgpr_u32(0), 0x40003C00)
+
+    def test_scalar_interpreter_clamp(self):
+        # Pack attr 0 chan X: 3.5 (0x4300)
+        u_val = f16_to_u16(3.5)
+        self.buf.write_param_channel(0, 0, Channel.X.value, pack_f16_pair(u_val, 0))
+
+        inst = ASTInstruction(
+            opcode=Opcode.V_INTERP_MOV_F16,
+            dst=ASTOperand(5, high=False),
+            param=ParamType.P0,
+            attr=AttributeRef(0, Channel.X),
+            high_src=False,
+            clamp=True,
+        )
+        self.interp.execute(inst)
+        # Clamped to 1.0 (0x3C00)
+        self.assertEqual(self.rf.read_vgpr_u32(5), H_ONE)
+
+    def test_scalar_interpreter_deterministic_repeatability(self):
+        self.buf.write_param_channel(1, 4, Channel.W.value, 0x12345678)
+        inst = ASTInstruction(
+            opcode=Opcode.V_INTERP_MOV_F16,
+            dst=ASTOperand(10, high=False),
+            param=ParamType.P10,
+            attr=AttributeRef(4, Channel.W),
+            high_src=True,
+        )
+        self.interp.execute(inst)
+        r1 = self.rf.read_vgpr_u32(10)
+        self.interp.execute(inst)
+        r2 = self.rf.read_vgpr_u32(10)
+        self.assertEqual(r1, r2)
+
+
 if __name__ == "__main__":
     unittest.main()
