@@ -2955,8 +2955,9 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                     }
                 }
             }
-        } else if (const auto* build = std::get_if<BuildAccelerationStructure>(&command); build && vk.xdxr_record) {
-            vk.xdxr_record(command_buffer, *build);
+        } else if (const auto* xdxr_build = std::get_if<BuildAccelerationStructure>(&command);
+                   xdxr_build && vk.xdxr_record) {
+            vk.xdxr_record(command_buffer, *xdxr_build);
         } else if (const auto* build = std::get_if<BuildAccelerationStructure>(&command)) {
             // The build's addresses are console VAs into the GPU address arena (heap_base is its device address).
             // A null VA (no index buffer, no transform) stays null: heap_base + 0 would name the arena's zero page.
