@@ -1353,6 +1353,14 @@ public:
         return view_formats_.empty() || format == format_ ||
                std::find(view_formats_.begin(), view_formats_.end(), format) != view_formats_.end();
     }
+    // The castable-format list in DXGI formats, which the Vulkan list can't tell apart where two families share a
+    // VkFormat: B8G8R8X8 and B8G8R8A8 are both BGRA8 images.
+    void keep_castable_formats(UINT32 count, const DXGI_FORMAT* formats) {
+        if (count && formats) castable_formats_.assign(formats, formats + count);
+    }
+    bool lists_castable_format(DXGI_FORMAT format) const {
+        return std::find(castable_formats_.begin(), castable_formats_.end(), format) != castable_formats_.end();
+    }
     bool r9g9b9e5_as_r32_uint() const { return r9g9b9e5_as_r32_uint_; }
     VkImageAspectFlags aspects() const { return aspects_; }
     bool rgb96() const { return rgb96_; }                        // a 96-bit texture in an RGBA32 image
@@ -1923,6 +1931,7 @@ private:
     void* mapped_ = nullptr;
     VkFormat format_ = VK_FORMAT_UNDEFINED;
     std::vector<VkFormat> view_formats_;  // creation-time castable list; empty means no restriction
+    std::vector<DXGI_FORMAT> castable_formats_;  // the same list as the application gave it
     bool r9g9b9e5_as_r32_uint_ = false;
     std::uint64_t image_address_ = 0;  // what a T# names the texture by
     bool rgb96_ = false;
@@ -3456,7 +3465,9 @@ bool image_descriptor(const Resource& resource, const TextureView& view, leonida
             log_once("incompatible typed A8 view format:", int(view.format));
             return false;
         }
-        if (alpha_unused(view.format) != alpha_unused(desc.Format)) {
+        // Only a castable-format list that names the view's format lets a view cross the two families, as WARP and
+        // AMD's D3D12 driver accept (relaxed casting).
+        if (alpha_unused(view.format) != alpha_unused(desc.Format) && !resource.lists_castable_format(view.format)) {
             log_once("view format from another typeless family (B8G8R8X8 and B8G8R8A8):", int(view.format));
             return false;
         }
@@ -3531,11 +3542,17 @@ bool image_descriptor(const Resource& resource, const TextureView& view, leonida
     // D3D12's component mapping picks, for each of R, G, B, A, a channel of the format or a constant; the T#
     // says the same about the hardware's channels, which the format places.
     // A stencil view's format has its eight bits in G and no R, B or A of its own (0, 0, 1 when read).
-    // B8G8R8X8 has no alpha: it reads 1.
-    g::Swizzle channels = g::format_swizzle(view_format);
+    // B8G8R8X8 has no alpha: a view in its family reads 1, and a B8G8R8A8 view of a B8G8R8X8 texture (through a
+    // castable-format list) the stored byte. The view's format decides, as on WARP and AMD's D3D12 driver.
+    // The T#'s format code is the same for both channel orders of a colour format (R8G8B8A8 and B8G8R8A8 are one
+    // 8_8_8_8 code), and the image view keeps the image's format; a castable-format list may still ask for the other
+    // order, so then the view's own format places the channels. Depth images keep their own format's channels.
+    const bool other_order = view.format != DXGI_FORMAT_UNKNOWN && !stencil && !depth_plane && !rgb96 &&
+                             named != view_format && !g::is_depth_stencil_format(view_format);
+    g::Swizzle channels = g::format_swizzle(other_order ? named : view_format);
     if (stencil) channels = {g::select_zero, g::select_x, g::select_zero, g::select_one};
     else if (desc.Format == DXGI_FORMAT_A8_UNORM) channels = {g::select_zero, g::select_zero, g::select_zero, g::select_x};
-    else if (alpha_unused(desc.Format)) channels[3] = g::select_one;
+    else if (alpha_unused(view.format != DXGI_FORMAT_UNKNOWN ? view.format : desc.Format)) channels[3] = g::select_one;
     for (UINT i = 0; i < 4; ++i) {
         const UINT from = D3D12_DECODE_SHADER_4_COMPONENT_MAPPING(i, view.mapping);
         if (msaa && from > D3D12_SHADER_COMPONENT_MAPPING_FORCE_VALUE_1) {
@@ -5432,6 +5449,7 @@ public:
                 std::vector<VkFormat> cast_formats;
                 hr = castable_view_formats(format, castable_count, castable, cast_formats);
                 if (SUCCEEDED(hr)) hr = resource->create_texture(format, cast_formats);
+                if (SUCCEEDED(hr)) resource->keep_castable_formats(castable_count, castable);
             }
         }
         if (FAILED(hr)) {
@@ -6429,6 +6447,7 @@ private:
                 std::vector<VkFormat> cast_formats;
                 hr = castable_view_formats(format, castable_count, castable, cast_formats);
                 if (SUCCEEDED(hr)) hr = resource->create_texture(format, cast_formats);
+                if (SUCCEEDED(hr)) resource->keep_castable_formats(castable_count, castable);
             }
         }
         if (FAILED(hr)) {
