@@ -440,11 +440,19 @@ def main() -> int:
             source.close()
 
     if a.csv:
-        write_csv(a.csv, rows)
+        try:
+            write_csv(a.csv, rows)
+        except OSError as e:
+            print(f"ERROR: cannot write {a.csv}: {e.strerror or e}", file=sys.stderr)
+            return 2
     if a.json:
-        _make_parent(a.json)
-        with open(a.json, "w", encoding="utf-8", newline="\n") as f:
-            json.dump({"summary": summary, "rows": rows}, f, indent=1)
+        try:
+            _make_parent(a.json)
+            with open(a.json, "w", encoding="utf-8", newline="\n") as f:
+                json.dump({"summary": summary, "rows": rows}, f, indent=1)
+        except OSError as e:
+            print(f"ERROR: cannot write {a.json}: {e.strerror or e}", file=sys.stderr)
+            return 2
 
     print(f'{summary["streams"]} streams, {summary["stored"]:,} stored, '
           f'{summary["inflated"]:,} inflated')
