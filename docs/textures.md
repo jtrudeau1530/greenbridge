@@ -394,6 +394,27 @@ independent of the chunk codec. Formats 71/72 use 8-byte BC1 blocks, 74/75/77/78
 98/99 use 16-byte blocks, and 80/81 use 8-byte BC4 blocks. No BC2 (codec 2) texture exists in
 this install.
 
+### Character material texture parameters
+
+Character drawables store material texture references as a 32-bit parameter hash immediately before
+the 64-bit asset key. In the measured character corpus the texture content separates by parameter
+rather than by array order:
+
+| Parameter | Common formats | Measured role |
+|---|---|---|
+| `0xC8E8C282` | BC1/BC3/BC7 sRGB, some BC1/BC7 UNORM | sRGB albedo |
+| `0xC6F46E79` | BC7 UNORM, BC1 UNORM | tangent-space normal map |
+| `0x1E77BF4C` | BC5 UNORM, some BC1/BC7 | normal/detail normal |
+| `0x739E3D0D` | BC7 UNORM, some BC1 | ORM/mask |
+| `0x8ADB8480` | BC4 UNORM | mask |
+
+The counts in the 246-record character corpus are 215 references each for `0xC6F46E79`,
+`0x1E77BF4C` and `0x739E3D0D`, 164 for `0x8ADB8480`, and 64 for `0xC8E8C282`. Not every
+material carries an albedo: the jacket, crop tee and some sports pieces have no `0xC8E8C282`
+entry. Exporters must **not** fall back to the first texture in that case; a normal map painted
+as a base colour is the usual symptom. The hashes are treated as measured corpus semantics, not
+as a claim that they are globally unique across every shader.
+
 ## BCPack block structure and limits
 
 A BCPack chunk is not a self-describing container. The container gives it a decoded (virtual)
