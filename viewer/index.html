@@ -290,7 +290,7 @@ function stream(now = performance.now()) {
     const previous = live.get(def.id);
     const entry = { def, obj: null, loading: true, attempts: (previous?.attempts || 0) + 1, retryAt: 0, previous };
     live.set(def.id, entry);
-    if (def.test) { entry.loading = false; entry.obj = buildTestChunk(def.test); scene.add(entry.obj); applyClay(entry.obj); applyWire(entry.obj); continue; }
+    if (world.test) { entry.loading = false; entry.obj = buildTestChunk(def.test); scene.add(entry.obj); applyClay(entry.obj); applyWire(entry.obj); continue; }
     entry.controller = new AbortController();
     void loadChunk(entry);
   }
