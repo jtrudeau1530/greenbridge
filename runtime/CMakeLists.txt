@@ -1159,6 +1159,7 @@ if(TARGET Vulkan::Headers)
     target_compile_options(d3d12_indirect_zero_test PRIVATE /W4 /permissive- /utf-8)
     add_test(NAME d3d12_indirect_zero COMMAND d3d12_indirect_zero_test)
     set_tests_properties(d3d12_node_mask PROPERTIES SKIP_RETURN_CODE 77)
+    set_tests_properties(d3d12_indirect_zero PROPERTIES SKIP_RETURN_CODE 77)
 
     # CopyResource / CopyTextureRegion between BC and its uncompressed equivalent (and depth <-> colour) against the
     # host runtime and WARP; run explicitly on a Vulkan GPU.
