@@ -3354,31 +3354,38 @@ int main() {
             EXPECT(levels.NumQualityLevels == 0);
         }
         for (UINT format = 0; format <= 192; ++format) {
-            const bool known = format <= 115 || (format >= 189 && format <= 191);
+            const bool known = format != UINT(DXGI_FORMAT_R1_UNORM) &&
+                               (format <= 115 || (format >= 189 && format <= 191));
             for (const UINT samples : {1u, 3u, 31u}) {
                 D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS levels{DXGI_FORMAT(format), samples,
                                                                    D3D12_MULTISAMPLE_QUALITY_LEVELS_FLAG_NONE, 99};
                 EXPECT(device->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &levels,
                                                    sizeof(levels)) == (known ? S_OK : E_FAIL));
-                EXPECT(levels.NumQualityLevels == UINT(known && samples == 1));
+                EXPECT(levels.NumQualityLevels == (known ? UINT(samples == 1) : 99u));
             }
         }
         D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS invalid_format_levels{DXGI_FORMAT_FORCE_UINT, 1,
                                                                           D3D12_MULTISAMPLE_QUALITY_LEVELS_FLAG_NONE, 99};
         EXPECT(device->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &invalid_format_levels,
                                            sizeof(invalid_format_levels)) == E_FAIL);
-        EXPECT(invalid_format_levels.NumQualityLevels == 0);
+        EXPECT(invalid_format_levels.NumQualityLevels == 99);
+        // Native (RTX 5070 / 621.24): an unknown format keeps the output even with an invalid count.
+        D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS unknown_zero{DXGI_FORMAT(192), 0,
+                                                                   D3D12_MULTISAMPLE_QUALITY_LEVELS_FLAG_NONE, 99};
+        EXPECT(device->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &unknown_zero,
+                                           sizeof(unknown_zero)) == E_FAIL);
+        EXPECT(unknown_zero.NumQualityLevels == 99);
         for (const auto format : {DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_BC1_UNORM, DXGI_FORMAT_R32G32B32_FLOAT}) {
             for (const UINT samples : {1u, 3u, 4u, 32u}) {
                 for (const UINT flags : {0u, 1u}) {
                     D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS plain{format, samples,
-                        D3D12_MULTISAMPLE_QUALITY_LEVELS_FLAGS(flags)};
+                        D3D12_MULTISAMPLE_QUALITY_LEVEL_FLAGS(flags)};
                     EXPECT(device->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &plain,
                                                        sizeof(plain)) == S_OK);
                     if (flags && format == DXGI_FORMAT_R32G32B32_FLOAT) EXPECT(plain.NumQualityLevels == 0);
                     for (const UINT extra : {2u, 0xfeu}) {
                         auto undefined_flags = plain;
-                        undefined_flags.Flags = D3D12_MULTISAMPLE_QUALITY_LEVELS_FLAGS(flags | extra);
+                        undefined_flags.Flags = D3D12_MULTISAMPLE_QUALITY_LEVEL_FLAGS(flags | extra);
                         undefined_flags.NumQualityLevels = 99;
                         EXPECT(device->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &undefined_flags,
                                                            sizeof(undefined_flags)) == S_OK);

@@ -5230,18 +5230,23 @@ public:
         case D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS: {
             if (size != sizeof(D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS)) return d3d12_trace::result(method, E_INVALIDARG);
             auto* levels = static_cast<D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS*>(data);
+            // RTX 5070 / 621.14/621.24: a format outside the runtime's table (and R1_UNORM) fails with the caller's
+            // output untouched; a known format clears it before the sample count is checked.
+            const UINT format_id = UINT(levels->Format);
+            if (levels->Format == DXGI_FORMAT_R1_UNORM ||
+                !(format_id <= DXGI_FORMAT_B4G4R4A4_UNORM ||
+                  (format_id >= DXGI_FORMAT_SAMPLER_FEEDBACK_MIN_MIP_OPAQUE &&
+                   format_id <= DXGI_FORMAT_A4B4G4R4_UNORM)))
+                return d3d12_trace::result(method, E_FAIL);
             levels->NumQualityLevels = 0;
             // TILED_RESOURCE asks about tiled (reserved, 64KB_UNDEFINED_SWIZZLE) textures. Measured natively on an
             // RX 7800 XT, a Radeon iGPU and WARP: 1x and 4x keep the plain answer, every other count has none, and a
             // format without a tile shape (96-bit) has none at any count. That is GetResourceAllocationInfo's rule
             // here (tiled MSAA is 4x only). 128-bit formats at 4x: the AMD drivers answer 0, WARP and the RTX 5070 Ti
             // allocate them; this follows the latter, as the allocation path does.
-            // RTX 5070 / 621.14: undefined flag bits are ignored; bad counts/formats fail, known formats have 1x.
+            // RTX 5070 / 621.14: undefined flag bits are ignored; bad counts fail, known formats have 1x.
             const bool tiled = (levels->Flags & D3D12_MULTISAMPLE_QUALITY_LEVELS_FLAG_TILED_RESOURCE) != 0;
-            if (levels->SampleCount == 0 || levels->SampleCount > D3D12_MAX_MULTISAMPLE_SAMPLE_COUNT ||
-                !(UINT(levels->Format) <= DXGI_FORMAT_B4G4R4A4_UNORM ||
-                  (UINT(levels->Format) >= DXGI_FORMAT_SAMPLER_FEEDBACK_MIN_MIP_OPAQUE &&
-                   UINT(levels->Format) <= DXGI_FORMAT_A4B4G4R4_UNORM)))
+            if (levels->SampleCount == 0 || levels->SampleCount > D3D12_MAX_MULTISAMPLE_SAMPLE_COUNT)
                 return d3d12_trace::result(method, E_FAIL);
             Format format = texture_storage_format(levels->Format, false);
             if (levels->SampleCount == 1) {
