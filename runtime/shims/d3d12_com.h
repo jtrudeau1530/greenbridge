@@ -273,6 +273,12 @@ inline constexpr UINT descriptor_size = 32;
 // ExecuteCommandLists returns void; this is what the last call on the queue did.
 leonida::ReplayResult last_execute_result(ID3D12CommandQueue* queue);
 
+// True when the current thread or process token has SeIncreaseBasePriorityPrivilege enabled (or the test override
+// forces it), which D3D12 requires for D3D12_COMMAND_QUEUE_PRIORITY_GLOBAL_REALTIME.
+bool has_global_realtime_privilege();
+// Test override for has_global_realtime_privilege(): -1 queries the token (default), 0 forces denied, 1 forces granted.
+void set_global_realtime_privilege_override_for_test(int state);
+
 // The front/back stencil references last recorded by ID3D12GraphicsCommandList8::OMSetFrontAndBackStencilRef on
 // `list`. The values are kept for the future pipeline path, which is what would apply them. False when `list` is
 // not one of this module's command lists.

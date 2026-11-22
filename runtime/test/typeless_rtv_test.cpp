@@ -262,9 +262,27 @@ int main() {
     EXPECT(rejects(wrong, {1, 0, 1, 2, ColorViewFormat::rgba8_srgb}, ReplayResult::invalid_subresource));
     wrong = binding; wrong.volume = true;
     EXPECT(rejects(wrong, {1, 0, 0, 1, ColorViewFormat::rgba8_srgb}));
-    wrong = binding; wrong.samples = 4;
-    EXPECT(rejects(wrong, {1, 0, 0, 1, ColorViewFormat::rgba8_uint}));
-    checks += 8;
+    {
+        auto msaa = binding; msaa.samples = 4;
+        for (const auto [format, expected] : formats) {
+            CommandList ms_list;
+            EXPECT(ms_list.clear_render_target({1, 0, 0, 1, format}, color) && ms_list.close());
+            EXPECT(run(ms_list, msaa, vk) == ReplayResult::success);
+            const bool attachment = format != ColorViewFormat::rgba8_unorm;
+            EXPECT(image_clears == (attachment ? 0u : 1u) && attachment_clears == (attachment ? 1u : 0u));
+            EXPECT(!attachment || (requested_format == expected && rendering_layers == 1));
+            ++checks;
+        }
+        auto msaa_layered = layered; msaa_layered.mip_levels = 1; msaa_layered.samples = 4;
+        CommandList ms_layer_list;
+        EXPECT(ms_layer_list.clear_render_target({1, 0, 1, 2, ColorViewFormat::rgba8_srgb}, color) &&
+               ms_layer_list.close());
+        EXPECT(run(ms_layer_list, msaa_layered, vk) == ReplayResult::success);
+        EXPECT(attachment_clears == 1 && requested_format == VK_FORMAT_R8G8B8A8_SRGB);
+        EXPECT(requested_range.baseArrayLayer == 1 && requested_range.layerCount == 2 && rendering_layers == 2);
+        ++checks;
+    }
+    checks += 7;
     CommandList list;
     EXPECT(list.clear_render_target({1, 0, 0, 1, ColorViewFormat::rgba8_srgb}, color) && list.close());
     auto unavailable = vk; unavailable.begin_rendering = nullptr;

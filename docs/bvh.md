@@ -367,8 +367,18 @@ children it already points to. The tree is kept, so a refit is valid for any mot
 the sort. It takes 0.07 ms for 1,000 triangles and 9.8 ms for 1,000,000 on an RTX 2050, against 0.19 ms and 22 ms for
 a build, but the tree traverses more slowly as the geometry moves away from where it was built.
 
-Not done yet: pairing triangles into TRI1 leaves, BOX16 nodes, compaction and copies. A higher-quality build (SAH)
-would also come later.
+**Copies and postbuild info.** `CopyRaytracingAccelerationStructure` with `CLONE` or `COMPACT` copies the
+structure's bytes. The records are position-independent: node pointers count from the structure's start, and a TLAS
+names its BLASes by address, which a clone keeps. The size comes from the source header (`totalSizeIn64BNodes`), so
+a copy can follow a build in the same command list, and it is bounded by the destination resource. A build is
+already exactly its layout's size, so `COMPACTED_SIZE` and `CURRENT_SIZE` (from
+`EmitRaytracingAccelerationStructurePostbuildInfo` or the postbuild descs of a build) are both
+`totalSizeIn64BNodes * 64`, and compaction saves nothing. Serialization, deserialization and the tools-visualization
+mode are refused at replay as unsupported, not faked. In `LEONIDA_RT_AS=khr` mode the postbuild descs stay ignored,
+as before.
+
+Not done yet: pairing triangles into TRI1 leaves, BOX16 nodes, serialization. A higher-quality build (SAH) would also
+come later.
 
 ```powershell
 python -I tools/xdxr_bvh.py selftest --seed 1 --rays 400   # build BLASes, compare closest hits with brute force

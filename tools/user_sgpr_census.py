@@ -24,6 +24,7 @@ Usage:
 """
 import argparse
 import json
+import os
 import sys
 from collections import Counter, defaultdict
 
@@ -83,19 +84,36 @@ def census(index, base=None):
     return out
 
 
+def stage_sgpr(text):
+    stage, _, value = text.partition("=")
+    message = f"expected STAGE=SGPR with a nonnegative SGPR: {text!r}"
+    try:
+        sgpr = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(message) from None
+    if not stage or sgpr < 0:
+        raise argparse.ArgumentTypeError(message)
+    return stage, sgpr
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("index", help="spirv/index.json written by tools/rdna2spirv.py")
     ap.add_argument("--json", help="also write the summary here")
-    ap.add_argument("--expect", nargs="*", default=[], metavar="STAGE=SGPR",
+    ap.add_argument("--expect", nargs="*", type=stage_sgpr, default=[], metavar="STAGE=SGPR",
                     help="fail if the most common lowest-pointer SGPR of STAGE is not SGPR")
-    ap.add_argument("--base", nargs="*", default=[], metavar="STAGE=SGPR",
+    ap.add_argument("--base", nargs="*", type=stage_sgpr, default=[], metavar="STAGE=SGPR",
                     help="report the reads below this first root-argument SGPR per stage")
     a = ap.parse_args(argv)
+    if a.json:
+        try:
+            if os.path.samefile(a.index, a.json):
+                ap.error("--json must not overwrite the input index")
+        except FileNotFoundError:
+            pass
     with open(a.index, encoding="utf-8") as f:
         index = json.load(f)
-    base = {k: int(v) for k, _, v in (b.partition("=") for b in a.base)}
-    summary = census(index, base)
+    summary = census(index, dict(a.base))
     for stage, s in summary.items():
         top = s["most_common_lowest_pointer_sgpr"]
         print(f"{stage}: {s['shaders']} shaders; lowest pointer SGPR "
@@ -103,13 +121,12 @@ def main(argv=None):
               f"pointer gaps {s['pointer_gap']}; after a ptr32 {s['after_ptr32']}"
               + (f"; below base {s['below_base']}" if "below_base" in s else ""))
     if a.json:
-        with open(a.json, "w", encoding="utf-8") as f:
+        with open(a.json, "w", encoding="utf-8", newline="\n") as f:
             json.dump(summary, f, indent=1, sort_keys=True)
     bad = []
-    for item in a.expect:
-        stage, _, sgpr = item.partition("=")
+    for stage, sgpr in a.expect:
         got = summary.get(stage, {}).get("most_common_lowest_pointer_sgpr")
-        if got != int(sgpr):
+        if got != sgpr:
             bad.append(f"{stage}: expected s{sgpr}, got {'s%d' % got if got is not None else 'none'}")
     for b in bad:
         print("MISMATCH", b, file=sys.stderr)

@@ -81,14 +81,14 @@ CS_SMEM = [0x5eed0024, 0x5eed0028, 0x5eed002c, 0x5eed0030, 0x5eed0010, 0x5eed001
 WAVE32_DUMPS = ("cs_store", "cs_smem_soffset_imm", "cs_wqm_w32", "cs_w32_lane_wrap", "cs_movrelsd_2", "cs_w32_permute",
                 "cs_barrier_divergent", "cs_barrier_early_end", "cs_barrier_loop", "cs_w32_lds_u8_d16", "cs_bpermute32",
                 "cs_w32_partial_scmp", "cs_exec_const", "cs_w32_mask_imm", "cs_w32_int_ext",
-                "cs_w32_salu64", "cs_w32_misc_ext", "cs_w32_new_ops", "cs_w32_sincos")
+                "cs_w32_salu64", "cs_w32_misc_ext", "cs_w32_new_ops", "cs_w32_sincos", "cs_lds_b64_cmpst")
 # Wave32 lane-mask dumps: their EXEC/VCC masks and lane selects cover 32 lanes, so a device whose widest subgroup is
 # narrower (Mesa llvmpipe: 8) can't produce their words. They are skipped there, as ps_bitmask_perm is. They run with
 # 32 lanes requested (WAVE32_LANE_ENV), as run_gpu_tests.py does: a device with a range like 8..32 (Intel ANV) may
 # otherwise pick a narrower size and return different words (#774).
 WAVE32_LANE_ENV = {"VKC_SUBGROUP_SIZE": "32"}
 WAVE32_LANE_DUMPS = ("cs_wqm_w32", "cs_w32_lane_wrap", "cs_w32_permute", "cs_bpermute32", "cs_w32_partial_scmp", "cs_exec_const",
-                     "cs_w32_mask_imm")
+                     "cs_w32_mask_imm", "cs_lds_b64_cmpst")
 CS_DPP = [("cs_dpp", [1, 0, 3, 2, 5, 4, 7, 6]),
           ("cs_dpp_row", [0, 0, 1, 2, 3, 4, 5, 6]),
           ("cs_dpp_mask", [1, 0, 3, 2, 0xeeeeeeee, 0xeeeeeeee, 0xeeeeeeee, 0xeeeeeeee]),
@@ -116,6 +116,9 @@ CS_DUMPS = [*CS_DPP, ("cs_store", CS_STORE), ("cs_smem_soffset_imm", CS_SMEM),
             ("cs_w32_salu64", [0x1E6A2C48, 0x1234, 0xFFFFFFFF, 0x100, 47, 48, 0xFFFF8000, 0xFFFFFFFE]),
             # SHADER-85: 8-bit LDS reads into one half of a VGPR, the other half kept
             ("cs_w32_lds_u8_d16", [0xBEEF00FF, 0x00FF1234, 0xBEEFFF80, 0xFF801234, 0xBEEF007F, 0x007F1234, 0xBEEF0080, 0xFFFF1234]),
+            # ds_cmpst_b32 and the b64 2-address forms (cs_lds_b64_cmpst.asm header)
+            ("cs_lds_b64_cmpst", [0x11110001, 0x22220002, 0x33330003, 0x44440004,
+                                  0xCCCC000C, 0x44440004, 0xBBBB000B, 0x3579BADC]),
             # constant EXEC: each lane takes its own bit (Intel got 16-bit constants wrong for lanes 16-31)
             ("cs_exec_const", [16, 8, 2, 16, 0, 16]),
             # a constant lane mask (saveexec, wrexec, s_and/s_not/s_mov_b64 into EXEC or VCC) gives lane L its bit L,
@@ -187,6 +190,16 @@ FMT_XY_XYZ_WORDS = [
     0x40003C00, 0x00000000, 0xA5A50268, 0xA5A5026C, 0x40003C00, 0x00004200, 0xA5A50278, 0xA5A5027C,
     0x3F800000, 0xA5A50284, 0xA5A50288, 0xA5A5028C, 0x0000FFFF, 0xA5A50294, 0xA5A50298, 0xA5A5029C,
     0x0003FF01, 0xA5A502A4, 0xA5A502A8, 0xA5A502AC, 0xA5A502B0, 0xA5A502B4, 0xA5A502B8, 0xA5A502BC,
+    0xA5A502C0, 0xA5A502C4, 0xA5A502C8, 0xA5A502CC]
+# cs_tbuffer_store.asm: 13 tbuffer_store_format_* regions read back, as a Radeon 680M (gfx1035) gives them
+# natively. Layout and rules in the .asm header.
+TBUFFER_STORE_WORDS = [
+    0x3F800000, 0x40000000, 0x40400000, 0x40800000, 0x40003C00, 0x00000000, 0xA5A50218, 0xA5A5021C,
+    0x00030201, 0xA5A50224, 0xA5A50228, 0xA5A5022C, 0xA5A5FF30, 0xA5A50234, 0xA5A50238, 0xA5A5023C,
+    0x40000240, 0xA5A50244, 0xA5A50248, 0xA5A5024C, 0xD00003FF, 0xA5A50254, 0xA5A50258, 0xA5A5025C,
+    0x3F800000, 0x40000000, 0xA5A50268, 0xA5A5026C, 0x40003C00, 0xA5A50274, 0xA5A50278, 0xA5A5027C,
+    0xFF0080FF, 0xA5A50284, 0xA5A50288, 0xA5A5028C, 0xA5A50290, 0xA5A50294, 0xA5A50298, 0xA5A5029C,
+    0xA5A502FF, 0xA5A502A4, 0xA5A502A8, 0xA5A502AC, 0x3F800000, 0xA5A502B4, 0xA5A502B8, 0xA5A502BC,
     0xA5A502C0, 0xA5A502C4, 0xA5A502C8, 0xA5A502CC]
 # Negative global_load/global_store offsets (cs_global_neg_offset.asm): 40 groups make a 0x2800-byte heap that holds
 # both the right addresses and the 4096-lower ones; only group 0 thread 0 runs, so no wave64 requirement.
@@ -318,7 +331,8 @@ CLIP_TESTS = ("vs_clip", "vs_clip_param4", "vs_clip_undeclared")
 # One definition: a later assignment used to drop ps_texoff (and any entry added by an earlier assignment) from
 # the standalone run. Keep every pixel fixture in this tuple.
 PIXEL_TESTS = sorted((*PIXEL_BITS, "ps_bary", "ps_flat", "ps_bitmask_perm", "ps_texoff", "ps_texoff_implicit",
-                      "ps_uniform_branch", "ps_wqm", "ps_scc_mask32", "ps_interp_f16_high", "ps_ij_computed"))
+                      "ps_uniform_branch", "ps_wqm", "ps_scc_mask32", "ps_interp_f16_high", "ps_ij_computed",
+                      "ps_mandelbrot"))
 # Pixel fixtures drawn with another vertex shader than vs_ids.
 PIXEL_VERTEX = {"ps_interp_f16_high": "vs_f16_pack",
                 "ps_interp_f32_mods": "vs_interp_consts", "ps_interp_mov_mods": "vs_interp_consts"}
@@ -465,6 +479,12 @@ def fmt_xy_xyz_test(tools, spirv, env=None):
     """TEST-185: the 84 result words and the untouched words after them, up to the inputs at 0x200. The heap needs
     0x2d0 bytes, so it is 192 words."""
     return dump_test(tools, spirv, "cs_fmt_xy_xyz", FMT_XY_XYZ_WORDS + [0xEEEEEEEE] * 44, 192, env)
+
+
+def tbuffer_store_test(tools, spirv, env=None):
+    """The 52 region words tbuffer_store_format_* leaves and the untouched words after them, up to the regions at
+    0x200. The heap needs 0x2d0 bytes, so it is 192 words."""
+    return dump_test(tools, spirv, "cs_tbuffer_store", TBUFFER_STORE_WORDS + [0xEEEEEEEE] * 76, 192, env)
 
 
 class Skip(str):
@@ -661,6 +681,8 @@ def cvt_f32_sat_test(tools, spirv):
     for bits, unsigned, signed in CVT_F32_SAT_CASES:
         problem = compute_test(tools, spirv, "cs_cvt_f32_sat", "1", "dump", expected_words=[unsigned, signed],
                                env={"VKC_SGPRS": f"{bits:#010x}"})
+        if problem is None or isinstance(problem, Skip):
+            return problem   # the device can't run it as recorded (wave size not pinnable): the same for every input
         if problem:
             wrong.append(f"{bits:#010x}: {problem}")
     return f"{len(wrong)} of {len(CVT_F32_SAT_CASES)} inputs wrong, first {wrong[0]}" if wrong else ""
@@ -1104,6 +1126,46 @@ def wide_pixel_skip(name, out):
     return Skip(f"SKIP (this device cannot require a {want}-wide fragment subgroup{seen})")
 
 
+def f32(x):
+    """x rounded to the nearest float32. One double add or multiply of two float32 values, then this, is the exact
+    IEEE float32 result, so a model built from it matches the GPU bit for bit."""
+    return struct.unpack("<f", struct.pack("<f", x))[0]
+
+
+def mandelbrot_counts(w):
+    """ps_mandelbrot.asm's iteration counts over a w x w frame, in the shader's order of float32 operations."""
+    counts = []
+    for y in range(w):
+        cy = f32(f32(3.0 * f32((y + 0.5) / w)) - 1.5)
+        for x in range(w):
+            cx = f32(f32(3.0 * f32((x + 0.5) / w)) - 2.25)
+            zx = zy = 0.0
+            n = 0
+            while n < 64:
+                zx2, zy2 = f32(zx * zx), f32(zy * zy)
+                if not 4.0 >= f32(zx2 + zy2):
+                    break
+                xy = f32(zx * zy)
+                zx, zy = f32(f32(zx2 - zy2) + cx), f32(f32(xy + xy) + cy)
+                n += 1
+            counts.append(n)
+    return counts
+
+
+def mandelbrot_problem(px):
+    """ps_mandelbrot: channel 3 is the lane's iteration count. A lane that leaves EXEC too early or late, or a loop
+    that ends on the wrong branch, changes counts; the colour channels are only for looking at the frame."""
+    w = int(len(px) ** 0.5)
+    if w * w != len(px):
+        return f"{len(px)} pixels is not a square frame"
+    want = mandelbrot_counts(w)
+    wrong = [(i, p[3], e) for i, (p, e) in enumerate(zip(px, want)) if p[3] != e]
+    if not wrong:
+        return ""
+    i, got, e = wrong[0]
+    return f"{len(wrong)} of {len(px)} iteration counts differ, e.g. pixel ({i % w}, {i // w}) {got} instead of {e}"
+
+
 def pixel_test(tools, spirv, name):
     path = os.path.join(spirv, name + ".spv")
     if name == "ps_ij_computed" and (BARY_FALLBACK or F16_HALVES):
@@ -1170,6 +1232,8 @@ def pixel_test(tools, spirv, name):
         c = collections.Counter((a, b) for a, b, _, _ in px)
         fine = c[(8, 1)] and c[(8, 0)] and c[(7, 0)] and set(c) <= {(8, 1), (8, 0), (7, 0)}
         return "" if fine else f"(s5, bit) counts {dict(c)}"
+    if name == "ps_mandelbrot":
+        return mandelbrot_problem(px)
     return "no check written for this shader"
 
 
@@ -1223,6 +1287,7 @@ def main():
     results.append(("cs_fmt_1010102", fmt_1010102_test(tools, spirv)))
     results.append(("cs_fmt_sint32", fmt_sint32_test(tools, spirv)))
     results.append(("cs_fmt_xy_xyz", fmt_xy_xyz_test(tools, spirv)))
+    results.append(("cs_tbuffer_store", tbuffer_store_test(tools, spirv)))
     for name, groups, want in GLOBAL_OFFSET:
         results.append((name, compute_test(tools, spirv, name, groups, "dump", expected_words=want)))
     results.append(("cs_user_sgprs", compute_test(tools, spirv, "cs_user_sgprs", "1", "dump",

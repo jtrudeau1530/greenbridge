@@ -101,7 +101,7 @@ def _mapped_source(archive, expected_id):
 def _staged_json(path, doc, **options):
     with tempfile.TemporaryDirectory(dir=os.path.dirname(path)) as directory:
         tmp = os.path.join(directory, os.path.basename(path))
-        with open(tmp, "w", encoding="utf-8") as f:
+        with open(tmp, "w", encoding="utf-8", newline="\n") as f:
             json.dump(doc, f, **options)
         try:
             mode = os.lstat(path).st_mode

@@ -14,7 +14,7 @@ Commands
   diff    <JSAV a> <JSAV b>      list blocks that were added, removed or changed between two saves
   import <save dir>... [--out DIR] [--map OLD=CONTAINER/BLOB]... [--with-packed] [--force] [--dry-run]
                                  copy the ASAV/JSAV payloads out of plain save folders into the on-disk layout
-                                 of the offline XGameSave shim (runtime/shims/xgameruntime_services.cpp):
+                                 of the offline XGameSave shim of the open #279 (not on main yet):
                                  DIR/local-user/<container>/<blob>, names %-encoded the same way.
                                  DIR defaults to %LOCALAPPDATA%\\Leonida\\saves (the shim's LEONIDA_SAVE_DIR default).
                                  VERIFY: container/blob names are a guess until the executable shows them; by default
@@ -245,16 +245,16 @@ def extract(p, out):
             e['file'] = f'blocks/{e["index"]:03d}_{e["group"]}_{e["hash"]}.json'
             with open(os.path.join(out, e['file']), 'wb') as f:
                 f.write(b)
-        with open(os.path.join(out, 'index.json'), 'w') as f:
+        with open(os.path.join(out, 'index.json'), 'w', newline="\n") as f:
             json.dump({'header': h, 'entries': es}, f, indent=1)
         body = d[h['body_offset']:h['body_end']].decode('utf-8')
-        with open(os.path.join(out, 'save.pretty.json'), 'w', encoding='utf-8') as f:
+        with open(os.path.join(out, 'save.pretty.json'), 'w', encoding='utf-8', newline="\n") as f:
             json.dump(json.loads(body), f, indent=1)
         print(f'{len(es)} blocks -> {out}')
     elif k == 'ASAV':
         h = parse_asav(d)
         pl = asav_payload(d, h)
-        with open(os.path.join(out, 'header.json'), 'w') as f:
+        with open(os.path.join(out, 'header.json'), 'w', newline="\n") as f:
             json.dump(h, f, indent=1)
         with open(os.path.join(out, 'header.bin'), 'wb') as f:
             f.write(d[:h['payload_offset']])
@@ -263,7 +263,7 @@ def extract(p, out):
         if pl[:1] == b'{':
             try:
                 obj = json.loads(pl.rstrip(b'\0').decode('utf-8'))
-                with open(os.path.join(out, 'payload.json'), 'w', encoding='utf-8') as f:
+                with open(os.path.join(out, 'payload.json'), 'w', encoding='utf-8', newline="\n") as f:
                     json.dump(obj, f, indent=1)
             except ValueError as ex:
                 print('payload looks like text but did not parse as JSON:', ex)
@@ -467,7 +467,7 @@ def import_saves(args):
         with open(tmp, 'wb') as f:
             f.write(read(src))
         os.replace(tmp, dst)
-    with open(os.path.join(out, 'import-manifest.json'), 'w', encoding='utf-8') as f:
+    with open(os.path.join(out, 'import-manifest.json'), 'w', encoding='utf-8', newline="\n") as f:
         json.dump(manifest, f, indent=1)
     print(f'wrote {len(plan)} blobs under {root}')
 
