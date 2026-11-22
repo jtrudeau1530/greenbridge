@@ -982,10 +982,14 @@ def read_glb_summary(data: bytes) -> dict:
     buffers = gltf.get("buffers")
     if isinstance(buffers, list) and buffers:
         buf0 = buffers[0]
-        if isinstance(buf0, dict) and "uri" not in buf0:
-            declared = buf0.get("byteLength", 0)
-            if isinstance(declared, bool) or not isinstance(declared, int) or declared < 0 or declared > bin_bytes:
+        if isinstance(buf0, dict):
+            embedded = "uri" not in buf0
+            declared = buf0.get("byteLength", 0 if embedded else None)
+            invalid_length = isinstance(declared, bool) or not isinstance(declared, int) or declared < 0
+            if embedded and (invalid_length or declared > bin_bytes):
                 raise GlbError(f"buffers[0].byteLength ({declared}) exceeds BIN chunk ({bin_bytes})")
+            if invalid_length:
+                raise GlbError("invalid buffers[0].byteLength")
             buf0_limit = declared
 
     buffer_views = gltf.get("bufferViews")
