@@ -11,13 +11,14 @@ method, scope and caveats. No game data is included.
 | [design.md](design.md) | Overall project design, asset status, translator contract and open blockers. |
 | [related_projects.md](related_projects.md) | Prior art we may read and the licence boundaries on it. |
 | [rpf.md](rpf.md) | RPF9 archive layout, the carve tools and the unreadable encrypted TOC. |
-| [testing.md](testing.md) | Running the GPU tests on your own GPU: setup per OS, wave64 emulation, and known problems. |
+| [testing.md](testing.md) | Running the GPU tests on your own GPU: setup per OS, wave64 emulation, running without a GPU on Mesa llvmpipe, and known problems. |
 
 ## Archives and assets
 
 | Document | Measured content |
 |---|---|
 | [models.md](models.md) | 155,598 models exported to OBJ with bounds, shader index and material keys. |
+| [resource_names.md](resource_names.md) | RPF9 named-resource index: bounded-inflate lookup for `name.#dr`/`#ft`/`#dd` without the TOC. |
 | [textures.md](textures.md) | 308,895 TTPF textures exported; 48,220 skips, mostly BCPack. |
 | [textures_arrays.md](textures_arrays.md) | 678 TTPF array/volume descriptors: 90 tile-mode-9 cubes have a validated 6-slice allocation layout; 588 remain unresolved. |
 | [animation.md](animation.md) | 130,470 `anim.rpf` streams, 95.4% readable; 1,126 rig sets / 6,677 source-to-rig entries / 3,669 rigs. |
@@ -52,6 +53,7 @@ method, scope and caveats. No game data is included.
 | [d3d12_xs_surface.md](d3d12_xs_surface.md) | The 116-slot `d3d12_xs.dll` export surface; 83/83 standard GUIDs match the PC SDK. |
 | [d3d12_command_objects.md](d3d12_command_objects.md) | Measured command queue/list/fence/`PresentX` surface; verified vs prior art vs open. |
 | [runtime_imports.md](runtime_imports.md) | The 16 shipped modules' measured imports and shim/host/unimplemented split. |
+| [saves.md](saves.md) | Save containers: `JSAV` (index + JSON story save, byte-exact rebuild), `ASAV` header, `SLAYER1` packed copy (not decoded); `tools/saves.py` and import into the offline `XGameSave` folder. |
 | [pipeline_check.md](pipeline_check.md) | Driver-level corpus check: 10/12 shards, 22,092 modules, 2,217 compute pipelines, 0 failures. |
 | [shader_validation.md](shader_validation.md) | Differential CPU/GPU validation design and the current CPU interpreter prototype. |
 | [fssm_crosscheck.md](fssm_crosscheck.md) | FSSM/RDNA2 facts cross-checked against SCARAB; code starts at `code_off + 0x28`. |

@@ -491,8 +491,15 @@ def main():
     ap.add_argument("--archives")
     ap.add_argument("--out")
     a = ap.parse_args()
+    if not os.path.isdir(a.carve):
+        ap.error(f"{a.carve} is not a folder")
     archs = a.archives.split(",") if a.archives else sorted(
         d for d in os.listdir(a.carve) if os.path.isfile(os.path.join(a.carve, d, "index.json")))
+    missing = [arch for arch in archs if not os.path.isfile(os.path.join(a.carve, arch, "index.json"))]
+    if missing:
+        ap.error(f"no index.json for {', '.join(missing)} in {a.carve}")
+    if not archs:
+        ap.error(f"no carved archive (a folder with index.json) in {a.carve}")
     allt = []
     for arch in archs:
         t = scan_archive(a.carve, arch)

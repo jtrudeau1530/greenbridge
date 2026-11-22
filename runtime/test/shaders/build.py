@@ -15,6 +15,7 @@ The comment at the top of each .asm says which test program to run on the result
 import json
 import os
 import re
+import struct
 import subprocess
 import sys
 import tempfile
@@ -45,15 +46,32 @@ def asm_mattr(path):
     return None
 
 
+CLIP_CASES = {"vs_clip": 1, "vs_clip_param4": 4, "vs_clip_undeclared": 1}
+
+
+def shader_source(name):
+    return "vs_clip" if name in CLIP_CASES else name
+
+
+def clip_container():
+    # One OSG1 element: stream 0, SV_ClipDistance0.xy, float, logical register 2.
+    name = b"SV_ClipDistance\0"
+    payload = struct.pack("<8I2B6x", 1, 8, 0, 40, 0, 2, 3, 2, 3, 0) + name
+    return (b"DXBC" + bytes(16) + struct.pack("<4I", 1, 44 + len(payload), 1, 36)
+            + b"OSG1" + struct.pack("<I", len(payload)) + payload)
+
+
 def translate_tests(work, names):
     disasm, fssm, spirv = (work / d for d in ("disasm", "fssm", "spirv"))
     disasm.mkdir()
     fssm.mkdir()
     for n in names:
-        asm_path = os.path.join(HERE, n + ".asm")
+        asm_path = os.path.join(HERE, shader_source(n) + ".asm")
         raw = Path(asm_path).read_text(encoding="utf-8")
         mattr = asm_mattr(asm_path)
         cmd = MC + ["-triple=amdgcn--amdpal", "-mcpu=gfx1013"]
+        if n in CLIP_CASES:
+            cmd.append(f"-defsym=PARAM_SLOT={CLIP_CASES[n]}")
         if mattr:
             cmd.append(f"-mattr={mattr}")
         cmd.append("-show-encoding")
@@ -66,6 +84,8 @@ def translate_tests(work, names):
         (disasm / (n + ".s")).write_text(f"; {n}  hand-written test\n{code}", encoding="utf-8")
         if n.startswith("cs_"):
             (fssm / (n + ".fssm")).write_bytes(compute_header(asm_path))
+        elif n in CLIP_CASES and n != "vs_clip_undeclared":
+            (work / (n + ".dxbc")).write_bytes(clip_container())
         else:
             (work / (n + ".dxbc")).write_bytes(bytes(32))  # chunk count 0
     cmd = [sys.executable, "-I", TRANSLATOR, disasm, "--out", spirv]
@@ -78,7 +98,7 @@ def main():
     if len(sys.argv) < 2:
         sys.exit(__doc__)
     out = Path(sys.argv[1])
-    available = sorted(p.stem for p in Path(HERE).glob("*.asm"))
+    available = sorted({p.stem for p in Path(HERE).glob("*.asm")} | CLIP_CASES.keys())
     names = sys.argv[2:] or available
     unknown = sorted(set(names) - set(available))
     if unknown:

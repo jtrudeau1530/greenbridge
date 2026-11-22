@@ -60,15 +60,17 @@ def below_normal():
 def decode_node_pointer(value):
     """Decode the low three type bits and the high 29-bit 64-byte node index."""
     typ = value & 7
+    invalid = value == INVALID_NODE
     return {"ptr": value, "index": value >> 3, "type": typ,
-            "name": NODE_TYPE_NAMES.get(typ, "invalid"), "invalid": value == INVALID_NODE}
+            "name": "invalid" if invalid else NODE_TYPE_NAMES[typ], "invalid": invalid}
 
 
 def parse_header(head):
     """Parse the 64-byte XboxBvh4Header at payload offset 0x100.
 
-    The field names and offsets match the public XboxBvh4Header used by the Xbox DXR traversal
-    shaders. The offsets in the header are relative to 0x100, the start of this header.
+    The field names, types and offsets match the public XboxBvh4Header used by the Xbox DXR traversal
+    shaders. The offsets in the header are relative to 0x100, the start of this header. The source
+    declares offsetToPrimRemap as int32_t and offsetToParents as uint32_t, so they are unpacked differently.
     """
     if len(head) < HEAD or struct.unpack_from("<I", head, TAG_OFF)[0] != TAG:
         return None
@@ -94,6 +96,7 @@ def parse_header(head):
         "root_node_index": root_ptr["index"],
         "root_node_type": root_ptr["type"],
         "root_node_type_name": root_ptr["name"],
+        "root_node_invalid": root_ptr["invalid"],
         "offset_to_elements": struct.unpack_from("<I", head, 0x134)[0],
         "offset_to_parents": struct.unpack_from("<I", head, 0x138)[0],
         "compression_params": struct.unpack_from("<I", head, 0x13C)[0],
@@ -145,7 +148,7 @@ def classify(head, size, tail=None):
         tail = struct.unpack_from("<I", head, TAIL_OFF)[0]
         hdr = parse_header(head)
         if hdr is not None and 0x140 + n * 64 == end and tail == end - 0x100:
-            common = dict(signature="bvh4:0x81020006", version="0x%08x" % hdr["flags"],
+            common = dict(signature="bvh4:0x81020006", version=hdr["version"],
                           node_count=n, node_bytes=n * 64, tail_offset=tail, declared_bytes=end,
                           bounds_min=[round(v, 4) for v in hdr["bounds_min"]],
                           bounds_max=[round(v, 4) for v in hdr["bounds_max"]],
@@ -156,6 +159,7 @@ def classify(head, size, tail=None):
                           root_node_index=hdr["root_node_index"],
                           root_node_type=hdr["root_node_type"],
                           root_node_type_name=hdr["root_node_type_name"],
+                          root_node_invalid=hdr["root_node_invalid"],
                           offset_to_elements=hdr["offset_to_elements"],
                           offset_to_parents=hdr["offset_to_parents"],
                           compression_params=hdr["compression_params"],
@@ -336,7 +340,8 @@ def write_outputs(rows, summaries, out, csv_path):
         cols = ["source", "offset", "stored", "size", "kind", "signature", "version", "node_count",
                 "node_bytes", "declared_bytes", "tail_offset", "flags", "crc32", "num_elements",
                 "offset_to_nodes", "offset_to_prim_remap", "root_node_ptr", "root_node_index",
-                "root_node_type", "root_node_type_name", "offset_to_elements", "offset_to_parents",
+                "root_node_type", "root_node_type_name", "root_node_invalid", "offset_to_elements",
+                "offset_to_parents",
                 "compression_params", "dehydrated", "chunked", "bounds_min", "bounds_max",
                 "hash", "off_a0", "hi16", "lo16", "desc_word", "fragment"]
         with open(csv_path, "w", newline="", encoding="utf-8") as f:

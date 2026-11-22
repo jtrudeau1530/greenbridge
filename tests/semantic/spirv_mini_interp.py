@@ -12,8 +12,9 @@ Design rules (see tests/semantic/README.md):
     are per lane). Control flow is the forward-only discard test and the forward merge/dynamic-bounds
     branches the translator emits: OpBranch / OpBranchConditional to a later label plus OpPhi at the merge block.
     Backward branches, loops, calls and switches are rejected. Function/Output/Input variables live in Python
-    boxes; PushConstant reads can be seeded with a word list; physical-storage-buffer loads/stores use a flat
-    address -> word dictionary. Workgroup storage and images are rejected.
+    boxes; PushConstant reads can be seeded with a word list; physical-storage-buffer loads/stores (and 32-bit
+    atomics, which with one invocation are read-combine-write) use a flat address -> word dictionary. Workgroup
+    storage and images are rejected.
   * A default run sees zero push constants, no inputs and empty memory, so tests that do not care about them
     keep the old behaviour.
 
@@ -37,6 +38,11 @@ _IGNORED = frozenset({
     "OpCapability", "OpExtension", "OpExtInstImport", "OpMemoryModel", "OpEntryPoint", "OpExecutionMode",
     "OpDecorate", "OpMemberDecorate", "OpTypeVoid", "OpTypeFunction", "OpLabel", "OpSelectionMerge",
     "OpReturn", "OpFunctionEnd", "OpName", "OpSource",
+})
+
+_ATOMICS = frozenset({
+    "OpAtomicIAdd", "OpAtomicISub", "OpAtomicUMin", "OpAtomicUMax", "OpAtomicSMin", "OpAtomicSMax", "OpAtomicAnd",
+    "OpAtomicOr", "OpAtomicXor", "OpAtomicExchange", "OpAtomicCompareExchange",
 })
 
 _LINE = re.compile(r"^(?:(%\S+)\s*=\s*)?(Op\w+)\s*(.*)$")
@@ -486,6 +492,25 @@ def _invocation(text, inputs, push_constants, memory, step=False):
                 memory[p[1]] = val(a[1])
             else:
                 p[0][p[1]] = val(a[1])
+        elif op in _ATOMICS:
+            # One invocation, so an atomic is read, combine, write; the result is the original value (SPIR-V spec,
+            # 3.42.18). Operands: result type, pointer, scope, semantics(, unequal semantics), value(, comparator).
+            p = pointers[a[1]]
+            if p[0] != "psb":
+                raise UnsupportedConstruct(f"{op} outside PhysicalStorageBuffer")
+            if types.bits(a[0]) != 32:
+                raise UnsupportedConstruct(f"{op} on a non-32-bit integer")
+            old = memory.get(p[1], 0)
+            if op == "OpAtomicCompareExchange":
+                new = val(a[5]) if old == val(a[6]) & MASK else old
+            else:
+                v = val(a[4]) & MASK
+                new = {"OpAtomicIAdd": old + v, "OpAtomicISub": old - v, "OpAtomicUMin": min(old, v),
+                       "OpAtomicUMax": max(old, v), "OpAtomicSMin": old if _s32(old) <= _s32(v) else v,
+                       "OpAtomicSMax": old if _s32(old) >= _s32(v) else v, "OpAtomicAnd": old & v,
+                       "OpAtomicOr": old | v, "OpAtomicXor": old ^ v, "OpAtomicExchange": v}[op]
+            memory[p[1]] = new & MASK
+            values[res] = old
         elif op == "OpSelect":
             if not isinstance(val(a[1]), bool):
                 raise UnsupportedConstruct("OpSelect with a non-scalar-bool condition")
@@ -543,14 +568,19 @@ def _invocation(text, inputs, push_constants, memory, step=False):
             values[res] = (val(a[1]) * val(a[2])) & wmask(a[0])
         elif op == "OpUConvert":
             values[res] = val(a[1]) & wmask(a[0])
+        elif op == "OpSConvert":
+            # Sign-extend from the operand's width, then wrap to the result's (SPIR-V spec, OpSConvert).
+            if types.t.get(id_type.get(a[1]), ("?",))[0] != "int":
+                raise UnsupportedConstruct("OpSConvert of an operand with no known integer type")
+            values[res] = sval(a[1]) & wmask(a[0])
         elif op == "OpBitReverse":
             bits = types.bits(a[0])
             values[res] = int(f"{val(a[1]) & wmask(a[0]):0{bits}b}"[::-1], 2)
         elif op in ("OpConvertUToF", "OpConvertSToF"):
             x = val(a[1])
-            if not isinstance(x, int):
-                raise UnsupportedConstruct(f"{op} on non-integer")
-            values[res] = f32(float(_s32(x) if op == "OpConvertSToF" else x & MASK))
+            if isinstance(x, bool) or not isinstance(x, int) or x > MASK:
+                raise UnsupportedConstruct(f"{op} on a non-32-bit-integer operand")
+            values[res] = f32(float(_s32(x) if op == "OpConvertSToF" else x))
         elif op == "OpBitCount":
             values[res] = (val(a[1]) & wmask(a[0])).bit_count()
         elif op == "OpISubBorrow":
@@ -635,11 +665,6 @@ def _invocation(text, inputs, push_constants, memory, step=False):
             values[res] = f32(x + y if op == "OpFAdd" else x - y if op == "OpFSub" else x * y)
         elif op == "OpFNegate":
             values[res] = f32(-val(a[1]))
-        elif op in ("OpConvertUToF", "OpConvertSToF"):
-            x = val(a[1])
-            if isinstance(x, bool) or not isinstance(x, int) or x > MASK:
-                raise UnsupportedConstruct(f"{op} on a non-32-bit-integer operand")
-            values[res] = f32(float(_s32(x) if op == "OpConvertSToF" else x))
         elif op in ("OpConvertFToU", "OpConvertFToS"):
             x, bits = val(a[1]), types.bits(a[0])
             if not isinstance(x, float) or not math.isfinite(x):
@@ -649,17 +674,23 @@ def _invocation(text, inputs, push_constants, memory, step=False):
             if not lo <= n < hi:
                 raise UnsupportedConstruct(f"{op} out of range (undefined in SPIR-V)")
             values[res] = n & wmask(a[0])
-        elif op in ("OpFOrdEqual", "OpFOrdLessThan", "OpFOrdGreaterThan", "OpFOrdGreaterThanEqual",
-                    "OpFOrdLessThanEqual", "OpFUnordNotEqual"):
+        elif op in ("OpFOrdEqual", "OpFOrdNotEqual", "OpFOrdLessThan", "OpFOrdGreaterThan",
+                    "OpFOrdGreaterThanEqual", "OpFOrdLessThanEqual", "OpFUnordEqual", "OpFUnordNotEqual",
+                    "OpFUnordLessThan", "OpFUnordGreaterThan", "OpFUnordGreaterThanEqual", "OpFUnordLessThanEqual"):
             x, y = val(a[1]), val(a[2])
             if not (isinstance(x, float) and isinstance(y, float)):
                 raise UnsupportedConstruct(f"{op} on non-float")
-            if op == "OpFUnordNotEqual":
-                values[res] = not (x == y)          # true when unordered, unlike OpFOrdNotEqual
-            else:
-                values[res] = {"OpFOrdEqual": x == y, "OpFOrdLessThan": x < y,
-                               "OpFOrdGreaterThan": x > y, "OpFOrdGreaterThanEqual": x >= y,
-                               "OpFOrdLessThanEqual": x <= y}[op]
+            # Ordered: false if either operand is NaN. Unordered: true if either is NaN. Python's own comparisons
+            # are already ordered (NaN compares false), and -0.0 == 0.0 as in SPIR-V.
+            unordered = math.isnan(x) or math.isnan(y)
+            rel = {"Equal": x == y, "NotEqual": x != y and not unordered, "LessThan": x < y,
+                   "GreaterThan": x > y, "GreaterThanEqual": x >= y, "LessThanEqual": x <= y}[op.removeprefix("OpFUnord").removeprefix("OpFOrd")]
+            values[res] = (rel or unordered) if op.startswith("OpFUnord") else rel
+        elif op in ("OpIsNan", "OpIsInf"):
+            x = val(a[1])
+            if not isinstance(x, float):
+                raise UnsupportedConstruct(f"{op} on non-float")
+            values[res] = math.isnan(x) if op == "OpIsNan" else math.isinf(x)
         elif op in ("OpBitFieldUExtract", "OpBitFieldSExtract"):
             base, off, cnt = val(a[1]), val(a[2]), val(a[3])
             if off + cnt > 32:
@@ -708,10 +739,10 @@ def _invocation(text, inputs, push_constants, memory, step=False):
             elif name == "RoundEven":
                 x = args[0]
                 values[res] = f32(float(round(x))) if math.isfinite(x) else x    # round() breaks ties to even
-            elif name in ("FMin", "FMax"):
+            elif name == "FMin":
                 if any(math.isnan(x) for x in args):
                     raise UnsupportedConstruct(f"GLSL.std.450 {name} of NaN (undefined)")
-                values[res] = f32(min(args) if name == "FMin" else max(args))
+                values[res] = f32(min(args))
             elif name == "UMin":
                 values[res] = min(args)
             elif name == "UMax":

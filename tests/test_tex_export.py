@@ -222,6 +222,24 @@ def test_unsupported_format_is_reported():
     assert T.export_one(texture(9999, "X", 4, 4, 1), "unused", "unused", {}) == "unsupported format"
 
 
+@pytest.mark.parametrize("fmt,bpe", [(61, 1), (56, 2), (10, 8), (28, 4)])
+@pytest.mark.parametrize("w,h", [(5, 3), (5, 1), (1, 5)])
+def test_score_prefers_a_smooth_gradient(fmt, bpe, w, h):
+    if fmt in T.PILLOW_OK:
+        pytest.importorskip("PIL")
+    pixels = max(w, h)
+    values = [i * 240 // (pixels - 1) for i in range(pixels)]
+    zigzag = values[::2] + values[1::2][::-1]
+    copies = min(w, h)
+    ramp = b"".join(bytes([value]) * bpe for value in values * copies)
+    rough = b"".join(bytes([value]) * bpe for value in zigzag * copies)
+    assert T.score_image(w, h, fmt, ramp, bpe) < T.score_image(w, h, fmt, rough, bpe)
+
+
+def test_single_element_has_no_edge_transitions():
+    assert T.score_image(1, 1, 61, b"\x80", 1) == 0
+
+
 def test_data_outside_the_blob_is_reported(eq, tmp_path):
     eq(8)
     carve = str(tmp_path / "carve")

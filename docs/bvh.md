@@ -75,27 +75,36 @@ inflated bytes belong to the BVH family. The archive is not a mixed asset pack.
   streams are ordered (`min <= max` on every axis); in `shared_minigame000_bvh4.rpf` 1,184 of 1,237 are ordered
   and 53 are not (sentinel or non-finite values).
 
-The field names and offsets now match the public `XboxBvh4Header` used by the Xbox DXR traversal shaders:
+The field names, types and offsets match the public `XboxBvh4Header` used by the Xbox DXR traversal shaders. The
+source is [`XDXRStandaloneTraverseShortStackCPU.hlsli`](https://github.com/GaijinEntertainment/DagorEngine/blob/9639942de5a8e5b01d91977f60ed82cda22d5f41/prog/gameLibs/bvh/shaders/XDXRStandaloneTraverseShortStackCPU.hlsli)
+at commit `9639942de5a8e5b01d91977f60ed82cda22d5f41`: `XboxBvh4Header` at L2531 and the flag masks at L2551.
 
-| header offset | field | sample value |
-|---|---|---:|
-| `0x100` | `flags` | `0x81020006` |
-| `0x104` | `totalSizeIn64BNodes` | 9,943 |
-| `0x108` | `crc32` | `0xeab7667e` |
-| `0x10c` | `numElements` | 5,447 |
-| `0x110` | `sceneBounds.min` (3 floats) | `-47.416, -25.742, -5.624` |
-| `0x11c` | `sceneBounds.max` (3 floats) | `47.416, 25.742, 5.624` |
-| `0x128` | `offsetToNodes` | `0x59480` |
-| `0x12c` | `offsetToPrimRemap` | 0 |
-| `0x130` | `rootNodePtr` | `0x136ac` |
-| `0x134` | `offsetToElements` | `0x4280` |
-| `0x138` | `offsetToParents` | `0xffffab40` |
-| `0x13c` | `compressionParams` | `0x808c8a89` |
+| header offset | field | type | sample value |
+|---|---|---|---:|
+| `0x100` | `flags` | `u32` | `0x81020006` |
+| `0x104` | `totalSizeIn64BNodes` | `u32` | 9,943 |
+| `0x108` | `crc32` | `u32` | `0xeab7667e` |
+| `0x10c` | `numElements` | `u32` | 5,447 |
+| `0x110` | `sceneBounds.min` | 3 x `f32` | `-47.416, -25.742, -5.624` |
+| `0x11c` | `sceneBounds.max` | 3 x `f32` | `47.416, 25.742, 5.624` |
+| `0x128` | `offsetToNodes` | `u32` | `0x59480` |
+| `0x12c` | `offsetToPrimRemap` | `i32` | 0 |
+| `0x130` | `rootNodePtr` | `u32` | `0x136ac` |
+| `0x134` | `offsetToElements` | `u32` | `0x4280` |
+| `0x138` | `offsetToParents` | `u32` | `0xffffab40` |
+| `0x13c` | `compressionParams` | `u32` | `0x808c8a89` |
+
+**Probe provenance.** The sample column is the 64-byte header at payload offset `0x100` of the complete `bvh4`
+stream at archive offset `0x4050` (16,464) in `shared_minigame000_bvh4.rpf`, inflated size 655,360 bytes. The
+pack is read-only and is not in the repository; only these header fields and the four root-record words quoted
+below are reproduced. `tools/bvh_index.py` reports the same stream as `node_count=9943` and
+`tail_offset=636416`.
 
 The offsets are relative to the header at `0x100`, not to the start of the payload. In the sample,
 `offsetToNodes` therefore addresses `0x59580` and `offsetToElements` addresses `0x4380`. The node and element
-regions are not necessarily the simple `0x140` onward array that the first indexer assumed. `offsetToParents`
-is a raw `u32`; its signed/relative interpretation is still **Open**.
+regions are not necessarily the simple `0x140` onward array that the first indexer assumed. `offsetToPrimRemap`
+is source type `int32_t`, so the indexer keeps it signed. `offsetToParents` is source type `uint32_t`, so the
+indexer keeps its raw value; its signed/relative interpretation is still **Open**.
 
 The `flags` word has version `6` in its low 16 bits. It also sets `0x80000000` (bottom level), `0x00020000`
 (offline) and `0x01000000` (dehydrated). It does not set `0x00010000` (compressed). The sample is therefore a
@@ -117,10 +126,13 @@ node_address = header + (ptr >> 3) * 64
 ```
 
 The type values are `0..3` = `TRI0..TRI3`, `4` = `BOX16`, `5` = `BOX32`, `6` = `INSTANCE`, `7` =
-`AABB_GEOMETRY`. `0xffffffff` is the invalid pointer. A `BOX32` node occupies 128 bytes, so it consumes two
-64-byte units; all other node records occupy 64 bytes.
+`AABB_GEOMETRY`. `0xffffffff` is the invalid pointer; the indexer reports it as `root_node_invalid: true` with
+the type name `invalid`, rather than naming it `AABB_GEOMETRY`. A `BOX32` node occupies 128 bytes, so it consumes
+two 64-byte units; all other node records occupy 64 bytes.
 
-The runtime records, which are what the traversal shaders read, are:
+The runtime records, which are what the traversal shaders read, are defined in the same file at L2285 (`Node16`),
+L2302 (`Node32`) and L2342 (`Leaf`). The sample is dehydrated, so these source layouts are not instantiated by
+it; the measured sample only confirms the node pointer and the header.
 
 | record | size | layout |
 |---|---:|---|
@@ -138,7 +150,8 @@ pointer. This is the dehydrated form, not a runtime `Node16`.
 
 #### Packed dehydrated forms
 
-The same public headers define the packed records used before rehydration:
+The same file defines the packed records: `XboxBvh4NodePacked` at L2326, `XboxBvh4BVVDHeader` at L2334 and
+`XboxBvh4LeafPacked` at L2376.
 
 | record | size | layout |
 |---|---:|---|
@@ -146,9 +159,9 @@ The same public headers define the packed records used before rehydration:
 | `LeafPacked` | 12 | `GeometryIndexAndFlags`, `BasePrimitiveIndex`, `PrimitiveIndex2AndBaryRemap` |
 | `BVVDHeader` | 8 | `variantNodeIndex` plus a six-bit mask and two-bit child selector |
 
-The dehydrated stream is not a contiguous array of runtime `Node16` records. Its record order, the `BVVDHeader`
-table and the exact traversal of `NodePacked`/`LeafPacked` remain **Open**. A decoder must not feed the sample
-root to the runtime traversal path until that packing is understood.
+The layouts above are source definitions. The dehydrated stream is not a contiguous array of runtime `Node16`
+records. Its record order, the `BVVDHeader` table and the exact traversal of `NodePacked`/`LeafPacked` remain
+**Open**. A decoder must not feed the sample root to the runtime traversal path until that packing is understood.
 
 ### 3.2 Instance descriptor (208 bytes)
 
@@ -262,8 +275,9 @@ into three 64 KiB/26 KiB chunks. These list the per-tile BVH packs; they are the
 
 `tools/bvh_index.py` (standard library only) scans an RPF9 archive or a directory of `.rpf`/`.bin` payloads and
 writes JSON and/or CSV with offset, stored size, inflated size, kind, signature, node count, tail offset, the
-`XboxBvh4Header` fields, root pointer/index/type, declared bytes, bounds, descriptor key/transform and fill
-counts. It reads only headers and emits no payload bytes.
+`XboxBvh4Header` fields, root pointer/index/type/invalid flag, declared bytes, bounds, descriptor key/transform
+and fill counts. It reads only headers and emits no payload bytes. The row's `version` is the low 16 bits of
+`flags` as an integer; `flags` keeps the full 32-bit word.
 
 ```powershell
 python -I tools/bvh_index.py <archive.rpf> --out index.json --csv index.csv

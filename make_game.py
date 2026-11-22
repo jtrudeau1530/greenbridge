@@ -26,6 +26,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -101,23 +102,47 @@ def versions() -> list:
 PROBES = ("MicrosoftGame.Config", "Catalog000.bin", "appdata0.rpf")
 
 
+def probe_mismatches(game: str, version: dict) -> list[str]:
+    """Describe which probe files prevent a version match, using only filesystem metadata."""
+    files = version["files"]
+    probes = [name for name in PROBES if name in files]
+    if not probes:
+        return ["No version probe files are listed in the manifest."]
+
+    mismatches = []
+    for name in probes:
+        expected_size = files[name]["size"]
+        try:
+            info = os.stat(os.path.join(game, name))
+        except (FileNotFoundError, NotADirectoryError):
+            mismatches.append(f"Missing {name}.")
+            continue
+        except OSError as error:
+            mismatches.append(f"Cannot read file metadata for {name} ({error.strerror}).")
+            continue
+
+        if not stat.S_ISREG(info.st_mode):
+            mismatches.append(f"{name} is not a regular file.")
+        elif info.st_size != expected_size:
+            mismatches.append(f"Wrong size for {name} ({info.st_size} bytes, expected {expected_size}).")
+    return mismatches
+
+
 def match_version(game: str):
     """The supported version this folder is, or None. Only names and sizes are read."""
-    for v in versions():
-        probes = [p for p in PROBES if p in v["files"]]
-        if probes and all(os.path.isfile(os.path.join(game, p)) and
-                          os.path.getsize(os.path.join(game, p)) == v["files"][p]["size"] for p in probes):
-            return v
-    return None
+    return next((v for v in versions() if not probe_mismatches(game, v)), None)
 
 
 def load_version(game: str) -> dict:
-    v = match_version(game)
-    if v is None:
-        fail("This doesn't look like a supported version of the game. Point --game at the folder that holds "
-             "MicrosoftGame.Config and the .rpf archives. Supported: "
-             + ", ".join(f"{x['title']} {x['version']}" for x in versions()))
-    return v
+    reports = []
+    for version in versions():
+        mismatches = probe_mismatches(game, version)
+        if not mismatches:
+            return version
+        reports.append(f"  {version['title']} {version['version']}\n    " + "\n    ".join(mismatches))
+    fail("This doesn't look like a supported version of the game. Point --game at the folder that holds "
+         "MicrosoftGame.Config and the .rpf archives.\nSupported:\n"
+         + "\n".join(reports or ["  No version manifests found."]))
 
 
 def find_dumps() -> list:
@@ -132,21 +157,23 @@ def find_dumps() -> list:
         roots += ["/mnt", "/media"]
     skip = {"windows", "program files", "program files (x86)", "programdata", "appdata", "$recycle.bin",
             "system volume information", "node_modules", ".git"}
-    seen, found = set(), []
+    visited_depths, found = {}, {}
 
     def visit(d: str, depth: int) -> None:
         try:
-            real = os.path.realpath(d)
+            real = os.path.normcase(os.path.realpath(d))
         except OSError:
             return
-        if real.lower() in seen:
+        previous_depth = visited_depths.get(real, -1)
+        if real in found or previous_depth >= depth:
             return
-        seen.add(real.lower())
-        if os.path.isfile(os.path.join(d, "MicrosoftGame.Config")):
+        # A later root can reach the same folder with more levels left to search.
+        visited_depths[real] = depth
+        if previous_depth < 0 and os.path.isfile(os.path.join(d, "MicrosoftGame.Config")):
             v = match_version(d)
             if v:
-                found.append((d, v))
-            return
+                found[real] = (d, v)
+                return
         if depth == 0:
             return
         try:
@@ -161,7 +188,7 @@ def find_dumps() -> list:
     for r in roots:
         if os.path.isdir(r):
             visit(r, 2)
-    return found
+    return list(found.values())
 
 
 def choose_game() -> str:
@@ -210,8 +237,8 @@ def preflight(stages: list, work: str, wav: bool = False) -> None:
     missing = []
     if wav and "assets" in stages and not shutil.which("ffmpeg"):
         missing.append("ffmpeg (needed for --wav): https://ffmpeg.org/download.html, then reopen the terminal")
-    if sys.version_info < (3, 11):
-        missing.append("Python 3.11 or newer: https://www.python.org/downloads/")
+    if sys.version_info < (3, 12):
+        missing.append("Python 3.12 or newer: https://www.python.org/downloads/")
     if "shaders" in stages:
         llvm = os.environ.get("LLVM_MC", "llvm-mc")
         if not tool_available(llvm):
@@ -228,11 +255,8 @@ def preflight(stages: list, work: str, wav: bool = False) -> None:
             missing.append(".NET 8 SDK (the .NET runtime alone can't build rpf9dump): "
                            "https://dotnet.microsoft.com/download/dotnet/8.0")
         ensure_submodule()
-    if "runtime" in stages and os.name == "nt":
-        vswhere = os.path.join(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
-                               "Microsoft Visual Studio", "Installer", "vswhere.exe")
-        if not os.path.isfile(vswhere):
-            missing.append("Visual Studio 2022 with 'Desktop development with C++'")
+    if "runtime" in stages and not visual_cpp_tools_ok():
+        missing.append("Visual Studio 2022 with 'Desktop development with C++'")
     if missing:
         fail("Install these first, then run the build again:\n  - " + "\n  - ".join(dict.fromkeys(missing)))
     need_gb = sum(MIN_FREE_GB.get(s, 0) for s in stages)
@@ -241,6 +265,21 @@ def preflight(stages: list, work: str, wav: bool = False) -> None:
     if free_gb < need_gb:
         fail(f"{free_gb:.0f} GB free on the drive of {work}, about {need_gb} GB is needed. "
              "Free some space or choose another drive with --work.")
+
+
+def visual_cpp_tools_ok() -> bool:
+    """Look for the x64 C++ tools required by scripts/build_runtime.ps1."""
+    vswhere = os.path.join(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
+                           "Microsoft Visual Studio", "Installer", "vswhere.exe")
+    if not os.path.isfile(vswhere):
+        return False
+    try:
+        result = subprocess.run([vswhere, "-latest", "-products", "*", "-requires",
+                                 "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
+                                 "-property", "installationPath"], capture_output=True, timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return result.returncode == 0 and bool(result.stdout.strip())
 
 
 def dotnet_sdk_ok() -> bool:
@@ -627,7 +666,7 @@ def main() -> int:
     ap.add_argument("--game", help="your package folder (found automatically if left out)")
     ap.add_argument("--out", help="folder for the finished port (default Documents/Leonida)")
     ap.add_argument("--work", help="folder for intermediate files (hundreds of GB; default <out>/work)")
-    ap.add_argument("--stages", default=",".join(STAGES), help="comma list from: " + ",".join(STAGES))
+    ap.add_argument("--stages", help="comma list from: " + ",".join(STAGES))
     ap.add_argument("--check", action="store_true", help="only check the game files")
     ap.add_argument("--full-check", action="store_true", help="also compare SHA-256 of every file (slow)")
     ap.add_argument("--wav", action="store_true",
@@ -663,11 +702,13 @@ def main() -> int:
             inside = False
         if inside:
             fail("--out and --work must be outside the game folder.")
-    stages = [s.strip() for s in a.stages.split(",") if s.strip()]
-    for s in stages:
-        if s not in STAGES:
-            fail(f"unknown stage '{s}'")
-    if os.name != "nt" and a.stages == ap.get_default("stages"):
+    stages = STAGES
+    if a.stages is not None:
+        stages = [s.strip() for s in a.stages.split(",") if s.strip()]
+        for s in stages:
+            if s not in STAGES:
+                fail(f"unknown stage '{s}'")
+    elif os.name != "nt":
         stages = [s for s in stages if s not in WINDOWS_ONLY]
         log(f"{', '.join(WINDOWS_ONLY)}: left out, it builds on Windows only for now")
     preflight(stages, work, a.wav)

@@ -4,6 +4,8 @@
 """
 import importlib.util
 import os
+import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -110,6 +112,14 @@ class ParseInterfacesTests(unittest.TestCase):
     def test_inline_comment_after_a_declaration_keeps_it(self):
         names = [item[2] for item in IFACES["IBase"][1] if item[0] == "m"]
         self.assertIn("AfterComment", names)
+
+    def test_cpp_line_comments_do_not_change_the_method_list(self):
+        header = GOOD_HEADER.replace(
+            "    virtual void STDMETHODCALLTYPE DoThing(UINT a, UINT b) = 0;",
+            "    // virtual void STDMETHODCALLTYPE Omitted() = 0; };\n"
+            "    virtual void STDMETHODCALLTYPE DoThing(UINT a, // parameter note\n"
+            "        UINT b) = 0; // trailing comment")
+        self.assertEqual(gen.parse_interfaces(header), IFACES)
 
     def test_preprocessor_lines_pass_through(self):
         items = gen.parse_interfaces(GUARDED_HEADER)["IGuarded"][1]
@@ -238,6 +248,16 @@ class MainTests(unittest.TestCase):
     def test_unknown_interface_raises(self):
         with self.assertRaises(SystemExit):
             self.run_main("IWho")
+
+    def test_circular_inheritance_reports_an_error(self):
+        with open(self.header, "w", encoding="utf-8") as f:
+            f.write(GOOD_HEADER.replace("IBase : public IUnknown", "IBase : public IChild"))
+        tool = os.path.join(ROOT, "tools", "gen_d3d12_stubs.py")
+        result = subprocess.run([sys.executable, "-I", tool, "--header", self.header,
+                                 "--out", self.out, "IChild"], capture_output=True, text=True, timeout=5)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("IChild -> IBase -> IChild", result.stderr)
+        self.assertFalse(os.path.exists(self.out))
 
     def test_find_header_uses_the_include_environment(self):
         with mock.patch.dict(os.environ, {"INCLUDE": self.dir}, clear=False):

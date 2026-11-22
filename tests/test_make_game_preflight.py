@@ -136,12 +136,36 @@ class VersionParsingAndMatchingTest(PreflightTestBase):
                                     match="This doesn't look like a supported version of the game")
             self.assertIn("Supported:", err)
             self.assertIn("1.0.2.1", err)
+            for name in make_game.PROBES:
+                self.assertIn(f"Missing {name}.", err)
 
 
 class GameCheckTest(PreflightTestBase):
     def test_check_nonexistent_directory_fails(self):
         self.assert_fails(make_game.check, "nonexistent_dir_0xdeadbeef", full=False,
                           match="Game folder not found: nonexistent_dir_0xdeadbeef")
+
+    def test_check_option_reports_each_version_probe_mismatch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(os.path.join(tmp, "MicrosoftGame.Config"), "wb") as config:
+                config.write(b"test")
+            os.mkdir(os.path.join(tmp, "Catalog000.bin"))
+            manifests = [
+                {"title": "Synthetic", "version": version, "files": {
+                    "MicrosoftGame.Config": {"size": size},
+                    "Catalog000.bin": {"size": 8},
+                    "appdata0.rpf": {"size": 16},
+                }}
+                for version, size in [("1.0", 6), ("2.0", 10)]
+            ]
+            with mock.patch.object(make_game, "versions", return_value=manifests), \
+                 mock.patch.object(sys, "argv", ["make_game.py", "--check", "--game", tmp]):
+                err = self.assert_fails(make_game.main)
+
+        self.assertIn("Synthetic 1.0\n    Wrong size for MicrosoftGame.Config (4 bytes, expected 6).", err)
+        self.assertIn("Synthetic 2.0\n    Wrong size for MicrosoftGame.Config (4 bytes, expected 10).", err)
+        self.assertEqual(err.count("Catalog000.bin is not a regular file."), 2)
+        self.assertEqual(err.count("Missing appdata0.rpf."), 2)
 
     def test_check_synthetic_game_all_files_present_with_exe(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -318,11 +342,11 @@ class PreflightPrerequisiteTest(PreflightTestBase):
 
     def test_preflight_success_all_tools_present_and_space_sufficient(self):
         with tempfile.TemporaryDirectory() as tmp_work:
-            with mock.patch("sys.version_info", (3, 11, 0)), \
+            with mock.patch("sys.version_info", (3, 12, 0)), \
                  mock.patch("shutil.which", return_value="/usr/bin/tool"), \
                  mock.patch("make_game.tool_available", return_value=True), \
                  mock.patch("make_game.ensure_submodule", return_value=None), \
-                 mock.patch("os.path.isfile", return_value=True), \
+                 mock.patch("make_game.visual_cpp_tools_ok", return_value=True), \
                  mock.patch("shutil.disk_usage", return_value=Usage(1000 * 2**30, 200 * 2**30, 800 * 2**30)):
                 # runtime is refused before any check off Windows (tests/test_make_game_platform.py)
                 stages = ["shaders", "assets"] + (["runtime"] if os.name == "nt" else [])
@@ -330,7 +354,7 @@ class PreflightPrerequisiteTest(PreflightTestBase):
 
     def test_preflight_aggregates_multiple_missing_tools_and_deduplicates(self):
         with tempfile.TemporaryDirectory() as tmp_work:
-            with mock.patch("sys.version_info", (3, 11, 0)), \
+            with mock.patch("sys.version_info", (3, 12, 0)), \
                  mock.patch("shutil.which", return_value=None), \
                  mock.patch("make_game.tool_available", return_value=False), \
                  mock.patch("make_game.ensure_submodule", return_value=None), \
@@ -345,23 +369,38 @@ class PreflightPrerequisiteTest(PreflightTestBase):
                 self.assertIn(".NET 8 SDK", err)
                 self.assertIn("Visual Studio 2022", err)
 
+    def test_preflight_rejects_visual_studio_installer_without_cpp_tools(self):
+        with tempfile.TemporaryDirectory() as tmp_work, \
+             mock.patch("os.name", "nt"), \
+             mock.patch("os.path.isfile", return_value=True), \
+             mock.patch("subprocess.run", return_value=mock.Mock(returncode=0, stdout=b"\r\n")):
+            self.assert_fails(make_game.preflight, ["runtime"], tmp_work, match="Visual Studio 2022")
+
+    def test_visual_cpp_tools_accepts_matching_installation(self):
+        with mock.patch("os.path.isfile", return_value=True), \
+             mock.patch("subprocess.run", return_value=mock.Mock(returncode=0, stdout=b"C:\\VS\r\n")) as run:
+            self.assertTrue(make_game.visual_cpp_tools_ok())
+        self.assertEqual(run.call_args.args[0][1:], ["-latest", "-products", "*", "-requires",
+                                                   "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
+                                                   "-property", "installationPath"])
+
     def test_preflight_python_version_check(self):
         with tempfile.TemporaryDirectory() as tmp_work:
-            with mock.patch("sys.version_info", (3, 10, 8)), \
+            with mock.patch("sys.version_info", (3, 11, 9)), \
                  mock.patch("shutil.which", return_value="/usr/bin/tool"), \
                  mock.patch("make_game.tool_available", return_value=True), \
                  mock.patch("make_game.ensure_submodule", return_value=None), \
                  mock.patch("os.path.isfile", return_value=True), \
                  mock.patch("shutil.disk_usage", return_value=Usage(1000 * 2**30, 100 * 2**30, 900 * 2**30)):
                 self.assert_fails(make_game.preflight, ["shaders"], tmp_work, wav=False,
-                                  match="Python 3.11 or newer:")
+                                  match="Python 3.12 or newer:")
 
     def test_preflight_wav_without_assets_does_not_require_ffmpeg(self):
         with tempfile.TemporaryDirectory() as tmp_work:
             def mock_which(cmd):
                 return None if cmd == "ffmpeg" else f"/bin/{cmd}"
 
-            with mock.patch("sys.version_info", (3, 11, 0)), \
+            with mock.patch("sys.version_info", (3, 12, 0)), \
                  mock.patch("shutil.which", side_effect=mock_which), \
                  mock.patch("make_game.tool_available", return_value=True), \
                  mock.patch("shutil.disk_usage", return_value=Usage(1000 * 2**30, 100 * 2**30, 900 * 2**30)):
@@ -373,7 +412,7 @@ class PreflightPrerequisiteTest(PreflightTestBase):
             def mock_which(cmd):
                 return None if cmd == "ffmpeg" else f"/bin/{cmd}"
 
-            with mock.patch("sys.version_info", (3, 11, 0)), \
+            with mock.patch("sys.version_info", (3, 12, 0)), \
                  mock.patch("shutil.which", side_effect=mock_which), \
                  mock.patch("make_game.ensure_submodule", return_value=None), \
                  mock.patch("shutil.disk_usage", return_value=Usage(1000 * 2**30, 100 * 2**30, 900 * 2**30)):
@@ -382,7 +421,7 @@ class PreflightPrerequisiteTest(PreflightTestBase):
 
     def test_preflight_disk_space_insufficient(self):
         with tempfile.TemporaryDirectory() as tmp_work:
-            with mock.patch("sys.version_info", (3, 11, 0)), \
+            with mock.patch("sys.version_info", (3, 12, 0)), \
                  mock.patch("shutil.which", return_value="/usr/bin/tool"), \
                  mock.patch("make_game.tool_available", return_value=True), \
                  mock.patch("make_game.ensure_submodule", return_value=None), \
@@ -394,7 +433,7 @@ class PreflightPrerequisiteTest(PreflightTestBase):
 
     def test_preflight_disk_space_stage_accumulation(self):
         with tempfile.TemporaryDirectory() as tmp_work:
-            with mock.patch("sys.version_info", (3, 11, 0)), \
+            with mock.patch("sys.version_info", (3, 12, 0)), \
                  mock.patch("shutil.which", return_value="/usr/bin/tool"), \
                  mock.patch("make_game.tool_available", return_value=True), \
                  mock.patch("make_game.ensure_submodule", return_value=None), \
@@ -421,6 +460,57 @@ class PreflightPrerequisiteTest(PreflightTestBase):
                  mock.patch("shutil.which", return_value=None):
                 self.assert_fails(make_game.ensure_submodule,
                                   match="third_party/rpf9-explorer is missing. Download the project with:")
+
+
+class GameDiscoveryTest(unittest.TestCase):
+    def setUp(self):
+        self.home = self.enterContext(tempfile.TemporaryDirectory())
+        self.desktop = os.path.join(self.home, "Desktop")
+        self.downloads = os.path.join(self.home, "Downloads")
+        self.version = {"title": "Synthetic", "version": "1.0", "files": {
+            "MicrosoftGame.Config": {"size": 3},
+            "Catalog000.bin": {"size": 4},
+            "appdata0.rpf": {"size": 5},
+        }}
+
+    def write_probes(self, folder):
+        os.makedirs(folder)
+        for name, info in self.version["files"].items():
+            with open(os.path.join(folder, name), "wb") as file:
+                file.truncate(info["size"])
+
+    def discover(self):
+        roots = (self.home, self.desktop, self.downloads)
+        isdir = os.path.isdir
+        with mock.patch("os.path.expanduser", return_value=self.home), \
+             mock.patch("os.path.isdir", side_effect=lambda path: path in roots and isdir(path)), \
+             mock.patch.object(make_game, "versions", return_value=[self.version]):
+            return make_game.find_dumps()
+
+    def test_find_searches_below_rejected_folder_with_config(self):
+        outer = os.path.join(self.desktop, "Backup")
+        package = os.path.join(outer, "Package")
+        self.write_probes(package)
+        with open(os.path.join(outer, "MicrosoftGame.Config"), "wb") as config:
+            config.write(b"abc")
+        self.write_probes(os.path.join(outer, "Other", "TooDeep"))
+
+        self.assertEqual(self.discover(), [(package, self.version)])
+
+    def test_find_revisits_aliased_root_with_more_depth(self):
+        target = os.path.join(self.downloads, "Outer", "Inner")
+        package = os.path.join(self.desktop, "Package")
+        self.write_probes(os.path.join(target, "Package"))
+        self.write_probes(package)
+        realpath = os.path.realpath
+
+        def resolve(path):
+            if path == self.desktop or path.startswith(self.desktop + os.sep):
+                path = os.path.join(target, os.path.relpath(path, self.desktop))
+            return realpath(path)
+
+        with mock.patch("os.path.realpath", side_effect=resolve):
+            self.assertEqual(self.discover(), [(package, self.version)])
 
 
 class PathAndGameSelectionTest(PreflightTestBase):

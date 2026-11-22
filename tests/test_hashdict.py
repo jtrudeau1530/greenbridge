@@ -141,6 +141,11 @@ class LookupCLITest(unittest.TestCase):
         self.assertEqual(p.returncode, 0, p.stderr)
         self.assertIn("0xdeadbeef ?", p.stdout)
 
+    def test_lookup_requires_at_least_one_hash(self):
+        result = self.run_tool("--lookup", self.hashes_file)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("hash", result.stderr.lower())
+
     def test_lookup_hex_formatting_variants(self):
         # Supports 0x prefix, uppercase, lowercase, and raw hex
         p = self.run_tool("--lookup", self.hashes_file, "0XB779A091", "0x18c8836d", "88F08EF3")
@@ -239,15 +244,28 @@ class CarveAndExtraCLITest(unittest.TestCase):
         self.assertEqual(p_lookup.returncode, 0, p_lookup.stderr)
         self.assertIn(f"{lookup_hash} model_prop", p_lookup.stdout)
 
+    def test_build_requires_an_explicit_carve_directory(self):
+        empty = os.path.join(self.dir, "empty")
+        os.mkdir(empty)
+        with open(self.out_json, "w", encoding="utf-8") as f:
+            f.write('{"12345678": "keep"}')
+        result = subprocess.run([sys.executable, "-I", TOOL, "--out", self.out_json],
+                                cwd=empty, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("carve", result.stderr.lower())
+        with open(self.out_json, encoding="utf-8") as f:
+            self.assertEqual(json.load(f), {"12345678": "keep"})
+
     def test_build_is_reproducible_with_collisions(self):
         with open(self.extra_file, "wb") as f:
             f.write(b"widget Widget str_85_83667 str_63346_847129")
 
+        flags = ["-P"] if sys.version_info >= (3, 11) else []
         results = []
         for seed in ("1", "2"):
             # Unlike -I, -P keeps PYTHONHASHSEED while leaving the script directory off sys.path.
             result = subprocess.run(
-                [sys.executable, "-P", TOOL, self.carve_dir, "--out", self.out_json, "--extra", self.extra_file],
+                [sys.executable, *flags, TOOL, self.carve_dir, "--out", self.out_json, "--extra", self.extra_file],
                 env=dict(os.environ, PYTHONHASHSEED=seed), capture_output=True, text=True,
             )
             self.assertEqual(result.returncode, 0, result.stderr)

@@ -18,6 +18,7 @@ import sys
 INTERFACE = re.compile(
     r'MIDL_INTERFACE\("[0-9a-fA-F-]+"\)\s*\n\s*(\w+)\s*:\s*public\s+(\w+)\s*\{\s*public:(.*?)\n\s*\};', re.S)
 METHOD = re.compile(r'virtual\s+(.*?)\s*STDMETHODCALLTYPE\s+(\w+)\s*\((.*)\)\s*(const)?\s*=\s*0\s*;\s*$', re.S)
+COMMENTS_OR_LITERALS = re.compile(r"""("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')|/\*.*?\*/|//[^\r\n]*""", re.S)
 
 
 def find_header():
@@ -30,10 +31,10 @@ def find_header():
 
 def parse_interfaces(text):
     """name -> (base, [lines]) where a line is ('#', text) or ('m', return, name, params, const)."""
+    text = COMMENTS_OR_LITERALS.sub(lambda match: match.group(1) or " ", text)
     out = {}
     for match in INTERFACE.finditer(text):
         name, base, body = match.groups()
-        body = re.sub(r"/\*.*?\*/", " ", body, flags=re.S)
         items, pending = [], []
         for line in body.splitlines():
             stripped = line.strip()
@@ -59,10 +60,14 @@ def parse_interfaces(text):
 
 def chain(interfaces, leaf):
     names = []
+    seen = set()
     name = leaf
     while name != "IUnknown":
         if name not in interfaces:
             raise SystemExit(f"interface {name} not found in d3d12.h")
+        if name in seen:
+            raise SystemExit(f"circular inheritance in d3d12.h: {' -> '.join([*names, name])}")
+        seen.add(name)
         names.append(name)
         name = interfaces[name][0]
     return list(reversed(names))

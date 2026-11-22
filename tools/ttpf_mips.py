@@ -305,6 +305,15 @@ class Pool:
     """Read-only RDS5 texture pool, mirroring TtpfReader's catalog checks."""
 
     def __init__(self, path):
+        # A pool that fails a check used to keep its file open and mapped (locked on Windows).
+        self._fh = self.data = None
+        try:
+            self._open(path)
+        except Exception:
+            self.close()
+            raise
+
+    def _open(self, path):
         self.path = path
         self._fh = open(path, "rb")
         try:
@@ -363,8 +372,10 @@ class Pool:
         self._starts = [c[0] for c in self.chunks]
 
     def close(self):
-        self.data.close()
-        self._fh.close()
+        if self.data is not None:
+            self.data.close()
+        if self._fh is not None:
+            self._fh.close()
 
     def descriptor(self, index):
         if not 0 <= index < self.textures:
@@ -542,7 +553,10 @@ def scan_pools(paths, as_json=None, include_tuples=False):
     gated_tuples = {}
     bcpack_allowed = {0, 8} | bcpack.SUPPORTED_REBUILD_CODECS
     for path in paths:
-        pool = Pool(path)
+        try:
+            pool = Pool(path)
+        except (OSError, ValueError) as exc:
+            raise ValueError(f"{path}: {exc}") from None
         try:
             total["pools"] += 1
             for i in range(pool.textures):
@@ -900,10 +914,22 @@ def main(argv=None):
         pools = []
         for p in a.paths:
             pools += find_pools(p)
-        scan_pools(pools, a.json, a.tuples)
+        try:
+            scan_pools(pools, a.json, a.tuples)
+        except ValueError as exc:   # a truncated or unsupported pool: name it instead of a traceback
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 2
         return 0
-    pool = Pool(a.pool)
     try:
+        pool = Pool(a.pool)
+    except (OSError, ValueError) as exc:
+        print(f"ERROR: {a.pool}: {exc}", file=sys.stderr)
+        return 2
+    try:
+        if not 0 <= a.index < pool.textures:
+            print(f"ERROR: texture {a.index} is out of range: {a.pool} holds {pool.textures}",
+                  file=sys.stderr)
+            return 2
         if a.cmd == "layout":
             print(json.dumps(describe(pool, a.index), indent=1))
             return 0

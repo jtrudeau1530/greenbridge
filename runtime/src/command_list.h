@@ -2,8 +2,8 @@
 
 // The command-list IR (docs/d3d12_vulkan.md section 3.2): what a D3D12 command list records, kept until
 // ExecuteCommandLists replays it on Vulkan (vulkan_replay.h). This slice covers legacy and enhanced barriers and
-// render-target and depth-stencil clears (whole views or rectangles), copies and resolves. It has no Windows or
-// Vulkan dependency.
+// render-target and depth-stencil clears (whole views or rectangles), copies, resolves and predication. It has no
+// Windows or Vulkan dependency.
 
 #include <array>
 #include <cstdint>
@@ -304,9 +304,26 @@ struct ClearDepthStencil {
     std::vector<Rect> rects;
 };
 
+// D3D12_PREDICATION_OP.
+namespace d3d12_predication {
+inline constexpr std::uint32_t equal_zero = 0;      // skip the predicated commands when the value is 0
+inline constexpr std::uint32_t not_equal_zero = 1;  // skip them when it isn't
+} // namespace d3d12_predication
+
+// D3D12 requires the predicate's offset to be a multiple of 8 (the value is 64 bits).
+inline constexpr std::uint64_t predication_alignment = 8;
+
+// SetPredication. buffer 0 turns predication off. A command list starts without predication, and it does not carry
+// over to the next list.
+struct Predication {
+    ResourceId buffer;
+    std::uint64_t offset;
+    std::uint32_t op;  // d3d12_predication
+};
+
 using Command = std::variant<TransitionBarrier, UavBarrier, AliasingBarrier, GlobalBarrier, BufferBarrier,
                              TextureBarrier, ClearRenderTarget, ClearDepthStencil, CopyBuffer, CopyTexture,
-                             CopyResource, ResolveSubresource>;
+                             CopyResource, ResolveSubresource, Predication>;
 
 class CommandList {
 public:
@@ -394,6 +411,23 @@ public:
         if (!flags || (flags & ~(clear_depth | clear_stencil))) return false;
         if ((flags & clear_depth) && !(depth >= 0.0f && depth <= 1.0f)) return false;
         return append(ClearDepthStencil{target, flags, depth, stencil, {rects.begin(), rects.end()}});
+    }
+
+    // ExecuteBundle copies the closed bundle's commands at the call site. The COM layer validates D3D12 list
+    // types and bundle-only restrictions before calling this method.
+    bool execute_bundle(const CommandList& bundle) {
+        if (this == &bundle || closed_ || !bundle.closed_) return false;
+        commands_.insert(commands_.end(), bundle.commands_.begin(), bundle.commands_.end());
+        return true;
+    }
+
+    // SetPredication. Turning it off ignores the offset and op, as D3D12 does.
+    bool set_predication(const Predication& predication) {
+        if (!predication.buffer) return append(Predication{0, 0, 0});
+        if (predication.op != d3d12_predication::equal_zero && predication.op != d3d12_predication::not_equal_zero)
+            return false;
+        if (predication.offset % predication_alignment) return false;
+        return append(predication);
     }
 
     bool close() {

@@ -13,13 +13,24 @@ What they check (`tools/rdna2spirv.py`, pixel shaders plus one compute shader):
 - `test_value_semantics.py` does the same for the recent value-level fixes: scalar b16 shifts, packed b16 shifts
   with `op_sel`, `v_add_nc_u16`, `v_sin_f16`/`v_cos_f16`, `s_buffer_load_dwordx2` into VCC and flat
   `v_interp_mov` input next to an interpolated one. `ps_ops5`, `ps_ops6`, `ps_vcc_x2` and `ps_flat` give 16 more
-  asserted values; `cs_bounds` runs as compute and asserts the four dwords in its buffer after in-bounds
+  asserted values, and `ps_fma_literal` 4 more: which operand the literal K multiplies in
+  `v_fmamk/fmaak/madmk/madak_f32`. `cs_bounds` runs as compute and asserts the four dwords in its buffer after in-bounds
   load/store and out-of-bounds load/store attempts (the V# has num_records 16). `ps_ops4` and `ps_legacy_mul`
   are also asserted there, duplicating the matching `test_ps_semantics.py` cases. As above, constants are
   written by hand and recomputed by plain-Python references checked against each other. `cs_fmt_1010102` runs
   as compute too and asserts 16 dwords: 10:10:10:2 words read through formats 50 and 44 (from the V# and from
   tbuffer's own format) and stored in both. `ps_scc_minmax` asserts SCC after `s_min`/`s_max` `_i32`/`_u32`:
   0 on a tie, and 1 on a pair (-1 against 1) that only the right signedness orders that way.
+<<<<<<< HEAD
+- `spirv_wave_interp.py` runs every invocation of one subgroup at once through structured control flow
+  (split at a selection, rejoin at its merge, loops until no invocation is left) with the subgroup
+  operations the translator emits. It is the SPIR-V side of `tools/cf_diff.py` (FUZZ-8);
+  `test_spirv_wave_interp.py` pins its convergence rules on hand-written modules.
+=======
+- `test_global_mem_offset.py` runs the address arithmetic `global_load*`/`global_store*` emit (its own small
+  evaluator, since the interpreter refuses 64-bit integers and PhysicalStorageBuffer) and asserts the address
+  accessed for the signed 12-bit instruction offset (-4, -2048, 2047, 0) in both addressing modes.
+>>>>>>> pr/421
 - `test_interp.py` tests the interpreter against the SPIR-V / GLSL.std.450 definitions. The interpreter raises
   `UnsupportedConstruct` for anything it does not model instead of approximating it. It can seed Input variables,
   PushConstant words and a flat physical-address memory map for the tests above.
@@ -36,6 +47,9 @@ What they check (`tools/rdna2spirv.py`, pixel shaders plus one compute shader):
   `cs_wavemask`): on one 64-wide subgroup every word equals the GPU check; on two 32-wide subgroups the
   words pinned there are the ones an RTX 4070 SUPER (driver 610.88) wrote without `--wave64-emulate`. The
   cs_w64x tests with branches need llvm-mc encodings and are not covered.
+- `test_alu_int_misc.py` translates one-instruction synthetic listings for `v_bfm_b32`, `v_and_or_b32`,
+  `v_add_lshl_u32`, `v_lshl_or_b32`, `v_mad_i32_i24` and `v_mul_lo_u32` and checks the mrt0 word against
+  hand-computed ISA values (masked shift counts, wrapping adds/products, 24-bit sign extension).
 - `test_negative_controls.py` sabotages the translated SPIR-V text and requires the result to change.
 - `test_mutations.py` sabotages a temporary copy of `tools/` (13 regressions across SDWA, min3/max3, `v_bfe_i32`,
   `v_pk_fma_f16`, `v_fma_f16 op_sel`, `v_subrev_co_ci_u32`, `v_cmpx_eq_u64`, `v_mul_i32_i24`, `v_ffbh_i32`,

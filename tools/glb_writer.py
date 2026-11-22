@@ -19,6 +19,7 @@ import math
 import os
 import struct
 import sys
+import tempfile
 
 GLB_MAGIC = b"glTF"
 GLB_VERSION = 2
@@ -166,6 +167,7 @@ def parse_obj(
         text = text_or_path
 
     z_up = up == "z"
+    mirrored = sc < 0
     raw_v: list[tuple[float, float, float] | None] = []
     raw_vt: list[tuple[float, float]] = []
     raw_vn: list[tuple[float, float, float]] = []
@@ -252,6 +254,8 @@ def parse_obj(
                 continue
             if z_up:
                 nx, ny, nz = nx, nz, -ny
+            if mirrored:
+                nx, ny, nz = -nx, -ny, -nz
             raw_vn_append(_normalize3(nx, ny, nz))
 
         elif cmd == "g":
@@ -325,7 +329,7 @@ def parse_obj(
                 c2 = corners[i + 1]
                 if c0[0] == c1[0] or c1[0] == c2[0] or c0[0] == c2[0]:
                     continue
-                tris.append((c0, c1, c2))
+                tris.append((c0, c2, c1) if mirrored else (c0, c1, c2))
 
             if not tris:
                 continue
@@ -839,20 +843,28 @@ def write_glb(
     primitives: list[dict],
     materials: dict[str, dict] | None = None,
 ) -> dict:
-    """Atomically write a binary .glb file and return geometry/texture summary stats."""
+    """Atomically publish a GLB using a private staging file in its destination directory.
+
+    Overlapping writers publish complete files (the last replacement wins), and
+    existing sibling files are never used as staging files.
+    """
     glb_bytes, stats = _build_glb_with_stats(primitives, materials)
     out_path = os.fspath(path)
     parent = os.path.dirname(os.path.abspath(out_path))
     if parent:
         os.makedirs(parent, exist_ok=True)
-    tmp_path = out_path + ".tmp"
+    tmp_path = None
     try:
-        with open(tmp_path, "wb") as f:
+        with tempfile.NamedTemporaryFile(
+            mode="wb", dir=parent, prefix=".glb-", suffix=".tmp", delete=False,
+        ) as f:
+            tmp_path = f.name
             f.write(glb_bytes)
+        # Close before replacement: Windows cannot rename an open staging file.
         os.replace(tmp_path, out_path)
     except BaseException:
         try:
-            if os.path.exists(tmp_path):
+            if tmp_path is not None:
                 os.remove(tmp_path)
         except OSError:
             pass

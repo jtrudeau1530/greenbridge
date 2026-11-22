@@ -80,7 +80,7 @@ def main():
             print(f"emulated: {seg[0]} segments, {seg[1]} of them continuation segments (one extra round each)")
         hashes, rows = {}, []
         for name, driver, emulate in CONFIGS:
-            med, mins, dev = [], [], None
+            med, mins, seen, dev = [], [], set(), None
             for _ in range(a.procs):
                 t, h, dev = run(a.build, spv[emulate], a.groups, a.reps, driver, emulate)
                 if t is None:
@@ -89,8 +89,11 @@ def main():
                     break
                 med.append(t[0])
                 mins.append(t[1])
-                hashes.setdefault(name, set()).add(h)
+                seen.add(h)
             if med:
+                # Only a configuration whose every process ran counts: the hashes of the processes before a
+                # failed one used to be kept, so the failure passed as a configuration that had run.
+                hashes[name] = seen
                 rows.append((name, dev, statistics.median(med), min(mins), min(med), max(med)))
         for name, dev, m, lo, a_, b_ in rows:
             print(f"{name:26} {dev:34} median {m:8.3f} ms   best {lo:8.3f}   process medians {a_:.3f}..{b_:.3f}")

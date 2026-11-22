@@ -12,12 +12,15 @@ Thanks for helping. A few rules keep the project safe to host:
 
 ## Before you start
 
-Claim the work in [#156](https://github.com/ItsNotRexed/Leonida/issues/156) first: check its tables and the open
-pull requests, post `claiming: <ID>` there (or a one-line description for something not listed yet), and put the ID
-in your pull request. When two pull requests overlap anyway, the one that lands first is merged and the other is
-asked to rebase or close. GPU test results go in [#166](https://github.com/ItsNotRexed/Leonida/issues/166). Work on
-the D3D12 → Vulkan layer has its own page, [#313](https://github.com/ItsNotRexed/Leonida/issues/313): the critical
-path, who builds what, and which D3D12 methods are still open.
+Claim the work in [the coordination issue][claims] first: the open issue titled "Coordinating who works on what" (it
+moves to a new issue when the thread gets long, so the link searches for it). Check its tables and the open pull
+requests, post `claiming: <ID>` there (or a one-line description for something not listed yet), and put the ID in
+your pull request. When two pull requests overlap anyway, the one that lands first is merged and the other is asked
+to rebase or close. GPU test results go in [#166](https://github.com/ItsNotRexed/Leonida/issues/166). Work on the
+D3D12 → Vulkan layer has its own page, [#313](https://github.com/ItsNotRexed/Leonida/issues/313): the critical path,
+who builds what, and which D3D12 methods are still open.
+
+[claims]: https://github.com/ItsNotRexed/Leonida/issues?q=is%3Aissue%20is%3Aopen%20in%3Atitle%20%22Coordinating%20who%20works%20on%20what%22
 
 ## Working on the code
 
@@ -26,12 +29,14 @@ path, who builds what, and which D3D12 methods are still open.
 - A new shader-translator rule goes into the contract table in `docs/design.md`, with how it was confirmed: a GPU
   test, a Mesa/LLVM reference, or a count over the corpus.
 - `python -I tests/test_<name>.py` runs one of the unit tests (standard library only; CI runs them all).
-- Runtime tests: `cmake -S runtime -B runtime/build`, `cmake --build runtime/build`, then
-  `ctest --test-dir runtime/build --output-on-failure`. The CPU tests that need no game data are configured
+- Runtime tests: `cmake -S runtime -B runtime/build`, `cmake --build runtime/build --config RelWithDebInfo`, then
+  `ctest --test-dir runtime/build -C RelWithDebInfo --output-on-failure`. The CPU tests that need no game data are configured
   on Windows. Tests that need the retail package read `LEONIDA_GAME_DIR` (and `LEONIDA_MOVIE` for the Bink
   decode test) in place and print `SKIP` when the variable is unset; never copy or commit those files.
-- Viewer streaming tests: `node --test tests/test_viewer_streaming.cjs` (Node.js 22+, no packages,
+- Viewer streaming tests: `node --test tests/test_viewer_streaming.cjs` (Node.js 22+, CI tests 24 LTS; no packages,
   browser, network or game data). These execute the viewer streaming code with a synthetic loader and clock.
+- `loader_test` writes small PE images to a `leonida_loader_test` folder in `%TEMP%`. Antivirus that blocks newly
+  written executables makes it stop with that reason; exclude the folder or set `LEONIDA_TEST_DIR` to one it skips.
 - Tool checks: `python -m compileall -q make_game.py tools tests`. The optional
   `vk_pipeline_check <spirv dir> [cache.bin] [--jobs N]` creates a module (and, for compute shaders, a
   pipeline) for every translated shader and reports failures plus the saved cache path.

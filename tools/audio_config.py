@@ -37,6 +37,7 @@ concatenated config blob. Records are found by their marker and duration range, 
 stream offset, so an incomplete carve simply yields fewer records.
 """
 import argparse
+from bisect import bisect_right
 import json
 import os
 import struct
@@ -148,25 +149,19 @@ def load_names(path):
     return names
 
 
-def _file_at(starts, offset):
-    """Return the stream name that contains a byte offset in a joined blob."""
-    import bisect
-    index = bisect.bisect_right(starts, (offset, "\uffff")) - 1
-    return starts[max(index, 0)][1]
-
-
 def collect(src, min_ms=MIN_MS, max_ms=MAX_MS, names=None, join=False):
     records = []
-    parts = list(files_in(src))
+    parts = list(files_in(src)) if join else files_in(src)
     if join and len(parts) > 1:
         blob = b"".join(part for _, part in parts)
         starts = []
         offset = 0
-        for name, part in parts:
-            starts.append((offset, name))
+        for _, part in parts:
+            starts.append(offset)
             offset += len(part)
         for record in scan(blob, min_ms, max_ms):
-            record["file"] = _file_at(starts, record["offset"])
+            index = bisect_right(starts, record["offset"]) - 1
+            record["file"] = parts[index][0]
             if names:
                 record["name"] = names.get(record["hash_b"], "")
             records.append(record)

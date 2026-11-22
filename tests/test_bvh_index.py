@@ -18,7 +18,7 @@ sys.path.insert(0, os.path.join(ROOT, "tools"))
 import bvh_index  # noqa: E402
 
 
-def bvh_payload(n=10, tag=bvh_index.TAG, end_delta=0):
+def bvh_payload(n=10, tag=bvh_index.TAG, end_delta=0, root=0x136AC):
     b = bytearray(0x140 + n * 64)
     struct.pack_into("<I", b, 0x100, tag)
     struct.pack_into("<I", b, 0x104, n)
@@ -30,7 +30,7 @@ def bvh_payload(n=10, tag=bvh_index.TAG, end_delta=0):
     struct.pack_into("<6f", b, 0x110, -1.5, -2.0, -3.0, 4.5, 5.0, 6.0)
     struct.pack_into("<I", b, 0x128, 0x1234)
     struct.pack_into("<i", b, 0x12C, -5)
-    struct.pack_into("<I", b, 0x130, 0x136AC)
+    struct.pack_into("<I", b, 0x130, root)
     struct.pack_into("<I", b, 0x134, 0x80)
     struct.pack_into("<I", b, 0x138, 0xFFFFAB40)
     struct.pack_into("<I", b, 0x13C, 0x808C8A89)
@@ -73,7 +73,7 @@ class ClassifyTest(unittest.TestCase):
         self.assertEqual(row["bounds_min"], [-1.5, -2.0, -3.0])
         self.assertEqual(row["bounds_max"], [4.5, 5.0, 6.0])
         self.assertEqual(row["flags"], bvh_index.TAG)
-        self.assertEqual(row["version"], "0x81020006")
+        self.assertEqual(row["version"], 6)
         self.assertEqual(row["crc32"], 0x9ABCDEF0)
         self.assertEqual(row["num_elements"], 7)
         self.assertEqual(row["offset_to_nodes"], 0x1234)
@@ -81,6 +81,7 @@ class ClassifyTest(unittest.TestCase):
         self.assertEqual(row["root_node_ptr"], 0x136AC)
         self.assertEqual((row["root_node_index"], row["root_node_type"]), (9941, 4))
         self.assertEqual(row["root_node_type_name"], "box16")
+        self.assertFalse(row["root_node_invalid"])
         self.assertEqual(row["offset_to_elements"], 0x80)
         self.assertEqual(row["offset_to_parents"], 0xFFFFAB40)
         self.assertEqual(row["compression_params"], 0x808C8A89)
@@ -89,17 +90,33 @@ class ClassifyTest(unittest.TestCase):
     def test_header_fields(self):
         hdr = bvh_index.parse_header(bvh_payload(4))
         self.assertIsNotNone(hdr)
+        self.assertEqual(hdr["version"], 6)
+        self.assertEqual(hdr["offset_to_prim_remap"], -5)
+        self.assertEqual(hdr["offset_to_parents"], 0xFFFFAB40)
         self.assertEqual(hdr["node_count"], 4)
         self.assertEqual(hdr["root_node_index"], 9941)
         self.assertEqual(hdr["root_node_type"], 4)
         self.assertEqual(hdr["root_node_type_name"], "box16")
+        self.assertFalse(hdr["root_node_invalid"])
         self.assertTrue(hdr["bottom_level"])
         self.assertFalse(hdr["compressed"])
 
     def test_node_pointer(self):
         self.assertEqual(bvh_index.decode_node_pointer(0x136AC),
                          {"ptr": 0x136AC, "index": 9941, "type": 4, "name": "box16", "invalid": False})
-        self.assertEqual(bvh_index.decode_node_pointer(bvh_index.INVALID_NODE)["invalid"], True)
+        self.assertEqual(bvh_index.decode_node_pointer(bvh_index.INVALID_NODE),
+                         {"ptr": 0xFFFFFFFF, "index": 536870911, "type": 7,
+                          "name": "invalid", "invalid": True})
+
+    def test_invalid_root_node_pointer(self):
+        payload = bvh_payload(4, root=bvh_index.INVALID_NODE)
+        hdr = bvh_index.parse_header(payload)
+        self.assertTrue(hdr["root_node_invalid"])
+        self.assertEqual(hdr["root_node_type_name"], "invalid")
+        row = bvh_index.classify(payload, len(payload))
+        self.assertEqual(row["kind"], "bvh4")
+        self.assertTrue(row["root_node_invalid"])
+        self.assertEqual(row["root_node_type_name"], "invalid")
 
     def test_bvh4_chunk(self):
         b = bytearray(65536)
@@ -175,9 +192,13 @@ class ScanTest(unittest.TestCase):
         self.assertEqual(doc["summary"]["streams"], 3)
         self.assertEqual(doc["summary"]["kinds"], {"instance208": 1, "bvh4": 1, "xml": 1})
         self.assertNotIn("head", doc["streams"][0])
+        self.assertEqual(doc["streams"][1]["version"], 6)
+        self.assertIsInstance(doc["streams"][1]["version"], int)
+        self.assertFalse(doc["streams"][1]["root_node_invalid"])
         with open(csv_path, encoding="utf-8") as f:
             text = f.read()
         self.assertIn("signature", text.splitlines()[0])
+        self.assertIn("root_node_invalid", text.splitlines()[0])
         self.assertIn("bvh4:0x81020006", text)
 
     def test_directory_of_payloads(self):

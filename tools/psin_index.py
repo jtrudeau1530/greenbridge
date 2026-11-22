@@ -175,7 +175,14 @@ def main():
     ap.add_argument("--limit", type=count, help="stop after this many PSIN files")
     a = ap.parse_args()
 
-    records = collect(a.src, a.limit)
+    if not os.path.exists(a.src):   # files_in took any non-file for a folder: a typo ended in a traceback
+        print(f"ERROR: {a.src}: no such file or folder", file=sys.stderr)
+        return 2
+    try:
+        records = collect(a.src, a.limit)
+    except OSError as e:
+        print(f"ERROR: {a.src}: {e}", file=sys.stderr)
+        return 2
     summary = summarize(records)
     if a.json:
         json.dump({"files": records, "summary": summary}, sys.stdout, indent=1)

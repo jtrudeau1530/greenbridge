@@ -171,6 +171,22 @@ class WorldIndexTest(unittest.TestCase):
         self.assertEqual(rows[0]["kind"], "map")
         self.assertEqual(rows[0]["entities"], 1)
 
+    def test_rpf_scan_survives_a_damaged_candidate_continuation(self):
+        blob = make_resource()
+        partial = blob[:0x150]
+        unrelated = bytes(72)
+        archive = bytearray(make_rpf_streams([partial, unrelated, blob]))
+        continuation = (0x40 + len(zlib.compress(partial)) + 15) & ~15
+        end = continuation + len(zlib.compress(unrelated))
+        archive[end - 1] ^= 1  # Corrupt only the second stream's checksum.
+        path = os.path.join(self.dir, "damaged_continuation.rpf")
+        with open(path, "wb") as f:
+            f.write(archive)
+        rows, stats = WI.scan_rpf(path)
+        self.assertEqual(stats["streams"], 2)
+        self.assertEqual(rows[-1]["offset"], (end + 15) & ~15)
+        self.assertEqual(rows[-1]["size"], len(blob))
+
     def test_directory_scan_and_outputs(self):
         with open(os.path.join(self.dir, "map.bin"), "wb") as f:
             f.write(make_resource())
@@ -195,6 +211,18 @@ class WorldIndexTest(unittest.TestCase):
         self.assertEqual(len(rows), 2)
         self.assertEqual(rows[0]["signature"], "0DRPz")
         self.assertEqual(rows[0]["version"], "122")
+
+    def test_directory_inflate_cap_does_not_exclude_large_archives(self):
+        resource = make_resource()
+        cap = len(resource)
+        with open(os.path.join(self.dir, "large.rpf"), "wb") as f:
+            f.write(make_rpf_streams([resource]) + bytes(cap))
+        with open(os.path.join(self.dir, "oversized.bin"), "wb") as f:
+            f.write(resource + b"\0")
+        rows, stats = WI.scan_path(self.dir, max_inflate=cap)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["kind"], "map")
+        self.assertEqual(stats["files"], 1)
 
 
 if __name__ == "__main__":
