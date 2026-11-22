@@ -4,6 +4,7 @@
 #pragma once
 
 #include "vulkan_loader.h"
+#include "../src/subgroup_size.h"
 
 #include <cstdint>
 #include <cstdio>
@@ -67,6 +68,8 @@ public:
     bool host_image_copy = false;  // VK_EXT_host_image_copy and hostImageCopy enabled
     bool occlusion_query_precise = false;    // occlusionQueryPrecise enabled
     bool pipeline_statistics_query = false;  // pipelineStatisticsQuery enabled
+    // The subgroup sizes of the device, with subgroupSizeControl and computeFullSubgroups enabled where it has them.
+    leonida::SubgroupSizeCaps subgroup;
 
     Device() = default;
     Device(const Device&) = delete;
@@ -251,6 +254,15 @@ public:
                                                   conditional_rendering ? &enable_conditional : nullptr};
         enable13.dynamicRendering = VK_TRUE;
         enable13.synchronization2 = VK_TRUE;
+        enable13.subgroupSizeControl = features13.subgroupSizeControl;
+        enable13.computeFullSubgroups = features13.computeFullSubgroups;
+        leonida::query_subgroup_size_caps(instance_fn<PFN_vkGetPhysicalDeviceProperties2>("vkGetPhysicalDeviceProperties2"),
+                                          physical, features13.subgroupSizeControl, features13.computeFullSubgroups,
+                                          subgroup);
+        std::printf("subgroup sizes: %u..%u (default %u), requirable in stages 0x%x, subgroupSizeControl %s, "
+                    "computeFullSubgroups %s\n",
+                    subgroup.min_size, subgroup.max_size, subgroup.default_size, unsigned(subgroup.required_stages),
+                    subgroup.subgroup_size_control ? "on" : "off", subgroup.compute_full_subgroups ? "on" : "off");
         VkPhysicalDeviceVulkan12Features enable12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &enable13};
         enable12.timelineSemaphore = VK_TRUE;
         enable12.separateDepthStencilLayouts = VK_TRUE;
