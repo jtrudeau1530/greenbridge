@@ -1377,6 +1377,63 @@ public:
         state_.bind_sampler(words);
     }
 
+    // CreateSampler with a UINT border colour and non-normalized coordinates (D3D-28). A description the PC runtime
+    // refuses leaves the slot as it was, as the runtime itself does (without the debug layer) on an RTX 4090 and
+    // on WARP: docs/d3d12_vulkan.md section 3.2.
+    void STDMETHODCALLTYPE CreateSampler2(const D3D12_SAMPLER_DESC2* desc,
+                                          D3D12_CPU_DESCRIPTOR_HANDLE destination) override {
+        if (!destination.ptr || !desc) return;
+        const char* refusal = sampler2_refusal(*desc);
+        if (refusal) {
+            log_once(refusal, desc->Flags);
+            return;
+        }
+        const bool uint_border = desc->Flags & D3D12_SAMPLER_FLAG_UINT_BORDER_COLOR;
+        D3D12_SAMPLER_DESC base{desc->Filter,   desc->AddressU,      desc->AddressV,       desc->AddressW,
+                                desc->MipLODBias, desc->MaxAnisotropy, desc->ComparisonFunc, {},
+                                desc->MinLOD,   desc->MaxLOD};
+        if (!uint_border) std::memcpy(base.BorderColor, desc->FloatBorderColor, sizeof(base.BorderColor));
+        leonida::gfx10::Sampler sampler = sampler_descriptor(base);
+        if (uint_border) {
+            // The S#'s border types are the float ones', plus the layer's integer mark (kIntegerBorderPtr), which
+            // gives the integer border its own key and VK_BORDER_COLOR_INT_* in Vulkan.
+            namespace g = leonida::gfx10;
+            const UINT* c = desc->UintBorderColor;
+            const bool black = c[0] == 0 && c[1] == 0 && c[2] == 0;
+            sampler.border_color = black && c[3] == 0                                 ? g::BorderColor::transparent_black
+                                   : black && c[3] == 1                               ? g::BorderColor::opaque_black
+                                   : c[0] == 1 && c[1] == 1 && c[2] == 1 && c[3] == 1 ? g::BorderColor::opaque_white
+                                                                                      : g::BorderColor::table;
+            sampler.integer_border = true;
+        }
+        sampler.unnormalized = desc->Flags & D3D12_SAMPLER_FLAG_NON_NORMALIZED_COORDINATES;
+        const leonida::gfx10::SamplerWords words = leonida::gfx10::encode(sampler);
+        std::memset(reinterpret_cast<void*>(destination.ptr), 0, kDescriptorSize);
+        std::memcpy(reinterpret_cast<void*>(destination.ptr), words.data(), sizeof(words));
+        state_.bind_sampler(words);
+    }
+
+    // Why the PC runtime refuses a D3D12_SAMPLER_DESC2, or null. The non-normalized rules are its debug layer's
+    // messages, which match Vulkan's for unnormalizedCoordinates; AddressW is free in both.
+    static const char* sampler2_refusal(const D3D12_SAMPLER_DESC2& desc) {
+        if (desc.Flags & ~UINT(D3D12_SAMPLER_FLAG_UINT_BORDER_COLOR | D3D12_SAMPLER_FLAG_NON_NORMALIZED_COORDINATES))
+            return "CreateSampler2 refused: unknown sampler flags; flags";
+        if (!(desc.Flags & D3D12_SAMPLER_FLAG_NON_NORMALIZED_COORDINATES)) return nullptr;
+        if (D3D12_DECODE_MIN_FILTER(desc.Filter) != D3D12_DECODE_MAG_FILTER(desc.Filter) ||
+            D3D12_DECODE_MIP_FILTER(desc.Filter) != D3D12_FILTER_TYPE_POINT ||
+            D3D12_DECODE_IS_ANISOTROPIC_FILTER(desc.Filter) ||
+            D3D12_DECODE_FILTER_REDUCTION(desc.Filter) == D3D12_FILTER_REDUCTION_TYPE_COMPARISON)
+            return "CreateSampler2 refused: non-normalized sampler filter; flags";
+        const auto clamps = [](D3D12_TEXTURE_ADDRESS_MODE m) {
+            return m == D3D12_TEXTURE_ADDRESS_MODE_CLAMP || m == D3D12_TEXTURE_ADDRESS_MODE_BORDER;
+        };
+        if (!clamps(desc.AddressU) || !clamps(desc.AddressV))
+            return "CreateSampler2 refused: non-normalized sampler address mode; flags";
+        if (desc.MinLOD != 0 || desc.MaxLOD != 0 || desc.MipLODBias != 0)
+            return "CreateSampler2 refused: non-normalized sampler LOD; flags";
+        return nullptr;
+    }
+
     HRESULT STDMETHODCALLTYPE CreateCommittedResource(const D3D12_HEAP_PROPERTIES* heap, D3D12_HEAP_FLAGS heap_flags,
                                                       const D3D12_RESOURCE_DESC* desc, D3D12_RESOURCE_STATES,
                                                       const D3D12_CLEAR_VALUE*, REFIID riid, void** out) override {
@@ -1696,6 +1753,15 @@ public:
             opts->CrossAdapterRowMajorTextureSupported = FALSE;
             opts->VPAndRTArrayIndexFromAnyShaderFeedingRasterizerSupportedWithoutGSEmulation = TRUE;
             opts->ResourceHeapTier = D3D12_RESOURCE_HEAP_TIER_1;
+            return S_OK;
+        }
+        case D3D12_FEATURE_D3D12_OPTIONS17: {
+            // Non-normalized samplers are core Vulkan (unnormalizedCoordinates), with the restrictions
+            // CreateSampler2 checks. No manual write tracking, as the RTX 4090 answers too.
+            if (size != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS17)) return E_INVALIDARG;
+            auto* opts = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS17*>(data);
+            *opts = {};
+            opts->NonNormalizedCoordinateSamplersSupported = TRUE;
             return S_OK;
         }
         case D3D12_FEATURE_GPU_VIRTUAL_ADDRESS_SUPPORT: {
