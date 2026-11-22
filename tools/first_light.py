@@ -131,26 +131,71 @@ def translate(work: str, picked: list[dict]) -> dict:
     return result
 
 
+def _obj_lines(handle):
+    """Yield logical OBJ lines with trailing-backslash continuations joined and # comments stripped."""
+    pending = ""
+    for raw_line in handle:
+        stripped = raw_line.rstrip("\r\n")
+        if stripped.endswith("\\"):
+            pending += stripped[:-1]
+            continue
+        yield (pending + stripped).split("#", 1)[0]
+        pending = ""
+    if pending:
+        yield pending.split("#", 1)[0]
+
+
+def _parse_obj_int(token: str, path: str, kind: str) -> int:
+    try:
+        return int(token)
+    except ValueError:
+        raise SystemExit(f"{path}: invalid {kind} index {token!r}") from None
+
+
 def read_obj(
     path: str,
 ) -> tuple[list[tuple[float, float, float, float, float]], list[int]]:
     """Positions, UVs and triangles as (x, y, z, u, v) vertices plus a u32 index list."""
     positions, uvs, faces = [], [], []
     with open(path, encoding="utf-8", errors="replace") as f:
-        for line in f:
+        for line in _obj_lines(f):
             p = line.split()
             if not p:
                 continue
             if p[0] == "v":
-                positions.append(tuple(float(x) for x in p[1:4]))
+                if len(p) < 4:
+                    raise SystemExit(f"{path}: short vertex line: {line.strip()!r}")
+                try:
+                    positions.append(tuple(float(x) for x in p[1:4]))
+                except ValueError:
+                    raise SystemExit(f"{path}: invalid vertex coordinates: {line.strip()!r}") from None
             elif p[0] == "vt":
-                uvs.append(tuple(float(x) for x in p[1:3]))
+                if len(p) < 3:
+                    raise SystemExit(f"{path}: short texture-coordinate line: {line.strip()!r}")
+                try:
+                    uvs.append(tuple(float(x) for x in p[1:3]))
+                except ValueError:
+                    raise SystemExit(f"{path}: invalid texture coordinates: {line.strip()!r}") from None
             elif p[0] == "f":
                 face = []
                 for word in p[1:]:
                     parts = word.split("/")
-                    vi = int(parts[0]) - 1
-                    ti = int(parts[1]) - 1 if len(parts) > 1 and parts[1] else -1
+                    raw_vi = _parse_obj_int(parts[0], path, "vertex")
+                    if raw_vi == 0:
+                        raise SystemExit(f"{path}: vertex index 0 is out of range (OBJ indices are 1-based)")
+                    vi = len(positions) + raw_vi if raw_vi < 0 else raw_vi - 1
+                    if raw_vi < 0 and vi < 0:
+                        raise SystemExit(f"{path}: vertex index {raw_vi} is out of range for {len(positions)} vertex(es)")
+                    if len(parts) > 1 and parts[1]:
+                        raw_ti = _parse_obj_int(parts[1], path, "texture-coordinate")
+                        if raw_ti == 0:
+                            ti = -1
+                        else:
+                            ti = len(uvs) + raw_ti if raw_ti < 0 else raw_ti - 1
+                            if raw_ti < 0 and ti < 0:
+                                ti = -1
+                    else:
+                        ti = -1
                     face.append((vi, ti))
                 for k in range(1, len(face) - 1):
                     faces.extend((face[0], face[k], face[k + 1]))
@@ -158,6 +203,8 @@ def read_obj(
         raise SystemExit(f"no vertices or faces in {path}")
     unique, vertices, indices = {}, [], []
     for vi, ti in faces:
+        if not 0 <= vi < len(positions):
+            raise SystemExit(f"{path}: vertex index {vi + 1} is out of range for {len(positions)} vertex(es)")
         key = (vi, ti)
         if key not in unique:
             unique[key] = len(vertices)
