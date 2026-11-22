@@ -438,8 +438,9 @@ World drawables do not carry the shared 597-name humanoid skeleton. Character `.
 store that name/hash table, and each character `#dr` model points at a local bone-hash array that
 maps into it. The measured name table, the following 597-record hierarchy/reference-TRS table,
 the model mapping and the texture-parameter split are in
-[character_skeleton.md](character_skeleton.md). No character bind matrices were recovered; that
-page records the reference-pose caveat rather than inventing a bind pose.
+[character_skeleton.md](character_skeleton.md). The character inverse bind matrices are at
+skeleton header `+0x30` and agree with the default bone transforms (see that page);
+`tools/anim_glb.py` exports a skinned part with them.
 
 The character-part inventory (Lucia's named records and decoded parts, the `player_story000_00`
 drawable set, slot-name counts and texture coverage) is in

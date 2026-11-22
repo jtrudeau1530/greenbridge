@@ -215,6 +215,11 @@ silhouette is geometry, not a painted-on atlas.
   and 0 `WEIGHTS_0`**, so there are no inverse-bind matrices to apply. The reference TRS is the
   only exported pose, and the meshes are not skinned to the 596-bone ped skeleton. A rigged export
   is still open; this is a data omission, not identity inverse-bind matrices.
+- **Bind pose and full skinning.** The `rpf9dump` GLBs use identity inverse-bind matrices and do
+  not apply the 8-influence bone-palette skinning. The inverse bind matrices are at skeleton header
+  `+0x30` (the drawable's `+0x18` points at the header) and agree with the default bone transforms;
+  `tools/anim_glb.py` exports a part with them as a glTF skin, with clips (see
+  [character_skeleton.md](character_skeleton.md#animated-gltf-export)).
 
 ## Reproduce
 
