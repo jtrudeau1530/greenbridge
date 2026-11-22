@@ -8132,7 +8132,10 @@ class Gen:
         emits only the code it needs; a run-time one emits all four and selects.
         Returns (coordinate, outside): outside is a bool id that is true when a border mode (6 clamp border, 7 mirror
         once border) puts the tap outside [0, n-1] before the clamp, so it takes the border colour, or None when the
-        literal mode has no border."""
+        literal mode has no border.
+        The modulo is OpSRem plus the period when the remainder is negative, not OpSMod: AMD's Windows driver
+        (24.10.24, RDNA2 iGPU) gave OpSMod of a negative coordinate the dividend's sign, so ps_gather_wrap's wrap and
+        mirror cases fetched outside the image and read zeros. The two are the same for a positive period."""
         zero, one = self.as_int(self.cu(0)), self.as_int(self.cu(1))
         static = isinstance(mode, int)
         base = {6: 2, 7: 3}.get(mode, mode if mode <= 3 else 2) if static else None
@@ -8140,17 +8143,25 @@ class Gen:
         nm1 = self.tmp()
         self.emit(f"{nm1} = OpISub %int {n} {one}")
         pre = {}                                        # the coordinate a border test sees: before the clamp
+
+        def modulo(x, m):
+            """x mod m for m > 0, in [0, m)."""
+            r, neg, up, out = (self.tmp() for _ in range(4))
+            self.emit(f"{r} = OpSRem %int {x} {m}")
+            self.emit(f"{neg} = OpSLessThan %bool {r} {zero}")
+            self.emit(f"{up} = OpIAdd %int {r} {m}")
+            self.emit(f"{out} = OpSelect %int {neg} {up} {r}")
+            return out
         res = {}
         if 2 in want:
             res[2] = self.tmp()
             self.emit(f"{res[2]} = OpExtInst %int %glsl SClamp {c} {zero} {nm1}")
         if 0 in want:
-            res[0] = self.tmp()
-            self.emit(f"{res[0]} = OpSMod %int {c} {n}")
+            res[0] = modulo(c, n)
         if 1 in want:
-            n2, p, hi, rf, lt, res[1] = (self.tmp() for _ in range(6))
+            n2, hi, rf, lt, res[1] = (self.tmp() for _ in range(5))
             self.emit(f"{n2} = OpIAdd %int {n} {n}")
-            self.emit(f"{p} = OpSMod %int {c} {n2}")
+            p = modulo(c, n2)
             self.emit(f"{hi} = OpISub %int {n2} {one}")
             self.emit(f"{rf} = OpISub %int {hi} {p}")
             self.emit(f"{lt} = OpSLessThan %bool {p} {n}")
