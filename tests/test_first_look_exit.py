@@ -35,8 +35,9 @@ class FirstLookExitTest(unittest.TestCase):
                 "$ErrorActionPreference = 'Stop'; "
                 "Add-Type -OutputAssembly gta6rt.exe -OutputType ConsoleApplication -TypeDefinition @'\n"
                 "public class Loader { public static int Main() {\n"
-                "    System.Console.WriteLine(\"synthetic dry run\");\n"
-                "    return int.Parse(System.Environment.GetEnvironmentVariable(\"LEONIDA_TEST_LOADER_EXIT\"));\n"
+                "    int code = int.Parse(System.Environment.GetEnvironmentVariable(\"LEONIDA_TEST_LOADER_EXIT\"));\n"
+                "    (code == 0 ? System.Console.Out : System.Console.Error).WriteLine(\"synthetic dry run\");\n"
+                "    return code;\n"
                 "} }\n'@"
             )
             env = {**os.environ, "PATH": str(Path(sys.executable).parent) + os.pathsep + os.environ["PATH"]}
