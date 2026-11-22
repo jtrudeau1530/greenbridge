@@ -1618,6 +1618,7 @@ public:
 
     explicit Device(const VulkanDeviceInfo& info) {
         state_.info = info;
+        queue_busy_.resize(info.command_queues.size(), false);
         const auto get_device = reinterpret_cast<PFN_vkGetDeviceProcAddr>(
             info.get_instance_proc(info.instance, "vkGetDeviceProcAddr"));
         state_.format_properties = reinterpret_cast<PFN_vkGetPhysicalDeviceFormatProperties>(
@@ -1964,11 +1965,41 @@ public:
                                                  void** out) override {
         constexpr auto method = "ID3D12Device::CreateCommandQueue";
         if (!desc) return d3d12_trace::result(method, E_INVALIDARG);
-        // Copy and compute queues share the one graphics VkQueue for now (section 8.2, question 12).
-        if (desc->Type != D3D12_COMMAND_LIST_TYPE_DIRECT) log_once("command queue type on the direct VkQueue:", desc->Type);
-        return d3d12_trace::result(method, create_command_queue(*state_.context, state_.info.queue,
-                                                                state_.info.queue_family, *desc, riid, out,
-                                                                identity(), state_.clock));
+        if (!out) return d3d12_trace::result(method, E_POINTER);
+        *out = nullptr;
+        if (desc->Type != D3D12_COMMAND_LIST_TYPE_DIRECT && desc->Type != D3D12_COMMAND_LIST_TYPE_COMPUTE &&
+            desc->Type != D3D12_COMMAND_LIST_TYPE_COPY) return d3d12_trace::result(method, E_INVALIDARG);
+        // Caller-owned devices that only provide the legacy queue cannot acquire more handles from their VkDevice.
+        if (state_.info.command_queues.empty())
+            return d3d12_trace::result(method, create_command_queue(*state_.context, state_.info.queue,
+                                                                     state_.info.queue_family, *desc, riid, out,
+                                                                     identity(), state_.clock));
+        // Vulkan only guarantees ordering within a VkQueue. Assign a distinct handle to each live D3D12 queue;
+        // otherwise a Wait submitted before another queue's Signal can deadlock the shared handle.
+        std::size_t slot = queue_busy_.size();
+        {
+            std::lock_guard lock(queue_mutex_);
+            for (std::size_t i = 0; i < queue_busy_.size(); ++i) {
+                if (!queue_busy_[i]) {
+                    queue_busy_[i] = true;
+                    slot = i;
+                    break;
+                }
+            }
+        }
+        if (slot == queue_busy_.size()) {
+            std::fprintf(stderr, "[rt] d3d12: no independent Vulkan queue available\n");
+            return d3d12_trace::result(method, E_OUTOFMEMORY);
+        }
+        // Child holds a device reference until after the lease has been released.
+        std::shared_ptr<void> lease(nullptr, [this, slot](void*) {
+            std::lock_guard lock(queue_mutex_);
+            queue_busy_[slot] = false;
+        });
+        const VkQueue queue = state_.info.command_queues[slot];
+        return d3d12_trace::result(method, create_command_queue(*state_.context, queue,
+                                                                 state_.info.queue_family, *desc, riid, out,
+                                                                 identity(), state_.clock, std::move(lease)));
     }
 
     HRESULT STDMETHODCALLTYPE CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE type, REFIID riid, void** out) override {
@@ -3567,6 +3598,8 @@ private:
         return desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER && (region.Width || region.Height || region.Depth);
     }
 
+    std::mutex queue_mutex_;
+    std::vector<bool> queue_busy_;
     DeviceState state_;
     OwnedRuntime owned_;
     IUnknown* outer_ = nullptr;  // the Xbox-ABI proxy, which owns a reference to this device
@@ -4039,11 +4072,16 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     enable12.samplerMirrorClampToEdge = info.sampler_mirror_clamp_to_edge;
     if (!info.bindless)
         std::fprintf(stderr, "[rt] d3d12: the GPU lacks a descriptor-indexing feature the bindless set needs\n");
-    const float priority = 1.0f;
+    std::uint32_t family_count = 0;
+    vkGetPhysicalDeviceQueueFamilyProperties(info.physical, &family_count, nullptr);
+    std::vector<VkQueueFamilyProperties> families(family_count);
+    vkGetPhysicalDeviceQueueFamilyProperties(info.physical, &family_count, families.data());
+    const std::uint32_t command_queue_count = std::min(16u, families[info.queue_family].queueCount);
+    std::vector<float> priorities(command_queue_count, 1.0f);
     VkDeviceQueueCreateInfo queue_info{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
     queue_info.queueFamilyIndex = info.queue_family;
-    queue_info.queueCount = 1;
-    queue_info.pQueuePriorities = &priority;
+    queue_info.queueCount = command_queue_count;
+    queue_info.pQueuePriorities = priorities.data();
     VkPhysicalDeviceFeatures enable{};
     info.texture_compression_bc = chosen_bc;
     enable.textureCompressionBC = chosen_bc ? VK_TRUE : VK_FALSE;  // the game's textures are BC1-7
@@ -4145,8 +4183,11 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
         return fail("vkCreateDevice failed");
     info.device = owned.device;
     owned.destroy_device = reinterpret_cast<PFN_vkDestroyDevice>(vkGetDeviceProcAddr(owned.device, "vkDestroyDevice"));
-    reinterpret_cast<PFN_vkGetDeviceQueue>(vkGetDeviceProcAddr(owned.device, "vkGetDeviceQueue"))(
-        owned.device, info.queue_family, 0, &info.queue);
+    info.command_queues.resize(command_queue_count);
+    const auto get_queue = reinterpret_cast<PFN_vkGetDeviceQueue>(vkGetDeviceProcAddr(owned.device, "vkGetDeviceQueue"));
+    for (std::uint32_t i = 0; i < command_queue_count; ++i)
+        get_queue(owned.device, info.queue_family, i, &info.command_queues[i]);
+    info.queue = info.command_queues[0];
     info.max_push_constants_size = chosen.limits.maxPushConstantsSize;
     info.push_constants_need_fallback = (info.max_push_constants_size < 144);
     std::fprintf(stderr, "[rt] d3d12: Vulkan device: %s (maxPushConstantsSize: %u bytes)\n", chosen.deviceName,
