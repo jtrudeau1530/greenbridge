@@ -926,6 +926,8 @@ if(TARGET Vulkan::Headers)
         LEONIDA_TEST_FS_SOLID_SPV="${LEONIDA_TEST_FS_SOLID}"
         LEONIDA_TEST_CS_RAYQUERY_SPV="${LEONIDA_TEST_CS_RAYQUERY}")
     endif()
+    add_test(NAME d3d12_indirect_rt COMMAND d3d12_indirect_rt_test)
+    set_tests_properties(d3d12_indirect_rt PROPERTIES SKIP_RETURN_CODE 77)
 
     # The loader can create this device instead of the host's (D3D12XboxCreateDevice, LEONIDA_D3D12=vulkan).
     if(TARGET gta6rt)
