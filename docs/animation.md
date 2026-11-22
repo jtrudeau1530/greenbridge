@@ -559,6 +559,19 @@ The three motion matcher streams in [Bone tables and motion matchers](#bone-tabl
 (`0x101c379a0`, `0x101c41d50`, `0x101ea66c0`) are the second system pages of three of those dictionaries, with 2, 1 and 2
 `.motionmatcher` clips. Their layout after the name is not decoded.
 
+### Other archives
+
+The same tool reads `story000.rpf` with no change: of 34,533 roots with the dictionary header, 34,518 join (7 with a
+gap page) and 9,190 are clip dictionaries. The other 25,328 roots have some other value at `+0x70` and are not clip
+dictionaries; 15 roots do not join. All 59,593 animations of those dictionaries decode with every check passing, and
+all 54,352,969 type-10 chunk boundaries close. Its 14 `.motion` clips have 75 children, and all 75 name a `.clip` of a
+dictionary in `story000.rpf`. None of its 9,188 distinct dictionary hashes is a dictionary in anim.rpf, and none is
+one of the 1,902 hashes anim.rpf refers to without having them.
+
+```
+python -I tools/anim_clips.py <package>/pack/story000/story000.rpf <work>/story000-clips.json --jobs 20
+```
+
 ## Readable, compressed and still opaque
 
 - **Readable:** all 273 name tables (2,298 paths), the `0DRP` version/page count, 1,371 type-hash headers,
