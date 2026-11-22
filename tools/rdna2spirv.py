@@ -8692,8 +8692,10 @@ class Gen:
           stride bytes when the V# stride (dword1[29:16]) is not 0, else NUM_RECORDS bytes (V# dword2). The bound
           is per dword and does not see base & 3; IMM is unsigned.
           s_load*: IMM is sign-extended from 21 bits and the sum is formed in 64 bits; no bound.
-        Not measured, and inferred: s_load with sOFF + IMM < 0 (the 64-bit signed sum is used), x16 (same rule as
-        x8), an s_buffer_load immediate with bit 20 set or a negative one (kept as the 32-bit value, as before)."""
+        Measured on gfx1036 (RDNA2): x16 is bounded per dword like x8, NUM_RECORDS * stride is 64-bit (2^32 does not
+        wrap to 0), NUM_RECORDS >= 2^31 is unsigned, and an s_load with sOFF + IMM < 0 reads at the 64-bit signed sum.
+        An s_buffer_load immediate with bit 20 set does not follow the bound on hardware and is not modelled (kept as
+        the 32-bit value, as before)."""
         n = 1 if op.endswith("dword") else int(op.rsplit("x", 1)[1])
         d, base = a[0], a[1]
         # A single dword may also land in vcc_lo / m0 / vcc_hi (seen: s_buffer_load_dword vcc_lo, ...), and a wide
