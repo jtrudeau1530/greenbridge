@@ -12,11 +12,14 @@
 // GPU without D24. Steps 3 and 4 use converters with a 1 MiB and a 1 KiB storage range, so copies split into dispatches.
 // Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation; any validation error fails the test.
 #include "vk_test_device.h"
+#include "../src/vulkan_backend.h"
 #include "../src/vulkan_depth24.h"
 
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <thread>
 #include <vector>
 
 #define EXPECT(condition) do { \
@@ -197,6 +200,149 @@ int main() {
                     EXPECT(scratch_words[(z * h + y) * w + x] == as_bits(depth24_to_float(d)));
                 }
         std::printf("depth24: a pitched copy at an offset touches only its texels\n");
+    }
+
+    // 5. Concurrent VulkanQueue::execute() with enable_depth24 active: one queue runs depth24_as_float
+    //    CopyTexture roundtrips (lazy tracker_mutex_ acquisition + collect/retire), while a second queue
+    //    runs non-depth24 CopyBuffer batches concurrently (parallel prepare()), plus an early-failure batch
+    //    that triggers Depth24Guard retirement.
+    {
+        VkPhysicalDeviceMemoryProperties mem_props{};
+        gpu.instance_fn<PFN_vkGetPhysicalDeviceMemoryProperties>("vkGetPhysicalDeviceMemoryProperties")(
+            gpu.physical, &mem_props);
+        const auto alloc_device_local = [&](const VkMemoryRequirements& req) -> VkDeviceMemory {
+            for (std::uint32_t i = 0; i < mem_props.memoryTypeCount; ++i) {
+                if (!(req.memoryTypeBits & (1u << i))) continue;
+                if ((mem_props.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) !=
+                    VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)
+                    continue;
+                VkMemoryAllocateInfo info{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+                info.allocationSize = req.size;
+                info.memoryTypeIndex = i;
+                VkDeviceMemory mem = VK_NULL_HANDLE;
+                if (gpu.fn<PFN_vkAllocateMemory>("vkAllocateMemory")(gpu.device, &info, nullptr, &mem) == VK_SUCCESS)
+                    return mem;
+                return VK_NULL_HANDLE;
+            }
+            return VK_NULL_HANDLE;
+        };
+
+        VulkanContext context(gpu.device_proc, gpu.device, true);
+        EXPECT(context.loaded());
+        context.enable_depth24(gpu.device_proc, alloc_device_local);
+
+        constexpr int kIters = 16;
+        constexpr std::uint32_t tex_w = 64, tex_h = 16;
+        constexpr std::uint32_t tex_words = tex_w * tex_h;
+        constexpr std::uint64_t tex_bytes = std::uint64_t(tex_words) * 4;
+        const VkImage depth_img =
+            gpu.image(VK_FORMAT_D32_SFLOAT_S8_UINT, tex_w, tex_h, 1, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT);
+        EXPECT(depth_img != VK_NULL_HANDLE);
+
+        std::uint32_t *d24_up_ptr = nullptr, *d24_rb_ptr = nullptr;
+        std::uint32_t *buf_src_ptr = nullptr, *buf_dst_ptr = nullptr;
+        const VkBuffer d24_up = gpu.buffer(tex_bytes, usage, reinterpret_cast<void**>(&d24_up_ptr));
+        const VkBuffer d24_rb = gpu.buffer(tex_bytes * kIters, usage, reinterpret_cast<void**>(&d24_rb_ptr));
+        const VkBuffer buf_src = gpu.buffer(tex_bytes, usage, reinterpret_cast<void**>(&buf_src_ptr));
+        const VkBuffer buf_dst = gpu.buffer(tex_bytes * kIters, usage, reinterpret_cast<void**>(&buf_dst_ptr));
+        EXPECT(d24_up && d24_rb && buf_src && buf_dst);
+
+        for (std::uint32_t i = 0; i < tex_words; ++i) {
+            d24_up_ptr[i] = ((i * 15973u + 13u) & depth24_max) | (0x7eu << 24);
+            buf_src_ptr[i] = 0x12340000u + i;
+        }
+
+        constexpr ResourceId id_depth = 1, id_d24_up = 2, id_d24_rb = 3, id_buf_src = 4, id_buf_dst = 5;
+        ResourceBinding img_b{};
+        img_b.image = depth_img;
+        img_b.format = VK_FORMAT_D32_SFLOAT_S8_UINT;
+        img_b.aspects = VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
+        img_b.width = tex_w;
+        img_b.height = tex_h;
+        img_b.mip_levels = 1;
+        img_b.array_layers = 1;
+        img_b.depth = 1;
+        img_b.samples = 1;
+        img_b.depth24 = true;
+        img_b.depth24_as_float = true;
+        context.add_resource(id_depth, img_b, VK_IMAGE_LAYOUT_UNDEFINED);
+
+        const auto reg_buf = [&](ResourceId id, VkBuffer buf, VkDeviceSize sz, bool readback) {
+            ResourceBinding b{};
+            b.buffer = buf;
+            b.size = sz;
+            b.host_readable = readback;
+            context.add_resource(id, b);
+        };
+        reg_buf(id_d24_up, d24_up, tex_bytes, false);
+        reg_buf(id_d24_rb, d24_rb, tex_bytes * kIters, true);
+        reg_buf(id_buf_src, buf_src, tex_bytes, false);
+        reg_buf(id_buf_dst, buf_dst, tex_bytes * kIters, true);
+
+        VulkanQueue queue_a(context, gpu.queue, gpu.family);
+        VulkanQueue queue_b(context, gpu.queue, gpu.family);
+        EXPECT(queue_a.ok() && queue_b.ok());
+
+        std::vector<CommandList> d24_lists(kIters);
+        std::vector<CommandList> buf_lists(kIters);
+        for (int iter = 0; iter < kIters; ++iter) {
+            const std::uint64_t off = std::uint64_t(iter) * tex_bytes;
+            CopyLocation fp_up{id_d24_up, true, 0, 0, tex_w, tex_h, 1, tex_w * 4};
+            CopyLocation fp_rb{id_d24_rb, true, 0, off, tex_w, tex_h, 1, tex_w * 4};
+            CopyLocation tex_loc{id_depth, false, 0, 0, 0, 0, 0, 0};
+            EXPECT(d24_lists[iter].copy_texture(CopyTexture{tex_loc, 0, 0, 0, fp_up, false, {}}));
+            EXPECT(d24_lists[iter].copy_texture(CopyTexture{fp_rb, 0, 0, 0, tex_loc, false, {}}));
+            EXPECT(d24_lists[iter].close());
+
+            EXPECT(buf_lists[iter].copy_buffer(CopyBuffer{id_buf_dst, off, id_buf_src, 0, tex_bytes}));
+            EXPECT(buf_lists[iter].close());
+        }
+
+        // Early-failure batch: valid depth24_as_float copy followed by an unknown resource copy must fail cleanly
+        // and retire the uncommitted depth24 scratch via Depth24Guard without corrupting subsequent executions.
+        {
+            CommandList failing_list;
+            CopyLocation fp_up{id_d24_up, true, 0, 0, tex_w, tex_h, 1, tex_w * 4};
+            CopyLocation tex_loc{id_depth, false, 0, 0, 0, 0, 0, 0};
+            EXPECT(failing_list.copy_texture(CopyTexture{tex_loc, 0, 0, 0, fp_up, false, {}}));
+            EXPECT(failing_list.copy_buffer(CopyBuffer{99999, 0, id_buf_src, 0, 4}));
+            EXPECT(failing_list.close());
+            const CommandList* ptrs[] = {&failing_list};
+            EXPECT(queue_a.execute(ptrs) == ReplayResult::unresolved_resource);
+        }
+
+        std::atomic<bool> failed{false};
+        std::thread ta([&] {
+            for (int iter = 0; iter < kIters; ++iter) {
+                const CommandList* ptrs[] = {&d24_lists[iter]};
+                if (queue_a.execute(ptrs) != ReplayResult::success) {
+                    failed.store(true);
+                    break;
+                }
+            }
+        });
+        std::thread tb([&] {
+            for (int iter = 0; iter < kIters; ++iter) {
+                const CommandList* ptrs[] = {&buf_lists[iter]};
+                if (queue_b.execute(ptrs) != ReplayResult::success) {
+                    failed.store(true);
+                    break;
+                }
+            }
+        });
+        ta.join();
+        tb.join();
+        EXPECT(!failed.load());
+        EXPECT(gpu.fn<PFN_vkDeviceWaitIdle>("vkDeviceWaitIdle")(gpu.device) == VK_SUCCESS);
+
+        for (int iter = 0; iter < kIters; ++iter) {
+            const std::size_t base = std::size_t(iter) * tex_words;
+            for (std::uint32_t i = 0; i < tex_words; ++i) {
+                EXPECT(d24_rb_ptr[base + i] == (d24_up_ptr[i] & depth24_max));
+                EXPECT(buf_dst_ptr[base + i] == buf_src_ptr[i]);
+            }
+        }
+        std::printf("depth24: concurrent VulkanQueue::execute (lazy depth24 lock + parallel non-d24 prepare) ok\n");
     }
 
     EXPECT(gpu.validation_errors() == 0);
