@@ -168,6 +168,24 @@ int main() {
     CHECK(fssm_program(fssm) == fssm);  // a bare FSSM blob passes through
     CHECK(fssm_program(container({{dynamic, 601}})).empty());  // stated size wrong
     CHECK(fssm_program(bytes("DXBC")).empty());
+    // Truncated DXBC part table: must return empty immediately instead of reading out-of-bounds offset 0
+    // (which would match "DXBC" at offset 0 or spin 0xFFFFFFFF iterations on a 32-byte header).
+    {
+        std::vector<std::uint8_t> trunc(32, 0);
+        std::memcpy(trunc.data(), "DXBC", 4);
+        trunc[4] = 4;   // if offset 0 is read as a part header, size=4 fits inside 32 bytes
+        trunc[28] = 1;  // parts = 1, but 0 bytes of part-offset table follow
+        CHECK(dxbc_part(trunc, "DXBC").empty());
+
+        std::vector<std::uint8_t> huge_parts(32, 0);
+        std::memcpy(huge_parts.data(), "DXBC", 4);
+        huge_parts[28] = 0xff;
+        huge_parts[29] = 0xff;
+        huge_parts[30] = 0xff;
+        huge_parts[31] = 0xff;  // parts = 0xFFFFFFFF with 0 bytes of part table
+        CHECK(dxbc_part(huge_parts, "DXIL").empty());
+        CHECK(fssm_program(huge_parts).empty());
+    }
     // Two different 0x0D payloads: the last one is the program, as tools/fssm_unpack.py (and so fssm_sha256) has it.
     CHECK(fssm_program(container({{fixed, 25}, {dynamic, 600}})) == skewed(600));
     CHECK(fssm_program(container({{dynamic, 600}, {fixed, 25}})) == bytes("hello hello hello leonida"));
