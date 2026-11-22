@@ -1256,7 +1256,202 @@ class TestConditionCodesAndStatusFlags(unittest.TestCase):
         self.assertEqual(flags_carry.dword_carry1, 0)
 
 
+class TestIEEE754BoundaryExtremes(unittest.TestCase):
+    """Unit tests for IEEE 754 boundary extremes, subnormals, and NaN bit preservation.
+
+    Verifies that ds_wrxchg2_b64 performs exact bitwise exchanges on 64-bit IEEE 754
+    bit patterns without quietening signaling NaNs, without flushing subnormals to zero,
+    and without sign modification of signed zeros.
+    """
+
+    def setUp(self) -> None:
+        self.interp = ScalarInterpreter()
+
+    def test_nan_signaling_preservation_without_quietening(self) -> None:
+        # Signaling NaN in IEEE 754 binary64: exponent=0x7FF, fraction != 0, quiet bit 51 is 0.
+        snan0 = 0x7FF0_0000_0000_0001
+        snan1 = 0x7FF0_1234_5678_9ABC
+        # Bit 51 (0x0008_0000_0000_0000) must remain 0
+        self.assertEqual(snan0 & 0x0008_0000_0000_0000, 0)
+        self.assertEqual(snan1 & 0x0008_0000_0000_0000, 0)
+
+        struct.pack_into("<Q", self.interp.lds_mem, 0x100, snan0)
+        struct.pack_into("<Q", self.interp.lds_mem, 0x108, snan1)
+
+        self.interp.rf.set_u32(1, 0x100)
+        # Exchange with new snan patterns
+        new_snan0 = 0x7FF4_0000_0000_0002
+        new_snan1 = 0x7FF0_0000_DEAD_BEEF
+        self.interp.rf.set_u64(RegPair(4), new_snan0)
+        self.interp.rf.set_u64(RegPair(6), new_snan1)
+
+        instr = DSWrxchg2B64Instruction(
+            vdst=RegQuad(8),
+            vaddr=RegSingle(1),
+            data0=RegPair(4),
+            data1=RegPair(6),
+            offset0=0,
+            offset1=1,
+        )
+
+        old0, old1 = self.interp.step(instr)
+        # Returned values must match original SNaN bits exactly (quiet bit must NOT be set)
+        self.assertEqual(old0, snan0)
+        self.assertEqual(old1, snan1)
+        self.assertEqual(old0 & 0x0008_0000_0000_0000, 0)
+        self.assertEqual(old1 & 0x0008_0000_0000_0000, 0)
+
+        # Memory must match new SNaN bits exactly
+        self.assertEqual(
+            struct.unpack_from("<Q", self.interp.lds_mem, 0x100)[0], new_snan0
+        )
+        self.assertEqual(
+            struct.unpack_from("<Q", self.interp.lds_mem, 0x108)[0], new_snan1
+        )
+
+    def test_nan_arbitrary_payload_preservation(self) -> None:
+        # Quiet NaNs with arbitrary unique payloads
+        qnan0 = 0x7FF8_AAAA_5555_1234
+        qnan1 = 0xFFF9_BEEF_CAFE_9876
+
+        struct.pack_into("<Q", self.interp.lds_mem, 0x200, qnan0)
+        struct.pack_into("<Q", self.interp.lds_mem, 0x208, qnan1)
+
+        self.interp.rf.set_u32(1, 0x200)
+        self.interp.rf.set_u64(RegPair(2), 0)
+        self.interp.rf.set_u64(RegPair(4), 0)
+
+        instr = DSWrxchg2B64Instruction(
+            vdst=RegQuad(8),
+            vaddr=RegSingle(1),
+            data0=RegPair(2),
+            data1=RegPair(4),
+            offset0=0,
+            offset1=1,
+        )
+
+        old0, old1 = self.interp.step(instr)
+        self.assertEqual(old0, qnan0)
+        self.assertEqual(old1, qnan1)
+
+    def test_signed_zeros_preservation(self) -> None:
+        # +0.0 = 0x0000_0000_0000_0000, -0.0 = 0x8000_0000_0000_0000
+        pos_zero = 0x0000_0000_0000_0000
+        neg_zero = 0x8000_0000_0000_0000
+
+        struct.pack_into("<Q", self.interp.lds_mem, 0x40, pos_zero)
+        struct.pack_into("<Q", self.interp.lds_mem, 0x48, neg_zero)
+
+        self.interp.rf.set_u32(1, 0x40)
+        self.interp.rf.set_u64(RegPair(2), neg_zero)
+        self.interp.rf.set_u64(RegPair(4), pos_zero)
+
+        instr = DSWrxchg2B64Instruction(
+            vdst=RegQuad(8),
+            vaddr=RegSingle(1),
+            data0=RegPair(2),
+            data1=RegPair(4),
+            offset0=0,
+            offset1=1,
+        )
+
+        old0, old1 = self.interp.step(instr)
+        self.assertEqual(old0, pos_zero)
+        self.assertEqual(old1, neg_zero)
+        self.assertEqual(
+            struct.unpack_from("<Q", self.interp.lds_mem, 0x40)[0], neg_zero
+        )
+        self.assertEqual(
+            struct.unpack_from("<Q", self.interp.lds_mem, 0x48)[0], pos_zero
+        )
+
+    def test_signed_infinities_preservation(self) -> None:
+        pos_inf = 0x7FF0_0000_0000_0000
+        neg_inf = 0xFFF0_0000_0000_0000
+
+        struct.pack_into("<Q", self.interp.lds_mem, 0x60, pos_inf)
+        struct.pack_into("<Q", self.interp.lds_mem, 0x68, neg_inf)
+
+        self.interp.rf.set_u32(1, 0x60)
+        self.interp.rf.set_u64(RegPair(2), 0x1234)
+        self.interp.rf.set_u64(RegPair(4), 0x5678)
+
+        instr = DSWrxchg2B64Instruction(
+            vdst=RegQuad(8),
+            vaddr=RegSingle(1),
+            data0=RegPair(2),
+            data1=RegPair(4),
+            offset0=0,
+            offset1=1,
+        )
+
+        old0, old1 = self.interp.step(instr)
+        self.assertEqual(old0, pos_inf)
+        self.assertEqual(old1, neg_inf)
+
+    def test_subnormal_preservation_without_flush_to_zero(self) -> None:
+        # Smallest subnormal: 2^-1074 = 0x0000_0000_0000_0001
+        # Largest subnormal: 0x000F_FFFF_FFFF_FFFF
+        min_subnormal = 0x0000_0000_0000_0001
+        max_subnormal = 0x000F_FFFF_FFFF_FFFF
+
+        struct.pack_into("<Q", self.interp.lds_mem, 0x80, min_subnormal)
+        struct.pack_into("<Q", self.interp.lds_mem, 0x88, max_subnormal)
+
+        self.interp.rf.set_u32(1, 0x80)
+        self.interp.rf.set_u64(RegPair(2), max_subnormal | 0x8000_0000_0000_0000)
+        self.interp.rf.set_u64(RegPair(4), min_subnormal | 0x8000_0000_0000_0000)
+
+        instr = DSWrxchg2B64Instruction(
+            vdst=RegQuad(8),
+            vaddr=RegSingle(1),
+            data0=RegPair(2),
+            data1=RegPair(4),
+            offset0=0,
+            offset1=1,
+        )
+
+        old0, old1 = self.interp.step(instr)
+        # Must NOT be flushed to 0
+        self.assertNotEqual(old0, 0)
+        self.assertNotEqual(old1, 0)
+        self.assertEqual(old0, min_subnormal)
+        self.assertEqual(old1, max_subnormal)
+
+        mem0 = struct.unpack_from("<Q", self.interp.lds_mem, 0x80)[0]
+        mem1 = struct.unpack_from("<Q", self.interp.lds_mem, 0x88)[0]
+        self.assertEqual(mem0, max_subnormal | 0x8000_0000_0000_0000)
+        self.assertEqual(mem1, min_subnormal | 0x8000_0000_0000_0000)
+
+    def test_normal_boundary_extremes(self) -> None:
+        # min_normal: 0x0010_0000_0000_0000
+        # max_normal: 0x7FEF_FFFF_FFFF_FFFF
+        min_norm = 0x0010_0000_0000_0000
+        max_norm = 0x7FEF_FFFF_FFFF_FFFF
+
+        struct.pack_into("<Q", self.interp.lds_mem, 0x90, min_norm)
+        struct.pack_into("<Q", self.interp.lds_mem, 0x98, max_norm)
+
+        self.interp.rf.set_u32(1, 0x90)
+        self.interp.rf.set_u64(RegPair(2), 0)
+        self.interp.rf.set_u64(RegPair(4), 0)
+
+        instr = DSWrxchg2B64Instruction(
+            vdst=RegQuad(8),
+            vaddr=RegSingle(1),
+            data0=RegPair(2),
+            data1=RegPair(4),
+            offset0=0,
+            offset1=1,
+        )
+
+        old0, old1 = self.interp.step(instr)
+        self.assertEqual(old0, min_norm)
+        self.assertEqual(old1, max_norm)
+
+
 if __name__ == "__main__":
     unittest.main()
+
 
 
