@@ -63,6 +63,23 @@ jobs:
           path: .vulkan-headers
           sparse-checkout: include
           persist-credentials: false
+      - name: Install glslang for D3D12 test shaders
+        shell: pwsh
+        run: |
+          $version = '16.6.0'
+          $release = "glslang-$version-windows-x86_64-release.zip"
+          $archive = Join-Path $env:RUNNER_TEMP $release
+          $destination = Join-Path $env:RUNNER_TEMP "glslang-$version"
+          Invoke-WebRequest -Uri "https://github.com/KhronosGroup/glslang/releases/download/$version/$release" -OutFile $archive
+          $expectedHash = '82bf434e69b9bb4829de7e2b4bc2c5e7a7861e53d66cf75e5cc70f5f694a8d9b'
+          if ((Get-FileHash -Algorithm SHA256 -LiteralPath $archive).Hash -ne $expectedHash) {
+            throw "Unexpected SHA-256 for $release"
+          }
+          Expand-Archive -LiteralPath $archive -DestinationPath $destination
+          $bin = Join-Path $destination 'bin'
+          # FindVulkan and the runtime fallback look for the legacy executable name.
+          Copy-Item -LiteralPath (Join-Path $bin 'glslang.exe') -Destination (Join-Path $bin 'glslangValidator.exe')
+          Add-Content -LiteralPath $env:GITHUB_PATH -Value $bin -Encoding utf8
       - name: Configure
         env:
           VULKAN_SDK: ${{ github.workspace }}/.vulkan-headers
@@ -75,6 +92,12 @@ jobs:
           -DCMAKE_MSVC_DEBUG_INFORMATION_FORMAT=Embedded
       - name: Build
         run: cmake --build runtime/build
+      - name: Verify the descriptor test shader
+        shell: pwsh
+        run: |
+          if (!(Test-Path -LiteralPath runtime/build/generated/cs_sample.spv -PathType Leaf)) {
+            throw 'The Windows runtime build did not compile the descriptor test shader'
+          }
       # For the wine job: the test list, the checkout it was made in, and the built executables and DLLs. Only what
       # this repository builds goes in; there is no game data on the runner.
       - name: List tests for Wine
