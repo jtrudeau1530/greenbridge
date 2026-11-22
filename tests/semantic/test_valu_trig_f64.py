@@ -1332,5 +1332,176 @@ class TestIEEE754BoundaryExtremes(unittest.TestCase):
         self.assertEqual(res_max, F64_POS_ZERO)
 
 
+# ==============================================================================
+# Mutants for Mutation Detection
+# ==============================================================================
+
+def mutant_radians_not_turns(s0: int, *, mode: TrigMode = TrigMode.SIN, **kwargs) -> int:
+    """Mutant 1: Treats input directly as radians instead of turns (missing 2*pi scale)."""
+    val = u64_to_f64(s0)
+    if is_f64_nan(s0) or is_f64_inf(s0):
+        return F64_CANONICAL_QNAN
+    res = math.sin(val) if mode == TrigMode.SIN else math.cos(val)
+    return f64_to_u64(res)
+
+
+def mutant_ignore_neg(s0: int, *, src0_neg: bool = False, **kwargs) -> int:
+    """Mutant 2: Ignores negative modifier."""
+    return ref_trig_f64(s0, src0_neg=False, **kwargs)
+
+
+def mutant_ignore_abs(s0: int, *, src0_abs: bool = False, **kwargs) -> int:
+    """Mutant 3: Ignores absolute value modifier."""
+    return ref_trig_f64(s0, src0_abs=False, **kwargs)
+
+
+def mutant_ignore_clamp(s0: int, *, clamp: bool = False, **kwargs) -> int:
+    """Mutant 4: Ignores clamp modifier."""
+    return ref_trig_f64(s0, clamp=False, **kwargs)
+
+
+def mutant_clamp_nan_to_nan(s0: int, *, clamp: bool = False, **kwargs) -> int:
+    """Mutant 5: Clamps numbers but fails to clamp NaN to +0.0."""
+    res = ref_trig_f64(s0, clamp=False, **kwargs)
+    if clamp and not is_f64_nan(res):
+        val = u64_to_f64(res)
+        if val < 0.0:
+            return F64_POS_ZERO
+        elif val > 1.0:
+            return F64_ONE
+    return res
+
+
+def mutant_snan_not_quieted(s0: int, **kwargs) -> int:
+    """Mutant 6: Returns SNaN without setting the quiet bit."""
+    if is_f64_snan(s0):
+        return s0
+    return ref_trig_f64(s0, **kwargs)
+
+
+def mutant_inf_returns_zero(s0: int, **kwargs) -> int:
+    """Mutant 7: Returns 0.0 on infinite inputs instead of Canonical QNaN."""
+    if is_f64_inf(s0):
+        return F64_POS_ZERO
+    return ref_trig_f64(s0, **kwargs)
+
+
+def mutant_f32_truncation(s0: int, **kwargs) -> int:
+    """Mutant 8: Truncates intermediate calculation to 32-bit single precision float."""
+    f0 = struct.unpack("<f", struct.pack("<f", u64_to_f64(s0)))[0]
+    red = ref_turn_reduce_f64(float(f0))
+    res = math.sin(red * TWO_PI)
+    f_res = struct.unpack("<f", struct.pack("<f", res))[0]
+    return f64_to_u64(float(f_res))
+
+
+# ==============================================================================
+# Negative Controls, Syntax Rejection, and Mutation Detection
+# ==============================================================================
+
+class TestNegativeControlsAndSyntaxRejection(unittest.TestCase):
+    """Test suite for negative controls, syntax rejection, and mutation detection."""
+
+    def test_syntax_rejection_bad_opcodes(self) -> None:
+        for bad_op in ("v_trig_f32", "v_sin_f32", "s_trig_f64", "v_add_f64", "unknown_op"):
+            with self.assertRaises(ValueError):
+                parse_asm_line(f"{bad_op} v[0:1], v[2:3]")
+
+    def test_syntax_rejection_bad_operands(self) -> None:
+        for bad_line in (
+            "v_trig_f64 v0, v[2:3]",
+            "v_trig_f64 v[0:1], invalid_reg",
+            "v_trig_f64 v[0:1], v[300:301]",
+        ):
+            with self.assertRaises(ValueError):
+                parse_asm_line(bad_line)
+
+    def test_syntax_rejection_operand_count(self) -> None:
+        # Too few operands
+        with self.assertRaises(ValueError):
+            parse_asm_line("v_trig_f64 v[0:1]")
+        # Too many operands
+        with self.assertRaises(ValueError):
+            parse_asm_line("v_trig_f64 v[0:1], v[2:3], v[4:5]")
+
+    def test_syntax_rejection_destination_modifiers(self) -> None:
+        with self.assertRaises(ValueError):
+            parse_asm_line("v_trig_f64 -v[0:1], v[2:3]")
+        with self.assertRaises(ValueError):
+            parse_asm_line("v_trig_f64 |v[0:1]|, v[2:3]")
+
+    def test_syntax_rejection_empty_lines(self) -> None:
+        with self.assertRaises(ValueError):
+            parse_asm_line("")
+        with self.assertRaises(ValueError):
+            parse_asm_line("   ; comment only")
+
+    def test_negative_control_radians_instead_of_turns(self) -> None:
+        # sin(0.25 turns) = 1.0; sin(0.25 rad) ~= 0.2474
+        s0 = F64_QUARTER
+        good = ref_trig_f64(s0, mode=TrigMode.SIN)
+        bad = mutant_radians_not_turns(s0, mode=TrigMode.SIN)
+        self.assertNotEqual(good, bad)
+        self.assertEqual(good, F64_ONE)
+        self.assertNotEqual(bad, F64_ONE)
+
+    def test_negative_control_f32_truncation_detected(self) -> None:
+        # An angle whose low 29 mantissa bits matter in binary64
+        angle = 0.125 + 2.0**(-30)
+        s0 = f64_to_u64(angle)
+        good = ref_trig_f64(s0)
+        bad = mutant_f32_truncation(s0)
+        self.assertNotEqual(good, bad, "Single precision truncation mutation must be detected")
+
+    def test_mutation_detection_all_mutants_caught(self) -> None:
+        # Mutant 1: radians not turns
+        self.assertNotEqual(ref_trig_f64(F64_QUARTER), mutant_radians_not_turns(F64_QUARTER))
+
+        # Mutant 2: ignore neg
+        self.assertNotEqual(
+            ref_trig_f64(F64_QUARTER, src0_neg=True),
+            mutant_ignore_neg(F64_QUARTER, src0_neg=True),
+        )
+
+        # Mutant 3: ignore abs
+        self.assertNotEqual(
+            ref_trig_f64(F64_NEG_QUARTER, src0_abs=True),
+            mutant_ignore_abs(F64_NEG_QUARTER, src0_abs=True),
+        )
+
+        # Mutant 4: ignore clamp
+        self.assertNotEqual(
+            ref_trig_f64(F64_NEG_QUARTER, clamp=True),
+            mutant_ignore_clamp(F64_NEG_QUARTER, clamp=True),
+        )
+
+        # Mutant 5: clamp NaN to NaN instead of +0.0
+        self.assertNotEqual(
+            ref_trig_f64(F64_POS_INF, clamp=True),
+            mutant_clamp_nan_to_nan(F64_POS_INF, clamp=True),
+        )
+
+        # Mutant 6: SNaN not quieted
+        snan = 0x7FF0000000000001
+        self.assertNotEqual(ref_trig_f64(snan), mutant_snan_not_quieted(snan))
+
+        # Mutant 7: Inf returns 0 instead of QNaN
+        self.assertNotEqual(ref_trig_f64(F64_POS_INF), mutant_inf_returns_zero(F64_POS_INF))
+
+    def test_mutation_detects_exec_mask_leakage(self) -> None:
+        sim = SIMDWavefront(wave_size=32)
+        sentinel = join_dwords(OLD_VGPR_SENTINEL, OLD_VGPR_SENTINEL)
+        sim.store_vgpr_pair_wave(0, [sentinel] * 32)
+        sim.store_vgpr_pair_wave(2, [F64_QUARTER] * 32)
+
+        # Only lane 0 active
+        sim.exec_mask = 0x00000001
+        res = sim.step_v_trig_f64(0, 2)
+
+        self.assertEqual(res[0], F64_ONE)
+        for lane in range(1, 32):
+            self.assertEqual(res[lane], sentinel, f"Lane {lane} leaked despite inactive EXEC mask")
+
+
 if __name__ == "__main__":
     unittest.main()
