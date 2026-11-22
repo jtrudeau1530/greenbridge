@@ -373,6 +373,24 @@ template, XML and XML fragments, the two-stream advance bug and CSV/JSON output.
 Measured with the tool on `shared_minigame000_bvh4.rpf`: 2,560 streams, 59,142,787 stored, 970,044,012 inflated,
 1,237 complete `bvh4`, 1,233 `instance208`, 85 descriptors, 5 XML. That matches the carver summary exactly.
 
+`tools/bvh_rehydrate.py` (standard library only) turns a dehydrated BLAS back into the runtime layout on the CPU,
+from float3 vertices, `uint16`/`uint32` or no indices and an optional 3x4 geometry transform, following the packing
+in §4a. On the 8 measured samples whose geometry is identified, its output is byte-identical to what
+`XboxBvhBuilder.dll`'s `RehydrateRaytracingAccelerationStructureX` writes (384 to 2,512,512 bytes per structure). It
+is the reference for checking the builder's `Box16Rehydration`, `Box32Rehydration` and `LeafRehydration` programs on
+a GPU ([embedded_shaders.md](embedded_shaders.md)). Its tests are synthetic.
+
+The output keeps the console's size convention: `64 * (totalSizeIn64BNodes + 1)` bytes from the header, which is the
+`0x140 + 64 * n` end of §3.1 with the header at `0x100`. `tools/xdxr_bvh.py validate` and the GPU builder use
+`64 * totalSizeIn64BNodes` for the whole structure instead, so `validate` reports a rehydrated console structure as
+not covering its buffer.
+
+```powershell
+python -I tools/bvh_rehydrate.py <dehydrated.bin> --geom <vertices.f32>[,<indices.u32>] --out <rehydrated.bin>
+python -I tools/bvh_rehydrate.py <bvh4 stream> --header-offset 256 --geom ... --transform m00,...,m23 --out ...
+python -I tests/test_bvh_rehydrate.py
+```
+
 ## 7a. Building runtime BVHs: `tools/xdxr_bvh.py`
 
 The Vulkan layer has to write acceleration structures in this runtime layout, because the game's traversal shaders
