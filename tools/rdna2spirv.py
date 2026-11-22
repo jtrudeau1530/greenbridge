@@ -431,7 +431,10 @@ class Gen:
         selhi = next((m for m in mods if m.startswith("op_sel_hi:")), "op_sel_hi:[0,0,0]")
         sb = [int(x) for x in sel.split("[")[1].rstrip("]").split(",")]
         hb = [int(x) for x in selhi.split("[")[1].rstrip("]").split(",")]
-        return [self.f16_in(src, sb[i]) if hb[i] else self.src_f(src) for i, src in enumerate(a[1:4])]
+        # An f32 operand reads as a zero of its sign when it is denormal: the game's MODE flushes f32 denormals
+        # (denorm_mode_32 = 0), measured on gfx1036 for 0x00000001, 0x807fffff and the integer inline constants 1 and
+        # 64 used as f32 operands (@Sanonymous01, SHADER-298). The f16 operands widen to normal f32 values.
+        return [self.f16_in(src, sb[i]) if hb[i] else self.flush_f32(self.src_f(src)) for i, src in enumerate(a[1:4])]
 
     def f16_bits(self, f, rtz=False):
         """f32 ``f`` -> f16 bits in the low 16 bits of a %uint, computed with integer ops only (SHADER-56).
