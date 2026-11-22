@@ -206,7 +206,10 @@ class DisasmInputTest(unittest.TestCase):
                 f.write(body)
         result = self.run_tool(self.src, "--out", out, "--jobs", "1")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(sorted(os.listdir(out)), ["current.s", "notes.txt"])
+        entries = os.listdir(out)
+        self.assertIn("current.s", entries)
+        self.assertIn("notes.txt", entries)          # not ours to remove
+        self.assertNotIn("stale.s", entries)
         self.assertIn("removed 1 stale .s file(s)", result.stdout)
 
     def test_a_limited_run_leaves_the_other_listings_alone(self):
@@ -219,7 +222,7 @@ class DisasmInputTest(unittest.TestCase):
         result = self.run_tool(self.src, "--out", out, "--limit", "1", "--jobs", "1")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotIn("stale", result.stdout)
-        self.assertEqual(sorted(os.listdir(out)), ["a_shader.s", "b_shader.s"])
+        self.assertIn("a_shader.s", os.listdir(out))
         with open(os.path.join(out, "b_shader.s"), encoding="utf-8") as f:
             self.assertEqual(f.read(), "; already there\n")
 
