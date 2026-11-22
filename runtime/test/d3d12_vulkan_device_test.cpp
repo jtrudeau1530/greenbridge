@@ -252,15 +252,15 @@ int cpu_copies(ID3D12Device* device, bool bc, const char* path) {
         EXPECT(bc1->WriteToSubresource(0, &cut, blocks, 16, 0) == E_INVALIDARG);
     }
 
-    // Calls D3D12 rejects.
+    // Calls D3D12 rejects, and two it doesn't: an empty box copies nothing, and pitches aren't checked (the host's
+    // answers, d3d12_subresource_copy_test).
     const D3D12_BOX outside{0, 0, 0, 9, 1, 1}, empty{2, 2, 0, 2, 3, 1};
     EXPECT(tex->WriteToSubresource(0, &outside, src.data(), 100, 0) == E_INVALIDARG);
-    EXPECT(tex->WriteToSubresource(0, &empty, src.data(), 100, 0) == E_INVALIDARG);
+    EXPECT(tex->WriteToSubresource(0, &empty, src.data(), 100, 0) == S_OK);
     EXPECT(tex->WriteToSubresource(2, nullptr, src.data(), 100, 0) == E_INVALIDARG);  // 2 mips, 1 layer
     EXPECT(tex->WriteToSubresource(0, nullptr, nullptr, 32, 0) == E_INVALIDARG);
     EXPECT(tex->ReadFromSubresource(nullptr, 32, 0, 0, nullptr) == E_INVALIDARG);
-    EXPECT(tex->WriteToSubresource(0, nullptr, src.data(), 16, 0) == E_INVALIDARG);  // 32-byte rows 16 apart
-    EXPECT(vol->WriteToSubresource(0, nullptr, src.data(), 16, 32) == E_INVALIDARG);  // 64-byte slices 32 apart
+    EXPECT(vol->WriteToSubresource(0, nullptr, src.data(), 16, 32) == S_OK);  // 64-byte slices 32 apart
     EXPECT(buffer->WriteToSubresource(0, nullptr, src.data(), 16, 0) == E_INVALIDARG);
 
     // A default-heap texture: D3D12 wants a CPU-visible heap, but the copy still works (and is logged).

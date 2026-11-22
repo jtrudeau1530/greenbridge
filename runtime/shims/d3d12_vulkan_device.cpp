@@ -1684,8 +1684,10 @@ private:
         std::uint32_t slices;
     };
 
-    // The region a copy names, or false when D3D12 would reject it: an unknown subresource, a box outside the
-    // mip, or one that cuts a compressed block anywhere but at the mip edge.
+    // The region a copy names, or false when D3D12 would reject it: an unknown subresource, a box whose right,
+    // bottom or back edge lies past the mip's, or one that cuts a compressed block anywhere but at the mip edge.
+    // An empty or inverted box that passes those checks is no copy at all: `rows` and `slices` are 0, and the host
+    // runtime answers S_OK without touching a byte (d3d12_subresource_copy_test, RTX 3060 / 610.88).
     bool region(UINT subresource, const D3D12_BOX* box, Region& out) const {
         VkImageSubresourceRange range{};
         if (subresource == leonida::all_subresources || !leonida::image_range(binding_, subresource, range)) return false;
@@ -1695,15 +1697,19 @@ private:
         const std::uint32_t depth = binding_.volume ? std::max(1u, binding_.depth >> mip) : 1;
         out.box = box ? *box : D3D12_BOX{0, 0, 0, width, height, depth};
         const D3D12_BOX& b = out.box;
-        if (b.left >= b.right || b.top >= b.bottom || b.front >= b.back || b.right > width || b.bottom > height ||
-            b.back > depth)
-            return false;
+        if (b.right > width || b.bottom > height || b.back > depth) return false;
         out.block = leonida::copy_block_format(binding_, range.aspectMask);
         if (!out.block.bytes) return false;
         const std::uint32_t k = out.block.block;
         if (b.left % k || b.top % k || (b.right % k && b.right != width) || (b.bottom % k && b.bottom != height))
             return false;
         out.layers = {range.aspectMask, mip, range.baseArrayLayer, 1};
+        if (b.left >= b.right || b.top >= b.bottom || b.front >= b.back) {
+            out.rows = 0;
+            out.row_bytes = 0;
+            out.slices = 0;
+            return true;
+        }
         out.rows = (b.bottom - b.top + k - 1) / k;
         out.row_bytes = std::uint64_t((b.right - b.left + k - 1) / k) * out.block.bytes;
         out.slices = b.back - b.front;
@@ -1715,10 +1721,9 @@ private:
         if (!image_ || !data) return E_INVALIDARG;
         Region r{};
         if (!region(subresource, box, r)) return E_INVALIDARG;
-        // The application's rows and slices must not overlap.
-        if ((r.rows > 1 && row_pitch < r.row_bytes) ||
-            (r.slices > 1 && depth_pitch < std::uint64_t(r.rows - 1) * row_pitch + r.row_bytes))
-            return E_INVALIDARG;
+        if (!r.rows || !r.slices) return S_OK;  // an empty box: nothing to copy
+        // The pitches are not checked, as on the host runtime: rows or slices that overlap (a pitch smaller than a
+        // row, or 0) are copied in order, row by row and slice by slice, so on a read the last one wins.
         if (!cpu_visible())
             log_once(write ? "WriteToSubresource on a texture outside a CPU-visible heap; heap type"
                            : "ReadFromSubresource on a texture outside a CPU-visible heap; heap type",
