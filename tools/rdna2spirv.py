@@ -528,6 +528,46 @@ class Gen:
         self.emit(f"{r} = OpSelect %uint {is_z} {z} {lo}")
         return r
 
+    def f16_omod(self, h, mods):
+        """VOP3 mul:2 / mul:4 / div:2 on the rounded f16 bits ``h`` (low 16) of v_cvt_f16_f32, as an RX 6800 does it
+        (@shelbykb2 on #718): after the rounding and before clamp, so 65520 div:2 is inf. The hardware applies an omod
+        to an f16 result only with IEEE off and f16 denormals flushed, and a compiler emits one only for that mode (the
+        corpus argument of the f32 output modifier rows in docs/design.md), so this models that mode: a zero or
+        denormal f16, before or after the scaling, gives +0 (2^-15 mul:2 and -0 mul:2 measured 0x0000), inf and NaN
+        pass through, and a finite overflow gives inf (65504 under MODE toward zero, as f16_res)."""
+        k = next((m for m in mods if m in ("mul:2", "mul:4", "div:2")), None)
+        if k is None:
+            return h
+        d = {"mul:2": 1, "mul:4": 2, "div:2": -1}[k]
+        t = self.tmp
+        sh, e, special, tiny, scaled, r = t(), t(), t(), t(), t(), t()
+        self.emit(f"{sh} = OpShiftRightLogical %uint {h} {self.cu(10)}")
+        self.emit(f"{e} = OpBitwiseAnd %uint {sh} {self.cu(31)}")
+        self.emit(f"{special} = OpIEqual %bool {e} {self.cu(31)}")
+        # Zero and denormal results are flushed, and the omod makes -0 +0; div:2 takes exponent 1 to a denormal too.
+        self.emit(f"{tiny} = OpULessThan %bool {e} {self.cu(2 if d < 0 else 1)}")
+        if d < 0:
+            self.emit(f"{scaled} = OpISub %uint {h} {self.cu(1 << 10)}")
+        else:
+            add, sign, over, inf, big = t(), t(), t(), t(), t()
+            self.emit(f"{add} = OpIAdd %uint {h} {self.cu(d << 10)}")
+            self.emit(f"{sign} = OpBitwiseAnd %uint {h} {self.cu(0x8000)}")
+            self.emit(f"{over} = OpUGreaterThanEqual %bool {e} {self.cu(31 - d)}")
+            self.emit(f"{inf} = OpBitwiseOr %uint {sign} {self.cu(0x7C00)}")
+            if self.round_mode:
+                m, is_z, top, sel = t(), t(), t(), t()
+                self.emit(f"{m} = OpLoad %uint %mode_r16")
+                self.emit(f"{is_z} = OpIEqual %bool {m} {self.cu(3)}")
+                self.emit(f"{top} = OpBitwiseOr %uint {sign} {self.cu(0x7BFF)}")
+                self.emit(f"{sel} = OpSelect %uint {is_z} {top} {inf}")
+                inf = sel
+            self.emit(f"{big} = OpSelect %uint {over} {inf} {add}")
+            scaled = big
+        z = t()
+        self.emit(f"{z} = OpSelect %uint {tiny} {self.cu(0)} {scaled}")
+        self.emit(f"{r} = OpSelect %uint {special} {h} {z}")
+        return r
+
     def sum_toward_zero(self, x, y, r):
         """f32 ``r`` = x + y (nearest even) for an f16 add/sub that will be narrowed by f16_res. Under MODE toward zero
         the f32 rounding must not decide the f16 result: x + y = 2 - 2^-24 rounds to 2.0 in f32, but toward zero
@@ -4120,8 +4160,16 @@ class Gen:
         elif op == "v_cvt_f16_f32":
             # Low 16 bits get the f16; on GFX10 the high half is kept (partial write: Mesa ACO instr_is_16bit lists
             # v_cvt_f16_f32 as 16-bit for gfx_level >= GFX10).
+            # VOP3 omod and clamp apply to the f16 (ACO: dst(F16)), in the order an RX 6800 applies them: round, omod
+            # (f16_omod), then clamp. They were dropped until 2026-11-22.
             x = self.src_f(a[1])
-            self.write_lo16(a[0], self.f16_res(x))
+            h = self.f16_omod(self.f16_res(x), mods)
+            if "clamp" in mods:
+                v2, f = self.tmp(), self.tmp()
+                self.emit(f"{v2} = OpExtInst %v2float %glsl UnpackHalf2x16 {h}")
+                self.emit(f"{f} = OpCompositeExtract %float {v2} 0")
+                h = self.f16_bits(self.clamp_mods(f, ["clamp"]))     # exact: the clamped value is an f16
+            self.write_lo16(a[0], h)
         elif op == "s_mulk_i32":
             v = a[1]["v"] & 0xFFFF
             k = v - 0x10000 if v & 0x8000 else v
