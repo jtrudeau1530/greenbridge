@@ -17,6 +17,7 @@
 
 #include <array>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <string>
@@ -526,7 +527,10 @@ const Pixel readlane_expected = {0x40000079u, 0x40000010u, 0x40000064u, 0x400000
 
 int main() {
     vktest::Device d;
-    EXPECT(d.create());
+    if (!d.create()) {  // no Vulkan loader or no 1.3 device: nothing to test (ctest: skipped)
+        std::fprintf(stderr, "d3d12_subgroup_test: no Vulkan device, skipped\n");
+        return 77;
+    }
     const leonida::SubgroupSizeCaps& caps = d.subgroup;
     leonida::SubgroupSizeCaps off = caps;  // the control: the layer knows nothing of the device's sizes
     off.min_size = off.max_size = off.default_size = 0;

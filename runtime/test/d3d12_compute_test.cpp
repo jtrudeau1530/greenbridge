@@ -14,6 +14,7 @@
 #include "../shims/d3d12_xs_device.h"
 
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -137,7 +138,10 @@ D3D12_RESOURCE_BARRIER transition(ID3D12Resource* resource, D3D12_RESOURCE_STATE
 
 int main() {
     vktest::Device d;
-    EXPECT(d.create());
+    if (!d.create()) {  // no Vulkan loader or no 1.3 device: nothing to test (ctest: skipped)
+        std::fprintf(stderr, "d3d12_compute_test: no Vulkan device, skipped\n");
+        return 77;
+    }
 
     // The shader program the PSO carries, and a translator index that maps its hash to the test module.
     constexpr std::uint32_t code_word = 5000;

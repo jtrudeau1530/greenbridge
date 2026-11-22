@@ -31,7 +31,11 @@ import sys
 import zlib
 
 KEY = re.compile(rb'"\$0x([0-9a-fA-F]{8})"')
-IDENT = re.compile(rb"[A-Za-z_][A-Za-z0-9_]{1,80}")
+# A whole run of identifier characters. With a bound inside the pattern ({1,80}) a longer name was cut after 81
+# characters and the search went on in what was left, so one 89-character name became two names nobody wrote
+# and the real one was never hashed. Runs past IDENT_MAX are not names (encoded blobs) and are left out whole.
+IDENT = re.compile(rb"[A-Za-z_][A-Za-z0-9_]+")
+IDENT_MAX = 255
 WORD = re.compile(r"[A-Z]?[a-z]+|[A-Z]+(?![a-z])|\d+")
 M32 = 0xFFFFFFFF
 
@@ -199,13 +203,18 @@ def collect_keys(paths):
     return keys
 
 
+def identifiers(data):
+    """The identifier-like strings in `data`, each a whole run (see IDENT)."""
+    return (m.group(0) for m in IDENT.finditer(data) if m.end() - m.start() <= IDENT_MAX)
+
+
 def harvest(paths):
     """Identifier-like strings from raw bytes and from every zlib stream found in them."""
     out = set()
     zhdr = re.compile(rb"\x78[\x01\x5e\x9c\xda]")
     for p in paths:
         d = read(p)
-        out.update(m.group(0) for m in IDENT.finditer(d))
+        out.update(identifiers(d))
         pos = 0
         while True:
             m = zhdr.search(d, pos)
@@ -215,7 +224,7 @@ def harvest(paths):
                 z = zlib.decompressobj()
                 data = z.decompress(d[m.start():m.start() + (8 << 20)], 64 << 20)
                 if z.eof and data:
-                    out.update(x.group(0) for x in IDENT.finditer(data))
+                    out.update(identifiers(data))
                     pos = m.start() + max(2, len(d[m.start():m.start() + (8 << 20)]) - len(z.unused_data))
                     continue
             except zlib.error:

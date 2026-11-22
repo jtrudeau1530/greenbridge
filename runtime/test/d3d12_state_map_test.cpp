@@ -191,6 +191,11 @@ int main() {
     CHECK(layout(s::generic_read) == VK_IMAGE_LAYOUT_GENERAL);
 
     // Accesses and stages.
+    const auto cb = vulkan_access(s::vertex_and_constant_buffer, false);
+    CHECK(cb.access & VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT);
+    CHECK(cb.access & VK_ACCESS_UNIFORM_READ_BIT);
+    CHECK(cb.access & VK_ACCESS_SHADER_READ_BIT);  // root CBV loaded through a physical storage buffer
+    CHECK(cb.stages & VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT);
     const auto rt = vulkan_access(s::render_target, false);
     CHECK(rt.access == (VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT));
     CHECK(rt.stages == VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
@@ -304,6 +309,9 @@ int main() {
           (VK_PIPELINE_STAGE_2_COPY_BIT | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT));
     CHECK(vulkan_sync(y::raytracing) == VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);
     CHECK(vulkan_barrier_access(a::no_access) == VK_ACCESS_2_NONE);
+    const auto cb_scope = vulkan_barrier_scope(y::pixel_shading, a::constant_buffer);
+    CHECK(cb_scope.access == (VK_ACCESS_2_UNIFORM_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT));
+    CHECK(cb_scope.stages == VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT);
     CHECK(vulkan_barrier_access(a::common) == (VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT));
     CHECK(vulkan_barrier_access(a::copy_source | a::shader_resource) ==
           (VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_SHADER_READ_BIT));
@@ -434,6 +442,62 @@ int main() {
         CHECK(past.discard({3, 4, 3, false}));
         CHECK(past.close());
         CHECK(prepare(past, resolve, ReplayFunctions{}, prepared) == ReplayResult::invalid_subresource);
+    }
+
+    // Indirect argument and count resources can occupy different slices of one Vulkan buffer.
+    {
+        ResourceBinding arguments{}, counts{};
+        arguments.buffer = counts.buffer = reinterpret_cast<VkBuffer>(std::uintptr_t{1});
+        arguments.buffer_offset = 256;
+        arguments.size = 128;
+        counts.buffer_offset = 512;
+        counts.size = 16;
+        const auto resolve = [&](ResourceId id) -> const ResourceBinding* {
+            if (id == 1) return &arguments;
+            if (id == 2) return &counts;
+            return nullptr;
+        };
+
+        static std::vector<VkDeviceSize> offsets;
+        ReplayFunctions vk{};
+        vk.draw_indirect = [](VkCommandBuffer, VkBuffer, VkDeviceSize offset, std::uint32_t, std::uint32_t) {
+            offsets.push_back(offset);
+        };
+        vk.draw_indexed_indirect = vk.draw_indirect;
+        vk.draw_indirect_count = [](VkCommandBuffer, VkBuffer, VkDeviceSize offset, VkBuffer,
+                                    VkDeviceSize count_offset, std::uint32_t, std::uint32_t) {
+            offsets.push_back(offset);
+            offsets.push_back(count_offset);
+        };
+        vk.draw_indexed_indirect_count = vk.draw_indirect_count;
+        vk.dispatch_indirect = [](VkCommandBuffer, VkBuffer, VkDeviceSize offset) {
+            offsets.push_back(offset);
+        };
+
+        CommandList list;
+        CHECK(list.execute_indirect({IndirectKind::draw, 16, 2, 1, 4, 0, 0}));
+        CHECK(list.execute_indirect({IndirectKind::draw_indexed, 20, 2, 1, 8, 0, 0}));
+        CHECK(list.execute_indirect({IndirectKind::draw, 16, 2, 1, 12, 2, 4}));
+        CHECK(list.execute_indirect({IndirectKind::draw_indexed, 20, 2, 1, 16, 2, 8}));
+        CHECK(list.execute_indirect({IndirectKind::dispatch, 20, 2, 1, 20, 0, 0}));
+        CHECK(list.close());
+        CHECK(replay(list, VK_NULL_HANDLE, resolve, vk) == ReplayResult::success);
+        const std::vector<VkDeviceSize> expected{260, 264, 268, 516, 272, 520, 276, 296};
+        CHECK(offsets == expected);
+
+        // Reject invalid spans before invoking Vulkan, including after adding the backing-buffer base.
+        const auto rejected = [&](const ExecuteIndirect& command) {
+            CommandList invalid;
+            return invalid.execute_indirect(command) && invalid.close() &&
+                   replay(invalid, VK_NULL_HANDLE, resolve, vk) == ReplayResult::invalid_indirect_arguments;
+        };
+        CHECK(rejected({IndirectKind::draw, 12, 1, 1, 0, 0, 0}));
+        CHECK(rejected({IndirectKind::draw, 16, 1, 1, 2, 0, 0}));
+        CHECK(rejected({IndirectKind::draw, 16, 2, 1, 112, 0, 0}));
+        CHECK(rejected({IndirectKind::draw, 16, 1, 1, 4, 2, 16}));
+        arguments.buffer_offset = UINT64_MAX - 3;
+        CHECK(rejected({IndirectKind::dispatch, 12, 1, 1, 0, 0, 0}));
+        CHECK(offsets == expected);
     }
 
     // Resizable BAR detection (D3D-96) on the heap layouts real cards report.

@@ -166,10 +166,14 @@ def music_channels(d: bytes, mus, data, collect_packets: bool = True):
     divided by the packet channel count when the Opus packets are stereo. `packet channels` is read from the
     Opus TOC stereo bit (bit 2) and defaults to 1 when no packet is present.
 
-    collect_packets=False keeps the packet lists empty for metadata-only callers (awc_manifest.py)."""
+    collect_packets=False keeps the packet lists empty for metadata-only callers (awc_manifest.py).
+    A descriptor whose declared blocks or subblock runs do not fit its data tag is rejected ([]), so a
+    corrupt descriptor cannot read past the tag into a sibling stream or past the end of the bank."""
     (m_at, m_size), (d_at, d_size) = mus, data
     blocks, chunk, channels = struct.unpack_from("<III", d, m_at)
     if not (1 <= channels <= 32 and 1 <= blocks and chunk >= 2048 and m_size == 12 + 16 * channels):
+        return []
+    if blocks * chunk > d_size:
         return []
     info = []
     for c in range(channels):
@@ -183,6 +187,8 @@ def music_channels(d: bytes, mus, data, collect_packets: bool = True):
         recs = [struct.unpack_from("<III", d, at + 24 * c + 4)[:2] for c in range(channels)]   # (count, skip)
         total = sum(r[0] for r in recs)
         header = (channels * 24 + total * 4 + 2047) & ~2047
+        if header + total * 2048 > d_size - b * chunk:
+            return []
         before = 0
         for c, (count, skip) in enumerate(recs):
             start = at + header + before * 2048

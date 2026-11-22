@@ -41,7 +41,10 @@ struct Vertex {
 
 int main() {
     vktest::Device d;
-    EXPECT(d.create());
+    if (!d.create()) {  // no Vulkan loader or no 1.3 device: nothing to test (ctest: skipped)
+        std::fprintf(stderr, "d3d12_draw_test: no Vulkan device, skipped\n");
+        return 77;
+    }
 
     // Shader programs and the index that maps their hashes to the compiled test modules.
     const auto vs_program = fssm_program({0x56530001, 0xbf810000});

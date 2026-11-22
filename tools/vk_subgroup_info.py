@@ -13,9 +13,9 @@ that is not checked here. vk_pipeline_check picks by device type only, so on a P
 stage can run on another GPU than the one asked here. VK_LOADER_DRIVERS_SELECT (e.g. '*amd*') narrows which
 drivers the loader offers.
 
-native64 matches vk_pipeline_check's can_require_sg(64, bit) for the compute and the mesh stage: the
-subgroupSizeControl feature, minSubgroupSize <= 64 <= maxSubgroupSize, and the stage in requiredSubgroupSizeStages.
-Mesh shaders are always wave64 natively, so both stage bits are needed.
+native64 matches the current translated SPIR-V 1.5 modules, which do not allow varying subgroup sizes: either 64 can
+be required for both compute and mesh, or the default subgroupSize is 64 and subgroup operations are supported in
+both stages. SPIR-V 1.6 modules or stages created with ALLOW_VARYING_SUBGROUP_SIZE need a different check.
 """
 import ctypes
 import json
@@ -26,6 +26,7 @@ VK_STRUCTURE_TYPE_APPLICATION_INFO = 0
 VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO = 1
 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2 = 1000059000
 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2 = 1000059001
+VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES = 1000094000
 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES = 51
 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES = 53
 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES = 1000225000
@@ -69,6 +70,12 @@ class SubgroupSizeControl(ctypes.Structure):
     _fields_ = [("sType", ctypes.c_uint32), ("pNext", ctypes.c_void_p), ("minSubgroupSize", ctypes.c_uint32),
                 ("maxSubgroupSize", ctypes.c_uint32), ("maxComputeWorkgroupSubgroups", ctypes.c_uint32),
                 ("requiredSubgroupSizeStages", ctypes.c_uint32)]
+
+
+class SubgroupProperties(ctypes.Structure):
+    _fields_ = [("sType", ctypes.c_uint32), ("pNext", ctypes.c_void_p), ("subgroupSize", ctypes.c_uint32),
+                ("supportedStages", ctypes.c_uint32), ("supportedOperations", ctypes.c_uint32),
+                ("quadOperationsInAllStages", ctypes.c_uint32)]
 
 
 def block(size: int, stype: int):
@@ -147,8 +154,11 @@ def query() -> dict:
         for d in devs:
             d = ctypes.c_void_p(d)
             sg = SubgroupSizeControl(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES)
+            subgroup = SubgroupProperties()
+            subgroup.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES
+            subgroup.pNext = ctypes.addressof(sg)
             props = block(16 + PROPS_SIZE, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2)
-            ctypes.c_void_p.from_buffer(props, 8).value = ctypes.addressof(sg)
+            set_next(props, subgroup)
             vk.vkGetPhysicalDeviceProperties2(d, props)
             raw = bytes(props)[16:]
             if int.from_bytes(raw[PROPS_API_VERSION:PROPS_API_VERSION + 4], "little") < VK_API_VERSION_1_3:
@@ -172,16 +182,30 @@ def query() -> dict:
             # the runtime's rule: the first usable device, replaced by every later discrete GPU
             if chosen is None or dtype == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU:
                 chosen = (raw[PROPS_DEVICE_NAME:PROPS_DEVICE_NAME + 256].split(b"\0")[0].decode("utf-8", "replace"),
-                          sg.minSubgroupSize, sg.maxSubgroupSize, sg.requiredSubgroupSizeStages,
-                          bool(u32(f13, F13_SUBGROUP_SIZE_CONTROL)))
+                          subgroup.subgroupSize, subgroup.supportedStages, sg.minSubgroupSize, sg.maxSubgroupSize,
+                          sg.requiredSubgroupSizeStages, bool(u32(f13, F13_SUBGROUP_SIZE_CONTROL)))
         if chosen is None:
             raise RuntimeError("no Vulkan 1.3 GPU with the features and graphics queue the runtime needs")
-        name, lo, hi, stages, sgc = chosen
-        comp = bool(stages & VK_SHADER_STAGE_COMPUTE_BIT)
-        mesh = bool(stages & VK_SHADER_STAGE_MESH_BIT_EXT)
-        return {"device": name, "min_subgroup_size": lo, "max_subgroup_size": hi,
-                "subgroup_size_control": sgc, "compute_in_required_stages": comp, "mesh_in_required_stages": mesh,
-                "native64": sgc and lo <= 64 <= hi and comp and mesh}
+        name, subgroup_size, supported_stages, lo, hi, required_stages, sgc = chosen
+        compute_required = bool(required_stages & VK_SHADER_STAGE_COMPUTE_BIT)
+        mesh_required = bool(required_stages & VK_SHADER_STAGE_MESH_BIT_EXT)
+        compute_supported = bool(supported_stages & VK_SHADER_STAGE_COMPUTE_BIT)
+        mesh_supported = bool(supported_stages & VK_SHADER_STAGE_MESH_BIT_EXT)
+        can_require_64 = (sgc and lo <= 64 <= hi and compute_required and mesh_required and
+                          compute_supported and mesh_supported)
+        has_default_64 = subgroup_size == 64 and compute_supported and mesh_supported
+        return {
+            "device": name,
+            "subgroup_size": subgroup_size,
+            "min_subgroup_size": lo,
+            "max_subgroup_size": hi,
+            "subgroup_size_control": sgc,
+            "compute_in_required_stages": compute_required,
+            "mesh_in_required_stages": mesh_required,
+            "compute_in_supported_stages": compute_supported,
+            "mesh_in_supported_stages": mesh_supported,
+            "native64": bool(can_require_64 or has_default_64),
+        }
     finally:
         vk.vkDestroyInstance(inst, None)
 

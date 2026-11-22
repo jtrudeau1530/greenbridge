@@ -4,6 +4,7 @@
 // device does not enable pipelineStatisticsQuery). No game data or shaders. Run explicitly (needs Vulkan
 // hardware); LEONIDA_VK_VALIDATION=1 checks Vulkan usage.
 #include "vk_test_device.h"
+#include "host_wine.h"
 #include "../shims/d3d12_com.h"
 #include <dxgi1_4.h>
 #include <cstdio>
@@ -285,6 +286,7 @@ int main() {
     if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory.p)))) return 1;
     unsigned differ = 0;
     for (const bool warp : {false, true}) {
+        if (hostwine::host_is_wine()) break;
         Ref<IDXGIAdapter> adapter;
         Ref<ID3D12Device> host;
         if (warp && FAILED(factory->EnumWarpAdapter(IID_PPV_ARGS(&adapter.p)))) continue;
