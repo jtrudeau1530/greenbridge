@@ -3,8 +3,9 @@
 // moves the back buffer PRESENT -> RENDER_TARGET, clears it, moves it back, executes, presents and signals a fence.
 // The window is then resized, which recreates the swapchain and scales the blit. The presented images are copied
 // back (the presenter's capture) and must hold the clear colour at the swapchain's size. Last, the colour on screen
-// is read back with GDI when the window is in front, the display is in SDR and GDI can read the screen (skipped
-// otherwise, e.g. in HDR, on a locked desktop or under Wine's macOS driver). No shaders or game data.
+// is read back with GDI on native Windows when the window is in front, the display is in SDR and GDI can read the
+// screen. Under Wine, rootless XWayland can return black for desktop reads, so the swapchain checks confirm the
+// colour there. No shaders or game data.
 // Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation; any validation error fails the test.
 #include "vk_test_device.h"
 #include "../shims/d3d12_com.h"
@@ -461,13 +462,16 @@ int main() {
                     "(%u real out-of-date presents)\n",
                     real_out_of_date);
 
-        // What reached the screen: the centre of the client area, if the window is in front. This needs GDI to read
-        // the screen, which not every window system gives it: under Wine's macOS driver the screen DC reads nothing
-        // (GetPixel returns CLR_INVALID even for a pixel GDI itself painted), so there the swapchain checks above are
-        // what confirms the colour.
-        Sleep(200);
-        pump();
-        if (GetForegroundWindow() == window && !IsIconic(window)) {
+        // Wine's desktop GDI read can return black even when the compositor presents the right colour.
+        // The swapchain checks above also cover Wine drivers that cannot read the desktop at all.
+        const bool wine = GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "wine_get_version") != nullptr;
+        if (!wine) {
+            Sleep(200);
+            pump();
+        }
+        if (wine) {
+            std::printf("Wine: on-screen colour check skipped after swapchain readback\n");
+        } else if (GetForegroundWindow() == window && !IsIconic(window)) {
             if (is_hdr_monitor(window)) {
                 std::printf("the monitor is in HDR mode: on-screen colour check skipped\n");
             } else {

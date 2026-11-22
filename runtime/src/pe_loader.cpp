@@ -65,7 +65,8 @@ uint64_t rva_in(const Module& m, uint64_t va, const char* what) {
 
 IMAGE_TLS_DIRECTORY64* tls_directory(Module& m) {
     auto* nt = at<IMAGE_NT_HEADERS64>(m.base, reinterpret_cast<IMAGE_DOS_HEADER*>(m.base)->e_lfanew);
-    const auto& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS];
+    // Through directory(), as every other directory: an entry past NumberOfRvaAndSizes is not a TLS directory.
+    const auto dir = directory(nt, IMAGE_DIRECTORY_ENTRY_TLS);
     if (!dir.Size || !dir.VirtualAddress) return nullptr;
     require_range(m.name, dir.VirtualAddress, sizeof(IMAGE_TLS_DIRECTORY64), m.size, "the TLS directory");
     return at<IMAGE_TLS_DIRECTORY64>(m.base, dir.VirtualAddress);
@@ -696,7 +697,6 @@ void Loader::initialise(Module& m) {
     // Only a DLL gets DllMain. An EXE's entry point has a different signature and is the caller's to run.
     auto* nt = at<IMAGE_NT_HEADERS64>(m.base, reinterpret_cast<IMAGE_DOS_HEADER*>(m.base)->e_lfanew);
     if ((nt->FileHeader.Characteristics & IMAGE_FILE_DLL) && m.entry_rva) {
-        if (m.entry_rva >= m.size) throw std::runtime_error(m.name + ": the entry point is outside the image");
         auto entry = reinterpret_cast<BOOL(NTAPI*)(void*, DWORD, void*)>(m.base + m.entry_rva);
         const BOOL ok = entry(m.base, DLL_PROCESS_ATTACH, nullptr);
         if (startup_trace::enabled())
@@ -741,6 +741,8 @@ Module& Loader::map_image(const std::filesystem::path& path) {
     if (!oh.SizeOfImage || oh.SizeOfHeaders < headers_end || oh.SizeOfHeaders > oh.SizeOfImage ||
         oh.SizeOfHeaders > file.size())
         throw std::runtime_error(name + ": SizeOfHeaders and SizeOfImage don't fit the headers and file");
+    if (oh.AddressOfEntryPoint && oh.AddressOfEntryPoint >= oh.SizeOfImage)
+        throw std::runtime_error(name + ": the entry point is outside the image");
 
     auto* m = new Module;
     m->name = name;

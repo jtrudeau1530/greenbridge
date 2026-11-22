@@ -1,7 +1,7 @@
 # Converts carved PSO ('PSIN') and RBF ('RBF0') metadata blobs to XML with CodeWalker.Core's parsers.
 # Run in Windows PowerShell 5.1.
 #   .\meta_to_xml.ps1 -Carve <work>\carve -Out <work>\meta [-Limit N]
-# Each blob becomes <Out>\<archive>\<offset>.xml. Failures go to <Out>\failures.txt with the parser's message.
+# Each blob becomes <Out>\<archive>\<offset>.xml. Failures go to <Out>\failures.txt with the error message.
 param(
     [string]$Carve = "<work>\carve",
     [string]$Out = "<work>\meta",
@@ -29,9 +29,9 @@ foreach ($dir in Get-ChildItem -LiteralPath $Carve -Directory) {
         if ($Limit -and $n -ge $Limit) { break }
         $n++
         $name = "{0:x12}" -f [int64]$r.off
-        $bytes = [IO.File]::ReadAllBytes((Join-Path $dir.FullName "$name.bin"))
         $kind = if ($r.head.StartsWith("5053494e")) { "pso" } else { "rbf" }
         try {
+            $bytes = [IO.File]::ReadAllBytes((Join-Path $dir.FullName "$name.bin"))
             if ($kind -eq "pso") {
                 $f = New-Object CodeWalker.GameFiles.PsoFile; $f.Load($bytes)
                 $xml = [CodeWalker.GameFiles.PsoXml]::GetXml($f)

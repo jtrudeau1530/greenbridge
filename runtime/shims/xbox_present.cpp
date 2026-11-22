@@ -1,5 +1,7 @@
 #include "xbox_present.h"
 
+#include "../src/vulkan_present.h"
+
 #include <cstdio>
 
 namespace rt::d3d12 {
@@ -79,6 +81,13 @@ HRESULT XboxPresentation::PresentX(UINT plane_count, const XboxPresentPlaneParam
         const XboxPresentPlaneParameters& plane = planes[i];
         if (plane.Token != token || plane.ResourceCount == 0 || !plane.ppResources || !plane.ppResources[0])
             return E_INVALIDARG;
+        // Both paths read ppResources[0] only: a plane with several resources would silently lose the others and could show
+        // the wrong frame, so it is refused (before anything is presented) until it is modelled. What the console does
+        // with ResourceCount above 1 (views? stereo?) is unmeasured.
+        if (plane.ResourceCount != 1) {
+            log_once(logged_resource_count_, "PresentX plane with ResourceCount other than 1: not implemented, refused");
+            return DXGI_ERROR_UNSUPPORTED;
+        }
     }
     // Only a token that was never handed out is refused. Null, stale and repeated tokens are presented anyway (what the
     // console does with them is unmeasured, and a title that does it must not freeze); each kind is logged once.
@@ -99,6 +108,90 @@ HRESULT XboxPresentation::PresentX(UINT plane_count, const XboxPresentPlaneParam
         break;
     }
 
+    // What each plane asks for. Colour spaces other than HDR10 are composed as the SDR default (logged once).
+    const auto is_hdr10 = [&](const XboxPresentPlaneParameters& p) {
+        if (p.ColorSpace != xbox_color_space_g22_p709 && p.ColorSpace != xbox_color_space_g2084_p2020)
+            log_once(logged_color_space_, "a present plane's DXGI colour space is neither G22/P709 nor G2084/P2020: composed as SDR G22/P709");
+        return p.ColorSpace == xbox_color_space_g2084_p2020;
+    };
+    // The extra fields are unmeasured, so they are read defensively: a placement that is not a sane sub-rectangle of the output
+    // (also NaN) counts as none, an unknown filter as the default, unknown flag bits are ignored, extended descriptors are
+    // not read; each is logged once and the frame is shown anyway (a title must not freeze on a field we misread).
+    const auto placement = [&](const XboxPresentPlaneParameters& p) -> const XboxViewRect* {
+        const XboxViewRect* r = p.pDestPlacementBase;
+        if (!r) return nullptr;
+        if (!(r->left >= 0.0f && r->left < r->right && r->right <= 1.0f && r->top >= 0.0f && r->top < r->bottom &&
+              r->bottom <= 1.0f)) {
+            log_once(logged_extras_, "a present plane's pDestPlacementBase is not a sub-rectangle of 0..1: ignored (whole output)");
+            return nullptr;
+        }
+        return (r->left == 0.0f && r->top == 0.0f && r->right == 1.0f && r->bottom == 1.0f) ? nullptr : r;
+    };
+    const auto filter_of = [&](const XboxPresentPlaneParameters& p) {
+        if (p.ScaleFilter == xbox_scale_filter_point || p.ScaleFilter == xbox_scale_filter_linear) return p.ScaleFilter;
+        if (p.ScaleFilter != xbox_scale_filter_default)
+            log_once(logged_extras_, "a present plane's ScaleFilter is not a known value: default filter");
+        return int(xbox_scale_filter_default);
+    };
+    for (UINT i = 0; i < plane_count; ++i)
+        if (planes[i].ExtendedDescCount)
+            log_once(logged_extras_, "a present plane has extended descriptors: ignored");
+    const bool hdr0 = is_hdr10(planes[0]);
+    // Plane 1 is composed over plane 0 only when flagged an overlay (hypothesis). Otherwise it is not shown, as before: in
+    // the public HDR sample it is the GameDVR copy of the frame, and blending a plane we cannot tell apart from it risks
+    // drawing the frame twice with an alpha that was never meant to be blended.
+    const bool overlay = plane_count == 2 && (planes[1].Flags & xbox_plane_flag_overlay) != 0;
+    if (plane_count == 2 && !overlay)
+        log_once(logged_planes_, "PresentX with 2 planes and no overlay flag on plane 1: only plane 0 is shown (plane 1 is taken "
+                                 "as the GameDVR copy of the frame)");
+    const bool compose = hdr0 || placement(planes[0]) || filter_of(planes[0]) != xbox_scale_filter_default || overlay;
+
+    if (compose) {
+        // Every shown plane: a 2D texture, a source rectangle inside it, a placement inside the output.
+        leonida::PresentPlanes composed;
+        composed.count = overlay ? 2 : 1;
+        composed.sdr_white_nits = sdr_white_nits_;
+        for (UINT i = 0; i < composed.count; ++i) {
+            const XboxPresentPlaneParameters& p = planes[i];
+            ID3D12Resource* source = p.ppResources[0];
+            const D3D12_RESOURCE_DESC source_desc = source->GetDesc();
+            if (source_desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D) return E_INVALIDARG;
+            const D3D12_RECT* source_rect = p.pSrcViewRects;
+            if (source_rect && (source_rect->left < 0 || source_rect->top < 0 || source_rect->left >= source_rect->right ||
+                                source_rect->top >= source_rect->bottom || UINT64(source_rect->right) > source_desc.Width ||
+                                UINT(source_rect->bottom) > source_desc.Height))
+                return E_INVALIDARG;
+            const XboxViewRect* place = placement(p);
+            leonida::PresentPlane& out = composed.plane[i];
+            out.source = resource_id(source);
+            if (source_rect) {
+                out.source_rect = {source_rect->left, source_rect->top, source_rect->right, source_rect->bottom};
+                out.has_source_rect = true;
+            }
+            if (place) {
+                out.dest[0] = place->left;
+                out.dest[1] = place->top;
+                out.dest[2] = place->right;
+                out.dest[3] = place->bottom;
+            }
+            out.point_filter = filter_of(p) == xbox_scale_filter_point;
+            out.hdr10 = is_hdr10(p);
+            out.straight_alpha = (p.Flags & xbox_plane_flag_straight_alpha) != 0;
+        }
+        bool tear = false;
+        if (wants_tear && sync_interval > 0 && presenter_->tear_supported()) {
+            const FramePacer::PresentTiming timing = pacer_.present_timing(token);
+            tear = leonida::decide_present_sync(timing.late_us, timing.period_us, threshold) == leonida::PresentSync::immediate;
+        }
+        const HRESULT result = presenter_->present_planes(composed, sync_interval, tear);
+        if (FAILED(result)) return pacer_.suspended() ? from_pacer(hr::invalid_state) : result;
+        pacer_.commit_present_token(token, plane_count,
+                                    tear && presenter_->last_present_tore() ? leonida::PresentSync::immediate
+                                                                            : leonida::PresentSync::vblank);
+        ++presents_;
+        return S_OK;
+    }
+
     const XboxPresentPlaneParameters& plane = planes[0];
     ID3D12Resource* resource = plane.ppResources[0];
     const D3D12_RESOURCE_DESC desc = resource->GetDesc();
@@ -112,9 +205,6 @@ HRESULT XboxPresentation::PresentX(UINT plane_count, const XboxPresentPlaneParam
     if (rect && (rect->left < 0 || rect->top < 0 || rect->left >= rect->right || rect->top >= rect->bottom ||
                  UINT64(rect->right) > desc.Width || UINT(rect->bottom) > desc.Height))
         return E_INVALIDARG;
-
-    if (plane_count == 2)
-        log_once(logged_planes_, "PresentX with 2 planes: only plane 0 is shown; HDR/GameDVR plane composition is not implemented");
 
     // How late the frame is, now that everything that can refuse it has: past the vblank it was due at, by what part of
     // the interval the scan has moved on. The presenter says whether it really queued it as a tear.

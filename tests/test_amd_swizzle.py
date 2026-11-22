@@ -7,6 +7,7 @@ import pytest  # noqa: E402 (keeps the CI bash loop from running this file)
 import os
 import sys
 import tempfile
+from pathlib import Path
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tools"))
 
@@ -141,3 +142,46 @@ def test_cli_detiles_4k_tables_with_4k_blocks():
     lines = p.stdout.splitlines()
     assert [ln.split()[1] for ln in lines] == ["GFX10_SW_4K_S_PATINFO"], p.stdout
     assert float(lines[0].split()[0]) == round(score(linear[..., :3].astype(np.float32)), 2), p.stdout
+
+
+def test_preview_keeps_partial_bc_blocks(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import struct
+
+    image = pytest.importorskip("PIL.Image")
+    preview = tmp_path / "preview.png"
+    tile = bytearray(4096)
+    colors = (
+        (0xF800, 0xF800, 0x07E0),
+        (0xF800, 0xF800, 0x07E0),
+        (0x001F, 0x001F, 0xFFFF),
+    )
+    for y, row in enumerate(colors):
+        for x, color in enumerate(row):
+            struct.pack_into("<HHI", tile, 8 * (32 * y + x), color, color, 0)
+    (tmp_path / "blob.bin").write_bytes(tile)
+
+    # A 4 KiB tile with 32 blocks per row and 16 rows.
+    rows = {
+        "NIBBLE01": ["0", "0", "0", "X0", "X1", "X2", "X3", "X4"],
+        "NIBBLE2": ["Y0", "Y1", "Y2", "Y3"],
+        "NIBBLE3": ["0"] * 4,
+        "NIBBLE4": ["0"] * 4,
+    }
+    header_path = tmp_path / "swizzle.h"
+    header_path.write_text(
+        "".join(table(name, [row]) for name, row in rows.items())
+        + "const ADDR_SW_PATINFO GFX10_SW_4K_S_PATINFO[] =\n{\n"
+        "    {   0,    0,    0,    0,    0, } , // synthetic 8 bpe\n};\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("AMD_SWIZZLE_HEADER", str(header_path))
+
+    result = cli(tmp_path, "--width", "9", "--height", "9", "--modes", "4K", "--out", str(preview))
+
+    assert result.returncode == 0, result.stderr
+    with image.open(preview) as png:
+        assert png.size == (9, 9)
+        assert png.getpixel((7, 7)) == (255, 0, 0)
+        assert png.getpixel((8, 7)) == (0, 255, 0)
+        assert png.getpixel((7, 8)) == (0, 0, 255)
+        assert png.getpixel((8, 8)) == (255, 255, 255)

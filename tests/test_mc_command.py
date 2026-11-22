@@ -40,6 +40,13 @@ class SplitCommandTest(unittest.TestCase):
             want = ["/opt/llvm 21/bin/llvm-mc", "--version"]
         self.assertEqual(mc_command.split_command(raw), want)
 
+    def test_windows_quoted_option_value_keeps_spaces_and_backslashes(self) -> None:
+        executable = r"C:\Program Files\LLVM\bin\llvm-mc.exe"
+        output = r"C:\shader builds\listing.s"
+        raw = f'"{executable}" -o="{output}" -show-encoding'
+        with mock.patch.object(mc_command.os, "name", "nt"):
+            self.assertEqual(mc_command.split_command(raw), [executable, f"-o={output}", "-show-encoding"])
+
     def test_path_with_spaces_is_kept_whole(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "llvm mc")
