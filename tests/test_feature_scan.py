@@ -249,7 +249,7 @@ def test_duplicate_shader_names_keep_file_stages():
                        capture_output=True, text=True, check=True)
         with open(out, encoding="utf-8") as f:
             ordered = json.load(f)["disasm"]["ordered_or_gws_shaders"]
-        assert ordered == {"gs": 1, "ms": 1}, f"ordered-count shaders keep their file stages: {ordered}"
+        check(ordered == {"gs": 1, "ms": 1}, f"ordered-count shaders keep their file stages: {ordered}")
 
 
 def test_v_perm_b32_selectors():
