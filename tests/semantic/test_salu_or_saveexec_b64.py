@@ -507,6 +507,181 @@ class TestSymbolicAST(unittest.TestCase):
                 SOrSaveExecB64Instruction.parse(inv)
 
 
+
+# ==============================================================================
+# Phase 3: Deterministic Scalar Instruction Interpreter
+# ==============================================================================
+
+@dataclass
+class ScalarMachineState:
+    """Architectural state of the AMD RDNA2 Scalar ALU machine."""
+    sgprs: List[int] = field(default_factory=lambda: [0] * 106)
+    exec_mask: int = ALL_LANES_ACTIVE_64
+    vcc: int = 0
+    scc: int = 0
+    pc: int = 0
+
+    def read_reg_pair(self, reg: RegPair64) -> int:
+        """Read 64-bit value from SGPR pair, EXEC, or VCC."""
+        if reg.is_exec:
+            return u64(self.exec_mask)
+        elif reg.is_vcc:
+            return u64(self.vcc)
+        elif reg.reg_type == RegType.SGPR:
+            lo = self.sgprs[reg.lo_reg]
+            hi = self.sgprs[reg.hi_reg]
+            return combine_u32s_to_u64(lo, hi)
+        raise ValueError(f"Unsupported register read: {reg.name}")
+
+    def write_reg_pair(self, reg: RegPair64, val: int) -> None:
+        """Write 64-bit value to SGPR pair, EXEC, or VCC."""
+        v = u64(val)
+        if reg.is_exec:
+            self.exec_mask = v
+        elif reg.is_vcc:
+            self.vcc = v
+        elif reg.reg_type == RegType.SGPR:
+            lo, hi = split_u64_to_u32s(v)
+            self.sgprs[reg.lo_reg] = lo
+            self.sgprs[reg.hi_reg] = hi
+        else:
+            raise ValueError(f"Unsupported register write: {reg.name}")
+
+    def read_operand(self, op: SaluOperand) -> int:
+        """Read 64-bit value from a typed SALU operand."""
+        if op.is_literal:
+            return u64(op.source.bits)  # type: ignore[union-attr]
+        elif op.is_reg:
+            return self.read_reg_pair(op.source)  # type: ignore[arg-type]
+        raise ValueError("Invalid operand type")
+
+
+class ScalarInterpreter:
+    """Deterministic step-by-step scalar instruction interpreter."""
+
+    def __init__(self, initial_state: Optional[ScalarMachineState] = None) -> None:
+        self.state = initial_state if initial_state is not None else ScalarMachineState()
+        self.history: List[Tuple[int, int, int]] = []
+
+    def step(self, inst: SOrSaveExecB64Instruction) -> Tuple[int, int, int]:
+        """Execute a single S_OR_SAVEEXEC_B64 instruction deterministically.
+        
+        Hardware execution order:
+          1. Latch source operand value
+          2. Latch current EXEC
+          3. Compute saved_sdst = EXEC
+          4. Compute new_exec = src_val | EXEC
+          5. Update SDEST with saved_sdst
+          6. Update EXEC with new_exec
+          7. Update SCC = (new_exec != 0)
+        """
+        src_val = self.state.read_operand(inst.src)
+        current_exec = self.state.exec_mask
+
+        saved_sdst, new_exec, scc = oracle_s_or_saveexec_b64(current_exec, src_val)
+
+        # Latch destination register write
+        self.state.write_reg_pair(inst.dst, saved_sdst)
+
+        # Update architectural EXEC and SCC
+        self.state.exec_mask = new_exec
+        self.state.scc = scc
+        self.state.pc += 4
+
+        record = (saved_sdst, new_exec, scc)
+        self.history.append(record)
+        return record
+
+    def run_program(self, instructions: Sequence[SOrSaveExecB64Instruction]) -> List[Tuple[int, int, int]]:
+        """Run a sequence of instructions to completion."""
+        results = []
+        for inst in instructions:
+            results.append(self.step(inst))
+        return results
+
+
+class TestScalarInterpreter(unittest.TestCase):
+    """Verifies deterministic execution in the architectural scalar interpreter."""
+
+    def test_single_step_execution(self) -> None:
+        state = ScalarMachineState(exec_mask=0x0000_0000_FFFF_FFFF)
+        interp = ScalarInterpreter(state)
+
+        # s_or_saveexec_b64 s[4:5], 0xFFFF_0000_0000_0000
+        inst = SOrSaveExecB64Instruction(
+            dst=RegPair64(4, RegType.SGPR),
+            src=SaluOperand(Literal64.from_int(0xFFFF_0000_0000_0000)),
+        )
+        saved, new_exec, scc = interp.step(inst)
+
+        self.assertEqual(saved, 0x0000_0000_FFFF_FFFF)
+        self.assertEqual(new_exec, 0xFFFF_0000_FFFF_FFFF)
+        self.assertEqual(scc, 1)
+
+        # Check architectural state
+        self.assertEqual(state.exec_mask, 0xFFFF_0000_FFFF_FFFF)
+        self.assertEqual(state.scc, 1)
+        self.assertEqual(state.read_reg_pair(RegPair64(4, RegType.SGPR)), 0x0000_0000_FFFF_FFFF)
+
+    def test_sequential_saveexec_chaining(self) -> None:
+        """Test accumulation of active lanes across chained calls."""
+        state = ScalarMachineState(exec_mask=0x1)
+        interp = ScalarInterpreter(state)
+
+        # Chain of 4 instructions setting bits 1, 2, 3, 4
+        prog = [
+            SOrSaveExecB64Instruction(RegPair64(0, RegType.SGPR), SaluOperand(Literal64.from_int(0x2))),
+            SOrSaveExecB64Instruction(RegPair64(2, RegType.SGPR), SaluOperand(Literal64.from_int(0x4))),
+            SOrSaveExecB64Instruction(RegPair64(4, RegType.SGPR), SaluOperand(Literal64.from_int(0x8))),
+            SOrSaveExecB64Instruction(RegPair64(6, RegType.SGPR), SaluOperand(Literal64.from_int(0x10))),
+        ]
+        history = interp.run_program(prog)
+
+        self.assertEqual(history[0], (0x1, 0x3, 1))
+        self.assertEqual(history[1], (0x3, 0x7, 1))
+        self.assertEqual(history[2], (0x7, 0xF, 1))
+        self.assertEqual(history[3], (0xF, 0x1F, 1))
+
+        # Check that saved registers contain exact previous states
+        self.assertEqual(state.read_reg_pair(RegPair64(0, RegType.SGPR)), 0x1)
+        self.assertEqual(state.read_reg_pair(RegPair64(2, RegType.SGPR)), 0x3)
+        self.assertEqual(state.read_reg_pair(RegPair64(4, RegType.SGPR)), 0x7)
+        self.assertEqual(state.read_reg_pair(RegPair64(6, RegType.SGPR)), 0xF)
+        self.assertEqual(state.exec_mask, 0x1F)
+
+    def test_zero_to_active_transition(self) -> None:
+        """Starting with EXEC=0 and SCC=0, transition to active."""
+        state = ScalarMachineState(exec_mask=0, scc=0)
+        interp = ScalarInterpreter(state)
+
+        inst = SOrSaveExecB64Instruction(
+            dst=RegPair64(0, RegType.SGPR),
+            src=SaluOperand(Literal64.from_int(0x8000_0000_0000_0000)),
+        )
+        saved, new_exec, scc = interp.step(inst)
+
+        self.assertEqual(saved, 0)
+        self.assertEqual(new_exec, 0x8000_0000_0000_0000)
+        self.assertEqual(scc, 1)
+        self.assertEqual(state.scc, 1)
+
+    def test_vcc_source_operand(self) -> None:
+        """Read mask from VCC into EXEC while saving old EXEC."""
+        state = ScalarMachineState(exec_mask=0x00FF_00FF_00FF_00FF, vcc=0xFF00_FF00_FF00_FF00)
+        interp = ScalarInterpreter(state)
+
+        inst = SOrSaveExecB64Instruction(
+            dst=RegPair64(8, RegType.SGPR),
+            src=SaluOperand(RegPair64(106, RegType.VCC, custom_name="vcc")),
+        )
+        saved, new_exec, scc = interp.step(inst)
+
+        self.assertEqual(saved, 0x00FF_00FF_00FF_00FF)
+        self.assertEqual(new_exec, 0xFFFF_FFFF_FFFF_FFFF)
+        self.assertEqual(scc, 1)
+
+
 if __name__ == "__main__":
     unittest.main()
+
 
