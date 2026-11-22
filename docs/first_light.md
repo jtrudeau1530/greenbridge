@@ -78,6 +78,11 @@ indices), writes `manifest.json` with the counts and FSSM hashes, and runs `vk_h
 other names from the carve index; `--no-fit` keeps a model that is already in NDC (the sky dome is). The test is
 package-gated: without `LEONIDA_FIRST_LIGHT_DIR` it skips, and it writes its image to that folder.
 
+Each run stages its pair in `<work>/first_light/dxbc` and translates it into `<work>/first_light/spirv`. Both folders
+are removed at the start of a run, so they hold that run's two shaders and nothing an earlier run selected; do not
+keep files there. The output folder (`first_light/out` or `--out`) and `<work>/shaders` are not emptied. If either
+folder is a symlink or a junction, or a file in it cannot be removed, the run stops and names it.
+
 ## 4. The harness mode
 
 `runtime/test/vk_harness.cpp` gained two environment options, inert when unset (the existing three-vertex and
