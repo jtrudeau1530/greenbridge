@@ -1154,15 +1154,15 @@ class SyntheticPoolTest(unittest.TestCase):
     def test_scan_buckets_an_unknown_element_size(self):
         path = os.path.join(self.tmp.name, "unknown-format.ttpf")
         build_pool(path, meta=0x599)
-        # Rewrite the 7-bit format field to DXGI 11 (R16G16B16A16_UNORM, intentionally
-        # unmapped in ELEMENT_BYTES). The scan rejects the record before reading texture data.
+        # Rewrite the 7-bit format field to DXGI 120 (unmapped in ELEMENT_BYTES).
+        # The scan rejects the record before reading texture data.
         etpf = ttpf.align(24 + 2 * 8, 256)
         at = etpf + 16 + 4
         with open(path, "r+b") as f:
             f.seek(at)
             b = struct.unpack("<I", f.read(4))[0]
             f.seek(at)
-            f.write(struct.pack("<I", (b & ~(0x7F << 3)) | (11 << 3)))
+            f.write(struct.pack("<I", (b & ~(0x7F << 3)) | (120 << 3)))
         out = os.path.join(self.tmp.name, "scan4.json")
         import io
         from contextlib import redirect_stdout
@@ -1170,7 +1170,8 @@ class SyntheticPoolTest(unittest.TestCase):
             ttpf.scan_pools([path], out)
         with open(out, encoding="utf-8") as f:
             total = json.load(f)["total"]
-        self.assertEqual(total["format11"], 1)
+        self.assertEqual(total["unsupported_format"], 1)
+        self.assertEqual(total["format11"], 0)
         self.assertEqual(total["whitelist_gated"], 1)
         self.assertEqual(total["gated_layout_ok"], 0)
         self.assertEqual(total["gated_no_layout"], 1)
@@ -2059,6 +2060,225 @@ class SyntheticVolumePoolTest(unittest.TestCase):
         self.assertIn("unsupported 3D volume", abc["blocked"])
         with redirect_stderr(io.StringIO()):
             self.assertEqual(ttpf.export(pool_bc, 0, os.path.join(self.tmp.name, "bad_vol.dds")), 2)
+
+
+class Uncompressed2DTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    @staticmethod
+    def _encode_pixel(fmt, r, g, b, a=255):
+        if fmt in (61, 65):
+            return bytes((r,))
+        if fmt in (28, 29):
+            return bytes((r, g, b, a))
+        if fmt in (87, 91):
+            return bytes((b, g, r, a))
+        if fmt == 49:
+            return bytes((r, g))
+        if fmt == 56:
+            return struct.pack("<H", r * 257)
+        if fmt == 54:
+            return struct.pack("<e", r / 64.0)
+        if fmt == 11:
+            return struct.pack("<HHHH", r * 257, g * 257, b * 257, a * 257)
+        if fmt == 10:
+            return struct.pack("<eeee", r / 64.0, g / 64.0, b / 64.0, 1.0)
+        if fmt == 2:
+            return struct.pack("<ffff", r / 255.0, g / 255.0, b / 255.0, 1.0)
+        raise AssertionError(f"unsupported test format {fmt}")
+
+    def _build_uncompressed_pool(self, path, width, height, fmt, mips, mode=2,
+                                 corrupt_mip=None):
+        tile = ttpf.tile_bytes(mode)
+        layout = ttpf.surface_layout(width, height, fmt, mips, tile)
+        eb = layout["element_bytes"]
+        # Build top mip gradient, then exact 2x2 box-downsample each child mip.
+        grids = {}
+        top = layout["mips"][0]
+        grids[0] = [
+            (min(255, x * 255 // max(1, top["pixels_w"] - 1)),
+             min(255, y * 255 // max(1, top["pixels_h"] - 1)),
+             (x * 7 + y * 13) & 0xFF)
+            for y in range(top["pixels_h"])
+            for x in range(top["pixels_w"])
+        ]
+        for k in range(1, mips):
+            pm, cm = layout["mips"][k - 1], layout["mips"][k]
+            pw, ph = pm["pixels_w"], pm["pixels_h"]
+            cw, ch = cm["pixels_w"], cm["pixels_h"]
+            parent = grids[k - 1]
+            cur = []
+            for y in range(ch):
+                y0, y1 = min(ph - 1, 2 * y), min(ph - 1, 2 * y + 1)
+                for x in range(cw):
+                    x0, x1 = min(pw - 1, 2 * x), min(pw - 1, 2 * x + 1)
+                    p00 = parent[y0 * pw + x0]
+                    p10 = parent[y0 * pw + x1]
+                    p01 = parent[y1 * pw + x0]
+                    p11 = parent[y1 * pw + x1]
+                    cur.append(tuple((p00[c] + p10[c] + p01[c] + p11[c] + 2) // 4 for c in range(3)))
+            grids[k] = cur
+
+        tiled = bytearray(layout["size"])
+        expected_payload = bytearray()
+        for k, mip in enumerate(layout["mips"]):
+            bw, bh = mip["blocks_w"], mip["blocks_h"]
+            pw, ph = mip["pixels_w"], mip["pixels_h"]
+            lin = bytearray(bw * bh * eb)
+            vis = bytearray()
+            g = grids[k]
+            for y in range(bh):
+                for x in range(bw):
+                    if x < pw and y < ph:
+                        r, gr, b = g[y * pw + x]
+                        if corrupt_mip == k:
+                            r, gr, b = 255 - r, 255 - gr, 255 - b
+                        px = self._encode_pixel(fmt, r, gr, b)
+                        vis += px
+                    else:
+                        # Non-zero sentinel in padding cells to verify cropping and masking.
+                        px = self._encode_pixel(fmt, 255, 0, 255)
+                    at = (y * bw + x) * eb
+                    lin[at:at + eb] = px
+            retile_to(layout, mip, lin, tiled)
+            expected_payload += vis
+
+        base = ttpf.align(16 + 24 + 32, 4096)
+        non_tail = min(7, layout["first_tail"])
+        rec = pack_etpf_record(width, height, mips - non_tail, non_tail, fmt, 1, 1, mode, base)
+        write_rds5_pool(path, [rec], [bytes(tiled)])
+        return layout, bytes(expected_payload)
+
+    def test_rdna2_sw_64k_d_4bpp_pattern_and_round_trip(self):
+        # Mesa addrlib GFX10_SW_64K_D_RBPLUS_PATINFO (RDNA2/Xbox Series): 4 BPP swaps
+        # bits 6..7 vs Navi 1x to (3, -3).
+        self.assertEqual(
+            ttpf.PATTERNS_64K[2],
+            (0, 0, 1, 2, -1, -2, 3, -3, -4, 4, -5, 5, -6, 6, -7, 7),
+        )
+        # Pixel (x=4, y=0) sets X2 (bit 6 -> +64 bytes); pixel (x=0, y=4) sets Y2 (bit 7 -> +128 bytes).
+        layout = ttpf.surface_layout(128, 128, 28, 1, tile=65536)
+        mip = layout["mips"][0]
+        tiled = bytearray(65536)
+        tiled[64:68] = b"\x11\x22\x33\x44"
+        tiled[128:132] = b"\x55\x66\x77\x88"
+        det = ttpf.detile(layout, mip, bytes(tiled))
+        self.assertEqual(det[4 * 4:4 * 4 + 4], b"\x11\x22\x33\x44")
+        self.assertEqual(det[(4 * 128) * 4:(4 * 128) * 4 + 4], b"\x55\x66\x77\x88")
+
+    def test_decode_pixels_all_validated_uncompressed_formats(self):
+        self.assertEqual(ttpf.ELEMENT_BYTES[11], 8)
+        for fmt in sorted(ttpf.UNCOMPRESSED_2D_FORMATS):
+            with self.subTest(fmt=fmt):
+                raw = self._encode_pixel(fmt, 64, 128, 192, 255)
+                px = ttpf.decode_pixels(fmt, raw, 1, 1)
+                self.assertEqual(len(px), 1)
+                r, g, b = px[0]
+                if fmt in (61, 65, 56):
+                    self.assertAlmostEqual(r, 64.0, places=3)
+                    self.assertAlmostEqual(g, 64.0, places=3)
+                    self.assertAlmostEqual(b, 64.0, places=3)
+                elif fmt == 49:
+                    self.assertEqual((r, g, b), (64.0, 128.0, 0.0))
+                elif fmt == 54:
+                    self.assertAlmostEqual(r, 1.0, places=3)
+                    self.assertAlmostEqual(g, 1.0, places=3)
+                    self.assertAlmostEqual(b, 1.0, places=3)
+                elif fmt == 10:
+                    self.assertAlmostEqual(r, 1.0, places=3)
+                    self.assertAlmostEqual(g, 2.0, places=3)
+                    self.assertAlmostEqual(b, 3.0, places=3)
+                else:  # 11, 28, 29, 87, 91
+                    self.assertAlmostEqual(r, 64.0, places=3)
+                    self.assertAlmostEqual(g, 128.0, places=3)
+                    self.assertAlmostEqual(b, 192.0, places=3)
+        # Non-finite float16 values clamp cleanly in _hdr_tonemap.
+        self.assertEqual(ttpf._hdr_tonemap(float("nan")), 0.0)
+        self.assertEqual(ttpf._hdr_tonemap(float("inf")), 255.0)
+        self.assertEqual(ttpf._hdr_tonemap(float("-inf")), -255.0)
+
+    def test_uncompressed_2d_check_export_and_scan(self):
+        import io
+        from contextlib import redirect_stdout, redirect_stderr
+
+        cases = [
+            # (name, w, h, fmt, mips, mode, expect_tail_control)
+            ("dxgi11_1mip_4k", 8, 4, 11, 1, 2, False),
+            ("dxgi11_multi_4k", 32, 32, 11, 4, 2, True),
+            ("dxgi28_multi_64k", 256, 256, 28, 5, 0, True),
+            ("dxgi28_odd_4k", 17, 13, 28, 4, 2, True),
+            ("dxgi49_multi_4k", 64, 64, 49, 4, 2, True),
+            ("dxgi56_multi_4k", 64, 64, 56, 4, 2, True),
+            ("dxgi54_multi_64k", 128, 128, 54, 3, 0, False),
+            ("dxgi61_multi_64k", 256, 256, 61, 4, 0, True),
+            ("dxgi65_multi_4k", 64, 64, 65, 5, 2, True),
+            ("dxgi87_multi_4k", 64, 64, 87, 5, 2, True),
+            ("dxgi10_multi_4k", 32, 32, 10, 4, 2, True),
+        ]
+        for name, w, h, fmt, mips, mode, expect_ctrl in cases:
+            with self.subTest(case=name):
+                path = os.path.join(self.tmp.name, f"{name}.ttpf")
+                _, expected_payload = self._build_uncompressed_pool(path, w, h, fmt, mips, mode)
+                pool = ttpf.Pool(path)
+                self.addCleanup(pool.close)
+
+                buf = io.StringIO()
+                with redirect_stdout(buf):
+                    rc = ttpf.check(pool, 0)
+                res = json.loads(buf.getvalue())
+                self.assertEqual(rc, 0, res)
+                if mips > 1:
+                    self.assertLessEqual(res["max_error"], 1.0, res)
+                if expect_ctrl and res["tail_origin_control"] is not None:
+                    self.assertGreater(res["tail_origin_control"], 6.0, res)
+
+                out_dds = os.path.join(self.tmp.name, f"{name}.dds")
+                with redirect_stdout(io.StringIO()):
+                    erc = ttpf.export(pool, 0, out_dds)
+                self.assertEqual(erc, 0)
+                with open(out_dds, "rb") as f:
+                    dds = f.read()
+                self.assertEqual(dds[:4], b"DDS ")
+                flags, dh, dw, pitch = struct.unpack_from("<IIII", dds, 8)
+                self.assertEqual(flags & 0x8, 0x8)  # DDSD_PITCH for uncompressed
+                self.assertEqual((dw, dh, pitch), (w, h, w * ttpf.ELEMENT_BYTES[fmt]))
+                dxgi_fmt, dim, misc, arr, _ = struct.unpack_from("<IIIII", dds, 128)
+                self.assertEqual((dxgi_fmt, dim, misc, arr), (fmt, 3, 0, 1))
+                self.assertEqual(dds[148:], expected_payload)
+
+                if fmt == 11:
+                    scan_out = os.path.join(self.tmp.name, f"scan_{name}.json")
+                    with redirect_stdout(io.StringIO()):
+                        ttpf.scan_pools([path], scan_out)
+                    with open(scan_out, encoding="utf-8") as f:
+                        total = json.load(f)["total"]
+                    self.assertEqual((total["unsupported_format"], total["format11"]), (0, 0))
+                    self.assertEqual((total["after_full"], total["after_skip"]), (1, 0))
+
+        # Negative control 1: corrupted child mip fails check (rc == 1).
+        bad = os.path.join(self.tmp.name, "dxgi28_bad.ttpf")
+        self._build_uncompressed_pool(bad, 256, 256, 28, 4, mode=0, corrupt_mip=2)
+        pool_bad = ttpf.Pool(bad)
+        self.addCleanup(pool_bad.close)
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rc = ttpf.check(pool_bad, 0)
+        res = json.loads(buf.getvalue())
+        self.assertEqual(rc, 1, res)
+        self.assertGreater(res["max_error"], 50.0)
+
+        # Negative control 2: unvalidated uncompressed format (DXGI 2, R32G32B32A32_FLOAT)
+        # is still blocked in check (rc == 2) and refused by export (rc == 2).
+        unval = os.path.join(self.tmp.name, "dxgi2_unval.ttpf")
+        self._build_uncompressed_pool(unval, 16, 16, 2, 2, mode=2)
+        pool_u = ttpf.Pool(unval)
+        self.addCleanup(pool_u.close)
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(ttpf.check(pool_u, 0), 2)
+        with redirect_stderr(io.StringIO()):
+            self.assertEqual(ttpf.export(pool_u, 0, os.path.join(self.tmp.name, "dxgi2.dds")), 2)
 
 
 if __name__ == "__main__":

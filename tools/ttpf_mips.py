@@ -61,11 +61,10 @@ MAX_OUTPUT = 256 * 1024 * 1024
 MAX_TEXTURES = 250_000
 ETPF_VERSION = 634
 
-# DXGI format -> element bytes, as RageTextureDecoder.ElementBytes. DXGI 11
-# (R16G16B16A16_UNORM) is 8 bytes but is left out here as well: its uncompressed
-# tiling has not been validated, so `scan` reports it as a format gap.
+# DXGI format -> element bytes, matching RageTextureDecoder.ElementBytes plus DXGI 11
+# (R16G16B16A16_UNORM, 8 bytes).
 ELEMENT_BYTES = {
-    2: 16, 3: 16, 4: 16, 6: 12, 7: 12, 8: 12, 10: 8, 12: 8, 13: 8, 14: 8,
+    2: 16, 3: 16, 4: 16, 6: 12, 7: 12, 8: 12, 10: 8, 11: 8, 12: 8, 13: 8, 14: 8,
     16: 8, 17: 8, 18: 8, 24: 4, 25: 4, 26: 4, 28: 4, 29: 4, 30: 4, 31: 4, 32: 4,
     34: 4, 35: 4, 36: 4, 37: 4, 38: 4, 41: 4, 42: 4, 43: 4, 49: 2, 50: 2, 51: 2,
     52: 2, 54: 2, 56: 2, 57: 2, 58: 2, 59: 2, 61: 1, 62: 1, 63: 1, 64: 1, 65: 1,
@@ -73,8 +72,11 @@ ELEMENT_BYTES = {
     87: 4, 88: 4, 91: 4, 93: 4, 95: 16, 96: 16, 98: 16, 99: 16,
 }
 BC_FORMATS = frozenset(range(70, 85)) | frozenset(range(94, 100))
+# Validated 2D/array/cubemap uncompressed DXGI formats decoded in `check` and exported in `export`.
+UNCOMPRESSED_2D_FORMATS = frozenset({10, 11, 28, 29, 49, 54, 56, 61, 65, 87, 91})
 
-# AMD Gfx10 intra-tile bit order (bit index -> source bit), from TtpfReader.
+# AMD Gfx10/RDNA2 (RbPlus) intra-tile bit order (bit index -> source bit), matching
+# Mesa addrlib GFX10_SW_4K_S_RBPLUS_PATINFO and GFX10_SW_64K_D_RBPLUS_PATINFO.
 PATTERNS_4K = {
     0: (1, 2, 3, 4, -1, -2, -3, -4, -5, 5, -6, 6),
     1: (0, 1, 2, 3, -1, -2, -3, 4, -4, 5, -5, 6),
@@ -85,7 +87,8 @@ PATTERNS_4K = {
 PATTERNS_64K = {
     0: (1, 2, 3, -2, -1, -3, 4, -4, -5, 5, -6, 6, -7, 7, -8, 8),
     1: (0, 1, 2, 3, -1, -2, -3, 4, -4, 5, -5, 6, -6, 7, -7, 8),
-    2: (0, 0, 1, 2, -1, -2, -3, 3, -4, 4, -5, 5, -6, 6, -7, 7),
+    # RDNA2/RbPlus SW_64KB_D swaps bits 6..7 vs Navi 1x ((3, -3) instead of (-3, 3)).
+    2: (0, 0, 1, 2, -1, -2, 3, -3, -4, 4, -5, 5, -6, 6, -7, 7),
     3: (0, 0, 0, 1, -1, 2, 3, -2, -3, 4, -4, 5, -5, 6, -6, 7),
     4: (0, 0, 0, 0, 1, -1, 2, -2, -3, 3, -4, 4, -5, 5, -6, 6),
 }
@@ -313,6 +316,7 @@ _BC7_MODES = (
 
 _F16_LUT = None
 _BC6H_HDR_FORMATS = {95, 96}
+_HDR_FORMATS = frozenset({10, 54, 95, 96})
 
 
 def _f16_lut():
@@ -574,6 +578,35 @@ def decode_bc7_block(data, at):
 
 def decode_pixels(fmt, data, blocks_w, blocks_h):
     """Return one (r, g, b) per pixel, or None for a format this tool cannot decode."""
+    if fmt not in BC_FORMATS:
+        n = blocks_w * blocks_h
+        if fmt in (61, 65):  # R8_UNORM, A8_UNORM
+            return [(float(b), float(b), float(b)) for b in data[:n]]
+        if fmt in (28, 29):  # R8G8B8A8_UNORM / UNORM_SRGB
+            return [(float(data[i]), float(data[i + 1]), float(data[i + 2]))
+                    for i in range(0, n * 4, 4)]
+        if fmt in (87, 91):  # B8G8R8A8_UNORM / UNORM_SRGB
+            return [(float(data[i + 2]), float(data[i + 1]), float(data[i]))
+                    for i in range(0, n * 4, 4)]
+        if fmt == 49:  # R8G8_UNORM
+            return [(float(data[i]), float(data[i + 1]), 0.0) for i in range(0, n * 2, 2)]
+        if fmt == 56:  # R16_UNORM
+            vals = struct.unpack_from(f"<{n}H", data, 0)
+            return [(v / 257.0, v / 257.0, v / 257.0) for v in vals]
+        if fmt == 54:  # R16_FLOAT
+            lut = _f16_lut()
+            vals = struct.unpack_from(f"<{n}H", data, 0)
+            return [(lut[v], lut[v], lut[v]) for v in vals]
+        if fmt == 11:  # R16G16B16A16_UNORM
+            vals = struct.unpack_from(f"<{n * 4}H", data, 0)
+            return [(vals[i] / 257.0, vals[i + 1] / 257.0, vals[i + 2] / 257.0)
+                    for i in range(0, n * 4, 4)]
+        if fmt == 10:  # R16G16B16A16_FLOAT
+            lut = _f16_lut()
+            vals = struct.unpack_from(f"<{n * 4}H", data, 0)
+            return [(lut[vals[i]], lut[vals[i + 1]], lut[vals[i + 2]])
+                    for i in range(0, n * 4, 4)]
+        return None
     px = []
     for by in range(blocks_h):
         rows = [[None] * (blocks_w * 4) for _ in range(4)]
@@ -603,21 +636,23 @@ def decode_pixels(fmt, data, blocks_w, blocks_h):
     return [p for row in px for p in row]
 
 
-def block_means(pixels, blocks_w, blocks_h, pixels_w=None, pixels_h=None):
-    pw = blocks_w * 4 if pixels_w is None else pixels_w
-    ph = blocks_h * 4 if pixels_h is None else pixels_h
+def block_means(pixels, blocks_w, blocks_h, pixels_w=None, pixels_h=None, block=4):
+    if block == 1:
+        return list(pixels)
+    pw = blocks_w * block if pixels_w is None else pixels_w
+    ph = blocks_h * block if pixels_h is None else pixels_h
     out = []
     for by in range(blocks_h):
         for bx in range(blocks_w):
             acc = [0.0, 0.0, 0.0]
             n = 0
-            for y in range(4):
-                if by * 4 + y >= ph:
+            for y in range(block):
+                if by * block + y >= ph:
                     continue
-                for x in range(4):
-                    if bx * 4 + x >= pw:
+                for x in range(block):
+                    if bx * block + x >= pw:
                         continue
-                    q = pixels[(by * 4 + y) * (blocks_w * 4) + bx * 4 + x]
+                    q = pixels[(by * block + y) * (blocks_w * block) + bx * block + x]
                     for k in range(3):
                         acc[k] += q[k]
                     n += 1
@@ -651,7 +686,9 @@ class MipGeometryError(ValueError):
 
 
 def _hdr_tonemap(v):
-    """Signed Reinhard tone-map onto (-255, 255) for HDR BC6H mip-chain comparison."""
+    """Signed Reinhard tone-map onto (-255, 255) for HDR mip-chain comparison."""
+    if not math.isfinite(v):
+        return 0.0 if math.isnan(v) else (255.0 if v > 0 else -255.0)
     return 255.0 * v / (1.0 + abs(v))
 
 
@@ -668,33 +705,33 @@ def mean_abs_error(a, b, *, hdr=False):
     return sum(abs(x - y) for pa, pb in zip(a, b) for x, y in zip(pa, pb)) / (3 * len(a))
 
 
-def _visible_grid(mip):
-    """Return the (blocks_w, blocks_h) that hold visible texels, checking the block grid."""
+def _visible_grid(mip, block=4):
+    """Return the (blocks_w, blocks_h) that hold visible texels, checking the element grid."""
     pw, ph, bw, bh = mip["pixels_w"], mip["pixels_h"], mip["blocks_w"], mip["blocks_h"]
-    vw, vh = (pw + 3) // 4, (ph + 3) // 4
+    vw, vh = (pw + block - 1) // block, (ph + block - 1) // block
     if pw < 1 or ph < 1 or bw < vw or bh < vh:
         raise MipGeometryError(
             f"mip {mip.get('index')} geometry: {bw}x{bh} blocks cannot hold {pw}x{ph} pixels")
     return vw, vh
 
 
-def _visible_rows(layout, mip, data):
-    """Crop block-linear `data` from `detile` to the mip's visible blocks, tightly packed.
+def _visible_rows(layout, mip, data, block=4):
+    """Crop block-linear `data` from `detile` to the mip's visible elements, tightly packed.
 
     Storage grids can be wider or taller than the visible grid (17x13 BC1 stores its 8x6
-    child as 3x2 blocks); standard DDS readers expect only the visible rows. Aligned grids
-    are returned unchanged.
+    child as 3x2 blocks; 17x13 uncompressed stores its 8x6 child as 9x7 elements); standard
+    DDS readers expect only the visible rows. Aligned grids are returned unchanged.
     """
-    vw, vh = _visible_grid(mip)
+    vw, vh = _visible_grid(mip, block)
     bw, eb = mip["blocks_w"], layout["element_bytes"]
     if (vw, vh) == (bw, mip["blocks_h"]):
         return data
     return b"".join(data[y * bw * eb:(y * bw + vw) * eb] for y in range(vh))
 
 
-def visible_block_means(means, mip):
-    """Select the `block_means` entries whose blocks hold visible texels, row-major."""
-    vw, vh = _visible_grid(mip)
+def visible_block_means(means, mip, block=4):
+    """Select the `block_means` entries whose elements hold visible texels, row-major."""
+    vw, vh = _visible_grid(mip, block)
     bw = mip["blocks_w"]
     if len(means) != bw * mip["blocks_h"]:
         raise MipGeometryError(
@@ -703,32 +740,50 @@ def visible_block_means(means, mip):
     return [means[by * bw + bx] for by in range(vh) for bx in range(vw)]
 
 
-def predict_child_means(pixels, parent, child):
-    """Predict the visible block means of `child` as a 2x2 box downsample of `parent` pixels.
+def predict_child_means(pixels, parent, child, block=4):
+    """Predict the visible element means of `child` as a 2x2 box downsample of `parent` pixels.
 
     Child texel (x, y) is the mean of parent texels (2x + dx, 2y + dy), dx, dy in {0, 1},
-    clamped to the last visible parent row/column. Each child block averages only its
-    visible texels, so padding in either mip is never read. Returns one (r, g, b) per block
+    clamped to the last visible parent row/column. Each child element averages only its
+    visible texels, so padding in either mip is never read. Returns one (r, g, b) per element
     of the child's visible grid, ordered like `visible_block_means`.
     """
     pw, ph, cw, ch = parent["pixels_w"], parent["pixels_h"], child["pixels_w"], child["pixels_h"]
-    _visible_grid(parent)
-    vw, vh = _visible_grid(child)
+    _visible_grid(parent, block)
+    vw, vh = _visible_grid(child, block)
     if (cw, ch) != (max(1, pw // 2), max(1, ph // 2)):
         raise MipGeometryError(
             f"mip {child.get('index')} geometry: {cw}x{ch} is not the 2x2 downsample of {pw}x{ph}")
-    stride = parent["blocks_w"] * 4
-    if len(pixels) != stride * parent["blocks_h"] * 4:
+    stride = parent["blocks_w"] * block
+    if len(pixels) != stride * parent["blocks_h"] * block:
         raise MipGeometryError(
             f"mip {parent.get('index')} geometry: {len(pixels)} pixels for "
             f"{parent['blocks_w']}x{parent['blocks_h']} blocks")
+    if block == 1:
+        out = []
+        for y in range(ch):
+            r0 = min(ph - 1, 2 * y) * stride
+            r1 = min(ph - 1, 2 * y + 1) * stride
+            for x in range(cw):
+                x0 = min(pw - 1, 2 * x)
+                x1 = min(pw - 1, 2 * x + 1)
+                p00 = pixels[r0 + x0]
+                p10 = pixels[r0 + x1]
+                p01 = pixels[r1 + x0]
+                p11 = pixels[r1 + x1]
+                out.append((
+                    0.25 * (p00[0] + p10[0] + p01[0] + p11[0]),
+                    0.25 * (p00[1] + p10[1] + p01[1] + p11[1]),
+                    0.25 * (p00[2] + p10[2] + p01[2] + p11[2]),
+                ))
+        return out
     out = []
     for by in range(vh):
         for bx in range(vw):
             acc = [0.0, 0.0, 0.0]
             n = 0
-            for y in range(by * 4, min(by * 4 + 4, ch)):
-                for x in range(bx * 4, min(bx * 4 + 4, cw)):
+            for y in range(by * block, min(by * block + block, ch)):
+                for x in range(bx * block, min(bx * block + block, cw)):
                     for dy in range(2):
                         row = min(ph - 1, 2 * y + dy) * stride
                         for dx in range(2):
@@ -1485,23 +1540,25 @@ def describe(pool, index):
 def _check_mip_chain(layout, fmt, slice_bytes_fn):
     """Detile every mip of one 2D slice and return (means_per_mip, mip_errors, predictions).
 
-    predictions[k] is the visible-block prediction for mip k from the decoded pixels of
+    predictions[k] is the visible-element prediction for mip k from the decoded pixels of
     mip k - 1 (None for mip 0 or an undecodable parent); mip_errors[k - 1] compares it with
-    mip k's visible blocks, so odd parent block counts and partial edge blocks are covered.
+    mip k's visible elements, so odd parent counts and partial edge blocks are covered.
     """
     means, errs, preds = [], [], [None]
     prev_px = None
-    hdr = fmt in _BC6H_HDR_FORMATS
+    block = 4 if fmt in BC_FORMATS else 1
+    hdr = fmt in _HDR_FORMATS
     for k, mip in enumerate(layout["mips"]):
         data = detile(layout, mip, slice_bytes_fn(mip))
         px = decode_pixels(fmt, data, mip["blocks_w"], mip["blocks_h"])
         means.append(None if px is None else block_means(
-            px, mip["blocks_w"], mip["blocks_h"], mip["pixels_w"], mip["pixels_h"]))
+            px, mip["blocks_w"], mip["blocks_h"], mip["pixels_w"], mip["pixels_h"], block))
         if k:
-            pred = None if prev_px is None else predict_child_means(prev_px, layout["mips"][k - 1], mip)
+            pred = None if prev_px is None else predict_child_means(
+                prev_px, layout["mips"][k - 1], mip, block)
             preds.append(pred)
             errs.append(None if pred is None or px is None else round(
-                mean_abs_error(pred, visible_block_means(means[k], mip), hdr=hdr), 2))
+                mean_abs_error(pred, visible_block_means(means[k], mip, block), hdr=hdr), 2))
         prev_px = px
     return means, errs, preds
 
@@ -1524,9 +1581,10 @@ def _tail_origin_control(layout, fmt, tiled, preds):
     px = decode_pixels(fmt, data, tm["blocks_w"], tm["blocks_h"])
     if px is None:
         return None
-    means = block_means(px, tm["blocks_w"], tm["blocks_h"], tm["pixels_w"], tm["pixels_h"])
-    return round(mean_abs_error(preds[ft], visible_block_means(means, tm),
-                                hdr=(fmt in _BC6H_HDR_FORMATS)), 2)
+    block = 4 if fmt in BC_FORMATS else 1
+    means = block_means(px, tm["blocks_w"], tm["blocks_h"], tm["pixels_w"], tm["pixels_h"], block)
+    return round(mean_abs_error(preds[ft], visible_block_means(means, tm, block),
+                                hdr=(fmt in _HDR_FORMATS)), 2)
 
 
 def _read_range_or_block(pool, start, size, cache, bcpack_mode, index, shape=None,
@@ -1619,8 +1677,8 @@ def _check_texture(pool, index, *, allow_provisional=False, history=None):
                                       m["offset"] + sl * m["slice_stride"] + m["region"]])
             if all(m is None for m in means):
                 print(json.dumps(dict(index=index, shape=shape, blocked=(
-                    f"format {d['format']} is not one of the BC formats this tool decodes "
-                    "(71/72/77/78/80/83/95/96/98/99)")), indent=1))
+                    f"format {d['format']} is not one of the formats this tool decodes "
+                    "(BC 71/72/77/78/80/83/95/96/98/99; uncompressed 10/11/28/29/49/54/56/61/65/87/91)")), indent=1))
                 return 2
             per_slice_max.append(max((e for e in errs if e is not None), default=None))
             all_errs.extend(errs)
@@ -1658,8 +1716,8 @@ def _check_texture(pool, index, *, allow_provisional=False, history=None):
                 lambda m, b0=fbase: tiled[b0 + m["offset"]:b0 + m["offset"] + m["region"]])
             if all(m is None for m in means):
                 print(json.dumps(dict(index=index, shape=shape, blocked=(
-                    f"format {d['format']} is not one of the BC formats this tool decodes "
-                    "(71/72/77/78/80/83/95/96/98/99)")), indent=1))
+                    f"format {d['format']} is not one of the formats this tool decodes "
+                    "(BC 71/72/77/78/80/83/95/96/98/99; uncompressed 10/11/28/29/49/54/56/61/65/87/91)")), indent=1))
                 return 2
             if face == 0:
                 face0_preds = preds
@@ -1687,8 +1745,8 @@ def _check_texture(pool, index, *, allow_provisional=False, history=None):
         lambda m: tiled[m["offset"]:m["offset"] + m["region"]])
     if all(m is None for m in means):
         print(json.dumps(dict(index=index, blocked=(
-            f"format {d['format']} is not one of the BC formats this tool decodes "
-            "(71/72/77/78/80/83/95/96/98/99)")), indent=1))
+            f"format {d['format']} is not one of the formats this tool decodes "
+            "(BC 71/72/77/78/80/83/95/96/98/99; uncompressed 10/11/28/29/49/54/56/61/65/87/91)")), indent=1))
         return 2
     control = None
     if 0 < layout["first_tail"] < d["mips"]:
@@ -1737,8 +1795,8 @@ def texture_dds(pool, a, mips=None, *, allow_provisional=False, history=None):
         raise ValueError(a.get("blocked", "layout unavailable"))
     d = a["descriptor"]
     shape = a.get("shape", "2d")
-    if shape != "volume" and d["format"] not in BC_FORMATS:
-        raise ValueError(f"format {d['format']} is uncompressed; this tool does not validate uncompressed 2D tiling")
+    if shape != "volume" and d["format"] not in BC_FORMATS and d["format"] not in UNCOMPRESSED_2D_FORMATS:
+        raise ValueError(f"format {d['format']} is uncompressed and not validated for 2D export")
     if shape == "volume" and d["format"] not in VOLUME_FLOAT_FORMATS:
         raise ValueError(f"volume format {d['format']} is not validated for export")
     if not a["full_chain"]:
@@ -1747,6 +1805,7 @@ def texture_dds(pool, a, mips=None, *, allow_provisional=False, history=None):
     if count < 1 or count > d["mips"]:
         raise ValueError(f"--mips must be 1..{d['mips']}")
     layout = a["layout"]
+    block = 4 if d["format"] in BC_FORMATS else 1
     cache = {}
     bcpack_mode = "provisional" if allow_provisional else "strict"
     payload = bytearray()
@@ -1760,7 +1819,7 @@ def texture_dds(pool, a, mips=None, *, allow_provisional=False, history=None):
                 tiled = pool.read_range(d["base"] + mip["offset"] + s * mip["slice_stride"],
                                         mip["region"], cache,
                                         bcpack_mode=bcpack_mode, bcpack_history=history)
-                payload += _visible_rows(layout, mip, detile(layout, mip, tiled))
+                payload += _visible_rows(layout, mip, detile(layout, mip, tiled), block)
     elif shape == "cubemap":
         face_base = d["base"] + layout["data_offset"]
         for face in range(6):
@@ -1768,15 +1827,15 @@ def texture_dds(pool, a, mips=None, *, allow_provisional=False, history=None):
                 tiled = pool.read_range(face_base + face * layout["face_size"] + mip["offset"],
                                         mip["region"], cache,
                                         bcpack_mode=bcpack_mode, bcpack_history=history)
-                payload += _visible_rows(layout, mip, detile(layout, mip, tiled))
+                payload += _visible_rows(layout, mip, detile(layout, mip, tiled), block)
     else:
         for mip in layout["mips"][:count]:
             tiled = pool.read_range(d["base"] + mip["offset"], mip["region"], cache,
                                     bcpack_mode=bcpack_mode, bcpack_history=history)
-            payload += _visible_rows(layout, mip, detile(layout, mip, tiled))
+            payload += _visible_rows(layout, mip, detile(layout, mip, tiled), block)
     if 148 + len(payload) > MAX_OUTPUT:
         raise ValueError("DDS exceeds the 256 MiB output limit")
-    top_w, top_h = (_visible_grid(layout["mips"][0]) if d["format"] in BC_FORMATS else (0, 0))
+    top_w, top_h = (_visible_grid(layout["mips"][0], block) if d["format"] in BC_FORMATS else (0, 0))
     linear = (top_w * top_h * layout["element_bytes"]
               if d["format"] in BC_FORMATS else d["width"] * layout["element_bytes"])
     return dds_bytes(
