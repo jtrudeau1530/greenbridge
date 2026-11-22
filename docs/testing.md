@@ -269,12 +269,16 @@ without it they're skipped, which is expected, not a failure. To test the fallba
 ## Fused multiply-add: GLSL Fma or OpFmaKHR
 
 `cs_fma_fused` checks that `v_fma_f32`, `v_fmac_f32`, `v_fmaak_f32`, `v_fmamk_f32` (and one `v_fma_f16`) round once, on
-operands taken from user SGPRs so the driver cannot fold them. It passes with the default translation (`--fma glsl`,
-GLSL.std.450 `Fma`) and with `LEONIDA_FMA=khr` **for `build.py`** (or for `run_gpu_tests.py`), which emits `OpFmaKHR`.
+operands taken from user SGPRs so the driver cannot fold them. Run it with default `--fma glsl` (GLSL.std.450 `Fma`) or
+with `LEONIDA_FMA=khr` **for `build.py`** (or for `run_gpu_tests.py`), which emits `OpFmaKHR`.
 That needs `VK_KHR_shader_fma` with `shaderFmaFloat32`; the test programs enable it when the device has it and exit
 77 (a SKIP) for a module that needs it on a device without it. The Vulkan specification allows a driver to split GLSL
-`Fma` into two roundings, which is why `khr` exists. Neither the AMD (26.11.2) nor the NVIDIA (617.42) driver we tried
-does, so `cs_fma_fused` passing with `glsl` is not evidence that every driver is safe.
+`Fma` into two roundings, which is why `khr` exists: on AMD Windows (26.11.2) and NVIDIA (617.42) GLSL `Fma` stayed
+fused, whereas **Mesa RADV (26.2.6-arch3.1, AMD Radeon RX 6800, Linux)** splits 5 of the 7 f32 ops under `--fma glsl`
+(reusing the live `a * a` product in `v3`) and returns 8/8 fused exact under `LEONIDA_FMA=khr`. Under default
+`--fma glsl`, `check.py` and `run_gpu_tests.py` therefore accept either the fused or the exact split word for each of
+the 7 f32 outputs while still requiring exact f16 round-to-odd (`0x00007351`); under `LEONIDA_FMA=khr`, all 8 words
+must be strictly fused.
 
 ## Hardware oracle (optional, AMD)
 
