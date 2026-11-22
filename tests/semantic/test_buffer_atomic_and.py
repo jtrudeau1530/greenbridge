@@ -809,6 +809,95 @@ class TestBufferAtomicAndConditionCodes(unittest.TestCase):
         self.assertEqual(self.interp.vcc, canary)
 
 
+class TestBufferAtomicAndBoundaryExtremes(unittest.TestCase):
+    """Unit tests for boundary extremes, address wrapping, and IEEE 754 bit pattern handling."""
+
+    def setUp(self) -> None:
+        self.mem = BufferMemory(4096)
+
+    def test_last_valid_dword_boundary(self) -> None:
+        desc = BufferResourceDescriptor(base_address=0, stride=0, num_records=100)
+        # Last valid 4-byte dword starts at offset 96 (96 + 4 = 100)
+        self.mem.write_u32(96, 0xFFFFFFFF)
+        ret, in_bounds = ref_buffer_atomic_and(
+            self.mem, desc, soffset=0, vaddr=96, and_val=0x12345678, glc=True
+        )
+        self.assertTrue(in_bounds)
+        self.assertEqual(ret, 0xFFFFFFFF)
+        self.assertEqual(self.mem.read_u32(96), 0x12345678)
+
+        # Offsets 97, 98, 99, 100 all exceed num_records (97 + 4 = 101 > 100)
+        for oob_off in (97, 98, 99, 100):
+            ret, in_bounds = ref_buffer_atomic_and(
+                self.mem, desc, soffset=0, vaddr=oob_off, and_val=0, glc=True
+            )
+            self.assertFalse(in_bounds)
+            self.assertEqual(ret, 0)
+
+    def test_zero_capacity_buffer(self) -> None:
+        desc = BufferResourceDescriptor(base_address=0, stride=0, num_records=0)
+        ret, in_bounds = ref_buffer_atomic_and(
+            self.mem, desc, soffset=0, vaddr=0, and_val=0, glc=True
+        )
+        self.assertFalse(in_bounds)
+        self.assertEqual(ret, 0)
+
+    def test_float_nan_and_subnormal_bit_patterns_raw_bitwise(self) -> None:
+        # Buffer atomic operations operate strictly on raw 32-bit dwords without IEEE 754 canonicalization
+        desc = BufferResourceDescriptor(base_address=0, stride=0, num_records=256)
+
+        # 1. Quiet NaN (0x7FC00000) & sign bit mask -> 0
+        qnan_bits = 0x7FC00000
+        self.mem.write_u32(0, qnan_bits)
+        ret, in_bounds = ref_buffer_atomic_and(
+            self.mem, desc, soffset=0, vaddr=0, and_val=0x80000000, glc=True
+        )
+        self.assertTrue(in_bounds)
+        self.assertEqual(ret, qnan_bits)
+        self.assertEqual(self.mem.read_u32(0), 0)
+
+        # 2. Signaling NaN (0x7F800001): clear payload bit 0 -> Positive Infinity (0x7F800000)
+        snan_bits = 0x7F800001
+        self.mem.write_u32(4, snan_bits)
+        ret, in_bounds = ref_buffer_atomic_and(
+            self.mem, desc, soffset=0, vaddr=4, and_val=0xFFFFFFFE, glc=True
+        )
+        self.assertTrue(in_bounds)
+        self.assertEqual(ret, snan_bits)
+        self.assertEqual(self.mem.read_u32(4), 0x7F800000)
+
+        # 3. Negative Infinity (0xFF800000): clear sign bit -> Positive Infinity (0x7F800000)
+        neg_inf = 0xFF800000
+        self.mem.write_u32(8, neg_inf)
+        ret, in_bounds = ref_buffer_atomic_and(
+            self.mem, desc, soffset=0, vaddr=8, and_val=0x7FFFFFFF, glc=True
+        )
+        self.assertTrue(in_bounds)
+        self.assertEqual(ret, neg_inf)
+        self.assertEqual(self.mem.read_u32(8), 0x7F800000)
+
+        # 4. Smallest subnormal float (0x00000001): AND with 0 -> 0
+        subnormal = 0x00000001
+        self.mem.write_u32(12, subnormal)
+        ret, in_bounds = ref_buffer_atomic_and(
+            self.mem, desc, soffset=0, vaddr=12, and_val=0, glc=True
+        )
+        self.assertTrue(in_bounds)
+        self.assertEqual(ret, subnormal)
+        self.assertEqual(self.mem.read_u32(12), 0)
+
+    def test_integer_extremes_and_masking(self) -> None:
+        desc = BufferResourceDescriptor(base_address=0, stride=0, num_records=256)
+        # INT32_MAX (0x7FFFFFFF) & INT32_MIN (0x80000000) = 0
+        self.mem.write_u32(0, 0x7FFFFFFF)
+        ret, in_bounds = ref_buffer_atomic_and(
+            self.mem, desc, soffset=0, vaddr=0, and_val=0x80000000, glc=True
+        )
+        self.assertTrue(in_bounds)
+        self.assertEqual(ret, 0x7FFFFFFF)
+        self.assertEqual(self.mem.read_u32(0), 0)
+
+
 class TestBufferAtomicAndScalarInterpreter(unittest.TestCase):
     """Unit tests for the deterministic scalar instruction interpreter."""
 
