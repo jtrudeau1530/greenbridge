@@ -525,6 +525,18 @@ class AlphaModeTests(unittest.TestCase):
         data = dds_buffer(4, 4, block, flags=DDPF_FOURCC, fourcc=b"DX10", dxgi=77, alpha_mode=2)
         self.assertEqual(dds.decode_dds(data), (4, 4, bytes((131, 0, 0, 128)) * 16))
 
+    def test_legacy_premultiplied_fourcc_png_pixels(self):
+        # The two FourCCs in each pair share their block layout and differ in alpha interpretation.
+        bc2 = bytes([0x88] * 8) + struct.pack("<HHI", 0x4000, 0, 0)
+        bc3 = bc3_block(128, 0, 0, c0=0x4000, c1=0)
+        for fourcc, block, red, alpha in ((b"DXT2", bc2, 124, 136), (b"DXT3", bc2, 66, 136),
+                                         (b"DXT4", bc3, 131, 128), (b"DXT5", bc3, 66, 128)):
+            with self.subTest(fourcc=fourcc):
+                data = dds_buffer(1, 1, block, flags=DDPF_FOURCC, fourcc=fourcc)
+                chunks = png_chunks(dds.dds_to_png_bytes(data))
+                raw = zlib.decompress(b"".join(payload for kind, payload, _ in chunks if kind == b"IDAT"))
+                self.assertEqual(raw, bytes((0, red, 0, 0, alpha)))
+
     def test_alpha_mode_uses_only_the_low_three_bits(self):
         data = dds_buffer(1, 1, bytes((64, 32, 16, 128)), flags=DDPF_FOURCC, fourcc=b"DX10",
                           dxgi=28, alpha_mode=0x80000002)
