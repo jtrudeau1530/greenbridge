@@ -3964,7 +3964,9 @@ class Gen:
                 raise Unsupported(op + " form")
             f = self.attribute(attr["a"], attr["c"])
             if op == "v_interp_p2_f16":
-                self.dst(a[0], self.f16_bits(f))
+                # VOP3 clamp applies to the f16 result (ACO: dst(F16); llvm-mc takes clamp but no omod on this op).
+                # Until 2026-11-22 it was dropped.
+                self.dst(a[0], self.f16_bits(self.clamp_mods(f, mods)))
             else:   # p1ll/p1lv produce the f32 intermediate consumed by p2_f16
                 self.dst(a[0], self.tou(f))
         elif op.startswith("s_cmp_"):
