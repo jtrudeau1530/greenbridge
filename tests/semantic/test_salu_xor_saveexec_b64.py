@@ -268,6 +268,65 @@ class ScalarSALUInterpreter:
         return ExecutionResult(saved_exec=saved_exec, new_exec=new_exec, scc=scc)
 
 
+# ==============================================================================
+# SIMD Multi-Lane Execution Engine and EXEC Masking
+# ==============================================================================
+
+@dataclass
+class SIMDWavefrontState:
+    """Multi-lane SIMD machine state representing Wave32 or Wave64."""
+    wave_size: int
+    salu_state: SALUArchitecturalState = field(default_factory=SALUArchitecturalState)
+    vgprs: List[List[int]] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        if self.wave_size not in (32, 64):
+            raise ValueError(f"wave_size must be 32 or 64, got {self.wave_size}")
+        if not self.vgprs:
+            self.vgprs = [[0] * 256 for _ in range(self.wave_size)]
+        if self.wave_size == 32:
+            self.salu_state.exec_mask &= ALL_LANES_W32
+
+    def is_lane_active(self, lane: int) -> bool:
+        if not (0 <= lane < self.wave_size):
+            raise IndexError(f"Lane {lane} out of range [0, {self.wave_size - 1}]")
+        return bool((self.salu_state.exec_mask & (1 << lane)) != 0)
+
+    def active_lane_indices(self) -> List[int]:
+        return [lane for lane in range(self.wave_size) if self.is_lane_active(lane)]
+
+    def read_vgpr(self, lane: int, vgpr_idx: int) -> int:
+        return self.vgprs[lane][vgpr_idx] & MASK32
+
+    def write_vgpr(self, lane: int, vgpr_idx: int, val: int) -> None:
+        self.vgprs[lane][vgpr_idx] = val & MASK32
+
+
+class SIMDInstructionExecutor:
+    """Executes SALU control-flow and masked VALU operations across wavefront lanes."""
+
+    def __init__(self, salu_interp: Optional[ScalarSALUInterpreter] = None) -> None:
+        self.salu_interp = salu_interp or ScalarSALUInterpreter()
+
+    def step_salu(self, instr: SXorSaveExecB64AST, state: SIMDWavefrontState) -> ExecutionResult:
+        res = self.salu_interp.step(instr, state.salu_state)
+        if state.wave_size == 32:
+            state.salu_state.exec_mask &= ALL_LANES_W32
+        return res
+
+    def step_valu_add_u32(self, dst_v: int, src_v: int, addend: int, state: SIMDWavefrontState) -> List[Optional[int]]:
+        """Masked VALU instruction: lane writes only if active under EXEC."""
+        written_vals: List[Optional[int]] = [None] * state.wave_size
+        for lane in range(state.wave_size):
+            if state.is_lane_active(lane):
+                in_val = state.read_vgpr(lane, src_v)
+                out_val = (in_val + addend) & MASK32
+                state.write_vgpr(lane, dst_v, out_val)
+                written_vals[lane] = out_val
+        return written_vals
+
+
+
 
 # ==============================================================================
 # Unit Tests: Phase 1 Oracle and Architectural Model
@@ -508,6 +567,125 @@ class TestScalarSALUInterpreter(unittest.TestCase):
         self.assertEqual(res.new_exec, 0)
         self.assertEqual(res.scc, 0)
         self.assertEqual(self.state.scc, 0)
+
+
+class TestSIMDMultiLaneDivergence(unittest.TestCase):
+    """Unit tests for SIMD execution, lane divergence, and 32/64-bit EXEC masking."""
+
+    def setUp(self) -> None:
+        self.executor = SIMDInstructionExecutor()
+
+    def test_wave64_divergence_toggle(self) -> None:
+        """Start with even lanes active, XOR with all ones, verify only odd lanes execute VALU."""
+        state = SIMDWavefrontState(wave_size=64)
+        state.salu_state.exec_mask = EVEN_LANES_W64
+
+        # Initialise v0 with 100 for all lanes, v1 with sentinel 0xDEAD
+        for lane in range(64):
+            state.write_vgpr(lane, 0, 100)
+            state.write_vgpr(lane, 1, 0xDEAD)
+
+        # Toggle active lanes with ~0
+        toggle_inst = SXorSaveExecB64AST(
+            dst=Register(RegKind.SGPR, 0, count=2),
+            src0=LiteralConstant64(ALL_LANES_W64),
+        )
+        salu_res = self.executor.step_salu(toggle_inst, state)
+        self.assertEqual(salu_res.saved_exec, EVEN_LANES_W64)
+        self.assertEqual(salu_res.new_exec, ODD_LANES_W64)
+        self.assertEqual(state.salu_state.exec_mask, ODD_LANES_W64)
+
+        # Execute masked VALU add: v1 = v0 + 50
+        written = self.executor.step_valu_add_u32(dst_v=1, src_v=0, addend=50, state=state)
+
+        for lane in range(64):
+            if lane % 2 == 1:
+                # Odd lanes were activated by XOR
+                self.assertEqual(written[lane], 150)
+                self.assertEqual(state.read_vgpr(lane, 1), 150)
+            else:
+                # Even lanes were deactivated by XOR
+                self.assertIsNone(written[lane])
+                self.assertEqual(state.read_vgpr(lane, 1), 0xDEAD)
+
+    def test_wave32_upper_half_masking(self) -> None:
+        """In Wave32 mode, execution mask is strictly bounded to lower 32 lanes."""
+        state = SIMDWavefrontState(wave_size=32)
+        state.salu_state.exec_mask = 0x0000_0000_FFFF_0000
+
+        # Attempt XOR with 64-bit mask that touches upper half
+        toggle_inst = SXorSaveExecB64AST(
+            dst=Register(RegKind.SGPR, 4, count=2),
+            src0=LiteralConstant64(ALL_LANES_W64),
+        )
+        self.executor.step_salu(toggle_inst, state)
+
+        # In Wave32, upper 32 bits of active exec mask must remain 0
+        self.assertEqual(state.salu_state.exec_mask & UPPER_HALF_W64, 0)
+        self.assertEqual(state.salu_state.exec_mask, 0x0000_0000_0000_FFFF)
+        self.assertEqual(len(state.active_lane_indices()), 16)
+
+    def test_wave64_if_else_reconvergence_flow(self) -> None:
+        """Emulate complete compiler if-else divergence and reconvergence workflow."""
+        state = SIMDWavefrontState(wave_size=64)
+        outer_mask = ALL_LANES_W64
+        state.salu_state.exec_mask = outer_mask
+
+        # Subgroup condition: lower 32 lanes satisfy 'if' condition
+        cond_mask = LOWER_HALF_W64
+
+        # Save outer mask in s[10:11], set EXEC to if-branch
+        # In compiler: s_and_saveexec_b64 s[10:11], cond_mask
+        state.salu_state.write_sgpr_u64(10, outer_mask)
+        state.salu_state.exec_mask = cond_mask
+
+        # At the end of 'if', transition to 'else' via s_xor_saveexec_b64 s[12:13], s[10:11]
+        # EXEC = EXEC ^ s[10:11] = LOWER_HALF ^ ALL_LANES = UPPER_HALF!
+        else_transition = SXorSaveExecB64AST(
+            dst=Register(RegKind.SGPR, 12, count=2),
+            src0=Register(RegKind.SGPR, 10, count=2),
+        )
+        res = self.executor.step_salu(else_transition, state)
+        self.assertEqual(res.saved_exec, LOWER_HALF_W64)
+        self.assertEqual(state.salu_state.exec_mask, UPPER_HALF_W64)
+        self.assertEqual(state.active_lane_indices(), list(range(32, 64)))
+
+    def test_wave_total_sleep_all_lanes_disabled(self) -> None:
+        """When EXEC XOR with itself yields 0, all lanes are disabled and VALU writes do nothing."""
+        state = SIMDWavefrontState(wave_size=64)
+        state.salu_state.exec_mask = 0x1234_5678_9ABC_DEF0
+        state.salu_state.write_sgpr_u64(6, 0x1234_5678_9ABC_DEF0)
+
+        inst = SXorSaveExecB64AST(
+            dst=Register(RegKind.SGPR, 0, count=2),
+            src0=Register(RegKind.SGPR, 6, count=2),
+        )
+        self.executor.step_salu(inst, state)
+        self.assertEqual(state.salu_state.exec_mask, 0)
+        self.assertEqual(state.salu_state.scc, 0)
+        self.assertEqual(len(state.active_lane_indices()), 0)
+
+        # VALU write
+        written = self.executor.step_valu_add_u32(dst_v=0, src_v=0, addend=1, state=state)
+        self.assertTrue(all(w is None for w in written))
+
+    def test_popcount_consistency_with_exec(self) -> None:
+        """Popcount of active lanes strictly matches active bits in exec_mask."""
+        test_masks = [
+            0x0,
+            0x1,
+            0x8000_0000_0000_0000,
+            EVEN_LANES_W64,
+            ODD_LANES_W64,
+            LOWER_HALF_W64,
+            UPPER_HALF_W64,
+            ALL_LANES_W64,
+        ]
+        for m in test_masks:
+            state = SIMDWavefrontState(wave_size=64)
+            state.salu_state.exec_mask = m
+            expected_pop = bin(m).count("1")
+            self.assertEqual(len(state.active_lane_indices()), expected_pop)
 
 
 if __name__ == "__main__":
