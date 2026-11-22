@@ -32,8 +32,8 @@ The decoded export used by the previews contains 13 parts:
 | head L2 | same | 599 | 514 | same preset |
 | eyes | `…_head_fr1_lat_000_m_eyes.#dr` | 434 | 816 | `0x429453B7A2EB9980` (sRGB + alpha) |
 | eyecap | `…_head_fr1_lat_000_m_eyecap.#dr` | 214 | 304 | `0x5CE55BAA340248BD` (sRGB + alpha) |
-| hands | `hand_fr1_000_nude_cull.#dr` | 10,440 | 13,534 | unresolved — key does not decode here |
-| feet | `feet_fr1_000_full.#dr` | 2,309 | 4,082 | unresolved — key does not decode here |
+| hands | `hand_fr1_000_nude_cull.#dr` | 10,440 | 13,534 | none in the package — `0x4D89F2311DBBB7A8` is in no TTPF pool (see [Hands and feet](#hands-and-feet)) |
+| feet | `feet_fr1_000_full.#dr` | 2,309 | 4,082 | none in the package — `0xA54D9F8B51CA6034` is in no TTPF pool (see [Hands and feet](#hands-and-feet)) |
 | body (legacy) | `cs_lucia_legacypedcs_fr1_000_fullbody_ws00_full.#dr` | 874 | 908 | `0x996FDBA2DB30CC12` |
 | legacy head | `cs_lucia_legacyheadcs_fr1_001_regular_ws00_full.#dr` | 592 | 1,028 | `0x707771F769AA3542` |
 | jacket (biker) | `cs_lucia_jacketbiker_fr1_000_regular_c_hl_long_full.#dr` | 9,818 | 10,837 | none — `speculartex` only (`0xF5073AA039BB3CED`) |
@@ -127,8 +127,8 @@ the export binds the slot (1,372 of 1,372). Both keys are 512x256 `BC3_UNORM_SRG
 other textures (`0x93CB433D30220BA6` and `0x5D237CCCD91F8E4D`, 256x128 `BC7_UNORM`), where the
 jacket's and the crop tee's table keys are `BC7_UNORM` `speculartex` sheets themselves.
 
-The hands and feet keys (`0x4D89F2311DBBB7A8`, `0xA54D9F8B51CA6034`) did not resolve in the
-scanned TTPF pools. The head drawable has no material texture reference, but its face is selected by
+The hands and feet bind an albedo key that is not in the package (see [Hands and feet](#hands-and-feet)).
+The head drawable has no material texture reference, but its face is selected by
 a **head-skin preset** keyed by the head name's `joaat32`:
 
 | Head | Face albedo | Face normal |
@@ -137,6 +137,47 @@ a **head-skin preset** keyed by the head name's `joaat32`:
 | `cs_monalisa_head_fr1_afr_000_m_full` | `0x53A2896F4E5A6BA6` | `0xE82C7F6E02C8B701` |
 
 The preset library covers 897 heads; `cs_lucia_head_fr1_lat_000_y_full` is not in it.
+
+### Hands and feet
+
+Measured against the catalogs of all 57 TTPF pools (357,115 textures). The hands and the feet bind
+the four maps on the same two shaders (`210FBC6A`, `8D69EDAB`), and **only the normal maps are in
+the package**:
+
+| Part | `diffusetex` | `speculartex` | `bumptex` (normal) | `speculartex2` (ORM) |
+|---|---|---|---|---|
+| hands (`hand_fr1_000_*`) | `0x4D89F2311DBBB7A8` — none | `0xA805B9A446CCE950` — none | `0x9D337DABCA636906` — `ttdb_peds_2_3`, 512×1024 BC5 | `0x09D2C98C5B40D16C` — none |
+| feet (`feet_fr1_000_*`) | `0xA54D9F8B51CA6034` — none | `0x752EA8A7A086558F` — none | `0x5091E86DE6196BC3` — `ttdb_peds_3_3`, 512×1024 BC7 | `0xD5C8D2A180326DE7` — none |
+
+Each material has ten slots; the other six bind `0x5D7A3A87CC19967D` on both shaders, which is in
+no pool either: it reads as an engine-supplied default, not a missing asset.
+
+**They are not textured on their own.** The hands and feet share their maps with the body skin
+pieces in `pack/core_restofworld/core_restofworld.rpf`:
+
+- `bodynipplesgen_fr1_000_regular_ws00_full`, the female upper body, binds **the same four keys**
+  as the hands, on the same two shaders. The hands are drawn with the upper-body skin sheet.
+- `bodygenitalsgen_f{r,b,o}1_008_regular_ws00_full`, the female lower body (and the `fr1`
+  `_alt_00`–`_02` variants), binds the feet's
+  `speculartex`, `bumptex` and `speculartex2`, and its own `diffusetex` `0x5B6829CFEC0F41A1`, also in
+  no pool.
+- The male lower body, `bodygenitalsgen_mr1_000_*`, has all four maps in the pools
+  (`diffusetex` `0xBCE4D91DA23689C7`).
+
+So the female body skin has no albedo, specular or ORM map in the package, for the hands and feet
+and for the body pieces that share their sheets. The skin colour has to come from data outside these
+materials, as the face comes from the head-skin preset. That data was not found: none of the keys
+above appears in another resource of `data.rpf`, `common.rpf`, `script.rpf`, `packs.rpf`,
+`anim.rpf`, `core_restofworld.rpf` or `core_restofworld001.rpf` (`story000.rpf` and
+`story000_restofworld.rpf` recover no entries with this reader).
+
+The pattern holds across the set. Of the 56 `hand_`/`feet_` drawables in `packs.rpf`, 52 bind only a
+`diffusetex` key that is in no pool; the four exceptions with all four maps shipped are
+`hand_fsk1_000_nude_cull`, `feet_fsk1_000_nude_cull` and the first-person hands
+`hand_mb1_000_nude_cull_fp` and `hand_mo1_000_nude_cull_fp`. The male hands and feet
+(`hand_mr1_000_nude_cull`, `feet_mr1_000_nude_cull`) also ship only their normal maps, and male and
+female feet bind the same `diffusetex` key. Until the skin data is decoded, render these parts with
+their normal map and a flat skin tone; do not borrow another part's albedo.
 
 ## Materials
 
@@ -273,6 +314,29 @@ for item in items:
 
 A key's size and format come from the pool that holds it: the `AssetKey`, `Width`, `Height`,
 `DxgiFormat` and `Mips` fields of the manifest `rpf9dump ttpf <pool.ttpf> <outdir>` writes.
+
+The [Hands and feet](#hands-and-feet) tables also need `core_restofworld.rpf` and the 57 pool
+catalogs (`AssetKey` in each pool's `manifest.json`):
+
+```powershell
+rpf9dump models <pack\core_restofworld\core_restofworld.rpf> <outdir>
+rpf9dump ttpf <each .ttpf under data\ttdb and pack\*\data\ttdb> <outdir>\ttpf\<pool>
+```
+
+```python
+import glob, json
+
+maps = {"C8E8C282": "diffusetex", "C6F46E79": "speculartex", "1E77BF4C": "bumptex", "739E3D0D": "speculartex2"}
+pooled = {t["AssetKey"] for m in glob.glob(r"<outdir>/ttpf/*/manifest.json")
+          for t in json.load(open(m, encoding="utf-8"))["Textures"]}
+items = [i for m in (r"<outdir>/packs/models/manifest.json", r"<outdir>/core_restofworld/models/manifest.json")
+         for i in json.load(open(m, encoding="utf-8"))["Items"]]
+for name in ("hand_fr1_000_nude_cull.#dr", "feet_fr1_000_full.#dr", "bodynipplesgen_fr1_000_regular_ws00_full.#dr",
+             "bodygenitalsgen_fr1_008_regular_ws00_full.#dr", "bodygenitalsgen_mr1_000_regular_ws00_full.#dr"):
+    keys = {maps[t["Param"]]: t["Id64"] for i in items if i["Name"] == name
+            for mat in i["Materials"] for t in mat["Textures"] if t["Param"] in maps}
+    print(name, {k: (v, v in pooled) for k, v in keys.items()})
+```
 
 The fragment and skinning fields are in the same manifest; the skeleton measurements are in
 [character_skeleton.md](character_skeleton.md), and the world model export is in
