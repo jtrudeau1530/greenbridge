@@ -417,6 +417,32 @@ def draw_binding(system, graphics, geometry):
     return {"vertex_block": vertex, "meshlet_group": index, "vertices": count}
 
 
+def same_output_path(first, second):
+    if os.path.normcase(os.path.realpath(first)) == os.path.normcase(os.path.realpath(second)):
+        return True
+    try:
+        return os.path.samefile(first, second)
+    except OSError:
+        return False
+
+
+def is_scanned_input(path, input_path):
+    """True when a report path is one of the files the scan reads: writing it would destroy the input."""
+    if same_output_path(path, input_path):
+        return True
+    if not os.path.isdir(input_path) or not os.path.isfile(path):
+        return False
+    manifest = os.path.join(input_path, "index.json")
+    if os.path.isfile(manifest) and same_output_path(path, manifest):
+        return True
+    root = os.path.normcase(os.path.abspath(input_path))
+    target = os.path.normcase(os.path.abspath(path))
+    if os.path.dirname(target) != root and not target.startswith(root + os.sep):
+        return False
+    base = os.path.basename(target)
+    return base.endswith(".bin") or base.endswith(".rpf")
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("inputs", nargs="+", help="carved page files, folders of them, or .rpf archives")
@@ -429,6 +455,17 @@ def main(argv=None):
     select.add_argument("--drawable-offset", type=lambda s: int(s, 0),
                         help="walk primary LOD geometry records from this system-segment drawable")
     args = ap.parse_args(argv)
+    if args.json:
+        if os.path.isdir(args.json):
+            print(f"error: --json {args.json} is a directory", file=sys.stderr)
+            return 2
+        candidates = list(args.inputs)
+        if args.draw_system:
+            candidates.append(args.draw_system)
+        for inp in candidates:
+            if is_scanned_input(args.json, inp):
+                print(f"error: --json would overwrite the input {inp}", file=sys.stderr)
+                return 2
     if args.draw_system is not None or args.geometry_offset is not None or args.drawable_offset is not None:
         if not args.draw_system or (not args.geometry_offset and args.drawable_offset is None) or len(args.inputs) != 1:
             ap.error("draw binding needs one graphics segment, --draw-system and a geometry or drawable offset")
@@ -449,8 +486,12 @@ def main(argv=None):
                 rows.append({"drawable": args.drawable_offset, "unresolved": str(exc)})
             report = json.dumps({"bindings": rows}, indent=2)
             if args.json:
-                with open(args.json, "w", encoding="utf-8") as out:
-                    out.write(report + "\n")
+                try:
+                    with open(args.json, "w", encoding="utf-8") as out:
+                        out.write(report + "\n")
+                except OSError as exc:
+                    print(f"error: cannot write {args.json}: {exc.strerror or exc}", file=sys.stderr)
+                    return 2
             if not args.quiet:
                 print(report)
             return int(any("unresolved" in row for row in rows))
