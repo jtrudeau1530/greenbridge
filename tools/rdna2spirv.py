@@ -485,8 +485,9 @@ class Gen:
         """Read the 3 operands of v_fma_mix*: f16 at op_sel[i] when op_sel_hi[i] is set (via src_h so fimm is binary16), else f32."""
         sel = next((m for m in mods if m.startswith("op_sel:")), "op_sel:[0,0,0]")
         selhi = next((m for m in mods if m.startswith("op_sel_hi:")), "op_sel_hi:[0,0,0]")
-        sb = [int(x) for x in sel.split("[")[1].rstrip("]").split(",")]
-        hb = [int(x) for x in selhi.split("[")[1].rstrip("]").split(",")]
+        # A hand-written list shorter than the three operands (op_sel_hi:[0,0]) is padded with 0, as llvm-mc prints it.
+        sb = ([int(x) for x in sel.split("[")[1].rstrip("]").split(",")] + [0, 0, 0])[:3]
+        hb = ([int(x) for x in selhi.split("[")[1].rstrip("]").split(",")] + [0, 0, 0])[:3]
         # An f32 operand reads as a zero of its sign when it is denormal: the game's MODE flushes f32 denormals
         # (denorm_mode_32 = 0), measured on gfx1036 for 0x00000001, 0x807fffff and the integer inline constants 1 and
         # 64 used as f32 operands (@Sanonymous01, SHADER-298). The f16 operands widen to normal f32 values.
@@ -5976,7 +5977,10 @@ class Gen:
             # op_sel_hi [1,1], no negation.
             def bits(name, default):
                 m = next((m for m in mods if m.startswith(name + ":")), None)
-                return [int(v) for v in m.split("[")[1].rstrip("]").split(",")] if m else default
+                if not m:
+                    return default
+                # a list shorter than the operands (neg_lo:[1,0] on v_pk_fma_f16) is padded with 0, as llvm-mc prints it
+                return ([int(v) for v in m.split("[")[1].rstrip("]").split(",")] + [0] * len(default))[:len(default)]
             ns = 3 if op == "v_pk_fma_f16" else 2
             sel, selhi = bits("op_sel", [0] * ns), bits("op_sel_hi", [1] * ns)
             nlo, nhi = bits("neg_lo", [0] * ns), bits("neg_hi", [0] * ns)
@@ -6457,6 +6461,11 @@ class Gen:
         elif op in ("v_add_co_u32", "v_add_co_ci_u32", "v_sub_co_u32", "v_sub_co_ci_u32", "v_subrev_co_u32",
                     "v_subrev_co_ci_u32"):
             # Lane masks are all-ones/zero: carry in = (vcc or the named mask) != 0, carry out stored the same way.
+            if op.endswith("ci_u32") and len(a) == 3:
+                # the assembler's short form v_add_co_ci_u32 vD, src0, src1: carry out and in are VCC (llvm-mc and the
+                # disassembler print it as v_add_co_ci_u32_e32 vD, vcc_lo, src0, src1, vcc_lo)
+                vcc = {"k": "special", "t": "vcc"}
+                a = [a[0], vcc, a[1], a[2], vcc]
             vd, cd = a[0], a[1]
             srcs = a[2:]
             x, y = self.src_u(srcs[0]), self.src_u(srcs[1])
