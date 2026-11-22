@@ -263,11 +263,15 @@ def register_summary(reg_stage) -> dict:
     return out
 
 
+def carve_index_path(disasm_dir):
+    return os.path.join(os.path.dirname(os.path.realpath(disasm_dir)), "index.json")
+
+
 def stage_map(disasm_dir) -> dict:
     """{shader file stem: stage} from shader_carve.py's index.json next to the disasm folder (the stage comes from
     each container's program header), as rdna2spirv.stage_of reads it. Most corpus names carry no stage prefix,
     so the name is only a fallback for shaders the index doesn't list. Empty when there is no readable index."""
-    path = os.path.join(os.path.dirname(os.path.realpath(disasm_dir)), "index.json")
+    path = carve_index_path(disasm_dir)
     try:
         with open(path, encoding="utf-8") as f:
             entries = json.load(f)
@@ -299,6 +303,10 @@ def main():
         print(f"ERROR: {a.src} {what}. Give the folder of .s files shader_disasm.py writes.", file=sys.stderr)
         return 2
     path = a.out or os.path.join(a.src, "..", "profile.json")
+    index = carve_index_path(a.src)
+    if same_output_path(index, path):
+        print(f"ERROR: output would overwrite the shader carve index {index}", file=sys.stderr)
+        return 2
     if os.path.isdir(path):
         print(f"ERROR: cannot write {path}: destination is a directory, not a file", file=sys.stderr)
         return 2

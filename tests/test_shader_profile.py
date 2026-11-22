@@ -534,6 +534,43 @@ class TestCommandLineEndToEnd(unittest.TestCase):
         b = os.path.join(self.disasm_dir, "b.json")
         self.assertFalse(P.same_output_path(a, b))
 
+    def assert_carve_index_output_refused(self, output):
+        tool = os.path.join(ROOT, "tools", "shader_profile.py")
+        res = subprocess.run(
+            [sys.executable, "-I", tool, self.disasm_dir, "--out", output],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(res.returncode, 2, res.stderr)
+        self.assertIn("ERROR: output would overwrite the shader carve index", res.stderr)
+
+    def test_cli_reserves_the_carve_index_path(self):
+        self.write("cs_main", "\ts_endpgm\n")
+        index = os.path.join(self.tmp.name, "index.json")
+        self.assert_carve_index_output_refused(index)
+        self.assertFalse(os.path.exists(index))
+        original = '[{"file": "cs_main.dxbc", "stage": "cs"}]'
+        with open(index, "w", encoding="utf-8") as f:
+            f.write(original)
+        self.assert_carve_index_output_refused(index)
+        with open(index, encoding="utf-8") as f:
+            self.assertEqual(f.read(), original)
+
+    def test_cli_refuses_a_hard_link_to_the_carve_index(self):
+        self.write("cs_main", "\ts_endpgm\n")
+        index = os.path.join(self.tmp.name, "index.json")
+        original = '[{"file": "cs_main.dxbc", "stage": "cs"}]'
+        with open(index, "w", encoding="utf-8") as f:
+            f.write(original)
+        alias = os.path.join(self.tmp.name, "alias.json")
+        try:
+            os.link(index, alias)
+        except OSError as error:
+            self.skipTest(f"hard links are unavailable: {error}")
+        self.assert_carve_index_output_refused(alias)
+        with open(index, encoding="utf-8") as f:
+            self.assertEqual(f.read(), original)
+
     def test_cli_refuses_output_overwriting_input_shader(self):
         tool = os.path.join(ROOT, "tools", "shader_profile.py")
         shader_file = os.path.join(self.disasm_dir, "ps_001.s")
