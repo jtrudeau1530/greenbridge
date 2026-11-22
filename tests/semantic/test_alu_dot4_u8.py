@@ -266,5 +266,281 @@ class ReferenceOracleTests(unittest.TestCase):
             self.assertEqual(ref_dot4acc_u32_u8(s0, s1, s2), ref_dot4_u32_u8(s0, s1, s2))
 
 
+class WavefrontDot4Interpreter:
+    """Simulates an RDNA2 SIMD wavefront executing VALU/SALU dot-product instructions.
+
+    Models:
+      - Wave32 (32 lanes) and Wave64 (64 lanes).
+      - Per-lane VGPR files: vgprs[reg][lane].
+      - Uniform SGPR file: sgprs[reg].
+      - EXEC mask: 32-bit or 64-bit integer mask.
+      - Instructions: v_mov_b32, s_mov_b32, s_mov_b64, v_dot4_u32_u8, v_dot4acc_u32_u8, v_dot4c_u32_u8.
+    """
+
+    def __init__(self, wave_size: int = 32):
+        if wave_size not in (32, 64):
+            raise ValueError(f"Unsupported wave_size {wave_size}; must be 32 or 64")
+        self.wave_size = wave_size
+        self.vgprs = [[0] * wave_size for _ in range(256)]
+        self.sgprs = [0] * 106
+        self.exec_mask = (1 << wave_size) - 1
+
+    def set_vgpr(self, reg: int, lane: int, val: int) -> None:
+        self.vgprs[reg][lane] = val & MASK32
+
+    def get_vgpr(self, reg: int, lane: int) -> int:
+        return self.vgprs[reg][lane] & MASK32
+
+    def set_sgpr(self, reg: int, val: int) -> None:
+        self.sgprs[reg] = val & MASK32
+
+    def get_sgpr(self, reg: int) -> int:
+        return self.sgprs[reg] & MASK32
+
+    def set_exec(self, mask: int) -> None:
+        self.exec_mask = mask & ((1 << self.wave_size) - 1)
+
+    def parse_operand(self, token: str, lane: int) -> int:
+        token = token.strip().rstrip(",")
+        lower = token.lower()
+        if lower.startswith("v") and lower[1:].isdigit():
+            idx = int(lower[1:])
+            if 0 <= idx < 256:
+                return self.vgprs[idx][lane] & MASK32
+            raise IndexError(f"VGPR index out of range: {token}")
+        if lower.startswith("s") and lower[1:].isdigit():
+            idx = int(lower[1:])
+            if 0 <= idx < 106:
+                return self.sgprs[idx] & MASK32
+            raise IndexError(f"SGPR index out of range: {token}")
+        if lower.startswith("0x") or lower.startswith("-0x"):
+            return int(token, 16) & MASK32
+        return int(token) & MASK32
+
+    def execute_line(self, line: str) -> None:
+        line = line.split(";", 1)[0].split("//", 1)[0].strip()
+        if not line:
+            return
+        parts = line.split(None, 1)
+        opcode = parts[0].lower()
+        args_str = parts[1] if len(parts) > 1 else ""
+
+        tokens = [t.strip() for t in args_str.split(",") if t.strip()]
+
+        if opcode == "s_mov_b32":
+            dst = tokens[0].lower()
+            if not (dst.startswith("s") and dst[1:].isdigit()):
+                raise ValueError(f"s_mov_b32 dst must be SGPR, got {tokens[0]}")
+            s_idx = int(dst[1:])
+            val = self.parse_operand(tokens[1], 0)
+            self.sgprs[s_idx] = val
+
+        elif opcode in ("v_mov_b32", "v_mov_b32_e32"):
+            dst = tokens[0].lower()
+            if not (dst.startswith("v") and dst[1:].isdigit()):
+                raise ValueError(f"v_mov_b32 dst must be VGPR, got {tokens[0]}")
+            v_idx = int(dst[1:])
+            for lane in range(self.wave_size):
+                if (self.exec_mask >> lane) & 1:
+                    val = self.parse_operand(tokens[1], lane)
+                    self.vgprs[v_idx][lane] = val
+
+        elif opcode in ("v_dot4_u32_u8", "v_dot4acc_u32_u8"):
+            # VOP3/VOP3P: dst, src0, src1, src2
+            dst = tokens[0].lower()
+            if not (dst.startswith("v") and dst[1:].isdigit()):
+                raise ValueError(f"{opcode} dst must be VGPR, got {tokens[0]}")
+            v_idx = int(dst[1:])
+            for lane in range(self.wave_size):
+                if (self.exec_mask >> lane) & 1:
+                    s0 = self.parse_operand(tokens[1], lane)
+                    s1 = self.parse_operand(tokens[2], lane)
+                    s2 = self.parse_operand(tokens[3], lane) if len(tokens) > 3 else 0
+                    self.vgprs[v_idx][lane] = ref_dot4_u32_u8(s0, s1, s2)
+
+        elif opcode == "v_dot4c_u32_u8":
+            # VOP2: dst, src0, src1 (dst is accumulator)
+            dst = tokens[0].lower()
+            if not (dst.startswith("v") and dst[1:].isdigit()):
+                raise ValueError(f"v_dot4c_u32_u8 dst must be VGPR, got {tokens[0]}")
+            v_idx = int(dst[1:])
+            for lane in range(self.wave_size):
+                if (self.exec_mask >> lane) & 1:
+                    s0 = self.parse_operand(tokens[1], lane)
+                    s1 = self.parse_operand(tokens[2], lane)
+                    old_acc = self.vgprs[v_idx][lane]
+                    self.vgprs[v_idx][lane] = ref_dot4_u32_u8(s0, s1, old_acc)
+
+        elif opcode == "s_endpgm":
+            return
+        else:
+            raise NotImplementedError(f"Unsupported opcode: {opcode}")
+
+    def execute_program(self, program: str | list[str]) -> None:
+        lines = program if isinstance(program, list) else program.strip().splitlines()
+        for line in lines:
+            self.execute_line(line)
+
+
+class WavefrontInterpreterTests(unittest.TestCase):
+    """Verifies SIMD multi-lane wavefront execution and accumulation semantics."""
+
+    def test_wave32_uniform_execution(self) -> None:
+        """32-lane SIMD execution under full EXEC mask with divergent per-lane data."""
+        interp = WavefrontDot4Interpreter(wave_size=32)
+        for lane in range(32):
+            s0 = ((lane + 1) * 0x01020304) & MASK32
+            s1 = 0x05060708
+            acc = lane * 10
+            interp.set_vgpr(1, lane, s0)
+            interp.set_vgpr(2, lane, s1)
+            interp.set_vgpr(3, lane, acc)
+
+        interp.execute_line("v_dot4_u32_u8 v0, v1, v2, v3")
+
+        for lane in range(32):
+            s0 = ((lane + 1) * 0x01020304) & MASK32
+            s1 = 0x05060708
+            acc = lane * 10
+            expected = ref_dot4_u32_u8(s0, s1, acc)
+            self.assertEqual(interp.get_vgpr(0, lane), expected)
+
+    def test_wave64_uniform_execution(self) -> None:
+        """64-lane SIMD execution covering the entire Wave64 execution space."""
+        interp = WavefrontDot4Interpreter(wave_size=64)
+        for lane in range(64):
+            s0 = (0x01010101 * lane) & MASK32
+            s1 = 0x02020202
+            interp.set_vgpr(1, lane, s0)
+            interp.set_vgpr(2, lane, s1)
+            interp.set_vgpr(3, lane, 0x1000)
+
+        interp.execute_line("v_dot4acc_u32_u8 v8, v1, v2, v3")
+
+        for lane in range(64):
+            s0 = (0x01010101 * lane) & MASK32
+            s1 = 0x02020202
+            expected = ref_dot4_u32_u8(s0, s1, 0x1000)
+            self.assertEqual(interp.get_vgpr(8, lane), expected)
+
+    def test_v_dot4c_u32_u8_accumulator_reads_destination(self) -> None:
+        """v_dot4c_u32_u8 (VOP2) uses destination register's prior value as accumulator."""
+        interp = WavefrontDot4Interpreter(wave_size=32)
+        # Initialize v0 destination accumulator to 500 across all lanes
+        for lane in range(32):
+            interp.set_vgpr(0, lane, 500)
+            interp.set_vgpr(1, lane, 0x01020304)
+            interp.set_vgpr(2, lane, 0x05060708)
+
+        # First dot product adds 70 to 500 = 570
+        interp.execute_line("v_dot4c_u32_u8 v0, v1, v2")
+        for lane in range(32):
+            self.assertEqual(interp.get_vgpr(0, lane), 570)
+
+        # Second successive dot product adds another 70 = 640
+        interp.execute_line("v_dot4c_u32_u8 v0, v1, v2")
+        for lane in range(32):
+            self.assertEqual(interp.get_vgpr(0, lane), 640)
+
+    def test_accumulator_chain_loop(self) -> None:
+        """Simulate an inner-loop dot-product reduction accumulating across iterations."""
+        interp = WavefrontDot4Interpreter(wave_size=32)
+        running_totals = [0] * 32
+        steps = [
+            (0x01010101, 0x02020202),  # 4 * 2 = 8
+            (0x03030303, 0x04040404),  # 4 * 12 = 48
+            (0x05050505, 0x06060606),  # 4 * 30 = 120
+            (0x07070707, 0x08080808),  # 4 * 56 = 224
+        ]
+        for s0, s1 in steps:
+            for lane in range(32):
+                interp.set_vgpr(1, lane, s0)
+                interp.set_vgpr(2, lane, s1)
+                running_totals[lane] = (running_totals[lane] + ref_dot4_u32_u8(s0, s1, 0)) & MASK32
+            interp.execute_line("v_dot4c_u32_u8 v0, v1, v2")
+
+        for lane in range(32):
+            self.assertEqual(interp.get_vgpr(0, lane), running_totals[lane])
+            self.assertEqual(interp.get_vgpr(0, lane), 8 + 48 + 120 + 224)
+
+    def test_wave_lane_divergence_exec_mask(self) -> None:
+        """Inactive lanes under partial EXEC mask must strictly preserve destination registers."""
+        interp = WavefrontDot4Interpreter(wave_size=32)
+        sentinel = 0xDEADBEEF
+
+        # Prepopulate destination register v5 with sentinel
+        for lane in range(32):
+            interp.set_vgpr(5, lane, sentinel)
+            interp.set_vgpr(1, lane, 0x01020304)
+            interp.set_vgpr(2, lane, 0x05060708)
+            interp.set_vgpr(3, lane, 100)
+
+        # Set EXEC to lower 16 lanes only (0x0000FFFF)
+        interp.set_exec(0x0000FFFF)
+        interp.execute_line("v_dot4_u32_u8 v5, v1, v2, v3")
+
+        # Active lanes (0..15) must be updated to 170 (70 + 100)
+        # Inactive lanes (16..31) must strictly preserve sentinel 0xDEADBEEF
+        for lane in range(32):
+            if lane < 16:
+                self.assertEqual(interp.get_vgpr(5, lane), 170)
+            else:
+                self.assertEqual(interp.get_vgpr(5, lane), sentinel)
+
+    def test_odd_even_lane_divergence(self) -> None:
+        """Divergent execution between alternating even and odd lanes."""
+        interp = WavefrontDot4Interpreter(wave_size=32)
+        for lane in range(32):
+            interp.set_vgpr(10, lane, 0)
+            interp.set_vgpr(1, lane, 0x01010101)  # dot = 4 * 10 = 40
+            interp.set_vgpr(2, lane, 0x0A0A0A0A)
+            interp.set_vgpr(3, lane, 0x02020202)  # dot = 4 * 40 = 160
+            interp.set_vgpr(4, lane, 0x14141414)
+
+        # Step 1: Execute even lanes with (v1 . v2)
+        interp.set_exec(0x55555555)  # 01010101... (even lanes 0, 2, 4...)
+        interp.execute_line("v_dot4_u32_u8 v10, v1, v2, 0")
+
+        # Step 2: Execute odd lanes with (v3 . v4)
+        interp.set_exec(0xAAAAAAAA)  # 10101010... (odd lanes 1, 3, 5...)
+        interp.execute_line("v_dot4_u32_u8 v10, v3, v4, 0")
+
+        for lane in range(32):
+            expected = 40 if (lane % 2 == 0) else 160
+            self.assertEqual(interp.get_vgpr(10, lane), expected)
+
+    def test_single_lane_active(self) -> None:
+        """Only a single lane active (lane 13), ensuring no collateral writes."""
+        interp = WavefrontDot4Interpreter(wave_size=32)
+        for lane in range(32):
+            interp.set_vgpr(7, lane, 0xBAADF00D)
+            interp.set_vgpr(1, lane, 0x01020304)
+            interp.set_vgpr(2, lane, 0x05060708)
+
+        target_lane = 13
+        interp.set_exec(1 << target_lane)
+        interp.execute_line("v_dot4_u32_u8 v7, v1, v2, 0")
+
+        for lane in range(32):
+            if lane == target_lane:
+                self.assertEqual(interp.get_vgpr(7, lane), 70)
+            else:
+                self.assertEqual(interp.get_vgpr(7, lane), 0xBAADF00D)
+
+    def test_scalar_source_broadcast(self) -> None:
+        """SGPR sources broadcast uniform values across all lanes."""
+        interp = WavefrontDot4Interpreter(wave_size=32)
+        interp.set_sgpr(4, 0x05060708)
+        interp.set_sgpr(5, 5000)
+
+        for lane in range(32):
+            interp.set_vgpr(1, lane, 0x01020304)
+
+        interp.execute_line("v_dot4_u32_u8 v0, v1, s4, s5")
+
+        for lane in range(32):
+            self.assertEqual(interp.get_vgpr(0, lane), 5070)
+
+
 if __name__ == "__main__":
     unittest.main()
