@@ -153,7 +153,9 @@ bool resolve_and_read(ID3D12Device* device, const Case& c, Planes& out, bool run
     Event event;
     CHECK(event.handle);
     CHECK(SUCCEEDED(fence->SetEventOnCompletion(1, event.handle)));
-    CHECK(WaitForSingleObject(event.handle, 5000) == WAIT_OBJECT_0);
+    // 30 s, not 5 s: under `ctest -j 6` other GPU tests share the device, and a fence can take longer
+    // than this test's idle runtime to signal (TEST-514 flake). Sibling tests already wait 15-60 s.
+    CHECK(WaitForSingleObject(event.handle, 30000) == WAIT_OBJECT_0);
     void* mapped = nullptr;
     const D3D12_RANGE range{0, SIZE_T(total)};
     CHECK(SUCCEEDED(readback->Map(0, &range, &mapped)) && mapped);
