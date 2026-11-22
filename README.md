@@ -93,8 +93,11 @@ Your game folder is the one that holds `MicrosoftGame.Config` and the `.rpf` arc
 - [Vulkan SDK](https://vulkan.lunarg.com/), for `spirv-as` / `spirv-val`.
 - [LLVM 21+](https://github.com/llvm/llvm-project/releases) with the **AMDGPU target** for `llvm-mc`. The official
   Windows build has no AMDGPU target. On Windows, `scripts\build_llvm_mc.ps1` builds a native `llvm-mc.exe` with it
-  (no WSL; needs git and the Visual Studio C++ tools below) and sets `LLVM_MC`. Or install `llvm-21` in WSL and set
-  `LLVM_MC` to the whole command, `LLVM_MC="wsl -d Ubuntu -e /usr/lib/llvm-21/bin/llvm-mc"` (see
+  (no WSL; needs git and the Visual Studio C++ tools below) and sets `LLVM_MC`; it takes about 20-40 minutes. A faster
+  way, if you use [conda](https://docs.conda.io/): `conda install -c conda-forge llvm-tools` (its Windows build
+  includes the AMDGPU target; [docs/testing.md](docs/testing.md) used version 23.1.6), then set `LLVM_MC` to the full
+  path of the `llvm-mc.exe` it installs (`where llvm-mc` shows it once the environment is active). Or install `llvm-21`
+  in WSL and set `LLVM_MC` to the whole command, `LLVM_MC="wsl -d Ubuntu -e /usr/lib/llvm-21/bin/llvm-mc"` (see
   [docs/design.md](docs/design.md#disassembling-shaders)). On Linux, `llvm-mc` on PATH is enough.
 - Visual Studio 2022 with **Desktop development with C++** and the **Windows SDK 10.0.26100 or newer**, for the
   runtime stage (the runtime uses version 1.2 root signatures, which older SDKs don't declare).
